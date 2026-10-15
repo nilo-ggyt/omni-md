@@ -9,7 +9,8 @@ The workspace contains:
 | `omni-md-plugin` | Static SDK registration, foreground session, AppKit workspace controls and piece-backed TextKit editor. |
 | `omni-markdown-core` | Confined vault operations, atomic revision-checked saves, bounded search, canonical piece-tree document and viewport Markdown presentation. |
 
-The SDK protocol version must match the host exactly. `REGISTRATION` exposes immutable descriptor data; only explicit activation opens a workspace or allocates native objects. The host must integrate the SDK from the same immutable Git revision used here so Cargo resolves one SDK package identity.
+SDK package 2.0.0 / protocol 2 must match the host exactly; the manifest pins canonical SDK commit
+[`3e17eaf4bf7def814c3e3bdd08155f6ca330be3b`](https://github.com/nilo-ggyt/omni-plugin-sdk/commit/3e17eaf4bf7def814c3e3bdd08155f6ca330be3b). `REGISTRATION` exposes immutable descriptor data; only explicit activation opens a workspace or allocates native objects. The host must integrate the SDK from the same immutable Git revision used here so Cargo resolves one SDK package identity.
 
 ## Build and checks
 
@@ -32,6 +33,13 @@ The native test has `harness = false`: AppKit runs on the real process main thre
 Depend on `omni-md-plugin` with its canonical repository and an immutable full `rev`, then add `omni_md_plugin::REGISTRATION` to the host's static `PluginCatalog`. Discovery, query matching and activation remain generic SDK operations. Never branch in host business logic on this plugin's ID or activation code.
 
 The host supplies the workspace root, application-data root and main-thread lifecycle callbacks. Mounting copies a borrowed native-view descriptor; it does not transfer or extend ownership. The close protocol saves first, preserves the editor on failure, observes the native close callback, unmounts borrowed views, releases the document/TextKit graph, and consumes one destruction barrier before creating a successor surface.
+
+Ordinary `ForegroundTransition` requests still require full native graph deallocation before any
+successor. Explicit `ApplicationTermination` requests require actual complete project-payload
+release and a typed proof of an empty, closed/detached panel that AppKit may still lease in its
+termination caller pool. That terminal receipt is not window deallocation and cannot reopen a
+surface. Scope promotion requires Host authorization, preserves original intent, and never repeats
+save/close; see [terminal ownership](docs/architecture.md#application-termination-scope).
 
 ## Native workspace
 

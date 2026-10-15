@@ -7,6 +7,8 @@
 mod close_policy;
 #[cfg(any(target_os = "macos", test))]
 mod foreground_owner;
+#[cfg(any(target_os = "macos", test))]
+mod terminal_close;
 
 #[cfg(feature = "native-input-trace")]
 mod native_input_trace;
@@ -20,7 +22,7 @@ pub use native_input_trace::{
 pub use native_surface::{arm_native_markdown_input_trace, drain_native_markdown_input_trace};
 
 use omni_plugin_sdk::{
-    OmniBarHostContext, PLUGIN_PROTOCOL_VERSION, PluginActivation, PluginCloseIntent,
+    OmniBarHostContext, PLUGIN_PROTOCOL_VERSION, PluginActivation, PluginCloseRequest,
     PluginCommandDescriptor, PluginDescriptor, PluginError, PluginInvocation, PluginNativeView,
     PluginRegistration, PluginSession,
 };
@@ -75,17 +77,17 @@ impl PluginSession for MarkdownSession {
         self.native_view
     }
 
-    fn request_close(&mut self, intent: PluginCloseIntent) -> Result<(), PluginError> {
+    fn request_close(&mut self, request: PluginCloseRequest) -> Result<(), PluginError> {
         // Delegate save-before-close and the once-only barrier to the native owner.
         #[cfg(target_os = "macos")]
         {
-            return native_surface::request_native_markdown_close(intent)
+            return native_surface::request_native_markdown_close(request)
                 .map_err(|_| PluginError::new("close_failed", "Markdown 原生 surface 关闭失败"));
         };
         // Unsupported platforms expose an explicit protocol error and allocate no surface.
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = intent;
+            let _ = request;
             Err(PluginError::new(
                 "platform_unavailable",
                 "Markdown 原生 surface 只支持 macOS",

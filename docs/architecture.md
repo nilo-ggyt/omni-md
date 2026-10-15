@@ -59,7 +59,7 @@ reopening a hidden graph.
 Window close has separate request, accepted intent, `windowWillClose:`, native-owner destruction,
 actual deallocation signal and weak-verification stages. Identical accepted intents coalesce; opposing requests cannot change
 the accepted intent. Final verification takes its weak-only evidence out of global state before
-native weak loads. Only a passing complete graph check calls the original SDK `finish_close`.
+native weak loads. For `ForegroundTransition`, only a passing complete graph check calls the original SDK `finish_close`.
 Observed native acceptance status is recorded in [validation](validation.md); these contracts are
 requirements, not a claim that every current runtime gate passes. A close that interrupts a pending
 note/file handoff must include that earlier editor's weak graph in the same final cohort; an empty
@@ -74,6 +74,52 @@ an elapsed deadline. Native handoff may therefore incur measurable system cleanu
 requires performance reporting and comparison. Production uses no cleanup timer or polling. The
 standalone probe may use one failure-only deadline to terminate a missing signal, without retrying
 or converting a failed graph check to success.
+
+## Application termination scope
+
+SDK package 2.0.0 / protocol 2 carries an explicit `PluginCloseRequest { intent, scope }` through
+`request_close`, `begin_close` and `finish_close`. Ordinary close and all note/file handoffs retain
+complete canonical/native nil-graph authority. Terminal scope is a separate process-exit transaction;
+it never creates a successor, negotiates protocol versions or adds a runtime compatibility path.
+
+The distinction follows production-shaped synthetic evidence. `NSTerminateLater` waits inside an
+AppKit caller pool. Before a local Host save/resign/close preflight pool was added, native temporary
+retains kept the editor subtree alive. Draining that effects pool while the Host remains Preparing
+released every editor role at approximately 502 ms, but a memory graph still showed four outstanding
+panel autoreleases in AppKit's caller pool. The earlier strict terminal tests failed; that evidence
+is preserved and is not relabelled as complete window deallocation. See the Host's
+[termination decision](https://github.com/nilo-ggyt/omni-bar/blob/main/docs/architecture/application-termination.md)
+and Apple's [termination reply contract](https://developer.apple.com/documentation/appkit/nsapplication/terminatereply/terminatelater).
+
+Final close registers two independently keyed, deduplicated cohorts: the original complete graph,
+and a resource graph containing every controller/content/editor/TextKit/gutter/cell identity,
+including predecessor editors from interrupted handoffs. Canonical/history/mapping ownership and
+foreground workers still end synchronously. An ordinary completion consumes only complete-graph
+release. A terminal completion requires the resource cohort's actual last deallocation event and
+one strict full payload nil check. It then transiently upgrades the panel inside a bounded local
+autorelease pool and verifies the real close notification, invisible/nonkey state, nil content,
+delegate and initial responder, no payload responder or sheet, and ended project strong ownership.
+The custom `NativeMarkdownPanel` subclass has no Rust ivars or retained project payload; its
+overrides are static routing methods, not a second controller. The copied receipt can report an
+empty framework lease of that subclass; it does not claim base-NSPanel identity or panel deallocation.
+A scalar RAII close-call depth must also be zero, so a native nested loop cannot misclassify a
+still-local project panel clone as framework ownership. A failed check is not retried.
+
+Before emitting that terminal receipt, full-graph observation is cancelled atomically and its
+callback captures are removed. Only then does public Objective-C association removal detach that
+cohort's own panel marker. Cancellation can never satisfy `has_completed`; no project callback or
+marker metadata remains attached to the framework shell. The transient upgrade and local pool
+end before the Host receives `finish_close` with the exact accepted terminal request.
+
+An already accepted ordinary close may promote only its scope after successful Host `begin_close`
+authorization for actual pending Quit. Intent and generation stay unchanged; there is no second
+composition/save/resign/close operation. A real resource event arriving before promotion is stored
+as scalar readiness; successful promotion reserves its single terminal check. Promotion arriving
+first uses the existing resource callback. Neither order polls or retries. Reentrant promotion
+while native verification is local rejects Busy without effects, leaving the old ordinary close
+intact; an already committed identical terminal request still coalesces. Failed proofs preserve
+Closing and never retry, downgrade or emit a successful receipt. Host must independently drop its
+SDK session, consume its original barrier and authorize only the matching process termination.
 
 ## Text, disk and cancellation
 
@@ -96,3 +142,12 @@ checks. Replacing a query, refreshing or closing cancels and joins it. Autosave 
 850 ms one-shot timer only after accepted canonical changes; handoff/close cancels the deadline and
 a persistence conflict creates no automatic retry loop. No plugin document, mapping, cursor, timer,
 worker or native cache exists in the idle SDK descriptor.
+
+
+Autosave cancellation takes its sole project owner and calls `invalidate` on the same AppKit
+installation thread. Generation and weak-controller guards revoke stale callback authority.
+Apple's [invalidation contract](https://developer.apple.com/documentation/foundation/timer/invalidate())
+guarantees the timer becomes invalid and never fires again, while permitting the run loop to release
+its strong timer reference later. This is a stopped capability, not a claim that every historical
+invalidated timer shell has deallocated. Controller/payload identities still require actual release;
+no timer-object survivor is used to relax those strict native widget checks.

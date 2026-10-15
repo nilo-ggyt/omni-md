@@ -282,8 +282,8 @@ dependencies = [
 
 [[package]]
 name = "omni-plugin-sdk"
-version = "1.0.0"
-source = "git+https://github.com/nilo-ggyt/omni-plugin-sdk.git?rev=f050d61ca88f5878c29b27fad74dca71eb2ca454#f050d61ca88f5878c29b27fad74dca71eb2ca454"
+version = "2.0.0"
+source = "git+https://github.com/nilo-ggyt/omni-plugin-sdk.git?rev=3e17eaf4bf7def814c3e3bdd08155f6ca330be3b#3e17eaf4bf7def814c3e3bdd08155f6ca330be3b"
 dependencies = [
  "thiserror",
 ]

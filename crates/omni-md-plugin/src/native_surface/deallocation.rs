@@ -30,6 +30,7 @@ struct NativeDeallocationCallback {
 struct NativeDeallocationSignals {
     remaining: AtomicUsize,
     relay_queued: AtomicBool,
+    cancelled: AtomicBool,
     callback: MainThreadBound<std::rc::Weak<NativeDeallocationCallback>>,
     started: Instant,
     completed_after_ns: AtomicU64,
@@ -56,7 +57,8 @@ impl NativeDeallocationSignals {
 
     /// Coalesce a completed cohort into one callback, including completion before handler installation.
     fn queue_if_complete(self: &Arc<Self>) {
-        if self.remaining.load(Ordering::Acquire) != 0
+        if self.cancelled.load(Ordering::Acquire)
+            || self.remaining.load(Ordering::Acquire) != 0
             || self.completed_after_ns.load(Ordering::Acquire) == u64::MAX
             || self.relay_queued.swap(true, Ordering::AcqRel)
         {
@@ -65,6 +67,10 @@ impl NativeDeallocationSignals {
         }
         let signals = Arc::clone(self);
         enqueue_native_markdown_main_task(move || {
+            if signals.cancelled.load(Ordering::Acquire) {
+                // Scope promotion revoked this observer before its queued relay could claim completion.
+                return;
+            }
             let mtm =
                 MainThreadMarker::new().expect("native deallocation relays use the main queue");
             let Some(callback) = signals.callback.get(mtm).upgrade() else {
@@ -92,8 +98,8 @@ struct NativeDeallocationMarkerIvars {
 
 impl Drop for NativeDeallocationMarkerIvars {
     fn drop(&mut self) {
-        // The runtime is removing this unique association because its source object is deallocating.
-        // Notify atomically and defer all main-thread state/native checks until after this stack returns.
+        // The runtime removes this unique association at source deallocation or explicit observer cancellation.
+        // Cancellation disables completion first; only an uncancelled final claim supplies actual release authority.
         self.signals.release_claim();
     }
 }
@@ -127,6 +133,7 @@ impl NativeMarkdownDeallocationCohort {
         let signals = Arc::new(NativeDeallocationSignals {
             remaining: AtomicUsize::new(1),
             relay_queued: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
             callback: MainThreadBound::new(Rc::downgrade(&callback), mtm),
             started: Instant::now(),
             completed_after_ns: AtomicU64::new(u64::MAX),
@@ -187,6 +194,10 @@ impl NativeMarkdownDeallocationCohort {
     /// Install one operation-specific handler; only actual completion makes it eligible to execute.
     pub(super) fn when_released(&self, work: impl FnOnce() + 'static) {
         assert!(
+            !self.signals.cancelled.load(Ordering::Acquire),
+            "a cancelled observation cannot install completion work"
+        );
+        assert!(
             !self.callback.consumed.get(),
             "native completion already consumed"
         );
@@ -196,6 +207,31 @@ impl NativeMarkdownDeallocationCohort {
         );
         *self.callback.work.borrow_mut() = Some(Box::new(work));
         self.signals.queue_if_complete();
+    }
+
+    /// Revoke callback authority before removing only this cohort's association from a terminal shell.
+    ///
+    /// This operation is observation cancellation, never an actual-deallocation signal. Terminal
+    /// callers must already have proved the complete payload graph released and the panel detached.
+    pub(super) fn cancel_observation<T: objc2::Message>(&mut self, panel: Option<&T>) {
+        // A queued relay checks cancellation before touching its weak callback. Clearing the work
+        // also removes every project callback capture before the framework-held shell is accepted.
+        self.signals.cancelled.store(true, Ordering::Release);
+        self.callback.work.borrow_mut().take();
+        self.callback.consumed.set(true);
+        if let Some(panel) = panel {
+            // SAFETY: the caller transiently owns this live main-thread panel. The stable Arc key
+            // identifies only this observer's association; nil removes that marker, not another
+            // owner's association or a panel retain. Cancellation preceded marker destruction.
+            unsafe {
+                objc_setAssociatedObject(
+                    std::ptr::from_ref(panel).cast(),
+                    Arc::as_ptr(&self.signals).cast(),
+                    std::ptr::null(),
+                    1,
+                );
+            }
+        }
     }
 
     /// Report measured registration-to-actual-completion latency without introducing a timer or retry.
@@ -214,12 +250,13 @@ impl NativeMarkdownDeallocationCohort {
     #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn diagnostic(&self) -> String {
         format!(
-            "sealed={} remaining={} relay_queued={} handler_installed={} handler_consumed={} elapsed_us={}",
+            "sealed={} remaining={} relay_queued={} handler_installed={} handler_consumed={} cancelled={} elapsed_us={}",
             self.sealed,
             self.signals.remaining.load(Ordering::Acquire),
             self.signals.relay_queued.load(Ordering::Acquire),
             self.callback.work.borrow().is_some(),
             self.callback.consumed.get(),
+            self.signals.cancelled.load(Ordering::Acquire),
             self.elapsed().as_micros(),
         )
     }
@@ -227,6 +264,7 @@ impl NativeMarkdownDeallocationCohort {
     /// Distinguish actual completed ownership from a guessed queue boundary before any native weak loads.
     pub(super) fn has_completed(&self) -> bool {
         self.sealed
+            && !self.signals.cancelled.load(Ordering::Acquire)
             && self.signals.remaining.load(Ordering::Acquire) == 0
             && self.signals.completed_after_ns.load(Ordering::Acquire) != u64::MAX
     }
@@ -288,8 +326,32 @@ pub(super) fn verify_native_markdown_deallocation_accounting(
         // One actual object destruction completes both independent operation-specific claims.
         return Err("overlapping native cohorts did not both observe actual release".into());
     }
+    let object = NSObject::new();
+    let mut cancelled = NativeMarkdownDeallocationCohort::new(mtm);
+    let mut preserved = NativeMarkdownDeallocationCohort::new(mtm);
+    cancelled.track(&*object, mtm);
+    preserved.track(&*object, mtm);
+    cancelled.seal();
+    preserved.seal();
+    cancelled.when_released(|| panic!("cancelled observer emitted completion"));
+    cancelled.cancel_observation(Some(&*object));
+    if cancelled.has_completed()
+        || cancelled.signals.remaining.load(Ordering::Acquire) != 0
+        || cancelled.callback.work.borrow().is_some()
+        || preserved.signals.remaining.load(Ordering::Acquire) != 1
+    {
+        // Removing this observer releases its marker but cannot certify object destruction or remove another key.
+        return Err(
+            "cancelled observation retained callback authority or changed another cohort".into(),
+        );
+    }
+    drop(object);
+    if cancelled.has_completed() || !preserved.has_completed() {
+        // Later actual deallocation completes only the independent live observer, never the cancelled receipt.
+        return Err("cancelled and actual release authority were conflated".into());
+    }
     println!(
-        "native_deallocation_accounting=passed empty_graph duplicate_identity overlapping_cohorts actual_marker_drop"
+        "native_deallocation_accounting=passed empty_graph duplicate_identity overlapping_cohorts cancelled_key actual_marker_drop"
     );
     Ok(())
 }

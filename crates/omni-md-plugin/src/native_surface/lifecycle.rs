@@ -8,7 +8,8 @@ thread_local! {
     pub(super) static CLOSING_NATIVE_MARKDOWN_SURFACE: RefCell<Option<NativeMarkdownWindowSurface>> = const { RefCell::new(None) };
     pub(super) static FINALIZING_NATIVE_MARKDOWN_CLOSE: RefCell<Option<NativeMarkdownCloseCompletion>> = const { RefCell::new(None) };
     pub(super) static NATIVE_MARKDOWN_CLOSE_GENERATION: Cell<u64> = const { Cell::new(0) };
-    pub(super) static VERIFYING_NATIVE_MARKDOWN_CLOSE: Cell<Option<(u64, NativeMarkdownCloseIntent)>> = const { Cell::new(None) };
+    pub(super) static VERIFYING_NATIVE_MARKDOWN_CLOSE: Cell<Option<(u64, PluginCloseRequest)>> = const { Cell::new(None) };
+    static NATIVE_MARKDOWN_CLOSE_CALL_DEPTH: Cell<usize> = const { Cell::new(0) };
     pub(super) static BORROWED_NATIVE_MARKDOWN_OWNER: Cell<Option<usize>> = const { Cell::new(None) };
     // At most one accepted note/file transition exists. A ready completion carries only weak identity
     // and scalar operation metadata while a reentrant callback temporarily observes its owner leased.
@@ -354,148 +355,320 @@ pub(super) fn finish_native_markdown_note_switch() -> Result<(), String> {
     })
 }
 
-/// Preserve Host query/resume semantics for a physical Escape dismissal.
+/// Preserve Host query/resume semantics through an explicit ordinary foreground request.
 pub(crate) fn request_native_markdown_window_dismiss() -> Result<(), String> {
-    request_native_markdown_close(NativeMarkdownCloseIntent::DismissAndResume)
+    request_native_markdown_close(PluginCloseRequest {
+        intent: NativeMarkdownCloseIntent::DismissAndResume,
+        scope: PluginCloseScope::ForegroundTransition,
+    })
 }
 
-/// Return to the launcher only through the same save and strict release protocol as dismissal.
+/// Return to the launcher only after ordinary complete-graph release.
 pub(crate) fn request_native_markdown_window_exit() -> Result<(), String> {
-    request_native_markdown_close(NativeMarkdownCloseIntent::ExitToLauncher)
+    request_native_markdown_close(PluginCloseRequest {
+        intent: NativeMarkdownCloseIntent::ExitToLauncher,
+        scope: PluginCloseScope::ForegroundTransition,
+    })
 }
 
-/// Preflight visible input and persistence before accepting one immutable close intent.
-pub(crate) fn request_native_markdown_close(
-    intent: NativeMarkdownCloseIntent,
-) -> Result<(), String> {
+/// Restore scalar call-stack evidence on both ordinary return and Rust unwinding.
+struct NativeMarkdownCloseCallGuard<'a>(&'a Cell<usize>);
+
+impl Drop for NativeMarkdownCloseCallGuard<'_> {
+    fn drop(&mut self) {
+        // Every successful entry owns one claim; no native value or callback is dropped under this scalar update.
+        self.0.set(self.0.get() - 1);
+    }
+}
+
+/// Reject a framework-only shell claim while any plugin close request may still own a local panel clone.
+pub(crate) fn request_native_markdown_close(request: PluginCloseRequest) -> Result<(), String> {
+    NATIVE_MARKDOWN_CLOSE_CALL_DEPTH.with(|depth| {
+        let next = depth
+            .get()
+            .checked_add(1)
+            .ok_or("Markdown close reentry depth exhausted")?;
+        depth.set(next);
+        let _guard = NativeMarkdownCloseCallGuard(depth);
+        // Cell access holds no state borrow across native callbacks; nested calls own independent balanced claims.
+        request_native_markdown_close_inner(request)
+    })
+}
+
+/// Preflight visible input and persistence, or promote only an already accepted scope.
+fn request_native_markdown_close_inner(request: PluginCloseRequest) -> Result<(), String> {
     MainThreadMarker::new()
         .ok_or_else(|| "原生 Markdown 窗口必须在 AppKit 主线程关闭".to_owned())?;
     let accepted = FINALIZING_NATIVE_MARKDOWN_CLOSE
-        .with_borrow(|completion| {
-            // A weak-only completion retains the same accepted intent after actual surface ownership ends.
-            completion.as_ref().map(|completion| completion.intent)
-        })
+        .with_borrow(|completion| completion.as_ref().map(|completion| completion.request))
         .or_else(|| {
             VERIFYING_NATIVE_MARKDOWN_CLOSE
                 .with(Cell::get)
-                .map(|(_, intent)| intent)
+                .map(|(_, request)| request)
         })
         .or_else(|| {
             CLOSING_NATIVE_MARKDOWN_SURFACE.with_borrow(|surface| {
-                // Before native owner teardown, the closing surface is the accepted intent's unique authority.
-                surface.as_ref().and_then(|surface| surface.closing_intent)
+                // Copy identity before effects; no native owner is lent by close admission.
+                surface.as_ref().and_then(|surface| surface.closing_request)
             })
         });
-    if crate::close_policy::coalesce_accepted_close(accepted, intent).map_err(str::to_owned)? {
-        // Repeated requests share one native close and one host completion callback.
-        return Ok(());
+    match crate::close_policy::admit_close(accepted, request).map_err(str::to_owned)? {
+        crate::close_policy::CloseAdmission::Coalesced => {
+            // An already committed identical request shares its one completion, even during verification.
+            return Ok(());
+        }
+        crate::close_policy::CloseAdmission::Promote => {
+            // Promotion never repeats composition, persistence, resignation or the native close selector.
+            return promote_native_markdown_close(request);
+        }
+        crate::close_policy::CloseAdmission::First => {
+            // First acceptance still requires every native/data preflight and Host authorization below.
+        }
     }
     if BORROWED_NATIVE_MARKDOWN_OWNER.with(Cell::get).is_some() {
-        // Reentry during an unaccepted save/layout/row transaction cannot be mistaken for an accepted close.
+        // Unaccepted reentry cannot acquire the temporarily local owner or pretend another close succeeded.
         return Err("Another Markdown native transaction is in progress".into());
     }
     if ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|surface| surface.is_none()) {
-        // No accepted in-flight intent and no foreground owner means there is no session left to close.
+        // No accepted transaction or live owner exists to supply save/release authority.
         return Err("原生 Markdown 窗口已经关闭".to_owned());
     }
-
     let save_result = with_active_native_markdown_surface(|surface| {
         surface.commit_marked_text()?;
         surface.save_current_document()?;
-        // A real AppKit resignation refusal vetoes close before the host lifecycle changes state.
+        // Actual responder refusal vetoes the close before the Host accepts its scope or destination.
         surface.resign_editor_responder()
     });
     if let Err(error) = save_result {
-        // Persistence or visible-draft rejection vetoes closing before any native owner is removed.
+        // A failed save/input/resignation preserves the original usable draft and its ordinary owner.
         present_native_markdown_error(&error);
         return Err(error);
     }
-
     let lifecycle = ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|surface| {
         surface
             .as_ref()
-            .expect("native Markdown existence was checked immediately above")
+            .expect("the preflight restored its exact owner")
             .lifecycle
             .clone()
     });
-    if let Err(error) = lifecycle.begin_close(intent) {
-        // Host lifecycle rejection preserves the saved foreground surface and its responder graph.
+    if let Err(error) = lifecycle.begin_close(request) {
+        // Host rejects terminal scope without pending Quit; restore input to the saved foreground owner.
         let message = error.to_string();
         present_native_markdown_error(&message);
         let _ = with_active_native_markdown_surface(|surface| {
             if let Some(editor) = &surface.editor {
-                // The host vetoed closing; restore normal input focus to the still-owned saved document.
+                // No close was accepted, so restoring focus does not revive a discarded document.
                 surface.panel.makeFirstResponder(Some(editor.text_view()));
             }
             Ok(())
         });
         return Err(message);
     }
-
     let Some(mut surface) = ACTIVE_NATIVE_MARKDOWN_SURFACE.take() else {
-        // Reentrant completion already consumed the unique owner; no second native close is needed.
+        // A reentrant completion already consumed ownership; never create another native close.
         return Ok(());
     };
-    surface.closing_intent = Some(intent);
+    surface.closing_request = Some(request);
     surface.prepare_to_close();
     let panel = surface.panel.clone();
-    CLOSING_NATIVE_MARKDOWN_SURFACE.with_borrow_mut(|closing_surface| {
-        *closing_surface = Some(surface);
-    });
+    CLOSING_NATIVE_MARKDOWN_SURFACE.with_borrow_mut(|closing| *closing = Some(surface));
     panel.close();
     Ok(())
 }
 
-/// Holds only weak graph observations and original host lifecycle identity after native owner teardown.
+/// Authorize one monotonic scope change while preserving original intent, generation and native effects.
+fn promote_native_markdown_close(request: PluginCloseRequest) -> Result<(), String> {
+    if VERIFYING_NATIVE_MARKDOWN_CLOSE.with(Cell::get).is_some() {
+        // The completion is local during native verification. Uncommitted reentry rejects Busy with no
+        // effects; Host may cancel Quit while the original ordinary transaction continues unchanged.
+        return Err("Markdown close verification is in progress".into());
+    }
+    if let Some(mut completion) = FINALIZING_NATIVE_MARKDOWN_CLOSE.take() {
+        let generation = completion.generation;
+        VERIFYING_NATIVE_MARKDOWN_CLOSE
+            .with(|gate| gate.set(Some((generation, completion.request))));
+        // The Host validates its actual pending Quit. No TLS borrow or native graph owner crosses this call.
+        let result = completion
+            .lifecycle
+            .begin_close(request)
+            .map_err(|error| error.to_string());
+        if result.is_ok() {
+            // Only successful Host authorization commits terminal scope; failure preserves the old receipt identity.
+            completion.request = request;
+        }
+        let schedule = result.is_ok() && completion.reserve_terminal_check();
+        FINALIZING_NATIVE_MARKDOWN_CLOSE.with_borrow_mut(|pending| *pending = Some(completion));
+        VERIFYING_NATIVE_MARKDOWN_CLOSE.with(|gate| gate.set(None));
+        if schedule {
+            // A recorded actual resource-release event already occurred. This queues its single
+            // terminal verification, not a timer, retry or guessed deallocation boundary.
+            enqueue_native_markdown_main_task(move || {
+                finish_native_markdown_close_release(generation, CloseBoundary::Resources)
+            });
+        }
+        return result;
+    }
+    if let Some(mut surface) = CLOSING_NATIVE_MARKDOWN_SURFACE.take() {
+        let accepted = surface
+            .closing_request
+            .expect("a closing surface has an accepted request");
+        VERIFYING_NATIVE_MARKDOWN_CLOSE.with(|gate| gate.set(Some((0, accepted))));
+        let result = surface
+            .lifecycle
+            .begin_close(request)
+            .map_err(|error| error.to_string());
+        if result.is_ok() {
+            // Native windowWillClose/finalization remains the original operation; only its authorized scope changes.
+            surface.closing_request = Some(request);
+        }
+        CLOSING_NATIVE_MARKDOWN_SURFACE.with_borrow_mut(|closing| *closing = Some(surface));
+        VERIFYING_NATIVE_MARKDOWN_CLOSE.with(|gate| gate.set(None));
+        return result;
+    }
+    // Admission and effects are synchronous on the main thread; disappearance cannot authorize a guessed promotion.
+    Err("The accepted Markdown close is no longer available for promotion".into())
+}
+
+/// Actual-release authority remains distinct for ordinary graph completion and terminal payload completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseBoundary {
+    FullGraph,
+    Resources,
+}
+
+/// A successful proof reports its real boundary, never relabelling an OS-held panel as deallocated.
+enum NativeMarkdownCloseReceipt {
+    ForegroundGraphReleased,
+    ApplicationResourcesReleased(crate::terminal_close::FrameworkWindowLeaseReceipt),
+}
+
+/// Holds weak observations and copied scope identity after every project/native owning root was dropped.
 struct NativeMarkdownCloseCompletion {
     generation: u64,
-    intent: NativeMarkdownCloseIntent,
+    request: PluginCloseRequest,
     lifecycle: Rc<dyn PluginHostLifecycle>,
     editors: Vec<NativeMarkdownEditorReleaseBarrier>,
     cohort: NativeMarkdownDeallocationCohort,
+    resources: NativeMarkdownDeallocationCohort,
+    terminal_authority: crate::close_policy::TerminalReleaseAuthority,
+    close_notified: bool,
+    project_owner_released: bool,
     panel: Weak<NativeMarkdownPanel>,
     controller: Weak<NativeMarkdownController>,
     content: Option<Weak<NSView>>,
 }
 
 impl NativeMarkdownCloseCompletion {
-    /// Verify actual deallocation once, without allowing a stale weak-only transaction to notify the host.
-    fn verify_released(&self) -> Result<(), String> {
-        if !self.cohort.has_completed() {
-            // Window completion waits for all interrupted/editor/window roles, not only the current native callback.
-            return Err(
-                "The complete Markdown window deallocation cohort has not completed".into(),
-            );
+    /// Coalesce an already recorded actual event into exactly one terminal verification authority.
+    fn reserve_terminal_check(&mut self) -> bool {
+        // A completed counter is set only by final marker destruction; it also covers promotion
+        // before the resource callback itself runs. No elapsed-time or queue-boundary inference exists.
+        self.terminal_authority
+            .reserve(self.request.scope, self.resources.has_completed())
+    }
+
+    /// Require every predecessor/editor and window payload identity to be actually nil.
+    fn verify_resources_released(&self) -> Result<(), String> {
+        if !self.resources.has_completed() || !self.project_owner_released {
+            // A resource signal and synchronous unique-owner destruction are independent requirements.
+            return Err("The Markdown project-resource release is incomplete".into());
         }
         for editor in &self.editors {
-            // Include a predecessor released by an interrupted note/file transition as well as the current editor.
+            // Interrupted handoffs retain their original strict canonical/TextKit barrier without exceptions.
             editor.verify_released()?;
         }
-        let panel = self.panel.load().is_some();
-        let controller = self.controller.load().is_some();
-        let content = self
-            .content
-            .as_ref()
-            .is_some_and(|content| content.load().is_some());
-        if panel || controller || content {
-            // A closed-but-retained window/controller/content owner cannot be treated as completed teardown.
-            return Err(format!(
-                "The Markdown window graph survived close: panel={panel} controller={controller} content={content}"
-            ));
+        if self.controller.load().is_some()
+            || self
+                .content
+                .as_ref()
+                .is_some_and(|content| content.load().is_some())
+        {
+            // Terminal scope permits only the panel shell; controller/content survival is still a strict failure.
+            return Err(
+                "The Markdown controller or content survived project-resource release".into(),
+            );
         }
         Ok(())
     }
+
+    /// Produce one scope-specific typed receipt after actual release, with no retained window escaping its pool.
+    fn verify_released(&mut self) -> Result<NativeMarkdownCloseReceipt, String> {
+        self.verify_resources_released()?;
+        match self.request.scope {
+            PluginCloseScope::ForegroundTransition => {
+                // Ordinary dismissal/back/resume still require the unchanged all-node cohort and exact nil panel.
+                if !self.cohort.has_completed() || self.panel.load().is_some() {
+                    return Err(
+                        "The complete Markdown foreground window graph has not deallocated".into(),
+                    );
+                }
+                Ok(NativeMarkdownCloseReceipt::ForegroundGraphReleased)
+            }
+            PluginCloseScope::ApplicationTermination => {
+                // All state getters below copy only ownership-presence flags; native queries occur after their borrows end.
+                let project_owner_present = ACTIVE_NATIVE_MARKDOWN_SURFACE
+                    .with_borrow(Option::is_some)
+                    || CLOSING_NATIVE_MARKDOWN_SURFACE.with_borrow(Option::is_some)
+                    || BORROWED_NATIVE_MARKDOWN_OWNER.with(Cell::get).is_some()
+                    || NATIVE_MARKDOWN_CLOSE_CALL_DEPTH.with(Cell::get) != 0;
+                let receipt = autoreleasepool(|_| {
+                    let panel = self.panel.load();
+                    let mut facts = crate::terminal_close::TerminalWindowFacts {
+                        close_notified: self.close_notified,
+                        project_owner_present,
+                        panel_present: panel.is_some(),
+                        visible: false,
+                        key: false,
+                        content_attached: false,
+                        delegate_attached: false,
+                        initial_responder_attached: false,
+                        payload_responder_attached: false,
+                        sheet_attached: false,
+                    };
+                    if let Some(panel) = &panel {
+                        // This is the sole transient panel upgrade. Public getters prove a closed/detached
+                        // shell; no retainCount, private ownership mutation or caller-pool operation is used.
+                        facts.visible = panel.isVisible();
+                        facts.key = panel.isKeyWindow();
+                        facts.content_attached = panel.contentView().is_some();
+                        facts.delegate_attached = panel.delegate().is_some();
+                        facts.initial_responder_attached = panel.initialFirstResponder().is_some();
+                        facts.payload_responder_attached =
+                            panel.firstResponder().is_some_and(|responder| {
+                                // NSWindow may itself be its inert responder; any different responder remains a forbidden payload edge.
+                                !std::ptr::eq(
+                                    std::ptr::from_ref(&*responder).cast::<()>(),
+                                    std::ptr::from_ref(&**panel).cast::<()>(),
+                                )
+                            });
+                        facts.sheet_attached = panel.attachedSheet().is_some();
+                    }
+                    let receipt = facts.verify().map_err(str::to_owned)?;
+                    // Revoke full-graph callback authority before removing only its own association.
+                    // Marker removal is cancelled observation, not deallocation; no project callback
+                    // or marker metadata remains attached to the AppKit-owned terminal panel shell.
+                    self.cohort.cancel_observation(panel.as_deref());
+                    Ok::<_, String>(receipt)
+                })?;
+                // The weak upgrade, all getter temporaries and their local pool ended before receipt use.
+                Ok(NativeMarkdownCloseReceipt::ApplicationResourcesReleased(
+                    receipt,
+                ))
+            }
+        }
+    }
 }
 
-/// Drop foreground owners after windowWillClose, then observe actual complete native deallocation.
+/// Drop foreground owners after the real windowWillClose and install independent actual-release authorities.
 pub(super) fn finalize_native_markdown_close() {
     let completion = autoreleasepool(|_| {
         let mut surface = CLOSING_NATIVE_MARKDOWN_SURFACE.take()?;
-        let intent = surface
-            .closing_intent
-            .expect("closing Markdown preserves its original intent");
+        let request = surface
+            .closing_request
+            .expect("closing Markdown preserves its accepted request");
+        let close_notified = surface.controller.ivars().close_finalizer_scheduled.get();
         let generation = NATIVE_MARKDOWN_CLOSE_GENERATION.with(|generation| {
-            // Every ownership teardown has a distinct scalar identity for its one queued weak observation.
+            // An operation generation prevents stale callbacks from observing or completing a successor.
             let next = generation.get().wrapping_add(1);
             generation.set(next);
             next
@@ -505,88 +678,151 @@ pub(super) fn finalize_native_markdown_close() {
         if let Some(pending) = surface.pending_note_switch.take()
             && let Some(barrier) = pending.release_barrier
         {
-            // Closing may interrupt a still-releasing predecessor even though the current editor slot is empty.
+            // Closing includes an earlier graph whose handoff has not yet finished.
             editors.push(barrier);
         }
         if let Some(pending) = surface.pending_file_mutation.take()
             && let Some(barrier) = pending.release_barrier
         {
-            // A pending filesystem handoff cannot let its earlier native document escape the final close gate.
+            // Filesystem handoff cannot exempt a preceding canonical/native editor from terminal or ordinary release.
             editors.push(barrier);
         }
         if let Some(editor) = surface.editor.take() {
-            // Preflight already saved and resigned input; destruction accepts no later source mutation.
+            // Preflight already saved and resigned; teardown synchronously drops canonical/history/mapping ownership.
             editors.push(destroy_native_markdown_editor(editor));
         }
         let mut cohort = NativeMarkdownDeallocationCohort::new(mtm);
+        let mut resources = NativeMarkdownDeallocationCohort::new(mtm);
         for editor in &editors {
-            // Already deallocated roles need no marker; each surviving identity joins one final operation cohort.
+            // Independent keys preserve the ordinary full graph while allowing terminal resource release to complete.
             editor.track_surviving_nodes(&mut cohort, mtm);
+            editor.track_surviving_nodes(&mut resources, mtm);
         }
         cohort.track(&*surface.panel, mtm);
         cohort.track(&*surface.controller, mtm);
+        resources.track(&*surface.controller, mtm);
         let content = surface.panel.contentView().map(|content| {
-            // End this temporary content retain before final native ownership is removed below.
+            // Root content is a payload identity under both scopes, never part of the permitted framework shell.
             cohort.track(&*content, mtm);
+            resources.track(&*content, mtm);
             Weak::from_retained(&content)
         });
         let mut completion = NativeMarkdownCloseCompletion {
             generation,
-            intent,
+            request,
             lifecycle: surface.lifecycle.clone(),
             editors,
             cohort,
+            resources,
+            terminal_authority: crate::close_policy::TerminalReleaseAuthority::default(),
+            close_notified,
+            project_owner_released: false,
             panel: Weak::from_retained(&surface.panel),
             controller: Weak::from_retained(&surface.controller),
             content,
         };
         surface.release_native_ownership();
-        // End canonical/editor/window/session ownership here; local AppKit autoreleases drain before enqueue.
         drop(surface);
+        // The unique surface/model/search owner has ended synchronously; callbacks retain only scalar/weak evidence.
+        completion.project_owner_released = true;
         completion.cohort.seal();
+        completion.resources.seal();
         Some(completion)
     });
     let Some(completion) = completion else {
-        // Duplicate native close notifications have no original foreground owner to consume.
+        // Duplicate notifications cannot consume another native owner or register another close authority.
         return;
     };
     let generation = completion.generation;
-    // The completion owns weak-only evidence; its callback captures only the original scalar generation.
+    completion.cohort.when_released(move || {
+        finish_native_markdown_close_release(generation, CloseBoundary::FullGraph)
+    });
     completion
-        .cohort
-        .when_released(move || finish_native_markdown_close_release(generation));
+        .resources
+        .when_released(move || observe_native_markdown_resource_release(generation));
     FINALIZING_NATIVE_MARKDOWN_CLOSE.with_borrow_mut(|pending| *pending = Some(completion));
 }
 
-/// Consume the actual-deallocation signal once; a failed complete graph check retains honest Closing state.
-pub(super) fn finish_native_markdown_close_release(generation: u64) {
-    let Some(completion) = FINALIZING_NATIVE_MARKDOWN_CLOSE.take() else {
-        // Duplicate queued events have no remaining close authority or strong native ownership.
+/// Preserve the real payload-deallocation event while an ordinary close may still await its panel.
+fn observe_native_markdown_resource_release(generation: u64) {
+    let Some(mut completion) = FINALIZING_NATIVE_MARKDOWN_CLOSE.take() else {
+        // A later completed transaction has no resource event left to consume.
         return;
     };
     if completion.generation != generation {
-        // Preserve a later accepted token when an earlier queued callback arrives out of order.
+        // An earlier event cannot annotate a later operation's readiness.
         FINALIZING_NATIVE_MARKDOWN_CLOSE.with_borrow_mut(|pending| *pending = Some(completion));
         return;
     }
-    // Keep reentrant activation/close policy gated using only Copy scalars while all native weak loads
-    // run outside RefCell/TLS state borrows. No controller/view/delegate is captured across verification.
-    VERIFYING_NATIVE_MARKDOWN_CLOSE
-        .with(|verifying| verifying.set(Some((generation, completion.intent))));
-    match completion.verify_released() {
-        // Complete deallocation authorizes exactly one original host lifecycle callback.
-        Ok(()) => {
-            native_markdown_trace! {
-                eprintln!("[probe] Markdown native close completed after_us={}", completion.cohort.elapsed().as_micros());
+    let finish = completion.reserve_terminal_check();
+    FINALIZING_NATIVE_MARKDOWN_CLOSE.with_borrow_mut(|pending| *pending = Some(completion));
+    if finish {
+        // This is already the actual-release relay after the final native destruction stack, not an added wait phase.
+        finish_native_markdown_close_release(generation, CloseBoundary::Resources);
+    }
+}
+
+/// Consume exactly one matching actual boundary; a failed proof retains honest Closing state.
+fn finish_native_markdown_close_release(generation: u64, boundary: CloseBoundary) {
+    let Some(mut completion) = FINALIZING_NATIVE_MARKDOWN_CLOSE.take() else {
+        // Late callbacks retain no native owners and cannot emit a second Host receipt.
+        return;
+    };
+    if completion.generation != generation
+        || (completion.request.scope == PluginCloseScope::ForegroundTransition
+            && boundary != CloseBoundary::FullGraph)
+        || (completion.request.scope == PluginCloseScope::ApplicationTermination
+            && boundary != CloseBoundary::Resources)
+    {
+        // Scope promotion invalidates ordinary completion authority without changing original identity or destination.
+        FINALIZING_NATIVE_MARKDOWN_CLOSE.with_borrow_mut(|pending| *pending = Some(completion));
+        return;
+    }
+    VERIFYING_NATIVE_MARKDOWN_CLOSE.with(|gate| gate.set(Some((generation, completion.request))));
+    let verified = autoreleasepool(|_| completion.verify_released());
+    match verified {
+        Ok(receipt) => {
+            // Only the typed proof authorizes its scope. Terminal diagnostics explicitly report a
+            // framework lease instead of claiming the surviving panel's native deallocation.
+            match receipt {
+                NativeMarkdownCloseReceipt::ForegroundGraphReleased => {
+                    native_markdown_trace! { eprintln!("[probe] Markdown foreground graph deallocated after_us={}", completion.cohort.elapsed().as_micros()); }
+                }
+                NativeMarkdownCloseReceipt::ApplicationResourcesReleased(lease) => {
+                    native_markdown_trace! { eprintln!("[probe] Markdown terminal resources released after_us={} framework_panel_pending={}", completion.resources.elapsed().as_micros(), lease.framework_panel_pending); }
+                }
             }
-            VERIFYING_NATIVE_MARKDOWN_CLOSE.with(|verifying| verifying.set(None));
-            completion.lifecycle.finish_close(completion.intent);
+            VERIFYING_NATIVE_MARKDOWN_CLOSE.with(|gate| gate.set(None));
+            completion.lifecycle.finish_close(completion.request);
         }
-        // Reinsert weak-only evidence before releasing the scalar gate; failures preserve Host Closing.
         Err(error) => {
+            // A failed resource/shell proof cannot retry, downgrade or announce a successful terminal receipt.
             FINALIZING_NATIVE_MARKDOWN_CLOSE.with_borrow_mut(|pending| *pending = Some(completion));
-            VERIFYING_NATIVE_MARKDOWN_CLOSE.with(|verifying| verifying.set(None));
+            VERIFYING_NATIVE_MARKDOWN_CLOSE.with(|gate| gate.set(None));
             eprintln!("Markdown close release failed: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod close_stack_tests {
+    use super::NativeMarkdownCloseCallGuard;
+    use std::cell::Cell;
+
+    /// Nested close work and rejected/unwinding effects cannot leave a false framework-only ownership claim.
+    #[test]
+    fn close_call_stack_claims_restore_after_nested_unwind() {
+        let depth = Cell::new(1);
+        let outer = NativeMarkdownCloseCallGuard(&depth);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            depth.set(depth.get() + 1);
+            let _inner = NativeMarkdownCloseCallGuard(&depth);
+            assert_eq!(depth.get(), 2);
+            panic!("synthetic close effect rejected by unwinding");
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(depth.get(), 1);
+        drop(outer);
+        assert_eq!(depth.get(), 0);
     }
 }

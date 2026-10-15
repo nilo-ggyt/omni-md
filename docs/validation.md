@@ -52,7 +52,7 @@ All-target plugin Clippy with the native probe feature passed with warnings deni
 | Source indentation and contextual editing | Source Tab/Shift-Tab use the atomic two-space core indentation planner; 2,178 actual CodeMirror references cover line endpoint exclusion, tabs and Unicode whitespace. Contextual Enter/Backspace route through the canonical atomic planner, with 4,328 actual CodeMirror references over 117 sources covering declared list/quote/fence/HTML and fallback indentation contexts. This covered corpus does not establish arbitrary embedded-language parser equivalence. | Native key delivery, list continuation and focus traversal pending. |
 | Active line, brackets and special characters | Source uses copied native geometry for active-line/ruler highlighting and bounded bracket/control-character decoration. The core classifies admitted token contexts against 588 independent CodeMirror cases at 12,475 scalar carets (546 admitted cases and 42 explicitly uncertain cases) and returns budget/context uncertainty; native geometry is capped at 130 rectangles, including multi-segment handles. | Mixed HTML/reference contexts remain conservatively omitted rather than fully parser-equivalent; visible geometry, control glyph spacing and accessibility pending. |
 | Accessibility | Editor, search, document actions and navigation controls expose native labels/help. | VoiceOver focus, announcements and keyboard traversal pending. |
-| Close and resource release | Save-before-close, actual responder resignation, sealed late-input gates and weak originating-action identity protect the final saved revision. Canonical document/history/mappings must release synchronously; public association markers signal the actual last tracked native deallocation, then one complete strict nil-graph check must pass before the Host receives completion. | Canonical shared strict graph gate passed after the constructor correction below; unlocked product and latency comparison pending. |
+| Close and resource release | Save-before-close, actual responder resignation, sealed late-input gates and weak originating-action identity protect the final saved revision. Canonical document/history/mappings must release synchronously; for ordinary scope, public association markers signal the actual last tracked native deallocation, then one complete strict nil-graph check must pass before the Host receives completion. | Canonical shared strict graph gate passed after the constructor correction below; unlocked product and latency comparison pending. |
 
 On 2026-10-15, the unlocked full native probe mounted, exercised and closed the synthetic editor
 through actual application events. Its input/style/fold/history/table and sealed-late-input
@@ -138,3 +138,50 @@ Host baseline retirement and final product acceptance require those concrete res
 component source publication includes this explicit incomplete acceptance record; publication is
 not a product-release or migration-completion claim. This record authorizes no baseline removal
 on the strength of portable tests or the shared native driver alone.
+
+
+## Scoped application termination
+
+SDK package 2.0.0 / protocol 2 separates complete ordinary `ForegroundTransition` release from
+terminal `ApplicationTermination` resource release. Ordinary dismissal, back/resume and note/file
+handoff retain their strict full native nil-graph requirements. Terminal completion additionally
+requires actual controller/content/editor/TextKit/gutter/cell nil checks and a typed closed/detached
+empty-panel proof; any AppKit framework lease is reported as such rather than as deallocation.
+The original strict terminal integration failure and its caller-pool attribution remain historical
+failure evidence. The scoped implementation requires fresh Host production-loop exit/save tests;
+source checks and ordinary probes do not establish that new runtime result.
+
+Pure scope tests cover first/duplicate/opposing requests, monotonic promotion and downgrade rejection;
+event/promotion ordering tests retain an actual resource event and reserve one terminal check only.
+Finite receipt tests reject every missing close/owner proof and live routing/payload edge. The native
+accounting probe includes cancellation of one association key while preserving another observer;
+its cancelled counter cannot become deallocation authority. These additions do not authorize a
+sleep, retry timer, private pool operation, forced release or cancel-and-reissue termination.
+
+
+The SDK2 source revision is `3e17eaf4bf7def814c3e3bdd08155f6ca330be3b`, resolved from the canonical
+Git repository with one package identity and no local override. On 2026-10-15, scoped-source checks
+passed the plugin's 20 default / 31 all-feature pure library tests, default/all-feature all-target
+Clippy with warnings denied, warning-denied rustdoc and formatting. Portable Linux library checks
+include all features; portable library/test checks enable the trace feature without the macOS-only
+native harness. The unchanged core suite passed 138 tests; six explicit manual profiles were not
+run. No new native GUI, terminal process-exit or physical-input observation is claimed here.
+
+A subsequent local-source SDK 2 ordinary-close run used the canonical plugin workspace with
+`cargo +1.99.0 test -p omni-md-plugin --test native_textkit --features native-markdown-runtime-probe --release --locked --offline`.
+It passed the shared TextKit driver, including cancellation of one association key without
+altering the independent observer, unmounted canonical/storage release, and the complete ordinary
+weak graph check. Canonical ownership ended synchronously; observed complete native release was
+510,008 microseconds and editor release was 501,314 microseconds. This was synthetic programmatic
+input with the latest known desktop locked, not a physical keyboard, system IME, application Quit,
+visible-frame or performance acceptance result. The scoped terminal path still requires the Host
+production-loop integration tests.
+
+The subsequent Host production-loop release test exercised this scoped source through both
+an app-local Command-Q menu event and the programmatic termination entry. Both dirty-Markdown
+children passed: exact saved bytes, scope-specific native resource receipt, reply ordering and
+actual process exit were verified. The assembly used public SDK 2 Git and the local plugin source;
+this is pre-publication integration evidence, not an immutable Host/plugin Git-pin rerun.
+The same four-case run failed both Launcher children at the single 20-second watchdog. Those
+failures remain preserved and the overall Host termination gate remains open. This component
+result does not establish complete product, physical input, visible-frame or performance acceptance.

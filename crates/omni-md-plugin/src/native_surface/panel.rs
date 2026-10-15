@@ -1,11 +1,16 @@
 //! Owns the plugin panel and physical keyboard/responder routing.
 //! A delayed key action carries weak panel identity and cannot close a later foreground session.
+//! NativeMarkdownPanel adds no Rust ivars or payload owner: its overrides are static routing methods.
+//! Terminal scope may accept this custom subclass only after all project associations/callbacks
+//! are removed and its closed, detached framework shell is independently verified.
 
 use super::*;
 
 define_class!(
     // SAFETY: NSPanel permits these keyboard-window overrides. All responder access is
     // main-thread-only and close intents return asynchronously to the same lifecycle state machine.
+    // This custom subclass has no Rust ivars or retained project payload; terminal shell proof still
+    // requires removal of its operation association and every delegate/content/responder edge.
     #[unsafe(super = NSPanel)]
     #[thread_kind = MainThreadOnly]
     pub(super) struct NativeMarkdownPanel;

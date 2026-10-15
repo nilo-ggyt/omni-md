@@ -50,7 +50,9 @@ use omni_markdown_core::{
     MarkdownTableAlignment, MarkdownTablePrototype, MarkdownTextSelection,
     MarkdownViewportPresentation, MarkdownViewportSemanticStatus, MarkdownWorkspaceSnapshot,
 };
-use omni_plugin_sdk::{OmniBarHostContext, PluginHostLifecycle, PluginNativeView};
+use omni_plugin_sdk::{
+    OmniBarHostContext, PluginCloseRequest, PluginCloseScope, PluginHostLifecycle, PluginNativeView,
+};
 use thiserror::Error;
 
 mod text_attributes;

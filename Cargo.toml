@@ -10,7 +10,7 @@ authors = ["nilo vance"]
 repository = "https://github.com/nilo-ggyt/omni-md"
 
 [workspace.dependencies]
-omni-plugin-sdk = { git = "https://github.com/nilo-ggyt/omni-plugin-sdk.git", rev = "f050d61ca88f5878c29b27fad74dca71eb2ca454", version = "=1.0.0" }
+omni-plugin-sdk = { git = "https://github.com/nilo-ggyt/omni-plugin-sdk.git", rev = "3e17eaf4bf7def814c3e3bdd08155f6ca330be3b", version = "=2.0.0" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
