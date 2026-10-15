@@ -1,0 +1,194 @@
+{
+  "schema": 1,
+  "provenance": {
+    "generator": "scripts/generate-word-count-reference.mjs",
+    "baseline_file": "src/features/markdown-editor/ui/MarkdownEditor.tsx",
+    "baseline_method_sha256": "ba1eda325cca4a9fef7c96c376b993e0ebc5163aad6fa069055732553954dbfd",
+    "node": "24.21.0",
+    "codemirror_state": "6.7.1",
+    "unicode": "17.0",
+    "regexp": "/[\\p{L}\\p{N}]+/gu",
+    "category": "General_Category=Letter|Number",
+    "encoding": "membership bits LSB-first by code point; join counts unsigned 32-bit little-endian"
+  },
+  "classifier": {
+    "code_points": 1114112,
+    "scalar_values": 1112064,
+    "member_count": 147596,
+    "sha256": "88c8c0f10eb6852d4c214ad9e26bd74849071c73bb27f3e67b1ad2ce26ff692d"
+  },
+  "boundaries": {
+    "fragments": [
+      "",
+      "A",
+      "7",
+      "中文",
+      "-",
+      "_",
+      "'",
+      "é",
+      "ͅ",
+      "ְ",
+      "ः",
+      "‍",
+      "😀",
+      "Ⅷ",
+      "½",
+      "𑶰",
+      "𖺠",
+      "𞛀",
+      "\r",
+      "\n",
+      "\r\n",
+      " "
+    ],
+    "case_count": 11132,
+    "sha256": "740448a4cc072e133d29f09a9e1ef45c13b80d51c8dd0f186dae3b89ee8b8590"
+  },
+  "cases": [
+    {
+      "text": "",
+      "expected": 0
+    },
+    {
+      "text": " \t\r\n",
+      "expected": 0
+    },
+    {
+      "text": "---_.'!?",
+      "expected": 0
+    },
+    {
+      "text": "😀👨‍👩‍👧‍👦",
+      "expected": 0
+    },
+    {
+      "text": "alpha-beta",
+      "expected": 2
+    },
+    {
+      "text": "can't",
+      "expected": 2
+    },
+    {
+      "text": "snake_case",
+      "expected": 2
+    },
+    {
+      "text": "é",
+      "expected": 1
+    },
+    {
+      "text": "éclair",
+      "expected": 2
+    },
+    {
+      "text": "éclair",
+      "expected": 1
+    },
+    {
+      "text": "ͅ",
+      "expected": 0
+    },
+    {
+      "text": "aͅb",
+      "expected": 2
+    },
+    {
+      "text": "ְ",
+      "expected": 0
+    },
+    {
+      "text": "ः",
+      "expected": 0
+    },
+    {
+      "text": "aःb",
+      "expected": 2
+    },
+    {
+      "text": "⃝",
+      "expected": 0
+    },
+    {
+      "text": "Ⅷ½",
+      "expected": 1
+    },
+    {
+      "text": "中文",
+      "expected": 1
+    },
+    {
+      "text": "中文😀中文",
+      "expected": 2
+    },
+    {
+      "text": "中文123Latin",
+      "expected": 1
+    },
+    {
+      "text": "a\u0000b",
+      "expected": 2
+    },
+    {
+      "text": "a‍b",
+      "expected": 2
+    },
+    {
+      "text": "a­b",
+      "expected": 2
+    },
+    {
+      "text": "a﻿b",
+      "expected": 2
+    },
+    {
+      "text": "a b",
+      "expected": 2
+    },
+    {
+      "text": "a b",
+      "expected": 2
+    },
+    {
+      "text": "one\rtwo\nthree\r\nfour",
+      "expected": 4
+    },
+    {
+      "text": "𐐀𐐨",
+      "expected": 1
+    },
+    {
+      "text": "1️⃣2",
+      "expected": 2
+    },
+    {
+      "text": "",
+      "expected": 0
+    },
+    {
+      "text": "͸",
+      "expected": 0
+    },
+    {
+      "text": "𑶰",
+      "expected": 1
+    },
+    {
+      "text": "𖺠",
+      "expected": 1
+    },
+    {
+      "text": "𞛀",
+      "expected": 1
+    },
+    {
+      "text": "A𑶰9",
+      "expected": 1
+    },
+    {
+      "text": "--𑶰😀𖺠--",
+      "expected": 2
+    }
+  ]
+}

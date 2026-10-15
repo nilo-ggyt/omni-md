@@ -1,0 +1,1914 @@
+[
+  {
+    "source": "# H\nbody\n\n## Sub\nsub\n\n# Next\nx",
+    "line": 0,
+    "expected": [
+      3,
+      20
+    ]
+  },
+  {
+    "source": "# H\nbody\n\n## Sub\nsub\n\n# Next\nx",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "# H\nbody\n\n## Sub\nsub\n\n# Next\nx",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "# H\nbody\n\n## Sub\nsub\n\n# Next\nx",
+    "line": 3,
+    "expected": [
+      16,
+      20
+    ]
+  },
+  {
+    "source": "# H\nbody\n\n## Sub\nsub\n\n# Next\nx",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "# H\nbody\n\n## Sub\nsub\n\n# Next\nx",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "# H\nbody\n\n## Sub\nsub\n\n# Next\nx",
+    "line": 6,
+    "expected": [
+      28,
+      30
+    ]
+  },
+  {
+    "source": "# H\nbody\n\n## Sub\nsub\n\n# Next\nx",
+    "line": 7,
+    "expected": null
+  },
+  {
+    "source": "# H\r\nbody\r\n\r\n## Sub\r\nsub\r\n\r\n# Next\r\nx",
+    "line": 0,
+    "expected": [
+      3,
+      24
+    ]
+  },
+  {
+    "source": "# H\r\nbody\r\n\r\n## Sub\r\nsub\r\n\r\n# Next\r\nx",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "# H\r\nbody\r\n\r\n## Sub\r\nsub\r\n\r\n# Next\r\nx",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "# H\r\nbody\r\n\r\n## Sub\r\nsub\r\n\r\n# Next\r\nx",
+    "line": 3,
+    "expected": [
+      19,
+      24
+    ]
+  },
+  {
+    "source": "# H\r\nbody\r\n\r\n## Sub\r\nsub\r\n\r\n# Next\r\nx",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "# H\r\nbody\r\n\r\n## Sub\r\nsub\r\n\r\n# Next\r\nx",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "# H\r\nbody\r\n\r\n## Sub\r\nsub\r\n\r\n# Next\r\nx",
+    "line": 6,
+    "expected": [
+      34,
+      37
+    ]
+  },
+  {
+    "source": "# H\r\nbody\r\n\r\n## Sub\r\nsub\r\n\r\n# Next\r\nx",
+    "line": 7,
+    "expected": null
+  },
+  {
+    "source": "para\ncontinued\n\nnext",
+    "line": 0,
+    "expected": [
+      4,
+      14
+    ]
+  },
+  {
+    "source": "para\ncontinued\n\nnext",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "para\ncontinued\n\nnext",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "para\ncontinued\n\nnext",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "para\r\ncontinued\r\n\r\nnext",
+    "line": 0,
+    "expected": [
+      4,
+      15
+    ]
+  },
+  {
+    "source": "para\r\ncontinued\r\n\r\nnext",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "para\r\ncontinued\r\n\r\nnext",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "para\r\ncontinued\r\n\r\nnext",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "- first\n  continued\n- second\n  end",
+    "line": 0,
+    "expected": [
+      7,
+      19
+    ]
+  },
+  {
+    "source": "- first\n  continued\n- second\n  end",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "- first\n  continued\n- second\n  end",
+    "line": 2,
+    "expected": [
+      28,
+      34
+    ]
+  },
+  {
+    "source": "- first\n  continued\n- second\n  end",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "- first\r\n  continued\r\n- second\r\n  end",
+    "line": 0,
+    "expected": [
+      7,
+      20
+    ]
+  },
+  {
+    "source": "- first\r\n  continued\r\n- second\r\n  end",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "- first\r\n  continued\r\n- second\r\n  end",
+    "line": 2,
+    "expected": [
+      30,
+      37
+    ]
+  },
+  {
+    "source": "- first\r\n  continued\r\n- second\r\n  end",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "> quote\n> next\n\npara",
+    "line": 0,
+    "expected": [
+      7,
+      14
+    ]
+  },
+  {
+    "source": "> quote\n> next\n\npara",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "> quote\n> next\n\npara",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "> quote\n> next\n\npara",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "> quote\r\n> next\r\n\r\npara",
+    "line": 0,
+    "expected": [
+      7,
+      15
+    ]
+  },
+  {
+    "source": "> quote\r\n> next\r\n\r\npara",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "> quote\r\n> next\r\n\r\npara",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "> quote\r\n> next\r\n\r\npara",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "```rust\nx\n```\n",
+    "line": 0,
+    "expected": [
+      7,
+      13
+    ]
+  },
+  {
+    "source": "```rust\nx\n```\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "```rust\nx\n```\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "```rust\nx\n```\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "```rust\r\nx\r\n```\r\n",
+    "line": 0,
+    "expected": [
+      7,
+      15
+    ]
+  },
+  {
+    "source": "```rust\r\nx\r\n```\r\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "```rust\r\nx\r\n```\r\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "```rust\r\nx\r\n```\r\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "Title\n=====\n\nbody\n\nnext\n",
+    "line": 0,
+    "expected": [
+      5,
+      23
+    ]
+  },
+  {
+    "source": "Title\n=====\n\nbody\n\nnext\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "Title\n=====\n\nbody\n\nnext\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "Title\n=====\n\nbody\n\nnext\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "Title\n=====\n\nbody\n\nnext\n",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "Title\n=====\n\nbody\n\nnext\n",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "Title\n=====\n\nbody\n\nnext\n",
+    "line": 6,
+    "expected": null
+  },
+  {
+    "source": "Title\r\n=====\r\n\r\nbody\r\n\r\nnext\r\n",
+    "line": 0,
+    "expected": [
+      5,
+      28
+    ]
+  },
+  {
+    "source": "Title\r\n=====\r\n\r\nbody\r\n\r\nnext\r\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "Title\r\n=====\r\n\r\nbody\r\n\r\nnext\r\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "Title\r\n=====\r\n\r\nbody\r\n\r\nnext\r\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "Title\r\n=====\r\n\r\nbody\r\n\r\nnext\r\n",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "Title\r\n=====\r\n\r\nbody\r\n\r\nnext\r\n",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "Title\r\n=====\r\n\r\nbody\r\n\r\nnext\r\n",
+    "line": 6,
+    "expected": null
+  },
+  {
+    "source": "|a|b|\n|---|---|\n|c|d|\n",
+    "line": 0,
+    "expected": [
+      5,
+      21
+    ]
+  },
+  {
+    "source": "|a|b|\n|---|---|\n|c|d|\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "|a|b|\n|---|---|\n|c|d|\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "|a|b|\n|---|---|\n|c|d|\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "|a|b|\r\n|---|---|\r\n|c|d|\r\n",
+    "line": 0,
+    "expected": [
+      5,
+      23
+    ]
+  },
+  {
+    "source": "|a|b|\r\n|---|---|\r\n|c|d|\r\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "|a|b|\r\n|---|---|\r\n|c|d|\r\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "|a|b|\r\n|---|---|\r\n|c|d|\r\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "    a\n    b\n\nx",
+    "line": 0,
+    "expected": [
+      5,
+      11
+    ]
+  },
+  {
+    "source": "    a\n    b\n\nx",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "    a\n    b\n\nx",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "    a\n    b\n\nx",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "    a\r\n    b\r\n\r\nx",
+    "line": 0,
+    "expected": [
+      5,
+      12
+    ]
+  },
+  {
+    "source": "    a\r\n    b\r\n\r\nx",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "    a\r\n    b\r\n\r\nx",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "    a\r\n    b\r\n\r\nx",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "<div>\nhi\n</div>\n",
+    "line": 0,
+    "expected": [
+      5,
+      15
+    ]
+  },
+  {
+    "source": "<div>\nhi\n</div>\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "<div>\nhi\n</div>\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "<div>\nhi\n</div>\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "<div>\r\nhi\r\n</div>\r\n",
+    "line": 0,
+    "expected": [
+      5,
+      17
+    ]
+  },
+  {
+    "source": "<div>\r\nhi\r\n</div>\r\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "<div>\r\nhi\r\n</div>\r\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "<div>\r\nhi\r\n</div>\r\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "~~~\n# not heading\n\n~~~\n\n# yes\nbody",
+    "line": 0,
+    "expected": [
+      3,
+      22
+    ]
+  },
+  {
+    "source": "~~~\n# not heading\n\n~~~\n\n# yes\nbody",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "~~~\n# not heading\n\n~~~\n\n# yes\nbody",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "~~~\n# not heading\n\n~~~\n\n# yes\nbody",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "~~~\n# not heading\n\n~~~\n\n# yes\nbody",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "~~~\n# not heading\n\n~~~\n\n# yes\nbody",
+    "line": 5,
+    "expected": [
+      29,
+      34
+    ]
+  },
+  {
+    "source": "~~~\n# not heading\n\n~~~\n\n# yes\nbody",
+    "line": 6,
+    "expected": null
+  },
+  {
+    "source": "~~~\r\n# not heading\r\n\r\n~~~\r\n\r\n# yes\r\nbody",
+    "line": 0,
+    "expected": [
+      3,
+      25
+    ]
+  },
+  {
+    "source": "~~~\r\n# not heading\r\n\r\n~~~\r\n\r\n# yes\r\nbody",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "~~~\r\n# not heading\r\n\r\n~~~\r\n\r\n# yes\r\nbody",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "~~~\r\n# not heading\r\n\r\n~~~\r\n\r\n# yes\r\nbody",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "~~~\r\n# not heading\r\n\r\n~~~\r\n\r\n# yes\r\nbody",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "~~~\r\n# not heading\r\n\r\n~~~\r\n\r\n# yes\r\nbody",
+    "line": 5,
+    "expected": [
+      34,
+      40
+    ]
+  },
+  {
+    "source": "~~~\r\n# not heading\r\n\r\n~~~\r\n\r\n# yes\r\nbody",
+    "line": 6,
+    "expected": null
+  },
+  {
+    "source": "### 😀\n中文\n\n#### Child\né\n\n## End\nx",
+    "line": 0,
+    "expected": [
+      6,
+      23
+    ]
+  },
+  {
+    "source": "### 😀\n中文\n\n#### Child\né\n\n## End\nx",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "### 😀\n中文\n\n#### Child\né\n\n## End\nx",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "### 😀\n中文\n\n#### Child\né\n\n## End\nx",
+    "line": 3,
+    "expected": [
+      21,
+      23
+    ]
+  },
+  {
+    "source": "### 😀\n中文\n\n#### Child\né\n\n## End\nx",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "### 😀\n中文\n\n#### Child\né\n\n## End\nx",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "### 😀\n中文\n\n#### Child\né\n\n## End\nx",
+    "line": 6,
+    "expected": [
+      31,
+      33
+    ]
+  },
+  {
+    "source": "### 😀\n中文\n\n#### Child\né\n\n## End\nx",
+    "line": 7,
+    "expected": null
+  },
+  {
+    "source": "### 😀\r\n中文\r\n\r\n#### Child\r\né\r\n\r\n## End\r\nx",
+    "line": 0,
+    "expected": [
+      6,
+      27
+    ]
+  },
+  {
+    "source": "### 😀\r\n中文\r\n\r\n#### Child\r\né\r\n\r\n## End\r\nx",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "### 😀\r\n中文\r\n\r\n#### Child\r\né\r\n\r\n## End\r\nx",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "### 😀\r\n中文\r\n\r\n#### Child\r\né\r\n\r\n## End\r\nx",
+    "line": 3,
+    "expected": [
+      24,
+      27
+    ]
+  },
+  {
+    "source": "### 😀\r\n中文\r\n\r\n#### Child\r\né\r\n\r\n## End\r\nx",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "### 😀\r\n中文\r\n\r\n#### Child\r\né\r\n\r\n## End\r\nx",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "### 😀\r\n中文\r\n\r\n#### Child\r\né\r\n\r\n## End\r\nx",
+    "line": 6,
+    "expected": [
+      37,
+      40
+    ]
+  },
+  {
+    "source": "### 😀\r\n中文\r\n\r\n#### Child\r\né\r\n\r\n## End\r\nx",
+    "line": 7,
+    "expected": null
+  },
+  {
+    "source": "one\n---\n\nbody\n\nend",
+    "line": 0,
+    "expected": [
+      3,
+      18
+    ]
+  },
+  {
+    "source": "one\n---\n\nbody\n\nend",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "one\n---\n\nbody\n\nend",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "one\n---\n\nbody\n\nend",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "one\n---\n\nbody\n\nend",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "one\n---\n\nbody\n\nend",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "one\r\n---\r\n\r\nbody\r\n\r\nend",
+    "line": 0,
+    "expected": [
+      3,
+      23
+    ]
+  },
+  {
+    "source": "one\r\n---\r\n\r\nbody\r\n\r\nend",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "one\r\n---\r\n\r\nbody\r\n\r\nend",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "one\r\n---\r\n\r\nbody\r\n\r\nend",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "one\r\n---\r\n\r\nbody\r\n\r\nend",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "one\r\n---\r\n\r\nbody\r\n\r\nend",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "- a\n  - b\n    c\n  - d\n    e\n- f",
+    "line": 0,
+    "expected": [
+      3,
+      27
+    ]
+  },
+  {
+    "source": "- a\n  - b\n    c\n  - d\n    e\n- f",
+    "line": 1,
+    "expected": [
+      9,
+      15
+    ]
+  },
+  {
+    "source": "- a\n  - b\n    c\n  - d\n    e\n- f",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "- a\n  - b\n    c\n  - d\n    e\n- f",
+    "line": 3,
+    "expected": [
+      21,
+      27
+    ]
+  },
+  {
+    "source": "- a\n  - b\n    c\n  - d\n    e\n- f",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "- a\n  - b\n    c\n  - d\n    e\n- f",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "- a\r\n  - b\r\n    c\r\n  - d\r\n    e\r\n- f",
+    "line": 0,
+    "expected": [
+      3,
+      31
+    ]
+  },
+  {
+    "source": "- a\r\n  - b\r\n    c\r\n  - d\r\n    e\r\n- f",
+    "line": 1,
+    "expected": [
+      10,
+      17
+    ]
+  },
+  {
+    "source": "- a\r\n  - b\r\n    c\r\n  - d\r\n    e\r\n- f",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "- a\r\n  - b\r\n    c\r\n  - d\r\n    e\r\n- f",
+    "line": 3,
+    "expected": [
+      24,
+      31
+    ]
+  },
+  {
+    "source": "- a\r\n  - b\r\n    c\r\n  - d\r\n    e\r\n- f",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "- a\r\n  - b\r\n    c\r\n  - d\r\n    e\r\n- f",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "paragraph\n  continued\nlast\n",
+    "line": 0,
+    "expected": [
+      9,
+      26
+    ]
+  },
+  {
+    "source": "paragraph\n  continued\nlast\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "paragraph\n  continued\nlast\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "paragraph\n  continued\nlast\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "paragraph\r\n  continued\r\nlast\r\n",
+    "line": 0,
+    "expected": [
+      9,
+      28
+    ]
+  },
+  {
+    "source": "paragraph\r\n  continued\r\nlast\r\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "paragraph\r\n  continued\r\nlast\r\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "paragraph\r\n  continued\r\nlast\r\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "> a\nlazy\n> b\n\nend",
+    "line": 0,
+    "expected": [
+      3,
+      12
+    ]
+  },
+  {
+    "source": "> a\nlazy\n> b\n\nend",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "> a\nlazy\n> b\n\nend",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "> a\nlazy\n> b\n\nend",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "> a\nlazy\n> b\n\nend",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "> a\r\nlazy\r\n> b\r\n\r\nend",
+    "line": 0,
+    "expected": [
+      3,
+      14
+    ]
+  },
+  {
+    "source": "> a\r\nlazy\r\n> b\r\n\r\nend",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "> a\r\nlazy\r\n> b\r\n\r\nend",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "> a\r\nlazy\r\n> b\r\n\r\nend",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "> a\r\nlazy\r\n> b\r\n\r\nend",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "1. first\n   second\n2. next\n   tail",
+    "line": 0,
+    "expected": [
+      8,
+      18
+    ]
+  },
+  {
+    "source": "1. first\n   second\n2. next\n   tail",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "1. first\n   second\n2. next\n   tail",
+    "line": 2,
+    "expected": [
+      26,
+      34
+    ]
+  },
+  {
+    "source": "1. first\n   second\n2. next\n   tail",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "1. first\r\n   second\r\n2. next\r\n   tail",
+    "line": 0,
+    "expected": [
+      8,
+      19
+    ]
+  },
+  {
+    "source": "1. first\r\n   second\r\n2. next\r\n   tail",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "1. first\r\n   second\r\n2. next\r\n   tail",
+    "line": 2,
+    "expected": [
+      28,
+      37
+    ]
+  },
+  {
+    "source": "1. first\r\n   second\r\n2. next\r\n   tail",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "```\nx\n",
+    "line": 0,
+    "expected": [
+      3,
+      6
+    ]
+  },
+  {
+    "source": "```\nx\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "```\nx\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "```\r\nx\r\n",
+    "line": 0,
+    "expected": [
+      3,
+      8
+    ]
+  },
+  {
+    "source": "```\r\nx\r\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "```\r\nx\r\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "text\n\n",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "text\n\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "text\n\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "text\r\n\r\n",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "text\r\n\r\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "text\r\n\r\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "text\n",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "text\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "text\r\n",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "text\r\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "## only\n",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "## only\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "## only\r\n",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "## only\r\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "## only\n\n",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "## only\n\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "## only\n\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "## only\r\n\r\n",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "## only\r\n\r\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "## only\r\n\r\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "## A\n\n## B\n",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "## A\n\n## B\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "## A\n\n## B\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "## A\n\n## B\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "## A\r\n\r\n## B\r\n",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "## A\r\n\r\n## B\r\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "## A\r\n\r\n## B\r\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "## A\r\n\r\n## B\r\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "## A\n\n### B\n\n",
+    "line": 0,
+    "expected": [
+      4,
+      11
+    ]
+  },
+  {
+    "source": "## A\n\n### B\n\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "## A\n\n### B\n\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "## A\n\n### B\n\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "## A\n\n### B\n\n",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "## A\r\n\r\n### B\r\n\r\n",
+    "line": 0,
+    "expected": [
+      4,
+      13
+    ]
+  },
+  {
+    "source": "## A\r\n\r\n### B\r\n\r\n",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "## A\r\n\r\n### B\r\n\r\n",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "## A\r\n\r\n### B\r\n\r\n",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "## A\r\n\r\n### B\r\n\r\n",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "text\n    indented continuation\nend",
+    "line": 0,
+    "expected": [
+      4,
+      34
+    ]
+  },
+  {
+    "source": "text\n    indented continuation\nend",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "text\n    indented continuation\nend",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "text\r\n    indented continuation\r\nend",
+    "line": 0,
+    "expected": [
+      4,
+      36
+    ]
+  },
+  {
+    "source": "text\r\n    indented continuation\r\nend",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "text\r\n    indented continuation\r\nend",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "    first\n\n    second\n\nend",
+    "line": 0,
+    "expected": [
+      9,
+      21
+    ]
+  },
+  {
+    "source": "    first\n\n    second\n\nend",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "    first\n\n    second\n\nend",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "    first\n\n    second\n\nend",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "    first\n\n    second\n\nend",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "    first\r\n\r\n    second\r\n\r\nend",
+    "line": 0,
+    "expected": [
+      9,
+      23
+    ]
+  },
+  {
+    "source": "    first\r\n\r\n    second\r\n\r\nend",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "    first\r\n\r\n    second\r\n\r\nend",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "    first\r\n\r\n    second\r\n\r\nend",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "    first\r\n\r\n    second\r\n\r\nend",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "```rust\n---\ninside\n```\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      7,
+      22
+    ]
+  },
+  {
+    "source": "- item\n---\noutside\nsecond",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "> # heading\noutside\nsecond",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "`````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````\nx\n````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      1025,
+      2067
+    ]
+  },
+  {
+    "source": "```bad`info\nbody\n```\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      11,
+      16
+    ]
+  },
+  {
+    "source": "<SCRIPT>\n# fake\n</SCRIPT>\n# Next\nbody",
+    "line": 0,
+    "expected": [
+      8,
+      25
+    ]
+  },
+  {
+    "source": "- # heading\noutside\nsecond",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "- ```\n  code\n  ```\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      5,
+      18
+    ]
+  },
+  {
+    "source": "> - item\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      8,
+      23
+    ]
+  },
+  {
+    "source": "- first\n\n  continued\n\nnext",
+    "line": 0,
+    "expected": [
+      7,
+      20
+    ]
+  },
+  {
+    "source": "paragraph\n***\noutside\nsecond",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "# H\n<script>\n# fake\n</script>\nbody\n# Next\nx",
+    "line": 0,
+    "expected": [
+      3,
+      34
+    ]
+  },
+  {
+    "source": "#\u000btitle\nbody\n\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      7,
+      12
+    ]
+  },
+  {
+    "source": "#\ftitle\nbody\n\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      7,
+      12
+    ]
+  },
+  {
+    "source": "-\u000bitem\n  continued\n# Next\nbody",
+    "line": 0,
+    "expected": [
+      6,
+      18
+    ]
+  },
+  {
+    "source": "1.\fitem\n  continued\n# Next\nbody",
+    "line": 0,
+    "expected": [
+      7,
+      19
+    ]
+  },
+  {
+    "source": "Title\n--- \n\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      5,
+      10
+    ]
+  },
+  {
+    "source": "Title\n=== \n\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      5,
+      10
+    ]
+  },
+  {
+    "source": "<divorce>\nbody\n# Next\nsection",
+    "line": 0,
+    "expected": [
+      9,
+      29
+    ]
+  },
+  {
+    "source": "<divorce\nbody\n# Next\nsection",
+    "line": 0,
+    "expected": [
+      8,
+      13
+    ]
+  },
+  {
+    "source": "<div\nbody\n# Next\nsection",
+    "line": 0,
+    "expected": [
+      4,
+      24
+    ]
+  },
+  {
+    "source": "<diver text\nbody\n# Next\nsection",
+    "line": 0,
+    "expected": [
+      11,
+      16
+    ]
+  },
+  {
+    "source": "-\titem\n  continued\n# Next\nbody",
+    "line": 0,
+    "expected": [
+      6,
+      18
+    ]
+  },
+  {
+    "source": "#\ttitle\nbody\n\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      7,
+      12
+    ]
+  },
+  {
+    "source": "    - code\noutside\nsecond",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "    - code\noutside\nsecond",
+    "line": 1,
+    "expected": [
+      18,
+      25
+    ]
+  },
+  {
+    "source": "    - code\noutside\nsecond",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "- item\n  # Heading\n  body\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      6,
+      40
+    ]
+  },
+  {
+    "source": "- item\n  # Heading\n  body\noutside\nsecond",
+    "line": 1,
+    "expected": [
+      18,
+      40
+    ]
+  },
+  {
+    "source": "- item\n  # Heading\n  body\noutside\nsecond",
+    "line": 2,
+    "expected": [
+      25,
+      40
+    ]
+  },
+  {
+    "source": "- item\n  # Heading\n  body\noutside\nsecond",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "- item\n  # Heading\n  body\noutside\nsecond",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "- item\n  <script>\n  # fake\n  </script>\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      6,
+      38
+    ]
+  },
+  {
+    "source": "- item\n  <script>\n  # fake\n  </script>\noutside\nsecond",
+    "line": 1,
+    "expected": [
+      17,
+      38
+    ]
+  },
+  {
+    "source": "- item\n  <script>\n  # fake\n  </script>\noutside\nsecond",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "- item\n  <script>\n  # fake\n  </script>\noutside\nsecond",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "- item\n  <script>\n  # fake\n  </script>\noutside\nsecond",
+    "line": 4,
+    "expected": [
+      46,
+      53
+    ]
+  },
+  {
+    "source": "- item\n  <script>\n  # fake\n  </script>\noutside\nsecond",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "> <script>\n> # fake\n> </script>\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      10,
+      31
+    ]
+  },
+  {
+    "source": "> <script>\n> # fake\n> </script>\noutside\nsecond",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "> <script>\n> # fake\n> </script>\noutside\nsecond",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "> <script>\n> # fake\n> </script>\noutside\nsecond",
+    "line": 3,
+    "expected": [
+      39,
+      46
+    ]
+  },
+  {
+    "source": "> <script>\n> # fake\n> </script>\noutside\nsecond",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "# H\n- item\n  # fake\n  body\n# Next\nsecond",
+    "line": 0,
+    "expected": [
+      3,
+      26
+    ]
+  },
+  {
+    "source": "# H\n- item\n  # fake\n  body\n# Next\nsecond",
+    "line": 1,
+    "expected": [
+      10,
+      26
+    ]
+  },
+  {
+    "source": "# H\n- item\n  # fake\n  body\n# Next\nsecond",
+    "line": 2,
+    "expected": [
+      19,
+      26
+    ]
+  },
+  {
+    "source": "# H\n- item\n  # fake\n  body\n# Next\nsecond",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "# H\n- item\n  # fake\n  body\n# Next\nsecond",
+    "line": 4,
+    "expected": [
+      33,
+      40
+    ]
+  },
+  {
+    "source": "# H\n- item\n  # fake\n  body\n# Next\nsecond",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "# H\nparagraph\ncontinued\n---\nnew section\nbody",
+    "line": 0,
+    "expected": [
+      3,
+      44
+    ]
+  },
+  {
+    "source": "# H\nparagraph\ncontinued\n---\nnew section\nbody",
+    "line": 1,
+    "expected": [
+      13,
+      44
+    ]
+  },
+  {
+    "source": "# H\nparagraph\ncontinued\n---\nnew section\nbody",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "# H\nparagraph\ncontinued\n---\nnew section\nbody",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "# H\nparagraph\ncontinued\n---\nnew section\nbody",
+    "line": 4,
+    "expected": [
+      39,
+      44
+    ]
+  },
+  {
+    "source": "# H\nparagraph\ncontinued\n---\nnew section\nbody",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "paragraph\ncontinued\n---\nbody\nsecond",
+    "line": 0,
+    "expected": [
+      9,
+      35
+    ]
+  },
+  {
+    "source": "paragraph\ncontinued\n---\nbody\nsecond",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "paragraph\ncontinued\n---\nbody\nsecond",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "paragraph\ncontinued\n---\nbody\nsecond",
+    "line": 3,
+    "expected": [
+      28,
+      35
+    ]
+  },
+  {
+    "source": "paragraph\ncontinued\n---\nbody\nsecond",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "    code\n    # fake\noutside\nsecond",
+    "line": 0,
+    "expected": [
+      8,
+      19
+    ]
+  },
+  {
+    "source": "    code\n    # fake\noutside\nsecond",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "    code\n    # fake\noutside\nsecond",
+    "line": 2,
+    "expected": [
+      27,
+      34
+    ]
+  },
+  {
+    "source": "    code\n    # fake\noutside\nsecond",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "<!--\n\n# fake\n-->\n# Next\nbody",
+    "line": 0,
+    "expected": [
+      4,
+      16
+    ]
+  },
+  {
+    "source": "<!--\n\n# fake\n-->\n# Next\nbody",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "<!--\n\n# fake\n-->\n# Next\nbody",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "<!--\n\n# fake\n-->\n# Next\nbody",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "<!--\n\n# fake\n-->\n# Next\nbody",
+    "line": 4,
+    "expected": [
+      23,
+      28
+    ]
+  },
+  {
+    "source": "<!--\n\n# fake\n-->\n# Next\nbody",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "<script / >\n# fake\n</script>\n# Next\nbody",
+    "line": 0,
+    "expected": [
+      11,
+      28
+    ]
+  },
+  {
+    "source": "<script / >\n# fake\n</script>\n# Next\nbody",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "<script / >\n# fake\n</script>\n# Next\nbody",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "<script / >\n# fake\n</script>\n# Next\nbody",
+    "line": 3,
+    "expected": [
+      35,
+      40
+    ]
+  },
+  {
+    "source": "<script / >\n# fake\n</script>\n# Next\nbody",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "# H\nTitle\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\nbody\n# Next\nsecond",
+    "line": 0,
+    "expected": [
+      3,
+      2064
+    ]
+  },
+  {
+    "source": "# H\nTitle\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\nbody\n# Next\nsecond",
+    "line": 1,
+    "expected": [
+      9,
+      2064
+    ]
+  },
+  {
+    "source": "# H\nTitle\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\nbody\n# Next\nsecond",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "# H\nTitle\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\nbody\n# Next\nsecond",
+    "line": 3,
+    "expected": null
+  },
+  {
+    "source": "# H\nTitle\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\nbody\n# Next\nsecond",
+    "line": 4,
+    "expected": [
+      2071,
+      2078
+    ]
+  },
+  {
+    "source": "# H\nTitle\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\nbody\n# Next\nsecond",
+    "line": 5,
+    "expected": null
+  },
+  {
+    "source": "## H\nTitle\n=================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================\nbody\nsecond",
+    "line": 0,
+    "expected": null
+  },
+  {
+    "source": "## H\nTitle\n=================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================\nbody\nsecond",
+    "line": 1,
+    "expected": [
+      10,
+      2072
+    ]
+  },
+  {
+    "source": "## H\nTitle\n=================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================\nbody\nsecond",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "## H\nTitle\n=================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================\nbody\nsecond",
+    "line": 3,
+    "expected": [
+      2065,
+      2072
+    ]
+  },
+  {
+    "source": "## H\nTitle\n=================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================================\nbody\nsecond",
+    "line": 4,
+    "expected": null
+  },
+  {
+    "source": "Title\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------x\n\nparagraph\nsecond",
+    "line": 0,
+    "expected": [
+      5,
+      2056
+    ]
+  },
+  {
+    "source": "Title\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------x\n\nparagraph\nsecond",
+    "line": 1,
+    "expected": null
+  },
+  {
+    "source": "Title\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------x\n\nparagraph\nsecond",
+    "line": 2,
+    "expected": null
+  },
+  {
+    "source": "Title\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------x\n\nparagraph\nsecond",
+    "line": 3,
+    "expected": [
+      2067,
+      2074
+    ]
+  },
+  {
+    "source": "Title\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------x\n\nparagraph\nsecond",
+    "line": 4,
+    "expected": null
+  }
+]

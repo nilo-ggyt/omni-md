@@ -1,0 +1,31 @@
+[package]
+name = "omni-markdown-core"
+version = "0.1.0"
+description = "Piece-tree Markdown document and confined workspace core"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = []
+native-markdown-candidate = ["dep:pulldown-cmark", "dep:unicode-properties"]
+
+[dependencies]
+libc = "=0.2.189"
+memmap2 = "=0.9.11"
+pulldown-cmark = { version = "=0.13.4", default-features = false, optional = true }
+serde = { version = "=1.0.229", features = ["derive"] }
+sha2 = "=0.10.9"
+thiserror = "=2.0.20"
+unicode-properties = { version = "=0.1.4", default-features = false, features = ["general-category"], optional = true }
+
+tempfile = "=3.27.0"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json = "=1.0.151"
