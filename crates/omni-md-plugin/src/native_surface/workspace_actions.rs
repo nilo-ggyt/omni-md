@@ -790,6 +790,8 @@ pub(super) fn copy_active_markdown_document_to_general_pasteboard() -> Result<()
     MainThreadMarker::new()
         .ok_or_else(|| "Markdown 全文复制必须在 AppKit 主线程执行".to_owned())?;
     if CLOSING_NATIVE_MARKDOWN_SURFACE.with_borrow(|surface| surface.is_some()) {
+        // Accepted closing has already consumed foreground copy authority; do not replace the
+        // system pasteboard from a delayed action while the old document is being released.
         return Err("原生 Markdown 窗口正在关闭".to_owned());
     }
 

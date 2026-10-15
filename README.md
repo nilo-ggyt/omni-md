@@ -52,3 +52,8 @@ The piece tree is the only canonical mutable text model. AppKit receives a virtu
 Formal acceptance is scoped to Apple M5 Max, 36 GiB, arm64, macOS 27.0.1. macOS 14 and M1/8 GiB runtime validation remain untested until actually performed. Successful compilation or core tests do not establish VoiceOver/IME behavior, native object release, full-product performance parity or the host baseline-retirement gate. Recorded observations belong in maintained validation reports and must distinguish executed, failed and unexecuted checks.
 
 Project-owned code is licensed under [MIT](LICENSE), copyright nilo vance. Third-party dependencies retain their own licenses; see [third-party notices](docs/third-party-notices.md).
+
+Optional actual-input instrumentation is isolated behind the nondefault `native-input-trace` feature.
+Its explicit arm/drain API stores bounded scalar callback/canonical evidence without output or
+observers; it does not certify semantic paint or real IME performance by itself. See
+[input trace contracts and limits](docs/input-trace.md).

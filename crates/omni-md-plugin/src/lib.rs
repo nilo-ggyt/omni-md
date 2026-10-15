@@ -8,6 +8,17 @@ mod close_policy;
 #[cfg(any(target_os = "macos", test))]
 mod foreground_owner;
 
+#[cfg(feature = "native-input-trace")]
+mod native_input_trace;
+#[cfg(feature = "native-input-trace")]
+pub use native_input_trace::{
+    NATIVE_INPUT_TRACE_CAPACITY, NativeInputTraceAccessError, NativeInputTraceDocument,
+    NativeInputTraceKind, NativeInputTraceOutcome, NativeInputTraceRecord,
+    NativeInputTraceRejection, NativeInputTraceSelector, NativeInputTraceSnapshot,
+};
+#[cfg(all(target_os = "macos", feature = "native-input-trace"))]
+pub use native_surface::{arm_native_markdown_input_trace, drain_native_markdown_input_trace};
+
 use omni_plugin_sdk::{
     OmniBarHostContext, PLUGIN_PROTOCOL_VERSION, PluginActivation, PluginCloseIntent,
     PluginCommandDescriptor, PluginDescriptor, PluginError, PluginInvocation, PluginNativeView,

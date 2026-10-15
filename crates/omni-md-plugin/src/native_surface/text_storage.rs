@@ -301,6 +301,9 @@ pub(super) fn native_markdown_table_cell_display_text_from_source(
 
 /// Weak document access plus editor-bounded derived attributes and synchronous input state.
 pub(super) struct PieceBackedTextStorageIvars {
+    // This scalar-only foreground recorder does not exist in the default class layout or binary.
+    #[cfg(feature = "native-input-trace")]
+    pub(super) input_trace: SharedNativeInputTrace,
     // AppKit may retain storage beyond the surface callback. The model owns text, and
     // this weak adapter link prevents delayed TextKit work from keeping that text alive.
     pub(super) document: WeakMarkdownDocument,
@@ -383,17 +386,35 @@ define_class!(
         fn replace_characters_in_range(&self, range: NSRange, replacement: &NSString) {
             if !self.ivars().accepts_edits.get() {
                 // After successful save/close preflight, delayed native input may not create an unsaved revision.
+                #[cfg(feature = "native-input-trace")]
+                self.record_input_trace_result(
+                    range.length,
+                    0,
+                    Some(NativeInputTraceRejection::Closing),
+                );
                 return;
             }
             // Reject arithmetic overflow before changing the canonical text or semantic selection.
             let Some(range_end) = range.location.checked_add(range.length) else {
                 // Foundation cannot receive a Rust Result here; invalid ranges preserve the current document.
+                #[cfg(feature = "native-input-trace")]
+                self.record_input_trace_result(
+                    range.length,
+                    0,
+                    Some(NativeInputTraceRejection::CoordinateOverflow),
+                );
                 return;
             };
             // Native selection coordinates count UTF-16 units, independently of the incoming UTF-8 byte length.
             let replacement_utf16_length = replacement.len_utf16();
             let Some(selection_offset) = range.location.checked_add(replacement_utf16_length) else {
                 // An unrepresentable caret would violate canonical selection bounds; reject the whole edit.
+                #[cfg(feature = "native-input-trace")]
+                self.record_input_trace_result(
+                    range.length,
+                    replacement_utf16_length,
+                    Some(NativeInputTraceRejection::CoordinateOverflow),
+                );
                 return;
             };
             // TextKit reports signed UTF-16 deltas, independently of the native unsigned range width.
@@ -401,11 +422,23 @@ define_class!(
                 .and_then(|inserted| isize::try_from(range.length).map(|removed| inserted - removed))
             else {
                 // A delta outside isize cannot be reported faithfully; leave text and history unchanged.
+                #[cfg(feature = "native-input-trace")]
+                self.record_input_trace_result(
+                    range.length,
+                    replacement_utf16_length,
+                    Some(NativeInputTraceRejection::CoordinateOverflow),
+                );
                 return;
             };
 
             let Some(document) = self.document() else {
                 // Delayed native edits after teardown cannot recreate a canonical document.
+                #[cfg(feature = "native-input-trace")]
+                self.record_input_trace_result(
+                    range.length,
+                    replacement_utf16_length,
+                    Some(NativeInputTraceRejection::DocumentUnavailable),
+                );
                 return;
             };
             // Group storage notifications, but release the Rust mutable borrow before reentrant native processing.
@@ -425,6 +458,15 @@ define_class!(
                     MarkdownTextSelection::caret(selection_offset),
                 )
             });
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(
+                range.length,
+                replacement_utf16_length,
+                edit_result.as_ref().err().map(|_| {
+                    // Retain only a fixed rejection category, never a formatted domain error or source payload.
+                    NativeInputTraceRejection::CanonicalError
+                }),
+            );
             if edit_result.is_ok() {
                 // Publish text/selection changes only after the canonical scalar-aligned edit committed.
                 self.ivars()
@@ -491,6 +533,8 @@ impl PieceBackedMarkdownTextStorage {
         };
         // Install all Rust ivars before superclass initialization can invoke virtual primitives.
         let storage = Self::alloc(mtm).set_ivars(PieceBackedTextStorageIvars {
+            #[cfg(feature = "native-input-trace")]
+            input_trace: Rc::new(RefCell::new(NativeInputTrace::default())),
             document: Rc::downgrade(&document),
             string,
             base_attributes,
@@ -550,26 +594,76 @@ impl PieceBackedMarkdownTextStorage {
     ) -> Result<MarkdownHistoryTextEdit, String> {
         if !self.ivars().accepts_edits.get() {
             // A delayed import cannot publish text after the accepted save/close boundary.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(
+                range.length,
+                0,
+                Some(NativeInputTraceRejection::Closing),
+            );
             return Err("The Markdown editor is closing".into());
         }
         // Validate native arithmetic before beginning an editing group or acquiring mutable text.
-        let range_end = range
-            .location
-            .checked_add(range.length)
-            .ok_or("The insertion range overflows UTF-16 coordinates")?;
+        let Some(range_end) = range.location.checked_add(range.length) else {
+            // Native coordinate failure must be visible even before a canonical transaction starts.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(
+                range.length,
+                0,
+                Some(NativeInputTraceRejection::CoordinateOverflow),
+            );
+            return Err("The insertion range overflows UTF-16 coordinates".into());
+        };
         let inserted = replacement.encode_utf16().count();
-        let caret = range
-            .location
-            .checked_add(inserted)
-            .ok_or("The insertion caret overflows UTF-16 coordinates")?;
-        let inserted_delta = isize::try_from(inserted)
-            .map_err(|_| "The insertion is too large for a native character notification")?;
-        let removed_delta = isize::try_from(range.length)
-            .map_err(|_| "The replaced range is too large for a native character notification")?;
-        let delta = inserted_delta
-            .checked_sub(removed_delta)
-            .ok_or("The insertion delta overflows native character coordinates")?;
-        let document = self.document().ok_or("The editor is closed")?;
+        let Some(caret) = range.location.checked_add(inserted) else {
+            // Native coordinate failure must be visible even before a canonical transaction starts.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(
+                range.length,
+                0,
+                Some(NativeInputTraceRejection::CoordinateOverflow),
+            );
+            return Err("The insertion caret overflows UTF-16 coordinates".into());
+        };
+        let inserted_delta = isize::try_from(inserted).map_err(|_| {
+            // Signed native notification limits reject this complete insertion without partial source mutation.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(
+                range.length,
+                inserted,
+                Some(NativeInputTraceRejection::CoordinateOverflow),
+            );
+            "The insertion is too large for a native character notification"
+        })?;
+        let removed_delta = isize::try_from(range.length).map_err(|_| {
+            // Signed native notification limits reject this complete insertion without partial source mutation.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(
+                range.length,
+                inserted,
+                Some(NativeInputTraceRejection::CoordinateOverflow),
+            );
+            "The replaced range is too large for a native character notification"
+        })?;
+        let Some(delta) = inserted_delta.checked_sub(removed_delta) else {
+            // Native coordinate failure must be visible even before a canonical transaction starts.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(
+                range.length,
+                0,
+                Some(NativeInputTraceRejection::CoordinateOverflow),
+            );
+            return Err("The insertion delta overflows native character coordinates".into());
+        };
+        let Some(document) = self.document() else {
+            // An absent canonical owner is a finite rejection, never a guessed no-op.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(
+                0,
+                0,
+                Some(NativeInputTraceRejection::DocumentUnavailable),
+            );
+            return Err("The editor is closed".into());
+        };
         let edit = MarkdownHistoryTextEdit {
             replaced_utf16_range: range.location..range_end,
             change_in_utf16_length: delta,
@@ -593,6 +687,12 @@ impl PieceBackedMarkdownTextStorage {
             }
             // Rejection balances the group and returns ownership to the pending attachment's rollback guard.
             Err(error) => {
+                #[cfg(feature = "native-input-trace")]
+                self.record_input_trace_result(
+                    range.length,
+                    inserted,
+                    Some(NativeInputTraceRejection::CanonicalError),
+                );
                 self.finish_canonical_edit(None);
                 Err(error.to_string())
             }
@@ -607,9 +707,20 @@ impl PieceBackedMarkdownTextStorage {
     ) -> Result<MarkdownHistoryTextEdit, String> {
         if !self.ivars().accepts_edits.get() {
             // A closing storage has no authority to create a format/keyboard revision after its last save.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(0, 0, Some(NativeInputTraceRejection::Closing));
             return Err("The Markdown editor is closing".into());
         }
-        let document = self.document().ok_or("The editor is closed")?;
+        let Some(document) = self.document() else {
+            // An absent canonical owner is a finite rejection, never a guessed no-op.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(
+                0,
+                0,
+                Some(NativeInputTraceRejection::DocumentUnavailable),
+            );
+            return Err("The editor is closed".into());
+        };
         self.beginEditing();
         let result = document.borrow_mut().apply_format(action, selection);
         match result {
@@ -620,6 +731,12 @@ impl PieceBackedMarkdownTextStorage {
             }
             // A rejected format preserves history/generation/source and still closes its native edit group.
             Err(error) => {
+                #[cfg(feature = "native-input-trace")]
+                self.record_input_trace_result(
+                    0,
+                    0,
+                    Some(NativeInputTraceRejection::CanonicalError),
+                );
                 self.finish_canonical_edit(None);
                 Err(error.to_string())
             }
@@ -634,9 +751,20 @@ impl PieceBackedMarkdownTextStorage {
     ) -> Result<MarkdownEditingOutcome, String> {
         if !self.ivars().accepts_edits.get() {
             // A closing storage has no authority to create a format/keyboard revision after its last save.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(0, 0, Some(NativeInputTraceRejection::Closing));
             return Err("The Markdown editor is closing".into());
         }
-        let document = self.document().ok_or("The editor is closed")?;
+        let Some(document) = self.document() else {
+            // An absent canonical owner is a finite rejection, never a guessed no-op.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(
+                0,
+                0,
+                Some(NativeInputTraceRejection::DocumentUnavailable),
+            );
+            return Err("The editor is closed".into());
+        };
         self.beginEditing();
         let result = document
             .borrow_mut()
@@ -654,6 +782,12 @@ impl PieceBackedMarkdownTextStorage {
             }
             // Capacity, scalar or context errors veto the native command without a partial edit.
             Err(error) => {
+                #[cfg(feature = "native-input-trace")]
+                self.record_input_trace_result(
+                    0,
+                    0,
+                    Some(NativeInputTraceRejection::CanonicalError),
+                );
                 self.finish_canonical_edit(None);
                 Err(error.to_string())
             }
@@ -667,9 +801,20 @@ impl PieceBackedMarkdownTextStorage {
     ) -> Option<MarkdownHistoryTextEdit> {
         if !self.ivars().accepts_edits.get() {
             // History is immutable after the accepted close gate, even while AppKit retains its shell.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(0, 0, Some(NativeInputTraceRejection::Closing));
             return None;
         }
-        let document = self.document()?;
+        let Some(document) = self.document() else {
+            // Expired native shells cannot reestablish a canonical history owner.
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(
+                0,
+                0,
+                Some(NativeInputTraceRejection::DocumentUnavailable),
+            );
+            return None;
+        };
         self.beginEditing();
         let edit = {
             // End the canonical mutable borrow before native observers can request strings/attributes again.
@@ -688,6 +833,14 @@ impl PieceBackedMarkdownTextStorage {
     /// Close one beginEditing group, publishing only a completed canonical receipt before native reentry.
     fn finish_canonical_edit(&self, edit: Option<&MarkdownHistoryTextEdit>) {
         if let Some(edit) = edit {
+            #[cfg(feature = "native-input-trace")]
+            self.record_input_trace_result(
+                edit.replaced_utf16_range.len(),
+                edit.replaced_utf16_range
+                    .len()
+                    .saturating_add_signed(edit.change_in_utf16_length),
+                None,
+            );
             // This marker prevents transient TextKit reconciliation ranges replacing the receipt's selection.
             let start = edit
                 .selection_after

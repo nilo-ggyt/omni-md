@@ -40,6 +40,12 @@ jobs:
           cargo +1.99.0 clippy -p omni-markdown-core --all-targets --all-features --target x86_64-unknown-linux-gnu --locked -- -D warnings
           cargo +1.99.0 test -p omni-markdown-core --all-features --target x86_64-unknown-linux-gnu --locked
           cargo +1.99.0 doc -p omni-markdown-core --all-features --no-deps --target x86_64-unknown-linux-gnu --locked
+      # Portable library tests cover scalar tracing without compiling the AppKit test harness.
+      - name: Check portable plugin and opt-in input trace
+        run: |
+          cargo +1.99.0 check -p omni-md-plugin --lib --target x86_64-unknown-linux-gnu --locked
+          cargo +1.99.0 check -p omni-md-plugin --lib --tests --features native-input-trace --target x86_64-unknown-linux-gnu --locked
+          cargo +1.99.0 test -p omni-md-plugin --lib --features native-input-trace --target x86_64-unknown-linux-gnu --locked
 
   native-contracts:
     name: AppKit contracts / Apple Silicon
@@ -70,6 +76,12 @@ jobs:
           cargo +1.99.0 test --workspace --lib --locked
           cargo +1.99.0 test --workspace --doc --locked
           cargo +1.99.0 doc --workspace --no-deps --locked
+      # Trace has its own feature configuration; the runtime-probe build does not include it.
+      - name: Check opt-in native input trace contracts
+        run: |
+          cargo +1.99.0 clippy -p omni-md-plugin --all-targets --features native-input-trace --locked -- -D warnings
+          cargo +1.99.0 test -p omni-md-plugin --lib --features native-input-trace --locked
+          cargo +1.99.0 doc -p omni-md-plugin --features native-input-trace --no-deps --locked
       # This requires actual native events and strict weak graph release; no GUI-unavailable skip.
       # Hosted-runner success does not replace M5 Max user-input/presentation acceptance.
       - name: Run real TextKit lifecycle contract

@@ -81,6 +81,17 @@ macro_rules! native_markdown_trace {
     };
 }
 
+#[cfg(feature = "native-input-trace")]
+mod input_trace;
+#[cfg(feature = "native-input-trace")]
+use crate::native_input_trace::{NativeInputTrace, SharedNativeInputTrace, TraceScope};
+#[cfg(feature = "native-input-trace")]
+use crate::{NativeInputTraceDocument, NativeInputTraceRejection, NativeInputTraceSelector};
+#[cfg(feature = "native-input-trace")]
+use input_trace::*;
+#[cfg(feature = "native-input-trace")]
+pub use input_trace::{arm_native_markdown_input_trace, drain_native_markdown_input_trace};
+
 mod text_storage;
 use text_storage::*;
 mod text_view;

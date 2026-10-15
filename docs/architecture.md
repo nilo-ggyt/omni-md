@@ -21,6 +21,7 @@ descriptor. It does not select Markdown implementation types or manage their int
 | `native_surface/table_layout.rs` | Coalesced weak layout work, viewport/table measurements and copied-geometry table painting. |
 | `native_surface/table_editor.rs` | One reusable native cell field, commit/cancel and semantic spreadsheet navigation. |
 | `native_surface/gutter.rs` and `source_decorations.rs` | Finite source-line/fold metadata and copied display geometry; neither owns a second text representation. |
+| `native_input_trace` and `native_surface/input_trace.rs` | Optional fixed-capacity scalar provenance and explicit arm/drain controls; absent from default builds, no text/native owners or output. |
 | `runtime_probe_application.rs` | Feature-gated standalone native event driver shared by independent plugin and pinned Host checks. |
 
 The dependency direction is Host composition → SDK registration → plugin application/native adapter

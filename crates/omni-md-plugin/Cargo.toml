@@ -13,15 +13,16 @@ publish = false
 default = ["native-markdown-runtime"]
 native-markdown-runtime = ["omni-markdown-core/native-markdown-candidate"]
 native-markdown-runtime-probe = ["native-markdown-runtime"]
+native-input-trace = ["native-markdown-runtime"]
 
 [dependencies]
-block2 = "=0.6.2"
-dispatch2 = { version = "=0.3.1", default-features = false, features = ["block2", "objc2", "std"] }
 omni-markdown-core = { path = "../omni-markdown-core", default-features = false }
 omni-plugin-sdk.workspace = true
 thiserror = "=2.0.20"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "=0.6.2"
+dispatch2 = { version = "=0.3.1", default-features = false, features = ["block2", "objc2", "std"] }
 core-foundation = "=0.10.1"
 objc2 = { version = "=0.6.4", default-features = true }
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = [

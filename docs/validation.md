@@ -23,6 +23,13 @@ The obsolete plain bracket tests were replaced by the core's actual CodeMirror t
 The complete 2026-10-15 source handoff passed workspace formatting, default and probe-feature
 all-target Clippy with warnings denied, all-feature rustdoc with warnings denied, 138 core tests
 and 18 plugin tests. Six explicitly opt-in core profiling tests were not part of that ordinary run.
+The separately enabled `native-input-trace` configuration subsequently passed 29 plugin tests,
+including 11 focused scalar-recording contracts, all-target Clippy and warnings-denied rustdoc.
+Independent review reran all 11 trace tests and compared default/feature LLVM output: default
+output contains no trace namespace/arm/drain/added-keyDown symbols or trace ivar members. Each
+instrumented view/storage adds one eight-byte recorder `Rc`; default layouts are unchanged.
+The review's stale-composition and invisible direct-command-rejection findings were fixed with
+regressions before publication. These are source/pure-test observations, not input-latency results.
 The workspace pager additionally verifies that multiple bounded pages reach all fixture notes,
 explicit close exhausts cursor ownership, and collapsed/reserved/symlink subtrees do not expose notes.
 All-target plugin Clippy with the native probe feature passed with warnings denied.

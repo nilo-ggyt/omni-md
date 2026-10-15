@@ -8,6 +8,9 @@ use objc2_app_kit::{NSTextContentManagerDelegate, NSTextContentStorageDelegate};
 
 /// Stores finite input/layout metadata and one lazily owned cell field, with weak graph backlinks.
 pub(super) struct PieceBackedTextViewIvars {
+    // Scalar evidence shares this editor's storage lifetime only in explicitly instrumented builds.
+    #[cfg(feature = "native-input-trace")]
+    pub(super) input_trace: SharedNativeInputTrace,
     pub(super) source_decorations: RefCell<Vec<NativeMarkdownDecorationGeometry>>,
     pub(super) source_decoration_generation: Cell<u64>,
     pub(super) source_decorations_dirty: Cell<bool>,
@@ -181,6 +184,32 @@ define_class!(
     unsafe impl NSTextFieldDelegate for PieceBackedMarkdownTextView {}
 
     impl PieceBackedMarkdownTextView {
+        #[cfg(feature = "native-input-trace")]
+        #[unsafe(method(keyDown:))]
+        /// Associate only callbacks executing on this real keyDown stack, forwarding native dispatch once.
+        fn traced_key_down(&self, event: &NSEvent) {
+            let entry = native_input_trace_now();
+            let timestamp_bits = event.timestamp().to_bits();
+            let (document, marked) = self.input_trace_observation();
+            let scope = TraceScope::event(
+                &self.ivars().input_trace,
+                entry,
+                timestamp_bits,
+                document,
+                marked,
+            );
+            // SAFETY: the original live AppKit event is forwarded unchanged to the matching main-thread
+            // superclass method exactly once. Standard input-manager interpretation remains native.
+            unsafe {
+                let _: () = msg_send![super(self), keyDown: event];
+            }
+            if let Some(scope) = scope {
+                // Return ends this actual event's causal scope; asynchronous IME delivery gets no guessed event.
+                let (document, marked) = self.input_trace_observation();
+                scope.finish(native_input_trace_now(), document, marked);
+            }
+        }
+
         #[unsafe(method(updateDragTypeRegistration))]
         /// Registers only the plain-source payload types this adapter can import, with no rich-text fallback.
         fn update_drag_type_registration(&self) {
@@ -517,9 +546,16 @@ define_class!(
         /// The input object must be a live NSString or NSAttributedString accepted by NSTextInputClient;
         /// AppKit must invoke this callback on the owning main thread.
         unsafe fn insert_text_replacement_range(&self, string: &AnyObject, replacement_range: NSRange) {
+            #[cfg(feature = "native-input-trace")]
+            let trace_scope = self.begin_input_trace_selector(NativeInputTraceSelector::InsertText);
             if self.ivars().textkit_graph_teardown.get() {
                 // Accepted close seals native composition/selection work as well as canonical edits;
                 // forwarding late input could otherwise create new system ownership after the final save.
+                #[cfg(feature = "native-input-trace")]
+                {
+                    self.reject_input_trace(NativeInputTraceRejection::Closing);
+                    self.finish_input_trace_selector(trace_scope);
+                }
                 return;
             }
             // TextKit 2 can send `NSNotFound` when the input method expects the
@@ -549,6 +585,8 @@ define_class!(
                 // End semantic deferral after native input has committed its provisional text.
                 text_storage.finish_composition();
             }
+            #[cfg(feature = "native-input-trace")]
+            self.finish_input_trace_selector(trace_scope);
             self.schedule_visible_table_layout_update();
         }
 
@@ -564,8 +602,15 @@ define_class!(
             selected_range: NSRange,
             replacement_range: NSRange,
         ) {
+            #[cfg(feature = "native-input-trace")]
+            let trace_scope = self.begin_input_trace_selector(NativeInputTraceSelector::SetMarkedText);
             if self.ivars().textkit_graph_teardown.get() {
                 // Native-only provisional state must not restart after the saved foreground input gate closes.
+                #[cfg(feature = "native-input-trace")]
+                {
+                    self.reject_input_trace(NativeInputTraceRejection::Closing);
+                    self.finish_input_trace_selector(trace_scope);
+                }
                 return;
             }
             // During an IME composition AppKit commonly supplies
@@ -593,6 +638,11 @@ define_class!(
             self.clear_pending_selection();
             let Some(marked_end) = effective_range.location.checked_add(replacement_length) else {
                 // An overflowing marked span cannot become valid canonical selection metadata.
+                #[cfg(feature = "native-input-trace")]
+                {
+                    self.reject_input_trace(NativeInputTraceRejection::CoordinateOverflow);
+                    self.finish_input_trace_selector(trace_scope);
+                }
                 return;
             };
             let document_length = self.ivars().text_storage.load().and_then(|storage| {
@@ -610,6 +660,8 @@ define_class!(
                     text_storage.set_composition_selection(marked_range, selected_range);
                 }
             }
+            #[cfg(feature = "native-input-trace")]
+            self.finish_input_trace_selector(trace_scope);
         }
 
         #[unsafe(method(unmarkText))]
@@ -618,8 +670,15 @@ define_class!(
         /// # Safety
         /// The retained view, native storage and input transaction must be live on the AppKit main thread.
         unsafe fn unmark_text(&self) {
+            #[cfg(feature = "native-input-trace")]
+            let trace_scope = self.begin_input_trace_selector(NativeInputTraceSelector::UnmarkText);
             if self.ivars().textkit_graph_teardown.get() {
                 // Closing was authorized only after composition cleared; stale selectors cannot accept more edits.
+                #[cfg(feature = "native-input-trace")]
+                {
+                    self.reject_input_trace(NativeInputTraceRejection::Closing);
+                    self.finish_input_trace_selector(trace_scope);
+                }
                 return;
             }
             // NSTextView must clear its own marked-text bookkeeping as well as our semantic
@@ -627,6 +686,8 @@ define_class!(
             // superclass state while the standard commit operation is in progress.
             if self.ivars().unmarking_text.replace(true) {
                 // A nested superclass callback belongs to the current unmark operation.
+                #[cfg(feature = "native-input-trace")]
+                self.finish_input_trace_selector(trace_scope);
                 return;
             }
             self.begin_textkit_input_operation();
@@ -642,6 +703,8 @@ define_class!(
                 text_storage.finish_composition();
             }
             self.ivars().unmarking_text.set(false);
+            #[cfg(feature = "native-input-trace")]
+            self.finish_input_trace_selector(trace_scope);
             self.schedule_visible_table_layout_update();
         }
 
@@ -946,6 +1009,8 @@ impl PieceBackedMarkdownTextView {
         let document_length = document.borrow().utf16_len();
 
         if is_valid_markdown_replacement_range(requested, document_length) {
+            // An explicit in-document native replacement outranks composition/selection fallbacks;
+            // preserving it lets the input method replace its intended scalar-aligned source interval.
             return requested;
         }
 
@@ -991,6 +1056,8 @@ impl PieceBackedMarkdownTextView {
         mtm: MainThreadMarker,
     ) -> Retained<Self> {
         let text_view = Self::alloc(mtm).set_ivars(PieceBackedTextViewIvars {
+            #[cfg(feature = "native-input-trace")]
+            input_trace: Rc::clone(&text_storage.ivars().input_trace),
             text_storage: Weak::from_retained(text_storage),
             source_decorations: RefCell::new(Vec::new()),
             source_decoration_generation: Cell::new(0),
