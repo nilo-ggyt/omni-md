@@ -118,7 +118,7 @@ impl Scanner {
             &mut rejected_thematic,
         )?;
         let mut spacing_cursor: Option<SourceCursor> = None;
-        let blank = line.whitespace(document, false);
+        let blank = line.whitespace(document, false)?;
         for index in 0..self.contexts.len() {
             // Each ancestor consumes only its own explicit source prefix; tab overflow remains source metadata.
             let old = &self.contexts[index];
@@ -178,13 +178,13 @@ impl Scanner {
                 while source_column < target {
                     // Consume each actual padding scalar once, sharing overflow with deeper ancestor checks.
                     let Some((scalar, _, unit)) = cursor
-                        .peek(document)
+                        .peek(document)?
                         .filter(|value| matches!(value.0, ' ' | '\t'))
                     else {
                         // Content before the required column cannot be an explicitly indented continuation.
                         break;
                     };
-                    cursor.next(document);
+                    cursor.next(document)?;
                     offset = unit - line.units.0 + 1;
                     source_column += if scalar == '\t' {
                         // A tab advances to the next four-column stop, possibly crossing the target.

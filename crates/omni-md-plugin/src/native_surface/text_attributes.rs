@@ -8,6 +8,9 @@ use super::*;
 /// Resources are created once per editor. A bounded LRU shares semantic dictionaries
 /// without constructing a complete attributed document or churning fonts on scroll.
 pub(super) struct MarkdownTextAttributePalette {
+    // 固定五个字形随活动editor释放；不按文档长度增长，也不进入进程静态缓存。
+    pub(super) list_glyphs: Option<MarkdownListMarkerGlyphPalette>,
+    pub(super) list_hidden_foreground: Retained<NSColor>,
     pub(super) normal_font: Retained<NSFont>,
     pub(super) strong_font: Retained<NSFont>,
     pub(super) source_strong_font: Retained<NSFont>,
@@ -21,7 +24,6 @@ pub(super) struct MarkdownTextAttributePalette {
     pub(super) marker_foreground: Retained<NSColor>,
     pub(super) hidden_foreground: Retained<NSColor>,
     pub(super) code_background: Retained<NSColor>,
-    pub(super) quote_background: Retained<NSColor>,
     pub(super) structure_border: Retained<NSColor>,
     pub(super) table_header_background: Retained<NSColor>,
     pub(super) table_row_background: Retained<NSColor>,
@@ -43,6 +45,8 @@ impl MarkdownTextAttributePalette {
             .collect();
         // Retain the complete color/font palette under the editor so cache entries never borrow stack values.
         Self {
+            list_glyphs: MarkdownListMarkerGlyphPalette::new(),
+            list_hidden_foreground: NSColor::clearColor(),
             strong_font: NSFont::boldSystemFontOfSize(15.0),
             source_strong_font: NSFont::monospacedSystemFontOfSize_weight(14.0, semibold_weight),
             normal_font,
@@ -56,7 +60,6 @@ impl MarkdownTextAttributePalette {
             marker_foreground: NSColor::colorWithSRGBRed_green_blue_alpha(0.48, 0.56, 0.68, 1.0),
             hidden_foreground: NSColor::colorWithSRGBRed_green_blue_alpha(0.075, 0.084, 0.11, 1.0),
             code_background: NSColor::colorWithSRGBRed_green_blue_alpha(0.13, 0.15, 0.20, 1.0),
-            quote_background: NSColor::colorWithSRGBRed_green_blue_alpha(0.10, 0.12, 0.16, 1.0),
             structure_border: NSColor::colorWithSRGBRed_green_blue_alpha(0.28, 0.34, 0.44, 1.0),
             table_header_background: NSColor::colorWithSRGBRed_green_blue_alpha(
                 0.105, 0.12, 0.16, 1.0,
@@ -205,13 +208,28 @@ pub(super) fn native_markdown_base_font(
             .unwrap_or(&palette.normal_font)
     };
 
-    if !hidden_marker && styles.contains(MarkdownPresentationStyles::EMPHASIS) {
-        // Add italic traits to the selected semantic base while preserving its point size.
+    let subscript_content = !hidden_marker
+        && !styles.contains(MarkdownPresentationStyles::MARKER)
+        && styles.contains(MarkdownPresentationStyles::SUBSCRIPT);
+    if !hidden_marker
+        && (styles.contains(MarkdownPresentationStyles::EMPHASIS) || subscript_content)
+    {
+        // 沿已选标题/粗体/表格face保留组合特征；只缩小实际下标内容，显露的语法符仍可正常编辑。
         let descriptor = base_font.fontDescriptor();
-        let italic_descriptor = descriptor.fontDescriptorWithSymbolicTraits(
-            descriptor.symbolicTraits() | NSFontDescriptorSymbolicTraits::TraitItalic,
-        );
-        NSFont::fontWithDescriptor_size(&italic_descriptor, base_font.pointSize())
+        let descriptor = if styles.contains(MarkdownPresentationStyles::EMPHASIS) {
+            // 倾斜与下标可同时存在，不能为缩字号覆盖原EMPHASIS语义。
+            descriptor.fontDescriptorWithSymbolicTraits(
+                descriptor.symbolicTraits() | NSFontDescriptorSymbolicTraits::TraitItalic,
+            )
+        } else {
+            descriptor // 普通下标沿原face，不引入独立字体集合或正文缓存。
+        };
+        let point_size = if subscript_content {
+            base_font.pointSize() * 0.75
+        } else {
+            base_font.pointSize() // 旧斜体保留原字号；Source不经过本Preview选字路径。
+        };
+        NSFont::fontWithDescriptor_size(&descriptor, point_size)
             .unwrap_or_else(|| base_font.clone())
     } else {
         // Nonitalic and hidden spans reuse the existing retained face without a new descriptor.
@@ -248,7 +266,48 @@ pub(super) struct MarkdownFontSelectionCache {
     pub(super) fallback_fonts: VecDeque<MarkdownFallbackFontEntry>,
 }
 
+impl super::cache_owner::CachePayload for MarkdownFontSelectionCache {
+    fn empty() -> Self {
+        Self::default()
+    }
+}
+
 impl MarkdownFontSelectionCache {
+    /// owner 正在外层 native 栈时按同一字体策略计算，但不分配或发布第二个 LRU。
+    pub(super) fn resolve_uncached(
+        styles: MarkdownPresentationStyles,
+        scalar: char,
+        palette: &MarkdownTextAttributePalette,
+        source_mode: bool,
+    ) -> MarkdownResolvedFont {
+        let base_font = if source_mode {
+            // Source 必须保留等宽语义，不能因重入改回 preview 字体。
+            native_markdown_source_font(styles, palette)
+        } else {
+            // Preview 仍处理标题、隐藏标记、表格和 emphasis 的原有优先级。
+            native_markdown_base_font(styles, palette)
+        };
+        let base_coverage = base_font.coveredCharacterSet();
+        if (!source_mode && styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER))
+            || native_markdown_character_set_covers(&base_coverage, scalar)
+        {
+            // 支持完整 scalar 时继续使用真实 base face，不伪造普通正文属性。
+            return MarkdownResolvedFont {
+                font: base_font,
+                base_coverage,
+                fallback_coverage: None,
+            };
+        }
+        // 未覆盖 scalar 按原策略让 Core Text 选择完整字符的 fallback，临时值仅活在调用栈。
+        let font = native_markdown_fallback_font(&base_font, scalar);
+        let coverage = font.coveredCharacterSet();
+        MarkdownResolvedFont {
+            font,
+            base_coverage,
+            fallback_coverage: Some(coverage),
+        }
+    }
+
     /// Resolves one scalar and promotes reused fallback faces within the bounded LRU.
     pub(super) fn resolve(
         &mut self,
@@ -384,9 +443,17 @@ pub(super) fn native_markdown_character_set_covers(
     scalar.is_ascii() || coverage.longCharacterIsMember(scalar as u32)
 }
 
+/// 同一字典的呈现身份；字形与行高都不能被相同style bit掩盖。
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct MarkdownTextAttributeVariant {
+    pub(super) source_mode: bool,
+    pub(super) table_row_height: Option<f64>,
+    pub(super) list_role: MarkdownListGlyphRole,
+}
+
 /// Complete immutable dictionary for one style/face combination.
 pub(super) struct MarkdownTextAttributeCacheEntry {
-    pub(super) source_mode: bool,
+    pub(super) variant: MarkdownTextAttributeVariant,
     pub(super) styles: MarkdownPresentationStyles,
     pub(super) font: Retained<NSFont>,
     pub(super) attributes: Retained<MarkdownTextAttributes>,
@@ -395,6 +462,15 @@ pub(super) struct MarkdownTextAttributeCacheEntry {
 /// Editor-local fixed-capacity LRU of derived attribute dictionaries.
 pub(super) struct MarkdownTextAttributeCache {
     pub(super) entries: VecDeque<MarkdownTextAttributeCacheEntry>,
+}
+
+impl super::cache_owner::CachePayload for MarkdownTextAttributeCache {
+    fn empty() -> Self {
+        // 失效和重入路径不预留另一个 128-entry LRU，容量只由真实活动查询按需增长。
+        Self {
+            entries: VecDeque::new(),
+        }
+    }
 }
 
 impl Default for MarkdownTextAttributeCache {
@@ -415,16 +491,19 @@ impl MarkdownTextAttributeCache {
         font: &Retained<NSFont>,
         palette: &MarkdownTextAttributePalette,
         base_attributes: &MarkdownTextAttributes,
-        source_mode: bool,
+        variant: MarkdownTextAttributeVariant,
     ) -> Retained<MarkdownTextAttributes> {
-        if styles.is_empty() && native_markdown_same_font(font, &palette.normal_font) {
+        if variant.list_role == MarkdownListGlyphRole::Literal
+            && styles.is_empty()
+            && native_markdown_same_font(font, &palette.normal_font)
+        {
             // Ordinary text uses the shared base dictionary without admitting a redundant cache entry.
             return base_attributes.into();
         }
         // A matching semantic style and exact face can reuse the same immutable dictionary.
         if let Some(index) = self.entries.iter().position(|entry| {
             // Font identity distinguishes Unicode fallback dictionaries with otherwise equal style bits.
-            entry.source_mode == source_mode
+            entry.variant == variant
                 && entry.styles == styles
                 && native_markdown_same_font(&entry.font, font)
         }) {
@@ -439,13 +518,14 @@ impl MarkdownTextAttributeCache {
         }
 
         // A miss creates a small semantic dictionary; no full-document attributed string is copied.
-        let attributes = build_markdown_text_attributes(styles, font, palette, source_mode);
+        let attributes =
+            build_markdown_text_attributes_with_row_height(styles, font, palette, variant);
         if self.entries.len() == MAX_NATIVE_MARKDOWN_ATTRIBUTE_CACHE_ENTRIES {
             // Remove the oldest dictionary before inserting a replacement at the bounded capacity.
             self.entries.pop_front();
         }
         self.entries.push_back(MarkdownTextAttributeCacheEntry {
-            source_mode,
+            variant,
             styles,
             font: font.clone(),
             attributes: attributes.clone(),
@@ -454,20 +534,29 @@ impl MarkdownTextAttributeCache {
     }
 }
 
-/// Creates one complete bounded dictionary of font/color and applicable semantic deltas.
-pub(super) fn build_markdown_text_attributes(
+/// 行高属于本次属性查询；构造出的字典不持有投影或正文。
+pub(super) fn build_markdown_text_attributes_with_row_height(
     styles: MarkdownPresentationStyles,
     font: &Retained<NSFont>,
     palette: &MarkdownTextAttributePalette,
-    source_mode: bool,
+    variant: MarkdownTextAttributeVariant,
 ) -> Retained<MarkdownTextAttributes> {
+    let MarkdownTextAttributeVariant {
+        source_mode,
+        table_row_height,
+        list_role,
+    } = variant;
     let hidden_marker = !source_mode
-        && (styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER)
+        && (list_role == MarkdownListGlyphRole::Hidden
+            || styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER)
             || styles.contains(MarkdownPresentationStyles::TABLE_ROW_PLACEHOLDER));
     let source_color = native_markdown_source_color(styles);
     let foreground = if source_mode {
         // Source syntax colors never conceal or shrink canonical Markdown delimiters.
         &source_color
+    } else if list_role == MarkdownListGlyphRole::Hidden {
+        // 只收起已成功替换任务框的原语法；透明色不在深浅主题间留下微小尾部笔画。
+        &palette.list_hidden_foreground
     } else if hidden_marker {
         // Hidden syntax blends with the editor background while retaining canonical source.
         &palette.hidden_foreground
@@ -492,13 +581,16 @@ pub(super) fn build_markdown_text_attributes(
     // constants are exported by AppKit and are immutable for the process lifetime.
     let underline = NSNumber::new_isize(NSUnderlineStyle::Single.0);
     let strikethrough = NSNumber::new_isize(NSUnderlineStyle::Single.0);
-    let baseline = NSNumber::new_f64(4.0);
+    let subscript_content = styles.contains(MarkdownPresentationStyles::SUBSCRIPT)
+        && !styles.contains(MarkdownPresentationStyles::MARKER);
+    // 公开baseline属性以pt为单位；下标下降3pt，原上标维持4pt，字典仍由现有有界LRU持有。
+    let baseline = NSNumber::new_f64(if subscript_content { -3.0 } else { 4.0 });
     let paragraph_style = if source_mode {
         // Literal source uses uniform native line geometry, with no preview table/quote placeholders.
         None
     } else {
         // Inline preview derives its bounded block spacing and backgrounds from the semantic role.
-        build_markdown_paragraph_style(styles, palette)
+        build_markdown_paragraph_style(styles, palette, table_row_height)
     };
     let mut keys: Vec<&NSAttributedStringKey> = Vec::with_capacity(8);
     let mut values: Vec<&AnyObject> = Vec::with_capacity(8);
@@ -530,6 +622,18 @@ pub(super) fn build_markdown_text_attributes(
     values.push(foreground_object);
 
     if !source_mode
+        && let Some(glyph) = palette
+            .list_glyphs
+            .as_ref()
+            .and_then(|glyphs| glyphs.info(list_role))
+    {
+        // 属性只覆盖完整的一个原unit；Source/活动字面/隐藏尾部永不附带旧glyphInfo。
+        // SAFETY: AppKit导出的不可变key进程期有效，glyph由本editor palette保持正确类型与所有权。
+        keys.push(unsafe { NSGlyphInfoAttributeName });
+        values.push(glyph);
+    }
+
+    if !source_mode
         && !hidden_marker
         && (styles.contains(MarkdownPresentationStyles::INLINE_CODE)
             || styles.contains(MarkdownPresentationStyles::FENCED_CODE))
@@ -551,10 +655,7 @@ pub(super) fn build_markdown_text_attributes(
     // This removes its layout width without replacing the canonical NSString or
     // creating a second rendered document. The active structure gets a distinct
     // style combination and therefore immediately returns the normal source font.
-    if ((!source_mode && styles.contains(MarkdownPresentationStyles::UNDERLINE))
-        || (source_mode && styles.contains(MarkdownPresentationStyles::LINK)))
-        && !hidden_marker
-    {
+    if native_markdown_should_underline(styles, source_mode, hidden_marker) {
         // Visible explicit underline uses the native single-underline attribute.
         let underline_object: &AnyObject = &underline;
         keys.push(underline_key);
@@ -568,8 +669,11 @@ pub(super) fn build_markdown_text_attributes(
         values.push(strikethrough_object);
     }
 
-    if !source_mode && styles.contains(MarkdownPresentationStyles::SUPERSCRIPT) && !hidden_marker {
-        // Superscript offsets the baseline while keeping bytes and selection in the same model.
+    if !source_mode
+        && !hidden_marker
+        && (styles.contains(MarkdownPresentationStyles::SUPERSCRIPT) || subscript_content)
+    {
+        // 只移动Preview可见内容；Source与显露的单~保持普通基线，不修改正文/选择或使用删除线。
         let baseline_object: &AnyObject = &baseline;
         keys.push(baseline_key);
         values.push(baseline_object);
@@ -581,10 +685,52 @@ pub(super) fn build_markdown_text_attributes(
     MarkdownTextAttributes::from_slices(&keys, &values)
 }
 
+/// 链接在两种模式都保持可辨识的下划线；显式 underline 仅在 preview解释。
+pub(super) fn native_markdown_should_underline(
+    styles: MarkdownPresentationStyles,
+    source_mode: bool,
+    hidden_marker: bool,
+) -> bool {
+    // 隐藏语法不能留下线条；source 的普通<u>仍按字面保留，不伪装已渲染HTML。
+    !hidden_marker
+        && (styles.contains(MarkdownPresentationStyles::LINK)
+            || (!source_mode && styles.contains(MarkdownPresentationStyles::UNDERLINE)))
+}
+
+/// 为一个完整、有界的可见单元格附加换行/对齐；同一结果同时用于测量和绘制。
+pub(super) fn native_markdown_wrapped_table_cell_text(
+    source: &NSAttributedString,
+    alignment: MarkdownTableAlignment,
+) -> Retained<NSAttributedString> {
+    let paragraph = NSMutableParagraphStyle::new();
+    // 这里是用户可见内容，始终允许换行；不能沿用 source placeholder 的 clipping。
+    paragraph.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByWordWrapping);
+    paragraph.setAlignment(match alignment {
+        // 普通列沿前缘对齐，完整content rect保留两侧一致padding。
+        MarkdownTableAlignment::Left => NSTextAlignment::Left,
+        // 居中逐视觉行计算，不能把一份紧缩测量框整体平移当成多行居中。
+        MarkdownTableAlignment::Center => NSTextAlignment::Center,
+        // 右列沿尾缘排版；仍由同一个完整宽度决定换行。
+        MarkdownTableAlignment::Right => NSTextAlignment::Right,
+    });
+    let result = NSMutableAttributedString::initWithAttributedString(
+        NSMutableAttributedString::alloc(),
+        source,
+    );
+    // SAFETY: AppKit导出的属性key进程内不可变，字典持有本地创建的正确NSParagraphStyle类型。
+    let attributes = unsafe {
+        MarkdownTextAttributes::from_slices(&[NSParagraphStyleAttributeName], &[&*paragraph])
+    };
+    // SAFETY: range恰好覆盖新建结果的完整UTF-16长度，不借用原文或越过Native字符串边界。
+    unsafe { result.addAttributes_range(&attributes, NSRange::new(0, result.length())) };
+    result.into_super()
+}
+
 /// Derives block geometry and returns no object for ordinary inline-only runs.
 pub(super) fn build_markdown_paragraph_style(
     styles: MarkdownPresentationStyles,
-    palette: &MarkdownTextAttributePalette,
+    _palette: &MarkdownTextAttributePalette,
+    table_row_height: Option<f64>,
 ) -> Option<Retained<NSMutableParagraphStyle>> {
     let hidden_marker = styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER);
     if hidden_marker && styles.contains(MarkdownPresentationStyles::FENCED_CODE) {
@@ -614,9 +760,12 @@ pub(super) fn build_markdown_paragraph_style(
     }
 
     if styles.contains(MarkdownPresentationStyles::TABLE_ROW_PLACEHOLDER) {
-        // Overlay cells need a fixed-height row slot independent of their concealed source glyph widths.
-        paragraph.setMinimumLineHeight(NATIVE_MARKDOWN_TABLE_ROW_HEIGHT);
-        paragraph.setMaximumLineHeight(NATIVE_MARKDOWN_TABLE_ROW_HEIGHT);
+        // 完整 overlay 负责可见格文字；隐藏的原始行只占同一批测量得出的单个行槽。
+        let height = table_row_height.unwrap_or(NATIVE_MARKDOWN_TABLE_ROW_HEIGHT);
+        paragraph.setMinimumLineHeight(height);
+        paragraph.setMaximumLineHeight(height);
+        // 这里只裁不可见 source placeholder，避免极长原始行产生多个占位软换行；可见格另行完整换行。
+        paragraph.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByClipping);
         paragraph.setParagraphSpacing(0.0);
         paragraph.setAlignment(
             if styles.contains(MarkdownPresentationStyles::TABLE_ALIGN_CENTER) {
@@ -653,8 +802,7 @@ pub(super) fn build_markdown_paragraph_style(
         paragraph.setMaximumLineHeight(12.0);
         paragraph.setParagraphSpacingBefore(6.0);
         paragraph.setParagraphSpacing(6.0);
-        let block = markdown_rule_text_block(&palette.structure_border);
-        paragraph.setTextBlocks(&NSArray::from_retained_slice(&[block]));
+        // 标准fragment保留行槽，有限背景hook画细线，不发布会触发兼容模式的textBlocks。
         return Some(paragraph);
     }
 
@@ -670,14 +818,8 @@ pub(super) fn build_markdown_paragraph_style(
         // Visible fenced code receives stable line height, padding and its own background block.
         paragraph.setMinimumLineHeight(22.0);
         paragraph.setParagraphSpacing(0.0);
-        let block = markdown_box_text_block(
-            Some(&palette.code_background),
-            // Table boundaries share the subdued structural border color.
-            &palette.structure_border,
-            0.0,
-            6.0,
-        );
-        paragraph.setTextBlocks(&NSArray::from_retained_slice(&[block]));
+        // 真实indent与段距参与软换行/选区；背景只画已准备矩形，不承担排版。
+        apply_preview_block_insets(&paragraph, 6.0);
         return Some(paragraph);
     }
 
@@ -685,14 +827,8 @@ pub(super) fn build_markdown_paragraph_style(
         // Quotes receive their block border/background without storing another attributed document.
         paragraph.setLineHeightMultiple(1.2);
         paragraph.setParagraphSpacing(2.0);
-        let block = markdown_box_text_block(
-            Some(&palette.quote_background),
-            // Table boundaries share the subdued structural border color.
-            &palette.structure_border,
-            1.0,
-            6.0,
-        );
-        paragraph.setTextBlocks(&NSArray::from_retained_slice(&[block]));
+        // 原2点段后距保留，额外7点包含引用边框和padding。
+        apply_preview_block_insets(&paragraph, 7.0);
         return Some(paragraph);
     }
 
@@ -700,40 +836,49 @@ pub(super) fn build_markdown_paragraph_style(
     has_semantic_layout.then_some(paragraph)
 }
 
-/// Constructs one full-width native block for code or quote decoration.
-pub(super) fn markdown_box_text_block(
-    background: Option<&NSColor>,
-    border: &NSColor,
-    border_width: f64,
-    padding: f64,
-) -> Retained<NSTextBlock> {
-    let block = NSTextBlock::new();
-    block.setContentWidth_type(100.0, NSTextBlockValueType::PercentageValueType);
-    block.setWidth_type_forLayer(
-        border_width,
-        NSTextBlockValueType::AbsoluteValueType,
-        NSTextBlockLayer::Border,
-    );
-    block.setBorderColor(Some(border));
-    block.setWidth_type_forLayer(
-        padding,
-        NSTextBlockValueType::AbsoluteValueType,
-        NSTextBlockLayer::Padding,
-    );
-    block.setBackgroundColor(background);
-    block
-}
+#[cfg(test)]
+mod underline_tests {
+    use super::{MarkdownPresentationStyles as Styles, native_markdown_should_underline};
 
-/// Constructs a single native bottom border for a Markdown rule placeholder.
-pub(super) fn markdown_rule_text_block(color: &NSColor) -> Retained<NSTextBlock> {
-    let block = NSTextBlock::new();
-    block.setContentWidth_type(100.0, NSTextBlockValueType::PercentageValueType);
-    block.setWidth_type_forLayer_edge(
-        1.0,
-        NSTextBlockValueType::AbsoluteValueType,
-        NSTextBlockLayer::Border,
-        NSRectEdge::MinY,
-    );
-    block.setBorderColor_forEdge(Some(color), NSRectEdge::MinY);
-    block
+    #[test]
+    fn preview_and_source_links_retain_a_visible_underline() {
+        // 旧CSS链接的可辨识能力在两种模式都保留，隐藏destination不得残留线条。
+        for source in [false, true] {
+            assert!(native_markdown_should_underline(
+                Styles::LINK,
+                source,
+                false
+            ));
+            assert!(!native_markdown_should_underline(
+                Styles::LINK,
+                source,
+                true
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_underline_is_rendered_only_in_preview_and_never_for_hidden_syntax() {
+        // source保留字面<u>语义；普通字和隐藏标记不被误当成链接/下划线。
+        assert!(native_markdown_should_underline(
+            Styles::UNDERLINE,
+            false,
+            false
+        ));
+        assert!(!native_markdown_should_underline(
+            Styles::UNDERLINE,
+            true,
+            false
+        ));
+        assert!(!native_markdown_should_underline(
+            Styles::UNDERLINE,
+            false,
+            true
+        ));
+        assert!(!native_markdown_should_underline(
+            Styles::default(),
+            false,
+            false
+        ));
+    }
 }

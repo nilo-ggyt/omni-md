@@ -1,0 +1,57 @@
+# 固定harfrust 0.14.0库源码与上游版权；本地修改将字形工作数组转成真实文件分页。
+# 仅库、源码内测试与测试实际include的字体进入此包；离线oracle/CLI/C资源探针不入依赖图。
+# std是文件分页所必需；libm/icu仍是上游算法选项，不代表另有Vec或no_std回退。
+[package]
+name = "harfrust"
+version = "0.14.0"
+edition = "2021"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/harfbuzz/harfrust"
+description = "HarfRust text shaping with bounded file-backed glyph working storage"
+publish = false
+autobins = false
+autoexamples = false
+autobenches = false
+autotests = false
+
+[lib]
+path = "src/lib.rs"
+bench = false
+
+# 独立vendor工作区避免自动成为Omni的成员；真正产品接线由父工作区显式添加path依赖。
+[workspace]
+resolver = "3"
+
+[features]
+default = ["std"]
+std = ["read-fonts/std"]
+libm = ["std", "dep:core_maths", "dep:spin", "read-fonts/libm"]
+icu = ["std", "dep:icu_properties", "dep:icu_normalizer"]
+
+[dependencies]
+bitflags = "2.9"
+bytemuck = { version = "1.22", features = ["extern_crate_alloc"] }
+read-fonts = { version = "0.45.0", default-features = false }
+smallvec = "1.14"
+libc = "0.2"
+tempfile = "3"
+core_maths = { version = "0.1", optional = true }
+spin = { version = "0.12.3", features = ["once"], default-features = false, optional = true }
+icu_properties = { version = "2.2.0", optional = true }
+icu_normalizer = { version = "=2.2.0", optional = true }
+
+[package.metadata.omni-vendor]
+upstream-version = "0.14.0"
+upstream-revision = "3fbac46c3943bffb7519e38fa1eabe963a6579c7"
+upstream-crate-sha256 = "86aa776d6d32b072119e1f1650f4db843ff4382a4aaa6a2c9c4e35703cd377cb"
+# Linux有真实文件映射和预分配，尚无驻留验收；该平台认证API明确为false。
+resident-validation-target = "aarch64-apple-darwin"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+incompatible_msrv = "deny"

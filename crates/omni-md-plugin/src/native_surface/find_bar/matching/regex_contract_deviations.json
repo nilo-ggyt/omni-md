@@ -1,0 +1,933 @@
+{
+  "contract": "Explicit native expectations for reviewed CodeMirror 6.7.1 differences. Every other row must match the oracle exactly.",
+  "counts": {
+    "unbounded_lookbehind_rejected": 36,
+    "continue_after_rejected_multiline_word_candidate": 9,
+    "icu_full_case_fold": 6
+  },
+  "entries": [
+    {
+      "row_index": 76,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "abc ABC a1 b22 __ \u4e2d\u6587 \uff11\uff12",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": false,
+        "valid": true,
+        "matches": [
+          {
+            "start": 1,
+            "end": 2
+          },
+          {
+            "start": 5,
+            "end": 6
+          }
+        ]
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 77,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "abc ABC a1 b22 __ \u4e2d\u6587 \uff11\uff12",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 78,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "abc ABC a1 b22 __ \u4e2d\u6587 \uff11\uff12",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": false,
+        "valid": true,
+        "matches": [
+          {
+            "start": 1,
+            "end": 2
+          }
+        ]
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 79,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "abc ABC a1 b22 __ \u4e2d\u6587 \uff11\uff12",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 105,
+      "reason": "continue_after_rejected_multiline_word_candidate",
+      "reference": {
+        "source": "abc ABC a1 b22 __ \u4e2d\u6587 \uff11\uff12",
+        "query": "\\D+",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [
+        {
+          "end": 23,
+          "start": 14
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 107,
+      "reason": "continue_after_rejected_multiline_word_candidate",
+      "reference": {
+        "source": "abc ABC a1 b22 __ \u4e2d\u6587 \uff11\uff12",
+        "query": "\\D+",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [
+        {
+          "end": 23,
+          "start": 14
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 276,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "a\nb\n\na\nb",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 277,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "a\nb\n\na\nb",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 278,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "a\nb\n\na\nb",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 279,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "a\nb\n\na\nb",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 476,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "\ud83d\ude00x \ud83d\ude0042 \ud83d\udc69\u200d\ud83d\udcbb",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 477,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "\ud83d\ude00x \ud83d\ude0042 \ud83d\udc69\u200d\ud83d\udcbb",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 478,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "\ud83d\ude00x \ud83d\ude0042 \ud83d\udc69\u200d\ud83d\udcbb",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 479,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "\ud83d\ude00x \ud83d\ude0042 \ud83d\udc69\u200d\ud83d\udcbb",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 676,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "\u00e9 e\u0301 \u00c9 \u00df SS ss \u017f s \u212a K",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 677,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "\u00e9 e\u0301 \u00c9 \u00df SS ss \u017f s \u212a K",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 678,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "\u00e9 e\u0301 \u00c9 \u00df SS ss \u017f s \u212a K",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 679,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "\u00e9 e\u0301 \u00c9 \u00df SS ss \u017f s \u212a K",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 752,
+      "reason": "icu_full_case_fold",
+      "reference": {
+        "source": "\u00e9 e\u0301 \u00c9 \u00df SS ss \u017f s \u212a K",
+        "query": "\u00df",
+        "case_sensitive": false,
+        "whole_word": false,
+        "valid": true,
+        "matches": [
+          {
+            "start": 7,
+            "end": 8
+          }
+        ]
+      },
+      "native_matches": [
+        {
+          "end": 8,
+          "start": 7
+        },
+        {
+          "end": 11,
+          "start": 9
+        },
+        {
+          "end": 14,
+          "start": 12
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 753,
+      "reason": "icu_full_case_fold",
+      "reference": {
+        "source": "\u00e9 e\u0301 \u00c9 \u00df SS ss \u017f s \u212a K",
+        "query": "\u00df",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": [
+          {
+            "start": 7,
+            "end": 8
+          }
+        ]
+      },
+      "native_matches": [
+        {
+          "end": 8,
+          "start": 7
+        },
+        {
+          "end": 11,
+          "start": 9
+        },
+        {
+          "end": 14,
+          "start": 12
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 756,
+      "reason": "icu_full_case_fold",
+      "reference": {
+        "source": "\u00e9 e\u0301 \u00c9 \u00df SS ss \u017f s \u212a K",
+        "query": "ss",
+        "case_sensitive": false,
+        "whole_word": false,
+        "valid": true,
+        "matches": [
+          {
+            "start": 9,
+            "end": 11
+          },
+          {
+            "start": 12,
+            "end": 14
+          }
+        ]
+      },
+      "native_matches": [
+        {
+          "end": 8,
+          "start": 7
+        },
+        {
+          "end": 11,
+          "start": 9
+        },
+        {
+          "end": 14,
+          "start": 12
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 757,
+      "reason": "icu_full_case_fold",
+      "reference": {
+        "source": "\u00e9 e\u0301 \u00c9 \u00df SS ss \u017f s \u212a K",
+        "query": "ss",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": [
+          {
+            "start": 9,
+            "end": 11
+          },
+          {
+            "start": 12,
+            "end": 14
+          }
+        ]
+      },
+      "native_matches": [
+        {
+          "end": 8,
+          "start": 7
+        },
+        {
+          "end": 11,
+          "start": 9
+        },
+        {
+          "end": 14,
+          "start": 12
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 760,
+      "reason": "icu_full_case_fold",
+      "reference": {
+        "source": "\u00e9 e\u0301 \u00c9 \u00df SS ss \u017f s \u212a K",
+        "query": "SS",
+        "case_sensitive": false,
+        "whole_word": false,
+        "valid": true,
+        "matches": [
+          {
+            "start": 9,
+            "end": 11
+          },
+          {
+            "start": 12,
+            "end": 14
+          }
+        ]
+      },
+      "native_matches": [
+        {
+          "end": 8,
+          "start": 7
+        },
+        {
+          "end": 11,
+          "start": 9
+        },
+        {
+          "end": 14,
+          "start": 12
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 761,
+      "reason": "icu_full_case_fold",
+      "reference": {
+        "source": "\u00e9 e\u0301 \u00c9 \u00df SS ss \u017f s \u212a K",
+        "query": "SS",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": [
+          {
+            "start": 9,
+            "end": 11
+          },
+          {
+            "start": 12,
+            "end": 14
+          }
+        ]
+      },
+      "native_matches": [
+        {
+          "end": 8,
+          "start": 7
+        },
+        {
+          "end": 11,
+          "start": 9
+        },
+        {
+          "end": 14,
+          "start": 12
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 876,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "foo scatter cat_ cat foo-bar foo1",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 877,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "foo scatter cat_ cat foo-bar foo1",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 878,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "foo scatter cat_ cat foo-bar foo1",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 879,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "foo scatter cat_ cat foo-bar foo1",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1076,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "ab ac b aab aaab",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": false,
+        "valid": true,
+        "matches": [
+          {
+            "start": 1,
+            "end": 2
+          },
+          {
+            "start": 10,
+            "end": 11
+          },
+          {
+            "start": 15,
+            "end": 16
+          }
+        ]
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1077,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "ab ac b aab aaab",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1078,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "ab ac b aab aaab",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": false,
+        "valid": true,
+        "matches": [
+          {
+            "start": 1,
+            "end": 2
+          },
+          {
+            "start": 10,
+            "end": 11
+          },
+          {
+            "start": 15,
+            "end": 16
+          }
+        ]
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1079,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "ab ac b aab aaab",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1276,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "1\t2\u000b3\f4\u00855\u00a06\ufeff7\u20288\u20299",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1277,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "1\t2\u000b3\f4\u00855\u00a06\ufeff7\u20288\u20299",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1278,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "1\t2\u000b3\f4\u00855\u00a06\ufeff7\u20288\u20299",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1279,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "1\t2\u000b3\f4\u00855\u00a06\ufeff7\u20288\u20299",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1476,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "(x) [y] $ z\\w",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1477,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "(x) [y] $ z\\w",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1478,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "(x) [y] $ z\\w",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1479,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "(x) [y] $ z\\w",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1676,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "\ud835\udc00A \u216b12 \u4e2d\u6587\u5b57",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1677,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "\ud835\udc00A \u216b12 \u4e2d\u6587\u5b57",
+        "query": "(?<=a+)b",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1678,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "\ud835\udc00A \u216b12 \u4e2d\u6587\u5b57",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": false,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1679,
+      "reason": "unbounded_lookbehind_rejected",
+      "reference": {
+        "source": "\ud835\udc00A \u216b12 \u4e2d\u6587\u5b57",
+        "query": "(?<=a+)b",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [],
+      "native_error": "正则表达式不符合原生 ICU 引擎的语法"
+    },
+    {
+      "row_index": 1689,
+      "reason": "continue_after_rejected_multiline_word_candidate",
+      "reference": {
+        "source": "\ud835\udc00A \u216b12 \u4e2d\u6587\u5b57",
+        "query": "\\W+",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [
+        {
+          "end": 11,
+          "start": 7
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 1691,
+      "reason": "continue_after_rejected_multiline_word_candidate",
+      "reference": {
+        "source": "\ud835\udc00A \u216b12 \u4e2d\u6587\u5b57",
+        "query": "\\W+",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [
+        {
+          "end": 11,
+          "start": 7
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 1697,
+      "reason": "continue_after_rejected_multiline_word_candidate",
+      "reference": {
+        "source": "\ud835\udc00A \u216b12 \u4e2d\u6587\u5b57",
+        "query": "[\\W]+",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [
+        {
+          "end": 11,
+          "start": 7
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 1699,
+      "reason": "continue_after_rejected_multiline_word_candidate",
+      "reference": {
+        "source": "\ud835\udc00A \u216b12 \u4e2d\u6587\u5b57",
+        "query": "[\\W]+",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [
+        {
+          "end": 11,
+          "start": 7
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 1705,
+      "reason": "continue_after_rejected_multiline_word_candidate",
+      "reference": {
+        "source": "\ud835\udc00A \u216b12 \u4e2d\u6587\u5b57",
+        "query": "\\D+",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [
+        {
+          "end": 11,
+          "start": 7
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 1707,
+      "reason": "continue_after_rejected_multiline_word_candidate",
+      "reference": {
+        "source": "\ud835\udc00A \u216b12 \u4e2d\u6587\u5b57",
+        "query": "\\D+",
+        "case_sensitive": true,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [
+        {
+          "end": 11,
+          "start": 7
+        }
+      ],
+      "native_error": null
+    },
+    {
+      "row_index": 1749,
+      "reason": "continue_after_rejected_multiline_word_candidate",
+      "reference": {
+        "source": "\ud835\udc00A \u216b12 \u4e2d\u6587\u5b57",
+        "query": "[^a]+",
+        "case_sensitive": false,
+        "whole_word": true,
+        "valid": true,
+        "matches": []
+      },
+      "native_matches": [
+        {
+          "end": 11,
+          "start": 3
+        }
+      ],
+      "native_error": null
+    }
+  ]
+}

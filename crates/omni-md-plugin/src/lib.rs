@@ -4,11 +4,17 @@
 //! its confined workspace, mounted native view, and deterministic close contract.
 
 #[cfg(any(target_os = "macos", test))]
+mod cancelable_mailbox;
+#[cfg(any(target_os = "macos", test))]
 mod close_policy;
 #[cfg(any(target_os = "macos", test))]
 mod foreground_owner;
 #[cfg(any(target_os = "macos", test))]
+mod payload_use;
+#[cfg(any(target_os = "macos", test))]
 mod terminal_close;
+#[cfg(any(target_os = "macos", test))]
+mod workspace_ready;
 
 #[cfg(feature = "native-input-trace")]
 mod native_input_trace;
@@ -32,16 +38,34 @@ pub mod native_surface;
 
 #[cfg(all(target_os = "macos", feature = "native-markdown-runtime-probe"))]
 pub use native_surface::{
-    NativeMarkdownRuntimeProbeCompletion, NativeMarkdownRuntimeProbeSession,
-    run_native_markdown_runtime_probe,
+    NativeMarkdownHostedStep, NativeMarkdownHostedWorkload, NativeMarkdownRuntimeProbeCompletion,
+    NativeMarkdownRuntimeProbeSession, run_native_markdown_runtime_probe,
 };
 
 #[cfg(all(target_os = "macos", feature = "native-markdown-runtime-probe"))]
 mod runtime_probe_application;
 #[cfg(all(target_os = "macos", feature = "native-markdown-runtime-probe"))]
 pub use runtime_probe_application::{
-    native_markdown_runtime_probe_fixture, run_native_markdown_runtime_probe_application,
+    NativeMarkdownMemoryStopAfter, native_markdown_runtime_probe_fixture,
+    native_markdown_semantic_snapshot_probe_fixture,
+    run_native_markdown_memory_workload_application, run_native_markdown_runtime_probe_application,
+    run_native_markdown_semantic_snapshot_probe_application,
+    write_native_markdown_giant_paragraph_fixture, write_native_markdown_memory_fixture,
 };
+
+#[cfg(all(
+    target_os = "macos",
+    feature = "native-markdown-runtime-probe",
+    feature = "native-table-row-append"
+))]
+pub use runtime_probe_application::run_native_markdown_table_append_workload_application;
+
+#[cfg(all(
+    target_os = "macos",
+    feature = "native-markdown-runtime-probe",
+    feature = "native-table-row-append"
+))]
+pub use native_surface::NativeMarkdownTableAppendCase;
 
 /// Stable protocol identity; the host treats it as descriptor data.
 pub const PLUGIN_ID: &str = "com.omnibar.plugins.omni-md";
@@ -50,7 +74,7 @@ pub const ACTIVATION_CODE: &str = "md";
 
 const COMMANDS: &[PluginCommandDescriptor] = &[PluginCommandDescriptor {
     id: "open",
-    title: "Markdown",
+    title: "Markdown 笔记",
     subtitle: "管理和编辑 Markdown 笔记",
     keywords: &["markdown", "md", "note", "笔记"],
 }];

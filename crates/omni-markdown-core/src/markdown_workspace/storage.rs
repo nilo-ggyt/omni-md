@@ -1,7 +1,10 @@
-//! Short-lived mapped inspection, atomic-save guards, and private legacy conflict-draft storage.
+//! 工作区有限冻结读取、原子保存检查与旧兼容草稿；旧全片入口等待其调用方逐项迁移。
 
 use super::*;
 use crate::immutable_snapshot::{SnapshotDirectory, SnapshotError, snapshot_file};
+
+mod bounded_text;
+pub(super) use bounded_text::BoundedMarkdownText;
 
 /// Derived inspection result paired with one exact content revision and validated file metadata.
 pub(super) struct InspectedMarkdown<T> {
@@ -16,6 +19,114 @@ pub(super) struct ValidatedMarkdownText<T> {
     pub(super) value: T,
     pub(super) byte_count: u64,
     pub(super) modified_at_ms: i64,
+}
+
+/// 冻结同一个文件身份，只允许有限源窗口；callback失败或真实close失败都不能发布结果。
+pub(super) fn inspect_bounded_markdown_text_cancellable<T>(
+    path: &Path,
+    maximum_bytes: u64,
+    is_current: impl Fn() -> bool,
+    inspect: impl FnOnce(&BoundedMarkdownText) -> Result<T, MarkdownWorkspaceError>,
+    snapshots: Option<&mut SnapshotDirectory>,
+) -> Result<ValidatedMarkdownText<T>, MarkdownWorkspaceError> {
+    if !is_current() {
+        return Err(MarkdownWorkspaceError::SearchSuperseded);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| MarkdownWorkspaceError::StorageUnavailable)?;
+    let before = file
+        .metadata()
+        .map_err(|_| MarkdownWorkspaceError::StorageUnavailable)?;
+    if !before.is_file() {
+        return Err(MarkdownWorkspaceError::StorageUnavailable);
+    }
+    if before.len() > maximum_bytes {
+        return Err(MarkdownWorkspaceError::DocumentTooLarge);
+    }
+    let length =
+        usize::try_from(before.len()).map_err(|_| MarkdownWorkspaceError::DocumentTooLarge)?;
+    let identity = FileIdentity::from(&before);
+    // 只有独立匿名冻结inode可建立有界mapping；每候选共享的只是空scratch目录。
+    let captured = match snapshots {
+        Some(directory) => directory.capture_backing(&file, before.len(), &is_current),
+        None => SnapshotDirectory::new()
+            .and_then(|mut directory| directory.capture_backing(&file, before.len(), &is_current)),
+    }
+    .map_err(|error| match error {
+        SnapshotError::SourceChanged => MarkdownWorkspaceError::DocumentChangedDuringRead,
+        SnapshotError::Cancelled => MarkdownWorkspaceError::SearchSuperseded,
+        SnapshotError::Storage(_) => MarkdownWorkspaceError::StorageUnavailable,
+    })?;
+    let text = BoundedMarkdownText::new(captured, length)?;
+    let result = inspect(&text);
+    let validation = if result.is_ok() {
+        // 搜索已在同一次KMP扫描完成校验；其他局部检查者仍必须证明整个冻结候选有效。
+        text.ensure_validated(&is_current)
+    } else {
+        Ok(()) // 业务失败不再重扫；归还仍由下面同一个显式close完成。
+    };
+    text.close()?; // callback错误也先完成实际归还；cleanup失败不能被较早的业务错误吞掉。
+    validation?;
+    let value = result?;
+    if !is_current() {
+        return Err(MarkdownWorkspaceError::SearchSuperseded);
+    }
+    let after = file
+        .metadata()
+        .map_err(|_| MarkdownWorkspaceError::StorageUnavailable)?;
+    let path_after = fs::symlink_metadata(path)
+        .map_err(|_| MarkdownWorkspaceError::DocumentChangedDuringRead)?;
+    if path_after.file_type().is_symlink()
+        || FileIdentity::from(&after) != identity
+        || FileIdentity::from(&path_after) != identity
+    {
+        // 原路径或descriptor变化时丢弃全部派生结果，不拿新身份继续旧扫描。
+        return Err(MarkdownWorkspaceError::DocumentChangedDuringRead);
+    }
+    Ok(ValidatedMarkdownText {
+        value,
+        byte_count: after.len(),
+        modified_at_ms: modified_at_ms(&after),
+    })
+}
+
+/// 只需revision的调用者也必须有限校验/散列；不得因callback不读正文而留全片扫描。
+pub(super) fn inspect_bounded_markdown<T>(
+    path: &Path,
+    maximum_bytes: u64,
+    inspect: impl FnOnce(&BoundedMarkdownText) -> Result<T, MarkdownWorkspaceError>,
+) -> Result<InspectedMarkdown<T>, MarkdownWorkspaceError> {
+    let inspected = inspect_bounded_markdown_text_cancellable(
+        path,
+        maximum_bytes,
+        || true,
+        |text| {
+            let mut digest = Sha256::new();
+            text.visit_validated_bytes(&|| true, |_, bytes| {
+                digest.update(bytes);
+                Ok(())
+            })?;
+            let digest = digest.finalize();
+            let mut revision = String::with_capacity(digest.len() * 2);
+            for byte in digest {
+                use std::fmt::Write as _;
+                let _ = write!(revision, "{byte:02x}");
+            }
+            // 完整UTF8和精确原字节摘要都成功后才进入消费者；消费者仍无全片借用接口。
+            Ok((inspect(text)?, revision))
+        },
+        None,
+    )?;
+    let (value, revision) = inspected.value;
+    Ok(InspectedMarkdown {
+        value,
+        revision,
+        byte_count: inspected.byte_count,
+        modified_at_ms: inspected.modified_at_ms,
+    })
 }
 
 /// Compute legacy open-note character and line metrics without a normalized document copy.
@@ -518,33 +629,33 @@ pub(super) fn read_conflict_draft(
     Ok(Some(content))
 }
 
-/// Validate record magic, bounded lengths, exact path ownership, and UTF-8 before copying draft text.
-pub(super) fn parse_conflict_draft(
-    bytes: &[u8],
-    expected_relative_path: &str,
-) -> Result<String, MarkdownWorkspaceError> {
-    if bytes.len() < CONFLICT_DRAFT_HEADER_BYTES
-        || &bytes[..CONFLICT_DRAFT_MAGIC.len()] != CONFLICT_DRAFT_MAGIC
+/// 固定header只决定合法范围与预算；此函数不借用正文，也不把未固定的源文件声明为不可变。
+pub(super) fn conflict_draft_payload_extent(
+    header: &[u8],
+    record_bytes: usize,
+) -> Result<std::ops::Range<usize>, MarkdownWorkspaceError> {
+    if header.len() < CONFLICT_DRAFT_HEADER_BYTES
+        || &header[..CONFLICT_DRAFT_MAGIC.len()] != CONFLICT_DRAFT_MAGIC
     {
-        // A missing header or wrong format marker cannot be interpreted as a recovery record.
+        // 缺失或错误magic不能授权按后面的不可信长度分配、复制或建立映射。
         return Err(MarkdownWorkspaceError::ConflictDraftCorrupted);
     }
 
-    // Decode fixed-width lengths only after magic and header validation; checked extents follow below.
+    // 仅在20B头完整后解码两个big-endian长度，后续所有端点均使用checked算术。
     let mut relative_path_length_bytes = [0_u8; 4];
-    relative_path_length_bytes.copy_from_slice(&bytes[8..12]);
+    relative_path_length_bytes.copy_from_slice(&header[8..12]);
     let relative_path_byte_count = u32::from_be_bytes(relative_path_length_bytes) as usize;
     let mut content_length_bytes = [0_u8; 8];
-    content_length_bytes.copy_from_slice(&bytes[12..20]);
+    content_length_bytes.copy_from_slice(&header[12..20]);
     let content_byte_count =
         usize::try_from(u64::from_be_bytes(content_length_bytes)).map_err(|_| {
-            // Unreadable, invalidly encoded, or unstable private-record bytes cannot supply recovered unsaved text.
+            // 无法寻址的正文长度不是可恢复的有界record。
             MarkdownWorkspaceError::ConflictDraftCorrupted
         })?;
     if relative_path_byte_count > MAX_RECOVERY_RELATIVE_PATH_BYTES
         || content_byte_count as u64 > MAX_DOCUMENT_BYTES
     {
-        // Encoded path and content lengths must respect the same bounds as draft creation.
+        // 路径和正文沿用旧写入格式的上限，防止header诱导无界读取。
         return Err(MarkdownWorkspaceError::ConflictDraftCorrupted);
     }
 
@@ -554,32 +665,41 @@ pub(super) fn parse_conflict_draft(
     let content_end = relative_path_end
         .checked_add(content_byte_count)
         .ok_or(MarkdownWorkspaceError::ConflictDraftCorrupted)?;
-    if content_end != bytes.len() {
-        // Extra or missing bytes indicate a corrupt record rather than a partially usable draft.
+    if content_end != record_bytes {
+        // 丢字节或额外尾字节都不能被当作部分有效的恢复内容。
         return Err(MarkdownWorkspaceError::ConflictDraftCorrupted);
     }
+    Ok(relative_path_end..content_end)
+}
 
-    // Require the embedded identifier and text to be UTF-8 before allocating the returned draft.
-    let stored_relative_path = std::str::from_utf8(
-        bytes
-            .get(CONFLICT_DRAFT_HEADER_BYTES..relative_path_end)
-            .ok_or(MarkdownWorkspaceError::ConflictDraftCorrupted)?,
-    )
-    .map_err(|_| {
-        // Unreadable, invalidly encoded, or unstable private-record bytes cannot supply recovered unsaved text.
-        MarkdownWorkspaceError::ConflictDraftCorrupted
-    })?;
-    if stored_relative_path != expected_relative_path {
-        // A hashed filename alone is insufficient: the embedded path must match the requested note.
+/// 固定record的精确内嵌path必须匹配请求；只返回正文范围，不分配正文String。
+pub(super) fn conflict_draft_payload_range(
+    bytes: &[u8],
+    expected_relative_path: &str,
+) -> Result<std::ops::Range<usize>, MarkdownWorkspaceError> {
+    let payload = conflict_draft_payload_extent(bytes, bytes.len())?;
+    if bytes.get(CONFLICT_DRAFT_HEADER_BYTES..payload.start)
+        != Some(expected_relative_path.as_bytes())
+    {
+        // 请求path本身是合法UTF-8，精确byte相等也验证了存储path编码；文件名哈希不足以代替此检查。
         return Err(MarkdownWorkspaceError::ConflictDraftCorrupted);
     }
+    Ok(payload)
+}
+
+/// 仅legacy String接口复制正文；原生恢复使用同一范围验证后直接接immutable mapping。
+pub(super) fn parse_conflict_draft(
+    bytes: &[u8],
+    expected_relative_path: &str,
+) -> Result<String, MarkdownWorkspaceError> {
+    let payload = conflict_draft_payload_range(bytes, expected_relative_path)?;
     let content = std::str::from_utf8(
         bytes
-            .get(relative_path_end..content_end)
+            .get(payload)
             .ok_or(MarkdownWorkspaceError::ConflictDraftCorrupted)?,
     )
     .map_err(|_| {
-        // Unreadable, invalidly encoded, or unstable private-record bytes cannot supply recovered unsaved text.
+        // legacy返回类型要求完整String，但非法UTF-8仍拒绝，不进行lossy修复。
         MarkdownWorkspaceError::ConflictDraftCorrupted
     })?;
     Ok(content.to_owned())

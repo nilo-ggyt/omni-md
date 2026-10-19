@@ -3,6 +3,11 @@
 use super::*;
 
 #[cfg(any(test, feature = "native-markdown-candidate"))]
+mod streaming;
+#[cfg(any(test, feature = "native-markdown-candidate"))]
+pub(super) use streaming::InitialBlockScanner;
+
+#[cfg(any(test, feature = "native-markdown-candidate"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// A complete line boundary and minimal restart state, never retained source text or AST nodes.
 pub(super) struct MarkdownBlockCheckpoint {
@@ -21,6 +26,7 @@ pub(super) struct MarkdownBlockCheckpointIndex {
 #[cfg(any(test, feature = "native-markdown-candidate"))]
 impl MarkdownBlockCheckpointIndex {
     /// Build sparse restart checkpoints while the original mapped text is already being indexed.
+    #[cfg(test)]
     pub(super) fn from_text(text: &str) -> Self {
         let initial = MarkdownBlockCheckpoint {
             utf16_offset: 0,
@@ -110,6 +116,18 @@ impl MarkdownBlockScannerState {
         line: MarkdownBlockLine<'_>,
         completed_blocks: &mut MarkdownCompletedBlockCollection,
     ) {
+        let facts = streaming::MarkdownBlockLineFacts::from_text(line.content);
+        self.consume_line_facts(line.utf16_range, line.byte_range, &facts, completed_blocks);
+    }
+
+    /// 固定行事实与完整line使用同一状态转移，初开不需要保留或合成巨物理行。
+    fn consume_line_facts(
+        &mut self,
+        utf16_range: Range<usize>,
+        byte_range: Range<usize>,
+        facts: &streaming::MarkdownBlockLineFacts,
+        completed_blocks: &mut MarkdownCompletedBlockCollection,
+    ) {
         if let Some(active) = self.active {
             // Existing multi-line constructs determine whether this line can start another block.
             match active.kind {
@@ -118,12 +136,12 @@ impl MarkdownBlockScannerState {
                     marker,
                     minimum_length,
                 } => {
-                    if markdown_closes_fence(line.content, marker, minimum_length) {
+                    if facts.closes_fence(marker, minimum_length) {
                         // A matching closing fence completes the block including the closing line ending.
                         complete_markdown_block(
                             &mut self.active,
-                            line.byte_range.end,
-                            line.utf16_range.end,
+                            byte_range.end,
+                            utf16_range.end,
                             completed_blocks,
                         );
                     }
@@ -133,12 +151,12 @@ impl MarkdownBlockScannerState {
                 }
                 // Front matter treats all interior text as opaque until its closing delimiter.
                 MarkdownScannedBlockKind::FrontMatter => {
-                    if markdown_closes_front_matter(line.content) {
+                    if facts.closes_front_matter() {
                         // A front-matter terminator completes the envelope including the terminator line.
                         complete_markdown_block(
                             &mut self.active,
-                            line.byte_range.end,
-                            line.utf16_range.end,
+                            byte_range.end,
+                            utf16_range.end,
                             completed_blocks,
                         );
                     }
@@ -147,9 +165,7 @@ impl MarkdownBlockScannerState {
                     return;
                 }
                 // A pipe-bearing nonblank line extends the current table and cannot start a competing block.
-                MarkdownScannedBlockKind::Table { .. }
-                    if markdown_table_body_line(line.content) =>
-                {
+                MarkdownScannedBlockKind::Table { .. } if facts.table_body() => {
                     self.previous_table_header = None;
                     self.document_start = false;
                     return;
@@ -158,19 +174,19 @@ impl MarkdownBlockScannerState {
                 MarkdownScannedBlockKind::Table { .. } => {
                     complete_markdown_block(
                         &mut self.active,
-                        line.byte_range.start,
-                        line.utf16_range.start,
+                        byte_range.start,
+                        utf16_range.start,
                         completed_blocks,
                     );
                 }
                 // After a blank list separator, unindented non-list text ends the prior list before this line.
                 MarkdownScannedBlockKind::List { saw_blank: true }
-                    if !markdown_list_continuation_line(line.content) =>
+                    if !facts.list_continuation() =>
                 {
                     complete_markdown_block(
                         &mut self.active,
-                        line.byte_range.start,
-                        line.utf16_range.start,
+                        byte_range.start,
+                        utf16_range.start,
                         completed_blocks,
                     );
                 }
@@ -179,7 +195,7 @@ impl MarkdownBlockScannerState {
             }
         }
 
-        if markdown_line_is_blank(line.content) {
+        if facts.blank() {
             // A blank line ends ordinary blocks but may separate items inside a continuing list.
             if let Some(active) = self.active.as_mut() {
                 // Only an existing block needs a boundary update for blank input.
@@ -189,8 +205,8 @@ impl MarkdownBlockScannerState {
                     // Non-list blocks end before the blank line, keeping the blank outside their semantic envelope.
                     _ => complete_markdown_block(
                         &mut self.active,
-                        line.byte_range.start,
-                        line.utf16_range.start,
+                        byte_range.start,
+                        utf16_range.start,
                         completed_blocks,
                     ),
                 }
@@ -200,17 +216,17 @@ impl MarkdownBlockScannerState {
             return;
         }
 
-        if self.document_start && markdown_opens_front_matter(line.content) {
+        if self.document_start && facts.opens_front_matter() {
             // Only the actual document start permits a front-matter opener.
             complete_markdown_block(
                 &mut self.active,
-                line.byte_range.start,
-                line.utf16_range.start,
+                byte_range.start,
+                utf16_range.start,
                 completed_blocks,
             );
             self.active = Some(MarkdownActiveBlock {
-                start_utf16: line.utf16_range.start,
-                start_byte: line.byte_range.start,
+                start_utf16: utf16_range.start,
+                start_byte: byte_range.start,
                 kind: MarkdownScannedBlockKind::FrontMatter,
             });
             self.previous_table_header = None;
@@ -218,17 +234,17 @@ impl MarkdownBlockScannerState {
             return;
         }
 
-        if let Some((marker, minimum_length)) = markdown_opening_fence(line.content) {
+        if let Some((marker, minimum_length)) = facts.opening_fence() {
             // A valid fence starts a new opaque block after completing any prior paragraph or list.
             complete_markdown_block(
                 &mut self.active,
-                line.byte_range.start,
-                line.utf16_range.start,
+                byte_range.start,
+                utf16_range.start,
                 completed_blocks,
             );
             self.active = Some(MarkdownActiveBlock {
-                start_utf16: line.utf16_range.start,
-                start_byte: line.byte_range.start,
+                start_utf16: utf16_range.start,
+                start_byte: byte_range.start,
                 kind: MarkdownScannedBlockKind::FencedCode {
                     marker,
                     minimum_length,
@@ -239,7 +255,7 @@ impl MarkdownBlockScannerState {
             return;
         }
 
-        if let Some(column_count) = markdown_table_delimiter_column_count(line.content)
+        if let Some(column_count) = facts.delimiter_columns()
             && let Some(header) = self.previous_table_header
             && header.column_count == column_count
         {
@@ -266,7 +282,7 @@ impl MarkdownBlockScannerState {
             return;
         }
 
-        let line_kind = if markdown_list_marker_length(line.content).is_some() {
+        let line_kind = if facts.list_marker() {
             // A recognized list marker gives a newly started block list continuation semantics.
             MarkdownScannedBlockKind::List { saw_blank: false }
         } else {
@@ -284,23 +300,22 @@ impl MarkdownBlockScannerState {
             // Without an active block, capture this line as the new envelope start.
             None => {
                 self.active = Some(MarkdownActiveBlock {
-                    start_utf16: line.utf16_range.start,
-                    start_byte: line.byte_range.start,
+                    start_utf16: utf16_range.start,
+                    start_byte: byte_range.start,
                     kind: line_kind,
                 });
             }
         }
 
         // Retain only the latest header candidate; a following matching delimiter may promote it.
-        self.previous_table_header =
-            markdown_table_header_column_count(line.content).map(|column_count| {
-                // Capture absolute starts so a later promotion can rewind to the true header.
-                MarkdownTableHeaderCandidate {
-                    start_utf16: line.utf16_range.start,
-                    start_byte: line.byte_range.start,
-                    column_count,
-                }
-            });
+        self.previous_table_header = facts.header_columns().map(|column_count| {
+            // Capture absolute starts so a later promotion can rewind to the true header.
+            MarkdownTableHeaderCandidate {
+                start_utf16: utf16_range.start,
+                start_byte: byte_range.start,
+                column_count,
+            }
+        });
         self.document_start = false;
     }
 }
@@ -507,7 +522,7 @@ pub(super) fn markdown_line_end_offsets(bytes: &[u8], start: usize) -> (usize, u
     (bytes.len(), bytes.len(), false)
 }
 
-#[cfg(any(test, feature = "native-markdown-candidate"))]
+#[cfg(test)]
 /// Recognize Markdown blank-line whitespace without treating other Unicode text as empty.
 pub(super) fn markdown_line_is_blank(line: &str) -> bool {
     line.bytes().all(|byte| {
@@ -516,19 +531,19 @@ pub(super) fn markdown_line_is_blank(line: &str) -> bool {
     })
 }
 
-#[cfg(any(test, feature = "native-markdown-candidate"))]
+#[cfg(test)]
 /// Recognize a first-line YAML-style delimiter with an optional UTF-8 BOM.
 pub(super) fn markdown_opens_front_matter(line: &str) -> bool {
     line.strip_prefix('\u{feff}').unwrap_or(line).trim() == "---"
 }
 
-#[cfg(any(test, feature = "native-markdown-candidate"))]
+#[cfg(test)]
 /// Recognize either supported front-matter terminator after surrounding whitespace.
 pub(super) fn markdown_closes_front_matter(line: &str) -> bool {
     matches!(line.trim(), "---" | "...")
 }
 
-#[cfg(any(test, feature = "native-markdown-candidate"))]
+#[cfg(test)]
 /// Recognize a conservative backtick or tilde fence and retain its closing threshold.
 pub(super) fn markdown_opening_fence(line: &str) -> Option<(u8, usize)> {
     let bytes = line.as_bytes();
@@ -564,7 +579,7 @@ pub(super) fn markdown_opening_fence(line: &str) -> Option<(u8, usize)> {
     Some((marker, marker_length))
 }
 
-#[cfg(any(test, feature = "native-markdown-candidate"))]
+#[cfg(test)]
 /// Require a compatible fence run followed only by permitted horizontal whitespace.
 pub(super) fn markdown_closes_fence(line: &str, marker: u8, minimum_length: usize) -> bool {
     let bytes = line.as_bytes();
@@ -593,14 +608,14 @@ pub(super) fn markdown_closes_fence(line: &str, marker: u8, minimum_length: usiz
         })
 }
 
-#[cfg(any(test, feature = "native-markdown-candidate"))]
+#[cfg(test)]
 /// Recognize a possible table header using unescaped, non-code pipe separators.
 pub(super) fn markdown_table_header_column_count(line: &str) -> Option<usize> {
     let pipe_count = markdown_unescaped_table_pipe_count(line);
     (pipe_count > 0).then_some(markdown_table_column_count(line, pipe_count))
 }
 
-#[cfg(any(test, feature = "native-markdown-candidate"))]
+#[cfg(test)]
 /// Validate each delimiter cell before promoting a header into a table.
 pub(super) fn markdown_table_delimiter_column_count(line: &str) -> Option<usize> {
     let trimmed = line.trim();
@@ -634,13 +649,13 @@ pub(super) fn markdown_table_delimiter_column_count(line: &str) -> Option<usize>
     (column_count > 0).then_some(column_count)
 }
 
-#[cfg(any(test, feature = "native-markdown-candidate"))]
+#[cfg(test)]
 /// Conservatively retain nonblank pipe-bearing lines inside a table envelope.
 pub(super) fn markdown_table_body_line(line: &str) -> bool {
     !markdown_line_is_blank(line) && markdown_unescaped_table_pipe_count(line) > 0
 }
 
-#[cfg(any(test, feature = "native-markdown-candidate"))]
+#[cfg(test)]
 /// Count structural pipe bytes while skipping escapes and matching inline-code runs.
 pub(super) fn markdown_unescaped_table_pipe_count(line: &str) -> usize {
     let bytes = line.as_bytes();
@@ -682,7 +697,7 @@ pub(super) fn markdown_unescaped_table_pipe_count(line: &str) -> usize {
     count
 }
 
-#[cfg(any(test, feature = "native-markdown-candidate"))]
+#[cfg(test)]
 /// Convert separator count into cells while excluding optional outer table pipes.
 pub(super) fn markdown_table_column_count(line: &str, pipe_count: usize) -> usize {
     let leading = usize::from(line.trim_start().starts_with('|'));
@@ -692,7 +707,7 @@ pub(super) fn markdown_table_column_count(line: &str, pipe_count: usize) -> usiz
         .saturating_sub(leading + trailing)
 }
 
-#[cfg(any(test, feature = "native-markdown-candidate"))]
+#[cfg(test)]
 /// Recognize bullet or numeric list prefixes and report the complete marker width.
 pub(super) fn markdown_list_marker_length(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
@@ -729,7 +744,7 @@ pub(super) fn markdown_list_marker_length(line: &str) -> Option<usize> {
     }
 }
 
-#[cfg(any(test, feature = "native-markdown-candidate"))]
+#[cfg(test)]
 /// Keep list envelopes open for another item marker or sufficiently indented continuation.
 pub(super) fn markdown_list_continuation_line(line: &str) -> bool {
     markdown_list_marker_length(line).is_some()

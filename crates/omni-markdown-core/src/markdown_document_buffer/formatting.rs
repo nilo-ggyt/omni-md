@@ -1,5 +1,6 @@
 //! Atomic Markdown commands over shared pieces, without materializing the selected body.
 
+use super::changes::{MarkdownObservedEditError, MarkdownTextChangeObserver};
 use super::*;
 
 pub(super) mod streaming;
@@ -31,6 +32,24 @@ pub enum MarkdownFormatAction {
     CodeBlock,
     FormulaBlock,
     Table,
+}
+
+impl MarkdownFormatAction {
+    #[must_use]
+    /// 正文与已验证单格共用行内源标记和空选区占位文字；块命令不具有格内包裹语义。
+    pub fn inline_markers(self) -> Option<(&'static str, &'static str, &'static str)> {
+        match self {
+            Self::Bold => Some(("**", "**", "加粗文字")), // 保留既有加粗分隔符与占位文字。
+            Self::Italic => Some(("*", "*", "斜体文字")), // 不额外解释或切换已有标记。
+            Self::Underline => Some(("<u>", "</u>", "下划线文字")), // 下划线继续使用 canonical HTML。
+            Self::Strikethrough => Some(("~~", "~~", "删除线文字")), // GFM 成对波浪线。
+            Self::InlineCode => Some(("`", "`", "code")),           // 空 caret 保留原 code 占位。
+            Self::InlineFormula => Some(("$", "$", "x^2")),         // 行内公式只包裹表达式。
+            Self::Superscript => Some(("<sup>", "</sup>", "上标")), // 上标仍为明确 HTML 源。
+            Self::Link => Some(("[", "](https://)", "链接文字")),   // URL 模板不进入标签选区。
+            _ => None, // 标题、列表与模板保持各自正文块计划，不伪造表格行内表达。
+        }
+    }
 }
 
 /// A constant-size plan keeps only markers and coordinates, never a selected-text copy.
@@ -76,20 +95,29 @@ impl MarkdownDocumentBuffer {
         action: MarkdownFormatAction,
         selection: MarkdownTextSelection,
     ) -> Result<MarkdownHistoryTextEdit, MarkdownDocumentBufferError> {
-        // Validate both native endpoints before deriving lines or allocating any edit storage.
+        self.apply_format_observed(action, selection, changes::NoopObserver)
+            .map(|(edit, ())| edit)
+            .map_err(changes::legacy_error)
+    }
+
+    /// 格式化保留真实插入/替换边界，不能把两侧Surround误当覆盖中间正文的一项替换。
+    pub fn apply_format_observed<O: MarkdownTextChangeObserver>(
+        &mut self,
+        action: MarkdownFormatAction,
+        selection: MarkdownTextSelection,
+        observer: O,
+    ) -> Result<(MarkdownHistoryTextEdit, O::Output), MarkdownObservedEditError<O::Error>> {
+        self.ensure_text_input_idle()?;
         self.validate_selection(selection)?;
         let plan = self.plan_format(action, selection)?;
         let (metrics, result_bytes) = plan.geometry(self)?;
-        // Formatting and keyboard commands share the same rollback and single-history publication.
-        super::command_transaction::commit_command(
+        super::command_transaction::commit_command_observed(
             self,
             metrics,
             result_bytes,
             selection,
-            |document| {
-                // Only this unpublished candidate may acquire appended canonical marker bytes.
-                plan.prepare(document)
-            },
+            observer,
+            |document, observer| plan.prepare(document, observer),
         )
     }
 
@@ -107,22 +135,14 @@ impl MarkdownDocumentBuffer {
             Ok(wrap_plan(start..end, opening, closing, placeholder))
         };
         match action {
-            // Inline emphasis preserves selected pieces and supplies the historical empty placeholder.
-            Bold => wrap("**", "**", "加粗文字"),
-            // Italic uses single asterisk markers without toggling or interpreting existing Markdown.
-            Italic => wrap("*", "*", "斜体文字"),
-            // Underline remains the HTML spelling understood by the product renderer.
-            Underline => wrap("<u>", "</u>", "下划线文字"),
-            // Strikethrough retains the baseline's GFM double-tilde spelling.
-            Strikethrough => wrap("~~", "~~", "删除线文字"),
-            // Inline code selects a short editable code placeholder at an empty caret.
-            InlineCode => wrap("`", "`", "code"),
-            // Formula markers retain their original literal content and selection offsets.
-            InlineFormula => wrap("$", "$", "x^2"),
-            // Superscript is represented by literal HTML tags, not an attributed-text-only style.
-            Superscript => wrap("<sup>", "</sup>", "上标"),
-            // Links select their label while leaving the URL template outside that selection.
-            Link => wrap("[", "](https://)", "链接文字"),
+            Bold | Italic | Underline | Strikethrough | InlineCode | InlineFormula
+            | Superscript | Link => {
+                // 此分支按相同八种 enum 准入；与单格格式消费同一领域投影，不维护第二套标记。
+                let (opening, closing, placeholder) = action
+                    .inline_markers()
+                    .expect("行内格式分支必须具有领域标记");
+                wrap(opening, closing, placeholder)
+            }
             // Heading levels replace an existing H1-H6 prefix on the head's current line only.
             Heading1 => self.plan_heading("# ", selection),
             // H2 changes only the requested level; its line and selection mapping follow the same contract.
@@ -302,10 +322,11 @@ impl FormatPlan {
     }
 
     /// Build an unpublished persistent root, sharing every unaffected and selected original piece.
-    fn prepare(
+    fn prepare<O: MarkdownTextChangeObserver>(
         self,
         document: &mut MarkdownDocumentBuffer,
-    ) -> Result<(PieceTreeLink, MarkdownTextSelection), MarkdownDocumentBufferError> {
+        observer: &mut O,
+    ) -> Result<(PieceTreeLink, MarkdownTextSelection), MarkdownObservedEditError<O::Error>> {
         // Each plan prepares a private root; the caller alone publishes it and its history memento.
         match self {
             // Static replacement text is appended only after the caller's complete size preflight.
@@ -316,6 +337,12 @@ impl FormatPlan {
             } => {
                 let byte_range = document.byte_offset_for_utf16(range.start)?
                     ..document.byte_offset_for_utf16(range.end)?;
+                changes::emit(
+                    document,
+                    observer,
+                    range.clone(),
+                    text.encode_utf16().count(),
+                )?;
                 let inserted = append_marker(document, text)?;
                 let root =
                     replace_tree_range(document, document.root.clone(), byte_range, inserted)?;
@@ -328,6 +355,27 @@ impl FormatPlan {
                 closing,
                 placeholder,
             } => {
+                if let Some(placeholder) = placeholder {
+                    // 空选区模板是一项真实插入；不构造三项重叠的伪替换。
+                    let inserted = opening.encode_utf16().count()
+                        + placeholder.encode_utf16().count()
+                        + closing.encode_utf16().count();
+                    changes::emit(document, observer, range.clone(), inserted)?;
+                } else {
+                    // 非空选区仅两端插入，中间原文与其中fold保持独立。
+                    changes::emit(
+                        document,
+                        observer,
+                        range.start..range.start,
+                        opening.encode_utf16().count(),
+                    )?;
+                    changes::emit(
+                        document,
+                        observer,
+                        range.end..range.end,
+                        closing.encode_utf16().count(),
+                    )?;
+                }
                 let start = document.byte_offset_for_utf16(range.start)?;
                 let end = document.byte_offset_for_utf16(range.end)?;
                 let closing_root = append_marker(document, closing)?;
@@ -363,8 +411,14 @@ impl FormatPlan {
             } => {
                 if last - first + 1 > MAX_SPARSE_PREFIX_LINES {
                     // Copy directly into new canonical edit segments, with no selected-body mirror.
-                    let root = prepare_dense_line_prefix(document, first, last, prefix)?;
+                    let root = prepare_dense_line_prefix(document, first, last, prefix, observer)?;
                     return Ok((root, selection_after));
+                }
+                // 稀疏行数已有4096上限；先升序发真实插入，随后仍沿旧算法倒序组树。
+                for line in first..=last {
+                    let at =
+                        document.utf16_offset_for_byte(document.byte_offset_for_line(line)?)?;
+                    changes::emit(document, observer, at..at, prefix.encode_utf16().count())?;
                 }
                 // Only a finite number of split/rejoin operations may duplicate original leaf metadata.
                 let inserted = append_marker(document, prefix)?;

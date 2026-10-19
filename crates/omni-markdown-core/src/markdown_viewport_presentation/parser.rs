@@ -2,11 +2,15 @@
 
 use super::*;
 
+mod heading_markers;
+pub(crate) use heading_markers::HeadingMarkerTail;
+
 #[derive(Default)]
 /// Completed bounded projection output transferred into the public presentation cache.
 pub(super) struct MarkdownPresentationBuild {
     pub(super) runs: Vec<MarkdownPresentationRun>,
     pub(super) tables: Vec<MarkdownTablePrototype>,
+    pub(super) list_markers: Vec<MarkdownPreviewListMarker>,
 }
 
 #[derive(Clone, Debug)]
@@ -14,7 +18,7 @@ pub(super) struct MarkdownPresentationBuild {
 pub(super) struct MarkdownByteDecoration {
     pub(super) byte_range: Range<usize>,
     pub(super) styles: MarkdownPresentationStyles,
-    pub(super) marker_owner: Option<Range<usize>>,
+    pub(super) marker_owner: Option<super::prefixes::MarkdownMarkerOwner>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,29 +65,153 @@ pub(super) struct MarkdownStyleTransition {
     pub(super) delta: i8,
 }
 
-/// Parse one complete bounded envelope into byte decorations, table prototypes, and UTF-16 runs.
+/// 普通完整envelope保持既有解析选项、引用范围和underline配对，不为窗口候选增加额外缓存。
 pub(super) fn build_markdown_presentation(
     source: &str,
     absolute_utf16_start: usize,
     active_selection: &Range<usize>,
 ) -> Result<MarkdownPresentationBuild, MarkdownViewportPresentationError> {
-    let mut decorations = Vec::new();
+    build_markdown_presentation_with_context(
+        source,
+        absolute_utf16_start,
+        active_selection,
+        absolute_utf16_start == 0,
+        None,
+        true,
+    )
+}
+
+/// 属性与有限引用查询使用完全相同的Parser选项，防止两条路径识别不同的inline标签。
+pub(crate) fn markdown_presentation_options(actual_document_start: bool) -> Options {
     let mut options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_MATH
         | Options::ENABLE_GFM
         | Options::ENABLE_SUPERSCRIPT
+        | Options::ENABLE_SUBSCRIPT
         | Options::ENABLE_FOOTNOTES;
-    if absolute_utf16_start == 0 {
-        // Only the actual document beginning can interpret a YAML metadata block.
+    if actual_document_start {
+        // 投影起点不等于真实文档起点；只有调用方提供的真实首行才启用YAML规则。
         options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
     }
+    options
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum MarkdownPresentationReferenceContext<'a> {
+    Definitions(&'a str),
+    #[cfg(feature = "s2-table-window-prototype")]
+    Resolved(&'a table_window::references::MarkdownTableReferenceQueries),
+}
+
+/// 有限投影复用相同public Parser；外部定义只用于查找，跨源片段underline必须由真实源证明。
+pub(super) fn build_markdown_presentation_with_context<'a>(
+    source: &'a str,
+    absolute_utf16_start: usize,
+    active_selection: &Range<usize>,
+    actual_document_start: bool,
+    reference_context: Option<&'a str>,
+    local_underline: bool,
+) -> Result<MarkdownPresentationBuild, MarkdownViewportPresentationError> {
+    build_markdown_presentation_with_reference_context(
+        source,
+        absolute_utf16_start,
+        active_selection,
+        actual_document_start,
+        reference_context.map(MarkdownPresentationReferenceContext::Definitions),
+        local_underline,
+    )
+}
+
+/// resolver只借当前有限查询和值；普通envelope保留原有局部RefDefs行为。
+pub(super) fn build_markdown_presentation_with_reference_context<'a>(
+    source: &'a str,
+    absolute_utf16_start: usize,
+    active_selection: &Range<usize>,
+    actual_document_start: bool,
+    reference_context: Option<MarkdownPresentationReferenceContext<'a>>,
+    local_underline: bool,
+) -> Result<MarkdownPresentationBuild, MarkdownViewportPresentationError> {
+    build_markdown_presentation_with_seeded_reference_context(
+        source,
+        absolute_utf16_start,
+        active_selection,
+        actual_document_start,
+        reference_context,
+        local_underline,
+        #[cfg(feature = "s2-table-window-prototype")]
+        None,
+    )
+}
+
+/// 真实source producer提供每个投影row的数学入口状态；普通路径不提供seed，沿原Parser行为。
+pub(super) fn build_markdown_presentation_with_seeded_reference_context<'a>(
+    source: &'a str,
+    absolute_utf16_start: usize,
+    active_selection: &Range<usize>,
+    actual_document_start: bool,
+    reference_context: Option<MarkdownPresentationReferenceContext<'a>>,
+    local_underline: bool,
+    #[cfg(feature = "s2-table-window-prototype")] math_seeds: Option<
+        &[pulldown_cmark::math_context::TableMathSeed],
+    >,
+) -> Result<MarkdownPresentationBuild, MarkdownViewportPresentationError> {
+    let mut decorations = Vec::new();
+    let options = markdown_presentation_options(actual_document_start);
     let mut item_ranges = Vec::new();
+    let mut item_prefixes = Vec::new();
+    let mut prefixes = super::prefixes::MarkdownPrefixBuilder::default();
     let mut table_prototypes = Vec::new();
     let mut active_table = None;
 
-    for (event, byte_range) in Parser::new_ext(source, options).into_offset_iter() {
+    // 普通路径为None，不构造第二Parser；窗口路径的定义文本已由入口单独计入有限预算。
+    let references = match reference_context {
+        Some(MarkdownPresentationReferenceContext::Definitions(text)) => {
+            Some(Parser::new_ext(text, options))
+        }
+        #[cfg(feature = "s2-table-window-prototype")]
+        Some(MarkdownPresentationReferenceContext::Resolved(_)) | None => None,
+        #[cfg(not(feature = "s2-table-window-prototype"))]
+        None => None,
+    };
+    let mut resolve_reference = |link: pulldown_cmark::BrokenLink<'a>| {
+        #[cfg(feature = "s2-table-window-prototype")]
+        if let Some(MarkdownPresentationReferenceContext::Resolved(queries)) = reference_context {
+            // 已验证的有限值活到此Parser结束；callback借用URL/title，不为每个链接再复制值。
+            return queries
+                .resolve(&link.reference)
+                .map(|(destination, title)| (destination.into(), title.into()));
+        }
+        // 使用固定依赖自己的label规范化/first-wins查找，不重写Unicode大小写或返回伪造URL。
+        references.as_ref().and_then(|parser| {
+            parser
+                .reference_definitions()
+                .get(&link.reference)
+                .map(|definition| {
+                    // resolver的局部Parser寿命更短，返回有限独立metadata；外层Parser的expansion fuel限制总量。
+                    (
+                        definition.dest.clone().into_static(),
+                        definition
+                            .title
+                            .clone()
+                            .map_or_else(|| "".into(), |title| title.into_static()),
+                    )
+                })
+        })
+    };
+    let callback = reference_context.map(|_| &mut resolve_reference);
+    #[cfg(feature = "s2-table-window-prototype")]
+    let parser = if let Some(seeds) = math_seeds {
+        // seed预算在任何AST创建前核验；失败不退回无seed的错误语义。
+        Parser::new_with_table_math_seeds(source, options, callback, seeds)
+            .map_err(|_| MarkdownViewportPresentationError::InvalidParserBoundary)?
+    } else {
+        Parser::new_with_broken_link_callback(source, options, callback)
+    };
+    #[cfg(not(feature = "s2-table-window-prototype"))]
+    let parser = Parser::new_with_broken_link_callback(source, options, callback);
+    for (event, byte_range) in parser.into_offset_iter() {
         // Consume parser events once while retaining only active list and table construction state.
         match event {
             // Start events establish source spans or nested structures used by later end events.
@@ -97,19 +225,14 @@ pub(super) fn build_markdown_presentation(
                     )?;
                     add_heading_markers(source, &byte_range, &mut decorations)?;
                 }
-                // Block quotes retain source text while exposing their per-line quote prefixes.
+                // quote范围只证明容器归属；物理前缀在事件结束后按容器次序单次分配。
                 Tag::BlockQuote(_) => {
                     push_markdown_decoration(
                         &mut decorations,
                         byte_range.clone(),
                         MarkdownPresentationStyles::BLOCK_QUOTE,
                     )?;
-                    add_line_prefix_markers(
-                        source,
-                        &byte_range,
-                        MarkdownLineMarkerKind::BlockQuote,
-                        &mut decorations,
-                    )?;
+                    prefixes.quote(byte_range, &decorations)?;
                 }
                 // Both indented and fenced code receive code styling without executing their contents.
                 Tag::CodeBlock(kind) => {
@@ -133,21 +256,13 @@ pub(super) fn build_markdown_presentation(
                         MarkdownPresentationStyles::UNORDERED_LIST
                     };
                     push_markdown_decoration(&mut decorations, byte_range.clone(), style)?;
-                    add_line_prefix_markers(
-                        source,
-                        &byte_range,
-                        if start.is_some() {
-                            // Ordered lists need numeric-prefix recognition for their visible markers.
-                            MarkdownLineMarkerKind::OrderedList
-                        } else {
-                            // Unordered lists need bullet-prefix recognition instead.
-                            MarkdownLineMarkerKind::UnorderedList
-                        },
-                        &mut decorations,
-                    )?;
                 }
-                // Retain nested item ownership so task checkboxes belong to the current item.
-                Tag::Item => item_ranges.push(byte_range),
+                // 只记录真实Item opening；整List中的lazy正文或代码不得凭行首字符变成marker。
+                Tag::Item => {
+                    let prefix = prefixes.item(source, byte_range.clone(), &decorations)?;
+                    item_ranges.push(byte_range);
+                    item_prefixes.push(prefix);
+                }
                 // A table start owns one local builder and its alignment metadata until the matching end event.
                 Tag::Table(alignments) => {
                     push_markdown_decoration(
@@ -211,13 +326,23 @@ pub(super) fn build_markdown_presentation(
                         &mut decorations,
                     )?;
                 }
-                // Strikethrough tracks its paired tilde markers.
+                // 双波浪号保留删除线；单波浪号由启用后的真实Subscript标签单独解释。
                 Tag::Strikethrough => {
                     add_delimited_inline_structure(
                         source,
                         &byte_range,
                         MarkdownPresentationStyles::STRIKETHROUGH,
                         &["~~"],
+                        &mut decorations,
+                    )?;
+                }
+                // 只消费Parser确认的单波浪号配对；沿原owner/活动选区规则隐藏或显露定界符。
+                Tag::Subscript => {
+                    add_delimited_inline_structure(
+                        source,
+                        &byte_range,
+                        MarkdownPresentationStyles::SUBSCRIPT,
+                        &["~"],
                         &mut decorations,
                     )?;
                 }
@@ -241,18 +366,25 @@ pub(super) fn build_markdown_presentation(
                     add_link_markers(source, &byte_range, &mut decorations)?;
                 }
                 // These containers preserve literal source without adding an independent decoration style.
+                Tag::FootnoteDefinition(_) => {
+                    // GFM脚注真实容器只为后续quote/list前缀提供四列continuation，不把label当marker。
+                    prefixes.footnote(byte_range, &decorations)?;
+                }
                 Tag::Paragraph
                 | Tag::HtmlBlock
-                | Tag::FootnoteDefinition(_)
                 | Tag::DefinitionList
                 | Tag::DefinitionListTitle
                 | Tag::DefinitionListDefinition
-                | Tag::MetadataBlock(_)
-                | Tag::Subscript => {}
+                | Tag::MetadataBlock(_) => {}
             },
             // An item end releases its nested task-marker ownership range.
             Event::End(TagEnd::Item) => {
                 item_ranges.pop();
+                item_prefixes.pop();
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                // 与真实quote Start配平，仅影响后续叶屏障的有限收集。
+                prefixes.end_quote()?;
             }
             // Row-end events finish cell accumulation for the active row.
             Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
@@ -269,9 +401,14 @@ pub(super) fn build_markdown_presentation(
                 table_prototypes.push(finish_markdown_table(source, table, &mut decorations)?);
             }
             // Ordinary text and breaks already inherit their enclosing source-span styles.
-            Event::End(_) | Event::Text(_) | Event::SoftBreak | Event::HardBreak => {}
+            Event::End(_) | Event::SoftBreak | Event::HardBreak => {}
+            Event::Text(_) => {
+                // 原始Text起点由Parser越过真实容器后授予，只屏蔽该起点所在行的字面内容。
+                prefixes.content(byte_range.start, &decorations)?;
+            }
             // Inline code receives code styling plus matching backtick delimiter spans.
             Event::Code(_) => {
+                prefixes.content(byte_range.start, &decorations)?;
                 add_backtick_code_structure(source, &byte_range, &mut decorations)?;
             }
             // Math remains source text with formula styling and tracked dollar delimiters.
@@ -288,29 +425,46 @@ pub(super) fn build_markdown_presentation(
                 push_markdown_marker(&mut decorations, byte_range.clone(), &byte_range)?;
             }
             // Task checkboxes retain visible marker styling and the current item ownership range.
-            Event::TaskListMarker(_) => {
+            Event::TaskListMarker(checked) => {
                 push_markdown_decoration(
                     &mut decorations,
                     byte_range.clone(),
                     MarkdownPresentationStyles::TASK_LIST,
                 )?;
+                let item = item_prefixes
+                    .last()
+                    .copied()
+                    .ok_or(MarkdownViewportPresentationError::InvalidParserBoundary)?;
+                prefixes.task(source, byte_range.clone(), checked, item, &decorations)?;
                 let owner = item_ranges.last().unwrap_or(&byte_range);
                 push_markdown_visible_marker(&mut decorations, byte_range.clone(), owner)?;
             }
             // Raw HTML stays literal source. A separate exact allowlist below
             // handles <u>; this boundary never generates HTML or executes URLs/scripts.
             // Raw HTML and footnote references remain literal; only exact underline tags receive the separate allowlist pass.
-            Event::Html(_) | Event::InlineHtml(_) | Event::FootnoteReference(_) => {}
+            Event::Html(_) | Event::InlineHtml(_) | Event::FootnoteReference(_) => {
+                // HTML与引用字面仍不执行；起点同样阻止把正文中的`>`误作容器前缀。
+                prefixes.content(byte_range.start, &decorations)?;
+            }
         }
     }
 
-    add_sanitized_underline_structures(source, &mut decorations)?;
+    let list_markers = prefixes.finish(source, &mut decorations)?;
+    if local_underline {
+        // 完整真实envelope仍保原配对；窗口gap不能拿省略行之后的标签制造新配对。
+        add_sanitized_underline_structures(source, &mut decorations, list_markers.len())?;
+    }
+    if decorations.len() + list_markers.len() > MAX_MARKDOWN_PRESENTATION_DECORATIONS {
+        // underline最后补入的记录也参与总预算，超限不能半发布列表glyph或引用隐藏。
+        return Err(MarkdownViewportPresentationError::DecorationLimitExceeded);
+    }
     markdown_byte_presentation_to_viewport(
         source,
         absolute_utf16_start,
         active_selection,
         decorations,
         table_prototypes,
+        list_markers,
     )
 }
 
@@ -378,7 +532,9 @@ pub(super) fn push_markdown_marker(
     decorations.push(MarkdownByteDecoration {
         byte_range: marker_range,
         styles: MarkdownPresentationStyles::MARKER,
-        marker_owner: Some(owner_range.clone()),
+        marker_owner: Some(super::prefixes::MarkdownMarkerOwner::Structure(
+            owner_range.clone(),
+        )),
     });
     Ok(())
 }
@@ -407,8 +563,8 @@ pub(super) fn push_markdown_visible_marker(
     )
 }
 
-/// Determine whether editing currently activates a marker's owning structure.
-pub(super) fn markdown_selection_intersects(
+/// 判断选区是否激活原结构 owner；真实有限语义与旧投影共用同一显隐规则。
+pub(crate) fn markdown_selection_intersects(
     selection: &Range<usize>,
     structure: &Range<usize>,
 ) -> bool {
@@ -621,15 +777,16 @@ pub(super) fn add_heading_markers(
             byte_range,
         )?;
 
-        let trimmed_end = first_line.trim_end_matches([' ', '\t']).len();
-        let closing_start = first_line[..trimmed_end].trim_end_matches('#').len();
-        if closing_start < trimmed_end && first_line[..closing_start].ends_with([' ', '\t']) {
-            // Only whitespace-separated trailing hashes are heading syntax rather than literal content.
-            push_markdown_marker(
-                decorations,
-                byte_range.start + closing_start..byte_range.start + first_line.len(),
-                byte_range,
-            )?;
+        let mut tail =
+            HeadingMarkerTail::new(byte_range.start, byte_range.start + first_line.len());
+        for &byte in first_line.as_bytes().iter().rev() {
+            tail.observe_reverse(byte);
+            if tail.done() {
+                break; // 与有限来源共用原tail规则，只扫描实际决定closing显示范围的尾段。
+            }
+        }
+        if let Some(marker) = tail.marker() {
+            push_markdown_marker(decorations, marker, byte_range)?;
         }
         return Ok(());
     }
@@ -661,6 +818,7 @@ pub(super) fn add_heading_markers(
     Ok(())
 }
 
+#[cfg(feature = "s2-table-window-prototype")]
 #[derive(Clone, Copy)]
 /// Prefix grammar selected from a parser-confirmed block container.
 pub(super) enum MarkdownLineMarkerKind {
@@ -669,77 +827,32 @@ pub(super) enum MarkdownLineMarkerKind {
     OrderedList,
 }
 
-/// Track quote or list source prefixes per line while retaining their native marker visibility.
-pub(super) fn add_line_prefix_markers(
-    source: &str,
-    byte_range: &Range<usize>,
-    marker_kind: MarkdownLineMarkerKind,
-    decorations: &mut Vec<MarkdownByteDecoration>,
-) -> Result<(), MarkdownViewportPresentationError> {
-    let Some(fragment) = source.get(byte_range.clone()) else {
-        // Parser offsets must describe a scalar-aligned slice of the supplied bounded source.
-        return Err(MarkdownViewportPresentationError::InvalidParserBoundary);
+#[cfg(feature = "s2-table-window-prototype")]
+/// 已验证单个物理行复用既有marker识别；只返回当前真实byte range，不携带text或AST。
+pub(crate) fn table_line_prefix_marker(
+    line: &str,
+    local_start: usize,
+    kind: pulldown_cmark::block_frontier::TableScopeKind,
+) -> Result<Option<Range<usize>>, MarkdownViewportPresentationError> {
+    use pulldown_cmark::block_frontier::TableScopeKind;
+    let marker = match kind {
+        TableScopeKind::BlockQuote => MarkdownLineMarkerKind::BlockQuote,
+        TableScopeKind::OrderedList => MarkdownLineMarkerKind::OrderedList,
+        TableScopeKind::UnorderedList => MarkdownLineMarkerKind::UnorderedList,
+        TableScopeKind::Other => return Ok(None),
     };
-    let mut line_start = 0;
-    for line in fragment.split_inclusive('\n') {
-        // Each complete source line independently determines its indentation and recognized marker width.
-        let line_without_newline = line.trim_end_matches(['\r', '\n']);
-        let indentation = line_without_newline
-            .bytes()
-            .take_while(|byte| {
-                // Leading horizontal whitespace positions the line prefix without becoming marker syntax itself.
-                *byte == b' ' || *byte == b'\t'
-            })
-            .count();
-        let content = &line_without_newline[indentation..];
-        let marker_length = match marker_kind {
-            // A quote prefix owns the greater-than sign and an optional following space.
-            MarkdownLineMarkerKind::BlockQuote => content
-                .strip_prefix('>')
-                .map(|rest| {
-                    // Include the quote sign plus at most one optional source separator space.
-                    1 + usize::from(rest.starts_with(' '))
-                })
-                .unwrap_or(0),
-            // A bullet requires one recognized marker followed by whitespace.
-            MarkdownLineMarkerKind::UnorderedList => content
-                .as_bytes()
-                .first()
-                .filter(|marker| {
-                    // Only the supported bullet markers can establish an unordered-list source prefix.
-                    matches!(marker, b'-' | b'+' | b'*')
-                })
-                .and_then(|_| {
-                    // A candidate bullet must also have a following separator byte.
-                    content.as_bytes().get(1)
-                })
-                .filter(|separator| {
-                    // The marker is structural only when separated from following text by whitespace.
-                    separator.is_ascii_whitespace()
-                })
-                .map_or(0, |_| {
-                    // A validated bullet prefix owns exactly its marker and one separator byte.
-                    2
-                }),
-            // An ordered item uses the shared numeric-prefix validation rule.
-            MarkdownLineMarkerKind::OrderedList => ordered_list_marker_length(content),
-        };
-        if marker_length != 0 {
-            // Only a recognized prefix produces a marker decoration; continuation text stays literal.
-            let absolute_line_start = byte_range.start + line_start;
-            let line_owner = absolute_line_start..absolute_line_start + line.len();
-            push_markdown_visible_marker(
-                decorations,
-                absolute_line_start + indentation
-                    ..absolute_line_start + indentation + marker_length,
-                &line_owner,
-            )?;
-        }
-        line_start += line.len();
+    if line.contains(['\r', '\n']) {
+        // 此窄入口只接受已验证container prefix，不借它重新扫描整个container或cell正文。
+        return Err(MarkdownViewportPresentationError::InvalidParserBoundary);
     }
-    Ok(())
+    let suffix = line
+        .get(local_start..)
+        .ok_or(MarkdownViewportPresentationError::InvalidParserBoundary)?;
+    Ok(markdown_line_prefix_marker_range(suffix, marker)
+        .map(|range| local_start + range.start..local_start + range.end))
 }
 
+#[cfg(feature = "s2-table-window-prototype")]
 /// Return a complete numeric-list prefix width or zero for ordinary source text.
 pub(super) fn ordered_list_marker_length(content: &str) -> usize {
     let digits = content.bytes().take_while(u8::is_ascii_digit).count();
@@ -889,6 +1002,53 @@ pub(super) fn finish_markdown_table(
     })
 }
 
+#[cfg(feature = "s2-table-window-prototype")]
+/// 原有quote/list标记判定的无分配共享内核；完整Parser和窗口prefix必须返回相同byte范围。
+fn markdown_line_prefix_marker_range(
+    line: &str,
+    marker_kind: MarkdownLineMarkerKind,
+) -> Option<Range<usize>> {
+    let line_without_newline = line.trim_end_matches(['\r', '\n']);
+    let indentation = line_without_newline
+        .bytes()
+        .take_while(|byte| matches!(*byte, b' ' | b'\t'))
+        .count();
+    let content = &line_without_newline[indentation..];
+    let marker_length = match marker_kind {
+        // 引用只拥有真实'>'和至多一个分隔空格，不把后续正文吞成marker。
+        MarkdownLineMarkerKind::BlockQuote => content
+            .strip_prefix('>')
+            .map(|rest| {
+                // 与完整源Parser保持同一个可见marker长度规则。
+                1 + usize::from(rest.starts_with(' '))
+            })
+            .unwrap_or(0),
+        // 无序列表必须同时存在受支持的marker和其后的分隔空白。
+        MarkdownLineMarkerKind::UnorderedList => content
+            .as_bytes()
+            .first()
+            .filter(|marker| {
+                // 其他标点不能借容器身份升级成列表marker。
+                matches!(marker, b'-' | b'+' | b'*')
+            })
+            .and_then(|_| {
+                // 行尾孤立marker没有分隔字节，因此不发布可见范围。
+                content.as_bytes().get(1)
+            })
+            .filter(|separator| {
+                // 分隔条件仍复用原ASCII规则，不另造投影专用列表语法。
+                separator.is_ascii_whitespace()
+            })
+            .map_or(0, |_| {
+                // 已验证前缀只拥有marker及第一个分隔字节。
+                2
+            }),
+        // 有序列表沿用原数值前缀校验；不从scope ordinal猜写数字宽度。
+        MarkdownLineMarkerKind::OrderedList => ordered_list_marker_length(content),
+    };
+    (marker_length != 0).then_some(indentation..indentation + marker_length)
+}
+
 /// Map parser alignment into presentation bits used by native table cells.
 pub(super) fn markdown_table_alignment_style(alignment: Alignment) -> MarkdownPresentationStyles {
     match alignment {
@@ -1032,30 +1192,33 @@ pub(super) fn trim_markdown_table_cell_range(
     Ok(range)
 }
 
-/// Recognize only exact paired underline tags without interpreting general HTML or attributes.
+/// 只识别真实allowlist的成对underline，并为已完成列表token预留同一记录预算。
 pub(super) fn add_sanitized_underline_structures(
     source: &str,
     decorations: &mut Vec<MarkdownByteDecoration>,
+    reserved_list_markers: usize,
 ) -> Result<(), MarkdownViewportPresentationError> {
-    let mut search_start = 0;
-    while let Some(open_relative) = source[search_start..].find("<u>") {
-        // Consume nonoverlapping exact tag pairs and advance beyond each complete structure.
-        let open = search_start + open_relative;
-        let content_start = open + "<u>".len();
-        let Some(close_relative) = source[content_start..].find("</u>") else {
-            // An unmatched exact opener remains literal source; general HTML is never interpreted.
-            break;
+    let mut scanner = super::underline::SanitizedUnderlineScanner::default();
+    for byte in source.bytes() {
+        // 普通有限envelope与新table context producer共用真实first-open→next-close状态，不在gap重配对。
+        let Some(pair) = scanner.push(byte) else {
+            continue;
         };
-        let close = content_start + close_relative;
-        let structure = open..close + "</u>".len();
+        let additional = 2 + usize::from(pair.content_start < pair.close_start);
+        if decorations.len() + reserved_list_markers + additional
+            > MAX_MARKDOWN_PRESENTATION_DECORATIONS
+        {
+            // 两个delimiter与非空内容style在任何push前整体准入，不能先越过共同8192硬界再拒绝。
+            return Err(MarkdownViewportPresentationError::DecorationLimitExceeded);
+        }
+        let structure = pair.open_start..pair.end;
         push_markdown_decoration(
             decorations,
-            content_start..close,
+            pair.content_start..pair.close_start,
             MarkdownPresentationStyles::UNDERLINE,
         )?;
-        push_markdown_marker(decorations, open..content_start, &structure)?;
-        push_markdown_marker(decorations, close..structure.end, &structure)?;
-        search_start = structure.end;
+        push_markdown_marker(decorations, pair.open_start..pair.content_start, &structure)?;
+        push_markdown_marker(decorations, pair.close_start..pair.end, &structure)?;
     }
     Ok(())
 }
@@ -1067,6 +1230,7 @@ pub(super) fn markdown_byte_presentation_to_viewport(
     active_selection: &Range<usize>,
     decorations: Vec<MarkdownByteDecoration>,
     table_prototypes: Vec<MarkdownByteTablePrototype>,
+    list_markers: Vec<super::prefixes::MarkdownByteListMarker>,
 ) -> Result<MarkdownPresentationBuild, MarkdownViewportPresentationError> {
     // Collect every distinct source endpoint before decoding Unicode; allocation stays viewport-bounded.
     let table_boundary_capacity = table_prototypes.iter().fold(0_usize, |total, table| {
@@ -1080,17 +1244,28 @@ pub(super) fn markdown_byte_presentation_to_viewport(
         decorations
             .len()
             .saturating_mul(4)
+            .saturating_add(list_markers.len().saturating_mul(4))
             .saturating_add(table_boundary_capacity),
     );
     for decoration in &decorations {
         // Collect both endpoints of every style span for the single coordinate translation pass.
         byte_boundaries.push(decoration.byte_range.start);
         byte_boundaries.push(decoration.byte_range.end);
-        if let Some(owner_range) = &decoration.marker_owner {
+        if let Some(owner) = &decoration.marker_owner {
+            let owner_range = owner.range();
             // Marker owners need their own endpoints to decide selection-dependent visibility.
             byte_boundaries.push(owner_range.start);
             byte_boundaries.push(owner_range.end);
         }
+    }
+    for marker in &list_markers {
+        // token与真实item owner共用同一坐标表，不重复解码前缀或持有第二份正文。
+        byte_boundaries.extend([
+            marker.range.start,
+            marker.range.end,
+            marker.owner.start,
+            marker.owner.end,
+        ]);
     }
     for table in &table_prototypes {
         // Include all table, header, delimiter, row, and cell boundaries in the same conversion set.
@@ -1120,7 +1295,8 @@ pub(super) fn markdown_byte_presentation_to_viewport(
     for decoration in decorations {
         // Consume decorations into style transitions after the shared coordinate map is complete.
         let mut styles = decoration.styles;
-        if let Some(owner_range) = &decoration.marker_owner {
+        if let Some(owner) = &decoration.marker_owner {
+            let owner_range = owner.range();
             // Only marker decorations with an owner have selection-dependent hiding behavior.
             let owner_start_index = byte_boundaries
                 .binary_search(&owner_range.start)
@@ -1130,7 +1306,7 @@ pub(super) fn markdown_byte_presentation_to_viewport(
                 .expect("Markdown marker owner end boundary was collected");
             let owner_utf16_range = absolute_utf16_start + utf16_boundaries[owner_start_index]
                 ..absolute_utf16_start + utf16_boundaries[owner_end_index];
-            if !markdown_selection_intersects(active_selection, &owner_utf16_range) {
+            if !owner.is_active(active_selection, &owner_utf16_range) {
                 // An inactive owning structure hides syntax while preserving source coordinates.
                 styles = styles.union(MarkdownPresentationStyles::HIDDEN_MARKER);
             }
@@ -1263,7 +1439,39 @@ pub(super) fn markdown_byte_presentation_to_viewport(
             cells,
         });
     }
-    Ok(MarkdownPresentationBuild { runs, tables })
+    let list_markers = list_markers
+        .into_iter()
+        .map(|marker| {
+            // item活动域仅看原选区两个端点；祖先Item自然包含嵌套端点，中间跨过的兄弟不误活动。
+            let owner_utf16_range = markdown_absolute_utf16_range(
+                &marker.owner,
+                absolute_utf16_start,
+                &byte_boundaries,
+                &utf16_boundaries,
+            );
+            let active = [active_selection.start, active_selection.end]
+                .into_iter()
+                .any(|position| {
+                    owner_utf16_range.start <= position && position <= owner_utf16_range.end
+                });
+            MarkdownPreviewListMarker {
+                utf16_range: markdown_absolute_utf16_range(
+                    &marker.range,
+                    absolute_utf16_start,
+                    &byte_boundaries,
+                    &utf16_boundaries,
+                ),
+                owner_utf16_range,
+                kind: marker.kind,
+                active,
+            }
+        })
+        .collect();
+    Ok(MarkdownPresentationBuild {
+        runs,
+        tables,
+        list_markers,
+    })
 }
 
 /// Translate a previously collected byte range through the validated shared boundary map.

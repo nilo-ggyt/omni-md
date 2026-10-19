@@ -24,6 +24,9 @@ const PREFIX_UNITS: usize = 1024;
 mod delimiters;
 mod lines;
 
+/// 真实旧坐标ChangeSet的有界折叠锚点映射；只准备候选，不修改文档或原生视图。
+pub mod anchor_mapping;
+
 use delimiters::{HtmlBlock, html_ends, scan_fence_delimiter};
 use lines::{Line, LineCursor};
 

@@ -17,12 +17,25 @@ use context::{Context, Kind, Scanner};
 use source::{SourceCursor, SourceLine, SourceLines, range_is_whitespace};
 use transaction::{Payload, Plan};
 
-/// Resolve one primary native selection without relying on an AppKit or CodeMirror syntax owner.
-pub(super) fn apply_markup_command(
+#[cfg(test)]
+// 既有语法golden继续走原签名；内部仍经同一个记录真实变化的Noop观察事务。
+fn apply_markup_command(
     document: &mut MarkdownDocumentBuffer,
     command: MarkdownEditingCommand,
     before: MarkdownTextSelection,
 ) -> Result<MarkdownEditingOutcome, MarkdownDocumentBufferError> {
+    apply_markup_command_observed(document, command, before, changes::NoopObserver)
+        .map(|(outcome, ())| outcome)
+        .map_err(changes::legacy_error)
+}
+
+/// Resolve one primary native selection without relying on an AppKit or CodeMirror syntax owner.
+pub(super) fn apply_markup_command_observed<O: MarkdownTextChangeObserver>(
+    document: &mut MarkdownDocumentBuffer,
+    command: MarkdownEditingCommand,
+    before: MarkdownTextSelection,
+    observer: O,
+) -> Result<(MarkdownEditingOutcome, O::Output), MarkdownObservedEditError<O::Error>> {
     let low = before.anchor_utf16.min(before.head_utf16);
     let high = before.anchor_utf16.max(before.head_utf16);
     let line_number = document.line_for_byte(document.byte_offset_for_utf16(low)?)?;
@@ -31,10 +44,15 @@ pub(super) fn apply_markup_command(
         // Markdown continuation only accepts carets; Enter still owns its ordinary selection replacement.
         return if command == MarkdownEditingCommand::InsertNewline {
             // The baseline default binding handles a nonempty selection after the Markdown command declines.
-            fallback_newline(document, before, line)
+            fallback_newline(document, before, line, observer)
         } else {
             // Ordinary native deletion retains grapheme/selection semantics outside this markup command.
-            Ok(MarkdownEditingOutcome::NotHandled)
+            complete_unchanged(
+                document,
+                before,
+                MarkdownEditingOutcome::NotHandled,
+                observer,
+            )
         };
     }
     let mut scanner = Scanner::new();
@@ -42,7 +60,7 @@ pub(super) fn apply_markup_command(
     for _ in 0..line_number {
         // Sequential prior boundaries prevent indexed rescans while the current body stays unmaterialized.
         let source = source_lines
-            .next(document)
+            .next(document)?
             .ok_or(MarkdownDocumentBufferError::RangeOutsideDocument)?;
         scanner.consume(document, source)?;
     }
@@ -78,15 +96,20 @@ pub(super) fn apply_markup_command(
         // Fenced/foreign syntax and ordinary prose delegate Enter to its default indentation behavior.
         return if command == MarkdownEditingCommand::InsertNewline {
             // Enter remains consumed even when no Markdown continuation applies.
-            fallback_newline(document, before, line)
+            fallback_newline(document, before, line, observer)
         } else {
             // Native Backspace performs ordinary grapheme deletion in this context.
-            Ok(MarkdownEditingOutcome::NotHandled)
+            complete_unchanged(
+                document,
+                before,
+                MarkdownEditingOutcome::NotHandled,
+                observer,
+            )
         };
     }
     if command == MarkdownEditingCommand::DeleteMarkupBackward {
         // Backspace needs only the current active path and has no future sibling-renumbering pass.
-        return delete_markup(document, before, line, contexts);
+        return delete_markup(document, before, line, contexts, observer);
     }
     // Loose-list status depends on the first two sibling items, which may follow this caret.
     let mut source_lines = if needs_future {
@@ -96,7 +119,10 @@ pub(super) fn apply_markup_command(
         // The final logical source line has no future sibling that could change looseness.
         None
     };
-    while let Some(source) = source_lines.as_mut().and_then(|lines| lines.next(document)) {
+    while let Some(lines) = source_lines.as_mut() {
+        let Some(source) = lines.next(document)? else {
+            break;
+        }; // 真EOF才结束未来项扫描，lease错误直接撤销命令。
         // Forward context scanning stores no suffix text or item list; it updates only current ancestors.
         scanner.consume(document, source)?;
         for context in &mut contexts {
@@ -122,22 +148,23 @@ pub(super) fn apply_markup_command(
     }
     // Future scanning no longer owns a second path when command output acquires canonical append storage.
     drop(scanner);
-    insert_markup(document, before, line, contexts)
+    insert_markup(document, before, line, contexts, observer)
 }
 
 /// Continue, exit or loosen the innermost list/quote using one source-coordinate transaction.
-fn insert_markup(
+fn insert_markup<O: MarkdownTextChangeObserver>(
     document: &mut MarkdownDocumentBuffer,
     before: MarkdownTextSelection,
     line: SourceLine,
     contexts: Vec<Context>,
-) -> Result<MarkdownEditingOutcome, MarkdownDocumentBufferError> {
+    observer: O,
+) -> Result<(MarkdownEditingOutcome, O::Output), MarkdownObservedEditError<O::Error>> {
     let inner = contexts.last().expect("nonempty command contexts");
     let pos = before.head_utf16;
     let local = pos - line.units.0;
     if inner.to - inner.after > local {
         // A caret inside marker punctuation precedes continuation authority and uses ordinary Enter.
-        return fallback_newline(document, before, line);
+        return fallback_newline(document, before, line, observer);
     }
     let empty = range_is_whitespace(
         document,
@@ -157,7 +184,7 @@ fn insert_markup(
             )?
         {
             // A continued nonblank marker-shaped line is not the list item's empty syntax line.
-            return fallback_newline(document, before, line);
+            return fallback_newline(document, before, line, observer);
         }
         let previous_blank = if line.number > 0 {
             // The original command treats whitespace/quote-only source immediately before this item as blank.
@@ -201,7 +228,7 @@ fn insert_markup(
             plan.add(line.units.0..line.units.0, Payload::BlankOuterAndBreak);
             plan.after = pos + plan.payload_units(&plan.edits[0].payload)?;
         }
-        return transaction::commit(document, before, plan);
+        return transaction::commit_observed(document, before, plan, observer);
     }
     if inner.kind == Kind::Quote && empty && line.number > 0 {
         // Two aligned quote-only lines exit one quote level by deleting each line's final marker suffix.
@@ -215,7 +242,7 @@ fn insert_markup(
             plan.add(first_start..previous.units.1, Payload::Empty);
             plan.add(line.units.0 + inner_from..line.units.1, Payload::Empty);
             plan.after = line.units.0 + inner_from - (previous.units.1 - first_start);
-            return transaction::commit(document, before, plan);
+            return transaction::commit_observed(document, before, plan, observer);
         }
     }
     let continued = inner.is_list() && inner.item_line < line.number;
@@ -231,16 +258,17 @@ fn insert_markup(
     );
     plan.after = trim + plan.payload_units(&plan.edits[0].payload)?;
     plan.add_renumber(inner_index, 0);
-    transaction::commit(document, before, plan)
+    transaction::commit_observed(document, before, plan, observer)
 }
 
 /// Apply only the baseline marker/indentation deletion, leaving ordinary Backspace to the native view.
-fn delete_markup(
+fn delete_markup<O: MarkdownTextChangeObserver>(
     document: &mut MarkdownDocumentBuffer,
     before: MarkdownTextSelection,
     line: SourceLine,
     contexts: Vec<Context>,
-) -> Result<MarkdownEditingOutcome, MarkdownDocumentBufferError> {
+    observer: O,
+) -> Result<(MarkdownEditingOutcome, O::Output), MarkdownObservedEditError<O::Error>> {
     let inner = contexts.last().expect("active context");
     let local = before.head_utf16 - line.units.0;
     let space_end = inner.to - inner.after + usize::from(inner.after != 0);
@@ -252,7 +280,7 @@ fn delete_markup(
         // Extra marker padding is deleted before a later key can remove or blank the marker itself.
         plan.add(line.units.0 + space_end..before.head_utf16, Payload::Empty);
         plan.after = line.units.0 + space_end;
-        return transaction::commit(document, before, plan);
+        return transaction::commit_observed(document, before, plan, observer);
     }
     if local == space_end
         && ((inner.is_list() && line.number <= inner.item_line)
@@ -278,19 +306,30 @@ fn delete_markup(
             plan.after = start;
         } else {
             // A caret already before this marker has no Markdown-specific deletion to consume.
-            return Ok(MarkdownEditingOutcome::NotHandled);
+            return complete_unchanged(
+                document,
+                before,
+                MarkdownEditingOutcome::NotHandled,
+                observer,
+            );
         }
-        return transaction::commit(document, before, plan);
+        return transaction::commit_observed(document, before, plan, observer);
     }
-    Ok(MarkdownEditingOutcome::NotHandled)
+    complete_unchanged(
+        document,
+        before,
+        MarkdownEditingOutcome::NotHandled,
+        observer,
+    )
 }
 
 /// Replace a selection with the default Markdown newline/indent fallback, including adjacent brackets.
-fn fallback_newline(
+fn fallback_newline<O: MarkdownTextChangeObserver>(
     document: &mut MarkdownDocumentBuffer,
     before: MarkdownTextSelection,
     line: SourceLine,
-) -> Result<MarkdownEditingOutcome, MarkdownDocumentBufferError> {
+    observer: O,
+) -> Result<(MarkdownEditingOutcome, O::Output), MarkdownObservedEditError<O::Error>> {
     let mut from = before.anchor_utf16.min(before.head_utf16);
     let mut to = before.anchor_utf16.max(before.head_utf16);
     let indent = foreign_blocks::html_indentation(document, line, from)?
@@ -300,11 +339,11 @@ fn fallback_newline(
         // Default Enter removes whitespace immediately to the right of a selection/caret on its first line.
         let mut cursor = line.cursor(document, to - line.units.0)?;
         while let Some((scalar, _, unit)) = cursor
-            .peek(document)
+            .peek(document)?
             .filter(|value| indentation_whitespace(value.0))
         {
             // Whole scalar positions preserve supplementary-boundary validation of the original selection.
-            cursor.next(document);
+            cursor.next(document)?;
             to = unit + scalar.len_utf16();
         }
     }
@@ -322,7 +361,7 @@ fn fallback_newline(
     let mut plan = Plan::new(Vec::new(), line, separator, document)?;
     plan.add(from..to, Payload::PlainNewline { indent, explode });
     plan.after = from + separator.len() + indent;
-    transaction::commit(document, before, plan)
+    transaction::commit_observed(document, before, plan, observer)
 }
 
 /// Determine the baseline configured physical separator without retaining any source string.
@@ -334,20 +373,21 @@ fn newline_separator(
     let mut carriage = false;
     while let Some(piece) = pieces.next_piece() {
         // Byte membership can skip LF-only giant bodies without scalar decoding or retained text.
-        let bytes = &document.piece_bytes(&piece.piece)[piece.local];
-        if previous_cr && bytes.first() == Some(&b'\n') {
-            // A CRLF pair can straddle canonical leaf boundaries without changing separator identity.
+        if source::scan_piece(document, &piece, |bytes| {
+            if previous_cr && bytes.first() == Some(&b'\n') {
+                return Ok(true); // CRLF可跨原piece或4KiB scratch边界，仍须真实回收后才返回。
+            }
+            if bytes.contains(&b'\r') {
+                carriage = true;
+                if bytes.windows(2).any(|pair| pair == b"\r\n") {
+                    return Ok(true);
+                }
+            }
+            previous_cr = bytes.last() == Some(&b'\r');
+            Ok(false)
+        })? {
             return Ok("\r\n");
         }
-        if bytes.contains(&b'\r') {
-            // Only source containing a CR needs the more specific adjacent-pair scan.
-            carriage = true;
-            if bytes.windows(2).any(|pair| pair == b"\r\n") {
-                // The original configured separator prefers CRLF whenever it exists in the input.
-                return Ok("\r\n");
-            }
-        }
-        previous_cr = bytes.last() == Some(&b'\r');
     }
     Ok(if carriage {
         // A CR-only file preserves its physical standalone separators for the new line.
@@ -365,7 +405,7 @@ fn leading_columns(
 ) -> Result<usize, MarkdownDocumentBufferError> {
     let mut cursor = line.cursor(document, 0)?;
     let mut columns = 0;
-    while let Some((scalar, _, _)) = cursor.next(document) {
+    while let Some((scalar, _, _)) = cursor.next(document)? {
         // Leading whitespace alone determines default indentation; the body is never scanned for columns.
         if !indentation_whitespace(scalar) {
             // The first content scalar fixes the indentation regardless of a giant following body.
@@ -390,7 +430,7 @@ fn columns_until(
 ) -> Result<usize, MarkdownDocumentBufferError> {
     let mut cursor = line.cursor(document, 0)?;
     let mut columns = 0;
-    while let Some((scalar, _, unit)) = cursor.next(document) {
+    while let Some((scalar, _, unit)) = cursor.next(document)? {
         // Count one ordered source prefix rather than repeatedly converting each tab-expanded boundary.
         if unit - line.units.0 >= end {
             // The requested native offset excludes this scalar and all later source.
@@ -414,7 +454,7 @@ fn last_nonwhitespace(
 ) -> Result<Option<(char, usize)>, MarkdownDocumentBufferError> {
     let mut cursor = line.cursor(document, 0)?;
     let mut last = None;
-    while let Some((scalar, _, unit)) = cursor.next(document) {
+    while let Some((scalar, _, unit)) = cursor.next(document)? {
         // Quote-exit and embedded continuation checks require the final content scalar, not a copied line.
         if !indentation_whitespace(scalar) {
             // Save only its identity and canonical native start; following whitespace cannot replace it.
@@ -474,7 +514,7 @@ fn allowed_markup_prefix(
 ) -> Result<usize, MarkdownDocumentBufferError> {
     let mut cursor = line.cursor(document, 0)?;
     let mut end = 0;
-    while let Some((scalar, _, unit)) = cursor.next(document) {
+    while let Some((scalar, _, unit)) = cursor.next(document)? {
         // Preserve the original command character class exactly, including digits and mixed marker punctuation.
         if !indentation_whitespace(scalar)
             && !scalar.is_ascii_digit()

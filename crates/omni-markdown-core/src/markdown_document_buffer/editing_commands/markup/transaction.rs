@@ -84,11 +84,11 @@ impl Plan {
         for context in &contexts {
             // Ordered active offsets share one scalar pass instead of rescanning a deep prefix per ancestor.
             while let Some((scalar, _, unit)) = cursor
-                .peek(document)
+                .peek(document)?
                 .filter(|value| value.2 - line.units.0 < context.from)
             {
                 // Tabs advance visual columns; other whole scalars occupy one counted editor column.
-                cursor.next(document);
+                cursor.next(document)?;
                 columns += if scalar == '\t' {
                     // A tab advances to the next four-column editor stop.
                     4 - columns % 4
@@ -298,11 +298,11 @@ fn marker(
 }
 
 /// Walk finite primary changes plus source-regenerated ordered sibling replacements in source order.
-fn each_edit(
+fn each_edit<E: From<MarkdownDocumentBufferError>>(
     document: &mut MarkdownDocumentBuffer,
     plan: &Plan,
-    mut visit: impl FnMut(&mut MarkdownDocumentBuffer, Edit) -> Result<(), MarkdownDocumentBufferError>,
-) -> Result<(), MarkdownDocumentBufferError> {
+    mut visit: impl FnMut(&mut MarkdownDocumentBuffer, Edit) -> Result<(), E>,
+) -> Result<(), E> {
     let mut primary = 0;
     if plan.rules.is_empty() {
         // Most Enter/Backspace commands need no suffix scan or sibling metadata at all.
@@ -315,7 +315,7 @@ fn each_edit(
     let mut rules = plan.rules.clone();
     let mut scanner = Scanner::new();
     let mut lines = SourceLines::new(document);
-    while let Some(line) = lines.next(document) {
+    while let Some(line) = lines.next(document)? {
         // Original piece descriptors retain no borrow across private canonical append allocation.
         let number = line.number;
         scanner.consume(document, line)?;
@@ -374,12 +374,25 @@ fn each_edit(
     Ok(())
 }
 
-/// Preflight complete geometry/budget, then publish one candidate root and one structural undo memento.
+#[cfg(test)]
+// 保留已有失败golden的直接规划入口；不绕开新journal与append回滚。
 pub(super) fn commit(
     document: &mut MarkdownDocumentBuffer,
     before: MarkdownTextSelection,
     plan: Plan,
 ) -> Result<MarkdownEditingOutcome, MarkdownDocumentBufferError> {
+    commit_observed(document, before, plan, changes::NoopObserver)
+        .map(|(outcome, ())| outcome)
+        .map_err(changes::legacy_error)
+}
+
+/// Preflight complete geometry/budget, then publish one candidate root and one structural undo memento.
+pub(super) fn commit_observed<O: MarkdownTextChangeObserver>(
+    document: &mut MarkdownDocumentBuffer,
+    before: MarkdownTextSelection,
+    plan: Plan,
+    observer: O,
+) -> Result<(MarkdownEditingOutcome, O::Output), MarkdownObservedEditError<O::Error>> {
     let mut envelope: Option<Range<usize>> = None;
     let mut count = 0;
     let mut removed_units = 0;
@@ -402,7 +415,7 @@ pub(super) fn commit(
             // The first real source change establishes the one command's native notification origin.
             envelope = Some(edit.range);
         }
-        Ok(())
+        Ok::<(), MarkdownDocumentBufferError>(())
     })?;
     let envelope = envelope.expect("markup command has a primary edit");
     let first_byte = document.byte_offset_for_utf16(envelope.start)?;
@@ -422,7 +435,7 @@ pub(super) fn commit(
         .is_none_or(|total| total > document.maximum_document_bytes)
     {
         // A complete budget check precedes all append allocation and leaves text/history/selection unchanged.
-        return Err(MarkdownDocumentBufferError::EditBufferLimitExceeded);
+        return Err(MarkdownDocumentBufferError::EditBufferLimitExceeded.into());
     }
     let result_bytes = document.byte_len() - removed_bytes + inserted_bytes;
     let metrics = MarkdownReplacementMetrics::new(
@@ -434,54 +447,73 @@ pub(super) fn commit(
         anchor_utf16: plan.after,
         head_utf16: plan.after,
     };
-    let edit = commit_command(document, metrics, result_bytes, before, |document| {
-        // Shared publication owns append rollback, future selection validation and the single history transition.
-        if count < 4096 {
-            // Ascending edits map original byte coordinates through prior byte deltas on an unpublished root.
-            let mut root = document.root.clone();
-            let mut removed = 0;
-            let mut inserted = 0;
-            each_edit(document, &plan, |document, edit| {
-                // Original root/indexes stay unchanged while replacement output consumes canonical append storage.
-                let bytes = edit.byte_range(document)?;
-                let (from, to) = (bytes.start, bytes.end);
+    let (edit, output) = commit_command_observed(
+        document,
+        metrics,
+        result_bytes,
+        before,
+        observer,
+        |document, observer| {
+            // Shared publication owns append rollback, future selection validation and the single history transition.
+            if count < 4096 {
+                // Ascending edits map original byte coordinates through prior byte deltas on an unpublished root.
+                let mut root = document.root.clone();
+                let mut removed = 0;
+                let mut inserted = 0;
+                each_edit(document, &plan, |document, edit| {
+                    // Original root/indexes stay unchanged while replacement output consumes canonical append storage.
+                    changes::emit(
+                        document,
+                        observer,
+                        edit.range.clone(),
+                        plan.payload_units(&edit.payload)?,
+                    )?;
+                    let bytes = edit.byte_range(document)?;
+                    let (from, to) = (bytes.start, bytes.end);
+                    let mut output = CanonicalOutput::new();
+                    plan.render(&edit.payload, |bytes| output.push(document, bytes))?;
+                    let replacement = output.finish(document)?;
+                    let replacement_length = plan.payload_units(&edit.payload)?;
+                    root = replace_tree_range(
+                        document,
+                        root.take(),
+                        from - removed + inserted..to - removed + inserted,
+                        replacement,
+                    )?;
+                    removed += to - from;
+                    inserted += replacement_length;
+                    Ok::<(), MarkdownObservedEditError<O::Error>>(())
+                })?;
+                Ok((root, after))
+            } else {
+                // Dense output copies old overlaps through fixed scratch and never borrows across append growth.
                 let mut output = CanonicalOutput::new();
-                plan.render(&edit.payload, |bytes| output.push(document, bytes))?;
+                let mut consumed = first_byte;
+                each_edit(document, &plan, |document, edit| {
+                    // Original byte coordinates stay valid while this unpublished output appends canonical segments.
+                    changes::emit(
+                        document,
+                        observer,
+                        edit.range.clone(),
+                        plan.payload_units(&edit.payload)?,
+                    )?;
+                    let bytes = edit.byte_range(document)?;
+                    let (from, to) = (bytes.start, bytes.end);
+                    copy_source(document, &mut output, consumed..from)?;
+                    plan.render(&edit.payload, |bytes| output.push(document, bytes))?;
+                    consumed = to;
+                    Ok::<(), MarkdownObservedEditError<O::Error>>(())
+                })?;
                 let replacement = output.finish(document)?;
-                let replacement_length = plan.payload_units(&edit.payload)?;
-                root = replace_tree_range(
+                let root = replace_tree_range(
                     document,
-                    root.take(),
-                    from - removed + inserted..to - removed + inserted,
+                    document.root.clone(),
+                    first_byte..last_byte,
                     replacement,
                 )?;
-                removed += to - from;
-                inserted += replacement_length;
-                Ok(())
-            })?;
-            Ok((root, after))
-        } else {
-            // Dense output copies old overlaps through fixed scratch and never borrows across append growth.
-            let mut output = CanonicalOutput::new();
-            let mut consumed = first_byte;
-            each_edit(document, &plan, |document, edit| {
-                // Original byte coordinates stay valid while this unpublished output appends canonical segments.
-                let bytes = edit.byte_range(document)?;
-                let (from, to) = (bytes.start, bytes.end);
-                copy_source(document, &mut output, consumed..from)?;
-                plan.render(&edit.payload, |bytes| output.push(document, bytes))?;
-                consumed = to;
-                Ok(())
-            })?;
-            let replacement = output.finish(document)?;
-            let root = replace_tree_range(
-                document,
-                document.root.clone(),
-                first_byte..last_byte,
-                replacement,
-            )?;
-            Ok((root, after))
-        }
-    })?;
-    Ok(MarkdownEditingOutcome::Changed(edit))
+                Ok((root, after))
+            }
+        },
+    )?;
+    Ok((MarkdownEditingOutcome::Changed(edit), output))
 }

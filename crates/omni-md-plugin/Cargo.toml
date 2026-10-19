@@ -10,10 +10,100 @@ repository.workspace = true
 publish = false
 
 [features]
-default = ["native-markdown-runtime"]
-native-markdown-runtime = ["omni-markdown-core/native-markdown-candidate"]
-native-markdown-runtime-probe = ["native-markdown-runtime"]
+# The default editor uses AppKit/TextKit and single-transaction table-end Tab appends; paged candidates remain opt-in.
+default = ["native-markdown-runtime", "native-table-row-append"]
+# Enable the current native runtime and bounded Core table APIs; Foundation read failures use the exception ABI.
+native-markdown-runtime = ["omni-markdown-core/native-markdown-candidate", "omni-markdown-core/s2-table-window-prototype", "objc2/exception", "dep:libc"]
+# Add explicit native acceptance entry points and inspection APIs; this feature does not select the paged editor.
+native-markdown-runtime-probe = [
+  "native-markdown-runtime",
+  "objc2-core-text/CTLine",
+  "objc2-core-text/CTRun",
+  "objc2/exception",
+  # Annotation probes create a temporary public text-checking controller and invalidate it after inspection.
+  "objc2-app-kit/NSTextCheckingController",
+  "objc2-app-kit/NSTextCheckingClient",
+  # Synthetic pointer probes inspect pixels from one visible cell; the default product creates no inspection bitmap.
+  "objc2-app-kit/NSBitmapImageRep",
+  "objc2-app-kit/NSImageRep",
+  "dep:libc",
+]
+# Compile the separate raster adapter experiment; allocating its raster resources also requires its explicit environment switch.
+native-raster-surface-probe = [
+  "native-markdown-runtime-probe",
+  # The viewport raster experiment is opt-in; the default editor remains on its TextKit path.
+  "dep:objc2-quartz-core",
+  "objc2-app-kit/objc2-quartz-core",
+  "objc2-foundation/NSOperation",
+  "objc2-core-graphics/CGBitmapContext",
+  "objc2-core-graphics/CGColorSpace",
+  "objc2-core-graphics/CGDataProvider",
+  "objc2-core-graphics/CGImage",
+  "objc2-core-graphics/CGAffineTransform",
+  "objc2-core-graphics/CGGeometry",
+]
+# Append a row only at a verified table end, without changing native attribute or visible-table producers.
+native-table-row-append = ["native-markdown-runtime", "omni-markdown-core/s2-table-window-prototype"]
 native-input-trace = ["native-markdown-runtime"]
+native-table-edit-diagnostic = ["native-markdown-runtime"]
+native-block-fragment-diagnostic = ["native-markdown-runtime"]
+native-close-stage-diagnostic = ["native-markdown-runtime"]
+# Expose native font-source candidate probes without selecting a new editor for the default product.
+native-paged-font-probe = [
+  "native-markdown-runtime",
+  "omni-markdown-core/paged-shaping",
+  "objc2-core-text/CTFontDescriptor",
+  "objc2-core-foundation/CFURL",
+  "objc2-core-foundation/CFDictionary",
+  "objc2-core-foundation/CFNumber",
+  "objc2-core-graphics/CGFont",
+]
+# Probe real per-font shaping of a single grapheme from the same source; the default editor is unchanged.
+native-paged-font-fallback-probe = [
+  "native-paged-font-probe",
+  "omni-markdown-core/paged-scripts",
+  # Exercise real descriptor exhaustion and release through existing bindings, without an extra package or product process.
+  "dep:libc",
+]
+# Compile the paged input and layout candidate for explicit native probes; default activation still mounts TextKit.
+native-paged-layout-probe = [
+  "native-paged-font-probe",
+  "omni-markdown-core/paged-layout-breaks",
+  "dep:libc",
+  # The candidate NSView implements the public NSTextInputClient protocol without whole-paragraph TextKit strings.
+  "objc2-app-kit/NSTextInputContext",
+  "objc2-foundation/NSOperation",
+  "dep:objc2-quartz-core",
+  "objc2-app-kit/objc2-quartz-core",
+  "objc2-core-graphics/CGBitmapContext",
+  "objc2-core-graphics/CGColorSpace",
+  "objc2-core-graphics/CGImage",
+  "objc2-core-graphics/CGDataProvider",
+]
+# Probe paged Find through its real input and visibility contracts, including Pending before line output exists.
+native-paged-find-probe = [
+  "native-paged-layout-probe",
+]
+# Probe native consumption of the paged line producer; partial readiness does not stand in for a real LineEnd.
+native-paged-compose-probe = [
+  "native-paged-find-probe",
+  "omni-markdown-core/paged-line-compose",
+]
+# Probe incremental prefixes from the same active line producer rather than substituting whole-paragraph output.
+native-paged-frontier-probe = [
+  "native-paged-compose-probe",
+  "omni-markdown-core/paged-shaping-frontier",
+]
+# Probe the Source-mode body candidate with the same paged lines and font fallback; default activation remains TextKit.
+native-paged-body-probe = [
+  "native-paged-frontier-probe",
+  "native-paged-font-fallback-probe",
+]
+# Enable one-shot source-lease reclaim fault injection only for explicit synthetic-data acceptance probes.
+native-source-reclaim-probe = [
+  "native-paged-body-probe",
+  "omni-markdown-core/original-backing-reclaim-probe",
+]
 
 [dependencies]
 omni-markdown-core = { path = "../omni-markdown-core", default-features = false }
@@ -21,11 +111,15 @@ omni-plugin-sdk.workspace = true
 thiserror = "=2.0.20"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Explicit copy uses read-only output mappings and real munmap; diagnostics also need process metrics and bounded backtraces.
+libc = { version = "=0.2.189", optional = true }
+tempfile = "=3.27.0"
 block2 = "=0.6.2"
 dispatch2 = { version = "=0.3.1", default-features = false, features = ["block2", "objc2", "std"] }
 core-foundation = "=0.10.1"
 objc2 = { version = "=0.6.4", default-features = true }
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
+  "NSActionCell",
   "NSAlert",
   "NSApplication",
   "NSAppearance",
@@ -33,16 +127,21 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
   "NSBezierPath",
   "NSBox",
   "NSButton",
+  "NSButtonCell",
   "NSClipView",
   "NSColor",
+  "NSColorSpace",
   "NSComboBox",
+  "NSComboBoxCell",
   "NSControl",
+  "NSCell",
   "NSEvent",
   "NSDragging",
   "NSFont",
   "NSFontDescriptor",
   "NSGraphics",
   "NSGraphicsContext",
+  "NSGlyphInfo",
   "NSLayoutManager",
   "NSMenu",
   "NSMenuItem",
@@ -57,19 +156,27 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
   "NSParagraphStyle",
   "NSPopUpButton",
   "NSResponder",
+  "NSUserInterfaceValidation",
   "NSRunningApplication",
   "NSRulerView",
   "NSTextElement",
   "NSScrollView",
+  "NSScroller",
+  "NSTableView",
+  "NSTableColumn",
+  "NSTableHeaderView",
+  "NSUserInterfaceItemIdentification",
   "NSStringDrawing",
   "NSText",
   "NSTextContainer",
   "NSTextContentManager",
   "NSTextField",
+  "NSTextFieldCell",
   "NSTextInputClient",
   "NSTextInputContext",
   "NSTextLayoutFragment",
   "NSTextLayoutManager",
+  "NSTextLineFragment",
   "NSTextViewportLayoutController",
   "NSTextRange",
   "NSTextSelection",
@@ -82,11 +189,14 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
   "NSWorkspace",
   "block2",
   "objc2-core-foundation",
+  "objc2-core-graphics",
   "objc2-core-text",
   "std",
 ] }
 objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["CFRunLoop", "CFString", "block2", "objc2", "std"] }
-objc2-core-text = { version = "=0.3.2", default-features = false, features = ["CTFont", "objc2", "std"] }
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGContext", "CGPath", "objc2", "std"] }
+objc2-quartz-core = { version = "=0.3.2", optional = true, default-features = false, features = ["CALayer", "CATransaction", "objc2-core-graphics", "objc2-core-foundation", "std"] }
+objc2-core-text = { version = "=0.3.2", default-features = false, features = ["CTFont", "CTFrame", "CTFramesetter", "CTLine", "CTRun", "CTStringAttributes", "objc2", "objc2-core-graphics", "std"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
   "NSArray",
   "NSAttributedString",
@@ -95,7 +205,12 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
   "NSGeometry",
   "NSNotification",
   "NSDate",
+  "NSDateFormatter",
   "NSTimer",
+  "NSUndoManager",
+  "NSRegularExpression",
+  "NSTextCheckingResult",
+  "NSError",
   "block2",
   "NSPathUtilities",
   "NSRange",
@@ -110,9 +225,131 @@ workspace = true
 
 [dev-dependencies]
 tempfile = "=3.27.0"
+serde_json = "=1.0.151"
+# Attribute-value tests inspect real NSNull objects; enable this binding only in the test dependency graph.
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSNull"] }
+
+[[test]]
+name = "native_line_metadata"
+path = "tests/native_line_metadata.rs"
+harness = false
+required-features = ["native-markdown-runtime-probe"]
 
 [[test]]
 name = "native_textkit"
 path = "tests/native_textkit.rs"
+harness = false
+required-features = ["native-markdown-runtime-probe"]
+
+[[test]]
+name = "paged_cell_history_oracle"
+path = "tests/paged_cell_history_oracle.rs"
+harness = false
+required-features = ["native-markdown-runtime-probe"]
+
+[[test]]
+name = "paged_cell_input"
+path = "tests/paged_cell_input.rs"
+harness = false
+required-features = ["native-paged-layout-probe"]
+
+# Run the long-paragraph Foundation regex negative control through an explicit probe entry point, outside default activation.
+[[test]]
+name = "native_long_regex"
+path = "tests/native_long_regex.rs"
+harness = false
+required-features = ["native-markdown-runtime-probe", "native-block-fragment-diagnostic"]
+
+[[test]]
+name = "paged_fonts"
+path = "tests/paged_fonts.rs"
+harness = false
+required-features = ["native-paged-font-probe"]
+
+[[test]]
+name = "paged_font_cascade"
+path = "tests/paged_font_cascade.rs"
+harness = false
+required-features = ["native-paged-font-probe"]
+
+[[test]]
+name = "paged_font_fallback"
+path = "tests/paged_font_fallback.rs"
+harness = false
+required-features = ["native-paged-font-fallback-probe"]
+
+[[test]]
+name = "native_textkit_memory"
+path = "tests/native_textkit_memory.rs"
+harness = false
+required-features = ["native-markdown-runtime-probe"]
+
+[[test]]
+name = "paged_layout"
+path = "tests/paged_layout.rs"
+harness = false
+required-features = ["native-paged-layout-probe"]
+
+[[test]]
+name = "paged_text_view"
+path = "tests/paged_text_view.rs"
+harness = false
+required-features = ["native-paged-layout-probe"]
+
+[[test]]
+name = "paged_viewport"
+path = "tests/paged_viewport.rs"
+harness = false
+required-features = ["native-paged-layout-probe"]
+
+[[test]]
+name = "paged_glyph_paint"
+path = "tests/paged_glyph_paint.rs"
+harness = false
+required-features = ["native-paged-layout-probe"]
+
+[[test]]
+name = "paged_line_viewport"
+path = "tests/paged_line_viewport.rs"
+harness = false
+required-features = ["native-paged-compose-probe"]
+
+[[test]]
+name = "paged_composed_surface"
+path = "tests/paged_composed_surface.rs"
+harness = false
+required-features = ["native-paged-frontier-probe"]
+
+[[test]]
+name = "paged_body_source"
+path = "tests/paged_body_source.rs"
+harness = false
+required-features = ["native-paged-body-probe"]
+
+[[test]]
+name = "frozen_native_string"
+path = "tests/frozen_native_string.rs"
+harness = false
+required-features = ["native-markdown-runtime-probe"]
+
+[[test]]
+name = "frozen_annotation"
+path = "tests/frozen_annotation.rs"
+harness = false
+required-features = ["native-markdown-runtime-probe"]
+
+[[test]]
+name = "frozen_value_family"
+path = "tests/frozen_value_family.rs"
+
+[[test]]
+name = "native_textkit_table_append"
+path = "tests/native_textkit_table_append.rs"
+harness = false
+required-features = ["native-markdown-runtime-probe", "native-table-row-append"]
+
+[[test]]
+name = "native_textkit_clipboard"
+path = "tests/native_textkit_clipboard.rs"
 harness = false
 required-features = ["native-markdown-runtime-probe"]

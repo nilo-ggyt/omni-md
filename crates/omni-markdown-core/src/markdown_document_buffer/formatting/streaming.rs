@@ -8,10 +8,11 @@ pub(crate) struct SourcePieceRange {
     pub(crate) local: Range<usize>,
 }
 
-/// Depth-first metadata cursor retains only the immutable source root and an AVL-height stack.
+/// 深度优先游标只保不可变root、AVL高度栈和一个有限Span续体，不收集全部小片。
 pub(crate) struct SourcePieceCursor {
     stack: Vec<(Arc<MarkdownPieceTreeNode>, usize)>,
     range: Range<usize>,
+    span: Option<(OriginalSpan, u8, usize)>,
 }
 
 impl SourcePieceCursor {
@@ -26,12 +27,35 @@ impl SourcePieceCursor {
             // Empty documents need no sentinel; a real source starts at its original byte zero.
             stack.push((root, 0));
         }
-        Self { stack, range }
+        Self {
+            stack,
+            range,
+            span: None,
+        }
     }
 
     /// Yield one scalar-aligned leaf overlap, pruning unselected source subtrees in order.
     pub(crate) fn next_piece(&mut self) -> Option<SourcePieceRange> {
-        while let Some((node, start)) = self.stack.pop() {
+        loop {
+            if let Some((span, ordinal, start)) = self.span.take() {
+                // 一次只展开一个已验证目录条目；续体不保正文借用，调用者仍沿原piece API读取。
+                let piece = span.piece(ordinal).expect("原不可变Span小目录已完整验证");
+                let end = start + piece.byte_len;
+                if ordinal + 1 < span.record_range().end {
+                    // 后继只保存共享目录与下一个逻辑byte起点，目录末端则自然释放当前Arc。
+                    self.span = Some((span, ordinal + 1, end));
+                }
+                if self.range.end > start && self.range.start < end {
+                    // 只发布真实相交部分；被剪掉的小片不借Source，也不改变有序输出。
+                    return Some(SourcePieceRange {
+                        local: self.range.start.saturating_sub(start)
+                            ..(self.range.end - start).min(piece.byte_len),
+                        piece,
+                    });
+                }
+                continue; // 仅推进有限小目录；返回给所有旧消费者的仍是≤4KiB普通piece。
+            }
+            let (node, start) = self.stack.pop()?;
             // Every iteration consumes a stack node; only intersecting branches add finite children.
             let end = start + node.metrics().byte_len;
             if self.range.end <= start || self.range.start >= end {
@@ -47,6 +71,10 @@ impl SourcePieceCursor {
                             ..(self.range.end - start).min(piece.byte_len),
                     });
                 }
+                MarkdownPieceTreeNode::OriginalSpan(span) => {
+                    // 目录作为一个真实树叶进入固定续体，不能为一次遍历分配16个Arc树叶。
+                    self.span = Some((span.clone(), span.record_range().start, start));
+                }
                 MarkdownPieceTreeNode::Branch { left, right, .. } => {
                     // LIFO right-then-left traversal yields original byte order without collecting leaves.
                     self.stack
@@ -55,7 +83,6 @@ impl SourcePieceCursor {
                 }
             }
         }
-        None
     }
 }
 
@@ -70,16 +97,23 @@ pub(super) fn scan_heading_whitespace(
     let mut units = 0;
     while let Some(source) = cursor.next_piece() {
         // The borrowed source is read-only, and heading planning appends no bytes or native state.
-        let bytes = &document.piece_bytes(&source.piece)[source.local];
-        let text = std::str::from_utf8(bytes).expect("source piece overlaps remain scalar aligned");
-        for scalar in text.chars() {
-            // JS whitespace contains only BMP scalars; CR/LF and supplementary text stop this line scan.
-            let whitespace = u16::try_from(u32::from(scalar)).is_ok_and(is_heading_whitespace);
-            if !whitespace {
-                // An ordinary character or preserved line separator ends the existing heading prefix.
-                return Ok(units);
+        let stopped = document.with_piece_bytes(&source.piece, |bytes| {
+            let bytes = &bytes[source.local];
+            let text =
+                std::str::from_utf8(bytes).expect("source piece overlaps remain scalar aligned");
+            for scalar in text.chars() {
+                // JS whitespace contains only BMP scalars; CR/LF and supplementary text stop this line scan.
+                let whitespace = u16::try_from(u32::from(scalar)).is_ok_and(is_heading_whitespace);
+                if !whitespace {
+                    // An ordinary character or preserved line separator ends the existing heading prefix.
+                    return Ok(true);
+                }
+                units += scalar.len_utf16();
             }
-            units += scalar.len_utf16();
+            Ok(false)
+        })?;
+        if stopped {
+            return Ok(units);
         }
     }
     Ok(units)
@@ -149,12 +183,13 @@ impl CanonicalOutput {
 }
 
 /// Stream a dense affected interval into new canonical pieces, preserving exact CRLF/CR/LF bytes.
-pub(super) fn prepare_dense_line_prefix(
+pub(super) fn prepare_dense_line_prefix<O: changes::MarkdownTextChangeObserver>(
     document: &mut MarkdownDocumentBuffer,
     first: usize,
     last: usize,
     prefix: &'static str,
-) -> Result<PieceTreeLink, MarkdownDocumentBufferError> {
+    observer: &mut O,
+) -> Result<PieceTreeLink, changes::MarkdownObservedEditError<O::Error>> {
     // The aggregate edit ends at the final line's start; its existing body remains an original suffix.
     let start = document.byte_offset_for_line(first)?;
     let end = document.byte_offset_for_line(last)?;
@@ -174,23 +209,26 @@ pub(super) fn prepare_dense_line_prefix(
         })
     {
         // Preflight the entire append before touching segments, root, history, or either selection endpoint.
-        return Err(MarkdownDocumentBufferError::EditBufferLimitExceeded);
+        return Err(MarkdownDocumentBufferError::EditBufferLimitExceeded.into());
     }
 
     // A metadata-only cursor keeps old edit-backed source pieces valid without borrowing their segments.
     let mut cursor = SourcePieceCursor::new(document.root.clone(), start..end);
     let mut source_bytes = [0_u8; ORIGINAL_PIECE_BYTES];
     let mut output = CanonicalOutput::new();
+    let mut source_units = document.utf16_offset_for_byte(start)?;
+    let prefix_units = prefix.encode_utf16().count();
+    changes::emit(document, observer, source_units..source_units, prefix_units)?;
     output.push(document, prefix.as_bytes())?;
     let mut pending_carriage_return = false;
     while let Some(source) = cursor.next_piece() {
         // Copy at most one bounded leaf before any append can grow the edit-segment vector. No
         // borrowed source slice crosses a mutable append, including when source is an earlier edit.
-        let length = {
-            let bytes = &document.piece_bytes(&source.piece)[source.local];
+        let length = document.with_piece_bytes(&source.piece, |bytes| {
+            let bytes = &bytes[source.local];
             source_bytes[..bytes.len()].copy_from_slice(bytes);
-            bytes.len()
-        };
+            Ok(bytes.len())
+        })?;
         let text = std::str::from_utf8(&source_bytes[..length])
             .expect("source overlaps remain scalar aligned");
         for scalar in text.chars() {
@@ -199,14 +237,19 @@ pub(super) fn prepare_dense_line_prefix(
                 if scalar == '\n' {
                     // The LF completes the prior CR; insert exactly one prefix after the complete pair.
                     output.push(document, b"\n")?;
+                    source_units += 1;
+                    changes::emit(document, observer, source_units..source_units, prefix_units)?;
                     output.push(document, prefix.as_bytes())?;
                     pending_carriage_return = false;
                     continue;
                 }
-                // A standalone CR ended the previous line, so prefix this next scalar's line first.
+                // 独立CR已计入旧坐标；在下一scalar前发出该行的真实插入。
+                changes::emit(document, observer, source_units..source_units, prefix_units)?;
                 output.push(document, prefix.as_bytes())?;
                 pending_carriage_return = false;
             }
+            // UTF16计量与已有源扫描同程，不另建全行索引或再次解码选中正文。
+            source_units += scalar.len_utf16();
             match scalar {
                 '\r' => {
                     // Preserve the CR byte now and wait for the following scalar before inserting a prefix.
@@ -214,8 +257,9 @@ pub(super) fn prepare_dense_line_prefix(
                     pending_carriage_return = true;
                 }
                 '\n' => {
-                    // A standalone LF completes one line and opens the next, including an empty endpoint line.
+                    // 独立LF完成一行；即使尾端空行也有一项原坐标插入。
                     output.push(document, b"\n")?;
+                    changes::emit(document, observer, source_units..source_units, prefix_units)?;
                     output.push(document, prefix.as_bytes())?;
                 }
                 _ => {
@@ -227,10 +271,16 @@ pub(super) fn prepare_dense_line_prefix(
         }
     }
     if pending_carriage_return {
-        // An interval ending in standalone CR still includes the selected final empty-line marker.
+        // 选中区间末尾独立CR后的空行仍拥有自己的插入锚点。
+        changes::emit(document, observer, source_units..source_units, prefix_units)?;
         output.push(document, prefix.as_bytes())?;
     }
     output.flush(document)?;
     // Replace the source interval once; the final line body and all outside pieces remain shared.
-    replace_tree_range(document, document.root.clone(), start..end, output.root)
+    Ok(replace_tree_range(
+        document,
+        document.root.clone(),
+        start..end,
+        output.root,
+    )?)
 }

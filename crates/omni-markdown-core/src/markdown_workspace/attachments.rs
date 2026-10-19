@@ -3,6 +3,9 @@
 use super::*;
 use std::os::fd::{AsRawFd, FromRawFd};
 
+mod streaming;
+pub(super) use streaming::rewrite_moved_note_attachment_links_streamed;
+
 /// Establish the reserved real asset directory only when an explicit import needs it.
 pub(super) fn ensure_attachments_directory(
     canonical_root: &Path,
@@ -272,7 +275,7 @@ impl PendingAttachmentFile {
 }
 
 /// Compare the current real confined directory with the descriptor pinned by this import operation.
-fn verify_attachment_parent(
+pub(super) fn verify_attachment_parent(
     canonical_root: &Path,
     directory_path: &Path,
     parent: &File,
@@ -416,22 +419,8 @@ pub(super) fn markdown_attachment_relative_prefix(
     Ok(destination)
 }
 
-/// Rewrite imported asset prefixes only when moving a note changes its relative depth.
-pub(super) fn rewrite_moved_note_attachment_links(
-    content: &str,
-    source_relative_path: &str,
-    destination_relative_path: &str,
-) -> Option<String> {
-    let source_prefix = markdown_attachment_relative_prefix(source_relative_path).ok()?;
-    let destination_prefix = markdown_attachment_relative_prefix(destination_relative_path).ok()?;
-    if source_prefix == destination_prefix {
-        // An unchanged asset prefix needs no copied document and no byte rewrite.
-        return None;
-    }
-    rewrite_inline_attachment_destinations(content, &source_prefix, &destination_prefix)
-}
-
 /// Rewrite recognized imported inline destinations while preserving code, escapes, and unrelated links.
+#[cfg(test)]
 pub(super) fn rewrite_inline_attachment_destinations(
     content: &str,
     source_prefix: &str,
@@ -551,6 +540,7 @@ pub(super) fn rewrite_inline_attachment_destinations(
 }
 
 /// Recognize a possible fence run with Markdown's maximum three-space indentation.
+#[cfg(test)]
 pub(super) fn markdown_fence_marker(
     bytes: &[u8],
     line_start: usize,
@@ -575,6 +565,7 @@ pub(super) fn markdown_fence_marker(
 }
 
 /// Count one contiguous ASCII delimiter run within the supplied line bounds.
+#[cfg(test)]
 pub(super) fn repeated_ascii_byte_count(
     bytes: &[u8],
     start: usize,
@@ -591,6 +582,7 @@ pub(super) fn repeated_ascii_byte_count(
 }
 
 /// Accept only a nonempty encoded filename segment immediately followed by the link terminator.
+#[cfg(test)]
 pub(super) fn is_encoded_attachment_destination(
     bytes: &[u8],
     start: usize,

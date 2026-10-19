@@ -17,7 +17,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
-!.env.sample
 .secrets/
 *.pem
 *.p12
@@ -27,7 +26,13 @@ __pycache__/
 *.mobileprovision
 id_ed25519
 id_rsa
-/.cargo/config.toml
+id_ecdsa
+id_dsa
+# Ignore the explicit machine-local override while allowing reviewed shared build configuration.
+/.cargo/config.local.toml
+**/.cargo/credentials
+**/.cargo/credentials.toml
+.cargo-ok
 
 # Native packaging and local diagnostic artifacts are outputs, not source inputs.
 *.app/
@@ -45,5 +50,18 @@ id_rsa
 /benchmarks/output/
 /local-output/
 
+# AI rules, session traces, and local tool configuration are not plugin source or required build inputs.
+/.agents/
+/.codex/
+/.trellis/
+/AGENTS.md
+/CLAUDE.md
+/.cursor/
+/.windsurf/
+/.claude/
+
 # JavaScript is an offline reference-generator tool; installed dependencies remain local output.
 node_modules/
+
+# Keep this sample-config exception after diagnostic *.sample exclusions so the reviewed example remains visible.
+!.env.sample

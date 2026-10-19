@@ -1,100 +1,176 @@
-//! Owns one canonical document and its explicitly retained AppKit/TextKit graph.
-//!
-//! Construction attaches the public graph in dependency order. Drop stops callbacks and removes
-//! container/content/storage edges before releasing the document, caches and native owners.
+//! 文稿模型只持唯一Core正文；旧TextKit适配图由实际编辑后端单独创建和释放。
 
 use super::*;
 
-/// Owns the sole active native document and its TextKit storage adapter.
-///
-/// Dropping this value synchronously releases its canonical piece tree, edit segments,
-/// structural history and private source mapping. Its native storage claim also ends here;
-/// transient platform ownership of the now-weak adapter is verified by the deallocation cohort.
+/// 唯一canonical根；构造时不分配NSString、NSTextStorage或任何排版对象。
+/// 丢弃后同步归还piece tree、增量编辑段和共享历史；快照alias另由原释放收据核对。
 pub(crate) struct NativeMarkdownTextModel {
     pub(super) document: SharedMarkdownDocument,
-    pub(super) text_storage: Retained<PieceBackedMarkdownTextStorage>,
 }
 
 impl NativeMarkdownTextModel {
-    /// Establish the unique strong canonical owner before constructing its weak virtual-storage adapter.
-    pub(crate) fn new(document: MarkdownDocumentBuffer, mtm: MainThreadMarker) -> Self {
-        let document = Rc::new(RefCell::new(document));
-        let text_storage = PieceBackedMarkdownTextStorage::new(Rc::clone(&document), mtm);
+    /// 先建立唯一文稿根；实际后端之后只借同一allocation，不可隐式创建第二正文。
+    pub(crate) fn new(document: MarkdownDocumentBuffer) -> Self {
         Self {
-            document,
-            text_storage,
+            document: Rc::new(RefCell::new(document)),
         }
     }
 
-    /// Borrow the shared handle without transferring a second persistent document ownership root.
+    /// 给事务适配器借用同一handle，不在模型内保存Native后端。
     pub(crate) fn document(&self) -> &SharedMarkdownDocument {
         &self.document
     }
-
-    /// Expose the native storage supertype for its public TextKit observer relationship.
-    pub(crate) fn text_storage(&self) -> &NSTextStorage {
-        &self.text_storage
-    }
 }
 
-/// Native TextKit 2 editor ownership root.
-///
-/// NSTextView accesses the document only through PieceBackedMarkdownTextStorage.
-/// NSScrollView owns viewport/scroll presentation. No setString:, setAttributedString:
-/// or equivalent whole-document Foundation mirror is used.
+/// 当前笔记的唯一文稿根；具体后端先释放，模型与原映射收据最后结束。
+/// 字段顺序也约束普通早退的析构顺序，不能让仍在断图的后端失去canonical正文。
 pub(crate) struct NativeMarkdownEditorSurface {
-    pub(super) scroll_view: Retained<NSScrollView>,
-    pub(super) gutter: Retained<NativeMarkdownGutter>,
-    pub(super) text_view: Retained<PieceBackedMarkdownTextView>,
-    pub(super) text_content_storage: Retained<objc2_app_kit::NSTextContentStorage>,
-    // The editor explicitly owns the complete manager/container network independently of
-    // transient AppKit attachment callbacks and their separate actual-deallocation signal.
-    pub(super) text_layout_manager: Retained<NSTextLayoutManager>,
-    pub(super) text_container: Retained<NSTextContainer>,
+    /// Find控件及其字段/共享编辑器弱收据属于原笔记会话，不归具体TextKit排版图。
+    pub(super) find_bar: RefCell<Option<Rc<NativeMarkdownFindBar>>>,
+    pub(super) find_resources: RefCell<NativeMarkdownFindResources>,
+    pub(super) session_field_editor: RefCell<Option<Weak<NativeMarkdownSessionFieldEditor>>>,
+    pub(super) backend: NativeMarkdownTextKitBackend,
     pub(super) model: NativeMarkdownTextModel,
+    /// 只保原映射的原子事实；后端局部释放不等待仍归文稿所有的mmap。
+    pub(super) document_resources: NativeMarkdownOwnedSnapshot,
 }
 
 impl NativeMarkdownEditorSurface {
-    /// Assemble a virtual-storage TextKit 2 graph and its scroll/ruler owners in dependency order.
+    /// 先取得唯一正文及其最终释放收据，再让实际TextKit后端借用同一allocation。
     pub(crate) fn new_with_mode(
         document: MarkdownDocumentBuffer,
         frame: NSRect,
         presentation_mode: MarkdownPresentationMode,
+        resource_root: &NativeMarkdownOwnedLedger,
         mtm: MainThreadMarker,
-    ) -> Self {
-        let model = NativeMarkdownTextModel::new(document, mtm);
-        model.text_storage.set_presentation_mode(presentation_mode);
-        // The surface constructs one complete TextKit 2 graph before exposing it to NSTextView.
-        // Replacing the storage in a view-created default graph left native edit/layout bookkeeping
-        // inconsistent on macOS 27: even one character edit warned and kept its old storage alive.
+    ) -> Result<Self, String> {
+        let model = NativeMarkdownTextModel::new(document);
+        // 原映射不属于展示图；先登记Session总预算，并为最终文稿释放保留独立弱收据。
+        // 登记失败时尚未构造TextKit，也不发布文稿根；局部模型随返回归还其原始资源。
+        let original_backing = model.document().borrow().original_backing_observer();
+        let document_resources = resource_root.include_document_backing(original_backing)?;
+        // 后端失败同样不发布外层根；局部Native claims按原作用域归还，
+        // 但归还项目claim不能直接充当框架实际dealloc或最终严格释放的证明。
+        let backend = NativeMarkdownTextKitBackend::new_with_mode(
+            model.document(),
+            frame,
+            presentation_mode,
+            resource_root,
+            mtm,
+        )?;
+        Ok(Self {
+            find_bar: RefCell::new(None),
+            find_resources: RefCell::new(NativeMarkdownFindResources::default()),
+            session_field_editor: RefCell::new(None),
+            backend,
+            model,
+            document_resources,
+        })
+    }
+
+    /// 保存、历史和有界查询直接访问唯一模型，不经过具体展示后端。
+    pub(crate) fn document(&self) -> &SharedMarkdownDocument {
+        self.model.document()
+    }
+
+    /// 有限观察本笔记的实际Find字段；先结束栏owner借用，再调用可重入Native getter。
+    pub(super) fn capture_find_resources(&self) -> Result<(), String> {
+        let bar = self.find_bar.borrow().clone();
+        let captured = NativeMarkdownFindResources::from_fields(
+            bar.as_ref().map(|bar| bar.fields()).into_iter().flatten(),
+        );
+        self.find_resources.borrow_mut().merge(captured)
+    }
+}
+
+impl Drop for NativeMarkdownEditorSurface {
+    fn drop(&mut self) {
+        // 普通早退也先封闭原输入；Find清空/拆挂可能重入，不能在最后保存之后追加正文。
+        self.backend.stop_accepting_input();
+        let bar = self.find_bar.take();
+        if let Some(bar) = bar {
+            // 本会话结束才清自有控件和callback；局部Rc在借用外归还，不等待下一篇笔记。
+            bar.finish_accepted();
+        }
+        // 字段随后按声明顺序Drop：会话弱票、具体后端、最后同一canonical模型及映射收据。
+    }
+}
+
+/// 具体TextKit图仅持Native与派生载荷；正文通过原storage的Weak关联访问。
+/// 构造和释放均不创建文稿、重开文件或保存整篇Foundation镜像。
+pub(crate) struct NativeMarkdownTextKitBackend {
+    // 仅保留原子释放事实，不保像素、Native 对象、正文或 mmap；供旧 editor barrier 核真实归还。
+    #[cfg(feature = "native-raster-surface-probe")]
+    pub(super) raster_release: Option<super::raster_surface::NativeMarkdownRasterReleaseReceipt>,
+    pub(super) scroll_view: Retained<NSScrollView>,
+    pub(super) owned_ledger: Rc<NativeMarkdownOwnedLedger>,
+    pub(super) gutter: Retained<NativeMarkdownGutter>,
+    pub(super) text_view: Retained<PieceBackedMarkdownTextView>,
+    pub(super) text_content_storage: Retained<objc2_app_kit::NSTextContentStorage>,
+    // 具体后端显式持有完整manager/container网络；临时AppKit挂接回调不接管这些强owner，
+    // 项目claim归还与框架实际dealloc信号仍是两个独立事件。
+    pub(super) text_layout_manager: Retained<NSTextLayoutManager>,
+    pub(super) text_container: Retained<NSTextContainer>,
+    // 只有这个TextKit后端持真实storage；新分页后端构造纯模型时没有这条隐含强边。
+    pub(super) text_storage: Retained<PieceBackedMarkdownTextStorage>,
+}
+
+impl NativeMarkdownTextKitBackend {
+    /// 按原依赖顺序构造完整TextKit图；只借外层文稿，失败由局部Native owner归还资源。
+    fn new_with_mode(
+        document: &SharedMarkdownDocument,
+        frame: NSRect,
+        presentation_mode: MarkdownPresentationMode,
+        resource_root: &NativeMarkdownOwnedLedger,
+        mtm: MainThreadMarker,
+    ) -> Result<Self, String> {
+        // 具体后端只登记其Native局部收据；身份先进入Session总预算，原映射另归外层文稿。
+        let owned_ledger = Rc::new(NativeMarkdownOwnedLedger::for_editor(resource_root));
+        // 弱适配器明确归旧后端；构造纯模型、PagedInput或新视图均不会触发TextKit。
+        let text_storage = PieceBackedMarkdownTextStorage::new(Rc::clone(document), mtm);
+        text_storage.set_presentation_mode(presentation_mode);
+        // 在交给NSTextView前先构造完整TextKit 2图，后端只借同一canonical文稿。
+        // macOS 27实测先让view创建默认图、再替换storage会破坏编辑/排版记账，
+        // 单字符编辑也可能报警并保留旧storage，因此这里始终先装配原图再创建view。
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        let text_content_storage =
+            super::content_storage_probe::NativeMarkdownContentStorageProbe::new_if_requested(
+                &text_storage,
+                &owned_ledger,
+                mtm,
+            )?;
+        #[cfg(not(feature = "native-markdown-runtime-probe"))]
         let text_content_storage = objc2_app_kit::NSTextContentStorage::new();
         let text_layout_manager = NSTextLayoutManager::new();
         let text_container = NSTextContainer::initWithSize(
             NSTextContainer::alloc(),
             NSSize::new(frame.size.width, f64::MAX),
         );
-        // Establish primary layout and container ownership before installing the canonical adapter.
-        // These nonnull native constructors leave no fallible graph lookup after text-view allocation.
+        // 不安装项目fragment factory：标准系统fragment负责正文排版与生命周期。
+        // 先建立primary manager和container归属，再安装canonical弱适配器。
+        // 这些已取得的非空Native构造结果直接用于view初始化，不在之后查询或替建另一图。
         text_content_storage.addTextLayoutManager(&text_layout_manager);
         text_content_storage.setPrimaryTextLayoutManager(Some(&text_layout_manager));
         text_layout_manager.setTextContainer(Some(&text_container));
         let text_storage_observer =
             ProtocolObject::<dyn NSTextStorageObserving>::from_ref(&*text_content_storage);
-        text_storage_observer.setTextStorage(Some(model.text_storage()));
-        // The designated view initializer receives the already attached container, preserving the
-        // same backing store throughout native initialization, editing and subsequent teardown.
-        let text_view = PieceBackedMarkdownTextView::new(
-            &model.text_storage,
-            &text_container,
+        text_storage_observer.setTextStorage(Some(&text_storage));
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        super::content_storage_probe::install_fragment_range_probe(
+            &text_content_storage,
             &text_layout_manager,
             mtm,
+        )?; // 仅明确合成实验在首次 NSTextView 初始化前接入；默认不分配或改变 delegate。
+        // 指定initializer接收已经挂接的container；初始化、编辑和后续拆图沿用同一storage，
+        // 具体后端不通过view默认构造另建排版网络。
+        let text_view = PieceBackedMarkdownTextView::new(
+            &text_storage,
+            &text_container,
+            &text_layout_manager,
+            &owned_ledger,
+            mtm,
         );
-
-        let document_frame = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
-        configure_markdown_text_view(&text_view, document_frame);
-        text_view.setDelegate(Some(ProtocolObject::from_ref(&*text_view)));
-        // SAFETY: content storage's delegate is weak, and the surface retains this main-thread view.
-        unsafe { text_content_storage.setDelegate(Some(ProtocolObject::from_ref(&*text_view))) };
+        text_storage.bind_text_view_once(&text_view)?; // 仅原composition root绑定单个Weak，清理不依赖子视图遍历。
 
         let scroll_view = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
         scroll_view.setAutoresizingMask(
@@ -103,68 +179,219 @@ impl NativeMarkdownEditorSurface {
         );
         scroll_view.setHasVerticalScroller(true);
         scroll_view.setHasHorizontalScroller(false);
+        // 可见滚动区域承担不透明底色；正文视图在同一底色上绘制原生文字和局部装饰。
         scroll_view.setDrawsBackground(true);
+        scroll_view.setBackgroundColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
+            0.075, 0.084, 0.11, 1.0,
+        ));
+        #[cfg(feature = "native-raster-surface-probe")]
+        let raster_release = if super::raster_surface::NativeMarkdownRasterSurface::requested() {
+            // 在首次挂接滚动正文和原生排版之前注册 factory，不能靠事后失效替换已缓存片段。
+            // 唯一 owner 先进入原 view 槽；后续同步回调仍沿同一文档与生命周期。
+            let raster = super::raster_surface::NativeMarkdownRasterSurface::install(
+                &text_view,
+                &text_storage,
+                &text_layout_manager,
+                &scroll_view,
+                &owned_ledger,
+                mtm,
+            )?;
+            let receipt = raster.release_receipt();
+            *text_view.ivars().raster_surface.borrow_mut() = Some(raster);
+            Some(receipt)
+        } else {
+            None // 普通诊断与正式路径均不创建光栅状态或第二释放收据。
+        };
+        let document_frame = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
+        configure_markdown_text_view(&text_view, document_frame);
+        text_view.setDelegate(Some(ProtocolObject::from_ref(&*text_view)));
+        // SAFETY: 当前局部Retained持有主线程view，成功后由具体后端接管；
+        // content storage的delegate关系为弱引用，不增加反向强owner。
+        unsafe { text_content_storage.setDelegate(Some(ProtocolObject::from_ref(&*text_view))) };
+
         scroll_view.setDocumentView(Some(&text_view));
-        // The surface/scroll own the ruler; its editor backlink remains weak and viewport metadata finite.
-        let gutter = NativeMarkdownGutter::new(&scroll_view, &text_view, mtm);
+        // 具体后端和scroll持有gutter；它回链正文的关系为Weak，视口元数据保持有限。
+        let gutter = NativeMarkdownGutter::new(&scroll_view, &text_view, &owned_ledger, mtm)?;
         let _ = text_view.ivars().gutter.set(Weak::from_retained(&gutter));
         scroll_view.setVerticalRulerView(Some(&gutter));
         scroll_view.setHasVerticalRuler(true);
         scroll_view.setRulersVisible(presentation_mode == MarkdownPresentationMode::Source);
         text_view.schedule_visible_table_layout_update();
 
-        Self {
+        owned_ledger.include("editor.scroll", &scroll_view)?;
+        #[cfg(feature = "native-block-fragment-diagnostic")]
+        super::preview_blocks::diagnostic::install(&text_view, &text_content_storage);
+        Ok(Self {
+            #[cfg(feature = "native-raster-surface-probe")]
+            raster_release,
             scroll_view,
+            owned_ledger,
             gutter,
             text_view,
             text_content_storage,
             text_layout_manager,
             text_container,
-            model,
-        }
+            text_storage,
+        })
     }
 
-    /// Borrow the retained viewport owner for mounting or release-barrier observation.
+    /// 只借本后端真实持有的scroll供挂载或释放观察，不移交独立生命周期权限。
     pub(crate) fn scroll_view(&self) -> &NSScrollView {
         &self.scroll_view
     }
 
-    /// Borrow the inherited editor interface without exposing independent native lifetime authority.
+    /// 窗口只借NSView完成原焦点交接；挂载层不取得TextKit专有的文本或布局能力。
+    pub(crate) fn input_view(&self) -> &NSView {
+        self.text_view.as_super().as_super().as_super()
+    }
+
+    /// TextKit对照验收借其真实文本协议；普通窗口焦点交接使用上面的NSView接口。
+    #[cfg(feature = "native-markdown-runtime-probe")]
     pub(crate) fn text_view(&self) -> &NSTextView {
         &self.text_view
     }
 
-    /// Reach the sole canonical model for bounded queries and revision-aware persistence.
-    pub(crate) fn document(&self) -> &SharedMarkdownDocument {
-        self.model.document()
+    /// 只给旧TextKit observer借用这个实际后端的storage，不在canonical模型内保存适配器。
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    pub(crate) fn text_storage(&self) -> &NSTextStorage {
+        &self.text_storage
     }
 
-    /// Seal input before accepted window close, preventing late native callbacks from creating unsaved edits.
+    /// 先封闭具体后端的输入及派生任务，禁止拆图中迟到回调追加未保存编辑。
+    /// 本步骤不销毁外层模型、清除Core历史或单独证明Native资源已经释放。
     pub(super) fn stop_accepting_input(&self) {
-        let accepted = self.model.text_storage.ivars().accepts_edits.replace(false);
+        let accepted = self.text_storage.ivars().accepts_edits.replace(false);
         self.text_view.ivars().textkit_graph_teardown.set(true);
+        self.text_view.cancel_pending_mode_viewport();
+        self.text_view.ivars().folds.seal();
+        // 撤销权限后立即take/drop有限背景的全部容量，迟到draw不能重新发布。
+        self.text_view.release_preview_blocks();
+        #[cfg(feature = "native-raster-surface-probe")]
+        {
+            let raster = self.text_view.ivars().raster_surface.borrow_mut().take();
+            if let Some(raster) = raster {
+                // 先移出唯一槽再断观察/图层关系；空槽和 sealed 标量阻止重入重新创建正文载荷。
+                if let Err(error) = raster.shutdown() {
+                    eprintln!(
+                        "native_raster_surface event=shutdown_failed error={error:?} formal=false"
+                    );
+                }
+            }
+        }
         if !accepted {
-            // Accepted close/handoff may seal more than once; native input policy is changed only once.
+            // 重复封闭仍完成上面的派生载荷清理；只有首次撤权继续清原生选区和编辑策略，
+            // 避免拆图重入再次执行这些Native setter。
             return;
         }
-        // Native setter callbacks now see the sealed canonical/graph gates before changing responder policy.
+        // 仍有有效 container/manager 且尚可选择时清 superclass caret，再撤销原生编辑策略。
+        self.text_view.clear_native_selection_before_release();
+        // 这些setter可触发同步回调；原输入和图权限已经封闭，不能向仍存活的模型提交新编辑。
         self.text_view.setEditable(false);
         self.text_view.setSelectable(false);
     }
 
-    /// Changes derived source/preview presentation without changing canonical Markdown bytes.
+    /// 只改变派生源码/预览展示，保留原始Markdown字节和真实选区。
     pub(crate) fn set_presentation_mode(
         &self,
         mode: MarkdownPresentationMode,
+        controller: &Retained<NativeMarkdownController>,
     ) -> Result<(), String> {
-        // A deliberate mode switch ends native provisional composition before changing its derived style projection.
-        self.text_view.commit_composition_before_release()?;
-        self.text_view.invalidate_visible_table_layouts(true)?;
-        self.text_view.unfold_source();
-        self.model.text_storage.set_presentation_mode(mode);
-        // The preserved editor exposes line/fold gutters only in literal source presentation.
+        let _payload_use = PayloadUseGuard::enter(&self.text_view.ivars().payload_use_depth);
+        // 新模式动作先撤旧Find/模式目标；相同模式不重新发布定位或清理已有选择。
+        if self
+            .text_view
+            .authorized_mode_action(controller, &self.text_storage, mode)
+            .is_none()
+        {
+            self.text_view.cancel_pending_find_reveal();
+        }
+        if self.text_storage.presentation_mode() == mode {
+            return Ok(());
+        }
+        let transition = self
+            .text_view
+            .capture_mode_viewport_transition(controller, &self.text_storage, mode)
+            .map_err(|_| "无法取得当前可见源位置，展示模式未切换".to_owned())?;
+        let preflight = (|| {
+            transition
+                .native_step(&self.text_view, || {
+                    self.text_view.commit_composition_before_release()
+                })
+                .map_err(|_| "展示模式切换期间笔记或输入已变更".to_owned())??;
+            // 活cell只在其真实observed receipt上推进原票；不在提交后的当前gen重新捕获目标。
+            transition
+                .native_step(&self.text_view, || {
+                    self.text_view
+                        .commit_active_table_cell_with_mode(&transition)
+                })
+                .map_err(|_| "表格提交期间展示模式动作已被新的输入撤销".to_owned())??;
+            transition
+                .native_step(&self.text_view, || {
+                    self.text_view.invalidate_visible_table_layouts(false)
+                })
+                .map_err(|_| "展示模式切换期间笔记或输入已变更".to_owned())??;
+            transition
+                .native_step(&self.text_view, || self.text_view.unfold_source())
+                .map_err(|_| "展示模式切换已被新的输入撤销".to_owned())?;
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = preflight {
+            transition.cancel(&self.text_view);
+            return Err(error); // 属性尚未改变，窗口原有错误分支可保持旧popup和原始草稿。
+        }
+        // 模式切换先丢旧背景容量，Source往返不能复用同代次旧矩形。
+        self.text_view.release_preview_blocks();
+        if !transition.begin_change(&self.text_view) {
+            transition.cancel(&self.text_view);
+            return Err("展示模式切换已被新的输入撤销".into());
+        }
+        #[cfg(feature = "native-block-fragment-diagnostic")]
+        self.text_view.begin_mode_attribute_diagnostic();
+        let applied = transition.native_step(&self.text_view, || {
+            self.text_storage.set_presentation_mode(mode)
+        });
+        #[cfg(feature = "native-block-fragment-diagnostic")]
+        self.text_storage
+            .ivars()
+            .mode_attribute_diagnostic
+            .report(0);
+        if self.text_storage.presentation_mode() != mode {
+            transition.cancel(&self.text_view);
+            return Err("展示模式切换在属性发布前已被撤销".into());
+        }
+        // 属性写入后仍完成同owner的ruler补偿；输入撤权只取消旧viewport后果，不能单独回退popup。
+        if !transition.application_current(&self.text_view) {
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            // 模式已写入但原owner/doc已撤权，不能以退出时slot为空解释成定位成功。
+            eprintln!("native_mode_completion_failure stage=after_attributes_authority");
+            transition.cancel(&self.text_view);
+            return Ok(()); // 已关闭/换owner，不再访问Native或把旧模式错误写回后继窗口。
+        }
         self.scroll_view
             .setRulersVisible(mode == MarkdownPresentationMode::Source);
+        if !transition.application_current(&self.text_view) {
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            // ruler调用可重入关闭/交接，必要补偿之后仍须保留原动作撤销的真实结果。
+            eprintln!("native_mode_completion_failure stage=after_ruler_authority");
+            transition.cancel(&self.text_view);
+            return Ok(());
+        }
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        if let Err(error) = &applied {
+            // 只报告已发生的属性调用失败；短路语义不变，不因诊断额外执行finish_change。
+            eprintln!("native_mode_completion_failure stage=attributes error={error:?}");
+        }
+        // 属性与ruler已完成后，以原Changing票据粗定位一次；失败不进入Ready或重领后继输入权限。
+        // 最终screenY仍由原有有界executor恢复/认证，不能把粗定位返回当作完成收据。
+        if applied.is_err()
+            || transition
+                .coarse_reveal_before_ready(&self.text_view)
+                .is_err()
+            || transition.finish_change(&self.text_view).is_err()
+        {
+            transition.fail(&self.text_view);
+            return Ok(()); // 实际模式已改变；仅定位失败，不让popup反映不存在的旧模式。
+        }
         self.text_view.schedule_visible_table_layout_update();
         Ok(())
     }
@@ -175,47 +402,47 @@ impl NativeMarkdownEditorSurface {
     }
 }
 
-impl Drop for NativeMarkdownEditorSurface {
+impl Drop for NativeMarkdownTextKitBackend {
     fn drop(&mut self) {
-        // From this point, synchronous callbacks may only disconnect the graph; they must
-        // not restore the layout manager through setTextContainer:.
-        self.stop_accepting_input();
-        // Clear fold and ruler state before removing either side of the weak native client relation.
-        self.text_view.ivars().folds.borrow_mut().clear();
-        self.text_view
+        // 唯一外层EditorSurface已封闭原输入并结束自身Find；这里只对称拆具体TextKit图。
+        #[cfg(feature = "native-block-fragment-diagnostic")]
+        super::preview_blocks::diagnostic::uninstall(&self.text_view, &self.text_content_storage);
+        // 先take/drop折叠与装饰容量，再清gutter并断开ruler关系，派生视口载荷不跨后端续命。
+        let folds = self.text_view.ivars().folds.replace(Vec::new());
+        drop(folds);
+        let decorations = self
+            .text_view
             .ivars()
             .source_decorations
-            .borrow_mut()
-            .clear();
+            .replace(Vec::new());
+        drop(decorations);
         self.text_view.ivars().source_decorations_dirty.set(false);
+        #[cfg(feature = "native-input-trace")]
+        self.text_view.release_input_trace();
         self.gutter.clear();
         self.scroll_view.setRulersVisible(false);
         self.scroll_view.setVerticalRulerView(None);
-        // Cancel pending layout and visible-table state before disconnecting TextKit. Queued
-        // work holds only a weak view and cannot resurrect the destroyed editing session.
+        // 断TextKit前取消原可见表格排版及待激活状态；排队工作只持Weak，
+        // 配合已封闭的图权限，不能在拆图后重建旧编辑会话。
         self.text_view
             .ivars()
             .table_layout_update_scheduled
             .set(false);
         self.text_view.ivars().table_layout_rebuilding.set(false);
-        self.text_view
-            .ivars()
-            .visible_table_layout_cache
-            .borrow_mut()
-            .take();
+        self.text_view.invalidate_visible_table_layout_cache();
         self.text_view
             .ivars()
             .pending_table_cell_activation
             .set(None);
         self.text_view.ivars().active_table_cell.borrow_mut().take();
-        if let Some(editor) = self.text_view.ivars().cell_editor.get() {
-            // Only a lazily created field has delegate/field-editor edges; teardown never creates one merely to remove it.
+        let cell_editor = self.text_view.ivars().cell_editor.borrow_mut().take();
+        if let Some(editor) = cell_editor {
+            // 只清理已经懒建的真实字段；没有字段时不为清理创建字段或共享编辑器。
             editor.abortEditing();
             editor.setHidden(true);
             editor.setStringValue(ns_string!(""));
-            // The reusable field must sever its borrowed delegate and field-editor relations before
-            // the parent view releases its final owner; hidden controls still belong to this session.
-            // SAFETY: the surface and main-thread text view still retain the live field during detach.
+            // 隐藏字段仍属于旧后端，必须在最后owner归还前断delegate、target/action及挂载关系。
+            // SAFETY: 局部Retained和后端的主线程text view在断开关系时仍持有此真实字段。
             unsafe {
                 editor.setDelegate(None);
                 editor.setTarget(None);
@@ -223,45 +450,48 @@ impl Drop for NativeMarkdownEditorSurface {
             }
             editor.removeFromSuperview();
         }
-        // Destruction accepts no text edits. Save/responder preflight committed composition before this
-        // ownership boundary; invoking unmarkText here could create unsaved source after the last save.
-        // Finish Foundation's lazy attribute bookkeeping while the canonical document
-        // is still alive. fixAttributesInRange: is a finite no-op, so this creates no mirror.
-        let document_length = self.model.document.borrow().utf16_len();
-        self.model
+        // 组合输入必须已由上层保存/responder预检提交；Drop不再调用unmarkText，
+        // 否则可能在最后一次保存后追加正文，导致未保存数据随模型一起丢弃。
+        // 模型仍存活时完成Foundation属性收尾；本适配器的fixAttributesInRange:为有限空操作，
+        // 传递真实长度不生成整篇Foundation镜像。
+        // 外层始终先释放本后端、最后释放模型；仅在本句临时升级原storage的Weak，
+        // 取得长度后即归还临时Rc，不把正文保留到后续Native属性收尾调用中。
+        let document_length = self
             .text_storage
+            .document()
+            .expect("TextKit backend teardown precedes its canonical model")
+            .borrow()
+            .utf16_len();
+        self.text_storage
             .ensureAttributesAreFixedInRange(NSRange::new(0, document_length));
-        // NSTextView registers drag types during initialization. Unregister symmetrically
-        // before graph release so deferred system transactions stop retaining the view.
+        // 对称注销NSTextView初始化时登记的drag类型，结束延迟系统事务对旧view的关联。
         self.text_view.unregisterDraggedTypes();
-        // A disconnected old responder must reject further user edits while native ownership unwinds.
+        // Native owner逐步归还期间，旧responder继续拒绝用户编辑。
         self.text_view.setEditable(false);
         self.text_view.setSelectable(false);
-        // Stop native find ownership before dismantling its original responder target. Drag cleanup
-        // is an AppKit override callback, not a teardown primitive to invoke outside a drag operation.
+        // 先结束Find对旧responder的关系，再移除documentView和delegate；
+        // drag注册已在上一阶段对称注销，不借系统drag回调伪造拆图步骤。
         self.text_view.setUsesFindBar(false);
         self.scroll_view.setDocumentView(None);
         self.text_view.setDelegate(None);
-        // TextKit 2 may expose a compatibility NSLayoutManager/storage relationship. Clear
-        // public delegates, viewport controller and layout queue before disconnecting owners
-        // so delayed layout cannot attach the old session again.
-        // SAFETY: the surface owns both main-thread objects; clearing delegate and queue ends callbacks before graph ownership is released.
+        // TextKit 2可能暴露兼容manager/storage关系；先清delegate、viewport回链和layout queue，
+        // 再归还强owner，避免延迟排版重新挂接旧会话。
+        // SAFETY: 具体后端此时仍持有这两个主线程对象，先结束回调关系再释放其owner。
         unsafe {
             self.text_content_storage.setDelegate(None);
             self.text_layout_manager.setLayoutQueue(None);
         }
         self.text_layout_manager.setDelegate(None);
-        // The surface owns this exact container even if AppKit temporarily detached it from the manager.
+        // 即使AppKit临时从manager拆除了container，具体后端仍持有并清理这一个实际container。
         self.text_container.setTextView(None);
         let text_viewport_controller = self.text_layout_manager.textViewportLayoutController();
         text_viewport_controller.setDelegate(None);
-        // Do not query NSTextView.layoutManager here: that compatibility accessor can
-        // create/switch to a TextKit 1 graph precisely while TextKit 2 is being released.
-        // Existing compatibility managers, if any, are detached through storage enumeration.
+        // 此处不查询NSTextView.layoutManager，该兼容getter可能在拆TextKit 2时新建或切入TextKit 1。
+        // 已存在的兼容manager随后只通过原storage枚举对称拆除。
 
         let text_storage_observer =
             ProtocolObject::<dyn NSTextStorageObserving>::from_ref(&*self.text_content_storage);
-        let legacy_layout_manager_count = self.model.text_storage.layoutManagers().count();
+        let legacy_layout_manager_count = self.text_storage.layoutManagers().count();
         native_markdown_trace! {
             eprintln!(
                 "[probe] drop graph before view_manager={} view_content={} storage={} manager={} container={} legacy_managers={}",
@@ -273,11 +503,11 @@ impl Drop for NativeMarkdownEditorSurface {
                 legacy_layout_manager_count,
             );
         }
+        // 仅处理view当前仍公开的manager/container关系；框架已拆除时不补建替代图。
         if let Some(text_layout_manager) = self.text_view.textLayoutManager()
             && let Some(text_container) = text_layout_manager.textContainer()
         {
-            // The manager strongly owns its text container. Clear the container's borrowed view
-            // link before removing the layout target to release the viewport graph at teardown.
+            // manager强持有container；先清container的借用view回链，再解除布局目标归属。
             text_container.setTextView(None);
             native_markdown_trace! {
                 eprintln!(
@@ -295,23 +525,18 @@ impl Drop for NativeMarkdownEditorSurface {
                 );
             }
         }
-        // NSTextContentStorage ignores attributedString while textStorage is installed.
-        // Detach that observer before replacing the fallback with a valid immutable empty value.
+        // 观察关系先与旧 backing store 断开，再用真实空 attributed string 清除 fallback。
+        // 外层model此时仍持有唯一正文；本后端只有原storage的Weak关联，
+        // 任何同步读取都必须遵守已封闭的客户端权限，断图不提前销毁该模型。
         text_storage_observer.setTextStorage(None);
-        // Apple's attributedString contract forbids setting nil even though the imported signature
-        // is nullable. A real empty value releases fallback text without violating that native invariant.
         let empty = NSAttributedString::initWithString(NSAttributedString::alloc(), ns_string!(""));
         self.text_content_storage.setAttributedString(Some(&empty));
-        // Content storage retains observed storage. Remove both its manager and primary
-        // relationship before continuing, preventing teardown callbacks from retaining the
-        // piece-backed string and canonical document again.
+        // 已撤 delegate、queue 和 container，再解除 content manager 的布局消费者。
         self.text_content_storage.setPrimaryTextLayoutManager(None);
         self.text_content_storage
             .removeTextLayoutManager(&self.text_layout_manager);
-        // NSTextContainer.setTextView(None) above notifies its view through setTextContainer:.
-        // The view setter is an AppKit callback rather than a second direct teardown API.
-        let detached_legacy_layout_managers =
-            self.model.text_storage.detach_legacy_layout_managers();
+        // 兼容 TextKit 1 同样先按 storage 的公开 owner 操作解除关系，不调用可能新建兼容图的 getter。
+        let detached_legacy_layout_managers = self.text_storage.detach_legacy_layout_managers();
         native_markdown_trace! {
             eprintln!(
                 "[probe] drop after content storage=nil manager={} content={} detached_legacy_managers={}",
@@ -334,38 +559,15 @@ impl Drop for NativeMarkdownEditorSurface {
                     .is_some(),
             );
         }
-        // Release derived native attribute dictionaries explicitly after layout detaches.
-        // Their paragraph/text-block objects belong to this session, even when AppKit
-        // temporarily retains an otherwise disconnected storage shell.
-        *self.model.text_storage.ivars().presentation.borrow_mut() =
-            MarkdownViewportPresentation::default();
-        *self
-            .model
-            .text_storage
-            .ivars()
-            .font_run_scratch
-            .borrow_mut() = Vec::new();
-        self.model
-            .text_storage
-            .ivars()
-            .attribute_cache
-            .borrow_mut()
-            .entries
-            .clear();
-        self.model
-            .text_storage
-            .ivars()
-            .font_selection_cache
-            .borrow_mut()
-            .style_fonts
-            .clear();
-        self.model
-            .text_storage
-            .ivars()
-            .font_selection_cache
-            .borrow_mut()
-            .fallback_fonts
-            .clear();
+        // 原生关系断开后 take/drop 全部存储 payload；框架持有空壳也无旧业务容量。
+        self.text_storage.release_payload();
+        self.text_view.release_payload();
+        // SAFETY: 空字典是有效属性值；已封闭 view 不再将它发布到 canonical 正文。
+        unsafe {
+            self.text_view
+                .setTypingAttributes(&MarkdownTextAttributes::new());
+        }
+        self.text_layout_manager.setTextSelections(&NSArray::new());
     }
 }
 
@@ -380,9 +582,9 @@ pub(super) fn configure_markdown_text_view(text_view: &NSTextView, frame: NSRect
     text_view.setHorizontallyResizable(false);
     text_view.setTextContainerInset(NSSize::new(36.0, 32.0));
     // Native accessibility reads the same canonical virtual string as editing.
-    text_view.setAccessibilityLabel(Some(ns_string!("Markdown editor")));
+    text_view.setAccessibilityLabel(Some(ns_string!("Markdown 编辑器")));
     text_view.setAccessibilityHelp(Some(ns_string!(
-        "Edit Markdown. Use the Document menu for formatting, find and replace, and file actions."
+        "编辑 Markdown。使用“文档”菜单设置格式、查找替换和管理文件。"
     )));
     text_view.setEditable(true);
     text_view.setSelectable(true);
@@ -398,7 +600,8 @@ pub(super) fn configure_markdown_text_view(text_view: &NSTextView, frame: NSRect
         ]
     };
     text_view.registerForDraggedTypes(&NSArray::from_slice(&drag_types));
-    text_view.setDrawsBackground(true);
+    // 原生文字与局部装饰透出滚动容器底色，正文不另建背景图像或独立文字副本。
+    text_view.setDrawsBackground(false);
     text_view.setBackgroundColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
         0.075, 0.084, 0.11, 1.0,
     ));
@@ -408,21 +611,9 @@ pub(super) fn configure_markdown_text_view(text_view: &NSTextView, frame: NSRect
     // NSUndoManager would retain a duplicate history. Use only the Rust piece tree's
     // 128 structurally shared revisions and notify TextKit through exact responder actions.
     text_view.setAllowsUndo(false);
-    // Native find UI stays enabled in every supported product and acceptance configuration.
-    text_view.setUsesFindBar(true);
-    text_view.setSmartInsertDeleteEnabled(false);
-    text_view.setAutomaticQuoteSubstitutionEnabled(false);
-    text_view.setAutomaticDashSubstitutionEnabled(false);
-    text_view.setAutomaticTextReplacementEnabled(false);
-    text_view.setAutomaticSpellingCorrectionEnabled(false);
-    text_view.setAutomaticLinkDetectionEnabled(false);
-    text_view.setAutomaticDataDetectionEnabled(false);
-    text_view.setAutomaticTextCompletionEnabled(false);
-    text_view.setContinuousSpellCheckingEnabled(false);
-    text_view.setGrammarCheckingEnabled(false);
-    // The switches above do not clear NSTextView's default spelling bit. Markdown owns
-    // its semantics, so disable unused NSTextCheckingController work after each edit.
-    text_view.setEnabledTextCheckingTypes(0);
+    // 项目自有 Find 栏提供完整输入与历史归属；不创建使用未知 editor/Undo 的标准 finder UI。
+    text_view.setUsesFindBar(false);
+    super::text_input_policy::configure_literal_text_input(text_view);
     // SAFETY: initUsingTextLayoutManager(true) creates the owned container; these public
     // layout constraints are changed only while its text view is alive.
     if let Some(text_container) = unsafe { text_view.textContainer() } {
@@ -433,5 +624,38 @@ pub(super) fn configure_markdown_text_view(text_view: &NSTextView, frame: NSRect
     if let Some(text_layout_manager) = text_view.textLayoutManager() {
         // Retain TextKit's protection against suspicious native layout requests for giant/untrusted source.
         text_layout_manager.setLimitsLayoutForSuspiciousContents(true);
+    }
+}
+
+#[cfg(test)]
+mod canonical_model_tests {
+    use std::io::Write;
+
+    use super::{MarkdownDocumentBuffer, NativeMarkdownTextModel, Rc};
+
+    #[test]
+    fn canonical_model_constructs_and_releases_without_a_native_thread() {
+        // 工作线程没有MainThreadMarker；纯文稿根不能在内部偷偷创建受主线程约束的Native对象。
+        std::thread::spawn(|| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            let chunk = [b'a'; 4_096];
+            for _ in 0..64 {
+                file.write_all(&chunk).unwrap();
+            } // 固定栈缓冲创建原始文件，不为测试构造整篇String。
+            let document = MarkdownDocumentBuffer::open(file.path(), 524_288).unwrap();
+            let mapping = document.original_backing_observer().unwrap();
+            let model = NativeMarkdownTextModel::new(document);
+            let weak = Rc::downgrade(model.document());
+            assert_eq!(model.document().borrow().utf16_len(), 262_144);
+            assert_eq!(mapping.mapped_bytes(), 262_144);
+            // 没有Native后端和冻结alias续命；丢弃唯一根就必须同步归还原映射。
+            drop(model);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(mapping.mapped_bytes(), 0);
+            assert!(mapping.unmap_succeeded());
+            assert!(!mapping.failed());
+        })
+        .join()
+        .unwrap();
     }
 }

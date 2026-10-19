@@ -1,6 +1,7 @@
 //! Atomic keyboard commands with bounded planning and shared canonical text/history publication.
 
-use super::command_transaction::commit_command;
+use super::changes::{MarkdownObservedEditError, MarkdownTextChangeObserver};
+use super::command_transaction::commit_command_observed;
 use super::formatting::streaming::{CanonicalOutput, SourcePieceCursor};
 use super::*;
 
@@ -56,27 +57,38 @@ impl MarkdownDocumentBuffer {
         command: MarkdownEditingCommand,
         selection: MarkdownTextSelection,
     ) -> Result<MarkdownEditingOutcome, MarkdownDocumentBufferError> {
-        // Invalid native positions must fail before a command scans source or acquires edit storage.
+        self.apply_editing_command_observed(command, selection, changes::NoopObserver)
+            .map(|(outcome, ())| outcome)
+            .map_err(changes::legacy_error)
+    }
+
+    /// 键盘命令的真实变化流与正文共用一次可拒绝提交；NotHandled不产生伪变化。
+    pub fn apply_editing_command_observed<O: MarkdownTextChangeObserver>(
+        &mut self,
+        command: MarkdownEditingCommand,
+        selection: MarkdownTextSelection,
+        observer: O,
+    ) -> Result<(MarkdownEditingOutcome, O::Output), MarkdownObservedEditError<O::Error>> {
+        self.ensure_text_input_idle()?;
         self.validate_selection(selection)?;
         match command {
-            // Indentation remains meaningful at a caret and is consumed even when outdent is empty.
             MarkdownEditingCommand::IndentMore | MarkdownEditingCommand::IndentLess => {
-                self.apply_indentation(command, selection)
+                self.apply_indentation(command, selection, observer)
             }
-            // Contextual Markdown input is dispatched by the markup command implementation.
             MarkdownEditingCommand::InsertNewline
             | MarkdownEditingCommand::DeleteMarkupBackward => {
-                markup::apply_markup_command(self, command, selection)
+                markup::apply_markup_command_observed(self, command, selection, observer)
             }
         }
     }
 
     /// Preflight affected prefixes, future selection and byte geometry without a per-line heap list.
-    fn apply_indentation(
+    fn apply_indentation<O: MarkdownTextChangeObserver>(
         &mut self,
         command: MarkdownEditingCommand,
         before: MarkdownTextSelection,
-    ) -> Result<MarkdownEditingOutcome, MarkdownDocumentBufferError> {
+        observer: O,
+    ) -> Result<(MarkdownEditingOutcome, O::Output), MarkdownObservedEditError<O::Error>> {
         let low = before.anchor_utf16.min(before.head_utf16);
         let high = before.anchor_utf16.max(before.head_utf16);
         let first = self.line_for_byte(self.byte_offset_for_utf16(low)?)?;
@@ -121,7 +133,7 @@ impl MarkdownDocumentBuffer {
         }
         if !changed {
             // Shift-Tab on unindented text is handled without changing selection, dirty state or undo.
-            return Ok(MarkdownEditingOutcome::Unchanged);
+            return complete_unchanged(self, before, MarkdownEditingOutcome::Unchanged, observer);
         }
         let envelope = envelope.expect("a changed indentation command has an edit envelope");
         let inserted = envelope.len() - removed_units + inserted_units;
@@ -130,13 +142,39 @@ impl MarkdownDocumentBuffer {
             anchor_utf16: anchor,
             head_utf16: head,
         };
-        let edit = commit_command(self, metrics, result_bytes, before, |document| {
-            // Preparation recomputes finite descriptors from unchanged original text, then publishes once.
-            let root = prepare_indentation(document, first, last, command)?;
-            Ok((root, after))
-        })?;
-        Ok(MarkdownEditingOutcome::Changed(edit))
+        let (edit, output) = commit_command_observed(
+            self,
+            metrics,
+            result_bytes,
+            before,
+            observer,
+            |document, observer| {
+                // Preparation recomputes finite descriptors from unchanged original text, then publishes once.
+                let root = prepare_indentation(document, first, last, command, observer)?;
+                Ok((root, after))
+            },
+        )?;
+        Ok((MarkdownEditingOutcome::Changed(edit), output))
     }
+}
+
+/// 不改变正文时仍允许显式head纯校验；派生结果由caller按实际是否消费命令采用。
+fn complete_unchanged<O: MarkdownTextChangeObserver>(
+    document: &MarkdownDocumentBuffer,
+    selection: MarkdownTextSelection,
+    outcome: MarkdownEditingOutcome,
+    observer: O,
+) -> Result<(MarkdownEditingOutcome, O::Output), MarkdownObservedEditError<O::Error>> {
+    let output = observer
+        .finish(
+            changes::MarkdownPreparedText {
+                document,
+                root: &document.root,
+            },
+            selection,
+        )
+        .map_err(MarkdownObservedEditError::Observer)?;
+    Ok((outcome, output))
 }
 
 /// Map a forward-associated original selection endpoint through one disjoint prefix replacement.
@@ -191,31 +229,37 @@ fn indentation_replacement(
     let mut units = 0_usize;
     let mut leading_ascii_spaces = 0_usize;
     let mut only_ascii_spaces = true;
-    'prefix: while let Some(source) = cursor.next_piece() {
+    while let Some(source) = cursor.next_piece() {
         // Source pieces remain immutable; only scalar prefix metrics are accumulated across leaves.
-        let text = std::str::from_utf8(&document.piece_bytes(&source.piece)[source.local])
-            .expect("document pieces remain scalar aligned");
-        for scalar in text.chars() {
-            if !indentation_whitespace(scalar) {
-                // The first content scalar or CR/LF ends indentation without scanning the line body.
-                break 'prefix;
+        let stopped = document.with_piece_bytes(&source.piece, |source_bytes| {
+            let text = std::str::from_utf8(&source_bytes[source.local])
+                .expect("document pieces remain scalar aligned");
+            for scalar in text.chars() {
+                if !indentation_whitespace(scalar) {
+                    // The first content scalar or CR/LF ends indentation without scanning the line body.
+                    return Ok(true);
+                }
+                bytes += scalar.len_utf8();
+                units += scalar.len_utf16();
+                if scalar == '\t' {
+                    // A tab advances to the next four-column stop used by the original editor.
+                    columns += 4 - columns % 4;
+                } else {
+                    // Other JS whitespace contributes one visible indentation column.
+                    columns += 1;
+                }
+                if only_ascii_spaces && scalar == ' ' {
+                    // Reuse only the exact leading bytes that equal the normalized all-space target.
+                    leading_ascii_spaces += 1;
+                } else {
+                    // Any tab or Unicode space ends the common literal prefix permanently.
+                    only_ascii_spaces = false;
+                }
             }
-            bytes += scalar.len_utf8();
-            units += scalar.len_utf16();
-            if scalar == '\t' {
-                // A tab advances to the next four-column stop used by the original editor.
-                columns += 4 - columns % 4;
-            } else {
-                // Other JS whitespace contributes one visible indentation column.
-                columns += 1;
-            }
-            if only_ascii_spaces && scalar == ' ' {
-                // Reuse only the exact leading bytes that equal the normalized all-space target.
-                leading_ascii_spaces += 1;
-            } else {
-                // Any tab or Unicode space ends the common literal prefix permanently.
-                only_ascii_spaces = false;
-            }
+            Ok(false)
+        })?;
+        if stopped {
+            break;
         }
     }
     let normalized = columns.saturating_sub(2);
@@ -237,34 +281,38 @@ fn copy_source(
     let mut scratch = [0_u8; ORIGINAL_PIECE_BYTES];
     while let Some(source) = cursor.next_piece() {
         // Copy one bounded scalar-aligned leaf before output may grow the backing segment vector.
-        let length = {
-            let bytes = &document.piece_bytes(&source.piece)[source.local];
+        let length = document.with_piece_bytes(&source.piece, |bytes| {
+            let bytes = &bytes[source.local];
             scratch[..bytes.len()].copy_from_slice(bytes);
-            bytes.len()
-        };
+            Ok(bytes.len())
+        })?;
         output.push(document, &scratch[..length])?;
     }
     Ok(())
 }
 
 /// Prepare bounded output for dense commands, sharing a giant final-line body and outside pieces.
-fn prepare_indentation(
+fn prepare_indentation<O: MarkdownTextChangeObserver>(
     document: &mut MarkdownDocumentBuffer,
     first: usize,
     last: usize,
     command: MarkdownEditingCommand,
-) -> Result<PieceTreeLink, MarkdownDocumentBufferError> {
+    observer: &mut O,
+) -> Result<PieceTreeLink, MarkdownObservedEditError<O::Error>> {
     if last - first < 4096 {
         // A finite sparse command shares all selected bodies and appends only normalized markers.
         let mut root = document.root.clone();
         let spaces = [b' '; ORIGINAL_PIECE_BYTES];
-        for line in (first..=last).rev() {
-            // Descending original positions remain valid after replacing prefixes to their right.
+        let mut removed_bytes = 0_usize;
+        let mut inserted_bytes = 0_usize;
+        for line in first..=last {
+            // 原坐标升序发变化；仅split位置应用此前字节delta，源查询仍读旧root。
             let edit = indentation_replacement(document, line, command)?;
             if edit.bytes.is_empty() && edit.spaces == 0 {
                 // Unchanged prefixes need neither canonical bytes nor additional tree structure.
                 continue;
             }
+            changes::emit(document, observer, edit.utf16.clone(), edit.spaces)?;
             let mut output = CanonicalOutput::new();
             let mut remaining = edit.spaces;
             while remaining > 0 {
@@ -274,9 +322,12 @@ fn prepare_indentation(
                 remaining -= length;
             }
             let inserted = output.finish(document)?;
-            let (prefix, rest) = split_piece_tree(document, root, edit.bytes.start)?;
+            let at = edit.bytes.start - removed_bytes + inserted_bytes;
+            let (prefix, rest) = split_piece_tree(document, root, at)?;
             let (_, suffix) = split_piece_tree(document, rest, edit.bytes.len())?;
             root = join_piece_trees(prefix, join_piece_trees(inserted, suffix));
+            removed_bytes += edit.bytes.len();
+            inserted_bytes += edit.spaces;
         }
         return Ok(root);
     }
@@ -287,6 +338,10 @@ fn prepare_indentation(
     for line in first..=last {
         // Only original prefix descriptors are rescanned; unpublished output never changes source indexes.
         let edit = indentation_replacement(document, line, command)?;
+        if !edit.utf16.is_empty() || edit.spaces != 0 {
+            // 无变化行不虚构delete段；真实prefix替换仍按旧坐标流式进入journal。
+            changes::emit(document, observer, edit.utf16.clone(), edit.spaces)?;
+        }
         copy_source(document, &mut output, consumed..edit.bytes.start)?;
         let mut remaining = edit.spaces;
         while remaining > 0 {

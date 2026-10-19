@@ -1,0 +1,75 @@
+# 固定上游pulldown-cmark 0.13.4的真实库源码，保留原作者、MIT许可和源码版权头。
+# 本地扩展提供同一parser规则的分段结构、真实表尾与数学状态；不引入第二套表格语法。
+# 仅打包库目标、src内测试与其实际include输入；CLI、示例、外部测试工具不进入插件依赖图。
+# gen-tests是上游单独的再生成工具路径，不由Omni的Core特性启用。
+
+[package]
+edition = "2021"
+rust-version = "1.71.1"
+name = "pulldown-cmark"
+version = "0.13.4"
+authors = [
+    "Raph Levien <raph.levien@gmail.com>",
+    "Marcus Klaas de Vries <mail@marcusklaas.nl>",
+]
+build = "build.rs"
+exclude = [
+    "/third_party/**/*",
+    "/tools/**/*",
+    "/specs/**/*",
+    "/azure-pipelines.yml",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "A pull parser for CommonMark"
+keywords = [
+    "markdown",
+    "commonmark",
+]
+categories = ["text-processing"]
+license = "MIT"
+repository = "https://github.com/raphlinus/pulldown-cmark"
+
+[features]
+omni-block-frontier = []
+default = [
+    "getopts",
+    "html",
+]
+gen-tests = []
+html = ["pulldown-cmark-escape"]
+simd = ["pulldown-cmark-escape?/simd"]
+
+[lib]
+name = "pulldown_cmark"
+path = "src/lib.rs"
+
+[dependencies.bitflags]
+version = "2"
+
+[dependencies.getopts]
+version = "0.2"
+optional = true
+
+[dependencies.memchr]
+version = "2.5"
+
+[dependencies.pulldown-cmark-escape]
+version = "0.11"
+optional = true
+
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+optional = true
+
+[dependencies.unicase]
+version = "2.6"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ["cfg(rustbuild)"]

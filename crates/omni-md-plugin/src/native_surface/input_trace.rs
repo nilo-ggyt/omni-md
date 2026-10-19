@@ -72,16 +72,20 @@ pub fn arm_native_markdown_input_trace(
             // No canonical editor means there is no foreground trace to admit.
             return Ok(Err(NativeInputTraceAccessError::NoEditor));
         };
-        if editor.model.text_storage.presentation_mode() != MarkdownPresentationMode::Source {
+        if editor.backend.text_storage.presentation_mode() != MarkdownPresentationMode::Source {
             // This latency contract measures the actual literal source surface.
             return Ok(Err(NativeInputTraceAccessError::SourceRequired));
         }
-        let (document, marked) = editor.text_view.input_trace_observation();
+        let (document, marked) = editor.backend.text_view.input_trace_observation();
         let Some(document) = document else {
             // A detached native adapter has no canonical metrics for an explicit run.
             return Ok(Err(NativeInputTraceAccessError::NoEditor));
         };
-        let result = editor.text_view.ivars().input_trace.borrow_mut().arm(
+        let Some(trace) = editor.backend.text_view.input_trace() else {
+            // 已封闭的 view 不能重新为关闭会话创建 trace Rc。
+            return Ok(Err(NativeInputTraceAccessError::NoEditor));
+        };
+        let result = trace.borrow_mut().arm(
             native_input_trace_now(),
             timebase.numer,
             timebase.denom,
@@ -122,13 +126,28 @@ pub fn drain_native_markdown_input_trace(
             return Ok(Err(NativeInputTraceAccessError::NoEditor));
         };
         // Move only the fixed scalar snapshot through this lease; it retains no native/document owner.
-        let snapshot = editor.text_view.ivars().input_trace.borrow_mut().drain();
+        let Some(trace) = editor.backend.text_view.input_trace() else {
+            // accepted release 已撤销记录所有权，不返回其他会话的证据。
+            return Ok(Err(NativeInputTraceAccessError::NoEditor));
+        };
+        let snapshot = trace.borrow_mut().drain();
         Ok(snapshot)
     })
     .map_err(|_| NativeInputTraceAccessError::Busy)?
 }
 
 impl PieceBackedMarkdownTextView {
+    /// 只在调用栈内复制记录器，状态借用不跨越原生回调。
+    pub(super) fn input_trace(&self) -> Option<SharedNativeInputTrace> {
+        self.ivars().input_trace.borrow().clone()
+    }
+
+    /// accepted release 取走可选记录器，空壳不保留 opt-in heap。
+    pub(super) fn release_input_trace(&self) {
+        let trace = self.ivars().input_trace.borrow_mut().take();
+        drop(trace);
+    }
+
     /// Query actual superclass marking and canonical counters before borrowing optional trace state.
     pub(super) fn input_trace_observation(&self) -> (Option<NativeInputTraceDocument>, bool) {
         // SAFETY: the live main-thread input subclass asks the matching public superclass getter,
@@ -150,7 +169,8 @@ impl PieceBackedMarkdownTextView {
     ) -> Option<TraceScope> {
         let ticks = native_input_trace_now();
         let (document, marked) = self.input_trace_observation();
-        TraceScope::selector(&self.ivars().input_trace, selector, ticks, document, marked)
+        let trace = self.input_trace()?;
+        TraceScope::selector(&trace, selector, ticks, document, marked)
     }
 
     /// Finish after all standard native input coordination, without writing output from a callback.
@@ -165,17 +185,28 @@ impl PieceBackedMarkdownTextView {
     /// Record a sealed native admission rejection even when no storage primitive is called.
     pub(super) fn reject_input_trace(&self, rejection: NativeInputTraceRejection) {
         let (document, _) = self.input_trace_observation();
-        self.ivars().input_trace.borrow_mut().canonical(
-            native_input_trace_now(),
-            document,
-            0,
-            0,
-            Some(rejection),
-        );
+        let Some(trace) = self.input_trace() else {
+            // 已关闭的记录器没有业务所有者，迟到回调保持无副作用。
+            return;
+        };
+        trace
+            .borrow_mut()
+            .canonical(native_input_trace_now(), document, 0, 0, Some(rejection));
     }
 }
 
 impl PieceBackedMarkdownTextStorage {
+    /// 只在调用栈内复制记录器，状态借用不跨越原生回调。
+    pub(super) fn input_trace(&self) -> Option<SharedNativeInputTrace> {
+        self.ivars().input_trace.borrow().clone()
+    }
+
+    /// accepted release 取走可选记录器，空壳不保留 opt-in heap。
+    pub(super) fn release_input_trace(&self) {
+        let trace = self.ivars().input_trace.borrow_mut().take();
+        drop(trace);
+    }
+
     /// Record the actual primitive Result with finite counters before notifying reentrant native observers.
     pub(super) fn record_input_trace_result(
         &self,
@@ -186,7 +217,11 @@ impl PieceBackedMarkdownTextStorage {
         let document = self
             .document()
             .map(|document| native_input_trace_document(&document));
-        self.ivars().input_trace.borrow_mut().canonical(
+        let Some(trace) = self.input_trace() else {
+            // 已关闭的记录器没有业务所有者，迟到回调保持无副作用。
+            return;
+        };
+        trace.borrow_mut().canonical(
             native_input_trace_now(),
             document,
             removed,

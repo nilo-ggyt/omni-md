@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/omni-md-plugin", "crates/omni-markdown-core"]
+# Build the pinned parser and shaper as vendored dependencies with their own metadata, outside this workspace.
+exclude = ["vendor/pulldown-cmark", "vendor/harfrust"]
 resolver = "3"
 
 [workspace.package]
@@ -10,7 +12,7 @@ authors = ["nilo vance"]
 repository = "https://github.com/nilo-ggyt/omni-md"
 
 [workspace.dependencies]
-omni-plugin-sdk = { git = "https://github.com/nilo-ggyt/omni-plugin-sdk.git", rev = "3e17eaf4bf7def814c3e3bdd08155f6ca330be3b", version = "=2.0.0" }
+omni-plugin-sdk = { git = "https://github.com/nilo-ggyt/omni-plugin-sdk.git", rev = "e50f3f379cdeb73522ab86b49539cfdcc66f17f9", version = "=3.0.0" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

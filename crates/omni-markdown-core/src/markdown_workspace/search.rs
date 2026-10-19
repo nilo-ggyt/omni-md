@@ -3,6 +3,9 @@
 use super::*;
 use crate::immutable_snapshot::SnapshotDirectory;
 
+mod paging;
+pub use paging::{MarkdownSearchAuthority, MarkdownSearchCursor, MarkdownSearchPage};
+
 impl MarkdownSessionAccess {
     /// Search the active vault with generation cancellation and bounded retained results.
     pub fn search_notes(
@@ -49,6 +52,7 @@ impl MarkdownSessionAccess {
         if query.is_empty() {
             // Clearing a query cancels older scans and intentionally displays no search results.
             self.search_generation.fetch_add(1, AtomicOrdering::AcqRel);
+            self.browse_generation.fetch_add(1, AtomicOrdering::AcqRel);
             return Ok(Vec::new());
         }
 
@@ -67,65 +71,105 @@ impl MarkdownSessionAccess {
                 })
         };
         let result_limit = requested_limit.clamp(1, MAX_SEARCH_RESULTS);
+        let scanned = self.scan_ranked_search(query, result_limit, None, &is_current);
+        if !is_current() {
+            // 保留旧Vec接口既有取消语义；新分页接口另以显式失败拒绝失效凭据。
+            return Ok(Vec::new());
+        }
+        Ok(scanned?
+            .into_iter()
+            .map(|item| {
+                // 旧接口只转移最多K条元数据，不暴露内部排序键。
+                item.result
+            })
+            .collect())
+    }
+
+    /// 共享单候选映射与有界排名；调用者决定旧Vec或新分页的取消返回语义。
+    fn scan_ranked_search(
+        &self,
+        query: &str,
+        result_limit: usize,
+        after: Option<&SearchPosition>,
+        is_current: &impl Fn() -> bool,
+    ) -> Result<Vec<RankedSearchResult>, MarkdownWorkspaceError> {
         let pattern = SearchPattern::new(query.as_bytes());
-        let mut ranked = Vec::<RankedSearchResult>::with_capacity(result_limit);
-        // One query may reuse an empty private scratch directory, but no snapshot or namespace survives the call.
+        let mut ranked = Vec::<RankedSearchResult>::with_capacity(result_limit + 1);
+        // 单次扫描可复用空的私有scratch目录；每个候选映射与目录owner都在本次调用结束前释放。
         let mut snapshot_directory = None;
         let walk_result = walk_markdown_workspace(&self.canonical_root, |entry| {
-            // Check directories too so cancellation does not walk a tree with no note files.
+            // 目录条目同样检查取消，纯目录树也不能绕过结束权限继续遍历。
             if !is_current() {
-                // Returning Stop releases the walk's active directory handles promptly.
+                // 停止遍历同时释放已打开目录句柄，不保留后台游标。
                 return Ok(WalkControl::Stop);
             }
             let MarkdownFilesystemEntry::Note(path) = entry else {
-                // Directory metadata is navigation input, not searchable Markdown text.
+                // 目录只用于导航，不能当成正文候选或搜索结果。
                 return Ok(WalkControl::Continue);
             };
-            // A title match ranks above a body match and avoids mapping that note's content.
+            // 先匹配标题；标题命中优先且完全跳过该笔记正文映射。
             let title = markdown_title(path)?;
             let title_match = pattern.find(title.as_bytes(), is_current)?;
+            // 在正文读取前按既有排序过滤已翻过的身份；不为旧页重复映射正文或生成摘要。
+            let score = if title_match.is_some() {
+                // 标题命中已经确定最高排名，不需要读取正文。
+                2
+            } else {
+                // 只有正文可能命中；先核对排名前缀，排除旧页后才映射该候选。
+                1
+            };
+            let relative_path = relative_markdown_path(&self.canonical_root, path)?;
+            if after.is_some_and(|last| {
+                // keyset 必须严格在末项之后；同分用原相对路径字节序，不受目录枚举顺序影响。
+                compare_search_position(score, &relative_path, last) != Ordering::Greater
+            }) {
+                // 已展示的排名前缀不再进入当前页，正文仍保持未打开状态。
+                return Ok(WalkControl::Continue);
+            }
             let (score, snippet) = if title_match.is_some() {
-                // Title results need no retained body snippet or file mapping.
+                // 标题命中不生成正文摘要，也不获取文件映射。
                 (2_u8, None)
             } else {
-                // Map one candidate transiently; its decoded text never escapes this callback.
+                // 仅临时映射当前正文候选；借用文本不能离开本回调。
                 if snapshot_directory.is_none() {
-                    // Acquire scratch only for the first body scan; title-only results perform no snapshot I/O.
+                    // 第一次正文扫描才取得私有scratch；纯标题查询不执行快照IO。
                     snapshot_directory = Some(SnapshotDirectory::new().map_err(|_| {
-                        // An unavailable private namespace cannot safely provide immutable source bytes.
+                        // 无法建立私有快照边界则返回存储失败，不能回退为用户文件的可变映射。
                         MarkdownWorkspaceError::StorageUnavailable
                     })?);
                 }
-                let body_match = inspect_validated_markdown_text_cancellable(
+                let body_match = inspect_bounded_markdown_text_cancellable(
                     path,
                     MAX_SEARCH_FILE_BYTES,
                     is_current,
                     |text| {
-                        // Search borrowed mapped bytes with the same cancellation predicate before deriving a bounded snippet.
-                        pattern
-                            .find(text.as_bytes(), is_current)
-                            .map(|match_start| {
-                                // Transform a found body offset into optional bounded context; no document body escapes the inspection callback.
-                                match_start.map(|match_start| {
-                                    // Retain only a bounded context around a complete literal match.
-                                    bounded_search_snippet(text, match_start, pattern.byte_len())
-                                })
+                        // 首次命中后仍验证候选全部UTF8；合法EOF后才派生有限摘要。
+                        let start = pattern.find_bounded(text, is_current)?;
+                        start
+                            .map(|start| {
+                                bounded_file_search_snippet(
+                                    text,
+                                    start,
+                                    pattern.byte_len(),
+                                    is_current,
+                                )
                             })
+                            .transpose()
                     },
                     snapshot_directory.as_mut(),
                 )?
-                .value?;
+                .value;
                 let Some(snippet) = body_match else {
-                    // An unmatched note contributes no result and releases its transient mapping.
+                    // 未命中候选不占结果名额，临时映射随检查返回释放。
                     return Ok(WalkControl::Continue);
                 };
                 (1_u8, Some(snippet))
             };
-            // Keep at most the requested best results, with deterministic path tie-breaking.
+            // 只保留当前有界最佳候选；同分按路径排序，淘汰项立即释放。
             ranked.push(RankedSearchResult {
                 score,
                 result: MarkdownSearchResult {
-                    relative_path: relative_markdown_path(&self.canonical_root, path)?,
+                    relative_path,
                     title,
                     snippet,
                 },
@@ -135,19 +179,9 @@ impl MarkdownSessionAccess {
             Ok(WalkControl::Continue)
         });
 
-        if !is_current() {
-            // A closing/superseded owner must receive no stale results or expected cancellation error.
-            return Ok(Vec::new());
-        }
-        // Genuine I/O failures still reach the current foreground owner after cancellation is ruled out.
+        // 扫描失败保留原类别；取消也由外层在结果发布前再次核验，不发布半页。
         walk_result?;
-        Ok(ranked
-            .into_iter()
-            .map(|item| {
-                // Ranking scores are private; transfer only bounded user-facing search metadata.
-                item.result
-            })
-            .collect())
+        Ok(ranked)
     }
 
     /// Invalidate the current generation without retaining a worker or a callback.
@@ -162,10 +196,17 @@ impl MarkdownSessionAccess {
         self.search_generation.load(AtomicOrdering::Acquire) == generation
     }
 
-    /// Supersede scans after a mutation or explicit foreground cancellation.
-    pub(super) fn cancel_active_search(&self) {
-        // No background work is created; already running callbacks observe this generation change.
+    /// 同路径正文已原子发布，只撤销可能依赖旧正文的搜索，不撤销目录排序末项。
+    /// 路径/kind/stem/root/collapse未变；note inode原子替换不属于目录cursor身份。
+    pub(super) fn invalidate_content_search(&self) {
         self.search_generation.fetch_add(1, AtomicOrdering::AcqRel);
+    }
+
+    /// 新建、路径变动、显式取消或关闭同时撤销搜索和目录；不用于同路径正文保存。
+    pub(super) fn cancel_active_search(&self) {
+        self.invalidate_content_search();
+        // 文件集合/排序身份已改变，旧目录after或排队页不能继续交付。
+        self.browse_generation.fetch_add(1, AtomicOrdering::AcqRel);
     }
 }
 
@@ -212,6 +253,41 @@ impl SearchPattern {
     fn byte_len(&self) -> usize {
         // ASCII folding does not change this length, and Unicode queries were not folded.
         self.bytes.len()
+    }
+
+    /// 单个KMP前缀跨真实4KiB窗口延续；命中位置只记录一次，尾部UTF8仍必须有效。
+    fn find_bounded(
+        &self,
+        text: &BoundedMarkdownText,
+        is_current: &impl Fn() -> bool,
+    ) -> Result<Option<usize>, MarkdownWorkspaceError> {
+        let mut matched = 0;
+        let mut found = self.bytes.is_empty().then_some(0);
+        text.visit_validated_bytes(is_current, |start, bytes| {
+            if found.is_some() {
+                // 无需继续KMP，但visit仍读取并校验真实尾部，非法文件不能发布局部命中。
+                return Ok(());
+            }
+            for (index, source_byte) in bytes.iter().copied().enumerate() {
+                let byte = if self.ascii_case_insensitive {
+                    source_byte.to_ascii_lowercase()
+                } else {
+                    source_byte
+                };
+                while matched > 0 && byte != self.bytes[matched] {
+                    matched = self.prefix_lengths[matched - 1];
+                }
+                if byte == self.bytes[matched] {
+                    matched += 1;
+                    if matched == self.bytes.len() {
+                        found = Some(start + index + 1 - matched);
+                        break; // 只停止此窗口KMP，不终止外层完整UTF8扫描。
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(found)
     }
 
     /// Scan one borrowed candidate, periodically yielding to both cancellation domains.
@@ -262,6 +338,21 @@ struct RankedSearchResult {
     result: MarkdownSearchResult,
 }
 
+/// 已展示末项的纯排序键；不持正文、摘要、映射或目录迭代器。
+#[derive(Debug)]
+struct SearchPosition {
+    score: u8,
+    relative_path: String,
+}
+
+/// 比较当前候选与旧页末项；Greater才有资格进入后续页。
+fn compare_search_position(score: u8, path: &str, last: &SearchPosition) -> Ordering {
+    last.score.cmp(&score).then_with(|| {
+        // 与首次查询同一字节序，避免并列项跨页重复或遗漏。
+        path.cmp(&last.relative_path)
+    })
+}
+
 /// Prefer title hits, then a stable relative-path ordering independent from filesystem iteration.
 fn compare_ranked_search_results(
     left: &RankedSearchResult,
@@ -272,6 +363,51 @@ fn compare_ranked_search_results(
         // Break otherwise equal search ranks by stable vault-relative path ordering.
         left.result.relative_path.cmp(&right.result.relative_path)
     })
+}
+
+/// 已完成全文件UTF8验证后，只借用命中周围足以覆盖原scalar规则的小窗口。
+fn bounded_file_search_snippet(
+    text: &BoundedMarkdownText,
+    match_start: usize,
+    match_bytes: usize,
+    is_current: &impl Fn() -> bool,
+) -> Result<String, MarkdownWorkspaceError> {
+    let match_end = match_start
+        .checked_add(match_bytes)
+        .filter(|end| *end <= text.len())
+        .ok_or(MarkdownWorkspaceError::StorageUnavailable)?;
+    // 原前缀rev().nth(N)实际需要N+1个前驱，后缀nth(N)最多需要N+1个边界。
+    // 每scalar至多4byte，查询上限128scalar，整个借用始终小于4KiB。
+    let context = (SNIPPET_CONTEXT_CHARACTERS + 1) * 4;
+    let begin = match_start.saturating_sub(context);
+    let end = match_end.saturating_add(context).min(text.len());
+    text.with_bytes(begin..end, is_current, |bytes| {
+        let mut skip = 0;
+        while skip < bytes.len() && bytes[skip] & 0xc0 == 0x80 {
+            // 任意字节起点最多切入一个已证明有效的scalar，跳过其continuation尾。
+            skip += 1;
+        }
+        let bytes = &bytes[skip..];
+        let valid = match std::str::from_utf8(bytes) {
+            Ok(value) => value,
+            Err(error) if error.error_len().is_none() => {
+                // 有限窗口尾可以切入下一scalar，只去掉该残余；已验证EOF本身不能残缺。
+                std::str::from_utf8(&bytes[..error.valid_up_to()])
+                    .map_err(|_| MarkdownWorkspaceError::InvalidUtf8Document)?
+            }
+            Err(_) => return Err(MarkdownWorkspaceError::InvalidUtf8Document),
+        };
+        let local = match_start
+            .checked_sub(begin + skip)
+            .filter(|local| {
+                valid.is_char_boundary(*local)
+                    && local
+                        .checked_add(match_bytes)
+                        .is_some_and(|end| valid.is_char_boundary(end))
+            })
+            .ok_or(MarkdownWorkspaceError::StorageUnavailable)?;
+        Ok(bounded_search_snippet(valid, local, match_bytes))
+    })?
 }
 
 /// Materialize only scalar-aligned context and remove control/duplicate whitespace for display.
@@ -353,3 +489,6 @@ mod tests {
         assert!(access.search_generation.load(AtomicOrdering::Acquire) > generation);
     }
 }
+
+#[cfg(test)]
+mod bounded_tests;

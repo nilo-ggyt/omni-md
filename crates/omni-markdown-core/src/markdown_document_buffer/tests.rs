@@ -17,6 +17,11 @@ use super::{
     MarkdownTextSelection, MarkdownViewportSemanticStatus, ORIGINAL_PIECE_BYTES, PieceTreeLink,
 };
 
+mod backing_windows;
+mod original_spans;
+mod streamed_selection;
+mod viewport_single_line;
+
 /// Own a real backing directory beside the mapped document for each isolated storage regression.
 struct MarkdownBufferFixture {
     _directory: TempDir,
@@ -49,7 +54,7 @@ impl MarkdownBufferFixture {
 /// Protect the zero-copy original-file ownership contract on document open.
 fn open_keeps_original_bytes_mapped_without_an_edit_copy() {
     // Use enough Unicode source to require multiple original leaves, then inspect retained storage immediately after open.
-    let content = "# 标题\n\n正文 😀\n".repeat(600);
+    let content = "# 标题\n\n正文 😀\n".repeat(4_000);
     let fixture = MarkdownBufferFixture::new(&content);
     let profile = fixture.buffer.storage_profile();
 
@@ -125,7 +130,9 @@ fn empty_ascii_and_giant_single_line_documents_keep_correct_aggregates() {
     assert_eq!(giant.buffer.line_count(), 1);
     assert_eq!(
         giant.buffer.storage_profile().piece_count,
-        giant_line.len().div_ceil(ORIGINAL_PIECE_BYTES)
+        giant_line
+            .len()
+            .div_ceil(ORIGINAL_PIECE_BYTES * super::ORIGINAL_SPAN_PIECES)
     );
     assert_tree_is_avl(&giant.buffer.root);
 }
@@ -744,7 +751,15 @@ fn revision_is_content_based_and_stable() {
         first.buffer.original_revision(),
         different.buffer.original_revision()
     );
-    assert_eq!(first.buffer.original_revision().encode_hex().len(), 64);
+    assert_eq!(
+        first
+            .buffer
+            .original_revision()
+            .expect("normal disk baseline")
+            .encode_hex()
+            .len(),
+        64
+    );
 }
 
 /// Materialize a test oracle through the public streaming API only.
@@ -813,6 +828,18 @@ fn assert_tree_is_avl(root: &PieceTreeLink) {
         match node {
             // A leaf supplies the base aggregate and height for recursive validation.
             MarkdownPieceTreeNode::Leaf(piece) => (1, piece.metrics, 1),
+            MarkdownPieceTreeNode::OriginalSpan(span) => {
+                // 独立累计目录中的真实小片，既验证压缩计量，也按实际物理树叶检查平衡。
+                let metrics =
+                    span.record_range()
+                        .fold(MarkdownDocumentMetrics::default(), |sum, ordinal| {
+                            let piece = span.piece(ordinal).unwrap();
+                            assert!(piece.byte_len <= ORIGINAL_PIECE_BYTES);
+                            MarkdownDocumentMetrics::joined(sum, piece.metrics)
+                        });
+                assert_eq!(span.metrics, metrics);
+                (1, metrics, 1)
+            }
             // A branch must match recomputed child aggregates, exact stored height, and the AVL height difference bound.
             MarkdownPieceTreeNode::Branch {
                 left,

@@ -51,13 +51,13 @@ pub(super) fn resolve(
     let mut comment = false;
     let mut comment_tail = ['\0'; 2];
     let mut last_open_end = None;
-    while let Some((scalar, byte, unit)) = cursor.peek(document) {
+    while let Some((scalar, byte, unit)) = cursor.peek(document)? {
         // Left affinity observes syntax ending at the caret, without consuming a source scalar after it.
         if unit >= position {
             // Syntax after the caret cannot affect its current indentation owner.
             break;
         }
-        cursor.next(document);
+        cursor.next(document)?;
         let scalar_column = column;
         if matches!(scalar, '\r' | '\n') {
             // Physical CRLF units stay canonical while either separator resets visual line indentation.
@@ -141,16 +141,16 @@ pub(super) fn resolve(
                         // A close removes its exact matching opener and any malformed still-open descendants.
                         for index in (0..elements.len()).rev() {
                             // Search only the still-open path; closed sibling tags occupy no retained metadata.
-                            if names_equal(document, &elements[index].name, &name) {
+                            if names_equal(document, &elements[index].name, &name)? {
                                 // Exact comparison, rather than hash equality, authorizes removing this owner.
                                 elements.truncate(index);
                                 break;
                             }
                         }
                         last_open_end = None;
-                    } else if !completed.slash && !void_name(document, &name) {
+                    } else if !completed.slash && !void_name(document, &name)? {
                         // A nonvoid opener owns body indentation until an exact source-matching close arrives.
-                        let raw = raw_name(document, &name);
+                        let raw = raw_name(document, &name)?;
                         elements.push(Element {
                             name,
                             indent: completed.indent,
@@ -172,7 +172,7 @@ pub(super) fn resolve(
             // Ordinary body scalars carry no tag-opening authority.
             continue;
         }
-        if starts_ascii(document, byte, "<!--") {
+        if starts_ascii(document, byte, "<!--")? {
             // Explicit comments suppress inner fake tags using only a two-character terminator tail.
             comment = true;
             comment_tail = ['\0'; 2];
@@ -180,12 +180,12 @@ pub(super) fn resolve(
         }
         if let Some(raw) = elements.last().and_then(|element| element.raw) {
             // Script/style/pre/textarea body is raw until its own exact closing tag spelling appears.
-            if !starts_ascii(document, byte, &format!("</{raw}")) {
+            if !starts_ascii(document, byte, &format!("</{raw}"))? {
                 // An inner fake tag in raw text cannot create a new element owner.
                 continue;
             }
         }
-        let next = cursor.peek(document).map(|value| value.0);
+        let next = cursor.peek(document)?.map(|value| value.0);
         if next.is_some_and(|scalar| scalar.is_ascii_alphabetic() || scalar == '/') {
             // Ordinary < prose is ignored; an actual tag starts a finite lexical owner at this source column.
             tag = Some(Tag {
@@ -232,87 +232,117 @@ fn name_scalar(scalar: char) -> bool {
 }
 
 /// Reject unequal names cheaply, then compare exact case-insensitive source scalars to avoid hash authority.
-fn names_equal(document: &MarkdownDocumentBuffer, left: &Name, right: &Name) -> bool {
+fn names_equal(
+    document: &MarkdownDocumentBuffer,
+    left: &Name,
+    right: &Name,
+) -> Result<bool, MarkdownDocumentBufferError> {
     if left.length != right.length || left.hash != right.hash {
         // Different finite summaries prove inequality; equal summaries still require exact source comparison.
-        return false;
+        return Ok(false);
     }
     let mut first = SourceCursor::new(document, left.bytes.clone(), left.unit);
     let mut second = SourceCursor::new(document, right.bytes.clone(), right.unit);
-    while let Some((scalar, _, _)) = first.next(document) {
+    while let Some((scalar, _, _)) = first.next(document)? {
         // Both validated name intervals contain ASCII scalars and terminate after the same known length.
         if second
-            .next(document)
+            .next(document)?
             .is_none_or(|value| !scalar.eq_ignore_ascii_case(&value.0))
         {
             // A single unequal source scalar rejects the candidate even if its rolling hash collided.
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// Compare a fixed grammar spelling directly against immutable source, without a name-sized copy.
-fn named(document: &MarkdownDocumentBuffer, name: &Name, expected: &str) -> bool {
+fn named(
+    document: &MarkdownDocumentBuffer,
+    name: &Name,
+    expected: &str,
+) -> Result<bool, MarkdownDocumentBufferError> {
     if name.length != expected.len() {
         // Fixed grammar names can reject arbitrary custom names without scanning their complete spelling.
-        return false;
+        return Ok(false);
     }
     let mut cursor = SourceCursor::new(document, name.bytes.clone(), name.unit);
-    expected.chars().all(|expected| {
-        // Fixed grammar names are short, while arbitrary custom source names stay ranged metadata.
-        cursor
-            .next(document)
+    for expected in expected.chars() {
+        if !cursor
+            .next(document)?
             .is_some_and(|value| value.0.eq_ignore_ascii_case(&expected))
-    })
+        {
+            return Ok(false); // 已知不相等才能拒绝；不能把原读取错误当名称不匹配继续语法fallback。
+        }
+    }
+    Ok(true)
 }
 
 /// Known void elements have no body and therefore contribute no active-element indentation owner.
-fn void_name(document: &MarkdownDocumentBuffer, name: &Name) -> bool {
-    [
+fn void_name(
+    document: &MarkdownDocumentBuffer,
+    name: &Name,
+) -> Result<bool, MarkdownDocumentBufferError> {
+    for expected in [
         "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
         "source", "track", "wbr",
-    ]
-    .iter()
-    .any(|expected| {
-        // Each fixed short name checks original source directly after the constant-width rejection.
-        named(document, name, expected)
-    })
+    ] {
+        if named(document, name, expected)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Raw element names disable tag parsing inside their bodies until their own literal closing name.
-fn raw_name(document: &MarkdownDocumentBuffer, name: &Name) -> Option<&'static str> {
-    ["script", "style", "pre", "textarea"]
-        .into_iter()
-        .find(|expected| {
-            // Only these known literal identities grant raw-body parsing behavior.
-            named(document, name, expected)
-        })
+fn raw_name(
+    document: &MarkdownDocumentBuffer,
+    name: &Name,
+) -> Result<Option<&'static str>, MarkdownDocumentBufferError> {
+    for expected in ["script", "style", "pre", "textarea"] {
+        if named(document, name, expected)? {
+            return Ok(Some(expected));
+        }
+    }
+    Ok(None)
 }
 
 /// A finite source-prefix comparison may inspect lookahead beyond the caret without mutating its position.
-fn starts_ascii(document: &MarkdownDocumentBuffer, byte: usize, expected: &str) -> bool {
-    let end = (byte + expected.len()).min(document.byte_len());
+fn starts_ascii(
+    document: &MarkdownDocumentBuffer,
+    byte: usize,
+    expected: &str,
+) -> Result<bool, MarkdownDocumentBufferError> {
+    let end = byte
+        .checked_add(expected.len())
+        .ok_or(MarkdownDocumentBufferError::RangeOutsideDocument)?
+        .min(document.byte_len());
     if end - byte != expected.len() {
         // Source exhaustion cannot satisfy a complete fixed grammar lookahead.
-        return false;
+        return Ok(false);
     }
     let mut pieces = SourcePieceCursor::new(document.root.clone(), byte..end);
     let mut expected = expected.bytes();
     while let Some(piece) = pieces.next_piece() {
         // Byte comparison rejects non-ASCII candidates without decoding a possibly partial UTF-8 overlap.
-        for &byte in &document.piece_bytes(&piece.piece)[piece.local] {
-            // Partial UTF-8 is harmless here because only exact ASCII byte equality can succeed.
-            if expected
-                .next()
-                .is_none_or(|expected| !byte.eq_ignore_ascii_case(&expected))
-            {
-                // Any different byte ends this fixed grammar lookahead immediately.
-                return false;
+        let rejected = source::scan_piece(document, &piece, |bytes| {
+            for &byte in bytes {
+                // Partial UTF-8 is harmless here because only exact ASCII byte equality can succeed.
+                if expected
+                    .next()
+                    .is_none_or(|expected| !byte.eq_ignore_ascii_case(&expected))
+                {
+                    // Any different byte ends this fixed grammar lookahead immediately.
+                    return Ok(true);
+                }
             }
+            Ok(false)
+        })?;
+        if rejected {
+            return Ok(false);
         }
     }
-    expected.next().is_none()
+    Ok(expected.next().is_none())
 }
 
 /// A closing tag immediately after optional line-local whitespace aligns to its element's source indent.
@@ -323,14 +353,14 @@ fn closing_after(
 ) -> Result<bool, MarkdownDocumentBufferError> {
     let mut cursor = line.cursor(document, position - line.units.0)?;
     while cursor
-        .peek(document)
+        .peek(document)?
         .is_some_and(|value| indentation_whitespace(value.0))
     {
         // Only whitespace before an immediate closing-tag prefix affects alignment.
-        cursor.next(document);
+        cursor.next(document)?;
     }
-    Ok(cursor.next(document).is_some_and(|value| value.0 == '<')
-        && cursor.next(document).is_some_and(|value| value.0 == '/'))
+    Ok(cursor.next(document)?.is_some_and(|value| value.0 == '<')
+        && cursor.next(document)?.is_some_and(|value| value.0 == '/'))
 }
 
 /// Preserve the embedded script service's indentation for a caret inside a simple unary statement.
@@ -342,7 +372,7 @@ fn unary_continuation_indent(
     let mut cursor = line.cursor(document, 0)?;
     let first = loop {
         // Prefix whitespace is counted in place, including source tabs and Unicode editor whitespace.
-        let Some(value) = cursor.next(document) else {
+        let Some(value) = cursor.next(document)? else {
             // A blank line contains no unary statement needing embedded continuation indentation.
             return Ok(None);
         };

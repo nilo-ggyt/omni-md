@@ -30,6 +30,15 @@ impl MarkdownSessionAccess {
         document: &mut MarkdownDocumentBuffer,
         synchronize_directory: impl FnOnce(&Path) -> Result<(), MarkdownWorkspaceError>,
     ) -> Result<MarkdownSaveReceipt, MarkdownWorkspaceError> {
+        // 原生输入尚未发布时拒绝保存；不能先覆盖磁盘，再在baseline采用处发现busy。
+        document
+            .ensure_text_input_idle()
+            .map_err(markdown_document_buffer_save_error)?;
+        let expected_revision = document
+            .original_revision()
+            // 旧record不含历史base；任何普通save/autosave/close均在文件检查或写入前拒绝。
+            .ok_or(MarkdownWorkspaceError::PendingLegacyRecovery)?
+            .encode_hex();
         let relative_path =
             relative_markdown_path(&self.canonical_root, document.path()).map_err(|_| {
                 // Unverifiable association or revision state cannot authorize replacing authoritative disk bytes.
@@ -46,11 +55,15 @@ impl MarkdownSessionAccess {
         }
 
         // Compare exact content revisions before acquiring a replacement temporary.
-        let expected_revision = document.original_revision().encode_hex();
         let current = inspect_markdown_save_baseline(&path)?;
         if current.revision != expected_revision {
             // A disk revision different from the opened baseline requires reload or an explicit conflict.
-            if current.revision == document.current_revision().encode_hex() {
+            if current.revision
+                == document
+                    .current_revision()
+                    .map_err(markdown_document_buffer_save_error)?
+                    .encode_hex()
+            {
                 // Identical live and external bytes can converge safely without overwriting either version.
                 return adopt_matching_document_buffer_baseline(document, &path, &current.revision);
             }
@@ -102,7 +115,11 @@ impl MarkdownSessionAccess {
         // Validate the complete streamed temporary through an independent immutable snapshot before publication.
         let mut replacement = MarkdownDocumentBuffer::open(&temporary.path, MAX_DOCUMENT_BYTES)
             .map_err(markdown_document_buffer_save_error)?;
-        let saved_revision = replacement.original_revision().encode_hex();
+        let saved_revision = replacement
+            .original_revision()
+            // 新打开的普通保存临时文件应有基线；意外pending也不能进入发布。
+            .ok_or(MarkdownWorkspaceError::PendingLegacyRecovery)?
+            .encode_hex();
         let rechecked = inspect_markdown_save_baseline(&path)?;
         if rechecked.revision != expected_revision {
             // A revision change while streaming invalidates the proposed overwrite.
@@ -123,6 +140,8 @@ impl MarkdownSessionAccess {
             MarkdownWorkspaceError::StorageUnavailable
         })?;
         temporary.disarm();
+        // rename已发布，后续sync/metadata即使失败也须立即撤旧正文搜索；同路径目录键不变。
+        self.invalidate_content_search();
         replacement
             .adopt_atomic_save_destination(&path)
             .map_err(markdown_document_buffer_save_error)?;
@@ -165,53 +184,125 @@ impl MarkdownSessionAccess {
         parent_directory: &str,
         title: &str,
     ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
-        // Require a buffer originating in this vault without reopening a now-conflicted file.
-        relative_markdown_path(&self.canonical_root, document.path())?;
-        let parent = resolve_existing_directory(&self.canonical_root, parent_directory)?;
-        let title = validated_note_title(title)?;
+        // 生产另存始终使用真实目录sync，不暴露故障开关。
+        self.save_document_buffer_as_new_with_directory_sync(
+            document,
+            parent_directory,
+            title,
+            sync_directory,
+        )
+    }
 
-        // Stream into an exclusively created sibling; Drop owns cleanup until publication.
-        let mut temporary = create_temporary_markdown_save(&parent, &self.save_sequence)?;
+    /// 另存后的私有同步边界，真实rename之后失败仍由原rollback和终态撤权负责。
+    #[cfg(feature = "native-markdown-candidate")]
+    pub(super) fn save_document_buffer_as_new_with_directory_sync(
+        &self,
+        document: &MarkdownDocumentBuffer,
+        parent_directory: &str,
+        title: &str,
+        mut synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
+    ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
+        // 另存也须等当前输入落定，避免把旧canonical作为用户正在提交的候选保存出去。
         document
-            .write_to(&mut temporary.file)
+            .ensure_text_input_idle()
             .map_err(markdown_document_buffer_save_error)?;
-        temporary.file.sync_all().map_err(|_| {
-            // Translate a failed filesystem stage into the stable vault-storage error category.
-            MarkdownWorkspaceError::StorageUnavailable
-        })?;
-        let revision = document.current_revision().encode_hex();
+        // 终态撤权必须晚于pending文件rollback，不把另存误判为同路径正文保存。
+        let publication = WorkspaceStructurePublication::new(self);
+        let result = (|| {
+            // Require a buffer originating in this vault without reopening a now-conflicted file.
+            relative_markdown_path(&self.canonical_root, document.path())?;
+            let parent = resolve_existing_directory(&self.canonical_root, parent_directory)?;
+            let title = validated_note_title(title)?;
 
-        // Atomic exclusive rename never exposes a partially written note or replaces an entry.
-        for suffix in 1_u16..=1_000 {
-            let name = if suffix == 1 {
-                // The requested title is preferred when no file or symlink already owns it.
-                format!("{title}.md")
-            } else {
-                // A bounded suffix sequence keeps both the existing entry and the live draft.
-                format!("{title} {suffix}.md")
-            };
-            let destination = parent.join(name);
-            match rename_without_replacement(&temporary.path, &destination) {
-                Ok(()) => {
-                    // The final file now owns the bytes; the temporary-path cleanup is obsolete.
-                    temporary.disarm();
-                    let mut pending = PendingVaultFile::new(destination.clone());
-                    sync_directory(&parent)?;
-                    let receipt = mutation_receipt(&self.canonical_root, &destination, revision)?;
-                    pending.disarm();
-                    return Ok(receipt);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // A collision leaves the temporary draft intact for the next unused name.
-                }
-                Err(_) => {
-                    // Temporary Drop cleans failed publication without touching the original note.
-                    return Err(MarkdownWorkspaceError::StorageUnavailable);
+            // 在临时文件之前pin同一父目录，rename之后沿用此身份而不认领可能替换的路径。
+            let parent_descriptor = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&parent)
+                .map_err(|_| MarkdownWorkspaceError::StorageUnavailable)?;
+            verify_attachment_parent(&self.canonical_root, &parent, &parent_descriptor)?;
+            // Stream into an exclusively created sibling; Drop owns cleanup until publication.
+            let mut temporary = create_temporary_markdown_save(&parent, &self.save_sequence)?;
+            document
+                .write_to(&mut temporary.file)
+                .map_err(markdown_document_buffer_save_error)?;
+            temporary.file.sync_all().map_err(|_| {
+                // Translate a failed filesystem stage into the stable vault-storage error category.
+                MarkdownWorkspaceError::StorageUnavailable
+            })?;
+            let revision = document
+                .current_revision()
+                .map_err(markdown_document_buffer_save_error)?
+                .encode_hex();
+            // 取得者身份在rename之前固定；发布后只更新完整metadata封值，不改变dev/ino来源。
+            let temporary_identity = FileIdentity::from(
+                &temporary
+                    .file
+                    .metadata()
+                    .map_err(|_| MarkdownWorkspaceError::StorageUnavailable)?,
+            );
+
+            // Atomic exclusive rename never exposes a partially written note or replaces an entry.
+            for suffix in 1_u16..=1_000 {
+                let name = if suffix == 1 {
+                    // The requested title is preferred when no file or symlink already owns it.
+                    format!("{title}.md")
+                } else {
+                    // A bounded suffix sequence keeps both the existing entry and the live draft.
+                    format!("{title} {suffix}.md")
+                };
+                let destination = parent.join(name);
+                match rename_without_replacement(&temporary.path, &destination) {
+                    Ok(()) => {
+                        // The final file now owns the bytes; the temporary-path cleanup is obsolete.
+                        temporary.disarm();
+                        // 新笔记名称已发布，原查询续页失效；既有失败清理仍由pending guard负责。
+                        publication.changed();
+                        // rename后再从原FD封ctime；复制FD失败时不得重新按路径认领替换文件。
+                        let acquired_destination = temporary
+                            .file
+                            .try_clone()
+                            .and_then(|file| {
+                                AcquiredMarkdownFile::seal(
+                                    file,
+                                    temporary_identity,
+                                    document.byte_len() as u64,
+                                    parent_descriptor,
+                                    parent.clone(),
+                                    &self.canonical_root,
+                                )
+                            })
+                            .map_err(|_| {
+                                publication.rollback_unconfirmed();
+                                MarkdownWorkspaceError::StorageUnavailable
+                            })?;
+                        let mut pending = PendingVaultFile::new(
+                            destination.clone(),
+                            acquired_destination,
+                            &publication,
+                        );
+                        synchronize_directory(&parent)?;
+                        let receipt =
+                            mutation_receipt(&self.canonical_root, &destination, revision)?;
+                        // 目录同步回调后仍须核原FD/path/parent封值；外部替换不能借旧同步成功变成新保存的receipt。
+                        pending.verify_for_commit()?;
+                        pending.disarm();
+                        return Ok(receipt);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        // A collision leaves the temporary draft intact for the next unused name.
+                    }
+                    Err(_) => {
+                        // Temporary Drop cleans failed publication without touching the original note.
+                        return Err(MarkdownWorkspaceError::StorageUnavailable);
+                    }
                 }
             }
-        }
-        // Exhaustion drops the unpublished temporary while preserving every preexisting entry.
-        Err(MarkdownWorkspaceError::NameCollisionLimitExceeded)
+            // Exhaustion drops the unpublished temporary while preserving every preexisting entry.
+            Err(MarkdownWorkspaceError::NameCollisionLimitExceeded)
+        })();
+        // 先完成pending析构，保留可能发生的外部修改和原始保存错误。
+        publication.finish(result)
     }
 }
 
@@ -246,7 +337,7 @@ mod tests {
             access.save_document_buffer(&mut document).err(),
             Some(MarkdownWorkspaceError::SaveConflict)
         );
-        let revision = document.current_revision();
+        let revision = document.current_revision().unwrap();
         let original_path = document.path().to_path_buf();
         let selection = document.selection();
         let generation = document.generation();
@@ -270,7 +361,7 @@ mod tests {
 
         // The UI, not persistence, owns the later switch; the old draft/history stay unchanged.
         assert_eq!(document.path(), original_path);
-        assert_eq!(document.current_revision(), revision);
+        assert_eq!(document.current_revision().unwrap(), revision);
         assert_eq!(document.selection(), selection);
         assert_eq!(document.generation(), generation);
         assert!(document.is_dirty());
@@ -445,18 +536,47 @@ mod tests {
         document.undo_text_edit().unwrap();
         let profile = document.storage_profile();
         let original_revision = document.original_revision();
-        let current_revision = document.current_revision();
+        let current_revision = document.current_revision().unwrap();
         let generation = document.generation();
         let selection = document.selection();
         assert!(document.can_undo());
         assert!(document.can_redo());
         let called = Cell::new(false);
 
+        // 实际发布前同时持有目录末页和正文搜索，后续故障不能错误恢复旧搜索权限。
+        let mut pager = access.open_workspace_pager().unwrap();
+        let super::paging::MarkdownWorkspacePageProgress::Ready(browse_page) = pager
+            .next_page_cancellable(
+                12,
+                512,
+                &std::collections::HashSet::new(),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap()
+        else {
+            panic!("单笔记fixture必须一步完整扫描");
+        };
+        let search_page = access
+            .search_notes_page_cancellable(
+                "before",
+                1,
+                None,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+
         // Fail only the one post-publication durability stage, after the real file rename completed.
         let failure = access.save_document_buffer_with_directory_sync(&mut document, |parent| {
             called.set(true);
             assert_eq!(parent, root.canonicalize().unwrap());
             assert_eq!(fs::read_to_string(&path).unwrap(), draft);
+            // 在真实rename之后、故意返回fsync错误之前就必须完成内容搜索撤权。
+            assert!(!search_page.authority.is_current(&access, "before"));
+            assert!(
+                browse_page
+                    .authority
+                    .is_current(&access, &std::collections::HashSet::new())
+            );
             assert!(fs::read_dir(parent).unwrap().all(|entry| {
                 // Rename already consumed the sibling name; no unpublished temporary survives this point.
                 !entry
@@ -469,11 +589,17 @@ mod tests {
         });
         assert!(called.get());
         assert_eq!(failure, Err(MarkdownWorkspaceError::StorageUnavailable));
+        assert!(!search_page.authority.is_current(&access, "before"));
+        assert!(
+            browse_page
+                .authority
+                .is_current(&access, &std::collections::HashSet::new())
+        );
         let published_inode = fs::metadata(&path).unwrap().ino();
         // A physically published file is not a clean-buffer acknowledgement when directory sync failed.
         assert!(document.is_dirty());
         assert_eq!(document.original_revision(), original_revision);
-        assert_eq!(document.current_revision(), current_revision);
+        assert_eq!(document.current_revision().unwrap(), current_revision);
         assert_eq!(document.storage_profile(), profile);
         assert_eq!(document.generation(), generation);
         assert_eq!(document.selection(), selection);
@@ -484,7 +610,7 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().ino(), published_inode);
         assert_eq!(receipt.revision, current_revision.encode_hex());
         assert_eq!(receipt.byte_count, draft.len() as u64);
-        assert_eq!(document.original_revision(), current_revision);
+        assert_eq!(document.original_revision(), Some(current_revision));
         assert!(document.original_file_identity_is_unchanged());
         assert!(!document.is_dirty());
         assert_eq!(document.storage_profile(), profile);

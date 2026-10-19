@@ -181,7 +181,13 @@ fn native_document_save_streams_pieces_and_preserves_edit_history() {
         fs::read_to_string(root.path().join("Note.md")).unwrap(),
         replacement
     );
-    assert_eq!(receipt.revision, document.original_revision().encode_hex());
+    assert_eq!(
+        receipt.revision,
+        document
+            .original_revision()
+            .expect("normal saved disk baseline")
+            .encode_hex()
+    );
     assert_eq!(receipt.byte_count, replacement.len() as u64);
     assert!(!document.is_dirty());
     assert_eq!(

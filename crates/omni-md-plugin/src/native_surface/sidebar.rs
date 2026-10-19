@@ -3,6 +3,11 @@
 
 use super::*;
 
+mod list;
+#[cfg(feature = "native-markdown-runtime-probe")]
+pub(super) use list::verify_search_rows;
+pub(super) use list::{NativeMarkdownSidebarList, NativeMarkdownSidebarTable};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// The vault root, a confined directory, or an editable note determines allowed sidebar actions.
 pub(super) enum NativeMarkdownSidebarEntryKind {
@@ -17,13 +22,44 @@ pub(super) struct NativeMarkdownSidebarRow {
     pub(super) kind: NativeMarkdownSidebarEntryKind,
     pub(super) relative_path: String,
     pub(super) title: String,
+    /// 仅搜索结果具有副行；纯目录页不增加行高，也不持有任何笔记正文。
+    pub(super) subtitle: Option<String>,
     pub(super) depth: usize,
     pub(super) is_collapsed: bool,
+}
+
+impl NativeMarkdownSidebarRow {
+    /// 仅消费原搜索页已经提供的有限摘要；标题与文件身份不再拼进同一个截断字段。
+    pub(super) fn from_search_result(result: omni_markdown_core::MarkdownSearchResult) -> Self {
+        let subtitle = match result.snippet {
+            // 原路径先呈现，重名标题仍可辨别目录；摘要只来自原页，不再读正文或自行截短。
+            Some(snippet) => format!("{} · {snippet}", result.relative_path),
+            None => result.relative_path.clone(), // 仅标题命中时仍保原路径，不能显示一条空副行。
+        };
+        Self {
+            kind: NativeMarkdownSidebarEntryKind::Note,
+            relative_path: result.relative_path,
+            title: result.title,
+            subtitle: Some(subtitle),
+            depth: 1,
+            is_collapsed: false,
+        }
+    }
+
+    /// Tooltip保留原路径与完整的有界副行；显示截断不会改变文件动作或无障碍身份。
+    fn search_description(&self) -> String {
+        format!(
+            "笔记：{}\n{}",
+            self.title,
+            self.subtitle.as_deref().expect("搜索行具有原副行")
+        )
+    }
 }
 
 /// Build the root and path-sorted metadata rows while preserving the bounded note snapshot.
 pub(super) fn native_markdown_sidebar_rows(
     snapshot: MarkdownWorkspaceSnapshot,
+    root_title: &str,
 ) -> (Vec<MarkdownNoteSummary>, Vec<NativeMarkdownSidebarRow>) {
     // The root always exists as a virtual row even when the bounded workspace contains no notes.
     let MarkdownWorkspaceSnapshot { directories, notes } = snapshot;
@@ -31,7 +67,9 @@ pub(super) fn native_markdown_sidebar_rows(
     rows.push(NativeMarkdownSidebarRow {
         kind: NativeMarkdownSidebarEntryKind::Root,
         relative_path: String::new(),
-        title: "OMNI".to_owned(),
+        // 根标签来自本会话已验证的实际目录，不能把合成库也伪装成正式 OMNI。
+        title: root_title.to_owned(),
+        subtitle: None,
         depth: 0,
         is_collapsed: false,
     });
@@ -40,6 +78,7 @@ pub(super) fn native_markdown_sidebar_rows(
         NativeMarkdownSidebarRow {
             kind: NativeMarkdownSidebarEntryKind::Directory,
             title: native_markdown_path_name(&relative_path),
+            subtitle: None,
             depth: Path::new(&relative_path).components().count(),
             is_collapsed: false,
             relative_path,
@@ -52,16 +91,192 @@ pub(super) fn native_markdown_sidebar_rows(
             kind: NativeMarkdownSidebarEntryKind::Note,
             relative_path: note.relative_path.clone(),
             title: note.title.clone(),
+            subtitle: None,
             depth: Path::new(&note.relative_path).components().count(),
             is_collapsed: false,
         }
     }));
-    // Keep the virtual root first and sort the remaining metadata deterministically by full path.
+    // 根行永远为首；其余行必须与Core跨页选择使用完全相同的树比较器。
     rows[1..].sort_unstable_by(|left, right| {
-        // Component identity remains independent of localized display titles.
-        left.relative_path.cmp(&right.relative_path)
+        let kind = |row: &NativeMarkdownSidebarRow| match row.kind {
+            // 根不在被排序的slice内；防御性映射为目录。
+            NativeMarkdownSidebarEntryKind::Root | NativeMarkdownSidebarEntryKind::Directory => {
+                omni_markdown_core::MarkdownWorkspaceEntryKind::Directory
+            }
+            NativeMarkdownSidebarEntryKind::Note => {
+                omni_markdown_core::MarkdownWorkspaceEntryKind::Note
+            }
+        };
+        omni_markdown_core::compare_markdown_workspace_entries(
+            &left.relative_path,
+            kind(left),
+            &right.relative_path,
+            kind(right),
+        )
     });
     (notes, rows)
+}
+
+#[cfg(test)]
+mod sorted_page_tests {
+    use super::*;
+
+    #[test]
+    /// 重名结果保留各自原路径与完整有界摘要；标题不再受摘要拼接和60scalar截短影响。
+    fn search_rows_separate_title_and_subtitle_without_rewriting_file_identity() {
+        let snippet = "中文😀命中摘要".repeat(12);
+        for path in ["设计/同名.md", "归档/同名.md"] {
+            let row = NativeMarkdownSidebarRow::from_search_result(
+                omni_markdown_core::MarkdownSearchResult {
+                    relative_path: path.into(),
+                    title: "同名".into(),
+                    snippet: Some(snippet.clone()),
+                },
+            );
+            assert_eq!(row.relative_path, path);
+            assert_eq!(row.title, "同名");
+            assert_eq!(
+                row.subtitle.as_deref(),
+                Some(format!("{path} · {snippet}").as_str())
+            );
+            assert!(row.search_description().contains(path));
+            assert!(row.search_description().contains(&snippet));
+        }
+        let row = NativeMarkdownSidebarRow::from_search_result(
+            omni_markdown_core::MarkdownSearchResult {
+                relative_path: "  原目录 /原题.md".into(),
+                title: " 原题 ".into(),
+                snippet: None,
+            },
+        );
+        assert_eq!(row.title, " 原题 ");
+        assert_eq!(row.subtitle.as_deref(), Some("  原目录 /原题.md"));
+    }
+
+    #[test]
+    /// 分组运输的目录/笔记必须还原同一树序；根行计入固定13行而非额外溢出。
+    fn metadata_page_keeps_tree_order_and_counts_root_inside_visible_budget() {
+        let notes = ["z.md", "a/child.md", "a/Z/leaf.md", "A.md"]
+            .into_iter()
+            .map(|path| MarkdownNoteSummary {
+                relative_path: path.to_owned(),
+                title: native_markdown_path_name(path),
+                byte_count: 0,
+                modified_at_ms: 0,
+            })
+            .collect();
+        let (_, rows) = native_markdown_sidebar_rows(
+            omni_markdown_core::MarkdownWorkspaceSnapshot {
+                directories: vec!["a/Z".into(), "a".into()],
+                notes,
+            },
+            "OMNI",
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            ["", "a", "a/Z", "a/Z/leaf.md", "a/child.md", "A.md", "z.md"]
+        );
+        let notes = (0..12)
+            .map(|index| MarkdownNoteSummary {
+                relative_path: format!("note-{index:02}.md"),
+                title: format!("note-{index:02}"),
+                byte_count: 0,
+                modified_at_ms: 0,
+            })
+            .collect();
+        let (_, full) = native_markdown_sidebar_rows(
+            omni_markdown_core::MarkdownWorkspaceSnapshot {
+                directories: Vec::new(),
+                notes,
+            },
+            "OMNI",
+        );
+        assert_eq!(full.len(), sidebar_geometry::MINIMUM_PAGE_ROWS);
+        assert_eq!(
+            full.first().unwrap().kind,
+            NativeMarkdownSidebarEntryKind::Root
+        );
+    }
+
+    #[test]
+    /// 目录选择只跟随真实成功收据；未打开正文和不在当前页都不改变路径含义。
+    fn successful_directory_receipts_preserve_selected_subtree_and_unrelated_browse_directory() {
+        let created = NativeMarkdownFileMutation::CreateDirectory {
+            parent_directory: "B".into(),
+            name: "新目录".into(),
+        };
+        assert_eq!(
+            native_markdown_directory_after_mutation(
+                "B",
+                &created,
+                &NativeMarkdownFileMutationResult::DirectoryCreated("B/新目录".into()),
+            ),
+            Some("B/新目录".into()),
+        );
+        let renamed = NativeMarkdownFileMutation::RenameDirectory {
+            relative_path: "B".into(),
+            name: "新位置".into(),
+        };
+        let receipt = NativeMarkdownFileMutationResult::DirectoryRenamed("新位置".into());
+        assert_eq!(
+            native_markdown_directory_after_mutation("B", &renamed, &receipt),
+            Some("新位置".into()),
+        );
+        assert_eq!(
+            native_markdown_directory_after_mutation("B/子目录", &renamed, &receipt),
+            Some("新位置/子目录".into()),
+        );
+        assert_eq!(
+            native_markdown_directory_after_mutation("Backup/子目录", &renamed, &receipt),
+            None,
+        );
+        // 正文另有笔记的操作不应覆盖独立的B目录；实际打开新正文才另行选择其父目录。
+        assert_eq!(
+            native_markdown_directory_after_mutation(
+                "B",
+                &NativeMarkdownFileMutation::RenameNote {
+                    relative_path: "A/原.md".into(),
+                    title: "新".into()
+                },
+                &NativeMarkdownFileMutationResult::NoteRenamed("A/新.md".into()),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    /// 删除选择所在子树后只回该子树真实父目录；同名前缀的兄弟和不匹配收据不迁移。
+    fn directory_deletion_uses_real_parent_and_does_not_accept_a_mismatched_receipt() {
+        let deleted = NativeMarkdownFileMutation::DeleteDirectory {
+            relative_path: "B/子目录".into(),
+        };
+        assert_eq!(
+            native_markdown_directory_after_mutation(
+                "B/子目录/后代",
+                &deleted,
+                &NativeMarkdownFileMutationResult::DirectoryDeleted
+            ),
+            Some("B".into()),
+        );
+        assert_eq!(
+            native_markdown_directory_after_mutation(
+                "B/子目录备份",
+                &deleted,
+                &NativeMarkdownFileMutationResult::DirectoryDeleted
+            ),
+            None,
+        );
+        assert_eq!(
+            native_markdown_directory_after_mutation(
+                "B/子目录",
+                &deleted,
+                &NativeMarkdownFileMutationResult::DirectoryRenamed("错误来源".into())
+            ),
+            None,
+        );
+    }
 }
 
 /// Extract a display basename without changing the confined relative identity.
@@ -110,6 +325,10 @@ pub(super) fn native_markdown_rewrite_directory_prefix(
     let suffix = Path::new(relative_path)
         .strip_prefix(Path::new(old_directory))
         .ok()?;
+    if suffix.as_os_str().is_empty() {
+        // 目录自身没有后代后缀，直接保留真实收据原串；join空路径会产生多余尾部斜杠。
+        return Some(new_directory.to_owned());
+    }
     Path::new(new_directory)
         .join(suffix)
         .to_str()
@@ -143,10 +362,11 @@ pub(super) fn native_markdown_sidebar_button_title(row: &NativeMarkdownSidebarRo
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// User actions are interpreted against the selected row and revalidated by the file state machine.
+/// 原行菜单与目录头部的实际动作，仍由同一文件流程执行Core约束。
 pub(super) enum NativeMarkdownSidebarAction {
     CreateNote,
     CreateDirectory,
+    ImportNote,
     Rename,
     MoveNote,
     CopyNote,
@@ -189,16 +409,60 @@ pub(super) enum NativeMarkdownFileMutation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Authoritative mutation receipts identify committed paths for editor recovery and selection.
+/// Core真实成功收据携带已提交路径，供正文恢复和独立目录选择使用。
 pub(super) enum NativeMarkdownFileMutationResult {
     NoteCreated(String),
-    DirectoryCreated,
+    DirectoryCreated(String),
     DirectoryRenamed(String),
     DirectoryDeleted,
     NoteRenamed(String),
     NoteMoved(String),
     NoteCopied(String),
     NoteDeleted,
+}
+
+/// 目录浏览与打开的正文独立；只有实际成功的目录收据能迁移这一选择。
+fn native_markdown_directory_after_mutation(
+    selected_directory: &str,
+    mutation: &NativeMarkdownFileMutation,
+    result: &NativeMarkdownFileMutationResult,
+) -> Option<String> {
+    match (mutation, result) {
+        // 新目录使用Core返回的真实身份，不能由尚未确认的名称预先拼接。
+        (
+            NativeMarkdownFileMutation::CreateDirectory { .. },
+            NativeMarkdownFileMutationResult::DirectoryCreated(path),
+        ) => Some(path.clone()),
+        // 重命名只迁移被改名子树中的当前选择，保留实际后代相对位置。
+        (
+            NativeMarkdownFileMutation::RenameDirectory { relative_path, .. },
+            NativeMarkdownFileMutationResult::DirectoryRenamed(path),
+        ) if native_markdown_path_is_inside_directory(selected_directory, relative_path) => {
+            native_markdown_rewrite_directory_prefix(selected_directory, relative_path, path)
+        }
+        // 删除选中子树后回到其真实父目录；这是成功删除的结果，不是失效路径的根目录兜底。
+        (
+            NativeMarkdownFileMutation::DeleteDirectory { relative_path },
+            NativeMarkdownFileMutationResult::DirectoryDeleted,
+        ) if native_markdown_path_is_inside_directory(selected_directory, relative_path) => {
+            Some(native_markdown_note_parent(relative_path))
+        }
+        // 笔记和无关目录操作不改变独立浏览选择；成功打开正文另行选择其真实父目录。
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+/// 原右键行绑定页，头部绑定独立目录选择；两种来源共用同一列表和文件动作入口。
+pub(super) enum NativeMarkdownSidebarActionOrigin {
+    Row {
+        row_index: usize,
+        revision: u64,
+    },
+    SelectedDirectory {
+        relative_path: String,
+        selection_revision: u64,
+    },
 }
 
 /// Determine whether a mutation touches the active note directly or through an ancestor directory.
@@ -386,7 +650,7 @@ pub(super) fn native_markdown_sidebar_action_is_allowed(
 /// A copied row and bounded directory list permit modal interaction without a borrowed surface.
 pub(super) struct NativeMarkdownSidebarActionContext {
     pub(super) controller: Retained<NativeMarkdownController>,
-    pub(super) row: NativeMarkdownSidebarRow,
+    pub(super) row: Option<NativeMarkdownSidebarRow>,
     pub(super) directories: Vec<String>,
 }
 
@@ -397,294 +661,290 @@ pub(super) fn assign_escape_to_native_markdown_alert_cancel(cancel_button: &NSBu
     cancel_button.setKeyEquivalentModifierMask(NSEventModifierFlags::empty());
 }
 
-/// Collect a trimmed candidate name after explicit confirmation; filesystem validation occurs later.
+/// 名称对话框只返回明确确认的有界候选；取消与资源失败分别表达。
 pub(super) fn run_native_markdown_name_dialog(
+    controller: &NativeMarkdownController,
     message: &str,
     informative_text: &str,
     initial_value: &str,
     placeholder: &str,
     action_title: &str,
     mtm: MainThreadMarker,
-) -> Option<String> {
-    // The synchronous modal graph is local; callers must release surface borrows before entering it.
-    let alert = NSAlert::new(mtm);
-    alert.setAlertStyle(NSAlertStyle::Informational);
-    alert.setMessageText(&NSString::from_str(message));
-    alert.setInformativeText(&NSString::from_str(informative_text));
-    alert.addButtonWithTitle(&NSString::from_str(action_title));
-    let cancel_button = alert.addButtonWithTitle(ns_string!("取消"));
-    assign_escape_to_native_markdown_alert_cancel(&cancel_button);
+) -> Result<Option<String>, NativeMarkdownModalError> {
+    let guard = NativeMarkdownModalUseGuard::enter(controller)?;
+    let result = autoreleasepool(|_| {
+        // 全部显式角色先登记，再安装用户候选；失败不展示部分构造的modal。
+        let alert = NSAlert::new(mtm);
+        alert.setAlertStyle(NSAlertStyle::Informational);
+        alert.addButtonWithTitle(&NSString::from_str(action_title));
+        let cancel = alert.addButtonWithTitle(ns_string!("取消"));
+        assign_escape_to_native_markdown_alert_cancel(&cancel);
+        let window = register_native_markdown_modal_alert(&guard, &alert)?;
+        let input = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(360.0, 24.0)),
+        );
+        let owner = install_native_markdown_modal_name_input(&guard, &input, &window, mtm)?;
 
-    // Accessory ownership keeps the editable name field live throughout AppKit's modal event loop.
-    let input = NSTextField::initWithFrame(
-        NSTextField::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(360.0, 24.0)),
-    );
-    input.setEditable(true);
-    input.setSelectable(true);
-    input.setStringValue(&NSString::from_str(initial_value));
-    input.setPlaceholderString(Some(&NSString::from_str(placeholder)));
-    alert.setAccessoryView(Some(&input));
-    alert.window().setInitialFirstResponder(Some(&input));
-    // SAFETY: the alert retains this NSTextField accessory; selection occurs on its allocating
-    // AppKit main thread before the synchronous modal loop, and the sender is intentionally nil.
-    unsafe { input.selectText(None) };
-
-    if alert.runModal() != NSAlertFirstButtonReturn {
-        // Cancellation produces no candidate name and authorizes no filesystem mutation.
-        return None;
-    }
-    // Return an owned trimmed candidate after the modal ends; domain validation still decides validity.
-    let value = input.stringValue().to_string();
-    Some(value.trim().to_owned())
+        // 自有cell保留标准输入/IME，独占provider只弱借用本dialog历史与ledger。
+        alert.setMessageText(&NSString::from_str(message));
+        alert.setInformativeText(&NSString::from_str(informative_text));
+        input.setEditable(true);
+        input.setSelectable(true);
+        input.setStringValue(&NSString::from_str(initial_value));
+        input.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+        alert.setAccessoryView(Some(&input));
+        window.setInitialFirstResponder(Some(&input));
+        let response = run_native_markdown_modal_input_response(&alert, &window, &input, &owner);
+        let candidate = response.and_then(|confirmed| {
+            if confirmed {
+                // 只有用户确认且正常辞任成功才复制候选，core仍负责最终名称/路径验证。
+                native_markdown_modal_candidate(&input).map(Some)
+            } else {
+                // 取消不读取字段正文，更不授权文件系统mutation。
+                Ok(None)
+            }
+        });
+        let cleanup = finish_native_markdown_modal_input(&guard, &owner, &window, &input);
+        detach_native_markdown_modal_alert(&alert, &window);
+        // 只有正常辞任通过才能到达这里；资源错误阻止后继，候选不持有native借用。
+        cleanup.and(candidate)
+    });
+    // guard晚于全部局部Retained与pool退出；末尾再复核borrowed公开事实。
+    guard.complete(result)
 }
 
-/// Offers bounded directory suggestions while allowing any explicitly typed confined destination.
+/// 可编辑目的目录保留有界页面建议；输入结果仍由core重复confinement/revision校验。
 pub(super) fn run_native_markdown_move_destination_dialog(
+    controller: &NativeMarkdownController,
     destination_directories: &[String],
     mtm: MainThreadMarker,
-) -> Result<Option<String>, String> {
-    // Directory suggestions come from the current metadata page. Editable input keeps directories
-    // on later pages reachable without loading an unbounded full-vault destination catalog.
-    let alert = NSAlert::new(mtm);
-    alert.setAlertStyle(NSAlertStyle::Informational);
-    alert.setMessageText(ns_string!("Move note"));
-    alert.setInformativeText(ns_string!("Choose a suggested folder or type its full path relative to the vault. Leave the field empty for the vault root."));
-    alert.addButtonWithTitle(ns_string!("Move"));
-    assign_escape_to_native_markdown_alert_cancel(&alert.addButtonWithTitle(ns_string!("Cancel")));
+) -> Result<Option<String>, NativeMarkdownModalError> {
+    let guard = NativeMarkdownModalUseGuard::enter(controller)?;
+    let result = autoreleasepool(|_| {
+        let alert = NSAlert::new(mtm);
+        alert.setAlertStyle(NSAlertStyle::Informational);
+        alert.addButtonWithTitle(ns_string!("移动"));
+        assign_escape_to_native_markdown_alert_cancel(
+            &alert.addButtonWithTitle(ns_string!("取消")),
+        );
+        let window = register_native_markdown_modal_alert(&guard, &alert)?;
+        let destinations = objc2_app_kit::NSComboBox::initWithFrame(
+            objc2_app_kit::NSComboBox::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 28.0)),
+        );
+        let owner = install_native_markdown_modal_move_input(&guard, &destinations, &window, mtm)?;
 
-    // The local alert owns its editable combo through modal tracking; no surface/document borrow escapes.
-    let destinations = objc2_app_kit::NSComboBox::initWithFrame(
-        objc2_app_kit::NSComboBox::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 28.0)),
-    );
-    destinations.setEditable(true);
-    destinations.setSelectable(true);
-    destinations.setCompletes(true);
-    destinations.setPlaceholderString(Some(ns_string!("Vault root, or relative folder/path")));
-    destinations
-        .setAccessibilityLabel(Some(ns_string!("Destination folder relative to the vault")));
-    // Suggest only the already copied bounded page; root remains expressible as an empty value.
-    for directory in destination_directories {
-        if !directory.is_empty() {
-            // An actual relative path can be selected unchanged; localized labels never become authority.
-            let value = NSString::from_str(directory);
-            // SAFETY: NSComboBox stores text entries and this live NSString has the expected object type.
-            unsafe {
-                destinations.addItemWithObjectValue(&value);
+        // 建议只复制当前sidebar页面，不扫描完整vault，也不以翻译标签替代路径authority。
+        alert.setMessageText(ns_string!("移动笔记"));
+        alert.setInformativeText(ns_string!(
+            "选择建议文件夹，或输入相对于笔记库的完整路径。留空表示笔记库根目录。"
+        ));
+        destinations.setEditable(true);
+        destinations.setSelectable(true);
+        destinations.setCompletes(true);
+        destinations.setPlaceholderString(Some(ns_string!("留空选择根目录，或输入相对文件夹路径")));
+        destinations.setAccessibilityLabel(Some(ns_string!("目标文件夹，相对于笔记库")));
+        for directory in destination_directories {
+            if !directory.is_empty() {
+                // 根目录以空字段表达；非空建议保持实际相对路径，不生成隐藏的全目录缓存。
+                let value = NSString::from_str(directory);
+                // SAFETY: 只向主线程自有combo添加活NSString，保留AppKit标准候选所有权。
+                unsafe { destinations.addItemWithObjectValue(&value) };
             }
         }
-    }
-    alert.setAccessoryView(Some(&destinations));
-    alert.window().setInitialFirstResponder(Some(&destinations));
-    if alert.runModal() != NSAlertFirstButtonReturn {
-        // Cancellation authorizes no mutation, including when the typed destination is invalid.
-        return Ok(None);
-    }
-    // Typed paths are candidates only; the core repeats path-component, existence, symlink and
-    // collision checks after the modal ends and the active controller identity is revalidated.
-    Ok(Some(
-        destinations.stringValue().to_string().trim().to_owned(),
-    ))
+        alert.setAccessoryView(Some(&destinations));
+        window.setInitialFirstResponder(Some(&destinations));
+        let response =
+            run_native_markdown_modal_input_response(&alert, &window, &destinations, &owner);
+        let candidate = response.and_then(|confirmed| {
+            if confirmed {
+                // 空候选合法表示vault root；其他候选不在UI层猜测存在性或绕过symlink检查。
+                native_markdown_modal_candidate(&destinations).map(Some)
+            } else {
+                // 取消即使发生在无效输入中也不创建任何移动命令。
+                Ok(None)
+            }
+        });
+        let cleanup = finish_native_markdown_modal_input(&guard, &owner, &window, &destinations);
+        // 只清自己安装的候选和completion配置，不触碰系统全局Find/clipboard状态。
+        destinations.setCompletes(false);
+        destinations.removeAllItems();
+        detach_native_markdown_modal_alert(&alert, &window);
+        cleanup.and(candidate)
+    });
+    guard.complete(result)
 }
 
-/// Authorize destructive deletion only for a note/directory and only after affirmative confirmation.
+/// 删除必须显式确认；资源错误不能压成bool取消，根目录仍无破坏权限。
 pub(super) fn run_native_markdown_delete_confirmation(
+    controller: &NativeMarkdownController,
     row: &NativeMarkdownSidebarRow,
     mtm: MainThreadMarker,
-) -> bool {
-    // The synchronous modal graph is local; callers must release surface borrows before entering it.
-    let alert = NSAlert::new(mtm);
-    alert.setAlertStyle(NSAlertStyle::Warning);
+) -> Result<bool, NativeMarkdownModalError> {
     let (message, informative_text) = match row.kind {
-        // Directory deletion must disclose recursive loss before requesting affirmative confirmation.
-        NativeMarkdownSidebarEntryKind::Directory => (
-            format!("删除目录“{}”？", row.title),
-            "目录中的全部笔记和子目录都会被删除，此操作无法撤销。",
-        ),
-        // A note confirmation describes only the one selected Markdown file.
-        NativeMarkdownSidebarEntryKind::Note => (
-            format!("删除笔记“{}”？", row.title),
-            "这篇笔记会从 OMNI 中删除，此操作无法撤销。",
-        ),
-        // The virtual vault root is never a legal destructive target, even through a stale action.
-        NativeMarkdownSidebarEntryKind::Root => return false,
+        NativeMarkdownSidebarEntryKind::Directory => {
+            // 与core现有递归删除语义一致，警告必须披露整个受限子树的损失。
+            (
+                format!("删除目录“{}”？", row.title),
+                "目录中的全部笔记和子目录都会被删除，此操作无法撤销。",
+            )
+        }
+        NativeMarkdownSidebarEntryKind::Note => {
+            // 单笔记确认只授权这个已复制的身份，返回后caller仍需重核row/revision。
+            (
+                format!("删除笔记“{}”？", row.title),
+                "这篇笔记会从 OMNI 中删除，此操作无法撤销。",
+            )
+        }
+        NativeMarkdownSidebarEntryKind::Root => {
+            // 虚拟根从不分配破坏性确认框，更不进入core删除接口。
+            return Ok(false);
+        }
     };
-    alert.setMessageText(&NSString::from_str(&message));
-    alert.setInformativeText(&NSString::from_str(informative_text));
-    alert.addButtonWithTitle(ns_string!("删除"));
-    let cancel_button = alert.addButtonWithTitle(ns_string!("取消"));
-    assign_escape_to_native_markdown_alert_cancel(&cancel_button);
-    alert.runModal() == NSAlertFirstButtonReturn
+    let guard = NativeMarkdownModalUseGuard::enter(controller)?;
+    let result = autoreleasepool(|_| {
+        let alert = NSAlert::new(mtm);
+        alert.setAlertStyle(NSAlertStyle::Warning);
+        alert.addButtonWithTitle(ns_string!("删除"));
+        assign_escape_to_native_markdown_alert_cancel(
+            &alert.addButtonWithTitle(ns_string!("取消")),
+        );
+        let window = register_native_markdown_modal_alert(&guard, &alert)?;
+        alert.setMessageText(&NSString::from_str(&message));
+        alert.setInformativeText(&NSString::from_str(informative_text));
+        let confirmed = native_markdown_alert_response(alert.runModal(), true);
+        detach_native_markdown_modal_alert(&alert, &window);
+        confirmed
+    });
+    guard.complete(result)
 }
 
-/// A native button retains scalar row identity and kind, never a document or session owner.
-pub(super) struct NativeMarkdownSidebarButtonIvars {
+/// 菜单目标固定原页与行号；列表重用行视图不会改变已打开菜单的文件身份。
+pub(super) struct NativeMarkdownSidebarMenuTargetIvars {
     pub(super) row_index: usize,
-    pub(super) kind: NativeMarkdownSidebarEntryKind,
+    pub(super) revision: u64,
+    pub(super) list: Weak<list::NativeMarkdownSidebarTable>,
 }
 
 define_class!(
-    /// A surface-owned row control resolves copied scalar actions through the deferred workspace state machine.
-    // SAFETY: this main-thread NSButton subclass uses the exact declared action/menu selectors.
-    // Its ivars contain scalar row metadata only; menus are created per event and are never
-    // retained as an idle surface resource.
-    #[unsafe(super = NSButton)]
+    /// 临时菜单只持原列表的弱身份；所有文件动作仍进入既有工作区状态机。
+    // SAFETY: 主线程NSObject仅实现下方固定action selector，不接收任意方法名。
+    #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
-    #[ivars = NativeMarkdownSidebarButtonIvars]
-    pub(super) struct NativeMarkdownSidebarButton;
+    #[ivars = NativeMarkdownSidebarMenuTargetIvars]
+    pub(super) struct NativeMarkdownSidebarMenuTarget;
 
-    impl NativeMarkdownSidebarButton {
-        #[unsafe(method(activateMarkdownSidebarRow:))]
-        fn activate_markdown_sidebar_row(&self, _sender: &AnyObject) {
-            // Bind the delayed action to this exact current row control, without retaining it.
-            self.enqueue_checked(|row_index| {
-                if let Err(error) = activate_native_markdown_sidebar_row(row_index) {
-                    // Rejected metadata changes preserve the current editor and show bounded status.
-                    present_native_markdown_error(&error);
-                    eprintln!("Markdown sidebar activation failed: {error}");
-                }
-            });
-        }
-
-        #[unsafe(method_id(menuForEvent:))]
-        fn menu_for_event(&self, _event: &NSEvent) -> Option<Retained<NSMenu>> {
-            // AppKit invokes menu construction synchronously on the button's allocating main thread.
-            let mtm = MainThreadMarker::new()
-                .expect("native Markdown context menus are restricted to the AppKit main thread");
-            if !native_markdown_sidebar_button_is_current(self) {
-                // A menu event from a removed page cannot acquire authority over replacement rows.
-                None
-            } else {
-                // The active row control owns this event's finite context menu.
-                Some(native_markdown_sidebar_menu(self, self.ivars().kind, mtm))
-            }
-        }
-
+    impl NativeMarkdownSidebarMenuTarget {
         #[unsafe(method(createMarkdownNoteFromSidebar:))]
         fn create_markdown_note(&self, _sender: &AnyObject) {
-            // Create under the selected root/directory after the shared confined action policy validates it.
+            // 仍由原文件策略验证根/目录范围，再创建笔记；菜单不自行打开路径。
             self.enqueue_action(NativeMarkdownSidebarAction::CreateNote);
         }
 
         #[unsafe(method(createMarkdownDirectoryFromSidebar:))]
         fn create_markdown_directory(&self, _sender: &AnyObject) {
-            // Create a directory through the same deferred mutation boundary as note creation.
+            // 新建目录复用同一延迟修改边界，不在菜单跟踪栈里改变目录页。
             self.enqueue_action(NativeMarkdownSidebarAction::CreateDirectory);
         }
 
         #[unsafe(method(renameMarkdownEntryFromSidebar:))]
         fn rename_markdown_entry(&self, _sender: &AnyObject) {
-            // Resolve note versus directory rename later from current authoritative row metadata.
+            // 执行时仍从原页身份区分笔记/目录重命名，不以显示文字拼路径。
             self.enqueue_action(NativeMarkdownSidebarAction::Rename);
         }
 
         #[unsafe(method(moveMarkdownNoteFromSidebar:))]
         fn move_markdown_note(&self, _sender: &AnyObject) {
-            // Present only supported confined destinations through the shared note action path.
+            // 移动沿原受限目标选择流程，不增加文件系统旁路。
             self.enqueue_action(NativeMarkdownSidebarAction::MoveNote);
         }
 
         #[unsafe(method(copyMarkdownNoteFromSidebar:))]
         fn copy_markdown_note(&self, _sender: &AnyObject) {
-            // Request a non-overwriting duplicate using the authoritative mutation receipt.
+            // 副本沿原不覆盖提交规则，菜单本身不分配第二份文档。
             self.enqueue_action(NativeMarkdownSidebarAction::CopyNote);
         }
 
         #[unsafe(method(revealMarkdownEntryFromSidebar:))]
         fn reveal_markdown_entry(&self, _sender: &AnyObject) {
-            // Reveal the revalidated row path without creating a competing document owner.
+            // Finder只接收原动作重新验证的路径，不获得正文所有权。
             self.enqueue_action(NativeMarkdownSidebarAction::RevealInFinder);
         }
 
         #[unsafe(method(deleteMarkdownEntryFromSidebar:))]
         fn delete_markdown_entry(&self, _sender: &AnyObject) {
-            // Require the shared destructive confirmation before any confined deletion.
+            // 删除仍要求原确认与保存/版本检查，不因列表重构跳过确认。
             self.enqueue_action(NativeMarkdownSidebarAction::Delete);
         }
     }
 );
 
-impl NativeMarkdownSidebarButton {
-    /// Allocate one main-thread row button and install its self-target while the surface retains it.
+impl NativeMarkdownSidebarMenuTarget {
+    /// 每个右键事件构造一次目标；NSMenuItem的representedObject在跟踪期间明确持有它。
     pub(super) fn new(
         row_index: usize,
-        row: &NativeMarkdownSidebarRow,
-        frame: NSRect,
+        revision: u64,
+        list: &list::NativeMarkdownSidebarTable,
         mtm: MainThreadMarker,
     ) -> Retained<Self> {
-        // Initialize immutable row metadata before NSButton can receive any declared selector.
-        let button = Self::alloc(mtm).set_ivars(NativeMarkdownSidebarButtonIvars {
+        let target = Self::alloc(mtm).set_ivars(NativeMarkdownSidebarMenuTargetIvars {
             row_index,
-            kind: row.kind,
+            revision,
+            list: Weak::new(list),
         });
-        // SAFETY: Rust ivars are initialized before the exact superclass designated initializer;
-        // allocation and all later accesses remain on the AppKit main thread.
-        let button: Retained<Self> = unsafe { msg_send![super(button), initWithFrame: frame] };
-        button.setTitle(&NSString::from_str(&native_markdown_sidebar_button_title(
-            row,
-        )));
-        // SAFETY: this live button implements the fixed action selector and targets itself weakly;
-        // the owning surface keeps the button alive until target/action are explicitly detached.
-        unsafe {
-            button.setTarget(Some(&*button));
-            button.setAction(Some(sel!(activateMarkdownSidebarRow:)));
-        }
-        button
+        // SAFETY: ivars已经完整初始化；NSObject designated initializer不引入另一所有者。
+        unsafe { msg_send![super(target), init] }
     }
 
-    /// Releases native tracking before running work that still belongs to this exact sidebar page.
-    fn enqueue_checked<F: Send + FnOnce(usize) + 'static>(&self, work: F) {
-        let row_index = self.ivars().row_index;
-        let weak = MainThreadBound::new(Weak::from(self), self.mtm());
-        enqueue_native_markdown_main_task(move || {
-            let mtm = MainThreadMarker::new().expect("sidebar actions execute on the main queue");
-            let current = weak
-                .get(mtm)
-                .load()
-                .is_some_and(|button| native_markdown_sidebar_button_is_current(&button));
-            if !current {
-                // Replaced/closed row controls cannot activate or mutate a same-index successor row.
-                return;
-            }
-            work(row_index);
-        });
-    }
-
-    /// Defer a copied row/action pair until the menu callback has returned before entering mutation state.
+    /// 菜单回调返回后再执行原行/动作；页身份在排队前后都必须一致。
     pub(super) fn enqueue_action(&self, action: NativeMarkdownSidebarAction) {
-        self.enqueue_checked(move |row_index| {
-            if let Err(error) = request_native_markdown_sidebar_action(row_index, action) {
-                // Failed mutations preserve the authoritative document and report only bounded status.
-                present_native_markdown_error(&error);
-                eprintln!("Markdown file action failed: {error}");
-            }
-        });
+        enqueue_native_markdown_sidebar_action(
+            self.ivars().list.clone(),
+            NativeMarkdownSidebarActionOrigin::Row {
+                row_index: self.ivars().row_index,
+                revision: self.ivars().revision,
+            },
+            action,
+            self.mtm(),
+        );
     }
 }
 
-/// Checks row-control identity in the current projection, independent of reused indices or file names.
-fn native_markdown_sidebar_button_is_current(button: &NativeMarkdownSidebarButton) -> bool {
-    ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
-        active.as_ref().is_some_and(|surface| {
-            surface
-                .sidebar_buttons
-                .iter()
-                .any(|current| std::ptr::eq(&**current, button))
-        })
-    })
+/// 头部按钮和原右键菜单只排同一份原来源；排队不保活列表、正文或笔记库。
+fn enqueue_native_markdown_sidebar_action(
+    list: Weak<list::NativeMarkdownSidebarTable>,
+    origin: NativeMarkdownSidebarActionOrigin,
+    action: NativeMarkdownSidebarAction,
+    mtm: MainThreadMarker,
+) {
+    let weak = MainThreadBound::new(list, mtm);
+    enqueue_native_markdown_main_task(move || {
+        let mtm = MainThreadMarker::new().expect("侧栏文件动作在AppKit主队列执行");
+        let Some(list) = weak.get(mtm).load() else {
+            return; // 原列表已释放，不能转投后继会话的同名目录。
+        };
+        if !list.permits_origin(&origin) {
+            return; // 原行换页、目录选择改变或会话关闭撤销对应来源，不领取后继权限。
+        }
+        if let Err(error) = request_native_markdown_sidebar_action(&list, &origin, action) {
+            // 只显示既有文件流程的真实失败，不重放操作或推断磁盘尚未改变。
+            present_native_markdown_error(&error);
+            eprintln!("Markdown file action failed: {error}");
+        }
+    });
 }
 
-/// Construct an ephemeral native context menu containing only actions allowed for this row kind.
+/// 右键事件临时构造对应条目允许的动作；菜单结束后不保留一份闲置菜单。
 pub(super) fn native_markdown_sidebar_menu(
-    target: &NativeMarkdownSidebarButton,
+    target: &NativeMarkdownSidebarMenuTarget,
     kind: NativeMarkdownSidebarEntryKind,
     mtm: MainThreadMarker,
 ) -> Retained<NSMenu> {
-    // Context menus are created only for the current event and released when native tracking ends.
+    // 本次菜单只由AppKit跟踪和局部栈持有，动作目标由菜单项明确保活。
     let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
     match kind {
-        // The virtual root exposes creation and reveal only; its identity cannot be deleted/renamed.
+        // 根行只允许新建和Finder显示，不能重命名或删除整个笔记库。
         NativeMarkdownSidebarEntryKind::Root => {
             add_native_markdown_menu_item(
                 &menu,
@@ -709,7 +969,7 @@ pub(super) fn native_markdown_sidebar_menu(
                 mtm,
             );
         }
-        // Directory menus operate on a confined subtree and require explicit destructive confirmation.
+        // 目录动作限制在原子树内，破坏性操作仍通过原确认边界。
         NativeMarkdownSidebarEntryKind::Directory => {
             add_native_markdown_menu_item(
                 &menu,
@@ -749,7 +1009,7 @@ pub(super) fn native_markdown_sidebar_menu(
                 mtm,
             );
         }
-        // Note menus expose exact-file operations and never offer child creation.
+        // 笔记动作只作用于该文件，不向笔记伪装出子目录操作。
         NativeMarkdownSidebarEntryKind::Note => {
             add_native_markdown_menu_item(
                 &menu,
@@ -793,16 +1053,15 @@ pub(super) fn native_markdown_sidebar_menu(
     menu
 }
 
-/// Install a fixed declared selector on a menu item whose target outlives the synchronous menu.
+/// 菜单项只绑定本模块已声明的动作，跟踪期间明确保活一次性目标。
 pub(super) fn add_native_markdown_menu_item(
     menu: &NSMenu,
-    target: &NativeMarkdownSidebarButton,
+    target: &NativeMarkdownSidebarMenuTarget,
     title: &str,
     action: objc2::runtime::Sel,
     mtm: MainThreadMarker,
 ) {
-    // SAFETY: action is one of this module's exact declared NSMenuItem-compatible selectors;
-    // the surface retains its main-thread button target throughout the synchronous menu.
+    // SAFETY: action只来自上方固定NSMenuItem兼容selector，target在主线程构造并由菜单项保活。
     let item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -811,9 +1070,12 @@ pub(super) fn add_native_markdown_menu_item(
             ns_string!(""),
         )
     };
-    // SAFETY: the fixed selector belongs to this live target, which the foreground surface owns;
-    // the temporary menu retains the item but does not become a second target owner.
-    unsafe { item.setTarget(Some(target)) };
+    // SAFETY: target实现固定selector；representedObject的强引用随原菜单项释放，没有回指菜单的环。
+    unsafe {
+        item.setTarget(Some(target));
+        // action target本身是弱引用；菜单项明确持有本次临时目标，菜单结束即一起归还。
+        item.setRepresentedObject(Some(target));
+    }
     menu.addItem(&item);
 }
 
@@ -828,53 +1090,39 @@ pub(super) fn native_markdown_note_color(selected: bool) -> Retained<NSColor> {
     }
 }
 
-/// Builds one bounded page of explicit native row controls from relative workspace metadata.
-pub(super) fn native_markdown_sidebar_buttons(
-    rows: &[NativeMarkdownSidebarRow],
-    selected_relative_path: Option<&str>,
-    content_view: &NSView,
-    mtm: MainThreadMarker,
-) -> Vec<Retained<NativeMarkdownSidebarButton>> {
-    let selected_note_color = native_markdown_note_color(true);
-    let unselected_note_color = native_markdown_note_color(false);
-    let directory_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.58, 0.63, 0.72, 1.0);
-    let root_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.82, 0.85, 0.91, 1.0);
-    let content_height = content_view.bounds().size.height;
-    let mut buttons = Vec::with_capacity(rows.len());
-    for (row_index, row) in rows.iter().enumerate() {
-        // The already bounded metadata page yields one surface-owned control per source row.
-        let row_y =
-            content_height - NATIVE_MARKDOWN_HEADER_HEIGHT - 106.0 - row_index as f64 * 31.0;
-        let button = NativeMarkdownSidebarButton::new(
-            row_index,
-            row,
-            NSRect::new(
-                NSPoint::new(18.0, row_y),
-                NSSize::new(NATIVE_MARKDOWN_SIDEBAR_WIDTH - 36.0, 22.0),
-            ),
-            mtm,
-        );
-        button.setBordered(false);
-        button.setAlignment(NSTextAlignment::Left);
-        button.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-        let color = match row.kind {
-            // The root row is the stable refresh/navigation origin.
-            NativeMarkdownSidebarEntryKind::Root => &root_color,
-            // Directories expose collapse and confined filesystem actions without opening document bodies.
-            NativeMarkdownSidebarEntryKind::Directory => &directory_color,
-            // Only the exact active relative path is highlighted across paging/search results.
-            NativeMarkdownSidebarEntryKind::Note
-                if selected_relative_path == Some(row.relative_path.as_str()) =>
-            {
-                &selected_note_color
-            }
-            // Inactive note rows remain selectable but own no editor resources.
-            NativeMarkdownSidebarEntryKind::Note => &unselected_note_color,
-        };
-        button.setContentTintColor(Some(color));
-        button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
-        content_view.addSubview(&button);
-        buttons.push(button);
+/// 搜索结果和目录有明确分区标题；刷新按钮沿既有动作返回目录，不构造新控件。
+impl NativeMarkdownWindowSurface {
+    pub(super) fn update_sidebar_mode_label(&self, searching: bool, intent: u64) {
+        if !self.workspace_refresh_intent_is_current(intent) {
+            // 新查询/关闭撤销旧结果的文字发布权限。
+            return;
+        }
+        self.sidebar_title.setStringValue(if searching {
+            // 搜索页明确区别于当前目录，避免用户把有限结果误当全部笔记。
+            ns_string!("搜索结果")
+        } else {
+            // 正常目录沿原分页/折叠合同呈现，不按标题文字推断模式。
+            ns_string!("笔记目录")
+        });
+        if !self.workspace_refresh_intent_is_current(intent) {
+            // 标题setter可重入，不能随后以旧模式更改新查询的返回按钮。
+            return;
+        }
+        if let Some(button) = self
+            .controller
+            .ivars()
+            .workspace_controls
+            .get()
+            .and_then(|controls| controls.get(2))
+            .and_then(|control| control.downcast_ref::<NSButton>())
+        {
+            button.setTitle(if searching {
+                // 复用原刷新动作取消查询并回目录，不增加第二套导航。
+                ns_string!("返回目录")
+            } else {
+                // 目录模式保留显式刷新入口。
+                ns_string!("刷新目录")
+            });
+        }
     }
-    buttons
 }

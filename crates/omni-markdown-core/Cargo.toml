@@ -11,16 +11,48 @@ publish = false
 
 [features]
 default = []
-native-markdown-candidate = ["dep:pulldown-cmark", "dep:unicode-properties"]
+# Expose one-shot reclaim EIO injection through the original weak observer only for explicit native fault probes.
+original-backing-reclaim-probe = []
+native-markdown-candidate = ["dep:pulldown-cmark", "dep:unicode-properties", "dep:unicode-normalization", "dep:unicode-bidi"]
+# Enable segmented block structure and bounded table windows; the plugin native runtime selects this feature by default.
+s2-table-window-prototype = ["native-markdown-candidate", "pulldown-cmark/omni-block-frontier", "dep:unicase"]
+
+# Compile the grapheme index for explicitly selected paged-layout features; Core enables no features by default.
+paged-graphemes = ["native-markdown-candidate"]
+# Share the source and fixed-page I/O with grapheme indexing while keeping line-break logic in its own module.
+paged-line-breaks = ["native-markdown-candidate"]
+# Shape paged glyph runs from the frozen source for the opt-in candidate; the default native editor remains TextKit.
+paged-shaping = ["native-markdown-candidate", "dep:harfrust", "dep:read-fonts"]
+# Query bounded intersections of the two Unicode indexes; these results do not certify font width or native layout.
+paged-layout-breaks = ["paged-graphemes", "paged-line-breaks"]
+# Reuse the same grapheme revision for script indexing consumed by the opt-in paged candidate.
+paged-scripts = ["paged-graphemes"]
+# Measure bounded widths from real glyphs and break opportunities without changing the default native entry point.
+paged-soft-line-measure = ["paged-shaping", "paged-layout-breaks"]
+# Resolve measured opportunities and whole-grapheme emergency breaks; missing dictionary or font input cannot become Ready.
+paged-soft-line-resolve = ["paged-soft-line-measure"]
+# Derive safe glyph slices from the measured choice and reuse output instead of reshaping the remaining paragraph for each soft line.
+paged-safe-glyph-slices = ["paged-soft-line-resolve"]
+# Compose font, script, bidi, and line output over the same source and indexes for the opt-in paged candidate.
+paged-line-compose = ["paged-safe-glyph-slices", "paged-scripts"]
+# Publish incremental shaping only for a real font plan and certified source boundaries; this does not select a native editor.
+paged-shaping-frontier = ["paged-line-compose"]
 
 [dependencies]
 libc = "=0.2.189"
+harfrust = { version = "=0.14.0", path = "../../vendor/harfrust", default-features = false, features = ["std"], optional = true }
+read-fonts = { version = "=0.45.1", default-features = false, features = ["std"], optional = true }
 memmap2 = "=0.9.11"
-pulldown-cmark = { version = "=0.13.4", default-features = false, optional = true }
+# Ship the parser extension with the plugin so transitive Host builds do not depend on an ignored workspace patch.
+pulldown-cmark = { version = "=0.13.4", path = "../../vendor/pulldown-cmark", default-features = false, optional = true }
 serde = { version = "=1.0.229", features = ["derive"] }
 sha2 = "=0.10.9"
 thiserror = "=2.0.20"
+unicase = { version = "=2.10.0", optional = true }
 unicode-properties = { version = "=0.1.4", default-features = false, features = ["general-category"], optional = true }
+unicode-normalization = { version = "=0.1.25", optional = true }
+# Paged bidi analysis reuses pinned Unicode properties and level types, without passing the document to whole-paragraph BidiInfo.
+unicode-bidi = { version = "=0.3.18", default-features = false, features = ["hardcoded-data"], optional = true }
 
 tempfile = "=3.27.0"
 

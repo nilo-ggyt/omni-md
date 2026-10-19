@@ -29,23 +29,23 @@ pub(super) fn html_start(
 ) -> Result<Option<HtmlKind>, MarkdownDocumentBufferError> {
     let mut cursor = line.ascii_cursor(document, offset);
     let mut spaces = 0;
-    while cursor.peek(document).is_some_and(|value| value.0 == ' ') {
+    while cursor.peek(document)?.is_some_and(|value| value.0 == ' ') {
         // Four relative spaces already identify code indentation, so no giant prefix must be copied/scanned.
-        cursor.next(document);
+        cursor.next(document)?;
         spaces += 1;
         if spaces > 3 {
             // An indented code suffix cannot establish HTML block ownership.
             return Ok(None);
         }
     }
-    if cursor.peek(document).is_none_or(|value| value.0 != '<') {
+    if cursor.peek(document)?.is_none_or(|value| value.0 != '<') {
         // Ordinary source avoids even a finite lexical allocation or parser invocation.
         return Ok(None);
     }
     let mut prefix = String::with_capacity(64);
     for _ in 0..64 {
         // A finite lexical prefix suffices for raw names and explicit comment/declaration openers.
-        let Some((scalar, _, _)) = cursor.next(document) else {
+        let Some((scalar, _, _)) = cursor.next(document)? else {
             // A shorter complete source line supplies the whole finite lexical candidate.
             break;
         };
@@ -104,7 +104,7 @@ fn find_ascii(
     let mut cursor = line.cursor(document, 0)?;
     let mut scratch = [0_u8; 16];
     let mut used = 0;
-    while let Some((scalar, _, unit)) = cursor.next(document) {
+    while let Some((scalar, _, unit)) = cursor.next(document)? {
         // Non-ASCII text cannot equal a delimiter but never changes canonical UTF-16 source coordinates.
         scratch.rotate_left(1);
         scratch[15] = if scalar.is_ascii() {
@@ -168,14 +168,13 @@ pub(super) fn html_indentation(
     position: usize,
 ) -> Result<Option<usize>, MarkdownDocumentBufferError> {
     let mut pieces = SourcePieceCursor::new(document.root.clone(), 0..target.bytes.1);
-    let has_angle = std::iter::from_fn(|| {
-        // This short-lived iterator yields immutable descriptors and retains no source byte slice.
-        pieces.next_piece()
-    })
-    .any(|piece| {
-        // Plain Markdown fallback skips scalar/block rescans when the canonical prefix has no HTML candidate.
-        document.piece_bytes(&piece.piece)[piece.local].contains(&b'<')
-    });
+    let mut has_angle = false;
+    while let Some(piece) = pieces.next_piece() {
+        if source::scan_piece(document, &piece, |bytes| Ok(bytes.contains(&b'<')))? {
+            has_angle = true;
+            break; // 只有完成真实lease回收的已知角括号才授权HTML分支，IO错误不变成普通文本。
+        }
+    }
     if !has_angle {
         // Most Enter actions need only the current line's finite whitespace metrics.
         return Ok(None);
@@ -185,7 +184,7 @@ pub(super) fn html_indentation(
     for _ in 0..target.number {
         // The same block/container scanner excludes HTML-looking text inside fenced code.
         let line = lines
-            .next(document)
+            .next(document)?
             .ok_or(MarkdownDocumentBufferError::RangeOutsideDocument)?;
         scanner.consume(document, line)?;
     }

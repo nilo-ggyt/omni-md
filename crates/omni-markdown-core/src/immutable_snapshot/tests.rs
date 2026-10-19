@@ -24,6 +24,113 @@ fn empty_source_needs_no_scratch_storage() {
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
+/// 新建与截成零长的独占输出都不建立映射，已写长度来自真实文件操作。
+#[cfg(feature = "native-markdown-candidate")]
+#[test]
+fn canonical_output_empty_and_truncated_empty_freeze_without_mapping() {
+    let empty = CanonicalSnapshotOutput::new().unwrap();
+    assert_eq!(empty.len(), 0);
+    assert!(empty.freeze().unwrap().is_none());
+
+    // 清洗结果可在最后一个非空白位置之前全部被截去，不能留下旧 extent 或零长 mmap。
+    let mut output = CanonicalSnapshotOutput::new().unwrap();
+    output.write_all(" \t\r\n".as_bytes()).unwrap();
+    output.truncate(0).unwrap();
+    assert_eq!(output.len(), 0);
+    assert_eq!(output.file.metadata().unwrap().len(), 0);
+    assert!(output.freeze().unwrap().is_none());
+}
+
+/// 多块写入与截尾后的追加保持字节顺序，只有最后映射 owner Drop 才报告真实释放。
+#[cfg(feature = "native-markdown-candidate")]
+#[test]
+fn canonical_output_chunks_truncate_and_freeze_retain_exact_bytes_until_last_drop() {
+    use std::sync::Arc;
+
+    // 第一块恰为 4096 字节且末尾是完整中文标量，第二块从 emoji 开始。
+    let first = format!("{}中", "a".repeat(4093));
+    let second = "😀文档\\|管道\r\n跨块";
+    let mut output = CanonicalSnapshotOutput::new().unwrap();
+    output.write_all(first.as_bytes()).unwrap();
+    output.write_all(second.as_bytes()).unwrap();
+    let kept = output.len();
+    output.write_all("应丢弃的尾部 \t\r\n".as_bytes()).unwrap();
+    output.truncate(kept).unwrap();
+    output.write_all("终点".as_bytes()).unwrap();
+    let expected = format!("{first}{second}终点");
+    let metadata = output.file.metadata().unwrap();
+    assert!(metadata.is_file());
+    assert_eq!(metadata.nlink(), 0);
+    assert_eq!(metadata.len(), expected.len() as u64);
+    assert_eq!(output.len(), expected.len());
+
+    // 封存直接消费同一独占文件；有限 lease 结束并不意味着映射本身已被释放。
+    let backing = Arc::new(output.freeze().unwrap().unwrap());
+    let observer = backing.observer();
+    for start in (0..expected.len()).step_by(crate::original_backing::ORIGINAL_READ_BYTES) {
+        // 逐个实际窗口比对，包括跨写入块的窗口；每次都显式处理归还 pin 的真实结果。
+        let end = (start + crate::original_backing::ORIGINAL_READ_BYTES).min(expected.len());
+        let lease = backing.lease(start..end).unwrap();
+        assert_eq!(&*lease, &expected.as_bytes()[start..end]);
+        lease.finish().unwrap();
+    }
+    assert!(!observer.unmap_succeeded());
+    assert_eq!(observer.mapped_bytes(), expected.len());
+    let retained = Arc::clone(&backing);
+    drop(backing);
+    assert!(!observer.unmap_succeeded());
+    assert_eq!(observer.mapped_bytes(), expected.len());
+
+    // 最后 owner 确实执行 munmap，观察者只保留固定事实，不保活正文或文件。
+    drop(retained);
+    assert!(observer.unmap_succeeded());
+    assert_eq!(observer.mapped_bytes(), 0);
+    assert!(!observer.failed());
+}
+
+/// 截尾不能扩展正文；封存也拒绝与完成写入计量不符的真实文件 extent。
+#[cfg(feature = "native-markdown-candidate")]
+#[test]
+fn canonical_output_rejects_growth_and_unaccounted_extent() {
+    let mut output = CanonicalSnapshotOutput::new().unwrap();
+    output.write_all("原文".as_bytes()).unwrap();
+    let bytes = output.len();
+    assert!(matches!(
+        output.truncate(bytes + 1),
+        Err(SnapshotError::Storage(error)) if error.kind() == io::ErrorKind::InvalidInput
+    ));
+    assert_eq!(output.len(), bytes);
+    assert_eq!(output.file.metadata().unwrap().len(), bytes as u64);
+
+    // 测试在工厂内部直接改变实际 extent；产品 API 没有取得或克隆此写句柄的入口。
+    output.file.set_len(bytes as u64 + 1).unwrap();
+    assert!(matches!(output.freeze(), Err(SnapshotError::SourceChanged)));
+}
+
+/// 真实只读descriptor上的write拒绝后，候选Drop确实关闭原FD；不以空字段或claim计数代替。
+#[cfg(feature = "native-markdown-candidate")]
+#[test]
+fn failed_output_write_releases_its_actual_descriptor() {
+    use std::os::fd::AsRawFd;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unchanged");
+    fs::write(&path, b"unchanged").unwrap();
+    // 只在工厂内部测试接管实际只读FD；产品没有File入口，业务层失败另由真实RLIMIT验证。
+    let mut output = CanonicalSnapshotOutput {
+        file: File::open(&path).unwrap(),
+        bytes: 0,
+    };
+    let descriptor = output.file.as_raw_fd();
+    assert!(
+        matches!(output.write_all(b"candidate"), Err(SnapshotError::Storage(error)) if error.raw_os_error() == Some(libc::EBADF))
+    );
+    drop(output);
+    // SAFETY: F_GETFD只查询刚归还的整数descriptor，不解引用指针或接管任何资源。
+    assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    assert_eq!(fs::read(path).unwrap(), b"unchanged");
+}
+
 /// Streaming fallback freezes exact bytes without retaining any public scratch names.
 #[test]
 fn forced_streaming_snapshot_survives_truncation_and_non_utf8_source_writes() {

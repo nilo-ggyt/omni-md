@@ -4,11 +4,19 @@
 //! No text body, HTML/AST, or AppKit object is retained; native adapters map runs
 //! to attributes while the piece tree remains the sole authoritative text model.
 
-mod parser;
+pub(crate) mod parser;
+mod prefixes;
+// S2原型只在显式feature中提供已验证窗口和导航；默认产品不公开候选构造接口。
+#[cfg(feature = "s2-table-window-prototype")]
+pub mod table_window;
+mod underline;
 
 use parser::*;
+#[cfg(feature = "s2-table-window-prototype")]
+pub(crate) use prefixes::markdown_physical_line_is_active;
 
 use std::ops::Range;
+use std::rc::Rc;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use thiserror::Error;
@@ -89,6 +97,8 @@ impl MarkdownPresentationStyles {
     pub const TABLE_ALIGN_RIGHT: Self = Self(1 << 28);
     /// A native table overlays this preview row; TextKit retains a fixed-height placeholder.
     pub const TABLE_ROW_PLACEHOLDER: Self = Self(1 << 29);
+    /// Parser确认的单波浪号下标；与双波浪号删除线独立组合，不改变源UTF16坐标。
+    pub const SUBSCRIPT: Self = Self(1 << 30);
 
     #[must_use]
     /// Require all requested style bits to be present in this style set.
@@ -98,7 +108,7 @@ impl MarkdownPresentationStyles {
 
     #[must_use]
     /// Combine independent presentation roles without changing either input set.
-    const fn union(self, other: Self) -> Self {
+    pub(crate) const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
@@ -150,6 +160,36 @@ pub struct MarkdownPresentationQuery {
     pub styles: MarkdownPresentationStyles,
 }
 
+/// Parser确认的无序列表原字符；glyph消费者不能据此改写正文。
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MarkdownBulletMarker {
+    Dash,
+    Plus,
+    Star,
+}
+
+/// 预览列表标记的源角色；TaskBox保留完整三字符范围，Native只替换首字符。
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MarkdownPreviewListMarkerKind {
+    Bullet(MarkdownBulletMarker),
+    TaskBox {
+        checked: bool,
+    },
+    TaskBullet {
+        source: MarkdownBulletMarker,
+        checked: bool,
+    },
+}
+
+/// 有限视口内的真实item标记；只有绝对UTF16范围与值，不持有文本或Parser节点。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownPreviewListMarker {
+    pub utf16_range: Range<usize>,
+    pub owner_utf16_range: Range<usize>,
+    pub kind: MarkdownPreviewListMarkerKind,
+    pub active: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Platform-neutral horizontal cell alignment.
 pub enum MarkdownTableAlignment {
@@ -195,17 +235,46 @@ pub enum MarkdownViewportPresentationError {
     DecorationLimitExceeded,
 }
 
-/// Semantic runs restricted to the current native layout window.
-///
-/// Generation ties metadata to the piece-tree revision; edit/history/selection
-/// changes invalidate it synchronously. Text slices exist only during rebuild.
+/// 当前有界窗口的控制状态与一份完整解析发布；正文只在 rebuild 内临时借用。
+/// 编辑、历史和选择同步撤销当前发布，在途 Native 快照仍保持其原不可变值。
 pub struct MarkdownViewportPresentation {
     mode: MarkdownPresentationMode,
     generation: Option<u64>,
     active_selection: Range<usize>,
     utf16_window: Option<Range<usize>>,
-    runs: Vec<MarkdownPresentationRun>,
-    tables: Vec<MarkdownTablePrototype>,
+    // 一次成功解析的三个目录整体发布；Native 借出的旧批次不会被后续属性查询原地改写。
+    publication: Option<Rc<MarkdownPresentationBuild>>,
+}
+
+#[derive(Clone)]
+/// 一次完整有界解析的不可变 metadata。Clone 只共享原目录，不复制表格、样式或正文。
+/// 此类型不持文档；消费者仍须绑定并验证原文档、选择及模式，不能仅凭 generation 获得源权限。
+pub struct MarkdownViewportPresentationSnapshot {
+    generation: u64,
+    utf16_window: Range<usize>,
+    publication: Rc<MarkdownPresentationBuild>,
+}
+
+impl MarkdownViewportPresentationSnapshot {
+    /// 原解析代次只用于与消费者保存的源票核对，不代表文档仍然存活。
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 原发布的精确有界范围；后继缓存不能扩大本快照的查询权限。
+    pub fn utf16_window(&self) -> &Range<usize> {
+        &self.utf16_window
+    }
+
+    /// 直接借用原表目录，不把窗口快照变成另一份整表副本。
+    pub fn tables(&self) -> &[MarkdownTablePrototype] {
+        &self.publication.tables
+    }
+
+    /// 样式与表目录来自同一次完整 build；覆盖外明确无结果。
+    pub fn query(&self, utf16_index: usize) -> Option<MarkdownPresentationQuery> {
+        query_published_runs(&self.publication.runs, &self.utf16_window, utf16_index)
+    }
 }
 
 impl Default for MarkdownViewportPresentation {
@@ -216,13 +285,21 @@ impl Default for MarkdownViewportPresentation {
             generation: None,
             active_selection: 0..0,
             utf16_window: None,
-            runs: Vec::new(),
-            tables: Vec::new(),
+            publication: None,
         }
     }
 }
 
 impl MarkdownViewportPresentation {
+    /// 检查重置缓存没有保留任何 run/table 容量或旧文档窗口。
+    #[must_use]
+    pub fn is_unallocated(&self) -> bool {
+        self.generation.is_none()
+            && self.utf16_window.is_none()
+            && self.publication.is_none()
+            && self.active_selection == (0..0)
+    }
+
     #[must_use]
     /// Read the current presentation preference without rebuilding semantic metadata.
     pub fn mode(&self) -> MarkdownPresentationMode {
@@ -239,14 +316,20 @@ impl MarkdownViewportPresentation {
         self.invalidate()
     }
 
-    /// Normalize directional selections and invalidate selection-dependent syntax visibility on change.
+    /// 记录归一化选区；只有预览的标记可见性依赖选区，源码模式保留原有有限覆盖。
     pub fn set_active_selection(&mut self, selection: Range<usize>) -> Option<Range<usize>> {
         let normalized = selection.start.min(selection.end)..selection.start.max(selection.end);
         if self.active_selection == normalized {
-            // An unchanged normalized selection cannot change marker visibility.
+            // 方向变化但范围相同不改变语法显隐；canonical 的方向由文档选区另行管理。
             return None;
         }
         self.active_selection = normalized;
+        if self.mode == MarkdownPresentationMode::Source {
+            // 源码始终显示原字符，不因查找或拖选发送属性重建通知；仍记录最新选区，
+            // 下次 set_mode 切回预览会先撤销旧覆盖，再用该选区决定可编辑标记。
+            return None;
+        }
+        // 预览仍须撤销旧选区对应的隐藏标记，不能把源码的优化推广到预览模式。
         self.invalidate()
     }
 
@@ -284,8 +367,12 @@ impl MarkdownViewportPresentation {
         // Publish only validated complete coverage; replacing vectors releases stale semantic ownership.
         self.generation = Some(generation);
         self.utf16_window = Some(utf16_window);
-        self.runs = build.runs;
-        self.tables = build.tables;
+        self.publication = if self.mode == MarkdownPresentationMode::InlinePreview {
+            // 三个目录 move 到同一 Rc；旧 Native 批次仍读原发布，新缓存不深复制旧目录。
+            Some(Rc::new(build))
+        } else {
+            None // 源码窗口只有范围，不为不存在的解析目录分配空 Rc。
+        };
         Ok(())
     }
 
@@ -306,8 +393,7 @@ impl MarkdownViewportPresentation {
         // Publish only validated complete coverage; replacing vectors releases stale semantic ownership.
         self.generation = Some(generation);
         self.utf16_window = Some(utf16_window);
-        self.runs.clear();
-        self.tables.clear();
+        self.publication = None;
         Ok(())
     }
 
@@ -327,8 +413,7 @@ impl MarkdownViewportPresentation {
         // Publish only validated complete coverage; replacing vectors releases stale semantic ownership.
         self.generation = Some(generation);
         self.utf16_window = Some(utf16_window);
-        self.runs.clear();
-        self.tables.clear();
+        self.publication = None;
         Ok(())
     }
 
@@ -344,44 +429,7 @@ impl MarkdownViewportPresentation {
     pub fn query(&self, utf16_index: usize) -> Option<MarkdownPresentationQuery> {
         self.generation?;
         let utf16_window = self.utf16_window.as_ref()?;
-        if utf16_index < utf16_window.start || utf16_index >= utf16_window.end {
-            // Coordinates outside the cached half-open interval cannot use this generation's attributes.
-            return None;
-        }
-
-        let candidate = self.runs.partition_point(|run| {
-            // Skip runs ending before the queried position using the sorted disjoint-run invariant.
-            run.utf16_range.end <= utf16_index
-        });
-        if let Some(run) = self.runs.get(candidate)
-            && run.utf16_range.start <= utf16_index
-        {
-            // A candidate whose start precedes the requested position contains the desired styled interval.
-            return Some(MarkdownPresentationQuery {
-                utf16_range: run.utf16_range.clone(),
-                styles: run.styles,
-            });
-        }
-
-        // Unstyled gaps receive precise boundaries so native layout need not query every character.
-        let gap_start = candidate
-            .checked_sub(1)
-            .and_then(|previous| {
-                // An existing previous run bounds the beginning of the unstyled gap.
-                self.runs.get(previous)
-            })
-            .map_or(utf16_window.start, |run| {
-                // The previous styled interval ends where the unstyled gap begins.
-                run.utf16_range.end
-            });
-        let gap_end = self.runs.get(candidate).map_or(utf16_window.end, |run| {
-            // The following styled interval begins where the unstyled gap ends.
-            run.utf16_range.start
-        });
-        Some(MarkdownPresentationQuery {
-            utf16_range: gap_start..gap_end,
-            styles: MarkdownPresentationStyles::default(),
-        })
+        query_published_runs(self.runs(), utf16_window, utf16_index)
     }
 
     #[must_use]
@@ -396,14 +444,80 @@ impl MarkdownViewportPresentation {
     #[must_use]
     /// Borrow current immutable table metadata without transferring source or native ownership.
     pub fn tables(&self) -> &[MarkdownTablePrototype] {
-        &self.tables
+        self.publication
+            .as_ref()
+            .map_or(&[], |publication| &publication.tables)
     }
 
     /// Borrow current bounded style runs for transient native visible-cell rendering.
     #[must_use]
     /// Borrow current bounded runs for transient native visible-cell rendering.
     pub fn runs(&self) -> &[MarkdownPresentationRun] {
-        &self.runs
+        self.publication
+            .as_ref()
+            .map_or(&[], |publication| &publication.runs)
+    }
+
+    /// 只有真实完整解析才可借出快照；源码和显式 fallback 的空 runs 不授予完整语义权限。
+    #[must_use]
+    pub fn semantic_snapshot(&self) -> Option<MarkdownViewportPresentationSnapshot> {
+        if self.mode != MarkdownPresentationMode::InlinePreview {
+            // 源码模式记录的覆盖用于属性通知，不能被表格布局当作预览解析完成。
+            return None;
+        }
+        Some(MarkdownViewportPresentationSnapshot {
+            generation: self.generation?,
+            utf16_window: self.utf16_window.as_ref()?.clone(),
+            publication: Rc::clone(self.publication.as_ref()?),
+        })
+    }
+
+    /// 内部列表查询与公开 runs/tables 共享原发布，不保留独立的可变列表目录。
+    fn list_markers(&self) -> &[MarkdownPreviewListMarker] {
+        self.publication
+            .as_ref()
+            .map_or(&[], |publication| &publication.list_markers)
+    }
+
+    /// 在当前有效窗口二分借用单个真实列表token；失效或源码模式不提供glyph权限。
+    #[must_use]
+    pub fn list_marker_at(&self, utf16_index: usize) -> Option<&MarkdownPreviewListMarker> {
+        self.generation?;
+        let marker = self
+            .list_markers()
+            .get(self.list_markers().partition_point(|marker| {
+                // 已结束的token不能覆盖后续空白或正文。
+                marker.utf16_range.end <= utf16_index
+            }))?;
+        (marker.utf16_range.start <= utf16_index).then_some(marker)
+    }
+
+    /// 返回token或相邻token间隙的精确边界，防止Native属性缓存从普通run跨进glyph角色。
+    #[must_use]
+    pub fn list_marker_boundary_range_at(&self, utf16_index: usize) -> Option<Range<usize>> {
+        let window = self.cached_utf16_window()?;
+        if utf16_index < window.start || utf16_index >= window.end {
+            // 窗外位置不能借用此批属性或列表元数据。
+            return None;
+        }
+        let index = self
+            .list_markers()
+            .partition_point(|marker| marker.utf16_range.end <= utf16_index);
+        if let Some(marker) = self.list_markers().get(index)
+            && marker.utf16_range.start <= utf16_index
+        {
+            // token内部只允许复用该原范围，TaskBox内部单unit细分由Native继续收窄。
+            return Some(marker.utf16_range.clone());
+        }
+        // 间隙也必须停在下一个token之前，不能沿较大的语义run吞掉它。
+        let start = index.checked_sub(1).map_or(window.start, |previous| {
+            self.list_markers()[previous].utf16_range.end
+        });
+        let end = self
+            .list_markers()
+            .get(index)
+            .map_or(window.end, |marker| marker.utf16_range.start);
+        Some(start..end)
     }
 
     /// Release semantic vectors while retaining the last bounded window for repeated native invalidations.
@@ -412,10 +526,44 @@ impl MarkdownViewportPresentation {
         // after generation is cleared; query rejects stale runs using that generation.
         let invalidated = self.utf16_window.as_ref().cloned();
         self.generation = None;
-        self.runs.clear();
-        self.tables.clear();
+        // 只撤销当前缓存的强边；在途快照的不可变值由其原调用栈自行结束，不强制清空旧值。
+        self.publication = None;
         invalidated
     }
+}
+
+/// 当前缓存和 Native 已借出的快照复用同一个纯查询，返回范围始终受原发布覆盖限制。
+fn query_published_runs(
+    runs: &[MarkdownPresentationRun],
+    window: &Range<usize>,
+    utf16_index: usize,
+) -> Option<MarkdownPresentationQuery> {
+    if !window.contains(&utf16_index) {
+        // 覆盖外没有默认样式权限，不能借邻接 run 或空目录伪造已完成解析。
+        return None;
+    }
+    let candidate = runs.partition_point(|run| run.utf16_range.end <= utf16_index);
+    if let Some(run) = runs.get(candidate)
+        && run.utf16_range.start <= utf16_index
+    {
+        // 一个真实 run 只返回原窗口内交集；不向旧发布未覆盖的正文延伸。
+        return Some(MarkdownPresentationQuery {
+            utf16_range: run.utf16_range.start.max(window.start)
+                ..run.utf16_range.end.min(window.end),
+            styles: run.styles,
+        });
+    }
+    // 未命中样式的字符仍取得准确 gap；两端由同一个不可变目录决定。
+    let start = candidate.checked_sub(1).map_or(window.start, |previous| {
+        runs[previous].utf16_range.end.max(window.start)
+    });
+    let end = runs
+        .get(candidate)
+        .map_or(window.end, |run| run.utf16_range.start.min(window.end));
+    Some(MarkdownPresentationQuery {
+        utf16_range: start..end,
+        styles: MarkdownPresentationStyles::default(),
+    })
 }
 
 #[cfg(test)]
