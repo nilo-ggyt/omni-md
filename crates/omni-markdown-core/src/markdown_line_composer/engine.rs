@@ -500,7 +500,7 @@ impl MarkdownLineComposer {
         self.finish(result)
     }
 
-    /// 同步检查原 SourceRequest 借出的真实 plain 前缀是否足以保留这个组合器。
+    /// 同步核原 SourceRequest 的选择样式不变能力能否覆盖这个组合器的实际库存。
     /// 仅普通完整行刚发布后的行首可准入；不截断 writer，不复制旧输出，也不替换资源 owner。
     /// 能力不授 GCB/Font 权限，旧 Scene 和 Reader 仍须由 Native 退休并以完整新输入重新发布。
     ///
@@ -510,9 +510,9 @@ impl MarkdownLineComposer {
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
     ))]
-    pub fn can_retain_plain_selection(
+    pub fn can_retain_selection_styles(
         &self,
-        capability: &crate::MarkdownPlainSelectionPrefix<'_>,
+        capability: &crate::MarkdownSelectionStyleInvariant<'_>,
     ) -> Result<bool> {
         self.guard()?;
         let result = (|| {
@@ -556,15 +556,16 @@ impl MarkdownLineComposer {
             }
             let Some(captured_end) = payload
                 .store
-                .plain_selection_prefix_end(payload.start, proven_end)?
+                .selection_style_capture_end(payload.start, proven_end)?
             else {
                 return Ok(false);
             };
             // Store.source_end 包含为测量而已预取的后继 item；只用可见 LineEnd 会漏掉
-            // 仍依赖旧样式的字形。Coordinator 还须核同一真实消费末端和固定活跃支持域。
+            // 仍依赖旧样式的字形。Root Code 可认证同源全域，Plain 仍只认证已读前缀；
+            // 两者都必须让 Coordinator 核同一消费末端、全部支持域与原 Font 注册。
             payload
                 .coordinator
-                .retains_plain_prefix(captured_end, proven_end)
+                .retains_selection_styles(captured_end, proven_end)
         })();
         self.guard()?;
         result

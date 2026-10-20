@@ -23,7 +23,7 @@ pub use cell_inline::{MarkdownTableCellInlineStep, VerifiedMarkdownTableCellInli
 mod selection_prefix;
 mod semantic;
 #[cfg(feature = "paged-line-compose")]
-pub use selection_prefix::MarkdownPlainSelectionPrefix;
+pub use selection_prefix::MarkdownSelectionStyleInvariant;
 pub use semantic::{
     MarkdownOrdinaryPendingReason, MarkdownOrdinarySemanticState, VerifiedMarkdownPlainViewport,
 };
@@ -98,6 +98,37 @@ impl VerifiedMarkdownOrdinaryLine {
 pub struct VerifiedMarkdownOrdinaryLeaf {
     block: VerifiedGlobalLeafBlock,
     physical_utf16: Range<usize>,
+    #[cfg(feature = "paged-line-compose")]
+    root_code_body: Option<RootCodeBody>,
+}
+
+/// 只在原 Root Code Leaf 的四端点转换完成时建立，不接受外部范围或推测正文末端。
+/// 关闭围栏整条物理行与后继块都在半开 body 外；两个选择的四端点均须留在正文内。
+#[cfg(feature = "paged-line-compose")]
+struct RootCodeBody {
+    utf16: Range<usize>,
+}
+
+#[cfg(feature = "paged-line-compose")]
+impl RootCodeBody {
+    fn contains_selection(&self, selection: MarkdownTextSelection) -> bool {
+        self.utf16.contains(&selection.anchor_utf16) && self.utf16.contains(&selection.head_utf16)
+    }
+}
+
+/// 同一 opaque Leaf 的真实 Root scope 与种类共同决定正文，容器内同形代码不借此能力。
+/// 这里只借已完成 producer 的元数据；Coordinates 仍负责原字节到 UTF16 的真实计量。
+fn root_code_body(block: &VerifiedGlobalLeafBlock) -> Option<&Range<usize>> {
+    if block.scope_depth() != 0 {
+        return None;
+    }
+    match (block.kind(), block.details()) {
+        (LeafBlockKind::FencedCode, LeafBlockDetails::FencedCode { body_enclosure, .. })
+        | (LeafBlockKind::IndentedCode, LeafBlockDetails::IndentedCode { body_enclosure, .. }) => {
+            Some(body_enclosure)
+        }
+        _ => None,
+    }
 }
 
 impl VerifiedMarkdownOrdinaryLeaf {
@@ -1062,10 +1093,13 @@ impl MarkdownViewportSourceRequest {
                 }
                 OrdinaryJob::Leaf(block) => {
                     // source_range.end 可能含后继行 prefix；只按真实返回 cursor 推进共享坐标游标。
+                    // Root Code 复用原四端点中间的两个位置计量正文，不再从可见 marker
+                    // 裁剪范围猜整叶边界，也不为选择等效检查另外建立 locator 或读取正文。
+                    let body = root_code_body(block);
                     [
                         block.physical_start(),
-                        block.source_range().start,
-                        block.consumed_end(),
+                        body.map_or_else(|| block.source_range().start, |body| body.start),
+                        body.map_or_else(|| block.consumed_end(), |body| body.end),
                         block.consumed_end(),
                     ]
                 }
@@ -1144,10 +1178,16 @@ impl MarkdownViewportSourceRequest {
                 let Some(OrdinaryJob::Leaf(block)) = self.job.take() else {
                     unreachable!()
                 };
+                #[cfg(feature = "paged-line-compose")]
+                let root_code_body = root_code_body(&block).map(|_| RootCodeBody {
+                    utf16: values[1]..values[2],
+                });
                 (
                     SourceRecord::Leaf(VerifiedMarkdownOrdinaryLeaf {
                         block,
                         physical_utf16: values[0]..values[3],
+                        #[cfg(feature = "paged-line-compose")]
+                        root_code_body,
                     }),
                     true,
                 )
@@ -1209,7 +1249,7 @@ impl MarkdownViewportSourceRequest {
         Ok(sources)
     }
 
-    /// 同一文档只有选择改变时，重投影原有限来源页实际保留的一条闭合普通行。
+    /// 同一文档只有选择改变时，重投影原有限来源页保留的闭合普通行或真实 Root Code 叶。
     /// Ok(false) 只表示当前库存不能覆盖目标，完全不改变原 owner、发布或证明；
     /// 成功仍须逐量子 advance 认证新选择并取得新发布，不能把旧 Ready/Reader 改名使用。
     ///
@@ -1271,17 +1311,22 @@ impl MarkdownViewportSourceRequest {
             return Ok(false); // 活跃来源/格作业有自己的归还义务，不能借选择变更截掉它们。
         }
         let Some((index, record)) = previous.records.iter().enumerate().find(|(_, record)| {
-            matches!(record.as_ref(), SourceRecord::Line(line)
-                if line.semantic_block.is_some()
-                    && record.utf16_range().start <= viewport.start
-                    && viewport.end <= record.utf16_range().end)
+            let range = record.utf16_range();
+            range.start <= viewport.start
+                && viewport.end <= range.end
+                && match record.as_ref() {
+                    SourceRecord::Line(line) => line.semantic_block.is_some(),
+                    SourceRecord::Leaf(leaf) => root_code_body(&leaf.block).is_some(),
+                }
         }) else {
             return Ok(false); // 旧 prefix 已释放或跨了未知块时仍走原冷路径，不补造历史行目录。
         };
-        let SourceRecord::Line(line) = record.as_ref() else {
-            unreachable!("上方只接受原闭合普通行");
+        let block = match record.as_ref() {
+            SourceRecord::Line(line) => line.semantic_block.as_ref(),
+            // Code 不冒充 OrdinaryBlock seed。保同一个 opaque Leaf Rc，后继仍由
+            // RestartLeaf 原坐标/语义流程签新选择；marker 显隐也须重新得到正常发布。
+            SourceRecord::Leaf(_) => None,
         };
-        let block = line.semantic_block.as_ref().unwrap();
         let result = (|| {
             if !self.batch.reproject_source_selection(
                 document,
@@ -1297,16 +1342,17 @@ impl MarkdownViewportSourceRequest {
             self.batch.admit_source_metadata(
                 previous.retained_metadata
                     + std::mem::size_of::<Rc<SourceRecord>>()
-                    + std::mem::size_of::<Rc<OrdinaryBlockRecord>>()
+                    + usize::from(block.is_some()) * std::mem::size_of::<Rc<OrdinaryBlockRecord>>()
                     + source_workspace_metadata()
                     + publication_reservation_metadata(),
             )?;
             self.batch
                 .admit_source_runs(previous.semantic.run_count())?;
-            let keep_plain = self
-                .semantic
-                .as_ref()
-                .is_some_and(|job| job.retains_plain_block(block));
+            let keep_plain = block.is_some_and(|block| {
+                self.semantic
+                    .as_ref()
+                    .is_some_and(|job| job.retains_plain_block(block))
+            });
             self.batch.account_source_work(SemanticWork {
                 structural_transitions: CONTROL_COST
                     + index
@@ -1325,7 +1371,7 @@ impl MarkdownViewportSourceRequest {
             }
             self.leaf_semantic = None;
             self.records = vec![Rc::clone(record)];
-            self.blocks = vec![Rc::clone(block)];
+            self.blocks = block.map_or_else(Vec::new, |block| vec![Rc::clone(block)]);
             self.selection = authority.selection;
             self.context_revision = authority.context_revision;
             self.selection_bytes = None; // 新选择必须重新通过原四端点定位，旧 byte pair 不授后继权限。

@@ -828,6 +828,14 @@ impl NativeMarkdownHostedTableProbe {
         before: NativeMarkdownPagedInputState,
     ) -> Result<std::rc::Weak<NativeMarkdownPagedBody>, String> {
         let generation = facts.generation.checked_add(1).ok_or("追加代次溢出")?;
+        // 原Cell追加只发布一次canonical事务；Input::publish无论folds_changed是否为真，
+        // 都为新Source重映射推进一次fold_revision。保精确后态，不能沿用旧源revision，
+        // 也不能接受同generation上另一次折叠动作造成的额外变化。
+        let expected_fold = before
+            .fold_revision
+            .checked_add(1)
+            .ok_or("追加折叠映射代次溢出")?;
+        let expected_units = APPENDED.encode_utf16().count();
         loop {
             let found = with_active_native_markdown_surface(|surface| {
                 if !self.current(surface, facts, facts.generation)
@@ -841,10 +849,14 @@ impl NativeMarkdownHostedTableProbe {
                     return Err("未发布追加前原完整父 Input 被别的动作改变".into());
                 }
                 if actual.generation == generation
-                    && (actual.utf16_len != APPENDED.encode_utf16().count()
+                    && (actual.utf16_len != expected_units
                         || actual.marked.is_some()
-                        || actual.fold_revision != before.fold_revision)
+                        || actual.fold_revision != expected_fold)
                 {
+                    // 同一失败边界只记纯Input标量，不读源或输出文本；原严格拒绝保持不变。
+                    eprintln!(
+                        "native_table_append_parent_input_replaced before={before:?} actual={actual:?} expected_generation={generation} expected_utf16_len={expected_units} expected_fold_revision={expected_fold}"
+                    );
                     return Err("追加发布的父 Input 不属于预声明新源".into());
                 }
                 if let Some(cause) = editor.body.take_failure() {

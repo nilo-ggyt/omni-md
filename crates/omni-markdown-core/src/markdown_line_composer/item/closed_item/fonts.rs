@@ -91,7 +91,7 @@ impl FontRuns {
     /// 但能力要覆盖其完整自然项及仍保留的有限后继，不能只检查刚发布软行的末端。
     /// 所有范围来自这个 owner 已接纳的真实响应；这里不领取 GCB、不读取正文或补签字体。
     #[cfg(feature = "s2-table-window-prototype")]
-    pub(in crate::markdown_line_composer::item) fn retains_plain_prefix(
+    pub(in crate::markdown_line_composer::item) fn retains_selection_styles(
         &self,
         source: &MarkdownLayoutTextAuthority,
         proven_end: usize,

@@ -753,7 +753,7 @@ impl MarkdownLineItemCoordinator {
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
     ))]
-    pub(super) fn retains_plain_prefix(
+    pub(super) fn retains_selection_styles(
         &self,
         captured_end: usize,
         proven_end: usize,
@@ -784,12 +784,12 @@ impl MarkdownLineItemCoordinator {
             // ClosedFonts 的 AwaitChild 会晚于 Store 的实际归还一步清槽；保留真实空 child
             // 的续体，不为得到空槽而额外推进一个量子，也不把仍活的 child 当作已释放。
             if let Some(fonts) = &payload.closed_fonts
-                && !fonts.retains_plain_prefix(&self.authority, proven_end)?
+                && !fonts.retains_selection_styles(&self.authority, proven_end)?
             {
                 return Ok(false);
             }
             if let Some(frontier) = &payload.frontier
-                && !frontier.retains_plain_prefix(proven_end)?
+                && !frontier.retains_selection_styles(proven_end)?
             {
                 return Ok(false);
             }

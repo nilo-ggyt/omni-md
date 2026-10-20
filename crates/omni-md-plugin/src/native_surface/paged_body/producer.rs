@@ -633,9 +633,21 @@ impl Producer {
                 )?;
         #[cfg(feature = "native-markdown-runtime-probe")]
         eprintln!(
-            "native_selection_layout retained={retain_composer} prepared_lines={} selection_serial={} generation={}",
-            self.lines, request.input.selection_serial, request.input.generation,
-        ); // 只在真实选择换代边界记录有限决策，不输出正文、路径或持久观察状态。
+            "native_selection_layout retained={retain_composer} prepared_lines={} selection_serial={} generation={} output_ready={} line_pending={} batch_pending={} queued_lines={} style_pending={} control_pending={} grid_active={} visible_grids={} restoring_grid={} cell_word={}",
+            self.lines,
+            request.input.selection_serial,
+            request.input.generation,
+            self.output.is_some(),
+            self.pending_line.is_some(),
+            self.pending_batch.is_some(),
+            self.queued_lines.is_some(),
+            self.pending_style.is_some(),
+            self.pending_control.is_some(),
+            self.grid.is_some(),
+            self.grids.len(),
+            self.restoring_grid.is_some(),
+            self.cell_word.is_some(),
+        ); // 只在原选择换代边界报告真实拥有槽；区分原拒绝门，不为获得保留而清槽，也不记录正文。
         self.pending_style = None;
         self.pending_control = None;
         self.grid = None;

@@ -109,7 +109,7 @@ impl PendingFrontier {
     /// 相等，后继 part 也逐次核 original_range；不能拿中心片或已发布行冒充其支持域。
     /// 语义边界及终端 Font 响应可能持旧出版物，首版一律交回冷路，不延长它们的寿命。
     #[cfg(feature = "s2-table-window-prototype")]
-    pub(super) fn retains_plain_prefix(&self, proven_end: usize) -> Result<bool> {
+    pub(super) fn retains_selection_styles(&self, proven_end: usize) -> Result<bool> {
         if self.facts.source_utf16.end > proven_end
             || self.style_boundary.is_some()
             || self.terminal.is_some()

@@ -286,7 +286,7 @@ impl GlyphStore {
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
     ))]
-    pub(super) fn plain_selection_prefix_end(
+    pub(super) fn selection_style_capture_end(
         &self,
         line_start: usize,
         proven_end: usize,

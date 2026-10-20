@@ -108,10 +108,10 @@ fn plain_selection_change_keeps_real_glyph_prefix_and_continues_fresh_publicatio
         // 语义证明扩成整段。能力拒绝后原出版物必须还能沿真正的旧选择继续推进。
         assert!(first.source_utf16.end <= 64);
         let capability = request
-            .plain_selection_prefix(&fixture.document, &previous, authority(&fixture.document))
+            .selection_style_invariant(&fixture.document, &previous, authority(&fixture.document))
             .unwrap()
             .expect("真实首窗已有有限 Plain 证明");
-        assert!(!worker.can_retain_plain_selection(&capability).unwrap());
+        assert!(!worker.can_retain_selection_styles(&capability).unwrap());
     }
     fixture.document.set_selection(original).unwrap();
     request
@@ -131,11 +131,11 @@ fn plain_selection_change_keeps_real_glyph_prefix_and_continues_fresh_publicatio
     fixture.document.set_selection(changed).unwrap();
     {
         let capability = request
-            .plain_selection_prefix(&fixture.document, &previous, authority(&fixture.document))
+            .selection_style_invariant(&fixture.document, &previous, authority(&fixture.document))
             .unwrap()
             .expect("原生产 Plain 证明必须覆盖完整实际段落");
         assert!(
-            worker.can_retain_plain_selection(&capability).unwrap(),
+            worker.can_retain_selection_styles(&capability).unwrap(),
             "真实已发布字形必须可在同一能力内继续，不重造 writer"
         );
     }
@@ -206,6 +206,149 @@ fn plain_selection_change_keeps_real_glyph_prefix_and_continues_fresh_publicatio
     assert!(source.payload_released());
     assert_eq!(backing.mapped_bytes(), 0);
     assert_eq!(backing.managed_resident_bytes(), 0);
+}
+
+#[cfg(feature = "s2-table-window-prototype")]
+#[test]
+fn root_code_selection_keeps_preceding_real_glyphs_with_fresh_output_authority() {
+    use crate::markdown_document_buffer::MarkdownTableRequestError;
+    use crate::{MarkdownTextSelection, MarkdownViewportSourceAuthority};
+
+    // 真正有限语义窗只在后方Code正文。已发布字形和完整自然项却在前方普通段落，
+    // 这覆盖“保838行前缀”所需的跨owner证明，不能把能力收缩为Code body内的交集。
+    let prefix = "office abc office xyz ".repeat(20);
+    let text = format!("{prefix}\n\n```text\nliteral alpha omega\n```\n");
+    let first = text.find("literal").unwrap();
+    let second = text.find("omega").unwrap();
+    let mut fixture = Fixture::new(&text);
+    let mapping = fixture.source.original_backing_observer().unwrap();
+    let source = fixture.source.resource_observer();
+    let original = MarkdownTextSelection::caret(first + 1);
+    fixture.document.set_selection(original).unwrap();
+    let authority = |document: &MarkdownDocumentBuffer| MarkdownViewportSourceAuthority {
+        context_revision: 73,
+        selection: document.selection(),
+        cancelled: false,
+    };
+    let finish = |request: &mut crate::MarkdownViewportSourceRequest,
+                  document: &MarkdownDocumentBuffer| {
+        for _ in 0..text.len() * 100 + 10000 {
+            request
+                .advance(document, authority(document), 4096)
+                .unwrap();
+            if request
+                .sources_for(document, authority(document))
+                .unwrap()
+                .is_some()
+            {
+                return;
+            }
+        }
+        panic!("真实Code窗口没有沿原有限Source量子完成");
+    };
+    let mut request = fixture
+        .document
+        .viewport_leaf_source_request(first..first + 7, 73, original)
+        .unwrap();
+    finish(&mut request, &fixture.document);
+    let previous = request
+        .take_sources_for(&fixture.document, authority(&fixture.document))
+        .unwrap()
+        .unwrap();
+    let (mut worker, font) = composer(&fixture, 80 * 64, MarkdownLineComposeCancellation::new());
+    let resources = worker.worker_resource_observer();
+    let writer = worker.resource_observer().unwrap();
+    let first_line = next_line(&mut worker, &font).unwrap();
+    assert!(first_line.source_utf16.end < prefix.len());
+    let mut old = worker.publish_ready_prefix().unwrap().unwrap();
+    let old_receipt = old.resource_observer();
+    let old_line = old.last_line().unwrap().unwrap();
+    let old_part = old.part(&old_line, 0).unwrap().unwrap();
+    let mut expected = vec![ZERO; old_part.facts().glyphs];
+    old.read_batch(&old_part, 0..expected.len(), &mut expected)
+        .unwrap();
+    assert!(expected.iter().all(|glyph| glyph.glyph_id != 0));
+
+    // 选择移到同一Code正文另一词，真正SourceRequest负责核Root/scope/body和完整选择。
+    // Composer仍核其自己的静止阶段、Font和全部ahead支持；测试不修改Store或构造能力。
+    let changed = MarkdownTextSelection {
+        anchor_utf16: second + 3,
+        head_utf16: second,
+    };
+    fixture.document.set_selection(changed).unwrap();
+    {
+        let capability = request
+            .selection_style_invariant(&fixture.document, &previous, authority(&fixture.document))
+            .unwrap()
+            .expect("同一Root Code正文内的选择应有真实不变能力");
+        assert!(worker.can_retain_selection_styles(&capability).unwrap());
+    }
+    assert!(
+        request
+            .reproject_selection(
+                &fixture.document,
+                &previous,
+                first..first + 7,
+                authority(&fixture.document)
+            )
+            .unwrap()
+    );
+    fixture.document.set_selection(original).unwrap();
+    assert!(matches!(
+        previous.ordinary_semantics_for(&fixture.document, authority(&fixture.document)),
+        Err(MarkdownTableRequestError::PublicationSuperseded)
+    ));
+    fixture.document.set_selection(changed).unwrap();
+    drop(previous);
+    old.close().unwrap();
+    assert!(!old_receipt.snapshot().file_open);
+    finish(&mut request, &fixture.document);
+    let current = request
+        .take_sources_for(&fixture.document, authority(&fixture.document))
+        .unwrap()
+        .unwrap();
+
+    // 同一个writer重新发布的Reader必须读到逐glyph相同结果，但不能接受旧弱Line身份。
+    // 只比较真实公开输出，不靠保留次数、内部目录或旧Reader仍可读来冒充正确复用。
+    let mut fresh = worker.publish_ready_prefix().unwrap().unwrap();
+    let fresh_receipt = fresh.resource_observer();
+    let line = fresh.last_line().unwrap().unwrap();
+    assert_eq!(line.facts(), &first_line);
+    let part = fresh.part(&line, 0).unwrap().unwrap();
+    let mut actual = vec![ZERO; part.facts().glyphs];
+    fresh
+        .read_batch(&part, 0..actual.len(), &mut actual)
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert!(matches!(
+        fresh.part(&old_line, 0),
+        Err(MarkdownLineComposeError::SourceMismatch)
+    ));
+    drop(fresh);
+    assert!(!fresh_receipt.snapshot().file_open);
+    let next = next_line(&mut worker, &font).unwrap();
+    assert_eq!(next.source_utf16.start, first_line.source_utf16.end);
+    let output = worker.into_output().unwrap();
+    assert_eq!(output.source_range().end, next.source_utf16.end);
+    assert!(output.source_range().end < prefix.len());
+    output.close().unwrap();
+    assert!(!writer.snapshot().file_open);
+    assert_eq!(fixture.document.selection(), changed);
+    assert_eq!(fixture.document.generation(), 0);
+    assert!(
+        !fixture.document.is_dirty()
+            && !fixture.document.can_undo()
+            && !fixture.document.can_redo()
+    );
+    assert_eq!(
+        std::fs::read(fixture._directory.path().join("真实分项.md")).unwrap(),
+        text.as_bytes()
+    );
+    drop((current, request, font, fixture));
+    assert!(resources.is_released());
+    assert!(source.payload_released());
+    assert_eq!(mapping.mapped_bytes(), 0);
+    assert_eq!(mapping.managed_resident_bytes(), 0);
 }
 
 #[test]

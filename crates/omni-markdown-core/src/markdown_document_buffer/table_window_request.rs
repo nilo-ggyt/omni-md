@@ -13,7 +13,7 @@ use checkpoint::{Boundary, ReplayAnchors};
 mod ordinary_source;
 use ordinary_source::CapturedOrdinary;
 #[cfg(feature = "paged-line-compose")]
-pub use ordinary_source::MarkdownPlainSelectionPrefix;
+pub use ordinary_source::MarkdownSelectionStyleInvariant;
 pub use ordinary_source::{
     MarkdownOrdinaryPendingReason, MarkdownOrdinarySemanticState, MarkdownRootLeafPendingReason,
     MarkdownTableCellInlineStep, MarkdownViewportSourceAuthority, MarkdownViewportSourceRequest,

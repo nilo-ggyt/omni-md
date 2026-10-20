@@ -1091,7 +1091,7 @@ impl RootLeaf {
         Ok(Some(row.prepare_cell(document, source, column)?))
     }
 
-    /// 只在原 Plain 负语法证明覆盖整个 Composer 实际库存时保留同源字形。
+    /// 原 Plain 前缀或真实 Root Code 能力覆盖整个 Composer 库存时，才保留同源字形。
     /// 能力借用、Composer 只读核验与旧发布退休都在同一纯 Core 栈中完成，没有 Native 回调。
     pub(super) fn reproject_selection_preserving_styles(
         &mut self,
@@ -1125,13 +1125,16 @@ impl RootLeaf {
         };
         {
             // cap 不是裸 Range，也不保旧 publication 的强副本；它借原请求/Doc/最新发布，
-            // 只认证真实 source0 Plain 前缀。Composer 自己核 Stage/Store/活跃支持范围，
+            // 认证 Plain 已读前缀或同一 Root Code 正文内的选择移动。后者不重用旧
+            // marked/选区像素：旧 Scene/Reader 仍退休，后继帧须匹配完整新 Input。
+            // Composer 自己核 Stage/Store/活跃支持范围，
             // 不能由 Native 的 SceneReady 或已显示行数猜测其尚未捕获的整形输入。
-            let Some(capability) = parser.plain_selection_prefix(&document, previous, authority)?
+            let Some(capability) =
+                parser.selection_style_invariant(&document, previous, authority)?
             else {
                 return Ok(false);
             };
-            if !composer.can_retain_plain_selection(&capability)? {
+            if !composer.can_retain_selection_styles(&capability)? {
                 return Ok(false);
             }
         } // 借用先结束，才允许原唯一请求改变选择、退休 publication；没有跨 Native 或挂起保存 cap。

@@ -222,6 +222,21 @@ pub struct VerifiedMarkdownRootLeafViewport {
 }
 
 impl VerifiedMarkdownRootLeafViewport {
+    /// 选择不变能力只借本次已发布的唯一真实 Root Code 记录，不把覆盖凸包当作块身份。
+    /// 原 Rc 仍归 SourceRequest；此处不扩 requested，不扫描正文，也不授予容器代码权限。
+    #[cfg(feature = "paged-line-compose")]
+    pub(super) fn root_code_leaf(&self) -> Option<&VerifiedMarkdownOrdinaryLeaf> {
+        if self.coverage.len != 1 {
+            return None;
+        }
+        let coverage = self.coverage.get(0)?;
+        let SourceRecord::Leaf(leaf) = coverage.record.as_ref() else {
+            return None;
+        };
+        leaf.root_code_body.as_ref()?;
+        Some(leaf)
+    }
+
     /// 原 Plain 槽与本次唯一覆盖必须持同一个真实 seed；相同数值包络不能替代来源身份。
     /// 只供父请求的同步前缀能力检查，外部仍须经 publication 的完整 Source/选择权限。
     #[cfg(feature = "paged-line-compose")]

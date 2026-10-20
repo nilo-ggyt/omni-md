@@ -265,7 +265,7 @@ pub use markdown_document_buffer::{
 
 // 有限来源与 Root Plain/Leaf 的 opt-in 出口不切换默认 Native；Pending 不能取得任何 Ready 权限。
 #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
-pub use markdown_document_buffer::MarkdownPlainSelectionPrefix;
+pub use markdown_document_buffer::MarkdownSelectionStyleInvariant;
 #[cfg(feature = "s2-table-window-prototype")]
 pub use markdown_document_buffer::{
     MarkdownOrdinaryPendingReason, MarkdownOrdinarySemanticState, MarkdownRootLeafPendingReason,

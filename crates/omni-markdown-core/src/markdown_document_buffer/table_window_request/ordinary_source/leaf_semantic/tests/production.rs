@@ -72,7 +72,7 @@ fn selection_reprojection_reuses_true_prefix_and_stops_at_later_inline() {
     #[cfg(feature = "paged-line-compose")]
     assert!(
         request
-            .plain_selection_prefix(&doc, &old, authority(&doc))
+            .selection_style_invariant(&doc, &old, authority(&doc))
             .unwrap()
             .is_some(),
         "原83K有限末端之前的Root Plain事实应能交给同源Composer核验"
@@ -151,7 +151,7 @@ fn selection_reprojection_reuses_true_prefix_and_stops_at_later_inline() {
     #[cfg(feature = "paged-line-compose")]
     assert!(
         request
-            .plain_selection_prefix(&doc, &current, authority(&doc))
+            .selection_style_invariant(&doc, &current, authority(&doc))
             .unwrap()
             .is_none(),
         "未知后缀遇真实特殊语法后不能沿已释放的旧Plain证明扩大能力"
@@ -269,6 +269,204 @@ fn selection_reprojection_recomputes_real_markers_links_and_underlines() {
     assert_eq!(backing.managed_resident_bytes(), 0);
 }
 
+#[cfg(feature = "paged-line-compose")]
+#[test]
+fn root_code_selection_invariant_reprojects_real_leaf_and_retires_previous_publication() {
+    // 四份原文分别保显式关闭/EOF、CRLF/缩进代码。正文中的 '</u>' 与 '**' 是
+    // literal，不能改变外部 underline owner 或生成 inline marker；期望仍来自完整 Parser。
+    for source in [
+        "<u>外部\r\n\r\n  ```text\r\nliteral alpha 中文😀 **标记** </u><u> omega\r\n  ```\r\n\r\n外部关闭</u>\r\n",
+        "前方 **真实粗体**\n\n```text\nliteral alpha 中文😀 **标记** omega",
+        "前方 [链接](../target)\n\n    literal alpha 中文😀 **标记** omega\n\n后继段落\n",
+        "前方\n\n    literal alpha 中文😀 **标记** omega",
+    ] {
+        let (directory, mut doc) = document(source);
+        let backing = doc.original_backing_observer().unwrap();
+        let first = units(
+            source,
+            source.find("literal").unwrap()..source.find("literal").unwrap(),
+        )
+        .start;
+        let second = units(
+            source,
+            source.find("omega").unwrap()..source.find("omega").unwrap(),
+        )
+        .start;
+        let requested = first..first + "literal".len();
+        let original = MarkdownTextSelection::caret(first + 1);
+        let changed = MarkdownTextSelection {
+            anchor_utf16: second + 3,
+            head_utf16: second,
+        };
+        doc.set_selection(original).unwrap();
+        let (mut request, previous) = leaf_sources(&doc, requested.clone());
+
+        // 独立解析旧/新选择的整份短夹具，证明其它 Root 块也不受这次正文内选择影响；
+        // 生产能力只借同一个真实 Leaf，不能靠 requested 的7字符范围签整个 Store。
+        let mut before = MarkdownViewportPresentation::default();
+        before.set_active_selection(ordered_selection(original));
+        before.rebuild(0, 0..doc.utf16_len(), source).unwrap();
+        doc.set_selection(changed).unwrap();
+        let mut after = MarkdownViewportPresentation::default();
+        after.set_active_selection(ordered_selection(changed));
+        after.rebuild(0, 0..doc.utf16_len(), source).unwrap();
+        for index in 0..doc.utf16_len() {
+            assert_eq!(
+                before.query(index).unwrap().styles,
+                after.query(index).unwrap().styles
+            );
+        }
+        // 撤销、外来 Doc 和错误上下文沿原强类型错误返回，不能误降为“能力不存在”。
+        let current = authority(&doc);
+        let mut cancelled = current;
+        cancelled.cancelled = true;
+        assert!(matches!(
+            request.selection_style_invariant(&doc, &previous, cancelled),
+            Err(MarkdownTableRequestError::Cancelled)
+        ));
+        let mut wrong = current;
+        wrong.context_revision += 1;
+        assert!(matches!(
+            request.selection_style_invariant(&doc, &previous, wrong),
+            Err(MarkdownTableRequestError::PublicationSuperseded)
+        ));
+        let (_foreign_directory, foreign) = document(source);
+        assert!(matches!(
+            request.selection_style_invariant(&foreign, &previous, authority(&foreign)),
+            Err(MarkdownTableRequestError::SourceSuperseded)
+        ));
+        assert!(
+            request
+                .selection_style_invariant(&doc, &previous, current)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            request
+                .reproject_selection(&doc, &previous, requested.clone(), current)
+                .unwrap()
+        );
+
+        // 新选择接管后旧发布永久失权。恢复旧选择数值只能验证 ABA 拒绝，不能给旧 Rc 续权。
+        doc.set_selection(original).unwrap();
+        assert!(matches!(
+            previous.ordinary_semantics_for(&doc, authority(&doc)),
+            Err(MarkdownTableRequestError::PublicationSuperseded)
+        ));
+        doc.set_selection(changed).unwrap();
+        drop(previous);
+        finish_sources(&mut request, &doc).unwrap();
+        let current = request
+            .take_sources_for(&doc, authority(&doc))
+            .unwrap()
+            .unwrap();
+        let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = current
+            .ordinary_semantics_for(&doc, authority(&doc))
+            .unwrap()
+        else {
+            panic!("同一个真实Code叶必须沿RestartLeaf重新签出有限语义");
+        };
+        assert_oracle(leaf, &doc, source, &requested);
+        assert_eq!(request.total_work().copied_source_bytes, 0);
+        assert_eq!(request.total_work().parser_input_bytes, 0);
+        assert_eq!(request.total_work().allocated_source_capacity, 0);
+        assert_eq!(doc.generation(), 0);
+        assert_eq!(doc.selection(), changed);
+        assert!(!doc.is_dirty() && !doc.can_undo() && !doc.can_redo());
+        assert_eq!(
+            std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+            source.as_bytes()
+        );
+        drop((current, request, doc));
+        assert_eq!(backing.mapped_bytes(), 0);
+        assert_eq!(backing.managed_resident_bytes(), 0);
+    }
+}
+
+#[cfg(feature = "paged-line-compose")]
+#[test]
+fn root_code_selection_invariant_declines_real_marker_owner_edges_and_container_prefixes() {
+    // 关闭行的两个空格不是 marker 字节，却属于该物理行的显隐 owner；不能仅排除反引号。
+    // 缩进代码尾端可能就是后继 Root 段落起点，EOF 末端也保守排除，不以裸 close_reason 放行。
+    for source in [
+        "前方\r\n\r\n  ```text\r\nliteral alpha omega\r\n  ```\r\n\r\n后继\r\n",
+        "前方\n\n```text\nliteral alpha omega",
+        "前方\n\n    literal alpha omega\n\n后继\n",
+        "前方\n\n    literal alpha omega",
+    ] {
+        let (_directory, mut doc) = document(source);
+        let first = units(
+            source,
+            source.find("literal").unwrap()..source.find("literal").unwrap(),
+        )
+        .start;
+        let original = MarkdownTextSelection::caret(first + 1);
+        doc.set_selection(original).unwrap();
+        let (request, previous) = leaf_sources(&doc, first..first + 7);
+        let last_body_byte = if let Some(closing) = source.rfind("  ```") {
+            closing
+        } else if let Some(next) = source.find("\n\n后继") {
+            next + 1
+        } else {
+            source.len()
+        };
+        let body_end = units(source, last_body_byte..last_body_byte).start;
+        for changed in [
+            MarkdownTextSelection::caret(0),
+            MarkdownTextSelection::caret(body_end),
+            MarkdownTextSelection {
+                anchor_utf16: first + 1,
+                head_utf16: 0,
+            },
+        ] {
+            doc.set_selection(changed).unwrap();
+            assert!(
+                request
+                    .selection_style_invariant(&doc, &previous, authority(&doc))
+                    .unwrap()
+                    .is_none()
+            );
+            // 只读拒绝没有退休原 publication；恢复真实旧选择后原有限样式仍可正常读取。
+            doc.set_selection(original).unwrap();
+            let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = previous
+                .ordinary_semantics_for(&doc, authority(&doc))
+                .unwrap()
+            else {
+                panic!("原Code窗口应保持Ready");
+            };
+            assert_oracle(leaf, &doc, source, &(first..first + 7));
+        }
+    }
+    for source in [
+        "> ```\n> literal alpha\n> omega\n> ```\n",
+        "- ```\n  literal alpha\n  omega\n  ```\n",
+    ] {
+        let (_directory, mut doc) = document(source);
+        let first = units(
+            source,
+            source.find("literal").unwrap()..source.find("literal").unwrap(),
+        )
+        .start;
+        let second = units(
+            source,
+            source.find("omega").unwrap()..source.find("omega").unwrap(),
+        )
+        .start;
+        doc.set_selection(MarkdownTextSelection::caret(first))
+            .unwrap();
+        let (request, previous) = leaf_sources(&doc, first..first + 7);
+        doc.set_selection(MarkdownTextSelection::caret(second))
+            .unwrap();
+        // 容器的逐行 prefix 会随端点移动显隐；同形 Code、同 Leaf 与同 Root 参数均不能替代真scope。
+        assert!(
+            request
+                .selection_style_invariant(&doc, &previous, authority(&doc))
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 #[test]
 fn selection_reprojection_declines_missing_records_and_keeps_real_failure_authority() {
     let source = "首段 **粗体**\n\n后段 中文😀 abc 尾\n";
@@ -383,7 +581,7 @@ fn plain_selection_prefix_declines_markup_and_preserves_original_publication() {
         doc.set_selection(changed).unwrap();
         assert!(
             request
-                .plain_selection_prefix(&doc, &previous, authority(&doc))
+                .selection_style_invariant(&doc, &previous, authority(&doc))
                 .unwrap()
                 .is_none(),
             "有真实marker/HTML/容器/table的语义不能保普通字形，source={source:?}"
@@ -443,14 +641,14 @@ fn plain_selection_prefix_keeps_real_source_cancellation_and_context_errors() {
         ),
     ] {
         assert!(matches!(
-            request.plain_selection_prefix(document, &previous, authority),
+            request.selection_style_invariant(document, &previous, authority),
             Err(cause) if cause == expected
         ));
     }
     // 只读能力检查不修改原请求；错误参数移除后仍能按真正新选择重投影同一已发布窗口。
     assert!(
         request
-            .plain_selection_prefix(&doc, &previous, current)
+            .selection_style_invariant(&doc, &previous, current)
             .unwrap()
             .is_some()
     );
@@ -482,7 +680,7 @@ fn plain_selection_prefix_keeps_real_source_cancellation_and_context_errors() {
         .unwrap();
     doc.undo().unwrap();
     assert!(matches!(
-        request.plain_selection_prefix(&doc, &current, authority(&doc)),
+        request.selection_style_invariant(&doc, &current, authority(&doc)),
         Err(MarkdownTableRequestError::SourceSuperseded)
     ));
     drop((current, request, doc));
