@@ -50,6 +50,17 @@ native-markdown-runtime-probe = [
   # 合成鼠标验收只观察一个可见格的像素；正式产品不分配验收位图。
   "objc2-app-kit/NSBitmapImageRep",
   "objc2-app-kit/NSImageRep",
+  # 系统组合专项只读原输入法窗口元数据，并创建交给本应用队列的本地 CG 按键。
+  # 明确启用所用绑定，不能依赖独立测试的 dev-dependency 特性合并。
+  "objc2-app-kit/NSScreen",
+  "objc2-app-kit/libc",
+  "objc2-core-graphics/CGEvent",
+  "objc2-core-graphics/CGEventTypes",
+  "objc2-core-graphics/CGEventSource",
+  "objc2-core-graphics/CGGeometry",
+  "objc2-core-graphics/CGWindow",
+  "objc2-core-graphics/CGWindowLevel",
+  "objc2-core-graphics/CGRemoteOperation",
   "dep:libc",
 ]
 # 独立光栅适配实验仍需显式环境开关才分配资源，不成为正式正文的隐式路径。
