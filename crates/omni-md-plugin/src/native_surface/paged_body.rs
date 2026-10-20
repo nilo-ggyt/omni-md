@@ -878,7 +878,15 @@ impl NativeMarkdownPagedBody {
             }
         }
         let view = self.view()?;
-        let request = view.capture_scene_request()?;
+        let request = view.capture_scene_request().inspect_err(|cause| {
+            // 临时失败定位只读原 typed cause，不为日志重捕几何或重新进入 Native。
+            #[cfg(feature = "native-close-stage-diagnostic")]
+            eprintln!(
+                "native_body_phase_failure phase=request cause={:?}",
+                std::mem::discriminant(cause)
+            );
+            let _ = cause;
+        })?;
         if !self
             .input
             .target_domain()
@@ -993,12 +1001,22 @@ impl NativeMarkdownPagedBody {
         };
         // 模式初始化在首Ready之前借唯一Producer的原Source，不能先发布文首再追逐旧caret。
         if let Err(cause) = self.prepare_mode_viewport(&mut producer, &request) {
+            #[cfg(feature = "native-close-stage-diagnostic")]
+            eprintln!(
+                "native_body_phase_failure phase=prepare_mode cause={:?}",
+                std::mem::discriminant(&cause)
+            );
             return producer::merge_preparation_cleanup(Err(cause), producer.retire());
         }
         // 同源选择可改变marker实际字号；先结束旧字体/Reader并重排，不把已封存的旧图换一张输入票。
         let refreshed = match producer.refresh_semantic_selection(self, &request) {
             Ok(refreshed) => refreshed,
             Err(cause) => {
+                #[cfg(feature = "native-close-stage-diagnostic")]
+                eprintln!(
+                    "native_body_phase_failure phase=refresh_selection cause={:?}",
+                    std::mem::discriminant(&cause)
+                );
                 return producer::merge_preparation_cleanup(Err(cause), producer.retire());
             } // 清理失败与原重排失败共同保留，不能只靠普通Drop丢失Font/Source退休错误。
         };
@@ -1035,6 +1053,14 @@ impl NativeMarkdownPagedBody {
         } else {
             producer.advance(self, &request)
         };
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        if let Err(cause) = &result {
+            // 这里只标识已经返回的原回合；不把可正常退休的 PreparationRevoked 改成另一种错误。
+            eprintln!(
+                "native_body_phase_failure phase=producer_advance cause={:?}",
+                std::mem::discriminant(cause)
+            );
+        }
         let replaced = match producer.replaced_cell_source(&self.input, &request) {
             Ok(replaced) => replaced,
             Err(cause) => {
@@ -1073,7 +1099,14 @@ impl NativeMarkdownPagedBody {
             return self.finish_word_delete(); // 原Box已放回，Ready才可归还旧读取并消费唯一输入票。
         }
         self.finish_vertical_navigation()?;
-        if self.finish_mode_viewport()? {
+        if self.finish_mode_viewport().inspect_err(|cause| {
+            #[cfg(feature = "native-close-stage-diagnostic")]
+            eprintln!(
+                "native_body_phase_failure phase=finish_mode cause={:?}",
+                std::mem::discriminant(cause)
+            );
+            let _ = cause;
+        })? {
             return Ok(()); // 真实glyph恢复改变了clip，旧Scene到此结束；下一原续体完成新帧认证。
         }
         self.finish_source_target()?;

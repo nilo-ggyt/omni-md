@@ -945,11 +945,26 @@ impl NativeMarkdownPagedBody {
         let first = match scene.first_rect(NSRange::new(anchor.probe.start, anchor.probe.len())) {
             Ok(first) => first,
             Err(ViewError::Pending) => return Ok(false),
-            Err(cause) => return Err(cause.into()),
+            Err(cause) => {
+                // 只标明既有失败出口；不额外查询原 Scene/current，也不把旧坐标拒绝改成重试。
+                #[cfg(feature = "native-close-stage-diagnostic")]
+                eprintln!(
+                    "native_mode_phase_failure phase=first_rect cause={:?}",
+                    std::mem::discriminant(&cause)
+                );
+                return Err(cause.into());
+            }
         };
         let request = &scene.key().request;
         let viewport = self.viewport.borrow().clone().ok_or(ViewError::Closed)?;
-        let geometry = viewport.geometry()?;
+        let geometry = viewport.geometry().inspect_err(|cause| {
+            #[cfg(feature = "native-close-stage-diagnostic")]
+            eprintln!(
+                "native_mode_phase_failure phase=geometry cause={:?}",
+                std::mem::discriminant(cause)
+            );
+            let _ = cause;
+        })?;
         let glyph_top = request.virtual_viewport.document_origin.y
             + request.viewport.origin.y
             + request.viewport.size.height
@@ -1005,6 +1020,14 @@ impl NativeMarkdownPagedBody {
         if let Some(producer) = self.producer.borrow().as_ref() {
             producer.target_source_health()?;
         }
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        if let Err(cause) = &changed {
+            // 原 Source 首错仍在上方优先返回；此处不提前消费或重放已发生的 Native reveal。
+            eprintln!(
+                "native_mode_phase_failure phase=reveal cause={:?}",
+                std::mem::discriminant(cause)
+            );
+        }
         if changed? {
             self.schedule()?;
             return Ok(true);
@@ -1029,7 +1052,15 @@ impl NativeMarkdownPagedBody {
             return Err(ViewError::Revoked.into());
         }
         self.view()?
-            .verify_find_target_visible(scene.key(), target.range)?;
+            .verify_find_target_visible(scene.key(), target.range)
+            .inspect_err(|cause| {
+                #[cfg(feature = "native-close-stage-diagnostic")]
+                eprintln!(
+                    "native_mode_phase_failure phase=verify cause={:?}",
+                    std::mem::discriminant(cause)
+                );
+                let _ = cause;
+            })?;
         drop(self.mode_viewport.borrow_mut().take());
         Ok(false)
     }
