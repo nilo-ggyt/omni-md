@@ -440,8 +440,8 @@ impl SoftwareInput {
         let presses: [u16; 9] = [0x06, 0x04, 0x1f, 0x2d, 0x05, 0x0d, 0x0e, 0x2d, 0x31];
         assert!(index < presses.len());
         assert!(self.pending.borrow().is_none() && self.waiting.get().is_none());
-        // 原纯 NSEvent 构造在标准 NSTextView 对照中也未产生 marked；同一客户使用
-        // CG-backed 事件才进入真实组合。因此只更换对象构造，后面的原 AppKit 路由不变。
+        // 本轮本地事件在原客户和标准 NSTextView 对照中均未证明真实组合；
+        // CG-backed 身份本身也不证明输入法已消费字母，后面的原 AppKit 路由保持不变。
         // NULL source 仅创建本地 CGEvent，不调用 CGEventPost/PostToPid、不申请全局事件权限，
         // 也不切换当前输入源或模式；真正处理结果仍由原 marked、中文和面板收据证明。
         let keycode = presses[index];
@@ -460,6 +460,16 @@ impl SoftwareInput {
                 if event.r#type() != kind || event.keyCode() != keycode || !cg_backed {
                     return Err("实际CG包装事件的类型、键码或原事件对象不符");
                 } // 原系统包装失败不补建纯文字事件，也不静默改用另一条输入路径。
+                // 当前 Squirrel 的 keyDown 先读取此字符再处理虚拟键码；仅有 CGEvent
+                // 不能证明这个前提。只核本次固定 ASCII 键，不写 Unicode 载荷或改变输入源。
+                let characters = event
+                    .charactersIgnoringModifiers()
+                    .ok_or("实际CG包装事件缺少本次ASCII按键字符")?;
+                if characters.length() != 1
+                    || characters.characterAtIndex(0) != u16::from(b"zhongwen "[index])
+                {
+                    return Err("实际CG包装事件的字符与本次ASCII按键不符");
+                } // down/up 均须带同一次预期字符；缺失或不符不交 pending，也不冒充有效字母。
                 println!(
                     "system_ime stage=software_key_prepared index={index} key_down={key_down} event_type={:?} event_key_code={} event_modifier_flags={:?} event_window_number={} timestamp_seconds={} cg_backed={cg_backed} unicode_payload_set=false global_event_posted=false transport=nsapplication_send_event software_events=true physical_keyboard=false",
                     event.r#type(),
