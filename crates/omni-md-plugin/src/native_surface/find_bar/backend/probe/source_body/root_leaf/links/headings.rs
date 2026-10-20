@@ -120,11 +120,19 @@ fn verify(rig: &mut Rig) -> Result<(), String> {
         let caret = scene
             .first_rect(NSRange::new(expected, 0))
             .map_err(|cause| cause.to_string())?;
+        // 零范围的公开几何是插入线：原caret_geometry保零宽与真实行高，只有绘制时才加1pt。
+        // 此处严格核原零宽，不把绘制厚度误作字符框；完整范围、可见性与同票CPU门仍分别保留。
         if caret.actual_range != NSRange::new(expected, 0)
+            || !caret.rect.origin.x.is_finite()
+            || !caret.rect.origin.y.is_finite()
+            || !caret.rect.size.height.is_finite()
             || caret.rect.size.height <= 0.0
-            || caret.rect.size.width <= 0.0
+            || caret.rect.size.width != 0.0
         {
-            return Err("标题终点没有原Source零caret的真实行几何".into());
+            return Err(format!(
+                "标题终点没有原Source零caret的真实行几何：stage={stage} expected={expected} actual_range={:?} rect={:?}",
+                caret.actual_range, caret.rect,
+            ));
         }
         drop(scene);
         unchanged(rig)?;
