@@ -1872,6 +1872,13 @@ impl NativeMarkdownHostedTableProbe {
                     .map_err(|_| "实际替换 editor 类型错误")?;
                 let original =
                     step(&current, || probe.field_editor.load())?.ok_or("原替换 editor 已释放")?;
+                // 实际鼠标 tracking 返回后，字段仍声明 currentEditor 不等于窗口仍把键盘交给它。
+                // 只核同一原 Input/Doc/意图下的公开 firstResponder，不补设焦点或重发按钮。
+                let responder = step(&current, || surface.panel.firstResponder())?
+                    .ok_or("查找按钮结束后窗口没有实际输入响应者")?;
+                if std::ptr::from_ref(&*responder).addr() != std::ptr::from_ref(&*actual).addr() {
+                    return Err("查找按钮结束后原替换字段失去真实键盘焦点".into());
+                }
                 let marked = stage <= 3;
                 if !std::ptr::eq(&*actual, &*original)
                     || step(&current, || actual.hasMarkedText())? != marked

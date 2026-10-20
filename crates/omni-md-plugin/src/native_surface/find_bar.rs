@@ -375,6 +375,9 @@ impl NativeMarkdownFindBar {
             };
             button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewNotSizable);
             button.setTag(action as isize);
+            // 与正文工具栏相同，动作按钮不接管查询/替换字段的第一响应者。
+            // 实际鼠标仍交原 NSButton tracking/target；字段的选区和未完成组合继续归原客户。
+            button.setRefusesFirstResponder(true);
             button.setBordered(true);
             button.setFont(Some(&NSFont::systemFontOfSize(12.0)));
             ledger.include_control("find.button", &button)?;
