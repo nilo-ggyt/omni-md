@@ -6,7 +6,9 @@ use crate::native_surface::viewport_pixels::{
 };
 
 /// 与同步SceneUse相同的原事实，但不能把Input或delegate强边保存到后续主队列轮次。
-struct Ticket {
+/// 克隆仍只有弱身份和固定元数据，供本次advance消费Candidate之后核原票的真实换代。
+#[derive(Clone)]
+pub(super) struct Ticket {
     input: Weak<NativeMarkdownPagedInput>,
     delegate: Weak<dyn NativeMarkdownPagedTextViewDelegate>,
     state: NativeMarkdownPagedInputState,
@@ -23,7 +25,7 @@ impl Ticket {
             geometry_epoch: scene.origin.geometry_epoch,
         }
     }
-    fn current(
+    pub(super) fn current(
         &self,
         view: &NativeMarkdownPagedTextView,
         key: &NativeMarkdownPagedSceneKey,
@@ -44,14 +46,48 @@ impl Ticket {
         };
         origin.current(view) && origin.delegate.scene_current(key) && origin.current(view)
     }
+
+    /// 只有客户、完整输入或几何确已换代，旧CPU票的撤权才是正常退休。
+    /// current中的bool还可能来自借用失败、Viewport故障或当前图层关系错误，不能直接
+    /// 把!current当作成功；这里不领取后继Scene，也不让清理后的空serial代替身份事实。
+    pub(super) fn superseded(&self, view: &NativeMarkdownPagedTextView) -> Result<bool> {
+        let ivars = view.ivars();
+        if ivars.geometry_failed.get() {
+            return Ok(false); // 几何计数失败不是一次合法布局换代，原Revoked必须继续交给失败边界。
+        }
+        if ivars.closed.get() || ivars.epoch != self.epoch {
+            return Ok(true);
+        }
+        let same_input = ivars
+            .input
+            .try_borrow()
+            .map_err(|_| NativeMarkdownPagedTextViewError::Busy)?
+            .as_ref()
+            .is_some_and(|input| Weak::ptr_eq(&self.input, &Rc::downgrade(input)));
+        let same_delegate = ivars
+            .delegate
+            .try_borrow()
+            .map_err(|_| NativeMarkdownPagedTextViewError::Busy)?
+            .as_ref()
+            .is_some_and(|delegate| Weak::ptr_eq(&self.delegate, delegate));
+        if !same_input || !same_delegate {
+            return Ok(true); // 只有原槽真的退出/换客户才退休；没有延长旧Input或delegate的强生命期。
+        }
+        let input = self
+            .input
+            .upgrade()
+            .ok_or(NativeMarkdownPagedTextViewError::Revoked)?;
+        let state = input.state()?; // Borrowed/StateChanged/Source等真实输入错误不能被bool撤权吞掉。
+        Ok(state != self.state || ivars.geometry_epoch.get() != self.geometry_epoch)
+    }
 }
 
 pub(super) struct Candidate {
     pub serial: u64,
     pub key: NativeMarkdownPagedSceneKey,
     pub geometry: Geometry,
-    ticket: Ticket,
-    scene: Rc<dyn NativeMarkdownPagedTextScene>,
+    pub(super) ticket: Ticket,
+    pub(super) scene: Rc<dyn NativeMarkdownPagedTextScene>,
     session: Option<Box<dyn NativeMarkdownPagedScenePaintSession>>,
     writable: Option<WritableTile>,
     staging: Box<Staging>,

@@ -374,6 +374,11 @@ impl CpuSurface {
         candidate: candidate::Candidate,
     ) -> Result<()> {
         let serial = candidate.serial;
+        let ticket = candidate.ticket.clone();
+        let key = candidate.key.clone();
+        let scene = Rc::clone(&candidate.scene);
+        // Candidate会移入Pending/Complete或在错误时真正析构；本同步栈仅保原弱票与同一Scene，
+        // 不另持Input/Doc，也不把较新Scene补签给旧绘图。错误分类必须发生在serial清理之前。
         let result = (|| {
             let step = self
                 .steps
@@ -435,7 +440,24 @@ impl CpuSurface {
                 }
             }
         })();
-        if result.is_err() && self.active_serial.get() == Some(serial) {
+        let failed = result.is_err();
+        let result = match result {
+            Err(NativeMarkdownPagedTextViewError::Revoked) => (|| {
+                let current =
+                    || self.active_serial.get() == Some(serial) && ticket.current(view, &key);
+                match scene.validate_ready(&current) {
+                    Ok(()) | Err(NativeMarkdownPagedTextViewError::Revoked) => {}
+                    Err(cause) => return Err(cause),
+                } // 沿原validate_ready保Source首错和实际字体/资源错误；不越过current给旧字体补权。
+                if ticket.superseded(view)? {
+                    Ok(()) // 已接纳的新客户/输入/几何只退休旧候选，不能污染新客户的永久输入失败槽。
+                } else {
+                    Err(NativeMarkdownPagedTextViewError::Revoked)
+                } // 同原完整票的图层/Scene错误仍严格失败；不泛吞scene_current的bool拒绝。
+            })(),
+            other => other,
+        };
+        if failed && self.active_serial.get() == Some(serial) {
             self.cancel_candidate(); // 首错终态，不能下一轮从同失败session继续或重放。
         }
         result
