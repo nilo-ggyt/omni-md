@@ -31,6 +31,8 @@ pub(super) fn sample(stage: &str) -> Result<(), String> {
     let resident = word64(&words, 16);
     let internal = word64(&words, 48);
     let external = word64(&words, 64);
+    // 原REV3快照已包含reusable；只补出这份事实，不为帧采样再查询allocator或改变回收。
+    let reusable = word64(&words, 80);
     let footprint = word64(&words, 144);
     let graphics = word64(&words, 272) as i64;
     // SAFETY: 公开rusage_info_v4只有固定整数/字节字段，零初始化有效；失败后不发布字段。
@@ -56,7 +58,7 @@ pub(super) fn sample(stage: &str) -> Result<(), String> {
     let max_resident =
         u64::try_from(resident_usage.ru_maxrss).map_err(|_| "真实Find RSS峰值不能为负")?;
     println!(
-        "native_body_find memory_stage={stage} resident_bytes={resident} internal_bytes={internal} external_bytes={external} footprint_bytes={footprint} graphics_footprint_bytes={graphics} lifetime_footprint_peak_bytes={} max_resident_bytes={max_resident} isolated=true whole_product=false formal=false",
+        "native_body_find memory_stage={stage} resident_bytes={resident} internal_bytes={internal} external_bytes={external} reusable_bytes={reusable} footprint_bytes={footprint} graphics_footprint_bytes={graphics} lifetime_footprint_peak_bytes={} max_resident_bytes={max_resident} isolated=true whole_product=false formal=false",
         usage.ri_lifetime_max_phys_footprint
     );
     Ok(()) // 诊断只发布真实值；是否严格低于150MB必须由包含全部场景的独立产品验收判断。

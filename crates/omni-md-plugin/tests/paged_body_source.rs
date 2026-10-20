@@ -44,6 +44,12 @@ use omni_md_plugin::native_surface::{
 
 const SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
+unsafe extern "C" {
+    // Darwin公开malloc/malloc.h合同：NULL检查全部zone，goal=0尽力回收，返回实际释放字节。
+    // libc尚未绑定此函数；这里只给严格收尾后的单次诊断使用，不改变生产分配器或帧量子。
+    fn malloc_zone_pressure_relief(zone: *mut libc::malloc_zone_t, goal: usize) -> usize;
+}
+
 #[path = "paged_body_source/fixture.rs"]
 mod fixture;
 use fixture::SourceFixture;
@@ -1203,6 +1209,39 @@ fn main() {
     #[cfg(feature = "native-markdown-runtime-probe")]
     reentry::run(mtm);
     process_memory::sample("source_after_all_actual_releases").unwrap();
+    if matches!(fixture, SourceFixture::Cjk) {
+        // 原大图和后继短图的pool、Doc/Source/FD/worker/font/Native/mmap/pixel门均已结束。
+        // 只在本次CJK收尾诊断一次分配器空闲页；不把它放入排版/绘制热循环，也不循环重试。
+        // 前一条原VM/rusage样本就是before；统计只含公开标量，不保任何业务图或Native客户。
+        // SAFETY: malloc_statistics_t只有公开整数；零初始化是完整可写输出，不创建zone或对象。
+        let mut before: libc::malloc_statistics_t = unsafe { std::mem::zeroed() };
+        // SAFETY: 公开合同允许NULL汇总本进程全部zone，存储在整个同步调用期间有效。
+        unsafe { libc::malloc_zone_statistics(std::ptr::null_mut(), &mut before) };
+        let started = Instant::now();
+        // SAFETY: 原所有项目资源已真实释放，且没有产品借用/分配器回调跨此调用。
+        // NULL与0沿公开合同仅请求本进程尽力回收，不清系统文件缓存或触碰已分配活对象。
+        let released = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+        let elapsed = started.elapsed();
+        // SAFETY: 同一公开结构仍只承接整数输出；调用后再取实际统计，不从返回值推算容量。
+        let mut after: libc::malloc_statistics_t = unsafe { std::mem::zeroed() };
+        // SAFETY: 与before同为原本进程全部zone的顺序快照，不遍历指针、正文或其他进程。
+        unsafe { libc::malloc_zone_statistics(std::ptr::null_mut(), &mut after) };
+        process_memory::sample("source_after_allocator_relief").unwrap();
+        // 全部测量先完成再格式化日志；返回0同样是有效观察，不改历史RSS/lifetime峰值。
+        // 即使当前RSS下降也不表示整产品通过，更不能用这个事后步骤覆盖早先超额峰值。
+        println!(
+            "native_allocator_pressure_relief stage=source_after_all_actual_releases released_bytes={released} elapsed_ms={:.3} before_blocks_in_use={} before_size_in_use_bytes={} before_max_size_in_use_bytes={} before_size_allocated_bytes={} after_blocks_in_use={} after_size_in_use_bytes={} after_max_size_in_use_bytes={} after_size_allocated_bytes={} scope=sequential_all_zone_snapshots whole_product_budget_pass=false formal=false",
+            elapsed.as_secs_f64() * 1000.0,
+            before.blocks_in_use,
+            before.size_in_use,
+            before.max_size_in_use,
+            before.size_allocated,
+            after.blocks_in_use,
+            after.size_in_use,
+            after.max_size_in_use,
+            after.size_allocated,
+        );
+    }
     if matches!(fixture, SourceFixture::Ascii) {
         // 独立短协议与首帧前 Pending 各自拥有真实 Body；原四 MiB 图已严格释放。
         // cjk 入口仍保完整长文流程，不重复跑同一固定短协议或要求任何输入法操作。

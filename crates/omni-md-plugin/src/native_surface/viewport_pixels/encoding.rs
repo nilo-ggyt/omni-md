@@ -621,6 +621,17 @@ fn finish_prepared_inner(
             }
         }
     }
+    // 本区的目标字节已经完整写入独立映射，后续颜色空间/provider/image只消费新页。
+    // 先归还不再读取的原RGBA，避免其最后强边跨Native封存保活；分区若仍需后续行，
+    // 原计划自己的Arc继续保留同一输入页，不能在这里声称它已销毁或改写实际页账。
+    drop(original);
+    if allocation
+        .counters
+        .pixel_release_failed
+        .load(Ordering::Acquire)
+    {
+        return Err(PixelError::Backend("原RGBA像素页未能真实归还"));
+    } // 实际释放失败先终止，不创建新Native图掩盖原资源首错或重放已经完成的像素编码。
     let (image, format) = if presentation == PixelPresentation::OpaqueNeutralMask {
         (
             seal_neutral_mask(&allocation, image_width, image_height, encoded_row)?,
@@ -676,14 +687,14 @@ fn finish_prepared_inner(
         encoded_row,
         format,
     )?;
-    drop(original); // 原RGBA真实munmap后只剩当前无损表示；没有留下隐藏的原帧副本。
+    // Native封存期间其它原provider仍可真正退还；保留原出口检查，不让前置释放检查替代后置首错。
     if allocation
         .counters
         .pixel_release_failed
         .load(Ordering::Acquire)
     {
         return Err(PixelError::Backend("原RGBA像素页未能真实归还"));
-    } // 真实清理失败必须拒收，不能因新表示已完成就把旧泄漏页从收据中抹掉。
+    }
     Ok(EncodedImage {
         image,
         secondary_image: None,
@@ -768,6 +779,16 @@ fn rgb24(
             to.copy_from_slice(&pixel[..3]); // 唯一省略的是已完整证明恒为255的alpha，不改变任一RGB bit。
         }
     }
+    // RGB三通道已逐byte复制完成，颜色空间和CGImage不再访问原RGBA。
+    // 仅提前释放这一个有限工作格的原Arc；原32MiB预算及真实munmap收据仍由分配owner维护。
+    drop(original);
+    if allocation
+        .counters
+        .pixel_release_failed
+        .load(Ordering::Acquire)
+    {
+        return Err(PixelError::Backend("原RGB24编码后的RGBA页未能真实归还"));
+    }
     // SAFETY: 原sRGB常量静态有效，RGB24与原RGBA使用完全相同的真实颜色空间。
     let color = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))
         .ok_or(PixelError::Backend("无法建立原RGB24的sRGB空间"))?;
@@ -789,7 +810,7 @@ fn rgb24(
         encoded_row,
         Format::Rgb24,
     )?;
-    drop(original); // seal实际mprotect并由独立provider接管后，原RGBA最后Arc才在这里归还。
+    // 与原实现相同，封存后的归还首错仍须核验；前移原RGBA只缩短所有权，不缩减资源门槛。
     if storage.release_failed() {
         return Err(PixelError::Backend("原RGB24编码后的RGBA页未能真实归还"));
     }
