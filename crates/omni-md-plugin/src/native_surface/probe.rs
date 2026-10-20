@@ -2051,11 +2051,12 @@ fn verify_unmounted_native_markdown_model_release(
 ) -> Result<(), String> {
     let document = MarkdownDocumentBuffer::open(path, 2 * 1_024 * 1_024)
         .map_err(|error| format!("failed to open storage countertest fixture: {error}"))?;
-    let (cohort, document_weak, storage_weak) = autoreleasepool(|_| {
+    let (cohort, document_weak, storage_weak) = autoreleasepool(|_| -> Result<_, String> {
         let model = NativeMarkdownTextModel::new(document);
         let document_weak = Rc::downgrade(&model.document);
         // 单独申请旧后端适配器，模型本身不会隐式建立TextKit图或第二canonical根。
-        let storage = PieceBackedMarkdownTextStorage::new(Rc::clone(model.document()), mtm);
+        let storage = PieceBackedMarkdownTextStorage::new(Rc::clone(model.document()), mtm)
+            .map_err(|cause| cause.to_string())?;
         let storage_weak = Weak::from_retained(&storage);
         let mut cohort = NativeMarkdownDeallocationCohort::new(mtm);
         cohort.track(&storage, mtm);
@@ -2063,8 +2064,8 @@ fn verify_unmounted_native_markdown_model_release(
         // 先归还明确的Native owner，再归还文稿根；没有view/manager/事件可替它们续命。
         drop(storage);
         drop(model);
-        (cohort, document_weak, storage_weak)
-    });
+        Ok((cohort, document_weak, storage_weak))
+    })?;
     if document_weak.upgrade().is_some() || storage_weak.load().is_some() || !cohort.has_completed()
     {
         // Construction alone must not create a persistent native/storage or canonical ownership cycle.

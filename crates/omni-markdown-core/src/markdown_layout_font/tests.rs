@@ -201,6 +201,119 @@ fn bound_point_size_keeps_old_scale_contract_and_rejects_a_different_size() {
 }
 
 #[test]
+fn derived_face_keeps_real_shaping_and_independent_payload_release() {
+    use crate::{
+        MarkdownDocumentBuffer, MarkdownLayoutTextSource, MarkdownShapingBudget,
+        MarkdownShapingDirection, MarkdownShapingJob, MarkdownShapingOptions,
+        MarkdownShapingStatus,
+    };
+
+    // 冻结真实上游字体并打开独立正文；本测试只写隔离目录，不借平台字体或用户笔记。
+    let directory = tempfile::tempdir().unwrap();
+    let font_path = directory.path().join("font.ttf");
+    let document_path = directory.path().join("source.md");
+    std::fs::write(&font_path, ROBOTO).unwrap();
+    std::fs::write(&document_path, "office AVA a\u{301} fi").unwrap();
+    let frozen = MarkdownLayoutFontBytes::capture_file(&font_path, ROBOTO.len() as u64).unwrap();
+    let mapping = frozen.resource_observer();
+    let name = tables(ROBOTO).remove(b"name").unwrap();
+    let original =
+        MarkdownLayoutFont::resolve_name_table_at_size(frozen.blob(), &name, &[], 14.0).unwrap();
+    let original_drop = original.resource_observer();
+    let document = MarkdownDocumentBuffer::open(&document_path, 65_536).unwrap();
+    let source = MarkdownLayoutTextSource::capture(&document);
+    let source_authority = source.authority();
+
+    // 走公开 Job 完整输入和整形；比较字号绑定后的实际 glyph/cluster/advance，
+    // 不读取底层缓存地址、不伪造推进表，也不以派生次数当性能通过的证据。
+    let shape = |font: &MarkdownLayoutFont, points: f32| {
+        let authority = font.authority();
+        let mut job = MarkdownShapingJob::new(
+            source.clone(),
+            &source_authority,
+            font.clone(),
+            &authority,
+            0..source.utf16_len(),
+            MarkdownShapingOptions {
+                direction: MarkdownShapingDirection::LeftToRight,
+                script: *b"Latn",
+                language: Some("en".into()),
+                points,
+                beginning_of_text: true,
+                end_of_text: true,
+                features: Vec::new(),
+            },
+        )
+        .unwrap();
+        let resources = job.resource_observer();
+        while job.status() == MarkdownShapingStatus::Ingesting {
+            job.step(
+                &source_authority,
+                &authority,
+                MarkdownShapingBudget::default(),
+            )
+            .unwrap();
+        }
+        job.shape(&source_authority, &authority).unwrap();
+        let count = job.profile().unwrap().glyph_count;
+        let result: Vec<_> = (0..count)
+            .map(|index| {
+                job.glyph(&source_authority, &authority, index)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        assert!(!result.is_empty());
+        drop(job);
+        // Source 和 Font 仍归本用例合法持有；这里只结算已经结束 Job 的实际存储。
+        let closed = resources.snapshot();
+        assert_eq!(
+            (
+                closed.work_bytes,
+                closed.files_open,
+                closed.mappings_open,
+                closed.mapped_bytes
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(closed.files_created, closed.files_closed);
+        assert_eq!(closed.mappings_created, closed.mappings_released);
+        assert!(!closed.cleanup_failed && closed.first_error.is_none());
+        result
+    };
+    let _ = shape(&original, 14.0); // 真实使用原 face 后再派生，不只覆盖未初始化的字体。
+    for points in [0.1, 14.0, 32.0] {
+        let derived = original
+            .derive_name_table_at_size(&name, &[], points)
+            .unwrap();
+        let full =
+            MarkdownLayoutFont::resolve_name_table_at_size(frozen.blob(), &name, &[], points)
+                .unwrap();
+        assert!(!derived.permits(&original.authority()));
+        assert_eq!(shape(&derived, points as f32), shape(&full, points as f32));
+        let released = derived.resource_observer();
+        drop(derived);
+        assert!(released.payload_released()); // 派生缓存共享不会反向保活它的独立权限 owner。
+    }
+
+    // 原 payload 可先结束；派生 face 继续独立完成真实整形，最后一条字节强边结束才 munmap。
+    let surviving = original
+        .derive_name_table_at_size(&name, &[], 32.0)
+        .unwrap();
+    let expected = shape(&surviving, 32.0);
+    drop(original);
+    assert!(original_drop.payload_released());
+    drop(frozen);
+    assert!(!mapping.mapping_drop_completed());
+    assert_eq!(shape(&surviving, 32.0), expected);
+    drop(surviving);
+    assert!(mapping.mapping_drop_completed());
+    assert!(mapping.unmap_succeeded());
+    assert_eq!(mapping.mapped_bytes(), 0);
+    assert!(!mapping.failed());
+}
+
+#[test]
 fn incomplete_or_unrepresentable_horizontal_metrics_reject_the_entire_font_capture() {
     let name = tables(ROBOTO).remove(b"name").unwrap();
     let original = MarkdownLayoutFont::resolve(bytes(ROBOTO), NAME, &[]).unwrap();
@@ -281,12 +394,26 @@ fn native_name_table_matches_complete_unique_face_without_resolving_ui_aliases()
         (1, 2)
     );
     assert!(second.metadata().postscript_name.starts_with('X'));
+    // 同一 TTC 的不同完整表不能借原 face 的派生入口；正确 face 仍可独立派生新字号。
+    assert!(matches!(
+        second.derive_name_table_at_size(&name, &[], 18.0),
+        Err(MarkdownLayoutFontError::PostScriptNotFound)
+    ));
+    let derived = second
+        .derive_name_table_at_size(&second_name, &[], 18.0)
+        .unwrap();
+    assert_eq!(derived.metadata(), second.metadata());
+    assert!(!derived.permits(&second.authority()));
     let mut altered = name.clone();
     let last = altered.len() - 1;
     altered[last] ^= 1;
     for candidate in [&altered[..], &name[..name.len() - 1]] {
         assert!(matches!(
             MarkdownLayoutFont::resolve_name_table(bytes(ROBOTO), candidate, &[]),
+            Err(MarkdownLayoutFontError::PostScriptNotFound)
+        ));
+        assert!(matches!(
+            font.derive_name_table_at_size(candidate, &[], 18.0),
             Err(MarkdownLayoutFontError::PostScriptNotFound)
         ));
     } // 全表任意字节不同和截短表都不能借PSName前缀补签原face。
@@ -308,6 +435,20 @@ fn native_name_table_keeps_axis_validation_and_uses_explicit_actual_coordinates(
     let font = MarkdownLayoutFont::resolve_name_table(bytes(&variable), &name, &[axis]).unwrap();
     assert_eq!(font.metadata().axes, vec![axis]);
     assert_eq!(font.metadata().named_instance, None); // 来源是base face加真实Native轴位，不假造命名实例索引。
+    let derived = font
+        .derive_name_table_at_size(
+            &name,
+            &[MarkdownLayoutFontAxis {
+                value: 700.0,
+                ..axis
+            }],
+            18.0,
+        )
+        .unwrap();
+    assert_eq!(derived.metadata().axes[0].value, 700.0);
+    derived
+        .verify_design_coordinates(&[(*b"wght", 700.0)])
+        .unwrap();
     for (axes, expected) in [
         (vec![axis, axis], "duplicate"),
         (
@@ -328,8 +469,18 @@ fn native_name_table_keeps_axis_validation_and_uses_explicit_actual_coordinates(
         let error = MarkdownLayoutFont::resolve_name_table(bytes(&variable), &name, &axes)
             .err()
             .unwrap();
+        let derived_error = font
+            .derive_name_table_at_size(&name, &axes, 18.0)
+            .err()
+            .unwrap();
         assert!(matches!(
             (expected, error),
+            ("duplicate", MarkdownLayoutFontError::DuplicateAxis)
+                | ("range", MarkdownLayoutFontError::InvalidAxisValue)
+                | ("unknown", MarkdownLayoutFontError::UnknownAxis)
+        ));
+        assert!(matches!(
+            (expected, derived_error),
             ("duplicate", MarkdownLayoutFontError::DuplicateAxis)
                 | ("range", MarkdownLayoutFontError::InvalidAxisValue)
                 | ("unknown", MarkdownLayoutFontError::UnknownAxis)
@@ -373,6 +524,21 @@ fn named_instance_coordinates_are_real_and_explicit_axes_are_not_clamped() {
     let explicit =
         MarkdownLayoutFont::resolve(Arc::clone(&value), "Roboto-Medium", &[axis]).unwrap();
     assert_eq!(explicit.metadata().axes, [axis]);
+    // 命名实例派生新轴时只保原 face，名称恢复为同完整 name 表解析得到的基础 PSName。
+    // 不能把旧 Roboto-Medium 标签留给新轴，也不能沿原 named_instance 隐式补回500。
+    let name = tables(&named_variable()).remove(b"name").unwrap();
+    let derived = named
+        .derive_name_table_at_size(&name, &[axis], 18.0)
+        .unwrap();
+    let resolved =
+        MarkdownLayoutFont::resolve_name_table_at_size(Arc::clone(&value), &name, &[axis], 18.0)
+            .unwrap();
+    assert_eq!(derived.metadata(), resolved.metadata());
+    assert_eq!(derived.metadata().postscript_name, NAME);
+    assert!(!derived.permits(&named.authority()));
+    derived
+        .verify_design_coordinates(&[(*b"wght", f64::from(axis.value))])
+        .unwrap();
     assert_ne!(
         named.font().normalized_coords(),
         explicit.font().normalized_coords()

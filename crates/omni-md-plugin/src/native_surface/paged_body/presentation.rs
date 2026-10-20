@@ -119,7 +119,8 @@ impl NativeMarkdownPagedBody {
                 .expect("活动正文持唯一基础字体")
                 .clone();
             let typography = (mode == MarkdownPresentationMode::InlinePreview)
-                .then(|| semantics::Typography::new(base.native().native_font()));
+                .then(|| semantics::Typography::new(base.native().native_font()))
+                .transpose()?;
             if !original() {
                 return Err(ViewError::Revoked.into());
             }

@@ -8,7 +8,27 @@ use read_fonts::types::{BigEndian, Fixed};
 use read_fonts::FontData;
 
 use crate::LayoutData;
-use crate::{buffer::Buffer, plan::ShapePlan, Scale};
+use crate::{buffer::Buffer, plan::ShapePlan, Direction, Scale};
+
+/// 查询与实际定位共用的原 tracking 值；这里只读同一 Font 的表与尺度，不修改字形。
+/// 平台 metrics 桥须扣除这一精确值，再由原定位阶段按 GCB 加回，不能另写插值器。
+pub(crate) fn advance(
+    layout: LayoutData<'_>,
+    scale: Scale,
+    point_size: Option<f32>,
+    direction: Direction,
+) -> Option<i32> {
+    let trak = layout.aat.trak.as_ref()?;
+    let mut ptem = point_size.unwrap_or(0.0);
+    if ptem <= 0.0 {
+        ptem = 12.0; // 与原 CoreText 默认字号路径保持一致，不把 None 当作禁用 tracking。
+    }
+    Some(if direction.is_horizontal() {
+        scale.scale_x_f(trak.get_h_tracking(ptem, 0.0))
+    } else {
+        scale.scale_y_f(trak.get_v_tracking(ptem, 0.0))
+    })
+}
 
 pub fn apply(
     _plan: &ShapePlan,
@@ -17,21 +37,12 @@ pub fn apply(
     point_size: Option<f32>,
     buffer: &mut Buffer,
 ) -> Option<()> {
-    let trak = layout.aat.trak.as_ref()?;
-    let mut ptem = point_size.unwrap_or(0.0);
-    if ptem <= 0.0 {
-        ptem = 12.0; // CoreText fallback
-    }
-
+    // 仍先验证原表存在；没有 tracking 表时不改变 buffer 的 position 状态。
+    layout.aat.trak.as_ref()?;
     if !buffer.have_positions {
         buffer.clear_positions();
     }
-
-    let advance_to_add = if buffer.direction.is_horizontal() {
-        scale.scale_x_f(trak.get_h_tracking(ptem, 0.0))
-    } else {
-        scale.scale_y_f(trak.get_v_tracking(ptem, 0.0))
-    };
+    let advance_to_add = advance(layout, scale, point_size, buffer.direction)?;
 
     foreach_grapheme!(buffer, start, end, {
         if buffer.direction.is_horizontal() {

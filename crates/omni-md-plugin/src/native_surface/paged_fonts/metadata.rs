@@ -73,17 +73,31 @@ impl Metadata {
     }
 }
 
-/// 位图彩色字体的实际推进由平台字体实例决定，不能以文件hmtx的em缩放代替。
+/// 彩色字体与含默认 tracking 的轮廓字体，其实际推进由原平台实例决定。
+/// 文稿字体不能套用文件的 UI tracking 默认策略，也不能只按 hmtx 的 em 缩放替代。
 /// 这里只捕获与原Font同寿命的固定glyph域元数据；不接收文本、Source或排版结果。
 pub(super) fn horizontal_advances(
     font: &CTFont,
+    graphics: &CGFont,
     glyph_count: usize,
     current: &(impl Fn() -> bool + ?Sized),
 ) -> Result<Option<Box<[f64]>>> {
     // SAFETY: 调用方在原主线程持有此不可变CTFont；只读取实际trait，不按名称猜字体种类。
     let traits = step(current, || unsafe { font.symbolic_traits() })?;
     if !traits.contains(CTFontSymbolicTraits::TraitColorGlyphs) {
-        return Ok(None); // 普通轮廓字体继续由原文件与变体表提供真实度量。
+        // 只对原实际 CGFont 同时提供 STAT/trak 的轮廓 face 建完整平台表；这与原
+        // HarfRust 默认 tracking 准入一致。没有这些表的普通字体继续原文件/变体路径，
+        // 不为每个字体增加无收益的全 glyph 复制，也不按名称、UI role 或正文字符猜测。
+        for tag in [*b"STAT", *b"trak"] {
+            let table = step(current, || {
+                CGFont::table_for_tag(Some(graphics), u32::from_be_bytes(tag))
+            })?;
+            let present = table.is_some();
+            step(current, || drop(table))?; // 临时表的 Native 强边在逐 glyph 读取前归还。
+            if !present {
+                return Ok(None);
+            }
+        }
     }
     let count = glyph_count;
     if !(1..=usize::from(u16::MAX) + 1).contains(&count) {
@@ -130,6 +144,138 @@ pub(super) fn name_bytes(data: &CFData) -> Result<&[u8]> {
     // SAFETY: CopyTable的不可变CFData保活完整count字节；上方已核有限长度和非空指针，
     // 返回slice生命周期受data借用约束，不允许跨其实际CFRelease保存裸地址。
     Ok(unsafe { std::slice::from_raw_parts(pointer, count) })
+}
+
+/// 把原系统字体的真实 CG 实例用于文稿，不把 UI usage 描述符带入正文级联。
+/// 这只创建尚未发布的不可变字体；没有 Source、输入权限、正文或全局资源注册。
+pub(super) fn document_instance(font: &CTFont) -> Result<CFRetained<CTFont>> {
+    // SAFETY: 调用者保活原 NSFont/CTFont，公开 getter 的返回值均由当前栈独占接管。
+    let (graphics, points, matrix, traits) = unsafe {
+        (
+            font.graphics_font(std::ptr::null_mut()),
+            font.size(),
+            font.matrix(),
+            font.symbolic_traits(),
+        )
+    };
+    if !points.is_finite() || points <= 0.0 {
+        return Err(Error::MetadataUnavailable);
+    }
+    // SAFETY: 原 CGFont 强边贯穿构造，matrix 是本栈完整 Copy 值；None 明确不传 UI descriptor。
+    // 每个实际字号/字重先由 AppKit 原工厂决定，本层不按名字匹配或继承别的字号光学轴。
+    let document = unsafe { CTFont::with_graphics_font(&graphics, points, &matrix, None) };
+    // SAFETY: 新字体为上方真实 +1 结果；取得自己的 CG 实例只用于有限来源后验。
+    let document_graphics = unsafe { document.graphics_font(std::ptr::null_mut()) };
+    let name = CGFont::table_for_tag(Some(&graphics), u32::from_be_bytes(*b"name"))
+        .ok_or(Error::MetadataUnavailable)?;
+    let document_name =
+        CGFont::table_for_tag(Some(&document_graphics), u32::from_be_bytes(*b"name"))
+            .ok_or(Error::MetadataUnavailable)?;
+    // 原 UI 包装与文稿实例的 CGFont CFEqual 可以为 false；完整名称表、真实 glyph 域、
+    // units 与原轴/矩阵才是此处应核的实际轮廓事实，不能假称两个包装对象相同。
+    if name_bytes(&name)? != name_bytes(&document_name)?
+        || CGFont::number_of_glyphs(Some(&graphics))
+            != CGFont::number_of_glyphs(Some(&document_graphics))
+        || CGFont::units_per_em(Some(&graphics)) != CGFont::units_per_em(Some(&document_graphics))
+    {
+        return Err(Error::GraphicsSourceMismatch);
+    }
+    // 此纯字体构造尚无 Source/事件票；沿既有有界读取复用完整轴与 file URL 校验，
+    // 临时字典/URL 全归本调用释放，不创建假请求，也不读取或冻结任何文稿文件。
+    if read_axes(font, &|| true)? != read_axes(&document, &|| true)? {
+        return Err(Error::GraphicsSourceMismatch);
+    }
+    let original_path = file_path(font, &|| true)?;
+    let document_path = file_path(&document, &|| true)?.ok_or(Error::FileSourceUnavailable)?;
+    if original_path.is_some_and(|original| original != document_path) {
+        return Err(Error::GraphicsSourceMismatch);
+    }
+    // SAFETY: 两个不可变对象仍由本栈强持；只核公开标量，不触发布局或访问正文。
+    let (actual_points, actual_matrix, actual_traits, units, actual_units) = unsafe {
+        (
+            document.size(),
+            document.matrix(),
+            document.symbolic_traits(),
+            font.units_per_em(),
+            document.units_per_em(),
+        )
+    };
+    let semantics = CTFontSymbolicTraits::TraitBold
+        | CTFontSymbolicTraits::TraitItalic
+        | CTFontSymbolicTraits::TraitMonoSpace;
+    if actual_points != points
+        || actual_matrix != matrix
+        || units != actual_units
+        || (traits & semantics) != (actual_traits & semantics)
+    {
+        return Err(Error::GraphicsSourceMismatch);
+    }
+    Ok(document) // 返回唯一新字体强边；原图形、名称表、轴字典和 URL 已随栈归还。
+}
+
+/// 样式转换可以换同 family 的真实 italic face，但不能丢字重、等宽或原矩阵。
+/// 缩字号允许平台重算 optical axis；不是用旧 UIFont 的隐藏轴补写新文稿实例。
+pub(super) fn require_derived_style(
+    original: &CTFont,
+    derived: &CTFont,
+    points: f64,
+    italic: bool,
+) -> Result<()> {
+    // SAFETY: 调用方在原主线程同时保活两个不可变字体；这里只读取有限公开事实。
+    let (
+        family,
+        derived_family,
+        before_points,
+        actual_points,
+        matrix,
+        actual_matrix,
+        before,
+        after,
+    ) = unsafe {
+        (
+            original.family_name(),
+            derived.family_name(),
+            original.size(),
+            derived.size(),
+            original.matrix(),
+            derived.matrix(),
+            original.symbolic_traits(),
+            derived.symbolic_traits(),
+        )
+    };
+    let unchanged = CTFontSymbolicTraits::TraitBold
+        | CTFontSymbolicTraits::TraitMonoSpace
+        | CTFontSymbolicTraits::TraitExpanded
+        | CTFontSymbolicTraits::TraitCondensed;
+    let expected_italic = italic || before.contains(CTFontSymbolicTraits::TraitItalic);
+    if *family != *derived_family
+        || !points.is_finite()
+        || points <= 0.0
+        || actual_points != points
+        || matrix != actual_matrix
+        || (before & unchanged) != (after & unchanged)
+        || after.contains(CTFontSymbolicTraits::TraitItalic) != expected_italic
+    {
+        return Err(Error::GraphicsSourceMismatch);
+    }
+    // 新 italic face 可以额外声明 YAXS 等轴；原 wght/wdth/其他已指定轴必须仍保持。
+    // 只有本次请求修改的 italic/slant 与缩字号时的 optical size 不作原数值相等要求。
+    let original_axes = read_axes(original, &|| true)?;
+    let actual_axes = read_axes(derived, &|| true)?;
+    for (tag, value) in original_axes {
+        if (italic && matches!(&tag, b"ital" | b"slnt"))
+            || (points != before_points && tag == *b"opsz")
+        {
+            continue;
+        }
+        if !actual_axes
+            .iter()
+            .any(|(actual_tag, actual)| *actual_tag == tag && *actual == value)
+        {
+            return Err(Error::GraphicsSourceMismatch);
+        }
+    }
+    Ok(()) // family 与轴的 Copy 强边只属于这次后验，不进入 palette、Source 或全局缓存。
 }
 
 fn string(value: &CFString, current: &(impl Fn() -> bool + ?Sized)) -> Result<String> {

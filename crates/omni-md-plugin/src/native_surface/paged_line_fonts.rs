@@ -26,6 +26,8 @@ pub enum NativeMarkdownLineFontError {
     FontMismatch,
     #[error("原生字体没有提供所需的粗体、斜体或等宽特征")]
     StyleUnavailable,
+    #[error("无法保留原系统字体的实际文稿实例：{0}")]
+    DocumentInstance(#[from] super::paged_fonts::NativeMarkdownPagedFontError),
     #[error("无法注册原Core字体：{0}")]
     Registration(#[from] MarkdownLineComposeError),
     #[error("无法读取原Native字体度量：{0}")]

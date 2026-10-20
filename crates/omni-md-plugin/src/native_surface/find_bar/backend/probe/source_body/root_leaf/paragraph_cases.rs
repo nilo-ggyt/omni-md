@@ -543,20 +543,19 @@ fn run_case(mtm: MainThreadMarker, name: &str, source: &str) -> Result<Option<St
     let candidate = result?;
     let mut differences = Vec::new();
     // 候选已严格关闭；完整旧 TextKit 图先确定真实软行，再归还其全部 owner。
-    let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+    let font = crate::native_surface::text_attributes::native_markdown_document_fixed_font(14.0)
+        .map_err(|cause| cause.to_string())?;
     let original =
         super::paragraph_oracle::measure(source, candidate.width, &font, &candidate.parts)?;
     if !candidate.parts.is_empty() {
         // 原 TextKit 真实行内已采字形边缘；这里只合计纯值，不再用 CTLine 的另一套 CJK 行末宽。
-        // 这个值用于观察平台排版政策，不是 OpenType 引擎的正确性期望：系统 UIFont 会把
-        // 中文标点替为半宽字形并按上下文分配间距，空 feature 的真实 OpenType 整形没有这项默认行为。
-        // 本轮差异所涉的 14pt 片段已用同字体表、face、轴、尺度和原上下文的独立 HarfBuzz
-        // 逐项核过实际 glyph、cluster、advance 与 offset；未将此结论外推到其他字体和轴。
-        // 不能用跨引擎总宽相等代替该证明，也不能为追平它补固定像素。
+        // 两边现在使用同一公开文稿角色；旧 UI 专用字体的半宽默认策略不再属于本产品对照。
+        // 仍保留逐 part 的实际推进观察，不能用整行总宽相等替代来源、字形和局部几何证明，
+        // 也不能为了追平平台结果改 glyph 或补固定像素。
         let expected = super::paragraph_oracle::part_advances(source, &original, &candidate.parts)?;
         for (part, expected) in candidate.parts.iter().zip(expected) {
             eprintln!(
-                "native_paragraph_advance_observation case={name} source={:?} actual_26_6={} textkit_26_6={expected} identical={} actual_policy=opentype_default reference_policy=coretext_contextual",
+                "native_paragraph_advance_observation case={name} source={:?} actual_26_6={} textkit_26_6={expected} identical={} actual_policy=opentype_default reference_policy=coretext_document_default",
                 part.source,
                 part.advance_26_6,
                 part.advance_26_6 == expected,

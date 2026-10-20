@@ -124,6 +124,20 @@ impl<'a, 'f> ShaperFont<'a, 'f> {
         self.scale
     }
 
+    /// 返回原字体默认定位会按 GCB 加入的 tracking，单位为本 ShaperFont 的实际尺度。
+    /// 与执行共用同一个 STAT/trak 准入、字号插值和轴实例；不包含 kern、GPOS 或字形替换。
+    /// 平台名义推进已包含自身 tracking 策略时，可在 metrics 桥扣除此值，让原定位只加一次。
+    pub fn default_tracking_advance(
+        &self,
+        direction: crate::Direction,
+        point_size: Option<f32>,
+    ) -> i32 {
+        if !self.apply_trak || direction == crate::Direction::Invalid {
+            return 0;
+        }
+        crate::aat::trak::advance(self.layout(), self.scale, point_size, direction).unwrap_or(0)
+    }
+
     /// Returns the name stored for a glyph in the font, if any.
     pub fn glyph_name(&self, glyph: GlyphId) -> Option<GlyphName> {
         self.font.glyph_name(glyph)

@@ -302,20 +302,19 @@ fn main() {
         registered_line_font_case(mtm);
         #[cfg(feature = "native-paged-compose-probe")]
         paragraph_style_case(mtm);
-        // 正式正文palette使用系统/粗体/等宽face；不能只用Helvetica oracle通过后假定这些face可捕获。
+        // 任意 UI 字体仍独立验证真实来源捕获、轴派生和归还；这不是正式文稿字体的排版支持承诺。
+        // 生产文稿角色的默认 glyph/advance 严格对照由下方 punctuation 完整上下文用例承担。
         for (label, font) in [
-            ("body_system", NSFont::systemFontOfSize(15.0)),
-            ("body_bold", NSFont::boldSystemFontOfSize(15.0)),
+            ("interface_system", NSFont::systemFontOfSize(15.0)),
+            ("interface_bold", NSFont::boldSystemFontOfSize(15.0)),
             (
-                "source_monospace",
+                "interface_monospace",
                 NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0),
             ),
         ] {
             let core: &CTFont = font.as_ref();
             let actual = NativeMarkdownPagedFont::capture(core, MAXIMUM_FONT_BYTES, mtm, &|| true)
-                .unwrap_or_else(|error| {
-                    panic!("正式palette字体{label}的真实来源捕获失败：{error:?}")
-                });
+                .unwrap_or_else(|error| panic!("UI字体{label}的真实来源捕获机制失败：{error:?}"));
             let bytes = actual.bytes_observer();
             let metrics = capture_paged_font_metrics(&actual, &|| true).unwrap();
             assert!(metrics.values_for(&actual).unwrap().ascent > 0.0);
@@ -344,7 +343,7 @@ fn main() {
                 500.0
             );
             println!(
-                "native_paged_font_palette case={label} source={} exact_metrics=true",
+                "native_paged_font_ui_mechanism case={label} source={} exact_metrics=true document_shaping_parity_claimed=false",
                 actual.source_face_postscript()
             );
             drop(actual);

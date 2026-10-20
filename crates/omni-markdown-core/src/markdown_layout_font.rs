@@ -217,8 +217,67 @@ impl MarkdownLayoutFont {
     ) -> Result<Self> {
         positioning::validate_points(points)?;
         let (font, metadata) = resolve::resolve_name_table(bytes, native_name_table, axes)?;
-        let horizontal_advances =
-            horizontal::HorizontalAdvances::new(points, metadata.glyph_count, horizontal_advances)?;
+        let horizontal_advances = horizontal::HorizontalAdvances::new(
+            &font,
+            points,
+            metadata.glyph_count,
+            horizontal_advances,
+        )?;
+        Ok(Self(Arc::new(Payload {
+            font,
+            metadata,
+            positioning_points: Some(points),
+            horizontal_advances: Some(horizontal_advances),
+            dropped: PayloadDrop(Arc::new(AtomicBool::new(false))),
+        })))
+    }
+
+    /// 从本实例的同一冻结来源派生新字号与轴位；必须匹配原 face 的完整 Native 名称表。
+    /// 底层只读 face 与布局缓存共享，新 payload、字体权限和字号绑定仍各自独立。
+    ///
+    /// # Errors
+    /// 外来或截短名称表、无效字号及重复、未知、越界轴均拒绝；不改用另一 face。
+    pub fn derive_name_table_at_size(
+        &self,
+        native_name_table: &[u8],
+        axes: &[MarkdownLayoutFontAxis],
+        points: f64,
+    ) -> Result<Self> {
+        positioning::validate_points(points)?;
+        let (font, metadata) =
+            resolve::derive_name_table(&self.0.font, &self.0.metadata, native_name_table, axes)?;
+        // 平台推进属于旧实例的真实字号；普通派生绝不继承旧表或它的度量权限。
+        Ok(Self(Arc::new(Payload {
+            font,
+            metadata,
+            positioning_points: Some(points),
+            horizontal_advances: None,
+            dropped: PayloadDrop(Arc::new(AtomicBool::new(false))),
+        })))
+    }
+
+    /// 派生同 face 时安装本次实际 Native 字号的完整推进表；旧表不会被共享或复用。
+    /// 表仍按真实 glyph 域校验并独占归新 payload，底层 face 数据保持原不可变来源。
+    ///
+    /// # Errors
+    /// 名称表、轴位、字号或任一真实推进不满足原捕获契约时拒绝整个新实例。
+    pub fn derive_name_table_at_size_with_horizontal_advances(
+        &self,
+        native_name_table: &[u8],
+        axes: &[MarkdownLayoutFontAxis],
+        points: f64,
+        horizontal_advances: Box<[f64]>,
+    ) -> Result<Self> {
+        positioning::validate_points(points)?;
+        let (font, metadata) =
+            resolve::derive_name_table(&self.0.font, &self.0.metadata, native_name_table, axes)?;
+        let horizontal_advances = horizontal::HorizontalAdvances::new(
+            &font,
+            points,
+            metadata.glyph_count,
+            horizontal_advances,
+        )?;
+        // 新表转换失败只归还候选；原实例、原权限与它已发布的字形不受影响。
         Ok(Self(Arc::new(Payload {
             font,
             metadata,

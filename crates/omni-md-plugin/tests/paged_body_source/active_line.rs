@@ -431,7 +431,8 @@ pub(super) fn eof(mtm: MainThreadMarker) {
         let bounds = NSRect::new(NSPoint::ZERO, NSSize::new(640.0, 240.0));
         let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), bounds);
         scroll.setHasVerticalScroller(true);
-        let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+        let font = native_markdown_document_fixed_font(14.0)
+            .expect("实际活动行控制必须取得生产文稿等宽字体");
         let paragraph = NSParagraphStyle::defaultParagraphStyle();
         let body = NativeMarkdownPagedBody::attach(
             document,

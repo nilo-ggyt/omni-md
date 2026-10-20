@@ -348,7 +348,8 @@ impl NativeMarkdownTextKitBackend {
         // 具体后端只登记其Native局部收据；身份先进入Session总预算，原映射另归外层文稿。
         let owned_ledger = Rc::new(NativeMarkdownOwnedLedger::for_editor(resource_root));
         // 弱适配器明确归旧后端；构造纯模型、PagedInput或新视图均不会触发TextKit。
-        let text_storage = PieceBackedMarkdownTextStorage::new(Rc::clone(document), mtm);
+        let text_storage = PieceBackedMarkdownTextStorage::new(Rc::clone(document), mtm)
+            .map_err(|cause| cause.to_string())?;
         text_storage.set_presentation_mode(presentation_mode);
         // 在交给NSTextView前先构造完整TextKit 2图，后端只借同一canonical文稿。
         // macOS 27实测先让view创建默认图、再替换storage会破坏编辑/排版记账，

@@ -420,7 +420,8 @@ impl NativeMarkdownPagedBody {
         )?);
         let typography = (configuration.presentation_mode
             == omni_markdown_core::MarkdownPresentationMode::InlinePreview)
-            .then(|| semantics::Typography::new(font));
+            .then(|| semantics::Typography::new(font))
+            .transpose()?;
         let registered = NativeMarkdownLineFont::register(captured, &catalog, &|| true)?;
         let registered = Rc::new(if let Some(typography) = &typography {
             registered.capture_preview_metrics(&typography.metrics_owner, &|| true)?

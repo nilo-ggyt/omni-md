@@ -297,7 +297,8 @@ fn original_frame(frame: NSRect, content: NSRect) -> NSRect {
 
 /// 产品图关闭后才排独立 Native 短串，实际 NSParagraphStyle 决定对齐和尾空白语义。
 fn original(observed: &[ObservedCell]) -> Result<(), String> {
-    let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+    let font = crate::native_surface::text_attributes::native_markdown_document_fixed_font(14.0)
+        .map_err(|cause| cause.to_string())?;
     for cell in observed {
         // 这六个固定字面只有 ASCII 字母/空格；每个 byte 是一个 scalar 和完整 GCB。
         // 端点仅从原 fixture 字面生成，不读取产品字符框、选区或 Core GCB 输出。
@@ -713,7 +714,8 @@ fn run_unicode(mtm: MainThreadMarker) -> Result<(), String> {
         Ok((retirement, result))
     })?;
     retirement.verify(false)?;
-    let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+    let font = crate::native_surface::text_attributes::native_markdown_document_fixed_font(14.0)
+        .map_err(|cause| cause.to_string())?;
     for cell in result? {
         // 原 UNICODE_CELLS 已独立声明 UAX GCB：Prepend+首空格为1..3，尾空格仍为3..4。
         // 这里只按固定字面/方向找回该声明，不能从待测 cell.graphemes 反推 Native 查询范围。

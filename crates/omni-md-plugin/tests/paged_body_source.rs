@@ -31,6 +31,7 @@ use objc2_foundation::{
 use objc2_quartz_core::CATransaction;
 use omni_markdown_core::{MarkdownDocumentBuffer, MarkdownTextSelection};
 use omni_md_plugin::native_surface::{
+    native_markdown_document_fixed_font,
     paged_body::{
         NativeMarkdownPagedBody, NativeMarkdownPagedBodyColors,
         NativeMarkdownPagedBodyConfiguration, NativeMarkdownPagedBodyPaintObserver,
@@ -268,7 +269,8 @@ fn native_client_protocol(mtm: MainThreadMarker) {
             let mapping = document.borrow().original_backing_observer().unwrap();
             let frame = NSRect::new(NSPoint::ZERO, NSSize::new(640.0, 240.0));
             let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
-            let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+            let font = native_markdown_document_fixed_font(14.0)
+                .expect("真实正文控制必须取得生产文稿等宽字体");
             let paragraph = NSParagraphStyle::defaultParagraphStyle();
             let body = NativeMarkdownPagedBody::attach(
                 document,
@@ -787,7 +789,8 @@ fn bounded_pending_client(mtm: MainThreadMarker) {
         let before = document.borrow().current_revision().unwrap();
         let frame = NSRect::new(NSPoint::ZERO, NSSize::new(640.0, 240.0));
         let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
-        let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+        let font = native_markdown_document_fixed_font(14.0)
+            .expect("真实正文控制必须取得生产文稿等宽字体");
         let paragraph = NSParagraphStyle::defaultParagraphStyle();
         let body = NativeMarkdownPagedBody::attach(
             document,
@@ -965,7 +968,8 @@ fn main() {
         let frame = NSRect::new(NSPoint::ZERO, NSSize::new(640.0, 240.0));
         let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
         scroll.setHasVerticalScroller(true);
-        let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+        let font = native_markdown_document_fixed_font(14.0)
+            .expect("真实长文控制必须取得生产文稿等宽字体");
         let ct: &CTFont = font.as_ref();
         let paragraph = NSParagraphStyle::defaultParagraphStyle();
         let body = NativeMarkdownPagedBody::attach(

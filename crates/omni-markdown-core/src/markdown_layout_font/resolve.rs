@@ -157,6 +157,72 @@ struct Candidate {
     has_fvar: bool,
 }
 
+/// 只解码已选 face 原名称表里的有界基础 PSName；不借 Native 合成名或命名实例标签。
+fn face_postscript(font: &Font) -> Result<String> {
+    for record in font.names().get(NameId::POSTSCRIPT_NAME).iter() {
+        let mut candidate = String::new();
+        for scalar in record.name().chars() {
+            if !scalar.is_ascii()
+                || scalar.is_ascii_control()
+                || candidate.len() >= MAX_POSTSCRIPT_BYTES
+            {
+                return Err(Error::InvalidPostScriptName);
+            }
+            candidate.push(scalar);
+        } // 原完整表已通过目录预算；这里只读一个有限名称，不碰字形轮廓或正文。
+        if !candidate.is_empty() {
+            return Ok(candidate);
+        }
+    }
+    Err(Error::PostScriptNotFound)
+}
+
+/// 从已经认证的不可变 face 派生另一实例；完整原表相等才保留它的唯一 face 事实。
+/// 不接受另一份 Blob，因此路径相同、同名或另一 TTC face 都不能替换原冻结来源。
+pub(super) fn derive_name_table(
+    original: &Font,
+    metadata: &Metadata,
+    native_name_table: &[u8],
+    axes: &[Axis],
+) -> Result<(Font, Metadata)> {
+    if native_name_table.is_empty() || native_name_table.len() > MAX_NAME_BYTES {
+        return Err(Error::InvalidNameTable);
+    }
+    if axes.len() > MAX_AXES {
+        return Err(Error::VariationBudgetExceeded);
+    }
+    // 原 resolver 已在完整容器中排除同表歧义。这里只核同一个 face 的完整表，
+    // 不能重新 Font::new 生成第二套布局缓存，也不能拿表前缀或 PSName 猜面索引。
+    if !original
+        .tables()
+        .name_data()
+        .is_some_and(|table| table == native_name_table)
+    {
+        return Err(Error::PostScriptNotFound);
+    }
+    // 通用 resolve 可从命名实例 PSName 建立原 owner；派生已回到基础 face 加显式轴，
+    // 不能让旧实例标签跟随新轴位。原 name-table owner 则已持同一真实基础名称。
+    let base_postscript = metadata
+        .named_instance
+        .map(|_| face_postscript(original))
+        .transpose()?;
+    let postscript = base_postscript
+        .as_deref()
+        .unwrap_or(&metadata.postscript_name);
+    finish(
+        Candidate {
+            face: metadata.face_index,
+            font: original.clone(),
+            named: None,
+            has_fvar: original.tables().fvar_data().is_some(),
+        },
+        metadata.face_count as usize,
+        metadata.source_bytes,
+        postscript,
+        axes,
+    ) // 原 finish 仍完整核真实 fvar、未知/重复/越界轴，并从同 SharedFont 建新实例。
+}
+
 /// 完整Native名称表必须逐字节属于唯一真实face；相同名称/字形数量不能代替这个来源核验。
 pub(super) fn resolve_name_table(
     bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
@@ -201,23 +267,7 @@ pub(super) fn resolve_name_table(
         if matched.is_some() {
             return Err(Error::AmbiguousFace);
         } // 多face共享完全相同name表时没有足够身份信息，不能用遍历顺序挑一个。
-        let mut postscript = None;
-        for record in font.names().get(NameId::POSTSCRIPT_NAME).iter() {
-            let mut candidate = String::new();
-            for scalar in record.name().chars() {
-                if !scalar.is_ascii()
-                    || scalar.is_ascii_control()
-                    || candidate.len() >= MAX_POSTSCRIPT_BYTES
-                {
-                    return Err(Error::InvalidPostScriptName);
-                }
-                candidate.push(scalar);
-            } // 只解码原表内这个有界名称；不读取正文、字形轮廓或Native合成PSName。
-            if !candidate.is_empty() {
-                postscript = Some(candidate);
-                break;
-            }
-        }
+        let postscript = face_postscript(&font)?;
         matched = Some((
             Candidate {
                 face: face as u32,
@@ -225,7 +275,7 @@ pub(super) fn resolve_name_table(
                 named: None,
                 has_fvar: directory.has_fvar,
             },
-            postscript.ok_or(Error::PostScriptNotFound)?,
+            postscript,
         ));
     }
     let (matched, postscript) = matched.ok_or(Error::PostScriptNotFound)?;

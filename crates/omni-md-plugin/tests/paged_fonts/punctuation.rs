@@ -1,11 +1,12 @@
-//! 同一真实 UIFont 的完整短串对照；语言只作观察，默认 None 仍须独立匹配 Native 默认。
+//! 同一真实生产文稿字体的完整短串对照；默认 None 必须匹配 Native 默认，语言仅作观察。
+//! 原 UI 等宽角色确曾触发不同的中文半宽/间距默认策略；本例不宣称任意 UIFont 的整形等价。
 
 use std::{io::Write, ptr::NonNull};
 
 use objc2::{AnyThread, rc::autoreleasepool, runtime::AnyObject};
-use objc2_app_kit::{NSFont, NSFontAttributeName};
+use objc2_app_kit::NSFontAttributeName;
 use objc2_core_foundation::{CFRange, CFString, CFType, CGSize};
-use objc2_core_text::{CTFont, CTLine, CTRun};
+use objc2_core_text::{CTFont, CTLine, CTRun, kCTFontAttributeName};
 use objc2_foundation::{MainThreadMarker, NSAttributedString, NSDictionary, NSString};
 use omni_markdown_core::{
     MarkdownDocumentBuffer, MarkdownLayoutFont, MarkdownLayoutTextSource, MarkdownShapingBudget,
@@ -13,9 +14,14 @@ use omni_markdown_core::{
 };
 
 use super::{MAXIMUM_FONT_BYTES, NativeMarkdownPagedFont, assert_released};
+use omni_md_plugin::native_surface::native_markdown_document_fixed_font;
 
-// 只允许这个固定五字符例子，完整输入远小于2KiB；这里没有产品文稿或长段落入口。
-const SOURCE: &str = "中文，中文";
+// 三个完整上下文固定且远小于2KiB；孤立标点、汉字邻接与拉丁混排都不能截成同一种参考。
+const CASES: [(&str, &str); 3] = [
+    ("isolated_comma", "，"),
+    ("han_context", "中文，中文"),
+    ("latin_context", "A，B"),
+];
 const GLYPHS: usize = 64;
 
 /// 两侧只交换真实 Copy 字形事实；不把 CTFont、Job、Source 或映射藏进诊断结果。
@@ -35,6 +41,7 @@ struct Observation {
 fn core_glyphs(
     source: &MarkdownLayoutTextSource,
     font: &MarkdownLayoutFont,
+    text: &str,
     language: Option<&'static str>,
 ) -> Result<Vec<Glyph>, String> {
     let source_authority = source.authority();
@@ -44,7 +51,7 @@ fn core_glyphs(
         &source_authority,
         font.clone(),
         &font_authority,
-        0..SOURCE.encode_utf16().count(),
+        0..text.encode_utf16().count(),
         MarkdownShapingOptions {
             direction: MarkdownShapingDirection::LeftToRight,
             script: *b"Hani",
@@ -116,10 +123,14 @@ fn core_glyphs(
 }
 
 /// 三种语言共用同一原文件、mmap 与字体实例；语言观察失败不会绕过真实 Source 释放。
-fn core_observations(font: MarkdownLayoutFont) -> Result<Vec<Observation>, String> {
+fn core_observations(
+    font: MarkdownLayoutFont,
+    label: &'static str,
+    text: &'static str,
+) -> Result<Vec<Observation>, String> {
     let mut file = tempfile::NamedTempFile::new()
         .map_err(|cause| format!("固定短例临时文件创建失败：{cause}"))?;
-    file.write_all(SOURCE.as_bytes())
+    file.write_all(text.as_bytes())
         .map_err(|cause| format!("固定短例写入失败：{cause}"))?;
     let document = MarkdownDocumentBuffer::open(file.path(), 2048)
         .map_err(|cause| format!("固定短例 mmap 文档打开失败：{cause:?}"))?;
@@ -131,9 +142,9 @@ fn core_observations(font: MarkdownLayoutFont) -> Result<Vec<Observation>, Strin
     let result = (|| {
         let mut observations = Vec::with_capacity(3);
         for language in [None, Some("zh-Hans"), Some("en")] {
-            let glyphs = core_glyphs(&source, &font, language)?;
+            let glyphs = core_glyphs(&source, &font, text, language)?;
             println!(
-                "native_paged_punctuation side=core language={} glyphs={glyphs:?}",
+                "native_paged_punctuation side=core case={label} language={} glyphs={glyphs:?}",
                 language.unwrap_or("none")
             );
             observations.push(Observation { language, glyphs });
@@ -153,9 +164,9 @@ fn core_observations(font: MarkdownLayoutFont) -> Result<Vec<Observation>, Strin
 }
 
 /// 原生参考只用完整固定短串与捕获时同一个真实 CTFont，不从候选 glyph 或局部子串反造期望。
-fn native_glyphs(font: &CTFont) -> Result<Vec<Glyph>, String> {
+fn native_glyphs(font: &CTFont, label: &str, source: &str) -> Result<Vec<Glyph>, String> {
     autoreleasepool(|_| {
-        let text = NSString::from_str(SOURCE);
+        let text = NSString::from_str(source);
         let font_type: &CFType = font.as_ref();
         let font_object: &AnyObject = font_type.as_ref();
         // SAFETY: AppKit 的 Font 属性键与当前仍活的原 CTFont/NSFont 公共桥接类型匹配。
@@ -175,7 +186,7 @@ fn native_glyphs(font: &CTFont) -> Result<Vec<Glyph>, String> {
         let (range, count, runs) =
             unsafe { (line.string_range(), line.glyph_count(), line.glyph_runs()) };
         let count = usize::try_from(count).map_err(|_| "原生短例字形数无效")?;
-        let length = SOURCE.encode_utf16().count();
+        let length = source.encode_utf16().count();
         if range != CFRange::new(0, length as _) || !(1..=GLYPHS).contains(&count) {
             return Err("原生参考未覆盖完整固定短串或超过64字形，禁止截断".into());
         }
@@ -191,6 +202,17 @@ fn native_glyphs(font: &CTFont) -> Result<Vec<Glyph>, String> {
             // SAFETY: 原 run 指针由上方真实数组保活，返回的数量和矩阵均为 Copy 值。
             let (used, matrix) =
                 unsafe { (run.as_ref().glyph_count(), run.as_ref().text_matrix()) };
+            // 独立参考也必须保持原实际字体；系统静默换 face 不能成为原 Core glyph 的期望。
+            // SAFETY: attributes 由仍活的 run 取得，公开 Font 键值的借用不离开此自动释放池。
+            let attributes = unsafe { run.as_ref().attributes() };
+            let actual =
+                unsafe { attributes.value(std::ptr::from_ref(kCTFontAttributeName).cast()) };
+            let actual = NonNull::new(actual.cast_mut().cast::<CTFont>())
+                .ok_or("原生短例实际 run 没有 Font 属性")?;
+            // SAFETY: 非空对象由 run 的真实属性字典保活；CTFont 的相等沿公开 CFEqual。
+            if unsafe { actual.as_ref() } != font {
+                return Err("原生短例实际 run 更换了原文稿字体".into());
+            }
             let used = usize::try_from(used).map_err(|_| "原生短例 run 字形数无效")?;
             if used > GLYPHS
                 || result.len() + used > count
@@ -239,48 +261,56 @@ fn native_glyphs(font: &CTFont) -> Result<Vec<Glyph>, String> {
         if result.len() != count {
             return Err("原生短例没有交付 line 声明的全部真实 glyph".into());
         }
-        println!("native_paged_punctuation side=native language=unset glyphs={result:?}");
+        println!(
+            "native_paged_punctuation side=native case={label} language=unset glyphs={result:?}"
+        );
         Ok(result)
     })
 }
 
 pub(super) fn run(mtm: MainThreadMarker) {
-    let base = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+    // 和正式编辑器相同的公开 14pt 文稿等宽角色；不按系统字体名称重建或覆盖 feature。
+    let base =
+        native_markdown_document_fixed_font(14.0).expect("系统必须为本机正式文稿提供实际等宽角色");
     let scalar = CFString::from_str("，");
     let base_font: &CTFont = base.as_ref();
-    // SAFETY: 同一个原 mono14 为完整 FF0C 选择真实回退字体；不按别名重建或改字号。
+    // SAFETY: 原文稿 base 为完整 FF0C 选择真实回退；所有 case 共用这一实际不可变实例。
     let native = unsafe { base_font.for_string(&scalar, CFRange::new(0, 1)) };
     let captured = NativeMarkdownPagedFont::capture(&native, MAXIMUM_FONT_BYTES, mtm, &|| true)
-        .expect("固定标点例的真实 UIFont 必须经过原生产捕获边界");
+        .expect("固定标点例的真实文稿字体必须经过原生产捕获边界");
     let bytes = captured.bytes_observer();
     let payload = captured.core_font().resource_observer();
     println!(
-        "native_paged_punctuation source_bytes={} font_metadata={:?} point_size={} actual_capture=true",
-        SOURCE.len(),
+        "native_paged_punctuation font_metadata={:?} point_size={} actual_capture=true font_role=document_fixed_pitch interface_font_parity_required=false",
         captured.core_font().metadata(),
         captured.point_size()
     );
-    let core_font = captured.core_font().clone();
-    // 原非 Send Job 在真实工作线程内构造和销毁；主线程只交原不可变 Font，并接纯值。
-    let worker = std::thread::spawn(move || core_observations(core_font));
-    let actual_native = native_glyphs(captured.native_font());
-    let actual_core = worker.join();
+    let mut observations = Vec::with_capacity(CASES.len());
+    for (label, text) in CASES {
+        let core_font = captured.core_font().clone();
+        // 原非 Send Job 仍在真实线程内构造/归还；每个短源、映射与 glyph 存储先结束再推进后例。
+        let worker = std::thread::spawn(move || core_observations(core_font, label, text));
+        let actual_native = native_glyphs(captured.native_font(), label, text);
+        observations.push((label, worker.join(), actual_native));
+    }
     drop((captured, native, scalar, base));
     assert!(payload.payload_released(), "固定标点例仍保活 Core Font");
     assert_released(&bytes);
     // 默认比对放在真实字形、Source、Font 和 mmap 释放之后；不能因差异 panic 漏掉清理核验。
-    let actual_core = actual_core
-        .expect("固定短例 Core 工作线程必须实际结束")
-        .expect("固定短例 Core 计算和真实资源释放必须成功");
-    let actual_native = actual_native.expect("固定短例原生完整上下文必须成功");
-    let default = actual_core
-        .iter()
-        .find(|observation| observation.language.is_none())
-        .expect("真实 None 语言观察不可缺失");
-    assert_eq!(
-        default.glyphs, actual_native,
-        "同一 UIFont 的 Core 默认 None 必须与 Native 默认完整短串一致；不能择另一语言过关"
-    );
+    for (label, actual_core, actual_native) in observations {
+        let actual_core = actual_core
+            .expect("固定短例 Core 工作线程必须实际结束")
+            .expect("固定短例 Core 计算和真实资源释放必须成功");
+        let actual_native = actual_native.expect("固定短例原生完整上下文必须成功");
+        let default = actual_core
+            .iter()
+            .find(|observation| observation.language.is_none())
+            .expect("真实 None 语言观察不可缺失");
+        assert_eq!(
+            default.glyphs, actual_native,
+            "{label}: 同一文稿字体的 Core 默认 None 必须与 Native 默认完整短串一致；不能择另一语言过关"
+        );
+    }
     println!(
         "native_paged_punctuation default_language_exact=true explicit_languages_observed=true glyph_stores_released=true source_released=true font_unmapped=true formal=false"
     );

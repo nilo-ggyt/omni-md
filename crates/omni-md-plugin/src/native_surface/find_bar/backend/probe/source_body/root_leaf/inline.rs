@@ -4,10 +4,10 @@ use super::*;
 use crate::native_surface::paged_line_fonts::NativeMarkdownLineFont;
 use crate::native_surface::paged_text_view::NativeMarkdownPagedTextScene;
 use crate::native_surface::text_attributes::{
-    MarkdownFontSelectionCache, MarkdownTextAttributePalette,
+    MarkdownFontSelectionCache, MarkdownTextAttributePalette, native_markdown_document_fixed_font,
 };
 use objc2::{AnyThread, rc::Retained, runtime::AnyObject};
-use objc2_app_kit::{NSFont, NSFontAttributeName};
+use objc2_app_kit::NSFontAttributeName;
 use objc2_core_foundation::{CFRange, CGSize};
 use objc2_core_graphics::{CGColor, CGFont};
 use objc2_core_text::{
@@ -38,8 +38,8 @@ fn quote_markers(
         .probe_root_leaf_parts()
         .map_err(|cause| cause.to_string())?;
     autoreleasepool(|_| {
-        let palette =
-            MarkdownTextAttributePalette::new(NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0));
+        let font = native_markdown_document_fixed_font(14.0).map_err(|cause| cause.to_string())?;
+        let palette = MarkdownTextAttributePalette::new(font).map_err(|cause| cause.to_string())?;
         // 三行属于同一引用段，强调和代码各自跨过真实 CRLF；Find 只在中间物理行内，
         // 不能令首行或代码结束行一起显露，也不能以该段内任意选择替代行端点事实。
         for (line, active) in [
@@ -214,7 +214,8 @@ fn original_scalar_font(
     actual: &NativeMarkdownLineFont,
     palette: &MarkdownTextAttributePalette,
 ) -> Result<f64, String> {
-    let resolved = MarkdownFontSelectionCache::resolve_uncached(styles, scalar, palette, false);
+    let resolved = MarkdownFontSelectionCache::resolve_uncached(styles, scalar, palette, false)
+        .map_err(|cause| cause.to_string())?;
     let mut bytes = [0; 4];
     let string = NSString::from_str(scalar.encode_utf8(&mut bytes));
     let font: &AnyObject = resolved.font.as_ref();
@@ -448,7 +449,7 @@ fn capture_whitespace_underline(
 
 /// 产品图关闭后，参考基线来自相同实际列宽的原 TextKit 完整短例；CG 仍逐 RGBA 零容差比较。
 fn whitespace_underline_pixels(sample: &WhitespaceUnderline) -> Result<(usize, usize), String> {
-    let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+    let font = native_markdown_document_fixed_font(14.0).map_err(|cause| cause.to_string())?;
     let original = super::paragraph_oracle::measure(SOURCE, sample.width, &font, &[])?;
     drop(font);
     let spaces = source_range("[    ]");
@@ -624,9 +625,10 @@ fn verify(
         stage.set("cjk_original_font");
         let mut advance_parts = Vec::<super::paragraph_oracle::PartAdvance>::new();
         autoreleasepool(|_| -> Result<(), String> {
-            let palette = MarkdownTextAttributePalette::new(
-                NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0),
-            );
+            let font =
+                native_markdown_document_fixed_font(14.0).map_err(|cause| cause.to_string())?;
+            let palette =
+                MarkdownTextAttributePalette::new(font).map_err(|cause| cause.to_string())?;
             for (label, bold, italic, quote, code) in [
                 ("中文", false, false, false, false),
                 ("粗体", true, false, false, false),
@@ -1000,7 +1002,7 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
         }
     }
     // 实际旧软行与逐 glyph 边缘同归完整固定短例的 TextKit，关闭后只比较来源及整数推进。
-    let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+    let font = native_markdown_document_fixed_font(14.0).map_err(|cause| cause.to_string())?;
     let lines = super::paragraph_oracle::measure(SOURCE, advances.width, &font, &advances.parts)?;
     let expected = super::paragraph_oracle::part_advances(SOURCE, &lines, &advances.parts)?;
     drop(font);

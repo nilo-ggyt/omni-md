@@ -81,7 +81,8 @@ pub(super) fn run(mtm: MainThreadMarker) {
             let frame = NSRect::new(NSPoint::ZERO, NSSize::new(640.0, 240.0));
             let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
             scroll.setHasVerticalScroller(true);
-            let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+            let font = native_markdown_document_fixed_font(14.0)
+                .expect("实际重入控制必须取得生产文稿等宽字体");
             let paragraph = NSParagraphStyle::defaultParagraphStyle();
             let body = NativeMarkdownPagedBody::attach(
                 document,
@@ -276,7 +277,8 @@ fn close_before_first_frame(mtm: MainThreadMarker) {
         let frame = NSRect::new(NSPoint::ZERO, NSSize::new(640.0, 240.0));
         let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
         scroll.setHasVerticalScroller(true);
-        let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+        let font = native_markdown_document_fixed_font(14.0)
+            .expect("实际重入控制必须取得生产文稿等宽字体");
         let paragraph = NSParagraphStyle::defaultParagraphStyle();
         let body = NativeMarkdownPagedBody::attach(
             document,

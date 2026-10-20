@@ -162,6 +162,7 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
   "NSEvent",
   "NSDragging",
   "NSFont",
+  "NSFontManager",
   "NSFontDescriptor",
   "NSGraphics",
   "NSGraphicsContext",

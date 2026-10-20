@@ -103,17 +103,18 @@ pub(super) struct Typography {
     pub(super) metrics_owner: Rc<Retained<NSLayoutManager>>,
 }
 impl Typography {
-    pub(super) fn new(font: &CTFont) -> Self {
+    pub(super) fn new(font: &CTFont) -> Result<Self> {
         // SAFETY: 活CTFont在本调用有效，retain取得独立+1；Apple定义NSFont/CTFont toll-free bridge。
         let retained = unsafe { CFRetained::retain(NonNull::from(font)) };
         let retained: Retained<CTFont> = retained.into();
         // SAFETY: 上述真实CTFont与NSFont同一对象，只转换Rust视图并保留原+1所有权。
         let normal: Retained<NSFont> = unsafe { Retained::cast_unchecked(retained) };
-        Self {
-            palette: MarkdownTextAttributePalette::new(normal),
+        Ok(Self {
+            // 文稿角色创建失败即终止本次装配；不能发布缺少标题/代码字体的半个 palette。
+            palette: MarkdownTextAttributePalette::new(normal)?,
             slots: [None; 41],
             metrics_owner: Rc::new(NSLayoutManager::new()),
-        }
+        })
     }
 }
 
@@ -456,7 +457,10 @@ impl Selection {
             // 不删源字符、不把marker混入标题槽，也不以默认字号覆盖Source授权的显隐。
             // 同一原样式位也随Composer封存part交给CPU画墨迹/装饰；字体只负责真实形状与宽度。
             let native = native_markdown_base_font(self.styles, &typography.palette);
+            // Native 样式转换可能交付重入；先核原 Source/票的真实首错，再接纳字体结果。
+            // 不能让字体失败覆盖同时发生的原映射异常，也不能把失权候选注册到后继输入。
             ticket.require(owner, source)?;
+            let native = native?;
             let current = || ticket.current(owner, source);
             // 只借同一 Body 已注册的有限字体；先结束槽借用，再进入可能交付重入的 Native。
             // 角色槽描述语义，实际字体可相同；不能为每个新角色重建同一文件快照与 Core payload。

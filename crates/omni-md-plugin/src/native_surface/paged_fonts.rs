@@ -99,6 +99,22 @@ impl NativeMarkdownFontCapture {
 }
 
 impl NativeMarkdownPagedFont {
+    /// 原系统工厂已经决定字号与字重；只沿同一实际 CGFont 去掉 UI usage 绑定。
+    /// 不匹配名称、不换字体家族，也不提前授予 Core Font 或任何 Source 权限。
+    pub(crate) fn document_instance(font: &CTFont) -> Result<CFRetained<CTFont>> {
+        metadata::document_instance(font)
+    }
+
+    /// 原实例派生样式后核真实 family/语义/轴/几何；不以私有 PSName 查找另一默认字体。
+    pub(crate) fn require_derived_style(
+        original: &CTFont,
+        derived: &CTFont,
+        points: f64,
+        italic: bool,
+    ) -> Result<()> {
+        metadata::require_derived_style(original, derived, points, italic)
+    }
+
     /// 捕获已有CTFont的原CGFont名称表与实际轴位；完整表匹配唯一文件face，不解释UIFont别名。
     ///
     /// # Errors
@@ -113,7 +129,7 @@ impl NativeMarkdownPagedFont {
         let bytes = step(current, || {
             MarkdownLayoutFontBytes::capture_file(&original.path, maximum_font_bytes)
         })??;
-        Self::capture_metadata(font, original, bytes, mtm, current)
+        Self::capture_metadata(font, original, bytes, None, mtm, current)
     }
 
     /// 只在系统已选出的实际候选内复用；不重排级联、不按名字猜字体，也不跳过后续原 GCB 试次。
@@ -148,6 +164,7 @@ impl NativeMarkdownPagedFont {
         }
         // 同一源文件可产生多个字号或轴实例；只共享不可变字节，每个新实例仍完整核验来源。
         // 这里仅遍历本Body已经拥有的有限palette，不另设全局目录或延长字体生命周期。
+        let mut shared_bytes = None;
         for registered in palette {
             let captured = registered.native();
             if captured.source_path != original.path {
@@ -159,14 +176,38 @@ impl NativeMarkdownPagedFont {
                     .share_unchanged_file(&original.path, maximum_font_bytes)
             })??;
             if let Some(bytes) = shared {
-                return Self::capture_metadata(font, original, bytes, mtm, current)
+                // 文件身份相同只证明这份冻结字节可复用；同 TTC 的其它 face 仍可能有不同名称表。
+                // 只有本 peer 的完整原表也相等，才从其 Core 实例派生并共享已有布局解析。
+                if step(current, || {
+                    Ok::<_, NativeMarkdownPagedFontError>(
+                        original.name_bytes()? == metadata::name_bytes(&captured.name_table)?,
+                    )
+                })?? {
+                    return Self::capture_metadata(
+                        font,
+                        original,
+                        bytes,
+                        Some(&captured.core),
+                        mtm,
+                        current,
+                    )
                     .map(NativeMarkdownFontCapture::SharedBytes);
+                }
+                // 仍找后继同 face peer；若只有其它 face，沿原完整 resolver 确定新 face。
+                // 这里最多保一个既有映射强边，不新建字体文件目录或进程级缓存。
+                if shared_bytes.is_none() {
+                    shared_bytes = Some(bytes);
+                }
             }
+        }
+        if let Some(bytes) = shared_bytes {
+            return Self::capture_metadata(font, original, bytes, None, mtm, current)
+                .map(NativeMarkdownFontCapture::SharedBytes);
         }
         let bytes = step(current, || {
             MarkdownLayoutFontBytes::capture_file(&original.path, maximum_font_bytes)
         })??;
-        Self::capture_metadata(font, original, bytes, mtm, current)
+        Self::capture_metadata(font, original, bytes, None, mtm, current)
             .map(NativeMarkdownFontCapture::Fresh)
     }
 
@@ -175,15 +216,30 @@ impl NativeMarkdownPagedFont {
         font: &CTFont,
         original: metadata::Metadata,
         bytes: MarkdownLayoutFontBytes,
+        same_face: Option<&MarkdownLayoutFont>,
         mtm: MainThreadMarker,
         current: &(impl Fn() -> bool + ?Sized),
     ) -> Result<Self> {
         let name_table = step(current, || original.name_bytes())??;
-        let horizontal = metadata::horizontal_advances(font, original.glyph_count, current)?;
+        let horizontal =
+            metadata::horizontal_advances(font, &original.graphics, original.glyph_count, current)?;
         let core = step(current, || {
-            // 同一个实际字体实例的彩色字形推进随Core payload封存，排版与Native绘制不再使用两套宽度。
-            match horizontal {
-                Some(advances) => {
+            // 完整推进属于同一个实际 Native 字号/轴实例；Core 在名义入口扣同 Font 的
+            // tracking，再让原定位按 GCB 加回，不能把 UI 默认表直接当作文稿度量。
+            match (same_face, horizontal) {
+                (Some(previous), Some(advances)) => previous
+                    .derive_name_table_at_size_with_horizontal_advances(
+                        name_table,
+                        &original.axes,
+                        original.point_size,
+                        advances,
+                    ),
+                (Some(previous), None) => previous.derive_name_table_at_size(
+                    name_table,
+                    &original.axes,
+                    original.point_size,
+                ),
+                (None, Some(advances)) => {
                     MarkdownLayoutFont::resolve_name_table_at_size_with_horizontal_advances(
                         bytes.blob(),
                         name_table,
@@ -192,7 +248,7 @@ impl NativeMarkdownPagedFont {
                         advances,
                     )
                 }
-                None => MarkdownLayoutFont::resolve_name_table_at_size(
+                (None, None) => MarkdownLayoutFont::resolve_name_table_at_size(
                     bytes.blob(),
                     name_table,
                     &original.axes,
@@ -277,7 +333,8 @@ impl NativeMarkdownPagedFont {
             return Err(NativeMarkdownPagedFontError::GraphicsSourceMismatch); // 派生不能重新匹配另一字体文件。
         }
         let name_table = step(current, || actual.name_bytes())??;
-        let horizontal = metadata::horizontal_advances(&native, actual.glyph_count, current)?;
+        let horizontal =
+            metadata::horizontal_advances(&native, &actual.graphics, actual.glyph_count, current)?;
         let core = step(current, || {
             // 轴实例的真实Native度量重新捕获；不能借旧轴快照或继承原字形宽度。
             match horizontal {

@@ -1242,6 +1242,9 @@ mod mutation_anchor_tests {
 pub(super) enum NativeMarkdownStableTableFailure {
     /// 新事件/文档/宽度已撤权，旧局部结果只能丢弃，不能恢复clip或发布literal覆盖新状态。
     InputIntentExpired,
+    /// 字段实际文稿字体取得失败；不是几何待决，也不能换 UI 字体继续显示草稿。
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+    FontUnavailable,
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     MissingGeometry,
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]

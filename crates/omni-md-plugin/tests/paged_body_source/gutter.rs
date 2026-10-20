@@ -3,7 +3,7 @@
 use super::*;
 use objc2::{AnyThread, ClassType};
 use objc2_app_kit::{
-    NSColor, NSEvent, NSEventModifierFlags, NSEventType, NSFontAttributeName,
+    NSColor, NSEvent, NSEventModifierFlags, NSEventType, NSFontAttributeName, NSFontWeightRegular,
     NSForegroundColorAttributeName, NSRulerView,
 };
 use objc2_core_graphics::{
@@ -105,7 +105,9 @@ fn width(ruler: &NSRulerView, lines: usize) -> f64 {
         100 => "999",
         _ => panic!("行号宽度回归只接受明确的9/10/99/100业务边界"),
     };
-    let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+    // 行号是原14pt界面数字角色；正文改用文稿字体不改变独立行号对照的真实字体来源。
+    // SAFETY: 公开regular权重是进程期不可变标量，与生产LineNumberFont使用同一公开入口。
+    let font = NSFont::monospacedSystemFontOfSize_weight(14.0, unsafe { NSFontWeightRegular });
     let line = label(placeholder, &font);
     // SAFETY: 不可变短CTLine存活；三个度量输出不需要时传null。
     let advance = unsafe {
@@ -190,7 +192,9 @@ fn pixels(
                 [19, 22, 28]
             },
         );
-        let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+        // 独立CTLine只排界面行号；不能借正文的文稿等宽字体改变预期数字墨迹与度量。
+        // SAFETY: 公开regular常量有效，本同步对照沿原LineNumberFont同一系统等宽入口。
+        let font = NSFont::monospacedSystemFontOfSize_weight(14.0, unsafe { NSFontWeightRegular });
         let mut regions = Vec::with_capacity(samples.len());
         for &(position, number, active, marker) in samples {
             let rect = scene
@@ -602,7 +606,8 @@ fn small_case(mtm: MainThreadMarker, lines: usize) {
                     clip.contentInsets(),
                 )
             }; // 仅保存Copy值，测试不能额外强持clip跨越原Native释放门。
-            let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+            let font = native_markdown_document_fixed_font(14.0)
+                .expect("实际正文行号控制必须取得生产文稿等宽字体");
             let paragraph = NSParagraphStyle::defaultParagraphStyle();
             let body = NativeMarkdownPagedBody::attach(
                 document,

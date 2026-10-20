@@ -807,13 +807,17 @@ impl PieceBackedMarkdownTextStorage {
     }
 
     /// Creates session-local derived caches and virtual native primitives over one weak canonical owner.
-    pub(super) fn new(document: SharedMarkdownDocument, mtm: MainThreadMarker) -> Retained<Self> {
+    pub(super) fn new(
+        document: SharedMarkdownDocument,
+        mtm: MainThreadMarker,
+    ) -> Result<Retained<Self>, super::paged_line_fonts::NativeMarkdownLineFontError> {
         // Fixed palette/base attributes are native resources acquired only for an explicitly active editor.
         let string = PieceBackedMarkdownString::new(&document, mtm);
-        let font = NSFont::systemFontOfSize(15.0);
+        // 这个标准 TextKit 对照也必须使用文稿角色，不能以 UI 默认排版充当正文 oracle。
+        let font = native_markdown_document_font(15.0)?;
         // TextKit 在原装配边界取得完整列表字形；分页只构造共同字体，不承担这组额外强边。
         // 此时尚未建立 render_payload 的 RefCell，也未借用正文，Native 初始化不会跨业务借用。
-        let palette = MarkdownTextAttributePalette::new_for_textkit(font);
+        let palette = MarkdownTextAttributePalette::new_for_textkit(font)?;
         let font_object: &AnyObject = &palette.normal_font;
         let foreground_color_object: &AnyObject = &palette.foreground;
         // SAFETY: AppKit exports these immutable keys for the process lifetime. The dictionary
@@ -874,7 +878,7 @@ impl PieceBackedMarkdownTextStorage {
         });
         // SAFETY: all required NSTextStorage primitives and Rust ivars are initialized before
         // the superclass initializer can dispatch to the subclass.
-        unsafe { msg_send![super(storage), init] }
+        Ok(unsafe { msg_send![super(storage), init] })
     }
 
     /// Temporarily acquires the canonical document only while its foreground model still owns it.
@@ -1933,7 +1937,9 @@ impl PieceBackedMarkdownTextStorage {
                 return None;
             }
         };
-        self.attribute_request_is_current(request).then_some(result)
+        // 真正字体转换失败不发布属性或回填普通字体；原 Option getter 边界拒绝整个候选。
+        self.attribute_request_is_current(request)
+            .then_some(result.ok()?)
     }
 
     /// 字典 factory 也在唯一局部 owner 上执行；Loaned 分支不预留临时 LRU。
@@ -2736,7 +2742,7 @@ impl PieceBackedMarkdownTextStorage {
                 // 没有实际显示单元就不调用属性setter。
                 continue;
             }
-            let font = native_markdown_base_font(span.styles, &render.palette);
+            let font = native_markdown_base_font(span.styles, &render.palette).ok()?;
             // 复用原编辑器有限LRU的完整不可变样式字典，不为命中复制另一套字体或布局。
             let attributes =
                 self.cached_attribute_dictionary(span.styles, &font, &render, &request)?;

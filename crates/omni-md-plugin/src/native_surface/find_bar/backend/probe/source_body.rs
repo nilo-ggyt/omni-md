@@ -7,8 +7,9 @@ use crate::native_surface::paged_body::{
     NativeMarkdownPagedBodyPreparationResources, NativeMarkdownPagedBodyProgress,
     NativeMarkdownPagedBodyResourceReceipts,
 };
+use crate::native_surface::text_attributes::native_markdown_document_fixed_font;
 use objc2::{rc::Weak as NativeWeak, runtime::ProtocolObject, sel};
-use objc2_app_kit::{NSAutoresizingMaskOptions, NSFont, NSParagraphStyle, NSTextInputClient};
+use objc2_app_kit::{NSAutoresizingMaskOptions, NSParagraphStyle, NSTextInputClient};
 use objc2_core_foundation::{CFRetained, CFRunLoop, kCFRunLoopDefaultMode};
 use std::time::{Duration, Instant};
 
@@ -148,7 +149,8 @@ impl Rig {
         panel.setContentView(Some(&parent));
         let bar = NativeMarkdownFindBar::new(&controller, &ledger, Rc::downgrade(&document), mtm)?;
         bar.show(&scroll, true, &controller)?;
-        let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+        // Rig 与真实编辑器共用同一文稿角色工厂；不能用 UI fallback 代替生产字体接受几何对照。
+        let font = native_markdown_document_fixed_font(14.0).map_err(|cause| cause.to_string())?;
         let paragraph = NSParagraphStyle::defaultParagraphStyle();
         let configuration = NativeMarkdownPagedBodyConfiguration {
             presentation_mode,

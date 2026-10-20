@@ -493,8 +493,10 @@ impl PieceBackedMarkdownTextView {
             NSColor::colorWithSRGBRed_green_blue_alpha(0.91, 0.93, 0.97, 1.0)
         })?;
         native_markdown_table_intent_step(is_current, || editor.setTextColor(Some(&foreground)))?;
+        // 格草稿仍是原文稿内容，沿公开文稿角色取字；控件本身不能令中文回退转成 UI 专用字体。
         let font =
-            native_markdown_table_intent_step(is_current, || NSFont::systemFontOfSize(14.0))?;
+            native_markdown_table_intent_step(is_current, || native_markdown_document_font(14.0))?
+                .map_err(|_| NativeMarkdownStableTableFailure::FontUnavailable)?;
         native_markdown_table_intent_step(is_current, || editor.setFont(Some(&font)))?;
         native_markdown_table_intent_step(is_current, || {
             editor.setFocusRingType(NSFocusRingType::None)

@@ -1,7 +1,83 @@
 //! Owns bounded native font/attribute caches and derived paragraph styling.
 //! No cache retains canonical document bytes or any session beyond its surface.
 
+use super::paged_fonts::NativeMarkdownPagedFont;
+use super::paged_line_fonts::NativeMarkdownLineFontError;
 use super::*;
+use objc2_app_kit::{NSFontManager, NSFontTraitMask};
+use objc2_core_text::CTFont;
+
+/// 保留原系统普通字体的实际字号与轮廓，沿其真实 CGFont 创建文稿实例。
+/// 不带入 UI usage，也不切换到用户偏好的另一个字体家族；失败直接归还候选。
+///
+/// # Errors
+/// 实际名称表、轴、矩阵、字号或语义特征不能保持时拒绝，不以另一字体补齐资源。
+pub fn native_markdown_document_font(
+    points: f64,
+) -> Result<Retained<NSFont>, NativeMarkdownLineFontError> {
+    into_document_font(NSFont::systemFontOfSize(points))
+}
+
+/// 源码与代码保留原系统等宽用途及字号，中文级联由转换后的真实文稿实例选择。
+///
+/// # Errors
+/// 原等宽语义或实际字体来源无法保持时拒绝，不按字体名称重建或更换家族。
+pub fn native_markdown_document_fixed_font(
+    points: f64,
+) -> Result<Retained<NSFont>, NativeMarkdownLineFontError> {
+    // SAFETY: 系统公开字重常量仅作为原等宽工厂的值，不改变用户字体配置。
+    into_document_font(NSFont::monospacedSystemFontOfSize_weight(points, unsafe {
+        NSFontWeightRegular
+    }))
+}
+
+/// 原始 UIFont 与转换后的文稿字体都只活在本次创建栈内；公开工厂不保存第二份字体图。
+/// 真正几何/来源校验由 Native 字体拥有层执行，NSFont/CTFont 仅做公开 toll-free 转移。
+fn into_document_font(
+    font: Retained<NSFont>,
+) -> Result<Retained<NSFont>, NativeMarkdownLineFontError> {
+    let native: &CTFont = font.as_ref();
+    let document = NativeMarkdownPagedFont::document_instance(native)?;
+    let retained: Retained<CTFont> = document.into();
+    // SAFETY: Apple 定义 CTFont/NSFont toll-free bridge；保留上方唯一 +1，只转换 Rust 视图。
+    Ok(unsafe { Retained::cast_unchecked(retained) })
+}
+
+/// 从这个实际文稿实例派生斜体/字号；不把私有 PSName 交 descriptor 重新匹配。
+/// 普通字体不是转换失败的替补：真实样式或原语义不能保持时直接拒绝整个候选。
+fn derive_document_font(
+    base: &NSFont,
+    points: f64,
+    italic: bool,
+) -> Result<Retained<NSFont>, NativeMarkdownLineFontError> {
+    // 样式只在原 Paged 主线程、MainThreadOnly storage 或 Native 参考中解析。
+    // 错误线程是调用方编程错误；不能伪装为缺少 italic 后再返回普通字体。
+    let mtm = MainThreadMarker::new().expect("原生样式字体只能在主线程转换");
+    let styled = if italic {
+        let manager = NSFontManager::sharedFontManager(mtm);
+        manager.convertFont_toHaveTrait(base, NSFontTraitMask::ItalicFontMask)
+    } else {
+        base.into()
+    };
+    let resized = if styled.pointSize() == points {
+        styled
+    } else {
+        let native: &CTFont = styled.as_ref();
+        // SAFETY: 原不可变 CTFont 仍强持；null matrix 保原矩阵，None 不引入另一描述符。
+        // 原生 API 按实际新字号重算 optical axis；不继承旧字号的手写轴或改 kern/feature。
+        let resized = unsafe { native.copy_with_attributes(points, std::ptr::null(), None) };
+        let retained: Retained<CTFont> = resized.into();
+        // SAFETY: 只转移同一 +1 公开 CTFont/NSFont 桥，不按名称新建字体。
+        unsafe { Retained::cast_unchecked(retained) }
+    };
+    NativeMarkdownPagedFont::require_derived_style(
+        base.as_ref(),
+        resized.as_ref(),
+        points,
+        italic,
+    )?;
+    Ok(resized)
+}
 
 /// 同一预览策略的链接/代码颜色供TextKit属性与Paged真实绘制共用，避免两条生产路径自行偏色。
 pub(super) const NATIVE_MARKDOWN_LINK_COLOR: [f64; 4] = [0.40, 0.68, 1.0, 1.0];
@@ -56,30 +132,41 @@ pub(super) struct MarkdownTextAttributePalette {
 impl MarkdownTextAttributePalette {
     /// 构造分页与属性分支共用的固定字体、颜色；不为分页创建仅 TextKit 消费的 NSGlyphInfo。
     /// 调用方须在原 Native 装配边界取得本值，不能把字体创建推迟到正文或 RefCell 借用中。
-    pub(super) fn new(normal_font: Retained<NSFont>) -> Self {
-        // Build the finite font variants once; scrolling only reuses these retained objects.
-        // SAFETY: AppKit exports immutable font-weight constants with process lifetime.
-        let (regular_weight, semibold_weight) =
-            unsafe { (NSFontWeightRegular, NSFontWeightSemibold) };
-        let fixed_font = NSFont::monospacedSystemFontOfSize_weight(14.0, regular_weight);
-        let table_header_font = NSFont::systemFontOfSize_weight(14.0, semibold_weight);
+    pub(super) fn new(normal_font: Retained<NSFont>) -> Result<Self, NativeMarkdownLineFontError> {
+        // 普通正文仍由原挂载方提供同一个实际 base，不能因切换模式偷偷改变文稿字体栈。
+        // 每个字重/字号先用原 AppKit 工厂选择，再转同 CG 文稿实例；不能把 15pt
+        // descriptor 的光学轴套给 28pt 标题，也不能把旧 semibold 表头改成 bold。
+        let fixed_font = native_markdown_document_fixed_font(14.0)?;
+        let strong_font = into_document_font(NSFont::boldSystemFontOfSize(15.0))?;
+        // SAFETY: 表头保留原 14pt semibold 请求，转换只剥离 UI usage，实际轴位仍逐项核对。
+        let table_header_font =
+            into_document_font(NSFont::systemFontOfSize_weight(14.0, unsafe {
+                NSFontWeightSemibold
+            }))?;
         let heading_fonts = [28.0, 24.0, 20.0, 18.0, 16.0, 15.0]
             .into_iter()
-            .map(NSFont::boldSystemFontOfSize)
-            .collect();
-        // Retain the complete color/font palette under the editor so cache entries never borrow stack values.
-        Self {
+            .map(|points| into_document_font(NSFont::boldSystemFontOfSize(points)))
+            .collect::<Result<Vec<_>, _>>()?;
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+        // SAFETY: 源码加重仍为原系统等宽 14pt semibold，不从 Preview 粗体继承另一套轴位。
+        let source_strong_font =
+            into_document_font(NSFont::monospacedSystemFontOfSize_weight(14.0, unsafe {
+                NSFontWeightSemibold
+            }))?;
+        // 隐藏语法仍保原真实 0.1pt 文稿字体；不是删除源码，也不借 UI 的细字号特殊策略。
+        let hidden_font = native_markdown_document_font(0.1)?;
+        Ok(Self {
             #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             list_glyphs: None,
             #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             list_hidden_foreground: NSColor::clearColor(),
-            strong_font: NSFont::boldSystemFontOfSize(15.0),
+            strong_font,
             #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
-            source_strong_font: NSFont::monospacedSystemFontOfSize_weight(14.0, semibold_weight),
+            source_strong_font,
             normal_font,
             fixed_font,
             table_header_font,
-            hidden_font: NSFont::systemFontOfSize(0.1),
+            hidden_font,
             heading_fonts,
             #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             foreground: NSColor::colorWithSRGBRed_green_blue_alpha(0.86, 0.88, 0.92, 1.0),
@@ -138,17 +225,19 @@ impl MarkdownTextAttributePalette {
             table_active_background: NSColor::colorWithSRGBRed_green_blue_alpha(
                 0.13, 0.20, 0.31, 1.0,
             ),
-        }
+        })
     }
 
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     /// TextKit 在原 storage 装配点取得完整资源；所有 Native 创建均先于属性/正文槽的借用。
     /// 五个字形仍整体成功或整体保持字面，由原 palette 独占到该 editor 实际释放。
-    pub(super) fn new_for_textkit(normal_font: Retained<NSFont>) -> Self {
-        let mut palette = Self::new(normal_font);
+    pub(super) fn new_for_textkit(
+        normal_font: Retained<NSFont>,
+    ) -> Result<Self, NativeMarkdownLineFontError> {
+        let mut palette = Self::new(normal_font)?;
         // 这里已经处于真实 TextKit 创建流程；不在属性 getter、首次滚动或懒查询中补建字形。
         palette.list_glyphs = MarkdownListMarkerGlyphPalette::new();
-        palette
+        Ok(palette)
     }
 }
 
@@ -172,7 +261,7 @@ fn native_markdown_is_heading(styles: MarkdownPresentationStyles) -> bool {
 fn native_markdown_source_font(
     styles: MarkdownPresentationStyles,
     palette: &MarkdownTextAttributePalette,
-) -> Retained<NSFont> {
+) -> Result<Retained<NSFont>, NativeMarkdownLineFontError> {
     let font = if native_markdown_is_heading(styles)
         || styles.contains(MarkdownPresentationStyles::STRONG)
     {
@@ -183,16 +272,11 @@ fn native_markdown_source_font(
         &palette.fixed_font
     };
     if styles.contains(MarkdownPresentationStyles::EMPHASIS) {
-        // Emphasis adds only an italic face while retaining the selected source point size.
-        let descriptor = font.fontDescriptor();
-        let descriptor = descriptor.fontDescriptorWithSymbolicTraits(
-            descriptor.symbolicTraits() | NSFontDescriptorSymbolicTraits::TraitItalic,
-        );
-        NSFont::fontWithDescriptor_size(&descriptor, font.pointSize())
-            .unwrap_or_else(|| font.clone())
+        // Source 仅增加真实 italic，保原等宽/字重/字号；不经私有字体名查找或普通字体兜底。
+        derive_document_font(font, font.pointSize(), true)
     } else {
         // Ordinary source reuses its fixed retained face.
-        font.clone()
+        Ok(font.clone())
     }
 }
 
@@ -235,7 +319,7 @@ fn native_markdown_source_color(styles: MarkdownPresentationStyles) -> Retained<
 pub(super) fn native_markdown_base_font(
     styles: MarkdownPresentationStyles,
     palette: &MarkdownTextAttributePalette,
-) -> Retained<NSFont> {
+) -> Result<Retained<NSFont>, NativeMarkdownLineFontError> {
     let hidden_marker = styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER)
         || styles.contains(MarkdownPresentationStyles::TABLE_ROW_PLACEHOLDER);
     let heading_font = if styles.contains(MarkdownPresentationStyles::HEADING_1) {
@@ -294,26 +378,20 @@ pub(super) fn native_markdown_base_font(
     if !hidden_marker
         && (styles.contains(MarkdownPresentationStyles::EMPHASIS) || subscript_content)
     {
-        // 沿已选标题/粗体/表格face保留组合特征；只缩小实际下标内容，显露的语法符仍可正常编辑。
-        let descriptor = base_font.fontDescriptor();
-        let descriptor = if styles.contains(MarkdownPresentationStyles::EMPHASIS) {
-            // 倾斜与下标可同时存在，不能为缩字号覆盖原EMPHASIS语义。
-            descriptor.fontDescriptorWithSymbolicTraits(
-                descriptor.symbolicTraits() | NSFontDescriptorSymbolicTraits::TraitItalic,
-            )
-        } else {
-            descriptor // 普通下标沿原face，不引入独立字体集合或正文缓存。
-        };
+        // 倾斜和下标可同时存在，统一派生同一个原 face；字号与 italic 都须真实成功。
         let point_size = if subscript_content {
             base_font.pointSize() * 0.75
         } else {
             base_font.pointSize() // 旧斜体保留原字号；Source不经过本Preview选字路径。
         };
-        NSFont::fontWithDescriptor_size(&descriptor, point_size)
-            .unwrap_or_else(|| base_font.clone())
+        derive_document_font(
+            base_font,
+            point_size,
+            styles.contains(MarkdownPresentationStyles::EMPHASIS),
+        )
     } else {
         // Nonitalic and hidden spans reuse the existing retained face without a new descriptor.
-        base_font.clone()
+        Ok(base_font.clone())
     }
 }
 
@@ -365,33 +443,33 @@ impl MarkdownFontSelectionCache {
         scalar: char,
         palette: &MarkdownTextAttributePalette,
         source_mode: bool,
-    ) -> MarkdownResolvedFont {
+    ) -> Result<MarkdownResolvedFont, NativeMarkdownLineFontError> {
         let base_font = if source_mode {
             // Source 必须保留等宽语义，不能因重入改回 preview 字体。
             native_markdown_source_font(styles, palette)
         } else {
             // Preview 仍处理标题、隐藏标记、表格和 emphasis 的原有优先级。
             native_markdown_base_font(styles, palette)
-        };
+        }?;
         let base_coverage = base_font.coveredCharacterSet();
         if (!source_mode && styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER))
             || native_markdown_character_set_covers(&base_coverage, scalar)
         {
             // 支持完整 scalar 时继续使用真实 base face，不伪造普通正文属性。
-            return MarkdownResolvedFont {
+            return Ok(MarkdownResolvedFont {
                 font: base_font,
                 base_coverage,
                 fallback_coverage: None,
-            };
+            });
         }
         // 未覆盖 scalar 按原策略让 Core Text 选择完整字符的 fallback，临时值仅活在调用栈。
         let font = native_markdown_fallback_font(&base_font, scalar);
         let coverage = font.coveredCharacterSet();
-        MarkdownResolvedFont {
+        Ok(MarkdownResolvedFont {
             font,
             base_coverage,
             fallback_coverage: Some(coverage),
-        }
+        })
     }
 
     /// Resolves one scalar and promotes reused fallback faces within the bounded LRU.
@@ -401,18 +479,18 @@ impl MarkdownFontSelectionCache {
         scalar: char,
         palette: &MarkdownTextAttributePalette,
         source_mode: bool,
-    ) -> MarkdownResolvedFont {
+    ) -> Result<MarkdownResolvedFont, NativeMarkdownLineFontError> {
         // Resolve semantic typography before testing coverage for this scalar.
-        let (base_font, base_coverage) = self.style_font(styles, palette, source_mode);
+        let (base_font, base_coverage) = self.style_font(styles, palette, source_mode)?;
         if (!source_mode && styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER))
             || native_markdown_character_set_covers(&base_coverage, scalar)
         {
             // Hidden syntax and supported scalars need no fallback font or fallback-run cache.
-            return MarkdownResolvedFont {
+            return Ok(MarkdownResolvedFont {
                 font: base_font,
                 base_coverage,
                 fallback_coverage: None,
-            };
+            });
         }
 
         // Reuse a fallback only when both semantic base identity and scalar coverage match.
@@ -432,7 +510,7 @@ impl MarkdownFontSelectionCache {
                 fallback_coverage: Some(entry.coverage.clone()),
             };
             self.fallback_fonts.push_back(entry);
-            return resolved;
+            return Ok(resolved);
         }
 
         // Core Text resolves an uncovered scalar without materializing any surrounding document.
@@ -447,11 +525,11 @@ impl MarkdownFontSelectionCache {
             font: fallback_font.clone(),
             coverage: fallback_coverage.clone(),
         });
-        MarkdownResolvedFont {
+        Ok(MarkdownResolvedFont {
             font: fallback_font,
             base_coverage,
             fallback_coverage: Some(fallback_coverage),
-        }
+        })
     }
 
     /// Resolves a semantic font once per style combination with bounded LRU promotion.
@@ -460,7 +538,7 @@ impl MarkdownFontSelectionCache {
         styles: MarkdownPresentationStyles,
         palette: &MarkdownTextAttributePalette,
         source_mode: bool,
-    ) -> (Retained<NSFont>, Retained<NSCharacterSet>) {
+    ) -> Result<(Retained<NSFont>, Retained<NSCharacterSet>), NativeMarkdownLineFontError> {
         if let Some(index) = self
             .style_fonts
             .iter()
@@ -473,7 +551,7 @@ impl MarkdownFontSelectionCache {
                 .expect("style font cache index was found immediately above");
             let result = (entry.font.clone(), entry.coverage.clone());
             self.style_fonts.push_back(entry);
-            return result;
+            return Ok(result);
         }
 
         // An unseen semantic combination acquires one face and its immutable coverage set.
@@ -483,7 +561,7 @@ impl MarkdownFontSelectionCache {
         } else {
             // Inline preview keeps heading sizes and concealed marker typography.
             native_markdown_base_font(styles, palette)
-        };
+        }?;
         let coverage = font.coveredCharacterSet();
         if self.style_fonts.len() == MAX_NATIVE_MARKDOWN_STYLE_FONT_CACHE_ENTRIES {
             // Enforce the fixed semantic-font bound before admitting another combination.
@@ -495,7 +573,7 @@ impl MarkdownFontSelectionCache {
             font: font.clone(),
             coverage: coverage.clone(),
         });
-        (font, coverage)
+        Ok((font, coverage))
     }
 }
 

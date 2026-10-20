@@ -20,15 +20,16 @@ use dispatch2::MainThreadBound;
 use objc2::rc::{Retained, Weak, autoreleasepool};
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{AnyThread, ClassType, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+use objc2_app_kit::NSFontDescriptorSymbolicTraits;
 use objc2_app_kit::{
     NSAccessibility, NSAlert, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSBox, NSBoxType, NSButton, NSColor, NSControl,
     NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSEventType,
-    NSFloatingWindowLevel, NSFocusRingType, NSFont, NSFontDescriptorSymbolicTraits,
-    NSFontWeightRegular, NSFontWeightSemibold, NSMenu, NSMenuItem, NSPanel, NSPasteboard,
-    NSPasteboardTypeString, NSPopUpButton, NSScrollView, NSTextAlignment, NSTextField,
-    NSTextFieldDelegate, NSTextFinderBarContainer, NSTextInputClient, NSTextView,
-    NSTextViewDelegate, NSTitlePosition, NSView, NSWindowAnimationBehavior,
+    NSFloatingWindowLevel, NSFocusRingType, NSFont, NSFontWeightRegular, NSFontWeightSemibold,
+    NSMenu, NSMenuItem, NSPanel, NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScrollView,
+    NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTextFinderBarContainer, NSTextInputClient,
+    NSTextView, NSTextViewDelegate, NSTitlePosition, NSView, NSWindowAnimationBehavior,
     NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
@@ -52,6 +53,7 @@ use thiserror::Error;
 mod text_attributes;
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use text_attributes::*;
+pub use text_attributes::{native_markdown_document_fixed_font, native_markdown_document_font};
 // 旧 GlyphInfo 与 TextKit 装配仅由独立机制夹具构造；正式分页图不编译这套适配器。
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 mod list_markers;

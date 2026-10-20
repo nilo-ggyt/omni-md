@@ -5,12 +5,13 @@ use crate::native_surface::{
     list_markers::MarkdownListGlyphRole,
     text_attributes::{
         MarkdownFontSelectionCache, MarkdownTextAttributePalette, MarkdownTextAttributeVariant,
-        build_markdown_text_attributes_with_row_height,
+        build_markdown_text_attributes_with_row_height, native_markdown_document_fixed_font,
+        native_markdown_document_font,
     },
 };
 use objc2::{AnyThread, rc::Weak, runtime::Bool};
 use objc2_app_kit::{
-    NSLayoutManager, NSTextContainer, NSTextContentStorage, NSTextLayoutFragment,
+    NSFont, NSLayoutManager, NSTextContainer, NSTextContentStorage, NSTextLayoutFragment,
     NSTextLayoutFragmentEnumerationOptions, NSTextLayoutFragmentState, NSTextLayoutManager,
     NSTextLayoutManagerSegmentOptions, NSTextLayoutManagerSegmentType, NSTextRange, NSTextStorage,
     NSTextStorageObserving,
@@ -312,19 +313,22 @@ fn native_weak(value: &AnyObject) -> Weak<AnyObject> {
 
 /// 系统 default-line API 与旧 TextKit 2 的独立短串同时给出真实标量，不用一次字号的失败反推 ceil 规则。
 pub(super) fn font_defaults() -> Result<(), String> {
+    // 行标量对照沿实际文稿 palette，不把任意 UI 字体的特殊默认策略算成产品字体合同。
+    let base = native_markdown_document_fixed_font(14.0).map_err(|cause| cause.to_string())?;
+    let palette = MarkdownTextAttributePalette::new(base).map_err(|cause| cause.to_string())?;
     for (name, font) in [
-        (
-            "mono14",
-            NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0),
-        ),
+        ("mono14", palette.fixed_font.clone()),
         (
             "mono13.5",
-            NSFont::monospacedSystemFontOfSize_weight(13.5, 0.0),
+            native_markdown_document_fixed_font(13.5).map_err(|cause| cause.to_string())?,
         ),
-        ("system15", NSFont::systemFontOfSize(15.0)),
-        ("heading28", NSFont::boldSystemFontOfSize(28.0)),
-        ("heading24", NSFont::boldSystemFontOfSize(24.0)),
-        ("hidden0.1", NSFont::systemFontOfSize(0.1)),
+        (
+            "document15",
+            native_markdown_document_font(15.0).map_err(|cause| cause.to_string())?,
+        ),
+        ("heading28", palette.heading_fonts[0].clone()),
+        ("heading24", palette.heading_fonts[1].clone()),
+        ("hidden0.1", palette.hidden_font.clone()),
     ] {
         let (height, baseline, weak) = autoreleasepool(|_| {
             let manager = NSLayoutManager::new();
@@ -364,7 +368,8 @@ fn attributed(
     presentation
         .rebuild(1, 0..source.encode_utf16().count(), source)
         .map_err(|cause| cause.to_string())?;
-    let palette = MarkdownTextAttributePalette::new(font.clone());
+    let palette =
+        MarkdownTextAttributePalette::new(font.clone()).map_err(|cause| cause.to_string())?;
     let string = NSString::from_str(source);
     let result =
         NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &string);
@@ -375,7 +380,8 @@ fn attributed(
             .ok_or("旧完整短样本缺少真实属性覆盖")?
             .styles;
         let resolved =
-            MarkdownFontSelectionCache::resolve_uncached(styles, scalar, &palette, false);
+            MarkdownFontSelectionCache::resolve_uncached(styles, scalar, &palette, false)
+                .map_err(|cause| cause.to_string())?;
         if matches!(scalar, '中' | '😀') {
             // 固定短例的原属性选字事实只含Font元数据；与候选相互独立，不输出正文或借它改变预期。
             eprintln!(

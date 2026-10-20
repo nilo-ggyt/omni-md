@@ -69,7 +69,8 @@ impl NativeMarkdownEditorSurface {
         scroll_view.setHasVerticalScroller(true);
         scroll_view.setHasHorizontalScroller(false);
         scroll_view.setDrawsBackground(true);
-        let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+        // 正文和源码沿同一 14pt 文稿等宽 base；UI 字体的中文半宽策略不属于文稿排版合同。
+        let font = native_markdown_document_fixed_font(14.0).map_err(|cause| cause.to_string())?;
         let paragraph = objc2_app_kit::NSParagraphStyle::defaultParagraphStyle();
         let body = NativeMarkdownPagedBody::attach(
             Rc::clone(model.document()),
