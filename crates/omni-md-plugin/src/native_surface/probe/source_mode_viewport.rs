@@ -147,13 +147,11 @@ impl ModeViewportExpectation {
         }
     }
 
-    /// 同一个 Body 固定持有原 Input 和视图；完整 InputState 保留主方向、多选、marked、fold 与 serial。
-    /// Native controller weak 的加载与前台查询不持 Doc 或回调槽借用，之后再核一遍真实输入。
-    fn require_original(&self, body: &Rc<NativeMarkdownPagedBody>) -> Result<(), String> {
-        if !std::rc::Weak::ptr_eq(&self.body, &Rc::downgrade(body))
-            || body.presentation_mode() != self.mode()
-        {
-            return Err("模式终点替换了原 Body 或尚未安装目标模式".into());
+    /// 等待登记也只认原 Body、视图和完整 Input；真实动作可能仍在等原 Producer 发布 Ready，
+    /// 此时旧模式不代表取消。这里只验证原拥有者，绝不把尚未安装的目标模式当作完成。
+    fn require_origin(&self, body: &Rc<NativeMarkdownPagedBody>) -> Result<(), String> {
+        if !std::rc::Weak::ptr_eq(&self.body, &Rc::downgrade(body)) {
+            return Err("模式动作替换了原 Body".into());
         }
         let controller = self.controller.load().ok_or("模式原 controller 已释放")?;
         if std::ptr::from_ref(&*controller).addr() != self.owner
@@ -167,12 +165,24 @@ impl ModeViewportExpectation {
         let document = self.document.upgrade().ok_or("模式原文稿已释放")?;
         let document = document.borrow();
         if std::ptr::from_ref(&**view).addr() != self.view
-            || body.presentation_mode() != self.mode()
             || input != self.input
             || document.generation() != self.generation
             || document.selection() != self.selection
         {
             return Err("模式终点改变了原文稿、Input、主选择或正文客户".into());
+        }
+        Ok(())
+    }
+
+    /// 只有终点才要求目标模式；原 weak 加载和 Native 输入读取前后都核同一实际模式。
+    /// CPU 发布与最终验收仍共用这道严格门，原动作被取消不会由旧模式帧取得成功收据。
+    fn require_original(&self, body: &Rc<NativeMarkdownPagedBody>) -> Result<(), String> {
+        if body.presentation_mode() != self.mode() {
+            return Err("模式终点尚未安装目标模式".into());
+        }
+        self.require_origin(body)?;
+        if body.presentation_mode() != self.mode() {
+            return Err("模式终点的目标模式已被撤销".into());
         }
         Ok(())
     }
@@ -317,7 +327,9 @@ impl ModeViewportExpectation {
             };
             let registered = (|| {
                 let body = expected.body.upgrade().ok_or("模式观察原 Body 已释放")?;
-                expected.require_original(&body)?;
+                // selector 可以先接纳原点击，再等唯一 Producer 的 Ready 才交模式事务。
+                // 登记观察不能抢先要求事务已完成；下方即时帧和 frame_published 仍只认目标模式。
+                expected.require_origin(&body)?;
                 let view = body.view().map_err(|cause| cause.to_string())?;
                 if let Some((key, paints)) = view.probe_cpu_published_frame()
                     && key.presentation_mode == expected.mode()

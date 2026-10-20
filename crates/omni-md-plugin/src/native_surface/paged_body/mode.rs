@@ -293,7 +293,11 @@ impl NativeMarkdownPagedBody {
         let body = MainThreadBound::new(self.weak.clone(), self.mtm);
         let pending = MainThreadBound::new(Rc::downgrade(&pending), self.mtm);
         let key = MainThreadBound::new(key, self.mtm);
-        controller.enqueue_owned(move || {
+        // 原模式动作已经由本 Body 的弱文稿、完整 Input、几何和 revision 接纳。
+        // AppKit 嵌套循环可暂借 Active；通用 enqueue_owned 只认槽内 owner，会在本闭包之前
+        // 静默丢掉合法动作并留下 queued=true。这里直交原主队列，由下面原 pending/槽身份
+        // 完整裁定执行或取消；真正 Busy 仍沿原事务失败，不重放、延时或借后继票补权。
+        crate::native_surface::enqueue_native_markdown_main_task(move || {
             let mtm = MainThreadMarker::new().expect("原模式动作只在主队列交付");
             let (Some(owner), Some(pending)) =
                 (body.get(mtm).upgrade(), pending.get(mtm).upgrade())
@@ -339,6 +343,8 @@ impl NativeMarkdownPagedBody {
                 controller.present_error(&cause);
             }
         });
+        // 与原 owned 入队保持相同临时强边；原队列只携弱身份，控制器析构在所有槽借用之外。
+        drop(controller);
     }
 
     /// 只取走本动作的原槽；返回值在槽借用结束后析构，避免Native weak控制块跨RefMut释放。
