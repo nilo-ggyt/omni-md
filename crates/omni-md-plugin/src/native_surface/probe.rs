@@ -350,10 +350,45 @@ impl NativeMarkdownPagedBodyPaintObserver for MemoryFrameObservation {
             let Some((actual, count)) = self.current_publication()? else {
                 return Err("CPU 发布回调没有真实当前完整帧".into());
             };
-            if !actual.same(key)
-                || count != paints
-                || self.started.elapsed() > Duration::from_secs(3)
-            {
+            let key_same = actual.same(key);
+            let count_same = count == paints;
+            let elapsed = self.started.elapsed();
+            if !key_same || !count_same || elapsed > Duration::from_secs(3) {
+                #[cfg(feature = "native-close-stage-diagnostic")]
+                {
+                    // 只在原失败分支拆开本次三个判据；两份 key 和计数均来自上述实际回调，
+                    // 不重新 capture Scene、查询 Native 或给旧观察补一张后继发布票。
+                    eprintln!(
+                        "native_memory_frame_callback_rejected elapsed_us={} key_same={key_same} count_same={count_same} callback_paints={paints} current_paints={count} request_same={} document_same={} target_same={} input_same={} geometry_same={} mode_same={} source_same={} nonce_same={} callback_input={:?} current_input={:?}",
+                        elapsed.as_micros(),
+                        actual.request.same(&key.request),
+                        WeakMarkdownDocument::ptr_eq(
+                            &actual.request.document,
+                            &key.request.document
+                        ),
+                        actual.request.target.same(&key.request.target),
+                        actual.request.input == key.request.input,
+                        actual.request.viewport == key.request.viewport
+                            && actual.request.bounds_width == key.request.bounds_width
+                            && actual.request.frame_in_parent == key.request.frame_in_parent
+                            && actual.request.geometry_epoch == key.request.geometry_epoch
+                            && actual.request.virtual_viewport == key.request.virtual_viewport,
+                        actual.presentation_mode == key.presentation_mode,
+                        actual.source == key.source,
+                        actual.nonce.same(&key.nonce),
+                        key.request.input,
+                        actual.request.input,
+                    );
+                    // 原 Body 的 Progress 只有现成计费和阶段标量；此处不推进执行器、读正文
+                    // 或保留新资源。它区分真正慢帧与 key/计数替换，错误仍走原拒绝和 signal。
+                    if let Some(body) = self.facts.body.upgrade() {
+                        eprintln!(
+                            "native_memory_frame_callback_progress progress={:?}",
+                            body.progress()
+                                .map_err(|cause| std::mem::discriminant(&cause)),
+                        );
+                    }
+                }
                 return Err("CPU 发布不是原票完整帧或超过原三秒期限".into());
             }
             // 仅保存源/输入弱票与 paints 标量。回调返回不保 Canvas、整幅 bitmap 或
