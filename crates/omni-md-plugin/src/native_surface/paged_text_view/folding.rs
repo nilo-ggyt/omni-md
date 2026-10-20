@@ -54,9 +54,23 @@ impl NativeMarkdownPagedTextView {
             let _callback = PayloadUseGuard::enter(&self.ivars().input_callback_depth);
             let _use = PayloadUseGuard::enter(&self.ivars().depth);
             self.cancel_link_intent();
-            if self.origin()?.state.marked.is_some() {
-                self.apply_unmark()?;
-            } // 已排在前面的真实 key 可能刚建立组合，沿原队首提交通知结束后再捕折叠 before。
+            let origin = self.origin()?;
+            if origin.state.marked.is_some() {
+                let context = self
+                    .ivars()
+                    .context
+                    .borrow()
+                    .clone()
+                    .ok_or(NativeMarkdownPagedTextViewError::ContextUnavailable)?;
+                // 已排在前面的key可刚建立组合；接受已显示文字后结束原系统转换，再捕折叠before。
+                // 不让旧IME会话跨fold重发缓冲，原行号key仍须通过下方同Scene权限检查。
+                self.finish_composition_in_context(
+                    &origin.input,
+                    &origin.delegate,
+                    &context,
+                    origin.epoch,
+                )?;
+            }
             let mut origin = self.origin()?;
             origin.interpreted = true;
             self.source_fold_at(&origin, action)

@@ -79,8 +79,22 @@ impl NativeMarkdownPagedTextView {
     pub(super) fn accept_drop(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> Result<()> {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         self.cancel_link_intent();
-        if self.origin()?.state.marked.is_some() {
-            self.apply_unmark()?; // 原输入法先完成真实组合；失败保留候选，外部文件尚未复制。
+        let origin = self.origin()?;
+        if origin.state.marked.is_some() {
+            let context = self
+                .ivars()
+                .context
+                .borrow()
+                .clone()
+                .ok_or(Error::ContextUnavailable)?;
+            // 放下接受已显示组合，再结束原转换；不能让旧IME缓冲在附件动作后再次提交。
+            // 同步回调仍核原客户，外部文件此时尚未复制，Scene命中仍在收尾后重新领取。
+            self.finish_composition_in_context(
+                &origin.input,
+                &origin.delegate,
+                &context,
+                origin.epoch,
+            )?;
         }
         let scene = self.scene()?;
         if scene.origin.input.is_cell() {
@@ -139,8 +153,22 @@ impl NativeMarkdownPagedTextView {
             let _callback = PayloadUseGuard::enter(&self.ivars().input_callback_depth);
             let _use = PayloadUseGuard::enter(&self.ivars().depth);
             self.cancel_link_intent();
-            if self.origin()?.state.marked.is_some() {
-                self.apply_unmark()?;
+            let origin = self.origin()?;
+            if origin.state.marked.is_some() {
+                let context = self
+                    .ivars()
+                    .context
+                    .borrow()
+                    .clone()
+                    .ok_or(Error::ContextUnavailable)?;
+                // 队首前面的真实输入可刚建立组合；仅接受该原客户显示文字并结束系统转换。
+                // 不重领解释权限；下方拖放generation与原physical命中仍须在收尾后严格核对。
+                self.finish_composition_in_context(
+                    &origin.input,
+                    &origin.delegate,
+                    &context,
+                    origin.epoch,
+                )?;
             }
             if let Some((generation, position)) = drop {
                 let mut origin = self.origin()?;

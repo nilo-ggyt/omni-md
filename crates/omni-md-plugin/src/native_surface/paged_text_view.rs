@@ -354,6 +354,35 @@ define_class!(
             self.finish_input_trace_scope(trace_scope);
         }
 
+        #[unsafe(method(flagsChanged:))]
+        fn flags_changed(&self, event: &NSEvent) {
+            let _use = PayloadUseGuard::enter(&self.ivars().depth);
+            let result = (|| {
+                let input = self.ivars().input.borrow().clone()
+                    .ok_or(NativeMarkdownPagedTextViewError::Closed)?;
+                let (delegate, context) = self.foreground_context()?;
+                let epoch = self.ivars().epoch;
+                let current = || self.same_input_context(&input, &delegate, &context)
+                    && delegate.current(epoch)
+                    && self.same_input_context(&input, &delegate, &context);
+                if !current() { return Err(NativeMarkdownPagedTextViewError::Revoked); }
+                // NSResponder默认只向nextResponder传播修饰键，不会替本客户通知输入上下文。
+                // IME可用单独Shift的按下/释放结束或切换本会话组合，故交给原context解释；
+                // 回调允许修改原Input，前后只核客户生命周期，不能要求旧marked/选择仍相等。
+                // flagsChanged没有字符或重复键合同，不借keyDown的trace、命令队列或字符属性。
+                let consumed = context.0.handleEvent(event);
+                if !current() { return Err(NativeMarkdownPagedTextViewError::Revoked); }
+                if !consumed {
+                    // 未消费才保留原responder链；不重放或自行解释该次修饰键。
+                    // SAFETY: 原主线程view由本回调保护，只同步借用公开flagsChanged:的原事件。
+                    unsafe { let _: () = msg_send![super(self), flagsChanged: event]; }
+                    if !current() { return Err(NativeMarkdownPagedTextViewError::Revoked); }
+                }
+                Ok(())
+            })();
+            self.record(result);
+        }
+
         #[unsafe(method(scrollWheel:))]
         /// 实际滚轮是新视口意图，即使重入原排版栈也先撤旧模式定位；系统滚动仍只传播一次。
         fn scroll_wheel(&self, event: &NSEvent) {
@@ -872,15 +901,27 @@ impl NativeMarkdownPagedTextView {
     }
     fn scene_request(&self, origin: &Origin) -> Result<NativeMarkdownPagedSceneRequest> {
         let visible = origin.step(self, || self.visibleRect())?;
-        let bounds = origin.step(self, || self.bounds())?;
+        // 前一个 getter 的完整出口检查已授权紧邻调用；中间没有重入、借用或对象析构。
+        // 每个实际 Native 返回后仍核原 Input/epoch/geometry，不合并为一组调用后的单次检查。
+        let bounds = self.bounds();
+        if !origin.current(self) {
+            return Err(NativeMarkdownPagedTextViewError::Revoked);
+        }
         let viewport =
             bounded_viewport(visible, bounds).ok_or(NativeMarkdownPagedTextViewError::Pending)?;
-        let frame_in_parent = origin.step(self, || self.frame())?;
-        let virtual_viewport = origin.step(self, || {
-            origin
-                .delegate
-                .virtual_viewport(origin.epoch, bounds.size.width)
-        })??;
+        // bounded_viewport 仅计算 Copy 矩形；沿同一出口权限读取原父坐标，不重采后继请求。
+        let frame_in_parent = self.frame();
+        if !origin.current(self) {
+            return Err(NativeMarkdownPagedTextViewError::Revoked);
+        }
+        let virtual_viewport = origin
+            .delegate
+            .virtual_viewport(origin.epoch, bounds.size.width);
+        // delegate 可重入且可失败；先检查原权限再解包结果，保持失权优先的原错误顺序。
+        if !origin.current(self) {
+            return Err(NativeMarkdownPagedTextViewError::Revoked);
+        }
+        let virtual_viewport = virtual_viewport?;
         if !finite_rect(viewport, true)
             || !bounds.size.width.is_finite()
             || bounds.size.width <= 0.0

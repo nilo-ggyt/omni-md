@@ -370,7 +370,20 @@ impl NativeMarkdownPagedTextView {
             return self.finish_edit_commit(&origin, commit); // 新增剪贴板文字仍走原有限输入转换/事务上限。
         }
         if selector == sel!(cancelOperation:) && origin.state.marked.is_some() {
-            return self.apply_unmark();
+            let context = self
+                .ivars()
+                .context
+                .borrow()
+                .clone()
+                .ok_or(NativeMarkdownPagedTextViewError::ContextUnavailable)?;
+            // 保原Esc接受已显示组合的交互，只结束该客户的系统转换，不扩为取消正文/退出格。
+            // 协议unmarkText自身仍仅local-unmark；这里是业务命令，不能留下旧IME缓冲继续提交。
+            return self.finish_composition_in_context(
+                &origin.input,
+                &origin.delegate,
+                &context,
+                origin.epoch,
+            );
         }
         if origin.input.is_cell() {
             use super::NativeMarkdownPagedCellAction as CellAction;
