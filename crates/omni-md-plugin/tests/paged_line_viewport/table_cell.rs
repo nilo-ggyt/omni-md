@@ -16,8 +16,8 @@ use omni_md_plugin::native_surface::paged_line_viewport::{
     NativeMarkdownComposedViewportPaintOutcome as PaintOutcome,
 };
 
-const TEXT: &str = "| H | C |\n| --- | --- |\n| **Bold** *Italic* [Link](https://example.com) `a\\|b` tail | second |\n";
-const DISPLAY: &str = "Bold Italic Link a|b tail";
+const TEXT: &str = "| H | C |\n| --- | --- |\n| **Bold** *Italic* [Link](https://example.com) `a\\|b` tail `#101` | second |\n";
+const DISPLAY: &str = "Bold Italic Link a|b tail #101";
 
 /// 原请求必须实际完成表格和 inline 发布；不手工填充样式、raw 范围或完成标记。
 fn publication(
@@ -324,6 +324,50 @@ pub(super) fn verify(mtm: MainThreadMarker) {
             );
             let other_canvas = Canvas::new();
             assert!(!cells[0].permits_completion(&first, &other_canvas.context));
+            // 普通单向字符的正中是合法鼠标落点；两端caret虽同距，却不是同一视觉位置。
+            // 用原Parser的代码显示源与真实Menlo度量取得字符框，不能改点避开产品的平局分支，
+            // 也不能把这种普通平局作为BiDi歧义传给Grid，令实际点击被拒绝。
+            let position = canonical("#101");
+            let character = cells[0]
+                .first_rect(
+                    NSRange::new(position, 1),
+                    NativeMarkdownPagedHeadAffinity::Downstream,
+                    &current,
+                )
+                .unwrap();
+            assert_eq!(character.actual_range, NSRange::new(position, 1));
+            assert!(character.rect.size.width > 0.0 && character.rect.size.height > 0.0);
+            // 两端另取原公开零范围几何，证明这是不同视觉位置的普通首GCB，
+            // 不靠UTF16差值或等宽字体名称猜caret间距，也不借被删除的代码标记充当端点。
+            let start = cells[0]
+                .first_rect(
+                    NSRange::new(position, 0),
+                    NativeMarkdownPagedHeadAffinity::Downstream,
+                    &current,
+                )
+                .unwrap();
+            let end = cells[0]
+                .first_rect(
+                    NSRange::new(position + 1, 0),
+                    NativeMarkdownPagedHeadAffinity::Downstream,
+                    &current,
+                )
+                .unwrap();
+            assert_ne!(start.rect.origin.x, end.rect.origin.x);
+            let midpoint = NSPoint::new(
+                character.rect.origin.x + character.rect.size.width / 2.0,
+                character.rect.origin.y + character.rect.size.height / 2.0,
+            );
+            let hit = cells[0].hit(midpoint, &current).unwrap();
+            // 平局可沿原稳定主候选落在此字符的任一真实端点，不强制新的视觉导航规则。
+            // 但另一个逻辑位置只能由真正重合的caret产生，否则Grid会拒绝合法单击。
+            assert!(hit.source_utf16 == position || hit.source_utf16 == position + 1);
+            assert!(
+                hit.other_source_utf16.is_none(),
+                "普通代码字符中点不能产生另一逻辑候选：hit={hit:?}, midpoint={midpoint:?}, start={:?}, end={:?}",
+                start.rect,
+                end.rect,
+            );
             // 返回值必须是 canonical 字符范围，不能把去除 Markdown 标记后的局部下标交给 Find。
             for label in ["Bold", "Italic", "Link", "a\\|b", "tail"] {
                 let position = canonical(label);

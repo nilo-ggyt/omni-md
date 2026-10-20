@@ -205,12 +205,21 @@ struct ConflictProbeFacts {
     completed: bool,
 }
 
+/// 真实按钮已发送、正式主队列尚可未执行时，只保留这一次排队的精确前后意图。
+/// 前态Input在点击前固定；等待端不能从后来状态重采，也不能借前态通过完成认证。
+struct FindReplacementQueuedButton {
+    before_intent: u64,
+    after_intent: u64,
+    before_input: NativeMarkdownPagedInputState,
+}
+
 /// 查找组合回归只跨事件保弱身份和预声明坐标；不保活栏、字段或共享 editor。
 struct FindReplacementProbeFacts {
     bar: std::rc::Weak<NativeMarkdownFindBar>,
     field_editor: Weak<NSTextView>,
     route: Option<(usize, u64)>,
     intent: u64,
+    queued_button: Option<FindReplacementQueuedButton>,
     first: MarkdownTextSelection,
     last: MarkdownTextSelection,
     /// 每个真实按钮或历史动作先固定起点；后继观察只能消费该次三秒期限。
@@ -1577,6 +1586,7 @@ impl NativeMarkdownHostedTableProbe {
                 field_editor: weak,
                 route: Some(route.get()),
                 intent: next,
+                queued_button: None,
                 first,
                 last,
                 action_started: Instant::now(),
@@ -1594,9 +1604,10 @@ impl NativeMarkdownHostedTableProbe {
         facts: &AppendFacts,
         probe: &FindReplacementProbeFacts,
         generation: u64,
+        intent: u64,
     ) -> bool {
         self.current(surface, facts, generation)
-            && surface.controller.find_input_intent() == probe.intent
+            && surface.controller.find_input_intent() == intent
             && probe.route.is_none_or(|route| {
                 surface
                     .controller
@@ -1621,13 +1632,30 @@ impl NativeMarkdownHostedTableProbe {
         probe: &mut FindReplacementProbeFacts,
         action: MarkdownFindAction,
     ) -> Result<(), String> {
-        let button = with_active_native_markdown_surface(|surface| {
-            let current = || self.find_replacement_current(surface, facts, probe, facts.generation);
+        if probe.queued_button.is_some() {
+            return Err("原查找按钮尚未消费真实终点".into());
+        }
+        let (button, before_input) = with_active_native_markdown_surface(|surface| {
+            let current = || {
+                self.find_replacement_current(surface, facts, probe, facts.generation, probe.intent)
+            };
             let bar = probe.bar.upgrade().ok_or("原查找栏已释放")?;
-            step(&current, || bar.probe_button(action).retain())
+            let button = step(&current, || bar.probe_button(action).retain())?;
+            let input = step(&current, || {
+                surface.editor.as_ref().unwrap().text_view.input_state()
+            })?
+            .map_err(|cause| cause.to_string())?;
+            Ok((button, input))
         })?;
         let next = probe.intent.checked_add(1).ok_or("查找按钮意图溢出")?;
         probe.action_started = Instant::now(); // 入原 selector 前固定期限，不从后来 Ready 重置时钟。
+        // performClick只排正式controller工作，下一Host事件与主GCD队列没有先后保证。
+        // 保存原票允许精确前态暂等；预声明后态仍只有这次按钮应推进的一次意图。
+        probe.queued_button = Some(FindReplacementQueuedButton {
+            before_intent: probe.intent,
+            after_intent: next,
+            before_input,
+        });
         // SAFETY: 只点击原栏当前具体按钮；原 target/action 自己排队执行，不伪造完成或直接调用后端。
         unsafe { button.performClick(None) };
         drop(button);
@@ -1641,7 +1669,7 @@ impl NativeMarkdownHostedTableProbe {
     fn wait_find_replacement(
         &self,
         facts: &AppendFacts,
-        probe: &FindReplacementProbeFacts,
+        probe: &mut FindReplacementProbeFacts,
         stage: u8,
     ) -> Result<(), String> {
         let (before_delta, after_delta, expected) = match stage {
@@ -1667,8 +1695,16 @@ impl NativeMarkdownHostedTableProbe {
         );
         loop {
             let ready = with_active_native_markdown_surface(|surface| {
-                if !self.find_replacement_current(surface, facts, probe, before)
-                    && !self.find_replacement_current(surface, facts, probe, after)
+                // 只有四次实际Find按钮拥有排队前态；Undo/Redo/保存不能借旧intent继续等。
+                let queued = probe.queued_button.as_ref().filter(|button| {
+                    stage <= 4
+                        && button.after_intent == probe.intent
+                        && surface.controller.find_input_intent() == button.before_intent
+                });
+                let intent = queued.map_or(probe.intent, |button| button.before_intent);
+                if !self.find_replacement_current(surface, facts, probe, before, intent)
+                    && (queued.is_some()
+                        || !self.find_replacement_current(surface, facts, probe, after, intent))
                 {
                     return Err("等待查找组合结果时原意图或文稿已撤销".into());
                 }
@@ -1679,6 +1715,24 @@ impl NativeMarkdownHostedTableProbe {
                 if let Some(cause) = editor.text_view.take_failure()
                     && !matches!(cause, crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Pending)
                 { return Err(format!("查找组合输入失败：{cause}")); }
+                if let Some(button) = queued {
+                    // 正文/客户失败仍优先于Pending；原Source健康也须真实核验，零端点
+                    // 不加载正文页。前态只接受点击前完整Input，任何额外输入立即撤权。
+                    editor
+                        .document()
+                        .borrow()
+                        .byte_offset_for_utf16(0)
+                        .map_err(|cause| cause.to_string())?;
+                    if editor
+                        .text_view
+                        .input_state()
+                        .map_err(|cause| cause.to_string())?
+                        != button.before_input
+                    {
+                        return Err("查找按钮排队期间原完整正文输入已改变".into());
+                    }
+                    return Ok(false); // 不看旧反馈/旧CPU，也不重发按钮或重新领取三秒期限。
+                }
                 {
                     let document = editor.document().borrow();
                     if document.generation() != after
@@ -1701,7 +1755,7 @@ impl NativeMarkdownHostedTableProbe {
                     {
                         return Ok(false);
                     }
-                    if !self.find_replacement_current(surface, facts, probe, after) {
+                    if !self.find_replacement_current(surface, facts, probe, after, probe.intent) {
                         return Err("替换拒绝反馈后原票已撤销".into());
                     }
                 }
@@ -1729,12 +1783,13 @@ impl NativeMarkdownHostedTableProbe {
                     Err(crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Pending) => return Ok(false),
                     Err(cause) => return Err(cause.to_string()),
                 }
-                if !self.find_replacement_current(surface, facts, probe, after) {
+                if !self.find_replacement_current(surface, facts, probe, after, probe.intent) {
                     return Err("真实查找可见证明返回后原票已撤销".into());
                 }
                 Ok(true)
             })?;
             if ready && probe.action_started.elapsed() <= Duration::from_secs(3) {
+                let _ = probe.queued_button.take(); // 只有原严格终点通过才消费前态，后继历史动作没有排队宽限。
                 return Ok(());
             }
             let remaining = Duration::from_secs(3)
@@ -1772,7 +1827,8 @@ impl NativeMarkdownHostedTableProbe {
             .checked_add(delta)
             .ok_or("查找组合代次溢出")?;
         let revision = with_active_native_markdown_surface(|surface| {
-            let current = || self.find_replacement_current(surface, facts, probe, generation);
+            let current =
+                || self.find_replacement_current(surface, facts, probe, generation, probe.intent);
             if !current() {
                 return Err("查找组合原操作票已失效".into());
             }
@@ -1889,7 +1945,7 @@ impl NativeMarkdownHostedTableProbe {
             .take()
             .ok_or("查找组合原票缺失")?;
         let result = (|| {
-            self.wait_find_replacement(&facts, &probe, stage)?;
+            self.wait_find_replacement(&facts, &mut probe, stage)?;
             self.verify_find_replacement_stage(&facts, &probe, stage)?;
             match stage {
                 1 => self.click_find_replacement_button(
@@ -1905,7 +1961,13 @@ impl NativeMarkdownHostedTableProbe {
                 3 => {
                     with_active_native_markdown_surface(|surface| {
                         let current = || {
-                            self.find_replacement_current(surface, &facts, &probe, facts.generation)
+                            self.find_replacement_current(
+                                surface,
+                                &facts,
+                                &probe,
+                                facts.generation,
+                                probe.intent,
+                            )
                         };
                         let actual = step(&current, || probe.field_editor.load())?
                             .ok_or("原替换 editor 已释放")?;
@@ -1934,8 +1996,15 @@ impl NativeMarkdownHostedTableProbe {
                 4 => {
                     with_active_native_markdown_surface(|surface| {
                         let generation = facts.generation.checked_add(1).ok_or("替换代次溢出")?;
-                        let current =
-                            || self.find_replacement_current(surface, &facts, &probe, generation);
+                        let current = || {
+                            self.find_replacement_current(
+                                surface,
+                                &facts,
+                                &probe,
+                                generation,
+                                probe.intent,
+                            )
+                        };
                         let view = &surface.editor.as_ref().ok_or("原正文缺失")?.text_view;
                         if !current() || !surface.panel.makeFirstResponder(Some(&**view)) {
                             return Err("提交后替换字段拒绝正常辞任".into());
@@ -1963,7 +2032,13 @@ impl NativeMarkdownHostedTableProbe {
                     probe.action_started = Instant::now();
                     with_active_native_markdown_surface(|surface| {
                         let generation = facts.generation.checked_add(3).ok_or("Redo代次溢出")?;
-                        if !self.find_replacement_current(surface, &facts, &probe, generation) {
+                        if !self.find_replacement_current(
+                            surface,
+                            &facts,
+                            &probe,
+                            generation,
+                            probe.intent,
+                        ) {
                             return Err("查找组合保存前原票已撤销".into());
                         }
                         surface.save_current_document() // 只用正常保存，不直接写测试期望到磁盘。

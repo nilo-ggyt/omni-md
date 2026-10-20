@@ -19,7 +19,7 @@ pub struct NativeMarkdownComposedViewportHit {
     pub source_affinity: omni_markdown_core::MarkdownComposedLineAffinity,
     /// 第二候选保它自己的实际 part 侧，不能借主候选的亲和解释 BiDi 边界。
     pub other_source_affinity: Option<omni_markdown_core::MarkdownComposedLineAffinity>,
-    /// 两个逻辑位置与点击点同距时保留另一候选，外层不能据此伪造主方向。
+    /// 同一实际视觉x对应两个逻辑位置时保留另一候选，外层不能据此伪造主方向。
     pub other_source_utf16: Option<usize>,
     pub line_ordinal: usize,
 }
@@ -426,6 +426,9 @@ impl NativeMarkdownComposedViewport {
         }
         let mut answer: Option<NativeMarkdownComposedViewportHit> = None;
         let mut distance = f64::INFINITY;
+        // 只在answer已由真实caret产生后参与比较；普通字符中点两侧同距不等于视觉位置重合。
+        // 这个坐标属于本次有限扫描，不保存Source、后继输入或跨调用几何缓存。
+        let mut primary_caret_x = 0.0;
         let mut primary_inside_part = false;
         // 有限GCB逐项比较真实caret；不假设连字内部GDEF单调，也不按源字节长度插值。
         for part in &line.parts {
@@ -458,6 +461,7 @@ impl NativeMarkdownComposedViewport {
                 if delta < distance {
                     // 更近的视觉位置整体替换旧候选，旧BiDi歧义不能污染新结果。
                     distance = delta;
+                    primary_caret_x = caret.baseline.x;
                     primary_inside_part = inside_part;
                     answer = Some(NativeMarkdownComposedViewportHit {
                         source_utf16: position,
@@ -472,14 +476,23 @@ impl NativeMarkdownComposedViewport {
                     && inside_part
                     && !primary_inside_part
                 {
-                    // 同一可见 caret 的两个样式 part 重合时，取点击点实际落入的墨迹跨度一侧。
-                    // 这只决定隐藏语法前后的来源亲和，不丢另一个真实 BiDi 逻辑候选。
+                    // 同源caret有两侧时，取点击点实际落入的墨迹跨度一侧，并同步真实视觉位置。
+                    // 若主位置已从另一同距x换边，原other属于旧x，不能挂到新位置冒称BiDi重合；
+                    // 同x只换样式亲和则保留真实的另一逻辑候选，不丢隐藏语法边缘事实。
+                    if primary_caret_x != caret.baseline.x {
+                        answer.other_source_affinity = None;
+                        answer.other_source_utf16 = None;
+                    }
                     answer.source_affinity = affinity;
+                    primary_caret_x = caret.baseline.x;
                     primary_inside_part = true;
                 } else if delta == distance
+                    && primary_caret_x == caret.baseline.x
                     && let Some(answer) = &mut answer
                     && answer.source_utf16 != position
                 {
+                    // 只有同x的真实不同端点才构成逻辑歧义；异x普通平局沿原稳定主候选结束，
+                    // 不按字符宽度插值、不新增方向猜测，也不把合法的字符中点交给外层拒绝。
                     if answer
                         .other_source_utf16
                         .is_some_and(|other| other != position)
