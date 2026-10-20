@@ -447,15 +447,9 @@ define_class!(
                 self.failure(NativeMarkdownPagedTextViewError::Closed);
                 return;
             };
-            let scene = match self.scene() {
-                Ok(scene) => scene,
-                Err(NativeMarkdownPagedTextViewError::Pending) => {
-                    // 原ready_scene已安排唯一schedule；本次没有可画图，不能把正常等帧写成输入失败。
-                    return; // 不发布image、不增加paint，也不把旧图冒充本次Ready。
-                }
-                Err(cause) => { self.failure(cause); return; }
-            };
-            self.record(surface.paint(self, &scene)); // 实际绘图/Source/资源错误照常保留，不能被上面的未Ready分支吞掉。
+            // 显示入口允许放弃获取期间已被真实输入或几何换代取代的旧请求。
+            // 输入命令仍走严格 scene()；实际 CPU 绘图和资源错误继续记录到原失败槽。
+            self.record(surface.paint_current(self));
         }
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
@@ -949,6 +943,11 @@ impl NativeMarkdownPagedTextView {
     }
     fn scene(&self) -> Result<SceneUse> {
         let origin = self.origin()?;
+        self.scene_for_origin(origin)
+    }
+
+    /// 一次 Scene 获取只沿同一原输入和几何事实推进，不在 Native 重入后重采后继客户。
+    fn scene_for_origin(&self, origin: Origin) -> Result<SceneUse> {
         let request = self.scene_request(&origin)?;
         let scene = origin.delegate.ready_scene(&request)?;
         let key = scene.key().clone();
@@ -1224,7 +1223,6 @@ impl NativeMarkdownPagedTextView {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         self.foreground().is_ok()
     }
-    #[track_caller]
     fn failure(&self, error: NativeMarkdownPagedTextViewError) {
         let mut slot = self.ivars().last_failure.borrow_mut();
         if slot.is_none()
@@ -1243,16 +1241,6 @@ impl NativeMarkdownPagedTextView {
                     | NativeMarkdownPagedTextViewError::FoldAction(_)
             ))
         {
-            #[cfg(feature = "native-close-stage-diagnostic")]
-            eprintln!(
-                "native_input_failure cause={:?} caller={} geometry_epoch={} depth={} interpreting_key={} closed={}",
-                std::mem::discriminant(&error),
-                std::panic::Location::caller(),
-                self.ivars().geometry_epoch.get(),
-                self.ivars().depth.get(),
-                self.ivars().interpreting_key.get(),
-                self.ivars().closed.get(),
-            );
             *slot = Some(error);
         } // Pending/外部文件拒绝不能挡住真实源、资源或已提交后果首错；真实首错不被后续普通拒绝覆盖。
     }
@@ -1272,7 +1260,6 @@ impl NativeMarkdownPagedTextView {
         } // 没有原链时才显示当前原窗口；关闭或换笔记后不复活旧反馈。
     }
     /// 只有顶层真实mutation/command的void回调决定原解释结果；候选坐标Pending保协议负值。
-    #[track_caller]
     fn record_input(&self, result: Result<()>) {
         if let Err(cause) = result {
             #[cfg(feature = "native-input-trace")]
@@ -1298,14 +1285,12 @@ impl NativeMarkdownPagedTextView {
             }
         }
     }
-    #[track_caller]
     fn record(&self, result: Result<()>) {
         if let Err(error) = result {
             self.report_attachment_rejection(&error);
             self.failure(error);
         }
     }
-    #[track_caller]
     fn boolean_result(&self, result: Result<()>) -> bool {
         match result {
             Ok(()) => true,

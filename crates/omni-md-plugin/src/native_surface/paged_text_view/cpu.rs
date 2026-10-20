@@ -207,65 +207,47 @@ impl CpuSurface {
         Ok(())
     }
 
-    pub(super) fn paint(
-        self: &Rc<Self>,
-        view: &NativeMarkdownPagedTextView,
-        scene: &SceneUse,
-    ) -> Result<()> {
+    /// AppKit 显示回调获取的是此刻画面；获取期间旧输入或几何已换代时，只放弃该次请求。
+    /// 原客户捕获失败、真正的资源错误以及 Ready 后的 CPU/图层检查仍由原失败边界处理。
+    pub(super) fn paint_current(self: &Rc<Self>, view: &NativeMarkdownPagedTextView) -> Result<()> {
+        let origin = view.origin()?;
+        let ticket = candidate::Ticket::new(&origin);
+        let scene = match view.scene_for_origin(origin) {
+            Ok(scene) => scene,
+            Err(NativeMarkdownPagedTextViewError::Pending) => {
+                return Ok(()); // 唯一布局任务已排队；不发布像素，也不把旧图冒充新 Ready。
+            }
+            Err(NativeMarkdownPagedTextViewError::Revoked) if ticket.superseded(view)? => {
+                return Ok(()); // 只认原客户、完整 Input 或几何的真实换代，不凭 !scene_current 放行。
+            }
+            Err(cause) => return Err(cause),
+        };
+        self.paint(view, &scene) // Ready 后不再借获取期票据吞掉 Source、字体或 Native 所有权错误。
+    }
+
+    fn paint(self: &Rc<Self>, view: &NativeMarkdownPagedTextView, scene: &SceneUse) -> Result<()> {
         let painting = match PaintUse::enter(&self.painting) {
             Ok(painting) => painting,
             Err(NativeMarkdownPagedTextViewError::Pending) => {
                 // updateLayer 可在 CoreText/AppKit 的同步回调里重入。这里只拒绝第二个写入者，
                 // 原候选仍由外层独占；健康的显示请求不应成为永久输入失败。
                 let current = || scene.current(view);
-                let result = (|| {
-                    scene.scene.validate_ready(&current)?;
-                    let layer = self.layer_current(view, &current);
-                    scene.scene.validate_ready(&current)?;
-                    layer
-                })();
-                #[cfg(feature = "native-close-stage-diagnostic")]
-                self.trace_paint_failure("reentrant", view, scene, &result);
-                result?; // 真实 Source、字体和 Native 所有权错误仍原样失败，不能被合并请求掩盖。
+                scene.scene.validate_ready(&current)?;
+                let layer = self.layer_current(view, &current);
+                scene.scene.validate_ready(&current)?;
+                layer?; // 真实 Source、字体和 Native 所有权错误仍原样失败，不能被合并请求掩盖。
                 self.repaint_requested.set(true);
                 return Ok(());
             }
             Err(cause) => return Err(cause),
         };
         let result = self.paint_inner(view, scene);
-        #[cfg(feature = "native-close-stage-diagnostic")]
-        self.trace_paint_failure("paint_inner", view, scene, &result);
         drop(painting);
         let wake = self.wake_deferred(view); // 若真实嵌套主队列让出了延续，只在原绘图栈退出后重排同serial。
-        #[cfg(feature = "native-close-stage-diagnostic")]
-        self.trace_paint_failure("wake_deferred", view, scene, &wake);
         match result {
             Err(error) => Err(error),
             Ok(()) => wake,
         } // 原绘图/Source首错不能被后继调度拒绝替换。
-    }
-    #[cfg(feature = "native-close-stage-diagnostic")]
-    fn trace_paint_failure(
-        &self,
-        stage: &str,
-        view: &NativeMarkdownPagedTextView,
-        scene: &SceneUse,
-        result: &Result<()>,
-    ) {
-        if let Err(cause) = result {
-            eprintln!(
-                "native_cpu_failure stage={stage} cause={:?} original={:?} actual={:?} original_geometry={} actual_geometry={} origin_current={} scene_current={} depth={} active_serial={:?}",
-                std::mem::discriminant(cause),
-                scene.origin.state,
-                scene.origin.input.state(),
-                scene.origin.geometry_epoch,
-                view.ivars().geometry_epoch.get(),
-                scene.origin.current(view),
-                scene.current(view),
-                view.ivars().depth.get(),
-                self.active_serial.get(),
-            );
-        }
     }
     fn paint_inner(
         self: &Rc<Self>,

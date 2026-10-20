@@ -16,13 +16,14 @@ pub(super) struct Ticket {
     geometry_epoch: u64,
 }
 impl Ticket {
-    fn new(scene: &SceneUse) -> Self {
+    /// 同步获取和异步候选共享原事实；只保存弱身份，绝不保存后继 Scene 或延长正文资源寿命。
+    pub(super) fn new(origin: &Origin) -> Self {
         Self {
-            input: Rc::downgrade(&scene.origin.input),
-            delegate: Rc::downgrade(&scene.origin.delegate),
-            state: scene.origin.state,
-            epoch: scene.origin.epoch,
-            geometry_epoch: scene.origin.geometry_epoch,
+            input: Rc::downgrade(&origin.input),
+            delegate: Rc::downgrade(&origin.delegate),
+            state: origin.state,
+            epoch: origin.epoch,
+            geometry_epoch: origin.geometry_epoch,
         }
     }
     pub(super) fn current(
@@ -150,7 +151,7 @@ impl Candidate {
             serial,
             key: scene.key.clone(),
             geometry,
-            ticket: Ticket::new(scene),
+            ticket: Ticket::new(&scene.origin),
             scene: Rc::clone(&scene.scene),
             bitmap: TiledBitmap::new(geometry.width, geometry.height, pixels)?,
             writable: None,
