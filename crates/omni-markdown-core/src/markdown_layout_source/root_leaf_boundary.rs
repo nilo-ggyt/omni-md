@@ -82,7 +82,7 @@ impl VerifiedMarkdownRootLeafStyleBoundary {
         if !source.permits(&self.source) {
             return Err(MarkdownTableRequestError::SourceSuperseded);
         }
-        Ok(())
+        self.publication.require_live_publication()
     }
 
     pub(crate) fn source(&self) -> &MarkdownLayoutTextAuthority {

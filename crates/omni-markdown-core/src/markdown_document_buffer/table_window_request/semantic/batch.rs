@@ -1178,6 +1178,94 @@ impl MarkdownTableViewportRequest {
         self.total
     }
 
+    /// 新选择只重投影原来已经闭合的无表区间；不倒退唯一 Global，也不恢复历史 Fact。
+    /// 调用者先核同一 SourceRequest 的完整选择及最新发布；这里继续核本批自己的发布身份。
+    pub(in crate::markdown_document_buffer::table_window_request) fn reproject_source_selection(
+        &mut self,
+        document: &MarkdownDocumentBuffer,
+        previous: &VerifiedMarkdownTableViewport,
+        viewport: Range<usize>,
+        context_revision: u64,
+        selection: Range<usize>,
+    ) -> Result<bool, MarkdownTableRequestError> {
+        previous.check(document)?;
+        if !self.source.is_current(document) {
+            return Err(MarkdownTableRequestError::SourceSuperseded);
+        }
+        if !matches!(self.phase, BatchPhase::Consumed)
+            || !self
+                .last_publication
+                .as_ref()
+                .is_some_and(|last| last.ptr_eq(&Rc::downgrade(&previous.publication)))
+            || self.context_revision != previous.publication.context_revision
+            || self.selection != previous.publication.selection
+        {
+            return Err(MarkdownTableRequestError::PublicationSuperseded);
+        }
+        // 这里只重用无表结构权限。旧 table window 中的 marker/inline 选择投影必须另做，
+        // 不能把整个 classified 凸包当作可重放库存，也不为旧表开第二个语义 Global。
+        if !previous.windows.is_empty() || !previous.structures.is_empty() {
+            return Ok(false);
+        }
+        let Some((index, gap)) =
+            previous.gaps.iter().enumerate().find(|(_, gap)| {
+                gap.utf16.start <= viewport.start && viewport.end <= gap.utf16.end
+            })
+        else {
+            return Ok(false);
+        };
+        if self
+            .structure
+            .as_ref()
+            .and_then(|structure| structure.global.as_ref())
+            .is_none_or(GlobalFrontier::semantic_boundary_retained)
+        {
+            return Ok(false); // 未归还语义前探义务不能因选择变化而丢掉。
+        }
+        // 先联合准入仍活的旧发布和本次新目录，再改变唯一 owner。共享 Gap 只复制 Rc，
+        // 其 Source/byte/UTF16 事实保持原值；新选择不能扩张它的真实无表覆盖。
+        let quota = super::prefixes::BatchQuota::new(MAX_RUNS, MAX_METADATA_BYTES);
+        quota
+            .admit_retained(previous.retained.runs, previous.retained.metadata_bytes)
+            .and_then(|()| {
+                quota.admit_metadata(
+                    publication_metadata() + std::mem::size_of::<Rc<VerifiedMarkdownTableGap>>(),
+                )
+            })
+            .map_err(MarkdownTableRequestError::Window)?;
+        let gap = Rc::clone(gap);
+        self.viewport = viewport.clone();
+        self.context_revision = context_revision;
+        self.selection = selection;
+        self.gaps = vec![gap];
+        self.coverage = Vec::new();
+        self.coverage_window = 0;
+        self.coverage_range = 0;
+        self.coverage_structure = 0;
+        self.coverage_structure_range = 0;
+        self.coverage_gap = 0;
+        self.covered_until = viewport.start;
+        self.records = MarkdownTableViewportBudget {
+            metadata_bytes: gap_metadata(),
+            ..Default::default()
+        };
+        self.budget = MarkdownTableViewportBudget {
+            metadata_bytes: quota.metadata_used(),
+            ..Default::default()
+        };
+        self.quota = quota;
+        self.required = None;
+        self.last_publication = None;
+        // 结构与 refs 不需要重新扫描：本次只含原无表 Gap。Coverage 仍逐步裁剪，
+        // 只有它正常完成后才能生成本批新 publication；原累计 fuel 与 Global 前沿不变。
+        self.phase = BatchPhase::Coverage;
+        self.account_source_work(SemanticWork {
+            structural_transitions: SWEEP_CONTROL_BASE + index + 1,
+            ..Default::default()
+        })?;
+        Ok(true)
+    }
+
     /// 原来源发布被新目标接管后重放唯一Global；旧窗口只预扣同活库存，不复制内容或重发扫描fuel。
     pub(in crate::markdown_document_buffer::table_window_request) fn reposition_source(
         &mut self,

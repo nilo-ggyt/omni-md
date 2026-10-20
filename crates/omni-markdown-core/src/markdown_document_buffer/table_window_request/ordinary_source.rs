@@ -6,6 +6,7 @@ use pulldown_cmark::global_frontier::{
     LeafBlockCloseReason, LeafBlockDetails, LeafBlockKind, VerifiedGlobalInlineBlock,
     VerifiedGlobalLeafBlock,
 };
+use std::cell::Cell;
 use std::rc::{Rc, Weak};
 
 mod coordinates;
@@ -138,6 +139,35 @@ struct SourcePublication {
     source: MarkdownTableSourceIdentity,
     context_revision: u64,
     selection: MarkdownTextSelection,
+    // 只有原请求明确接受新的选择投影时才撤销本次发布。旧 Rc 即使仍被调用方保留，
+    // 也不能在文档以后选回相同 anchor/head 时恢复旧样式权限；结构记录本身仍可共享。
+    retired: Cell<bool>,
+}
+
+impl SourcePublication {
+    /// 真实源、取消和完整选择的原错误优先；退休状态只撤销这份发布，不能掩盖 Source 首因。
+    fn check(
+        &self,
+        document: &MarkdownDocumentBuffer,
+        authority: MarkdownViewportSourceAuthority,
+    ) -> Result<(), MarkdownTableRequestError> {
+        check_authority(
+            &self.source,
+            self.context_revision,
+            self.selection,
+            document,
+            authority,
+        )?;
+        self.require_live()
+    }
+
+    /// 弱语义票先保原 Source/取消优先顺序，再沿其真实发布核同一撤权事实。
+    fn require_live(&self) -> Result<(), MarkdownTableRequestError> {
+        if self.retired.get() {
+            return Err(MarkdownTableRequestError::PublicationSuperseded);
+        }
+        Ok(())
+    }
 }
 
 /// 同一真实请求生成的表格结果与有限普通来源；整个类型仍然不是 ordinary 语义 Ready。
@@ -153,6 +183,13 @@ pub struct VerifiedMarkdownViewportSources {
 }
 
 impl VerifiedMarkdownViewportSources {
+    /// 派生的冻结 Source 样式边界已经自行核源健康；仍须沿原出版物拒绝显式退休。
+    /// 这里只观察该 Rc 自身的生命周期，不替代有活 Doc 时的完整 Source/选择/context 校验。
+    #[cfg(feature = "paged-line-compose")]
+    pub(crate) fn require_live_publication(&self) -> Result<(), MarkdownTableRequestError> {
+        self.publication.require_live()
+    }
+
     /// SourcesOnly/Pending 不代表默认样式已验证；两个 Ready variant 各自只授权真实有限覆盖。
     pub fn ordinary_semantics_for(
         &self,
@@ -168,13 +205,7 @@ impl VerifiedMarkdownViewportSources {
         document: &MarkdownDocumentBuffer,
         authority: MarkdownViewportSourceAuthority,
     ) -> Result<(), MarkdownTableRequestError> {
-        check_authority(
-            &self.publication.source,
-            self.publication.context_revision,
-            self.publication.selection,
-            document,
-            authority,
-        )
+        self.publication.check(document, authority)
     }
 
     pub fn requested_for(
@@ -772,6 +803,7 @@ impl MarkdownViewportSourceRequest {
             source: self.source.clone(),
             context_revision: self.context_revision,
             selection: self.selection,
+            retired: Cell::new(false),
         });
         // 移交语义 owner 前接回同源、同完整选择的真实端点。后续每格仍须核当前发布，
         // 但无需为远处 Find 选区反复解码从根到选区的 UTF8；这些标量不授予额外语义覆盖。
@@ -1171,6 +1203,141 @@ impl MarkdownViewportSourceRequest {
             self.phase = SourcePhase::Consumed;
         }
         Ok(sources)
+    }
+
+    /// 同一文档只有选择改变时，重投影原有限来源页实际保留的一条闭合普通行。
+    /// Ok(false) 只表示当前库存不能覆盖目标，完全不改变原 owner、发布或证明；
+    /// 成功仍须逐量子 advance 认证新选择并取得新发布，不能把旧 Ready/Reader 改名使用。
+    ///
+    /// # Errors
+    /// Source 健康、取消、当前完整选择和最新发布分别核验；准入后的真实失败固定首因并结束原请求。
+    pub fn reproject_selection(
+        &mut self,
+        document: &MarkdownDocumentBuffer,
+        previous: &VerifiedMarkdownViewportSources,
+        viewport: Range<usize>,
+        authority: MarkdownViewportSourceAuthority,
+    ) -> Result<bool, MarkdownTableRequestError> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        // 根端点只触原健康门。旧选择此时已经不是 Doc 当前选择，不能调用旧 check
+        // 后把 PublicationSuperseded 吞成能力缺失，更不能绕过真实映射首错与取消。
+        let current = document
+            .byte_offset_for_utf16(0)
+            .map_err(MarkdownTableRequestError::Source)
+            .and_then(|_| {
+                check_authority(
+                    &self.source,
+                    self.context_revision,
+                    authority.selection,
+                    document,
+                    authority,
+                )
+            });
+        if let Err(error) = current {
+            self.fail(error);
+            return Err(error);
+        }
+        if !matches!(self.phase, SourcePhase::Consumed)
+            || previous.publication.retired.get()
+            || self.context_revision != previous.publication.context_revision
+            || self.selection != previous.publication.selection
+            || !self
+                .last_publication
+                .as_ref()
+                .is_some_and(|last| last.ptr_eq(&Rc::downgrade(&previous.publication)))
+        {
+            return Err(MarkdownTableRequestError::PublicationSuperseded);
+        }
+        if viewport.is_empty() || viewport.end > document.utf16_len() || viewport.len() > 64 * 1024
+        {
+            return Err(MarkdownTableRequestError::InvalidRequest);
+        }
+        if !self.leaf_mode
+            || self.job.is_some()
+            || self.coordinate_active
+            || self.cell_inline.is_some()
+            || self.row_source_position.is_some()
+            || !matches!(
+                &previous.semantic,
+                MarkdownOrdinarySemanticState::RootLeafReady(_)
+            )
+        {
+            return Ok(false); // 活跃来源/格作业有自己的归还义务，不能借选择变更截掉它们。
+        }
+        let Some((index, record)) = previous.records.iter().enumerate().find(|(_, record)| {
+            matches!(record.as_ref(), SourceRecord::Line(line)
+                if line.semantic_block.is_some()
+                    && record.utf16_range().start <= viewport.start
+                    && viewport.end <= record.utf16_range().end)
+        }) else {
+            return Ok(false); // 旧 prefix 已释放或跨了未知块时仍走原冷路径，不补造历史行目录。
+        };
+        let SourceRecord::Line(line) = record.as_ref() else {
+            unreachable!("上方只接受原闭合普通行");
+        };
+        let block = line.semantic_block.as_ref().unwrap();
+        let result = (|| {
+            if !self.batch.reproject_source_selection(
+                document,
+                &previous.table,
+                viewport.clone(),
+                authority.context_revision,
+                ordered_selection(authority.selection),
+            )? {
+                return Ok(false);
+            }
+            // 原 previous 仍活到调用返回；共享行/seed 只增加有限 Rc 目录，新 Leaf 固定槽
+            // 和新发布按原 workspace/reservation 联合准入，既不复制正文也不重发累计 fuel。
+            self.batch.admit_source_metadata(
+                previous.retained_metadata
+                    + std::mem::size_of::<Rc<SourceRecord>>()
+                    + std::mem::size_of::<Rc<OrdinaryBlockRecord>>()
+                    + source_workspace_metadata()
+                    + publication_reservation_metadata(),
+            )?;
+            self.batch
+                .admit_source_runs(previous.semantic.run_count())?;
+            let keep_plain = self
+                .semantic
+                .as_ref()
+                .is_some_and(|job| job.retains_plain_block(block));
+            self.batch.account_source_work(SemanticWork {
+                structural_transitions: CONTROL_COST
+                    + index
+                    + 1
+                    + usize::from(self.leaf_semantic.is_some())
+                        * RootLeafSemanticJob::completed_owner_drop_control()
+                    + usize::from(self.semantic.is_some() && !keep_plain)
+                        * PlainSemanticJob::completed_drop_control(),
+                ..Default::default()
+            })?;
+            // 所有可失败的准入已完成，紧接着退休原发布。外带旧 Rc/弱语义票以后即使
+            // 遇到相同选择值也不能复活；新 SourcePublication 只由正常发布步骤生成。
+            previous.publication.retired.set(true);
+            if !keep_plain {
+                self.semantic = None;
+            }
+            self.leaf_semantic = None;
+            self.records = vec![Rc::clone(record)];
+            self.blocks = vec![Rc::clone(block)];
+            self.selection = authority.selection;
+            self.context_revision = authority.context_revision;
+            self.selection_bytes = None; // 新选择必须重新通过原四端点定位，旧 byte pair 不授后继权限。
+            self.viewport = viewport;
+            self.ready = None;
+            self.last_publication = None;
+            self.leaf_offer_index = 0;
+            self.phase = SourcePhase::RestartLeaf;
+            // 唯一 underline 继续按原 ResumeUnderline 协议处理：反向覆盖必拒绝续读，
+            // 在其独立量子归还旧 scanner 后冷准备；绝不把已有空 pair 当全文负证明。
+            Ok(true)
+        })();
+        if let Err(error) = result {
+            self.fail(error);
+        }
+        result
     }
 
     /// 只复用原最后 publication 与唯一未完 origin cursor；逆向且无 checkpoint 明确拒绝。

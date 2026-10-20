@@ -22,13 +22,7 @@ impl VerifiedMarkdownTableRowSource {
         document
             .original_backing_health()
             .map_err(MarkdownTableRequestError::Source)?;
-        check_authority(
-            &self.publication.source,
-            self.publication.context_revision,
-            self.publication.selection,
-            document,
-            authority,
-        )
+        self.publication.check(document, authority)
     }
 
     pub fn coordinate_for(

@@ -538,6 +538,8 @@ pub(super) struct RootLeaf {
     request: Option<MarkdownViewportSourceRequest>,
     ready: Option<Rc<VerifiedMarkdownViewportSources>>,
     window: Range<usize>,
+    // 正常来源准备时 ready=None；选择换代后 pending+ready 只暂存原最后发布，
+    // 等首次真实样式范围到来再交给 Core 重投影，绝不把它当作新选择的 Ready。
     pending: bool,
     /// 只记本次click真正回退的起点；同一次完整重放后仍未知必须保原错误，不能自动无限重试。
     link_repositioned: Option<usize>,
@@ -635,6 +637,9 @@ impl RootLeaf {
             selection: document.selection(),
             cancelled: false,
         };
+        if self.pending && self.ready.is_some() {
+            return Ok(None); // 原样式范围尚未到来，不能用新选择推进旧请求或借旧行票。
+        }
         let parser = self.request.as_mut().expect("真实表格沿原唯一来源请求恢复");
         if self.pending {
             // 原在途来源量子先结束，不能为另一个可见行并存第二份 Global 或 publication。
@@ -738,7 +743,7 @@ impl RootLeaf {
     }
 
     pub(super) fn request_started(&self) -> bool {
-        self.request.is_some()
+        self.request.is_some() && !(self.pending && self.ready.is_some())
     }
 
     /// 每回合只推进原请求一个实际阶段。同行换列也要取得最新结构来源，不能把旧 Layout 票
@@ -985,6 +990,11 @@ impl RootLeaf {
         if source.authority() != self.source || self.selection != Some(document.selection()) {
             return Err(super::ViewError::Revoked.into());
         }
+        if self.pending && self.ready.is_some() && self.cell_navigation.is_none() {
+            // 同源健康和新完整选择均已核；pending+ready 只等首次新样式范围，没有格作业可排空。
+            // 取消导航不应把新选择交给仍待重投影的旧请求，更不能撤掉原 Composer 的准备。
+            return Ok(true);
+        }
         let authority = self.authority(document);
         let navigation = self.cell_navigation.take();
         match navigation {
@@ -1080,9 +1090,23 @@ impl RootLeaf {
         Ok(Some(row.prepare_cell(document, source, column)?))
     }
 
-    /// 旧字形图已真实结束后撤销原语义publication；保留同一Source及累计工作账。
+    /// 旧字形图已真实结束后接纳新选择；只有已移交输出的原请求可尝试保同源结构。
+    /// 实际新窗口由后继首次 StyleRequest 决定，不能猜一个可能截断 GCB 的范围。
     pub(super) fn reset_selection(&mut self, selection: MarkdownTextSelection) {
-        self.clear();
+        if !self.pending
+            && self.request.is_some()
+            && self.ready.is_some()
+            && self.cell_navigation.is_none()
+        {
+            // pending+ready 是同一原槽的待重投影意图；旧发布仍按旧完整选择核权，
+            // 所有查询先受 pending 阻断。Core 接受或拒绝后才退还这枚最后 publication。
+            self.pending = true;
+            self.link_repositioned = None;
+            self.row_repositioned = None;
+            self.cell_navigation = None;
+        } else {
+            self.clear(); // 活动来源/格作业或再次换选择仍走原取消、释放与冷准备。
+        }
         self.selection = Some(selection);
     }
 
@@ -1099,7 +1123,6 @@ impl RootLeaf {
         if source.authority() != self.source {
             return Err(super::ViewError::Revoked);
         }
-        let ready = self.ready.as_ref().ok_or(super::ViewError::Pending)?;
         let document = owner
             .document
             .borrow()
@@ -1112,6 +1135,13 @@ impl RootLeaf {
             selection: document.selection(),
             cancelled: false,
         };
+        if self.pending && self.ready.is_some() {
+            if self.selection != Some(authority.selection) {
+                return Err(super::ViewError::Revoked);
+            }
+            return Err(super::ViewError::Pending); // 原最后发布不能因 Native 已接纳新选择而获得新权限。
+        }
+        let ready = self.ready.as_ref().ok_or(super::ViewError::Pending)?;
         let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = ready
             .ordinary_semantics_for(&document, authority)
             .map_err(super::ViewError::LinkSource)?
@@ -1158,6 +1188,9 @@ impl RootLeaf {
         };
         if self.selection != Some(authority.selection) {
             return Err(super::ViewError::Revoked.into()); // 不能借click对选择变化后的旧语义图重新授权。
+        }
+        if self.pending && self.ready.is_some() {
+            return Ok(None); // 等待原 Composer 给出新样式范围，不把旧完整选择的请求推进成失败。
         }
         if self.pending {
             let parser = self.request.as_mut().expect("pending持唯一来源请求");
@@ -1304,6 +1337,24 @@ impl RootLeaf {
             cancelled: false,
         };
         let desired = range.start..range.end.min(range.start.saturating_add(WINDOW_UTF16));
+        if self.pending && self.ready.is_some() {
+            // 这里只移交原已消费输出的请求和它最后一枚发布；新范围来自真实 Style/Control，
+            // 新完整选择来自当前 Doc。Core 自己核同源、闭合记录和 prefix 能力，不据默认样式猜资格。
+            let parser = self.request.as_mut().expect("待重投影仍持原唯一来源请求");
+            let previous = self.ready.as_ref().expect("待重投影只借原最后发布");
+            let reprojected =
+                parser.reproject_selection(&document, previous, desired.clone(), authority)?;
+            self.work = parser.total_work(); // 固定控制准备与真正析构费用仍计入原请求累计账。
+            if reprojected {
+                self.ready = None; // Core 已撤旧 publication；不保旧 Ready/Reader 或给旧 Font 响应补票。
+                self.window = desired;
+                return Ok(None); // 重投影控制与后继来源 advance 分回合，不重新领取或隐藏原步骤额度。
+            }
+            // false 只表示原有限记录/已证前缀不足；Core 保证未改 owner。
+            // I/O、取消、旧发布或完整选择失权均由上面的 Err 原样退出，不能降为冷准备成功。
+            self.clear();
+            self.selection = Some(selection);
+        }
         if self.request.is_none() {
             #[cfg(feature = "native-markdown-runtime-probe")]
             if std::env::var_os("OMNI_NATIVE_PROBE_TRACE").is_some() {
@@ -1474,7 +1525,11 @@ impl RootLeaf {
     }
     #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn publication(&self) -> Option<std::rc::Weak<VerifiedMarkdownViewportSources>> {
-        self.ready.as_ref().map(Rc::downgrade)
+        if self.pending {
+            None // 待重投影的旧 publication 仍属旧选择，不发布为当前图的观察票。
+        } else {
+            self.ready.as_ref().map(Rc::downgrade)
+        }
     }
 
     fn clear(&mut self) {

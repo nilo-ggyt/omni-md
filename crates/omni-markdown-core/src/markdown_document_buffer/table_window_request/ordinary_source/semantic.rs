@@ -116,11 +116,11 @@ impl VerifiedMarkdownPlainViewport {
             document,
             authority,
         )?;
-        if self.publication.upgrade().is_none() {
-            // 原来源结果已释放时，孤立的语义 metadata 不能借相同 g 恢复发布身份。
-            return Err(MarkdownTableRequestError::PublicationSuperseded);
-        }
-        Ok(())
+        // 原来源结果已释放或退休时，孤立语义 metadata 不能借相同 g 恢复发布身份。
+        self.publication
+            .upgrade()
+            .ok_or(MarkdownTableRequestError::PublicationSuperseded)?
+            .require_live()
     }
 
     pub fn coverage_for(
@@ -513,39 +513,59 @@ impl PlainSemanticJob {
     }
 
     /// 父 Leaf 已计量新窗口与完整选择端点，且接回唯一 underline 后，才续同一普通块。
-    /// 只接受不重叠前进；反向、异块或复杂路径保持原冷准备，不把旧 proof 当成新窗口覆盖。
+    /// 同选择只接受不重叠前进；新选择可重投影同 seed 已证前缀，实际坐标另行认证。
+    /// 异块与复杂路径仍保持原冷准备，未知后缀不能继承旧 proof 的默认样式。
     pub(super) fn continue_closed_block(
         &mut self,
         requested: Range<usize>,
+        selection: MarkdownTextSelection,
         byte_coverage: Range<usize>,
         selection_bytes: Range<usize>,
-        block: &Rc<OrdinaryBlockRecord>,
         underline: &mut Option<MarkdownTableUnderlineRequest>,
         quota: MarkdownTableWindowQuota,
     ) -> bool {
-        if !self.retains_plain_block(block)
-            || self.selection_bytes != selection_bytes
-            || requested.start < self.requested.end
-            || requested.is_empty()
-            || byte_coverage.is_empty()
-            || self
-                .byte_coverage
-                .as_ref()
-                .is_none_or(|previous| byte_coverage.start < previous.end)
-            || block.seed.physical_range().start > byte_coverage.start
-            || byte_coverage.end > block.seed.physical_range().end
+        let new_selection = self.selection != selection;
+        if !self.retains_plain_prefix() || requested.is_empty() || byte_coverage.is_empty() {
+            return false;
+        }
+        if !new_selection
+            && (self.selection_bytes != selection_bytes
+                || requested.start < self.requested.end
+                || self
+                    .byte_coverage
+                    .as_ref()
+                    .is_none_or(|previous| byte_coverage.start < previous.end))
         {
             return false;
         }
-        // 原 SourceRequest 的完整 selection 不可变且已在本量子前后核验；这里不复制另一份权限。
-        // 旧 run 已全部移交；原固定槽重置只影响这一批输出，原 cursor 的已证前缀继续保留。
+        // 唯一 Leaf 调用点已紧邻核对其真实 SourceRecord 的 Rc 身份；这里继续沿本槽
+        // 原 seed 核 byte 包络，两个纯 Core 检查之间没有回调、读源或挂起。
+        let physical = self.block.as_ref().unwrap().seed.physical_range();
+        if physical.start > byte_coverage.start || byte_coverage.end > physical.end {
+            return false;
+        }
+        // 新选择只能来自父 SourceRequest 已接受的真实重投影；Leaf 在进入本分支前，
+        // 已用同 Source 重新定位四端点并核当前完整选择。旧 run 不参与这次投影。
+        // cursor/proof 只证明同一个 opaque seed 的原字节前缀，不携带选择显隐或 publication 权限。
+        if new_selection {
+            self.selection = selection;
+            self.selection_bytes = selection_bytes;
+            self.projection = None;
+            self.projected = None; // 逆向坐标必须重新从原 Source 认证，不回退旧前向游标。
+        }
+        let covered = self
+            .proof
+            .as_ref()
+            .is_some_and(|proof| byte_coverage.end <= proof.proven_end());
         // 新 batch 的同一 quota 必须替换旧句柄；不给后继重新发放累计扫描 fuel 或新增库存。
         self.run_next = requested.start;
         self.requested = requested;
         self.byte_coverage = Some(byte_coverage);
-        self.proof = None;
-        // 唯一完成的坐标游标同样留在原槽；下一真实 proof 给出边界后调用 continue_at。
-        // projected 仍表示旧组已完成，只用于区分续接初始化，不拿旧数值作为新窗口结果。
+        if !covered {
+            self.proof = None;
+        } // 超出原已扫描前缀仍须由同 cursor.extend_to 真实读源，不能借新选区扩大证明。
+        // 同选择的前进继续使用唯一完成坐标游标；新选择已在上方结束旧坐标。
+        // projected 只区分真实完成/待准备，不拿上一组数值作为新窗口结果。
         self.underline = underline.take();
         self.runs = std::array::from_fn(|_| None);
         self.len = 0;
@@ -752,7 +772,11 @@ impl PlainSemanticJob {
                     self.phase = SemanticPhase::Done;
                 } else {
                     // 来源与覆盖已经收齐，但仍须真实 Root/LUT 证明及全局上下文，不能直接 Ready。
-                    self.phase = if self.block.as_ref().is_some_and(|block| {
+                    self.phase = if self.proof.is_some() {
+                        // 原请求保留的负语法证明已经覆盖当前 byte 末端；只重做实际坐标、
+                        // underline 与选择显隐，不再借一片远端源帧来重复返回同一 Proven。
+                        SemanticPhase::Coordinates
+                    } else if self.block.as_ref().is_some_and(|block| {
                         matches!(block.seed.kind(), InlineBlockKind::SetextHeading(_))
                             && BoundedInline::supports_scoped(block)
                     }) {

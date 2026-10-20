@@ -25,13 +25,7 @@ impl VerifiedMarkdownTableCellInline {
         authority: MarkdownViewportSourceAuthority,
     ) -> Result<(), MarkdownTableRequestError> {
         self.cell.require(document)?;
-        check_authority(
-            &self.publication.source,
-            self.publication.context_revision,
-            self.publication.selection,
-            document,
-            authority,
-        )
+        self.publication.check(document, authority)
     }
     pub fn cell_source_for(
         &self,

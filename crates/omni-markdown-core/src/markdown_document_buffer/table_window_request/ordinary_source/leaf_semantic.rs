@@ -234,10 +234,10 @@ impl VerifiedMarkdownRootLeafViewport {
             document,
             authority,
         )?;
-        if self.publication.upgrade().is_none() {
-            return Err(MarkdownTableRequestError::PublicationSuperseded);
-        }
-        Ok(())
+        self.publication
+            .upgrade()
+            .ok_or(MarkdownTableRequestError::PublicationSuperseded)?
+            .require_live()
     }
     pub fn coverage_for(
         &self,
@@ -1326,16 +1326,18 @@ impl RootLeafSemanticJob {
         let requested = self.active_coverage.as_ref().unwrap().clone();
         let byte_coverage = self.active_byte_coverage.as_ref().unwrap().clone();
         if let Some(job) = ordinary.as_mut() {
-            if job.continue_closed_block(
-                requested.clone(),
-                byte_coverage.clone(),
-                self.selection_bytes
-                    .clone()
-                    .expect("Leaf Bounds已完成同一完整选择的字节定位"),
-                line.semantic_block.as_ref().unwrap(),
-                &mut self.underline,
-                self.quota.clone(),
-            ) {
+            if job.retains_plain_block(line.semantic_block.as_ref().unwrap())
+                && job.continue_closed_block(
+                    requested.clone(),
+                    self.selection,
+                    byte_coverage.clone(),
+                    self.selection_bytes
+                        .clone()
+                        .expect("Leaf Bounds已完成同一完整选择的字节定位"),
+                    &mut self.underline,
+                    self.quota.clone(),
+                )
+            {
                 // 原固定 scratch 只换本批端点、输出与 quota；沿原构造的固定元数据上界收费，
                 // 真正前缀读取仍由后继 cursor.extend_to/advance 逐量子归账，没有预取新正文。
                 self.ordinary_run_index = 0;
@@ -1699,6 +1701,7 @@ impl RootLeafSemanticJob {
             .upgrade()
             .ok_or(MarkdownTableRequestError::PublicationSuperseded)?;
         if !original.source.is_current(document)
+            || original.retired.get()
             || original.context_revision != self.context_revision
             || original.selection != self.selection
             || !self.done()
