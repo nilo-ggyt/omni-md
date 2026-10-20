@@ -1590,11 +1590,20 @@ impl MarkdownViewportSourceRequest {
             .iter()
             .filter(|record| {
                 let range = record.utf16_range();
-                range.start < viewport.end && viewport.start < range.end
+                // Leaf 可能为跨空白封窗先消费唯一下一行。它的原 origin 已越过 Global，
+                // 因此只淘汰前方记录；未来记录仍待真实交集，公开 getter 不扩充当前请求范围。
+                viewport.start < range.end && (self.leaf_mode || range.start < viewport.end)
             })
             .cloned()
             .collect();
-        self.blocks = previous.blocks.clone();
+        let block_control = if self.leaf_mode {
+            let (blocks, control) = self.retained_leaf_blocks(previous);
+            self.blocks = blocks;
+            control
+        } else {
+            self.blocks = previous.blocks.clone();
+            2 * previous.blocks.len() // Plain 的既有 Bounds 阶段另按实际 byte 覆盖淘汰块。
+        };
         // 旧 table 目录的库存 fold/句柄复制同样收费；仅 ordinary 目录收费会遗漏 source-aware resume 工作。
         let control = previous
             .records
@@ -1605,7 +1614,7 @@ impl MarkdownViewportSourceRequest {
                     .checked_mul(3)
                     .and_then(|tables| count.checked_add(tables))
             })
-            .and_then(|count| count.checked_add(CONTROL_COST + 2 * previous.blocks.len()))
+            .and_then(|count| count.checked_add(CONTROL_COST + block_control))
             .ok_or(MarkdownTableRequestError::WorkLimit)?;
         self.batch.account_source_work(SemanticWork {
             structural_transitions: control,
@@ -1625,6 +1634,52 @@ impl MarkdownViewportSourceRequest {
         self.phase = SourcePhase::Produce;
         self.last_publication = None;
         Ok(())
+    }
+
+    /// Leaf 续批只保实际记录、在途 origin 或原 Plain 前缀仍持有的 opaque seed。
+    /// previous 保持不可变，旧公开句柄/分叉仍有原权限；这里只克隆后继真正需要的 Rc。
+    fn retained_leaf_blocks(
+        &self,
+        previous: &VerifiedMarkdownViewportSources,
+    ) -> (Vec<Rc<OrdinaryBlockRecord>>, usize) {
+        let mut blocks = Vec::with_capacity(previous.blocks.len());
+        let mut records = self
+            .records
+            .iter()
+            .filter_map(|record| match record.as_ref() {
+                SourceRecord::Line(line) => line.semantic_block.as_ref(),
+                SourceRecord::Leaf(_) => None, // 真 Leaf 不持 Inline seed，不能凭相邻范围补一个。
+            });
+        let mut next_record = records.next();
+        let mut control = 0;
+        // 两个目录都沿同一 Global 的真实来源顺序产生；双游标只跳过已到前方的记录，
+        // 坐标仅用于归并，不授予身份。最终保留必须命中原 Rc 或实际在途拥有者。
+        for block in &previous.blocks {
+            let start = block.seed.physical_range().start;
+            while let Some(record) = next_record {
+                control += 1;
+                if record.seed.physical_range().start >= start {
+                    break;
+                }
+                next_record = records.next();
+            }
+            let retained_record = next_record.is_some_and(|record| Rc::ptr_eq(record, block));
+            let pending_origin = matches!(
+                &self.job,
+                Some(OrdinaryJob::Inline(job))
+                    if job.semantic_block.as_ref().is_some_and(|current| Rc::ptr_eq(current, block))
+            );
+            let plain_prefix = self
+                .semantic
+                .as_ref()
+                .is_some_and(|job| job.retains_plain_block(block));
+            control += 3; // 三条实际拥有关系各核一次，没有全历史目录的嵌套扫描。
+            if retained_record || pending_origin || plain_prefix {
+                blocks.push(Rc::clone(block));
+                control += 1;
+            } // 已无后继拥有者的前方 seed 随旧 previous 归还，不占下一批256条来源库存。
+        }
+        (blocks, control)
     }
 
     /// 只由显式 Leaf 工厂与已接受的原 forward 路径调用，不会额外创建 source request。

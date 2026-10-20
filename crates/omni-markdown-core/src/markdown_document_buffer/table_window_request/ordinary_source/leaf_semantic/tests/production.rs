@@ -45,6 +45,169 @@ pub(super) fn leaf_sources(
 }
 
 #[test]
+fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_windows() {
+    use crate::markdown_document_buffer::MarkdownHeadingAnchorStep as HeadingStep;
+    use std::io::{Read, Write};
+
+    const OPENING: &str = "original opening paragraph.\n\n";
+    const PARAGRAPH: &str =
+        "original bounded source paragraph keeps unchanged bytes for heading navigation.\n\n";
+    const HEADING: &str = "# Deep title\n\n";
+    const PARAGRAPHS: usize = 512;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("远端标题原来源续批.md");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(OPENING.as_bytes()).unwrap();
+    for _ in 0..PARAGRAPHS {
+        file.write_all(PARAGRAPH.as_bytes()).unwrap();
+    }
+    let expected_heading = OPENING.len() + PARAGRAPH.len() * PARAGRAPHS;
+    file.write_all(HEADING.as_bytes()).unwrap();
+    for _ in 0..PARAGRAPHS {
+        file.write_all(PARAGRAPH.as_bytes()).unwrap();
+    }
+    file.sync_all().unwrap();
+    drop(file); // 合成源逐片写入；生产打开前结束写句柄，不构造整篇期望 String。
+
+    let mut doc = MarkdownDocumentBuffer::open(&path, 1024 * 1024).unwrap();
+    let backing = doc.original_backing_observer().unwrap();
+    let mut heading = doc.heading_anchor_request("deep-title").unwrap();
+    let target = (0..1_000_000)
+        .find_map(|_| {
+            let step = heading.advance(&doc, 4096).unwrap();
+            let work = match &step {
+                HeadingStep::Progress { work }
+                | HeadingStep::Found { work, .. }
+                | HeadingStep::NotFound { work } => work,
+            };
+            // 查询的真实源片、复制和文件工作仍受原量子限制；找到标题不等于正文排版已完成。
+            assert!(work.source_bytes <= 4096 && work.copied_bytes <= 4096);
+            assert!(work.storage_bytes <= 4096 && work.parser_input_bytes <= 16 * 1024);
+            match step {
+                HeadingStep::Found { target, .. } => Some(target),
+                HeadingStep::Progress { .. } => None,
+                HeadingStep::NotFound { .. } => panic!("真实远端 ATX 标题必须存在"),
+            }
+        })
+        .expect("有限合成源上的真实标题查询必须结束");
+    assert_eq!(target.position_for(&doc).unwrap(), expected_heading);
+    let selection = MarkdownTextSelection::caret(expected_heading);
+    doc.set_selection(selection).unwrap();
+    // 保留第一份公开结果跨越整个续批：淘汰后继不需要的 seed，不能破坏旧只读句柄。
+    let (mut request, first) = leaf_sources(&doc, 0..1);
+    let mut previous = None;
+    for paragraph in 0..PARAGRAPHS {
+        let start = OPENING.len() + paragraph * PARAGRAPH.len();
+        let blank = start + PARAGRAPH.len() - 1;
+        for (range, content) in [(start..start + 1, true), (blank..blank + 1, false)] {
+            // 先查询段首，再经过真实空白控制。原 Global 可前探下一行，但不得丢掉其来源，
+            // 也不能把512个已经过段落的 seed 留成下一批的历史目录。
+            request
+                .continue_forward(
+                    &doc,
+                    previous.as_ref().unwrap_or(&first),
+                    range.clone(),
+                    authority(&doc),
+                )
+                .unwrap();
+            drop(previous.take()); // 只保第一份独立旧结果和当前结果，不人为积存全部发布。
+            finish_sources(&mut request, &doc).unwrap();
+            let current = request
+                .take_sources_for(&doc, authority(&doc))
+                .unwrap()
+                .unwrap();
+            if content {
+                let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = current
+                    .ordinary_semantics_for(&doc, authority(&doc))
+                    .unwrap()
+                else {
+                    panic!("第{paragraph}段的真实来源与语义不能因历史库存耗尽而缺失");
+                };
+                assert_eq!(
+                    leaf.query_for(&doc, authority(&doc), start)
+                        .unwrap()
+                        .unwrap()
+                        .styles,
+                    MarkdownPresentationStyles::default()
+                );
+            } // 空白不伪造正文样式；下一次段首查询必须重新取得该原行真正的语义结果。
+            previous = Some(current);
+        }
+    }
+
+    let title = expected_heading + 2;
+    request
+        .continue_forward(
+            &doc,
+            previous.as_ref().unwrap(),
+            expected_heading..title + 1,
+            authority(&doc),
+        )
+        .unwrap();
+    drop(previous.take());
+    finish_sources(&mut request, &doc).unwrap();
+    let current = request
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = current
+        .ordinary_semantics_for(&doc, authority(&doc))
+        .unwrap()
+    else {
+        panic!("标题查询成功后，原正文语义仍须完成远端标题交集");
+    };
+    assert!(
+        leaf.query_for(&doc, authority(&doc), title)
+            .unwrap()
+            .unwrap()
+            .styles
+            .contains(MarkdownPresentationStyles::HEADING_1)
+    );
+    let work = request.total_work();
+    assert_eq!(work.copied_source_bytes, 0);
+    assert_eq!(work.allocated_source_capacity, 0);
+    // 取消唯一在途 owner 后，既有只读结果仍按原 Source/选择可读；取消不能复活请求。
+    request.cancel();
+    assert_eq!(
+        request.advance(&doc, authority(&doc), 4096).err(),
+        Some(MarkdownTableRequestError::Cancelled)
+    );
+    let MarkdownOrdinarySemanticState::RootLeafReady(first_leaf) =
+        first.ordinary_semantics_for(&doc, authority(&doc)).unwrap()
+    else {
+        panic!("原第一份不可变发布仍须有完整来源");
+    };
+    assert_eq!(
+        first_leaf
+            .query_for(&doc, authority(&doc), 0)
+            .unwrap()
+            .unwrap()
+            .styles,
+        MarkdownPresentationStyles::default()
+    );
+    assert_eq!(doc.selection(), selection);
+    assert_eq!(doc.generation(), 0);
+    assert!(!doc.is_dirty() && !doc.can_undo() && !doc.can_redo());
+    assert!(doc.original_file_identity_is_unchanged());
+    // 磁盘期望也逐片独立核验；完整正文从未为了比较而进入一份 String 或 Vec。
+    let mut file = std::fs::File::open(&path).unwrap();
+    let mut bytes = [0; 128];
+    for segment in std::iter::once(OPENING)
+        .chain(std::iter::repeat_n(PARAGRAPH, PARAGRAPHS))
+        .chain(std::iter::once(HEADING))
+        .chain(std::iter::repeat_n(PARAGRAPH, PARAGRAPHS))
+    {
+        file.read_exact(&mut bytes[..segment.len()]).unwrap();
+        assert_eq!(&bytes[..segment.len()], segment.as_bytes());
+    }
+    assert_eq!(file.read(&mut bytes[..1]).unwrap(), 0);
+    drop((file, heading, target, request, first, current, doc));
+    assert_eq!(backing.mapped_bytes(), 0);
+    assert_eq!(backing.managed_resident_bytes(), 0);
+    assert_eq!(backing.first_errno(), None);
+}
+
+#[test]
 fn selection_reprojection_reuses_true_prefix_and_stops_at_later_inline() {
     // 原单段落先真实准备83K远端窗口，再改变完整有向选择返回首窗。未来的 ** 仍在同一
     // 闭合 seed 中，但初次 Plain proof 尚未读到它；重投影不能把 proven_end 扩成全文证明。
