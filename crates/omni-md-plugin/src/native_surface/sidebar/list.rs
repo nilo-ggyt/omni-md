@@ -674,9 +674,11 @@ impl NativeMarkdownSidebarList {
         if self.table.ivars().closed.replace(true) {
             return; // 显式关闭和Rust Drop共享同一清理，不再向已拆图发送第二轮消息。
         }
-        self.table.ivars().rows.borrow_mut().clear();
-        self.table.ivars().active_path.borrow_mut().take();
-        self.table.ivars().selected_directory.take();
+        // 关闭归还整份有限页及路径容量；只clear会让被框架暂存的table继续拥有旧Vec缓冲。
+        // take先结束槽借用再析构原值，后续Native拆图不跨任何metadata借用。
+        drop(self.table.ivars().rows.take());
+        drop(self.table.ivars().active_path.take());
+        drop(self.table.ivars().selected_directory.take());
         // SAFETY: 原唯一table所有者在主线程断开全部weak协议/动作入口。
         unsafe {
             self.table.setAction(None);
@@ -685,7 +687,15 @@ impl NativeMarkdownSidebarList {
             self.table.setDataSource(None);
         }
         self.table.clear_labels();
+        // 所有真实标签先清空文字、路径提示和AX，再归还弱身份数组及其容量。
+        drop(self.table.ivars().labels.take());
         self.table.reloadData();
+        // table拥有其列，不能把列的归还推迟到table本体析构。复制本次真实列集合，
+        // 避免removeTableColumn修改原数组时仍遍历它；临时列强边只活到本轮移除结束。
+        let columns = self.table.tableColumns().to_vec();
+        for column in columns {
+            self.table.removeTableColumn(&column);
+        }
         self.scroll.setDocumentView(None);
         self.table.removeFromSuperview();
         self.scroll.removeFromSuperview();

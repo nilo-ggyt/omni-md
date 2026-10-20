@@ -89,6 +89,61 @@ impl NativeMarkdownOwnedSnapshot {
         )
     }
 
+    /// 只观察原账本中侧栏的两个已登记Weak，不遍历框架子树或建立额外身份清单。
+    /// 调用方在同一局部pool内消费；所有Native临时claim结束后才输出返回的纯标量文本。
+    #[cfg(feature = "native-close-stage-diagnostic")]
+    pub(super) fn diagnostic_sidebar_relationships(&self) -> String {
+        let table = self
+            .identities
+            .iter()
+            .find(|entry| entry.role == "sidebar.table")
+            .and_then(|entry| entry.object.load());
+        let table_facts = match table.as_deref() {
+            None => "live=false".to_owned(),
+            Some(object) => match object.downcast_ref::<objc2_app_kit::NSTableView>() {
+                Some(table) => {
+                    // 类型由原构造角色及动态类型共同确认；公开getter只读取关系/数量，不读行内容。
+                    // SAFETY: 原主线程NSTableView仍由本次Weak升级保活，未持有TLS或账本可变借用。
+                    let (super_attached, data_source_attached, delegate_attached) = unsafe {
+                        (
+                            table.superview().is_some(),
+                            table.dataSource().is_some(),
+                            table.delegate().is_some(),
+                        )
+                    };
+                    format!(
+                        "live=true type_match=true window_attached={} super_attached={super_attached} data_source_attached={data_source_attached} delegate_attached={delegate_attached} target_attached={} header_attached={} corner_attached={} columns={} rows={}",
+                        table.window().is_some(),
+                        table.target().is_some(),
+                        table.headerView().is_some(),
+                        table.cornerView().is_some(),
+                        table.numberOfColumns(),
+                        table.numberOfRows(),
+                    )
+                }
+                None => "live=true type_match=false".to_owned(),
+            },
+        };
+        drop(table); // 不把table的临时Native强边带入下一个角色或stage。
+        let column = self
+            .identities
+            .iter()
+            .find(|entry| entry.role == "sidebar.column")
+            .and_then(|entry| entry.object.load());
+        let column_facts = match column.as_deref() {
+            None => "live=false".to_owned(),
+            Some(object) => match object.downcast_ref::<objc2_app_kit::NSTableColumn>() {
+                Some(column) => format!(
+                    "live=true type_match=true table_attached={}",
+                    column.tableView().is_some(),
+                ),
+                None => "live=true type_match=false".to_owned(),
+            },
+        };
+        drop(column); // getter返回值与原Weak升级都只归本次观察，不延长关闭资源的真实寿命。
+        format!("table=[{table_facts}] column=[{column_facts}]")
+    }
+
     /// 与首次关闭角色统计同池执行；只记录指定既有Weak，不安装额外观察或改变nil门禁。
     #[cfg(feature = "native-close-stage-diagnostic")]
     pub(super) fn diagnostic_raster_close_identities(

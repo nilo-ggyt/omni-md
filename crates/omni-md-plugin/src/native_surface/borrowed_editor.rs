@@ -1463,7 +1463,10 @@ impl NativeMarkdownBorrowedEditorSnapshot {
         self.0.borrow().failure.clone()
     }
 
-    #[cfg(feature = "native-markdown-runtime-probe")]
+    #[cfg(any(
+        feature = "native-markdown-runtime-probe",
+        feature = "native-close-stage-diagnostic"
+    ))]
     /// 失败时只检查一次有限 weak 角色/公开标量，不输出文本、路径、类名或任意错误内容。
     pub(super) fn failure_diagnostic(&self) -> String {
         let (finished, detached, failed, editors, managers) = {

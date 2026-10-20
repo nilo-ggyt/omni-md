@@ -1384,10 +1384,12 @@ pub(super) fn finalize_native_markdown_close() {
         && !CLOSE_DIAGNOSTIC_ROLES.with(|reported| reported.replace(true))
     {
         // 原finalizer本地pool已排空；只做一次完整既有Weak角色统计，观察pool也先结束再输出。
-        let (roles, identities) = autoreleasepool(|_| {
+        let (roles, identities, borrowed, sidebar) = autoreleasepool(|_| {
             (
                 completion.owned.diagnostic_alive_roles(),
                 completion.owned.diagnostic_raster_close_identities(),
+                completion.borrowed.failure_diagnostic(),
+                completion.owned.diagnostic_sidebar_relationships(),
             )
         }); // 所有Weak升级、类名/长度读取与临时Native claim先在同一观察池内结束。
         let resources = completion.resources.diagnostic_state();
@@ -1396,15 +1398,21 @@ pub(super) fn finalize_native_markdown_close() {
         let documents_released = completion.editors.iter().all(|editor| {
             editor.document_released_synchronously && editor.document.strong_count() == 0
         });
-        let renders_released = completion
-            .editors
-            .iter()
-            .all(|editor| editor.native.render.strong_count() == 0);
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+        let renders_released = Some(
+            completion
+                .editors
+                .iter()
+                .all(|editor| editor.native.render.strong_count() == 0),
+        );
+        // 退出诊断可独立编译；没有原render观察字段时明确未观察，不能将缺票输出为已释放。
+        #[cfg(not(any(test, feature = "native-markdown-runtime-probe")))]
+        let renders_released = None::<bool>;
         diagnostic_close_stage(
             "finalizer_pool_drained",
             completion.generation,
             format_args!(
-                "owner_released={} documents_released={documents_released} renders_released={renders_released} resources={resources:?} full={full:?} roles_complete={} roles={:?} raster_identities={:?} raster_identities_truncated={}",
+                "owner_released={} documents_released={documents_released} renders_released={renders_released:?} resources={resources:?} full={full:?} roles_complete={} roles={:?} raster_identities={:?} raster_identities_truncated={} borrowed=[{borrowed}] sidebar=[{sidebar}]",
                 completion.project_owner_released, roles.0, roles.1, identities.0, identities.1
             ),
         );
