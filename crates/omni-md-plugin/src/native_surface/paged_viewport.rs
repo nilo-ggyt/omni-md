@@ -177,12 +177,24 @@ fn finite(rect: NSRect) -> bool {
         && rect.size.height > 0.0
 }
 
+#[track_caller]
 fn step<T>(current: &(impl Fn() -> bool + ?Sized), operation: impl FnOnce() -> T) -> Result<T> {
     if !current() {
+        // 临时归因只记原调用位置，不重新查询 Native、Source 或输入。
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        eprintln!(
+            "native_viewport_revoked phase=before line={}",
+            std::panic::Location::caller().line()
+        );
         return Err(NativeMarkdownPagedViewportError::Revoked);
     }
     let value = operation();
     if !current() {
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        eprintln!(
+            "native_viewport_revoked phase=after line={}",
+            std::panic::Location::caller().line()
+        );
         return Err(NativeMarkdownPagedViewportError::Revoked);
     }
     Ok(value)
@@ -806,6 +818,8 @@ impl NativeMarkdownPagedViewport {
         // Weak.load与撤CPU候选也可能归还Native资源并重入几何查询，故从这里起就标明
         // “本owner正在同步、尚无新geometry”。失败同样由原RAII归还，不把busy留给后继。
         if self.busy.replace(true) {
+            #[cfg(feature = "native-close-stage-diagnostic")]
+            eprintln!("native_viewport_sync_failure phase=nested epoch={epoch}");
             return Err(NativeMarkdownPagedViewportError::Busy);
         }
         let _updating = Updating(&self.busy);
@@ -934,6 +948,13 @@ impl NativeMarkdownPagedViewport {
                 && step(&current, || body.frame())? == body_frame,
         )?;
         let body_bounds = step(&current, || body.bounds())?;
+        // 仅消费已经完成的原 getter，查明大文档位置是否改变有限视图的实际 bounds。
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        if body_bounds != NSRect::new(NSPoint::ZERO, body_frame.size) {
+            eprintln!(
+                "native_viewport_sync_failure phase=body_bounds actual={body_bounds:?} expected_frame={body_frame:?}"
+            );
+        }
         checked(body_bounds == NSRect::new(NSPoint::ZERO, body_frame.size))?;
         // 本视图不承载整文坐标或隐式缩放；非零bounds/大逻辑画布必须被拒绝，不能发布伪小frame。
         // 发布前再核原Native关系；嵌套通知或后继挂载不能把原候选geometry补签成功。
