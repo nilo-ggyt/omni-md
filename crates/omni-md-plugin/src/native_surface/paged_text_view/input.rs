@@ -469,15 +469,10 @@ impl NativeMarkdownPagedTextView {
                     return Err(NativeMarkdownPagedTextViewError::Revoked);
                 }
             } // 尚未挂窗没有实际正面积视口；保留已接受canonical输入，不伪造绘制Ready。
-            let context = self
-                .ivars()
-                .context
-                .borrow()
-                .clone()
-                .ok_or(NativeMarkdownPagedTextViewError::ContextUnavailable)?;
-            commit.check_current(&current)?;
-            context.0.invalidateCharacterCoordinates();
-            commit.check_current(&current)?;
+            // 正文已提交不等于新字形坐标已发布；此时通知 IME 重查可能把有效缓存刷新成 Pending。
+            // Body 的 committed 已撤旧 Scene 并安排唯一排版；只有 scene_ready 对同一实际
+            // Input/几何和 context 发坐标失效通知，被后继输入撤销的中间状态不会伪报完成。
+            // 保存、结束组合和关闭仍各自处理原 context，不依赖这项显示完成通知归还资源。
             Ok(())
         })();
         // 到这里Core已经发布；错误只能停止显示后果，不能让调用方误认正文仍是旧值。

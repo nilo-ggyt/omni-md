@@ -296,7 +296,10 @@ impl ModeViewportExpectation {
         }
         *self.signal.borrow_mut() = Some(Box::new(observer));
         let captured = MainThreadBound::new(Rc::downgrade(self), controller.mtm());
-        controller.enqueue_owned(move || {
+        // 观察已由原动作接纳，只携原期望的弱身份。AppKit 嵌套循环可能暂时借出
+        // Active 槽；这里由下方完整原客户守卫认定借出身份，不能把空槽当作关闭而丢登记。
+        // 登记只访问同一 Body/View，不申请 surface 租约，也不占用笔记交接的单次续体槽。
+        enqueue_native_markdown_main_task(move || {
             let mtm = MainThreadMarker::new().expect("模式 CPU 帧登记只在原主队列执行");
             let Some(expected) = captured.into_inner(mtm).upgrade() else {
                 return;

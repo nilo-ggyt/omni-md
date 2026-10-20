@@ -364,33 +364,26 @@ impl Producer {
         {
             self.target = Some(ActualTarget::new(pending));
         }
-        let mut target = self.target.take().ok_or(Error::Closed)?;
-        let result = self.advance_actual_target(owner, ticket, &mut target);
-        self.target = Some(target);
-        result
-    }
-
-    fn advance_actual_target(
-        &mut self,
-        owner: &Owner,
-        ticket: &PreparationTicket,
-        target: &mut ActualTarget,
-    ) -> Result<TargetAdvance> {
+        // 先守原 Source/输入票，再借原槽判断真实前缀；尚未覆盖时没有查询要推进，
+        // 不为每个 Composer 回合搬出并放回整份目标。失权仍撤原请求，源首错仍先返回。
         ticket.require_pure(owner, &self.source)?;
+        let target = self.target.as_ref().ok_or(Error::Closed)?;
         if !target.request.current(owner) {
             target.request.revoke();
             return Ok(TargetAdvance::VisibleBand);
         }
-        let at_eof = target.request.range.location == self.source.utf16_len();
-        // 同一量子最多256个真实64B目录读取；每part包含Line认证2条、Part2条和Directory3条，
-        // previous_line也包含原行认证与前驱两条。不能把API调用次数冒充真实record数。
-        let mut records_left = 256usize;
         if target.anchor.is_none() {
+            let at_eof = target.request.range.location == self.source.utf16_len();
             if self.output.is_none() || (at_eof && !self.complete) {
                 return Ok(TargetAdvance::NeedPrefix);
             }
-            let output = self.output.as_ref().cloned().ok_or(Error::Closed)?;
-            let covered = output.borrow().source_range().end;
+            let covered = self
+                .output
+                .as_ref()
+                .ok_or(Error::Closed)?
+                .borrow()
+                .source_range()
+                .end;
             if target.request.first_end > covered
                 || (!at_eof && target.request.range.location >= covered)
             {
@@ -399,6 +392,28 @@ impl Producer {
                 }
                 return Ok(TargetAdvance::NeedPrefix);
             }
+        }
+        // 以上只有纯票与同 Output 的范围观察，借用已结束；真正目录/Native 工作才取槽。
+        let mut target = self.target.take().ok_or(Error::Closed)?;
+        let result = self.advance_actual_target(owner, ticket, &mut target);
+        self.target = Some(target);
+        result
+    }
+
+    /// 唯一调用处已核原纯票、请求和未定锚点的前缀覆盖；取槽后不再重复这些检查。
+    /// 后续目录读取、Native reveal 及各自前后的当前性复核仍由原消费路径负责。
+    fn advance_actual_target(
+        &mut self,
+        owner: &Owner,
+        ticket: &PreparationTicket,
+        target: &mut ActualTarget,
+    ) -> Result<TargetAdvance> {
+        let at_eof = target.request.range.location == self.source.utf16_len();
+        // 同一量子最多256个真实64B目录读取；每part包含Line认证2条、Part2条和Directory3条，
+        // previous_line也包含原行认证与前驱两条。不能把API调用次数冒充真实record数。
+        let mut records_left = 256usize;
+        if target.anchor.is_none() {
+            let output = self.output.as_ref().cloned().ok_or(Error::Closed)?;
             if target.ordinal.is_none() {
                 if target.lookup.is_none() {
                     let upstream = if target.request.range.length == 0 {

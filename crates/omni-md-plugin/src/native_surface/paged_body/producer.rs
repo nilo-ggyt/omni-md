@@ -1343,10 +1343,16 @@ impl Producer {
         Ok(receipts)
     }
 
-    /// Drop only the weak directory cursor; the single Producer retirement still releases Source and reader.
+    /// 只归还原弱目录游标；Source 和 Reader 仍由唯一 Producer 退休路径释放。
     pub(super) fn cancel_visual(&mut self) {
-        drop(self.visual.take());
-        drop(self.visual_word.take());
+        // 普通排版每回合也会走到这里；空槽没有要归还的游标，不搬出大型 Option。
+        // 真正取消仍先 take 清原槽，再 Drop 原值，保留原资源释放和重入可见顺序。
+        if self.visual.is_some() {
+            drop(self.visual.take());
+        }
+        if self.visual_word.is_some() {
+            drop(self.visual_word.take());
+        }
     }
 
     /// Alternate visual queries with original font/line work; a directory-read turn cannot also run a Composer quantum.
