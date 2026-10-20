@@ -2339,6 +2339,18 @@ impl NativeMarkdownPagedBody {
             let permit = self
                 .input
                 .capture(self.configuration.epoch, &body_current)?;
+            if canonical_invalidation.is_none()
+                && transfer.is_none()
+                && parent_pointer.is_none()
+                && word_anchor.is_none()
+            {
+                // 普通保存/辞任只封闭原字节未变的草稿，receipt交付映射位置不等于父选择意图。
+                // 局部格式即使恢复原文，也可留下不同的局部有向选区；不能因此移动canonical、
+                // 推进父选择serial或改写其导航侧。保留原票健康/当前性检查，再沿原关闭流程归还。
+                // 显式拖选移交仍走下方映射；独立扩选调用方则消费同receipt发布自己的最终选择。
+                self.input.check_permit(&permit, &body_current)?;
+                return Ok(());
+            }
             let mut mapped = self.input.set_selection_intent(
                 &permit,
                 committed.receipt.selection,
