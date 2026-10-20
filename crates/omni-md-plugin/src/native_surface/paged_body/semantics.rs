@@ -8,10 +8,11 @@ use objc2_core_foundation::CFRetained;
 use objc2_core_text::CTFont;
 use omni_markdown_core::{
     MarkdownLayoutTextAuthority, MarkdownLayoutTextSource, MarkdownLineComposeStyle,
-    MarkdownLineStyleRequest, MarkdownOrdinarySemanticState, MarkdownPresentationStyles,
-    MarkdownTableCellDisplaySource, MarkdownTextSelection, MarkdownViewportSourceAuthority,
-    MarkdownViewportSourceRequest, MarkdownViewportSourceStep, VerifiedMarkdownLayoutTableRow,
-    VerifiedMarkdownRootLeafStyleBoundary, VerifiedMarkdownViewportSources,
+    MarkdownLineComposer, MarkdownLineStyleRequest, MarkdownOrdinarySemanticState,
+    MarkdownPresentationStyles, MarkdownTableCellDisplaySource, MarkdownTextSelection,
+    MarkdownViewportSourceAuthority, MarkdownViewportSourceRequest, MarkdownViewportSourceStep,
+    VerifiedMarkdownLayoutTableRow, VerifiedMarkdownRootLeafStyleBoundary,
+    VerifiedMarkdownViewportSources,
 };
 
 use omni_markdown_core::markdown_document_buffer::{MarkdownTableRequestError, SemanticWork};
@@ -1088,6 +1089,65 @@ impl RootLeaf {
             return Err(super::ViewError::Revoked.into());
         }
         Ok(Some(row.prepare_cell(document, source, column)?))
+    }
+
+    /// 只在原 Plain 负语法证明覆盖整个 Composer 实际库存时保留同源字形。
+    /// 能力借用、Composer 只读核验与旧发布退休都在同一纯 Core 栈中完成，没有 Native 回调。
+    pub(super) fn reproject_selection_preserving_styles(
+        &mut self,
+        owner: &Owner,
+        source: &MarkdownLayoutTextSource,
+        selection: MarkdownTextSelection,
+        composer: &MarkdownLineComposer,
+        ticket: &PreparationTicket,
+    ) -> Result<bool> {
+        ticket.require_pure(owner, source)?;
+        if source.authority() != self.source {
+            return Err(super::ViewError::Revoked.into());
+        }
+        if self.pending || self.cell_navigation.is_some() {
+            return Ok(false); // 原请求/格作业尚在途，仍由原重排路径取消并等待真实归还。
+        }
+        let (Some(parser), Some(previous)) = (self.request.as_mut(), self.ready.as_ref()) else {
+            return Ok(false);
+        };
+        let document = owner
+            .document
+            .borrow()
+            .as_ref()
+            .expect("RootLeaf只借原Body文档")
+            .clone();
+        let document = document.borrow();
+        let authority = MarkdownViewportSourceAuthority {
+            context_revision: self.context,
+            selection,
+            cancelled: false,
+        };
+        {
+            // cap 不是裸 Range，也不保旧 publication 的强副本；它借原请求/Doc/最新发布，
+            // 只认证真实 source0 Plain 前缀。Composer 自己核 Stage/Store/活跃支持范围，
+            // 不能由 Native 的 SceneReady 或已显示行数猜测其尚未捕获的整形输入。
+            let Some(capability) = parser.plain_selection_prefix(&document, previous, authority)?
+            else {
+                return Ok(false);
+            };
+            if !composer.can_retain_plain_selection(&capability)? {
+                return Ok(false);
+            }
+        } // 借用先结束，才允许原唯一请求改变选择、退休 publication；没有跨 Native 或挂起保存 cap。
+        ticket.require_pure(owner, source)?;
+        if !parser.reproject_selection(&document, previous, self.window.clone(), authority)? {
+            return Ok(false); // Core 资格不满足保证原 owner/发布不变，交原 reset_styles 冷路径。
+        }
+        self.work = parser.total_work();
+        self.ready = None; // 旧发布此刻已永久退休，不等下一 NeedStyle，目标可能已经落在保留前缀内。
+        self.pending = true;
+        self.selection = Some(selection);
+        self.link_repositioned = None;
+        self.row_repositioned = None;
+        // 后继样式必须由新选择正常 advance 生成的新发布提供，不能借旧 Boundary 给新 Input 补票。
+        ticket.require_pure(owner, source)?;
+        Ok(true)
     }
 
     /// 旧字形图已真实结束后接纳新选择；只有已移交输出的原请求可尝试保同源结构。

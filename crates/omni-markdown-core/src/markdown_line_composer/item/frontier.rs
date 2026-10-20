@@ -105,6 +105,32 @@ impl PendingTerminal {
     }
 }
 impl PendingFrontier {
+    /// 只保留已归还 child 的原前沿。facts 的完整范围与 owner.original 在原装配时
+    /// 相等，后继 part 也逐次核 original_range；不能拿中心片或已发布行冒充其支持域。
+    /// 语义边界及终端 Font 响应可能持旧出版物，首版一律交回冷路，不延长它们的寿命。
+    #[cfg(feature = "s2-table-window-prototype")]
+    pub(super) fn retains_plain_prefix(&self, proven_end: usize) -> Result<bool> {
+        if self.facts.source_utf16.end > proven_end
+            || self.style_boundary.is_some()
+            || self.terminal.is_some()
+            || self
+                .child
+                .as_ref()
+                .is_some_and(|child| child.strong_count() != 0)
+        {
+            return Ok(false);
+        }
+        if let Some(registration) = &self.registration
+            && !self.original.permits(&registration.authority()?)
+        {
+            return Err(MarkdownLineComposeError::SourceMismatch);
+        }
+        if let Some(preferred) = &self.preferred_registration {
+            preferred.lease()?;
+        }
+        Ok(true)
+    }
+
     /// 首 Font 探测未取得真实字体右界后，保留同一失败计划及原 SCX/词证明续体。
     pub(in crate::markdown_line_composer::item) fn decline_font_head(&mut self) {
         self.declined_font_head = true;

@@ -500,6 +500,76 @@ impl MarkdownLineComposer {
         self.finish(result)
     }
 
+    /// 同步检查原 SourceRequest 借出的真实 plain 前缀是否足以保留这个组合器。
+    /// 仅普通完整行刚发布后的行首可准入；不截断 writer，不复制旧输出，也不替换资源 owner。
+    /// 能力不授 GCB/Font 权限，旧 Scene 和 Reader 仍须由 Native 退休并以完整新输入重新发布。
+    ///
+    /// # Errors
+    /// 原 Source、取消、出版物和实际 Font 注册失效均返回原错误；false 仅表示当前续体不能复用。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub fn can_retain_plain_selection(
+        &self,
+        capability: &crate::MarkdownPlainSelectionPrefix<'_>,
+    ) -> Result<bool> {
+        self.guard()?;
+        let result = (|| {
+            let payload = self
+                .payload
+                .as_ref()
+                .ok_or(MarkdownLineComposeError::Poisoned)?;
+            let proven_end = capability
+                .end_for(&payload.source)
+                .map_err(|error| match error {
+                    crate::markdown_document_buffer::MarkdownTableRequestError::Source(cause) => {
+                        MarkdownLineComposeError::Source(cause)
+                    }
+                    cause => MarkdownLineComposeError::RootLeafBoundary(Box::new(cause)),
+                })?;
+            // next_start 只能由本引擎普通 Publish 的真实 selected_permit 创建；该阶段
+            // 同时清 current/measure 并把 start 设为最新 LineEnd.end。重排签包的发布仍在
+            // Resolution，不能拿它残留的范围或旧行首票冒充这个静止边界。
+            if !matches!(payload.stage, Stage::Start)
+                || payload.next_start.is_none()
+                || payload.item.is_some()
+                || payload.current.is_some()
+                || payload.next.is_some()
+                || payload.measure.is_some()
+                || payload.request.is_some()
+                || payload.graphemes.is_some()
+                || payload.control.is_some()
+                || payload.resolution.is_some()
+                || payload.resolver.is_some()
+                || payload.resolved_capture.is_some()
+                || payload.resolver_resources.is_some()
+                || payload.tab_pending.is_some()
+                || payload.word_delete.is_some()
+                || payload.table.is_some()
+                || payload.line_breaks_pending
+                || payload.graphemes_pending
+                || payload.empty_due
+                || payload.empty_capture
+            {
+                return Ok(false);
+            }
+            let Some(captured_end) = payload
+                .store
+                .plain_selection_prefix_end(payload.start, proven_end)?
+            else {
+                return Ok(false);
+            };
+            // Store.source_end 包含为测量而已预取的后继 item；只用可见 LineEnd 会漏掉
+            // 仍依赖旧样式的字形。Coordinator 还须核同一真实消费末端和固定活跃支持域。
+            payload
+                .coordinator
+                .retains_plain_prefix(captured_end, proven_end)
+        })();
+        self.guard()?;
+        result
+    }
+
     /// 原字体候选已真实归还当前 worker 后，借唯一协调器推进同一 GCB 的下一 level 段。
     /// 只转移实际目录费用，不重建 Bidi/Script 或为平台 worker 创建第二份 owner。
     pub fn step_font_probe_segment(

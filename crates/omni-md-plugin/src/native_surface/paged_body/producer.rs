@@ -608,6 +608,34 @@ impl Producer {
                 result.retire(false)?;
             } // 真实源/Font清理失败仍沿原失败出口，不能被新的空图覆盖。
         }
+        // 只有所有已发布行都已完成原度量时，Native 累计 Y 才与同 Store 的最新
+        // LineEnd 一致。半批次仍走旧重排，不丢掉已封存但尚未计入高度的行。
+        let retain_composer = self.output.is_some()
+            && self.pending_line.is_none()
+            && self.pending_batch.is_none()
+            && self.queued_lines.is_none()
+            && self.pending_style.is_none()
+            && self.pending_control.is_none()
+            && self.grid.is_none()
+            && self.grids.is_empty()
+            && self.restoring_grid.is_none()
+            && self.cell_word.is_none()
+            && self
+                .semantics
+                .as_mut()
+                .expect("选择显隐只属于当前 Preview 语义")
+                .reproject_selection_preserving_styles(
+                    owner,
+                    &self.source,
+                    request.input.selection,
+                    self.composer.as_ref().ok_or(Error::Closed)?,
+                    &ticket,
+                )?;
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        eprintln!(
+            "native_selection_layout retained={retain_composer} prepared_lines={} selection_serial={} generation={}",
+            self.lines, request.input.selection_serial, request.input.generation,
+        ); // 只在真实选择换代边界记录有限决策，不输出正文、路径或持久观察状态。
         self.pending_style = None;
         self.pending_control = None;
         self.grid = None;
@@ -626,8 +654,17 @@ impl Producer {
         self.visual = None;
         self.visual_word = None;
         self.last_target_anchor = None;
-        drop(self.output.take()); // Body已先清旧Scene；所有项目Reader在新writer创建前真实归还。
+        drop(self.output.take()); // Body已先清旧Scene；即使字形不变，旧输出身份也不为新Input补票。
         ticket.require_pure(owner, &self.source)?;
+        if retain_composer {
+            // 原 SourceRequest 已在上方同栈退休旧 publication；字形、原 Font 注册和
+            // 资源 scope 保持原 owner。重新 dup 同 writer 的已提交前缀，旧弱 Line/Part
+            // 仍然失效；后继 Scene/CPU 使用完整新 Input 和新输出身份，不复用旧帧。
+            self.output = Some(self.checkpoint_prefix(false)?);
+            owner.input.clear_style_navigation_geometry();
+            ticket.require_pure(owner, &self.source)?;
+            return Ok(true);
+        }
         self.composer
             .as_mut()
             .ok_or(Error::Closed)?

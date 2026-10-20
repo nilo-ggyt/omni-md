@@ -279,6 +279,33 @@ pub(super) struct GlyphStore {
 }
 
 impl GlyphStore {
+    /// 选择显隐不变的能力必须覆盖所有已签入 item，而不只是最后一条可见 LineEnd。
+    /// 此处只检查原 writer 的固定事实；不扫描历史目录，也不截断或复制已付费的字形。
+    /// 半 capture 可能已改写 forest，不能把它当作可回退边界，必须交回原冷重排路径。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub(super) fn plain_selection_prefix_end(
+        &self,
+        line_start: usize,
+        proven_end: usize,
+    ) -> Result<Option<usize>> {
+        self.guard()?;
+        if self.capture.is_some()
+            || self.control_capture.is_some()
+            || self.table_line.is_some()
+            || self.table_skip.is_some()
+            || self.lines == 0
+            || self.line_source_end != line_start
+            || self.line_source_end > self.source_end
+            || self.source_end > proven_end
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.source_end))
+    }
+
     pub(super) fn new(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,

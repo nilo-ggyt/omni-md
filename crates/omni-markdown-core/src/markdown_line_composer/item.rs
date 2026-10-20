@@ -746,6 +746,59 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
+    /// 同一原源的已封存字形只有在整个仍活跃样式域均位于真实 plain 证明内才可保留。
+    /// 不改 cursor、nonce 或 scope；后继 NeedStyle 仍由新选择的正常语义发布授权。
+    /// 未交付输入和旧 RootLeaf 边界不在这个窄能力内，不能以默认样式或相同坐标猜测。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub(super) fn retains_plain_prefix(
+        &self,
+        captured_end: usize,
+        proven_end: usize,
+    ) -> Result<bool> {
+        self.guard()?;
+        let result = (|| {
+            let payload = self
+                .payload
+                .as_ref()
+                .ok_or(MarkdownLineComposeError::Poisoned)?;
+            if payload.cursor != captured_end
+                || payload.cursor > proven_end
+                || payload.request.is_some()
+                || payload.pending_style.is_some()
+                || payload.font_probe_scope.is_some()
+                || payload.item.is_some()
+                || payload.closed_input.is_some()
+                || payload.scan.is_some()
+                || payload.control.is_some()
+                || payload.open_probe.is_some()
+                || !matches!(
+                    payload.stage,
+                    Stage::ItemStart | Stage::ClosedFonts | Stage::Frontier | Stage::End
+                )
+            {
+                return Ok(false);
+            }
+            // ClosedFonts 的 AwaitChild 会晚于 Store 的实际归还一步清槽；保留真实空 child
+            // 的续体，不为得到空槽而额外推进一个量子，也不把仍活的 child 当作已释放。
+            if let Some(fonts) = &payload.closed_fonts
+                && !fonts.retains_plain_prefix(&self.authority, proven_end)?
+            {
+                return Ok(false);
+            }
+            if let Some(frontier) = &payload.frontier
+                && !frontier.retains_plain_prefix(proven_end)?
+            {
+                return Ok(false);
+            }
+            Ok(true)
+        })();
+        self.guard()?; // Font 注册检查失败也先归还同一原 Source 健康首因。
+        result
+    }
+
     #[cfg(all(test, feature = "paged-shaping-frontier"))]
     /// 实际语言索引的累计源读取只用于重排回归；getter自身不推进任何Job。
     pub(super) fn style_dependency_source_reads(&mut self) -> (usize, usize) {

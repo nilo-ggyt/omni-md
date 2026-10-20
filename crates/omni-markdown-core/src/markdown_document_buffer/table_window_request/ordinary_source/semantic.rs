@@ -34,6 +34,13 @@ pub(super) struct OrdinaryBlockRecord {
     pub(super) seed: VerifiedInlineSemanticSeed,
 }
 
+/// 同一真实投影末端的两种坐标；只在能力构造栈中使用，不是另一份正文索引。
+#[cfg(feature = "paged-line-compose")]
+pub(super) struct PlainPrefixEnd {
+    pub(super) byte: usize,
+    pub(super) utf16: usize,
+}
+
 impl OrdinaryBlockRecord {
     /// 容器段落须持原 Origin 才可进入 inline；Root 与 Setext 保留各自完整块合同。
     pub(super) fn is_scoped_paragraph(&self) -> bool {
@@ -510,6 +517,47 @@ impl PlainSemanticJob {
                 .block
                 .as_ref()
                 .is_some_and(|current| Rc::ptr_eq(current, block))
+    }
+
+    /// 只把原 Root Paragraph 已读到的无特殊语法前缀交给选择等效检查；不是整个块的证明。
+    /// UTF16 末端沿本次 Bounds/Coordinates 的真实投影取得，不为远端标题或未知后缀另扫正文。
+    #[cfg(feature = "paged-line-compose")]
+    pub(super) fn selection_invariant_prefix(
+        &self,
+        source: &MarkdownTableSourceIdentity,
+        leaf: &VerifiedMarkdownRootLeafViewport,
+    ) -> Option<PlainPrefixEnd> {
+        if !self.retains_plain_prefix() {
+            return None;
+        }
+        let block = self.block.as_ref()?;
+        let proof = self.proof.as_ref()?;
+        let coverage = self.byte_coverage.as_ref()?;
+        let projected = self.projected?;
+        // 同一个 seed 同时绑定原 Parser options 与 Root scope。标题、容器、格与有 marker
+        // 的证明都不授予此能力；前缀在源0开始，才没有其外部的标签或容器改变已有样式。
+        if block.seed.scope_depth() != 1
+            || block.seed.kind() != InlineBlockKind::Paragraph
+            || block.seed.physical_range().start != 0
+            || block.seed.source_range().start != 0
+            || proof.kind() != InlineBlockKind::Paragraph
+            || proof.marker_range().is_some()
+            || proof.physical_range().start != 0
+            || proof.source_range().start != 0
+            || proof.source_revision() != source.generation()
+            || proof.source_end() != source.byte_len()
+            || coverage.end > proof.proven_end()
+            || projected[3] < self.requested.end
+            || !leaf.covers_plain_block(block, &self.requested)
+        {
+            return None;
+        }
+        // byte 端点可因完整 scalar 包络略超 UTF16 查询；只授予已投影的 requested.end，
+        // 绝不用 source_range.end 或 proven_end 推测整段 UTF16 长度，也不授予 GCB 边界。
+        Some(PlainPrefixEnd {
+            byte: coverage.end,
+            utf16: self.requested.end,
+        })
     }
 
     /// 父 Leaf 已计量新窗口与完整选择端点，且接回唯一 underline 后，才续同一普通块。

@@ -69,6 +69,14 @@ fn selection_reprojection_reuses_true_prefix_and_stops_at_later_inline() {
         head_utf16: 83_069,
     };
     doc.set_selection(new_selection).unwrap();
+    #[cfg(feature = "paged-line-compose")]
+    assert!(
+        request
+            .plain_selection_prefix(&doc, &old, authority(&doc))
+            .unwrap()
+            .is_some(),
+        "原83K有限末端之前的Root Plain事实应能交给同源Composer核验"
+    );
     assert!(
         request
             .reproject_selection(&doc, &old, 0..7, authority(&doc))
@@ -140,6 +148,14 @@ fn selection_reprojection_reuses_true_prefix_and_stops_at_later_inline() {
     else {
         panic!("原证明末端之后的真实粗体仍须独立完成");
     };
+    #[cfg(feature = "paged-line-compose")]
+    assert!(
+        request
+            .plain_selection_prefix(&doc, &current, authority(&doc))
+            .unwrap()
+            .is_none(),
+        "未知后缀遇真实特殊语法后不能沿已释放的旧Plain证明扩大能力"
+    );
     assert_oracle(leaf, &doc, &source, &suffix);
     assert!(
         leaf.query_for(&doc, authority(&doc), suffix_start + 3)
@@ -330,6 +346,146 @@ fn selection_reprojection_declines_missing_records_and_keeps_real_failure_author
         request.reproject_selection(&foreign, &previous, 0..1, authority(&foreign)),
         Err(MarkdownTableRequestError::SourceSuperseded)
     );
+}
+
+#[cfg(feature = "paged-line-compose")]
+#[test]
+fn plain_selection_prefix_declines_markup_and_preserves_original_publication() {
+    // 每个负例仍经过真实 Global/Leaf/Parser 完成并移交输出；不能靠构造一个空目录
+    // 测出 None。能力缺失后恢复原选择，原公开语义与正常重投影继续工作，证明没有偷偷退休。
+    for source in [
+        "普通 **粗体** 尾\n",
+        "<u>下划线😀</u> 尾\n",
+        "<div>真实HTML</div>\n",
+        "## 标题😀\n",
+        "> 引用普通正文\n",
+        "| 列 |\n| --- |\n| 值 |\n",
+    ] {
+        let (directory, mut doc) = document(source);
+        let backing = doc.original_backing_observer().unwrap();
+        let original = MarkdownTextSelection::caret(doc.utf16_len());
+        doc.set_selection(original).unwrap();
+        let requested = 0..doc.utf16_len();
+        let mut request = doc
+            .viewport_leaf_source_request(requested.clone(), 57, original)
+            .unwrap();
+        super::inline::finish_inline(&mut request, &doc).unwrap();
+        let previous = request
+            .take_sources_for(&doc, authority(&doc))
+            .unwrap()
+            .unwrap();
+        let changed = MarkdownTextSelection {
+            anchor_utf16: 2,
+            head_utf16: 0,
+        };
+        doc.set_selection(changed).unwrap();
+        assert!(
+            request
+                .plain_selection_prefix(&doc, &previous, authority(&doc))
+                .unwrap()
+                .is_none(),
+            "有真实marker/HTML/容器/table的语义不能保普通字形，source={source:?}"
+        );
+        doc.set_selection(original).unwrap();
+        let semantic = previous
+            .ordinary_semantics_for(&doc, authority(&doc))
+            .unwrap();
+        if let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = semantic {
+            for covered in leaf.covered_ranges_for(&doc, authority(&doc)).unwrap() {
+                assert_oracle(leaf, &doc, source, covered);
+            }
+        }
+        assert_eq!(doc.generation(), 0);
+        assert!(!doc.can_undo() && !doc.can_redo());
+        assert_eq!(
+            std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+            source.as_bytes()
+        );
+        drop((previous, request, doc));
+        assert_eq!(backing.mapped_bytes(), 0);
+        assert_eq!(backing.managed_resident_bytes(), 0);
+    }
+}
+
+#[cfg(feature = "paged-line-compose")]
+#[test]
+fn plain_selection_prefix_keeps_real_source_cancellation_and_context_errors() {
+    let source = "中文 abc😀 真实普通前缀 尾";
+    let (_directory, mut doc) = document(source);
+    let backing = doc.original_backing_observer().unwrap();
+    let original = MarkdownTextSelection::caret(doc.utf16_len());
+    doc.set_selection(original).unwrap();
+    let (mut request, previous) = leaf_sources(&doc, 0..2);
+    doc.set_selection(MarkdownTextSelection {
+        anchor_utf16: 4,
+        head_utf16: 0,
+    })
+    .unwrap();
+    let current = authority(&doc);
+    let (_foreign_directory, foreign) = document(source);
+    let mut cancelled = current;
+    cancelled.cancelled = true;
+    let mut wrong_context = current;
+    wrong_context.context_revision += 1;
+    for (document, authority, expected) in [
+        (&doc, cancelled, MarkdownTableRequestError::Cancelled),
+        (
+            &doc,
+            wrong_context,
+            MarkdownTableRequestError::PublicationSuperseded,
+        ),
+        (
+            &foreign,
+            authority(&foreign),
+            MarkdownTableRequestError::SourceSuperseded,
+        ),
+    ] {
+        assert!(matches!(
+            request.plain_selection_prefix(document, &previous, authority),
+            Err(cause) if cause == expected
+        ));
+    }
+    // 只读能力检查不修改原请求；错误参数移除后仍能按真正新选择重投影同一已发布窗口。
+    assert!(
+        request
+            .plain_selection_prefix(&doc, &previous, current)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        request
+            .reproject_selection(&doc, &previous, 0..2, current)
+            .unwrap()
+    );
+    doc.set_selection(original).unwrap();
+    assert!(matches!(
+        previous.ordinary_semantics_for(&doc, authority(&doc)),
+        Err(MarkdownTableRequestError::PublicationSuperseded)
+    ));
+    doc.set_selection(current.selection).unwrap();
+    drop(previous);
+    finish_sources(&mut request, &doc).unwrap();
+    let current = request
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = current
+        .ordinary_semantics_for(&doc, authority(&doc))
+        .unwrap()
+    else {
+        panic!("原请求在拒绝外来参数之后仍须真实完成新选择发布");
+    };
+    assert_oracle(leaf, &doc, source, &(0..2));
+    doc.replace_utf16_range(0..0, "新", MarkdownTextSelection::caret(1))
+        .unwrap();
+    doc.undo().unwrap();
+    assert!(matches!(
+        request.plain_selection_prefix(&doc, &current, authority(&doc)),
+        Err(MarkdownTableRequestError::SourceSuperseded)
+    ));
+    drop((current, request, doc));
+    assert_eq!(backing.mapped_bytes(), 0);
+    assert_eq!(backing.managed_resident_bytes(), 0);
 }
 
 #[test]

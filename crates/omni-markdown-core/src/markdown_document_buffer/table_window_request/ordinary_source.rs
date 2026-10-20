@@ -19,7 +19,11 @@ pub use required::{
 pub use table_row::VerifiedMarkdownTableRowSource;
 mod cell_inline;
 pub use cell_inline::{MarkdownTableCellInlineStep, VerifiedMarkdownTableCellInline};
+#[cfg(feature = "paged-line-compose")]
+mod selection_prefix;
 mod semantic;
+#[cfg(feature = "paged-line-compose")]
+pub use selection_prefix::MarkdownPlainSelectionPrefix;
 pub use semantic::{
     MarkdownOrdinaryPendingReason, MarkdownOrdinarySemanticState, VerifiedMarkdownPlainViewport,
 };

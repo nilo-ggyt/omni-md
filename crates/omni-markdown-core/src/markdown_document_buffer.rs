@@ -56,6 +56,8 @@ pub use table_row_append::MarkdownTableRowAppendPlan;
 mod table_source;
 #[cfg(feature = "s2-table-window-prototype")]
 mod table_window_request;
+#[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+pub use table_window_request::MarkdownPlainSelectionPrefix;
 #[cfg(feature = "s2-table-window-prototype")]
 pub use table_window_request::{
     MarkdownOrdinaryPendingReason, MarkdownOrdinarySemanticState, MarkdownRootLeafPendingReason,

@@ -849,12 +849,23 @@ impl SoftwareInput {
         self.panel_querying.set(false); // 本同步查询及按键准备已退栈，不把保护当面板完成状态。
     }
 
-    /// 错源直出英文或空格确认了其他词都是真失败；只唤醒原loop，不补造目标中文。
+    /// 一个IME事件可先insertText再setMarkedText，未标记通知不是原按键的解释终点。
+    /// 字母仍等真实marked；确认键若没有提交目标中文才失败，不补造文字或重放输入。
     fn unexpected_commit(&self, commit: &NativeMarkdownPagedInputCommit) {
-        if self.waiting.get().is_some()
+        if let Some((index, _)) = self.waiting.get()
             && (commit.invalidation.characters_changed || commit.invalidation.marked_changed)
             && self.failed.get().is_none()
         {
+            if index < 8 {
+                // Squirrel同次rimeUpdate可先消费已提交文字，再显示后继组合；此时立即
+                // stop会让后面的真实marked被首错门挡掉。保留原waiting，不发送下一字母；
+                // 若原事件始终没有marked，仍由既有30秒期限失败，不续期或另排检查任务。
+                println!(
+                    "system_ime stage=intermediate_unmarked index={index} generation={} utf16_len={} marked={:?} waiting_preserved=true next_press_posted=false deadline_unchanged=true software_events=true physical_keyboard=false",
+                    commit.state.generation, commit.state.utf16_len, commit.state.marked,
+                );
+                return;
+            }
             self.failed.set(Some("实际系统IME没有按本序列提交目标中文"));
             stop(&self.application);
         }

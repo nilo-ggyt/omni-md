@@ -87,6 +87,64 @@ struct Run {
 }
 
 impl FontRuns {
+    /// 已交付 child 的原 Font owner 可以等下一正常 step 归还；选择改变不需要重造它。
+    /// 但能力要覆盖其完整自然项及仍保留的有限后继，不能只检查刚发布软行的末端。
+    /// 所有范围来自这个 owner 已接纳的真实响应；这里不领取 GCB、不读取正文或补签字体。
+    #[cfg(feature = "s2-table-window-prototype")]
+    pub(in crate::markdown_line_composer::item) fn retains_plain_prefix(
+        &self,
+        source: &MarkdownLayoutTextAuthority,
+        proven_end: usize,
+    ) -> Result<bool> {
+        if &self.source != source {
+            return Err(MarkdownLineComposeError::SourceMismatch);
+        }
+        if self.cancellation.requested() {
+            return Err(MarkdownLineComposeError::Cancelled);
+        }
+        let inside = |range: &Range<usize>| range.start <= range.end && range.end <= proven_end;
+        if !matches!(self.phase, Phase::AwaitChild)
+            || self
+                .child
+                .as_ref()
+                .is_none_or(|child| child.strong_count() != 0)
+            || !inside(&self.facts.source_utf16)
+            || self.run.as_ref().is_some_and(|run| !inside(&run.range))
+            || self.emit.as_ref().is_some_and(|run| !inside(&run.range))
+            || self
+                .probe
+                .as_ref()
+                .is_some_and(|probe| !inside(&probe.range))
+            || self
+                .audit
+                .as_ref()
+                .is_some_and(|audit| !inside(&audit.range))
+            || self
+                .awaiting
+                .as_ref()
+                .is_none_or(|(range, _)| !inside(range))
+        {
+            return Ok(false);
+        }
+        // 只借仍活着的原注册核实际 Font payload；不注册同名替身，也不把旧弱票升级为新代次。
+        if let Some(registration) = &self.registration
+            && !self.original.permits(&registration.authority()?)
+        {
+            return Err(MarkdownLineComposeError::SourceMismatch);
+        }
+        for run in [&self.run, &self.emit].into_iter().flatten() {
+            if let Some(registration) = &run.registration
+                && !run.font.permits(&registration.authority()?)
+            {
+                return Err(MarkdownLineComposeError::SourceMismatch);
+            }
+        }
+        if let Some(audit) = &self.audit {
+            audit.preferred.lease()?;
+        }
+        Ok(true)
+    }
+
     pub(in crate::markdown_line_composer::item) fn new(
         closed: &ClosedItem,
         original: MarkdownLayoutFont,

@@ -222,6 +222,22 @@ pub struct VerifiedMarkdownRootLeafViewport {
 }
 
 impl VerifiedMarkdownRootLeafViewport {
+    /// 原 Plain 槽与本次唯一覆盖必须持同一个真实 seed；相同数值包络不能替代来源身份。
+    /// 只供父请求的同步前缀能力检查，外部仍须经 publication 的完整 Source/选择权限。
+    #[cfg(feature = "paged-line-compose")]
+    pub(super) fn covers_plain_block(
+        &self,
+        block: &Rc<OrdinaryBlockRecord>,
+        utf16: &Range<usize>,
+    ) -> bool {
+        self.coverage.len == 1
+            && self.coverage.get(0).is_some_and(|coverage| {
+                &coverage.utf16 == utf16
+                    && matches!(coverage.record.as_ref(), SourceRecord::Line(line)
+                        if line.semantic_block.as_ref().is_some_and(|current| Rc::ptr_eq(current, block)))
+            })
+    }
+
     fn check(
         &self,
         document: &MarkdownDocumentBuffer,
