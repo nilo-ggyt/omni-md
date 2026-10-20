@@ -566,26 +566,37 @@ fn bounded_pending_client(mtm: MainThreadMarker) {
         assert!(view.take_failure().is_none());
         assert_eq!(view.input_state().unwrap().generation, 0);
         drop(substring);
-        // 帧坐标只读原公开请求；不记录委托调用次数，实际宽度撤权另由原 targets 流程验证。
-        let previous = view.capture_scene_request().unwrap();
+        // 首帧前委托尚无可见布局，请求捕获也应如实保留 Pending；不能为观察 frame 造一张布局票。
+        // 这里只比较真实 NSView 的移动与完整输入事实，已有 Ready 的几何撤权由原 targets 流程验证。
+        assert!(matches!(
+            view.capture_scene_request(),
+            Err(NativeMarkdownPagedTextViewError::Pending)
+        ));
+        let previous = view.frame();
+        let input_before_move = view.input_state().unwrap();
         view.setFrameOrigin(NSPoint::new(0.0, 12000.0));
-        let current = view.capture_scene_request().unwrap();
-        assert!(current.geometry_epoch > previous.geometry_epoch);
-        assert_eq!(current.frame_in_parent.origin.y, 12000.0);
-        assert_eq!(current.viewport.size.height, previous.viewport.size.height);
+        let current = view.frame();
+        assert_eq!(current.origin.y, 12000.0);
+        assert_eq!(current.size, previous.size);
+        assert_eq!(view.input_state().unwrap(), input_before_move);
+        assert!(matches!(
+            view.capture_scene_request(),
+            Err(NativeMarkdownPagedTextViewError::Pending)
+        ));
         assert!(matches!(
             view.scene_ready(),
             Err(NativeMarkdownPagedTextViewError::Pending)
         ));
+        assert_eq!(view.cpu_paints(), Some(0));
+        assert_eq!(pixels.snapshot().live_pixel_bytes, 0);
+        assert!(view.take_failure().is_none());
         let resources = body.resource_receipts().unwrap();
         assert!(resources.reader.is_none()); // 未执行来源推进，不能为了资源门偷偷创建 Reader。
         let close = body.begin_close().unwrap();
         assert!(Rc::ptr_eq(&close, &body.begin_close().unwrap()));
         paged_close_event::wait(&close);
         close.verify_released().unwrap();
-        drop((
-            context, current, previous, view, body, scroll, font, paragraph,
-        ));
+        drop((context, view, body, scroll, font, paragraph));
         CATransaction::flush();
         assert!(document_weak.upgrade().is_none());
         (native, mapping, pixels, resources)
@@ -599,7 +610,7 @@ fn bounded_pending_client(mtm: MainThreadMarker) {
     assert_eq!(pixels.snapshot().live_pixel_bytes, 0);
     verify_source_release(vec![resources]);
     println!(
-        "paged_body_source stage=bounded_pending_client actual_body=true bounded_substring=true scalar_edges=true natural_scene_pending=true pending_geometry_rejected=true frame_origin_revoked=true no_frame_fabricated=true actual_native_mmap_font_pixel_released=true whole_product=false formal=false"
+        "paged_body_source stage=bounded_pending_client actual_body=true bounded_substring=true scalar_edges=true natural_scene_pending=true pending_geometry_rejected=true frame_origin_changed=true full_input_unchanged=true no_frame_fabricated=true actual_native_mmap_font_pixel_released=true whole_product=false formal=false"
     );
 }
 
