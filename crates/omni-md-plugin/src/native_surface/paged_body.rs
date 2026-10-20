@@ -730,6 +730,80 @@ impl NativeMarkdownPagedBody {
         self.fail_pending_find(&cause);
         // 首错是 sticky：停止原续体并清掉 Ready，不用再次捕获较新 Source 隐藏错误。
         if self.failure.borrow().is_none() {
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            {
+                // 只在原首次失败边界记录枚举分类；后继Busy/Revoked不能替代原准备首因。
+                // 只读这一层已持有的typed cause，不遍历错误链、不展开String/Source或正文路径。
+                // View错误可能持有链接或附件错误文本，因此不对整个ViewError做Debug。
+                let view = match &cause {
+                    NativeMarkdownPagedBodyError::View(error) => {
+                        Some(std::mem::discriminant(error))
+                    }
+                    _ => None,
+                };
+                // Core分类区分权限、覆盖、断行和整形；具体Source与分页资源仍留在原错误中。
+                let compose = match &cause {
+                    NativeMarkdownPagedBodyError::Compose(error) => {
+                        Some(std::mem::discriminant(error))
+                    }
+                    _ => None,
+                };
+                // 字体捕获可携带系统或文件失败信息；这里只识别捕获类型，不打印描述或URL。
+                let font = match &cause {
+                    NativeMarkdownPagedBodyError::Font(error) => {
+                        Some(std::mem::discriminant(error))
+                    }
+                    _ => None,
+                };
+                // 注册失败属于原真实catalog，不为诊断重新解析、注册或获取字体权限。
+                let registration = match &cause {
+                    NativeMarkdownPagedBodyError::Registration(error) => {
+                        Some(std::mem::discriminant(error))
+                    }
+                    _ => None,
+                };
+                // 已捕获的段落失败只读枚举；不在错误边界再次调用Native样式getter。
+                let paragraph = match &cause {
+                    NativeMarkdownPagedBodyError::Paragraph(error) => {
+                        Some(std::mem::discriminant(error))
+                    }
+                    _ => None,
+                };
+                // 滚动几何失败与正文源失败分开标明，不重新捕Scene或领取后继窗口。
+                let viewport = match &cause {
+                    NativeMarkdownPagedBodyError::Viewport(error) => {
+                        Some(std::mem::discriminant(error))
+                    }
+                    _ => None,
+                };
+                // 候选试次不因观察而继续推进；完整内层原因及资源归还义务仍归原cause。
+                let fallback = match &cause {
+                    NativeMarkdownPagedBodyError::Fallback(error) => {
+                        Some(std::mem::discriminant(error))
+                    }
+                    _ => None,
+                };
+                // 语义层保留WorkLimit/撤销/Source分类，不输出其可能包含的冻结源错误载荷。
+                let semantics = match &cause {
+                    NativeMarkdownPagedBodyError::Semantics(error) => {
+                        Some(std::mem::discriminant(error))
+                    }
+                    _ => None,
+                };
+                // 仅真实std::io::Error可投影errno；不格式化其可能包含外部载荷的message。
+                let storage_errno = match &cause {
+                    NativeMarkdownPagedBodyError::Compose(
+                        omni_markdown_core::MarkdownLineComposeError::Storage(error),
+                    ) => error.raw_os_error(),
+                    _ => None,
+                };
+                // 固定字段仅含Discriminant和可选整数；普通构建完全不编译这条诊断。
+                // 原sticky赋值及下方真实清理继续原样执行，诊断不消费或替换任何错误。
+                eprintln!(
+                    "native_body_failure body={:?} view={view:?} compose={compose:?} font={font:?} registration={registration:?} paragraph={paragraph:?} viewport={viewport:?} fallback={fallback:?} semantics={semantics:?} storage_errno={storage_errno:?}",
+                    std::mem::discriminant(&cause),
+                );
+            }
             *self.failure.borrow_mut() = Some(cause);
         }
         self.failed.set(true);
