@@ -148,6 +148,9 @@ pub struct NativeMarkdownPagedViewport {
     horizontal_scroller_changed: Cell<bool>,
     epoch: Cell<u64>,
     busy: Cell<bool>,
+    // 仅覆盖原同步里的 document.setFrame；此时 Geometry 已撤销且 busy，通知不能另开同步。
+    // setter 返回后仍由原调用读取并严格核对真实 clip/转换，不表示新几何已经完成。
+    installing_document_frame: Cell<bool>,
     closed: Cell<bool>,
     poisoned: Cell<bool>,
     failure: RefCell<Option<NativeMarkdownPagedViewportError>>,
@@ -177,24 +180,12 @@ fn finite(rect: NSRect) -> bool {
         && rect.size.height > 0.0
 }
 
-#[track_caller]
 fn step<T>(current: &(impl Fn() -> bool + ?Sized), operation: impl FnOnce() -> T) -> Result<T> {
     if !current() {
-        // 临时归因只记原调用位置，不重新查询 Native、Source 或输入。
-        #[cfg(feature = "native-close-stage-diagnostic")]
-        eprintln!(
-            "native_viewport_revoked phase=before line={}",
-            std::panic::Location::caller().line()
-        );
         return Err(NativeMarkdownPagedViewportError::Revoked);
     }
     let value = operation();
     if !current() {
-        #[cfg(feature = "native-close-stage-diagnostic")]
-        eprintln!(
-            "native_viewport_revoked phase=after line={}",
-            std::panic::Location::caller().line()
-        );
         return Err(NativeMarkdownPagedViewportError::Revoked);
     }
     Ok(value)
@@ -413,6 +404,7 @@ impl NativeMarkdownPagedViewport {
             horizontal_scroller_changed: Cell::new(false),
             epoch: Cell::new(0),
             busy: Cell::new(false),
+            installing_document_frame: Cell::new(false),
             closed: Cell::new(false),
             poisoned: Cell::new(false),
             failure: RefCell::new(None),
@@ -463,6 +455,12 @@ impl NativeMarkdownPagedViewport {
                     return; // 外部代码可在其他线程伪发同名通知；不触碰Rc、Native或主线程状态。
                 };
                 if let Some(owner) = weak.get(mtm).upgrade() {
+                    // 空画布改高可在 setFrame 内夹回 clip 并同步发通知。原同步已经撤掉
+                    // 所有旧 Geometry，且将在 setter 退栈后完整量取实际结果；这里不能
+                    // 再递增 epoch 使原同步永久失权。范围外的通知继续严格撤票并同步。
+                    if owner.installing_document_frame.get() {
+                        return;
+                    }
                     // 通知不携文字或事件；只立即撤旧geometry并核对本次真实clip，不保存待重放输入。
                     if let Err(error) = owner.synchronize() {
                         let mut slot = owner.failure.borrow_mut();
@@ -818,8 +816,6 @@ impl NativeMarkdownPagedViewport {
         // Weak.load与撤CPU候选也可能归还Native资源并重入几何查询，故从这里起就标明
         // “本owner正在同步、尚无新geometry”。失败同样由原RAII归还，不把busy留给后继。
         if self.busy.replace(true) {
-            #[cfg(feature = "native-close-stage-diagnostic")]
-            eprintln!("native_viewport_sync_failure phase=nested epoch={epoch}");
             return Err(NativeMarkdownPagedViewportError::Busy);
         }
         let _updating = Updating(&self.busy);
@@ -828,11 +824,19 @@ impl NativeMarkdownPagedViewport {
             .load()
             .ok_or(NativeMarkdownPagedViewportError::Closed)?;
         body.invalidate_geometry()?;
+        // 自有 frame 的同步通知可以合并，正文输入或内容范围换代却不能借此续权。
+        // 只持完整 Input 纯值及原尺寸，不持正文、Scene 或另一读取者。
+        let input_before = body.input_state()?;
+        let content_width = self.width.get();
+        let content_height = self.height.get();
         let pure_current = || {
             !self.closed.get()
                 && !self.poisoned.get()
                 && !self.off_main_notice.load(Ordering::Acquire)
                 && self.epoch.get() == epoch
+                && self.width.get() == content_width
+                && self.height.get() == content_height
+                && body.input_state().is_ok_and(|input| input == input_before)
         };
         let current = || pure_current() && body.session_is_current() && pure_current();
         let checked = |value: bool| {
@@ -892,6 +896,10 @@ impl NativeMarkdownPagedViewport {
         );
         checked(finite(document_frame))?;
         if step(&current, || document.frame())? != document_frame {
+            // 只合并这一个实际 setter 栈内的 clip 通知；RAII 在失败与正常返回时均恢复。
+            // 这里不发布、不重签原票，后继的真实几何读取及所有精确终检仍必须完成。
+            self.installing_document_frame.set(true);
+            let _installing = Updating(&self.installing_document_frame);
             step(&current, || document.setFrame(document_frame))?;
         } // 精确相等时不发冗余setFrame，以免一条clip通知制造无关layout递归。
         let visible = step(&current, || clip.documentVisibleRect())?;
@@ -948,13 +956,6 @@ impl NativeMarkdownPagedViewport {
                 && step(&current, || body.frame())? == body_frame,
         )?;
         let body_bounds = step(&current, || body.bounds())?;
-        // 仅消费已经完成的原 getter，查明大文档位置是否改变有限视图的实际 bounds。
-        #[cfg(feature = "native-close-stage-diagnostic")]
-        if body_bounds != NSRect::new(NSPoint::ZERO, body_frame.size) {
-            eprintln!(
-                "native_viewport_sync_failure phase=body_bounds actual={body_bounds:?} expected_frame={body_frame:?}"
-            );
-        }
         checked(body_bounds == NSRect::new(NSPoint::ZERO, body_frame.size))?;
         // 本视图不承载整文坐标或隐式缩放；非零bounds/大逻辑画布必须被拒绝，不能发布伪小frame。
         // 发布前再核原Native关系；嵌套通知或后继挂载不能把原候选geometry补签成功。
