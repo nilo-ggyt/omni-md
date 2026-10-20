@@ -93,6 +93,11 @@ pub(super) fn observe(
             return Err(PanelError::CallerRevoked);
         }
         if applications.len() != 1 {
+            // 只记录本次已有查询的数量；LS应用数组为空与多实例都不是原PID已退出的证明。
+            println!(
+                "system_ime stage=squirrel_instance_count phase=initial count={} process_exit_proven=false",
+                applications.len(),
+            );
             return Err(PanelError::SquirrelInstanceNotUnique);
         }
         let application = applications.objectAtIndex(0);
@@ -211,6 +216,12 @@ pub(super) fn observe(
         // bundle/version/source 表，避免查询期间退出重启或把新的输入法实例当原客户的面板。
         let remaining = NSRunningApplication::runningApplicationsWithBundleIdentifier(bundle_id);
         if remaining.len() != 1 {
+            // 原窗口已实测后仍不从另一实例补票；记录真实末端数量，不放宽面板或存活判断。
+            println!(
+                "system_ime stage=squirrel_instance_count phase=after_window count={} original_pid={} process_exit_proven=false",
+                remaining.len(),
+                process.pid,
+            );
             return Err(PanelError::SquirrelInstanceNotUnique);
         }
         let still_running = remaining.objectAtIndex(0);

@@ -18,7 +18,8 @@ use objc2_core_graphics::{
     kCGWindowAlpha, kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use objc2_foundation::{
-    NSContainsRect, NSNotification, NSNotificationCenter, NSObjectProtocol, NSPointInRect, NSTimer,
+    NSContainsRect, NSMatchingOptions, NSNotification, NSNotificationCenter, NSObjectProtocol,
+    NSPointInRect, NSRegularExpression, NSRegularExpressionOptions, NSTimer, ns_string,
 };
 use omni_markdown_core::MarkdownTextSelection;
 use omni_md_plugin::native_surface::{
@@ -28,7 +29,8 @@ use omni_md_plugin::native_surface::{
 };
 
 const INSERTION: usize = 70_001;
-const EXPECTED: [u16; 2] = [0x4e2d, 0x6587];
+// 只观察本合成文稿一次提交的至多128B纯UTF16值，不按字面词假定当前Rime使用全拼。
+const MAX_COMMIT_UTF16: usize = 64;
 const SOFTWARE_INPUT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
@@ -436,15 +438,15 @@ impl SoftwareInput {
             return;
         }
         let index = self.next.get();
-        // zhongwen 后由 Space 确认；只有原始虚拟键码，没有预填拼音或目标中文的 Unicode 载荷。
-        let presses: [u16; 9] = [0x06, 0x04, 0x1f, 0x2d, 0x05, 0x0d, 0x0e, 0x2d, 0x31];
+        // 当前Rime可以是双拼或形码，不能把全拼zhongwen当共同协议；只固定试一次a，绝不轮换键串。
+        // 真实marked和可见候选出现后才以Space确认；这里只列虚拟键码与应有ASCII，不注入汉字。
+        let presses: [(u16, u8); 2] = [(0x00, b'a'), (0x31, b' ')];
         assert!(index < presses.len());
         assert!(self.pending.borrow().is_none() && self.waiting.get().is_none());
-        // 本轮本地事件在原客户和标准 NSTextView 对照中均未证明真实组合；
-        // CG-backed 身份本身也不证明输入法已消费字母，后面的原 AppKit 路由保持不变。
+        // CG-backed身份和合法ASCII自身都不证明输入法已组合或面板已显示，仍须消费实际后态。
         // NULL source 仅创建本地 CGEvent，不调用 CGEventPost/PostToPid、不申请全局事件权限，
         // 也不切换当前输入源或模式；真正处理结果仍由原 marked、中文和面板收据证明。
-        let keycode = presses[index];
+        let (keycode, ascii) = presses[index];
         let created = (|| -> Result<[Retained<NSEvent>; 2], &'static str> {
             let create = |key_down: bool| -> Result<Retained<NSEvent>, &'static str> {
                 let raw = CGEvent::new_keyboard_event(None, keycode, key_down)
@@ -465,9 +467,7 @@ impl SoftwareInput {
                 let characters = event
                     .charactersIgnoringModifiers()
                     .ok_or("实际CG包装事件缺少本次ASCII按键字符")?;
-                if characters.length() != 1
-                    || characters.characterAtIndex(0) != u16::from(b"zhongwen "[index])
-                {
+                if characters.length() != 1 || characters.characterAtIndex(0) != u16::from(ascii) {
                     return Err("实际CG包装事件的字符与本次ASCII按键不符");
                 } // down/up 均须带同一次预期字符；缺失或不符不交 pending，也不冒充有效字母。
                 println!(
@@ -529,7 +529,7 @@ impl SoftwareInput {
         // Space只接收最后一个字母的原CPU票；真实面板已经被同票观察后才会准备这个按键。
         // 先把弱帧移到本同步栈再做Native查询；否则pending.take后的重入通知会再次看到
         // “尚未发送Space”的旧槽，既可能重复准备按键，也可能把正常确认后的换代误报撤权。
-        let composition_frame = if index == 8 {
+        let composition_frame = if index == 1 {
             self.panel_frame.borrow_mut().take()
         } else {
             None
@@ -622,7 +622,7 @@ impl SoftwareInput {
             self.stop_sequence();
             return true;
         }
-        if index == 8 {
+        if index == 1 {
             // 面板观察后还有一次真实主队列间隔；交付前不能给新输入或新几何重新捕generation。
             // 原窗口的Native查询结束后最后核同Input/Scene/CPU，撤权只终止而不重试Space。
             if composition_frame
@@ -677,39 +677,34 @@ impl SoftwareInput {
         if self.stopped.get() || self.failed.get().is_some() {
             return; // 同一IME事件可先insert再marked；首错之后的回调不能登记CPU或覆盖失败。
         }
-        if let Some((index, generation)) = self.waiting.get()
-            && index < 8
+        if let Some((0, generation)) = self.waiting.get()
             && commit.state.generation != generation
             && (commit.invalidation.characters_changed || commit.invalidation.marked_changed)
         {
             self.waiting.set(None);
             println!(
-                "system_ime stage=software_marked index={index} generation={} software_events=true physical_keyboard=false",
+                "system_ime stage=software_marked index=0 generation={} software_events=true physical_keyboard=false",
                 commit.state.generation,
             );
-            if index == 7 {
-                // Squirrel先回调setMarkedText才显示面板；此栈不能把旧面板或CPU排队当真实位置。
-                // 在原提交尚未结束时登记下一实际CPU终点，避免退栈后才观察而漏掉已完成帧。
-                // Body原观察槽只保本driver的Weak；原输入观察者继续唯一强持driver，不延长文稿生命。
-                self.panel_input.set(Some(commit.state));
-                let armed =
-                    self.body
-                        .upgrade()
-                        .zip(self.weak.upgrade())
-                        .is_some_and(|(body, driver)| {
-                            let observer: Rc<dyn NativeMarkdownPagedBodyPaintObserver> = driver;
-                            body.observe_next_cpu_frame(Rc::downgrade(&observer))
-                                .is_ok()
-                        });
-                if !armed {
-                    self.panel_input.set(None);
-                    if self.failed.get().is_none() {
-                        self.failed.set(Some("无法观察原组合Input的下一实际CPU帧"));
-                    }
-                    self.stop_sequence();
+            // Squirrel先回调setMarkedText才显示面板；此栈不能把旧面板或CPU排队当真实位置。
+            // 本次唯一字母先登记原提交对应的实际CPU终点，面板贴近后才能准备Space。
+            // Body原观察槽只保driver的Weak，不为取得候选而延长文稿生命或补入另一字母。
+            self.panel_input.set(Some(commit.state));
+            let armed =
+                self.body
+                    .upgrade()
+                    .zip(self.weak.upgrade())
+                    .is_some_and(|(body, driver)| {
+                        let observer: Rc<dyn NativeMarkdownPagedBodyPaintObserver> = driver;
+                        body.observe_next_cpu_frame(Rc::downgrade(&observer))
+                            .is_ok()
+                    });
+            if !armed {
+                self.panel_input.set(None);
+                if self.failed.get().is_none() {
+                    self.failed.set(Some("无法观察原组合Input的下一实际CPU帧"));
                 }
-            } else {
-                self.prepare_next();
+                self.stop_sequence();
             }
         }
     }
@@ -728,7 +723,7 @@ impl SoftwareInput {
             !self.stopped.get()
                 && self.failed.get().is_none()
                 && Instant::now() < self.deadline
-                && self.next.get() == 8
+                && self.next.get() == 1
                 && self.waiting.get().is_none()
                 && self.pending.borrow().is_none()
                 && key.request.input.marked.is_some()
@@ -798,7 +793,7 @@ impl SoftwareInput {
             || self.failed.get().is_some()
             || self.panel_observation.get().is_some()
             || self.panel_querying.get()
-            || self.next.get() != 8
+            || self.next.get() != 1
             || self.waiting.get().is_some()
             || self.pending.borrow().is_some()
         {
@@ -874,7 +869,7 @@ impl SoftwareInput {
         if self.stopped.get()
             || self.failed.get().is_some()
             || self.panel_observation.get().is_some()
-            || self.next.get() != 8
+            || self.next.get() != 1
             || self.waiting.get().is_some()
             || self.pending.borrow().is_some()
             || self.panel_querying.replace(true)
@@ -998,7 +993,7 @@ impl SoftwareInput {
             && (commit.invalidation.characters_changed || commit.invalidation.marked_changed)
             && self.failed.get().is_none()
         {
-            if index < 8 {
+            if index == 0 {
                 // Squirrel同次rimeUpdate可先消费已提交文字，再显示后继组合；此时立即
                 // stop会让后面的真实marked被首错门挡掉。保留原waiting，不发送下一字母；
                 // 若原事件始终没有marked，仍由既有30秒期限失败，不续期或另排检查任务。
@@ -1233,6 +1228,8 @@ struct InputObservation {
     document: std::rc::Weak<RefCell<MarkdownDocumentBuffer>>,
     marked_seen: Cell<bool>,
     finished: Cell<bool>,
+    // 只保实际提交的至多128B UTF16纯值，用于流式原文与历史对照；不保Source或Native强边。
+    committed_utf16: RefCell<Option<Vec<u16>>>,
     application: Retained<NSApplication>,
     software: RefCell<Option<Rc<SoftwareInput>>>,
     started: Cell<bool>,
@@ -1278,7 +1275,7 @@ impl InputObservation {
             "awaiting_physical_input"
         };
         println!(
-            "system_ime stage={stage} expected=中文 location={INSERTION} window_number={} visible={} key={} app_active={} software_events={} physical_keyboard={} deadline_seconds={seconds} injected_text=false whole_product=false formal=false",
+            "system_ime stage={stage} expected=actual_han_candidate location={INSERTION} window_number={} visible={} key={} app_active={} software_events={} physical_keyboard={} deadline_seconds={seconds} injected_text=false whole_product=false formal=false",
             window.windowNumber(),
             window.isVisible(),
             window.isKeyWindow(),
@@ -1291,13 +1288,73 @@ impl InputObservation {
             driver.prepare_next();
         }
     }
+
+    /// 只读本合成文稿在原插入点的有限实际提交，不把候选内容、文稿或Core映射留到后续阶段。
+    /// UTF16与Unicode Han分类都完整成功才交纯值；不从输入源标识推断方案或重建预期词。
+    fn capture_han_commit(
+        &self,
+        commit: &NativeMarkdownPagedInputCommit,
+    ) -> Result<Vec<u16>, &'static str> {
+        // 只按本次合成原文的净增量读取；超出观察容量直接失败，不截短真实候选或接受部分提交。
+        let length = commit
+            .state
+            .utf16_len
+            .checked_sub(SourceFixture::Cjk.source_utf16())
+            .filter(|length| (1..=MAX_COMMIT_UTF16).contains(length))
+            .ok_or("实际汉字提交为空或超出本次有限观察范围")?;
+        if commit.state.selection != MarkdownTextSelection::caret(INSERTION + length) {
+            return Err("实际汉字提交没有保留原插入点末端caret");
+        }
+        let mut units = vec![0; length];
+        {
+            let document = self.document.upgrade().ok_or("原合成文稿已经释放")?;
+            let document = document.borrow();
+            if document.generation() != commit.state.generation
+                || document.utf16_len() != commit.state.utf16_len
+                || document.selection() != commit.state.selection
+            {
+                return Err("原合成文稿已不是这次实际提交的后态");
+            }
+            document
+                .copy_utf16_code_units(INSERTION, &mut units)
+                .map_err(|_| "无法读取原合成文稿的实际有限提交")?;
+        } // 真实Source读取与Ref借用结束后才进入Foundation，不跨Native保留文稿借用。
+        let text = String::from_utf16(&units).map_err(|_| "实际提交不是完整合法的UTF16")?;
+        let string = NSString::from_str(&text);
+        // 复用已有Foundation ICU的Unicode脚本性质，不手写汉字区间或把任意非ASCII都算汉字。
+        // 原actual文字只活在这次有界分类栈，不打印文字、不读取面板标题或用户方案配置。
+        let expression = NSRegularExpression::regularExpressionWithPattern_options_error(
+            ns_string!("\\A\\p{Han}+\\z"),
+            NSRegularExpressionOptions::empty(),
+        )
+        .map_err(|_| "系统无法建立实际汉字提交的Unicode分类")?;
+        let range = NSRange::new(0, length);
+        if expression.rangeOfFirstMatchInString_options_range(
+            &string,
+            NSMatchingOptions::empty(),
+            range,
+        ) != range
+        {
+            return Err("实际候选提交不是完整汉字，不能计作中文输入法通过");
+        }
+        if !self.body.upgrade().is_some_and(|body| {
+            body.view()
+                .is_ok_and(|view| view.input_state().ok() == Some(commit.state))
+        }) {
+            return Err("实际有限提交分类后原输入后态已撤销");
+        }
+        Ok(units) // 最多64个UTF16单元，临时NSString/正则/UTF8串在返回时全部归还。
+    }
 }
 
 impl NativeMarkdownPagedBodyInputObserver for InputObservation {
     /// 原业务提交通知在Core借用结束后交付，只有实际marked再提交目标中文才结束人工输入。
     fn committed(&self, commit: &NativeMarkdownPagedInputCommit) {
         let software = self.software.borrow().clone();
-        if !self.started.get() || software.as_ref().is_some_and(|driver| driver.stopped.get()) {
+        if !self.started.get()
+            || self.finished.get()
+            || software.as_ref().is_some_and(|driver| driver.stopped.get())
+        {
             return; // 原客户的组合清理回调没有权限补签已超时/失败的实际输入序列。
         }
         if commit.state.marked.is_some() {
@@ -1307,26 +1364,33 @@ impl NativeMarkdownPagedBodyInputObserver for InputObservation {
             }
             return;
         }
-        if !self.marked_seen.get()
-            || commit.state.utf16_len != SourceFixture::Cjk.source_utf16() + 2
-        {
+        if !self.marked_seen.get() {
             if let Some(driver) = &software {
                 driver.unexpected_commit(commit);
             }
             return;
         }
-        let original = self.document.upgrade().unwrap();
-        let mut units = [0; 2];
-        original
-            .borrow()
-            .copy_utf16_code_units(INSERTION, &mut units)
-            .unwrap();
-        if units != EXPECTED {
-            if let Some(driver) = &software {
-                driver.unexpected_commit(commit);
-            }
-            return; // 错词、英文或粘贴不能替代中文候选确认；仍保留实际失败/未完成事实。
+        if let Some(driver) = &software
+            && (driver.next.get() != 2
+                || driver.panel_observation.get().is_none()
+                || driver.waiting.get().is_none_or(|(index, _)| index != 1))
+        {
+            // 单键产生marked不代表确认完成；原可见面板和Space阶段缺一就不能接纳后继汉字。
+            driver.unexpected_commit(commit);
+            return;
         }
+        let units = match self.capture_han_commit(commit) {
+            Ok(units) => units,
+            Err(cause) => {
+                if let Some(driver) = &software {
+                    if driver.failed.get().is_none() {
+                        driver.failed.set(Some(cause));
+                    }
+                    driver.stop_sequence();
+                }
+                return; // 不合格值不补试其他键串，也不能以净长度或已入队次数宣称中文成功。
+            }
+        };
         if let Some(driver) = &software
             && Instant::now() >= driver.deadline
         {
@@ -1336,6 +1400,7 @@ impl NativeMarkdownPagedBodyInputObserver for InputObservation {
             driver.stop_sequence();
             return;
         }
+        *self.committed_utf16.borrow_mut() = Some(units);
         self.finished.set(true);
         stop(&self.application); // 标准run在真实中文提交后退出，不造按键或输入法回调。
     }
@@ -1346,17 +1411,25 @@ impl NativeMarkdownPagedBodyInputObserver for InputObservation {
 }
 
 /// 每次4KiB读回全部canonical内容，确认远端插字未覆盖原四MiB，也没有把组合过程变成多笔历史。
-fn verify(document: &std::rc::Weak<RefCell<MarkdownDocumentBuffer>>, inserted: bool) {
+fn verify(document: &std::rc::Weak<RefCell<MarkdownDocumentBuffer>>, inserted: &[u16]) {
     let original = document.upgrade().unwrap();
     let original = original.borrow();
-    let extra = if inserted { 2 } else { 0 };
+    let extra = inserted.len();
+    // 逐scalar计真实UTF8字节，补充字符不能按每个UTF16单元三个字节误算，也不构造第二份字符串。
+    let inserted_bytes: usize = char::decode_utf16(inserted.iter().copied())
+        .map(|scalar| {
+            scalar
+                .expect("已接纳的有限汉字提交始终为合法UTF16")
+                .len_utf8()
+        })
+        .sum();
     assert_eq!(
         original.utf16_len(),
         SourceFixture::Cjk.source_utf16() + extra
     );
     assert_eq!(
         original.byte_len(),
-        SourceFixture::Cjk.edited_source_bytes() + extra * 3
+        SourceFixture::Cjk.edited_source_bytes() + inserted_bytes
     );
     let mut units = [0; 2048];
     for start in (0..original.utf16_len()).step_by(units.len()) {
@@ -1368,12 +1441,13 @@ fn verify(document: &std::rc::Weak<RefCell<MarkdownDocumentBuffer>>, inserted: b
             let at = start + offset;
             let expected = if at == 0 {
                 b'X' as u16
-            } else if inserted && (INSERTION..INSERTION + 2).contains(&at) {
-                EXPECTED[at - INSERTION]
+            } else if (INSERTION..INSERTION + extra).contains(&at) {
+                inserted[at - INSERTION]
             } else {
                 0x4e2d
             };
-            assert_eq!(actual, expected, "真实中文输入修改了非目标位置{at}");
+            // 比较仍是逐unit精确相等；失败只报告原位置，不让断言格式化实际候选的字符编码。
+            assert!(actual == expected, "真实中文输入修改了非目标位置{at}");
         }
     }
 }
@@ -1434,6 +1508,7 @@ pub(super) fn run(
         document: document.clone(),
         marked_seen: Cell::new(false),
         finished: Cell::new(false),
+        committed_utf16: RefCell::new(None),
         application: app.clone(),
         software: RefCell::new(None),
         started: Cell::new(false),
@@ -1512,7 +1587,7 @@ pub(super) fn run(
         if failure.is_none()
             && !(completed_before_cleanup
                 && original_failure.is_none()
-                && presses_started == 9
+                && presses_started == 2
                 && cleaned)
         {
             failure = Some(format!(
@@ -1524,16 +1599,18 @@ pub(super) fn run(
         failure = Some("没有收到实际中文输入法marked到中文提交，不能计作真实IME验收".into());
     }
     let marked_seen = observer.marked_seen.get();
+    let committed = observer.committed_utf16.borrow_mut().take();
     drop(observer); // 先撤输入弱客户，成功后的历史与失败后的关闭都不能重启输入阶段。
     drop(software); // 原context与本地软件key owner不能跨入父用例的严格释放终点。
     if let Some(failure) = failure {
         return Err(failure); // 父用例先走原唯一关闭/弱票/mmap门，再报告这里的首个真实失败。
     }
     assert!(marked_seen);
-    verify(document, true);
+    let committed = committed.expect("真实中文成功始终保存同一次有限提交值");
+    verify(document, &committed);
     assert_eq!(
         view.input_state().unwrap().selection,
-        MarkdownTextSelection::caret(INSERTION + 2)
+        MarkdownTextSelection::caret(INSERTION + committed.len())
     );
     for (command, inserted) in [
         (sel!(undo:), false),
@@ -1543,12 +1620,13 @@ pub(super) fn run(
         let frame = observe(body, Instant::now());
         view.command(command).unwrap();
         deliver_visible("system_ime_exact_history", body, frame);
-        verify(document, inserted);
+        // 每次仍流式核完整四MiB；Redo只恢复同一次实际值，Undo必须精确归还整个原prefix/suffix。
+        verify(document, if inserted { committed.as_slice() } else { &[] });
         let state = view.input_state().unwrap();
         assert!(state.marked.is_none());
         assert_eq!(
             state.selection,
-            MarkdownTextSelection::caret(INSERTION + if inserted { 2 } else { 0 })
+            MarkdownTextSelection::caret(INSERTION + if inserted { committed.len() } else { 0 })
         ); // 撤销/重做也要恢复真实输入前后caret，不能只让净文字看起来相同。
         receipts.push(body.resource_receipts().unwrap());
     }
