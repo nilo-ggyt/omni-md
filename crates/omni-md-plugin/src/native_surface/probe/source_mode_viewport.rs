@@ -61,6 +61,17 @@ fn screen_frame(
             .is_none_or(|end| end < probe.location + probe.length)
         || (actual.rect.size.height - visible.first_rect().size.height).abs() > 0.5
     {
+        // 只在原严格判断真实失败时记录两份既有几何，区分范围不完整和实际clip裁切。
+        // 不再领取Scene、不查询正文，也不以零宽字形为由改变半像素容差或接受后继帧。
+        eprintln!(
+            "native_source_mode_screen_mismatch probe={probe:?} actual_range={:?} actual_screen={:?} visible_range={:?} visible_local={:?} viewport={:?} mode={:?}",
+            actual.actual_range,
+            actual.rect,
+            visible.range(),
+            visible.first_rect(),
+            key.request.viewport,
+            key.presentation_mode,
+        );
         return Err("正式模式首 scalar 的完整字形未进入实际 clip".into());
     }
     let window = view.window().ok_or("正式分页窗口已经释放")?;

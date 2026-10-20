@@ -29,6 +29,7 @@ use omni_md_plugin::native_surface::{
 
 const INSERTION: usize = 70_001;
 const EXPECTED: [u16; 2] = [0x4e2d, 0x6587];
+const SOFTWARE_INPUT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 /// 软件模式验证当前IME真实组合/提交及实际面板几何；不据此声称物理按键或候选内容已通过。
@@ -349,6 +350,8 @@ struct SoftwareInput {
     application: Retained<NSApplication>,
     context: Retained<NSTextInputContext>,
     initial_source: Retained<NSString>,
+    // 与外层输入阶段共用唯一绝对期限；面板轮询、后继Space或Host通知均不能重新起算。
+    deadline: Instant,
     window_owner: Weak<NSWindow>,
     window: isize,
     next: Cell<usize>,
@@ -359,6 +362,9 @@ struct SoftwareInput {
     // 最后一个字母的原帧从首次观察一直守到Space真正交付；Missing不能换新帧补权。
     // key只有Source/Scene弱身份，不保正文；Space取走本槽后，Host通知不能再查旧组合。
     panel_frame: RefCell<Option<(NativeMarkdownPagedSceneKey, usize)>>,
+    // 另一个进程上屏不会必然更新本Host。只在原组合等待期保这一份标准timer；
+    // block只持driver Weak，确认、失败和关闭均先invalidate，不保正文或候选窗。
+    panel_timer: RefCell<Option<Retained<NSTimer>>>,
     // firstRect/系统查询可同步发Host通知；只阻止本次Native栈的递归查询，不代表面板完成。
     panel_querying: Cell<bool>,
     panel_observation: Cell<Option<panel::PanelObservation>>,
@@ -375,6 +381,7 @@ impl SoftwareInput {
         view: &NativeMarkdownPagedTextView,
         body: std::rc::Weak<NativeMarkdownPagedBody>,
         document: std::rc::Weak<RefCell<MarkdownDocumentBuffer>>,
+        deadline: Instant,
     ) -> Rc<Self> {
         let context = view.inputContext().expect("原正文必须持有系统输入context");
         // nil不能证明后继软件key仍交给最初输入源；拒绝本次验收，而不是替用户选择一个输入法。
@@ -392,6 +399,7 @@ impl SoftwareInput {
             application: app.clone(),
             context,
             initial_source,
+            deadline,
             window_owner: Weak::from(window),
             window: window.windowNumber(),
             next: Cell::new(0),
@@ -399,6 +407,7 @@ impl SoftwareInput {
             waiting: Cell::new(None),
             panel_input: Cell::new(None),
             panel_frame: RefCell::new(None),
+            panel_timer: RefCell::new(None),
             panel_querying: Cell::new(false),
             panel_observation: Cell::new(None),
             failed: Cell::new(None),
@@ -418,6 +427,12 @@ impl SoftwareInput {
     /// 本地槽只持下一个press的完整down/up；marked退栈后投递，不能递归分发事件。
     fn prepare_next(&self) {
         if self.stopped.get() || self.failed.get().is_some() {
+            return;
+        }
+        if Instant::now() >= self.deadline {
+            self.failed
+                .set(Some("原三十秒输入期限已到，不能准备后继按键"));
+            self.stop_sequence();
             return;
         }
         let index = self.next.get();
@@ -467,7 +482,7 @@ impl SoftwareInput {
                 if self.failed.get().is_none() {
                     self.failed.set(Some(cause));
                 }
-                stop(&self.application);
+                self.stop_sequence();
                 return; // 构造拒绝也交父唯一严格关闭，不panic绕开弱票及mmap门。
             }
         };
@@ -519,7 +534,7 @@ impl SoftwareInput {
                 if self.failed.get().is_none() {
                     self.failed.set(Some("原软件key文稿身份或完整Input已失效"));
                 }
-                stop(&self.application);
+                self.stop_sequence();
                 return true;
             }
         };
@@ -571,7 +586,7 @@ impl SoftwareInput {
                     .set(Some("原软件key交付前已失去窗口/输入context焦点权限"));
             }
             self.waiting.set(None);
-            stop(&self.application);
+            self.stop_sequence();
             return true; // 本地owner随栈结束；不重投此key，也不拦截任何其他真实事件。
         }
         // 焦点正确不代表输入源仍相同。每键紧前核原标识；变化只结束本序列，绝不切回旧源。
@@ -581,7 +596,7 @@ impl SoftwareInput {
                     .set(Some("当前输入源已变化，本次软件输入序列失效"));
             }
             self.waiting.set(None);
-            stop(&self.application);
+            self.stop_sequence();
             return true;
         }
         // 原始 CG 包装事件的 windowNumber 可以为0，由 NSApplication 的真实 keyWindow 路由。
@@ -594,7 +609,7 @@ impl SoftwareInput {
                 self.failed
                     .set(Some("软件key交付前原窗口或输入context已撤销"));
             }
-            stop(&self.application);
+            self.stop_sequence();
             return true;
         }
         if index == 8 {
@@ -608,7 +623,7 @@ impl SoftwareInput {
                     self.failed
                         .set(Some("面板观察后的原Input或几何已撤销，不能确认候选"));
                 }
-                stop(&self.application);
+                self.stop_sequence();
                 return true;
             }
         }
@@ -620,7 +635,15 @@ impl SoftwareInput {
                 self.failed
                     .set(Some("软件key焦点查询期间原完整Input已变化"));
             }
-            stop(&self.application);
+            self.stop_sequence();
+            return true;
+        }
+        // 所有可重入焦点/Source查询都已归还；Space只能在同一原期限内真正交付，
+        // 不能因面板较晚上屏而把30秒以后的确认或中文提交算作成功。
+        if Instant::now() >= self.deadline {
+            self.failed
+                .set(Some("原三十秒输入期限已到，不能交付后继按键"));
+            self.stop_sequence();
             return true;
         }
         let generation = original_input.generation;
@@ -643,7 +666,7 @@ impl SoftwareInput {
                 self.failed
                     .set(Some("软件key按下后原客户或输入源已撤销，不能交付释放"));
             }
-            stop(&self.application);
+            self.stop_sequence();
             return true;
         }
         self.application.sendEvent(&up);
@@ -655,7 +678,7 @@ impl SoftwareInput {
             if self.failed.get().is_none() {
                 self.failed.set(Some("软件key释放后原客户或输入源已撤销"));
             }
-            stop(&self.application);
+            self.stop_sequence();
             return true;
         }
         println!(
@@ -698,7 +721,7 @@ impl SoftwareInput {
                     if self.failed.get().is_none() {
                         self.failed.set(Some("无法观察原组合Input的下一实际CPU帧"));
                     }
-                    stop(&self.application);
+                    self.stop_sequence();
                 }
             } else {
                 self.prepare_next();
@@ -719,6 +742,7 @@ impl SoftwareInput {
         let pure = || {
             !self.stopped.get()
                 && self.failed.get().is_none()
+                && Instant::now() < self.deadline
                 && self.next.get() == 8
                 && self.waiting.get().is_none()
                 && self.pending.borrow().is_none()
@@ -801,9 +825,66 @@ impl SoftwareInput {
         }
     }
 
-    /// 真实key与CPU均退栈后的首次查询，或一次真实Host更新，共用同一原Input/CPU权限。
-    /// 面板尚未上屏时保留原组合与CPU票，只让既有真实Host更新再次观察；其余拒绝仍立即失败。
-    /// 原期限与固定键序不变，不重发按键、补wake或在确认后补签组合期几何。
+    /// 首次Missing后等待真实外部面板上屏；所有采样仍消费原完整Input与同一CPU帧。
+    /// timer不是完成收据，也不触发排版、输入或窗口显示；到期只失败，不自我延长。
+    fn wait_for_panel(&self) {
+        if self.stopped.get()
+            || self.failed.get().is_some()
+            || self.panel_observation.get().is_some()
+            || self.panel_timer.borrow().is_some()
+        {
+            return;
+        }
+        if Instant::now() >= self.deadline {
+            self.failed
+                .set(Some("原三十秒输入期限内未观察到实际候选面板"));
+            self.stop_sequence();
+            return;
+        }
+        let weak = dispatch2::MainThreadBound::new(self.weak.clone(), self.application.mtm());
+        let block = block2::RcBlock::new(move |_timer: std::ptr::NonNull<NSTimer>| {
+            autoreleasepool(|_| {
+                let mtm = MainThreadMarker::new().expect("面板观察timer仅在原主线程交付");
+                if let Some(driver) = weak.get(mtm).upgrade() {
+                    if driver.stopped.get() || driver.failed.get().is_some() {
+                        driver.cancel_panel_wait();
+                    } else if Instant::now() >= driver.deadline {
+                        driver
+                            .failed
+                            .set(Some("原三十秒输入期限内未观察到实际候选面板"));
+                        driver.stop_sequence();
+                    } else {
+                        driver.host_updated(); // 同一原票重查，不续订CPU、不投递任何按键。
+                    }
+                }
+            });
+        });
+        // SAFETY: 原主线程default runloop只登记这一份100ms标准timer；block跨轮次仅持Weak。
+        let timer =
+            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.1, true, &block) };
+        if self.stopped.get() || self.failed.get().is_some() {
+            timer.invalidate(); // Native构造重入后的取消不能留下没有owner的重复回调。
+            return;
+        }
+        *self.panel_timer.borrow_mut() = Some(timer);
+    }
+
+    /// 先移出唯一timer槽，再执行Native取消；回调即使正在退栈也不持正文或后继输入权限。
+    fn cancel_panel_wait(&self) {
+        let timer = self.panel_timer.borrow_mut().take();
+        if let Some(timer) = timer {
+            timer.invalidate();
+        }
+    }
+
+    /// 所有软件输入失败共用原run退出；候选观察先结束，后继关闭再归还原context和mmap。
+    fn stop_sequence(&self) {
+        self.cancel_panel_wait();
+        stop(&self.application);
+    }
+
+    /// 真实key/CPU退栈后的首次查询、Host更新和有限timer均共用原Input/CPU权限。
+    /// 面板尚未上屏保留原组合与CPU票；其余拒绝立即失败，不在确认后补签组合期几何。
     fn observe_panel(&self, key: &NativeMarkdownPagedSceneKey, paints: usize) {
         if self.stopped.get()
             || self.failed.get().is_some()
@@ -900,6 +981,7 @@ impl SoftwareInput {
                 // 只有同原Input/CPU且真正可见、贴近组合起点的面板才授权准备Space。
                 // 该纯收据不保活系统窗口；最终中文、历史与面板检查仍各自必须通过。
                 self.panel_observation.set(Some(observation));
+                self.cancel_panel_wait();
                 println!(
                     "system_ime stage=composition_confirmation_admitted panel_observed=true original_input_cpu=true final_panel_gate_preserved=true deadline_unchanged=true software_events=true physical_keyboard=false",
                 );
@@ -907,17 +989,18 @@ impl SoftwareInput {
                 self.prepare_next();
             }
             Ok(None) => {
-                // 不取走panel_frame、不改原Input、不建立确认按键；下一次真实Host更新
-                // 只能沿同一个key/paints重查。没有新timer、wake、订阅或延长原30秒期限。
+                // 不取走panel_frame、不改原Input、不建立确认按键；外部显示可以晚于Host更新。
+                // 唯一标准timer只沿同一个key/paints重查，绝不重采CPU或延长原30秒期限。
+                self.wait_for_panel();
                 println!(
-                    "system_ime stage=awaiting_composition_panel panel_observed=false original_input_cpu=true actual_host_updates_only=true confirmation_dispatched=false deadline_unchanged=true software_events=true physical_keyboard=false"
+                    "system_ime stage=awaiting_composition_panel panel_observed=false original_input_cpu=true metadata_wait=host_update_or_standard_timer confirmation_dispatched=false deadline_unchanged=true software_events=true physical_keyboard=false"
                 );
             }
             Err(cause) => {
                 if self.failed.get().is_none() {
                     self.failed.set(Some(cause));
                 }
-                stop(&self.application);
+                self.stop_sequence();
             }
         }
         self.panel_querying.set(false); // 本同步查询及按键准备已退栈，不把保护当面板完成状态。
@@ -941,7 +1024,7 @@ impl SoftwareInput {
                 return;
             }
             self.failed.set(Some("实际系统IME没有按本序列提交目标中文"));
-            stop(&self.application);
+            self.stop_sequence();
         }
     }
 
@@ -949,6 +1032,7 @@ impl SoftwareInput {
     /// 输入源变化或客户失焦时不操作系统组合；无法证明归属、或正常辞任后仍有marked，都返回失败。
     fn cleanup(&self) -> bool {
         let already_stopped = self.stopped.replace(true);
+        self.cancel_panel_wait(); // 先撤重复系统回调，后面的Native组合清理不能再次启动观察。
         self.waiting.set(None);
         self.panel_input.set(None);
         self.panel_observation.set(None);
@@ -1042,7 +1126,7 @@ impl NativeMarkdownPagedBodyPaintObserver for SoftwareInput {
         }
         if key.request.input != input {
             self.failed.set(Some("原组合CPU终点已被后继Input替代"));
-            stop(&self.application);
+            self.stop_sequence();
             return;
         }
         // key只携原Source/Scene弱身份；跨队列不保存view、Doc、Reader或候选窗Native强边。
@@ -1059,7 +1143,7 @@ impl NativeMarkdownPagedBodyPaintObserver for SoftwareInput {
                     // 唯一原CPU终点只在本次退栈续体安装。更早的Host通知看不到等待槽，
                     // 后来的通知也只能重用此key/paints，不能重订阅或采新Input给旧组合补票。
                     *driver.panel_frame.borrow_mut() = Some((key.get(mtm).clone(), paints));
-                    println!("system_ime stage=awaiting_composition_panel original_cpu=true actual_host_updates_only=true deadline_unchanged=true software_events=true physical_keyboard=false");
+                    println!("system_ime stage=awaiting_composition_panel original_cpu=true metadata_wait=host_update_or_standard_timer deadline_unchanged=true software_events=true physical_keyboard=false");
                     driver.observe_panel(key.get(mtm), paints);
                 }
             });
@@ -1175,6 +1259,7 @@ impl InputObservation {
     fn start(&self, mode: Mode, window: &NSWindow, view: &NativeMarkdownPagedTextView) {
         let focus_deadline = self.deadline.borrow_mut().take();
         drop(focus_deadline); // 焦点期限先归还；它不能迟到停止正在进行的实际中文组合。
+        let started = Instant::now();
         let software = matches!(mode, Mode::Software).then(|| {
             SoftwareInput::new(
                 &self.application,
@@ -1182,12 +1267,20 @@ impl InputObservation {
                 view,
                 self.body.clone(),
                 self.document.clone(),
+                started + SOFTWARE_INPUT_TIMEOUT,
             )
         });
         *self.software.borrow_mut() = software.clone();
         self.started.set(true);
-        let seconds = if software.is_some() { 30.0 } else { 300.0 };
-        *self.deadline.borrow_mut() = Some(InputDeadline::new(&self.application, seconds));
+        let timeout = if software.is_some() {
+            SOFTWARE_INPUT_TIMEOUT
+        } else {
+            Duration::from_secs(300)
+        };
+        let seconds = timeout.as_secs_f64();
+        // Driver构造与真实焦点查询也消耗原输入阶段期限；外层终止timer不能从这里另加30秒。
+        let remaining = timeout.saturating_sub(started.elapsed()).as_secs_f64();
+        *self.deadline.borrow_mut() = Some(InputDeadline::new(&self.application, remaining));
         println!(
             "system_ime stage=actual_focus_ready visible=true key=true app_active=true original_context_active=true on_active_space={} window_server_onscreen=true occlusion_visible=true software_events={} physical_keyboard={}",
             window.isOnActiveSpace(),
@@ -1248,6 +1341,15 @@ impl NativeMarkdownPagedBodyInputObserver for InputObservation {
                 driver.unexpected_commit(commit);
             }
             return; // 错词、英文或粘贴不能替代中文候选确认；仍保留实际失败/未完成事实。
+        }
+        if let Some(driver) = &software
+            && Instant::now() >= driver.deadline
+        {
+            driver
+                .failed
+                .set(Some("实际中文提交未在原三十秒输入期限内完成"));
+            driver.stop_sequence();
+            return;
         }
         self.finished.set(true);
         stop(&self.application); // 标准run在真实中文提交后退出，不造按键或输入法回调。

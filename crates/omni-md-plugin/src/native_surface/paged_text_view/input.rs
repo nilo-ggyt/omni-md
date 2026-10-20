@@ -289,6 +289,11 @@ impl NativeMarkdownPagedTextView {
     ) -> Result<()> {
         // 普通输入转交唯一 owned 收据；插表还需把同一 Rc 交给后继首格激活，不能重取选择补票。
         let commit = commit.into();
+        // Core已消费并验证的空IME提交可能保留完整before；它没有文字、marked、折叠或选择后果。
+        // 只在这个确实持有提交前Origin的入口识别相同完整状态，不能把事后捕获Origin的
+        // Find/导航通知也当作空操作。真实解释中的同张收据仍须交回原队列，不能提前丢弃。
+        let changed = commit.state != origin.state;
+        let reveal = reveal && changed;
         let interpreted = origin.interpreted
             && origin
                 .delegate
@@ -296,7 +301,17 @@ impl NativeMarkdownPagedTextView {
                 .map_err(|cause| {
                     NativeMarkdownPagedTextViewError::CommittedEffect(Box::new(cause))
                 })?;
-        self.finish_commit_ref(origin, &commit)?;
+        if changed {
+            self.finish_commit_ref(origin, &commit)?;
+        } else {
+            // 没有显示后果便保留原Scene、CPU候选和用户滚动位置；尤其不能把离屏caret
+            // 揭示成新的滚动意图。仍核原owner/epoch/完整后态，真实失权不能返回假成功。
+            commit
+                .check_current(&|epoch| origin.session_current(self, epoch))
+                .map_err(|cause| {
+                    NativeMarkdownPagedTextViewError::CommittedEffect(Box::new(cause.into()))
+                })?;
+        }
         if interpreted {
             return origin
                 .delegate
@@ -576,8 +591,19 @@ impl NativeMarkdownPagedTextView {
         let window = scene
             .step(self, || self.window())?
             .ok_or(NativeMarkdownPagedTextViewError::Pending)?;
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        let raw = value.rect;
         let base = scene.step(self, || self.convertRect_toView(value.rect, None))?;
         value.rect = scene.step(self, || window.convertRectToScreen(base))?;
+        // 零宽换行仍有真实行高；只在显式验收构建记录两个原生转换的几何，
+        // 区分空矩形转换与原Scene范围/排版故障，不读取或打印任何正文。
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        if raw.size.width == 0.0 {
+            eprintln!(
+                "native_zero_width_screen_rect raw={raw:?} base={base:?} screen={:?} actual_range={:?}",
+                value.rect, value.actual_range,
+            );
+        }
         if !finite_rect(value.rect, false) {
             return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
         }

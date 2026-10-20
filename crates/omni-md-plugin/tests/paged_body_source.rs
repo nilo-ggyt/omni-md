@@ -61,6 +61,8 @@ mod reentry;
 mod targets;
 #[path = "paged_body_source/word.rs"]
 mod word;
+#[path = "paged_body_source/zero_width.rs"]
+mod zero_width;
 
 fn weak(value: &AnyObject) -> Weak<AnyObject> {
     Weak::from(value)
@@ -438,6 +440,7 @@ fn native_client_protocol(mtm: MainThreadMarker) {
             drop(substring);
             marked_pixels(&body, &view, &window, &scroll, &document_weak);
             marked_focus_release(&body, &view, &window, &document_weak);
+            zero_width::run(&body, &view, &window, &mut receipts);
             assert_eq!(std::fs::read(file.path()).unwrap(), b" "); // 未保存协议编辑无权回写原文件。
 
             let mut native = body.native_weaks().unwrap();
@@ -1094,6 +1097,9 @@ fn main() {
                 assert!(scrolled.request.virtual_viewport.document_origin.y > 0.0);
                 assert!(body.progress().unwrap().prepared_lines > before);
                 receipts.push(body.resource_receipts().unwrap());
+                if scroll_stage == "actual_scroll_1" {
+                    zero_width::empty_ime_keeps_scrolled_frame(&body, &view, &scroll, &doc_weak);
+                }
                 let returned_frame = observe(&body, Instant::now());
                 clip.scrollToPoint(NSPoint::ZERO);
                 scroll.reflectScrolledClipView(&clip);
