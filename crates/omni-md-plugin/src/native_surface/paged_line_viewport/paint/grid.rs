@@ -16,6 +16,8 @@ pub(in crate::native_surface) struct NativeMarkdownComposedViewportDecorationCur
     canonical: Option<Range<usize>>,
     // 当前一个选区完成前保留其display端点，下一选区覆盖它，不收集全部映射结果。
     selected: Option<Range<usize>>,
+    // marked 只改变本次显示：原 Input 范围、字形与行槽不变，确认组合后随旧 Scene 一起退役。
+    marked: bool,
     native_draw_returned: bool,
 }
 
@@ -53,6 +55,7 @@ impl NativeMarkdownComposedViewportDecorationCursor {
             cursor: Decoration::BackgroundLine(0),
             canonical: None,
             selected: None,
+            marked: false,
             native_draw_returned: false,
         }
     }
@@ -69,8 +72,16 @@ impl NativeMarkdownComposedViewportDecorationCursor {
             cursor: Decoration::SelectionEntry(first),
             canonical: Some(canonical),
             selected: None,
+            marked: false,
             native_draw_returned: false,
         }
+    }
+
+    /// 组合文字沿原选区的真实坐标映射，只把填框改为各 part 原字体的下划线。
+    /// 不解释输入法属性、不建立另一份 marked 状态，也不改变候选范围或实际选择。
+    pub(in crate::native_surface) fn marked_text(mut self) -> Self {
+        self.marked = true;
+        self
     }
 }
 
@@ -251,8 +262,21 @@ impl NativeMarkdownComposedViewport {
                                     let range =
                                         self.boundary(start, false)?.max(facts.source_utf16.start)
                                             ..self.boundary(end, true)?.min(facts.source_utf16.end);
-                                    let frame =
+                                    let mut frame =
                                         self.part_rect(&self.lines[line], actual, range, current)?;
+                                    if cursor.marked {
+                                        // 部分范围、跨软行与 RTL 都沿同一个真实 part_rect 求横向两端。
+                                        // 垂直位置只取本 part 原字体度量，不按字符串长度或全行最高字体猜线。
+                                        let metrics = self.palette[actual.font]
+                                            .metrics()
+                                            .map_err(NativeMarkdownComposedViewportError::Font)?;
+                                        frame.origin.y =
+                                            self.part_baseline(&self.lines[line], actual).y
+                                                + facts.origin_y_26_6 as f64 / 64.0
+                                                + metrics.underline_position
+                                                - metrics.underline_thickness / 2.0;
+                                        frame.size.height = metrics.underline_thickness;
+                                    }
                                     if let Some(frame) =
                                         super::super::geometry::clip_selection(frame, self.clip())
                                     {

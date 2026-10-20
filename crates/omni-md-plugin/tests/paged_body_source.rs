@@ -20,8 +20,8 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSFont, NSParagraphStyle,
-    NSScrollView, NSTextInputClient, NSWindow, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBitmapFormat, NSFont,
+    NSParagraphStyle, NSScrollView, NSTextInputClient, NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFRetained, CFRunLoop, kCFRunLoopDefaultMode};
 use objc2_core_text::CTFont;
@@ -36,7 +36,10 @@ use omni_md_plugin::native_surface::{
         NativeMarkdownPagedBodyConfiguration, NativeMarkdownPagedBodyPaintObserver,
         NativeMarkdownPagedBodyProgress, NativeMarkdownPagedBodyResourceReceipts,
     },
-    paged_text_view::{NativeMarkdownPagedSceneKey, NativeMarkdownPagedTextViewError},
+    paged_text_view::{
+        NativeMarkdownPagedSceneKey, NativeMarkdownPagedTextView,
+        NativeMarkdownPagedTextViewDelegate, NativeMarkdownPagedTextViewError,
+    },
 };
 
 const SOURCE_BYTES: usize = 4 * 1024 * 1024;
@@ -433,6 +436,7 @@ fn native_client_protocol(mtm: MainThreadMarker) {
             }
             assert_eq!(substring.string().to_string(), "中文🙂");
             drop(substring);
+            marked_pixels(&body, &view, &window, &scroll, &document_weak);
             assert_eq!(std::fs::read(file.path()).unwrap(), b" "); // 未保存协议编辑无权回写原文件。
 
             let mut native = body.native_weaks().unwrap();
@@ -478,6 +482,237 @@ fn native_client_protocol(mtm: MainThreadMarker) {
     println!(
         "paged_body_source stage=client_protocol actual_body=true marked_unicode=true exact_history=true empty_input=true context_client_nonretaining=true source_disk_unchanged=true actual_native_mmap_font_pixel_released=true physical_ime=false whole_product=false formal=false"
     );
+}
+
+/// 两次原生截图只跨动作保存有限像素与纯几何；不保 bitmap、字体、Scene 或输入上下文强边。
+/// key 仍是原发布的弱身份，不能用它使已经撤销的组合帧重新获得读取权。
+/// profile 是本次 AppKit bitmap 实际 ICC 的有限值副本，不是另一份调色板或正文状态。
+/// unmark 后若格式、空间或几何发生变化，先报告不同来源，不把原始字节差误称为组合线变化。
+struct MarkedPixelSample {
+    key: NativeMarkdownPagedSceneKey,
+    source: usize,
+    frame: NSRect,
+    rect: NSRect,
+    width: usize,
+    height: usize,
+    format: NSBitmapFormat,
+    profile: Vec<u8>,
+    pixels: Vec<u8>,
+}
+
+/// 只缓存实际已发布 View 的一个完整 CJK 字形邻域；不调用 Scene.paint 或另画期望画布。
+fn marked_sample(
+    body: &NativeMarkdownPagedBody,
+    view: &NativeMarkdownPagedTextView,
+    source: usize,
+) -> MarkedPixelSample {
+    autoreleasepool(|_| {
+        let key = view.capture_ready_scene_key().unwrap();
+        let paints = view.cpu_paints().unwrap();
+        // 调用前已消费原 PaintDelivery 的真实 CPU 完成通知；这里保同一 Ready key 与 paints。
+        // 截图可能进入 AppKit 绘制栈，因此重新核完整 Input、原 Scene 和未在途像素候选。
+        // 当前函数不会推进布局；系统缓存缺少此帧时明确失败，不绘制一张替代图来满足断言。
+        let current = || {
+            NativeMarkdownPagedTextViewDelegate::scene_current(body, &key)
+                && view
+                    .capture_ready_scene_key()
+                    .is_ok_and(|actual| actual.same(&key))
+                && view
+                    .input_state()
+                    .is_ok_and(|actual| actual == key.request.input)
+                && view.cpu_paints() == Some(paints)
+                && view.cpu_paint_pending() == Some(false)
+        };
+        let scene = NativeMarkdownPagedTextViewDelegate::ready_scene(body, &key.request).unwrap();
+        scene.validate_ready(&current).unwrap();
+        let glyph = scene.first_rect(NSRange::new(source, 1)).unwrap();
+        assert_eq!(glyph.actual_range, NSRange::new(source, 1));
+        // 只取固定夹具中的一个完整汉字；真实 first_rect 必须返回这个 canonical 单元。
+        // 横向保字形两边少量背景，纵向保原行框及其边缘，包含原字体的自然下划线位置。
+        // 采样始终裁到同一可见窗口，不把离屏字形夹到别的位置或采整个文档 backing。
+        let frame = glyph.rect;
+        let clip = key.request.viewport;
+        let left = (frame.origin.x - 2.0).max(clip.origin.x);
+        let bottom = (frame.origin.y - 2.0).max(clip.origin.y);
+        let right = (frame.origin.x + frame.size.width + 2.0).min(clip.origin.x + clip.size.width);
+        let top = (frame.origin.y + frame.size.height + 2.0).min(clip.origin.y + clip.size.height);
+        let rect = NSRect::new(
+            NSPoint::new(left, bottom),
+            NSSize::new(right - left, top - bottom),
+        );
+        assert!(rect.size.width > 0.0 && rect.size.height > 0.0 && current());
+        let bitmap = view.bitmapImageRepForCachingDisplayInRect(rect).unwrap();
+        assert!(current());
+        // cacheDisplay 采正式 View 当前已经挂载的内容；不触发 Scene.paint 或独立 glyph painter。
+        // 原 bitmap 及其内部数据仅活于本 pool；跨 unmark 只留下固定上限的值，不能保活旧图。
+        view.cacheDisplayInRect_toBitmapImageRep(rect, &bitmap);
+        assert!(current());
+        let (width, height) = (bitmap.pixelsWide(), bitmap.pixelsHigh());
+        assert!(width > 0 && width <= 64 && height > 0 && height <= 48);
+        // 按原整数 bitmap 的公开存储合同复制；两次比较前还精确核实际 ICC 和格式，
+        // 不把 colorAtX 误标的 GenericRGB 分量当作 sRGB，也不对实际像素重新着色。
+        assert_eq!(bitmap.bitsPerSample(), 8);
+        assert_eq!(bitmap.samplesPerPixel(), 4);
+        assert_eq!(bitmap.bitsPerPixel(), 32);
+        assert!(!bitmap.isPlanar());
+        let format = bitmap.bitmapFormat();
+        assert!(!format.contains(NSBitmapFormat::FloatingPointSamples));
+        // 显示器 ICC 可有自己的 RGB 传递曲线；逐字节比较只在前后 profile 完全相同时成立。
+        // 上限保护系统返回值的副本成本，不解析 profile，也不假定目标显示器一定叫 sRGB。
+        let profile = bitmap.colorSpace().ICCProfileData().unwrap();
+        assert!(profile.length() <= 128 * 1024);
+        let profile = profile.to_vec();
+        let stride = usize::try_from(bitmap.bytesPerRow()).unwrap();
+        let (width, height) = (width as usize, height as usize);
+        let row_bytes = width.checked_mul(4).unwrap();
+        assert!(row_bytes <= stride && stride.checked_mul(height).unwrap() <= 32 * 1024);
+        let data = bitmap.bitmapData();
+        assert!(!data.is_null() && current());
+        // SAFETY: 原 bitmap 的 claim 覆盖同步借用，整数非 planar 格式及 stride*height 已核。
+        // 只复制每行真实像素而不含 padding；RGBA 次序与预乘保持原样，ICC 相同才比较。
+        let bytes = unsafe { std::slice::from_raw_parts(data, stride * height) };
+        let mut pixels = Vec::with_capacity(row_bytes * height);
+        for row in bytes.chunks_exact(stride) {
+            pixels.extend_from_slice(&row[..row_bytes]);
+        }
+        // 原 Source/字体/输出的深检查仍在 Native 采样后执行，I/O 或撤权不能变成像素差结果。
+        // 返回之前 bitmap、profile 对象和 Scene 临时强引用由本 pool 归还。
+        scene.validate_ready(&current).unwrap();
+        assert!(current());
+        MarkedPixelSample {
+            key,
+            source,
+            frame,
+            rect,
+            width,
+            height,
+            format,
+            profile,
+            pixels,
+        }
+    })
+}
+
+/// 原客户端协议的外观验收：窄窗口令固定候选跨软行且部分离屏，不能只验保存的 marked 元数据。
+/// 全程不交软件/物理按键、不选择输入法；本例通过也仅证明协议与实际 CPU 像素，不冒充系统 IME。
+fn marked_pixels(
+    body: &NativeMarkdownPagedBody,
+    view: &NativeMarkdownPagedTextView,
+    window: &NSWindow,
+    scroll: &NSScrollView,
+    document: &std::rc::Weak<RefCell<MarkdownDocumentBuffer>>,
+) {
+    // 原用例先前已把正文恢复成独立的 a；本组只替换该真实全选，最后一次 Undo 必须还原它。
+    // 只缩当前正式窗口，保同一个滚动文档、Body、Input 和系统输入上下文，不重新装配客户端。
+    // 窗口真实 resize 和每次协议动作各自沿既有三秒 CPU 终点等待，不追加延时或新观察通道。
+    let original_size = window.frame().size;
+    let resized = observe(body, Instant::now());
+    window.setContentSize(NSSize::new(160.0, 70.0));
+    deliver_frame("client_marked_narrow_viewport", body, resized);
+    let selected = observe(body, Instant::now());
+    view.command(sel!(selectAll:)).unwrap();
+    deliver_frame("client_marked_original_selection", body, selected);
+    // 所有字面位置由这个固定新候选定义；既不读取文稿全文，也不从候选字体反推期望字形。
+    let candidate = "中文🙂 ".repeat(18);
+    let length = candidate.encode_utf16().count();
+    let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(view);
+    let marked = observe(body, Instant::now());
+    // SAFETY: 固定候选在本栈存活，尾选区是完整 UTF16 端点；NSNotFound 只替换原真实全选。
+    unsafe {
+        client.setMarkedText_selectedRange_replacementRange(
+            &NSString::from_str(&candidate),
+            NSRange::new(length, 0),
+            NSRange::new(NSNotFound as usize, 0),
+        );
+    }
+    deliver_frame("client_marked_wrapped_pixels", body, marked);
+    let before = view.input_state().unwrap();
+    assert_eq!(before.marked, Some(NSRange::new(0, length)));
+    assert_eq!(before.selection, MarkdownTextSelection::caret(length));
+    // 候选尾部的真实 caret 交给原 reveal 处理；不猜每行容量，也不把目标百分比当可见证明。
+    // 下面只从固定新载荷的十八个“中”查询当前真实框，不读取原映射文稿或复制长段落。
+    let key = view.capture_ready_scene_key().unwrap();
+    let scene = NativeMarkdownPagedTextViewDelegate::ready_scene(body, &key.request).unwrap();
+    let clip = key.request.viewport;
+    let mut visible = Vec::new();
+    let mut outside = false;
+    for source in (0..length).step_by(5) {
+        let glyph = match scene.first_rect(NSRange::new(source, 1)) {
+            Ok(glyph) => glyph,
+            Err(
+                NativeMarkdownPagedTextViewError::Pending
+                | NativeMarkdownPagedTextViewError::InvalidRange,
+            ) => {
+                // 这里只允许当前窗口未提供该位置的几何；其他 Source/字体错误仍立刻失败。
+                outside = true;
+                continue;
+            }
+            Err(cause) => panic!("marked 原字形查询失败：{cause:?}"),
+        };
+        assert_eq!(glyph.actual_range, NSRange::new(source, 1));
+        let rect = glyph.rect;
+        let fully_visible = rect.origin.x >= clip.origin.x
+            && rect.origin.y >= clip.origin.y
+            && rect.origin.x + rect.size.width <= clip.origin.x + clip.size.width
+            && rect.origin.y + rect.size.height <= clip.origin.y + clip.size.height;
+        outside |= !fully_visible;
+        if fully_visible && !visible.iter().any(|&(_, y)| y == rect.origin.y) {
+            // 同一软行只留一个真实源位置，避免两个相邻汉字假冒“跨软行”覆盖。
+            visible.push((source, rect.origin.y));
+        }
+    }
+    assert!(
+        outside && visible.len() >= 2,
+        "原候选须真实跨软行且只部分位于视口：clip={clip:?} visible={visible:?}"
+    );
+    drop(scene); // 旧 Scene 的强边不跨 unmark；只保两个有限真实字形的纯像素和弱 key。
+    let first = marked_sample(body, view, visible[0].0);
+    let second = marked_sample(body, view, visible[1].0);
+    let unmarked = observe(body, Instant::now());
+    client.unmarkText();
+    deliver_frame("client_marked_unmark_pixels", body, unmarked);
+    let after = view.input_state().unwrap();
+    // unmark 本来会发布新的 selection_serial，不能以完整 before/after 相等否定合法提交。
+    // 文字 generation、逻辑选择和长度必须原样保留；新帧只能去掉组合外观，不能改正文或移动 caret。
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.selection, before.selection);
+    assert_eq!(after.utf16_len, before.utf16_len);
+    assert!(after.marked.is_none());
+    for previous in [first, second] {
+        let actual = marked_sample(body, view, previous.source);
+        // 新 Scene nonce 和输入 serial 已换代；原 Source、模式和实际滚动几何仍必须完全一致。
+        // 不以相对平移、容差或另一字形的同色像素掩盖错误；每条已验证软行都要有真实外观变化。
+        assert!(actual.key.source == previous.key.source);
+        assert_eq!(actual.key.presentation_mode, previous.key.presentation_mode);
+        assert_eq!(actual.key.request.viewport, previous.key.request.viewport);
+        assert_eq!(
+            actual.key.request.virtual_viewport,
+            previous.key.request.virtual_viewport
+        );
+        assert_eq!(actual.frame, previous.frame);
+        assert_eq!(actual.rect, previous.rect);
+        assert_eq!(
+            (actual.width, actual.height, actual.format),
+            (previous.width, previous.height, previous.format)
+        );
+        assert_eq!(actual.profile, previous.profile);
+        assert_eq!(actual.pixels.len(), previous.pixels.len());
+        assert_ne!(
+            actual.pixels, previous.pixels,
+            "unmark 必须撤去这个真实软行内的组合外观"
+        );
+    }
+    let undone = observe(body, Instant::now());
+    // 本次组合含一次 marked 和一次 unmark，历史仍应只需一次 Undo，不能把外观另记一笔文字事务。
+    view.command(sel!(undo:)).unwrap();
+    deliver_frame("client_marked_one_undo", body, undone);
+    client_text(document, "a");
+    let restored = observe(body, Instant::now());
+    window.setContentSize(original_size);
+    // 恢复原视口后再进入既有关闭；所有 Native、InputContext、Source、Font、mmap 和像素收据仍逐项核。
+    // 原临时文件从未保存，调用方仍以独立文件字节证明协议编辑没有回写磁盘。
+    scroll.reflectScrolledClipView(&scroll.contentView());
+    deliver_frame("client_marked_restore_viewport", body, restored);
 }
 
 /// attach 已装配正式委托，但原调度尚未运行，因而这里的 Pending 是真实首帧前状态。

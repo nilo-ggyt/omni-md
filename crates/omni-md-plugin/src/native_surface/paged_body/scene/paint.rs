@@ -24,6 +24,9 @@ enum Cursor {
     GridSelection { row: usize, cell: usize },
     Text,
     Cell { row: usize, cell: usize },
+    // 组合外观在真实字形之后、caret 之前完成；不被普通选区底色盖回已提交正文的外观。
+    TextMarked,
+    GridMarked { row: usize, cell: usize },
     Done,
 }
 
@@ -104,29 +107,50 @@ impl Paint {
             }
             Cursor::GridBackground { row, cell }
             | Cursor::GridSelection { row, cell }
-            | Cursor::GridFind { row, cell } => {
+            | Cursor::GridFind { row, cell }
+            | Cursor::GridMarked { row, cell } => {
                 // 两个pass共享同一格顺序，但分别保原背景先于正文装饰、选区晚于正文装饰的顺序。
                 // 行/格终点只是有限metadata迭代，不启动新的排版或Glyph会话。
                 let finding = matches!(self.cursor, Cursor::GridFind { .. });
-                let selection = finding || matches!(self.cursor, Cursor::GridSelection { .. });
-                let ranges = if finding {
+                let marking = matches!(self.cursor, Cursor::GridMarked { .. });
+                let selection =
+                    finding || marking || matches!(self.cursor, Cursor::GridSelection { .. });
+                // 范围来自原 key 的完整 Input；没有重复发布或从后继客户借一个更新的 marked。
+                let marked = scene
+                    .key
+                    .request
+                    .input
+                    .marked
+                    .map(|range| range.location..range.location + range.length);
+                let ranges: &[Range<usize>] = if marking {
+                    marked.as_slice()
+                } else if finding {
                     &scene.find_highlights
                 } else {
                     &scene.selections
                 };
-                let fill = if finding {
+                let fill = if marking {
+                    scene.colors.text
+                } else if finding {
                     [1.0, 0.75, 0.12, 0.25]
                 } else {
                     scene.colors.selection
                 };
                 if row == scene.grids.len() {
-                    self.cursor = if finding {
+                    self.cursor = if marking {
+                        Cursor::Done
+                    } else if finding {
                         Cursor::TextSelection
                     } else {
                         Cursor::Text
                     };
                 } else if cell == scene.grids[row].cells.len() {
-                    self.cursor = if finding {
+                    self.cursor = if marking {
+                        Cursor::GridMarked {
+                            row: row + 1,
+                            cell: 0,
+                        }
+                    } else if finding {
                         Cursor::GridFind {
                             row: row + 1,
                             cell: 0,
@@ -146,9 +170,14 @@ impl Paint {
                         // 显式领取与具体装饰工作分别收费，不能把整格成本折算成一次领取。
                         if self.decoration.is_none() {
                             self.decoration = Some(if selection {
-                                window
+                                let cursor = window
                                     .selection_cursor(ranges, &permit)
-                                    .map_err(scene_error)?
+                                    .map_err(scene_error)?;
+                                if marking {
+                                    cursor.marked_text()
+                                } else {
+                                    cursor
+                                }
                             } else {
                                 window.code_background_cursor()
                             });
@@ -172,7 +201,12 @@ impl Paint {
                             }
                             // 只有真实完成才移交下一格，没有截断末part或遗漏后续选区。
                             self.decoration = None;
-                            self.cursor = if finding {
+                            self.cursor = if marking {
+                                Cursor::GridMarked {
+                                    row,
+                                    cell: cell + 1,
+                                }
+                            } else if finding {
                                 Cursor::GridFind {
                                     row,
                                     cell: cell + 1,
@@ -190,7 +224,12 @@ impl Paint {
                             };
                         }
                     } else {
-                        self.cursor = if finding {
+                        self.cursor = if marking {
+                            Cursor::GridMarked {
+                                row,
+                                cell: cell + 1,
+                            }
+                        } else if finding {
                             Cursor::GridFind {
                                 row,
                                 cell: cell + 1,
@@ -240,17 +279,31 @@ impl Paint {
                 }
                 self.cursor = Cursor::GridRow(row + 1);
             }
-            Cursor::TextBackground | Cursor::TextSelection | Cursor::TextFind => {
+            Cursor::TextBackground
+            | Cursor::TextSelection
+            | Cursor::TextFind
+            | Cursor::TextMarked => {
                 // 正文与格消费同一封存line/part几何和同一装饰游标，Body选区保持canonical坐标。
                 // 创建游标与实际遍历分别付费；当前量子余量不会因进入正文而重置为32。
                 let finding = matches!(self.cursor, Cursor::TextFind);
-                let selection = finding || matches!(self.cursor, Cursor::TextSelection);
-                let ranges = if finding {
+                let marking = matches!(self.cursor, Cursor::TextMarked);
+                let selection = finding || marking || matches!(self.cursor, Cursor::TextSelection);
+                let marked = scene
+                    .key
+                    .request
+                    .input
+                    .marked
+                    .map(|range| range.location..range.location + range.length);
+                let ranges: &[Range<usize>] = if marking {
+                    marked.as_slice()
+                } else if finding {
                     &scene.find_highlights
                 } else {
                     &scene.selections
                 };
-                let fill = if finding {
+                let fill = if marking {
+                    scene.colors.text
+                } else if finding {
                     [1.0, 0.75, 0.12, 0.25]
                 } else {
                     scene.colors.selection
@@ -271,10 +324,15 @@ impl Paint {
                         step.complete
                     } else {
                         self.decoration = Some(if selection {
-                            NativeMarkdownComposedViewportDecorationCursor::selections(
+                            let cursor = NativeMarkdownComposedViewportDecorationCursor::selections(
                                 window.source_range(),
                                 ranges,
-                            )
+                            );
+                            if marking {
+                                cursor.marked_text()
+                            } else {
+                                cursor
+                            }
                         } else {
                             NativeMarkdownComposedViewportDecorationCursor::backgrounds()
                         });
@@ -285,7 +343,9 @@ impl Paint {
                 };
                 if complete {
                     self.decoration = None;
-                    self.cursor = if finding {
+                    self.cursor = if marking {
+                        Cursor::GridMarked { row: 0, cell: 0 }
+                    } else if finding {
                         Cursor::GridFind { row: 0, cell: 0 }
                     } else if selection {
                         scene.color(&self.context, scene.colors.text);
@@ -398,7 +458,12 @@ impl Paint {
                     }
                     Cursor::Cell { row, cell } => {
                         let Some(row_value) = self.scene.grids.get(row) else {
-                            self.cursor = Cursor::Done;
+                            // 原帧没有组合就直接结束，不为普通键入增添一个空的逐行装饰 pass。
+                            self.cursor = if self.scene.key.request.input.marked.is_some() {
+                                Cursor::TextMarked
+                            } else {
+                                Cursor::Done
+                            };
                             continue;
                         };
                         let Some(cell_value) = row_value.cells.get(cell) else {

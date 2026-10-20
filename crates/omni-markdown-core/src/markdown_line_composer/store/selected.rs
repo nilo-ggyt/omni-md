@@ -121,19 +121,26 @@ impl GlyphStore {
             if bidi.source_range() != (0..self.source.utf16_len()) {
                 return Err(Error::SourceMismatch);
             }
-            let LocatedItem {
-                proof: last_proof,
-                directory: last_item,
-            } = self
-                .item_at(range.end.checked_sub(1).ok_or(Error::Overflow)?)?
-                .ok_or(Error::InconsistentCoverage)?;
+            let last_point = range.end.checked_sub(1).ok_or(Error::Overflow)?;
+            let located_last;
+            // 原 measure 的 anchor 已由同 Store/proof 完整读取；末点确在它内部时直接借这份事实。
+            // 跨 item 的行仍真实定位最后一项，两个借用都只活在本次行组合，不放入后继状态。
+            let (last_proof, last_item) = if anchor.facts.source_utf16.contains(&last_point) {
+                self.fonts.resolve(anchor.font)?;
+                self.guard()?;
+                (current, &anchor)
+            } else {
+                located_last = self
+                    .item_at(last_point)?
+                    .ok_or(Error::InconsistentCoverage)?;
+                (&located_last.proof, &located_last.directory)
+            };
             let hard_break = matches!(
                 last_item.kind,
                 super::super::MarkdownComposedLinePartKind::ParagraphBreak
                     | super::super::MarkdownComposedLinePartKind::FoldedSection
-            )
-            .then_some((last_proof, last_item));
-            let paragraph = if hard_break.is_some() {
+            );
+            let paragraph = if hard_break {
                 self.source
                     .snapshot_for_bidi()
                     .text_checking_paragraph_range(range.clone())?
@@ -144,10 +151,11 @@ impl GlyphStore {
             if range.end > paragraph.end {
                 return Err(Error::InconsistentCoverage);
             }
-            let visual_range = range.start
-                ..hard_break
-                    .as_ref()
-                    .map_or(range.end, |(_, item)| item.facts.source_utf16.start);
+            let visual_range = range.start..if hard_break {
+                last_item.facts.source_utf16.start
+            } else {
+                range.end
+            };
             let kind = match &original.selected.kind {
                 SelectedMeasureKind::Natural(boundary) => match boundary.kind {
                     MarkdownLineBreakKind::Allowed => MarkdownComposedLineKind::Allowed,
@@ -219,11 +227,29 @@ impl GlyphStore {
                         } else {
                             at
                         };
-                        // 同一 forest 定位已完整核过这份目录；本回调不再读取相同三条记录。
-                        let LocatedItem {
-                            proof,
-                            directory: item,
-                        } = self.item_at(point)?.ok_or(Error::InconsistentCoverage)?;
+                        // 只复用本次已经真实读取的 anchor/末项；contains 选择原票，不从范围新造权限。
+                        // 其他 item 仍走原 forest。复用前照核实际 Font 与 Source/取消，不能让目录
+                        // 不可变掩盖弱注册撤权；后续 part 的 GCB、UBA seam 和 unsafe 检查保持原样。
+                        let reusable = if anchor.facts.source_utf16.contains(&point) {
+                            Some((current, &anchor))
+                        } else if last_item.facts.source_utf16.contains(&point) {
+                            Some((last_proof, last_item))
+                        } else {
+                            None
+                        };
+                        let located;
+                        let (proof, item) = match reusable {
+                            Some(actual) => {
+                                self.fonts.resolve(actual.1.font)?;
+                                self.guard()?;
+                                actual
+                            }
+                            None => {
+                                located =
+                                    self.item_at(point)?.ok_or(Error::InconsistentCoverage)?;
+                                (&located.proof, &located.directory)
+                            }
+                        };
                         let segment = visual.start.max(item.facts.source_utf16.start)
                             ..visual.end.min(item.facts.source_utf16.end);
                         if (backwards && segment.end != at) || (!backwards && segment.start != at) {
@@ -233,8 +259,8 @@ impl GlyphStore {
                             return Err(Error::NeedsBidiAssembly);
                         } // L1改变整形方向时须真实重形，不能反转glyph或强制方向。
                         self.append_selected_part(
-                            &proof,
-                            &item,
+                            proof,
+                            item,
                             segment.clone(),
                             run.level,
                             &range,
@@ -257,12 +283,12 @@ impl GlyphStore {
             if let Some(error) = failure {
                 return Err(error);
             }
-            if let Some((proof, item)) = hard_break {
+            if hard_break {
                 self.append_selected_part(
-                    &proof,
-                    &item,
-                    item.facts.source_utf16.clone(),
-                    item.facts.level,
+                    last_proof,
+                    last_item,
+                    last_item.facts.source_utf16.clone(),
+                    last_item.facts.level,
                     &range,
                     &mut totals,
                 )?;

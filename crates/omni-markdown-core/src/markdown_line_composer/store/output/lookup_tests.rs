@@ -261,6 +261,7 @@ fn paged_selected_lines_keep_remote_unicode_clusters_and_release_original_resour
     let resources = output.resource_observer();
     let mut expected_end = text.encode_utf16().count();
     let mut line = output.last_line().unwrap();
+    // 从实际末行逆行核完整覆盖；固定字面的边界独立于输出索引，不用查询结果生成期望。
     while let Some(actual) = line {
         let facts = actual.facts();
         assert_eq!(facts.source_utf16.end, expected_end);
@@ -271,6 +272,7 @@ fn paged_selected_lines_keep_remote_unicode_clusters_and_release_original_resour
             let part = output.part(&actual, ordinal).unwrap().unwrap();
             let range = part.facts().source_utf16.clone();
             let mut at = range.start;
+            // 每个真实 part 的簇必须连续走到尾端；跨页读取不能跳过字符或借缺字完成。
             while at < range.end {
                 let crate::MarkdownGlyphClusterAnswer::Known(Some(cluster)) =
                     output.cluster(&part, at).unwrap()
@@ -308,11 +310,13 @@ fn paged_selected_lines_keep_remote_unicode_clusters_and_release_original_resour
         assert!(rejected);
     }
     assert!(output.last_line().unwrap().is_some());
+    // 布局及被拒绝的光标查询都是只读操作，磁盘原文和文稿历史必须一起保持不变。
     assert_eq!(
         std::fs::read(fixture._directory.path().join("真实行查找.md")).unwrap(),
         text.as_bytes()
     );
     assert!(!fixture.document.is_dirty() && !fixture.document.can_undo());
+    // 关闭原输出后撤掉文稿、字体目录和来源拥有者，只通过原资源观察票核真实释放。
     output.close().unwrap();
     drop(fixture);
     let actual = resources.snapshot();

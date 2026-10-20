@@ -405,12 +405,14 @@ impl GlyphStore {
         if range.start > range.end || range.end > self.source.utf16_len() {
             return Err(Error::InvalidRequest);
         }
+        // 输出前缀只到实际已提交的 GCB；更远的位置应等待原推进，不能误判成簇内部。
         if range.end > directory.covered.utf16 {
             return Err(Error::GraphemePrefixPending);
         }
         let bytes = self.source.byte_len();
         let units = self.source.utf16_len();
         let mut query = BoundarySearch::offset(range.end);
+        // 先定位右端，让左端沿同一反链复用已认证路径；两个源长度仍来自当前冻结来源。
         let right = query
             .step(directory, bytes, units, usize::MAX, |record| {
                 self.guard()?;
@@ -430,6 +432,7 @@ impl GlyphStore {
             .ok_or(Error::InconsistentCoverage)?
             .1;
         self.guard()?;
+        // 查找可返回目标右侧的真实边界；必须分别精确命中，才能签出完整范围。
         Ok(left.is_some_and(|value| value.utf16 == range.start)
             && right.is_some_and(|value| value.utf16 == range.end))
     }

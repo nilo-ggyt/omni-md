@@ -1259,6 +1259,58 @@ impl NativeMarkdownPagedTextScene for Scene {
                 }
             }
         }
+        // 独立同步 paint 也消费原完整 Input 的组合外观；不另画字形或取得后继 marked 票。
+        // 与正式 CPU 会话共用同一个逐 part 装饰实现，所有范围映射、字体度量及撤权规则一致。
+        if let Some(marked) = self.key.request.input.marked {
+            use crate::native_surface::paged_line_viewport::NativeMarkdownComposedViewportDecorationCursor;
+            let marked = marked.location..marked.location + marked.length;
+            let ranges = std::slice::from_ref(&marked);
+            let permit = || current() && self.current();
+            if let Some(window) = &self.window {
+                let mut cursor = NativeMarkdownComposedViewportDecorationCursor::selections(
+                    window.source_range(),
+                    ranges,
+                )
+                .marked_text();
+                while !window
+                    .advance_decorations(
+                        &mut cursor,
+                        context,
+                        ranges,
+                        self.colors.text,
+                        NativeMarkdownComposedViewportPaintBudget::default().metadata_records,
+                        &permit,
+                    )
+                    .map_err(paint_error)?
+                    .complete
+                {}
+            }
+            // 格窗口仍先取其真实 canonical 域；不能把原 Body 的端点直接当 display 端点。
+            // 同步入口原本逐个消费有限窗口，此处不进入未准备行或启动任何额外排版。
+            for row in &self.grids {
+                for cell in &row.cells {
+                    if let GridCellContent::Composed(window) = &cell.content {
+                        let mut cursor = window
+                            .selection_cursor(ranges, &permit)
+                            .map_err(scene_error)?
+                            .marked_text();
+                        while !window
+                            .advance_decorations(
+                                &mut cursor,
+                                context,
+                                ranges,
+                                self.colors.text,
+                                NativeMarkdownComposedViewportPaintBudget::default()
+                                    .metadata_records,
+                                &permit,
+                            )
+                            .map_err(paint_error)?
+                            .complete
+                        {}
+                    }
+                }
+            }
+        }
         self.caret(context, current)
     }
 }
