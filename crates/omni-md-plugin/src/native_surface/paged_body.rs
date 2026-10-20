@@ -1222,10 +1222,19 @@ impl NativeMarkdownPagedBody {
         Ok(receipt)
     }
 
-    /// 所有正文Scene失权出口同时撤行号弱快照；Native调用发生在RefCell槽借用结束后。
+    /// 所有正文Scene失权出口同时退休未发布CPU候选与行号弱快照。
+    /// 格关闭等动作可以保留相同Input/几何；不能等新Scene发布才撤旧候选，否则旧续绘
+    /// 会在两次有限准备之间把正常退休误报为永久输入失败。已发布像素仍归原CPU owner。
     fn clear_scene(&self) {
-        drop(self.pending_link.borrow_mut().take()); // Reader/Scene真正失权也同时结束其旧click意图，不能给新publication补票。
+        let pending_link = self.pending_link.borrow_mut().take();
         let scene = self.scene.borrow_mut().take();
+        // 这里只克隆本Body实际持有的Rust Rc，不调用Native retain、查询或重新领取Scene。
+        // 两个槽及view槽的借用均已结束，候选会话/context的真实析构才可进入可重入Native。
+        let view = self.view.borrow().clone();
+        if let Some(view) = view {
+            view.retire_scene_candidate();
+        }
+        drop(pending_link); // 同一旧Scene的click意图不再持Reader，也不能给后继publication补票。
         let gutter = self.gutter.borrow().clone();
         if let Some(gutter) = gutter {
             gutter.clear_snapshot();

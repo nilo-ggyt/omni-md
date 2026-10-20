@@ -985,6 +985,15 @@ impl NativeMarkdownPagedTextView {
         }
         result
     }
+    /// 原Body退休Scene时同步撤掉本View唯一未发布候选；Input/几何和已发布像素保持原归属。
+    /// 此入口不查询Native或后继Scene。先退出CPU槽借用，再归还旧绘图会话、context与tiles；
+    /// 已排队闭包只持Weak/serial，发现原serial失效即退出，不能把旧Scene退休写成输入失败。
+    pub(in crate::native_surface) fn retire_scene_candidate(&self) {
+        let cpu = self.ivars().cpu.borrow().clone();
+        if let Some(cpu) = cpu {
+            cpu.cancel_candidate();
+        }
+    }
     /// 单格提交准入后只归还未完成paint的Source；不推进几何、不关闭Input或改写已显示像素。
     pub(in crate::native_surface) fn release_scene_readers(&self) -> Result<()> {
         if self.ivars().closed.get() {
@@ -1223,6 +1232,7 @@ impl NativeMarkdownPagedTextView {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         self.foreground().is_ok()
     }
+    #[cfg_attr(feature = "native-close-stage-diagnostic", track_caller)]
     fn failure(&self, error: NativeMarkdownPagedTextViewError) {
         let mut slot = self.ivars().last_failure.borrow_mut();
         if slot.is_none()
@@ -1241,7 +1251,21 @@ impl NativeMarkdownPagedTextView {
                     | NativeMarkdownPagedTextViewError::FoldAction(_)
             ))
         {
+            #[cfg(feature = "native-close-stage-diagnostic")]
+            let report_revoked = matches!(error, NativeMarkdownPagedTextViewError::Revoked);
             *slot = Some(error);
+            drop(slot);
+            #[cfg(feature = "native-close-stage-diagnostic")]
+            if report_revoked {
+                // 仅定位首个真实入槽的撤权；槽借用已归还，不输出输入状态、正文或Native对象。
+                let caller = std::panic::Location::caller();
+                eprintln!(
+                    "native_view_first_failure cause=Revoked file={} line={} column={}",
+                    caller.file(),
+                    caller.line(),
+                    caller.column(),
+                );
+            }
         } // Pending/外部文件拒绝不能挡住真实源、资源或已提交后果首错；真实首错不被后续普通拒绝覆盖。
     }
     /// 入队前的外部文件拒绝与队首复制失败共用原反馈边；状态栏改变不能撤权已接纳的Word输入。
@@ -1260,6 +1284,7 @@ impl NativeMarkdownPagedTextView {
         } // 没有原链时才显示当前原窗口；关闭或换笔记后不复活旧反馈。
     }
     /// 只有顶层真实mutation/command的void回调决定原解释结果；候选坐标Pending保协议负值。
+    #[cfg_attr(feature = "native-close-stage-diagnostic", track_caller)]
     fn record_input(&self, result: Result<()>) {
         if let Err(cause) = result {
             #[cfg(feature = "native-input-trace")]
@@ -1285,12 +1310,14 @@ impl NativeMarkdownPagedTextView {
             }
         }
     }
+    #[cfg_attr(feature = "native-close-stage-diagnostic", track_caller)]
     fn record(&self, result: Result<()>) {
         if let Err(error) = result {
             self.report_attachment_rejection(&error);
             self.failure(error);
         }
     }
+    #[cfg_attr(feature = "native-close-stage-diagnostic", track_caller)]
     fn boolean_result(&self, result: Result<()>) -> bool {
         match result {
             Ok(()) => true,
