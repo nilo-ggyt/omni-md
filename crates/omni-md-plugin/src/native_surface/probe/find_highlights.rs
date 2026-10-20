@@ -9,6 +9,7 @@ use objc2::rc::Weak as NativeWeak;
 use objc2_app_kit::{NSBitmapFormat, NSClipView, NSColor, NSColorSpace, NSColorSpaceModel};
 #[cfg(feature = "native-block-fragment-diagnostic")]
 use objc2_core_graphics::{CGColorSpace, CGImage};
+use objc2_foundation::NSAlignmentOptions;
 use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 
@@ -698,7 +699,56 @@ impl PixelSample {
         }
         let frame = Self::source_frame(view, body, &source, current)?;
         let visible = step(current, || view.visibleRect())?;
-        let rect = sample_rect(frame, visible).ok_or("实际字形和对照条不在有限可见区域")?;
+        let proposed = sample_rect(frame, visible).ok_or("实际字形和对照条不在有限可见区域")?;
+        // 缓存区域必须先由同一个真实 View 对齐完整 backing 像素。此前把小数 ROI 的宽度
+        // 平摊到整数 bitmap，会把 emoji 左缘的部分覆盖像素误签成相邻未命中点：其中心
+        // 虽在字框外，原像素仍与字框相交。这里保留原左右各 8pt 对照，再向外像素对齐，
+        // 不挪字形、不改颜色阈值，也不让 AppKit 隐含取整决定我们未记录的采样原点。
+        let rect = step(current, || {
+            view.backingAlignedRect_options(proposed, NSAlignmentOptions::AlignAllEdgesOutward)
+        })?;
+        let backing = step(current, || view.convertRectToBacking(rect))?;
+        let glyph_backing = step(current, || view.convertRectToBacking(frame))?;
+        // 向外对齐最多补足边缘像素，但仍须支付原 ROI/可见区上限，不能借对齐扩大观察预算。
+        // backing 原点和边长必须确为整数；后续每个 getPixel 才对应一个完整单位像素，
+        // 而不是按显示器倍率或 bitmap 与小数 rect 的宽度比推测坐标。
+        if ![
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
+            backing.origin.x,
+            backing.origin.y,
+            backing.size.width,
+            backing.size.height,
+            glyph_backing.origin.x,
+            glyph_backing.origin.y,
+            glyph_backing.size.width,
+            glyph_backing.size.height,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
+            || rect.size.width <= 0.0
+            || rect.size.height <= 0.0
+            || rect.size.width > 64.0
+            || rect.size.height > 32.0
+            || rect.origin.x < visible.origin.x
+            || rect.origin.y < visible.origin.y
+            || rect.origin.x + rect.size.width > visible.origin.x + visible.size.width
+            || rect.origin.y + rect.size.height > visible.origin.y + visible.size.height
+            || backing.size.width <= 0.0
+            || backing.size.height <= 0.0
+            || [
+                backing.origin.x,
+                backing.origin.y,
+                backing.size.width,
+                backing.size.height,
+            ]
+            .into_iter()
+            .any(|value| value.fract() != 0.0)
+        {
+            return Err("像素对齐后的原字形采样区不在有限可见 backing 范围".into());
+        }
         let sample = autoreleasepool(|_| {
             let bitmap = step(current, || view.bitmapImageRepForCachingDisplayInRect(rect))?
                 .ok_or("AppKit 未创建原视图有限 bitmap")?;
@@ -707,8 +757,16 @@ impl PixelSample {
             })?;
             let width = step(current, || bitmap.pixelsWide())?;
             let height = step(current, || bitmap.pixelsHigh())?;
-            if width <= 0 || height <= 0 || width > 128 || height > 64 {
-                return Err("实际 bitmap 超出128×64像素预算".into());
+            // 只接受同 View 已声明的逐 backing 像素缓存。其它实际分辨率应明确失败，
+            // 不能再次线性缩放坐标把格式不符掩盖成合法未命中点。
+            if width <= 0
+                || height <= 0
+                || width > 128
+                || height > 64
+                || width as f64 != backing.size.width
+                || height as f64 != backing.size.height
+            {
+                return Err("实际 bitmap 未逐像素覆盖原 backing 范围或超出128×64预算".into());
             }
             // 实测colorAtX把显示器ICC的原分量包装成GenericRGB；不能据这个错误源空间再转换。
             // getPixel与原colorAtX共用左上角原点，仍只读同128个整数坐标，不引入图像绘制或Y翻转。
@@ -803,9 +861,17 @@ impl PixelSample {
                             ]
                         })
                     })?;
-                    let view_x = rect.origin.x + (x as f64 + 0.5) * rect.size.width / width as f64;
-                    in_match[index] =
-                        frame.origin.x <= view_x && view_x < frame.origin.x + frame.size.width;
+                    // NSBitmap 的整数行从左上开始；本 NSView 使用原未翻转坐标。只换算
+                    // 该已读像素在同一 backing 中的完整单位面积，不翻转或重采颜色数据。
+                    // 任何正面积交集都属于命中边缘的合法覆盖；只有完全不相交的像素才是
+                    // 严格未命中对照。恢复检查仍比较全部 128 点，包括这些部分覆盖像素。
+                    let pixel_left = backing.origin.x + x as f64;
+                    let pixel_bottom = backing.origin.y + backing.size.height - y as f64 - 1.0;
+                    in_match[index] = pixel_left
+                        < glyph_backing.origin.x + glyph_backing.size.width
+                        && glyph_backing.origin.x < pixel_left + 1.0
+                        && pixel_bottom < glyph_backing.origin.y + glyph_backing.size.height
+                        && glyph_backing.origin.y < pixel_bottom + 1.0;
                 }
             }
             #[cfg(feature = "native-block-fragment-diagnostic")]
