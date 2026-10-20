@@ -372,7 +372,7 @@ impl FindHighlightsProbe {
                 {
                     return Err("真实滚动没有撤销旧高亮几何或发布新clip".into());
                 }
-                let source = self.visible_chinese(surface)?;
+                let source = self.visible_window_chinese(surface)?;
                 self.scrolled_baseline = Some(self.sample(surface, source)?);
                 self.input(surface, "中文", false)?;
             }
@@ -392,7 +392,7 @@ impl FindHighlightsProbe {
                 baseline.require_restored(&self.sample(surface, baseline.source.clone())?)?;
             }
             436 => {
-                let source = self.visible_chinese(surface)?;
+                let source = self.visible_window_chinese(surface)?;
                 self.preview_baseline = Some(self.sample(surface, source)?);
                 self.input(surface, "中文", false)?;
             }
@@ -549,8 +549,8 @@ impl FindHighlightsProbe {
         let visible = step(&current, || view.visibleRect())?;
         for source in &self.chinese {
             // 只读已声明的有限源位置；不ensure离屏段落或把未知结构默认成普通正文。
-            let frame = PixelSample::source_frame(view, &paged.body, source, &current);
-            if let Ok(frame) = frame
+            let frame = PixelSample::source_frame(view, &paged.body, source, &current)?;
+            if let Some(frame) = frame
                 && sample_rect(frame, visible).is_some()
             {
                 return Ok(source.clone());
@@ -560,6 +560,84 @@ impl FindHighlightsProbe {
             }
         }
         Err("实际可见窗口没有有限文首的完整中文glyph".into())
+    }
+
+    /// 半页滚动与模式保位后，文首1024单元不一定仍在可见区；不能据此否定真实新帧。
+    /// 只借同一已封存Scene的实际命中确定当前源窗口，再以原正文中的字面“中文”选取ROI。
+    /// 这不是高亮结果反推期望：尚未输入该查询，颜色仍由原无亮基线与后继实际像素比较。
+    fn visible_window_chinese(
+        &self,
+        surface: &NativeMarkdownWindowSurface,
+    ) -> Result<Range<usize>, String> {
+        let current = || self.current(surface);
+        let editor = surface.editor.as_ref().ok_or("高亮正文缺失")?;
+        let view = &**editor.text_view;
+        let visible = step(&current, || view.visibleRect())?;
+        let key = view
+            .capture_ready_scene_key()
+            .map_err(|cause| cause.to_string())?;
+        let scene = NativeMarkdownPagedTextViewDelegate::ready_scene(&*editor.body, &key.request)
+            .map_err(|cause| cause.to_string())?;
+        scene
+            .validate_ready(&current)
+            .map_err(|cause| cause.to_string())?;
+        if !scene.key().same(&key) {
+            return Err("当前可见中文定位没有原Scene权限".into());
+        }
+        // hit只消费本次真实视口的已封存字形，返回合法canonical/GCB位置；不让SourceTarget
+        // 偷移视口，也不按平均行高或字体宽度猜测滚动后对应的UTF16偏移。
+        let point = NSPoint::new(
+            visible.origin.x + visible.size.width * 0.5,
+            visible.origin.y + visible.size.height * 0.5,
+        );
+        let start = scene.hit(point).map_err(|cause| cause.to_string())?;
+        let mut units = [0_u16; HEAD_UNITS];
+        let mut length = {
+            // 文稿借用只包这一次有界读取；离开后才再查询字形，不跨Native或布局回调保留。
+            let document = editor.document().borrow();
+            let remaining = document
+                .utf16_len()
+                .checked_sub(start)
+                .ok_or("可见Scene命中超出原正文范围")?;
+            let length = HEAD_UNITS.min(remaining);
+            document
+                .copy_utf16_code_units(start, &mut units[..length])
+                .map_err(|cause| cause.to_string())?;
+            length
+        };
+        if length != 0 && (0xd800..=0xdbff).contains(&units[length - 1]) {
+            // 上界可恰落代理项中间，只收回该未完整scalar；起点仍必须是Scene真实GCB命中。
+            length -= 1;
+        }
+        let head = String::from_utf16(&units[..length])
+            .map_err(|_| "当前可见源窗口不是完整UTF16 scalar")?;
+        scene
+            .validate_ready(&current)
+            .map_err(|cause| cause.to_string())?;
+        let mut candidates = 0usize;
+        let mut last_frame = None;
+        // 只逐个消费固定小片中的独立字面位置，不collect新的候选表，也不读取整段或全文。
+        for (byte, _) in head.match_indices("中文") {
+            candidates += 1;
+            let position = start + head[..byte].encode_utf16().count();
+            let source = position..position + 2;
+            let frame = PixelSample::source_frame(view, &editor.body, &source, &current)?;
+            // 跨软行或屏外候选可以不适合作ROI；原Source/Font/撤权首错必须仍立即返回，
+            // 不能把损坏的Scene吞成“没有中文”。本次Scene强边只活同步栈，不进入后继阶段。
+            scene
+                .validate_ready(&current)
+                .map_err(|cause| cause.to_string())?;
+            if let Some(frame) = frame {
+                last_frame = Some(frame);
+                if sample_rect(frame, visible).is_some() {
+                    return Ok(source);
+                }
+            }
+        }
+        Err(format!(
+            "当前实际可见窗口没有有限源片的完整中文glyph：hit={start} source_window={:?} visible={visible:?} candidates={candidates} last_frame={last_frame:?}",
+            start..start + length,
+        ))
     }
 
     /// 有限glyph几何来自已知canonical范围；不以生产batch.frames作为绘制通过证据。
@@ -621,7 +699,7 @@ impl PixelSample {
         body: &NativeMarkdownPagedBody,
         source: &Range<usize>,
         current: &impl Fn() -> bool,
-    ) -> Result<NSRect, String> {
+    ) -> Result<Option<NSRect>, String> {
         let key = view
             .capture_ready_scene_key()
             .map_err(|cause| cause.to_string())?;
@@ -638,9 +716,15 @@ impl PixelSample {
         while cursor < source.end {
             // first_rect的公开合同是首个完整GCB，而非请求范围内所有字符。原固定中文两字
             // 与单个nonBMP分别逐GCB取景，始终借同一Scene；不另求布局或读取正文。
-            let actual = scene
-                .first_rect(NSRange::new(cursor, source.end - cursor))
-                .map_err(|cause| cause.to_string())?;
+            let actual = match scene.first_rect(NSRange::new(cursor, source.end - cursor)) {
+                Ok(actual) => actual,
+                Err(crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Pending) => {
+                    // 屏外范围没有ROI是正常候选结果；Source/Font/当前Input首错仍先由原Scene核验。
+                    scene.validate_ready(current).map_err(|cause| cause.to_string())?;
+                    return Ok(None);
+                }
+                Err(cause) => return Err(cause.to_string()),
+            };
             let end = actual
                 .actual_range
                 .location
@@ -653,7 +737,11 @@ impl PixelSample {
                 if previous.origin.y != actual.rect.origin.y
                     || previous.size.height != actual.rect.size.height
                 {
-                    return Err("有限像素目标跨越实际软行或不同字形带".into());
+                    // 同一中文查询可能恰跨软行，不能拉成一条伪ROI；继续另一个有限字面候选。
+                    scene
+                        .validate_ready(current)
+                        .map_err(|cause| cause.to_string())?;
+                    return Ok(None);
                 }
                 // 左右对照仍包围完整查询。只截首字或末字会把查询另一字误当成未命中对照，
                 // 因而这里仅合并真实同带字形的横向包络，原ROI尺寸上限继续在sample_rect核验。
@@ -672,7 +760,7 @@ impl PixelSample {
         scene
             .validate_ready(current)
             .map_err(|cause| cause.to_string())?;
-        frame.ok_or("有限像素目标没有真实完整字形".into())
+        Ok(frame)
     }
 
     /// 只截取原已安装分页视图的≤128×64像素；不能另调用 Scene.paint 生成一张替代通过图。
@@ -697,7 +785,8 @@ impl PixelSample {
         {
             return Err("有限像素目标不是原完整 CPU 发布帧".into());
         }
-        let frame = Self::source_frame(view, body, &source, current)?;
+        let frame = Self::source_frame(view, body, &source, current)?
+            .ok_or("有限像素目标没有当前完整同软行字形")?;
         let visible = step(current, || view.visibleRect())?;
         let proposed = sample_rect(frame, visible).ok_or("实际字形和对照条不在有限可见区域")?;
         // 缓存区域必须先由同一个真实 View 对齐完整 backing 像素。此前把小数 ROI 的宽度
@@ -985,7 +1074,7 @@ impl PixelSample {
             || !stable_cpu
             || view.cpu_paint_pending() != Some(false)
             || step(current, || view.visibleRect())? != visible
-            || Self::source_frame(view, body, &source, current)? != frame
+            || Self::source_frame(view, body, &source, current)? != Some(frame)
         {
             return Err("原视图采样或临时对象归还后，原 CPU 帧、clip 或字形已变化".into());
         }
