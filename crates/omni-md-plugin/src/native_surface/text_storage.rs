@@ -811,7 +811,9 @@ impl PieceBackedMarkdownTextStorage {
         // Fixed palette/base attributes are native resources acquired only for an explicitly active editor.
         let string = PieceBackedMarkdownString::new(&document, mtm);
         let font = NSFont::systemFontOfSize(15.0);
-        let palette = MarkdownTextAttributePalette::new(font);
+        // TextKit 在原装配边界取得完整列表字形；分页只构造共同字体，不承担这组额外强边。
+        // 此时尚未建立 render_payload 的 RefCell，也未借用正文，Native 初始化不会跨业务借用。
+        let palette = MarkdownTextAttributePalette::new_for_textkit(font);
         let font_object: &AnyObject = &palette.normal_font;
         let foreground_color_object: &AnyObject = &palette.foreground;
         // SAFETY: AppKit exports these immutable keys for the process lifetime. The dictionary

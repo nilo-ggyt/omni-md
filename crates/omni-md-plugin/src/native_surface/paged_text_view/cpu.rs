@@ -242,10 +242,15 @@ impl CpuSurface {
                 // updateLayer 可在 CoreText/AppKit 的同步回调里重入。这里只拒绝第二个写入者，
                 // 原候选仍由外层独占；健康的显示请求不应成为永久输入失败。
                 let current = || scene.current(view);
-                scene.scene.validate_ready(&current)?;
-                let layer = self.layer_current(view, &current);
-                scene.scene.validate_ready(&current)?;
-                layer?; // 真实 Source、字体和 Native 所有权错误仍原样失败，不能被合并请求掩盖。
+                if !Self::scene_ready_for_display(view, scene)? {
+                    return Ok(());
+                }
+                if let Err(cause) = self.layer_current(view, &current) {
+                    return Err(Self::native_failure(view, scene, cause));
+                }
+                if !Self::scene_ready_for_display(view, scene)? {
+                    return Ok(());
+                } // 真实 Source、字体和 Native 所有权错误仍原样失败，不能被合并请求掩盖。
                 self.repaint_requested.set(true);
                 return Ok(());
             }
@@ -265,10 +270,16 @@ impl CpuSurface {
         scene: &SceneUse,
     ) -> Result<()> {
         let current = || scene.current(view);
-        scene.scene.validate_ready(&current)?; // 原Source/Font/输出健康先于缓存命中；同nonce不能掩盖EIO。
-        let geometry = self.geometry(view, scene);
-        scene.scene.validate_ready(&current)?;
-        let geometry = geometry?;
+        if !Self::scene_ready_for_display(view, scene)? {
+            return Ok(()); // 原Source/Font/输出健康先于退休判定；相同nonce不能掩盖EIO。
+        }
+        let geometry = match self.geometry(view, scene) {
+            Ok(geometry) => geometry,
+            Err(cause) => return Err(Self::native_failure(view, scene, cause)),
+        };
+        if !Self::scene_ready_for_display(view, scene)? {
+            return Ok(());
+        }
         let prior = self.published.borrow().clone(); // Rc只借固定metadata，结束槽借用后才进入Native/current。
         if let Some(prior) = prior
             && prior.key.same(&scene.key)
@@ -277,17 +288,37 @@ impl CpuSurface {
             let native = self
                 .layers
                 .validate(&self.layer, &prior.publication, &current);
-            scene.scene.validate_ready(&current)?; // Native检查失权时仍让真实Source首错优先，不改读后继来源。
-            native?;
-            let same_geometry = self.geometry(view, scene);
-            scene.scene.validate_ready(&current)?;
-            let same_geometry = same_geometry? == geometry;
+            if let Err(cause) = native {
+                return Err(Self::native_failure(view, scene, cause));
+            }
+            if !Self::scene_ready_for_display(view, scene)? {
+                return Ok(());
+            }
+            let same_geometry = match self.geometry(view, scene) {
+                Ok(actual) => actual == geometry,
+                Err(cause) => return Err(Self::native_failure(view, scene, cause)),
+            };
+            if !Self::scene_ready_for_display(view, scene)? {
+                return Ok(());
+            }
             let native = self
                 .layers
                 .validate(&self.layer, &prior.publication, &current);
-            scene.scene.validate_ready(&current)?;
-            native?;
-            if !same_geometry || !current() {
+            if let Err(cause) = native {
+                return Err(Self::native_failure(view, scene, cause));
+            }
+            if !Self::scene_ready_for_display(view, scene)? {
+                return Ok(());
+            }
+            if !same_geometry {
+                return Err(NativeMarkdownPagedTextViewError::Revoked);
+            }
+            if !current() {
+                // 实际 Native 几何和图组已经通过；这里只分类最后一次原票检查的撤权。
+                // 相同票的 Scene 异常仍失败，不能借另一次 current 返回覆盖已观察的拒绝。
+                if !Self::scene_ready_for_display(view, scene)? {
+                    return Ok(());
+                }
                 return Err(NativeMarkdownPagedTextViewError::Revoked);
             }
             let count = self
@@ -296,7 +327,9 @@ impl CpuSurface {
                 .checked_add(1)
                 .ok_or(NativeMarkdownPagedTextViewError::CounterExhausted)?;
             self.cancel_candidate(); // 即使producer返回旧已显示nonce，也先消费任何不相干的未发布候选。
-            scene.scene.validate_ready(&current)?;
+            if !Self::scene_ready_for_display(view, scene)? {
+                return Ok(());
+            }
             self.reuses.set(count);
             return Ok(()); // 已发布的同一完整帧仍健康，不再分配第三帧，也不重复向CTFont提交glyph。
         }
@@ -329,6 +362,34 @@ impl CpuSurface {
                 self.cancel_candidate();
                 Err(error)
             }
+        }
+    }
+
+    /// 只有这一项原 Scene 健康校验失败、且没有待处理的 Native 错误，才可能正常退休。
+    /// Source/Font/目录的真实错误由 validate_ready 原样交付；原客户或完整输入/几何
+    /// 确实换代才放弃旧显示，不以 scene_current 的普通 false 或空候选 serial 作证明。
+    fn scene_ready_for_display(
+        view: &NativeMarkdownPagedTextView,
+        scene: &SceneUse,
+    ) -> Result<bool> {
+        let ticket = candidate::Ticket::new(&scene.origin);
+        match scene.scene.validate_ready(&|| scene.current(view)) {
+            Ok(()) => Ok(true),
+            Err(NativeMarkdownPagedTextViewError::Revoked) if ticket.superseded(view)? => Ok(false),
+            Err(cause) => Err(cause),
+        }
+    }
+
+    /// 几何或实际图层检查自身已经失败，后置普通撤权不得把该 Native 错误吞成退休。
+    /// 仍沿同一 Scene 再核 Source/Font 首错；只有明确资源错误可以优先于原 Native 失败。
+    fn native_failure(
+        view: &NativeMarkdownPagedTextView,
+        scene: &SceneUse,
+        cause: NativeMarkdownPagedTextViewError,
+    ) -> NativeMarkdownPagedTextViewError {
+        match scene.scene.validate_ready(&|| scene.current(view)) {
+            Ok(()) | Err(NativeMarkdownPagedTextViewError::Revoked) => cause,
+            Err(resource) => resource,
         }
     }
 

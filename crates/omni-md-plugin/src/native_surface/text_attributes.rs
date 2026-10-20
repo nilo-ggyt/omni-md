@@ -14,12 +14,11 @@ pub(super) const NATIVE_MARKDOWN_TABLE_BORDER: [f64; 4] = [0.28, 0.34, 0.44, 1.0
 pub(super) const NATIVE_MARKDOWN_TABLE_HEADER_BACKGROUND: [f64; 4] = [0.105, 0.12, 0.16, 1.0];
 pub(super) const NATIVE_MARKDOWN_TABLE_ROW_BACKGROUND: [f64; 4] = [0.075, 0.084, 0.11, 1.0];
 
-/// Fixed colors and fonts for bounded TextKit attribute dictionaries.
-///
-/// Resources are created once per editor. A bounded LRU shares semantic dictionaries
-/// without constructing a complete attributed document or churning fonts on scroll.
+/// 同一活动 editor 的有限字体与颜色；分页只取共同策略，TextKit 另在装配时取得列表字形。
+/// 资源随原 palette 归还，不持正文，也不因滚动建立新的字体或属性资源拥有者。
 pub(super) struct MarkdownTextAttributePalette {
-    // 固定五个字形随活动editor释放；不按文档长度增长，也不进入进程静态缓存。
+    // 分页不消费 NSGlyphInfo，因此没有这组强边；TextKit 构造入口仍一次捕获完整五字形。
+    // 字体不支持该组符号时保留原 None/字面语义，不把资源缺席冒充隐藏源码的权限。
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) list_glyphs: Option<MarkdownListMarkerGlyphPalette>,
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
@@ -55,7 +54,8 @@ pub(super) struct MarkdownTextAttributePalette {
 }
 
 impl MarkdownTextAttributePalette {
-    /// Acquires a fixed native palette owned only by this active editor.
+    /// 构造分页与属性分支共用的固定字体、颜色；不为分页创建仅 TextKit 消费的 NSGlyphInfo。
+    /// 调用方须在原 Native 装配边界取得本值，不能把字体创建推迟到正文或 RefCell 借用中。
     pub(super) fn new(normal_font: Retained<NSFont>) -> Self {
         // Build the finite font variants once; scrolling only reuses these retained objects.
         // SAFETY: AppKit exports immutable font-weight constants with process lifetime.
@@ -70,7 +70,7 @@ impl MarkdownTextAttributePalette {
         // Retain the complete color/font palette under the editor so cache entries never borrow stack values.
         Self {
             #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
-            list_glyphs: MarkdownListMarkerGlyphPalette::new(),
+            list_glyphs: None,
             #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             list_hidden_foreground: NSColor::clearColor(),
             strong_font: NSFont::boldSystemFontOfSize(15.0),
@@ -139,6 +139,16 @@ impl MarkdownTextAttributePalette {
                 0.13, 0.20, 0.31, 1.0,
             ),
         }
+    }
+
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+    /// TextKit 在原 storage 装配点取得完整资源；所有 Native 创建均先于属性/正文槽的借用。
+    /// 五个字形仍整体成功或整体保持字面，由原 palette 独占到该 editor 实际释放。
+    pub(super) fn new_for_textkit(normal_font: Retained<NSFont>) -> Self {
+        let mut palette = Self::new(normal_font);
+        // 这里已经处于真实 TextKit 创建流程；不在属性 getter、首次滚动或懒查询中补建字形。
+        palette.list_glyphs = MarkdownListMarkerGlyphPalette::new();
+        palette
     }
 }
 
