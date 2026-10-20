@@ -251,12 +251,12 @@ workspace = true
 [dev-dependencies]
 tempfile = "=3.27.0"
 serde_json = "=1.0.151"
-# 人工输入法窗口只在首次上屏前读取当前鼠标所在显示器；生产窗口不增加屏幕选择策略。
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSScreen"] }
+# 输入法验收只读实际屏幕与运行实例 PID；生产窗口不增加屏幕选择或进程扫描策略。
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSScreen", "libc"] }
 # 原生属性用例借NSNull，输入事件以系统启动时钟记录真实创建时刻；仅测试图需要这两个绑定。
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSNull", "NSProcessInfo"] }
-# 单窗输入法验收只取原ID的WindowServer元数据与CGRect；不启用录屏或生产窗口扫描。
-objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGWindow", "CGGeometry"] }
+# 输入法验收构造带真实 CGEvent 的本地队列事件，只读原窗与组合面板元数据；不向系统投递按键或录屏。
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGWindow", "CGGeometry", "CGWindowLevel", "CGEvent", "CGEventTypes", "CGRemoteOperation"] }
 objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["CFNumber"] }
 
 [[test]]

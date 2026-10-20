@@ -924,7 +924,7 @@ fn main() {
         SourceFixture::from_arguments()
     };
     process_memory::sample("source_before_open").unwrap();
-    let (weak, mapping, pixels) = autoreleasepool(|_| {
+    let (weak, mapping, pixels, ime_result) = autoreleasepool(|_| {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         fixture.write_source(&mut file).unwrap();
         file.flush().unwrap();
@@ -1056,71 +1056,93 @@ fn main() {
             .copy_utf16_code_units(0, &mut prefix)
             .unwrap();
         assert_eq!(prefix, fixture.edited_prefix());
-        if let Some(mode) = ime_mode {
-            ime::run(&app, &window, &body, &view, &doc_weak, &mut receipts, mode);
+        let ime_result = if let Some(mode) = ime_mode {
+            ime::run(&app, &window, &body, &view, &doc_weak, &mut receipts, mode)
+        } else {
+            Ok(())
+        };
+        if let Err(cause) = &ime_result {
+            // 原输入首错先留有限事实；后续资源断言仍必须执行，失败不能覆盖或冲销此输入结论。
+            eprintln!(
+                "system_ime stage=input_failed reason={cause:?} software_events={} physical_keyboard={}",
+                matches!(ime_mode, Some(ime::Mode::Software)),
+                matches!(ime_mode, Some(ime::Mode::Manual)),
+            );
         }
         let clip = scroll.contentView();
-        for (scroll_stage, return_stage) in [
-            ("actual_scroll_1", "actual_return_to_top_1"),
-            ("actual_scroll_2", "actual_return_to_top_2"),
-            ("actual_scroll_3", "actual_return_to_top_3"),
-            ("actual_scroll_4", "actual_return_to_top_4"),
-        ] {
-            let before = body.progress().unwrap().prepared_lines;
-            let old_height = body.prepared_height().unwrap();
-            // 只滚到真实已排版内容的末端附近；不按字节、行号或平均高度假造整篇滚动范围。
-            // 每轮必须越过上一屏前沿并新增实际prefix，覆盖旧Scene/中间Reader/下一发布的释放顺序。
-            let y = old_height - clip.bounds().size.height - 1.0;
-            assert!(y > 0.0);
-            let scrolled_frame = observe(&body, Instant::now());
-            clip.scrollToPoint(NSPoint::new(0.0, y));
-            scroll.reflectScrolledClipView(&clip);
-            window.displayIfNeeded();
-            deliver(scroll_stage, &body, scrolled_frame);
-            let scrolled = view.capture_ready_scene_key().unwrap();
-            assert!(scrolled.request.virtual_viewport.document_origin.y > 0.0);
-            assert!(body.progress().unwrap().prepared_lines > before);
-            receipts.push(body.resource_receipts().unwrap());
-            let returned_frame = observe(&body, Instant::now());
-            clip.scrollToPoint(NSPoint::ZERO);
-            scroll.reflectScrolledClipView(&clip);
-            window.displayIfNeeded();
-            deliver(return_stage, &body, returned_frame);
-            let returned = view.capture_ready_scene_key().unwrap();
-            // 真正返回文首只要求纵向为零；行号占用的横向Native区域仍在，不能把正文原点写成ZERO。
-            assert_eq!(
-                returned.request.virtual_viewport.document_origin,
-                view.frame().origin
-            );
-            assert_eq!(returned.request.virtual_viewport.document_origin.y, 0.0);
-            let returned_proof = view
-                .verify_find_target_visible(&returned, NSRange::new(1, 1))
-                .unwrap();
-            assert_eq!(returned_proof.range(), NSRange::new(1, 1));
-        }
-        word::run(&body, &view, &doc_weak, &mut receipts, fixture);
-        active_line::run(&body, &window, &scroll, &view, &mut receipts);
-        gutter::long(&body, &window, &scroll, &view, &mut receipts);
-        let target_handles = targets::run(
-            &body,
-            &window,
-            &scroll,
-            &view,
-            &doc_weak,
-            &mut receipts,
-            fixture,
-        );
+        // 输入法失败只结束功能阶段，不在仍持view/context时panic假装完成资源验收。
+        // 该图仍沿下方唯一begin_close、Native弱票、Source及mmap门归还；成功时全部原业务照旧。
+        let target_handles = if ime_result.is_ok() {
+            for (scroll_stage, return_stage) in [
+                ("actual_scroll_1", "actual_return_to_top_1"),
+                ("actual_scroll_2", "actual_return_to_top_2"),
+                ("actual_scroll_3", "actual_return_to_top_3"),
+                ("actual_scroll_4", "actual_return_to_top_4"),
+            ] {
+                let before = body.progress().unwrap().prepared_lines;
+                let old_height = body.prepared_height().unwrap();
+                // 只滚到真实已排版内容的末端附近；不按字节、行号或平均高度假造整篇滚动范围。
+                // 每轮必须越过上一屏前沿并新增实际prefix，覆盖旧Scene/中间Reader/下一发布的释放顺序。
+                let y = old_height - clip.bounds().size.height - 1.0;
+                assert!(y > 0.0);
+                let scrolled_frame = observe(&body, Instant::now());
+                clip.scrollToPoint(NSPoint::new(0.0, y));
+                scroll.reflectScrolledClipView(&clip);
+                window.displayIfNeeded();
+                deliver(scroll_stage, &body, scrolled_frame);
+                let scrolled = view.capture_ready_scene_key().unwrap();
+                assert!(scrolled.request.virtual_viewport.document_origin.y > 0.0);
+                assert!(body.progress().unwrap().prepared_lines > before);
+                receipts.push(body.resource_receipts().unwrap());
+                let returned_frame = observe(&body, Instant::now());
+                clip.scrollToPoint(NSPoint::ZERO);
+                scroll.reflectScrolledClipView(&clip);
+                window.displayIfNeeded();
+                deliver(return_stage, &body, returned_frame);
+                let returned = view.capture_ready_scene_key().unwrap();
+                // 真正返回文首只要求纵向为零；行号占用的横向Native区域仍在，不能把正文原点写成ZERO。
+                assert_eq!(
+                    returned.request.virtual_viewport.document_origin,
+                    view.frame().origin
+                );
+                assert_eq!(returned.request.virtual_viewport.document_origin.y, 0.0);
+                let returned_proof = view
+                    .verify_find_target_visible(&returned, NSRange::new(1, 1))
+                    .unwrap();
+                assert_eq!(returned_proof.range(), NSRange::new(1, 1));
+            }
+            word::run(&body, &view, &doc_weak, &mut receipts, fixture);
+            active_line::run(&body, &window, &scroll, &view, &mut receipts);
+            gutter::long(&body, &window, &scroll, &view, &mut receipts);
+            targets::run(
+                &body,
+                &window,
+                &scroll,
+                &view,
+                &doc_weak,
+                &mut receipts,
+                fixture,
+            )
+        } else {
+            Vec::new() // 失败后不再创建滚动、词组或远端目标意图，也不另建一套关闭资源图。
+        };
         let mut native = body.native_weaks().unwrap();
         native.push(("test-scroll", weak(&scroll)));
         native.push(("test-window", weak(&window)));
-        let pending_key = word::native_before_close(&view);
+        let pending_key = ime_result.is_ok().then(|| word::native_before_close(&view));
         let close_started = Instant::now();
+        // 与正式窗口关闭相同，先让AppKit辞任原客户，再封闭Input并拆view；仅清initial不是辞任。
+        // 原Body/Doc/view及其context仍存活到本次Native调用返回，拒绝时不能伪签后续释放。
+        assert!(
+            window.makeFirstResponder(None),
+            "原输入客户没有正常辞任，不能开始关闭"
+        );
         let close = body.begin_close().unwrap();
         assert!(Rc::ptr_eq(&close, &body.begin_close().unwrap()));
         paged_close_event::wait(&close);
         close.verify_released().unwrap();
         assert!(
-            pending_key.load().is_none(),
+            pending_key.as_ref().is_none_or(|key| key.load().is_none()),
             "真实关闭必须归还尚未交给IME解释的原event"
         );
         assert!(target_handles.iter().all(|target| !target.is_pending()));
@@ -1146,6 +1168,7 @@ fn main() {
             view_weak,
             mapping,
             (pixels, native, receipts, close_started, target_handles),
+            ime_result,
         )
     });
     assert!(weak.load().is_none(), "正文 NSView 必须实际释放");
@@ -1167,6 +1190,8 @@ fn main() {
     );
     // 这些调用方持票在全部Doc/Source/FD/worker/font/NativeWeak/mmap/pixel门通过后才释放。
     drop(pixels.4);
+    // 原IME首错必须在全部真实释放门之后报告，且不能再进入后继短fixture或启动后来客户。
+    ime_result.unwrap_or_else(|cause| panic!("{cause}"));
     gutter::small(mtm);
     active_line::eof(mtm);
     #[cfg(feature = "native-markdown-runtime-probe")]

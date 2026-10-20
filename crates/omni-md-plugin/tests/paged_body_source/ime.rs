@@ -1,5 +1,8 @@
 //! 当前已选输入法在原四MiB映射正文的远端视口组合；不切换输入源，也不调用插字接口。
 
+#[path = "ime/panel.rs"]
+mod panel;
+
 use super::*;
 use objc2::{ClassType, define_class, msg_send, rc::Retained};
 use objc2_app_kit::{
@@ -7,12 +10,13 @@ use objc2_app_kit::{
     NSEventModifierFlags, NSEventType, NSFloatingWindowLevel, NSScreen, NSTextInputContext,
     NSWindowCollectionBehavior, NSWindowDidBecomeKeyNotification,
     NSWindowDidChangeOcclusionStateNotification, NSWindowDidUpdateNotification,
-    NSWindowOcclusionState,
+    NSWindowOcclusionState, NSWorkspace,
 };
 use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFNumber, CFString, CFType};
 use objc2_core_graphics::{
-    CGRectMakeWithDictionaryRepresentation, CGWindowListCreateDescriptionFromArray, kCGWindowAlpha,
-    kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowNumber, kCGWindowOwnerPID,
+    CGEvent, CGEventField, CGEventFlags, CGRectMakeWithDictionaryRepresentation,
+    CGWindowListCreateDescriptionFromArray, kCGWindowAlpha, kCGWindowBounds, kCGWindowIsOnscreen,
+    kCGWindowNumber, kCGWindowOwnerPID,
 };
 use objc2_foundation::{
     NSContainsRect, NSNotification, NSNotificationCenter, NSObjectProtocol, NSPointInRect,
@@ -21,7 +25,7 @@ use objc2_foundation::{
 use omni_markdown_core::MarkdownTextSelection;
 use omni_md_plugin::native_surface::{
     paged_body::{NativeMarkdownPagedBodyInputObserver, NativeMarkdownPagedBodyResourceReceipts},
-    paged_input::NativeMarkdownPagedInputCommit,
+    paged_input::{NativeMarkdownPagedInputCommit, NativeMarkdownPagedInputState},
     paged_text_view::NativeMarkdownPagedTextView,
 };
 
@@ -29,7 +33,7 @@ const INSERTION: usize = 70_001;
 const EXPECTED: [u16; 2] = [0x4e2d, 0x6587];
 
 #[derive(Clone, Copy)]
-/// 软件模式只验证AppKit到当前IME的真实软件事件；不能据此声称物理按键或候选位置已通过。
+/// 软件模式验证当前IME真实组合/提交及实际面板几何；不据此声称物理按键或候选内容已通过。
 pub(super) enum Mode {
     Manual,
     Software,
@@ -48,6 +52,7 @@ impl FocusNotifications {
         window: &NSWindow,
         view: &NativeMarkdownPagedTextView,
         on_ready: impl FnOnce() + 'static,
+        on_update: impl Fn() + 'static,
     ) -> (Self, impl FnOnce()) {
         let center = NSNotificationCenter::defaultCenter();
         let application = Weak::from(app);
@@ -98,7 +103,18 @@ impl FocusNotifications {
                     });
                 }
             });
-        // SAFETY: 五个通知均属原主线程AppKit对象；可发送block只持MainThreadBound弱客户和一次回调。
+        // 焦点回调消费后，原窗口/应用仍会收到真实更新通知；只在这些通知里交付面板等待。
+        // MainThreadBound内仅有同一焦点block和弱输入观察者，不让通知中心保活正文或客户。
+        // 此block自身不排后继面板任务，Host更新也不是Squirrel面板已可见的完成证明。
+        let focus = std::sync::Arc::new(dispatch2::MainThreadBound::new(block.clone(), app.mtm()));
+        let updated = std::sync::Arc::new(dispatch2::MainThreadBound::new(on_update, app.mtm()));
+        let update_block =
+            block2::RcBlock::new(move |notification: std::ptr::NonNull<NSNotification>| {
+                let mtm = MainThreadMarker::new().expect("原AppKit更新通知只能在主线程交付");
+                focus.get(mtm).call((notification,));
+                updated.get(mtm)();
+            });
+        // SAFETY: 五个通知均属原主线程AppKit对象；可发送block只持MainThreadBound弱客户和原回调。
         let tokens = unsafe {
             [
                 center.addObserverForName_object_queue_usingBlock(
@@ -123,7 +139,7 @@ impl FocusNotifications {
                     Some(NSWindowDidUpdateNotification),
                     Some(window),
                     None,
-                    &block,
+                    &update_block,
                 ),
                 // 应用完成真实窗口更新时再检查一次，覆盖早期key/active通知之后才激活输入客户的次序。
                 // 由标准run交付实际生命周期通知，不增加定时器、轮询或第二次事件循环。
@@ -131,7 +147,7 @@ impl FocusNotifications {
                     Some(NSApplicationDidUpdateNotification),
                     Some(app),
                     None,
-                    &block,
+                    &update_block,
                 ),
             ]
         };
@@ -157,6 +173,13 @@ impl FocusNotifications {
         let key = window.isKeyWindow();
         let on_space = window.isOnActiveSpace();
         let occlusion = window.occlusionState();
+        // AppKit活动状态与系统前台应用是独立事实；此处只记录原PID是否匹配，
+        // 不读取或输出其他应用身份，也不把这项诊断增添为本轮焦点准入条件。
+        // SAFETY: getpid无指针前提，只读取本进程的实际PID，不访问或控制其他进程。
+        let original_pid = unsafe { libc::getpid() };
+        let system_frontmost_is_original = NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .is_some_and(|application| application.processIdentifier() == original_pid);
         let original_responder = window.firstResponder().is_some_and(|responder| {
             std::ptr::eq::<objc2_app_kit::NSResponder>(&*responder, view.as_super().as_super())
         });
@@ -174,7 +197,7 @@ impl FocusNotifications {
         let server_onscreen = focused && original_window_is_onscreen(window);
         // 记录同一次真实交接缺少的具体权限；主循环退出后的状态不能反推早期通知已就绪。
         println!(
-            "system_ime stage=focus_permissions active={active} visible={visible} key={key} on_space={on_space} occlusion={occlusion:?} original_responder={original_responder} original_context={original_context} window_server_onscreen={server_onscreen}",
+            "system_ime stage=focus_permissions active={active} visible={visible} key={key} on_space={on_space} occlusion={occlusion:?} original_responder={original_responder} original_context={original_context} window_server_onscreen={server_onscreen} system_frontmost_is_original={system_frontmost_is_original}",
         );
         focused && server_onscreen
     }
@@ -318,17 +341,28 @@ impl Drop for InputDeadline {
     }
 }
 
-/// 本会话只持一个待交付的软件key；真实marked才准备下一键，不向系统事件队列投递文本事件。
+/// 本会话只持一对待投递的软件down/up；真实marked才准备下一press，系统队列负责实际分发。
 struct SoftwareInput {
     weak: std::rc::Weak<Self>,
+    body: std::rc::Weak<NativeMarkdownPagedBody>,
+    document: std::rc::Weak<RefCell<MarkdownDocumentBuffer>>,
     view: Weak<NativeMarkdownPagedTextView>,
     application: Retained<NSApplication>,
     context: Retained<NSTextInputContext>,
     initial_source: Retained<NSString>,
+    window_owner: Weak<NSWindow>,
     window: isize,
     next: Cell<usize>,
-    pending: RefCell<Option<(usize, Retained<NSEvent>)>>,
+    pending: RefCell<Option<(usize, [Retained<NSEvent>; 2])>>,
     waiting: Cell<Option<(usize, u64)>>,
+    // 最后一个字母只等待该完整Input的真实CPU；面板结果仅保纯身份/几何，不保活系统窗口。
+    panel_input: Cell<Option<NativeMarkdownPagedInputState>>,
+    // 最后一个字母的原帧从首次观察一直守到Space真正post；Missing不能换新帧补权。
+    // key只有Source/Scene弱身份，不保正文；后继Host通知只借这份原事实再查一次系统面板。
+    panel_frame: RefCell<Option<(NativeMarkdownPagedSceneKey, usize)>>,
+    // firstRect/系统查询可同步发Host通知；只阻止本次Native栈的递归查询，不代表面板完成。
+    panel_querying: Cell<bool>,
+    panel_observation: Cell<Option<panel::PanelObservation>>,
     failed: Cell<Option<&'static str>>,
     stopped: Cell<bool>,
 }
@@ -340,6 +374,8 @@ impl SoftwareInput {
         app: &Retained<NSApplication>,
         window: &NSWindow,
         view: &NativeMarkdownPagedTextView,
+        body: std::rc::Weak<NativeMarkdownPagedBody>,
+        document: std::rc::Weak<RefCell<MarkdownDocumentBuffer>>,
     ) -> Rc<Self> {
         let context = view.inputContext().expect("原正文必须持有系统输入context");
         // nil不能证明后继软件key仍交给最初输入源；拒绝本次验收，而不是替用户选择一个输入法。
@@ -351,14 +387,21 @@ impl SoftwareInput {
         assert_eq!(input.selection, MarkdownTextSelection::caret(INSERTION));
         let driver = Rc::new_cyclic(|weak| Self {
             weak: weak.clone(),
+            body,
+            document,
             view: Weak::from(view),
             application: app.clone(),
             context,
             initial_source,
+            window_owner: Weak::from(window),
             window: window.windowNumber(),
             next: Cell::new(0),
             pending: RefCell::new(None),
             waiting: Cell::new(None),
+            panel_input: Cell::new(None),
+            panel_frame: RefCell::new(None),
+            panel_querying: Cell::new(false),
+            panel_observation: Cell::new(None),
             failed: Cell::new(None),
             stopped: Cell::new(false),
         });
@@ -373,34 +416,63 @@ impl SoftwareInput {
         driver
     }
 
-    /// 本地槽只持下一个有限key；主队列弱续体等marked回调退栈后交付，不能递归sendEvent。
+    /// 本地槽只持下一个press的完整down/up；marked退栈后投递，不能递归分发事件。
     fn prepare_next(&self) {
         if self.stopped.get() || self.failed.get().is_some() {
             return;
         }
         let index = self.next.get();
-        let keys = [
-            ("z", 0x06),
-            ("h", 0x04),
-            ("o", 0x1f),
-            ("n", 0x2d),
-            ("g", 0x05),
-            ("w", 0x0d),
-            ("e", 0x0e),
-            ("n", 0x2d),
-            (" ", 0x31),
-        ];
+        let keys = [0x06, 0x04, 0x1f, 0x2d, 0x05, 0x0d, 0x0e, 0x2d, 0x31];
         assert!(index < keys.len());
         assert!(self.pending.borrow().is_none() && self.waiting.get().is_none());
-        let (text, code) = keys[index];
-        let text = NSString::from_str(text);
-        // 按系统启动时钟记录真正创建时刻；零时间戳不代表当前输入源之后到达的这次软件事件。
-        let timestamp = NSProcessInfo::processInfo().systemUptime();
-        let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
-            NSEventType::KeyDown, NSPoint::ZERO, NSEventModifierFlags::empty(), timestamp,
-            self.window, None, &text, &text, false, code,
-        ).expect("系统拒绝创建本窗口的软件key事件");
-        *self.pending.borrow_mut() = Some((index, event));
+        // AppKit的keyEventWithType构造不保证走IME；由公开CG键盘事件形成真正backing，
+        // 再桥接NSEvent。只给原虚拟键码，不设置Unicode文字、私有window字段或输入源。
+        // 事件仍只post到本进程NSApp；这里绝不CGEventPost、PostToPid或模拟物理键盘。
+        let created = (|| -> Result<[Retained<NSEvent>; 2], &'static str> {
+            let create = |key_down: bool| -> Result<Retained<NSEvent>, &'static str> {
+                let event = CGEvent::new_keyboard_event(None, keys[index], key_down)
+                    .ok_or("系统拒绝创建本次Quartz软件键盘事件")?;
+                CGEvent::set_flags(Some(&event), CGEventFlags::empty());
+                CGEvent::set_integer_value_field(
+                    Some(&event),
+                    CGEventField::KeyboardEventAutorepeat,
+                    0,
+                );
+                // 分别保留两个事件的真实创建时刻；CG以纳秒计，不人为制造按压时长或等待。
+                let uptime = NSProcessInfo::processInfo().systemUptime();
+                CGEvent::set_timestamp(Some(&event), (uptime * 1_000_000_000.0) as u64);
+                let event = NSEvent::eventWithCGEvent(&event)
+                    .ok_or("系统拒绝桥接本次Quartz软件键盘事件")?;
+                if event.CGEvent().is_none() {
+                    return Err("本次软件键盘事件没有真实CGEvent backing");
+                }
+                println!(
+                    "system_ime stage=software_key_prepared index={index} key_down={key_down} event_window_number={} cg_backed=true timestamp_seconds={} software_events=true physical_keyboard=false",
+                    event.windowNumber(),
+                    event.timestamp(),
+                );
+                Ok(event) // NSEvent保留其真实CGEvent；局部CF owner随本同步构造栈归还。
+            };
+            // 一个keycode的按下与释放必须全部创建成功才交pending；up失败时down也归还，
+            // 不能先post半个press，再用后继构造或重试补其释放。
+            let down = create(true)?;
+            let up = create(false)?;
+            Ok([down, up])
+        })();
+        let events = match created {
+            Ok(events) => events,
+            Err(cause) => {
+                if self.failed.get().is_none() {
+                    self.failed.set(Some(cause));
+                }
+                stop(&self.application);
+                return; // 构造拒绝也交父唯一严格关闭，不panic绕开弱票及mmap门。
+            }
+        };
+        if self.stopped.get() || self.failed.get().is_some() {
+            return; // Native构造期的迟到取消不能重新安装原本地pending槽。
+        }
+        *self.pending.borrow_mut() = Some((index, events));
         let weak = std::sync::Arc::new(dispatch2::MainThreadBound::new(
             self.weak.clone(),
             self.application.mtm(),
@@ -418,32 +490,44 @@ impl SoftwareInput {
         });
     }
 
-    /// 原loop栈顶取走一个本地key，每键核真实焦点后只send一次；这仍是软件事件而非物理键盘。
+    /// 原loop栈顶取走一个完整press，核原客户后按down/up顺序入队；不把posted写成delivered。
     fn dispatch_pending(&self, view: &NativeMarkdownPagedTextView) -> bool {
-        let Some((index, event)) = self.pending.borrow_mut().take() else {
+        let Some((index, [down, up])) = self.pending.borrow_mut().take() else {
             return false;
-        }; // 槽借用先结束，Native交付与同步marked回调可安全准备后继槽。
+        }; // 槽借用先结束，系统分发后的真实marked回调可安全准备后继槽。
         if self.stopped.get() || self.failed.get().is_some() {
             return true; // 已撤权的本地key直接归还，不进入系统队列或发送给后继客户。
         }
-        let current = NSTextInputContext::currentInputContext(self.application.mtm());
-        let client = self.context.client();
-        let admitted = std::ptr::eq(
-            Retained::as_ptr(&client).cast::<AnyObject>(),
-            std::ptr::from_ref(view).cast::<AnyObject>(),
-        ) && self.application.isActive()
-            && self.application.keyWindow().is_some_and(|window| {
-                window.windowNumber() == self.window
-                    && window.isKeyWindow()
-                    && window.firstResponder().is_some_and(|responder| {
-                        std::ptr::eq(
-                            Retained::as_ptr(&responder).cast::<AnyObject>(),
-                            Retained::as_ptr(&client).cast::<AnyObject>(),
-                        )
-                    })
-            })
-            && current.is_some_and(|current| std::ptr::eq(&*current, &*self.context));
-        if !admitted {
+        if index == 8 && self.panel_observation.get().is_none() {
+            self.failed
+                .set(Some("原真实组合面板尚未验证，不能确认候选"));
+            stop(&self.application);
+            return true;
+        }
+        let admitted = || {
+            let current = NSTextInputContext::currentInputContext(self.application.mtm());
+            let client = self.context.client();
+            let Some(original_window) = self.window_owner.load() else {
+                return false;
+            };
+            std::ptr::eq(
+                Retained::as_ptr(&client).cast::<AnyObject>(),
+                std::ptr::from_ref(view).cast::<AnyObject>(),
+            ) && self.application.isActive()
+                && self.application.keyWindow().is_some_and(|window| {
+                    std::ptr::eq(&*window, &*original_window)
+                        && window.windowNumber() == self.window
+                        && window.isKeyWindow()
+                        && window.firstResponder().is_some_and(|responder| {
+                            std::ptr::eq(
+                                Retained::as_ptr(&responder).cast::<AnyObject>(),
+                                Retained::as_ptr(&client).cast::<AnyObject>(),
+                            )
+                        })
+                })
+                && current.is_some_and(|current| std::ptr::eq(&*current, &*self.context))
+        };
+        if !admitted() {
             if self.failed.get().is_none() {
                 self.failed
                     .set(Some("原软件key交付前已失去窗口/输入context焦点权限"));
@@ -462,20 +546,59 @@ impl SoftwareInput {
             stop(&self.application);
             return true;
         }
+        // CG桥接事件的windowNumber可为0，系统将按真正keyWindow分发；Native查询后
+        // 再核原窗口对象/context/输入源，不能把本事件改投到刚切换的客户或别的窗口。
+        if !admitted()
+            || self.context.selectedKeyboardInputSource().as_deref() != Some(&*self.initial_source)
+        {
+            if self.failed.get().is_none() {
+                self.failed
+                    .set(Some("软件key入队前原窗口或输入context已撤销"));
+            }
+            stop(&self.application);
+            return true;
+        }
+        if index == 8 {
+            // 面板观察后还有一次真实主队列间隔；投递前不能给新输入或新几何重新捕generation。
+            // 原窗口的Native查询结束后最后核同Input/Scene/CPU，撤权只终止而不重试Space。
+            let frame = self.panel_frame.borrow().clone();
+            if frame
+                .as_ref()
+                .is_none_or(|(key, paints)| !self.panel_current(view, key, *paints))
+            {
+                if self.failed.get().is_none() {
+                    self.failed
+                        .set(Some("面板观察后的原Input或几何已撤销，不能确认候选"));
+                }
+                stop(&self.application);
+                return true;
+            }
+        }
         let generation = view.input_state().unwrap().generation;
         self.waiting.set(Some((index, generation)));
         self.next.set(index + 1);
-        // waiting先于真实sendEvent安装，系统同步或异步marked都只消费这次输入；
-        // 系统仍沿NSApplication→原responder→真实NSTextInputContext解释，不调用文本协议造中文。
-        self.application.sendEvent(&event);
+        // waiting先于入队安装且按press推进一次；系统后继marked仍决定下一press，
+        // 不因up创建/入队就推进输入，也不把释放误当中文提交或面板显示完成。
+        // currentEvent属于真正从队列取出的事件，不能用直接sendEvent假装它已经经过run。
+        // CG桥接事件未必带windowNumber；只在原keyWindow/context仍属本客户时post，
+        // 原run再沿NSApplication→原keyWindow/responder→输入context解释，
+        // 不直接调用文本协议，也不在系统未产生marked时重试、切模式或替换输入源。
+        // 同一主线程同步栈内相邻post，期间不插入getter、回调或等待。两事件都入原队尾，
+        // 后继marked才能准备下一press，因此其down入队时这次up已经在前。
+        // 仅记录实际posted；末SpaceDown提交即stop时，其up仍可能尚未由run取走。
+        self.application.postEvent_atStart(&down, false);
+        self.application.postEvent_atStart(&up, false);
         println!(
-            "system_ime stage=software_key_delivered index={index} before_generation={generation} original_input_source=true software_events=true physical_keyboard=false"
+            "system_ime stage=software_key_posted index={index} posted_events_for_press=2 before_generation={generation} original_input_source=true software_events=true physical_keyboard=false"
         );
         true
     }
 
     /// 当前票只接受真正后继marked变化；一个key的多个通知不能重复发送下一字符。
     fn marked(&self, commit: &NativeMarkdownPagedInputCommit) {
+        if self.stopped.get() || self.failed.get().is_some() {
+            return; // 同一IME事件可先insert再marked；首错之后的回调不能登记CPU或覆盖失败。
+        }
         if let Some((index, generation)) = self.waiting.get()
             && index < 8
             && commit.state.generation != generation
@@ -486,7 +609,230 @@ impl SoftwareInput {
                 "system_ime stage=software_marked index={index} generation={} software_events=true physical_keyboard=false",
                 commit.state.generation,
             );
-            self.prepare_next();
+            if index == 7 {
+                // Squirrel先回调setMarkedText才显示面板；此栈不能把旧面板或CPU排队当真实位置。
+                // 在原提交尚未结束时登记下一实际CPU终点，避免退栈后才观察而漏掉已完成帧。
+                // Body原观察槽只保本driver的Weak；原输入观察者继续唯一强持driver，不延长文稿生命。
+                self.panel_input.set(Some(commit.state));
+                let armed =
+                    self.body
+                        .upgrade()
+                        .zip(self.weak.upgrade())
+                        .is_some_and(|(body, driver)| {
+                            let observer: Rc<dyn NativeMarkdownPagedBodyPaintObserver> = driver;
+                            body.observe_next_cpu_frame(Rc::downgrade(&observer))
+                                .is_ok()
+                        });
+                if !armed {
+                    self.panel_input.set(None);
+                    if self.failed.get().is_none() {
+                        self.failed.set(Some("无法观察原组合Input的下一实际CPU帧"));
+                    }
+                    stop(&self.application);
+                }
+            } else {
+                self.prepare_next();
+            }
+        }
+    }
+
+    /// 面板查询只在原客户、同源完整Input及刚观察到的CPU仍当前时执行；Native查询后再纯核。
+    /// 不把同generation或相同窗口号当身份，不从后继Ready重采一份授权给原组合。
+    fn panel_current(
+        &self,
+        view: &NativeMarkdownPagedTextView,
+        key: &NativeMarkdownPagedSceneKey,
+        paints: usize,
+    ) -> bool {
+        // 实际CPU通知携带的key是唯一几何来源；原完整Input和nonce缺一都不能借新帧补权。
+        // 字母已经全部投递、Space尚未创建才属于本观察阶段；清理或另一次输入会立即撤销。
+        let pure = || {
+            !self.stopped.get()
+                && self.failed.get().is_none()
+                && self.next.get() == 8
+                && self.waiting.get().is_none()
+                && self.pending.borrow().is_none()
+                && key.request.input.marked.is_some()
+                && std::rc::Weak::ptr_eq(&self.document, &key.request.document)
+                && view
+                    .input_state()
+                    .is_ok_and(|state| state == key.request.input)
+                && !view.is_busy()
+                && paints > 0
+                && view.cpu_paints() == Some(paints)
+                && view.cpu_paint_pending() == Some(false)
+                && view
+                    .capture_ready_scene_key()
+                    .is_ok_and(|actual| actual.same(key))
+        };
+        if !pure() {
+            return false;
+        }
+        // Weak只保证不保活owner，不能单凭upgrade就认客户；仍核Body实际view是原通知客户。
+        // 这些强借用只活本同步守卫，返回前归还，不进入后继主队列或系统窗口记录。
+        let Some(body) = self.body.upgrade() else {
+            return false;
+        };
+        if !body
+            .view()
+            .is_ok_and(|owner| std::ptr::eq::<NativeMarkdownPagedTextView>(&**owner, view))
+        {
+            return false;
+        }
+        // 焦点和当前context是两项不同系统事实：客户仍挂在原view，并不保证它还接收键盘。
+        // Native getter均无RefCell/Doc借用；纯核在最后执行，重入的新选择或关闭不能蒙混通过。
+        let context = NSTextInputContext::currentInputContext(self.application.mtm());
+        let client = self.context.client();
+        let Some(window) = self.window_owner.load() else {
+            return false;
+        };
+        // 事件windowNumber只负责路由，不能代替窗口对象身份；原view也必须仍挂在同一窗口。
+        // 弱窗口不会把关闭后的客户留到后来应用，号码复用也不能让新窗口接管本次观察。
+        let original = std::ptr::eq(
+            Retained::as_ptr(&client).cast::<AnyObject>(),
+            std::ptr::from_ref(view).cast::<AnyObject>(),
+        ) && context.is_some_and(|current| std::ptr::eq(&*current, &*self.context))
+            && view
+                .window()
+                .is_some_and(|actual| std::ptr::eq(&*actual, &*window))
+            && self.application.isActive()
+            && self.application.keyWindow().is_some_and(|actual| {
+                std::ptr::eq(&*actual, &*window)
+                    && actual.windowNumber() == self.window
+                    && actual.isKeyWindow()
+                    && actual.firstResponder().is_some_and(|responder| {
+                        std::ptr::eq(
+                            Retained::as_ptr(&responder).cast::<AnyObject>(),
+                            std::ptr::from_ref(view).cast::<AnyObject>(),
+                        )
+                    })
+            });
+        // 最后一个Native getter仍核原输入源；后置纯核防查询期间新输入、滚动或关闭补签。
+        original
+            && self.context.selectedKeyboardInputSource().as_deref() == Some(&*self.initial_source)
+            && pure()
+    }
+
+    /// 仅真实Host更新可重看尚未显示的面板；没有原CPU等待就直接返回，不创建后继任务。
+    fn host_updated(&self) {
+        if self.stopped.get()
+            || self.failed.get().is_some()
+            || self.panel_observation.get().is_some()
+            || self.panel_querying.get()
+        {
+            return;
+        }
+        let frame = self.panel_frame.borrow().clone();
+        if let Some((key, paints)) = frame {
+            self.observe_panel(&key, paints); // 槽借用已结束，Native可同步交付另一个真实通知。
+        }
+    }
+
+    /// 真实key与CPU均退栈后的首次查询，或一次真实Host更新，共用同一原Input/CPU权限。
+    /// Missing只保持原期限等待；其余拒绝立即失败，绝不自排轮询、补wake或猜测确认按键。
+    fn observe_panel(&self, key: &NativeMarkdownPagedSceneKey, paints: usize) {
+        if self.stopped.get()
+            || self.failed.get().is_some()
+            || self.panel_observation.get().is_some()
+            || self.panel_querying.replace(true)
+        {
+            return;
+        }
+        let observed = (|| -> Result<Option<panel::PanelObservation>, &'static str> {
+            let view = self.view.load().ok_or("原组合客户已释放")?;
+            let current = || self.panel_current(&view, key, paints);
+            if !current() {
+                return Err("原组合Input/CPU/焦点已变化，不能观察面板");
+            }
+            // Squirrel1.1.2以attributes(index:0)查询inline session起点；真实系统桥接
+            // 已观测为marked.start的首字符，不是当前caret。只沿原CPU票取该组合起点，
+            // 不能从第三方面板位置倒推字符，也不能以marked尾端的caret另造期望锚点。
+            let marked = key
+                .request
+                .input
+                .marked
+                .filter(|marked| marked.length > 0)
+                .ok_or("原Input没有可查询首字符的实际组合范围")?;
+            let range = NSRange::new(marked.location, 1);
+            let marked_end = marked
+                .location
+                .checked_add(marked.length)
+                .ok_or("原组合范围末端溢出")?;
+            let requested_end = range
+                .location
+                .checked_add(range.length)
+                .ok_or("原组合首字符末端溢出")?;
+            let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&*view);
+            let mut actual = NSRange::new(NSNotFound as usize, 0);
+            // SAFETY: 同一原客户、组合首字符及栈上完整out范围；真实协议可扩展到完整字素。
+            let rect = unsafe { client.firstRectForCharacterRange_actualRange(range, &mut actual) };
+            // 请求从marked起点开始，返回值也必须从该起点覆盖所求首字符且不越marked末端。
+            // 实际Native端点用checked_add核算；允许真实GCB扩展，不接受空范围或溢出补票。
+            if !current()
+                || actual.location != marked.location
+                || actual
+                    .location
+                    .checked_add(actual.length)
+                    .is_none_or(|end| end < requested_end || end > marked_end)
+            {
+                return Err("原组合起点没有同Input且完全位于组合范围内的实际firstRect");
+            }
+            // helper只读真实窗口，不负责等待。Host的CPU完成不能保证另一个进程的窗口
+            // 已经发布；仅Missing允许原槽留到下次真实通知，原Input撤权仍立即失败。
+            let observed = match panel::observe(&self.initial_source, rect, current) {
+                Ok(observed) => observed,
+                Err(panel::PanelError::PanelMissing) => {
+                    if !self.panel_current(&view, key, paints) {
+                        return Err("面板等待期间原组合Input/CPU/焦点已变化");
+                    }
+                    return Ok(None);
+                }
+                Err(cause) => {
+                    println!(
+                        "system_ime stage=composition_panel_failed cause={cause:?} anchor=composition_start software_events=true physical_keyboard=false"
+                    );
+                    return Err("无法确认当前Squirrel真实组合面板");
+                }
+            };
+            // 只输出原窗口号、进程和points几何；不读取标题、候选文字、窗口图像或AX树。
+            // touches_screen_edge仅报告边缘事实，绝不能替near/same_screen的独立位置要求。
+            println!(
+                "system_ime stage=composition_panel pid={} launch_unix_seconds={} window_id={} panel_rect={:?} anchor_rect={:?} screen_rect={:?} distance_points={} maximum_distance_points={} near_anchor={} same_screen={} touches_screen_edge={} anchor=composition_start requested_range={range:?} actual_range={actual:?} actual_input_cpu=true candidate_contents_verified=false software_events=true physical_keyboard=false",
+                observed.process.pid,
+                observed.process.launch_unix_seconds,
+                observed.window_id,
+                observed.panel_rect,
+                observed.anchor_rect,
+                observed.screen_rect,
+                observed.distance_points,
+                observed.maximum_distance_points,
+                observed.near_anchor,
+                observed.same_screen,
+                observed.touches_screen_edge,
+            );
+            if !observed.near_anchor
+                || !observed.same_screen
+                || !self.panel_current(&view, key, paints)
+            {
+                return Err("真实组合面板没有在原组合起点同屏附近");
+            }
+            Ok(Some(observed))
+        })();
+        self.panel_querying.set(false); // 本同步Native查询已退栈；不把递归保护当外部完成状态。
+        match observed {
+            Ok(Some(observation)) => {
+                // 纯几何收据留下给本轮最终验收；Space仍经原pending槽和系统队列一次交付。
+                // 没有组合面板证明就停在失败，不能靠确认后的中文文本倒签先前的位置。
+                self.panel_observation.set(Some(observation));
+                self.prepare_next();
+            }
+            Ok(None) => {} // 不改变原帧或30秒期限；没有后继真实通知就由原deadline结束。
+            Err(cause) => {
+                if self.failed.get().is_none() {
+                    self.failed.set(Some(cause));
+                }
+                stop(&self.application);
+            }
         }
     }
 
@@ -502,12 +848,18 @@ impl SoftwareInput {
     }
 
     /// 先撤本地软件key，再只清理仍属于原客户、原输入源和原活动context的组合。
-    /// 输入源变化或客户失焦时不操作系统组合；无法证明归属、或公开discard后仍有marked，都返回失败。
+    /// 输入源变化或客户失焦时不操作系统组合；无法证明归属、或正常辞任后仍有marked，都返回失败。
     fn cleanup(&self) -> bool {
         let already_stopped = self.stopped.replace(true);
         self.waiting.set(None);
+        self.panel_input.set(None);
+        self.panel_observation.set(None);
+        let panel_frame = self.panel_frame.borrow_mut().take();
+        drop(panel_frame); // 原弱Scene票也随本次输入结束，不留给后来客户或后继Space。
         let pending = self.pending.borrow_mut().take();
-        drop(pending); // 软件key从未入系统队列；先撤发送权，再在无槽借用时实际归还本地Native owner。
+        // 本地槽只含尚未post的key，归还它不会撤销已入系统队列的事件；这里不丢弃用户事件。
+        // stopped先撤后继投递权，原窗口/context的真实关闭继续由本用例既有资源收尾负责。
+        drop(pending);
         let source_unchanged =
             self.context.selectedKeyboardInputSource().as_deref() == Some(&*self.initial_source);
         // context不保活其client；先取得原view的真实强借用，再读client，不能向已释放客户发Native消息。
@@ -522,15 +874,21 @@ impl SoftwareInput {
             Retained::as_ptr(&client).cast::<AnyObject>(),
             Retained::as_ptr(&original_view).cast::<AnyObject>(),
         );
-        let mut discarded_local_marked = false;
-        if !already_stopped && original_client && client.hasMarkedText() {
-            // discard会回调输入客户，故不持本地RefCell借用；此时只准原激活context及其原焦点客户。
-            let current = NSTextInputContext::currentInputContext(self.application.mtm());
+        let mut resigned_local_client = None;
+        if !already_stopped
+            && original_client
+            && client.hasMarkedText()
+            && let Some(window) = self.window_owner.load()
+        {
+            // discard只通知系统转换，并不保证客户Core组合已结束。沿正式窗口辞任调用
+            // 原客户的生产resign流程，让真实IME提交或既有Core收尾完成，不直调unmark协议。
+            // view/context/window仍由本同步栈保护；所有RefCell借用先结束才调用Native。
             let original_focus = self.application.isActive()
-                && self.application.keyWindow().is_some_and(|window| {
-                    window.windowNumber() == self.window
-                        && window.isKeyWindow()
-                        && window.firstResponder().is_some_and(|responder| {
+                && self.application.keyWindow().is_some_and(|actual| {
+                    std::ptr::eq(&*actual, &*window)
+                        && actual.windowNumber() == self.window
+                        && actual.isKeyWindow()
+                        && actual.firstResponder().is_some_and(|responder| {
                             std::ptr::eq(
                                 Retained::as_ptr(&responder).cast::<AnyObject>(),
                                 Retained::as_ptr(&client).cast::<AnyObject>(),
@@ -539,19 +897,22 @@ impl SoftwareInput {
                 });
             if source_unchanged
                 && original_focus
-                && current.is_some_and(|current| std::ptr::eq(&*current, &*self.context))
+                && NSTextInputContext::currentInputContext(self.application.mtm())
+                    .is_some_and(|current| std::ptr::eq(&*current, &*self.context))
+                && self.context.selectedKeyboardInputSource().as_deref()
+                    == Some(&*self.initial_source)
             {
-                self.context.discardMarkedText();
-                discarded_local_marked = true;
+                // 仅残余组合需要辞任；已经真正提交中文的成功路径保持原客户和后续历史动作。
+                resigned_local_client = Some(window.makeFirstResponder(None));
             }
         }
-        // SDK要求客户自行清除marked；调用discard本身不是完成收据，必须核原客户与真实Input状态。
+        // 辞任返回也不是文字完成收据；仍核同原view的公开marked及真实Input，不能补签中文成功。
         let marked_cleared = original_client
             && !client.hasMarkedText()
             && original_view
                 .input_state()
                 .is_ok_and(|state| state.marked.is_none());
-        // discard和客户查询可同步进入Native；返回后仍核最初源，发生变化只报告失败而不修复用户选择。
+        // 辞任和客户查询可同步进入Native；返回后仍核最初源，发生变化只报告失败而不修复用户选择。
         let source_unchanged = source_unchanged
             && self.context.selectedKeyboardInputSource().as_deref() == Some(&*self.initial_source);
         if !source_unchanged && self.failed.get().is_none() {
@@ -559,11 +920,52 @@ impl SoftwareInput {
                 .set(Some("当前输入源已变化，本次软件输入序列失效"));
         }
         let pending_released = self.pending.borrow().is_none();
-        let cleaned = pending_released && source_unchanged && marked_cleared;
+        let cleaned = pending_released
+            && source_unchanged
+            && marked_cleared
+            && resigned_local_client != Some(false);
         println!(
-            "system_ime stage=local_input_cleanup cleaned={cleaned} input_source_unchanged={source_unchanged} original_client={original_client} discarded_local_marked={discarded_local_marked} marked_cleared={marked_cleared} local_pending_released={pending_released} input_source_selected=false software_key_queued=false software_events=true physical_keyboard=false"
+            "system_ime stage=local_input_cleanup cleaned={cleaned} input_source_unchanged={source_unchanged} original_client={original_client} resigned_local_client={resigned_local_client:?} marked_cleared={marked_cleared} local_pending_released={pending_released} input_source_selected=false software_events=true physical_keyboard=false"
         );
         cleaned
+    }
+}
+
+impl NativeMarkdownPagedBodyPaintObserver for SoftwareInput {
+    /// 原Body已验证并发布完整CPU；只携同key弱身份再退一层，面板查询不穿过绘图回调栈。
+    fn frame_published(&self, key: &NativeMarkdownPagedSceneKey, paints: usize) {
+        // 只消费此前最后一个真实marked的完整Input；后继发布不能复活已经结束的等待。
+        // 不因旧帧失效而反复重订阅或延长原输入期限，也不替换原输入观察者。
+        let Some(input) = self.panel_input.take() else {
+            return;
+        };
+        if self.stopped.get() || self.failed.get().is_some() {
+            return;
+        }
+        if key.request.input != input {
+            self.failed.set(Some("原组合CPU终点已被后继Input替代"));
+            stop(&self.application);
+            return;
+        }
+        // key只携原Source/Scene弱身份；跨队列不保存view、Doc、Reader或候选窗Native强边。
+        // 再退一次主队列后仍检查view未处于输入回调，不能把Native嵌套交付冒充keyDown退栈。
+        let weak = dispatch2::MainThreadBound::new(self.weak.clone(), self.application.mtm());
+        let key = dispatch2::MainThreadBound::new(key.clone(), self.application.mtm());
+        dispatch2::DispatchQueue::main().exec_async(move || {
+            autoreleasepool(|_| {
+                let mtm = MainThreadMarker::new().unwrap();
+                if let Some(driver) = weak.get(mtm).upgrade() {
+                    if driver.stopped.get() || driver.failed.get().is_some() {
+                        return;
+                    }
+                    // 唯一原CPU终点只在本次退栈续体安装。更早的Host通知看不到等待槽，
+                    // 后来的通知也只能重用此key/paints，不能重订阅或采新Input给旧组合补票。
+                    *driver.panel_frame.borrow_mut() = Some((key.get(mtm).clone(), paints));
+                    println!("system_ime stage=awaiting_composition_panel original_cpu=true actual_host_updates_only=true deadline_unchanged=true software_events=true physical_keyboard=false");
+                    driver.observe_panel(key.get(mtm), paints);
+                }
+            });
+        });
     }
 }
 
@@ -574,7 +976,8 @@ impl Drop for SoftwareInput {
             eprintln!(
                 "system_ime stage=local_input_cleanup_failed software_events=true physical_keyboard=false"
             );
-            assert!(std::thread::panicking(), "原软件输入会话未能安全清理");
+            // run已把真实清理失败返回父用例；Drop不能再panic抢掉首错、绕过唯一严格关闭。
+            // 这里只撤本地发送权，尚存的原系统组合由同一Body的正常关闭继续归还。
         }
     }
 }
@@ -659,6 +1062,7 @@ pub(super) fn window(frame: NSRect, mtm: MainThreadMarker) -> Retained<NSWindow>
 
 /// 只保存真实提交的标量事实；不保文稿、候选文字、NSTextInputContext或第二正文。
 struct InputObservation {
+    body: std::rc::Weak<NativeMarkdownPagedBody>,
     document: std::rc::Weak<RefCell<MarkdownDocumentBuffer>>,
     marked_seen: Cell<bool>,
     finished: Cell<bool>,
@@ -673,8 +1077,15 @@ impl InputObservation {
     fn start(&self, mode: Mode, window: &NSWindow, view: &NativeMarkdownPagedTextView) {
         let focus_deadline = self.deadline.borrow_mut().take();
         drop(focus_deadline); // 焦点期限先归还；它不能迟到停止正在进行的实际中文组合。
-        let software = matches!(mode, Mode::Software)
-            .then(|| SoftwareInput::new(&self.application, window, view));
+        let software = matches!(mode, Mode::Software).then(|| {
+            SoftwareInput::new(
+                &self.application,
+                window,
+                view,
+                self.body.clone(),
+                self.document.clone(),
+            )
+        });
         *self.software.borrow_mut() = software.clone();
         self.started.set(true);
         let seconds = if software.is_some() { 30.0 } else { 300.0 };
@@ -795,12 +1206,12 @@ fn deliver_visible(stage: &str, body: &NativeMarkdownPagedBody, frame: Rc<PaintD
 pub(super) fn run(
     app: &Retained<NSApplication>,
     window: &NSWindow,
-    body: &NativeMarkdownPagedBody,
+    body: &Rc<NativeMarkdownPagedBody>,
     view: &NativeMarkdownPagedTextView,
     document: &std::rc::Weak<RefCell<MarkdownDocumentBuffer>>,
     receipts: &mut Vec<NativeMarkdownPagedBodyResourceReceipts>,
     mode: Mode,
-) {
+) -> Result<(), String> {
     let target_frame = observe(body, Instant::now());
     let target = body
         .request_source_target(NSRange::new(INSERTION, 0))
@@ -834,6 +1245,7 @@ pub(super) fn run(
     );
     assert!(window.makeFirstResponder(Some(view)));
     let observer = Rc::new(InputObservation {
+        body: Rc::downgrade(body),
         document: document.clone(),
         marked_seen: Cell::new(false),
         finished: Cell::new(false),
@@ -846,15 +1258,32 @@ pub(super) fn run(
     body.observe_input(Rc::downgrade(&erased)).unwrap();
     drop(erased); // Body只持原观察者Weak，焦点和输入阶段共用该客户，不另建文稿或输入图。
     let weak = Rc::downgrade(&observer);
+    let updates = Rc::downgrade(&observer);
     let original_window = Weak::from(window);
     let original_view = Weak::from(view);
-    let (focus, first_focus) = FocusNotifications::new(app, window, view, move || {
-        if let (Some(observer), Some(window), Some(view)) =
-            (weak.upgrade(), original_window.load(), original_view.load())
-        {
-            observer.start(mode, &window, &view);
-        }
-    });
+    let (focus, first_focus) = FocusNotifications::new(
+        app,
+        window,
+        view,
+        move || {
+            if let (Some(observer), Some(window), Some(view)) =
+                (weak.upgrade(), original_window.load(), original_view.load())
+            {
+                observer.start(mode, &window, &view);
+            }
+        },
+        move || {
+            if let Some(observer) = updates.upgrade()
+                && observer.started.get()
+            {
+                let driver = observer.software.borrow().clone();
+                if let Some(driver) = driver {
+                    // 只借原通知owner的弱客户；RefCell先归还再进入Native，清理后无槽就早返。
+                    autoreleasepool(|_| driver.host_updated());
+                }
+            }
+        },
+    );
     window.makeKeyAndOrderFront(None);
     app.activate();
     window.orderFrontRegardless();
@@ -863,48 +1292,60 @@ pub(super) fn run(
     let deadline = observer.deadline.borrow_mut().take();
     drop(deadline);
     drop(focus); // 主循环退出时同步撤真实通知；后继历史与资源验收不会重启输入阶段。
-    assert!(
-        observer.started.get(),
-        "系统未完成原窗口真实显示与输入焦点交接：active={} visible={} key={} on_space={} occlusion={:?} original_responder={} original_context={}",
-        app.isActive(),
-        window.isVisible(),
-        window.isKeyWindow(),
-        window.isOnActiveSpace(),
-        window.occlusionState(),
-        window.firstResponder().is_some_and(|responder| {
-            std::ptr::eq::<objc2_app_kit::NSResponder>(&*responder, view.as_super().as_super())
-        }),
-        NSTextInputContext::currentInputContext(view.mtm())
-            .zip(view.inputContext())
-            .is_some_and(|(current, original)| std::ptr::eq(&*current, &*original)),
-    );
-    let software = observer.software.borrow().clone();
+    // run退出即撤观察者的输入接纳权；cleanup可同步unmark，不能把该次清理补签成成功输入。
+    // 原已投递事件只属于这一窗口；失败返回后由父用例关闭它，不再run或挂载后继客户。
+    let started = observer.started.replace(false);
     let completed_before_cleanup = observer.finished.get();
+    let mut failure = (!started).then(|| {
+        format!(
+            "系统未完成原窗口真实显示与输入焦点交接：active={} visible={} key={} on_space={} occlusion={:?} original_responder={} original_context={}",
+            app.isActive(),
+            window.isVisible(),
+            window.isKeyWindow(),
+            window.isOnActiveSpace(),
+            window.occlusionState(),
+            window.firstResponder().is_some_and(|responder| {
+                std::ptr::eq::<objc2_app_kit::NSResponder>(&*responder, view.as_super().as_super())
+            }),
+            NSTextInputContext::currentInputContext(view.mtm())
+                .zip(view.inputContext())
+                .is_some_and(|(current, original)| std::ptr::eq(&*current, &*original)),
+        )
+    });
+    let software = observer.software.borrow_mut().take();
     if let Some(driver) = &software {
-        let keys_delivered = driver.next.get();
+        let presses_posted = driver.next.get();
+        let events_posted = presses_posted * 2; // 原固定九个press，每次只在同一同步栈投递一对。
+        let panel_observed = driver.panel_observation.get().is_some();
         let cleaned = driver.cleanup();
         let original_failure = driver.failed.get(); // 清理发现源身份变化也须保留为本次真实失败。
-        assert!(
-            completed_before_cleanup
+        if failure.is_none()
+            && !(completed_before_cleanup
                 && original_failure.is_none()
-                && keys_delivered == 9
-                && cleaned,
-            "当前IME软件事件序列失败：completed={completed_before_cleanup} original_failure={original_failure:?} keys_delivered={keys_delivered} local_input_cleaned={cleaned}",
-        );
-        assert!(driver.pending.borrow().is_none());
+                && presses_posted == 9
+                && panel_observed
+                && cleaned)
+        {
+            failure = Some(format!(
+                "当前IME软件事件序列失败：completed={completed_before_cleanup} original_failure={original_failure:?} presses_posted={presses_posted} events_posted={events_posted} panel_observed={panel_observed} local_input_cleaned={cleaned}",
+            ));
+        }
     }
-    assert!(
-        completed_before_cleanup,
-        "没有收到实际中文输入法marked到中文提交，不能计作真实IME验收"
-    );
-    assert!(observer.marked_seen.get());
+    if failure.is_none() && !completed_before_cleanup {
+        failure = Some("没有收到实际中文输入法marked到中文提交，不能计作真实IME验收".into());
+    }
+    let marked_seen = observer.marked_seen.get();
+    drop(observer); // 先撤输入弱客户，成功后的历史与失败后的关闭都不能重启输入阶段。
+    drop(software); // 原context与本地软件key owner不能跨入父用例的严格释放终点。
+    if let Some(failure) = failure {
+        return Err(failure); // 父用例先走原唯一关闭/弱票/mmap门，再报告这里的首个真实失败。
+    }
+    assert!(marked_seen);
     verify(document, true);
     assert_eq!(
         view.input_state().unwrap().selection,
         MarkdownTextSelection::caret(INSERTION + 2)
     );
-    drop(observer); // 真实输入阶段结束即撤弱客户；后续自动历史动作不能补签人工中文输入。
-    drop(software); // 原context与本地软件key owner只属于这次输入阶段，不进入历史/释放验收。
     for (command, inserted) in [
         (sel!(undo:), false),
         (sel!(redo:), true),
@@ -931,4 +1372,5 @@ pub(super) fn run(
         matches!(mode, Mode::Software),
         matches!(mode, Mode::Manual),
     );
+    Ok(())
 }
