@@ -36,6 +36,7 @@ mod selection_actions;
 mod semantic_snapshot;
 mod source_session;
 mod subscript;
+mod system_ime;
 #[cfg(feature = "native-table-row-append")]
 mod table_append;
 mod terminal;
@@ -51,6 +52,9 @@ fn step<T>(current: &impl Fn() -> bool, work: impl FnOnce() -> T) -> Result<T, S
 pub use hosted_workload::{
     NativeMarkdownHostedFlow, NativeMarkdownHostedStep, NativeMarkdownHostedWorkload,
     write_native_markdown_giant_paragraph_fixture, write_native_markdown_memory_fixture,
+};
+pub use system_ime::{
+    NativeMarkdownHostedImeProbe, NativeMarkdownHostedImeStep, write_native_markdown_ime_fixture,
 };
 #[cfg(feature = "native-table-row-append")]
 pub(in crate::native_surface) use table_append::wait_for_paged_cell;

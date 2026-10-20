@@ -38,9 +38,10 @@ pub mod native_surface;
 
 #[cfg(all(target_os = "macos", feature = "native-markdown-runtime-probe"))]
 pub use native_surface::{
-    NativeMarkdownHostedFlow, NativeMarkdownHostedStep, NativeMarkdownHostedWorkload,
-    NativeMarkdownRuntimeProbeCompletion, NativeMarkdownRuntimeProbeSession,
-    run_native_markdown_runtime_probe, write_native_markdown_giant_paragraph_fixture,
+    NativeMarkdownHostedFlow, NativeMarkdownHostedImeProbe, NativeMarkdownHostedImeStep,
+    NativeMarkdownHostedStep, NativeMarkdownHostedWorkload, NativeMarkdownRuntimeProbeCompletion,
+    NativeMarkdownRuntimeProbeSession, run_native_markdown_runtime_probe,
+    write_native_markdown_giant_paragraph_fixture, write_native_markdown_ime_fixture,
     write_native_markdown_memory_fixture,
 };
 
