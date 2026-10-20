@@ -16,14 +16,34 @@ struct Entry {
     request: MaskPaletteRequest,
     tables: [Option<MaskCalibrationTable>; 2],
     attempted: [bool; 2],
+    used_for_frame: bool,
 }
 
-/// 固定最多两组端点、每组两个模式；全部纯表仍计原32MiB页账，原候选结束就归还。
+/// Surface仅保最多两组端点、每组两个模式的纯输出表，最多1MiB并计原32MiB页账。
+/// 校准固定sRGB/RGBA8输出、Gray8 mask、256²和1x；不依赖窗口、主题、字体或Source。
+/// 表只证明这些精确RGB端点与blend的合成结果，每个新调色板仍逐色certify。
 #[derive(Default)]
 pub(super) struct Calibrations {
     entries: Vec<Entry>,
 }
 impl Calibrations {
+    /// 新候选保留已认证纯表，仅重新开放原两端点的本帧额度；不扩大Native尝试上限。
+    /// 没有表的预算miss只约束旧帧，不能令后来的合法可用预算永久失去校准机会。
+    pub(super) fn begin_frame(&mut self) {
+        for entry in &mut self.entries {
+            entry.used_for_frame = false;
+            for (attempted, table) in entry.attempted.iter_mut().zip(&entry.tables) {
+                *attempted = table.is_some();
+            }
+        }
+    }
+
+    pub(super) fn has_pages(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.tables.iter().any(Option::is_some))
+    }
+
     pub(super) fn pairs(
         &mut self,
         request: &MaskPaletteRequest,
@@ -37,8 +57,21 @@ impl Calibrations {
             .position(|entry| entry.request.same_endpoints(request))
         {
             Some(index) => index,
-            None if self.entries.len() == MAX_ENDPOINTS => return Ok(None),
             None => {
+                if self.entries.len() == MAX_ENDPOINTS {
+                    let Some(unused) = self.entries.iter().position(|entry| !entry.used_for_frame)
+                    else {
+                        return Ok(None); // 第三组仍走原lossless表示，不为跨帧复用扩大本帧校准额度。
+                    };
+                    // 只淘汰本帧尚未消费的旧颜色。纯表在建立新Native图之前实际munmap，
+                    // 两组端点不会永久锁死最早颜色，也不会短暂多保第三组输出页。
+                    drop(self.entries.remove(unused));
+                    if pixels.observer().snapshot().release_failed {
+                        return Err(NativeMarkdownPagedTextViewError::Raster(
+                            "旧校准纯颜色表未能实际归还".into(),
+                        ));
+                    }
+                }
                 if self.entries.capacity() == 0 {
                     self.entries.reserve_exact(MAX_ENDPOINTS);
                 }
@@ -46,10 +79,12 @@ impl Calibrations {
                     request: request.clone(),
                     tables: [None, None],
                     attempted: [false; 2],
+                    used_for_frame: false,
                 });
                 self.entries.len() - 1
             }
         }; // 模式不是新的端点组；第二组实际颜色仍保留自己的两个固定槽。
+        self.entries[endpoint].used_for_frame = true;
         for (mode, blend) in [
             MaskPairBlend::ForegroundThenForeground,
             MaskPairBlend::ForegroundThenBackground,

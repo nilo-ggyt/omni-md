@@ -103,7 +103,6 @@ struct Staging {
     prepared: Option<PreparedTileEncodingPlan>,
     certificates: [Option<CertifiedMaskPairs>; 4],
     next_region: usize,
-    calibrations: calibration::Calibrations,
 }
 pub(super) enum Advance {
     Pending(Candidate),
@@ -144,16 +143,33 @@ impl Candidate {
         serial: u64,
         scene: &SceneUse,
         geometry: Geometry,
-        pixels: Arc<NativeMarkdownViewportPixels>,
+        surface: &CpuSurface,
         reusable: std::rc::Weak<TileFrame>,
     ) -> Result<Self> {
+        let bitmap =
+            match TiledBitmap::new(geometry.width, geometry.height, Arc::clone(&surface.pixels)) {
+                Err(crate::native_surface::viewport_pixels::PixelError::BudgetExceeded)
+                    if surface.clear_calibrations() =>
+                {
+                    // 此构造到预算拒绝为止没有Native、mmap或绘图副作用。先实际归还可选表页，
+                    // 再核同一个候选的原预检，不能因优化常驻页缩小用户原本可绘制的视口。
+                    if surface.pixels.observer().snapshot().release_failed {
+                        return Err(NativeMarkdownPagedTextViewError::Raster(
+                            "预算预检前校准纯颜色表未能实际归还".into(),
+                        ));
+                    }
+                    TiledBitmap::new(geometry.width, geometry.height, Arc::clone(&surface.pixels))?
+                }
+                other => other?,
+            };
+        surface.calibrations.borrow_mut().begin_frame(); // 纯Rust额度转移，不查询新Scene或续原权限。
         Ok(Self {
             serial,
             key: scene.key.clone(),
             geometry,
             ticket: Ticket::new(&scene.origin),
             scene: Rc::clone(&scene.scene),
-            bitmap: TiledBitmap::new(geometry.width, geometry.height, pixels)?,
+            bitmap,
             writable: None,
             staging: Box::default(),
             session: None,
@@ -270,12 +286,19 @@ impl Candidate {
         let index = self.staging.next_region;
         let pairs = if let Some(request) = prepared.mask_request(index)? {
             // 把有限纯事实槽移到借用外，Native/current重入期间没有借用Candidate内部容器。
-            let mut calibrations = std::mem::take(&mut self.staging.calibrations);
+            let mut calibrations = std::mem::take(&mut *surface.calibrations.borrow_mut());
             let pairs = calibrations.pairs(&request, Arc::clone(&surface.pixels), &|| {
                 self.validate(surface, view)
             });
-            self.staging.calibrations = calibrations;
-            self.validate(surface, view)?;
+            let current = self.validate(surface, view);
+            if pairs.is_ok() && current.is_ok() {
+                // Native可关闭或撤销原候选；只有原serial/Source/几何全部仍成立才归还纯表。
+                // 取出期间Surface槽为空，重入取消不会借用冲突；失权局部值直接drop，不复活旧页。
+                drop(surface.calibrations.replace(calibrations));
+            } else {
+                drop(calibrations);
+            }
+            current?; // 真实Source/Font首错仍高于校准拒绝或原生撤权。
             pairs?
         } else {
             None // 固色、透明或原中性A8不必加载双色校准图，保持旧表示与功能。
@@ -303,7 +326,6 @@ impl Candidate {
         if self.bitmap.next_tile().is_some() {
             Ok(Advance::Pending(self)) // 所有tile完成前仍不展示部分候选。
         } else {
-            drop(std::mem::take(&mut self.staging.calibrations)); // 发布前实际归还校准纯表页，不留在Published或idle。
             self.validate(surface, view)?;
             if surface.pixels.observer().snapshot().release_failed {
                 return Err(NativeMarkdownPagedTextViewError::Raster(

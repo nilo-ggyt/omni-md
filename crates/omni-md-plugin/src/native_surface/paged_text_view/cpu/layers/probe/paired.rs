@@ -25,7 +25,8 @@ fn fixture(
     counters: Arc<NativeMarkdownViewportPixels>,
     case: PaletteCase,
 ) -> Result<TileFrame> {
-    fixture_with_prior(source, counters, None, false, case)
+    let mut calibrations = Calibrations::default();
+    fixture_with_prior(source, counters, None, false, case, &mut calibrations)
 }
 
 fn fixture_with_prior(
@@ -34,6 +35,7 @@ fn fixture_with_prior(
     prior: Option<&TileFrame>,
     change_pixel: bool,
     case: PaletteCase,
+    calibrations: &mut Calibrations,
 ) -> Result<TileFrame> {
     let base = [19_u8, 21, 28];
     let ink = [219_u8, 224, 235];
@@ -113,7 +115,7 @@ fn fixture_with_prior(
         }
     }
     let mut bitmap = TiledBitmap::new(WIDTH, HEIGHT, counters.clone())?;
-    let mut calibrations = Calibrations::default();
+    calibrations.begin_frame(); // 同一Surface的后继候选只开放本帧额度，原纯表继续逐色认证。
     while let Some(tile) = bitmap.next_tile() {
         let writable = bitmap.begin_tile(tile)?;
         let row = CGBitmapContextGetBytesPerRow(Some(writable.context()));
@@ -136,7 +138,6 @@ fn fixture_with_prior(
         };
         bitmap.finish_prepared(prepared, pairs.as_ref(), prior)?;
     }
-    drop(calibrations); // 原候选结束前归还校准页，不能将纯表藏到原帧或闲置插件中。
     let frame = bitmap.finish()?;
     if frame.tiles.len() != 2
         || !matches!(
@@ -156,52 +157,125 @@ fn fixture_with_prior(
 fn paired_reuse(case: PaletteCase) -> Result<()> {
     let counters = Arc::new(NativeMarkdownViewportPixels::default());
     let observer = counters.observer();
-    autoreleasepool(|_| -> Result<()> {
+    let (result, detached, weaks) = autoreleasepool(|_| -> Result<_> {
         let mut source = Canvas::new()?;
-        let original = fixture(&mut source, counters.clone(), case)?;
-        let same = fixture_with_prior(&mut source, counters.clone(), Some(&original), false, case)?;
-        let changed =
-            fixture_with_prior(&mut source, counters.clone(), Some(&original), true, case)?;
-        let left = &original.tiles[0];
-        let equal = &same.tiles[0];
-        let altered = &changed.tiles[0];
-        let first_equal = std::ptr::eq::<CGImage>(&*left.image, &*equal.image);
-        let second_equal = std::ptr::eq::<CGImage>(
-            left.secondary_image
-                .as_deref()
-                .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?,
-            equal
-                .secondary_image
-                .as_deref()
-                .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?,
-        );
-        let first_changed = !std::ptr::eq::<CGImage>(&*left.image, &*altered.image);
-        let second_changed = !std::ptr::eq::<CGImage>(
-            left.secondary_image
-                .as_deref()
-                .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?,
-            altered
-                .secondary_image
-                .as_deref()
-                .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?,
-        );
-        let valid = same.reused_images == 2
-            && changed.reused_images == 1
-            && first_equal
-            && second_equal
-            && first_changed
-            && second_changed;
-        println!(
-            "paged_paired_reuse case={case:?} actual_same_tile_reuses={} actual_changed_tile_reuses={} actual_both_equal={first_equal}/{second_equal} actual_both_changed={first_changed}/{second_changed} formal=false",
-            same.reused_images, changed.reused_images
-        );
-        drop((original, same, changed, source));
+        let bounds = NSRect::new(NSPoint::ZERO, NSSize::new(WIDTH as f64, HEIGHT as f64));
+        let backing = CALayer::new();
+        backing.setFrame(bounds);
+        backing.setBounds(bounds);
+        let pool = LayerPool::new(&|| true)?;
+        backing.addSublayer(pool.mount());
+        let mut weaks = pool.weaks();
+        weaks.push(layer_weak(&backing));
+        // 原帧、等值后继和真实单像素修改共享同一有限纯表，模拟Surface的真实存活期。
+        // 每次仍走原Native层发布和完整RGBA差分，不能用复用次数证明颜色正确。
+        let mut calibrations = Calibrations::default();
+        let result = (|| -> Result<()> {
+            let original = fixture_with_prior(
+                &mut source,
+                counters.clone(),
+                None,
+                false,
+                case,
+                &mut calibrations,
+            )?;
+            render_exact(&pool, &backing, &original, &source, bounds)?;
+            weaks.extend(pool.weaks());
+            let same = fixture_with_prior(
+                &mut source,
+                counters.clone(),
+                Some(&original),
+                false,
+                case,
+                &mut calibrations,
+            )?;
+            render_exact(&pool, &backing, &same, &source, bounds)?;
+            weaks.extend(pool.weaks());
+            let changed = fixture_with_prior(
+                &mut source,
+                counters.clone(),
+                Some(&original),
+                true,
+                case,
+                &mut calibrations,
+            )?;
+            render_exact(&pool, &backing, &changed, &source, bounds)?;
+            weaks.extend(pool.weaks());
+            let left = &original.tiles[0];
+            let equal = &same.tiles[0];
+            let altered = &changed.tiles[0];
+            let first_equal = std::ptr::eq::<CGImage>(&*left.image, &*equal.image);
+            let second_equal = std::ptr::eq::<CGImage>(
+                left.secondary_image
+                    .as_deref()
+                    .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?,
+                equal
+                    .secondary_image
+                    .as_deref()
+                    .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?,
+            );
+            let first_changed = !std::ptr::eq::<CGImage>(&*left.image, &*altered.image);
+            let second_changed = !std::ptr::eq::<CGImage>(
+                left.secondary_image
+                    .as_deref()
+                    .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?,
+                altered
+                    .secondary_image
+                    .as_deref()
+                    .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?,
+            );
+            let valid = same.reused_images == 2
+                && changed.reused_images == 1
+                && first_equal
+                && second_equal
+                && first_changed
+                && second_changed;
+            println!(
+                "paged_paired_reuse case={case:?} actual_same_tile_reuses={} actual_changed_tile_reuses={} actual_both_equal={first_equal}/{second_equal} actual_both_changed={first_changed}/{second_changed} all_three_native_frames_pixel_exact=true shared_surface_calibration=true formal=false",
+                same.reused_images, changed.reused_images
+            );
+            if !valid {
+                return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
+            }
+            Ok(())
+        })();
+        let detached = pool.detach(&backing); // 任何差分或构造失败都先清原Native关系，不靠早返越过归还。
+        drop((calibrations, source, pool, backing)); // Surface结束同时归还纯表及真实provider/context。
         CATransaction::flush();
-        if !valid || !observer.is_released() {
-            return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
-        }
-        Ok(())
-    })
+        Ok((result, detached, weaks))
+    })?;
+    result?;
+    if !detached || !weaks.iter().all(|weak| weak.load().is_none()) || !observer.is_released() {
+        return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
+    }
+    Ok(())
+}
+
+/// 同一实际Native图发布后，完整比较原RGBA图合成结果；配对与半透明右格均不能丢色。
+fn render_exact(
+    pool: &LayerPool,
+    backing: &CALayer,
+    frame: &TileFrame,
+    source: &Canvas,
+    bounds: NSRect,
+) -> Result<()> {
+    let reference = CGBitmapContextCreateImage(Some(&source.context))
+        .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
+    let baseline = Canvas::new()?;
+    baseline.blue(bounds);
+    CGContext::draw_image(Some(&baseline.context), bounds, Some(&reference));
+    CGContext::flush(Some(&baseline.context));
+    let rendered = Canvas::new()?;
+    rendered.blue(bounds);
+    let attempt = pool.attempt()?;
+    let publication = pool.publish(backing, frame, &attempt, bounds, 1.0, &|| true)?;
+    pool.validate(backing, &publication, &|| true)?;
+    pool.mount().renderInContext(&rendered.context);
+    CGContext::flush(Some(&rendered.context));
+    if rendered.pixels != baseline.pixels {
+        return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -33,6 +33,9 @@ pub(super) struct CpuSurface {
     published: RefCell<Option<Rc<Published>>>,
     reuses: Cell<usize>,
     candidate: RefCell<Option<candidate::Candidate>>,
+    // 只跨本Surface帧保有限原生合成纯表；没有Scene、Input、provider或CALayer强边。
+    // Native校准前整槽移出，关闭重入与表的实际munmap均不穿过RefCell借用。
+    calibrations: RefCell<calibration::Calibrations>,
     active_serial: Cell<Option<u64>>,
     next_serial: Cell<u64>,
     scheduled: Cell<Option<u64>>,
@@ -137,6 +140,7 @@ impl CpuSurface {
             published: RefCell::new(None),
             reuses: Cell::new(0),
             candidate: RefCell::new(None),
+            calibrations: RefCell::default(),
             active_serial: Cell::new(None),
             next_serial: Cell::new(0),
             scheduled: Cell::new(None),
@@ -210,19 +214,25 @@ impl CpuSurface {
     /// AppKit 显示回调获取的是此刻画面；获取期间旧输入或几何已换代时，只放弃该次请求。
     /// 原客户捕获失败、真正的资源错误以及 Ready 后的 CPU/图层检查仍由原失败边界处理。
     pub(super) fn paint_current(self: &Rc<Self>, view: &NativeMarkdownPagedTextView) -> Result<()> {
-        let origin = view.origin()?;
-        let ticket = candidate::Ticket::new(&origin);
-        let scene = match view.scene_for_origin(origin) {
-            Ok(scene) => scene,
-            Err(NativeMarkdownPagedTextViewError::Pending) => {
-                return Ok(()); // 唯一布局任务已排队；不发布像素，也不把旧图冒充新 Ready。
-            }
-            Err(NativeMarkdownPagedTextViewError::Revoked) if ticket.superseded(view)? => {
-                return Ok(()); // 只认原客户、完整 Input 或几何的真实换代，不凭 !scene_current 放行。
-            }
-            Err(cause) => return Err(cause),
-        };
-        self.paint(view, &scene) // Ready 后不再借获取期票据吞掉 Source、字体或 Native 所有权错误。
+        let result = (|| {
+            let origin = view.origin()?;
+            let ticket = candidate::Ticket::new(&origin);
+            let scene = match view.scene_for_origin(origin) {
+                Ok(scene) => scene,
+                Err(NativeMarkdownPagedTextViewError::Pending) => {
+                    return Ok(()); // 唯一布局任务已排队；不发布像素，也不把旧图冒充新 Ready。
+                }
+                Err(NativeMarkdownPagedTextViewError::Revoked) if ticket.superseded(view)? => {
+                    return Ok(()); // 只认原客户、完整 Input 或几何的真实换代，不凭 !scene_current 放行。
+                }
+                Err(cause) => return Err(cause),
+            };
+            self.paint(view, &scene) // Ready 后不再借获取期票据吞掉 Source、字体或 Native 所有权错误。
+        })();
+        if result.is_err() {
+            self.clear_calibrations(); // 获取、重入健康检查或显示真实失败均归还优化页，原typed首错不变。
+        }
+        result
     }
 
     fn paint(self: &Rc<Self>, view: &NativeMarkdownPagedTextView, scene: &SceneUse) -> Result<()> {
@@ -312,8 +322,7 @@ impl CpuSurface {
             .as_ref()
             .and_then(|published| published.frame.borrow().as_ref().map(Rc::downgrade))
             .unwrap_or_default();
-        let candidate =
-            candidate::Candidate::new(serial, scene, geometry, Arc::clone(&self.pixels), reusable);
+        let candidate = candidate::Candidate::new(serial, scene, geometry, self, reusable);
         match candidate {
             Ok(candidate) => self.advance(view, candidate),
             Err(error) => {
@@ -325,11 +334,22 @@ impl CpuSurface {
 
     /// 任何新原票或关闭只取消本surface候选；排队闭包仅含Weak，不保这些资源。
     pub(super) fn cancel_candidate(&self) {
-        self.active_serial.set(None);
+        let active = self.active_serial.replace(None).is_some();
         self.scheduled.set(None);
         self.deferred.set(None);
         let candidate = self.candidate.borrow_mut().take();
         drop(candidate); // 借用先归还，再真实drop会话/context和已封存的有限tiles。
+        if active {
+            self.clear_calibrations(); // 真取消未完帧立即归还表；没有候选的普通Scene退休保有限纯事实。
+        }
+    }
+
+    /// 实际归还全部纯表；返回是否确有优化状态可淘汰，不把预算拒绝变成通用重试。
+    fn clear_calibrations(&self) -> bool {
+        let calibrations = std::mem::take(&mut *self.calibrations.borrow_mut());
+        let occupied = calibrations.has_pages();
+        drop(calibrations); // 最后Arc的munmap在槽借用结束后执行，失败仍留在原像素释放收据。
+        occupied
     }
 
     /// 单格准入后归还真实绘图读取；同步paint仍在栈上时拒绝，不以取消标志冒充其析构。
@@ -534,6 +554,7 @@ impl CpuSurface {
     pub(super) fn detach(&self, view: &NativeMarkdownPagedTextView) -> Result<()> {
         self.repaint_requested.set(false); // 关闭不复活较早的显示请求；标量本身没有异步业务强边。
         self.cancel_candidate(); // 先归还所有Pending session/context，不让真实业务数据躲在主队列任务里。
+        self.clear_calibrations(); // idle也可能持纯表；原Surface关闭不能靠稍后Rust owner析构归还。
         let published = self.published.borrow_mut().take();
         drop(published);
         let actual = view.layer();
