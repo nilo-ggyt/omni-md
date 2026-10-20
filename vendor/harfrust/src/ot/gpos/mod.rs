@@ -507,29 +507,26 @@ mod tests {
         positions.commit_len(40);
         let observer = positions.resource_observer();
         let active = observer.snapshot();
-        // 小任务只拥有一个真实64 KiB工作块，不应为了沿用旧断言创建匿名文件。
+        // 小任务只拥有实际所需的有限工作块；不能把64KiB上限当作固定分配大小。
+        assert!(active.work_bytes > 0 && active.work_bytes <= 64 * 1024);
+        assert_eq!(active.peak_work_bytes, active.work_bytes);
         assert_eq!(
-            (
-                active.work_bytes,
-                active.peak_work_bytes,
-                active.files_open,
-                active.mappings_open,
-                active.mapped_bytes
-            ),
-            (64 * 1024, 64 * 1024, 0, 0, 0)
+            (active.files_open, active.mappings_open, active.mapped_bytes),
+            (0, 0, 0)
         );
         let prefix = AdvancePrefixes::build(&positions, 40).unwrap();
         // 前缀实际分配第二个工作块，必须计入positions的原scope，而非另建任务漏计。
         let with_prefix = observer.snapshot();
+        assert!(with_prefix.work_bytes > active.work_bytes);
+        assert!(with_prefix.work_bytes - active.work_bytes <= 64 * 1024);
+        assert_eq!(with_prefix.peak_work_bytes, with_prefix.work_bytes);
         assert_eq!(
             (
-                with_prefix.work_bytes,
-                with_prefix.peak_work_bytes,
                 with_prefix.files_open,
                 with_prefix.mappings_open,
                 with_prefix.mapped_bytes
             ),
-            (128 * 1024, 128 * 1024, 0, 0, 0)
+            (0, 0, 0)
         );
         drop(prefix);
         let without_prefix = observer.snapshot();
@@ -542,7 +539,7 @@ mod tests {
                 without_prefix.mappings_open,
                 without_prefix.mapped_bytes
             ),
-            (64 * 1024, 128 * 1024, 0, 0, 0)
+            (active.work_bytes, with_prefix.peak_work_bytes, 0, 0, 0)
         );
         drop(positions);
         let ended = observer.snapshot();
@@ -555,7 +552,7 @@ mod tests {
                 ended.mapped_bytes,
                 ended.peak_mapped_bytes
             ),
-            (0, 128 * 1024, 0, 0, 0, 0)
+            (0, with_prefix.peak_work_bytes, 0, 0, 0, 0)
         );
         assert_eq!((ended.files_created, ended.mappings_created), (0, 0));
         assert_eq!(ended.files_created, ended.files_closed);

@@ -130,6 +130,83 @@ fn real_piece_byte_splits_preserve_global_utf16_clusters_and_exact_shaper_fields
 }
 
 #[test]
+fn real_short_and_growing_shapes_keep_complete_glyphs_and_release_actual_storage() {
+    // 同一公开Job逐小批输入：极短项、小工作区增长以及真实64KiB溢出都必须保留完整字形。
+    // 只核原文本的实际结果与FD/映射归还，不读取分配器私态或断言内部增长次数。
+    for units in [7, 600, 2400, 4000] {
+        let text = "x".repeat(units);
+        let (directory, document) = document(&text);
+        let mapping = document.original_backing_observer().unwrap();
+        let source = MarkdownLayoutTextSource::capture(&document);
+        let source_authority = source.authority();
+        let font = font();
+        let font_authority = font.authority();
+        let mut job = MarkdownShapingJob::new(
+            source.clone(),
+            &source_authority,
+            font.clone(),
+            &font_authority,
+            0..source.utf16_len(),
+            options(*b"Latn", MarkdownShapingDirection::LeftToRight),
+        )
+        .unwrap();
+        let observer = job.resource_observer();
+        fill(&mut job, &source_authority, &font_authority, 4096, 256);
+        job.shape(&source_authority, &font_authority).unwrap();
+        assert_eq!(job.profile().unwrap().glyph_count, units);
+        assert!(job.profile().unwrap().source_borrow_max_bytes <= 4096);
+        let first = job
+            .glyph(&source_authority, &font_authority, 0)
+            .unwrap()
+            .unwrap();
+        assert!(first.glyph_id != 0 && first.x_advance > 0);
+        for index in 0..units {
+            let actual = job
+                .glyph(&source_authority, &font_authority, index)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.source_utf16_cluster, index);
+            assert_eq!(actual.glyph_id, first.glyph_id);
+            assert_eq!(actual.x_advance, first.x_advance);
+        }
+        assert!(
+            job.glyph(&source_authority, &font_authority, units)
+                .unwrap()
+                .is_none()
+        );
+        if units <= 2400 {
+            let active = observer.paging.snapshot();
+            assert!(active.work_bytes > 0);
+            assert_eq!((active.files_created, active.mappings_created), (0, 0));
+        } else {
+            assert!(observer.paging.snapshot().files_created > 0);
+        } // 小项不能因首次块变小而提前落盘；超过原64KiB仍必须走原文件分页。
+        assert!(!document.is_dirty() && !document.can_undo() && !document.can_redo());
+        assert_eq!(
+            std::fs::read(directory.path().join("bounded-shaping.md")).unwrap(),
+            text.as_bytes()
+        );
+        drop(job);
+        let closed = observer.paging.snapshot();
+        assert_eq!(
+            (
+                closed.work_bytes,
+                closed.files_open,
+                closed.mappings_open,
+                closed.mapped_bytes
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(closed.files_created, closed.files_closed);
+        assert_eq!(closed.mappings_created, closed.mappings_released);
+        assert!(!closed.cleanup_failed && closed.first_error.is_none());
+        drop((source, font, document));
+        assert!(observer.resources_released());
+        assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0 && !mapping.failed());
+    }
+}
+
+#[test]
 fn invalid_foreign_authority_poisoning_closes_real_arrays_and_never_recovers() {
     let (_directory, document) = document("office a\u{301}🙂");
     let source = MarkdownLayoutTextSource::capture(&document);

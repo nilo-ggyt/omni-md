@@ -379,6 +379,19 @@ fn forward_small_leaf_windows_keep_far_directed_selection_under_original_work_li
         else {
             panic!("同一真实普通段落的小窗必须完成样式，range={range:?}");
         };
+        // 同一发布的结构层只证明无表：连续小窗必须各自裁剪真实 Gap，不能把整个段落
+        // 或上一窗的覆盖当成本窗结果；真正的默认样式仍由下方原 Leaf 查询独立证明。
+        let table = previous.table_sources_for(&doc, authority(&doc)).unwrap();
+        assert!(table.windows_for(&doc).unwrap().next().is_none());
+        let [
+            crate::markdown_document_buffer::MarkdownTableViewportCoverage::Gap {
+                utf16_range, ..
+            },
+        ] = table.coverage_for(&doc).unwrap()
+        else {
+            panic!("普通段落小窗必须保留自己的真实无表分区");
+        };
+        assert_eq!(utf16_range, &range);
         for local in [0, 1, 2, 3, 4, 5] {
             let at = range.start + local;
             let query = leaf.query_for(&doc, authority(&doc), at).unwrap().unwrap();
@@ -394,6 +407,184 @@ fn forward_small_leaf_windows_keep_far_directed_selection_under_original_work_li
         source.as_bytes()
     );
     drop((previous, request, doc));
+    assert_eq!(backing.mapped_bytes(), 0);
+    assert_eq!(backing.managed_resident_bytes(), 0);
+}
+
+#[test]
+fn forward_structure_and_gap_pruning_preserve_real_cell_semantics_after_reposition() {
+    // 原 Global 先交普通 Gap，再交真正结构表；每次只请求行首一个单元，不把物理行截短。
+    // 最后从尾 Gap 返回粗体格，必须沿公开 reposition 恢复原来源与内联语义。
+    let source =
+        "前段甲😀乙\n\n| H |\n| --- |\n| **粗体** |\n| *斜体* |\n| `代码` |\n\n尾段甲😀乙xyz\n";
+    let (directory, mut doc) = document(source);
+    let backing = doc.original_backing_observer().unwrap();
+    let (mut request, mut previous) = leaf_sources(&doc, 0..1);
+    let mut previous_start = 0;
+    let header_byte = source.find("| H |").unwrap();
+    let tail = source.find("尾段").unwrap();
+    // None是实际普通尾段；其余固定原行既核公开物理身份，也核实际每格的强/弱/代码样式。
+    // 重复的粗体行有明确用户行为意义：它位于尾段之前，不能沿前向游标假签旧行。
+    for cell in [
+        Some((
+            "| **粗体** |\n",
+            "粗体",
+            1,
+            MarkdownPresentationStyles::STRONG,
+        )),
+        Some((
+            "| *斜体* |\n",
+            "斜体",
+            2,
+            MarkdownPresentationStyles::EMPHASIS,
+        )),
+        Some((
+            "| `代码` |\n",
+            "代码",
+            3,
+            MarkdownPresentationStyles::INLINE_CODE,
+        )),
+        None,
+        Some((
+            "| **粗体** |\n",
+            "粗体",
+            1,
+            MarkdownPresentationStyles::STRONG,
+        )),
+    ] {
+        let byte_start = cell.map_or(tail, |(line, _, _, _)| source.find(line).unwrap());
+        let start = units(source, byte_start..byte_start).start;
+        let range = start..start + 1;
+        if start < previous_start {
+            request
+                .reposition(&doc, &previous, range.clone(), authority(&doc))
+                .unwrap();
+        } else {
+            request
+                .continue_forward(&doc, &previous, range.clone(), authority(&doc))
+                .unwrap();
+        }
+        drop(previous); // 已准入的旧发布归还后，仍只推进原唯一请求及累计额度。
+        finish_sources(&mut request, &doc).unwrap();
+        previous = request
+            .take_sources_for(&doc, authority(&doc))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            previous.requested_for(&doc, authority(&doc)).unwrap(),
+            &range
+        );
+        let Some((line, word, ordinal, expected)) = cell else {
+            // 表已离开当前窗口时，结构表目录不能被空阶段选择遗漏，仍须真正裁掉。
+            assert!(
+                previous
+                    .table_row_at_for(&doc, authority(&doc), start)
+                    .unwrap()
+                    .is_none()
+            );
+            let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = previous
+                .ordinary_semantics_for(&doc, authority(&doc))
+                .unwrap()
+            else {
+                panic!("表后的真实普通段落必须有当前覆盖");
+            };
+            assert_eq!(
+                leaf.query_for(&doc, authority(&doc), start)
+                    .unwrap()
+                    .unwrap()
+                    .styles,
+                MarkdownPresentationStyles::default()
+            );
+            previous_start = start;
+            continue;
+        };
+        let row = previous
+            .table_row_at_for(&doc, authority(&doc), start)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.coordinate_for(&doc, authority(&doc)).unwrap(),
+            (header_byte, ordinal, 1)
+        );
+        assert_eq!(
+            row.physical_utf16_range_for(&doc, authority(&doc)).unwrap(),
+            units(source, byte_start..byte_start + line.len())
+        );
+        request
+            .prepare_cell_inline(&doc, row, authority(&doc), 0)
+            .unwrap();
+        // 单格真正借原 scope/raw source/Parser 完成；结构行 Ready 不能代替实际字符样式。
+        let mut complete = false;
+        for _ in 0..source.len() * 100 {
+            let step = request
+                .advance_cell_inline(&doc, authority(&doc), 4096)
+                .unwrap();
+            let (MarkdownTableCellInlineStep::Progress { work }
+            | MarkdownTableCellInlineStep::Ready { work }) = step;
+            assert!(work.source_bytes <= 4096 && work.structural_transitions <= 4096);
+            if matches!(step, MarkdownTableCellInlineStep::Ready { .. }) {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete, "有限真实格必须完成全部内联语义");
+        let inline = request
+            .take_cell_inline_ready_for(&doc, authority(&doc))
+            .unwrap()
+            .unwrap();
+        let word_byte = byte_start + line.find(word).unwrap();
+        let at = units(source, word_byte..word_byte).start;
+        let query = inline
+            .query_for(&doc, authority(&doc), at)
+            .unwrap()
+            .unwrap();
+        assert!(query.utf16_range.contains(&at) && query.styles.contains(expected));
+        previous_start = start;
+    }
+    // 在恢复的非空结构页上取消后继，旧真实发布仍可读，但任务不能再产生新来源。
+    request
+        .continue_forward(
+            &doc,
+            &previous,
+            units(source, tail..tail + "尾".len()),
+            authority(&doc),
+        )
+        .unwrap();
+    request.cancel();
+    assert_eq!(
+        request.advance(&doc, authority(&doc), 4096).err(),
+        Some(MarkdownTableRequestError::Cancelled)
+    );
+    assert!(
+        previous
+            .table_row_at_for(&doc, authority(&doc), previous_start)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(doc.generation(), 0);
+    assert!(!doc.can_undo() && !doc.can_redo());
+    // 真实编辑再Undo虽恢复字面值，仍是新代次；已取消的请求和旧结构发布都不能补签新来源。
+    doc.replace_utf16_range(0..1, "新", MarkdownTextSelection::caret(1))
+        .unwrap();
+    doc.undo().unwrap();
+    assert!(doc.generation() > 0 && doc.can_redo() && !doc.is_dirty());
+    assert_eq!(
+        previous
+            .table_row_at_for(&doc, authority(&doc), previous_start)
+            .err(),
+        Some(MarkdownTableRequestError::SourceSuperseded)
+    );
+    assert_eq!(
+        request.advance(&doc, authority(&doc), 4096).err(),
+        Some(MarkdownTableRequestError::Cancelled)
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+        source.as_bytes()
+    );
+    // 所有请求、原 publication 与文档都归还后，再核真实映射；不观察私有 phase 或句柄计数。
+    drop((previous, request, doc));
+    assert!(backing.unmap_succeeded() && !backing.failed());
     assert_eq!(backing.mapped_bytes(), 0);
     assert_eq!(backing.managed_resident_bytes(), 0);
 }

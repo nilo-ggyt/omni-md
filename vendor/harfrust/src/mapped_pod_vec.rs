@@ -22,6 +22,8 @@ use std::{
 };
 
 const BUCKET_BYTES: usize = 64 * 1024;
+// 很短的原整形项只分配实际小工作区；64KiB仍是转文件的唯一上界，不设池或跨任务库存。
+const MIN_WORK_BYTES: usize = 4 * 1024;
 const WINDOWS: usize = 8;
 mod platform;
 mod resources;
@@ -300,11 +302,11 @@ struct Mapping {
     state: PageState,
 }
 impl Mapping {
-    /// 只为实际非空小输入懒分配一个固定块；不会按Source长度或调用预算增长heap。
-    fn workspace<T: Pod>(scope: PagingScope, bounded: bool) -> Option<Self> {
-        let layout = Layout::from_size_align(BUCKET_BYTES, align_of::<T>())
+    /// 工作区只按本次实际所需字节增长，仍不超过原64KiB；不按Source总长或调用预算预留。
+    fn workspace<T: Pod>(scope: PagingScope, bounded: bool, bytes: usize) -> Option<Self> {
+        let layout = Layout::from_size_align(bytes, align_of::<T>())
             .expect("非零且不超过64KiB的真实Pod必须具有有效分配Layout");
-        // SAFETY: Layout满足T的原对齐，大小固定64KiB；全零是Pod的有效表示。
+        // SAFETY: Layout满足T的原对齐，大小来自已核的有限工作区；全零是Pod的有效表示。
         // 原Layout连同owner保存，任何cast或溢出转换都不会改用mmap的释放方法。
         let base = NonNull::new(unsafe { alloc_zeroed(layout) })?;
         scope.allocated_work(layout.size());
@@ -580,109 +582,124 @@ impl<T: Pod> MappedPodVec<T> {
         let Some(required_bytes) = required.checked_mul(size_of::<T>()) else {
             return self.fail();
         };
-        if self.map.is_none() && required_bytes <= BUCKET_BYTES {
-            // 空容器的首次真实使用才创建小工作区；溢出已经进入File的owner永不退回heap。
+        let candidate = if required_bytes <= BUCKET_BYTES
+            && self
+                .map
+                .as_ref()
+                .is_none_or(|mapping| matches!(mapping.backing, Backing::Work(_)))
+        {
+            // 已进入File的owner永不回heap。小工作区按实际容量向上取幂，增长仍留在同一原槽，
+            // 不能只缩小首次分配、却让下一次合法的小项增长提前创建FD。
+            let Some(bytes) = required_bytes.checked_next_power_of_two() else {
+                return self.fail();
+            };
+            let bytes = bytes.max(MIN_WORK_BYTES);
             if crate::cooperative::poll_boundary().is_err() {
                 return self.fail();
             }
-            self.map = Mapping::workspace::<T>(self.scope.clone(), self.bounded_access_certified());
-            if self.map.is_none() || crate::cooperative::poll_boundary().is_err() {
+            let Some(candidate) =
+                Mapping::workspace::<T>(self.scope.clone(), self.bounded_access_certified(), bytes)
+            else {
+                return self.fail();
+            };
+            if crate::cooperative::poll_boundary().is_err() {
+                return self.fail(); // 新块实际归还，旧块和initialized仍由原owner保留，失败不得换备用路径。
+            }
+            candidate
+        } else {
+            // 仅独占借用可改变映射地址，和原Vec增长的引用失效边界一致。
+            let wanted = required.max(self.capacity().saturating_mul(2)).max(256);
+            let page = self
+                .map
+                .as_ref()
+                .and_then(|m| m.state.page)
+                .unwrap_or_else(|| {
+                    // SAFETY: sysconf只查询系统页大小，不触及业务内存。
+                    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                    usize::try_from(value).unwrap_or(0)
+                });
+            if page == 0 {
                 return self.fail();
             }
-            return self.healthy();
-        }
-        // 仅独占借用可改变映射地址，和原Vec增长的引用失效边界一致。
-        let wanted = required.max(self.capacity().saturating_mul(2)).max(256);
-        let page = self
-            .map
-            .as_ref()
-            .and_then(|m| m.state.page)
-            .unwrap_or_else(|| {
-                // SAFETY: sysconf只查询系统页大小，不触及业务内存。
-                let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-                usize::try_from(value).unwrap_or(0)
+            let Some(bytes) = wanted
+                .checked_mul(size_of::<T>())
+                .and_then(|n| n.checked_add(page - 1))
+                .map(|n| n / page * page)
+            else {
+                return self.fail();
+            };
+            let Ok(bytes_off) = i64::try_from(bytes) else {
+                return self.fail();
+            };
+            let file = match self.map.as_ref().map(|m| &m.backing) {
+                Some(Backing::File(file)) => match file.try_clone() {
+                    Ok(file) => file,
+                    Err(error) => return self.fail_io(PagingOperation::CloneFile, &error),
+                },
+                Some(Backing::Work(_)) | None => match TrackedFile::create(self.scope.clone()) {
+                    Ok(file) => file,
+                    Err(error) => return self.fail_io(PagingOperation::CreateFile, &error),
+                },
+            };
+            // 当前capacity必须先真实预留磁盘块；普通磁盘不足在公开错误边界失败。
+            // 平台适配不回退heap数组，也不把失败延后到已发布引用的SIGBUS。
+            let old_bytes = self.map.as_ref().map_or(0, |m| match m.backing {
+                Backing::File(_) => m.state.bytes,
+                Backing::Work(_) => 0, // 工作块从未占有这个新文件，预分配必须覆盖整个新文件区间。
             });
-        if page == 0 {
-            return self.fail();
-        }
-        let Some(bytes) = wanted
-            .checked_mul(size_of::<T>())
-            .and_then(|n| n.checked_add(page - 1))
-            .map(|n| n / page * page)
-        else {
-            return self.fail();
-        };
-        let Ok(bytes_off) = i64::try_from(bytes) else {
-            return self.fail();
-        };
-        let file = match self.map.as_ref().map(|m| &m.backing) {
-            Some(Backing::File(file)) => match file.try_clone() {
-                Ok(file) => file,
-                Err(error) => return self.fail_io(PagingOperation::CloneFile, &error),
-            },
-            Some(Backing::Work(_)) | None => match TrackedFile::create(self.scope.clone()) {
-                Ok(file) => file,
-                Err(error) => return self.fail_io(PagingOperation::CreateFile, &error),
-            },
-        };
-        // 当前capacity必须先真实预留磁盘块；普通磁盘不足在公开错误边界失败。
-        // 平台适配不回退heap数组，也不把失败延后到已发布引用的SIGBUS。
-        let old_bytes = self.map.as_ref().map_or(0, |m| match m.backing {
-            Backing::File(_) => m.state.bytes,
-            Backing::Work(_) => 0, // 工作块从未占有这个新文件，预分配必须覆盖整个新文件区间。
-        });
-        if let Err(error) = platform::preallocate(&file, old_bytes, bytes_off) {
-            return self.fail_io(PagingOperation::Preallocate, &error);
-        }
-        if let Err(error) = file.set_len(bytes as u64) {
-            return self.fail_io(PagingOperation::Resize, &error);
-        }
-        // SAFETY: 文件先完成真实预分配/扩长；len为页倍数，PROT读写+SHARED不建立副本。
-        let address = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
-                bytes,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        if address == libc::MAP_FAILED {
-            return self.fail_io(PagingOperation::Map, &io::Error::last_os_error());
-        }
-        // mmap已实际成功就立即计费，连随后NonNull/对齐补偿失败也不能漏报资源。
-        self.scope.mapped(bytes);
-        let Some(base) = NonNull::new(address.cast::<u8>()) else {
-            // SAFETY: 极端系统配置若把有效映射放到零地址，不能构造NonNull；
-            // 新映射尚未发布，失败分支必须先归还它，不能泄漏文件映射。
-            let status = unsafe { libc::munmap(address, bytes) };
-            self.scope.unmapped(status, bytes);
-            return self.fail();
-        };
-        if base.as_ptr().align_offset(align_of::<T>()) != 0 {
-            // SAFETY: 此时尚未发布任何新引用，失败分支归还刚建立的映射。
-            let status = unsafe { libc::munmap(address, bytes) };
-            self.scope.unmapped(status, bytes);
-            return self.fail();
-        }
-        let was_bounded = self.bounded_access_certified();
-        let candidate = Mapping {
-            backing: Backing::File(file),
-            state: PageState {
-                base,
-                bytes,
-                page: Some(page),
-                poison: Cell::new(None),
-                scope: self.scope.clone(),
-                mutation: Rc::new(MutationDomain::new()),
-                epoch: Cell::new(0),
-                fast_span: Cell::new(ResidentSpan::EMPTY),
-                bounded_access: Cell::new(was_bounded),
-                windows: Cell::new([None; WINDOWS]),
-                clock: Cell::new(0),
-                last_bucket: Cell::new(usize::MAX),
-            },
+            if let Err(error) = platform::preallocate(&file, old_bytes, bytes_off) {
+                return self.fail_io(PagingOperation::Preallocate, &error);
+            }
+            if let Err(error) = file.set_len(bytes as u64) {
+                return self.fail_io(PagingOperation::Resize, &error);
+            }
+            // SAFETY: 文件先完成真实预分配/扩长；len为页倍数，PROT读写+SHARED不建立副本。
+            let address = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if address == libc::MAP_FAILED {
+                return self.fail_io(PagingOperation::Map, &io::Error::last_os_error());
+            }
+            // mmap已实际成功就立即计费，连随后NonNull/对齐补偿失败也不能漏报资源。
+            self.scope.mapped(bytes);
+            let Some(base) = NonNull::new(address.cast::<u8>()) else {
+                // SAFETY: 极端系统配置若把有效映射放到零地址，不能构造NonNull；
+                // 新映射尚未发布，失败分支必须先归还它，不能泄漏文件映射。
+                let status = unsafe { libc::munmap(address, bytes) };
+                self.scope.unmapped(status, bytes);
+                return self.fail();
+            };
+            if base.as_ptr().align_offset(align_of::<T>()) != 0 {
+                // SAFETY: 此时尚未发布任何新引用，失败分支归还刚建立的映射。
+                let status = unsafe { libc::munmap(address, bytes) };
+                self.scope.unmapped(status, bytes);
+                return self.fail();
+            }
+            let was_bounded = self.bounded_access_certified();
+            Mapping {
+                backing: Backing::File(file),
+                state: PageState {
+                    base,
+                    bytes,
+                    page: Some(page),
+                    poison: Cell::new(None),
+                    scope: self.scope.clone(),
+                    mutation: Rc::new(MutationDomain::new()),
+                    epoch: Cell::new(0),
+                    fast_span: Cell::new(ResidentSpan::EMPTY),
+                    bounded_access: Cell::new(was_bounded),
+                    windows: Cell::new([None; WINDOWS]),
+                    clock: Cell::new(0),
+                    last_bucket: Cell::new(usize::MAX),
+                },
+            }
         };
         if let Some(old) = self
             .map
@@ -692,11 +709,11 @@ impl<T: Pod> MappedPodVec<T> {
             // 尚未commit或clear后仍保留的initialized字节也属于原有效状态，不能只迁移len。
             let count = self.initialized * size_of::<T>();
             if crate::cooperative::poll_boundary().is_err() {
-                return self.fail(); // candidate先实际unmap/close；原工作块仍由本owner真实归还。
+                return self.fail(); // candidate先实际dealloc或unmap/close；旧工作块仍归原owner。
             }
             if count != 0 {
                 candidate.state.touch(0, count);
-                // SAFETY: initialized不超过原64KiB工作块，目标文件已完整预分配和映射。
+                // SAFETY: initialized不超过原工作区；新工作块已真实zero，或目标文件已预分配/映射。
                 // 两个活分配不重叠，只有独占self可迁移；一次复制最多64KiB，无Source读取。
                 unsafe {
                     core::ptr::copy_nonoverlapping(
@@ -711,8 +728,9 @@ impl<T: Pod> MappedPodVec<T> {
             }
         }
         let old = self.map.replace(candidate);
-        // File增长仍引用同一inode；Work溢出只迁移一次固定前缀，随即真实dealloc。
-        // 旧owner真实unmap/close也可能失败；不能在其负面收据产生后仍发布新长度。
+        // 小块增长和最终转File共用同一份initialized迁移与发布。新旧块同时存活的真实峰值
+        // 已由同scope计入，不能把32KiB+64KiB伪报成一块；旧Layout随原owner实际dealloc。
+        // File增长仍引用同一inode；旧owner真实unmap/close失败时，不能继续发布新长度。
         drop(old);
         self.healthy()
     }
@@ -724,7 +742,7 @@ impl<T: Pod> MappedPodVec<T> {
         if new_len <= self.len {
             return true;
         }
-        // 新文件区间由OS保证为零；只有重用旧区间或非零初值需要实际有限写入。
+        // 新工作块由alloc_zeroed、文件新区域由OS保证为零；重用旧区间或非零初值仍须实际写入。
         let zero = bytemuck::bytes_of(&value).iter().all(|b| *b == 0);
         let write_end = if zero {
             new_len.min(self.initialized)
@@ -1282,7 +1300,7 @@ mod tests {
         values[0] = [u128::MAX; 4];
         assert!(values.prepare_resize(7, [9; 4]));
         let active = observer.snapshot();
-        assert_eq!(active.work_bytes, BUCKET_BYTES);
+        assert!(active.work_bytes > 0 && active.work_bytes <= BUCKET_BYTES);
         assert_eq!(
             (active.files_open, active.mappings_open, active.mapped_bytes),
             (0, 0, 0)
@@ -1295,7 +1313,7 @@ mod tests {
         let before_cast = values.read_witness(&scope, 0..3).unwrap();
         let mut values = values.cast::<[i128; 4]>();
         assert!(values.witness_range(&scope, &before_cast).is_none());
-        assert_eq!(observer.snapshot().work_bytes, BUCKET_BYTES);
+        assert_eq!(observer.snapshot().work_bytes, active.work_bytes);
         assert_eq!(values[0], [-1; 4]);
         let before_spill = values.read_witness(&scope, 0..3).unwrap();
         assert!(values.reserve(BUCKET_BYTES / size_of::<[i128; 4]>() + 1));
@@ -1308,7 +1326,7 @@ mod tests {
         }
         let spilled = observer.snapshot();
         assert_eq!(spilled.work_bytes, 0);
-        assert_eq!(spilled.peak_work_bytes, BUCKET_BYTES);
+        assert_eq!(spilled.peak_work_bytes, active.work_bytes);
         assert_eq!((spilled.files_open, spilled.mappings_open), (1, 1));
         assert!(spilled.mapped_bytes > BUCKET_BYTES);
         let proof = values.read_witness(&scope, 0..3).unwrap();
@@ -1357,6 +1375,7 @@ mod tests {
         };
         let mut values = resized(100);
         let observer = values.resource_observer();
+        let original_work = observer.snapshot().work_bytes;
         let token = crate::CancellationToken::new();
         let requested = token.clone();
         let watched = observer.clone();
@@ -1376,7 +1395,7 @@ mod tests {
         );
         assert_eq!(result, Err(crate::ShapeError::Cancelled));
         let failed = observer.snapshot();
-        assert_eq!(failed.work_bytes, BUCKET_BYTES);
+        assert_eq!(failed.work_bytes, original_work);
         assert!(failed.mappings_created > 0 && failed.files_created > 0);
         assert_eq!((failed.files_open, failed.mappings_open), (0, 0));
         assert!(!values.healthy());
@@ -1408,6 +1427,7 @@ mod tests {
         }
         let mut values = resized(100);
         let observer = values.resource_observer();
+        let original_work = observer.snapshot().work_bytes;
         let scope = Rc::new(());
         let witness = values.read_witness(&scope, 0..100).unwrap();
         let mut old = libc::rlimit {
@@ -1437,7 +1457,7 @@ mod tests {
                 errno: libc::EMFILE
             })
         );
-        assert_eq!(actual.work_bytes, BUCKET_BYTES); // 迁移失败不伪造旧块已归还，也不返回新heap兜底。
+        assert_eq!(actual.work_bytes, original_work); // 迁移失败不伪造旧块已归还，也不返回新heap兜底。
         assert_eq!((actual.files_created, actual.mappings_created), (0, 0));
         drop(values);
         let ended = observer.snapshot();

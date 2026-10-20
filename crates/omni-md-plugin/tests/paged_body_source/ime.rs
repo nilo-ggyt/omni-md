@@ -358,7 +358,7 @@ struct SoftwareInput {
     // 最后一个字母只等待该完整Input的真实CPU；面板结果仅保纯身份/几何，不保活系统窗口。
     panel_input: Cell<Option<NativeMarkdownPagedInputState>>,
     // 最后一个字母的原帧从首次观察一直守到Space真正post；Missing不能换新帧补权。
-    // key只有Source/Scene弱身份，不保正文；后继Host通知只借这份原事实再查一次系统面板。
+    // key只有Source/Scene弱身份，不保正文；Space取走本槽后，Host通知不能再查旧组合。
     panel_frame: RefCell<Option<(NativeMarkdownPagedSceneKey, usize)>>,
     // firstRect/系统查询可同步发Host通知；只阻止本次Native栈的递归查询，不代表面板完成。
     panel_querying: Cell<bool>,
@@ -498,12 +498,14 @@ impl SoftwareInput {
         if self.stopped.get() || self.failed.get().is_some() {
             return true; // 已撤权的本地key直接归还，不进入系统队列或发送给后继客户。
         }
-        if index == 8 && self.panel_observation.get().is_none() {
-            self.failed
-                .set(Some("原真实组合面板尚未验证，不能确认候选"));
-            stop(&self.application);
-            return true;
-        }
+        // Space只接收最后一个字母已实际发布的原CPU票，不以面板可见性作为确认前置。
+        // 先把弱帧移到本同步栈再做Native查询；否则pending.take后的重入通知会再次看到
+        // “尚未发送Space”的旧槽，既可能重复准备按键，也可能把正常确认后的换代误报撤权。
+        let composition_frame = if index == 8 {
+            self.panel_frame.borrow_mut().take()
+        } else {
+            None
+        };
         let admitted = || {
             let current = NSTextInputContext::currentInputContext(self.application.mtm());
             let client = self.context.client();
@@ -561,8 +563,7 @@ impl SoftwareInput {
         if index == 8 {
             // 面板观察后还有一次真实主队列间隔；投递前不能给新输入或新几何重新捕generation。
             // 原窗口的Native查询结束后最后核同Input/Scene/CPU，撤权只终止而不重试Space。
-            let frame = self.panel_frame.borrow().clone();
-            if frame
+            if composition_frame
                 .as_ref()
                 .is_none_or(|(key, paints)| !self.panel_current(view, key, *paints))
             {
@@ -713,12 +714,15 @@ impl SoftwareInput {
             && pure()
     }
 
-    /// 仅真实Host更新可重看尚未显示的面板；没有原CPU等待就直接返回，不创建后继任务。
+    /// 仅原组合仍待确认时接受真实Host更新；Space的准备、入队和后继换代均不再查旧帧。
     fn host_updated(&self) {
         if self.stopped.get()
             || self.failed.get().is_some()
             || self.panel_observation.get().is_some()
             || self.panel_querying.get()
+            || self.next.get() != 8
+            || self.waiting.get().is_some()
+            || self.pending.borrow().is_some()
         {
             return;
         }
@@ -729,11 +733,15 @@ impl SoftwareInput {
     }
 
     /// 真实key与CPU均退栈后的首次查询，或一次真实Host更新，共用同一原Input/CPU权限。
-    /// Missing只保持原期限等待；其余拒绝立即失败，绝不自排轮询、补wake或猜测确认按键。
+    /// 面板与中文提交分别留下真实结果；Missing不阻断原Space，其余拒绝仍立即失败。
+    /// 原期限与固定键序不变，不为缺失面板重试、补wake或在确认后补签组合期几何。
     fn observe_panel(&self, key: &NativeMarkdownPagedSceneKey, paints: usize) {
         if self.stopped.get()
             || self.failed.get().is_some()
             || self.panel_observation.get().is_some()
+            || self.next.get() != 8
+            || self.waiting.get().is_some()
+            || self.pending.borrow().is_some()
             || self.panel_querying.replace(true)
         {
             return;
@@ -777,8 +785,8 @@ impl SoftwareInput {
             {
                 return Err("原组合起点没有同Input且完全位于组合范围内的实际firstRect");
             }
-            // helper只读真实窗口，不负责等待。Host的CPU完成不能保证另一个进程的窗口
-            // 已经发布；仅Missing允许原槽留到下次真实通知，原Input撤权仍立即失败。
+            // helper只读真实窗口。Host的CPU完成不能保证另一个进程的面板已发布；
+            // Missing仅记录这项尚未观察到，仍须完整原Input与几何才能独立确认中文。
             let observed = match panel::observe(&self.initial_source, rect, current) {
                 Ok(observed) => observed,
                 Err(panel::PanelError::PanelMissing) => {
@@ -818,15 +826,19 @@ impl SoftwareInput {
             }
             Ok(Some(observed))
         })();
-        self.panel_querying.set(false); // 本同步Native查询已退栈；不把递归保护当外部完成状态。
         match observed {
-            Ok(Some(observation)) => {
-                // 纯几何收据留下给本轮最终验收；Space仍经原pending槽和系统队列一次交付。
-                // 没有组合面板证明就停在失败，不能靠确认后的中文文本倒签先前的位置。
-                self.panel_observation.set(Some(observation));
+            Ok(observation) => {
+                // Some只代表当次真实可见且贴近组合起点的面板；None不能由后继中文补签。
+                // 两项结果独立：先走原Space/内容/历史验证，最终仍严格要求面板收据。
+                self.panel_observation.set(observation);
+                println!(
+                    "system_ime stage=composition_confirmation_admitted panel_observed={} original_input_cpu=true panel_not_a_precondition=true final_panel_gate_preserved=true deadline_unchanged=true software_events=true physical_keyboard=false",
+                    observation.is_some(),
+                );
+                // 创建CG事件也可能同步通知；原递归保护要守到pending真实安装，不能在
+                // Missing分支提前放开而让同一Host更新再次创建Space。它不跨异步队列。
                 self.prepare_next();
             }
-            Ok(None) => {} // 不改变原帧或30秒期限；没有后继真实通知就由原deadline结束。
             Err(cause) => {
                 if self.failed.get().is_none() {
                     self.failed.set(Some(cause));
@@ -834,6 +846,7 @@ impl SoftwareInput {
                 stop(&self.application);
             }
         }
+        self.panel_querying.set(false); // 本同步查询及按键准备已退栈，不把保护当面板完成状态。
     }
 
     /// 错源直出英文或空格确认了其他词都是真失败；只唤醒原loop，不补造目标中文。
@@ -1313,21 +1326,24 @@ pub(super) fn run(
         )
     });
     let software = observer.software.borrow_mut().take();
+    // 面板收据只复制纯结果，必须在cleanup撤槽前保存；不保留系统窗口或旧组合CPU票。
+    // None是人工路径没有本软件观察，Some(false)才是软件路径尚缺的最终面板证据。
+    let panel_observed = software
+        .as_ref()
+        .map(|driver| driver.panel_observation.get().is_some());
     if let Some(driver) = &software {
         let presses_posted = driver.next.get();
         let events_posted = presses_posted * 2; // 原固定九个press，每次只在同一同步栈投递一对。
-        let panel_observed = driver.panel_observation.get().is_some();
         let cleaned = driver.cleanup();
         let original_failure = driver.failed.get(); // 清理发现源身份变化也须保留为本次真实失败。
         if failure.is_none()
             && !(completed_before_cleanup
                 && original_failure.is_none()
                 && presses_posted == 9
-                && panel_observed
                 && cleaned)
         {
             failure = Some(format!(
-                "当前IME软件事件序列失败：completed={completed_before_cleanup} original_failure={original_failure:?} presses_posted={presses_posted} events_posted={events_posted} panel_observed={panel_observed} local_input_cleaned={cleaned}",
+                "当前IME软件事件序列失败：completed={completed_before_cleanup} original_failure={original_failure:?} presses_posted={presses_posted} events_posted={events_posted} panel_observed={panel_observed:?} local_input_cleaned={cleaned}",
             ));
         }
     }
@@ -1367,10 +1383,16 @@ pub(super) fn run(
     let top = observe(body, Instant::now());
     view.command(sel!(moveToBeginningOfDocument:)).unwrap();
     deliver_visible("system_ime_return", body, top);
+    // 真实中文与一次历史事务已经独立完成；仍缺面板就返回失败，由父用例唯一严格关闭。
+    // 不能因为文字正确而把未观察到的候选位置签成通过，也不能让这项缺证吞掉历史结果。
+    let full_result = panel_observed != Some(false);
     println!(
-        "system_ime marked_then_chinese=true one_undo=true exact_four_mebibytes=true viewport_lazy=true software_events={} physical_keyboard={} whole_product=false formal=false",
+        "system_ime stage=full_ime_result passed={full_result} marked_then_chinese=true one_undo=true exact_four_mebibytes=true viewport_lazy=true panel_observed={panel_observed:?} software_events={} physical_keyboard={} whole_product=false formal=false",
         matches!(mode, Mode::Software),
         matches!(mode, Mode::Manual),
     );
+    if !full_result {
+        return Err("实际中文提交与撤销重做已验证，但未观察到原组合起点附近的真实可见面板，完整IME验收仍失败".into());
+    }
     Ok(())
 }

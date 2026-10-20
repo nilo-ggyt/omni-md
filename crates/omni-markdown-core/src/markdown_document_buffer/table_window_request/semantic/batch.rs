@@ -428,7 +428,15 @@ impl MarkdownTableViewportRequest {
                 .max(work.copied_source_bytes)
                 .max(work.utf8_validation_bytes);
             let remaining = budget.saturating_sub(used);
-            if remaining < 4096 {
+            // Gap 仅持 Range 与原 root Weak；一次裁剪/归还只付原固定64控制费，没有源借用、
+            // spine 析构或外部回调。只让它消费本量子的真实余额，不为每个 Gap 重领 budget。
+            // 进入 Coverage 或其它阶段立即恢复4096准入；Native原4096量子不会顺带推进它们。
+            let minimum = if matches!(self.phase, BatchPhase::PruneGaps) {
+                64
+            } else {
+                4096
+            };
+            if remaining < minimum {
                 return Ok(MarkdownTableViewportStep::Progress { work });
             }
             let mut measured = self.advance_one(document, remaining)?;
@@ -1576,7 +1584,16 @@ impl MarkdownTableViewportRequest {
         self.records = MarkdownTableViewportBudget::default();
         self.prune_index = 0;
         self.prune_keep = 0;
-        self.phase = BatchPhase::PruneWindows;
+        // 空目录没有句柄、spine 或行载荷可归还；按这次真实库存选择第一个有工作的阶段，
+        // 避免普通 Gap 小窗为两个空表目录各自交还一次量子。非空目录仍逐项裁剪、计费，
+        // Gap 及 Coverage 始终走原流程，不从目录为空推导任何正文样式或新的无表覆盖。
+        self.phase = if !self.windows.is_empty() {
+            BatchPhase::PruneWindows
+        } else if !self.structures.is_empty() {
+            BatchPhase::PruneStructures
+        } else {
+            BatchPhase::PruneGaps
+        };
     }
 
     /// 在本请求最后一份 Ready 上共享已验证窗口，只从仍活的原 Global/Math 续体读取右侧后缀。
