@@ -108,22 +108,6 @@ pub enum NativeMarkdownPagedBodyError {
     ),
 }
 
-/// 临时定位原未支持错误的真实构造处；只记录静态源码位置，不输出正文、URI 或出版物。
-/// 返回仍是原 Unsupported，不新增语义许可、业务状态或错误种类；普通构建没有这条日志。
-#[track_caller]
-pub(super) fn unsupported() -> NativeMarkdownPagedBodyError {
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    {
-        let caller = std::panic::Location::caller();
-        eprintln!(
-            "native_body_unsupported_origin file={} line={}",
-            caller.file(),
-            caller.line(),
-        );
-    }
-    NativeMarkdownPagedBodyError::Unsupported
-}
-
 impl From<omni_markdown_core::markdown_document_buffer::MarkdownTableRequestError>
     for NativeMarkdownPagedBodyError
 {
@@ -476,7 +460,7 @@ impl NativeMarkdownPagedBody {
                 if configuration.presentation_mode
                     != omni_markdown_core::MarkdownPresentationMode::Source
                 {
-                    return Err(unsupported());
+                    return Err(NativeMarkdownPagedBodyError::Unsupported);
                 } // 草稿局部坐标不借原 Doc 的 RootLeaf 语义。
                 let input = NativeMarkdownPagedInput::new_cell(Rc::downgrade(&session))
                     .map_err(ViewError::Input)?;
@@ -1333,7 +1317,13 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             return Err(ViewError::Revoked);
         }
         let viewport = self.viewport.borrow().clone().ok_or(ViewError::Pending)?;
-        let geometry = viewport.geometry().map_err(|_| ViewError::Revoked)?;
+        // 这是领取“此刻”几何的入口，没有调用方交来的旧票。真实同步重入期间只等新
+        // geometry，不能把旧像素或撤掉的矩形当作Ready，也不把正常等候写成永久输入首错。
+        // 其他错误仍按原撤权处理；已签Scene/Geometry的消费继续走原严格current检查。
+        let geometry = viewport.geometry().map_err(|cause| match cause {
+            super::paged_viewport::NativeMarkdownPagedViewportError::Busy => ViewError::Pending,
+            _ => ViewError::Revoked,
+        })?;
         // 正文坐标从扣除真实行号/页眉遮挡后的frame起点算；raw clip曝露区域仍只归滚动所有者。
         Ok(NativeMarkdownPagedVirtualViewport {
             document_origin: geometry.body_frame.origin,

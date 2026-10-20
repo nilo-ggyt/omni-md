@@ -802,15 +802,18 @@ impl NativeMarkdownPagedViewport {
         }; // 耗尽时旧票必须失效；不能因无法计数而继续消费变化前的viewport。
         self.epoch.set(epoch);
         self.geometry.borrow_mut().take(); // 第一个可重入getter之前，所有后继消费先失去旧发布票。
+        // 仍先递增epoch并撤旧几何，再判断同步重入；内层不能留下外层尚可发布的旧票。
+        // Weak.load与撤CPU候选也可能归还Native资源并重入几何查询，故从这里起就标明
+        // “本owner正在同步、尚无新geometry”。失败同样由原RAII归还，不把busy留给后继。
+        if self.busy.replace(true) {
+            return Err(NativeMarkdownPagedViewportError::Busy);
+        }
+        let _updating = Updating(&self.busy);
         let body = self
             .body
             .load()
             .ok_or(NativeMarkdownPagedViewportError::Closed)?;
         body.invalidate_geometry()?;
-        if self.busy.replace(true) {
-            return Err(NativeMarkdownPagedViewportError::Busy);
-        }
-        let _updating = Updating(&self.busy);
         let pure_current = || {
             !self.closed.get()
                 && !self.poisoned.get()
@@ -963,6 +966,11 @@ impl NativeMarkdownPagedViewport {
         }
         if self.poisoned.get() {
             return Err(NativeMarkdownPagedViewportError::Revoked);
+        }
+        // 当前同步栈已撤旧geometry，新几何尚未发布；只报告真实Busy，不授旧矩形。
+        // 关闭/off-main/poison仍先拒绝；显式持有的旧Geometry::is_current也不会因此复活。
+        if self.busy.get() {
+            return Err(NativeMarkdownPagedViewportError::Busy);
         }
         let geometry = self
             .geometry

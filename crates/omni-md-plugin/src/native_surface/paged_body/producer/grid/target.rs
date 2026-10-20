@@ -103,9 +103,13 @@ impl Grid {
     ) -> Result<Option<Advance>> {
         // 只走本行有限列 metadata；未知格先交原串行准备量子，不抢先读取整行内容。
         let columns = self.cells.len();
-        for _ in 0..columns {
+        let row_start_caret = target.request.range.length == 0
+            && target.request.range.location == self.row.source_range().start;
+        // column 已跨真实准备回合前进；这里只消费剩余列，不能从后列续接后再遍历总列数。
+        // 完整排除所有列仍由末尾原 Unsupported 拒绝，不把非法列或非归属目标改成 Pending。
+        for _ in target.column..columns {
             let column = target.column;
-            let cell = self.cells.get_mut(column).ok_or_else(|| unsupported())?;
+            let cell = self.cells.get_mut(column).ok_or(Error::Unsupported)?;
             let document = owner
                 .document
                 .borrow()
@@ -134,21 +138,19 @@ impl Grid {
                     .advance(owner, source, &self.row, false, semantics, &mut self.work)
                     .map(Some);
             };
-            let canonical = target.request.range.location;
-            let belongs = range.contains(&canonical)
+            // 行首零 caret 的空间边缘属于首列：该 Cell 的 raw 票由原 row/column 工厂取得，
+            // 不能用可见数组的首项替代列号。只变内部定位点，原请求仍保 canonical 行起点。
+            // 巨行在旧视口可能只排了中段；沿首列真实首行定位，不等全格 EOF 或借父行估算高度。
+            let row_edge = row_start_caret && column == 0 && cell.column == 0;
+            let canonical = if row_edge {
+                range.start
+            } else {
+                target.request.range.location
+            };
+            let belongs = row_edge
+                || range.contains(&canonical)
                 || target.request.range.length == 0 && canonical == range.end;
             if !belongs {
-                #[cfg(feature = "native-markdown-runtime-probe")]
-                eprintln!(
-                    "native_grid_target_outside_cell target_range={:?} target_first_end={} column={} columns={} cell_range={range:?} row_range={:?} empty={} display={}",
-                    target.request.range,
-                    target.request.first_end,
-                    column,
-                    columns,
-                    self.row.source_range(),
-                    cell.empty.is_some(),
-                    cell.display.is_some(),
-                ); // 仅观察本轮已认证的纯坐标，排除格后仍按原规则推进，绝不夹取管道或补默认目标。
                 // 格间管道和分隔行不属于显示正文；仅前进列游标，不夹到邻格伪造命中。
                 target.column += 1;
                 continue;
@@ -159,14 +161,20 @@ impl Grid {
                     let position = display
                         .canonical_to_display(canonical, MarkdownComposedLineAffinity::Downstream)
                         .map_err(ViewError::Document)?
-                        .ok_or_else(|| unsupported())?;
+                        .ok_or(Error::Unsupported)?;
                     let first_end = display
                         .canonical_to_display(
-                            target.request.first_end,
+                            if row_edge {
+                                canonical
+                            } else {
+                                target.request.first_end
+                            },
                             MarkdownComposedLineAffinity::Downstream,
                         )
                         .map_err(ViewError::Document)?
-                        .ok_or_else(|| unsupported())?;
+                        .ok_or(Error::Unsupported)?;
+                    // 两端同点才是零 caret；前导粗体/代码/链接隐藏语法仍由原 sealed 映射处理。
+                    // 最后 Scene 依原请求验证 row.start 的零范围，不把这里的显示点签成源字符。
                     cell.target = Some(CellTarget {
                         position,
                         first_end,
@@ -257,7 +265,7 @@ impl Grid {
             }
             return Ok(None); // 原目标所在行已在真实 band；其他可见列仍须按同一视口完成再发布。
         }
-        Err(unsupported()) // 表格管道和delimiter不属于可见格，不能夹到相邻正文伪造目标框。
+        Err(Error::Unsupported) // 表格管道和delimiter不属于可见格，不能夹到相邻正文伪造目标框。
     }
 }
 
@@ -343,7 +351,7 @@ impl Cell {
             }
             if walk.target_top.is_none() {
                 if walk.metrics.is_none() {
-                    let handle = walk.cursor.take().ok_or_else(|| unsupported())?;
+                    let handle = walk.cursor.take().ok_or(Error::Unsupported)?;
                     walk.metrics = Some(LineMetrics::new(
                         handle,
                         omni_markdown_core::MarkdownPresentationMode::InlinePreview,
@@ -378,7 +386,7 @@ impl Cell {
                 let part = output
                     .borrow_mut()
                     .part(&metrics.handle, ordinal)?
-                    .ok_or_else(|| unsupported())?;
+                    .ok_or(Error::Unsupported)?;
                 walk.target_part += 1;
                 budget.metadata_units -= 1;
                 budget.records -= 7;
@@ -397,7 +405,7 @@ impl Cell {
                 let font = palette
                     .iter()
                     .find(|font| font.native().core_font().permits(&authority))
-                    .ok_or_else(|| unsupported())?;
+                    .ok_or(Error::Unsupported)?;
                 let content_width = native_markdown_table_content_width(self.width)
                     .ok_or(ViewError::InvalidGeometry)?;
                 let baseline =

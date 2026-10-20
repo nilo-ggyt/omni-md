@@ -32,6 +32,8 @@ mod release;
 mod root_leaf;
 #[path = "source_body/selection.rs"]
 mod selection;
+#[path = "source_body/table_edge.rs"]
+mod table_edge;
 use frame::{observe, wait_frame};
 
 const EPOCH: u64 = 83;
@@ -295,6 +297,7 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
     result?;
     navigation::run(mtm)?; // 原四MiB完整图已严格释放，才创建独立65,529B导航样本。
     interleave::run(mtm)?;
+    table_edge::run(mtm)?; // 巨行边缘真实回退及严格释放完成后，才创建下一份RootLeaf文稿。
     root_leaf::run(mtm)?; // 独立Rig先完成Root语义帧及严格释放，不依赖后继Cell EOF结果。
     cell::run(mtm)?; // 原Body与RootLeaf已归还，才用同装配实测独立Cell Source及大草稿。
     Ok(())

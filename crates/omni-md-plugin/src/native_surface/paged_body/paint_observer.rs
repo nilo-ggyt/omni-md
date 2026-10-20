@@ -7,7 +7,7 @@ use objc2_foundation::MainThreadMarker;
 
 use super::{
     NativeMarkdownPagedBody, NativeMarkdownPagedBodyError, NativeMarkdownPagedSceneKey,
-    NativeMarkdownPagedTextViewDelegate, Result, unsupported,
+    NativeMarkdownPagedTextViewDelegate, Result,
 };
 
 /// 调用方只接收仍属原 key 的真实完整帧；弱观察不延长界面、正文或测试 runloop。
@@ -33,7 +33,10 @@ impl NativeMarkdownPagedBody {
         if self.paint_observation.borrow().is_some() {
             return Err(NativeMarkdownPagedBodyError::Busy);
         }
-        let baseline = self.view()?.cpu_paints().ok_or_else(|| unsupported())?;
+        let baseline = self
+            .view()?
+            .cpu_paints()
+            .ok_or(NativeMarkdownPagedBodyError::Unsupported)?;
         *self.paint_observation.borrow_mut() = Some(PaintObservation { observer, baseline });
         Ok(())
     }

@@ -18,10 +18,8 @@ use omni_markdown_core::{
 use omni_markdown_core::markdown_document_buffer::{MarkdownTableRequestError, SemanticWork};
 use omni_markdown_core::markdown_viewport_presentation::table_window::MarkdownTableWindowError;
 
-#[cfg(feature = "native-markdown-runtime-probe")]
-use super::NativeMarkdownPagedBodyError as Error;
 use super::preparation::PreparationTicket;
-use super::{NativeMarkdownPagedBody as Owner, Result, unsupported};
+use super::{NativeMarkdownPagedBody as Owner, NativeMarkdownPagedBodyError as Error, Result};
 use crate::native_surface::{
     paged_fonts::NativeMarkdownPagedFont,
     paged_line_fonts::NativeMarkdownLineFont,
@@ -315,7 +313,7 @@ impl Selection {
                     range.end,
                     display.source().utf16_len(),
                 );
-                return Err(unsupported());
+                return Err(Error::Unsupported);
             };
             let end = range.end.min(query.utf16_range.end);
             if end <= range.start {
@@ -325,7 +323,7 @@ impl Selection {
                     "native_cell_unsupported phase=style_empty range_start={} range_end={} covered_end={}",
                     range.start, range.end, query.utf16_range.end,
                 );
-                return Err(unsupported());
+                return Err(Error::Unsupported);
             }
             (end, query.styles)
         };
@@ -386,7 +384,7 @@ impl Selection {
                 let query = display
                     .styles_at(self.coverage.start)
                     .map_err(super::ViewError::Document)?
-                    .ok_or_else(|| unsupported())?;
+                    .ok_or(Error::Unsupported)?;
                 if query.utf16_range.end < self.coverage.end || query.styles != self.styles {
                     return Err(super::ViewError::Revoked.into());
                 }
@@ -414,11 +412,11 @@ impl Selection {
             let MarkdownOrdinarySemanticState::RootLeafReady(leaf) =
                 publication.ordinary_semantics_for(&document, *authority)?
             else {
-                return Err(unsupported());
+                return Err(Error::Unsupported);
             };
             let query = leaf
                 .query_for(&document, *authority, self.coverage.start)?
-                .ok_or_else(|| unsupported())?;
+                .ok_or(Error::Unsupported)?;
             if query.utf16_range.end < self.coverage.end
                 || query.styles != self.styles
                 || Role::from_styles(query.styles) != self.role
@@ -676,7 +674,7 @@ impl RootLeaf {
         }
         if self.row_repositioned == Some(position) {
             // 同一原查询已经完整重放仍没有实际行，不把裸坐标升级成来源权限或反复重试。
-            return Err(unsupported());
+            return Err(Error::Unsupported);
         }
         // 恢复一行只需要行首完整scalar的查询窗；原Scanner仍负责认证整条物理行及H/D来源。
         // 额外带上后方16K会把无关普通尾段塞进256条来源页，并让每格反复重扫同一大表前缀。
@@ -776,7 +774,7 @@ impl RootLeaf {
             let local = match action {
                 Action::Next if column + 1 < columns => Some(column + 1),
                 Action::Previous if column > 0 => Some(column - 1),
-                Action::Cancel => return Err(unsupported()),
+                Action::Cancel => return Err(Error::Unsupported),
                 _ => None,
             };
             if let Some(column) = local {
@@ -1108,29 +1106,9 @@ impl RootLeaf {
             return Err(super::ViewError::Revoked.into());
         }
         if self.pending || self.cell_navigation.is_some() {
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            eprintln!(
-                "native_selection_invariant stage=semantic_pending pending={} cell_navigation={} capability=unattempted composer=unattempted reproject=unattempted window={}..{} context={} anchor={} head={}",
-                self.pending,
-                self.cell_navigation.is_some(),
-                self.window.start,
-                self.window.end,
-                self.context,
-                selection.anchor_utf16,
-                selection.head_utf16,
-            ); // 只记录本次选择移交的原有限事实，不推进语义或把Pending冒充能力缺失。
             return Ok(false); // 原请求/格作业尚在途，仍由原重排路径取消并等待真实归还。
         }
         let (Some(parser), Some(previous)) = (self.request.as_mut(), self.ready.as_ref()) else {
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            eprintln!(
-                "native_selection_invariant stage=missing_publication capability=unattempted composer=unattempted reproject=unattempted window={}..{} context={} anchor={} head={}",
-                self.window.start,
-                self.window.end,
-                self.context,
-                selection.anchor_utf16,
-                selection.head_utf16,
-            );
             return Ok(false);
         };
         let document = owner
@@ -1154,41 +1132,14 @@ impl RootLeaf {
             let Some(capability) =
                 parser.selection_style_invariant(&document, previous, authority)?
             else {
-                #[cfg(feature = "native-markdown-runtime-probe")]
-                eprintln!(
-                    "native_selection_invariant stage=capability capability=none composer=unattempted reproject=unattempted window={}..{} context={} anchor={} head={}",
-                    self.window.start,
-                    self.window.end,
-                    self.context,
-                    selection.anchor_utf16,
-                    selection.head_utf16,
-                ); // 工厂确实返回None才记此分支，原Source/权限错误仍由?直接返回。
                 return Ok(false);
             };
             if !composer.can_retain_selection_styles(&capability)? {
-                #[cfg(feature = "native-markdown-runtime-probe")]
-                eprintln!(
-                    "native_selection_invariant stage=composer capability=some composer=false reproject=unattempted window={}..{} context={} anchor={} head={}",
-                    self.window.start,
-                    self.window.end,
-                    self.context,
-                    selection.anchor_utf16,
-                    selection.head_utf16,
-                ); // 原Store/Font/活跃支持域门完全未改；不用显示行数猜拒绝原因。
                 return Ok(false);
             }
         } // 借用先结束，才允许原唯一请求改变选择、退休 publication；没有跨 Native 或挂起保存 cap。
         ticket.require_pure(owner, source)?;
         if !parser.reproject_selection(&document, previous, self.window.clone(), authority)? {
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            eprintln!(
-                "native_selection_invariant stage=reproject capability=some composer=true reproject=false window={}..{} context={} anchor={} head={}",
-                self.window.start,
-                self.window.end,
-                self.context,
-                selection.anchor_utf16,
-                selection.head_utf16,
-            );
             return Ok(false); // Core 资格不满足保证原 owner/发布不变，交原 reset_styles 冷路径。
         }
         self.work = parser.total_work();
@@ -1199,15 +1150,6 @@ impl RootLeaf {
         self.row_repositioned = None;
         // 后继样式必须由新选择正常 advance 生成的新发布提供，不能借旧 Boundary 给新 Input 补票。
         ticket.require_pure(owner, source)?;
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        eprintln!(
-            "native_selection_invariant stage=reproject capability=some composer=true reproject=true window={}..{} context={} anchor={} head={}",
-            self.window.start,
-            self.window.end,
-            self.context,
-            selection.anchor_utf16,
-            selection.head_utf16,
-        ); // 本栈只在实际最终返回点打印一次；不持publication或新增跨回合诊断状态。
         Ok(true)
     }
 
@@ -1406,7 +1348,7 @@ impl RootLeaf {
         )? {
             None => Ok(None),
             Some(StyleDecision::Font(selection)) => Ok(Some(selection)),
-            Some(StyleDecision::Table(_)) => Err(unsupported()),
+            Some(StyleDecision::Table(_)) => Err(Error::Unsupported),
         }
     }
 
@@ -1577,7 +1519,7 @@ impl RootLeaf {
         {
             let row = source.verified_table_layout_row_from_source(&document, row, authority)?;
             if row.source_range().start != range.start {
-                return Err(unsupported());
+                return Err(Error::Unsupported);
             } // 原 NeedStyle 必须正处于真实块起点，不能在已消费的半行里事后跳过正文。
             return Ok(Some(StyleDecision::Table(row)));
         } // TABLE 样式位、同值范围及离屏 header context 均不能补造可绘制行。
@@ -1603,7 +1545,7 @@ impl RootLeaf {
                     MarkdownOrdinarySemanticState::RootLeafReady(_) => unreachable!(),
                 }
             );
-            return Err(unsupported()); // SourcesOnly/未知inline不签默认Body样式。
+            return Err(Error::Unsupported); // SourcesOnly/未知inline不签默认Body样式。
         };
         let query = match leaf.query_for(&document, authority, range.start)? {
             Some(query) => query,
@@ -1622,12 +1564,12 @@ impl RootLeaf {
                     leaf.covered_ranges_for(&document, authority)?
                         .collect::<Vec<_>>()
                 );
-                return Err(unsupported());
+                return Err(Error::Unsupported);
             }
         };
         let end = range.end.min(query.utf16_range.end);
         if end <= range.start {
-            return Err(unsupported());
+            return Err(Error::Unsupported);
         }
         Ok(Some(StyleDecision::Font(Selection {
             coverage: range.start..end,
