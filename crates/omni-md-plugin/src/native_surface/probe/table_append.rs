@@ -272,7 +272,7 @@ struct FindButtonPaint {
     down_identity: FindButtonDownIdentity,
     dispatched: Cell<bool>,
     action_returned: Cell<bool>,
-    // 临时定位只限本场景首个 Next 的三个实际边界；早帧/外来 Down 不重复刷日志。
+    // 临时派发/帧诊断只限首个 Next；action 返回各记原四次动作的一条，均不重复刷早帧。
     #[cfg(feature = "native-close-stage-diagnostic")]
     dispatch_diagnosed: Cell<bool>,
     #[cfg(feature = "native-close-stage-diagnostic")]
@@ -509,12 +509,58 @@ impl FindButtonPaint {
     fn after_action(&self) {
         #[cfg(feature = "native-close-stage-diagnostic")]
         let mut authority = None;
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        let (
+            mut route_same,
+            mut controller_same,
+            mut foreground_current,
+            mut body_same,
+            mut doc_same,
+            mut view_same,
+            mut bar_same,
+            mut mode_same,
+        ) = (false, false, false, false, false, false, false, false);
         let checked = with_active_native_markdown_surface(|surface| {
             let current = self.current(surface);
             let intent = surface.controller.find_input_intent();
             #[cfg(feature = "native-close-stage-diagnostic")]
             {
                 authority = Some((current, intent));
+                // 仅分解原 current 的身份事实，不读取字段正文、Native 焦点或重新取得业务票。
+                // Surface 未取得时保持 false，配合 entered_surface 区分 Busy 与身份变化。
+                let controller = self.controller.load();
+                controller_same = controller.as_ref().is_some_and(|controller| {
+                    std::ptr::eq(&**controller, &*surface.controller)
+                        && std::ptr::from_ref(&**controller).addr() == self.facts.owner
+                });
+                foreground_current = controller.as_ref().is_some_and(|controller| {
+                    native_markdown_controller_has_foreground_authority(controller)
+                });
+                route_same = controller.as_ref().is_some_and(|controller| {
+                    controller
+                        .ivars()
+                        .field_editor_provider
+                        .current_input_client_identity()
+                        == self.route
+                });
+                if let Some(editor) = &surface.editor {
+                    body_same =
+                        std::rc::Weak::ptr_eq(&self.facts.body, &Rc::downgrade(&editor.body));
+                    doc_same = WeakMarkdownDocument::ptr_eq(
+                        &self.facts.document,
+                        &Rc::downgrade(editor.document()),
+                    );
+                    view_same = self
+                        .view
+                        .load()
+                        .is_some_and(|view| std::ptr::eq(&*view, &**editor.text_view));
+                    bar_same =
+                        editor.find_bar.borrow().as_ref().is_some_and(|bar| {
+                            std::rc::Weak::ptr_eq(&self.bar, &Rc::downgrade(bar))
+                        });
+                    mode_same =
+                        editor.presentation_mode() == MarkdownPresentationMode::InlinePreview;
+                }
             }
             if !current
                 || intent != self.after_intent
@@ -548,9 +594,9 @@ impl FindButtonPaint {
             Ok(Some((key, paints)))
         });
         #[cfg(feature = "native-close-stage-diagnostic")]
-        if self.action == MarkdownFindAction::Next {
+        {
             eprintln!(
-                "native_find_button_terminal phase=after_action kind={} entered_surface={} current={:?} actual_intent={:?} checked_ok={} before_intent={} after_intent={} dispatched={} frame_terminal={} deadline_current={}",
+                "native_find_button_terminal phase=after_action kind={} entered_surface={} current={:?} actual_intent={:?} checked_ok={} before_intent={} after_intent={} dispatched={} frame_terminal={} deadline_current={} route_same={route_same} controller_same={controller_same} foreground_current={foreground_current} body_same={body_same} doc_same={doc_same} view_same={view_same} bar_same={bar_same} mode_same={mode_same}",
                 self.action as isize,
                 authority.is_some(),
                 authority.map(|(current, _)| current),
