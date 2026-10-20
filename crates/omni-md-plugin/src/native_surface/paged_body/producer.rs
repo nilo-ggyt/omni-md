@@ -3363,6 +3363,13 @@ impl Producer {
                 - request.virtual_viewport.document_origin.x,
             request.viewport.size.height + top - scan.first_top,
         );
+        // 临时几何归因只打印本次已完成扫描的原值；不重新查询行、Source 或 Native。
+        // 同一行在栏高变化前后的 seed 与局部起点可据此区分逆扫误差和后续 baseline 运算。
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        eprintln!(
+            "native_line_geometry_seed first_ordinal={first_ordinal} prefix_height={prefix_height:?} scan_first_top={:?} first_top_y={:?} document_origin_y={top:?} viewport_height={:?}",
+            scan.first_top, first_top.y, request.viewport.size.height,
+        );
         let window = Rc::new(
             NativeMarkdownComposedViewport::prepare(
                 output.clone(),

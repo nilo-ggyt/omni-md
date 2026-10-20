@@ -168,6 +168,20 @@ impl NativeMarkdownComposedViewport {
         if !self.visible(line.frame) {
             return Err(NativeMarkdownComposedViewportError::Pending);
         }
+        // 只观察这次真实 first_rect 已定位的原行，不为诊断另读目录、正文或补领权限。
+        // seed 日志与本行封存 frame/baseline 共用原 Scene，最终框仍由下面原 GCB 路径计算。
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        eprintln!(
+            "native_first_rect_line ordinal={} frame_y={:?} frame_height={:?} baseline_from_top={:?} baseline_y={:?} descent={:?} document_origin_y={:?} viewport_height={:?}",
+            line.handle.facts().ordinal,
+            line.frame.origin.y,
+            line.frame.size.height,
+            line.geometry.baseline_from_top,
+            line.baseline.y,
+            line.descent,
+            self.key.request.virtual_viewport.document_origin.y,
+            self.key.request.viewport.size.height,
+        );
         // 非空请求扩到首scalar所属完整GCB；不把后继行或UTF16中点当作字形首位置。
         let start = self.boundary(range.location, false)?;
         let next = self.next_boundary(start)?;
