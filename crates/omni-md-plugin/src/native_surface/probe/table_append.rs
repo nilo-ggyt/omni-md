@@ -236,6 +236,11 @@ struct FindButtonPaint {
     window_number: isize,
     dispatched: Cell<bool>,
     action_returned: Cell<bool>,
+    // 临时定位只限本场景首个 Next 的三个实际边界；早帧/外来 Down 不重复刷日志。
+    #[cfg(feature = "native-close-stage-diagnostic")]
+    dispatch_diagnosed: Cell<bool>,
+    #[cfg(feature = "native-close-stage-diagnostic")]
+    frame_diagnosed: Cell<bool>,
     terminal: RefCell<Option<Result<(NativeMarkdownPagedSceneKey, usize), String>>>,
     observer: terminal::ProbeTerminalObserver,
 }
@@ -466,9 +471,17 @@ impl FindButtonPaint {
     /// 仅在实际 Down 调用返回后，FIFO 排在原正式 action 之后执行一次。
     /// 组合拒绝不改正文，没有新帧也能由真实 action 终点证明；其它动作仍必须等原新帧。
     fn after_action(&self) {
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        let mut authority = None;
         let checked = with_active_native_markdown_surface(|surface| {
-            if !self.current(surface)
-                || surface.controller.find_input_intent() != self.after_intent
+            let current = self.current(surface);
+            let intent = surface.controller.find_input_intent();
+            #[cfg(feature = "native-close-stage-diagnostic")]
+            {
+                authority = Some((current, intent));
+            }
+            if !current
+                || intent != self.after_intent
                 || self.started.elapsed() > Duration::from_secs(3)
             {
                 return Err("原 Find action 返回后客户、唯一意图或三秒期限不符".into());
@@ -498,6 +511,22 @@ impl FindButtonPaint {
             }
             Ok(Some((key, paints)))
         });
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        if self.action == MarkdownFindAction::Next {
+            eprintln!(
+                "native_find_button_terminal phase=after_action kind={} entered_surface={} current={:?} actual_intent={:?} checked_ok={} before_intent={} after_intent={} dispatched={} frame_terminal={} deadline_current={}",
+                self.action as isize,
+                authority.is_some(),
+                authority.map(|(current, _)| current),
+                authority.map(|(_, intent)| intent),
+                checked.is_ok(),
+                self.before_intent,
+                self.after_intent,
+                self.dispatched.get(),
+                self.terminal.borrow().is_some(),
+                self.started.elapsed() <= Duration::from_secs(3),
+            ); // 原租约即使 Busy 也记录到达；None明确没有取得Surface，不额外调用Native或重借。
+        }
         // Active 租约结束后才复用真实帧验证，避免在一个 SurfaceLease 内递归借活窗口。
         let checked = match checked {
             Ok(Some((key, paints))) => match self.check_frame(&key, paints) {
@@ -532,7 +561,27 @@ impl NativeMarkdownPagedBodyPaintObserver for FindButtonPaint {
         if self.terminal.borrow().is_some() {
             return; // 已写入的成功或失败都只交付一次，后继帧不能改写原动作结论。
         }
-        let checked = match self.check_frame(key, paints) {
+        let checked = self.check_frame(key, paints);
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        if self.action == MarkdownFindAction::Next && !self.frame_diagnosed.replace(true) {
+            let outcome = match &checked {
+                Ok(true) => "ready",
+                Ok(false) => "earlier_frame",
+                Err(_) => "failed",
+            };
+            eprintln!(
+                "native_find_button_terminal phase=frame kind={} outcome={outcome} before_intent={} after_intent={} dispatched={} action_returned={} generation={} selection_serial={} fold_revision={} paints={paints}",
+                self.action as isize,
+                self.before_intent,
+                self.after_intent,
+                self.dispatched.get(),
+                self.action_returned.get(),
+                key.request.input.generation,
+                key.request.input.selection_serial,
+                key.request.input.fold_revision,
+            ); // 首张实际交付帧只记 key 标量及原检查结果，不打印错误正文或源内容。
+        }
+        let checked = match checked {
             Ok(false) => match self.rearm() {
                 Ok(()) => return,
                 Err(cause) => Err(cause),
@@ -909,7 +958,22 @@ impl NativeMarkdownHostedTableProbe {
         let Some(paint) = paint else {
             return Ok(()); // 其它表格/工具栏事件没有这个具体 Find 动作的后继权限。
         };
-        let Some(down) = paint.down.load() else {
+        let down = paint.down.load();
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        if paint.action == MarkdownFindAction::Next && !paint.dispatch_diagnosed.replace(true) {
+            eprintln!(
+                "native_find_button_terminal phase=dispatch kind={} weak_alive={} ptr_same={} window_same={} before_intent={} after_intent={} dispatched={}",
+                paint.action as isize,
+                down.is_some(),
+                down.as_ref()
+                    .is_some_and(|down| std::ptr::eq(&**down, event)),
+                event.windowNumber() == paint.window_number,
+                paint.before_intent,
+                paint.after_intent,
+                paint.dispatched.get(),
+            ); // 必须在中性忽略之前记录原弱票事实，才能区分释放/事件副本与回调未到达。
+        }
+        let Some(down) = down else {
             return Ok(());
         };
         if !std::ptr::eq(&*down, event) {
@@ -2127,6 +2191,10 @@ impl NativeMarkdownHostedTableProbe {
                 window_number,
                 dispatched: Cell::new(false),
                 action_returned: Cell::new(false),
+                #[cfg(feature = "native-close-stage-diagnostic")]
+                dispatch_diagnosed: Cell::new(false),
+                #[cfg(feature = "native-close-stage-diagnostic")]
+                frame_diagnosed: Cell::new(false),
                 terminal: RefCell::new(None),
                 observer: terminal::ProbeTerminalObserver::default(),
             });
