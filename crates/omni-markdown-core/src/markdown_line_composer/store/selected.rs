@@ -380,12 +380,19 @@ impl GlyphStore {
         // 同次行尾游标只缩短原查找路径，不把任意视觉端点或普通 item 边缘升级为字素边界。
         let proof = &actual.proof;
         let item = &actual.directory;
-        // 非 GCB 只允许原 Store 签入的 item 本端，不能让任意视觉范围绕过字素校验。
+        // Glyphs 的完整端点已由 ItemScan 的 GCB/seam、缩短响应的新右 GCB，或
+        // ClosedItem/Frontier 的原封存端点认证；capture_item_graphemes 完成后才准入。
+        // Store commit 又以原 Job/facts/seams 复核并写入该 Directory，因此复用的是
+        // 当前 LocatedItem 的构造证明，不能仅从 shaping_seams 的 None 推断任意坐标合法。
+        // 视觉裁切若落在 item 内部仍须真实查 GCB；控制项保持原端点条件，整行两端也仍严查。
         // 原相邻 resolved levels 已在捕获与目录解码复核；这里没有重写 level 或拆分字形。
+        let glyphs = item.kind == super::super::MarkdownComposedLinePartKind::Glyphs;
         let check_start = source.start != line.start
-            && (source.start != item.facts.source_utf16.start || item.shaping_seams[0].is_none());
+            && (source.start != item.facts.source_utf16.start
+                || (!glyphs && item.shaping_seams[0].is_none()));
         let check_end = source.end != line.end
-            && (source.end != item.facts.source_utf16.end || item.shaping_seams[1].is_none());
+            && (source.end != item.facts.source_utf16.end
+                || (!glyphs && item.shaping_seams[1].is_none()));
         let checked = match (check_start, check_end) {
             (true, true) => Some(source.clone()),
             (true, false) => Some(source.start..source.start),
