@@ -2,6 +2,7 @@
 //! 桥只保弱身份、固定样本与有限收据，不创建窗口、SDK会话或第二个主事件循环。
 
 use super::*;
+use crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewDelegate;
 
 mod editing;
 mod fixture;
@@ -508,7 +509,7 @@ impl NativeMarkdownHostedWorkload {
                 _ => unreachable!("原具名步骤只签发有限专项阶段"),
             };
         }
-        match step {
+        let result = match step {
             NativeMarkdownHostedStep::VerifyOpen => self.workload.verify_open(), // 原401。
             NativeMarkdownHostedStep::SelectSource => self.workload.change_mode(true), // 原402/412。
             NativeMarkdownHostedStep::VerifySource => self.workload.verify_mode(true), // 原403/413。
@@ -537,7 +538,102 @@ impl NativeMarkdownHostedWorkload {
             | NativeMarkdownHostedStep::SaveRestored
             | NativeMarkdownHostedStep::VerifySaved) => self.editing_step(step),
             _ => unreachable!("专项步骤已经在原用例入口消费"),
+        };
+        result?;
+        // 只有原业务验证已经通过且拥有稳定CPU终点的步骤才可导图；FindShown仅有字段
+        // 就绪，不能为截图新增等待。默认未选择目录时下面不领取Native或bitmap。
+        let label = match step {
+            NativeMarkdownHostedStep::VerifyOpen => Some("hosted-open"),
+            NativeMarkdownHostedStep::VerifySource => Some("hosted-source"),
+            NativeMarkdownHostedStep::VerifyPreview => Some("hosted-preview"),
+            NativeMarkdownHostedStep::VerifyTableFind => Some("hosted-find"),
+            NativeMarkdownHostedStep::VerifyInserted => Some("hosted-inserted"),
+            _ => None,
+        };
+        if let Some(label) = label {
+            self.capture_ui(label, step == NativeMarkdownHostedStep::VerifyInserted)?;
         }
+        Ok(())
+    }
+
+    /// 只借刚通过的同一工作负载结果；不改变步骤顺序、补发动作或等待另一张未来Scene。
+    /// 插入终点已有原编辑票认证g+1，故沿同弱身份和预声明代次，不能套只读g0门或复活旧pub。
+    fn capture_ui(&self, label: &'static str, inserted: bool) -> Result<(), String> {
+        let Some(directory) = ui_render::directory()? else {
+            return Ok(());
+        };
+        let facts = self.workload.facts()?;
+        let generation = facts
+            .generation
+            .checked_add(u64::from(inserted))
+            .ok_or("UI图源代次溢出")?;
+        with_active_native_markdown_surface(|surface| {
+            let owner_current = || {
+                if inserted {
+                    memory_workload_identity_current(surface, &facts)
+                        && surface.editor.as_ref().is_some_and(|editor| {
+                            editor.document().borrow().generation() == generation
+                        })
+                } else {
+                    self.workload.current(surface, &facts)
+                }
+            };
+            if !owner_current() {
+                return Err("UI图不属于原已验证工作负载".into());
+            }
+            let editor = surface.editor.as_ref().ok_or("UI图缺少原正文")?;
+            // 原验证返回至这里没有Native或runloop交付；此完整Input只绑定刚验证的后态，
+            // 后面任何Native换代都撤图，不能从更晚的选择或另一文稿重新采样来放行。
+            let input = editor
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            let epoch = MemoryActionEpoch::capture(surface);
+            let key = editor
+                .text_view
+                .capture_ready_scene_key()
+                .map_err(|cause| cause.to_string())?;
+            let (published, paints) = editor
+                .text_view
+                .probe_cpu_published_frame()
+                .ok_or("工作负载UI图没有真实CPU发布帧")?;
+            let current = || {
+                owner_current()
+                    && epoch.permits(surface)
+                    && input.generation == generation
+                    && key.request.input == input
+                    && editor
+                        .text_view
+                        .input_state()
+                        .is_ok_and(|actual| actual == input)
+                    && NativeMarkdownPagedTextViewDelegate::scene_current(&*editor.body, &key)
+                    && published.same(&key)
+                    && paints != 0
+                    && editor.text_view.cpu_paints() == Some(paints)
+                    && editor.text_view.cpu_paint_pending() == Some(false)
+            };
+            let scene =
+                NativeMarkdownPagedTextViewDelegate::ready_scene(&*editor.body, &key.request)
+                    .map_err(|cause| cause.to_string())?;
+            scene
+                .validate_ready(&current)
+                .map_err(|cause| cause.to_string())?;
+            let content = step(&current, || surface.panel.contentView())?
+                .ok_or("工作负载UI图没有原内容根")?;
+            let result = ui_render::write(&directory, &content, label, paints, &current);
+            // 共享I/O先退出全部Native临时claim，再优先检查同原Scene的Source/Font和实际失败槽。
+            // 即使导图本身失败，也不能将此前真实正文或输入错误洗成文件输出错误。
+            scene
+                .validate_ready(&current)
+                .map_err(|cause| cause.to_string())?;
+            if let Some(cause) = editor.body.take_failure() {
+                return Err(format!("工作负载UI图期间原正文失败：{cause}"));
+            }
+            if let Some(cause) = editor.text_view.take_failure() {
+                return Err(format!("工作负载UI图期间原输入失败：{cause}"));
+            }
+            result
+        })
     }
 
     /// 下一验证只观察动作保存的原票；返回 false 后必须等同一请求终点，不能自行重排检查。

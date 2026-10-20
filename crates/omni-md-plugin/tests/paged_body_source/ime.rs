@@ -14,12 +14,11 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFNumber, CFString, CFType};
 use objc2_core_graphics::{
-    CGRectMakeWithDictionaryRepresentation, CGWindowListCreateDescriptionFromArray, kCGWindowAlpha,
-    kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowNumber, kCGWindowOwnerPID,
+    CGEvent, CGRectMakeWithDictionaryRepresentation, CGWindowListCreateDescriptionFromArray,
+    kCGWindowAlpha, kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use objc2_foundation::{
-    NSContainsRect, NSNotification, NSNotificationCenter, NSObjectProtocol, NSPointInRect,
-    NSProcessInfo, NSTimer,
+    NSContainsRect, NSNotification, NSNotificationCenter, NSObjectProtocol, NSPointInRect, NSTimer,
 };
 use omni_markdown_core::MarkdownTextSelection;
 use omni_md_plugin::native_surface::{
@@ -422,41 +421,35 @@ impl SoftwareInput {
             return;
         }
         let index = self.next.get();
-        let presses: [(u16, &str); 9] = [
-            (0x06, "z"),
-            (0x04, "h"),
-            (0x1f, "o"),
-            (0x2d, "n"),
-            (0x05, "g"),
-            (0x0d, "w"),
-            (0x0e, "e"),
-            (0x2d, "n"),
-            (0x31, " "),
-        ];
+        // zhongwen 后由 Space 确认；只有原始虚拟键码，没有预填拼音或目标中文的 Unicode 载荷。
+        let presses: [u16; 9] = [0x06, 0x04, 0x1f, 0x2d, 0x05, 0x0d, 0x0e, 0x2d, 0x31];
         assert!(index < presses.len());
         assert!(self.pending.borrow().is_none() && self.waiting.get().is_none());
-        // 固定ASCII按键只构造AppKit事件，原windowNumber负责本进程窗口路由。
-        // 不创建/投递Quartz事件，也不需要或申请全局事件权限；实际IME是否解释按键，
-        // 仍只能由原客户收到的marked、中文提交及真实面板收据证明，不能由构造成功代签。
-        let (keycode, characters) = presses[index];
-        let characters = NSString::from_str(characters);
+        // 原纯 NSEvent 构造在标准 NSTextView 对照中也未产生 marked；同一客户使用
+        // CG-backed 事件才进入真实组合。因此只更换对象构造，后面的原 AppKit 路由不变。
+        // NULL source 仅创建本地 CGEvent，不调用 CGEventPost/PostToPid、不申请全局事件权限，
+        // 也不切换当前输入源或模式；真正处理结果仍由原 marked、中文和面板收据证明。
+        let keycode = presses[index];
         let created = (|| -> Result<[Retained<NSEvent>; 2], &'static str> {
             let create = |key_down: bool| -> Result<Retained<NSEvent>, &'static str> {
-                let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
-                    if key_down { NSEventType::KeyDown } else { NSEventType::KeyUp },
-                    NSPoint::ZERO,
-                    NSEventModifierFlags::empty(),
-                    NSProcessInfo::processInfo().systemUptime(),
-                    self.window,
-                    None,
-                    &characters,
-                    &characters,
-                    false,
-                    keycode,
-                )
-                .ok_or("系统拒绝创建本次AppKit软件键盘事件")?;
+                let raw = CGEvent::new_keyboard_event(None, keycode, key_down)
+                    .ok_or("系统拒绝创建本次本地CG键盘事件")?;
+                let event = NSEvent::eventWithCGEvent(&raw).ok_or("系统拒绝包装本次CG键盘事件")?;
+                drop(raw); // NSEvent 按公开合同保留同一 CGEvent；本地额外 claim 不跨入后继队列。
+                let cg_backed = event.CGEvent().is_some();
+                let kind = if key_down {
+                    NSEventType::KeyDown
+                } else {
+                    NSEventType::KeyUp
+                };
+                if event.r#type() != kind || event.keyCode() != keycode || !cg_backed {
+                    return Err("实际CG包装事件的类型、键码或原事件对象不符");
+                } // 原系统包装失败不补建纯文字事件，也不静默改用另一条输入路径。
                 println!(
-                    "system_ime stage=software_key_prepared index={index} key_down={key_down} event_window_number={} timestamp_seconds={} transport=nsapplication_send_event software_events=true physical_keyboard=false",
+                    "system_ime stage=software_key_prepared index={index} key_down={key_down} event_type={:?} event_key_code={} event_modifier_flags={:?} event_window_number={} timestamp_seconds={} cg_backed={cg_backed} unicode_payload_set=false global_event_posted=false transport=nsapplication_send_event software_events=true physical_keyboard=false",
+                    event.r#type(),
+                    event.keyCode(),
+                    event.modifierFlags(),
                     event.windowNumber(),
                     event.timestamp(),
                 );
@@ -508,7 +501,7 @@ impl SoftwareInput {
         if self.stopped.get() || self.failed.get().is_some() {
             return true; // 已撤权的本地key直接归还，不发送给后继客户。
         }
-        // Space只接收最后一个字母已实际发布的原CPU票，不以面板可见性作为确认前置。
+        // Space只接收最后一个字母的原CPU票；真实面板已经被同票观察后才会准备这个按键。
         // 先把弱帧移到本同步栈再做Native查询；否则pending.take后的重入通知会再次看到
         // “尚未发送Space”的旧槽，既可能重复准备按键，也可能把正常确认后的换代误报撤权。
         let composition_frame = if index == 8 {
@@ -591,8 +584,9 @@ impl SoftwareInput {
             stop(&self.application);
             return true;
         }
-        // 事件显式携带原windowNumber；Native查询后仍核原窗口对象/context/输入源，
-        // 号码相同或NSApp.sendEvent可调用，都不能把本事件改投给后继客户。
+        // 原始 CG 包装事件的 windowNumber 可以为0，由 NSApplication 的真实 keyWindow 路由。
+        // 不私写窗口号或直投 NSWindow；Native 查询后仍核原窗口对象/context/输入源，
+        // 不能因为 AppKit 可分发事件就把它交给后来取得焦点的客户。
         if !admitted()
             || self.context.selectedKeyboardInputSource().as_deref() != Some(&*self.initial_source)
         {
@@ -665,7 +659,7 @@ impl SoftwareInput {
             return true;
         }
         println!(
-            "system_ime stage=software_key_dispatched index={index} send_event_returns_for_press=2 before_generation={generation} original_input_source=true transport=nsapplication_send_event software_events=true physical_keyboard=false"
+            "system_ime stage=software_key_dispatched index={index} send_event_returns_for_press=2 before_generation={generation} original_input_source=true cg_backed=true unicode_payload_set=false global_event_posted=false transport=nsapplication_send_event software_events=true physical_keyboard=false"
         );
         true
     }
@@ -808,8 +802,8 @@ impl SoftwareInput {
     }
 
     /// 真实key与CPU均退栈后的首次查询，或一次真实Host更新，共用同一原Input/CPU权限。
-    /// 面板与中文提交分别留下真实结果；Missing不阻断原Space，其余拒绝仍立即失败。
-    /// 原期限与固定键序不变，不为缺失面板重试、补wake或在确认后补签组合期几何。
+    /// 面板尚未上屏时保留原组合与CPU票，只让既有真实Host更新再次观察；其余拒绝仍立即失败。
+    /// 原期限与固定键序不变，不重发按键、补wake或在确认后补签组合期几何。
     fn observe_panel(&self, key: &NativeMarkdownPagedSceneKey, paints: usize) {
         if self.stopped.get()
             || self.failed.get().is_some()
@@ -861,7 +855,7 @@ impl SoftwareInput {
                 return Err("原组合起点没有同Input且完全位于组合范围内的实际firstRect");
             }
             // helper只读真实窗口。Host的CPU完成不能保证另一个进程的面板已发布；
-            // Missing仅记录这项尚未观察到，仍须完整原Input与几何才能独立确认中文。
+            // Missing只保留这次未完成事实，不能提前发送Space关闭仍在上屏的候选面板。
             let observed = match panel::observe(&self.initial_source, rect, current) {
                 Ok(observed) => observed,
                 Err(panel::PanelError::PanelMissing) => {
@@ -902,17 +896,22 @@ impl SoftwareInput {
             Ok(Some(observed))
         })();
         match observed {
-            Ok(observation) => {
-                // Some只代表当次真实可见且贴近组合起点的面板；None不能由后继中文补签。
-                // 两项结果独立：先走原Space/内容/历史验证，最终仍严格要求面板收据。
-                self.panel_observation.set(observation);
+            Ok(Some(observation)) => {
+                // 只有同原Input/CPU且真正可见、贴近组合起点的面板才授权准备Space。
+                // 该纯收据不保活系统窗口；最终中文、历史与面板检查仍各自必须通过。
+                self.panel_observation.set(Some(observation));
                 println!(
-                    "system_ime stage=composition_confirmation_admitted panel_observed={} original_input_cpu=true panel_not_a_precondition=true final_panel_gate_preserved=true deadline_unchanged=true software_events=true physical_keyboard=false",
-                    observation.is_some(),
+                    "system_ime stage=composition_confirmation_admitted panel_observed=true original_input_cpu=true final_panel_gate_preserved=true deadline_unchanged=true software_events=true physical_keyboard=false",
                 );
-                // 创建AppKit事件也可能同步通知；原递归保护要守到pending真实安装，不能在
-                // Missing分支提前放开而让同一Host更新再次创建Space。它不跨异步队列。
+                // 创建事件也可同步通知；保护守到pending真实安装，防止同一Host更新重复准备Space。
                 self.prepare_next();
+            }
+            Ok(None) => {
+                // 不取走panel_frame、不改原Input、不建立确认按键；下一次真实Host更新
+                // 只能沿同一个key/paints重查。没有新timer、wake、订阅或延长原30秒期限。
+                println!(
+                    "system_ime stage=awaiting_composition_panel panel_observed=false original_input_cpu=true actual_host_updates_only=true confirmation_dispatched=false deadline_unchanged=true software_events=true physical_keyboard=false"
+                );
             }
             Err(cause) => {
                 if self.failed.get().is_none() {
@@ -1470,7 +1469,7 @@ pub(super) fn run(
     let top = observe(body, Instant::now());
     view.command(sel!(moveToBeginningOfDocument:)).unwrap();
     deliver_visible("system_ime_return", body, top);
-    // 真实中文与一次历史事务已经独立完成；仍缺面板就返回失败，由父用例唯一严格关闭。
+    // 真实中文与一次历史事务已经完成；仍独立核最终面板收据，由父用例唯一严格关闭。
     // 不能因为文字正确而把未观察到的候选位置签成通过，也不能让这项缺证吞掉历史结果。
     let full_result = panel_observed != Some(false);
     println!(

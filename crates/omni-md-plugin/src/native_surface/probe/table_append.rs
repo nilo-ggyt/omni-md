@@ -382,11 +382,6 @@ pub struct NativeMarkdownHostedTableProbe {
     find_replacement: RefCell<Option<FindReplacementProbeFacts>>,
 }
 
-fn step<T>(current: &impl Fn() -> bool, work: impl FnOnce() -> T) -> Result<T, String> {
-    native_markdown_table_intent_step(current, work)
-        .map_err(|_| "原表格窗口、文稿或操作权限已撤销".to_owned())
-}
-
 impl NativeMarkdownHostedTableProbe {
     /// 只接真实 Host 已激活的根目录合成笔记；不创建会话、Native 图或替代宿主端口。
     /// 调用者拥有这张隔离样本及其目录，8 个场景才有权保存或创建固定冲突副本。
@@ -2925,18 +2920,37 @@ impl NativeMarkdownHostedTableProbe {
         Ok(())
     }
 
-    /// 点击实际装配的按钮；原controller自行捕获意图并排队，调用返回不是编辑完成证明。
+    /// 工具栏点击走原窗口命中路由；一次准备完整 Down/Up，不能在 Down 的 tracking 栈里才发送 Up。
+    /// 原controller仍自行捕获意图并排队，事件入队不代表格式、历史或信息卡已经完成。
     fn click_toolbar_button(&self, delta: u64, tag: isize) -> Result<(), String> {
         let facts = self.facts()?;
         let generation = facts
             .generation
             .checked_add(delta)
             .ok_or("工具栏代次溢出")?;
-        let button = with_active_native_markdown_surface(|surface| {
+        let (down, up, mtm) = with_active_native_markdown_surface(|surface| {
             let current = || self.current(surface, &facts, generation);
             if !current() {
                 return Err("工具栏点击前原文档已改变".into());
             }
+            let editor = surface.editor.as_ref().unwrap();
+            let before = editor
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            // 格草稿与父canonical是两个真实客户；工具栏滚动不能确认组合或偷偷切换活动格。
+            // 这些临时claim只服务本次Native坐标准备，不进入事件或下一轮观察槽。
+            let child = editor.body.active_cell_body();
+            let child_view = child
+                .as_ref()
+                .map(|child| child.view())
+                .transpose()
+                .map_err(|cause| cause.to_string())?;
+            let child_before = child_view
+                .as_ref()
+                .map(|view| view.input_state())
+                .transpose()
+                .map_err(|cause| cause.to_string())?;
             let controls = surface.controller.ivars().workspace_controls.get().unwrap();
             for control in controls.iter().skip(NATIVE_MARKDOWN_TOOLBAR_START) {
                 let Some(button) = control.downcast_ref::<NSButton>() else {
@@ -2948,21 +2962,75 @@ impl NativeMarkdownHostedTableProbe {
                     {
                         return Err("工具栏按钮不可用或会夺取文本焦点".into());
                     }
-                    return step(&current, || button.retain());
+                    let bounds = step(&current, || button.bounds())?;
+                    step(&current, || button.scrollRectToVisible(bounds))?;
+                    // 只显露原按钮并命中它的真实可见中心；不能用离屏坐标或直接action替代失败点击。
+                    // 这不是正文Reveal，原有Source目标和canonical选择均不获得新权限。
+                    let point = NSPoint::new(
+                        bounds.origin.x + bounds.size.width * 0.5,
+                        bounds.origin.y + bounds.size.height * 0.5,
+                    );
+                    if !step(&current, || NSPointInRect(point, button.visibleRect()))? {
+                        return Err("原工具栏按钮中心没有实际可见命中区域".into());
+                    }
+                    let window =
+                        step(&current, || button.window())?.ok_or("原工具栏按钮已脱离窗口")?;
+                    let original_window: &objc2_app_kit::NSWindow = &surface.panel;
+                    if !std::ptr::eq::<objc2_app_kit::NSWindow>(&*window, original_window) {
+                        return Err("原工具栏按钮不属于当前文稿窗口".into());
+                    }
+                    // NSEvent要求窗口坐标；同一原按钮负责转换，不从屏幕或窗口固定尺寸猜点击点。
+                    let point = step(&current, || button.convertPoint_toView(point, None))?;
+                    let number = step(&current, || window.windowNumber())?;
+                    let event = |kind, sequence, pressure| {
+                        NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                            kind, point, NSEventModifierFlags::empty(), 1.0, number, None,
+                            sequence, 1, pressure,
+                        ).ok_or("无法创建原工具栏窗口鼠标事件".to_owned())
+                    };
+                    let down = event(NSEventType::LeftMouseDown, 1, 1.0)?;
+                    let up = event(NSEventType::LeftMouseUp, 2, 0.0)?;
+                    // 两事件都构造成功才可发布；失败不能只留一个Down把原按钮tracking悬挂。
+                    // 显露横向工具栏只允许几何变化；父/子客户、组合态和完整选择不能借此重采。
+                    let same_child = match (&child, editor.body.active_cell_body()) {
+                        (Some(before), Some(after)) => Rc::ptr_eq(before, &after),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !current()
+                        || !same_child
+                        || editor
+                            .text_view
+                            .input_state()
+                            .map_err(|cause| cause.to_string())?
+                            != before
+                        || child_view
+                            .as_ref()
+                            .map(|view| view.input_state())
+                            .transpose()
+                            .map_err(|cause| cause.to_string())?
+                            != child_before
+                    {
+                        return Err("工具栏命中准备改变了原父子客户或完整Input".into());
+                    }
+                    return Ok((down, up, window.mtm()));
                 }
             }
             Err("实际工具栏没有所需按钮".into())
         })?;
-        // ACTIVE已归还，正常target callback才能捕原Cell子选区；不直接调用菜单实现或历史方法。
-        // SAFETY: 主线程上实际已安装且启用的NSButton，action/target均由产品装配并仍属于原owner。
-        unsafe { button.performClick(None) };
-        drop(button); // 不让诊断持有按钮跨后续事件或真实关闭，结果由下一阶段的canonical事实核验。
+        // ACTIVE、原按钮和父子客户强claim已归还；先把完整事件对放进同一AppKit队列，
+        // NSButton.mouseDown的真实tracking才可取到对应Up，不需全局事件权限或嵌套等待。
+        let application = NSApplication::sharedApplication(mtm);
+        application.postEvent_atStart(&down, false);
+        application.postEvent_atStart(&up, false);
         Ok(())
     }
 
     /// 字段激活前由真实窗口resize通知完成布局，往返后正文、选择和历史必须仍是同一基线。
     fn verify_toolbar_resize(&self, facts: &AppendFacts) -> Result<(), String> {
         let started = Instant::now();
+        // 显式目录只选择本次合成UI图的输出位置；普通验收不分配整窗bitmap、不写图。
+        let capture = ui_render::directory()?;
         let (panel, input) = with_active_native_markdown_surface(|surface| {
             if !self.current(surface, facts, facts.generation) {
                 return Err("缩放前原窗口已改变".into());
@@ -2974,9 +3042,11 @@ impl NativeMarkdownHostedTableProbe {
                 .text_view
                 .input_state()
                 .map_err(|cause| cause.to_string())?;
-            Ok((surface.panel.clone(), input))
+            Ok((Weak::from_retained(&surface.panel), input))
         })?;
         let original = panel
+            .load()
+            .ok_or("缩放原窗口已释放")?
             .contentView()
             .ok_or("缩放窗口缺少内容根")?
             .frame()
@@ -2988,16 +3058,29 @@ impl NativeMarkdownHostedTableProbe {
                 NSSize::new(1400.0, 900.0),
             ] {
                 // ACTIVE已归还；setContentSize触发原windowDidResize，不在probe调用布局实现补签。
-                panel.setContentSize(size);
-                panel.displayIfNeeded();
+                let window = panel.load().ok_or("缩放原窗口已释放")?;
+                window.setContentSize(size);
+                window.displayIfNeeded();
+                drop(window); // 只保原Weak跨CPU等待，不让诊断保活Native窗口。
                 self.verify_actual_toolbar_frames(facts, size)?;
+                if let Some(directory) = &capture {
+                    // 三个尺寸和最后恢复共用原started；PNG编码/写盘也计入这次三秒，绝不重置期限。
+                    self.wait_parent(facts, facts.generation, started, true)?;
+                    self.capture_toolbar_ui(facts, input, size, directory)?;
+                    if started.elapsed() > Duration::from_secs(3) {
+                        return Err("三尺寸实际CPU与内部渲染图超过原三秒期限".into());
+                    }
+                }
             }
             Ok(())
         })();
-        panel.setContentSize(original); // 即便某一尺寸失败，也先恢复原大小，保留最初的验收错误。
-        panel.displayIfNeeded();
-        let restored = self.verify_actual_toolbar_frames(facts, original);
-        drop(panel);
+        let restored = (|| {
+            let window = panel.load().ok_or("恢复尺寸前原窗口已释放")?;
+            window.setContentSize(original); // 失败也恢复原大小，保留最初验收错误。
+            window.displayIfNeeded();
+            drop(window);
+            self.verify_actual_toolbar_frames(facts, original)
+        })();
         result?;
         restored?;
         // 控件frame同步正确不代表正文已完成异步重排；restore同样会撤旧几何和CPU票。
@@ -3024,6 +3107,63 @@ impl NativeMarkdownHostedTableProbe {
             "native_toolbar_resize actual_delegate=true minimum=900x600 larger=1400x900 original_size_restored=true source_selection_history_unchanged=true formal=false"
         );
         Ok(())
+    }
+
+    /// 三尺寸只借原父正文已核CPU；共享模块独占bitmap与文件I/O，不让输出改变原帧权限。
+    fn capture_toolbar_ui(
+        &self,
+        facts: &AppendFacts,
+        input: NativeMarkdownPagedInputState,
+        size: NSSize,
+        directory: &Path,
+    ) -> Result<(), String> {
+        with_active_native_markdown_surface(|surface| {
+            let editor = surface.editor.as_ref().ok_or("UI图缺少原正文")?;
+            let key = editor
+                .text_view
+                .capture_ready_scene_key()
+                .map_err(|cause| cause.to_string())?;
+            let (published, paints) = editor
+                .text_view
+                .probe_cpu_published_frame()
+                .ok_or("UI图没有实际已发布CPU帧")?;
+            let current = || {
+                self.current(surface, facts, facts.generation)
+                    && key.request.input == input
+                    && editor
+                        .text_view
+                        .input_state()
+                        .is_ok_and(|actual| actual == input)
+                    && NativeMarkdownPagedTextViewDelegate::scene_current(&*editor.body, &key)
+                    && published.same(&key)
+                    && paints != 0
+                    && editor.text_view.cpu_paints() == Some(paints)
+                    && editor.text_view.cpu_paint_pending() == Some(false)
+            };
+            let scene =
+                NativeMarkdownPagedTextViewDelegate::ready_scene(&*editor.body, &key.request)
+                    .map_err(|cause| cause.to_string())?;
+            scene
+                .validate_ready(&current)
+                .map_err(|cause| cause.to_string())?;
+            let content =
+                step(&current, || surface.panel.contentView())?.ok_or("UI图缺少原窗口内容根")?;
+            if step(&current, || content.bounds())?.size != size {
+                return Err("UI图内容根尺寸不是本次预声明窗口".into());
+            }
+            let result = ui_render::write(directory, &content, "table-toolbar", paints, &current);
+            // Native缓存/编码即使先报撤权，仍保原Source/Font首因和实际updateLayer失败；不以PNG洗错。
+            scene
+                .validate_ready(&current)
+                .map_err(|cause| cause.to_string())?;
+            if let Some(cause) = editor.body.take_failure() {
+                return Err(format!("UI内部渲染时原正文失败：{cause}"));
+            }
+            if let Some(cause) = editor.text_view.take_failure() {
+                return Err(format!("UI内部渲染时原输入失败：{cause}"));
+            }
+            result
+        })
     }
 
     /// 仅此合成工具栏用例读取实际控件矩形、标题和中文AX；不调用生产几何函数推导“实际结果”。

@@ -39,6 +39,14 @@ mod subscript;
 mod table_append;
 mod terminal;
 pub(super) mod toolbar;
+mod ui_render;
+
+/// 原窗口、表格和内部渲染共同使用同一同步 Native 权限边界。
+/// 只在真实调用前后核原票，不能把查询过程中换代的结果交给后来窗口或输入客户。
+fn step<T>(current: &impl Fn() -> bool, work: impl FnOnce() -> T) -> Result<T, String> {
+    native_markdown_table_intent_step(current, work)
+        .map_err(|_| "原Markdown窗口、文稿或操作权限已撤销".to_owned())
+}
 pub use hosted_workload::{
     NativeMarkdownHostedFlow, NativeMarkdownHostedStep, NativeMarkdownHostedWorkload,
     write_native_markdown_giant_paragraph_fixture, write_native_markdown_memory_fixture,
