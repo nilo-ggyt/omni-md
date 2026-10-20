@@ -874,24 +874,38 @@ impl NativeMarkdownPagedInput {
     ) -> NativeMarkdownPagedInputCommit {
         let generation = document.generation();
         let folds_changed = *folds != prepared.folds;
-        *folds = prepared.folds; // 旧有限Vec在纯Rust发布内释放，不跨Native调用保留容量。
-        self.fold_revision.set(self.fold_revision.get() + 1); // begin已预检checked_add且busy禁止第二发布。
-        self.marked.set(marked);
-        // 生产输入和历史发布一个明确after，旧多范围在同一不可重入栈内释放。
-        drop(self.selection_ranges.replace(Vec::new()));
-        let serial = self
-            .selection
-            .publish(generation, prepared.selection, true, None, None);
-        let state = NativeMarkdownPagedInputState {
-            generation,
-            selection: prepared.selection,
-            selection_is_directed: true,
-            selection_range_count: 1,
-            primary_range: ordered_selection_range(prepared.selection),
-            marked,
-            utf16_len: prepared.length,
-            selection_serial: serial,
-            fold_revision: self.fold_revision.get(),
+        // 系统IME可在激活/辞任时提交空字符串。Core已经真实消费原prepare票并验证Source，
+        // 空替换的SelectionOnly结果不能凭空推进选择和fold版本，撤销刚签的首帧或模式票。
+        // 仍逐项比较实际发布结果：删除选区、清marked、折叠映射或多选收束都必须正常发布。
+        let unchanged = generation == permit.before.generation
+            && prepared.length == permit.before.utf16_len
+            && prepared.selection == permit.before.selection
+            && marked == permit.before.marked
+            && !folds_changed
+            && permit.before.selection_is_directed
+            && permit.before.selection_range_count == 1;
+        let state = if unchanged {
+            permit.before // 保原完整Input，包括真实导航侧、选择serial和fold revision，不重签旧票。
+        } else {
+            *folds = prepared.folds; // 旧有限Vec在纯Rust发布内释放，不跨Native调用保留容量。
+            self.fold_revision.set(self.fold_revision.get() + 1); // begin已预检checked_add且busy禁止第二发布。
+            self.marked.set(marked);
+            // 生产输入和历史发布一个明确after，旧多范围在同一不可重入栈内释放。
+            drop(self.selection_ranges.replace(Vec::new()));
+            let serial = self
+                .selection
+                .publish(generation, prepared.selection, true, None, None);
+            NativeMarkdownPagedInputState {
+                generation,
+                selection: prepared.selection,
+                selection_is_directed: true,
+                selection_range_count: 1,
+                primary_range: ordered_selection_range(prepared.selection),
+                marked,
+                utf16_len: prepared.length,
+                selection_serial: serial,
+                fold_revision: self.fold_revision.get(),
+            }
         };
         let commit = NativeMarkdownPagedInputCommit {
             owner: Rc::downgrade(self),

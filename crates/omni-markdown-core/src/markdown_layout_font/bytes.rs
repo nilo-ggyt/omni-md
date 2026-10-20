@@ -67,6 +67,8 @@ pub struct MarkdownLayoutFontBytes(Arc<Payload>);
 struct Payload {
     // VM由唯一owner实际munmap；observer仅保固定原子，不参与Font或映射保活。
     mapping: ReadonlyFontMapping,
+    // 只保留捕获时的文件标量身份；不同字号可复用同一冻结字节，不保源路径或源FD。
+    source: FileIdentity,
 }
 
 /// Drop步骤、实际munmap和descriptor关闭分别观察；多字段不是运行中事务快照。
@@ -127,6 +129,25 @@ impl MarkdownLayoutFontBytes {
     /// 非普通文件、末级符号链接、空/过大来源、路径替换、源变动或实际快照IO失败均拒绝。
     pub fn capture_file(path: &Path, max_bytes: u64) -> Result<Self> {
         capture(path, max_bytes, || {})
+    }
+
+    /// 在调用方现有有限字体集合内共享同一未变来源的冻结字节；不建立进程缓存。
+    /// 文件身份与首次捕获一致才可复用，face、轴位、字号仍由新Font各自解析和验证。
+    /// 与首次捕获相同，这项乐观复核不能识别外部蓄意恢复全部元数据的写入。
+    ///
+    /// # Errors
+    /// 来源不可访问、变成非普通文件或超出本次字节预算时拒绝；正常文件换代返回None。
+    pub fn share_unchanged_file(&self, path: &Path, max_bytes: u64) -> Result<Option<Self>> {
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(MarkdownLayoutFontBytesError::Storage)?;
+        if !regular(&metadata) {
+            return Err(MarkdownLayoutFontBytesError::NotRegularFile);
+        }
+        if metadata.len() > max_bytes {
+            return Err(MarkdownLayoutFontBytesError::FileTooLarge);
+        }
+        // 新inode、长度、mtime或ctime任一变化都回到真实捕获，不能只凭路径复用旧字体。
+        Ok((FileIdentity::from(&metadata) == self.0.source).then(|| self.clone()))
     }
     #[must_use]
     pub fn byte_len(&self) -> usize {
@@ -221,7 +242,10 @@ fn capture(
             .map_err(MarkdownLayoutFontBytesError::Storage)?;
         return Err(error); // 路径变动时先实际归还私有VM，再保留SourceChanged类别。
     }
-    Ok(MarkdownLayoutFontBytes(Arc::new(Payload { mapping })))
+    Ok(MarkdownLayoutFontBytes(Arc::new(Payload {
+        mapping,
+        source: identity,
+    })))
 }
 
 #[cfg(test)]
@@ -289,6 +313,42 @@ mod tests {
             Err(MarkdownLayoutFontBytesError::SourceChanged)
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"next");
+    }
+
+    #[test]
+    fn unchanged_font_source_shares_one_mapping_until_its_last_instance_releases() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("font.bin");
+        std::fs::write(&path, b"font").unwrap();
+        let first = MarkdownLayoutFontBytes::capture_file(&path, 4).unwrap();
+        let release = first.resource_observer();
+        let second = first.share_unchanged_file(&path, 4).unwrap().unwrap();
+        // 原观察者见到同一真实映射的生存期；不会因为另一个字号实例还活着而提前报归还。
+        drop(first);
+        assert!(!release.mapping_drop_completed());
+        assert_eq!(second.as_ref(), b"font");
+        assert_eq!(release.mapped_bytes(), 4);
+        drop(second);
+        assert!(release.mapping_drop_completed() && release.unmap_succeeded());
+        assert_eq!(release.mapped_bytes(), 0);
+        assert!(release.source_descriptor_closed() && release.backing_descriptor_closed());
+        assert!(!release.failed());
+    }
+
+    #[test]
+    fn replaced_font_source_is_recaptured_without_mutating_the_existing_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("font.bin");
+        let replacement = directory.path().join("replacement.bin");
+        std::fs::write(&path, b"font").unwrap();
+        let original = MarkdownLayoutFontBytes::capture_file(&path, 4).unwrap();
+        // 不同inode即使字节数相同也必须重新捕获，避免字体文件更新时套用旧字形数据。
+        std::fs::write(&replacement, b"next").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(original.share_unchanged_file(&path, 4).unwrap().is_none());
+        let next = MarkdownLayoutFontBytes::capture_file(&path, 4).unwrap();
+        assert_eq!(original.as_ref(), b"font");
+        assert_eq!(next.as_ref(), b"next");
     }
 
     #[test]

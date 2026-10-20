@@ -86,6 +86,112 @@ fn committed(outcome: NativeMarkdownPagedInputOutcome) -> NativeMarkdownPagedInp
 }
 
 #[test]
+fn empty_ime_commit_keeps_original_complete_input_and_existing_folds() {
+    for folded in [false, true] {
+        let original = "# A\n正文\n# B\n尾行";
+        let (_file, document) = fixture(original, 4096);
+        let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
+        let current = |_| true;
+        if folded {
+            let permit = owner.capture(1, &current).unwrap();
+            committed(owner.toggle_fold(&permit, 0, &current).unwrap());
+        }
+        // 模拟IME的空提交仍经过公开生产prepare/publish，不能靠跳过Core健康检查伪造无变化。
+        let before = owner.state().unwrap();
+        let permit = owner.capture(1, &current).unwrap();
+        let folds = owner.folded_layout_ranges(&permit, &current).unwrap();
+        let receipt = owner
+            .insert_text(&permit, "", unspecified(), &current)
+            .unwrap();
+        assert_eq!(owner.state().unwrap(), before);
+        assert_eq!(receipt.state, before);
+        assert!(receipt.check_current(&current).is_ok());
+        assert_eq!(
+            owner.folded_layout_ranges(&permit, &current).unwrap(),
+            folds
+        );
+        assert_eq!(text(&document), original);
+        assert!(!document.borrow().can_undo() && !document.borrow().can_redo());
+    }
+}
+
+#[test]
+fn empty_text_deletes_actual_selection_or_marked_range() {
+    for marked in [false, true] {
+        let (_file, document) = fixture("甲乙丙", 4096);
+        let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
+        let current = |_| true;
+        let permit = owner.capture(1, &current).unwrap();
+        if marked {
+            owner
+                .set_marked_text(
+                    &permit,
+                    "中",
+                    NSRange::new(1, 0),
+                    NSRange::new(0, 1),
+                    &current,
+                )
+                .unwrap();
+        } else {
+            committed(
+                owner
+                    .set_selection(
+                        &permit,
+                        MarkdownTextSelection {
+                            anchor_utf16: 0,
+                            head_utf16: 1,
+                        },
+                        &current,
+                    )
+                    .unwrap(),
+            );
+        }
+        // 空载荷并不等于空操作；原选区和真实marked都必须被删除且保留真实历史。
+        let before = owner.state().unwrap();
+        let permit = owner.capture(1, &current).unwrap();
+        let receipt = owner
+            .insert_text(&permit, "", unspecified(), &current)
+            .unwrap();
+        assert!(receipt.state.generation > before.generation);
+        assert!(receipt.state.marked.is_none());
+        assert_eq!(receipt.state.selection, MarkdownTextSelection::caret(0));
+        assert_eq!(text(&document), "乙丙");
+        assert!(document.borrow().can_undo());
+    }
+}
+
+#[test]
+fn empty_explicit_replacement_preserves_secondary_range_semantics() {
+    let (_file, document) = fixture("甲乙丙", 4096);
+    let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
+    let current = |_| true;
+    let permit = owner.capture(1, &current).unwrap();
+    committed(
+        owner
+            .set_selected_ranges(&permit, &[0..0, 2..3], &current)
+            .unwrap(),
+    );
+    let before = owner.state().unwrap();
+    let permit = owner.capture(1, &current).unwrap();
+    // 未指定范围仍拒绝多选歧义；显式次范围则真正删除，不能拿未变化的主caret吞掉它。
+    assert!(matches!(
+        owner.insert_text(&permit, "", unspecified(), &current),
+        Err(NativeMarkdownPagedInputError::MultipleSelectionInput)
+    ));
+    assert_eq!(owner.state().unwrap(), before);
+    // 显式范围是下一次独立输入请求，不能重放已由歧义拒绝消费的一次性许可。
+    let permit = owner.capture(1, &current).unwrap();
+    let receipt = owner
+        .insert_text(&permit, "", NSRange::new(2, 1), &current)
+        .unwrap();
+    assert!(receipt.state.generation > before.generation);
+    assert_eq!(receipt.state.selection_range_count, 1);
+    assert_eq!(receipt.state.selection, MarkdownTextSelection::caret(2));
+    assert_eq!(text(&document), "甲乙");
+    assert!(document.borrow().can_undo());
+}
+
+#[test]
 fn chinese_emoji_marked_replacement_and_history_use_real_core_transactions() {
     let (_file, document) = fixture("首尾", 4096);
     document

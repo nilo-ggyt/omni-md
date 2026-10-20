@@ -67,23 +67,25 @@ pub struct NativeMarkdownPagedFont {
     _main_thread: MainThreadMarker,
 }
 
-/// 本次候选的新快照与已有活动 owner 的借用具有不同释放义务；不以共享映射尚活误报泄漏。
+/// 新快照、完整字体复用和仅共享字节的释放义务不同；不能把原Body仍使用的映射误报为泄漏。
 pub(crate) enum NativeMarkdownFontCapture {
     Fresh(NativeMarkdownPagedFont),
     Reused(NativeMarkdownPagedFont),
+    // 新Native/Core实例共享本Body已有的冻结字体字节；拒绝候选不能要求仍使用的映射销毁。
+    SharedBytes(NativeMarkdownPagedFont),
 }
 impl NativeMarkdownFontCapture {
-    /// 两类候选都使用同一个不可变 Native/Core 字体，原 GCB 仍必须完成真实整形试次。
+    /// 返回本次已验证的Native/Core实例；共享字节不会跳过原GCB的真实整形试次。
     pub(crate) fn font(&self) -> &NativeMarkdownPagedFont {
         match self {
-            Self::Fresh(font) | Self::Reused(font) => font,
+            Self::Fresh(font) | Self::Reused(font) | Self::SharedBytes(font) => font,
         }
     }
 
-    /// Selected 把这一真实强边移交给 Body；复用结果保留原 Core payload 注册身份。
+    /// Selected把真实强边移交给Body；完整复用保原Core身份，新实例按原注册流程接纳。
     pub(crate) fn into_font(self) -> NativeMarkdownPagedFont {
         match self {
-            Self::Fresh(font) | Self::Reused(font) => font,
+            Self::Fresh(font) | Self::Reused(font) | Self::SharedBytes(font) => font,
         }
     }
 
@@ -91,7 +93,7 @@ impl NativeMarkdownFontCapture {
     pub(crate) fn fresh_bytes_observer(&self) -> Option<MarkdownLayoutFontBytesResourceObserver> {
         match self {
             Self::Fresh(font) => Some(font.bytes_observer()),
-            Self::Reused(_) => None,
+            Self::Reused(_) | Self::SharedBytes(_) => None,
         }
     }
 }
@@ -108,7 +110,10 @@ impl NativeMarkdownPagedFont {
         current: &(impl Fn() -> bool + ?Sized),
     ) -> Result<Self> {
         let original = metadata::read(font, current)?;
-        Self::capture_metadata(font, original, maximum_font_bytes, mtm, current)
+        let bytes = step(current, || {
+            MarkdownLayoutFontBytes::capture_file(&original.path, maximum_font_bytes)
+        })??;
+        Self::capture_metadata(font, original, bytes, mtm, current)
     }
 
     /// 只在系统已选出的实际候选内复用；不重排级联、不按名字猜字体，也不跳过后续原 GCB 试次。
@@ -129,21 +134,38 @@ impl NativeMarkdownPagedFont {
                 });
             }
         }
-        Self::capture_metadata(font, original, maximum_font_bytes, mtm, current)
-            .map(NativeMarkdownFontCapture::Fresh)
-    }
-
-    /// 只有未命中原实际字体时进入真实文件快照边界；精确 face/轴/尺寸仍由原解析器核验。
-    fn capture_metadata(
-        font: &CTFont,
-        original: metadata::Metadata,
-        maximum_font_bytes: u64,
-        mtm: MainThreadMarker,
-        current: &(impl Fn() -> bool + ?Sized),
-    ) -> Result<Self> {
+        // 同一源文件可产生多个字号或轴实例；只共享不可变字节，每个新实例仍完整核验来源。
+        // 这里仅遍历本Body已经拥有的有限palette，不另设全局目录或延长字体生命周期。
+        for registered in palette {
+            let captured = registered.native();
+            if captured.source_path != original.path {
+                continue;
+            }
+            let shared = step(current, || {
+                captured
+                    .bytes
+                    .share_unchanged_file(&original.path, maximum_font_bytes)
+            })??;
+            if let Some(bytes) = shared {
+                return Self::capture_metadata(font, original, bytes, mtm, current)
+                    .map(NativeMarkdownFontCapture::SharedBytes);
+            }
+        }
         let bytes = step(current, || {
             MarkdownLayoutFontBytes::capture_file(&original.path, maximum_font_bytes)
         })??;
+        Self::capture_metadata(font, original, bytes, mtm, current)
+            .map(NativeMarkdownFontCapture::Fresh)
+    }
+
+    /// 消费同票交付的冻结字节，逐实例核精确face/轴/尺寸；不按共享文件猜测Native身份。
+    fn capture_metadata(
+        font: &CTFont,
+        original: metadata::Metadata,
+        bytes: MarkdownLayoutFontBytes,
+        mtm: MainThreadMarker,
+        current: &(impl Fn() -> bool + ?Sized),
+    ) -> Result<Self> {
         let name_table = step(current, || original.name_bytes())??;
         let horizontal = metadata::horizontal_advances(font, original.glyph_count, current)?;
         let core = step(current, || {
