@@ -218,22 +218,54 @@ impl CpuSurface {
                 // updateLayer 可在 CoreText/AppKit 的同步回调里重入。这里只拒绝第二个写入者，
                 // 原候选仍由外层独占；健康的显示请求不应成为永久输入失败。
                 let current = || scene.current(view);
-                scene.scene.validate_ready(&current)?;
-                let layer = self.layer_current(view, &current);
-                scene.scene.validate_ready(&current)?;
-                layer?; // 真实 Source、字体和 Native 所有权错误仍原样失败，不能被合并请求掩盖。
+                let result = (|| {
+                    scene.scene.validate_ready(&current)?;
+                    let layer = self.layer_current(view, &current);
+                    scene.scene.validate_ready(&current)?;
+                    layer
+                })();
+                #[cfg(feature = "native-close-stage-diagnostic")]
+                self.trace_paint_failure("reentrant", view, scene, &result);
+                result?; // 真实 Source、字体和 Native 所有权错误仍原样失败，不能被合并请求掩盖。
                 self.repaint_requested.set(true);
                 return Ok(());
             }
             Err(cause) => return Err(cause),
         };
         let result = self.paint_inner(view, scene);
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        self.trace_paint_failure("paint_inner", view, scene, &result);
         drop(painting);
         let wake = self.wake_deferred(view); // 若真实嵌套主队列让出了延续，只在原绘图栈退出后重排同serial。
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        self.trace_paint_failure("wake_deferred", view, scene, &wake);
         match result {
             Err(error) => Err(error),
             Ok(()) => wake,
         } // 原绘图/Source首错不能被后继调度拒绝替换。
+    }
+    #[cfg(feature = "native-close-stage-diagnostic")]
+    fn trace_paint_failure(
+        &self,
+        stage: &str,
+        view: &NativeMarkdownPagedTextView,
+        scene: &SceneUse,
+        result: &Result<()>,
+    ) {
+        if let Err(cause) = result {
+            eprintln!(
+                "native_cpu_failure stage={stage} cause={:?} original={:?} actual={:?} original_geometry={} actual_geometry={} origin_current={} scene_current={} depth={} active_serial={:?}",
+                std::mem::discriminant(cause),
+                scene.origin.state,
+                scene.origin.input.state(),
+                scene.origin.geometry_epoch,
+                view.ivars().geometry_epoch.get(),
+                scene.origin.current(view),
+                scene.current(view),
+                view.ivars().depth.get(),
+                self.active_serial.get(),
+            );
+        }
     }
     fn paint_inner(
         self: &Rc<Self>,

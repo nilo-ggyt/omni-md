@@ -1224,6 +1224,7 @@ impl NativeMarkdownPagedTextView {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         self.foreground().is_ok()
     }
+    #[track_caller]
     fn failure(&self, error: NativeMarkdownPagedTextViewError) {
         let mut slot = self.ivars().last_failure.borrow_mut();
         if slot.is_none()
@@ -1242,6 +1243,16 @@ impl NativeMarkdownPagedTextView {
                     | NativeMarkdownPagedTextViewError::FoldAction(_)
             ))
         {
+            #[cfg(feature = "native-close-stage-diagnostic")]
+            eprintln!(
+                "native_input_failure cause={:?} caller={} geometry_epoch={} depth={} interpreting_key={} closed={}",
+                std::mem::discriminant(&error),
+                std::panic::Location::caller(),
+                self.ivars().geometry_epoch.get(),
+                self.ivars().depth.get(),
+                self.ivars().interpreting_key.get(),
+                self.ivars().closed.get(),
+            );
             *slot = Some(error);
         } // Pending/外部文件拒绝不能挡住真实源、资源或已提交后果首错；真实首错不被后续普通拒绝覆盖。
     }
@@ -1261,6 +1272,7 @@ impl NativeMarkdownPagedTextView {
         } // 没有原链时才显示当前原窗口；关闭或换笔记后不复活旧反馈。
     }
     /// 只有顶层真实mutation/command的void回调决定原解释结果；候选坐标Pending保协议负值。
+    #[track_caller]
     fn record_input(&self, result: Result<()>) {
         if let Err(cause) = result {
             #[cfg(feature = "native-input-trace")]
@@ -1286,12 +1298,14 @@ impl NativeMarkdownPagedTextView {
             }
         }
     }
+    #[track_caller]
     fn record(&self, result: Result<()>) {
         if let Err(error) = result {
             self.report_attachment_rejection(&error);
             self.failure(error);
         }
     }
+    #[track_caller]
     fn boolean_result(&self, result: Result<()>) -> bool {
         match result {
             Ok(()) => true,
