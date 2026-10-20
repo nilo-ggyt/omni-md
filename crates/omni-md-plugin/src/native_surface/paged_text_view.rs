@@ -269,16 +269,46 @@ define_class!(
             } else {
                 let result = (|| {
                 let input = self.ivars().input.borrow().clone().ok_or(NativeMarkdownPagedTextViewError::Closed)?;
-                if input.state()?.marked.is_some() {
-                    self.apply_unmark()?; // 仍有真实候选时必须同步提交，不能因排版失败跳过或丢弃组合。
-                }
                 let before = input.state()?;
                 let context = self.ivars().context.borrow().clone().ok_or(NativeMarkdownPagedTextViewError::ContextUnavailable)?;
-                // 辞任只需结束本客户的真实context；无marked时不向已failed的排版owner申请编辑权限。
-                context.0.deactivate();
-                if self.ivars().closed.get() { return Ok(()); } // Native重入已封闭的空客户不能再阻止原窗口detach。
-                if input.state()? != before { return Err(NativeMarkdownPagedTextViewError::Revoked); }
-                Ok(())
+                let delegate = self.ivars().delegate.borrow().as_ref().and_then(Weak::upgrade)
+                    .ok_or(NativeMarkdownPagedTextViewError::Revoked)?;
+                let epoch = self.ivars().epoch;
+                if !self.same_input_context(&input, &delegate, &context)
+                    || (before.marked.is_some() && !delegate.current(epoch))
+                    || !self.same_input_context(&input, &delegate, &context)
+                { return Err(NativeMarkdownPagedTextViewError::Revoked); }
+                // IMK停用可以合法回调insertText/unmarkText。先保留原marked替换权限，
+                // 不能先local-unmark让该次真实提交落到caret，再把它误判为Input失权。
+                // 回调自己的Input许可仍完整检查；这里只核原客户身份，不要求完整Input不变。
+                let deactivated = self.input_context_step(|| context.0.deactivate());
+                if self.ivars().closed.get() {
+                    if let Err(cause) = deactivated { self.failure(cause); }
+                    return Ok(()); // 已封闭的空客户仍不能阻止原窗口detach；真实回调失败保留在原槽。
+                }
+                if self.ivars().epoch != epoch || !self.same_input_context(&input, &delegate, &context) {
+                    return deactivated.and(Err(NativeMarkdownPagedTextViewError::Revoked));
+                }
+                if input.state()?.marked.is_some() {
+                    // 没有终结组合的IME仍由原Input接受当前已显示文字，然后结束原转换会话。
+                    // 无marked的failed排版owner保持可辞任，不为纯客户释放新增编辑/Scene准入。
+                    let finished = self.finish_composition_in_context(&input, &delegate, &context, epoch);
+                    deactivated?;
+                    return finished;
+                }
+                if before.marked.is_some() && !delegate.current(epoch) {
+                    return deactivated.and(Err(NativeMarkdownPagedTextViewError::Revoked));
+                }
+                match deactivated {
+                    Err(cause @ NativeMarkdownPagedTextViewError::Revoked)
+                        if before.marked.is_none() && !delegate.current(epoch) => {
+                            // 原failed正文已经没有组合，停用中的迟到输入只能被撤权。
+                            // 保该真实失败，不让它重新困住这个仅需释放焦点的空客户；Source等其它错误仍返回。
+                            self.failure(cause);
+                            Ok(())
+                        }
+                    result => result,
+                }
                 })();
                 self.boolean_result(result)
             }

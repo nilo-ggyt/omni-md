@@ -437,6 +437,7 @@ fn native_client_protocol(mtm: MainThreadMarker) {
             assert_eq!(substring.string().to_string(), "中文🙂");
             drop(substring);
             marked_pixels(&body, &view, &window, &scroll, &document_weak);
+            marked_focus_release(&body, &view, &window, &document_weak);
             assert_eq!(std::fs::read(file.path()).unwrap(), b" "); // 未保存协议编辑无权回写原文件。
 
             let mut native = body.native_weaks().unwrap();
@@ -480,7 +481,7 @@ fn native_client_protocol(mtm: MainThreadMarker) {
     assert!(receipts.iter().all(|receipt| receipt.reader.is_some()));
     verify_source_release(receipts);
     println!(
-        "paged_body_source stage=client_protocol actual_body=true marked_unicode=true exact_history=true empty_input=true context_client_nonretaining=true source_disk_unchanged=true actual_native_mmap_font_pixel_released=true physical_ime=false whole_product=false formal=false"
+        "paged_body_source stage=client_protocol actual_body=true marked_unicode=true marked_focus_release=true exact_history=true empty_input=true context_client_nonretaining=true source_disk_unchanged=true actual_native_mmap_font_pixel_released=true physical_ime=false whole_product=false formal=false"
     );
 }
 
@@ -498,6 +499,51 @@ struct MarkedPixelSample {
     format: NSBitmapFormat,
     profile: Vec<u8>,
     pixels: Vec<u8>,
+}
+
+/// 原窗口真正移交firstResponder；协议候选只证明客户收尾，不冒充系统输入法候选会话。
+/// 固定短文字必须在辞任后完整保留，且整组只能用一次原Undo恢复此前的独立正文。
+fn marked_focus_release(
+    body: &NativeMarkdownPagedBody,
+    view: &NativeMarkdownPagedTextView,
+    window: &NSWindow,
+    document: &std::rc::Weak<RefCell<MarkdownDocumentBuffer>>,
+) {
+    assert!(window.makeFirstResponder(Some(view)));
+    let selected = observe(body, Instant::now());
+    view.command(sel!(selectAll:)).unwrap();
+    deliver_frame("client_marked_focus_selection", body, selected);
+    let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(view);
+    let marked = observe(body, Instant::now());
+    // SAFETY: 仅固定四个UTF16单元的原客户协议调用；不发按键、不选择或切换系统输入源。
+    unsafe {
+        client.setMarkedText_selectedRange_replacementRange(
+            &NSString::from_str("失焦🙂"),
+            NSRange::new(4, 0),
+            NSRange::new(NSNotFound as usize, 0),
+        );
+    }
+    deliver_frame("client_marked_focus_candidate", body, marked);
+    client_text(document, "失焦🙂");
+    let before = view.input_state().unwrap();
+    assert_eq!(before.marked, Some(NSRange::new(0, 4)));
+    let resigned = observe(body, Instant::now());
+    assert!(window.makeFirstResponder(None));
+    deliver_frame("client_marked_focus_resigned", body, resigned);
+    // 没有注入IME事件，本次协议文字的保留由原Input收尾负责；deactivate不得重复追加它。
+    // 辞任允许真实unmark改变selection_serial，不能要求整个InputState仍等于旧候选状态。
+    client_text(document, "失焦🙂");
+    let after = view.input_state().unwrap();
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.selection, before.selection);
+    assert_eq!(after.utf16_len, before.utf16_len);
+    assert!(after.marked.is_none());
+    assert!(view.take_failure().is_none());
+    let undone = observe(body, Instant::now());
+    view.command(sel!(undo:)).unwrap();
+    deliver_frame("client_marked_focus_one_undo", body, undone);
+    client_text(document, "a");
+    // 继续原用例的磁盘不变与全图关闭门；不新建App、Body或替代输入上下文。
 }
 
 /// 只缓存实际已发布 View 的一个完整 CJK 字形邻域；不调用 Scene.paint 或另画期望画布。

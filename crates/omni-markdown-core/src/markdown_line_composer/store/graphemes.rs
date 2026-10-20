@@ -398,9 +398,13 @@ impl GlyphStore {
         Ok(value.is_some_and(|value| value.utf16 == offset))
     }
 
-    /// 范围的两个端点共用本次原查询游标，不向 Store 增加字段或预取任何未请求记录。
-    /// 右端完成后只沿同一目录向左；非精确命中仍为 false，内部标量 seam 不因此变成 GCB。
-    pub(super) fn is_grapheme_range(&mut self, range: &Range<usize>) -> Result<bool> {
+    /// 精确核原范围两端，并交回本次已解码的右端游标；非 GCB 返回 None，不签新边界。
+    /// 整行从原目录起查；内部 part 只借同次行尾副本继续向左，不向 Store 增加状态或预取。
+    pub(super) fn grapheme_range_end(
+        &mut self,
+        range: &Range<usize>,
+        preceding: Option<&BoundarySearch>,
+    ) -> Result<Option<BoundarySearch>> {
         let directory = self.grapheme_directory()?;
         if range.start > range.end || range.end > self.source.utf16_len() {
             return Err(Error::InvalidRequest);
@@ -411,7 +415,16 @@ impl GlyphStore {
         }
         let bytes = self.source.byte_len();
         let units = self.source.utf16_len();
-        let mut query = BoundarySearch::offset(range.end);
+        let mut query = match preceding {
+            Some(right) => {
+                // 原行右端已经实际读取并解码；这里只复制固定查询事实，所有后继记录仍走
+                // 原 step 的 ordinal、skip、previous 和字节顺序校验，不能从坐标猜 GCB。
+                let mut query = right.clone();
+                query.preceding_offset(range.end)?;
+                query
+            }
+            None => BoundarySearch::offset(range.end),
+        };
         // 先定位右端，让左端沿同一反链复用已认证路径；两个源长度仍来自当前冻结来源。
         let right = query
             .step(directory, bytes, units, usize::MAX, |record| {
@@ -422,6 +435,9 @@ impl GlyphStore {
             .ok_or(Error::InconsistentCoverage)?
             .1;
         self.guard()?; // 第一次真实 IO 后仍核原 Source；没有用共享路径跳过取消或首错。
+        // 后续左端会移动原游标；保留右端只供本次行组合内的其他 part 使用。
+        // 即使目标恰是已解码 current、没有 pread，前后的 guard 也仍必须执行。
+        let right_query = query.clone();
         query.preceding_offset(range.start)?;
         let left = query
             .step(directory, bytes, units, usize::MAX, |record| {
@@ -433,7 +449,8 @@ impl GlyphStore {
             .1;
         self.guard()?;
         // 查找可返回目标右侧的真实边界；必须分别精确命中，才能签出完整范围。
-        Ok(left.is_some_and(|value| value.utf16 == range.start)
+        Ok((left.is_some_and(|value| value.utf16 == range.start)
             && right.is_some_and(|value| value.utf16 == range.end))
+        .then_some(right_query))
     }
 }

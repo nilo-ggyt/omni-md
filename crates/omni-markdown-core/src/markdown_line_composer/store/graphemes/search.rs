@@ -16,6 +16,8 @@ enum Next {
 }
 
 /// Retain one authenticated directory record and its next link, without a reader or a second GCB index.
+/// 本次行组合可复制已解码的右端，再各自向左查真实 part；副本不持资源，也不跨行保留。
+#[derive(Clone)]
 pub(in crate::markdown_line_composer::store) struct BoundarySearch {
     target: Target,
     current: Option<BoundaryRecord>,

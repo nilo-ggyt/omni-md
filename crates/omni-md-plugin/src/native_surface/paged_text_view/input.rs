@@ -46,6 +46,8 @@ impl NativeMarkdownPagedTextView {
         if self.is_busy() {
             return Err(NativeMarkdownPagedTextViewError::Busy);
         }
+        // discard可以同步回调客户；原view payload必须活到本次Native栈退出，关闭仍走既有Busy/延后归还。
+        let _use = crate::payload_use::PayloadUseGuard::enter(&self.ivars().depth);
         let input = self
             .ivars()
             .input
@@ -55,11 +57,120 @@ impl NativeMarkdownPagedTextView {
         if input.state()?.marked.is_none() {
             return Ok(()); // 没有组合就没有提交事务；排版失败不应阻止原canonical保存与正常关闭。
         }
-        self.apply_unmark()?;
+        let origin = self.origin()?;
+        let context = self
+            .ivars()
+            .context
+            .borrow()
+            .clone()
+            .ok_or(NativeMarkdownPagedTextViewError::ContextUnavailable)?;
+        self.finish_composition_in_context(&input, &origin.delegate, &context, origin.epoch)
+    }
+
+    /// 保存与真正辞任后剩余的组合共用原客户收尾；这不是另一次输入请求或重新捕获目标。
+    /// 只接受该 Input 原已显示文字，系统上下文结束期间仍准许原客户的真实协议回调。
+    pub(super) fn finish_composition_in_context(
+        &self,
+        input: &std::rc::Rc<super::NativeMarkdownPagedInput>,
+        delegate: &std::rc::Rc<dyn super::NativeMarkdownPagedTextViewDelegate>,
+        context: &std::rc::Rc<super::InputContextOwner>,
+        epoch: u64,
+    ) -> Result<()> {
+        if !self.same_input_context(input, delegate, context)
+            || self.ivars().epoch != epoch
+            || !delegate.current(epoch)
+            || !self.same_input_context(input, delegate, context)
+        {
+            return Err(NativeMarkdownPagedTextViewError::Revoked);
+        }
+        // 保存接受客户已经显示的组合文字，不擅自选择候选词。先由原 Input 真正结束
+        // Core 组合；discard 只结束系统转换会话，不能冒充一次 insertText 或提交收据。
+        self.cancel_link_intent();
+        let mut origin = self.origin()?;
+        if !std::rc::Rc::ptr_eq(&origin.input, input)
+            || !std::rc::Rc::ptr_eq(&origin.delegate, delegate)
+        {
+            return Err(NativeMarkdownPagedTextViewError::Revoked);
+        }
+        origin.interpreted =
+            self.ivars().interpreting_key.get() && self.ivars().input_callback_depth.get() == 1;
+        let current = |epoch| epoch == origin.epoch && origin.current(self);
+        let permit = input.capture(epoch, &current)?;
+        let unmarked = input.unmark(&permit, &current)?;
+        if !self.same_input_context(input, delegate, context)
+            || self.ivars().epoch != epoch
+            || !delegate.current(epoch)
+            || !self.same_input_context(input, delegate, context)
+        {
+            return Err(NativeMarkdownPagedTextViewError::CommittedEffect(Box::new(
+                NativeMarkdownPagedTextViewError::Revoked,
+            )));
+        }
+        // 先清系统转换，再交原unmark收据的显示通知。否则invalidateCharacterCoordinates
+        // 本身也可能回调仍持旧缓冲的IME，使它在本地marked已清后把旧文字追加到caret。
+        // 全部 RefCell/Doc 借用已结束；这里只结束原会话，不用discard伪造Core提交结果。
+        let discarded = self.input_context_step(|| context.0.discardMarkedText());
+        let current = self.same_input_context(input, delegate, context)
+            && self.ivars().epoch == epoch
+            && delegate.current(epoch)
+            && self.same_input_context(input, delegate, context);
+        if !current {
+            return discarded.and(Err(NativeMarkdownPagedTextViewError::CommittedEffect(
+                Box::new(NativeMarkdownPagedTextViewError::Revoked),
+            )));
+        }
+        let displayed = self.finish_edit_outcome(&origin, unmarked);
+        discarded?;
+        displayed?;
         if input.state()?.marked.is_some() {
             return Err(super::NativeMarkdownPagedInputError::CompositionActive.into());
         }
         Ok(())
+    }
+
+    /// 同步上下文回调只借原客户；合法提交可改变完整 Input，但不能改用后继挂载的身份。
+    /// InputTarget 在构造后不可变，同一 Input Rc 固定原 Doc/草稿；格内容版本会随真实输入变化，
+    /// 因此这里不能比较旧 TargetDomain 中的 content_serial，更不能拿旧 Scene 补签新文字。
+    pub(super) fn same_input_context(
+        &self,
+        input: &std::rc::Rc<super::NativeMarkdownPagedInput>,
+        delegate: &std::rc::Rc<dyn super::NativeMarkdownPagedTextViewDelegate>,
+        context: &std::rc::Rc<super::InputContextOwner>,
+    ) -> bool {
+        !self.ivars().closed.get()
+            && self
+                .ivars()
+                .input
+                .borrow()
+                .as_ref()
+                .is_some_and(|actual| std::rc::Rc::ptr_eq(actual, input))
+            && self
+                .ivars()
+                .delegate
+                .borrow()
+                .as_ref()
+                .is_some_and(|actual| {
+                    std::rc::Weak::ptr_eq(actual, &std::rc::Rc::downgrade(delegate))
+                })
+            && self
+                .ivars()
+                .context
+                .borrow()
+                .as_ref()
+                .is_some_and(|actual| std::rc::Rc::ptr_eq(actual, context))
+    }
+
+    /// NSTextInputClient 的写回是 void；本次真实上下文调用必须取回其回调首错。
+    /// 暂存并恢复此前视图错误，不给这里伪造 keyDown/菜单解释权限，也不让旧 Pending
+    /// 冒充本次转换失败。Native 调用和回调期间没有持有错误槽或正文的 RefCell 借用。
+    pub(super) fn input_context_step(&self, operation: impl FnOnce()) -> Result<()> {
+        let previous = self.ivars().last_failure.borrow_mut().take();
+        operation();
+        let callback = self.ivars().last_failure.borrow_mut().take();
+        if let Some(previous) = previous {
+            self.failure(previous);
+        }
+        callback.map_or(Ok(()), Err)
     }
 
     /// 延后导航只能通知已提交的原收据；此处新origin仅供显示副作用，不重签导航before或位置。

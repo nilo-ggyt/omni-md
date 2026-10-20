@@ -1,4 +1,5 @@
 //! 原Store测量选中的整行，按同Source真实L1/L2次序组合，不把每个item结尾当换行。
+use super::graphemes::BoundarySearch;
 use super::output;
 use super::*;
 use crate::markdown_soft_line_measure::provider::{
@@ -74,10 +75,13 @@ impl GlyphStore {
             {
                 return Err(Error::SourceMismatch);
             }
-            let anchor = self.directory(current)?;
+            let anchor = LocatedItem {
+                proof: current.clone(),
+                directory: self.directory(current)?,
+            };
             if !self
                 .fonts
-                .resolve(anchor.font)?
+                .resolve(anchor.directory.font)?
                 .font()
                 .permits(&original.font)
             {
@@ -93,9 +97,9 @@ impl GlyphStore {
             {
                 return Err(Error::InconsistentCoverage);
             }
-            if !self.is_grapheme_range(&range)? {
-                return Err(Error::InconsistentCoverage);
-            }
+            let line_grapheme_end = self
+                .grapheme_range_end(&range, None)?
+                .ok_or(Error::InconsistentCoverage)?;
             #[cfg(feature = "paged-shaping-frontier")]
             if matches!(
                 original.selected.kind,
@@ -125,16 +129,17 @@ impl GlyphStore {
             let located_last;
             // 原 measure 的 anchor 已由同 Store/proof 完整读取；末点确在它内部时直接借这份事实。
             // 跨 item 的行仍真实定位最后一项，两个借用都只活在本次行组合，不放入后继状态。
-            let (last_proof, last_item) = if anchor.facts.source_utf16.contains(&last_point) {
-                self.fonts.resolve(anchor.font)?;
+            let last = if anchor.directory.facts.source_utf16.contains(&last_point) {
+                self.fonts.resolve(anchor.directory.font)?;
                 self.guard()?;
-                (current, &anchor)
+                &anchor
             } else {
                 located_last = self
                     .item_at(last_point)?
                     .ok_or(Error::InconsistentCoverage)?;
-                (&located_last.proof, &located_last.directory)
+                &located_last
             };
+            let last_item = &last.directory;
             let hard_break = matches!(
                 last_item.kind,
                 super::super::MarkdownComposedLinePartKind::ParagraphBreak
@@ -230,26 +235,27 @@ impl GlyphStore {
                         // 只复用本次已经真实读取的 anchor/末项；contains 选择原票，不从范围新造权限。
                         // 其他 item 仍走原 forest。复用前照核实际 Font 与 Source/取消，不能让目录
                         // 不可变掩盖弱注册撤权；后续 part 的 GCB、UBA seam 和 unsafe 检查保持原样。
-                        let reusable = if anchor.facts.source_utf16.contains(&point) {
-                            Some((current, &anchor))
+                        let reusable = if anchor.directory.facts.source_utf16.contains(&point) {
+                            Some(&anchor)
                         } else if last_item.facts.source_utf16.contains(&point) {
-                            Some((last_proof, last_item))
+                            Some(last)
                         } else {
                             None
                         };
                         let located;
-                        let (proof, item) = match reusable {
+                        let actual = match reusable {
                             Some(actual) => {
-                                self.fonts.resolve(actual.1.font)?;
+                                self.fonts.resolve(actual.directory.font)?;
                                 self.guard()?;
                                 actual
                             }
                             None => {
                                 located =
                                     self.item_at(point)?.ok_or(Error::InconsistentCoverage)?;
-                                (&located.proof, &located.directory)
+                                &located
                             }
                         };
+                        let item = &actual.directory;
                         let segment = visual.start.max(item.facts.source_utf16.start)
                             ..visual.end.min(item.facts.source_utf16.end);
                         if (backwards && segment.end != at) || (!backwards && segment.start != at) {
@@ -259,11 +265,11 @@ impl GlyphStore {
                             return Err(Error::NeedsBidiAssembly);
                         } // L1改变整形方向时须真实重形，不能反转glyph或强制方向。
                         self.append_selected_part(
-                            proof,
-                            item,
+                            actual,
                             segment.clone(),
                             run.level,
                             &range,
+                            &line_grapheme_end,
                             &mut totals,
                         )?;
                         at = if backwards {
@@ -285,11 +291,11 @@ impl GlyphStore {
             }
             if hard_break {
                 self.append_selected_part(
-                    last_proof,
-                    last_item,
+                    last,
                     last_item.facts.source_utf16.clone(),
                     last_item.facts.level,
                     &range,
+                    &line_grapheme_end,
                     &mut totals,
                 )?;
             }
@@ -362,27 +368,35 @@ impl GlyphStore {
     /// 整行两端仍是 GCB；内部视觉分段还可消费原 item 同来源的 UBA 标量 seam。
     fn append_selected_part(
         &mut self,
-        proof: &StoredItemProof,
-        item: &Directory,
+        actual: &LocatedItem,
         source: Range<usize>,
         level: u8,
         line: &Range<usize>,
+        line_grapheme_end: &BoundarySearch,
         totals: &mut Totals,
     ) -> Result<()> {
         self.guard()?;
+        // 原定位值把同次读取的目录和弱票一起借入；它不保资源，也不把控制范围当 UBA run。
+        // 同次行尾游标只缩短原查找路径，不把任意视觉端点或普通 item 边缘升级为字素边界。
+        let proof = &actual.proof;
+        let item = &actual.directory;
         // 非 GCB 只允许原 Store 签入的 item 本端，不能让任意视觉范围绕过字素校验。
         // 原相邻 resolved levels 已在捕获与目录解码复核；这里没有重写 level 或拆分字形。
         let check_start = source.start != line.start
             && (source.start != item.facts.source_utf16.start || item.shaping_seams[0].is_none());
         let check_end = source.end != line.end
             && (source.end != item.facts.source_utf16.end || item.shaping_seams[1].is_none());
-        let boundaries = match (check_start, check_end) {
-            (true, true) => self.is_grapheme_range(&source)?,
-            (true, false) => self.is_grapheme(source.start)?,
-            (false, true) => self.is_grapheme(source.end)?,
-            (false, false) => true,
+        let checked = match (check_start, check_end) {
+            (true, true) => Some(source.clone()),
+            (true, false) => Some(source.start..source.start),
+            (false, true) => Some(source.end..source.end),
+            (false, false) => None,
         };
-        if !boundaries {
+        if let Some(checked) = checked
+            && self
+                .grapheme_range_end(&checked, Some(line_grapheme_end))?
+                .is_none()
+        {
             return Err(Error::InconsistentCoverage);
         }
         if item.kind != super::super::MarkdownComposedLinePartKind::Glyphs {

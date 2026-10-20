@@ -59,6 +59,7 @@ struct ItemKey {
 }
 
 /// 只在当前查询/行组合借用期保留这一张弱票，不形成按item数增长的Weak集合。
+#[derive(Clone)]
 pub(super) struct StoredItemProof {
     store: Weak<()>,
     key: ItemKey,
