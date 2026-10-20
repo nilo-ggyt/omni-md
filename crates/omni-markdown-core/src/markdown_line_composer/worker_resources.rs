@@ -66,6 +66,23 @@ pub struct MarkdownLineComposerResolveResources {
     pub cleanup_failed: bool,
 }
 
+/// 原表格结构分页目录的固定角色；单个 FD 和 16KiB 页不随行数形成常驻 owner 表。
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-shaping-frontier"
+))]
+#[derive(Clone, Copy, Debug)]
+pub struct MarkdownLineComposerTableResources {
+    pub owner_released: bool,
+    pub directory_created: bool,
+    pub file_open: bool,
+    pub mapped_bytes: usize,
+    pub buffer_bytes: usize,
+    pub peak_buffer_bytes: usize,
+    pub cleanup_failed: bool,
+    pub reader_failed: bool,
+}
+
 /// None明确表示该固定角色尚未创建；coverage_complete=false时不能签完整worker释放。
 #[derive(Clone, Copy, Debug)]
 pub struct MarkdownLineComposerWorkerResources {
@@ -81,6 +98,11 @@ pub struct MarkdownLineComposerWorkerResources {
     pub graphemes: Option<MarkdownGraphemeResourceSnapshot>,
     pub line_breaks: Option<MarkdownLineBreakResourceSnapshot>,
     pub writer: Option<MarkdownComposedLineResources>,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub table_directory: Option<MarkdownLineComposerTableResources>,
     pub shapes: MarkdownLineComposerShapeResources,
     pub clusters: MarkdownLineComposerClusterResources,
     pub resolvers: MarkdownLineComposerResolveResources,
@@ -129,6 +151,29 @@ impl MarkdownLineComposerWorkerResources {
                     && !value.cleanup_failed
                     && !value.reader_failed
             })
+            && {
+                #[cfg(all(
+                    feature = "s2-table-window-prototype",
+                    feature = "paged-shaping-frontier"
+                ))]
+                {
+                    self.table_directory.is_none_or(|value| {
+                        value.owner_released
+                            && !value.file_open
+                            && value.mapped_bytes == 0
+                            && value.buffer_bytes == 0
+                            && !value.cleanup_failed
+                            && !value.reader_failed
+                    })
+                }
+                #[cfg(not(all(
+                    feature = "s2-table-window-prototype",
+                    feature = "paged-shaping-frontier"
+                )))]
+                {
+                    true
+                }
+            }
             && self.shapes.active == 0
             && self.shapes.registered == self.shapes.settled
             && self.shapes.files_created == self.shapes.files_closed
@@ -160,6 +205,11 @@ struct Records {
     scripts: Option<MarkdownScriptResourceObserver>,
     breaks: Option<MarkdownLayoutBreakResourceObserver>,
     writer: Option<MarkdownComposedLineResourceObserver>,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    table_directory: Option<crate::markdown_layout_source::table_rows::TablePlanObserver>,
     shapes: MarkdownLineComposerShapeResources,
     clusters: MarkdownLineComposerClusterResources,
     resolvers: MarkdownLineComposerResolveResources,
@@ -193,6 +243,25 @@ impl MarkdownLineComposerWorkerResourceObserver {
             }
             None => (None, None),
         }; // 没创建的角色保留None；已创建的角色始终回读其原始实际收据。
+        #[cfg(all(
+            feature = "s2-table-window-prototype",
+            feature = "paged-shaping-frontier"
+        ))]
+        let table_directory = if let Some(observer) = &records.table_directory {
+            let actual = observer.snapshot();
+            Some(MarkdownLineComposerTableResources {
+                owner_released: actual.owner_released,
+                directory_created: actual.file.is_some(),
+                file_open: actual.file.is_some_and(|file| file.file_open),
+                mapped_bytes: actual.file.map_or(0, |file| file.mapped_bytes),
+                buffer_bytes: actual.file.map_or(0, |file| file.buffer_bytes),
+                peak_buffer_bytes: actual.file.map_or(0, |file| file.peak_buffer_bytes),
+                cleanup_failed: actual.file.is_some_and(|file| file.cleanup_failed),
+                reader_failed: actual.file.is_some_and(|file| file.reader_failed),
+            })
+        } else {
+            None
+        };
         Some(MarkdownLineComposerWorkerResources {
             coverage_complete: !self.0.bidi_unobserved.load(Ordering::Acquire)
                 && !self.0.frontier_unobserved.load(Ordering::Acquire)
@@ -214,6 +283,11 @@ impl MarkdownLineComposerWorkerResourceObserver {
             graphemes,
             line_breaks,
             writer: records.writer.as_ref().map(|value| value.snapshot()),
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            table_directory,
             shapes: records.shapes,
             clusters: records.clusters,
             resolvers: records.resolvers,
@@ -282,6 +356,24 @@ impl ComposerResourceScope {
             Some(())
         });
     }
+    /// 与原 scripts/breaks/writer 同一固定角色账本；只允许当前结构目录登记一次实际收据。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub(super) fn register_table_directory(
+        &self,
+        observer: crate::markdown_layout_source::table_rows::TablePlanObserver,
+    ) {
+        self.update(|records| {
+            if records.table_directory.is_some() {
+                return None;
+            }
+            records.table_directory = Some(observer);
+            Some(())
+        });
+    }
+
     pub(super) fn begin_bidi(&self) {
         self.0.bidi_unobserved.store(true, Ordering::Release);
     }

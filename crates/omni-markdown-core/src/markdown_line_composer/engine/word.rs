@@ -7,7 +7,7 @@ use std::ops::Range;
 mod group;
 pub use group::{
     MarkdownWordGroupAction, MarkdownWordGroupAnswer, MarkdownWordGroupStep,
-    MarkdownWordMovePreparation,
+    MarkdownWordMovePreparation, MarkdownWordMoveScope,
 };
 
 /// 同一Composer只拥有一个词组动作；移动/选词与删除共享原GCB，不能并行创建第二套索引。
@@ -25,6 +25,8 @@ pub enum MarkdownWordDeleteDirection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MarkdownWordDeleteAnswer {
     Yielded,
+    /// 同一量子已到真实 opaque 端点；调用方须展开原 fold 并重建读图，不能据此删除隐区。
+    NeedsFoldExpansion(Range<usize>),
     /// 只交原Source内的真实删除范围；调用方仍须消费原输入permit，不能据此重签当前正文。
     Ready(Range<usize>),
 }
@@ -51,16 +53,18 @@ impl MarkdownWordDeleteStep {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum Category {
+pub(in crate::markdown_line_composer) enum Category {
     Space,
     Word,
     Other,
 }
 
 #[derive(Clone, Copy)]
-/// 三类真实消费者使用不同停止规则；移动不能继承删除的单空格与换行特殊手感。
+/// 真实消费者共享GCB游标但保各自停止规则；普通删除不继承词类别，移动不继承单空格特例。
 enum CursorMode {
     Delete,
+    /// 普通删除只消费相邻的一个真实GCB，不读取词类别，也不依赖软换行几何。
+    Grapheme,
     Move,
     Seed,
     Expand(Category),
@@ -74,7 +78,7 @@ struct Seek {
 }
 
 /// 单个GCB也可远大于4KiB；这里只累计类别和一个UTF8半标量，不保留整簇字节。
-struct Cluster {
+pub(in crate::markdown_line_composer) struct Cluster {
     next_ordinal: usize,
     next: MarkdownGraphemeBoundary,
     byte: usize,
@@ -90,7 +94,7 @@ struct Cluster {
 }
 
 impl Cluster {
-    fn new(
+    pub(in crate::markdown_line_composer) fn new(
         next_ordinal: usize,
         current: MarkdownGraphemeBoundary,
         next: MarkdownGraphemeBoundary,
@@ -151,7 +155,7 @@ impl Cluster {
         Ok(())
     }
 
-    fn read(
+    pub(in crate::markdown_line_composer) fn read(
         &mut self,
         source: &MarkdownLayoutTextSource,
         budget: MarkdownLineComposeBudget,
@@ -194,7 +198,7 @@ impl Cluster {
         Ok(false)
     }
 
-    fn category(&self) -> Category {
+    pub(in crate::markdown_line_composer) fn category(&self) -> Category {
         if self.space {
             Category::Space
         } else if self.word {
@@ -228,6 +232,10 @@ pub(super) struct WordDelete {
     ascii_endpoint: Option<usize>,
     ascii_skip: bool,
     seed_newline: bool,
+    visible_word: bool,
+    visible_proved: bool,
+    visible_proof_next: Option<usize>,
+    visual_rejected: bool,
 }
 
 impl WordDelete {
@@ -248,6 +256,10 @@ impl WordDelete {
             ascii_endpoint: None,
             ascii_skip: false,
             seed_newline: false,
+            visible_word: false,
+            visible_proved: false,
+            visible_proof_next: None,
+            visual_rejected: false,
         }
     }
 
@@ -282,7 +294,8 @@ impl WordDelete {
         budget: MarkdownLineComposeBudget,
         step: &mut MarkdownWordDeleteStep,
     ) -> Result<bool> {
-        if matches!(self.mode, CursorMode::Seed)
+        if self.visible_word
+            || matches!(self.mode, CursorMode::Seed | CursorMode::Grapheme)
             || self.ascii_skip
             || self
                 .category
@@ -369,6 +382,30 @@ impl WordDelete {
         authority: &MarkdownLayoutTextAuthority,
         budget: MarkdownLineComposeBudget,
     ) -> Result<MarkdownWordDeleteStep> {
+        if self.visible_word
+            && !self.visible_proved
+            && let Some(cluster) = &self.cluster
+        {
+            let position = self.visible_proof_next.unwrap_or(cluster.utf16);
+            let (actual, proof) =
+                coordinator.prepare_word_cluster(position..cluster.end.utf16, budget)?;
+            if let Some((permitted, through)) = proof {
+                if through <= position || through > cluster.end.utf16 {
+                    return Err(MarkdownLineComposeError::InconsistentCoverage);
+                } // 完整 B 段只签真实覆盖终点；不能停在当前点或越过原 GCB 后替它猜范围。
+                self.visual_rejected = !permitted;
+                self.visible_proved = permitted && through == cluster.end.utf16;
+                self.visible_proof_next = (permitted && !self.visible_proved).then_some(through);
+            }
+            return Ok(MarkdownWordDeleteStep {
+                bytes: actual.bytes,
+                scalars: actual.scalars,
+                records: actual.records,
+                metadata_units: actual.metadata_units,
+                answer: MarkdownWordDeleteAnswer::Yielded,
+            });
+        } // 端点已由原 GCB 证明；借 Breaks 前先完成同一 Item 的 B 段准备，不并借两个可变角色。
+        let folds = coordinator.fold_plan();
         let breaks = coordinator.word_breaks()?;
         if self.dependency {
             // 未知边界只推进原GCB一次；本次不再消费类别，避免依赖和调用方各花一份配额。
@@ -419,9 +456,22 @@ impl WordDelete {
                     let (ordinal, boundary) = seek
                         .candidate
                         .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
-                    if ordinal != seek.low || boundary.utf16 != self.head {
-                        return Err(MarkdownLineComposeError::InvalidRequest);
-                    } // caret必须是原完整GCB；不能从combining/emoji内部签出半簇删除。
+                    if ordinal != seek.low {
+                        return Err(MarkdownLineComposeError::InconsistentCoverage);
+                    } // 已读取候选必须就是二分落点；索引矛盾不能当作普通用户坐标错误。
+                    if boundary.utf16 != self.head {
+                        if !matches!(self.mode, CursorMode::Grapheme) {
+                            return Err(MarkdownLineComposeError::InvalidRequest);
+                        } // 词组动作仍要求真实GCB；普通删除保留原Scene对任意合法scalar caret的语义。
+                        self.at = Some((ordinal, boundary));
+                        self.seek = None;
+                        if self.direction == MarkdownWordDeleteDirection::Forward {
+                            // 原Next在簇内部取lower_bound本身；不可多跳一簇，也不擅自扩大到簇左端。
+                            self.finish(&mut step)?;
+                            return Ok(step);
+                        }
+                        continue; // 原Previous取lower_bound的前驱；后续仍只收费一条真实边界记录。
+                    }
                     self.at = Some((ordinal, boundary));
                     self.seek = None;
                     continue;
@@ -482,7 +532,30 @@ impl WordDelete {
                 {
                     return Err(MarkdownLineComposeError::InconsistentCoverage);
                 } // 原ordinal前后必须对应真实源同方向，损坏记录不能把Backward变成向后删正文。
+                if let Some(plan) = &folds
+                    && let Some(span) = plan.spans().iter().find(|span| {
+                        span.start.utf16 == current.utf16.min(record[0].utf16)
+                            && span.end.utf16 == current.utf16.max(record[0].utf16)
+                    })
+                {
+                    step.answer = MarkdownWordDeleteAnswer::NeedsFoldExpansion(
+                        span.start.utf16..span.end.utf16,
+                    );
+                    return Ok(step);
+                } // 明确交回原展开意图；不按“一个字符”删除整段，也不借 Cluster::read 物化隐区。
+                if matches!(self.mode, CursorMode::Grapheme) {
+                    // 相邻ordinal已经由同一GCB目录认证；emoji、CRLF和任意长combining簇
+                    // 均直接使用它的两个真实端点，禁止重新按scalar或视口截取删除范围。
+                    self.at = Some((next, record[0]));
+                    self.finish(&mut step)?;
+                    return Ok(step);
+                }
                 self.cluster = Some(Cluster::new(next, current, record[0])?);
+                if self.visible_word {
+                    self.visible_proved = false;
+                    self.visible_proof_next = None;
+                    return Ok(step);
+                } // opaque 已先处理；下一回合消费真实 B 段证书后才能读取/分类这个原簇。
             }
             if step.bytes == budget.bytes || step.scalars == budget.scalars {
                 return Ok(step);
@@ -498,6 +571,8 @@ impl WordDelete {
                 .cluster
                 .take()
                 .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
+            self.visible_proved = false;
+            self.visible_proof_next = None;
             match self.mode {
                 CursorMode::Seed => {
                     // 首簇只用于固定真实类别和硬换行事实；即使巨大单GCB也必须读完原簇才完成。
@@ -532,6 +607,7 @@ impl WordDelete {
                     self.ascii_skip = false;
                     continue;
                 }
+                CursorMode::Grapheme => unreachable!("单GCB动作在取得相邻原边界时已经结束"),
                 CursorMode::Delete => {} // 原删除的单ASCII空格与独立换行规则继续由下方原路径处理。
             }
             if cluster.newline {
@@ -566,6 +642,28 @@ impl MarkdownLineComposer {
         direction: MarkdownWordDeleteDirection,
         head_utf16: usize,
     ) -> Result<()> {
+        self.begin_delete(direction, head_utf16, CursorMode::Delete)
+    }
+
+    /// 开始普通前删或退格；原GCB端点取相邻完整簇，簇内部scalar caret保留原严格Next/Previous语义。
+    ///
+    /// # Errors
+    /// 原Source、取消、未完成动作和范围错误与词组删除完全相同，不建立第二份源或索引。
+    pub fn begin_grapheme_delete(
+        &mut self,
+        direction: MarkdownWordDeleteDirection,
+        head_utf16: usize,
+    ) -> Result<()> {
+        self.begin_delete(direction, head_utf16, CursorMode::Grapheme)
+    }
+
+    /// 两种删除只在实际停止规则上不同；认证和唯一原动作槽沿同一个入口装配。
+    fn begin_delete(
+        &mut self,
+        direction: MarkdownWordDeleteDirection,
+        head_utf16: usize,
+        mode: CursorMode,
+    ) -> Result<()> {
         self.guard()?;
         let payload = self
             .payload
@@ -574,7 +672,14 @@ impl MarkdownLineComposer {
         if payload.word_delete.is_some() || head_utf16 > payload.source.utf16_len() {
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
-        payload.word_delete = Some(WordJob::Delete(WordDelete::new(direction, head_utf16)));
+        if matches!(mode, CursorMode::Grapheme) {
+            // 原NSTextInputClient允许GCB内部的scalar caret，但代理对内部不能进入不可逆删除。
+            // 这里复用原源的UTF16→byte合同，不猜测Unicode边界或创建局部正文副本。
+            payload.source.byte_offset_for_utf16(head_utf16)?;
+        }
+        let mut cursor = WordDelete::new(direction, head_utf16);
+        cursor.mode = mode;
+        payload.word_delete = Some(WordJob::Delete(cursor));
         Ok(())
     }
 
@@ -632,5 +737,7 @@ impl MarkdownLineComposer {
     }
 }
 
+#[cfg(test)]
+mod fold_tests;
 #[cfg(test)]
 mod tests;

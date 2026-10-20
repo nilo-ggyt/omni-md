@@ -15,6 +15,7 @@ use thiserror::Error;
 mod bytes;
 #[cfg(feature = "paged-shaping-frontier")]
 pub(crate) mod frontier;
+mod horizontal;
 pub(crate) mod positioning;
 mod resolve;
 pub use bytes::{
@@ -81,6 +82,10 @@ pub enum MarkdownLayoutFontError {
     InvalidPointSize,
     #[error("字体设计轴转换后不再是同一实际归一化位置")]
     DesignCoordinatesMismatch,
+    #[error("字体水平推进表与实际glyph域、字号或可表示尺度不一致")]
+    InvalidHorizontalAdvances,
+    #[error("字体水平推进快照分配失败")]
+    HorizontalAdvanceAllocation,
 }
 type Result<T> = std::result::Result<T, MarkdownLayoutFontError>;
 
@@ -94,6 +99,8 @@ struct Payload {
     metadata: MarkdownLayoutFontMetadata,
     // 只有显式字号构造采用高精度定位；旧通用字体仍保留HarfBuzz的原26.6合同。
     positioning_points: Option<f64>,
+    // 平台位图/UI字体的实际水平推进只保纯值，不保Native对象或回调；原Font最后一个owner归还时一起释放。
+    horizontal_advances: Option<horizontal::HorizontalAdvances>,
     dropped: PayloadDrop,
 }
 struct PayloadDrop(Arc<AtomicBool>);
@@ -147,6 +154,7 @@ impl MarkdownLayoutFont {
             font,
             metadata,
             positioning_points: None,
+            horizontal_advances: None,
             dropped: PayloadDrop(Arc::new(AtomicBool::new(false))),
         })))
     }
@@ -166,6 +174,7 @@ impl MarkdownLayoutFont {
             font,
             metadata,
             positioning_points: None,
+            horizontal_advances: None,
             dropped: PayloadDrop(Arc::new(AtomicBool::new(false))),
         })))
     }
@@ -187,6 +196,34 @@ impl MarkdownLayoutFont {
             font,
             metadata,
             positioning_points: Some(points),
+            horizontal_advances: None,
+            dropped: PayloadDrop(Arc::new(AtomicBool::new(false))),
+        })))
+    }
+
+    /// 绑定同一个实际平台字体在原双精度字号下的完整水平推进，单位为point。
+    /// 仅平台实际度量不同于文件hmtx时使用；调用方须交付每个真实glyph恰好一项，
+    /// 不能交正文出现字形的抽样。纯值表转入本payload，既不保平台对象也不按正文增长。
+    ///
+    /// # Errors
+    /// face/轴/字号解析失败，表项数量不等于真实glyph域，或任一推进非有限、超坐标范围时拒绝；
+    /// 不以默认hmtx补缺项。真实负值照常保留，由原前沿非负证明决定能否提前发布。
+    pub fn resolve_name_table_at_size_with_horizontal_advances(
+        bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        native_name_table: &[u8],
+        axes: &[MarkdownLayoutFontAxis],
+        points: f64,
+        horizontal_advances: Box<[f64]>,
+    ) -> Result<Self> {
+        positioning::validate_points(points)?;
+        let (font, metadata) = resolve::resolve_name_table(bytes, native_name_table, axes)?;
+        let horizontal_advances =
+            horizontal::HorizontalAdvances::new(points, metadata.glyph_count, horizontal_advances)?;
+        Ok(Self(Arc::new(Payload {
+            font,
+            metadata,
+            positioning_points: Some(points),
+            horizontal_advances: Some(horizontal_advances),
             dropped: PayloadDrop(Arc::new(AtomicBool::new(false))),
         })))
     }
@@ -231,6 +268,19 @@ impl MarkdownLayoutFont {
     /// 只供同crate的原shaping任务借用；不得把克隆出的底层Font绕过本owner长期保留。
     pub(crate) fn font(&self) -> &Font {
         &self.0.font
+    }
+
+    /// 整形与证明统一借同一原Font和原水平推进；绑定平台度量的实例不能借另一个尺度查询。
+    /// 不含平台度量的通用字体仍直接使用文件实际hmtx/变体表，不建立另一份默认表。
+    pub(crate) fn shaper_at_scale(&self, scale: i32) -> Result<harfrust::ShaperFont<'_, '_>> {
+        let shaper = harfrust::ShaperFont::new(self.font()).with_scale(scale);
+        match &self.0.horizontal_advances {
+            Some(advances) => {
+                advances.require_scale(scale)?;
+                Ok(shaper.with_font_funcs(Some(advances)))
+            }
+            None => Ok(shaper),
+        }
     }
 }
 

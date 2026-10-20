@@ -72,19 +72,37 @@ impl MarkdownTableUnderlineContext {
         source_end: usize,
         coverage: &[Range<usize>],
     ) -> Result<Self, MarkdownTableWindowError> {
+        let total = coverage.iter().fold(0usize, |total, range| {
+            total.saturating_add(range.end.saturating_sub(range.start))
+        });
+        if total > TABLE_WINDOW_MAX_BYTES {
+            return Err(MarkdownTableWindowError::SourceLimit);
+        }
+        Self::with_coverage(generation, source_end, coverage)
+    }
+
+    /// 同源串行窗口由 Doc adapter 核身份；只保当前真实范围，逐帧工作和配对库存沿原 scanner。
+    pub(crate) fn for_streamed_source(
+        generation: u64,
+        source_end: usize,
+        coverage: Range<usize>,
+    ) -> Result<Self, MarkdownTableWindowError> {
+        Self::with_coverage(generation, source_end, std::slice::from_ref(&coverage))
+    }
+
+    /// 两个业务入口共用同一源边界和 scanner 初始化，普通整窗仍在调用前核复制容量。
+    fn with_coverage(
+        generation: u64,
+        source_end: usize,
+        coverage: &[Range<usize>],
+    ) -> Result<Self, MarkdownTableWindowError> {
         if coverage.len() > 2 {
             return Err(MarkdownTableWindowError::InvalidSource);
         }
-        let mut total = 0_usize;
         let mut previous_end = 0;
         for range in coverage {
             if range.start >= range.end || range.end > source_end || range.start < previous_end {
-                // 不接受反序、重叠或越界coverage，避免同一源段重复计数掩盖预算。
                 return Err(MarkdownTableWindowError::InvalidSource);
-            }
-            total = total.saturating_add(range.end - range.start);
-            if total > TABLE_WINDOW_MAX_BYTES {
-                return Err(MarkdownTableWindowError::SourceLimit);
             }
             previous_end = range.end;
         }
@@ -112,6 +130,66 @@ impl MarkdownTableUnderlineContext {
         self.scanner.next_byte()
     }
 
+    /// 只观察已决权限，不移走配对Vec；真正移交仍由唯一owner完成。
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready && !self.failed
+    }
+
+    /// 后继窗口只续已经真实读过的原前沿；反向覆盖必须重建，不能把任意偏移当成没有 HTML 的起点。
+    /// 旧覆盖之外的扫描只会为其中未闭合标签前瞻到真正 close；所以跨到新格的旧配对仍须保留。
+    pub(crate) fn continue_source(
+        &mut self,
+        bytes: Range<usize>,
+        utf16: Range<usize>,
+        pairs: &mut Vec<super::MarkdownTableUnderline>,
+    ) -> bool {
+        if !self.is_ready()
+            || self.coverage_len != 1
+            || bytes.is_empty()
+            || bytes.end > self.source_end
+            || bytes.start < self.coverage[0].start
+            || bytes.end < self.coverage[0].end
+            || bytes != self.coverage[0] && bytes.start < self.coverage[0].end
+            || self.unicode_len != 0
+        {
+            return false; // 包含回到旧列的自然测宽/显示往返；没有覆盖权限时仍走原文首扫描。
+        }
+        let same = bytes == self.coverage[0];
+        self.coverage[0] = bytes.clone();
+        // Publish 已把此 Vec 的唯一归属交给原 request；移回同一容量，不复制配对或另建库存。
+        std::mem::swap(&mut self.utf16_pairs, pairs);
+        if !same {
+            // 原 scanner 是 first-open→next-close，配对严格有序且互不重叠。新格从旧覆盖末端
+            // 之后开始，因此只有最后一项可能跨进新格；不是把多个标签 union 成一个下划线。
+            let last = self.utf16_pairs.pop();
+            self.utf16_pairs.clear(); // 元素仅有 Range 标量，无资源析构；不逐条过滤最多2730项。
+            if let Some(pair) = last
+                && pair.open.start < utf16.end
+                && utf16.start < pair.close.end
+            {
+                self.utf16_pairs.push(pair);
+            }
+        }
+        #[cfg(test)]
+        if !same {
+            let last = self.pairs.pop();
+            self.pairs.clear();
+            if let Some(pair) = last
+                && pair.open.start < bytes.end
+                && bytes.start < pair.close.end
+            {
+                self.pairs.push(pair);
+            }
+        }
+        self.ready = self.scanner.settled_after(bytes.end);
+        true
+    }
+
+    /// 已跨过旧覆盖但仍有真实 open/partial 标签时，后继字节仍须由同 Global 的代码权限分类。
+    pub(crate) fn needs_classified_continuation(&self) -> bool {
+        !self.scanner.settled_after(self.scanner.next_byte())
+    }
+
     /// None表示真实配对尚未决定；只有Ready才可以把空slice解释为本窗口无underline。
     #[cfg(test)]
     pub(crate) fn ready_byte_pairs(&self) -> Option<&[MarkdownTableUnderlineBytePair]> {
@@ -128,6 +206,24 @@ impl MarkdownTableUnderlineContext {
         &mut self,
         frame: MarkdownTableContextFrame<'_>,
         budget: usize,
+    ) -> Result<MarkdownTableContextStep, MarkdownTableWindowError> {
+        self.advance_classified(frame, budget, false)
+    }
+
+    /// 代码权限来自同一真实Global的闭合Fact；字面字节仍逐scalar计量，不能跳过UTF16位置。
+    pub(crate) fn advance_literal(
+        &mut self,
+        frame: MarkdownTableContextFrame<'_>,
+        budget: usize,
+    ) -> Result<MarkdownTableContextStep, MarkdownTableWindowError> {
+        self.advance_classified(frame, budget, true)
+    }
+
+    fn advance_classified(
+        &mut self,
+        frame: MarkdownTableContextFrame<'_>,
+        budget: usize,
+        literal: bool,
     ) -> Result<MarkdownTableContextStep, MarkdownTableWindowError> {
         let frame_end = frame.byte_start.checked_add(frame.bytes.len());
         if self.failed {
@@ -185,7 +281,13 @@ impl MarkdownTableUnderlineContext {
             }
             self.utf16_next += units;
             let was_open = self.scanner.has_open();
-            let pair = self.scanner.push(*byte);
+            let pair = if literal {
+                // 代码两侧残缺标签不拼接，代码内假close不吞外部完整open；真实Unicode计量保留。
+                self.scanner.skip_literal(1);
+                None
+            } else {
+                self.scanner.push(*byte)
+            };
             if !was_open && self.scanner.has_open() {
                 // ASCII opening完成时UTF16位置已确定，后面任意长Unicode内容不会改变此锚点。
                 self.open_utf16 = Some(self.utf16_next - 3);

@@ -1,4 +1,4 @@
-//! 固定五层只表达原图、中性遮罩或实际校准的双遮罩；不持正文、Source 或回调强边。
+//! 原图、单遮罩和双遮罩分别只建立一个、三个和五个真实角色；不持正文或回调强边。
 
 use super::*;
 use crate::native_surface::viewport_pixels::{MaskPairBlend, PixelPresentation};
@@ -99,13 +99,13 @@ pub(super) struct Layout {
     pub(super) presentation: PixelPresentation,
 }
 
-/// 容器自身承担背景，两组前景/遮罩保持实际合成顺序；闲置角色必须完全游离。
+/// 容器承担背景；只创建当前表示实际需要的前景/遮罩，保持原生精确合成顺序。
 pub(super) struct Slot {
     container: Retained<CALayer>,
-    foreground: Retained<CALayer>,
-    mask: Retained<CALayer>,
-    second_foreground: Retained<CALayer>,
-    second_mask: Retained<CALayer>,
+    foreground: Option<Retained<CALayer>>,
+    mask: Option<Retained<CALayer>>,
+    second_foreground: Option<Retained<CALayer>>,
+    second_mask: Option<Retained<CALayer>>,
     payload: RefCell<Option<Payload>>,
     installing: RefCell<Option<std::rc::Weak<()>>>,
     background_installed: Cell<bool>,
@@ -117,13 +117,26 @@ pub(super) struct Slot {
     second_foreground_installed: Cell<bool>,
 }
 impl Slot {
-    pub(super) fn new(current: &impl Fn() -> bool) -> Result<Self> {
+    /// 只为本瓦片实际采用的表示建立角色；普通图像不预建遮罩，单遮罩不预建第二组。
+    pub(super) fn new(
+        presentation: PixelPresentation,
+        current: &impl Fn() -> bool,
+    ) -> Result<Self> {
+        let masked = presentation != PixelPresentation::Image;
+        let paired = matches!(presentation, PixelPresentation::OpaquePairedMasks { .. });
+        let layer = |needed| {
+            if needed {
+                checked(current, CALayer::new).map(Some)
+            } else {
+                Ok(None) // 缺席角色没有 Native 对象，也没有空闲 backing 或关闭义务。
+            }
+        };
         Ok(Self {
             container: checked(current, CALayer::new)?,
-            foreground: checked(current, CALayer::new)?,
-            mask: checked(current, CALayer::new)?,
-            second_foreground: checked(current, CALayer::new)?,
-            second_mask: checked(current, CALayer::new)?,
+            foreground: layer(masked)?,
+            mask: layer(masked)?,
+            second_foreground: layer(paired)?,
+            second_mask: layer(paired)?,
             payload: RefCell::new(None),
             installing: RefCell::new(None),
             background_installed: Cell::new(false),
@@ -139,23 +152,49 @@ impl Slot {
         &self.container
     }
 
+    /// 只枚举真正建过的角色；观察本身不能为了检查而实例化闲置遮罩。
     pub(super) fn add_weaks(&self, values: &mut Vec<Weak<AnyObject>>) {
-        values.extend([
-            layer_weak(&self.container),
-            layer_weak(&self.foreground),
-            layer_weak(&self.mask),
-            layer_weak(&self.second_foreground),
-            layer_weak(&self.second_mask),
-        ]);
+        values.push(layer_weak(&self.container));
+        for layer in self.auxiliary_layers() {
+            values.push(layer_weak(layer));
+        }
     }
 
-    /// 保留既有负控的三个原角色，不能悄悄把外部替换测试转到新增层。
+    fn auxiliary_layers(&self) -> impl Iterator<Item = &CALayer> {
+        [
+            self.foreground.as_deref(),
+            self.mask.as_deref(),
+            self.second_foreground.as_deref(),
+            self.second_mask.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    fn primary(&self) -> (&CALayer, &CALayer) {
+        // 角色由构造时的封存表示决定，必需角色缺失属于装配错误，不作静默重建。
+        (
+            self.foreground.as_deref().expect("遮罩表示拥有前景"),
+            self.mask.as_deref().expect("遮罩表示拥有遮罩"),
+        )
+    }
+
+    fn secondary(&self) -> (&CALayer, &CALayer) {
+        // 双遮罩表示才可访问第二组，普通图像或单遮罩不会分配这些对象。
+        (
+            self.second_foreground
+                .as_deref()
+                .expect("双遮罩表示拥有第二前景"),
+            self.second_mask.as_deref().expect("双遮罩表示拥有第二遮罩"),
+        )
+    }
+
     #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn diagnostic_layers(&self) -> [Retained<CALayer>; 3] {
         [
             self.container.clone(),
-            self.foreground.clone(),
-            self.mask.clone(),
+            self.foreground.as_ref().expect("真实单遮罩控制").clone(),
+            self.mask.as_ref().expect("真实单遮罩控制").clone(),
         ]
     }
 
@@ -163,10 +202,13 @@ impl Slot {
     pub(super) fn diagnostic_all_layers(&self) -> [Retained<CALayer>; 5] {
         [
             self.container.clone(),
-            self.foreground.clone(),
-            self.mask.clone(),
-            self.second_foreground.clone(),
-            self.second_mask.clone(),
+            self.foreground.as_ref().expect("真实双遮罩控制").clone(),
+            self.mask.as_ref().expect("真实双遮罩控制").clone(),
+            self.second_foreground
+                .as_ref()
+                .expect("真实双遮罩控制")
+                .clone(),
+            self.second_mask.as_ref().expect("真实双遮罩控制").clone(),
         ]
     }
 
@@ -245,7 +287,7 @@ impl Slot {
                 self.install_mask_geometry(local, layout.scale, false, current)?;
                 self.install_colors(&palette.white, &palette.black, None, current, &assignment)?;
                 self.install_mask_relations(false, current, &assignment)?;
-                self.install_contents(&self.mask, image, false, current, &assignment)?;
+                self.install_contents(self.primary().1, image, false, current, &assignment)?;
             }
             PixelPresentation::OpaquePairedMasks { .. } => {
                 let (background, foreground, secondary_foreground) = color_claims
@@ -260,9 +302,9 @@ impl Slot {
                     &assignment,
                 )?;
                 self.install_mask_relations(true, current, &assignment)?;
-                self.install_contents(&self.mask, image, false, current, &assignment)?;
+                self.install_contents(self.primary().1, image, false, current, &assignment)?;
                 self.install_contents(
-                    &self.second_mask,
+                    self.secondary().1,
                     secondary_image.ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?,
                     true,
                     current,
@@ -280,12 +322,12 @@ impl Slot {
         paired: bool,
         current: &impl Fn() -> bool,
     ) -> Result<()> {
-        configure(&self.foreground, rect, scale, false, current)?;
-        configure(&self.mask, rect, scale, true, current)?;
+        configure(self.primary().0, rect, scale, false, current)?;
+        configure(self.primary().1, rect, scale, true, current)?;
         if paired {
             // 第二遮罩使用相同真实局部几何，不能缩放或错位近似原像素。
-            configure(&self.second_foreground, rect, scale, false, current)?;
-            configure(&self.second_mask, rect, scale, true, current)?;
+            configure(self.secondary().0, rect, scale, false, current)?;
+            configure(self.secondary().1, rect, scale, true, current)?;
         }
         Ok(())
     }
@@ -303,13 +345,14 @@ impl Slot {
         })?;
         self.background_installed.set(true);
         assignment.apply(AssignmentPoint::ForegroundColor, current, || {
-            self.foreground.setBackgroundColor(Some(foreground));
+            self.primary().0.setBackgroundColor(Some(foreground));
         })?;
         self.foreground_color_installed.set(true);
         if let Some(secondary_foreground) = secondary_foreground {
             // 回混背景和再次加前景必须使用证书记录的原身份，不能在安装后只据RGB推断。
             assignment.apply(AssignmentPoint::SecondColor, current, || {
-                self.second_foreground
+                self.secondary()
+                    .0
                     .setBackgroundColor(Some(secondary_foreground));
             })?;
             self.second_color_installed.set(true);
@@ -325,21 +368,21 @@ impl Slot {
     ) -> Result<()> {
         assignment.apply(AssignmentPoint::Mask, current, || {
             // SAFETY: 本槽独占的固定标准 CALayer，不持视图、正文或业务回调。
-            unsafe { self.foreground.setMask(Some(&self.mask)) };
+            unsafe { self.primary().0.setMask(Some(self.primary().1)) };
         })?;
         self.mask_installed.set(true);
         if paired {
             assignment.apply(AssignmentPoint::SecondMask, current, || {
                 // SAFETY: 第二组同样只归本槽，实际身份和父关系在关闭及验证时分别核对。
-                unsafe { self.second_foreground.setMask(Some(&self.second_mask)) };
+                unsafe { self.secondary().0.setMask(Some(self.secondary().1)) };
             })?;
             self.second_mask_installed.set(true);
         }
         let children = checked(current, || {
             if paired {
-                NSArray::from_slice(&[&*self.foreground, &*self.second_foreground])
+                NSArray::from_slice(&[self.primary().0, self.secondary().0])
             } else {
-                NSArray::from_slice(&[&*self.foreground])
+                NSArray::from_slice(&[self.primary().0])
             }
         })?;
         assignment.apply(AssignmentPoint::Children, current, || {

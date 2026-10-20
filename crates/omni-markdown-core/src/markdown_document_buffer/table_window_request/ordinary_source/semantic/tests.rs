@@ -198,6 +198,8 @@ fn setext_marker_crlf_and_real_global_underline_match_complete_projection() {
         "   中文标题😀  \r\n  ===  \r\n\r\n另一段\n",
         "中文标题\r\n  ---\t\r\n\r\n另一段\n",
         "<u>前面的省略块\n\n标题😀  \r\n===\r\n\r\n后面的省略块</u>\n",
+        "<u>前面的省略块\n\n```text\n</u>\n```\n\n标题😀\n===\n\n后面的省略块</u>\n",
+        "<u>前面的省略块\n\n    </u>\n\n标题😀\n===\n\n后面的省略块</u>\n",
     ] {
         let options =
             crate::markdown_viewport_presentation::parser::markdown_presentation_options(true);
@@ -303,7 +305,7 @@ fn forward_prefix_keeps_true_seed_origin_and_semantic_fuel_then_refuses_complex_
     let mut source = (0..120)
         .map(|line| format!("第{line}行中😀\r\n"))
         .collect::<String>();
-    source.push_str("后面的 **复杂语法**\r\n");
+    source.push_str("后面的 [复杂语法](https://example.com/not-yet-streamed)\r\n");
     let starts = source
         .match_indices('第')
         .map(|(byte, _)| byte)
@@ -406,18 +408,15 @@ fn forward_prefix_keeps_true_seed_origin_and_semantic_fuel_then_refuses_complex_
 
 #[test]
 fn complex_nonroot_and_cross_block_holes_stay_pending_and_source_entry_stays_source_only() {
+    // 一般强调现已真实支持；该负例保留尚未完成的 giant link，不能退回默认样式。
+    let complex = format!(
+        "普通 **{}** [未决链接](https://example.com)\n",
+        "粗体".repeat(400)
+    );
     for (source, expected) in [
         (
-            "普通 **粗体**\n",
+            complex.as_str(),
             MarkdownOrdinaryPendingReason::NeedsGeneralInline,
-        ),
-        (
-            "> 引用中文\n> 第二行\n",
-            MarkdownOrdinaryPendingReason::NonRootScope,
-        ),
-        (
-            "- 列表中文\n  第二行\n",
-            MarkdownOrdinaryPendingReason::NonRootScope,
         ),
         (
             "第一段\n\n第二段\n",
@@ -440,6 +439,55 @@ fn complex_nonroot_and_cross_block_holes_stay_pending_and_source_entry_stays_sou
             + sources.blocks.len() * block_metadata()
             + sources.blocks.capacity() * std::mem::size_of::<Rc<OrdinaryBlockRecord>>();
         assert_eq!(sources.retained_metadata, expected_metadata);
+    }
+    // 引用/列表短块已经接同源 context；保留原夹具，改为与独立完整 Parser 逐位置验证真实新行为。
+    // 未覆盖洞的负例仍在上面断言 Pending，不把新 Ready 能力外推成任意跨块或长链接支持。
+    for source in ["> 引用中文\n> 第二行\n", "- 列表中文\n  第二行\n"] {
+        let (directory, doc) = document(source);
+        let observer = doc.original_backing_observer().unwrap();
+        let mut request = doc
+            .viewport_plain_source_request(0..doc.utf16_len(), 41, doc.selection())
+            .unwrap();
+        finish(&mut request, &doc).unwrap();
+        let sources = request
+            .take_sources_for(&doc, authority(&doc))
+            .unwrap()
+            .unwrap();
+        let MarkdownOrdinarySemanticState::PlainReady(ready) = sources
+            .ordinary_semantics_for(&doc, authority(&doc))
+            .unwrap()
+        else {
+            panic!("真实短容器必须完成，不能保留过期 NonRootScope 负断言")
+        };
+        let mut baseline = MarkdownViewportPresentation::default();
+        baseline.set_active_selection(ordered_selection(doc.selection()));
+        baseline
+            .rebuild(doc.generation(), 0..doc.utf16_len(), source)
+            .unwrap();
+        assert_eq!(
+            ready.coverage_for(&doc, authority(&doc)).unwrap(),
+            &(0..doc.utf16_len())
+        );
+        for index in 0..doc.utf16_len() {
+            assert_eq!(
+                ready
+                    .query_for(&doc, authority(&doc), index)
+                    .unwrap()
+                    .unwrap()
+                    .styles,
+                baseline.query(index).unwrap().styles,
+                "source={source:?}, index={index}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(directory.path().join("有限普通语义验收.md")).unwrap(),
+            source.as_bytes()
+        );
+        drop(sources);
+        drop(request);
+        drop(doc);
+        assert_eq!(observer.mapped_bytes(), 0);
+        assert_eq!(observer.managed_resident_bytes(), 0);
     }
     let (_directory, doc) = document("原来源入口\n");
     let mut request = doc

@@ -613,3 +613,142 @@ fn combining_interior_caret_is_rejected_before_any_partial_grapheme_edit() {
     ));
     assert!(!document.is_dirty() && !document.can_undo());
 }
+
+#[test]
+fn ordinary_delete_uses_one_real_gcb_for_crlf_emoji_combining_and_rtl_with_tiny_budgets() {
+    let text = "a\r\ne\u{301}👩‍👩‍👧‍👦🇨🇳אב!";
+    // 固定样本的独立期望：ASCII、CRLF、e+combining、四人ZWJ簇、双RI旗帜、两个RTL字母、标点。
+    // 各簇UTF16长度为1/2/2/11/4/1/1/1；不能向被测GCB查询期望，免得同错相消。
+    let boundaries = [0, 1, 3, 5, 16, 20, 21, 22, 23];
+    for (index, head) in boundaries.iter().copied().enumerate() {
+        for direction in [
+            MarkdownWordDeleteDirection::Backward,
+            MarkdownWordDeleteDirection::Forward,
+        ] {
+            let (_directory, document, mut composer) = fixture(text);
+            composer.begin_grapheme_delete(direction, head).unwrap();
+            let endpoint = if direction == MarkdownWordDeleteDirection::Backward {
+                boundaries[index.saturating_sub(1)]
+            } else {
+                boundaries[(index + 1).min(boundaries.len() - 1)]
+            };
+            let actual = drive(
+                &mut composer,
+                MarkdownLineComposeBudget {
+                    bytes: 1,
+                    scalars: 1,
+                    records: 1,
+                    metadata_units: 1,
+                },
+            );
+            assert_eq!(actual, head.min(endpoint)..head.max(endpoint));
+            assert!(!document.is_dirty() && !document.can_undo());
+        } // 两方向含真实BOF/EOF；CRLF和整段emoji不能因预算1而被拆成半个删除。
+    }
+}
+
+#[test]
+fn ordinary_delete_keeps_a_multi_mebibyte_grapheme_streamed_and_releases_its_source() {
+    use std::io::Write;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("超长单簇.md");
+    let marks = 1024 * 1024;
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(b"!e").unwrap();
+    let chunk = "\u{301}".repeat(2048);
+    for _ in 0..marks / 2048 {
+        file.write_all(chunk.as_bytes()).unwrap();
+    } // 测试也以4KiB块生成单簇，不为期望结果构造两MiB正文副本。
+    file.write_all(b"?").unwrap();
+    drop(file);
+    let document = MarkdownDocumentBuffer::open(&path, 3 * 1024 * 1024).unwrap();
+    let mapping = document.original_backing_observer().unwrap();
+    let source = MarkdownLayoutTextSource::capture(&document);
+    let mut composer = MarkdownLineComposer::new(
+        source.clone(),
+        &source.authority(),
+        MarkdownLineFontCatalog::new(),
+        640 * 64,
+        MarkdownLineComposeCancellation::new(),
+    )
+    .unwrap();
+    drop(source); // 原Composer持唯一布局Source，不让测试旁路Rc掩盖真实资源释放。
+    let resources = composer.worker_resource_observer();
+    for (direction, head) in [
+        (MarkdownWordDeleteDirection::Forward, 1),
+        (MarkdownWordDeleteDirection::Backward, marks + 2),
+    ] {
+        composer.begin_grapheme_delete(direction, head).unwrap();
+        assert_eq!(
+            drive(&mut composer, MarkdownLineComposeBudget::default()),
+            1..marks + 2
+        );
+        assert!(pending_delete(&composer).cluster.is_none());
+        composer.cancel_word_delete(); // 只归还本次游标；第二方向仍复用同一个真实GCB索引。
+    }
+    drop((composer, document));
+    assert!(resources.is_released());
+    assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0);
+}
+
+#[test]
+fn ordinary_delete_preserves_scalar_carets_inside_combining_zwj_and_crlf() {
+    for (text, head, backward, forward) in [
+        ("!e\u{301}?", 2, 1..2, 2..3),
+        ("!\r\n?", 2, 1..2, 2..3),
+        ("!👩‍👩‍👧‍👦?", 3, 1..3, 3..12),
+        ("!👩‍👩‍👧‍👦?", 4, 1..4, 4..12),
+    ] {
+        for (direction, expected) in [
+            (MarkdownWordDeleteDirection::Backward, backward),
+            (MarkdownWordDeleteDirection::Forward, forward),
+        ] {
+            let (_directory, document, mut composer) = fixture(text);
+            document.byte_offset_for_utf16(head).unwrap();
+            composer.begin_grapheme_delete(direction, head).unwrap();
+            assert_eq!(
+                drive(
+                    &mut composer,
+                    MarkdownLineComposeBudget {
+                        bytes: 1,
+                        scalars: 1,
+                        records: 1,
+                        metadata_units: 1,
+                    },
+                ),
+                expected
+            );
+            assert!(pending_delete(&composer).cluster.is_none());
+            assert!(!document.is_dirty() && !document.can_undo());
+        } // 期望来自原同步Scene严格Previous/Next合同，不能将外部caret擅自吸附成另一位置。
+    }
+}
+
+#[test]
+fn ordinary_delete_rejects_surrogate_interior_without_starting_a_cursor() {
+    for direction in [
+        MarkdownWordDeleteDirection::Backward,
+        MarkdownWordDeleteDirection::Forward,
+    ] {
+        let (_directory, document, mut composer) = fixture("!😀?");
+        assert!(matches!(
+            composer.begin_grapheme_delete(direction, 2),
+            Err(MarkdownLineComposeError::Source(
+                MarkdownDocumentBufferError::NotUnicodeBoundary
+            ))
+        ));
+        assert!(composer.payload.as_ref().unwrap().word_delete.is_none());
+        assert!(!document.is_dirty() && !document.can_undo());
+        composer.begin_grapheme_delete(direction, 1).unwrap();
+        let expected = if direction == MarkdownWordDeleteDirection::Forward {
+            1..3
+        } else {
+            0..1
+        };
+        assert_eq!(
+            drive(&mut composer, MarkdownLineComposeBudget::default()),
+            expected
+        ); // 非法坐标没有消费合法后继，也没有发布半个代理对或破坏原Source。
+    }
+}

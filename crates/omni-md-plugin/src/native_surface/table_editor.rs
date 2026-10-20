@@ -14,10 +14,7 @@ mod commit;
 mod observation;
 mod row_request;
 #[cfg(feature = "native-markdown-runtime-probe")]
-pub(super) use observation::{
-    NativeMarkdownTableCellOutcome, NativeMarkdownTableCellReceipt,
-    NativeMarkdownTableInsertionObservation,
-};
+pub(super) use observation::{NativeMarkdownTableCellOutcome, NativeMarkdownTableCellReceipt};
 use row_request::*;
 pub(super) use row_request::{
     NativeMarkdownPendingTableCell, NativeMarkdownTableCellAction,
@@ -137,13 +134,6 @@ impl PieceBackedMarkdownTextView {
                             && cache.request_key.presentation_mode == key.presentation_mode
                     });
             if still_current {
-                #[cfg(all(
-                    feature = "native-markdown-runtime-probe",
-                    feature = "native-table-row-append"
-                ))]
-                if let Some(pointer) = request.pointer() {
-                    NativeMarkdownTableAppendWorkload::observe_pointer_ready(self, &pointer, false);
-                }
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 request.finish_activated_observer();
             }
@@ -545,6 +535,7 @@ impl PieceBackedMarkdownTextView {
     }
 
     /// 仅模式前置操作消费真实单cell observed receipt；其他命令不重新取得Mode权限。
+    #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn commit_active_table_cell_with_mode(
         &self,
         mode: &super::table_layout::NativeMarkdownModeViewportContext,
@@ -736,6 +727,7 @@ impl PieceBackedMarkdownTextView {
     }
 
     /// Releases derived table geometry and optionally commits the active cell before changing presentation.
+    #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn invalidate_visible_table_layouts(
         &self,
         end_cell_editing: bool,
@@ -756,8 +748,6 @@ impl PieceBackedMarkdownTextView {
 
     /// 插表只提交一次正文历史；第一格选择、滚动与激活始终消费这份原提交收据。
     pub(super) fn insert_default_markdown_table(&self) {
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        let _observation = self.probe_table_insertion_scope(); // 未进入原 request 的失败也必须有一次真实终点。
         if !self.commit_cell_before_command() || !self.commit_composition_before_command() {
             return; // 前置草稿/组合输入拒绝时，原工具栏动作不得继续改写正文。
         }

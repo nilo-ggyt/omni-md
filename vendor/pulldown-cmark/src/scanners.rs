@@ -133,6 +133,14 @@ pub(crate) struct LineStart<'a> {
 }
 
 impl<'a> LineStart<'a> {
+    #[cfg(feature = "omni-block-frontier")]
+    /// 只接原短块 context 已证明的同物理行状态；部分 Tab 列不能由最终字节偏移反推。
+    pub(crate) fn from_stream_state(bytes: &'a [u8], state: LineStartState) -> Self {
+        let mut line = Self::new(bytes);
+        line.apply_stream_state(state);
+        line
+    }
+
     pub(crate) fn new(bytes: &[u8]) -> LineStart<'_> {
         LineStart {
             bytes,

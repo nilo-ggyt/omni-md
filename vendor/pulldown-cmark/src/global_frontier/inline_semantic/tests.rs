@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::global_frontier::{
-    GlobalFact, GlobalFrontier, GlobalFrontierLimits, GlobalStep, InlineOriginLimits,
+    BlockOriginLimits, GlobalFact, GlobalFrontier, GlobalFrontierLimits, GlobalStep,
     StructuralSpineLimits,
 };
 use crate::{Event, Parser, Tag};
@@ -24,6 +24,97 @@ fn options() -> Options {
         | Options::ENABLE_SUBSCRIPT
         | Options::ENABLE_SUPERSCRIPT
 }
+
+#[test]
+/// 必须由原 Root Fact 真正进入 code 路径；HTML、escape、失败 opener 重放均与完整 Parser 独立对照。
+fn verified_code_spans_match_original_parser_at_split_frames_without_history() {
+    for source in [
+        "before `中文😀` after",
+        r"before \``中文😀` after",
+        "before ` x ` after",
+        "before `   ` after",
+        "pre <span title=\"`fake`\">x</span> `real`",
+        "pre <!-- `fake` --> `real`",
+        "`foo``bar``",
+        "pre ` 中\r\n😀 ` after\r\n",
+        "<u>before `</u>` true close</u>",
+    ] {
+        let expected: Vec<_> = Parser::new_ext(source, options())
+            .into_offset_iter()
+            .filter_map(|(event, range)| matches!(event, Event::Code(_)).then_some(range))
+            .collect();
+        for width in [1, 2, 7, 4096] {
+            for budget in [2048, 4096] {
+                let seed = seed(source, options());
+                let mut cursor = seed
+                    .code_cursor(seed.source_range().end, limits(source))
+                    .unwrap()
+                    .expect("原 Root Paragraph self 为唯一 scope，不得把合法入口误判 NonRoot");
+                let mut actual = Vec::new();
+                let mut finished = false;
+                for _ in 0..source.len() * 100 + 10000 {
+                    let start = cursor.next_byte();
+                    let end = (start + width).min(source.len());
+                    let step = cursor
+                        .advance(
+                            SourceFrame {
+                                source_revision: 41,
+                                byte_start: start,
+                                bytes: &source.as_bytes()[start..end],
+                                real_eof: end == source.len(),
+                            },
+                            authority(),
+                            budget,
+                        )
+                        .unwrap();
+                    let measured = match &step {
+                        InlineCodeStep::Progress { work }
+                        | InlineCodeStep::NeedInput { work }
+                        | InlineCodeStep::Span { work, .. }
+                        | InlineCodeStep::Prefix { work, .. }
+                        | InlineCodeStep::Emphasis { work, .. }
+                        | InlineCodeStep::Proven { work, .. }
+                        | InlineCodeStep::NeedsGeneralInline { work } => *work,
+                    };
+                    assert!(measured.byte_reads + measured.transitions <= budget);
+                    match step {
+                        InlineCodeStep::Span { proof, .. } => {
+                            assert_eq!(proof.source_revision(), 41);
+                            assert_eq!(proof.source_end(), source.len());
+                            let body = &source[proof.raw_body_range()];
+                            let normalized = body.replace("\r\n", " ").replace(['\r', '\n'], " ");
+                            let trim = normalized.starts_with(' ')
+                                && normalized.ends_with(' ')
+                                && !normalized.bytes().all(|byte| byte == b' ');
+                            assert_eq!(proof.trims_boundary_spaces(), trim);
+                            actual.push(proof.source_range());
+                        }
+                        InlineCodeStep::Proven {
+                            requires_general_styles,
+                            ..
+                        } => {
+                            assert!(!requires_general_styles);
+                            finished = true;
+                            break;
+                        }
+                        InlineCodeStep::NeedsGeneralInline { .. } => {
+                            panic!("真实 plain/code/原 HTML 组合不应丢失 code 优先级: {source:?}")
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(
+                    finished,
+                    "游标必须在真实块末端完成，不能把短 frame 当作 EOF"
+                );
+                assert_eq!(
+                    actual, expected,
+                    "source={source:?} width={width} budget={budget}"
+                );
+            }
+        }
+    }
+}
 fn limits(source: &str) -> InlinePlainLimits {
     InlinePlainLimits {
         max_byte_work: source.len() * 256 + 1024 * 1024,
@@ -32,6 +123,16 @@ fn limits(source: &str) -> InlinePlainLimits {
 }
 
 fn seed(source: &str, options: Options) -> VerifiedInlineSemanticSeed {
+    source_pair(source, options).1
+}
+
+fn source_pair(
+    source: &str,
+    options: Options,
+) -> (
+    crate::global_frontier::BlockOriginCursor,
+    VerifiedInlineSemanticSeed,
+) {
     // 不手造权限：只有真实 producer 的已闭合 Fact 可以进入配对 factory。
     let mut global = GlobalFrontier::new(
         41,
@@ -69,13 +170,12 @@ fn seed(source: &str, options: Options) -> VerifiedInlineSemanticSeed {
             .unwrap()
         {
             let (origins, seed) = block
-                .into_origins_and_semantic_seed(InlineOriginLimits {
+                .into_origins_and_semantic_seed(BlockOriginLimits {
                     max_byte_work: limits(source).max_byte_work,
                     max_transitions: limits(source).max_transitions,
                 })
                 .unwrap();
-            drop(origins); // 留下的 seed 仍共享真实 scope 页；没有保第二份原始 source。
-            return seed;
+            return (origins, seed); // 两者共享同一原 scope 页；没有建立第二份正文或另一 Global。
         }
     }
     panic!("真实 Global 未交付闭合 inline Fact");
@@ -346,4 +446,116 @@ fn nonroot_and_enabled_special_are_pending_and_authority_fuel_failures_remain_st
             .unwrap_err(),
         GlobalFrontierError::WorkFuel
     );
+}
+
+#[test]
+/// 真 Origin 进入 code 的三阶段；1-byte frame 把 UTF8、CRLF、Tab 与前缀都切开，仍保原 canonical 匹配。
+fn scoped_code_normal_probe_and_trim_share_actual_origin_at_split_frames() {
+    for (source, trims) in [
+        ("> ` 甲\r\n> 乙 ` 后文\r\n", vec![true]),
+        ("> ` \n>   `\n", vec![false]),
+        ("> ` \n> \t `\n", vec![true]),
+        ("> - ` \r\n>   \t `\r\n", vec![true]),
+        ("> - ` 甲\n>   乙 ` 与 ``后文``\n", vec![true, false]),
+        ("1. `首行\r   末行` 后文\r", vec![false]),
+        ("> `前行\n懒续行` 后文\n", vec![false]),
+        (
+            "> `未配对 **正文\n> 续行** 与 ``真实\n> 代码``\n",
+            vec![false],
+        ),
+    ] {
+        let expected: Vec<_> = Parser::new_ext(source, options())
+            .into_offset_iter()
+            .filter_map(|(event, range)| matches!(event, Event::Code(_)).then_some(range))
+            .collect();
+        assert_eq!(expected.len(), trims.len());
+        for width in [1, 2, 7, 4096] {
+            for budget in [2048, 4096] {
+                let (mut origins, seed) = source_pair(source, options());
+                let origin = loop {
+                    let start = origins.next_byte();
+                    let end = (start + width).min(source.len());
+                    match origins
+                        .advance(
+                            SourceFrame {
+                                source_revision: 41,
+                                byte_start: start,
+                                bytes: &source.as_bytes()[start..end],
+                                real_eof: end == source.len(),
+                            },
+                            authority(),
+                            budget,
+                        )
+                        .unwrap()
+                    {
+                        crate::global_frontier::BlockOriginStep::Line { line, .. } => break line,
+                        crate::global_frontier::BlockOriginStep::Complete { .. } => {
+                            panic!("真实段落须有原 Origin")
+                        }
+                        _ => {}
+                    }
+                };
+                let mut cursor = seed
+                    .emphasis_origin_cursor(&origin, seed.source_range().end, limits(source))
+                    .unwrap()
+                    .unwrap();
+                drop(origins);
+                let mut actual = Vec::new();
+                let mut actual_trims = Vec::new();
+                let mut finished = false;
+                for _ in 0..source.len() * 1000 + 10000 {
+                    let start = cursor.next_byte();
+                    let end = (start + width).min(source.len());
+                    let step = cursor.advance(SourceFrame {
+                        source_revision: 41, byte_start: start, bytes: &source.as_bytes()[start..end], real_eof: end == source.len(),
+                    }, authority(), budget).unwrap_or_else(|error| panic!("{error:?}: source={source:?} width={width} budget={budget} cursor={cursor:?}"));
+                    let work = match &step {
+                        InlineCodeStep::Progress { work }
+                        | InlineCodeStep::NeedInput { work }
+                        | InlineCodeStep::Span { work, .. }
+                        | InlineCodeStep::Prefix { work, .. }
+                        | InlineCodeStep::Emphasis { work, .. }
+                        | InlineCodeStep::Proven { work, .. }
+                        | InlineCodeStep::NeedsGeneralInline { work } => *work,
+                    };
+                    assert!(work.byte_reads + work.transitions <= budget);
+                    match step {
+                        InlineCodeStep::Span { proof, .. } => {
+                            actual.push(proof.source_range());
+                            actual_trims.push(proof.trims_boundary_spaces());
+                        }
+                        InlineCodeStep::Prefix { proof, .. } => {
+                            let range = proof.source_range();
+                            assert!(
+                                range.end <= source.len()
+                                    && source.is_char_boundary(range.start)
+                                    && source.is_char_boundary(range.end)
+                            );
+                        }
+                        InlineCodeStep::Proven {
+                            requires_general_styles,
+                            ..
+                        } => {
+                            assert!(!requires_general_styles);
+                            finished = true;
+                            break;
+                        }
+                        InlineCodeStep::NeedsGeneralInline { .. } => {
+                            panic!("Code/强调与已证容器不能误降为未知：{source:?}")
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(finished, "source={source:?} width={width} budget={budget}");
+                assert_eq!(
+                    actual, expected,
+                    "source={source:?} width={width} budget={budget}"
+                );
+                assert_eq!(
+                    actual_trims, trims,
+                    "真实容器前缀不能参与 code 首尾空白判断：{source:?}"
+                );
+            }
+        }
+    }
 }

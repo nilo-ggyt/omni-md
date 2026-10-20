@@ -1395,6 +1395,8 @@ fn markdown_document_buffer_open_error(
         // 原映射读取/归还失败或同时租约耗尽不能交付可用文档；保留存储失败语义。
         | MarkdownDocumentBufferError::OriginalBackingUnavailable(_)
         | MarkdownDocumentBufferError::EditStorageUnavailable(_)
+        // 显示来源目录的真实读取/锁失败仍是存储错误，不能让打开或保存领取成功收据。
+        | MarkdownDocumentBufferError::DisplayStorageUnavailable(_)
         | MarkdownDocumentBufferError::OriginalReadLeaseLimitExceeded
         | MarkdownDocumentBufferError::Utf16ReadCacheUnavailable
         | MarkdownDocumentBufferError::RevisionCacheUnavailable => MarkdownWorkspaceError::StorageUnavailable,
@@ -1433,6 +1435,8 @@ fn markdown_document_buffer_save_error(
         // 分块映射失败或并发租约耗尽不能形成保存收据，不能降级为空内容。
         | MarkdownDocumentBufferError::OriginalBackingUnavailable(_)
         | MarkdownDocumentBufferError::EditStorageUnavailable(_)
+        // 显示来源目录的真实读取/锁失败仍是存储错误，不能让打开或保存领取成功收据。
+        | MarkdownDocumentBufferError::DisplayStorageUnavailable(_)
         | MarkdownDocumentBufferError::OriginalReadLeaseLimitExceeded
         | MarkdownDocumentBufferError::Utf16ReadCacheUnavailable
         | MarkdownDocumentBufferError::RevisionCacheUnavailable

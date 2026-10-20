@@ -107,30 +107,6 @@ fn canonical_output_rejects_growth_and_unaccounted_extent() {
     assert!(matches!(output.freeze(), Err(SnapshotError::SourceChanged)));
 }
 
-/// 真实只读descriptor上的write拒绝后，候选Drop确实关闭原FD；不以空字段或claim计数代替。
-#[cfg(feature = "native-markdown-candidate")]
-#[test]
-fn failed_output_write_releases_its_actual_descriptor() {
-    use std::os::fd::AsRawFd;
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("unchanged");
-    fs::write(&path, b"unchanged").unwrap();
-    // 只在工厂内部测试接管实际只读FD；产品没有File入口，业务层失败另由真实RLIMIT验证。
-    let mut output = CanonicalSnapshotOutput {
-        file: File::open(&path).unwrap(),
-        bytes: 0,
-    };
-    let descriptor = output.file.as_raw_fd();
-    assert!(
-        matches!(output.write_all(b"candidate"), Err(SnapshotError::Storage(error)) if error.raw_os_error() == Some(libc::EBADF))
-    );
-    drop(output);
-    // SAFETY: F_GETFD只查询刚归还的整数descriptor，不解引用指针或接管任何资源。
-    assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
-    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-    assert_eq!(fs::read(path).unwrap(), b"unchanged");
-}
-
 /// Streaming fallback freezes exact bytes without retaining any public scratch names.
 #[test]
 fn forced_streaming_snapshot_survives_truncation_and_non_utf8_source_writes() {

@@ -11,7 +11,7 @@ fn ready(sources: &VerifiedMarkdownViewportSources) -> &VerifiedMarkdownRootLeaf
 }
 
 /// 完整parser只存在于测试；按显式预期交集逐字符比较，空洞连默认styles也不能获得。
-fn assert_partial_oracle(
+pub(super) fn assert_partial_oracle(
     source: &str,
     document: &MarkdownDocumentBuffer,
     ready: &VerifiedMarkdownRootLeafViewport,
@@ -106,22 +106,43 @@ fn assert_fence_separator_is_unknown(
 }
 
 #[test]
-fn mixed_window_publishes_disjoint_root_code_and_rule_without_claiming_unknown_inline_or_container()
-{
+fn mixed_window_publishes_proven_root_and_nested_code_without_claiming_unknown_inline() {
     let code = "```rust\r\n中文😀<u>代码</u>\r\n```\r\n";
     let rule = "***\n";
+    let unknown = format!(
+        "**普通正文{}** [未知链接](https://example.com)",
+        "中".repeat(700)
+    );
     let source = format!(
-        "前面的**普通正文**\n\n{code}\n中间**普通正文**\n\n> ```\n> 容器代码\n> ```\n\n{rule}\n尾部**普通正文**\n"
+        "前面的{unknown}\n\n{code}\n中间{unknown}\n\n> ```\n> 容器代码\n> ```\n\n{rule}\n尾部{unknown}\n"
     );
     let code_start = source.find(code).unwrap();
     // 显式golden止于末尾三个反引号；CRLF由consumed_end消费，不能扩张source_range。
     let code_marker_end = code_start + code.rfind("```").unwrap() + 3;
     assert_eq!(first_leaf_range(&source), code_start..code_marker_end);
-    let rule_start = source.rfind(rule).unwrap();
-    let expected = [
-        units(&source, code_start..code_marker_end),
-        units(&source, rule_start..rule_start + rule.len()),
-    ];
+    let mut expected = Vec::new();
+    let mut quote_start = None;
+    for (event, range) in Parser::new_ext(
+        &source,
+        crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+    )
+    .into_offset_iter()
+    {
+        match event {
+            Event::Start(Tag::BlockQuote(_)) => quote_start = Some(range.start),
+            Event::End(pulldown_cmark::TagEnd::BlockQuote(_)) => quote_start = None,
+            Event::Start(Tag::CodeBlock(_)) => {
+                // 新能力包含原 quote 首行 prefix；末端仍是原 Parser 的真正 CodeBlock 末端。
+                // giant link 的普通段落没有进入这个预期库存，未知洞的逐字符拒绝保持原断言。
+                expected.push(units(
+                    &source,
+                    quote_start.unwrap_or(range.start)..range.end,
+                ));
+            }
+            Event::Rule => expected.push(units(&source, range)),
+            _ => {}
+        }
+    }
     let (_directory, mut doc) = document(&source);
     // 完整方向仍进入同一语义票据，不能按有序范围补签相反方向。
     doc.set_selection(MarkdownTextSelection {
@@ -156,7 +177,7 @@ fn mixed_window_publishes_disjoint_root_code_and_rule_without_claiming_unknown_i
     );
     assert_eq!(
         ready
-            .block_kind_at_for(&doc, authority(&doc), expected[1].start)
+            .block_kind_at_for(&doc, authority(&doc), expected.last().unwrap().start)
             .unwrap(),
         Some(LeafBlockKind::ThematicBreak)
     );
@@ -167,7 +188,11 @@ fn mixed_window_publishes_disjoint_root_code_and_rule_without_claiming_unknown_i
 
 #[test]
 fn viewport_edges_clip_only_true_leaf_source_and_preserve_unicode_half_unit_queries() {
-    let source = "**前言**\n\n```text\n中文😀<u>强调</u>\n```\n\n**尾部**\n";
+    let unknown = "中".repeat(700);
+    let source = format!(
+        "**前言{unknown}** [未知](https://example.com)\n\n```text\n中文😀<u>强调</u>\n```\n\n**尾部{unknown}** [未知](https://example.com)\n"
+    );
+    let source = source.as_str();
     let code = units(source, first_leaf_range(source));
     let emoji = source.find('😀').unwrap();
     let emoji_utf16 = source[..emoji].encode_utf16().count();
@@ -208,18 +233,28 @@ fn viewport_edges_clip_only_true_leaf_source_and_preserve_unicode_half_unit_quer
 }
 
 #[test]
-fn bad_eof_fence_does_not_revoke_independent_proven_leaf_or_gain_coverage_itself() {
+fn unknown_link_keeps_its_gap_while_real_eof_code_is_independently_proven() {
     let first = "```text\n首块中文\n```\n";
-    let source = format!("{first}\n**普通正文**\n\n````\n未闭合正文\n```");
+    let source = format!(
+        "{first}\n**普通正文{}** [未知](https://example.com)\n\n````\n未闭合正文\n```",
+        "中".repeat(700)
+    );
     let (_directory, doc) = document(&source);
     let (request, sources) = leaf_sources(&doc, 0..doc.utf16_len());
     let ready = ready(&sources);
     let marker_end = first.rfind("```").unwrap() + 3;
     assert_eq!(first_leaf_range(&source), 0..marker_end);
-    let expected = [units(&source, 0..marker_end)];
+    let expected = Parser::new_ext(
+        &source,
+        crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+    )
+    .into_offset_iter()
+    .filter_map(|(event, range)| {
+        matches!(event, Event::Start(Tag::CodeBlock(_))).then(|| units(&source, range))
+    })
+    .collect::<Vec<_>>();
     assert_partial_oracle(&source, &doc, ready, 0..doc.utf16_len(), &expected);
     assert_fence_separator_is_unknown(&source, &doc, ready, marker_end..first.len(), "\n");
-    assert!(request.leaf_semantic.is_none());
     assert_eq!(request.total_work().allocated_source_capacity, 0);
 }
 
@@ -235,7 +270,12 @@ fn multiple_coverage_pages_share_one_global_and_forward_quota_with_live_old_publ
         source.push_str(&block);
         expected.push(first..source[..marker_end].encode_utf16().count());
         separators.push(marker_end..source.len());
-        source.push_str("\n间隔**普通段落**\n\n");
+        // 短 scoped 链接已经接原 Parser；这个分页/累计配额负例保留真实 >2KiB 的长链接空洞。
+        // marker goldens、两页覆盖和零复制断言都不变，不能再把新支持的小块当作应当未知。
+        source.push_str(&format!(
+            "\n> 间隔[{}](https://example.com)\n\n",
+            "真实未知链接".repeat(128)
+        ));
     }
     // golden来自显式marker端点，并独立对照完整Parser，而不是从Core覆盖反推预期。
     let parser_ranges: Vec<_> = Parser::new_ext(

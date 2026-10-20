@@ -2,7 +2,10 @@
 
 use super::*;
 use objc2::{AnyThread, ClassType};
-use objc2_app_kit::{NSColor, NSFontAttributeName, NSForegroundColorAttributeName, NSRulerView};
+use objc2_app_kit::{
+    NSColor, NSEvent, NSEventModifierFlags, NSEventType, NSFontAttributeName,
+    NSForegroundColorAttributeName, NSRulerView,
+};
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextCreateImage, CGColor, CGColorRenderingIntent,
     CGColorSpace, CGContext, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo, kCGColorSpaceSRGB,
@@ -21,6 +24,13 @@ use omni_md_plugin::native_surface::{
 struct Canvas {
     context: CFRetained<CGContext>,
     pixels: Vec<u8>,
+}
+
+/// 固定夹具预先声明可见折叠语义；不读取生产Scene的may_fold或私有图形状态反推期望。
+#[derive(Clone, Copy)]
+enum FoldMarker {
+    Expanded,
+    Collapsed,
 }
 impl Canvas {
     fn new(bounds: NSRect, scale: f64) -> Self {
@@ -105,7 +115,8 @@ fn width(ruler: &NSRulerView, lines: usize) -> f64 {
             std::ptr::null_mut(),
         )
     };
-    let expected = (advance + 5.0 + 3.0).max(20.0) + 1.0;
+    // 行号沿原左5/右3与1pt分隔线，另外公开预留10pt折叠槽；号码不占这个标记热区。
+    let expected = (advance + 5.0 + 3.0).max(20.0) + 1.0 + 10.0;
     assert_eq!(
         ruler.ruleThickness(),
         expected,
@@ -121,7 +132,7 @@ fn pixels(
     scroll: &NSScrollView,
     view: &NativeMarkdownPagedTextView,
     stage: &str,
-    samples: &[(usize, Option<&str>, bool)],
+    samples: &[(usize, Option<&str>, bool, Option<FoldMarker>)],
     entire_active_without_number: bool,
 ) {
     autoreleasepool(|_| {
@@ -181,7 +192,7 @@ fn pixels(
         );
         let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
         let mut regions = Vec::with_capacity(samples.len());
-        for &(position, number, active) in samples {
+        for &(position, number, active, marker) in samples {
             let rect = scene
                 .first_rect(NSRange::new(
                     position,
@@ -255,11 +266,45 @@ fn pixels(
                 };
                 CGContext::set_text_position(
                     Some(&source.context),
-                    bounds.origin.x + bounds.size.width - 1.0 - 3.0 - advance,
+                    bounds.origin.x + bounds.size.width - 1.0 - 3.0 - 10.0 - advance,
                     frame.origin.y + frame.size.height / 2.0 - (ascent - descent) / 2.0,
                 );
                 // SAFETY: 本同步栈独占有限CPU context，固定CTLine和真实字体在绘制期间存活。
                 unsafe { line.draw(&source.context) };
+            }
+            if let Some(marker) = marker {
+                // 公开10pt槽内的固定右/下三角表示收起/展开；只借真实行中心，不借生产marker路径。
+                // 与数字同一独立sRGB画布逐像素对照，图层插值或抗锯齿差异都不能用容差掩盖。
+                let center = NSPoint::new(
+                    bounds.origin.x + bounds.size.width - 7.0,
+                    frame.origin.y + frame.size.height * 0.5,
+                );
+                let vertices = match marker {
+                    FoldMarker::Expanded => [
+                        NSPoint::new(center.x - 3.0, center.y + 2.0),
+                        NSPoint::new(center.x + 3.0, center.y + 2.0),
+                        NSPoint::new(center.x, center.y - 2.0),
+                    ],
+                    FoldMarker::Collapsed => [
+                        NSPoint::new(center.x - 2.0, center.y - 3.0),
+                        NSPoint::new(center.x + 2.0, center.y),
+                        NSPoint::new(center.x - 2.0, center.y + 3.0),
+                    ],
+                };
+                CGContext::set_rgb_fill_color(
+                    Some(&source.context),
+                    81.0 / 255.0,
+                    91.0 / 255.0,
+                    109.0 / 255.0,
+                    1.0,
+                );
+                CGContext::begin_path(Some(&source.context));
+                CGContext::move_to_point(Some(&source.context), vertices[0].x, vertices[0].y);
+                for vertex in &vertices[1..] {
+                    CGContext::add_line_to_point(Some(&source.context), vertex.x, vertex.y);
+                }
+                CGContext::close_path(Some(&source.context));
+                CGContext::fill_path(Some(&source.context));
             }
             regions.push((row, number, active));
         }
@@ -399,7 +444,11 @@ pub(super) fn long(
         scroll,
         view,
         "gutter_original_long_bof",
-        &[(1, Some("1"), true), (80, None, true), (160, None, true)],
+        &[
+            (1, Some("1"), true, None),
+            (80, None, true, None),
+            (160, None, true, None),
+        ],
         false,
     );
     let key = view.capture_ready_scene_key().unwrap();
@@ -447,7 +496,11 @@ pub(super) fn long(
         scroll,
         view,
         "gutter_long_restored_number",
-        &[(1, Some("1"), true), (80, None, true), (160, None, true)],
+        &[
+            (1, Some("1"), true, None),
+            (80, None, true, None),
+            (160, None, true, None),
+        ],
         false,
     );
     assert!(
@@ -471,6 +524,45 @@ pub(super) fn small(mtm: MainThreadMarker) {
         small_case(mtm, lines);
         process_memory::sample(after).unwrap();
     } // 同样的两个真实场景各重开一次；只记录原Mach分类，不用四次样本冒签长期内存稳定。
+}
+
+/// 固定九行夹具的首段有真实后续行；通过挂载ruler的标准鼠标入口切换原折叠，不直接改Input。
+fn click_first_fold(
+    body: &NativeMarkdownPagedBody,
+    window: &NSWindow,
+    scroll: &NSScrollView,
+    view: &NativeMarkdownPagedTextView,
+) {
+    let key = view.capture_ready_scene_key().unwrap();
+    let scene = NativeMarkdownPagedTextViewDelegate::ready_scene(body, &key.request).unwrap();
+    let first = scene.first_rect(NSRange::new(0, 1)).unwrap().rect;
+    let ruler = scroll.verticalRulerView().unwrap();
+    let frame = ruler.convertRect_fromView(first, Some(view));
+    let bounds = ruler.bounds();
+    let point = ruler.convertPoint_toView(
+        NSPoint::new(
+            bounds.origin.x + bounds.size.width - 7.0,
+            frame.origin.y + frame.size.height * 0.5,
+        ),
+        None,
+    );
+    drop(scene); // 后继实际折叠前归还旧Scene强边，不让对照自己的Reader阻碍生产退休。
+    let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+        NSEventType::LeftMouseDown,
+        point,
+        NSEventModifierFlags::empty(),
+        1.0,
+        window.windowNumber(),
+        None,
+        1,
+        1,
+        1.0,
+    )
+    .unwrap();
+    // SAFETY: 同步存活的公开NSEvent交给真实NSRulerView标准void入口；不是系统物理鼠标验收。
+    unsafe {
+        let _: () = objc2::msg_send![&*ruler, mouseDown: &*event];
+    }
 }
 
 fn small_case(mtm: MainThreadMarker, lines: usize) {
@@ -553,13 +645,35 @@ fn small_case(mtm: MainThreadMarker, lines: usize) {
             window.orderFrontRegardless();
             window.displayIfNeeded();
             deliver_frame("gutter_small_initial_frame", &body, first);
+            autoreleasepool(|_| {
+                // 本夹具固定从无缩进的LTR“x\r\n”开始，Source首part从本行X=0起排，
+                // attach明确给8pt正文padding；ruler/调用方inset只移动正文frame，不能再加进局部caret。
+                // 期望值直接来自这份公开交互合同，不从待测layout_origin或可见frame反推。
+                let key = view.capture_ready_scene_key().unwrap();
+                let scene =
+                    NativeMarkdownPagedTextViewDelegate::ready_scene(&*body, &key.request).unwrap();
+                let caret = scene.first_rect(NSRange::new(0, 0)).unwrap();
+                assert_eq!(caret.actual_range, NSRange::new(0, 0));
+                assert_eq!(
+                    caret.rect.origin.x,
+                    8.0,
+                    "gutter_small_initial_frame lines={lines}: 原首字caret必须仍是局部8pt；virtual={:?} body_frame={:?} clip_bounds={:?} clip_insets={:?}",
+                    key.request.virtual_viewport,
+                    key.request.frame_in_parent,
+                    scroll.contentView().bounds(),
+                    scroll.contentView().contentInsets(),
+                );
+            }); // 不保留Scene/Reader到后续选择、折叠或实际关闭收据。
             pixels(
                 &body,
                 &window,
                 &scroll,
                 &view,
                 "gutter_small_initial_crlf_numbers",
-                &[(0, Some("1"), true), (3, Some("2"), false)],
+                &[
+                    (0, Some("1"), true, Some(FoldMarker::Expanded)),
+                    (3, Some("2"), false, None),
+                ],
                 false,
             );
             let first_resources = body.resource_receipts().unwrap();
@@ -568,6 +682,33 @@ fn small_case(mtm: MainThreadMarker, lines: usize) {
                 "首个真实完整帧必须有原Reader"
             );
             let mut resources = vec![first_resources];
+            if lines == 9 {
+                for (stage, marker) in [
+                    ("gutter_small_fold_marker", FoldMarker::Collapsed),
+                    ("gutter_small_unfold_marker", FoldMarker::Expanded),
+                ] {
+                    // 同一九行资源图内核实际折叠/展开；每次等原完整CPU帧，再独立绘图核箭头方向。
+                    // 不改行号、UTF16长度或正文版本来适配显示结果，随后原跨位数/Undo流程照常运行。
+                    let frame = observe(&body, Instant::now());
+                    click_first_fold(&body, &window, &scroll, &view);
+                    deliver_frame(stage, &body, frame);
+                    resources.push(body.resource_receipts().unwrap());
+                    let document = doc_weak.upgrade().unwrap();
+                    assert_eq!(document.borrow().line_count(), lines);
+                    assert_eq!(document.borrow().utf16_len(), original_length);
+                    assert_eq!(document.borrow().current_revision().unwrap(), revision);
+                    drop(document);
+                    pixels(
+                        &body,
+                        &window,
+                        &scroll,
+                        &view,
+                        stage,
+                        &[(0, Some("1"), true, Some(marker))],
+                        false,
+                    );
+                }
+            }
             let frame = observe(&body, Instant::now());
             view.command(sel!(moveToEndOfDocument:)).unwrap();
             deliver_frame("gutter_small_tail_empty_frame", &body, frame);
@@ -589,8 +730,8 @@ fn small_case(mtm: MainThreadMarker, lines: usize) {
                 &view,
                 "gutter_small_tail_crlf_numbers",
                 &[
-                    (original_length - 3, Some(&previous_number), false),
-                    (original_length, Some(&last_number), true),
+                    (original_length - 3, Some(&previous_number), false, None),
+                    (original_length, Some(&last_number), true, None),
                 ],
                 false,
             );
@@ -662,8 +803,8 @@ fn small_case(mtm: MainThreadMarker, lines: usize) {
                 &view,
                 "gutter_small_expanded_digit_numbers",
                 &[
-                    (original_length, Some(&last_number), false),
-                    (original_length + 2, Some(&new_number), true),
+                    (original_length, Some(&last_number), false, None),
+                    (original_length + 2, Some(&new_number), true, None),
                 ],
                 false,
             );
@@ -696,8 +837,8 @@ fn small_case(mtm: MainThreadMarker, lines: usize) {
                 &view,
                 "gutter_small_undo_tail_numbers",
                 &[
-                    (original_length - 3, Some(&previous_number), false),
-                    (original_length, Some(&last_number), true),
+                    (original_length - 3, Some(&previous_number), false, None),
+                    (original_length, Some(&last_number), true, None),
                 ],
                 false,
             );

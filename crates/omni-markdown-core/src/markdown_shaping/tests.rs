@@ -1,5 +1,6 @@
 //! 真实冻结piece与真实字体之间的契约回归；不把同一算法对照当成Native功能或总峰值证明。
 use super::*;
+use harfrust::ShaperFont;
 use std::sync::Arc;
 
 const ROBOTO: &[u8] = include_bytes!(concat!(

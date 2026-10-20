@@ -61,7 +61,7 @@ pub struct NativeMarkdownFontTrialStep {
 
 /// 只在原worker内部构造并保留原非Send Job；跨线程传送的仍只有Trial packet和最终结果。
 pub struct NativeMarkdownFontTrialWorker {
-    #[cfg(feature = "native-paged-compose-probe")]
+    #[cfg(feature = "native-paged-production")]
     probe: Option<omni_markdown_core::MarkdownLineFontProbe>,
     identity: Arc<()>,
     source: MarkdownLayoutTextAuthority,
@@ -82,7 +82,7 @@ impl NativeMarkdownFontTrial {
     #[must_use]
     pub fn into_worker(self) -> NativeMarkdownFontTrialWorker {
         let Self {
-            #[cfg(feature = "native-paged-compose-probe")]
+            #[cfg(feature = "native-paged-production")]
             probe,
             source,
             source_authority,
@@ -94,7 +94,7 @@ impl NativeMarkdownFontTrial {
             identity,
         } = self;
         let mut worker = NativeMarkdownFontTrialWorker {
-            #[cfg(feature = "native-paged-compose-probe")]
+            #[cfg(feature = "native-paged-production")]
             probe,
             identity,
             source: source_authority,
@@ -116,14 +116,23 @@ impl NativeMarkdownFontTrial {
             result: None,
         };
         let created = (|| {
-            source.byte_offset_for_utf16(range.start)?;
-            #[cfg(feature = "native-paged-compose-probe")]
+            #[cfg(feature = "native-paged-production")]
             if let Some(probe) = &worker.probe {
                 probe.validate().map_err(compose::error)?;
+                if MainThreadMarker::new().is_some() {
+                    return Err(NativeMarkdownFontFallbackError::MainThreadShape);
+                }
+                // 外 GCB 与当前 scalar shaping 段均来自同 Source 的封存票；Worker 只消费当前真段。
+                // 下一段只能在此 Job/glyph 存储真实归还后由原 Composer 推进，不重扫远端段首。
+                return probe
+                    .shaping_job(font, &worker.font, options, worker.cancellation.clone())
+                    .map_err(compose::error);
             }
+            // 未取得协调器原票的公开完整试次仍由原构造验证两端，不凭本地范围补签权限。
+            source.byte_offset_for_utf16(range.start)?;
             if MainThreadMarker::new().is_some() {
                 return Err(NativeMarkdownFontFallbackError::MainThreadShape);
-            } // 原Source真实错误优先于线程调度；不让长GCB进入主线程同步算法。
+            } // 原 Source 真实错误优先于线程调度；不让长 GCB 进入主线程同步算法。
             Ok(MarkdownShapingJob::new_with_cancellation(
                 source,
                 &worker.source,
@@ -200,7 +209,7 @@ impl NativeMarkdownFontTrialWorker {
         budget: NativeMarkdownFontTrialBudget,
         step: &mut NativeMarkdownFontTrialStep,
     ) -> Result<bool> {
-        #[cfg(feature = "native-paged-compose-probe")]
+        #[cfg(feature = "native-paged-production")]
         if let Some(probe) = &self.probe {
             probe.validate().map_err(compose::error)?;
         } // 零预算也核原Source及原Style scope；原响应已消费时不能继续旧字体试次。
@@ -258,6 +267,24 @@ impl NativeMarkdownFontTrialWorker {
                     let glyph = job
                         .glyph(&self.source, &self.font, self.checked)?
                         .ok_or(NativeMarkdownFontFallbackError::InvalidCluster)?;
+                    #[cfg(all(
+                        feature = "native-paged-production",
+                        feature = "native-markdown-runtime-probe"
+                    ))]
+                    if self.facts.glyph_count <= 8
+                        && let Some(probe) = &self.probe
+                        && probe.source_range().len() > 1
+                        && probe.source_range().end <= 8
+                        && std::env::var_os("OMNI_NATIVE_PROBE_TRACE").is_some()
+                    {
+                        // 原检查循环刚取得的实际glyph直接交诊断；不重读spool、不另shape，
+                        // 也不把试次候选当最终选择。主线程原Choice日志另确认最终注册Font。
+                        eprintln!(
+                            "native_font_trial_glyph whole_gcb={:?} record_index={} actual_glyph={glyph:?}",
+                            probe.source_range(),
+                            self.checked,
+                        );
+                    }
                     // 只成功读取原记录才增加计数；任何后续失败都整次撤权，不发布已有前缀。
                     step.glyphs += 1;
                     self.checked += 1;
@@ -302,6 +329,7 @@ impl NativeMarkdownFontTrialWorker {
             resources.files_open != 0
                 || resources.mappings_open != 0
                 || resources.mapped_bytes != 0
+                || resources.work_bytes != 0
                 || resources.cleanup_failed
                 || !resources.shaper_access_certified
         }) {
@@ -321,7 +349,7 @@ impl NativeMarkdownFontTrialWorker {
     }
 
     fn refresh_terminal_error(&mut self) {
-        #[cfg(feature = "native-paged-compose-probe")]
+        #[cfg(feature = "native-paged-production")]
         let probe_error = self.probe.as_ref().and_then(|probe| probe.validate().err());
         let Some(result) = self.result.as_mut() else {
             return;
@@ -334,7 +362,7 @@ impl NativeMarkdownFontTrialWorker {
             result.outcome =
                 Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
         }
-        #[cfg(feature = "native-paged-compose-probe")]
+        #[cfg(feature = "native-paged-production")]
         if let Some(cause) = probe_error
             && (matches!(
                 &cause,

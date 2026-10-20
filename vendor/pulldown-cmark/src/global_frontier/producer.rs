@@ -32,6 +32,9 @@ use crate::source_frontier::{
 const GLOBAL_CONTROL_WORK: usize = 128;
 const PREFIX_WORKSPACE_WORK: usize = 1024;
 
+mod semantic_boundary;
+use semantic_boundary::SemanticBoundary;
+
 #[derive(Clone, Copy, Debug)]
 pub struct GlobalFrontierLimits {
     pub spine: StructuralSpineLimits,
@@ -118,6 +121,7 @@ pub(crate) struct VerifiedGlobalTable {
     next_utf16: usize,
     next_line: usize,
     options: Options,
+    header_inline: crate::block_frontier::cell::TableInlineRow,
 }
 impl VerifiedGlobalTable {
     pub(crate) fn into_parts(
@@ -135,6 +139,7 @@ impl VerifiedGlobalTable {
         usize,
         usize,
         Options,
+        crate::block_frontier::cell::TableInlineRow,
     ) {
         (
             self.spine,
@@ -149,6 +154,7 @@ impl VerifiedGlobalTable {
             self.next_utf16,
             self.next_line,
             self.options,
+            self.header_inline,
         )
     }
 }
@@ -359,6 +365,8 @@ pub struct GlobalFrontier {
     inline_fact: Option<VerifiedGlobalInlineBlock>,
     leaf_block: Option<PendingGlobalLeaf>,
     leaf_fact: Option<VerifiedGlobalLeafBlock>,
+    // 只有语义上下文前探持一个真实恢复点；不保存未来Fact目录，也不另建结构前沿。
+    semantic_boundary: Option<SemanticBoundary>,
     failure: Option<GlobalFrontierError>,
 }
 impl std::fmt::Debug for GlobalFrontier {
@@ -444,6 +452,7 @@ impl GlobalFrontier {
             inline_fact: None,
             leaf_block: None,
             leaf_fact: None,
+            semantic_boundary: None,
             failure: None,
         })
     }
@@ -588,12 +597,14 @@ impl GlobalFrontier {
             // 本轮新叶块的私有 scope claims 与未提交事实同时撤销，sticky 失败不能复活它们。
             self.leaf_block = None;
             self.leaf_fact = None;
+            self.semantic_boundary = None;
             self.failure = Some(GlobalFrontierError::Cancelled);
             return Err(GlobalFrontierError::Cancelled);
         }
         if authority.current_revision != self.revision {
             self.leaf_block = None;
             self.leaf_fact = None;
+            self.semantic_boundary = None;
             self.failure = Some(GlobalFrontierError::SourceSuperseded);
             return Err(GlobalFrontierError::SourceSuperseded);
         }
@@ -614,6 +625,7 @@ impl GlobalFrontier {
                 // UTF8、结构或总 fuel 失败同样丢弃尚未公开的叶块，不能在后继 advance 补签。
                 self.leaf_block = None;
                 self.leaf_fact = None;
+                self.semantic_boundary = None;
                 self.failure = Some(error);
                 Err(error)
             }
@@ -1643,14 +1655,19 @@ impl GlobalFrontier {
                     self.spine
                         .entry(self.spine.len().saturating_sub(1))
                         .map(|e| e.kind),
-                    Some(StructuralKind::Footnote)
+                    Some(StructuralKind::Footnote { .. })
                 ) {
                     self.spine.pop()?;
                 }
-                self.spine.push(StructuralEntry::for_role(
-                    crate::block_context::ContainerRole::Footnote,
-                    start,
-                ))?;
+                // 同一原 scanner 已确认 closing colon 并消费其后真实空白；首行 label 字面
+                // enclosure 到此为止。不能让后续语义消费者重扫数字、标点或猜祖先 opening。
+                let body_start = self.origin + self.state.ix;
+                self.spine.push(StructuralEntry {
+                    kind: StructuralKind::Footnote {
+                        body_start: std::num::NonZeroUsize::new(body_start),
+                    },
+                    source_start: start,
+                })?;
                 self.origin += self.state.ix;
                 self.state = LineStartState::default();
                 self.phase = Phase::Ready(Ready::Opening);
@@ -2194,7 +2211,7 @@ impl GlobalFrontier {
             self.options,
             kind,
             start,
-            self.position.byte,
+            (self.position.byte, self.origin, self.state),
             self.spine.clone(),
         ));
         Ok(())
@@ -2414,6 +2431,13 @@ impl GlobalFrontier {
             next_utf16: self.position.utf16,
             next_line: self.position.line,
             options: self.options,
+            header_inline: crate::block_frontier::cell::TableInlineRow {
+                ordinal: 0,
+                start: self.header_physical_start,
+                content_start: header.start,
+                content_end: header.content_end,
+                end: header.end,
+            },
         };
         self.table = Some(TableContinuationState::from_verified_global(verified));
         self.phase = Phase::Table;

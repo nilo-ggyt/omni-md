@@ -38,6 +38,10 @@ pub enum MarkdownEmergencyGlyphSliceAnswer {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownEmergencyGlyphSliceStep {
     pub input_bytes: usize,
+    /// 原重排步骤实际消费的标量；安全复用路径保持零，不按字形数换算。
+    pub input_scalars: usize,
+    /// 本轮新 Job 的真实上下文读取，沿原解析步骤交回，不重复算入正文输入。
+    pub context_bytes: usize,
     pub glyphs: usize,
     pub candidates: usize,
     pub shapes: usize,
@@ -288,6 +292,8 @@ impl MarkdownEmergencyGlyphSliceJob {
         self.inner.guard(measure, original)?;
         Ok(MarkdownEmergencyGlyphSliceStep {
             input_bytes: step.input_bytes,
+            input_scalars: step.input_scalars,
+            context_bytes: step.context_bytes,
             glyphs: step.glyphs,
             candidates: step.candidates,
             shapes: step.shapes,
@@ -397,6 +403,8 @@ impl MarkdownEmergencyGlyphSliceJob {
 fn empty_step(answer: MarkdownEmergencyGlyphSliceAnswer) -> MarkdownEmergencyGlyphSliceStep {
     MarkdownEmergencyGlyphSliceStep {
         input_bytes: 0,
+        input_scalars: 0,
+        context_bytes: 0,
         glyphs: 0,
         candidates: 0,
         shapes: 0,

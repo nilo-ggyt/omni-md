@@ -116,7 +116,10 @@ impl ResolvedCapture {
         item_facts.beginning_of_text = range.start == item_facts.paragraph_utf16.start;
         item_facts.end_of_text = range.end == item_facts.paragraph_utf16.end;
         let directory = Directory {
+            shaping_seams: [None; 2], // 重排范围两端来自原行选择的 GCB，不能沿普通 item 扩大分段权限。
+            paragraph_inset_26_6: item.paragraph_inset_26_6,
             facts: item_facts,
+            presentation: item.presentation, // child沿原样式整形，折行不能丢失隐藏或装饰身份。
             font: item.font,
             glyph_start: start,
             glyph_count: facts.boundary.glyphs,
@@ -407,6 +410,7 @@ impl ResolvedCapture {
             MarkdownComposedLineKind::Mandatory => 1,
             MarkdownComposedLineKind::Emergency => 2,
             MarkdownComposedLineKind::Overflow => 3,
+            MarkdownComposedLineKind::TableRow => return Err(Error::InvalidRequest),
         };
         rows[0][58] = self.base_level; // 原同源准备阶段捕获，不能由child方向重签原段base。
         for (at, value) in [

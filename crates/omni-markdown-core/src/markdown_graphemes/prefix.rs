@@ -4,9 +4,11 @@ use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MarkdownGraphemePrefixFacts {
-    /// 已证明且按全局ordinal连续的边界数；Dense为逻辑记录，物理IO另由原profile计量。
+    /// Source 域保留原全源序号；FoldedVisible 序号只覆盖可见边界与显式折叠两端。
+    pub ordinal_domain: MarkdownGraphemeOrdinalDomain,
+    /// 本记录域中已经连续提交的边界数；Dense为逻辑记录，物理IO另由原profile计量。
     pub known_boundary_count: usize,
-    /// 这个位置及之前的单点分类已完成；它本身不一定是GCB。
+    /// 这个位置之前的可查询位置已经分类；折叠隐藏内部始终是 FoldedRange。
     pub confirmed_through: Option<MarkdownGraphemeBoundary>,
     pub last_committed_boundary: Option<MarkdownGraphemeBoundary>,
     pub complete: bool,
@@ -45,6 +47,7 @@ impl MarkdownGraphemeJob {
             self.machine.last_committed_boundary()
         };
         let facts = MarkdownGraphemePrefixFacts {
+            ordinal_domain: self.ordinal_domain(),
             known_boundary_count,
             confirmed_through: self.machine.frontier,
             last_committed_boundary,
@@ -78,7 +81,8 @@ impl MarkdownGraphemePrefix<'_> {
         Ok(end)
     }
 
-    /// 一次只读取≤256条原已提交记录；未知记录保持Pending且不改输出，真EOF越界才失败。
+    /// 一次只读取≤256条当前显式域的已提交记录；未知记录保持Pending且不改输出。
+    /// FoldedVisible 的相邻序号不能推导隐藏内部的原 GCB 数目或完整 cluster。
     pub fn read_boundaries(
         &mut self,
         range: Range<usize>,

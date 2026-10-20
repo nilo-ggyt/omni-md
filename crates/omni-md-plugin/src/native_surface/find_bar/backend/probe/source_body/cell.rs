@@ -832,7 +832,7 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
         .body
         .commit_cell_to_body(&original.canonical, &permit, &|epoch| epoch == EPOCH)
         .map_err(|cause| cause.to_string())?;
-    let NativeMarkdownPagedInputOutcome::Committed(commit) = outcome else {
+    let NativeMarkdownPagedInputOutcome::Committed(commit) = outcome.outcome else {
         return Err("两MiBCell没有沿原canonical Input交付真实提交".into());
     };
     commit

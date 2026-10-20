@@ -7,7 +7,7 @@ fn prepare(
     doc: &MarkdownDocumentBuffer,
     token: &MarkdownCellDraft,
 ) -> Result<MarkdownCellDraftPreparedCommit, MarkdownCellDraftError> {
-    doc.prepare_cell_draft_commit(doc.capture_cell_draft_edit(token)?)
+    doc.prepare_cell_draft_commit(doc.capture_cell_draft_edit(token)?, None)
 }
 
 fn assert_no_admission(observer: &MarkdownCellDraftResourceObserver) {
@@ -80,6 +80,7 @@ fn long_admission_keeps_two_real_scenes_and_busy_consumption_unmaps_only_its_can
     let prepared = prepare(&doc, &token).unwrap();
     doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap()
+        .edit
         .unwrap();
     let expected = SOURCE.replacen("| a |", &format!("| {} |", "x".repeat(2 * 1024 * 1024)), 1);
     assert_eq!(canonical(&doc), expected);
@@ -139,6 +140,7 @@ fn same_admission_after_scene_drop_publishes_once_with_one_canonical_undo() {
     drop((first, second));
     doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap()
+        .edit
         .unwrap();
     let expected = SOURCE.replacen("| a |", "| new\\|中 😀 |", 1);
     assert_eq!(canonical(&doc), expected);
@@ -258,7 +260,7 @@ fn foreign_document_cannot_consume_or_reprepare_the_original_capsule() {
     let other_token = begin(&mut other);
     let original_edit = doc.capture_cell_draft_edit(&token).unwrap();
     assert!(matches!(
-        other.prepare_cell_draft_commit(original_edit),
+        other.prepare_cell_draft_commit(original_edit, None),
         Err(MarkdownCellDraftError::Stale)
     ));
     let prepared = prepare(&doc, &token).unwrap();
@@ -302,6 +304,7 @@ fn new_prepare_preserves_marked_failure_and_legacy_commit_keeps_its_existing_beh
     // 旧public入口先前允许原owner明确提交marked内容；新协议不静默改变兼容行为。
     doc.commit_cell_draft_observed(&token, NoopObserver)
         .unwrap()
+        .edit
         .unwrap();
     assert_eq!(canonical(&doc), SOURCE.replacen("| a |", "| ni |", 1));
     assert!(observer.is_released());
@@ -317,6 +320,7 @@ fn unchanged_admission_does_not_call_observer_or_publish_selection_and_history()
     assert!(
         doc.commit_prepared_cell_draft_observed(prepared, Reject)
             .unwrap()
+            .edit
             .is_none()
     );
     assert_eq!(doc.storage_profile(), before);
@@ -449,6 +453,7 @@ fn exact_utf16_limit_and_maximal_utf8_or_escaping_stay_within_the_single_sanitiz
         };
         doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
             .unwrap()
+            .edit
             .unwrap();
         assert_eq!(
             canonical(&doc),
@@ -480,6 +485,7 @@ fn exact_utf16_limit_and_maximal_utf8_or_escaping_stay_within_the_single_sanitiz
     assert_eq!(doc.cell_draft_facts(&token).unwrap().utf16_len, 65537);
     doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap()
+        .edit
         .unwrap();
     assert_eq!(
         canonical(&doc),
@@ -562,7 +568,7 @@ fn prepare_source_error_precedes_marked_and_busy_without_releasing_another_live_
         ))
     );
     assert!(matches!(
-        doc.prepare_cell_draft_commit(edit),
+        doc.prepare_cell_draft_commit(edit, None),
         Err(MarkdownCellDraftError::Document(
             MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
         ))
@@ -670,6 +676,7 @@ fn long_sanitize_boundaries_save_and_history_preserve_exact_bytes() {
     let mapping = prepared.replacement_backing_observer().unwrap();
     doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap()
+        .edit
         .unwrap();
     let full = SOURCE.replacen("| a |", &format!("| {expected} |"), 1);
     assert_eq!(canonical(&doc), full);
@@ -754,6 +761,7 @@ fn candidate_reclaim_failure_rolls_back_without_poisoning_the_original_draft() {
     replace(&mut doc, &token, "继续编辑");
     doc.commit_cell_draft_observed(&token, NoopObserver)
         .unwrap()
+        .edit
         .unwrap();
     assert_eq!(canonical(&doc), SOURCE.replacen("| a |", "| 继续编辑 |", 1));
     assert!(!resources.is_released()); // 后继成功不能把先前真实候选I/O失败洗成健康释放。
@@ -787,6 +795,7 @@ fn long_whitespace_sanitizes_to_the_existing_empty_cell_semantics() {
     assert!(prepared.replacement_backing_observer().is_none());
     doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap()
+        .edit
         .unwrap();
     assert_eq!(canonical(&doc), SOURCE.replacen("| a |", "|  |", 1));
     doc.undo_text_edit().unwrap();
@@ -809,6 +818,17 @@ fn anonymous_output_io_failures_preserve_the_original_draft() {
         let second = doc.capture_cell_draft(&token).unwrap();
         let before = doc.cell_draft_facts(&token).unwrap();
         let baseline = doc.storage_profile();
+        // 本 --exact 子进程没有其他测试竞争FD；原Doc、草稿和两个reader在前后均保持存活。
+        // 每次目录迭代器只活在同一局部查询内，贡献对称，返回前已关闭；枚举失败不能算作释放。
+        let open_descriptors = || {
+            let mut count = 0;
+            for descriptor in std::fs::read_dir("/dev/fd").unwrap() {
+                descriptor.unwrap();
+                count += 1;
+            }
+            count
+        };
+        let descriptors_before = open_descriptors();
         let result = if kind == "create" {
             std::fs::remove_dir(&scratch).unwrap(); // 原快照与raw文件均已匿名，删除空scratch不影响原字节。
             prepare(&doc, &token)
@@ -832,6 +852,9 @@ fn anonymous_output_io_failures_preserve_the_original_draft() {
             unsafe { libc::signal(libc::SIGXFSZ, signal) };
             result
         };
+        // 真实创建/写入失败已返回且rlimit已恢复；候选输出必须归还其FD，不能只撤prepared标志。
+        // 不再查询已关闭FD的旧整数，避免将整数重用后的别的文件误判为原候选仍存活。
+        assert_eq!(open_descriptors(), descriptors_before);
         let expected = if kind == "create" {
             libc::ENOENT
         } else {

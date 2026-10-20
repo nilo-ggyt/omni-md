@@ -43,6 +43,9 @@ pub(in crate::native_surface) struct NativeMarkdownPagedFindRevealRequest {
     committed: Option<Rc<NativeMarkdownPagedInputCommit>>,
     terminal: Cell<Terminal>,
     failure: RefCell<Option<NativeMarkdownFindExecutionError>>,
+    // 只在显式验收构建观察原终态；回调不保正文、View 或后继请求，没有第二份成功状态。
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    terminal_observer: crate::native_surface::probe::ProbeTerminalObserver,
 }
 
 impl NativeMarkdownPagedFindRevealRequest {
@@ -82,6 +85,8 @@ impl NativeMarkdownPagedFindRevealRequest {
             committed,
             terminal: Cell::new(Terminal::Pending),
             failure: RefCell::new(None),
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            terminal_observer: crate::native_surface::probe::ProbeTerminalObserver::default(),
         });
         if !request.is_current() {
             return Err("原查找定位请求已经失效".into());
@@ -93,6 +98,8 @@ impl NativeMarkdownPagedFindRevealRequest {
     pub(in crate::native_surface) fn cancel(&self) {
         if self.terminal.get() == Terminal::Pending {
             self.terminal.set(Terminal::Cancelled);
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            self.terminal_observer.notify();
         }
     }
 
@@ -102,6 +109,59 @@ impl NativeMarkdownPagedFindRevealRequest {
         if self.terminal.get() == Terminal::Pending {
             *self.failure.borrow_mut() = Some(self.error(cause));
             self.terminal.set(Terminal::Failed);
+            // Body.fail还在封闭自身，不能在此同步进入Native布局让未结束的错误栈再次advance。
+            // 只排原controller/bar/Doc弱身份和错误文本；消息不保活正文、Source或Native图。
+            let message = self.failure.borrow().as_ref().map(ToString::to_string);
+            // 先固定产品实际错误反馈，再通知外部观察；观察者可能消费原 typed failure，
+            // 不能因验收回调取走错误而让正式窗口丢失本次已提交后果的中文提示。
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            self.terminal_observer.notify();
+            let Some(message) = message else {
+                return;
+            };
+            let mtm = MainThreadMarker::new().expect("Find终态只在AppKit主线程交付");
+            let identity = dispatch2::MainThreadBound::new(
+                (
+                    self.controller.clone(),
+                    self.bar.clone(),
+                    self.document.clone(),
+                ),
+                mtm,
+            );
+            let intent = self.intent;
+            crate::native_surface::enqueue_native_markdown_main_task(move || {
+                let mtm = MainThreadMarker::new().expect("Find错误反馈只在原主队列执行");
+                let (controller, bar, document) = identity.get(mtm);
+                let Some(controller) = controller.load() else {
+                    return;
+                };
+                let Some(actual_bar) = bar.upgrade() else {
+                    return;
+                };
+                if native_markdown_controller_has_foreground_authority(&controller)
+                    && controller.find_input_intent() == intent
+                    && controller.owns_find_input_bar(bar)
+                    && !actual_bar.closed.get()
+                    && std::rc::Weak::ptr_eq(&actual_bar.document, document)
+                {
+                    // 多个Native setter必须在同一原窗口owner租约内；重入关闭/换笔记不能让余下反馈落到新会话。
+                    // 租约Busy/已关闭只撤本条UI投影，typed源首因仍保留在原请求中，不重试或重放替换。
+                    let _ = crate::native_surface::with_active_native_markdown_surface(|surface| {
+                        if std::ptr::eq(&*surface.controller, &*controller)
+                            && native_markdown_controller_has_foreground_authority(&controller)
+                            && controller.find_input_intent() == intent
+                            && controller.owns_find_input_bar(bar)
+                            && !actual_bar.closed.get()
+                            && surface.editor.as_ref().is_some_and(|editor| {
+                                std::ptr::eq(document.as_ptr(), Rc::as_ptr(editor.document()))
+                            })
+                        {
+                            controller.present_error(&message);
+                        }
+                        Ok(())
+                    });
+                }
+            });
         }
     }
 
@@ -113,11 +173,13 @@ impl NativeMarkdownPagedFindRevealRequest {
     }
 
     #[must_use]
+    #[cfg(feature = "native-markdown-runtime-probe")]
     pub(in crate::native_surface) fn pending(&self) -> bool {
         self.terminal.get() == Terminal::Pending
     }
 
     #[must_use]
+    #[cfg(feature = "native-markdown-runtime-probe")]
     pub(in crate::native_surface) fn cancelled(&self) -> bool {
         self.terminal.get() == Terminal::Cancelled
     }
@@ -139,8 +201,29 @@ impl NativeMarkdownPagedFindRevealRequest {
         self.document.clone()
     }
     #[must_use]
+    #[cfg(feature = "native-markdown-runtime-probe")]
     pub(in crate::native_surface) fn completed_visible(&self) -> bool {
         self.terminal.get() == Terminal::Visible
+    }
+
+    /// 复用原请求的真实终态；Pending 与取消/失败都不能由槽是否存在或栏文案反推。
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    pub(in crate::native_surface) fn probe_completed(&self) -> Option<bool> {
+        match self.terminal.get() {
+            Terminal::Pending => None,
+            Terminal::Visible => Some(true),
+            Terminal::Cancelled | Terminal::Failed => Some(false),
+        }
+    }
+
+    /// 仅登记一次原终点，已结束则把排队权限交还调用者；不会执行 Find、重排或补造可见证明。
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    pub(in crate::native_surface) fn observe_probe_terminal(
+        &self,
+        observer: impl FnOnce() + 'static,
+    ) -> Result<bool, String> {
+        self.terminal_observer
+            .observe(self.probe_completed(), observer)
     }
 
     /// 不要求旧viewport仍相同：原请求可以合法滚到目标；最后必须认证producer给出的真实原key。
@@ -217,6 +300,8 @@ impl NativeMarkdownPagedFindRevealRequest {
             return Err("查找成功反馈已被后继请求撤销".into());
         }
         self.terminal.set(Terminal::Visible);
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        self.terminal_observer.notify();
         Ok(())
     }
 

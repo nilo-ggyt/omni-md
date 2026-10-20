@@ -15,6 +15,10 @@ pub enum MarkdownWordGroupAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MarkdownWordGroupAnswer {
     Yielded,
+    /// 真实已准备段没有无控制零级证明；该逻辑词组不提供 RTL 视觉遍历，也不毒化健康 Source。
+    UnsupportedVisualOrder,
+    /// 保留原 Step 实际工作；当前逻辑组不能跨尚未展开的隐藏 Source 范围继续读正文。
+    NeedsFoldExpansion(Range<usize>),
     /// 原Source真实逻辑范围；移动以方向端点为head，Select使用完整范围，未授予Native提交权。
     Ready(Range<usize>),
 }
@@ -27,12 +31,20 @@ pub struct MarkdownWordGroupStep {
     pub answer: MarkdownWordGroupAnswer,
 }
 
-/// 原全源UBA准备的真实工作量；None仍在准备，false明确表示本源不能用逻辑词组模拟视觉移动。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarkdownWordMoveScope {
+    WholeUniformZero,
+    /// 每个实际 GCB 必须再消费完整原 B 段证书；这项本身不授任何位置的零级权限。
+    VisibleParagraphScopes,
+    Unsupported,
+}
+
+/// 原 UBA 准备的真实工作量；None 仍在准备，Source 方向职责不会被可见子段偷换。
 pub struct MarkdownWordMovePreparation {
     pub bytes: usize,
     pub scalars: usize,
     pub metadata_units: usize,
-    pub uniform_zero: Option<bool>,
+    pub scope: Option<MarkdownWordMoveScope>,
 }
 
 enum Phase {
@@ -41,6 +53,7 @@ enum Phase {
     Left,
     Right,
     Complete(Range<usize>),
+    Unsupported,
 }
 
 /// 两侧依次推进同一游标，阶段转换本身不再花第二份字节/记录量子。
@@ -50,6 +63,8 @@ pub(in crate::markdown_line_composer::engine) struct WordGroup {
     start: usize,
     phase: Phase,
     cursor: WordDelete,
+    restore_position: Option<usize>,
+    deferred_answer: Option<MarkdownWordGroupAnswer>,
 }
 
 impl WordGroup {
@@ -90,6 +105,8 @@ impl WordGroup {
             start: head,
             phase,
             cursor: WordDelete::group(direction, head, mode),
+            restore_position: None,
+            deferred_answer: None,
         }
     }
 
@@ -100,10 +117,55 @@ impl WordGroup {
         authority: &MarkdownLayoutTextAuthority,
         budget: MarkdownLineComposeBudget,
     ) -> Result<MarkdownWordGroupStep> {
+        if self.deferred_answer.is_some() {
+            let position = self
+                .restore_position
+                .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
+            let (actual, restored) = coordinator.restore_word_layout_context(position, budget)?;
+            let answer = if restored {
+                self.restore_position = None;
+                self.deferred_answer
+                    .take()
+                    .ok_or(MarkdownLineComposeError::InconsistentCoverage)?
+            } else {
+                MarkdownWordGroupAnswer::Yielded
+            };
+            return Ok(MarkdownWordGroupStep {
+                bytes: actual.bytes,
+                scalars: actual.scalars,
+                records: actual.records,
+                metadata_units: actual.metadata_units,
+                answer,
+            });
+        } // 两个实际段槽仍由原 Bidi owner 管理；恢复量子不再兼花 GCB/分类预算。
+        if matches!(self.phase, Phase::Unsupported) {
+            return Ok(self.defer_scoped_answer(MarkdownWordGroupStep {
+                bytes: 0,
+                scalars: 0,
+                records: 0,
+                metadata_units: 0,
+                answer: MarkdownWordGroupAnswer::UnsupportedVisualOrder,
+            }));
+        } // 外层 Composer 已核原 Source 与取消；能力拒绝不重新读取未知方向的正文。
         let step = self
             .cursor
             .advance(source, coordinator, authority, budget)?;
-        let mut answer = MarkdownWordGroupAnswer::Yielded;
+        if self.cursor.visual_rejected {
+            self.phase = Phase::Unsupported;
+            return Ok(self.defer_scoped_answer(MarkdownWordGroupStep {
+                bytes: step.bytes,
+                scalars: step.scalars,
+                records: step.records,
+                metadata_units: step.metadata_units,
+                answer: MarkdownWordGroupAnswer::UnsupportedVisualOrder,
+            }));
+        } // 拒绝仍交实际本步工作；不能把同一游标已做的段准备或 I/O 擦成零。
+        let mut answer = match &step.answer {
+            MarkdownWordDeleteAnswer::NeedsFoldExpansion(hidden) => {
+                MarkdownWordGroupAnswer::NeedsFoldExpansion(hidden.clone())
+            }
+            _ => MarkdownWordGroupAnswer::Yielded,
+        };
         if let MarkdownWordDeleteAnswer::Ready(range) = step.answer {
             match &self.phase {
                 Phase::Move => {
@@ -171,23 +233,35 @@ impl WordGroup {
                 Phase::Complete(range) => {
                     answer = MarkdownWordGroupAnswer::Ready(range.clone()); // 终态仍经过同原Source/GCB健康门。
                 }
+                Phase::Unsupported => unreachable!("能力拒绝已经在推进原游标前返回"),
             }
         }
-        Ok(MarkdownWordGroupStep {
+        Ok(self.defer_scoped_answer(MarkdownWordGroupStep {
             bytes: step.bytes,
             scalars: step.scalars,
             records: step.records,
             metadata_units: step.metadata_units,
             answer,
-        })
+        }))
+    }
+
+    /// 只有 scoped 终点先让原布局段恢复；原 Root 快路和所有逻辑组没有额外阶段或读取。
+    fn defer_scoped_answer(&mut self, mut step: MarkdownWordGroupStep) -> MarkdownWordGroupStep {
+        if self.restore_position.is_some()
+            && !matches!(step.answer, MarkdownWordGroupAnswer::Yielded)
+        {
+            self.deferred_answer = Some(step.answer);
+            step.answer = MarkdownWordGroupAnswer::Yielded;
+        }
+        step
     }
 }
 
 impl MarkdownLineComposer {
-    /// 按词视觉移动先借原Coordinator的全源UniformZero事实；每次只消费原一份量子。
+    /// 按词视觉移动先确认原 Coordinator 的实际职责；每次只消费原一份准备量子。
     ///
     /// # Errors
-    /// 原Source、取消和实际Bidi存储错误沿原失败关闭；健康的非UniformZero正常返回false。
+    /// 原 Source、取消和实际 Bidi 存储错误沿原失败关闭；能力结果只声明后续职责，不签未分析位置。
     pub fn prepare_word_move(
         &mut self,
         budget: MarkdownLineComposeBudget,
@@ -211,12 +285,12 @@ impl MarkdownLineComposer {
                 .payload
                 .as_mut()
                 .ok_or(MarkdownLineComposeError::Poisoned)?;
-            let (step, uniform_zero) = payload.coordinator.prepare_word_move(budget)?;
+            let (step, scope) = payload.coordinator.prepare_word_move(budget)?;
             Ok(MarkdownWordMovePreparation {
                 bytes: step.bytes,
                 scalars: step.scalars,
                 metadata_units: step.metadata_units,
-                uniform_zero,
+                scope,
             })
         })();
         self.finish(result)
@@ -231,6 +305,29 @@ impl MarkdownLineComposer {
         action: MarkdownWordGroupAction,
         head_utf16: usize,
     ) -> Result<()> {
+        self.begin_group(action, head_utf16, false)
+    }
+
+    /// 原视觉移动在完整 Root 证书下保持快路；显式折叠职责则逐 GCB 核原可见段，绝不据逻辑序猜 RTL。
+    pub fn begin_visual_word_group(
+        &mut self,
+        direction: MarkdownWordDeleteDirection,
+        head_utf16: usize,
+    ) -> Result<()> {
+        let action = match direction {
+            MarkdownWordDeleteDirection::Backward => MarkdownWordGroupAction::Backward,
+            MarkdownWordDeleteDirection::Forward => MarkdownWordGroupAction::Forward,
+        };
+        self.begin_group(action, head_utf16, true)
+    }
+
+    /// 两种实际消费者共享同一个 Source/GCB owner；调用方传视觉意图，权限只能由原 Coordinator 给出。
+    fn begin_group(
+        &mut self,
+        action: MarkdownWordGroupAction,
+        head_utf16: usize,
+        visual: bool,
+    ) -> Result<()> {
         self.guard()?;
         let payload = self
             .payload
@@ -239,11 +336,21 @@ impl MarkdownLineComposer {
         if payload.word_delete.is_some() || head_utf16 > payload.source.utf16_len() {
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
-        payload.word_delete = Some(WordJob::Group(WordGroup::new(
-            action,
-            head_utf16,
-            payload.source.utf16_len(),
-        )));
+        let scoped = if visual {
+            match payload.coordinator.word_move_scope()? {
+                Some(MarkdownWordMoveScope::WholeUniformZero) => false,
+                Some(MarkdownWordMoveScope::VisibleParagraphScopes) => true,
+                _ => return Err(MarkdownLineComposeError::InvalidRequest),
+            }
+        } else {
+            false
+        };
+        let mut group = WordGroup::new(action, head_utf16, payload.source.utf16_len());
+        group.cursor.visible_word = scoped;
+        if scoped {
+            group.restore_position = Some(payload.coordinator.word_layout_position()?);
+        }
+        payload.word_delete = Some(WordJob::Group(group));
         Ok(())
     }
 
@@ -302,3 +409,6 @@ mod tests;
 
 #[cfg(test)]
 mod move_tests;
+
+#[cfg(test)]
+mod visible_tests;

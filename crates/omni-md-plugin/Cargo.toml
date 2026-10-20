@@ -10,28 +10,52 @@ repository.workspace = true
 publish = false
 
 [features]
-# The default editor uses AppKit/TextKit and single-transaction table-end Tab appends; paged candidates remain opt-in.
+# 正式源码和预览共用分页 AppKit 输入与有界 Source；验收功能单独显式启用。
 default = ["native-markdown-runtime", "native-table-row-append"]
-# Enable the current native runtime and bounded Core table APIs; Foundation read failures use the exception ABI.
-native-markdown-runtime = ["omni-markdown-core/native-markdown-candidate", "omni-markdown-core/s2-table-window-prototype", "objc2/exception", "dep:libc"]
-# Add explicit native acceptance entry points and inspection APIs; this feature does not select the paged editor.
+# 原生运行时启用有界 Core 表格接口；Foundation 读取失败保留原异常 ABI。
+native-markdown-runtime = ["omni-markdown-core/native-markdown-candidate", "omni-markdown-core/s2-table-window-prototype", "objc2/exception", "dep:libc", "native-paged-production"]
+# 正式两种模式直接装配同一有界分页图；只启用产品所需 API，不启用验收入口。
+native-paged-production = [
+  "omni-markdown-core/paged-shaping",
+  "omni-markdown-core/paged-scripts",
+  "omni-markdown-core/paged-layout-breaks",
+  "omni-markdown-core/paged-line-compose",
+  "omni-markdown-core/paged-shaping-frontier",
+  "objc2-core-text/CTFontDescriptor",
+  "objc2-core-foundation/CFURL",
+  "objc2-core-foundation/CFDictionary",
+  "objc2-core-foundation/CFNumber",
+  "objc2-core-graphics/CGFont",
+  "objc2-app-kit/NSTextInputContext",
+  "objc2-foundation/NSOperation",
+  "dep:objc2-quartz-core",
+  "objc2-app-kit/objc2-quartz-core",
+  "objc2-core-graphics/CGBitmapContext",
+  "objc2-core-graphics/CGColorSpace",
+  "objc2-core-graphics/CGImage",
+  "objc2-core-graphics/CGDataProvider",
+]
+# 显式增加原生验收入口与观察 API；正式分页后端由生产特性装配，不依赖验收开关。
 native-markdown-runtime-probe = [
   "native-markdown-runtime",
   "objc2-core-text/CTLine",
   "objc2-core-text/CTRun",
+  "objc2-core-text/CTTypesetter",
   "objc2/exception",
-  # Annotation probes create a temporary public text-checking controller and invalidate it after inspection.
+  # 原行号鼠标验收在库内读取系统运行时钟，不能借测试依赖的特性合并掩盖缺失绑定。
+  "objc2-foundation/NSProcessInfo",
+  # 注释验收借临时公开文本检查控制器，观察完成后必须使其失效并归还。
   "objc2-app-kit/NSTextCheckingController",
   "objc2-app-kit/NSTextCheckingClient",
-  # Synthetic pointer probes inspect pixels from one visible cell; the default product creates no inspection bitmap.
+  # 合成鼠标验收只观察一个可见格的像素；正式产品不分配验收位图。
   "objc2-app-kit/NSBitmapImageRep",
   "objc2-app-kit/NSImageRep",
   "dep:libc",
 ]
-# Compile the separate raster adapter experiment; allocating its raster resources also requires its explicit environment switch.
+# 独立光栅适配实验仍需显式环境开关才分配资源，不成为正式正文的隐式路径。
 native-raster-surface-probe = [
   "native-markdown-runtime-probe",
-  # The viewport raster experiment is opt-in; the default editor remains on its TextKit path.
+  # 旧TextKit光栅机制对照仍需显式开关，不改变正式Source唯一分页图。
   "dep:objc2-quartz-core",
   "objc2-app-kit/objc2-quartz-core",
   "objc2-foundation/NSOperation",
@@ -42,13 +66,13 @@ native-raster-surface-probe = [
   "objc2-core-graphics/CGAffineTransform",
   "objc2-core-graphics/CGGeometry",
 ]
-# Append a row only at a verified table end, without changing native attribute or visible-table producers.
+# 仅在原表格真实末端接纳追加行；原属性与可见表格生产者继续拥有布局。
 native-table-row-append = ["native-markdown-runtime", "omni-markdown-core/s2-table-window-prototype"]
 native-input-trace = ["native-markdown-runtime"]
 native-table-edit-diagnostic = ["native-markdown-runtime"]
 native-block-fragment-diagnostic = ["native-markdown-runtime"]
 native-close-stage-diagnostic = ["native-markdown-runtime"]
-# Expose native font-source candidate probes without selecting a new editor for the default product.
+# 显式观察原生字体来源，不改变正式编辑图或字体资源归属。
 native-paged-font-probe = [
   "native-markdown-runtime",
   "omni-markdown-core/paged-shaping",
@@ -58,19 +82,19 @@ native-paged-font-probe = [
   "objc2-core-foundation/CFNumber",
   "objc2-core-graphics/CGFont",
 ]
-# Probe real per-font shaping of a single grapheme from the same source; the default editor is unchanged.
+# 同一 Source 的完整字素使用真实候选字体整形；验收入口不替换正式编辑器。
 native-paged-font-fallback-probe = [
   "native-paged-font-probe",
   "omni-markdown-core/paged-scripts",
-  # Exercise real descriptor exhaustion and release through existing bindings, without an extra package or product process.
+  # 复用原绑定检验真实描述符耗尽与释放，不增加产品进程或另一测试包。
   "dep:libc",
 ]
-# Compile the paged input and layout candidate for explicit native probes; default activation still mounts TextKit.
+# 只增加分页输入/布局的显式验收入口；实际Source能力由native-paged-production装配。
 native-paged-layout-probe = [
   "native-paged-font-probe",
   "omni-markdown-core/paged-layout-breaks",
   "dep:libc",
-  # The candidate NSView implements the public NSTextInputClient protocol without whole-paragraph TextKit strings.
+  # 分页 NSView 实现公开输入协议，不构造整段 TextKit 字符串。
   "objc2-app-kit/NSTextInputContext",
   "objc2-foundation/NSOperation",
   "dep:objc2-quartz-core",
@@ -80,21 +104,21 @@ native-paged-layout-probe = [
   "objc2-core-graphics/CGImage",
   "objc2-core-graphics/CGDataProvider",
 ]
-# Probe paged Find through its real input and visibility contracts, including Pending before line output exists.
+# 分页 Find 验收保真实输入和可见性合同；行尚未完成时必须保留 Pending。
 native-paged-find-probe = [
   "native-paged-layout-probe",
 ]
-# Probe native consumption of the paged line producer; partial readiness does not stand in for a real LineEnd.
+# 原生客户只消费真实分页行；部分准备不能替代已经封存的 LineEnd。
 native-paged-compose-probe = [
   "native-paged-find-probe",
   "omni-markdown-core/paged-line-compose",
 ]
-# Probe incremental prefixes from the same active line producer rather than substituting whole-paragraph output.
+# 同一个活动行生产者逐步发布前缀，不以整段输出替代真实续体。
 native-paged-frontier-probe = [
   "native-paged-compose-probe",
   "omni-markdown-core/paged-shaping-frontier",
 ]
-# Probe the Source-mode body candidate with the same paged lines and font fallback; default activation remains TextKit.
+# 显式验收同一分页正文与字体回退；正式源码和预览已经直接使用该生产后端。
 native-paged-body-probe = [
   "native-paged-frontier-probe",
   "native-paged-font-fallback-probe",
@@ -196,7 +220,7 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
 objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["CFRunLoop", "CFString", "block2", "objc2", "std"] }
 objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGContext", "CGPath", "objc2", "std"] }
 objc2-quartz-core = { version = "=0.3.2", optional = true, default-features = false, features = ["CALayer", "CATransaction", "objc2-core-graphics", "objc2-core-foundation", "std"] }
-objc2-core-text = { version = "=0.3.2", default-features = false, features = ["CTFont", "CTFrame", "CTFramesetter", "CTLine", "CTRun", "CTStringAttributes", "objc2", "objc2-core-graphics", "std"] }
+objc2-core-text = { version = "=0.3.2", default-features = false, features = ["CTFont", "CTFontTraits", "CTFrame", "CTFramesetter", "CTLine", "CTRun", "CTStringAttributes", "objc2", "objc2-core-graphics", "std"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
   "NSArray",
   "NSAttributedString",
@@ -207,6 +231,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
   "NSDate",
   "NSDateFormatter",
   "NSTimer",
+  "NSRunLoop",
   "NSUndoManager",
   "NSRegularExpression",
   "NSTextCheckingResult",
@@ -226,8 +251,13 @@ workspace = true
 [dev-dependencies]
 tempfile = "=3.27.0"
 serde_json = "=1.0.151"
-# Attribute-value tests inspect real NSNull objects; enable this binding only in the test dependency graph.
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSNull"] }
+# 人工输入法窗口只在首次上屏前读取当前鼠标所在显示器；生产窗口不增加屏幕选择策略。
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSScreen"] }
+# 原生属性用例借NSNull，输入事件以系统启动时钟记录真实创建时刻；仅测试图需要这两个绑定。
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSNull", "NSProcessInfo"] }
+# 单窗输入法验收只取原ID的WindowServer元数据与CGRect；不启用录屏或生产窗口扫描。
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGWindow", "CGGeometry"] }
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["CFNumber"] }
 
 [[test]]
 name = "native_line_metadata"
@@ -279,12 +309,6 @@ harness = false
 required-features = ["native-paged-font-fallback-probe"]
 
 [[test]]
-name = "native_textkit_memory"
-path = "tests/native_textkit_memory.rs"
-harness = false
-required-features = ["native-markdown-runtime-probe"]
-
-[[test]]
 name = "paged_layout"
 path = "tests/paged_layout.rs"
 harness = false
@@ -294,7 +318,7 @@ required-features = ["native-paged-layout-probe"]
 name = "paged_text_view"
 path = "tests/paged_text_view.rs"
 harness = false
-required-features = ["native-paged-layout-probe"]
+required-features = ["native-paged-find-probe", "native-paged-body-probe", "native-markdown-runtime-probe"]
 
 [[test]]
 name = "paged_viewport"
@@ -341,12 +365,6 @@ required-features = ["native-markdown-runtime-probe"]
 [[test]]
 name = "frozen_value_family"
 path = "tests/frozen_value_family.rs"
-
-[[test]]
-name = "native_textkit_table_append"
-path = "tests/native_textkit_table_append.rs"
-harness = false
-required-features = ["native-markdown-runtime-probe", "native-table-row-append"]
 
 [[test]]
 name = "native_textkit_clipboard"

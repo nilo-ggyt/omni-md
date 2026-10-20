@@ -4,6 +4,7 @@ use super::*;
 
 /// 显式原生诊断只记录公开单调时钟与固定阶段名，不取得正文、对象或新的动作权限。
 #[cfg(feature = "native-markdown-runtime-probe")]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn trace_find_native_phase(phase: &'static str) {
     native_markdown_trace! {
         // SAFETY: 签名对应系统mach_time.h的无参uint64时钟；此调用不访问AppKit或产生回调。
@@ -20,6 +21,7 @@ fn trace_find_native_phase(phase: &'static str) {
 
 /// 有限诊断只使用本次动作已读取的标量，不为观察补做布局或原生查询。
 #[cfg(feature = "native-markdown-runtime-probe")]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn trace_find_geometry(
     phase: &'static str,
     probe: &std::ops::Range<usize>,
@@ -36,6 +38,7 @@ fn trace_find_geometry(
         "native_find_geometry phase={phase} probe={probe:?} clip={clip:?} frame={frame:?} target={target:?}"
     );
 }
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use objc2_app_kit::{NSTextLayoutManagerSegmentOptions, NSTextLayoutManagerSegmentType};
 
 /// 反馈只说明本次已提交动作；正文或查找字符串绝不进入延后票据。
@@ -88,6 +91,7 @@ impl NativeMarkdownFindVisibility {
 
 /// 同一次定位的所有标量权限。相同generation不代表同文档，弱身份另行独立核对。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct FindRevealStamp {
     owner: usize,
     generation: u64,
@@ -99,6 +103,7 @@ struct FindRevealStamp {
 }
 
 /// slot、owner关闭态和分配身份都必须成立，不能用Rc仍存活或某一个代次代替授权。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn find_reveal_permissions(
     expected: FindRevealStamp,
     actual: FindRevealStamp,
@@ -111,6 +116,7 @@ fn find_reveal_permissions(
 }
 
 /// 匹配扫描/替换收据给出的原始身份与坐标；arm不得重新领取当前文档代次。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(in crate::native_surface) enum NativeMarkdownFindRevealSelection {
     Captured {
         capture: NativeMarkdownSelectionCapture,
@@ -119,6 +125,7 @@ pub(in crate::native_surface) enum NativeMarkdownFindRevealSelection {
     Committed(Rc<NativeMarkdownCommittedSelection>),
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(in crate::native_surface) struct NativeMarkdownFindRevealTarget {
     pub(in crate::native_surface) document: WeakMarkdownDocument,
     pub(in crate::native_surface) generation: u64,
@@ -132,6 +139,7 @@ pub(in crate::native_surface) struct NativeMarkdownFindRevealTarget {
 }
 
 /// 每view唯一有限目标。两个Rust Weak不延长正文/栏的存活，不持Native对象或片段。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(in crate::native_surface) struct NativeMarkdownFindRevealRequest {
     document: WeakMarkdownDocument,
     bar: std::rc::Weak<NativeMarkdownFindBar>,
@@ -150,22 +158,11 @@ pub(in crate::native_surface) struct NativeMarkdownFindRevealRequest {
     /// 独立工作负载只观察原请求终点；产品默认构建不增加收据状态。
     #[cfg(feature = "native-markdown-runtime-probe")]
     completed: Cell<Option<bool>>,
-    /// 仅验收构建持一次标量回调；没有正文、窗口或栏的强引用。
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    terminal_observer: crate::native_surface::probe::ProbeTerminalObserver,
 }
 
 #[cfg(feature = "native-markdown-runtime-probe")]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownFindRevealRequest {
-    /// 注册前已经完成也只复用原终点；返回 true 不代表成功，后继仍核原 completed 值。
-    pub(in crate::native_surface) fn observe_probe_terminal(
-        &self,
-        observer: impl FnOnce() + 'static,
-    ) -> Result<bool, String> {
-        self.terminal_observer
-            .observe(self.completed.get(), observer)
-    }
-
     /// 只读原请求的实际终点，slot消失和后继栏文案都不能代替该收据。
     pub(in crate::native_surface) fn probe_completed(&self) -> Option<bool> {
         self.completed.get()
@@ -176,17 +173,18 @@ impl NativeMarkdownFindRevealRequest {
         if self.completed.get().is_none() {
             self.completed.set(Some(false));
         }
-        self.terminal_observer.notify(); // 原取消或既有成功均是终点；不在 find_reveal 槽借用内回调。
     }
 }
 
 /// 仅同步executor栈内持有实际controller/storage；外层PayloadUseGuard阻止栈内关闭。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(in crate::native_surface) struct NativeMarkdownFindRevealContext {
     request: Rc<NativeMarkdownFindRevealRequest>,
     controller: Retained<NativeMarkdownController>,
     storage: Retained<PieceBackedMarkdownTextStorage>,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownFindRevealContext {
     /// 所有条件均为Rust元数据，不在原生调用之后用另一个getter重新领取权限。
     pub(in crate::native_surface) fn is_current(&self, view: &PieceBackedMarkdownTextView) -> bool {
@@ -253,6 +251,7 @@ impl NativeMarkdownFindRevealContext {
     }
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownFindRevealRequest {
     fn selection_is_current(&self) -> bool {
         let committed = self.committed.borrow();
@@ -268,6 +267,7 @@ impl NativeMarkdownFindRevealRequest {
 }
 
 /// EOF零长匹配保持caret；补充平面首字形不能把surrogate一分为二。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn first_match_scalar(
     start: usize,
     length: usize,
@@ -290,6 +290,7 @@ fn first_match_scalar(
 }
 
 /// 真实segment须有限且有高度；超宽字形以其起点可见为准，不伪造完整匹配全可见。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn find_segment_is_visible(frame: NSRect, clip: NSRect) -> bool {
     let Some(origin) = native_markdown_minimal_cell_scroll_origin(frame, clip) else {
         return false; // NaN/无限/零clip没有可见性收据。
@@ -297,21 +298,8 @@ fn find_segment_is_visible(frame: NSRect, clip: NSRect) -> bool {
     (origin.x - clip.origin.x).abs() <= 0.5 && (origin.y - clip.origin.y).abs() <= 0.5
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl PieceBackedMarkdownTextView {
-    /// 字段变化只回收先前输入的目标；不能取消其后新建的模式定位或显式Find目标。
-    pub(in crate::native_surface) fn cancel_find_reveal_before_input(&self, intent: u64) {
-        let previous = self
-            .ivars()
-            .find_reveal
-            .borrow()
-            .as_ref()
-            .filter(|request| request.stamp.input_epoch < intent)
-            .map(Rc::clone);
-        if let Some(previous) = previous {
-            self.remove_find_reveal_if_same(&previous);
-        } // 原slot若已有后继目标，身份核验不会取走它；没有原目标也不动模式槽。
-    }
-
     /// 新命令、resize、物理输入和accepted release同步撤权；drop不跨slot借用。
     pub(in crate::native_surface) fn cancel_pending_find_reveal(&self) {
         self.cancel_pending_mode_viewport(); // 新Find动作不能让上一模式目标在同一视图上迟到恢复。
@@ -522,8 +510,6 @@ impl PieceBackedMarkdownTextView {
             prepared: Cell::new(false),
             #[cfg(feature = "native-markdown-runtime-probe")]
             completed: Cell::new(None),
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            terminal_observer: crate::native_surface::probe::ProbeTerminalObserver::default(),
         });
         // 先取得局部原生owner；失败不能留下ready=false而永远阻止cache命中的票据。
         if !current() || !request.selection_is_current() {
@@ -762,6 +748,21 @@ impl PieceBackedMarkdownTextView {
         current: &impl Fn() -> bool,
     ) -> Result<NSRect, NativeMarkdownStableTableFailure> {
         use NativeMarkdownStableTableFailure as Failure;
+        let cache = self.ivars().visible_table_layout_cache.borrow().clone();
+        if let Some(cache) = cache {
+            let rect = native_markdown_table_scalar_frame(&cache.tables, probe)?;
+            if let Some(rect) = rect {
+                // 当前可见CTFrame必须仍属于原文稿/完整表格几何票，不能用旧行位置给新输入补证。
+                let actual = native_markdown_table_intent_step(current, || {
+                    self.current_table_layout_request_key()
+                })?
+                .ok_or(Failure::MissingGeometry)?;
+                if actual != cache.request_key {
+                    return Err(Failure::InputIntentExpired);
+                }
+                return Ok(rect);
+            }
+        }
         let manager = native_markdown_table_intent_step(&current, || self.textLayoutManager())?
             .ok_or(Failure::MissingGeometry)?;
         let content = native_markdown_table_intent_step(&current, || manager.textContentManager())?
@@ -939,7 +940,6 @@ impl PieceBackedMarkdownTextView {
                 .request
                 .completed
                 .set(Some(verified && context.is_current(self)));
-            context.request.terminal_observer.notify(); // 原反馈与最终权限核对已结束，随后独立事件验证。
         }
         self.remove_find_reveal_if_same(&context.request);
     }
@@ -973,23 +973,13 @@ mod tests {
             ready: Cell::new(true),
             prepared: Cell::new(true),
             completed: Cell::new(None),
-            terminal_observer: crate::native_surface::probe::ProbeTerminalObserver::default(),
         };
-        let calls = Rc::new(Cell::new(0));
-        let callback_calls = Rc::clone(&calls);
-        assert!(
-            !request
-                .observe_probe_terminal(move || callback_calls.set(callback_calls.get() + 1))
-                .unwrap()
-        );
         // 整批prepared也可能在最终verify失败；缺原终点不能被当成成功。
         assert_eq!(request.probe_completed(), None);
         request.record_probe_removal();
         assert_eq!(request.probe_completed(), Some(false));
-        assert_eq!(calls.get(), 1); // 取消 false 唤醒一次原验证，不把 prepared 当成功。
         request.record_probe_removal();
         assert_eq!(request.probe_completed(), Some(false));
-        assert_eq!(calls.get(), 1);
         // 真实成功终点在移除之前已签发，正常移除不能把它覆写为失败。
         request.completed.set(Some(true));
         request.record_probe_removal();

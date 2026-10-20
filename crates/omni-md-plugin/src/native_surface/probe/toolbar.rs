@@ -2,11 +2,6 @@
 
 use super::*;
 
-mod menu_cancellation;
-pub(in crate::native_surface) use menu_cancellation::{
-    finish_cancelled_menu, supersede_menu_with_select_all,
-};
-
 /// 跨菜单排队事件只保存原 Weak 身份、有限标量及小表候选，不保活 surface、正文 root 或 Native 图。
 pub(in crate::native_surface) struct NativeMarkdownToolbarProbe {
     document: WeakMarkdownDocument,
@@ -16,32 +11,22 @@ pub(in crate::native_surface) struct NativeMarkdownToolbarProbe {
     units: usize,
     dirty: bool,
     undo: bool,
-    redo: bool,
     saved_selection: MarkdownTextSelection,
     counts: [u64; 4],
     table: String,
     table_units: usize,
     finished: Cell<bool>,
-    activation: Option<Rc<NativeMarkdownTableInsertionObservation>>,
-    cancelled_menu: Option<menu_cancellation::CancelledMenuSelection>,
 }
 
 /// 首 Native 前固定唯一字符前/后态；与产品提交收据分离，只用于观察该合成动作是否完成。
 struct ToolbarPermission<'a> {
-    surface: &'a NativeMarkdownEditorSurface,
+    surface: &'a NativeMarkdownTextKitEditorSurface,
     document: WeakMarkdownDocument,
     generation: u64,
     bytes: usize,
     units: usize,
     added_bytes: usize,
     added_units: usize,
-}
-
-/// borrowed 实现检查不能冒充 main loop 已交付；真实菜单场景必须验证正常队列建立的字段终点。
-#[derive(Clone, Copy)]
-enum ToolbarCompletion {
-    Submission,
-    ActivatedField,
 }
 
 impl ToolbarPermission<'_> {
@@ -108,77 +93,9 @@ impl ToolbarPermission<'_> {
         }
         Ok(())
     }
-
-    /// 只观察正常队列已完成的原字段；Progress 不由测试补跑 executor 或 nested loop 推进。
-    fn activate_and_cancel_first_cell(
-        &self,
-        target: NativeMarkdownTableCellCoordinate,
-    ) -> Result<(), String> {
-        let view = &self.surface.backend.text_view;
-        let active = view
-            .ivars()
-            .active_table_cell
-            .borrow()
-            .as_ref()
-            .map(|active| {
-                (
-                    active.coordinate,
-                    active.source_utf16_range.clone(),
-                    active.original_source == "列 1",
-                )
-            });
-        if active != Some((target, 2..5, true))
-            || !view.ivars().pending_table_cell_activation.is_empty()
-            || view.ivars().table_layout_update_scheduled.get()
-        {
-            return Err(format!(
-                "正常插表队列尚未完成原首格终点：active={active:?} pending={:?} scheduled={}",
-                view.ivars().pending_table_cell_activation.get(),
-                view.ivars().table_layout_update_scheduled.get()
-            ));
-        }
-        self.step(|| {
-            autoreleasepool(|_| {
-                let field = self
-                    .step(|| view.existing_table_cell_editor())?
-                    .ok_or("插表首格未创建实际字段")?;
-                let hidden = self.step(|| field.isHidden())?;
-                let text = self.step(|| field.stringValue())?;
-                let input = self
-                    .step(|| field.currentEditor())?
-                    .ok_or("插表首格没有实际字段编辑关系")?;
-                let selection = self.step(|| input.selectedRange())?;
-                let text_matches = self.step(|| text.to_string() == "列 1")?;
-                if hidden || !text_matches || selection != NSRange::new(0, 3) {
-                    return Err(format!(
-                        "插表首格实际字段未匹配原目标：hidden={hidden} selection={selection:?}"
-                    ));
-                }
-                drop(input);
-                drop(text);
-                // 只调用正常取消入口；它负责撤销原请求、辞任字段及清空复用草稿。
-                self.step(|| view.cancel_active_table_cell())?;
-                let hidden = self.step(|| field.isHidden())?;
-                let text = self.step(|| field.stringValue())?;
-                let empty = self.step(|| text.length() == 0)?;
-                if !hidden
-                    || !empty
-                    || view.ivars().active_table_cell.borrow().is_some()
-                    || !view.ivars().pending_table_cell_activation.is_empty()
-                {
-                    return Err("插表首格正常取消后仍持草稿或活动请求".into());
-                }
-                drop(text);
-                drop(field); // 原动作的后检查还覆盖字段 claims 析构与 pool drain。
-                Ok::<_, String>(())
-            })
-        })??;
-        self.require_actual_first_cell()?;
-        Ok(())
-    }
 }
 
-fn counts(surface: &NativeMarkdownEditorSurface) -> [u64; 4] {
+fn counts(surface: &NativeMarkdownTextKitEditorSurface) -> [u64; 4] {
     let state = surface.backend.text_storage.ivars();
     [
         state.character_process_count.get(),
@@ -189,8 +106,8 @@ fn counts(surface: &NativeMarkdownEditorSurface) -> [u64; 4] {
 }
 
 /// 准备阶段先建立合法正文 caret，再把原动作有限前态交给下一次真实菜单事件。
-pub(in crate::native_surface) fn prepare(
-    surface: &NativeMarkdownEditorSurface,
+fn prepare(
+    surface: &NativeMarkdownTextKitEditorSurface,
 ) -> Result<NativeMarkdownToolbarProbe, String> {
     if surface
         .backend
@@ -244,7 +161,7 @@ pub(in crate::native_surface) fn prepare(
     {
         return Err("插表验收未建立原合法正文选择".into());
     }
-    let (generation, revision, bytes, units, dirty, undo, redo, suffix) = {
+    let (generation, revision, bytes, units, dirty, undo, suffix) = {
         let document = surface.document().borrow();
         let suffix = document.utf16_len() != 0
             && !document
@@ -259,7 +176,6 @@ pub(in crate::native_surface) fn prepare(
             document.utf16_len(),
             document.is_dirty(),
             document.can_undo(),
-            document.can_redo(),
             suffix,
         )
     };
@@ -280,64 +196,22 @@ pub(in crate::native_surface) fn prepare(
         units,
         dirty,
         undo,
-        redo,
         saved_selection: saved,
         counts: counts(surface),
         table,
         table_units,
         finished: Cell::new(false),
-        activation: None,
-        cancelled_menu: None,
     })
 }
 
-/// 菜单执行前只预签观察原字符后果；真实 fold 和 request Rc 在 product 绑定点取得，不发新激活。
-pub(in crate::native_surface) fn observe_menu_activation(
-    surface: &NativeMarkdownEditorSurface,
-    state: &mut NativeMarkdownToolbarProbe,
-    callback: fn(NativeMarkdownTableCellOutcome),
-) -> Result<(), String> {
-    if state.activation.is_some() {
-        return Err("菜单插表原观察已签发".into());
-    }
-    let observation = surface
-        .backend
-        .text_view
-        .probe_prepare_table_insertion_observation(
-            surface.document(),
-            state.table_units,
-            NativeMarkdownTableCellCoordinate {
-                table_utf16_start: 0,
-                row_index: 0,
-                column_index: 0,
-            },
-            MarkdownTextSelection::caret(2),
-            callback,
-        )?;
-    state.activation = Some(observation);
-    Ok(())
-}
-
-/// 原菜单 action 在正常事件中提交后才调用；每份纯状态最多消费一次，不允许失败后重新核发完成权限。
-fn finish_with_completion(
-    surface: &NativeMarkdownEditorSurface,
+/// 独立TextKit实现入口只核真实一次提交和Undo；未交回事件循环，不声称字段已经激活。
+fn finish_submission(
+    surface: &NativeMarkdownTextKitEditorSurface,
     state: &NativeMarkdownToolbarProbe,
     trigger: &'static str,
-    completion: ToolbarCompletion,
 ) -> Result<(), String> {
     if state.finished.replace(true) {
         return Err("原插表验收状态已消费，不能再次完成或撤销".into());
-    }
-    if matches!(completion, ToolbarCompletion::ActivatedField) {
-        let observation = state.activation.as_ref().ok_or("菜单插表缺少原请求观察")?;
-        if observation.outcome() != Some(NativeMarkdownTableCellOutcome::Activated)
-            || !observation.current_for(&surface.backend.text_view)
-        {
-            return Err(format!(
-                "菜单插表原请求没有真实激活终点：outcome={:?}",
-                observation.outcome()
-            ));
-        }
     }
     let permission = ToolbarPermission {
         surface,
@@ -420,36 +294,26 @@ fn finish_with_completion(
                 .get()
         ));
     }
-    let activation = match completion {
-        ToolbarCompletion::ActivatedField => {
-            // ACTIVE 菜单场景已交还 main loop；字段、草稿、完整选择与正常结束必须全部真实成立。
-            permission.activate_and_cancel_first_cell(target)?;
-            "actual_field"
-        }
-        ToolbarCompletion::Submission => {
-            // borrowed 实现检查尚未交还事件循环，只证明唯一提交和明确 after；不声称请求已激活。
-            // 正常取消入口撤原请求，随后 Undo 才是新的独立意图；不得手清 Ready 或强跑排队任务。
-            permission.step(|| surface.backend.text_view.cancel_active_table_cell())?;
-            if surface
-                .backend
-                .text_view
-                .ivars()
-                .active_table_cell
-                .borrow()
-                .is_some()
-                || !surface
-                    .backend
-                    .text_view
-                    .ivars()
-                    .pending_table_cell_activation
-                    .is_empty()
-            {
-                return Err("插表实现检查的原请求未由正常取消入口撤销".into());
-            }
-            permission.require_actual_first_cell()?;
-            "submission_only"
-        }
-    };
+    // 本独立实现检查没有交还事件循环，只证明原提交和明确after，不推断字段激活成功。
+    // 原正常取消入口撤销尚未完成的请求，之后Undo仍是新的独立用户意图。
+    permission.step(|| surface.backend.text_view.cancel_active_table_cell())?;
+    if surface
+        .backend
+        .text_view
+        .ivars()
+        .active_table_cell
+        .borrow()
+        .is_some()
+        || !surface
+            .backend
+            .text_view
+            .ivars()
+            .pending_table_cell_activation
+            .is_empty()
+    {
+        return Err("插表实现检查的原请求未由正常取消入口撤销".into());
+    }
+    permission.require_actual_first_cell()?;
     if counts(surface) != after {
         return Err("插表首格激活或正常取消额外提交了字符或 autosave".into());
     }
@@ -536,22 +400,13 @@ fn finish_with_completion(
         return Err("插表验收结束未恢复原合法完整选择".into());
     }
     eprintln!(
-        "omni_toolbar_insert restored=true generation_steps=2 history_steps=1 first_cell_utf16=2 activation={activation} executor_count=0 trigger={trigger} counts={before:?}/{after:?}/{undo_counts:?}"
+        "omni_toolbar_insert restored=true generation_steps=2 history_steps=1 first_cell_utf16=2 activation=submission_only executor_count=0 trigger={trigger} counts={before:?}/{after:?}/{undo_counts:?}"
     );
     Ok(())
 }
 
-/// 真实 foreground 菜单必须完整通过字段终点；不能以 borrowed 的提交检查替代功能验收。
-pub(in crate::native_surface) fn finish(
-    surface: &NativeMarkdownEditorSurface,
-    state: &NativeMarkdownToolbarProbe,
-    trigger: &'static str,
-) -> Result<(), String> {
-    finish_with_completion(surface, state, trigger, ToolbarCompletion::ActivatedField)
-}
-
-/// 独立 Native9 继续覆盖实现入口；正式菜单绑定由真实 foreground case 跨事件调用 prepare/finish。
-pub(super) fn verify(surface: &NativeMarkdownEditorSurface) -> Result<(), String> {
+/// 原Native9保留真实TextKit插表实现对照；正式菜单与自动首格接管由Paged Host流程独立验收。
+pub(super) fn verify(surface: &NativeMarkdownTextKitEditorSurface) -> Result<(), String> {
     let state = prepare(surface)?;
     let permission = ToolbarPermission {
         surface,
@@ -563,10 +418,5 @@ pub(super) fn verify(surface: &NativeMarkdownEditorSurface) -> Result<(), String
         added_units: state.table_units,
     };
     permission.step(|| surface.backend.text_view.insert_default_markdown_table())?;
-    finish_with_completion(
-        surface,
-        &state,
-        "view_implementation",
-        ToolbarCompletion::Submission,
-    )
+    finish_submission(surface, &state, "view_implementation")
 }

@@ -509,7 +509,7 @@ fn half_page_publication_writes_only_each_new_suffix_and_keeps_one_buffer() {
     }
     let observer = index.resource_observer();
     let identity = buffer_identity(&index);
-    let mut prefix = index.snapshot_reader(2).unwrap();
+    let prefix = index.snapshot_reader(2).unwrap();
     assert_eq!(index.file.as_ref().unwrap().metadata().unwrap().len(), 64);
     assert_eq!(index.page.as_ref().unwrap().flushed, 64);
     assert_eq!(prefix.read(1).unwrap(), record::<32>(1));
@@ -522,7 +522,7 @@ fn half_page_publication_writes_only_each_new_suffix_and_keeps_one_buffer() {
         .write_all_at(&[0x7d], 0)
         .unwrap();
     index.append(record::<32>(4)).unwrap();
-    let mut second = index.snapshot_reader(5).unwrap();
+    let second = index.snapshot_reader(5).unwrap();
     assert_eq!(index.file.as_ref().unwrap().metadata().unwrap().len(), 160);
     assert_eq!(index.page.as_ref().unwrap().flushed, 160);
     let mut witness = [0];

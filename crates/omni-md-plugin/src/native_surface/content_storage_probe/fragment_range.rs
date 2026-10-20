@@ -141,10 +141,7 @@ impl FragmentRangeFactory {
                 provider.ivars().storage.load()
             })?
             .ok_or(ProviderFailure::Source)?;
-        if !std::ptr::eq::<PieceBackedMarkdownTextStorage>(
-            &*observed_storage,
-            &*ticket.storage,
-        ) {
+        if !std::ptr::eq::<PieceBackedMarkdownTextStorage>(&*observed_storage, &*ticket.storage) {
             return Err(ProviderFailure::Source); // provider也必须仍观察原安装storage，而非同坐标后继对象。
         }
         let actual_manager = ticket

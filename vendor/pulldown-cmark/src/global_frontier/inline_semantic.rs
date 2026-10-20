@@ -9,8 +9,7 @@ use super::{
     GlobalFrontierError, GlobalSourceAuthority, GlobalWork, InlineBlockKind,
     VerifiedGlobalInlineBlock,
 };
-use crate::block_frontier::{MAX_FRONTIER_STEP_BYTES, SourceFrame};
-use crate::line_start_stream::LineStartState;
+use crate::block_frontier::{SourceFrame, MAX_FRONTIER_STEP_BYTES};
 use crate::structural_spine::{
     StructuralCursorStep, StructuralKind, StructuralSpineCursor, StructuralSpineSnapshot,
 };
@@ -19,6 +18,12 @@ use crate::{HeadingLevel, Options};
 const MIN_STEP: usize = 2048;
 const CONTROL_WORK: usize = 128;
 const WORKSPACE_WORK: usize = 1024;
+
+#[path = "inline_code.rs"]
+mod code;
+pub use code::{
+    InlineCodeCursor, InlineCodeStep, VerifiedInlineCodeSpan, VerifiedInlineEmphasisRun,
+};
 
 /// Plain 与 ATX 共用原 special-bytes 表及逐 byte 规则；候选只要求完整 inline，绝不自行配对。
 pub(super) fn scan_plain_bytes(
@@ -46,25 +51,50 @@ pub(super) fn scan_plain_bytes(
     (bytes.len(), false)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 /// 只由原闭合 Fact 配对 factory 创建；不接受 Range、外部 scope 或归一化正文来制造权限。
 pub struct VerifiedInlineSemanticSeed {
-    revision: u64,
-    source_end: usize,
-    options: Options,
-    kind: InlineBlockKind,
-    physical_start: usize,
-    start: usize,
-    end: usize,
-    lexical_end: usize,
-    first_state_origin: usize,
-    first_state: LineStartState,
-    last_content_end: usize,
-    last_line_end: usize,
-    spine: StructuralSpineSnapshot,
+    pub(crate) revision: u64,
+    pub(crate) source_end: usize,
+    pub(crate) options: Options,
+    pub(crate) kind: InlineBlockKind,
+    pub(crate) physical_start: usize,
+    // 真 Paragraph/Setext 的首行已由 opening 消费；Cell 没有这种块前缀事实。
+    pub(crate) opening: Option<(usize, crate::line_start_stream::LineStartState)>,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) lexical_end: usize,
+    pub(crate) last_content_end: usize,
+    pub(crate) last_line_end: usize,
+    pub(crate) spine: StructuralSpineSnapshot,
+    pub(crate) cell: Option<TableCellInlineContext>,
+}
+
+#[derive(Clone, Copy, Debug)]
+/// 只有原表格格扫描能创建；原行入口经过前列真实扫描后保留的数学状态不能在短串解析时重置。
+pub(crate) struct TableCellInlineContext {
+    pub(crate) header: usize,
+    pub(crate) row: usize,
+    pub(crate) column: usize,
+    pub(crate) math: crate::math_context::MathContext,
 }
 
 impl VerifiedInlineSemanticSeed {
+    /// 有限完整块的原 Parser 入口使用本 Fact 的真实选项；调用方不能补造容器或开启另一套语法。
+    pub fn options(&self) -> Options {
+        self.options
+    }
+
+    /// 仅真实 cell seed 有表身份；Root 块不会因相同范围或字符串被解释成表格。
+    pub fn table_cell_coordinate(&self) -> Option<(usize, usize, usize)> {
+        self.cell.map(|cell| (cell.header, cell.row, cell.column))
+    }
+
+    /// 供同一个原格 Parser 入口消费；该状态来自行上下文及前列扫描，不是重置后的默认 math。
+    pub fn table_cell_math_context(&self) -> Option<crate::math_context::MathContext> {
+        self.cell.map(|cell| cell.math)
+    }
+
     pub(super) fn from_verified(block: &VerifiedGlobalInlineBlock) -> Self {
         // 仅复制固定标量与一个原页 claim；不复制正文、AST 或 flatten 原 scope。
         Self {
@@ -73,14 +103,14 @@ impl VerifiedInlineSemanticSeed {
             options: block.options,
             kind: block.kind,
             physical_start: block.physical_start,
+            opening: Some((block.first_state_origin, block.first_state)),
             start: block.start,
             end: block.end,
             lexical_end: block.lexical_end,
-            first_state_origin: block.first_state_origin,
-            first_state: block.first_state,
             last_content_end: block.last_content_end,
             last_line_end: block.last_line_end,
             spine: block.spine.clone(),
+            cell: None,
         }
     }
 
@@ -120,14 +150,14 @@ impl VerifiedInlineSemanticSeed {
                 options: self.options,
                 kind: self.kind,
                 physical_start: self.physical_start,
+                opening: self.opening,
                 start: self.start,
                 end: self.end,
                 lexical_end: self.lexical_end,
-                first_state_origin: self.first_state_origin,
-                first_state: self.first_state,
                 last_content_end: self.last_content_end,
                 last_line_end: self.last_line_end,
                 spine: self.spine.clone(),
+                cell: self.cell,
             },
             limits,
             total: GlobalWork::default(),
@@ -145,6 +175,14 @@ impl VerifiedInlineSemanticSeed {
             failure: None,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// 只说明原 capture 中实际出现的祖先种类；列表编号、tight 终态和 checkbox 不由此推断。
+pub struct InlinePlainContainers {
+    pub quote: bool,
+    pub unordered_list: bool,
+    pub ordered_list: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -268,6 +306,11 @@ impl std::fmt::Debug for InlinePlainCursor {
 }
 
 impl InlinePlainCursor {
+    /// 原 Paragraph scope 或已认证 TableCell 来源完成后才借固定短块，不以 depth 或裸 Range 伪造语法入口。
+    pub fn bounded_inline_range(&self) -> Option<Range<usize>> {
+        let range = self.seed.physical_range();
+        (self.failure.is_none() && self.scope_seen && range.len() <= 2048).then_some(range)
+    }
     pub fn next_byte(&self) -> usize {
         self.next
     }
@@ -297,7 +340,7 @@ impl InlinePlainCursor {
         }
         self.total.transitions = next_total;
         self.requested_end = end;
-        self.phase = if self.next < end.min(self.seed.lexical_end).max(self.seed.start) {
+        self.phase = if self.next < self.body_end(end) {
             Phase::Body
         } else if end > self.seed.lexical_end {
             Phase::Marker
@@ -393,8 +436,14 @@ impl InlinePlainCursor {
         self.real_eof_seen |= frame.real_eof;
         match self.phase {
             Phase::Init => {
-                if self.seed.spine.len() != 1 {
-                    // Root 仍含 Paragraph 自身这一层；depth0/多祖先均不能冒充 Root paragraph。
+                if self.seed.cell.is_some() {
+                    // 原行/格词法已保留真实 Table scope；cell 没有 paragraph 前缀，不伪造 sole Paragraph。
+                    self.lut = Some(crate::firstpass::special_bytes(&self.seed.options));
+                    self.scope_seen = true;
+                    work.transitions += 256;
+                    self.phase = Phase::Body;
+                } else if self.seed.spine.len() != 1 {
+                    // 旧块入口仍只接受 Root；容器必须另持原 Origin 行，不能仅删除深度限制扩权。
                     self.phase = Phase::NonRoot;
                 } else {
                     // 原 LUT 与固定 page-pointer 工作区只在真实初始化时收费，不按每个 frame 重收。
@@ -414,13 +463,17 @@ impl InlinePlainCursor {
                 {
                     StructuralCursorStep::Building => (),
                     StructuralCursorStep::Entry { index, entry } => {
-                        if index != 0
-                            || entry.kind != StructuralKind::Paragraph
-                            || entry.source_start != self.seed.start
-                        {
+                        let paragraph = self.seed.spine.len() - 1;
+                        if index == paragraph {
+                            if entry.kind != StructuralKind::Paragraph
+                                || entry.source_start != self.seed.start
+                            {
+                                return Err(GlobalFrontierError::InvalidFrame);
+                            }
+                            self.scope_seen = true;
+                        } else {
                             return Err(GlobalFrontierError::InvalidFrame);
                         }
-                        self.scope_seen = true;
                     }
                     StructuralCursorStep::End => {
                         if !self.scope_seen {
@@ -435,10 +488,7 @@ impl InlinePlainCursor {
                 work.transitions += 1;
             }
             Phase::Body => {
-                let end = self
-                    .requested_end
-                    .min(self.seed.lexical_end)
-                    .max(self.seed.start);
+                let end = self.body_end(self.requested_end);
                 let count = frame
                     .bytes
                     .len()
@@ -580,6 +630,12 @@ impl InlinePlainCursor {
                 },
             ),
         }
+    }
+
+    fn body_end(&self, requested_end: usize) -> usize {
+        requested_end
+            .min(self.seed.lexical_end)
+            .max(self.seed.start)
     }
 }
 

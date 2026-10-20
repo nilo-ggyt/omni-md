@@ -23,6 +23,11 @@ pub(crate) fn scale(font: &MarkdownLayoutFont, points: f32, legacy: i32) -> Resu
     if (bound as f32).to_bits() != points.to_bits() {
         return Err(Error::InvalidPointSize); // 同face另一个字号不取得本实例定位权限。
     }
+    bound_scale(bound)
+}
+
+/// 字号绑定与平台纯值推进共用同一内部尺度；不能各自舍入后再在绘图端修补差值。
+pub(super) fn bound_scale(bound: f64) -> Result<(i32, i32)> {
     let mut divisor = 1_i32 << 14;
     loop {
         let scaled = (bound * 64.0 * f64::from(divisor)).round();

@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[cfg(feature = "native-paged-find-probe")]
+#[cfg(feature = "native-paged-production")]
 use crate::native_surface::{
     paged_input::{
         NativeMarkdownPagedInput, NativeMarkdownPagedInputCommit, NativeMarkdownPagedInputOutcome,
@@ -10,10 +10,10 @@ use crate::native_surface::{
     paged_text_view::{NativeMarkdownPagedFindVisibleProof, NativeMarkdownPagedTextView},
 };
 
-#[cfg(feature = "native-paged-find-probe")]
+#[cfg(feature = "native-paged-production")]
 #[path = "backend/paged_reveal.rs"]
 mod paged_reveal;
-#[cfg(feature = "native-paged-find-probe")]
+#[cfg(feature = "native-paged-production")]
 pub(in crate::native_surface) use paged_reveal::*;
 #[cfg(all(
     feature = "native-paged-find-probe",
@@ -34,25 +34,26 @@ pub use probe::run_native_paged_find_body_transaction_control;
 
 /// composition root提供当前实际视图，不以隐藏NSTextView为Paged路径保留第二套正文图。
 pub(in crate::native_surface) enum NativeMarkdownFindBackend<'a> {
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     TextKit {
         view: &'a PieceBackedMarkdownTextView,
         controller: &'a NativeMarkdownController,
         intent: u64,
     },
-    #[cfg(feature = "native-paged-find-probe")]
+    #[cfg(feature = "native-paged-production")]
     Paged(NativeMarkdownPagedFindBackend<'a>),
 }
 
 pub(in crate::native_surface) enum NativeMarkdownFindExecution {
     Complete,
-    #[cfg(feature = "native-paged-find-probe")]
+    #[cfg(feature = "native-paged-production")]
     Pending(Rc<NativeMarkdownPagedFindRevealRequest>),
 }
 
 /// 已发布的Core结果必须单独保留；任何后续显示错误都不能把调用方带回可重放的Rejected分支。
 pub(in crate::native_surface) enum NativeMarkdownFindExecutionError {
     Rejected(String),
-    #[cfg(feature = "native-paged-find-probe")]
+    #[cfg(feature = "native-paged-production")]
     CommittedEffect {
         commit: Rc<NativeMarkdownPagedInputCommit>,
         cause: String,
@@ -63,7 +64,7 @@ impl std::fmt::Debug for NativeMarkdownFindExecutionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Rejected(cause) => formatter.debug_tuple("Rejected").field(cause).finish(),
-            #[cfg(feature = "native-paged-find-probe")]
+            #[cfg(feature = "native-paged-production")]
             Self::CommittedEffect { cause, .. } => formatter
                 .debug_tuple("CommittedEffect")
                 .field(cause)
@@ -75,9 +76,16 @@ impl std::fmt::Display for NativeMarkdownFindExecutionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Rejected(cause) => formatter.write_str(cause),
-            #[cfg(feature = "native-paged-find-probe")]
-            Self::CommittedEffect { cause, .. } => {
-                write!(formatter, "正文或选择已经提交，原显示后果未完成：{cause}")
+            #[cfg(feature = "native-paged-production")]
+            Self::CommittedEffect { commit, cause } => {
+                if commit.invalidation.characters_changed {
+                    write!(
+                        formatter,
+                        "替换已生效，请勿重复替换；定位显示未完成：{cause}"
+                    )
+                } else {
+                    write!(formatter, "文档选择已更新；定位显示未完成：{cause}")
+                }
             }
         }
     }
@@ -90,6 +98,7 @@ pub(in crate::native_surface) fn execute_find_backend(
     action: MarkdownFindAction,
 ) -> Result<NativeMarkdownFindExecution, NativeMarkdownFindExecutionError> {
     match backend {
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         NativeMarkdownFindBackend::TextKit {
             view,
             controller,
@@ -100,12 +109,12 @@ pub(in crate::native_surface) fn execute_find_backend(
                 .map(|()| NativeMarkdownFindExecution::Complete)
                 .map_err(NativeMarkdownFindExecutionError::Rejected)
         }
-        #[cfg(feature = "native-paged-find-probe")]
+        #[cfg(feature = "native-paged-production")]
         NativeMarkdownFindBackend::Paged(backend) => backend.execute(bar, action),
     }
 }
 
-#[cfg(feature = "native-paged-find-probe")]
+#[cfg(feature = "native-paged-production")]
 /// 同步动作只借用真实owner；reveal port由原viewport/composer协调器提供。
 pub(in crate::native_surface) struct NativeMarkdownPagedFindBackend<'a> {
     pub(in crate::native_surface) view: &'a NativeMarkdownPagedTextView,
@@ -116,14 +125,14 @@ pub(in crate::native_surface) struct NativeMarkdownPagedFindBackend<'a> {
     pub(in crate::native_surface) reveal: &'a dyn NativeMarkdownPagedFindRevealPort,
 }
 
-#[cfg(feature = "native-paged-find-probe")]
+#[cfg(feature = "native-paged-production")]
 /// 同一明确动作的逻辑目标与反馈相随，权限和已提交状态仍由独立原票认证。
 struct PagedFindTarget {
     selection: MarkdownTextSelection,
     feedback: NativeMarkdownFindRevealFeedback,
 }
 
-#[cfg(feature = "native-paged-find-probe")]
+#[cfg(feature = "native-paged-production")]
 impl NativeMarkdownPagedFindBackend<'_> {
     fn execute(
         &self,
@@ -395,7 +404,7 @@ impl NativeMarkdownPagedFindBackend<'_> {
             };
             let outcome = self
                 .input
-                .set_selection(&permit, after, &session_current)
+                .select_find_result(&permit, after, &session_current)
                 .map_err(|error| error.to_string())?;
             self.publish_outcome(outcome, committed)?;
             self.reveal_target(

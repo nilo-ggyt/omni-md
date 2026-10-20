@@ -1,15 +1,14 @@
 use crate::{
-    GlyphInfo,
     ot::apply::{
         Apply, ApplyContext, SubtableExternalCache, SubtableExternalCacheMode, WouldApply,
         WouldApplyContext,
     },
     ot::layout::LayoutTableKind,
     set_digest::SetDigest,
+    GlyphInfo,
 };
 use alloc::vec::Vec;
 use read_fonts::{
-    FontData, FontRead, Offset, ReadError,
     tables::{
         gpos::{
             CursivePosFormat1, Gpos, MarkBasePosFormat1, MarkLigPosFormat1, MarkMarkPosFormat1,
@@ -27,6 +26,7 @@ use read_fonts::{
             SequenceContextFormat3,
         },
     },
+    FontData, FontRead, Offset, ReadError,
 };
 
 pub struct LookupData<'a> {

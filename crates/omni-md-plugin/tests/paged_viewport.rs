@@ -171,7 +171,13 @@ impl NativeMarkdownPagedTextScene for Scene {
         _clicks: usize,
         _anchor: Option<usize>,
         _extend: bool,
-    ) -> Result<MarkdownTextSelection, Error> {
+    ) -> Result<
+        (
+            MarkdownTextSelection,
+            omni_md_plugin::native_surface::paged_text_view::NativeMarkdownPagedHeadAffinity,
+        ),
+        Error,
+    > {
         Err(Error::Pending)
     }
     fn navigate(
@@ -359,7 +365,11 @@ impl NativeMarkdownPagedTextViewDelegate for Delegate {
     fn current(&self, epoch: u64) -> bool {
         self.active.get() && epoch == EPOCH
     }
-    fn virtual_viewport(&self, epoch: u64) -> Result<NativeMarkdownPagedVirtualViewport, Error> {
+    fn virtual_viewport(
+        &self,
+        epoch: u64,
+        _bounds_width: f64,
+    ) -> Result<NativeMarkdownPagedVirtualViewport, Error> {
         if !self.current(epoch) {
             return Err(Error::Revoked);
         }
@@ -367,6 +377,8 @@ impl NativeMarkdownPagedTextViewDelegate for Delegate {
         let geometry = owner.geometry().map_err(|_| Error::Pending)?;
         Ok(NativeMarkdownPagedVirtualViewport {
             document_origin: geometry.body_frame.origin,
+            layout_origin_x: geometry.layout_origin_x,
+            layout_width: geometry.layout_width,
             scroll_epoch: geometry.scroll_epoch,
         })
     }
@@ -487,6 +499,7 @@ fn paint_stage(
     let nonce = NativeMarkdownPagedSceneNonce::new();
     let scene = Rc::new(Scene {
         key: NativeMarkdownPagedSceneKey {
+            presentation_mode: omni_markdown_core::MarkdownPresentationMode::Source,
             request,
             source: payload.source.clone(),
             nonce: nonce.authority(),
@@ -983,14 +996,17 @@ fn run_case(
                 w,
             )
         }));
-        if let Some(layers) = body.cpu_layer_weaks() {
-            assert_eq!(
-                layers.len(),
-                643,
-                "必须登记mount、两组和128个slot各自的容器及两组前景/遮罩"
-            );
-            native.extend(layers.into_iter().map(|layer| ("cpu_owned_layer", layer)));
-        }
+        // 惰性瓦片会在每个实际场景创建后继角色；每次合并真实 LayerPool 的 Weak，保留前序收据。
+        // Direct 场景没有 CPU owner，其余 Native 角色仍由同一关闭列表逐对象核真实析构。
+        let mut register_cpu_layers = || {
+            if strategy == NativeMarkdownPagedRenderStrategy::CpuViewport {
+                let layers = body
+                    .cpu_layer_weaks()
+                    .expect("已实际绘图的 CPU 视口必须保留原资源拥有者");
+                native.extend(layers.into_iter().map(|layer| ("cpu_owned_layer", layer)));
+            }
+        };
+        register_cpu_layers();
         drop(body_layer);
         drop(shim_layer);
         drop(context);
@@ -1004,6 +1020,7 @@ fn run_case(
             scroll.reflectScrolledClipView(&clip);
             assert!(!old.is_current(), "真实clip滚动没有撤旧票");
             old = paint_stage(stage, height, &body, &viewport, &delegate, &payload);
+            register_cpu_layers();
         }
         // 实际改变clip大小，依赖原frame通知撤票；不调用synchronize补签或伪造新geometry。
         window.setContentSize(NSSize::new(480.0, 240.0));
@@ -1011,6 +1028,7 @@ fn run_case(
         scroll.layoutSubtreeIfNeeded();
         assert!(!old.is_current(), "真实resize没有撤销旧几何票");
         let resized = paint_stage("resized", height, &body, &viewport, &delegate, &payload);
+        register_cpu_layers();
         same_scene_repaint(&body, &payload, "resized_repaint");
         assert!(resized.body_frame.size.width < width as f64);
         autoreleasepool(|_| {
@@ -1033,6 +1051,7 @@ fn run_case(
                 "insets_unflipped"
             };
             let geometry = paint_stage(stage, height, &body, &viewport, &delegate, &payload);
+            register_cpu_layers();
             let document_view = viewport.document_view().unwrap();
             let actual_clip_frame =
                 clip.convertRect_fromView(geometry.body_frame, Some(&document_view));
@@ -1116,6 +1135,7 @@ fn run_case(
                     &delegate,
                     &payload,
                 );
+                register_cpu_layers();
                 viewport.set_content_height(height).unwrap();
                 assert_eq!(viewport.geometry().unwrap().body_frame.origin.y, 0.0);
             }
@@ -1125,6 +1145,7 @@ fn run_case(
                 "insets_unflipped_after_scroll_reveal_height"
             };
             paint_stage(stage, height, &body, &viewport, &delegate, &payload);
+            register_cpu_layers();
         });
         let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&*body);
         let mut actual = NSRange::new(9, 9);
@@ -1142,6 +1163,7 @@ fn run_case(
             );
         }
         poisoned_spool_refuses_reuse(&body, &payload);
+        register_cpu_layers();
         assert!(!viewport.is_busy() && !body.is_busy());
         viewport.close().unwrap();
         assert!(!resized.is_current());

@@ -36,6 +36,13 @@ pub(super) fn drive(
         );
         match progress.answer {
             MarkdownLineComposeAnswer::Yielded => {}
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            MarkdownLineComposeAnswer::NeedsTableRow(_) => {
+                panic!("未启用表格流的原文字 oracle 不应产生 Grid 请求")
+            }
             MarkdownLineComposeAnswer::NeedStyle(request) => {
                 let range = request.source_range();
                 worker
@@ -352,6 +359,13 @@ fn drive_controls(
             .answer
         {
             MarkdownLineComposeAnswer::Yielded => {}
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            MarkdownLineComposeAnswer::NeedsTableRow(_) => {
+                panic!("未启用表格流的原文字 oracle 不应产生 Grid 请求")
+            }
             MarkdownLineComposeAnswer::NeedStyle(request) => {
                 let range = request.source_range();
                 worker

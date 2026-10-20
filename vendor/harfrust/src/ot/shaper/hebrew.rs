@@ -2,7 +2,7 @@ use super::Tag;
 use super::*;
 use crate::buffer::Buffer;
 use crate::plan::ShapePlan;
-use crate::unicode::{self, Codepoint, combining_class, modified_combining_class};
+use crate::unicode::{self, combining_class, modified_combining_class, Codepoint};
 
 pub const HEBREW_SHAPER: OtShaper = OtShaper {
     collect_features: None,
@@ -118,7 +118,11 @@ fn compose(ctx: &NormalizeContext, a: Codepoint, b: Codepoint) -> Option<Codepoi
                     match a {
                         0x05D0..=0x05EA => {
                             let c = S_DAGESH_FORMS[a as usize - 0x05D0];
-                            if c != 0 { Some(c) } else { None }
+                            if c != 0 {
+                                Some(c)
+                            } else {
+                                None
+                            }
                         }
                         0xFB2A => Some(0xFB2C), // SHIN WITH SHIN DOT
                         0xFB2B => Some(0xFB2D), // SHIN WITH SIN DOT

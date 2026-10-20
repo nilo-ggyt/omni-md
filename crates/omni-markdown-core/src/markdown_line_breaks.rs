@@ -10,8 +10,13 @@ use crate::{
 };
 use thiserror::Error;
 
+#[cfg(feature = "paged-line-compose")]
+use crate::markdown_layout_source::folds::FoldPlan;
+
 mod machine;
 mod store;
+#[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+mod table_rows;
 mod unicode_data;
 
 pub const MARKDOWN_LINE_BREAK_SOURCE_BYTES: usize = 4096;
@@ -23,6 +28,10 @@ pub enum MarkdownLineBreakError {
     InvalidBudget,
     #[error("默认断行查询范围无效")]
     InvalidRange,
+    #[error("折叠内部没有可见默认断行查询权限")]
+    FoldedRange,
+    #[error("独立表格行内部须查询该格的显示断行来源")]
+    TableRange,
     #[error("默认断行源权限不匹配")]
     SourceMismatch,
     #[error("默认断行坐标或计数溢出")]
@@ -176,6 +185,14 @@ pub struct MarkdownLineBreakJob {
     failed: bool,
     ready: bool,
     source_borrow_max: usize,
+    // 跳过隐区只改变 canonical 游标；实读计数不能用该游标冒充已扫描全文。
+    source_bytes_read: usize,
+    #[cfg(feature = "paged-line-compose")]
+    folds: Option<FoldPlan>,
+    #[cfg(feature = "paged-line-compose")]
+    next_fold: usize,
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    tables: Option<table_rows::State>,
     #[cfg(test)]
     split: Option<usize>,
 }
@@ -192,18 +209,69 @@ impl MarkdownLineBreakJob {
             failed: false,
             ready: false,
             source_borrow_max: 0,
+            source_bytes_read: 0,
+            #[cfg(feature = "paged-line-compose")]
+            folds: None,
+            #[cfg(feature = "paged-line-compose")]
+            next_fold: 0,
+            #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+            tables: None,
             #[cfg(test)]
             split: None,
         })
     }
-    fn guard(&mut self, authority: &MarkdownLayoutTextAuthority) -> Result<()> {
-        if self.failed {
-            return Err(MarkdownLineBreakError::Poisoned);
+
+    /// 显示装配只在首个扫描量子之前共享同 Source 的端点证明；普通构造仍分析完整正文。
+    #[cfg(feature = "paged-line-compose")]
+    pub(crate) fn install_fold_plan(&mut self, plan: FoldPlan) -> Result<()> {
+        self.guard(plan.authority())?;
+        if self.source_bytes_read != 0 || self.ready || self.folds.is_some() {
+            self.fail();
+            return Err(MarkdownLineBreakError::InvalidRange);
         }
+        self.folds = Some(plan);
+        Ok(())
+    }
+
+    /// 原 pending 只推进到已实读的 header 换行；隐区末尾仍交给原 UTF8/LB 规则消费。
+    #[cfg(feature = "paged-line-compose")]
+    fn advance_fold(&mut self, records: &mut usize, budget: usize) -> Result<()> {
+        let Some(span) = self
+            .folds
+            .as_ref()
+            .and_then(|plan| plan.spans().get(self.next_fold))
+            .copied()
+        else {
+            return Ok(());
+        };
+        if self.machine.byte_offset() != span.header_end.byte as u64 {
+            return Ok(());
+        }
+        // 两端共用同一终止符时无中段可跳，继续原扫描即可；机会写入仍过滤隐藏内部。
+        if span.tail_start.byte <= span.header_end.byte {
+            self.next_fold += 1;
+            return Ok(());
+        }
+        while *records < budget && !self.machine.fold_header_drained()? {
+            if let Some(event) = self.machine.drain_fold_header_one()? {
+                self.index.push(event, self.machine.needs_dictionary())?;
+                *records += 1;
+            }
+        }
+        if self.machine.fold_header_drained()? {
+            self.machine.resume_at_fold_tail(span)?;
+            self.next_fold += 1;
+        }
+        Ok(())
+    }
+    fn guard(&mut self, authority: &MarkdownLayoutTextAuthority) -> Result<()> {
         if let Err(error) = self.source.health() {
             // 同一冻结源的回收失败永久撤销已发布前缀与Ready权限；保留这次真实源错误。
             self.fail();
             return Err(MarkdownLineBreakError::Source(error));
+        }
+        if self.failed {
+            return Err(MarkdownLineBreakError::Poisoned);
         }
         if !self.source.permits(authority) {
             self.fail();
@@ -227,6 +295,11 @@ impl MarkdownLineBreakJob {
     ) -> Result<MarkdownLineBreakStep> {
         self.guard(authority)?;
         let result = self.step_inner(budget);
+        let result = self
+            .source
+            .health()
+            .map_err(MarkdownLineBreakError::from)
+            .and(result);
         if result.is_err() {
             self.fail();
         }
@@ -255,6 +328,17 @@ impl MarkdownLineBreakJob {
             && step.scalars < budget.scalars
             && step.records < budget.records
         {
+            #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+            if table_rows::advance(self, budget, &mut step)? {
+                return Ok(step);
+            }
+            #[cfg(feature = "paged-line-compose")]
+            self.advance_fold(&mut step.records, budget.records)?;
+            if step.records == budget.records
+                || self.machine.byte_offset() == self.source.byte_len() as u64
+            {
+                break;
+            }
             let start = usize::try_from(self.machine.byte_offset())
                 .map_err(|_| MarkdownLineBreakError::CoordinateOverflow)?;
             // 每字节至多完成一个scalar/机会；按三项余量的最小值借用，完整消费原piece回调，
@@ -264,9 +348,26 @@ impl MarkdownLineBreakJob {
                 .min(budget.records - step.records)
                 .min(MARKDOWN_LINE_BREAK_SOURCE_BYTES)
                 .min(self.source.byte_len() - start);
+            #[cfg(feature = "paged-line-compose")]
+            let size = if let Some(span) = self
+                .folds
+                .as_ref()
+                .and_then(|plan| plan.spans().get(self.next_fold))
+            {
+                size.min(
+                    span.header_end
+                        .byte
+                        .checked_sub(start)
+                        .ok_or(MarkdownLineBreakError::CorruptMetadata)?,
+                )
+            } else {
+                size
+            };
             let end = start
                 .checked_add(size)
                 .ok_or(MarkdownLineBreakError::CoordinateOverflow)?;
+            #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+            let end = table_rows::read_end(self, end);
             #[cfg(test)]
             let end = self
                 .split
@@ -278,6 +379,8 @@ impl MarkdownLineBreakJob {
             let mut failure = None;
             let machine = &mut self.machine;
             let index = &mut self.index;
+            #[cfg(feature = "paged-line-compose")]
+            let folds = &self.folds;
             let source_result = self.source.visit_byte_range(start..end, |bytes| {
                 if failure.is_some() {
                     return Ok(());
@@ -301,6 +404,13 @@ impl MarkdownLineBreakJob {
                         break;
                     }
                     if let Some(event) = event {
+                        #[cfg(feature = "paged-line-compose")]
+                        if folds
+                            .as_ref()
+                            .is_some_and(|plan| plan.hides(event.utf16_offset as usize, true))
+                        {
+                            continue;
+                        }
                         // 一个字节最多完成一个scalar/机会。先结束machine可变借用，再取它的
                         // 原SA事实写同一个record，不把默认AL解析错误标记为词典已经完成。
                         match index.push(event, machine.needs_dictionary()) {
@@ -311,14 +421,20 @@ impl MarkdownLineBreakJob {
                 }
                 Ok(())
             });
+            // 失败前已经解码的真实前缀也属于本量子的实际工作，跳过的源坐标不参与计数。
+            let consumed = usize::try_from(self.machine.byte_offset() - before_byte)
+                .map_err(|_| MarkdownLineBreakError::CoordinateOverflow)?;
+            self.source_bytes_read = self
+                .source_bytes_read
+                .checked_add(consumed)
+                .ok_or(MarkdownLineBreakError::CoordinateOverflow)?;
+            step.bytes += consumed;
+            step.scalars += usize::try_from(self.machine.scalar_count() - before_scalars)
+                .map_err(|_| MarkdownLineBreakError::CoordinateOverflow)?;
             if let Some(error) = failure {
                 return Err(error);
             }
             source_result?;
-            step.bytes += usize::try_from(self.machine.byte_offset() - before_byte)
-                .map_err(|_| MarkdownLineBreakError::CoordinateOverflow)?;
-            step.scalars += usize::try_from(self.machine.scalar_count() - before_scalars)
-                .map_err(|_| MarkdownLineBreakError::CoordinateOverflow)?;
         }
         if usize::try_from(self.machine.byte_offset())
             .map_err(|_| MarkdownLineBreakError::CoordinateOverflow)?
@@ -362,8 +478,46 @@ impl MarkdownLineBreakJob {
         query: MarkdownLineBreakQuery,
     ) -> Result<MarkdownLineBreakAnswer> {
         self.guard(authority)?;
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if let Some(tables) = &self.tables
+            && tables
+                .cursor
+                .plan
+                .contains(offset, matches!(unit, MarkdownLineBreakUnit::Utf16))?
+        {
+            return Err(MarkdownLineBreakError::TableRange);
+        }
+        #[cfg(feature = "paged-line-compose")]
+        if self
+            .folds
+            .as_ref()
+            .is_some_and(|plan| plan.hides(offset, matches!(unit, MarkdownLineBreakUnit::Utf16)))
+        {
+            // 隐区是有效正文，但本显示配置没有其查询权限；拒绝不会撤销健康可见前缀。
+            return Err(MarkdownLineBreakError::FoldedRange);
+        }
         let result = self.query_inner(unit, offset, query);
-        if result.is_err() {
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        let result = result.and_then(|answer| {
+            if let (MarkdownLineBreakAnswer::Known(Some(value)), Some(state)) =
+                (&answer, &self.tables)
+                && state.cursor.plan.contains(value.utf16, true)?
+            {
+                return Err(MarkdownLineBreakError::TableRange);
+            }
+            Ok(answer)
+        });
+        let result = self
+            .source
+            .health()
+            .map_err(MarkdownLineBreakError::from)
+            .and(result);
+        if result.as_ref().is_err_and(|error| {
+            !matches!(
+                error,
+                MarkdownLineBreakError::TableRange | MarkdownLineBreakError::FoldedRange
+            )
+        }) {
             self.fail();
         }
         result
@@ -456,8 +610,7 @@ impl MarkdownLineBreakJob {
             generation: self.source.generation(),
             source_bytes: self.source.byte_len(),
             source_utf16: self.source.utf16_len(),
-            source_bytes_read: usize::try_from(self.machine.byte_offset())
-                .expect("只消费不超过原usize源长度的借用"),
+            source_bytes_read: self.source_bytes_read,
             source_borrow_max_bytes: self.source_borrow_max,
             boundary_records: self.index.len(),
             index_page_loads: self.index.page_loads(),
@@ -486,3 +639,15 @@ impl MarkdownLineBreakJob {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-line-compose",
+    feature = "paged-shaping-frontier"
+))]
+impl MarkdownLineBreakJob {
+    /// 结构跳跃只在原 machine 已消费真实行尾后完成，尚未提交端点保持待决。
+    pub(crate) fn table_passed(&self, end: usize) -> bool {
+        self.machine.utf16_offset() >= end as u64
+    }
+}

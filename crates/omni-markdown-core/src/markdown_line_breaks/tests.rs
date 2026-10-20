@@ -113,6 +113,132 @@ fn compare(
     count
 }
 
+/// 每个量子只收费实际字节、标量和机会；折叠跳转不能以零工作 Pending 忙转。
+#[cfg(feature = "paged-line-compose")]
+fn finish_visible(job: &mut MarkdownLineBreakJob, authority: &MarkdownLayoutTextAuthority) {
+    for _ in 0..16_384 {
+        let step = job.step(authority, TINY).unwrap();
+        assert!(
+            step.bytes <= TINY.bytes
+                && step.scalars <= TINY.scalars
+                && step.records <= TINY.records
+        );
+        if step.status == MarkdownLineBreakStatus::Ready {
+            assert!(job.is_ready());
+            return;
+        }
+        assert!(step.bytes != 0 || step.scalars != 0 || step.records != 0);
+    }
+    panic!("可见断行量子没有收敛到真实 EOF");
+}
+
+#[cfg(feature = "paged-line-compose")]
+#[test]
+/// 同源折叠只撤内部查询；可见首尾机会仍逐条等同原完整 UAX14 结果。
+fn folded_hard_breaks_keep_original_rules_and_deny_only_hidden_queries() {
+    // CR、LF、CRLF、真实无终止符 EOF 都由同一原 job 处理，含引号、数字和组合标记上下文。
+    for (text, hidden) in [
+        ("a (\r\n隐😀\r\n后 1.2\n", 3..10),
+        ("a\n\n后\n", 1..3),
+        ("a\r隐\r后", 1..4),
+        ("a\n隐😀", 1..5),
+        ("a\r\n", 1..3),
+        ("x \"\r\n\u{301}z\n后", 3..8),
+    ] {
+        let original = source(text.as_bytes());
+        let authority = original.authority();
+        let plan = FoldPlan::new(&original, std::slice::from_ref(&hidden)).unwrap();
+        let span = plan.spans()[0];
+        let mut complete = MarkdownLineBreakJob::new(original.clone()).unwrap();
+        finish(&mut complete, &authority);
+        let mut expected = Vec::new();
+        for index in 0..complete.index.len() {
+            let value = complete.index.get(index).unwrap();
+            if !plan.hides(value.utf16, true) {
+                expected.push(value);
+            }
+        }
+        let mut folded = MarkdownLineBreakJob::new(original.clone()).unwrap();
+        folded.install_fold_plan(plan.clone()).unwrap();
+        let observer = folded.resource_observer();
+        finish_visible(&mut folded, &authority);
+        assert_eq!(folded.index.len(), expected.len(), "{text:?}");
+        for (index, wanted) in expected.into_iter().enumerate() {
+            assert_eq!(folded.index.get(index).unwrap(), wanted, "{text:?}");
+        }
+        for unit in [MarkdownLineBreakUnit::Byte, MarkdownLineBreakUnit::Utf16] {
+            let (start, end) = match unit {
+                MarkdownLineBreakUnit::Byte => (span.start.byte, span.end.byte),
+                MarkdownLineBreakUnit::Utf16 => (span.start.utf16, span.end.utf16),
+            };
+            for query in [
+                MarkdownLineBreakQuery::IsBoundary,
+                MarkdownLineBreakQuery::Previous,
+                MarkdownLineBreakQuery::Next,
+            ] {
+                assert!(matches!(
+                    folded.query(&authority, unit, start + 1, query),
+                    Err(MarkdownLineBreakError::FoldedRange)
+                ));
+            }
+            // 有效终点保留真实 mandatory；拒绝内部查询不会撤销它或原健康资源。
+            assert!(matches!(
+                folded
+                    .query(&authority, unit, end, MarkdownLineBreakQuery::IsBoundary)
+                    .unwrap(),
+                MarkdownLineBreakAnswer::Known(Some(MarkdownLineBreakBoundary {
+                    kind: MarkdownLineBreakKind::Mandatory,
+                    ..
+                }))
+            ));
+        }
+        folded.close().unwrap();
+        released(&observer, false);
+        complete.close().unwrap();
+        drop(original);
+        released(&observer, true);
+    }
+}
+
+#[cfg(feature = "paged-line-compose")]
+#[test]
+/// 超长隐区不经过解码器，取消后仍须真实交还匿名索引与原 Source 资源。
+fn folded_giant_body_is_not_read_and_original_eof_and_cancel_owners_still_apply() {
+    let hidden_body = "隐😀ภาษาไทย".repeat(32_768);
+    let text = format!("可见标题\r\n{hidden_body}\r\n后续正文\n");
+    let hidden_start = "可见标题".encode_utf16().count();
+    let hidden_end = hidden_start + 2 + hidden_body.encode_utf16().count() + 2;
+    let original = source(text.as_bytes());
+    let authority = original.authority();
+    let plan = FoldPlan::new(&original, std::slice::from_ref(&(hidden_start..hidden_end))).unwrap();
+    let mut folded = MarkdownLineBreakJob::new(original.clone()).unwrap();
+    folded.install_fold_plan(plan.clone()).unwrap();
+    let observer = folded.resource_observer();
+    finish_visible(&mut folded, &authority);
+    let profile = folded.storage_profile();
+    assert_eq!(profile.source_bytes_read, text.len() - hidden_body.len());
+    assert!(profile.source_bytes_read < 64);
+    assert!(profile.source_borrow_max_bytes <= TINY.bytes);
+    assert!(!profile.needs_dictionary, "未读隐区不能声称实际扫描过 SA");
+    assert!(folded.is_ready());
+    folded.cancel();
+    assert!(matches!(
+        folded.query(
+            &authority,
+            MarkdownLineBreakUnit::Utf16,
+            hidden_start + 1,
+            MarkdownLineBreakQuery::Next
+        ),
+        Err(MarkdownLineBreakError::Poisoned)
+    ));
+    drop(folded);
+    released(&observer, false);
+    drop(original);
+    // proof 只保原 Weak authority；保留显示段表不应保活正文或匿名断行文件。
+    released(&observer, true);
+    drop(plan);
+}
+
 #[test]
 fn empty_crlf_and_surrogates_use_real_eof_and_exact_global_coordinates() {
     for (bytes, expected) in [

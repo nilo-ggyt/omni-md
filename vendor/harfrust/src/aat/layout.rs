@@ -2,10 +2,10 @@
 
 use super::map;
 use super::{kerx, morx, trak};
+use crate::aat::common::{AatApplyContext, HB_BUFFER_SCRATCH_FLAG_AAT_HAS_DELETED};
 use crate::Feature;
 use crate::LayoutData;
-use crate::aat::common::{AatApplyContext, HB_BUFFER_SCRATCH_FLAG_AAT_HAS_DELETED};
-use crate::{GlyphInfo, Scale, Tag, buffer::Buffer, plan::ShapePlan};
+use crate::{buffer::Buffer, plan::ShapePlan, GlyphInfo, Scale, Tag};
 
 pub type FeatureType = u8;
 

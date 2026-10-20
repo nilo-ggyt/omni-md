@@ -1,9 +1,14 @@
 //! 原长文窗口的有限像素回归；只保存弱权限和颜色样本，不保存图像、正文副本或另一份布局。
 
 use super::*;
-use crate::native_surface::find_bar::NativeMarkdownFindHighlightBatch;
-use crate::native_surface::source_decorations::NativeMarkdownDecorationGeometry;
-use objc2_app_kit::NSColorSpace;
+use crate::native_surface::paged_body::NativeMarkdownPagedBody;
+use crate::native_surface::paged_text_view::{
+    NativeMarkdownPagedSceneKey, NativeMarkdownPagedTextView, NativeMarkdownPagedTextViewDelegate,
+};
+use objc2::rc::Weak as NativeWeak;
+use objc2_app_kit::{NSBitmapFormat, NSClipView, NSColor, NSColorSpace, NSColorSpaceModel};
+#[cfg(feature = "native-block-fragment-diagnostic")]
+use objc2_core_graphics::{CGColorSpace, CGImage};
 use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 
@@ -16,6 +21,7 @@ const PIXEL_SAMPLES: usize = SAMPLE_COLUMNS * SAMPLE_ROWS;
 pub(super) struct FindHighlightsProbe {
     facts: MemoryWorkloadFacts,
     selection: MarkdownTextSelection,
+    input: crate::native_surface::paged_input::NativeMarkdownPagedInputState,
     epoch: MemoryActionEpoch,
     bar: std::rc::Weak<NativeMarkdownFindBar>,
     query_units: usize,
@@ -26,18 +32,25 @@ pub(super) struct FindHighlightsProbe {
     non_bmp_baseline: Option<PixelSample>,
     scrolled_baseline: Option<PixelSample>,
     preview_baseline: Option<PixelSample>,
-    scrolled_from: Option<(NSRect, std::rc::Weak<NativeMarkdownFindHighlightBatch>)>,
+    // Hide只允许归还原Find栏实测占高；不把任意滚动或resize当作同一glyph的合法平移。
+    hidden_bar_height: Option<f64>,
+    // 有限Paged正文随滚动移动frame，本地visibleRect可不变；原滚动票必须记录真正clip的bounds。
+    scrolled_from: Option<(NativeWeak<NSClipView>, NSRect, NativeMarkdownPagedSceneKey)>,
 }
 
 /// 一个真实glyph及右侧未命中对照共用同一小bitmap；只复制128个RGB标量。
-struct PixelSample {
+pub(super) struct PixelSample {
+    pub(super) key: NativeMarkdownPagedSceneKey,
     source: Range<usize>,
     frame: NSRect,
     rect: NSRect,
     width: isize,
     height: isize,
-    colors: [[f64; 3]; PIXEL_SAMPLES],
-    in_match: [bool; PIXEL_SAMPLES],
+    pub(super) colors: [[f64; 3]; PIXEL_SAMPLES],
+    pub(super) in_match: [bool; PIXEL_SAMPLES],
+    // 仅原代码背景验收保存颜色解释的纯值；bitmap、CGImage和NSColor都不能跨事件保活。
+    #[cfg(feature = "native-block-fragment-diagnostic")]
+    pub(super) color_diagnostic: String,
 }
 
 impl NativeMarkdownMemoryWorkload {
@@ -49,13 +62,21 @@ impl NativeMarkdownMemoryWorkload {
             }
             let facts = self.facts()?;
             let probe = with_active_native_markdown_surface(|surface| {
-                FindHighlightsProbe::capture(surface, facts)
+                let mut probe = FindHighlightsProbe::capture(surface, facts)?;
+                let editor = surface.editor.as_ref().ok_or("高亮源码模式缺少原正文")?;
+                if editor.presentation_mode() != MarkdownPresentationMode::Source {
+                    // 正式 Paged 模式转换会撤销原 Find 意图；动作前声明唯一后继，不能事后重采 epoch。
+                    probe.epoch = probe.next_find_epoch()?;
+                }
+                Ok(probe)
             })?;
             *self.find_highlights.borrow_mut() = Some(probe);
             return self.change_mode(true); // 沿原产品模式收据推进，不手动补跑executor。
         }
-        if stage == 426 || stage == 434 {
+        if stage == 426 || stage == 436 {
             self.verify_mode(stage == 426)?; // 原模式真实完成后，才读取相应正文的像素。
+        } else {
+            self.verify_memory_frame()?; // 原动作的真实完整 CPU 终点由统一 driver 交付，采样不补跑排版。
         }
         let mut probe = self
             .find_highlights
@@ -71,9 +92,22 @@ impl NativeMarkdownMemoryWorkload {
                 probe.exercise(surface, stage)?;
                 probe.verify_document(surface, &self.path)
             })?;
-            if stage == 433 {
+            if stage == 435 {
+                with_active_native_markdown_surface(|surface| {
+                    if !probe.current(surface) {
+                        return Err("高亮 Preview 转换前原输入已撤权".into());
+                    }
+                    let editor = surface
+                        .editor
+                        .as_ref()
+                        .ok_or("高亮 Preview 转换缺少原正文")?;
+                    if editor.presentation_mode() != MarkdownPresentationMode::InlinePreview {
+                        probe.epoch = probe.next_find_epoch()?;
+                    }
+                    Ok(())
+                })?;
                 self.change_mode(false)?; // 仅真实Preview转换；下一事件仍核原mode收据。
-            } else if stage == 435 {
+            } else if stage == 437 {
                 // 首Native前声明Hide将推进的原Find意图；返回后不重采新epoch替换预期。
                 let expected = probe.next_find_epoch()?;
                 perform_native_markdown_find_action(MarkdownFindAction::Hide)?;
@@ -86,18 +120,25 @@ impl NativeMarkdownMemoryWorkload {
                     if bar.is_visible() {
                         return Err("真实Hide未隐藏原查找栏".into());
                     }
+                    probe.verify_document(surface, &self.path)
+                })?;
+            } else if stage == 438 {
+                with_active_native_markdown_surface(|surface| {
                     let baseline = probe.preview_baseline.as_ref().ok_or("缺少Preview基线")?;
-                    let clear = probe.sample(surface, baseline.source.clone())?;
-                    baseline.require_restored(&clear)?;
+                    let height = probe.hidden_bar_height.ok_or("Hide缺少原查找栏实测高度")?;
+                    baseline.require_hidden_restored(
+                        &probe.sample(surface, baseline.source.clone())?,
+                        height,
+                    )?;
                     probe.verify_document(surface, &self.path)
                 })?;
                 println!(
-                    "native_find_highlight verified=true source_pixels=true preview_pixels=true unicode_non_bmp=true ime_query_no_provisional=true old_geometry_revoked=true selection_unchanged=true empty_history_unchanged=true nonempty_undo_redo_verified=false screen_present_verified=false"
+                    "native_find_highlight verified=true source_pixels=true preview_pixels=true unicode_non_bmp=true marked_query_protocol_no_provisional=true real_system_ime_verified=false old_geometry_revoked=true selection_unchanged=true empty_history_unchanged=true nonempty_undo_redo_verified=false screen_present_verified=false"
                 );
             }
             Ok(())
         })();
-        if stage != 435 || result.is_err() {
+        if stage != 438 || result.is_err() {
             *self.find_highlights.borrow_mut() = Some(probe); // 错误也交还原弱状态，由原Return一并清理。
         }
         result
@@ -114,7 +155,16 @@ impl FindHighlightsProbe {
             return Err("高亮验收原窗口已失效".into());
         }
         let editor = surface.editor.as_ref().ok_or("高亮验收缺少原正文")?;
-        let bar = editor.find_bar.borrow().clone().ok_or("高亮验收缺少原栏")?;
+        let paged = editor;
+        let input = paged
+            .text_view
+            .input_state()
+            .map_err(|cause| cause.to_string())?;
+        let bar = editor
+            .find_bar()
+            .borrow()
+            .clone()
+            .ok_or("高亮验收缺少原栏")?;
         let (selection, chinese, non_bmp, non_bmp_range) = {
             let document = editor.document().borrow();
             if document.can_undo() || document.can_redo() {
@@ -154,6 +204,7 @@ impl FindHighlightsProbe {
         let mut probe = Self {
             facts,
             selection,
+            input,
             epoch: MemoryActionEpoch::capture(surface),
             bar: Rc::downgrade(&bar),
             query_units: 0,
@@ -164,6 +215,7 @@ impl FindHighlightsProbe {
             non_bmp_baseline: None,
             scrolled_baseline: None,
             preview_baseline: None,
+            hidden_bar_height: None,
             scrolled_from: None,
         };
         // 查询长度只在尚未开始组合输入的原字段读取；后继长度均由本用例明确输入决定。
@@ -190,12 +242,13 @@ impl FindHighlightsProbe {
             && epoch.permits(surface)
             && surface.editor.as_ref().is_some_and(|editor| {
                 let same_bar = editor
-                    .find_bar
+                    .find_bar()
                     .borrow()
                     .as_ref()
                     .is_some_and(|bar| std::rc::Weak::ptr_eq(&self.bar, &Rc::downgrade(bar)));
                 let document = editor.document().borrow();
                 same_bar
+                    && editor.text_view.input_state().ok() == Some(self.input)
                     && document.selection() == self.selection
                     && !document.can_undo()
                     && !document.can_redo()
@@ -224,12 +277,12 @@ impl FindHighlightsProbe {
             return Err("高亮验收的原正文、选择或意图已失效".into());
         }
         let editor = surface.editor.as_ref().ok_or("高亮正文缺失")?;
-        let view = &editor.backend.text_view;
-        let _payload = PayloadUseGuard::enter(&view.ivars().payload_use_depth);
+        let paged = editor;
+        let view = &**paged.text_view;
         match stage {
             426 => {
                 let current = || self.current(surface);
-                let scroll = &editor.backend.scroll_view;
+                let scroll = editor.scroll_view();
                 let clip = step(&current, || scroll.contentView())?;
                 step(&current, || clip.scrollToPoint(NSPoint::new(0.0, 0.0)))?;
                 step(&current, || scroll.reflectScrolledClipView(&clip))?;
@@ -277,73 +330,84 @@ impl FindHighlightsProbe {
                 let current = || self.current(surface);
                 let visible = step(&current, || view.visibleRect())?;
                 let old = view
-                    .ivars()
-                    .source_decorations
-                    .borrow()
-                    .iter()
-                    .find_map(|geometry| match geometry {
-                        NativeMarkdownDecorationGeometry::Find(batch) => Some(Rc::downgrade(batch)),
-                        NativeMarkdownDecorationGeometry::Source { .. }
-                        | NativeMarkdownDecorationGeometry::PreviewVisibility(_) => None,
-                    })
-                    .ok_or("滚动前没有原高亮批次")?;
-                let scroll = &editor.backend.scroll_view;
+                    .capture_ready_scene_key()
+                    .map_err(|cause| cause.to_string())?;
+                let scroll = editor.scroll_view();
                 let clip = step(&current, || scroll.contentView())?;
+                let before = step(&current, || clip.bounds())?;
+                let original = step(&current, || NativeWeak::from_retained(&clip))?;
                 step(&current, || {
                     clip.scrollToPoint(NSPoint::new(
                         visible.origin.x,
                         visible.origin.y + visible.size.height * 0.5,
-                    ));
+                    ))
                 })?;
                 step(&current, || scroll.reflectScrolledClipView(&clip))?;
                 drop(clip);
-                self.scrolled_from = Some((visible, old));
-                // 原clip已改变，旧batch此刻必须拒绝绘制；有限真实paint本身也会沿产品路径排settled刷新。
-                let source = self.visible_chinese(surface)?;
-                self.scrolled_baseline = Some(self.sample(surface, source)?);
+                self.scrolled_from = Some((original, before, old));
+                // 新clip先走真实空查询帧；不能拿尚未刷新的旧高亮时序伪造新位置的无亮基线。
+                self.input(surface, "", false)?;
             }
             433 => {
                 let current = || self.current(surface);
-                let visible = step(&current, || view.visibleRect())?;
-                let width = step(&current, || view.bounds().size.width)?;
-                let (old_visible, old) = self.scrolled_from.as_ref().ok_or("缺少原滚动票")?;
-                if visible == *old_visible {
-                    return Err("真实滚动没有改变原clip".into());
+                let (original, old_bounds, old) =
+                    self.scrolled_from.as_ref().ok_or("缺少原滚动票")?;
+                let original = step(&current, || original.load())?.ok_or("原滚动clip已释放")?;
+                let scroll = editor.scroll_view();
+                let clip = step(&current, || scroll.contentView())?;
+                if !std::ptr::eq(&*clip, &*original) {
+                    return Err("滚动后的clip不再属于原实际挂载对象".into());
                 }
-                if let Some(old) = old.upgrade()
-                    && old.current(
-                        view,
-                        &editor.backend.text_storage,
-                        &surface.controller,
-                        visible,
-                        width,
-                    )
+                let bounds = step(&current, || clip.bounds())?;
+                drop((clip, original)); // 原弱身份只在本事件同步升级，不保活后继图或补采替代clip。
+                let key = view
+                    .capture_ready_scene_key()
+                    .map_err(|cause| cause.to_string())?;
+                // 正式正文只占当前视口；update把frame跟随document原点、bounds保持零，
+                // 因而不能用它的本地visibleRect冒充滚动量。真实clip必须已动，旧Scene仍必须撤权。
+                if bounds == *old_bounds
+                    || key.same(old)
+                    || NativeMarkdownPagedTextViewDelegate::scene_current(&*paged.body, old)
                 {
-                    return Err("滚动后的旧高亮几何仍有权限".into());
+                    return Err("真实滚动没有撤销旧高亮几何或发布新clip".into());
                 }
+                let source = self.visible_chinese(surface)?;
+                self.scrolled_baseline = Some(self.sample(surface, source)?);
+                self.input(surface, "中文", false)?;
+            }
+            434 => {
                 let baseline = self
                     .scrolled_baseline
                     .as_ref()
-                    .ok_or("缺少新clip的真实无亮区基线")?;
-                let source = baseline.source.clone();
-                let highlighted = self.sample(surface, source.clone())?;
-                baseline.require_highlight(&highlighted)?;
+                    .ok_or("缺少新clip的无亮基线")?;
+                baseline.require_highlight(&self.sample(surface, baseline.source.clone())?)?;
                 self.input(surface, "", false)?;
-                let clear = self.sample(surface, source)?;
-                self.scrolled_baseline
-                    .as_ref()
-                    .ok_or("新clip基线在明确查询输入后丢失")?
-                    .require_restored(&clear)?;
             }
-            434 => {
+            435 => {
+                let baseline = self
+                    .scrolled_baseline
+                    .as_ref()
+                    .ok_or("缺少新clip的原基线")?;
+                baseline.require_restored(&self.sample(surface, baseline.source.clone())?)?;
+            }
+            436 => {
                 let source = self.visible_chinese(surface)?;
                 self.preview_baseline = Some(self.sample(surface, source)?);
                 self.input(surface, "中文", false)?;
             }
-            435 => {
+            437 => {
                 let baseline = self.preview_baseline.as_ref().ok_or("缺少Preview基线")?;
                 baseline.require_highlight(&self.sample(surface, baseline.source.clone())?)?;
+                let current = || self.current(surface);
+                let bar = self.bar.upgrade().ok_or("Hide前原查找栏已释放")?;
+                let frame = step(&current, || bar.visible_frame_for_probe())?
+                    .ok_or("Hide前原查找栏没有实际可见frame")?;
+                if !frame.size.height.is_finite() || frame.size.height <= 0.0 {
+                    return Err("Hide前原查找栏没有有限正高布局".into());
+                }
+                self.hidden_bar_height = Some(frame.size.height);
             }
+            438 => {} // 原Hide后的完整CPU帧由外层原等待交付，再核同一有限像素已恢复。
             _ => return Err("未声明的高亮像素阶段".into()), // 原driver才能决定后继，不在这里发明另一状态机。
         }
         Ok(())
@@ -366,7 +430,9 @@ impl FindHighlightsProbe {
                     .input_client_revision();
                 Ok((field, selection, marked, revision))
             })?;
-        show_native_markdown_find_bar(true)?;
+        // 重复原Find模式只核焦点与组合是否保持；打开Replace会改变栏高和正文几何，
+        // 不能把这种额外布局动作混入后继同一像素基线的恢复检查。
+        show_native_markdown_find_bar(false)?;
         let result = with_active_native_markdown_surface(|surface| {
             let current = || self.current(surface);
             let field = self.field_editor(surface, &current)?;
@@ -448,15 +514,13 @@ impl FindHighlightsProbe {
                 // 失败后只记录原窗口现有标量，不能用实际新值替换预声明的输入权限。
                 let actual = MemoryActionEpoch::capture(surface);
                 format!(
-                    "{cause}：marked={marked}，预期/实际Find={}/{}, workspace={}/{}, header={}/{}, table={}/{}",
+                    "{cause}：marked={marked}，预期/实际Find={}/{}, workspace={}/{}, header={}/{}",
                     expected.find,
                     actual.find,
                     expected.workspace,
                     actual.workspace,
                     expected.header,
                     actual.header,
-                    expected.table,
-                    actual.table,
                 )
             })?;
             if step(&after, || field.hasMarkedText())? != marked {
@@ -478,16 +542,13 @@ impl FindHighlightsProbe {
         surface: &NativeMarkdownWindowSurface,
     ) -> Result<Range<usize>, String> {
         let current = || self.current(surface);
-        let view = &surface
-            .editor
-            .as_ref()
-            .ok_or("高亮正文缺失")?
-            .backend
-            .text_view;
+        let editor = surface.editor.as_ref().ok_or("高亮正文缺失")?;
+        let paged = editor;
+        let view = &**paged.text_view;
         let visible = step(&current, || view.visibleRect())?;
         for source in &self.chinese {
             // 只读已声明的有限源位置；不ensure离屏段落或把未知结构默认成普通正文。
-            let frame = view.source_probe_segment(source, &current);
+            let frame = PixelSample::source_frame(view, &paged.body, source, &current);
             if let Ok(frame) = frame
                 && sample_rect(frame, visible).is_some()
             {
@@ -507,81 +568,9 @@ impl FindHighlightsProbe {
         source: Range<usize>,
     ) -> Result<PixelSample, String> {
         let current = || self.current(surface);
-        let view = &surface
-            .editor
-            .as_ref()
-            .ok_or("像素正文缺失")?
-            .backend
-            .text_view;
-        let frame = view
-            .source_probe_segment(&source, &current)
-            .map_err(|_| "实际glyph几何不可用")?;
-        let visible = step(&current, || view.visibleRect())?;
-        let rect = sample_rect(frame, visible).ok_or("实际glyph和对照条不在有限可见区域")?;
-        let sample = autoreleasepool(|_| {
-            let bitmap = step(&current, || {
-                view.bitmapImageRepForCachingDisplayInRect(rect)
-            })?
-            .ok_or("AppKit未创建有限高亮bitmap")?;
-            step(&current, || {
-                view.cacheDisplayInRect_toBitmapImageRep(rect, &bitmap)
-            })?;
-            let width = step(&current, || bitmap.pixelsWide())?;
-            let height = step(&current, || bitmap.pixelsHigh())?;
-            if width <= 0 || height <= 0 || width > 128 || height > 64 {
-                return Err("高亮bitmap超出128x64实际像素预算".into());
-            }
-            let space = step(&current, NSColorSpace::sRGBColorSpace)?;
-            let mut colors = [[0.0; 3]; PIXEL_SAMPLES];
-            let mut in_match = [false; PIXEL_SAMPLES];
-            for row in 0..SAMPLE_ROWS {
-                for column in 0..SAMPLE_COLUMNS {
-                    // 固定网格覆盖真实glyph和右侧非命中对照；每个颜色的Native claim局部归还。
-                    let index = row * SAMPLE_COLUMNS + column;
-                    let x = ((2 * column + 1) as isize * width / (2 * SAMPLE_COLUMNS) as isize)
-                        .min(width - 1);
-                    let y = ((2 * row + 1) as isize * height / (2 * SAMPLE_ROWS) as isize)
-                        .min(height - 1);
-                    colors[index] = autoreleasepool(|_| {
-                        let color = step(&current, || bitmap.colorAtX_y(x, y))?
-                            .ok_or("bitmap像素不可读")?;
-                        let rgb = step(&current, || color.colorUsingColorSpace(&space))?
-                            .ok_or("像素无法转换为sRGB")?;
-                        let channels = step(&current, || {
-                            [
-                                rgb.redComponent(),
-                                rgb.greenComponent(),
-                                rgb.blueComponent(),
-                            ]
-                        })?;
-                        drop((rgb, color));
-                        Ok::<_, String>(channels)
-                    })?;
-                    let view_x = rect.origin.x + (x as f64 + 0.5) * rect.size.width / width as f64;
-                    in_match[index] = view_x < frame.origin.x + frame.size.width;
-                }
-            }
-            drop((space, bitmap)); // 图像和颜色空间不得跨事件；只返回有限颜色标量。
-            Ok::<_, String>(PixelSample {
-                source: source.clone(),
-                frame,
-                rect,
-                width,
-                height,
-                colors,
-                in_match,
-            })
-        })?;
-        if !current()
-            || step(&current, || view.visibleRect())? != visible
-            || view
-                .source_probe_segment(&source, &current)
-                .map_err(|_| "像素结束后glyph失效")?
-                != frame
-        {
-            return Err("实际paint或局部pool归还后原clip/glyph已变化".into());
-        }
-        Ok(sample)
+        let editor = surface.editor.as_ref().ok_or("像素正文缺失")?;
+        let paged = editor;
+        PixelSample::capture(&paged.text_view, &paged.body, source, &current)
     }
 
     /// 每个事件结束核原保存摘要和磁盘身份；只读回归不能借dirty=false掩盖历史或数据改变。
@@ -624,9 +613,328 @@ impl FindHighlightsProbe {
 }
 
 impl PixelSample {
+    /// 几何只取当前已封存Scene的完整GCB；中文查询可含两字，不能要求IME首框冒充整个词框。
+    /// 只聚合同一软行带的实际字形，不跨行拉大ROI，也不以隐藏语法占位框替代真实内容。
+    pub(super) fn source_frame(
+        view: &NativeMarkdownPagedTextView,
+        body: &NativeMarkdownPagedBody,
+        source: &Range<usize>,
+        current: &impl Fn() -> bool,
+    ) -> Result<NSRect, String> {
+        let key = view
+            .capture_ready_scene_key()
+            .map_err(|cause| cause.to_string())?;
+        let scene = NativeMarkdownPagedTextViewDelegate::ready_scene(body, &key.request)
+            .map_err(|cause| cause.to_string())?;
+        scene
+            .validate_ready(current)
+            .map_err(|cause| cause.to_string())?;
+        if !scene.key().same(&key) {
+            return Err("有限像素几何没有原 Scene 权限".into());
+        }
+        let mut cursor = source.start;
+        let mut frame: Option<NSRect> = None;
+        while cursor < source.end {
+            // first_rect的公开合同是首个完整GCB，而非请求范围内所有字符。原固定中文两字
+            // 与单个nonBMP分别逐GCB取景，始终借同一Scene；不另求布局或读取正文。
+            let actual = scene
+                .first_rect(NSRange::new(cursor, source.end - cursor))
+                .map_err(|cause| cause.to_string())?;
+            let end = actual
+                .actual_range
+                .location
+                .checked_add(actual.actual_range.length)
+                .ok_or("有限像素实际字形范围溢出")?;
+            if actual.actual_range.location != cursor || end <= cursor || end > source.end {
+                return Err("有限像素目标未按完整GCB连续覆盖原范围".into());
+            }
+            frame = Some(if let Some(previous) = frame {
+                if previous.origin.y != actual.rect.origin.y
+                    || previous.size.height != actual.rect.size.height
+                {
+                    return Err("有限像素目标跨越实际软行或不同字形带".into());
+                }
+                // 左右对照仍包围完整查询。只截首字或末字会把查询另一字误当成未命中对照，
+                // 因而这里仅合并真实同带字形的横向包络，原ROI尺寸上限继续在sample_rect核验。
+                let left = previous.origin.x.min(actual.rect.origin.x);
+                let right = (previous.origin.x + previous.size.width)
+                    .max(actual.rect.origin.x + actual.rect.size.width);
+                NSRect::new(
+                    NSPoint::new(left, previous.origin.y),
+                    NSSize::new(right - left, previous.size.height),
+                )
+            } else {
+                actual.rect
+            });
+            cursor = end;
+        }
+        scene
+            .validate_ready(current)
+            .map_err(|cause| cause.to_string())?;
+        frame.ok_or("有限像素目标没有真实完整字形".into())
+    }
+
+    /// 只截取原已安装分页视图的≤128×64像素；不能另调用 Scene.paint 生成一张替代通过图。
+    /// AppKit bitmap、颜色与 Scene 强边全在同步栈归还，跨事件只留下128个RGB与原弱 key。
+    pub(super) fn capture(
+        view: &NativeMarkdownPagedTextView,
+        body: &NativeMarkdownPagedBody,
+        source: Range<usize>,
+        current: &impl Fn() -> bool,
+    ) -> Result<Self, String> {
+        let key = view
+            .capture_ready_scene_key()
+            .map_err(|cause| cause.to_string())?;
+        let (published, paints) = view
+            .probe_cpu_published_frame()
+            .ok_or("有限像素目标缺少实际 CPU 帧")?;
+        if !published.same(&key)
+            || paints == 0
+            || view.cpu_paints() != Some(paints)
+            || view.cpu_paint_pending() != Some(false)
+            || !current()
+        {
+            return Err("有限像素目标不是原完整 CPU 发布帧".into());
+        }
+        let frame = Self::source_frame(view, body, &source, current)?;
+        let visible = step(current, || view.visibleRect())?;
+        let rect = sample_rect(frame, visible).ok_or("实际字形和对照条不在有限可见区域")?;
+        let sample = autoreleasepool(|_| {
+            let bitmap = step(current, || view.bitmapImageRepForCachingDisplayInRect(rect))?
+                .ok_or("AppKit 未创建原视图有限 bitmap")?;
+            step(current, || {
+                view.cacheDisplayInRect_toBitmapImageRep(rect, &bitmap)
+            })?;
+            let width = step(current, || bitmap.pixelsWide())?;
+            let height = step(current, || bitmap.pixelsHigh())?;
+            if width <= 0 || height <= 0 || width > 128 || height > 64 {
+                return Err("实际 bitmap 超出128×64像素预算".into());
+            }
+            // 实测colorAtX把显示器ICC的原分量包装成GenericRGB；不能据这个错误源空间再转换。
+            // getPixel与原colorAtX共用左上角原点，仍只读同128个整数坐标，不引入图像绘制或Y翻转。
+            let bitmap_space = step(current, || bitmap.colorSpace())?;
+            let color_components = step(current, || bitmap_space.numberOfColorComponents())?;
+            let model = step(current, || bitmap_space.colorSpaceModel())?;
+            let (bps, spp, format, alpha) = step(current, || {
+                (
+                    bitmap.bitsPerSample(),
+                    bitmap.samplesPerPixel(),
+                    bitmap.bitmapFormat(),
+                    bitmap.hasAlpha(),
+                )
+            })?;
+            // getPixel对浮点样本会截成整数，无法保原颜色；只接受可以无损读出的整数布局。
+            // 单色/RGB/CMYK至多四个色分量，真实alpha另占一项；不按显示器名字猜RGB或字节次序。
+            if !(1..=32).contains(&bps)
+                || !(1..=4).contains(&color_components)
+                || spp != color_components + isize::from(alpha)
+                || format.contains(NSBitmapFormat::FloatingPointSamples)
+                || !matches!(
+                    model,
+                    NSColorSpaceModel::Gray | NSColorSpaceModel::RGB | NSColorSpaceModel::CMYK
+                )
+            {
+                return Err("实际缓存像素格式不能按原颜色空间无损读取".into());
+            }
+            let color_components = color_components as usize;
+            let maximum = ((1u64 << bps as u32) - 1) as usize;
+            let alpha_first = alpha && format.contains(NSBitmapFormat::AlphaFirst);
+            let premultiplied = alpha && !format.contains(NSBitmapFormat::AlphaNonpremultiplied);
+            let space = step(current, NSColorSpace::sRGBColorSpace)?;
+            let mut colors = [[0.0; 3]; PIXEL_SAMPLES];
+            let mut in_match = [false; PIXEL_SAMPLES];
+            for row in 0..SAMPLE_ROWS {
+                for column in 0..SAMPLE_COLUMNS {
+                    let index = row * SAMPLE_COLUMNS + column;
+                    let x = ((2 * column + 1) as isize * width / (2 * SAMPLE_COLUMNS) as isize)
+                        .min(width - 1);
+                    let y = ((2 * row + 1) as isize * height / (2 * SAMPLE_ROWS) as isize)
+                        .min(height - 1);
+                    let mut raw = [0usize; 5];
+                    step(current, || {
+                        // SAFETY: spp已经证明为真实色分量数加可选alpha且≤5，原坐标仍完整位于bitmap。
+                        // getPixel负责实际位深/planar/端序解码，数组顺序继续按bitmapFormat解释。
+                        unsafe { bitmap.getPixel_atX_y(std::ptr::NonNull::from(&mut raw[0]), x, y) }
+                    })?;
+                    if raw[..spp as usize].iter().any(|value| *value > maximum) {
+                        return Err("实际缓存像素分量超出原整数位深".into());
+                    }
+                    let alpha_sample = if alpha {
+                        raw[if alpha_first { 0 } else { color_components }]
+                    } else {
+                        maximum
+                    };
+                    let mut components = [0.0; 5];
+                    for (channel, component) in
+                        components[..color_components].iter_mut().enumerate()
+                    {
+                        let sample = raw[channel + usize::from(alpha_first)];
+                        // NSColor需要非预乘、alpha末置的真实ICC分量；仅原格式要求时解除预乘。
+                        // 透明像素没有可恢复色值，按零色交付，不能除零或假设本图恒opaque。
+                        *component = if premultiplied {
+                            if alpha_sample == 0 {
+                                0.0
+                            } else {
+                                sample as f64 / alpha_sample as f64
+                            }
+                        } else {
+                            sample as f64 / maximum as f64
+                        };
+                    }
+                    components[color_components] = alpha_sample as f64 / maximum as f64;
+                    colors[index] = autoreleasepool(|_| {
+                        let color = step(current, || {
+                            // SAFETY: 完整原ICC分量及alpha末项都在固定数组内，count严格等于该空间要求。
+                            unsafe {
+                                NSColor::colorWithColorSpace_components_count(
+                                    &bitmap_space,
+                                    std::ptr::NonNull::from(&components[0]),
+                                    (color_components + 1) as isize,
+                                )
+                            }
+                        })?;
+                        let rgb = step(current, || color.colorUsingColorSpace(&space))?
+                            .ok_or("实际缓存ICC像素不能转换为 sRGB")?;
+                        step(current, || {
+                            [
+                                rgb.redComponent(),
+                                rgb.greenComponent(),
+                                rgb.blueComponent(),
+                            ]
+                        })
+                    })?;
+                    let view_x = rect.origin.x + (x as f64 + 0.5) * rect.size.width / width as f64;
+                    in_match[index] =
+                        frame.origin.x <= view_x && view_x < frame.origin.x + frame.size.width;
+                }
+            }
+            #[cfg(feature = "native-block-fragment-diagnostic")]
+            let color_diagnostic = {
+                // 描述实际源空间而不改tag；名称缺席也保留真实model，不把未命名ICC空间当sRGB。
+                let describe_cg = |value: Option<&CGColorSpace>| {
+                    step(current, || {
+                        let model = CGColorSpace::model(value).0;
+                        let name = CGColorSpace::name(value).map(|name| name.to_string());
+                        format!("present={} model={model} name={name:?}", value.is_some())
+                    })
+                };
+                let describe = |value: &NSColorSpace| -> Result<String, String> {
+                    let (model, name) = step(current, || {
+                        (
+                            value.colorSpaceModel().0,
+                            value.localizedName().map(|name| name.to_string()),
+                        )
+                    })?;
+                    let cg = step(current, || value.CGColorSpace())?;
+                    Ok(format!(
+                        "model={model} name={name:?} cg=({})",
+                        describe_cg(cg.as_deref())?
+                    ))
+                };
+                let bitmap_description = describe(&bitmap_space)?;
+                let image = step(current, || bitmap.CGImage())?;
+                let image_space = image
+                    .as_deref()
+                    .map(|image| step(current, || CGImage::color_space(Some(image))))
+                    .transpose()?
+                    .flatten();
+                let image_description = describe_cg(image_space.as_deref())?;
+                let bpp = step(current, || bitmap.bitsPerPixel())?;
+                let last = in_match.iter().rposition(|inside| !inside);
+                let control = if let Some(index) = last {
+                    // 仍读原128点中的最后对照；不另取ROI、不改变字形命中或颜色通过标准。
+                    let column = index % SAMPLE_COLUMNS;
+                    let row = index / SAMPLE_COLUMNS;
+                    let x = ((2 * column + 1) as isize * width / (2 * SAMPLE_COLUMNS) as isize)
+                        .min(width - 1);
+                    let y = ((2 * row + 1) as isize * height / (2 * SAMPLE_ROWS) as isize)
+                        .min(height - 1);
+                    let mut raw = [0usize; 5];
+                    let raw = if (1..=raw.len() as isize).contains(&spp) {
+                        step(current, || {
+                            // SAFETY: spp已核为1..=5，固定数组覆盖全部实际分量；x/y仍在原bitmap内。
+                            // getPixel只读原像素，不自行假定RGBA字节次序或解除预乘。
+                            unsafe {
+                                bitmap.getPixel_atX_y(std::ptr::NonNull::from(&mut raw[0]), x, y)
+                            }
+                        })?;
+                        Some(raw)
+                    } else {
+                        None // 未支持的分量数明确记缺席，不能向小数组写入，也不改原像素判定。
+                    };
+                    let color = step(current, || bitmap.colorAtX_y(x, y))?
+                        .ok_or("原最后对照点的颜色诊断不可读")?;
+                    let color_space = step(current, || color.colorSpace())?;
+                    let color_description = describe(&color_space)?;
+                    let (count, color_alpha) = step(current, || {
+                        (color.numberOfComponents(), color.alphaComponent())
+                    })?;
+                    let mut components = [0.0; 5];
+                    let components = if (1..=components.len() as isize).contains(&count) {
+                        step(current, || {
+                            // SAFETY: 原NSColor的完整分量数已在固定数组内；包含其原alpha，不先转sRGB。
+                            unsafe {
+                                color.getComponents(std::ptr::NonNull::from(&mut components[0]))
+                            }
+                        })?;
+                        Some(components)
+                    } else {
+                        None // 仅诊断保留未知格式，不插值、截断或伪造原色分量。
+                    };
+                    format!(
+                        "index={index} x={x} y={y} raw_count={spp} raw_pixel={raw:?} color_space=({color_description}) color_count={count} color_components={components:?} color_alpha={color_alpha} source_icc_to_srgb={:?}",
+                        colors[index]
+                    )
+                } else {
+                    "present=false".into()
+                };
+                // 所有Native强边都在当前pool归还；跨事件只带格式、空间名和同点分量的有限文本。
+                format!(
+                    "bitmap_space=({bitmap_description}) image_space=({image_description}) bps={bps} spp={spp} bpp={bpp} format={} alpha={alpha} last_control=({control})",
+                    format.0
+                )
+            };
+            drop((space, bitmap_space, bitmap));
+            Ok::<_, String>(Self {
+                key: key.clone(),
+                source: source.clone(),
+                frame,
+                rect,
+                width,
+                height,
+                colors,
+                in_match,
+                #[cfg(feature = "native-block-fragment-diagnostic")]
+                color_diagnostic,
+            })
+        })?;
+        let after = view
+            .capture_ready_scene_key()
+            .map_err(|cause| cause.to_string())?;
+        let stable_cpu = view
+            .probe_cpu_published_frame()
+            .is_some_and(|(actual, count)| actual.same(&key) && count == paints);
+        if !current()
+            || !after.same(&key)
+            || !stable_cpu
+            || view.cpu_paint_pending() != Some(false)
+            || step(current, || view.visibleRect())? != visible
+            || Self::source_frame(view, body, &source, current)? != frame
+        {
+            return Err("原视图采样或临时对象归还后，原 CPU 帧、clip 或字形已变化".into());
+        }
+        Ok(sample)
+    }
+
     /// 同一个真实glyph和采样网格才可比较颜色，不能将模式/滚动后的不同位置拼成差分。
     fn same_region(&self, actual: &Self) -> bool {
-        self.source == actual.source
+        self.key.source == actual.key.source
+            && self.key.presentation_mode == actual.key.presentation_mode
+            && WeakMarkdownDocument::ptr_eq(
+                &self.key.request.document,
+                &actual.key.request.document,
+            )
+            && self.source == actual.source
             && self.frame == actual.frame
             && self.rect == actual.rect
             && self.width == actual.width
@@ -682,13 +990,88 @@ impl PixelSample {
         }
         Ok(())
     }
+
+    /// Hide真实增大有限正文的局部高度，旧TextKit绝对Y不再是Paged相同glyph的坐标合同。
+    /// 只认可原栏占高引起的精确平移；文档原点、原Source/Input和相对ROI均须不变。
+    fn require_hidden_restored(&self, actual: &Self, bar_height: f64) -> Result<(), String> {
+        let before = &self.key.request;
+        let after = &actual.key.request;
+        let same_source = self.key.source == actual.key.source
+            && self.key.presentation_mode == actual.key.presentation_mode
+            && WeakMarkdownDocument::ptr_eq(&before.document, &after.document)
+            && before.target.same(&after.target)
+            && self.source == actual.source;
+        let same_input = before.input == after.input;
+        // 关闭栏只能归还它自身的实际高度，不能掩盖页底夹滚、横向滚动、换宽或后继用户操作。
+        // virtual document_origin是原有限正文的真实文档坐标，不用本地visibleRect的零点代替。
+        let translated = bar_height.is_finite()
+            && bar_height > 0.0
+            && before.bounds_width == after.bounds_width
+            && before.virtual_viewport.document_origin == after.virtual_viewport.document_origin
+            && before.virtual_viewport.layout_origin_x == after.virtual_viewport.layout_origin_x
+            && before.virtual_viewport.layout_width == after.virtual_viewport.layout_width
+            && before.viewport.origin == after.viewport.origin
+            && before.viewport.size.width == after.viewport.size.width
+            && after.viewport.size.height - before.viewport.size.height == bar_height
+            && before.frame_in_parent.origin == after.frame_in_parent.origin
+            && before.frame_in_parent.size.width == after.frame_in_parent.size.width
+            && after.frame_in_parent.size.height - before.frame_in_parent.size.height == bar_height;
+        let mut frame = self.frame;
+        frame.origin.y += bar_height;
+        let mut rect = self.rect;
+        rect.origin.y += bar_height;
+        // 同完整字形及其左右原8pt对照只平移，像素尺寸和128个命中标记仍逐项一致。
+        // 不缩成首字、不换采样点，也不重新绘制一幅没有真实发布的替代图。
+        let same_grid = actual.frame == frame
+            && actual.rect == rect
+            && actual.width == self.width
+            && actual.height == self.height
+            && actual.in_match == self.in_match;
+        let colors_restored = !self
+            .colors
+            .iter()
+            .zip(&actual.colors)
+            .any(|(before, after)| {
+                before
+                    .iter()
+                    .zip(after)
+                    .any(|(before, after)| (before - after).abs() > 0.025)
+            });
+        if same_source && same_input && translated && same_grid && colors_restored {
+            return Ok(());
+        }
+        // 失败仅消费原128点已有纯值；区分错几何与残色，不补采样、不改原.025颜色门槛。
+        let maximum_delta = self
+            .colors
+            .iter()
+            .zip(&actual.colors)
+            .flat_map(|(before, after)| before.iter().zip(after))
+            .map(|(before, after)| (before - after).abs())
+            .fold(0.0_f64, f64::max);
+        Err(format!(
+            "Hide后有限正文像素未恢复原基线：same_source={same_source} same_input={same_input} hide_translation={translated} same_grid={same_grid} colors_restored={colors_restored} original_same_region={} bar_height={bar_height} old_viewport={:?} new_viewport={:?} old_document_origin={:?} new_document_origin={:?} old_frame={:?} new_frame={:?} old_rect={:?} new_rect={:?} old_pixels={}x{} new_pixels={}x{} max_rgb_delta={maximum_delta}",
+            self.same_region(actual),
+            before.viewport,
+            after.viewport,
+            before.virtual_viewport.document_origin,
+            after.virtual_viewport.document_origin,
+            self.frame,
+            actual.frame,
+            self.rect,
+            actual.rect,
+            self.width,
+            self.height,
+            actual.width,
+            actual.height,
+        ))
+    }
 }
 
-/// ROI包括原glyph与8pt非命中对照，始终完整位于真实clip且不超过64x32pt。
+/// ROI包括原glyph与左右各8pt非命中对照，始终完整位于真实clip且不超过64x32pt。
 fn sample_rect(frame: NSRect, visible: NSRect) -> Option<NSRect> {
     let rect = NSRect::new(
-        frame.origin,
-        NSSize::new(frame.size.width + 8.0, frame.size.height),
+        NSPoint::new(frame.origin.x - 8.0, frame.origin.y),
+        NSSize::new(frame.size.width + 16.0, frame.size.height),
     );
     (rect.origin.x.is_finite()
         && rect.origin.y.is_finite()

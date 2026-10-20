@@ -34,7 +34,7 @@ impl NativeMarkdownComposedViewport {
 
     /// 真实EOF沿原last ordinal定位；其他位置严格消费soft-wrap侧而不夹到窗口边缘。
     pub(super) fn caret_line_index(&self, utf16: usize, affinity: Affinity) -> Result<usize> {
-        let length = self.key.request.input.utf16_len;
+        let length = self.utf16_len();
         if utf16 > length {
             return Err(NativeMarkdownComposedViewportError::InvalidRange);
         }

@@ -98,6 +98,91 @@ fn consume(source: &str, width: usize) -> (Vec<VerifiedGlobalLeafBlock>, usize) 
     panic!("真实叶块未在有限步内完成");
 }
 
+#[test]
+fn real_leaf_origins_preserve_nested_code_text_and_tab_columns() {
+    use crate::global_frontier::{BlockOriginKind, BlockOriginLimits, BlockOriginStep};
+    for source in [
+        "> ```text\r\n> 中文😀\r\n> 第二行\r\n> ```\r\n",
+        "- ```text\n  中文😀\n  \t保留Tab\n  ```\n",
+        ">     中文😀\n>     第二行\n",
+        "- 父项\n\n      中文😀\n      第二行\n",
+    ] {
+        let mut expected = String::new();
+        let mut in_code = false;
+        for event in Parser::new_ext(source, options()) {
+            match event {
+                Event::Start(Tag::CodeBlock(_)) => in_code = true,
+                Event::Text(text) if in_code => expected.push_str(&text),
+                Event::End(crate::TagEnd::CodeBlock) => in_code = false,
+                _ => {} // 独立原 Parser 的普通父项文本不属于代码 owner，不靠字面 strip 拼造预期。
+            }
+        }
+        for width in [1, 2, 7, 4096] {
+            let (leaves, _) = consume(source, width);
+            let mut actual = String::new();
+            for leaf in leaves.iter().filter(|leaf| {
+                matches!(
+                    leaf.kind(),
+                    LeafBlockKind::FencedCode | LeafBlockKind::IndentedCode
+                )
+            }) {
+                let body = match leaf.details() {
+                    LeafBlockDetails::FencedCode { body_enclosure, .. }
+                    | LeafBlockDetails::IndentedCode { body_enclosure, .. } => {
+                        body_enclosure.clone()
+                    }
+                    _ => unreachable!("只消费原代码Leaf"),
+                };
+                let mut cursor = leaf
+                    .line_origins(BlockOriginLimits {
+                        max_byte_work: source.len() * 1000 + 1_000_000,
+                        max_transitions: source.len() * 10000 + 1_000_000,
+                    })
+                    .unwrap();
+                for _ in 0..source.len() * 100 + 10000 {
+                    let start = cursor.next_byte();
+                    let end = start.saturating_add(width).min(source.len());
+                    match cursor
+                        .advance(
+                            SourceFrame {
+                                source_revision: 93,
+                                byte_start: start,
+                                bytes: &source.as_bytes()[start..end],
+                                real_eof: end == source.len(),
+                            },
+                            GlobalSourceAuthority {
+                                current_revision: 93,
+                                cancelled: false,
+                            },
+                            4096,
+                        )
+                        .unwrap()
+                    {
+                        BlockOriginStep::Line { line, .. } => {
+                            assert_eq!(line.block_kind(), BlockOriginKind::Leaf(leaf.kind()));
+                            let content = line.content_range();
+                            if content.start >= body.start
+                                && content.end <= body.end
+                                && line.physical_range().start < body.end
+                            {
+                                // 原parse_code_line按真实部分Tab残余补空格；正文仍取同一canonical物理行，不能去前缀后重建Root。
+                                actual.push_str(&" ".repeat(line.content_state().spaces_remaining));
+                                actual.push_str(&source[content]);
+                                if !line.eol_range().is_empty() {
+                                    actual.push('\n');
+                                }
+                            }
+                        }
+                        BlockOriginStep::Complete { .. } => break,
+                        _ => {} // 完整行之前只推进同源原语；小frame不构造虚拟EOL。
+                    }
+                }
+            }
+            assert_eq!(actual, expected, "source={source:?}; width={width}");
+        }
+    }
+}
+
 fn compare(source: &str, width: usize) {
     let expected = crate::firstpass::capture_closed_leaf_blocks(source, options());
     let (leaves, _) = consume(source, width);

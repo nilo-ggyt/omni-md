@@ -5,9 +5,9 @@
 
 use crate::structural_spine::StructuralSpineSnapshot;
 
-use crate::Options;
 #[cfg(test)]
 use crate::block_context::ContainerRole;
+use crate::Options;
 
 /// byte读取与转换均有独立硬上限；成员分类和UTF16计量也必须可恢复。
 pub const MAX_FRONTIER_STEP_BYTES: usize = 64 * 1024;
@@ -78,6 +78,8 @@ pub struct TableCheckpoint {
     spine: StructuralSpineSnapshot,
     scalars: TableScalars,
     options: Options,
+    header_inline: cell::TableInlineRow,
+    last_inline: Option<cell::TableInlineRow>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -106,6 +108,8 @@ pub struct TableContinuationState {
     last_work: TableWork,
     ended: Option<usize>,
     failed: bool,
+    header_inline: cell::TableInlineRow,
+    last_inline: Option<cell::TableInlineRow>,
 }
 
 impl std::fmt::Debug for TableContinuationState {
@@ -122,10 +126,13 @@ impl std::fmt::Debug for TableContinuationState {
     }
 }
 
+pub(crate) mod cell;
 mod end;
 mod row;
 mod scope;
+pub use crate::line_frontier::TableDelimiterScanner;
 pub use crate::table_scan::{TableCellBoundary, TableCellScanner};
+pub use cell::{TableCellSemanticScanner, VerifiedTableInlineRow};
 pub use end::VerifiedTableEnd;
 pub use row::TableWork;
 pub use scope::{TableScopeCursor, TableScopeKind, TableScopeStep};
@@ -148,6 +155,7 @@ impl TableContinuationState {
             next_utf16,
             next_source_line,
             options,
+            header_inline,
         ) = verified.into_parts();
         Self::resume(TableCheckpoint {
             spine,
@@ -166,6 +174,8 @@ impl TableContinuationState {
                 missing_cells: 0,
             },
             options,
+            header_inline,
+            last_inline: None,
         })
     }
 
@@ -195,6 +205,8 @@ impl TableContinuationState {
             last_work: TableWork::default(),
             ended: None,
             failed: false,
+            header_inline: checkpoint.header_inline,
+            last_inline: checkpoint.last_inline,
         }
     }
     pub fn checkpoint(&self) -> Option<TableCheckpoint> {
@@ -205,6 +217,8 @@ impl TableContinuationState {
             spine: self.spine.clone(),
             scalars: self.scalars,
             options: self.options,
+            header_inline: self.header_inline,
+            last_inline: self.last_inline,
         })
     }
     /// 新实现没有任何行源缓冲；纯metadata/固定游标容量由独立预算计量，不冒称整进程零内存。
@@ -306,6 +320,14 @@ impl TableContinuationState {
                     actual_cells: line.actual_cells,
                     missing_cells,
                 };
+                // 只保刚刚实际接受的这一行；源范围与原容器前缀不能由后继调用者的 Range 补造。
+                self.last_inline = Some(cell::TableInlineRow {
+                    ordinal: fact.row_ordinal,
+                    start: fact.byte_start,
+                    content_start: fact.byte_start + fact.container_prefix_bytes,
+                    content_end: line.content_end,
+                    end: fact.byte_end,
+                });
                 self.scalars.missing_cells += missing_cells;
                 self.scalars.next_row_ordinal += 1;
                 self.scalars.next_byte = line.end;

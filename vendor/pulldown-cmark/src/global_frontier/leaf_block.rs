@@ -6,11 +6,11 @@
 use std::ops::Range;
 
 use crate::{
-    HeadingLevel, MetadataBlockKind, Options,
     firstpass::leaf_line_facts::{FenceInfoBoundsScanner, HeadingBoundsScanner},
     line_frontier::LineFacts,
     scanners::is_ascii_whitespace_no_nl,
     structural_spine::StructuralSpineSnapshot,
+    HeadingLevel, MetadataBlockKind, Options,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,7 +86,7 @@ pub enum LeafBlockDetails {
     },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 /// 构造器与字段只属于真实 producer；调用者不能用任意 Range 或同 revision 文档造权限。
 /// 一个票据只保固定标量与原共享 scope 页，不保源、映射、行集合或 AST。
 pub struct VerifiedGlobalLeafBlock {
@@ -96,13 +96,24 @@ pub struct VerifiedGlobalLeafBlock {
     kind: LeafBlockKind,
     source_range: Range<usize>,
     physical_start: usize,
+    // 和原 opening 同次捕获；部分Tab列不能由最终marker字节坐标倒推。
+    pub(super) first_state_origin: usize,
+    pub(super) first_state: crate::line_start_stream::LineStartState,
     consumed_end: usize,
     close_reason: LeafBlockCloseReason,
     details: LeafBlockDetails,
-    spine: StructuralSpineSnapshot,
+    pub(super) spine: StructuralSpineSnapshot,
 }
 
 impl VerifiedGlobalLeafBlock {
+    /// 共享原物理行算法，但保Leaf真实种类、闭合末端与祖先capture；不构造Inline/Paragraph票。
+    pub fn line_origins(
+        &self,
+        limits: super::BlockOriginLimits,
+    ) -> Result<super::BlockOriginCursor, super::GlobalFrontierError> {
+        super::BlockOriginCursor::from_leaf(self, limits)
+    }
+
     /// 只扫描原 Root ATX 正文的一帧；返回候选事实，不授予最终 inline 或样式权限。
     /// 连续 next 与完整扫描由原 Core Leaf 续体维护，不能拿一帧成功代表整块 Plain。
     pub fn plain_heading_content_step(
@@ -127,8 +138,8 @@ impl VerifiedGlobalLeafBlock {
         else {
             return Err(Error::InvalidFrame); // 其他 Leaf 不借此入口改写自己的 inline 规则。
         };
-        if self.spine.len() != 0 || attributes.is_some() {
-            return Err(Error::InvalidFrame); // 本片不扩大容器或未启用的 heading attributes 合同。
+        if attributes.is_some() {
+            return Err(Error::InvalidFrame); // 属性仍须完整短块 Parser，不能当作普通字面正文忽略。
         }
         if !(2048..=crate::block_frontier::MAX_FRONTIER_STEP_BYTES).contains(&budget) {
             return Err(Error::InvalidBudget);
@@ -245,6 +256,8 @@ pub(super) struct PendingGlobalLeaf {
     kind: PendingLeafKind,
     start: usize,
     physical_start: usize,
+    first_state_origin: usize,
+    first_state: crate::line_start_stream::LineStartState,
     spine: StructuralSpineSnapshot,
     opening_end: usize,
     body_end: usize,
@@ -267,7 +280,7 @@ impl PendingGlobalLeaf {
         options: Options,
         kind: PendingLeafKind,
         start: usize,
-        physical_start: usize,
+        opening: (usize, usize, crate::line_start_stream::LineStartState),
         spine: StructuralSpineSnapshot,
     ) -> Self {
         let opening_end = match kind {
@@ -280,7 +293,9 @@ impl PendingGlobalLeaf {
             options,
             kind,
             start,
-            physical_start,
+            physical_start: opening.0,
+            first_state_origin: opening.1,
+            first_state: opening.2,
             spine,
             opening_end,
             body_end: opening_end,
@@ -531,6 +546,8 @@ impl PendingGlobalLeaf {
             kind,
             source_range: self.start..semantic_end,
             physical_start: self.physical_start,
+            first_state_origin: self.first_state_origin,
+            first_state: self.first_state,
             consumed_end,
             close_reason,
             details,

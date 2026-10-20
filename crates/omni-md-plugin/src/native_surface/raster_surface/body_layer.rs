@@ -12,7 +12,6 @@ pub(in crate::native_surface) struct NativeMarkdownRasterBodyLayerLease {
     previous_wants_layer: bool,
     previous_redraw: NSViewLayerContentsRedrawPolicy,
     counters: Arc<ResourceCounters>,
-    owner: std::rc::Weak<NativeMarkdownRasterSurface>,
     finished: Cell<bool>,
 }
 
@@ -41,7 +40,6 @@ impl NativeMarkdownRasterBodyLayerLease {
             previous_wants_layer,
             previous_redraw,
             counters: Arc::clone(counters),
-            owner: Rc::downgrade(owner),
             finished: Cell::new(false),
         };
         // 只在挂窗之前准备backing；updateLayer中不得创建几何或改变视图树。
@@ -79,10 +77,7 @@ impl NativeMarkdownRasterBodyLayerLease {
         let result = self.restore_once();
         if result.is_err() {
             self.counters.fail();
-            // restore_once 的 Native 临时 claim 与状态借用已归还，再通知原主线程 owner。
-            if let Some(owner) = self.owner.upgrade() {
-                owner.notify_failed_first_paint();
-            }
+            // 恢复失败仍进入共享真实收据；该租约不再保留仅用于旧首帧通知的 weak 回链。
         }
         result
     }

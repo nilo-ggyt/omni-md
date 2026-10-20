@@ -24,7 +24,18 @@ use crate::{
 const METADATA_UNITS: usize = 256;
 mod bidi_preparation;
 mod font_probe;
-pub use font_probe::MarkdownLineFontProbe;
+mod shaping_boundary;
+#[cfg(feature = "paged-shaping-frontier")]
+pub(crate) use shaping_boundary::CertifiedShapingEndpoint;
+pub(crate) use shaping_boundary::ResolvedBidiShapingSeam;
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-shaping-frontier"
+))]
+mod table_row;
+pub use font_probe::{
+    MarkdownLineFontProbe, MarkdownLineFontProbeSegmentAnswer, MarkdownLineFontProbeSegmentStep,
+};
 #[cfg(feature = "paged-shaping-frontier")]
 pub(super) mod closed_item;
 #[cfg(feature = "paged-shaping-frontier")]
@@ -48,8 +59,12 @@ pub enum MarkdownLineComposeError {
     InvalidRequest,
     #[error("组合器元数据覆盖不连续")]
     InconsistentCoverage,
+    #[error("查询位置位于尚未展开的隐藏范围 {0:?}")]
+    FoldedRange(Range<usize>),
     #[error("已发布输出尚未覆盖所查询的字素边界")]
     GraphemePrefixPending,
+    #[error("表格块内部的字素与命中由原格显示源提供")]
+    TableRange,
     #[error("本行必须按真实UBA视觉顺序继续组合多个字形片段")]
     NeedsBidiAssembly,
     #[error("组合器坐标或计数溢出")]
@@ -59,6 +74,14 @@ pub enum MarkdownLineComposeError {
     #[error("组合器已永久撤权")]
     Poisoned,
     #[cfg(feature = "paged-shaping-frontier")]
+    #[error("样式重排失败：{cause}；原字形资源归还{operation:?}失败，errno={errno}")]
+    StyleResetCleanup {
+        #[source]
+        cause: Box<MarkdownLineComposeError>,
+        operation: crate::MarkdownShapingIoOperation,
+        errno: i32,
+    },
+    #[cfg(feature = "paged-shaping-frontier")]
     #[error("已提交行的两份只读快照仍在使用，请先归还一份")]
     SnapshotBusy,
     #[error("实际字体注册表已失效或锁已失败")]
@@ -67,6 +90,12 @@ pub enum MarkdownLineComposeError {
     FontBudgetExceeded,
     #[error("原实际字体注册已经过期")]
     FontExpired,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    #[error("原相邻样式来源失效：{0:?}")]
+    RootLeafBoundary(Box<crate::markdown_document_buffer::MarkdownTableRequestError>),
     #[error("原冻结源读取失败")]
     Source(#[from] MarkdownDocumentBufferError),
     #[error("原UBA元数据失败")]
@@ -103,6 +132,10 @@ pub enum MarkdownLineInlineControlKind {
     LineSeparator,
     ParagraphSeparator,
     EmptyParagraph,
+    /// 原折叠隐区的整段控制；没有字形，端点仍属于原完整 Source。
+    FoldedSection,
+    /// 原结构行的独立块；内部正文只由真实格显示源布局。
+    TableRow,
 }
 #[derive(Clone)]
 pub struct MarkdownLineInlineControl {
@@ -163,6 +196,8 @@ impl Default for MarkdownLineComposeBudget {
 /// 平台响应样式和实际Font；方向、脚本及BOT/EOT由Core原事实确定，不接受响应伪造。
 #[derive(Clone, Debug)]
 pub struct MarkdownLineComposeStyle {
+    /// 原语义来源的绘制位随同一字体响应封存；不改写字形、源坐标或断行权限。
+    pub presentation: crate::MarkdownPresentationStyles,
     pub points: f32,
     pub language: Option<String>,
     pub features: Vec<MarkdownShapingFeature>,
@@ -174,11 +209,32 @@ pub struct MarkdownLineStyleRequest {
     nonce: Arc<()>,
     source: MarkdownLayoutTextAuthority,
     range: Range<usize>,
+    scope: StyleScope,
+    // 只有真实 UBA 自然分界可不为 GCB；不能从短 coverage 或源坐标自行构造。
+    shaping_seams: [Option<ResolvedBidiShapingSeam>; 2],
+    #[cfg(feature = "paged-shaping-frontier")]
+    continuation_font: Option<MarkdownLayoutFontAuthority>,
+    // 字体交接已经持原 GCB 两端票；保其真实字节范围供有限首 scalar 读取，不能再次远端定位。
+    #[cfg(feature = "paged-shaping-frontier")]
+    continuation_bytes: Option<Range<usize>>,
+}
+
+/// 普通文字的真实 Unicode 事实与已认证结构行互斥；表格握手不持伪造脚本、级别或段落。
+#[derive(Clone)]
+enum StyleScope {
+    Text(TextStyleScope),
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    Table(crate::markdown_layout_source::table_rows::TableSpan),
+}
+
+#[derive(Clone)]
+struct TextStyleScope {
     paragraph: Range<usize>,
     script: [u8; 4],
     level: u8,
-    #[cfg(feature = "paged-shaping-frontier")]
-    continuation_font: Option<MarkdownLayoutFontAuthority>,
 }
 impl MarkdownLineStyleRequest {
     pub fn source(&self) -> &MarkdownLayoutTextAuthority {
@@ -187,16 +243,36 @@ impl MarkdownLineStyleRequest {
     pub fn source_range(&self) -> Range<usize> {
         self.range.clone()
     }
+    /// 仅文字作用域持原 Unicode 段落；结构行必须先交回真实行票，误用按调用契约 panic。
     pub fn paragraph_range(&self) -> Range<usize> {
-        self.paragraph.clone()
+        self.text_scope()
+            .expect("结构表格请求没有文字段落权限")
+            .paragraph
+            .clone()
     }
+    /// 只返回实际 Script 分析值；表格结构握手没有可借用的脚本，误用按调用契约 panic。
     pub fn script(&self) -> [u8; 4] {
-        self.script
+        self.text_scope().expect("结构表格请求没有脚本权限").script
     }
+    /// 只返回原 UBA 级别；结构行不经过文字 UBA，误用按调用契约 panic。
     pub fn level(&self) -> u8 {
-        self.level
+        self.text_scope()
+            .expect("结构表格请求没有 UBA 级别权限")
+            .level
     }
-    /// 字体交接的每个真实GCB必须先试原Font；普通样式请求不指定续算字体。
+    /// 字体/整形入口必须先取得真实 Text 作用域；结构请求只能交回原行票，不能降为文字。
+    fn text_scope(&self) -> Result<&TextStyleScope> {
+        match &self.scope {
+            StyleScope::Text(text) => Ok(text),
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            StyleScope::Table(_) => Err(MarkdownLineComposeError::TableRange),
+        }
+    }
+    /// 字体交接保留原item的Font上下文身份；普通样式请求没有续算身份。
+    /// 这不是平台字体优先策略：完整GCB仍按真实语义base选择，不能让旧fallback吞掉已可回base的字符。
     #[cfg(feature = "paged-shaping-frontier")]
     pub fn continuation_font(&self) -> Option<&MarkdownLayoutFontAuthority> {
         self.continuation_font.as_ref()
@@ -208,6 +284,7 @@ impl MarkdownLineStyleRequest {
         font: MarkdownLayoutFont,
         style: MarkdownLineComposeStyle,
     ) -> Result<MarkdownLineStyleResponse> {
+        self.text_scope()?; // 没有 Unicode/Font 权限的结构请求不得产生普通字体响应。
         if coverage.start != self.range.start
             || coverage.end <= coverage.start
             || coverage.end > self.range.end
@@ -220,6 +297,14 @@ impl MarkdownLineStyleRequest {
             font,
             style,
             registration: None,
+            #[cfg(feature = "paged-shaping-frontier")]
+            preferred_registration: None,
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            root_leaf_boundary: None,
+            paragraph_inset_26_6: 0,
         })
     }
 
@@ -243,6 +328,76 @@ pub struct MarkdownLineStyleResponse {
     font: MarkdownLayoutFont,
     style: MarkdownLineComposeStyle,
     registration: Option<MarkdownLineFontRegistration>,
+    #[cfg(feature = "paged-shaping-frontier")]
+    preferred_registration: Option<MarkdownLineFontRegistration>,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    root_leaf_boundary: Option<crate::VerifiedMarkdownRootLeafStyleBoundary>,
+    pub(super) paragraph_inset_26_6: i32,
+}
+
+impl MarkdownLineStyleResponse {
+    /// 只附同一个真实请求签出的相邻语义票；短coverage本身没有闭项权。
+    /// 后继仍须按原预算取得右侧完整GCB，并实测另一Font，颜色变化不能强行断开连字。
+    ///
+    /// # Errors
+    /// 异源或另一次请求即使坐标相同也拒绝；票的左样式和本响应必须精确一致。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub fn with_root_leaf_style_boundary(
+        mut self,
+        boundary: crate::VerifiedMarkdownRootLeafStyleBoundary,
+    ) -> Result<Self> {
+        if !Arc::ptr_eq(&self.request.nonce, &boundary.request().nonce)
+            || self.request.source != *boundary.source()
+        {
+            return Err(MarkdownLineComposeError::SourceMismatch);
+        }
+        if self.coverage.end != boundary.left().utf16_range.end
+            || self.coverage.start < boundary.left().utf16_range.start
+            || self.style.presentation != boundary.left().styles
+        {
+            return Err(MarkdownLineComposeError::InvalidRequest);
+        }
+        self.root_leaf_boundary = Some(boundary);
+        Ok(self)
+    }
+
+    /// 原平台语义base随同本次nonce封存；这是字体选择的真实优先身份，不是范围或闭项许可。
+    /// 选中fallback后，后继完整GCB仍须重新实际试base，不能凭fallback也覆盖空格而吞掉优先字体。
+    ///
+    /// # Errors
+    /// 原注册已过期或绑定字号与本样式不一致时拒绝，不按同名字体重新注册替代权限。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub fn with_preferred_registered_font(
+        mut self,
+        preferred: &MarkdownLineRegisteredFont,
+    ) -> Result<Self> {
+        let registration = preferred.registration();
+        let actual = registration.lease()?;
+        if actual
+            .font()
+            .shaping_point_size()
+            .is_some_and(|points| (points as f32).to_bits() != self.style.points.to_bits())
+        {
+            return Err(MarkdownLineComposeError::InvalidRequest);
+        }
+        self.preferred_registration = Some(registration);
+        Ok(self)
+    }
+
+    /// 左右段落缩进随原 nonce 响应封存；字面调用不设置该值，保持原零缩进行为。
+    pub fn with_paragraph_inset(mut self, inset_26_6: i32) -> Result<Self> {
+        if inset_26_6 < 0 {
+            return Err(MarkdownLineComposeError::InvalidRequest);
+        } // 负可用宽度不能等到绘图时裁掉；实际行宽在原测量入口继续核验。
+        self.paragraph_inset_26_6 = inset_26_6;
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -267,8 +422,16 @@ pub struct MarkdownLineItem {
     // 只保上游已校验的小样式，不保正文；历史字形遇到真正unsafe边界时须用原选项重形。
     pub(super) replay_style: MarkdownLineComposeStyle,
     facts: MarkdownLineItemFacts,
+    shaping_seams: [Option<ResolvedBidiShapingSeam>; 2],
 }
 impl MarkdownLineItem {
+    /// Store 只借原分项签出的两张 scalar shaping seam；None 仍须核真实 GCB。
+    /// 这两端不授予 LineEnd/caret；下游不得将视觉 part 的边缘冒充编辑边界。
+    pub(in crate::markdown_line_composer) fn shaping_seams(
+        &self,
+    ) -> &[Option<ResolvedBidiShapingSeam>; 2] {
+        &self.shaping_seams
+    }
     pub fn facts(&self) -> &MarkdownLineItemFacts {
         &self.facts
     }
@@ -315,6 +478,16 @@ enum Stage {
     ItemStart,
     ItemScan,
     Style,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    TableDirectory,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    TableRow,
     #[cfg(feature = "paged-shaping-frontier")]
     StyleEndpoint,
     Input,
@@ -336,21 +509,38 @@ struct Scan {
     paragraph: Range<usize>,
     script: [u8; 4],
     level: u8,
+    shaping_seams: [Option<ResolvedBidiShapingSeam>; 2],
+    last_bidi_unit: Option<crate::markdown_bidi::MarkdownBidiShapingUnit>,
     #[cfg(feature = "paged-shaping-frontier")]
     verified_endpoints: usize,
     #[cfg(feature = "paged-shaping-frontier")]
-    endpoint_proofs: [Option<crate::markdown_layout_breaks::MarkdownCertifiedGraphemeEndpoint>; 2],
+    endpoint_proofs: [Option<CertifiedShapingEndpoint>; 2],
 }
 struct Payload {
     source: MarkdownLayoutTextSource,
+    folds: super::folds::Plan,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    tables: Option<crate::markdown_layout_source::table_rows::TablePlanWriter>,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    table_checked_at: Option<usize>,
     bidi: Option<MarkdownBidiParagraph>,
     bidi_preparation: Option<MarkdownBidiPrepareJob>,
+    #[cfg(feature = "paged-shaping-frontier")]
+    bidi_visible_preparation: crate::markdown_bidi::MarkdownBidiVisiblePreparation,
     scripts: MarkdownScriptJob,
     breaks: MarkdownLayoutBreakJob,
     scripts_ready: bool,
     breaks_ready: bool,
     script_first: bool,
     cursor: usize,
+    // 上一原 item 真消费完的右 seam 才能授权下一分项的相同起点；不凭裸 cursor 复建。
+    next_shaping_seam: Option<ResolvedBidiShapingSeam>,
     scan: Option<Scan>,
     request: Option<MarkdownLineStyleRequest>,
     // 内部缩短coverage的响应只有一份；等待实际metadata量子时不持Native借用或新正文。
@@ -412,14 +602,28 @@ impl MarkdownLineItemCoordinator {
         Ok(Self {
             payload: Some(Payload {
                 source,
+                folds: super::folds::Plan::default(),
+                #[cfg(all(
+                    feature = "s2-table-window-prototype",
+                    feature = "paged-shaping-frontier"
+                ))]
+                tables: None,
+                #[cfg(all(
+                    feature = "s2-table-window-prototype",
+                    feature = "paged-shaping-frontier"
+                ))]
+                table_checked_at: None,
                 bidi: None,
                 bidi_preparation: None,
+                #[cfg(feature = "paged-shaping-frontier")]
+                bidi_visible_preparation: Default::default(),
                 scripts,
                 breaks,
                 scripts_ready: false,
                 breaks_ready: false,
                 script_first: true,
                 cursor: 0,
+                next_shaping_seam: None,
                 scan: None,
                 request: None,
                 #[cfg(feature = "paged-shaping-frontier")]
@@ -457,6 +661,99 @@ impl MarkdownLineItemCoordinator {
 
     pub(super) fn resource_scope(&self) -> super::worker_resources::ComposerResourceScope {
         self.resources.clone()
+    }
+
+    /// 原词组/删除共享此有限 proof，不能把可见序列的相邻端点当作完整原 GCB 读取隐区。
+    pub(in crate::markdown_line_composer) fn fold_plan(
+        &self,
+    ) -> Option<crate::markdown_layout_source::folds::FoldPlan> {
+        self.payload
+            .as_ref()
+            .and_then(|payload| payload.folds.shared())
+    }
+
+    /// 折叠是构造期的显示意图；开始消费原 Source 后不能改写尚在用的控制范围。
+    pub(super) fn install_folded_ranges(&mut self, ranges: &[Range<usize>]) -> Result<()> {
+        let result = (|| {
+            self.guard()?;
+            let payload = self
+                .payload
+                .as_mut()
+                .ok_or(MarkdownLineComposeError::Poisoned)?;
+            if !matches!(payload.stage, Stage::Bidi) || payload.cursor != 0 {
+                return Err(MarkdownLineComposeError::InvalidRequest);
+            }
+            let plan = super::folds::Plan::new(&payload.source, ranges)?;
+            if let Some(shared) = plan.shared() {
+                payload.scripts.install_fold_plan(shared.clone())?;
+                payload.breaks.install_fold_plan(shared)?;
+            }
+            payload.folds = plan;
+            Ok(())
+        })();
+        self.finish(result)
+    }
+
+    /// 同一冻结源的显隐选择变化只撤销样式项；保留已收费的UBA、Script和GCB/LB索引。
+    /// 旧Font试次须由Native先取消并归还，此处撤销nonce后不能再接受旧响应。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(super) fn reset_styles(&mut self) -> Result<()> {
+        let result = (|| {
+            self.guard()?;
+            let payload = self
+                .payload
+                .as_mut()
+                .ok_or(MarkdownLineComposeError::Poisoned)?;
+            // 原样式的实际整形owner先退出；Source及语言索引保持同一allocation，不重新扫描原mmap。
+            payload.font_probe_scope = None;
+            payload.request = None;
+            payload.pending_style = None;
+            payload.item = None;
+            payload.closed_input = None;
+            payload.closed_fonts = None;
+            payload.frontier = None;
+            payload.scan = None;
+            payload.control = None;
+            payload.open_probe = None;
+            payload.closed_script_at = None;
+            payload.open_script = false;
+            payload.script_source_demand = false;
+            payload.cursor = 0;
+            payload.next_shaping_seam = None;
+            payload.stage = Stage::Bidi; // 已有Bidi直接复用；尚未完成的原准备续体沿原量子继续。
+
+            // 新glyph writer有独立释放收据；复用依赖的实际observer，不能把旧writer登记覆盖成“已释放”。
+            let resources = super::worker_resources::ComposerResourceScope::new(&payload.source);
+            resources.register_dependencies(
+                payload.scripts.resource_observer(),
+                payload.breaks.resource_observer(),
+            );
+            #[cfg(feature = "s2-table-window-prototype")]
+            if let Some(tables) = &mut payload.tables {
+                tables.rewind();
+                payload.table_checked_at = None;
+                resources.register_table_directory(tables.plan().resource_observer());
+            }
+            if let Some(bidi) = &payload.bidi {
+                resources.register_bidi(bidi.resource_observer());
+            } else if let Some(preparation) = &payload.bidi_preparation {
+                resources.register_bidi(preparation.resource_observer());
+            } // 尚未创建UBA时不制造observer，真正创建仍由原bidi_preparation登记。
+            payload.resources = resources.clone();
+            self.resources = resources;
+            Ok(())
+        })();
+        self.finish(result)
+    }
+
+    #[cfg(all(test, feature = "paged-shaping-frontier"))]
+    /// 实际语言索引的累计源读取只用于重排回归；getter自身不推进任何Job。
+    pub(super) fn style_dependency_source_reads(&mut self) -> (usize, usize) {
+        let payload = self.payload.as_mut().expect("原索引仍由Coordinator持有");
+        (
+            payload.scripts.storage_profile().source_bytes_read,
+            payload.breaks.line_source_bytes_read_for_test(),
+        )
     }
 
     fn guard(&self) -> Result<()> {
@@ -508,12 +805,12 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
-    /// 词组移动只推进原全源Bidi准备；不顺带推进Script/GCB或再花一份量子。
+    /// 词组移动只推进原 Bidi 准备；整源证书和逐可见段职责明确区分，不顺带推进 GCB。
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn prepare_word_move(
         &mut self,
         budget: MarkdownLineComposeBudget,
-    ) -> Result<(MarkdownLineItemStep, Option<bool>)> {
+    ) -> Result<(MarkdownLineItemStep, Option<super::MarkdownWordMoveScope>)> {
         let result = (|| {
             self.guard()?;
             let mut step = MarkdownLineItemStep {
@@ -538,14 +835,138 @@ impl MarkdownLineItemCoordinator {
                     &mut step,
                 )?;
             } // 已发布的原Paragraph直接借其事实，不为每个按键重复扫描或另建分析器。
-            let proved = payload
-                .bidi
-                .as_ref()
-                .map(|bidi| bidi.whole_source_uniform_zero(&self.authority))
-                .transpose()?;
+            let proved = self.word_move_scope()?;
             Ok((step, proved))
         })();
-        self.finish(result) // false是能力事实；只有真实Source/取消/I/O失败才沿原关闭边退休。
+        self.finish(result) // 能力结果不是样式或位置；只有真实 Source/取消/I/O 失败才沿原关闭边退休。
+    }
+
+    /// 已准备表示决定后续真实消费者；Visible 只允许逐 GCB 求原完整 B 段的真实零级顺序。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(in crate::markdown_line_composer) fn word_move_scope(
+        &self,
+    ) -> Result<Option<super::MarkdownWordMoveScope>> {
+        self.guard()?;
+        let Some(bidi) = self
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.bidi.as_ref())
+        else {
+            return Ok(None);
+        };
+        let scope = if bidi.whole_source_uniform_zero(&self.authority)? {
+            super::MarkdownWordMoveScope::WholeUniformZero
+        } else if bidi.uses_visible_paragraph_scopes(&self.authority)? {
+            super::MarkdownWordMoveScope::VisibleParagraphScopes
+        } else {
+            super::MarkdownWordMoveScope::Unsupported
+        };
+        Ok(Some(scope))
+    }
+
+    /// 同一 Item 的原在途 owner 准备实际 GCB 所属完整 B 段；任何工作都结束本回合，不再兼花分类量子。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(in crate::markdown_line_composer) fn prepare_word_cluster(
+        &mut self,
+        range: Range<usize>,
+        budget: MarkdownLineComposeBudget,
+    ) -> Result<(MarkdownLineItemStep, Option<(bool, usize)>)> {
+        let result = (|| {
+            self.guard()?;
+            let payload = self
+                .payload
+                .as_mut()
+                .ok_or(MarkdownLineComposeError::Poisoned)?;
+            let bidi = payload
+                .bidi
+                .as_mut()
+                .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
+            let progress = bidi.prepare_layout_paragraph_range(
+                &self.authority,
+                range.start,
+                MarkdownBidiPrepareBudget {
+                    bytes: budget.bytes,
+                    scalars: budget.scalars,
+                    metadata_ops: budget.metadata_units,
+                },
+                &mut payload.bidi_visible_preparation,
+            )?;
+            let mut step = MarkdownLineItemStep {
+                bytes: progress.bytes,
+                context_bytes: 0,
+                scalars: progress.scalars,
+                records: 0,
+                metadata_units: progress.metadata,
+                shapes: 0,
+                answer: MarkdownLineItemAnswer::Yielded,
+            };
+            if !progress.ready || step.bytes != 0 || step.scalars != 0 || step.metadata_units != 0 {
+                return Ok((step, None));
+            } // 刚完成的真实段在下一回合借证书；原 4KiB 量子不会被两种角色重复使用。
+            let (proof, through) = bidi.prepare_word_order(
+                &self.authority,
+                range,
+                budget.records.min(budget.metadata_units),
+            )?;
+            step.records = proof.records;
+            step.metadata_units = proof.metadata_units;
+            Ok((step, proof.permitted.map(|permitted| (permitted, through))))
+        })();
+        self.finish(result)
+    }
+
+    /// 原布局游标仍在暂停中的真实 Item 起点；Word 只保存该标量，不保额外 B 段或 Source。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(in crate::markdown_line_composer) fn word_layout_position(&self) -> Result<usize> {
+        self.guard()?;
+        Ok(self
+            .payload
+            .as_ref()
+            .ok_or(MarkdownLineComposeError::Poisoned)?
+            .cursor)
+    }
+
+    /// Word 可能换走两槽中的旧 B 段；发布终点前在同一在途 owner 中恢复原布局段，避免 Style/Scan 借失效段。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(in crate::markdown_line_composer) fn restore_word_layout_context(
+        &mut self,
+        position: usize,
+        budget: MarkdownLineComposeBudget,
+    ) -> Result<(MarkdownLineItemStep, bool)> {
+        let result = (|| {
+            self.guard()?;
+            let payload = self
+                .payload
+                .as_mut()
+                .ok_or(MarkdownLineComposeError::Poisoned)?;
+            let progress = payload
+                .bidi
+                .as_mut()
+                .ok_or(MarkdownLineComposeError::InconsistentCoverage)?
+                .prepare_layout_paragraph_range(
+                    &self.authority,
+                    position,
+                    MarkdownBidiPrepareBudget {
+                        bytes: budget.bytes,
+                        scalars: budget.scalars,
+                        metadata_ops: budget.metadata_units,
+                    },
+                    &mut payload.bidi_visible_preparation,
+                )?;
+            Ok((
+                MarkdownLineItemStep {
+                    bytes: progress.bytes,
+                    context_bytes: 0,
+                    scalars: progress.scalars,
+                    records: 0,
+                    metadata_units: progress.metadata,
+                    shapes: 0,
+                    answer: MarkdownLineItemAnswer::Yielded,
+                },
+                progress.ready,
+            ))
+        })();
+        self.finish(result)
     }
 
     fn advance(&mut self, budget: MarkdownLineComposeBudget) -> Result<MarkdownLineItemStep> {
@@ -602,7 +1023,24 @@ impl MarkdownLineItemCoordinator {
             .payload
             .as_mut()
             .ok_or(MarkdownLineComposeError::Poisoned)?;
+        #[cfg(all(
+            feature = "s2-table-window-prototype",
+            feature = "paged-shaping-frontier"
+        ))]
+        if matches!(payload.stage, Stage::Bidi | Stage::ItemStart)
+            && table_row::known_row_request(payload, &self.authority, &mut step)?
+        {
+            return Ok(step); // 真实目录访问独占此量子，表格行首先交语义来源，不能先进入 Body UBA。
+        }
         match payload.stage {
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            Stage::TableDirectory | Stage::TableRow => {
+                return Err(MarkdownLineComposeError::InvalidRequest);
+            }
+
             Stage::Bidi => {
                 #[cfg(feature = "paged-shaping-frontier")]
                 if payload.bidi.is_some() {
@@ -697,7 +1135,17 @@ impl MarkdownLineItemCoordinator {
                 {
                     return Ok(step); // 跨段先结束真实叶/目录查询，Ready同样不在这一量子再推进分项。
                 }
-                if payload.cursor == payload.source.utf16_len() {
+                if let Some(range) = payload.folds.at(payload.cursor) {
+                    // 隐藏行只交原控制 nonce，不进入 Script/Font/HarfBuzz；原源索引仍分步推进。
+                    let control = MarkdownLineInlineControl::new(
+                        self.authority.clone(),
+                        range,
+                        MarkdownLineInlineControlKind::FoldedSection,
+                    );
+                    payload.control = Some(control.clone());
+                    payload.stage = Stage::Control;
+                    step.answer = MarkdownLineItemAnswer::NeedsControl(control);
+                } else if payload.cursor == payload.source.utf16_len() {
                     // 这里只报告分项输入的真实EOF。末尾空视觉行仍由后继行组合器按实际分隔符处理。
                     payload.stage = Stage::End;
                     step.answer = MarkdownLineItemAnswer::EndOfSource;
@@ -742,6 +1190,8 @@ impl MarkdownLineItemCoordinator {
                         .as_mut()
                         .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
                     bidi.require_layout_source(&self.authority)?;
+                    let first_bidi_unit =
+                        bidi.shaping_unit_at_utf16(&self.authority, payload.cursor)?;
                     #[cfg(feature = "paged-shaping-frontier")]
                     let (paragraph, level) = {
                         let end = payload
@@ -760,7 +1210,10 @@ impl MarkdownLineItemCoordinator {
                             (
                                 bidi.paragraph_range_at_utf16(payload.cursor)?
                                     .ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
-                                bidi.level_at_utf16(payload.cursor)?,
+                                match &first_bidi_unit {
+                                    Some(unit) => unit.level,
+                                    None => bidi.level_at_utf16(payload.cursor)?,
+                                },
                             )
                         }
                     };
@@ -768,7 +1221,10 @@ impl MarkdownLineItemCoordinator {
                     let (paragraph, level) = (
                         bidi.paragraph_range_at_utf16(payload.cursor)?
                             .ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
-                        bidi.level_at_utf16(payload.cursor)?,
+                        match &first_bidi_unit {
+                            Some(unit) => unit.level,
+                            None => bidi.level_at_utf16(payload.cursor)?,
+                        },
                     );
                     payload.scan = Some(Scan {
                         start: payload.cursor,
@@ -780,6 +1236,8 @@ impl MarkdownLineItemCoordinator {
                         paragraph,
                         script: script.script.iso15924_tag(),
                         level,
+                        shaping_seams: [payload.next_shaping_seam.clone(), None],
+                        last_bidi_unit: first_bidi_unit,
                         #[cfg(feature = "paged-shaping-frontier")]
                         verified_endpoints: 0,
                         #[cfg(feature = "paged-shaping-frontier")]
@@ -800,7 +1258,7 @@ impl MarkdownLineItemCoordinator {
                     .bidi
                     .as_mut()
                     .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
-                let mut complete = scan.next == scan.limit;
+                let mut complete = scan.next == scan.limit || scan.shaping_seams[1].is_some();
                 #[cfg(feature = "paged-shaping-frontier")]
                 if !complete
                     && let Some(span) =
@@ -842,10 +1300,29 @@ impl MarkdownLineItemCoordinator {
                         complete = true; // 控制之前的真实GCB封闭字形项；控制本身留给原下一阶段。
                         break;
                     }
-                    if bidi.level_at_utf16(scan.next)? != scan.level {
+                    let unit = bidi.shaping_unit_at_utf16(&self.authority, scan.next)?;
+                    let level = match &unit {
+                        Some(unit) => unit.level,
+                        None => bidi.level_at_utf16(scan.next)?,
+                    };
+                    if level != scan.level {
+                        let left = scan
+                            .last_bidi_unit
+                            .as_ref()
+                            .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
+                        let right = unit
+                            .as_ref()
+                            .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
+                        scan.shaping_seams[1] = Some(ResolvedBidiShapingSeam::from_adjacent_units(
+                            &self.authority,
+                            left,
+                            right,
+                        )?);
+                        step.metadata_units += 1; // 真正读到不同 level 的那条记录同样收费，不能藏在结束分支。
                         complete = true;
                         break;
                     }
+                    scan.last_bidi_unit = unit;
                     scan.next = scan
                         .next
                         .checked_add(1)
@@ -858,6 +1335,17 @@ impl MarkdownLineItemCoordinator {
                         return Err(MarkdownLineComposeError::InconsistentCoverage);
                     }
                     for (ordinal, endpoint) in [scan.start, scan.next].into_iter().enumerate() {
+                        let seam = scan.shaping_seams[ordinal].clone();
+                        if let Some(seam) = &seam {
+                            let (_, actual) = seam.boundary(&self.authority)?;
+                            let (left, right) = seam.levels();
+                            if actual != endpoint
+                                || (ordinal == 0 && right != scan.level)
+                                || (ordinal == 1 && left != scan.level)
+                            {
+                                return Err(MarkdownLineComposeError::InconsistentCoverage);
+                            }
+                        } // 只借原扫描确实读到的不同 level；script/样式/预算上界不能补签。
                         #[cfg(feature = "paged-shaping-frontier")]
                         {
                             if payload.frontier_enabled {
@@ -889,23 +1377,44 @@ impl MarkdownLineItemCoordinator {
                                 #[cfg(feature = "paged-shaping-frontier")]
                                 {
                                     scan.verified_endpoints += 1;
-                                    scan.endpoint_proofs[ordinal] = proof;
+                                    scan.endpoint_proofs[ordinal] =
+                                        Some(CertifiedShapingEndpoint::Grapheme {
+                                            proof: proof.ok_or(
+                                                MarkdownLineComposeError::InconsistentCoverage,
+                                            )?,
+                                            seam,
+                                        });
+                                }
+                            }
+                            MarkdownGraphemeAnswer::Known(None) if seam.is_some() => {
+                                #[cfg(feature = "paged-shaping-frontier")]
+                                {
+                                    scan.verified_endpoints += 1;
+                                    scan.endpoint_proofs[ordinal] =
+                                        Some(CertifiedShapingEndpoint::Bidi(
+                                            seam.expect("分支已核原实际 seam"),
+                                        ));
                                 }
                             }
                             #[cfg(feature = "paged-shaping-frontier")]
                             MarkdownGraphemeAnswer::Pending => return Ok(step),
                             _ => return Err(MarkdownLineComposeError::InconsistentCoverage),
                         }
-                    } // 不能把UBA/script/style的内部边界升级成可切开的字素端点。
+                    } // 非 GCB 只用于本地 shaping 分项，GCB 目录、caret 和软行机会保持原事实。
                     payload.request = Some(MarkdownLineStyleRequest {
                         nonce: Arc::new(()),
                         source: self.authority.clone(),
                         range: scan.start..scan.next,
-                        paragraph: scan.paragraph.clone(),
-                        script: scan.script,
-                        level: scan.level,
+                        scope: StyleScope::Text(TextStyleScope {
+                            paragraph: scan.paragraph.clone(),
+                            script: scan.script,
+                            level: scan.level,
+                        }),
+                        shaping_seams: scan.shaping_seams.clone(),
                         #[cfg(feature = "paged-shaping-frontier")]
                         continuation_font: None,
+                        #[cfg(feature = "paged-shaping-frontier")]
+                        continuation_bytes: None,
                     });
                     payload.font_probe_scope = Some(Arc::new(()));
                     payload.stage = Stage::Style;
@@ -953,7 +1462,11 @@ impl MarkdownLineItemCoordinator {
                             &self.authority,
                             &self.cancellation,
                             response,
-                            StyleCoordinates { endpoint },
+                            StyleCoordinates {
+                                endpoint: endpoint.map(|proof| {
+                                    CertifiedShapingEndpoint::Grapheme { proof, seam: None }
+                                }),
+                            },
                         )?;
                     }
                     _ => return Err(MarkdownLineComposeError::InvalidRequest),
@@ -999,6 +1512,7 @@ impl MarkdownLineItemCoordinator {
                         registration: pending.registration,
                         replay_style: pending.replay_style,
                         facts: pending.facts,
+                        shaping_seams: pending.shaping_seams,
                     });
                     payload.stage = Stage::Input;
                 } // 固定上下文全部准备好才装配唯一Job；下一回合才输入中心正文，预算不复用。
@@ -1247,6 +1761,7 @@ impl MarkdownLineItemCoordinator {
             closed_item::lend_font_item(payload, &item)?;
             // 新Font段登记的是这一个真实Ready child；原Frontier在其实际归还前不能越过它。
             payload.cursor = item.facts.source_utf16.end;
+            payload.next_shaping_seam = item.shaping_seams[1].clone();
             #[cfg(feature = "paged-shaping-frontier")]
             if payload.closed_fonts.is_some() {
                 payload.stage = Stage::ClosedFonts;
@@ -1269,14 +1784,14 @@ impl MarkdownLineItemCoordinator {
 #[derive(Default)]
 struct StyleCoordinates {
     #[cfg(feature = "paged-shaping-frontier")]
-    endpoint: Option<crate::markdown_layout_breaks::MarkdownCertifiedGraphemeEndpoint>,
+    endpoint: Option<CertifiedShapingEndpoint>,
 }
 
 fn install_style(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
     cancellation: &MarkdownLineComposeCancellation,
-    response: MarkdownLineStyleResponse,
+    mut response: MarkdownLineStyleResponse,
     coordinates: StyleCoordinates,
 ) -> Result<()> {
     #[cfg(not(feature = "paged-shaping-frontier"))]
@@ -1295,8 +1810,17 @@ fn install_style(
         // 相同字节、相同坐标、旧请求重放都不能替代实际仍待响应的唯一nonce。
         return Err(MarkdownLineComposeError::SourceMismatch);
     }
+    let text = request.text_scope()?; // 真实样式安装只消费已分析文字，不能为结构行补造 Unicode 事实。
+    let mut shaping_seams = request.shaping_seams.clone();
+    if response.coverage.end != request.range.end {
+        shaping_seams[1] = None; // 真实缩短样式段不能继承尚未到达的右 UBA seam。
+    }
     #[cfg(feature = "paged-shaping-frontier")]
     if request.continuation_font.is_some() {
+        #[cfg(feature = "s2-table-window-prototype")]
+        if frontier::has_style_boundary_probe(payload) {
+            return frontier::provide_boundary_style(payload, authority, cancellation, response);
+        }
         // 两条路径都只发已取得原GCB端点的试次；不能让闭项响应误落到另一个Frontier owner。
         if payload.closed_fonts.is_some() {
             return closed_item::provide_font_style(payload, authority, response);
@@ -1317,7 +1841,25 @@ fn install_style(
             MarkdownGraphemeAnswer::Known(Some(boundary))
                 if boundary.utf16 == response.coverage.end =>
             {
-                endpoint.ok_or(MarkdownLineComposeError::InconsistentCoverage)?
+                CertifiedShapingEndpoint::Grapheme {
+                    proof: endpoint.ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
+                    seam: if response.coverage.end == request.range.end {
+                        request.shaping_seams[1].clone()
+                    } else {
+                        None
+                    },
+                }
+            }
+            MarkdownGraphemeAnswer::Known(None) if response.coverage.end == request.range.end => {
+                let seam = request.shaping_seams[1]
+                    .clone()
+                    .ok_or(MarkdownLineComposeError::InvalidRequest)?;
+                if seam.boundary(authority)?.1 != response.coverage.end
+                    || seam.levels().0 != text.level
+                {
+                    return Err(MarkdownLineComposeError::SourceMismatch);
+                }
+                CertifiedShapingEndpoint::Bidi(seam)
             }
             _ => return Err(MarkdownLineComposeError::InvalidRequest),
         }
@@ -1330,9 +1872,16 @@ fn install_style(
     )? {
         MarkdownGraphemeAnswer::Known(Some(boundary))
             if boundary.utf16 == response.coverage.end => {}
+        MarkdownGraphemeAnswer::Known(None)
+            if response.coverage.end == request.range.end
+                && request.shaping_seams[1].as_ref().is_some_and(|seam| {
+                    seam.boundary(authority)
+                        .is_ok_and(|(_, at)| at == response.coverage.end)
+                        && seam.levels().0 == text.level
+                }) => {}
         _ => return Err(MarkdownLineComposeError::InvalidRequest),
     }
-    let direction = if request.level & 1 == 0 {
+    let direction = if text.level & 1 == 0 {
         MarkdownShapingDirection::LeftToRight
     } else {
         MarkdownShapingDirection::RightToLeft
@@ -1353,13 +1902,13 @@ fn install_style(
     // 平台只提供实际Font与有限样式；段落、脚本、方向和BOT/EOT由原分析事实封闭决定。
     let facts = MarkdownLineItemFacts {
         source_utf16: response.coverage.clone(),
-        paragraph_utf16: request.paragraph.clone(),
-        script: request.script,
-        level: request.level,
+        paragraph_utf16: text.paragraph.clone(),
+        script: text.script,
+        level: text.level,
         direction,
         points: response.style.points,
-        beginning_of_text: response.coverage.start == request.paragraph.start,
-        end_of_text: response.coverage.end == request.paragraph.end,
+        beginning_of_text: response.coverage.start == text.paragraph.start,
+        end_of_text: response.coverage.end == text.paragraph.end,
     };
     let font = response.font.authority();
     // 先显式核固定小预算，才复制重形所需样式；非法大Vec不能为错误响应再分配一份。
@@ -1387,11 +1936,11 @@ fn install_style(
     let options = MarkdownShapingOptions {
         direction,
         script: facts.script,
-        language: response.style.language,
+        language: response.style.language.take(),
         points: facts.points,
         beginning_of_text: facts.beginning_of_text,
         end_of_text: facts.end_of_text,
-        features: response.style.features,
+        features: std::mem::take(&mut response.style.features),
     };
     #[cfg(feature = "paged-shaping-frontier")]
     let end_proof = match admission {
@@ -1404,7 +1953,8 @@ fn install_style(
                 response.registration.clone(),
                 replay_style.clone(),
                 facts.clone(),
-            );
+                response.preferred_registration.clone(),
+            )?;
             let shaping = crate::markdown_shaping::PendingClosedShaping::new(
                 payload.source.clone(),
                 authority,
@@ -1419,6 +1969,7 @@ fn install_style(
                 registration: response.registration,
                 replay_style,
                 facts,
+                shaping_seams: shaping_seams.clone(),
             });
             payload.closed_fonts = Some(fonts);
             payload.request.take();
@@ -1432,7 +1983,6 @@ fn install_style(
     #[cfg(feature = "paged-shaping-frontier")]
     if payload.frontier_enabled {
         // 原完整响应先建能力owner，尚未认证的tail不创建glyph输入或伪造部分item。
-        let original_font = response.font.clone(); // 仅随原Frontier生命周期保实际Font，不按名字重建。
         let resource_registration = payload.resources.begin_frontier_audit();
         let scan = payload
             .scan
@@ -1453,10 +2003,10 @@ fn install_style(
             crate::markdown_shaping::frontier::MarkdownShapingFrontierJob::new_with_scope(
                 payload.source.clone(),
                 authority,
-                response.font,
+                response.font.clone(),
                 &font,
                 crate::markdown_shaping::frontier::MarkdownShapingFrontierScope::Open {
-                    original: response.coverage,
+                    original: response.coverage.clone(),
                     endpoints: [start, &end_proof],
                     script: &prefix,
                 },
@@ -1466,9 +2016,9 @@ fn install_style(
             .map_err(frontier::map_error)?
         } else {
             crate::markdown_shaping::frontier::MarkdownShapingFrontierJob::new_with_scope(
-                        payload.source.clone(), authority, response.font, &font,
+                        payload.source.clone(), authority, response.font.clone(), &font,
                         crate::markdown_shaping::frontier::MarkdownShapingFrontierScope::CertifiedCoordinates {
-                            original: response.coverage, endpoints: [start, &end_proof],
+                            original: response.coverage.clone(), endpoints: [start, &end_proof],
                         }, options, cancellation.shape.clone(),
                     )
                     .map_err(frontier::map_error)?
@@ -1478,8 +2028,7 @@ fn install_style(
             .map_err(frontier::map_error)?;
         payload.frontier = Some(frontier::PendingFrontier::new(
             owner,
-            original_font,
-            response.registration,
+            response,
             replay_style,
             facts,
             payload.open_script,
@@ -1491,15 +2040,46 @@ fn install_style(
         payload.stage = Stage::Frontier;
         return Ok(());
     }
-    let job = MarkdownShapingJob::new_with_cancellation(
-        payload.source.clone(),
-        authority,
-        response.font,
-        &font,
-        response.coverage,
-        options,
-        cancellation.shape.clone(),
-    )?;
+    let job = if shaping_seams.iter().any(Option::is_some) {
+        // 非前沿入口仍保持完整项合同；真正 UBA seam 只裁断邻接上下文，不签新的 GCB/BOT/EOT。
+        let start = match &shaping_seams[0] {
+            Some(seam) => seam.boundary(authority)?.0,
+            None => payload
+                .source
+                .byte_offset_for_utf16(response.coverage.start)?,
+        };
+        let end = match &shaping_seams[1] {
+            Some(seam) => seam.boundary(authority)?.0,
+            None => payload
+                .source
+                .byte_offset_for_utf16(response.coverage.end)?,
+        };
+        let context = (if shaping_seams[0].is_some() { start } else { 0 })
+            ..(if shaping_seams[1].is_some() {
+                end
+            } else {
+                payload.source.byte_len()
+            });
+        MarkdownShapingJob::from_certified_item_input(
+            payload.source.clone(),
+            authority,
+            response.font,
+            &font,
+            (response.coverage, start..end, Some(context)),
+            options,
+            cancellation.shape.clone(),
+        )?
+    } else {
+        MarkdownShapingJob::new_with_cancellation(
+            payload.source.clone(),
+            authority,
+            response.font,
+            &font,
+            response.coverage,
+            options,
+            cancellation.shape.clone(),
+        )?
+    };
     payload.item = Some(MarkdownLineItem {
         job: super::worker_resources::ShapeResourceOwner::new(job, &payload.resources),
         source: payload.source.clone(),
@@ -1508,6 +2088,7 @@ fn install_style(
         registration: response.registration,
         replay_style,
         facts,
+        shaping_seams,
     });
     payload.request.take();
     payload.font_probe_scope.take(); // 不保活已完成样式阶段的字体探测或相同坐标旧票。

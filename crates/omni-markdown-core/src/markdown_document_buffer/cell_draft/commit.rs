@@ -15,6 +15,10 @@ pub struct MarkdownCellDraftPreparedCommit {
     range: Range<usize>,
     replacement: CellReplacement,
     replacement_utf16: usize,
+    /// 同次清洗得到的有向位置仍封存在候选内；只有真实发布或未改内容封闭后才交付调用方。
+    selection: MarkdownTextSelection,
+    /// 原Word首组两端或Shift锚点；同次清洗映射真实范围，禁止提交后从裸种子重新扩词。
+    word_anchor: Option<MarkdownCellDraftWordAnchor>,
     unchanged: bool,
     next_cell: Option<(usize, usize)>,
     // 按字段Drop顺序，先真实释放上面的候选存储，再归还唯一准入槽及其分配收据。
@@ -67,12 +71,40 @@ impl<E: std::error::Error + 'static> std::error::Error for MarkdownCellDraftComm
     }
 }
 
-/// 与既有未改内容跳过提交相同：None不运行观察者、不移动canonical选区、也不制造空Undo。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 首词组与真实首击位置属于同一次草稿输入；只映射坐标，不重新查询或扩大词组。
+/// Shift锚点以空范围及同一个首击位置表达，实际角色仍由原输入手势拥有者保持。
+pub struct MarkdownCellDraftWordAnchor {
+    /// 原词组的真实两端；裁去首尾空白后可以真实收敛为空，不转选相邻内容。
+    pub range: MarkdownTextSelection,
+    /// 首击落点用于同词内往返拖选的原方向判断，不能用词组中心或后继指针位置替代。
+    pub origin_utf16: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 这次原文档提交的真实结果坐标；不是后继Source权限，也不负责移动canonical选区。
+/// 调用方须与原Body提交结果一起核对当前代际，不能把旧位置重新授权给较新的正文。
+pub struct MarkdownCellDraftCommitReceipt {
+    /// 原草稿有向anchor/head经过同次清洗后，在本次canonical正文中的UTF16位置。
+    pub selection: MarkdownTextSelection,
+    /// 原Word首组两端经过同趟清洗后的canonical范围；Shift锚点以相同的两端表示。
+    /// trim后允许真实空组，不从空组重新选择邻词；None表示本次提交没有Word手势。
+    pub word_anchor: Option<MarkdownCellDraftWordAnchor>,
+    /// 仅真实末格追加才有下一格查询坐标；激活仍必须取得新一代的真实行/格来源票。
+    pub next_cell: Option<(usize, usize)>,
+}
+
+#[derive(Debug)]
+/// 保留原一次事务及未改内容语义，同时交付这次实际清洗的端点，避免关闭草稿后重读整格。
+pub struct MarkdownCellDraftCommit<O> {
+    /// None不运行观察者、不移动canonical选区，也不制造空Undo；receipt仍来自已封闭的同次草稿。
+    pub edit: Option<(MarkdownHistoryTextEdit, O)>,
+    pub receipt: MarkdownCellDraftCommitReceipt,
+}
+
+/// 失败仍保留原草稿；只有真实publish或unchanged封闭成功才返回结果和原端点收据。
 pub type MarkdownCellDraftCommitResult<O> = Result<
-    Option<(
-        MarkdownHistoryTextEdit,
-        <O as MarkdownTextChangeObserver>::Output,
-    )>,
+    MarkdownCellDraftCommit<<O as MarkdownTextChangeObserver>::Output>,
     MarkdownCellDraftCommitError<<O as MarkdownTextChangeObserver>::Error>,
 >;
 
@@ -80,7 +112,15 @@ impl PendingCellDraft {
     fn replacement(
         &self,
         document: &MarkdownDocumentBuffer,
-    ) -> Result<CellReplacementOutput, MarkdownCellDraftError> {
+        word_anchor: Option<MarkdownCellDraftWordAnchor>,
+    ) -> Result<
+        (
+            CellReplacementOutput,
+            MarkdownTextSelection,
+            Option<MarkdownCellDraftWordAnchor>,
+        ),
+        MarkdownCellDraftError,
+    > {
         self.require(document)?;
         let (_, prefix) = self.plan.replacement_for(document)?;
         let source = DraftSource {
@@ -90,7 +130,22 @@ impl PendingCellDraft {
             serial: self.serial,
         };
         let metrics = piece_tree_metrics(&self.root);
+        if word_anchor.is_some_and(|anchor| {
+            anchor.range.anchor_utf16 > metrics.utf16_len
+                || anchor.range.head_utf16 > metrics.utf16_len
+                || anchor.origin_utf16 > metrics.utf16_len
+        }) {
+            return Err(MarkdownDocumentBufferError::RangeOutsideDocument.into());
+        } // 这里只接受原child的真实两端；越界在写候选前拒绝，不钳成邻词或新Source权限。
         let mut sanitized = CellReplacementOutput::new(metrics, prefix)?;
+        // 固定保存输入选区两端、首词组两端及首击位置，不建逐字符表，也不再遍历长格。
+        // 缺格前缀已经写入；局部0须落在前缀之后，两个端点都保留各自方向。
+        let mut selection = MarkdownTextSelection::caret(sanitized.utf16_len());
+        let mut mapped_word_anchor = word_anchor.map(|_| MarkdownCellDraftWordAnchor {
+            range: selection,
+            origin_utf16: sanitized.utf16_len(),
+        });
+        let mut input_utf16 = 0;
         let mut odd_backslashes = false;
         let mut last_is_space = false;
         let mut started = false;
@@ -105,6 +160,20 @@ impl PendingCellDraft {
                 let text = std::str::from_utf8(bytes)
                     .map_err(|_| MarkdownDocumentBufferError::InvalidUtf8Document)?;
                 for scalar in text.chars() {
+                    // 同趟经过原标量时认证首组两端；代理对内部不是有效端点。
+                    // 任一端点无效只丢本候选，原草稿、选择和输入许可仍可继续使用。
+                    let next_utf16 = input_utf16 + scalar.len_utf16();
+                    if word_anchor.is_some_and(|anchor| {
+                        [
+                            anchor.range.anchor_utf16,
+                            anchor.range.head_utf16,
+                            anchor.origin_utf16,
+                        ]
+                        .into_iter()
+                        .any(|point| input_utf16 < point && point < next_utf16)
+                    }) {
+                        return Err(MarkdownDocumentBufferError::NotUnicodeBoundary);
+                    }
                     // CR/LF折为空格且连续分隔不重复；反斜线奇偶状态跨真实4KiB叶延续。
                     let needs_space = !last_is_space;
                     let mut emit = |value: char| -> Result<(), MarkdownDocumentBufferError> {
@@ -145,6 +214,27 @@ impl PendingCellDraft {
                             odd_backslashes = false;
                         }
                     }
+                    // 一个原始标量的全部转义或折行完成后才落点；CRLF中间点和合并后的LF末点可重合。
+                    // 草稿输入已验证Unicode边界，因此不会把补出的反斜线或代理项中间位置冒充原caret。
+                    input_utf16 = next_utf16;
+                    if input_utf16 == self.selection.anchor_utf16 {
+                        selection.anchor_utf16 = sanitized.utf16_len();
+                    }
+                    if input_utf16 == self.selection.head_utf16 {
+                        selection.head_utf16 = sanitized.utf16_len();
+                    }
+                    if let Some(original) = word_anchor {
+                        let mapped = mapped_word_anchor.as_mut().expect("原首组有同趟映射槽");
+                        if original.range.anchor_utf16 == input_utf16 {
+                            mapped.range.anchor_utf16 = sanitized.utf16_len();
+                        }
+                        if original.range.head_utf16 == input_utf16 {
+                            mapped.range.head_utf16 = sanitized.utf16_len();
+                        }
+                        if original.origin_utf16 == input_utf16 {
+                            mapped.origin_utf16 = sanitized.utf16_len();
+                        }
+                    }
                 }
                 Ok(())
             },
@@ -160,8 +250,43 @@ impl PendingCellDraft {
         }
         // 旧Unicode trim只执行一次；真实匿名文件截尾并定位EOF后，末格追加仍可续写同一输出。
         sanitized.truncate(trimmed_end.0, trimmed_end.1)?;
+        // 尾部Unicode空白真正截去后，两端分别钳到保留正文末端；反向选择方向不互换。
+        // 绝对坐标在候选阶段检查溢出，发布后不再增加任何可能失败的坐标计算或Source读取。
+        selection.anchor_utf16 = self
+            .range
+            .start
+            .checked_add(selection.anchor_utf16.min(trimmed_end.1))
+            .ok_or(MarkdownCellDraftError::CommitLimit)?;
+        selection.head_utf16 = self
+            .range
+            .start
+            .checked_add(selection.head_utf16.min(trimmed_end.1))
+            .ok_or(MarkdownCellDraftError::CommitLimit)?;
+        let word_anchor = mapped_word_anchor
+            .map(|anchor| {
+                Ok::<_, MarkdownCellDraftError>(MarkdownCellDraftWordAnchor {
+                    range: MarkdownTextSelection {
+                        anchor_utf16: self
+                            .range
+                            .start
+                            .checked_add(anchor.range.anchor_utf16.min(trimmed_end.1))
+                            .ok_or(MarkdownCellDraftError::CommitLimit)?,
+                        head_utf16: self
+                            .range
+                            .start
+                            .checked_add(anchor.range.head_utf16.min(trimmed_end.1))
+                            .ok_or(MarkdownCellDraftError::CommitLimit)?,
+                    },
+                    origin_utf16: self
+                        .range
+                        .start
+                        .checked_add(anchor.origin_utf16.min(trimmed_end.1))
+                        .ok_or(MarkdownCellDraftError::CommitLimit)?,
+                })
+            })
+            .transpose()?; // 空白首组可能收敛为空；保住这个真实结果，不能改选相邻内容。
         self.require(document)?;
-        Ok(sanitized)
+        Ok((sanitized, selection, word_anchor))
     }
 
     fn unchanged(
@@ -199,24 +324,30 @@ impl MarkdownDocumentBuffer {
     pub fn prepare_cell_draft_commit(
         &self,
         edit: super::edit::MarkdownCellDraftEditCapsule,
+        word_anchor: Option<MarkdownCellDraftWordAnchor>,
     ) -> Result<MarkdownCellDraftPreparedCommit, MarkdownCellDraftError> {
         let pending = self.require_cell_draft_edit(&edit)?;
         if pending.marked_range.is_some() {
             return Err(MarkdownCellDraftError::CompositionActive);
         }
-        self.prepare_cell_draft_commit_inner(pending)
+        self.prepare_cell_draft_commit_inner(pending, word_anchor)
     }
 
     fn prepare_cell_draft_commit_inner(
         &self,
         pending: &PendingCellDraft,
+        word_anchor: Option<MarkdownCellDraftWordAnchor>,
     ) -> Result<MarkdownCellDraftPreparedCommit, MarkdownCellDraftError> {
         // 名额先于任何String分配取得；后续失败的局部String先Drop，claim才实际开放下一张票。
         let mut claim = pending.scope.reserve_commit()?;
-        let candidate = pending
-            .replacement(self)
-            .and_then(|output| output.seal(&mut claim).map_err(Into::into));
-        let (replacement, replacement_utf16) = match candidate {
+        let candidate =
+            pending
+                .replacement(self, word_anchor)
+                .and_then(|(output, selection, word_anchor)| {
+                    let (replacement, units) = output.seal(&mut claim)?;
+                    Ok((replacement, units, selection, word_anchor))
+                });
+        let (replacement, replacement_utf16, selection, word_anchor) = match candidate {
             Ok(value) => value,
             Err(error) => {
                 pending.require(self)?; // 匿名候选I/O失败也不能遮住原Source同时到达的真实首因。
@@ -232,6 +363,8 @@ impl MarkdownDocumentBuffer {
             range: pending.range.clone(),
             replacement,
             replacement_utf16,
+            selection,
+            word_anchor,
             unchanged,
             next_cell: None,
             _claim: claim,
@@ -243,25 +376,37 @@ impl MarkdownDocumentBuffer {
     pub fn prepare_cell_draft_row_append(
         &self,
         edit: super::edit::MarkdownCellDraftEditCapsule,
-        window: &VerifiedMarkdownTableWindow,
-        row_ordinal: usize,
-        column_index: usize,
+        terminal: &VerifiedMarkdownTableRowSource,
+        authority: MarkdownViewportSourceAuthority,
+        word_anchor: Option<MarkdownCellDraftWordAnchor>,
     ) -> Result<MarkdownCellDraftPreparedCommit, MarkdownCellDraftError> {
         let pending = self.require_cell_draft_edit(&edit)?;
         if pending.marked_range.is_some() {
             return Err(MarkdownCellDraftError::CompositionActive);
         }
         let prepared = (|| {
-            window
-                .table_end_for(self)
-                .map_err(|_| MarkdownTableWindowError::InvalidSource)?
+            let end = terminal
+                .terminal_end_for(self, authority)
+                .map_err(|_| MarkdownCellDraftError::Stale)?
                 .ok_or(MarkdownTableWindowError::ContextPending)?;
+            let (header, row, columns) = terminal
+                .coordinate_for(self, authority)
+                .map_err(|_| MarkdownCellDraftError::Stale)?;
+            let context = &pending.plan.cell.context;
+            if header != context.header.start
+                || row != context.row_ordinal
+                || columns != context.columns
+            {
+                // 原 End 属于另一真实行/表时不借给当前草稿；同长范围、同一插入锚点也不够。
+                return Err(MarkdownTableWindowError::InvalidSource.into());
+            }
             // 唯一名额先于任何有限补格或sanitize String分配；Busy不额外制造候选副本。
             let claim = pending.scope.reserve_commit()?;
-            // 同一插入锚点可以对应多个implicit缺格；必须同时比较原补格前缀，不能仅凭range相等。
-            let target =
-                self.plan_verified_table_cell_edit(window, row_ordinal, column_index, "")?;
-            self.prepare_cell_draft_append_inner(pending, &target, claim)
+            // 当前 raw 端点及补列事实来自激活时的原票；只补本次真实 End，不回读巨格或重建完整窗口。
+            let mut cell = pending.plan.cell.clone();
+            cell.context.end = Some(end.clone());
+            let target = self.plan_table_cell_source_replacement(cell, "")?;
+            self.prepare_cell_draft_append_inner(pending, &target, claim, word_anchor)
         })();
         if prepared.is_err() {
             // 表格源适配器返回Table错误时仍核原健康门；真实reclaim/read首错不能降成无效坐标。
@@ -274,25 +419,28 @@ impl MarkdownDocumentBuffer {
     pub fn prepare_cell_draft_original_row_append(
         &self,
         edit: super::edit::MarkdownCellDraftEditCapsule,
+        word_anchor: Option<MarkdownCellDraftWordAnchor>,
     ) -> Result<MarkdownCellDraftPreparedCommit, MarkdownCellDraftError> {
         let pending = self.require_cell_draft_edit(&edit)?;
         if pending.marked_range.is_some() {
             return Err(MarkdownCellDraftError::CompositionActive);
         }
         let claim = pending.scope.reserve_commit()?;
-        let prepared = self.prepare_cell_draft_append_inner(pending, &pending.plan, claim);
+        let prepared =
+            self.prepare_cell_draft_append_inner(pending, &pending.plan, claim, word_anchor);
         if prepared.is_err() {
             pending.require(self)?;
         }
         prepared
     }
 
-    /// 两个入口只区别真实End来自当前短窗还是原格计划；比较、sanitize、尾部与唯一publish共用。
+    /// 两个入口只区别真实 End 来自后继 terminal 还是原格计划；sanitize、尾部和唯一 publish 共用。
     fn prepare_cell_draft_append_inner(
         &self,
         pending: &PendingCellDraft,
         target: &MarkdownTableCellEditPlan,
         mut claim: CommitClaim,
+        word_anchor: Option<MarkdownCellDraftWordAnchor>,
     ) -> Result<MarkdownCellDraftPreparedCommit, MarkdownCellDraftError> {
         let (target_range, target_prefix) = target.replacement_for(self)?;
         let (original_range, original_prefix) = pending.plan.replacement_for(self)?;
@@ -300,7 +448,7 @@ impl MarkdownDocumentBuffer {
             return Err(MarkdownTableWindowError::InvalidSource.into());
         }
         // 同一规则清洗后仍不seal；真实尾部和新行直接续写，长cell不会为Tab再复制一份。
-        let mut replacement = pending.replacement(self)?;
+        let (mut replacement, selection, word_anchor) = pending.replacement(self, word_anchor)?;
         let tail = self.verified_cell_row_append_tail_for_plan(target)?;
         let next_cell = tail.next_cell();
         let range = tail.replacement_range_for(self)?.clone();
@@ -322,6 +470,8 @@ impl MarkdownDocumentBuffer {
             range,
             replacement,
             replacement_utf16,
+            selection, // 原草稿端点在真实追加尾部前已经封定，不能被新行字节移到下一格。
+            word_anchor,
             unchanged: false,
             next_cell: Some(next_cell),
             _claim: claim,
@@ -340,7 +490,7 @@ impl MarkdownDocumentBuffer {
         if pending.scope.has_readers() {
             return Err(MarkdownCellDraftError::ReadersBusy.into());
         }
-        let prepared = self.prepare_cell_draft_commit_inner(pending)?;
+        let prepared = self.prepare_cell_draft_commit_inner(pending, None)?;
         self.commit_prepared_cell_draft_observed(prepared, observer)
     }
 
@@ -369,7 +519,14 @@ impl MarkdownDocumentBuffer {
             // 与原字段关闭未改草稿一致；不调用观察者，不产生空变化日志或Undo。
             pending.scope.cancelled.store(true, Ordering::Release);
             drop(pending);
-            return Ok(None);
+            return Ok(MarkdownCellDraftCommit {
+                edit: None,
+                receipt: MarkdownCellDraftCommitReceipt {
+                    selection: prepared.selection,
+                    word_anchor: prepared.word_anchor,
+                    next_cell: prepared.next_cell,
+                },
+            });
         }
         let result = (|| {
             let after = prepared
@@ -423,7 +580,14 @@ impl MarkdownDocumentBuffer {
                 pending.scope.cancelled.store(true, Ordering::Release);
                 // canonical只保最终替换段；原raw branch真实Drop，不把2MiB垃圾段移入会话库存。
                 drop(pending);
-                Ok(Some(value))
+                Ok(MarkdownCellDraftCommit {
+                    edit: Some(value),
+                    receipt: MarkdownCellDraftCommitReceipt {
+                        selection: prepared.selection,
+                        word_anchor: prepared.word_anchor,
+                        next_cell: prepared.next_cell,
+                    },
+                })
             }
             Err(error) => {
                 self.cell_draft = Some(CellDraftSlot::Active(pending));

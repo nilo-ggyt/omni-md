@@ -79,6 +79,145 @@ fn gb2_exists_before_scanning_but_never_creates_a_record_ordinal_or_next_cluster
 }
 
 #[test]
+fn paged_mixed_unicode_queries_keep_strict_neighbors_and_pending_prefix() {
+    // 固定字面明确声明÷中÷𠮷÷A×COMBINING ACUTE÷；每组10B、5个UTF16单元。
+    // 两份短样本分别保留半页尾部、恰好整页尾部；写入中和封存后均查真实页间邻居。
+    // 期望始终来自字面字素规则，不读取待测索引，也不按其record布局生成结果。
+    for groups in [400, 1365] {
+        let text = "中𠮷A\u{301}".repeat(groups);
+        let (directory, document, source) = fixture(&text);
+        let authority = source.authority();
+        let source_receipt = source.resource_observer();
+        let backing = source.original_backing_observer().unwrap();
+        let mut job = MarkdownGraphemeJob::new_paged(source.clone()).unwrap();
+        let resources = job.resource_observer();
+        let quantum = MarkdownGraphemeBudget {
+            bytes: 256,
+            scalars: 256,
+            records: 256,
+        };
+        assert_eq!(
+            job.query(
+                &authority,
+                MarkdownGraphemeUnit::Utf16,
+                0,
+                MarkdownGraphemeQuery::Next,
+            )
+            .unwrap(),
+            MarkdownGraphemeAnswer::Pending,
+        ); // 尚未开始读取，不能从空追加区间伪造首个完整字素。
+        for _ in 0..14 {
+            job.step(&authority, quantum).unwrap();
+        }
+        assert!(!job.is_ready());
+        assert!(resources.snapshot().metadata_file_open); // 已实际换页取得FD，尚有未分类尾部。
+        for (unit, offset) in [
+            (MarkdownGraphemeUnit::Byte, text.len()),
+            (MarkdownGraphemeUnit::Utf16, groups * 5),
+        ] {
+            for query in [
+                MarkdownGraphemeQuery::IsBoundary,
+                MarkdownGraphemeQuery::Previous,
+            ] {
+                assert_eq!(
+                    job.query(&authority, unit, offset, query).unwrap(),
+                    MarkdownGraphemeAnswer::Pending,
+                ); // EOF长度事实不能替未知尾部签IsBoundary或严格Previous。
+            }
+        }
+        let mut expected = Vec::with_capacity(groups * 3 + 1);
+        for block in 0..groups {
+            for (byte, utf16) in [(0, 0), (3, 1), (7, 3)] {
+                expected.push(MarkdownGraphemeBoundary {
+                    byte: block * 10 + byte,
+                    utf16: block * 5 + utf16,
+                });
+            }
+        }
+        expected.push(MarkdownGraphemeBoundary {
+            byte: groups * 10,
+            utf16: groups * 5,
+        });
+        for complete in [false, true] {
+            if complete {
+                let mut completed = false;
+                for _ in 0..text.len() {
+                    if job.step(&authority, quantum).unwrap().status
+                        == MarkdownGraphemeStatus::Ready
+                    {
+                        completed = true;
+                        break;
+                    }
+                }
+                assert!(completed);
+            }
+            for (unit, stride) in [
+                (MarkdownGraphemeUnit::Byte, 10),
+                (MarkdownGraphemeUnit::Utf16, 5),
+            ] {
+                let position = |boundary: MarkdownGraphemeBoundary| match unit {
+                    MarkdownGraphemeUnit::Byte => boundary.byte,
+                    MarkdownGraphemeUnit::Utf16 => boundary.utf16,
+                };
+                // 已分类前缀在3500B之前；封存后另查后段与EOF。两阶段都包含页首、页首
+                // 前一记录及其内部坐标，严格Previous/Next不能被当前页首替代或漏掉。
+                for block in [0, 170, 341, 349, 1023, 1024, groups - 1]
+                    .into_iter()
+                    .filter(|&block| block < groups && (complete || block <= 349))
+                {
+                    for offset in block * stride..=block * stride + stride {
+                        for query in [
+                            MarkdownGraphemeQuery::IsBoundary,
+                            MarkdownGraphemeQuery::Previous,
+                            MarkdownGraphemeQuery::Next,
+                        ] {
+                            let wanted = match query {
+                                MarkdownGraphemeQuery::IsBoundary => expected
+                                    .iter()
+                                    .copied()
+                                    .find(|boundary| position(*boundary) == offset),
+                                MarkdownGraphemeQuery::Previous => expected
+                                    .iter()
+                                    .copied()
+                                    .rev()
+                                    .find(|boundary| position(*boundary) < offset),
+                                MarkdownGraphemeQuery::Next => expected
+                                    .iter()
+                                    .copied()
+                                    .find(|boundary| position(*boundary) > offset),
+                            };
+                            assert_eq!(
+                                job.query(&authority, unit, offset, query).unwrap(),
+                                MarkdownGraphemeAnswer::Known(wanted),
+                                "groups={groups} complete={complete} unit={unit:?} offset={offset} query={query:?}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // 只读查询既不修改原Doc，也不写用户内容；磁盘对照仅针对上方有界固定fixture。
+        assert_eq!(document.generation(), 0);
+        assert_eq!(
+            std::fs::read(directory.path().join("真实字素前缀.md")).unwrap(),
+            text.as_bytes()
+        );
+        job.close().unwrap();
+        let closed = resources.snapshot();
+        assert!(
+            closed.metadata_owner_released
+                && !closed.metadata_file_open
+                && closed.metadata_map_bytes == 0
+                && closed.metadata_buffer_bytes == 0
+                && !closed.cleanup_failed
+        );
+        drop((source, document));
+        assert!(source_receipt.payload_released());
+        assert!(backing.unmap_succeeded() && backing.mapped_bytes() == 0);
+    }
+}
+
+#[test]
 fn every_quota_one_prefix_matches_explicit_non_bmp_combining_oracle_and_real_eof() {
     let (_directory, _document, source) = fixture("中𠮷A\u{301}");
     let authority = source.authority();

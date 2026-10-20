@@ -216,6 +216,10 @@ pub struct Parser<'input, F = DefaultBrokenLinkCallback> {
     wikilink_stack: LinkStack,
     code_delims: CodeDelims,
     math_delims: MathDelims,
+    #[cfg(feature = "omni-block-frontier")]
+    cell_root: Option<TreeIndex>,
+    #[cfg(feature = "omni-block-frontier")]
+    paragraph_context: Option<&'input crate::global_frontier::InlineParagraphContext>,
 }
 
 impl<'input, F> std::fmt::Debug for Parser<'input, F> {
@@ -296,6 +300,58 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
         ))
     }
 
+    #[cfg(feature = "omni-block-frontier")]
+    /// 真实闭合短格共用原 inline 两遍解析；保 Active pipe/escape/math，不重新执行 Root block 分类。
+    pub fn new_with_table_cell_seed(
+        text: &'input str,
+        seed: &crate::global_frontier::VerifiedInlineSemanticSeed,
+        broken_link_callback: Option<F>,
+    ) -> Result<Self, crate::global_frontier::GlobalFrontierError> {
+        let (tree, allocs) = crate::firstpass::run_first_pass_table_cell(text, seed)?;
+        let mut parser =
+            Self::from_first_pass(text, seed.options(), broken_link_callback, tree, allocs);
+        // 原 Cell parent 仍供 inline passes 定界；对外只迭代它的 children，不伪造 Table 包装事件。
+        parser.cell_root = Some(parser.tree.push());
+        Ok(parser)
+    }
+
+    #[cfg(feature = "omni-block-frontier")]
+    /// 真短 ATX 保完整 raw 物理前缀，直接进入原标题与 inline 两遍算法；不重判容器为 Root。
+    /// 调用方仍负责同源读取、取消与原文档权限，返回结果仅是这个真实 Leaf 的解析事件。
+    pub fn new_with_atx_leaf_seed(
+        text: &'input str,
+        leaf: &crate::global_frontier::VerifiedGlobalLeafBlock,
+        broken_link_callback: Option<F>,
+    ) -> Result<Self, crate::global_frontier::GlobalFrontierError> {
+        let (tree, allocs) = crate::firstpass::run_first_pass_atx_leaf(text, leaf)?;
+        Ok(Self::from_first_pass(
+            text,
+            leaf.options(),
+            broken_link_callback,
+            tree,
+            allocs,
+        ))
+    }
+
+    #[cfg(feature = "omni-block-frontier")]
+    /// 原 scoped 段落及 Setext 只借同一已完成 context；不复制去前缀字符串或重新建立容器树。
+    pub fn new_with_inline_block_seed(
+        text: &'input str,
+        context: &'input crate::global_frontier::InlineParagraphContext,
+        broken_link_callback: Option<F>,
+    ) -> Result<Self, crate::global_frontier::GlobalFrontierError> {
+        let (tree, allocs) = crate::firstpass::run_first_pass_inline_block(text, context)?;
+        let mut parser = Self::from_first_pass(
+            text,
+            context.seed().options(),
+            broken_link_callback,
+            tree,
+            allocs,
+        );
+        parser.paragraph_context = Some(context);
+        Ok(parser)
+    }
+
     /// 两条入口共用完全相同的Parser组装，seed只作用于上游firstpass的真实row入口。
     fn from_first_pass(
         text: &'input str,
@@ -323,6 +379,10 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             link_ref_expansion_limit: text.len().max(100_000),
             code_delims: CodeDelims::new(),
             math_delims: MathDelims::new(),
+            #[cfg(feature = "omni-block-frontier")]
+            cell_root: None,
+            #[cfg(feature = "omni-block-frontier")]
+            paragraph_context: None,
         }
     }
 
@@ -725,8 +785,13 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                         } else {
                             // ok, so its not an inline link. maybe it is a reference
                             // to a defined link?
-                            let scan_result =
-                                scan_reference(&self.tree, block_text, next, self.options);
+                            let scan_result = scan_reference(
+                                &self.tree,
+                                block_text,
+                                next,
+                                self.options,
+                                &|bytes| self.skip_inline_container_prefixes(bytes),
+                            );
                             let (node_after_link, link_type) = match scan_result {
                                 // [label][reference]
                                 RefScan::LinkLabel(_, end_ix) => {
@@ -785,6 +850,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                                         &self.tree,
                                         &self.text[label_start..label_end],
                                         self.options,
+                                        &|bytes| self.skip_inline_container_prefixes(bytes),
                                     )
                                     .map(|(ix, label)| (label, label_start + ix))
                                     .filter(|(_, end)| *end == label_end)
@@ -1015,46 +1081,31 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
 
                             // work from the inside out
                             while start > el.start + el.count - match_count {
-                                let inc = if start > el.start + el.count - match_count + 1 {
-                                    2
-                                } else {
-                                    1
-                                };
-                                let ty = if c == b'~' {
-                                    if inc == 2 {
-                                        if self.options.contains(Options::ENABLE_STRIKETHROUGH) {
-                                            ItemBody::Strikethrough
-                                        } else {
-                                            ItemBody::Text {
-                                                backslash_escaped: false,
-                                            }
-                                        }
-                                    } else {
-                                        if self.options.contains(Options::ENABLE_SUBSCRIPT) {
-                                            ItemBody::Subscript
-                                        } else if self
-                                            .options
-                                            .contains(Options::ENABLE_STRIKETHROUGH)
-                                        {
-                                            ItemBody::Strikethrough
-                                        } else {
-                                            ItemBody::Text {
-                                                backslash_escaped: false,
-                                            }
-                                        }
-                                    }
-                                } else if c == b'^' {
-                                    if self.options.contains(Options::ENABLE_SUPERSCRIPT) {
-                                        ItemBody::Superscript
-                                    } else {
+                                // 原树与文件栈共享每次消费宽度及扩展开关，不保第二套强调标签规则。
+                                let inc = crate::inline_emphasis::consume_count(
+                                    start.get() - (el.start + el.count - match_count).get(),
+                                );
+                                let ty = match crate::inline_emphasis::style(c, inc, self.options) {
+                                    crate::inline_emphasis::EmphasisStyle::Literal => {
                                         ItemBody::Text {
                                             backslash_escaped: false,
                                         }
                                     }
-                                } else if inc == 2 {
-                                    ItemBody::Strong
-                                } else {
-                                    ItemBody::Emphasis
+                                    crate::inline_emphasis::EmphasisStyle::Emphasis => {
+                                        ItemBody::Emphasis
+                                    }
+                                    crate::inline_emphasis::EmphasisStyle::Strong => {
+                                        ItemBody::Strong
+                                    }
+                                    crate::inline_emphasis::EmphasisStyle::Strikethrough => {
+                                        ItemBody::Strikethrough
+                                    }
+                                    crate::inline_emphasis::EmphasisStyle::Subscript => {
+                                        ItemBody::Subscript
+                                    }
+                                    crate::inline_emphasis::EmphasisStyle::Superscript => {
+                                        ItemBody::Superscript
+                                    }
                                 };
 
                                 let root = start - inc;
@@ -1173,11 +1224,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             *ix += scan_while(&underlying.as_bytes()[*ix..], is_ascii_whitespace_no_nl);
             if let Some(bl) = scan_eol(&underlying.as_bytes()[*ix..]) {
                 *ix += bl;
-                *ix += skip_container_prefixes(
-                    &self.tree,
-                    &underlying.as_bytes()[*ix..],
-                    self.options,
-                );
+                *ix += self.skip_inline_container_prefixes(&underlying.as_bytes()[*ix..]);
             }
             *ix += scan_while(&underlying.as_bytes()[*ix..], is_ascii_whitespace_no_nl);
         };
@@ -1330,7 +1377,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                 ix += 1;
                 let buf = buf.get_or_insert_with(|| String::with_capacity(spanned_bytes.len()));
                 buf.push_str(&spanned_text[start_ix..ix]);
-                ix += skip_container_prefixes(&self.tree, &spanned_bytes[ix..], self.options);
+                ix += self.skip_inline_container_prefixes(&spanned_bytes[ix..]);
                 start_ix = ix;
             } else if c == b'\\'
                 && spanned_bytes.get(ix + 1) == Some(&b'|')
@@ -1377,7 +1424,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                 buf.push_str(&spanned_text[start_ix..ix]);
                 buf.push(' ');
                 ix += 1;
-                ix += skip_container_prefixes(&self.tree, &spanned_bytes[ix..], self.options);
+                ix += self.skip_inline_container_prefixes(&spanned_bytes[ix..]);
                 start_ix = ix;
             } else if c == b'\\'
                 && spanned_bytes.get(ix + 1) == Some(&b'|')
@@ -1457,7 +1504,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             let (span, i) = scan_html_block_inner(
                 // Subtract 1 to include the < character
                 &bytes[(ix - 1)..],
-                Some(&|bytes| skip_container_prefixes(&self.tree, bytes, self.options)),
+                Some(&|bytes| self.skip_inline_container_prefixes(bytes)),
             )?;
             Some((span, i + ix - 1))
         }
@@ -1468,6 +1515,16 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
     /// range in the markdown source.
     pub fn into_offset_iter(self) -> OffsetIter<'input, F> {
         OffsetIter { inner: self }
+    }
+
+    /// 两遍算法借同一真实容器来源。Root 继续原 Tree 扫描；scoped 短块只借已证明行状态。
+    /// 此借用只活到 Parser 迭代结束，不复制 context、保活 Doc/mmap 或增加第二个 source owner。
+    fn skip_inline_container_prefixes(&self, bytes: &[u8]) -> usize {
+        #[cfg(feature = "omni-block-frontier")]
+        if let Some(context) = self.paragraph_context {
+            return context.prefix_bytes_in(self.text, bytes);
+        }
+        skip_container_prefixes(&self.tree, bytes, self.options)
     }
 }
 
@@ -1510,7 +1567,8 @@ impl Tree<Item> {
                     | ItemBody::TableCell)
         }
         for &ix in self.walk_spine().rev() {
-            if matches!(self[ix].item.body, ItemBody::Table(_)) {
+            if matches!(self[ix].item.body, ItemBody::Table(_) | ItemBody::TableCell) {
+                // Cell 节点本身已由真实 table/seed 创建；独立短格保原转义语义，不需要伪造 Table 祖先。
                 return true;
             }
             if !might_be_in_table(&self[ix].item) {
@@ -1542,20 +1600,12 @@ struct InlineStack {
     // a strikethrough delimiter will never match with any element
     // in the stack with index smaller than
     // `lower_bounds[InlineStack::TILDES]`.
-    lower_bounds: [usize; 9],
+    lower_bounds: crate::inline_emphasis::EmphasisBounds,
 }
 
 impl InlineStack {
-    /// These are indices into the lower bounds array.
-    /// Not both refers to the property that the delimiter can not both
-    /// be opener as a closer.
-    const UNDERSCORE_NOT_BOTH: usize = 0;
-    const ASTERISK_NOT_BOTH: usize = 1;
-    const ASTERISK_BASE: usize = 2;
-    const TILDES: usize = 5;
-    const UNDERSCORE_BASE: usize = 6;
-
     fn pop_all(&mut self, tree: &mut Tree<Item>) {
+        // 原未匹配节点仍逐个还原 Text；只共用固定下界内核，不改变树或节点顺序。
         for el in self.stack.drain(..) {
             for i in 0..el.count {
                 tree[el.start + i].item.body = ItemBody::Text {
@@ -1563,59 +1613,12 @@ impl InlineStack {
                 };
             }
         }
-        self.lower_bounds = [0; 9];
-    }
-
-    fn get_lowerbound(&self, c: u8, count: usize, both: bool) -> usize {
-        if c == b'_' {
-            let mod3_lower = self.lower_bounds[InlineStack::UNDERSCORE_BASE + count % 3];
-            if both {
-                mod3_lower
-            } else {
-                min(
-                    mod3_lower,
-                    self.lower_bounds[InlineStack::UNDERSCORE_NOT_BOTH],
-                )
-            }
-        } else if c == b'*' {
-            let mod3_lower = self.lower_bounds[InlineStack::ASTERISK_BASE + count % 3];
-            if both {
-                mod3_lower
-            } else {
-                min(
-                    mod3_lower,
-                    self.lower_bounds[InlineStack::ASTERISK_NOT_BOTH],
-                )
-            }
-        } else {
-            self.lower_bounds[InlineStack::TILDES]
-        }
-    }
-
-    fn set_lowerbound(&mut self, c: u8, count: usize, both: bool, new_bound: usize) {
-        if c == b'_' {
-            if both {
-                self.lower_bounds[InlineStack::UNDERSCORE_BASE + count % 3] = new_bound;
-            } else {
-                self.lower_bounds[InlineStack::UNDERSCORE_NOT_BOTH] = new_bound;
-            }
-        } else if c == b'*' {
-            self.lower_bounds[InlineStack::ASTERISK_BASE + count % 3] = new_bound;
-            if !both {
-                self.lower_bounds[InlineStack::ASTERISK_NOT_BOTH] = new_bound;
-            }
-        } else {
-            self.lower_bounds[InlineStack::TILDES] = new_bound;
-        }
+        self.lower_bounds.clear();
     }
 
     fn truncate(&mut self, new_bound: usize) {
         self.stack.truncate(new_bound);
-        for lower_bound in &mut self.lower_bounds {
-            if *lower_bound > new_bound {
-                *lower_bound = new_bound;
-            }
-        }
+        self.lower_bounds.truncate(new_bound);
     }
 
     fn find_match(
@@ -1625,19 +1628,16 @@ impl InlineStack {
         run_length: usize,
         both: bool,
     ) -> Option<InlineEl> {
-        let lowerbound = min(self.stack.len(), self.get_lowerbound(c, run_length, both));
+        let lowerbound = min(
+            self.stack.len(),
+            self.lower_bounds.lower_bound(c, run_length, both),
+        );
         let res = self.stack[lowerbound..]
             .iter()
             .cloned()
             .enumerate()
             .rfind(|(_, el)| {
-                if c == b'~' && run_length != el.run_length {
-                    return false;
-                }
-                el.c == c
-                    && (!both && !el.both
-                        || (run_length + el.run_length) % 3 != 0
-                        || run_length % 3 == 0)
+                crate::inline_emphasis::matches(c, run_length, both, el.c, el.run_length, el.both)
             });
 
         if let Some((matching_ix, matching_el)) = res {
@@ -1652,19 +1652,14 @@ impl InlineStack {
             self.truncate(matching_ix);
             Some(matching_el)
         } else {
-            self.set_lowerbound(c, run_length, both, self.stack.len());
+            self.lower_bounds
+                .failed(c, run_length, both, self.stack.len());
             None
         }
     }
 
-    fn trim_lower_bound(&mut self, ix: usize) {
-        self.lower_bounds[ix] = self.lower_bounds[ix].min(self.stack.len());
-    }
-
     fn push(&mut self, el: InlineEl) {
-        if el.c == b'~' {
-            self.trim_lower_bound(InlineStack::TILDES);
-        }
+        self.lower_bounds.before_push(el.c, self.stack.len());
         self.stack.push(el)
     }
 }
@@ -1702,12 +1697,13 @@ fn scan_link_label<'text>(
     tree: &Tree<Item>,
     text: &'text str,
     options: Options,
+    container_prefix: &impl Fn(&[u8]) -> usize,
 ) -> Option<(usize, ReferenceLabel<'text>)> {
     let bytes = text.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'[' {
         return None;
     }
-    let linebreak_handler = |bytes: &[u8]| Some(skip_container_prefixes(tree, bytes, options));
+    let linebreak_handler = |bytes: &[u8]| Some(container_prefix(bytes));
     if options.contains(Options::ENABLE_FOOTNOTES)
         && b'^' == bytes[1]
         && bytes.get(2) != Some(&b']')
@@ -1733,6 +1729,7 @@ fn scan_reference<'b>(
     text: &'b str,
     cur: Option<TreeIndex>,
     options: Options,
+    container_prefix: &impl Fn(&[u8]) -> usize,
 ) -> RefScan<'b> {
     let cur_ix = match cur {
         None => return RefScan::Failed,
@@ -1746,7 +1743,7 @@ fn scan_reference<'b>(
         let closing_node = tree[cur_ix].next.unwrap();
         RefScan::Collapsed(tree[closing_node].next)
     } else {
-        let label = scan_link_label(tree, &text[start..], options);
+        let label = scan_link_label(tree, &text[start..], options, container_prefix);
         match label {
             Some((ix, ReferenceLabel::Link(label))) => RefScan::LinkLabel(label, start + ix),
             Some((_ix, ReferenceLabel::Footnote(_label))) => RefScan::UnexpectedFootnote,
@@ -2172,6 +2169,11 @@ impl<'a, F: BrokenLinkCallback<'a>> Iterator for OffsetIter<'a, F> {
         match self.inner.tree.cur() {
             None => {
                 let ix = self.inner.tree.pop()?;
+                #[cfg(feature = "omni-block-frontier")]
+                if self.inner.cell_root == Some(ix) {
+                    self.inner.tree.next_sibling(ix);
+                    return None; // 原单格 child 链真实结束；后继 next 仍是 EOF，不重新暴露外层 Cell。
+                }
                 let ix = if matches!(self.inner.tree[ix].item.body, ItemBody::TightParagraph) {
                     // tight paragraphs emit nothing
                     self.inner.tree.next_sibling(ix);
@@ -2258,7 +2260,7 @@ fn item_to_event<'a>(item: Item, text: &'a str, allocs: &mut Allocations<'a>) ->
         ItemBody::SoftBreak => return Event::SoftBreak,
         ItemBody::HardBreak(_) => return Event::HardBreak,
         ItemBody::FootnoteReference(cow_ix) => {
-            return Event::FootnoteReference(allocs.take_cow(cow_ix))
+            return Event::FootnoteReference(allocs.take_cow(cow_ix));
         }
         ItemBody::TaskListMarker(checked) => return Event::TaskListMarker(checked),
         ItemBody::Rule => return Event::Rule,
@@ -2325,7 +2327,7 @@ fn item_to_event<'a>(item: Item, text: &'a str, allocs: &mut Allocations<'a>) ->
                 Event::DisplayMath(allocs.take_cow(cow_ix))
             } else {
                 Event::InlineMath(allocs.take_cow(cow_ix))
-            }
+            };
         }
         ItemBody::DefinitionList(_) => Tag::DefinitionList,
         ItemBody::DefinitionListTitle => Tag::DefinitionListTitle,
@@ -2343,6 +2345,11 @@ impl<'a, F: BrokenLinkCallback<'a>> Iterator for Parser<'a, F> {
         match self.tree.cur() {
             None => {
                 let ix = self.tree.pop()?;
+                #[cfg(feature = "omni-block-frontier")]
+                if self.cell_root == Some(ix) {
+                    self.tree.next_sibling(ix);
+                    return None;
+                }
                 let ix = if matches!(self.tree[ix].item.body, ItemBody::TightParagraph) {
                     // tight paragraphs emit nothing
                     self.tree.next_sibling(ix);

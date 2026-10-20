@@ -3,28 +3,43 @@
 //! This module owns derived viewport/font dictionaries and balanced native edit notifications.
 //! Every document backlink is weak; native temporary retention cannot prolong canonical text.
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use super::cache_owner::{CacheAdmission, CacheOwner, CachePayload};
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use super::font_run_scratch::{FontRunScratch, copy_query_scalar};
 use super::*;
 use omni_markdown_core::MarkdownDocumentBufferError;
 
 mod pasteboard_output;
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+pub(super) use super::text_input_policy::copy_native_markdown_input_text;
+// 正式 Paged 输入沿共享策略复制本次候选；这三个入口不依赖旧 storage 的构造与缓存。
+pub(super) use super::text_input_policy::{
+    NATIVE_MARKDOWN_INPUT_TRANSACTION_MAX_BYTES, copy_native_markdown_input_text_with_limit,
+};
 pub(super) use pasteboard_output::MarkdownPasteboardOutput;
-#[cfg(feature = "native-paged-body-probe")]
+#[cfg(feature = "native-paged-production")]
 pub(super) use pasteboard_output::MarkdownPasteboardWriteError;
 
 #[path = "input_transaction.rs"]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 mod input_transaction;
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) use input_transaction::*;
 #[path = "pending_selection.rs"]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 mod pending_selection;
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) use pending_selection::*;
 #[path = "source_semantics.rs"]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 mod source_semantics;
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use source_semantics::{NativeMarkdownNoTablesProof, NativeMarkdownSourceOwner};
 
 /// 字符发布同时移交编辑结果、原选择收据和通知尾声；调用方须先声明尾槽，
 /// 将 guard 保持到实际 after 安装及全部局部 Native claims 释放结束。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 type NativeMarkdownCanonicalPublication<Edit> = (
     Edit,
     Rc<NativeMarkdownCommittedSelection>,
@@ -32,6 +47,7 @@ type NativeMarkdownCanonicalPublication<Edit> = (
 );
 
 /// 原生计算的原始正文与模式；相同代次数值不等于同一笔记。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct AttributeRequest {
     identity: WeakMarkdownDocument,
     generation: u64,
@@ -203,6 +219,7 @@ impl PieceBackedMarkdownString {
 
 #[derive(Clone)]
 /// 几何、单格和 delimiter 共享同一不可变目录；原源与选择票不能由后继缓存重新签发。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownTablePresentationSnapshot {
     pub(super) document_generation: u64,
     pub(super) utf16_window: std::ops::Range<usize>,
@@ -216,6 +233,7 @@ pub(super) struct NativeMarkdownTablePresentationSnapshot {
     pub(super) verified_no_tables: Option<NativeMarkdownNoTablesProof>,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownTablePresentationSnapshot {
     pub(super) fn tables(&self) -> &[MarkdownTablePrototype] {
         self.semantics
@@ -257,6 +275,7 @@ impl NativeMarkdownTablePresentationSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// A visible-cell UTF-16 interval carries only the semantic style required for native drawing.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownTableCellStyleSpan {
     pub(super) utf16_range: std::ops::Range<usize>,
     pub(super) styles: MarkdownPresentationStyles,
@@ -264,6 +283,7 @@ pub(super) struct NativeMarkdownTableCellStyleSpan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// 每个显示run都线性对应原文相同数量的UTF16单元；隐藏语法不占显示坐标。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownTableCellSourceSpan {
     pub(super) display_utf16_range: std::ops::Range<usize>,
     pub(super) source_utf16_range: std::ops::Range<usize>,
@@ -271,6 +291,7 @@ pub(super) struct NativeMarkdownTableCellSourceSpan {
 
 #[derive(Debug, Eq, PartialEq)]
 /// 有限单格只生成一次显示文字；样式与源run共享同一次标量追加结果，供实际绘制和命中使用。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownTableCellDisplayText {
     pub(super) text: String,
     pub(super) style_spans: Vec<NativeMarkdownTableCellStyleSpan>,
@@ -278,143 +299,66 @@ pub(super) struct NativeMarkdownTableCellDisplayText {
 }
 
 /// 隐藏标记和折叠转义时同时记录原绝对坐标，不为指针命中重读单格或重建另一份显示串。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_cell_display_text_from_source(
     source: &str,
     absolute_utf16_start: usize,
     mut styles_at: impl FnMut(usize) -> MarkdownPresentationStyles,
 ) -> NativeMarkdownTableCellDisplayText {
-    // 调用方已经准入这一有限单格；字节、原绝对UTF16与显示UTF16独立推进，不能把删标记后的index当源位置。
+    use omni_markdown_core::{
+        MarkdownTableCellDisplayAnswer, MarkdownTableCellDisplayCursor,
+        MarkdownTableCellDisplayInput,
+    };
     let mut text = String::with_capacity(source.len());
     let mut style_spans: Vec<NativeMarkdownTableCellStyleSpan> = Vec::new();
     let mut source_spans: Vec<NativeMarkdownTableCellSourceSpan> = Vec::new();
-    let mut source_byte_offset = 0;
-    let mut absolute_utf16 = absolute_utf16_start;
-    let mut visible_utf16 = 0;
-
-    let append_scalar = |scalar: char,
-                         source_utf16: usize,
-                         styles: MarkdownPresentationStyles,
-                         text: &mut String,
-                         style_spans: &mut Vec<NativeMarkdownTableCellStyleSpan>,
-                         source_spans: &mut Vec<NativeMarkdownTableCellSourceSpan>,
-                         visible_utf16: &mut usize| {
-        // 原源和显示都追加同一个完整标量；emoji的两个UTF16单元不能被压成一个位置。
-        text.push(scalar);
-        let scalar_range = *visible_utf16..*visible_utf16 + scalar.len_utf16();
-        *visible_utf16 = scalar_range.end;
-        let source_range = source_utf16..source_utf16 + scalar.len_utf16();
+    let mut input = source.chars();
+    let mut cursor = MarkdownTableCellDisplayCursor::new(absolute_utf16_start);
+    loop {
+        // 现行 CTFrame 只保留原已准入小格的输出；实际转换规则与新分页显示源共用原 Core 游标。
+        let step = cursor
+            .step(|canonical| {
+                Ok::<_, std::convert::Infallible>(match input.next() {
+                    Some(scalar) => MarkdownTableCellDisplayInput::Scalar {
+                        scalar,
+                        styles: styles_at(canonical),
+                    },
+                    None => MarkdownTableCellDisplayInput::End,
+                })
+            })
+            .expect("固定字符串读取没有失败分支");
+        let scalar = match step.answer {
+            MarkdownTableCellDisplayAnswer::Scalar(scalar) => scalar,
+            MarkdownTableCellDisplayAnswer::Progress => continue,
+            MarkdownTableCellDisplayAnswer::Complete => break,
+            MarkdownTableCellDisplayAnswer::NeedInput => unreachable!("完整有限字符串没有暂停来源"),
+        };
+        text.push(scalar.scalar);
         if let Some(previous) = source_spans.last_mut()
-            && previous.display_utf16_range.end == scalar_range.start
-            && previous.source_utf16_range.end == source_range.start
+            && previous.display_utf16_range.end == scalar.display_utf16.start
+            && previous.source_utf16_range.end == scalar.canonical_utf16.start
         {
-            // 每次追加已保证同长一一对应；只有两边同时连续才合并，隐藏标记或转义造成的源gap不能跨越。
-            previous.display_utf16_range.end = scalar_range.end;
-            previous.source_utf16_range.end = source_range.end;
+            // 只有显示和 canonical 两边都连续才合并；隐藏标记与转义的源 gap 必须保留。
+            previous.display_utf16_range.end = scalar.display_utf16.end;
+            previous.source_utf16_range.end = scalar.canonical_utf16.end;
         } else {
             source_spans.push(NativeMarkdownTableCellSourceSpan {
-                display_utf16_range: scalar_range.clone(),
-                source_utf16_range: source_range,
+                display_utf16_range: scalar.display_utf16.clone(),
+                source_utf16_range: scalar.canonical_utf16,
             });
         }
         if let Some(previous) = style_spans.last_mut()
-            && previous.utf16_range.end == scalar_range.start
-            && previous.styles == styles
+            && previous.utf16_range.end == scalar.display_utf16.start
+            && previous.styles == scalar.styles
         {
-            // 样式只按显示邻接合并；源gap不改变同一可见字体，却仍由上方独立run保持精确命中。
-            previous.utf16_range.end = scalar_range.end;
+            // 显示相邻且实际样式一致便复用原属性 run；它不改变上方来源断点。
+            previous.utf16_range.end = scalar.display_utf16.end;
         } else {
-            // 新字体或样式必须保留自己的实际显示区间。
             style_spans.push(NativeMarkdownTableCellStyleSpan {
-                utf16_range: scalar_range,
-                styles,
+                utf16_range: scalar.display_utf16,
+                styles: scalar.styles,
             });
         }
-    };
-
-    // 原有限源只遍历一次；空格也按原位置追加，不隐式trim或构造整篇属性镜像。
-    while source_byte_offset < source.len() {
-        let scalar = source[source_byte_offset..]
-            .chars()
-            .next()
-            .expect("有效 UTF-8 标量");
-        let scalar_utf16_length = scalar.len_utf16();
-        let styles =
-            styles_at(absolute_utf16).without(MarkdownPresentationStyles::TABLE_ROW_PLACEHOLDER);
-        if styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER)
-            || styles.contains(MarkdownPresentationStyles::MARKER)
-        {
-            // 隐藏语法只推进源位置；没有可见标量就不造样式或命中run，空格与可见内容不受影响。
-            source_byte_offset += scalar.len_utf8();
-            absolute_utf16 = absolute_utf16.saturating_add(scalar_utf16_length);
-            continue;
-        }
-
-        if scalar == '\\' {
-            // 普通转义和code内表级pipe转义有不同的实际可见slash来源。
-            let run_styles = styles;
-            let run_source_start = absolute_utf16;
-            let mut run_length = 0_usize;
-            // 只扫描连续slash；后一个普通标量仍由外层追加，因此pipe始终保留自身真实源位置。
-            while source_byte_offset < source.len()
-                && source[source_byte_offset..].starts_with('\\')
-            {
-                run_length += 1;
-                source_byte_offset += 1;
-                absolute_utf16 = absolute_utf16.saturating_add(1);
-            }
-            let next_scalar = source[source_byte_offset..].chars().next();
-            let next_styles = next_scalar
-                .map(|_| {
-                    styles_at(absolute_utf16)
-                        .without(MarkdownPresentationStyles::TABLE_ROW_PLACEHOLDER)
-                })
-                .unwrap_or_default();
-            let inline_code_escape = next_scalar == Some('|')
-                && run_styles.contains(MarkdownPresentationStyles::INLINE_CODE)
-                && next_styles.contains(MarkdownPresentationStyles::INLINE_CODE);
-            let commonmark_escape = next_scalar.is_some_and(|scalar| scalar.is_ascii_punctuation())
-                && !run_styles.contains(MarkdownPresentationStyles::INLINE_CODE);
-            let visible_backslashes = if inline_code_escape {
-                // code里的pipe只消费最后一个表级转义slash，其余每个slash保持原位。
-                run_length.saturating_sub(1)
-            } else if commonmark_escape {
-                // 普通成对slash显示第二个原标量，奇数末slash仅转义紧随的标点。
-                run_length / 2
-            } else {
-                // 非标点目标没有压缩，每个原slash都可见。
-                run_length
-            };
-            for index in 0..visible_backslashes {
-                let source_utf16 = if commonmark_escape {
-                    run_source_start + index * 2 + 1 // 每一对只显示被首slash转义的第二个实际slash。
-                } else {
-                    run_source_start + index // code或普通字面slash逐个对应，code末个隐藏slash不进入此循环。
-                };
-                append_scalar(
-                    '\\',
-                    source_utf16,
-                    run_styles,
-                    &mut text,
-                    &mut style_spans,
-                    &mut source_spans,
-                    &mut visible_utf16,
-                );
-            }
-            continue;
-        }
-
-        // 普通可见标量保原绝对位置；源内隐藏marker已经造成的gap不能被显示偏移补平。
-        append_scalar(
-            scalar,
-            absolute_utf16,
-            styles,
-            &mut text,
-            &mut style_spans,
-            &mut source_spans,
-            &mut visible_utf16,
-        );
-        source_byte_offset += scalar.len_utf8();
-        absolute_utf16 = absolute_utf16.saturating_add(scalar_utf16_length);
     }
     NativeMarkdownTableCellDisplayText {
         text,
@@ -424,16 +368,19 @@ pub(super) fn native_markdown_table_cell_display_text_from_source(
 }
 
 /// 仅存活前台编辑器拥有的有限字体、颜色和基础属性；关闭取走最后一个项目 Rc。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct MarkdownStorageRenderPayload {
     pub(super) base_attributes: Retained<MarkdownTextAttributes>,
     pub(super) palette: MarkdownTextAttributePalette,
 }
 
 /// composition root只绑定一次原view；借出时没有RefCell借用跨Weak升级，关闭后不能恢复。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct NativeMarkdownStorageViewLink {
     view: Option<Weak<PieceBackedMarkdownTextView>>,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl CachePayload for NativeMarkdownStorageViewLink {
     fn empty() -> Self {
         Self { view: None }
@@ -441,12 +388,10 @@ impl CachePayload for NativeMarkdownStorageViewLink {
 }
 
 /// Weak document access plus editor-bounded derived attributes and synchronous input state.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct PieceBackedTextStorageIvars {
     view_link: CacheOwner<NativeMarkdownStorageViewLink>,
     view_link_bound: Cell<bool>,
-    // This scalar-only foreground recorder does not exist in the default class layout or binary.
-    #[cfg(feature = "native-input-trace")]
-    pub(super) input_trace: RefCell<Option<SharedNativeInputTrace>>,
     // AppKit may retain storage beyond the surface callback. The model owns text, and
     // this weak adapter link prevents delayed TextKit work from keeping that text alive.
     pub(super) document: RefCell<WeakMarkdownDocument>,
@@ -505,6 +450,7 @@ pub(super) struct PieceBackedTextStorageIvars {
     pub(super) deferred_presentation_invalidation: RefCell<Option<std::ops::Range<usize>>>,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 define_class!(
     // SAFETY: this NSTextStorage subclass implements all four required mutable attributed
     // string primitives and reports edits through edited:range:changeInLength:.
@@ -623,33 +569,15 @@ define_class!(
 
             if !self.ivars().accepts_edits.get() {
                 // After successful save/close preflight, delayed native input may not create an unsaved revision.
-                #[cfg(feature = "native-input-trace")]
-                self.record_input_trace_result(
-                    range.length,
-                    0,
-                    Some(NativeInputTraceRejection::Closing),
-                );
                 return;
             }
             // Reject arithmetic overflow before changing the canonical text or semantic selection.
             let Some(range_end) = range.location.checked_add(range.length) else {
                 // Foundation cannot receive a Rust Result here; invalid ranges preserve the current document.
-                #[cfg(feature = "native-input-trace")]
-                self.record_input_trace_result(
-                    range.length,
-                    0,
-                    Some(NativeInputTraceRejection::CoordinateOverflow),
-                );
                 return;
             };
             let Some(document) = self.document() else {
                 // Delayed native edits after teardown cannot recreate a canonical document.
-                #[cfg(feature = "native-input-trace")]
-                self.record_input_trace_result(
-                    range.length,
-                    0,
-                    Some(NativeInputTraceRejection::DocumentUnavailable),
-                );
                 return;
             };
             // 本次计划的 observer 已在 super 前完成，primitive 不能再准备另一份候选。
@@ -669,12 +597,6 @@ define_class!(
             }
             let Some(selection_offset) = range.location.checked_add(replacement_utf16_length) else {
                 // An unrepresentable caret would violate canonical selection bounds; reject the whole edit.
-                #[cfg(feature = "native-input-trace")]
-                self.record_input_trace_result(
-                    range.length,
-                    replacement_utf16_length,
-                    Some(NativeInputTraceRejection::CoordinateOverflow),
-                );
                 return;
             };
             let selection_after = input.as_ref().map_or(
@@ -692,12 +614,6 @@ define_class!(
                 .and_then(|inserted| isize::try_from(range.length).map(|removed| inserted - removed))
             else {
                 // A delta outside isize cannot be reported faithfully; leave text and history unchanged.
-                #[cfg(feature = "native-input-trace")]
-                self.record_input_trace_result(
-                    range.length,
-                    replacement_utf16_length,
-                    Some(NativeInputTraceRejection::CoordinateOverflow),
-                );
                 return;
             };
 
@@ -782,15 +698,6 @@ define_class!(
                 input.reject(error); // 无成功票就不改 marked；原候选和原 Core 状态保持。
             }
             let pending_trace = edit_result.as_ref().ok().and_then(|(committed, _)| self.pending_selection_for(committed));
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(
-                range.length,
-                replacement_utf16_length,
-                edit_result.as_ref().err().map(|_| {
-                    // Retain only a fixed rejection category, never a formatted domain error or source payload.
-                    NativeInputTraceRejection::CanonicalError
-                }),
-            );
             if edit_result.is_ok() {
                 // 原 owner 在首池 drain 前已经发布；字符通知不再依赖另一份无身份标量。
                 if let Some(owner) = &pending_trace {
@@ -821,6 +728,7 @@ define_class!(
             native_markdown_input_probe_stage("primitive_after_end_editing", self);
             if edit_result.is_ok() {
                 // Observe dirtiness only after native observers finish this primitive's edit group.
+                #[cfg(feature = "native-markdown-runtime-probe")]
                 queue_native_markdown_autosave_for_storage(self);
             }
         }
@@ -863,6 +771,7 @@ define_class!(
     }
 );
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl PieceBackedMarkdownTextStorage {
     #[cfg(any(
         test,
@@ -917,8 +826,6 @@ impl PieceBackedMarkdownTextStorage {
         let storage = Self::alloc(mtm).set_ivars(PieceBackedTextStorageIvars {
             view_link: CacheOwner::new(NativeMarkdownStorageViewLink::empty()),
             view_link_bound: Cell::new(false),
-            #[cfg(feature = "native-input-trace")]
-            input_trace: RefCell::new(Some(Rc::new(RefCell::new(NativeInputTrace::default())))),
             document: RefCell::new(Rc::downgrade(&document)),
             fold_state: RefCell::new(std::rc::Weak::new()),
             string,
@@ -1348,8 +1255,6 @@ impl PieceBackedMarkdownTextStorage {
         drop(pending_selection);
         #[cfg(feature = "native-markdown-runtime-probe")]
         drop(pending_selection_fault);
-        #[cfg(feature = "native-input-trace")]
-        self.release_input_trace();
         #[cfg(all(
             feature = "native-block-fragment-diagnostic",
             feature = "native-markdown-runtime-probe"
@@ -1363,18 +1268,15 @@ impl PieceBackedMarkdownTextStorage {
 
     /// 逐字段证明项目存储 payload 已排空；不把文档弱引用失效当作缓存释放。
     pub(super) fn payload_is_empty(&self) -> bool {
-        #[cfg(feature = "native-input-trace")]
-        let trace_empty = self.ivars().input_trace.borrow().is_none();
-        #[cfg(not(feature = "native-input-trace"))]
-        let trace_empty = true;
-        let trace_empty = trace_empty && self.ivars().pending_selection.borrow().is_none();
+        let pending_empty = self.ivars().pending_selection.borrow().is_none();
         #[cfg(feature = "native-markdown-runtime-probe")]
-        let trace_empty = trace_empty && self.ivars().pending_selection_fault.borrow().is_none();
+        let pending_empty =
+            pending_empty && self.ivars().pending_selection_fault.borrow().is_none();
         #[cfg(all(
             feature = "native-block-fragment-diagnostic",
             feature = "native-markdown-runtime-probe"
         ))]
-        let trace_empty = trace_empty
+        let pending_empty = pending_empty
             && self
                 .ivars()
                 .string
@@ -1382,7 +1284,7 @@ impl PieceBackedMarkdownTextStorage {
                 .frozen_values
                 .as_ref()
                 .is_none_or(super::frozen_live_values::FrozenLiveValues::live_cache_is_released);
-        trace_empty
+        pending_empty
             && !self.ivars().accepts_edits.get()
             && self.ivars().view_link.is_released()
             && self.ivars().document.borrow().strong_count() == 0
@@ -1523,25 +1425,6 @@ impl PieceBackedMarkdownTextStorage {
         }
     }
 
-    /// Replace explicit imported/generated text with a fallible canonical transaction.
-    ///
-    /// Native insertText: has no error result. File commands need a positive commit result before
-    /// retaining a copied attachment, so they use this same character publisher after core validation.
-    pub(super) fn apply_explicit_replacement(
-        &self,
-        range: NSRange,
-        replacement: &str,
-    ) -> Result<
-        (
-            MarkdownHistoryTextEdit,
-            Rc<NativeMarkdownCommittedSelection>,
-            Option<NativeMarkdownPendingSelectionGuard>,
-        ),
-        String,
-    > {
-        self.apply_explicit_replacement_inner(range, replacement, None, None, &|| true)
-    }
-
     /// 插表明确第一格为同一次历史编辑的 after；不在提交后另发一份选择转换。
     pub(super) fn apply_table_insertion(
         &self,
@@ -1587,74 +1470,32 @@ impl PieceBackedMarkdownTextStorage {
 
         if !self.ivars().accepts_edits.get() {
             // A delayed import cannot publish text after the accepted save/close boundary.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(
-                range.length,
-                0,
-                Some(NativeInputTraceRejection::Closing),
-            );
             return Err("笔记编辑器正在关闭".into());
         }
         // Validate native arithmetic before beginning an editing group or acquiring mutable text.
         let Some(range_end) = range.location.checked_add(range.length) else {
             // Native coordinate failure must be visible even before a canonical transaction starts.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(
-                range.length,
-                0,
-                Some(NativeInputTraceRejection::CoordinateOverflow),
-            );
             return Err("插入范围超过 UTF-16 坐标上限".into());
         };
         let inserted = replacement.encode_utf16().count();
         let Some(caret) = range.location.checked_add(inserted) else {
             // Native coordinate failure must be visible even before a canonical transaction starts.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(
-                range.length,
-                0,
-                Some(NativeInputTraceRejection::CoordinateOverflow),
-            );
             return Err("插入位置超过 UTF-16 坐标上限".into());
         };
         let inserted_delta = isize::try_from(inserted).map_err(|_| {
             // Signed native notification limits reject this complete insertion without partial source mutation.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(
-                range.length,
-                inserted,
-                Some(NativeInputTraceRejection::CoordinateOverflow),
-            );
             "插入内容超过原生文本通知的长度上限"
         })?;
         let removed_delta = isize::try_from(range.length).map_err(|_| {
             // Signed native notification limits reject this complete insertion without partial source mutation.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(
-                range.length,
-                inserted,
-                Some(NativeInputTraceRejection::CoordinateOverflow),
-            );
             "替换范围超过原生文本通知的长度上限"
         })?;
         let Some(delta) = inserted_delta.checked_sub(removed_delta) else {
             // Native coordinate failure must be visible even before a canonical transaction starts.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(
-                range.length,
-                0,
-                Some(NativeInputTraceRejection::CoordinateOverflow),
-            );
             return Err("文本长度变化超过原生坐标上限".into());
         };
         let Some(document) = self.document() else {
             // An absent canonical owner is a finite rejection, never a guessed no-op.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(
-                0,
-                0,
-                Some(NativeInputTraceRejection::DocumentUnavailable),
-            );
             return Err("编辑器已关闭".into());
         };
         let edit = MarkdownHistoryTextEdit {
@@ -1708,12 +1549,6 @@ impl PieceBackedMarkdownTextStorage {
             }
             // Rejection balances the group and returns ownership to the pending attachment's rollback guard.
             Err(error) => {
-                #[cfg(feature = "native-input-trace")]
-                self.record_input_trace_result(
-                    range.length,
-                    inserted,
-                    Some(NativeInputTraceRejection::CanonicalError),
-                );
                 drop(self.finish_canonical_edit(None, None, "explicit"));
                 Err(error.to_string())
             }
@@ -1815,18 +1650,10 @@ impl PieceBackedMarkdownTextStorage {
 
         if !self.ivars().accepts_edits.get() {
             // A closing storage has no authority to create a format/keyboard revision after its last save.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(0, 0, Some(NativeInputTraceRejection::Closing));
             return Err("笔记编辑器正在关闭".into());
         }
         let Some(document) = self.document() else {
             // An absent canonical owner is a finite rejection, never a guessed no-op.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(
-                0,
-                0,
-                Some(NativeInputTraceRejection::DocumentUnavailable),
-            );
             return Err("编辑器已关闭".into());
         };
         let observer = self.prepare_fold_observer(&document)?;
@@ -1856,12 +1683,6 @@ impl PieceBackedMarkdownTextStorage {
             }
             // A rejected format preserves history/generation/source and still closes its native edit group.
             Err(error) => {
-                #[cfg(feature = "native-input-trace")]
-                self.record_input_trace_result(
-                    0,
-                    0,
-                    Some(NativeInputTraceRejection::CanonicalError),
-                );
                 drop(self.finish_canonical_edit(None, None, "format"));
                 Err(error.to_string())
             }
@@ -1887,18 +1708,10 @@ impl PieceBackedMarkdownTextStorage {
 
         if !self.ivars().accepts_edits.get() {
             // A closing storage has no authority to create a format/keyboard revision after its last save.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(0, 0, Some(NativeInputTraceRejection::Closing));
             return Err("笔记编辑器正在关闭".into());
         }
         let Some(document) = self.document() else {
             // An absent canonical owner is a finite rejection, never a guessed no-op.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(
-                0,
-                0,
-                Some(NativeInputTraceRejection::DocumentUnavailable),
-            );
             return Err("编辑器已关闭".into());
         };
         let observer = self
@@ -1933,12 +1746,6 @@ impl PieceBackedMarkdownTextStorage {
             }
             // Capacity, scalar or context errors veto the native command without a partial edit.
             Err(error) => {
-                #[cfg(feature = "native-input-trace")]
-                self.record_input_trace_result(
-                    0,
-                    0,
-                    Some(NativeInputTraceRejection::CanonicalError),
-                );
                 drop(self.finish_canonical_edit(None, None, "keyboard"));
                 Err(error.to_string())
             }
@@ -1955,18 +1762,10 @@ impl PieceBackedMarkdownTextStorage {
 
         if !self.ivars().accepts_edits.get() {
             // History is immutable after the accepted close gate, even while AppKit retains its shell.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(0, 0, Some(NativeInputTraceRejection::Closing));
             return Err("笔记编辑器已关闭".into());
         }
         let Some(document) = self.document() else {
             // Expired native shells cannot reestablish a canonical history owner.
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(
-                0,
-                0,
-                Some(NativeInputTraceRejection::DocumentUnavailable),
-            );
             return Err("笔记编辑器已关闭".into());
         };
         let observer = self.prepare_fold_observer(&document)?;
@@ -2026,14 +1825,6 @@ impl PieceBackedMarkdownTextStorage {
             _ => None, // 无字符提交没有 pending owner，不为旧范围重新签票。
         };
         if let Some(edit) = edit {
-            #[cfg(feature = "native-input-trace")]
-            self.record_input_trace_result(
-                edit.replaced_utf16_range.len(),
-                edit.replaced_utf16_range
-                    .len()
-                    .saturating_add_signed(edit.change_in_utf16_length),
-                None,
-            );
             // 原 owner 已固定 before/after 与原长度派生来源；通知期间只能消费该有限声明。
             if let Some(trace) = &pending_trace {
                 self.pending_selection_phase(
@@ -2075,6 +1866,7 @@ impl PieceBackedMarkdownTextStorage {
         }
         if edit.is_some() {
             // 只在真实字符提交及 Native 通知结束后排队原弱前台保存动作。
+            #[cfg(feature = "native-markdown-runtime-probe")]
             queue_native_markdown_autosave_for_storage(self);
         }
         pending_trace // 同一实际 owner 移交调用方，直到原 explicit-after 安装及 Native claims 析构结束。
@@ -3134,6 +2926,7 @@ impl PieceBackedMarkdownTextStorage {
 }
 
 /// 返回包含原查询单元的有限标量对齐窗口；任何源错误原样失败，不扫到0或EOF补范围。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn markdown_attribute_request_window(
     document: &MarkdownDocumentBuffer,
     index: usize,
@@ -3209,6 +3002,7 @@ pub(super) fn markdown_utf16_boundary_down(
 }
 
 /// 将低代理项位置移至后一真实标量边界；错误立即传播，不循环搜索替代范围。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn markdown_utf16_boundary_up(
     document: &MarkdownDocumentBuffer,
     offset: usize,
@@ -3254,6 +3048,7 @@ fn markdown_utf16_boundary_by(
 }
 
 /// 仅在全部Rust读取claims已结束后把真实错误转为公开异常；成功值保持原样。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn markdown_attribute_read_or_throw<T>(read: Result<T, MarkdownDocumentBufferError>) -> T {
     match read {
         Ok(value) => value,
@@ -3263,6 +3058,7 @@ fn markdown_attribute_read_or_throw<T>(read: Result<T, MarkdownDocumentBufferErr
 }
 
 /// Foundation原语不能携带Rust错误；中止原读取，不制造有效属性range或隐藏sticky源错误。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn throw_markdown_storage_unavailable() -> ! {
     throw_markdown_native_exception(
         ns_string!("NSInternalInconsistencyException"),
@@ -3271,6 +3067,7 @@ pub(super) fn throw_markdown_storage_unavailable() -> ! {
 }
 
 /// 唯一公开异常工厂只接固定元数据；调用方须先结束Doc/RefCell借用和业务payload guard。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn throw_markdown_native_exception(name: &NSString, reason: &NSString) -> ! {
     let class = objc2::runtime::AnyClass::get(c"NSException").expect("Foundation异常类已链接");
     // SAFETY: 公开NSException工厂接固定名称/原因和nil userInfo；ABI与Foundation声明一致。
@@ -3283,6 +3080,7 @@ pub(super) fn throw_markdown_native_exception(name: &NSString, reason: &NSString
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// One decoded scalar and its local half-open UTF-16 interval in a bounded scratch window.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownUtf16Scalar {
     pub(super) start: usize,
     pub(super) end: usize,
@@ -3290,6 +3088,7 @@ pub(super) struct NativeMarkdownUtf16Scalar {
 }
 
 /// Decodes the complete scalar containing a bounded UTF-16 code-unit index.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_utf16_scalar_at(
     code_units: &[unichar],
     index: usize,
@@ -3332,16 +3131,19 @@ pub(super) fn native_markdown_utf16_scalar_at(
 }
 
 /// Identify the leading half of a supplementary Unicode scalar in Foundation UTF-16 storage.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 const fn is_native_markdown_high_surrogate(code_unit: unichar) -> bool {
     code_unit >= 0xd800 && code_unit <= 0xdbff
 }
 
 /// Identify the trailing half before extending an attribute range across its paired leading unit.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 const fn is_native_markdown_low_surrogate(code_unit: unichar) -> bool {
     code_unit >= 0xdc00 && code_unit <= 0xdfff
 }
 
 /// Finds adjacent scalar-safe text sharing the resolved fallback-font policy.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_font_run_range(
     code_units: &[unichar],
     global_start: usize,
@@ -3359,6 +3161,7 @@ pub(super) fn native_markdown_font_run_range(
 }
 
 /// Expands a bounded font run through neighboring scalars accepted by the supplied face predicate.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_font_run_range_by(
     code_units: &[unichar],
     global_start: usize,
@@ -3402,6 +3205,7 @@ pub(super) fn native_markdown_font_run_range_by(
 }
 
 /// Intersects a candidate attribute run with its bounded fallback while preserving the queried index.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn clamp_markdown_attribute_range(
     range: std::ops::Range<usize>,
     fallback_range: std::ops::Range<usize>,

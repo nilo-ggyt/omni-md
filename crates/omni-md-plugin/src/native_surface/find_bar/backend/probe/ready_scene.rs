@@ -105,7 +105,13 @@ impl NativeMarkdownPagedTextScene for Scene {
         _: usize,
         _: Option<usize>,
         _: bool,
-    ) -> Result<MarkdownTextSelection, ViewError> {
+    ) -> Result<
+        (
+            MarkdownTextSelection,
+            crate::native_surface::paged_text_view::NativeMarkdownPagedHeadAffinity,
+        ),
+        ViewError,
+    > {
         Err(ViewError::Pending)
     }
     fn navigate(
@@ -231,12 +237,15 @@ impl NativeMarkdownPagedTextViewDelegate for Delegate {
     fn virtual_viewport(
         &self,
         epoch: u64,
+        bounds_width: f64,
     ) -> Result<NativeMarkdownPagedVirtualViewport, ViewError> {
         if !self.current(epoch) {
             return Err(ViewError::Revoked);
         }
         Ok(NativeMarkdownPagedVirtualViewport {
             document_origin: NSPoint::ZERO,
+            layout_origin_x: 0.0,
+            layout_width: bounds_width,
             scroll_epoch: 1,
         })
     }
@@ -487,6 +496,7 @@ pub(super) fn run_ready_control(
         let nonce = NativeMarkdownPagedSceneNonce::new();
         let scene = Rc::new(Scene {
             key: NativeMarkdownPagedSceneKey {
+                presentation_mode: omni_markdown_core::MarkdownPresentationMode::Source,
                 request,
                 source: payload.source_authority.clone(),
                 nonce: nonce.authority(),
@@ -535,6 +545,7 @@ pub(super) fn run_ready_control(
         let nonce = NativeMarkdownPagedSceneNonce::new();
         *delegate.scene.borrow_mut() = Some(Rc::new(Scene {
             key: NativeMarkdownPagedSceneKey {
+                presentation_mode: omni_markdown_core::MarkdownPresentationMode::Source,
                 request: key.request.clone(),
                 source: payload.source_authority.clone(),
                 nonce: nonce.authority(),

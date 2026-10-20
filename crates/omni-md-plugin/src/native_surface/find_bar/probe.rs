@@ -1,10 +1,11 @@
 //! 同一Native9图上的真实Find接点；测试权限由原owner/root/epoch签发，不向全局前台槽安装替身。
 
 use super::*;
+use crate::native_surface::NativeMarkdownTextKitEditorSurface;
 
 /// 所有合成 Find 场景复用原 editor 的唯一栏 owner；不另建前台槽或第二份控件实现。
 fn find_probe_bar(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
     current: &impl Fn() -> bool,
 ) -> Result<Rc<NativeMarkdownFindBar>, String> {
@@ -15,11 +16,17 @@ fn find_probe_bar(
     match original {
         Some(bar) => Ok(bar),
         None => {
-            // 栏仍登记在原editor的正常账本；局部构造完成且原票有效后才发布唯一owner。
+            // 只克隆同一Rust账本owner；Native构造期间不持RefCell借用，真实控件仍走同一总预算。
+            let ledger = surface
+                .find_ledger
+                .borrow()
+                .as_ref()
+                .expect("实际Find对照已装配会话账本")
+                .clone();
             let created = native_markdown_table_intent_step(current, || {
                 NativeMarkdownFindBar::new(
                     controller,
-                    &surface.backend.owned_ledger,
+                    &ledger,
                     Rc::downgrade(surface.document()),
                     surface.backend.text_view.mtm(),
                 )
@@ -55,7 +62,7 @@ fn configure_find_probe_x(
 }
 
 pub(in crate::native_surface) fn begin_list_marker_find_probe(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
     intent: u64,
     expected: std::ops::Range<usize>,
@@ -80,7 +87,7 @@ pub(in crate::native_surface) fn begin_list_marker_find_probe(
 
 /// 只复制原栏的纯 stamp；不读取 Native、不保控件，供外层原票跨 helper 与 pool 保持权限。
 pub(in crate::native_surface) fn multi_selection_find_probe_bar_stamp(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
 ) -> Option<(u64, bool)> {
     surface.find_bar.borrow().as_ref().and_then(|bar| {
         (!bar.closed.get()).then_some((bar.layout_revision.get(), bar.visible.get()))
@@ -89,7 +96,7 @@ pub(in crate::native_surface) fn multi_selection_find_probe_bar_stamp(
 
 /// 多匹配动作实际挂载生产栏；visible 与布局代次只由原 show 事务更新。
 pub(in crate::native_surface) fn prepare_multi_selection_find_probe(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
     current: &impl Fn() -> bool,
 ) -> Result<Rc<NativeMarkdownFindBar>, String> {
@@ -163,7 +170,7 @@ pub(in crate::native_surface) fn prepare_multi_selection_find_probe(
 
 /// 只执行真实匹配器；多选没有 Reveal 收据，Next 则必须交还同一原 Rc 请求。
 pub(in crate::native_surface) fn execute_multi_selection_find_probe(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
     bar: &Rc<NativeMarkdownFindBar>,
     intent: u64,
@@ -234,7 +241,7 @@ pub(in crate::native_surface) fn execute_multi_selection_find_probe(
 }
 
 pub(in crate::native_surface) fn finish_list_marker_find_probe(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
     current: &impl Fn() -> bool,
 ) -> Result<(), String> {

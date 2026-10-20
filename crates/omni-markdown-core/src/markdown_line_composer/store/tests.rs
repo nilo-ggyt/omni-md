@@ -68,6 +68,7 @@ impl Fixture {
         self.next_with_style(
             coordinator,
             MarkdownLineComposeStyle {
+                presentation: Default::default(),
                 points: 16.0,
                 language: Some("en-GB".to_owned()),
                 features: vec![crate::MarkdownShapingFeature {
@@ -229,6 +230,7 @@ fn real_mixed_items_share_one_store_and_match_original_glyphs_clusters_after_job
         }
         assert!(store.glyph(&proof, expected.len()).unwrap().is_none());
         let style = store.style(&proof).unwrap();
+        assert_eq!(style.presentation, expected_style.presentation);
         assert_eq!(style.language, expected_style.language);
         assert_eq!(style.features, expected_style.features);
         assert_eq!(style.points, expected_style.points);
@@ -462,6 +464,8 @@ fn metadata_uses_the_actual_record_budget_and_invalid_large_batch_permanently_re
     let fixture = Fixture::new("Office");
     let mut coordinator = fixture.coordinator();
     let style = MarkdownLineComposeStyle {
+        presentation: crate::MarkdownPresentationStyles::UNDERLINE
+            .union(crate::MarkdownPresentationStyles::STRIKETHROUGH),
         points: 16.0,
         language: Some("x".repeat(64)),
         features: vec![
@@ -480,6 +484,22 @@ fn metadata_uses_the_actual_record_budget_and_invalid_large_batch_permanently_re
     let mut store = fixture.store(MarkdownLineComposeCancellation::new());
     let proof = capture(&mut store, &mut item);
     let restored = store.style(&proof).unwrap();
+    assert_eq!(restored.presentation, style.presentation);
+    // 同一目录真实编码保留原样式及零缩进；样式保留位、负缩进和剩余保留字节都必须拒绝。
+    let encoded = encode_directory(&store.directory(&proof).unwrap()).unwrap();
+    assert_eq!(
+        decode_directory(encoded).unwrap().presentation,
+        style.presentation
+    );
+    assert_eq!(decode_directory(encoded).unwrap().paragraph_inset_26_6, 0);
+    for (offset, bit) in [(43, 0x80), (47, 0x80), (48, 1)] {
+        let mut damaged = encoded;
+        damaged[2][offset] |= bit;
+        assert!(matches!(
+            decode_directory(damaged),
+            Err(Error::InconsistentCoverage)
+        ));
+    }
     assert_eq!(restored.features, style.features);
     assert_eq!(restored.language, style.language);
     store.seal_items().unwrap();

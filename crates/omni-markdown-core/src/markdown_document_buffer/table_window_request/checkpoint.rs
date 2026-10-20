@@ -427,6 +427,15 @@ impl ReplayRequest {
             header_utf16: self.anchors.header_utf16.clone(),
             delimiter_utf16: self.anchors.delimiter_utf16.clone(),
             body,
+            inline_rows: row
+                .map(|_| {
+                    self.boundary
+                        .checkpoint
+                        .last_inline_row()
+                        .expect("目标原行已经真实接受，after-row checkpoint 保留同一行来源")
+                })
+                .into_iter()
+                .collect(),
             math_rows,
             include_header: self.target == 0,
             next_required_row: None,

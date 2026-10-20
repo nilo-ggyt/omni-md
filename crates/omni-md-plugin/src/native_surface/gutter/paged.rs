@@ -26,17 +26,21 @@ use super::labels::LineNumberFont;
 use crate::native_surface::{
     paged_body::{NativeMarkdownPagedBody, scene::Scene},
     paged_text_view::{
-        NativeMarkdownPagedCloseReceipt, NativeMarkdownPagedTextView,
+        NativeMarkdownPagedCloseReceipt, NativeMarkdownPagedTextScene, NativeMarkdownPagedTextView,
         NativeMarkdownPagedTextViewError as Error,
     },
     viewport_pixels::{Bitmap, NativeMarkdownViewportPixels},
 };
 
 type Result<T> = std::result::Result<T, Error>;
+mod folding;
 
 /// 原canonical逻辑行与同次已度量软行的交集；续行没有伪造的行号，仍保活动底色。
 pub(in crate::native_surface) struct GutterRow {
+    pub logical_line: usize,
     pub number: Option<usize>,
+    pub may_fold: bool,
+    pub folded: bool,
     pub frame: NSRect,
     pub active: bool,
 }
@@ -111,8 +115,13 @@ define_class!(
         fn draw_rect(&self, _dirty: NSRect) {}
 
         #[unsafe(method(mouseDown:))]
-        /// 原lineNumbers()没有数字区事件处理；不擅自增加整行选择或折叠交互。
-        fn mouse_down(&self, _event: &NSEvent) {}
+        /// 原 Source 行号点击仍执行同一折叠动作，迟到 Scene 没有重捕后继布局的权限。
+        fn mouse_down(&self, event: &NSEvent) {
+            let result = autoreleasepool(|_| self.toggle_fold_at_event(event));
+            if let Err(cause) = result && !matches!(cause, Error::Pending | Error::Revoked) {
+                crate::native_surface::present_native_markdown_error(&cause.to_string());
+            }
+        }
     }
 );
 
@@ -239,6 +248,11 @@ impl NativeMarkdownPagedGutter {
 
     /// 只挂同次发布的弱Scene；行号不会延长原Reader、Source或文档的生命期。
     pub(in crate::native_surface) fn publish(&self, scene: &Rc<Scene>) -> Result<()> {
+        if scene.key().presentation_mode != omni_markdown_core::MarkdownPresentationMode::Source {
+            // 隐藏的源码附件不消费预览排版，也不让已排队的行号绘制保留旧 Source。
+            self.clear_snapshot();
+            return Ok(());
+        }
         scene.gutter_rows()?;
         if self.ivars().closed.get() {
             return Err(Error::Revoked);
@@ -255,6 +269,47 @@ impl NativeMarkdownPagedGutter {
             // SAFETY: 只清本自有图层的原contents，provider沿原像素归还回调执行真实munmap。
             unsafe { layer.setContents(None) };
         }
+    }
+
+    /// 同一个编辑会话只持一份标准 ruler；模式仅改变其可见性，像素立即归还，最终关闭统一拆图。
+    pub(in crate::native_surface) fn set_mode_visibility(
+        &self,
+        visible: bool,
+        current: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        if self.ivars().closed.get() || !current() {
+            return Err(Error::Revoked);
+        }
+        let scroll = self.scroll_view().ok_or(Error::Revoked)?;
+        if !current() {
+            return Err(Error::Revoked);
+        }
+        let actual = scroll.verticalRulerView();
+        if !current()
+            || !actual
+                .as_deref()
+                .is_some_and(|actual| std::ptr::eq::<NSRulerView>(actual, self.as_super()))
+        {
+            return Err(Error::Revoked);
+        }
+        drop(actual); // Native claim 的析构不跨后面的状态变更或 RefCell 借用。
+        self.clear_snapshot();
+        if !current() {
+            return Err(Error::Revoked);
+        }
+        self.setNeedsDisplay(false); // 隐藏期间不让旧脏标记重新创建行号像素。
+        if !current() {
+            return Err(Error::Revoked);
+        }
+        scroll.setRulersVisible(visible);
+        if !current() {
+            return Err(Error::Revoked);
+        }
+        scroll.tile(); // 先完成真实 clip 宽度改变，后继模式目标才按新 lane 排版。
+        if !current() {
+            return Err(Error::Revoked);
+        }
+        Ok(())
     }
 
     /// Weak加载可能进入原生引用计数；先结束槽借用，关闭回调才可取走相同槽。
@@ -387,10 +442,18 @@ impl NativeMarkdownPagedGutter {
                     font.draw(
                         context,
                         number,
-                        bounds.origin.x + bounds.size.width - 1.0 - 3.0,
+                        bounds.origin.x + bounds.size.width - 1.0 - 3.0 - 10.0,
                         frame,
                     )
                 })?;
+                if row.folded || row.may_fold {
+                    folding::draw_fold_marker(
+                        context,
+                        frame,
+                        bounds.origin.x + bounds.size.width - 3.0,
+                        row.folded,
+                    );
+                }
             } // 数字只来自原逻辑行首；后续wrapped行不建立重复标签或折叠标记。
         }
         CGContext::set_rgb_fill_color(Some(context), 37.0 / 255.0, 42.0 / 255.0, 51.0 / 255.0, 1.0);

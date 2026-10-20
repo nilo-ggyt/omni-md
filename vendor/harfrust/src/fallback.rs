@@ -1,9 +1,9 @@
 use read_fonts::types::GlyphId;
 
 use super::plan::ShapePlan;
-use crate::Direction;
 use crate::buffer::{Buffer, GlyphPosition};
 use crate::unicode::*;
+use crate::Direction;
 use crate::{GlyphExtents, Scale, ShaperFont};
 
 struct FallbackShapeContext<'a, 'x, 'c, 'd> {

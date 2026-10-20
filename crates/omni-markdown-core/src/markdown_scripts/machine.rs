@@ -107,7 +107,7 @@ struct Action {
 
 pub(super) struct Machine {
     pub(super) byte: usize,
-    utf16: usize,
+    pub(super) utf16: usize,
     scalar_start: usize,
     pending_utf8: [u8; 4],
     used: usize,
@@ -146,6 +146,155 @@ impl Default for Machine {
     }
 }
 impl Machine {
+    /// 任何原行前 action/cluster 必须先沿原 pump 完成；不能用结构跳转吞掉已接受的正文义务。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(super) fn settle_before_table(
+        &mut self,
+        span: crate::markdown_layout_source::table_rows::TableSpan,
+        store: &mut Store,
+        step: &mut Step,
+        budget: Budget,
+    ) -> Result<bool> {
+        if !self.pump(store, step, budget, false)? {
+            return Ok(false);
+        }
+        if self.byte == span.start.byte && span.start.byte != 0 {
+            return self.settle_hard_boundary(
+                span.start.byte,
+                span.start.utf16,
+                store,
+                step,
+                budget,
+            );
+        }
+        if self
+            .action
+            .as_ref()
+            .is_some_and(|action| action.cluster.start_byte < span.start.byte)
+            || self
+                .cluster
+                .as_ref()
+                .is_some_and(|cluster| cluster.start_byte < span.start.byte)
+            || self
+                .current
+                .as_ref()
+                .is_some_and(|run| run.start_byte < span.start.byte)
+        {
+            return Err(Error::CorruptMetadata);
+        }
+        Ok(true)
+    }
+
+    /// 只有表格内部的未完成 SCX 状态可舍弃；硬边界之前的配对栈已由原 B 段逻辑结清。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(super) fn begin_table_tail(
+        &mut self,
+        span: crate::markdown_layout_source::table_rows::TableSpan,
+    ) {
+        self.held = None;
+        self.cluster = None;
+        self.action = None;
+        self.current = None;
+        self.preceding = None;
+        self.top = store::NONE;
+        self.same_kind = [store::NONE; 65];
+        self.byte = span.tail.byte;
+        self.utf16 = span.tail.utf16;
+        self.used = 0;
+        self.needed = 0;
+        self.pending_utf8 = [0; 4];
+    }
+
+    /// 末 CR/LF 只恢复同一原 GCB scalar 后缀；未终止 EOF 不伪造后继上下文或脚本值。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(super) fn finish_table(
+        &mut self,
+        span: crate::markdown_layout_source::table_rows::TableSpan,
+        tail: &[u8],
+    ) -> Result<()> {
+        if tail.iter().any(|byte| !matches!(*byte, b'\r' | b'\n')) {
+            return Err(Error::CorruptMetadata);
+        }
+        self.cursor = MarkdownGraphemeScalarCursor::default();
+        for byte in tail {
+            self.cursor.push(char::from(*byte));
+        }
+        self.byte = span.end.byte;
+        self.utf16 = span.end.utf16;
+        self.scalar_start = span.end.byte;
+        Ok(())
+    }
+    /// header 的真实 CR/LF 已完整解码，GB4/B 段事实足以结算当前 cluster，无需读取隐藏首字符。
+    #[cfg(feature = "paged-line-compose")]
+    pub(super) fn settle_hard_boundary(
+        &mut self,
+        byte: usize,
+        utf16: usize,
+        store: &mut Store,
+        step: &mut Step,
+        budget: Budget,
+    ) -> Result<bool> {
+        if self.byte != byte || self.utf16 != utf16 || self.used != 0 {
+            return Err(Error::CorruptMetadata);
+        }
+        if !self.pump(store, step, budget, false)? {
+            return Ok(false);
+        }
+        if let Some(cluster) = self.cluster.take() {
+            if !cluster.paragraph
+                || cluster.end_byte != self.byte
+                || cluster.end_utf16 != self.utf16
+            {
+                return Err(Error::CorruptMetadata);
+            }
+            self.action = Some(Action {
+                cluster,
+                phase: Phase::Locate,
+            });
+        }
+        if !self.pump(store, step, budget, false)? {
+            return Ok(false);
+        }
+        if self.current.is_some() || self.held.is_some() || self.top != store::NONE {
+            return Err(Error::CorruptMetadata);
+        }
+        Ok(true)
+    }
+
+    /// 原 B 已结束 header 的配对与 preceding；实际尾终止符只恢复原 GCB 后缀，不授隐区 SCX。
+    #[cfg(feature = "paged-line-compose")]
+    pub(super) fn resume_after_fold(
+        &mut self,
+        span: &crate::markdown_layout_source::folds::FoldSpan,
+        tail: &[u8],
+    ) -> Result<()> {
+        if self.byte != span.header_end.byte
+            || self.held.is_some()
+            || self.cluster.is_some()
+            || self.action.is_some()
+            || self.current.is_some()
+            || self.top != store::NONE
+            || tail.iter().any(|byte| !matches!(*byte, b'\r' | b'\n'))
+        {
+            return Err(Error::CorruptMetadata);
+        }
+        if !tail.is_empty() {
+            self.cursor = MarkdownGraphemeScalarCursor::default();
+            for byte in tail {
+                self.cursor.push(char::from(*byte));
+            }
+        } // 无尾分隔符只允许原 proof 的真实 EOF；后面没有可见 scalar 需要上下文。
+        self.byte = span.end.byte;
+        self.utf16 = span.end.utf16;
+        self.scalar_start = span.end.byte;
+        self.pending_utf8 = [0; 4];
+        self.used = 0;
+        self.needed = 0;
+        self.preceding = None;
+        self.same_kind = [store::NONE; 65];
+        Ok(())
+    }
+
     #[cfg(all(test, feature = "paged-shaping-frontier"))]
     pub(super) fn has_pending_action(&self) -> bool {
         self.action.is_some()

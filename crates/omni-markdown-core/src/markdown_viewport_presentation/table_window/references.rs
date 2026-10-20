@@ -1,5 +1,6 @@
 //! 当前有限投影实际需要的引用查询和值；不创建全文definition目录。
 
+use crate::markdown_viewport_presentation::parser::MarkdownParserSeed;
 use std::{cell::Cell, collections::HashMap};
 
 use pulldown_cmark::{BrokenLink, Parser};
@@ -64,6 +65,48 @@ impl MarkdownTableReferenceQueries {
         actual_document_start: bool,
         math_seeds: Option<&[pulldown_cmark::math_context::TableMathSeed]>,
     ) -> Result<(), MarkdownTableWindowError> {
+        self.collect_with_options(
+            projection,
+            markdown_presentation_options(actual_document_start),
+            math_seeds.map(MarkdownParserSeed::TableRows),
+        )
+    }
+
+    /// 真实 Root Fact 保留自己的 options；查询与最终 Parser 必须共用它，不能重新启用扩展语法。
+    pub(crate) fn from_bounded_inline(
+        projection: &str,
+        options: pulldown_cmark::Options,
+        quota: super::MarkdownTableWindowQuota,
+        seed: Option<MarkdownParserSeed<'_>>,
+    ) -> Result<Self, MarkdownTableWindowError> {
+        let mut result = Self::for_batch(Some(quota));
+        result.collect_with_options(projection, options, seed)?;
+        result.seal_batch();
+        Ok(result)
+    }
+
+    /// 全源配对真正遇到含tick的小块时，在原库存补收该块的实际label；已证值和Missing不重置。
+    pub(crate) fn collect_for_classification(
+        &mut self,
+        source: &str,
+        options: pulldown_cmark::Options,
+    ) -> Result<(), MarkdownTableWindowError> {
+        self.collecting = true;
+        let result = self.collect_with_options(source, options, None);
+        self.seal_batch();
+        if result.is_err() {
+            self.failed = true; // 有限收集失败撤销整个原库存，不能发布只收了一部分label的配对。
+        }
+        result
+    }
+
+    /// 有限整块的原 Parser 只收集实际触发的引用；完整定义仍须原 Global 顺序确认。
+    fn collect_with_options(
+        &mut self,
+        projection: &str,
+        options: pulldown_cmark::Options,
+        seed: Option<MarkdownParserSeed<'_>>,
+    ) -> Result<(), MarkdownTableWindowError> {
         if !self.collecting || self.failed {
             return Err(MarkdownTableWindowError::ReferenceLimit);
         }
@@ -84,13 +127,24 @@ impl MarkdownTableReferenceQueries {
             }
             None
         };
-        let options = markdown_presentation_options(actual_document_start);
-        let mut parser = if let Some(seeds) = math_seeds {
-            // 先由上游有限入口核坐标/数量，不在失败后改走无seed旧分支。
-            Parser::new_with_table_math_seeds(projection, options, Some(&mut observe), seeds)
-                .map_err(|_| MarkdownTableWindowError::ParserMismatch)?
-        } else {
-            Parser::new_with_broken_link_callback(projection, options, Some(&mut observe))
+        let mut parser = match seed {
+            Some(MarkdownParserSeed::Cell(seed)) => {
+                Parser::new_with_table_cell_seed(projection, seed, Some(&mut observe))
+                    .map_err(|_| MarkdownTableWindowError::ParserMismatch)?
+            }
+            Some(MarkdownParserSeed::Atx(leaf)) => {
+                Parser::new_with_atx_leaf_seed(projection, leaf, Some(&mut observe))
+                    .map_err(|_| MarkdownTableWindowError::ParserMismatch)?
+            }
+            Some(MarkdownParserSeed::Scoped(context)) => {
+                Parser::new_with_inline_block_seed(projection, context, Some(&mut observe))
+                    .map_err(|_| MarkdownTableWindowError::ParserMismatch)?
+            }
+            Some(MarkdownParserSeed::TableRows(seeds)) => {
+                Parser::new_with_table_math_seeds(projection, options, Some(&mut observe), seeds)
+                    .map_err(|_| MarkdownTableWindowError::ParserMismatch)?
+            }
+            None => Parser::new_with_broken_link_callback(projection, options, Some(&mut observe)),
         };
         while parser.next().is_some() {
             if failed.get() {
@@ -152,6 +206,17 @@ impl MarkdownTableReferenceQueries {
 
     pub(crate) fn is_ready(&self) -> bool {
         self.finished && !self.failed && !self.collecting
+    }
+
+    /// 原定义解析器的真实目录和续行记录共用当前批次额度，不借另一份库存绕过上限。
+    pub(crate) fn admit_resolution_metadata(
+        &self,
+        bytes: usize,
+    ) -> Result<(), MarkdownTableWindowError> {
+        if let Some(quota) = &self.quota {
+            quota.admit_metadata(bytes)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -288,6 +353,22 @@ impl MarkdownTableReferenceQueries {
             ReferenceValue::Pending | ReferenceValue::Missing => None,
         }
     }
+
+    /// code/HTML优先级需要区分已证缺失和未收集的label；后者不能借普通callback的None伪作Missing。
+    pub(crate) fn resolve_for_classification(
+        &self,
+        normalized_label: &str,
+    ) -> Result<Option<(&str, &str)>, MarkdownTableWindowError> {
+        if !self.is_ready() {
+            return Err(MarkdownTableWindowError::ContextPending);
+        }
+        let folded = folded_label(normalized_label)?;
+        match self.entries.get(&folded) {
+            Some(ReferenceValue::Resolved { destination, title }) => Ok(Some((destination, title))),
+            Some(ReferenceValue::Missing) => Ok(None),
+            Some(ReferenceValue::Pending) | None => Err(MarkdownTableWindowError::ContextPending),
+        }
+    }
 }
 
 fn folded_label(normalized: &str) -> Result<String, MarkdownTableWindowError> {
@@ -307,6 +388,57 @@ fn folded_label(normalized: &str) -> Result<String, MarkdownTableWindowError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// 同库存补收只增加新未知；旧真实Missing、已解析目标和新增定义的first-wins都保持有效。
+    fn code_classification_extension_preserves_verified_queries_and_first_wins() {
+        let mut queries =
+            MarkdownTableReferenceQueries::from_projection("[当前][T] [原缺失][M]", true).unwrap();
+        queries
+            .admit_verified_value("T", "/current", "当前标题")
+            .unwrap();
+        queries.finish_verified_eof();
+        assert_eq!(queries.resolve_for_classification("M"), Ok(None));
+        queries
+            .collect_for_classification("[前置][U] `</u>`", pulldown_cmark::Options::empty())
+            .unwrap();
+        assert!(!queries.is_ready());
+        assert!(
+            queries
+                .admit_verified_value("U", "/first", "首定义")
+                .unwrap()
+        );
+        assert!(
+            !queries
+                .admit_verified_value("U", "/later", "后定义")
+                .unwrap()
+        );
+        queries.finish_verified_eof();
+        assert_eq!(queries.resolve("T"), Some(("/current", "当前标题")));
+        assert_eq!(queries.resolve("U"), Some(("/first", "首定义")));
+        assert_eq!(queries.resolve_for_classification("M"), Ok(None));
+        assert_eq!(
+            queries.resolve_for_classification("未查询"),
+            Err(MarkdownTableWindowError::ContextPending)
+        );
+    }
+
+    #[test]
+    /// 同一个空结果可能是已证缺失或根本没有查询权限；code分类只接受前者。
+    fn code_classification_preserves_unknown_and_verified_missing() {
+        let mut queries =
+            MarkdownTableReferenceQueries::from_projection("[x][wanted]", true).unwrap();
+        assert_eq!(
+            queries.resolve_for_classification("wanted"),
+            Err(MarkdownTableWindowError::ContextPending)
+        );
+        queries.finish_verified_eof();
+        assert_eq!(queries.resolve_for_classification("WANTED"), Ok(None));
+        assert_eq!(
+            queries.resolve_for_classification("uncollected"),
+            Err(MarkdownTableWindowError::ContextPending)
+        );
+    }
 
     #[test]
     fn actual_parser_labels_share_unicode_and_table_escape_queries() {

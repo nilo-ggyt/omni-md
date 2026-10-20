@@ -93,6 +93,7 @@ impl GlyphStore {
                 MarkdownComposedLineKind::Mandatory => 1,
                 MarkdownComposedLineKind::Emergency => 2,
                 MarkdownComposedLineKind::Overflow => 3,
+                MarkdownComposedLineKind::TableRow => return Err(Error::InvalidRequest),
             };
             rows[0][58] = self.paragraph_base_level(bidi, selected.source_utf16.start)?;
             // 同源原段base与单item的resolved level分开，完整Uniform证书不重扫正文。
@@ -177,11 +178,19 @@ impl GlyphStore {
             fonts: self.fonts,
             cancellation: self.cancellation,
             reader,
+            #[cfg(feature = "paged-shaping-frontier")]
+            lineage: Arc::downgrade(&self.identity),
             identity: self.identity,
             last: self.line_end,
             count: self.lines,
             range: 0..self.line_source_end,
             graphemes,
+            folds: self.folds,
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            tables: self.tables.clone(),
         })
     }
 }

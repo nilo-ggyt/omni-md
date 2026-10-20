@@ -1,6 +1,6 @@
 //! Unicode 18 扩展字素的分页索引；正文只借用原冻结piece，不建立第二份正文文件或编码镜像。
 //!
-//! 本模块只产生全局byte/UTF16边界，不计算软行、字体或Native几何。已扫描前缀可以查询；
+//! 本模块只产生原 Source 的byte/UTF16边界，不计算软行、字体或Native几何。已扫描前缀可以查询；
 //! 未确认的后继仍为Pending，真实EOF才是eot。`paged-graphemes`不会自动切换Native路径。
 
 use thiserror::Error;
@@ -13,6 +13,8 @@ use crate::{
 mod machine;
 #[cfg(feature = "paged-shaping-frontier")]
 mod prefix;
+#[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+mod table_rows;
 #[cfg(feature = "paged-shaping-frontier")]
 pub use prefix::{MarkdownGraphemePrefix, MarkdownGraphemePrefixFacts, MarkdownGraphemePrefixRead};
 mod store;
@@ -33,6 +35,10 @@ pub enum MarkdownGraphemeError {
     InvalidBudget,
     #[error("字素查询范围无效")]
     InvalidRange,
+    #[error("字素查询位于显式折叠的隐藏内部")]
+    FoldedRange,
+    #[error("字素查询位于独立表格行内部，须使用该格显示来源")]
+    TableRange,
     #[error("字素源权限不匹配")]
     SourceMismatch,
     #[error("字素坐标或计数溢出")]
@@ -78,6 +84,16 @@ pub enum MarkdownGraphemeStatus {
     Ready,
 }
 
+/// 索引序号所属的实际记录域；两种域的 byte/UTF16 仍使用同一完整 Source 坐标。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarkdownGraphemeOrdinalDomain {
+    Source,
+    /// 仅可见边界与折叠两端；相邻序号之间可能是未分析的显式隐藏范围。
+    FoldedVisible,
+    /// 独立表格块内部没有正文 GCB 权限；序号只覆盖真正正文与结构行两端。
+    TableVisible,
+}
+
 /// 三个独立计费维度；零配额不产生一个可重试的空Pending。
 #[derive(Clone, Copy, Debug)]
 pub struct MarkdownGraphemeBudget {
@@ -110,7 +126,7 @@ pub struct MarkdownGraphemeStorageProfile {
     pub source_utf16: usize,
     pub source_bytes_read: usize,
     pub source_borrow_max_bytes: usize,
-    /// 已证明的逻辑边界数；Dense不为这些边界逐一分配存储行。
+    /// 当前显式记录域中已证明的逻辑边界数；Dense不为这些边界逐一分配存储行。
     pub boundary_count: usize,
     /// 实际匿名索引中的16B行数；Dense始终为0。
     pub boundary_records: usize,
@@ -172,9 +188,23 @@ pub struct MarkdownGraphemeJob {
     source: MarkdownLayoutTextSource,
     machine: machine::Machine,
     failed: bool,
+    // 全局游标可跨过显式隐区；实际读取必须另按真正解引用的 byte 累加。
+    source_bytes_read: usize,
     source_borrow_max: usize,
+    #[cfg(feature = "paged-line-compose")]
+    folds: Option<FoldCursor>,
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    tables: Option<table_rows::State>,
     #[cfg(test)]
     split: Option<usize>,
+}
+
+/// 各算法共享同一端点证明；本 job 只保留自己的推进位置，不复制范围表或正文。
+#[cfg(feature = "paged-line-compose")]
+struct FoldCursor {
+    plan: crate::markdown_layout_source::folds::FoldPlan,
+    next: usize,
+    tail: bool,
 }
 
 impl MarkdownGraphemeJob {
@@ -214,10 +244,52 @@ impl MarkdownGraphemeJob {
             source,
             machine,
             failed: false,
+            source_bytes_read: 0,
             source_borrow_max: 0,
+            #[cfg(feature = "paged-line-compose")]
+            folds: None,
+            #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+            tables: None,
             #[cfg(test)]
             split: None,
         })
+    }
+
+    /// 只在尚未读取原源时装入同 Source 的显式折叠；普通无折叠任务的表示与序号不变。
+    #[cfg(feature = "paged-line-compose")]
+    pub(crate) fn install_fold_plan(
+        &mut self,
+        plan: crate::markdown_layout_source::folds::FoldPlan,
+    ) -> Result<()> {
+        self.guard(plan.authority())?;
+        if plan.spans().is_empty() {
+            return Ok(());
+        } // 空显示意图不替换 Dense 或增加普通任务的第二套初始化状态。
+        if self.machine.byte != 0 || self.machine.ready || self.index.len() != 0 {
+            self.failed = true;
+            return Err(MarkdownGraphemeError::InvalidRange);
+        }
+        self.folds = Some(FoldCursor {
+            plan,
+            next: 0,
+            tail: false,
+        });
+        self.source.health().inspect_err(|_| self.failed = true)?;
+        Ok(())
+    }
+
+    /// 计数和 prefix 读取都以此域解释序号；折叠域绝不声称提供原全源 GCB ordinal。
+    #[must_use]
+    pub(crate) fn ordinal_domain(&self) -> MarkdownGraphemeOrdinalDomain {
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if self.tables.is_some() {
+            return MarkdownGraphemeOrdinalDomain::TableVisible;
+        }
+        #[cfg(feature = "paged-line-compose")]
+        if self.folds.is_some() {
+            return MarkdownGraphemeOrdinalDomain::FoldedVisible;
+        }
+        MarkdownGraphemeOrdinalDomain::Source
     }
 
     /// 原流式/真实FD故障oracle显式走分页表示，不让Dense跳过被测I/O或分块边界。
@@ -279,11 +351,33 @@ impl MarkdownGraphemeJob {
             step.status = MarkdownGraphemeStatus::Ready;
             return Ok(step);
         }
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if table_rows::advance(self, budget, &mut step)? {
+            return Ok(step);
+        }
         let source = &self.source;
         let start = self.machine.byte;
         let end = start
             .saturating_add(budget.bytes.min(MARKDOWN_GRAPHEME_SOURCE_BYTES))
             .min(self.source.byte_len());
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        let end = table_rows::read_end(self, end);
+        #[cfg(feature = "paged-line-compose")]
+        let fold = self
+            .folds
+            .as_ref()
+            .and_then(|cursor| cursor.plan.spans().get(cursor.next).copied())
+            .map(|span| (span, self.folds.as_ref().is_some_and(|cursor| cursor.tail)));
+        #[cfg(feature = "paged-line-compose")]
+        let end = fold.map_or(end, |(span, tail)| {
+            end.min(if tail {
+                span.end.byte
+            } else if start < span.start.byte {
+                span.start.byte
+            } else {
+                span.header_end.byte
+            })
+        }); // 每次借用止于真正控制边界；隐藏行体从不进入 visitor。
         #[cfg(test)]
         let end = self
             .split
@@ -301,7 +395,17 @@ impl MarkdownGraphemeJob {
                     stopped = true;
                     return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
                 }
-                if let Err(error) = self.machine.push(*byte, &mut self.index, &mut step) {
+                self.source_bytes_read += 1;
+                #[cfg(feature = "paged-line-compose")]
+                let pushed = if fold.is_some_and(|(_, tail)| tail) {
+                    self.machine
+                        .push_fold_tail(*byte, &mut self.index, &mut step)
+                } else {
+                    self.machine.push(*byte, &mut self.index, &mut step)
+                };
+                #[cfg(not(feature = "paged-line-compose"))]
+                let pushed = self.machine.push(*byte, &mut self.index, &mut step);
+                if let Err(error) = pushed {
                     failure = Some(error);
                     return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
                 }
@@ -318,6 +422,39 @@ impl MarkdownGraphemeJob {
         if let Some(error) = failure {
             return Err(error);
         }
+        #[cfg(feature = "paged-line-compose")]
+        if let Some((span, tail)) = fold {
+            if tail && self.machine.byte == span.end.byte {
+                if self.machine.utf16 != span.end.utf16 || self.machine.used != 0 {
+                    return Err(MarkdownGraphemeError::CorruptMetadata);
+                }
+                let cursor = self
+                    .folds
+                    .as_mut()
+                    .expect("原 fold cursor 仍由本次推进持有");
+                cursor.next += 1;
+                cursor.tail = false;
+            } else if !tail && self.machine.byte == span.header_end.byte {
+                // 首 CRLF 已由原 DFA 完整消费；仅末真实 CRLF 还需读，其他隐藏内容不解码。
+                let target = if span.header_end == span.end {
+                    span.end
+                } else {
+                    span.tail_start
+                };
+                self.machine
+                    .jump_fold(span.header_end, target, span.start)?;
+                let cursor = self
+                    .folds
+                    .as_mut()
+                    .expect("原 fold cursor 仍由本次推进持有");
+                if target == span.end {
+                    cursor.next += 1;
+                    cursor.tail = false;
+                } else {
+                    cursor.tail = true;
+                }
+            }
+        }
         if self.machine.byte == self.source.byte_len() {
             // 只在真实冻结源EOF结算；完整UTF16聚合和逐标量计数必须一致，不能用短读补eot。
             if self.machine.used != 0 || self.machine.utf16 != self.source.utf16_len() {
@@ -330,10 +467,11 @@ impl MarkdownGraphemeJob {
         Ok(step)
     }
 
-    /// 只查询已经发布的边界。Previous/Next为严格前驱/后继，允许观察UTF8内部或低代理项坐标。
+    /// 只查询当前显式域已经发布的边界；Previous/Next 是该域的严格前驱/后继。
+    /// 普通域允许观察UTF8内部或低代理项坐标，折叠隐藏内部则以 FoldedRange 明确拒绝。
     ///
     /// # Errors
-    /// 越界、外来权限或元数据错误永久撤权；Pending不冒充不存在的边界。
+    /// 越界、外来权限或元数据错误永久撤权；FoldedRange 保留健康任务供可见位置继续使用。
     pub fn query(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,
@@ -343,17 +481,33 @@ impl MarkdownGraphemeJob {
     ) -> Result<MarkdownGraphemeAnswer> {
         self.guard(authority)?;
         let result = self.query_inner(unit, offset, query);
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        let result = result.and_then(|answer| {
+            if let (MarkdownGraphemeAnswer::Known(Some(value)), Some(state)) =
+                (&answer, &self.tables)
+                && state.cursor.plan.contains(value.utf16, true)?
+            {
+                return Err(MarkdownGraphemeError::TableRange);
+            }
+            Ok(answer)
+        });
         let result = match self.source.health() {
             Err(error) => Err(error.into()),
             Ok(()) => result,
         };
-        if result.is_err() {
+        if result.as_ref().is_err_and(|error| {
+            !matches!(
+                error,
+                MarkdownGraphemeError::FoldedRange | MarkdownGraphemeError::TableRange
+            )
+        }) {
             self.failed = true;
         }
         result
     }
 
-    /// 只在原扫描真实Ready后暴露record数；None表示未知，不能被行输出解释为零个边界。
+    /// 只在当前记录域真实Ready后暴露record数；须与 ordinal_domain 一起解释。
+    /// None 表示未知，不能被行输出解释为零个边界或原全源总数。
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn ready_boundary_count(
         &mut self,
@@ -415,6 +569,23 @@ impl MarkdownGraphemeJob {
         if offset > maximum {
             return Err(MarkdownGraphemeError::InvalidRange);
         }
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if let Some(tables) = &self.tables
+            && tables
+                .cursor
+                .plan
+                .contains(offset, unit == MarkdownGraphemeUnit::Utf16)?
+        {
+            return Err(MarkdownGraphemeError::TableRange);
+        }
+        #[cfg(feature = "paged-line-compose")]
+        if self.folds.as_ref().is_some_and(|cursor| {
+            cursor
+                .plan
+                .hides(offset, unit == MarkdownGraphemeUnit::Utf16)
+        }) {
+            return Err(MarkdownGraphemeError::FoldedRange);
+        } // 合法的隐藏内部查询是显示域拒绝，不伪造不存在的全源边界，也不损坏健康 job。
         if self.index.is_dense() {
             // 原精确证明使每个整数位置均为GCB，严格Previous/Next只做checked坐标运算。
             // 虽然无页读取，外层仍在前后检查同Source健康与原authority。
@@ -436,41 +607,66 @@ impl MarkdownGraphemeJob {
             })));
         }
         let known = self.machine.frontier.is_some_and(|b| position(b) >= offset);
+        if !known
+            && matches!(
+                query,
+                MarkdownGraphemeQuery::IsBoundary | MarkdownGraphemeQuery::Previous
+            )
+        {
+            // 原稳定前沿尚未分类这个位置，两种查询原本也只能返回Pending。
+            // 不为一个必定未知的结果遍历旧记录；外层Source健康后验与表格/折叠拒绝仍照常生效。
+            return Ok(MarkdownGraphemeAnswer::Pending);
+        }
         let mut low = 0;
         let mut high = self.index.len();
+        // 只保本次二分真正读到的两侧边界，不跨query保存，也不添索引页或来源缓存。
+        // 循环结束时左值就是严格前驱，右值就是lower_bound，不能再读同一原record来取结果。
+        let mut previous = None;
+        let mut following = None;
+        if let Some(page) = self.index.append_page_records()?
+            && !page.is_empty()
+        {
+            // 当前前沿通常位于原16KiB追加页内。先消费该页首条真实记录，便可在RAM区间
+            // 内完成后继二分；旧位置仍查原FD，不预读旧页，也不增加驻留记录或来源强边。
+            let first = self.index.get(page.start)?;
+            if position(first) < offset {
+                low = page.start + 1;
+                high = page.end;
+                previous = Some(first);
+            } else {
+                high = page.start;
+                following = Some(first); // 旧区间的严格Next可能恰好就是追加页首记录。
+                if position(first) == offset {
+                    low = page.start;
+                    if matches!(query, MarkdownGraphemeQuery::Previous) && page.start != 0 {
+                        // 页首不能拿自身冒充严格前驱；上一条仍必须读取原FD的真实记录。
+                        previous = Some(self.index.get(page.start - 1)?);
+                    }
+                }
+            }
+        }
         while low < high {
             let middle = low + (high - low) / 2;
-            if position(self.index.get(middle)?) < offset {
+            let boundary = self.index.get(middle)?;
+            if position(boundary) < offset {
                 low = middle + 1;
+                previous = Some(boundary);
             } else {
                 high = middle;
+                following = Some(boundary);
             }
         }
         match query {
-            MarkdownGraphemeQuery::IsBoundary => {
-                if !known {
-                    return Ok(MarkdownGraphemeAnswer::Pending);
-                }
-                if low < self.index.len() {
-                    let boundary = self.index.get(low)?;
-                    if position(boundary) == offset {
+            MarkdownGraphemeQuery::IsBoundary => Ok(MarkdownGraphemeAnswer::Known(
+                following.filter(|boundary| position(*boundary) == offset),
+            )),
+            MarkdownGraphemeQuery::Previous => Ok(MarkdownGraphemeAnswer::Known(previous)),
+            MarkdownGraphemeQuery::Next => {
+                if let Some(boundary) = following {
+                    if position(boundary) != offset {
                         return Ok(MarkdownGraphemeAnswer::Known(Some(boundary)));
                     }
-                }
-                Ok(MarkdownGraphemeAnswer::Known(None))
-            }
-            MarkdownGraphemeQuery::Previous => {
-                if !known {
-                    return Ok(MarkdownGraphemeAnswer::Pending);
-                }
-                Ok(MarkdownGraphemeAnswer::Known(if low == 0 {
-                    None
-                } else {
-                    Some(self.index.get(low - 1)?)
-                }))
-            }
-            MarkdownGraphemeQuery::Next => {
-                if low < self.index.len() && position(self.index.get(low)?) == offset {
+                    // Next是严格后继；当前边界已由二分交付，只在相等时再读真正下一条记录。
                     low += 1;
                 }
                 if low < self.index.len() {
@@ -499,11 +695,7 @@ impl MarkdownGraphemeJob {
             generation: self.source.generation(),
             source_bytes: self.source.byte_len(),
             source_utf16: self.source.utf16_len(),
-            source_bytes_read: if self.index.is_dense() {
-                0
-            } else {
-                self.machine.byte
-            },
+            source_bytes_read: self.source_bytes_read,
             source_borrow_max_bytes: self.source_borrow_max,
             boundary_count: self.index.len(),
             boundary_records: self.index.physical_records(),
@@ -536,3 +728,19 @@ impl MarkdownGraphemeJob {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-line-compose",
+    feature = "paged-shaping-frontier"
+))]
+impl MarkdownGraphemeJob {
+    /// 结构跳跃只在原 machine 已消费真实行尾后完成，尚未提交端点保持待决。
+    pub(crate) fn table_passed(&self, end: usize) -> bool {
+        self.machine.utf16 >= end
+            && self
+                .machine
+                .last_committed_boundary()
+                .is_some_and(|value| value.utf16 >= end)
+    }
+}

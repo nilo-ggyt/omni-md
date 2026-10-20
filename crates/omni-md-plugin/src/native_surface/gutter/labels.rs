@@ -78,7 +78,7 @@ impl LineNumberFont {
             digits += 1;
         }
         // 原CM用同位数的连续9撑宽；border-box的最小20已经包含左右padding。
-        (self.advances[9] * digits as f64 + 5.0 + 3.0).max(20.0) + 1.0
+        (self.advances[9] * digits as f64 + 5.0 + 3.0).max(20.0) + 1.0 + 10.0
     }
 
     /// 右对齐同一逻辑行的有限数字；usize最多二十位，全部字形和位置只占固定栈数组。

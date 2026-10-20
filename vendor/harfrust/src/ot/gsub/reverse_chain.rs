@@ -1,6 +1,6 @@
 use crate::buffer::GlyphInfo;
 use crate::ot::apply::ApplyContext;
-use crate::ot::apply::{Apply, WouldApply, WouldApplyContext, match_backtrack, match_lookahead};
+use crate::ot::apply::{match_backtrack, match_lookahead, Apply, WouldApply, WouldApplyContext};
 use crate::ot::layout::MAX_NESTING_LEVEL;
 use read_fonts::tables::gsub::ReverseChainSingleSubstFormat1;
 

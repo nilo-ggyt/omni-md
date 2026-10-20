@@ -27,13 +27,13 @@ pub(in crate::native_surface) struct NativeMarkdownViewportPixels {
 }
 
 /// 只保活固定原子事实；观察者自身不会延长context、provider、image或mmap生命期。
-#[cfg(any(test, feature = "native-paged-layout-probe"))]
+#[cfg(any(test, feature = "native-paged-production"))]
 #[derive(Clone)]
 pub struct NativeMarkdownViewportPixelObserver(
     pub(in crate::native_surface) Arc<NativeMarkdownViewportPixels>,
 );
 
-#[cfg(any(test, feature = "native-paged-layout-probe"))]
+#[cfg(any(test, feature = "native-paged-production"))]
 #[derive(Clone, Copy, Debug)]
 pub struct NativeMarkdownViewportPixelSnapshot {
     pub live_pixel_buffers: usize,
@@ -45,7 +45,7 @@ pub struct NativeMarkdownViewportPixelSnapshot {
     pub peak_pixel_bytes: usize,
 }
 
-#[cfg(any(test, feature = "native-paged-layout-probe"))]
+#[cfg(any(test, feature = "native-paged-production"))]
 impl NativeMarkdownViewportPixels {
     pub(in crate::native_surface) fn observer(
         self: &Arc<Self>,
@@ -64,7 +64,7 @@ impl NativeMarkdownViewportPixels {
         }
     }
 }
-#[cfg(any(test, feature = "native-paged-layout-probe"))]
+#[cfg(any(test, feature = "native-paged-production"))]
 impl NativeMarkdownViewportPixelObserver {
     pub fn snapshot(&self) -> NativeMarkdownViewportPixelSnapshot {
         self.0.snapshot()
@@ -117,7 +117,7 @@ impl Drop for PixelAllocation {
 #[cfg(any(
     test,
     feature = "native-raster-surface-probe",
-    feature = "native-paged-body-probe"
+    feature = "native-paged-production"
 ))]
 pub(in crate::native_surface) struct Bitmap {
     allocation: Arc<PixelAllocation>,
@@ -134,7 +134,7 @@ fn rgba_info() -> CGBitmapInfo {
 #[cfg(any(
     test,
     feature = "native-raster-surface-probe",
-    feature = "native-paged-body-probe"
+    feature = "native-paged-production"
 ))]
 impl Bitmap {
     pub(in crate::native_surface) fn new(
@@ -148,9 +148,9 @@ impl Bitmap {
             return Err("光栅视口超过像素上限".into()); // 不降采样或裁切来制造低内存通过。
         }
         // Paged正文与行号共用同一真实页账；窄图也不能在原32MiB存活预算外分配。
-        #[cfg(feature = "native-paged-body-probe")]
+        #[cfg(feature = "native-paged-production")]
         let budget = Some(tiled::LIVE_PIXEL_BUDGET);
-        #[cfg(not(feature = "native-paged-body-probe"))]
+        #[cfg(not(feature = "native-paged-production"))]
         let budget = None;
         let allocation = allocate(length, counters, budget).map_err(|error| error.to_string())?;
         let context = make_context(&allocation, 0, width, height, row_bytes)
@@ -241,7 +241,7 @@ pub(in crate::native_surface) enum PixelError {
     InvalidGeometry,
     #[error("绘制context未真实归还，不能封存或复用像素")]
     ContextRetained,
-    #[cfg(any(test, feature = "native-paged-layout-probe"))]
+    #[cfg(any(test, feature = "native-paged-production"))]
     #[error("原视口仍有未完成tile，不能发布部分图像")]
     IncompleteViewport,
     #[error("{0}")]
@@ -462,7 +462,7 @@ fn seal_format(
 }
 
 /// 只有已逐像素证明opaque-neutral的瓦片能调用；A8保存255-gray，原sRGB字节不变。
-#[cfg(any(test, feature = "native-paged-layout-probe"))]
+#[cfg(any(test, feature = "native-paged-production"))]
 fn seal_neutral_mask(
     allocation: &Arc<PixelAllocation>,
     width: usize,
@@ -524,17 +524,17 @@ fn image_provider(
     Ok(provider)
 }
 
-#[cfg(any(test, feature = "native-paged-layout-probe"))]
+#[cfg(any(test, feature = "native-paged-production"))]
 mod encoding;
-#[cfg(any(test, feature = "native-paged-layout-probe"))]
+#[cfg(any(test, feature = "native-paged-production"))]
 mod paired;
-#[cfg(any(test, feature = "native-paged-layout-probe"))]
+#[cfg(any(test, feature = "native-paged-production"))]
 mod tiled;
-#[cfg(any(test, feature = "native-paged-layout-probe"))]
+#[cfg(any(test, feature = "native-paged-production"))]
 pub(in crate::native_surface) use paired::{
     CertifiedMaskPairs, MaskCalibrationPixels, MaskCalibrationTable, MaskPaletteRequest,
 };
-#[cfg(any(test, feature = "native-paged-layout-probe"))]
+#[cfg(any(test, feature = "native-paged-production"))]
 pub(in crate::native_surface) use tiled::{
     MAX_TILE_SLOTS, MaskPairBlend, PixelPresentation, PixelTile, PreparedTileEncodingPlan,
     TileFrame, TiledBitmap, WritableTile,

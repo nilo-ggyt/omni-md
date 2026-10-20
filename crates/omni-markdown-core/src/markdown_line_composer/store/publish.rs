@@ -39,10 +39,18 @@ impl GlyphStore {
                 reader,
                 // 每次交付独立输出身份；相同inode、行号或record不能让旧Part跨快照补签。
                 identity: Arc::new(()),
+                #[cfg(feature = "paged-shaping-frontier")]
+                lineage: Arc::downgrade(&self.identity),
                 last: Some(last),
                 count: self.lines,
                 range: 0..self.line_source_end,
                 graphemes,
+                folds: self.folds.clone(),
+                #[cfg(all(
+                    feature = "s2-table-window-prototype",
+                    feature = "paged-shaping-frontier"
+                ))]
+                tables: self.tables.clone(),
             })?))
         })();
         if matches!(result, Err(Error::SnapshotBusy)) {

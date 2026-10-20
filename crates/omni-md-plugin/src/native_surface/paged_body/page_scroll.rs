@@ -42,8 +42,10 @@ impl PendingPageScroll {
         actual.target.is_body(&actual.document)
             && Weak::ptr_eq(&actual.document, &self.request.document)
             && actual.input == self.request.input
-            && actual.bounds_width == self.request.bounds_width
-            && actual.viewport.size == self.request.viewport.size
+            && actual.virtual_viewport.layout_width == self.request.virtual_viewport.layout_width
+            && actual.virtual_viewport.layout_origin_x
+                == self.request.virtual_viewport.layout_origin_x
+            && actual.viewport.size.height == self.request.viewport.size.height
     }
 
     pub(super) fn matches(

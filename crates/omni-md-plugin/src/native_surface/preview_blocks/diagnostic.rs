@@ -8,15 +8,6 @@ use objc2_app_kit::{
 };
 use objc2_foundation::NSNotificationCenter;
 
-#[cfg(feature = "native-markdown-runtime-probe")]
-mod paint_receipts;
-#[cfg(feature = "native-markdown-runtime-probe")]
-pub(in crate::native_surface) use paint_receipts::{
-    CodePaintReceipt, MAX_PROBE_CODE_REQUEST_UTF16, NativeMarkdownPreviewBlockProbeSnapshot,
-    ProbeBlockKey, cancel_code_paint_for_body, code_paint_sequence, code_snapshot_matches,
-    matching_code_paint, observe_code_paint, painted_current, prepared,
-};
-
 thread_local! {
     static SEEN: Cell<u16> = const { Cell::new(0) };
 }

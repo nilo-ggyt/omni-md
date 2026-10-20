@@ -74,14 +74,52 @@ fn blocks(source: &str, width: usize) -> Vec<VerifiedGlobalInlineBlock> {
     panic!("真实 GlobalFrontier 没有结束");
 }
 
-fn limits(source: &str) -> InlineOriginLimits {
-    InlineOriginLimits {
+fn limits(source: &str) -> BlockOriginLimits {
+    BlockOriginLimits {
         max_byte_work: source.len().saturating_mul(1000) + 1_000_000,
         max_transitions: source.len().saturating_mul(10000) + 1_000_000,
     }
 }
 
-fn collect(source: &str, cursor: &mut InlineOriginCursor, width: usize) -> Vec<InlineOriginLine> {
+#[test]
+/// 两遍原 Parser 的真实 Code/Math 规范化和跨行 Link 值必须一致，样式位相同本身不足以证明功能。
+fn bounded_scoped_parser_preserves_original_inline_values_across_physical_prefixes() {
+    for source in [
+        "> **中文** ` 代码\n> \t续行😀 ` 和 $甲\n> 乙$\n",
+        "> - [跨行链接](\n>   https://example.com/across\n>   \"实际 &amp; 标题\") 与 ` a\r\n>   \tb `\r\n",
+        "- > [链接](https://example.com/a \"标题\") 与 ` \n  > \t `\n",
+        "> 标题 ` 多行\n> 代码😀 ` 和 $甲\n> 乙$\n> ===\n",
+    ] {
+        let block = blocks(source, 1).into_iter().find(|block| block.scope_depth() > 1).unwrap();
+        let physical = block.physical_range();
+        let (origins, seed) = block.into_origins_and_semantic_seed(limits(source)).unwrap();
+        drop(origins); // 只保这次真实闭合 seed；不存在另一个运行中的来源生产者或手造内部状态。
+        let mut context = seed.bounded_paragraph_context(super::super::InlinePlainLimits {
+            max_byte_work: limits(source).max_byte_work,
+            max_transitions: limits(source).max_transitions,
+        }).unwrap().unwrap();
+        let raw = &source[physical.clone()];
+        for _ in 0..source.len() * 100 + 10000 {
+            context.advance(raw, authority(), 4096).unwrap();
+            if context.is_complete() { break; }
+            assert!(!context.is_unsupported());
+        }
+        assert!(context.is_complete());
+        let interesting = |event: &crate::Event<'_>| matches!(event,
+            crate::Event::Code(_) | crate::Event::InlineMath(_) | crate::Event::DisplayMath(_)
+            | crate::Event::Start(crate::Tag::Link { .. }));
+        let expected = Parser::new_ext(source, dialect()).into_offset_iter()
+            .filter(|(event, _)| interesting(event))
+            .map(|(event, range)| (event.into_static(), range)).collect::<Vec<_>>();
+        let actual = Parser::<crate::DefaultBrokenLinkCallback>::new_with_inline_block_seed(raw, &context, None)
+            .unwrap().into_offset_iter().filter(|(event, _)| interesting(event))
+            .map(|(event, range)| (event.into_static(), range.start + physical.start..range.end + physical.start))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "source={source:?}");
+    }
+}
+
+fn collect(source: &str, cursor: &mut BlockOriginCursor, width: usize) -> Vec<BlockOriginLine> {
     let mut result = Vec::new();
     let mut total = GlobalWork::default();
     for _ in 0..source.len().saturating_mul(100) + 10000 {
@@ -100,18 +138,18 @@ fn collect(source: &str, cursor: &mut InlineOriginCursor, width: usize) -> Vec<I
             )
             .unwrap_or_else(|error| panic!("{error:?} source={source:?} cursor={cursor:?}"));
         let work = match &step {
-            InlineOriginStep::Progress { work, .. }
-            | InlineOriginStep::NeedInput { work, .. }
-            | InlineOriginStep::Line { work, .. }
-            | InlineOriginStep::Complete { work } => *work,
+            BlockOriginStep::Progress { work, .. }
+            | BlockOriginStep::NeedInput { work, .. }
+            | BlockOriginStep::Line { work, .. }
+            | BlockOriginStep::Complete { work } => *work,
         };
         assert!(work.byte_reads <= 4096 && work.transitions <= 4096);
         total.byte_reads += work.byte_reads;
         total.transitions += work.transitions;
         assert_eq!(cursor.total_work(), total);
         match step {
-            InlineOriginStep::Line { line, .. } => result.push(line),
-            InlineOriginStep::Complete { .. } => return result,
+            BlockOriginStep::Line { line, .. } => result.push(line),
+            BlockOriginStep::Complete { .. } => return result,
             _ => (), // NeedInput 没有完成行，更不代表 source EOF。
         }
     }
@@ -252,25 +290,25 @@ fn compare(source: &str, width: usize) {
             assert_eq!(actual.matched_depth(), matched);
             assert_eq!(actual.total_depth(), roles.len());
             assert_eq!(actual.is_terminal(), eol_end == lexical.end);
-            assert_eq!(actual.block_kind(), kind);
+            assert_eq!(actual.block_kind(), super::BlockOriginKind::Inline(kind));
             assert_eq!(
                 actual.kind(),
                 if ordinal == 0 {
-                    InlineOriginLineKind::First
+                    BlockOriginLineKind::First
                 } else {
-                    InlineOriginLineKind::Continuation
+                    BlockOriginLineKind::Continuation
                 }
             );
             if let Some(state) = container {
                 assert_eq!(
                     actual.container_state(),
-                    InlineOriginState::capture(physical, state)
+                    BlockOriginState::capture(physical, state)
                 );
             }
             if let Some(state) = final_state {
                 assert_eq!(
                     actual.content_state(),
-                    InlineOriginState::capture(physical, state)
+                    BlockOriginState::capture(physical, state)
                 );
             }
             physical = eol_end;
@@ -331,11 +369,11 @@ fn first_line_preserves_original_opening_tab_state_without_continuation_rescan()
         let rows = collect(source, &mut cursor, 1);
         assert_eq!(
             rows[0].container_state(),
-            InlineOriginState::capture(0, expected)
+            BlockOriginState::capture(0, expected)
         );
         assert_eq!(
             rows[0].content_state(),
-            InlineOriginState::capture(0, expected)
+            BlockOriginState::capture(0, expected)
         );
     }
 }
@@ -381,9 +419,9 @@ fn false_frame_eof_is_rejected_and_missing_real_eof_cannot_close_the_last_line()
             )
             .unwrap();
         match step {
-            InlineOriginStep::Line { line, .. } => seen.push(line),
-            InlineOriginStep::NeedInput { next_byte, .. } if next_byte == source.len() => break,
-            InlineOriginStep::Complete { .. } => panic!("frame 尾不能关闭无 EOL 末行"),
+            BlockOriginStep::Line { line, .. } => seen.push(line),
+            BlockOriginStep::NeedInput { next_byte, .. } if next_byte == source.len() => break,
+            BlockOriginStep::Complete { .. } => panic!("frame 尾不能关闭无 EOL 末行"),
             _ => (),
         }
     }
@@ -401,7 +439,7 @@ fn false_frame_eof_is_rejected_and_missing_real_eof_cannot_close_the_last_line()
         )
         .unwrap();
     assert!(
-        matches!(step, InlineOriginStep::Line { line, .. } if line.is_terminal() && line.eol_range().is_empty())
+        matches!(step, BlockOriginStep::Line { line, .. } if line.is_terminal() && line.eol_range().is_empty())
     );
 }
 
@@ -457,11 +495,11 @@ fn cancellation_revision_and_cumulative_fuel_failures_are_sticky() {
         );
     }
     for restricted in [
-        InlineOriginLimits {
+        BlockOriginLimits {
             max_byte_work: 3,
             max_transitions: 1_000_000,
         },
-        InlineOriginLimits {
+        BlockOriginLimits {
             max_byte_work: 1_000_000,
             max_transitions: 4096,
         },
@@ -488,7 +526,7 @@ fn cancellation_revision_and_cumulative_fuel_failures_are_sticky() {
                     failed = true;
                     break;
                 }
-                Ok(InlineOriginStep::Complete { .. }) => panic!("不能逐行重新发放总 fuel"),
+                Ok(BlockOriginStep::Complete { .. }) => panic!("不能逐行重新发放总 fuel"),
                 Ok(_) => (),
                 Err(other) => panic!("意外失败 {other:?}"),
             }
@@ -512,7 +550,7 @@ fn cancellation_revision_and_cumulative_fuel_failures_are_sticky() {
     }
 }
 
-fn cursor_at_child_phase(source: &str, target: Phase) -> InlineOriginCursor {
+fn cursor_at_child_phase(source: &str, target: Phase) -> BlockOriginCursor {
     // 从真实闭合 Global 票据逐字节驱动到续行阶段；不手工构造来源权限或内部扫描器。
     let mut cursor = blocks(source, 1)
         .remove(0)
@@ -542,7 +580,7 @@ fn cursor_at_child_phase(source: &str, target: Phase) -> InlineOriginCursor {
             )
             .unwrap();
         assert!(
-            !matches!(step, InlineOriginStep::Complete { .. }),
+            !matches!(step, BlockOriginStep::Complete { .. }),
             "真实多行夹具应先经过目标续行阶段"
         );
     }
@@ -712,7 +750,7 @@ fn dense_short_lines_pay_actual_workspace_events_with_original_core_fuel_at_mini
             assert_eq!(block.lexical_range(), expected[0].2);
             let observer = block.spine.clone();
             let mut cursor = block
-                .into_line_origins(InlineOriginLimits {
+                .into_line_origins(BlockOriginLimits {
                     max_byte_work: source.len() * 256 + 1024 * 1024,
                     max_transitions: source.len() * 2048 + 1024 * 1024,
                 })
@@ -742,10 +780,10 @@ fn dense_short_lines_pay_actual_workspace_events_with_original_core_fuel_at_mini
                     )
                     .unwrap();
                 let work = match &step {
-                    InlineOriginStep::Progress { work, .. }
-                    | InlineOriginStep::NeedInput { work, .. }
-                    | InlineOriginStep::Line { work, .. }
-                    | InlineOriginStep::Complete { work } => *work,
+                    BlockOriginStep::Progress { work, .. }
+                    | BlockOriginStep::NeedInput { work, .. }
+                    | BlockOriginStep::Line { work, .. }
+                    | BlockOriginStep::Complete { work } => *work,
                 };
                 assert!(
                     work.byte_reads <= budget && work.transitions <= budget,
@@ -790,7 +828,7 @@ fn dense_short_lines_pay_actual_workspace_events_with_original_core_fuel_at_mini
                 total.transitions += work.transitions;
                 assert_eq!(cursor.total_work(), total);
                 match step {
-                    InlineOriginStep::Line { line, .. } => {
+                    BlockOriginStep::Line { line, .. } => {
                         // 独立物理字节 oracle 不调用新来源输出计算期望边界，也不保整篇行集合。
                         let content_end = physical
                             + source.as_bytes()[physical..]
@@ -807,7 +845,7 @@ fn dense_short_lines_pay_actual_workspace_events_with_original_core_fuel_at_mini
                         physical = eol_end;
                         rows += 1;
                     }
-                    InlineOriginStep::Complete { .. } => {
+                    BlockOriginStep::Complete { .. } => {
                         completed = true;
                         break;
                     }

@@ -157,13 +157,21 @@ mod segmented {
             let options = Options::ENABLE_TABLES | Options::ENABLE_MATH;
             let rows = crate::firstpass::capture_math_rows(source, options);
             assert!(rows.len() >= 3);
-            let header_end = source[rows[0].0..].find('\n').map_or(source.len(), |n| rows[0].0 + n + 1);
+            let header_end = source[rows[0].0..]
+                .find('\n')
+                .map_or(source.len(), |n| rows[0].0 + n + 1);
             for width in 1..=19 {
-                let mut current = scan(source, rows[0].0..header_end, MathContext::default(), width);
+                let mut current =
+                    scan(source, rows[0].0..header_end, MathContext::default(), width);
                 for &(start, expected) in &rows {
                     // capture与scan都只用真实行内容起点，容器prefix不能污染数学状态。
-                    assert_eq!(current, expected, "width={width}, row={start}, source={source:?}");
-                    let end = source[start..].find('\n').map_or(source.len(), |n| start + n + 1);
+                    assert_eq!(
+                        current, expected,
+                        "width={width}, row={start}, source={source:?}"
+                    );
+                    let end = source[start..]
+                        .find('\n')
+                        .map_or(source.len(), |n| start + n + 1);
                     current = scan(source, start..end, current, width);
                 }
             }

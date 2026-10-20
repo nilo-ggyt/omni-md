@@ -48,6 +48,22 @@ impl NativeMarkdownComposedViewport {
         self.caret_geometry_impl(source_utf16, affinity, Some(side), current)
     }
 
+    /// 场景路由只消费原已准备行的真实kind与既有换行侧；不从源字符或范围长度猜结构块。
+    /// 用于识别只在正文overscan内、未产生可见Grid窗口的表格，不能为它合成font0文字几何。
+    pub(in crate::native_surface) fn table_row_at(
+        &self,
+        position: usize,
+        affinity: NativeMarkdownPagedHeadAffinity,
+        current: &dyn Fn() -> bool,
+    ) -> Result<bool> {
+        self.require(current)?;
+        let index = self.caret_line_index(position, affinity)?;
+        let table = self.lines[index].handle.facts().kind
+            == omni_markdown_core::MarkdownComposedLineKind::TableRow;
+        self.require(current)?;
+        Ok(table)
+    }
+
     fn caret_geometry_impl(
         &self,
         source_utf16: usize,
@@ -59,6 +75,9 @@ impl NativeMarkdownComposedViewport {
         let index = self.caret_line_index(source_utf16, affinity)?;
         self.require(current)?; // 原Reader租约已结束，真实Source错误仍先于缺页或撤权。
         let line = &self.lines[index];
+        if line.handle.facts().kind == omni_markdown_core::MarkdownComposedLineKind::TableRow {
+            return Err(NativeMarkdownComposedViewportError::Pending);
+        } // 结构块没有文字字号或caret；真正格位置由外层同源Grid提供，不放宽字体guard。
         let selected = side
             .map(|side| self.caret_part_index(line, source_utf16, side))
             .transpose()?;

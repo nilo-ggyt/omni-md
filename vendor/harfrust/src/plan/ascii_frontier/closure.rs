@@ -1,10 +1,10 @@
 //! 单输入查表的保守非缺字闭包；cmap覆盖不能代替实际可达替换输出证明。
 use super::*;
 use read_fonts::{
-    FontData, FontRead,
     tables::gsub::{
         AlternateSubstFormat1, MultipleSubstFormat1, SingleSubstFormat1, SingleSubstFormat2,
     },
+    FontData, FontRead,
 };
 
 /// 固定字形编号域的实际查表事实，不是当前Source或软行权限。

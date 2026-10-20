@@ -31,6 +31,8 @@ pub struct MarkdownTextSnapshot {
 ///
 /// 稀疏索引沿用原segment编号，避免为了连续索引保活已经删除、仅供历史使用的段。
 struct FrozenText {
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    projection: Option<Arc<super::display_projection::DisplayProjection>>,
     root: PieceTreeLink,
     original_snapshot: Option<Arc<OriginalBacking>>,
     original_range: Range<usize>,
@@ -49,6 +51,57 @@ struct FrozenText {
 }
 
 impl MarkdownTextSnapshot {
+    /// 表格物理行只能绑定当前 canonical 根；同内容另一文档、旧代次与局部显示值不能补签。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(crate) fn shares_current_table_root(&self, document: &MarkdownDocumentBuffer) -> bool {
+        self.text.projection.is_none()
+            && self.text.generation == document.generation
+            && self.text.draft_guard.is_none()
+            && self.text.root.as_ref().is_some_and(|root| {
+                document
+                    .root
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(root, current))
+            })
+    }
+    /// 原树与显示目录是不同读取来源；调用者必须显式选择，不能把投影的 None root 当成空文档。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(super) fn display_projection(
+        &self,
+    ) -> Option<&Arc<super::display_projection::DisplayProjection>> {
+        self.text.projection.as_ref()
+    }
+
+    /// 只从真实封存显示目录建立冻结值；没有活动 Doc、正文复制或显示 AVL 节点。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(crate) fn from_display_projection(
+        projection: Arc<super::display_projection::DisplayProjection>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            text: Arc::new(FrozenText {
+                projection: Some(projection),
+                root: None,
+                original_snapshot: None,
+                original_range: 0..0,
+                edits: HashMap::new(),
+                edit_backings: Vec::new(),
+                utf16_read_cache: Arc::new(Mutex::new(read_cache::Utf16ReadCache::default())),
+                generation,
+                draft_guard: None,
+                _draft_read_claim: None,
+            }),
+        }
+    }
+
+    /// 摘要必须与实际读取字节同源；显示路径只取转换时已累积的真实可见标量事实。
+    fn metrics(&self) -> MarkdownDocumentMetrics {
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if let Some(projection) = self.display_projection() {
+            return projection.metrics();
+        }
+        piece_tree_metrics(&self.text.root)
+    }
     /// 只建立原树路径；混合端点的真实字节读取留给原调用方配额。
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn begin_printable_ascii_suffix(
@@ -123,6 +176,8 @@ impl MarkdownTextSnapshot {
         generation: u64,
     ) -> Self {
         let mut text = FrozenText {
+            #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+            projection: None,
             root: root.clone(),
             original_snapshot: None,
             original_range: document.original_range.clone(),
@@ -140,6 +195,28 @@ impl MarkdownTextSnapshot {
         Self {
             text: Arc::new(text),
         }
+    }
+
+    /// 只读格共享原树切片；即使本格全为编辑片或为空，仍保原 Doc 来源的真实 I/O 健康事实。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        any(
+            feature = "paged-graphemes",
+            feature = "paged-line-breaks",
+            feature = "paged-shaping"
+        )
+    ))]
+    pub(super) fn capture_table_cell_root(
+        document: &MarkdownDocumentBuffer,
+        root: &PieceTreeLink,
+    ) -> Self {
+        let mut snapshot = Self::capture_root(document, root, &document.edits, document.generation);
+        let text = Arc::get_mut(&mut snapshot.text).expect("新只读格 Frozen 尚未共享");
+        if text.original_snapshot.is_none() {
+            // 这张格票来自原表格结构；源错误不能因切片恰无 Original piece 而退化为成功。
+            text.original_snapshot = document.original_snapshot.clone();
+        }
+        snapshot
     }
 
     /// 同一Frozen构造完成后，在唯一新Arc上安装原草稿门；普通Source不能提供这些封闭参数。
@@ -176,6 +253,10 @@ impl MarkdownTextSnapshot {
     /// 原映射的原子健康事实，不持有正文强边；草稿保留原健康owner，canonical纯编辑值仍为None。
     #[must_use]
     pub fn original_backing_observer(&self) -> Option<crate::MarkdownOriginalBackingObserver> {
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if let Some(projection) = self.display_projection() {
+            return projection.raw().original_backing_observer();
+        }
         let observer = self
             .text
             .original_snapshot
@@ -196,20 +277,20 @@ impl MarkdownTextSnapshot {
     #[must_use]
     /// 从冻结root的缓存聚合读取真实UTF-8字节数，不扫描正文。
     pub fn byte_len(&self) -> usize {
-        piece_tree_metrics(&self.text.root).byte_len
+        self.metrics().byte_len
     }
 
     #[must_use]
     /// 从冻结root的缓存聚合读取真实UTF-16单元数，不建立编码镜像。
     pub fn utf16_len(&self) -> usize {
-        piece_tree_metrics(&self.text.root).utf16_len
+        self.metrics().utf16_len
     }
 
     /// 原逐scalar计量相等即没有代理对；这个字符域事实只证明UTF16端点，不证明GCB或段落。
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn utf16_boundaries_are_scalar(&self) -> Result<bool, MarkdownDocumentBufferError> {
         self.text.source_health()?;
-        let metrics = piece_tree_metrics(&self.text.root);
+        let metrics = self.metrics();
         let dense = metrics.character_count == metrics.utf16_len;
         self.text.source_health()?;
         Ok(dense)
@@ -231,6 +312,10 @@ impl MarkdownTextSnapshot {
         request: Range<usize>,
     ) -> Result<Range<usize>, MarkdownDocumentBufferError> {
         self.text.source_health()?;
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if let Some(projection) = self.display_projection() {
+            return projection.text_checking_paragraph_range(request);
+        }
         text_checking_range::paragraph_range(self.text.as_ref(), self.text.root.as_deref(), request)
     }
 
@@ -246,6 +331,10 @@ impl MarkdownTextSnapshot {
         &self,
         range: Range<usize>,
     ) -> Result<bool, MarkdownDocumentBufferError> {
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if let Some(projection) = self.display_projection() {
+            return projection.is_printable_ascii_range(range);
+        }
         printable_ascii::query(self.text.as_ref(), self.text.root.as_deref(), range)
     }
 
@@ -258,6 +347,17 @@ impl MarkdownTextSnapshot {
         authority: crate::MarkdownLayoutTextAuthority,
     ) -> Result<MarkdownAsciiWordRun, MarkdownDocumentBufferError> {
         self.text.source_health()?;
+        #[cfg(feature = "s2-table-window-prototype")]
+        if let Some(projection) = self.display_projection() {
+            if position > self.utf16_len()
+                || !projection.metrics().all_printable_ascii.is_printable()
+            {
+                return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
+            }
+            return Ok(MarkdownAsciiWordRun::new_display(
+                position, forward, authority,
+            ));
+        }
         if position > self.utf16_len()
             || !self
                 .text
@@ -272,6 +372,35 @@ impl MarkdownTextSnapshot {
         Ok(run)
     }
 
+    /// 显示目录只授其同长连续 raw run；全 ASCII 证明属于已封存 display 摘要，不在构造时重扫。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub(super) fn begin_scoped_ascii_word_run(
+        &self,
+        position: usize,
+        forward: bool,
+        authority: crate::MarkdownLayoutTextAuthority,
+        range: Range<usize>,
+    ) -> Result<MarkdownAsciiWordRun, MarkdownDocumentBufferError> {
+        self.text.source_health()?;
+        if self.display_projection().is_some()
+            || range.start > position
+            || position > range.end
+            || range.end > self.utf16_len()
+        {
+            return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
+        }
+        Ok(MarkdownAsciiWordRun::new_range(
+            &self.text.root,
+            position,
+            forward,
+            authority,
+            range,
+        ))
+    }
+
     /// 同一冻结payload在访问前后核真实健康；每步只消费调用方剩余的原bytes/scalar/metadata。
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn advance_ascii_word_run(
@@ -282,6 +411,12 @@ impl MarkdownTextSnapshot {
         metadata: usize,
     ) -> Result<MarkdownAsciiWordStep, MarkdownDocumentBufferError> {
         self.text.source_health()?;
+        #[cfg(feature = "s2-table-window-prototype")]
+        if let Some(projection) = self.display_projection() {
+            let result = run.advance_display(projection, bytes, scalars, metadata);
+            self.text.source_health()?;
+            return result;
+        }
         let result = run.advance(self.text.as_ref(), bytes, scalars, metadata);
         self.text.source_health()?;
         result
@@ -294,13 +429,7 @@ impl MarkdownTextSnapshot {
         &self,
     ) -> Result<Option<bool>, MarkdownDocumentBufferError> {
         self.text.source_health()?;
-        let class = self
-            .text
-            .root
-            .as_ref()
-            .map_or(PrintableAsciiClass::WithoutLetters, |root| {
-                root.metrics().all_printable_ascii
-            });
+        let class = self.metrics().all_printable_ascii;
         self.text.source_health()?; // 正聚合也不能掩盖查询期间真实到达的原映射错误。
         Ok(class.has_letters())
     }
@@ -312,13 +441,7 @@ impl MarkdownTextSnapshot {
         &self,
     ) -> Result<MarkdownUnicodeProperties, MarkdownDocumentBufferError> {
         self.text.source_health()?;
-        let properties = self
-            .text
-            .root
-            .as_ref()
-            .map_or_else(MarkdownUnicodeProperties::default, |root| {
-                root.metrics().unicode_properties
-            });
+        let properties = self.metrics().unicode_properties;
         self.text.source_health()?;
         Ok(properties)
     }
@@ -329,6 +452,10 @@ impl MarkdownTextSnapshot {
         utf16_offset: usize,
     ) -> Result<usize, MarkdownDocumentBufferError> {
         self.text.source_health()?;
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if let Some(projection) = self.display_projection() {
+            return projection.byte_offset_for_utf16(utf16_offset);
+        }
         if utf16_offset > self.utf16_len() {
             // 在下降树前拒绝越界；EOF仍是可用于空范围的真实边界。
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
@@ -347,6 +474,10 @@ impl MarkdownTextSnapshot {
         byte_offset: usize,
     ) -> Result<usize, MarkdownDocumentBufferError> {
         self.text.source_health()?;
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if let Some(projection) = self.display_projection() {
+            return projection.utf16_offset_for_byte(byte_offset);
+        }
         if byte_offset > self.byte_len() {
             // 先校验总体范围，避免叶解码器借用不存在的前缀。
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
@@ -384,6 +515,10 @@ impl MarkdownTextSnapshot {
         destination: &mut [u16],
     ) -> Result<(), MarkdownDocumentBufferError> {
         self.text.source_health()?;
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if let Some(projection) = self.display_projection() {
+            return projection.copy_utf16_code_units(utf16_offset, destination);
+        }
         let mut cache = self
             .text
             .utf16_read_cache
@@ -409,6 +544,10 @@ impl MarkdownTextSnapshot {
         mut visit: impl FnMut(&[u8]) -> Result<(), MarkdownDocumentBufferError>,
     ) -> Result<(), MarkdownDocumentBufferError> {
         self.text.source_health()?;
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if let Some(projection) = self.display_projection() {
+            return projection.visit_byte_range(range, &mut visit);
+        }
         if range.start > range.end || range.end > self.byte_len() {
             // 倒置或越界在第一次回调之前拒绝；空值仅有0..0可访问。
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
@@ -480,6 +619,10 @@ fn retain_piece_sources(
 
 impl PieceByteSource for FrozenText {
     fn source_health(&self) -> Result<(), MarkdownDocumentBufferError> {
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if let Some(projection) = &self.projection {
+            return projection.health();
+        }
         #[cfg(feature = "s2-table-window-prototype")]
         let guarded = if let Some(guard) = &self.draft_guard {
             // 原受控capture给guard与Original叶同一Doc backing，且纯编辑raw仍保原Source健康。

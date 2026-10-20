@@ -1,11 +1,11 @@
 use super::*;
-use crate::Direction;
-use crate::ShaperFont;
 use crate::normalize::NormalizationMode;
 use crate::once::Once;
 use crate::ot::map::*;
 use crate::plan::ShapePlan;
 use crate::unicode::*;
+use crate::Direction;
+use crate::ShaperFont;
 use crate::{GlyphInfo, Mask, Script, Tag};
 use alloc::boxed::Box;
 

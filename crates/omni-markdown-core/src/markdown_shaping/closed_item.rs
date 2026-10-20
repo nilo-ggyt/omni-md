@@ -1,7 +1,7 @@
 //! 消费原协调器的小闭项票；端点不重新定位，实际整形仍只使用原Job装配路径。
 
 use super::*;
-use crate::markdown_line_composer::ClosedItem;
+use crate::markdown_line_composer::{ClosedItem, ClosedShapingInput};
 
 struct Payload {
     source: MarkdownLayoutTextSource,
@@ -43,12 +43,17 @@ impl PendingClosedShaping {
         if !font.permits(font_authority) {
             return Err(MarkdownShapingError::FontMismatch);
         } // 原Style选定的真实Font身份不由名字、face编号或相同轴值替代。
-        let (utf16, bytes, cancellation) = closed.into_input(authority, font_authority)?;
+        let ClosedShapingInput {
+            source_utf16: utf16,
+            source_bytes: bytes,
+            context_bytes: context_bounds,
+            cancellation,
+        } = closed.into_input(authority, font_authority, source.byte_len())?;
         if cancellation.requested() {
             return Err(MarkdownShapingError::Cancelled);
         } // 已取消时不创建Buffer或借邻接上下文；源首错在此之前已经核验。
         let validated = options::ValidatedOptions::new(options, &font)?;
-        let context = ContextInput::new(&bytes, source.byte_len());
+        let context = ContextInput::new(&bytes, context_bounds);
         Ok(Self {
             payload: Some(Payload {
                 source,
@@ -142,11 +147,11 @@ struct ContextInput {
 }
 
 impl ContextInput {
-    fn new(bytes: &Range<usize>, length: usize) -> Self {
+    fn new(bytes: &Range<usize>, bounds: Range<usize>) -> Self {
         Self {
             ranges: [
-                bytes.start.saturating_sub(20)..bytes.start,
-                bytes.end..bytes.end.saturating_add(20).min(length),
+                bytes.start.saturating_sub(20).max(bounds.start)..bytes.start,
+                bytes.end..bytes.end.saturating_add(20).min(bounds.end),
             ],
             raw: [[0; 20]; 2],
             used: [0; 2],

@@ -18,7 +18,7 @@ use omni_markdown_core::{
     MarkdownComposedLine, MarkdownComposedLines, MarkdownDocumentBuffer, MarkdownLayoutTextSource,
     MarkdownLineComposeAnswer, MarkdownLineComposeBudget, MarkdownLineComposeCancellation,
     MarkdownLineComposeError, MarkdownLineComposeStyle, MarkdownLineComposer,
-    MarkdownLineFontCatalog,
+    MarkdownLineFontCatalog, MarkdownPresentationStyles,
 };
 use omni_md_plugin::native_surface::{
     paged_fonts::NativeMarkdownPagedFont,
@@ -39,6 +39,8 @@ const WIDTH: usize = 720;
 const HEIGHT: usize = 320;
 #[path = "paged_line_viewport/paint_steps.rs"]
 mod paint_steps;
+#[path = "paged_line_viewport/table_cell.rs"]
+mod table_cell;
 #[path = "paged_line_viewport/visual_steps.rs"]
 mod visual_steps;
 struct Canvas {
@@ -82,6 +84,7 @@ fn compose(
     palette: &[Rc<NativeMarkdownLineFont>],
     catalog: MarkdownLineFontCatalog,
     width: i64,
+    presentation: MarkdownPresentationStyles,
 ) -> MarkdownComposedLines {
     let mut composer = MarkdownLineComposer::new(
         source.clone(),
@@ -118,6 +121,7 @@ fn compose(
                                 range,
                                 font.registered(),
                                 MarkdownLineComposeStyle {
+                                    presentation,
                                     points: font.native().point_size() as f32,
                                     language: None,
                                     features: Vec::new(),
@@ -133,6 +137,10 @@ fn compose(
             }
             MarkdownLineComposeAnswer::NeedsControl(request) => {
                 panic!("无控制符夹具出现未处理请求：{request:?}")
+            }
+            // 本夹具未启用真实表格 flow，出现块行请求必须报错，不能吞作普通文字完成。
+            MarkdownLineComposeAnswer::NeedsTableRow(_) => {
+                panic!("非表格夹具出现真实表格行请求")
             }
             MarkdownLineComposeAnswer::NeedsTabPlacement(_) => {
                 panic!("无制表符的有限夹具不能伪造Tab定位")
@@ -278,7 +286,14 @@ fn verify_caret_geometry(
     ));
 }
 
-fn finite_case(mtm: MainThreadMarker, text: &str, width: i64, over_budget: bool, mixed: bool) {
+fn finite_case(
+    mtm: MainThreadMarker,
+    text: &str,
+    width: i64,
+    over_budget: bool,
+    mixed: bool,
+    presentation: MarkdownPresentationStyles,
+) {
     assert!(text.len() <= 16_384); // 原语控制输入上限，不能把整段读取逻辑引入产品。
     let (mapping, source_observer, font_bytes, font_observer, output_observer, weak_doc) =
         autoreleasepool(|_| {
@@ -321,13 +336,20 @@ fn finite_case(mtm: MainThreadMarker, text: &str, width: i64, over_budget: bool,
                     NativeMarkdownLineFont::register(captured, &catalog, &|| true).unwrap(),
                 ));
             }
-            let output = Rc::new(RefCell::new(compose(&source, &palette, catalog, width)));
+            let output = Rc::new(RefCell::new(compose(
+                &source,
+                &palette,
+                catalog,
+                width,
+                presentation,
+            )));
             let output_observer = output.borrow().resource_observer();
             let input = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
             let bounds = NSRect::new(NSPoint::ZERO, NSSize::new(WIDTH as f64, HEIGHT as f64));
             let nonce = NativeMarkdownPagedSceneNonce::new();
             // 几何是本原语控制声明的有限画布；Source/Input/nonce均真实，但不冒充Native View签发的Ready。
             let key = NativeMarkdownPagedSceneKey {
+                presentation_mode: omni_markdown_core::MarkdownPresentationMode::Source,
                 request: NativeMarkdownPagedSceneRequest {
                     document: Rc::downgrade(&document),
                     target: input.target_domain().unwrap(),
@@ -338,6 +360,8 @@ fn finite_case(mtm: MainThreadMarker, text: &str, width: i64, over_budget: bool,
                     geometry_epoch: 1,
                     virtual_viewport: NativeMarkdownPagedVirtualViewport {
                         document_origin: NSPoint::ZERO,
+                        layout_origin_x: 0.0,
+                        layout_width: bounds.size.width,
                         scroll_epoch: 1,
                     },
                 },
@@ -411,7 +435,11 @@ fn finite_case(mtm: MainThreadMarker, text: &str, width: i64, over_budget: bool,
                 visual_steps::verify(&window, &output, &palette, text, &current);
                 let receipt = window.paint(&canvas.context, &current).unwrap();
                 assert!(receipt.glyphs > 0 && receipt.batches > 0 && receipt.missing_glyphs == 0);
-                assert!(canvas.ink() > 0);
+                if presentation.contains(MarkdownPresentationStyles::HIDDEN_MARKER) {
+                    assert_eq!(canvas.ink(), 0); // 真正32.1pt的非空glyph全部透明，不能靠0.1pt字体看似“无墨迹”。
+                } else {
+                    assert!(canvas.ink() > 0); // 两个装饰夹具只有空格；没有实际线像素就不能用字形墨迹蒙混。
+                }
                 paint_steps::matches_finite_oracle(
                     &window,
                     &canvas.pixels,
@@ -538,16 +566,64 @@ fn finite_case(mtm: MainThreadMarker, text: &str, width: i64, over_budget: bool,
 
 fn main() {
     let mtm = MainThreadMarker::new().expect("原生字体控制必须在实际主线程运行");
+    table_cell::verify(mtm);
     finite_case(
         mtm,
         "office office office office office office office office ",
         180 * 64,
         false,
         false,
+        MarkdownPresentationStyles::default(),
     );
-    finite_case(mtm, "office אבג office", 600 * 64, false, true);
-    finite_case(mtm, "office e\u{301} office", 600 * 64, false, false);
-    finite_case(mtm, &"x ".repeat(2_500), 100_000 * 64, true, false);
+    finite_case(
+        mtm,
+        "office אבג office",
+        600 * 64,
+        false,
+        true,
+        MarkdownPresentationStyles::default(),
+    );
+    finite_case(
+        mtm,
+        "office e\u{301} office",
+        600 * 64,
+        false,
+        false,
+        MarkdownPresentationStyles::default(),
+    );
+    finite_case(
+        mtm,
+        &"x ".repeat(2_500),
+        100_000 * 64,
+        true,
+        false,
+        MarkdownPresentationStyles::default(),
+    );
+    // 明确的typed样式只验证真实绘制原语；普通<u>与删除线语法尚无完整RootLeaf发布证明。
+    finite_case(
+        mtm,
+        "XXXXX",
+        600 * 64,
+        false,
+        false,
+        MarkdownPresentationStyles::HIDDEN_MARKER,
+    );
+    finite_case(
+        mtm,
+        "     ",
+        600 * 64,
+        false,
+        false,
+        MarkdownPresentationStyles::UNDERLINE,
+    );
+    finite_case(
+        mtm,
+        "     ",
+        600 * 64,
+        false,
+        false,
+        MarkdownPresentationStyles::STRIKETHROUGH,
+    );
     println!(
         "native_paged_line_viewport budget_rejected_before_draw=true actual_sources_unmapped=true actual_fonts_unmapped=true actual_output_fd_closed=true no_body_textkit=true formal=false"
     );

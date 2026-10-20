@@ -4,7 +4,7 @@ use super::*;
 
 /// 在既有真实probe owner lease内观察旧产品delete:，不以独立NSTextView的行为代替产品合同。
 pub(super) fn observe_delete_baseline(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
     fixture: &str,
 ) -> Result<(), String> {
@@ -178,7 +178,7 @@ struct State {
 }
 
 struct Permission<'a> {
-    surface: &'a NativeMarkdownEditorSurface,
+    surface: &'a NativeMarkdownTextKitEditorSurface,
     controller: &'a Retained<NativeMarkdownController>,
     document: WeakMarkdownDocument,
     generation: u64,
@@ -763,7 +763,7 @@ impl Permission<'_> {
 
 /// 沿原 owner lease 验证真实多选；不创建窗口、嵌套 run loop、重试或第二份全文。
 pub(super) fn verify(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
     fixture: &str,
 ) -> Result<(), String> {

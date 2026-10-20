@@ -25,14 +25,16 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::{CFRetained, CFRunLoop, kCFRunLoopDefaultMode};
 use objc2_core_text::CTFont;
-use objc2_foundation::{MainThreadMarker, NSNotFound, NSPoint, NSRange, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    MainThreadMarker, NSNotFound, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString,
+};
 use objc2_quartz_core::CATransaction;
-use omni_markdown_core::MarkdownDocumentBuffer;
+use omni_markdown_core::{MarkdownDocumentBuffer, MarkdownTextSelection};
 use omni_md_plugin::native_surface::{
     paged_body::{
         NativeMarkdownPagedBody, NativeMarkdownPagedBodyColors,
         NativeMarkdownPagedBodyConfiguration, NativeMarkdownPagedBodyPaintObserver,
-        NativeMarkdownPagedBodyProgress,
+        NativeMarkdownPagedBodyProgress, NativeMarkdownPagedBodyResourceReceipts,
     },
     paged_text_view::{NativeMarkdownPagedSceneKey, NativeMarkdownPagedTextViewError},
 };
@@ -47,6 +49,8 @@ use fixture::SourceFixture;
 mod active_line;
 #[path = "paged_body_source/gutter.rs"]
 mod gutter;
+#[path = "paged_body_source/ime.rs"]
+mod ime;
 #[cfg(feature = "native-markdown-runtime-probe")]
 #[path = "paged_body_source/reentry.rs"]
 mod reentry;
@@ -176,11 +180,434 @@ fn deliver_frame(
     progress
 }
 
+/// 关闭后的检查只消费原生产观察者；保留这些弱收据不能延长 Source、字体、FD 或 worker。
+/// 首帧之前可以确实没有 Reader；需要完整帧的调用方在取得收据时另核 Reader 已存在，
+/// 不能为了统一收据形状创建读者，也不能把尚未创建与曾创建但泄漏混为一谈。
+fn verify_source_release(receipts: Vec<NativeMarkdownPagedBodyResourceReceipts>) {
+    for (index, receipt) in receipts.into_iter().enumerate() {
+        assert!(receipt.source.payload_released());
+        for cell in &receipt.cells {
+            cell.verify_released()
+                .unwrap_or_else(|cause| panic!("generation {index} 原格资源未归还：{cause}"));
+        }
+        for observer in receipt
+            .reader
+            .into_iter()
+            .chain(std::iter::once(receipt.writer))
+        {
+            let actual = observer.snapshot();
+            assert!(
+                !actual.file_open
+                    && actual.mapped_bytes == 0
+                    && !actual.cleanup_failed
+                    && !actual.reader_failed
+                    && actual.source_payload_released,
+                "generation resource {index}: {actual:?}"
+            );
+        }
+        let worker = receipt
+            .worker
+            .snapshot()
+            .expect("资源观察损坏不能视为释放完成");
+        assert!(
+            worker.is_released(),
+            "generation worker {index}: {worker:?}"
+        );
+        for (bytes, payload) in receipt.fonts {
+            assert!(
+                payload.payload_released()
+                    && bytes.unmap_succeeded()
+                    && bytes.mapped_bytes() == 0
+                    && !bytes.failed()
+            );
+        }
+        println!(
+            "paged_body_source original_resource_generation={index} actual_source_released=true actual_reader_writer_closed=true complete_worker_released=true actual_font_bytes_unmapped=true formal=false"
+        );
+    }
+}
+
+/// 字面预期来自这个有限协议样本；不调用可选全文 getter，也不把实际返回值作为期望。
+/// 文稿借用在函数返回时结束，后面的 Native 输入、关闭与候选回调没有 RefCell 借用穿越。
+fn client_text(document: &std::rc::Weak<RefCell<MarkdownDocumentBuffer>>, expected: &str) {
+    let owner = document.upgrade().expect("原协议文稿必须仍由 Body 持有");
+    let document = owner.borrow();
+    let count = expected.encode_utf16().count();
+    let mut units = [0_u16; 64];
+    assert!(count <= units.len());
+    assert_eq!(document.utf16_len(), count);
+    document
+        .copy_utf16_code_units(0, &mut units[..count])
+        .unwrap();
+    assert!(units[..count].iter().copied().eq(expected.encode_utf16()));
+}
+
+/// 协议次序消费正式 Body/View 与原 NSTextInputClient；没有永久 Pending 的测试委托。
+/// 每次文字或选择改变后都等原 CPU 帧，再核正文和历史，显示后果不能代替 canonical 提交。
+fn native_client_protocol(mtm: MainThreadMarker) {
+    let (context, context_weak, view_weak, native, mapping, pixels, receipts, document) =
+        autoreleasepool(|_| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(b" ").unwrap();
+            file.flush().unwrap();
+            let document = Rc::new(RefCell::new(
+                MarkdownDocumentBuffer::open(file.path(), 65_536).unwrap(),
+            ));
+            let document_weak = Rc::downgrade(&document);
+            let mapping = document.borrow().original_backing_observer().unwrap();
+            let frame = NSRect::new(NSPoint::ZERO, NSSize::new(640.0, 240.0));
+            let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
+            let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+            let paragraph = NSParagraphStyle::defaultParagraphStyle();
+            let body = NativeMarkdownPagedBody::attach(
+                document,
+                &scroll,
+                font.as_ref(),
+                &paragraph,
+                NativeMarkdownPagedBodyConfiguration {
+                    presentation_mode: omni_markdown_core::MarkdownPresentationMode::Source,
+                    epoch: 74,
+                    maximum_font_bytes: 512 * 1024 * 1024,
+                    padding: 8.0,
+                    colors: NativeMarkdownPagedBodyColors {
+                        background: [1.0; 4],
+                        active_line: [27.0 / 255.0, 32.0 / 255.0, 42.0 / 255.0, 1.0],
+                        text: [0.0, 0.0, 0.0, 1.0],
+                        selection: [0.7, 0.8, 1.0, 1.0],
+                        caret: [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+                mtm,
+            )
+            .unwrap();
+            let view = body.view().unwrap();
+            let context = view.inputContext().expect("正式 View 必须提供原输入上下文");
+            let context_weak = Weak::from_retained(&context);
+            let view_weak = Weak::from(&**view);
+            let actual_client = context.client();
+            assert!(std::ptr::eq::<AnyObject>(
+                AsRef::<AnyObject>::as_ref(&*actual_client),
+                AsRef::<AnyObject>::as_ref(&**view),
+            ));
+            drop(actual_client); // 输入上下文的客户 claim 不跨后续输入与关闭。
+            let first = observe(&body, Instant::now());
+            // SAFETY: 合成样本沿正式无边框 NSWindow 挂载；外层 Retained 负责关闭后的唯一释放。
+            let window = unsafe {
+                NSWindow::initWithContentRect_styleMask_backing_defer(
+                    NSWindow::alloc(mtm),
+                    frame,
+                    NSWindowStyleMask::Borderless,
+                    NSBackingStoreType::Buffered,
+                    false,
+                )
+            };
+            // SAFETY: 与其余原窗口验收相同，不让系统额外释放 Rust 的独立 claim。
+            unsafe { window.setReleasedWhenClosed(false) };
+            window.setContentView(Some(&scroll));
+            window.orderFrontRegardless();
+            window.displayIfNeeded();
+            deliver_frame("client_protocol_first", &body, first);
+            let mut receipts = vec![body.resource_receipts().unwrap()];
+            let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**view);
+            let unspecified = NSRange::new(NSNotFound as usize, 0);
+
+            // 普通键入先形成独立一笔历史；其后两个候选更新必须仍归同一组合事务。
+            let inserted = observe(&body, Instant::now());
+            // SAFETY: 有限 NSString 同步存活，NSNotFound 由原 Input 解释为当前有向选择。
+            unsafe { client.insertText_replacementRange(&NSString::from_str("a"), unspecified) };
+            deliver_frame("client_protocol_insert", &body, inserted);
+            client_text(&document_weak, "a ");
+            assert!(document_weak.upgrade().unwrap().borrow().can_undo());
+            receipts.push(body.resource_receipts().unwrap());
+            for (candidate, selection, expected, marked) in [
+                ("zh", NSRange::new(2, 0), "azh ", NSRange::new(1, 2)),
+                ("中🙂文", NSRange::new(1, 2), "a中🙂文 ", NSRange::new(1, 4)),
+            ] {
+                let frame = observe(&body, Instant::now());
+                // SAFETY: 组合内选区来自固定完整 UTF16 scalar 边界，不读或改变当前系统输入源。
+                unsafe {
+                    client.setMarkedText_selectedRange_replacementRange(
+                        &NSString::from_str(candidate),
+                        selection,
+                        unspecified,
+                    );
+                }
+                deliver_frame("client_protocol_marked", &body, frame);
+                client_text(&document_weak, expected);
+                assert!(client.hasMarkedText());
+                assert_eq!(client.markedRange(), marked);
+                assert_eq!(
+                    client.selectedRange(),
+                    NSRange::new(1 + selection.location, selection.length)
+                );
+                receipts.push(body.resource_receipts().unwrap());
+            }
+            let committed = observe(&body, Instant::now());
+            // SAFETY: 原客户确认同一组合，最终值仅四个 UTF16 单元；这不是物理输入法验收。
+            unsafe {
+                client.insertText_replacementRange(&NSString::from_str("中文🙂"), unspecified)
+            };
+            deliver_frame("client_protocol_commit", &body, committed);
+            client_text(&document_weak, "a中文🙂 ");
+            assert!(!client.hasMarkedText());
+            receipts.push(body.resource_receipts().unwrap());
+            let before_unmark = view.input_state().unwrap().generation;
+            client.unmarkText();
+            assert_eq!(view.input_state().unwrap().generation, before_unmark);
+
+            // 方向由原 Cocoa 扩选命令产生；代理对仍完整，不能只核排序后的 NSRange。
+            // 选择与折回 caret 不产生文字历史，随后的 Undo 仍只能撤销原组合。
+            for _ in 0..2 {
+                let frame = observe(&body, Instant::now());
+                view.command(sel!(moveLeftAndModifySelection:)).unwrap();
+                deliver_frame("client_protocol_reverse_selection", &body, frame);
+                receipts.push(body.resource_receipts().unwrap());
+            }
+            assert_eq!(
+                view.input_state().unwrap().selection,
+                MarkdownTextSelection {
+                    anchor_utf16: 5,
+                    head_utf16: 2,
+                }
+            );
+            assert_eq!(client.selectedRange(), NSRange::new(2, 3));
+            assert_eq!(view.input_state().unwrap().generation, before_unmark);
+            let collapsed = observe(&body, Instant::now());
+            view.command(sel!(moveRight:)).unwrap();
+            deliver_frame("client_protocol_collapse_selection", &body, collapsed);
+            assert_eq!(client.selectedRange(), NSRange::new(5, 0));
+            assert_eq!(view.input_state().unwrap().generation, before_unmark);
+            receipts.push(body.resource_receipts().unwrap());
+
+            // 组合确认只能是一笔撤销；再一次撤销才回到普通键入之前，重做恢复原精确 caret。
+            for (selector, expected, caret, can_undo, can_redo) in [
+                (sel!(undo:), "a ", 1, true, true),
+                (sel!(undo:), " ", 0, false, true),
+                (sel!(redo:), "a ", 1, true, true),
+                (sel!(redo:), "a中文🙂 ", 5, true, false),
+            ] {
+                let before = view.input_state().unwrap().generation;
+                let frame = observe(&body, Instant::now());
+                view.command(selector).unwrap();
+                deliver_frame("client_protocol_history", &body, frame);
+                client_text(&document_weak, expected);
+                assert_eq!(view.input_state().unwrap().generation, before + 1);
+                assert_eq!(client.selectedRange(), NSRange::new(caret, 0));
+                let owner = document_weak.upgrade().unwrap();
+                let document = owner.borrow();
+                assert_eq!(document.can_undo(), can_undo);
+                assert_eq!(document.can_redo(), can_redo);
+                drop(document);
+                drop(owner);
+                receipts.push(body.resource_receipts().unwrap());
+            }
+            let generation = view.input_state().unwrap().generation;
+            let selected = observe(&body, Instant::now());
+            view.command(sel!(selectAll:)).unwrap();
+            deliver_frame("client_protocol_select_all", &body, selected);
+            assert_eq!(view.input_state().unwrap().generation, generation);
+            assert_eq!(client.selectedRange(), NSRange::new(0, 6));
+            receipts.push(body.resource_receipts().unwrap());
+            let mut actual = NSRange::new(99, 99);
+            // SAFETY: actual 是可写栈值；这次有限不可变返回必须保持完整 emoji，且不跟随后续编辑。
+            let substring = unsafe {
+                client.attributedSubstringForProposedRange_actualRange(
+                    NSRange::new(1, 4),
+                    &mut actual,
+                )
+            }
+            .unwrap();
+            assert_eq!(actual, NSRange::new(1, 4));
+            assert_eq!(substring.string().to_string(), "中文🙂");
+            assert!(!view.respondsToSelector(sel!(attributedString)));
+            for (value, expected) in [("", ""), ("a", "a")] {
+                let frame = observe(&body, Instant::now());
+                // SAFETY: 先真实删除全选，再在原空正文输入；仍由同一 canonical Input 提交。
+                unsafe {
+                    client.insertText_replacementRange(&NSString::from_str(value), unspecified)
+                };
+                deliver_frame("client_protocol_empty_input", &body, frame);
+                client_text(&document_weak, expected);
+                assert!(document_weak.upgrade().unwrap().borrow().can_undo());
+                receipts.push(body.resource_receipts().unwrap());
+            }
+            assert_eq!(substring.string().to_string(), "中文🙂");
+            drop(substring);
+            assert_eq!(std::fs::read(file.path()).unwrap(), b" "); // 未保存协议编辑无权回写原文件。
+
+            let mut native = body.native_weaks().unwrap();
+            native.push(("client-protocol-window", weak(&window)));
+            native.push(("client-protocol-scroll", weak(&scroll)));
+            let pixels = view.pixel_observer().unwrap();
+            let close = body.begin_close().unwrap();
+            assert!(Rc::ptr_eq(&close, &body.begin_close().unwrap()));
+            paged_close_event::wait(&close);
+            close.verify_released().unwrap();
+            assert!(view.inputContext().is_none());
+            window.setContentView(None);
+            window.orderOut(None);
+            window.close();
+            drop((view, body, scroll, window, font, paragraph));
+            CATransaction::flush();
+            // context 刻意由调用方持过原图释放；它不能因此强持 View、Input 或文稿。
+            (
+                context,
+                context_weak,
+                view_weak,
+                native,
+                mapping,
+                pixels,
+                receipts,
+                document_weak,
+            )
+        });
+    assert!(view_weak.load().is_none()); // 外部 context 仍活着时，先证明它没有强持原 View。
+    assert!(document.upgrade().is_none());
+    assert!(context_weak.load().is_some());
+    drop(context);
+    assert!(context_weak.load().is_none());
+    assert!(
+        native
+            .into_iter()
+            .all(|(_, object)| object.load().is_none())
+    );
+    assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0 && !mapping.failed());
+    assert_eq!(pixels.snapshot().live_pixel_bytes, 0);
+    assert!(receipts.iter().all(|receipt| receipt.reader.is_some()));
+    verify_source_release(receipts);
+    println!(
+        "paged_body_source stage=client_protocol actual_body=true marked_unicode=true exact_history=true empty_input=true context_client_nonretaining=true source_disk_unchanged=true actual_native_mmap_font_pixel_released=true physical_ime=false whole_product=false formal=false"
+    );
+}
+
+/// attach 已装配正式委托，但原调度尚未运行，因而这里的 Pending 是真实首帧前状态。
+/// 公开字符协议只读有限子串；随后直接关闭同一 Body，不借测试端口强制布局或注入 Ready。
+fn bounded_pending_client(mtm: MainThreadMarker) {
+    let (native, mapping, pixels, resources) = autoreleasepool(|_| {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for _ in 0..2400 {
+            file.write_all("a😀中".as_bytes()).unwrap();
+        }
+        file.flush().unwrap();
+        let document = Rc::new(RefCell::new(
+            MarkdownDocumentBuffer::open(file.path(), 65_536).unwrap(),
+        ));
+        let document_weak = Rc::downgrade(&document);
+        let mapping = document.borrow().original_backing_observer().unwrap();
+        let before = document.borrow().current_revision().unwrap();
+        let frame = NSRect::new(NSPoint::ZERO, NSSize::new(640.0, 240.0));
+        let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
+        let font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+        let paragraph = NSParagraphStyle::defaultParagraphStyle();
+        let body = NativeMarkdownPagedBody::attach(
+            document,
+            &scroll,
+            font.as_ref(),
+            &paragraph,
+            NativeMarkdownPagedBodyConfiguration {
+                presentation_mode: omni_markdown_core::MarkdownPresentationMode::Source,
+                epoch: 75,
+                maximum_font_bytes: 512 * 1024 * 1024,
+                padding: 8.0,
+                colors: NativeMarkdownPagedBodyColors {
+                    background: [1.0; 4],
+                    active_line: [27.0 / 255.0, 32.0 / 255.0, 42.0 / 255.0, 1.0],
+                    text: [0.0, 0.0, 0.0, 1.0],
+                    selection: [0.7, 0.8, 1.0, 1.0],
+                    caret: [0.0, 0.0, 0.0, 1.0],
+                },
+            },
+            mtm,
+        )
+        .unwrap();
+        let view = body.view().unwrap();
+        let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**view);
+        let context = view.inputContext().unwrap();
+        let mut native = body.native_weaks().unwrap();
+        native.push(("bounded-pending-scroll", weak(&scroll)));
+        native.push(("bounded-pending-context", weak(&context)));
+        let pixels = view.pixel_observer().unwrap();
+        assert_eq!(view.cpu_paints(), Some(0));
+        assert_eq!(pixels.snapshot().live_pixel_bytes, 0);
+        assert!(matches!(
+            view.scene_ready(),
+            Err(NativeMarkdownPagedTextViewError::Pending)
+        ));
+        let mut actual = NSRange::new(99, 99);
+        // SAFETY: proposed 从 emoji 的低代理项开始，原 Input 必须向完整 scalar 边界归一化。
+        let substring = unsafe {
+            client
+                .attributedSubstringForProposedRange_actualRange(NSRange::new(2, 9000), &mut actual)
+        }
+        .unwrap();
+        assert!(actual.length <= 4096 && actual.location == 1);
+        {
+            let document = document_weak.upgrade().unwrap();
+            let document = document.borrow();
+            document.byte_offset_for_utf16(actual.location).unwrap();
+            document
+                .byte_offset_for_utf16(actual.location + actual.length)
+                .unwrap();
+            assert!(document.current_revision().unwrap() == before);
+            assert!(!document.can_undo() && !document.can_redo());
+        }
+        assert_eq!(substring.length(), actual.length);
+        let mut pending = NSRange::new(88, 88);
+        // SAFETY: 尚无实际 Scene 时只能返回协议负值；这不是零坐标的可见 caret。
+        let rect = unsafe {
+            client.firstRectForCharacterRange_actualRange(NSRange::new(0, 0), &mut pending)
+        };
+        assert_eq!(rect, NSRect::ZERO);
+        assert_eq!(pending.location, NSNotFound as usize);
+        assert_eq!(
+            client.characterIndexForPoint(NSPoint::new(0.0, 0.0)),
+            NSNotFound as usize
+        );
+        assert!(view.take_failure().is_none());
+        assert_eq!(view.input_state().unwrap().generation, 0);
+        drop(substring);
+        // 帧坐标只读原公开请求；不记录委托调用次数，实际宽度撤权另由原 targets 流程验证。
+        let previous = view.capture_scene_request().unwrap();
+        view.setFrameOrigin(NSPoint::new(0.0, 12000.0));
+        let current = view.capture_scene_request().unwrap();
+        assert!(current.geometry_epoch > previous.geometry_epoch);
+        assert_eq!(current.frame_in_parent.origin.y, 12000.0);
+        assert_eq!(current.viewport.size.height, previous.viewport.size.height);
+        assert!(matches!(
+            view.scene_ready(),
+            Err(NativeMarkdownPagedTextViewError::Pending)
+        ));
+        let resources = body.resource_receipts().unwrap();
+        assert!(resources.reader.is_none()); // 未执行来源推进，不能为了资源门偷偷创建 Reader。
+        let close = body.begin_close().unwrap();
+        assert!(Rc::ptr_eq(&close, &body.begin_close().unwrap()));
+        paged_close_event::wait(&close);
+        close.verify_released().unwrap();
+        drop((
+            context, current, previous, view, body, scroll, font, paragraph,
+        ));
+        CATransaction::flush();
+        assert!(document_weak.upgrade().is_none());
+        (native, mapping, pixels, resources)
+    });
+    assert!(
+        native
+            .into_iter()
+            .all(|(_, object)| object.load().is_none())
+    );
+    assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0 && !mapping.failed());
+    assert_eq!(pixels.snapshot().live_pixel_bytes, 0);
+    verify_source_release(vec![resources]);
+    println!(
+        "paged_body_source stage=bounded_pending_client actual_body=true bounded_substring=true scalar_edges=true natural_scene_pending=true pending_geometry_rejected=true frame_origin_revoked=true no_frame_fabricated=true actual_native_mmap_font_pixel_released=true whole_product=false formal=false"
+    );
+}
+
 fn main() {
     let mtm = MainThreadMarker::new().expect("测试入口必须在 AppKit 主线程");
     let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("gutter-layouts")) {
+        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         assert!(
             std::env::args_os().nth(2).is_none(),
             "行号布局控制不接受额外参数"
@@ -189,7 +616,30 @@ fn main() {
         gutter::small(mtm);
         return;
     }
-    let fixture = SourceFixture::from_arguments();
+    // 真实输入法入口只改变验收驱动；样本仍是原四MiB单段落，不注入组合文字。
+    let ime_mode = match std::env::args_os().nth(1).as_deref() {
+        Some(argument) if argument == std::ffi::OsStr::new("ime") => Some(ime::Mode::Manual),
+        Some(argument) if argument == std::ffi::OsStr::new("system-ime") => {
+            Some(ime::Mode::Software)
+        }
+        _ => None,
+    };
+    let interactive_ime = ime_mode.is_some();
+    // 临时输入法验收需要可由本人点击的Dock入口；产品仍沿原Accessory策略，不在这里改产品装配。
+    // 其余组件控制保持无Dock入口，不能为无键盘交互的测试抢占前台应用。
+    app.setActivationPolicy(if interactive_ime {
+        NSApplicationActivationPolicy::Regular
+    } else {
+        NSApplicationActivationPolicy::Accessory
+    });
+    let fixture = if interactive_ime {
+        assert!(std::env::args_os().nth(2).is_none());
+        // 实际键盘入口完成AppKit启动通知，输入法才绑定当前应用而非无事件循环的测试进程。
+        app.finishLaunching();
+        SourceFixture::Cjk
+    } else {
+        SourceFixture::from_arguments()
+    };
     process_memory::sample("source_before_open").unwrap();
     let (weak, mapping, pixels) = autoreleasepool(|_| {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -251,19 +701,28 @@ fn main() {
         let view = body.view().unwrap();
         let pixels = view.pixel_observer().unwrap();
         let view_weak = Weak::from(&**view);
-        // SAFETY: 合成测试使用唯一 borderless 窗口；没有红黄绿按钮或新增产品交互。
-        let window = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                NSWindow::alloc(mtm),
-                frame,
-                NSWindowStyleMask::Borderless,
-                NSBackingStoreType::Buffered,
-                false,
-            )
+        // 输入法窗口沿正式浮动层级；默认控制仍使用原唯一无边框窗口。
+        let window = if interactive_ime {
+            ime::window(frame, mtm)
+        } else {
+            // SAFETY: 有效主线程frame和标准NSWindow initializer；Retained接管唯一无边框窗口。
+            unsafe {
+                NSWindow::initWithContentRect_styleMask_backing_defer(
+                    NSWindow::alloc(mtm),
+                    frame,
+                    NSWindowStyleMask::Borderless,
+                    NSBackingStoreType::Buffered,
+                    false,
+                )
+            }
         };
         // SAFETY: Retained 栈持有真实 window 至 close 后，避免额外自动 release。
         unsafe { window.setReleasedWhenClosed(false) };
         window.setContentView(Some(&scroll));
+        if interactive_ime {
+            // 与正式窗口一致，在首次显示前指定正文客户；makeFirstResponder成功本身不证明客户接受了焦点。
+            window.setInitialFirstResponder(Some(&view));
+        }
         window.orderFrontRegardless();
         window.displayIfNeeded();
         deliver("first_frame", &body, first_observer);
@@ -314,6 +773,9 @@ fn main() {
             .copy_utf16_code_units(0, &mut prefix)
             .unwrap();
         assert_eq!(prefix, fixture.edited_prefix());
+        if let Some(mode) = ime_mode {
+            ime::run(&app, &window, &body, &view, &doc_weak, &mut receipts, mode);
+        }
         let clip = scroll.contentView();
         for (scroll_stage, return_stage) in [
             ("actual_scroll_1", "actual_return_to_top_1"),
@@ -368,11 +830,16 @@ fn main() {
         let mut native = body.native_weaks().unwrap();
         native.push(("test-scroll", weak(&scroll)));
         native.push(("test-window", weak(&window)));
+        let pending_key = word::native_before_close(&view);
         let close_started = Instant::now();
         let close = body.begin_close().unwrap();
         assert!(Rc::ptr_eq(&close, &body.begin_close().unwrap()));
         paged_close_event::wait(&close);
         close.verify_released().unwrap();
+        assert!(
+            pending_key.load().is_none(),
+            "真实关闭必须归还尚未交给IME解释的原event"
+        );
         assert!(target_handles.iter().all(|target| !target.is_pending()));
         println!(
             "paged_body_source stage=explicit_close actual_close_ms={:.3} actual_pixels_zero={} formal=false",
@@ -380,6 +847,7 @@ fn main() {
             pixels.snapshot().live_pixel_bytes == 0,
         );
         assert_eq!(pixels.snapshot().live_pixel_bytes, 0);
+        window.setInitialFirstResponder(None); // 临时窗口归还首次焦点配置，不能保留已关闭正文客户。
         window.setContentView(None);
         window.orderOut(None);
         window.close();
@@ -405,44 +873,11 @@ fn main() {
     for (role, weak) in pixels.1 {
         assert!(weak.load().is_none(), "自有 Native role 未实际释放：{role}");
     }
-    for (index, receipt) in pixels.2.into_iter().enumerate() {
-        assert!(receipt.source.payload_released());
-        assert!(receipt.reader.is_some(), "完整帧必须创建真实Reader");
-        for observer in receipt
-            .reader
-            .into_iter()
-            .chain(std::iter::once(receipt.writer))
-        {
-            let actual = observer.snapshot();
-            assert!(
-                !actual.file_open
-                    && actual.mapped_bytes == 0
-                    && !actual.cleanup_failed
-                    && !actual.reader_failed
-                    && actual.source_payload_released,
-                "generation resource {index}: {actual:?}"
-            );
-        }
-        let worker = receipt
-            .worker
-            .snapshot()
-            .expect("资源台账 poison 不是释放成功");
-        assert!(
-            worker.is_released(),
-            "generation worker {index}: {worker:?}"
-        );
-        for (bytes, payload) in receipt.fonts {
-            assert!(
-                payload.payload_released()
-                    && bytes.unmap_succeeded()
-                    && bytes.mapped_bytes() == 0
-                    && !bytes.failed()
-            );
-        }
-        println!(
-            "paged_body_source original_resource_generation={index} actual_source_released=true actual_reader_writer_closed=true complete_worker_released=true actual_font_bytes_unmapped=true formal=false"
-        );
-    }
+    assert!(
+        pixels.2.iter().all(|receipt| receipt.reader.is_some()),
+        "完整帧必须创建真实Reader"
+    );
+    verify_source_release(pixels.2);
     println!(
         "paged_body_source stage=actual_release actual_close_to_all_receipts_ms={:.3} native_weak_nil=true source_worker_font_closed=true actual_mmap_unmapped=true formal=false",
         pixels.3.elapsed().as_secs_f64() * 1000.0,
@@ -454,6 +889,12 @@ fn main() {
     #[cfg(feature = "native-markdown-runtime-probe")]
     reentry::run(mtm);
     process_memory::sample("source_after_all_actual_releases").unwrap();
+    if matches!(fixture, SourceFixture::Ascii) {
+        // 独立短协议与首帧前 Pending 各自拥有真实 Body；原四 MiB 图已严格释放。
+        // cjk 入口仍保完整长文流程，不重复跑同一固定短协议或要求任何输入法操作。
+        native_client_protocol(mtm);
+        bounded_pending_client(mtm);
+    }
     println!(
         "paged_body_source first_frame=true actual_scroll=true actual_canonical_insert=true actual_gcb_navigation=true actual_gcb_delete=true same_source_find_visible=true actual_pixels_zero=true actual_mmap_unmapped=true actual_native_weak_nil=true whole_product=false full_markdown_parity=false formal=false"
     );

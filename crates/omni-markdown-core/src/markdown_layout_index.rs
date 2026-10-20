@@ -427,6 +427,27 @@ impl<const N: usize> PagedLayoutIndex<N> {
     pub(crate) fn len(&self) -> usize {
         self.count
     }
+
+    /// 只描述原唯一追加buffer已初始化的record；不加载旧页，也不创建另一份读取缓存。
+    #[cfg(feature = "paged-graphemes")]
+    pub(crate) fn append_page_records(&mut self) -> Result<Option<std::ops::Range<usize>>> {
+        self.healthy()?;
+        let result = (|| {
+            let Some(page) = &self.page else {
+                return Ok(None); // 尚无真实追加页，不能把未分配的零字节当作可读record。
+            };
+            let start = self.number.checked_mul(PAGE / N).ok_or(Error::Overflow)?;
+            let end = start.checked_add(page.used / N).ok_or(Error::Overflow)?;
+            // page.used只在完整record写入后增长；seal保留同一buffer及其真实有效范围。
+            // 不把整页容量或已flush长度当作初始化长度，最后半页仍只授权实际写过的记录。
+            Ok(Some(start..end))
+        })();
+        if result.is_err() {
+            self.mark_failed(); // 坐标错误仍沿原owner撤权，不由查询优化改签成功或重新建页。
+        }
+        result
+    }
+
     #[cfg(any(feature = "paged-graphemes", feature = "paged-line-breaks"))]
     pub(crate) fn page_loads(&self) -> u64 {
         self.loads
@@ -518,6 +539,12 @@ pub(crate) struct LayoutIndexObserver {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LayoutIndexResources {
     pub(crate) file_open: bool,
+    /// 原 writer 已交付而尚未真实 close 的前缀 FD 数，包含 close 结果未知的未归还名额。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(crate) prefix_readers: usize,
+    /// 原 inode 的真实写入、前缀读取或归还失败，后继前缀继续观察同一撤权事实。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(crate) producer_failed: bool,
     /// Writer已实际close或完成File移交；不声称接收该File的Reader也已关闭。
     #[cfg(any(feature = "paged-graphemes", feature = "paged-shaping"))]
     pub(crate) owner_closed: bool,
@@ -535,6 +562,10 @@ impl LayoutIndexObserver {
     pub(crate) fn snapshot(&self) -> LayoutIndexResources {
         LayoutIndexResources {
             file_open: self.own.file_open.load(Ordering::Acquire),
+            #[cfg(feature = "paged-shaping-frontier")]
+            prefix_readers: self.own.prefix_readers.load(Ordering::Acquire),
+            #[cfg(feature = "paged-shaping-frontier")]
+            producer_failed: self.own.producer_failed.load(Ordering::Acquire),
             #[cfg(any(feature = "paged-graphemes", feature = "paged-shaping"))]
             owner_closed: self.own.owner_closed.load(Ordering::Acquire),
             mapped_bytes: 0,

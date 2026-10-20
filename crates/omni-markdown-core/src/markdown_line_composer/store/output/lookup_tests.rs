@@ -74,6 +74,7 @@ impl Fixture {
                                     range,
                                     &self.font,
                                     MarkdownLineComposeStyle {
+                                        presentation: Default::default(),
                                         points: 16.0,
                                         language: None,
                                         features: Vec::new(),
@@ -291,6 +292,7 @@ fn missing_font_choice(
                                 range,
                                 &fixture.font,
                                 MarkdownLineComposeStyle {
+                                    presentation: Default::default(),
                                     points: 16.0,
                                     language: None,
                                     features: Vec::new(),
@@ -455,17 +457,26 @@ fn corrupted(
         index.append(row).unwrap();
     }
     let payload = output.payload.as_ref().unwrap();
+    let identity = Arc::new(());
     MarkdownComposedLines::from_sealed(OutputSeal {
         source: payload.source.clone(),
         authority: output.authority.clone(),
         fonts: payload.fonts.clone(),
         cancellation: output.cancellation.clone(),
         reader: index.into_reader().unwrap(),
-        identity: Arc::new(()),
+        #[cfg(feature = "paged-shaping-frontier")]
+        lineage: Arc::downgrade(&identity),
+        identity,
         last: output.last,
         count: output.count,
         range: output.range.clone(),
         graphemes: output.graphemes,
+        folds: payload.folds.clone(),
+        #[cfg(all(
+            feature = "s2-table-window-prototype",
+            feature = "paged-shaping-frontier"
+        ))]
+        tables: payload.tables.clone(),
     })
     .unwrap()
 }

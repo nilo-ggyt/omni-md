@@ -11,8 +11,8 @@ fn prepare(composer: &mut MarkdownLineComposer, budget: MarkdownLineComposeBudge
         assert!(step.bytes <= budget.bytes.min(4096));
         assert!(step.scalars <= budget.scalars.min(256));
         assert!(step.metadata_units <= budget.metadata_units.min(256));
-        if let Some(uniform_zero) = step.uniform_zero {
-            return uniform_zero;
+        if let Some(scope) = step.scope {
+            return scope == MarkdownWordMoveScope::WholeUniformZero;
         }
     }
     panic!("同源原Bidi没有完成视觉Word能力准备");
@@ -105,10 +105,10 @@ fn four_mebibyte_word_move_reuses_original_root_proof_and_bounded_gcb() {
             .unwrap();
         bytes += step.bytes;
         assert!(step.bytes <= 4096 && step.scalars <= 256 && step.metadata_units <= 256);
-        if step.uniform_zero == Some(true) {
+        if step.scope == Some(MarkdownWordMoveScope::WholeUniformZero) {
             break;
         }
-        assert_ne!(step.uniform_zero, Some(false));
+        assert_ne!(step.scope, Some(MarkdownWordMoveScope::Unsupported));
     }
     assert!(prepare(&mut composer, MarkdownLineComposeBudget::default()));
     composer

@@ -74,6 +74,7 @@ pub(super) fn run(mtm: MainThreadMarker) {
                                     range,
                                     font.registered(),
                                     MarkdownLineComposeStyle {
+                                        presentation: Default::default(),
                                         points: 15.0,
                                         language: None,
                                         features: Vec::new(),
@@ -99,6 +100,7 @@ pub(super) fn run(mtm: MainThreadMarker) {
                 }
                 MarkdownLineComposeAnswer::Complete => break, // 完整固定短源必须归一行，不省略末尾x/z。
                 MarkdownLineComposeAnswer::NeedsResolution(_)
+                | MarkdownLineComposeAnswer::NeedsTableRow(_)
                 | MarkdownLineComposeAnswer::NeedsTabPlacement(_) => {
                     panic!("原实际left/default Tab必须真实完成，不允许pending代替原生行为")
                 }

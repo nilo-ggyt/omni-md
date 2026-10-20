@@ -22,7 +22,7 @@ impl MarkdownLayoutTextSource {
             generation: facts.content_serial,
             bytes: facts.byte_len,
             utf16: facts.utf16_len,
-            draft: Some(draft),
+            domain: SourceDomain::ActiveCellDraft(draft),
             dropped: PayloadDrop(Arc::new(AtomicBool::new(false))),
         }));
         // 原capture期间的最后门仍属于同nonce；失败时Source和临时capsule按真实Arc寿命归还。
@@ -31,9 +31,12 @@ impl MarkdownLayoutTextSource {
     }
 
     #[must_use]
-    /// None是canonical正文；Some只标识原cell局部域，不提供编辑或跨域坐标转换权限。
+    /// Some 仅标识原活动草稿；None 也可能为只读格，完整坐标域必须查询 domain。
     pub fn cell_draft_authority(&self) -> Option<MarkdownCellDraftSourceAuthority> {
-        self.0.draft.clone()
+        match &self.0.domain {
+            SourceDomain::ActiveCellDraft(authority) => Some(authority.clone()),
+            SourceDomain::Canonical | SourceDomain::ReadOnlyCell(_) => None,
+        }
     }
 }
 

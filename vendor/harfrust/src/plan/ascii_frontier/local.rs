@@ -6,10 +6,10 @@
 
 mod positioned;
 mod read;
-use super::{AsciiFrontierRejection as Rejection, closure::GlyphSet};
+use super::{closure::GlyphSet, AsciiFrontierRejection as Rejection};
 use crate::{
-    Direction, Font, ShapePlan, ShaperFont, Tag,
     ot::{layout::LayoutTableKind, lookup::SubtableKind},
+    Direction, Font, ShapePlan, ShaperFont, Tag,
 };
 pub use positioned::{AsciiPositionedAdvance, AsciiPositionedAdvanceJob};
 use read::Read;
@@ -437,7 +437,7 @@ impl AsciiLocalFrontierJob {
                 {
                     return Err(Rejection::Positioning);
                 } // 真实mark firstCoverage命中时仍无局部能力；不按GDEF类别或正文语言直接跳过。
-                // 每个实际可达glyph都核GDEF；不把“源不是mark”替代替换后glyph属性。
+                  // 每个实际可达glyph都核GDEF；不把“源不是mark”替代替换后glyph属性。
                 if layout.ot.glyph_props(glyph.into()) & 0x0c != 0 {
                     return Err(Rejection::LookupBehavior);
                 }

@@ -4,7 +4,9 @@ use super::*;
 use omni_markdown_core::markdown_document_buffer::{
     MarkdownTableWindowStep, MarkdownTableWindowTarget,
 };
-use omni_markdown_core::{MarkdownCellDraftCommitError, MarkdownCellDraftError};
+use omni_markdown_core::{
+    MarkdownCellDraftCommitError, MarkdownCellDraftError, MarkdownCellDraftHistoryFacts,
+};
 
 const SOURCE: &str = "| H | C |\n| --- | --- |\n| base | other |\n";
 type CellFixture = (
@@ -36,9 +38,11 @@ fn cell_fixture() -> CellFixture {
             }
         }
     };
-    let session =
-        NativeMarkdownPagedCellSession::begin(Rc::downgrade(&document), Rc::new(verified), 1, 0)
-            .unwrap();
+    let source = document
+        .borrow()
+        .verified_table_cell_source(&verified, 1, 0)
+        .unwrap();
+    let session = NativeMarkdownPagedCellSession::begin(Rc::downgrade(&document), source).unwrap();
     let input = NativeMarkdownPagedInput::new_cell(Rc::downgrade(&session)).unwrap();
     (file, document, session, input)
 }
@@ -70,6 +74,14 @@ fn insert(input: &Rc<NativeMarkdownPagedInput>, value: &str) {
 fn actual_cell_ime_and_typing_groups_do_not_publish_canonical_and_match_measured_selections() {
     for ime in [true, false] {
         let (_file, document, session, input) = cell_fixture();
+        // 工具栏按这一个真实局部栈启用；原canonical是否有历史不能替代草稿Undo可用性。
+        assert_eq!(
+            input.cell_history_facts().unwrap(),
+            Some(MarkdownCellDraftHistoryFacts {
+                can_undo: false,
+                can_redo: false,
+            })
+        );
         if ime {
             select(
                 &input,
@@ -97,6 +109,13 @@ fn actual_cell_ime_and_typing_groups_do_not_publish_canonical_and_match_measured
                 insert(&input, candidate);
             }
         }
+        assert_eq!(
+            input.cell_history_facts().unwrap(),
+            Some(MarkdownCellDraftHistoryFacts {
+                can_undo: true,
+                can_redo: false,
+            })
+        );
         let permit = input.capture(1, &|_| true).unwrap();
         let commit = committed(
             input
@@ -116,6 +135,14 @@ fn actual_cell_ime_and_typing_groups_do_not_publish_canonical_and_match_measured
             }
         );
         assert!(commit.state.marked.is_none());
+        // 一组连续输入只撤一次；局部栈耗尽后菜单禁用，不穿透为正文Undo。
+        assert_eq!(
+            input.cell_history_facts().unwrap(),
+            Some(MarkdownCellDraftHistoryFacts {
+                can_undo: false,
+                can_redo: true,
+            })
+        );
         let permit = input.capture(1, &|_| true).unwrap();
         assert!(matches!(
             input
@@ -252,6 +279,63 @@ fn cell_domain_rejects_canonical_and_stale_content_but_selection_keeps_same_sour
 }
 
 #[test]
+/// 只读格和活动草稿即使属于同一 Doc，也不能把局部 UTF16 冒充正文或借用彼此输入权限。
+fn canonical_and_active_draft_domains_both_reject_readonly_raw_cell_sources() {
+    use omni_markdown_core::{MarkdownLayoutTextSource, MarkdownLayoutTextSourceDomain};
+    let (_file, document, session, input) = cell_fixture();
+    let mut request = document.borrow().table_cell_edit_request(0, 1, 0).unwrap();
+    let cell = loop {
+        let document = document.borrow();
+        match request.advance(&document, false, 4096).unwrap() {
+            omni_markdown_core::markdown_document_buffer::MarkdownTableCellEditStep::Progress {
+                ..
+            } => {}
+            omni_markdown_core::markdown_document_buffer::MarkdownTableCellEditStep::Ready {
+                ..
+            } => {
+                break request.take_cell_source_for(&document).unwrap().unwrap();
+            }
+            other => panic!("原格尚未取得结构来源：{other:?}"),
+        }
+    };
+    let raw = MarkdownLayoutTextSource::capture_table_cell(&document.borrow(), &cell).unwrap();
+    let canonical = MarkdownLayoutTextSource::capture(&document.borrow());
+    let draft = session.capture_source().unwrap();
+    let body = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
+    let body_domain = body.target_domain().unwrap();
+    let cell_domain = input.target_domain().unwrap();
+    assert_eq!(raw.domain(), MarkdownLayoutTextSourceDomain::ReadOnlyCell);
+    assert_eq!(
+        canonical.domain(),
+        MarkdownLayoutTextSourceDomain::Canonical
+    );
+    assert_eq!(
+        draft.domain(),
+        MarkdownLayoutTextSourceDomain::ActiveCellDraft
+    );
+    body_domain.require_source(&canonical).unwrap();
+    cell_domain.require_source(&draft).unwrap();
+    for rejected in [&raw, &draft] {
+        assert!(matches!(
+            body_domain.require_source(rejected),
+            Err(NativeMarkdownPagedInputError::StateChanged)
+        ));
+    }
+    for rejected in [&raw, &canonical] {
+        assert!(matches!(
+            cell_domain.require_source(rejected),
+            Err(NativeMarkdownPagedInputError::StateChanged)
+        ));
+    }
+    body.close().unwrap();
+    input.close().unwrap();
+    session.close().unwrap();
+    drop(draft); // 原草稿 reader 真正归还，原只读格不参加这个名额或原会话的取消门。
+    document.borrow_mut().drain_cancelled_cell_draft();
+    raw.byte_offset_for_utf16(4).unwrap();
+}
+
+#[test]
 fn same_original_capsule_cannot_be_rebound_after_external_state_change_or_consumed_twice() {
     let (_file, _document, session, input) = cell_fixture();
     let permit = input.capture(1, &|_| true).unwrap();
@@ -337,7 +421,9 @@ fn prepared_commit_keeps_scene_until_admission_and_consumes_once_after_real_read
     let second = session.capture_source().unwrap();
     let observer = session.resource_observer().unwrap();
     let permit = input.capture(1, &|_| true).unwrap();
-    let prepared = input.prepare_cell_commit(&permit, &|_| true).unwrap();
+    let prepared = input
+        .prepare_cell_commit(&permit, None, None, &|_| true)
+        .unwrap();
     assert!(observer.snapshot().prepared_commit_live);
     assert!(matches!(
         input.commit_cell_observed(prepared, Observe, &|_| true),
@@ -348,13 +434,16 @@ fn prepared_commit_keeps_scene_until_admission_and_consumes_once_after_real_read
     assert_eq!(local_text(&input), "中|😀");
     assert!(!observer.snapshot().prepared_commit_live);
     let permit = input.capture(1, &|_| true).unwrap();
-    let prepared = input.prepare_cell_commit(&permit, &|_| true).unwrap();
+    let prepared = input
+        .prepare_cell_commit(&permit, None, None, &|_| true)
+        .unwrap();
     drop(first);
     drop(second);
     assert!(
         input
             .commit_cell_observed(prepared, Observe, &|_| true)
             .unwrap()
+            .edit
             .is_some()
     );
     assert!(observer.is_released());
@@ -382,7 +471,9 @@ fn two_mebibyte_raw_commit_waits_for_original_readers_and_preserves_one_undo() {
     assert_eq!(state.utf16_len, 2 * 1024 * 1024);
     let observer = session.resource_observer().unwrap();
     let permit = input.capture(1, &|_| true).unwrap();
-    let prepared = input.prepare_cell_commit(&permit, &|_| true).unwrap();
+    let prepared = input
+        .prepare_cell_commit(&permit, None, None, &|_| true)
+        .unwrap();
     // 大结果允许流式准备；实际Scene仍持读取时必须拒绝发布，并归还这份准入结果。
     assert!(observer.snapshot().prepared_commit_live);
     assert!(matches!(
@@ -403,13 +494,16 @@ fn two_mebibyte_raw_commit_waits_for_original_readers_and_preserves_one_undo() {
     }
     assert_eq!(text(&document), SOURCE);
     // 原读取者真正结束后重新准备，仍由同一草稿和唯一canonical事务提交。
-    let prepared = input.prepare_cell_commit(&permit, &|_| true).unwrap();
+    let prepared = input
+        .prepare_cell_commit(&permit, None, None, &|_| true)
+        .unwrap();
     drop(first);
     drop(second);
     assert!(
         input
             .commit_cell_observed(prepared, Observe, &|_| true)
             .unwrap()
+            .edit
             .is_some()
     );
     assert!(observer.is_released());

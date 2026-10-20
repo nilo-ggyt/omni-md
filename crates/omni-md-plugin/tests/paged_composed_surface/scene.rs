@@ -190,7 +190,13 @@ impl NativeMarkdownPagedTextScene for Scene {
         _clicks: usize,
         _anchor: Option<usize>,
         _extend: bool,
-    ) -> Result<MarkdownTextSelection, Error> {
+    ) -> Result<
+        (
+            MarkdownTextSelection,
+            omni_md_plugin::native_surface::paged_text_view::NativeMarkdownPagedHeadAffinity,
+        ),
+        Error,
+    > {
         Err(Error::Pending) // 此组件没有生产选择方向，不拿最近caret伪造真实选择。
     }
     fn navigate(
@@ -399,7 +405,11 @@ impl NativeMarkdownPagedTextViewDelegate for Owner {
         }
         self.active.get()
     }
-    fn virtual_viewport(&self, epoch: u64) -> Result<NativeMarkdownPagedVirtualViewport, Error> {
+    fn virtual_viewport(
+        &self,
+        epoch: u64,
+        _bounds_width: f64,
+    ) -> Result<NativeMarkdownPagedVirtualViewport, Error> {
         if !self.current(epoch) {
             return Err(Error::Revoked);
         }
@@ -411,6 +421,8 @@ impl NativeMarkdownPagedTextViewDelegate for Owner {
             .map_err(|_| Error::Pending)?;
         Ok(NativeMarkdownPagedVirtualViewport {
             document_origin: geometry.document_visible.origin,
+            layout_origin_x: geometry.layout_origin_x,
+            layout_width: geometry.layout_width,
             scroll_epoch: geometry.scroll_epoch,
         }) // RefCell借用已在geometry/current等可重入调用之前结束。
     }

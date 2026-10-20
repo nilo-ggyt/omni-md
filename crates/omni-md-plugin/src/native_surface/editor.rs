@@ -1,6 +1,117 @@
-//! 文稿模型只持唯一Core正文；旧TextKit适配图由实际编辑后端单独创建和释放。
+//! 唯一正式分页表面持有文稿模型；独立 TextKit 机制夹具不参与正式打开和模式切换。
 
 use super::*;
+#[cfg(feature = "native-markdown-runtime-probe")]
+use objc2_app_kit::{
+    NSClipView, NSViewBoundsDidChangeNotification, NSViewFrameDidChangeNotification,
+};
+#[cfg(feature = "native-markdown-runtime-probe")]
+use objc2_foundation::NSNotificationCenter;
+
+mod paged;
+pub(in crate::native_surface) mod viewport;
+pub(super) use paged::NativeMarkdownEditorSurface;
+
+impl NativeMarkdownEditorSurface {
+    /// 保存和业务查询借同一个 canonical 模型；模式只改变此 Body 的真实排版配置。
+    pub(crate) fn document(&self) -> &SharedMarkdownDocument {
+        self.model.document()
+    }
+
+    /// 模式真值归原 Body，不从按钮或已退休 Scene 推断。
+    pub(super) fn presentation_mode(&self) -> MarkdownPresentationMode {
+        self.body.presentation_mode()
+    }
+
+    /// 窗口始终挂载这一个滚动根；切换模式不交换 Native 图。
+    pub(super) fn scroll_view(&self) -> &NSScrollView {
+        &self.scroll_view
+    }
+
+    /// 正文直接实现 NSTextInputClient；Find 和侧栏仍使用其原生字段编辑器。
+    pub(super) fn input_view(&self) -> &NSView {
+        self.text_view.as_super()
+    }
+
+    /// Find 控件、输入历史和释放收据都属于当前文稿会话，模式改变不移动它们。
+    pub(super) fn find_bar(&self) -> &RefCell<Option<Rc<NativeMarkdownFindBar>>> {
+        &self.find_bar
+    }
+    pub(super) fn find_resources(&self) -> &RefCell<NativeMarkdownFindResources> {
+        &self.find_resources
+    }
+    pub(super) fn session_field_editor(
+        &self,
+    ) -> &RefCell<Option<Weak<NativeMarkdownSessionFieldEditor>>> {
+        &self.session_field_editor
+    }
+
+    /// 新栏只登记当前会话的独立账本；没有旧模式接管或后备正文。
+    pub(super) fn find_owned_ledger(&self) -> Rc<NativeMarkdownOwnedLedger> {
+        self.find_ledger
+            .borrow()
+            .as_ref()
+            .expect("活动笔记已装配唯一Find账本")
+            .clone()
+    }
+    pub(super) fn owned_ledger(&self) -> &NativeMarkdownOwnedLedger {
+        &self.owned_ledger
+    }
+
+    /// 先结束栏槽借用，再调用可能重入的 Native 字段 getter；收据只记录实际拥有资源。
+    pub(super) fn capture_find_resources(&self) -> Result<(), String> {
+        let bar = self.find_bar.borrow().clone();
+        let captured = NativeMarkdownFindResources::from_fields(
+            bar.as_ref().map(|bar| bar.fields()).into_iter().flatten(),
+        );
+        self.find_resources.borrow_mut().merge(captured)
+    }
+
+    /// 保存和模式交接先提交原单格；Busy/marked 不能被当成输入已经持久化。
+    /// 关闭可取消纯导航和未开始的附件，真正字符事务及输入法组字仍须完成。
+    pub(super) fn commit_marked_text(&self, closing: bool) -> Result<(), String> {
+        self.body
+            .commit_active_cell()
+            .map_err(|cause| cause.to_string())?;
+        self.body
+            .preflight_release()
+            .map_err(|cause| cause.to_string())?;
+        if self.body.has_pending_input() {
+            let state = self
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            if !closing || state.marked.is_some() || self.body.has_pending_canonical_input() {
+                return Err("正文输入仍在完成中，请稍后再试".into());
+            }
+        }
+        self.text_view
+            .commit_composition_before_release()
+            .map_err(|cause| cause.to_string())
+    }
+
+    /// 同一 Body 原地切换模式，保留 Model、Input、历史、Find 和滚动根。
+    /// 真实几何及 Source 退休仍由现有模式事务完成，不另建预览后备图。
+    pub(super) fn set_presentation_mode(
+        &mut self,
+        mode: MarkdownPresentationMode,
+        controller: &Retained<NativeMarkdownController>,
+    ) -> Result<(), String> {
+        if self.presentation_mode() == mode {
+            return Ok(());
+        }
+        self.commit_marked_text(false)?;
+        let (anchor, key) = self
+            .body
+            .capture_mode_viewport()
+            .map_err(|cause| cause.to_string())?;
+        self.body
+            .change_presentation_mode(mode, &self.scroll_view, anchor, &key)
+            .map_err(|cause| cause.to_string())?;
+        controller.advance_find_input_intent();
+        Ok(())
+    }
+}
 
 /// 唯一canonical根；构造时不分配NSString、NSTextStorage或任何排版对象。
 /// 丢弃后同步归还piece tree、增量编辑段和共享历史；快照alias另由原释放收据核对。
@@ -24,10 +135,13 @@ impl NativeMarkdownTextModel {
 
 /// 当前笔记的唯一文稿根；具体后端先释放，模型与原映射收据最后结束。
 /// 字段顺序也约束普通早退的析构顺序，不能让仍在断图的后端失去canonical正文。
-pub(crate) struct NativeMarkdownEditorSurface {
+#[cfg(feature = "native-markdown-runtime-probe")]
+pub(crate) struct NativeMarkdownTextKitEditorSurface {
     /// Find控件及其字段/共享编辑器弱收据属于原笔记会话，不归具体TextKit排版图。
     pub(super) find_bar: RefCell<Option<Rc<NativeMarkdownFindBar>>>,
     pub(super) find_resources: RefCell<NativeMarkdownFindResources>,
+    /// 会话控件随模式移动；None只存在于已经交接、即将析构的旧owner。
+    pub(super) find_ledger: RefCell<Option<Rc<NativeMarkdownOwnedLedger>>>,
     pub(super) session_field_editor: RefCell<Option<Weak<NativeMarkdownSessionFieldEditor>>>,
     pub(super) backend: NativeMarkdownTextKitBackend,
     pub(super) model: NativeMarkdownTextModel,
@@ -35,7 +149,8 @@ pub(crate) struct NativeMarkdownEditorSurface {
     pub(super) document_resources: NativeMarkdownOwnedSnapshot,
 }
 
-impl NativeMarkdownEditorSurface {
+#[cfg(feature = "native-markdown-runtime-probe")]
+impl NativeMarkdownTextKitEditorSurface {
     /// 先取得唯一正文及其最终释放收据，再让实际TextKit后端借用同一allocation。
     pub(crate) fn new_with_mode(
         document: MarkdownDocumentBuffer,
@@ -45,6 +160,17 @@ impl NativeMarkdownEditorSurface {
         mtm: MainThreadMarker,
     ) -> Result<Self, String> {
         let model = NativeMarkdownTextModel::new(document);
+        Self::from_model(model, frame, presentation_mode, resource_root, mtm)
+    }
+
+    /// 模式切换保同一canonical、Undo与原mmap；此构造只替换Native展示图。
+    fn from_model(
+        model: NativeMarkdownTextModel,
+        frame: NSRect,
+        presentation_mode: MarkdownPresentationMode,
+        resource_root: &NativeMarkdownOwnedLedger,
+        mtm: MainThreadMarker,
+    ) -> Result<Self, String> {
         // 原映射不属于展示图；先登记Session总预算，并为最终文稿释放保留独立弱收据。
         // 登记失败时尚未构造TextKit，也不发布文稿根；局部模型随返回归还其原始资源。
         let original_backing = model.document().borrow().original_backing_observer();
@@ -61,6 +187,9 @@ impl NativeMarkdownEditorSurface {
         Ok(Self {
             find_bar: RefCell::new(None),
             find_resources: RefCell::new(NativeMarkdownFindResources::default()),
+            find_ledger: RefCell::new(Some(Rc::new(NativeMarkdownOwnedLedger::for_editor(
+                resource_root,
+            )))),
             session_field_editor: RefCell::new(None),
             backend,
             model,
@@ -83,7 +212,8 @@ impl NativeMarkdownEditorSurface {
     }
 }
 
-impl Drop for NativeMarkdownEditorSurface {
+#[cfg(feature = "native-markdown-runtime-probe")]
+impl Drop for NativeMarkdownTextKitEditorSurface {
     fn drop(&mut self) {
         // 普通早退也先封闭原输入；Find清空/拆挂可能重入，不能在最后保存之后追加正文。
         self.backend.stop_accepting_input();
@@ -98,6 +228,7 @@ impl Drop for NativeMarkdownEditorSurface {
 
 /// 具体TextKit图仅持Native与派生载荷；正文通过原storage的Weak关联访问。
 /// 构造和释放均不创建文稿、重开文件或保存整篇Foundation镜像。
+#[cfg(feature = "native-markdown-runtime-probe")]
 pub(crate) struct NativeMarkdownTextKitBackend {
     // 仅保留原子释放事实，不保像素、Native 对象、正文或 mmap；供旧 editor barrier 核真实归还。
     #[cfg(feature = "native-raster-surface-probe")]
@@ -113,8 +244,98 @@ pub(crate) struct NativeMarkdownTextKitBackend {
     pub(super) text_container: Retained<NSTextContainer>,
     // 只有这个TextKit后端持真实storage；新分页后端构造纯模型时没有这条隐含强边。
     pub(super) text_storage: Retained<PieceBackedMarkdownTextStorage>,
+    /// 两枚系统通知只属于本次真实 clip；输入关闭或后端析构时归还，不保活正文或 Native 图。
+    clip_notifications: RefCell<Option<TextKitClipNotifications>>,
 }
 
+/// 旧 TextKit 图的具体几何订阅资源；通知只唤醒已有表格续体，不接管原生滚动事件。
+#[cfg(feature = "native-markdown-runtime-probe")]
+struct TextKitClipNotifications {
+    clip: Weak<NSClipView>,
+    bounds_before: bool,
+    frame_before: bool,
+    tokens: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
+}
+
+#[cfg(feature = "native-markdown-runtime-probe")]
+impl TextKitClipNotifications {
+    fn install(
+        clip: &NSClipView,
+        view: &PieceBackedMarkdownTextView,
+        ledger: &NativeMarkdownOwnedLedger,
+        mtm: MainThreadMarker,
+    ) -> Result<Self, String> {
+        let mut lease = Self {
+            clip: Weak::from(clip),
+            bounds_before: clip.postsBoundsChangedNotifications(),
+            frame_before: clip.postsFrameChangedNotifications(),
+            tokens: Vec::with_capacity(2),
+        };
+        let center = NSNotificationCenter::defaultCenter();
+        // SAFETY: AppKit 两个不可变名称进程内有效；object 精确限定为本后端的原 clip。
+        for name in unsafe {
+            [
+                NSViewBoundsDidChangeNotification,
+                NSViewFrameDidChangeNotification,
+            ]
+        } {
+            let weak = MainThreadBound::new(Weak::from(view), mtm);
+            let callback = block2::RcBlock::new(move |_notification: NonNull<NSNotification>| {
+                let Some(mtm) = MainThreadMarker::new() else {
+                    return; // 外来线程伪发通知不得读取主线程 Weak、View 或正文状态。
+                };
+                if let Some(view) = weak.get(mtm).load()
+                    && !view.ivars().textkit_graph_teardown.get()
+                {
+                    // 触控板、滚条、Find 及模式定位均以实际 clip 几何变化为准。
+                    // 仍由原方法合并几何请求并排后继续体；不直接布局或重领输入上下文。
+                    view.schedule_visible_table_layout_update();
+                }
+            });
+            // SAFETY: 空 queue 保持系统通知线程；闭包先核主线程，仅持原 View 的 Weak。
+            let token = unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(name),
+                    Some(clip),
+                    None,
+                    &callback,
+                )
+            };
+            lease.tokens.push(token);
+            // 先由局部租约接管 token，ledger 登记失败同样实际注销已取得的通知。
+            let token = &**lease.tokens.last().expect("真实通知 token 已归本租约");
+            ledger.include(
+                "editor.clip-geometry-observer",
+                <ProtocolObject<dyn NSObjectProtocol> as AsRef<AnyObject>>::as_ref(token),
+            )?;
+        }
+        clip.setPostsBoundsChangedNotifications(true);
+        clip.setPostsFrameChangedNotifications(true);
+        Ok(lease)
+    }
+}
+
+#[cfg(feature = "native-markdown-runtime-probe")]
+impl Drop for TextKitClipNotifications {
+    fn drop(&mut self) {
+        let center = NSNotificationCenter::defaultCenter();
+        for token in std::mem::take(&mut self.tokens) {
+            // SAFETY: 仅注销本租约实际保存的 token，不影响同名通知或其他模式的订阅。
+            unsafe {
+                center.removeObserver(
+                    <ProtocolObject<dyn NSObjectProtocol> as AsRef<AnyObject>>::as_ref(&*token),
+                );
+            }
+        }
+        if let Some(clip) = self.clip.load() {
+            // 通知中心的持有已结束，再恢复同一原 clip 的两个开关；不查找或改写后继 clip。
+            clip.setPostsBoundsChangedNotifications(self.bounds_before);
+            clip.setPostsFrameChangedNotifications(self.frame_before);
+        }
+    }
+}
+
+#[cfg(feature = "native-markdown-runtime-probe")]
 impl NativeMarkdownTextKitBackend {
     /// 按原依赖顺序构造完整TextKit图；只借外层文稿，失败由局部Native owner归还资源。
     fn new_with_mode(
@@ -184,6 +405,13 @@ impl NativeMarkdownTextKitBackend {
         scroll_view.setBackgroundColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
             0.075, 0.084, 0.11, 1.0,
         ));
+        // 在可选光栅几何租约之前保存原开关；关闭时先结束光栅，再还原这份原 clip 关系。
+        let clip_notifications = TextKitClipNotifications::install(
+            &scroll_view.contentView(),
+            &text_view,
+            &owned_ledger,
+            mtm,
+        )?;
         #[cfg(feature = "native-raster-surface-probe")]
         let raster_release = if super::raster_surface::NativeMarkdownRasterSurface::requested() {
             // 在首次挂接滚动正文和原生排版之前注册 factory，不能靠事后失效替换已缓存片段。
@@ -232,17 +460,13 @@ impl NativeMarkdownTextKitBackend {
             text_layout_manager,
             text_container,
             text_storage,
+            clip_notifications: RefCell::new(Some(clip_notifications)),
         })
     }
 
     /// 只借本后端真实持有的scroll供挂载或释放观察，不移交独立生命周期权限。
     pub(crate) fn scroll_view(&self) -> &NSScrollView {
         &self.scroll_view
-    }
-
-    /// 窗口只借NSView完成原焦点交接；挂载层不取得TextKit专有的文本或布局能力。
-    pub(crate) fn input_view(&self) -> &NSView {
-        self.text_view.as_super().as_super().as_super()
     }
 
     /// TextKit对照验收借其真实文本协议；普通窗口焦点交接使用上面的NSView接口。
@@ -278,6 +502,8 @@ impl NativeMarkdownTextKitBackend {
                 }
             }
         }
+        let clip_notifications = self.clip_notifications.borrow_mut().take();
+        drop(clip_notifications); // 槽借用已结束；实际注销及 Native 开关恢复允许同步重入。
         if !accepted {
             // 重复封闭仍完成上面的派生载荷清理；只有首次撤权继续清原生选区和编辑策略，
             // 避免拆图重入再次执行这些Native setter。
@@ -290,7 +516,8 @@ impl NativeMarkdownTextKitBackend {
         self.text_view.setSelectable(false);
     }
 
-    /// 只改变派生源码/预览展示，保留原始Markdown字节和真实选区。
+    /// 旧TextKit同图模式交换仅供仍运行的机制对照；正式窗口使用上层actual mode owner交接。
+    #[cfg(feature = "native-markdown-runtime-probe")]
     pub(crate) fn set_presentation_mode(
         &self,
         mode: MarkdownPresentationMode,
@@ -395,16 +622,14 @@ impl NativeMarkdownTextKitBackend {
         self.text_view.schedule_visible_table_layout_update();
         Ok(())
     }
-
-    /// Inserts one small source table with valid block spacing through the canonical text-input path.
-    pub(crate) fn insert_default_markdown_table(&self) {
-        self.text_view.insert_default_markdown_table();
-    }
 }
 
+#[cfg(feature = "native-markdown-runtime-probe")]
 impl Drop for NativeMarkdownTextKitBackend {
     fn drop(&mut self) {
         // 唯一外层EditorSurface已封闭原输入并结束自身Find；这里只对称拆具体TextKit图。
+        let clip_notifications = self.clip_notifications.get_mut().take();
+        drop(clip_notifications); // 也覆盖后端局部构造成功但上层挂载失败的资源归还。
         #[cfg(feature = "native-block-fragment-diagnostic")]
         super::preview_blocks::diagnostic::uninstall(&self.text_view, &self.text_content_storage);
         // 先take/drop折叠与装饰容量，再清gutter并断开ruler关系，派生视口载荷不跨后端续命。
@@ -417,8 +642,6 @@ impl Drop for NativeMarkdownTextKitBackend {
             .replace(Vec::new());
         drop(decorations);
         self.text_view.ivars().source_decorations_dirty.set(false);
-        #[cfg(feature = "native-input-trace")]
-        self.text_view.release_input_trace();
         self.gutter.clear();
         self.scroll_view.setRulersVisible(false);
         self.scroll_view.setVerticalRulerView(None);
@@ -571,9 +794,16 @@ impl Drop for NativeMarkdownTextKitBackend {
     }
 }
 
-/// Configures bounded plain-source editing, native input and accessibility without an independent undo/checking model.
+/// 原 TextKit 预览继续消费同一 canonical 模型；绘制失效只围绕真实视口处理。
+#[cfg(feature = "native-markdown-runtime-probe")]
 pub(super) fn configure_markdown_text_view(text_view: &NSTextView, frame: NSRect) {
-    // Scroll owns vertical overflow; fixed horizontal tracking wraps source without a document-sized native buffer.
+    // 文档的估算高度会随实际行布局变化，不能因此逐帧重新缓存整张正文 layer。
+    // 尺寸回调会显式标脏真实可见区域；已有内容固定在左上角，不随逻辑高度拉伸文字。
+    text_view.setLayerContentsRedrawPolicy(
+        objc2_app_kit::NSViewLayerContentsRedrawPolicy::OnSetNeedsDisplay,
+    );
+    text_view.setLayerContentsPlacement(objc2_app_kit::NSViewLayerContentsPlacement::TopLeft);
+    // 原滚动容器持有纵向范围，文字容器只跟随实际宽度进行换行。
     text_view.setFrame(frame);
     text_view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
     text_view.setMinSize(NSSize::new(0.0, frame.size.height));
@@ -581,7 +811,7 @@ pub(super) fn configure_markdown_text_view(text_view: &NSTextView, frame: NSRect
     text_view.setVerticallyResizable(true);
     text_view.setHorizontallyResizable(false);
     text_view.setTextContainerInset(NSSize::new(36.0, 32.0));
-    // Native accessibility reads the same canonical virtual string as editing.
+    // 辅助功能与输入共用原虚拟字符串，不创建另一份可变正文。
     text_view.setAccessibilityLabel(Some(ns_string!("Markdown 编辑器")));
     text_view.setAccessibilityHelp(Some(ns_string!(
         "编辑 Markdown。使用“文档”菜单设置格式、查找替换和管理文件。"
@@ -590,9 +820,8 @@ pub(super) fn configure_markdown_text_view(text_view: &NSTextView, frame: NSRect
     text_view.setSelectable(true);
     text_view.setRichText(false);
     text_view.setImportsGraphics(false);
-    // Support plain-text drags plus explicit confined file imports; rich-text graphics
-    // may not create a second mutable attributed document behind the piece tree.
-    // SAFETY: AppKit exports immutable process-lifetime pasteboard type identifiers.
+    // 普通文字拖入和受笔记库约束的文件导入走原入口，富文本不能另建 attributed 文档。
+    // SAFETY: AppKit 导出的类型标识是进程内有效的不可变常量。
     let drag_types = unsafe {
         [
             objc2_app_kit::NSPasteboardTypeFileURL,
@@ -608,21 +837,19 @@ pub(super) fn configure_markdown_text_view(text_view: &NSTextView, frame: NSRect
     text_view.setInsertionPointColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
         0.45, 0.66, 1.0, 1.0,
     )));
-    // NSUndoManager would retain a duplicate history. Use only the Rust piece tree's
-    // 128 structurally shared revisions and notify TextKit through exact responder actions.
+    // 历史只归 Rust piece tree 的结构共享版本，原 responder action 负责通知 TextKit。
     text_view.setAllowsUndo(false);
     // 项目自有 Find 栏提供完整输入与历史归属；不创建使用未知 editor/Undo 的标准 finder UI。
     text_view.setUsesFindBar(false);
     super::text_input_policy::configure_literal_text_input(text_view);
-    // SAFETY: initUsingTextLayoutManager(true) creates the owned container; these public
-    // layout constraints are changed only while its text view is alive.
+    // SAFETY: 构造根已给当前活 view 装配原 container；这里只改变公开布局约束。
     if let Some(text_container) = unsafe { text_view.textContainer() } {
-        // A live container follows viewport width while allowing lazy vertical growth.
+        // 实际宽度决定换行，高度由原布局按需增长。
         text_container.setWidthTracksTextView(true);
         text_container.setHeightTracksTextView(false);
     }
     if let Some(text_layout_manager) = text_view.textLayoutManager() {
-        // Retain TextKit's protection against suspicious native layout requests for giant/untrusted source.
+        // 保留框架对异常布局请求的原有保护；不能为了性能让巨型输入强制全量排版。
         text_layout_manager.setLimitsLayoutForSuspiciousContents(true);
     }
 }

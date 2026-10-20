@@ -23,12 +23,12 @@ pub(crate) mod use_table;
 #[allow(clippy::collapsible_match)]
 pub(crate) mod vowel_constraints;
 
-use crate::ShaperFont;
 use crate::buffer::*;
 use crate::normalize::*;
 use crate::plan::ShapePlan;
 use crate::tag::TagExt;
 use crate::unicode::Codepoint;
+use crate::ShaperFont;
 use crate::*;
 use crate::{Direction, Script, Tag};
 use alloc::boxed::Box;

@@ -29,9 +29,9 @@ fn capture_attributed(
     units: usize,
     roles: (&'static str, &'static str),
     current: &(impl Fn() -> bool + ?Sized),
-) -> Result<Option<Retained<NSString>>, String> {
+) -> Result<(), String> {
     if units == 0 {
-        return Ok(None); // 真实空值不是业务正文；不能把共享空常量包装成非空数据释放证据。
+        return Ok(()); // 真实空值不是业务正文；不能把共享空常量包装成非空数据释放证据。
     }
     let string = checked(current, || attributed.string())?;
     if checked(current, || string.length())? != units {
@@ -47,7 +47,11 @@ fn capture_attributed(
         // 不按类、tag位、文本相等或事后“缓存”解释放过任何其他String/Frozen/自建对象。
         checked(current, || ledger.include(roles.1, &string))??;
     } // 借用已有明确来源与标量观察记录；不制造该预存原值的“已析构”收据。
-    Ok(Some(string)) // 返回的只是原string临时claim，来源记录必须复用它，不能再取一个后继值。
+    drop(string); // 原 attributed/string 的 Weak 仍归唯一账本；这里只结束本次 getter 的强 claim。
+    if !current() {
+        return Err("归还原业务字符串临时值后光栅票已撤销".into());
+    }
+    Ok(())
 }
 
 pub(super) struct ParagraphObservation {
@@ -66,7 +70,7 @@ pub(super) fn capture_paragraph(
         .ok_or("标准fragment不是可证明的paragraph，业务覆盖不完整")?;
     let attributed = checked(current, || paragraph.attributedString())?;
     let units = checked(current, || attributed.length())?;
-    let string = capture_attributed(
+    capture_attributed(
         ledger,
         &attributed,
         units,
@@ -76,7 +80,6 @@ pub(super) fn capture_paragraph(
         ),
         current,
     )?;
-    drop(string);
     drop(element);
     if !current() {
         return Err("归还原paragraph临时claim后光栅票已撤销".into());
@@ -91,59 +94,6 @@ pub(super) fn capture_paragraph(
 pub(super) struct VisibleLineObservation<'a> {
     pub(super) content: &'a NSTextContentManager,
     pub(super) manager: &'a NSTextLayoutManager,
-    pub(super) element_range: &'a NSTextRange,
-    pub(super) generation: u64,
-    pub(super) diagnostic: &'a LineStringDiagnosticStore,
-}
-
-#[derive(Clone, Copy)]
-struct OriginalSourceFacts {
-    document_units: usize,
-    element: (usize, usize),
-    fragment: (usize, usize),
-}
-
-fn original_source_facts(
-    original: &VisibleLineObservation<'_>,
-    source_start: &ProtocolObject<dyn NSTextLocation>,
-    source_end: &ProtocolObject<dyn NSTextLocation>,
-    current: &(impl Fn() -> bool + ?Sized),
-) -> Result<OriginalSourceFacts, String> {
-    let provider: &ProtocolObject<dyn NSTextElementProvider> =
-        ProtocolObject::from_ref(original.content);
-    let document = checked(current, || provider.documentRange())?;
-    let document_start = checked(current, || document.location())?;
-    let document_end = checked(current, || document.endLocation())?;
-    let element_start = checked(current, || original.element_range.location())?;
-    let element_end = checked(current, || original.element_range.endLocation())?;
-    // 所有offset都来自同原content的公开位置；只保留单位数，不读取这些范围内的字符。
-    let offset = |location: &ProtocolObject<dyn NSTextLocation>| -> Result<usize, String> {
-        let actual = checked(current, || {
-            provider.offsetFromLocation_toLocation(&document_start, location)
-        })?;
-        usize::try_from(actual).map_err(|_| "行来源出现负数或不可表示的原source offset".into())
-    };
-    let facts = OriginalSourceFacts {
-        document_units: offset(&document_end)?,
-        element: (offset(&element_start)?, offset(&element_end)?),
-        fragment: (offset(source_start)?, offset(source_end)?),
-    };
-    if facts.element.0 > facts.fragment.0
-        || facts.fragment.0 > facts.fragment.1
-        || facts.fragment.1 > facts.element.1
-        || facts.element.1 > facts.document_units
-    {
-        return Err("行来源的原element/fragment/document嵌套不符，来源未知".into());
-    }
-    drop(element_end);
-    drop(element_start);
-    drop(document_end);
-    drop(document_start);
-    drop(document);
-    if !current() {
-        return Err("归还行来源位置临时claim后原票已撤销".into());
-    }
-    Ok(facts)
 }
 
 pub(super) fn capture_visible_lines(
@@ -312,7 +262,6 @@ pub(super) fn capture_visible_lines(
     }
     let last = last.ok_or("标准fragment缺少可证明的末行身份")?;
     let mut cursor = top;
-    let mut source_facts = None; // 只有真实1unit候选需要来源；同片段后续候选复用已有纯标量。
     // 只用macOS14公开逐行查询；不取textLineFragments数组，巨段落的离屏line不产生镜像。
     for _ in 0..MAX_VISIBLE_LINE_OBSERVATIONS {
         let line = checked(current, || {
@@ -331,56 +280,13 @@ pub(super) fn capture_visible_lines(
             .checked_add(range.length)
             .filter(|end| *end <= units)
             .ok_or("实际可见line的characterRange越出原业务值")?;
-        let string = capture_attributed(
+        capture_attributed(
             ledger,
             &attributed,
             units,
             ("editor.raster.line-value", "editor.raster.line-string"),
             current,
         )?;
-        if units == 1 {
-            let string = string
-                .as_deref()
-                .ok_or("非空行业务值缺少原string，来源未知")?;
-            let facts = match source_facts {
-                Some(facts) => facts,
-                None => {
-                    let facts =
-                        original_source_facts(&original, &source_start, &end_location, current)?;
-                    source_facts = Some(facts);
-                    facts
-                }
-            };
-            let element = facts.element.0..facts.element.1;
-            let fragment = facts.fragment.0..facts.fragment.1;
-            // 与正式源锚定位复用同一规则；顶边/底边分别记录，不能拿EOF空终点冒充普通源行。
-            let mapping = |bottom| {
-                crate::native_surface::table_layout::visible_line_source_range_at_edge(
-                    &element,
-                    &fragment,
-                    range,
-                    facts.document_units,
-                    bottom,
-                )
-                .map(|source| (source.start, source.end))
-            };
-            original.diagnostic.record(
-                string,
-                NativeMarkdownRasterLineStringOrigin {
-                    generation: original.generation,
-                    document_units: facts.document_units,
-                    element_source: facts.element,
-                    fragment_source: facts.fragment,
-                    line_range: range,
-                    paragraph_units,
-                    line_attribute_units: units,
-                    mapped_top: mapping(false),
-                    mapped_bottom: mapping(true),
-                },
-                current,
-            )?;
-        }
-        drop(string);
         let next = bounds.origin.y + bounds.size.height;
         // 只有实际末行同一身份才能证明尾部没有后继line；每行string可能是独立子串，长度不能代替身份。
         // 其余情况必须在真实几何上严格前进，不能重复同一line伪造覆盖。

@@ -8,8 +8,7 @@ use super::*;
 const REGION_WIDTH: usize = 513;
 const REGION_HEIGHT: usize = 259;
 const FIRST_HEIGHT: usize = 129;
-// mount加两组各一group、64槽各五层：1+2*(1+64*5)，未使用的槽也必须登记并真实释放。
-const POOL_ROLES: usize = 643;
+// 原结构层与每次真实发布的角色分别登记；不存在的瓦片没有预建空图层。
 
 fn invalid() -> NativeMarkdownPagedTextViewError {
     NativeMarkdownPagedTextViewError::InvalidGeometry
@@ -239,6 +238,7 @@ pub(super) fn run(_mtm: MainThreadMarker) -> Result<()> {
     let observer = counters.observer();
     let (passed, weaks) = autoreleasepool(|_| -> Result<_> {
         let successor = CALayer::new();
+        let foreign_owner = layer_weak(&successor);
         let (intact, weaks) = autoreleasepool(|_| -> Result<_> {
             let bounds = NSRect::new(
                 NSPoint::ZERO,
@@ -252,21 +252,31 @@ pub(super) fn run(_mtm: MainThreadMarker) -> Result<()> {
             let pool = LayerPool::new(&|| true)?;
             backing.addSublayer(pool.mount());
             let mut weaks = pool.weaks();
-            if weaks.len() != POOL_ROLES {
-                return Err(invalid());
-            }
             weaks.push(layer_weak(&backing));
-            weaks.push(layer_weak(&successor));
             let mut frames = Vec::with_capacity(3);
             let mut publication = None;
             let result = (|| -> Result<usize> {
                 frames.push(encode(&source, counters.clone(), None)?);
                 publication = Some(render_exact(&pool, &backing, &frames[0], &source, bounds)?);
+                // 只登记该次真实发布的瓦片；后继缩窗/换组的旧角色仍须按原 Weak 验证已归还。
+                for group in &pool.groups {
+                    let slots = group.slots.borrow().clone();
+                    for slot in slots {
+                        slot.add_weaks(&mut weaks);
+                    }
+                }
                 let same = encode(&source, counters.clone(), Some(&frames[0]))?;
                 let same_reused = same.reused_images == 3
                     && (0..3).all(|index| same_images(&frames[0], &same, index));
                 frames.push(same);
                 publication = Some(render_exact(&pool, &backing, &frames[1], &source, bounds)?);
+                // 只登记该次真实发布的瓦片；后继缩窗/换组的旧角色仍须按原 Weak 验证已归还。
+                for group in &pool.groups {
+                    let slots = group.slots.borrow().clone();
+                    for slot in slots {
+                        slot.add_weaks(&mut weaks);
+                    }
+                }
                 // 原色表内仅改一个真实像素；其它行、局部palette端点、几何及两后继子tile均不变。
                 let first: [u8; 4] = source.pixels[..4].try_into().map_err(|_| invalid())?;
                 let other = source.pixels[4..512 * 4]
@@ -284,6 +294,13 @@ pub(super) fn run(_mtm: MainThreadMarker) -> Result<()> {
                     && (1..3).all(|index| same_images(&frames[0], &changed, index));
                 frames.push(changed);
                 publication = Some(render_exact(&pool, &backing, &frames[2], &source, bounds)?);
+                // 只登记该次真实发布的瓦片；后继缩窗/换组的旧角色仍须按原 Weak 验证已归还。
+                for group in &pool.groups {
+                    let slots = group.slots.borrow().clone();
+                    for slot in slots {
+                        slot.add_weaks(&mut weaks);
+                    }
+                }
                 let secondary = frames[0]
                     .tiles
                     .iter()
@@ -326,10 +343,8 @@ pub(super) fn run(_mtm: MainThreadMarker) -> Result<()> {
         CATransaction::flush();
         let pixels_released_with_foreign = observer.is_released();
         let foreign_mount_alive = weaks[0].load().is_some();
-        let foreign_owner_alive = weaks[POOL_ROLES + 1].load().is_some();
-        let other_owned_released = weaks[1..=POOL_ROLES]
-            .iter()
-            .all(|weak| weak.load().is_none());
+        let foreign_owner_alive = foreign_owner.load().is_some();
+        let other_owned_released = weaks[1..].iter().all(|weak| weak.load().is_none());
         println!(
             "paged_region_slots original_provider_maps_zero_with_foreign_alive={pixels_released_with_foreign} foreign_mount_still_alive={foreign_mount_alive} foreign_owner_still_alive={foreign_owner_alive} other_pool_and_backing_weak_nil={other_owned_released} actual_pixels={:?} formal=false",
             observer.snapshot(),

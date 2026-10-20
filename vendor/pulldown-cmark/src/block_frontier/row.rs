@@ -225,7 +225,7 @@ impl ActiveRow {
                             self.phase = Phase::Leaf(LeafProbe::new(self.content));
                         }
                         LineStartValue::List(Some(_)) | LineStartValue::Bool(true) => {
-                            return Ok(RowStep::NotMember)
+                            return Ok(RowStep::NotMember);
                         }
                         LineStartValue::List(None) => {
                             self.phase = Phase::Quote(self.operation(LineStartOperation::Quote)?)

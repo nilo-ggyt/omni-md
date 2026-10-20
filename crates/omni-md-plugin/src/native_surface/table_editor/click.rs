@@ -3,14 +3,12 @@
 use super::*;
 use objc2_app_kit::{NSSelectionAffinity, NSSelectionGranularity};
 
-/// 原真实点击只有一份事件载荷；Latest 被替换而非累积，Up/取消后立即归还 Native 事件。
+/// 独立 TextKit 参考点击只保原 Down 到真实格激活；取消归还该事件，不接管正式分页手势。
 pub(in crate::native_surface) struct NativeMarkdownTableCellPointer {
-    events: RefCell<Option<PointerEvents>>,
+    event: RefCell<Option<Rc<Retained<NSEvent>>>>,
     input_epoch: u64,
     identity: WeakMarkdownDocument,
     key: NativeMarkdownTableLayoutRequestKey,
-    window_number: isize,
-    down_timestamp: f64,
     pub(super) ended: Cell<bool>,
     pub(super) extending: bool,
     click_count: isize,
@@ -20,24 +18,6 @@ pub(in crate::native_surface) struct NativeMarkdownTableCellPointer {
     initial_field_range: Cell<Option<NSRange>>,
     captured: RefCell<Option<NativeMarkdownCapturedSelection>>,
     pub(super) body_selection: Cell<bool>,
-    // 同格 Shift 的真实 raw 字段使用局部坐标；不把未提交草稿偏移误作旧 canonical 坐标。
-    raw_field: Option<NativeMarkdownTableRawFieldPointer>,
-}
-
-struct NativeMarkdownTableRawFieldPointer {
-    field: Weak<NSTextField>,
-    editor: Weak<NSTextView>,
-    coordinate: NativeMarkdownTableCellCoordinate,
-    source: std::ops::Range<usize>,
-    anchor: usize,
-    down_hit: usize,
-    down_range: NSRange,
-    head: Cell<usize>,
-}
-
-struct PointerEvents {
-    _down: Rc<Retained<NSEvent>>,
-    latest: Rc<Retained<NSEvent>>,
 }
 
 /// 仅跨当前同步 mouseDown 栈保存真实字段命中；Native 返回后不再保留 editor 或事件。
@@ -53,17 +33,6 @@ pub(in crate::native_surface) struct NativeMarkdownTableFieldMouseSelection {
 }
 
 impl NativeMarkdownTableCellPointer {
-    #[cfg(all(
-        feature = "native-markdown-runtime-probe",
-        feature = "native-table-row-append"
-    ))]
-    /// 只借原 Down 的对象身份，供预武装合成票绑定同一实际手势；不返回事件或窗口强引用。
-    pub(in crate::native_surface) fn probe_down_identity(&self) -> Option<usize> {
-        self.events
-            .borrow()
-            .as_ref()
-            .map(|events| std::ptr::from_ref(&***events._down).addr())
-    }
     /// 权限随原 input/root/width 存活；只含 Weak 文档，不持有第二正文或窗口 owner。
     fn current(&self, view: &PieceBackedMarkdownTextView) -> bool {
         !view.ivars().textkit_graph_teardown.get()
@@ -78,7 +47,7 @@ impl NativeMarkdownTableCellPointer {
 
     pub(in crate::native_surface) fn cancel(&self) {
         self.ended.set(true);
-        let previous = self.events.borrow_mut().take();
+        let previous = self.event.borrow_mut().take();
         drop(previous); // NSEvent 最后 release 不跨 RefCell 借用，关闭/后继输入不会继承旧事件。
         let previous = self.captured.borrow_mut().take();
         drop(previous); // 原选择票也在终点归还，不让活动字段保留无用的旧 fold 资源。
@@ -92,19 +61,16 @@ impl NativeMarkdownTableCellPointer {
         }
     }
 
-    /// 借用 Latest 的同 Rc 事实；Native getter 重入交付更新事件时旧调用立即失效。
+    /// 借原首击的同 Rc 身份；Native getter 重入若撤销该次激活，后继立即失权。
     pub(super) fn latest_event(&self) -> Option<Rc<Retained<NSEvent>>> {
-        self.events
-            .borrow()
-            .as_ref()
-            .map(|events| Rc::clone(&events.latest))
+        self.event.borrow().as_ref().map(Rc::clone)
     }
 
     pub(super) fn owns_event(&self, event: &Rc<Retained<NSEvent>>) -> bool {
-        self.events
+        self.event
             .borrow()
             .as_ref()
-            .is_some_and(|events| Rc::ptr_eq(&events.latest, event))
+            .is_some_and(|original| Rc::ptr_eq(original, event))
     }
 }
 
@@ -152,399 +118,6 @@ fn map_click_source_range(
 }
 
 impl PieceBackedMarkdownTextView {
-    /// 同格 Shift 沿原字段的真实 glyph 开始同一个 Pointer，后续 drag/up 不依赖系统私有 anchor。
-    pub(in crate::native_surface) fn begin_table_raw_field_shift(&self, event: &NSEvent) -> bool {
-        let _payload = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
-        let epoch = self.ivars().table_input_intent_epoch.get();
-        let current = || {
-            !self.ivars().textkit_graph_teardown.get()
-                && self.ivars().table_input_intent_epoch.get() == epoch
-        };
-        let pointer = (|| {
-            let flags =
-                native_markdown_table_intent_step(&current, || event.modifierFlags()).ok()?;
-            if !flags.contains(NSEventModifierFlags::Shift)
-                || flags.intersects(
-                    NSEventModifierFlags::Command
-                        | NSEventModifierFlags::Control
-                        | NSEventModifierFlags::Option,
-                )
-            {
-                return None; // 只拥有既有 Shift 扩选，其他修饰组合保持原 Native 行为。
-            }
-            let (coordinate, source, selection, identity) = self
-                .ivars()
-                .active_table_cell
-                .borrow()
-                .as_ref()
-                .and_then(|active| {
-                    Some((
-                        active.coordinate,
-                        active.source_utf16_range.clone(),
-                        active.field_selection?,
-                        active.authority.as_ref()?.document.clone(),
-                    ))
-                })?;
-            let key = native_markdown_table_intent_step(&current, || {
-                self.current_table_layout_request_key()
-            })
-            .ok()??;
-            let field =
-                native_markdown_table_intent_step(&current, || self.existing_table_cell_editor())
-                    .ok()??;
-            let actual = native_markdown_table_intent_step(&current, || field.currentEditor())
-                .ok()??
-                .downcast::<NSTextView>()
-                .ok()?;
-            if !native_markdown_table_intent_step(&current, || {
-                self.table_field_command_is_current(&field, &actual)
-            })
-            .ok()?
-            {
-                return None;
-            }
-            let input = ProtocolObject::<dyn NSTextInputClient>::from_ref(&*actual);
-            if native_markdown_table_intent_step(&current, || input.hasMarkedText()).ok()? {
-                return None; // 原 IME 得到系统处理机会，不为定位取消或提交 marked text。
-            }
-            let range =
-                native_markdown_table_intent_step(&current, || actual.selectedRange()).ok()?;
-            native_markdown_table_field_selection(None, range, Some(selection), false)?;
-            let point =
-                native_markdown_table_intent_step(&current, || event.locationInWindow()).ok()?;
-            let point = native_markdown_table_intent_step(&current, || {
-                actual.convertPoint_fromView(point, None)
-            })
-            .ok()?;
-            if !native_markdown_table_intent_step(&current, || {
-                NSPointInRect(point, actual.visibleRect())
-            })
-            .ok()?
-            {
-                return None; // 点击正文、Find 或另一格时不得截取当前字段的扩选。
-            }
-            let hit = native_markdown_table_intent_step(&current, || {
-                actual.characterIndexForInsertionAtPoint(point)
-            })
-            .ok()?;
-            let count = native_markdown_table_intent_step(&current, || event.clickCount()).ok()?;
-            let granularity = match count {
-                count if count >= 3 => NSSelectionGranularity::SelectByParagraph,
-                2 => NSSelectionGranularity::SelectByWord,
-                _ => NSSelectionGranularity::SelectByCharacter,
-            };
-            let down_range = native_markdown_table_intent_step(&current, || {
-                actual.selectionRangeForProposedRange_granularity(NSRange::new(hit, 0), granularity)
-            })
-            .ok()?;
-            let number =
-                native_markdown_table_intent_step(&current, || event.windowNumber()).ok()?;
-            let timestamp =
-                native_markdown_table_intent_step(&current, || event.timestamp()).ok()?;
-            let field = native_markdown_table_intent_step(&current, || Weak::from(&*field)).ok()?;
-            let editor =
-                native_markdown_table_intent_step(&current, || Weak::from(&*actual)).ok()?;
-            let down = native_markdown_table_intent_step(&current, || {
-                // SAFETY: 原 Down 仍由 panel 同步派发持有；只进入原 gesture 的唯一事件载荷。
-                unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
-            })
-            .ok()??;
-            let down = Rc::new(down);
-            Some(Rc::new(NativeMarkdownTableCellPointer {
-                events: RefCell::new(Some(PointerEvents {
-                    _down: Rc::clone(&down),
-                    latest: down,
-                })),
-                input_epoch: epoch,
-                identity,
-                key,
-                window_number: number,
-                down_timestamp: timestamp,
-                ended: Cell::new(false),
-                extending: true,
-                click_count: count,
-                anchor: MarkdownTextSelection::caret(source.start),
-                down_hit: source.start,
-                head: Cell::new(source.start),
-                initial_field_range: Cell::new(None),
-                captured: RefCell::new(None),
-                body_selection: Cell::new(false),
-                raw_field: Some(NativeMarkdownTableRawFieldPointer {
-                    field,
-                    editor,
-                    coordinate,
-                    source,
-                    anchor: selection.anchor_utf16,
-                    down_hit: hit,
-                    down_range,
-                    head: Cell::new(hit),
-                }),
-            }))
-        })();
-        let Some(pointer) = pointer else {
-            return false;
-        };
-        if !current() || !pointer.current(self) {
-            return false; // Native 借用/Weak 构造析构后已失去原意图，不安装新事件槽。
-        }
-        let raw = pointer.raw_field.as_ref().unwrap();
-        if !self
-            .ivars()
-            .active_table_cell
-            .borrow()
-            .as_ref()
-            .is_some_and(|active| {
-                active.coordinate == raw.coordinate
-                    && active.source_utf16_range == raw.source
-                    && active
-                        .field_selection
-                        .is_some_and(|selection| selection.anchor_utf16 == raw.anchor)
-                    && active.authority.as_ref().is_some_and(|authority| {
-                        WeakMarkdownDocument::ptr_eq(&authority.document, &pointer.identity)
-                    })
-            })
-        {
-            return false; // 同数值 epoch 不能替代原活动格、源及字段方向的实际关联。
-        }
-        let previous = self
-            .ivars()
-            .active_table_cell
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .pointer
-            .replace(Rc::clone(&pointer));
-        if let Some(previous) = previous {
-            previous.cancel();
-        } // 借用结束后才释放先前事件。
-        if self
-            .apply_table_raw_field_pointer(&pointer, &current)
-            .is_err()
-        {
-            pointer.cancel();
-            self.take_table_pointer_if_same(&pointer);
-        }
-        true // 原 Down 已由同一实际字段处理；失败也不能把它再派发一次到系统。
-    }
-
-    /// 只撤当前原 Pointer 的强边；后继格/新手势不受旧取消和 Up 影响。
-    fn take_table_pointer_if_same(&self, pointer: &NativeMarkdownTableCellPointer) {
-        let previous = self
-            .ivars()
-            .active_table_cell
-            .borrow_mut()
-            .as_mut()
-            .and_then(|active| {
-                active
-                    .pointer
-                    .as_ref()
-                    .filter(|value| std::ptr::eq(&***value, pointer))?;
-                active.pointer.take()
-            });
-        drop(previous);
-    }
-
-    /// raw 字段每一步同时核原活动格、字段及共享 editor 身份；Find 复用同 editor 也不能借权。
-    fn raw_table_field_editor(
-        &self,
-        pointer: &NativeMarkdownTableCellPointer,
-        allowed: &impl Fn() -> bool,
-    ) -> Result<Retained<NSTextView>, NativeMarkdownStableTableFailure> {
-        let raw = pointer
-            .raw_field
-            .as_ref()
-            .ok_or(NativeMarkdownStableTableFailure::MissingGeometry)?;
-        if !allowed()
-            || !self
-                .ivars()
-                .active_table_cell
-                .borrow()
-                .as_ref()
-                .is_some_and(|active| {
-                    active.coordinate == raw.coordinate
-                        && active.source_utf16_range == raw.source
-                        && active
-                            .pointer
-                            .as_ref()
-                            .is_some_and(|value| std::ptr::eq(&**value, pointer))
-                })
-        {
-            return Err(NativeMarkdownStableTableFailure::MissingGeometry);
-        }
-        let field = native_markdown_table_intent_step(allowed, || raw.field.load())?
-            .ok_or(NativeMarkdownStableTableFailure::MissingGeometry)?;
-        let actual = native_markdown_table_intent_step(allowed, || raw.editor.load())?
-            .ok_or(NativeMarkdownStableTableFailure::MissingGeometry)?;
-        if !native_markdown_table_intent_step(allowed, || {
-            self.table_field_command_is_current(&field, &actual)
-        })? {
-            return Err(NativeMarkdownStableTableFailure::MissingGeometry);
-        }
-        Ok(actual)
-    }
-
-    /// 每个原生阶段都核同一 active/field/editor；共享 editor 仍活不代表它还属于原格。
-    fn raw_table_field_is_current(
-        &self,
-        pointer: &NativeMarkdownTableCellPointer,
-        field: &NSTextField,
-        actual: &NSTextView,
-    ) -> bool {
-        let raw = pointer.raw_field.as_ref().unwrap();
-        let active = || {
-            self.ivars()
-                .active_table_cell
-                .borrow()
-                .as_ref()
-                .is_some_and(|active| {
-                    active.coordinate == raw.coordinate
-                        && active.source_utf16_range == raw.source
-                        && active
-                            .pointer
-                            .as_ref()
-                            .is_some_and(|value| std::ptr::eq(&**value, pointer))
-                        && active.authority.as_ref().is_some_and(|authority| {
-                            WeakMarkdownDocument::ptr_eq(&authority.document, &pointer.identity)
-                        })
-                })
-        };
-        // active 的 Ref 已在布尔值计算后结束；currentEditor 的真实 Native getter 不跨该借用。
-        active() && self.table_field_command_is_current(field, actual) && active()
-    }
-
-    /// 同一字段的真实 raw caret 与 Native 粒度决定 head，未提交草稿不使用旧 canonical 的长度。
-    fn apply_table_raw_field_pointer(
-        &self,
-        pointer: &NativeMarkdownTableCellPointer,
-        allowed: &impl Fn() -> bool,
-    ) -> Result<(), NativeMarkdownStableTableFailure> {
-        let event = pointer
-            .latest_event()
-            .ok_or(NativeMarkdownStableTableFailure::MissingGeometry)?;
-        let original = || allowed() && pointer.current(self) && pointer.owns_event(&event);
-        let actual = self.raw_table_field_editor(pointer, &original)?;
-        let field = native_markdown_table_intent_step(&original, || {
-            pointer.raw_field.as_ref().unwrap().field.load()
-        })?
-        .ok_or(NativeMarkdownStableTableFailure::MissingGeometry)?;
-        let current = || original() && self.raw_table_field_is_current(pointer, &field, &actual);
-        let input = ProtocolObject::<dyn NSTextInputClient>::from_ref(&*actual);
-        if native_markdown_table_intent_step(&current, || input.hasMarkedText())? {
-            return Err(NativeMarkdownStableTableFailure::MissingGeometry);
-        }
-        let raw = pointer.raw_field.as_ref().unwrap();
-        let hit = raw.head.get();
-        let range = if hit == raw.down_hit {
-            raw.down_range // 原 Down 的真实粒度只领取一次；后续回到该点仍是同一词/段落。
-        } else {
-            native_markdown_table_intent_step(&current, || {
-                actual.selectionRangeForProposedRange_granularity(
-                    NSRange::new(hit, 0),
-                    pointer.granularity(),
-                )
-            })?
-        };
-        let head = if hit < raw.anchor {
-            range.location
-        } else {
-            range
-                .location
-                .checked_add(range.length)
-                .ok_or(NativeMarkdownStableTableFailure::MissingGeometry)?
-        };
-        let value = native_markdown_table_intent_step(&current, || actual.string())?;
-        let length = native_markdown_table_intent_step(&current, || value.length())?;
-        drop(value); // 只取同字段长度，不物化或复制原草稿。
-        if raw.anchor > length || head > length || range.location == NSNotFound as usize {
-            return Err(NativeMarkdownStableTableFailure::MissingGeometry);
-        }
-        let start = raw.anchor.min(head);
-        let affinity = if head < raw.anchor {
-            NSSelectionAffinity::Upstream
-        } else {
-            NSSelectionAffinity::Downstream
-        };
-        native_markdown_table_intent_step(&current, || {
-            actual.setSelectionGranularity(pointer.granularity())
-        })?;
-        native_markdown_table_intent_step(&current, || {
-            actual.setSelectedRange_affinity_stillSelecting(
-                NSRange::new(start, raw.anchor.max(head) - start),
-                affinity,
-                !pointer.ended.get(),
-            )
-        })?;
-        self.record_table_field_selection(
-            &actual,
-            Some(MarkdownTextSelection {
-                anchor_utf16: raw.anchor,
-                head_utf16: head,
-            }),
-            false,
-            &current,
-        )
-    }
-
-    /// 真实 drag/up 替换原 Latest 后才安装同格 Shift；原字段已复用或输入改变则拒绝并保留草稿。
-    fn update_table_raw_field_pointer(
-        &self,
-        pointer: &NativeMarkdownTableCellPointer,
-        event: &NSEvent,
-        allowed: &impl Fn() -> bool,
-        event_claim: &RefCell<Rc<Retained<NSEvent>>>,
-    ) -> Result<(), NativeMarkdownStableTableFailure> {
-        let current = || allowed() && pointer.owns_event(&event_claim.borrow());
-        let kind = native_markdown_table_intent_step(&current, || event.r#type())?;
-        if kind == NSEventType::MouseCancelled {
-            pointer.cancel();
-            self.take_table_pointer_if_same(pointer);
-            return Ok(());
-        }
-        let actual = self.raw_table_field_editor(pointer, &current)?;
-        let field = native_markdown_table_intent_step(&current, || {
-            pointer.raw_field.as_ref().unwrap().field.load()
-        })?
-        .ok_or(NativeMarkdownStableTableFailure::MissingGeometry)?;
-        let input_current =
-            || current() && self.raw_table_field_is_current(pointer, &field, &actual);
-        let point = native_markdown_table_intent_step(&current, || event.locationInWindow())?;
-        let point = native_markdown_table_intent_step(&input_current, || {
-            actual.convertPoint_fromView(point, None)
-        })?;
-        let hit = native_markdown_table_intent_step(&input_current, || {
-            actual.characterIndexForInsertionAtPoint(point)
-        })?;
-        drop(field);
-        drop(actual); // 临时 editor claim 归还后再替换原事件；不跨状态借用析构 Native 对象。
-        let retained = native_markdown_table_intent_step(&current, || {
-            // SAFETY: 原 sendEvent 正持有此 drag/up，唯一 Latest 只保留本次真实事件。
-            unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
-        })?
-        .ok_or(NativeMarkdownStableTableFailure::MissingGeometry)?;
-        let retained = Rc::new(retained);
-        let previous_claim = event_claim.replace(Rc::clone(&retained));
-        let previous = {
-            let mut events = pointer.events.borrow_mut();
-            let events = events
-                .as_mut()
-                .ok_or(NativeMarkdownStableTableFailure::MissingGeometry)?;
-            std::mem::replace(&mut events.latest, retained)
-        };
-        drop(previous);
-        drop(previous_claim);
-        if !current() {
-            return Err(NativeMarkdownStableTableFailure::MissingGeometry);
-        }
-        pointer.raw_field.as_ref().unwrap().head.set(hit);
-        pointer.ended.set(kind == NSEventType::LeftMouseUp);
-        self.apply_table_raw_field_pointer(pointer, &current)?;
-        if pointer.ended.get() {
-            pointer.cancel();
-            self.take_table_pointer_if_same(pointer);
-        }
-        Ok(())
-    }
-
     /// 真实字段选择只有同一活动格及 Native editor 可发布；未知方向清除旧事实但不移动选择。
     fn record_table_field_selection(
         &self,
@@ -929,13 +502,7 @@ impl PieceBackedMarkdownTextView {
             return Err("正文未取得输入焦点".into());
         }
         drop(window); // 真实 Native claim 结束后才通知合成后继；通知本身不授予产品权限。
-        #[cfg(all(
-            feature = "native-markdown-runtime-probe",
-            feature = "native-table-row-append"
-        ))]
-        if current() && receipt.current() {
-            NativeMarkdownTableAppendWorkload::observe_pointer_ready(self, pointer, true);
-        }
+
         if pointer.ended.get() {
             pointer.cancel();
             self.ivars()
@@ -943,261 +510,6 @@ impl PieceBackedMarkdownTextView {
                 .clear_if_same(request);
         }
         Ok(())
-    }
-
-    /// 返回“原 Pointer 已消费、需交还原系统 Up”；两个结果只属于本同步真实事件，不建立后继状态。
-    pub(in crate::native_surface) fn route_table_pointer_event(
-        &self,
-        event: &NSEvent,
-    ) -> (bool, bool) {
-        let _payload = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
-        let kind = event.r#type();
-        if !matches!(
-            kind,
-            NSEventType::LeftMouseDragged | NSEventType::LeftMouseUp | NSEventType::MouseCancelled
-        ) {
-            return (false, false);
-        }
-        let request = self.ivars().pending_table_cell_activation.request();
-        let pending_pointer = request.as_ref().and_then(|request| request.pointer());
-        let active = self
-            .ivars()
-            .active_table_cell
-            .borrow()
-            .as_ref()
-            .and_then(|state| {
-                state.pointer.as_ref().map(|pointer| {
-                    (
-                        state.coordinate,
-                        state.source_utf16_range.clone(),
-                        Rc::clone(pointer),
-                    )
-                })
-            });
-        let pointer =
-            pending_pointer.or_else(|| active.as_ref().map(|(_, _, pointer)| Rc::clone(pointer)));
-        let Some(pointer) = pointer else {
-            return (false, false);
-        };
-        let Some(storage) = self.ivars().text_storage.load() else {
-            return (false, false);
-        };
-        let Some(original_latest) = pointer.latest_event() else {
-            return (false, false);
-        };
-        let event_claim = RefCell::new(original_latest);
-        let current = || {
-            pointer.current(self)
-                && pointer.owns_event(&event_claim.borrow())
-                && storage.ivars().accepts_edits.get()
-                && storage.presentation_mode() == pointer.key.presentation_mode
-                && storage.ivars().table_projection_width_key.get() == pointer.key.text_view_width
-                && WeakMarkdownDocument::ptr_eq(
-                    &pointer.identity,
-                    &storage.ivars().document.borrow(),
-                )
-                && request
-                    .as_ref()
-                    .is_none_or(|request| request.current(self, &storage))
-                && active.as_ref().is_none_or(|(coordinate, source, _)| {
-                    self.ivars()
-                        .active_table_cell
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|state| {
-                            state.coordinate == *coordinate
-                                && state.source_utf16_range == *source
-                                && state
-                                    .pointer
-                                    .as_ref()
-                                    .is_some_and(|active| Rc::ptr_eq(active, &pointer))
-                        })
-                })
-        };
-        let cross_cell_shift = pointer.extending && request.as_ref().is_some_and(|request| {
-            matches!(&*request.action.borrow(), NativeMarkdownTableCellAction::ActivateOriginalClick { source_utf16_range, .. }
-                if !(source_utf16_range.start..=source_utf16_range.end).contains(&pointer.anchor.anchor_utf16))
-        });
-        let body_hit = pointer.body_selection.get() || cross_cell_shift;
-        let system_mouse_up = Cell::new(false); // 只在原窗口/时间/Pointer 权限通过后记录本次真实终点。
-        let result = (|| {
-            if pointer.ended.get() || !current() {
-                return Err(());
-            }
-            let window = native_markdown_table_intent_step(&current, || event.windowNumber())
-                .map_err(|_| ())?;
-            let timestamp = native_markdown_table_intent_step(&current, || event.timestamp())
-                .map_err(|_| ())?;
-            // 同窗口、同按钮的后续真实事件才属于原 Down；新 Down 从不进入这个入口。
-            if window != pointer.window_number || timestamp < pointer.down_timestamp {
-                return Err(());
-            }
-            // preview Down 的唯一构造入口来自 PieceBacked.mouseDown，已经经过 NSWindow.super。
-            // raw-field Down 在 Panel 内消费，不能给系统补一个它从未开始的 Up。
-            system_mouse_up.set(kind == NSEventType::LeftMouseUp && pointer.raw_field.is_none());
-            if pointer.raw_field.is_some() {
-                return self
-                    .update_table_raw_field_pointer(&pointer, event, &current, &event_claim)
-                    .map_err(|_| ()); // 同原 Pointer 的 raw 字段坐标不进入 preview hit/旧源长度判断。
-            }
-            if kind == NSEventType::MouseCancelled {
-                pointer.cancel();
-                if let Some(request) = &request {
-                    self.ivars()
-                        .pending_table_cell_activation
-                        .clear_if_same(request);
-                }
-                return Ok(()); // 系统取消只结束选择手势，不提交或回滚实际草稿。
-            }
-            let point = native_markdown_table_intent_step(&current, || event.locationInWindow())
-                .map_err(|_| ())?;
-            let point = native_markdown_table_intent_step(&current, || {
-                self.convertPoint_fromView(point, None)
-            })
-            .map_err(|_| ())?;
-            let coordinate = active
-                .as_ref()
-                .map(|(coordinate, _, _)| *coordinate)
-                .or_else(|| request.as_ref().map(|request| request.target))
-                .ok_or(())?;
-            let cell = if body_hit {
-                native_markdown_table_intent_step(&current, || {
-                    self.visible_table_cell_at_point(point)
-                })
-                .map_err(|_| ())?
-            } else {
-                // 字段内拖选沿原格布局到其边缘；不把邻格的源码当成本格局部偏移。
-                let key = native_markdown_table_intent_step(&current, || {
-                    self.current_table_layout_request_key()
-                })
-                .map_err(|_| ())?
-                .ok_or(())?;
-                self.ivars()
-                    .visible_table_layout_cache
-                    .borrow()
-                    .as_ref()
-                    .filter(|cache| {
-                        cache.request_key == key
-                            && WeakMarkdownDocument::ptr_eq(
-                                &cache.document_identity,
-                                &pointer.identity,
-                            )
-                    })
-                    .and_then(|cache| {
-                        cache
-                            .tables
-                            .iter()
-                            .flat_map(|table| &table.cells)
-                            .find(|cell| cell.coordinate == coordinate)
-                    })
-                    .cloned()
-            };
-            let hit = if let Some(cell) = cell {
-                native_markdown_table_intent_step(&current, || cell.source_index_at_point(point))
-                    .map_err(|_| ())?
-                    .ok_or(())?
-            } else if body_hit {
-                let graph = NativeMarkdownSelectionGraph::load(self, &current).map_err(|_| ())?;
-                graph
-                    .selection_at_point(
-                        self,
-                        NativeMarkdownSelectionPointQuery {
-                            point,
-                            anchor: None,
-                            extending: false,
-                            selecting: true,
-                            length: pointer.key.document_length,
-                        },
-                        &current,
-                    )
-                    .map_err(|_| ())?
-                    .selection
-                    .head_utf16
-            } else {
-                return Err(());
-            };
-            if !pointer
-                .identity
-                .upgrade()
-                .is_some_and(|document| document.borrow().byte_offset_for_utf16(hit).is_ok())
-            {
-                return Err(());
-            }
-            let retained = native_markdown_table_intent_step(&current, || {
-                // SAFETY: 本 sendEvent 正在持有该真实事件，单个 Latest claim 替换旧事件。
-                unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
-            })
-            .map_err(|_| ())?
-            .ok_or(())?;
-            let retained = Rc::new(retained);
-            let previous_claim = event_claim.replace(Rc::clone(&retained));
-            let previous = {
-                let mut events = pointer.events.borrow_mut();
-                let events = events.as_mut().ok_or(())?;
-                std::mem::replace(&mut events.latest, retained)
-            };
-            drop(previous);
-            drop(previous_claim);
-            if !current() {
-                return Err(());
-            }
-            pointer.head.set(hit);
-            pointer.ended.set(kind == NSEventType::LeftMouseUp);
-            if let Some((_, source, _)) = &active {
-                let field = native_markdown_table_intent_step(&current, || {
-                    self.existing_table_cell_editor()
-                })
-                .map_err(|_| ())?
-                .ok_or(())?;
-                self.apply_table_field_pointer(&field, source, &pointer, &current)
-                    .map_err(|_| ())?;
-                if pointer.ended.get() {
-                    pointer.cancel();
-                    let previous = self
-                        .ivars()
-                        .active_table_cell
-                        .borrow_mut()
-                        .as_mut()
-                        .and_then(|state| {
-                            state
-                                .pointer
-                                .as_ref()
-                                .filter(|candidate| Rc::ptr_eq(candidate, &pointer))?;
-                            state.pointer.take()
-                        });
-                    drop(previous);
-                }
-            } else if pointer.body_selection.get()
-                && let Some(request) = &request
-            {
-                self.install_table_pointer_body_selection(request, &pointer)
-                    .map_err(|_| ())?;
-            }
-            Ok(())
-        })();
-        if result.is_err() && pointer.owns_event(&event_claim.borrow()) {
-            pointer.cancel();
-            let previous = self
-                .ivars()
-                .active_table_cell
-                .borrow_mut()
-                .as_mut()
-                .and_then(|state| {
-                    state
-                        .pointer
-                        .as_ref()
-                        .filter(|candidate| Rc::ptr_eq(candidate, &pointer))?;
-                    state.pointer.take()
-                });
-            drop(previous);
-            if let Some(request) = &request {
-                self.ivars()
-                    .pending_table_cell_activation
-                    .clear_if_same(request);
-            }
-            // 只取消此原 gesture，草稿、正文、历史和先前已接受选择均保留。
-        }
-        (true, system_mouse_up.get())
     }
 
     /// 首次点击在 Ready 后恢复原 point 的实际选择；不重播早已结束的 mouseDown tracking。
@@ -1465,15 +777,6 @@ impl PieceBackedMarkdownTextView {
         let Ok(count) = native_markdown_table_intent_step(&initial, || event.clickCount()) else {
             return;
         };
-        let Ok(window_number) =
-            native_markdown_table_intent_step(&initial, || event.windowNumber())
-        else {
-            return;
-        };
-        let Ok(timestamp) = native_markdown_table_intent_step(&initial, || event.timestamp())
-        else {
-            return;
-        };
         let Ok(Some(down)) = native_markdown_table_intent_step(&initial, || {
             // SAFETY: 原真实事件由本 mouseDown 回调持有；额外 claim 仅供此未完成 gesture。
             unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
@@ -1587,10 +890,7 @@ impl PieceBackedMarkdownTextView {
         };
         let down = Rc::new(down);
         let pointer = Rc::new(NativeMarkdownTableCellPointer {
-            events: RefCell::new(Some(PointerEvents {
-                _down: Rc::clone(&down),
-                latest: down,
-            })),
+            event: RefCell::new(Some(down)),
             input_epoch: epoch,
             identity: identity.clone(),
             key: NativeMarkdownTableLayoutRequestKey {
@@ -1598,8 +898,6 @@ impl PieceBackedMarkdownTextView {
                 document_length: expected_length,
                 ..key
             },
-            window_number,
-            down_timestamp: timestamp,
             ended: Cell::new(false),
             extending: flags.contains(NSEventModifierFlags::Shift),
             click_count: count,
@@ -1609,19 +907,7 @@ impl PieceBackedMarkdownTextView {
             initial_field_range: Cell::new(None),
             captured: RefCell::new(Some(captured)),
             body_selection: Cell::new(false),
-            raw_field: None,
         });
-        #[cfg(all(
-            feature = "native-markdown-runtime-probe",
-            feature = "native-table-row-append"
-        ))]
-        NativeMarkdownTableAppendWorkload::observe_pointer_begin(
-            self,
-            &pointer,
-            &identity,
-            coordinate,
-            &source_range,
-        );
         let intent = NativeMarkdownTableCellIntent {
             input_epoch: epoch,
             fold_revision: fold,

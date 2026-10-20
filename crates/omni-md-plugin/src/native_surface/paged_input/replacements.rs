@@ -64,14 +64,7 @@ impl NativeMarkdownPagedInput {
         }
         // Core成功后只交换有限metadata。这里禁止Native/current及其他可失败操作，避免把
         // 已发生的正文修改报告成普通Err，导致调用方重放同一批替换。
-        let commit = self.publish(
-            permit,
-            document.generation(),
-            prepared,
-            None,
-            edit,
-            &mut folds,
-        );
+        let commit = self.publish(permit, &document, prepared, None, edit, &mut folds);
         drop(folds);
         drop(document);
         drop(original);

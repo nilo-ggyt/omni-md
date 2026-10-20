@@ -581,7 +581,9 @@ impl PieceBackedMarkdownTextStorage {
         view.ivars().source_decorations_dirty.set(true);
         view.schedule_visible_table_layout_update(); // 继续既有settled executor与Find/Mode流程。
         if self.owns_source(owner) {
-            view.setNeedsDisplay(true); // 有真实新publication才请求绘制，不以draw驱动Core轮询。
+            // publication只准备了原有限视口，不能用整篇逻辑bounds向AppKit申请新的正文backing。
+            // 原helper取真实visibleRect并拒绝已关闭/异常几何；滚动与后继覆盖仍由同一executor重建。
+            view.invalidate_visible_body(); // 有真实新publication才排绘制，不以draw推进Core或改变布局范围。
         }
         if self.owns_source(owner) {
             self.forward_source_if_needed(owner);
@@ -820,8 +822,12 @@ mod tests {
     #[test]
     /// 同一无表窗口分别核来源票与真实语义票；普通块已证不能替复杂 inline 的空洞补签。
     fn gap_proof_and_plain_semantics_keep_independent_authority() {
-        let source = "普通正文\n\n**复杂正文仍未知**\n\n```text\n中文😀\n```\n\n尾部\n";
-        let (_directory, document, sources, work) = sources(source);
+        // 长强调已由原分页语义续体证明；此处改用尚未授权的超限链接，继续核无表票不能补签语义。
+        let source = format!(
+            "普通正文\n\n[复杂{}仍未知](https://example.invalid)\n\n```text\n中文😀\n```\n\n尾部\n",
+            "正文".repeat(400)
+        );
+        let (_directory, document, sources, work) = sources(&source);
         let authority = authority(&document);
         let window = 0..document.utf16_len();
         assert_eq!(work.copied_source_bytes, 0);
@@ -849,7 +855,7 @@ mod tests {
             omni_markdown_core::MarkdownPresentationStyles::default(),
             "普通块由原 Plain proof 授权，不能再把真实证明误判成仅有gap"
         );
-        let unknown = source[..source.find("**复杂").unwrap()]
+        let unknown = source[..source.find("[复杂").unwrap()]
             .encode_utf16()
             .count();
         assert!(
@@ -883,10 +889,9 @@ mod tests {
     #[test]
     fn actual_table_cannot_be_hidden_by_gap_envelope_or_empty_snapshot() {
         let source = "前言\n\n| 左 | 右 |\n| --- | --- |\n| 中文 | 😀 |\n\n尾部\n";
-        let (_directory, document, sources, work) = sources(source);
-        // 必须经过真实表格语义工作；有界复制不是RootLeaf自身复制了代码块或全文。
-        assert!(work.copied_source_bytes > 0);
-        assert!(work.parser_input_bytes > 0);
+        let (_directory, document, sources, _) = sources(source);
+        // 无表权限只能来自真实结构覆盖；结构行可在不复制正文、不运行整窗解析时发布。
+        // 此例继续验证表格不能被隐藏，不把某一种复制或解析实现当作表格存在的证据。
         assert!(!no_tables_covered(
             &sources,
             &document,
@@ -906,12 +911,13 @@ mod tests {
             authority(&document),
             &(table..table + 1)
         ));
-        let table = sources
-            .table_sources_for(&document, authority(&document))
-            .unwrap();
+        // 来源票要实际拥有这一行；不要求先为旧整窗后端物化全部单元格语义。
         assert!(
-            table.windows_for(&document).unwrap().next().is_some(),
-            "必须实际取得表格，不能把未知source当无表"
+            sources
+                .table_row_at_for(&document, authority(&document), table)
+                .unwrap()
+                .is_some(),
+            "必须取得真实结构表行，不能把未知来源当作表格覆盖"
         );
     }
 

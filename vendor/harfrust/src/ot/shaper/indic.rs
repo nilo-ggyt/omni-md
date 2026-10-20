@@ -7,15 +7,15 @@ use read_fonts::types::GlyphId;
 
 use super::syllabic::*;
 use super::*;
-use crate::ShaperFont;
 use crate::algs::*;
-use crate::ot::OtData;
 use crate::ot::apply::WouldApplyContext;
 use crate::ot::layout::*;
 use crate::ot::map::*;
+use crate::ot::OtData;
 use crate::plan::ShapePlan;
 use crate::unicode::GeneralCategory;
 use crate::unicode::{CharExt, Codepoint};
+use crate::ShaperFont;
 use crate::{GlyphInfo, Mask, Script, Tag};
 
 pub const INDIC_SHAPER: OtShaper = OtShaper {

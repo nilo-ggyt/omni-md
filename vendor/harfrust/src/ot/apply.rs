@@ -1,17 +1,17 @@
 //! Matching of glyph patterns.
 
-use super::Mask;
-use super::OtData;
 use super::buffer::GlyphInfo;
 use super::buffer::{Buffer, GlyphPropsFlags};
 use super::cache::Cache;
 use super::layout::*;
 use super::lookup_flags;
 use super::set_digest::SetDigest;
-use crate::Scale;
+use super::Mask;
+use super::OtData;
 use crate::mapped_pod_vec::ReadSpanWitness;
 use crate::ot::{ClassDefInfo, CoverageInfo};
 use crate::unicode::GeneralCategory;
+use crate::Scale;
 use alloc::boxed::Box;
 use core::{
     cell::{Cell, RefCell},
@@ -1950,12 +1950,10 @@ mod paged_backtrack_tests {
             crate::cooperative::poll_boundary()
         });
         assert_eq!(result, Err(crate::ShapeError::Cancelled));
-        assert!(
-            context
-                .ignore_proofs
-                .range(context.buffer, context.lookup_props)
-                .is_none()
-        );
+        assert!(context
+            .ignore_proofs
+            .range(context.buffer, context.lookup_props)
+            .is_none());
     }
 
     #[test]

@@ -255,11 +255,15 @@ fn emit_memory(phase: &'static str, sequence: u16, output: &mut impl Write) {
         );
         (pid, status)
     };
-    // 只有这三个既有标签新增分类；仍受原trace/audit环境门与各自固定次数预算约束。
+    // 原绘制边界及固定视图观察前后读取同一分类；仍受原trace/audit门与次数预算约束。
     // 先取得全部标量再输出，避免把本条日志格式化产生的分配计入它自身的分类快照。
     let classes = matches!(
         phase,
-        "table_110_request_return" | "body_draw_end" | "table_executor_pending_begin"
+        "table_110_request_return"
+            | "body_draw_end"
+            | "table_executor_pending_begin"
+            | "view_geometry_begin"
+            | "view_geometry_end"
     )
     .then(capture_memory_classes);
     if status == 0 {
@@ -303,6 +307,8 @@ pub(crate) fn memory_point(phase: &'static str) {
             | "workload_stage_return"
             | "workload_stage_drained"
             | "workload_terminal"
+            | "view_geometry_begin"
+            | "view_geometry_end"
     ) || !enabled()
     {
         return;

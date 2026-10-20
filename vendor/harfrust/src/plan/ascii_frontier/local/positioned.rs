@@ -36,7 +36,6 @@ pub struct AsciiPositionedAdvance {
 pub struct AsciiPositionedAdvanceJob {
     glyphs: GlyphSet,
     classes: [GlyphSet; 2],
-    scale_input: i32,
     points: Option<f32>,
     mode: usize,
     stage: usize,
@@ -70,15 +69,10 @@ pub struct AsciiPositionedAdvanceJob {
 }
 impl AsciiLocalFrontierCertificate {
     /// 仅完整局部闭包可开始定位下界作业；仍须沿同Font/实际计划/scale/字号消费。
-    pub fn positioned_advance_job(
-        &self,
-        scale: i32,
-        points: Option<f32>,
-    ) -> AsciiPositionedAdvanceJob {
+    pub fn positioned_advance_job(&self, points: Option<f32>) -> AsciiPositionedAdvanceJob {
         AsciiPositionedAdvanceJob {
             glyphs: self.glyphs.clone(),
             classes: [GlyphSet([0; 1024]), GlyphSet([0; 1024])],
-            scale_input: scale,
             points,
             mode: 0,
             stage: 0,
@@ -117,7 +111,7 @@ impl AsciiPositionedAdvanceJob {
     pub fn checked_records(&self) -> usize {
         self.records
     }
-    /// 与PairValue/region等元数据分开报告的实际默认glyph advance查询数。
+    /// 与PairValue/region等元数据分开报告的实际glyph advance查询数。
     pub fn queried_glyphs(&self) -> usize {
         self.glyph_queries
     }
@@ -129,7 +123,7 @@ impl AsciiPositionedAdvanceJob {
     pub fn step(
         &mut self,
         plan: &ShapePlan,
-        font: &Font,
+        font: &ShaperFont<'_, '_>,
         budget: usize,
     ) -> Result<Option<AsciiPositionedAdvance>, Rejection> {
         if self.failed {
@@ -236,7 +230,7 @@ impl AsciiPositionedAdvanceJob {
     fn advance(
         &mut self,
         plan: &ShapePlan,
-        font: &Font,
+        shaper: &ShaperFont<'_, '_>,
         budget: usize,
     ) -> Result<Option<AsciiPositionedAdvance>, Rejection> {
         if budget == 0 {
@@ -246,7 +240,8 @@ impl AsciiPositionedAdvanceJob {
             return Ok(self.complete);
         }
         let before = self.records;
-        let shaper = ShaperFont::new(font).with_scale(self.scale_input);
+        // 调用方交付同一实际执行Font与尺度；平台不可变metrics也必须进入这一原始下界，
+        // 不能内部重造默认Font后对hmtx证明，却在实际shape中使用不同的水平推进。
         let layout = shaper.layout();
         let scale = shaper.scale;
         while self.records - before < budget {
@@ -258,8 +253,7 @@ impl AsciiPositionedAdvanceJob {
                         return Err(Rejection::MetadataBudget);
                     }
                     self.glyph_ids[self.count] = glyph;
-                    self.advances[self.count] =
-                        shaper.default_glyph_h_advance(GlyphId::from(glyph));
+                    self.advances[self.count] = shaper.glyph_h_advance(GlyphId::from(glyph));
                     self.count += 1;
                     self.first = u32::from(glyph) + 1;
                     continue;

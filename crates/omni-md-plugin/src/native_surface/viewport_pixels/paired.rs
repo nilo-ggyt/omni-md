@@ -53,11 +53,6 @@ impl MaskPaletteRequest {
         self.background == other.background && self.foreground == other.foreground
     }
 
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    pub(in crate::native_surface) fn color_count(&self) -> usize {
-        self.count
-    }
-
     fn locate(&self, color: u32) -> Option<usize> {
         let mut slot = hash(color);
         for _ in 0..COLORS * 2 {
@@ -293,34 +288,6 @@ impl MaskCalibrationTable {
                     });
                 }
             }
-        }
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        {
-            // 直接格式化原有限色表与本次found事实；不复制像素、重扫校准图或读取文稿。
-            struct RgbList<'a>(&'a [u32], Option<&'a [bool]>);
-            impl std::fmt::Debug for RgbList<'_> {
-                fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    let mut list = formatter.debug_list();
-                    for (index, color) in self.0.iter().enumerate() {
-                        if self.1.is_none_or(|found| !found[index]) {
-                            list.entry(&format_args!("{color:06x}"));
-                        } // 最多256个原色；同一formatter可报告缺色或完整原色，不复制像素。
-                    }
-                    list.finish()
-                }
-            }
-            eprintln!(
-                "paged_pair_missing actual_background={:?} actual_foreground={:?} blend={:?} original_palette_colors={} actual_missing_count={remaining} actual_missing_rgb={:?} actual_original_rgb={:?} rgba_alpha=255 tolerance=0 qualification_unchanged=true whole_product=false formal=false",
-                request.background,
-                request.foreground,
-                self.blend,
-                request.count,
-                RgbList(
-                    &request.colors[..request.count],
-                    Some(&found[..request.count])
-                ),
-                RgbList(&request.colors[..request.count], None),
-            );
         }
         None // 任一真实RGB没有完全相同的Native输出，整个瓦片沿原表示，不近似或舍弃颜色。
     }

@@ -206,7 +206,7 @@ impl MarkdownDocumentBuffer {
         )?;
         let (range, replacement) = cell.replacement_for(self)?;
         self.finish_table_row_append_with_end(
-            &cell.context,
+            &cell.cell.context,
             end,
             range.clone(),
             replacement.to_owned(),
@@ -220,11 +220,12 @@ impl MarkdownDocumentBuffer {
     ) -> Result<VerifiedCellRowAppendTail, MarkdownTableWindowError> {
         let (range, _) = plan.replacement_for(self)?;
         let end = plan
+            .cell
             .context
             .end
             .as_ref()
             .ok_or(MarkdownTableWindowError::ContextPending)?;
-        self.table_row_append_tail_with_end(&plan.context, end, range.clone())
+        self.table_row_append_tail_with_end(&plan.cell.context, end, range.clone())
     }
 
     /// 旧公开有限String计划保原复制预算；规则与长Cell文件续写共用同一个真实表尾证明。

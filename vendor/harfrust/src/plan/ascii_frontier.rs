@@ -1,7 +1,7 @@
 //! 只读检查实际已编译计划，不执行或修改字形算法；源范围权限由调用方另行认证。
 
 use super::ShapePlan;
-use crate::{Direction, Font, ShaperFont, ot::layout::LayoutTableKind, ot::lookup::SubtableKind};
+use crate::{ot::layout::LayoutTableKind, ot::lookup::SubtableKind, Direction, Font, ShaperFont};
 
 mod closure;
 mod local;

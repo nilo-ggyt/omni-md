@@ -38,19 +38,19 @@ pub mod native_surface;
 
 #[cfg(all(target_os = "macos", feature = "native-markdown-runtime-probe"))]
 pub use native_surface::{
-    NativeMarkdownHostedStep, NativeMarkdownHostedWorkload, NativeMarkdownRuntimeProbeCompletion,
-    NativeMarkdownRuntimeProbeSession, run_native_markdown_runtime_probe,
+    NativeMarkdownHostedFlow, NativeMarkdownHostedStep, NativeMarkdownHostedWorkload,
+    NativeMarkdownRuntimeProbeCompletion, NativeMarkdownRuntimeProbeSession,
+    run_native_markdown_runtime_probe, write_native_markdown_giant_paragraph_fixture,
+    write_native_markdown_memory_fixture,
 };
 
 #[cfg(all(target_os = "macos", feature = "native-markdown-runtime-probe"))]
 mod runtime_probe_application;
 #[cfg(all(target_os = "macos", feature = "native-markdown-runtime-probe"))]
 pub use runtime_probe_application::{
-    NativeMarkdownMemoryStopAfter, native_markdown_runtime_probe_fixture,
-    native_markdown_semantic_snapshot_probe_fixture,
-    run_native_markdown_memory_workload_application, run_native_markdown_runtime_probe_application,
+    native_markdown_runtime_probe_fixture, native_markdown_semantic_snapshot_probe_fixture,
+    run_native_markdown_runtime_probe_application,
     run_native_markdown_semantic_snapshot_probe_application,
-    write_native_markdown_giant_paragraph_fixture, write_native_markdown_memory_fixture,
 };
 
 #[cfg(all(
@@ -58,14 +58,16 @@ pub use runtime_probe_application::{
     feature = "native-markdown-runtime-probe",
     feature = "native-table-row-append"
 ))]
-pub use runtime_probe_application::run_native_markdown_table_append_workload_application;
+pub use native_surface::{NativeMarkdownHostedResourceCase, NativeMarkdownHostedResourceProbe};
 
 #[cfg(all(
     target_os = "macos",
     feature = "native-markdown-runtime-probe",
     feature = "native-table-row-append"
 ))]
-pub use native_surface::NativeMarkdownTableAppendCase;
+pub use native_surface::{
+    NativeMarkdownHostedTableCase, NativeMarkdownHostedTableProbe, NativeMarkdownHostedTableStep,
+};
 
 /// Stable protocol identity; the host treats it as descriptor data.
 pub const PLUGIN_ID: &str = "com.omnibar.plugins.omni-md";

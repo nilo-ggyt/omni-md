@@ -4,9 +4,8 @@ use super::super::{table_reference_request, table_source::MarkdownTableUnderline
 use super::*;
 use crate::markdown_viewport_presentation::table_window::{
     MarkdownProjectedTableWindow, MarkdownTableGlobalContext, MarkdownTableSourceLine,
-    MarkdownTableWindowInput, MarkdownTableWindowQuota, project_table_window,
-    project_table_window_with_quota, references::MarkdownTableReferenceQueries,
-    table_window_reference_queries,
+    MarkdownTableWindowInput, MarkdownTableWindowQuota, project_table_window_with_quota,
+    references::MarkdownTableReferenceQueries, table_window_reference_queries,
 };
 use crate::markdown_viewport_presentation::{MarkdownPresentationRun, MarkdownPresentationStyles};
 use pulldown_cmark::block_frontier::{TableScopeCursor, TableScopeStep};
@@ -18,6 +17,9 @@ use prefixes::{PrefixRuns, ScopeProjection};
 use source_lines::{LineCopy, OwnedLine};
 
 type Error = MarkdownTableWindowError;
+// 单窗口与同批窗口沿用同一有限投影上限；独立入口也明确持有自己的真实预算owner。
+const MAX_RUNS: usize = 8192;
+const MAX_METADATA_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// 已知增量工作与有限whole-slice Parser输入分列；不把input cap误称AST/总内存或逐token证明。
@@ -102,7 +104,7 @@ enum Phase {
 pub struct MarkdownTableWindowRequest {
     source: MarkdownTableSourceIdentity,
     batch: bool,
-    quota: Option<MarkdownTableWindowQuota>,
+    quota: MarkdownTableWindowQuota,
     structure: Option<MarkdownTableWindowStructureRequest>,
     ticket: Option<MarkdownTableStructuralWindow>,
     scope_cursor: Option<TableScopeCursor>,
@@ -133,14 +135,15 @@ impl MarkdownDocumentBuffer {
         active_selection: Range<usize>,
     ) -> Result<MarkdownTableWindowRequest, MarkdownTableRequestError> {
         let structure = self.table_window_structure_request(target, viewport)?;
+        let quota = MarkdownTableWindowQuota::new(MAX_RUNS, MAX_METADATA_BYTES);
         Ok(MarkdownTableWindowRequest {
             source: structure.source.clone(),
             batch: false,
-            quota: None,
+            quota: quota.clone(),
             structure: Some(structure),
             ticket: None,
             scope_cursor: None,
-            scope: ScopeProjection::default(),
+            scope: ScopeProjection::with_quota(quota),
             copier: None,
             lines: Vec::new(),
             prefixes: None,
@@ -177,7 +180,7 @@ impl MarkdownDocumentBuffer {
             column,
             escaped_source,
         )?;
-        plan.context.end = window.table_end.clone();
+        plan.cell.context.end = window.table_end.clone();
         Ok(plan)
     }
 }
@@ -189,7 +192,7 @@ impl MarkdownTableWindowRequest {
         cancelled: bool,
         budget: usize,
     ) -> Result<MarkdownTableWindowStep, MarkdownTableRequestError> {
-        self.advance_with_references(document, cancelled, budget, None)
+        self.advance_with_references(document, cancelled, budget, None, None)
     }
 
     fn advance_with_references(
@@ -198,6 +201,7 @@ impl MarkdownTableWindowRequest {
         cancelled: bool,
         budget: usize,
         references: Option<&MarkdownTableReferenceQueries>,
+        global: Option<&mut GlobalFrontier>,
     ) -> Result<MarkdownTableWindowStep, MarkdownTableRequestError> {
         if let Some(error) = self.failed {
             return Err(error);
@@ -209,7 +213,7 @@ impl MarkdownTableWindowRequest {
         } else if !(4096..=65536).contains(&budget) {
             Err(MarkdownTableRequestError::InvalidRequest)
         } else {
-            self.advance_inner(document, budget, references)
+            self.advance_inner(document, budget, references, global)
         };
         if let Err(error) = result {
             // 任一子阶段失败都丢弃整批和全部容量；不继续用后继definition/旧Ready修补错误。
@@ -226,6 +230,7 @@ impl MarkdownTableWindowRequest {
         document: &MarkdownDocumentBuffer,
         budget: usize,
         references: Option<&MarkdownTableReferenceQueries>,
+        global: Option<&mut GlobalFrontier>,
     ) -> Result<MarkdownTableWindowStep, MarkdownTableRequestError> {
         let mut work = SemanticWork::default();
         match self.phase {
@@ -247,7 +252,7 @@ impl MarkdownTableWindowRequest {
                 match step {
                     MarkdownTableStructureStep::StructureReady { .. } => {
                         self.ticket = structure.ready.take();
-                        self.structure = None;
+                        // 有限语义仍借用同一个结构Global；原票据已移交，Ready时统一释放它。
                         self.phase = Phase::Scope;
                     }
                     MarkdownTableStructureStep::NotTable { .. } => {
@@ -350,7 +355,7 @@ impl MarkdownTableWindowRequest {
                 }
             }
             Phase::Queries => {
-                // 有限projection Parser的输入额外计量；这些节点峰值仍须实际整产品门禁，不外推100MB。
+                // 有限projection Parser的输入额外计量；这些节点峰值仍须实际整产品验收，不外推150MB。
                 self.queries =
                     Some(self.with_input(document, false, table_window_reference_queries)?);
                 work.parser_input_bytes = self
@@ -371,33 +376,43 @@ impl MarkdownTableWindowRequest {
             Phase::References => return self.advance_references(document, budget),
             Phase::Underline => {
                 if self.underline.is_none() {
-                    if let Some(quota) = &self.quota {
-                        quota
-                            .reserve_underline_workspace()
-                            .map_err(MarkdownTableRequestError::Window)?;
-                    }
+                    self.quota
+                        .reserve_underline_workspace()
+                        .map_err(MarkdownTableRequestError::Window)?;
                     let ticket = self
                         .ticket
                         .as_ref()
                         .ok_or(MarkdownTableRequestError::InvalidRequest)?;
                     self.underline = Some(
                         document
-                            .table_underline_request(&byte_coverage(ticket))
+                            .table_underline_request(&byte_coverage(ticket), self.quota.clone())
                             .map_err(MarkdownTableRequestError::Window)?,
                     );
                     work.structural_transitions = 64;
                     return Ok(MarkdownTableWindowStep::Progress { work });
                 }
-                let result = self
-                    .underline
-                    .as_mut()
-                    .unwrap()
-                    .advance(document, budget / 8)
-                    .map_err(MarkdownTableRequestError::Window)?;
-                work.source_bytes = result.source_bytes;
+                let global = match global {
+                    Some(global) => global, // batch把原结构Global的唯一可变借用交到当前串行job。
+                    None => self
+                        .structure
+                        .as_mut()
+                        .and_then(|structure| structure.global.as_mut())
+                        .ok_or(MarkdownTableRequestError::InvalidRequest)?,
+                };
+                let result =
+                    self.underline
+                        .as_mut()
+                        .unwrap()
+                        .advance(document, global, budget - 64)?;
+                work.source_bytes = result.source_bytes + result.global_source_bytes;
                 work.utf8_validation_bytes = result.utf8_validation_bytes;
-                work.source_tree_steps = result.source_tree_steps;
-                work.structural_transitions = 64;
+                work.source_tree_steps = result.source_tree_steps + result.global_source_tree_steps;
+                work.structural_transitions = result.structural_transitions + 64;
+                work.copied_source_bytes = result.copied_source_bytes;
+                work.metadata_bytes = result.metadata_bytes;
+                work.normalizer_input_bytes = result.normalizer_input_bytes;
+                work.parser_input_bytes = result.parser_input_bytes;
+                work.allocated_source_capacity = result.allocated_source_capacity;
                 if result.ready {
                     self.phase = Phase::Project;
                 }
@@ -405,10 +420,7 @@ impl MarkdownTableWindowRequest {
             Phase::Project => {
                 let presentation =
                     self.with_input_references(document, true, references, |input| {
-                        match self.quota.as_ref() {
-                            Some(quota) => project_table_window_with_quota(input, Some(quota)),
-                            None => project_table_window(input),
-                        }
+                        project_table_window_with_quota(input, Some(&self.quota))
                     })?;
                 work.parser_input_bytes = presentation.projection_bytes;
                 let ticket = self
@@ -714,6 +726,9 @@ pub use batch::{
     MarkdownTableViewportBudget, MarkdownTableViewportCoverage, MarkdownTableViewportRequest,
     MarkdownTableViewportRequiredRowQuery, MarkdownTableViewportRequiredRowResult,
     MarkdownTableViewportStep, VerifiedMarkdownTableGap, VerifiedMarkdownTableViewport,
+};
+pub(in crate::markdown_document_buffer::table_window_request) use batch::{
+    RequiredLocation, RequiredPublication,
 };
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use harfrust::{Buffer, BufferFlags, ClusterLevel, ShapeOptions, ShaperFont};
+use harfrust::{Buffer, BufferFlags, ClusterLevel, ShapeOptions};
 use thiserror::Error;
 
 use crate::{
@@ -354,6 +354,53 @@ impl MarkdownShapingJob {
         )
     }
 
+    /// 原 FontProbe 或分项协调器消费已认证的两套坐标，不为远端字素重走定位。
+    /// 这不是公开范围构造口；Source、Font、选项和坐标上界仍按原构造合同验证。
+    #[cfg(feature = "paged-line-compose")]
+    pub(crate) fn from_certified_item_input(
+        source: MarkdownLayoutTextSource,
+        source_authority: &MarkdownLayoutTextAuthority,
+        font: MarkdownLayoutFont,
+        font_authority: &MarkdownLayoutFontAuthority,
+        ranges: (Range<usize>, Range<usize>, Option<Range<usize>>),
+        options: MarkdownShapingOptions,
+        cancellation: MarkdownShapingCancellation,
+    ) -> Result<Self> {
+        source.health()?;
+        if !source.permits(source_authority) {
+            return Err(MarkdownShapingError::SourceMismatch);
+        }
+        if !font.permits(font_authority) {
+            return Err(MarkdownShapingError::FontMismatch);
+        }
+        if ranges.0.start > ranges.0.end
+            || ranges.0.end > source.utf16_len()
+            || ranges.1.start > ranges.1.end
+            || ranges.1.end > source.byte_len()
+        {
+            return Err(MarkdownShapingError::InvalidRange);
+        }
+        u32::try_from(ranges.0.end).map_err(|_| MarkdownShapingError::CoordinateOverflow)?;
+        let options = options::ValidatedOptions::new(options, &font)?;
+        let prepared = ranges
+            .2
+            .map(|bounds| input::prepare_context(&source, ranges.1.clone(), Some(bounds)))
+            .transpose()?;
+        let mut job = Self::assemble_with_context(
+            source,
+            source_authority,
+            font,
+            font_authority,
+            (ranges.0, ranges.1, prepared),
+            options,
+            cancellation,
+        )?;
+        if job.cancellation.requested() {
+            job.guard(source_authority, font_authority)?;
+        } // 和原new_with_cancellation相同：真实Source/资源首错优先，并实际归还取消中的候选载荷。
+        Ok(job)
+    }
+
     /// 只接收本模块已经验证的样式与原范围；公开构造和真实软行派生共享唯一装配路径。
     fn assemble(
         source: MarkdownLayoutTextSource,
@@ -626,7 +673,10 @@ impl MarkdownShapingJob {
                 .payload
                 .as_mut()
                 .ok_or(MarkdownShapingError::Poisoned)?;
-            let shaper = ShaperFont::new(payload.font.font()).with_scale(self.options.scale);
+            let shaper = payload
+                .font
+                .shaper_at_scale(self.options.scale)
+                .map_err(|_| MarkdownShapingError::InvalidOptions)?;
             // 冷Font的OnceLock初始化不在取消scope内；其返回后深层原算法逐批观察原请求。
             harfrust::with_cooperative_control(control, || {
                 let shape_options = ShapeOptions::new()

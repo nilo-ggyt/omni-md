@@ -77,7 +77,10 @@ impl Capture<'_> {
                     2
                 } else {
                     u8::from(length == 2)
-                } | bracket.map_or(0, |value| if value.is_open { 4 } else { 8 }),
+                } | bracket.map_or(0, |value| if value.is_open { 4 } else { 8 })
+                    | ((scalar.len_utf8() as u8 - 1) << 4),
+                // bit4..5 保存本次原捕获已经解码的真实 UTF8 宽度，头/低代理记录共享该值。
+                // 仍写同一条 32B 私有临时记录；段末消费者无需借下一段或回源重定位 byte 尾。
             }
             .write_prepared(self.store, self.units + offset)
             .await?;

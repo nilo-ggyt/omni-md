@@ -4,9 +4,9 @@ use super::*;
 
 #[derive(Clone, Debug)]
 pub(super) enum MarkdownMarkerOwner {
-    /// 普通inline沿既有完整结构相交规则显露。
+    /// 普通inline仅由选区端点所在的真实结构及祖先显露。
     Structure(Range<usize>),
-    /// quote只由选区端点所在物理行显露；带EOL的末端属于下一行。
+    /// quote与围栏只由选区端点所在物理行显露；带EOL的末端属于下一行。
     PhysicalLine {
         range: Range<usize>,
         includes_end: bool,
@@ -21,7 +21,7 @@ impl MarkdownMarkerOwner {
         }
     }
 
-    /// quote不把跨行选区中间的行误作正在编辑的端点行。
+    /// 物理行owner不把跨行选区中间的行误作正在编辑的端点行。
     pub(super) fn is_active(&self, selection: &Range<usize>, range: &Range<usize>) -> bool {
         match self {
             Self::Structure(_) => markdown_selection_intersects(selection, range),

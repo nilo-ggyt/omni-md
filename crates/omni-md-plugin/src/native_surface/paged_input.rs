@@ -21,13 +21,16 @@ use omni_markdown_core::{
 mod cell;
 mod cell_commit;
 mod cell_mutations;
+mod folding;
 mod formatting;
+#[cfg(feature = "native-input-trace")]
+mod input_trace;
 mod source_commands;
 mod target;
 pub use cell::NativeMarkdownPagedCellSession;
 pub use cell_commit::{
-    NativeMarkdownPagedCellCommitError, NativeMarkdownPagedCellCommitResult,
-    NativeMarkdownPagedCellPreparedCommit,
+    NativeMarkdownPagedCellCommit, NativeMarkdownPagedCellCommitError,
+    NativeMarkdownPagedCellCommitResult, NativeMarkdownPagedCellPreparedCommit,
 };
 use target::InputTarget;
 pub use target::NativeMarkdownPagedTargetDomain;
@@ -92,6 +95,8 @@ pub enum NativeMarkdownPagedInputError {
     Document(#[from] MarkdownDocumentBufferError),
     #[error("无法访问原单元格草稿：{0}")]
     Cell(#[from] MarkdownCellDraftError),
+    #[error("无法访问原单元格来源：{0:?}")]
+    CellSource(omni_markdown_core::markdown_document_buffer::MarkdownTableRequestError),
     #[error("该操作需要原正文目标，不能以单元格局部坐标执行")]
     BodyTargetRequired,
     #[error("无法准备原折叠状态：{0}")]
@@ -195,6 +200,9 @@ pub struct NativeMarkdownPagedInput {
     fold_revision: Cell<u64>,
     closed: Cell<bool>,
     busy: Cell<bool>,
+    // 只在显式arm成功后分配原有限记录器；字段没有Doc、Native或异步反向所有权。
+    #[cfg(feature = "native-input-trace")]
+    input_trace: RefCell<Option<crate::native_input_trace::SharedNativeInputTrace>>,
 }
 
 struct Mutation<'a>(&'a Cell<bool>);
@@ -294,6 +302,8 @@ impl NativeMarkdownPagedInput {
             fold_revision: Cell::new(0),
             closed: Cell::new(false),
             busy: Cell::new(false),
+            #[cfg(feature = "native-input-trace")]
+            input_trace: RefCell::new(None),
         }))
     }
 
@@ -522,6 +532,19 @@ impl NativeMarkdownPagedInput {
     ) -> Result<NativeMarkdownPagedInputCommit> {
         let _mutation = self.begin(permit, current)?;
         let intent = self.cell_intent(permit, MarkdownCellDraftInputKind::Typing)?;
+        self.replace(permit, text, replacement, None, intent, current)
+    }
+
+    /// 已在真实Paste到达时转换的有限载荷，沿原Isolated事务执行，不重建NSString副本。
+    pub(in crate::native_surface) fn insert_text_isolated(
+        self: &Rc<Self>,
+        permit: &NativeMarkdownPagedInputPermit,
+        text: &str,
+        replacement: NSRange,
+        current: &(impl Fn(u64) -> bool + ?Sized),
+    ) -> Result<NativeMarkdownPagedInputCommit> {
+        let _mutation = self.begin(permit, current)?;
+        let intent = self.cell_intent(permit, MarkdownCellDraftInputKind::Isolated)?;
         self.replace(permit, text, replacement, None, intent, current)
     }
 
@@ -821,14 +844,7 @@ impl NativeMarkdownPagedInput {
             }
         };
         // 从publish到metadata完成没有Native、current或可失败IO；不允许提交后再用普通Err谎报未修改。
-        let commit = self.publish(
-            permit,
-            document.generation(),
-            prepared,
-            marked,
-            Some(edit),
-            &mut folds,
-        );
+        let commit = self.publish(permit, &document, prepared, marked, Some(edit), &mut folds);
         drop(folds);
         drop(document);
         drop(original);
@@ -850,12 +866,13 @@ impl NativeMarkdownPagedInput {
     fn publish(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
-        generation: u64,
+        document: &MarkdownDocumentBuffer,
         prepared: PreparedFolds,
         marked: Option<NSRange>,
         edit: Option<MarkdownHistoryTextEdit>,
         folds: &mut Vec<MarkdownFoldRegion>,
     ) -> NativeMarkdownPagedInputCommit {
+        let generation = document.generation();
         let folds_changed = *folds != prepared.folds;
         *folds = prepared.folds; // 旧有限Vec在纯Rust发布内释放，不跨Native调用保留容量。
         self.fold_revision.set(self.fold_revision.get() + 1); // begin已预检checked_add且busy禁止第二发布。
@@ -876,7 +893,7 @@ impl NativeMarkdownPagedInput {
             selection_serial: serial,
             fold_revision: self.fold_revision.get(),
         };
-        NativeMarkdownPagedInputCommit {
+        let commit = NativeMarkdownPagedInputCommit {
             owner: Rc::downgrade(self),
             epoch: permit.epoch,
             state,
@@ -889,7 +906,10 @@ impl NativeMarkdownPagedInput {
                 marked_changed: marked != permit.before.marked,
                 folds_changed,
             },
-        }
+        };
+        #[cfg(feature = "native-input-trace")]
+        self.record_input_trace_commit(&commit, document); // 纯标量观察不调用Native/current，失败后果不改变已发布事务。
+        commit
     }
 
     /// 解除标记只改变原owner的组合metadata；不创建候选、追加、日志或历史事务。
@@ -940,23 +960,51 @@ impl NativeMarkdownPagedInput {
             selection_serial,
             ..permit.before
         };
+        let commit = NativeMarkdownPagedInputCommit {
+            owner: Rc::downgrade(self),
+            epoch: permit.epoch,
+            state,
+            invalidation: NativeMarkdownPagedInputInvalidation {
+                replaced_utf16_range: None,
+                change_in_utf16_length: 0,
+                characters_changed: false,
+                selection_changed: false,
+                marked_changed: true,
+                folds_changed: false,
+            },
+        };
+        #[cfg(feature = "native-input-trace")]
+        self.record_input_trace_commit(&commit, &document); // 无字节变化的真实unmark也属于原组合的完成。
         drop(document);
         drop(original);
-        Ok(NativeMarkdownPagedInputOutcome::Committed(
-            NativeMarkdownPagedInputCommit {
-                owner: Rc::downgrade(self),
-                epoch: permit.epoch,
-                state,
-                invalidation: NativeMarkdownPagedInputInvalidation {
-                    replaced_utf16_range: None,
-                    change_in_utf16_length: 0,
-                    characters_changed: false,
-                    selection_changed: false,
-                    marked_changed: true,
-                    folds_changed: false,
-                },
-            },
-        ))
+        Ok(NativeMarkdownPagedInputOutcome::Committed(commit))
+    }
+
+    /// 菜单只读当前客户真正拥有的历史；活动格不能借正文栈启用撤销，组合输入不执行历史动作。
+    pub(in crate::native_surface) fn can_perform_history(
+        &self,
+        direction: NativeMarkdownPagedInputHistory,
+    ) -> Result<bool> {
+        if self.state()?.marked.is_some() {
+            return Ok(false);
+        }
+        if let Some(facts) = self.cell_history_facts()? {
+            return Ok(match direction {
+                NativeMarkdownPagedInputHistory::Undo => facts.can_undo,
+                NativeMarkdownPagedInputHistory::Redo => facts.can_redo,
+            }); // 局部草稿的历史在原 Cell token 下读取，不为菜单提交它或创建新的历史。
+        }
+        let owner = self
+            .document_identity()
+            .upgrade()
+            .ok_or(NativeMarkdownPagedInputError::DocumentReleased)?;
+        let document = owner
+            .try_borrow()
+            .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
+        Ok(match direction {
+            NativeMarkdownPagedInputHistory::Undo => document.can_undo(),
+            NativeMarkdownPagedInputHistory::Redo => document.can_redo(),
+        }) // 只读真实栈，既不读取正文，也不改变选择、历史分组或磁盘状态。
     }
 
     /// 直接复用Core已预检的observed历史事务，不把Undo伪装为一次新replacement。
@@ -999,14 +1047,7 @@ impl NativeMarkdownPagedInput {
         let Some((edit, prepared)) = restored else {
             return Ok(NativeMarkdownPagedInputOutcome::Unchanged(permit.before));
         };
-        let commit = self.publish(
-            permit,
-            document.generation(),
-            prepared,
-            None,
-            Some(edit),
-            &mut folds,
-        );
+        let commit = self.publish(permit, &document, prepared, None, Some(edit), &mut folds);
         drop(folds);
         drop(document);
         drop(original);
@@ -1127,6 +1168,11 @@ impl NativeMarkdownPagedInput {
         self.selection.clear_vertical_goal();
     }
 
+    /// 原 Source 未换代，只撤选择样式重排所淘汰的视觉几何；本次显式 head 亲和不重新捕获。
+    pub(in crate::native_surface) fn clear_style_navigation_geometry(&self) {
+        self.selection.clear_style_geometry();
+    }
+
     fn publish_selection(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -1165,10 +1211,33 @@ impl NativeMarkdownPagedInput {
             document.byte_offset_for_utf16(permit.before.selection.anchor_utf16)?;
             return Err(NativeMarkdownPagedInputError::InvalidRange);
         }
+        let mut folds = self
+            .folds
+            .try_borrow_mut()
+            .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
+        let mut retained = Vec::with_capacity(folds.len());
+        for fold in folds.iter() {
+            let hidden = folding::folded_layout_range(&document, fold)?;
+            let inside = |position| hidden.start < position && position < hidden.end;
+            if !inside(selection.anchor_utf16) && !inside(selection.head_utf16) {
+                retained.push(fold.clone());
+            }
+        } // 系统/程序选择的真实端点进入隐区时必须同收据展开；跨越隐区的外部端点不凭重叠展开。
+        let folds_changed = retained.len() != folds.len();
+        let fold_revision = if folds_changed {
+            permit
+                .before
+                .fold_revision
+                .checked_add(1)
+                .ok_or(NativeMarkdownPagedInputError::CounterExhausted)?
+        } else {
+            permit.before.fold_revision
+        };
         document.set_selection(selection)?;
         if intent.is_none()
             && selection == permit.before.selection
             && permit.before.selection_is_directed
+            && !folds_changed
         {
             return Ok(NativeMarkdownPagedInputOutcome::Unchanged(permit.before));
         }
@@ -1183,14 +1252,20 @@ impl NativeMarkdownPagedInput {
             side,
         );
         drop(self.selection_ranges.replace(Vec::new()));
+        if folds_changed {
+            *folds = retained;
+            self.fold_revision.set(fold_revision);
+        }
         let state = NativeMarkdownPagedInputState {
             selection,
             selection_is_directed: true,
             selection_range_count: 1,
             primary_range: ordered_selection_range(selection),
             selection_serial: serial,
+            fold_revision,
             ..permit.before
         };
+        drop(folds);
         drop(document);
         drop(original);
         Ok(NativeMarkdownPagedInputOutcome::Committed(
@@ -1204,7 +1279,7 @@ impl NativeMarkdownPagedInput {
                     characters_changed: false,
                     selection_changed: true,
                     marked_changed: false,
-                    folds_changed: false,
+                    folds_changed,
                 },
             },
         ))
@@ -1228,6 +1303,8 @@ impl NativeMarkdownPagedInput {
             return Err(NativeMarkdownPagedInputError::Busy);
         }
         self.closed.set(true);
+        #[cfg(feature = "native-input-trace")]
+        drop(self.input_trace.borrow_mut().take()); // 接受close即移走payload；迟到scope只剩固定标量记录。
         self.marked.set(None);
         if self.selection.serial() != u64::MAX {
             self.selection.seal();

@@ -57,34 +57,17 @@ impl Calibrations {
         .into_iter()
         .enumerate()
         {
-            let captured = if !self.entries[endpoint].attempted[mode] {
+            // 每个模式在同候选中只尝试一次；预算不足也保留attempted事实，不逐tile重建原生图。
+            if !self.entries[endpoint].attempted[mode] {
                 let table = capture_checked(request, blend, Arc::clone(&pixels), validate)?;
                 validate()?;
                 self.entries[endpoint].tables[mode] = table;
                 self.entries[endpoint].attempted[mode] = true;
-                true
-            } else {
-                false // 原模式已尝试过，包括预算miss；同候选不会因后续tile反复创建校准图。
-            };
+            }
             let table = &self.entries[endpoint].tables[mode];
             let pairs = table
                 .as_ref()
                 .and_then(|table| table.certify(request, blend));
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            if captured {
-                eprintln!(
-                    "paged_pair_calibration actual_background={:?} actual_foreground={:?} blend={blend:?} original_palette_colors={} actual_native_roles={} actual_native_nil=true actual_table_ready={} actual_palette_covered={} actual_source_maps_returned={} whole_product=false formal=false",
-                    request.background,
-                    request.foreground,
-                    request.color_count(),
-                    if table.is_some() { 5 } else { 0 },
-                    table.is_some(),
-                    pairs.is_some(),
-                    table.is_some(),
-                );
-            }
-            #[cfg(not(feature = "native-markdown-runtime-probe"))]
-            let _ = captured;
             validate()?;
             if pairs.is_some() {
                 return Ok(pairs); // 先保旧同前景模式；未全色匹配才允许原背景回混的独立实际表。

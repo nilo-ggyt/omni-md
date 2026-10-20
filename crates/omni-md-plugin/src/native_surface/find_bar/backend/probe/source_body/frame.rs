@@ -71,6 +71,23 @@ fn wait(
         frame.waiting.set(false);
     }
     if let Some(cause) = body.take_failure() {
+        // 合成验收边界保留具体语义错误类型以定位真实失败，不更改用户公开文案，也不记录正文或链接。
+        if let crate::native_surface::paged_body::NativeMarkdownPagedBodyError::Semantics(
+            semantic,
+        ) = &cause
+        {
+            return Err(format!(
+                "{stage}: 原Body失败：{cause}；semantic_error={semantic:?}"
+            ));
+        }
+        if let crate::native_surface::paged_body::NativeMarkdownPagedBodyError::Compose(
+            omni_markdown_core::MarkdownLineComposeError::Bidi(bidi),
+        ) = &cause
+        {
+            // 同样保留真实 UBA 错误种类，区分表格域误用、来源失效与实际存储失败。
+            // BidiError 只含类型、坐标或系统错误，不输出文稿字符，也不改变原三秒完成要求。
+            return Err(format!("{stage}: 原Body失败：{cause}；bidi_error={bidi:?}"));
+        }
         return Err(format!("{stage}: 原Body失败：{cause}"));
     }
     let view = body.view().map_err(|cause| cause.to_string())?;

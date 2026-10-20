@@ -1,4 +1,4 @@
-use crate::{Direction, Feature, Language, Script, text_parser::TextParser};
+use crate::{text_parser::TextParser, Direction, Feature, Language, Script};
 use read_fonts::model::Variation;
 
 /// Parses a HarfBuzz-style setting from text.

@@ -14,6 +14,7 @@ pub(super) struct UnicodeState {
     count: usize,
     ordinal: Option<usize>,
     locate: Option<(usize, usize)>,
+    successor_ordinal: Option<usize>,
     total: Option<usize>,
     next_boundary: Option<MarkdownGraphemeBoundary>,
     bytes: [u8; 4096],
@@ -80,6 +81,7 @@ impl UnicodeState {
             count: 0,
             ordinal: None,
             locate: None,
+            successor_ordinal: None,
             total: None,
             next_boundary: None,
             bytes: [0; 4096],
@@ -126,6 +128,7 @@ impl UnicodeState {
         self.used = 0;
         self.needed = 0;
         self.next_boundary = None;
+        self.successor_ordinal = None;
         self.scanned = false;
         self.center_count = 0;
         self.verified = 0;
@@ -162,6 +165,7 @@ impl UnicodeState {
         source: &MarkdownLayoutTextAuthority,
         step: &mut MarkdownShapingFrontierStep,
         budget: usize,
+        shaping_start: Option<MarkdownGraphemeBoundary>,
     ) -> FrontierResult<bool> {
         if self.ordinal.is_some() {
             return Ok(true);
@@ -174,6 +178,24 @@ impl UnicodeState {
         while Self::remaining(step, budget)? != 0 {
             let (low, high) = self.locate.ok_or(MarkdownShapingError::Pending)?;
             if low >= high {
+                if let (Some(start), Some(next), Some(ordinal)) =
+                    (shaping_start, self.next_boundary, self.successor_ordinal)
+                    && start.utf16 == self.utf16
+                    && start.byte == self.byte
+                    && next.utf16 > start.utf16
+                    && next.byte > start.byte
+                {
+                    // 本地首点来自原 UBA seam，不是新源 GCB。后继仍取原目录，
+                    // 只在本 shaper 内形成 GB1 片段；Store/LineEnd/caret 保留全局真 GCB。
+                    self.ordinal = Some(
+                        ordinal
+                            .checked_sub(1)
+                            .ok_or(MarkdownShapingError::InvalidRange)?,
+                    );
+                    self.boundaries[0] = start;
+                    self.locate = None;
+                    return Ok(true);
+                }
                 if prefix.complete {
                     return Err(MarkdownShapingError::InvalidRange.into());
                 }
@@ -189,6 +211,8 @@ impl UnicodeState {
             if value.utf16 < self.utf16 {
                 self.locate = Some((middle + 1, high));
             } else if value.utf16 > self.utf16 {
+                self.next_boundary = Some(value);
+                self.successor_ordinal = Some(middle);
                 self.locate = Some((low, middle));
             } else {
                 if value.byte != self.byte {
@@ -196,6 +220,8 @@ impl UnicodeState {
                 }
                 self.ordinal = Some(middle);
                 self.boundaries[0] = value;
+                self.next_boundary = None;
+                self.successor_ordinal = None;
                 self.locate = None;
                 return Ok(true);
             }
@@ -287,7 +313,12 @@ impl MarkdownShapingFrontierJob {
             }
         }
         if !state.scanned {
-            if !state.locate(breaks, source, &mut step, metadata_budget)? {
+            let shaping_start = (self.partial_grapheme[0] && state.utf16 == self.original.start)
+                .then_some(MarkdownGraphemeBoundary {
+                    byte: self.original_bytes.start,
+                    utf16: self.original.start,
+                });
+            if !state.locate(breaks, source, &mut step, metadata_budget, shaping_start)? {
                 return Ok(step);
             }
             while state.count <= LIMIT && step.scalars < budget.scalars {
@@ -305,9 +336,15 @@ impl MarkdownShapingFrontierJob {
                     let ordinal =
                         state.ordinal.ok_or(MarkdownShapingError::Pending)? + state.count + 1;
                     step.boundary_records += 1;
-                    let Some(next) = UnicodeState::boundary(breaks, source, ordinal)? else {
+                    let Some(mut next) = UnicodeState::boundary(breaks, source, ordinal)? else {
                         return Ok(step);
                     };
+                    if next.utf16 > self.original.end && self.partial_grapheme[1] {
+                        next = MarkdownGraphemeBoundary {
+                            byte: self.original_bytes.end,
+                            utf16: self.original.end,
+                        };
+                    } // 只有原类型化 UBA 末端能闭本地片段，预算/窗口边缘绝不截 GCB。
                     let previous = state.boundaries[state.count];
                     if next.byte <= previous.byte
                         || next.utf16 <= previous.utf16
@@ -446,7 +483,18 @@ impl MarkdownShapingFrontierJob {
             let mut options = payload.options.clone();
             options.beginning_of_text &= self.next == self.original.start;
             options.end_of_text &= support_end.utf16 == self.original.end;
-            let mut child = MarkdownShapingJob::assemble(
+            let prepared = self
+                .context_bounds
+                .clone()
+                .map(|bounds| {
+                    input::prepare_context(
+                        &payload.source,
+                        self.next_byte..support_end.byte,
+                        Some(bounds),
+                    )
+                })
+                .transpose()?;
+            let mut child = MarkdownShapingJob::assemble_with_context(
                 payload.source.clone(),
                 source,
                 payload.font.clone(),
@@ -454,6 +502,7 @@ impl MarkdownShapingFrontierJob {
                 (
                     self.next..support_end.utf16,
                     self.next_byte..support_end.byte,
+                    prepared,
                 ),
                 options,
                 self.cancellation.clone(),

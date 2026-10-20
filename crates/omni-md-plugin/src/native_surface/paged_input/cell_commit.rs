@@ -1,7 +1,11 @@
 //! 先有限准入，再由原控制器撤Scene并消费同票；不重新捕获后继草稿或执行第二次sanitize。
 
 use super::*;
-use omni_markdown_core::{MarkdownCellDraftCommitError, MarkdownCellDraftPreparedCommit};
+use omni_markdown_core::markdown_document_buffer::VerifiedMarkdownTableRowSource;
+use omni_markdown_core::{
+    MarkdownCellDraftCommit, MarkdownCellDraftCommitError, MarkdownCellDraftCommitReceipt,
+    MarkdownCellDraftPreparedCommit, MarkdownCellDraftWordAnchor, MarkdownViewportSourceAuthority,
+};
 
 #[cfg(test)]
 #[path = "cell_commit/body_tests.rs"]
@@ -15,6 +19,21 @@ pub struct NativeMarkdownPagedCellPreparedCommit {
     epoch: u64,
     before: NativeMarkdownPagedInputState,
     prepared: MarkdownCellDraftPreparedCommit,
+}
+
+impl NativeMarkdownPagedCellPreparedCommit {
+    #[must_use]
+    /// 只供真正提交后重查新行格；准备票不提供caret、Source或提前激活权限。
+    pub fn next_cell(&self) -> Option<(usize, usize)> {
+        self.prepared.next_cell()
+    }
+}
+
+/// 原Body的真实提交结果与同趟草稿端点一并交付；只有原Body权限仍当前时才可消费坐标。
+/// 这份结果不修改Body选择，也不能替代下一格真实Source或后继输入准入。
+pub struct NativeMarkdownPagedCellCommit {
+    pub outcome: NativeMarkdownPagedInputOutcome,
+    pub receipt: MarkdownCellDraftCommitReceipt,
 }
 
 #[derive(Debug)]
@@ -49,10 +68,7 @@ impl<E> From<NativeMarkdownPagedInputError> for NativeMarkdownPagedCellCommitErr
 
 /// canonical观察者仍消费原一次事务；局部Input不能把提交结果伪装为同一Cell的可继续状态。
 pub type NativeMarkdownPagedCellCommitResult<O> = std::result::Result<
-    Option<(
-        MarkdownHistoryTextEdit,
-        <O as MarkdownTextChangeObserver>::Output,
-    )>,
+    MarkdownCellDraftCommit<<O as MarkdownTextChangeObserver>::Output>,
     NativeMarkdownPagedCellCommitError<<O as MarkdownTextChangeObserver>::Error>,
 >;
 
@@ -71,7 +87,7 @@ impl NativeMarkdownPagedInput {
         cell_current: &(impl Fn(u64) -> bool + ?Sized),
         body_current: &(impl Fn(u64) -> bool + ?Sized),
     ) -> std::result::Result<
-        NativeMarkdownPagedInputOutcome,
+        NativeMarkdownPagedCellCommit,
         NativeMarkdownPagedCellCommitError<NativeMarkdownPagedInputObserverError>,
     > {
         // 不读取外来prepared的Doc；先核原Cell owner，再沿自己的session保Source首因。
@@ -127,13 +143,13 @@ impl NativeMarkdownPagedInput {
         let result = document
             .commit_prepared_cell_draft_observed(prepared.prepared, observer)
             .map_err(NativeMarkdownPagedCellCommitError::Commit)?;
-        let outcome = match result {
+        let outcome = match result.edit {
             Some((edit, mapped)) => {
                 // canonical已经发布。publish只交换原FoldObserver的有限metadata与selection，
                 // 没有current、Native或可失败IO；receipt始终属于原Body而非局部Cell坐标域。
                 NativeMarkdownPagedInputOutcome::Committed(body.publish(
                     body_permit,
-                    document.generation(),
+                    &document,
                     mapped,
                     None,
                     Some(edit),
@@ -147,7 +163,10 @@ impl NativeMarkdownPagedInput {
             }
         };
         self.seal_committed_cell(&session);
-        Ok(outcome)
+        Ok(NativeMarkdownPagedCellCommit {
+            outcome,
+            receipt: result.receipt,
+        })
     }
 
     /// 只在Core成功后封闭原局部metadata；不调用可失败close或后置Source读取。
@@ -168,6 +187,11 @@ impl NativeMarkdownPagedInput {
     pub fn prepare_cell_commit(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
+        append: Option<(
+            &VerifiedMarkdownTableRowSource,
+            MarkdownViewportSourceAuthority,
+        )>,
+        word_anchor: Option<MarkdownCellDraftWordAnchor>,
         current: &(impl Fn(u64) -> bool + ?Sized),
     ) -> Result<NativeMarkdownPagedCellPreparedCommit> {
         let _mutation = self.begin(permit, current)?;
@@ -182,7 +206,18 @@ impl NativeMarkdownPagedInput {
             let document = original
                 .try_borrow()
                 .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
-            document.prepare_cell_draft_commit(cell.take()?)?
+            // 两种实际动作共用原输入准入和唯一候选槽；End只能来自同Source请求的封闭行票。
+            // 不先提交原格再追加第二次，也不以裸行列或范围给缺少End的草稿补权限。
+            let edit = cell.take()?;
+            match append {
+                Some((terminal, authority)) => document.prepare_cell_draft_row_append(
+                    edit,
+                    terminal,
+                    authority,
+                    word_anchor,
+                )?,
+                None => document.prepare_cell_draft_commit(edit, word_anchor)?,
+            }
         };
         session.facts()?; // Source首错先于可重入前台门；准入本身不改变原serial或原草稿。
         self.check_original(permit.epoch, permit.before, current)?;

@@ -212,7 +212,9 @@ pub fn find_syllables_indic(buffer: &mut Buffer) {
     let mut syllable_serial = 1u8;
 
     macro_rules! found_syllable {
-        ($kind:expr) => {{ found_syllable(ts, te, &mut syllable_serial, $kind, buffer) }};
+        ($kind:expr) => {{
+            found_syllable(ts, te, &mut syllable_serial, $kind, buffer)
+        }};
     }
 
     {

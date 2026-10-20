@@ -99,6 +99,7 @@ fn publish_scene(
     let source = output.borrow().source_authority().clone();
     let nonce = NativeMarkdownPagedSceneNonce::new();
     let key = NativeMarkdownPagedSceneKey {
+        presentation_mode: omni_markdown_core::MarkdownPresentationMode::Source,
         request,
         source,
         nonce: nonce.authority(),
@@ -733,14 +734,12 @@ fn main() {
                     )
                 }),
         );
-        if let Some(layers) = body.cpu_layer_weaks() {
-            assert_eq!(
-                layers.len(),
-                643,
-                "必须登记mount、两组和128个slot各自的容器及两组前景/遮罩"
-            );
-            native.extend(layers.into_iter().map(|layer| ("cpu_owned_layer", layer)));
-        }
+        // 本场景固定使用真实 CPU 视口；登记实际存活与退休角色，不要求不存在的预分配槽。
+        // 下方仍逐对象验证 Weak 归零，所有像素、Font、Source、FD 和外方关系验收保持独立。
+        let layers = body
+            .cpu_layer_weaks()
+            .expect("已实际绘图的 CPU 视口必须保留原资源拥有者");
+        native.extend(layers.into_iter().map(|layer| ("cpu_owned_layer", layer)));
         if let Some(lifecycle) = &lifecycle {
             native.extend(lifecycle.weaks());
         }

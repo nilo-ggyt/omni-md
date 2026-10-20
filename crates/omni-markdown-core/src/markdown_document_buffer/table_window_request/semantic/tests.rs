@@ -123,6 +123,26 @@ fn global_reference_underline_and_math_context_are_all_required_before_ready() {
 }
 
 #[test]
+fn standalone_table_underline_uses_literal_code_facts_before_and_after_its_viewport() {
+    for source in [
+        "<u>外部开标记\n\n```text\n</u>围栏字面\n```\n\n| H | C |\n| - | - |\n| [r] | 中文😀 |\n\n    </u><u>缩进字面\n\n外部真实关闭</u>\n\n[r]: /first\n[r]: /later\n",
+        "<u>外部开标记\r\n\r\n>\t```text\r\n>\t</u>围栏字面\r\n>\t```\r\n>\r\n> | H | C |\r\n> | - | - |\r\n> | [r] | 中文😀 |\r\n\r\n    </u><u>缩进字面\r\n\r\n外部真实关闭</u>\r\n\r\n[r]: /first\r\n[r]: /later\r\n",
+    ] {
+        let probe_byte = source.find("[r]").unwrap();
+        let probe = source[..probe_byte].encode_utf16().count();
+        let start = source[..probe_byte].rfind('\n').unwrap() + 1;
+        let end = probe_byte + source[probe_byte..].find('\n').unwrap() + 1;
+        // standalone的原结构Global要存活到配对恢复完成；不能丢它后再创建另一个分类器。
+        assert_matches_original(
+            source,
+            probe,
+            source[..start].encode_utf16().count()..source[..end].encode_utf16().count(),
+            usize::MAX..usize::MAX,
+        );
+    }
+}
+
+#[test]
 fn verified_window_cannot_authorize_other_note_or_stale_edit_and_releases_scratch() {
     let source = "| H | C |\n| - | - |\n| first | second |\n";
     let (_directory, mut doc) = document(source);

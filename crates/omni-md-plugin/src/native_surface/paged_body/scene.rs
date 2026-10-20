@@ -1,13 +1,13 @@
 //! 原已封存窗口的输入和绘图消费；任何方法都不创建新 Source 或推进排版。
 
 use std::{
-    cell::RefCell,
+    cell::{OnceCell, RefCell},
     ops::Range,
     rc::{Rc, Weak},
 };
 
 use objc2_core_foundation::CFRetained;
-use objc2_core_graphics::CGContext;
+use objc2_core_graphics::{CGColorSpace, CGContext, kCGColorSpaceSRGB};
 use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use omni_markdown_core::{
     MarkdownComposedLines, MarkdownGraphemeAnswer, MarkdownGraphemeQuery, MarkdownTextSelection,
@@ -22,9 +22,10 @@ use crate::native_surface::{
     gutter::paged::GutterRow,
     paged_input::{NativeMarkdownBidiCaretSide, NativeMarkdownVerticalGoal},
     paged_line_viewport::{
-        NativeMarkdownComposedViewport, NativeMarkdownComposedViewportPaintBudget,
-        NativeMarkdownComposedViewportPaintCause, NativeMarkdownComposedViewportPaintError,
-        NativeMarkdownComposedViewportPaintOutcome, NativeMarkdownComposedViewportPaintSession,
+        NativeMarkdownComposedViewport, NativeMarkdownComposedViewportError as ViewportError,
+        NativeMarkdownComposedViewportPaintBudget, NativeMarkdownComposedViewportPaintCause,
+        NativeMarkdownComposedViewportPaintError, NativeMarkdownComposedViewportPaintOutcome,
+        NativeMarkdownComposedViewportPaintSession,
     },
     paged_text_view::{
         NativeMarkdownPagedCharacterRect, NativeMarkdownPagedEditCommand as Edit,
@@ -40,16 +41,23 @@ use crate::native_surface::{
 };
 
 type Result<T> = std::result::Result<T, Error>;
+mod grid;
+mod paint;
+use grid::GridCharacterGeometry;
+pub(super) use grid::{GridCellContent, GridCellPublication, GridRowPublication};
+use paint::Paint;
 
 pub(in crate::native_surface) struct Scene {
     key: NativeMarkdownPagedSceneKey,
     _nonce: NativeMarkdownPagedSceneNonce,
     geometry: NativeMarkdownPagedViewportGeometry,
-    window: Rc<NativeMarkdownComposedViewport>,
-    output: Rc<RefCell<MarkdownComposedLines>>,
+    window: Option<Rc<NativeMarkdownComposedViewport>>,
+    output: Option<Rc<RefCell<MarkdownComposedLines>>>,
+    grids: Box<[GridRowPublication]>,
     owner: Weak<Owner>,
     ranges: Box<[Range<usize>]>,
     paragraphs: Box<[Range<usize>]>,
+    folded_ends: Box<[Option<usize>]>,
     simple_ltr: bool,
     navigation: NativeMarkdownPagedNavigationGeometry,
     colors: NativeMarkdownPagedBodyColors,
@@ -57,10 +65,15 @@ pub(in crate::native_surface) struct Scene {
     first_ordinal: usize,
     /// 仅保存发布时同一输入票的有限范围；高亮不能用主范围冒充全部选中。
     selections: Box<[Range<usize>]>,
+    /// 当前查询在真实可见源域中的有限匹配；不保栏、查询或Native强引用。
+    find_highlights: Box<[Range<usize>]>,
     /// 仅原Source单有向选择的canonical逻辑行；UBA段和soft line均不授予此范围。
     active_line: Option<Range<usize>>,
     /// Source同次发布的有限行号；真实软行几何与canonical逻辑行只在Producer相交一次。
     gutter: Option<Box<[GutterRow]>>,
+    // Scene 发布不创建 Native 资源；首个实际绘图入口捕获一次命名空间，随本 Scene 释放。
+    // None 是该次真实创建失败，不能改成 DeviceRGB 默认空间继续画出另一种颜色。
+    paint_space: OnceCell<Option<CFRetained<CGColorSpace>>>,
 }
 
 /// 一次准备结束的有限字段集合；构造范围仅限 Body，外界不能凭范围制造 Ready。
@@ -68,11 +81,13 @@ pub(super) struct Publication {
     pub key: NativeMarkdownPagedSceneKey,
     pub nonce: NativeMarkdownPagedSceneNonce,
     pub geometry: NativeMarkdownPagedViewportGeometry,
-    pub window: Rc<NativeMarkdownComposedViewport>,
-    pub output: Rc<RefCell<MarkdownComposedLines>>,
+    pub window: Option<Rc<NativeMarkdownComposedViewport>>,
+    pub output: Option<Rc<RefCell<MarkdownComposedLines>>>,
+    pub grids: Box<[GridRowPublication]>,
     pub owner: Weak<Owner>,
     pub ranges: Box<[Range<usize>]>,
     pub paragraphs: Box<[Range<usize>]>,
+    pub folded_ends: Box<[Option<usize>]>,
     pub simple_ltr: bool,
     pub width_key: i64,
     pub layout_epoch: u64,
@@ -80,11 +95,23 @@ pub(super) struct Publication {
     pub head_affinity: Option<Affinity>,
     pub first_ordinal: usize,
     pub selections: Box<[Range<usize>]>,
+    pub find_highlights: Box<[Range<usize>]>,
     pub active_line: Option<Range<usize>>,
     pub gutter: Option<Box<[GutterRow]>>,
 }
 
 impl Scene {
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    /// 原帧的弱身份仍有效才交付有限几何；短 oracle 不取得这个 Scene 的长期强引用。
+    pub(super) fn probe_line_geometry(
+        &self,
+    ) -> Result<Vec<crate::native_surface::preview_paragraph::PreviewLineObservation>> {
+        self.require()?;
+        self.text_window()?
+            .probe_line_geometry(&|| self.current())
+            .map_err(scene_error)
+    }
+
     pub(super) fn new(publication: Publication) -> Self {
         let Publication {
             key,
@@ -92,9 +119,11 @@ impl Scene {
             geometry,
             window,
             output,
+            grids,
             owner,
             ranges,
             paragraphs,
+            folded_ends,
             simple_ltr,
             width_key,
             layout_epoch,
@@ -102,6 +131,7 @@ impl Scene {
             head_affinity,
             first_ordinal,
             selections,
+            find_highlights,
             active_line,
             gutter,
         } = publication;
@@ -116,18 +146,92 @@ impl Scene {
             geometry,
             window,
             output,
+            grids,
             owner,
             ranges,
             paragraphs,
+            folded_ends,
             simple_ltr,
             navigation,
             colors,
             head_affinity,
             first_ordinal,
             selections,
+            find_highlights,
             active_line,
             gutter,
+            paint_space: OnceCell::new(),
         }
+    }
+
+    /// Source 与 Ready 核验包住实际色空间捕获；创建失败沿绘图错误返回，不能冒充几何失败。
+    fn prepare_paint_space(&self, current: &dyn Fn() -> bool) -> Result<()> {
+        self.validate_ready(current)?;
+        let space = self.paint_space.get_or_init(|| {
+            // SAFETY: 公开 sRGB 名称静态有效；同一个 Scene 不为每次颜色或 glyph 重新分配对象。
+            CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))
+        });
+        self.validate_ready(current)?;
+        if space.is_none() {
+            return Err(Error::Raster(
+                ViewportError::ColorSpaceUnavailable.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 调色板声明的是源 sRGB 分量，须显式设置输入空间；位图的目标空间不能替代此事实。
+    fn color(&self, context: &CGContext, color: [f64; 4]) {
+        let space = self
+            .paint_space
+            .get()
+            .and_then(Option::as_deref)
+            .expect("Scene 实际绘图先取得命名 sRGB 空间");
+        CGContext::set_fill_color_space(Some(context), Some(space));
+        // SAFETY: 命名 sRGB 有三个颜色分量，本同步栈的数组另含一个 alpha，恰好满足公开 API。
+        unsafe { CGContext::set_fill_color(Some(context), color.as_ptr()) };
+    }
+
+    /// 边线使用同一份源色空间；不调用会把输入重新切回 DeviceRGB 的 convenience setter。
+    fn stroke_color(&self, context: &CGContext, color: [f64; 4]) {
+        let space = self
+            .paint_space
+            .get()
+            .and_then(Option::as_deref)
+            .expect("Scene 实际绘图先取得命名 sRGB 空间");
+        CGContext::set_stroke_color_space(Some(context), Some(space));
+        // SAFETY: 当前 stroke 空间同为三分量 sRGB，四个栈分量完整有效到原调用返回。
+        unsafe { CGContext::set_stroke_color(Some(context), color.as_ptr()) };
+    }
+
+    /// 模式捕获只检查已封存窗口中的有限候选，离屏caret不能替代真实可见字形。
+    pub(super) fn mode_source_candidates(&self) -> impl Iterator<Item = Result<usize>> + '_ {
+        let head = self.key.request.input.primary_range.location;
+        let visible = self.window.as_ref().is_some_and(|window| {
+            let source = window.source_range();
+            source.start <= head && head <= source.end
+        }) || self.grids.iter().any(|row| {
+            let range = row.row.source_range();
+            range.start <= head && head <= range.end
+        });
+        std::iter::once(head)
+            .filter(move |_| visible)
+            .map(Ok)
+            .chain(self.ranges.iter().map(|range| Ok(range.start)))
+            .chain(
+                self.grids
+                    .iter()
+                    .flat_map(|row| row.cells.iter())
+                    .filter_map(|cell| {
+                        let GridCellContent::Composed(window) = &cell.content else {
+                            return None;
+                        };
+                        match window.first_visible_source(&|| self.current()) {
+                            Ok(value) => value.map(Ok),
+                            Err(cause) => Some(Err(scene_error(cause))),
+                        }
+                    }),
+            )
     }
 
     /// 行号借用原Scene的全部Source/输入/字体/几何权限，不创建新的Ready或读取正文。
@@ -148,7 +252,7 @@ impl Scene {
             return Err(Error::Revoked);
         }
         let caret = self
-            .window
+            .text_window()?
             .caret_geometry_with_side(
                 head,
                 context.head_affinity.unwrap_or(Affinity::Downstream),
@@ -208,7 +312,7 @@ impl Scene {
             .filter(|index| *index < self.ranges.len())
             .ok_or(Error::Pending)?;
         let frame = self
-            .window
+            .text_window()?
             .line_frame(index)
             .ok_or(Error::InvalidGeometry)?;
         let viewport = self.key.request.viewport;
@@ -219,7 +323,7 @@ impl Scene {
             return Err(Error::Pending);
         }
         let hit = self
-            .window
+            .text_window()?
             .hit(
                 NSPoint::new(
                     x.clamp(
@@ -277,10 +381,13 @@ impl Scene {
         Ok(side)
     }
 
+    /// Grid-only 前缀没有文字行；文字专用几何保持真实 Pending，不能造空文字窗口补票。
+    fn text_window(&self) -> Result<&Rc<NativeMarkdownComposedViewport>> {
+        self.window.as_ref().ok_or(Error::Pending)
+    }
+
     fn require(&self) -> Result<()> {
-        self.window
-            .validate_ready(&|| self.current())
-            .map_err(scene_error)
+        self.validate_ready(&|| self.current())
     }
 
     fn selection(&self) -> Result<MarkdownTextSelection> {
@@ -306,10 +413,21 @@ impl Scene {
             .ok_or(Error::InvalidRange)
     }
 
+    /// canonical 行覆盖仍含整个 opaque 区；只有行内动作使用同次 glyph/control 证明的可见末端。
+    fn visible_line_range(&self, line: usize) -> Range<usize> {
+        let range = &self.ranges[line];
+        range.start..self.folded_ends[line].unwrap_or(range.end)
+    }
+
     fn boundary(&self, position: usize, next: bool) -> Result<usize> {
         self.require()?;
         let answer = {
-            let mut output = self.output.try_borrow_mut().map_err(|_| Error::Busy)?;
+            let mut output = self
+                .output
+                .as_ref()
+                .ok_or(Error::Pending)?
+                .try_borrow_mut()
+                .map_err(|_| Error::Busy)?;
             output
                 .grapheme_query(
                     position,
@@ -368,13 +486,34 @@ impl Scene {
         })
     }
 
+    /// 同步对照保原顺序：整背景、Grid底色边线、正文装饰、Grid选区，最后才绘制字形。
     fn decorations(&self, context: &CGContext, current: &dyn Fn() -> bool) -> Result<()> {
+        self.fill_canvas(context, current)?;
+        self.grid_decorations(context, &|| current() && self.current())?;
+        self.text_decorations(context, current)?;
+        self.grid_selection(context, &|| current() && self.current())?;
+        self.color(context, self.colors.text);
+        self.validate_ready(current)
+    }
+
+    /// 候选画布只填一次固定视口；Grid的逐项工作留给原Paint续体，不在构造栈扫描各格。
+    fn fill_canvas(&self, context: &CGContext, current: &dyn Fn() -> bool) -> Result<()> {
         self.validate_ready(current)?;
-        color(context, self.colors.background);
+        self.color(context, self.colors.background);
         CGContext::fill_rect(Some(context), self.key.request.viewport);
+        self.validate_ready(current)
+    }
+
+    /// 正文保既有单窗口装饰路径和像素顺序；Source没有Grid时原入口行为不变。
+    fn text_decorations(&self, context: &CGContext, current: &dyn Fn() -> bool) -> Result<()> {
         self.validate_ready(current)?;
+        if let Some(window) = &self.window {
+            window
+                .paint_code_backgrounds(context, &|| current() && self.current())
+                .map_err(paint_error)?;
+        } // 原代码底色先落，再画活动行和真实选区；同步与CPU候选共用此顺序。
         if let Some(active) = &self.active_line {
-            color(context, self.colors.active_line);
+            self.color(context, self.colors.active_line);
             for (index, range) in self.ranges.iter().enumerate() {
                 let selected = if active.is_empty() {
                     range.is_empty() && range.start == active.start
@@ -385,7 +524,7 @@ impl Scene {
                     continue; // 不同逻辑行或真实EOF尾空行不能借前一wrapped行的范围着色。
                 }
                 let frame = self
-                    .window
+                    .text_window()?
                     .line_frame(index)
                     .ok_or(Error::InvalidGeometry)?;
                 let viewport = self.key.request.viewport;
@@ -406,29 +545,85 @@ impl Scene {
             }
             self.validate_ready(current)?;
         } // 活动行先于选区和文字绘制；不遮掉原选中反馈，也不读取或重排离屏正文。
-        let prepared = self.window.source_range();
-        // 输入所有者已经认证范围有序且不重叠；二分跳过视口前的范围，不扫描其正文。
-        // 这里只借发布时的整数元数据，离屏匹配不会推进排版或使匹配包络进入内存。
-        let first = self
-            .selections
-            .partition_point(|selection| selection.end <= prepared.start);
-        color(context, self.colors.selection);
-        for selection in &self.selections[first..] {
-            if selection.start >= prepared.end {
-                break; // 后续范围同样位于本次准备窗口之后，没有本帧绘图后果。
+        // 查找背景与分步路径一样位于代码/活动行之后、用户选区之前。
+        // 同步入口保独立的真实窗口循环，不能漏掉查找反馈后再拿缺色图当像素期望。
+        self.find_decorations(context, current)?;
+        if let Some(window) = &self.window {
+            let prepared = window.source_range();
+            // 输入所有者已经认证范围有序且不重叠；二分跳过视口前的范围，不扫描其正文。
+            // 这里只借发布时的整数元数据，离屏匹配不会推进排版或使匹配包络进入内存。
+            let first = self
+                .selections
+                .partition_point(|selection| selection.end <= prepared.start);
+            self.color(context, self.colors.selection);
+            for selection in &self.selections[first..] {
+                if selection.start >= prepared.end {
+                    break; // 后续范围同样位于本次准备窗口之后，没有本帧绘图后果。
+                }
+                if selection.is_empty() {
+                    continue; // 空范围是光标位置，不能制造额外的选中背景。
+                }
+                // 所有范围共用同一封存窗口和候选画布；任一真实几何或权限错误使整帧失败。
+                window
+                    .selection_rects(selection.clone(), current, |rect| {
+                        CGContext::fill_rect(Some(context), rect);
+                        Ok(())
+                    })
+                    .map_err(scene_error)?;
             }
-            if selection.is_empty() {
-                continue; // 空范围是光标位置，不能制造额外的选中背景。
-            }
-            // 所有范围共用同一封存窗口和候选画布；任一真实几何或权限错误使整帧失败。
-            self.window
-                .selection_rects(selection.clone(), current, |rect| {
-                    CGContext::fill_rect(Some(context), rect);
-                    Ok(())
-                })
-                .map_err(scene_error)?;
         }
-        color(context, self.colors.text);
+        self.color(context, self.colors.text);
+        self.validate_ready(current)
+    }
+
+    /// 只画本次已封存可见匹配；每个框由原窗口映射并裁剪，不创建第二份Find或排版结果。
+    /// 正文与格分别消费各自Source，透明色只覆盖一次真实矩形，不能叠加同一边缘clip。
+    fn find_decorations(&self, context: &CGContext, current: &dyn Fn() -> bool) -> Result<()> {
+        self.validate_ready(current)?;
+        if self.find_highlights.is_empty() {
+            return Ok(()); // 没有实际匹配就没有绘图副作用，也不枚举当前Grid。
+        }
+        self.color(context, [1.0, 0.75, 0.12, 0.25]);
+        if let Some(window) = &self.window {
+            let prepared = window.source_range();
+            let first = self
+                .find_highlights
+                .partition_point(|range| range.end <= prepared.start);
+            for range in &self.find_highlights[first..] {
+                if range.start >= prepared.end {
+                    break;
+                }
+                window
+                    .selection_rects(range.clone(), current, |frame| {
+                        CGContext::fill_rect(Some(context), frame);
+                        Ok(())
+                    })
+                    .map_err(scene_error)?;
+            }
+        }
+        // 真实格映射只裁本格交集，隐藏Markdown语法不产生面积；离屏匹配不推进任何来源。
+        // 与异步阶段保持正文Find→Grid Find→正文选区→Grid选区的相同覆盖顺序。
+        for row in &self.grids {
+            let source = row.row.source_range();
+            let first = self
+                .find_highlights
+                .partition_point(|range| range.end <= source.start);
+            for range in &self.find_highlights[first..] {
+                if range.start >= source.end {
+                    break;
+                }
+                for cell in &row.cells {
+                    if let GridCellContent::Composed(window) = &cell.content {
+                        window
+                            .selection_rects(range.clone(), current, |frame| {
+                                CGContext::fill_rect(Some(context), frame);
+                                Ok(())
+                            })
+                            .map_err(scene_error)?;
+                    }
+                }
+            }
+        }
         self.validate_ready(current)
     }
 
@@ -439,12 +634,36 @@ impl Scene {
             return Ok(());
         }
         let selection = self.selection()?;
-        let prepared = self.window.source_range();
+        let affinity = self.head_affinity.unwrap_or(Affinity::Downstream);
+        match self.grid_first_rect(NSRange::new(selection.head_utf16, 0), affinity)? {
+            GridCharacterGeometry::Ready(value) => {
+                let mut rect = value.rect;
+                rect.size.width = 1.0;
+                self.color(context, self.colors.caret);
+                CGContext::fill_rect(Some(context), rect);
+                return self.validate_ready(current);
+            }
+            GridCharacterGeometry::Unavailable => return self.validate_ready(current),
+            GridCharacterGeometry::Outside => {}
+        } // 隐藏语法仍属于表格；没有可见格时不退到零字号TableRow结构part。
+
+        let Some(window) = &self.window else {
+            return self.validate_ready(current);
+        };
+        let prepared = window.source_range();
         if selection.head_utf16 < prepared.start || selection.head_utf16 > prepared.end {
             return Ok(()); // 离屏 caret 没有本次绘图后果，不为它重排或读取其他段落。
         }
+        if window
+            .table_row_at(selection.head_utf16, affinity, &|| {
+                current() && self.current()
+            })
+            .map_err(scene_error)?
+        {
+            return self.validate_ready(current); // 原正文overscan中的离屏结构行也没有普通文字caret。
+        }
         let geometry = self
-            .window
+            .text_window()?
             .caret_geometry_with_side(
                 selection.head_utf16,
                 self.head_affinity.unwrap_or(Affinity::Downstream),
@@ -457,7 +676,7 @@ impl Scene {
         }
         let mut rect = geometry.primary;
         rect.size.width = 1.0;
-        color(context, self.colors.caret);
+        self.color(context, self.colors.caret);
         CGContext::fill_rect(Some(context), rect);
         self.validate_ready(current)
     }
@@ -467,6 +686,56 @@ impl NativeMarkdownPagedTextScene for Scene {
     fn key(&self) -> &NativeMarkdownPagedSceneKey {
         &self.key
     }
+    /// 原sealed LINK part与真实GCB侧只授命中事实，不同步推进语义或把marker当作label。
+    fn link_hit(&self, local: NSPoint) -> Result<Option<(Range<usize>, usize)>> {
+        self.require()?;
+        if self.grid_cell_at(local).is_some() {
+            return self.grid_link_hit(local);
+        }
+        if self.window.is_none() {
+            return Ok(None);
+        }
+        let Some(part) = self
+            .text_window()?
+            .link_part_at(local, &|| self.current())
+            .map_err(scene_error)?
+        else {
+            return Ok(None); // 普通文本不触发额外来源查询，行尾空白和显露marker也不截获原点击。
+        };
+        let (head, backward, _) = self.word_hit(local)?;
+        let index = if backward {
+            self.boundary(head, false)?
+        } else {
+            head
+        };
+        if !part.contains(&index) {
+            return Ok(None); // 最近caret可位于链接边缘之外；只有实际命中part中的原GCB才拥有激活权限。
+        }
+        self.require()?;
+        Ok(Some((part, index)))
+    }
+    /// 原mouseup意图移交唯一Body；Scene不持后继闭包，也不在指针栈排版或打开外部应用。
+    fn follow_link(&self, index: usize, intent: Weak<()>) -> Result<()> {
+        self.require()?;
+        let owner = self.owner.upgrade().ok_or(Error::Revoked)?;
+        owner.follow_link(&self.key, index, intent)
+    }
+    /// 先证原可见链接part和真实GCB侧，再从同一Source/选择/publication取得有限目标副本。
+    fn link_target(&self, local: NSPoint) -> Result<Option<String>> {
+        let Some((_, index)) = self.link_hit(local)? else {
+            return Ok(None);
+        };
+        let owner = self.owner.upgrade().ok_or(Error::Revoked)?;
+        let link = {
+            let producer = owner.producer.borrow();
+            producer
+                .as_ref()
+                .ok_or(Error::Pending)?
+                .link_at(&owner, &self.key, index)?
+        }; // 原Doc/Producer借用已结束，后继Native URL初始化不跨Core资源借用。
+        self.require()?;
+        Ok(link.map(|link| link.destination))
+    }
     fn cpu_frame_published(&self, paints: usize) {
         // CPU owner 已真正提交完整帧；这里只排同一个原 key 的弱通知，不在绘图栈调用外方。
         if let Some(owner) = self.owner.upgrade() {
@@ -474,24 +743,64 @@ impl NativeMarkdownPagedTextScene for Scene {
         }
     }
     fn validate_ready(&self, current: &dyn Fn() -> bool) -> Result<()> {
-        self.window
-            .validate_ready(&|| current() && self.current())
-            .map_err(scene_error)
+        // 先核所有真实派生源；正文普通撤权不能把另一个格的目录首错覆盖为取消。
+        for row in &self.grids {
+            for cell in &row.cells {
+                if let GridCellContent::Composed(window) = &cell.content {
+                    window.source_health().map_err(scene_error)?;
+                }
+            }
+        }
+        if let Some(window) = &self.window {
+            window
+                .validate_ready(&|| current() && self.current())
+                .map_err(scene_error)?;
+        }
+        self.validate_grids(&|| current() && self.current())?;
+        if self.window.is_none() && self.grids.is_empty() {
+            return Err(Error::Pending);
+        }
+        Ok(())
     }
     fn first_rect(&self, range: NSRange) -> Result<NativeMarkdownPagedCharacterRect> {
+        self.require()?; // 包括Grid域内无可见格的结果；Source首错不能被空间Pending掩盖。
         let affinity =
             if range.length == 0 && range.location == self.key.request.input.selection.head_utf16 {
                 self.head_affinity.unwrap_or(Affinity::Downstream)
             } else {
                 Affinity::Downstream
             };
-        self.window
+        match self.grid_first_rect(range, affinity)? {
+            GridCharacterGeometry::Ready(rect) => return Ok(rect),
+            GridCharacterGeometry::Unavailable => {
+                self.require()?; // 空间不可用也先保原Source首错，不把异步读取失败改写成Pending。
+                return Err(Error::Pending);
+            }
+            GridCharacterGeometry::Outside => {}
+        }
+        let geometry_error = |cause| match cause {
+            ViewportError::Pending => Error::Pending,
+            other => scene_error(other),
+        }; // 行域查询与实际字符查询同属此公开边界，屏外/尚未准备都保原Pending语义。
+        let window = self.text_window()?;
+        if range.length == 0
+            && window
+                .table_row_at(range.location, affinity, &|| self.current())
+                .map_err(geometry_error)?
+        {
+            return Err(Error::Pending); // 可见Grid之外的结构行不借目录中的font0合成文字矩形。
+        }
+        window
             .first_rect_with_caret_side(range, affinity, self.bidi_side()?, &|| self.current())
-            .map_err(scene_error)
+            .map_err(geometry_error)
     }
     fn hit(&self, local: NSPoint) -> Result<usize> {
+        self.require()?;
+        if let Some(position) = self.grid_hit(local)? {
+            return Ok(position);
+        }
         let hit = self
-            .window
+            .text_window()?
             .hit(local, &|| self.current())
             .map_err(scene_error)?;
         if hit.other_source_utf16.is_some() {
@@ -499,81 +808,127 @@ impl NativeMarkdownPagedTextScene for Scene {
         }
         Ok(hit.source_utf16)
     }
-    fn word_hit(&self, local: NSPoint) -> Result<(usize, bool)> {
-        let hit = self
-            .window
-            .hit(local, &|| self.current())
-            .map_err(scene_error)?;
-        if hit.other_source_utf16.is_some() {
-            return Err(Error::UnsupportedCommand); // 真实同点的两个逻辑位置尚无主侧，不能猜词组来源。
-        }
-        let index = hit
-            .line_ordinal
-            .checked_sub(self.first_ordinal)
-            .ok_or(Error::InvalidGeometry)?;
-        let range = self.ranges.get(index).ok_or(Error::InvalidGeometry)?;
-        let affinity = if hit.source_utf16 == range.end {
-            Affinity::Upstream
-        } else {
-            Affinity::Downstream
+    fn drag_selection_point(&self, local: NSPoint) -> Result<NSPoint> {
+        self.require()?;
+        let mut nearest = None;
+        let mut distance = f64::INFINITY;
+        let mut consider = |point: NSPoint| {
+            let delta = (local.x - point.x).hypot(local.y - point.y);
+            if delta < distance {
+                nearest = Some(point);
+                distance = delta;
+            }
         };
-        let caret = self
-            .window
-            .caret_geometry(hit.source_utf16, affinity, &|| self.current())
-            .map_err(scene_error)?;
-        if caret.line_ordinal != hit.line_ordinal || caret.secondary.is_some() {
-            return Err(Error::Pending); // soft-wrap侧与Bidi次插入点必须来自本次命中行，不能借邻行坐标。
+        if let Some(window) = &self.window
+            && let Some(point) = window
+                .project_drag_point(local, &|| self.current())
+                .map_err(scene_error)?
+        {
+            consider(point);
         }
-        for next in [true, false] {
-            let position = self.boundary(hit.source_utf16, next)?;
-            if position == hit.source_utf16 || position < range.start || position > range.end {
-                continue; // 只比较当前真实可见行相邻GCB，硬换行/窗口外位置没有本次点击几何。
+        for row in &self.grids {
+            for cell in &row.cells {
+                if let GridCellContent::Composed(window) = &cell.content {
+                    if let Some(point) = window
+                        .project_drag_point(local, &|| self.current())
+                        .map_err(scene_error)?
+                    {
+                        consider(point);
+                    }
+                } else {
+                    // 空格、文字前/后padding只有原格框能授予真实端点；不用整行等分推测列位置。
+                    let clip = self.key.request.viewport;
+                    let left = cell.frame.origin.x.max(clip.origin.x);
+                    let right = (cell.frame.origin.x + cell.frame.size.width)
+                        .min(clip.origin.x + clip.size.width);
+                    let bottom = cell.frame.origin.y.max(clip.origin.y);
+                    let top = (cell.frame.origin.y + cell.frame.size.height)
+                        .min(clip.origin.y + clip.size.height);
+                    if right > left && top > bottom {
+                        consider(NSPoint::new(
+                            local.x.clamp(left, right.next_down()),
+                            local.y.clamp(bottom, top.next_down()),
+                        ));
+                    }
+                }
             }
-            let adjacent = self
-                .window
-                .caret_geometry(
-                    position,
-                    if next {
-                        Affinity::Upstream
-                    } else {
-                        Affinity::Downstream
-                    },
-                    &|| self.current(),
-                )
-                .map_err(scene_error)?;
-            if adjacent.line_ordinal != hit.line_ordinal || adjacent.secondary.is_some() {
-                continue; // 一个邻侧歧义时仍可由另一个实际同run邻侧证明方向，不丢弃真实错误。
-            }
-            let forward_x = if next {
-                adjacent.primary.origin.x - caret.primary.origin.x
-            } else {
-                caret.primary.origin.x - adjacent.primary.origin.x
-            };
-            if forward_x == 0.0 {
-                continue; // 零advance没有方向证明，不能由UTF16 ordinal或固定LTR默认值代替。
-            }
-            let backward_bias = if forward_x > 0.0 {
-                local.x < caret.primary.origin.x
-            } else {
-                local.x > caret.primary.origin.x
-            };
-            self.require()?;
-            return Ok((hit.source_utf16, backward_bias));
         }
-        if range.is_empty() {
-            self.require()?;
-            return Ok((hit.source_utf16, false)); // 真空行无可选GCB；Core将核硬行并返回原空范围，bias不选择邻行。
-        }
-        Err(Error::Pending) // 尚无非零相邻字形方向时保真实未完成，不伪造选词侧。
+        self.require()?;
+        nearest.ok_or(Error::Pending)
     }
+    fn cell_hit(
+        &self,
+        local: NSPoint,
+        word: bool,
+    ) -> Result<Option<super::super::paged_text_view::NativeMarkdownPagedCellHit>> {
+        self.require()?;
+        let hit = self.grid_pointer_hit(local, word)?;
+        self.require()?;
+        Ok(hit)
+    }
+
+    fn paragraph_selection(
+        &self,
+        position: usize,
+        affinity: Affinity,
+    ) -> Result<MarkdownTextSelection> {
+        self.require()?;
+        let line = self.line(position, affinity)?;
+        let range = &self.paragraphs[line];
+        self.require()?;
+        Ok(MarkdownTextSelection {
+            anchor_utf16: range.start,
+            head_utf16: range.end,
+        })
+    }
+
+    fn word_hit(
+        &self,
+        local: NSPoint,
+    ) -> Result<(
+        usize,
+        bool,
+        Option<crate::native_surface::paged_text_view::NativeMarkdownPagedCellWordTarget>,
+    )> {
+        self.require()?;
+        if let Some(hit) = self.grid_pointer_hit(local, true)? {
+            self.require()?;
+            return Ok((hit.head_utf16, hit.backward_bias, hit.word_target));
+        }
+        let (hit, backward_bias) = self
+            .text_window()?
+            .word_hit(local, &|| self.current())
+            .map_err(scene_error)?;
+        self.require()?;
+        Ok((hit.source_utf16, backward_bias, None))
+    }
+
     fn mouse_selection(
         &self,
         local: NSPoint,
         clicks: usize,
         anchor: Option<usize>,
         extend: bool,
-    ) -> Result<MarkdownTextSelection> {
-        let position = self.hit(local)?;
+    ) -> Result<(MarkdownTextSelection, Affinity)> {
+        self.require()?;
+        let (position, affinity) = if let Some(hit) = self.grid_pointer_hit(local, false)? {
+            (hit.head_utf16, hit.head_affinity)
+        } else {
+            let hit = self
+                .text_window()?
+                .hit(local, &|| self.current())
+                .map_err(scene_error)?;
+            if hit.other_source_utf16.is_some() {
+                return Err(Error::Pending);
+            }
+            (
+                hit.source_utf16,
+                Affinity::from_upstream(
+                    hit.source_affinity
+                        == omni_markdown_core::MarkdownComposedLineAffinity::Upstream,
+                ),
+            )
+        }; // 实际命中侧与选择一并交付；跨格提交不能用固定Downstream覆盖软换行上游。
         let before = self.selection()?;
         let selection = match clicks {
             0 | 1 => MarkdownTextSelection {
@@ -584,19 +939,19 @@ impl NativeMarkdownPagedTextScene for Scene {
                 }),
                 head_utf16: position,
             },
-            3 => {
-                let line = self.line(position, Affinity::Downstream)?;
-                let range = &self.paragraphs[line];
-                MarkdownTextSelection {
-                    anchor_utf16: range.start,
-                    head_utf16: range.end,
-                }
-            }
+            3 => self.paragraph_selection(position, affinity)?,
             // 双击分词需要真实 word producer；不按 ASCII 空格猜中文和标点的选择范围。
             _ => return Err(Error::UnsupportedCommand),
         };
         self.require()?;
-        Ok(selection)
+        Ok((
+            selection,
+            if clicks == 3 {
+                Affinity::Upstream
+            } else {
+                affinity
+            },
+        ))
     }
     fn navigation_geometry(&self) -> Result<NativeMarkdownPagedNavigationGeometry> {
         self.require()?;
@@ -619,7 +974,7 @@ impl NativeMarkdownPagedTextScene for Scene {
         let collapse = |backward: bool| if backward { ordered.start } else { ordered.end };
         match action {
             Nav::Left | Nav::Right if extend || ordered.is_empty() => {
-                let visual = self.window.visual_neighbor(
+                let visual = self.text_window()?.visual_neighbor(
                     head,
                     affinity,
                     context.bidi_side,
@@ -651,7 +1006,7 @@ impl NativeMarkdownPagedTextScene for Scene {
                     Nav::Left | Nav::Right => {
                         // 原CM非空选择只collapse一次；左右的from/to由真实段base决定，
                         // 不能用首part/最小level或mixed标记猜RTL段方向。
-                        let base = match self.window.paragraph_base_level_at(head, affinity, &|| self.current()) {
+                        let base = match self.text_window()?.paragraph_base_level_at(head, affinity, &|| self.current()) {
                             Ok(base) => base,
                             Err(crate::native_surface::paged_line_viewport::NativeMarkdownComposedViewportError::Pending) => return Err(Error::Pending),
                             Err(cause) => return Err(scene_error(cause)),
@@ -682,7 +1037,7 @@ impl NativeMarkdownPagedTextScene for Scene {
                 }
                 let line = self.line(head, affinity)?;
                 let start = matches!(action, Nav::LineStart | Nav::LineLeft);
-                let range = &self.ranges[line];
+                let range = self.visible_line_range(line);
                 self.target(
                     if start { range.start } else { range.end },
                     extend,
@@ -697,9 +1052,9 @@ impl NativeMarkdownPagedTextScene for Scene {
             Nav::ParagraphStart | Nav::ParagraphEnd | Nav::SelectParagraph | Nav::SelectLine => {
                 let line = self.line(head, affinity)?;
                 let range = if action == Nav::SelectLine {
-                    &self.ranges[line]
+                    self.visible_line_range(line)
                 } else {
-                    &self.paragraphs[line]
+                    self.paragraphs[line].clone()
                 };
                 if matches!(action, Nav::SelectParagraph | Nav::SelectLine) {
                     self.require()?;
@@ -745,7 +1100,7 @@ impl NativeMarkdownPagedTextScene for Scene {
             ),
             Nav::Up | Nav::Down | Nav::PageUp | Nav::PageDown => {
                 let caret = self
-                    .window
+                    .text_window()?
                     .caret_geometry(head, affinity, &|| self.current())
                     .map_err(scene_error)?;
                 if caret.secondary.is_some() {
@@ -773,13 +1128,13 @@ impl NativeMarkdownPagedTextScene for Scene {
                     .filter(|line| *line < self.ranges.len())
                     .ok_or_else(|| self.missing_geometry())?;
                     let frame = self
-                        .window
+                        .text_window()?
                         .line_frame(target_line)
                         .ok_or(Error::InvalidGeometry)?;
                     frame.origin.y + frame.size.height * 0.5
                 };
                 let hit = self
-                    .window
+                    .text_window()?
                     .hit(NSPoint::new(x, target_y), &|| self.current())
                     .map_err(scene_error)?;
                 if hit.other_source_utf16.is_some() {
@@ -853,7 +1208,7 @@ impl NativeMarkdownPagedTextScene for Scene {
                 let target = if action == Edit::DeleteToLineStart {
                     self.ranges[line].start
                 } else {
-                    self.ranges[line].end
+                    self.visible_line_range(line).end
                 };
                 let start = range.location.min(target);
                 replacement = NSRange::new(start, end.max(target) - start);
@@ -875,89 +1230,39 @@ impl NativeMarkdownPagedTextScene for Scene {
         context: CFRetained<CGContext>,
         current: &dyn Fn() -> bool,
     ) -> Result<Box<dyn NativeMarkdownPagedScenePaintSession>> {
-        self.decorations(&context, &|| current() && self.current())?;
-        let session = self
-            .window
-            .clone()
-            .begin_paint(context.clone(), &|| current() && self.current())
-            .map_err(paint_error)?;
-        Ok(Box::new(Paint {
-            scene: self,
-            context,
-            session,
-        }))
+        // 正文与Grid都只在构造时填固定画布；全部装饰沿同一量子预算继续，不能同步扫完整窗口。
+        // 原同步paint保独立完整像素对照，不参与异步候选的背景、选区或字形推进。
+        self.prepare_paint_space(current)?;
+        self.fill_canvas(&context, &|| current() && self.current())?;
+        Ok(Box::new(Paint::new(self, context)))
     }
     fn paint(&self, context: &CGContext, current: &dyn Fn() -> bool) -> Result<()> {
+        self.prepare_paint_space(current)?;
         self.decorations(context, current)?;
-        let receipt = self
-            .window
-            .paint(context, &|| current() && self.current())
-            .map_err(|cause| Error::Raster(cause.to_string()))?;
-        if receipt.missing_glyphs != 0 {
-            return Err(Error::UnsupportedCommand);
+        if let Some(window) = &self.window {
+            let receipt = window
+                .paint(context, &|| current() && self.current())
+                .map_err(paint_error)?;
+            if receipt.missing_glyphs != 0 {
+                return Err(Error::UnsupportedCommand);
+            }
+        }
+        for row in &self.grids {
+            for cell in &row.cells {
+                if let GridCellContent::Composed(window) = &cell.content {
+                    let receipt = window
+                        .paint(context, &|| current() && self.current())
+                        .map_err(paint_error)?;
+                    if receipt.missing_glyphs != 0 {
+                        return Err(Error::UnsupportedCommand);
+                    }
+                }
+            }
         }
         self.caret(context, current)
     }
 }
 
-struct Paint {
-    scene: Rc<Scene>,
-    context: CFRetained<CGContext>,
-    session: NativeMarkdownComposedViewportPaintSession,
-}
-impl NativeMarkdownPagedScenePaintSession for Paint {
-    fn step(
-        self: Box<Self>,
-        budget: NativeMarkdownPagedScenePaintBudget,
-        current: &dyn Fn() -> bool,
-    ) -> Result<NativeMarkdownPagedScenePaintStep> {
-        let Self {
-            scene,
-            context,
-            session,
-        } = *self;
-        let valid = || current() && scene.current();
-        let step = session.step(
-            NativeMarkdownComposedViewportPaintBudget {
-                glyphs: budget.glyphs,
-                metadata_records: budget.metadata_records,
-            },
-            &valid,
-        );
-        scene.validate_ready(&valid)?; // 原 Source 首错不能被绘图取消或 Native bool 掩盖。
-        let step = step.map_err(paint_error)?;
-        let work = NativeMarkdownPagedScenePaintWork {
-            glyphs: step.work.glyphs,
-            batches: step.work.batches,
-            metadata_records: step.work.metadata_records,
-        };
-        let outcome = match step.outcome {
-            NativeMarkdownComposedViewportPaintOutcome::Pending(session) => {
-                NativeMarkdownPagedScenePaintOutcome::Pending(Box::new(Self {
-                    scene,
-                    context,
-                    session,
-                }))
-            }
-            NativeMarkdownComposedViewportPaintOutcome::Complete(completion) => {
-                if completion.receipt().missing_glyphs != 0 {
-                    return Err(Error::UnsupportedCommand);
-                }
-                scene.caret(&context, &valid)?;
-                NativeMarkdownPagedScenePaintOutcome::Complete(
-                    NativeMarkdownPagedScenePaintCompletion::from_composed(
-                        completion, &scene.key, &context,
-                    )?,
-                )
-            }
-        };
-        Ok(NativeMarkdownPagedScenePaintStep { work, outcome })
-    }
-}
-
-fn color(context: &CGContext, color: [f64; 4]) {
-    CGContext::set_rgb_fill_color(Some(context), color[0], color[1], color[2], color[3]);
-}
 fn paint_error(cause: NativeMarkdownComposedViewportPaintError) -> Error {
     match cause.cause {
         NativeMarkdownComposedViewportPaintCause::Window(cause) => scene_error(cause),

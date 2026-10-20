@@ -63,6 +63,7 @@ impl Prepared {
                                     0..6,
                                     &fixture.font,
                                     MarkdownLineComposeStyle {
+                                        presentation: Default::default(),
                                         points: 16.0,
                                         language: None,
                                         features: Vec::new(),
@@ -305,6 +306,7 @@ fn complete(fixture: &Fixture) -> MarkdownComposedLines {
                                 range,
                                 &fixture.font,
                                 MarkdownLineComposeStyle {
+                                    presentation: Default::default(),
                                     points: 16.0,
                                     language: None,
                                     features: Vec::new(),

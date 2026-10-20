@@ -56,13 +56,16 @@ fn options(source: &MarkdownLayoutTextSource, range: &Range<usize>) -> MarkdownS
     }
 }
 
-/// 只对首一个字素运行旧完整Job取得独立实际字形，绝不对长尾建立完整整形输入。
+/// 只对短 Font 段运行旧完整 Job 取得独立实际字形，绝不对长尾建立完整整形输入。
 fn glyphs(
     source: &MarkdownLayoutTextSource,
     font: &MarkdownLayoutFont,
     range: Range<usize>,
 ) -> Vec<MarkdownShapedGlyph> {
-    assert_eq!(range.len(), 1);
+    assert!(
+        range.len() <= 16,
+        "独立完整 oracle 只接收夹具中的真实短 Font 段"
+    );
     let authority = source.authority();
     let mut job = MarkdownShapingJob::new(
         source.clone(),
@@ -135,6 +138,7 @@ fn respond(
                     range,
                     font.clone(),
                     MarkdownLineComposeStyle {
+                        presentation: Default::default(),
                         points: 16.0,
                         language: None,
                         features: Vec::new(),
@@ -271,7 +275,12 @@ fn unchanged_first_font_cannot_publish_an_open_prefix_as_a_closed_run() {
         {
             MarkdownLineItemAnswer::Yielded => {}
             MarkdownLineItemAnswer::NeedStyle(request) => respond(&mut worker, request, &original),
-            MarkdownLineItemAnswer::NeedsFrontier(MarkdownLineFrontierReason::UnsupportedPlan) => {
+            MarkdownLineItemAnswer::NeedsFrontier(reason) => {
+                // 实际字体计划拒绝与连续字体段预算不是同一事实；失配时保留完整类型化原因。
+                assert_eq!(
+                    reason,
+                    MarkdownLineFrontierReason::Plan(harfrust::AsciiFrontierRejection::Positioning)
+                );
                 rejected = true;
                 break;
             }
@@ -280,6 +289,476 @@ fn unchanged_first_font_cannot_publish_an_open_prefix_as_a_closed_run() {
     }
     assert!(rejected && worker.payload.as_ref().unwrap().cursor == 0);
     drop((worker, source, document, file, original));
+}
+
+#[test]
+/// 非自然短样式也必须取得真实Font变化；段内缺字不能被首字素选Font遮住，短末端不能冒充闭合。
+fn shortened_style_head_uses_real_gcb_font_boundary_and_keeps_same_font_rejection() {
+    for (text, changes_font) in [("Ax*A*", true), ("AA*A*", false)] {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+        let document = MarkdownDocumentBuffer::open(file.path(), 64 * 1024).unwrap();
+        let source = MarkdownLayoutTextSource::capture(&document);
+        let source_observer = source.resource_observer();
+        let backing = document.original_backing_observer().unwrap();
+        let original = font(MORX);
+        let fallback = font(ROBOTO);
+        let original_observer = original.resource_observer();
+        let fallback_observer = fallback.resource_observer();
+
+        // 原Parser的真实正文run止于后面的斜体标记；不是为了通过闭项预算而任意截一段文字。
+        let mut semantics = crate::MarkdownViewportPresentation::default();
+        semantics
+            .rebuild(document.generation(), 0..document.utf16_len(), text)
+            .unwrap();
+        let coverage = semantics.query(0).unwrap().utf16_range;
+        assert_eq!(coverage, 0..2);
+        let mut worker = MarkdownLineItemCoordinator::new_with_frontier(
+            source.clone(),
+            &source.authority(),
+            MarkdownLineComposeCancellation::new(),
+        )
+        .unwrap();
+        let resources = worker.resources.observer();
+        let initial = request(&mut worker);
+        assert!(initial.source_range().end > coverage.end);
+        assert!(initial.paragraph_range().len() < MAX_CLOSED_UTF16);
+        worker
+            .provide_style(
+                initial
+                    .respond(
+                        coverage,
+                        original.clone(),
+                        MarkdownLineComposeStyle {
+                            presentation: Default::default(),
+                            points: 16.0,
+                            language: None,
+                            features: Vec::new(),
+                        },
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+        let limit = MarkdownLineComposeBudget {
+            bytes: 7,
+            scalars: 3,
+            records: 3,
+            metadata_units: 3,
+        };
+        let mut completed = false;
+        for _ in 0..100_000 {
+            let progress = worker.step(limit).unwrap();
+            assert!(progress.bytes <= limit.bytes && progress.scalars <= limit.scalars);
+            assert!(
+                progress.records <= limit.records
+                    && progress.metadata_units <= limit.metadata_units
+            );
+            match progress.answer {
+                MarkdownLineItemAnswer::Yielded => {}
+                MarkdownLineItemAnswer::NeedStyle(request) => {
+                    let probe = worker.font_probe(&request).unwrap();
+                    let range = probe.source_range();
+                    assert!(range == (0..1) || range == (1..2));
+                    // 同一个完整GCB先实际试原Font；只在真实glyph0后选择确实覆盖它的另一Font。
+                    let primary = glyphs(probe.source().unwrap(), &original, range.clone());
+                    let selected = if primary.iter().any(|glyph| glyph.glyph_id == 0) {
+                        assert!(changes_font && range == (1..2));
+                        assert!(
+                            glyphs(probe.source().unwrap(), &fallback, range)
+                                .iter()
+                                .all(|glyph| glyph.glyph_id != 0)
+                        );
+                        &fallback
+                    } else {
+                        &original
+                    };
+                    respond(&mut worker, request, selected);
+                    assert!(probe.validate().is_err()); // 原nonce消费后，旧探测不能为后继字素补权。
+                }
+                MarkdownLineItemAnswer::ItemReady(facts) => {
+                    assert!(changes_font);
+                    assert_eq!(facts.source_utf16, 0..1);
+                    let mut item = worker.take_item().unwrap();
+                    let count = item.job.profile().unwrap().glyph_count;
+                    let actual = (0..count)
+                        .map(|ordinal| item.glyph(ordinal).unwrap().unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, glyphs(&source, &original, 0..1));
+                    assert!(matches!(
+                        worker.step(limit).unwrap().answer,
+                        MarkdownLineItemAnswer::NeedsFrontier(
+                            MarkdownLineFrontierReason::PendingConsumer
+                        )
+                    ));
+                    drop(item); // Font边界不免除原child的实际释放责任。
+                    assert_eq!(request(&mut worker).source_range().start, 1);
+                    completed = true;
+                    break;
+                }
+                MarkdownLineItemAnswer::NeedsFrontier(reason) => {
+                    assert!(!changes_font);
+                    assert_eq!(
+                        reason,
+                        MarkdownLineFrontierReason::Plan(
+                            harfrust::AsciiFrontierRejection::Positioning
+                        )
+                    ); // 两个GCB都仍是原Font，不能借短coverage末端交付伪闭合段。
+                    completed = true;
+                    break;
+                }
+                _ => panic!("尚未消费的原样式尾部不能被宣布完整"),
+            }
+        }
+        assert!(completed);
+        assert_eq!(std::fs::read(file.path()).unwrap(), text.as_bytes());
+        drop((worker, source, document, file, original, fallback));
+        assert!(resources.snapshot().unwrap().is_released());
+        assert!(source_observer.payload_released());
+        assert!(original_observer.payload_released() && fallback_observer.payload_released());
+        assert!(backing.unmap_succeeded() && backing.mapped_bytes() == 0 && !backing.failed());
+    }
+}
+
+#[test]
+/// fallback本身无缺字也必须恢复实际可用的base；整个自然窗口仍同Font时保留原完整字形结果。
+fn preferred_font_policy_restores_primary_after_fallback_and_preserves_unchanged_runs() {
+    for (text, expected) in [
+        ("xA", vec![0..1, 1..2]),
+        ("xx", std::iter::once(0..2).collect()),
+    ] {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+        let document = MarkdownDocumentBuffer::open(file.path(), 64 * 1024).unwrap();
+        let source = MarkdownLayoutTextSource::capture(&document);
+        let source_observer = source.resource_observer();
+        let backing = document.original_backing_observer().unwrap();
+        let primary = font(MORX);
+        let fallback = font(ROBOTO);
+        let primary_observer = primary.resource_observer();
+        let fallback_observer = fallback.resource_observer();
+        let catalog = super::super::super::super::MarkdownLineFontCatalog::new();
+        let primary_registered = catalog.register(&primary).unwrap();
+        let fallback_registered = catalog.register(&fallback).unwrap();
+        let mut worker = MarkdownLineItemCoordinator::new_with_frontier(
+            source.clone(),
+            &source.authority(),
+            MarkdownLineComposeCancellation::new(),
+        )
+        .unwrap();
+        let resources = worker.resources.observer();
+        let mut emitted = Vec::new();
+        let mut ended = false;
+        for _ in 0..100_000 {
+            let progress = worker.step(MarkdownLineComposeBudget::default()).unwrap();
+            match progress.answer {
+                MarkdownLineItemAnswer::Yielded => {}
+                MarkdownLineItemAnswer::NeedStyle(request) => {
+                    let range = request.source_range();
+                    let probe = worker.font_probe(&request).unwrap();
+                    let primary_glyphs =
+                        glyphs(probe.source().unwrap(), &primary, probe.source_range());
+                    // 两个真实face都可能覆盖A；策略先实际试base，只有真实缺字才采用fallback。
+                    // 这正是“CJK fallback也覆盖空格”时必须保留的优先权，不能沿上个Font继续猜。
+                    let selected = if primary_glyphs.iter().any(|glyph| glyph.glyph_id == 0) {
+                        assert!(
+                            glyphs(probe.source().unwrap(), &fallback, probe.source_range())
+                                .iter()
+                                .all(|glyph| glyph.glyph_id != 0)
+                        );
+                        &fallback_registered
+                    } else {
+                        &primary_registered
+                    };
+                    worker
+                        .provide_style(
+                            request
+                                .respond_registered(
+                                    range,
+                                    selected,
+                                    MarkdownLineComposeStyle {
+                                        presentation: Default::default(),
+                                        points: 16.0,
+                                        language: None,
+                                        features: Vec::new(),
+                                    },
+                                )
+                                .unwrap()
+                                .with_preferred_registered_font(&primary_registered)
+                                .unwrap(),
+                        )
+                        .unwrap();
+                    assert!(probe.validate().is_err());
+                }
+                MarkdownLineItemAnswer::ItemReady(facts) => {
+                    let mut item = worker.take_item().unwrap();
+                    let selected = if text == "xA" && facts.source_utf16.start == 1 {
+                        &primary
+                    } else {
+                        &fallback
+                    };
+                    assert!(selected.permits(&item.font));
+                    let actual = (0..item.job.profile().unwrap().glyph_count)
+                        .map(|ordinal| item.glyph(ordinal).unwrap().unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual,
+                        glyphs(&source, selected, facts.source_utf16.clone())
+                    );
+                    assert!(actual.iter().all(|glyph| glyph.glyph_id != 0));
+                    emitted.push(facts.source_utf16);
+                    drop(item);
+                }
+                MarkdownLineItemAnswer::EndOfSource => {
+                    ended = true;
+                    break;
+                }
+                MarkdownLineItemAnswer::NeedsFrontier(reason) => {
+                    panic!("原自然项的真实base策略不能丢失已可用Font: {reason:?}")
+                }
+                _ => panic!("纯文本小项没有另一个控制协议"),
+            }
+        }
+        assert!(ended);
+        assert_eq!(emitted, expected);
+        assert_eq!(std::fs::read(file.path()).unwrap(), text.as_bytes());
+        drop((worker, source, document, file));
+        drop((
+            primary_registered,
+            fallback_registered,
+            catalog,
+            primary,
+            fallback,
+        ));
+        assert!(resources.snapshot().unwrap().is_released());
+        assert!(source_observer.payload_released());
+        assert!(primary_observer.payload_released() && fallback_observer.payload_released());
+        assert!(backing.unmap_succeeded() && backing.mapped_bytes() == 0 && !backing.failed());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+/// 从实际首safePart定位后继起点，验证其首GCB恢复base时不误报异源，也不假消费整part。
+fn preferred_font_restores_primary_at_real_bounded_frontier_start() {
+    // 第一份样本只提供真实计划选择的公开边界，第二份是独立Doc/Source；不能把前次nonce带入本次。
+    // 夹具始终按4KiB写入，候选只消费有限首部，不为了构造问题预解析或加载整段。
+    let mut boundary = None;
+    for restore_primary in [false, true] {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let block = [b'x'; 4096];
+        for _ in 0..16 {
+            file.write_all(&block).unwrap();
+        }
+        if restore_primary {
+            // 位置只来自前一独立样本公开交付的真实part；不读取协调器游标或修改私有状态。
+            use std::io::{Seek, SeekFrom};
+            file.seek(SeekFrom::Start(boundary.expect("已消费原首part") as u64))
+                .unwrap();
+            file.write_all(b"A").unwrap();
+        }
+        let document = MarkdownDocumentBuffer::open(file.path(), 128 * 1024).unwrap();
+        let source = MarkdownLayoutTextSource::capture(&document);
+        let observed = source.resource_observer();
+        let backing = document.original_backing_observer().unwrap();
+        let primary = font(MORX);
+        let primary_observer = primary.resource_observer();
+        // MORX确实不覆盖x，原实机Mono确实覆盖它；不修改cmap、AAT计划或Font名称来制造变化。
+        // 原文件快照与Core payload各有真实收据，最后必须同时看到close/munmap完成。
+        let bytes = crate::MarkdownLayoutFontBytes::capture_file(
+            std::path::Path::new("/System/Library/Fonts/SFNSMono.ttf"),
+            32 * 1024 * 1024,
+        )
+        .unwrap();
+        let mapping = bytes.resource_observer();
+        let name = read_fonts::FontRef::from_index(bytes.as_ref(), 0)
+            .unwrap()
+            .table_data(read_fonts::types::Tag::new(b"name"))
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let fallback =
+            MarkdownLayoutFont::resolve_name_table_at_size(bytes.blob(), &name, &[], 16.0).unwrap();
+        drop(bytes); // Font是这份真实冻结映射的唯一业务owner，临时capture不能保额外强边。
+        let fallback_observer = fallback.resource_observer();
+        // 和正式调用相同，palette持强注册，响应只带弱身份；优先策略不能额外延长字体映射。
+        let catalog = super::super::super::super::MarkdownLineFontCatalog::new();
+        let primary_registered = catalog.register(&primary).unwrap();
+        let fallback_registered = catalog.register(&fallback).unwrap();
+        let mut worker = MarkdownLineItemCoordinator::new_with_frontier(
+            source.clone(),
+            &source.authority(),
+            MarkdownLineComposeCancellation::new(),
+        )
+        .unwrap();
+        let resources = worker.resources.observer();
+        let budget = MarkdownLineComposeBudget::default();
+        let mut ranges = Vec::new();
+        let mut restored = false;
+        for _ in 0..100_000 {
+            let step = worker.step(budget).unwrap();
+            assert!(step.bytes <= budget.bytes && step.scalars <= budget.scalars);
+            assert!(step.records <= budget.records && step.metadata_units <= budget.metadata_units);
+            match step.answer {
+                MarkdownLineItemAnswer::Yielded => {}
+                MarkdownLineItemAnswer::NeedStyle(request) => {
+                    let range = request.source_range();
+                    let probe = worker.font_probe(&request).unwrap();
+                    let actual = glyphs(probe.source().unwrap(), &primary, probe.source_range());
+                    // 每一个原完整GCB实际试base；命中A时立即恢复，不能因为Mono也覆盖A而沿用fallback。
+                    // 只有真实glyph0才选另一font，短oracle本身不预判长run末端或伪造闭项权限。
+                    let selected = if actual.iter().any(|glyph| glyph.glyph_id == 0) {
+                        assert!(
+                            glyphs(probe.source().unwrap(), &fallback, probe.source_range())
+                                .iter()
+                                .all(|glyph| glyph.glyph_id != 0)
+                        );
+                        &fallback_registered
+                    } else {
+                        &primary_registered
+                    };
+                    worker
+                        .provide_style(
+                            request
+                                .respond_registered(
+                                    range,
+                                    selected,
+                                    MarkdownLineComposeStyle {
+                                        presentation: Default::default(),
+                                        points: 16.0,
+                                        language: None,
+                                        features: Vec::new(),
+                                    },
+                                )
+                                .unwrap()
+                                .with_preferred_registered_font(&primary_registered)
+                                .unwrap(),
+                        )
+                        .unwrap();
+                    assert!(probe.validate().is_err());
+                }
+                MarkdownLineItemAnswer::ItemReady(facts) => {
+                    let mut item = worker.take_item().unwrap();
+                    let range = facts.source_utf16.clone();
+                    if ranges.is_empty() {
+                        // 首项允许实际计划选择任意有界长度；断言用户可见输出及独立字形结果，不固化内部块长。
+                        assert_eq!(range.start, 0);
+                        assert!(range.end > 1 && range.end <= MAX_CLOSED_UTF16);
+                        assert!(fallback.permits(&item.font));
+                        if restore_primary {
+                            assert_eq!(range.end, boundary.unwrap());
+                        }
+                        // 独立完整oracle只处理已真实交付的有界首part，绝不把64KiB源交给完整整形。
+                        let mut oracle = MarkdownShapingJob::new(
+                            source.clone(),
+                            &source.authority(),
+                            fallback.clone(),
+                            &fallback.authority(),
+                            range.clone(),
+                            options(&source, &range),
+                        )
+                        .unwrap();
+                        for _ in 0..10_000 {
+                            if oracle
+                                .step(
+                                    &source.authority(),
+                                    &fallback.authority(),
+                                    MarkdownShapingBudget {
+                                        bytes: budget.bytes,
+                                        scalars: budget.scalars,
+                                    },
+                                )
+                                .unwrap()
+                                .status
+                                == MarkdownShapingStatus::AwaitingShape
+                            {
+                                break;
+                            }
+                        }
+                        oracle
+                            .shape(&source.authority(), &fallback.authority())
+                            .unwrap();
+                        let count = oracle.profile().unwrap().glyph_count;
+                        assert_eq!(item.job.profile().unwrap().glyph_count, count);
+                        for index in 0..count {
+                            assert_eq!(
+                                item.glyph(index).unwrap(),
+                                oracle
+                                    .glyph(&source.authority(), &fallback.authority(), index)
+                                    .unwrap()
+                            );
+                        }
+                        if !restore_primary {
+                            boundary = Some(range.end);
+                        }
+                    } else {
+                        // 恢复base的首GCB恰在原真实part后；其右侧x又是真Font变化，A只能作为独立自然短段。
+                        assert!(restore_primary);
+                        assert_eq!(range, boundary.unwrap()..boundary.unwrap() + 1);
+                        assert!(primary.permits(&item.font));
+                        let actual = (0..item.job.profile().unwrap().glyph_count)
+                            .map(|index| item.glyph(index).unwrap().unwrap())
+                            .collect::<Vec<_>>();
+                        assert_eq!(actual, glyphs(&source, &primary, range.clone()));
+                        restored = true;
+                    }
+                    ranges.push(range);
+                    drop(item); // 原child真实归还后才可退役旧parent；不通过游标或计数假装完成。
+                    if !restore_primary || restored {
+                        break;
+                    }
+                }
+                MarkdownLineItemAnswer::NeedsFrontier(reason) => {
+                    panic!("有界首GCB恢复base不能拒绝：{reason:?}; actual={ranges:?}")
+                }
+                _ => panic!("只消费有限首part及恢复base的A，未读长尾不能成为EOF"),
+            }
+        }
+        assert!(!ranges.is_empty() && (!restore_primary || restored));
+        // 分块核对原磁盘；不为数据完整性检查再把整份样本放入内存。
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut read = [0; 4096];
+        for block_start in (0..65536).step_by(read.len()) {
+            file.read_exact(&mut read).unwrap();
+            for (offset, byte) in read.iter().enumerate() {
+                let expected = if restore_primary && block_start + offset == boundary.unwrap() {
+                    b'A'
+                } else {
+                    b'x'
+                };
+                assert_eq!(*byte, expected);
+            }
+        }
+        drop((
+            worker,
+            source,
+            document,
+            file,
+            primary_registered,
+            fallback_registered,
+            catalog,
+            primary,
+            fallback,
+        ));
+        // worker、Doc、palette与所有临时Font强边均已归还；资源结论来自原实际observer，不拿计数推导。
+        assert!(resources.snapshot().unwrap().is_released());
+        assert!(
+            observed.payload_released()
+                && primary_observer.payload_released()
+                && fallback_observer.payload_released()
+        );
+        assert!(backing.unmap_succeeded() && backing.mapped_bytes() == 0 && !backing.failed());
+        assert!(
+            mapping.mapping_drop_completed()
+                && mapping.unmap_succeeded()
+                && mapping.mapped_bytes() == 0
+        );
+        assert!(
+            mapping.source_descriptor_closed()
+                && mapping.backing_descriptor_closed()
+                && !mapping.failed()
+        );
+    }
 }
 
 #[test]
@@ -321,5 +800,122 @@ fn original_source_error_precedes_cancel_during_initial_font_probe() {
         }
         assert!(worker.payload.is_none() && probe.validate().is_err());
         drop((probe, first, worker, source, document, file, original));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+/// 跨输入 GSUB 首拒绝后，只在真实 Font 变化处交付组合字和家庭 emoji，长 ASCII 尾仍由原局部计划认证。
+fn cross_input_combining_and_family_emoji_close_real_font_runs_before_long_ascii_suffix() {
+    fn captured(path: &str, maximum: u64) -> MarkdownLayoutFont {
+        // 使用未改写的实机字体表；名称只定位真实 face，计划仍按活动查表认证。
+        let bytes =
+            crate::MarkdownLayoutFontBytes::capture_file(std::path::Path::new(path), maximum)
+                .unwrap();
+        let name = read_fonts::FontRef::from_index(bytes.as_ref(), 0)
+            .unwrap()
+            .table_data(read_fonts::types::Tag::new(b"name"))
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        MarkdownLayoutFont::resolve_name_table_at_size(bytes.blob(), &name, &[], 16.0).unwrap()
+    }
+    for prefix in ["e\u{301}👩‍👩‍👧‍👦!", "a?👩‍👩‍👧‍👦!"] {
+        let mono = captured("/System/Library/Fonts/SFNSMono.ttf", 32 * 1024 * 1024);
+        let emoji = captured(
+            "/System/Library/Fonts/Apple Color Emoji.ttc",
+            512 * 1024 * 1024,
+        );
+        let (file, document, source) = fixture(prefix.as_bytes());
+        let backing = document.original_backing_observer().unwrap();
+        let observed = source.resource_observer();
+        let prefix_oracle = glyphs(&source, &mono, 0..2);
+        let emoji_oracle = glyphs(&source, &emoji, 2..13);
+        assert!(prefix_oracle.iter().all(|glyph| glyph.glyph_id != 0));
+        assert!(emoji_oracle.iter().all(|glyph| glyph.glyph_id != 0));
+        let mut worker = MarkdownLineItemCoordinator::new_with_frontier(
+            source.clone(),
+            &source.authority(),
+            MarkdownLineComposeCancellation::new(),
+        )
+        .unwrap();
+        let resources = worker.resources.observer();
+        let limit = MarkdownLineComposeBudget {
+            bytes: 31,
+            scalars: 7,
+            records: 7,
+            metadata_units: 7,
+        };
+        let mut emitted = Vec::new();
+        for _ in 0..100_000 {
+            let step = worker.step(limit).unwrap();
+            assert!(step.bytes <= limit.bytes && step.scalars <= limit.scalars);
+            assert!(step.records <= limit.records && step.metadata_units <= limit.metadata_units);
+            match step.answer {
+                MarkdownLineItemAnswer::Yielded => {}
+                MarkdownLineItemAnswer::NeedStyle(request) => {
+                    let range = request.source_range();
+                    let selected = if request.continuation_font().is_some() {
+                        // 每次范围均由原 GCB 两端点签发；真实缺字才选择 emoji Font，不能为过门任意换字库。
+                        let primary = glyphs(&source, &mono, range.clone());
+                        if primary.iter().any(|glyph| glyph.glyph_id == 0) {
+                            let fallback = glyphs(&source, &emoji, range);
+                            assert!(fallback.iter().all(|glyph| glyph.glyph_id != 0));
+                            &emoji
+                        } else {
+                            &mono
+                        }
+                    } else {
+                        &mono // 初始范围只是样式请求，不对整条长项创建完整整形输入。
+                    };
+                    respond(&mut worker, request, selected);
+                }
+                MarkdownLineItemAnswer::ItemReady(facts) => {
+                    let mut item = worker.take_item().unwrap();
+                    let count = item.job.profile().unwrap().glyph_count;
+                    let actual = (0..count)
+                        .map(|ordinal| item.glyph(ordinal).unwrap().unwrap())
+                        .collect::<Vec<_>>();
+                    match emitted.len() {
+                        0 => {
+                            assert_eq!(facts.source_utf16, 0..2);
+                            assert_eq!(actual, prefix_oracle);
+                        }
+                        1 => {
+                            assert_eq!(facts.source_utf16, 2..13);
+                            assert_eq!(actual, emoji_oracle);
+                        }
+                        2 => {
+                            // 字体变化后的原 ASCII 计划必须交付有限前沿，不能把 64KiB 尾文整体 shape。
+                            assert_eq!(facts.source_utf16.start, 13);
+                            assert!(facts.source_utf16.end <= 13 + 256);
+                            assert!(mono.permits(&item.font));
+                        }
+                        _ => unreachable!("有限回归只消费三个实际前沿项"),
+                    }
+                    emitted.push(facts.source_utf16);
+                    drop(item); // 真实 child 归还后原协调器才可继续，不伪造 PendingConsumer 解除。
+                    if emitted.len() == 3 {
+                        break;
+                    }
+                }
+                MarkdownLineItemAnswer::NeedsFrontier(reason) => {
+                    panic!(
+                        "真实 Font 变化与可认证 ASCII 后缀不能退化为前沿拒绝: {reason:?}; 已交付原范围={emitted:?}"
+                    )
+                }
+                MarkdownLineItemAnswer::EndOfSource => {
+                    panic!("尚未消费的长尾不能被提前宣布完整")
+                }
+                _ => panic!("有限组合字与 emoji 回归不能转入其他布局协议"),
+            }
+        }
+        assert_eq!(emitted.len(), 3);
+        let actual = worker.frontier_work().unwrap();
+        assert!(actual.input_bytes < 1024 && actual.shape_calls < 8);
+        drop((worker, source, document, file, mono, emoji));
+        assert!(resources.snapshot().unwrap().is_released());
+        assert!(observed.payload_released());
+        assert!(backing.unmap_succeeded() && backing.mapped_bytes() == 0 && !backing.failed());
     }
 }

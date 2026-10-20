@@ -85,17 +85,6 @@ struct BlockGeometry {
     source: std::ops::Range<usize>,
     kind: NativeMarkdownPreviewBlockKind,
     frame: NSRect,
-    // 探针只保两个有限源坐标范围；不复制语义窗口或段落内容。
-    #[cfg(all(
-        feature = "native-markdown-runtime-probe",
-        feature = "native-block-fragment-diagnostic"
-    ))]
-    semantic_window: std::ops::Range<usize>,
-    #[cfg(all(
-        feature = "native-markdown-runtime-probe",
-        feature = "native-block-fragment-diagnostic"
-    ))]
-    semantic_source: std::ops::Range<usize>,
 }
 
 /// 一个真实可见行窗口只给相交fragment分配probe，完整段落长度不参与请求预算。
@@ -331,11 +320,6 @@ impl PieceBackedMarkdownTextView {
         let obsolete = self.ivars().preview_blocks.borrow_mut().take();
         let attempt = self.ivars().preview_block_attempt.borrow_mut().take();
         drop((obsolete, attempt));
-        #[cfg(all(
-            feature = "native-markdown-runtime-probe",
-            feature = "native-block-fragment-diagnostic"
-        ))]
-        diagnostic::cancel_code_paint_for_body(std::ptr::from_ref(self).addr()); // 原缓存撤权后只取消原paint等待。
     }
 
     /// 原fold入口仍更新同一权限代次，标准fragment不再需要项目delegate。
@@ -670,16 +654,6 @@ impl PieceBackedMarkdownTextView {
                     source,
                     kind,
                     frame,
-                    #[cfg(all(
-                        feature = "native-markdown-runtime-probe",
-                        feature = "native-block-fragment-diagnostic"
-                    ))]
-                    semantic_window: semantic_request.window.clone(),
-                    #[cfg(all(
-                        feature = "native-markdown-runtime-probe",
-                        feature = "native-block-fragment-diagnostic"
-                    ))]
-                    semantic_source: visible_part.clone(),
                 }); // 背景占正文列宽，不依赖glyph tight width。
             }
         }
@@ -693,26 +667,12 @@ impl PieceBackedMarkdownTextView {
         if actual_viewport != viewport || !self.preview_block_current(&storage, &identity, key) {
             return None; // drop/geometry getter重入后的旧矩形不能进入新会话。
         }
-        let prepared = NativeMarkdownPreviewBlocks {
+        Some(NativeMarkdownPreviewBlocks {
             identity,
             key,
             viewport,
             geometry,
-        };
-        #[cfg(all(
-            feature = "native-markdown-runtime-probe",
-            feature = "native-block-fragment-diagnostic"
-        ))]
-        for item in &prepared.geometry {
-            // 所有Native claims结束且最终原权限已核验；只交已有坐标，不把prepared当作paint完成。
-            diagnostic::prepared(self.block_probe_snapshot(
-                &prepared.identity,
-                prepared.key,
-                prepared.viewport,
-                item,
-            ));
-        }
-        Some(prepared)
+        })
     }
 
     /// 标准背景完成后只读有限Copy缓存，不枚举、layout、解析或取得任何正文字符串。
@@ -771,18 +731,6 @@ impl PieceBackedMarkdownTextView {
             {
                 break; // Native绘制返回后实际几何/原票失效，不能登记成功或画下一块；不能早退漏restore。
             }
-            #[cfg(all(
-                feature = "native-markdown-runtime-probe",
-                feature = "native-block-fragment-diagnostic"
-            ))]
-            diagnostic::painted_current(
-                &identity,
-                self.block_probe_key(key),
-                viewport.visible,
-                &item.source,
-                paint,
-                item.kind as u8,
-            ); // 只有实际paint返回且原票/几何仍有效，才交正面积真实交集事实。
             #[cfg(feature = "native-block-fragment-diagnostic")]
             diagnostic::painted(
                 item.kind as u8,
@@ -793,89 +741,6 @@ impl PieceBackedMarkdownTextView {
         CGContext::restore_g_state(Some(&context));
         #[cfg(feature = "native-block-fragment-diagnostic")]
         storage.ivars().mode_attribute_diagnostic.report(2);
-    }
-
-    #[cfg(all(
-        feature = "native-markdown-runtime-probe",
-        feature = "native-block-fragment-diagnostic"
-    ))]
-    /// 原body保活期间的辅助标量镜像；验收仍必须同时核实际Weak body及doc身份。
-    fn block_probe_key(&self, key: BlockKey) -> diagnostic::ProbeBlockKey {
-        diagnostic::ProbeBlockKey {
-            body_owner: std::ptr::from_ref(self).addr(),
-            generation: key.generation,
-            semantic_epoch: key.semantic_epoch,
-            table_epoch: key.table_epoch,
-            fold_epoch: key.fold_epoch,
-            mode: key.mode,
-        }
-    }
-
-    #[cfg(all(
-        feature = "native-markdown-runtime-probe",
-        feature = "native-block-fragment-diagnostic"
-    ))]
-    /// 只克隆Weak与有限坐标，不能通过此入口取得任何正文或Native布局对象。
-    fn block_probe_snapshot(
-        &self,
-        identity: &WeakMarkdownDocument,
-        key: BlockKey,
-        viewport: BlockViewport,
-        item: &BlockGeometry,
-    ) -> diagnostic::NativeMarkdownPreviewBlockProbeSnapshot {
-        diagnostic::NativeMarkdownPreviewBlockProbeSnapshot {
-            identity: identity.clone(),
-            key: self.block_probe_key(key),
-            viewport: viewport.visible,
-            fragment_source: item.source.clone(),
-            semantic_window: item.semantic_window.clone(),
-            semantic_source: item.semantic_source.clone(),
-            kind: item.kind as u8,
-            frame: item.frame,
-        }
-    }
-
-    #[cfg(all(
-        feature = "native-markdown-runtime-probe",
-        feature = "native-block-fragment-diagnostic"
-    ))]
-    /// 验收只能读取当前真实视口内覆盖原target的有限准备快照；存在cache不证明已经paint。
-    pub(super) fn preview_block_probe_snapshot(
-        &self,
-        target: &std::ops::Range<usize>,
-    ) -> Option<diagnostic::NativeMarkdownPreviewBlockProbeSnapshot> {
-        if target.is_empty() {
-            return None; // 空端点不能伪造可见长代码内容或背景覆盖。
-        }
-        let capture = self.ivars().folds.capture_selection().ok()?;
-        let storage = self.ivars().text_storage.load()?;
-        let (identity, key) = self.preview_block_key(&storage)?;
-        let viewport = self.preview_block_viewport();
-        if self.bounded_paint_viewport() != Some((viewport.visible, viewport.origin))
-            || !capture.current()
-            || !self.preview_block_current(&storage, &identity, key)
-        {
-            return None; // 原生getter返回后必须还是原body/doc/key/完整视口，不能追认后继请求。
-        }
-        let snapshot = {
-            let slot = self.ivars().preview_blocks.borrow();
-            let cache = slot.as_ref().filter(|cache| {
-                cache.key == key
-                    && cache.viewport == viewport
-                    && WeakMarkdownDocument::ptr_eq(&cache.identity, &identity)
-            })?;
-            let item = cache.geometry.iter().find(|item| {
-                item.semantic_source.start <= target.start && item.semantic_source.end >= target.end
-            })?; // 必须由真实可见交集覆盖原target，不能只凭巨大完整fragment包含它。
-            self.block_probe_snapshot(&cache.identity, cache.key, cache.viewport, item)
-        }; // cache借用在下一次Native viewport getter前结束。
-        if self.preview_block_viewport() != viewport
-            || !capture.current()
-            || !self.preview_block_current(&storage, &identity, key)
-        {
-            return None; // 构造快照/临时Nativeclaim析构重入后也不能留下过期准备收据。
-        }
-        Some(snapshot)
     }
 
     #[cfg(feature = "native-block-fragment-diagnostic")]

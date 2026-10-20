@@ -49,6 +49,7 @@ pub struct NativeMarkdownComposedViewportPaintStep {
 /// 消费者须归还本收据及自己的最后context，核真实释放callback后才允许封存像素。
 pub struct NativeMarkdownComposedViewportPaintCompletion {
     key: NativeMarkdownPagedSceneKey,
+    cell_window: Option<std::rc::Weak<()>>,
     context: CFRetained<CGContext>,
     receipt: NativeMarkdownComposedViewportPaintReceipt,
     work: NativeMarkdownComposedViewportPaintWork,
@@ -57,7 +58,21 @@ impl NativeMarkdownComposedViewportPaintCompletion {
     /// 只核同一次候选身份；使用者仍须复核原Scene健康、几何和实际context释放后才能发布。
     #[must_use]
     pub fn permits(&self, key: &NativeMarkdownPagedSceneKey, context: &CGContext) -> bool {
-        self.key.same(key) && ptr::eq(&*self.context, context)
+        self.cell_window.is_none() && self.key.same(key) && ptr::eq(&*self.context, context)
+    }
+    /// 完成事实只属于创建此绘图会话的具体内层格；相同 Source/外层 nonce 不能互换不同窗口。
+    pub(in crate::native_surface::paged_line_viewport) fn permits_cell(
+        &self,
+        window: &NativeMarkdownComposedViewport,
+        context: &CGContext,
+    ) -> bool {
+        let LayoutDomain::TableCell { identity, .. } = &window.domain else {
+            return false;
+        };
+        self.cell_window.as_ref().is_some_and(|owner| {
+            std::rc::Weak::ptr_eq(owner, &Rc::downgrade(identity)) && owner.strong_count() != 0
+        }) && self.key.same(&window.key)
+            && ptr::eq(&*self.context, context)
     }
     /// 桥接者只转交同一个实际claim；额外保留会阻止真实像素seal，不能作为无资源收据缓存。
     #[must_use]
@@ -266,6 +281,10 @@ impl NativeMarkdownComposedViewportPaintSession {
             Ok(true) => {
                 let completion = NativeMarkdownComposedViewportPaintCompletion {
                     key: self.window.key.clone(),
+                    cell_window: match &self.window.domain {
+                        LayoutDomain::Body => None,
+                        LayoutDomain::TableCell { identity, .. } => Some(Rc::downgrade(identity)),
+                    },
                     context: self.context.clone(),
                     receipt: self.receipt,
                     work: self.total,
@@ -363,17 +382,20 @@ impl NativeMarkdownComposedViewportPaintSession {
                     let authority = font.native().core_font().authority();
                     CGContext::save_g_state(Some(&self.context));
                     let restore = Restore(&self.context);
-                    CGContext::clip_to_rect(Some(&self.context), self.window.key.request.viewport);
+                    CGContext::clip_to_rect(Some(&self.context), self.window.clip());
+                    self.window.ink_style(original, &self.context);
                     let painted = paint_composed_glyphs(
                         &self.window.output,
                         &original.handle,
                         NativeMarkdownPagedGlyphPaintRequest {
-                            source: &self.window.key.source,
+                            source: &self.window.source(),
                             font_authority: &authority,
                             native_font: font.native(),
                             glyph_range: start..end,
                             origin: NativeMarkdownPagedGlyphOrigin {
-                                baseline: self.window.lines[line].baseline,
+                                baseline: self
+                                    .window
+                                    .part_baseline(&self.window.lines[line], original),
                                 pen_x_26_6: pen_x,
                                 pen_y_26_6: pen_y,
                             },
@@ -419,6 +441,14 @@ impl NativeMarkdownComposedViewportPaintSession {
                     {
                         return Err(NativeMarkdownComposedViewportPaintCause::InconsistentAdvance);
                     }
+                    // 原part字形完整且advance核验后只画一次装饰；续体不会每个glyph批次叠线。
+                    self.window.paint_decorations(
+                        &self.window.lines[line],
+                        &self.window.lines[line].parts[part],
+                        &self.context,
+                        &mut self.native_draw_returned,
+                        current,
+                    )?;
                     self.cursor = Cursor::Part {
                         line,
                         part: part + 1,

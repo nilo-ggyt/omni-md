@@ -94,6 +94,18 @@ impl CodeSpanProbe {
     pub fn next_byte(&self) -> usize {
         self.cursor.next_byte()
     }
+
+    /// 原段落 owner 已完成真实续行前缀；closer 配对仍完全交给原词法和 code_matches。
+    pub(crate) fn skip_prefix(
+        &mut self,
+        prefix: &crate::global_frontier::VerifiedInlinePrefix,
+    ) -> Result<(), InlineError> {
+        if self.closed || self.failure.is_some() {
+            return Err(InlineError::Closed);
+        }
+        self.cursor.skip_prefix(prefix)
+    }
+
     pub fn committed_byte(&self) -> usize {
         self.opener.start
     }

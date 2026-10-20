@@ -46,11 +46,49 @@ pub(crate) fn run_first_pass_with_math_seeds<'a>(
     #[cfg(feature = "omni-block-frontier")] seeds: &[crate::math_context::TableMathSeed],
     #[cfg(not(feature = "omni-block-frontier"))] _seeds: &[()],
 ) -> (Tree<Item>, Allocations<'a>, bool) {
+    let lookup_table = &create_lut(&options);
+    first_pass(
+        text,
+        options,
+        lookup_table,
+        #[cfg(feature = "omni-block-frontier")]
+        seeds,
+        #[cfg(not(feature = "omni-block-frontier"))]
+        _seeds,
+    )
+    .run()
+}
+
+#[cfg(feature = "omni-block-frontier")]
+#[path = "firstpass/table_cell.rs"]
+mod table_cell;
+#[cfg(feature = "omni-block-frontier")]
+pub(crate) use table_cell::run as run_first_pass_table_cell;
+
+#[cfg(feature = "omni-block-frontier")]
+#[path = "firstpass/atx_leaf.rs"]
+mod atx_leaf;
+#[cfg(feature = "omni-block-frontier")]
+pub(crate) use atx_leaf::run as run_first_pass_atx_leaf;
+
+#[cfg(feature = "omni-block-frontier")]
+#[path = "firstpass/inline_block.rs"]
+mod inline_block;
+#[cfg(feature = "omni-block-frontier")]
+pub(crate) use inline_block::run as run_first_pass_inline_block;
+
+/// 所有真实 firstpass 入口共享同一初始化；cell 只改变原 lexer 的入口，不建立另一份解析图。
+fn first_pass<'a, 'b>(
+    text: &'a str,
+    options: Options,
+    lookup_table: &'b LookupTable,
+    #[cfg(feature = "omni-block-frontier")] seeds: &'b [crate::math_context::TableMathSeed],
+    #[cfg(not(feature = "omni-block-frontier"))] _seeds: &'b [()],
+) -> FirstPass<'a, 'b> {
     // This is a very naive heuristic for the number of nodes
     // we'll need.
     let start_capacity = max(128, text.len() / 32);
-    let lookup_table = &create_lut(&options);
-    let first_pass = FirstPass {
+    FirstPass {
         text,
         tree: Tree::with_capacity(start_capacity),
         begin_list_item: None,
@@ -65,6 +103,10 @@ pub(crate) fn run_first_pass_with_math_seeds<'a>(
         table_math_seed_used: 0,
         #[cfg(feature = "omni-block-frontier")]
         table_math_seed_invalid: false,
+        #[cfg(feature = "omni-block-frontier")]
+        paragraph_context: None,
+        #[cfg(feature = "omni-block-frontier")]
+        paragraph_seed_error: None,
         #[cfg(all(test, feature = "omni-block-frontier"))]
         captured_tables: Vec::new(),
         #[cfg(all(test, feature = "omni-block-frontier"))]
@@ -73,8 +115,7 @@ pub(crate) fn run_first_pass_with_math_seeds<'a>(
         captured_inline_blocks: Vec::new(),
         #[cfg(all(test, feature = "omni-block-frontier"))]
         captured_leaf_blocks: Vec::new(),
-    };
-    first_pass.run()
+    }
 }
 
 /// State for the first parsing pass.
@@ -94,6 +135,10 @@ struct FirstPass<'a, 'b> {
     table_math_seed_used: usize,
     #[cfg(feature = "omni-block-frontier")]
     table_math_seed_invalid: bool,
+    #[cfg(feature = "omni-block-frontier")]
+    paragraph_context: Option<&'b crate::global_frontier::InlineParagraphContext>,
+    #[cfg(feature = "omni-block-frontier")]
+    paragraph_seed_error: Option<crate::global_frontier::GlobalFrontierError>,
     #[cfg(all(test, feature = "omni-block-frontier"))]
     captured_tables: Vec<crate::block_frontier::tests::CapturedTableSeed>,
     #[cfg(all(test, feature = "omni-block-frontier"))]
@@ -668,7 +713,10 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         let bytes = self.text.as_bytes();
         let mut ix = start_ix;
         loop {
-            let scan_mode = if self.options.contains(Options::ENABLE_TABLES) && ix == start_ix {
+            let scan_tables = self.options.contains(Options::ENABLE_TABLES) && ix == start_ix;
+            #[cfg(feature = "omni-block-frontier")]
+            let scan_tables = scan_tables && self.paragraph_context.is_none();
+            let scan_mode = if scan_tables {
                 TableParseMode::Scan
             } else {
                 TableParseMode::Disabled
@@ -697,9 +745,25 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             }
 
             ix = next_ix;
-            let mut line_start = LineStart::new(&bytes[ix..]);
-            let tree_position = scan_containers(&self.tree, &mut line_start, self.options);
-            let current_container = tree_position == self.tree.spine_len();
+            #[cfg(feature = "omni-block-frontier")]
+            if self.paragraph_context.is_some() && ix == bytes.len() {
+                if let Some(Item {
+                    start,
+                    body: ItemBody::HardBreak(true),
+                    ..
+                }) = brk
+                {
+                    if bytes[start] == b'\\' {
+                        self.tree.append_text(start, start + 1, false);
+                    }
+                } // 与原终行 is_at_eol 路径相同：未被提交为行内 break 的末尾反斜杠仍是字面文本。
+                break; // 原闭合 seed 的末端已经由 Global 证明，不把有限 frame 尾或邻块当作虚拟 EOF。
+            }
+            let Some((mut line_start, tree_position, current_container)) =
+                self.paragraph_line_start(ix, bytes.len())
+            else {
+                break;
+            };
             let trailing_backslash_pos = match brk {
                 Some(Item {
                     start,
@@ -804,10 +868,9 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         if next_line_start >= content_end {
                             break;
                         }
-                        let mut line_start = LineStart::new(&bytes[next_line_start..content_end]);
-                        if scan_containers(&self.tree, &mut line_start, self.options)
-                            != self.tree.spine_len()
-                        {
+                        let (line_start, _, current_container) =
+                            self.paragraph_line_start(next_line_start, content_end)?;
+                        if !current_container {
                             break;
                         }
                         last_line_start = next_line_start + line_start.bytes_scanned();
@@ -1963,6 +2026,19 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         current_container: bool,
         tree_position: usize,
     ) -> bool {
+        #[cfg(feature = "omni-block-frontier")]
+        if let Some(context) = self.paragraph_context {
+            // 原 Global 的最终 Paragraph/Setext Fact 已排除 table 改型；这里仍沿原非 table 中断规则。
+            // context 的角色已经真实核为 Quote/List/Item/Paragraph，不借没有祖先的局部 Tree 猜层级。
+            return scan_paragraph_interrupt_no_table(
+                bytes,
+                current_container,
+                self.options.contains(Options::ENABLE_FOOTNOTES),
+                self.options.contains(Options::ENABLE_DEFINITION_LIST),
+                context,
+                tree_position,
+            );
+        }
         if scan_paragraph_interrupt_no_table(
             bytes,
             current_container,
@@ -1979,6 +2055,32 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             self.tree.spine_len(),
             self.options,
         )
+    }
+
+    /// 原 Root Tree 与真实 scoped context 共用同一 paragraph 控制流；只替换容器事实来源。
+    fn paragraph_line_start(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Option<(LineStart<'a>, usize, bool)> {
+        let bytes = &self.text.as_bytes()[start..end];
+        #[cfg(feature = "omni-block-frontier")]
+        if let Some(context) = self.paragraph_context {
+            return match context.line_state_at(start) {
+                Ok((state, matched, depth)) => Some((
+                    LineStart::from_stream_state(bytes, state),
+                    matched,
+                    matched == depth,
+                )),
+                Err(error) => {
+                    self.paragraph_seed_error = Some(error);
+                    None // 真 context 失配拒绝整个有限 Parser，不重扫 Root 或发布部分 AST。
+                }
+            };
+        }
+        let mut line = LineStart::new(bytes);
+        let matched = scan_containers(&self.tree, &mut line, self.options);
+        Some((line, matched, matched == self.tree.spine_len()))
     }
 
     /// Extracts and parses a heading attribute block if exists.
@@ -2115,49 +2217,19 @@ fn delim_run_can_open(
     mode: TableParseMode,
     options: Options,
 ) -> bool {
-    let next_char = if let Some(c) = suffix[run_len..].chars().next() {
-        c
-    } else {
-        return false;
-    };
-    if next_char.is_whitespace() {
-        return false;
-    }
-    if ix == 0 {
-        return true;
-    }
-    if mode == TableParseMode::Active {
-        if s.as_bytes()[..ix].ends_with(b"|") && !s.as_bytes()[..ix].ends_with(br"\|") {
-            return true;
-        }
-        if next_char == '|' {
-            return false;
-        }
-    }
-    let delim = suffix.bytes().next().unwrap();
-    if delim == b'~' && run_len == 1 && options.contains(Options::ENABLE_SUBSCRIPT) {
-        // 单~下标允许H~2~O的词内起点；仍先经过原空白/表格边界，关闭选项与双~~沿原grammar。
-        return true;
-    }
-    // `*` and `~~` can be intraword, `_` and `~` cannot
-    if delim == b'*' && !is_punctuation(next_char) {
-        return true;
-    }
-    if delim == b'~' && run_len > 1 {
-        return true;
-    }
-    let prev_char = s[..ix].chars().last().unwrap();
-    if delim == b'~' && prev_char == '~' && !is_punctuation(next_char) {
-        return true;
-    }
-
-    prev_char.is_whitespace()
-        || is_punctuation(prev_char) && (delim != b'\'' || ![']', ')'].contains(&prev_char))
+    // 原 firstpass 只提取真实源邻接；分段 Root 游标与本入口共用同一 Unicode/table/flanking 内核。
+    crate::inline_emphasis::can_open(
+        s[..ix].chars().last(),
+        suffix[run_len..].chars().next(),
+        suffix.as_bytes()[0],
+        run_len,
+        mode == TableParseMode::Active,
+        s.as_bytes()[..ix].ends_with(b"|") && !s.as_bytes()[..ix].ends_with(br"\|"),
+        options,
+    )
 }
 
-/// Determines whether the delimiter run starting at given index is
-/// right-flanking, as defined by the commonmark spec (and isn't intraword
-/// for _ delims)
+/// 原关闭规则同样只在真实块边界传 None；源 frame 尾部不属于这个调用合同。
 fn delim_run_can_close(
     s: &str,
     suffix: &str,
@@ -2166,40 +2238,15 @@ fn delim_run_can_close(
     mode: TableParseMode,
     options: Options,
 ) -> bool {
-    if ix == 0 {
-        return false;
-    }
-    let prev_char = s[..ix].chars().last().unwrap();
-    if prev_char.is_whitespace() {
-        return false;
-    }
-    let next_char = if let Some(c) = suffix[run_len..].chars().next() {
-        c
-    } else {
-        return true;
-    };
-    if mode == TableParseMode::Active {
-        if s.as_bytes()[..ix].ends_with(b"|") && !s.as_bytes()[..ix].ends_with(br"\|") {
-            return false;
-        }
-        if next_char == '|' {
-            return true;
-        }
-    }
-    let delim = suffix.bytes().next().unwrap();
-    if delim == b'~' && run_len == 1 && options.contains(Options::ENABLE_SUBSCRIPT) {
-        // 旧比较基线的Subscript不限制后继字符；只放行已明确启用的单~，原逃逸/code节点不受影响。
-        return true;
-    }
-    // `*` and `~~` can be intraword, `_` and `~` cannot
-    if (delim == b'*' || (delim == b'~' && run_len > 1)) && !is_punctuation(prev_char) {
-        return true;
-    }
-    if delim == b'~' && prev_char == '~' {
-        return true;
-    }
-
-    next_char.is_whitespace() || is_punctuation(next_char)
+    crate::inline_emphasis::can_close(
+        s[..ix].chars().last(),
+        suffix[run_len..].chars().next(),
+        suffix.as_bytes()[0],
+        run_len,
+        mode == TableParseMode::Active,
+        s.as_bytes()[..ix].ends_with(b"|") && !s.as_bytes()[..ix].ends_with(br"\|"),
+        options,
+    )
 }
 
 fn create_lut(options: &Options) -> LookupTable {
@@ -2669,27 +2716,7 @@ pub(crate) fn capture_table_seeds(
 ) -> Vec<crate::block_frontier::tests::CapturedTableSeed> {
     assert!(text.len() <= 64 * 1024);
     let lookup_table = &create_lut(&options);
-    let mut pass = FirstPass {
-        text,
-        tree: Tree::with_capacity(128),
-        begin_list_item: None,
-        last_line_blank: false,
-        allocs: Allocations::new(),
-        options,
-        lookup_table,
-        math_context: MathContext::default(),
-        #[cfg(feature = "omni-block-frontier")]
-        table_math_seeds: &[],
-        table_math_seed_used: 0,
-        table_math_seed_invalid: false,
-        captured_tables: Vec::new(),
-        #[cfg(all(test, feature = "omni-block-frontier"))]
-        captured_math_rows: Vec::new(),
-        #[cfg(all(test, feature = "omni-block-frontier"))]
-        captured_inline_blocks: Vec::new(),
-        #[cfg(all(test, feature = "omni-block-frontier"))]
-        captured_leaf_blocks: Vec::new(),
-    };
+    let mut pass = first_pass(text, options, lookup_table, &[]);
     let mut ix = 0;
     while ix < text.len() {
         ix = pass.parse_block(ix);
@@ -2702,24 +2729,7 @@ pub(crate) fn capture_table_seeds(
 pub(crate) fn capture_math_rows(text: &str, options: Options) -> Vec<(usize, MathContext)> {
     assert!(text.len() <= 64 * 1024);
     let lookup_table = &create_lut(&options);
-    let mut pass = FirstPass {
-        text,
-        tree: Tree::with_capacity(128),
-        begin_list_item: None,
-        last_line_blank: false,
-        allocs: Allocations::new(),
-        options,
-        lookup_table,
-        math_context: MathContext::default(),
-        table_math_seeds: &[],
-        table_math_seed_used: 0,
-        table_math_seed_invalid: false,
-        captured_tables: Vec::new(),
-        captured_math_rows: Vec::new(),
-        #[cfg(all(test, feature = "omni-block-frontier"))]
-        captured_inline_blocks: Vec::new(),
-        captured_leaf_blocks: Vec::new(),
-    };
+    let mut pass = first_pass(text, options, lookup_table, &[]);
     let mut ix = 0;
     while ix < text.len() {
         ix = pass.parse_block(ix);
@@ -2738,23 +2748,7 @@ pub(crate) fn capture_closed_inline_blocks(
     Range<usize>,
 )> {
     let lookup_table = &create_lut(&options);
-    let mut pass = FirstPass {
-        text,
-        tree: Tree::with_capacity(128),
-        begin_list_item: None,
-        last_line_blank: false,
-        allocs: Allocations::new(),
-        options,
-        lookup_table,
-        math_context: MathContext::default(),
-        table_math_seeds: &[],
-        table_math_seed_used: 0,
-        table_math_seed_invalid: false,
-        captured_tables: Vec::new(),
-        captured_math_rows: Vec::new(),
-        captured_inline_blocks: Vec::new(),
-        captured_leaf_blocks: Vec::new(),
-    };
+    let mut pass = first_pass(text, options, lookup_table, &[]);
     let mut ix = 0;
     while ix < text.len() {
         ix = pass.parse_block(ix);
@@ -2769,23 +2763,7 @@ pub(crate) fn capture_closed_leaf_blocks(
     options: Options,
 ) -> Vec<(crate::global_frontier::LeafBlockKind, Range<usize>, usize)> {
     let lookup_table = &create_lut(&options);
-    let mut pass = FirstPass {
-        text,
-        tree: Tree::with_capacity(128),
-        begin_list_item: None,
-        last_line_blank: false,
-        allocs: Allocations::new(),
-        options,
-        lookup_table,
-        math_context: MathContext::default(),
-        table_math_seeds: &[],
-        table_math_seed_used: 0,
-        table_math_seed_invalid: false,
-        captured_tables: Vec::new(),
-        captured_math_rows: Vec::new(),
-        captured_inline_blocks: Vec::new(),
-        captured_leaf_blocks: Vec::new(),
-    };
+    let mut pass = first_pass(text, options, lookup_table, &[]);
     let mut ix = 0;
     while ix < text.len() {
         ix = pass.parse_block(ix);

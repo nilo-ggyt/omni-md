@@ -171,6 +171,16 @@ impl BoundaryIndex {
         }
         result
     }
+
+    /// 借原分页owner给出的已初始化追加区间；字素层不复制页，也不推测页中坐标。
+    pub(super) fn append_page_records(&mut self) -> Result<Option<std::ops::Range<usize>>> {
+        match &mut self.inner {
+            Representation::Paged(inner) => inner.append_page_records().map_err(Into::into),
+            #[cfg(feature = "paged-shaping-frontier")]
+            Representation::DensePrintableAscii(_) => Ok(None), // 密集证明没有物理追加页。
+        }
+    }
+
     /// 顺序导出至多256条原边界；Dense计算整数不读页，Paged只访问真实固定记录。
     #[cfg(feature = "paged-line-compose")]
     pub(super) fn read_batch(

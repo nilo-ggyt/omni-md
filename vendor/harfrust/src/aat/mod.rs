@@ -13,11 +13,11 @@ use crate::aat::morx::{MorphSubtableCache, MorphSubtableDescriptor};
 use crate::ot::OtCache;
 use alloc::vec::Vec;
 use read_fonts::{
-    TableProvider,
     tables::{
         ankr::Ankr, feat::Feat, kern::Kern, kerx::Kerx, ltag::Ltag, mort::Mort, morx::Morx,
         trak::Trak,
     },
+    TableProvider,
 };
 
 #[derive(Default)]

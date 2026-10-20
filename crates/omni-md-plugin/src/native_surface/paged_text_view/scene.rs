@@ -5,6 +5,7 @@ use std::{
     rc::{Rc, Weak},
 };
 
+use objc2::rc::Retained;
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::CGContext;
 
@@ -64,6 +65,10 @@ pub struct NativeMarkdownPagedSceneRequest {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NativeMarkdownPagedVirtualViewport {
     pub document_origin: NSPoint,
+    /// 同次Native转换证明的lane零滚动X；与实际可见origin分列，不能把ruler/inset当水平滚动。
+    pub layout_origin_x: f64,
+    /// 完整clip inset lane的实际宽度；有限Body在文档边缘缩窄不改变原换行宽。
+    pub layout_width: f64,
     pub scroll_epoch: u64,
 }
 
@@ -85,6 +90,8 @@ impl NativeMarkdownPagedSceneRequest {
 #[derive(Clone)]
 pub struct NativeMarkdownPagedSceneKey {
     pub request: NativeMarkdownPagedSceneRequest,
+    /// 同一空样式正文在 Source 与 Preview 使用不同真实行槽；模式属于本次几何身份，不能从styles猜测。
+    pub presentation_mode: omni_markdown_core::MarkdownPresentationMode,
     pub source: MarkdownLayoutTextAuthority,
     pub nonce: NativeMarkdownPagedSceneAuthority,
 }
@@ -92,6 +99,7 @@ impl NativeMarkdownPagedSceneKey {
     #[must_use]
     pub fn same(&self, other: &Self) -> bool {
         self.request.same(&other.request)
+            && self.presentation_mode == other.presentation_mode
             && self.source == other.source
             && self.nonce.same(&other.nonce)
     }
@@ -125,13 +133,52 @@ pub enum NativeMarkdownPagedNavigation {
     SelectParagraph,
 }
 
+/// Word 的逻辑方向与屏幕方向跨异步队列仍保持原 selector 含义；不能提前压成同一个布尔值。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeMarkdownPagedWordMotion {
+    Backward,
+    Forward,
+    Left,
+    Right,
+}
+
+impl NativeMarkdownPagedWordMotion {
+    /// 只有逻辑动作直接给出 Source 前后方向；视觉动作必须由真实布局或完整零级证明解释。
+    pub(crate) fn logical_forward(self) -> Option<bool> {
+        match self {
+            Self::Backward => Some(false),
+            Self::Forward => Some(true),
+            Self::Left | Self::Right => None,
+        }
+    }
+
+    /// 屏幕方向只属于 Left/Right；不得从 RTL 段的逻辑前后反推原系统动作。
+    pub(crate) fn visual_right(self) -> Option<bool> {
+        match self {
+            Self::Left => Some(false),
+            Self::Right => Some(true),
+            Self::Backward | Self::Forward => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// 扩选只保原指针的逻辑锚点；词组拖动保首击真实GCB及点击侧，不保事件或正文。
 pub enum NativeMarkdownPagedWordAnchor {
     Selection(usize),
+    /// 仅首组尚未 Ready 时使用真实首击位置；同一原查询完成后必须由 Group 替换。
     Word {
         head_utf16: usize,
         backward_bias: bool,
+        /// 首击若属于表格，查询仍须重获同原行列的真实格 Source，不能把 canonical head 交正文 UBA。
+        cell: Option<super::NativeMarkdownPagedCellWordTarget>,
+    },
+    /// 原 Core 已完成的首击组；后继拖选与跨提交保两端，不重新在新显示中扩种子。
+    Group {
+        from_utf16: usize,
+        to_utf16: usize,
+        /// 首击实际命中只决定同组往返方向，不再参与词组范围查询；跨提交也须同趟真实映射。
+        origin_utf16: usize,
     },
 }
 
@@ -141,6 +188,8 @@ pub struct NativeMarkdownPagedWordSelection {
     pub head_utf16: usize,
     pub backward_bias: bool,
     pub anchor: Option<NativeMarkdownPagedWordAnchor>,
+    /// 仅最新目标的真实格查询意图；已 Ready 的首组不保 Source，原首查询则另保自己的 cell 域。
+    pub cell: Option<super::NativeMarkdownPagedCellWordTarget>,
 }
 
 impl NativeMarkdownPagedNavigation {
@@ -239,6 +288,69 @@ pub enum NativeMarkdownPagedCellAction {
     Cancel,
 }
 
+#[derive(Clone)]
+/// 当前真实格的命中事实；原row/raw票仍管理来源，内容框来自同次实测行而非分页后缀高度。
+/// 不持Source正文、Doc、Native view或系统事件，延后激活仍须由唯一Body核同一次请求。
+pub struct NativeMarkdownPagedCellHit {
+    pub row: omni_markdown_core::VerifiedMarkdownLayoutTableRow,
+    pub source: omni_markdown_core::markdown_document_buffer::VerifiedMarkdownTableCellSource,
+    pub content_frame: NSRect,
+    pub head_utf16: usize,
+    pub head_affinity: NativeMarkdownPagedHeadAffinity,
+    pub backward_bias: bool,
+    /// 只由同一次 Grid 词命中填写；普通 caret/Tab 不伪装成已经取得词查询来源。
+    pub word_target: Option<super::NativeMarkdownPagedCellWordTarget>,
+}
+
+#[derive(Clone)]
+/// 一次已解释的格指针意图；手势弱票只说明原Down尚未Up，不使异步Ready复活拖选。
+/// Shift与双击种子各保原有向来源；它们都不是可重播NSEvent或另一份选择缓存。
+pub struct NativeMarkdownPagedCellPointer {
+    pub hit: NativeMarkdownPagedCellHit,
+    pub clicks: usize,
+    pub extending: bool,
+    pub anchor: Option<usize>,
+    pub word_anchor: Option<NativeMarkdownPagedWordAnchor>,
+    pub dragging: bool,
+    pub intent: Weak<()>,
+}
+
+#[derive(Clone, Copy)]
+/// 子格原Down确定的局部选择种子；词组不降为caret，Shift仍保原有向anchor。
+pub enum NativeMarkdownPagedCellDragAnchor {
+    Caret { anchor_utf16: usize },
+    Word(NativeMarkdownPagedWordAnchor),
+}
+
+#[derive(Clone)]
+/// 当前原生手势已经解码的一个有限终点；窗口点留待原 Scene Ready 后转换。
+/// mouse_up 只由仍拥有原 Down 的实际 Up 入口设置。接纳后的终点可完成，不能重新授予拖动寿命。
+/// 不保存 NSEvent、视图、正文或第二张输入票；原输入域、代次与几何仍属于同次 request。
+pub struct NativeMarkdownPagedPointerLocation {
+    pub window_point: NSPoint,
+    pub clicks: usize,
+    pub extending: bool,
+    pub anchor: Option<NativeMarkdownPagedCellDragAnchor>,
+    pub dragging: bool,
+    pub intent: Weak<()>,
+    pub mouse_up: bool,
+}
+
+#[derive(Clone)]
+/// 活动格跨向正文的真实选择动作；词拖选保原种子，普通选择保真实有向端点与换行侧。
+/// 唯一父Body先完成草稿发布，再沿同次实际变更映射它，不能让旧Scene直接改canonical。
+pub enum NativeMarkdownPagedCellExtension {
+    Selection {
+        selection: MarkdownTextSelection,
+        head_affinity: NativeMarkdownPagedHeadAffinity,
+        intent: Weak<()>,
+    },
+    Word {
+        selection: NativeMarkdownPagedWordSelection,
+        intent: Weak<()>,
+    },
+}
+
 pub struct NativeMarkdownPagedEditPlan {
     pub replacement: NSRange,
     /// 仅本次新增文字；不得把原全文或离屏段落复制进plan。
@@ -256,6 +368,19 @@ pub struct NativeMarkdownPagedCharacterRect {
 /// 选择和装饰合同；成功不是“有缓存”，也不允许空image冒充非空正文。
 pub trait NativeMarkdownPagedTextScene {
     fn key(&self) -> &NativeMarkdownPagedSceneKey;
+
+    /// 命中只读取本次已封存的可见LINK part和原GCB，不在mousedown同步解析或打开URL。
+    fn link_hit(&self, _local: NSPoint) -> Result<Option<(std::ops::Range<usize>, usize)>> {
+        Ok(None)
+    }
+    /// mouseup接纳原手势的弱权限；成功表示唯一正文owner接管意图，目标仍须由真实来源准备。
+    fn follow_link(&self, _index: usize, _intent: Weak<()>) -> Result<()> {
+        Err(super::NativeMarkdownPagedTextViewError::UnsupportedCommand)
+    }
+    /// 仅真实链接producer可在当前命中位置给出已解析目标；普通Source/Cell不从可见文字猜URL。
+    fn link_target(&self, _local: NSPoint) -> Result<Option<String>> {
+        Ok(None)
+    }
     /// 原完整CPU帧已提交且真实计数增长后的单次通知；不另授Source或Native可见权限。
     /// 实现者只排持弱身份的后继通知，归还当前绘图栈后仍须核原key和实际发布计数。
     fn cpu_frame_published(&self, _paints: usize) {
@@ -266,8 +391,31 @@ pub trait NativeMarkdownPagedTextScene {
     fn validate_ready(&self, current: &dyn Fn() -> bool) -> Result<()>;
     fn first_rect(&self, range: NSRange) -> Result<NativeMarkdownPagedCharacterRect>;
     fn hit(&self, local: NSPoint) -> Result<usize>;
+    /// 连续拖选可越出物理视口；仅真实窗口owner能投到已封存的最近可见行，原物理点不变。
+    fn drag_selection_point(&self, local: NSPoint) -> Result<NSPoint> {
+        Ok(local)
+    }
     /// 双击必须消费原字形命中及真实点击侧；单个source整数不足以判断词边界的哪一组。
-    fn word_hit(&self, _local: NSPoint) -> Result<(usize, bool)> {
+    fn word_hit(
+        &self,
+        _local: NSPoint,
+    ) -> Result<(
+        usize,
+        bool,
+        Option<super::NativeMarkdownPagedCellWordTarget>,
+    )> {
+        Err(super::NativeMarkdownPagedTextViewError::UnsupportedCommand)
+    }
+    /// 只把本次真实Grid命中交原活动格owner；word仅要求真实字形点击侧，不在此选择词范围。
+    fn cell_hit(&self, _local: NSPoint, _word: bool) -> Result<Option<NativeMarkdownPagedCellHit>> {
+        Ok(None)
+    }
+    /// 三击与菜单段落选择消费原Source已认证的段落范围，不以显示换行或空格猜一个段落。
+    fn paragraph_selection(
+        &self,
+        _position: usize,
+        _affinity: NativeMarkdownPagedHeadAffinity,
+    ) -> Result<MarkdownTextSelection> {
         Err(super::NativeMarkdownPagedTextViewError::UnsupportedCommand)
     }
     fn mouse_selection(
@@ -276,7 +424,7 @@ pub trait NativeMarkdownPagedTextScene {
         clicks: usize,
         anchor: Option<usize>,
         extend: bool,
-    ) -> Result<MarkdownTextSelection>;
+    ) -> Result<(MarkdownTextSelection, NativeMarkdownPagedHeadAffinity)>;
     /// 尚无实际排版坐标producer时保持Pending；Ready绘图本身不授权导航。
     fn navigation_geometry(&self) -> Result<NativeMarkdownPagedNavigationGeometry> {
         Err(super::NativeMarkdownPagedTextViewError::Pending)
@@ -303,18 +451,47 @@ pub trait NativeMarkdownPagedTextScene {
 /// composition root实现弱委托。current可重入，所以View调用前后都结束借用并复核原状态。
 /// ready_scene只查已发布scene；尚未Ready必须Pending，不保存或重放本次Native事件。
 pub trait NativeMarkdownPagedTextViewDelegate {
+    /// 父正文有真实活动格时，右键编辑动作仍归那个客户；普通正文不创建替代输入视图。
+    fn context_menu_client(
+        &self,
+    ) -> Result<Option<Rc<Retained<super::NativeMarkdownPagedTextView>>>> {
+        Ok(None)
+    }
     fn current(&self, epoch: u64) -> bool;
-    fn virtual_viewport(&self, epoch: u64) -> Result<NativeMarkdownPagedVirtualViewport>;
+    /// bounds_width是本次真实有限正文宽；无滚动owner的独立组件直接消费此输入，不填默认宽。
+    fn virtual_viewport(
+        &self,
+        epoch: u64,
+        bounds_width: f64,
+    ) -> Result<NativeMarkdownPagedVirtualViewport>;
     fn ready_scene(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
     ) -> Result<Rc<dyn NativeMarkdownPagedTextScene>>;
     fn scene_current(&self, key: &NativeMarkdownPagedSceneKey) -> bool;
+    /// 真实scrollWheel先撤旧模式位置，再沿原NSView responder链滚动；独立场景没有模式票可撤。
+    fn user_scroll(&self, _epoch: u64) -> Result<()> {
+        Ok(())
+    }
+    /// 同一真实Down越过视口后，原滚动owner按窗口终点移动有限距离；不读取或改写正文。
+    fn drag_autoscroll(
+        &self,
+        _request: &NativeMarkdownPagedSceneRequest,
+        _point: NSPoint,
+        _intent: &Weak<()>,
+    ) -> Result<bool> {
+        Ok(false) // 无滚动owner的独立客户没有可滚动图，不借父responder猜目标。
+    }
     /// 这里只通知已有coalesced调度入口；不允许在输入回调内整段排版或静默替换canonical。
     fn committed(&self, commit: &NativeMarkdownPagedInputCommit) -> Result<()>;
     /// 文档头尾已提交后，只接收这张原收据的显示意图；实际Source绑定和滚动由唯一正文
     /// producer继续。接收成功不是Ready，也不能让调用方重放已经发生的选择提交。
     fn reveal_committed_selection(&self, commit: &NativeMarkdownPagedInputCommit) -> Result<()>;
+    /// 插表事务已发布，真实预览 Body 可接首格激活；独立 Source 客户保留上方原 caret reveal。
+    /// 原收据只借本栈，不能保住旧 Scene、重新插表或从较新的选择创建另一张激活票。
+    fn activate_inserted_table(&self, _commit: &NativeMarkdownPagedInputCommit) -> Result<()> {
+        Ok(()) // 不拥有表格编辑图的原 Source/独立消费者没有需要挂载的 Cell。
+    }
     /// 正文owner可接纳一次真实垂直目标并延后排版；true仅表示已接纳，不表示选择已移动。
     /// 其他客户继续原Scene同步导航，不创建备用正文或把未准备结果当Ready。
     fn navigate_vertical(
@@ -345,11 +522,11 @@ pub trait NativeMarkdownPagedTextViewDelegate {
     ) -> Result<bool> {
         Ok(false)
     }
-    /// 原全源UniformZero准备完成后才执行标准Word移动；Pending不等于已改变选择。
+    /// 保留系统的逻辑/视觉 Word 意图，是否需要布局由原 Body 的实际消费者决定。
     fn move_word(
         &self,
         _request: &NativeMarkdownPagedSceneRequest,
-        _forward: bool,
+        _motion: NativeMarkdownPagedWordMotion,
         _extend: bool,
         _permit: crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
     ) -> Result<()> {
@@ -360,9 +537,109 @@ pub trait NativeMarkdownPagedTextViewDelegate {
         &self,
         _request: &NativeMarkdownPagedSceneRequest,
         _selection: NativeMarkdownPagedWordSelection,
+        _gesture: Option<Weak<()>>,
         _permit: crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
     ) -> Result<()> {
         Err(super::NativeMarkdownPagedTextViewError::UnsupportedCommand)
+    }
+    /// key尚未解释时保原event，marked回调仍同步；false表示既有直接键盘路径。
+    fn defer_key_down(
+        &self,
+        _event: &objc2_app_kit::NSEvent,
+        _permit: &crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    /// 仅公开菜单在真实屏障后排队；不捕新Source或建立默认事件图。
+    fn has_native_input_barrier(&self) -> bool {
+        false
+    }
+    /// Paste携带动作到达时已捕获的有限新文字，其余只保原typed selector。
+    fn defer_native_command(
+        &self,
+        _selector: objc2::runtime::Sel,
+        _permit: &crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    /// 文件路径与原鼠标命中只进入现存输入队列；None锚点表示等前一步真实选择后粘贴。
+    /// drop的二元组为原canonical generation及真实Scene命中的UTF-16位置，不代表后继文稿坐标。
+    fn defer_attachments(
+        &self,
+        _paths: Vec<std::path::PathBuf>,
+        _drop: Option<(u64, usize)>,
+        _permit: &crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    /// URL/批次在入队前拒绝也须等原链结束显示；true仅表示原owner接住了这一条有限业务反馈。
+    fn defer_attachment_rejection(&self, _message: &str) -> bool {
+        false
+    }
+    /// 原格式动作可排在已接纳导航之后；没有屏障的客户继续原同步事务。
+    fn defer_format(
+        &self,
+        _action: omni_markdown_core::MarkdownFormatAction,
+        _permit: &crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    /// 插表保领域语义，不提前在旧caret生成/插入Markdown文本。
+    fn defer_table_insertion(
+        &self,
+        _permit: &crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    /// 原折叠菜单和行号意图可排在未完成导航之后；队首才解析真实当前段落。
+    fn defer_source_fold(
+        &self,
+        _action: super::NativeMarkdownPagedSourceFoldAction,
+        _permit: &crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    /// 只有当前解释回调的原before与这张Rc收据能交接后继事件权限。
+    fn begin_interpreted_commit(
+        &self,
+        _before: NativeMarkdownPagedInputState,
+        _commit: Rc<NativeMarkdownPagedInputCommit>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    /// 前一步已接纳同张收据，通知后只完成原显示/permit交接，不读取后继状态补签。
+    fn finish_interpreted_commit(
+        &self,
+        _commit: &NativeMarkdownPagedInputCommit,
+        _reveal: bool,
+    ) -> Result<()> {
+        Err(super::NativeMarkdownPagedTextViewError::Revoked)
+    }
+    /// 文档端点在原Word/Visual链后解释；true只表示接纳，不代表选择已移动或EOF可见。
+    fn defer_document_motion(
+        &self,
+        _end: bool,
+        _extend: bool,
+        _permit: &crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false) // 没有输入链的客户保留原同步端点合同，不建立备用事件队列。
+    }
+    /// 只保已有Body语义命令的到达顺序；真正续行/缩进必须消费前一步收据后的原Core事务。
+    fn defer_source_command(
+        &self,
+        _command: omni_markdown_core::MarkdownEditingCommand,
+        _permit: &crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false) // 没有原输入链的客户仍同步处理，Cell不借该入口伪造表格导航。
+    }
+    /// 原移动仍在逐量子准备时，普通退格/前删必须排在它后面；false保既有同步路径。
+    /// 接纳只记录方向，实际完整GCB和原标记命令须由前一步真实提交后的同一个Source决定。
+    fn defer_grapheme_delete(
+        &self,
+        _forward: bool,
+        _permit: &crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false) // 不拥有在途输入链的客户不创建备用队列或改写原删除语义。
     }
     /// Body已有词组删除在途时，可接纳随后普通输入；载荷只同步借用，false保原直接输入。
     /// 接纳者必须复制本次有限新增载荷且保序，不能保留Native对象或凭旧permit稍后重放。
@@ -376,6 +653,55 @@ pub trait NativeMarkdownPagedTextViewDelegate {
     /// 裸Page是纯滚动；Source owner等待真实下一页高度再调用系统动作，不提交文本选择。
     fn scroll_page(&self, _request: &NativeMarkdownPagedSceneRequest, _down: bool) -> Result<()> {
         Err(super::NativeMarkdownPagedTextViewError::UnsupportedCommand)
+    }
+    /// 组合中的实际子格先同步消费这一个真实鼠标事件；不存事件，也不在父view移焦后补交。
+    fn handle_cell_marked_mouse(&self, _event: &objc2_app_kit::NSEvent) -> Result<bool> {
+        Ok(false)
+    }
+    /// 真实child越界Drag只在本同步栈借原事件；父Body从自己当前Scene命中目标，不重播mouse方法。
+    fn drag_cell_pointer_outside(
+        &self,
+        _request: &NativeMarkdownPagedSceneRequest,
+        _pointer: NativeMarkdownPagedPointerLocation,
+        _permit: crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    /// 跨出活动格的选择沿原父子提交边界；true已接管，调用方不得再消费旧Scene修改正文。
+    fn extend_cell_pointer(
+        &self,
+        _request: &NativeMarkdownPagedSceneRequest,
+        _extension: NativeMarkdownPagedCellExtension,
+        _permit: crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    /// 真实父Body可接纳当前格指针，true才停止普通正文选择；其它实际客户保原Source行为。
+    fn cell_pointer(
+        &self,
+        _request: &NativeMarkdownPagedSceneRequest,
+        _pointer: NativeMarkdownPagedCellPointer,
+        _permit: crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    /// Scene 尚在准备时只接同一个 Caret 手势的最新真实窗口终点；false 明确表示没有接纳。
+    /// 真实 Up 的准入必须在原 View 撤 Down 票之前完成，之后不以 Weak 活性猜测终点或取消。
+    fn defer_pointer(
+        &self,
+        _request: &NativeMarkdownPagedSceneRequest,
+        _pointer: NativeMarkdownPagedPointerLocation,
+        _permit: crate::native_surface::paged_input::NativeMarkdownPagedInputPermit,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    /// 新 Down、键盘、命令与关闭撤销旧的已接纳终点；纯撤权不申请新 Scene，也不撤其它 Cell 导航。
+    fn cancel_deferred_pointer(&self) -> bool {
+        false
+    }
+    /// 原Up只结束已存在的手势；即使Scene正在准备也不得重新打开格或补发Down。
+    fn finish_cell_pointer(&self, _request: &NativeMarkdownPagedSceneRequest) -> Result<()> {
+        Ok(())
     }
     /// Cell候选尚未接原RequiredRow/BorrowedEditor控制器时必须Pending，不退回插入Tab/换行或发布正文。
     fn cell_action(

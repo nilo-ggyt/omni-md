@@ -3,6 +3,7 @@
 
 //! 全局活动容器spine的持久分页；不能为每个push/pop复制整段祖先前缀。
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -12,9 +13,11 @@ use crate::block_context::ContainerSpine;
 
 /// 每次写时复制最多一页的32项；祖先页只共享Arc，不按depth复制。
 const PAGE_ENTRIES: usize = 32;
-/// 固定page-pointer栈最多512槽，64bit target上为4KiB；遍历不递归，也不临时分配。
+/// page-pointer目录最多512槽，按两个实际2KiB片段延迟取得；遍历不递归。
 pub(crate) const MAX_STRUCTURAL_DEPTH: usize = 16_384;
 const MAX_SPINE_PAGES: usize = MAX_STRUCTURAL_DEPTH / PAGE_ENTRIES;
+const CURSOR_DIRECTORY_SLOTS: usize = MAX_SPINE_PAGES / 2;
+type CursorDirectory = [Option<Arc<SpinePage>>; CURSOR_DIRECTORY_SLOTS];
 /// 所有checkpoint仍活的页payload合计最多4MiB，Arc/allocator开销不在此逻辑计量中。
 pub(crate) const MAX_SPINE_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -25,7 +28,9 @@ pub(crate) enum StructuralKind {
     List { marker: u8, tight: bool },
     Item { indent: usize },
     Definition { indent: usize },
-    Footnote,
+    // 普通 ContainerRole 只证明续行的四列规则，不能推造首行 label 的结束位置。
+    // 实际 producer 完成 label/colon/AllSpace 后才填写 body_start；NonZero 保持原页项宽度。
+    Footnote { body_start: Option<NonZeroUsize> },
     Paragraph,
     Table,
     Other,
@@ -43,7 +48,7 @@ impl StructuralEntry {
             ContainerRole::Quote => StructuralKind::Quote,
             ContainerRole::Item(indent) => StructuralKind::Item { indent },
             ContainerRole::Definition(indent) => StructuralKind::Definition { indent },
-            ContainerRole::Footnote => StructuralKind::Footnote,
+            ContainerRole::Footnote => StructuralKind::Footnote { body_start: None },
             ContainerRole::Other => StructuralKind::Other,
         };
         Self { kind, source_start }
@@ -54,7 +59,7 @@ impl StructuralEntry {
             StructuralKind::Quote => ContainerRole::Quote,
             StructuralKind::Item { indent } => ContainerRole::Item(indent),
             StructuralKind::Definition { indent } => ContainerRole::Definition(indent),
-            StructuralKind::Footnote => ContainerRole::Footnote,
+            StructuralKind::Footnote { .. } => ContainerRole::Footnote,
             _ => ContainerRole::Other,
         }
     }
@@ -90,7 +95,7 @@ struct SpineBudget {
 }
 
 /// 页的计量按实际项目payload类型大小；不宣称等于allocator/Arc内部头或整进程内存。
-/// allocator overhead和调用者保存checkpoint handle的容器另归整产品100MB门槛。
+/// allocator overhead和调用者保存checkpoint handle的容器另归实际整产品内存验收。
 const PAGE_PAYLOAD_BYTES: usize = std::mem::size_of::<SpinePage>();
 
 impl SpineBudget {
@@ -204,6 +209,15 @@ impl std::fmt::Debug for StructuralSpineSnapshot {
 }
 
 impl StructuralSpineSnapshot {
+    /// 同一前沿回放源前缀时从空根开始；旧恢复点与新页继续共享原库存及不可退还的工作量。
+    pub(crate) fn empty_shared(&self) -> Self {
+        Self {
+            tail: None,
+            len: 0,
+            budget: Arc::clone(&self.budget),
+        }
+    }
+
     /// 空spine本身不分配页；所有页的reserve发生在真正push之前。
     pub(crate) fn new(limits: StructuralSpineLimits) -> Result<Self, StructuralSpineError> {
         if limits.max_depth > MAX_STRUCTURAL_DEPTH
@@ -256,6 +270,15 @@ impl StructuralSpineSnapshot {
             page = current.parent.as_deref();
         }
         None
+    }
+
+    /// 真实单层 Root 只需一页一项；沿同一角色账本收费，不为此初始化通用深树游标的4KiB槽。
+    pub(crate) fn sole_entry(&self) -> Result<Option<StructuralEntry>, StructuralSpineError> {
+        if self.len != 1 {
+            return Ok(None);
+        }
+        self.budget.work(2)?;
+        Ok(self.tail.as_ref().and_then(|page| page.entries[0]))
     }
 
     /// push至多复制32项；唯一页可原位写，不为没有checkpoint的普通解析创建无用版本。
@@ -401,9 +424,9 @@ impl StructuralSpineSnapshot {
     }
 }
 
-/// 单个活动prefix续体的固定page-pointer工作区；不是checkpoint，也不随source长度分配。
+/// 单个活动prefix续体最多持有两片page-pointer目录；空scope不分配目录，也不保存源正文。
 pub(crate) struct StructuralSpineCursor {
-    pages: [Option<Arc<SpinePage>>; MAX_SPINE_PAGES],
+    pages: [Option<Box<CursorDirectory>>; 2],
     building: Option<Arc<SpinePage>>,
     count: usize,
     emitted: usize,
@@ -421,10 +444,10 @@ pub(crate) enum StructuralCursorStep {
 }
 
 impl StructuralSpineSnapshot {
-    /// 构造只初始化固定4KiB槽，不遍历深度；每个祖先Arc在后续cursor step中单独收费。
+    /// 构造只持原tail和两个空槽；目录随真实page重建分片取得，祖先Arc仍逐步收费。
     pub(crate) fn cursor(&self) -> StructuralSpineCursor {
         StructuralSpineCursor {
-            pages: std::array::from_fn(|_| None),
+            pages: [None, None],
             building: self.tail.clone(),
             count: 0,
             emitted: 0,
@@ -435,12 +458,22 @@ impl StructuralSpineSnapshot {
 }
 
 impl StructuralSpineCursor {
+    /// 仅报告本cursor实际取得的目录payload；外层引用事务据此计入同一批次库存。
+    pub(crate) fn allocated_workspace_bytes(&self) -> usize {
+        self.pages.iter().filter(|page| page.is_some()).count()
+            * std::mem::size_of::<CursorDirectory>()
+    }
+
     /// 一次只移交一页或一个role；外层决定本step剩余transition是否足够，不藏整depth循环。
     pub(crate) fn next(&mut self) -> Result<StructuralCursorStep, StructuralSpineError> {
         if let Some(page) = self.building.as_ref() {
             self.budget.work(1)?;
             let next = page.parent.clone();
-            self.pages[self.count] = self.building.take();
+            let directory = self.count / CURSOR_DIRECTORY_SLOTS;
+            // 一次真实page交接至多新建一片2KiB目录，不在小请求owner里预埋整个4KiB数组。
+            let slots = self.pages[directory]
+                .get_or_insert_with(|| Box::new(std::array::from_fn(|_| None)));
+            slots[self.count % CURSOR_DIRECTORY_SLOTS] = self.building.take();
             self.count += 1;
             self.building = next;
             return Ok(StructuralCursorStep::Building);
@@ -452,7 +485,9 @@ impl StructuralSpineCursor {
         let index = self.emitted;
         // 页base固定为32的倍数；只对已经按root-first建立的page槽取值，不重复爬parent。
         let page_index = self.count - 1 - index / PAGE_ENTRIES;
-        let page = self.pages[page_index]
+        let page = self.pages[page_index / CURSOR_DIRECTORY_SLOTS]
+            .as_ref()
+            .expect("完整cursor已经取得真实目录片")[page_index % CURSOR_DIRECTORY_SLOTS]
             .as_ref()
             .expect("完整cursor已经建立全部page槽");
         let entry = page.entries[index - page.base].expect("有效长度内有真实entry");

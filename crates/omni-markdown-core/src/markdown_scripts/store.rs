@@ -42,6 +42,35 @@ fn get(record: &[u8], field: usize) -> Result<usize> {
     usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| Error::CoordinateOverflow)
 }
 impl Store {
+    /// 表格本体没有 SCX run；此覆盖游标仅承认原物理硬边界，不能给被跳正文补 Common。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(super) fn skip_table(
+        &mut self,
+        span: crate::markdown_layout_source::table_rows::TableSpan,
+    ) -> Result<()> {
+        self.cancellation.check()?;
+        if self.end_byte < span.start.byte || self.end_byte > span.end.byte {
+            return Err(Error::CorruptMetadata);
+        }
+        self.end_byte = span.end.byte;
+        self.end_utf16 = span.end.utf16;
+        Ok(())
+    }
+    /// 同一折叠 proof 只转移覆盖游标；隐藏 body 没有 Script 值，也不制造 Unknown/空 run 填洞。
+    #[cfg(feature = "paged-line-compose")]
+    pub(super) fn skip_fold(
+        &mut self,
+        span: &crate::markdown_layout_source::folds::FoldSpan,
+    ) -> Result<()> {
+        self.cancellation.check()?;
+        if self.end_byte != span.header_end.byte || self.end_utf16 != span.header_end.utf16 {
+            return Err(Error::CorruptMetadata);
+        }
+        self.end_byte = span.end.byte;
+        self.end_utf16 = span.end.utf16;
+        Ok(())
+    }
+
     pub(super) fn new(cancellation: &Cancellation) -> Result<Self> {
         cancellation.check()?;
         let runs = PagedLayoutIndex::new()?;

@@ -5,9 +5,9 @@ use smallvec::SmallVec;
 use crate::aat::map::AatMap;
 use crate::ot::shaper::OtShaper;
 
-use crate::LayoutData;
 use crate::ot::map::*;
-use crate::{Direction, Feature, Language, Mask, Script, ShapePlanner, ShaperFont, font::Font};
+use crate::LayoutData;
+use crate::{font::Font, Direction, Feature, Language, Mask, Script, ShapePlanner, ShaperFont};
 
 mod ascii_frontier;
 mod simple_gcb_frontier;
@@ -17,8 +17,8 @@ pub use ascii_frontier::{
     AsciiPositionedAdvance, AsciiPositionedAdvanceJob,
 };
 pub use simple_gcb_frontier::{
-    SimpleGcbFrontierCapability, SimpleGcbFrontierJob, simple_gcb_nominal,
-    simple_gcb_output_is_base,
+    simple_gcb_nominal, simple_gcb_output_is_base, SimpleGcbFrontierCapability,
+    SimpleGcbFrontierJob,
 };
 
 /// A reusable plan for shaping with one set of segment properties.

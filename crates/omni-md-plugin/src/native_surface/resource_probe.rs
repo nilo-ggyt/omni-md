@@ -1,166 +1,72 @@
-//! 实际产品 surface 的具名资源场景；由共享 AppKit 驱动分事件执行，不作物理输入声明。
+//! 真实 Host 已挂载笔记上的九项资源场景；这里只观察原组合根，不实现替代 Host 或生命周期。
 
 use super::*;
+use crate::native_surface::paged_body::NativeMarkdownPagedBody;
+use crate::native_surface::paged_text_view::{
+    NativeMarkdownPagedTextView, NativeMarkdownPagedTextViewDelegate,
+};
+use core_foundation::runloop::{CFRunLoop, kCFRunLoopDefaultMode};
 use objc2_app_kit::NSWindow;
-use omni_plugin_sdk::{PluginCloseIntent, PluginError};
+use omni_plugin_sdk::PluginCloseIntent;
+use std::io::{Read, Seek, Write};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-/// 每个场景独立激活/关闭，不借用上一场景的窗口、controller 或工作区。
-/// 编号固定对应：0 未提交搜索，1 已提交可取消搜索，2 Find，3 Replace，4 表格草稿，
-/// 5 旧笔记交接排队后关闭，6 正文保存冲突，7 表格保存冲突，8 分事件 Replace 双字段；
-/// case 3 保留同事件双字段的真实回归，case 8 不替换或弱化该场景。
-pub(crate) const NATIVE_MARKDOWN_RESOURCE_PROBE_CASES: usize = 9;
-
-/// 只消费产品验证后的精确关闭回执；标量身份和完成次数本身不是资源释放证明。
-/// 实际资源、逐角色与 borrowed 状态检查仍由产品 lifecycle 负责，夹具只推进后续事件。
-#[derive(Default)]
-struct ResourceProbeLifecycle {
-    expected_intent: Cell<Option<PluginCloseIntent>>,
-    accepted: Cell<Option<PluginCloseRequest>>,
-    completed: Cell<Option<PluginCloseRequest>>,
-    expected_saved: Cell<Option<omni_markdown_core::MarkdownDocumentRevision>>,
-    completion: RefCell<Option<Box<dyn FnOnce()>>>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 各场景保留原客户端、关闭及冲突前提；Host 为每案重新正式激活独立 A.md。
+pub enum NativeMarkdownHostedResourceCase {
+    /// 未提交的真实搜索字段仍拥有共享 editor；窗口关闭必须先辞任再退出到 Launcher。
+    UnsubmittedSearch,
+    /// 已提交工作区查询须在关闭时真正取消其后台扫描和旧结果权限。
+    SubmittedSearch,
+    /// Find 客户正在编辑，关闭后字段、共享 editor 和字段历史都不得跨会话存活。
+    FindField,
+    /// 同一事件先后输入两个 Replace 客户，第一字段的历史不能接管第二字段。
+    ReplaceFields,
+    /// 单格原始草稿仅在关闭提交一次；此前的局部历史不许提前改动父正文。
+    CellDraft,
+    /// 已接受的笔记交接尚未装配后继时关闭，旧图与在途交接均须纳入同一释放事务。
+    PendingNoteClose,
+    /// 正文有未保存字符且磁盘已外改：保存拒绝不能关闭或丢弃仍可编辑的草稿。
+    BodyConflict,
+    /// 同样的磁盘冲突发生在格草稿，预检允许一次真实 canonical 提交但不允许丢用户内容。
+    CellConflict,
+    /// 两个真实事件分别编辑 Replace 客户，并在转客户前实际往返本地 Undo/Redo。
+    SequentialReplaceFields,
 }
+use NativeMarkdownHostedResourceCase as Case;
 
-impl PluginHostLifecycle for ResourceProbeLifecycle {
-    fn commit_creation(&self) -> Result<(), PluginError> {
-        Ok(())
-    }
-
-    fn begin_close(&self, request: PluginCloseRequest) -> Result<(), PluginError> {
-        if request.scope != PluginCloseScope::ForegroundTransition {
-            // 本夹具不模拟真实待退出 Host，不提供终止 scope 授权。
-            return Err(PluginError::new(
-                "probe_scope",
-                "resource fixture requires foreground close",
-            ));
-        }
-        if self.expected_intent.get() != Some(request.intent) {
-            // 窗口关闭必须真正返回启动器；其余显式 SDK 隐藏场景仍核原 DismissAndResume。
-            return Err(PluginError::new(
-                "probe_close_intent",
-                "资源场景没有收到原动作对应的关闭意图",
-            ));
-        }
-        if self
-            .accepted
-            .get()
-            .is_some_and(|accepted| accepted != request)
-        {
-            // 首次接受后不能换 intent 或 scope，否则后来的回调无法证明属于同一次关闭。
-            return Err(PluginError::new(
-                "probe_identity",
-                "resource fixture close identity changed",
-            ));
-        }
-        if self.accepted.get().is_none() {
-            // begin_close 发生在真实保存和辞任之后，只拷贝 canonical revision，不持有正文或路径。
-            let expected = ACTIVE_NATIVE_MARKDOWN_SURFACE
-                .with_borrow(|surface| {
-                    surface
-                        .as_ref()
-                        .and_then(|surface| surface.editor.as_ref())
-                        .map(|editor| editor.document().borrow().current_revision())
-                })
-                .transpose()
-                .map_err(|error| {
-                    // 原保存摘要不可读就拒绝接受关闭验收；不能用None绕过随后磁盘核对。
-                    eprintln!("native_resource_probe stage=revision_failed cause={error}");
-                    PluginError::new("probe_revision", "无法核对已保存正文的摘要")
-                })?;
-            self.expected_saved.set(expected);
-        }
-        self.accepted.set(Some(request));
-        Ok(())
-    }
-
-    fn finish_close(&self, request: PluginCloseRequest) {
-        // 产品先完成资源证明才调用这里；这两项断言只核验回执身份和唯一消费，不能替代该证明。
-        assert_eq!(
-            self.accepted.get(),
-            Some(request),
-            "resource fixture exact accepted request"
-        );
-        assert!(
-            self.completed.replace(Some(request)).is_none(),
-            "resource fixture completion exactly once"
-        );
-        let completion = self.completion.borrow_mut().take();
-        if let Some(completion) = completion {
-            // 回调只持 driver weak 和标量；先结束借用再投递真实下一事件。
-            completion();
-        }
-    }
-}
-
-struct ResourceProbeHost {
-    root: std::path::PathBuf,
-    lifecycle: Rc<ResourceProbeLifecycle>,
-}
-
-/// case0 先由真实取消终点完成负例，再由真实激活终点完成原正例，最后继续原搜索场景。
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ResourceToolbarStage {
-    PrepareCancellation,
-    AwaitCancellation,
-    PrepareInsertion,
-    AwaitInsertion,
-    Complete,
-}
-
-impl OmniBarHostContext for ResourceProbeHost {
-    fn workspace_root(&self) -> &Path {
-        &self.root
-    }
-    fn application_data_root(&self) -> &Path {
-        &self.root
-    }
-    fn mount_native_view(&mut self, _view: PluginNativeView) -> Result<(), PluginError> {
-        Ok(())
-    }
-    fn read_clipboard_text(&mut self) -> Result<Option<String>, PluginError> {
-        // 资源夹具没有读取真实用户剪贴板的授权。
-        Err(PluginError::new(
-            "probe_clipboard",
-            "resource fixture has no clipboard authority",
-        ))
-    }
-    fn write_clipboard_text(&mut self, _text: &str) -> Result<(), PluginError> {
-        Err(PluginError::new(
-            "probe_clipboard",
-            "resource fixture has no clipboard authority",
-        ))
-    }
-    fn foreground_lifecycle(&self) -> Rc<dyn PluginHostLifecycle> {
-        self.lifecycle.clone()
-    }
-}
-
-/// 仅持 portable 工作区和标量/weak 完成状态；原生唯一 owner 仍在产品前台槽中。
-pub(crate) struct NativeMarkdownResourceProbe {
-    workspace: omni_markdown_core::MarkdownWorkspace,
-    lifecycle: Rc<ResourceProbeLifecycle>,
-    directory: std::path::PathBuf,
-    case: usize,
+/// 原 Host 独占窗口、文稿和会话。观察者仅保存弱身份、有限收据及独立匿名基线 FD；
+/// 实际 finish_close、Launcher 恢复和关闭请求匹配继续由生产 Host 验证。
+pub struct NativeMarkdownHostedResourceProbe {
+    // 路径只限定 Host 预声明的独立合成笔记；不会扫描或清理用户库。
+    path: PathBuf,
+    case: Case,
+    // 同一路径重新打开也不能继承旧验收；两个 Weak 分别约束 canonical 根和实际分页 owner。
+    document: WeakMarkdownDocument,
+    body: std::rc::Weak<NativeMarkdownPagedBody>,
+    // 控制器和窗口只用原生弱身份；不因等待下一事件延长真实 Native 图的生命周期。
+    controller: Weak<NativeMarkdownController>,
+    window: Weak<NativeMarkdownPanel>,
+    view: Weak<NativeMarkdownPagedTextView>,
+    // 这个匿名 FD 仅保存独立测试基线，按8 KiB流式还原外改反例。
+    // 它不借产品 Source/Reader，也不纳入产品释放角色；观察者 Drop 时由 File 真正关闭。
+    baseline: RefCell<std::fs::File>,
+    // 摘要只在实际草稿提交后更新，用来核已经保存的字节；从不代替 Host 关闭回执。
+    expected_saved: Cell<omni_markdown_core::MarkdownDocumentRevision>,
+    // 首图收据补充检查原图弱身份；后建字段、child和工作线程仍由真实产品完整 close门负责。
+    owned: NativeMarkdownOwnedSnapshot,
+    backing: NativeMarkdownOwnedSnapshot,
+    // child只保存共享等待器证明的原域 Weak，后继同坐标重新激活的格不能补签旧输入。
+    child: RefCell<Option<std::rc::Weak<NativeMarkdownPagedBody>>>,
     input_started_close: Cell<bool>,
     field_input_step: Cell<usize>,
+    // 最后一个真实字段的历史事实跨事件保留；任何 Native 调用前先复制并结束槽借用。
     field_history: RefCell<Option<ResourceFieldHistoryObservation>>,
-    table_activation: RefCell<Option<Rc<NativeMarkdownTableCellReceipt>>>,
-    toolbar: RefCell<Option<super::probe::toolbar::NativeMarkdownToolbarProbe>>,
-    toolbar_stage: Cell<ResourceToolbarStage>,
 }
 
-fn resource_table_four_ready(_: NativeMarkdownTableCellOutcome) {
-    crate::runtime_probe_application::post_table_resource_activation(4);
-}
-fn resource_table_seven_ready(_: NativeMarkdownTableCellOutcome) {
-    crate::runtime_probe_application::post_table_resource_activation(7);
-}
-fn resource_toolbar_ready(_: NativeMarkdownTableCellOutcome) {
-    crate::runtime_probe_application::post_table_toolbar_activation();
-}
-
-/// 只记最后一次实际字段输入的弱身份；不会延长 editor、历史或字段的生命周期。
 #[derive(Clone)]
+/// 字段历史仅弱观察当前实际 field editor；不把共享编辑器或 Undo manager 保留到关闭之后。
 struct ResourceFieldHistoryObservation {
     field: Weak<NSTextField>,
     editor: Weak<NSTextView>,
@@ -168,582 +74,610 @@ struct ResourceFieldHistoryObservation {
     owned_at_input: bool,
 }
 
-impl NativeMarkdownResourceProbe {
-    /// 私有合成目录采用 exclusive 创建；不会打开生产 vault、设置或剪贴板。
-    pub(crate) fn start(
-        document_path: &Path,
-        case: usize,
-        finished: impl FnOnce() + 'static,
-        mtm: MainThreadMarker,
-    ) -> Result<Self, String> {
-        use std::os::unix::fs::DirBuilderExt;
-        let parent = document_path
-            .parent()
-            .ok_or("resource fixture has no parent directory")?;
-        let directory = parent.join(format!(
-            "native-resource-case-{case}-{}",
-            std::process::id()
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|error| format!("create exclusive resource fixture: {error}"))?;
-        let vault = directory.join("vault");
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&vault)
-            .map_err(|error| format!("create resource vault: {error}"))?;
-        let source = crate::native_markdown_runtime_probe_fixture();
-        std::fs::write(vault.join("A.md"), &source)
-            .map_err(|error| format!("write private resource note: {error}"))?;
-        std::fs::write(vault.join("B.md"), "# Second\n\nnew independent note\n")
-            .map_err(|error| format!("write private successor note: {error}"))?;
-        let workspace =
-            omni_markdown_core::MarkdownWorkspace::new(vault, directory.join("recovery"));
-        let session = workspace
-            .open_session()
-            .map_err(|error| error.to_string())?;
-        let lifecycle = Rc::new(ResourceProbeLifecycle {
-            expected_intent: Cell::new(Some(if case == 0 {
-                // 实际 performClose: 不以私有关闭函数或应用退出替代窗口关闭交付。
-                PluginCloseIntent::ExitToLauncher
-            } else {
-                // 其他场景保留既有 SDK 隐藏请求，验证本次修复没有整批改写共享 intent。
-                PluginCloseIntent::DismissAndResume
-            })),
-            completion: RefCell::new(Some(Box::new(finished))),
-            ..ResourceProbeLifecycle::default()
-        });
-        let mut host = ResourceProbeHost {
-            root: directory.clone(),
-            lifecycle: Rc::clone(&lifecycle),
-        };
-        show_native_markdown_window(session, lifecycle.clone(), &mut host)?;
-        // 初次展示与后面的具体输入位于不同实际事件，fixture 不在构造栈中立刻关闭。
-        let probe = Self {
-            workspace,
-            lifecycle,
-            directory,
-            case,
-            input_started_close: Cell::new(false),
-            field_input_step: Cell::new(0),
-            field_history: RefCell::new(None),
-            table_activation: RefCell::new(None),
-            toolbar: RefCell::new(None),
-            toolbar_stage: Cell::new(ResourceToolbarStage::PrepareCancellation),
-        };
-        probe.assert_case(mtm)?;
-        Ok(probe)
-    }
-
-    fn assert_case(&self, _mtm: MainThreadMarker) -> Result<(), String> {
-        if self.case >= NATIVE_MARKDOWN_RESOURCE_PROBE_CASES {
-            // 未知编号不能当作空场景进入关闭流程，否则会虚增具名场景的覆盖数。
-            return Err("unknown resource probe case".into());
-        }
-        if self.case == 0 {
-            // 读取实际产品面板，先结束前台状态借用再调用原生 getter，避免重入跨越 TLS 借用。
-            let panel = with_active_native_markdown_surface(|surface| Ok(surface.panel.clone()))?;
-            let style = panel.styleMask();
-            let system_chrome = NSWindowStyleMask::Titled
-                | NSWindowStyleMask::Closable
-                | NSWindowStyleMask::Miniaturizable;
-            if style.intersects(system_chrome)
-                || !style
-                    .contains(NSWindowStyleMask::Resizable | NSWindowStyleMask::NonactivatingPanel)
-                || !panel.isMovableByWindowBackground()
-            {
-                // 无边框、可缩放与原有背景拖动必须同时成立，不能仅把系统按钮藏起来。
-                return Err("插件面板偏离既有无边框与背景拖动交互".into());
+impl NativeMarkdownHostedResourceProbe {
+    /// 只认 Host 已正式打开的确切路径和当前整 CPU 帧，不创建 workspace、surface 或 Native 图。
+    pub fn observe_active_document(path: &Path, case: Case) -> Result<Self, String> {
+        MainThreadMarker::new().ok_or("资源验收必须在 AppKit 主线程执行")?;
+        let path = path.canonicalize().map_err(|_| "无法解析合成资源笔记")?;
+        // 激活返回并不表示首帧已发布。先固定实际原 Doc/Body/Input，随后每个真实事件只核这份票。
+        let (document, body, input) = with_active_native_markdown_surface(|surface| {
+            let editor = surface
+                .editor
+                .as_ref()
+                .ok_or("资源验收缺少真实 Host 正文")?;
+            if editor.document().borrow().path() != path {
+                return Err("资源验收不是预声明的合成笔记".into());
             }
-            for button in [
-                objc2_app_kit::NSWindowButton::CloseButton,
-                objc2_app_kit::NSWindowButton::MiniaturizeButton,
-                objc2_app_kit::NSWindowButton::ZoomButton,
-            ] {
-                if panel.standardWindowButton(button).is_some() {
-                    // 验证框架没有为产品创建三色窗口按钮，禁止以不可见替代移除。
-                    return Err("插件面板意外创建了系统窗口按钮".into());
+            Ok((
+                Rc::downgrade(editor.document()),
+                Rc::downgrade(&editor.body),
+                editor
+                    .text_view
+                    .input_state()
+                    .map_err(|cause| cause.to_string())?,
+            ))
+        })?;
+        // 原三秒包括首次资源准备；事件未完成始终失败，不以队列轮数或时间流逝推成功。
+        let started = Instant::now();
+        loop {
+            let ready = with_active_native_markdown_surface(|surface| {
+                let editor = surface
+                    .editor
+                    .as_ref()
+                    .ok_or("首帧完成前原资源正文已结束")?;
+                if !std::rc::Weak::ptr_eq(&document, &Rc::downgrade(editor.document()))
+                    || !std::rc::Weak::ptr_eq(&body, &Rc::downgrade(&editor.body))
+                    || editor
+                        .text_view
+                        .input_state()
+                        .map_err(|cause| cause.to_string())?
+                        != input
+                {
+                    return Err("首帧等待中原文稿或完整输入已经改变".into());
                 }
+                if let Some(cause) = editor.body.take_failure() {
+                    return Err(cause.to_string());
+                }
+                let key = match editor.text_view.capture_ready_scene_key() {
+                    Ok(key) => key,
+                    Err(crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Pending | crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Busy) => return Ok(false),
+                    Err(cause) => return Err(cause.to_string()),
+                };
+                Ok(editor
+                    .text_view
+                    .probe_cpu_published_frame()
+                    .is_some_and(|(cpu, paints)| {
+                        cpu.same(&key) && editor.text_view.cpu_paints() == Some(paints)
+                    })
+                    && editor.text_view.cpu_paint_pending() == Some(false))
+            })?;
+            if ready {
+                // 本轮 Native 查询也计入原期限；恰在超时之后就绪不能反签为三秒内完成。
+                if started.elapsed() > Duration::from_secs(3) {
+                    return Err("资源原完整 CPU 帧超过三秒期限".into());
+                }
+                break;
             }
-            println!(
-                "omni_panel_chrome verified=true titled=false standard_buttons=0 background_drag=true resizable=true"
-            );
+            // 每轮沿原 started 扣除真实耗时，不因收到无关事件重新获得三秒。
+            let remaining = Duration::from_secs(3)
+                .checked_sub(started.elapsed())
+                .ok_or("资源原首屏三秒内没有完整 CPU 帧")?;
+            // Active 租约及 Native claim 已全部结束；原安全封装只消费同次剩余期限的真实事件。
+            // SAFETY: CoreFoundation 导出的默认 mode 为进程期不可变 CFString；只借其原静态值。
+            let mode = unsafe { kCFRunLoopDefaultMode };
+            CFRunLoop::run_in_mode(mode, remaining, true);
         }
-        Ok(())
+        with_active_native_markdown_surface(|surface| {
+            let editor = surface
+                .editor
+                .as_ref()
+                .ok_or("资源验收缺少真实 Host 正文")?;
+            if !std::rc::Weak::ptr_eq(&document, &Rc::downgrade(editor.document()))
+                || !std::rc::Weak::ptr_eq(&body, &Rc::downgrade(&editor.body))
+                || editor
+                    .text_view
+                    .input_state()
+                    .map_err(|cause| cause.to_string())?
+                    != input
+                || editor.document().borrow().path() != path
+                || editor.presentation_mode() != MarkdownPresentationMode::InlinePreview
+            {
+                return Err("资源验收必须从指定笔记的真实预览开始".into());
+            }
+            let key = editor
+                .text_view
+                .capture_ready_scene_key()
+                .map_err(|cause| cause.to_string())?;
+            let (cpu, _) = editor
+                .text_view
+                .probe_cpu_published_frame()
+                .ok_or("资源验收缺少实际 CPU 帧")?;
+            if !cpu.same(&key) || editor.text_view.cpu_paint_pending() != Some(false) {
+                return Err("资源验收不能把 Ready 或旧 CPU 帧当作首屏完成".into());
+            }
+            let mut baseline = tempfile::tempfile().map_err(|_| "无法建立资源场景独立基线 FD")?;
+            editor
+                .document()
+                .borrow()
+                .write_to(&mut baseline)
+                .map_err(|cause| cause.to_string())?;
+            let revision = editor
+                .document()
+                .borrow()
+                .current_revision()
+                .map_err(|cause| cause.to_string())?;
+            Ok(Self {
+                path: path.clone(),
+                case,
+                document: Rc::downgrade(editor.document()),
+                body: Rc::downgrade(&editor.body),
+                controller: Weak::from_retained(&surface.controller),
+                window: Weak::from_retained(&surface.panel),
+                view: Weak::from(&**editor.text_view),
+                baseline: RefCell::new(baseline),
+                expected_saved: Cell::new(revision),
+                owned: editor.owned_ledger.snapshot(),
+                backing: editor.document_resources.clone(),
+                child: RefCell::new(None),
+                input_started_close: Cell::new(false),
+                field_input_step: Cell::new(0),
+                field_history: RefCell::new(None),
+            })
+        })
     }
 
-    /// Show/activate 与后续输入分开；Find 和表格须经过真实产品的 UI 建立事务。
-    pub(crate) fn configure(&self, mtm: MainThreadMarker) -> Result<(), String> {
-        if self.toolbar_menu_needed() {
-            return self.begin_toolbar_menu(); // 两份原菜单各等一次真实终点，再回201建立原未提交搜索场景。
-        }
+    /// 每次 Native 操作仍核原弱身份；同路径重新打开或同地址重用都不能接管旧场景。
+    fn owns(&self, surface: &NativeMarkdownWindowSurface) -> bool {
+        surface.editor.as_ref().is_some_and(|editor| {
+            std::rc::Weak::ptr_eq(&self.document, &Rc::downgrade(editor.document()))
+                && std::rc::Weak::ptr_eq(&self.body, &Rc::downgrade(&editor.body))
+                && self
+                    .controller
+                    .load()
+                    .is_some_and(|owner| std::ptr::eq(&*owner, &*surface.controller))
+                && self
+                    .window
+                    .load()
+                    .is_some_and(|window| std::ptr::eq(&*window, &*surface.panel))
+                && native_markdown_controller_has_foreground_authority(&surface.controller)
+        })
+    }
+
+    /// 配置动作只借出原控件；真正激活格时退还 Active 租约后才等待原 child CPU。
+    pub fn configure(&self) -> Result<(), String> {
         match self.case {
-            0 | 1 => with_active_native_markdown_surface(|surface| {
-                // 两种搜索先建立相同的真实编辑关系，是否提交查询由后续输入阶段区分。
-                let field = search_field(surface)?;
-                // SAFETY: 活的项目字段在实际主线程窗口中，正常 selectText 建立共享编辑关系。
+            Case::UnsubmittedSearch | Case::SubmittedSearch => {
+                let field = with_active_native_markdown_surface(|surface| {
+                    if !self.owns(surface) {
+                        return Err("搜索场景原窗口已经撤销".into());
+                    }
+                    search_field(surface)
+                })?;
+                // SAFETY: 活主线程字段使用原公开 AppKit 焦点入口，不替换 delegate 或 field editor。
                 unsafe {
                     field.selectText(None);
                 }
                 Ok(())
-            }),
-            2 | 3 | 8 => {
-                // 直接调用产品具名菜单行为，不复制 Find 构造或覆盖其私有 delegate。
-                // action 7 打开 Find，action 8 打开 Replace，后者必须覆盖两个实际输入字段。
-                perform_native_markdown_workspace_action(if self.case == 2 { 7 } else { 8 })
             }
-            4 | 7 => with_active_native_markdown_surface(|surface| {
-                // 两者都先建立表格草稿；场景 7 在关闭阶段额外制造磁盘冲突并核验草稿保留。
-                let editor = surface
-                    .editor
-                    .as_ref()
-                    .ok_or("table resource fixture editor missing")?;
-                let view = &editor.backend.text_view;
-                // Find 全部匹配保留真实 body Multi；后续 cell 草稿关闭必须通过显式格选择归一。
-                let identity = Rc::downgrade(editor.document());
-                let (generation, revision, length) = {
-                    let document = editor.document().borrow();
-                    (
-                        document.generation(),
-                        document
-                            .current_revision()
-                            .map_err(|error| error.to_string())?,
-                        document.utf16_len(),
-                    )
-                };
-                let original = || {
-                    !view.ivars().textkit_graph_teardown.get()
-                        && identity.upgrade().is_some_and(|document| {
-                            let document = document.borrow();
-                            document.generation() == generation
-                                && document
-                                    .current_revision()
-                                    .is_ok_and(|actual| actual == revision)
-                                && document.utf16_len() == length
-                        })
-                };
-                let bar =
-                    prepare_multi_selection_find_probe(editor, &surface.controller, &original)?;
-                execute_multi_selection_find_probe(
-                    editor,
-                    &surface.controller,
-                    &bar,
-                    surface.controller.find_input_intent(),
-                    MarkdownFindAction::SelectAll,
-                    None,
-                    &original,
-                )?;
-                finish_list_marker_find_probe(editor, &surface.controller, &original)?;
-                if view
-                    .native_ordered_selection_state()
-                    .map_err(|error| error.to_string())?
-                    != NativeMarkdownOrderedSelection::Multiple
-                    || view.ivars().folds.known_selection().is_some()
-                {
-                    return Err("资源表格前置 Find 全选未保留真实 Multi/未知 head".into());
-                }
-                drop(bar); // 同栏仍由原editor/owned ledger管理，关闭资源门槛不得漏掉它。
-                // 使用现有 coalesced 产品事务体准备真实 TextKit 几何，不跑嵌套循环或等待重试。
-                view.schedule_visible_table_layout_update();
-                view.run_scheduled_table_layout_update();
-                let cache = view
-                    .ivars()
-                    .visible_table_layout_cache
-                    .borrow()
-                    .as_ref()
-                    .map(Rc::clone);
-                let cell = cache
-                    .as_ref()
-                    .and_then(|cache| {
-                        cache
-                            .tables
-                            .iter()
-                            .flat_map(|table| &table.cells)
-                            .find(|cell| cell.coordinate.row_index == 1)
-                            .cloned()
-                    })
-                    .ok_or("table resource fixture has no actual visible body cell")?;
-                drop(cache); // Native属性clone和cache析构均在槽借用外，之后才签发原动作票。
-                let callback = if self.case == 4 {
-                    resource_table_four_ready
+            Case::FindField | Case::ReplaceFields | Case::SequentialReplaceFields => {
+                with_active_native_markdown_surface(|surface| {
+                    self.owns(surface)
+                        .then_some(())
+                        .ok_or("Find 场景原窗口已经撤销".into())
+                })?;
+                perform_native_markdown_workspace_action(if self.case == Case::FindField {
+                    7
                 } else {
-                    resource_table_seven_ready
-                };
-                let receipt = view.probe_prepare_table_cell_receipt(
-                    editor.document(),
-                    cell.coordinate,
-                    callback,
-                )?;
-                if !view.probe_begin_table_cell_editing(cell, Rc::clone(&receipt)) {
-                    return Err("资源表格激活原请求未被接受".into());
-                }
-                let previous = self.table_activation.replace(Some(receipt));
-                drop(previous); // 纯原票在owner放回前发布；嵌套终点由driver暂存。
-                Ok(())
-            }),
-            5 | 6 => {
-                // 笔记交接及保存失败在输入事件执行，此阶段保留完整初始图。
-                let _ = mtm;
-                Ok(())
-            }
-            // 阶段与固定编号表不一致时拒绝执行，不能略过配置后仍宣称该场景通过。
-            _ => Err("unknown resource probe case".into()),
-        }
-    }
-
-    pub(crate) fn toolbar_waiting(&self) -> bool {
-        self.case == 0
-            && self.toolbar.borrow().is_some()
-            && matches!(
-                self.toolbar_stage.get(),
-                ResourceToolbarStage::AwaitCancellation | ResourceToolbarStage::AwaitInsertion
-            )
-    }
-
-    pub(crate) fn toolbar_menu_needed(&self) -> bool {
-        self.case == 0
-            && matches!(
-                self.toolbar_stage.get(),
-                ResourceToolbarStage::PrepareCancellation | ResourceToolbarStage::PrepareInsertion
-            )
-    }
-
-    fn begin_toolbar_menu(&self) -> Result<(), String> {
-        let cancelling = match self.toolbar_stage.get() {
-            ResourceToolbarStage::PrepareCancellation => true, // 负例必须先取得原正常菜单，再用新明确全选撤销。
-            ResourceToolbarStage::PrepareInsertion => false,   // 恢复后新正例重新通过完整原插表链。
-            _ => return Err("菜单回归尚未准备或仍在等待原终点".into()),
-        };
-        let (mut state, capture, menu, index, view) =
-            with_active_native_markdown_surface(|surface| {
-                let editor = surface.editor.as_ref().ok_or("菜单插表缺少原编辑器")?;
-                let mut state = super::probe::toolbar::prepare(editor)?;
-                super::probe::toolbar::observe_menu_activation(
-                    editor,
-                    &mut state,
-                    resource_toolbar_ready,
-                )?;
-                let capture = editor
-                    .backend
-                    .text_view
-                    .ivars()
-                    .folds
-                    .capture_selection()
-                    .map_err(|error| error.to_string())?;
-                let item = surface
-                    .controller
-                    .ivars()
-                    .table_menu_item
-                    .get()
-                    .ok_or("真实插表菜单项缺失")?;
-                let valid = selection_native_step(&capture, || {
-                    item.tag() == 118
-                        && item.action() == Some(sel!(performMarkdownWorkspaceAction:))
-                        && item.isEnabled()
+                    8
                 })
-                .map_err(|error| error.to_string())?;
-                if !valid {
-                    return Err("真实插表菜单绑定或启用状态不符".into());
-                }
-                let menu = selection_native_step(&capture, || {
-                    // SAFETY: 活foreground菜单项由原controller/owned ledger持有，公开menu getter不转移业务所有权。
-                    unsafe { item.menu() }
-                })
-                .map_err(|error| error.to_string())?
-                .ok_or("插表菜单项没有真实父菜单")?;
-                let index = selection_native_step(&capture, || menu.indexOfItem(item))
-                    .map_err(|error| error.to_string())?;
-                if index < 0 {
-                    return Err("插表菜单项没有实际索引".into());
-                }
-                if !capture.current() {
-                    return Err("菜单准备返回时原插表权限已改变".into());
-                }
-                let view = selection_native_step(&capture, || editor.backend.text_view.clone())
-                    .map_err(|error| error.to_string())?;
-                Ok((state, capture, menu, index, view))
-            })?;
-        // 菜单 action 的生产门禁只认实际 ACTIVE；必须先结束借出 scope，让同一 owner 恢复到槽内。
-        // 原 capture、实际 menu/index 来自准备前态，恢复后只复核这份票，不重新领取当前文档权限。
-        selection_native_step(&capture, || menu.performActionForItemAtIndex(index))
-            .map_err(|error| error.to_string())?;
-        if cancelling {
-            // ACTIVE 已归还且没有先 yield；公开 selectAll 必须位于原菜单返回后的同一个 handler。
-            // view/menu 仅是本同步调用的局部 claim，不写入跨事件状态或队列。
-            super::probe::toolbar::supersede_menu_with_select_all(&view, &mut state, capture)?;
-            self.toolbar_stage
-                .set(ResourceToolbarStage::AwaitCancellation);
-        } else {
-            if !capture.current() {
-                return Err("菜单 action 返回时原插表权限已改变".into());
             }
-            self.toolbar_stage.set(ResourceToolbarStage::AwaitInsertion);
+            Case::CellDraft | Case::CellConflict => self.open_cell(),
+            // 交接和冲突必须在后继输入事件实际触发，不能在构造时伪造 pending 或 dirty。
+            Case::PendingNoteClose | Case::BodyConflict => Ok(()),
         }
-        drop(menu);
-        drop(view); // 最后 Native claims 在本事件返回前结束；205仍重新核原状态与实际选择。
-        self.toolbar.replace(Some(state));
-        Ok(())
     }
 
-    pub(crate) fn finish_toolbar_menu(&self) -> Result<(), String> {
-        if !self.toolbar_waiting() {
-            return Err("菜单插表终点缺少原有限阶段".into());
-        }
-        let state = self
-            .toolbar
-            .borrow_mut()
-            .take()
-            .ok_or("菜单插表状态已被替换")?;
-        with_active_native_markdown_surface(|surface| {
-            let editor = surface.editor.as_ref().ok_or("菜单插表后原编辑器已关闭")?;
-            match self.toolbar_stage.get() {
-                ResourceToolbarStage::AwaitCancellation => {
-                    super::probe::toolbar::finish_cancelled_menu(editor, &state)
-                }
-                ResourceToolbarStage::AwaitInsertion => {
-                    super::probe::toolbar::finish(editor, &state, "workspace_menu_action")
-                }
-                _ => Err("菜单终点不属于原等待阶段".into()), // 重复或乱序终点不能跳过负例或正例。
+    fn open_cell(&self) -> Result<(), String> {
+        let started = Instant::now();
+        // 原资源回归先保真实 Multi/未知方向；格内激活必须明确收拢，不能借历史 memento 猜 head。
+        show_native_markdown_find_bar(false)?;
+        let bar = with_active_native_markdown_surface(|surface| {
+            if !self.owns(surface) {
+                return Err("资源格多选原票已失效".into());
             }
+            surface
+                .editor
+                .as_ref()
+                .expect("原身份已核")
+                .find_bar
+                .borrow()
+                .clone()
+                .ok_or("资源格缺少实际 Find 栏".into())
         })?;
-        self.toolbar_stage.set(match self.toolbar_stage.get() {
-            ResourceToolbarStage::AwaitCancellation => ResourceToolbarStage::PrepareInsertion,
-            ResourceToolbarStage::AwaitInsertion => ResourceToolbarStage::Complete,
-            _ => return Err("菜单终点消费期间阶段已变更".into()),
-        });
+        bar.fields()[0].setStringValue(ns_string!("#10"));
+        if !matches!(
+            perform_native_markdown_find_action(MarkdownFindAction::SelectAll)?,
+            NativeMarkdownFindExecution::Complete
+        ) {
+            return Err("固定资源格四处 Find 多选未同步完成原事务".into());
+        }
+        let input = with_active_native_markdown_surface(|surface| {
+            if !self.owns(surface) {
+                return Err("资源格多选发布后原窗口已撤销".into());
+            }
+            let input = surface
+                .editor
+                .as_ref()
+                .expect("原身份已核")
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            if input.selection_is_directed || input.selection_range_count != 4 {
+                return Err("资源格前置 Find 没有保留四处真实 Multi/未知 head".into());
+            }
+            Ok(input)
+        })?;
+        perform_native_markdown_find_action(MarkdownFindAction::Hide)?;
+        drop(bar); // 栏仍归正式会话，测试不将 Native 控件保留到后继量子或关闭。
+        loop {
+            let ready = with_active_native_markdown_surface(|surface| {
+                if !self.owns(surface) {
+                    return Err("资源格多选后原窗口已经撤销".into());
+                }
+                let editor = surface.editor.as_ref().expect("原身份已核");
+                if editor
+                    .text_view
+                    .input_state()
+                    .map_err(|cause| cause.to_string())?
+                    != input
+                {
+                    return Err("资源格多选在准备中被后继输入替代".into());
+                }
+                if let Some(cause) = editor.body.take_failure() {
+                    return Err(cause.to_string());
+                }
+                let key = match editor.text_view.capture_ready_scene_key() {
+                    Ok(key) => key,
+                    Err(crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Pending | crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Busy) => return Ok(false),
+                    Err(cause) => return Err(cause.to_string()),
+                };
+                Ok({
+                    editor
+                        .text_view
+                        .probe_cpu_published_frame()
+                        .is_some_and(|(cpu, paints)| {
+                            cpu.same(&key) && editor.text_view.cpu_paints() == Some(paints)
+                        })
+                        && editor.text_view.cpu_paint_pending() == Some(false)
+                })
+            })?;
+            if ready {
+                // 本轮 Native 查询也计入原期限；恰在超时之后就绪不能反签为三秒内完成。
+                if started.elapsed() > Duration::from_secs(3) {
+                    return Err("资源原完整 CPU 帧超过三秒期限".into());
+                }
+                break;
+            }
+            // 每轮沿原 started 扣除真实耗时，不因收到无关事件重新获得三秒。
+            let remaining = Duration::from_secs(3)
+                .checked_sub(started.elapsed())
+                .ok_or("资源格原多选首帧三秒内未完成")?;
+            // 全部 Active/字段/Scene 借用已结束；安全封装接真实 Duration，不重新开启三秒。
+            // SAFETY: CoreFoundation 导出的默认 mode 为进程期不可变 CFString；只借其原静态值。
+            let mode = unsafe { kCFRunLoopDefaultMode };
+            CFRunLoop::run_in_mode(mode, remaining, true);
+        }
+        let (view, point, number) = with_active_native_markdown_surface(|surface| {
+            if !self.owns(surface) {
+                return Err("资源格场景原窗口已经撤销".into());
+            }
+            let editor = surface.editor.as_ref().expect("原正文身份已核");
+            let position = editor
+                .document()
+                .borrow()
+                .find_utf16("#101", 0, false, true)
+                .map_err(|cause| cause.to_string())?
+                .ok_or("固定夹具没有首个真实内容格")?
+                .start;
+            let key = editor
+                .text_view
+                .capture_ready_scene_key()
+                .map_err(|cause| cause.to_string())?;
+            let scene =
+                NativeMarkdownPagedTextViewDelegate::ready_scene(&*editor.body, &key.request)
+                    .map_err(|cause| cause.to_string())?;
+            let hit = scene
+                .first_rect(NSRange::new(position, 1))
+                .map_err(|cause| cause.to_string())?;
+            let point = editor.text_view.convertPoint_toView(
+                NSPoint::new(
+                    hit.rect.origin.x + hit.rect.size.width / 2.0,
+                    hit.rect.origin.y + hit.rect.size.height / 2.0,
+                ),
+                None,
+            );
+            if !editor
+                .text_view
+                .capture_ready_scene_key()
+                .is_ok_and(|value| value.same(&key))
+            {
+                return Err("资源格真实几何在鼠标动作前已撤销".into());
+            }
+            Ok((
+                editor.text_view.clone(),
+                point,
+                surface.panel.windowNumber(),
+            ))
+        })?;
+        // 只解释这一对真实公开 NSResponder 事件；待首帧时不保存或重播 NSEvent。
+        // Up仍沿原命令结束手势，后继Source量子只完成已接纳的格位置意图。
+        for event_type in [
+            objc2_app_kit::NSEventType::LeftMouseDown,
+            objc2_app_kit::NSEventType::LeftMouseUp,
+        ] {
+            // SAFETY: 单次合成事件精确属于原真实窗口；不注入系统输入源或用户设备事件。
+            let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                event_type, point, NSEventModifierFlags::empty(), 1.0, number, None, 1, 1, 1.0,
+            ).ok_or("无法构造原资源格鼠标事件")?;
+            // SAFETY: 同一实际主线程 NSResponder、原窗口位置及活事件，只调用对应公开鼠标 selector 一次。
+            unsafe {
+                if event_type == objc2_app_kit::NSEventType::LeftMouseDown {
+                    let _: () = msg_send![&**view, mouseDown: &*event];
+                } else {
+                    let _: () = msg_send![&**view, mouseUp: &*event];
+                }
+            }
+        }
+        let input = view.input_state().map_err(|cause| cause.to_string())?;
+        drop(view); // 动作后态来自本次真实 Input；不保 Native claim 跨 runloop。
+        let child = super::probe::wait_for_paged_cell(
+            self.body.clone(),
+            self.document.clone(),
+            input,
+            None,
+            started,
+        )?;
+        self.child.replace(Some(child));
         Ok(())
     }
 
-    /// 对实际 currentEditor 调用公开输入协议；这是合成 native 输入，不是硬件/系统 IME 验收。
-    pub(crate) fn input(&self) -> Result<(), String> {
+    /// 合成文字只交真正的 NSTextInputClient，不读取或替换整篇正文。
+    pub fn input(&self) -> Result<(), String> {
         match self.case {
-            0 | 1 => {
+            Case::UnsubmittedSearch | Case::SubmittedSearch => {
                 let (field, controller) = with_active_native_markdown_surface(|surface| {
+                    if !self.owns(surface) {
+                        return Err("资源搜索输入原票已失效".into());
+                    }
                     Ok((search_field(surface)?, surface.controller.clone()))
                 })?;
-                let observation = input_actual_field(&field, &controller, "Probe资源")?;
-                self.field_history.replace(Some(observation));
-                if self.case == 1 {
-                    // 场景 0 保留未提交字段；只有场景 1 在 owner lease 结束后提交到可取消查询邮箱。
-                    // SAFETY: 活主线程 controller 实现该精确 selector，字段 sender 在同步调用内保持有效。
+                self.field_history.replace(Some(input_actual_field(
+                    &field,
+                    &controller,
+                    "Probe资源",
+                )?));
+                if self.case == Case::SubmittedSearch {
+                    // SAFETY: 原 controller 的公开 selector 使用同一个实际字段，提交真实可取消查询。
                     unsafe {
                         let _: () = msg_send![&*controller, searchMarkdownWorkspace: &*field];
                     }
                 }
                 Ok(())
             }
-            2 | 3 | 8 => {
+            Case::FindField | Case::ReplaceFields | Case::SequentialReplaceFields => {
                 let (fields, controller) = with_active_native_markdown_surface(|surface| {
-                    let editor = surface
-                        .editor
-                        .as_ref()
-                        .ok_or("Find resource editor missing")?;
+                    if !self.owns(surface) {
+                        return Err("资源 Find 输入原票已失效".into());
+                    }
+                    let editor = surface.editor.as_ref().expect("原正文身份已核");
                     editor.capture_find_resources()?;
-                    let fields: Vec<_> = editor
+                    let fields = editor
                         .find_resources
                         .borrow()
                         .fields()
                         .into_iter()
                         .filter(|field| field.isEditable() && !field.isHidden())
-                        .collect();
+                        .collect::<Vec<_>>();
                     Ok((fields, surface.controller.clone()))
                 })?;
-                let required = if matches!(self.case, 3 | 8) { 2 } else { 1 };
+                let required = if self.case == Case::FindField { 1 } else { 2 };
                 if fields.len() < required {
-                    // replace 场景不能只编辑 query 字段而宣称覆盖了替换输入。
-                    return Err("actual Find/Replace editable fields are incomplete".into());
+                    return Err("实际 Find/Replace 输入字段不完整".into());
                 }
-                let fields = if self.case == 8 {
+                // 同事件两字段与分事件两字段各保原边界；不能用多一次消息循环掩盖共享 editor 归属。
+                let fields = if self.case == Case::SequentialReplaceFields {
                     let step = self.field_input_step.get();
-                    if step >= 2 {
-                        return Err(
-                            "sequential field probe exceeded its two declared input events".into(),
-                        );
+                    if step > 1 {
+                        return Err("分事件 Replace 输入超出原两步".into());
                     }
                     if step == 1 {
-                        // 第一字段仍拥有焦点：在独立事件实际 Undo/Redo 后，才正常结束它并转第二字段。
-                        let observation = self.field_history.borrow().clone();
-                        verify_focused_field_history(observation.as_ref())?;
+                        let original = self.field_history.borrow().clone();
+                        verify_focused_field_history(original.as_ref())?;
                     }
                     self.field_input_step.set(step + 1);
-                    vec![
-                        fields
-                            .into_iter()
-                            .nth(step)
-                            .ok_or("sequential field probe is missing its declared field")?,
-                    ]
+                    vec![fields.into_iter().nth(step).ok_or("缺少原 Replace 字段")?]
                 } else {
-                    fields // case3 原同一事件依次编辑两个字段，不能用分事件替代本次异常回归。
+                    fields
                 };
                 for field in fields {
-                    // 每个实际可编辑字段都经历共享 editor 焦点；不依赖私有类名或本地化标签辨认角色。
-                    // SAFETY: 字段由活窗口公开 Find bar 得到，正常聚焦不替换框架委托。
+                    // SAFETY: 只向当前原窗口拥有的实际字段交付标准聚焦和输入。
                     unsafe {
                         field.selectText(None);
                     }
-                    let observation = input_actual_field(&field, &controller, "Probe查找")?;
-                    self.field_history.replace(Some(observation));
+                    self.field_history.replace(Some(input_actual_field(
+                        &field,
+                        &controller,
+                        "Probe查找",
+                    )?));
                 }
                 Ok(())
             }
-            4 | 7 => {
-                let receipt = self
-                    .table_activation
+            Case::CellDraft | Case::CellConflict => {
+                // 原 child 已实际获得焦点及完整像素；这里只升级该 Weak，不寻找当前任意格续权。
+                let child = self
+                    .child
                     .borrow()
                     .as_ref()
-                    .map(Rc::clone)
-                    .ok_or("资源表格缺少原激活收据")?;
-                let (field, controller) = with_active_native_markdown_surface(|surface| {
-                    let editor = surface
-                        .editor
-                        .as_ref()
-                        .ok_or("table resource editor missing")?;
-                    let view = &editor.backend.text_view;
-                    if receipt.outcome() != Some(NativeMarkdownTableCellOutcome::Activated)
-                        || !receipt.current_for(view)
-                    {
-                        return Err(format!("资源表格原激活没有成功：{:?}", receipt.outcome()));
-                    }
-                    let field =
-                        native_markdown_table_intent_step(&|| receipt.current_for(view), || {
-                            view.existing_table_cell_editor()
-                        })
-                        .map_err(|_| "资源表格激活已撤权")?
-                        .ok_or("actual table field did not activate")?;
-                    let controller =
-                        native_markdown_table_intent_step(&|| receipt.current_for(view), || {
-                            surface.controller.clone()
-                        })
-                        .map_err(|_| "资源表格owner已撤权")?;
-                    Ok((field, controller))
-                })?;
-                let observation = input_actual_field(&field, &controller, "resource-cell-draft")?;
-                self.field_history.replace(Some(observation));
+                    .and_then(std::rc::Weak::upgrade)
+                    .ok_or("原资源格尚未激活")?;
+                let view = child.view().map_err(|cause| cause.to_string())?;
+                view.command(sel!(selectAll:))
+                    .map_err(|cause| cause.to_string())?;
+                let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**view);
+                // SAFETY: 仅用固定有限原始格草稿覆盖真实 local selection；父 canonical 仍不改变。
+                unsafe {
+                    client.insertText_replacementRange(
+                        ns_string!("resource-cell-draft"),
+                        NSRange::new(NSNotFound as usize, 0),
+                    );
+                }
+                view.command(sel!(undo:))
+                    .map_err(|cause| cause.to_string())?;
+                view.command(sel!(redo:))
+                    .map_err(|cause| cause.to_string())?;
+                let facts = view
+                    .cell_history_facts()
+                    .map_err(|cause| cause.to_string())?
+                    .ok_or("资源格输入没有真实 local history")?;
+                let mut actual = NSRange::new(NSNotFound as usize, 0);
+                // 只请求独立固定的19个ASCII units；不得以整格/整篇字符串代替实际输入协议结果。
+                let expected = ns_string!("resource-cell-draft");
+                let range = NSRange::new(0, expected.length());
+                // SAFETY: 原实际客户仍由当前 child 拥有，out 参数有效，有限范围不越固定期望。
+                let text = unsafe {
+                    client.attributedSubstringForProposedRange_actualRange(range, &mut actual)
+                }
+                .ok_or("资源格没有交付真实有限草稿")?;
+                if !facts.can_undo
+                    || actual != range
+                    || !text.string().isEqualToString(expected)
+                    || view
+                        .input_state()
+                        .map_err(|cause| cause.to_string())?
+                        .utf16_len
+                        != range.length
+                {
+                    return Err("资源格 local 输入或 Undo/Redo 没有恢复固定原草稿".into());
+                }
+                let parent = self
+                    .document
+                    .upgrade()
+                    .ok_or("资源格编辑期间原正文已释放")?;
+                if parent
+                    .borrow()
+                    .current_revision()
+                    .map_err(|cause| cause.to_string())?
+                    != self.expected_saved.get()
+                {
+                    return Err("格内 local 输入或历史提前改变了父 canonical 字节".into());
+                }
                 Ok(())
             }
-            5 => {
+            Case::PendingNoteClose => {
                 let index = with_active_native_markdown_surface(|surface| {
+                    if !self.owns(surface) {
+                        return Err("旧笔记交接原窗口已撤销".into());
+                    }
                     surface
                         .sidebar_rows
                         .iter()
                         .position(|row| row.relative_path == "B.md")
-                        .ok_or_else(|| "successor row missing".to_owned())
+                        .ok_or("原后继 B.md 不存在".into())
                 })?;
-                // 真正产品侧栏路径注册旧图的 continuation，不制造没有回调的假 pending 状态。
+                // 采用产品侧栏的保存→旧图归还→目标挂载事务，不能直接写 pending 字段。
+                // 随后的关闭属于同一原事件，必须接管真实在途交接，不能等它自然完成后冒充覆盖。
                 activate_native_markdown_sidebar_row(index)?;
-                let pending = ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
+                if !ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
                     active
                         .as_ref()
                         .is_some_and(|surface| surface.pending_note_switch.is_some())
-                });
-                if !pending {
-                    // 没有实际排队的旧图就未覆盖 handoff 关闭边界，不能继续普通关闭冒充该场景。
-                    return Err("the old note handoff was not actually pending".into());
+                }) {
+                    return Err("旧笔记真实交接没有进入 pending，不能冒充普通关闭".into());
                 }
-                // 同一程序事务可在旧 handoff 回调排队后请求关闭；产品必须纳入该旧资源 ledger。
                 self.request_close()?;
                 self.input_started_close.set(true);
                 Ok(())
             }
-            6 => {
-                // 正文冲突先建立未保存的 canonical 草稿，与场景 7 的表格客户端草稿分别覆盖。
-                let view = active_document_view()?;
-                let input = ProtocolObject::<dyn NSTextInputClient>::from_ref(view.as_super());
-                // SAFETY: 合成 NSString 和有限插入范围在同步输入调用期间有效。
+            Case::BodyConflict => {
+                let view = with_active_native_markdown_surface(|surface| {
+                    if !self.owns(surface) {
+                        return Err("正文冲突原窗口已撤销".into());
+                    }
+                    Ok(surface
+                        .editor
+                        .as_ref()
+                        .expect("原身份已核")
+                        .text_view
+                        .clone())
+                })?;
+                let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**view);
+                // SAFETY: 固定小串插在合法 BOF，原 source/历史由正式 Input 事务维护。
                 unsafe {
-                    input.insertText_replacementRange(
+                    client.insertText_replacementRange(
                         ns_string!("resource-unsaved-draft\n"),
                         NSRange::new(0, 0),
                     );
                 }
                 Ok(())
             }
-            // 未知输入路径不能退化为无输入关闭；覆盖不完整必须使整个场景失败。
-            _ => Err("unknown resource probe case".into()),
         }
     }
 
-    /// 只有新增的分事件场景在固定两步中的第一步之后，再投递一次真实 input 事件。
-    pub(crate) fn more_input_events(&self) -> bool {
-        self.case == 8 && self.field_input_step.get() == 1
+    pub fn more_input_events(&self) -> bool {
+        self.case == Case::SequentialReplaceFields && self.field_input_step.get() == 1
     }
-
-    /// 驱动只对预先声明的 handoff 场景跳过另一个 close 事件，不重复关闭或更改等待阶段。
-    pub(crate) fn input_started_close(&self) -> bool {
+    pub fn input_started_close(&self) -> bool {
         self.input_started_close.get()
     }
 
-    /// 失败预检必须保留原生 owner 和 canonical 草稿，然后才进行允许成功的资源清理。
-    pub(crate) fn request_close(&self) -> Result<(), String> {
-        if matches!(self.case, 0..=4 | 7 | 8) {
-            // 输入事件已经返回；在独立事件验证实际客户端 Undo/Redo，再开始可失败关闭。
+    /// 冲突必须先被真实保存预检拒绝且保留原草稿；恢复独立 FD 基线后才另行显式请求关闭。
+    pub fn request_close(&self) -> Result<(), String> {
+        if matches!(
+            self.case,
+            Case::UnsubmittedSearch
+                | Case::SubmittedSearch
+                | Case::FindField
+                | Case::ReplaceFields
+                | Case::SequentialReplaceFields
+        ) {
             let observation = self.field_history.borrow().clone();
             verify_focused_field_history(observation.as_ref())?;
-            if matches!(self.case, 3 | 8) {
-                // 第一字段已经正常提交/辞任；第二字段 Undo/Redo 不能误改它的值或重新接管其客户端。
-                let first = with_active_native_markdown_surface(|surface| {
-                    surface
-                        .editor
-                        .as_ref()
-                        .and_then(|editor| {
-                            editor.find_resources.borrow().fields().into_iter().next()
-                        })
-                        .ok_or_else(|| "the prior Find field disappeared".to_owned())
-                })?;
-                if first.currentEditor().is_some()
-                    || !first.stringValue().isEqualToString(ns_string!("Probe查找"))
-                {
-                    return Err("the ended Find field changed while undoing the next client".into());
+        }
+        if matches!(
+            self.case,
+            Case::ReplaceFields | Case::SequentialReplaceFields
+        ) {
+            let first = with_active_native_markdown_surface(|surface| {
+                if !self.owns(surface) {
+                    return Err("Replace 关闭前原窗口已撤销".into());
                 }
+                surface
+                    .editor
+                    .as_ref()
+                    .expect("原身份已核")
+                    .find_resources
+                    .borrow()
+                    .fields()
+                    .into_iter()
+                    .next()
+                    .ok_or("原 Find 首字段已结束".into())
+            })?;
+            if first.currentEditor().is_some()
+                || !first.stringValue().isEqualToString(ns_string!("Probe查找"))
+            {
+                return Err("结束首字段在后继 Replace 客户历史中被改动或复活".into());
             }
         }
         let request = PluginCloseRequest {
             intent: PluginCloseIntent::DismissAndResume,
             scope: PluginCloseScope::ForegroundTransition,
         };
-        if matches!(self.case, 6 | 7) {
-            let (controller, view, generation) = with_active_native_markdown_surface(|surface| {
-                let editor = surface
-                    .editor
-                    .as_ref()
-                    .ok_or("rejected-close editor missing")?;
-                Ok((
-                    Weak::from_retained(&surface.controller),
-                    Weak::from_retained(&editor.backend.text_view),
-                    editor.document().borrow().generation(),
-                ))
-            })?;
-            // 私有夹具故意改变磁盘版本；新文档私有 snapshot 不受 truncate/重写影响。
-            let path = self.directory.join("vault/A.md");
-            std::fs::write(&path, "# External resource-probe revision\n")
-                .map_err(|error| error.to_string())?;
-            if request_native_markdown_close(request).is_ok()
-                || self.lifecycle.accepted.get().is_some()
-            {
-                // 磁盘冲突必须在 Host admission 前拒绝；accepted 后的 Closing 不能冒充可恢复失败。
-                return Err("save conflict incorrectly accepted the resource close".into());
+        // 两类冲突都发生在真实磁盘基线之后，正文与格客户端分别走原保存前置事务。
+        // 若关闭已错误接受，立即保留失败，不再把恢复文件或第二次关闭解释为首次成功。
+        if matches!(self.case, Case::BodyConflict | Case::CellConflict) {
+            let before = self
+                .document
+                .upgrade()
+                .ok_or("冲突场景原文稿已释放")?
+                .borrow()
+                .generation();
+            std::fs::write(&self.path, "# External resource-probe revision\n")
+                .map_err(|cause| cause.to_string())?;
+            if request_native_markdown_close(request).is_ok() {
+                return Err("真实保存冲突错误地接受了关闭".into());
             }
             with_active_native_markdown_surface(|surface| {
-                let current = surface
-                    .editor
-                    .as_ref()
-                    .ok_or("failed save removed the editor")?;
-                // 必须保留同一可编辑图和草稿；表格辞任可先提交 canonical，因此只禁止代次倒退。
-                if !controller
-                    .load()
-                    .is_some_and(|expected| std::ptr::eq(&*expected, &*surface.controller))
-                    || !view.load().is_some_and(|expected| {
-                        std::ptr::eq(&*expected, &*current.backend.text_view)
-                    })
-                    || !current.backend.text_view.isEditable()
-                    || !current.backend.text_storage.ivars().accepts_edits.get()
-                    || current.document().borrow().generation() < generation
-                    || current
+                if !self.owns(surface) {
+                    return Err("保存冲突销毁或替换了原业务图".into());
+                }
+                let editor = surface.editor.as_ref().expect("原身份已核");
+                if !editor.text_view.session_is_current()
+                    || editor.document().borrow().generation() < before
+                    || editor
                         .document()
                         .borrow()
                         .find_utf16(
-                            if self.case == 7 {
+                            if self.case == Case::CellConflict {
                                 "resource-cell-draft"
                             } else {
                                 "resource-unsaved-draft"
@@ -752,93 +686,94 @@ impl NativeMarkdownResourceProbe {
                             false,
                             true,
                         )
-                        .map_err(|error| error.to_string())?
+                        .map_err(|cause| cause.to_string())?
                         .is_none()
                 {
-                    return Err("failed save did not preserve the original editable draft".into());
+                    return Err("保存冲突没有保留原可编辑 canonical 草稿".into());
                 }
                 Ok(())
             })?;
-            // 恢复私有 fixture 的原始基线字节，下一次显式保存按真实冲突契约重试。
-            std::fs::write(&path, crate::native_markdown_runtime_probe_fixture())
-                .map_err(|error| error.to_string())?;
+            // 只还原 Host 声明的这个合成文件，独立匿名 FD 分块读取，不截取或复制长正文。
+            let mut baseline = self.baseline.borrow_mut();
+            baseline.rewind().map_err(|cause| cause.to_string())?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&self.path)
+                .map_err(|cause| cause.to_string())?;
+            let mut bytes = [0u8; 8192];
+            loop {
+                let count = baseline
+                    .read(&mut bytes)
+                    .map_err(|cause| cause.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                file.write_all(&bytes[..count])
+                    .map_err(|cause| cause.to_string())?;
+            }
+            file.sync_all().map_err(|cause| cause.to_string())?;
         }
-        if self.case == 0 {
-            // TLS 借用先结束；公开原生窗口动作自行弱排队，局部 panel 在队列执行前正常释放。
-            let panel = with_active_native_markdown_surface(|surface| Ok(surface.panel.clone()))?;
-            panel.performClose(None);
+        // 主动结束真正格草稿后捕本次保存摘要；外部 Host admission 和资源证明仍只走原关闭事务。
+        if self.case != Case::PendingNoteClose {
+            with_active_native_markdown_surface(|surface| {
+                if !self.owns(surface) {
+                    return Err("关闭前原资源窗口已撤销".into());
+                }
+                let editor = surface.editor.as_ref().expect("原身份已核");
+                editor.commit_marked_text(false)?;
+                self.expected_saved.set(
+                    editor
+                        .document()
+                        .borrow()
+                        .current_revision()
+                        .map_err(|cause| cause.to_string())?,
+                );
+                Ok(())
+            })?;
+        }
+        if self.case == Case::UnsubmittedSearch {
+            let panel = self.window.load().ok_or("原关闭窗口已释放")?;
+            panel.performClose(None); // 只此原窗口动作具有 ExitToLauncher 意图。
             Ok(())
         } else {
-            // 显式 SDK 隐藏保持其原请求，不能借窗口入口改变全局唤出键的切换语义。
             request_native_markdown_close(request)
         }
     }
 
-    /// 仅在产品实际发出一次精确资源收据后清理 portable 会话和私有测试目录。
-    pub(crate) fn finish(self) -> Result<(), String> {
-        // 此处消费产品完成验证后的通知，不从两个相等标量重新推导 native 或业务 payload 已释放。
-        if self.lifecycle.completed.get() != self.lifecycle.accepted.get()
-            || self.lifecycle.completed.get().is_none()
-        {
-            return Err("resource fixture did not receive its exact lifecycle receipt".into());
-        }
-        // 任何产品 owner 槽仍被占用都不能结束夹具；清理测试目录不能替代产品自己的资源收据。
+    /// Host 已收到生产 matching lifecycle 后调用；独立测试 FD 不列为产品泄漏，图弱票必须真实失效。
+    pub fn verify_closed(&self) -> Result<(), String> {
+        MainThreadMarker::new().ok_or("资源关闭检查必须在 AppKit 主线程执行")?;
         if ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(Option::is_some)
             || CLOSING_NATIVE_MARKDOWN_SURFACE.with_borrow(Option::is_some)
             || FINALIZING_NATIVE_MARKDOWN_CLOSE.with_borrow(Option::is_some)
+            || self.document.upgrade().is_some()
+            || self.body.upgrade().is_some()
+            || self.view.load().is_some()
+            || self
+                .child
+                .borrow()
+                .as_ref()
+                .is_some_and(|child| child.upgrade().is_some())
         {
-            return Err("resource fixture retained a native product owner after receipt".into());
+            return Err("真实资源场景仍持业务图或原文稿".into());
         }
-        if let Some(expected) = self.lifecycle.expected_saved.get() {
-            // 旧业务 owner 已结束后再独立重开私有文件，比较实际磁盘字节的内容 revision。
-            let saved =
-                MarkdownDocumentBuffer::open(&self.directory.join("vault/A.md"), 2 * 1_024 * 1_024)
-                    .map_err(|error| error.to_string())?;
-            if saved
-                .current_revision()
-                .map_err(|error| error.to_string())?
-                != expected
-            {
-                return Err("resource close did not persist the accepted canonical bytes".into());
-            }
-            drop(saved);
+        // 不能只用父窗口 nil 推测所有业务载荷已经结束。
+        // 原初始 Native/映射收据逐项核对；Host另外完成其完整 accepted→finish_close 资源证明。
+        self.owned.verify_released()?;
+        self.backing.verify_released()?;
+        // 只有原图和 mmap 已真正退出后，才独立打开保存文件核内容摘要。
+        // 这份只读核验模型在当前同步栈结束，不成为新的产品正文或后台图。
+        let saved = MarkdownDocumentBuffer::open(&self.path, 2 * 1024 * 1024)
+            .map_err(|cause| cause.to_string())?;
+        if saved
+            .current_revision()
+            .map_err(|cause| cause.to_string())?
+            != self.expected_saved.get()
+        {
+            return Err("真实关闭没有保存本次已接受的 canonical 字节".into());
         }
-        self.workspace.close_session();
-        if self.case == 0 {
-            // 仅在产品严格资源回执及保存字节检查通过后记录真实窗口关闭的具体意图。
-            println!(
-                "omni_window_close verified=true intent=ExitToLauncher strict_release=true application_quit=false"
-            );
-        }
-        println!("markdown_resource_case_{}_passed=true", self.case);
-        std::fs::remove_dir_all(&self.directory)
-            .map_err(|error| format!("remove private resource fixture: {error}"))
-    }
-
-    /// 失败只报告标量及静态角色，不读取或输出用户正文或路径。
-    pub(crate) fn failure_diagnostic(&self) -> String {
-        let pending = FINALIZING_NATIVE_MARKDOWN_CLOSE.with_borrow(|completion| {
-            completion.as_ref().map(|completion| {
-                (
-                    completion.owned.clone(),
-                    completion.cohort.diagnostic(),
-                    completion.resources.diagnostic(),
-                )
-            })
-        });
-        let pending = pending.map(|(owned, full, resources)| {
-            format!(
-                "full=[{full}] resources=[{resources}] owned={:?}",
-                owned.verify_released().err()
-            )
-        });
-        format!(
-            "resource_case={} accepted={} completed={} pending={}",
-            self.case,
-            self.lifecycle.accepted.get().is_some(),
-            self.lifecycle.completed.get().is_some(),
-            pending.as_deref().unwrap_or("none")
-        )
+        Ok(())
     }
 }
 
@@ -956,7 +891,13 @@ fn field_history_failure_diagnostic(
         .and_then(Weak::load);
     let responder = panel.and_then(NSWindow::firstResponder);
     let current_editor = field.as_ref().and_then(|field| field.currentEditor());
-    let body = active_document_view().ok();
+    let body = ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
+        active
+            .as_ref()?
+            .editor
+            .as_ref()
+            .map(|editor| editor.text_view.clone())
+    });
     let borrowed = controller.ivars().borrowed.borrow().clone();
     // 指针只在本次同步观测中比较活对象身份，从不输出或跨阶段缓存地址。
     let same = |left: *const (), right: *const ()| left == right;

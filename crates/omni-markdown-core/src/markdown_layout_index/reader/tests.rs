@@ -26,7 +26,7 @@ fn empty_final_handoff_creates_one_real_file_without_allocating_a_record_buffer(
     let observer = index.resource_observer();
     assert!(!observer.snapshot().file_open);
     assert_eq!(observer.snapshot().peak_buffer_bytes, 0);
-    let mut reader = index.into_reader().unwrap();
+    let reader = index.into_reader().unwrap();
     // 空输出也移交真实File，Reader的现有close和逻辑EOF协议不需要空实现或备用owner。
     assert!(observer.snapshot().file_open);
     #[cfg(feature = "paged-graphemes")]
@@ -59,7 +59,6 @@ fn seal_moves_the_same_file_to_a_naturally_send_reader_and_closes_on_worker() {
 
     // 构建器未跨线程；只有封存后的原File与原子收据被真实移交，且读取不再建立映射。
     std::thread::spawn(move || {
-        let mut reader = reader;
         assert_eq!(reader.len(), 2051);
         assert_eq!(reader.read(2050).unwrap(), record::<64>(2050));
         let mut output = [[0; 64]; 256];
@@ -83,7 +82,7 @@ fn seal_moves_the_same_file_to_a_naturally_send_reader_and_closes_on_worker() {
 #[test]
 fn each_batch_limit_and_exact_output_length_revoke_without_modifying_output() {
     fn rejects<const N: usize>(range: Range<usize>, output_count: usize) {
-        let mut reader = index::<N>(300).into_reader().unwrap();
+        let reader = index::<N>(300).into_reader().unwrap();
         let observer = reader.resource_observer();
         let mut output = vec![[0xab; N]; output_count];
         assert!(matches!(
@@ -108,7 +107,7 @@ fn each_batch_limit_and_exact_output_length_revoke_without_modifying_output() {
 
 #[test]
 fn actual_short_read_keeps_partial_output_negative_and_returns_the_file() {
-    let mut reader = index::<64>(2).into_reader().unwrap();
+    let reader = index::<64>(2).into_reader().unwrap();
     let observer = reader.resource_observer();
     // 只在测试内截短原唯一File，制造真实pread短读后EOF；不复制FD或提前关闭可复用descriptor。
     reader.file.as_ref().unwrap().set_len(96).unwrap();

@@ -47,9 +47,15 @@ impl NativeMarkdownPagedTextViewDelegate for Delegate {
     fn current(&self, epoch: u64) -> bool {
         self.active.get() && epoch == 7
     }
-    fn virtual_viewport(&self, _: u64) -> Result<NativeMarkdownPagedVirtualViewport, Error> {
+    fn virtual_viewport(
+        &self,
+        _: u64,
+        bounds_width: f64,
+    ) -> Result<NativeMarkdownPagedVirtualViewport, Error> {
         Ok(NativeMarkdownPagedVirtualViewport {
             document_origin: NSPoint::ZERO,
+            layout_origin_x: 0.0,
+            layout_width: bounds_width,
             scroll_epoch: 1,
         })
     }
@@ -104,9 +110,11 @@ fn fixture() -> Fixture {
         }
         ready.expect("有限真实表格认证必须结束")
     };
-    let session =
-        NativeMarkdownPagedCellSession::begin(Rc::downgrade(&document), Rc::new(verified), 1, 0)
-            .unwrap();
+    let source = document
+        .borrow()
+        .verified_table_cell_source(&verified, 1, 0)
+        .unwrap();
+    let session = NativeMarkdownPagedCellSession::begin(Rc::downgrade(&document), source).unwrap();
     let input = NativeMarkdownPagedInput::new_cell(Rc::downgrade(&session)).unwrap();
     (file, document, session, input)
 }
@@ -179,7 +187,7 @@ fn run_case(mtm: MainThreadMarker, case: usize) {
                 let state = input.state().unwrap();
                 let permit = input.capture(7, &|epoch| epoch == 7).unwrap();
                 assert!(matches!(
-                    input.prepare_cell_commit(&permit, &|epoch| epoch == 7),
+                    input.prepare_cell_commit(&permit, None, None, &|epoch| epoch == 7),
                     Err(NativeMarkdownPagedInputError::Cell(
                         MarkdownCellDraftError::CommitLimit
                     ))

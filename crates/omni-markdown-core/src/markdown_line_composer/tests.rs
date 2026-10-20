@@ -2,6 +2,7 @@
 
 use super::*;
 mod engine;
+mod folding;
 mod font_probe;
 #[cfg(feature = "paged-shaping-frontier")]
 mod frontier;
@@ -21,6 +22,7 @@ fn font() -> MarkdownLayoutFont {
 }
 fn style() -> MarkdownLineComposeStyle {
     MarkdownLineComposeStyle {
+        presentation: Default::default(),
         points: 16.0,
         language: None,
         features: Vec::new(),

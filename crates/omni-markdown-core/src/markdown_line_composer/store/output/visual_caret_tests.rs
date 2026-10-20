@@ -4,6 +4,11 @@ use super::*;
 use crate::{
     MarkdownComposedCaretAssociation as Association, MarkdownComposedVisualGraphemeAnswer as Answer,
 };
+#[path = "trailing_whitespace_tests.rs"]
+mod trailing_whitespace_tests;
+#[cfg(feature = "paged-shaping-frontier")]
+#[path = "visual_word_tests.rs"]
+mod word_tests;
 
 fn output(fixture: &Fixture) -> MarkdownComposedLines {
     let mut worker = MarkdownLineComposer::new(
@@ -18,7 +23,7 @@ fn output(fixture: &Fixture) -> MarkdownComposedLines {
     worker.into_output().unwrap()
 }
 
-/// Only finite business tests drive this cursor to completion; production returns to its queue after each step.
+/// 仅有限真实业务夹具推进到终点；生产客户每个量子后回到原队列。
 fn neighbor(
     output: &mut MarkdownComposedLines,
     part: &MarkdownComposedLinePart,
@@ -40,6 +45,32 @@ fn use_arabic_font(fixture: &mut Fixture) {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../vendor/harfrust/tests/fonts/in-house/SimpArabicTest.ttf"
+    ));
+    let name = read_fonts::FontRef::from_index(bytes, 0)
+        .unwrap()
+        .table_data(read_fonts::types::Tag::new(b"name"))
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    let font = crate::MarkdownLayoutFont::resolve_name_table_at_size(
+        Arc::new(bytes.as_slice()),
+        &name,
+        &[],
+        16.0,
+    )
+    .unwrap();
+    fixture.font = fixture.catalog.register(&font).unwrap();
+}
+
+/// U+0600 必须使用确实覆盖该字符的原字体；旧 PUA Arabic 样本只有历史字母映射。
+fn use_prepend_font(fixture: &mut Fixture) {
+    // 未改造的 Amiri 1.002，源提交 04d40ee68cc6b8cb6870eca81a8a7451165aa95a。
+    // https://github.com/aliftype/amiri/releases/download/1.002/Amiri-1.002.zip
+    // 原 TTF SHA256：ab391c4147d054c48976e98322ad0eefe1427aa0e0502a12a4c75d80a70cfcd7。
+    // 必要 OFL 与字体同目录；仅作为测试编译输入，不装入正式应用或复制系统字体。
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fonts/amiri/Amiri-Regular.ttf"
     ));
     let name = read_fonts::FontRef::from_index(bytes, 0)
         .unwrap()
@@ -180,7 +211,7 @@ fn combining_interior_is_rejected_instead_of_becoming_a_visual_step() {
     ));
 }
 
-/// Drive one original record at a time; the expectation comes from the finite source, not directory counters.
+/// 每回合只读一条原记录；预期来自有限原文，不从私有目录计数反推。
 fn visual(
     output: &mut MarkdownComposedLines,
     head: usize,
@@ -263,6 +294,87 @@ fn quota_one_visual_uses_actual_soft_lines_and_unknown_prefix_is_not_eof() {
     assert!(
         matches!(visual(&mut output,first.source_utf16.end,false,false),Visual::Found{utf16,ordinal:0,..} if utf16==first.source_utf16.end-1)
     ); // 软行入口没有字符：原CM的一次Left/Right必须越过真实ASCII GCB，不先消耗亲和性动作。
+}
+
+#[test]
+fn quota_one_visual_keeps_prepend_graphemes_across_actual_bidi_shaping_parts() {
+    use crate::MarkdownComposedVisualAnswer as Visual;
+    for text in ["\u{600}  ", "\u{600}ا"] {
+        // U+0600 与后一个标量属于同一 GCB，但原 UBA 可以在其内部产生不同 level 的整形项。
+        // 使用实际字体和 Composer，不能靠改 level、伪造 glyph 或目录记录构造这条边界。
+        let mut fixture = Fixture::new(text);
+        use_prepend_font(&mut fixture);
+        let source = fixture.source.resource_observer();
+        let mapping = fixture.source.original_backing_observer().unwrap();
+        let mut output = self::output(&fixture);
+        let resources = output.resource_observer();
+        let last = text.encode_utf16().count();
+
+        // 用户不能把簇内部的标量位置作为箭头起点；拒绝只结束这一次无效请求。
+        let mut invalid = output
+            .visual_query(
+                1,
+                crate::MarkdownComposedLineAffinity::Downstream,
+                None,
+                true,
+            )
+            .unwrap();
+        let mut rejected = false;
+        for _ in 0..32768 {
+            match output.step_visual(&mut invalid, 1) {
+                Err(Error::InvalidRequest) => {
+                    rejected = true;
+                    break;
+                }
+                Ok(step) => {
+                    assert!(step.records <= 1);
+                    assert_eq!(step.answer, Visual::Pending);
+                }
+                Err(cause) => panic!("簇内部输入不得污染健康 Output：{cause:?}"),
+            }
+        }
+        assert!(rejected, "真实 GCB 校验必须明确拒绝 UTF16=1");
+
+        // 两个屏幕方向都经原真实视觉项和同一条 GCB 目录续算，任何终点都不能停在内部 seam。
+        // 对 RTL 样本保留原方向与亲和性，不拿源下标的正负方向代替屏幕方向。
+        let mut reached_other_boundary = false;
+        for at in [0, 2, last] {
+            for right in [false, true] {
+                let answer = visual(&mut output, at, false, right);
+                let Visual::Found { utf16, .. } = answer else {
+                    panic!("完整短文的实际视觉动作必须完成：text={text:?} answer={answer:?}");
+                };
+                assert!(utf16 == 0 || utf16 == 2 || utf16 == last);
+                reached_other_boundary |= at == 0 && utf16 == 2;
+                if text.ends_with("  ") {
+                    let expected = match (at, right) {
+                        (0, false) => 0,
+                        (0, true) | (3, false) => 2,
+                        (2, false) => 0,
+                        (2, true) | (3, true) => 3,
+                        _ => unreachable!("该有限原文只含三个真实 GCB 端点"),
+                    };
+                    assert_eq!(utf16, expected, "head={at}, right={right}");
+                }
+            }
+        }
+        assert!(
+            reached_other_boundary,
+            "原同一字素必须能通过实际箭头动作越过"
+        );
+
+        // 导航不能改 canonical、历史或磁盘；仍存活的弱查询也不能保活 Reader 和原文件映射。
+        let path = fixture._directory.path().join("真实行查找.md");
+        assert_eq!(std::fs::read(path).unwrap(), text.as_bytes());
+        assert!(!fixture.document.is_dirty() && !fixture.document.can_undo());
+        output.close().unwrap();
+        drop(fixture);
+        let actual = resources.snapshot();
+        assert!(!actual.file_open && actual.mapped_bytes == 0 && !actual.cleanup_failed);
+        assert!(source.payload_released());
+        assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0 && !mapping.failed());
+        drop(invalid);
+    }
 }
 
 #[test]

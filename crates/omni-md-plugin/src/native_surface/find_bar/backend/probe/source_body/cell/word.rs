@@ -624,14 +624,14 @@ fn ordered_selection_inputs(rig: &mut Rig) -> Result<(), String> {
 }
 
 /// 在同一实际帧事件中领取这一动作的错误，随后仍沿原Frame核完整票、三秒和原像素门。
-struct MoveRejectionFrame {
+struct WordMoveFrame {
     frame: Rc<frame::Frame>,
     view: Rc<Retained<NativeMarkdownPagedTextView>>,
     error:
         RefCell<Option<crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError>>,
 }
 
-impl NativeMarkdownPagedBodyPaintObserver for MoveRejectionFrame {
+impl NativeMarkdownPagedBodyPaintObserver for WordMoveFrame {
     fn frame_published(&self, key: &NativeMarkdownPagedSceneKey, paints: usize) {
         *self.error.borrow_mut() = self.view.take_failure(); // 真实错误只移交给本用例，不转成Pending或吞掉Source错误。
         self.frame.frame_published(key, paints);
@@ -718,49 +718,140 @@ fn move_words(rig: &mut Rig) -> Result<(), String> {
     finish(rig, "cell_word_move_restore_seed", restore)?;
     check(rig, "seed", original_selection)?;
 
-    // 原全源确有RTL时拒绝本次视觉移动，但同一已接纳队列的Typing仍必须结算。
-    select(rig, 0..4)?;
-    let original_selection = rig
-        .view
-        .input_state()
-        .map_err(|cause| cause.to_string())?
-        .selection;
-    let setup = observe(&rig.body)?;
-    insert(rig, "one אבג ", unspecified());
-    finish(rig, "cell_word_move_mixed_setup", setup)?;
-    let before = rig.view.input_state().map_err(|cause| cause.to_string())?;
-    let frame = frame::pending()?;
-    let rejected = Rc::new(MoveRejectionFrame {
-        frame: Rc::clone(&frame),
-        view: Rc::clone(&rig.view),
-        error: RefCell::new(None),
-    });
-    let erased: Rc<dyn NativeMarkdownPagedBodyPaintObserver> = rejected.clone();
-    rig.body
-        .observe_next_cpu_frame(Rc::downgrade(&erased))
-        .map_err(|cause| cause.to_string())?;
-    command(rig, sel!(moveWordBackward:));
-    insert(rig, "x", unspecified());
-    finish(rig, "cell_word_move_mixed_keeps_typing", frame)?;
-    if !matches!(rejected.error.borrow_mut().take(), Some(crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::UnsupportedCommand)) {
-        return Err("真实混合Bidi移动没有逐项交付能力拒绝".into());
-    }
-    drop((erased, rejected)); // 帧回调的Native边只属于本次有限观察，必须在后续关闭之前实际归还。
-    if rig
-        .view
-        .input_state()
-        .map_err(|cause| cause.to_string())?
-        .generation
-        != before.generation + 1
-    {
-        return Err("能力拒绝错误丢弃了原链后续已接纳文字".into());
-    }
-    check(rig, "one אבג x", MarkdownTextSelection::caret(9))?;
-    for (expected, selection) in [("one אבג ", before.selection), ("seed", original_selection)] {
-        let undo = observe(&rig.body)?;
-        command(rig, sel!(undo:));
-        finish(rig, "cell_word_move_mixed_one_typing_undo", undo)?;
-        check(rig, expected, selection)?;
+    // 同一真实队列核逻辑前后、RTL 屏幕左右、非空收拢及保锚扩选；后继 Typing 必须落在精确目标。
+    for (text, from, to, selector, moved, expected, final_head) in [
+        (
+            "one אבג ",
+            0,
+            0,
+            sel!(moveWordForward:),
+            MarkdownTextSelection::caret(3),
+            "onex אבג ",
+            4,
+        ),
+        (
+            "one אבג ",
+            8,
+            8,
+            sel!(moveWordBackward:),
+            MarkdownTextSelection::caret(4),
+            "one xאבג ",
+            5,
+        ),
+        (
+            "سلام عالم",
+            0,
+            0,
+            sel!(moveWordLeft:),
+            MarkdownTextSelection::caret(4),
+            "سلامx عالم",
+            5,
+        ),
+        (
+            "سلام عالم",
+            9,
+            9,
+            sel!(moveWordRight:),
+            MarkdownTextSelection::caret(5),
+            "سلام xعالم",
+            6,
+        ),
+        (
+            "سلام عالم",
+            1,
+            3,
+            sel!(moveWordLeft:),
+            MarkdownTextSelection::caret(3),
+            "سلاxم عالم",
+            4,
+        ),
+        (
+            "سلام عالم",
+            1,
+            3,
+            sel!(moveWordRight:),
+            MarkdownTextSelection::caret(1),
+            "سxلام عالم",
+            2,
+        ),
+        (
+            "سلام عالم",
+            0,
+            0,
+            sel!(moveWordLeftAndModifySelection:),
+            MarkdownTextSelection {
+                anchor_utf16: 0,
+                head_utf16: 4,
+            },
+            "x عالم",
+            1,
+        ),
+        (
+            "سلام عالم",
+            9,
+            9,
+            sel!(moveWordRightAndModifySelection:),
+            MarkdownTextSelection {
+                anchor_utf16: 9,
+                head_utf16: 5,
+            },
+            "سلام x",
+            6,
+        ),
+    ] {
+        select(rig, 0..4)?;
+        let original_selection = rig
+            .view
+            .input_state()
+            .map_err(|cause| cause.to_string())?
+            .selection;
+        let setup = observe(&rig.body)?;
+        insert(rig, text, unspecified());
+        finish(rig, "cell_word_four_directions_setup", setup)?;
+        let selection = observe(&rig.body)?;
+        select(rig, from..to)?;
+        finish(rig, "cell_word_four_directions_origin", selection)?;
+        let before = rig.view.input_state().map_err(|cause| cause.to_string())?;
+        if let Some(cause) = rig.view.take_failure() {
+            return Err(format!(
+                "四向 Word 原位置准备失败 selector={selector:?}: {cause}"
+            ));
+        }
+        let frame = frame::pending()?;
+        let observed = Rc::new(WordMoveFrame {
+            frame: Rc::clone(&frame),
+            view: Rc::clone(&rig.view),
+            error: RefCell::new(None),
+        });
+        let erased: Rc<dyn NativeMarkdownPagedBodyPaintObserver> = observed.clone();
+        rig.body
+            .observe_next_cpu_frame(Rc::downgrade(&erased))
+            .map_err(|cause| cause.to_string())?;
+        command(rig, selector);
+        insert(rig, "x", unspecified());
+        finish(rig, "cell_word_four_directions_ordered_typing", frame)?;
+        if let Some(cause) = observed.error.borrow_mut().take() {
+            return Err(format!(
+                "四向 Word 实际动作失败 selector={selector:?}: {cause}"
+            ));
+        }
+        drop((erased, observed)); // 本帧观察的 Native 强边在 Undo 或关闭前真实归还。
+        if rig
+            .view
+            .input_state()
+            .map_err(|cause| cause.to_string())?
+            .generation
+            != before.generation + 1
+        {
+            return Err("Word 建立了额外字符事务或丢失后继 Typing".into());
+        }
+        check(rig, expected, MarkdownTextSelection::caret(final_head))?;
+        for (expected, selection) in [(text, moved), ("seed", original_selection)] {
+            let undo = observe(&rig.body)?;
+            command(rig, sel!(undo:));
+            finish(rig, "cell_word_four_directions_exact_undo", undo)?;
+            check(rig, expected, selection)?;
+        }
     }
     Ok(())
 }
@@ -927,7 +1018,7 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
         check(rig, text, selection)?;
     }
     println!(
-        "native_body_cell word_delete_native=true word_select_native=true double_click_native=true word_drag_native=true shift_word_drag_native=true same_word_drag_direction_matches_codemirror=true selection_no_text_history=true select_then_delete_order_verified=true select_typing_delete_order_verified=true exact_local_unicode=true canonical_unchanged=true single_undo_redo=true bof_eof_empty_history=true input_revoked_real_pending=true repeat_order_verified=true reverse_order_verified=true ordinary_nsnotfound_order_verified=true ime_order_verified=false visual_bidi_word_motion_verified=false original_two_mebibyte_workload_preserved=true formal=false"
+        "native_body_cell word_delete_native=true word_select_native=true double_click_native=true word_drag_native=true shift_word_drag_native=true same_word_drag_direction_matches_codemirror=true selection_no_text_history=true select_then_delete_order_verified=true select_typing_delete_order_verified=true exact_local_unicode=true canonical_unchanged=true single_undo_redo=true bof_eof_empty_history=true input_revoked_real_pending=true repeat_order_verified=true reverse_order_verified=true ordinary_nsnotfound_order_verified=true ime_order_verified=false visual_bidi_word_motion_verified=true original_two_mebibyte_workload_preserved=true formal=false"
     );
     Ok(())
 }

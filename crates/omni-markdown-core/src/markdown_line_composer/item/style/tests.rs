@@ -67,6 +67,7 @@ fn response(
             0..end,
             font,
             MarkdownLineComposeStyle {
+                presentation: Default::default(),
                 points: 16.0,
                 language: None,
                 features: Vec::new(),

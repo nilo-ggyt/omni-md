@@ -37,12 +37,10 @@ impl Canvas {
         {
             return Err("原像素视口或实际 backing scale 超出固定合成画布".into());
         }
-        let width = viewport.size.width * scale;
-        let height = viewport.size.height * scale;
-        if (width - width.round()).abs() > 1e-6 || (height - height.round()).abs() > 1e-6 {
-            return Err("原视口没有可精确对齐的实际 backing 像素尺寸".into());
-        }
-        let (width, height) = (width.round() as usize, height.round() as usize);
+        // 活动格的真实行高可以落在像素内部；与产品 CPU surface 一样向外取整，
+        // 保留原 scale、原点及精确 clip。不能把合法的亚像素视口改成整数点或裁掉末行。
+        let width = (viewport.size.width * scale).ceil() as usize;
+        let height = (viewport.size.height * scale).ceil() as usize;
         let mut pixels = vec![0; width * height * 4];
         // SAFETY: 系统公开 sRGB 静态名在本进程有效。
         let space =
@@ -110,16 +108,25 @@ pub(super) fn paint_scene(
         .map_err(|cause| cause.to_string())?;
     let mut steps = 0;
     loop {
+        // 首轮只给一条 metadata，实际领取窗口后必须可让出；后继仍沿同一绘图游标完成原帧。
+        let budget = if steps == 0 {
+            NativeMarkdownPagedScenePaintBudget {
+                glyphs: 1,
+                metadata_records: 1,
+            }
+        } else {
+            NativeMarkdownPagedScenePaintBudget::default()
+        };
         // 真实生产 session 每步继续原游标；绝不以一次无预算 paint 绕开原 bounded 路径。
         let step = session
-            .step(NativeMarkdownPagedScenePaintBudget::default(), current)
+            .step(budget, current)
             .map_err(|cause| cause.to_string())?;
         steps += 1;
         scene
             .validate_ready(current)
             .map_err(|cause| cause.to_string())?;
-        if step.work.glyphs > 256
-            || step.work.metadata_records > 32
+        if step.work.glyphs > budget.glyphs
+            || step.work.metadata_records > budget.metadata_records
             || step.work.batches > 256
             || started.elapsed() > Duration::from_secs(3)
         {
@@ -136,6 +143,138 @@ pub(super) fn paint_scene(
         }
     }
     Ok(steps)
+}
+
+/// 同一真实Scene的同步图与每步1/1预算异步图逐像素核对，完成票还须真实归还原context。
+/// 此处不读取Scene内部Grid、游标或publication；只消费产品Scene接口及真实像素资源操作。
+pub(super) fn exact_scene_rgba(
+    scene: Rc<dyn NativeMarkdownPagedTextScene>,
+    key: &NativeMarkdownPagedSceneKey,
+    scale: f64,
+    current: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    use crate::native_surface::viewport_pixels::{NativeMarkdownViewportPixels, TiledBitmap};
+    let expected = Canvas::scaled(key.request.viewport, scale)?;
+    let actual = Canvas::scaled(key.request.viewport, scale)?;
+    // 同步路径保原背景/选区循环，不调用新装饰游标；相同系统CG颜色与scale就是独立像素oracle。
+    scene
+        .paint(&expected.context, current)
+        .map_err(|cause| cause.to_string())?;
+    let started = Instant::now();
+    let mut session = scene
+        .clone()
+        .begin_cpu_paint(actual.context.clone(), current)
+        .map_err(|cause| cause.to_string())?;
+    let mut steps = 0;
+    loop {
+        let budget = NativeMarkdownPagedScenePaintBudget {
+            glyphs: 1,
+            metadata_records: 1,
+        };
+        let step = session
+            .step(budget, current)
+            .map_err(|cause| cause.to_string())?;
+        steps += 1;
+        scene
+            .validate_ready(current)
+            .map_err(|cause| cause.to_string())?;
+        // 预算对应真实主线程让出；不能只核最终图相同而允许一个格先同步处理所有parts。
+        if step.work.glyphs > budget.glyphs
+            || step.work.metadata_records > budget.metadata_records
+            || started.elapsed() > Duration::from_secs(3)
+        {
+            return Err("真实Grid分步绘制超出1/1预算或原三秒帧期限".into());
+        }
+        match step.outcome {
+            NativeMarkdownPagedScenePaintOutcome::Pending(next) => session = next,
+            NativeMarkdownPagedScenePaintOutcome::Complete(completion) => {
+                if !completion.permits(key, &actual.context) || completion.work().glyphs == 0 {
+                    return Err("真实Grid分步完成票丢失原Scene/context或实际字符绘制".into());
+                }
+                drop(completion); // 像素读取前归还游标与完成票的实际context强边。
+                break;
+            }
+        }
+    }
+    CGContext::flush(Some(&expected.context));
+    CGContext::flush(Some(&actual.context));
+    scene
+        .validate_ready(current)
+        .map_err(|cause| cause.to_string())?;
+    if let Some((pixel, (expected, actual))) = expected
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(actual.pixels.as_chunks::<4>().0)
+        .enumerate()
+        .find(|(_, (expected, actual))| expected != actual)
+    {
+        return Err(format!(
+            "真实Grid同步/1项预算异步RGBA不相同：pixel={pixel}, expected={expected:?}, actual={actual:?}"
+        ));
+    }
+
+    // 同一Scene另外使用产品的真实首tile验证context归还，不能把Canvas字段drop顺序当作释放成功。
+    // 原prepare_tile只有Native context release callback完成后才能seal实际mmap，外部claim未归还就失败。
+    let resources = std::sync::Arc::new(NativeMarkdownViewportPixels::default());
+    let observer = resources.observer();
+    let bitmap = TiledBitmap::new(
+        // 同一亚像素视口必须覆盖同一组外取整像素；不能在 context 归还控制里少分配边缘一行。
+        (key.request.viewport.size.width * scale).ceil() as usize,
+        (key.request.viewport.size.height * scale).ceil() as usize,
+        resources,
+    )
+    .map_err(|cause| cause.to_string())?;
+    let tile = bitmap.next_tile().ok_or("真实Grid像素候选没有首tile")?;
+    let writable = bitmap.begin_tile(tile).map_err(|cause| cause.to_string())?;
+    // 采用产品tile同一Y-up位置与真实scale；这个context只属于本函数尚未发布的实际候选。
+    CGContext::scale_ctm(Some(writable.context()), scale, scale);
+    CGContext::translate_ctm(
+        Some(writable.context()),
+        -key.request.viewport.origin.x - tile.x as f64 / scale,
+        -key.request.viewport.origin.y - tile.bottom as f64 / scale,
+    );
+    let mut session = scene
+        .clone()
+        .begin_cpu_paint(writable.context_claim(), current)
+        .map_err(|cause| cause.to_string())?;
+    loop {
+        let step = session
+            .step(NativeMarkdownPagedScenePaintBudget::default(), current)
+            .map_err(|cause| cause.to_string())?;
+        if started.elapsed() > Duration::from_secs(3) {
+            return Err("真实Grid完成context归还超过原帧期限".into());
+        }
+        match step.outcome {
+            NativeMarkdownPagedScenePaintOutcome::Pending(next) => session = next,
+            NativeMarkdownPagedScenePaintOutcome::Complete(completion) => {
+                if !completion.permits(key, writable.context()) {
+                    return Err("真实Grid完成票属于另一个tile context".into());
+                }
+                drop(completion);
+                break;
+            }
+        }
+    }
+    let prepared = bitmap
+        .prepare_tile(writable)
+        .map_err(|cause| cause.to_string())?;
+    drop(prepared); // 本资源对照不发布image；真实封存后的原mmap由生产owner立即归还。
+    drop(bitmap);
+    scene
+        .validate_ready(current)
+        .map_err(|cause| cause.to_string())?;
+    if !observer.is_released() {
+        return Err(format!(
+            "真实Grid完成context后像素资源未归还：{:?}",
+            observer.snapshot()
+        ));
+    }
+    println!(
+        "native_body_table_paint exact_sync_async_rgba=true metadata_budget=1 glyph_budget=1 actual_steps={steps} actual_context_sealed=true pixel_resources_released=true mid_paint_cancel_tested=false whole_product=false formal=false"
+    );
+    Ok(())
 }
 
 fn paint(rig: &Rig, key: &NativeMarkdownPagedSceneKey) -> Result<(), String> {

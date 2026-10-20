@@ -201,6 +201,38 @@ fn bound_point_size_keeps_old_scale_contract_and_rejects_a_different_size() {
 }
 
 #[test]
+fn incomplete_or_unrepresentable_horizontal_metrics_reject_the_entire_font_capture() {
+    let name = tables(ROBOTO).remove(b"name").unwrap();
+    let original = MarkdownLayoutFont::resolve(bytes(ROBOTO), NAME, &[]).unwrap();
+    let count = original.metadata().glyph_count as usize;
+    // 这些都是公开捕获边界的真实非法输入，不伪造一份“平台成功”推进表作Native oracle。
+    // 数量不足不能被默认hmtx补齐；非有限或超坐标推进不能饱和成另一个有效字宽。
+    for (case, advances) in [
+        ("missing_glyph_domain", Box::<[f64]>::default()),
+        ("not_finite", vec![f64::NAN; count].into_boxed_slice()),
+        ("infinite", vec![f64::INFINITY; count].into_boxed_slice()),
+        (
+            "coordinate_overflow",
+            vec![f64::MAX; count].into_boxed_slice(),
+        ),
+    ] {
+        assert!(
+            matches!(
+                MarkdownLayoutFont::resolve_name_table_at_size_with_horizontal_advances(
+                    bytes(ROBOTO),
+                    &name,
+                    &[],
+                    14.0,
+                    advances,
+                ),
+                Err(MarkdownLayoutFontError::InvalidHorizontalAdvances)
+            ),
+            "非法水平推进不得发布部分字体: {case}"
+        );
+    }
+}
+
+#[test]
 fn original_double_design_axes_require_exact_normalized_equivalence() {
     let variable = named_variable();
     let name = tables(&variable).remove(b"name").unwrap();

@@ -27,6 +27,7 @@ fn item_until(
                                 coverage,
                                 &fixture.font,
                                 MarkdownLineComposeStyle {
+                                    presentation: Default::default(),
                                     points,
                                     language: None,
                                     features: Vec::new(),

@@ -497,7 +497,7 @@ impl NativeMarkdownWindowSurface {
         let mut empty_label = None;
         if let Some(editor) = &editor {
             // The content view owns the mounted scroll graph while the surface owns its editor root.
-            content_view.addSubview(editor.backend.scroll_view());
+            content_view.addSubview(editor.scroll_view());
         } else {
             // Preserve an interactive navigation surface even when no document could be opened.
             let empty_message = if sidebar_scan_pending {
@@ -561,20 +561,8 @@ impl NativeMarkdownWindowSurface {
                 controller.present_pending_legacy_recovery();
             }
             // 表格真实编辑只弱引用窗口 controller；正文不增加窗口的强所有权环。
-            let _ = editor
-                .backend
-                .text_view
-                .ivars()
-                .controller
-                .set(Weak::from_retained(&controller));
-            editor
-                .backend
-                .text_view
-                .ivars()
-                .folds
-                .bind_owner(std::ptr::from_ref(&*controller).addr());
             // Only a live editor can own the initial text responder.
-            panel.setInitialFirstResponder(Some(editor.backend.input_view()));
+            panel.setInitialFirstResponder(Some(editor.input_view()));
         }
 
         // 仅登记本构造路径显式创建/配置的原生角色，不把 AppKit 内部子树升级为项目所有。
@@ -687,7 +675,7 @@ impl NativeMarkdownWindowSurface {
         );
 
         if let Some(editor) = &editor {
-            controller.bind_document_area(editor.backend.scroll_view());
+            controller.bind_document_area(editor.scroll_view());
             if !controller.layout_document_area(NativeMarkdownHeaderAuthority::Construction) {
                 return Err("笔记正文与反馈布局未能完成，请重新打开笔记窗口".into());
             }
@@ -749,9 +737,7 @@ impl NativeMarkdownWindowSurface {
         self.panel.orderFrontRegardless();
         self.panel.makeKeyWindow();
         if let Some(editor) = &self.editor
-            && !self
-                .panel
-                .makeFirstResponder(Some(editor.backend.input_view()))
+            && !self.panel.makeFirstResponder(Some(editor.input_view()))
         {
             // Focus refusal leaves the mounted editor usable through a later explicit click.
             self.controller
@@ -804,7 +790,7 @@ impl NativeMarkdownWindowSurface {
                 // 输入数量超出账本预算时不隐藏任何部分组件。
                 return Err(());
             }
-            let body: &NSView = editor.backend.scroll_view.as_super();
+            let body: &NSView = editor.scroll_view().as_super();
             let mut body_matches = 0_usize;
             for index in 0..count {
                 // 完整预检原 scroll_view 身份；不递归接管 AppKit 内部子树。
@@ -849,8 +835,9 @@ impl NativeMarkdownWindowSurface {
                 if !current() {
                     return Err(());
                 }
-                editor.backend.gutter.setHidden(true);
-                if !current() || !editor.backend.gutter.isHidden() || !current() {
+                let gutter = editor.scroll_view().verticalRulerView().ok_or(())?;
+                gutter.setHidden(true);
+                if !current() || !gutter.isHidden() || !current() {
                     return Err(());
                 }
                 hidden_components += 1;
@@ -1023,7 +1010,7 @@ impl NativeMarkdownWindowSurface {
             empty_label.removeFromSuperview();
         }
         // Mount after release verification, then publish the authoritative title/identity together.
-        content_view.addSubview(editor.backend.scroll_view());
+        content_view.addSubview(editor.scroll_view());
         // Core已成功打开并验证此笔记路径；标题沿同一file_stem规则，不依赖尚在异步刷新的目录页。
         // 目录名仍保留完整文件名规则，碰撞生成的数字后缀及标题内部的点也保持原值。
         let title = std::path::Path::new(&relative_path)
@@ -1042,22 +1029,9 @@ impl NativeMarkdownWindowSurface {
         self.controller.set_copy_document_available(true);
         self.controller.set_table_insertion_available(true);
         self.update_selected_note(Some(&relative_path));
-        let _ = editor
-            .backend
-            .text_view
-            .ivars()
-            .controller
-            .set(Weak::from_retained(&self.controller));
-        editor
-            .backend
-            .text_view
-            .ivars()
-            .folds
-            .bind_owner(std::ptr::from_ref(&*self.controller).addr());
         self.editor = Some(editor);
         let installed = self.editor.as_ref().expect("原editor刚完成唯一安装");
-        self.controller
-            .bind_document_area(installed.backend.scroll_view());
+        self.controller.bind_document_area(installed.scroll_view());
         let footer = NativeMarkdownFooterDocument::capture(&installed.document().borrow());
         self.controller
             .bind_conflict_note(NativeMarkdownCurrentNoteIntent::for_document(
@@ -1085,7 +1059,7 @@ impl NativeMarkdownWindowSurface {
         if feedback.permits(self) {
             // 文件操作期间已发生新B时不抢查询焦点，正文仍已作为可用补偿发布。
             self.panel
-                .setInitialFirstResponder(Some(editor.backend.input_view()));
+                .setInitialFirstResponder(Some(editor.input_view()));
         }
         if feedback.permits(self) {
             // 上一个Native setter也可能重入；只清仍属于本次原反馈的状态。
@@ -1097,9 +1071,7 @@ impl NativeMarkdownWindowSurface {
             self.controller.present_pending_legacy_recovery();
         }
         if feedback.permits(self)
-            && !self
-                .panel
-                .makeFirstResponder(Some(editor.backend.input_view()))
+            && !self.panel.makeFirstResponder(Some(editor.input_view()))
             && feedback.permits(self)
         {
             // 焦点失败也属于原操作反馈，不能在getter重入B后显示旧错误。
@@ -1129,7 +1101,7 @@ impl NativeMarkdownWindowSurface {
         )
     }
 
-    /// Apply the selected source/preview mode to current and subsequently opened editors.
+    /// 同一正文只更换排版策略；窗口模式、按钮和后续打开默认值都以实际接纳结果为准。
     pub(super) fn set_presentation_mode(
         &mut self,
         mode: MarkdownPresentationMode,
@@ -1139,17 +1111,123 @@ impl NativeMarkdownWindowSurface {
             self.controller.select_presentation_mode(mode);
             return Ok(());
         }
-        if let Some(editor) = &self.editor
-            && let Err(error) = editor.backend.set_presentation_mode(mode, &self.controller)
+        // 查找字段也可能正处于中文组合；先走原窗口辞任预检，不把候选迁到另一输入客户。
+        let previous = self.panel.firstResponder();
+        let find_focus = self.capture_mode_find_focus();
+        self.commit_marked_text(false)?;
+        self.resign_editor_responder()?;
+        if let Some(editor) = &mut self.editor
+            && let Err(error) = editor.set_presentation_mode(mode, &self.controller)
         {
-            // Rejected cell input keeps both the old presentation and the native picker coherent.
+            // 接纳前的拒绝保留旧模式；接纳后的 Native 重入可能撤销位置恢复，
+            // 但已退休的 Producer 不能回滚。始终读取真实正文模式，避免按钮与正文失配。
+            if let Some(editor) = &self.editor {
+                self.presentation_mode = editor.presentation_mode();
+            }
             self.controller
                 .select_presentation_mode(self.presentation_mode);
+            if self.presentation_mode == mode
+                && let Some(editor) = &self.editor
+                && let Err(mount) = editor.finish_mode_viewport_mount(&self.controller)
+            {
+                // 模式可能已接纳后被 Native 输入撤位；仍结束原未绑定票，不留下永远等待的空正文。
+                return Err(format!("{error}；{mount}"));
+            }
+            if let Some((field, range)) = find_focus {
+                self.restore_mode_find_focus(&field, range)
+                    .map_err(|restore| format!("{error}；{restore}"))?;
+            } else if let Some(previous) = previous
+                && !self.panel.makeFirstResponder(Some(&previous))
+            {
+                return Err(format!("{error}；无法恢复原输入焦点"));
+            }
             return Err(error);
         }
-        // Persist the accepted mode for later note opens only after the current editor accepted it.
-        self.presentation_mode = mode;
-        self.controller.select_presentation_mode(mode);
+        // 未打开文稿时只改变下一次打开默认值；当前文稿则必须已经真实接纳目标模式。
+        self.presentation_mode = self
+            .editor
+            .as_ref()
+            .map_or(mode, NativeMarkdownEditorSurface::presentation_mode);
+        self.controller
+            .select_presentation_mode(self.presentation_mode);
+        if let Some(editor) = &self.editor {
+            // 正文、scroll、Find 栏和字段客户都是原实例；只重算 ruler 显隐后的实际区域。
+            // 重复 addSubview 或重绑 Find 会额外改变层级和字段焦点，不属于模式动作。
+            self.controller
+                .layout_document_area(NativeMarkdownHeaderAuthority::Foreground);
+            self.panel
+                .setInitialFirstResponder(Some(editor.input_view()));
+            let focus = if let Some((field, range)) = find_focus {
+                self.restore_mode_find_focus(&field, range)
+            } else if self.panel.makeFirstResponder(Some(editor.input_view())) {
+                Ok(())
+            } else {
+                Err("展示模式已切换，但正文暂时无法获得键盘焦点".into())
+            };
+            // 焦点失败也必须交还本次挂载义务；否则已提交模式会永远停在 controller=None。
+            // 位置只使用原锚点；绑定失败在 Body 内撤同一票并恢复当前模式的普通排版。
+            let mounted = editor.finish_mode_viewport_mount(&self.controller);
+            match (focus, mounted) {
+                (Err(focus), Err(mount)) => return Err(format!("{focus}；{mount}")),
+                (Err(cause), Ok(())) | (Ok(()), Err(cause)) => return Err(cause),
+                (Ok(()), Ok(())) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// 模式动作只保原实际Find客户和有限NSRange；不把共享field editor地址当作查询/替换身份。
+    fn capture_mode_find_focus(&self) -> Option<(Retained<NSTextField>, Option<NSRange>)> {
+        let bar = self
+            .editor
+            .as_ref()
+            .and_then(|editor| editor.find_bar().borrow().clone())?;
+        let responder = self
+            .panel
+            .firstResponder()
+            .and_then(|view| view.downcast::<NSTextView>().ok())?;
+        for field in bar.fields() {
+            let actual = field.currentEditor();
+            if actual.as_ref().is_some_and(|actual| {
+                std::ptr::eq::<objc2_app_kit::NSText>(&**actual, responder.as_super())
+            }) {
+                let input = ProtocolObject::<dyn NSTextInputClient>::from_ref(&*responder);
+                // 组合候选由下面真实辞任完成；它的内部选择不能作为普通已提交查询选区强行恢复。
+                let selected = (!input.hasMarkedText()).then(|| responder.selectedRange());
+                return Some((
+                    field,
+                    selected.filter(|range| range.location != NSNotFound as usize),
+                ));
+            }
+        }
+        None
+    }
+
+    /// 同一原字段重新获得真实Native客户后恢复其选择，不重建控件或复制查询文字/Undo。
+    fn restore_mode_find_focus(
+        &self,
+        field: &NSTextField,
+        selected: Option<NSRange>,
+    ) -> Result<(), String> {
+        // SAFETY: 模式交接仍持唯一窗口owner，field来自该笔记原Find栏，并未清理或换目标。
+        unsafe {
+            field.selectText(None);
+        }
+        let editor = field
+            .currentEditor()
+            .and_then(|editor| editor.downcast::<NSTextView>().ok())
+            .ok_or("展示模式已切换，但原查找字段未恢复输入")?;
+        if let Some(selected) = selected {
+            let length = editor.string().length(); // 只借Native字段长度，不物化第二份查询或正文。
+            if selected
+                .location
+                .checked_add(selected.length)
+                .is_none_or(|end| end > length)
+            {
+                return Err("原查找输入在模式交接期间改变，未套用过期选区".into());
+            }
+            editor.setSelectedRange(selected);
+        }
         Ok(())
     }
 
@@ -1160,7 +1238,10 @@ impl NativeMarkdownWindowSurface {
             .editor
             .as_ref()
             .ok_or_else(|| "当前没有可编辑的 Markdown 笔记".to_owned())?;
-        editor.backend.insert_default_markdown_table();
+        editor
+            .text_view
+            .insert_default_table()
+            .map_err(|cause| cause.to_string())?;
         Ok(())
     }
 
@@ -1254,10 +1335,7 @@ impl NativeMarkdownWindowSurface {
         };
         if let Some(editor) = &self.editor {
             // 单元格和 Find 属于即将结束的编辑客户端，不把它们留在下一笔记的共享缓存内。
-            if let Some(field) = editor.backend.text_view.existing_table_cell_editor() {
-                fields.push(field);
-            }
-            let find = editor.find_resources.borrow().clone();
+            let find = editor.find_resources().borrow().clone();
             fields.extend(find.fields());
         }
         let field_refs: Vec<_> = fields.iter().map(|field| &**field).collect();
@@ -1271,18 +1349,16 @@ impl NativeMarkdownWindowSurface {
             close_window,
         );
         if let Some(editor) = &self.editor {
-            *editor.session_field_editor.borrow_mut() = released_field_editor.clone();
+            *editor.session_field_editor().borrow_mut() = released_field_editor.clone();
             let mut find = editor
-                .find_resources
+                .find_resources()
                 .replace(NativeMarkdownFindResources::default());
             // 原生清空可能重入，不能持 editor RefMut；完成后恢复仅弱元数据收据。
             find.finish_accepted();
-            *editor.find_resources.borrow_mut() = find;
-            let container = ProtocolObject::<dyn NSTextFinderBarContainer>::from_ref(
-                &*editor.backend.scroll_view,
-            );
+            *editor.find_resources().borrow_mut() = find;
+            let container =
+                ProtocolObject::<dyn NSTextFinderBarContainer>::from_ref(editor.scroll_view());
             container.setFindBarVisible(false);
-            editor.backend.text_view.setUsesFindBar(false);
         }
         (borrowed, released_field_editor)
     }
@@ -1380,8 +1456,7 @@ impl NativeMarkdownWindowSurface {
             self.controller.clear_status();
             if let Some(editor) = &self.editor {
                 // This branch has already established live editor ownership for the current note.
-                self.panel
-                    .makeFirstResponder(Some(editor.backend.input_view()));
+                self.panel.makeFirstResponder(Some(editor.input_view()));
             }
             return Ok(false);
         }
@@ -1390,7 +1465,7 @@ impl NativeMarkdownWindowSurface {
 
         // Marked-text commit may produce the final piece-tree edit, so it precedes saving.
         // A failed save leaves the old editor and its in-memory draft intact for user recovery.
-        self.commit_marked_text()?;
+        self.commit_marked_text(false)?;
         self.save_current_document()?;
         let release_barrier = self.destroy_current_editor()?;
         self.pending_note_switch = Some(PendingNativeMarkdownNoteSwitch {
@@ -1540,7 +1615,7 @@ impl NativeMarkdownWindowSurface {
         if release_editor {
             // IME marked text can contain the final piece-tree edit. Commit it before the
             // revision is saved and before any path mutation can invalidate the mmap.
-            self.commit_marked_text()?;
+            self.commit_marked_text(false)?;
             self.save_current_document()?;
         }
         let expected_revision = if expected_revision_required {
@@ -1857,8 +1932,8 @@ impl NativeMarkdownWindowSurface {
         saved
     }
 
-    /// Commit table-cell and IME composition before save, copy, or an ownership transition.
-    pub(super) fn commit_marked_text(&self) -> Result<(), String> {
+    /// 同一原组合提交边界区分关闭与保存/模式交接；只有关闭可撤尚未发布的纯显示动作。
+    pub(super) fn commit_marked_text(&self, closing: bool) -> Result<(), String> {
         self.controller.ivars().undo.preflight()?;
         let borrowed = self.controller.ivars().borrowed.borrow().clone();
         borrowed.capture(&self.panel)?;
@@ -1866,33 +1941,8 @@ impl NativeMarkdownWindowSurface {
             // No editor implies no cell or input-method composition can contribute a final edit.
             return Ok(());
         };
-        if editor.backend.text_view.ivars().textkit_input_depth.get() != 0
-            || editor.backend.text_view.ivars().payload_use_depth.get() != 0
-            || editor.backend.text_storage.ivars().payload_use_depth.get() != 0
-            || editor
-                .backend
-                .text_view
-                .ivars()
-                .table_layout_rebuilding
-                .get()
-            || editor
-                .backend
-                .text_view
-                .ivars()
-                .text_container_recovery_depth
-                .get()
-                != 0
-        {
-            // 源数据/布局回调仍在栈内时拒绝预检；不能接受后再丢弃局部工作载荷。
-            return Err("笔记输入或排版仍在完成中".into());
-        }
         editor.capture_find_resources()?;
-        // Commit the table field before ending IME marked text so the piece tree reflects visible input.
-        editor.backend.text_view.commit_active_table_cell()?;
-        editor
-            .backend
-            .text_view
-            .commit_composition_before_release()?;
+        editor.commit_marked_text(closing)?;
         Ok(())
     }
 
@@ -1911,7 +1961,7 @@ impl NativeMarkdownWindowSurface {
 
         // Table-cell and IME composition are visible user edits; commit them before borrowing
         // the canonical piece tree so copied text agrees with the current editor state.
-        self.commit_marked_text()?;
+        self.commit_marked_text(false)?;
         let editor = self
             .editor
             .as_ref()
@@ -1942,7 +1992,7 @@ impl NativeMarkdownWindowSurface {
         self.sidebar_pager.take();
         if let Some(editor) = &self.editor {
             // Save and actual responder resignation succeeded; seal both canonical and native input before close callbacks.
-            editor.backend.stop_accepting_input();
+            editor.stop_accepting_input();
         }
         // The save/close preflight already committed composition and required actual responder resignation.
         // Do not create another native input transaction after the host accepted its Closing state.
@@ -2013,7 +2063,7 @@ pub(super) fn native_markdown_empty_label(
     label
 }
 
-/// Opens one selected note and assembles the actual TextKit surface for its foreground lifetime.
+/// 打开选中笔记并建立唯一分页正文；参考 TextKit 图只由独立夹具显式构造。
 pub(super) fn native_markdown_editor_surface(
     document: MarkdownDocumentBuffer,
     frame: NSRect,
@@ -2030,7 +2080,6 @@ pub(super) fn native_markdown_editor_surface(
         mtm,
     )?;
     editor
-        .backend
         .scroll_view()
         .setBackgroundColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
             0.075, 0.084, 0.11, 1.0,

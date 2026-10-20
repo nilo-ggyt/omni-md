@@ -6,12 +6,12 @@ mod pair;
 mod single;
 mod value;
 
-use crate::Direction;
-use crate::ShaperFont;
 use crate::buffer::*;
 use crate::mapped_pod_vec::MappedPodVec;
 use crate::ot::layout::*;
 use crate::plan::ShapePlan;
+use crate::Direction;
+use crate::ShaperFont;
 
 pub fn position(plan: &ShapePlan, font: &ShaperFont<'_, '_>, buffer: &mut Buffer) {
     let table = font.layout().ot.gpos.clone();

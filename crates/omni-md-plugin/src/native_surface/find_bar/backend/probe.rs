@@ -57,12 +57,15 @@ impl NativeMarkdownPagedTextViewDelegate for PendingDelegate {
     fn virtual_viewport(
         &self,
         epoch: u64,
+        bounds_width: f64,
     ) -> Result<NativeMarkdownPagedVirtualViewport, ViewError> {
         if !self.current(epoch) {
             return Err(ViewError::Revoked);
         }
         Ok(NativeMarkdownPagedVirtualViewport {
             document_origin: NSPoint::ZERO,
+            layout_origin_x: 0.0,
+            layout_width: bounds_width,
             scroll_epoch: 1,
         })
     }

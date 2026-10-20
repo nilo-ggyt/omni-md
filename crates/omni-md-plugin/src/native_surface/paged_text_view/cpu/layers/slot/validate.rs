@@ -68,17 +68,13 @@ impl Slot {
         no_mask(&self.container, current)?;
         match receipt.presentation {
             PixelPresentation::Image => {
-                // 原图只用容器 contents，四个辅助层必须真正空闲。
+                // 普通图像没有遮罩角色；外来表示不能借已有 payload 访问其他角色。
+                require(
+                    self.foreground.is_none() && self.second_foreground.is_none(),
+                    current,
+                )?;
                 no_color(&self.container, current)?;
                 no_children(&self.container, current)?;
-                for layer in [
-                    &*self.foreground,
-                    &*self.mask,
-                    &*self.second_foreground,
-                    &*self.second_mask,
-                ] {
-                    empty(layer, current)?;
-                }
                 contents(&self.container, receipt.image, current)?;
             }
             PixelPresentation::OpaqueNeutralMask => {
@@ -91,8 +87,8 @@ impl Slot {
                 no_contents(&self.container, current)?;
                 mask_group(
                     &self.container,
-                    &self.foreground,
-                    &self.mask,
+                    self.primary().0,
+                    self.primary().1,
                     MaskIdentity {
                         rect: local,
                         scale,
@@ -101,9 +97,11 @@ impl Slot {
                     },
                     current,
                 )?;
-                children(&self.container, &[&*self.foreground], current)?;
-                empty(&self.second_foreground, current)?;
-                empty(&self.second_mask, current)?;
+                children(&self.container, &[self.primary().0], current)?;
+                require(
+                    self.second_foreground.is_none() && self.second_mask.is_none(),
+                    current,
+                )?;
             }
             PixelPresentation::OpaquePairedMasks { .. } => {
                 let (background, foreground, secondary_foreground) =
@@ -112,8 +110,8 @@ impl Slot {
                 no_contents(&self.container, current)?;
                 mask_group(
                     &self.container,
-                    &self.foreground,
-                    &self.mask,
+                    self.primary().0,
+                    self.primary().1,
                     MaskIdentity {
                         rect: local,
                         scale,
@@ -124,8 +122,8 @@ impl Slot {
                 )?;
                 mask_group(
                     &self.container,
-                    &self.second_foreground,
-                    &self.second_mask,
+                    self.secondary().0,
+                    self.secondary().1,
                     MaskIdentity {
                         rect: local,
                         scale,
@@ -138,7 +136,7 @@ impl Slot {
                 )?;
                 children(
                     &self.container,
-                    &[&*self.foreground, &*self.second_foreground],
+                    &[self.primary().0, self.secondary().0],
                     current,
                 )?;
             }
@@ -301,12 +299,4 @@ fn no_contents(layer: &CALayer, current: &impl Fn() -> bool) -> Result<()> {
         checked(current, || unsafe { layer.contents() })?.is_none(),
         current,
     )
-}
-fn empty(layer: &CALayer, current: &impl Fn() -> bool) -> Result<()> {
-    no_contents(layer, current)?;
-    no_children(layer, current)?;
-    no_color(layer, current)?;
-    no_mask(layer, current)?;
-    require(checked(current, || layer.superlayer())?.is_none(), current)?;
-    require(checked(current, || layer.delegate())?.is_none(), current)
 }

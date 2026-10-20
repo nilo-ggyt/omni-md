@@ -351,7 +351,7 @@ fn cell_format_large_selection_shares_body_and_preserves_commit_admission() {
     }
     drop(source);
     let edit = doc.capture_cell_draft_edit(&token).unwrap();
-    let prepared = doc.prepare_cell_draft_commit(edit).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(edit, None).unwrap();
     assert!(prepared.replacement_backing_observer().is_some());
     drop(prepared); // 本测试继续核raw局部Undo；放弃真实已封存准入，不提前发布canonical。
     assert_eq!(doc.cell_draft_facts(&token).unwrap(), formatted);
@@ -374,7 +374,7 @@ fn cell_format_revokes_old_prepared_commit_and_source_failure_still_precedes_for
     let token = begin(&mut doc);
     let observer = doc.cell_draft_resource_observer(&token).unwrap();
     let edit = doc.capture_cell_draft_edit(&token).unwrap();
-    let prepared = doc.prepare_cell_draft_commit(edit).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(edit, None).unwrap();
     let edit = doc.capture_cell_draft_edit(&token).unwrap();
     let (formatted, _) = doc
         .format_cell_draft(edit, MarkdownFormatAction::Bold)
@@ -387,7 +387,7 @@ fn cell_format_revokes_old_prepared_commit_and_source_failure_still_precedes_for
     ));
     assert_eq!(doc.cell_draft_facts(&token).unwrap(), formatted);
     let edit = doc.capture_cell_draft_edit(&token).unwrap();
-    drop(doc.prepare_cell_draft_commit(edit).unwrap()); // 旧失败票已真Drop，唯一准入槽允许下一次原serial准备。
+    drop(doc.prepare_cell_draft_commit(edit, None).unwrap()); // 旧失败票已真Drop，唯一准入槽允许下一次原serial准备。
     let edit = doc.capture_cell_draft_edit(&token).unwrap();
     doc.original_snapshot
         .as_ref()
@@ -483,7 +483,7 @@ fn large_draft_is_accepted_and_can_shrink_without_polluting_canonical_append() {
     assert_eq!(doc.storage_profile(), baseline);
     assert_eq!(doc.current_revision().unwrap(), revision);
     let prepared = doc
-        .prepare_cell_draft_commit(doc.capture_cell_draft_edit(&token).unwrap())
+        .prepare_cell_draft_commit(doc.capture_cell_draft_edit(&token).unwrap(), None)
         .unwrap();
     let candidate = prepared.replacement_backing_observer().unwrap();
     drop(prepared); // 长准入已经可用；用户继续缩短raw时不把已放弃的大候选移入canonical库存。
@@ -500,6 +500,7 @@ fn large_draft_is_accepted_and_can_shrink_without_polluting_canonical_append() {
     assert!(
         doc.commit_cell_draft_observed(&token, NoopObserver)
             .unwrap()
+            .edit
             .is_some()
     );
     assert_eq!(canonical(&doc), SOURCE.replacen("| a |", "| small |", 1));
@@ -640,6 +641,7 @@ fn token_drop_drains_and_unchanged_commit_does_not_add_history() {
     assert!(
         doc.commit_cell_draft_observed(&token, NoopObserver)
             .unwrap()
+            .edit
             .is_none()
     );
     assert_eq!(doc.storage_profile(), baseline);
@@ -720,6 +722,7 @@ fn held_reader_blocks_commit_and_observer_rejection_preserves_exact_draft() {
     assert!(
         doc.commit_cell_draft_observed(&token, NoopObserver)
             .unwrap()
+            .edit
             .is_some()
     );
 }

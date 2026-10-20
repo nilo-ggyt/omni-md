@@ -18,10 +18,21 @@ const CURSOR_RESERVE: usize = 1024;
 /// 保留每个实际层级。捕获时 tight 不是未来闭合列表的最终 Tag，marker 也不包含起始编号。
 pub enum CapturedScopeRole {
     Quote,
-    List { marker: u8, tight_at_capture: bool },
-    Item { indent: usize },
-    Definition { indent: usize },
-    Footnote,
+    List {
+        marker: u8,
+        tight_at_capture: bool,
+    },
+    Item {
+        indent: usize,
+    },
+    Definition {
+        indent: usize,
+    },
+    /// Some 只来自原 producer 已完成的 label/colon/空白；None 仅表示原角色本身不含 opening 事实。
+    /// 没有该事实的 capture 仍可说明四列续行种类，不能授权首行 prefix 的视觉解释。
+    Footnote {
+        body_start: Option<usize>,
+    },
     Paragraph,
     Table,
     Other,
@@ -81,6 +92,7 @@ pub struct CapturedScopeCursor {
     cursor: Option<StructuralSpineCursor>,
     complete: bool,
     failure: Option<GlobalFrontierError>,
+    allocated: usize,
 }
 
 impl std::fmt::Debug for CapturedScopeCursor {
@@ -141,7 +153,13 @@ impl CapturedScopeCursor {
             cursor: None,
             complete: false,
             failure: None,
+            allocated: 0,
         })
+    }
+
+    /// 只报告原页游标实际取得的目录累计量；Core 将增量记入同一来源请求，释放不重发额度。
+    pub fn allocated_workspace_bytes(&self) -> usize {
+        self.allocated
     }
 
     pub fn header(&self) -> &CapturedScopeHeader {
@@ -194,12 +212,11 @@ impl CapturedScopeCursor {
         }
         while work.transitions < budget {
             work.transitions += 1;
-            let step = match self
-                .cursor
-                .as_mut()
-                .expect("初始化后拥有原 scope 游标")
-                .next()
-            {
+            let cursor = self.cursor.as_mut().expect("初始化后拥有原 scope 游标");
+            let before = cursor.allocated_workspace_bytes();
+            let step = cursor.next();
+            self.allocated += cursor.allocated_workspace_bytes() - before;
+            let step = match step {
                 Ok(step) => step,
                 Err(error) => return Err(self.fail(GlobalFrontierError::Spine(error))),
             };
@@ -220,7 +237,15 @@ impl CapturedScopeCursor {
                         StructuralKind::Definition { indent } => {
                             CapturedScopeRole::Definition { indent }
                         }
-                        StructuralKind::Footnote => CapturedScopeRole::Footnote,
+                        StructuralKind::Footnote { body_start } => {
+                            let body_start = body_start.map(std::num::NonZeroUsize::get);
+                            if body_start.is_some_and(|end| {
+                                end <= entry.source_start || end > self.header.block_source_start
+                            }) {
+                                return Err(self.fail(GlobalFrontierError::InvalidFrame));
+                            }
+                            CapturedScopeRole::Footnote { body_start }
+                        }
                         StructuralKind::Paragraph => CapturedScopeRole::Paragraph,
                         StructuralKind::Table => CapturedScopeRole::Table,
                         StructuralKind::Other => CapturedScopeRole::Other,

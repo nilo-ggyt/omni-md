@@ -15,14 +15,17 @@ pub(super) fn prepare(
     if !bidi.uses_prepared_paragraphs() {
         return Ok(true); // 原单段/Paged路径没有端点查询工作；沿外层原Source/取消guard继续，不重复授权。
     }
-    let progress = bidi.prepare_uniform_paragraph_range(
+    let budget = MarkdownBidiPrepareBudget {
+        bytes: budget.bytes.min(4096),
+        scalars: budget.scalars.min(256),
+        metadata_ops: budget.metadata_units.min(256),
+    };
+    // 同一原入口按真实已封存表示派发；!Send 在途 owner 仅留 Item，root 证书仍复用原 Uniform。
+    let progress = bidi.prepare_layout_paragraph_range(
         authority,
         payload.cursor,
-        MarkdownBidiPrepareBudget {
-            bytes: budget.bytes.min(4096),
-            scalars: budget.scalars.min(256),
-            metadata_ops: budget.metadata_units.min(256),
-        },
+        budget,
+        &mut payload.bidi_visible_preparation,
     )?;
     step.bytes = progress.bytes;
     step.scalars = progress.scalars;

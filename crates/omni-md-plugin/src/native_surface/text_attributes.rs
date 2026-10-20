@@ -3,30 +3,54 @@
 
 use super::*;
 
+/// 同一预览策略的链接/代码颜色供TextKit属性与Paged真实绘制共用，避免两条生产路径自行偏色。
+pub(super) const NATIVE_MARKDOWN_LINK_COLOR: [f64; 4] = [0.40, 0.68, 1.0, 1.0];
+pub(super) const NATIVE_MARKDOWN_CODE_BACKGROUND: [f64; 4] = [0.13, 0.15, 0.20, 1.0];
+pub(super) const NATIVE_MARKDOWN_MARKER_COLOR: [f64; 4] = [0.48, 0.56, 0.68, 1.0];
+/// 引用正文只改变墨迹，不替换真实字体；属性和分页绘图使用同一既有颜色。
+pub(super) const NATIVE_MARKDOWN_QUOTE_COLOR: [f64; 4] = [0.58, 0.66, 0.78, 1.0];
+/// 表格沿既有界面色值；CPU分页绘图与原NSColor策略共用，接入时不另造主题。
+pub(super) const NATIVE_MARKDOWN_TABLE_BORDER: [f64; 4] = [0.28, 0.34, 0.44, 1.0];
+pub(super) const NATIVE_MARKDOWN_TABLE_HEADER_BACKGROUND: [f64; 4] = [0.105, 0.12, 0.16, 1.0];
+pub(super) const NATIVE_MARKDOWN_TABLE_ROW_BACKGROUND: [f64; 4] = [0.075, 0.084, 0.11, 1.0];
+
 /// Fixed colors and fonts for bounded TextKit attribute dictionaries.
 ///
 /// Resources are created once per editor. A bounded LRU shares semantic dictionaries
 /// without constructing a complete attributed document or churning fonts on scroll.
 pub(super) struct MarkdownTextAttributePalette {
     // 固定五个字形随活动editor释放；不按文档长度增长，也不进入进程静态缓存。
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) list_glyphs: Option<MarkdownListMarkerGlyphPalette>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) list_hidden_foreground: Retained<NSColor>,
     pub(super) normal_font: Retained<NSFont>,
     pub(super) strong_font: Retained<NSFont>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) source_strong_font: Retained<NSFont>,
     pub(super) fixed_font: Retained<NSFont>,
     pub(super) table_header_font: Retained<NSFont>,
     pub(super) hidden_font: Retained<NSFont>,
     pub(super) heading_fonts: Vec<Retained<NSFont>>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) foreground: Retained<NSColor>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) muted_foreground: Retained<NSColor>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) accent_foreground: Retained<NSColor>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) marker_foreground: Retained<NSColor>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) hidden_foreground: Retained<NSColor>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) code_background: Retained<NSColor>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) structure_border: Retained<NSColor>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) table_header_background: Retained<NSColor>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) table_row_background: Retained<NSColor>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) table_active_background: Retained<NSColor>,
 }
 
@@ -45,28 +69,72 @@ impl MarkdownTextAttributePalette {
             .collect();
         // Retain the complete color/font palette under the editor so cache entries never borrow stack values.
         Self {
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             list_glyphs: MarkdownListMarkerGlyphPalette::new(),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             list_hidden_foreground: NSColor::clearColor(),
             strong_font: NSFont::boldSystemFontOfSize(15.0),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             source_strong_font: NSFont::monospacedSystemFontOfSize_weight(14.0, semibold_weight),
             normal_font,
             fixed_font,
             table_header_font,
             hidden_font: NSFont::systemFontOfSize(0.1),
             heading_fonts,
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             foreground: NSColor::colorWithSRGBRed_green_blue_alpha(0.86, 0.88, 0.92, 1.0),
-            muted_foreground: NSColor::colorWithSRGBRed_green_blue_alpha(0.58, 0.66, 0.78, 1.0),
-            accent_foreground: NSColor::colorWithSRGBRed_green_blue_alpha(0.40, 0.68, 1.0, 1.0),
-            marker_foreground: NSColor::colorWithSRGBRed_green_blue_alpha(0.48, 0.56, 0.68, 1.0),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+            muted_foreground: NSColor::colorWithSRGBRed_green_blue_alpha(
+                NATIVE_MARKDOWN_QUOTE_COLOR[0],
+                NATIVE_MARKDOWN_QUOTE_COLOR[1],
+                NATIVE_MARKDOWN_QUOTE_COLOR[2],
+                NATIVE_MARKDOWN_QUOTE_COLOR[3],
+            ),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+            accent_foreground: NSColor::colorWithSRGBRed_green_blue_alpha(
+                NATIVE_MARKDOWN_LINK_COLOR[0],
+                NATIVE_MARKDOWN_LINK_COLOR[1],
+                NATIVE_MARKDOWN_LINK_COLOR[2],
+                NATIVE_MARKDOWN_LINK_COLOR[3],
+            ),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+            marker_foreground: NSColor::colorWithSRGBRed_green_blue_alpha(
+                NATIVE_MARKDOWN_MARKER_COLOR[0],
+                NATIVE_MARKDOWN_MARKER_COLOR[1],
+                NATIVE_MARKDOWN_MARKER_COLOR[2],
+                NATIVE_MARKDOWN_MARKER_COLOR[3],
+            ),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             hidden_foreground: NSColor::colorWithSRGBRed_green_blue_alpha(0.075, 0.084, 0.11, 1.0),
-            code_background: NSColor::colorWithSRGBRed_green_blue_alpha(0.13, 0.15, 0.20, 1.0),
-            structure_border: NSColor::colorWithSRGBRed_green_blue_alpha(0.28, 0.34, 0.44, 1.0),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+            code_background: NSColor::colorWithSRGBRed_green_blue_alpha(
+                NATIVE_MARKDOWN_CODE_BACKGROUND[0],
+                NATIVE_MARKDOWN_CODE_BACKGROUND[1],
+                NATIVE_MARKDOWN_CODE_BACKGROUND[2],
+                NATIVE_MARKDOWN_CODE_BACKGROUND[3],
+            ),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+            structure_border: NSColor::colorWithSRGBRed_green_blue_alpha(
+                NATIVE_MARKDOWN_TABLE_BORDER[0],
+                NATIVE_MARKDOWN_TABLE_BORDER[1],
+                NATIVE_MARKDOWN_TABLE_BORDER[2],
+                NATIVE_MARKDOWN_TABLE_BORDER[3],
+            ),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             table_header_background: NSColor::colorWithSRGBRed_green_blue_alpha(
-                0.105, 0.12, 0.16, 1.0,
+                NATIVE_MARKDOWN_TABLE_HEADER_BACKGROUND[0],
+                NATIVE_MARKDOWN_TABLE_HEADER_BACKGROUND[1],
+                NATIVE_MARKDOWN_TABLE_HEADER_BACKGROUND[2],
+                NATIVE_MARKDOWN_TABLE_HEADER_BACKGROUND[3],
             ),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             table_row_background: NSColor::colorWithSRGBRed_green_blue_alpha(
-                0.075, 0.084, 0.11, 1.0,
+                NATIVE_MARKDOWN_TABLE_ROW_BACKGROUND[0],
+                NATIVE_MARKDOWN_TABLE_ROW_BACKGROUND[1],
+                NATIVE_MARKDOWN_TABLE_ROW_BACKGROUND[2],
+                NATIVE_MARKDOWN_TABLE_ROW_BACKGROUND[3],
             ),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             table_active_background: NSColor::colorWithSRGBRed_green_blue_alpha(
                 0.13, 0.20, 0.31, 1.0,
             ),
@@ -75,6 +143,7 @@ impl MarkdownTextAttributePalette {
 }
 
 /// Detect a heading role in the fixed semantic bit domain without allocating a style collection.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn native_markdown_is_heading(styles: MarkdownPresentationStyles) -> bool {
     [
         MarkdownPresentationStyles::HEADING_1,
@@ -89,6 +158,7 @@ fn native_markdown_is_heading(styles: MarkdownPresentationStyles) -> bool {
 }
 
 /// Select literal source typography, preserving every marker's width and a uniform 14-point baseline.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn native_markdown_source_font(
     styles: MarkdownPresentationStyles,
     palette: &MarkdownTextAttributePalette,
@@ -117,6 +187,7 @@ fn native_markdown_source_font(
 }
 
 /// Match the preserved source highlighter's principal Markdown colors using finite semantic roles.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn native_markdown_source_color(styles: MarkdownPresentationStyles) -> Retained<NSColor> {
     let (red, green, blue) = if styles.contains(MarkdownPresentationStyles::MARKER) {
         // Delimiters/meta remain visible and subdued rather than preview-concealed.
@@ -238,6 +309,7 @@ pub(super) fn native_markdown_base_font(
 }
 
 /// One style-to-face cache entry, including immutable scalar coverage.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct MarkdownStyleFontEntry {
     pub(super) source_mode: bool,
     pub(super) styles: MarkdownPresentationStyles,
@@ -246,6 +318,7 @@ pub(super) struct MarkdownStyleFontEntry {
 }
 
 /// One bounded Unicode fallback entry tied to its semantic base face.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct MarkdownFallbackFontEntry {
     pub(super) base_font: Retained<NSFont>,
     pub(super) font: Retained<NSFont>,
@@ -253,6 +326,7 @@ pub(super) struct MarkdownFallbackFontEntry {
 }
 
 /// Selected face and coverage used to bound an adjacent compatible UTF-16 run.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct MarkdownResolvedFont {
     pub(super) font: Retained<NSFont>,
     pub(super) base_coverage: Retained<NSCharacterSet>,
@@ -261,17 +335,20 @@ pub(super) struct MarkdownResolvedFont {
 
 /// Editor-owned LRU caches; their fixed capacities do not scale with document length.
 #[derive(Default)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct MarkdownFontSelectionCache {
     pub(super) style_fonts: VecDeque<MarkdownStyleFontEntry>,
     pub(super) fallback_fonts: VecDeque<MarkdownFallbackFontEntry>,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl super::cache_owner::CachePayload for MarkdownFontSelectionCache {
     fn empty() -> Self {
         Self::default()
     }
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl MarkdownFontSelectionCache {
     /// owner 正在外层 native 栈时按同一字体策略计算，但不分配或发布第二个 LRU。
     pub(super) fn resolve_uncached(
@@ -414,6 +491,7 @@ impl MarkdownFontSelectionCache {
 }
 
 /// Asks Core Text for the complete scalar, preserving its returned ownership claim.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_fallback_font(base_font: &NSFont, scalar: char) -> Retained<NSFont> {
     // A Unicode scalar needs at most four UTF-8 bytes and two UTF-16 units.
     let mut utf8 = [0; 4];
@@ -431,11 +509,13 @@ pub(super) fn native_markdown_fallback_font(base_font: &NSFont, scalar: char) ->
 }
 
 /// Compares cached native face identity without expensive semantic equality.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_same_font(left: &NSFont, right: &NSFont) -> bool {
     std::ptr::eq(left, right)
 }
 
 /// Treats ASCII as a base-font fast path and checks full scalar coverage otherwise.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_character_set_covers(
     coverage: &NSCharacterSet,
     scalar: char,
@@ -445,6 +525,7 @@ pub(super) fn native_markdown_character_set_covers(
 
 /// 同一字典的呈现身份；字形与行高都不能被相同style bit掩盖。
 #[derive(Clone, Copy, PartialEq)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct MarkdownTextAttributeVariant {
     pub(super) source_mode: bool,
     pub(super) table_row_height: Option<f64>,
@@ -452,6 +533,7 @@ pub(super) struct MarkdownTextAttributeVariant {
 }
 
 /// Complete immutable dictionary for one style/face combination.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct MarkdownTextAttributeCacheEntry {
     pub(super) variant: MarkdownTextAttributeVariant,
     pub(super) styles: MarkdownPresentationStyles,
@@ -460,10 +542,12 @@ pub(super) struct MarkdownTextAttributeCacheEntry {
 }
 
 /// Editor-local fixed-capacity LRU of derived attribute dictionaries.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct MarkdownTextAttributeCache {
     pub(super) entries: VecDeque<MarkdownTextAttributeCacheEntry>,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl super::cache_owner::CachePayload for MarkdownTextAttributeCache {
     fn empty() -> Self {
         // 失效和重入路径不预留另一个 128-entry LRU，容量只由真实活动查询按需增长。
@@ -473,6 +557,7 @@ impl super::cache_owner::CachePayload for MarkdownTextAttributeCache {
     }
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl Default for MarkdownTextAttributeCache {
     /// Reserves only the fixed cache capacity when the active editor is constructed.
     fn default() -> Self {
@@ -483,6 +568,7 @@ impl Default for MarkdownTextAttributeCache {
     }
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl MarkdownTextAttributeCache {
     /// Reuses or creates one immutable dictionary while enforcing the fixed LRU bound.
     pub(super) fn get_or_insert(
@@ -535,6 +621,7 @@ impl MarkdownTextAttributeCache {
 }
 
 /// 行高属于本次属性查询；构造出的字典不持有投影或正文。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn build_markdown_text_attributes_with_row_height(
     styles: MarkdownPresentationStyles,
     font: &Retained<NSFont>,
@@ -581,10 +668,8 @@ pub(super) fn build_markdown_text_attributes_with_row_height(
     // constants are exported by AppKit and are immutable for the process lifetime.
     let underline = NSNumber::new_isize(NSUnderlineStyle::Single.0);
     let strikethrough = NSNumber::new_isize(NSUnderlineStyle::Single.0);
-    let subscript_content = styles.contains(MarkdownPresentationStyles::SUBSCRIPT)
-        && !styles.contains(MarkdownPresentationStyles::MARKER);
-    // 公开baseline属性以pt为单位；下标下降3pt，原上标维持4pt，字典仍由现有有界LRU持有。
-    let baseline = NSNumber::new_f64(if subscript_content { -3.0 } else { 4.0 });
+    // 原属性和分页绘图消费同一可见内容偏移；不让显露的单~或Source借用下标基线。
+    let baseline = native_markdown_baseline_offset(styles, source_mode).map(NSNumber::new_f64);
     let paragraph_style = if source_mode {
         // Literal source uses uniform native line geometry, with no preview table/quote placeholders.
         None
@@ -669,12 +754,9 @@ pub(super) fn build_markdown_text_attributes_with_row_height(
         values.push(strikethrough_object);
     }
 
-    if !source_mode
-        && !hidden_marker
-        && (styles.contains(MarkdownPresentationStyles::SUPERSCRIPT) || subscript_content)
-    {
+    if let Some(baseline) = baseline.as_ref() {
         // 只移动Preview可见内容；Source与显露的单~保持普通基线，不修改正文/选择或使用删除线。
-        let baseline_object: &AnyObject = &baseline;
+        let baseline_object: &AnyObject = baseline;
         keys.push(baseline_key);
         values.push(baseline_object);
     }
@@ -685,7 +767,27 @@ pub(super) fn build_markdown_text_attributes_with_row_height(
     MarkdownTextAttributes::from_slices(&keys, &values)
 }
 
+/// 基线以pt表达同一原属性规则；隐藏语法和Source没有内容偏移，两个脚本样式同时存在时保原下标优先级。
+pub(super) fn native_markdown_baseline_offset(
+    styles: MarkdownPresentationStyles,
+    source_mode: bool,
+) -> Option<f64> {
+    if source_mode || styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER) {
+        return None;
+    }
+    if styles.contains(MarkdownPresentationStyles::SUBSCRIPT)
+        && !styles.contains(MarkdownPresentationStyles::MARKER)
+    {
+        Some(-3.0)
+    } else if styles.contains(MarkdownPresentationStyles::SUPERSCRIPT) {
+        Some(4.0)
+    } else {
+        None // 普通文字和显露的下标marker保持原字体基线，不新增一个零值Native属性。
+    }
+}
+
 /// 链接在两种模式都保持可辨识的下划线；显式 underline 仅在 preview解释。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_should_underline(
     styles: MarkdownPresentationStyles,
     source_mode: bool,
@@ -698,6 +800,7 @@ pub(super) fn native_markdown_should_underline(
 }
 
 /// 为一个完整、有界的可见单元格附加换行/对齐；同一结果同时用于测量和绘制。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_wrapped_table_cell_text(
     source: &NSAttributedString,
     alignment: MarkdownTableAlignment,
@@ -727,6 +830,7 @@ pub(super) fn native_markdown_wrapped_table_cell_text(
 }
 
 /// Derives block geometry and returns no object for ordinary inline-only runs.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn build_markdown_paragraph_style(
     styles: MarkdownPresentationStyles,
     _palette: &MarkdownTextAttributePalette,

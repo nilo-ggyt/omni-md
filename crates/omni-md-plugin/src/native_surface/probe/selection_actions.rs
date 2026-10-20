@@ -13,7 +13,7 @@ struct ActionState {
 
 /// 夹具只有借用；正文身份只有 Weak，原生图仍由原 surface 独占装配与释放。
 struct Permission<'a> {
-    surface: &'a NativeMarkdownEditorSurface,
+    surface: &'a NativeMarkdownTextKitEditorSurface,
     controller: &'a Retained<NativeMarkdownController>,
     document: WeakMarkdownDocument,
     generation: u64,
@@ -326,7 +326,7 @@ impl Permission<'_> {
 
 /// 仅在现有 ProbeEditingOwnerLease 和首次字符编辑前运行；失败后也不接管已撤权的新输入。
 pub(super) fn verify(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
     fixture: &str,
 ) -> Result<(), String> {

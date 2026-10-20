@@ -13,12 +13,13 @@ enum Seek {
 }
 
 enum Pending {
-    Node(Arc<MarkdownPieceTreeNode>, usize),
+    Node(Arc<MarkdownPieceTreeNode>, usize, usize),
     Span {
         span: OriginalSpan,
         ordinal: u8,
         base: usize,
         byte_edge: usize,
+        source_byte: usize,
         prefix: Option<u8>,
     },
     Leaf(Leaf),
@@ -28,20 +29,26 @@ struct Leaf {
     piece: MarkdownPiece,
     utf16: usize,
     byte: usize,
+    source_byte: usize,
     pending: [u8; 4],
     used: usize,
     needed: usize,
-    previous: Option<usize>,
+    previous: Option<(usize, usize)>,
 }
 
 /// 只保原冻结树的路径与一个scalar残余；Weak标记原Frozen身份，不增加正文或Reader owner。
 pub(crate) struct FrozenBidiParagraphCursor {
     origin: std::sync::Weak<FrozenText>,
+    // 显示源必须走自己的输出目录；其 root=None 不能落入原树空值分支。
+    #[cfg(feature = "s2-table-window-prototype")]
+    projection: Option<Box<display_projection::algorithms::ProjectionBidiParagraphCursor>>,
     root: PieceTreeLink,
     pending: Vec<Pending>,
     position: usize,
     start: usize,
     end: usize,
+    start_byte: usize,
+    end_byte: usize,
     content_end: usize,
     seek: Seek,
 }
@@ -51,20 +58,47 @@ pub(crate) struct FrozenBidiParagraphStep {
     pub(crate) scalars: usize,
     pub(crate) metadata: usize,
     pub(crate) range: Option<Range<usize>>,
+    // 同一次真实 B 段定位同时保留 canonical byte 端点，后继 UBA 不必另读边叶转换。
+    pub(crate) byte_range: Option<Range<usize>>,
     pub(crate) content_end: usize,
     pub(crate) maximum_borrow: usize,
 }
 
 impl FrozenBidiParagraphCursor {
     pub(super) fn new(snapshot: &MarkdownTextSnapshot, position: usize) -> Self {
+        #[cfg(feature = "s2-table-window-prototype")]
+        if let Some(projection) = snapshot.display_projection() {
+            let metrics = projection.metrics();
+            return Self {
+                origin: Arc::downgrade(&snapshot.text),
+                projection: Some(Box::new(
+                    display_projection::algorithms::ProjectionBidiParagraphCursor::new(
+                        projection, position,
+                    ),
+                )),
+                root: None,
+                pending: Vec::new(),
+                position,
+                start: 0,
+                end: metrics.utf16_len,
+                start_byte: 0,
+                end_byte: metrics.byte_len,
+                content_end: metrics.utf16_len,
+                seek: Seek::Complete,
+            };
+        }
         let metrics = piece_tree_metrics(&snapshot.text.root);
         let mut cursor = Self {
             origin: Arc::downgrade(&snapshot.text),
+            #[cfg(feature = "s2-table-window-prototype")]
+            projection: None,
             root: snapshot.text.root.clone(),
             pending: Vec::new(),
             position,
             start: 0,
             end: metrics.utf16_len,
+            start_byte: 0,
+            end_byte: metrics.byte_len,
             content_end: metrics.utf16_len,
             seek: Seek::Boundary,
         };
@@ -88,7 +122,7 @@ impl FrozenBidiParagraphCursor {
         self.pending.clear();
         self.seek = seek;
         if let Some(root) = &self.root {
-            self.pending.push(Pending::Node(Arc::clone(root), 0));
+            self.pending.push(Pending::Node(Arc::clone(root), 0, 0));
         }
     }
 
@@ -121,12 +155,24 @@ impl FrozenBidiParagraphCursor {
             scalars: 0,
             metadata: 0,
             range: None,
+            byte_range: None,
             content_end: self.content_end,
             maximum_borrow: 0,
         };
         if !std::sync::Weak::ptr_eq(&self.origin, &Arc::downgrade(&snapshot.text)) {
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         } // 内部游标也不能借同文本的另一Frozen替换实际读取资源。
+        #[cfg(feature = "s2-table-window-prototype")]
+        if let Some(cursor) = &mut self.projection {
+            return cursor.advance(
+                snapshot
+                    .display_projection()
+                    .expect("显示游标保留原冻结值身份"),
+                maximum_bytes,
+                maximum_scalars,
+                maximum_metadata,
+            );
+        }
         while self.seek != Seek::Complete {
             let Some(next) = self.pending.last() else {
                 match self.seek {
@@ -195,9 +241,10 @@ impl FrozenBidiParagraphCursor {
                         }
                     } else if UnicodeBidiData.bidi_class(scalar) == BidiClass::B {
                         if self.seek == Seek::Previous && leaf.utf16 < self.position {
-                            leaf.previous = Some(end);
+                            leaf.previous = Some((end, leaf.source_byte + leaf.byte));
                         } else if self.seek == Seek::Next && leaf.utf16 >= self.position {
                             self.end = end;
+                            self.end_byte = leaf.source_byte + leaf.byte;
                             self.content_end = leaf.utf16;
                             complete = true;
                         }
@@ -227,9 +274,10 @@ impl FrozenBidiParagraphCursor {
                     self.seek = Seek::Complete;
                 } else if complete || leaf.byte == leaf.piece.byte_len {
                     if self.seek == Seek::Previous
-                        && let Some(start) = leaf.previous
+                        && let Some((start, byte)) = leaf.previous
                     {
                         self.start = start;
+                        self.start_byte = byte;
                         self.restart(Seek::Next);
                     }
                 } else {
@@ -242,21 +290,36 @@ impl FrozenBidiParagraphCursor {
             }
             step.metadata += 1;
             match self.pending.pop().expect("已有原待访问节点") {
-                Pending::Node(node, base) => {
+                Pending::Node(node, base, source_byte) => {
                     if !self.relevant(node.metrics(), base) {
                         continue;
                     }
                     match node.as_ref() {
                         MarkdownPieceTreeNode::Branch { left, right, .. } => {
                             let right_base = base + left.metrics().utf16_len;
+                            let right_byte = source_byte + left.metrics().byte_len;
                             if self.seek == Seek::Previous {
-                                self.pending.push(Pending::Node(Arc::clone(left), base));
-                                self.pending
-                                    .push(Pending::Node(Arc::clone(right), right_base));
+                                self.pending.push(Pending::Node(
+                                    Arc::clone(left),
+                                    base,
+                                    source_byte,
+                                ));
+                                self.pending.push(Pending::Node(
+                                    Arc::clone(right),
+                                    right_base,
+                                    right_byte,
+                                ));
                             } else {
-                                self.pending
-                                    .push(Pending::Node(Arc::clone(right), right_base));
-                                self.pending.push(Pending::Node(Arc::clone(left), base));
+                                self.pending.push(Pending::Node(
+                                    Arc::clone(right),
+                                    right_base,
+                                    right_byte,
+                                ));
+                                self.pending.push(Pending::Node(
+                                    Arc::clone(left),
+                                    base,
+                                    source_byte,
+                                ));
                             }
                         }
                         MarkdownPieceTreeNode::OriginalSpan(span) => {
@@ -276,6 +339,11 @@ impl FrozenBidiParagraphCursor {
                                     base
                                 },
                                 byte_edge: span.word_block_byte_start(),
+                                source_byte: if reverse {
+                                    source_byte + node.metrics().byte_len
+                                } else {
+                                    source_byte
+                                },
                                 prefix: (target != 0).then_some(0),
                             });
                         }
@@ -284,6 +352,7 @@ impl FrozenBidiParagraphCursor {
                                 piece: piece.clone(),
                                 utf16: base,
                                 byte: 0,
+                                source_byte,
                                 pending: [0; 4],
                                 used: 0,
                                 needed: 0,
@@ -297,6 +366,7 @@ impl FrozenBidiParagraphCursor {
                     ordinal,
                     base,
                     byte_edge,
+                    source_byte,
                     prefix,
                 } => {
                     if let Some(prefix) = prefix {
@@ -311,6 +381,7 @@ impl FrozenBidiParagraphCursor {
                             ordinal,
                             base,
                             byte_edge: byte_edge + metrics.byte_len,
+                            source_byte,
                             prefix: (prefix + 1 < target).then_some(prefix + 1),
                         });
                         continue; // 实际小目录的物理前缀同样逐条计费，budget1不会暗中展开十六项。
@@ -326,6 +397,11 @@ impl FrozenBidiParagraphCursor {
                         byte_edge - metrics.byte_len
                     } else {
                         byte_edge
+                    };
+                    let source_start = if reverse {
+                        source_byte - metrics.byte_len
+                    } else {
+                        source_byte
                     };
                     let next = if reverse {
                         ordinal
@@ -348,6 +424,11 @@ impl FrozenBidiParagraphCursor {
                             } else {
                                 byte_edge + metrics.byte_len
                             },
+                            source_byte: if reverse {
+                                source_start
+                            } else {
+                                source_byte + metrics.byte_len
+                            },
                             prefix: None,
                         });
                     }
@@ -361,6 +442,7 @@ impl FrozenBidiParagraphCursor {
                             },
                             utf16: start,
                             byte: 0,
+                            source_byte: source_start,
                             pending: [0; 4],
                             used: 0,
                             needed: 0,
@@ -373,6 +455,7 @@ impl FrozenBidiParagraphCursor {
         }
         if self.seek == Seek::Complete {
             step.range = Some(self.start..self.end);
+            step.byte_range = Some(self.start_byte..self.end_byte);
             step.content_end = self.content_end;
         }
         Ok(step)

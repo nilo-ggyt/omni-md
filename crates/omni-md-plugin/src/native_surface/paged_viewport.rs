@@ -53,7 +53,7 @@ type Result<T> = std::result::Result<T, NativeMarkdownPagedViewportError>;
 define_class!(
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
-    /// 无像素、文字、回调和业务owner；高度只供NSScrollView的公开几何计算使用。
+    /// 无像素、文字、回调和业务owner；真实二维范围只供NSScrollView的公开几何计算使用。
     pub struct NativeMarkdownPagedScrollDocument;
 
     // SAFETY: NSObject身份沿主线程NSView实现，新增类没有改变父类对象布局。
@@ -92,6 +92,12 @@ pub struct NativeMarkdownPagedViewportGeometry {
     pub document_visible: NSRect,
     /// 扣实际clip inset后转入原document的有限正文；Source原点和绘图尺寸均消费此值。
     pub body_frame: NSRect,
+    /// 实际clip内容lane相对逻辑document零滚动处的X，含真实inset，不是当前水平滚动量。
+    pub layout_origin_x: f64,
+    /// 原完整lane宽决定换行；Body与document交集变窄时仍不能把剩余可见宽当排版宽。
+    pub layout_width: f64,
+    /// 当前Source/行宽epoch已经交付的lane内容宽；零表示尚无已测宽，不是默认排版宽。
+    pub content_width: f64,
     pub content_height: f64,
     /// 来自原同步更新的checked_add计数；不是由frame、时间或后继scene推算出的序号。
     pub scroll_epoch: u64,
@@ -136,7 +142,10 @@ pub struct NativeMarkdownPagedViewport {
     document: RefCell<Option<Rc<Retained<NativeMarkdownPagedScrollDocument>>>>,
     notifications: RefCell<Option<Rc<NotificationLease>>>,
     geometry: RefCell<Option<NativeMarkdownPagedViewportGeometry>>,
+    width: Cell<f64>,
     height: Cell<f64>,
+    original_horizontal_scroller: bool,
+    horizontal_scroller_changed: Cell<bool>,
     epoch: Cell<u64>,
     busy: Cell<bool>,
     closed: Cell<bool>,
@@ -191,6 +200,103 @@ impl NativeMarkdownPagedViewport {
         let geometry = self.geometry()?;
         let scroll = step(current, || self.scroll.load())?
             .ok_or(NativeMarkdownPagedViewportError::Closed)?;
+        let overlap = step(current, || scroll.verticalPageScroll())?;
+        if !overlap.is_finite() || overlap < 0.0 {
+            return Err(NativeMarkdownPagedViewportError::InvalidGeometry);
+        }
+        // AppKit的pageScroll表示分页后保留的上下文高度，不是移动距离；仍使用原公开配置。
+        let distance = (geometry.body_frame.size.height - overlap).max(0.0);
+        self.scroll_document_delta(
+            &geometry,
+            NSPoint::new(0.0, if down { distance } else { -distance }),
+            current,
+        )?;
+        Ok(self.geometry()?.body_frame.origin)
+    }
+
+    /// 原拖选的真实窗口终点越出有限正文时，只滚动同一个空高度文档；不保事件或读取源文字。
+    ///
+    /// # Errors
+    /// 原挂载已替换、输入失权或Native几何非法时拒绝，不能滚动外方后挂载的文档。
+    pub fn scroll_for_drag(
+        self: &Rc<Self>,
+        window_point: NSPoint,
+        current: &dyn Fn() -> bool,
+    ) -> Result<bool> {
+        if self.busy.get() {
+            return Err(NativeMarkdownPagedViewportError::Busy);
+        }
+        let geometry = self.geometry()?;
+        let document = self
+            .document
+            .borrow()
+            .as_ref()
+            .cloned()
+            .ok_or(NativeMarkdownPagedViewportError::Closed)?;
+        // 空document按阅读方向翻转，正文NSView保持AppKit坐标；必须真实转换，不能挪用局部y符号。
+        let local = step(current, || {
+            document.convertPoint_fromView(window_point, None)
+        })?;
+        let visible = geometry.body_frame;
+        if !finite(visible) || !local.x.is_finite() || !local.y.is_finite() {
+            return Err(NativeMarkdownPagedViewportError::InvalidGeometry);
+        }
+        let outside = |value: f64, start: f64, extent: f64| {
+            if value < start {
+                value - start
+            } else if value > start + extent {
+                value - start - extent
+            } else {
+                0.0
+            }
+        };
+        let dx = outside(local.x, visible.origin.x, visible.size.width);
+        let dy = outside(local.y, visible.origin.y, visible.size.height);
+        if dx == 0.0 && dy == 0.0 {
+            return Ok(false); // 两轴都回到实际正文才结束；宽表格仍保原生横向拖选能力。
+        }
+        let scroll = step(current, || self.scroll.load())?
+            .ok_or(NativeMarkdownPagedViewportError::Closed)?;
+        let vertical = step(current, || scroll.verticalLineScroll())?;
+        let horizontal = step(current, || scroll.horizontalLineScroll())?;
+        if !vertical.is_finite()
+            || vertical < 0.0
+            || !horizontal.is_finite()
+            || horizontal < 0.0
+            || !geometry.is_current()
+        {
+            return Err(NativeMarkdownPagedViewportError::InvalidGeometry);
+        }
+        // 近边缘至少按原生一行的距离前进，远离边缘逐渐加速，但一轮不越过一个实际视口。
+        let distance = |outside: f64, line: f64, extent: f64| {
+            if outside == 0.0 {
+                0.0
+            } else {
+                outside.signum() * outside.abs().max(line).min(extent)
+            }
+        }; // 零轴必须保持零；f64的正零signum为1，不能凭此制造另一轴的滚动。
+        let delta = NSPoint::new(
+            distance(dx, horizontal, visible.size.width),
+            distance(dy, vertical, visible.size.height),
+        );
+        self.scroll_document_delta(&geometry, delta, current)
+    }
+
+    /// Page与拖选只在真实距离来源上有差异；Native挂载校验、坐标换算和同步归原滚动owner。
+    fn scroll_document_delta(
+        self: &Rc<Self>,
+        geometry: &NativeMarkdownPagedViewportGeometry,
+        delta: NSPoint,
+        current: &dyn Fn() -> bool,
+    ) -> Result<bool> {
+        if self.busy.get() {
+            return Err(NativeMarkdownPagedViewportError::Busy);
+        }
+        if !delta.x.is_finite() || !delta.y.is_finite() {
+            return Err(NativeMarkdownPagedViewportError::InvalidGeometry);
+        }
+        let scroll = step(current, || self.scroll.load())?
+            .ok_or(NativeMarkdownPagedViewportError::Closed)?;
         let document = self
             .document
             .borrow()
@@ -207,33 +313,33 @@ impl NativeMarkdownPagedViewport {
         if before != geometry.document_visible || !geometry.is_current() {
             return Err(NativeMarkdownPagedViewportError::Revoked);
         }
-        let overlap = step(current, || scroll.verticalPageScroll())?;
         let bounds = step(current, || clip.bounds())?;
-        if !finite(bounds) || !overlap.is_finite() || overlap < 0.0 {
+        if !finite(bounds) {
             return Err(NativeMarkdownPagedViewportError::InvalidGeometry);
         }
-        // AppKit的pageScroll表示分页后保留的上下文高度，不是移动距离。使用原值而不改
-        // 系统配置；原生文本动作的私有页距不属于这个空滚动文档的实现契约。
-        let distance = (geometry.body_frame.size.height - overlap).max(0.0);
         let old = step(current, || {
             clip.convertPoint_fromView(geometry.body_frame.origin, Some(&***document))
         })?;
         let target = step(current, || {
             clip.convertPoint_fromView(
                 NSPoint::new(
-                    geometry.body_frame.origin.x,
-                    geometry.body_frame.origin.y + if down { distance } else { -distance },
+                    geometry.body_frame.origin.x + delta.x,
+                    geometry.body_frame.origin.y + delta.y,
                 ),
                 Some(&***document),
             )
         })?;
         let mut proposed = bounds;
+        proposed.origin.x += target.x - old.x;
         proposed.origin.y += target.y - old.y;
         let constrained = step(current, || clip.constrainBoundsRect(proposed))?;
         if !finite(constrained) {
             return Err(NativeMarkdownPagedViewportError::InvalidGeometry);
         }
         if constrained.origin != bounds.origin {
+            if !geometry.is_current() {
+                return Err(NativeMarkdownPagedViewportError::Revoked);
+            } // 坐标转换或constrain的Native重入不能把旧几何授权给真实scroll副作用。
             // 真实BOF/EOF由原clip按已安装的实际排版高度约束；同步通知可撤掉旧geometry，
             // 所以这里只核稳定输入票，不要求滚动前的nonce在原生调用后仍然有效。
             step(current, || clip.scrollToPoint(constrained.origin))?;
@@ -245,7 +351,7 @@ impl NativeMarkdownPagedViewport {
         if actual.document_visible != visible || !actual.is_current() || !current() {
             return Err(NativeMarkdownPagedViewportError::Revoked);
         }
-        Ok(actual.body_frame.origin) // 同步通知已发布实际正文原点，不能把兄弟覆盖区冒充可见Source。
+        Ok(constrained.origin != bounds.origin) // BOF/EOF没有实际移动时，不延续无效的拖选期限。
     }
 
     /// 挂载只建立空高度文档与视口正文；调用方须持有并验证实际View/Context/层的构造账本。
@@ -277,6 +383,7 @@ impl NativeMarkdownPagedViewport {
             return Err(NativeMarkdownPagedViewportError::InvalidGeometry);
         }
         let frame = NSRect::new(NSPoint::ZERO, NSSize::new(visible.size.width, height));
+        let original_horizontal_scroller = step(&current, || scroll.hasHorizontalScroller())?;
         let document = step(&current, || {
             NativeMarkdownPagedScrollDocument::new(frame, mtm)
         })?;
@@ -288,7 +395,10 @@ impl NativeMarkdownPagedViewport {
             document: RefCell::new(Some(Rc::new(document))),
             notifications: RefCell::new(None),
             geometry: RefCell::new(None),
+            width: Cell::new(0.0),
             height: Cell::new(content_height),
+            original_horizontal_scroller,
+            horizontal_scroller_changed: Cell::new(false),
             epoch: Cell::new(0),
             busy: Cell::new(false),
             closed: Cell::new(false),
@@ -491,6 +601,78 @@ impl NativeMarkdownPagedViewport {
         result
     }
 
+    /// 只接受原Producer已经量化的内容宽；空document扩范围，有限Body不随整表宽度扩张。
+    /// 缩宽前先在旧真实范围内归还横向锚点，避免AppKit夹回bounds时重入半成品几何。
+    pub fn set_content_width(self: &Rc<Self>, width: f64) -> Result<()> {
+        if !width.is_finite() || width <= 0.0 || width >= (1u64 << 46) as f64 {
+            return Err(NativeMarkdownPagedViewportError::InvalidGeometry);
+        }
+        if self.closed.get() {
+            return Err(NativeMarkdownPagedViewportError::Closed);
+        }
+        if self.busy.get() {
+            return Err(NativeMarkdownPagedViewportError::Busy);
+        }
+        let geometry = self.geometry()?;
+        let body = self
+            .body
+            .load()
+            .ok_or(NativeMarkdownPagedViewportError::Closed)?;
+        let input_before = body.input_state()?;
+        let current = || {
+            !self.closed.get()
+                && !self.poisoned.get()
+                && !self.off_main_notice.load(Ordering::Acquire)
+                && body.input_state().is_ok_and(|state| state == input_before)
+        };
+        let result = (|| {
+            let scroll = step(&current, || self.scroll.load())?
+                .ok_or(NativeMarkdownPagedViewportError::Closed)?;
+            let document = self
+                .document
+                .borrow()
+                .as_ref()
+                .cloned()
+                .ok_or(NativeMarkdownPagedViewportError::Closed)?;
+            if !step(&current, || scroll.documentView())?
+                .is_some_and(|actual| std::ptr::eq::<NSView>(&*actual, &***document))
+                || !geometry.is_current()
+            {
+                return Err(NativeMarkdownPagedViewportError::Revoked);
+            } // width/scroller是原挂载的副作用，外方换document以后不得先改变它的flag再报撤权。
+            let maximum_x = geometry.layout_origin_x + (width - geometry.layout_width).max(0.0);
+            let x = geometry
+                .body_frame
+                .origin
+                .x
+                .clamp(geometry.layout_origin_x, maximum_x);
+            if x != geometry.body_frame.origin.x {
+                // 只在宽度收缩真正越过原右端时移动；已有合法横向位置保持，Source/选择不变。
+                self.reveal_document_rect(
+                    NSRect::new(
+                        NSPoint::new(x, geometry.body_frame.origin.y),
+                        NSSize::new(width.min(geometry.layout_width), 1.0),
+                    ),
+                    &current,
+                )?;
+            }
+            // 原horizontal flag只归本挂载管理；已有启用状态保留，无溢出时归还原值。
+            // 设置可能同步改变clip尺寸，因此先存真实内容宽，再领取完整的新Native转换。
+            self.width.set(width);
+            let horizontal = self.original_horizontal_scroller || width > geometry.layout_width;
+            if step(&current, || scroll.hasHorizontalScroller())? != horizontal {
+                self.horizontal_scroller_changed.set(true);
+                step(&current, || scroll.setHasHorizontalScroller(horizontal))?;
+            }
+            self.synchronize()
+        })();
+        // Native/current布尔只表示权限；真正Source读错仍从原input取得，不能用撤权覆盖errno。
+        if body.input_state()? != input_before {
+            return Err(NativeMarkdownPagedViewportError::Revoked);
+        }
+        result
+    }
+
     /// 只滚到调用方已实际度量的正文矩形；此方法不定位Source、不读取文本或扩张内容高度。
     /// 返回true表示真实滚动改变了几何，调用方须结束旧请求并在下一续体领取新Scene票。
     pub fn reveal_document_rect(
@@ -498,7 +680,19 @@ impl NativeMarkdownPagedViewport {
         rect: NSRect,
         current: &impl Fn() -> bool,
     ) -> Result<bool> {
-        if !finite(rect)
+        // 插入点的真实宽可以为零；只在此目标边界接纳它，document/Body尺寸仍必须严格为正。
+        if ![
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
+            rect.origin.x + rect.size.width,
+            rect.origin.y + rect.size.height,
+        ]
+        .into_iter()
+        .all(|value| value.is_finite() && value.abs() < (1u64 << 46) as f64)
+            || rect.size.width < 0.0
+            || rect.size.height <= 0.0
             || rect.origin.y < 0.0
             || rect.origin.y + rect.size.height > self.height.get()
         {
@@ -527,18 +721,36 @@ impl NativeMarkdownPagedViewport {
         if exposed != geometry.document_visible || !geometry.is_current() {
             return Err(NativeMarkdownPagedViewportError::Revoked);
         }
+        let frame = step(current, || document.frame())?;
+        if !finite(frame)
+            || rect.origin.x < frame.origin.x
+            || rect.origin.x + rect.size.width > frame.origin.x + frame.size.width
+        {
+            return Err(NativeMarkdownPagedViewportError::InvalidGeometry);
+        }
         let visible = geometry.body_frame;
+        let right = rect.origin.x + rect.size.width;
+        let x = if rect.origin.x < visible.origin.x || rect.size.width > visible.size.width {
+            rect.origin.x // 宽于视口的真实列只展示其首部，不把列宽压成估计字符宽。
+        } else if right > visible.origin.x + visible.size.width {
+            right - visible.size.width
+        } else {
+            visible.origin.x
+        };
+        let maximum_x =
+            geometry.layout_origin_x + (self.width.get() - geometry.layout_width).max(0.0);
+        let x = x.clamp(geometry.layout_origin_x, maximum_x);
         let bottom = rect.origin.y + rect.size.height;
         let y = if rect.origin.y < visible.origin.y || rect.size.height > visible.size.height {
             rect.origin.y // 超高行也只把其真实首部放进可见区，不按字形数虚构缩放。
         } else if bottom > visible.origin.y + visible.size.height {
             bottom - visible.size.height
         } else {
-            return Ok(false); // 原实际矩形已可见，不发冗余scroll或额外几何代次。
+            visible.origin.y
         };
         let y = y.clamp(0.0, (self.height.get() - visible.size.height).max(0.0));
-        if y == visible.origin.y {
-            return Ok(false);
+        if x == visible.origin.x && y == visible.origin.y {
+            return Ok(false); // 两轴均已实际可见，不发冗余scroll或额外几何代次。
         }
         // Source目标转换到实际clip再滚动；不把documentVisibleRect的原点误当成clip.bounds原点。
         // 原生约束负责真实边界；current只核稳定目标身份，这次滚动必然撤销旧geometry。
@@ -547,9 +759,10 @@ impl NativeMarkdownPagedViewport {
             clip.convertPoint_fromView(visible.origin, Some(&***document))
         })?;
         let target = step(current, || {
-            clip.convertPoint_fromView(NSPoint::new(visible.origin.x, y), Some(&***document))
+            clip.convertPoint_fromView(NSPoint::new(x, y), Some(&***document))
         })?;
         let mut proposed = bounds;
+        proposed.origin.x += target.x - old.x;
         proposed.origin.y += target.y - old.y;
         let constrained = step(current, || clip.constrainBoundsRect(proposed))?;
         if !finite(constrained) {
@@ -562,7 +775,7 @@ impl NativeMarkdownPagedViewport {
             return Err(NativeMarkdownPagedViewportError::Revoked);
         }
         let actual = self.geometry()?;
-        if actual.body_frame.origin.y != y {
+        if actual.body_frame.origin != NSPoint::new(x, y) {
             return Err(NativeMarkdownPagedViewportError::Revoked);
         }
         Ok(true)
@@ -627,10 +840,40 @@ impl NativeMarkdownPagedViewport {
         let clip = step(&current, || scroll.contentView())?;
         let before = step(&current, || clip.bounds())?;
         checked(finite(before))?;
+        let before_insets = step(&current, || clip.contentInsets())?;
+        let before_flipped = step(&current, || clip.isFlipped())?;
+        let before_content = NSRect::new(
+            NSPoint::new(
+                before.origin.x + before_insets.left,
+                before.origin.y
+                    + if before_flipped {
+                        before_insets.top
+                    } else {
+                        before_insets.bottom
+                    },
+            ),
+            NSSize::new(
+                before.size.width - before_insets.left - before_insets.right,
+                before.size.height - before_insets.top - before_insets.bottom,
+            ),
+        );
+        checked(finite(before_content))?;
+        let whole = step(&current, || {
+            document.convertRect_fromView(before, Some(&clip))
+        })?;
+        let lane = step(&current, || {
+            document.convertRect_fromView(before_content, Some(&clip))
+        })?;
+        checked(finite(whole) && finite(lane))?;
+        // 同一次真实转换分出固定左/右覆盖区；当前滚动量在相减时消去，不能假设inset为零。
+        let left = lane.origin.x - whole.origin.x;
+        let right = whole.origin.x + whole.size.width - lane.origin.x - lane.size.width;
+        let document_width = whole.size.width.max(left + self.width.get() + right);
         let document_frame = NSRect::new(
             NSPoint::ZERO,
-            NSSize::new(before.size.width, self.height.get().max(before.size.height)),
+            NSSize::new(document_width, self.height.get().max(before.size.height)),
         );
+        checked(finite(document_frame))?;
         if step(&current, || document.frame())? != document_frame {
             step(&current, || document.setFrame(document_frame))?;
         } // 精确相等时不发冗余setFrame，以免一条clip通知制造无关layout递归。
@@ -661,6 +904,12 @@ impl NativeMarkdownPagedViewport {
         let in_document = step(&current, || {
             document.convertRect_fromView(content, Some(&clip))
         })?;
+        let whole_in_document = step(&current, || {
+            document.convertRect_fromView(bounds, Some(&clip))
+        })?;
+        checked(finite(in_document) && finite(whole_in_document))?;
+        let layout_origin_x = in_document.origin.x - whole_in_document.origin.x;
+        let layout_width = in_document.size.width;
         let body_frame = NSIntersectionRect(in_document, visible);
         checked(finite(body_frame))?;
         if step(&current, || body.frame())? != body_frame {
@@ -675,6 +924,10 @@ impl NativeMarkdownPagedViewport {
                 && step(&current, || {
                     document.convertRect_fromView(content, Some(&clip))
                 })? == in_document
+                && step(&current, || {
+                    document.convertRect_fromView(bounds, Some(&clip))
+                })? == whole_in_document
+                && step(&current, || document.frame())? == document_frame
                 && step(&current, || body.frame())? == body_frame,
         )?;
         let body_bounds = step(&current, || body.bounds())?;
@@ -690,6 +943,9 @@ impl NativeMarkdownPagedViewport {
             nonce: Rc::new(()),
             document_visible: visible,
             body_frame,
+            layout_origin_x,
+            layout_width,
+            content_width: self.width.get(),
             content_height: self.height.get(),
             scroll_epoch: epoch,
         };
@@ -804,6 +1060,10 @@ impl NativeMarkdownPagedViewport {
                     .is_some_and(|actual| std::ptr::eq::<NSView>(&*actual, &***document))
             {
                 scroll.setDocumentView(None);
+                if self.horizontal_scroller_changed.get() {
+                    // 只归还本次挂载实际改变的原flag；后继documentView不归本owner清理。
+                    scroll.setHasHorizontalScroller(self.original_horizontal_scroller);
+                }
             }
             if let Some(body) = self.body.load()
                 // SAFETY: 本地强claim贯穿公开getter；只核原parent，不假设Native图仍有本owner。

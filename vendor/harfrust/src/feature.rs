@@ -1,4 +1,4 @@
-use crate::{Tag, text_parser::TextParser};
+use crate::{text_parser::TextParser, Tag};
 use core::{
     ops::{Bound, RangeBounds},
     str::FromStr,

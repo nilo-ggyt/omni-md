@@ -33,7 +33,8 @@ pub(super) struct SourceTargetRequest {
     state: NativeMarkdownPagedInputState,
     serial: u64,
     layout_epoch: u64,
-    bounds_width: f64,
+    layout_width: f64,
+    layout_origin_x: f64,
     pub(super) range: NSRange,
     pub(super) first_end: usize,
     terminal: Cell<Terminal>,
@@ -57,7 +58,8 @@ impl SourceTargetRequest {
             && self.domain.same(&actual.target)
             && Weak::ptr_eq(&self.document, &actual.document)
             && actual.input == self.state
-            && actual.bounds_width == self.bounds_width
+            && actual.virtual_viewport.layout_width == self.layout_width
+            && actual.virtual_viewport.layout_origin_x == self.layout_origin_x
     }
     pub(super) fn current(&self, owner: &NativeMarkdownPagedBody) -> bool {
         self.terminal.get() != Terminal::Revoked
@@ -73,7 +75,10 @@ impl SourceTargetRequest {
             && owner.input.state().is_ok_and(|state| state == self.state)
     }
     pub(super) fn current_native(&self, owner: &NativeMarkdownPagedBody) -> bool {
-        if !self.current(owner) || !owner.find_source_target_current(self) {
+        if !self.current(owner)
+            || !owner.find_source_target_current(self)
+            || !owner.mode_target_current_native(self)
+        {
             return false;
         }
         // 稳定目标允许自身滚动；实际Native宽度仍在每个可重入几何动作前后核原值。
@@ -81,7 +86,10 @@ impl SourceTargetRequest {
             .view()
             .and_then(|view| view.capture_scene_request().map_err(Into::into))
             .is_ok_and(|actual| self.matches(owner, &actual));
-        matches && self.current(owner) && owner.find_source_target_current(self)
+        matches
+            && self.current(owner)
+            && owner.find_source_target_current(self)
+            && owner.mode_target_current_native(self)
     }
 }
 
@@ -197,7 +205,8 @@ impl NativeMarkdownPagedBody {
             state,
             serial,
             layout_epoch,
-            bounds_width: actual.bounds_width,
+            layout_width: actual.virtual_viewport.layout_width,
+            layout_origin_x: actual.virtual_viewport.layout_origin_x,
             range,
             first_end,
             terminal: Cell::new(Terminal::Pending),
@@ -306,9 +315,17 @@ impl NativeMarkdownPagedBody {
             target.revoke();
             return Ok(());
         }
-        let result = self
-            .view()?
-            .verify_find_target_visible(scene.key(), target.range);
+        let result = if self.reopening_empty_cell_target(&target)? {
+            // 真零长 raw 格没有父显示字形；该导航仍由原目标推进真实行列 reveal，
+            // 仅其当前 Reopen 在退出 preparing 后消费实际 cell_source_hit 内容框。
+            // 不给 Find/模式签空 proof，也不把通用几何 Pending 降成成功。
+            None
+        } else {
+            Some(
+                self.view()?
+                    .verify_find_target_visible(scene.key(), target.range),
+            )
+        };
         if let Some(producer) = self.producer.borrow().as_ref() {
             producer.target_source_health()?; // 原Source首错高于verify期间的普通前台撤权。
         }
@@ -317,6 +334,9 @@ impl NativeMarkdownPagedBody {
             self.schedule()?;
             return Ok(()); // 实际编辑/宽度已换代只撤此旧目标；后继显示沿已有原续体前进。
         }
+        let Some(result) = result else {
+            return Ok(());
+        };
         match result {
             Ok(proof) => {
                 if !target.current_native(self) {

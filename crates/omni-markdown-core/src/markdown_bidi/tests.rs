@@ -340,6 +340,8 @@ fn compare(source: &str, base: BidiBaseDirection, all_lines: bool) {
             assert_eq!(profile.page_loads, 0);
         }
         Resolution::Paged(_) => assert_eq!(profile.cache_bytes, 4 * store::PAGE_BYTES),
+        #[cfg(feature = "paged-shaping-frontier")]
+        Resolution::VisibleParagraphs(_) => panic!("原完整分析 oracle 不构造显式折叠结果"),
     }
     assert!(profile.source_borrow_max_bytes <= 4096);
     assert_eq!(profile.unicode_version, (18, 0, 0)); // 实际property provider版本，不沿用算法crate自带的数据版本。
@@ -754,6 +756,8 @@ fn official_bidi_character_test_levels_and_order_are_exact() {
         let paragraph_base = match &mut value.resolution {
             Resolution::UniformZero(_) => 0,
             Resolution::Paged(store) => Paragraph::read(store, 0).unwrap().base,
+            #[cfg(feature = "paged-shaping-frontier")]
+            Resolution::VisibleParagraphs(_) => panic!("官方单段 oracle 不构造显式折叠结果"),
         };
         assert_eq!(
             paragraph_base,

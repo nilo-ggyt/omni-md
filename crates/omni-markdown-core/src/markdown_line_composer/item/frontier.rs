@@ -6,11 +6,18 @@ use crate::markdown_shaping::frontier::{
     MarkdownShapingFrontierError, MarkdownShapingFrontierJob, MarkdownShapingFrontierReason,
     MarkdownShapingTerminalGrapheme,
 };
+#[cfg(feature = "s2-table-window-prototype")]
+mod style_boundary;
+#[cfg(feature = "s2-table-window-prototype")]
+pub(super) use style_boundary::{has_style_boundary_probe, provide_boundary_style};
 
 /// 未认证能力保持真实待决；这些原因不表示缺字、整段Ready或默认排版降级。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownLineFrontierReason {
-    UnsupportedPlan,
+    /// 原字体真实计划的窄证书拒绝；保留下层类型，调用者才能区分定位、查表与缺字。
+    Plan(harfrust::AsciiFrontierRejection),
+    /// 同一回退字体继续覆盖后继字素，尚未遇到真实字体边界且本次有界输入已用尽。
+    FontRunBeyondBudget,
     NonAscii,
     WordBeyondBudget,
     NotGraphemeBoundary,
@@ -41,6 +48,7 @@ pub(super) struct PendingFrontier {
     registration: Option<MarkdownLineFontRegistration>,
     replay_style: MarkdownLineComposeStyle,
     facts: MarkdownLineItemFacts,
+    shaping_seams: [Option<ResolvedBidiShapingSeam>; 2],
     continuation: Option<MarkdownShapingFrontierContinuation>,
     child: Option<std::sync::Weak<()>>,
     complete: bool,
@@ -48,6 +56,11 @@ pub(super) struct PendingFrontier {
     natural_tail: bool,
     terminal: Option<PendingTerminal>,
     declined_same_font: bool,
+    declined_font_head: bool,
+    // 原平台base只保弱注册；实际part完成后才对其有限GCB窗口审核字体选择，不预扫整个FontRun。
+    preferred_registration: Option<MarkdownLineFontRegistration>,
+    #[cfg(feature = "s2-table-window-prototype")]
+    style_boundary: Option<style_boundary::StyleBoundary>,
 }
 
 /// 一个真实阻塞GCB开启的回退字体段；只存端点、已选Font及最多一个后继GCB，不存正文。
@@ -92,23 +105,28 @@ impl PendingTerminal {
     }
 }
 impl PendingFrontier {
+    /// 首 Font 探测未取得真实字体右界后，保留同一失败计划及原 SCX/词证明续体。
+    pub(in crate::markdown_line_composer::item) fn decline_font_head(&mut self) {
+        self.declined_font_head = true;
+    }
+
     pub(super) fn new(
         owner: MarkdownShapingFrontierJob,
-        original: MarkdownLayoutFont,
-        registration: Option<MarkdownLineFontRegistration>,
+        response: MarkdownLineStyleResponse,
         replay_style: MarkdownLineComposeStyle,
         facts: MarkdownLineItemFacts,
         open_script: bool,
         natural_tail: bool,
     ) -> Self {
-        let font = original.authority();
+        let font = response.font.authority();
         Self {
             owner,
-            original,
+            original: response.font,
             font,
-            registration,
+            registration: response.registration,
             replay_style,
             facts,
+            shaping_seams: response.request.shaping_seams.clone(),
             continuation: None,
             child: None,
             complete: false,
@@ -116,6 +134,12 @@ impl PendingFrontier {
             natural_tail,
             terminal: None,
             declined_same_font: false,
+            declined_font_head: false,
+            preferred_registration: response.preferred_registration,
+            #[cfg(feature = "s2-table-window-prototype")]
+            style_boundary: response
+                .root_leaf_boundary
+                .map(style_boundary::StyleBoundary::new),
         }
     }
 }
@@ -159,10 +183,25 @@ fn prepare_terminal_style(
         nonce: Arc::new(()),
         source: authority.clone(),
         range,
-        paragraph: pending.facts.paragraph_utf16.clone(),
-        script: pending.facts.script,
-        level: pending.facts.level,
+        scope: StyleScope::Text(TextStyleScope {
+            paragraph: pending.facts.paragraph_utf16.clone(),
+            script: pending.facts.script,
+            level: pending.facts.level,
+        }),
+        shaping_seams: [None, None],
         continuation_font: Some(pending.font.clone()),
+        continuation_bytes: Some(
+            terminal.endpoints[0]
+                .as_ref()
+                .expect("原末 GCB 起点已认证")
+                .boundary(authority)?
+                .byte
+                ..terminal.endpoints[1]
+                    .as_ref()
+                    .expect("原末 GCB 终点已认证")
+                    .boundary(authority)?
+                    .byte,
+        ),
     };
     payload.request = Some(request.clone());
     payload.font_probe_scope = Some(Arc::new(()));
@@ -184,6 +223,7 @@ pub(super) fn provide_terminal_style(
         |probe| probe.range.clone(),
     );
     if response.coverage != expected
+        || response.style.presentation != pending.replay_style.presentation
         || response.style.points.to_bits() != pending.replay_style.points.to_bits()
         || response.style.language != pending.replay_style.language
         || response.style.features != pending.replay_style.features
@@ -265,7 +305,7 @@ fn advance_font_run(
     let terminal = pending.terminal.as_mut().expect("真实Font段仍待消费");
     if terminal.beyond_limit {
         step.answer =
-            MarkdownLineItemAnswer::NeedsFrontier(MarkdownLineFrontierReason::UnsupportedPlan);
+            MarkdownLineItemAnswer::NeedsFrontier(MarkdownLineFrontierReason::FontRunBeyondBudget);
         return Ok(step); // 有限完整输入上限不是真Font边界，绝不能截断这个真实连续Font段。
     }
     if terminal.boundary_ready {
@@ -331,10 +371,25 @@ fn advance_font_run(
         nonce: Arc::new(()),
         source: authority.clone(),
         range: probe.range.clone(),
-        paragraph: pending.facts.paragraph_utf16.clone(),
-        script: pending.facts.script,
-        level: pending.facts.level,
+        scope: StyleScope::Text(TextStyleScope {
+            paragraph: pending.facts.paragraph_utf16.clone(),
+            script: pending.facts.script,
+            level: pending.facts.level,
+        }),
+        shaping_seams: [None, None],
         continuation_font: Some(pending.font.clone()),
+        continuation_bytes: Some(
+            probe.endpoints[0]
+                .as_ref()
+                .expect("原相邻 GCB 起点已认证")
+                .boundary(authority)?
+                .byte
+                ..probe.endpoints[1]
+                    .as_ref()
+                    .expect("原相邻 GCB 终点已认证")
+                    .boundary(authority)?
+                    .byte,
+        ),
     };
     payload.request = Some(request.clone());
     payload.font_probe_scope = Some(Arc::new(()));
@@ -401,6 +456,7 @@ fn install_terminal_font(
         registration: response.registration,
         replay_style: style,
         facts,
+        shaping_seams: [None, None],
     });
     payload.stage = Stage::ClosedInput;
     Ok(()) // 原owner继续持同一计划；新Font段真实归还后才允许移动其私有游标。
@@ -503,7 +559,7 @@ pub(super) fn map_error(error: MarkdownShapingFrontierError) -> MarkdownLineComp
 }
 fn reason(value: MarkdownShapingFrontierReason) -> MarkdownLineFrontierReason {
     match value {
-        MarkdownShapingFrontierReason::Plan(_) => MarkdownLineFrontierReason::UnsupportedPlan,
+        MarkdownShapingFrontierReason::Plan(reason) => MarkdownLineFrontierReason::Plan(reason),
         MarkdownShapingFrontierReason::NonAscii => MarkdownLineFrontierReason::NonAscii,
         MarkdownShapingFrontierReason::WordBeyondBudget => {
             MarkdownLineFrontierReason::WordBeyondBudget
@@ -538,6 +594,10 @@ pub(super) fn advance(
         shapes: 0,
         answer: MarkdownLineItemAnswer::Yielded,
     };
+    #[cfg(feature = "s2-table-window-prototype")]
+    if has_style_boundary_probe(payload) {
+        return style_boundary::prepare(payload, authority, budget, step);
+    }
     if payload.frontier.as_ref().is_some_and(|pending| {
         pending
             .terminal
@@ -661,16 +721,22 @@ pub(super) fn advance(
     match progress.answer {
         Answer::Pending => {}
         Answer::NeedsFrontier(value) => {
-            // 诊断仅输出原失败出口已有标量，不额外借正文/字体或改变原拒绝分支。
-            if value
-                == MarkdownShapingFrontierReason::Plan(
-                    harfrust::AsciiFrontierRejection::Positioning,
-                )
-                && payload.cursor == pending.facts.source_utf16.start
+            let at_unconsumed_head = payload.cursor == pending.facts.source_utf16.start
                 && pending.child.is_none()
                 && pending.terminal.is_none()
-                && pending.facts.paragraph_utf16.end - payload.cursor
+                && !pending.declined_font_head
+                && (pending.facts.paragraph_utf16.end - payload.cursor
                     > closed_item::MAX_CLOSED_UTF16
+                    || (!pending.open_script && !pending.natural_tail));
+            if at_unconsumed_head
+                && matches!(
+                    value,
+                    MarkdownShapingFrontierReason::Plan(
+                        harfrust::AsciiFrontierRejection::Positioning
+                            | harfrust::AsciiFrontierRejection::CrossInputSubtable
+                            | harfrust::AsciiFrontierRejection::LookupBehavior
+                    ) | MarkdownShapingFrontierReason::NonAscii
+                )
             {
                 let ascii_suffix = if pending.open_script {
                     let span = payload
@@ -713,10 +779,17 @@ pub(super) fn advance(
                     return Ok(step); // 实际后缀证明在下一原Script量子执行，不偷用本次整形剩余额度。
                 }
                 // 后缀不是ASCII、上下文未结算或没有同源端点时仍用原FontRuns；emoji首Font不能沿用到巨项。
-                // 首GCB的实际Font不证明整个SCX交集均可用；只按真实相邻字体选择封闭首Font段。
+                // ASCII 字体的局部资格也可能先被后面的中文拒绝：起始空格选中原 Font，
+                // 不代表同一样式交集中后继中文也使用它。NonAscii 同样只允许原完整 GCB
+                // 字体试次；必须找到真实 Font 变化才封闭前段，无变化仍保留原精确拒绝。
+                // Positioning 或跨输入 GSUB 拒绝都没有赋予任意切分权限。首 GCB 的实际 Font
+                // 不证明整个 SCX 均可用，只在相邻完整 GCB 确认另一真实 Font 后封闭首 Font 段。
+                // 同 Font 的组合字/连字不能因此被拆开；未找到变化只退役探测，继续原 SCX/词域证明。
                 // 原owner仍持Source/Font/取消及资源scope，直到这个短段child真正归还才结束。
-                // 剩余自然段本来已在旧闭项预算内时，仍先完成原SCX并保留连字/缺字合并行为；
-                // 不能用这条长项路径抢走已支持的小项，或额外拆出逐字素的字体请求。
+                // 原自然小项仍走已有闭项合同；只有尚未消费的非自然短样式项也可试真实Font边界。
+                // 例如“空格、中文、空格”首字素选中Mono，并不证明该Font覆盖中间中文；原计划可能
+                // 在缺字处理前就拒绝跨输入查表。这里只开放同GCB试次机会，不授予短样式末端闭合权：
+                // 只有后继确实选出另一原Font才交付，直到coverage末端仍相同则原样退役并保精确拒绝。
                 payload.closed_fonts = Some(closed_item::FontRuns::frontier_head(
                     authority.clone(),
                     pending.original.clone(),
@@ -724,10 +797,18 @@ pub(super) fn advance(
                     pending.replay_style.clone(),
                     pending.facts.clone(),
                     cancellation.shaping(),
+                    pending.shaping_seams.clone(),
                 ));
                 payload.stage = Stage::ClosedFonts;
                 return Ok(step);
             }
+            #[cfg(feature = "s2-table-window-prototype")]
+            if style_boundary::begin(payload)? {
+                // 原head量子已经使用了本次计划预算；右侧GCB从下一step独立收费，
+                // 不把同一个metadata配额先交旧owner再偷偷交第二次目录查询。
+                return Ok(step);
+            }
+            let pending = payload.frontier.as_mut().expect("原失败计划仍在同owner内");
             if pending.open_script {
                 // 开放SCX没有资格退到有限context的ASCII计划；保持原run算法直到真实闭合，
                 // 再请求对应完整交集的样式。旧响应和资源真实归还，不扩充其Font覆盖权限。
@@ -766,6 +847,14 @@ pub(super) fn advance(
             {
                 return Err(MarkdownLineComposeError::InconsistentCoverage);
             }
+            let audit = closed_item::FontRuns::for_frontier_part(
+                &part,
+                pending.original.clone(),
+                pending.registration.clone(),
+                pending.replay_style.clone(),
+                pending.facts.clone(),
+                pending.preferred_registration.clone(),
+            )?;
             let (mut job, continuation) = part.into_parts();
             let profile = job.profile()?;
             job.glyph(authority, &pending.font, profile.glyph_count)?;
@@ -776,6 +865,19 @@ pub(super) fn advance(
             pending.child = Some(job.index_identity());
             pending.continuation = Some(continuation);
             pending.complete = complete;
+            let mut shaping_seams = [None, None];
+            for (index, seam) in pending.shaping_seams.iter().enumerate() {
+                let Some(seam) = seam else { continue };
+                let (_, at) = seam.boundary(authority)?;
+                let endpoint = if index == 0 {
+                    facts.source_utf16.start
+                } else {
+                    facts.source_utf16.end
+                };
+                if at == endpoint {
+                    shaping_seams[index] = Some(seam.clone());
+                }
+            } // 原 Source 错配必须返回 typed 错误，不能靠 .ok() 悄悄抹去内部 shaping 票。
             payload.item = Some(MarkdownLineItem {
                 job: crate::markdown_line_composer::worker_resources::ShapeResourceOwner::new(
                     job,
@@ -787,6 +889,7 @@ pub(super) fn advance(
                 registration: pending.registration.clone(),
                 replay_style: pending.replay_style.clone(),
                 facts: facts.clone(),
+                shaping_seams,
             });
             work.parts = work
                 .parts
@@ -794,6 +897,13 @@ pub(super) fn advance(
                 .ok_or(MarkdownLineComposeError::Overflow)?;
             payload.stage = Stage::Ready;
             step.answer = MarkdownLineItemAnswer::ItemReady(facts);
+            if let Some(audit) = audit {
+                // 只暂借刚封存的同一个原Job；没有第二字形图。未发现Font变化时原continuation
+                // 原封交回；真实变化后的旧parent必须等重形child归还才退役，不能resume到整part末端。
+                payload.closed_fonts = Some(audit);
+                payload.stage = Stage::ClosedFonts;
+                step.answer = MarkdownLineItemAnswer::Yielded;
+            }
         } // 只移交实际Ready子任务；Store完成后才能归还私有Continuation并推进下一前沿。
         Answer::PendingConsumer | Answer::Complete => {
             return Err(MarkdownLineComposeError::InconsistentCoverage);

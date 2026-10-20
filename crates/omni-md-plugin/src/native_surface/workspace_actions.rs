@@ -841,14 +841,10 @@ impl NativeMarkdownCurrentNoteIntent {
         if !current() {
             return Ok(());
         }
-        if let Ok(view) = active_document_view() {
-            // 保留原具体重载/另存前置输入提交；信息卡等只读动作不走这里。
-            view.commit_active_table_cell()?;
-            if !current() {
-                return Ok(());
-            }
-            view.commit_composition_before_release()?;
-        }
+        with_active_native_markdown_surface(|surface| {
+            // 重载/另存提交实际模式的唯一客户端；Source不能因没有NSTextView而跳过中文组合。
+            surface.commit_marked_text(false)
+        })?;
         if !current() {
             return Ok(());
         }
@@ -1132,16 +1128,144 @@ impl NativeMarkdownCurrentNoteIntent {
     }
 }
 
-/// Retains a view only around an immediate text transaction, never around a modal dialog.
-pub(super) fn active_document_view() -> Result<Retained<PieceBackedMarkdownTextView>, String> {
-    ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
-        let surface = active.as_ref().ok_or("笔记窗口已关闭")?;
-        surface
-            .editor
-            .as_ref()
-            .map(|editor| editor.backend.text_view.clone())
-            .ok_or_else(|| "当前没有打开的笔记".into())
-    })
+/// URL的path已由Foundation解码；这里只执行相对当前笔记目录的dot-segment规则，最终文件仍由原session限域。
+#[cfg(feature = "native-paged-production")]
+fn relative_note_link_path(note: &str, path: &str) -> Result<String, String> {
+    use std::path::Component;
+    let mut target = PathBuf::from(native_markdown_note_parent(note));
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(name) => target.push(name),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !target.pop() {
+                    return Err("笔记链接不能越出当前笔记库".into());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                return Err("笔记链接必须使用库内相对路径".into());
+            }
+        }
+    }
+    target
+        .to_str()
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "笔记链接没有有效的目标路径".into())
+}
+
+/// 真click只排一个弱续体；原Body的排版/输入栈退出后才调用既有保存、拆图和切换流程。
+#[cfg(feature = "native-paged-production")]
+pub(super) fn queue_native_markdown_relative_note_link(
+    view: &super::paged_text_view::NativeMarkdownPagedTextView,
+    key: &super::paged_text_view::NativeMarkdownPagedSceneKey,
+    click: &std::rc::Weak<()>,
+    path: &str,
+) -> Result<(), super::paged_text_view::NativeMarkdownPagedTextViewError> {
+    use super::paged_text_view::NativeMarkdownPagedTextViewError as LinkError;
+    let note = ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
+        let surface = active.as_ref().ok_or_else(|| {
+            LinkError::RelativeNoteLink("当前链接不属于已打开的笔记工作区".into())
+        })?;
+        let editor = surface.editor.as_ref().ok_or(LinkError::Revoked)?;
+        if !std::ptr::eq(editor.input_view(), view.as_super())
+            || !std::rc::Weak::ptr_eq(&key.request.document, &Rc::downgrade(editor.document()))
+            || !native_markdown_controller_has_foreground_authority(&surface.controller)
+            || native_markdown_operation_is_busy(
+                surface.pending_note_switch.is_some(),
+                surface.pending_file_mutation.is_some(),
+            )
+        {
+            return Err(LinkError::Revoked);
+        }
+        let relative = surface
+            .current_note_relative_path
+            .as_deref()
+            .ok_or(LinkError::Revoked)?;
+        Ok(NativeMarkdownCurrentNoteIntent::for_document(
+            &surface.controller,
+            &surface.panel,
+            editor.document(),
+            relative,
+        ))
+    })?;
+    let target =
+        relative_note_link_path(&note.relative_path, path).map_err(LinkError::RelativeNoteLink)?;
+    if !view.link_intent_current(key, click)? || !note.current() {
+        return Err(LinkError::Revoked);
+    }
+    // Native Weak本身也不能保活原正文；跨主队列只转运原弱key/click、文件身份和有限相对目标。
+    let pending = MainThreadBound::new(
+        (Weak::from(view), key.clone(), click.clone(), note, target),
+        view.mtm(),
+    );
+    enqueue_native_markdown_main_task(move || {
+        let mtm = MainThreadMarker::new().expect("相对笔记链接只在原AppKit主队列消费");
+        let (weak, key, click, note, target) = pending.get(mtm);
+        let Some(view) = weak.load() else { return };
+        let result = (|| {
+            let current = match view.link_intent_current(key, click) {
+                Ok(current) => current,
+                Err(LinkError::Revoked | LinkError::Closed | LinkError::Pending) => false,
+                Err(cause) => return Err(cause),
+            };
+            if !current || !note.current() {
+                return Ok(false);
+            }
+            let session = ACTIVE_NATIVE_MARKDOWN_SURFACE
+                .with_borrow(|active| {
+                    active
+                        .as_ref()
+                        .filter(|surface| note.matches(surface))
+                        .map(|surface| surface.session.clone())
+                })
+                .ok_or(LinkError::Revoked)?;
+            // 先确认真实Markdown文件和symlink限域，再触及当前未保存草稿；不为无效路径拆掉旧图。
+            session
+                .resolve_note_for_system_action(target)
+                .map_err(|cause| LinkError::RelativeNoteLink(cause.to_string()))?;
+            if !view.link_intent_current(key, click)? || !note.current() {
+                return Ok(false);
+            }
+            view.retire_link_intent(click); // 先消费原票，再允许保存/退出；错误只回报，不重放已经接纳的切换。
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => {
+                drop(view); // 不把临时Native claim保到旧图resource barrier，否则会阻塞它自己的真实dealloc。
+                if let Err(cause) = switch_native_markdown_note(target)
+                    && let Some(view) = weak.load()
+                {
+                    view.report_link_failure(key, LinkError::RelativeNoteLink(cause));
+                }
+            }
+            Ok(false) => view.retire_link_intent(click), // 后继输入/焦点/关闭只撤原click，不给当前新笔记续权。
+            Err(cause) => {
+                view.retire_link_intent(click);
+                view.report_link_failure(key, cause);
+            }
+        }
+    });
+    Ok(())
+}
+
+/// 失败文案只能写回这个真实View/Doc的原工作区；不向后继窗口或另一个打开的同名笔记发旧错误。
+#[cfg(feature = "native-paged-production")]
+pub(super) fn present_native_markdown_paged_link_error(
+    view: &super::paged_text_view::NativeMarkdownPagedTextView,
+    key: &super::paged_text_view::NativeMarkdownPagedSceneKey,
+    cause: &super::paged_text_view::NativeMarkdownPagedTextViewError,
+) {
+    let _ = with_active_native_markdown_surface(|surface| {
+        if surface.editor.as_ref().is_some_and(|editor| {
+            std::ptr::eq(editor.input_view(), view.as_super())
+                && std::rc::Weak::ptr_eq(&key.request.document, &Rc::downgrade(editor.document()))
+        }) && native_markdown_controller_has_foreground_authority(&surface.controller)
+        {
+            surface.controller.present_error(&cause.to_string());
+        }
+        Ok(())
+    });
 }
 
 /// 系统文件选择器只把明确确认的有限file URL交给core；Cancel与Abort分开。
@@ -1286,11 +1410,10 @@ pub(super) fn import_native_markdown_note_to_directory(
         controller,
         relative_path,
     } = active_action_context()?;
-    if let Ok(view) = active_document_view() {
-        // 同一原字段和正文先完成IME；不能在面板回来后丢掉用户仍可见的草稿。
-        view.commit_active_table_cell()?;
-        view.commit_composition_before_release()?;
-    }
+    with_active_native_markdown_surface(|surface| {
+        // 导入先提交实际模式原客户端，再走下方原保存入口；没有TextKit不代表没有待完成输入。
+        surface.commit_marked_text(false)
+    })?;
     ensure_action_is_current(&controller, relative_path.as_deref())?;
     with_active_native_markdown_surface(|surface| {
         if !list.origin_matches_surface(surface, origin) {
@@ -1382,10 +1505,7 @@ pub(super) fn perform_native_markdown_workspace_action(action: isize) -> Result<
         relative_path,
     } = active_action_context()?;
     // Submit any visible IME/table draft before reading document bytes or launching a modal action.
-    if let Ok(view) = active_document_view() {
-        view.commit_active_table_cell()?;
-        view.commit_composition_before_release()?;
-    }
+    with_active_native_markdown_surface(|surface| surface.commit_marked_text(false))?;
     match action {
         // Saving rechecks the authoritative revision; a conflict leaves the piece tree untouched.
         1 => with_active_native_markdown_surface(|surface| surface.save_current_document()),
@@ -1399,35 +1519,37 @@ pub(super) fn perform_native_markdown_workspace_action(action: isize) -> Result<
                 return Ok(());
             };
             ensure_action_is_current(&controller, Some(note))?;
-            let view = active_document_view()?;
-            insert_native_markdown_attachment(&session, note, &path, &view)
+            let view = ACTIVE_NATIVE_MARKDOWN_SURFACE
+                .with_borrow(|active| {
+                    active
+                        .as_ref()?
+                        .editor
+                        .as_ref()
+                        .map(|editor| Rc::clone(&editor.text_view))
+                })
+                .ok_or("当前没有打开的笔记")?;
+            insert_native_markdown_paged_attachment(&session, note, &path, &view, false)
+                .map_err(|cause| cause.to_string())
         }
         // 普通查找直接保留原完整替换面板；字段和真实editor/Undo仍属于本会话。
         7 | 8 => show_native_markdown_find_bar(true),
-        // The native menu exposes folding to keyboard and accessibility clients as well as gutter clicks.
-        20 => {
-            let view = active_document_view()?;
-            let offset = view.selectedRange().location;
-            let document = view
-                .ivars()
-                .text_storage
-                .load()
-                .and_then(|storage| storage.document())
-                .ok_or("编辑器已关闭")?;
-            let line = {
-                // Resolve canonical source position before invoking a native fold/layout transaction.
-                let document = document.borrow();
-                document
-                    .byte_offset_for_utf16(offset)
-                    .and_then(|byte| document.line_for_byte(byte))
-                    .map_err(|error| error.to_string())?
-            };
-            view.toggle_source_fold(line)
-        }
-        // Expansion is view-local and never touches persistence, history, or document generation.
-        21 => {
-            active_document_view()?.unfold_source();
-            Ok(())
+        // 折叠只改变当前分页客户的显示事实，不提交字符或改写历史。
+        20 | 21 => {
+            let view = ACTIVE_NATIVE_MARKDOWN_SURFACE
+                .with_borrow(|active| {
+                    active
+                        .as_ref()?
+                        .editor
+                        .as_ref()
+                        .map(|editor| Rc::clone(&editor.text_view))
+                })
+                .ok_or("当前没有打开的笔记")?;
+            if action == 20 {
+                view.toggle_current_source_fold()
+            } else {
+                view.expand_source_folds()
+            }
+            .map_err(|cause| cause.to_string())
         }
         // 显式按钮的通常入口已固定意图；直接调用也只清本次当前查询，不提交或保存正文。
         9 => return_native_markdown_workspace_to_directory(
@@ -1439,7 +1561,11 @@ pub(super) fn perform_native_markdown_workspace_action(action: isize) -> Result<
         // 真实菜单和独立插表 action 共用一次提交、明确首格选择及 RequiredRow 激活，不落旧格式器分支。
         118 => insert_table_into_active_native_markdown_editor(),
         // 其余格式仍沿同一已捕获选择和 canonical 事务处理。
-        100..=117 => format_active_markdown_selection(action, active_document_view()?),
+        100..=117 | 22 | 23 => {
+            let intent = NativeMarkdownWorkspacePagedEditIntent::capture(&controller)
+                .ok_or("格式操作的原文档或选择已经改变")?;
+            intent.perform(action)
+        }
         // Unknown tags cannot trigger arbitrary selectors or mutate document state.
         _ => {
             controller.clear_status();
@@ -1448,85 +1574,103 @@ pub(super) fn perform_native_markdown_workspace_action(action: isize) -> Result<
     }
 }
 
-/// Couple one new confined asset to a positively acknowledged canonical link transaction.
-fn insert_native_markdown_attachment(
+/// 分页正文把同一provisional附件与真实Input提交相连；显示失败后仍保已被正文引用的文件。
+fn insert_native_markdown_paged_attachment(
     session: &MarkdownSessionAccess,
     note: &str,
     path: &Path,
-    view: &PieceBackedMarkdownTextView,
-) -> Result<(), String> {
-    // 空尾槽先于任何局部 Native claim 声明；提交后接住原 guard，最后析构才清掉同一 pending owner。
-    let pending_tail: RefCell<Option<NativeMarkdownPendingSelectionGuard>> = RefCell::new(None);
+    view: &super::paged_text_view::NativeMarkdownPagedTextView,
+    interpreted: bool,
+) -> Result<(), super::paged_text_view::NativeMarkdownPagedTextViewError> {
+    use super::paged_text_view::NativeMarkdownPagedTextViewError as ViewError;
     with_active_native_markdown_surface(|surface| {
-        // Native reentry cannot switch/save/close while the copied asset and canonical text are between commit points.
-        let current_view = surface.editor.as_ref().ok_or("当前没有打开的笔记")?;
-        if !std::ptr::eq(&*current_view.backend.text_view, view)
+        let source = surface.editor.as_ref().ok_or("原源码文稿已经关闭")?;
+        if !std::ptr::eq(&**source.text_view, view)
             || surface.current_note_relative_path.as_deref() != Some(note)
         {
-            // A retained old view or dialog context has no authority to import into a replacement document.
-            return Err("插入附件前编辑器已变更，请重试".into());
+            return Err("插入附件前原源码文稿已经改变".into());
         }
         if native_markdown_operation_is_busy(
             surface.pending_note_switch.is_some(),
             surface.pending_file_mutation.is_some(),
         ) {
-            // An accepted handoff owns the last persistence boundary and forbids further asset/text mutations.
             return Err("另一项文档操作仍在完成中".into());
         }
-        let storage = view.ivars().text_storage.load().ok_or("编辑器已关闭")?;
-        // 附件插入也由真实ChangeSet映射fold，不先丢弃无关的折叠。
-        let range = view.selectedRange();
-        let pending = session
-            .prepare_attachment_import(note, path)
-            .map_err(|error| error.to_string())?;
-        let result =
-            storage.apply_explicit_replacement(range, &pending.receipt().markdown_insertion);
-        match result {
-            // The source/history transaction succeeded; retain the asset before publishing native caret changes.
-            Ok((_edit, committed, pending_selection)) => {
-                drop(pending_tail.replace(pending_selection));
-                // 同一原提交的 pending guard 交给早声明尾槽，覆盖附件确认、选择安装及 Native claim 的最后析构。
-                // 不能在 storage 返回时先清槽，再让同步通知把中间选择重签为普通新输入。
-                // The link is already canonical; no additional asset metadata needs to persist in the UI.
-                let _ = pending.commit();
-                if view.apply_committed_selection(&committed) {
-                    let _ = committed.native_step(|| view.schedule_visible_table_layout_update());
-                } // 附件已在canonical内；失效票只阻止旧caret覆盖后继输入。
-                Ok(())
-            }
-            // Text rejection leaves no new history revision; explicitly roll back the still-provisional asset.
-            Err(error) => match pending.rollback() {
-                // Verified cleanup removes only the unchanged newly created attachment, preserving the live draft.
-                Ok(()) => Err(error),
-                // A detected external replacement/change must be preserved and reported, never blindly removed.
-                Err(cleanup) => Err(format!(
-                    "插入附件链接失败：{error}；清理临时附件失败：{cleanup}"
-                )),
-            },
+        if !interpreted {
+            surface.commit_marked_text(false)?; // 队首输入已在原NSTextInputClient栈内完成组合，不能再把它当外部关闭前置提交。
         }
+        let before = match view.input_state() {
+            Ok(before) => before,
+            Err(cause) => return Ok(Err(cause)), // 真实Input/Source错误保typed首因，不能降级成外部文件业务拒绝。
+        };
+        let provisional = session
+            .prepare_attachment_import(note, path)
+            .map_err(|cause| cause.to_string())?;
+        let text = provisional.receipt().markdown_insertion.clone(); // 只复制本次有限文件名/链接，不读原文或附件内容。
+        let mut provisional = Some(provisional);
+        let inserted = view.insert_attachment_link(before, &text, interpreted, || {
+            let _ = provisional
+                .take()
+                .expect("原Core提交只确认一次同一附件")
+                .commit();
+        });
+        let result = match (inserted, provisional) {
+            (Ok(()), _) => Ok(()),
+            (Err(cause), None) => Err(cause), // Core已提交，原Native显示后果失败绝不能反向删除附件。
+            (Err(cause), Some(provisional)) => match provisional.rollback() {
+                Ok(()) => Err(cause),
+                Err(cleanup) => Err(ViewError::AttachmentRollback {
+                    cause: Box::new(cause),
+                    cleanup: cleanup.to_string(),
+                }),
+            },
+        };
+        Ok(result) // 区分外部文件业务拒绝与真实Core/Native后果错误，不把后者压成普通字符串。
     })
+    .map_err(ViewError::AttachmentImport)?
 }
 
-impl NativeMarkdownWorkspaceEditIntent {
-    /// 菜单原票直接到实际命令；格内行内格式先于普通前置提交，避免丢掉真实子选区。
-    pub(super) fn perform(&self, action: isize) -> Result<(), String> {
-        if !self.current() {
-            return Err("格式操作的原文档或选择已经改变".into());
-        }
-        if self.has_table_selection() && matches!(action, 103..=108 | 113..=114) {
-            // 原字段自己的 IME 确认、序列化和格式组成一次有限提交；不先走会清字段的通用 preflight。
-            preflight_native_markdown_modal()?;
-            let view = active_document_view()?;
-            view.format_table_cell_for_menu(self, native_markdown_format_action(action)?)
-        } else {
-            // 非格内动作沿原文件、正文块和插表事务，不添加新的表格块语法或快捷键。
-            perform_native_markdown_workspace_action(action)
-        }
+/// 原分页队首逐个执行受限复制；每次都核同一实际Source视图，已提交附件不因后续失败删除。
+pub(super) fn insert_native_markdown_paged_attachments(
+    view: &super::paged_text_view::NativeMarkdownPagedTextView,
+    paths: &[PathBuf],
+) -> Result<(), super::paged_text_view::NativeMarkdownPagedTextViewError> {
+    use super::paged_text_view::NativeMarkdownPagedTextViewError as ViewError;
+    let DocumentActionContext {
+        session,
+        controller: _,
+        relative_path,
+    } = active_action_context().map_err(ViewError::AttachmentImport)?;
+    let note =
+        relative_path.ok_or_else(|| ViewError::AttachmentImport("当前没有打开的笔记".into()))?;
+    for path in paths {
+        // 最多十六条有限路径；Core只流式复制本文件，正文只增加其有限链接，不复制整篇笔记。
+        insert_native_markdown_paged_attachment(&session, &note, path, view, true)?;
+    }
+    Ok(())
+}
+
+/// 原队首归还Surface租约后再反馈；旧文件请求没有覆盖后继笔记状态栏的权限。
+pub(super) fn present_native_markdown_paged_attachment_error(
+    view: &super::paged_text_view::NativeMarkdownPagedTextView,
+    message: &str,
+) {
+    let current = ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
+        active.as_ref().is_some_and(|surface| {
+            surface
+                .editor
+                .as_ref()
+                .is_some_and(|source| std::ptr::eq(&**source.text_view, view))
+                && native_markdown_controller_has_foreground_authority(&surface.controller)
+        })
+    });
+    if current {
+        present_native_markdown_error(message); // 只显示当前原文稿的有限业务错误，不关闭文稿或清空未保存正文。
     }
 }
 
 /// 菜单 tag 只映射既有领域命令；正文与真实单格使用同一个映射。
-fn native_markdown_format_action(action: isize) -> Result<MarkdownFormatAction, String> {
+pub(super) fn native_markdown_format_action(action: isize) -> Result<MarkdownFormatAction, String> {
     Ok(match action {
         // 一级标题归一化当前行原有的标题前缀。
         100 => MarkdownFormatAction::Heading1,
@@ -1569,32 +1713,6 @@ fn native_markdown_format_action(action: isize) -> Result<MarkdownFormatAction, 
     })
 }
 
-/// 有限正文命令进入同一原子格式器，并发布其准确选择。
-fn format_active_markdown_selection(
-    action: isize,
-    view: Retained<PieceBackedMarkdownTextView>,
-) -> Result<(), String> {
-    // 空槽的声明早于局部原生持有；把参数 owner 移入后声明局部，保证视图最终 release 也先于 guard 清槽。
-    let pending_tail: RefCell<Option<NativeMarkdownPendingSelectionGuard>> = RefCell::new(None);
-    let command_view = view;
-    let view = &*command_view;
-    // 主head捕获、Core提交与Native选择发布的整个栈都参与关闭预检，不能只靠Retained保活。
-    let _payload = PayloadUseGuard::enter(&view.ivars().payload_use_depth);
-    let action = native_markdown_format_action(action)?;
-    let selection = view
-        .selection_for_command()
-        .map_err(|error| error.to_string())?;
-    let storage = view.ivars().text_storage.load().ok_or("编辑器已关闭")?;
-    let (_edit, committed, pending) = storage.apply_format_captured(action, selection)?;
-    drop(pending_tail.replace(pending));
-    // 原 guard 与同一 Rc 交给早声明尾槽，覆盖安装、布局以及 storage/视图 Native claims 的最后析构。
-    // 正文成功不依赖后续选择仍获授权；Native重入后停止旧UI后果，不重放格式事务。
-    if view.apply_committed_selection(&committed) {
-        let _ = committed.native_step(|| view.schedule_visible_table_layout_update());
-    }
-    Ok(())
-}
-
 /// Reads only explicit file-URL pasteboard items, with a fixed batch limit and no cache.
 pub(super) fn native_markdown_pasteboard_file_paths(
     pasteboard: &NSPasteboard,
@@ -1628,6 +1746,15 @@ pub(super) fn native_markdown_pasteboard_file_paths(
             return Err("附件地址超过导入长度上限".into());
         }
         let url = NSURL::URLWithString(&value).ok_or("附件地址无效")?;
+        if !url.isFileURL() {
+            return Err("附件地址必须是本地文件地址".into()); // 不把网络URL的path误当本机外部文件读取授权。
+        }
+        if let Some(host) = url.host()
+            && host.length() != 0
+            && !host.to_string().eq_ignore_ascii_case("localhost")
+        {
+            return Err("附件地址不能包含远端文件主机".into()); // 不丢弃file://server的authority后读取同名本机路径。
+        }
         let path = url.path().ok_or("附件没有本地路径")?;
         if path.length() > 4_096 {
             return Err("附件路径超过导入长度上限".into());
@@ -1638,7 +1765,7 @@ pub(super) fn native_markdown_pasteboard_file_paths(
 }
 
 /// 限制待通知业务载荷总量；原生 adapter 与纯测试共享同一入队判定。
-fn validate_attachment_queue(pending: usize, paths: &[PathBuf]) -> Result<(), String> {
+pub(super) fn admit_attachment_paths(pending: usize, paths: &[PathBuf]) -> Result<(), String> {
     if pending >= 4 {
         // 不丢弃旧请求，也不把新请求的路径放到无界 dispatch 队列。
         return Err("已有 4 项附件导入正在等待，请完成后重试".into());
@@ -1653,108 +1780,13 @@ fn validate_attachment_queue(pending: usize, paths: &[PathBuf]) -> Result<(), St
     Ok(())
 }
 
-/// Defers external-file I/O while carrying no strong native editor ownership across the queue.
-pub(super) fn schedule_native_markdown_attachment_paths(
-    view: &PieceBackedMarkdownTextView,
-    paths: Vec<PathBuf>,
-) -> Result<(), String> {
-    validate_attachment_queue(
-        view.ivars().pending_attachment_imports.borrow().len(),
-        &paths,
-    )?;
-    if view.ivars().textkit_graph_teardown.get() {
-        // 关闭后的路径不进入任何邮箱，也不获得新工作权限。
-        return Err("笔记编辑器正在关闭".into());
-    }
-    let mtm = MainThreadMarker::new().expect("native paste/drop callbacks run on the main thread");
-    // Preserve the user's exact paste/drop anchor while deferring file I/O outside native callbacks.
-    let anchor_range = view.selectedRange();
-    let anchor_generation = view
-        .ivars()
-        .text_storage
-        .load()
-        .and_then(|storage| storage.document())
-        .map(|document| document.borrow().generation());
-    let mailbox = std::sync::Arc::new(crate::cancelable_mailbox::CancelableMailbox::new());
-    mailbox.publish(paths);
-    view.ivars()
-        .pending_attachment_imports
-        .borrow_mut()
-        .push(std::sync::Arc::clone(&mailbox));
-    let mailbox = std::sync::Arc::downgrade(&mailbox);
-    let weak = MainThreadBound::new(Weak::from(view), mtm);
-    enqueue_native_markdown_main_task(move || {
-        let mtm = MainThreadMarker::new().expect("native imports execute on the main queue");
-        // A closed editor cannot be revived by an earlier drop or paste operation.
-        let Some(view) = weak.get(mtm).load() else {
-            // The original native editor has deallocated; queued file work owns no successor authority.
-            return;
-        };
-        let Some(mailbox) = mailbox.upgrade() else {
-            // close 已同步取消并释放路径；主队列通知不需要执行才能完成清理。
-            return;
-        };
-        let pending = {
-            let mut imports = view.ivars().pending_attachment_imports.borrow_mut();
-            // 移出本请求的 owner，其他仍待执行请求继续留在当前会话邮箱账本内。
-            imports
-                .iter()
-                .position(|entry| std::sync::Arc::ptr_eq(entry, &mailbox))
-                .map(|index| imports.swap_remove(index))
-        };
-        drop(pending);
-        let Some(paths) = mailbox.take() else {
-            // 迟到或重复通知没有路径载荷，也不能恢复已关闭编辑器的权限。
-            return;
-        };
-        let result = (|| {
-            let DocumentActionContext {
-                session,
-                controller: _,
-                relative_path,
-            } = active_action_context()?;
-            let current = active_document_view()?;
-            // Session replacement invalidates old file actions even when their weak view still exists.
-            if !std::ptr::eq(&*view, &*current) {
-                // A still-alive old native shell cannot import files into the newly selected document.
-                return Err("导入附件前编辑器已变更，请重试".into());
-            }
-            let generation = view
-                .ivars()
-                .text_storage
-                .load()
-                .and_then(|storage| storage.document())
-                .map(|document| document.borrow().generation());
-            if generation != anchor_generation || view.selectedRange() != anchor_range {
-                // Intervening input or caret movement invalidates the original physical drop/paste anchor.
-                return Err("导入附件前文档或插入位置已变更，请重试".into());
-            }
-            let note = relative_path.ok_or("当前没有打开的笔记")?;
-            // Commit composition before using the current selection for explicit attachment links.
-            view.commit_active_table_cell()?;
-            view.commit_composition_before_release()?;
-            for path in paths {
-                // Each accepted file has one canonical undo transaction; failure rolls back only that provisional copy.
-                insert_native_markdown_attachment(&session, &note, &path, &view)?;
-            }
-            Ok::<(), String>(())
-        })();
-        // Report bounded import failures without closing the note or losing its live draft.
-        if let Err(error) = result {
-            // Display only the bounded failure message; the already committed draft remains editable.
-            present_native_markdown_error(&error);
-        }
-    });
-    Ok(())
-}
-
 /// Hides native find UI before Escape is allowed to close the document's foreground session.
 pub(super) fn dismiss_active_native_markdown_find_bar() -> bool {
     let visible = ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
         active
             .as_ref()
             .and_then(|surface| surface.editor.as_ref())
-            .and_then(|editor| editor.find_bar.borrow().clone())
+            .and_then(|editor| editor.find_bar().borrow().clone())
             .is_some_and(|bar| bar.is_visible())
     });
     if !visible {
@@ -1850,8 +1882,32 @@ pub(super) fn deliver_native_markdown_search_result(
 
 #[cfg(test)]
 mod resource_budget_tests {
-    use super::{submitted_workspace_query_from_utf16, validate_attachment_queue};
+    use super::{admit_attachment_paths, submitted_workspace_query_from_utf16};
     use std::path::PathBuf;
+
+    #[test]
+    #[cfg(feature = "native-paged-production")]
+    /// 真实URI相对文件语义必须允许库内父目录，并在任何保存/拆图前拒绝越库和绝对路径。
+    fn relative_note_links_keep_the_origin_directory_and_vault_boundary() {
+        let resolve = super::relative_note_link_path;
+        assert_eq!(
+            resolve("guide/start.md", "next.md").unwrap(),
+            "guide/next.md"
+        );
+        assert_eq!(
+            resolve("guide/start.md", "../other.md").unwrap(),
+            "other.md"
+        );
+        assert_eq!(
+            resolve("guide/start.md", "./子目录/中文 笔记.md").unwrap(),
+            "guide/子目录/中文 笔记.md"
+        );
+        assert_eq!(resolve("start.md", "nested/../next.md").unwrap(), "next.md");
+        assert!(resolve("start.md", "../outside.md").is_err());
+        assert!(resolve("guide/start.md", "../../outside.md").is_err());
+        assert!(resolve("guide/start.md", "/absolute.md").is_err());
+        assert!(resolve("start.md", "").is_err());
+    }
 
     #[test]
     fn query_scalar_limit_preserves_pairs_and_rejects_malformed_native_utf16() {
@@ -1894,13 +1950,13 @@ mod resource_budget_tests {
     #[test]
     fn bounded_attachment_admission_never_discards_an_accepted_prefix() {
         let paths = vec![PathBuf::from("/synthetic/file.md"); 16];
-        assert!(validate_attachment_queue(3, &paths).is_ok());
-        assert!(validate_attachment_queue(4, &paths).is_err());
-        assert!(validate_attachment_queue(0, &[]).is_err());
+        assert!(admit_attachment_paths(3, &paths).is_ok());
+        assert!(admit_attachment_paths(4, &paths).is_err());
+        assert!(admit_attachment_paths(0, &[]).is_err());
         let too_many = vec![PathBuf::from("/synthetic/file.md"); 17];
-        assert!(validate_attachment_queue(0, &too_many).is_err());
-        assert!(validate_attachment_queue(0, &[PathBuf::from("x".repeat(16_384))]).is_ok());
-        assert!(validate_attachment_queue(0, &[PathBuf::from("x".repeat(16_385))]).is_err());
+        assert!(admit_attachment_paths(0, &too_many).is_err());
+        assert!(admit_attachment_paths(0, &[PathBuf::from("x".repeat(16_384))]).is_ok());
+        assert!(admit_attachment_paths(0, &[PathBuf::from("x".repeat(16_385))]).is_err());
         // 验证不消费调用者输入；拒绝后仍可修改批次并明确重试。
         assert_eq!(too_many.len(), 17);
     }

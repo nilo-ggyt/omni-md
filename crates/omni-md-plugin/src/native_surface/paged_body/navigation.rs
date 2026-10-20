@@ -119,8 +119,10 @@ impl PendingVertical {
             && actual.target.is_body(&actual.document)
             && Weak::ptr_eq(&actual.document, &self.request.document)
             && actual.input == self.request.input
-            && actual.bounds_width == self.request.bounds_width
-            && actual.viewport.size == self.request.viewport.size
+            && actual.virtual_viewport.layout_width == self.request.virtual_viewport.layout_width
+            && actual.virtual_viewport.layout_origin_x
+                == self.request.virtual_viewport.layout_origin_x
+            && actual.viewport.size.height == self.request.viewport.size.height
     }
     pub(super) fn current_native(&self, owner: &NativeMarkdownPagedBody) -> bool {
         self.current(owner)
@@ -219,6 +221,10 @@ impl NativeMarkdownPagedBody {
             resolved: Cell::new(None),
         });
         self.pending_vertical.replace(Some(pending.clone()));
+        self.attach_native_vertical(&pending).map_err(|cause| {
+            self.fail(cause);
+            ViewError::Revoked
+        })?; // 原event中的新垂直动作也必须先交真实收据，不能让下一key抢旧caret。
         if let Some(target) = immediate {
             pending.processing.set(true);
             let result = self.commit_vertical_navigation(&pending, target);
@@ -308,6 +314,13 @@ impl NativeMarkdownPagedBody {
         pending: &Rc<PendingVertical>,
         target: super::super::paged_text_view::NativeMarkdownPagedNavigationTarget,
     ) -> std::result::Result<(), ViewError> {
+        let before = self
+            .view()
+            .map_err(|_| ViewError::Closed)?
+            .capture_scene_request()?;
+        if !pending.current_native(self) {
+            return Err(ViewError::Revoked);
+        }
         let current = |epoch| self.current(epoch) && pending.current_native(self);
         let permit = self.input.capture(self.configuration.epoch, &current)?;
         let outcome = self.input.set_selection_intent(
@@ -332,11 +345,41 @@ impl NativeMarkdownPagedBody {
         };
         drop(removed); // 选择已提交后不再要求旧before；只有原commit可通知显示，不能重放动作。
         match outcome {
-            super::super::paged_input::NativeMarkdownPagedInputOutcome::Committed(commit) => self
-                .view()
-                .map_err(|_| ViewError::Closed)?
-                .finish_navigation_commit(&commit),
-            super::super::paged_input::NativeMarkdownPagedInputOutcome::Unchanged(_) => Ok(()),
+            super::super::paged_input::NativeMarkdownPagedInputOutcome::Committed(commit) => {
+                let commit = Rc::new(commit);
+                let keys = self
+                    .bind_vertical_native_receipt(pending, &before, Some(Rc::clone(&commit)))
+                    .map_err(|cause| {
+                        self.fail(cause);
+                        ViewError::Revoked
+                    })?;
+                self.view()
+                    .map_err(|_| ViewError::Closed)?
+                    .finish_navigation_commit(&commit)?;
+                if keys {
+                    self.finish_vertical_native_receipt(Some(&commit))
+                        .map_err(|cause| {
+                            self.fail(cause);
+                            ViewError::Revoked
+                        })?;
+                }
+                Ok(())
+            }
+            super::super::paged_input::NativeMarkdownPagedInputOutcome::Unchanged(_) => {
+                let keys = self
+                    .bind_vertical_native_receipt(pending, &before, None)
+                    .map_err(|cause| {
+                        self.fail(cause);
+                        ViewError::Revoked
+                    })?;
+                if keys {
+                    self.finish_vertical_native_receipt(None).map_err(|cause| {
+                        self.fail(cause);
+                        ViewError::Revoked
+                    })?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -358,9 +401,78 @@ impl NativeMarkdownPagedBody {
         {
             return Err(ViewError::Revoked);
         } // 只接同一Body/Cell完整postcommit状态；Cell局部坐标仍由原domain约束，不借canonical身份。
+        let request = self.synchronize_committed_gutter(commit, &request)?;
         let old = self.selection_reveal.replace(Some(request));
         drop(old); // 只归还原弱请求，不保留旧Native事件、Source或历史副本。
         self.schedule().map_err(|_| ViewError::Revoked)
+    }
+
+    /// 行号位数改变只授权这次收据引起的自有横向布局；原输入与外部滚动容器必须保持。
+    pub(super) fn synchronize_committed_gutter(
+        &self,
+        commit: &NativeMarkdownPagedInputCommit,
+        before: &NativeMarkdownPagedSceneRequest,
+    ) -> std::result::Result<NativeMarkdownPagedSceneRequest, ViewError> {
+        let view = self.view().map_err(|_| ViewError::Closed)?;
+        commit.check_current(&|epoch| self.current(epoch))?;
+        let actual = view.capture_scene_request()?;
+        commit.check_current(&|epoch| self.current(epoch))?;
+        if !actual.same(before) || actual.input != commit.state {
+            return Err(ViewError::Revoked); // 自有布局尚未开始，任何旧票变化均为外部接管，不能续权。
+        }
+        let gutter = self.gutter.borrow().clone();
+        let Some(gutter) = gutter else {
+            return Ok(actual); // Cell或无行号客户没有这次横向变化，不创建替代请求或额外布局。
+        };
+        let scroll = gutter.scrollView();
+        commit.check_current(&|epoch| self.current(epoch))?;
+        let scroll = scroll.ok_or(ViewError::Closed)?;
+        let frame = scroll.frame();
+        commit.check_current(&|epoch| self.current(epoch))?;
+        let bounds = scroll.bounds();
+        commit.check_current(&|epoch| self.current(epoch))?;
+        if !view.capture_scene_request()?.same(before) {
+            return Err(ViewError::Revoked);
+        } // Native读取期间也不能发生未授权几何变化；这里只固定原真实容器，不推算新宽度。
+        let lines = self
+            .document
+            .borrow()
+            .as_ref()
+            .expect("Source行号属于原Body文档")
+            .borrow()
+            .line_count();
+        let changed = gutter.update_width(lines);
+        commit.check_current(&|epoch| self.current(epoch))?;
+        let changed = changed?;
+        if changed {
+            let viewport = self.viewport.borrow().clone().ok_or(ViewError::Closed)?;
+            let synchronized = viewport.synchronize();
+            commit.check_current(&|epoch| self.current(epoch))?;
+            synchronized.map_err(|cause| ViewError::Raster(cause.to_string()))?;
+        } // 只有这次真实行号宽度变化能同步正文frame；不为普通外部resize重绑定输入链。
+        let after_frame = scroll.frame();
+        commit.check_current(&|epoch| self.current(epoch))?;
+        let after_bounds = scroll.bounds();
+        commit.check_current(&|epoch| self.current(epoch))?;
+        if after_frame != frame || after_bounds != bounds {
+            return Err(ViewError::Revoked); // 用户改变外层大小或位置时，原已提交后果立即停止，不恢复关闭owner。
+        }
+        let after = view.capture_scene_request()?;
+        commit.check_current(&|epoch| self.current(epoch))?;
+        if !changed {
+            if !after.same(before) {
+                return Err(ViewError::Revoked);
+            }
+        } else if !Weak::ptr_eq(&after.document, &before.document)
+            || !after.target.same(&before.target)
+            || after.input != commit.state
+            || after.viewport.size.height != before.viewport.size.height
+            || after.frame_in_parent.size.height != before.frame_in_parent.size.height
+            || after.virtual_viewport.document_origin.y != before.virtual_viewport.document_origin.y
+        {
+            return Err(ViewError::Revoked);
+        } // 自有ruler只改变横向空间；真实正文、输入、垂直视口或外层容器改变不能由它补签。
+        Ok(after)
     }
 
     /// 唯一Producer选定后才绑定一次原Source；原请求失效只撤销，不将后继状态补签为旧导航。

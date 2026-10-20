@@ -18,7 +18,8 @@ use pulldown_cmark::{
 };
 use std::ops::Range;
 
-const MIN_STEP: usize = 4 * 1_024;
+// 同一来源 owner 为控制/释放保留少量额度；真实 scanner 仍在下面核足 2048 的可用工作。
+const MIN_STEP: usize = 3 * 1_024;
 const MAX_STEP: usize = 64 * 1_024;
 const STATE_WORK: usize = 1_024;
 
@@ -222,7 +223,7 @@ impl Request {
             }
             Phase::ScanLabel | Phase::ScanDefinition => self.scan_lines(available, &mut work)?,
             Phase::ProbeLabel | Phase::ProbeDefinition => {
-                self.advance_prefix(document, available, tree_work, &mut work)?;
+                self.advance_prefix(document, queries, available, tree_work, &mut work)?;
             }
             Phase::NormalizeLabel => self.normalize(queries, &mut work)?,
             Phase::StripDefinition => self.strip(available, &mut work)?,
@@ -329,6 +330,7 @@ impl Request {
     fn advance_prefix(
         &mut self,
         document: &MarkdownDocumentBuffer,
+        queries: &Queries,
         available: usize,
         tree_work: usize,
         work: &mut ReferenceWork,
@@ -350,6 +352,7 @@ impl Request {
             return Ok(()); // 固定游标建立与实际源读取分step，不能隐藏deep scope展开。
         }
         let probe = self.probe.as_mut().ok_or(Error::InvalidSource)?;
+        let workspace_before = probe.allocated_workspace_bytes();
         let frame = document
             .table_source_frame(probe.next_byte(), available)
             .map_err(|_| Error::InvalidSource)?;
@@ -372,6 +375,9 @@ impl Request {
         // 回收成功后才消费step，不能让原parser提前终止遮住真实映射错误。
         frame.finish().map_err(|_| Error::InvalidSource)?;
         let step = step?;
+        let allocated = probe.allocated_workspace_bytes() - workspace_before;
+        queries.admit_resolution_metadata(allocated)?;
+        work.metadata_bytes += allocated;
         let (child_work, completed) = match step {
             ReferencePrefixStep::Progress { work, .. }
             | ReferencePrefixStep::NeedInput { work, .. } => (work, None),
@@ -391,10 +397,14 @@ impl Request {
             {
                 return Err(Error::ParserMismatch);
             }
-            if buffer.prefixes.is_empty() {
-                // 每条记录至少对应一个实际EOL；总payload≤有限raw字节数×size_of(PrefixRecord)。
-                // 常见单行定义完全不分配此Vec，不能把16KiB正文上限误称全部metadata内存。
-                buffer.prefixes = Vec::with_capacity(buffer.text.len());
+            if buffer.prefixes.len() == buffer.prefixes.capacity() {
+                // 每条真实续行只增加一个记录槽；不为一个换行预分配整段raw字节数个记录。
+                let before = buffer.prefixes.capacity();
+                buffer.prefixes.reserve_exact(1);
+                let allocated =
+                    (buffer.prefixes.capacity() - before) * std::mem::size_of::<PrefixRecord>();
+                queries.admit_resolution_metadata(allocated)?;
+                work.metadata_bytes += allocated;
             }
             buffer.prefixes.push(PrefixRecord {
                 at: line,

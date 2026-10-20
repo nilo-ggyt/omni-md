@@ -4,10 +4,10 @@ use super::super::table_cell_edit::{
     MarkdownTableCellEditPlan, TableCellEditContext, missing_cell_separators,
 };
 use super::*;
-use pulldown_cmark::block_frontier::TableCellScanner;
+use pulldown_cmark::block_frontier::{TableCellSemanticScanner, TableDelimiterScanner};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Ready仅说明原格编辑计划已经认证，不表达预览样式或Native挂载完成。
+/// Ready 只说明原格结构端点已认证；编辑计划和只读来源择一消费，不表达预览样式或 Native 挂载。
 pub enum MarkdownTableCellEditStep {
     Progress { work: SemanticWork },
     Ready { work: SemanticWork },
@@ -20,7 +20,12 @@ pub struct MarkdownTableCellEditRequest {
     structure: Option<MarkdownTableWindowStructureRequest>,
     ticket: Option<MarkdownTableStructuralWindow>,
     context: Option<TableCellEditContext>,
-    scanner: Option<TableCellScanner>,
+    scanner: Option<TableCellSemanticScanner>,
+    // 同一真实 separator 只流式提取当前列；不为对齐创建整行字符串或完整 alignment Vec。
+    delimiter: Option<TableDelimiterScanner>,
+    delimiter_next: usize,
+    delimiter_end: usize,
+    alignment: Option<crate::MarkdownTableAlignment>,
     next: usize,
     content_start: usize,
     utf16: usize,
@@ -28,7 +33,7 @@ pub struct MarkdownTableCellEditRequest {
     selected: Option<Range<usize>>,
     row: usize,
     column: usize,
-    ready: Option<MarkdownTableCellEditPlan>,
+    ready: Option<VerifiedMarkdownTableCellSource>,
     finished: bool,
     failed: Option<MarkdownTableRequestError>,
 }
@@ -56,6 +61,10 @@ impl MarkdownDocumentBuffer {
             ticket: None,
             context: None,
             scanner: None,
+            delimiter: None,
+            delimiter_next: 0,
+            delimiter_end: 0,
+            alignment: None,
             next: 0,
             content_start: 0,
             utf16: 0,
@@ -71,6 +80,34 @@ impl MarkdownDocumentBuffer {
 }
 
 impl MarkdownTableCellEditRequest {
+    /// 只移交原 RequiredRow 回放票，不建立结构 Global；所有后续扫描仍走同一个原实现。
+    pub(super) fn from_ticket(
+        ticket: MarkdownTableStructuralWindow,
+        row: usize,
+        column: usize,
+    ) -> Self {
+        Self {
+            source: ticket.source.clone(),
+            structure: None,
+            ticket: Some(ticket),
+            context: None,
+            scanner: None,
+            delimiter: None,
+            delimiter_next: 0,
+            delimiter_end: 0,
+            alignment: None,
+            next: 0,
+            content_start: 0,
+            utf16: 0,
+            trimmed_utf16: 0..0,
+            selected: None,
+            row,
+            column,
+            ready: None,
+            finished: false,
+            failed: None,
+        }
+    }
     /// 每次结构或原格扫描均至多借4096字节；取消/失效丢弃候选，不发布部分编辑权限。
     pub fn advance(
         &mut self,
@@ -110,6 +147,7 @@ impl MarkdownTableCellEditRequest {
                 self.ticket = None;
                 self.context = None;
                 self.scanner = None;
+                self.delimiter = None;
                 self.selected = None;
                 self.ready = None;
                 Err(error)
@@ -201,7 +239,27 @@ impl MarkdownTableCellEditRequest {
             self.next = start;
             self.content_start = start + prefix;
             self.utf16 = utf16.start;
-            self.scanner = Some(TableCellScanner::new(self.content_start));
+            let inline_row = if self.row == 0 {
+                ticket.checkpoint.header_inline_row()
+            } else {
+                ticket
+                    .inline_rows
+                    .iter()
+                    .find(|row| row.row_ordinal() == self.row)
+                    .cloned()
+                    .ok_or(MarkdownTableRequestError::InvalidRequest)?
+            };
+            let math = ticket
+                .math_rows
+                .iter()
+                .find(|row| row.row_ordinal == self.row)
+                .ok_or(MarkdownTableRequestError::InvalidRequest)?
+                .context;
+            self.scanner = Some(
+                inline_row
+                    .cell_scanner(self.column, math)
+                    .map_err(|cause| MarkdownTableRequestError::Global(cause.into()))?,
+            );
             self.context = Some(TableCellEditContext {
                 header: header.header_byte_start..header_end,
                 delimiter: header.separator_byte_start..delimiter_end,
@@ -212,10 +270,74 @@ impl MarkdownTableCellEditRequest {
                 columns: header.columns,
                 end: ticket.table_end.clone(),
             });
+            // 原 Global 已认证 separator 的真实容器前缀；只跳过它，不在 Native 重识别 quote/list。
+            self.delimiter_next = header.separator_byte_start + header.separator_prefix_bytes;
+            self.delimiter_end = delimiter_end;
+            self.delimiter = Some(TableDelimiterScanner::new());
             self.ticket = None; // 原身份和所需End已移入同一计划上下文，不保整份窗口metadata。
             return Ok(MarkdownTableCellEditStep::Progress {
                 work: SemanticWork {
                     source_bytes: header_reads + delimiter_reads + row_reads,
+                    structural_transitions: 64,
+                    ..SemanticWork::default()
+                },
+            });
+        }
+        if let Some(delimiter) = self.delimiter.as_mut() {
+            // 与原 LineReader 共用唯一 delimiter 转换，每轮仍按真实 byte/树定位/状态工作收费。
+            // 整行有效和列数已由同一 Global/结构票认证；目标列闭合即可停，不重扫该列之后的分隔行。
+            let context = self.context.as_ref().unwrap();
+            if self.delimiter_next < self.delimiter_end {
+                let tree = tree_height(document);
+                let count =
+                    ((budget - tree - 64) / 4).min(self.delimiter_end - self.delimiter_next);
+                let frame = document
+                    .table_source_frame(self.delimiter_next, count)
+                    .map_err(MarkdownTableRequestError::Source)?;
+                let available = frame.bytes.len().min(count);
+                if available == 0 {
+                    return Err(MarkdownTableRequestError::InvalidRequest);
+                }
+                let mut used = 0;
+                let mut completed = false;
+                for byte in &frame.bytes[..available] {
+                    used += 1;
+                    if let Some((column, alignment)) = delimiter.push(*byte)
+                        && column == context.column
+                    {
+                        self.alignment = Some(table_alignment(alignment));
+                        completed = true;
+                        break;
+                    }
+                }
+                // 实际只消费到目标 pipe 的部分才计源读取；未扫描的同 frame 后缀不冒充工作。
+                // 归还失败保留原 typed errno，不能以已取得 alignment 的局部成功覆盖它。
+                self.delimiter_next += used;
+                frame.finish().map_err(MarkdownTableRequestError::Source)?;
+                if completed {
+                    self.delimiter = None;
+                }
+                return Ok(MarkdownTableCellEditStep::Progress {
+                    work: SemanticWork {
+                        source_bytes: used,
+                        source_tree_steps: tree,
+                        structural_transitions: used * 3 + 64,
+                        ..SemanticWork::default()
+                    },
+                });
+            }
+            if let Some((column, alignment)) = delimiter.final_column()
+                && column == context.column
+            {
+                self.alignment = Some(table_alignment(alignment));
+            }
+            // 没有尾 pipe 的真实末列只能在 content_end 收口；未知/缺失值不能默认左对齐。
+            if delimiter.columns() != Some(context.columns) || self.alignment.is_none() {
+                return Err(MarkdownTableRequestError::InvalidRequest);
+            }
+            self.delimiter = None;
+            return Ok(MarkdownTableCellEditStep::Progress {
+                work: SemanticWork {
                     structural_transitions: 64,
                     ..SemanticWork::default()
                 },
@@ -226,7 +348,7 @@ impl MarkdownTableCellEditRequest {
         let tree = tree_height(document);
         if self.next < context.row_bytes.end {
             // 逐字节转换与原树定位共同收费；不以4KiB借用宣称隐藏扫描了整格。
-            let count = ((budget - tree - 64) / 4).min(context.row_bytes.end - self.next);
+            let count = ((budget - tree - 64) / 6).min(context.row_bytes.end - self.next);
             let frame = document
                 .table_source_frame(self.next, count)
                 .map_err(MarkdownTableRequestError::Source)?;
@@ -271,7 +393,7 @@ impl MarkdownTableCellEditRequest {
                 work: SemanticWork {
                     source_bytes: used,
                     source_tree_steps: tree,
-                    structural_transitions: used * 3 + 64,
+                    structural_transitions: used * 5 + 64, // 原格词法/UTF16之外，同源 math 的两个逐字节转换也真实收费。
                     ..SemanticWork::default()
                 },
             });
@@ -279,8 +401,8 @@ impl MarkdownTableCellEditRequest {
         if scanner.finish().is_some() && scanner.cell_count() == self.column + 1 {
             self.selected = Some(self.trimmed_utf16.clone());
         }
-        let (range, separators) = match self.selected.take() {
-            Some(range) => (range, 0),
+        let (range, separators, implicit_empty) = match self.selected.take() {
+            Some(range) => (range, 0, false),
             None => {
                 // 原词法确认目标属于连续缺格；只按真实已有尾pipe补足所需分隔符。
                 let separators = missing_cell_separators(
@@ -289,20 +411,25 @@ impl MarkdownTableCellEditRequest {
                     scanner.trailing_pipe(),
                 )
                 .map_err(MarkdownTableRequestError::Window)?;
-                (context.row_utf16.end..context.row_utf16.end, separators)
+                (
+                    context.row_utf16.end..context.row_utf16.end,
+                    separators,
+                    true,
+                )
             }
         };
-        self.ready = Some(
-            document
-                .plan_table_cell_replacement(
-                    &self.source,
-                    self.context.take().unwrap(),
-                    range,
-                    separators,
-                    "",
-                )
-                .map_err(MarkdownTableRequestError::Window)?,
-        );
+        // 编辑和只读布局消费同一原结构端点；此处不建立 replacement，更不签 inline 样式。
+        self.ready = Some(VerifiedMarkdownTableCellSource {
+            source: self.source.clone(),
+            context: self.context.take().unwrap(),
+            range,
+            implicit_empty,
+            separators,
+            alignment: self.alignment.expect("原 separator 完整结束后才签发格票"),
+            // 原 Scanner 已证实的补列事实与端点同票移交，显示消费不能再把它丢成一对裸整数。
+            // seed 仅含纯值与原 Arc/Atomic scope 页，允许原 layout Source 的真实 worker 跨线程释放。
+            inline_seed: scanner.take_semantic_seed().map(std::sync::Arc::new),
+        });
         self.scanner = None;
         Ok(MarkdownTableCellEditStep::Ready {
             work: SemanticWork {
@@ -312,11 +439,29 @@ impl MarkdownTableCellEditRequest {
         })
     }
 
-    /// 只移交一次原plan；拿走后请求不复活，也不能凭相同generation给另一个Doc补签。
+    /// 同一原端点只可交给一个消费者；编辑沿原 replacement 规则，不把 raw 来源解释为预览 Ready。
     pub fn take_plan_for(
         &mut self,
         document: &MarkdownDocumentBuffer,
     ) -> Result<Option<MarkdownTableCellEditPlan>, MarkdownTableRequestError> {
+        self.take_raw_cell_for(document)?
+            .map(|cell| document.plan_verified_table_cell_draft(cell))
+            .transpose()
+    }
+
+    /// 巨格同样只移交原 Scanner 证实的 raw 格；不占草稿槽，不复制源行，也没有 inline 权限。
+    pub fn take_cell_source_for(
+        &mut self,
+        document: &MarkdownDocumentBuffer,
+    ) -> Result<Option<VerifiedMarkdownTableCellSource>, MarkdownTableRequestError> {
+        self.take_raw_cell_for(document)
+    }
+
+    /// 共享原请求的一次消费权；健康门先于首因与代次判断，不能从旧整数坐标签发另一个格。
+    fn take_raw_cell_for(
+        &mut self,
+        document: &MarkdownDocumentBuffer,
+    ) -> Result<Option<VerifiedMarkdownTableCellSource>, MarkdownTableRequestError> {
         document
             .original_backing_health()
             .map_err(MarkdownTableRequestError::Source)?;
@@ -326,11 +471,22 @@ impl MarkdownTableCellEditRequest {
         if !self.source.is_current(document) {
             return Err(MarkdownTableRequestError::SourceSuperseded);
         }
-        let plan = self.ready.take();
-        if plan.is_some() {
+        let cell = self.ready.take();
+        if cell.is_some() {
             self.finished = true;
         }
-        Ok(plan)
+        Ok(cell)
+    }
+}
+
+/// 原 Parser 的默认方向与显式左对齐具有相同布局语义；这里仅映 enum，不解释字节。
+fn table_alignment(alignment: pulldown_cmark::Alignment) -> crate::MarkdownTableAlignment {
+    match alignment {
+        pulldown_cmark::Alignment::None | pulldown_cmark::Alignment::Left => {
+            crate::MarkdownTableAlignment::Left
+        }
+        pulldown_cmark::Alignment::Center => crate::MarkdownTableAlignment::Center,
+        pulldown_cmark::Alignment::Right => crate::MarkdownTableAlignment::Right,
     }
 }
 

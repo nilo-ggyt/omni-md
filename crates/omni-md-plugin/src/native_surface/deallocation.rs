@@ -42,6 +42,9 @@ const MAX_NATIVE_COHORT_IDENTITIES: usize = 2_048;
 struct NativeDeallocationCallback {
     work: RefCell<Option<Box<dyn FnOnce()>>>,
     consumed: Cell<bool>,
+    // 显式原生验收只唤醒一个原场景，不消费父close唯一的生产handler。
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    probe_wake: RefCell<Option<Box<dyn FnOnce()>>>,
 }
 
 /// Atomic counters can be notified by native destruction without touching main-thread Rust state.
@@ -146,6 +149,14 @@ impl NativeDeallocationSignals {
                 return;
             };
             let work = callback.work.borrow_mut().take();
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            let probe_wake = {
+                let wake = callback.probe_wake.borrow_mut().take();
+                // 两个原槽都已取出且没有借用；验收先消费真实完成后，未来父close仍可
+                // 给尚未消费的生产槽安装handler，并从同一remaining==0事实重新排原relay。
+                signals.relay_queued.store(false, Ordering::Release);
+                wake
+            };
             if let Some(work) = work {
                 // End state borrowing before the unique actual-completion handler can reenter AppKit or the Host.
                 callback.consumed.set(true);
@@ -155,6 +166,14 @@ impl NativeDeallocationSignals {
                 // one relay, while no strict graph check has happened in this handler-less observation.
                 signals.relay_queued.store(false, Ordering::Release);
             }
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            if let Some(wake) = probe_wake {
+                // relay入口已核真实释放，且本次观察已从原槽取出。生产handler正常消费
+                // 原cohort会执行Drop并撤销后续观察，却不能抹掉本次已经发生的释放事实。
+                // 只有work正常返回才到这里；panic不经finally交付。观察者仍须核自己原弱
+                // owner与在途终点，不能借此通知复活已关闭的业务或把资源完成当作安装成功。
+                wake();
+            } // 进入relay以前的取消仍在上方拒绝；所有闭包始终在槽借用之外归还。
         });
     }
 }
@@ -196,7 +215,7 @@ pub(super) struct NativeMarkdownDeallocationCohort {
 /// 一份真实外部资源的归还义务；只保cohort原子事实，不保资源本身或主线程业务图。
 #[cfg(any(
     feature = "native-raster-surface-probe",
-    feature = "native-paged-layout-probe"
+    feature = "native-paged-production"
 ))]
 pub(in crate::native_surface) struct NativeMarkdownDeallocationClaim {
     signals: Option<Arc<NativeDeallocationSignals>>,
@@ -204,7 +223,7 @@ pub(in crate::native_surface) struct NativeMarkdownDeallocationClaim {
 
 #[cfg(any(
     feature = "native-raster-surface-probe",
-    feature = "native-paged-layout-probe"
+    feature = "native-paged-production"
 ))]
 impl NativeMarkdownDeallocationClaim {
     /// 调用方已经完成真实资源归还；取走原claim后，重复析构不能再发送完成。
@@ -218,7 +237,7 @@ impl NativeMarkdownDeallocationClaim {
 
 #[cfg(any(
     feature = "native-raster-surface-probe",
-    feature = "native-paged-layout-probe"
+    feature = "native-paged-production"
 ))]
 impl Drop for NativeMarkdownDeallocationClaim {
     fn drop(&mut self) {
@@ -234,7 +253,7 @@ impl NativeMarkdownDeallocationCohort {
     /// 在seal前接纳一个外部资源义务；最后真实归还仍走同一主线程一次relay。
     #[cfg(any(
         feature = "native-raster-surface-probe",
-        feature = "native-paged-layout-probe"
+        feature = "native-paged-production"
     ))]
     pub(in crate::native_surface) fn resource_claim(&mut self) -> NativeMarkdownDeallocationClaim {
         assert!(!self.sealed, "资源登记不能晚于cohort封闭");
@@ -258,6 +277,8 @@ impl NativeMarkdownDeallocationCohort {
         let callback = Rc::new(NativeDeallocationCallback {
             work: RefCell::new(None),
             consumed: Cell::new(false),
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            probe_wake: RefCell::new(None),
         });
         let signals = Arc::new(NativeDeallocationSignals {
             remaining: AtomicUsize::new(1),
@@ -390,6 +411,21 @@ impl NativeMarkdownDeallocationCohort {
         self.signals.queue_if_complete();
     }
 
+    /// 只给既有Source场景安装一次有限唤醒；实际零claim沿同一relay交付，生产完成槽仍归父close。
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    pub(super) fn probe_when_released(&self, wake: impl FnOnce() + 'static) {
+        assert!(
+            !self.signals.cancelled.load(Ordering::Acquire),
+            "已取消的资源观察不能安装验收唤醒"
+        );
+        assert!(
+            self.callback.probe_wake.borrow().is_none(),
+            "原生资源验收唤醒已安装"
+        );
+        *self.callback.probe_wake.borrow_mut() = Some(Box::new(wake));
+        self.signals.queue_if_complete();
+    }
+
     /// Revoke callback authority before removing only this cohort's association from a terminal shell.
     ///
     /// This operation is observation cancellation, never an actual-deallocation signal. Terminal
@@ -400,6 +436,10 @@ impl NativeMarkdownDeallocationCohort {
         self.signals.cancelled.store(true, Ordering::Release);
         let work = self.callback.work.borrow_mut().take();
         self.callback.consumed.set(true);
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        let probe_wake = self.callback.probe_wake.borrow_mut().take();
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        drop(probe_wake);
         drop(work); // 回调捕获的析构允许重新借槽或调用Native；此时全部RefCell借用已经结束。
         if let Some(panel) = panel {
             // SAFETY: the caller transiently owns this live main-thread panel. The stable Arc key
@@ -460,6 +500,10 @@ impl Drop for NativeMarkdownDeallocationCohort {
         self.signals.cancelled.store(true, Ordering::Release);
         let work = self.callback.work.borrow_mut().take();
         self.callback.consumed.set(true);
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        let probe_wake = self.callback.probe_wake.borrow_mut().take();
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        drop(probe_wake);
         drop(work); // 必须在借用外释放，捕获的Drop可能重入同一原生/资源边界。
         let observed = std::mem::take(&mut self.observed);
         for weak in observed {
@@ -633,10 +677,9 @@ struct CancelledCallbackDropProbe {
 impl Drop for CancelledCallbackDropProbe {
     fn drop(&mut self) {
         self.dropped.set(true);
-        let clear = self
-            .callback
-            .upgrade()
-            .is_some_and(|callback| callback.work.try_borrow_mut().is_ok());
+        let clear = self.callback.upgrade().is_some_and(|callback| {
+            callback.work.try_borrow_mut().is_ok() && callback.probe_wake.try_borrow_mut().is_ok()
+        });
         self.borrow_clear.set(clear); // 真正在捕获析构中借槽，不能靠源码顺序或标量假设通过。
     }
 }
@@ -686,6 +729,20 @@ fn verify_dropped_cohort_unloads_own_marker(mtm: MainThreadMarker) -> Result<(),
             drop(probe);
             called.set(true);
         });
+        let wake_called = Rc::new(Cell::new(false));
+        let wake_dropped = Rc::new(Cell::new(false));
+        let wake_borrow_clear = Rc::new(Cell::new(false));
+        let wake_probe = CancelledCallbackDropProbe {
+            callback: Rc::downgrade(&discarded.callback),
+            dropped: Rc::clone(&wake_dropped),
+            borrow_clear: Rc::clone(&wake_borrow_clear),
+        };
+        let called = Rc::clone(&wake_called);
+        discarded.probe_when_released(move || {
+            // 原对象仍活时取消观察，验收槽同样只归还捕获，不能投递一次伪完成。
+            drop(wake_probe);
+            called.set(true);
+        });
         if explicitly_cancelled {
             discarded.cancel_observation(Some(&*object));
             if discarded.has_completed() || signals.remaining.load(Ordering::Acquire) != 0 {
@@ -700,6 +757,9 @@ fn verify_dropped_cohort_unloads_own_marker(mtm: MainThreadMarker) -> Result<(),
             || callback_called.get()
             || !callback_dropped.get()
             || !borrow_clear.get()
+            || wake_called.get()
+            || !wake_dropped.get()
+            || !wake_borrow_clear.get()
         {
             return Err("cohort Drop没有真实卸载自己的marker或取消回调发生借用重入".into());
         }

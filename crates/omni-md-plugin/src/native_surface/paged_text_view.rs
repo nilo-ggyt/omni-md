@@ -10,7 +10,10 @@ use objc2::{
     rc::{Retained, autoreleasepool},
     runtime::{AnyObject, ProtocolObject, Sel},
 };
-use objc2_app_kit::{NSEvent, NSGraphicsContext, NSTextInputClient, NSTextInputContext, NSView};
+use objc2_app_kit::{
+    NSDragOperation, NSDraggingInfo, NSEvent, NSGraphicsContext, NSMenu, NSTextInputClient,
+    NSTextInputContext, NSView,
+};
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSNotFound,
     NSObjectProtocol, NSPoint, NSRange, NSRect,
@@ -24,23 +27,31 @@ use super::paged_input::{
 };
 use crate::payload_use::PayloadUseGuard;
 
+mod cell_word;
 mod close;
 mod commands;
+mod context_menu;
 mod cpu;
 mod find;
+mod folding;
 mod formatting;
 mod input;
+mod paste;
+mod pointer_scroll;
 mod scene;
 pub use super::viewport_pixels::{
     NativeMarkdownViewportPixelObserver, NativeMarkdownViewportPixelSnapshot,
 };
+pub use cell_word::NativeMarkdownPagedCellWordTarget;
 pub use close::{NativeMarkdownPagedCloseFailure, NativeMarkdownPagedCloseReceipt};
 pub use find::NativeMarkdownPagedFindVisibleProof;
+pub use folding::NativeMarkdownPagedSourceFoldAction;
 pub use scene::*;
 
-/// Direct保留真实窗口绘制对照；CpuViewport只改变同scene的像素后端，默认产品不切换。
+/// 正式输入视图只装配有限CPU视口；旧直接绘制仅在显式原生对照中编译。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeMarkdownPagedRenderStrategy {
+    #[cfg(feature = "native-markdown-runtime-probe")]
     Direct,
     CpuViewport,
 }
@@ -67,6 +78,20 @@ pub enum NativeMarkdownPagedTextViewError {
     ClipboardUnavailable,
     #[error("无法复制选中文本：{0}")]
     ClipboardWrite(String),
+    #[error("无法导入附件：{0}")]
+    AttachmentImport(String),
+    #[error("无法执行折叠：{0}")]
+    FoldAction(String),
+    #[error("插入附件链接失败：{cause}；清理临时附件失败：{cleanup}")]
+    AttachmentRollback { cause: Box<Self>, cleanup: String },
+    #[error("系统未能打开该链接")]
+    LinkOpenFailed,
+    #[error("当前编辑器尚未提供稳定的标题锚点导航，无法跳转到该锚点")]
+    LinkAnchorUnsupported,
+    #[error("无法打开笔记链接：{0}")]
+    RelativeNoteLink(String),
+    #[error("原链接来源查询失败")]
+    LinkSource(omni_markdown_core::markdown_document_buffer::MarkdownTableRequestError),
     #[error("该selector不是本正文支持的typed编辑动作")]
     UnsupportedCommand,
     #[error("原输入事务失败：{0}")]
@@ -106,8 +131,24 @@ pub struct PagedTextViewIvars {
     closed: Cell<bool>,
     depth: Cell<usize>,
     last_failure: RefCell<Option<NativeMarkdownPagedTextViewError>>,
+    interpreting_key: Cell<bool>,
+    input_callback_depth: Cell<usize>,
+    interpretation_failure: RefCell<Option<NativeMarkdownPagedTextViewError>>,
     // 同一指针槽保存首击caret或word种子；鼠标抬起/关闭清空它，不持异步输入owner。
     drag_anchor: Cell<Option<commands::DragAnchor>>,
+    // 原Down物理位置与真实Drag事实只随该手势存活；选择激活引起的排版不能伪造鼠标移动。
+    pointer_motion: Cell<Option<commands::PointerMotion>>,
+    // 链接在原mouseup才提交；两槽只保弱Scene身份及单手势寿命，不保NSEvent、Doc或Reader。
+    pressed_link: RefCell<Option<commands::PressedLink>>,
+    link_intent: RefCell<Option<Rc<()>>>,
+    // 原Down到Up只有一张弱手势票；活动格异步准备不保系统事件，也不能在Up后复活拖选。
+    cell_pointer_intent: RefCell<Option<Rc<()>>>,
+    // 已发布后旧child只弱认真正父view及原手势；没有Input/Scene/Doc或retired Body强边。
+    cell_pointer_forward: RefCell<Option<commands::CellPointerForward>>,
+    // 拖选越过视口时只有一份原手势期限；定时器仅持弱view，真实Up/新输入/关闭都会撤销。
+    drag_scroll: RefCell<Option<pointer_scroll::DragScroll>>,
+    // 每个客户最多保留一份原生编辑菜单；关闭先撤其动作，再归还输入及视图资源。
+    context_menu: RefCell<Option<Retained<NSMenu>>>,
     render_strategy: NativeMarkdownPagedRenderStrategy,
     cpu: RefCell<Option<Rc<cpu::CpuSurface>>>,
     close_receipt: RefCell<Option<Rc<NativeMarkdownPagedCloseReceipt>>>,
@@ -120,6 +161,8 @@ struct Origin {
     state: NativeMarkdownPagedInputState,
     geometry_epoch: u64,
     epoch: u64,
+    /// 只由实际NSTextInputClient回调或已排队菜单入口设置；外部选择/鼠标不能借解释depth认领收据。
+    interpreted: bool,
 }
 impl Origin {
     fn session_current(&self, view: &NativeMarkdownPagedTextView, epoch: u64) -> bool {
@@ -219,14 +262,22 @@ define_class!(
         #[unsafe(method(resignFirstResponder))]
         fn resign_first_responder(&self) -> bool {
             let _use = PayloadUseGuard::enter(&self.ivars().depth);
+            self.stop_drag_scroll(); // 已失去键盘/鼠标客户资格，不能让原越界拖选继续滚动。
+            self.cancel_link_intent(); // 焦点已开始移交，未完成的旧链接不再拥有外部打开权限。
             if self.ivars().closed.get() {
                 true // 已封闭的空view不能阻止原窗口断开firstResponder。
             } else {
                 let result = (|| {
-                self.apply_unmark()?;
-                let (delegate, context) = self.foreground_context()?;
+                let input = self.ivars().input.borrow().clone().ok_or(NativeMarkdownPagedTextViewError::Closed)?;
+                if input.state()?.marked.is_some() {
+                    self.apply_unmark()?; // 仍有真实候选时必须同步提交，不能因排版失败跳过或丢弃组合。
+                }
+                let before = input.state()?;
+                let context = self.ivars().context.borrow().clone().ok_or(NativeMarkdownPagedTextViewError::ContextUnavailable)?;
+                // 辞任只需结束本客户的真实context；无marked时不向已failed的排版owner申请编辑权限。
                 context.0.deactivate();
-                if !delegate.current(self.ivars().epoch) { return Err(NativeMarkdownPagedTextViewError::Revoked); }
+                if self.ivars().closed.get() { return Ok(()); } // Native重入已封闭的空客户不能再阻止原窗口detach。
+                if input.state()? != before { return Err(NativeMarkdownPagedTextViewError::Revoked); }
                 Ok(())
                 })();
                 self.boolean_result(result)
@@ -241,16 +292,47 @@ define_class!(
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             let _use = PayloadUseGuard::enter(&self.ivars().depth);
+            #[cfg(feature = "native-input-trace")]
+            let trace_scope = self.begin_input_trace_event(event);
+            self.cancel_cell_pointer_intent();
+            self.cancel_link_intent(); // 连无文本变化的后继按键也撤旧click，不能在稍后突然打开旧链接。
             let result = (|| {
-                let (delegate, _context) = self.foreground_context()?;
+                let origin = self.origin()?;
+                let current_input = |epoch| epoch == origin.epoch && origin.current(self);
+                let permit = origin.input.capture(origin.epoch, &current_input)?;
+                if origin.delegate.defer_key_down(event, &permit)? {
+                    return Ok(()); // 原key尚未交给IME，marked协议没有被异步假完成。
+                }
+                let (delegate, context) = self.foreground_context()?;
                 let current = || !self.ivars().closed.get()
                     && delegate.current(self.ivars().epoch) && !self.ivars().closed.get();
                 if !current() { return Err(NativeMarkdownPagedTextViewError::Revoked); }
-                // 系统key binding与IME只解释一次；不再先handleEvent再重复interpret同一按键。
-                let events = NSArray::from_slice(&[event]);
+                // 自写NSView把原key交给本客户的系统context，IME与key binding由handleEvent统一解释；
+                // 回调允许实际改变文字、marked或选择，事后只核会话存活，不要求旧generation不变。
+                let consumed = context.0.handleEvent(event);
                 if !current() { return Err(NativeMarkdownPagedTextViewError::Revoked); }
-                self.interpretKeyEvents(&events);
-                if !current() { return Err(NativeMarkdownPagedTextViewError::Revoked); }
+                if !consumed {
+                    // 系统明确未消费才沿原responder链传播一次，不再interpret同key造成二次解释。
+                    // SAFETY: 原主线程NSView仍由当前回调保护，公开keyDown:签名只借同步活NSEvent。
+                    unsafe { let _: () = msg_send![super(self), keyDown: event]; }
+                    if !current() { return Err(NativeMarkdownPagedTextViewError::Revoked); }
+                }
+                Ok(())
+            })();
+            self.record(result);
+            #[cfg(feature = "native-input-trace")]
+            self.finish_input_trace_scope(trace_scope);
+        }
+
+        #[unsafe(method(scrollWheel:))]
+        /// 实际滚轮是新视口意图，即使重入原排版栈也先撤旧模式定位；系统滚动仍只传播一次。
+        fn scroll_wheel(&self, event: &NSEvent) {
+            let _use = PayloadUseGuard::enter(&self.ivars().depth);
+            let result = (|| {
+                let delegate = self.foreground()?;
+                delegate.user_scroll(self.ivars().epoch)?;
+                // SAFETY: 原主线程NSView及本同步NSEvent仍存活，保持原父responder的公开scrollWheel:语义。
+                unsafe { let _: () = msg_send![super(self), scrollWheel: event]; }
                 Ok(())
             })();
             self.record(result);
@@ -261,7 +343,29 @@ define_class!(
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) { self.mouse(event, true); }
         #[unsafe(method(mouseUp:))]
-        fn mouse_up(&self, _event: &NSEvent) { self.ivars().drag_anchor.set(None); }
+        fn mouse_up(&self, event: &NSEvent) { self.finish_link_mouse(event); }
+
+        #[unsafe(method_id(menuForEvent:))]
+        /// 仅恢复当前正文的原生右键编辑菜单；不移动原选区、不创建新的快捷键或窗口。
+        fn menu_for_event(&self, _event: &NSEvent) -> Option<Retained<NSMenu>> {
+            match self.edit_context_menu() {
+                Ok(menu) => Some(menu),
+                Err(cause) => { self.failure(cause); None }
+            }
+        }
+
+        #[unsafe(method(draggingEntered:))]
+        /// 原生拖放仅声明实际支持的受限文件复制与纯文本，不接收富文本或图形副本。
+        fn dragging_entered(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            self.accepted_drag_operation(sender)
+        }
+
+        #[unsafe(method(performDragOperation:))]
+        /// 实际放下时固定同一可见Scene命中；文件工作随后沿原输入队列执行。
+        fn perform_drag_operation(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+            let result = self.accept_drop(sender);
+            self.boolean_result(result)
+        }
 
         #[unsafe(method(wantsUpdateLayer))]
         fn wants_update_layer(&self) -> bool {
@@ -280,27 +384,41 @@ define_class!(
                 return;
             }
             let cpu = self.ivars().cpu.borrow().clone();
-            let result = (|| {
-                let surface = cpu.ok_or(NativeMarkdownPagedTextViewError::Closed)?;
-                let scene = self.scene()?;
-                surface.paint(self, &scene)
-            })();
-            self.record(result); // Pending没有新image；实际canvas未成功绝不增加paint或签Ready。
+            let Some(surface) = cpu else {
+                self.failure(NativeMarkdownPagedTextViewError::Closed);
+                return;
+            };
+            let scene = match self.scene() {
+                Ok(scene) => scene,
+                Err(NativeMarkdownPagedTextViewError::Pending) => {
+                    // 原ready_scene已安排唯一schedule；本次没有可画图，不能把正常等帧写成输入失败。
+                    return; // 不发布image、不增加paint，也不把旧图冒充本次Ready。
+                }
+                Err(cause) => { self.failure(cause); return; }
+            };
+            self.record(surface.paint(self, &scene)); // 实际绘图/Source/资源错误照常保留，不能被上面的未Ready分支吞掉。
         }
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
             if self.ivars().render_strategy == NativeMarkdownPagedRenderStrategy::CpuViewport { return; }
 
             let _use = PayloadUseGuard::enter(&self.ivars().depth);
+            let scene = match self.scene() {
+                Ok(scene) => scene,
+                Err(NativeMarkdownPagedTextViewError::Pending) => {
+                    // Direct入口同样只消费已经发布的图；原准备尚未完成时保留原调度与输入首错。
+                    return;
+                }
+                Err(cause) => { self.failure(cause); return; }
+            };
             let result = (|| {
-                let scene = self.scene()?;
                 let context = scene.step(self, NSGraphicsContext::currentContext)?.ok_or(NativeMarkdownPagedTextViewError::ContextUnavailable)?;
                 let cg = scene.step(self, || context.CGContext())?;
                 scene.scene.paint(&cg, &|| scene.current(self))?;
                 if !scene.current(self) { return Err(NativeMarkdownPagedTextViewError::Revoked); }
                 Ok(())
             })();
-            self.record(result); // Pending不画旧image，不触发layout/重试，也不把零坐标签成Ready。
+            self.record(result); // 真正开始绘图后的任何失败均保原cause，不用等帧分支掩盖Source或资源后果。
         }
 
         #[unsafe(method(setFrameSize:))]
@@ -353,7 +471,7 @@ define_class!(
             unsafe { let _: () = msg_send![super(self), viewDidMoveToSuperview]; }
         }
 
-        // 菜单和responder目标沿相同typed命令入口，系统物理按键仍由interpretKeyEvents解释。
+        // 菜单和responder目标沿相同typed命令入口，系统按键由原NSTextInputContext统一解释。
         #[unsafe(method(copy:))]
         fn copy(&self, _sender: Option<&AnyObject>) { self.record(self.command(objc2::sel!(copy:))); }
         #[unsafe(method(cut:))]
@@ -373,17 +491,32 @@ define_class!(
         #[unsafe(method(insertText:replacementRange:))]
         unsafe fn insert_text(&self, text: &AnyObject, replacement: NSRange) {
             let _use = PayloadUseGuard::enter(&self.ivars().depth);
-            self.record(self.apply_native_input(text, replacement, None));
+            let _callback = PayloadUseGuard::enter(&self.ivars().input_callback_depth);
+            #[cfg(feature = "native-input-trace")]
+            let trace_scope = self.begin_input_trace_selector(crate::NativeInputTraceSelector::InsertText);
+            self.record_input(self.apply_native_input(text, replacement, None));
+            #[cfg(feature = "native-input-trace")]
+            self.finish_input_trace_scope(trace_scope);
         }
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
         unsafe fn set_marked_text(&self, text: &AnyObject, selected: NSRange, replacement: NSRange) {
             let _use = PayloadUseGuard::enter(&self.ivars().depth);
-            self.record(self.apply_native_input(text, replacement, Some(selected)));
+            let _callback = PayloadUseGuard::enter(&self.ivars().input_callback_depth);
+            #[cfg(feature = "native-input-trace")]
+            let trace_scope = self.begin_input_trace_selector(crate::NativeInputTraceSelector::SetMarkedText);
+            self.record_input(self.apply_native_input(text, replacement, Some(selected)));
+            #[cfg(feature = "native-input-trace")]
+            self.finish_input_trace_scope(trace_scope);
         }
         #[unsafe(method(unmarkText))]
         fn unmark_text(&self) {
             let _use = PayloadUseGuard::enter(&self.ivars().depth);
-            self.record(self.apply_unmark());
+            let _callback = PayloadUseGuard::enter(&self.ivars().input_callback_depth);
+            #[cfg(feature = "native-input-trace")]
+            let trace_scope = self.begin_input_trace_selector(crate::NativeInputTraceSelector::UnmarkText);
+            self.record_input(self.apply_unmark());
+            #[cfg(feature = "native-input-trace")]
+            self.finish_input_trace_scope(trace_scope);
         }
         #[unsafe(method(selectedRange))]
         fn selected_range(&self) -> NSRange {
@@ -421,25 +554,37 @@ define_class!(
                     unsafe { write_actual(actual, value.actual_range); }
                     value.rect
                 }
+                Err(NativeMarkdownPagedTextViewError::Pending) => {
+                    // 原提交到新帧之间系统可同步询问候选坐标；负坐标协议不代表已接纳输入失败。
+                    NSRect::ZERO // actualRange保持上方NotFound，不借旧scene伪造候选框位置。
+                }
                 Err(error) => { self.failure(error); NSRect::ZERO }
             }
         }
         #[unsafe(method(characterIndexForPoint:))]
         fn character_index(&self, point: NSPoint) -> usize {
             let _use = PayloadUseGuard::enter(&self.ivars().depth);
-            match self.screen_hit(point) { Ok(value) => value, Err(error) => { self.failure(error); NSNotFound as usize } }
+            match self.screen_hit(point) {
+                Ok(value) => value,
+                Err(NativeMarkdownPagedTextViewError::Pending) => {
+                    // 尚未发布真实命中几何时只交原NotFound，不能污染独立的输入失败槽或签发旧位置。
+                    NSNotFound as usize
+                }
+                Err(error) => { self.failure(error); NSNotFound as usize }
+            }
         }
         #[unsafe(method(doCommandBySelector:))]
         unsafe fn do_command(&self, selector: Sel) {
             let _use = PayloadUseGuard::enter(&self.ivars().depth);
+            let _callback = PayloadUseGuard::enter(&self.ivars().input_callback_depth);
             let result = if commands::recognizes_selector(selector) {
-                self.command(selector) // 原命令即使返回UnsupportedCommand也须记录；Scene歧义/功能缺失不能静默交给别的responder。
+                self.command_from_input_context(selector) // 原命令即使返回UnsupportedCommand也须记录；Scene歧义/功能缺失不能静默交给别的responder。
             } else {
                 // SAFETY: 只有系统原NSTextInputClient action入口可保证未知selector仍为sender签名。
                 // 安全Rust command不会把任意Sel当对象参数函数调用；转发仍使用原链和同一action一次。
                 unsafe { self.forward_native_action(selector) }
             };
-            self.record(result);
+            self.record_input(result);
         }
     }
 );
@@ -523,7 +668,7 @@ impl NativeMarkdownPagedTextView {
             delegate,
             epoch,
             frame,
-            NativeMarkdownPagedRenderStrategy::Direct,
+            NativeMarkdownPagedRenderStrategy::CpuViewport,
             mtm,
         )
     }
@@ -557,7 +702,17 @@ impl NativeMarkdownPagedTextView {
             closed: Cell::new(false),
             depth: Cell::new(0),
             last_failure: RefCell::new(None),
+            interpreting_key: Cell::new(false),
+            input_callback_depth: Cell::new(0),
+            interpretation_failure: RefCell::new(None),
             drag_anchor: Cell::new(None),
+            pointer_motion: Cell::new(None),
+            pressed_link: RefCell::new(None),
+            link_intent: RefCell::new(None),
+            cell_pointer_intent: RefCell::new(None),
+            cell_pointer_forward: RefCell::new(None),
+            drag_scroll: RefCell::new(None),
+            context_menu: RefCell::new(None),
             render_strategy,
             cpu: RefCell::new(None),
             close_receipt: RefCell::new(None),
@@ -579,9 +734,23 @@ impl NativeMarkdownPagedTextView {
         view.ivars()
             .context
             .replace(Some(Rc::new(InputContextOwner(context))));
+        // 自写NSView没有NSTextView的拖放注册；仅声明同一有限纯文本/文件入口真实处理的类型。
+        // SAFETY: AppKit公开不可变类型常量具有进程寿命，不涉及读取任何剪贴板或正文内容。
+        let drag_types = unsafe {
+            [
+                objc2_app_kit::NSPasteboardTypeFileURL,
+                objc2_app_kit::NSPasteboardTypeString,
+            ]
+        };
+        view.registerForDraggedTypes(&NSArray::from_slice(&drag_types));
         if render_strategy == NativeMarkdownPagedRenderStrategy::CpuViewport {
-            let cpu = cpu::CpuSurface::install(&view)?;
-            view.ivars().cpu.replace(Some(cpu)); // 只在Native构造全部返回后发布唯一owner槽。
+            // AppKit启用backing时产生的临时view/layer claim必须在本次装配结束归还；
+            // 唯一Cpu owner只带显式Retained层，不让外方长寿命池推迟已关闭view的析构。
+            autoreleasepool(|_| -> Result<()> {
+                let cpu = cpu::CpuSurface::install(&view)?;
+                view.ivars().cpu.replace(Some(cpu)); // 先完整发布唯一owner，池末Native析构回调才能看到同一装配。
+                Ok(())
+            })?;
         }
         Ok(view)
     }
@@ -664,6 +833,7 @@ impl NativeMarkdownPagedTextView {
             delegate,
             geometry_epoch: self.ivars().geometry_epoch.get(),
             epoch: self.ivars().epoch,
+            interpreted: false,
         };
         if !origin.current(self) {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
@@ -676,8 +846,11 @@ impl NativeMarkdownPagedTextView {
         let viewport =
             bounded_viewport(visible, bounds).ok_or(NativeMarkdownPagedTextViewError::Pending)?;
         let frame_in_parent = origin.step(self, || self.frame())?;
-        let virtual_viewport =
-            origin.step(self, || origin.delegate.virtual_viewport(origin.epoch))??;
+        let virtual_viewport = origin.step(self, || {
+            origin
+                .delegate
+                .virtual_viewport(origin.epoch, bounds.size.width)
+        })??;
         if !finite_rect(viewport, true)
             || !bounds.size.width.is_finite()
             || bounds.size.width <= 0.0
@@ -686,6 +859,9 @@ impl NativeMarkdownPagedTextView {
         }
         if !virtual_viewport.document_origin.x.is_finite()
             || !virtual_viewport.document_origin.y.is_finite()
+            || !virtual_viewport.layout_origin_x.is_finite()
+            || !virtual_viewport.layout_width.is_finite()
+            || virtual_viewport.layout_width <= 0.0
         {
             return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
         }
@@ -731,6 +907,7 @@ impl NativeMarkdownPagedTextView {
         if self.ivars().closed.get() {
             return Err(NativeMarkdownPagedTextViewError::Closed);
         }
+        self.cancel_link_intent(); // 宽度、滚动或frame换代使原鼠标命中失效，不能给旧click补签新坐标。
         let result = advance_geometry(&self.ivars().geometry_epoch, &self.ivars().geometry_failed);
         let cpu = self.ivars().cpu.borrow().clone();
         if let Some(cpu) = cpu {
@@ -749,6 +926,18 @@ impl NativeMarkdownPagedTextView {
         }
         Ok(())
     }
+
+    /// 模式动作结束原指针寿命并撤旧几何；不关闭输入上下文或重建文稿选择。
+    pub(in crate::native_surface) fn prepare_presentation_change(&self) -> Result<()> {
+        if self.is_busy() {
+            return Err(NativeMarkdownPagedTextViewError::Busy);
+        }
+        if self.cancel_cell_pointer_intent() {
+            return Err(NativeMarkdownPagedTextViewError::Pending);
+        }
+        self.cancel_link_intent();
+        self.invalidate_geometry()
+    }
     fn invalidate_geometry_only(&self) {
         if !self.ivars().closed.get()
             && let Err(error) = self.invalidate_geometry()
@@ -756,7 +945,8 @@ impl NativeMarkdownPagedTextView {
             self.failure(error);
         }
     }
-    /// 原scene真正Ready后由既有调度者调用；只使实际有限可见区标脏，不强制display/layout。
+    /// 原scene真正Ready后由既有调度者调用；标脏有限可见区并通知原输入客户重查坐标。
+    /// 通知只消费本次已发布几何，不强制display/layout，也不把先前Pending的坐标签成Ready。
     pub fn scene_ready(&self) -> Result<()> {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         let scene = self.scene()?;
@@ -767,6 +957,33 @@ impl NativeMarkdownPagedTextView {
         scene.step(self, || {
             self.setNeedsDisplayInRect(scene.key.request.viewport)
         })?;
+        // 滚动、缩放和异步排版可在handleEvent之外发布真实后继帧。此前firstRect若返回Pending，
+        // 系统仍需在此重新查询；仅标脏像素不会使输入法缓存的候选坐标失效。
+        let context = self
+            .ivars()
+            .context
+            .borrow()
+            .clone()
+            .ok_or(NativeMarkdownPagedTextViewError::ContextUnavailable)?;
+        let context_current = || {
+            self.ivars()
+                .context
+                .borrow()
+                .as_ref()
+                .is_some_and(|current| Rc::ptr_eq(current, &context))
+        };
+        scene.step(self, || -> Result<()> {
+            if !context_current() {
+                return Err(NativeMarkdownPagedTextViewError::Revoked);
+            }
+            // Rust槽借用已结束；公开通知可能同步回调firstRect/selectedRange，只允许原客户
+            // 和原Scene的Input、geometry及发布身份在Native调用前后均仍有效，不激活或切换输入源。
+            context.0.invalidateCharacterCoordinates();
+            if !context_current() {
+                return Err(NativeMarkdownPagedTextViewError::Revoked);
+            }
+            Ok(())
+        })??;
         Ok(())
     }
     #[must_use]
@@ -797,7 +1014,11 @@ impl NativeMarkdownPagedTextView {
         let receipt = NativeMarkdownPagedCloseReceipt::new(self.mtm());
         *self.ivars().close_receipt.borrow_mut() = Some(Rc::clone(&receipt));
         self.ivars().closed.set(true);
+        self.close_context_menu(); // 跟踪中的原菜单先结束且失去target/action，不能在关闭后路由到另一篇笔记。
+        self.unregisterDraggedTypes(); // 封闭后不再接收新路径或文本，原队列的已有载荷由Body同步归还。
         self.ivars().drag_anchor.set(None);
+        self.cancel_cell_pointer_intent();
+        self.cancel_link_intent();
         let context = self.ivars().context.borrow_mut().take();
         let cpu = self.ivars().cpu.borrow_mut().take();
         let delegate = self.ivars().delegate.borrow_mut().take();
@@ -854,6 +1075,15 @@ impl NativeMarkdownPagedTextView {
             .as_ref()
             .map(|surface| surface.paints())
     }
+    /// 同一已发布key证明正式窗口所验的是当前画面；纯Rust弱票不延长实际绘图资源。
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    pub(in crate::native_surface) fn probe_cpu_published_frame(
+        &self,
+    ) -> Option<(NativeMarkdownPagedSceneKey, usize)> {
+        let cpu = self.ivars().cpu.borrow().clone();
+        cpu.and_then(|surface| surface.published_frame())
+    }
+
     /// 只计同原Scene且全部实际健康门通过的复用次数，不保留请求历史或业务载荷。
     #[must_use]
     pub fn cpu_reuses(&self) -> Option<usize> {
@@ -895,13 +1125,27 @@ impl NativeMarkdownPagedTextView {
     pub fn take_failure(&self) -> Option<NativeMarkdownPagedTextViewError> {
         self.ivars().last_failure.borrow_mut().take()
     }
-    /// 异步能力结论只交付原动作失败；不撤销健康Body或后续已接纳输入。
-    pub(in crate::native_surface) fn reject_word_move(&self) {
-        self.failure(NativeMarkdownPagedTextViewError::UnsupportedCommand);
+    /// 外部文件业务失败沿原View反馈；它不撤销健康正文、已提交链接或后继队列权限。
+    pub(in crate::native_surface) fn reject_attachment_import(
+        &self,
+        cause: NativeMarkdownPagedTextViewError,
+    ) {
+        super::workspace_actions::present_native_markdown_paged_attachment_error(
+            self,
+            &cause.to_string(),
+        );
+        self.failure(cause);
     }
     pub fn input_state(&self) -> Result<NativeMarkdownPagedInputState> {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         Ok(self.origin()?.state)
+    }
+    /// 工具栏只查询此刻真实输入客户的局部历史；正文返回None，不创建系统Undo manager。
+    pub(in crate::native_surface) fn cell_history_facts(
+        &self,
+    ) -> Result<Option<omni_markdown_core::MarkdownCellDraftHistoryFacts>> {
+        let _use = PayloadUseGuard::enter(&self.ivars().depth);
+        Ok(self.origin()?.input.cell_history_facts()?)
     }
     /// 原session纯前台准入供viewport同步原语复用；不捕获较新输入或scene替旧请求续权。
     #[must_use]
@@ -914,12 +1158,66 @@ impl NativeMarkdownPagedTextView {
         if slot.is_none()
             || (matches!(*slot, Some(NativeMarkdownPagedTextViewError::Pending))
                 && !matches!(error, NativeMarkdownPagedTextViewError::Pending))
+            || (matches!(
+                *slot,
+                Some(
+                    NativeMarkdownPagedTextViewError::AttachmentImport(_)
+                        | NativeMarkdownPagedTextViewError::FoldAction(_)
+                )
+            ) && !matches!(
+                error,
+                NativeMarkdownPagedTextViewError::Pending
+                    | NativeMarkdownPagedTextViewError::AttachmentImport(_)
+                    | NativeMarkdownPagedTextViewError::FoldAction(_)
+            ))
         {
             *slot = Some(error);
-        } // Pending只是可用性状态；不能挡住后来的真实源/输入错误，真实首错也不被嵌套Pending覆盖。
+        } // Pending/外部文件拒绝不能挡住真实源、资源或已提交后果首错；真实首错不被后续普通拒绝覆盖。
+    }
+    /// 入队前的外部文件拒绝与队首复制失败共用原反馈边；状态栏改变不能撤权已接纳的Word输入。
+    fn report_attachment_rejection(&self, cause: &NativeMarkdownPagedTextViewError) {
+        let NativeMarkdownPagedTextViewError::AttachmentImport(message) = cause else {
+            return;
+        };
+        let Ok(delegate) = self.foreground() else {
+            return;
+        };
+        if !delegate.defer_attachment_rejection(message) {
+            super::workspace_actions::present_native_markdown_paged_attachment_error(
+                self,
+                &cause.to_string(),
+            );
+        } // 没有原链时才显示当前原窗口；关闭或换笔记后不复活旧反馈。
+    }
+    /// 只有顶层真实mutation/command的void回调决定原解释结果；候选坐标Pending保协议负值。
+    fn record_input(&self, result: Result<()>) {
+        if let Err(cause) = result {
+            #[cfg(feature = "native-input-trace")]
+            if !matches!(cause, NativeMarkdownPagedTextViewError::CommittedEffect(_)) {
+                // 真实Core成功已在原Input发布点记录；后续绘图/撤权失败不能再报canonical拒绝。
+                self.reject_input_trace(&cause);
+            }
+            if matches!(
+                &cause,
+                NativeMarkdownPagedTextViewError::AttachmentImport(_)
+            ) {
+                self.report_attachment_rejection(&cause);
+                self.failure(cause);
+                return; // 实际文件业务拒绝已交付，不伪装成NSTextInputContext/Core资源失败而撤销整条输入链。
+            }
+            if self.ivars().interpreting_key.get() && self.ivars().input_callback_depth.get() == 1 {
+                let mut slot = self.ivars().interpretation_failure.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(cause);
+                }
+            } else {
+                self.failure(cause); // 外部/重入回调不认领原event，也不吞掉其真实失败。
+            }
+        }
     }
     fn record(&self, result: Result<()>) {
         if let Err(error) = result {
+            self.report_attachment_rejection(&error);
             self.failure(error);
         }
     }
@@ -927,6 +1225,7 @@ impl NativeMarkdownPagedTextView {
         match result {
             Ok(()) => true,
             Err(error) => {
+                self.report_attachment_rejection(&error);
                 self.failure(error);
                 false
             }

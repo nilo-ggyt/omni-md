@@ -12,12 +12,10 @@ use crate::markdown_viewport_presentation::{
 #[derive(Debug)]
 /// 计划只保一次有限replacement和root Weak。原生层须在自己的意图token仍有效时提交。
 pub struct MarkdownTableCellEditPlan {
-    source: MarkdownTableSourceIdentity,
-    range: Range<usize>,
+    pub(super) cell: VerifiedMarkdownTableCellSource,
     replacement: String,
     /// 实际缺格分隔符和显式替换正文分开计量；后者不能冒充草稿激活前缀。
     pub(super) separator_prefix_bytes: usize,
-    pub(super) context: TableCellEditContext,
 }
 
 #[derive(Clone, Debug)]
@@ -46,16 +44,27 @@ pub(super) fn missing_cell_separators(
 }
 
 impl MarkdownTableCellEditPlan {
+    /// 草稿会话在消费计划前捕获原列方向；不从 raw 文字或当前光标重新查另一张表。
+    ///
+    /// # Errors
+    /// 原来源失败或计划所属根失效时拒绝，不消费计划或创建草稿。
+    pub fn alignment_for(
+        &self,
+        document: &MarkdownDocumentBuffer,
+    ) -> Result<crate::MarkdownTableAlignment, MarkdownTableRequestError> {
+        self.cell.alignment_for(document)
+    }
+
     /// 返回前重核真实root及代次；NSString构造等可重入操作之后仍须在提交边界再次检查。
     pub fn replacement_for(
         &self,
         document: &MarkdownDocumentBuffer,
     ) -> Result<(&Range<usize>, &str), MarkdownTableWindowError> {
-        if !self.source.is_current(document) {
+        if !self.cell.source.is_current(document) {
             // 编辑、Undo、换note都不能复用旧整数坐标，即使新长度恰好相同。
             return Err(MarkdownTableWindowError::InvalidSource);
         }
-        Ok((&self.range, &self.replacement))
+        Ok((&self.cell.range, &self.replacement))
     }
 }
 
@@ -74,6 +83,17 @@ impl MarkdownDocumentBuffer {
             // 先拒绝其他root，不能读取外来投影的行尾或由它推导补格前缀。
             return Err(MarkdownTableWindowError::InvalidSource);
         }
+        let cell = self.projected_table_cell_source(window, row_ordinal, column_index)?;
+        self.plan_table_cell_source_replacement(cell, escaped_cell_source)
+    }
+
+    /// 认证窗口和原编辑计划共用同一份端点规则；返回纯结构来源，不构造 replacement 或 inline Ready。
+    pub(super) fn projected_table_cell_source(
+        &self,
+        window: &MarkdownProjectedTableWindow,
+        row_ordinal: usize,
+        column_index: usize,
+    ) -> Result<VerifiedMarkdownTableCellSource, MarkdownTableWindowError> {
         let row = window
             .row(row_ordinal)
             .ok_or(MarkdownTableWindowError::InvalidSource)?;
@@ -86,7 +106,7 @@ impl MarkdownDocumentBuffer {
             // row的byte/UTF16坐标必须同时落在当前piece源，不能拿投影坐标替换原文。
             return Err(MarkdownTableWindowError::InvalidSource);
         }
-        let (range, separators) = match &cell.source {
+        let range = match &cell.source {
             MarkdownTableWindowCellSource::Present(range) => {
                 if range.start < row.utf16_range.start
                     || range.start > range.end
@@ -94,81 +114,97 @@ impl MarkdownDocumentBuffer {
                     || self.byte_offset_for_utf16(range.start).is_err()
                     || self.byte_offset_for_utf16(range.end).is_err()
                 {
-                    // 显式空格trim后也可以是零长Present；只替换其真实位置，不补新列。
+                    // 显式空格 trim 后也可以是零长 Present；只证明真实范围，不补新列。
                     return Err(MarkdownTableWindowError::InvalidSource);
                 }
-                (range.clone(), 0)
+                range.clone()
             }
             MarkdownTableWindowCellSource::ImplicitEmpty {
                 insertion_anchor_utf16,
             } => {
                 if *insertion_anchor_utf16 != row.utf16_range.end {
-                    // 补格只可发生在真实行内容尾，不能越过EOL或写入省略gap。
+                    // 缺格只有原行内容末端锚点，不产生可读取字符，也不能跨 EOL 借邻行正文。
                     return Err(MarkdownTableWindowError::InvalidSource);
                 }
-                let cells = window
-                    .cells
-                    .get(row.cell_index_range.clone())
-                    .ok_or(MarkdownTableWindowError::InvalidSource)?;
-                let first_missing = cells
-                    .iter()
-                    .position(|cell| {
-                        matches!(
-                            cell.source,
-                            MarkdownTableWindowCellSource::ImplicitEmpty { .. }
-                        )
-                    })
-                    .ok_or(MarkdownTableWindowError::ParserMismatch)?;
-                if cells[first_missing..].iter().any(|cell| {
-                    !matches!(cell.source, MarkdownTableWindowCellSource::ImplicitEmpty { insertion_anchor_utf16: anchor } if anchor == *insertion_anchor_utf16)
-                }) {
-                    // 原Parser只在行尾补连续缺格；中途缺格后再有Present说明本批metadata不一致。
-                    return Err(MarkdownTableWindowError::ParserMismatch);
-                }
-                let tail_start = if let Some(index) = first_missing.checked_sub(1) {
-                    match &cells[index].source {
-                        // 最后一个真实cell末尾之后才可能有结构尾pipe或行内padding。
-                        MarkdownTableWindowCellSource::Present(range) => range.end,
-                        MarkdownTableWindowCellSource::ImplicitEmpty { .. } => {
-                            // first_missing之前不可能又有缺格；若不变量破坏则拒绝，不猜另一插入位置。
-                            return Err(MarkdownTableWindowError::ParserMismatch);
-                        }
-                    }
-                } else {
-                    // 没有真实前驱的极小row，从其已验证内容起点读尾部，仍受独立64KiB限制。
-                    row.utf16_range.start
-                };
-                if tail_start < row.utf16_range.start || tail_start > *insertion_anchor_utf16 {
-                    // 前一真实cell也必须属于本行；不能为补格读取邻段或越过插入锚点。
-                    return Err(MarkdownTableWindowError::InvalidSource);
-                }
-                let tail_byte = self
-                    .byte_offset_for_utf16(tail_start)
-                    .map_err(|_| MarkdownTableWindowError::InvalidSource)?;
-                let tail = self
-                    .copy_table_source_range(tail_byte..row.byte_range.end, 64 * 1024)
-                    .map_err(|_| MarkdownTableWindowError::SourceLimit)?;
-                let trimmed = tail.trim_end_matches([' ', '\t']);
-                let trailing_pipe = trimmed.ends_with('|') && {
-                    // 真实字符之外还必须有Parser给出的TABLE_BOUNDARY证据；escaped pipe不能算闭列。
-                    let at = tail_start + trimmed.encode_utf16().count() - 1;
-                    let index = window.runs.partition_point(|run| run.utf16_range.end <= at);
-                    window.runs.get(index).is_some_and(|run| {
-                        run.utf16_range.contains(&at)
-                            && run
-                                .styles
-                                .contains(MarkdownPresentationStyles::TABLE_BOUNDARY)
-                    })
-                };
-                // 已有真实尾pipe可分开第一个新cell；没有尾pipe时先补一条，再为中间空格补条数。
-                let separators =
-                    missing_cell_separators(column_index, first_missing, trailing_pipe)?;
-                (*insertion_anchor_utf16..*insertion_anchor_utf16, separators)
+                *insertion_anchor_utf16..*insertion_anchor_utf16
             }
         };
-        self.plan_table_cell_replacement(
+        let source = self
+            .table_source_identity()
+            .ok_or(MarkdownTableWindowError::InvalidSource)?;
+        let implicit_empty = matches!(
+            cell.source,
+            MarkdownTableWindowCellSource::ImplicitEmpty { .. }
+        );
+        // 有限窗口与流式 Scanner 在签发格票时各自证实同一种补列事实，消费计划时不再解释范围。
+        // 此路径只读取原有限投影的尾部 padding；正式巨格直接携带原 Scanner 的结果，不重读整格。
+        let separators = if implicit_empty {
+            let insertion_anchor_utf16 = range.start;
+            let cells = window
+                .cells
+                .get(row.cell_index_range.clone())
+                .ok_or(MarkdownTableWindowError::InvalidSource)?;
+            let first_missing = cells
+                .iter()
+                .position(|cell| {
+                    matches!(
+                        cell.source,
+                        MarkdownTableWindowCellSource::ImplicitEmpty { .. }
+                    )
+                })
+                .ok_or(MarkdownTableWindowError::ParserMismatch)?;
+            if cells[first_missing..]
+                .iter()
+                .any(|cell| match &cell.source {
+                    MarkdownTableWindowCellSource::ImplicitEmpty {
+                        insertion_anchor_utf16: anchor,
+                    } => *anchor != insertion_anchor_utf16,
+                    MarkdownTableWindowCellSource::Present(_) => true,
+                })
+            {
+                // 原 Parser 只在同一行尾补连续缺格；中间再有真实格不能按空列插入。
+                return Err(MarkdownTableWindowError::ParserMismatch);
+            }
+            let tail_start = if let Some(index) = first_missing.checked_sub(1) {
+                match &cells[index].source {
+                    // 最后一个真实格末尾之后才可能有结构尾 pipe 或行内 padding。
+                    MarkdownTableWindowCellSource::Present(range) => range.end,
+                    MarkdownTableWindowCellSource::ImplicitEmpty { .. } => {
+                        return Err(MarkdownTableWindowError::ParserMismatch);
+                    }
+                }
+            } else {
+                // 没有真实前驱的极小行仍受原有限窗口的独立 64KiB 读取上限约束。
+                row.utf16_range.start
+            };
+            if tail_start < row.utf16_range.start || tail_start > insertion_anchor_utf16 {
+                return Err(MarkdownTableWindowError::InvalidSource);
+            }
+            let tail_byte = self
+                .byte_offset_for_utf16(tail_start)
+                .map_err(|_| MarkdownTableWindowError::InvalidSource)?;
+            let tail = self
+                .copy_table_source_range(tail_byte..row.byte_range.end, 64 * 1024)
+                .map_err(|_| MarkdownTableWindowError::SourceLimit)?;
+            let trimmed = tail.trim_end_matches([' ', '\t']);
+            let trailing_pipe = trimmed.ends_with('|') && {
+                // 字符之外必须有原 Parser 的 TABLE_BOUNDARY 证据；escaped pipe 不能算闭列。
+                let at = tail_start + trimmed.encode_utf16().count() - 1;
+                let index = window.runs.partition_point(|run| run.utf16_range.end <= at);
+                window.runs.get(index).is_some_and(|run| {
+                    run.utf16_range.contains(&at)
+                        && run
+                            .styles
+                            .contains(MarkdownPresentationStyles::TABLE_BOUNDARY)
+                })
+            };
+            missing_cell_separators(column_index, first_missing, trailing_pipe)?
+        } else {
+            0 // 显式空格的零长原范围是现成格，不能因显示为空额外插入分隔符。
+        };
+        Ok(VerifiedMarkdownTableCellSource {
             source,
-            TableCellEditContext {
+            context: TableCellEditContext {
                 header: window.header_byte_range.clone(),
                 delimiter: window.delimiter_byte_range.clone(),
                 row_bytes: row.byte_range.clone(),
@@ -176,24 +212,26 @@ impl MarkdownDocumentBuffer {
                 row_ordinal,
                 column: column_index,
                 columns: window.column_count,
-                end: None, // 完整Window的真实End由其封闭owner在上一入口附加。
+                end: None, // 原 verified owner 在边界附加 End；metadata 本身不能推断表尾。
             },
             range,
+            implicit_empty,
             separators,
-            escaped_cell_source,
-        )
+            alignment: cell.alignment,
+            inline_seed: None, // 普通格已由 verified window 的完整语义授权；此编辑端点工厂不另签 inline。
+        })
     }
 
     /// 短窗口与流式原格扫描共用唯一计划构造；上游各自交出真实GFM端点，不另定义补格协议。
-    pub(super) fn plan_table_cell_replacement(
+    pub(super) fn plan_table_cell_source_replacement(
         &self,
-        source: &MarkdownTableSourceIdentity,
-        context: TableCellEditContext,
-        range: Range<usize>,
-        separators: usize,
+        cell: VerifiedMarkdownTableCellSource,
         escaped_cell_source: &str,
     ) -> Result<MarkdownTableCellEditPlan, MarkdownTableWindowError> {
-        if !source.is_current(self)
+        let separators = cell.separators;
+        let range = &cell.range;
+        let context = &cell.context;
+        if !cell.source.is_current(self)
             || range.start < context.row_utf16.start
             || range.start > range.end
             || range.end > context.row_utf16.end
@@ -228,13 +266,9 @@ impl MarkdownDocumentBuffer {
         }
         replacement.push_str(escaped_cell_source);
         Ok(MarkdownTableCellEditPlan {
-            source: self
-                .table_source_identity()
-                .ok_or(MarkdownTableWindowError::InvalidSource)?,
-            range,
+            cell,
             replacement,
             separator_prefix_bytes: separators * 3,
-            context,
         })
     }
 }

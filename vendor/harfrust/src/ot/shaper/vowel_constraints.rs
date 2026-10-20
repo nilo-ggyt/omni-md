@@ -3,9 +3,9 @@
 
 #![allow(clippy::single_match)]
 
+use crate::buffer::Buffer;
 use crate::BufferFlags;
 use crate::Script;
-use crate::buffer::Buffer;
 
 fn output_dotted_circle(buffer: &mut Buffer) {
     buffer.output_glyph(0x25CC);

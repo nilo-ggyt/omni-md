@@ -306,6 +306,269 @@ fn partial_snapshot_cannot_claim_source_and_bound_partial_source_cannot_extend_c
     ));
 }
 
+/// 部分分析从真实B正文中部开始时，snapshot游标可见的前缀不属于原分析权限。
+/// 同一流式证书仍必须排除末尾换行，并在取消后撤销已经就绪的正文跨度。
+#[test]
+fn scanned_partial_terminal_b_keeps_its_original_analysis_start_and_body_end() {
+    for ending in ['\n', '\r', '\u{2029}'] {
+        let text = format!("前缀中文😀{ending}后段");
+        let (directory, document) = fixture(&text);
+        let source = MarkdownLayoutTextSource::capture(&document);
+        let authority = source.authority();
+        let start = "前缀".encode_utf16().count();
+        let content_end = "前缀中文😀".encode_utf16().count();
+        let end = content_end + ending.len_utf16();
+        let mapping = source.original_backing_observer().unwrap();
+        let payload = source.resource_observer();
+        let cancel = MarkdownBidiCancellation::new();
+        let mut actual = MarkdownBidiParagraph::analyze_layout_source_cancellable(
+            source.clone(),
+            &authority,
+            start..end,
+            BidiBaseDirection::Auto,
+            BidiMemoryBudget::new(65536).unwrap(),
+            &cancel,
+        )
+        .unwrap();
+        let receipt = actual.resource_observer();
+        assert!(
+            actual
+                .uniform_control_free_span(&authority, start..content_end)
+                .unwrap()
+                .is_none()
+        );
+        let mut ready = false;
+        for _ in 0..100_000 {
+            let step = actual
+                .prepare_uniform_paragraph_range(&authority, start, ONE)
+                .unwrap();
+            assert!(step.bytes <= 1 && step.scalars <= 1 && step.metadata <= 1);
+            assert!(step.maximum_borrow <= 1);
+            if step.ready {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready);
+        let span = actual
+            .uniform_control_free_span(&authority, start..content_end)
+            .unwrap()
+            .unwrap();
+        assert_eq!(span.source_range(), start..content_end);
+        assert_eq!(span.paragraph_range(), start..end);
+        assert_eq!(span.content_end(), content_end);
+        assert_eq!(
+            actual.paragraph_range_at_utf16(start).unwrap(),
+            Some(start..end)
+        );
+        assert!(
+            actual
+                .uniform_control_free_span(&authority, start..end)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            actual.uniform_control_free_span(&authority, 0..start),
+            Err(BidiError::InvalidRange)
+        ));
+        cancel.cancel();
+        assert!(matches!(
+            actual.uniform_control_free_span(&authority, start..content_end),
+            Err(BidiError::Cancelled)
+        ));
+        assert_eq!(
+            std::fs::read(directory.path().join("uniform-control.md")).unwrap(),
+            text.as_bytes()
+        );
+        drop((actual, source, document));
+        assert!(payload.payload_released() && receipt.is_released());
+        assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0 && !mapping.failed());
+    }
+}
+
+/// table-flow实际按B段准备；末尾分隔符不是正文控制，TAB/LS则仍属于同段内部。
+/// 全程一字节/一标量/一元数据，不用证书字段或人工构造段范围替代实际Visible消费者。
+#[cfg(feature = "s2-table-window-prototype")]
+#[test]
+fn visible_table_flow_keeps_terminal_b_outside_the_actual_control_free_body() {
+    for ending in ["\n", "\r", "\u{2029}", "\r\n"] {
+        for interior in ["", "\t", "\u{2028}"] {
+            let prefix = "前段\n";
+            let content = format!("中文{interior}😀");
+            let text = format!("{prefix}{content}{ending}后段\n");
+            let start = prefix.encode_utf16().count();
+            let content_end = start + content.encode_utf16().count();
+            let (directory, document) = fixture(&text);
+            let source = MarkdownLayoutTextSource::capture(&document);
+            let authority = source.authority();
+            let mapping = source.original_backing_observer().unwrap();
+            let payload = source.resource_observer();
+            let writer = crate::markdown_layout_source::table_rows::TablePlanWriter::new(&source);
+            let cancel = MarkdownBidiCancellation::new();
+            let (job, receipt) = MarkdownBidiPrepareJob::new_layout_source_table_observed(
+                source.clone(),
+                &authority,
+                writer.plan(),
+                None,
+                BidiBaseDirection::Auto,
+                BidiMemoryBudget::new(65536).unwrap(),
+                &cancel,
+            );
+            let mut job = job.unwrap();
+            assert_eq!(
+                job.step(&authority, ONE).unwrap().status,
+                MarkdownBidiPrepareStatus::Ready
+            );
+            let mut actual = job.take_ready(&authority).unwrap().unwrap();
+            drop(job);
+            let mut work = crate::markdown_bidi::visible::VisiblePreparation::default();
+            let mut ready = false;
+            for _ in 0..100_000 {
+                let step = actual
+                    .prepare_layout_paragraph_range(&authority, start, ONE, &mut work)
+                    .unwrap();
+                assert!(step.bytes <= 1 && step.scalars <= 1 && step.metadata <= 1);
+                assert!(step.maximum_borrow <= 1);
+                if step.ready {
+                    ready = true;
+                    break;
+                }
+                // 完整UBA和真实正文端点都未交付之前，不签开放Script所消费的无控制跨度。
+                assert!(matches!(
+                    actual.uniform_control_free_span(&authority, start..content_end),
+                    Ok(None) | Err(BidiError::UnpreparedRange)
+                ));
+            }
+            assert!(
+                ready,
+                "真实Visible正文准备未完成：ending={ending:?} interior={interior:?}"
+            );
+            let span = actual
+                .uniform_control_free_span(&authority, start..content_end)
+                .unwrap();
+            if interior.is_empty() {
+                let span = span.expect("真实末尾B之外的正文应可开放Script前缀");
+                assert_eq!(span.source_range(), start..content_end);
+                assert_eq!(span.paragraph_range(), start..content_end + 1);
+                assert_eq!(span.content_end(), content_end);
+                assert_eq!(span.level(), 0);
+            } else {
+                assert!(span.is_none(), "同B段内部TAB/LS不能取得无控制授权");
+            }
+            assert!(
+                actual
+                    .uniform_control_free_span(&authority, start..content_end + 1)
+                    .unwrap()
+                    .is_none()
+            );
+            // CRLF是一张GCB、两个真实B段；后继LF本身不能变为正文或扩大前一段的权限。
+            if ending == "\r\n" {
+                let next = content_end + 1;
+                let mut complete = false;
+                for _ in 0..100_000 {
+                    let step = actual
+                        .prepare_layout_paragraph_range(&authority, next, ONE, &mut work)
+                        .unwrap();
+                    assert!(step.bytes <= 1 && step.scalars <= 1 && step.metadata <= 1);
+                    assert!(step.maximum_borrow <= 1);
+                    if step.ready {
+                        complete = true;
+                        break;
+                    }
+                }
+                assert!(complete);
+                assert_eq!(
+                    actual.paragraph_range_at_utf16(next).unwrap(),
+                    Some(next..next + 1)
+                );
+                assert!(
+                    actual
+                        .uniform_control_free_span(&authority, next..next + 1)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let analyzed = format!("{content}{}", ending.chars().next().unwrap());
+            let units: Vec<u16> = analyzed.encode_utf16().collect();
+            let expected = BidiInfo::new_with_data_source(&UnicodeBidiData, &units, None);
+            for (offset, level) in expected.levels.iter().enumerate() {
+                assert_eq!(
+                    actual.level_at_utf16(start + offset).unwrap(),
+                    level.number()
+                );
+            }
+            // 取消撤销同Source已完成的跨度；没有文字编辑、历史或磁盘变化可被后继准备吞掉。
+            cancel.cancel();
+            assert!(matches!(
+                actual.uniform_control_free_span(&authority, start..content_end),
+                Err(BidiError::Cancelled)
+            ));
+            assert_eq!(
+                std::fs::read(directory.path().join("uniform-control.md")).unwrap(),
+                text.as_bytes()
+            );
+            drop((work, actual, writer, source, document));
+            assert!(payload.payload_released() && receipt.is_released());
+            assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0 && !mapping.failed());
+        }
+    }
+}
+
+/// 正式table-flow Composer必须在长中文B段完整SCX之前发首个真实有界样式请求。
+/// 不提供猜测字体或伪LineReady；这里核原开放入口，后继整形另由原字体/字形回归负责。
+#[cfg(feature = "s2-table-window-prototype")]
+#[test]
+fn table_flow_terminal_b_opens_first_style_before_the_complete_long_scx() {
+    let content = "巨段落可见区域绘制检查 ".repeat(1500);
+    let text = format!("{content}\n后继\n");
+    let (directory, document) = fixture(&text);
+    let source = MarkdownLayoutTextSource::capture(&document);
+    let authority = source.authority();
+    let mapping = source.original_backing_observer().unwrap();
+    let payload = source.resource_observer();
+    let mut worker = crate::MarkdownLineComposer::new_with_table_flow(
+        source.clone(),
+        &authority,
+        crate::MarkdownLineFontCatalog::new(),
+        200 * 64,
+        crate::MarkdownLineComposeCancellation::new(),
+    )
+    .unwrap();
+    let resources = worker.worker_resource_observer();
+    let budget = crate::MarkdownLineComposeBudget {
+        bytes: 1,
+        scalars: 1,
+        records: 1,
+        metadata_units: 1,
+    };
+    let mut requested = false;
+    for _ in 0..200_000 {
+        let step = worker.step(budget).unwrap();
+        assert!(
+            step.bytes <= 1 && step.scalars <= 1 && step.records <= 1 && step.metadata_units <= 1
+        );
+        match step.answer {
+            crate::MarkdownLineComposeAnswer::Yielded => {}
+            crate::MarkdownLineComposeAnswer::NeedStyle(request) => {
+                assert!(request.source() == &authority, "首个请求必须属于原来源");
+                assert_eq!(request.source_range().start, 0);
+                assert!(request.source_range().end < content.encode_utf16().count());
+                requested = true;
+                break;
+            }
+            _ => panic!("长中文正文首个真实样式请求之前出现其它结果"),
+        }
+    }
+    assert!(requested, "实际table-flow未交付正文首个有界样式请求");
+    assert_eq!(
+        std::fs::read(directory.path().join("uniform-control.md")).unwrap(),
+        text.as_bytes()
+    );
+    drop((worker, source, document));
+    assert!(resources.is_released() && payload.payload_released());
+    assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0 && !mapping.failed());
+}
+
 #[test]
 fn subrange_span_returns_original_analyzed_paragraph_without_reborrowing_source() {
     let (_directory, document) = fixture("AA中文😀BB");

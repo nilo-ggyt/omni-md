@@ -123,6 +123,82 @@ pub struct MarkdownLayoutBreakJob {
 }
 
 impl MarkdownLayoutBreakJob {
+    /// 原两个算法共享同 Source 的真实段落 proof，各自原游标只跳过明确隐藏 body。
+    #[cfg(feature = "paged-line-compose")]
+    pub(crate) fn install_fold_plan(
+        &mut self,
+        plan: crate::markdown_layout_source::folds::FoldPlan,
+    ) -> Result<()> {
+        let authority = self.authority.clone();
+        self.require_source(&authority)?;
+        let result = (|| {
+            let payload = self
+                .payload
+                .as_mut()
+                .ok_or(MarkdownLayoutBreakError::Poisoned)?;
+            payload.grapheme.install_fold_plan(plan.clone())?;
+            payload.line.install_fold_plan(plan)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => self.poison(error),
+        }
+    }
+
+    /// 表格流只分享原结构行目录；两个 Unicode 游标仍保各自真实状态和原配额。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub(crate) fn install_table_plan(
+        &mut self,
+        plan: crate::markdown_layout_source::table_rows::TablePlan,
+    ) -> Result<()> {
+        let authority = self.authority.clone();
+        self.require_source(&authority)?;
+        let payload = self
+            .payload
+            .as_mut()
+            .ok_or(MarkdownLayoutBreakError::Poisoned)?;
+        payload.grapheme.install_table_plan(plan.clone())?;
+        payload.line.install_table_plan(plan)?;
+        Ok(())
+    }
+
+    /// 只观察两个原 machine 的真实 canonical 进度，不以需求位置伪造已消费。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub(crate) fn table_passed(
+        &mut self,
+        authority: &MarkdownLayoutTextAuthority,
+        end: usize,
+    ) -> Result<bool> {
+        self.require_source(authority)?;
+        let payload = self
+            .payload
+            .as_ref()
+            .ok_or(MarkdownLayoutBreakError::Poisoned)?;
+        Ok(payload.grapheme.table_passed(end) && payload.line.table_passed(end))
+    }
+
+    /// 迁移者必须明确区分原全源 ordinal 与本次显式可见序列；两者不互相补签。
+    #[cfg(feature = "paged-line-compose")]
+    pub(crate) fn grapheme_ordinal_domain(
+        &mut self,
+        authority: &MarkdownLayoutTextAuthority,
+    ) -> Result<crate::MarkdownGraphemeOrdinalDomain> {
+        self.require_source(authority)?;
+        Ok(self
+            .payload
+            .as_ref()
+            .ok_or(MarkdownLayoutBreakError::Poisoned)?
+            .grapheme
+            .ordinal_domain())
+    }
+
     pub fn new(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
@@ -252,6 +328,13 @@ impl MarkdownLayoutBreakJob {
     }
 
     fn poison<T>(&mut self, error: MarkdownLayoutBreakError) -> Result<T> {
+        if matches!(
+            &error,
+            MarkdownLayoutBreakError::Grapheme(crate::MarkdownGraphemeError::FoldedRange)
+                | MarkdownLayoutBreakError::Line(crate::MarkdownLineBreakError::FoldedRange)
+        ) {
+            return Err(error);
+        } // 明确隐藏是权限域差异，不是索引损坏；保留仍健康的可见 worker。
         drop(self.payload.take()); // 原索引和source强边真实Drop，外部cursor/observer不保活资源。
         Err(error)
     }

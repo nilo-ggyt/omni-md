@@ -1,9 +1,9 @@
 use super::layout::DELETED_GLYPH;
-use crate::U32Set;
 use crate::aat::common::{
-    AatApplyContext, ClassCache, START_OF_TEXT, SafeToBreakAccel, SafeToBreakSubtable,
-    TypedCollectGlyphs, get_class,
+    get_class, AatApplyContext, ClassCache, SafeToBreakAccel, SafeToBreakSubtable,
+    TypedCollectGlyphs, START_OF_TEXT,
 };
+use crate::U32Set;
 use crate::{
     buffer::*,
     ot::apply::{ApplyContext, SkippingIterator},
@@ -14,7 +14,6 @@ use crate::{
 use alloc::boxed::Box;
 use core::convert::TryFrom;
 use read_fonts::{
-    FontData,
     tables::{
         aat,
         ankr::Ankr,
@@ -24,6 +23,7 @@ use read_fonts::{
         },
     },
     types::{BigEndian, FixedSize, GlyphId},
+    FontData,
 };
 
 pub(crate) fn apply(c: &mut AatApplyContext) -> Option<()> {

@@ -118,7 +118,7 @@ impl NativeMarkdownModalUseGuard {
                 .as_ref()
                 .map_or(&*surface.owned_ledger, |editor| {
                     // 活动笔记的 Modal 角色同时进入 editor 局部清单和共同 root。
-                    &*editor.backend.owned_ledger
+                    editor.owned_ledger()
                 });
             Ok(Rc::new(source.modal_scope()))
         })?;
@@ -704,7 +704,7 @@ pub(super) fn run_native_markdown_modal_confirmation(
             feature = "native-markdown-runtime-probe",
             feature = "native-table-row-append"
         ))]
-        NativeMarkdownTableAppendWorkload::observe_conflict_modal_ready(&alert, &window, None);
+        NativeMarkdownHostedTableProbe::observe_conflict_modal_ready(&alert, &window, None);
         let confirmed = native_markdown_alert_response(alert.runModal(), cancel.is_some());
         detach_native_markdown_modal_alert(&alert, &window);
         confirmed
@@ -743,7 +743,7 @@ pub(super) fn run_native_markdown_modal_input_response(
         feature = "native-markdown-runtime-probe",
         feature = "native-table-row-append"
     ))]
-    NativeMarkdownTableAppendWorkload::observe_conflict_modal_ready(alert, window, Some(field));
+    NativeMarkdownHostedTableProbe::observe_conflict_modal_ready(alert, window, Some(field));
     await_prepared_modal_response(
         || {
             // 同一显式owner留在外层；每次用户动作的框架临时值在独立局部pool结束，不随失败次数积累。

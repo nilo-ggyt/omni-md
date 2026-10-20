@@ -8,6 +8,7 @@ use crate::{
 
 fn style() -> MarkdownLineComposeStyle {
     MarkdownLineComposeStyle {
+        presentation: Default::default(),
         points: 16.0,
         language: Some("en".into()),
         features: Vec::new(),
@@ -432,6 +433,13 @@ fn terminal_same_font_continues_through_original_composer_store_and_real_line_en
         assert!(step.bytes <= budget().bytes && step.scalars <= budget().scalars);
         assert!(step.metadata_units <= budget().metadata_units && step.shapes <= 1);
         match step.answer {
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            MarkdownLineComposeAnswer::NeedsTableRow(_) => {
+                panic!("未启用表格流的原文字 oracle 不应产生 Grid 请求")
+            }
             MarkdownLineComposeAnswer::Yielded | MarkdownLineComposeAnswer::LineReady(_) => {}
             MarkdownLineComposeAnswer::NeedStyle(request) => {
                 styles += 1;

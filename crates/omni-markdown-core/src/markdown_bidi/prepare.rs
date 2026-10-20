@@ -88,14 +88,24 @@ struct Seed {
     cancellation: MarkdownBidiCancellation,
     #[cfg(feature = "paged-layout-breaks")]
     layout_source: Option<crate::MarkdownLayoutTextSource>,
+    #[cfg(feature = "paged-shaping-frontier")]
+    folds: Option<crate::markdown_layout_source::folds::FoldPlan>,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    tables: Option<crate::markdown_layout_source::table_rows::TablePlan>,
 }
 
 /// 只复制稳定原因，不保留正文或业务闭包；首次Storage错误的原值仍由首次返回完整交付。
 #[derive(Clone, Copy)]
-enum Failure {
+pub(super) enum Failure {
     Cancelled,
     SourceMismatch,
     InvalidRange,
+    FoldedRange,
+    TableRange,
+    UnpreparedRange,
     InvalidScalarBoundary,
     InvalidBudget,
     CoordinateOverflow,
@@ -105,11 +115,14 @@ enum Failure {
     Storage(Option<i32>, std::io::ErrorKind),
 }
 impl Failure {
-    fn capture(error: &BidiError) -> Self {
+    pub(super) fn capture(error: &BidiError) -> Self {
         match error {
             BidiError::Cancelled => Self::Cancelled,
             BidiError::SourceMismatch => Self::SourceMismatch,
             BidiError::InvalidRange => Self::InvalidRange,
+            BidiError::FoldedRange => Self::FoldedRange,
+            BidiError::TableRange => Self::TableRange,
+            BidiError::UnpreparedRange => Self::UnpreparedRange,
             BidiError::InvalidScalarBoundary => Self::InvalidScalarBoundary,
             BidiError::InvalidBudget => Self::InvalidBudget,
             BidiError::CoordinateOverflow => Self::CoordinateOverflow,
@@ -119,11 +132,14 @@ impl Failure {
             BidiError::Storage(error) => Self::Storage(error.raw_os_error(), error.kind()),
         }
     }
-    fn error(self) -> BidiError {
+    pub(super) fn error(self) -> BidiError {
         match self {
             Self::Cancelled => BidiError::Cancelled,
             Self::SourceMismatch => BidiError::SourceMismatch,
             Self::InvalidRange => BidiError::InvalidRange,
+            Self::FoldedRange => BidiError::FoldedRange,
+            Self::TableRange => BidiError::TableRange,
+            Self::UnpreparedRange => BidiError::UnpreparedRange,
             Self::InvalidScalarBoundary => BidiError::InvalidScalarBoundary,
             Self::InvalidBudget => BidiError::InvalidBudget,
             Self::CoordinateOverflow => BidiError::CoordinateOverflow,
@@ -178,6 +194,86 @@ impl MarkdownBidiPrepareJob {
         budget: BidiMemoryBudget,
         cancellation: &MarkdownBidiCancellation,
     ) -> (Result<Self, BidiError>, MarkdownBidiResourceObserver) {
+        Self::layout_source_observed(
+            source,
+            authority,
+            base,
+            budget,
+            cancellation,
+            #[cfg(feature = "paged-shaping-frontier")]
+            None,
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            None,
+        )
+    }
+
+    /// 折叠装配只建立显式可见段 scope；首个 level 仍须在后续原段量子内完成 UBA。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(crate) fn new_layout_source_folded_observed(
+        source: crate::MarkdownLayoutTextSource,
+        authority: &crate::MarkdownLayoutTextAuthority,
+        folds: crate::markdown_layout_source::folds::FoldPlan,
+        base: BidiBaseDirection,
+        budget: BidiMemoryBudget,
+        cancellation: &MarkdownBidiCancellation,
+    ) -> (Result<Self, BidiError>, MarkdownBidiResourceObserver) {
+        Self::layout_source_observed(
+            source,
+            authority,
+            base,
+            budget,
+            cancellation,
+            Some(folds),
+            #[cfg(feature = "s2-table-window-prototype")]
+            None,
+        )
+    }
+
+    /// 原 Body flow 只声明动态表格结构目录，UBA 仍按当前真实完整 B 段逐量子准备。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub(crate) fn new_layout_source_table_observed(
+        source: crate::MarkdownLayoutTextSource,
+        authority: &crate::MarkdownLayoutTextAuthority,
+        tables: crate::markdown_layout_source::table_rows::TablePlan,
+        folds: Option<crate::markdown_layout_source::folds::FoldPlan>,
+        base: BidiBaseDirection,
+        budget: BidiMemoryBudget,
+        cancellation: &MarkdownBidiCancellation,
+    ) -> (Result<Self, BidiError>, MarkdownBidiResourceObserver) {
+        Self::layout_source_observed(
+            source,
+            authority,
+            base,
+            budget,
+            cancellation,
+            folds,
+            Some(tables),
+        )
+    }
+
+    /// 所有 Source 装配复用同一 Seed/Future 初始化图，差异只在显式显示 proof 是否存在。
+    #[cfg(feature = "paged-layout-breaks")]
+    fn layout_source_observed(
+        source: crate::MarkdownLayoutTextSource,
+        authority: &crate::MarkdownLayoutTextAuthority,
+        base: BidiBaseDirection,
+        budget: BidiMemoryBudget,
+        cancellation: &MarkdownBidiCancellation,
+        #[cfg(feature = "paged-shaping-frontier")] folds: Option<
+            crate::markdown_layout_source::folds::FoldPlan,
+        >,
+        #[cfg(all(
+            feature = "s2-table-window-prototype",
+            feature = "paged-shaping-frontier"
+        ))]
+        tables: Option<crate::markdown_layout_source::table_rows::TablePlan>,
+    ) -> (Result<Self, BidiError>, MarkdownBidiResourceObserver) {
         let resources = resource::ResourceState::new();
         let observer = resources.observe();
         let result = (|| {
@@ -185,7 +281,21 @@ impl MarkdownBidiPrepareJob {
             if !source.permits(authority) {
                 return Err(BidiError::SourceMismatch);
             }
+            #[cfg(feature = "paged-shaping-frontier")]
+            if folds
+                .as_ref()
+                .is_some_and(|plan| !source.permits(plan.authority()))
+            {
+                return Err(BidiError::SourceMismatch);
+            }
             cancellation.check()?;
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            if let Some(tables) = &tables {
+                tables.require(&source)?;
+            }
             let snapshot = source.snapshot_for_bidi();
             let utf16 = 0..source.utf16_len();
             let bytes = 0..source.byte_len();
@@ -198,6 +308,13 @@ impl MarkdownBidiPrepareJob {
                     budget,
                     cancellation: cancellation.clone(),
                     layout_source: Some(source),
+                    #[cfg(feature = "paged-shaping-frontier")]
+                    folds,
+                    #[cfg(all(
+                        feature = "s2-table-window-prototype",
+                        feature = "paged-shaping-frontier"
+                    ))]
+                    tables,
                 },
                 Arc::clone(&resources),
             )?;
@@ -205,6 +322,42 @@ impl MarkdownBidiPrepareJob {
             Ok(job)
         })();
         (result, observer)
+    }
+
+    /// 原有界端点游标已经封闭完整 B 段和双坐标；这里不再同步读取边叶转换端点。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(super) fn new_layout_paragraph_observed(
+        source: crate::MarkdownLayoutTextSource,
+        authority: &crate::MarkdownLayoutTextAuthority,
+        endpoints: (Range<usize>, Range<usize>),
+        base: BidiBaseDirection,
+        budget: BidiMemoryBudget,
+        cancellation: &MarkdownBidiCancellation,
+        resources: Arc<resource::ResourceState>,
+    ) -> Result<Self, BidiError> {
+        source.health()?;
+        if !source.permits(authority) {
+            return Err(BidiError::SourceMismatch);
+        }
+        cancellation.check()?;
+        let snapshot = source.snapshot_for_bidi();
+        let mut job = Self::with_endpoints(
+            Seed {
+                snapshot,
+                range: endpoints.0,
+                bytes: endpoints.1,
+                base,
+                budget,
+                cancellation: cancellation.clone(),
+                layout_source: Some(source),
+                folds: None,
+                #[cfg(feature = "s2-table-window-prototype")]
+                tables: None,
+            },
+            resources,
+        )?;
+        job.authority = Some(authority.clone());
+        Ok(job)
     }
 
     /// 旧Snapshot/range入口本来就是同步契约；只在这里执行原有有限叶端点定位，
@@ -238,6 +391,13 @@ impl MarkdownBidiPrepareJob {
                 cancellation: cancellation.clone(),
                 #[cfg(feature = "paged-layout-breaks")]
                 layout_source: None,
+                #[cfg(feature = "paged-shaping-frontier")]
+                folds: None,
+                #[cfg(all(
+                    feature = "s2-table-window-prototype",
+                    feature = "paged-shaping-frontier"
+                ))]
+                tables: None,
             },
             resources
                 .cloned()
@@ -403,6 +563,16 @@ impl MarkdownBidiPrepareJob {
     pub fn resource_observer(&self) -> MarkdownBidiResourceObserver {
         self.resources.clone()
     }
+
+    /// 可见段 owner 只复核原任务的永久状态，不补预算、运行 Future 或转移 Ready 权限。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(super) fn require_healthy(&self) -> Result<(), BidiError> {
+        self.gate.source_health()?;
+        if let Some(failure) = self.failure {
+            return Err(failure.error());
+        }
+        self.gate.health()
+    }
     /// 失败时同样可核上次实际工作；这是固定诊断计数，不授予Source或部分层级权限。
     pub fn last_step(&self) -> MarkdownBidiPrepareStep {
         self.gate.progress()
@@ -433,12 +603,52 @@ async fn compute(
         cancellation,
         #[cfg(feature = "paged-layout-breaks")]
         layout_source,
+        #[cfg(feature = "paged-shaping-frontier")]
+        folds,
+        #[cfg(all(
+            feature = "s2-table-window-prototype",
+            feature = "paged-shaping-frontier"
+        ))]
+        tables,
     } = seed;
     snapshot.original_backing_health()?;
     gate.health()?;
-    if let Some(certificate) =
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    if let Some(tables) = tables {
+        // 表格目录最初可为空；未来行追加只撤其内部权限，不能为此预扫整篇或换一份 Source。
+        return Ok(MarkdownBidiParagraph {
+            _snapshot: snapshot,
+            layout_source,
+            source,
+            resolution: Resolution::VisibleParagraphs(Box::new(
+                visible::VisibleParagraphs::new_tables(
+                    tables,
+                    folds,
+                    base,
+                    budget,
+                    cancellation,
+                    resources,
+                ),
+            )),
+            units,
+            paragraph_count: None,
+            source_borrow_max: 0,
+            word_order: visible::WordOrder::default(),
+        });
+    }
+    #[cfg(feature = "paged-shaping-frontier")]
+    let certificate = if folds.as_ref().is_some_and(|plan| !plan.spans().is_empty()) {
+        uniform::root::certify(&snapshot, &source, &bytes, base)?
+    } else {
         uniform::certify_prepared(&snapshot, &source, bytes.clone(), base, &gate).await?
-    {
+    };
+    #[cfg(not(feature = "paged-shaping-frontier"))]
+    let certificate =
+        uniform::certify_prepared(&snapshot, &source, bytes.clone(), base, &gate).await?;
+    if let Some(certificate) = certificate {
         snapshot.original_backing_health()?;
         gate.health()?;
         let paragraph_count = if certificate.has_paragraph_boundaries() {
@@ -455,6 +665,30 @@ async fn compute(
             units,
             paragraph_count,
             source_borrow_max: gate.source_borrow_max(),
+            #[cfg(feature = "paged-shaping-frontier")]
+            word_order: visible::WordOrder::default(),
+        });
+    }
+    #[cfg(feature = "paged-shaping-frontier")]
+    if let Some(plan) = folds.filter(|plan| !plan.spans().is_empty()) {
+        // 完整 root 未证明零级时仅建立可见段 scope；禁止为了拿快路扫描隐藏 RTL 或控制正文。
+        snapshot.original_backing_health()?;
+        gate.health()?;
+        return Ok(MarkdownBidiParagraph {
+            _snapshot: snapshot,
+            layout_source,
+            source,
+            resolution: Resolution::VisibleParagraphs(Box::new(visible::VisibleParagraphs::new(
+                plan,
+                base,
+                budget,
+                cancellation,
+                resources,
+            ))),
+            units,
+            paragraph_count: None,
+            source_borrow_max: 0,
+            word_order: visible::WordOrder::default(),
         });
     }
     let mut store =
@@ -483,5 +717,7 @@ async fn compute(
         units,
         paragraph_count: Some(paragraph_count),
         source_borrow_max: gate.source_borrow_max(),
+        #[cfg(feature = "paged-shaping-frontier")]
+        word_order: visible::WordOrder::default(),
     })
 }

@@ -9,9 +9,8 @@ use objc2_app_kit::{
 };
 use omni_markdown_core::markdown_brackets::{MarkdownBracketQuery, markdown_bracket_match};
 
-/// 可见反馈和控制字符发现共用有限源窗口与结果数量；不随整篇长度增加载荷。
-pub(super) const MAX_DECORATION_VIEWPORT_UNITS: usize = 16_384;
-pub(super) const MAX_SPECIAL_CHARACTER_MARKERS: usize = 128;
+// 独立参考图也沿正式可见 Find 的原配额，不在旧装饰模块重复定义数值。
+use super::find_bar::{MAX_DECORATION_VIEWPORT_UNITS, MAX_SPECIAL_CHARACTER_MARKERS};
 
 /// 原装饰Vec统一归还有限提示和Find矩形；批次仅保弱票，不持正文或Native布局对象。
 #[derive(Clone)]
@@ -233,71 +232,6 @@ impl PieceBackedMarkdownTextView {
             .ok()?;
         } // 同步StackBlock的词法作用域结束后才交付Copy矩形，不用drop延长非析构类型的借用。
         Some(frames.into_inner())
-    }
-
-    /// 旧Find批次从原Vec实际取走；重绘既有view擦除旧像素，不创建额外层或取消用户选区。
-    pub(super) fn invalidate_find_highlights(&self, current: &impl Fn() -> bool) {
-        if !current() || self.ivars().textkit_graph_teardown.get() {
-            return;
-        }
-        let changed = {
-            let mut geometry = self.ivars().source_decorations.borrow_mut();
-            let length = geometry.len();
-            geometry.retain(|cue| !matches!(cue, NativeMarkdownDecorationGeometry::Find(_)));
-            length != geometry.len()
-        };
-        self.ivars().source_decorations_dirty.set(true);
-        if changed {
-            let _ = native_markdown_table_intent_step(current, || self.setNeedsDisplay(true));
-        } // 所有Vec借用在Native重绘请求之前结束；后继关闭只丢掉旧setter权限。
-    }
-
-    /// 输入反馈可能晚于已排队的布局；仅撤旧批次，不能删掉同次输入已经准备好的当前几何。
-    pub(super) fn invalidate_stale_find_highlights(
-        &self,
-        controller: &NativeMarkdownController,
-        current: &impl Fn() -> bool,
-    ) {
-        let Ok(storage) =
-            native_markdown_table_intent_step(current, || self.ivars().text_storage.load())
-        else {
-            return; // 首个 Native claim 已撤权，旧反馈不再操作原装饰或后继文稿。
-        };
-        let Some(storage) = storage else {
-            self.invalidate_find_highlights(current);
-            return; // 没有真实正文图就不存在可保留的当前高亮，仍走原清除边界。
-        };
-        let Ok(visible) = native_markdown_table_intent_step(current, || self.visibleRect()) else {
-            return;
-        };
-        let Ok(width) = native_markdown_table_intent_step(current, || self.bounds().size.width)
-        else {
-            return;
-        };
-        let (changed, prepared) = {
-            // 所有 Native getter 已返回；借用 Vec 期间只核原 batch 的 Rust 权限和实际几何标量。
-            let mut geometry = self.ivars().source_decorations.borrow_mut();
-            let length = geometry.len();
-            let mut prepared = false;
-            geometry.retain(|cue| match cue {
-                NativeMarkdownDecorationGeometry::Source { .. } => true,
-                NativeMarkdownDecorationGeometry::PreviewVisibility(proof) => {
-                    proof.current(self, &storage) // 查询换代只撤 Find；真正正文/模式/几何变化仍撤可见事实。
-                }
-                NativeMarkdownDecorationGeometry::Find(batch) => {
-                    let keep = batch.current(self, &storage, controller, visible, width);
-                    prepared |= keep;
-                    keep // 原 Doc/gen/intent/bar、模式、字体、折叠、table、clip 和宽度均须仍相同。
-                }
-            });
-            (length != geometry.len(), prepared)
-        };
-        if !prepared {
-            self.ivars().source_decorations_dirty.set(true); // 缺少当前批次仍需要原 coalesced executor 准备，不同步强排版。
-        }
-        if changed {
-            let _ = native_markdown_table_intent_step(current, || self.setNeedsDisplay(true));
-        } // 已有当前批次时不补置 dirty；其他真实失效留下的 dirty 也不会在这里被清除。
     }
 
     /// 首个正文 Native getter 前裁出当前可见样式；后续属性窗口换页不会逐出这份有限事实。

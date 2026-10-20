@@ -6,6 +6,7 @@ pub(super) struct WordClusterProbe {
     cluster: MarkdownGlyphCluster,
     grapheme_checked: bool,
     cursor: Option<MarkdownLayoutBreakCursor>,
+    shaping_seam: bool,
 }
 
 /// 整行只保一个安全GCB候选及最新可容纳GCB末端；跨真实前缀不保旧Job或每item证明数组。
@@ -16,6 +17,7 @@ pub(super) struct WordSafeState {
     first_end: Option<usize>,
     latest_fitting_end: Option<usize>,
     fitting: Option<WordSafeFit>,
+    incomplete_grapheme: bool,
 }
 
 struct WordSafeFit {
@@ -66,6 +68,10 @@ impl MarkdownSoftLineMeasureJob {
             .as_ref()
             .is_none_or(|state| state.word_end != word_end || !state.font.same_payload(&self.font))
         {
+            let incomplete_grapheme = payload
+                .word_safe
+                .as_ref()
+                .is_some_and(|state| state.incomplete_grapheme);
             payload.word_safe = Some(WordSafeState {
                 word_end,
                 font: self.font.clone(),
@@ -73,6 +79,7 @@ impl MarkdownSoftLineMeasureJob {
                 first_end: None,
                 latest_fitting_end: None,
                 fitting: None,
+                incomplete_grapheme,
             }); // 源已同票固定；换字体或闭合词项会撤旧紧急候选，不能跨别的字形依赖重签。
         }
         loop {
@@ -135,7 +142,10 @@ impl MarkdownSoftLineMeasureJob {
                     .ok_or(MarkdownSoftLineMeasureError::Poisoned)?;
                 if payload.scan == self.start {
                     safe.start_safe = cluster.flags & UNSAFE_TO_BREAK == 0;
-                } else if safe.start_safe && cluster.flags & UNSAFE_TO_BREAK == 0 {
+                } else if safe.start_safe
+                    && !safe.incomplete_grapheme
+                    && cluster.flags & UNSAFE_TO_BREAK == 0
+                {
                     // 当前真实cluster是前一个GCB的后继。其原flags才证明该切口可复用，
                     // 不能拿前缀flags并集、item末端或缺少后继记录来推测安全。
                     let fit = WordSafeFit {
@@ -160,6 +170,7 @@ impl MarkdownSoftLineMeasureJob {
                     cluster,
                     grapheme_checked: false,
                     cursor: None,
+                    shaping_seam: false,
                 });
             }
             let probe = payload
@@ -179,11 +190,35 @@ impl MarkdownSoftLineMeasureJob {
                         return Ok(true);
                     }
                     MarkdownGraphemeAnswer::Known(Some(boundary)) if boundary.utf16 == end => {}
+                    MarkdownGraphemeAnswer::Known(None)
+                        if end == self.item.end
+                            && provider.bidi_shaping_end(&self.source, &self.font)?
+                                == Some(end) =>
+                    {
+                        probe.shaping_seam = true;
+                    }
                     MarkdownGraphemeAnswer::Known(_) => {
                         return Err(MarkdownSoftLineMeasureError::InconsistentCoverage);
                     }
                 }
                 probe.grapheme_checked = true; // 原索引不可变；quota1后继不重复计量或把未知当边界。
+            }
+            if probe.shaping_seam {
+                let probe = payload
+                    .word_probe
+                    .take()
+                    .ok_or(MarkdownSoftLineMeasureError::Poisoned)?;
+                payload.advance = payload
+                    .advance
+                    .checked_add(probe.cluster.x_advance_26_6)
+                    .ok_or(MarkdownSoftLineMeasureError::Overflow)?;
+                payload.scan = end;
+                payload
+                    .word_safe
+                    .as_mut()
+                    .ok_or(MarkdownSoftLineMeasureError::Poisoned)?
+                    .incomplete_grapheme = true;
+                continue; // 只累计这个真实分项，不能在内部 seam 更新 fitting、首字素或 emergency。
             }
             if step.break_queries == budget.break_queries.min(MARKDOWN_SOFT_LINE_BREAK_QUERIES) {
                 return Ok(true);
@@ -223,6 +258,7 @@ impl MarkdownSoftLineMeasureJob {
                 .word_safe
                 .as_mut()
                 .ok_or(MarkdownSoftLineMeasureError::Poisoned)?;
+            safe.incomplete_grapheme = false; // 此前 IsBoundary 与 At 已核完真正外 GCB，才能恢复断点候选。
             if safe.first_end.is_none() {
                 safe.first_end = Some(end);
             } // 只有刚完成原GCB/At检查才记首字素末端；quota暂停时不提前签候选。

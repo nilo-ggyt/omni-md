@@ -8,6 +8,14 @@ pub(in crate::markdown_line_composer) struct ValidatedControl {
     pub(in crate::markdown_line_composer) registered: MarkdownLineRegisteredFont,
     pub(in crate::markdown_line_composer) facts: MarkdownLineItemFacts,
     pub(in crate::markdown_line_composer) paragraph: MarkdownLineParagraphStyle,
+    pub(in crate::markdown_line_composer) presentation: crate::MarkdownPresentationStyles,
+    pub(in crate::markdown_line_composer) paragraph_inset_26_6: i32,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub(in crate::markdown_line_composer) table:
+        Option<super::super::engine::table_row::TableGeometry>,
 }
 impl ValidatedControl {
     pub(in crate::markdown_line_composer) fn require(
@@ -24,7 +32,8 @@ impl ValidatedControl {
             || self.facts.source_utf16.start < self.facts.paragraph_utf16.start
             || self.facts.source_utf16.end > self.facts.paragraph_utf16.end
             || !self.facts.points.is_finite()
-            || self.facts.points <= 0.0
+            || (self.facts.points <= 0.0
+                && self.request.kind != super::super::MarkdownLineInlineControlKind::TableRow)
         {
             return Err(Error::SourceMismatch);
         }
@@ -44,6 +53,13 @@ impl ValidatedControl {
             registered: response.registered,
             facts,
             paragraph: response.paragraph,
+            presentation: response.presentation,
+            paragraph_inset_26_6: response.paragraph_inset_26_6,
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            table: None,
         }
     }
 }

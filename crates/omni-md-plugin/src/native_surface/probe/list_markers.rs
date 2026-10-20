@@ -6,7 +6,7 @@ use objc2_core_text::{CTFontOrientation, CTGlyphInfo, CTLine, CTRun};
 
 /// 纯测试权限只借原surface/controller；root只有Weak，允许的模式/选区转换须在首Native前声明。
 struct Permission<'a> {
-    surface: &'a NativeMarkdownEditorSurface,
+    surface: &'a NativeMarkdownTextKitEditorSurface,
     controller: &'a Retained<NativeMarkdownController>,
     document: WeakMarkdownDocument,
     generation: u64,
@@ -671,7 +671,7 @@ impl Permission<'_> {
 
 /// 原Native9权限内运行；失败仍只按已声明的模式/选区转换收尾，不采纳后继输入签新票。
 pub(super) fn verify(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
     fixture: &str,
 ) -> Result<(), String> {

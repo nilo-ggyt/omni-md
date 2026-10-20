@@ -13,9 +13,13 @@ use std::sync::{
 };
 use thiserror::Error;
 
+#[cfg(feature = "paged-line-compose")]
+mod folds;
 mod machine;
 #[cfg(feature = "paged-shaping-frontier")]
 mod prefix;
+#[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+mod table_rows;
 #[cfg(feature = "paged-shaping-frontier")]
 pub use prefix::{
     MarkdownScriptPrefixAnswer, MarkdownScriptPrefixKind, MarkdownStableScriptPrefix,
@@ -90,6 +94,11 @@ pub enum MarkdownScriptError {
     InvalidBudget,
     #[error("脚本查询范围无效")]
     InvalidRange,
+    #[cfg(feature = "paged-line-compose")]
+    #[error("该原 Source 范围已折叠，没有可见脚本权限")]
+    FoldedRange,
+    #[error("独立表格行内部须查询该格显示来源的脚本")]
+    TableRange,
     #[error("脚本源权限不匹配")]
     SourceMismatch,
     #[error("脚本坐标或计数溢出")]
@@ -199,6 +208,10 @@ pub struct MarkdownScriptJob {
     cancelled: bool,
     source_borrow_max: usize,
     source_bytes_read: usize,
+    #[cfg(feature = "paged-line-compose")]
+    folds: Option<folds::State>,
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    tables: Option<table_rows::State>,
     #[cfg(feature = "paged-shaping-frontier")]
     completed_ascii_suffix: Option<(std::ops::Range<usize>, bool)>,
     #[cfg(feature = "paged-shaping-frontier")]
@@ -260,6 +273,10 @@ impl MarkdownScriptJob {
             cancelled: false,
             source_borrow_max: 0,
             source_bytes_read: 0,
+            #[cfg(feature = "paged-line-compose")]
+            folds: None,
+            #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+            tables: None,
             #[cfg(feature = "paged-shaping-frontier")]
             completed_ascii_suffix: None,
             #[cfg(feature = "paged-shaping-frontier")]
@@ -280,6 +297,9 @@ impl MarkdownScriptJob {
         self.cancellation.check()
     }
     fn fail(&mut self, error: &MarkdownScriptError) {
+        if matches!(error, MarkdownScriptError::TableRange) {
+            return;
+        }
         self.failed = true;
         self.cancelled = matches!(error, MarkdownScriptError::Cancelled);
         self.store.poison();
@@ -322,6 +342,16 @@ impl MarkdownScriptJob {
         };
         if self.machine.ready {
             step.status = MarkdownScriptStatus::Ready;
+            return Ok(step);
+        }
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if table_rows::advance(self, budget, &mut step)? {
+            self.source_bytes_read += step.bytes;
+            return Ok(step);
+        }
+        #[cfg(feature = "paged-line-compose")]
+        if folds::advance_boundary(self, budget, &mut step)? {
+            self.source_bytes_read += step.bytes;
             return Ok(step);
         }
         #[cfg(feature = "paged-shaping-frontier")]
@@ -367,6 +397,10 @@ impl MarkdownScriptJob {
         let end = start
             .saturating_add(budget.bytes.min(MARKDOWN_SCRIPT_SOURCE_BYTES))
             .min(self.source.byte_len());
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        let end = table_rows::read_end(self, end);
+        #[cfg(feature = "paged-line-compose")]
+        let end = folds::read_end(self, end);
         let mut paused = false;
         let mut failure = None;
         let source = &self.source;
@@ -491,6 +525,10 @@ impl MarkdownScriptJob {
             self.fail(&error);
             return Err(error);
         }
+        #[cfg(feature = "paged-line-compose")]
+        if folds::hidden(self, unit, offset) {
+            return Err(MarkdownScriptError::FoldedRange);
+        } // 真实 Source 首错已核；隐藏查询不代表任务损坏，不撤销仍有效的可见 run。
         let result = self.find_run(unit, offset);
         let result = match self.source.health() {
             Err(error) => Err(error.into()),
@@ -509,6 +547,14 @@ impl MarkdownScriptJob {
         unit: MarkdownScriptUnit,
         offset: usize,
     ) -> Result<MarkdownScriptAnswer> {
+        #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+        if table_rows::hidden(self, unit, offset)? {
+            return Err(MarkdownScriptError::TableRange);
+        }
+        #[cfg(feature = "paged-line-compose")]
+        if folds::hidden(self, unit, offset) {
+            return Err(MarkdownScriptError::FoldedRange);
+        } // 稳定前缀也不能绕过 run_at 的隐藏权限，把后继脚本误授给未分析正文。
         let end = match unit {
             MarkdownScriptUnit::Byte => self.source.byte_len(),
             MarkdownScriptUnit::Utf16 => self.source.utf16_len(),
@@ -573,5 +619,22 @@ impl MarkdownScriptJob {
     pub fn close(mut self) -> Result<()> {
         // 不因取消跳过清理；两个真实owner都尝试close，之后字段析构交还原Source。
         self.store.close()
+    }
+}
+
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-line-compose",
+    feature = "paged-shaping-frontier"
+))]
+impl MarkdownScriptJob {
+    /// 原 SCX 游标真正越过行尾才可恢复后继正文，已读取字节总量不代表这个事实。
+    pub(crate) fn table_passed(&self, end: usize) -> bool {
+        self.machine.utf16 >= end
+    }
+    /// 新行结构撤销可能跨该行的原 suffix 试次，后继 job 仍沿原预算和同一 Source 前进。
+    pub(crate) fn table_announced(&mut self) {
+        self.printable = None;
+        self.completed_ascii_suffix = None;
     }
 }

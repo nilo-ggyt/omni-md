@@ -4,13 +4,12 @@ use super::{coverage_binary_cached, coverage_index, covered, glyph_class, glyph_
 use crate::buffer::GlyphInfo;
 use crate::ot::apply::ApplyContext;
 use crate::ot::apply::{
-    Apply, BinaryCache, ChainContextClassCaches, ChainContextFormat2Cache, ContextFormat2Cache,
+    apply_lookup, match_always, match_backtrack, match_glyph, match_input, match_lookahead, Apply,
+    BinaryCache, ChainContextClassCaches, ChainContextFormat2Cache, ContextFormat2Cache,
     MappingCache, MaySkip, RuleSetDigest, SkippingIterator, SubtableExternalCache,
-    SubtableExternalCacheMode, WouldApply, WouldApplyContext, apply_lookup, match_always,
-    match_backtrack, match_glyph, match_input, match_lookahead,
+    SubtableExternalCacheMode, WouldApply, WouldApplyContext,
 };
 use crate::ot::{ClassDefInfo, CoverageInfo};
-use read_fonts::FontData;
 use read_fonts::tables::gsub::ClassDef;
 use read_fonts::tables::layout::{
     ChainedClassSequenceRule, ChainedSequenceContextFormat1, ChainedSequenceContextFormat2,
@@ -18,6 +17,7 @@ use read_fonts::tables::layout::{
     SequenceContextFormat2, SequenceContextFormat3, SequenceLookupRecord, SequenceRule,
 };
 use read_fonts::types::{BigEndian, FixedSize, GlyphId, Offset16};
+use read_fonts::FontData;
 
 fn context_rule_set_digests(table: &SequenceContextFormat2<'_>) -> Box<[RuleSetDigest]> {
     table

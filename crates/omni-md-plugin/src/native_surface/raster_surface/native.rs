@@ -193,7 +193,7 @@ define_class!(
         fn received_set_needs_layout(&self, viewport: &NSTextViewportLayoutController) {
             // 只消费系统交付的实际回调，不自行发事件、重排或定时查询；计数耗尽永久失败而不回绕。
             let Some(sequence) = self.ivars().received_layout_calls.get().checked_add(1) else {
-                self.fail_first_paint(); return;
+                self.ivars().counters.fail(); return;
             };
             self.ivars().received_layout_calls.set(sequence);
             let available = objc2::available!(macos = 27.0);
@@ -254,7 +254,7 @@ define_class!(
             let sequence = if self.ivars().forward_configure {
                 // 仅对真实交付回调计数；固定日志预算之外仍核耗尽，不回绕生成伪序号。
                 let Some(sequence) = self.ivars().forward_configure_calls.get().checked_add(1) else {
-                    self.fail_first_paint(); return;
+                    self.ivars().counters.fail(); return;
                 };
                 self.ivars().forward_configure_calls.set(sequence);
                 Some(sequence)
@@ -351,15 +351,6 @@ define_class!(
 );
 
 impl NativeMarkdownRasterViewportProxy {
-    fn fail_first_paint(&self) {
-        // 原 owner 仍活时在主线程终止其等待；失去 owner 只记失败，不能换另一会话或持强回链。
-        if let Some(owner) = self.ivars().owner.upgrade() {
-            owner.fail_first_paint();
-        } else {
-            self.ivars().counters.fail();
-        }
-    }
-
     pub(super) fn new(
         owner: &Rc<NativeMarkdownRasterSurface>,
         viewport: &NSTextViewportLayoutController,
@@ -440,17 +431,17 @@ impl NativeMarkdownRasterViewportProxy {
         }
         let Some(owner) = self.ivars().owner.upgrade() else {
             // 活动代理失去原owner属于结构失败，不能转入另一个图或原GPU配置路径。
-            self.fail_first_paint();
+            self.ivars().counters.fail();
             return None;
         };
         let _operation = OperationGuard::new(Arc::clone(&owner.counters));
         let Some(view) = owner.graph.view.load() else {
-            owner.fail_first_paint();
+            owner.counters.fail();
             return None;
         };
         let _view_payload = PayloadUseGuard::enter(&view.ivars().payload_use_depth);
         let Some(storage) = owner.graph.storage.load() else {
-            owner.fail_first_paint();
+            owner.counters.fail();
             return None;
         };
         let _storage_payload = PayloadUseGuard::enter(&storage.ivars().payload_use_depth);
@@ -462,7 +453,7 @@ impl NativeMarkdownRasterViewportProxy {
             }
             Err(error) => {
                 self.trace_failure(kind, &error);
-                owner.fail_first_paint();
+                owner.counters.fail();
                 return None;
             }
         };
@@ -487,7 +478,7 @@ impl NativeMarkdownRasterViewportProxy {
             Ok(value) => Some(value),
             Err(error) => {
                 self.trace_failure(kind, &error);
-                owner.fail_first_paint();
+                owner.counters.fail();
                 None
             }
         }

@@ -27,116 +27,6 @@ pub(super) struct NativeMarkdownPendingTableAppend {
     phase: Cell<AppendPhase>,
     core: RefCell<Option<MarkdownTableWindowRequest>>,
     committed: RefCell<Option<Rc<NativeMarkdownCommittedSelection>>>,
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    probe_receipt: Option<Rc<NativeMarkdownTableAppendReceipt>>,
-}
-
-/// 诊断只报告原动作的真实终点；取消或失败须明确此前是否已经原子提交正文。
-#[cfg(feature = "native-markdown-runtime-probe")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum NativeMarkdownTableAppendOutcome {
-    Activated,
-    Cancelled { committed: bool },
-    Failed { committed: bool },
-}
-
-/// 只含 Weak、标量和函数指针；不能持有 Native、正文 root 或 Core 请求 scratch。
-#[cfg(feature = "native-markdown-runtime-probe")]
-pub(super) struct NativeMarkdownTableAppendReceipt {
-    document: WeakMarkdownDocument,
-    generation: u64,
-    coordinate: NativeMarkdownTableCellCoordinate,
-    source: std::ops::Range<usize>,
-    before_input_epoch: u64,
-    accepted_input_epoch: u64,
-    fold_revision: u64,
-    outcome: Cell<Option<NativeMarkdownTableAppendOutcome>>,
-    callback: Cell<Option<fn(NativeMarkdownTableAppendOutcome)>>,
-}
-
-#[cfg(feature = "native-markdown-runtime-probe")]
-impl NativeMarkdownTableAppendReceipt {
-    pub(super) fn outcome(&self) -> Option<NativeMarkdownTableAppendOutcome> {
-        self.outcome.get()
-    }
-
-    /// 原提交前绑定的代次，供独立 driver 验证一次编辑恰好推进一代。
-    pub(super) fn original_generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub(super) fn original_coordinate(&self) -> NativeMarkdownTableCellCoordinate {
-        self.coordinate
-    }
-
-    fn finish(&self, outcome: NativeMarkdownTableAppendOutcome) {
-        if self.outcome.get().is_some() {
-            return; // 一次终点不能被后续槽移除覆盖，重复撤销也不能二次投递。
-        }
-        self.outcome.set(Some(outcome));
-        if let Some(callback) = self.callback.take() {
-            // 仅函数指针与 Copy 结果跨队列；回调合同只 post 下一个事件，不采新权限或运行断言。
-            // exec_async 只负责排队，不保证外层 Native 栈已退出；driver 须守原票并仅 post 独立事件。
-            enqueue_native_markdown_main_task(move || callback(outcome));
-        }
-    }
-
-    fn matches_request(
-        &self,
-        document: &WeakMarkdownDocument,
-        key: NativeMarkdownTableLayoutRequestKey,
-        epoch: u64,
-        fold_revision: u64,
-        original: &NativeMarkdownTableCellEditorState,
-    ) -> bool {
-        self.outcome.get().is_none()
-            && std::rc::Weak::ptr_eq(&self.document, document)
-            && self.generation == key.document_generation
-            && self.accepted_input_epoch == epoch
-            && self.fold_revision == fold_revision
-            && self.coordinate == original.coordinate
-            && self.source == original.source_utf16_range
-    }
-}
-
-/// 请求构造失败也有明确失败终点；移入真实请求后该局部不再拥有完成权。
-#[cfg(feature = "native-markdown-runtime-probe")]
-struct ProbeReceiptAdmission<'a> {
-    view: &'a PieceBackedMarkdownTextView,
-    receipt: Option<Rc<NativeMarkdownTableAppendReceipt>>,
-}
-
-#[cfg(feature = "native-markdown-runtime-probe")]
-impl Drop for ProbeReceiptAdmission<'_> {
-    fn drop(&mut self) {
-        if let Some(receipt) = self.receipt.take() {
-            let current =
-                self.view.ivars().table_input_intent_epoch.get() == receipt.accepted_input_epoch
-                    && self
-                        .view
-                        .ivars()
-                        .folds
-                        .read_is_current(receipt.fold_revision)
-                    && receipt.document.upgrade().is_some_and(|document| {
-                        document.borrow().generation() == receipt.generation
-                    });
-            receipt.finish(if current {
-                NativeMarkdownTableAppendOutcome::Failed { committed: false }
-            } else {
-                NativeMarkdownTableAppendOutcome::Cancelled { committed: false }
-            });
-        }
-    }
-}
-
-#[cfg(feature = "native-markdown-runtime-probe")]
-impl Drop for NativeMarkdownPendingTableAppend {
-    fn drop(&mut self) {
-        // 发布前失败、accepted release 和普通取消均不能遗留一个永远 Pending 的原收据。
-        self.finish_probe(NativeMarkdownTableAppendOutcome::Cancelled {
-            committed: self.probe_was_committed(),
-        });
-    }
 }
 
 /// Complete 才沿原 executor 刷新几何；Progress 不推进输入 epoch，也不要求重绘。
@@ -188,52 +78,6 @@ impl NativeMarkdownPendingTableAppend {
                 && document.utf16_len() == key.document_length
         })
     }
-
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    fn finish_probe(&self, outcome: NativeMarkdownTableAppendOutcome) {
-        if let Some(receipt) = &self.probe_receipt {
-            receipt.finish(outcome);
-        }
-    }
-
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    fn probe_was_committed(&self) -> bool {
-        self.committed.borrow().is_some()
-    }
-
-    /// Native claims 释放后继续核原纯提交票，不重新获取原生图或补签。
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    fn probe_completion_authority_is_current(&self, view: &PieceBackedMarkdownTextView) -> bool {
-        let key = self.key.get();
-        view.owns_table_append(self)
-            && !view.ivars().textkit_graph_teardown.get()
-            && view.ivars().table_input_intent_epoch.get() == self.input_epoch
-            && self.commit().is_some_and(|receipt| receipt.current())
-            && self.identity.upgrade().is_some_and(|document| {
-                let document = document.borrow();
-                document.generation() == key.document_generation
-                    && document.utf16_len() == key.document_length
-            })
-    }
-
-    /// Activated 还要求刚消费的新格几何属于同一批 width/source；缺少几何不能升级为成功。
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    fn probe_activation_is_current(&self, view: &PieceBackedMarkdownTextView) -> bool {
-        let key = self.key.get();
-        self.probe_completion_authority_is_current(view)
-            && view
-                .ivars()
-                .visible_table_layout_cache
-                .borrow()
-                .as_ref()
-                .is_some_and(|cache| {
-                    cache.request_key.document_generation == key.document_generation
-                        && cache.request_key.document_length == key.document_length
-                        && cache.request_key.presentation_mode == key.presentation_mode
-                        && cache.request_key.text_view_width == key.text_view_width
-                        && std::rc::Weak::ptr_eq(&cache.document_identity, &self.identity)
-                })
-    }
 }
 
 impl PieceBackedMarkdownTextView {
@@ -261,89 +105,13 @@ impl PieceBackedMarkdownTextView {
                 None
             }
         };
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        if previous.is_some() {
-            request.finish_probe(NativeMarkdownTableAppendOutcome::Cancelled {
-                committed: request.probe_was_committed(),
-            }); // 已 Activated/Failed 的原收据不会被此正常移除覆盖。
-        }
         drop(previous); // Core scratch、Weak 和纯 receipt 最后一个 owner 都在 RefMut 结束后释放。
     }
 
-    /// 取消只取当前唯一槽，不清理字段内容；实际输入仍由原 field editor 保留。
+    /// 取消仅取走当前原请求；Core scratch和弱身份在RefMut结束后归还，不动活动格的草稿。
     pub(super) fn cancel_pending_table_append(&self) {
-        let previous = { self.ivars().table_append.borrow_mut().take() };
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        if let Some(request) = &previous {
-            request.finish_probe(NativeMarkdownTableAppendOutcome::Cancelled {
-                committed: request.probe_was_committed(),
-            });
-        }
+        let previous = self.ivars().table_append.borrow_mut().take();
         drop(previous);
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        self.cancel_predeclared_table_append_receipt(false);
-    }
-
-    /// 必须与随后唯一生产 navigate 调用处于同一同步栈，中间不得调用 Native 或投递其他动作。
-    /// 原导航已固定会 advance 一次输入 epoch；本收据只接受这一代，不能被后继 Tab 借用。
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    pub(super) fn probe_prepare_table_append_receipt(
-        &self,
-        document: &SharedMarkdownDocument,
-        callback: fn(NativeMarkdownTableAppendOutcome),
-    ) -> Result<Rc<NativeMarkdownTableAppendReceipt>, String> {
-        let before_input_epoch = self.ivars().table_input_intent_epoch.get();
-        let fold_revision = self.ivars().folds.revision();
-        if !self.ivars().folds.read_is_current(fold_revision)
-            || !self.ivars().folds.matches_document(document)
-            || self.ivars().textkit_graph_teardown.get()
-            || self.table_append_pending()
-            || self.ivars().table_append_probe_receipt.borrow().is_some()
-        {
-            return Err("末格验收的原动作权限不可用".into());
-        }
-        let (coordinate, source) = self
-            .ivars()
-            .active_table_cell
-            .borrow()
-            .as_ref()
-            .map(|active| (active.coordinate, active.source_utf16_range.clone()))
-            .ok_or("末格验收缺少活动草稿")?;
-        let receipt = Rc::new(NativeMarkdownTableAppendReceipt {
-            document: Rc::downgrade(document),
-            generation: document.borrow().generation(),
-            coordinate,
-            source,
-            before_input_epoch,
-            accepted_input_epoch: before_input_epoch
-                .checked_add(1)
-                .ok_or("表格输入代次已达上限")?,
-            fold_revision,
-            outcome: Cell::new(None),
-            callback: Cell::new(Some(callback)),
-        });
-        self.ivars()
-            .table_append_probe_receipt
-            .replace(Some(Rc::clone(&receipt)));
-        Ok(receipt)
-    }
-
-    /// 首次 navigate 的现有撤权调用只消费预声明的一次 advance；其余新输入或 close 都取消。
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    pub(super) fn cancel_predeclared_table_append_receipt(&self, closing: bool) {
-        let previous = {
-            let mut slot = self.ivars().table_append_probe_receipt.borrow_mut();
-            if slot.as_ref().is_some_and(|receipt| {
-                closing || self.ivars().table_input_intent_epoch.get() != receipt.before_input_epoch
-            }) {
-                slot.take()
-            } else {
-                None
-            }
-        };
-        if let Some(receipt) = previous {
-            receipt.finish(NativeMarkdownTableAppendOutcome::Cancelled { committed: false });
-        }
     }
 
     pub(super) fn table_append_pending(&self) -> bool {
@@ -366,11 +134,6 @@ impl PieceBackedMarkdownTextView {
         fold_revision: u64,
     ) -> Result<(), String> {
         let _payload = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        let mut probe_admission = ProbeReceiptAdmission {
-            view: self,
-            receipt: self.ivars().table_append_probe_receipt.borrow_mut().take(),
-        }; // 在首 Native 前绑定原预声明；任何早退由同一局部失败出口完成。
         let original_coordinate = original.coordinate;
         let original_range = original.source_utf16_range.clone();
         let initial = || {
@@ -437,13 +200,6 @@ impl PieceBackedMarkdownTextView {
                 .map_err(|_| "无法准备真实表尾验证，草稿将保持打开")?
         };
         let identity = Rc::downgrade(&document);
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        if let Some(receipt) = &probe_admission.receipt
-            && !receipt.matches_request(&identity, key, epoch, fold_revision, &original)
-        {
-            receipt.finish(NativeMarkdownTableAppendOutcome::Cancelled { committed: false });
-            probe_admission.receipt = None; // 不匹配的预声明不能附到另一真实 Tab 上。
-        }
         let request = Rc::new(NativeMarkdownPendingTableAppend {
             identity,
             key: Cell::new(key),
@@ -455,8 +211,6 @@ impl PieceBackedMarkdownTextView {
             phase: Cell::new(AppendPhase::ResolveNext),
             core: RefCell::new(Some(core)),
             committed: RefCell::new(None),
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            probe_receipt: probe_admission.receipt.take(),
         });
         let admitted = initial()
             && self.table_input_intent_is_current(&storage, &request.identity, key, epoch);
@@ -535,16 +289,6 @@ impl PieceBackedMarkdownTextView {
                     Err(error) => {
                         let report = request.current(self, &storage);
                         drop(storage); // 收据排队前释放本分支的临时 Native claim，不跨其析构发布。
-                        #[cfg(feature = "native-markdown-runtime-probe")]
-                        request.finish_probe(if report {
-                            NativeMarkdownTableAppendOutcome::Failed {
-                                committed: request.probe_was_committed(),
-                            }
-                        } else {
-                            NativeMarkdownTableAppendOutcome::Cancelled {
-                                committed: request.probe_was_committed(),
-                            }
-                        });
                         self.discard_table_append(&request);
                         if report {
                             present_native_markdown_error(&error);
@@ -556,16 +300,6 @@ impl PieceBackedMarkdownTextView {
             Err(error) => {
                 let report = request.current(self, &storage);
                 drop(storage); // 原失败首因和 report 保留；回调不在持 storage 的栈内排队。
-                #[cfg(feature = "native-markdown-runtime-probe")]
-                request.finish_probe(if report {
-                    NativeMarkdownTableAppendOutcome::Failed {
-                        committed: request.probe_was_committed(),
-                    }
-                } else {
-                    NativeMarkdownTableAppendOutcome::Cancelled {
-                        committed: request.probe_was_committed(),
-                    }
-                });
                 self.discard_table_append(&request);
                 if report {
                     present_native_markdown_error(&error);
@@ -869,18 +603,6 @@ impl PieceBackedMarkdownTextView {
             && active == Some(target)
             && self.ivars().pending_table_cell_activation.get().is_none();
         drop(storage); // 原激活使用的临时 Native claim 先释放，收据发布不跨越其析构。
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        request.finish_probe(if succeeded && request.probe_activation_is_current(self) {
-            NativeMarkdownTableAppendOutcome::Activated
-        } else if current && request.probe_completion_authority_is_current(self) {
-            NativeMarkdownTableAppendOutcome::Failed {
-                committed: request.probe_was_committed(),
-            }
-        } else {
-            NativeMarkdownTableAppendOutcome::Cancelled {
-                committed: request.probe_was_committed(),
-            }
-        });
         self.discard_table_append(&request);
         if current && !succeeded {
             if self.ivars().pending_table_cell_activation.get() == Some(target) {
@@ -1046,35 +768,5 @@ mod tests {
         assert!(validate_append_window(&first, &window, 0, &active).is_ok());
         assert!(validate_append_window(&second, &window, 0, &active).is_err());
         assert!(validate_append_window(&first, &window, 1, &active).is_err());
-    }
-
-    /// 失败已签发就不能被正常槽移除或迟到成功覆盖；committed 事实也不得丢失。
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    #[test]
-    fn terminal_receipt_keeps_first_outcome_and_commit_fact() {
-        let coordinate = NativeMarkdownTableCellCoordinate {
-            table_utf16_start: 0,
-            row_index: 1,
-            column_index: 1,
-        };
-        let receipt = NativeMarkdownTableAppendReceipt {
-            document: WeakMarkdownDocument::new(),
-            generation: 3,
-            coordinate,
-            source: 0..0,
-            before_input_epoch: 4,
-            accepted_input_epoch: 5,
-            fold_revision: 6,
-            outcome: Cell::new(None),
-            callback: Cell::new(None),
-        };
-        assert_eq!(receipt.outcome(), None);
-        assert_eq!(receipt.original_generation(), 3);
-        assert_eq!(receipt.original_coordinate(), coordinate);
-        let failure = NativeMarkdownTableAppendOutcome::Failed { committed: true };
-        receipt.finish(failure);
-        receipt.finish(NativeMarkdownTableAppendOutcome::Activated);
-        receipt.finish(NativeMarkdownTableAppendOutcome::Cancelled { committed: false });
-        assert_eq!(receipt.outcome(), Some(failure));
     }
 }

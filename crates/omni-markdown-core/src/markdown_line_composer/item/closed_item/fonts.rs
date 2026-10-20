@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// 只接原自然闭项或首Positioning拒绝；最多持当前Font段和一个后继，不随文档长度增长。
+/// 只接原自然闭项或首定位/跨输入计划拒绝；最多持当前Font段和一个后继，不随文档长度增长。
 pub(in crate::markdown_line_composer::item) struct FontRuns {
     source: MarkdownLayoutTextAuthority,
     scope: Arc<()>,
@@ -15,11 +15,46 @@ pub(in crate::markdown_line_composer::item) struct FontRuns {
     probe: Option<Probe>,
     run: Option<Run>,
     emit: Option<Run>,
-    endpoints: [Option<MarkdownCertifiedGraphemeEndpoint>; 2],
+    endpoints: [Option<CertifiedShapingEndpoint>; 2],
+    shaping_seams: [Option<ResolvedBidiShapingSeam>; 2],
     awaiting: Option<(Range<usize>, MarkdownLayoutFontAuthority)>,
     child: Option<std::sync::Weak<()>>,
     // 首项计划拒绝时只有真实不同Font可封口；开放SCX端点和预算都不是自然右界。
     frontier_head: bool,
+    audit: Option<FontAudit>,
+}
+
+/// 审核只借原自然项或刚封存的安全part；后者的末端不是新Font的自然边界。
+enum FontAuditOrigin {
+    Natural,
+    Frontier,
+}
+struct FontAudit {
+    // palette仍是注册的唯一强owner；在途审核不延长Native字体，也不创建第二字体目录。
+    preferred: MarkdownLineFontRegistration,
+    origin: FontAuditOrigin,
+    range: Range<usize>,
+}
+impl FontAudit {
+    fn new(
+        preferred: Option<MarkdownLineFontRegistration>,
+        selected: &MarkdownLayoutFont,
+        origin: FontAuditOrigin,
+        range: Range<usize>,
+    ) -> Result<Option<Self>> {
+        let Some(preferred) = preferred else {
+            return Ok(None);
+        };
+        let primary = preferred.lease()?;
+        if selected.permits(&primary.font().authority()) {
+            return Ok(None); // 真选中原base时无需为整个窗口增加同一份选择审核。
+        }
+        Ok(Some(Self {
+            preferred,
+            origin,
+            range,
+        }))
+    }
 }
 
 /// 只对应同一原项的字形检查、GCB试次和Font段交付，不承接调度或Source重捕。
@@ -34,12 +69,14 @@ enum Phase {
     Probe,
     Emit,
     AwaitChild,
+    ReuseOriginal,
+    UncertifiedSupport,
 }
 
 /// 范围来自原GCB的Next及两张端点票；尚未完整取得时不能签发字体请求。
 struct Probe {
     range: Range<usize>,
-    endpoints: [Option<MarkdownCertifiedGraphemeEndpoint>; 2],
+    endpoints: [Option<CertifiedShapingEndpoint>; 2],
 }
 
 /// 当前范围只随真实GCB响应推进；封口只认Font变化或自然端点，Font不按名字重建。
@@ -56,8 +93,15 @@ impl FontRuns {
         registration: Option<MarkdownLineFontRegistration>,
         style: MarkdownLineComposeStyle,
         facts: MarkdownLineItemFacts,
-    ) -> Self {
-        Self {
+        preferred: Option<MarkdownLineFontRegistration>,
+    ) -> Result<Self> {
+        let audit = FontAudit::new(
+            preferred,
+            &original,
+            FontAuditOrigin::Natural,
+            facts.source_utf16.clone(),
+        )?;
+        Ok(Self {
             source: closed.source.clone(),
             scope: Arc::new(()),
             cancellation: closed.cancellation.clone(),
@@ -74,13 +118,61 @@ impl FontRuns {
             run: None,
             emit: None,
             endpoints: [None, None],
+            shaping_seams: std::array::from_fn(|index| closed.endpoints[index].seam().cloned()),
             awaiting: None,
             child: None,
             frontier_head: false,
-        }
+            audit,
+        })
     }
 
-    /// 仅原首项Positioning拒绝可进入；共享原GCB和Font，尚不创建完整输入或任何字形。
+    /// 只能借真实封存part构造审核范围；不接受调用方坐标或把安全末端升级为新Font末端。
+    pub(in crate::markdown_line_composer::item) fn for_frontier_part(
+        part: &crate::markdown_shaping::frontier::MarkdownShapingFrontierPart,
+        original: MarkdownLayoutFont,
+        registration: Option<MarkdownLineFontRegistration>,
+        style: MarkdownLineComposeStyle,
+        mut facts: MarkdownLineItemFacts,
+        preferred: Option<MarkdownLineFontRegistration>,
+    ) -> Result<Option<Self>> {
+        let Some(audit) = FontAudit::new(
+            preferred,
+            &original,
+            FontAuditOrigin::Frontier,
+            part.shaping_range(),
+        )?
+        else {
+            return Ok(None);
+        };
+        facts.source_utf16 = part.certified_range();
+        // 审核上界来自已经完成的原安全窗口，而非整个SCX/样式run；4MiB同Font正文
+        // 每次也只审这一固定part。原Job仍在父item槽，累计Source/metadata配额没有重置。
+        let start = audit.range.start;
+        Ok(Some(Self {
+            source: part.source_authority().clone(),
+            scope: Arc::new(()),
+            cancellation: part.cancellation(),
+            original,
+            registration,
+            style,
+            facts,
+            phase: Phase::Probe,
+            probe: Some(Probe {
+                range: start..start,
+                endpoints: [None, None],
+            }),
+            run: None,
+            emit: None,
+            endpoints: [None, None],
+            shaping_seams: part.shaping_seams().clone(),
+            awaiting: None,
+            child: None,
+            frontier_head: false,
+            audit: Some(audit),
+        }))
+    }
+
+    /// 仅原首项定位或跨输入计划拒绝可进入；共享原GCB和Font，尚不创建完整输入或任何字形。
     pub(in crate::markdown_line_composer::item) fn frontier_head(
         source: MarkdownLayoutTextAuthority,
         original: MarkdownLayoutFont,
@@ -88,6 +180,7 @@ impl FontRuns {
         style: MarkdownLineComposeStyle,
         facts: MarkdownLineItemFacts,
         cancellation: MarkdownShapingCancellation,
+        shaping_seams: [Option<ResolvedBidiShapingSeam>; 2],
     ) -> Self {
         let start = facts.source_utf16.start;
         Self {
@@ -106,16 +199,58 @@ impl FontRuns {
             run: None,
             emit: None,
             endpoints: [None, None],
+            shaping_seams,
             awaiting: None,
             child: None,
             frontier_head: true,
+            audit: None,
         }
+    }
+
+    /// 仅原相邻语义票加完整右GCB的实际不同Font，才可调用此内部转移。
+    /// 原head试次已证明左短项内没有更早Font边界；右字素未消费，等左child归还再重新请求。
+    #[cfg(feature = "s2-table-window-prototype")]
+    pub(in crate::markdown_line_composer::item) fn style_boundary(
+        source: MarkdownLayoutTextAuthority,
+        original: MarkdownLayoutFont,
+        registration: Option<MarkdownLineFontRegistration>,
+        style: MarkdownLineComposeStyle,
+        facts: MarkdownLineItemFacts,
+        cancellation: MarkdownShapingCancellation,
+        shaping_seams: [Option<ResolvedBidiShapingSeam>; 2],
+    ) -> Self {
+        let emit = Run {
+            range: facts.source_utf16.clone(),
+            font: original.clone(),
+            registration: registration.clone(),
+        };
+        let mut fonts = Self::frontier_head(
+            source,
+            original,
+            registration,
+            style,
+            facts,
+            cancellation,
+            shaping_seams,
+        );
+        fonts.probe = None;
+        fonts.emit = Some(emit);
+        fonts.phase = Phase::Emit;
+        fonts
     }
 
     /// 原Job真实Ready之后才领取glyph计数；分段子Job不再次递归触发同一字体选择。
     fn inspect(&mut self, item: &mut MarkdownLineItem) -> Result<bool> {
         if let Phase::Scan { count, .. } = &mut self.phase {
             *count = item.job.profile()?.glyph_count;
+            if let Some(audit) = &self.audit {
+                let start = audit.range.start;
+                self.probe = Some(Probe {
+                    range: start..start,
+                    endpoints: [None, None],
+                });
+                self.phase = Phase::Probe;
+            } // 原Ready Job仍在唯一item槽；优先字体审核不为首GCB或整个窗口重新shape。
             return Ok(true);
         }
         Ok(false)
@@ -124,7 +259,15 @@ impl FontRuns {
     /// 当前段到自然末端即可输出，否则只探测紧邻的完整GCB，绝不按预算制造Font边界。
     fn following(&mut self) {
         let run = self.run.as_ref().expect("原闭项仍持当前真实Font段");
-        if run.range.end == self.facts.source_utf16.end && !self.frontier_head {
+        let end = self
+            .audit
+            .as_ref()
+            .map_or(self.facts.source_utf16.end, |audit| audit.range.end);
+        if run.range.end == end && !self.frontier_head {
+            if self.audit.is_some() {
+                self.phase = Phase::ReuseOriginal;
+                return; // 全窗口实际仍选同Font，原glyph与continuation无需任何改写。
+            }
             self.emit = self.run.take();
             self.phase = Phase::Emit;
         } else {
@@ -135,6 +278,28 @@ impl FontRuns {
             self.phase = Phase::Probe;
         }
     }
+
+    /// 只返回原 item 精确两端的真实 UBA 票；Font/GCB 中间坐标不能从范围自行补签。
+    fn seam_at(&self, offset: usize) -> Result<Option<ResolvedBidiShapingSeam>> {
+        seam_at(&self.shaping_seams, &self.source, offset)
+    }
+
+    fn seams_for(&self, range: &Range<usize>) -> Result<[Option<ResolvedBidiShapingSeam>; 2]> {
+        Ok([self.seam_at(range.start)?, self.seam_at(range.end)?])
+    }
+}
+
+fn seam_at(
+    seams: &[Option<ResolvedBidiShapingSeam>; 2],
+    source: &MarkdownLayoutTextAuthority,
+    offset: usize,
+) -> Result<Option<ResolvedBidiShapingSeam>> {
+    for seam in seams.iter().flatten() {
+        if seam.boundary(source)?.1 == offset {
+            return Ok(Some(seam.clone()));
+        }
+    }
+    Ok(None)
 }
 
 pub(in crate::markdown_line_composer::item) fn inspect_shaped(
@@ -178,6 +343,7 @@ pub(in crate::markdown_line_composer::item) fn provide_font_style(
     let probe = fonts.probe.as_ref().expect("原NeedStyle来自一个完整GCB");
     if fonts.source != *authority
         || response.coverage != probe.range
+        || response.style.presentation != fonts.style.presentation
         || response.style.points.to_bits() != fonts.style.points.to_bits()
         || response.style.language != fonts.style.language
         || response.style.features != fonts.style.features
@@ -189,6 +355,10 @@ pub(in crate::markdown_line_composer::item) fn provide_font_style(
         if !response.font.permits(&actual.font().authority()) {
             return Err(MarkdownLineComposeError::SourceMismatch);
         }
+    }
+    if fonts.audit.is_some() {
+        // 与“缺字修复”用途区分：首GCB仍选原Font是正常选择结果，不能据此提前跳过后继base恢复。
+        return provide_audit_style(payload, response);
     }
     let first = fonts.run.is_none();
     if first && !fonts.frontier_head && response.font.permits(&fonts.original.authority()) {
@@ -240,6 +410,88 @@ pub(in crate::markdown_line_composer::item) fn provide_font_style(
     }
     payload.request.take();
     payload.font_probe_scope.take(); // 响应消费后原试字票立即失效，后继不能复用旧nonce。
+    Ok(())
+}
+
+/// 审核原Ready窗口的真实字体策略；只保当前同Font段，在首次变化后交还未消费余文。
+fn provide_audit_style(payload: &mut Payload, response: MarkdownLineStyleResponse) -> Result<()> {
+    let fonts = payload.closed_fonts.as_mut().expect("原字体审核owner仍活");
+    let audit = fonts.audit.as_ref().expect("审核响应只进入原审核用途");
+    let preferred = response
+        .preferred_registration
+        .as_ref()
+        .ok_or(MarkdownLineComposeError::SourceMismatch)?;
+    if !preferred
+        .authority()?
+        .same_payload(&audit.preferred.authority()?)
+    {
+        return Err(MarkdownLineComposeError::SourceMismatch);
+    } // 相同文字不能替代原语义base身份；每个实际试次仍属于同一原样式/注册。
+    if fonts.run.is_none()
+        && !response.font.permits(&fonts.original.authority())
+        && matches!(audit.origin, FontAuditOrigin::Frontier)
+    {
+        // 后续安全part的首GCB可恰好恢复base；前一part已真实消费，这里没有可输出的旧Font首段。
+        // 先归还未发布的旧Job，再退役原parent及其整part continuation；同cursor重新ItemStart，
+        // 不能输出空run、拒绝合法变化或伪造已经消费到该part末端。原Source/Script/Breaks照常保留。
+        let at_head = fonts.probe.as_ref().expect("原审核仍持GCB").range.start == payload.cursor;
+        drop(payload.item.take());
+        if !at_head {
+            // 变化落在中心之前的左支持内，不能把它伪称为当前cursor的新Font起点。
+            fonts.phase = Phase::UncertifiedSupport;
+            payload.request.take();
+            payload.font_probe_scope.take();
+            payload.stage = Stage::ClosedFonts;
+            return Ok(());
+        }
+        drop(payload.frontier.take());
+        payload.closed_fonts = None;
+        payload.request.take();
+        payload.font_probe_scope.take();
+        payload.stage = Stage::ItemStart;
+        return Ok(());
+    }
+    let range = fonts.probe.take().expect("原完整GCB试次仍在").range;
+    match &mut fonts.run {
+        None => {
+            if !response.font.permits(&fonts.original.authority()) {
+                return Err(MarkdownLineComposeError::SourceMismatch);
+            } // 首GCB已由发起响应选择过；同Source/语义未变时不能悄悄改写原首Font事实。
+            fonts.run = Some(Run {
+                range,
+                font: response.font,
+                registration: response.registration,
+            });
+            fonts.following();
+        }
+        Some(run) if response.font.permits(&run.font.authority()) => {
+            run.range.end = range.end;
+            fonts.following();
+        }
+        Some(_) => {
+            if fonts.run.as_ref().expect("原连续Font段仍在").range.start != payload.cursor {
+                // 有上下文计划的左支持不能裸裁掉；缺少同计划重形中心票时明确保持未认证，
+                // 不发布已知使用错误支持字体的旧Job，也不把预算末端签为新Font自然边界。
+                drop(payload.item.take());
+                fonts.phase = Phase::UncertifiedSupport;
+                payload.request.take();
+                payload.font_probe_scope.take();
+                payload.stage = Stage::ClosedFonts;
+                return Ok(());
+            }
+            fonts.emit = fonts.run.take();
+            fonts.frontier_head = true;
+            fonts.phase = Phase::Emit;
+            // 原Job包含已发现字体选择不同的后文，先真实归还再建立自然首段，绝不同时保两张主字形图。
+            // 后继Font必须在首段child归还后从真实b回ItemStart取得自己计划；旧part末端不给它闭项权。
+            drop(payload.item.take());
+            // 旧Frontier的child弱身份现在只反映旧Job已归还；continuation仍记录整part原末端。
+            // 它绝不传给resume；后续AwaitChild只等本次自然首段再真正释放后整体退役原parent。
+        }
+    }
+    payload.request.take();
+    payload.font_probe_scope.take();
+    payload.stage = Stage::ClosedFonts;
     Ok(())
 }
 
@@ -354,6 +606,28 @@ pub(in crate::markdown_line_composer::item) fn advance_fonts(
                 } // 最后一段真实释放后才归还原Font/有限样式，不保活历史Job或Source。
             }
         }
+        Phase::ReuseOriginal => {
+            let item = payload
+                .item
+                .as_mut()
+                .expect("未变化审核仍持唯一原Ready Job");
+            let audit = fonts.audit.as_ref().expect("复用只属于原字体审核");
+            audit.preferred.lease()?;
+            if item.facts.source_utf16 != fonts.facts.source_utf16
+                || !fonts.original.permits(&item.font)
+            {
+                return Err(MarkdownLineComposeError::SourceMismatch);
+            }
+            let count = item.job.profile()?.glyph_count;
+            item.job.glyph(authority, &item.font, count)?;
+            step.answer = MarkdownLineItemAnswer::ItemReady(item.facts.clone());
+            payload.closed_fonts = None;
+            payload.stage = Stage::Ready;
+        } // Frontier原parent/child弱票及continuation未改动；自然项也复用原完整Job，不重复shape。
+        Phase::UncertifiedSupport => {
+            step.answer =
+                MarkdownLineItemAnswer::NeedsFrontier(MarkdownLineFrontierReason::UncertifiedWord);
+        }
     }
     Ok(step)
 }
@@ -374,9 +648,17 @@ fn prepare_probe(
                 .as_ref()
                 .is_some_and(|run| run.range.len() > MAX_CLOSED_UTF16))
     {
-        step.answer =
-            MarkdownLineItemAnswer::NeedsFrontier(MarkdownLineFrontierReason::UnsupportedPlan);
-        return Ok(step); // 未出现真实不同Font，不能把开放SCX上界或有限闭段上限伪装为右边界。
+        // 这次同 Font 探测没有取得自然右界，不能发布预算截断段，也不能覆盖原计划更精确的拒绝。
+        // 原 Frontier 从未交出 child；只销毁本次试字 owner，回到同一 Source/SCX/词域续体。
+        payload
+            .frontier
+            .as_mut()
+            .expect("首 Font 探测仍归原 Frontier")
+            .decline_font_head();
+        let retired = payload.closed_fonts.take();
+        payload.stage = Stage::Frontier;
+        drop(retired); // 归还本次 Font 段/试次 scope；旧字体请求不能延长或重启已拒探测。
+        return Ok(step);
     }
     if probe.range.is_empty() {
         step.metadata_units += 1;
@@ -386,10 +668,17 @@ fn prepare_probe(
             MarkdownGraphemeQuery::Next,
         )? {
             MarkdownGraphemeAnswer::Pending => return Ok(step),
-            MarkdownGraphemeAnswer::Known(Some(end))
-                if end.utf16 > probe.range.start && end.utf16 <= fonts.facts.source_utf16.end =>
-            {
-                probe.range.end = end.utf16
+            MarkdownGraphemeAnswer::Known(Some(end)) if end.utf16 > probe.range.start => {
+                let limit = fonts
+                    .audit
+                    .as_ref()
+                    .map_or(fonts.facts.source_utf16.end, |audit| audit.range.end);
+                if end.utf16 > limit
+                    && seam_at(&fonts.shaping_seams, &fonts.source, limit)?.is_none()
+                {
+                    return Err(MarkdownLineComposeError::InconsistentCoverage);
+                }
+                probe.range.end = end.utf16.min(limit); // 只有原 UBA 自然端点可截交本地 shaping 段。
             }
             _ => return Err(MarkdownLineComposeError::InconsistentCoverage),
         }
@@ -408,8 +697,16 @@ fn prepare_probe(
         match answer {
             MarkdownGraphemeAnswer::Pending => return Ok(step),
             MarkdownGraphemeAnswer::Known(Some(value)) if value.utf16 == offset => {
-                probe.endpoints[index] =
-                    Some(endpoint.ok_or(MarkdownLineComposeError::InconsistentCoverage)?);
+                probe.endpoints[index] = Some(CertifiedShapingEndpoint::Grapheme {
+                    proof: endpoint.ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
+                    seam: seam_at(&fonts.shaping_seams, &fonts.source, offset)?,
+                });
+            }
+            MarkdownGraphemeAnswer::Known(None) => {
+                probe.endpoints[index] = Some(CertifiedShapingEndpoint::Bidi(
+                    seam_at(&fonts.shaping_seams, &fonts.source, offset)?
+                        .ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
+                ));
             }
             _ => return Err(MarkdownLineComposeError::InconsistentCoverage),
         }
@@ -418,10 +715,28 @@ fn prepare_probe(
         nonce: Arc::new(()),
         source: authority.clone(),
         range: probe.range.clone(),
-        paragraph: fonts.facts.paragraph_utf16.clone(),
-        script: fonts.facts.script,
-        level: fonts.facts.level,
+        scope: StyleScope::Text(TextStyleScope {
+            paragraph: fonts.facts.paragraph_utf16.clone(),
+            script: fonts.facts.script,
+            level: fonts.facts.level,
+        }),
+        shaping_seams: [
+            seam_at(&fonts.shaping_seams, &fonts.source, probe.range.start)?,
+            seam_at(&fonts.shaping_seams, &fonts.source, probe.range.end)?,
+        ],
         continuation_font: Some(fonts.original.authority()),
+        continuation_bytes: Some(
+            probe.endpoints[0]
+                .as_ref()
+                .expect("原闭项 GCB 起点已认证")
+                .boundary(authority)?
+                .byte
+                ..probe.endpoints[1]
+                    .as_ref()
+                    .expect("原闭项 GCB 终点已认证")
+                    .boundary(authority)?
+                    .byte,
+        ),
     };
     payload.request = Some(request.clone());
     payload.font_probe_scope = Some(Arc::new(()));
@@ -453,8 +768,17 @@ fn prepare_run(
         match answer {
             MarkdownGraphemeAnswer::Pending => return Ok(step),
             MarkdownGraphemeAnswer::Known(Some(value)) if value.utf16 == offset => {
-                fonts.endpoints[index] =
-                    Some(endpoint.ok_or(MarkdownLineComposeError::InconsistentCoverage)?);
+                fonts.endpoints[index] = Some(CertifiedShapingEndpoint::Grapheme {
+                    proof: endpoint.ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
+                    seam: fonts.seam_at(offset)?,
+                });
+            }
+            MarkdownGraphemeAnswer::Known(None) => {
+                fonts.endpoints[index] = Some(CertifiedShapingEndpoint::Bidi(
+                    fonts
+                        .seam_at(offset)?
+                        .ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
+                ));
             }
             _ => return Err(MarkdownLineComposeError::InconsistentCoverage),
         }
@@ -465,15 +789,26 @@ fn prepare_run(
         .map(|value| value.take().expect("原Font段两张GCB票齐备"));
     let first = endpoints[0].boundary(authority)?;
     let last = endpoints[1].boundary(authority)?;
+    endpoints[0].require_pair(&endpoints[1], authority)?;
+    // 普通闭项仍受原256 UTF16上限约束。已封存Frontier窗口另有原256 scalar/1024 byte
+    // 证明，非BMP不能被误按UTF16单位扩成两倍工作；此用途只构造过真实part，并仍限制在其内。
+    // 这里只为已实测字体变化之前的旧Font首段保留该原预算，不把安全窗口末端授给后继新Font。
     if fonts.source != *authority
-        || !endpoints[0].same_scope(&endpoints[1])
         || first.utf16 != payload.cursor
         || first.utf16 != run.range.start
         || last.utf16 != run.range.end
         || first.utf16 < fonts.facts.source_utf16.start
-        || last.utf16 > fonts.facts.source_utf16.end
+        || last.utf16
+            > fonts
+                .audit
+                .as_ref()
+                .map_or(fonts.facts.source_utf16.end, |audit| audit.range.end)
         || first.utf16 >= last.utf16
-        || last.utf16 - first.utf16 > MAX_CLOSED_UTF16
+        || (last.utf16 - first.utf16 > MAX_CLOSED_UTF16
+            && !fonts
+                .audit
+                .as_ref()
+                .is_some_and(|audit| matches!(audit.origin, FontAuditOrigin::Frontier)))
         || last.byte - first.byte > MAX_CLOSED_BYTES
     {
         return Err(MarkdownLineComposeError::InconsistentCoverage);
@@ -495,6 +830,7 @@ fn prepare_run(
     };
     let mut facts = fonts.facts.clone();
     facts.source_utf16 = run.range.clone();
+    let shaping_seams = fonts.seams_for(&run.range)?;
     facts.beginning_of_text = run.range.start == facts.paragraph_utf16.start;
     facts.end_of_text = run.range.end == facts.paragraph_utf16.end;
     let options = MarkdownShapingOptions {
@@ -522,6 +858,7 @@ fn prepare_run(
         registration: run.registration,
         replay_style: fonts.style.clone(),
         facts,
+        shaping_seams,
     });
     payload.stage = Stage::ClosedInput;
     Ok(step) // 这里只交权；原邻接context和中心正文在后继独立bytes/scalars量子实际读取。

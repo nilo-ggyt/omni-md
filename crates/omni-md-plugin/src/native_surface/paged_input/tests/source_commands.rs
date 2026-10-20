@@ -4,6 +4,97 @@ use super::*;
 use omni_markdown_core::MarkdownEditingCommand;
 
 #[test]
+fn source_table_insertion_places_first_cell_and_restores_reverse_selection_in_one_undo() {
+    for (input, before, prefix, suffix) in [
+        ("", MarkdownTextSelection::caret(0), "", ""),
+        (
+            "甲🙂乙",
+            MarkdownTextSelection {
+                anchor_utf16: 3,
+                head_utf16: 1,
+            },
+            "甲\n\n",
+            "\n\n乙",
+        ),
+        (
+            "甲\r\n乙",
+            MarkdownTextSelection::caret(3),
+            "甲\r\n",
+            "\n\n乙",
+        ),
+    ] {
+        // 真实选区含代理对及反向范围；一次Undo须同时恢复原字符、方向与mmap，不只比较净长度。
+        let (_file, document) = fixture(input, 4096);
+        document.borrow_mut().set_selection(before).unwrap();
+        let mapping = document.borrow().original_backing_observer();
+        // 空文件没有可映射区；非空原文必须保留真实映射，而不是为验收制造一个空映射。
+        assert_eq!(mapping.is_some(), !input.is_empty());
+        let mapped = mapping.as_ref().map(|mapping| mapping.mapped_bytes());
+        let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
+        let permit = owner.capture(1, &|_| true).unwrap();
+        let commit = owner.insert_default_table(&permit, &|_| true).unwrap();
+        let table = crate::native_surface::native_markdown_default_table_source(false, false);
+        let expected = format!("{prefix}{table}{suffix}");
+        assert_eq!(text(&document), expected);
+        let first = prefix.encode_utf16().count() + 2;
+        assert_eq!(commit.state.selection, MarkdownTextSelection::caret(first));
+        assert!(commit.invalidation.characters_changed);
+        if let Some(mapping) = &mapping {
+            assert!(!mapping.failed());
+            assert_eq!(Some(mapping.mapped_bytes()), mapped);
+        }
+        let undo = owner.capture(1, &|_| true).unwrap();
+        let undo = committed(
+            owner
+                .history(&undo, NativeMarkdownPagedInputHistory::Undo, &|_| true)
+                .unwrap(),
+        );
+        assert_eq!(text(&document), input);
+        assert_eq!(undo.state.selection, before);
+        assert!(!document.borrow().can_undo());
+        let redo = owner.capture(1, &|_| true).unwrap();
+        let redo = committed(
+            owner
+                .history(&redo, NativeMarkdownPagedInputHistory::Redo, &|_| true)
+                .unwrap(),
+        );
+        assert_eq!(text(&document), expected);
+        assert_eq!(redo.state.selection, MarkdownTextSelection::caret(first));
+        owner.close().unwrap();
+    }
+}
+
+#[test]
+fn source_table_preparation_revocation_and_capacity_failure_preserve_original_history() {
+    for maximum in [8, 4096] {
+        let (_file, document) = fixture("首尾", maximum);
+        let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
+        let before = owner.state().unwrap();
+        let permit = owner.capture(1, &|_| true).unwrap();
+        let prepared = Cell::new(false);
+        // 只在Core已经持有真实候选时撤前台权限；不依赖调用次数来假设准备已经发生。
+        let current = |_| {
+            let pending = document.borrow().has_prepared_text_input();
+            prepared.set(prepared.get() || pending);
+            !pending
+        };
+        assert!(owner.insert_default_table(&permit, &current).is_err());
+        assert_eq!(text(&document), "首尾");
+        assert_eq!(owner.state().unwrap(), before);
+        assert!(!document.borrow().can_undo() && !document.borrow().can_redo());
+        assert!(!document.borrow().has_prepared_text_input());
+        // 撤销准备后原pending槽应可再次使用；不是仅让失败返回却遗留一张占用事务。
+        if maximum == 4096 {
+            assert!(prepared.get());
+            let permit = owner.capture(1, &|_| true).unwrap();
+            owner.insert_default_table(&permit, &|_| true).unwrap();
+            assert!(document.borrow().can_undo());
+        }
+        owner.close().unwrap();
+    }
+}
+
+#[test]
 fn source_return_continues_markdown_and_restores_original_selection_in_one_history() {
     for (input, expected) in [
         ("- 文🙂", "- 文🙂\n- "),
@@ -354,12 +445,15 @@ fn source_command_capacity_and_current_rejections_keep_document_history_and_fold
         }]
     );
     let stable = owner.state().unwrap();
+    let active = Cell::new(true);
     let current = |_| {
         assert!(document.try_borrow_mut().is_ok());
         assert!(owner.folds.try_borrow_mut().is_ok());
-        !owner.is_busy()
+        active.get()
     };
     let permit = owner.capture(1, &current).unwrap();
+    // 捕获后真实前台权限被撤销；begin须拒绝原票，不依赖内部busy翻转制造第二次相同检查。
+    active.set(false);
     assert!(matches!(
         owner.apply_source_editing_command(
             &permit,

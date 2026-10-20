@@ -17,13 +17,22 @@ pub(crate) struct ClosedItem {
     source: MarkdownLayoutTextAuthority,
     font: MarkdownLayoutFontAuthority,
     scope: std::sync::Weak<()>,
-    endpoints: [MarkdownCertifiedGraphemeEndpoint; 2],
+    endpoints: [CertifiedShapingEndpoint; 2],
     cancellation: MarkdownShapingCancellation,
+}
+
+/// 原闭项票消费后的唯一整形输入值；三种范围具名区分，不把上下文包络当正文或 GCB。
+/// 没有 Source/Font 强边；真实资源仍由紧接着创建的原 PendingClosedShaping 独占。
+pub(crate) struct ClosedShapingInput {
+    pub(crate) source_utf16: Range<usize>,
+    pub(crate) source_bytes: Range<usize>,
+    pub(crate) context_bytes: Range<usize>,
+    pub(crate) cancellation: MarkdownShapingCancellation,
 }
 
 pub(super) enum Admission {
     Closed(ClosedItem),
-    Frontier(MarkdownCertifiedGraphemeEndpoint),
+    Frontier(CertifiedShapingEndpoint),
 }
 
 /// 原唯一item槽先保存有限准备续体；Font/样式/段落事实直到原Job装配后原样移交。
@@ -33,6 +42,7 @@ pub(super) struct PendingItem {
     pub(super) registration: Option<MarkdownLineFontRegistration>,
     pub(super) replay_style: MarkdownLineComposeStyle,
     pub(super) facts: MarkdownLineItemFacts,
+    pub(super) shaping_seams: [Option<ResolvedBidiShapingSeam>; 2],
 }
 
 impl ClosedItem {
@@ -68,7 +78,8 @@ impl ClosedItem {
             source: authority.clone(),
             font: font.clone(),
             scope,
-            endpoints,
+            endpoints: endpoints
+                .map(|proof| CertifiedShapingEndpoint::Grapheme { proof, seam: None }),
             cancellation: terminal.cancellation(),
         })
     }
@@ -77,7 +88,7 @@ impl ClosedItem {
         payload: &mut Payload,
         authority: &MarkdownLayoutTextAuthority,
         response: &MarkdownLineStyleResponse,
-        end: MarkdownCertifiedGraphemeEndpoint,
+        end: CertifiedShapingEndpoint,
         cancellation: &MarkdownLineComposeCancellation,
     ) -> Result<Admission> {
         payload.source.health()?;
@@ -97,8 +108,8 @@ impl ClosedItem {
             .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
         let first = start.boundary(authority)?;
         let last = end.boundary(authority)?;
-        if !start.same_scope(&end)
-            || !matches!(payload.stage, Stage::Style)
+        start.require_pair(&end, authority)?;
+        if !matches!(payload.stage, Stage::Style)
             || !Arc::ptr_eq(&request.nonce, &response.request.nonce)
             || request.source != *authority
             || !payload.source.permits(authority)
@@ -142,10 +153,8 @@ impl ClosedItem {
         self,
         source: &MarkdownLayoutTextAuthority,
         font: &MarkdownLayoutFontAuthority,
-    ) -> std::result::Result<
-        (Range<usize>, Range<usize>, MarkdownShapingCancellation),
-        MarkdownShapingError,
-    > {
+        source_bytes: usize,
+    ) -> std::result::Result<ClosedShapingInput, MarkdownShapingError> {
         if &self.source != source {
             return Err(MarkdownShapingError::SourceMismatch);
         } // 相同文字、相同坐标的新Source不能继承原Style阶段的闭项权限。
@@ -163,14 +172,24 @@ impl ClosedItem {
             .boundary(source)
             .map_err(|_| MarkdownShapingError::SourceMismatch)?;
         // 端点getter只检查来源和弱scope，不执行I/O；原Source健康门由装配入口先核。
-        if !start.same_scope(&end) {
-            return Err(MarkdownShapingError::SourceMismatch);
-        }
-        Ok((
-            first.utf16..last.utf16,
-            first.byte..last.byte,
-            self.cancellation,
-        ))
+        start
+            .require_pair(&end, source)
+            .map_err(|_| MarkdownShapingError::SourceMismatch)?;
+        let context = (if start.seam().is_some() {
+            first.byte
+        } else {
+            0
+        })..(if end.seam().is_some() {
+            last.byte
+        } else {
+            source_bytes
+        });
+        Ok(ClosedShapingInput {
+            source_utf16: first.utf16..last.utf16,
+            source_bytes: first.byte..last.byte,
+            context_bytes: context,
+            cancellation: self.cancellation,
+        })
     }
 }
 

@@ -1,6 +1,14 @@
-//! Exercises real TextKit input and object release on the process main thread.
+//! 正式分页工作负载与独立原生参考验收；只观察各自真实输入、完整帧和资源释放。
 
 use super::*;
+use crate::native_surface::NativeMarkdownTextKitEditorSurface;
+use crate::native_surface::destroy_native_markdown_textkit_editor as destroy_native_markdown_editor;
+use crate::native_surface::paged_body::{
+    NativeMarkdownPagedBody, NativeMarkdownPagedBodyPaintObserver,
+};
+use crate::native_surface::paged_input::{NativeMarkdownPagedInput, NativeMarkdownPagedInputState};
+use crate::native_surface::paged_text_view::NativeMarkdownPagedSceneKey;
+use std::time::{Duration, Instant};
 
 mod clipboard;
 pub use clipboard::{
@@ -21,58 +29,58 @@ pub use paged_cell_history::run_native_markdown_cell_history_oracle;
 mod regex_streaming;
 #[cfg(feature = "native-block-fragment-diagnostic")]
 pub use regex_streaming::run_native_markdown_long_regex_control;
-#[cfg(all(
-    feature = "native-raster-surface-probe",
-    feature = "native-close-stage-diagnostic"
-))]
-mod raster_close;
+#[path = "probe/source_mode_viewport.rs"]
+mod mode_viewport;
 mod selection_actions;
 mod semantic_snapshot;
+mod source_session;
 mod subscript;
 #[cfg(feature = "native-table-row-append")]
 mod table_append;
 mod terminal;
 pub(super) mod toolbar;
-mod view_geometry;
-pub use hosted_workload::{NativeMarkdownHostedStep, NativeMarkdownHostedWorkload};
+pub use hosted_workload::{
+    NativeMarkdownHostedFlow, NativeMarkdownHostedStep, NativeMarkdownHostedWorkload,
+    write_native_markdown_giant_paragraph_fixture, write_native_markdown_memory_fixture,
+};
 #[cfg(feature = "native-table-row-append")]
-pub use table_append::{NativeMarkdownTableAppendCase, NativeMarkdownTableAppendWorkload};
+pub(in crate::native_surface) use table_append::wait_for_paged_cell;
+#[cfg(feature = "native-table-row-append")]
+pub use table_append::{
+    NativeMarkdownHostedTableCase, NativeMarkdownHostedTableProbe, NativeMarkdownHostedTableStep,
+};
 pub(super) use terminal::ProbeTerminalObserver;
 
-/// 专用内存工作负载只保留portable会话、弱正文身份与固定marker坐标；
-/// 真实窗口/编辑器仍完全归产品前台槽，不复用旧probe的整篇期待String。
-pub struct NativeMarkdownMemoryWorkload {
-    owner: MemoryWorkloadOwner,
+/// Host工作负载只保原弱正文、有限动作票和固定marker坐标；真实会话完全由Host拥有。
+/// 不创建workspace或窗口，也不保整篇期待String或另一份原文图。
+struct NativeMarkdownMemoryWorkload {
+    flow: NativeMarkdownHostedFlow,
     path: std::path::PathBuf,
     facts: RefCell<Option<MemoryWorkloadFacts>>,
+    cpu_frame: RefCell<Option<Rc<MemoryFrameObservation>>>,
     pending_mode: RefCell<Option<MemoryModeObservation>>,
-    pending_find: RefCell<Option<MemoryFindObservation>>,
+    pending_find: RefCell<Option<Rc<MemoryFindObservation>>>,
     pending_query: Cell<Option<MemoryQueryObservation>>,
     verified_query: Cell<Option<(bool, u64)>>,
     find_highlights: RefCell<Option<find_highlights::FindHighlightsProbe>>,
-    #[cfg(all(
-        feature = "native-raster-surface-probe",
-        feature = "native-close-stage-diagnostic"
-    ))]
-    raster_close_observation: RefCell<Option<raster_close::RasterCloseObservation>>,
-}
-
-/// 独立驱动才创建并结束portable会话；Hosted只观察Host已经拥有的真实会话。
-enum MemoryWorkloadOwner {
-    Standalone {
-        workspace: omni_markdown_core::MarkdownWorkspace,
-        lifecycle: Rc<MemoryWorkloadLifecycle>,
-    },
-    Hosted,
+    source_session: RefCell<Option<source_session::SourceSession>>,
+    // 相对链接的通知/目标FD在Return前归还；原独立inode仅留到423流式核保存，随后关闭。
+    relative_link: RefCell<Option<Rc<source_session::RelativeLink>>>,
 }
 
 struct MemoryModeObservation {
-    request: Rc<super::table_layout::NativeMarkdownModeViewportRequest>,
+    request: Rc<mode_viewport::ModeViewportExpectation>,
     epoch: MemoryActionEpoch,
+    // 仅原输入已验证时延续相同字面查询；模式的真实 Find+1 不能让未知查询重新取得权限。
+    verified_query: Option<bool>,
+    field: Option<(std::rc::Weak<NativeMarkdownFindBar>, NSRange)>,
 }
 
 struct MemoryFindObservation {
-    request: Rc<NativeMarkdownFindRevealRequest>,
+    execution: NativeMarkdownFindExecution,
+    input: NativeMarkdownPagedInputState,
+    mode: MarkdownPresentationMode,
+    frame: Rc<MemoryFrameObservation>,
     epoch: MemoryActionEpoch,
     before: std::ops::Range<usize>,
     expected: std::ops::Range<usize>,
@@ -80,9 +88,6 @@ struct MemoryFindObservation {
     #[cfg(feature = "native-block-fragment-diagnostic")]
     code_paint: Option<Rc<code_paint::ExpectedCodePaint>>,
 }
-
-#[cfg(feature = "native-block-fragment-diagnostic")]
-type MemoryPaintContinuation = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 
 #[derive(Clone, Copy)]
 /// 一次明确查询输入的原正文选区和预声明输入代次；不持Native对象，不在下一事件重签。
@@ -98,7 +103,6 @@ struct MemoryActionEpoch {
     find: u64,
     workspace: u64,
     header: u64,
-    table: u64,
 }
 
 impl MemoryActionEpoch {
@@ -107,14 +111,6 @@ impl MemoryActionEpoch {
             find: surface.controller.find_input_intent(),
             workspace: surface.controller.workspace_query_intent(),
             header: surface.controller.ivars().header_layout_revision.get(),
-            table: surface.editor.as_ref().map_or(0, |editor| {
-                editor
-                    .backend
-                    .text_view
-                    .ivars()
-                    .table_input_intent_epoch
-                    .get()
-            }),
         }
     }
 
@@ -122,15 +118,6 @@ impl MemoryActionEpoch {
         self.find == surface.controller.find_input_intent()
             && self.workspace == surface.controller.workspace_query_intent()
             && self.header == surface.controller.ivars().header_layout_revision.get()
-            && surface.editor.as_ref().is_some_and(|editor| {
-                self.table
-                    == editor
-                        .backend
-                        .text_view
-                        .ivars()
-                        .table_input_intent_epoch
-                        .get()
-            })
     }
 }
 
@@ -138,132 +125,298 @@ impl MemoryActionEpoch {
 struct MemoryWorkloadFacts {
     owner: usize,
     document: WeakMarkdownDocument,
+    body: std::rc::Weak<NativeMarkdownPagedBody>,
+    input: std::rc::Weak<NativeMarkdownPagedInput>,
     generation: u64,
     length: usize,
     revision: omni_markdown_core::MarkdownDocumentRevision,
     disk: (u64, u64, u64, i64, i64),
     opening_selection: MarkdownTextSelection,
+    opening_input: NativeMarkdownPagedInputState,
     opening_epoch: MemoryActionEpoch,
     table_match: std::ops::Range<usize>,
     code_matches: [std::ops::Range<usize>; 3],
 }
 
-/// completion只在产品严格finish_close之后调用；相等标量本身不能授权完成。
-struct MemoryWorkloadLifecycle {
-    accepted: Cell<Option<PluginCloseRequest>>,
-    completed: Cell<Option<PluginCloseRequest>>,
-    valid: Cell<bool>,
-    finished: RefCell<Option<Box<dyn FnOnce()>>>,
+type MemoryFrameContinuation = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+
+/// 一次实际动作的完整 CPU 帧终点；只持原弱身份、完整输入和发布 key，不持 Scene、Reader 或像素。
+struct MemoryFrameObservation {
+    facts: MemoryWorkloadFacts,
+    controller: Weak<NativeMarkdownController>,
+    epoch: MemoryActionEpoch,
+    input: NativeMarkdownPagedInputState,
+    mode: MarkdownPresentationMode,
+    started: Instant,
+    registered: Cell<bool>,
+    published: RefCell<Option<(NativeMarkdownPagedSceneKey, usize)>>,
+    signal: RefCell<Option<Box<dyn FnOnce()>>>,
+    failure: RefCell<Option<String>>,
 }
 
-impl PluginHostLifecycle for MemoryWorkloadLifecycle {
-    fn commit_creation(&self) -> Result<(), omni_plugin_sdk::PluginError> {
-        Ok(())
+impl MemoryFrameObservation {
+    /// 输入必须是调用者已核验的本次后态；这里只固定原 owner，不重新发现窗口或改正文选择。
+    /// 只读 Find 与 Hosted 真编辑共用实际发布机制，是否允许 dirty 由各自原动作验证负责；
+    /// 不能拿只读 g0 的 dirty 规则拒绝合法 g+1，也不能让后继合法输入成为本动作的新期待。
+    fn capture(
+        surface: &NativeMarkdownWindowSurface,
+        facts: &MemoryWorkloadFacts,
+        epoch: MemoryActionEpoch,
+        input: NativeMarkdownPagedInputState,
+    ) -> Result<Rc<Self>, String> {
+        let paged = surface.editor.as_ref().ok_or("完整帧观察没有原分页正文")?;
+        if !memory_workload_identity_current(surface, facts)
+            || !epoch.permits(surface)
+            || paged
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?
+                != input
+        {
+            return Err("完整帧观察不属于原窗口和完整 Input".into());
+        }
+        // 这里只创建有限观察载荷。弱 Doc/Body/Input 不保留 canonical root、reader 或字体，
+        // 原 foreground controller 的 weak 仅用于其既有 owned queue 登记这一次通知。
+        Ok(Rc::new(Self {
+            facts: facts.clone(),
+            controller: Weak::from_retained(&surface.controller),
+            epoch,
+            input,
+            mode: paged.body.presentation_mode(),
+            started: Instant::now(),
+            registered: Cell::new(false),
+            published: RefCell::new(None),
+            signal: RefCell::new(None),
+            failure: RefCell::new(None),
+        }))
     }
 
-    fn begin_close(&self, request: PluginCloseRequest) -> Result<(), omni_plugin_sdk::PluginError> {
-        let expected = PluginCloseRequest {
-            intent: omni_plugin_sdk::PluginCloseIntent::ExitToLauncher,
-            scope: PluginCloseScope::ForegroundTransition,
+    /// 发布检查只读同一 Body/View 的现成元数据；没有当前整帧就等待原生产者，不主动绘图。
+    fn current_publication(&self) -> Result<Option<(NativeMarkdownPagedSceneKey, usize)>, String> {
+        with_active_native_markdown_surface(|surface| self.current_publication_at(surface))
+    }
+
+    /// 同一 Active 租约中的调用不得再次借全局槽；完整 Input 允许原真实编辑后的 dirty 文稿。
+    fn current_publication_at(
+        &self,
+        surface: &NativeMarkdownWindowSurface,
+    ) -> Result<Option<(NativeMarkdownPagedSceneKey, usize)>, String> {
+        // 原弱 Input 身份排除同文稿重挂另一客户；Find/workspace/header 代次则撤销旧动作。
+        // 两者都不是布局权限：下方仍须向当前实际 View 取得 Ready 和原完整发布 key。
+        if !memory_workload_identity_current(surface, &self.facts) || !self.epoch.permits(surface) {
+            return Err("CPU 帧原文稿或动作代次已撤销".into());
+        }
+        let paged = surface.editor.as_ref().ok_or("CPU 帧原分页客户已释放")?;
+        if paged.body.presentation_mode() != self.mode
+            || paged
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?
+                != self.input
+        {
+            return Err("CPU 帧模式或完整 Input 已被后继动作替换".into());
+        }
+        let ready = match paged.text_view.capture_ready_scene_key() {
+            Ok(key) => key,
+            Err(
+                crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Pending,
+            ) => return Ok(None),
+            Err(cause) => return Err(cause.to_string()),
         };
-        if request != expected || self.accepted.get().is_some_and(|old| old != request) {
-            // 工作负载只测试真实“返回”；应用退出或另一个请求不能替代此收据。
-            self.valid.set(false);
-            return Err(omni_plugin_sdk::PluginError::new(
-                "memory_close_identity",
-                "内存工作负载关闭身份不一致",
-            ));
+        // 两种展示模式不会推进 generation；单凭同 g 可误接旧 Source 帧，因此模式与完整
+        // Input 一并核验，包括有向选择、marked、多选、fold 和 selection serial。
+        if ready.presentation_mode != self.mode
+            || ready.request.input != self.input
+            || !WeakMarkdownDocument::ptr_eq(&ready.request.document, &self.facts.document)
+        {
+            return Err("CPU 帧没有原输入与模式的真实当前 Ready".into());
         }
-        self.accepted.set(Some(request));
+        let Some((key, paints)) = paged.text_view.probe_cpu_published_frame() else {
+            return Ok(None);
+        };
+        // CPU 的所有可见槽完整提交后才发布此 key。排队、局部 tile 或旧 paints 均不授予
+        // 采样权限；这里只读原 surface 标量，绝不主动 paint 出一个测试专用画面。
+        if paints == 0
+            || !key.same(&ready)
+            || paged.text_view.cpu_paints() != Some(paints)
+            || paged.text_view.cpu_paint_pending() != Some(false)
+        {
+            return Ok(None); // Ready 不替代已经完整发布的相同 key 像素。
+        }
+        Ok(Some((key, paints)))
+    }
+
+    fn reject(&self, cause: String) {
+        let mut failure = self.failure.borrow_mut();
+        if failure.is_none() {
+            *failure = Some(cause); // 缺帧或取消后的次级观察不能覆盖本动作已保存的原失败。
+        }
+    }
+
+    fn signal(&self) {
+        let signal = self.signal.borrow_mut().take();
+        if let Some(signal) = signal {
+            signal();
+        }
+    }
+
+    /// 注册和已完成交付都离开动作的 Active 租约；队列只保本观察 Weak，不使测试延长正文寿命。
+    fn observe(self: &Rc<Self>, observer: impl FnOnce() + 'static) -> Result<(), String> {
+        if self.registered.replace(true) {
+            return Err("原完整帧终点不能重复观察".into());
+        }
+        *self.signal.borrow_mut() = Some(Box::new(observer));
+        // 观察者在原 workload/probe 槽保活，生产 Body 只保 std::Weak。关闭会先取走这些
+        // 槽再严格归还 Native 图；本队列不会因一个未完成测试而延长正文生命周期。
+        let controller = self
+            .controller
+            .load()
+            .ok_or("完整帧观察原 controller 已释放")?;
+        let weak = MainThreadBound::new(Rc::downgrade(self), controller.mtm());
+        controller.enqueue_owned(move || {
+            let mtm = MainThreadMarker::new().expect("完整帧观察只在原主队列运行");
+            let Some(observation) = weak.into_inner(mtm).upgrade() else {
+                return;
+            };
+            let result = (|| {
+                if let Some((key, paints)) = observation.current_publication()? {
+                    // 原完整帧已在登记之前完成也可以接纳；依旧执行同一次当前 key 认证，
+                    // 不要求为了通知额外制造一个没有实际动作来源的新帧。
+                    observation.frame_published(&key, paints);
+                    return Ok(());
+                }
+                let body = observation
+                    .facts
+                    .body
+                    .upgrade()
+                    .ok_or("完整帧原 Body 已释放")?;
+                let erased: Rc<dyn NativeMarkdownPagedBodyPaintObserver> = observation.clone();
+                // 唯一实际 Body 已有的一次发布通知承担等待；Busy/关闭是注册失败，不能另建
+                // timer 或扫描视图树来寻找一个“看起来完成”的替代终点。
+                body.observe_next_cpu_frame(Rc::downgrade(&erased))
+                    .map_err(|cause| cause.to_string())
+            })();
+            if let Err(cause) = result {
+                observation.reject(cause);
+                observation.signal();
+            }
+        });
         Ok(())
     }
 
-    fn finish_close(&self, request: PluginCloseRequest) {
-        if self.accepted.get() != Some(request) || self.completed.replace(Some(request)).is_some() {
-            // 错误只变为最终失败，不把Rust panic带过原生回调或重复执行下一阶段。
-            self.valid.set(false);
-        }
-        let finished = self.finished.borrow_mut().take();
-        if let Some(finished) = finished {
-            finished(); // 借用已结束；该闭包只投递driver事件，不持产品Native图。
-        }
+    fn completed(&self) -> Result<(), String> {
+        with_active_native_markdown_surface(|surface| self.completed_at(surface))
     }
-}
 
-struct MemoryWorkloadHost {
-    root: std::path::PathBuf,
-    lifecycle: Rc<MemoryWorkloadLifecycle>,
-}
-
-impl OmniBarHostContext for MemoryWorkloadHost {
-    fn workspace_root(&self) -> &Path {
-        &self.root
-    }
-    fn application_data_root(&self) -> &Path {
-        &self.root
-    }
-    fn mount_native_view(
-        &mut self,
-        _view: PluginNativeView,
-    ) -> Result<(), omni_plugin_sdk::PluginError> {
+    fn completed_at(&self, surface: &NativeMarkdownWindowSurface) -> Result<(), String> {
+        if let Some(cause) = self.failure.borrow().as_ref() {
+            return Err(cause.clone());
+        }
+        let published = self
+            .published
+            .borrow()
+            .clone()
+            .ok_or("原动作没有真实完整 CPU 帧终点")?;
+        let actual = self
+            .current_publication_at(surface)?
+            .ok_or("原动作 CPU 帧仍在准备")?;
+        // 通知只能给出排下一验证事件的权限；验证时还必须仍是当初那份完整发布，
+        // 后继滚动/输入生成的合法 frame 不能倒填到原观察记录里。
+        if !published.0.same(&actual.0) || published.1 != actual.1 {
+            return Err("原完整 CPU 帧被后继发布替换".into());
+        }
         Ok(())
     }
-    fn read_clipboard_text(&mut self) -> Result<Option<String>, omni_plugin_sdk::PluginError> {
-        Err(omni_plugin_sdk::PluginError::new(
-            "memory_clipboard",
-            "工作负载不访问用户剪贴板",
-        ))
+}
+
+impl NativeMarkdownPagedBodyPaintObserver for MemoryFrameObservation {
+    fn frame_published(&self, key: &NativeMarkdownPagedSceneKey, paints: usize) {
+        let checked = (|| {
+            let Some((actual, count)) = self.current_publication()? else {
+                return Err("CPU 发布回调没有真实当前完整帧".into());
+            };
+            if !actual.same(key)
+                || count != paints
+                || self.started.elapsed() > Duration::from_secs(3)
+            {
+                return Err("CPU 发布不是原票完整帧或超过原三秒期限".into());
+            }
+            // 仅保存源/输入弱票与 paints 标量。回调返回不保 Canvas、整幅 bitmap 或
+            // 任何页目录，故正常关闭仍由产品自己的严格资源收据证明。
+            *self.published.borrow_mut() = Some((key.clone(), paints));
+            Ok(())
+        })();
+        if let Err(cause) = checked {
+            self.reject(cause);
+        }
+        self.signal(); // 归还全部 RefCell/Active 借用后才交外部下一事件。
     }
-    fn write_clipboard_text(&mut self, _text: &str) -> Result<(), omni_plugin_sdk::PluginError> {
-        Err(omni_plugin_sdk::PluginError::new(
-            "memory_clipboard",
-            "工作负载不访问用户剪贴板",
-        ))
+}
+
+impl MemoryFindObservation {
+    fn find_completed(&self) -> Result<(), String> {
+        // Complete 是本次生产调用同步成功，Pending 则必须消费其原终态；二者都不能
+        // 由栏文案或 Body.pending_find 已清空代替。失败沿原请求保留已提交后果。
+        match &self.execution {
+            NativeMarkdownFindExecution::Complete => Ok(()),
+            NativeMarkdownFindExecution::Pending(request) => match request.probe_completed() {
+                Some(true) => Ok(()),
+                Some(false) => Err(request.take_failure().map_or_else(
+                    || "原 Find 请求已取消或失败".to_owned(),
+                    |cause| cause.to_string(),
+                )),
+                None => Err("原 Find 请求尚未完成可见性认证".into()),
+            },
+        }
     }
-    fn foreground_lifecycle(&self) -> Rc<dyn PluginHostLifecycle> {
-        self.lifecycle.clone()
+
+    fn completed(&self) -> Result<(), String> {
+        self.find_completed()?;
+        self.frame.completed()
+    }
+
+    fn completed_at(&self, surface: &NativeMarkdownWindowSurface) -> Result<(), String> {
+        self.find_completed()?;
+        self.frame.completed_at(surface)
+    }
+
+    /// 同一实际 Pending 先结束 Find，再等原输入的完整 CPU 帧；没有新的查询、票或布局执行。
+    fn observe_terminal(self: &Rc<Self>, observer: impl FnOnce() + 'static) -> Result<(), String> {
+        let continuation: MemoryFrameContinuation = Rc::new(RefCell::new(Some(Box::new(observer))));
+        let after = |observation: Rc<Self>, continuation: MemoryFrameContinuation| {
+            let observer = continuation.borrow_mut().take();
+            if let Some(observer) = observer {
+                if let Err(cause) = observation.find_completed() {
+                    observation.frame.reject(cause);
+                    observer();
+                } else if let Err(cause) = observation.frame.observe(observer) {
+                    observation.frame.reject(cause);
+                    observation.frame.signal();
+                }
+            }
+        };
+        let terminal = match &self.execution {
+            NativeMarkdownFindExecution::Complete => true,
+            NativeMarkdownFindExecution::Pending(request) => {
+                // 请求可能持有此通知，而 workload 又持原请求；回调只保观察者 Weak，
+                // 避免形成 request→observer→request 环。续体本身只有一次外部事件闭包。
+                let weak = Rc::downgrade(self);
+                let continuation = continuation.clone();
+                request.observe_probe_terminal(move || {
+                    if let Some(observation) = weak.upgrade() {
+                        after(observation, continuation);
+                    }
+                })?
+            }
+        };
+        if terminal {
+            after(self.clone(), continuation);
+        }
+        Ok(())
     }
 }
 
 impl NativeMarkdownMemoryWorkload {
-    /// 调用者先在独占临时root中流式复制exact seed；此处通过正式workspace/窗口入口挂载。
-    pub(crate) fn start(root: &Path, finished: impl FnOnce() + 'static) -> Result<Self, String> {
-        let workspace =
-            omni_markdown_core::MarkdownWorkspace::new(root.join("vault"), root.join("recovery"));
-        let session = workspace
-            .open_session()
-            .map_err(|_| "无法打开合成工作负载会话")?;
-        let lifecycle = Rc::new(MemoryWorkloadLifecycle {
-            accepted: Cell::new(None),
-            completed: Cell::new(None),
-            valid: Cell::new(true),
-            finished: RefCell::new(Some(Box::new(finished))),
-        });
-        let mut host = MemoryWorkloadHost {
-            root: root.to_owned(),
-            lifecycle: Rc::clone(&lifecycle),
-        };
-        show_native_markdown_window(session, lifecycle.clone(), &mut host)?;
-        Ok(Self {
-            owner: MemoryWorkloadOwner::Standalone {
-                workspace,
-                lifecycle,
-            },
-            path: root.join("vault/工作负载.md"),
-            facts: RefCell::new(None),
-            pending_mode: RefCell::new(None),
-            pending_find: RefCell::new(None),
-            pending_query: Cell::new(None),
-            verified_query: Cell::new(None),
-            find_highlights: RefCell::new(None),
-            #[cfg(all(
-                feature = "native-raster-surface-probe",
-                feature = "native-close-stage-diagnostic"
-            ))]
-            raster_close_observation: RefCell::new(None),
-        })
-    }
-
     /// 固定当前已经打开的真实路径与弱正文身份；不创建窗口、workspace或第二个正文。
     fn capture_open_facts(&self) -> Result<MemoryWorkloadFacts, String> {
         use std::os::unix::fs::MetadataExt;
@@ -274,6 +427,11 @@ impl NativeMarkdownMemoryWorkload {
             .map_err(|_| "无法解析合成笔记路径")?;
         with_active_native_markdown_surface(|surface| {
             let editor = surface.editor.as_ref().ok_or("工作负载没有打开实际笔记")?;
+            let paged = editor;
+            let opening_input = paged
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
             let document = editor.document().borrow();
             if document.path().canonicalize().ok().as_ref() != Some(&expected_path)
                 || !document.original_file_identity_is_unchanged()
@@ -290,6 +448,8 @@ impl NativeMarkdownMemoryWorkload {
             Ok(MemoryWorkloadFacts {
                 owner: std::ptr::from_ref(&*surface.controller).addr(),
                 document: Rc::downgrade(editor.document()),
+                body: Rc::downgrade(&paged.body),
+                input: paged.body.probe_find_input_weak(),
                 generation: document.generation(),
                 length: document.utf16_len(),
                 revision: document
@@ -303,6 +463,7 @@ impl NativeMarkdownMemoryWorkload {
                     metadata.mtime_nsec(),
                 ),
                 opening_selection: document.selection(),
+                opening_input,
                 opening_epoch: MemoryActionEpoch::capture(surface),
                 table_match: table[0].clone(),
                 code_matches: [code[0].clone(), code[1].clone(), code[2].clone()],
@@ -310,67 +471,36 @@ impl NativeMarkdownMemoryWorkload {
         })
     }
 
-    /// 首次独立事件建立原身份；Hosted已经观察的原身份只能核验，不能为后继窗口重新签票。
+    /// 首次身份已在原真实帧观察前固定；实际 Ready 与同 key 的完整 CPU 发布缺一不可。
     pub(crate) fn verify_open(&self) -> Result<(), String> {
-        let observed = self.facts.borrow().clone();
-        let facts = match observed {
-            Some(facts) => facts, // Hosted必须继续使用observe时的原弱根，不能重新发现同名笔记。
-            None => self.capture_open_facts()?, // 独立驱动保留原首次VerifyOpen建立身份的顺序。
-        };
+        let facts = self.facts()?;
+        let frame = self
+            .cpu_frame
+            .borrow()
+            .clone()
+            .ok_or("首屏没有原完整帧观察")?;
+        frame.completed()?;
         with_active_native_markdown_surface(|surface| {
-            if !self.current(surface, &facts) {
-                return Err("初次显示前原笔记或窗口已失效".into());
+            if !self.current(surface, &facts)
+                || !facts.opening_epoch.permits(surface)
+                || !surface.editor.as_ref().is_some_and(|editor| {
+                    editor.document().borrow().selection() == facts.opening_selection
+                })
+            {
+                return Err("初次显示前原笔记、完整输入或窗口已失效".into());
             }
-            let editor = surface.editor.as_ref().ok_or("初次显示缺少原编辑器")?;
-            let _payload =
-                PayloadUseGuard::enter(&editor.backend.text_view.ivars().payload_use_depth);
-            let current = || {
-                self.current(surface, &facts)
-                    && facts.opening_epoch.permits(surface)
-                    && editor.document().borrow().selection() == facts.opening_selection
-            };
-            // 原开场选区和输入代次一并贯穿显示；observe后未知动作不能变成新的验收基线。
-            native_markdown_table_intent_step(&current, || surface.panel.displayIfNeeded())
-                .map_err(|_| "初次显示已失去原窗口")?;
-            let application = native_markdown_table_intent_step(&current, || {
-                NSApplication::sharedApplication(surface.panel.mtm())
-            })
-            .map_err(|_| "初次显示application已失效")?;
-            native_markdown_table_intent_step(&current, || application.updateWindows())
-                .map_err(|_| "初次窗口更新已失去原权限")?;
-            let viewport = native_markdown_table_intent_step(&current, || {
-                editor.backend.text_view.bounded_paint_viewport()
-            })
-            .map_err(|_| "初次可见区已失效")?
-            .ok_or("初次打开没有真实有限可见区")?;
-            #[cfg(feature = "native-raster-surface-probe")]
-            if super::raster_surface::NativeMarkdownRasterSurface::requested() {
-                let raster = editor
-                    .backend
-                    .raster_release
-                    .as_ref()
-                    .ok_or("光栅验收没有原编辑器的资源收据")?
-                    .snapshot();
-                if raster.sticky_failure
-                    || raster.actual_paints == 0
-                    || raster.configured_fragments == 0
-                {
-                    // 真实显示调用已返回；空图像或只抑制系统字形不能作为功能/低内存成功。
-                    return Err(format!("首屏光栅未完成同源字形发布：{raster:?}"));
-                }
-                println!(
-                    "native_raster_surface event=open_paint_verified actual_paints={} configured_fragments={} formal=false",
-                    raster.actual_paints, raster.configured_fragments,
-                );
-            }
+            let paged = surface.editor.as_ref().ok_or("首屏没有唯一分页正文")?;
+            let key = paged
+                .text_view
+                .capture_ready_scene_key()
+                .map_err(|cause| cause.to_string())?;
             println!(
-                "native_memory_open mounted=true viewport_width={} viewport_height={}",
-                viewport.0.size.width, viewport.0.size.height
+                "native_memory_open mounted=true viewport_width={} viewport_height={} actual_cpu_mode={:?} actual_cpu_paints={:?}",
+                key.request.viewport.size.width,
+                key.request.viewport.size.height,
+                key.presentation_mode,
+                paged.text_view.cpu_paints(),
             );
-            drop(application);
-            if !current() {
-                return Err("初次显示临时对象释放后原窗口失效".into());
-            }
             Ok(())
         })?;
         println!(
@@ -379,7 +509,6 @@ impl NativeMarkdownMemoryWorkload {
             facts.length,
             facts.revision.encode_hex()
         );
-        *self.facts.borrow_mut() = Some(facts);
         self.verify_unchanged()
     }
 
@@ -390,13 +519,132 @@ impl NativeMarkdownMemoryWorkload {
             .ok_or_else(|| "工作负载原正文身份尚未建立".to_owned())
     }
 
+    /// 原三秒期限已经失败后，只观察最初那一正文的现成进度和发布事实；
+    /// 不推进队列、不读取正文，也不消费 Body/View 的失败槽，避免诊断改变首因。
+    pub(crate) fn diagnose_frame_deadline(&self, stage: i16) {
+        if stage == 573 {
+            // 链接已合法切换时旧Body本来就必须消失；先结束场景槽借用，再只读原预声明目标
+            // 的安装/完整帧事实，不能沿旧facts的Weak失败推断链接是否成功。
+            let relative = self.relative_link.borrow().clone();
+            if let Some(relative) = relative {
+                relative.diagnose_deadline();
+            }
+            return;
+        }
+        #[cfg(feature = "native-block-fragment-diagnostic")]
+        if stage == 421 {
+            // 先结束原Find槽借用；仅打印已存失败，期限后不能再做一次采样来替换原结果。
+            let paint = self
+                .pending_find
+                .borrow()
+                .as_ref()
+                .and_then(|request| request.code_paint.clone());
+            if let Some(paint) = paint {
+                paint.diagnose_deadline();
+            }
+        }
+        let facts = self.facts.borrow().clone();
+        let Some(facts) = facts else {
+            eprintln!("native_memory_frame_deadline stage={stage} original_facts=false");
+            return;
+        };
+        let Some(body) = facts.body.upgrade() else {
+            eprintln!("native_memory_frame_deadline stage={stage} original_body=false");
+            return;
+        };
+        // 工作负载可能已完成真实编辑；这里核原弱身份，不把只读 g0 的规则错用于 g+1。
+        // Progress 只含原生产者的标量/计费事实；错误仅输出枚举判别值，不展开外部载荷。
+        eprintln!(
+            "native_memory_frame_deadline stage={stage} original_body=true original_input={} mode={:?} progress={:?}",
+            std::rc::Weak::ptr_eq(&body.probe_find_input_weak(), &facts.input),
+            body.presentation_mode(),
+            body.progress()
+                .map_err(|cause| std::mem::discriminant(&cause)),
+        );
+        let Ok(view) = body.view() else {
+            eprintln!("native_memory_frame_deadline stage={stage} original_view=false");
+            return;
+        };
+        // 先结束所有 workload 槽借用，再调用可能核验 Native 几何的 Ready 入口。
+        // 两张 key 仍只是原弱票；既不保留 Scene/Source，也不把旧 CPU 帧当当前成功帧。
+        let input = view
+            .input_state()
+            .map_err(|cause| std::mem::discriminant(&cause));
+        // Ready 尚未建立时仍需原 View 的实际滚动坐标，才能区分准备不足与两次真实 reveal 互相覆盖。
+        // 这里只捕现成请求，不申请 Scene、移动 clip，或以新请求补签原超时动作。
+        match view.capture_scene_request() {
+            Ok(request) => eprintln!(
+                "native_memory_frame_deadline_request stage={stage} input={:?} viewport={:?} bounds_width={} geometry_epoch={} virtual_viewport={:?}",
+                request.input,
+                request.viewport,
+                request.bounds_width,
+                request.geometry_epoch,
+                request.virtual_viewport,
+            ),
+            Err(cause) => eprintln!(
+                "native_memory_frame_deadline_request stage={stage} error={:?}",
+                std::mem::discriminant(&cause),
+            ),
+        }
+        let ready = view.capture_ready_scene_key();
+        let published = view.probe_cpu_published_frame();
+        let ready_status = match &ready {
+            Ok(_) => "ready",
+            Err(
+                crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Pending,
+            ) => "pending",
+            Err(
+                crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Revoked,
+            ) => "revoked",
+            Err(
+                crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Closed,
+            ) => "closed",
+            Err(crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Busy) => {
+                "busy"
+            }
+            Err(_) => "other_error",
+        };
+        eprintln!(
+            "native_memory_frame_deadline stage={stage} input={input:?} ready_status={ready_status} cpu_published={} cpu_paints={:?} cpu_pending={:?} cpu_steps={:?} ready_cpu_same={}",
+            published.is_some(),
+            view.cpu_paints(),
+            view.cpu_paint_pending(),
+            view.cpu_paint_steps(),
+            ready.as_ref().is_ok_and(|key| published
+                .as_ref()
+                .is_some_and(|(actual, _)| key.same(actual))),
+        );
+        // 仅输出 key 中的有限坐标和完整输入，不输出弱对象地址、路径、查询或 Source 字节。
+        for (kind, key, paints) in ready
+            .as_ref()
+            .ok()
+            .map(|key| ("ready", key, None))
+            .into_iter()
+            .chain(
+                published
+                    .as_ref()
+                    .map(|(key, paints)| ("cpu", key, Some(*paints))),
+            )
+        {
+            eprintln!(
+                "native_memory_frame_deadline_key stage={stage} kind={kind} mode={:?} input={:?} viewport={:?} bounds_width={} geometry_epoch={} virtual_viewport={:?} paints={paints:?}",
+                key.presentation_mode,
+                key.request.input,
+                key.request.viewport,
+                key.request.bounds_width,
+                key.request.geometry_epoch,
+                key.request.virtual_viewport,
+            );
+        }
+    }
+
     fn current(&self, surface: &NativeMarkdownWindowSurface, facts: &MemoryWorkloadFacts) -> bool {
         memory_workload_facts_current(surface, facts)
     }
 }
 
 /// 原文件与正文身份的纯检查可供一次终点闭包复用；不让闭包持有整个工作负载owner。
-fn memory_workload_facts_current(
+fn memory_workload_identity_current(
     surface: &NativeMarkdownWindowSurface,
     facts: &MemoryWorkloadFacts,
 ) -> bool {
@@ -408,16 +656,24 @@ fn memory_workload_facts_current(
     let Some(editor) = surface.editor.as_ref() else {
         return false;
     };
+    let paged = editor;
     if !std::rc::Weak::ptr_eq(&Rc::downgrade(editor.document()), &facts.document)
-        || editor
-            .backend
-            .text_view
-            .ivars()
-            .textkit_graph_teardown
-            .get()
+        || !std::rc::Weak::ptr_eq(&Rc::downgrade(&paged.body), &facts.body)
+        || !std::rc::Weak::ptr_eq(&paged.body.probe_find_input_weak(), &facts.input)
     {
         return false;
     }
+    true
+}
+
+fn memory_workload_facts_current(
+    surface: &NativeMarkdownWindowSurface,
+    facts: &MemoryWorkloadFacts,
+) -> bool {
+    if !memory_workload_identity_current(surface, facts) {
+        return false;
+    }
+    let editor = surface.editor.as_ref().expect("原身份已核唯一 editor");
     let document = editor.document().borrow();
     // 每个Native边界只核原弱身份/代次/长度/dirty；不为观察重复整篇hash，关闭后独立核真实字节。
     document.generation() == facts.generation
@@ -426,6 +682,90 @@ fn memory_workload_facts_current(
 }
 
 impl NativeMarkdownMemoryWorkload {
+    /// 原工作负载的真实终点入口；动作已执行，这里只安装一次原请求/CPU 发布观察。
+    /// 每个阶段的三秒由外部原 driver deadline 约束，不在这里轮询、延时或补发输入。
+    pub(crate) fn observe_memory_terminal(
+        &self,
+        stage: i16,
+        observer: impl FnOnce() + 'static,
+    ) -> Result<(), String> {
+        if matches!(stage, 403 | 411 | 413 | 419 | 426 | 436) {
+            let expected = self
+                .pending_mode
+                .borrow()
+                .as_ref()
+                .map(|receipt| receipt.request.clone())
+                .ok_or("模式终点缺少原动作期望")?;
+            return with_active_native_markdown_surface(|surface| {
+                expected.observe_preview_terminal(&surface.controller, observer)
+            });
+        }
+        if matches!(stage, 409 | 417) {
+            let receipt = self
+                .pending_find
+                .borrow()
+                .clone()
+                .ok_or("Find 终点缺少原动作请求")?;
+            return receipt.observe_terminal(observer);
+        }
+        if stage == 421 {
+            #[cfg(feature = "native-block-fragment-diagnostic")]
+            return self.observe_preview_find_paint(observer);
+            #[cfg(not(feature = "native-block-fragment-diagnostic"))]
+            {
+                let receipt = self
+                    .pending_find
+                    .borrow()
+                    .clone()
+                    .ok_or("Find 终点缺少原动作请求")?;
+                return receipt.observe_terminal(observer);
+            }
+        }
+        if stage != 401 && !matches!(stage, 427..=435 | 437..=438) {
+            return Err("未声明的 Memory 完整帧终点".into());
+        }
+        let captured = self.facts.borrow().clone();
+        let facts = match captured {
+            Some(facts) => facts,
+            None if stage == 401 => {
+                let facts = self.capture_open_facts()?;
+                *self.facts.borrow_mut() = Some(facts.clone());
+                facts
+            }
+            None => return Err("Memory 完整帧观察没有原打开身份".into()),
+        };
+        let frame = with_active_native_markdown_surface(|surface| {
+            let paged = surface.editor.as_ref().ok_or("Memory 帧没有唯一分页正文")?;
+            let input = if stage == 401 {
+                facts.opening_input
+            } else {
+                paged
+                    .text_view
+                    .input_state()
+                    .map_err(|cause| cause.to_string())?
+            };
+            let epoch = if stage == 401 {
+                facts.opening_epoch
+            } else {
+                MemoryActionEpoch::capture(surface)
+            };
+            MemoryFrameObservation::capture(surface, &facts, epoch, input)
+        })?;
+        let previous = self.cpu_frame.replace(Some(frame.clone()));
+        drop(previous);
+        frame.observe(observer)
+    }
+
+    /// 后继像素动作先消费同一次观察的当前完整帧；失败通知只能唤醒检查，不能冒充通过。
+    fn verify_memory_frame(&self) -> Result<(), String> {
+        let frame = self
+            .cpu_frame
+            .borrow()
+            .clone()
+            .ok_or("Memory 缺少原 CPU 帧观察")?;
+        frame.completed()
+    }
+
     /// 正文选择也属于原查询动作：即便正文未改，意外Next仍必须使该输入阶段失败。
     fn query_current(
         &self,
@@ -452,33 +792,80 @@ impl NativeMarkdownMemoryWorkload {
         })
     }
 
-    /// 使用正式窗口模式入口及原Capturing收据，不主动执行executor或补发新的源位置票。
+    /// 沿实际模式按钮 selector 变更同一 Body；动作前固定完整 Input 与首 scalar 屏幕位置。
     pub(crate) fn change_mode(&self, source: bool) -> Result<(), String> {
-        let mode = if source {
-            MarkdownPresentationMode::Source
-        } else {
-            MarkdownPresentationMode::InlinePreview
-        };
         let facts = self.facts()?;
-        let receipt = with_active_native_markdown_surface(|surface| {
+        let (controller, button, receipt) = with_active_native_markdown_surface(|surface| {
             if !self.current(surface, &facts) {
                 return Err("模式工作负载原窗口已失效".into());
             }
-            let editor = surface.editor.as_ref().ok_or("模式工作负载缺少编辑器")?;
-            let epoch = MemoryActionEpoch::capture(surface);
-            let receipt =
-                capture_native_markdown_probe_mode_receipt(editor, &surface.controller, mode)?;
-            surface.set_presentation_mode(mode)?;
-            if !self.current(surface, &facts) || !epoch.permits(surface) {
-                return Err("模式动作返回前原输入权限已失效".into());
-            }
-            Ok(MemoryModeObservation {
-                request: receipt,
-                epoch,
-            })
+            let before = MemoryActionEpoch::capture(surface);
+            let editor = surface.editor.as_ref().ok_or("模式入口缺少原文稿")?;
+            let target = if source {
+                MarkdownPresentationMode::Source
+            } else {
+                MarkdownPresentationMode::InlinePreview
+            };
+            let epoch = MemoryActionEpoch {
+                find: if editor.presentation_mode() != target {
+                    before.find.checked_add(1).ok_or("模式 Find 代次耗尽")?
+                } else {
+                    before.find
+                },
+                ..before
+            };
+            let verified_query = self
+                .verified_query
+                .get()
+                .filter(|(_, intent)| *intent == before.find)
+                .map(|(code, _)| code);
+            let request = Rc::new(mode_viewport::ModeViewportExpectation::capture(
+                surface, source,
+            )?);
+            let original_bar = editor.find_bar().borrow().clone();
+            let field = if let Some(bar) = original_bar.filter(|bar| bar.is_visible()) {
+                let fields = bar.fields();
+                let input = fields[0]
+                    .currentEditor()
+                    .ok_or("模式前没有原 Find 字段 editor")?;
+                let selection = input.selectedRange();
+                if !self.current(surface, &facts) || !before.permits(surface) {
+                    return Err("模式捕获原字段时输入已撤销".into());
+                }
+                Some((Rc::downgrade(&bar), selection))
+            } else {
+                None
+            };
+            let button = surface
+                .controller
+                .ivars()
+                .presentation_mode_button
+                .get()
+                .expect("正式窗口已装配原模式按钮")
+                .clone();
+            Ok((
+                surface.controller.clone(),
+                button,
+                MemoryModeObservation {
+                    request,
+                    epoch,
+                    verified_query,
+                    field,
+                },
+            ))
         })?;
+        // 归还 Active 租约后才交真实 target/action；不能在借出槽中让产品按钮被 Busy 拒绝。
+        button.setState(if source {
+            objc2_app_kit::NSControlStateValueOn
+        } else {
+            objc2_app_kit::NSControlStateValueOff
+        });
+        // SAFETY: 原 controller 与同窗口真实模式按钮均存活，selector 与生产按钮 ABI 相同。
+        unsafe {
+            let _: () = msg_send![&*controller, changeMarkdownPresentationMode: &*button];
+        }
         let previous = self.pending_mode.replace(Some(receipt));
-        drop(previous); // 只持原request的Rust Rc，正文/Native均为弱身份。
+        drop(previous); // 原观察只持弱身份；Native weak 的析构不跨工作负载 RefMut。
         Ok(())
     }
 
@@ -488,14 +875,6 @@ impl NativeMarkdownMemoryWorkload {
             .borrow_mut()
             .take()
             .ok_or("模式工作负载没有原收据")?;
-        if receipt.request.completed() != Some(true) {
-            println!(
-                "native_memory_mode completed={:?} phase={}",
-                receipt.request.completed(),
-                receipt.request.completion_phase()
-            );
-            return Err("原模式请求尚未成功完成真实源位置认证".into());
-        }
         let facts = self.facts()?;
         with_active_native_markdown_surface(|surface| {
             let mode = if source {
@@ -509,26 +888,47 @@ impl NativeMarkdownMemoryWorkload {
             {
                 return Err("模式工作负载实际模式或原正文不一致".into());
             }
+            receipt.request.verify(surface)?;
             let editor = surface.editor.as_ref().ok_or("模式验证缺少正文")?;
-            let _payload =
-                PayloadUseGuard::enter(&editor.backend.text_view.ivars().payload_use_depth);
+            let paged = editor;
             let current = || self.current(surface, &facts) && receipt.epoch.permits(surface);
-            let ruler = native_markdown_table_intent_step(&current, || {
-                editor.backend.scroll_view.rulersVisible()
-            })
-            .map_err(|_| "模式ruler检查已撤权")?;
+            let ruler =
+                native_markdown_table_intent_step(&current, || paged.scroll_view.rulersVisible())
+                    .map_err(|_| "模式 ruler 检查已撤权")?;
             if ruler != source {
-                return Err("实际模式与ruler展示不一致".into());
+                return Err("实际模式与 ruler 展示不一致".into());
             }
-            let bar = editor.find_bar.borrow().clone();
+            let bar = editor.find_bar().borrow().clone();
+            if receipt.field.is_some() && bar.as_ref().is_none_or(|bar| !bar.is_visible()) {
+                return Err("模式交接隐藏或释放了原可见 Find 栏".into());
+            }
             if let Some(bar) = bar.filter(|bar| bar.is_visible()) {
-                // 显示过Find后切模式不能改查询焦点；只比较两个暂持活对象，不输出地址或正文。
+                // 同栏真实 field editor 与窗口 responder 必须仍是同一对象，查询不借新字段补签。
                 let fields = native_markdown_table_intent_step(&current, || bar.fields())
                     .map_err(|_| "模式字段检查已撤权")?;
                 let input =
                     native_markdown_table_intent_step(&current, || fields[0].currentEditor())
                         .map_err(|_| "模式输入焦点已撤权")?
-                        .ok_or("模式切换丢失Find字段编辑关系")?;
+                        .ok_or("模式切换丢失 Find 编辑关系")?;
+                let Some((original_bar, field_selection)) = &receipt.field else {
+                    return Err("模式后出现了动作前不存在的 Find 字段".into());
+                };
+                if !std::rc::Weak::ptr_eq(original_bar, &Rc::downgrade(&bar))
+                    || input.selectedRange() != *field_selection
+                {
+                    return Err("模式交接替换了原 Find 栏或字段选择".into());
+                }
+                if let Some(code) = receipt.verified_query {
+                    let value = fields[0].stringValue();
+                    let expected = NSString::from_str(if code {
+                        "巨段落可见区域绘制检查"
+                    } else {
+                        "第115行"
+                    });
+                    if !value.isEqualToString(&expected) || !current() {
+                        return Err("模式交接改变了原已验证查询".into());
+                    }
+                }
                 let responder =
                     native_markdown_table_intent_step(&current, || surface.panel.firstResponder())
                         .map_err(|_| "模式窗口焦点已撤权")?
@@ -536,11 +936,14 @@ impl NativeMarkdownMemoryWorkload {
                 if std::ptr::from_ref(&*input).cast::<c_void>()
                     != std::ptr::from_ref(&*responder).cast::<c_void>()
                 {
-                    return Err("模式切换没有保持真实Find字段焦点".into());
+                    return Err("模式切换没有保持真实 Find 字段焦点".into());
                 }
             }
             if !current() {
-                return Err("模式焦点检查临时对象释放后已撤权".into());
+                return Err("模式焦点对象释放后原权限已撤销".into());
+            }
+            if let Some(code) = receipt.verified_query {
+                self.verified_query.set(Some((code, receipt.epoch.find)));
             }
             Ok(())
         })
@@ -559,9 +962,7 @@ impl NativeMarkdownMemoryWorkload {
                 return Err("Find栏原窗口已失效".into());
             }
             let editor = surface.editor.as_ref().ok_or("Find栏缺少编辑器")?;
-            let _payload =
-                PayloadUseGuard::enter(&editor.backend.text_view.ivars().payload_use_depth);
-            let bar = editor.find_bar.borrow().clone().ok_or("Find栏尚未建立")?;
+            let bar = editor.find_bar().borrow().clone().ok_or("Find栏尚未建立")?;
             if !bar.is_visible() {
                 return Err("Find栏没有实际显示".into());
             }
@@ -587,8 +988,6 @@ impl NativeMarkdownMemoryWorkload {
                 return Err("查询输入原窗口已失效".into());
             }
             let editor = surface.editor.as_ref().ok_or("查询输入缺少正文")?;
-            let _payload =
-                PayloadUseGuard::enter(&editor.backend.text_view.ivars().payload_use_depth);
             // 在currentEditor/selectText等首Native前固定方向完整的正文选择与全部原输入代次。
             let original = MemoryQueryObservation {
                 epoch: MemoryActionEpoch::capture(surface),
@@ -610,7 +1009,7 @@ impl NativeMarkdownMemoryWorkload {
             (|| -> Result<(), String> {
                 let current = || self.query_current(surface, &facts, original);
                 let bar = editor
-                    .find_bar
+                    .find_bar()
                     .borrow()
                     .clone()
                     .ok_or("查询输入缺少Find栏")?;
@@ -694,10 +1093,8 @@ impl NativeMarkdownMemoryWorkload {
                 ));
             }
             let editor = surface.editor.as_ref().ok_or("查询检查缺少正文")?;
-            let _payload =
-                PayloadUseGuard::enter(&editor.backend.text_view.ivars().payload_use_depth);
             let bar = editor
-                .find_bar
+                .find_bar()
                 .borrow()
                 .clone()
                 .ok_or("查询检查缺少Find栏")?;
@@ -734,40 +1131,42 @@ impl NativeMarkdownMemoryWorkload {
         let (epoch, before, expected, code, old_feedback) = with_active_native_markdown_surface(
             |surface| {
                 if !self.current(surface, &facts) {
-                    return Err("Next入口原窗口已失效".into());
+                    return Err("Next 入口原窗口已失效".into());
                 }
-                // 首Native前固定完整canonical选择与原输入；期望只由这些旧值计算，不读后继结果猜匹配。
                 let input_epoch = MemoryActionEpoch::capture(surface);
-                // 显式入口会推进同一原intent；首Native前预声明唯一后态，完成后不能从当前UI重签。
                 let epoch = MemoryActionEpoch {
                     find: input_epoch
                         .find
                         .checked_add(1)
-                        .ok_or("Next原输入代次耗尽")?,
+                        .ok_or("Next 原输入代次耗尽")?,
                     ..input_epoch
                 };
-                let (code, query_intent) =
-                    self.verified_query.get().ok_or("Next没有已验证的查询")?;
-                if query_intent != input_epoch.find {
-                    return Err("Next的原查询输入已变更".into());
+                let (code, intent) = self.verified_query.get().ok_or("Next 没有已验证的查询")?;
+                if intent != input_epoch.find {
+                    return Err("Next 原查询输入已变化".into());
                 }
-                let editor = surface.editor.as_ref().ok_or("Next入口缺少正文")?;
+                let editor = surface.editor.as_ref().ok_or("Next 没有实际正文")?;
+                let paged = editor;
                 let bar = editor
-                    .find_bar
+                    .find_bar()
                     .borrow()
                     .clone()
-                    .ok_or("Next入口缺少原Find栏")?;
+                    .ok_or("Next 没有原 Find 栏")?;
                 let old_feedback = NativeMarkdownFindViewportFeedback::capture(
                     &bar,
                     &surface.controller,
                     input_epoch.find,
                     true,
                 )
-                .ok_or("Next前无法捕获原已排队输入反馈")?;
-                if editor.backend.text_view.ivars().textkit_input_depth.get() != 0 {
-                    return Err("Next不能在未结束的原生正文输入中猜测选择".into());
-                }
+                .ok_or("Next 前无法捕获原排队反馈")?;
+                let input = paged
+                    .text_view
+                    .input_state()
+                    .map_err(|cause| cause.to_string())?;
                 let selection = editor.document().borrow().selection();
+                if input.marked.is_some() || input.directed_selection() != Some(selection) {
+                    return Err("Next 不能跳过原组字或未知方向选区".into());
+                }
                 let before = selection.anchor_utf16.min(selection.head_utf16)
                     ..selection.anchor_utf16.max(selection.head_utf16);
                 let candidates = if code {
@@ -775,34 +1174,21 @@ impl NativeMarkdownMemoryWorkload {
                 } else {
                     std::slice::from_ref(&facts.table_match)
                 };
-                let expected =
-                    memory_expected_next_match(candidates, !code, &before).ok_or_else(|| {
-                        format!("Next旧选择超出有限标记可证明域：preaction={before:?}")
-                    })?;
-                let _payload =
-                    PayloadUseGuard::enter(&editor.backend.text_view.ivars().payload_use_depth);
+                let expected = memory_expected_next_match(candidates, !code, &before)
+                    .ok_or_else(|| format!("Next 旧选择超出有限标记域：preaction={before:?}"))?;
                 let current = || self.current(surface, &facts) && input_epoch.permits(surface);
                 #[cfg(feature = "native-block-fragment-diagnostic")]
                 if code && surface.presentation_mode == MarkdownPresentationMode::InlinePreview {
-                    // 原实际body Weak与原序号在动作首Native前固定；不在观察paint后重新签票。
                     code_paint = Some(Rc::new(code_paint::ExpectedCodePaint::capture(
-                        &editor.backend.text_view,
+                        &paged.text_view,
                         &facts,
                         epoch,
                         &expected,
                         &current,
                     )?));
                 }
-                let actual = native_markdown_table_intent_step(&current, || {
-                    editor.backend.text_view.selectedRange()
-                })
-                .map_err(|_| "Next原选择读取期间已撤权")?;
-                if actual != NSRange::new(before.start, before.len()) {
-                    return Err(format!(
-                        "Next原选择尚未一致：preaction={before:?} actual={}..{}",
-                        actual.location,
-                        actual.location.saturating_add(actual.length)
-                    ));
+                if !current() || input.primary_range != NSRange::new(before.start, before.len()) {
+                    return Err("Next 前完整 Input 与原 canonical 选择不一致".into());
                 }
                 println!(
                     "native_memory_find_before preaction={before:?} expected={expected:?} code={code}"
@@ -810,102 +1196,102 @@ impl NativeMarkdownMemoryWorkload {
                 Ok((epoch, before, expected, code, old_feedback))
             },
         )?;
-        perform_native_markdown_find_action(MarkdownFindAction::Next)?;
+        // 原生产入口返回本次真实 Complete/Pending；不在后继从可变槽发现另一份请求补票。
+        let execution = perform_native_markdown_find_action(MarkdownFindAction::Next)?;
         let receipt = with_active_native_markdown_surface(|surface| {
             if !self.current(surface, &facts) || !epoch.permits(surface) {
-                return Err("Next返回时原正文已失效".into());
+                return Err("Next 返回时原正文已失效".into());
             }
-            let editor = surface.editor.as_ref().ok_or("Next缺少正文")?;
-            let view = &editor.backend.text_view;
-            let bar = editor.find_bar.borrow().clone().ok_or("Next缺少原Find栏")?;
-            let request = view
-                .observe_find_reveal_for_probe()
-                .ok_or_else(|| "Next返回时无法观察原请求，不能由slot为空推定成功".to_owned())?;
+            let editor = surface.editor.as_ref().ok_or("Next 返回缺少原正文")?;
+            let paged = editor;
+            let bar = editor
+                .find_bar()
+                .borrow()
+                .clone()
+                .ok_or("Next 返回缺少原栏")?;
+            let input = match &execution {
+                NativeMarkdownFindExecution::Complete => paged
+                    .text_view
+                    .input_state()
+                    .map_err(|cause| cause.to_string())?,
+                NativeMarkdownFindExecution::Pending(request) => request.input_state(),
+            };
+            if input.primary_range != NSRange::new(expected.start, expected.len())
+                || paged
+                    .text_view
+                    .input_state()
+                    .map_err(|cause| cause.to_string())?
+                    != input
+                || old_feedback.current(&surface.controller)
+            {
+                return Err("Next 没有提交原预期选择或没有撤销旧输入反馈".into());
+            }
             let current = || self.current(surface, &facts) && epoch.permits(surface);
-            if old_feedback.current(&surface.controller) {
-                return Err("显式Next没有撤销原已排队输入反馈".into());
-            }
-            let selection = editor.document().borrow().selection();
             let status =
                 native_markdown_table_intent_step(&current, || bar.probe_feedback_status())
-                    .map_err(|_| "Next状态观察期间原权限已撤销")?;
-            // 交付同一旧输入收据的真实生产入口；两次操作都无权清反馈、取走新请求或改变选择。
+                    .map_err(|_| "Next 状态读取时失权")?;
+            // 旧反馈的原 clear/run 必须保持新 Find 的完整输入、状态和实际原请求，不能取消新定位。
             old_feedback.clear(&surface.controller);
             old_feedback.run(&surface.controller);
-            if !view
-                .observe_find_reveal_for_probe()
-                .is_some_and(|pending| Rc::ptr_eq(&pending, &request))
-                || editor.document().borrow().selection() != selection
+            let after = native_markdown_table_intent_step(&current, || bar.probe_feedback_status())
+                .map_err(|_| "旧反馈交付后原 Next 已失权")?;
+            let unchanged =
+                native_markdown_table_intent_step(&current, || status.isEqualToString(&after))
+                    .map_err(|_| "Next 状态比较时失权")?;
+            drop((status, after));
+            if !unchanged
                 || !current()
+                || paged
+                    .text_view
+                    .input_state()
+                    .map_err(|cause| cause.to_string())?
+                    != input
+                || matches!(&execution, NativeMarkdownFindExecution::Pending(request)
+                    if request.probe_completed() == Some(false))
             {
-                return Err("旧输入反馈撤销了显式Next请求或改变原选择".into());
+                return Err("旧输入反馈覆盖了原 Next 请求、选择或状态".into());
             }
-            let after_status =
-                native_markdown_table_intent_step(&current, || bar.probe_feedback_status())
-                    .map_err(|_| "Next旧反馈交付后原权限已撤销")?;
-            let unchanged = native_markdown_table_intent_step(&current, || {
-                status.isEqualToString(&after_status)
-            })
-            .map_err(|_| "Next状态比较期间原权限已撤销")?;
-            drop(after_status);
-            drop(status);
-            if !unchanged || !current() {
-                return Err("旧输入反馈覆盖显式Next状态".into());
-            }
-            // 字段值没有变化；只沿首Native前声明的显式后态延续原查询证明，便于下一次Next。
             self.verified_query.set(Some((code, epoch.find)));
-            Ok(request)
+            let frame = MemoryFrameObservation::capture(surface, &facts, epoch, input)?;
+            Ok(Rc::new(MemoryFindObservation {
+                execution,
+                input,
+                mode: paged.body.presentation_mode(),
+                frame,
+                epoch,
+                before,
+                expected,
+                code,
+                #[cfg(feature = "native-block-fragment-diagnostic")]
+                code_paint,
+            }))
         })?;
-        let previous = self.pending_find.replace(Some(MemoryFindObservation {
-            request: receipt,
-            epoch,
-            before,
-            expected,
-            code,
-            #[cfg(feature = "native-block-fragment-diagnostic")]
-            code_paint,
-        }));
+        let previous = self.pending_find.replace(Some(receipt));
         drop(previous);
         Ok(())
     }
 
     #[cfg(feature = "native-block-fragment-diagnostic")]
-    /// Find实际终点与背景paint分别消费；闭包只持原弱票，任何路径都不重跑Find动作。
+    /// 原 Find 和完整 CPU 帧已终结后才核同一实际代码背景；不另注册没有生产者的第二帧。
     pub(crate) fn observe_preview_find_paint(
         &self,
         observer: impl FnOnce() + 'static,
     ) -> Result<(), String> {
-        let (request, paint) = self
+        let receipt = self
             .pending_find
             .borrow()
-            .as_ref()
-            .map(|receipt| {
-                (
-                    Rc::clone(&receipt.request),
-                    receipt.code_paint.as_ref().map(Rc::clone),
-                )
-            })
-            .ok_or("背景终点观察缺少原Find票据")?;
-        let paint = paint.ok_or("背景终点观察缺少原Preview代码动作票")?;
-        let continuation: MemoryPaintContinuation = Rc::new(RefCell::new(Some(Box::new(observer))));
-        let later_continuation = Rc::clone(&continuation);
-        let later_request = Rc::downgrade(&request); // observer不能反向强持它所属的原request而形成自环。
-        let later_paint = Rc::clone(&paint);
-        let terminal = request.observe_probe_terminal(move || {
-            let observer = later_continuation.borrow_mut().take();
-            if let Some(observer) = observer {
-                // 原Find observer借用与本续体借用均已结束，才能观察Native准备或投递后继事件。
-                later_paint.after_find_terminal(later_request.upgrade(), observer);
+            .clone()
+            .ok_or("背景观察缺少原 Find 请求")?;
+        let paint = receipt
+            .code_paint
+            .clone()
+            .ok_or("背景观察缺少原 Preview 代码动作")?;
+        let weak = Rc::downgrade(&receipt);
+        receipt.observe_terminal(move || {
+            if let Some(receipt) = weak.upgrade() {
+                paint.after_find_terminal(receipt, Box::new(observer));
             }
-        })?;
-        if terminal {
-            let observer = continuation
-                .borrow_mut()
-                .take()
-                .ok_or("原背景终点续体重复消费")?;
-            paint.after_find_terminal(Some(request), observer); // 注册前已完成也走同一条原票链。
-        }
-        Ok(())
+        })
     }
 
     pub(crate) fn verify_find(&self, code: bool, second: bool) -> Result<(), String> {
@@ -913,63 +1299,72 @@ impl NativeMarkdownMemoryWorkload {
             .pending_find
             .borrow_mut()
             .take()
-            .ok_or("Find工作负载缺少原请求")?;
-        if receipt.request.probe_completed() != Some(true) {
-            return Err("原Find请求未完成整批布局与真实可见性认证".into());
-        }
+            .ok_or("Find 工作负载缺少原请求")?;
+        receipt.completed()?;
         let facts = self.facts()?;
         if receipt.code != code {
-            return Err("Find检查阶段与原已验证查询不一致".into());
+            return Err("Find 检查阶段与原查询不一致".into());
         }
-        // second只标识driver的Preview后Next阶段；真正期望来自该次动作前的选择，不能固定假设首项。
-        let expected = &receipt.expected;
         with_active_native_markdown_surface(|surface| {
             let current = || self.current(surface, &facts) && receipt.epoch.permits(surface);
             if !current() {
-                return Err("Find检查原窗口已失效".into());
+                return Err("Find 检查原窗口已失效".into());
             }
-            let editor = surface.editor.as_ref().ok_or("Find检查缺少正文")?;
-            let _payload =
-                PayloadUseGuard::enter(&editor.backend.text_view.ivars().payload_use_depth);
-            let bar = editor.find_bar.borrow().clone().ok_or("Find检查缺少原栏")?;
-            let selected = native_markdown_table_intent_step(&current, || {
-                editor.backend.text_view.selectedRange()
-            })
-            .map_err(|_| "Find检查已撤权")?;
-            if selected != NSRange::new(expected.start, expected.len()) {
+            let editor = surface.editor.as_ref().ok_or("Find 检查缺少正文")?;
+            let paged = editor;
+            let bar = editor
+                .find_bar()
+                .borrow()
+                .clone()
+                .ok_or("Find 检查没有原栏")?;
+            let input = paged
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            let expected = &receipt.expected;
+            if input != receipt.input
+                || input.primary_range != NSRange::new(expected.start, expected.len())
+                || paged.body.presentation_mode() != receipt.mode
+            {
                 return Err(format!(
-                    "Find没有选中预定的原文匹配：preaction={:?} expected={expected:?} actual={}..{}",
-                    receipt.before,
-                    selected.location,
-                    selected.location.saturating_add(selected.length)
+                    "Find 原完整 Input 或选择错误：preaction={:?} expected={expected:?} actual={:?}",
+                    receipt.before, input.primary_range
                 ));
             }
-            let frame = editor
-                .backend
+            let key = paged
                 .text_view
-                .source_probe_segment(&(expected.start..expected.start + 1), &current)
-                .map_err(|_| "Find检查无法取得真实首scalar")?;
-            let visible = native_markdown_table_intent_step(&current, || {
-                editor.backend.text_view.visibleRect()
-            })
-            .map_err(|_| "Find检查可见区已撤权")?;
-            let in_view =
-                native_markdown_minimal_cell_scroll_origin(frame, visible).is_some_and(|origin| {
-                    (origin.x - visible.origin.x).abs() <= 0.5
-                        && (origin.y - visible.origin.y).abs() <= 0.5
-                });
+                .capture_ready_scene_key()
+                .map_err(|cause| cause.to_string())?;
+            let proof = paged
+                .text_view
+                .verify_find_target_visible(&key, NSRange::new(expected.start, expected.len()))
+                .map_err(|cause| cause.to_string())?;
+            let frame = proof.first_rect();
+            let visible = key.request.viewport;
             let feedback =
                 native_markdown_table_intent_step(&current, || bar.probe_found_feedback())
-                    .map_err(|_| "Find反馈检查已撤权")?;
-            if !in_view || !feedback {
-                return Err("原Find成功收据与实际字形或反馈不一致".into());
+                    .map_err(|_| "Find 反馈检查已失权")?;
+            if !feedback
+                || !current()
+                || !paged
+                    .text_view
+                    .capture_ready_scene_key()
+                    .map_err(|cause| cause.to_string())?
+                    .same(&key)
+                || paged
+                    .text_view
+                    .probe_cpu_published_frame()
+                    .is_none_or(|(actual, paints)| !actual.same(&key) || paints == 0)
+                || paged.text_view.cpu_paint_pending() != Some(false)
+            {
+                return Err("原 Find 成功终点与实际当前字形、完整帧或反馈不一致".into());
             }
             if code && second {
                 #[cfg(feature = "native-block-fragment-diagnostic")]
                 receipt
                     .code_paint
                     .as_ref()
-                    .ok_or("Preview代码背景缺少原Find动作前的观察票")?
+                    .ok_or("Preview 代码背景没有原动作观察")?
                     .verify(surface, &current)?;
                 #[cfg(not(feature = "native-block-fragment-diagnostic"))]
                 println!(
@@ -977,22 +1372,19 @@ impl NativeMarkdownMemoryWorkload {
                 );
             }
             println!(
-                "native_memory_find verified=true selected_start={} selected_units={} glyph_screen_y={} preview_next={second}",
-                selected.location,
-                selected.length,
-                frame.origin.y - visible.origin.y
+                "native_memory_find verified=true selected_start={} selected_units={} glyph_screen_y={} preview_next={second} actual_cpu_mode={:?}",
+                input.primary_range.location,
+                input.primary_range.length,
+                frame.origin.y - visible.origin.y,
+                key.presentation_mode,
             );
             if std::env::var_os("OMNI_NATIVE_PROBE_TRACE").is_some() {
-                // 原Find收据、字形与反馈先按原门禁通过；以下显式诊断不改变动作或成功条件。
-                view_geometry::trace_memory_view_geometry(editor, &current);
-                trace_memory_find_fragment_geometry(
-                    editor,
-                    &current,
-                    expected.start,
-                    facts.length,
+                eprintln!(
+                    "native_memory_paged_frame generation={} mode={:?} viewport={:?} actual_paints={:?}",
+                    input.generation,
+                    key.presentation_mode,
                     visible,
-                    code,
-                    second,
+                    paged.text_view.cpu_paints()
                 );
             }
             Ok(())
@@ -1001,15 +1393,28 @@ impl NativeMarkdownMemoryWorkload {
 
     /// 合成“返回”只进入正式typed退出，不调用NSApplication.terminate或跳过严格释放。
     pub(crate) fn request_return(&self) -> Result<(), String> {
+        let facts = self.facts()?;
+        let relative = self.relative_link.borrow().clone();
+        // 关闭只核原Host窗口与真实输入客户，不拿只读g0阻止已接纳的编辑或历史退出。
+        // 相对链接的唯一目标仍交原弱票核验；后来打开的同名Doc不能接管失败清理。
+        with_active_native_markdown_surface(|surface| {
+            if let Some(relative) = relative.as_ref() {
+                relative.require_return_current(surface)
+            } else if memory_workload_identity_current(surface, &facts) {
+                Ok(())
+            } else {
+                Err("原Host工作负载会话已经失效，不能关闭后继笔记".into())
+            }
+        })?;
+        if let Some(relative) = relative {
+            relative.prepare_return(); // Native注销与FD归还均在工作负载槽借用之外完成。
+        }
+        let frame = self.cpu_frame.borrow_mut().take();
         let mode = self.pending_mode.borrow_mut().take();
         let find = self.pending_find.borrow_mut().take();
         let highlights = self.find_highlights.borrow_mut().take();
-        drop((mode, find, highlights)); // 原动作票和有限颜色样本先离开借用，再释放其弱观察载荷。
-        #[cfg(all(
-            feature = "native-raster-surface-probe",
-            feature = "native-close-stage-diagnostic"
-        ))]
-        self.capture_raster_close_observation()?;
+        let source = self.source_session.borrow_mut().take();
+        drop((frame, mode, find, highlights, source)); // 原动作票和有限颜色样本先离开借用，再释放其弱观察载荷。
         request_native_markdown_window_exit()
     }
 
@@ -1022,8 +1427,7 @@ impl NativeMarkdownMemoryWorkload {
         saved_disk: (u64, u64, u64, i64, i64),
     ) -> Result<(), String> {
         let stored = self.facts()?;
-        if !matches!(self.owner, MemoryWorkloadOwner::Hosted)
-            || stored.owner != original.owner
+        if stored.owner != original.owner
             || !WeakMarkdownDocument::ptr_eq(&stored.document, &original.document)
             || stored.generation != original.generation
             || stored.length != original.length
@@ -1070,30 +1474,6 @@ impl NativeMarkdownMemoryWorkload {
         Ok(())
     }
 
-    /// 只有产品实际finish_close之后检查原文件及空owner；这里不等待survivor变nil。
-    pub(crate) fn finish(&self) -> Result<(), String> {
-        let MemoryWorkloadOwner::Standalone {
-            workspace,
-            lifecycle,
-        } = &self.owner
-        else {
-            // Hosted的生命周期收据由真实Host验收；不能借独立驱动入口代签Host完成。
-            return Err("Hosted工作负载不能使用独立驱动的关闭完成入口".into());
-        };
-        if !lifecycle.valid.get()
-            || lifecycle.completed.get().is_none()
-            || lifecycle.completed.get() != lifecycle.accepted.get()
-        {
-            return Err("工作负载没有收到真实唯一严格关闭收据".into());
-        }
-        self.verify_native_closed()?;
-        workspace.close_session();
-        println!(
-            "native_memory_strict_close passed=true bytes_unchanged=true metadata_unchanged=true"
-        );
-        Ok(())
-    }
-
     /// 只核Native完整空owner、原正文死亡与磁盘未变；不推断Host收据、session Drop或启动器状态。
     fn verify_native_closed(&self) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
@@ -1106,6 +1486,19 @@ impl NativeMarkdownMemoryWorkload {
             return Err("工作负载原Native前台、关闭或验证owner仍未释放".into());
         }
         let facts = self.facts()?;
+        if facts.document.upgrade().is_some()
+            || facts.body.upgrade().is_some()
+            || facts.input.upgrade().is_some()
+        {
+            return Err("工作负载原Doc/Body/Input尚未释放".into());
+        }
+        let relative = self.relative_link.borrow().clone();
+        if let Some(relative) = relative {
+            // 相对链接具有预声明的真实未保存编辑，Return会保存它；只读facts仍保持原值。
+            // 独立FD和原编辑revision核实际落盘及资源，driver保存的功能首因不受此清理结果改写。
+            relative.verify_closed()?;
+            return Ok(());
+        }
         let metadata = std::fs::metadata(&self.path).map_err(|_| "关闭后无法核对合成文件")?;
         let disk = (
             metadata.dev(),
@@ -1114,8 +1507,8 @@ impl NativeMarkdownMemoryWorkload {
             metadata.mtime(),
             metadata.mtime_nsec(),
         );
-        if disk != facts.disk || facts.document.upgrade().is_some() {
-            return Err("只读工作负载改变了文件元数据或保活正文".into());
+        if disk != facts.disk {
+            return Err("只读工作负载改变了文件元数据".into());
         }
         let saved = MarkdownDocumentBuffer::open(&self.path, 2 * 1_024 * 1_024)
             .map_err(|_| "关闭后无法验证合成文件内容")?;
@@ -1127,353 +1520,10 @@ impl NativeMarkdownMemoryWorkload {
             return Err("只读工作负载改变了合成文件字节".into());
         }
         drop(saved);
-        #[cfg(all(
-            feature = "native-raster-surface-probe",
-            feature = "native-close-stage-diagnostic"
-        ))]
-        self.clear_raster_close_observation(); // 真实严格完成后移出并归还诊断 Weak，不进入驻留测量。
         Ok(())
     }
 }
 
-/// 片段诊断只保存有限矩形标量；最大宽、高、面积分别统计，不把面积最大的矩形当作所有维度的上界。
-#[derive(Clone, Copy, Default)]
-struct MemoryFragmentBounds {
-    count: usize,
-    max_width: f64,
-    max_height: f64,
-    max_area: f64,
-    largest: Option<NSRect>,
-}
-
-impl MemoryFragmentBounds {
-    /// 非有限坐标、负尺寸或乘积溢出不进入最大值；返回值只标识该合法矩形是否成为最大面积候选。
-    fn observe(&mut self, bounds: NSRect) -> Option<bool> {
-        let area = bounds.size.width * bounds.size.height;
-        if ![
-            bounds.origin.x,
-            bounds.origin.y,
-            bounds.size.width,
-            bounds.size.height,
-            bounds.origin.x + bounds.size.width,
-            bounds.origin.y + bounds.size.height,
-            area,
-        ]
-        .iter()
-        .all(|value| value.is_finite())
-            || bounds.size.width < 0.0
-            || bounds.size.height < 0.0
-        {
-            // 无法解释的几何保持“不完整”，不能用截断值制造有限surface证据。
-            return None;
-        }
-        let largest = self.largest.is_none() || area > self.max_area;
-        self.count += 1;
-        self.max_width = self.max_width.max(bounds.size.width);
-        self.max_height = self.max_height.max(bounds.size.height);
-        self.max_area = self.max_area.max(area);
-        if largest {
-            // 只复制CGRect，不保留fragment、surface对象或正文。
-            self.largest = Some(bounds);
-        }
-        Some(largest)
-    }
-}
-
-/// 固定大小的本地聚合；状态顺序为None、Estimated、Calculated、LayoutAvailable和未知值。
-#[derive(Clone, Copy, Default)]
-struct MemoryFragmentGeometry {
-    visited: usize,
-    states: [usize; 5],
-    frames: MemoryFragmentBounds,
-    surfaces: MemoryFragmentBounds,
-    largest_surface_fragment: Option<NSRect>,
-    // 这些只是已观察source的包络，不能将未布局/未访问的中间区域称为连续覆盖。
-    source_coverage: Option<(usize, usize)>,
-    visible_source_coverage: Option<(usize, usize)>,
-    target_covered: bool,
-    invalid: usize,
-    limit: bool,
-    stale: bool,
-    incomplete: bool,
-}
-
-/// 单个callback只返回值，不把range/location/fragment claim带到聚合或下一方向。
-struct MemoryFragmentMeasurement {
-    frame: NSRect,
-    surface: NSRect,
-    source: (usize, usize),
-}
-
-/// 从原目标两向观察现有布局；公开getter/枚举未承诺零分配，本诊断不充当原样footprint验收。
-fn trace_memory_find_fragment_geometry(
-    surface: &NativeMarkdownEditorSurface,
-    current: &impl Fn() -> bool,
-    target: usize,
-    length: usize,
-    visible: NSRect,
-    code: bool,
-    second: bool,
-) {
-    const MAX_FRAGMENTS_PER_DIRECTION: usize = 128;
-    let empty = MemoryFragmentGeometry {
-        incomplete: true,
-        ..MemoryFragmentGeometry::default()
-    };
-    let captured = autoreleasepool(|_| {
-        let view = &surface.backend.text_view;
-        let manager = &surface.backend.text_layout_manager;
-        let content = &surface.backend.text_content_storage;
-        let origin = native_markdown_table_intent_step(current, || view.textContainerOrigin())?;
-        if target > length || !origin.x.is_finite() || !origin.y.is_finite() {
-            // 原目标越界或真实origin非法时不改用文档起点，也不截断成另一个候选。
-            return Err(NativeMarkdownStableTableFailure::InvalidSourceAssociation);
-        }
-        let provider = ProtocolObject::<dyn NSTextElementProvider>::from_ref(&**content);
-        let range = native_markdown_table_intent_step(current, || provider.documentRange())?;
-        let start = native_markdown_table_intent_step(current, || range.location())?;
-        let offset = isize::try_from(target)
-            .map_err(|_| NativeMarkdownStableTableFailure::InvalidSourceAssociation)?;
-        let location = native_markdown_table_intent_step(current, || {
-            content.locationFromLocation_withOffset(&start, offset)
-        })?
-        .ok_or(NativeMarkdownStableTableFailure::InvalidSourceAssociation)?;
-        let mut directions = [empty; 2];
-        for (direction, reverse) in [false, true].into_iter().enumerate() {
-            // 前向包含目标fragment；公开Reverse从包含目标的前一个fragment开始，不靠docedge走到目标。
-            let summary = Cell::new(MemoryFragmentGeometry::default());
-            let block = block2::RcBlock::new(
-                |pointer: NonNull<objc2_app_kit::NSTextLayoutFragment>| -> objc2::runtime::Bool {
-                    let mut observed = summary.get();
-                    let authorized = current();
-                    if !authorized || observed.visited == MAX_FRAGMENTS_PER_DIRECTION {
-                        // 撤权或额度用尽即停止；即使平台继续callback也不读取额外Native属性。
-                        observed.stale |= !authorized;
-                        observed.limit |= observed.visited == MAX_FRAGMENTS_PER_DIRECTION;
-                        observed.incomplete = true;
-                        summary.set(observed);
-                        return objc2::runtime::Bool::NO;
-                    }
-                    observed.visited += 1;
-                    // SAFETY: 同步NS_NOESCAPE枚举仅在callback内借出活fragment，不retain也不保存地址。
-                    let fragment = unsafe { pointer.as_ref() };
-                    let measurements: Result<
-                        Option<MemoryFragmentMeasurement>,
-                        NativeMarkdownStableTableFailure,
-                    > = (|| {
-                        let state =
-                            native_markdown_table_intent_step(current, || fragment.state())?;
-                        let index = match state {
-                            objc2_app_kit::NSTextLayoutFragmentState::None => 0,
-                            objc2_app_kit::NSTextLayoutFragmentState::EstimatedUsageBounds => 1,
-                            objc2_app_kit::NSTextLayoutFragmentState::CalculatedUsageBounds => 2,
-                            objc2_app_kit::NSTextLayoutFragmentState::LayoutAvailable => 3,
-                            _ => 4, // 未知状态不假定具有surface/source测量许可。
-                        };
-                        observed.states[index] += 1;
-                        if state != objc2_app_kit::NSTextLayoutFragmentState::LayoutAvailable {
-                            // 未布局对象严格只计状态；不查frame/range/surface，也不要求ensure。
-                            observed.incomplete = true;
-                            return Ok(None);
-                        }
-                        let frame = native_markdown_table_intent_step(current, || {
-                            fragment.layoutFragmentFrame()
-                        })?;
-                        let before_surface =
-                            native_markdown_table_intent_step(current, || fragment.state())?;
-                        if before_surface != state {
-                            // frame getter若改变状态，原状态不再授予读取surface的许可。
-                            observed.incomplete = true;
-                            return Ok(None);
-                        }
-                        let rendering = native_markdown_table_intent_step(current, || {
-                            fragment.renderingSurfaceBounds()
-                        })?;
-                        let source_range = native_markdown_table_intent_step(current, || {
-                            fragment.rangeInElement()
-                        })?;
-                        let source_start =
-                            native_markdown_table_intent_step(current, || source_range.location())?;
-                        let source_end = native_markdown_table_intent_step(current, || {
-                            source_range.endLocation()
-                        })?;
-                        let from = native_markdown_table_intent_step(current, || {
-                            content.offsetFromLocation_toLocation(&start, &source_start)
-                        })?;
-                        let to = native_markdown_table_intent_step(current, || {
-                            content.offsetFromLocation_toLocation(&start, &source_end)
-                        })?;
-                        let from = usize::try_from(from).map_err(|_| {
-                            NativeMarkdownStableTableFailure::InvalidSourceAssociation
-                        })?;
-                        let to = usize::try_from(to).map_err(|_| {
-                            NativeMarkdownStableTableFailure::InvalidSourceAssociation
-                        })?;
-                        if from > to || to > length {
-                            // 失真的全局坐标不能进入sourceCoverage；不靠clamp掩盖非法range。
-                            return Err(NativeMarkdownStableTableFailure::InvalidSourceAssociation);
-                        }
-                        let after =
-                            native_markdown_table_intent_step(current, || fragment.state())?;
-                        if after != state {
-                            observed.incomplete = true;
-                            return Ok(None); // 读间布局变化不合成一个稳定的几何样本。
-                        }
-                        Ok(Some(MemoryFragmentMeasurement {
-                            frame,
-                            surface: rendering,
-                            source: (from, to),
-                        }))
-                    })(); // range及两个location claim先drop，再认证原票并发布Copy标量。
-                    if !current() {
-                        observed.stale = true;
-                        observed.incomplete = true;
-                    } else {
-                        match measurements {
-                            Ok(Some(measured)) => {
-                                let source = measured.source;
-                                observed.source_coverage =
-                                    Some(observed.source_coverage.map_or(source, |old| {
-                                        (old.0.min(source.0), old.1.max(source.1))
-                                    }));
-                                observed.target_covered |= source.0 <= target
-                                    && (target < source.1
-                                        || (target == length && source.1 == length));
-                                // frame在text container坐标，移到本次原view clip；不截断合法负origin。
-                                let displayed = NSRect::new(
-                                    NSPoint::new(
-                                        measured.frame.origin.x + origin.x,
-                                        measured.frame.origin.y + origin.y,
-                                    ),
-                                    measured.frame.size,
-                                );
-                                let valid_frame = observed.frames.observe(measured.frame).is_some()
-                                    && [
-                                        displayed.origin.x,
-                                        displayed.origin.y,
-                                        displayed.origin.x + displayed.size.width,
-                                        displayed.origin.y + displayed.size.height,
-                                    ]
-                                    .iter()
-                                    .all(|value| value.is_finite());
-                                if !valid_frame {
-                                    observed.invalid += 1;
-                                    observed.incomplete = true;
-                                } else if NSIntersectsRect(displayed, visible) {
-                                    observed.visible_source_coverage = Some(
-                                        observed.visible_source_coverage.map_or(source, |old| {
-                                            (old.0.min(source.0), old.1.max(source.1))
-                                        }),
-                                    );
-                                }
-                                match observed.surfaces.observe(measured.surface) {
-                                    Some(true) => {
-                                        observed.largest_surface_fragment = Some(measured.frame);
-                                    }
-                                    Some(false) => {} // 非最大候选仍计入各维度最大值。
-                                    None => {
-                                        observed.invalid += 1;
-                                        observed.incomplete = true;
-                                    }
-                                }
-                            }
-                            Ok(None) => {} // 未布局或状态变化仅有计数，不推断source范围。
-                            Err(_) => {
-                                observed.invalid += 1;
-                                observed.incomplete = true;
-                            }
-                        }
-                    }
-                    if observed.visited == MAX_FRAGMENTS_PER_DIRECTION {
-                        observed.limit = true;
-                        observed.incomplete = true; // 无法证明没有下一fragment，满额即不完整。
-                    }
-                    let proceed = !observed.stale && !observed.limit;
-                    summary.set(observed);
-                    // 不按第一个离屏frame提前停，避免遗漏延伸回clip的巨大extent。
-                    proceed.into()
-                },
-            );
-            let options = if reverse {
-                objc2_app_kit::NSTextLayoutFragmentEnumerationOptions::Reverse
-            } else {
-                objc2_app_kit::NSTextLayoutFragmentEnumerationOptions::empty()
-            };
-            let enumerated = native_markdown_table_intent_step(current, || {
-                // 两向均不请求estimate/ensure/extra-line，也不查询viewport.range。
-                manager.enumerateTextLayoutFragmentsFromLocation_options_usingBlock(
-                    Some(&location),
-                    options,
-                    &block,
-                )
-            });
-            let failed = enumerated.is_err();
-            drop(enumerated);
-            drop(block); // 返回location/block释放后仍用原票，无RefCell借用跨Native或Drop。
-            let mut observed = summary.get();
-            if failed || !current() {
-                observed.stale = true;
-                observed.incomplete = true;
-            }
-            directions[direction] = observed;
-            if observed.stale {
-                break; // 失效后不为另一方向重采权限；未执行方向保留incomplete初值。
-            }
-        }
-        let after_visible = native_markdown_table_intent_step(current, || view.visibleRect())?;
-        let after_origin =
-            native_markdown_table_intent_step(current, || view.textContainerOrigin())?;
-        if after_visible != visible || after_origin != origin {
-            for observed in &mut directions {
-                observed.incomplete = true; // 不同viewport时刻的读数不冒称同一完整屏幕快照。
-            }
-        }
-        Ok(directions)
-    }); // 原document range/start/target location及全部pool临时claims先结束，仅Copy统计跨pool。
-    let (mut directions, setup_failure) = match captured {
-        Ok(directions) => (directions, None),
-        Err(error) => ([empty; 2], Some(error)), // 原票或位置取得失败只记诊断，不改变Find原结果。
-    };
-    let authorized = current();
-    for (direction, summary) in directions.iter_mut().enumerate() {
-        if !authorized || summary.frames.count == 0 || summary.surfaces.count == 0 {
-            summary.stale |= !authorized;
-            summary.incomplete = true; // 零样本/最终Native Drop撤权都不能构成覆盖证明。
-        }
-        let direction = if direction == 0 { "forward" } else { "reverse" };
-        println!(
-            "native_memory_fragment_geometry direction={direction} target={target} count={} states={:?} sourceCoverage={:?} visibleSourceCoverage={:?} targetCovered={} coverage_kind=envelope invalid={} limit={} stale={} incomplete={} setup_failure={setup_failure:?} code={code} preview_next={second}",
-            summary.visited,
-            summary.states,
-            summary.source_coverage,
-            summary.visible_source_coverage,
-            summary.target_covered,
-            summary.invalid,
-            summary.limit,
-            summary.stale,
-            summary.incomplete
-        );
-        println!(
-            "native_memory_fragment_frames direction={direction} count={} max_width={} max_height={} max_area={} largest={:?}",
-            summary.frames.count,
-            summary.frames.max_width,
-            summary.frames.max_height,
-            summary.frames.max_area,
-            summary.frames.largest
-        );
-        println!(
-            "native_memory_fragment_surfaces direction={direction} count={} max_width={} max_height={} max_area={} largest={:?} fragment={:?}",
-            summary.surfaces.count,
-            summary.surfaces.max_width,
-            summary.surfaces.max_height,
-            summary.surfaces.max_area,
-            summary.surfaces.largest,
-            summary.largest_surface_fragment
-        );
-    }
-}
-
-/// 每种marker最多保留三处坐标，核心字面扫描不复制整段/全部命中或建立第二个文档。
 fn memory_marker_ranges(
     document: &MarkdownDocumentBuffer,
     query: &str,
@@ -1613,7 +1663,7 @@ impl ProbeParagraphObservations {
 
 /// 只读已经完成的可见布局；空options不要求ensure，不创建paragraph或替代delegate。
 fn capture_probe_paragraph_observations(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
 ) -> ProbeParagraphObservations {
     const MAX_VISITED: usize = 32;
     let _payload = PayloadUseGuard::enter(&surface.backend.text_view.ivars().payload_use_depth);
@@ -1787,8 +1837,31 @@ impl NativeMarkdownRuntimeProbeCompletion {
     pub fn failure_diagnostic(&self, _mtm: MainThreadMarker) -> String {
         // Every temporary native upgrade immediately becomes a boolean. This diagnostic cannot
         // accept a survivor, schedule another check or convert missing completion into success.
+        let owned = self.owned.verify_released().err();
+        // 只在原失败出口检查同一懒建字段；全部临时Native claim在本地池归还，
+        // 只带出公开关系和长度，不读取草稿正文，也不改变仍存活控件的任何关系。
+        let cell = autoreleasepool(|_| {
+            self.table_cell_editor
+                .as_ref()
+                .and_then(Weak::load)
+                .map(|field| {
+                    // SAFETY: 失败观察仍在AppKit主线程，局部Retained保护同一活字段；
+                    // superview仅查询当前公开层级，不沿已释放的旧父图保存或发送后继消息。
+                    let parent = unsafe { field.superview() }.is_some();
+                    format!(
+                        "hidden={} parent={} window={} current_editor={} delegate={} target={} units={}",
+                        field.isHidden(),
+                        parent,
+                        field.window().is_some(),
+                        field.currentEditor().is_some(),
+                        field.delegate().is_some(),
+                        field.target().is_some(),
+                        field.stringValue().length(),
+                    )
+                })
+        });
         format!(
-            "cohort=[{}] canonical_released_synchronously={} panel={} root={} document={} scroll={} gutter={} storage={} view={} content={} manager={} container={} cell={}",
+            "cohort=[{}] canonical_released_synchronously={} panel={} root={} document={} scroll={} gutter={} storage={} view={} content={} manager={} container={} cell={} owned={owned:?} cell_relations={cell:?}",
             self.cohort.diagnostic(),
             self.release_barrier.canonical_released_synchronously(),
             self.panel.load().is_some(),
@@ -1923,7 +1996,7 @@ pub struct NativeMarkdownRuntimeProbeSession {
     // 测试图真实跨事件持有同一panel/controller；异常drop先撤此lease，再释放下面的Native图。
     table_owner_lease: RefCell<Option<ProbeEditingOwnerLease>>,
     application: Retained<NSApplication>,
-    surface: NativeMarkdownEditorSurface,
+    surface: NativeMarkdownTextKitEditorSurface,
     panel: Retained<NativeMarkdownPanel>,
     container_view: Retained<NSView>,
     controller: Retained<NativeMarkdownController>,
@@ -1967,7 +2040,7 @@ pub fn run_native_markdown_runtime_probe(
     let owned = Rc::new(NativeMarkdownOwnedLedger::default());
     // 首次构造Native编辑器前固定唯一夹具尺寸，后面的parent不再使用另一套默认宽度。
     let fixture_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(720.0, 520.0));
-    let surface = NativeMarkdownEditorSurface::new_with_mode(
+    let surface = NativeMarkdownTextKitEditorSurface::new_with_mode(
         document,
         fixture_frame,
         MarkdownPresentationMode::InlinePreview,
@@ -3327,7 +3400,7 @@ fn complete_native_markdown_probe_layout_transaction(
     application: &NSApplication,
     panel: &NativeMarkdownPanel,
     container_view: &NSView,
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
 ) -> Result<(), String> {
     // A mounted visible hierarchy supplies valid TextKit geometry, unlike an unhosted view-only shortcut.
     container_view.layoutSubtreeIfNeeded();
@@ -3413,7 +3486,7 @@ fn markdown_probe_utf16_offset(source: &str, byte_offset: usize) -> Result<usize
 #[cfg(feature = "native-markdown-runtime-probe")]
 /// Compare the small synthetic fixture with canonical piece-tree text without logging its contents.
 fn expect_document_text(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     expected: &str,
 ) -> Result<(), String> {
     // Probe fixtures are bounded; production never materializes a complete document for comparison.
@@ -3446,7 +3519,7 @@ fn expect_document_text(
 #[cfg(feature = "native-markdown-runtime-probe")]
 /// Check bounded native attribute ranges and explicit underline/font semantics at one valid fixture index.
 fn assert_native_markdown_attributes(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     index: usize,
     expected_underline: bool,
     semantic_label: &str,
@@ -3505,7 +3578,7 @@ fn assert_native_markdown_attributes(
 #[cfg(feature = "native-markdown-runtime-probe")]
 /// Verify required and forbidden Markdown semantics in the current bounded presentation query.
 fn assert_native_markdown_styles(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     index: usize,
     required: &[MarkdownPresentationStyles],
     forbidden: &[MarkdownPresentationStyles],
@@ -3541,7 +3614,7 @@ fn assert_native_markdown_styles(
 #[cfg(feature = "native-markdown-runtime-probe")]
 /// Require delimiter parsing to recover the complete six-column semantic table and aligned source ranges.
 fn assert_native_markdown_table_recovered(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     delimiter_index: usize,
 ) -> Result<(), String> {
     // A delimiter query must recover its whole semantic table within the bounded presentation contract.
@@ -3593,7 +3666,7 @@ fn assert_native_markdown_table_recovered(
 #[cfg(feature = "native-markdown-runtime-probe")]
 /// Check visible table row/cell geometry, column alignment, plain display text, and inline font traits.
 fn assert_native_markdown_table_layout(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
 ) -> Result<(), String> {
     // 110仅建立原表几何并发起第一格请求，不在本事件推进Core请求。
     let text_view = &surface.backend.text_view;
@@ -3866,7 +3939,7 @@ fn assert_native_markdown_table_layout(
 #[cfg(feature = "native-markdown-runtime-probe")]
 /// Require a complete native grid for the final four-column table after scrolling to the document tail.
 fn assert_native_markdown_eof_table_layout(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     table_utf16_start: usize,
 ) -> Result<(), String> {
     // Select the tail table by semantic identity and exact expected shape, never by viewport order alone.
@@ -3990,7 +4063,7 @@ fn assert_native_markdown_table_cell_font_trait(
 #[cfg(feature = "native-markdown-runtime-probe")]
 /// Exercise reentrancy/IME scheduling guards and restore original scalar state on every outcome.
 fn assert_native_markdown_table_input_guards(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
 ) -> Result<(), String> {
     // Save scheduling/composition scalars so this adversarial guard exercise cannot alter later tests.
     let text_view = &surface.backend.text_view;
@@ -4058,7 +4131,7 @@ fn assert_native_markdown_table_input_guards(
 #[cfg(feature = "native-markdown-runtime-probe")]
 /// 沿正式模式捕获入口观察原纯收据，不以调用后的slot存在性推测成功。
 fn capture_native_markdown_probe_mode_receipt(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
     mode: MarkdownPresentationMode,
 ) -> Result<Rc<super::table_layout::NativeMarkdownModeViewportRequest>, String> {
@@ -4069,7 +4142,12 @@ fn capture_native_markdown_probe_mode_receipt(
         .text_view
         .capture_mode_viewport_transition(controller, &surface.backend.text_storage, mode)
         .map_err(|_| "模式回归无法捕获原动作源位置".to_owned())?;
-    let observation = transition.observe_request();
+    // 捕获已由原具体入口完成；这里只借原 Capturing 槽的同一收据，不新增诊断访问口。
+    let observation = surface
+        .backend
+        .text_view
+        .authorized_mode_action(controller, &surface.backend.text_storage, mode)
+        .ok_or("模式参考图捕获后没有原 Capturing 收据")?;
     drop(transition); // 返回值只Rc共享Weak正文/标量；不把额外Native强引用带入实际模式提交或关闭。
     let original = surface.backend.text_view.authorized_mode_action(
         controller,
@@ -4557,7 +4635,9 @@ impl NativeMarkdownRuntimeProbeSession {
 
 #[cfg(feature = "native-markdown-runtime-probe")]
 /// Require the native string primitive to agree with every UTF-16 code unit of the small probe document.
-fn assert_textkit_matches_piece_tree(surface: &NativeMarkdownEditorSurface) -> Result<(), String> {
+fn assert_textkit_matches_piece_tree(
+    surface: &NativeMarkdownTextKitEditorSurface,
+) -> Result<(), String> {
     // Borrow the canonical-backed NSString primitive without asking NSTextView for a legacy layout graph.
     let textkit_string = surface.backend.text_storage().string();
     let document = surface.document().borrow();

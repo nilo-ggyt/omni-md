@@ -63,14 +63,7 @@ impl NativeMarkdownPagedInput {
         // 仅Core生成标记、共享原选中文字并准备真实变化流；Native不维护第二份格式或tag表。
         let (edit, prepared) =
             document.apply_format_observed(action, permit.before.selection, observer)?;
-        let commit = self.publish(
-            permit,
-            document.generation(),
-            prepared,
-            None,
-            Some(edit),
-            &mut folds,
-        ); // Core已发布；从这里到收据返回无Native/current/后置可失败IO，不把已提交结果伪装成拒绝。
+        let commit = self.publish(permit, &document, prepared, None, Some(edit), &mut folds); // Core已发布；从这里到收据返回无Native/current/后置可失败IO，不把已提交结果伪装成拒绝。
         drop(folds);
         drop(document);
         drop(original);

@@ -1,6 +1,7 @@
 //! 完整Uniform扫描封闭的控制事实；未完成Future不能把局部“未见控制”交给分项消费者。
 
 use super::super::{BidiError, MarkdownBidiCancellation};
+use unicode_bidi::BidiClass;
 
 #[cfg(feature = "paged-shaping-frontier")]
 enum InlineControls {
@@ -62,7 +63,16 @@ impl UniformCertificate {
         }
     }
 
-    pub(super) fn observe(&mut self, scalar: char) {
+    pub(super) fn observe(&mut self, scalar: char, class: BidiClass) {
+        #[cfg(feature = "paged-shaping-frontier")]
+        {
+            // 同一完整Reader已解析这个scalar的UBA类别；末尾B仍属于原段，
+            // 不能因含换行就丢掉正文的零级事实，也不能把它误签为整段无控制。
+            self.paragraphs |= class == BidiClass::B;
+            // TAB和LS能位于同一B段内部；它们必须继续阻止正文无内联控制授权。
+            // CR/LF/NEL/PS的排除则只交给后继真实B游标的content_end，绝不猜末字符。
+            self.interior_controls_absent &= !matches!(scalar, '\t' | '\u{2028}');
+        }
         #[cfg(feature = "paged-shaping-frontier")]
         if matches!(
             scalar,
@@ -73,7 +83,7 @@ impl UniformCertificate {
             self.controls = InlineControls::Present;
         }
         #[cfg(not(feature = "paged-shaping-frontier"))]
-        let _ = scalar; // 未启用分项快路时不新增控制事实或改变原UBA规则。
+        let _ = (scalar, class); // 未启用分项快路时不新增控制事实或改变原UBA规则。
     }
 
     pub(in crate::markdown_bidi) fn seal(

@@ -3,7 +3,7 @@
 use super::*;
 use objc2_app_kit::{NSPasteboardItem, NSPasteboardWriting};
 use objc2_foundation::NSData;
-#[cfg(feature = "native-paged-body-probe")]
+#[cfg(feature = "native-paged-production")]
 use omni_markdown_core::MarkdownLayoutTextSource;
 use std::io::BufWriter;
 use std::os::fd::AsRawFd;
@@ -107,7 +107,7 @@ impl MarkdownPasteboardOutput {
     }
 
     /// 复制原Input捕获的Body/Cell来源；所有范围先核验，再逐有限piece写出同一个匿名输出。
-    #[cfg(feature = "native-paged-body-probe")]
+    #[cfg(feature = "native-paged-production")]
     pub(in crate::native_surface) fn prepare_source_ranges(
         source: &MarkdownLayoutTextSource,
         ranges: &[std::ops::Range<usize>],

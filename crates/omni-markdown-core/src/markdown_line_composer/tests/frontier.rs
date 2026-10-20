@@ -204,7 +204,7 @@ fn actual_frontier_worker_rejects_unproven_plan_without_whole_item_shape_fallbac
                     .unwrap();
             }
             MarkdownLineComposeAnswer::NeedsFrontier(reason) => {
-                assert_eq!(reason, MarkdownLineFrontierReason::UnsupportedPlan);
+                assert!(matches!(reason, MarkdownLineFrontierReason::Plan(_)));
                 let work = worker.frontier_work().unwrap();
                 assert_eq!(
                     (

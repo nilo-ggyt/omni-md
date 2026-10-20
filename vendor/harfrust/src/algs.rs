@@ -7,7 +7,11 @@ pub const fn rb_flag(x: u32) -> u32 {
 // FLAG_UNSAFE macro in harfbuzz.
 #[inline]
 pub fn rb_flag_unsafe(x: u32) -> u32 {
-    if x < 32 { 1 << x } else { 0 }
+    if x < 32 {
+        1 << x
+    } else {
+        0
+    }
 }
 
 // FLAG64 macro in harfbuzz.
@@ -19,7 +23,11 @@ pub const fn rb_flag64(x: u32) -> u64 {
 // FLAG64_UNSAFE macro in harfbuzz.
 #[inline]
 pub fn rb_flag64_unsafe(x: u32) -> u64 {
-    if x < 64 { 1 << (x as u64) } else { 0 }
+    if x < 64 {
+        1 << (x as u64)
+    } else {
+        0
+    }
 }
 
 /* Encodes three unsigned integers in one 64-bit number.  If the inputs have more than 21 bits,

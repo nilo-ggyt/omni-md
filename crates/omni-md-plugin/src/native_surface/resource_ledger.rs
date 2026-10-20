@@ -27,19 +27,6 @@ impl std::fmt::Debug for NativeMarkdownCloseRasterIdentity {
     }
 }
 
-#[cfg(all(
-    feature = "native-raster-surface-probe",
-    feature = "native-close-stage-diagnostic"
-))]
-/// 失败后只输出标量与原Weak身份的来源结果；None/Err从不构成资源释放证明。
-pub(super) struct NativeMarkdownSurvivingRasterString {
-    pub(super) class: String,
-    pub(super) length: Option<usize>,
-    pub(super) live_adapter: bool,
-    pub(super) origins:
-        Option<Result<Vec<super::raster_surface::NativeMarkdownRasterLineStringOrigin>, String>>,
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 /// scope 由构造者明确指定，只决定既有收据的子集，不是原生类型豁免。
 enum NativeMarkdownOwnedScope {
@@ -82,44 +69,6 @@ pub(super) struct NativeMarkdownOwnedSnapshot {
 }
 
 impl NativeMarkdownOwnedSnapshot {
-    /// 关闭已失败时仅观察既有行字符串Weak的类型和长度；不取字符、不决定资源豁免。
-    #[cfg(all(
-        feature = "native-raster-surface-probe",
-        feature = "native-close-stage-diagnostic"
-    ))]
-    pub(super) fn diagnostic_raster_surviving_strings(
-        &self,
-        raster: Option<&super::raster_surface::NativeMarkdownRasterReleaseReceipt>,
-    ) -> Vec<NativeMarkdownSurvivingRasterString> {
-        self.identities
-            .iter()
-            .filter(|entry| entry.role == "editor.raster.line-string")
-            .filter_map(|entry| {
-                let object = entry.object.load()?; // 已有Weak的临时claim只活本次同步观察。
-                let class = object
-                    .class()
-                    .name()
-                    .to_string_lossy()
-                    .chars()
-                    .take(128)
-                    .collect();
-                let string = object.downcast_ref::<NSString>();
-                let length = string.map(NSString::length);
-                let live_adapter = object.downcast_ref::<PieceBackedMarkdownString>().is_some();
-                let origins = string
-                    .zip(raster)
-                    .map(|(string, raster)| raster.diagnostic_line_string_origins(string)); // 原实际NSString只用于同一Weak身份比对，来源API不再次读取line、字符或正文。
-                Some(NativeMarkdownSurvivingRasterString {
-                    class,
-                    length,
-                    live_adapter,
-                    origins,
-                })
-            })
-            .take(8) // 失败-only有限证据；不建立新的对象目录或延长任何业务值生命周期。
-            .collect()
-    }
-
     /// 仅私有退出诊断使用一次既有Weak清单；统计不是资源收据，不添加或漏掉任何身份。
     #[cfg(feature = "native-close-stage-diagnostic")]
     pub(super) fn diagnostic_alive_roles(&self) -> (bool, Vec<(&'static str, usize, usize)>) {

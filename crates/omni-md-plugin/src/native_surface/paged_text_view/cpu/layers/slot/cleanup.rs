@@ -8,30 +8,28 @@ impl Slot {
         let mut intact = true;
         if let Some(payload) = &payload {
             let target = match payload.presentation {
-                PixelPresentation::Image => &self.container,
+                PixelPresentation::Image => &*self.container,
                 PixelPresentation::OpaqueNeutralMask
-                | PixelPresentation::OpaquePairedMasks { .. } => &self.mask,
+                | PixelPresentation::OpaquePairedMasks { .. } => self.primary().1,
             };
             intact &= clear_image(target, payload.image.as_deref());
-            // 第二张图有独立 provider；安装只完成一半时，空 claim 不能授权清除外部内容。
-            intact &= clear_image(&self.second_mask, payload.secondary_image.as_deref());
+            if let Some(second_mask) = self.second_mask.as_deref() {
+                // 第二 provider 只有实际双遮罩才存在；空 claim 仍不能清除外方后来装入的内容。
+                intact &= clear_image(second_mask, payload.secondary_image.as_deref());
+            }
         }
-        intact &= clear_mask(&self.foreground, &self.mask, &self.mask_installed);
-        intact &= clear_mask(
-            &self.second_foreground,
-            &self.second_mask,
-            &self.second_mask_installed,
-        );
-        intact &= clear_parent(
-            &self.foreground,
-            &self.container,
-            &self.foreground_installed,
-        );
-        intact &= clear_parent(
-            &self.second_foreground,
-            &self.container,
-            &self.second_foreground_installed,
-        );
+        if let (Some(foreground), Some(mask)) = (&self.foreground, &self.mask) {
+            intact &= clear_mask(foreground, mask, &self.mask_installed);
+            intact &= clear_parent(foreground, &self.container, &self.foreground_installed);
+        }
+        if let (Some(foreground), Some(mask)) = (&self.second_foreground, &self.second_mask) {
+            intact &= clear_mask(foreground, mask, &self.second_mask_installed);
+            intact &= clear_parent(
+                foreground,
+                &self.container,
+                &self.second_foreground_installed,
+            );
+        }
         let colors = payload
             .as_ref()
             .and_then(|value| value.paired_colors.as_ref());
@@ -49,41 +47,28 @@ impl Slot {
             intact &= clear_color(&self.container, background);
         }
         if self.foreground_color_installed.replace(false) {
-            intact &= clear_color(&self.foreground, foreground);
+            intact &= clear_color(self.primary().0, foreground);
         }
         if self.second_color_installed.replace(false) {
-            intact &= clear_color(&self.second_foreground, secondary_foreground);
+            intact &= clear_color(self.secondary().0, secondary_foreground);
         }
-        drop(payload); // 所有原图像和颜色关系完成身份核对后，才在无槽借用时归还强 claim。
+        drop(payload); // 关系逐项核对后才归还原图/颜色 claim，不在槽借用中执行 CFRelease。
 
         let parent = self.container.superlayer();
         if parent
             .as_deref()
             .is_some_and(|value| !std::ptr::eq(value, group))
         {
-            intact = false; // 外方挂载保留原样，不能为了关闭通过而从后继父层移除。
+            intact = false; // 外方重挂保留原样，关闭不能抢回后继父层。
         }
         drop(parent);
         if parent_is(&self.container, group) {
             self.container.removeFromSuperlayer();
         }
-        for layer in [
-            &*self.container,
-            &*self.foreground,
-            &*self.mask,
-            &*self.second_foreground,
-            &*self.second_mask,
-        ] {
-            // 五个角色都必须真正空闲；不能只清旧三层而遗留第二张图或 Native 颜色。
-            intact &= empty(layer);
-        }
-        for layer in [
-            &*self.foreground,
-            &*self.mask,
-            &*self.second_foreground,
-            &*self.second_mask,
-        ] {
-            intact &= layer.superlayer().is_none();
+        intact &= empty(&self.container);
+        for layer in self.auxiliary_layers() {
+            // 只检查实际存在的角色；缺席角色没有 Native 资源，不以创建空对象证明释放。
+            intact &= empty(layer) && layer.superlayer().is_none();
         }
         intact
     }

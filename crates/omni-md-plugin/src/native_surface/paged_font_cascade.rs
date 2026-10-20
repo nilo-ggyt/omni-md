@@ -13,7 +13,9 @@ use objc2_foundation::MainThreadMarker;
 use omni_markdown_core::MarkdownLayoutFontAuthority;
 use thiserror::Error;
 
-use super::paged_fonts::{NativeMarkdownPagedFont, NativeMarkdownPagedFontError};
+use super::paged_fonts::{
+    NativeMarkdownFontCapture, NativeMarkdownPagedFont, NativeMarkdownPagedFontError,
+};
 
 /// 系统列表超过此硬上限时明确拒绝，不静默删掉列表尾部的回退字体。
 pub const NATIVE_MARKDOWN_CASCADE_MAX_CANDIDATES: usize = 256;
@@ -270,6 +272,44 @@ impl NativeMarkdownFontCandidate {
         maximum_font_bytes: u64,
         current: &(impl Fn() -> bool + ?Sized),
     ) -> Result<NativeMarkdownPagedFont> {
+        let (permit, native) = self.construct(base, authority, current)?;
+        let valid = || permit.check(base, authority, current).is_ok();
+        let captured =
+            NativeMarkdownPagedFont::capture(&native, maximum_font_bytes, self.mtm, &valid);
+        permit.native(base, authority, current, || drop(native))?;
+        permit.check(base, authority, current)?;
+        captured.map_err(Into::into) // 候选失败不会自动拿后一个字体掩盖；下一步由composer显式决定。
+    }
+    /// 活动 Body 只复用这个实际候选的既有 capture；级联 ordinal 与原单 GCB 试次顺序不变。
+    pub(crate) fn capture_reusing(
+        &self,
+        base: &NativeMarkdownPagedFont,
+        authority: &MarkdownLayoutFontAuthority,
+        palette: &[Rc<super::paged_line_fonts::NativeMarkdownLineFont>],
+        maximum_font_bytes: u64,
+        current: &(impl Fn() -> bool + ?Sized),
+    ) -> Result<NativeMarkdownFontCapture> {
+        let (permit, native) = self.construct(base, authority, current)?;
+        let valid = || permit.check(base, authority, current).is_ok();
+        let captured = NativeMarkdownPagedFont::capture_reusing(
+            &native,
+            palette,
+            maximum_font_bytes,
+            self.mtm,
+            &valid,
+        );
+        permit.native(base, authority, current, || drop(native))?;
+        permit.check(base, authority, current)?;
+        captured.map_err(Into::into)
+    }
+
+    /// 独立捕获与活动 palette 复用共用实际 best-match 构造；仅原弱许可仍活时可以进入 Native。
+    fn construct(
+        &self,
+        base: &NativeMarkdownPagedFont,
+        authority: &MarkdownLayoutFontAuthority,
+        current: &(impl Fn() -> bool + ?Sized),
+    ) -> Result<(Rc<CascadePermit>, CFRetained<CTFont>)> {
         let permit = self
             .permit
             .upgrade()
@@ -285,11 +325,6 @@ impl NativeMarkdownFontCandidate {
                 CTFontOptions::PreventAutoActivation | CTFontOptions::PreventAutoDownload,
             )
         })?;
-        let valid = || permit.check(base, authority, current).is_ok();
-        let captured =
-            NativeMarkdownPagedFont::capture(&native, maximum_font_bytes, self.mtm, &valid);
-        permit.native(base, authority, current, || drop(native))?;
-        permit.check(base, authority, current)?;
-        captured.map_err(Into::into) // 候选失败不会自动拿后一个字体掩盖；下一步由composer显式决定。
+        Ok((permit, native))
     }
 }

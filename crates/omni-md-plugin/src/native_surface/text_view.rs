@@ -46,9 +46,6 @@ pub(super) struct PieceBackedTextViewIvars {
     #[cfg(feature = "native-raster-surface-probe")]
     pub(super) raster_body_layer:
         RefCell<Option<Rc<super::raster_surface::NativeMarkdownRasterBodyLayerLease>>>,
-    // Scalar evidence shares this editor's storage lifetime only in explicitly instrumented builds.
-    #[cfg(feature = "native-input-trace")]
-    pub(super) input_trace: RefCell<Option<SharedNativeInputTrace>>,
     pub(super) source_decorations: RefCell<Vec<NativeMarkdownDecorationGeometry>>,
     pub(super) source_decoration_generation: Cell<u64>,
     pub(super) source_decorations_dirty: Cell<bool>,
@@ -85,10 +82,6 @@ pub(super) struct PieceBackedTextViewIvars {
     // 纯 Rust 槽的 Weak 可在首 Native 前取得原 owner；关闭时清除，不保活 storage 或正文。
     pub(super) pending_selection_slot:
         RefCell<Option<std::rc::Weak<NativeMarkdownPendingSelectionSlot>>>,
-    // 仅原生回归保存预签弱观察；实际请求的产品权限和 Core scratch 仍只有原 RequiredRow owner。
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    pub(super) table_insertion_observation:
-        RefCell<Option<Rc<NativeMarkdownTableInsertionObservation>>>,
     pub(super) unmarking_text: Cell<bool>,
     pub(super) textkit_input_depth: Cell<usize>,
     pub(super) payload_use_depth: Cell<usize>,
@@ -108,11 +101,6 @@ pub(super) struct PieceBackedTextViewIvars {
     // 一个末格 Tab 的 Core 请求与纯提交票；真实输入或 accepted release 同步撤销唯一槽。
     #[cfg(feature = "native-table-row-append")]
     pub(super) table_append: RefCell<Option<Rc<NativeMarkdownPendingTableAppend>>>,
-    #[cfg(all(
-        feature = "native-table-row-append",
-        feature = "native-markdown-runtime-probe"
-    ))]
-    pub(super) table_append_probe_receipt: RefCell<Option<Rc<NativeMarkdownTableAppendReceipt>>>,
     pub(super) table_field_expectation: RefCell<Option<Rc<NativeMarkdownTableFieldExpectation>>>,
     pub(super) table_field_notification_checking: Cell<bool>,
     // 局部Rc先结束slot借用再retain；关闭仍take/drop唯一会话owner，不增加Native身份。
@@ -121,10 +109,6 @@ pub(super) struct PieceBackedTextViewIvars {
     pub(super) controller: OnceCell<Weak<NativeMarkdownController>>,
     pub(super) active_table_cell: RefCell<Option<NativeMarkdownTableCellEditorState>>,
     pub(super) pending_table_cell_activation: NativeMarkdownPendingTableCell,
-    // 附件路径在会话可取消邮箱内，排队 relay 不持有外部路径集合。
-    pub(super) pending_attachment_imports: RefCell<
-        Vec<std::sync::Arc<crate::cancelable_mailbox::CancelableMailbox<Vec<std::path::PathBuf>>>>,
-    >,
 }
 
 define_class!(
@@ -990,27 +974,10 @@ define_class!(
             }
 
             self.ivars().folds.invalidate_native_install();
-            #[cfg(feature = "native-input-trace")]
-            let entry = native_input_trace_now();
-            #[cfg(feature = "native-input-trace")]
-            let timestamp_bits = event.timestamp().to_bits();
-            #[cfg(feature = "native-input-trace")]
-            let (document, marked) = self.input_trace_observation();
-            #[cfg(feature = "native-input-trace")]
-            let scope = self.input_trace().and_then(|trace| {
-                // 已释放的 trace 无记录权限；实际事件仍由正常原生路径处理一次。
-                TraceScope::event(&trace, entry, timestamp_bits, document, marked)
-            });
             // SAFETY: the original live AppKit event is forwarded unchanged to the matching main-thread
             // superclass method exactly once. Standard input-manager interpretation remains native.
             unsafe {
                 let _: () = msg_send![super(self), keyDown: event];
-            }
-            #[cfg(feature = "native-input-trace")]
-            if let Some(scope) = scope {
-                // Return ends this actual event's causal scope; asynchronous IME delivery gets no guessed event.
-                let (document, marked) = self.input_trace_observation();
-                scope.finish(native_input_trace_now(), document, marked);
             }
         }
 
@@ -1035,114 +1002,8 @@ define_class!(
             }
         }
 
-        #[unsafe(method(paste:))]
-        /// Routes explicit file payloads through confined import and ordinary text through native editing.
-        fn paste(&self, sender: Option<&AnyObject>) {
-            if self.ivars().textkit_graph_teardown.get() {
-                // accepted release 后迟到入口不再读取外部数据、调用业务或恢复原生编辑。
-                return;
-            }
-
-            // File URLs are imported through the confined vault before inserting Markdown links.
-            let files = match native_markdown_pasteboard_file_paths(&NSPasteboard::generalPasteboard()) {
-                Ok(files) => files,
-                Err(error) => {
-                    // 文件批次拒绝必须反馈，不能回落为部分导入或富文本粘贴。
-                    present_native_markdown_error(&error);
-                    return;
-                }
-            };
-            if files.is_empty() {
-                // Ordinary text keeps native selection, IME and canonical storage behavior.
-                // SAFETY: the superclass receives the borrowed sender synchronously on the main thread.
-                unsafe {
-                    let _: () = msg_send![super(self), paste: sender];
-                }
-            } else {
-                // Queue file work outside the native paste callback; only a weak view identity escapes.
-                if let Err(error) = schedule_native_markdown_attachment_paths(self, files) {
-                    // 有限排队预算已满时明确拒绝整个操作，原文和外部文件保持未修改。
-                    present_native_markdown_error(&error);
-                }
-            }
-        }
-
-        #[unsafe(method(draggingEntered:))]
-        /// Advertises copy-only file import while preserving ordinary native text dragging.
-        fn dragging_entered(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
-            if self.ivars().textkit_graph_teardown.get() {
-                // accepted release 后迟到入口不再读取外部数据、调用业务或恢复原生编辑。
-                return NSDragOperation::None;
-            }
-
-            // File drags advertise a copy, keeping the external source file untouched.
-            let files = match native_markdown_pasteboard_file_paths(&sender.draggingPasteboard()) {
-                Ok(files) => files,
-                Err(error) => {
-                    // 超限拖入不宣称可接收，静态状态反馈说明整个批次未被导入。
-                    present_native_markdown_error(&error);
-                    return NSDragOperation::None;
-                }
-            };
-            if !files.is_empty() {
-                // External files remain unchanged; only an explicit confined asset copy is offered.
-                NSDragOperation::Copy
-            } else {
-                // Non-file text drags retain the inherited native editing contract.
-                // SAFETY: AppKit owns the drag-info object throughout this main-thread callback.
-                unsafe { msg_send![super(self), draggingEntered: sender] }
-            }
-        }
-
-        #[unsafe(method(performDragOperation:))]
-        /// Anchors file insertion to the visible physical drop point before scheduling confined import.
-        fn perform_drag_operation(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
-            if self.ivars().textkit_graph_teardown.get() {
-                // accepted release 后迟到入口不再读取外部数据、调用业务或恢复原生编辑。
-                return false.into();
-            }
-
-            let files = match native_markdown_pasteboard_file_paths(&sender.draggingPasteboard()) {
-                Ok(files) => files,
-                Err(error) => {
-                    // 拖放必须整体拒绝而非静默导入前缀。
-                    present_native_markdown_error(&error);
-                    return false.into();
-                }
-            };
-            if files.is_empty() {
-                // Non-file payloads are handled once by the inherited text view.
-                // SAFETY: AppKit supplies live drag information and the superclass handles it synchronously.
-                unsafe { msg_send![super(self), performDragOperation: sender] }
-            } else {
-                // Commit existing provisional edits before resolving the physical drop location.
-                if !self.commit_cell_before_command() {
-                    // Rejected native field input forbids importing an attachment at a different caret.
-                    false
-                } else {
-                    if !self.commit_composition_before_command() {
-                        // A refused native commit leaves the original composition editable and imports nothing.
-                        return false.into();
-                    }
-                    let point = self.convertPoint_fromView(sender.draggingLocation(), None);
-                    if let Some(offset) = self.insertion_offset_at_view_point(point) {
-                        // The queued import preserves this exact generation/caret anchor or fails without a link.
-                        self.setSelectedRange(NSRange::new(offset, 0));
-                        match schedule_native_markdown_attachment_paths(self, files) {
-                            Ok(()) => true,
-                            Err(error) => {
-                                // 失败只消耗本次拖放，不写文件或正文。
-                                present_native_markdown_error(&error);
-                                false
-                            }
-                        }
-                    } else {
-                        // Missing transient TextKit geometry rejects the drop without copying any external file.
-                        false
-                    }
-                }
-            }
-        }
+        // 独立 TextKit 参考图仅接受原生文字机制输入；正式附件粘贴/拖入由分页 Input 唯一处理。
+        // 此处继承 NSTextView 的标准文字入口，不再把参考视图接回正式窗口的附件导入队列。
 
         #[unsafe(method(setTextContainer:))]
         /// Preserves the existing weak layout-manager relation during native container callbacks.
@@ -1315,7 +1176,7 @@ define_class!(
         }
 
         #[unsafe(method(setFrameSize:))]
-        /// Preserves native sizing and invalidates only bounded viewport geometry.
+        /// 保留原生尺寸计算，逻辑文档增高只标脏当次真实可见交集。
         fn set_frame_size(&self, new_size: NSSize) {
             #[cfg(feature = "native-markdown-runtime-probe")]
             let reentry = (!self.ivars().textkit_graph_teardown.get()).then(|| {
@@ -1349,13 +1210,16 @@ define_class!(
                     }
                 );
             }
-            // SAFETY: NSSize has the declared Cocoa ABI and the live main-thread view receives its matching superclass method.
+            // SAFETY: 当前主线程活 view 将原 NSSize 转发匹配的 superclass 方法一次。
             unsafe {
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 let _phase = super::viewport_reentry_diagnostic::enter(super::viewport_reentry_diagnostic::Phase::FrameSuper);
                 let _: () = msg_send![super(self), setFrameSize: new_size];
             }
-            // Resize invalidates viewport geometry even when source bytes are unchanged.
+            // OnSetNeedsDisplay 不因整篇逻辑高度变化自动重绘；宽度和可见区域变化仍须交付真实文字。
+            // 原helper同时检查关闭和有限可见几何，不用整篇bounds请求新的正文backing。
+            self.invalidate_visible_body();
+            // 字节未变的缩放同样撤销旧视口几何，仍由原有续体合并表格布局工作。
             {
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 let _phase = super::viewport_reentry_diagnostic::enter(super::viewport_reentry_diagnostic::Phase::FrameSchedule);
@@ -1385,19 +1249,6 @@ define_class!(
             // SAFETY: the live main-thread view forwards its matching no-argument superclass callback once.
             unsafe {
                 let _: () = msg_send![super(self), viewDidEndLiveResize];
-            }
-            self.schedule_visible_table_layout_update();
-        }
-
-        #[unsafe(method(scrollWheel:))]
-        /// Preserves native scrolling before scheduling the new visible table projection.
-        fn scroll_wheel(&self, event: &NSEvent) {
-            native_markdown_trace! {
-                eprintln!("[probe] scroll wheel manager={}", self.textLayoutManager().is_some());
-            }
-            // SAFETY: AppKit owns the event for this callback; the live superclass receives it synchronously on the main thread.
-            unsafe {
-                let _: () = msg_send![super(self), scrollWheel: event];
             }
             self.schedule_visible_table_layout_update();
         }
@@ -1787,16 +1638,9 @@ define_class!(
             // 输入解释或 trace scope 尚在栈内时，资源预检不能接受旧业务结束。
             let _payload_use = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
 
-            #[cfg(feature = "native-input-trace")]
-            let trace_scope = self.begin_input_trace_selector(NativeInputTraceSelector::InsertText);
             if self.ivars().textkit_graph_teardown.get() {
                 // Accepted close seals native composition/selection work as well as canonical edits;
                 // forwarding late input could otherwise create new system ownership after the final save.
-                #[cfg(feature = "native-input-trace")]
-                {
-                    self.reject_input_trace(NativeInputTraceRejection::Closing);
-                    self.finish_input_trace_selector(trace_scope);
-                }
                 return;
             }
             let result = self.run_planned_native_input(string, replacement_range, None, |range| {
@@ -1804,8 +1648,6 @@ define_class!(
                 unsafe { let _: () = msg_send![super(self), insertText: string, replacementRange: range]; }
             });
             if let Err(error) = result {
-                #[cfg(feature = "native-input-trace")]
-                self.reject_input_trace(NativeInputTraceRejection::CanonicalError);
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 if std::env::var_os("OMNI_NATIVE_PROBE_INPUT_DIAGNOSTIC").is_some()
                     || std::env::var_os("OMNI_NATIVE_PROBE_INPUT_CAPACITY_REJECTION").is_some()
@@ -1815,8 +1657,6 @@ define_class!(
                 }
                 present_native_markdown_error(&error); // 拒绝只提示，不清除或重写原候选。
             }
-            #[cfg(feature = "native-input-trace")]
-            self.finish_input_trace_selector(trace_scope);
             self.schedule_visible_table_layout_update();
         }
 
@@ -1834,15 +1674,8 @@ define_class!(
             // 输入解释或 trace scope 尚在栈内时，资源预检不能接受旧业务结束。
             let _payload_use = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
 
-            #[cfg(feature = "native-input-trace")]
-            let trace_scope = self.begin_input_trace_selector(NativeInputTraceSelector::SetMarkedText);
             if self.ivars().textkit_graph_teardown.get() {
                 // Native-only provisional state must not restart after the saved foreground input gate closes.
-                #[cfg(feature = "native-input-trace")]
-                {
-                    self.reject_input_trace(NativeInputTraceRejection::Closing);
-                    self.finish_input_trace_selector(trace_scope);
-                }
                 return;
             }
             let result = self.run_planned_native_input(string, replacement_range, Some(selected_range), |range| {
@@ -1852,8 +1685,6 @@ define_class!(
                 }
             });
             if let Err(error) = result {
-                #[cfg(feature = "native-input-trace")]
-                self.reject_input_trace(NativeInputTraceRejection::CanonicalError);
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 if std::env::var_os("OMNI_NATIVE_PROBE_INPUT_DIAGNOSTIC").is_some()
                     || std::env::var_os("OMNI_NATIVE_PROBE_INPUT_CAPACITY_REJECTION").is_some()
@@ -1863,8 +1694,6 @@ define_class!(
                 }
                 present_native_markdown_error(&error); // 没有原 primitive 成功收据就不发布 marked 成功状态。
             }
-            #[cfg(feature = "native-input-trace")]
-            self.finish_input_trace_selector(trace_scope);
         }
 
         #[unsafe(method(unmarkText))]
@@ -1876,15 +1705,8 @@ define_class!(
             // 输入解释或 trace scope 尚在栈内时，资源预检不能接受旧业务结束。
             let _payload_use = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
 
-            #[cfg(feature = "native-input-trace")]
-            let trace_scope = self.begin_input_trace_selector(NativeInputTraceSelector::UnmarkText);
             if self.ivars().textkit_graph_teardown.get() {
                 // Closing was authorized only after composition cleared; stale selectors cannot accept more edits.
-                #[cfg(feature = "native-input-trace")]
-                {
-                    self.reject_input_trace(NativeInputTraceRejection::Closing);
-                    self.finish_input_trace_selector(trace_scope);
-                }
                 return;
             }
             // NSTextView must clear its own marked-text bookkeeping as well as our semantic
@@ -1892,8 +1714,6 @@ define_class!(
             // superclass state while the standard commit operation is in progress.
             if self.ivars().unmarking_text.replace(true) {
                 // A nested superclass callback belongs to the current unmark operation.
-                #[cfg(feature = "native-input-trace")]
-                self.finish_input_trace_selector(trace_scope);
                 return;
             }
             let result = self.run_native_unmark(|| {
@@ -1901,8 +1721,6 @@ define_class!(
                 unsafe { let _: () = msg_send![super(self), unmarkText]; }
             });
             if let Err(error) = result {
-                #[cfg(feature = "native-input-trace")]
-                self.reject_input_trace(NativeInputTraceRejection::CanonicalError);
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 if std::env::var_os("OMNI_NATIVE_PROBE_INPUT_DIAGNOSTIC").is_some()
                     || std::env::var_os("OMNI_NATIVE_PROBE_INPUT_CAPACITY_REJECTION").is_some()
@@ -1913,8 +1731,6 @@ define_class!(
                 present_native_markdown_error(&error);
             }
             self.ivars().unmarking_text.set(false);
-            #[cfg(feature = "native-input-trace")]
-            self.finish_input_trace_selector(trace_scope);
             self.schedule_visible_table_layout_update();
         }
 
@@ -2143,23 +1959,8 @@ define_class!(
             }
         }
 
-        #[unsafe(method(performKeyEquivalent:))]
-        /// 标准关闭键只请求当前插件窗口返回，其他等价键仍交给原生输入链。
-        fn perform_key_equivalent(&self, event: &NSEvent) -> bool {
-            if self.ivars().textkit_graph_teardown.get() {
-                // accepted release 后迟到入口不再读取外部数据、调用业务或恢复原生编辑。
-                return false.into();
-            }
+        // 独立 TextKit 参考图不拥有正式窗口关闭权限；窗口级按键继续由实际 panel/responder 负责。
 
-            if is_exact_markdown_command_w_event(event) {
-                // 与 panel 使用同一保存及释放协议，绝不把窗口关闭提升为整个应用退出。
-                self.enqueue_markdown_window_close();
-                true
-            } else {
-                // SAFETY: key equivalents not owned by Omni forward exactly once to NSTextView.
-                unsafe { msg_send![super(self), performKeyEquivalent: event] }
-            }
-        }
     }
 );
 
@@ -3605,8 +3406,6 @@ impl PieceBackedMarkdownTextView {
             raster_layer_update_calls: Cell::new(0),
             #[cfg(feature = "native-raster-surface-probe")]
             raster_body_layer: RefCell::new(None),
-            #[cfg(feature = "native-input-trace")]
-            input_trace: RefCell::new(text_storage.input_trace()),
             text_storage: Weak::from_retained(text_storage),
             #[cfg(all(
                 feature = "native-block-fragment-diagnostic",
@@ -3627,8 +3426,6 @@ impl PieceBackedMarkdownTextView {
             pending_selection_slot: RefCell::new(Some(Rc::downgrade(
                 &text_storage.ivars().pending_selection,
             ))),
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            table_insertion_observation: RefCell::new(None),
             unmarking_text: Cell::new(false),
             text_layout_manager: OnceCell::new(),
             text_container_recovery_depth: Cell::new(0),
@@ -3644,11 +3441,6 @@ impl PieceBackedMarkdownTextView {
             table_input_intent_epoch: Cell::new(0),
             #[cfg(feature = "native-table-row-append")]
             table_append: RefCell::new(None),
-            #[cfg(all(
-                feature = "native-table-row-append",
-                feature = "native-markdown-runtime-probe"
-            ))]
-            table_append_probe_receipt: RefCell::new(None),
             table_field_expectation: RefCell::new(None),
             table_field_notification_checking: Cell::new(false),
             cell_editor: RefCell::new(None),
@@ -3656,7 +3448,6 @@ impl PieceBackedMarkdownTextView {
             controller: OnceCell::new(),
             active_table_cell: RefCell::new(None),
             pending_table_cell_activation: NativeMarkdownPendingTableCell::default(),
-            pending_attachment_imports: RefCell::new(Vec::new()),
         });
         // SAFETY: all Rust ivars are initialized, and the surface already owns the live container,
         // primary TextKit 2 manager and content store. This is NSTextView's designated initializer;
@@ -3714,18 +3505,9 @@ impl PieceBackedMarkdownTextView {
                 drop(lease);
             }
         }
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        {
-            let observation = self.ivars().table_insertion_observation.borrow_mut().take();
-            if let Some(observation) = observation {
-                observation.cancel_unbound(); // 关闭也撤销尚未绑定的原观察，借用已结束才排一次终点。
-            }
-        }
         #[cfg(feature = "native-table-row-append")]
         {
             self.cancel_pending_table_append();
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            self.cancel_predeclared_table_append_receipt(true);
         }
         let expectation = { self.ivars().table_field_expectation.borrow_mut().take() };
         self.ivars().table_field_notification_checking.set(false);
@@ -3749,43 +3531,19 @@ impl PieceBackedMarkdownTextView {
         let decorations = self.ivars().source_decorations.replace(Vec::new());
         let tables = self.ivars().visible_table_layout_cache.borrow_mut().take();
         let cell_state = self.ivars().active_table_cell.borrow_mut().take();
-        let imports = self.ivars().pending_attachment_imports.replace(Vec::new());
-        // cancel 同步取走路径，先结束 ivar 借用，避免任意载荷析构重入。
-        for mailbox in imports {
-            // 每个请求拥有独立邮箱，取消一条不会把其他请求的路径移动到队列。
-            mailbox.cancel();
-        }
         drop((folds, decorations, tables, cell_state));
-        #[cfg(feature = "native-input-trace")]
-        self.release_input_trace();
     }
 
     /// 检查具体 view 空壳的业务字段和公开原生关系，不依据运行时类名放行。
     pub(super) fn payload_is_empty(&self) -> bool {
-        #[cfg(feature = "native-input-trace")]
-        let trace_empty = self.ivars().input_trace.borrow().is_none();
-        #[cfg(not(feature = "native-input-trace"))]
-        let trace_empty = true;
-        let trace_empty = trace_empty && self.ivars().pending_selection_slot.borrow().is_none();
+        let pending_empty = self.ivars().pending_selection_slot.borrow().is_none();
         #[cfg(feature = "native-raster-surface-probe")]
-        let trace_empty = trace_empty && self.ivars().raster_body_layer.borrow().is_none();
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        let trace_empty =
-            trace_empty && self.ivars().table_insertion_observation.borrow().is_none();
-        let metadata_empty = trace_empty
+        let pending_empty = pending_empty && self.ivars().raster_body_layer.borrow().is_none();
+        let metadata_empty = pending_empty
             && {
                 #[cfg(feature = "native-table-row-append")]
                 {
-                    self.ivars().table_append.borrow().is_none() && {
-                        #[cfg(feature = "native-markdown-runtime-probe")]
-                        {
-                            self.ivars().table_append_probe_receipt.borrow().is_none()
-                        }
-                        #[cfg(not(feature = "native-markdown-runtime-probe"))]
-                        {
-                            true
-                        }
-                    }
+                    self.ivars().table_append.borrow().is_none()
                 }
                 #[cfg(not(feature = "native-table-row-append"))]
                 {
@@ -3802,7 +3560,6 @@ impl PieceBackedMarkdownTextView {
             && self.ivars().visible_table_layout_cache.borrow().is_none()
             && self.ivars().active_table_cell.borrow().is_none()
             && self.ivars().cell_editor.borrow().is_none()
-            && self.ivars().pending_attachment_imports.borrow().capacity() == 0
             && self.ivars().pending_table_cell_activation.is_empty()
             && !self.ivars().table_layout_update_scheduled.get()
             && !self.ivars().table_layout_rebuilding.get()
@@ -3830,10 +3587,6 @@ impl PieceBackedMarkdownTextView {
     #[cfg(feature = "native-markdown-runtime-probe")]
     /// 只在失败时一次性读取现有每项谓词及容量，不输出正文/路径/地址或省略残留角色。
     pub(super) fn payload_failure_diagnostic(&self) -> String {
-        #[cfg(feature = "native-input-trace")]
-        let trace_empty = self.ivars().input_trace.borrow().is_none();
-        #[cfg(not(feature = "native-input-trace"))]
-        let trace_empty = true;
         let sealed = self.ivars().textkit_graph_teardown.get();
         let (folds_len, folds_capacity) = {
             let folds = self.ivars().folds.borrow();
@@ -3846,10 +3599,6 @@ impl PieceBackedMarkdownTextView {
         let table_cache_none = self.ivars().visible_table_layout_cache.borrow().is_none();
         let active_cell_none = self.ivars().active_table_cell.borrow().is_none();
         let cell_owner_none = self.ivars().cell_editor.borrow().is_none();
-        let (imports_len, imports_capacity) = {
-            let imports = self.ivars().pending_attachment_imports.borrow();
-            (imports.len(), imports.capacity())
-        };
         let pending_cell_none = self.ivars().pending_table_cell_activation.is_empty();
         let layout_scheduled = self.ivars().table_layout_update_scheduled.get();
         let layout_rebuilding = self.ivars().table_layout_rebuilding.get();
@@ -3866,7 +3615,7 @@ impl PieceBackedMarkdownTextView {
         let selection = self.selectedRange();
         let super_selection = self.super_selected_range();
         format!(
-            "trace_empty={trace_empty},sealed={sealed},folds_len={folds_len},folds_capacity={folds_capacity},decorations_len={decorations_len},decorations_capacity={decorations_capacity},table_cache_none={table_cache_none},active_cell_none={active_cell_none},cell_owner_none={cell_owner_none},imports_len={imports_len},imports_capacity={imports_capacity},pending_cell_none={pending_cell_none},layout_scheduled={layout_scheduled},layout_rebuilding={layout_rebuilding},semantic_marked_none={semantic_marked_none},input_depth={input_depth},payload_depth={payload_depth},editable={editable},selectable={selectable},allows_undo={allows_undo},delegate_none={delegate_none},string_units={string_units},native_marked={native_marked},native_marked_location={},native_marked_length={},selection_location={},selection_length={},super_selection_location={},super_selection_length={}",
+            "sealed={sealed},folds_len={folds_len},folds_capacity={folds_capacity},decorations_len={decorations_len},decorations_capacity={decorations_capacity},table_cache_none={table_cache_none},active_cell_none={active_cell_none},cell_owner_none={cell_owner_none},pending_cell_none={pending_cell_none},layout_scheduled={layout_scheduled},layout_rebuilding={layout_rebuilding},semantic_marked_none={semantic_marked_none},input_depth={input_depth},payload_depth={payload_depth},editable={editable},selectable={selectable},allows_undo={allows_undo},delegate_none={delegate_none},string_units={string_units},native_marked={native_marked},native_marked_location={},native_marked_length={},selection_location={},selection_length={},super_selection_location={},super_selection_length={}",
             native_marked_range.location,
             native_marked_range.length,
             selection.location,
@@ -3943,31 +3692,6 @@ impl PieceBackedMarkdownTextView {
             return;
         }
         let _ = committed.native_step(|| self.finish_table_mutation_continuity());
-    }
-
-    /// 原编辑器只通过弱身份排队关闭；完成严格释放后，由 Host 恢复启动器。
-    pub(super) fn enqueue_markdown_window_close(&self) {
-        let weak = MainThreadBound::new(Weak::from(self), self.mtm());
-        enqueue_native_markdown_main_task(move || {
-            let mtm = MainThreadMarker::new().expect("Markdown 窗口关闭沿主队列执行");
-            let is_current = weak.get(mtm).load().is_some_and(|view| {
-                // 被框架暂留的旧空壳不能获得新笔记或新会话的关闭权限。
-                ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
-                    active
-                        .as_ref()
-                        .and_then(|surface| surface.editor.as_ref())
-                        .is_some_and(|editor| std::ptr::eq(&*editor.backend.text_view, &*view))
-                })
-            });
-            if !is_current {
-                // 原编辑器在队列执行前已关闭或切换；旧动作不能作用于后继正文。
-                return;
-            }
-            if let Err(error) = request_native_markdown_window_exit() {
-                // 保存冲突保留原可编辑草稿，不能先隐藏窗口或直接恢复启动器。
-                eprintln!("关闭 Markdown 窗口失败：{error}");
-            }
-        });
     }
 
     /// Read the superclass state directly, avoiding a semantic adapter masking a native provisional span.
@@ -4050,28 +3774,6 @@ fn input_text_has_utf16_boundary(text: &str, offset: usize) -> bool {
         }
     }
     current == offset // 末端与空候选的 0 都是合法边界，超出候选则拒绝。
-}
-
-/// Recognizes the exact native Command-W equivalent from unmodified event characters and modifiers.
-pub(super) fn is_exact_markdown_command_w_event(event: &NSEvent) -> bool {
-    let Some(characters) = event.charactersIgnoringModifiers() else {
-        // A key event without character identity cannot claim this command equivalent.
-        return false;
-    };
-    autoreleasepool(|pool| {
-        // SAFETY: the borrowed string is compared only inside this autorelease pool and cannot escape.
-        is_exact_markdown_command_w(unsafe { characters.to_str(pool) }, event.modifierFlags())
-    })
-}
-
-/// Accepts Command-W only when no additional device-independent modifiers alter its meaning.
-pub(super) fn is_exact_markdown_command_w(
-    characters_ignoring_modifiers: &str,
-    modifiers: NSEventModifierFlags,
-) -> bool {
-    characters_ignoring_modifiers.eq_ignore_ascii_case("w")
-        && modifiers.intersection(NSEventModifierFlags::DeviceIndependentFlagsMask)
-            == NSEventModifierFlags::Command
 }
 
 #[cfg(test)]

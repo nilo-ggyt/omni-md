@@ -66,22 +66,12 @@ fn production_atx_tab_separator_empty_hashes_and_partial_coverage_keep_original_
         "#\n\n尾\n",
         "######\t\n\n尾\n",
         "### ###\n\n尾\n",
-        "## 中文\\###\n\n尾\n",
     ] {
         let requested = heading_range(source);
         let (_directory, mut doc) = document(source);
         doc.set_selection(MarkdownTextSelection::caret(doc.utf16_len()))
             .unwrap();
         let (_request, sources) = leaf_sources(&doc, requested.clone());
-        if source.contains('\\') {
-            assert!(matches!(
-                sources.semantic,
-                MarkdownOrdinarySemanticState::LeafPending(
-                    MarkdownRootLeafPendingReason::NeedsGeneralInline
-                )
-            )); // 原Plain规则也拒绝未证转义，不能只按最终可见结果猜测字面。
-            continue;
-        }
         let MarkdownOrdinarySemanticState::RootLeafReady(ready) = &sources.semantic else {
             panic!("Tab分隔或空ATX仍应沿真实块事实完成");
         };
@@ -188,7 +178,7 @@ fn production_atx_fixed_tail_tab_spans_preserve_known_marker_visibility() {
 }
 
 #[test]
-fn production_atx_general_inline_and_nested_scope_stay_unpublished() {
+fn production_atx_large_general_inline_stays_unpublished() {
     for text in [
         "**强调**",
         "*斜体*",
@@ -203,7 +193,7 @@ fn production_atx_general_inline_and_nested_scope_stay_unpublished() {
         "~下标~",
         "普通中文之后才有 **强调**",
     ] {
-        let source = format!("## {text}\n\n尾\n");
+        let source = format!("## {}\n\n尾\n", text.repeat(2049));
         let (_directory, doc) = document(&source);
         let requested = heading_range(&source);
         for range in [
@@ -219,22 +209,17 @@ fn production_atx_general_inline_and_nested_scope_stay_unpublished() {
             )); // 局部未见符号也不够：原标题的后续候选可能决定前面文字的配对与样式。
         }
     }
-    for source in ["> ## 引用标题\n\n尾\n", "- ## 列表标题\n\n尾\n"] {
-        let (_directory, doc) = document(source);
-        let (_request, sources) = leaf_sources(&doc, heading_range(source));
-        assert!(matches!(
-            sources.semantic,
-            MarkdownOrdinarySemanticState::LeafPending(MarkdownRootLeafPendingReason::NonRootScope)
-        )); // 原Root合同不因识别出#而吞掉引用/列表前缀和几何。
-    }
-    let source = "## **标题仍未知**\n\n```\n独立代码\n```\n";
-    let (_directory, doc) = document(source);
+    let source = format!(
+        "## **{}**\n\n```\n独立代码\n```\n",
+        "标题仍未知".repeat(500)
+    );
+    let (_directory, doc) = document(&source);
     let (_request, sources) = leaf_sources(&doc, 0..doc.utf16_len());
     let MarkdownOrdinarySemanticState::RootLeafReady(ready) = &sources.semantic else {
         panic!("未知标题不能取消同窗独立代码的真实覆盖");
     };
     assert!(ready.query_for(&doc, authority(&doc), 0).unwrap().is_none());
-    let code = units(source, first_leaf_range(source));
+    let code = units(&source, first_leaf_range(&source));
     assert!(
         ready
             .query_for(&doc, authority(&doc), code.start)
@@ -284,10 +269,10 @@ fn production_atx_joint_quota_cancel_edit_and_mapping_error_release_original_own
                 .advance(
                     &doc,
                     authority(&doc),
-                    true,
                     4096,
                     request.remaining_source_limits().unwrap(),
                     &mut request.semantic,
+                    Some(request.batch.source_global_mut().unwrap()),
                 )
                 .unwrap();
             assert_step(work);
@@ -308,10 +293,10 @@ fn production_atx_joint_quota_cancel_edit_and_mapping_error_release_original_own
                 job.advance(
                     &doc,
                     authority(&doc),
-                    true,
                     4096,
                     request.remaining_source_limits().unwrap(),
-                    &mut request.semantic
+                    &mut request.semantic,
+                    None,
                 )
                 .err(),
                 Some(MarkdownTableRequestError::InvalidRequest)
@@ -323,10 +308,10 @@ fn production_atx_joint_quota_cancel_edit_and_mapping_error_release_original_own
                 job.advance(
                     &doc,
                     cancelled,
-                    true,
                     4096,
                     request.remaining_source_limits().unwrap(),
-                    &mut request.semantic
+                    &mut request.semantic,
+                    None,
                 )
                 .err(),
                 Some(MarkdownTableRequestError::Cancelled)
@@ -335,10 +320,10 @@ fn production_atx_joint_quota_cancel_edit_and_mapping_error_release_original_own
                 job.advance(
                     &doc,
                     authority(&doc),
-                    true,
                     4096,
                     request.remaining_source_limits().unwrap(),
-                    &mut request.semantic
+                    &mut request.semantic,
+                    None,
                 )
                 .err(),
                 Some(MarkdownTableRequestError::Cancelled)

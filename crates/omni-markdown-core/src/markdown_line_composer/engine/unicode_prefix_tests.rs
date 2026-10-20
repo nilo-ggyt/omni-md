@@ -110,6 +110,7 @@ fn respond(
                     coverage,
                     font,
                     MarkdownLineComposeStyle {
+                        presentation: Default::default(),
                         points: 14.0,
                         language: None,
                         features: Vec::new(),
@@ -142,6 +143,13 @@ fn complete(
 ) {
     for _ in 0..2_000_000 {
         match step(worker, budget).answer {
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            MarkdownLineComposeAnswer::NeedsTableRow(_) => {
+                panic!("未启用表格流的原文字 oracle 不应产生 Grid 请求")
+            }
             MarkdownLineComposeAnswer::NeedStyle(request) => respond(worker, request, font, length),
             MarkdownLineComposeAnswer::Yielded | MarkdownLineComposeAnswer::LineReady(_) => {}
             MarkdownLineComposeAnswer::Complete => return,
@@ -395,6 +403,7 @@ fn respond_one_grapheme(
                     coverage,
                     font,
                     MarkdownLineComposeStyle {
+                        presentation: Default::default(),
                         points: 14.0,
                         language: None,
                         features: Vec::new(),

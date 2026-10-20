@@ -17,9 +17,14 @@ pub(super) struct SanitizedUnderlineScanner {
 }
 
 impl SanitizedUnderlineScanner {
-    #[cfg(any(test, feature = "s2-table-window-prototype"))]
     pub(super) fn next_byte(self) -> usize {
         self.next_byte
+    }
+
+    /// 同次Parser已证明的代码段只推进原byte坐标；保留外部完整开标签，截断未完成token。
+    pub(super) fn skip_literal(&mut self, bytes: usize) {
+        self.next_byte += bytes;
+        self.matched = 0; // 代码前后的半个标签不能拼接；代码内假close也不能吃掉外部open。
     }
 
     #[cfg(feature = "s2-table-window-prototype")]
@@ -139,5 +144,43 @@ mod tests {
         assert!(scanner.settled_after(6));
         assert!(std::mem::size_of::<SanitizedUnderlineScanner>() <= 32);
         assert!(!std::mem::needs_drop::<SanitizedUnderlineScanner>());
+    }
+
+    #[test]
+    /// 字面代码保留外部完整开标签及源坐标；两侧残缺标签不能越过代码重新拼接。
+    fn literal_code_preserves_outer_open_and_original_offsets_without_joining_partial_tags() {
+        let mut scanner = SanitizedUnderlineScanner::default();
+        for byte in b"<u>left</" {
+            assert!(scanner.push(*byte).is_none());
+        }
+        scanner.skip_literal(4 * 1024 * 1024); // 原Parser代码段无需交给allowlist；本扫描器仍不持正文。
+        for byte in b"u>after" {
+            assert!(scanner.push(*byte).is_none());
+        } // 代码前的半个close已被截断，不能跨代码恢复匹配。
+        let mut actual = None;
+        for byte in b"</u>" {
+            actual = scanner.push(*byte).or(actual);
+        }
+        let pair = actual.unwrap();
+        assert_eq!(pair.open_start, 0);
+        assert_eq!(pair.content_start, 3);
+        assert_eq!(
+            pair.close_start,
+            b"<u>left</".len() + 4 * 1024 * 1024 + b"u>after".len()
+        );
+        assert_eq!(pair.end, scanner.next_byte());
+
+        let mut scanner = SanitizedUnderlineScanner::default();
+        scanner.push(b'<');
+        scanner.skip_literal(7);
+        for byte in b"u>x</u>" {
+            assert!(scanner.push(*byte).is_none());
+        } // 未完成open同样不跨代码拼接；之后真正完整的pair仍使用原绝对offset。
+        let start = scanner.next_byte();
+        let mut actual = None;
+        for byte in b"<u>x</u>" {
+            actual = scanner.push(*byte).or(actual);
+        }
+        assert_eq!(actual.unwrap().open_start, start);
     }
 }

@@ -1,9 +1,12 @@
 //! 有限可见行的真实GCB几何；不按UTF16平均分配，不保留整行字素列表。
 
 use super::*;
-use crate::native_surface::paged_line_geometry::composed_part_caret;
+use crate::native_surface::paged_line_geometry::{
+    ComposedPartSourceEdge, composed_part_caret, composed_part_extent_edge,
+};
 use omni_markdown_core::{
     MarkdownComposedLinePartKind, MarkdownGraphemeAnswer, MarkdownGraphemeQuery,
+    MarkdownPresentationStyles,
 };
 
 /// 一次命中最多查询固定数量的真实边界；超大零advance行由后继producer另行索引。
@@ -12,12 +15,89 @@ const HIT_BOUNDARIES: usize = 4_096;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NativeMarkdownComposedViewportHit {
     pub source_utf16: usize,
+    /// 实际命中 part 的起/末侧；显示格删除语法后，相同局部 caret 两侧的 canonical 端点可以不同。
+    pub source_affinity: omni_markdown_core::MarkdownComposedLineAffinity,
+    /// 第二候选保它自己的实际 part 侧，不能借主候选的亲和解释 BiDi 边界。
+    pub other_source_affinity: Option<omni_markdown_core::MarkdownComposedLineAffinity>,
     /// 两个逻辑位置与点击点同距时保留另一候选，外层不能据此伪造主方向。
     pub other_source_utf16: Option<usize>,
     pub line_ordinal: usize,
 }
 
 impl NativeMarkdownComposedViewport {
+    /// Find只借当前可见软行的真实part源域；Preview的Markdown语法没有高亮权限，
+    /// Source保留字面字符。折叠区和表格占位没有普通正文glyph，不能借行包络扫描其隐藏源。
+    pub(in crate::native_surface) fn visible_find_ranges(
+        &self,
+        current: &dyn Fn() -> bool,
+    ) -> Result<Vec<Range<usize>>> {
+        self.require(current)?;
+        let preview = self.key.presentation_mode == MarkdownPresentationMode::InlinePreview;
+        let mut ranges = Vec::new();
+        for line in self.lines.iter().filter(|line| self.visible(line.frame)) {
+            for part in &line.parts {
+                let facts = part.handle.facts();
+                if facts.source_utf16.is_empty()
+                    || matches!(
+                        facts.kind,
+                        MarkdownComposedLinePartKind::FoldedSection
+                            | MarkdownComposedLinePartKind::TableRow
+                    )
+                    || preview
+                        && (facts
+                            .presentation
+                            .contains(MarkdownPresentationStyles::MARKER)
+                            || facts
+                                .presentation
+                                .contains(MarkdownPresentationStyles::HIDDEN_MARKER))
+                {
+                    continue;
+                }
+                ranges.push(facts.source_utf16.clone()); // 仅封存metadata，不读取、复制或解析正文。
+            }
+        }
+        self.require(current)?;
+        Ok(ranges)
+    }
+
+    /// 只给实际链接墨迹区域开放后继目标查询；样式位不能自行构造URL或扩大到行尾空白。
+    pub fn link_part_at(
+        &self,
+        local: NSPoint,
+        current: &dyn Fn() -> bool,
+    ) -> Result<Option<Range<usize>>> {
+        self.require(current)?;
+        if !inside(local, self.clip()) {
+            return Ok(None);
+        }
+        for line in &self.lines {
+            if !self.visible(line.frame) {
+                continue;
+            }
+            for part in &line.parts {
+                let facts = part.handle.facts();
+                let styles = facts.presentation;
+                if !styles.contains(MarkdownPresentationStyles::LINK)
+                    || styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER)
+                    || styles.contains(MarkdownPresentationStyles::MARKER)
+                {
+                    continue; // 激活只属于原链接正文；显露的Markdown语法仍可普通点击、选择和编辑。
+                }
+                let start = line.baseline.x + facts.origin_x_26_6 as f64 / 64.0;
+                let end = start + facts.x_advance_26_6 as f64 / 64.0;
+                let rect = NSRect::new(
+                    NSPoint::new(start.min(end), line.baseline.y - line.descent),
+                    NSSize::new((end - start).abs(), line.ascent + line.descent),
+                );
+                if inside(local, rect) {
+                    self.require(current)?;
+                    return Ok(Some(facts.source_utf16.clone()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// 正式IME/可见性与绘制消费同一选择槽的真实Bidi侧；非空范围仍定位首GCB。
     pub fn first_rect_with_caret_side(
         &self,
@@ -71,7 +151,7 @@ impl NativeMarkdownComposedViewport {
         range
             .location
             .checked_add(range.length)
-            .filter(|end| *end <= self.key.request.input.utf16_len)
+            .filter(|end| *end <= self.utf16_len())
             .ok_or(NativeMarkdownComposedViewportError::InvalidRange)?;
         if range.length == 0 {
             let caret = self.caret_geometry(range.location, affinity, current)?;
@@ -84,18 +164,50 @@ impl NativeMarkdownComposedViewport {
                 actual_range: range,
             });
         }
-        let (line, part) = self.part_for_position(range.location)?;
+        let (line, _) = self.part_for_position(range.location)?;
         if !self.visible(line.frame) {
             return Err(NativeMarkdownComposedViewportError::Pending);
         }
         // 非空请求扩到首scalar所属完整GCB；不把后继行或UTF16中点当作字形首位置。
         let start = self.boundary(range.location, false)?;
         let next = self.next_boundary(start)?;
-        if next > part.handle.facts().source_utf16.end || next <= start {
+        if next > line.handle.facts().source_utf16.end || next <= start {
             return Err(NativeMarkdownComposedViewportError::InvalidRange);
         }
         let actual = start..next;
-        let rect = self.part_rect(line, part, actual.clone(), current)?;
+        let mut rect: Option<NSRect> = None;
+        let mut covered = 0usize;
+        for part in &line.parts {
+            let source = &part.handle.facts().source_utf16;
+            let overlap = actual.start.max(source.start)..actual.end.min(source.end);
+            if overlap.start >= overlap.end {
+                continue;
+            }
+            // 同一 GCB 的字形可以属于数个真实 UBA/字体项；只聚合原有限行的实际包络。
+            // 内部 seam 仅作绘制截面，actual_range 始终保留原完整 GCB，不给 IME 半个字符框。
+            let next = self.part_rect(line, part, overlap.clone(), current)?;
+            covered = covered
+                .checked_add(overlap.len())
+                .ok_or(NativeMarkdownComposedViewportError::InvalidRange)?;
+            rect = Some(if let Some(previous) = rect {
+                let left = previous.origin.x.min(next.origin.x);
+                let bottom = previous.origin.y.min(next.origin.y);
+                let right =
+                    (previous.origin.x + previous.size.width).max(next.origin.x + next.size.width);
+                let top = (previous.origin.y + previous.size.height)
+                    .max(next.origin.y + next.size.height);
+                NSRect::new(
+                    NSPoint::new(left, bottom),
+                    NSSize::new(right - left, top - bottom),
+                )
+            } else {
+                next
+            });
+        }
+        if covered != actual.len() {
+            return Err(NativeMarkdownComposedViewportError::Pending);
+        } // 未准备完整原 GCB 时不能把一个已显示片段签为整个字符。
+        let rect = rect.ok_or(NativeMarkdownComposedViewportError::Pending)?;
         if !self.visible(rect) && rect.size.width != 0.0 {
             return Err(NativeMarkdownComposedViewportError::Pending);
         }
@@ -106,17 +218,170 @@ impl NativeMarkdownComposedViewport {
         })
     }
 
+    /// 词组点击侧只由本次真实字形与相邻GCB的caret方向决定；Body和只读格共用此事实。
+    /// 返回命中而非词范围，真正中文、标点和双向文字分词仍交同Source的原UBA生产者。
+    pub(in crate::native_surface) fn word_hit(
+        &self,
+        local: NSPoint,
+        current: &dyn Fn() -> bool,
+    ) -> Result<(NativeMarkdownComposedViewportHit, bool)> {
+        let hit = self.hit(local, current)?;
+        if hit.other_source_utf16.is_some() {
+            return Err(NativeMarkdownComposedViewportError::Pending);
+        } // 同视觉位置仍有两个逻辑候选时，不能从UTF16大小或默认LTR猜词组侧。
+        let line = self
+            .lines
+            .iter()
+            .find(|line| line.handle.facts().ordinal == hit.line_ordinal)
+            .ok_or(NativeMarkdownComposedViewportError::InvalidGeometry)?;
+        let range = &line.handle.facts().source_utf16;
+        let affinity =
+            crate::native_surface::paged_text_view::NativeMarkdownPagedHeadAffinity::from_upstream(
+                hit.source_affinity == omni_markdown_core::MarkdownComposedLineAffinity::Upstream,
+            );
+        let caret = self.caret_geometry(hit.source_utf16, affinity, current)?;
+        if caret.line_ordinal != hit.line_ordinal || caret.secondary.is_some() {
+            return Err(NativeMarkdownComposedViewportError::Pending);
+        }
+        for next in [true, false] {
+            let position = {
+                // 只读原封存GCB目录；Reader租约在Native几何或current回调前结束。
+                let mut output = self
+                    .output
+                    .try_borrow_mut()
+                    .map_err(|_| NativeMarkdownComposedViewportError::Busy)?;
+                match output.grapheme_query(
+                    hit.source_utf16,
+                    if next {
+                        MarkdownGraphemeQuery::Next
+                    } else {
+                        MarkdownGraphemeQuery::Previous
+                    },
+                )? {
+                    MarkdownGraphemeAnswer::Known(Some(boundary)) => Some(boundary.utf16),
+                    _ => None,
+                }
+            };
+            self.require(current)?;
+            let Some(position) =
+                position.filter(|position| range.contains(position) || *position == range.end)
+            else {
+                continue; // 窗口外、硬换行或尚无相邻边界均不授方向，仍可检查另一真实同run邻侧。
+            };
+            let adjacent = self.caret_geometry(
+                position,
+                crate::native_surface::paged_text_view::NativeMarkdownPagedHeadAffinity::from_upstream(next),
+                current,
+            )?;
+            if adjacent.line_ordinal != hit.line_ordinal || adjacent.secondary.is_some() {
+                continue;
+            }
+            let forward_x = if next {
+                adjacent.primary.origin.x - caret.primary.origin.x
+            } else {
+                caret.primary.origin.x - adjacent.primary.origin.x
+            };
+            if forward_x == 0.0 {
+                continue; // 零advance没有可证明方向，不能把UTF16邻接当作真实视觉位置。
+            }
+            let backward_bias = if forward_x > 0.0 {
+                local.x < caret.primary.origin.x
+            } else {
+                local.x > caret.primary.origin.x
+            };
+            self.require(current)?;
+            return Ok((hit, backward_bias));
+        }
+        self.require(current)?;
+        if range.is_empty() {
+            return Ok((hit, false)); // 真空行没有词组，原UBA将返回同一空范围，不借相邻行补内容。
+        }
+        Err(NativeMarkdownComposedViewportError::Pending)
+    }
+
     /// 有界顺序比较原GCB的实际caret，保留BiDi同视觉位置的两个逻辑候选。
     ///
     /// # Errors
     /// 点在窗口外、候选行尚未准备、边界预算不足或原权限失效时返回Pending/错误。
+    /// 拖选终点只投到本窗口真正可见的封存行；保留原物理点供滚动使用，不猜离屏文字位置。
+    pub(in crate::native_surface) fn project_drag_point(
+        &self,
+        local: NSPoint,
+        current: &dyn Fn() -> bool,
+    ) -> Result<Option<NSPoint>> {
+        self.require(current)?;
+        if !point(local) {
+            return Err(NativeMarkdownComposedViewportError::InvalidGeometry);
+        }
+        let clip = self.clip();
+        let mut nearest = None;
+        let mut distance = f64::INFINITY;
+        for line in &self.lines {
+            if line.handle.facts().kind == omni_markdown_core::MarkdownComposedLineKind::TableRow
+                || line.parts.is_empty()
+                || line.parts.iter().all(|part| {
+                    matches!(
+                        part.handle.facts().kind,
+                        MarkdownComposedLinePartKind::FoldedSection
+                            | MarkdownComposedLinePartKind::TableRow
+                    )
+                })
+            {
+                continue; // 结构行交真实Grid；折叠隐区没有可用于拖选的可见墨迹或虚构行高。
+            }
+            if self.key.presentation_mode == MarkdownPresentationMode::InlinePreview {
+                let mut hidden_text = false;
+                let mut visible_text = false;
+                for part in &line.parts {
+                    let facts = part.handle.facts();
+                    if matches!(
+                        facts.kind,
+                        MarkdownComposedLinePartKind::Glyphs | MarkdownComposedLinePartKind::Tab
+                    ) {
+                        if facts
+                            .presentation
+                            .contains(MarkdownPresentationStyles::HIDDEN_MARKER)
+                        {
+                            hidden_text = true;
+                        } else {
+                            visible_text = true;
+                        }
+                    }
+                }
+                if hidden_text && !visible_text {
+                    continue; // 整行只有0.1pt隐藏语法时没有拖选目标；真实空行的ParagraphBreak仍保留。
+                }
+            }
+            let bottom = line.frame.origin.y.max(clip.origin.y);
+            let top = (line.frame.origin.y + line.frame.size.height)
+                .min(clip.origin.y + clip.size.height);
+            if top <= bottom {
+                continue;
+            }
+            // 严格小于右/上边，沿原hit的半开行框；next_down只选同一真实框内的最近可表示点。
+            let projected = NSPoint::new(
+                local
+                    .x
+                    .clamp(clip.origin.x, (clip.origin.x + clip.size.width).next_down()),
+                local.y.clamp(bottom, top.next_down()),
+            );
+            let delta = (local.x - projected.x).hypot(local.y - projected.y);
+            if delta < distance {
+                nearest = Some(projected);
+                distance = delta;
+            }
+        }
+        self.require(current)?;
+        Ok(nearest) // 仅遍历当前已拥有的有限行metadata；不读Source、GCB或建立新目录。
+    }
+
     pub fn hit(
         &self,
         local: NSPoint,
         current: &dyn Fn() -> bool,
     ) -> Result<NativeMarkdownComposedViewportHit> {
         self.require(current)?;
-        if !point(local) || !inside(local, self.key.request.viewport) {
+        if !point(local) || !inside(local, self.clip()) {
             return Err(NativeMarkdownComposedViewportError::Pending);
         }
         let line = self
@@ -127,19 +392,25 @@ impl NativeMarkdownComposedViewport {
                     && local.y < line.frame.origin.y + line.frame.size.height
             })
             .ok_or(NativeMarkdownComposedViewportError::Pending)?;
+        if line.handle.facts().kind == omni_markdown_core::MarkdownComposedLineKind::TableRow {
+            return Err(NativeMarkdownComposedViewportError::Pending);
+        }
         // 先以原目录rank预检全行查询量；没有预算时不能用已比较的前缀冒称最近位置。
         let mut count = 0usize;
         {
-            let mut reader = self
-                .output
-                .try_borrow_mut()
-                .map_err(|_| NativeMarkdownComposedViewportError::Busy)?;
             for part in &line.parts {
+                let Some(range) = self.part_grapheme_range(part)? else {
+                    continue; // 两个整形 seam 之间可以没有可编辑边界，不把零个 GCB 当成缺源错误。
+                };
+                let mut reader = self
+                    .output
+                    .try_borrow_mut()
+                    .map_err(|_| NativeMarkdownComposedViewportError::Busy)?;
                 let start = reader
-                    .grapheme_ordinal(part.handle.facts().source_utf16.start)?
+                    .grapheme_ordinal(*range.start())?
                     .ok_or(NativeMarkdownComposedViewportError::InvalidRange)?;
                 let end = reader
-                    .grapheme_ordinal(part.handle.facts().source_utf16.end)?
+                    .grapheme_ordinal(*range.end())?
                     .ok_or(NativeMarkdownComposedViewportError::InvalidRange)?;
                 count = count
                     .checked_add(
@@ -155,9 +426,13 @@ impl NativeMarkdownComposedViewport {
         }
         let mut answer: Option<NativeMarkdownComposedViewportHit> = None;
         let mut distance = f64::INFINITY;
+        let mut primary_inside_part = false;
         // 有限GCB逐项比较真实caret；不假设连字内部GDEF单调，也不按源字节长度插值。
         for part in &line.parts {
-            let mut position = part.handle.facts().source_utf16.start;
+            let Some(range) = self.part_grapheme_range(part)? else {
+                continue;
+            };
+            let mut position = *range.start();
             loop {
                 let caret = composed_part_caret(
                     &self.output,
@@ -169,15 +444,38 @@ impl NativeMarkdownComposedViewport {
                 );
                 self.require(current)?; // 原Source故障优先，不能被几何回调的bool撤权掩盖。
                 let caret = caret?;
+                let affinity = if position == part.handle.facts().source_utf16.end {
+                    omni_markdown_core::MarkdownComposedLineAffinity::Upstream
+                } else {
+                    omni_markdown_core::MarkdownComposedLineAffinity::Downstream
+                }; // 只消费原真实 part 边界，不按文字方向或平均 advance 猜测隐藏语法的来源侧。
+                let facts = part.handle.facts();
+                let part_start = line.baseline.x + facts.origin_x_26_6 as f64 / 64.0;
+                let part_end = part_start + facts.x_advance_26_6 as f64 / 64.0;
+                let inside_part =
+                    local.x >= part_start.min(part_end) && local.x < part_start.max(part_end);
                 let delta = (caret.baseline.x - local.x).abs();
                 if delta < distance {
                     // 更近的视觉位置整体替换旧候选，旧BiDi歧义不能污染新结果。
                     distance = delta;
+                    primary_inside_part = inside_part;
                     answer = Some(NativeMarkdownComposedViewportHit {
                         source_utf16: position,
+                        source_affinity: affinity,
+                        other_source_affinity: None,
                         other_source_utf16: None,
                         line_ordinal: line.handle.facts().ordinal,
                     });
+                } else if delta == distance
+                    && let Some(answer) = &mut answer
+                    && answer.source_utf16 == position
+                    && inside_part
+                    && !primary_inside_part
+                {
+                    // 同一可见 caret 的两个样式 part 重合时，取点击点实际落入的墨迹跨度一侧。
+                    // 这只决定隐藏语法前后的来源亲和，不丢另一个真实 BiDi 逻辑候选。
+                    answer.source_affinity = affinity;
+                    primary_inside_part = true;
                 } else if delta == distance
                     && let Some(answer) = &mut answer
                     && answer.source_utf16 != position
@@ -188,16 +486,18 @@ impl NativeMarkdownComposedViewport {
                     {
                         return Err(NativeMarkdownComposedViewportError::Pending);
                     } // 多个零advance/GCB重合时不丢中间逻辑候选，等待后继完整affinity生产者。
+                    answer.other_source_affinity = Some(affinity);
                     answer.other_source_utf16 = Some(position); // 不丢BiDi边界歧义，亦不声称这是选择anchor/head。
                 }
-                if position == part.handle.facts().source_utf16.end
+                if position == *range.end()
                     || part.handle.facts().kind == MarkdownComposedLinePartKind::ParagraphBreak
+                    || part.handle.facts().kind == MarkdownComposedLinePartKind::FoldedSection
                 {
                     break;
                 } // 换段part的起点是本行末caret，末端属于下一视觉行；CRLF零advance不能凭空制造BiDi歧义。
                 // 其他part仍遍历原GCB端点，保留真实同x候选；不跨字体/方向目录猜位置。
                 let next = self.next_boundary(position)?;
-                if next <= position || next > part.handle.facts().source_utf16.end {
+                if next <= position || next > *range.end() {
                     return Err(NativeMarkdownComposedViewportError::InvalidRange);
                 }
                 position = next;
@@ -219,7 +519,7 @@ impl NativeMarkdownComposedViewport {
         mut visitor: impl FnMut(NSRect) -> Result<()>,
     ) -> Result<usize> {
         self.require(current)?;
-        if selection.start > selection.end || selection.end > self.key.request.input.utf16_len {
+        if selection.start > selection.end || selection.end > self.utf16_len() {
             return Err(NativeMarkdownComposedViewportError::InvalidRange);
         }
         let mut count = 0usize;
@@ -230,14 +530,23 @@ impl NativeMarkdownComposedViewport {
             }
             for part in &line.parts {
                 let facts = part.handle.facts();
+                if matches!(
+                    facts.kind,
+                    MarkdownComposedLinePartKind::FoldedSection
+                        | MarkdownComposedLinePartKind::TableRow
+                ) {
+                    continue; // 隐区没有可见字形或选区框，不能沿其原 UTF16 长度遍历内部 GCB。
+                }
                 let start = selection.start.max(facts.source_utf16.start);
                 let end = selection.end.min(facts.source_utf16.end);
                 if start >= end {
                     continue;
                 } // 该视觉part没有选中字节，不能通过取整制造额外高亮。
-                let actual = self.boundary(start, false)?..self.boundary(end, true)?;
+                // 先保原完整字素，再裁回真实绘制项；整形 seam 只影响包络，不拆用户的选择。
+                let actual = self.boundary(start, false)?.max(facts.source_utf16.start)
+                    ..self.boundary(end, true)?.min(facts.source_utf16.end);
                 let rect = self.part_rect(line, part, actual, current)?;
-                let Some(rect) = clip_selection(rect, self.key.request.viewport) else {
+                let Some(rect) = clip_selection(rect, self.clip()) else {
                     continue;
                 };
                 self.require(current)?;
@@ -253,7 +562,13 @@ impl NativeMarkdownComposedViewport {
         for line in &self.lines {
             for part in &line.parts {
                 let range = &part.handle.facts().source_utf16;
-                if range.contains(&offset) {
+                if range.contains(&offset)
+                    && !matches!(
+                        part.handle.facts().kind,
+                        MarkdownComposedLinePartKind::FoldedSection
+                            | MarkdownComposedLinePartKind::TableRow
+                    )
+                {
                     return Ok((line, part));
                 }
             }
@@ -261,7 +576,7 @@ impl NativeMarkdownComposedViewport {
         Err(NativeMarkdownComposedViewportError::Pending) // 本分支只定位非空首scalar；caret由真实换行侧单独查询。
     }
 
-    fn boundary(&self, offset: usize, following: bool) -> Result<usize> {
+    pub(super) fn boundary(&self, offset: usize, following: bool) -> Result<usize> {
         let mut reader = self
             .output
             .try_borrow_mut()
@@ -289,7 +604,15 @@ impl NativeMarkdownComposedViewport {
             _ => Err(NativeMarkdownComposedViewportError::InvalidRange), // 真EOF与缺失目录不制造下一字素。
         }
     }
-    fn part_rect(
+
+    /// 只借原目录确定这个真实 part 内第一/最后的 GCB；不造新边界或缓存逐字素数组。
+    fn part_grapheme_range(&self, part: &Part) -> Result<Option<std::ops::RangeInclusive<usize>>> {
+        let range = &part.handle.facts().source_utf16;
+        let first = self.boundary(range.start, true)?;
+        let last = self.boundary(range.end, false)?;
+        Ok((first <= last).then_some(first..=last))
+    }
+    pub(super) fn part_rect(
         &self,
         line: &Line,
         part: &Part,
@@ -301,36 +624,46 @@ impl NativeMarkdownComposedViewport {
             return Err(NativeMarkdownComposedViewportError::InvalidRange);
         }
         let guarded = || self.require(current).is_ok(); // Native GDEF查询只拿bool，外层仍优先重报实际Source错误。
-        let start = composed_part_caret(
-            &self.output,
-            &part.handle,
-            &self.palette[part.font],
-            selection.start,
-            line.baseline,
-            &guarded,
-        );
+        let position = |at| {
+            let edge = if at == actual.start {
+                Some(ComposedPartSourceEdge::Start)
+            } else if at == actual.end {
+                Some(ComposedPartSourceEdge::End)
+            } else {
+                None
+            };
+            if let Some(edge) = edge {
+                composed_part_extent_edge(
+                    &self.output,
+                    &part.handle,
+                    &self.palette[part.font],
+                    edge,
+                    line.baseline,
+                    &guarded,
+                )
+            } else {
+                // 真正位于项内部的位置仍是公开 caret 合同，只允许原 GCB/GDEF，不能按 scalar 插值。
+                composed_part_caret(
+                    &self.output,
+                    &part.handle,
+                    &self.palette[part.font],
+                    at,
+                    line.baseline,
+                    &guarded,
+                )
+                .map(|caret| caret.baseline)
+            }
+        };
+        let start = position(selection.start);
         self.require(current)?;
         let start = start?;
-        let end = composed_part_caret(
-            &self.output,
-            &part.handle,
-            &self.palette[part.font],
-            selection.end,
-            line.baseline,
-            &guarded,
-        );
+        let end = position(selection.end);
         self.require(current)?;
         let end = end?;
         // RTL端点按实际视觉x取min/max；高度沿同一行真实metrics，不能用UTF16长度推宽度。
         let rect = NSRect::new(
-            NSPoint::new(
-                start.baseline.x.min(end.baseline.x),
-                line.baseline.y - line.descent,
-            ),
-            NSSize::new(
-                (end.baseline.x - start.baseline.x).abs(),
-                line.ascent + line.descent,
-            ),
+            NSPoint::new(start.x.min(end.x), line.baseline.y - line.descent),
+            NSSize::new((end.x - start.x).abs(), line.ascent + line.descent),
         );
         if !point(rect.origin)
             || !rect.size.width.is_finite()
@@ -350,7 +683,7 @@ fn inside(point: NSPoint, clip: NSRect) -> bool {
         && point.y < clip.origin.y + clip.size.height
 }
 
-fn clip_selection(rect: NSRect, clip: NSRect) -> Option<NSRect> {
+pub(super) fn clip_selection(rect: NSRect, clip: NSRect) -> Option<NSRect> {
     let left = rect.origin.x.max(clip.origin.x);
     let bottom = rect.origin.y.max(clip.origin.y);
     let right = (rect.origin.x + rect.size.width).min(clip.origin.x + clip.size.width);

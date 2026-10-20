@@ -171,82 +171,57 @@ fn append_line_strikes(
 }
 
 impl NativeMarkdownTableCellTextLayout {
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    /// 合成事件只借原 CTLine 的实际 caret，不用等宽估算或创建另一份排版。
-    pub(in crate::native_surface) fn probe_point_for_display_index(
+    /// 源scalar已映射为本格display范围；矩形只读实际绘制CTLine，不借Native行高占位框。
+    pub(in crate::native_surface) fn display_scalar_rect(
         &self,
-        index: usize,
+        display: std::ops::Range<usize>,
         text_frame: NSRect,
-    ) -> Option<NSPoint> {
-        // SAFETY: 本 layout 持有原不可变 frame，公开数组中的行在本方法结束前存活。
+    ) -> Option<NSRect> {
+        // SAFETY: 本layout持有不可变CTFrame，行对象只在此同步借用，不保留数组内部指针。
         let lines = unsafe { self.frame.lines() };
         for (ordinal, geometry) in self.lines.iter().enumerate() {
-            // SAFETY: ordinal 来自该 frame 的实际行数组，元素公开类型为 CTLine。
+            // SAFETY: ordinal来自同一frame实际行数组，公开元素类型为CTLine。
             let raw = unsafe { lines.value_at_index(ordinal.try_into().ok()?) };
-            let raw = NonNull::new(raw.cast_mut().cast::<CTLine>())?;
-            // SAFETY: 原 frame/lines 持有该不可变 line；只读真实源范围与 caret 偏移。
-            let (range, offset) = unsafe {
-                let line = raw.as_ref();
+            let line = NonNull::new(raw.cast_mut().cast::<CTLine>())?;
+            // SAFETY: 原frame保活line，两个caret输出仅为栈上的实际CoreText坐标。
+            let (range, start, end) = unsafe {
+                let line = line.as_ref();
                 (
                     line.string_range(),
-                    line.offset_for_string_index(index.try_into().ok()?, std::ptr::null_mut()),
+                    line.offset_for_string_index(
+                        display.start.try_into().ok()?,
+                        std::ptr::null_mut(),
+                    ),
+                    line.offset_for_string_index(
+                        display.end.try_into().ok()?,
+                        std::ptr::null_mut(),
+                    ),
                 )
             };
-            let start = usize::try_from(range.location).ok()?;
-            let end = start.checked_add(usize::try_from(range.length).ok()?)?;
-            if index < start || index >= end {
-                continue;
+            let from = usize::try_from(range.location).ok()?;
+            let to = from.checked_add(usize::try_from(range.length).ok()?)?;
+            if display.start < from || display.start >= to || display.end > to {
+                continue; // 下一真实视觉行才可拥有此scalar，不能用上一行尾caret充当字形。
             }
-            return Some(NSPoint::new(
-                text_frame.origin.x + geometry.origin.x + offset + 0.1,
-                text_frame.origin.y + self.size.height - geometry.origin.y - geometry.ascent / 2.0,
-            ));
-        }
-        None
-    }
-
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    /// 删除线像素检查取真实空格两端 caret 的最近视觉间隔，覆盖 RTL 边界的 secondary caret。
-    pub(in crate::native_surface) fn probe_strike_space_point(
-        &self,
-        index: usize,
-        text_frame: NSRect,
-    ) -> Option<NSPoint> {
-        // SAFETY: 原不可变 frame 持有实际 CTLine 数组，方法内无修改或再排版。
-        let lines = unsafe { self.frame.lines() };
-        for (ordinal, geometry) in self.lines.iter().enumerate() {
-            // SAFETY: ordinal 在实际行数内，公开元素类型为 CTLine。
-            let raw = unsafe { lines.value_at_index(ordinal.try_into().ok()?) };
-            let raw = NonNull::new(raw.cast_mut().cast::<CTLine>())?;
-            // SAFETY: 原 frame/lines 保活该行；两个 secondary 输出均为可写栈标量。
-            let (range, starts, ends) = unsafe {
-                let line = raw.as_ref();
-                let (mut a, mut b) = (0.0, 0.0);
-                let left = line.offset_for_string_index(index.try_into().ok()?, &mut a);
-                let right =
-                    line.offset_for_string_index(index.checked_add(1)?.try_into().ok()?, &mut b);
-                (line.string_range(), [left, a], [right, b])
-            };
-            let start = usize::try_from(range.location).ok()?;
-            let end = start.checked_add(usize::try_from(range.length).ok()?)?;
-            if index < start || index.checked_add(1)? > end {
-                continue;
-            }
-            let (_, x) = starts
-                .into_iter()
-                .flat_map(|a| ends.map(|b| ((a - b).abs(), (a + b) / 2.0)))
-                .filter(|(width, x)| width.is_finite() && *width > 0.2 && x.is_finite())
-                .min_by(|a, b| a.0.total_cmp(&b.0))?;
-            let x = geometry.origin.x + x;
-            let strike = self.strikes.iter().find(|strike| {
-                x > strike.start.x.min(strike.end.x)
-                    && x < strike.start.x.max(strike.end.x)
-                    && (strike.start.y - geometry.origin.y).abs() < geometry.ascent
-            })?;
-            return Some(NSPoint::new(
-                text_frame.origin.x + x,
-                text_frame.origin.y + self.size.height - strike.start.y,
-            ));
+            let rect = NSRect::new(
+                NSPoint::new(
+                    text_frame.origin.x + geometry.origin.x + start.min(end),
+                    text_frame.origin.y + self.size.height - geometry.origin.y - geometry.ascent,
+                ),
+                NSSize::new(
+                    (end - start).abs().max(1.0),
+                    geometry.ascent + geometry.descent,
+                ),
+            );
+            return [
+                rect.origin.x,
+                rect.origin.y,
+                rect.size.width,
+                rect.size.height,
+            ]
+            .into_iter()
+            .all(f64::is_finite)
+            .then_some(rect);
         }
         None
     }

@@ -220,26 +220,36 @@ impl Producer {
                     MarkdownComposedLineLookupAnswer::Found(line)
                         if line.facts().ordinal == ordinal =>
                     {
-                        target.metrics = Some(LineMetrics::new(line));
+                        target.metrics =
+                            Some(LineMetrics::new(line, owner.presentation_mode(), false));
                         target.lookup = None;
                     }
                     _ => return Err(Error::Unsupported), // 已度量前缀缺失原ordinal是源/目录错误，不签空目标。
                 }
             }
             let mut metrics = target.metrics.take().ok_or(Error::Closed)?;
-            let allowed = parts.min(records / 4);
-            let mut quota = allowed;
+            // 一个part实际读取Line认证2条、Part2条、Directory3条；只领取本轮真实record余量。
+            let allowed = parts.min(records / 7);
+            let mut quota = MarkdownLineComposeBudget {
+                metadata_units: allowed,
+                records,
+                ..LINE_METRIC_BUDGET
+            };
             ticket.require(owner, &self.source)?;
-            let ready = metrics.advance(&output, owner, &mut quota)?;
-            parts -= allowed - quota;
-            records -= (allowed - quota) * 4;
+            let mut work = grid::Work::default();
+            let ready = metrics.advance(&output, owner, &mut quota, &mut work);
+            self.record_grid_work(work)?;
+            let ready = ready?;
+            let used = allowed - quota.metadata_units;
+            parts -= used;
+            records = quota.records;
             self.target_metric_parts = self
                 .target_metric_parts
-                .checked_add(allowed - quota)
+                .checked_add(used)
                 .ok_or(Error::CounterExhausted)?;
             self.target_index_records = self
                 .target_index_records
-                .checked_add((allowed - quota) * 4)
+                .checked_add(used * 7)
                 .ok_or(Error::CounterExhausted)?;
             ticket.require(owner, &self.source)?;
             if !ready {
@@ -291,17 +301,30 @@ impl Producer {
         self.last_target_anchor = Some(anchor.clone());
         ticket.require(owner, &self.source)?;
         let viewport = owner.viewport.borrow().clone().ok_or(Error::Closed)?;
+        if viewport.geometry()?.content_width != self.maximum_content_width {
+            owner.native_preparation_geometry(&ticket.request, &viewport, || {
+                viewport.set_content_width(self.maximum_content_width)
+            })?;
+            owner.schedule()?;
+            return Ok(TargetAdvance::Handled); // 先归还旧横向范围，原目标在后继真实geometry继续。
+        }
         if viewport.geometry()?.content_height != self.height() {
-            viewport.set_content_height(self.height())?;
+            owner.native_preparation_geometry(&ticket.request, &viewport, || {
+                viewport.set_content_height(self.height())
+            })?;
             owner.schedule()?;
             return Ok(TargetAdvance::Handled); // 自有高度更新撤旧geometry，下一真实请求再滚动。
         }
         let rect = NSRect::new(
-            NSPoint::new(self.padding, anchor.top),
+            NSPoint::new(
+                ticket.request.virtual_viewport.layout_origin_x + self.padding,
+                anchor.top,
+            ),
             NSSize::new(1.0, anchor.bottom - anchor.top),
         );
-        let revealed =
-            viewport.reveal_document_rect(rect, &|| target.request.current_native(owner));
+        let revealed = owner.native_preparation_geometry(&ticket.request, &viewport, || {
+            viewport.reveal_document_rect(rect, &|| target.request.current_native(owner))
+        });
         self.target_source_health()?; // Native或current重入的普通撤权不得掩盖同一Source首错。
         if !target.request.current_native(owner) {
             return Err(Error::PreparationRevoked);
@@ -359,7 +382,7 @@ impl Producer {
             return Ok(TargetAdvance::VisibleBand);
         }
         let at_eof = target.request.range.location == self.source.utf16_len();
-        // 同一量子最多256个真实64B目录读取；每part包含require_line两条和part两条，
+        // 同一量子最多256个真实64B目录读取；每part包含Line认证2条、Part2条和Directory3条，
         // previous_line也包含原行认证与前驱两条。不能把API调用次数冒充真实record数。
         let mut records_left = 256usize;
         if target.anchor.is_none() {
@@ -507,20 +530,29 @@ impl Producer {
                 if walk.metrics.is_none() {
                     walk.metrics = Some(LineMetrics::new(
                         walk.cursor.take().ok_or(Error::Unsupported)?,
+                        owner.presentation_mode(),
+                        false,
                     ));
                 }
                 let mut metrics = walk.metrics.take().ok_or(Error::Closed)?;
                 ticket.require(owner, &self.source)?;
                 let before = metrics.part;
-                let allowed = parts.min(records_left / 4);
-                let mut part_quota = allowed;
-                let ready = metrics.advance(&output, owner, &mut part_quota)?;
-                let used = allowed - part_quota;
+                let allowed = parts.min(records_left / 7);
+                let mut part_quota = MarkdownLineComposeBudget {
+                    metadata_units: allowed,
+                    records: records_left,
+                    ..LINE_METRIC_BUDGET
+                };
+                let mut work = grid::Work::default();
+                let ready = metrics.advance(&output, owner, &mut part_quota, &mut work);
+                self.record_grid_work(work)?;
+                let ready = ready?;
+                let used = allowed - part_quota.metadata_units;
                 parts -= used;
-                records_left -= used * 4;
+                records_left = part_quota.records;
                 self.target_index_records = self
                     .target_index_records
-                    .checked_add(used * 4)
+                    .checked_add(used * 7)
                     .ok_or(Error::CounterExhausted)?;
                 self.target_metric_parts = self
                     .target_metric_parts
@@ -576,13 +608,39 @@ impl Producer {
             }
         }
         let anchor = target.anchor.as_ref().ok_or(Error::Closed)?;
+        if owner
+            .mode_viewport_required_bottom(
+                &target.request,
+                anchor.top,
+                ticket.request.viewport.size.height,
+            )
+            .is_some_and(|bottom| self.needs_document_prefix(bottom))
+        {
+            return Ok(TargetAdvance::NeedPrefix); // 同一模式目标只补实际下方可见区，不用临时短前缀的页底约束认证原Y。
+        }
         self.last_target_anchor = Some(anchor.clone());
         ticket.require(owner, &self.source)?;
         let viewport = owner.viewport.borrow().clone().ok_or(Error::Closed)?;
+        if viewport.geometry()?.content_width != self.maximum_content_width {
+            owner.native_preparation_geometry(&ticket.request, &viewport, || {
+                viewport.set_content_width(self.maximum_content_width)
+            })?;
+            owner.schedule()?;
+            return Ok(TargetAdvance::Handled); // 先归还旧横向范围，原目标在后继真实geometry继续。
+        }
         if viewport.geometry()?.content_height != self.height() {
-            viewport.set_content_height(self.height())?;
+            owner.native_preparation_geometry(&ticket.request, &viewport, || {
+                viewport.set_content_height(self.height())
+            })?;
             owner.schedule()?;
             return Ok(TargetAdvance::Handled); // 自有高度改变后不捕后继request给旧准备票补签。
+        }
+        // 原模式已经从真实 Scene 测得格内字形时，由模式恢复它的屏内位置。
+        // 整条表格行可能比首字形更高；再次最小滚入整行会与底边文字锚反复争夺滚动。
+        // 这里只继续当前视口发布，模式仍须在新 Scene 上取得实际字形与可见证明才完成。
+        if owner.mode_retains_measured_glyph(&target.request) {
+            ticket.require(owner, &self.source)?;
+            return Ok(TargetAdvance::VisibleBand);
         }
         // 只有真实文首位置和原ordinal0同时成立才涵盖已有顶部留白；PageUp提交head0后
         // 与DocStart共用此处，不得把首行top=padding的最小滚入误当文档已经返回y0。
@@ -592,11 +650,15 @@ impl Producer {
             anchor.top // 其他目标仍只滚入其真实行，不扩读前文或按估计行高调整页面。
         };
         let rect = NSRect::new(
-            NSPoint::new(self.padding, top),
+            NSPoint::new(
+                ticket.request.virtual_viewport.layout_origin_x + self.padding,
+                top,
+            ),
             NSSize::new(1.0, anchor.bottom - top),
         );
-        let revealed =
-            viewport.reveal_document_rect(rect, &|| target.request.current_native(owner));
+        let revealed = owner.native_preparation_geometry(&ticket.request, &viewport, || {
+            viewport.reveal_document_rect(rect, &|| target.request.current_native(owner))
+        });
         self.source
             .byte_offset_for_utf16(0)
             .map_err(ViewError::Document)?;

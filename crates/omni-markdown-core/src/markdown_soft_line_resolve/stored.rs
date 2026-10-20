@@ -293,6 +293,9 @@ impl MarkdownStoredPrefixResolveJob {
         self.guard(permit, provider)?;
         Ok(MarkdownEmergencyGlyphSliceStep {
             input_bytes: step.input_bytes,
+            // Store 只转交原 Job 的实读工作；目录交接不重新领一份输入额度。
+            input_scalars: step.input_scalars,
+            context_bytes: step.context_bytes,
             glyphs: step.glyphs,
             candidates: step.candidates,
             shapes: step.shapes,
@@ -369,6 +372,8 @@ impl MarkdownStoredPrefixResolveJob {
 fn empty(answer: MarkdownEmergencyGlyphSliceAnswer) -> MarkdownEmergencyGlyphSliceStep {
     MarkdownEmergencyGlyphSliceStep {
         input_bytes: 0,
+        input_scalars: 0,
+        context_bytes: 0,
         glyphs: 0,
         candidates: 0,
         shapes: 0,

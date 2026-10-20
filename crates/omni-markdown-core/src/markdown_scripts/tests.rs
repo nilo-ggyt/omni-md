@@ -2,6 +2,10 @@
 use super::*;
 use crate::MarkdownDocumentBuffer;
 
+#[cfg(feature = "paged-line-compose")]
+#[path = "fold_tests.rs"]
+mod fold_tests;
+
 /// 先真实借入一页，再在公开测试驱逐点制造I/O失败；归还pin本身不代表msync发生。
 fn poison_original_read_windows(document: &MarkdownDocumentBuffer) {
     document

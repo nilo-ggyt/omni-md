@@ -64,6 +64,7 @@ fn style_needs_no_output_gcb_and_ready_item_copies_only_its_actual_prefix_with_r
                     0..12,
                     &font,
                     MarkdownLineComposeStyle {
+                        presentation: Default::default(),
                         points: 16.0,
                         language: None,
                         features: Vec::new(),

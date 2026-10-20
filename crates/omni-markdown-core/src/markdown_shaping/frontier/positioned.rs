@@ -69,10 +69,8 @@ impl MarkdownShapingFrontierJob {
                 .local_certificate
                 .as_ref()
                 .ok_or(MarkdownShapingFrontierError::Poisoned)?;
-            self.positioned_scan = Some(
-                certificate
-                    .positioned_advance_job(payload.options.scale, Some(payload.options.points)),
-            );
+            self.positioned_scan =
+                Some(certificate.positioned_advance_job(Some(payload.options.points)));
         }
         let scan = self
             .positioned_scan
@@ -80,7 +78,12 @@ impl MarkdownShapingFrontierJob {
             .ok_or(MarkdownShapingFrontierError::Poisoned)?;
         let records = scan.checked_records();
         let glyphs = scan.queried_glyphs();
-        let result = scan.step(&plan.plan(), payload.font.font(), remaining);
+        // 下界证明借实际执行所用的同Font、同尺度、同不可变水平推进表；vendor不再重建默认hmtx。
+        let shaper = payload
+            .font
+            .shaper_at_scale(payload.options.scale)
+            .map_err(|_| MarkdownShapingError::InvalidOptions)?;
+        let result = scan.step(&plan.plan(), &shaper, remaining);
         let queried = scan.queried_glyphs() - glyphs;
         step.metadata_glyphs += queried;
         step.plan_records += scan.checked_records() - records - queried;

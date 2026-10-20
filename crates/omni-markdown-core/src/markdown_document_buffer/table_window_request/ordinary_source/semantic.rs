@@ -1,8 +1,10 @@
 //! 原来源 owner 内的 Root Plain/Setext 有限语义；复杂 inline/非 Root/空洞明确保持 Pending。
 
 use super::*;
+use crate::MarkdownSourceLink;
 use crate::markdown_document_buffer::table_source::MarkdownTableUnderlineRequest;
 use crate::markdown_viewport_presentation::parser::markdown_selection_intersects;
+use crate::markdown_viewport_presentation::table_window::MarkdownTableWindowQuota;
 use crate::markdown_viewport_presentation::{
     MarkdownPresentationQuery, MarkdownPresentationRun, MarkdownPresentationStyles,
 };
@@ -10,6 +12,11 @@ use pulldown_cmark::global_frontier::{
     InlinePlainCursor, InlinePlainLimits, InlinePlainStep, VerifiedInlinePlainProof,
     VerifiedInlineSemanticSeed,
 };
+mod bounded_inline;
+use bounded_inline::BoundedInline;
+mod code;
+use code::CodeJob;
+pub(super) use code::{PrefixDecoration, SpanProof};
 
 const PLAIN_CONTROL: usize = 128;
 const MAX_PLAIN_RUNS: usize = 16;
@@ -25,6 +32,13 @@ pub enum MarkdownOrdinaryPendingReason {
 /// 这里只保原 paired seed；各物理行与当前语义任务通过同一个 Rc 关联，不按行复制 scope。
 pub(super) struct OrdinaryBlockRecord {
     pub(super) seed: VerifiedInlineSemanticSeed,
+}
+
+impl OrdinaryBlockRecord {
+    /// 容器段落须持原 Origin 才可进入 inline；Root 与 Setext 保留各自完整块合同。
+    pub(super) fn is_scoped_paragraph(&self) -> bool {
+        self.seed.scope_depth() > 1 && self.seed.kind() == InlineBlockKind::Paragraph
+    }
 }
 
 /// 来源发布与有限语义结果共享原 publication；SourcesOnly/Pending 均不是默认样式的完成证明。
@@ -50,7 +64,17 @@ impl MarkdownOrdinarySemanticState {
     /// 外带结果只登记实际保留的 Box 与页；Pending 没有借预留量虚构出语义载荷。
     pub(super) fn retained_metadata(&self) -> usize {
         match self {
-            Self::PlainReady(_) => plain_publication_metadata(),
+            Self::PlainReady(ready) => {
+                plain_publication_metadata()
+                    + ready.rich_runs.capacity()
+                        * std::mem::size_of::<Option<MarkdownPresentationRun>>()
+                    + ready.links.capacity() * std::mem::size_of::<MarkdownSourceLink>()
+                    + ready
+                        .links
+                        .iter()
+                        .map(|link| link.destination.capacity())
+                        .sum::<usize>()
+            }
             Self::RootLeafReady(ready) => ready.retained_metadata(),
             Self::SourcesOnly | Self::Pending(_) | Self::LeafPending(_) => 0,
         }
@@ -67,6 +91,8 @@ pub struct VerifiedMarkdownPlainViewport {
     runs: [Option<MarkdownPresentationRun>; MAX_PLAIN_RUNS],
     len: usize,
     block: Rc<OrdinaryBlockRecord>,
+    rich_runs: Vec<Option<MarkdownPresentationRun>>,
+    links: Vec<MarkdownSourceLink>,
 }
 
 /// Box 载荷在原来源发布预留时统一准入；枚举自身的句柄已包含在父发布结构大小中。
@@ -127,8 +153,9 @@ impl VerifiedMarkdownPlainViewport {
             return Ok(None);
         }
         // 固定最多16段，不遍历全文、所有块或 source 页；真实 default run 也显式返回。
-        Ok(self.runs[..self.len]
+        Ok(self.runs[..self.len.min(MAX_PLAIN_RUNS)]
             .iter()
+            .chain(self.rich_runs.iter())
             .flatten()
             .find(|run| run.utf16_range.contains(&index))
             .map(|run| MarkdownPresentationQuery {
@@ -143,7 +170,29 @@ impl VerifiedMarkdownPlainViewport {
         authority: MarkdownViewportSourceAuthority,
     ) -> Result<impl Iterator<Item = &MarkdownPresentationRun>, MarkdownTableRequestError> {
         self.check(document, authority)?;
-        Ok(self.runs[..self.len].iter().flatten())
+        Ok(self.runs[..self.len.min(MAX_PLAIN_RUNS)]
+            .iter()
+            .chain(self.rich_runs.iter())
+            .flatten())
+    }
+
+    /// 链接命中保留原 Source/完整选择/publication 核验；样式位本身不授予 URL 权限。
+    pub fn link_at_for(
+        &self,
+        document: &MarkdownDocumentBuffer,
+        authority: MarkdownViewportSourceAuthority,
+        index: usize,
+    ) -> Result<Option<&MarkdownSourceLink>, MarkdownTableRequestError> {
+        self.check(document, authority)?;
+        if !self.requested.contains(&index) {
+            return Err(MarkdownTableRequestError::Window(
+                MarkdownTableWindowError::ContextPending,
+            ));
+        }
+        Ok(self
+            .links
+            .iter()
+            .find(|link| link.label_utf16_range.contains(&index)))
     }
 }
 
@@ -152,6 +201,10 @@ enum SemanticPhase {
     Bounds,
     AwaitSource,
     Proof,
+    AtxBounded,
+    ScopedBounded,
+    BoundedInline,
+    Code,
     Coordinates,
     Underline,
     Build,
@@ -161,12 +214,15 @@ enum SemanticPhase {
 /// 状态属于原请求；前缀 cursor 在同一块 forward 时保留，既不建新 Global，也不重发累计 fuel。
 pub(super) struct PlainSemanticJob {
     requested: Range<usize>,
+    cell: Option<VerifiedMarkdownTableCellSource>,
     selection: MarkdownTextSelection,
     positions: [PositionLocator; 4],
     position_index: usize,
     byte_coverage: Option<Range<usize>>,
     selection_bytes: Range<usize>,
     block: Option<Rc<OrdinaryBlockRecord>>,
+    // 原 Origin 只授予同块 scoped 入口；真实前缀与行内配对由唯一 Code owner 分段证明。
+    line: Option<BlockOriginLine>,
     cursor: Option<InlinePlainCursor>,
     proof: Option<VerifiedInlinePlainProof>,
     projection: Option<Coordinates>,
@@ -179,10 +235,57 @@ pub(super) struct PlainSemanticJob {
     pending: Option<MarkdownOrdinaryPendingReason>,
     saw_intersection: bool,
     phase: SemanticPhase,
+    bounded: Option<Box<BoundedInline>>,
+    code: Option<Box<CodeJob>>,
+    quota: MarkdownTableWindowQuota,
 }
 
 impl PlainSemanticJob {
-    pub(super) fn new(requested: Range<usize>, selection: MarkdownTextSelection) -> Self {
+    /// 一个真实 cell seed 只复制固定标量及原共享 scope；绝不复制格正文或把 raw 范围当成默认样式。
+    pub(super) fn for_cell(
+        cell: &VerifiedMarkdownTableCellSource,
+        selection: MarkdownTextSelection,
+        selection_bytes: Option<Range<usize>>,
+        underline: Option<MarkdownTableUnderlineRequest>,
+        quota: MarkdownTableWindowQuota,
+    ) -> Result<Self, MarkdownTableRequestError> {
+        quota
+            .admit_metadata(
+                // Self 内嵌于唯一 CellInlineJob，已经随原固定槽准入；这里只保原 block 的独立 Rc。
+                std::mem::size_of::<OrdinaryBlockRecord>() + 2 * std::mem::size_of::<usize>(),
+            )
+            .map_err(MarkdownTableRequestError::Window)?;
+        let mut job = Self::new(cell.range.clone(), selection, quota);
+        job.block = Some(Rc::new(OrdinaryBlockRecord {
+            seed: cell
+                .inline_seed
+                .as_deref()
+                .expect("非空真实格持原 Scanner 签发的 seed")
+                .clone(),
+        }));
+        job.cell = Some(cell.clone());
+        job.underline = underline;
+        job.saw_intersection = true;
+        if let Some(selection_bytes) = selection_bytes {
+            // 原 Scanner 已同时签发本格 UTF16 范围和真实 trimmed byte seed；父请求又持有
+            // 同完整选择的已定位端点，因此直接接续语义阶段，不为每一格重读四条全源前缀。
+            job.byte_coverage = Some(
+                job.block
+                    .as_ref()
+                    .expect("非空真实格已持原 seed")
+                    .seed
+                    .physical_range(),
+            );
+            job.selection_bytes = selection_bytes;
+            job.phase = SemanticPhase::AwaitSource;
+        }
+        Ok(job)
+    }
+    pub(super) fn new(
+        requested: Range<usize>,
+        selection: MarkdownTextSelection,
+        quota: MarkdownTableWindowQuota,
+    ) -> Self {
         let ordered = ordered_selection(selection);
         Self {
             positions: [
@@ -193,11 +296,13 @@ impl PlainSemanticJob {
             ],
             run_next: requested.start,
             requested,
+            cell: None,
             selection,
             position_index: 0,
             byte_coverage: None,
             selection_bytes: 0..0,
             block: None,
+            line: None,
             cursor: None,
             proof: None,
             projection: None,
@@ -209,6 +314,9 @@ impl PlainSemanticJob {
             pending: None,
             saw_intersection: false,
             phase: SemanticPhase::Bounds,
+            bounded: None,
+            code: None,
+            quota,
         }
     }
 
@@ -221,6 +329,7 @@ impl PlainSemanticJob {
         selection_bytes: Range<usize>,
         block: &Rc<OrdinaryBlockRecord>,
         underline: MarkdownTableUnderlineRequest,
+        quota: MarkdownTableWindowQuota,
     ) -> Result<Self, MarkdownTableRequestError> {
         let physical = block.seed.physical_range();
         if requested.is_empty()
@@ -231,7 +340,7 @@ impl PlainSemanticJob {
             // 原闭合 Fact 必须完整包含实际交集，不能借邻行或请求包络补签 Plain。
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
-        let mut job = Self::new(requested, selection);
+        let mut job = Self::new(requested, selection, quota);
         job.byte_coverage = Some(byte_coverage);
         job.selection_bytes = selection_bytes;
         job.block = Some(Rc::clone(block));
@@ -239,6 +348,87 @@ impl PlainSemanticJob {
         job.underline = Some(underline);
         job.phase = SemanticPhase::AwaitSource;
         Ok(job)
+    }
+
+    /// 原 SourceRequest 已经用同一 Global/PrefixCursor 证明 physical、prefix、content 和 EOL。
+    /// 这里只移交固定 Origin 身份；同一块只创建一个 Code owner，不按物理行重扫跨行强调。
+    pub(super) fn for_closed_origin(
+        requested: Range<usize>,
+        selection: MarkdownTextSelection,
+        byte_coverage: Range<usize>,
+        selection_bytes: Range<usize>,
+        line: &VerifiedMarkdownOrdinaryLine,
+        underline: MarkdownTableUnderlineRequest,
+        quota: MarkdownTableWindowQuota,
+    ) -> Result<Self, MarkdownTableRequestError> {
+        let mut job = Self::for_closed_block(
+            requested,
+            selection,
+            byte_coverage,
+            selection_bytes,
+            line.semantic_block
+                .as_ref()
+                .expect("语义行必须持原配对 seed"),
+            underline,
+            quota,
+        )?;
+        job.line = Some(line.origin.clone());
+        Ok(job)
+    }
+
+    /// 真闭合 ATX 只借原 Leaf 工厂取得有限解析权限；容器的原 capture/prefix 由父续体先完成。
+    pub(super) fn supports_closed_atx(leaf: &VerifiedGlobalLeafBlock) -> bool {
+        BoundedInline::supports_atx(leaf)
+    }
+
+    /// ATX 复用父请求唯一语义槽；本步只填固定字段，正文/Parser 库存在下一独立量子取得。
+    pub(super) fn for_closed_atx(
+        requested: Range<usize>,
+        selection: MarkdownTextSelection,
+        byte_coverage: Range<usize>,
+        selection_bytes: Range<usize>,
+        leaf: &VerifiedGlobalLeafBlock,
+        underline: Option<MarkdownTableUnderlineRequest>,
+        quota: MarkdownTableWindowQuota,
+    ) -> Result<Self, MarkdownTableRequestError> {
+        if !Self::supports_closed_atx(leaf)
+            || requested.is_empty()
+            || byte_coverage.is_empty()
+            || leaf.physical_start() > byte_coverage.start
+            || byte_coverage.end > leaf.source_range().end
+        {
+            return Err(MarkdownTableRequestError::InvalidRequest);
+        }
+        let mut job = Self::new(requested, selection, quota);
+        job.byte_coverage = Some(byte_coverage);
+        job.selection_bytes = selection_bytes;
+        job.underline = underline;
+        job.phase = SemanticPhase::AtxBounded;
+        Ok(job)
+    }
+
+    /// 原 Leaf owner 每步仍提供同一真实票；初次只分配小块，后继沿既有 Parser/配对/Build 链推进。
+    pub(super) fn advance_atx_after_sources(
+        &mut self,
+        document: &MarkdownDocumentBuffer,
+        leaf: &VerifiedGlobalLeafBlock,
+        budget: usize,
+        limits: (usize, usize),
+        global: Option<&mut GlobalFrontier>,
+    ) -> Result<(SemanticWork, usize), MarkdownTableRequestError> {
+        if matches!(self.phase, SemanticPhase::AtxBounded) {
+            self.bounded = Some(BoundedInline::for_atx(leaf, &self.quota)?);
+            self.phase = SemanticPhase::BoundedInline;
+            return Ok((
+                SemanticWork {
+                    metadata_bytes: BoundedInline::atx_metadata(),
+                    structural_transitions: PLAIN_CONTROL,
+                    ..Default::default()
+                },
+                0,
+            ));
+        }
+        self.advance_after_sources(document, budget, limits, global)
     }
 
     /// 父 SourceRequest 已预留整个固定槽；新块只填写活跃字段，不另分配内嵌的空 cursor 工作区。
@@ -269,7 +459,26 @@ impl PlainSemanticJob {
         {
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
-        Ok(self.runs.get_mut(index).and_then(Option::take))
+        Ok(if let Some(code) = self.code.as_mut() {
+            code.output.get_mut(index).and_then(Option::take)
+        } else if let Some(bounded) = self.bounded.as_mut() {
+            bounded.output.get_mut(index).and_then(Option::take)
+        } else {
+            self.runs.get_mut(index).and_then(Option::take)
+        })
+    }
+
+    /// Native 链接目标按同一发布路径移交；只移动已验证 String 的唯一归属，不复制目标字节。
+    pub(super) fn take_proven_link(
+        &mut self,
+    ) -> Result<Option<MarkdownSourceLink>, MarkdownTableRequestError> {
+        if !self.done() || self.pending.is_some() {
+            return Err(MarkdownTableRequestError::InvalidRequest);
+        }
+        Ok(self
+            .bounded
+            .as_mut()
+            .and_then(|bounded| bounded.links.pop()))
     }
 
     /// 原全源配对请求在一个活动块完成后归还 RootLeaf，下一块复用同一已闭合上下文。
@@ -277,11 +486,116 @@ impl PlainSemanticJob {
         self.underline.take()
     }
 
+    /// Leaf 已逐项移走输出后，只保原普通块的已证前缀；复杂 inline、容器和未完任务不能驻留。
+    /// 这仍是父请求已经准入的唯一 semantic 槽，不持 publication、正文帧或历史 run 集合。
+    pub(super) fn retains_plain_prefix(&self) -> bool {
+        self.done()
+            && self.pending.is_none()
+            && self.cell.is_none()
+            && self.line.is_none()
+            && self.cursor.is_some()
+            && self.proof.is_some()
+            && self.projection.is_some()
+            && self.projected.is_some()
+            && self.bounded.is_none()
+            && self.code.is_none()
+            && self.underline.is_none()
+            && self.runs.iter().all(Option::is_none)
+    }
+
+    /// 当前来源记录必须仍持同一真实 seed；相同文本或数值范围不授予另一个块继续扫描的权限。
+    pub(super) fn retains_plain_block(&self, block: &Rc<OrdinaryBlockRecord>) -> bool {
+        self.retains_plain_prefix()
+            && self
+                .block
+                .as_ref()
+                .is_some_and(|current| Rc::ptr_eq(current, block))
+    }
+
+    /// 父 Leaf 已计量新窗口与完整选择端点，且接回唯一 underline 后，才续同一普通块。
+    /// 只接受不重叠前进；反向、异块或复杂路径保持原冷准备，不把旧 proof 当成新窗口覆盖。
+    pub(super) fn continue_closed_block(
+        &mut self,
+        requested: Range<usize>,
+        byte_coverage: Range<usize>,
+        selection_bytes: Range<usize>,
+        block: &Rc<OrdinaryBlockRecord>,
+        underline: &mut Option<MarkdownTableUnderlineRequest>,
+        quota: MarkdownTableWindowQuota,
+    ) -> bool {
+        if !self.retains_plain_block(block)
+            || self.selection_bytes != selection_bytes
+            || requested.start < self.requested.end
+            || requested.is_empty()
+            || byte_coverage.is_empty()
+            || self
+                .byte_coverage
+                .as_ref()
+                .is_none_or(|previous| byte_coverage.start < previous.end)
+            || block.seed.physical_range().start > byte_coverage.start
+            || byte_coverage.end > block.seed.physical_range().end
+        {
+            return false;
+        }
+        // 原 SourceRequest 的完整 selection 不可变且已在本量子前后核验；这里不复制另一份权限。
+        // 旧 run 已全部移交；原固定槽重置只影响这一批输出，原 cursor 的已证前缀继续保留。
+        // 新 batch 的同一 quota 必须替换旧句柄；不给后继重新发放累计扫描 fuel 或新增库存。
+        self.run_next = requested.start;
+        self.requested = requested;
+        self.byte_coverage = Some(byte_coverage);
+        self.proof = None;
+        // 唯一完成的坐标游标同样留在原槽；下一真实 proof 给出边界后调用 continue_at。
+        // projected 仍表示旧组已完成，只用于区分续接初始化，不拿旧数值作为新窗口结果。
+        self.underline = underline.take();
+        self.runs = std::array::from_fn(|_| None);
+        self.len = 0;
+        self.underline_index = 0;
+        self.saw_intersection = true;
+        self.quota = quota;
+        self.phase = SemanticPhase::AwaitSource;
+        true
+    }
+
+    /// 仅 scoped Code 的真实 prefix 需要原来源页；Root/cell 与已验证 owner 不进入此分支。
+    pub(super) fn prefix_origin_record_index(&self) -> Option<usize> {
+        self.code.as_ref()?.prefix_origin_record_index()
+    }
+
+    /// 父请求每量子只借一条现有记录；同 Rc block 和 exact prefix 都成立才交物理行事实。
+    pub(super) fn advance_prefix_origin(
+        &mut self,
+        record: &Rc<SourceRecord>,
+    ) -> Result<SemanticWork, MarkdownTableRequestError> {
+        let code = self
+            .code
+            .as_mut()
+            .ok_or(MarkdownTableRequestError::InvalidRequest)?;
+        let line = match record.as_ref() {
+            SourceRecord::Line(line)
+                if line.semantic_block.as_ref().is_some_and(|block| {
+                    self.block
+                        .as_ref()
+                        .is_some_and(|current| Rc::ptr_eq(block, current))
+                }) =>
+            {
+                Some(&line.origin)
+            }
+            _ => None,
+        };
+        code.advance_prefix_origin(line, &self.selection_bytes)
+    }
+
     pub(super) fn preparing(&self) -> bool {
         matches!(self.phase, SemanticPhase::Bounds)
     }
     pub(super) fn done(&self) -> bool {
         matches!(self.phase, SemanticPhase::Done)
+    }
+
+    /// byte 覆盖只在真实定位结束或父 owner 移交已证端点后存在；零选区仍是有效事实。
+    pub(super) fn verified_selection_bytes(&self) -> Option<Range<usize>> {
+        self.byte_coverage.as_ref()?;
+        Some(self.selection_bytes.clone())
     }
     pub(super) fn publication_control(
         &self,
@@ -335,6 +649,8 @@ impl PlainSemanticJob {
         self.projection = None;
         self.projected = None;
         self.underline = None;
+        self.bounded = None;
+        self.code = None;
         self.runs = std::array::from_fn(|_| None);
         self.len = 0;
         self.run_next = self.requested.start;
@@ -370,6 +686,8 @@ impl PlainSemanticJob {
         {
             // 只有另一个真实 Fact 能更换块；先丢旧进度，绝不把旧范围当新块的种子。
             self.cursor = None;
+            self.bounded = None;
+            self.code = None;
             self.pending = None;
             self.block = Some(Rc::clone(block));
         }
@@ -412,6 +730,7 @@ impl PlainSemanticJob {
         document: &MarkdownDocumentBuffer,
         budget: usize,
         limits: (usize, usize),
+        global: Option<&mut GlobalFrontier>,
     ) -> Result<(SemanticWork, usize), MarkdownTableRequestError> {
         let mut work = SemanticWork {
             structural_transitions: PLAIN_CONTROL,
@@ -433,26 +752,39 @@ impl PlainSemanticJob {
                     self.phase = SemanticPhase::Done;
                 } else {
                     // 来源与覆盖已经收齐，但仍须真实 Root/LUT 证明及全局上下文，不能直接 Ready。
-                    self.phase = SemanticPhase::Proof;
+                    self.phase = if self.block.as_ref().is_some_and(|block| {
+                        matches!(block.seed.kind(), InlineBlockKind::SetextHeading(_))
+                            && BoundedInline::supports_scoped(block)
+                    }) {
+                        SemanticPhase::ScopedBounded
+                    } else if self.line.is_some() {
+                        SemanticPhase::Code
+                    } else {
+                        SemanticPhase::Proof
+                    };
                 }
+            }
+            SemanticPhase::ScopedBounded => {
+                self.bounded = Some(BoundedInline::for_scoped(
+                    self.block.as_ref().unwrap(),
+                    limits,
+                    &self.quota,
+                )?);
+                self.phase = SemanticPhase::BoundedInline;
+                work.metadata_bytes = BoundedInline::scoped_metadata();
             }
             SemanticPhase::Proof => {
                 let end = self.byte_coverage.as_ref().unwrap().end;
                 match self.cursor.as_mut() {
                     None => {
                         // 构造只保存原 capture；LUT、scope初始化留给下个有预算的 vendor 步骤。
+                        let seed = &self.block.as_ref().unwrap().seed;
+                        let limits = InlinePlainLimits {
+                            max_byte_work: limits.0,
+                            max_transitions: limits.1,
+                        };
                         self.cursor = Some(
-                            self.block
-                                .as_ref()
-                                .unwrap()
-                                .seed
-                                .plain_cursor(
-                                    end,
-                                    InlinePlainLimits {
-                                        max_byte_work: limits.0,
-                                        max_transitions: limits.1,
-                                    },
-                                )
+                            seed.plain_cursor(end, limits)
                                 .map_err(MarkdownTableRequestError::Global)?,
                         );
                     }
@@ -494,16 +826,32 @@ impl PlainSemanticJob {
                             InlinePlainStep::Progress { work }
                             | InlinePlainStep::NeedInput { work, .. } => work, // frame结束只续读，不冒充完整块/EOF。
                             InlinePlainStep::NeedsGeneralInline { work } => {
-                                // 已遇 enabled special，不能猜其未来配对、引用或HTML效果，也不发布默认样式。
-                                self.pending =
-                                    Some(MarkdownOrdinaryPendingReason::NeedsGeneralInline);
-                                self.phase = SemanticPhase::Done;
+                                if self
+                                    .cursor
+                                    .as_ref()
+                                    .unwrap()
+                                    .bounded_inline_range()
+                                    .is_some()
+                                {
+                                    self.phase = SemanticPhase::BoundedInline;
+                                } else {
+                                    self.phase = SemanticPhase::Code;
+                                }
                                 work
                             }
                             InlinePlainStep::NonRootScope { work } => {
-                                // 原scope含祖先时留给后续真实容器投影，不能从前缀文本猜Root身份。
-                                self.pending = Some(MarkdownOrdinaryPendingReason::NonRootScope);
-                                self.phase = SemanticPhase::Done;
+                                // 只有完整短块可以进入原 scoped context；长块仍需真实 Origin，不能假装 Root。
+                                if self
+                                    .block
+                                    .as_ref()
+                                    .is_some_and(|block| BoundedInline::supports_scoped(block))
+                                {
+                                    self.phase = SemanticPhase::ScopedBounded;
+                                } else {
+                                    self.pending =
+                                        Some(MarkdownOrdinaryPendingReason::NonRootScope);
+                                    self.phase = SemanticPhase::Done;
+                                }
                                 work
                             }
                             InlinePlainStep::Proven { proof, work } => {
@@ -519,8 +867,115 @@ impl PlainSemanticJob {
                     }
                 }
             }
+            SemanticPhase::BoundedInline => {
+                if let Some(bounded) = self.bounded.as_mut() {
+                    if bounded.references_attached()
+                        && self.underline.as_ref().is_some_and(|underline| {
+                            underline
+                                .ready_pairs_for(document)
+                                .is_ok_and(|pairs| pairs.is_none())
+                        })
+                    {
+                        let measured = self.underline.as_mut().unwrap().advance(
+                            document,
+                            global.ok_or(MarkdownTableRequestError::InvalidRequest)?,
+                            budget - PLAIN_CONTROL,
+                        )?;
+                        work = underline_work(measured);
+                        work.structural_transitions += PLAIN_CONTROL;
+                    } else {
+                        let (measured, complete) = bounded.advance(
+                            document,
+                            &mut self.underline,
+                            &self.quota,
+                            self.selection,
+                            &self.selection_bytes,
+                            budget - PLAIN_CONTROL,
+                        )?;
+                        work = measured;
+                        work.structural_transitions += PLAIN_CONTROL;
+                        if complete {
+                            if bounded.unsupported_scope() {
+                                self.pending = Some(MarkdownOrdinaryPendingReason::NonRootScope);
+                                self.phase = SemanticPhase::Done;
+                            } else {
+                                self.phase = SemanticPhase::Build;
+                            }
+                        }
+                    }
+                } else {
+                    self.bounded = BoundedInline::new(
+                        self.cursor.as_ref().unwrap(),
+                        self.block.as_ref().unwrap(),
+                        &self.quota,
+                    )?;
+                    work.metadata_bytes = std::mem::size_of::<BoundedInline>();
+                }
+            }
+            SemanticPhase::Code => {
+                if let Some(code) = self.code.as_mut() {
+                    let (measured, complete) = code.advance(
+                        document,
+                        &self.selection_bytes,
+                        &self.quota,
+                        budget - PLAIN_CONTROL,
+                    )?;
+                    work = measured;
+                    work.structural_transitions += PLAIN_CONTROL;
+                    if complete {
+                        if code.general {
+                            if self
+                                .block
+                                .as_ref()
+                                .is_some_and(|block| BoundedInline::supports_scoped(block))
+                            {
+                                // 原 streaming Plain/Code/Emphasis 成功时继续零复制；只把真实 general 负证明
+                                // 转交完整短块 Parser。旧试次先真正归还，不能保两套活动 inline/配对 owner。
+                                code.release_scratch();
+                                self.code = None;
+                                self.cursor = None;
+                                self.phase = SemanticPhase::ScopedBounded;
+                            } else {
+                                self.pending =
+                                    Some(MarkdownOrdinaryPendingReason::NeedsGeneralInline);
+                                self.phase = SemanticPhase::Done;
+                            }
+                        } else {
+                            self.phase = SemanticPhase::Underline;
+                        }
+                    }
+                } else {
+                    self.code = CodeJob::new(
+                        self.block.as_ref().unwrap(),
+                        self.line.as_ref(),
+                        self.byte_coverage.as_ref().unwrap().clone(),
+                        self.requested.clone(),
+                        limits,
+                        &self.quota,
+                    )?;
+                    if self.code.is_none() {
+                        self.pending = Some(MarkdownOrdinaryPendingReason::NeedsGeneralInline);
+                        self.phase = SemanticPhase::Done;
+                    }
+                    work.metadata_bytes = std::mem::size_of::<CodeJob>();
+                }
+            }
             SemanticPhase::Coordinates => {
-                if self.projection.is_none() {
+                if self.projected.is_none()
+                    && let Some(projection) = self.projection.as_mut()
+                {
+                    // 当前组尚未完成时直接推进原坐标游标；分支借用同时证明它真实存在。
+                    let (measured, values) =
+                        projection.advance(document, budget - PLAIN_CONTROL)?;
+                    work = measured;
+                    work.structural_transitions += PLAIN_CONTROL;
+                    if let Some(values) = values {
+                        // 所有可见边界已在原源上真实解码，才能把样式分段转为绝对UTF16坐标。
+                        self.projected = Some(values);
+                        // 原完成游标只持四个边界/计量，不持正文；Leaf 同块续批继续使用这一实例。
+                        self.phase = SemanticPhase::Underline;
+                    }
+                } else {
                     let coverage = self.byte_coverage.as_ref().unwrap();
                     let proof = self.proof.as_ref().unwrap();
                     let owner = proof
@@ -531,41 +986,36 @@ impl PlainSemanticJob {
                         range.start.clamp(coverage.start, coverage.end)
                     });
                     // 只转换实际可见边界；不为判断远处完整owner反复解码整个 giant paragraph。
-                    let (projection, measured) = Coordinates::new(
-                        document,
-                        [coverage.start, owner, marker, coverage.end],
-                        budget - PLAIN_CONTROL,
-                    )?;
-                    self.projection = Some(projection);
+                    let boundaries = [coverage.start, owner, marker, coverage.end];
+                    let measured = if let Some(projection) = self.projection.as_mut() {
+                        // 同块前进只从原真实末端接续；间隙仍由后继 advance 实际读取，
+                        // 不能每个六单元样式窗口又回到 source 小片起点解码前缀。
+                        projection.continue_at(boundaries)?
+                    } else {
+                        let (projection, measured) =
+                            Coordinates::new(document, boundaries, budget - PLAIN_CONTROL)?;
+                        self.projection = Some(projection);
+                        measured
+                    };
+                    self.projected = None;
                     work = measured;
                     work.structural_transitions += PLAIN_CONTROL;
-                } else {
-                    let (measured, values) = self
-                        .projection
-                        .as_mut()
-                        .unwrap()
-                        .advance(document, budget - PLAIN_CONTROL)?;
-                    work = measured;
-                    work.structural_transitions += PLAIN_CONTROL;
-                    if let Some(values) = values {
-                        // 所有可见边界已在原源上真实解码，才能把样式分段转为绝对UTF16坐标。
-                        self.projected = Some(values);
-                        self.projection = None;
-                        self.phase = SemanticPhase::Underline;
-                    }
                 }
             }
             SemanticPhase::Underline => {
                 match self.underline.as_mut() {
                     None => {
                         // 父owner在进入本阶段前已联合准入唯一underline工作区；只接实际有限byte覆盖。
-                        self.underline = Some(
+                        self.underline = Some(if let Some(cell) = &self.cell {
+                            document.table_cell_underline_request(cell, self.quota.clone())?
+                        } else {
                             document
-                                .table_underline_request(std::slice::from_ref(
-                                    self.byte_coverage.as_ref().unwrap(),
-                                ))
-                                .map_err(MarkdownTableRequestError::Window)?,
-                        );
+                                .table_underline_request(
+                                    std::slice::from_ref(self.byte_coverage.as_ref().unwrap()),
+                                    self.quota.clone(),
+                                )
+                                .map_err(MarkdownTableRequestError::Window)?
+                        });
                     }
                     Some(underline)
                         if underline
@@ -578,15 +1028,21 @@ impl PlainSemanticJob {
                     }
                     Some(underline) => {
                         // 每源 byte 同时可能做UTF8前缀验证；保守缩分后所有实际读取/树路径都进入原总账。
-                        let measured = underline
-                            .advance(document, (budget - PLAIN_CONTROL) / 16)
-                            .map_err(MarkdownTableRequestError::Window)?;
-                        work.source_bytes = measured.source_bytes;
+                        let measured = underline.advance(
+                            document,
+                            global.ok_or(MarkdownTableRequestError::InvalidRequest)?,
+                            budget - PLAIN_CONTROL,
+                        )?;
+                        work.source_bytes = measured.source_bytes + measured.global_source_bytes;
                         work.utf8_validation_bytes = measured.utf8_validation_bytes;
-                        work.source_tree_steps = measured.source_tree_steps;
-                        work.structural_transitions += measured.source_bytes
-                            + measured.utf8_validation_bytes
-                            + measured.source_tree_steps;
+                        work.source_tree_steps =
+                            measured.source_tree_steps + measured.global_source_tree_steps;
+                        work.structural_transitions += measured.structural_transitions;
+                        work.copied_source_bytes = measured.copied_source_bytes;
+                        work.metadata_bytes = measured.metadata_bytes;
+                        work.normalizer_input_bytes = measured.normalizer_input_bytes;
+                        work.parser_input_bytes = measured.parser_input_bytes;
+                        work.allocated_source_capacity = measured.allocated_source_capacity;
                     }
                 }
             }
@@ -594,6 +1050,12 @@ impl PlainSemanticJob {
                 if self.run_next == self.requested.end {
                     // 每个可查询位置都有真实样式段后才结束；覆盖外仍是None而非默认样式。
                     self.phase = SemanticPhase::Done;
+                    if let Some(bounded) = self.bounded.as_mut() {
+                        bounded.release_scratch();
+                    }
+                    if let Some(code) = self.code.as_mut() {
+                        code.release_scratch();
+                    }
                 } else {
                     let pairs = self
                         .underline
@@ -609,38 +1071,55 @@ impl PlainSemanticJob {
                         // 已闭合且完全位于当前位置前的配对不再影响剩余有限覆盖。
                         self.underline_index += 1;
                     } else {
-                        let values = self.projected.unwrap();
-                        let proof = self.proof.as_ref().unwrap();
                         let mut end = self.requested.end;
                         let mut styles = MarkdownPresentationStyles::default();
-                        let heading = match proof.kind() {
-                            InlineBlockKind::Paragraph => MarkdownPresentationStyles::default(), // 真Root paragraph没有隐式容器样式。
-                            InlineBlockKind::SetextHeading(pulldown_cmark::HeadingLevel::H1) => {
-                                MarkdownPresentationStyles::HEADING_1
-                            }
-                            InlineBlockKind::SetextHeading(_) => {
-                                MarkdownPresentationStyles::HEADING_2
-                            }
-                        };
-                        if self.run_next >= values[1] {
-                            // heading只从原Parser owner开始，原物理缩进前缀仍保持默认样式。
-                            styles = styles.union(heading);
+                        if let Some(code) = self.code.as_mut() {
+                            let (measured, query) =
+                                code.advance_query(self.run_next, budget - PLAIN_CONTROL);
+                            work.structural_transitions += measured.structural_transitions;
+                            let Some(query) = query else {
+                                return Ok((work, 0)); // 样式交集仍未完整扫完时不提交半个run，后继继续同一查询。
+                            };
+                            end = end.min(query.utf16_range.end);
+                            styles = query.styles;
+                        } else if let Some(bounded) = self.bounded.as_ref() {
+                            let query = bounded.query(self.run_next, self.requested.end);
+                            end = end.min(query.utf16_range.end);
+                            styles = query.styles;
                         } else {
-                            end = end.min(values[1]);
-                        }
-                        if proof.marker_range().is_some() {
-                            // underline标记仅使用原Setext证明的实际区间，显隐按完整owner与完整选择判定。
-                            if self.run_next >= values[2] {
-                                styles = styles.union(MarkdownPresentationStyles::MARKER);
-                                if !markdown_selection_intersects(
-                                    &self.selection_bytes,
-                                    &proof.source_range(),
-                                ) {
-                                    styles =
-                                        styles.union(MarkdownPresentationStyles::HIDDEN_MARKER);
+                            let values = self.projected.unwrap();
+                            let proof = self.proof.as_ref().unwrap();
+                            let heading = match proof.kind() {
+                                InlineBlockKind::Paragraph | InlineBlockKind::TableCell => {
+                                    MarkdownPresentationStyles::default()
+                                } // 容器样式由其原 scope 投影提供，不从格内容猜测。
+                                InlineBlockKind::SetextHeading(
+                                    pulldown_cmark::HeadingLevel::H1,
+                                ) => MarkdownPresentationStyles::HEADING_1,
+                                InlineBlockKind::SetextHeading(_) => {
+                                    MarkdownPresentationStyles::HEADING_2
                                 }
+                            };
+                            if self.run_next >= values[1] {
+                                // heading只从原Parser owner开始，原物理缩进前缀仍保持默认样式。
+                                styles = styles.union(heading);
                             } else {
-                                end = end.min(values[2]);
+                                end = end.min(values[1]);
+                            }
+                            if proof.marker_range().is_some() {
+                                // underline标记仅使用原Setext证明的实际区间，显隐按完整owner与完整选择判定。
+                                if self.run_next >= values[2] {
+                                    styles = styles.union(MarkdownPresentationStyles::MARKER);
+                                    if !markdown_selection_intersects(
+                                        &self.selection_bytes,
+                                        &proof.source_range(),
+                                    ) {
+                                        styles =
+                                            styles.union(MarkdownPresentationStyles::HIDDEN_MARKER);
+                                    }
+                                } else {
+                                    end = end.min(values[2]);
+                                }
                             }
                         }
                         if let Some(pair) = pairs.get(self.underline_index) {
@@ -657,7 +1136,11 @@ impl PlainSemanticJob {
                                     end = end.min(boundary);
                                 }
                             }
-                            if pair.content.contains(&self.run_next) {
+                            if pair.content.contains(&self.run_next)
+                                && !styles.contains(MarkdownPresentationStyles::INLINE_CODE)
+                                && !styles.contains(MarkdownPresentationStyles::FENCED_CODE)
+                            {
+                                // 原完整投影的外部配对跨过代码，但线条不进入已证代码本体或其 delimiter。
                                 styles = styles.union(MarkdownPresentationStyles::UNDERLINE);
                             }
                             if pair.open.contains(&self.run_next)
@@ -677,7 +1160,40 @@ impl PlainSemanticJob {
                             // 坐标失配不能靠跳过字符恢复；拒绝半份覆盖避免query出现隐式空洞。
                             return Err(MarkdownTableRequestError::InvalidRequest);
                         }
-                        if self.len > 0
+                        if let Some(code) = self.code.as_mut() {
+                            if let Some(previous) = code.output.last_mut().and_then(Option::as_mut)
+                                && previous.styles == styles
+                            {
+                                previous.utf16_range.end = end;
+                            } else {
+                                code.push_output(
+                                    MarkdownPresentationRun {
+                                        utf16_range: self.run_next..end,
+                                        styles,
+                                    },
+                                    &self.quota,
+                                )?;
+                                self.len += 1;
+                                new_runs = 1;
+                            }
+                        } else if let Some(bounded) = self.bounded.as_mut() {
+                            if let Some(previous) =
+                                bounded.output.last_mut().and_then(Option::as_mut)
+                                && previous.styles == styles
+                            {
+                                previous.utf16_range.end = end;
+                            } else {
+                                bounded.push_output(
+                                    MarkdownPresentationRun {
+                                        utf16_range: self.run_next..end,
+                                        styles,
+                                    },
+                                    &self.quota,
+                                )?;
+                                self.len += 1;
+                                new_runs = 1;
+                            }
+                        } else if self.len > 0
                             && self.runs[self.len - 1].as_ref().unwrap().styles == styles
                         {
                             // 相邻等样式段原地合并；不建立boundary Vec、排序或随段落大小增长的输出队列。
@@ -702,6 +1218,7 @@ impl PlainSemanticJob {
                 }
             }
             SemanticPhase::Bounds => return Err(MarkdownTableRequestError::InvalidRequest), // 端点阶段必须由父owner优先推进。
+            SemanticPhase::AtxBounded => return Err(MarkdownTableRequestError::InvalidRequest), // ATX 必须借父 owner 当前真 Leaf 安装，不能从空 block 槽构造权限。
             SemanticPhase::Done => (), // 父owner只执行一次显式发布，不在此重复分配结果。
         }
         Ok((work, new_runs))
@@ -726,6 +1243,19 @@ impl PlainSemanticJob {
         self.underline = None;
         self.projection = None;
         self.projected = None;
+        let (rich_runs, links) = if let Some(code) = self.code.as_mut() {
+            (std::mem::take(&mut code.output), Vec::new())
+        } else {
+            self.bounded.as_mut().map_or_else(
+                || (Vec::new(), Vec::new()),
+                |bounded| {
+                    (
+                        std::mem::take(&mut bounded.output),
+                        std::mem::take(&mut bounded.links),
+                    )
+                },
+            )
+        };
         // 父发布已先计入 Box 载荷、句柄与显式发布步骤；这里只移交固定数组，不复制正文。
         Ok(MarkdownOrdinarySemanticState::PlainReady(Box::new(
             VerifiedMarkdownPlainViewport {
@@ -737,8 +1267,27 @@ impl PlainSemanticJob {
                 runs: std::mem::replace(&mut self.runs, std::array::from_fn(|_| None)),
                 len: self.len,
                 block: Rc::clone(self.block.as_ref().unwrap()),
+                rich_runs,
+                links,
             },
         )))
+    }
+}
+
+/// 复用唯一 Global 前探的完整费用；引用的有限复制/Parser 不可藏在 underline 的 byte 位移里。
+fn underline_work(
+    measured: crate::markdown_document_buffer::table_source::MarkdownTableUnderlineRequestStep,
+) -> SemanticWork {
+    SemanticWork {
+        source_bytes: measured.source_bytes + measured.global_source_bytes,
+        utf8_validation_bytes: measured.utf8_validation_bytes,
+        source_tree_steps: measured.source_tree_steps + measured.global_source_tree_steps,
+        structural_transitions: measured.structural_transitions,
+        copied_source_bytes: measured.copied_source_bytes,
+        metadata_bytes: measured.metadata_bytes,
+        normalizer_input_bytes: measured.normalizer_input_bytes,
+        parser_input_bytes: measured.parser_input_bytes,
+        allocated_source_capacity: measured.allocated_source_capacity,
     }
 }
 
@@ -784,6 +1333,115 @@ impl PositionLocator {
             result: None,
             leaf: None,
         }
+    }
+
+    /// 唯一行查询还在定位时不能换另一个点；只比较同一定位器已经拥有的目标，不授来源权限。
+    pub(super) fn targets(&self, position: usize) -> bool {
+        self.target == position
+    }
+
+    /// 原父请求已核同Source/完整选择；只续同一小片中真正完成的scalar前沿。
+    /// floor落在代理对内部时result不等于next，不能把已越过的后半scalar当成新起点。
+    pub(super) fn retarget_forward(&mut self, target: usize, ceil: bool) -> SemanticWork {
+        let reusable = self.located
+            && self.remaining == 0
+            && self.result == Some(self.next)
+            && target >= self.utf16
+            && self
+                .leaf
+                .as_ref()
+                .is_some_and(|leaf| target <= leaf.utf16.end && self.next <= leaf.bytes.end);
+        let metadata_bytes = if reusable {
+            // 真实叶身份、解码位置和完整scalar均留在原槽；只撤旧答案，不能沿用旧byte结果。
+            self.target = target;
+            self.ceil = ceil;
+            self.result = None;
+            std::mem::size_of::<usize>()
+                + std::mem::size_of::<bool>()
+                + std::mem::size_of::<Option<usize>>()
+        } else {
+            // 跨片、逆向、未完成或半代理对均走原冷定位；没有另一份定位器或前缀缓存。
+            *self = Self::new(target, ceil);
+            std::mem::size_of::<Self>()
+        };
+        SemanticWork {
+            structural_transitions: Self::PREFIX_REUSE_CONTROL,
+            metadata_bytes,
+            ..SemanticWork::default()
+        }
+    }
+
+    /// 行首查询只需要完整首标量，不冷填Doc的4096-unit NSString缓存或读取后方整窗。
+    /// 原定位步骤先独立归账；确定byte起点后最多借四字节，允许真实piece边界把标量分成小片。
+    pub(super) fn advance_row_source_viewport(
+        &mut self,
+        document: &MarkdownDocumentBuffer,
+        budget: usize,
+    ) -> (
+        SemanticWork,
+        Result<Option<Range<usize>>, MarkdownTableRequestError>,
+    ) {
+        if self.result.is_none() {
+            // 同一定位实现写入本次实际费用；发生Source/解码失败时也不能丢掉已经借过的前缀。
+            let mut work = SemanticWork::default();
+            let result = self
+                .advance_position(document, budget, &mut work)
+                .map(|()| None);
+            return (work, result);
+        }
+        let mut work = SemanticWork {
+            structural_transitions: PLAIN_CONTROL,
+            ..SemanticWork::default()
+        };
+        let result = (|| {
+            // 普通viewport端点允许floor/ceil；真实行首必须恰好是scalar边界，代理对中部不能冒充行首。
+            if self.utf16 != self.target || self.remaining != 0 {
+                return Err(MarkdownTableRequestError::InvalidRequest);
+            }
+            let start = self.result.expect("本分支已经完成原定位");
+            let tree = tree_height(document);
+            // 最坏四个真实piece借用与四字节解码全部预留；这不是一轮完整行或一个新Parser的费用。
+            let reservation = PLAIN_CONTROL + 4 * (tree + PLAIN_CONTROL + 4);
+            if reservation > budget {
+                return Err(MarkdownTableRequestError::WorkLimit);
+            }
+            let mut bytes = [0_u8; 4];
+            let mut read = 0;
+            let mut width = 1;
+            while read < width {
+                let frame = document
+                    .table_source_frame(start + read, width - read)
+                    .map_err(MarkdownTableRequestError::Source)?;
+                work.source_tree_steps += tree;
+                work.structural_transitions += tree + PLAIN_CONTROL;
+                let count = frame.bytes.len();
+                bytes[read..read + count].copy_from_slice(&frame.bytes);
+                read += count;
+                work.source_bytes += count;
+                work.utf8_validation_bytes += count;
+                work.structural_transitions += count * 2;
+                frame.finish().map_err(MarkdownTableRequestError::Source)?;
+                if count == 0 {
+                    return Err(MarkdownTableRequestError::InvalidRequest);
+                }
+                if read == 1 {
+                    width = match bytes[0] {
+                        0x00..=0x7f => 1,
+                        0xc2..=0xdf => 2,
+                        0xe0..=0xef => 3,
+                        0xf0..=0xf4 => 4,
+                        _ => return Err(MarkdownTableRequestError::InvalidRequest),
+                    };
+                }
+            }
+            let scalar = std::str::from_utf8(&bytes[..read])
+                .map_err(|_| MarkdownTableRequestError::InvalidRequest)?
+                .chars()
+                .next()
+                .ok_or(MarkdownTableRequestError::InvalidRequest)?;
+            Ok(Some(self.target..self.target + scalar.len_utf16()))
+        })();
+        (work, result) // Source归还或UTF8验证失败也交回真实借字节，不把失败误记为零工作。
     }
 
     /// 同源 Leaf job 复用原端点续体，不能另建整段 UTF16 或正文副本。
@@ -840,10 +1498,19 @@ impl PositionLocator {
         document: &MarkdownDocumentBuffer,
         budget: usize,
     ) -> Result<SemanticWork, MarkdownTableRequestError> {
-        let mut work = SemanticWork {
-            structural_transitions: PLAIN_CONTROL,
-            ..SemanticWork::default()
-        };
+        let mut work = SemanticWork::default();
+        self.advance_position(document, budget, &mut work)?;
+        Ok(work)
+    }
+
+    /// 普通Bounds与行首恢复共用实际定位步骤；后者在失败时仍向原请求交回已发生的读取。
+    fn advance_position(
+        &mut self,
+        document: &MarkdownDocumentBuffer,
+        budget: usize,
+        work: &mut SemanticWork,
+    ) -> Result<(), MarkdownTableRequestError> {
+        work.structural_transitions = PLAIN_CONTROL;
         if !self.located {
             let tree = tree_height(document);
             if tree + PLAIN_CONTROL > budget {
@@ -901,11 +1568,11 @@ impl PositionLocator {
             work.source_tree_steps = tree;
             work.structural_transitions += tree;
             work.metadata_bytes = std::mem::size_of::<Self>();
-            return Ok(work); // 已完成的AVL定位即刻归账，取消也不会遗漏同步工作。
+            return Ok(()); // 已完成的AVL定位即刻归账，取消也不会遗漏同步工作。
         }
         if self.remaining == 0 && self.utf16 == self.target {
             self.result = Some(self.next);
-            return Ok(work);
+            return Ok(());
         }
         let tree = tree_height(document);
         let wanted = budget
@@ -966,7 +1633,7 @@ impl PositionLocator {
         frame
             .finish()
             .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
-        Ok(work)
+        Ok(())
     }
 }
 

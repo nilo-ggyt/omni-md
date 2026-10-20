@@ -25,7 +25,8 @@ use template::*;
 #[path = "backend.rs"]
 pub(super) mod backend;
 
-/// 旧默认入口仍走原TextKit动作；具体后端选择由实际editor composition root负责。
+/// 独立 TextKit 夹具显式提供自己的实际图；正式 Find 直接使用分页后端。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn execute_find_action(
     bar: &Rc<NativeMarkdownFindBar>,
     view: &PieceBackedMarkdownTextView,
@@ -544,6 +545,7 @@ impl NavigationMatches {
 }
 
 /// 导航只保留首/末/当前候选；替换先封存匿名记录，再一次提交原子 canonical 事务。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn execute_textkit_find_action(
     bar: &Rc<NativeMarkdownFindBar>,
     view: &PieceBackedMarkdownTextView,

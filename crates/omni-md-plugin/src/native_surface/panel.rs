@@ -31,34 +31,6 @@ define_class!(
         #[unsafe(method(sendEvent:))]
         /// Routes a physical Escape only after the actual field/editor composition has first refusal.
         fn send_event(&self, event: &NSEvent) {
-            if native_markdown_panel_is_current(self)
-                && let Ok(view) = active_document_view()
-            {
-                let (handled, system_mouse_up) = view.route_table_pointer_event(event);
-                if handled {
-                    if system_mouse_up {
-                        // 选择已由原 Pointer 处理；NSWindow 仍须收到自己真实 Down 的同一 Up 结束内部跟踪。
-                        // SAFETY: 原事件仍在本 sendEvent 栈，仅该 preview Up 转发一次；不重播 Down/drag 或 raw-field Up。
-                        unsafe { let _: () = msg_send![super(self), sendEvent: event]; }
-                    }
-                    return; // 其它已消费事件不二次派发；Up 也不落回下方通用 super 路径。
-                }
-            }
-            if native_markdown_panel_is_current(self)
-                && matches!(event.r#type(),NSEventType::KeyDown|NSEventType::ScrollWheel|NSEventType::LeftMouseDown|NSEventType::RightMouseDown|NSEventType::OtherMouseDown|NSEventType::LeftMouseDragged|NSEventType::RightMouseDragged|NSEventType::OtherMouseDragged)
-                && let Ok(view)=active_document_view()
-            {
-                // 父panel在NSScroller开始内部tracking前即撤销旧权限；布局bounds变化不走此入口。
-                // anchor本来就须在动作返回前消费，这里只防御迟到状态，并取消旧单元格激活意图。
-                view.cancel_table_continuity_for_new_input();
-            }
-            if event.r#type() == NSEventType::LeftMouseDown
-                && native_markdown_panel_is_current(self)
-                && let Ok(view) = active_document_view()
-                && view.begin_table_raw_field_shift(event)
-            {
-                return; // 原真实 Shift-Down 已进入该格唯一 Pointer，后继 drag/up 沿同一个事件槽。
-            }
             if event.r#type() == NSEventType::KeyDown
                 && native_markdown_panel_is_current(self)
                 && let Some(action) = markdown_find_return_action(self, event)
@@ -73,24 +45,60 @@ define_class!(
                 && event.keyCode() == 53
                 && native_markdown_panel_is_current(self)
             {
+                // 在首个responder getter前固定真实分页子格及其输入；这里仅克隆Rust owner，
+                // 不调用Native、不持TLS借用跨过后续焦点或IME回调。
+                let paged_cell = ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
+                    let surface = active.as_ref()?;
+                    let source = surface.editor.as_ref()?;
+                    let cell = source.body.active_cell_body()?;
+                    let captured = cell
+                        .view()
+                        .map_err(|cause| cause.to_string())
+                        .and_then(|view| {
+                            let state = view.input_state().map_err(|cause| cause.to_string())?;
+                            Ok((Rc::clone(&source.body), cell, view, state))
+                        });
+                    Some(captured)
+                });
                 // The field editor can own a table draft or finder input. Its composition gets
                 // first refusal before an actual physical Escape may affect the document window.
                 let marked = self
                     .firstResponder()
-                    .and_then(|responder| responder.downcast::<NSTextView>().ok())
-                    .is_some_and(|view| {
-                        // SAFETY: AppKit NSTextView implements NSTextInputClient on the main thread.
-                        unsafe { msg_send![&*view, hasMarkedText] }
+                    .is_some_and(|responder| {
+                        if let Some(view) = responder.downcast_ref::<NSTextView>() {
+                            // SAFETY: 原生字段编辑器实现 NSTextInputClient，主线程借用贯穿本次查询。
+                            unsafe { msg_send![view, hasMarkedText] }
+                        } else if let Some(view) = responder.downcast_ref::<
+                            super::paged_text_view::NativeMarkdownPagedTextView,
+                        >() {
+                            // 分页正文直接实现同一输入协议；不能只识别旧 NSTextView 后误把组字 Esc 当返回。
+                            // SAFETY: 已核实际具体类型，公开 hasMarkedText 只查询当前输入状态，不复制正文。
+                            unsafe { msg_send![view, hasMarkedText] }
+                        } else {
+                            false // 非文本 responder 没有组字所有权，继续原面板的返回优先级。
+                        }
                     });
                 if !marked {
-                    // Clone the editor outside TLS before native selection/focus operations can reenter.
-                    if let Ok(view) = active_document_view() {
-                        let editing_cell = view.ivars().active_table_cell.borrow().is_some();
-                        if editing_cell {
-                            // First Escape cancels only the reusable cell draft.
-                            view.cancel_active_table_cell();
-                            return;
+                    if let Some(captured) = paged_cell {
+                        // 第一枚Esc只取消原草稿，不能因只识别旧NSTextView而关闭整个插件。
+                        // 新输入或重新开格撤销旧Esc；不把当前焦点重新捕获成另一格的取消权限。
+                        let result = captured.and_then(|(parent, cell, view, state)| {
+                            let current = native_markdown_panel_is_current(self)
+                                && view.session_is_current()
+                                && parent
+                                    .active_cell_body()
+                                    .is_some_and(|actual| Rc::ptr_eq(&actual, &cell))
+                                && view.input_state().is_ok_and(|actual| actual == state);
+                            if !current {
+                                return Err("原单元格输入已改变，本次取消未执行".into());
+                            }
+                            view.command(sel!(cancelOperation:))
+                                .map_err(|cause| cause.to_string())
+                        });
+                        if let Err(error) = result {
+                            present_native_markdown_error(&error);
                         }
+                        return; // 本次物理Esc已交同一真实client一次，不再落入Find或窗口返回分支。
                     }
                     if dismiss_active_native_markdown_find_bar() {
                         // The finder consumes Escape without closing the unsaved document session.
@@ -100,28 +108,9 @@ define_class!(
                     return;
                 }
             }
-            let table_mouse = if event.r#type() == NSEventType::LeftMouseDown
-                && native_markdown_panel_is_current(self)
-                && let Ok(view) = active_document_view()
-            {
-                view.capture_table_field_mouse_selection(event)
-            } else {
-                None // 只跨此原 Down 的同步 tracking 记录；不挂观察器或保留后续事件队列。
-            };
             // SAFETY: the unconsumed live native event is forwarded once on the AppKit main thread.
             unsafe {
                 let _: () = msg_send![super(self), sendEvent: event];
-            }
-            if native_markdown_panel_is_current(self) && let Ok(view)=active_document_view() {
-                if let Some(mouse) = table_mouse {
-                    view.finish_table_field_mouse_selection(mouse);
-                }
-                if event.r#type() == NSEventType::KeyDown {
-                    // 真实按键已返回；只用实际 caret 或仍保留原 anchor 的连续 Shift 续接格内方向。
-                    view.observe_active_table_field_selection(Some(event));
-                }
-                // 同步entry已自行消费；若重入路径遗留权限，也只能在本事件结束前尝试一次再撤销。
-                view.finish_table_mutation_continuity();
             }
             if event.r#type() == NSEventType::KeyDown {
                 // 真实输入派发已经完成；Find 私有字段委托不被替换，只记录实际共享 editor 的历史归属。
@@ -263,6 +252,28 @@ fn is_exact_markdown_save_key(characters: &str, modifiers: NSEventModifierFlags)
         | NSEventModifierFlags::Shift;
     characters.eq_ignore_ascii_case("s")
         && modifiers.intersection(command_modifiers) == NSEventModifierFlags::Command
+}
+
+/// 窗口按原逻辑字符识别既有 Command-W；不以物理键码新增命令或改变修饰键合同。
+fn is_exact_markdown_command_w_event(event: &NSEvent) -> bool {
+    let Some(characters) = event.charactersIgnoringModifiers() else {
+        // 缺少逻辑字符的事件没有本窗口关闭权限，继续交原系统路由。
+        return false;
+    };
+    autoreleasepool(|pool| {
+        // SAFETY: 字符借用只活当前池内，比较结束后不进入窗口关闭事务。
+        is_exact_markdown_command_w(unsafe { characters.to_str(pool) }, event.modifierFlags())
+    })
+}
+
+/// 只有原单独 Command-W 才是本窗口关闭；额外修饰键保持各自原生含义。
+pub(super) fn is_exact_markdown_command_w(
+    characters_ignoring_modifiers: &str,
+    modifiers: NSEventModifierFlags,
+) -> bool {
+    characters_ignoring_modifiers.eq_ignore_ascii_case("w")
+        && modifiers.intersection(NSEventModifierFlags::DeviceIndependentFlagsMask)
+            == NSEventModifierFlags::Command
 }
 
 #[cfg(test)]

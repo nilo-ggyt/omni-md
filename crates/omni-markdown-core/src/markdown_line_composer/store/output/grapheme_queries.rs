@@ -1,7 +1,7 @@
 //! 只读快照的字素覆盖独立于glyph布局范围；未迁入的尾部保留Pending而非伪EOF。
 use super::*;
 
-/// Known(None)只代表已覆盖位置不是原GCB；Pending代表此快照没有足够原记录。
+/// Known(None)只代表已覆盖记录域内不是 GCB；隐区 typed 拒绝，Pending 表示原记录尚未迁入。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownComposedGraphemeOrdinalAnswer {
     Pending,
@@ -9,16 +9,43 @@ pub enum MarkdownComposedGraphemeOrdinalAnswer {
 }
 
 impl MarkdownComposedLines {
+    /// 序号只属于本次明确的记录域；FoldedVisible 不含隐区内部边界，不能当全源字素计数。
+    pub fn grapheme_ordinal_domain(&self) -> Result<crate::MarkdownGraphemeOrdinalDomain> {
+        self.require(&self.authority)?;
+        Ok(self.graphemes.domain)
+    }
+
     fn grapheme_dimensions(&self, offset: usize) -> Result<(usize, usize)> {
         self.require(&self.authority)?;
         let source = &self.payload.as_ref().ok_or(Error::Poisoned)?.source;
         if offset > source.utf16_len() {
             return Err(Error::InvalidRequest);
         }
+        if let Some(fold) = self
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.folds.as_ref())
+            .and_then(|plan| {
+                plan.spans()
+                    .iter()
+                    .find(|fold| fold.start.utf16 < offset && offset < fold.end.utf16)
+            })
+        {
+            return Err(Error::FoldedRange(fold.start.utf16..fold.end.utf16));
+        } // 这里只使用同 Source 的有限锚点，绝不为一次查询遍历或解析隐藏正文。
+        #[cfg(all(
+            feature = "s2-table-window-prototype",
+            feature = "paged-shaping-frontier"
+        ))]
+        if let Some(tables) = &self.payload.as_ref().ok_or(Error::Poisoned)?.tables
+            && tables.contains(offset, true)?
+        {
+            return Err(Error::TableRange);
+        }
         Ok((source.byte_len(), source.utf16_len()))
     }
 
-    /// 原全局ordinal不由UTF16差推算；非BMP和多scalar GCB都沿原BreakJob记录。
+    /// ordinal 属于显式 Source/FoldedVisible 域；非 BMP 与多 scalar GCB 沿原 BreakJob 记录。
     pub fn grapheme_ordinal_answer(
         &mut self,
         offset: usize,

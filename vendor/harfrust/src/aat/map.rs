@@ -3,8 +3,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
-use super::AatData;
 use super::layout::*;
+use super::AatData;
 use crate::{Language, Mask, Tag};
 
 /// HB: hb_aat_map_t

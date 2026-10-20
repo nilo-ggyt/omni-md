@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) fn verify(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     controller: &NativeMarkdownController,
     fixture: &str,
 ) -> Result<(), String> {

@@ -1,4 +1,4 @@
-//! 两个有限复用图层组只持只读瓦片；挂载点一次切换完整候选，绝不显露部分帧。
+//! 双组只为实际瓦片建立图层；挂载点原子切换完整候选，旧组立即归还全部角色。
 
 use super::*;
 use crate::native_surface::viewport_pixels::MAX_TILE_SLOTS;
@@ -29,7 +29,8 @@ pub(super) struct Publication {
 }
 struct LayerGroup {
     layer: Retained<CALayer>,
-    slots: Box<[slot::Slot]>,
+    slots: RefCell<Vec<Rc<slot::Slot>>>,
+    retired: RefCell<Vec<Weak<AnyObject>>>,
     palette: slot::Palette,
 }
 
@@ -73,14 +74,14 @@ impl LayerPool {
         Retained::clone(&self.mount)
     }
 
-    /// 固定池全部角色都登记Weak，包括从未用于较小窗口的slot；不保存历次Native对象或像素。
+    /// 只登记当前真实图中的角色；记录不保活图层，也不为未用瓦片建立空对象。
     pub(super) fn weaks(&self) -> Vec<Weak<AnyObject>> {
-        // 每槽容器与两组前景/遮罩共五层，所有实际角色均进入同一严格 Weak 释放账。
-        let mut values = Vec::with_capacity(1 + 2 * (1 + 5 * MAX_TILE_SLOTS));
-        values.push(layer_weak(&self.mount));
+        let mut values = vec![layer_weak(&self.mount)];
         for group in &self.groups {
             values.push(layer_weak(&group.layer));
-            for slot in &group.slots {
+            values.extend(group.retired.borrow().iter().cloned());
+            let slots = group.slots.borrow().clone();
+            for slot in slots {
                 slot.add_weaks(&mut values);
             }
         }
@@ -174,7 +175,14 @@ impl LayerPool {
         let local = NSRect::new(NSPoint::new(0.0, 0.0), bounds.size);
         checked(current, || group.layer.setFrame(local))?;
         checked(current, || group.layer.setBounds(local))?;
-        for (slot, image) in group.slots.iter().zip(&frame.tiles) {
+        // 每次候选只建立本帧所需角色；先交本组接管，重入撤权能看见并清理已建的原关系。
+        let slots = frame
+            .tiles
+            .iter()
+            .map(|image| slot::Slot::new(image.presentation, current).map(Rc::new))
+            .collect::<Result<Vec<_>>>()?;
+        group.slots.replace(slots.clone());
+        for (slot, image) in slots.iter().zip(&frame.tiles) {
             let tile = image.tile;
             // tile的frame仍是精确像素数/scale，contents与mask保持1:1；尾部余像素由mount裁掉。
             let rect = NSRect::new(
@@ -193,7 +201,7 @@ impl LayerPool {
                 current,
             )?;
         }
-        let containers = group.slots[..frame.tiles.len()]
+        let containers = slots
             .iter()
             .map(|slot| &**slot.container())
             .collect::<Vec<_>>();
@@ -293,6 +301,11 @@ impl LayerPool {
         if actual_tiles.len() != publication.tiles.len() {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
+        // 快照只保本次有限槽；Native/current 调用前归还 RefCell 借用，允许真实关闭重入。
+        let slots = group.slots.borrow().clone();
+        if slots.len() != publication.tiles.len() {
+            return Err(NativeMarkdownPagedTextViewError::Revoked);
+        }
         for (index, receipt) in publication.tiles.iter().enumerate() {
             let tile = receipt.tile;
             let actual_slot = checked(current, || actual_tiles.objectAtIndex(index))?;
@@ -307,13 +320,13 @@ impl LayerPool {
                 ),
             );
             let matches = checked(current, || {
-                std::ptr::eq::<CALayer>(&*actual_slot, &**group.slots[index].container())
+                std::ptr::eq::<CALayer>(&*actual_slot, &**slots[index].container())
             })?;
             if !matches {
                 return Err(NativeMarkdownPagedTextViewError::Revoked);
             }
             drop(actual_slot);
-            group.slots[index].validate(
+            slots[index].validate(
                 receipt,
                 expected,
                 publication.scale,
@@ -380,21 +393,33 @@ impl LayerPool {
 impl LayerGroup {
     fn new(current: &impl Fn() -> bool) -> Result<Self> {
         let layer = checked(current, CALayer::new)?;
-        let mut slots = Vec::with_capacity(MAX_TILE_SLOTS);
-        for _ in 0..MAX_TILE_SLOTS {
-            slots.push(slot::Slot::new(current)?);
-        } // 固定对象池仅持空Native层；没有Source、回调、文档或历次image缓存。
+        // 空组只有一个结构层；未激活的第二组不预占 64 个瓦片和 320 个辅助角色。
         Ok(Self {
             layer,
-            slots: slots.into_boxed_slice(),
+            slots: RefCell::new(Vec::new()),
+            retired: RefCell::new(Vec::new()),
             palette: slot::Palette::new(current)?,
         })
     }
     fn clear(&self) -> bool {
         let mut intact = true;
-        for slot in &self.slots {
+        // 先移出有限槽，再发 Native 清理；关闭重入不会再次清同一槽或保留历史空层。
+        let slots = std::mem::take(&mut *self.slots.borrow_mut());
+        let mut retired = std::mem::take(&mut *self.retired.borrow_mut());
+        // 历史身份只保 Weak；框架或外方仍持空角色时，关闭收据仍须观察它的真实生命周期。
+        objc2::rc::autoreleasepool(|_| retired.retain(|weak| weak.load().is_some()));
+        if retired.is_empty() {
+            // 所有旧角色都已真实销毁，连 Weak 列表的历史容量也归还；活 Weak 一项不丢。
+            retired = Vec::new();
+        }
+        for slot in &slots {
+            slot.add_weaks(&mut retired);
+        }
+        self.retired.replace(retired); // 归还槽借用后才逐项发 Native 清理，允许同一关闭边界重入。
+        for slot in &slots {
             intact &= slot.clear(&self.layer, &self.palette);
         }
+        drop(slots); // 旧帧及缩窗淘汰的角色在本事务结束前归还，不成为闲置图层缓存。
         // 本组从不安装背景、mask、contents或delegate；外方后来设置的内容保持原样并拒绝复用。
         // SAFETY: 标准CALayer getter只核空值，不把外方opaque内容解引用为CGImage。
         let contents = unsafe { self.layer.contents() };

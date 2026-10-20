@@ -1,13 +1,13 @@
-use super::AatData;
 use super::layout::*;
 use super::map::{AatMap, AatMapBuilder, RangeFlags};
-use crate::U32Set;
+use super::AatData;
 use crate::aat::common::{
-    AatApplyContext, ClassCache, START_OF_TEXT, SafeToBreakAccel, SafeToBreakSubtable,
-    TypedCollectGlyphs,
+    AatApplyContext, ClassCache, SafeToBreakAccel, SafeToBreakSubtable, TypedCollectGlyphs,
+    START_OF_TEXT,
 };
 use crate::ot::layout::MAX_CONTEXT_LENGTH;
 use crate::tag::lang_matches;
+use crate::U32Set;
 use crate::{GlyphInfo, Language};
 use alloc::{vec, vec::Vec};
 use read_fonts::tables::aat::{self, ExtendedStateTable, NoPayload, StateEntry, StateTable};

@@ -63,7 +63,7 @@ impl NativeMarkdownPagedScenePaintCompletion {
     }
 
     /// 接受真实组合器完成票，而非调用者自报的glyph计数或成功布尔值。
-    #[cfg(feature = "native-paged-compose-probe")]
+    #[cfg(feature = "native-paged-production")]
     pub fn from_composed(
         completion: crate::native_surface::paged_line_viewport::NativeMarkdownComposedViewportPaintCompletion,
         key: &NativeMarkdownPagedSceneKey,
@@ -82,6 +82,20 @@ impl NativeMarkdownPagedScenePaintCompletion {
                 metadata_records: actual.metadata_records,
             },
         })
+    }
+
+    /// 原Scene消费全部真实Text/Cell完成票后转交同一context；空格背景也在该同步栈实际绘完。
+    /// 此入口仅供native_surface内部装配，公开调用者仍必须提交真实组合器完成票。
+    pub(in crate::native_surface) fn from_native_composite(
+        key: &NativeMarkdownPagedSceneKey,
+        context: CFRetained<CGContext>,
+        work: NativeMarkdownPagedScenePaintWork,
+    ) -> Self {
+        Self {
+            key: Box::new(key.clone()),
+            context,
+            work,
+        }
     }
 
     /// 有限旧spool适配直接执行唯一真实批次，不能用外部receipt或declaredLimit授权任意scene.paint。

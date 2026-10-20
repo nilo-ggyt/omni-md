@@ -1,6 +1,6 @@
 //! 同一实际字体全部默认水平advance的分步下界；此证明本身不授予软行或源切片权限。
 
-use harfrust::{GlyphId, ShapePlan, ShapePlanKey, ShaperFont};
+use harfrust::{GlyphId, ShapePlan, ShapePlanKey};
 use std::sync::{Arc, Weak};
 
 use super::{
@@ -195,10 +195,13 @@ impl DefaultAdvanceScan {
             let start = self.next;
             if self.answer == AdvanceScanAnswer::Pending {
                 let font = self.font.as_ref().ok_or(AdvanceScanError::Incomplete)?;
-                let shaper = ShaperFont::new(font.font()).with_scale(self.options.scale);
+                let shaper = font
+                    .shaper_at_scale(self.options.scale)
+                    .map_err(|_| AdvanceScanError::InvalidRequest)?;
                 while self.next < end {
-                    // 正文尚未读到的glyph也逐项覆盖；没有自定义FontFuncs或不同scale可混入。
-                    let raw = shaper.default_glyph_h_advance(GlyphId::new(self.next));
+                    // 正文尚未读到的glyph也逐项覆盖；有平台纯值表时与实际shape消费同一张表，
+                    // 无平台表才读真实hmtx。不可证明文件值非负，却在排版时执行另一套advance。
+                    let raw = shaper.glyph_h_advance(GlyphId::new(self.next));
                     let advance = self.options.quantize(raw);
                     let glyph = self.next;
                     self.next += 1;

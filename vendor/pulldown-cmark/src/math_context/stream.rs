@@ -5,7 +5,6 @@
 
 use super::MathContext;
 use crate::block_frontier::SourceFrame;
-use crate::scanners::is_ascii_punctuation;
 use std::ops::Range;
 
 const MAX_STEP: usize = 64 * 1024;
@@ -168,24 +167,7 @@ impl MathContextScan {
             work.byte_reads += 1;
             work.transitions += 2;
             self.next += 1;
-            if self.escaped {
-                self.escaped = false;
-                if is_ascii_punctuation(byte) {
-                    // 原backslash_transition对punctuation至少跳过本字节；backtick run和
-                    // double-backslash-pipe额外跳的字节都不含数学token，逐byte消费与其状态等价。
-                    continue;
-                }
-                // 非punctuation不被原escape吞掉，必须继续走本字节的普通分派。
-            }
-            match byte {
-                b'\\' => self.escaped = true,
-                b'$' => {
-                    self.context.dollar();
-                }
-                b'{' => self.context.open(),
-                b'}' => self.context.close(),
-                _ => {} // 其他真实字节不改变数学上下文，但同样纳入读取/转换fuel。
-            }
+            super::observe_math_byte(&mut self.context, &mut self.escaped, byte);
         }
         if work.transitions == budget {
             // 完成转换留到下一step；不能在预算尾免费发布一个新的状态。

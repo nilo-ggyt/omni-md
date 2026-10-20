@@ -1,6 +1,8 @@
 //! 在原四MiB单段落上添加有限原生输入段；真实Word、历史和撤权均消费同一个Body。
 
 use super::*;
+#[path = "word/native.rs"]
+mod native;
 use objc2::runtime::Sel;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
 use omni_markdown_core::MarkdownTextSelection;
@@ -30,14 +32,28 @@ fn check(
     prefix: &str,
     selection: MarkdownTextSelection,
 ) {
+    check_with_suffix(document, fixture, prefix, "", selection);
+}
+
+/// EOF原生输入必须落在前面真实编辑后的末端；仍以4KiB栈片验证原正文和有限前后缀。
+fn check_with_suffix(
+    document: &std::rc::Weak<RefCell<MarkdownDocumentBuffer>>,
+    fixture: SourceFixture,
+    prefix: &str,
+    suffix: &str,
+    selection: MarkdownTextSelection,
+) {
     let original = document.upgrade().unwrap();
     let original = original.borrow();
     let prefix_bytes = prefix.len();
+    let suffix_bytes = suffix.len();
     let prefix: Vec<_> = prefix.encode_utf16().collect();
-    assert_eq!(original.utf16_len(), fixture.source_utf16() + prefix.len());
+    let suffix: Vec<_> = suffix.encode_utf16().collect();
+    let source_end = prefix.len() + fixture.source_utf16();
+    assert_eq!(original.utf16_len(), source_end + suffix.len());
     assert_eq!(
         original.byte_len(),
-        fixture.edited_source_bytes() + prefix_bytes
+        fixture.edited_source_bytes() + prefix_bytes + suffix_bytes
     );
     assert_eq!(original.selection(), selection);
     let mut units = [0_u16; 2048];
@@ -53,9 +69,11 @@ fn check(
                 prefix[offset]
             } else if offset == prefix.len() {
                 b'X' as u16 // 原GCB编辑后首字固定为X；新增有限段不得改动原大正文。
-            } else {
+            } else if offset < source_end {
                 repeated
-            };
+            } else {
+                suffix[offset - source_end]
+            }; // 只有这次明确EOF输入属于末尾；旧长度定位会落入原正文并在此逐单位暴露。
             assert_eq!(*unit, expected, "原四MiB正文位置{offset}被词组编辑误改");
         }
     }
@@ -847,6 +865,417 @@ fn visual_queued_across_unprepared_crlf(
     } // Exactly four character transactions; neither movement nor side-only commits create Undo records.
 }
 
+/// 未排版的跨视口移动后，退格、前删和键入必须按真实到达次序消费完整GCB。
+fn ordinary_delete_after_pending_visual(
+    body: &NativeMarkdownPagedBody,
+    view: &NativeMarkdownPagedTextView,
+    document: &std::rc::Weak<RefCell<MarkdownDocumentBuffer>>,
+    receipts: &mut Vec<NativeMarkdownPagedBodyResourceReceipts>,
+    fixture: SourceFixture,
+) {
+    let original = view.input_state().unwrap().selection;
+    let lines = "a\r\n".repeat(32);
+    let family = "👩‍👩‍👧‍👦";
+    let text = format!("{lines}e\u{301}{family}!");
+    let setup = observe(body, Instant::now());
+    insert(view, &text, NSRange::new(0, 0));
+    finish("source_grapheme_pending_setup", body, setup, receipts);
+    let top = observe(body, Instant::now());
+    command(view, sel!(moveToBeginningOfDocument:));
+    finish("source_grapheme_pending_origin", body, top, receipts);
+    let before = view.input_state().unwrap();
+    let frame = observe(body, Instant::now());
+    insert(
+        view,
+        "b",
+        NSRange::new(objc2_foundation::NSNotFound as usize, 0),
+    );
+    let after_first = view.input_state().unwrap();
+    for _ in 0..64 {
+        command(view, sel!(moveRight:));
+    } // 每个真实ASCII与CRLF各一簇；移动穿过视口，仍不预先准备整段行几何。
+    command(view, sel!(deleteBackward:));
+    command(view, sel!(deleteForward:));
+    insert(
+        view,
+        "?",
+        NSRange::new(objc2_foundation::NSNotFound as usize, 0),
+    );
+    command(view, sel!(deleteForward:)); // 最后一个动作仍须以实际删除收据定位caret，不能依靠后继键入。
+    assert_eq!(view.input_state().unwrap(), after_first);
+    finish("source_grapheme_pending_order", body, frame, receipts);
+    assert_eq!(
+        view.input_state().unwrap().generation,
+        before.generation + 5
+    );
+    let shortened = format!("b{}a", "a\r\n".repeat(31));
+    check(
+        document,
+        fixture,
+        &format!("{shortened}?!"),
+        MarkdownTextSelection::caret(96),
+    );
+    let key = view.capture_ready_scene_key().unwrap();
+    view.verify_find_target_visible(&key, NSRange::new(96, 0))
+        .unwrap(); // 真实可见区域必须容纳最后删除后的caret，发布旧BOF帧不算成功。
+    for (stage, prefix, selection) in [
+        (
+            "source_grapheme_pending_undo_emoji",
+            format!("{shortened}?{family}!"),
+            MarkdownTextSelection::caret(96),
+        ),
+        (
+            "source_grapheme_pending_undo_typing",
+            format!("{shortened}{family}!"),
+            MarkdownTextSelection::caret(95),
+        ),
+        (
+            "source_grapheme_pending_undo_combining",
+            format!("{shortened}e\u{301}{family}!"),
+            MarkdownTextSelection::caret(95),
+        ),
+        (
+            "source_grapheme_pending_undo_crlf",
+            format!("b{text}"),
+            MarkdownTextSelection::caret(97),
+        ),
+        (
+            "source_grapheme_pending_undo_fresh_source",
+            text,
+            MarkdownTextSelection::caret(0),
+        ),
+        ("source_grapheme_pending_restore", String::new(), original),
+    ] {
+        let history = observe(body, Instant::now());
+        command(view, sel!(undo:));
+        finish(stage, body, history, receipts);
+        check(document, fixture, &prefix, selection);
+    } // 逐笔Undo暴露真实中间文本；原四MiB正文每个UTF16单位均由现有check流式比对。
+}
+
+/// 跨视口续行与行号跨位数后仍保所有已接纳动作；末尾无变化不伪造Undo或丢掉caret。
+fn source_commands_after_pending_visual_and_word(
+    body: &NativeMarkdownPagedBody,
+    view: &NativeMarkdownPagedTextView,
+    document: &std::rc::Weak<RefCell<MarkdownDocumentBuffer>>,
+    receipts: &mut Vec<NativeMarkdownPagedBodyResourceReceipts>,
+    fixture: SourceFixture,
+) {
+    for initial_lines in [9, 34, 99] {
+        let original = view.input_state().unwrap().selection;
+        let preceding = initial_lines - 2;
+        let lines = "a\r\n".repeat(preceding);
+        let text = format!("{lines}- item\r\n");
+        let setup_before = view.input_state().unwrap();
+        let setup = observe(body, Instant::now());
+        insert(view, &text, NSRange::new(0, 0));
+        assert_eq!(
+            view.input_state().unwrap().generation,
+            setup_before.generation + 1
+        );
+        assert_eq!(
+            view.input_state().unwrap().selection,
+            MarkdownTextSelection::caret(text.encode_utf16().count()),
+        ); // 显式合法插入须同步发布；后续显示失败不能被误诊为正文未改而重放。
+        assert_eq!(
+            document.upgrade().unwrap().borrow().line_count(),
+            initial_lines
+        );
+        finish(
+            &format!("source_command_pending_setup_{initial_lines}"),
+            body,
+            setup,
+            receipts,
+        );
+        let setup_key = view.capture_ready_scene_key().unwrap();
+        view.verify_find_target_visible(&setup_key, NSRange::new(text.encode_utf16().count(), 0))
+            .unwrap(); // 尾CRLF后的真实下游caret也须准备，不能只发布旧viewport像素。
+        let top = observe(body, Instant::now());
+        command(view, sel!(moveToBeginningOfDocument:));
+        finish(
+            &format!("source_command_pending_origin_{initial_lines}"),
+            body,
+            top,
+            receipts,
+        );
+        let before = view.input_state().unwrap();
+        let frame = observe(body, Instant::now());
+        insert(
+            view,
+            "b",
+            NSRange::new(objc2_foundation::NSNotFound as usize, 0),
+        );
+        let after_first = view.input_state().unwrap();
+        for _ in 0..2 * preceding + 2 {
+            command(view, sel!(moveRight:));
+        } // 每行ASCII和CRLF各一簇，再越过列表标记；99行样本实际跨多个视口。
+        command(view, sel!(moveWordForward:));
+        insert(
+            view,
+            "!",
+            NSRange::new(objc2_foundation::NSNotFound as usize, 0),
+        ); // Source前的真实键入必须先提交，不能在输入占位退出后误执行后继命令。
+        command(view, sel!(insertNewline:));
+        insert(
+            view,
+            "z",
+            NSRange::new(objc2_foundation::NSNotFound as usize, 0),
+        ); // 这一步已在Return前接纳，不能被9→10或99→100行号自有宽度变化静默取消。
+        command(view, sel!(insertTab:));
+        command(view, sel!(insertBacktab:));
+        command(view, sel!(insertBacktab:));
+        assert_eq!(view.input_state().unwrap(), after_first);
+        finish(
+            &format!("source_command_pending_order_{initial_lines}"),
+            body,
+            frame,
+            receipts,
+        );
+        assert_eq!(
+            view.input_state().unwrap().generation,
+            before.generation + 6
+        );
+        assert_eq!(
+            document.upgrade().unwrap().borrow().line_count(),
+            initial_lines + 1
+        );
+        let returned = format!("b{lines}- item!\r\n- \r\n");
+        let final_text = format!("b{lines}- item!\r\n- z\r\n");
+        let indented = format!("b{lines}- item!\r\n  - z\r\n");
+        // 所有期望位置只由有限固定样本给出，不从被测排版或实际选择反推。
+        let word_end = 1 + preceding * 3 + 6;
+        let return_before = word_end + 1;
+        let returned_head = return_before + 4;
+        let final_head = returned_head + 1;
+        check(
+            document,
+            fixture,
+            &final_text,
+            MarkdownTextSelection::caret(final_head),
+        );
+        let key = view.capture_ready_scene_key().unwrap();
+        view.verify_find_target_visible(&key, NSRange::new(final_head, 0))
+            .unwrap(); // 最后noop沿上一真实收据显示caret，不造空事务或只验证逻辑head。
+        for (stage, prefix, selection) in [
+            (
+                "undo_backtab",
+                indented,
+                MarkdownTextSelection::caret(final_head + 2),
+            ),
+            (
+                "undo_tab",
+                final_text,
+                MarkdownTextSelection::caret(final_head),
+            ),
+            (
+                "undo_post_return_typing",
+                returned,
+                MarkdownTextSelection::caret(returned_head),
+            ),
+            (
+                "undo_return",
+                format!("b{lines}- item!\r\n"),
+                MarkdownTextSelection::caret(return_before),
+            ),
+            (
+                "undo_first_typing",
+                format!("b{text}"),
+                MarkdownTextSelection::caret(word_end),
+            ),
+            ("undo_fresh_source", text, MarkdownTextSelection::caret(0)),
+            ("restore", String::new(), original),
+        ] {
+            let history = observe(body, Instant::now());
+            command(view, sel!(undo:));
+            finish(
+                &format!("source_command_pending_{stage}_{initial_lines}"),
+                body,
+                history,
+                receipts,
+            );
+            check(document, fixture, &prefix, selection);
+        } // 真正Typing、Return和有效缩进各一笔历史，末尾noop与自有行号布局没有额外Undo。
+    }
+}
+
+/// 文档端点必须等在途移动和键入真正提交；EOF输入证明长度更新，扩选证明不继承旧anchor。
+fn document_boundaries_after_pending_input(
+    body: &NativeMarkdownPagedBody,
+    view: &NativeMarkdownPagedTextView,
+    document: &std::rc::Weak<RefCell<MarkdownDocumentBuffer>>,
+    receipts: &mut Vec<NativeMarkdownPagedBodyResourceReceipts>,
+    fixture: SourceFixture,
+) {
+    for extend in [false, true] {
+        let original = view.input_state().unwrap().selection;
+        let lines = "a\r\n".repeat(32);
+        let text = format!("{lines}one two\r\n");
+        let setup = observe(body, Instant::now());
+        insert(view, &text, NSRange::new(0, 0));
+        finish("source_document_pending_setup", body, setup, receipts);
+        let top = observe(body, Instant::now());
+        command(view, sel!(moveToBeginningOfDocument:));
+        finish("source_document_pending_origin", body, top, receipts);
+        let before = view.input_state().unwrap();
+        let frame = observe(body, Instant::now());
+        insert(
+            view,
+            "b",
+            NSRange::new(objc2_foundation::NSNotFound as usize, 0),
+        );
+        let after_first = view.input_state().unwrap();
+        for _ in 0..64 {
+            command(view, sel!(moveRight:));
+        }
+        command(view, sel!(moveWordForward:));
+        insert(
+            view,
+            "!",
+            NSRange::new(objc2_foundation::NSNotFound as usize, 0),
+        );
+        let middle = format!("b{lines}one! two\r\n");
+        let cases = if extend {
+            command(view, sel!(moveToBeginningOfDocumentAndModifySelection:));
+            command(view, sel!(moveToBeginningOfDocumentAndModifySelection:));
+            insert(
+                view,
+                "R",
+                NSRange::new(objc2_foundation::NSNotFound as usize, 0),
+            );
+            command(view, sel!(moveToEndOfDocumentAndModifySelection:));
+            command(view, sel!(moveToBeginningOfDocumentAndModifySelection:));
+            insert(
+                view,
+                "Q",
+                NSRange::new(objc2_foundation::NSNotFound as usize, 0),
+            );
+            vec![
+                (
+                    "undo_last_replacement",
+                    "R two\r\n".to_owned(),
+                    "",
+                    MarkdownTextSelection {
+                        anchor_utf16: 1,
+                        head_utf16: 0,
+                    },
+                    false,
+                ),
+                (
+                    "undo_first_replacement",
+                    middle.clone(),
+                    "",
+                    MarkdownTextSelection {
+                        anchor_utf16: 101,
+                        head_utf16: 0,
+                    },
+                    false,
+                ),
+            ] // 扩选只保前一步真实anchor；重复BOF与往返EOF不产生文字Undo。
+        } else {
+            command(view, sel!(moveToEndOfDocument:));
+            command(view, sel!(moveToEndOfDocument:));
+            insert(
+                view,
+                "EOF",
+                NSRange::new(objc2_foundation::NSNotFound as usize, 0),
+            );
+            command(view, sel!(moveToBeginningOfDocument:));
+            command(view, sel!(moveToBeginningOfDocument:));
+            insert(
+                view,
+                "?",
+                NSRange::new(objc2_foundation::NSNotFound as usize, 0),
+            );
+            vec![
+                (
+                    "undo_first_insertion",
+                    middle.clone(),
+                    "EOF",
+                    MarkdownTextSelection::caret(0),
+                    false,
+                ),
+                (
+                    "undo_eof_insertion_then_home",
+                    middle.clone(),
+                    "",
+                    MarkdownTextSelection::caret(fixture.source_utf16() + 107),
+                    true,
+                ),
+            ] // EOF文字必须追加在middle真实107单位之后；不用旧总长，也不要求先排版全文。
+        };
+        let final_selection = if extend {
+            command(view, sel!(moveToBeginningOfDocumentAndModifySelection:));
+            command(view, sel!(moveToBeginningOfDocumentAndModifySelection:));
+            MarkdownTextSelection {
+                anchor_utf16: 1,
+                head_utf16: 0,
+            }
+        } else {
+            command(view, sel!(moveToBeginningOfDocument:));
+            command(view, sel!(moveToBeginningOfDocument:));
+            MarkdownTextSelection::caret(0)
+        }; // 最后重复BOF真实Unchanged，仍应保留前一步选择的显示意图且不增加文字Undo。
+        assert_eq!(view.input_state().unwrap(), after_first);
+        finish("source_document_pending_order", body, frame, receipts);
+        assert_eq!(
+            view.input_state().unwrap().generation,
+            before.generation + 4
+        );
+        if extend {
+            check(document, fixture, "Q two\r\n", final_selection);
+        } else {
+            check_with_suffix(
+                document,
+                fixture,
+                &format!("?{middle}"),
+                "EOF",
+                final_selection,
+            );
+        }
+        let key = view.capture_ready_scene_key().unwrap();
+        view.verify_find_target_visible(&key, NSRange::new(final_selection.head_utf16, 0))
+            .unwrap();
+        for (stage, prefix, suffix, selection, home_before_frame) in cases {
+            let history = observe(body, Instant::now());
+            let generation = view.input_state().unwrap().generation;
+            command(view, sel!(undo:));
+            assert_eq!(view.input_state().unwrap().generation, generation + 1);
+            check_with_suffix(document, fixture, &prefix, suffix, selection);
+            let visible = if home_before_frame {
+                // Undo必须先真实恢复EOF收据；同步核全文和精确caret后，才用原Home动作回首屏。
+                // 这里只验输入/历史保序，不把尚未准备的EOF宣称可见，也不要求中间态先排版全文。
+                command(view, sel!(moveToBeginningOfDocument:));
+                MarkdownTextSelection::caret(0)
+            } else {
+                selection
+            };
+            finish(stage, body, history, receipts);
+            check_with_suffix(document, fixture, &prefix, suffix, visible);
+            let key = view.capture_ready_scene_key().unwrap();
+            view.verify_find_target_visible(&key, NSRange::new(visible.head_utf16, 0))
+                .unwrap();
+        }
+        for (stage, prefix, selection) in [
+            (
+                "source_document_undo_pending_typing",
+                format!("b{text}"),
+                MarkdownTextSelection::caret(100),
+            ),
+            (
+                "source_document_undo_fresh_source",
+                text,
+                MarkdownTextSelection::caret(0),
+            ),
+            ("source_document_restore", String::new(), original),
+        ] {
+            let history = observe(body, Instant::now());
+            command(view, sel!(undo:));
+            finish(stage, body, history, receipts);
+            check(document, fixture, &prefix, selection);
+        } // 五笔真实字符历史含setup；移动、扩选和端点noop没有伪造额外Undo。
+    }
+}
+
 pub(super) fn run(
     body: &NativeMarkdownPagedBody,
     view: &NativeMarkdownPagedTextView,
@@ -973,6 +1402,12 @@ pub(super) fn run(
     }
 
     visual_queued_across_unprepared_crlf(body, view, document, receipts, fixture);
+    ordinary_delete_after_pending_visual(body, view, document, receipts, fixture);
+    source_commands_after_pending_visual_and_word(body, view, document, receipts, fixture);
+    document_boundaries_after_pending_input(body, view, document, receipts, fixture);
+    native::run(body, view, document, receipts, fixture);
+    native::external_replacement(body, view, document, receipts, fixture);
+    native::focus_transfer(body, view, document, receipts, fixture);
     move_words(body, view, document, receipts, fixture);
     ordered_words(body, view, document, receipts, fixture);
     ordered_typing(body, view, document, receipts, fixture);
@@ -1061,4 +1496,9 @@ pub(super) fn run(
     println!(
         "paged_body_source word_delete_native=true word_select_native=true double_click_native=true word_drag_native=true shift_word_drag_native=true same_word_drag_direction_matches_codemirror=true selection_no_text_history=true select_then_delete_order_verified=true select_typing_delete_order_verified=true exact_original_four_mebibytes=true single_undo_redo=true bof_eof_no_history=true input_revoked_real_pending=true repeat_order_verified=true reverse_order_verified=true ordinary_nsnotfound_order_verified=true ime_order_verified=false visual_bidi_word_motion_verified=false formal=false"
     );
+}
+
+/// 关闭仍由原验收入口执行，这里只交出本次实际未解释event的弱释放票。
+pub(super) fn native_before_close(view: &NativeMarkdownPagedTextView) -> objc2::rc::Weak<NSEvent> {
+    native::before_close(view)
 }

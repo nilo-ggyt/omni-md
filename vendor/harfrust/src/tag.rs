@@ -1,6 +1,6 @@
 use smallvec::SmallVec;
 
-use super::{Language, Script, Tag, tag_table};
+use super::{tag_table, Language, Script, Tag};
 
 type ThreeTags = SmallVec<[Tag; 3]>;
 

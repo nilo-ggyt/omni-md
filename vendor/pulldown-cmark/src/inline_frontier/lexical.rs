@@ -116,6 +116,25 @@ impl InlineLexicalCursor {
         self.next
     }
 
+    /// 实际 EOL 已使词法回到 Normal；只接受同源前缀，不能在 tick/entity 中间跳字节。
+    pub(crate) fn skip_prefix(
+        &mut self,
+        prefix: &crate::global_frontier::VerifiedInlinePrefix,
+    ) -> Result<(), InlineError> {
+        if self.failed.is_some()
+            || self.complete
+            || !matches!(self.state, State::Normal)
+            || prefix.revision != self.revision
+            || prefix.source_end != self.source_end
+            || prefix.range.start != self.next
+            || prefix.range.end > self.range_end
+        {
+            return Err(InlineError::InvalidFrame);
+        }
+        self.next = prefix.range.end;
+        Ok(())
+    }
+
     pub fn cancel(&mut self) {
         // 取消立即撤销scratch访问权限；状态不持heap，外层drop续体后释放其固定存储。
         // 后续即使同revision也不能复活已撤权候选扫描，不声称这些字节已经安全清零。

@@ -30,10 +30,14 @@ mod store;
 // 文档叶聚合与UBA只使用这一份Unicode 18发布增量；生成文件和许可保持原位置。
 use crate::unicode_bidi_data as unicode_data;
 mod uniform;
+#[cfg(feature = "paged-shaping-frontier")]
+mod visible;
 pub use prepare::{
     MarkdownBidiPrepareBudget, MarkdownBidiPrepareJob, MarkdownBidiPrepareStatus,
     MarkdownBidiPrepareStep,
 };
+#[cfg(feature = "paged-shaping-frontier")]
+pub(crate) use visible::VisiblePreparation as MarkdownBidiVisiblePreparation;
 
 use store::{NONE, Store, Table, read_u32, write_u32};
 use unicode_data::UnicodeBidiData;
@@ -87,6 +91,12 @@ pub enum BidiError {
     SourceMismatch,
     #[error("双向文本分析范围无效")]
     InvalidRange,
+    #[error("折叠内部没有可见双向文本查询权限")]
+    FoldedRange,
+    #[error("独立表格行内部须查询该格显示来源的 UBA 结果")]
+    TableRange,
+    #[error("实际双向文本段尚未在原量子内准备完成")]
+    UnpreparedRange,
     #[error("双向文本分析端点不是完整标量边界")]
     InvalidScalarBoundary,
     #[error("双向文本分析缓存预算无效")]
@@ -131,6 +141,38 @@ pub struct MarkdownBidiParagraph {
     units: u32,
     paragraph_count: Option<u32>,
     source_borrow_max: usize,
+    // 查询游标只读取已完成的原 UBA 表；与这个真实段一起退役，不保活第三段或在途 Future。
+    #[cfg(feature = "paged-shaping-frontier")]
+    word_order: visible::WordOrder,
+}
+
+/// 原已完成 UBA 的单个 UTF16 记录；只供实际整形分项消费，不宣称这里存在 GCB 或 caret。
+/// 字节坐标来自原 Text 表的源捕获事实，不能为跨视口分项重新从正文起点定位。
+#[cfg(feature = "paged-line-compose")]
+#[derive(Clone)]
+pub(crate) struct MarkdownBidiShapingUnit {
+    source: crate::MarkdownLayoutTextAuthority,
+    pub(crate) utf16: usize,
+    pub(crate) byte: usize,
+    pub(crate) byte_end: usize,
+    pub(crate) level: u8,
+    pub(crate) continuation: bool,
+}
+
+#[cfg(feature = "paged-line-compose")]
+impl MarkdownBidiShapingUnit {
+    /// 两条原记录必须同源、逐 UTF16 相邻且右边是真标量头；不同级别才构成自然整形分界。
+    pub(crate) fn precedes_different_level(&self, right: &Self) -> bool {
+        self.source == right.source
+            && self.utf16.checked_add(1) == Some(right.utf16)
+            && self.byte_end == right.byte
+            && !right.continuation
+            && self.level != right.level
+    }
+
+    pub(crate) fn permits(&self, source: &crate::MarkdownLayoutTextAuthority) -> bool {
+        &self.source == source
+    }
 }
 
 /// 只借用原完整Uniform结果的范围事实；不授予GCB端点、活动文档或后继Source权限。
@@ -168,6 +210,8 @@ impl UniformControlFreeSpan<'_> {
 enum Resolution {
     UniformZero(uniform::UniformResolution),
     Paged(Store),
+    #[cfg(feature = "paged-shaping-frontier")]
+    VisibleParagraphs(Box<visible::VisibleParagraphs>),
 }
 
 impl Resolution {
@@ -175,6 +219,8 @@ impl Resolution {
         match self {
             Self::UniformZero(cancellation) => cancellation.check(),
             Self::Paged(store) => store.healthy(),
+            #[cfg(feature = "paged-shaping-frontier")]
+            Self::VisibleParagraphs(visible) => visible.healthy(),
         } // Uniform没有文件或页，但取消仍永久撤销已完成的分析值。
     }
 
@@ -183,6 +229,8 @@ impl Resolution {
         match self {
             Self::Paged(store) => store,
             Self::UniformZero(_) => panic!("此故障/资源测试必须使用真实复杂UBA输入"),
+            #[cfg(feature = "paged-shaping-frontier")]
+            Self::VisibleParagraphs(_) => panic!("此故障测试必须选定原实际段的分页存储"),
         }
     }
 }
@@ -191,7 +239,8 @@ impl MarkdownBidiParagraph {
     /// 仅用于原协调器选择是否有新端点工作；不读取来源或签发任何范围事实。
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn uses_prepared_paragraphs(&self) -> bool {
-        matches!(&self.resolution, Resolution::UniformZero(certificate) if certificate.paragraphs)
+        matches!(&self.resolution, Resolution::VisibleParagraphs(_))
+            || matches!(&self.resolution, Resolution::UniformZero(certificate) if certificate.paragraphs)
     }
 
     /// 原有限oracle仍核真实段数；未建立总目录的表示沿公开范围查询逐段验证，不伪造总数。
@@ -219,6 +268,8 @@ impl MarkdownBidiParagraph {
         match &self.resolution {
             Resolution::UniformZero(_) => MarkdownBidiResourceObserver::unallocated(),
             Resolution::Paged(store) => store.resource_observer(),
+            #[cfg(feature = "paged-shaping-frontier")]
+            Resolution::VisibleParagraphs(visible) => visible.resource_observer(),
         }
     }
 
@@ -407,6 +458,16 @@ impl MarkdownBidiParagraph {
         Ok(proved)
     }
 
+    /// 只声明当前结果按真实可见 B 段准备；不把子段零级、未准备段或隐区升级为全源方向证明。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(crate) fn uses_visible_paragraph_scopes(
+        &self,
+        authority: &crate::MarkdownLayoutTextAuthority,
+    ) -> Result<bool, BidiError> {
+        self.require_layout_source(authority)?;
+        Ok(matches!(self.resolution, Resolution::VisibleParagraphs(_)))
+    }
+
     /// 在原分析范围内消费完整Uniform的“无六种内联控制且level0”事实，不重新借正文。
     /// 数字范围可含低代理项；它不是可编辑端点证明，分项交付仍须检查原GCB边界。
     #[cfg(feature = "paged-shaping-frontier")]
@@ -419,6 +480,16 @@ impl MarkdownBidiParagraph {
         let valid = range.start <= range.end
             && range.start >= self.source.start
             && range.end <= self.source.end;
+        if let Resolution::VisibleParagraphs(visible) = &self.resolution {
+            if !valid {
+                self.require_layout_source(authority)?;
+                return Err(BidiError::InvalidRange);
+            }
+            // 子段证书只归属于其完整实际 B 范围，不能扩大为外层完整 Source 的 level0。
+            return visible
+                .range(&range)?
+                .uniform_control_free_span(authority, range);
+        }
         let paragraph_range = match &self.resolution {
             Resolution::UniformZero(certificate) if certificate.control_free() => {
                 Some((self.source.clone(), self.source.end))
@@ -426,7 +497,19 @@ impl MarkdownBidiParagraph {
             Resolution::UniformZero(certificate)
                 if certificate.paragraphs && certificate.interior_controls_absent =>
             {
-                certificate.paragraph.control_free(&range)
+                certificate
+                    .paragraph
+                    .control_free(&range)
+                    .map(|(paragraph, content_end)| {
+                        // Frozen游标定位的是同snapshot完整B段；公开分析入口也允许从其正文
+                        // 中部开始。可消费的段仍只到原分析权限两端，不能把snapshot外侧
+                        // 上下文授给开放Script或ascii_suffix当作自己的paragraph范围。
+                        (
+                            paragraph.start.max(self.source.start)
+                                ..paragraph.end.min(self.source.end),
+                            content_end.min(self.source.end),
+                        )
+                    })
             }
             _ => None, // Paged及未证明的六种内联控制保持原查询；level0不授予GCB或字体权限。
         };
@@ -460,6 +543,7 @@ impl MarkdownBidiParagraph {
             return Err(BidiError::InvalidRange);
         }
         let result = match &mut self.resolution {
+            Resolution::VisibleParagraphs(_) => Err(BidiError::UnpreparedRange),
             Resolution::UniformZero(certificate)
                 if certificate.paragraphs && position < self.source.end =>
             {
@@ -473,6 +557,49 @@ impl MarkdownBidiParagraph {
             self.source_borrow_max = self.source_borrow_max.max(step.maximum_borrow);
         }
         self.require_layout_source(authority)?; // 元数据剪枝也保原Source/取消；真实lease失败先于候选结果。
+        result
+    }
+
+    /// 显式折叠的在途任务归原 Item；此处只把完整真实 B 段移入可跨线程的已封存结果。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(crate) fn prepare_layout_paragraph_range(
+        &mut self,
+        authority: &crate::MarkdownLayoutTextAuthority,
+        position: usize,
+        budget: MarkdownBidiPrepareBudget,
+        work: &mut MarkdownBidiVisiblePreparation,
+    ) -> Result<uniform::ParagraphPrepareStep, BidiError> {
+        self.require_layout_source(authority)?;
+        if budget.bytes == 0 || budget.scalars == 0 || budget.metadata_ops == 0 {
+            return Err(BidiError::InvalidBudget);
+        }
+        if position < self.source.start || position > self.source.end {
+            return Err(BidiError::InvalidRange);
+        }
+        let Resolution::VisibleParagraphs(visible) = &mut self.resolution else {
+            return self.prepare_uniform_paragraph_range(authority, position, budget);
+        };
+        let result = if position == self.source.end {
+            Ok(uniform::ParagraphPrepareStep::ready())
+        } else {
+            visible.step(
+                self.layout_source
+                    .as_ref()
+                    .ok_or(BidiError::SourceMismatch)?,
+                &self._snapshot,
+                authority,
+                position,
+                budget,
+                work,
+            )
+        };
+        if let Ok(step) = &result {
+            self.source_borrow_max = self.source_borrow_max.max(step.maximum_borrow);
+        }
+        if let Err(error) = &result {
+            visible.remember_failure(error);
+        }
+        self.require_layout_source(authority)?;
         result
     }
 
@@ -500,24 +627,34 @@ impl MarkdownBidiParagraph {
             } // 公共同步API仍拒绝代理项内部；范围事实不能替代scalar边界。
             self._snapshot.original_backing_health()?;
             self.resolution.healthy()?;
-            return Ok(Some(range));
+            // 部分分析仍可从snapshot真实B中部开始；公开段范围只交回该分析实际拥有的交集。
+            return Ok(Some(
+                range.start.max(self.source.start)..range.end.min(self.source.end),
+            ));
         }
         while certificate.paragraph.range_at(position).is_none() {
-            let step = certificate.paragraph.step(
-                &self._snapshot,
-                position,
-                MarkdownBidiPrepareBudget {
-                    bytes: 4096,
-                    scalars: 256,
-                    metadata_ops: 256,
-                },
-            )?;
+            let step = certificate
+                .paragraph
+                .step(
+                    &self._snapshot,
+                    position,
+                    MarkdownBidiPrepareBudget {
+                        bytes: 4096,
+                        scalars: 256,
+                        metadata_ops: 256,
+                    },
+                )
+                .map_err(|cause| match cause {
+                    // 首次定位和已知范围命中共用公开的标量边界错误；真实文件错误仍保原Source链。
+                    BidiError::Source(cause) => scalar_endpoint_error(cause),
+                    other => other,
+                })?;
             self.source_borrow_max = self.source_borrow_max.max(step.maximum_borrow);
         } // 同步API原本允许完成有限元数据查询；没有新增整段缓冲、Reader或另一份段规则。
         let range = certificate.paragraph.range_at(position);
         self._snapshot.original_backing_health()?;
         self.resolution.healthy()?;
-        Ok(range)
+        Ok(range.map(|range| range.start.max(self.source.start)..range.end.min(self.source.end)))
     }
 
     pub fn source_range(&self) -> Range<usize> {
@@ -566,6 +703,11 @@ impl MarkdownBidiParagraph {
                 self.source.start + paragraph.start as usize
                     ..self.source.start + paragraph.end as usize
             }
+            #[cfg(feature = "paged-shaping-frontier")]
+            Resolution::VisibleParagraphs(visible) => visible
+                .character_mut(offset)?
+                .paragraph_range_at_utf16(offset)?
+                .ok_or(BidiError::CorruptMetadata)?,
         };
         self._snapshot.original_backing_health()?;
         self.resolution.healthy()?; // 元数据IO后的同一源/取消复核，不能发布撤权前找到的候选。
@@ -615,6 +757,11 @@ impl MarkdownBidiParagraph {
                     }
                 }
             }
+            #[cfg(feature = "paged-shaping-frontier")]
+            Resolution::VisibleParagraphs(visible) => visible
+                .character_mut(offset)?
+                .paragraph_base_level_at_utf16(offset)?
+                .ok_or(BidiError::CorruptMetadata)?,
         };
         self._snapshot.original_backing_health()?;
         self.resolution.healthy()?;
@@ -634,10 +781,64 @@ impl MarkdownBidiParagraph {
             // level是每UTF16单位事实；低代理项仍与head共享0，不把它当成run合法端点。
             Resolution::UniformZero(_) => 0,
             Resolution::Paged(store) => Text::read(store, relative as u32)?.level,
+            #[cfg(feature = "paged-shaping-frontier")]
+            Resolution::VisibleParagraphs(visible) => {
+                visible.character_mut(index)?.level_at_utf16(index)?
+            }
         };
         self._snapshot.original_backing_health()?;
         self.resolution.healthy()?;
         Ok(level)
+    }
+
+    /// 从原 General UBA 记录同时借真实级别、标量头和 byte 坐标；每次仅一次 Text 记录读取。
+    /// Uniform 没有该记录域，明确返回 None，由原聚合分项保留既有零级快速路径。
+    #[cfg(feature = "paged-line-compose")]
+    pub(crate) fn shaping_unit_at_utf16(
+        &mut self,
+        authority: &crate::MarkdownLayoutTextAuthority,
+        index: usize,
+    ) -> Result<Option<MarkdownBidiShapingUnit>, BidiError> {
+        self.require_layout_source(authority)?;
+        let relative = index
+            .checked_sub(self.source.start)
+            .ok_or(BidiError::InvalidRange)?;
+        if relative >= self.units as usize {
+            return Err(BidiError::InvalidRange);
+        }
+        let source_bytes = self
+            .layout_source
+            .as_ref()
+            .expect("原 require_layout_source 已确认本次真实布局来源")
+            .byte_len();
+        let value = match &mut self.resolution {
+            Resolution::UniformZero(_) => None,
+            Resolution::Paged(store) => {
+                let value = Text::read(store, relative as u32)?;
+                let byte = value.byte as usize;
+                // 宽度来自同一次原 UTF8 捕获；不是用 UTF16 长度推测，也不读未来段的首记录。
+                let byte_end = byte
+                    .checked_add(usize::from((value.flags >> 4) & 3) + 1)
+                    .ok_or(BidiError::CoordinateOverflow)?;
+                if byte_end > source_bytes {
+                    return Err(BidiError::CorruptMetadata);
+                }
+                Some(MarkdownBidiShapingUnit {
+                    source: authority.clone(),
+                    utf16: index,
+                    byte,
+                    byte_end,
+                    level: value.level,
+                    continuation: value.continuation(),
+                })
+            }
+            #[cfg(feature = "paged-shaping-frontier")]
+            Resolution::VisibleParagraphs(visible) => visible
+                .character_mut(index)?
+                .shaping_unit_at_utf16(authority, index)?,
+        };
+        self.require_layout_source(authority)?; // 元数据 I/O 之后同样保原 Source 首错与原取消位。
+        Ok(value)
     }
 
     /// 顺序交付逻辑run的Copy候选；调用方只能在本次返回Ok后提交这一批事实。
@@ -664,6 +865,19 @@ impl MarkdownBidiParagraph {
                 return cancellation.check();
             }
             Resolution::Paged(store) => store,
+            #[cfg(feature = "paged-shaping-frontier")]
+            Resolution::VisibleParagraphs(visible) => {
+                let range = self.source.start + relative.start as usize
+                    ..self.source.start + relative.end as usize;
+                let result = if range.is_empty() && range.start == self.source.end {
+                    Ok(())
+                } else {
+                    visible.range_mut(&range)?.visit_logical_runs(range, visit)
+                };
+                self._snapshot.original_backing_health()?;
+                self.resolution.healthy()?;
+                return result;
+            }
         };
         let mut at = relative.start;
         while at < relative.end {
@@ -721,6 +935,14 @@ impl MarkdownBidiParagraph {
                     visit,
                 )?;
             }
+            #[cfg(feature = "paged-shaping-frontier")]
+            Resolution::VisibleParagraphs(visible) => {
+                let range = self.source.start + relative.start as usize
+                    ..self.source.start + relative.end as usize;
+                if !(range.is_empty() && range.start == self.source.end) {
+                    visible.range_mut(&range)?.visit_visual_runs(range, visit)?;
+                }
+            }
         }
         self._snapshot.original_backing_health()?;
         self.resolution.healthy()
@@ -730,6 +952,8 @@ impl MarkdownBidiParagraph {
         let (cache_bytes, page_loads) = match &self.resolution {
             Resolution::UniformZero(_) => (0, 0),
             Resolution::Paged(store) => (store.cache_bytes(), store.page_loads),
+            #[cfg(feature = "paged-shaping-frontier")]
+            Resolution::VisibleParagraphs(visible) => visible.storage(),
         }; // 资源事实按真实表示报告；Uniform不能冒充配置过但实际不存在的1MiB缓存。
         MarkdownBidiStorageProfile {
             cache_bytes,
@@ -773,6 +997,16 @@ impl MarkdownBidiParagraph {
                         return Err(BidiError::InvalidScalarBoundary); // run不能拆开代理对，即使level_at允许观察低项。
                     }
                 }
+            }
+            #[cfg(feature = "paged-shaping-frontier")]
+            Resolution::VisibleParagraphs(visible) => {
+                let range = self.source.start + start as usize..self.source.start + end as usize;
+                visible.require_range(&range)?;
+                if !(range.is_empty() && range.start == self.source.end) {
+                    visible.range_mut(&range)?.checked_range(range)?;
+                }
+                self._snapshot.original_backing_health()?;
+                self.resolution.healthy()?;
             }
         }
         Ok(start..end)

@@ -66,6 +66,20 @@ impl MarkdownPresentationMode {
 pub struct MarkdownPresentationStyles(u32);
 
 impl MarkdownPresentationStyles {
+    /// 内部封存记录按原固定32位样式保存；这不是额外的语义解析入口。
+    pub(crate) const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// 封存格式只恢复已声明的31个语义位；保留位被污染时拒绝原记录，不静默去掉未知样式。
+    pub(crate) const fn from_bits(bits: u32) -> Option<Self> {
+        if bits & (1 << 31) != 0 {
+            None
+        } else {
+            Some(Self(bits))
+        }
+    }
+
     pub const HEADING_1: Self = Self(1 << 0);
     pub const HEADING_2: Self = Self(1 << 1);
     pub const HEADING_3: Self = Self(1 << 2);
@@ -158,6 +172,13 @@ pub struct MarkdownPresentationRun {
 pub struct MarkdownPresentationQuery {
     pub utf16_range: Range<usize>,
     pub styles: MarkdownPresentationStyles,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// 原 Parser 已解析的可见链接；目标经过原 escape/entity 规则，范围仍属于 canonical UTF16。
+pub struct MarkdownSourceLink {
+    pub label_utf16_range: Range<usize>,
+    pub destination: String,
 }
 
 /// Parser确认的无序列表原字符；glyph消费者不能据此改写正文。
@@ -533,7 +554,7 @@ impl MarkdownViewportPresentation {
 }
 
 /// 当前缓存和 Native 已借出的快照复用同一个纯查询，返回范围始终受原发布覆盖限制。
-fn query_published_runs(
+pub(crate) fn query_published_runs(
     runs: &[MarkdownPresentationRun],
     window: &Range<usize>,
     utf16_index: usize,

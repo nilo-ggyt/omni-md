@@ -41,9 +41,9 @@ use crate::ot::shaper::*;
 use crate::ot::*;
 use crate::plan::ShapePlan;
 use crate::unicode::{CharExt, GeneralCategory};
+use crate::{fallback, normalize};
 use crate::{Advances, ShapeError, ShapeOptions, ShaperFont};
 use crate::{BufferFlags, ContentType, Direction, Feature, Mask, Script};
-use crate::{fallback, normalize};
 
 /// Runs a compiled plan using prepared layout data and effective font queries.
 pub(crate) fn shape_with_font(
@@ -116,7 +116,7 @@ impl OtShapeContext<'_, '_, '_> {
 
     // hb_ot_shape_internal: <https://github.com/harfbuzz/harfbuzz/blob/22ea52f42fa4fc168be91ef4e56aee3affda6e28/src/hb-ot-shape.cc#L1171>
     fn shape_internal(&mut self) -> Result<(), ShapeError> {
-        use crate::cooperative::{CooperativePhase as Phase, phase, poll_boundary};
+        use crate::cooperative::{phase, poll_boundary, CooperativePhase as Phase};
         self.buffer.allocate_unicode_vars();
         {
             let _phase = phase(Phase::Unicode);

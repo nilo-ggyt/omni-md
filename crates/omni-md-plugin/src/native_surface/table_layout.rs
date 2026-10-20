@@ -39,8 +39,16 @@ struct NativeMarkdownTablePhaseDiagnosticRow {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModeViewportPhase {
     Capturing,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     Changing,
     Ready(i64),
+}
+
+impl ModeViewportPhase {
+    /// 同图对照与正式新预览都由原executor消费Ready；捕获阶段没有布局后果。
+    fn is_ready(self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -144,6 +152,7 @@ fn mode_probe_belongs_to_window(
 }
 
 /// ruler可占clip中的负origin区域；交集只证明正文列完整可见，不产生新的语义宽度。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn mode_content_column_is_visible(bounds: NSRect, visible: NSRect, clip_in_view: NSRect) -> bool {
     if ![bounds, visible, clip_in_view]
         .into_iter()
@@ -259,9 +268,6 @@ pub(super) struct NativeMarkdownModeViewportRequest {
     applied_screen_y: Cell<Option<f64>>,
     /// 完整executor消费结果供原生probe核对；只有有限弱票据可延长到观察栈。
     completed: Cell<Option<bool>>,
-    /// 只在显式原生验收构建观察同一终点；默认产品不增加闭包槽或观察资源。
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    terminal_observer: crate::native_surface::probe::ProbeTerminalObserver,
     /// 队列在BORROWED期被撤销时只纯撤权，不能遗留Capturing槽阻挡后续布局。
     cancelled: Cell<bool>,
 }
@@ -273,117 +279,6 @@ pub(super) struct NativeMarkdownModeViewportContext {
     storage: Retained<PieceBackedMarkdownTextStorage>,
 }
 
-/// 弹出菜单首getter至deferred消费共用原弱票；MainThreadBound仅转运Rust弱元数据。
-pub(super) struct NativeMarkdownModeActionTicket {
-    owner: usize,
-    find_input: u64,
-    workspace_input: u64,
-    header: u64,
-    before: MarkdownPresentationMode,
-    request: Option<std::rc::Weak<NativeMarkdownModeViewportRequest>>,
-}
-
-impl NativeMarkdownModeActionTicket {
-    pub(super) fn cancel(&self) {
-        if let Some(request) = self.request.as_ref().and_then(std::rc::Weak::upgrade) {
-            // 只撤销原分配中的纯权限；不取当前 slot，也不影响新的模式目标。
-            request.cancelled.set(true);
-            request.completed.set(Some(false));
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            request.terminal_observer.notify(); // 原取消已落定，回调不持模式 slot 借用。
-        }
-    }
-    pub(super) fn empty(
-        controller: &NativeMarkdownController,
-        before: MarkdownPresentationMode,
-    ) -> Self {
-        Self {
-            owner: std::ptr::from_ref(controller).addr(),
-            find_input: controller.find_input_intent(),
-            workspace_input: controller.workspace_query_intent(),
-            header: controller.ivars().header_layout_revision.get(),
-            before,
-            request: None,
-        }
-    }
-
-    fn current_surface(&self, surface: &NativeMarkdownWindowSurface) -> bool {
-        let controller = &surface.controller;
-        if self.owner != std::ptr::from_ref(&**controller).addr()
-            || !native_markdown_controller_has_foreground_authority(controller)
-            || self.find_input != controller.find_input_intent()
-            || self.workspace_input != controller.workspace_query_intent()
-            || self.header != controller.ivars().header_layout_revision.get()
-            || self.before != surface.presentation_mode
-        {
-            // 任一原输入、窗口或模式身份改变，都不能给排队的旧源码按钮动作补发权限。
-            return false;
-        }
-        match (&surface.editor, &self.request) {
-            // 有正文时还须原请求仍占同 slot，并核同一 Weak 正文和精确文本代次。
-            (Some(editor), Some(request)) => request.upgrade().is_some_and(|request| {
-                request.is_current(
-                    &editor.backend.text_view,
-                    controller,
-                    &editor.backend.text_storage,
-                )
-            }),
-            // 原空态仍为空；这里只配置下一篇模式，不读取或假定正文位置。
-            (None, None) => true,
-            // 后来新开的笔记或已经释放的正文均不能继承旧空态或旧正文动作。
-            _ => false,
-        }
-    }
-
-    /// 只在队列交付的Active状态读取纯元数据，不在Native getter后重新捕获票据。
-    pub(super) fn is_current(&self) -> bool {
-        ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|surface| {
-            surface
-                .as_ref()
-                .is_some_and(|surface| self.current_surface(surface))
-        })
-    }
-
-    pub(super) fn read_destination(
-        &self,
-        surface: &NativeMarkdownWindowSurface,
-        sender: &AnyObject,
-    ) -> Result<MarkdownPresentationMode, String> {
-        if !self.current_surface(surface) {
-            // 类型查询也可能进入原生 runtime，第一次调用前即要求原动作权限。
-            return Err("展示模式动作已失效".into());
-        }
-        let button = sender.downcast_ref::<NSButton>();
-        if !self.current_surface(surface) {
-            // 类型查询的重入不能把新输入代次贴给旧sender。
-            return Err("展示模式动作已被新的输入撤销".into());
-        }
-        let button = button.ok_or("展示模式动作缺少原源码按钮")?;
-        let owned = surface
-            .controller
-            .ivars()
-            .presentation_mode_button
-            .get()
-            .expect("原窗口已安装源码按钮");
-        if !std::ptr::eq(button, &**owned) {
-            return Err("展示模式动作不属于原源码按钮".into()); // 外来按钮没有本窗口的模式发布权限。
-        }
-        let state = button.state();
-        if !self.current_surface(surface) {
-            // 实际状态getter返回后仍核同票，不重新捕获文档、选区或窗口权限。
-            return Err("展示模式选择期间笔记或输入已变更".into());
-        }
-        if state == objc2_app_kit::NSControlStateValueOn {
-            // 标准双态按钮已按下一次点击开启源码；失败补偿仍显示原已发布模式。
-            Ok(MarkdownPresentationMode::Source)
-        } else if state == objc2_app_kit::NSControlStateValueOff {
-            Ok(MarkdownPresentationMode::InlinePreview) // 同一按钮关闭源码，沿原事务回到实时预览。
-        } else {
-            Err("展示模式选择无效".into()) // Mixed等未知状态不得猜作默认模式。
-        }
-    }
-}
-
 /// Changing免除的仅是本次ruler输出宽度；文档/输入/窗口代次从未放宽。
 fn mode_viewport_phase_permits(
     stamp: ModeViewportStamp,
@@ -393,6 +288,7 @@ fn mode_viewport_phase_permits(
 ) -> bool {
     match phase {
         ModeViewportPhase::Capturing => mode == stamp.before && width == stamp.width,
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         ModeViewportPhase::Changing => mode == stamp.before || mode == stamp.after,
         ModeViewportPhase::Ready(expected) => mode == stamp.after && width == expected,
     }
@@ -412,16 +308,6 @@ fn mode_viewport_authority_permits(
 }
 
 impl NativeMarkdownModeViewportRequest {
-    /// 只观察本请求原终点；不重采 source、输入代次或 Native 所有者。
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    pub(super) fn observe_probe_terminal(
-        &self,
-        observer: impl FnOnce() + 'static,
-    ) -> Result<bool, String> {
-        self.terminal_observer
-            .observe(self.completed.get(), observer)
-    }
-
     #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn completed(&self) -> Option<bool> {
         self.completed.get()
@@ -503,38 +389,6 @@ impl NativeMarkdownModeViewportRequest {
 }
 
 impl NativeMarkdownModeViewportContext {
-    /// probe在原动作首Native前观察同一请求；返回值只有Weak正文与标量，不保活Native图。
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    pub(super) fn observe_request(&self) -> Rc<NativeMarkdownModeViewportRequest> {
-        Rc::clone(&self.request)
-    }
-    pub(super) fn action_ticket(&self) -> NativeMarkdownModeActionTicket {
-        let stamp = self.request.stamp.get();
-        NativeMarkdownModeActionTicket {
-            owner: stamp.owner,
-            find_input: stamp.find_input,
-            workspace_input: stamp.workspace_input,
-            header: stamp.header,
-            before: stamp.before,
-            request: Some(Rc::downgrade(&self.request)),
-        }
-    }
-
-    pub(super) fn set_action_destination(
-        &self,
-        view: &PieceBackedMarkdownTextView,
-        after: MarkdownPresentationMode,
-    ) -> bool {
-        if !self.is_current(view) || self.request.phase.get() != ModeViewportPhase::Capturing {
-            return false;
-        }
-        self.request.stamp.set(ModeViewportStamp {
-            after,
-            ..self.request.stamp.get()
-        });
-        true // 原slot/旧source/epoch均保持，只签发getter已认证的目标模式。
-    }
-
     fn is_current(&self, view: &PieceBackedMarkdownTextView) -> bool {
         self.request
             .is_current(view, &self.controller, &self.storage)
@@ -678,6 +532,7 @@ impl NativeMarkdownModeViewportContext {
     }
 
     /// 合法模式写入前进入明确转换阶段，随后只有本次ruler可输出新内容宽度。
+    #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn begin_change(&self, view: &PieceBackedMarkdownTextView) -> bool {
         if !self.is_current(view) || self.request.anchor.borrow().is_none() {
             return false;
@@ -692,6 +547,7 @@ impl NativeMarkdownModeViewportContext {
 
     /// 模式属性已写入后，ruler是同owner的必要UI补偿，不再授权旧source滚动。
     /// 新query可撤定位票，但不能令实际Preview仍留Source ruler；关闭/换doc仍严格拒绝。
+    #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn application_current(&self, view: &PieceBackedMarkdownTextView) -> bool {
         !view.ivars().textkit_graph_teardown.get()
             && self.storage.ivars().accepts_edits.get()
@@ -718,6 +574,7 @@ impl NativeMarkdownModeViewportContext {
     }
 
     /// 属性和ruler完成后仅粗定位原scalar/EOF，尚未签发Ready时不得消费最终布局。
+    #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn coarse_reveal_before_ready(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -739,6 +596,7 @@ impl NativeMarkdownModeViewportContext {
     }
 
     /// 只封本次受控ruler输出；窗口resize另有原header revision，不可在此重采。
+    #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn finish_change(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -828,8 +686,6 @@ impl PieceBackedMarkdownTextView {
             prepared: Cell::new(false),
             applied_screen_y: Cell::new(None),
             completed: Cell::new(None),
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            terminal_observer: crate::native_surface::probe::ProbeTerminalObserver::default(),
             cancelled: Cell::new(false),
         });
         // 旧slot只有Rust Weak/标量；先换出再drop，模式ABA不能复活旧局部目标。
@@ -1156,7 +1012,14 @@ impl PieceBackedMarkdownTextView {
             Ok(offset..end)
         };
         let mut anchor = None;
-        if let Ok(selection) = context.native_step(self, || self.primary_text_selection())? {
+        if let Ok(selection) = context
+            .native_step(self, || self.primary_text_selection())?
+            .inspect_err(|_error| {
+                #[cfg(feature = "native-markdown-runtime-probe")]
+                // 只报告原查询已有的选择失败；不为capture另读caret或把canonical当作已显示的Native选择。
+                eprintln!("native_mode_capture_failure stage=primary_selection error={_error}");
+            })
+        {
             // 主选择已由公开TK2信息证明；这里只取其范围起点用于几何，不改anchor/head方向。
             let offset = selection
                 .selection
@@ -1167,7 +1030,11 @@ impl PieceBackedMarkdownTextView {
                 // 仅记录原选择候选的坐标；不输出码元或重新读取正文来诊断边界。
                 eprintln!("native_mode_capture_failure stage=selection_scalar error={_error:?} candidate={offset} source={}..{} length={length}", source_window.start, source_window.end);
             })?;
-            if let Ok(frame) = self.source_probe_segment(&probe, &current) {
+            if let Ok(frame) = self.source_probe_segment(&probe, &current).inspect_err(|_error| {
+                #[cfg(feature = "native-markdown-runtime-probe")]
+                // 同一个实际主scalar的已有失败归因，不能让后续line候选掩盖其资源/几何来源。
+                eprintln!("native_mode_capture_failure stage=primary_segment error={_error:?} candidate={}..{} source={}..{}", probe.start, probe.end, source_window.start, source_window.end);
+            }) {
                 let clip = context.native_step(self, || self.visibleRect())?;
                 if mode_probe_is_visible(frame, clip) {
                     #[cfg(feature = "native-markdown-runtime-probe")]
@@ -1261,8 +1128,6 @@ impl PieceBackedMarkdownTextView {
         let previous = self.ivars().mode_viewport.borrow_mut().take();
         if let Some(previous) = previous.as_ref() {
             previous.completed.set(Some(false));
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            previous.terminal_observer.notify(); // 已结束 slot 借用；取消 false 也唤醒原验证一次。
         }
         drop(previous);
     }
@@ -1276,6 +1141,7 @@ impl PieceBackedMarkdownTextView {
             .as_ref()
             .is_some_and(|request| match request.phase.get() {
                 ModeViewportPhase::Capturing => request.stamp.get().width != metric,
+                #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
                 ModeViewportPhase::Changing => false, // 原窗口revision仍固定，本动作ruler可输出一次新宽。
                 ModeViewportPhase::Ready(expected) => expected != metric,
             });
@@ -1297,8 +1163,6 @@ impl PieceBackedMarkdownTextView {
             && previous.completed.get().is_none()
         {
             previous.completed.set(Some(false));
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            previous.terminal_observer.notify();
         }
         drop(previous);
     }
@@ -1311,7 +1175,7 @@ impl PieceBackedMarkdownTextView {
             .borrow()
             .as_ref()
             .map(Rc::clone)?;
-        if !matches!(request.phase.get(), ModeViewportPhase::Ready(_)) {
+        if !request.phase.get().is_ready() {
             return None;
         }
         if !request.slot_is_current(self) {
@@ -1369,8 +1233,6 @@ impl PieceBackedMarkdownTextView {
             context.fail(self);
         } else {
             context.request.completed.set(Some(true));
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            context.request.terminal_observer.notify(); // 沿原完整认证成功点发信号，不改变认证条件。
             self.remove_mode_viewport_if_same(&context.request);
         }
     }
@@ -1383,7 +1245,7 @@ impl PieceBackedMarkdownTextView {
     ) -> Result<(), NativeMarkdownStableTableFailure> {
         use NativeMarkdownStableTableFailure as Failure;
         if context.request.stamp.get().length == 0 {
-            return self.position_mode_viewport(context);
+            return self.position_mode_viewport(context, None);
         }
         self.ensure_stable_table_source_range(&context.probe(), current)?;
         let manager = native_markdown_table_intent_step(current, || self.textLayoutManager())?
@@ -1391,13 +1253,14 @@ impl PieceBackedMarkdownTextView {
         let viewport =
             native_markdown_table_intent_step(current, || manager.textViewportLayoutController())?;
         native_markdown_table_intent_step(current, || viewport.layoutViewport())?;
-        self.position_mode_viewport(context)
+        self.position_mode_viewport(context, None)
     }
 
     /// 目标高度确定后恢复同一源scalar的屏幕位置；只用公开clip约束处理EOF边界。
     fn position_mode_viewport(
         &self,
         context: &NativeMarkdownModeViewportContext,
+        tables: Option<&[NativeMarkdownVisibleTableLayout]>,
     ) -> Result<(), NativeMarkdownStableTableFailure> {
         use NativeMarkdownStableTableFailure as Failure;
         if context.request.stamp.get().length == 0 {
@@ -1412,10 +1275,17 @@ impl PieceBackedMarkdownTextView {
             if raster_active {
                 // 光栅正文不安装系统 glyph surface；先用原全局源位置更新公开 viewport 锚点，
                 // 不能把尚未完整布局的绝对 y 当作下一次 viewport 的稳定文档坐标。
-                self.relocate_raster_mode_viewport(context, &probe)?;
+                self.relocate_mode_viewport(context, &probe)?;
             }
         }
-        let frame = self.source_probe_segment(&probe, &current)?;
+        let frame = match tables
+            .map(|tables| native_markdown_table_scalar_frame(tables, &probe))
+            .transpose()?
+            .flatten()
+        {
+            Some(frame) => frame,
+            None => self.source_probe_segment(&probe, &current)?,
+        };
         let visible = context.native_step(self, || self.visibleRect())?;
         let screen_y = context
             .request
@@ -1457,12 +1327,15 @@ impl PieceBackedMarkdownTextView {
         }
         drop(clip);
         drop(scroll);
-        self.verify_mode_viewport(context)
+        if tables.is_some() {
+            Ok(()) // 自有scroll可能兑现新行高；原有第二矩阵/最多两批随后以真实cell glyph完成认证。
+        } else {
+            self.verify_mode_viewport(context)
+        }
     }
 
-    #[cfg(feature = "native-raster-surface-probe")]
     /// 只移动同一次模式动作的真实 Native 源锚点，不扩大 ensure 范围或重新签发输入权限。
-    fn relocate_raster_mode_viewport(
+    fn relocate_mode_viewport(
         &self,
         context: &NativeMarkdownModeViewportContext,
         probe: &std::ops::Range<usize>,
@@ -2027,11 +1900,21 @@ impl PieceBackedMarkdownTextView {
                 }
             };
             native_markdown_table_intent_step(&is_current, || viewport.layoutViewport())?;
+            if mode.is_some() {
+                // 可见glyph属于真实行中的CTFrame，先认证/更新有限候选矩阵，不能先使用零Y或行占位框。
+                self.resolve_stable_table_matrix(
+                    storage,
+                    &snapshot,
+                    &mut tables,
+                    &working,
+                    &is_current,
+                )?;
+            }
             let positioned = if let Some(reveal) = reveal {
                 // 同一批行高已发布且唯一连续ensure已完成；目标segment取代当前顶部旧锚点。
                 self.position_find_reveal(reveal)
             } else if let Some(mode) = mode {
-                self.position_mode_viewport(mode)
+                self.position_mode_viewport(mode, Some(&tables))
             } else if let Some(anchor) = anchor {
                 self.restore_stable_table_anchor(anchor, &is_current)
             } else {
@@ -2069,7 +1952,32 @@ impl PieceBackedMarkdownTextView {
                     &is_current,
                 )
             })??; // 剩余全部可见行仍过原两遍身份、几何、连续性门，任何可见缺口照常失败。
-            let covered = current.start >= snapshot.utf16_window.start
+            // 原矩阵getter也可能兑现TextKit延迟几何；用后读的实际clip核同批位置，变化交原第二批。
+            let actual_visible =
+                native_markdown_table_intent_step(&is_current, || self.visibleRect())?;
+            let mode_stable = if let Some(mode) = mode {
+                let probe = mode.probe();
+                let frame = match native_markdown_table_scalar_frame(&tables, &probe)? {
+                    Some(frame) => frame,
+                    None => self.source_probe_segment(&probe, &is_current)?, // 目标是同视口普通正文时仍用其原Native字形。
+                };
+                let actual_y = frame.origin.y - actual_visible.origin.y;
+                let expected_y = mode
+                    .request
+                    .applied_screen_y
+                    .get()
+                    .ok_or(Failure::AnchorUnavailable)?;
+                mode_probe_is_visible(frame, actual_visible)
+                    && (actual_y - expected_y).abs() <= 0.5
+                    && (actual_visible.origin.x - visible.origin.x).abs() <= 0.01
+                    && (actual_visible.origin.y - visible.origin.y).abs() <= 0.01
+                    && (actual_visible.size.width - visible.size.width).abs() <= 0.01
+                    && (actual_visible.size.height - visible.size.height).abs() <= 0.01
+            } else {
+                true
+            };
+            let covered = mode_stable
+                && current.start >= snapshot.utf16_window.start
                 && current.end <= snapshot.utf16_window.end
                 && snapshot
                     .tables()
@@ -2118,9 +2026,7 @@ impl PieceBackedMarkdownTextView {
                 anchor.map_or(0.0, |value| value.screen_y)
             );
             if covered {
-                if let Some(mode) = mode {
-                    self.verify_mode_viewport(mode)?;
-                }
+                // mode_stable已用本批同源CTFrame认证；最终原executor将在发布cache后再独立复核。
                 if let Some(anchor) = anchor {
                     native_markdown_table_intent_step(&is_current, || {
                         self.verify_stable_table_anchor(anchor)
@@ -3228,7 +3134,7 @@ impl PieceBackedMarkdownTextView {
             .mode_viewport
             .borrow()
             .as_ref()
-            .is_some_and(|request| !matches!(request.phase.get(), ModeViewportPhase::Ready(_)))
+            .is_some_and(|request| !request.phase.get().is_ready())
         {
             // 同步转换的Native回调不能提前消费半成品；本动作结束时会正常调度唯一任务。
             self.ivars().table_layout_update_scheduled.set(false);
@@ -6084,59 +5990,6 @@ mod mode_viewport_tests {
                 invalid
             ));
         }
-    }
-
-    #[test]
-    fn queued_cancellation_cannot_cancel_successor_or_resurrect_old_request() {
-        // 票据只弱观察原目标；取消不需要 Native 对象，也不能触及后来建立的 slot。
-        let request = || {
-            Rc::new(NativeMarkdownModeViewportRequest {
-                document: WeakMarkdownDocument::new(),
-                stamp: Cell::new(source_stamp()),
-                phase: Cell::new(ModeViewportPhase::Capturing),
-                anchor: RefCell::new(None),
-                prepared: Cell::new(false),
-                applied_screen_y: Cell::new(None),
-                completed: Cell::new(None),
-                #[cfg(feature = "native-markdown-runtime-probe")]
-                terminal_observer: crate::native_surface::probe::ProbeTerminalObserver::default(),
-                cancelled: Cell::new(false),
-            })
-        };
-        let old = request();
-        let successor = request();
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        let terminal_calls = Rc::new(Cell::new(0));
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        {
-            let calls = Rc::clone(&terminal_calls);
-            assert!(
-                !old.observe_probe_terminal(move || calls.set(calls.get() + 1))
-                    .unwrap()
-            );
-        }
-        let ticket = NativeMarkdownModeActionTicket {
-            owner: 7,
-            find_input: 30,
-            workspace_input: 50,
-            header: 40,
-            before: MarkdownPresentationMode::Source,
-            request: Some(Rc::downgrade(&old)),
-        };
-        ticket.cancel();
-        assert!(old.cancelled.get());
-        assert_eq!(old.completed.get(), Some(false));
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        assert_eq!(terminal_calls.get(), 1); // 原取消实际触发一次，不能由后继请求代签。
-        assert!(!successor.cancelled.get());
-        assert_eq!(successor.completed.get(), None);
-        // 原请求释放后再次取消不会复活资源，也不改变后继目标的状态。
-        drop(old);
-        assert!(ticket.request.as_ref().unwrap().upgrade().is_none());
-        ticket.cancel();
-        assert!(!successor.cancelled.get());
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        assert_eq!(terminal_calls.get(), 1);
     }
 
     #[test]

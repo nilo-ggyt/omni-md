@@ -12,58 +12,6 @@ pub(in crate::native_surface) struct NativeMarkdownTableCellCommit {
     pub(in crate::native_surface) field_anchor: Option<usize>,
 }
 
-/// 只处理已准入的一格原始草稿；标记来自 Core，UTF16 选择必须位于真实 scalar 边界。
-fn format_table_cell_input(
-    source: &str,
-    selection: NSRange,
-    action: MarkdownFormatAction,
-) -> Result<(String, std::ops::Range<usize>), String> {
-    let (opening, closing, placeholder) = action.inline_markers().ok_or("该格式需要正文块位置")?;
-    let end = selection
-        .location
-        .checked_add(selection.length)
-        .ok_or("格内选择溢出")?;
-    let mut units = 0;
-    let mut start_byte = None;
-    let mut end_byte = None;
-    for (byte, scalar) in source.char_indices() {
-        // 从同一有限字段逐 scalar 换算两个真实端点；不把 UTF16 索引误作 UTF8 字节索引。
-        if units == selection.location {
-            start_byte = Some(byte);
-        }
-        if units == end {
-            end_byte = Some(byte);
-        }
-        units += scalar.len_utf16();
-    }
-    if units == selection.location {
-        start_byte = Some(source.len()); // 文本尾 caret 是合法边界。
-    }
-    if units == end {
-        end_byte = Some(source.len());
-    }
-    let (start_byte, end_byte) = start_byte.zip(end_byte).ok_or("格内选择不在有效文字边界")?;
-    let inner = if selection.length == 0 {
-        placeholder // 空 caret 沿原命令选择占位文字，不格式化整格。
-    } else {
-        &source[start_byte..end_byte] // 非空选择只包裹实际选中的原 Unicode 字节。
-    };
-    let extra = if selection.length == 0 {
-        inner.len()
-    } else {
-        0
-    };
-    let mut formatted = String::with_capacity(source.len() + opening.len() + closing.len() + extra);
-    formatted.push_str(&source[..start_byte]);
-    formatted.push_str(opening);
-    let inner_start = selection.location + opening.encode_utf16().count();
-    formatted.push_str(inner);
-    let inner_end = inner_start + inner.encode_utf16().count();
-    formatted.push_str(closing);
-    formatted.push_str(&source[end_byte..]);
-    native_markdown_sanitize_table_cell_input_with_selection(&formatted, inner_start..inner_end)
-}
-
 impl PieceBackedMarkdownTextView {
     /// 普通提交和模式前置提交均须拥有活动格的真实窗口；不会同步解析整个表来补权限。
     pub(super) fn commit_verified_table_cell(
@@ -71,7 +19,7 @@ impl PieceBackedMarkdownTextView {
         mode: Option<&super::super::table_layout::NativeMarkdownModeViewportContext>,
         request: Option<&NativeMarkdownTableCellRequest>,
     ) -> Result<bool, String> {
-        self.commit_verified_table_cell_result(mode, request, None, false, &|| true, &|_| {})
+        self.commit_verified_table_cell_result(mode, request, false, &|| true, &|_| {})
             .map(|result| result.changed)
     }
 
@@ -82,7 +30,6 @@ impl PieceBackedMarkdownTextView {
         on_selection_committed: &impl Fn(&Rc<NativeMarkdownCommittedSelection>),
     ) -> Result<NativeMarkdownTableCellCommit, String> {
         self.commit_verified_table_cell_result(
-            None,
             None,
             None,
             false,
@@ -96,31 +43,13 @@ impl PieceBackedMarkdownTextView {
         &self,
         origin_current: &impl Fn() -> bool,
     ) -> Result<NativeMarkdownTableCellCommit, String> {
-        self.commit_verified_table_cell_result(None, None, None, true, origin_current, &|_| {})
-    }
-
-    /// 格内行内格式与未提交草稿共用一次真实单格计划；原字段选择不落回旧正文 caret。
-    pub(in crate::native_surface) fn format_table_cell_for_menu(
-        &self,
-        intent: &NativeMarkdownWorkspaceEditIntent,
-        action: MarkdownFormatAction,
-    ) -> Result<(), String> {
-        self.commit_verified_table_cell_result(
-            None,
-            None,
-            Some((intent, action)),
-            false,
-            &|| intent.current(), // 原菜单的正文/窗口权限跨到结束尾部，不以已辞任的 field editor 续权。
-            &|receipt| intent.accept_table_commit(receipt),
-        )
-        .map(|_| ())
+        self.commit_verified_table_cell_result(None, None, true, origin_current, &|_| {})
     }
 
     fn commit_verified_table_cell_result(
         &self,
         mode: Option<&super::super::table_layout::NativeMarkdownModeViewportContext>,
         request: Option<&NativeMarkdownTableCellRequest>,
-        format: Option<(&NativeMarkdownWorkspaceEditIntent, MarkdownFormatAction)>,
         map_field_anchor: bool,
         origin_current: &impl Fn() -> bool,
         on_selection_committed: &impl Fn(&Rc<NativeMarkdownCommittedSelection>),
@@ -129,18 +58,13 @@ impl PieceBackedMarkdownTextView {
         let pending_tail = RefCell::new(None); // 正常字段结束、body after 和全部 Native claim 析构共用同原 owner。
         let epoch = self.ivars().table_input_intent_epoch.get();
         let fold = self.ivars().folds.revision();
-        let selection_capture = match format {
-            Some((intent, _)) => intent.source_capture(), // 格内菜单必须消费首 getter 前的原正文 before。
-            None => self
-                .ivars()
-                .folds
-                .capture_selection()
-                .map_err(|error| error.to_string())?,
-        };
+        // 独立 TextKit 机制夹具仍由其真实 fold 选择授予提交；正式菜单只消费分页 Input。
+        let selection_capture = self
+            .ivars()
+            .folds
+            .capture_selection()
+            .map_err(|error| error.to_string())?;
         let Some(state) = self.ivars().active_table_cell.borrow().clone() else {
-            if format.is_some() {
-                return Err("原表格单元格已经结束，格式操作已取消".into());
-            } // 不能把已丢失的格内命令降为正文格式或成功空操作。
             return Ok(NativeMarkdownTableCellCommit {
                 changed: false,
                 edit: None,
@@ -163,10 +87,6 @@ impl PieceBackedMarkdownTextView {
                 || self.ivars().table_input_intent_epoch.get() != epoch
             {
                 return false;
-            }
-            if !ending.get() && format.is_some_and(|(intent, _)| !intent.table_input_current(self))
-            {
-                return false; // 结束阶段开始前必须保持原真实格内选择；之后由同一源票约束 abort/隐藏。
             }
             if request
                 .is_some_and(|request| !self.ivars().pending_table_cell_activation.owns(request))
@@ -258,9 +178,6 @@ impl PieceBackedMarkdownTextView {
         };
         check_click_selection()?; // 任何 IME 确认之前先核原字段范围，未知外来选择不被提交。
         if let Some(actual) = actual.as_ref() {
-            if let Some((intent, _)) = format {
-                intent.table_selection_for(self, actual)?; // IME 确认前先核原实际 editor 与子选区。
-            }
             let input = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**actual);
             if native_markdown_table_intent_step(&current, || input.hasMarkedText())
                 .map_err(|_| expired())?
@@ -286,20 +203,11 @@ impl PieceBackedMarkdownTextView {
                 || editor.validateEditing(),
             )?;
         } else {
-            if format.is_some() {
-                return Err("原表格字段已不再编辑，草稿将保持打开".into());
-            } // 无实际 field editor 就没有格内选择，不能猜一个全格或正文范围。
             native_markdown_table_intent_step(&current, || editor.validateEditing())
                 .map_err(|_| expired())?;
         }
-        let field_selection = match format {
-            Some((intent, _)) => {
-                Some(intent.table_selection_for(self, actual.as_ref().ok_or_else(expired)?)?)
-            }
-            None => None, // 普通提交只使用既有 caret after，不读取无关字段选择。
-        }; // unmark/validate 只确认同一文本；若同时移动选区就撤销旧菜单，不借新选择续命。
         check_click_selection()?; // Unmark/Validate 只准确认同一范围；不能借后继新 caret 重签旧点击。
-        let (replacement, cell_selection_after, sanitized_anchor) = (|| {
+        let (replacement, sanitized_anchor) = (|| {
             let value = native_markdown_table_intent_step(&current, || editor.stringValue())
                 .map_err(|_| expired())?;
             if native_markdown_table_intent_step(&current, || value.length())
@@ -313,30 +221,18 @@ impl PieceBackedMarkdownTextView {
                 let text =
                     native_markdown_table_intent_step(&current, || unsafe { value.to_str(pool) })
                         .map_err(|_| expired())?;
-                match (format, field_selection) {
-                    (Some((_, action)), Some(selection)) => {
-                        let (replacement, selection) =
-                            format_table_cell_input(text, selection, action)?;
-                        Ok((replacement, Some(selection), None))
-                    }
-                    _ => {
-                        if let Some(selection) = click_selection {
-                            let (replacement, mapped) =
-                                native_markdown_sanitize_table_cell_input_with_selection(
-                                    text,
-                                    selection.anchor_utf16..selection.anchor_utf16,
-                                )?;
-                            Ok((replacement, None, Some(mapped.start))) // 同次实际 escape/trim 输出带回 anchor，不复制字段。
-                        } else {
-                            Ok((native_markdown_sanitize_table_cell_input(text), None, None)) // 原普通提交保持原序列化。
-                        }
-                    }
+                if let Some(selection) = click_selection {
+                    let (replacement, mapped) =
+                        native_markdown_sanitize_table_cell_input_with_selection(
+                            text,
+                            selection.anchor_utf16..selection.anchor_utf16,
+                        )?;
+                    Ok((replacement, Some(mapped.start))) // 同次 escape/trim 带回真实 anchor。
+                } else {
+                    Ok((native_markdown_sanitize_table_cell_input(text), None))
                 }
             })
         })()?;
-        if let (Some((intent, _)), Some(actual)) = (format, actual.as_ref()) {
-            intent.table_selection_for(self, actual)?; // stringValue/UTF16 借用返回后仍是原选区才准入计划。
-        }
         check_click_selection()?;
         drop(actual); // 字段局部Nativeclaims析构后重新核原动作，不能继承析构中出现的新输入。
         if !current() {
@@ -399,7 +295,7 @@ impl PieceBackedMarkdownTextView {
                         .clone()
                 }
             };
-            let (plan, baseline, selection_after) = {
+            let (plan, baseline) = {
                 let document = document.borrow();
                 authority.source_range(&document, state.coordinate)?;
                 let plan = document
@@ -425,18 +321,7 @@ impl PieceBackedMarkdownTextView {
                 if let Some(anchor) = sanitized_anchor {
                     field_anchor.set(Some(start.checked_add(anchor).ok_or("表格选择溢出")?));
                 } // implicit-empty 前缀只由本计划补一次；不拿旧 cell.start 猜新锚点。
-                let selection_after = cell_selection_after
-                    .as_ref()
-                    .map(|selection| {
-                        Ok::<_, String>(MarkdownTextSelection {
-                            anchor_utf16: start
-                                .checked_add(selection.start)
-                                .ok_or("表格选择溢出")?,
-                            head_utf16: start.checked_add(selection.end).ok_or("表格选择溢出")?,
-                        })
-                    })
-                    .transpose()?;
-                (plan, start..end, selection_after)
+                (plan, start..end)
             };
             let mode_accepted = Cell::new(true);
             // 单格字段与正文各有自己的选择；把原票下实际正文 before 传到同一次字符提交。
@@ -446,7 +331,7 @@ impl PieceBackedMarkdownTextView {
                 &captured,
                 |document| {
                     plan.replacement_for(document)
-                        .map(|(range, text)| (range, text, selection_after))
+                        .map(|(range, text)| (range, text, None))
                         .map_err(|_| expired())
                 },
                 &current,
@@ -620,39 +505,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inline_cell_format_preserves_real_unicode_subselection_and_escaped_pipe() {
-        // UTF16 位置 2 从“👩”开始；ZWJ 序列与选中 pipe/汉字共同移动，未选中的“甲”不加粗。
-        let (source, selection) = format_table_cell_input(
-            " 甲👩‍💻|乙 \r\n ",
-            NSRange::new(2, 7),
-            MarkdownFormatAction::Bold,
-        )
-        .unwrap();
-        assert_eq!(source, "甲**👩‍💻\\|乙**");
-        assert_eq!(selection, 3..11); // trim 一单位，opening 两单位，pipe 序列化增加一单位。
-    }
-
-    #[test]
-    fn inline_cell_format_can_restore_original_source_without_a_character_edit() {
-        // 原格为“**甲**”，用户在真实字段删掉标记后选中“甲”再次加粗，结果仍是原 canonical 源。
-        // 此输入合法且没有字符差异；结束字段必须沿原动作完成，不能靠多造一次编辑/Undo 取得尾部权限。
-        let original = "**甲**";
-        let (replacement, selection) =
-            format_table_cell_input("甲", NSRange::new(0, 1), MarkdownFormatAction::Bold).unwrap();
-        assert_eq!(replacement, original);
-        assert_eq!(selection, 2..3);
-    }
-
-    #[test]
-    fn empty_cell_caret_selects_only_the_original_link_placeholder() {
-        let (source, selection) =
-            format_table_cell_input("甲乙", NSRange::new(1, 0), MarkdownFormatAction::Link)
-                .unwrap();
-        assert_eq!(source, "甲[链接文字](https://)乙");
-        assert_eq!(selection, 2..6); // 标签占位四单位，不包含 opening、URL 或相邻正文。
-    }
-
-    #[test]
     fn cell_serialization_maps_crlf_unicode_trim_and_backslash_parity() {
         let source = "\u{2003}\t甲\r\n乙|丙\\|丁\\\\|戊  ";
         let start = source[..source.find('乙').unwrap()].encode_utf16().count();
@@ -688,11 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn cell_format_rejects_a_selection_inside_a_surrogate_pair() {
-        assert!(
-            format_table_cell_input("😀", NSRange::new(1, 0), MarkdownFormatAction::Italic,)
-                .is_err()
-        ); // 不将非法端点扩到整格或相邻 scalar。
+    fn cell_serialization_rejects_a_selection_inside_a_surrogate_pair() {
         assert!(native_markdown_sanitize_table_cell_input_with_selection("😀", 1..1).is_err());
         // 直接序列化入口同样拒绝代理项中点；不能只靠格式调用者提前拦截。
     }
@@ -708,26 +556,5 @@ mod tests {
         );
         assert!(serialized.is_empty());
         assert_eq!(selection, 0..0); // 全部空白都由实际 trim 删除，合法原选区成为真实空 caret。
-    }
-
-    #[test]
-    fn every_inline_cell_command_keeps_unselected_prefix_and_suffix() {
-        for action in [
-            MarkdownFormatAction::Bold,
-            MarkdownFormatAction::Italic,
-            MarkdownFormatAction::Underline,
-            MarkdownFormatAction::Strikethrough,
-            MarkdownFormatAction::InlineCode,
-            MarkdownFormatAction::InlineFormula,
-            MarkdownFormatAction::Superscript,
-            MarkdownFormatAction::Link,
-        ] {
-            // 同一真实中部选区走所有现有行内动作；提取选择后仍为原“中😀”而非整格。
-            let (source, selection) =
-                format_table_cell_input("前中😀后", NSRange::new(1, 3), action).unwrap();
-            assert!(source.starts_with('前') && source.ends_with('后'));
-            let units: Vec<_> = source.encode_utf16().collect();
-            assert_eq!(String::from_utf16(&units[selection]).unwrap(), "中😀");
-        }
     }
 }

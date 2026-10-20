@@ -40,6 +40,7 @@ impl NativeMarkdownPagedBody {
                 if !owner.active.get() {
                     return;
                 }
+                owner.cancel_mode_for_external_clip(); // 原prepare外的真实clip意图撤旧mode位置，不能反向拉回用户。
                 // 既有 Viewport observer 负责同步真实几何；这里只排同一主队列续体。
                 // 因而不依赖 observer 注册次序，也不在通知栈里读取混合前后坐标。
                 if let Err(cause) = owner.schedule() {
@@ -85,6 +86,9 @@ impl NativeMarkdownPagedBody {
         let mut roles = Vec::new();
         let weak = |value: &AnyObject| Weak::from(value);
         roles.push(("body-view", weak(&view)));
+        if let Some(typography) = self.typography.borrow().as_ref() {
+            roles.push(("preview-font-metrics", weak(&typography.metrics_owner)));
+        } // 同一有限系统行标量 owner 也必须在真实关闭后销毁，不能漏在字体/正文弱图之外。
         if let Some(context) = view.inputContext() {
             roles.push(("input-context", weak(&context)));
         }
@@ -108,6 +112,14 @@ impl NativeMarkdownPagedBody {
         }
         if let Some(layers) = view.cpu_layer_weaks() {
             roles.extend(layers.into_iter().map(|layer| ("cpu-role", layer)));
+        }
+        roles.extend(
+            view.context_menu_weaks()
+                .into_iter()
+                .map(|menu| ("edit-menu", menu)),
+        );
+        if let Some(timer) = view.drag_scroll_weak() {
+            roles.push(("drag-scroll-timer", timer));
         }
         // Rc 只用于把 Native claim 移到借用外；清单本身只有弱引用。
         drop((view, viewport));

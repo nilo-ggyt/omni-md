@@ -7,15 +7,15 @@ use core::{
     ops::{Deref, Range},
     ptr, slice,
 };
-use read_fonts::TableProvider;
 use read_fonts::types::GlyphId;
+use read_fonts::TableProvider;
 
 use crate::aat::{AatCache, AatData, EMPTY_AAT_DATA};
 use crate::buffer::{Buffer, GlyphInfo, GlyphPosition};
 use crate::cache::Cache;
 use crate::font::Font;
 use crate::once::Once;
-use crate::ot::{EMPTY_OT_DATA, OtCache, OtData};
+use crate::ot::{OtCache, OtData, EMPTY_OT_DATA};
 use crate::scale::Scale;
 use read_fonts::model::{
     charmap::Charmap,
@@ -769,7 +769,7 @@ fn arabic_pua_map(codepoint: u32, simplified: bool) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Tag, aat::AatData, ot::OtData};
+    use crate::{aat::AatData, ot::OtData, Tag};
     use core::sync::atomic::{AtomicUsize, Ordering};
     use read_fonts::{FontRef, TableProvider};
 

@@ -20,12 +20,14 @@ mod inline_block;
 pub use inline_block::{InlineBlockKind, VerifiedGlobalInlineBlock};
 mod inline_origin;
 pub use inline_origin::{
-    InlineOriginCursor, InlineOriginLimits, InlineOriginLine, InlineOriginLineKind,
-    InlineOriginState, InlineOriginStep,
+    BlockOriginCursor, BlockOriginKind, BlockOriginLimits, BlockOriginLine, BlockOriginLineKind,
+    BlockOriginState, BlockOriginStep,
 };
 mod inline_semantic;
+pub(crate) use inline_semantic::TableCellInlineContext;
 pub use inline_semantic::{
-    InlinePlainCursor, InlinePlainLimits, InlinePlainStep, InlinePlainTerminal,
+    InlineCodeCursor, InlineCodeStep, InlinePlainContainers, InlinePlainCursor, InlinePlainLimits,
+    InlinePlainStep, InlinePlainTerminal, VerifiedInlineCodeSpan, VerifiedInlineEmphasisRun,
     VerifiedInlinePlainProof, VerifiedInlineSemanticSeed,
 };
 mod leaf_block;
@@ -36,6 +38,9 @@ pub use leaf_block::{
 use leaf_block::{PendingGlobalLeaf, PendingLeafKind};
 mod scope;
 pub use scope::{CapturedScopeCursor, CapturedScopeHeader, CapturedScopeRole, CapturedScopeStep};
+
+mod inline_paragraph;
+pub use inline_paragraph::{InlineParagraphContext, InlineParagraphLine, InlineParagraphStep};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GlobalFrontierError {
@@ -109,6 +114,11 @@ pub(crate) struct ContainerPrefix {
 }
 
 impl ContainerPrefix {
+    /// 只交出原cursor已实际分配的目录大小，不把保留容量或整个scope算作源正文。
+    fn allocated_workspace_bytes(&self) -> usize {
+        self.cursor.allocated_workspace_bytes()
+    }
+
     pub(crate) fn new(
         revision: u64,
         origin: usize,
@@ -221,7 +231,7 @@ impl ContainerPrefix {
             work.transitions += step.work.transitions;
             match step.progress {
                 LineStartProgress::NeedInput { next_byte } => {
-                    return Ok((PrefixProgress::NeedInput { next_byte }, work))
+                    return Ok((PrefixProgress::NeedInput { next_byte }, work));
                 }
                 LineStartProgress::Progress { .. } => return Ok((PrefixProgress::Progress, work)),
                 LineStartProgress::Complete { state, value } => {
@@ -277,4 +287,6 @@ pub use producer::{
     GlobalTableFact, GlobalWork, VerifiedGlobalReference,
 };
 mod reference_scope;
-pub use reference_scope::{ReferencePrefixPurpose, ReferencePrefixScanner, ReferencePrefixStep};
+pub use reference_scope::{
+    ReferencePrefixPurpose, ReferencePrefixScanner, ReferencePrefixStep, VerifiedInlinePrefix,
+};

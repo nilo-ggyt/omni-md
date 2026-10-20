@@ -16,6 +16,10 @@ use omni_md_plugin::native_surface::paged_fonts::{
 
 const MAXIMUM_FONT_BYTES: u64 = 512 * 1024 * 1024;
 
+#[cfg(feature = "native-markdown-runtime-probe")]
+#[path = "paged_fonts/punctuation.rs"]
+mod punctuation;
+
 fn coverage(font: &CTFont, text: &str) {
     let mut input = [0u16; 8];
     let mut used = 0;
@@ -489,5 +493,7 @@ fn main() {
         println!(
             "native_paged_font_control cases=4 actual_native_fonts=true drop_steps_verified=true kernel_unmapped_verified=true native_cache_deallocated_verified=false formal=false"
         );
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        punctuation::run(mtm);
     });
 }

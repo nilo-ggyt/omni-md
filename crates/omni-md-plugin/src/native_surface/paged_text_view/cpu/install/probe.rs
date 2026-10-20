@@ -46,7 +46,7 @@ impl NativeMarkdownPagedTextViewDelegate for Owner {
         }
         self.active.get()
     }
-    fn virtual_viewport(&self, _: u64) -> Result<NativeMarkdownPagedVirtualViewport> {
+    fn virtual_viewport(&self, _: u64, _: f64) -> Result<NativeMarkdownPagedVirtualViewport> {
         Err(NativeMarkdownPagedTextViewError::Pending)
     }
     fn ready_scene(

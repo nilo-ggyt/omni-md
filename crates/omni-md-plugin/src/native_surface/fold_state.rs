@@ -1,18 +1,24 @@
 //! view拥有的有限折叠状态；storage只保Rust Weak，观察者没有Native对象或正文所有权。
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use super::selection_state::{
     NativeMarkdownSelectionInstallObservation, NativeMarkdownSelectionState,
     NativeMarkdownVerticalGoal,
 };
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use super::*;
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use omni_markdown_core::markdown_folding::{
     MarkdownFoldRegion,
     anchor_mapping::{MarkdownFoldAnchorMapping, MarkdownFoldChange, MarkdownFoldMappingError},
 };
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use omni_markdown_core::{MarkdownPreparedText, MarkdownTextChange, MarkdownTextChangeObserver};
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use std::ops::Deref;
 
 /// 只在显式折叠metadata的固定预算内求联合覆盖；无序、嵌套与重叠不改变隐藏集合。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn hidden_fold_union_covers(
     gap: &std::ops::Range<usize>,
     length: usize,
@@ -53,7 +59,7 @@ fn hidden_fold_union_covers(
 
 /// 原 Core 坐标只到末行内容结尾；Native delegate 却按起点在 hidden 内的整 paragraph 省略。
 /// 只补证末行真实终止符，不修改 Core fold、正文或历史；最多请求两个 UTF-16 单元。
-fn native_fold_projection_end(
+pub(super) fn native_fold_projection_end(
     hidden: &std::ops::Range<usize>,
     length: usize,
     mut unit_at: impl FnMut(usize) -> Option<u16>,
@@ -87,6 +93,7 @@ fn native_fold_projection_end(
 }
 
 /// 先保留原 metadata 联合判断；确实缺少尾 terminator 时才在同一 Doc 借用内补有限源证明。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn native_hidden_fold_union_covers(
     gap: &std::ops::Range<usize>,
     document: &MarkdownDocumentBuffer,
@@ -142,6 +149,7 @@ fn native_hidden_fold_union_covers(
 }
 
 #[derive(Debug, thiserror::Error)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) enum NativeMarkdownFoldError {
     #[error("折叠对应的笔记、模式或输入状态已变更")]
     Stale,
@@ -156,6 +164,7 @@ pub(super) enum NativeMarkdownFoldError {
 }
 
 /// 透明复用原fold Vec借用接口；新共享边只指向这些有限纯metadata。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownFoldState {
     ranges: RefCell<Vec<MarkdownFoldRegion>>,
     pub(super) generation: Cell<u64>,
@@ -170,6 +179,7 @@ pub(super) struct NativeMarkdownFoldState {
     selection: NativeMarkdownSelectionState,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl Deref for NativeMarkdownFoldState {
     type Target = RefCell<Vec<MarkdownFoldRegion>>;
     fn deref(&self) -> &Self::Target {
@@ -177,6 +187,7 @@ impl Deref for NativeMarkdownFoldState {
     }
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownFoldState {
     pub(super) fn new(document: &SharedMarkdownDocument, mode: MarkdownPresentationMode) -> Self {
         let (generation, selection) = {
@@ -461,7 +472,9 @@ impl NativeMarkdownFoldState {
     }
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownDeleteScope<'a>(&'a NativeMarkdownFoldState, bool);
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl Drop for NativeMarkdownDeleteScope<'_> {
     fn drop(&mut self) {
         if self.1 {
@@ -471,6 +484,7 @@ impl Drop for NativeMarkdownDeleteScope<'_> {
 }
 
 #[derive(Clone)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct FoldTicket {
     document: WeakMarkdownDocument,
     generation: u64,
@@ -482,6 +496,7 @@ struct FoldTicket {
     // 首个 Native 调用前同 root 的精确长度；提交后票据会更新为候选长度，不能沿用旧长度。
     utf16_len: usize,
 }
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl FoldTicket {
     fn current(&self, state: &NativeMarkdownFoldState) -> bool {
         // 此处不能borrow RefCell<Doc>：Core finish正在持有真实mutable document借用。
@@ -498,16 +513,19 @@ impl FoldTicket {
 
 /// Native getter之前就取得原权限，返回时不重新领取较新的owner/revision。
 #[derive(Clone)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownSelectionCapture {
     state: Rc<NativeMarkdownFoldState>,
     ticket: FoldTicket,
 }
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl std::fmt::Debug for NativeMarkdownSelectionCapture {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("NativeMarkdownSelectionCapture") // 不输出Native地址、正文或路径。
     }
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownSelectionCapture {
     pub(super) fn current(&self) -> bool {
         self.ticket.current(&self.state)
@@ -546,6 +564,7 @@ impl NativeMarkdownSelectionCapture {
     }
 }
 #[derive(Clone)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownCapturedSelection {
     pub(super) selection: MarkdownTextSelection,
     capture: NativeMarkdownSelectionCapture,
@@ -554,6 +573,7 @@ pub(super) struct NativeMarkdownCapturedSelection {
     vertical_goal: Option<NativeMarkdownVerticalGoal>,
     native_before_range: NSRange,
 }
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownCapturedSelection {
     /// 只借用这份原票，不重新捕获当前代次；用于同一同步输入内的实际有序查询。
     pub(super) fn native_capture(&self) -> &NativeMarkdownSelectionCapture {
@@ -726,12 +746,11 @@ impl NativeMarkdownCapturedSelection {
             selection: self.selection,
             before_range,
             native_before_utf16_len: self.capture.ticket.utf16_len,
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            source_ticket: self.capture.ticket.clone(),
         }
     }
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownFoldObserver {
     state: Rc<NativeMarkdownFoldState>,
     ticket: FoldTicket,
@@ -739,6 +758,7 @@ pub(super) struct NativeMarkdownFoldObserver {
     explicit_after: bool,
     native_before_range: NSRange,
 }
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownFoldObserver {
     /// 只接收同一原票观察到的 Native before；Core ticket 的完整选择仍独立核权。
     pub(super) fn with_native_before(
@@ -773,6 +793,7 @@ impl NativeMarkdownFoldObserver {
 }
 
 /// Core成功后唯一纯安装载荷；不借Native、不再读源，也不携完整变化流。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownPreparedFolds {
     state: Rc<NativeMarkdownFoldState>,
     ticket: FoldTicket,
@@ -782,6 +803,7 @@ pub(super) struct NativeMarkdownPreparedFolds {
     // observer.finish 从实际候选 root 取得；发布后 capture 必须使用新长度，旧长度另存原生来源。
     utf16_len_after: usize,
 }
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownPreparedFolds {
     /// 两阶段 Core 候选尚未发布时，原 fold 票与原完整 Core 选择必须仍然成立。
     pub(super) fn is_current(&self, document: &MarkdownDocumentBuffer) -> bool {
@@ -810,8 +832,6 @@ impl NativeMarkdownPreparedFolds {
         drop(previous);
         // 这是唯一能签发提交后票据的位置：原root刚发布，尚无Native通知或局部池drain。
         let native_before_utf16_len = self.ticket.utf16_len;
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        let source_ticket = self.ticket.clone(); // 仅观察原转换；不能把它重新发布为产品选择权限。
         self.ticket.generation = generation;
         self.ticket.utf16_len = self.utf16_len_after;
         self.ticket.revision = self.state.revision.get();
@@ -826,40 +846,20 @@ impl NativeMarkdownPreparedFolds {
             selection: self.selection,
             before_range,
             native_before_utf16_len,
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            source_ticket,
         }
     }
 }
 
 /// 提交收据的选择后果权限；只携有限纯标量/Weak，不拥有Native或另一个正文root。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownCommittedSelection {
     capture: NativeMarkdownSelectionCapture,
     pub(super) selection: MarkdownTextSelection,
     before_range: NSRange,
     native_before_utf16_len: usize,
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    source_ticket: FoldTicket,
 }
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownCommittedSelection {
-    /// 观察器只认原 capture 的这一次字符后果；同 g/len 或同范围不能替代原 serial 与 root。
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    pub(super) fn is_text_successor_of(&self, original: &NativeMarkdownSelectionCapture) -> bool {
-        let source = &self.source_ticket;
-        let before = &original.ticket;
-        self.current()
-            && Rc::ptr_eq(&self.capture.state, &original.state)
-            && std::rc::Weak::ptr_eq(&source.document, &before.document)
-            && source.generation == before.generation
-            && source.utf16_len == before.utf16_len
-            && source.selection_before == before.selection_before
-            && source.selection_serial == before.selection_serial
-            && source.revision == before.revision
-            && source.owner == before.owner
-            && source.mode == before.mode
-            && source.generation.checked_add(1) == Some(self.capture.ticket.generation)
-    }
-
     /// 首Native之前捕获的原Core范围；调用方不能以安装中读到的新Native值重签声明。
     pub(super) fn native_before_range(&self) -> NSRange {
         self.before_range
@@ -979,11 +979,13 @@ impl NativeMarkdownCommittedSelection {
 }
 
 /// guard没有Native析构；退出只清自己id/serial，不能清除重入后 successor 的lease。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownSelectionInstallGuard {
     capture: NativeMarkdownSelectionCapture,
     id: u64,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownSelectionInstallGuard {
     pub(super) fn current(&self) -> bool {
         self.capture.current()
@@ -1006,6 +1008,7 @@ impl NativeMarkdownSelectionInstallGuard {
     }
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl Drop for NativeMarkdownSelectionInstallGuard {
     fn drop(&mut self) {
         self.capture
@@ -1015,11 +1018,13 @@ impl Drop for NativeMarkdownSelectionInstallGuard {
     }
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn ordered_selection_range(selection: MarkdownTextSelection) -> NSRange {
     let start = selection.anchor_utf16.min(selection.head_utf16);
     let end = selection.anchor_utf16.max(selection.head_utf16);
     NSRange::new(start, end - start)
 }
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl MarkdownTextChangeObserver for NativeMarkdownFoldObserver {
     type Output = NativeMarkdownPreparedFolds;
     type Error = NativeMarkdownFoldError;

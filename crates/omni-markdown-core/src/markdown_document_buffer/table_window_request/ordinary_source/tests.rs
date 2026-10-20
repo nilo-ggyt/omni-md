@@ -1,6 +1,584 @@
 //! 合成真实文件与完整 Parser 是测试 oracle；正文副本和事件 Vec 不进入产品请求。
 
 use super::*;
+use crate::MarkdownPresentationStyles;
+
+/// 巨格在原 LineCopy 的 256KiB 上限之前交真实结构行；首份发布只保 metadata 与同一 Global。
+#[test]
+fn first_giant_table_row_publishes_real_structure_without_copying_or_reparsing_the_row() {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    let header = "|H|C|\r\n|---|---|\r\n";
+    file.write_all(header.as_bytes()).unwrap();
+    file.write_all(b"|").unwrap();
+    let page = [b'a'; 4096];
+    for _ in 0..80 {
+        file.write_all(&page).unwrap();
+    }
+    file.write_all(b"|tail|\r\n").unwrap();
+    file.flush().unwrap();
+    let document = MarkdownDocumentBuffer::open(file.path(), 8 * 1024 * 1024).unwrap();
+    let authority = MarkdownViewportSourceAuthority {
+        context_revision: 7,
+        selection: document.selection(),
+        cancelled: false,
+    };
+    let mut request = document
+        .viewport_leaf_source_request(0..128, 7, authority.selection)
+        .unwrap();
+    let publication = loop {
+        match request.advance(&document, authority, 4096).unwrap() {
+            MarkdownViewportSourceStep::Progress { work } => {
+                assert!(work.source_bytes <= 4096);
+                assert!(work.structural_transitions <= 4096);
+            }
+            MarkdownViewportSourceStep::SourcesAvailable { .. } => {
+                break request
+                    .take_sources_for(&document, authority)
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+    };
+    let h = publication
+        .table_row_at_for(&document, authority, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.coordinate_for(&document, authority).unwrap(), (0, 0, 2));
+    assert_eq!(
+        h.physical_byte_range_for(&document, authority).unwrap(),
+        0..header.len()
+    );
+    let row = publication
+        .table_row_at_for(&document, authority, header.len())
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.coordinate_for(&document, authority).unwrap(), (0, 1, 2));
+    assert_eq!(
+        row.physical_byte_range_for(&document, authority).unwrap(),
+        header.len()..document.byte_len()
+    );
+    assert_eq!(
+        row.physical_utf16_range_for(&document, authority).unwrap(),
+        header.len()..document.utf16_len()
+    );
+    assert_eq!(
+        publication
+            .table_sources_for(&document, authority)
+            .unwrap()
+            .windows_for(&document)
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(request.total_work().copied_source_bytes, 0);
+    assert_eq!(request.total_work().parser_input_bytes, 0);
+}
+
+/// 恢复长表最后一行只沿原请求逐行续读；每行四格仍真正完成inline，不把后方普通段落纳入来源页。
+#[test]
+fn narrow_row_source_windows_keep_long_table_forward_and_unrelated_tail_outside() {
+    assert_long_table_row_recovery(false);
+}
+
+/// Find 已选中最后一格时，恢复每一行仍共用原累计额度；远端选区不能被每份后继来源重新扫描。
+#[test]
+fn narrow_row_source_windows_keep_last_cell_find_selection_within_original_work_limit() {
+    assert_long_table_row_recovery(true);
+}
+
+// 两个真实选择场景共用同一完整来源、四格 inline 与尾部隔离流程；不以不同的轻量路径替代 Find。
+fn assert_long_table_row_recovery(last_cell_find: bool) {
+    // 四种真实inline沿同一表格来源准备；裸结构行成功不能代替实际加粗、斜体和代码格完成。
+    let header = "| 普通 | 粗体 | 斜体 | 代码 |\r\n| --- | --- | --- | --- |\r\n";
+    let mut source = String::from(header);
+    let mut rows = Vec::new();
+    let mut next_utf16 = header.encode_utf16().count();
+    // 期望行坐标只从固定输入字面计算，不从待测publication或Parser结果倒推。
+    for ordinal in 1..=240 {
+        let row = format!("| 中文{ordinal} | **粗体** | *斜体* | `a\\|b` |\r\n");
+        let end = next_utf16 + row.encode_utf16().count();
+        rows.push((next_utf16..end, ordinal));
+        next_utf16 = end;
+        source.push_str(&row);
+    }
+    // 旧16K恢复窗口会顺带纳入这些普通块；保持真实尾部，让来源页过量的问题可见。
+    for _ in 0..600 {
+        source.push_str("\r\n后方普通段落不能为表格查找预先解析\r\n");
+    }
+    let (_directory, mut doc) = document(&source);
+    if last_cell_find {
+        // 选区来自固定最后一行的代码格字面；后方六百段只是无关尾部，不能据总长度猜出目标。
+        let byte_start = source.rfind("`a\\|b`").unwrap() + 1;
+        let anchor = source[..byte_start].encode_utf16().count();
+        doc.set_selection(MarkdownTextSelection {
+            anchor_utf16: anchor,
+            head_utf16: anchor + "a\\|b".encode_utf16().count(),
+        })
+        .unwrap();
+    }
+    let authority = authority(&doc);
+    // 唯一请求先公开真实表头；后继行只能借最后一份publication前向续读，不重建Global或配额。
+    let mut request = doc
+        .viewport_leaf_source_request(0..1, 41, authority.selection)
+        .unwrap();
+    finish(&mut request, &doc).unwrap();
+    let mut publication = request.take_sources_for(&doc, authority).unwrap().unwrap();
+    for (physical, ordinal) in rows {
+        // 查询头尚未定位时只推进原4096量子；完整标量窗口就绪才改变真实来源视口。
+        let viewport = loop {
+            if let Some(viewport) = request
+                .table_row_source_viewport(&doc, authority, physical.start, 4096)
+                .unwrap()
+            {
+                break viewport;
+            }
+        };
+        assert_eq!(viewport, physical.start..physical.start + 1);
+        request
+            .continue_forward(&doc, &publication, viewport.clone(), authority)
+            .unwrap();
+        finish(&mut request, &doc).unwrap();
+        publication = request.take_sources_for(&doc, authority).unwrap().unwrap();
+        // 窄查询必须仍给出完整物理行身份，不能把一字符视口冒充裁切后残缺的行。
+        assert_eq!(
+            publication.requested_for(&doc, authority).unwrap(),
+            &viewport
+        );
+        let row = publication
+            .table_row_at_for(&doc, authority, physical.start)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.coordinate_for(&doc, authority).unwrap(),
+            (0, ordinal, 4)
+        );
+        assert_eq!(
+            row.physical_utf16_range_for(&doc, authority).unwrap(),
+            physical
+        );
+        // 每格都消费自己的原opaque来源和语义；完成后立即归还，下一格仍复用同一请求。
+        for column in 0..4 {
+            request
+                .prepare_cell_inline(&doc, row.clone(), authority, column)
+                .unwrap();
+            loop {
+                if matches!(
+                    request.advance_cell_inline(&doc, authority, 4096).unwrap(),
+                    MarkdownTableCellInlineStep::Ready { .. }
+                ) {
+                    break;
+                }
+            }
+            // 成功消费实际单格语义，才能串行启动下一格；测试不读取或突变请求内部游标。
+            let inline = request
+                .take_cell_inline_ready_for(&doc, authority)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                inline
+                    .cell_source_for(&doc, authority)
+                    .unwrap()
+                    .coordinate_for(&doc)
+                    .unwrap()
+                    .2,
+                column
+            );
+        }
+        // 这一页只服务当前真实表行；后方普通尾部不能作为“已经准备好”的隐藏库存。
+        assert_eq!(
+            publication
+                .ordinary_lines_for(&doc, authority)
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+}
+
+/// Native 长表的同一固定配方必须真正生成显示来源，不能只用更长尾部扩大原总 fuel 后证明 inline。
+#[test]
+fn actual_cell_displays_keep_native_long_table_find_within_original_work_limit() {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    let header = "| 普通 | 粗体 | 斜体 | 行内代码 |\r\n| --- | --- | --- | --- |\r\n";
+    file.write_all(header.as_bytes()).unwrap();
+    let mut ranges = vec![(0..header.encode_utf16().count(), 0)];
+    let mut offset = header.encode_utf16().count();
+    let mut selection = MarkdownTextSelection::caret(0);
+    for ordinal in 1..=240 {
+        let row = format!(
+            "| 中文普通{ordinal:04} | **中文粗体{ordinal:04}** | *中文斜体{ordinal:04}* | `中文代码{ordinal:04}` |\r\n"
+        );
+        if ordinal == 240 {
+            let query = format!("中文普通{ordinal:04}");
+            let byte = row.find(&query).unwrap();
+            let anchor_utf16 = offset + row[..byte].encode_utf16().count();
+            selection = MarkdownTextSelection {
+                anchor_utf16,
+                head_utf16: anchor_utf16 + query.encode_utf16().count(),
+            };
+        }
+        let end = offset + row.encode_utf16().count();
+        ranges.push((offset..end, ordinal));
+        offset = end;
+        file.write_all(row.as_bytes()).unwrap();
+    }
+    for _ in 0..128 {
+        file.write_all("\r\n表后尾部保持按视口读取\r\n".as_bytes())
+            .unwrap();
+    }
+    file.flush().unwrap();
+    let mut doc = MarkdownDocumentBuffer::open(file.path(), 32 * 1024 * 1024).unwrap();
+    doc.set_selection(selection).unwrap();
+    let authority = authority(&doc);
+    let mut request = doc
+        .viewport_leaf_source_request(0..1, 41, selection)
+        .unwrap();
+    finish(&mut request, &doc).unwrap();
+    let mut publication = request.take_sources_for(&doc, authority).unwrap().unwrap();
+    for (physical, ordinal) in ranges {
+        if ordinal != 0 {
+            // 与真实 NeedStyle 一样查询本物理行正文，CRLF 控制仍由它们自己的原来源处理。
+            request
+                .continue_forward(
+                    &doc,
+                    &publication,
+                    physical.start..physical.end - 2,
+                    authority,
+                )
+                .unwrap();
+            finish(&mut request, &doc).unwrap();
+            publication = request.take_sources_for(&doc, authority).unwrap().unwrap();
+        }
+        let row = publication
+            .table_row_at_for(&doc, authority, physical.start)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.coordinate_for(&doc, authority).unwrap(),
+            (0, ordinal, 4)
+        );
+        let mut displays = Vec::new();
+        for column in 0..4 {
+            // 同一行四个显示来源真实共活；每次调用都经过原 CellInline、逐标量转换及磁盘投影目录。
+            displays.push(prepare_actual_cell_display(
+                &mut request,
+                &doc,
+                row.clone(),
+                authority,
+                column,
+            ));
+        }
+        let observers: Vec<_> = displays
+            .iter()
+            .map(|display| display.resource_observer())
+            .collect();
+        drop(displays);
+        for observer in observers {
+            let actual = observer.snapshot();
+            assert!(
+                actual.source_payload_released
+                    && !actual.origin_file_open
+                    && actual.origin_buffer_bytes == 0
+            );
+            assert!(!actual.origin_cleanup_failed && !actual.origin_reader_failed);
+        }
+    }
+}
+
+/// 宽表首行自然测宽后会再次准备显示；已归还的临时语义库存不能在同一来源 quota 内单调累积。
+#[test]
+fn actual_wide_header_displays_release_serial_preparation_inventory() {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    let lead = "宽表前的独立正文保持原布局\r\n\r\n";
+    for _ in 0..32 {
+        file.write_all(lead.as_bytes()).unwrap();
+    }
+    let header_start = lead.encode_utf16().count() * 32;
+    let mut header = String::from("|");
+    for column in 1..=20 {
+        header.push_str(&format!(
+            " 表头{column:02}{}中文 |",
+            "宽".repeat(column % 4 + 1)
+        ));
+    }
+    let header_end = header_start + header.encode_utf16().count();
+    header.push_str("\r\n|");
+    for _ in 0..20 {
+        header.push_str(" --- |");
+    }
+    header.push_str("\r\n");
+    file.write_all(header.as_bytes()).unwrap();
+    let mut offset = header_start + header.encode_utf16().count();
+    let mut target = 0;
+    for row in 1..=3 {
+        let mut text = String::from("|");
+        for column in 1..=20 {
+            text.push(' ');
+            if row == 1 && column == 1 {
+                text.push_str("左端首列目标");
+            } else if row == 1 && column == 20 {
+                target = offset + text.encode_utf16().count();
+                text.push_str("右端末列目标");
+            } else {
+                text.push_str(&format!("真实第{row:02}行第{column:02}列"));
+            }
+            text.push_str(" |");
+        }
+        text.push_str("\r\n");
+        offset += text.encode_utf16().count();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+    let tail = "宽表后仍未显示的固定尾段\r\n\r\n";
+    for _ in 0..(1024 * 1024) / tail.len() {
+        file.write_all(tail.as_bytes()).unwrap();
+    }
+    file.flush().unwrap();
+    let mut doc = MarkdownDocumentBuffer::open(file.path(), 32 * 1024 * 1024).unwrap();
+    let selection = MarkdownTextSelection {
+        anchor_utf16: target,
+        head_utf16: target + "右端末列目标".encode_utf16().count(),
+    };
+    doc.set_selection(selection).unwrap();
+    let authority = authority(&doc);
+    let mut request = doc
+        .viewport_leaf_source_request(header_start..header_end, 41, selection)
+        .unwrap();
+    finish(&mut request, &doc).unwrap();
+    let publication = request.take_sources_for(&doc, authority).unwrap().unwrap();
+    let row = publication
+        .table_row_at_for(&doc, authority, header_start)
+        .unwrap()
+        .unwrap();
+    for _ in 0..2 {
+        let mut displays = Vec::new();
+        for column in 0..20 {
+            displays.push(prepare_actual_cell_display(
+                &mut request,
+                &doc,
+                row.clone(),
+                authority,
+                column,
+            ));
+        }
+        // 两次真实用途各只保当前行；归还后才开始第二轮，不把已经销毁的工作区当作活库存。
+        let observers: Vec<_> = displays
+            .iter()
+            .map(|display| display.resource_observer())
+            .collect();
+        drop(displays);
+        for observer in observers {
+            let actual = observer.snapshot();
+            assert!(
+                actual.source_payload_released
+                    && !actual.origin_file_open
+                    && actual.origin_buffer_bytes == 0
+            );
+            assert!(!actual.origin_cleanup_failed && !actual.origin_reader_failed);
+        }
+    }
+}
+
+/// 跨格闭合和嵌套开启必须保留原 first-open→next-close；反向恢复仍从真实根重建 HTML 上下文。
+#[test]
+fn cell_displays_keep_cross_cell_underline_markers_during_forward_and_backward_recovery() {
+    // 第一对跨表头两格，第二对跨表头与下一行；已有 open 时的嵌套 <u> 和多余 close
+    // 都按旧产品解析，不能为了只保最后一项而隐藏它们或把两个真实 pair 合并。
+    let source = concat!(
+        "| <u>头甲 | <u>头乙 </u> | 后丙 </u> | <u>尾丁 |\r\n",
+        "| --- | --- | --- | --- |\r\n",
+        "| 续甲 | 续乙 </u> | <u>新丙</u> | 末丁 |\r\n",
+        "| 后甲 | 后乙 | 后丙 | 后丁 |\r\n",
+    );
+    let source_len = source.encode_utf16().count();
+    let mut row_starts = Vec::new();
+    let mut offset = 0;
+    for (line, text) in source.split_inclusive('\n').enumerate() {
+        if line != 1 {
+            row_starts.push(offset);
+        }
+        offset += text.encode_utf16().count();
+    }
+    let selected = source[..source.find("头甲").unwrap()]
+        .encode_utf16()
+        .count();
+    for selection in [
+        MarkdownTextSelection::caret(source_len),
+        MarkdownTextSelection::caret(selected),
+    ] {
+        let (_directory, mut doc) = document(source);
+        doc.set_selection(selection).unwrap();
+        let authority = authority(&doc);
+        // 完整 Parser 只读这个固定短夹具，独立决定原标签样式；期望不来自新 scanner 或实际输出。
+        let mut original = crate::MarkdownViewportPresentation::default();
+        original.set_active_selection(selection.head_utf16..selection.head_utf16);
+        original.rebuild(0, 0..source_len, source).unwrap();
+        let mut request = doc
+            .viewport_leaf_source_request(0..1, 41, selection)
+            .unwrap();
+        finish(&mut request, &doc).unwrap();
+        let mut publication = request.take_sources_for(&doc, authority).unwrap().unwrap();
+        // 后两次回到已完成的表头再前进；沿最近 publication 进行真实 reposition，
+        // 不用新请求掩盖旧 scanner 已经过了 close 的状态，也不保旧行票跨发布使用。
+        for (step, row_index) in [0, 1, 2, 0, 1].into_iter().enumerate() {
+            let row_start = row_starts[row_index];
+            if step != 0 {
+                if row_index == 0 {
+                    request
+                        .reposition(&doc, &publication, row_start..row_start + 1, authority)
+                        .unwrap();
+                } else {
+                    request
+                        .continue_forward(&doc, &publication, row_start..row_start + 1, authority)
+                        .unwrap();
+                }
+                finish(&mut request, &doc).unwrap();
+                publication = request.take_sources_for(&doc, authority).unwrap().unwrap();
+            }
+            let row = publication
+                .table_row_at_for(&doc, authority, row_start)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.coordinate_for(&doc, authority).unwrap(),
+                (0, row_index, 4)
+            );
+            for column in 0..4 {
+                request
+                    .prepare_cell_inline(&doc, row.clone(), authority, column)
+                    .unwrap();
+                loop {
+                    if matches!(
+                        request.advance_cell_inline(&doc, authority, 4096).unwrap(),
+                        MarkdownTableCellInlineStep::Ready { .. }
+                    ) {
+                        break;
+                    }
+                }
+                let inline = request
+                    .take_cell_inline_ready_for(&doc, authority)
+                    .unwrap()
+                    .unwrap();
+                let raw = inline
+                    .cell_source_for(&doc, authority)
+                    .unwrap()
+                    .canonical_range_for(&doc)
+                    .unwrap();
+                for index in raw.clone() {
+                    let actual = inline.query_for(&doc, authority, index).unwrap().unwrap();
+                    let expected = original.query(index).unwrap();
+                    // 表格/表头等继承样式有自己的真实来源；这里只比较迁移可能影响的三个标签角色。
+                    for role in [
+                        MarkdownPresentationStyles::UNDERLINE,
+                        MarkdownPresentationStyles::MARKER,
+                        MarkdownPresentationStyles::HIDDEN_MARKER,
+                    ] {
+                        assert_eq!(
+                            actual.styles.contains(role),
+                            expected.styles.contains(role),
+                            "row={row_index} column={column} index={index} role={role:?} selection={selection:?}"
+                        );
+                    }
+                }
+                drop(inline);
+                // 同格显示会再次取得实际语义，覆盖保持不变时必须完整交回所有原 pair，
+                // 随后真正落盘投影并释放，不能仅靠 query 结果声称 Display 生命周期正确。
+                let display =
+                    prepare_actual_cell_display(&mut request, &doc, row.clone(), authority, column);
+                let observer = display.resource_observer();
+                drop(display);
+                let released = observer.snapshot();
+                assert!(released.source_payload_released && !released.origin_file_open);
+                assert_eq!(released.origin_buffer_bytes, 0);
+                assert!(!released.origin_cleanup_failed && !released.origin_reader_failed);
+            }
+        }
+    }
+}
+
+/// 只复用公开生产准备流程；返回真正完成的显示 Source，不能用 raw/inline Ready 替代显示目录完成。
+fn prepare_actual_cell_display(
+    request: &mut MarkdownViewportSourceRequest,
+    document: &MarkdownDocumentBuffer,
+    row: VerifiedMarkdownTableRowSource,
+    authority: MarkdownViewportSourceAuthority,
+    column: usize,
+) -> crate::MarkdownTableCellDisplaySource {
+    let coordinate = row.coordinate_for(document, authority).unwrap();
+    let mut preparation = crate::MarkdownTableCellDisplayPreparation::from_row_source(
+        document, row, authority, column,
+    )
+    .unwrap();
+    loop {
+        let step = preparation
+            .advance_with_source_request(document, request, false)
+            .unwrap_or_else(|cause| {
+                panic!("实际显示准备失败 row={coordinate:?} column={column} cause={cause:?}")
+            });
+        if matches!(
+            step,
+            crate::MarkdownTableCellDisplayPreparationStep::Ready { .. }
+        ) {
+            break;
+        }
+    }
+    let display = preparation.take_ready_for(document).unwrap().unwrap();
+    assert_eq!(
+        display
+            .canonical_raw_cell()
+            .coordinate_for(document)
+            .unwrap()
+            .2,
+        column
+    );
+    assert!(display.source().utf16_len() > 0);
+    display
+}
+
+/// 无前导管道的真实表格行可从补充平面字符开始；首标量窗口必须同时包含两项UTF16，不能截半个代理对。
+#[test]
+fn row_source_window_preserves_supplementary_scalar_and_rejects_surrogate_interior() {
+    let source = "H | C\r\n--- | ---\r\n😀原格 | 中文\r\n";
+    let (_directory, doc) = document(source);
+    let authority = authority(&doc);
+    let row_start = source[..source.find('😀').unwrap()].encode_utf16().count();
+    // 不加前导管道，确保真实行首就是两个UTF16单元的字符，不能碰巧靠ASCII令测试通过。
+    let mut request = doc
+        .viewport_leaf_source_request(0..1, 41, authority.selection)
+        .unwrap();
+    finish(&mut request, &doc).unwrap();
+    let initial = request.take_sources_for(&doc, authority).unwrap().unwrap();
+    // 真标量窗口由原来源定位器确认；预期长度来自固定字符，而非实现返回值。
+    let viewport = loop {
+        if let Some(viewport) = request
+            .table_row_source_viewport(&doc, authority, row_start, 4096)
+            .unwrap()
+        {
+            break viewport;
+        }
+    };
+    assert_eq!(viewport, row_start..row_start + 2);
+    request
+        .continue_forward(&doc, &initial, viewport, authority)
+        .unwrap();
+    finish(&mut request, &doc).unwrap();
+    let row_sources = request.take_sources_for(&doc, authority).unwrap().unwrap();
+    let row = row_sources
+        .table_row_at_for(&doc, authority, row_start)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.coordinate_for(&doc, authority).unwrap(), (0, 1, 2));
+    // 低代理项位置不是另一条合法行首；错误必须保留，不能静默floor回前一单元补造权限。
+    let failure = loop {
+        match request.table_row_source_viewport(&doc, authority, row_start + 1, 4096) {
+            Ok(None) => {}
+            result => break result,
+        }
+    };
+    assert_eq!(failure, Err(MarkdownTableRequestError::InvalidRequest));
+}
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
 fn document(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
@@ -119,6 +697,93 @@ fn assert_line_oracle(
             units(source, content_end)..units(source, eol_end)
         );
     }
+}
+
+#[test]
+fn root_leaf_reposition_replays_same_global_keeps_old_permissions_and_cumulative_work() {
+    let source = format!("# 开头\n\n{}\n# 结尾\n", "中文 ascii\n".repeat(1200));
+    let (_directory, doc) = document(&source);
+    let tail = doc.utf16_len() - 6..doc.utf16_len();
+    let mut request = doc
+        .viewport_leaf_source_request(tail.clone(), 41, doc.selection())
+        .unwrap();
+    finish(&mut request, &doc).unwrap();
+    let old = request
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    let original_global = request.batch.source_probe_state().0;
+    let original_work = request.total_work();
+    request
+        .reposition(&doc, &old, 0..4, authority(&doc))
+        .unwrap();
+    assert_eq!(request.batch.source_probe_state().0, original_global);
+    assert_eq!(request.batch.source_probe_state().1, 0);
+    assert!(request.total_work().structural_transitions > original_work.structural_transitions);
+    finish(&mut request, &doc).unwrap();
+    let first = request
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    let MarkdownOrdinarySemanticState::RootLeafReady(leaf) =
+        first.ordinary_semantics_for(&doc, authority(&doc)).unwrap()
+    else {
+        panic!("重放文首必须取得真实RootLeaf权限");
+    };
+    assert!(leaf.query_for(&doc, authority(&doc), 2).unwrap().is_some());
+    old.ordinary_semantics_for(&doc, authority(&doc)).unwrap(); // 原不可变发布没有因重定位偷换身份或选择。
+    request
+        .continue_forward(&doc, &first, tail, authority(&doc))
+        .unwrap();
+    finish(&mut request, &doc).unwrap();
+    assert_eq!(request.batch.source_probe_state().0, original_global);
+    assert!(request.total_work().source_bytes > original_work.source_bytes);
+    assert_eq!(request.total_work().copied_source_bytes, 0);
+    request.cancel();
+}
+
+#[test]
+fn root_leaf_reposition_rejects_foreign_publication_without_destroying_original_owner() {
+    let (_directory, doc) = document("# 头\n\n正文\n\n# 尾\n");
+    let mut request = doc
+        .viewport_leaf_source_request(6..doc.utf16_len(), 41, doc.selection())
+        .unwrap();
+    let mut foreign = doc
+        .viewport_leaf_source_request(0..3, 41, doc.selection())
+        .unwrap();
+    finish(&mut request, &doc).unwrap();
+    finish(&mut foreign, &doc).unwrap();
+    let old = request
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    let other = foreign
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    let state = request.batch.source_probe_state();
+    assert_eq!(
+        request.reposition(&doc, &other, 0..3, authority(&doc)),
+        Err(MarkdownTableRequestError::PublicationSuperseded)
+    );
+    assert_eq!(request.batch.source_probe_state(), state);
+    request
+        .reposition(&doc, &old, 0..3, authority(&doc))
+        .unwrap();
+    finish(&mut request, &doc).unwrap();
+    let cancelled = MarkdownViewportSourceAuthority {
+        cancelled: true,
+        ..authority(&doc)
+    };
+    let ready = request
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request.reposition(&doc, &ready, 4..8, cancelled),
+        Err(MarkdownTableRequestError::Cancelled)
+    );
+    assert_eq!(request.batch.source_probe_state().0, 0); // 真实取消释放原Global，不可拿新范围复活旧owner。
 }
 
 #[test]

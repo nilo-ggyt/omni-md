@@ -58,6 +58,7 @@ fn font(bytes: &'static [u8]) -> MarkdownLayoutFont {
 }
 fn style() -> MarkdownLineComposeStyle {
     MarkdownLineComposeStyle {
+        presentation: Default::default(),
         points: 16.0,
         language: None,
         features: Vec::new(),

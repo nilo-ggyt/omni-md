@@ -1,9 +1,9 @@
 //! 普通来源 owner 内的真实单行续权；沿原 batch 回放，不产生第二份 Global 或 ordinary Ready。
 
+use super::super::semantic::{RequiredLocation, RequiredPublication};
 use super::*;
-use crate::markdown_document_buffer::{
-    MarkdownTableViewportRequiredRowQuery, MarkdownTableViewportRequiredRowResult,
-};
+use crate::markdown_document_buffer::MarkdownTableViewportRequiredRowQuery;
+use crate::markdown_viewport_presentation::table_window::navigation::MarkdownTableWindowNavigation;
 
 /// 两层 publication 都固定在签发时；同一表坐标不能借另一份 source publication 续权。
 pub struct MarkdownViewportSourceRequiredRowQuery {
@@ -11,34 +11,98 @@ pub struct MarkdownViewportSourceRequiredRowQuery {
     table_query: MarkdownTableViewportRequiredRowQuery,
 }
 
+/// Row 与真正 End 都交原来源行票；没有 window index、裸 End 或可以自行签发来源的整数。
+pub enum MarkdownViewportSourceRequiredRowResult {
+    Row {
+        row: VerifiedMarkdownTableRowSource,
+    },
+    TableEnd {
+        terminal: VerifiedMarkdownTableRowSource,
+    },
+}
+
 impl VerifiedMarkdownViewportSources {
-    /// origin 必须是本 publication 内实际已发布的表行；context-only H 不贡献编辑来源。
+    /// origin 必须是本 publication 实际结构行，方向只产生待解析目标，不能以整数获得行权限。
+    /// None 仅表示表头向前的真实 TableStart；Next/NextRow 都查询后一物理表行，列策略由原格负责。
     pub fn required_row_query_for(
         &self,
         document: &MarkdownDocumentBuffer,
         authority: MarkdownViewportSourceAuthority,
-        window_index: usize,
-        origin_row: usize,
-        requested_row: usize,
-    ) -> Result<MarkdownViewportSourceRequiredRowQuery, MarkdownTableRequestError> {
+        origin: &VerifiedMarkdownTableRowSource,
+        navigation: MarkdownTableWindowNavigation,
+    ) -> Result<Option<MarkdownViewportSourceRequiredRowQuery>, MarkdownTableRequestError> {
         self.check(document, authority)?;
-        let table_query =
-            self.table
-                .required_row_query_for(document, window_index, origin_row, requested_row)?;
-        Ok(MarkdownViewportSourceRequiredRowQuery {
+        origin.require_for(document, authority)?;
+        if !Rc::ptr_eq(&origin.publication, &self.publication) {
+            return Err(MarkdownTableRequestError::PublicationSuperseded);
+        }
+        let requested_row = match navigation {
+            MarkdownTableWindowNavigation::Previous => match origin.ordinal.checked_sub(1) {
+                Some(row) => row,
+                None => return Ok(None),
+            },
+            MarkdownTableWindowNavigation::Next | MarkdownTableWindowNavigation::NextRow => origin
+                .ordinal
+                .checked_add(1)
+                .ok_or(MarkdownTableRequestError::InvalidRequest)?,
+        };
+        let table_query = self.table.required_structure_query_for(
+            document,
+            &origin.ticket,
+            origin.ordinal,
+            requested_row,
+        )?;
+        Ok(Some(MarkdownViewportSourceRequiredRowQuery {
             publication: Rc::downgrade(&self.publication),
             table_query,
-        })
+        }))
     }
 
-    /// Some 只表示真实 Row/End；None 尚无 RequiredRow 终点，SourcesAvailable 仍不授 ordinary 样式。
+    /// Some 只表示原 Replay 完成后的实际 Row/terminal；目标离开视觉范围也交同一 publication 的封闭票。
     pub fn required_row_result_for(
         &self,
         document: &MarkdownDocumentBuffer,
         authority: MarkdownViewportSourceAuthority,
-    ) -> Result<Option<MarkdownTableViewportRequiredRowResult<'_>>, MarkdownTableRequestError> {
+    ) -> Result<Option<MarkdownViewportSourceRequiredRowResult>, MarkdownTableRequestError> {
         self.check(document, authority)?;
-        self.table.required_row_result_for(document)
+        let Some(result) = self.table.required_publication_for(document)? else {
+            return Ok(None);
+        };
+        let (index, ordinal, ended) = match result {
+            RequiredPublication::Row {
+                location: RequiredLocation::Structure(index),
+                row_ordinal,
+            } => (*index, *row_ordinal, false),
+            RequiredPublication::End {
+                terminal: RequiredLocation::Structure(index),
+                end,
+            } => (*index, end.last_body_row_ordinal().unwrap_or(0), true),
+            _ => return Err(MarkdownTableRequestError::InvalidRequest),
+        };
+        let ticket = self
+            .table
+            .structural_tables()
+            .get(index)
+            .ok_or(MarkdownTableRequestError::InvalidRequest)?;
+        let row = VerifiedMarkdownTableRowSource {
+            ticket: Rc::clone(ticket),
+            publication: Rc::clone(&self.publication),
+            ordinal,
+            terminal: match result {
+                RequiredPublication::End { end, .. } => Some(end.clone()),
+                RequiredPublication::Row { .. } => ticket
+                    .table_end
+                    .as_ref()
+                    .filter(|end| end.last_body_row_ordinal().unwrap_or(0) == ordinal)
+                    .cloned(),
+            },
+        };
+        row.require_for(document, authority)?;
+        Ok(Some(if ended {
+            MarkdownViewportSourceRequiredRowResult::TableEnd { terminal: row }
+        } else {
+            MarkdownViewportSourceRequiredRowResult::Row { row }
+        }))
     }
 }
 

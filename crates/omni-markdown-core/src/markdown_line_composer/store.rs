@@ -34,6 +34,11 @@ const ITEM_END: u8 = 7;
 mod control;
 mod forest;
 mod graphemes;
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-shaping-frontier"
+))]
+mod table_row;
 use graphemes::{GraphemeCapture, GraphemeDirectory};
 mod line;
 pub(super) mod output;
@@ -64,6 +69,7 @@ pub(super) struct StoredItemProof {
 
 #[derive(Clone)]
 pub(super) struct StoredItemFacts {
+    pub paragraph_inset_26_6: i32,
     #[cfg(test)]
     pub facts: MarkdownLineItemFacts,
     #[cfg(test)]
@@ -78,7 +84,9 @@ pub(super) struct StoredItemFacts {
 }
 
 struct Directory {
+    paragraph_inset_26_6: i32,
     facts: MarkdownLineItemFacts,
+    presentation: crate::MarkdownPresentationStyles,
     font: FontKey,
     glyph_start: usize,
     glyph_count: usize,
@@ -96,6 +104,8 @@ struct Directory {
     tab_interval: Option<i64>,
     // 只来自原frontier ReadyJob的封闭词证书；该端点不是本目录glyphReady范围。
     frontier_word_end: Option<usize>,
+    /// 只来自原 ItemScan 的两端 UBA 分段许可；它们不是编辑、断行或字素边界。
+    shaping_seams: [Option<(u8, u8)>; 2],
 }
 
 enum Phase {
@@ -157,6 +167,7 @@ impl Rows {
 }
 
 struct Capture {
+    paragraph_inset_26_6: i32,
     // 只在实际producer工作期持原job弱身份；写完即Drop，不把控制块写成内存历史表。
     job: Weak<()>,
     facts: MarkdownLineItemFacts,
@@ -176,6 +187,42 @@ struct Capture {
     y_advance: i64,
     tree: Option<forest::Build>,
     frontier_word_end: Option<usize>,
+    /// 捕获期间每批都与原 Item 的封闭票复核，提交后才写入同一私有目录。
+    shaping_seams: [Option<(u8, u8)>; 2],
+}
+
+/// 只从原 Item 的强类型分段票提取固定元数据；外部范围或相同数值不能登记一个内部边界。
+fn item_shaping_seams(
+    item: &MarkdownLineItem,
+    authority: &MarkdownLayoutTextAuthority,
+) -> Result<[Option<(u8, u8)>; 2]> {
+    if &item.authority != authority {
+        return Err(Error::SourceMismatch);
+    }
+    let mut seams = [None; 2];
+    let facts = item.facts();
+    for (index, proof) in item.shaping_seams().iter().enumerate() {
+        let Some(proof) = proof else {
+            continue; // 普通端点仍由真实 GCB 目录拥有，不能从未登记推导出标量分段许可。
+        };
+        let (_, utf16) = proof.boundary(authority)?;
+        let levels = proof.levels();
+        let expected = if index == 0 {
+            facts.source_utf16.start
+        } else {
+            facts.source_utf16.end
+        };
+        if utf16 != expected
+            || levels.0 == levels.1
+            || levels.0 > 126
+            || levels.1 > 126
+            || (if index == 0 { levels.1 } else { levels.0 }) != facts.level
+        {
+            return Err(Error::InconsistentCoverage);
+        }
+        seams[index] = Some(levels);
+    }
+    Ok(seams)
 }
 
 /// 只有一页16KiB输出缓存及一个当前capture；任何失败都撤销整个尚未封口的候选。
@@ -195,6 +242,22 @@ pub(super) struct GlyphStore {
     items: usize,
     observer: LayoutIndexObserver,
     graphemes: Option<GraphemeCapture>,
+    folds: Option<crate::markdown_layout_source::folds::FoldPlan>,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    tables: Option<crate::markdown_layout_source::table_rows::TablePlan>,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    table_skip: Option<crate::markdown_layout_source::table_rows::TableSpan>,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    table_line: Option<table_row::TableLineCapture>,
     // 只随真实LineEnd提交；后继GCB预取不能扩张旧输出的目录/EOF。
     published_graphemes: Option<GraphemeDirectory>,
     line_end: Option<usize>,
@@ -236,6 +299,22 @@ impl GlyphStore {
             items: 0,
             observer,
             graphemes: None,
+            folds: None,
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            tables: None,
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            table_skip: None,
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            table_line: None,
             published_graphemes: None,
             line_end: None,
             line_source_end: 0,
@@ -254,6 +333,38 @@ impl GlyphStore {
             &self.source,
         ));
         self.resources = Some(resources);
+    }
+
+    /// 只在 composer 构造时分享原有限物理行 proof；输出 reader 不保存第二份范围目录。
+    pub(super) fn set_fold_plan(
+        &mut self,
+        folds: Option<crate::markdown_layout_source::folds::FoldPlan>,
+    ) {
+        self.folds = folds;
+    }
+
+    /// 输出与原 Unicode job 共用结构身份；只读查询不会给表格内部原正文补布局权限。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub(super) fn set_table_plan(
+        &mut self,
+        plan: Option<crate::markdown_layout_source::table_rows::TablePlan>,
+    ) {
+        self.tables = plan;
+    }
+
+    /// 当前行的迁移范围只来自 sealed row，不接受外部裸 Range。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub(super) fn set_table_skip(
+        &mut self,
+        span: crate::markdown_layout_source::table_rows::TableSpan,
+    ) {
+        self.table_skip = Some(span);
     }
 
     fn guard(&self) -> Result<()> {
@@ -308,6 +419,7 @@ impl GlyphStore {
             || profile.source_generation != self.source.generation()
             || profile.glyph_count != capture.count
             || item.facts() != &capture.facts
+            || item_shaping_seams(item, &self.authority)? != capture.shaping_seams
         {
             return Err(Error::SourceMismatch);
         }
@@ -318,20 +430,32 @@ impl GlyphStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn begin(&mut self, item: &mut MarkdownLineItem) -> Result<()> {
+        self.begin_with_inset(item, 0)
+    }
+
+    /// 原捕获和字形记录数不变；缩进只随这一个同 nonce Item 写入既有目录空闲字段。
+    pub(super) fn begin_with_inset(
+        &mut self,
+        item: &mut MarkdownLineItem,
+        paragraph_inset_26_6: i32,
+    ) -> Result<()> {
         let result = (|| {
             self.guard()?;
             if self.capture.is_some()
                 || self.control_capture.is_some()
                 || item.facts().source_utf16.start != self.source_end
                 || !matches!(self.index, Some(Rows::Writing(_)))
-                || self
-                    .graphemes
-                    .as_ref()
-                    .is_some_and(GraphemeCapture::has_buffered_record)
+                || self.graphemes.as_ref().is_some_and(|capture| {
+                    capture.has_buffered_through(item.facts().source_utf16.end)
+                })
             {
                 return Err(Error::InconsistentCoverage);
             }
+            if paragraph_inset_26_6 < 0 {
+                return Err(Error::InvalidRequest);
+            } // 真正参与行宽运算的封存值不能为负，不能扩大超过原正文列的可用范围。
             let registration = item.registration.clone().ok_or(Error::FontExpired)?;
             let registered = self.fonts.require_registration(&registration)?;
             if item.authority != self.authority || !registered.font().permits(&item.font) {
@@ -344,6 +468,7 @@ impl GlyphStore {
             let frontier_word_end = item.job.frontier_word_end(&self.authority, &item.font)?;
             #[cfg(not(feature = "paged-shaping-frontier"))]
             let frontier_word_end = None;
+            let shaping_seams = item_shaping_seams(item, &self.authority)?;
             let created =
                 MarkdownGlyphClusterIndex::new(&mut item.job, &self.authority, &item.font);
             if created.is_err()
@@ -357,6 +482,7 @@ impl GlyphStore {
             );
             let glyph_start = self.index.as_ref().ok_or(Error::Poisoned)?.len();
             self.capture = Some(Capture {
+                paragraph_inset_26_6,
                 job: item.job.index_identity(),
                 facts: item.facts().clone(),
                 registration,
@@ -375,6 +501,7 @@ impl GlyphStore {
                 y_advance: 0,
                 tree: None,
                 frontier_word_end,
+                shaping_seams,
             });
             self.require_capture(item)
         })();
@@ -544,7 +671,9 @@ impl GlyphStore {
                 let capture = self.capture.as_mut().ok_or(Error::InvalidRequest)?;
                 let origin = self.origins.checked_add(1).ok_or(Error::Overflow)?;
                 let directory = Directory {
+                    paragraph_inset_26_6: capture.paragraph_inset_26_6,
                     facts: capture.facts.clone(),
+                    presentation: capture.style.presentation,
                     font: capture.registration.key(),
                     glyph_start: capture.glyph_start,
                     glyph_count: capture.count,
@@ -561,6 +690,7 @@ impl GlyphStore {
                     kind: super::MarkdownComposedLinePartKind::Glyphs,
                     tab_interval: None,
                     frontier_word_end: capture.frontier_word_end,
+                    shaping_seams: capture.shaping_seams,
                 };
                 let file = self.index.as_mut().ok_or(Error::Poisoned)?;
                 let record = capture
@@ -663,6 +793,7 @@ impl GlyphStore {
         let result = (|| {
             let directory = self.directory(proof)?;
             Ok(StoredItemFacts {
+                paragraph_inset_26_6: directory.paragraph_inset_26_6,
                 #[cfg(test)]
                 facts: directory.facts,
                 #[cfg(test)]
@@ -675,6 +806,26 @@ impl GlyphStore {
                 y_advance_26_6: directory.y_advance,
                 registration: self.fonts.resolve(directory.font)?.registration(),
             })
+        })();
+        self.finish(result)
+    }
+
+    /// 只为原已选重排范围领取一个真实Glyphs目录；Tab或跨item范围没有单字体重排权限。
+    pub(super) fn resolution_item_at(
+        &mut self,
+        range: &Range<usize>,
+    ) -> Result<Option<StoredItemProof>> {
+        let result = (|| {
+            let Some(proof) = self.item_at(range.start)? else {
+                return Ok(None);
+            };
+            let directory = self.directory(&proof)?;
+            Ok(
+                (directory.kind == super::MarkdownComposedLinePartKind::Glyphs
+                    && range.start >= directory.facts.source_utf16.start
+                    && range.end <= directory.facts.source_utf16.end)
+                    .then_some(proof),
+            )
         })();
         self.finish(result)
     }
@@ -865,6 +1016,7 @@ impl GlyphStore {
                 )
             };
             Ok(MarkdownLineComposeStyle {
+                presentation: directory.presentation,
                 points: directory.facts.points,
                 language,
                 features,
@@ -1204,6 +1356,17 @@ fn encode_directory(value: &Directory) -> Result<[[u8; 64]; 3]> {
             .unwrap_or(0)
             .to_le_bytes(),
     );
+    // 绘制语义与原item同一固定记录封存；不增加正文、样式表或额外IO记录。
+    rows[2][40..44].copy_from_slice(&value.presentation.bits().to_le_bytes());
+    rows[2][44..48].copy_from_slice(&value.paragraph_inset_26_6.to_le_bytes());
+    // 两个实际 UBA seam 复用既有目录保留位；不扩大记录或新建按 item 增长的内存索引。
+    for (index, levels) in value.shaping_seams.iter().enumerate() {
+        if let Some((left, right)) = levels {
+            rows[2][48] |= 1 << index;
+            rows[2][49 + index * 2] = *left;
+            rows[2][50 + index * 2] = *right;
+        }
+    }
     rows[2][56] = ITEM_END;
     Ok(rows)
 }
@@ -1215,7 +1378,7 @@ fn decode_directory(rows: [[u8; 64]; 3]) -> Result<Directory> {
         || rows[1][10..12]
             .iter()
             .chain(rows[1][57..].iter())
-            .chain(rows[2][40..56].iter())
+            .chain(rows[2][53..56].iter())
             .chain(rows[2][57..].iter())
             .any(|value| *value != 0)
     {
@@ -1238,6 +1401,28 @@ fn decode_directory(rows: [[u8; 64]; 3]) -> Result<Directory> {
         end_of_text: rows[0][59] & 2 != 0,
     };
     let kind = super::MarkdownComposedLinePartKind::decode(rows[1][54])?;
+    if rows[2][48] > 3 {
+        return Err(Error::InconsistentCoverage);
+    }
+    let mut shaping_seams = [None; 2];
+    for (index, seam) in shaping_seams.iter_mut().enumerate() {
+        let levels = (rows[2][49 + index * 2], rows[2][50 + index * 2]);
+        if rows[2][48] & (1 << index) == 0 {
+            if levels != (0, 0) {
+                return Err(Error::InconsistentCoverage);
+            }
+            continue; // 无许可的保留位必须仍为空，不能把损坏目录解释成普通端点。
+        }
+        if kind != super::MarkdownComposedLinePartKind::Glyphs
+            || levels.0 == levels.1
+            || levels.0 > 126
+            || levels.1 > 126
+            || (if index == 0 { levels.1 } else { levels.0 }) != facts.level
+        {
+            return Err(Error::InconsistentCoverage);
+        }
+        *seam = Some(levels);
+    }
     let tab_interval = match (rows[1][55], i64_at(&rows[2], 24)) {
         (0, 0) => None,
         (1, value) if value >= 0 => Some(value),
@@ -1257,12 +1442,15 @@ fn decode_directory(rows: [[u8; 64]; 3]) -> Result<Directory> {
     }) {
         return Err(Error::InconsistentCoverage);
     } // 最后真实短片可等于原词末端；任何consumer仍核同Source/Font/origin，不据数字扩大源覆盖。
-    if (facts.source_utf16.is_empty()
-        && kind != super::MarkdownComposedLinePartKind::ParagraphBreak)
+    let paragraph_inset_26_6 =
+        i32::from_le_bytes(rows[2][44..48].try_into().expect("固定4B缩进字段"));
+    if paragraph_inset_26_6 < 0
+        || (facts.source_utf16.is_empty()
+            && kind != super::MarkdownComposedLinePartKind::ParagraphBreak)
         || facts.source_utf16.start < facts.paragraph_utf16.start
         || facts.source_utf16.end > facts.paragraph_utf16.end
         || !facts.points.is_finite()
-        || facts.points <= 0.0
+        || (facts.points <= 0.0 && kind != super::MarkdownComposedLinePartKind::TableRow)
         || facts.level > 126
         || origin == 0
         || origin != u64_at(&rows[2], 16)
@@ -1280,7 +1468,12 @@ fn decode_directory(rows: [[u8; 64]; 3]) -> Result<Directory> {
         Some(usize_at(&rows[0], 48)?)
     };
     Ok(Directory {
+        paragraph_inset_26_6,
         facts,
+        presentation: crate::MarkdownPresentationStyles::from_bits(u32::from_le_bytes(
+            rows[2][40..44].try_into().expect("固定4B样式字段"),
+        ))
+        .ok_or(Error::InconsistentCoverage)?,
         font: FontKey {
             generation: u64_at(&rows[1], 0),
             slot: u16::from_le_bytes(rows[1][8..10].try_into().expect("固定2B字段")),
@@ -1303,6 +1496,7 @@ fn decode_directory(rows: [[u8; 64]; 3]) -> Result<Directory> {
         kind,
         tab_interval,
         frontier_word_end,
+        shaping_seams,
     })
 }
 

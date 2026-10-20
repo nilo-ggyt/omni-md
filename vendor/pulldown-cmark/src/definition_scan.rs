@@ -239,7 +239,7 @@ impl TitleScanner {
             let byte = bytes[consumed];
             match self.phase {
                 TitlePhase::Complete | TitlePhase::Rejected | TitlePhase::AwaitLine => {
-                    return (consumed, self.step())
+                    return (consumed, self.step());
                 }
                 TitlePhase::Start => {
                     self.closing = match byte {
@@ -389,7 +389,7 @@ impl RefdefSpaceScanner {
             let byte = bytes[consumed];
             match self.phase {
                 SpacePhase::Complete | SpacePhase::Rejected | SpacePhase::AwaitLine => {
-                    return (consumed, self.step())
+                    return (consumed, self.step());
                 }
                 SpacePhase::PendingCr => {
                     if byte == b'\n' {

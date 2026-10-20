@@ -9,6 +9,10 @@ use std::{
 };
 use tempfile::TempDir;
 
+#[cfg(feature = "paged-shaping-frontier")]
+#[path = "fold_tests.rs"]
+mod fold_tests;
+
 const TINY: MarkdownGraphemeBudget = MarkdownGraphemeBudget {
     bytes: 3,
     scalars: 1,

@@ -2,7 +2,9 @@
 
 use super::cell::{CellPermit, NativeMarkdownPagedCellSession};
 use super::*;
-use omni_markdown_core::{MarkdownCellDraftSourceAuthority, MarkdownLayoutTextSource};
+use omni_markdown_core::{
+    MarkdownCellDraftSourceAuthority, MarkdownLayoutTextSource, MarkdownLayoutTextSourceDomain,
+};
 
 pub(super) enum InputTarget {
     Body(Weak<RefCell<MarkdownDocumentBuffer>>),
@@ -18,6 +20,7 @@ enum Domain {
     Cell {
         session: Weak<NativeMarkdownPagedCellSession>,
         source: MarkdownCellDraftSourceAuthority,
+        alignment: omni_markdown_core::MarkdownTableAlignment,
     },
 }
 
@@ -34,12 +37,14 @@ impl NativeMarkdownPagedTargetDomain {
                 Domain::Cell {
                     session: a,
                     source: x,
+                    alignment: left,
                 },
                 Domain::Cell {
                     session: b,
                     source: y,
+                    alignment: right,
                 },
-            ) => Weak::ptr_eq(a, b) && x == y,
+            ) => Weak::ptr_eq(a, b) && x == y && left == right,
             _ => false, // Body与Cell从不共享位置域，不能比较原Doc指针后继续解释局部range。
         }
     }
@@ -49,6 +54,15 @@ impl NativeMarkdownPagedTargetDomain {
         matches!(&self.0, Domain::Body(original) if Weak::ptr_eq(original, document))
     }
 
+    /// 活动格的真实列方向属于已捕获 session/source；正文没有表列方向，不改变原段落设置。
+    #[must_use]
+    pub fn cell_alignment(&self) -> Option<omni_markdown_core::MarkdownTableAlignment> {
+        match &self.0 {
+            Domain::Body(_) => None,
+            Domain::Cell { alignment, .. } => Some(*alignment),
+        }
+    }
+
     /// 此门只核原capture类别与弱内容身份；Body的具体Doc/capture仍由原producer和SceneKey核对。
     ///
     /// # Errors
@@ -56,12 +70,14 @@ impl NativeMarkdownPagedTargetDomain {
     pub fn require_source(&self, source: &MarkdownLayoutTextSource) -> Result<()> {
         source.byte_offset_for_utf16(0)?; // public有限端点门同样保原Source首错，不另借正文或造Source票。
         let accepted = match &self.0 {
-            Domain::Body(_) => source.cell_draft_authority().is_none(),
+            Domain::Body(_) => source.domain() == MarkdownLayoutTextSourceDomain::Canonical,
             Domain::Cell {
                 session,
                 source: original,
+                ..
             } => {
-                session.strong_count() != 0
+                source.domain() == MarkdownLayoutTextSourceDomain::ActiveCellDraft
+                    && session.strong_count() != 0
                     && source.cell_draft_authority().as_ref() == Some(original)
             }
         };
@@ -109,6 +125,7 @@ impl InputTarget {
                 Domain::Cell {
                     session: session.clone(),
                     source,
+                    alignment: original.alignment(),
                 }
             }
         };

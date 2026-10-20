@@ -156,6 +156,7 @@ fn leading_and_intermediate_crlf_keep_original_dependencies_and_next_real_style(
                                         range,
                                         &registered,
                                         MarkdownLineComposeStyle {
+                                            presentation: Default::default(),
                                             points: 16.0,
                                             language: None,
                                             features: Vec::new(),
@@ -263,6 +264,13 @@ fn actual_255_byte_crlf_prefix_and_four_mebibyte_tail_publish_a_real_tail_line_b
         bytes += step.bytes;
         match step.answer {
             MarkdownLineComposeAnswer::Yielded => {}
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            MarkdownLineComposeAnswer::NeedsTableRow(_) => {
+                panic!("未启用表格流的原文字 oracle 不应产生 Grid 请求")
+            }
             MarkdownLineComposeAnswer::NeedStyle(request) => {
                 let range = request.source_range();
                 worker
@@ -272,6 +280,7 @@ fn actual_255_byte_crlf_prefix_and_four_mebibyte_tail_publish_a_real_tail_line_b
                                 range,
                                 &registered,
                                 MarkdownLineComposeStyle {
+                                    presentation: Default::default(),
                                     points: 16.0,
                                     language: None,
                                     features: Vec::new(),

@@ -15,13 +15,24 @@ use crate::{
 };
 
 #[cfg(feature = "paged-shaping-frontier")]
-mod word;
+pub(super) mod word;
 #[cfg(feature = "paged-shaping-frontier")]
 pub use word::{
     MarkdownWordDeleteAnswer, MarkdownWordDeleteDirection, MarkdownWordDeleteStep,
     MarkdownWordGroupAction, MarkdownWordGroupAnswer, MarkdownWordGroupStep,
-    MarkdownWordMovePreparation,
+    MarkdownWordMovePreparation, MarkdownWordMoveScope,
 };
+
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-shaping-frontier"
+))]
+pub(super) mod table_row;
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-shaping-frontier"
+))]
+pub use table_row::{MarkdownLineTableRowRequest, MarkdownLineTableRowResponse};
 
 /// LineReady只由真实LineEnd产生；待处理控制或unsafe/词典/缺字都保留原阶段。
 #[derive(Clone)]
@@ -33,11 +44,19 @@ pub enum MarkdownLineComposeAnswer {
     NeedsControl(MarkdownLineInlineControl),
     NeedsResolution(MarkdownSoftLineMeasureChoice),
     NeedsTabPlacement(MarkdownLineTabPlacement),
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    NeedsTableRow(MarkdownLineTableRowRequest),
     #[cfg(feature = "paged-shaping-frontier")]
     NeedsFrontier(MarkdownLineFrontierReason),
 }
 pub struct MarkdownLineComposeStep {
     pub bytes: usize,
+    /// 本次只消费已发布目录或字形；供调度器在原剩余配额内继续，不授予新的源读取额度。
+    /// 未逐项证明的阶段始终为 false，零 bytes 本身不能证明没有原文端点或控制字符读取。
+    pub source_free_continuation: bool,
     /// 真实前沿子任务的邻接上下文读量；和source扫描、带halo输入分别保留。
     #[cfg(feature = "paged-shaping-frontier")]
     pub context_bytes: usize,
@@ -51,6 +70,7 @@ impl MarkdownLineComposeStep {
     fn yielded() -> Self {
         Self {
             bytes: 0,
+            source_free_continuation: false,
             #[cfg(feature = "paged-shaping-frontier")]
             context_bytes: 0,
             scalars: 0,
@@ -78,6 +98,26 @@ enum Stage {
     ControlCapture,
     EmptyPublish,
     TabPending,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    TableRow,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    TableGraphemes,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    TableCapture,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    TablePublish,
 }
 /// GCB复制只服务真实Ready item/control；配额暂停保留同一个待消费owner，不重建Job。
 #[derive(Clone, Copy)]
@@ -92,6 +132,11 @@ struct Payload {
     #[cfg(feature = "paged-shaping-frontier")]
     word_delete: Option<word::WordJob>,
     store: GlyphStore,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    table: Option<table_row::PendingRow>,
     stage: Stage,
     // 真实LB Pending后仅留一个恢复标量；下一量子只推进原依赖，原Stage和consumer原样保留。
     #[cfg(feature = "paged-shaping-frontier")]
@@ -116,8 +161,57 @@ struct Payload {
     tab_pending: Option<MarkdownLineTabPlacement>,
     start: usize,
     width: i64,
+    style_inset_26_6: i32,
     // 所有selector和已移出的prefix都先真实归还，最后才结算原selector收据。
     resolver_resources: Option<super::worker_resources::ResolveResourceClaim>,
+}
+
+impl Payload {
+    /// 原构造与同源样式重排共用唯一组合游标；传入的索引依赖已由调用方确定所有权。
+    fn new(
+        source: MarkdownLayoutTextSource,
+        coordinator: MarkdownLineItemCoordinator,
+        store: GlyphStore,
+        width: i64,
+    ) -> Box<Self> {
+        Box::new(Self {
+            source,
+            coordinator,
+            #[cfg(feature = "paged-shaping-frontier")]
+            word_delete: None,
+            store,
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            table: None,
+            stage: Stage::Item,
+            #[cfg(feature = "paged-shaping-frontier")]
+            line_breaks_pending: false,
+            #[cfg(feature = "paged-shaping-frontier")]
+            graphemes_pending: false,
+            request: None,
+            item: None,
+            graphemes: None,
+            current: None,
+            next: None,
+            measure: None,
+            next_start: None,
+            resolution: None,
+            resolver: None,
+            resolved_capture: None,
+            control: None,
+            empty_due: false,
+            empty_capture: false,
+            pen: 0,
+            next_pen: 0,
+            tab_pending: None,
+            start: 0,
+            width,
+            style_inset_26_6: 0,
+            resolver_resources: None,
+        })
+    }
 }
 
 /// 只保一个实际Job、一个Measure和一个固定页Store；历史item在同一匿名File中检索。
@@ -153,37 +247,7 @@ impl MarkdownLineComposer {
         store.set_resource_scope(resources.clone());
         let backing = source.original_backing_observer();
         Ok(Self {
-            payload: Some(Box::new(Payload {
-                source,
-                coordinator,
-                #[cfg(feature = "paged-shaping-frontier")]
-                word_delete: None,
-                store,
-                stage: Stage::Item,
-                #[cfg(feature = "paged-shaping-frontier")]
-                line_breaks_pending: false,
-                #[cfg(feature = "paged-shaping-frontier")]
-                graphemes_pending: false,
-                request: None,
-                item: None,
-                graphemes: None,
-                current: None,
-                next: None,
-                measure: None,
-                next_start: None,
-                resolution: None,
-                resolver: None,
-                resolved_capture: None,
-                control: None,
-                empty_due: false,
-                empty_capture: false,
-                pen: 0,
-                next_pen: 0,
-                tab_pending: None,
-                start: 0,
-                width: width_26_6,
-                resolver_resources: None,
-            })),
+            payload: Some(Payload::new(source, coordinator, store, width_26_6)),
             authority: authority.clone(),
             cancellation,
             backing,
@@ -265,6 +329,29 @@ impl MarkdownLineComposer {
     pub fn source_authority(&self) -> &MarkdownLayoutTextAuthority {
         &self.authority
     }
+
+    /// 仅在首次 step 之前安装原锚点的有限物理行投影；正文、Source 身份与语言索引保持原样。
+    /// 隐区仍连续覆盖 canonical 坐标，但不会送入字体选择或字形整形。
+    ///
+    /// # Errors
+    /// 超过原折叠上限、端点不是真实物理换行、已开始排版或源失败时撤销本 worker。
+    pub fn install_folded_ranges(&mut self, ranges: &[std::ops::Range<usize>]) -> Result<()> {
+        let result = (|| {
+            self.guard()?;
+            let payload = self
+                .payload
+                .as_mut()
+                .ok_or(MarkdownLineComposeError::Poisoned)?;
+            if !matches!(payload.stage, Stage::Item) || payload.start != 0 {
+                return Err(MarkdownLineComposeError::InvalidRequest);
+            }
+            payload.coordinator.install_folded_ranges(ranges)?;
+            // 输出保留同一有限端点 proof，公开 GCB 查询必须识别未迁入的隐区，而非答成非字素。
+            payload.store.set_fold_plan(payload.coordinator.fold_plan());
+            Ok(())
+        })();
+        self.finish(result)
+    }
     /// 只观察原writer的实际FD/映射与源释放；快照reader必须另取自身收据。
     pub fn resource_observer(&self) -> Result<MarkdownComposedLineResourceObserver> {
         self.guard()?;
@@ -278,6 +365,118 @@ impl MarkdownLineComposer {
     pub fn worker_resource_observer(&self) -> MarkdownLineComposerWorkerResourceObserver {
         self.resources.observer()
     }
+
+    /// 选择相关的语法显隐变化使旧字形/软行失效；同一Source和已计算语言索引继续使用。
+    /// 调用前必须归还旧prefix Reader及Font试次；本方法不读取正文，也不重建UBA/Script/GCB。
+    ///
+    /// # Errors
+    /// 原Source失败、取消、旧派生资源未归还或新输出文件创建失败时撤销本worker。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub fn reset_styles(&mut self, fonts: MarkdownLineFontCatalog) -> Result<()> {
+        let old_resources = self.resources.observer();
+        let result = (|| {
+            self.guard()?;
+            // 这个局部作用域先结束整张旧glyph图；不能在旧Measure/item/Store仍活时创建新writer。
+            let (source, mut coordinator, width, writer) = {
+                let mut payload = self
+                    .payload
+                    .take()
+                    .ok_or(MarkdownLineComposeError::Poisoned)?;
+                close_resolver(&mut payload)?;
+                let writer = payload.store.resource_observer()?;
+                let Payload {
+                    source,
+                    coordinator,
+                    store,
+                    width,
+                    ..
+                } = *payload;
+                drop(store);
+                (source, coordinator, width, writer)
+            }; // payload在此作用域内声明，未移出的旧item/Measure等字段也在新图创建前析构。
+            coordinator.reset_styles()?;
+            let closed = writer.snapshot();
+            let retired = old_resources
+                .snapshot()
+                .ok_or(MarkdownLineComposeError::Poisoned)?;
+            if closed.file_open
+                || closed.mapped_bytes != 0
+                || closed.cleanup_failed
+                || closed.reader_failed
+                || !retired.coverage_complete
+                || retired.observation_failed
+                || retired.shapes.active != 0
+                || retired.shapes.cleanup_failed
+                || retired.shapes.first_error.is_some()
+                || retired.clusters.active != 0
+                || retired.clusters.cleanup_failed
+                || retired.resolvers.active != 0
+                || retired.resolvers.cleanup_failed
+            {
+                return Err(MarkdownLineComposeError::Poisoned);
+            } // 真实关闭失败不能被新空writer洗掉；复用中的语言依赖在最终会话关闭时独立验收。
+            let resources = coordinator.resource_scope();
+            let mut store = GlyphStore::new(
+                source.clone(),
+                &self.authority,
+                fonts,
+                self.cancellation.clone(),
+            )?;
+            store.set_resource_scope(resources.clone());
+            store.set_fold_plan(coordinator.fold_plan());
+            #[cfg(feature = "s2-table-window-prototype")]
+            store.set_table_plan(coordinator.table_plan());
+            self.resources = resources;
+            self.payload = Some(Payload::new(source, coordinator, store, width));
+            Ok(())
+        })();
+        if let Err(cause) = result {
+            drop(self.payload.take()); // 失败候选先真实退出，随后读取同次Drop刚记录的Source/shape首错。
+            if let Some(errno) = self
+                .backing
+                .as_ref()
+                .and_then(|backing| backing.first_errno())
+            {
+                return Err(
+                    crate::MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into(),
+                );
+            }
+            if let Some(error) = old_resources
+                .snapshot()
+                .and_then(|resources| resources.shapes.first_error)
+            {
+                return Err(MarkdownLineComposeError::StyleResetCleanup {
+                    cause: Box::new(cause),
+                    operation: error.operation,
+                    errno: error.errno,
+                }); // 原操作与真实归还errno共同保留，不能用新空账本或Poisoned覆盖失败详情。
+            }
+            return Err(cause); // payload已移出时不能调用常规finish，把真实原错改写成“空payload”。
+        }
+        self.finish(Ok(()))
+    }
+    /// 查询当前已经发布的样式请求，不推进协调器、读取正文或重新签发 nonce。
+    /// 调用方可在本次有限工作结束后保留它，下一回合仍沿原样式响应入口消费。
+    ///
+    /// # Errors
+    /// 原 Source、取消或 worker 已失效时拒绝；样式阶段缺少原请求仍是真实覆盖错误。
+    pub fn pending_style_request(&self) -> Result<Option<MarkdownLineStyleRequest>> {
+        self.guard()?;
+        let payload = self
+            .payload
+            .as_ref()
+            .ok_or(MarkdownLineComposeError::Poisoned)?;
+        if !matches!(payload.stage, Stage::Style) {
+            return Ok(None);
+        }
+        payload
+            .request
+            .as_ref()
+            .cloned()
+            .map(Some)
+            .ok_or(MarkdownLineComposeError::InconsistentCoverage)
+    }
+
     /// 外部响应仍消费原协调器的nonce；同范围、同名字体或新捕文档均不能补签旧请求。
     /// 只借原协调器的唯一依赖签发一个GCB，不推进排版或构造第二份索引。
     ///
@@ -301,6 +500,67 @@ impl MarkdownLineComposer {
         self.finish(result)
     }
 
+    /// 原字体候选已真实归还当前 worker 后，借唯一协调器推进同一 GCB 的下一 level 段。
+    /// 只转移实际目录费用，不重建 Bidi/Script 或为平台 worker 创建第二份 owner。
+    pub fn step_font_probe_segment(
+        &mut self,
+        probe: &mut MarkdownLineFontProbe,
+        budget: MarkdownLineComposeBudget,
+    ) -> Result<MarkdownLineFontProbeSegmentStep> {
+        let result = (|| {
+            self.guard()?;
+            let payload = self
+                .payload
+                .as_mut()
+                .ok_or(MarkdownLineComposeError::Poisoned)?;
+            if !matches!(payload.stage, Stage::Style) {
+                return Err(MarkdownLineComposeError::InvalidRequest);
+            }
+            payload.coordinator.step_font_probe_segment(probe, budget)
+        })();
+        self.finish(result)
+    }
+
+    /// 同一候选任一真实段缺字后才重启外层 GCB；原请求、取消与失败责任仍归该 Composer。
+    pub fn restart_font_probe(&mut self, probe: &mut MarkdownLineFontProbe) -> Result<()> {
+        let result = (|| {
+            self.guard()?;
+            let payload = self
+                .payload
+                .as_mut()
+                .ok_or(MarkdownLineComposeError::Poisoned)?;
+            if !matches!(payload.stage, Stage::Style) {
+                return Err(MarkdownLineComposeError::InvalidRequest);
+            }
+            payload.coordinator.restart_font_probe(probe)
+        })();
+        self.finish(result)
+    }
+
+    /// 只借当前右GCB请求的同一RootLeaf票；不把Rc出版物放入必须Send的请求或字体worker。
+    /// 原样式颜色变化不直接封口，后继实际Font响应仍由唯一协调器验证。
+    ///
+    /// # Errors
+    /// 原Source首错、取消、阶段或nonce失效时拒绝，不能借相同数值范围重放。
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub fn root_leaf_style_boundary_for(
+        &self,
+        request: &MarkdownLineStyleRequest,
+    ) -> Result<Option<&crate::VerifiedMarkdownRootLeafStyleBoundary>> {
+        self.guard()?;
+        let payload = self
+            .payload
+            .as_ref()
+            .ok_or(MarkdownLineComposeError::Poisoned)?;
+        if !matches!(payload.stage, Stage::Style) {
+            return Err(MarkdownLineComposeError::InvalidRequest);
+        }
+        payload.coordinator.root_leaf_style_boundary_for(request)
+    }
+
     /// 外部响应消费原协调器的nonce；原完整字体响应仍由唯一coordinator核验。
     pub fn provide_style(&mut self, response: MarkdownLineStyleResponse) -> Result<()> {
         let result = (|| {
@@ -312,6 +572,25 @@ impl MarkdownLineComposer {
             if !matches!(payload.stage, Stage::Style) {
                 return Err(MarkdownLineComposeError::InvalidRequest);
             }
+            let inset = response.paragraph_inset_26_6;
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            let font_witness = payload
+                .coordinator
+                .root_leaf_style_boundary_for(
+                    payload
+                        .request
+                        .as_ref()
+                        .ok_or(MarkdownLineComposeError::InvalidRequest)?,
+                )?
+                .is_some();
+            #[cfg(not(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            )))]
+            let font_witness = false;
             #[cfg(feature = "paged-shaping-frontier")]
             {
                 if payload
@@ -327,6 +606,9 @@ impl MarkdownLineComposer {
             }
             #[cfg(not(feature = "paged-shaping-frontier"))]
             payload.coordinator.provide_style(response)?;
+            if !font_witness {
+                payload.style_inset_26_6 = inset;
+            } // 右GCB只见证Font边界，不能把它的段落缩进写给仍待发布的左项；正常响应保持原合同。
             payload.request = None;
             payload.stage = Stage::Item;
             Ok(())
@@ -367,9 +649,24 @@ impl MarkdownLineComposer {
             } else {
                 payload.coordinator.consume_control(response)?
             };
+            let at_eof = value.facts.source_utf16.end == payload.source.utf16_len();
+            let trailing_separator =
+                if at_eof && value.request.kind == MarkdownLineInlineControlKind::FoldedSection {
+                    // 原 TextKit 仍显示真实尾分隔符之后的空段；折到未终止正文 EOF 则没有后继空行。
+                    matches!(
+                        payload
+                            .source
+                            .snapshot_for_bidi()
+                            .utf16_code_unit_at(value.facts.source_utf16.end - 1)?,
+                        10 | 13 | 0x85 | 0x2028 | 0x2029
+                    )
+                } else {
+                    true
+                };
             payload.empty_due = !payload.empty_capture
                 && value.request.kind != MarkdownLineInlineControlKind::Tab
-                && value.facts.source_utf16.end == payload.source.utf16_len();
+                && at_eof
+                && trailing_separator;
             payload.store.begin_control(value)?;
             payload.control = None;
             payload.stage = Stage::ControlCapture;
@@ -417,7 +714,22 @@ impl MarkdownLineComposer {
             result.records = progress.records;
             return Ok(result); // 同一个原GCB前进一次后交回消费者，不能同量子再读一份预算。
         }
+        // 只认可已审核的原 GCB/字形目录消费阶段。Item、行起点和重排封存可能
+        // 隐式读取源端点，不能把它们的零 bytes 误当作可在同一量子继续的证明。
+        // 依赖推进的早返回保持 false；真实读源仍归它本来的独立步骤与错误路径。
+        result.source_free_continuation = matches!(
+            payload.stage,
+            Stage::Graphemes | Stage::Capture | Stage::Measure | Stage::ControlCapture
+        );
         match payload.stage {
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            Stage::TableRow | Stage::TableGraphemes | Stage::TableCapture | Stage::TablePublish => {
+                table_row::advance(payload, &self.authority, budget, &mut result)?;
+            }
+
             Stage::Item => {
                 let progress = payload.coordinator.step(budget)?;
                 result.bytes = progress.bytes;
@@ -478,12 +790,23 @@ impl MarkdownLineComposer {
                     .graphemes
                     .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
                 let (_, breaks) = payload.coordinator.dependencies()?;
-                let progress = payload.store.capture_graphemes_through(
-                    breaks,
-                    through,
-                    budget.records.min(256),
-                    budget.metadata_units.min(256),
-                )?;
+                let progress = match resume {
+                    GraphemeResume::Item => payload.store.capture_item_graphemes(
+                        breaks,
+                        payload
+                            .item
+                            .as_ref()
+                            .ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
+                        budget.records.min(256),
+                        budget.metadata_units.min(256),
+                    )?,
+                    GraphemeResume::Control => payload.store.capture_graphemes_through(
+                        breaks,
+                        through,
+                        budget.records.min(256),
+                        budget.metadata_units.min(256),
+                    )?,
+                };
                 result.records = progress.records;
                 result.metadata_units = progress.metadata_units;
                 if progress.ready {
@@ -492,11 +815,12 @@ impl MarkdownLineComposer {
                     // glyph/cluster/style段内部仍保持其原连续格式和一次producer权限。
                     payload.stage = match resume {
                         GraphemeResume::Item => {
-                            payload.store.begin(
+                            payload.store.begin_with_inset(
                                 payload
                                     .item
                                     .as_mut()
                                     .ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
+                                payload.style_inset_26_6,
                             )?;
                             Stage::Capture
                         }
@@ -560,12 +884,18 @@ impl MarkdownLineComposer {
                         payload.stage = Stage::TabPending;
                         return Ok(result);
                     }
-                    let font = payload.store.facts(&proof)?.registration.authority()?;
+                    let facts = payload.store.facts(&proof)?;
+                    let font = facts.registration.authority()?;
+                    let width = payload
+                        .width
+                        .checked_sub(i64::from(facts.paragraph_inset_26_6) * 2)
+                        .filter(|width| *width > 0)
+                        .ok_or(MarkdownLineComposeError::InvalidRequest)?;
                     let (_, breaks) = payload.coordinator.dependencies()?;
                     let mut provider = payload.store.borrow_at(&proof, 0)?;
                     let request = MarkdownSoftLineMeasureRequest {
                         start_utf16: payload.start,
-                        width_26_6: payload.width,
+                        width_26_6: width,
                         cancellation: self.cancellation.measure(),
                     };
                     payload.measure = Some(if let Some(start) = payload.next_start.take() {
@@ -604,7 +934,11 @@ impl MarkdownLineComposer {
                     .next
                     .take()
                     .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
-                if let Some(placement) = payload.store.tab_placement(&next, payload.next_pen)?
+                let placement = payload.store.tab_placement(&next, payload.next_pen)?;
+                // 对下一已封存项执行一次元数据准入；这是完整语义操作，不是底层记录或 pread 数。
+                // Tab 尚待决时仍交回原控制路径，不能因已经查过目录就获得继续合并的权限。
+                result.metadata_units = 1;
+                if let Some(placement) = placement
                     && !matches!(placement, MarkdownLineTabPlacement::Left { .. })
                 {
                     payload.next = Some(next);
@@ -629,6 +963,8 @@ impl MarkdownLineComposer {
                 payload.current = Some(next);
                 payload.pen = payload.next_pen;
                 payload.stage = Stage::Measure;
+                // 同 Store 前后项已经真实交接，只读已有目录/字形；失败或提前返回均未到此签发。
+                result.source_free_continuation = true;
             }
             Stage::Measure => {
                 let current = payload
@@ -720,6 +1056,53 @@ impl MarkdownLineComposer {
             }
             Stage::Complete => result.answer = MarkdownLineComposeAnswer::Complete,
             Stage::Resolution => {
+                if payload.resolver.is_none() {
+                    let selected = match payload.resolution.as_ref() {
+                        Some(MarkdownSoftLineMeasureChoice::NeedsEmergencyBreak(value)) => {
+                            Some(value.source_utf16.clone())
+                        }
+                        Some(MarkdownSoftLineMeasureChoice::NeedsReshape {
+                            source_utf16, ..
+                        }) => Some(source_utf16.clone()),
+                        #[cfg(feature = "paged-shaping-frontier")]
+                        Some(MarkdownSoftLineMeasureChoice::NeedsFrontierEmergencyPrefix {
+                            source_utf16,
+                            ..
+                        }) => Some(source_utf16.clone()),
+                        _ => None,
+                    };
+                    if let Some(selected) = selected {
+                        let current = payload
+                            .current
+                            .as_ref()
+                            .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
+                        let measure = payload
+                            .measure
+                            .as_mut()
+                            .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
+                        let item = {
+                            let mut provider = payload.store.borrow_at(current, payload.pen)?;
+                            let permit = measure.resolution_permit(&mut provider)?;
+                            permit.seed(&mut provider)?.item
+                        }; // 先核原current的真实nonce与选中范围，再归还借用查同Store旧目录。
+                        if selected.start < item.start
+                            && let Some(previous) = payload.store.resolution_item_at(&selected)?
+                        {
+                            let previous_font =
+                                payload.store.facts(&previous)?.registration.authority()?;
+                            let mut provider = payload.store.borrow_at(&previous, 0)?;
+                            let facts = crate::markdown_soft_line_measure::provider::GlyphProvider::require(
+                                &mut provider, &self.authority, &previous_font,
+                            )?;
+                            if selected.end <= facts.source_utf16.end {
+                                // 只有整个选中范围属于这一旧item才可恢复；实际Font/points由该目录真实注册与样式提供。
+                                measure.restore_selected_item(&mut provider, &previous_font)?;
+                                payload.current = Some(previous);
+                                payload.pen = 0; // 已认证Glyphs的cluster/reshape不使用pen；仅Tab依赖它，而上方目录已排除Tab。
+                            } // 跨多个Font/Script的选中范围保留原NextItem能力出口，不借其中一段伪造整段。
+                        }
+                    }
+                } // 已启动的原selector保持原锚点，不在每个量子重绑定或重新创建一个重排Job。
                 let current = payload
                     .current
                     .as_ref()
@@ -758,6 +1141,12 @@ impl MarkdownLineComposer {
                         )?
                 };
                 result.bytes = progress.input_bytes;
+                // 重排正文与构造 halo 分开归还原量子；不能把只读了上下文的步骤当作零源工作。
+                result.scalars = progress.input_scalars;
+                #[cfg(feature = "paged-shaping-frontier")]
+                {
+                    result.context_bytes = progress.context_bytes;
+                }
                 result.records = progress.glyphs;
                 result.metadata_units = progress.candidates;
                 result.shapes = progress.shapes;

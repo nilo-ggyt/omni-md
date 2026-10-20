@@ -23,6 +23,9 @@ pub struct MarkdownShapingFeature {
     pub source_utf16_end: u32,
 }
 
+/// 明确选择真实字体表的 OpenType 整形；features 之外不追加平台私有的标点替换或留白策略。
+/// 全宽标点的默认字形可能与 CoreText UIFont 不同，几何必须始终消费本任务封存的实际输出，
+/// 不能按字体名、语言或与另一个引擎的宽度差事后补偿，否则绘图、caret 与命中会失去同一来源。
 #[derive(Clone, Debug)]
 pub struct MarkdownShapingOptions {
     pub direction: MarkdownShapingDirection,

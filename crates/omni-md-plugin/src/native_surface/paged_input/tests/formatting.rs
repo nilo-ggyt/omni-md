@@ -418,9 +418,11 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
             }
         }
     };
-    let session =
-        NativeMarkdownPagedCellSession::begin(Rc::downgrade(&document), Rc::new(verified), 1, 0)
-            .unwrap();
+    let source = document
+        .borrow()
+        .verified_table_cell_source(&verified, 1, 0)
+        .unwrap();
+    let session = NativeMarkdownPagedCellSession::begin(Rc::downgrade(&document), source).unwrap();
     let resources = session.resource_observer().unwrap();
     let owner = NativeMarkdownPagedInput::new_cell(Rc::downgrade(&session)).unwrap();
     let permit = owner.capture(1, &|_| true).unwrap();

@@ -2,11 +2,13 @@
 
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
-use objc2_core_foundation::CGPoint;
+use objc2_core_foundation::{CFRetained, CGPoint};
+use objc2_core_graphics::{CGColorSpace, kCGColorSpaceSRGB};
 use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use omni_markdown_core::{
     MARKDOWN_LINE_FONT_SLOTS, MarkdownComposedLine, MarkdownComposedLinePart,
-    MarkdownComposedLines, MarkdownLineComposeError,
+    MarkdownComposedLines, MarkdownLayoutTextAuthority, MarkdownLineComposeError,
+    MarkdownLineFontRegistration, MarkdownPresentationMode, MarkdownTableCellDisplaySource,
 };
 
 use super::{
@@ -16,11 +18,19 @@ use super::{
 };
 
 mod caret;
+mod table_cell;
+pub use table_cell::NativeMarkdownComposedTableCell;
+mod line_alignment;
+pub(in crate::native_surface) use line_alignment::NativeMarkdownLineAlignmentMeasure;
+pub use line_alignment::NativeMarkdownMeasuredLine;
 mod geometry;
 mod paint;
 mod visual;
 pub use caret::NativeMarkdownComposedCaretGeometry;
 pub use geometry::NativeMarkdownComposedViewportHit;
+pub(in crate::native_surface) use paint::{
+    NativeMarkdownComposedViewportDecorationCursor, NativeMarkdownComposedViewportDecorationStep,
+};
 pub use paint::{
     NativeMarkdownComposedViewportPaintBudget, NativeMarkdownComposedViewportPaintCause,
     NativeMarkdownComposedViewportPaintCompletion, NativeMarkdownComposedViewportPaintError,
@@ -53,8 +63,12 @@ pub enum NativeMarkdownComposedViewportError {
     InvalidRange,
     #[error("原palette没有这个part实际使用的字体")]
     FontMissing,
+    #[error("无法创建原绘图的命名 sRGB 颜色空间")]
+    ColorSpaceUnavailable,
     #[error("原行目录读取失败：{0}")]
     Composed(#[from] MarkdownLineComposeError),
+    #[error("原表格显示来源失效：{0:?}")]
+    Table(omni_markdown_core::markdown_document_buffer::MarkdownTableRequestError),
     #[error("原字体注册或度量失效：{0}")]
     Font(#[from] NativeMarkdownLineFontError),
     #[error("原行文字几何失效：{0}")]
@@ -66,6 +80,12 @@ struct Part {
     handle: MarkdownComposedLinePart,
     font: usize,
 }
+/// 每个实际使用的 Font 只保同输出的原弱注册票；同名或另一 catalog 的活 Font 不能代替它续权。
+struct FontUse {
+    index: usize,
+    registration: MarkdownLineFontRegistration,
+}
+
 struct Line {
     handle: MarkdownComposedLine,
     parts: Vec<Part>,
@@ -73,22 +93,126 @@ struct Line {
     baseline: CGPoint,
     ascent: f64,
     descent: f64,
+    paragraph: super::preview_paragraph::PreviewParagraph,
+    geometry: super::preview_paragraph::PreviewLineGeometry,
 }
 
 /// 强边只覆盖同一个封存Reader、有限行元数据和有限palette；没有正文、glyph或GCB列表。
 pub struct NativeMarkdownComposedViewport {
     output: Rc<RefCell<MarkdownComposedLines>>,
     key: NativeMarkdownPagedSceneKey,
+    domain: LayoutDomain,
     palette: Box<[Rc<NativeMarkdownLineFont>]>,
+    fonts: Box<[FontUse]>,
     lines: Vec<Line>,
     glyphs: usize,
+    // 调色板分量属于 sRGB；目标 bitmap 的空间不决定 CGContext 颜色 setter 的输入空间。
+    // 当前窗口仅持这一份命名空间，随 Reader/Font 窗口一起归还，不逐 part 或 glyph 建 CGColor。
+    paint_space: CFRetained<CGColorSpace>,
+}
+
+/// Body 沿原 SceneKey；只读格另持同一真实 display Source，不伪造 Body Input 或本地文档。
+enum LayoutDomain {
+    Body,
+    TableCell {
+        display: Rc<MarkdownTableCellDisplaySource>,
+        alignment: omni_markdown_core::MarkdownTableAlignment,
+        /// 完整实测内容 lane；横向 clip 只裁像素，不改变每条软行的对齐基准。
+        width: f64,
+        clip: NSRect,
+        identity: Rc<()>,
+    },
+}
+
+impl LayoutDomain {
+    /// 活动格从同 session/source 的 TargetDomain 取方向，只读格从原 raw 票取方向。
+    /// 普通 Body 保既有段落几何；不把整张表或滚动后的 clip 宽当成活动格行宽。
+    fn line_origin_x(
+        &self,
+        key: &NativeMarkdownPagedSceneKey,
+        first_x: f64,
+        inset: f64,
+        extent: Option<&line_alignment::Extent>,
+    ) -> Result<f64> {
+        let (alignment, width) = match self {
+            Self::Body => {
+                let Some(alignment) = key.request.target.cell_alignment() else {
+                    return Ok(first_x + inset);
+                };
+                // 左边距来自同次 Native 转换后的真实 layout 起点；不靠 Source/Preview 常量兜底。
+                let layout_left = key.request.virtual_viewport.layout_origin_x
+                    - key.request.virtual_viewport.document_origin.x;
+                let padding = first_x - layout_left;
+                (
+                    alignment,
+                    key.request.virtual_viewport.layout_width - padding * 2.0,
+                )
+            }
+            Self::TableCell {
+                alignment, width, ..
+            } => (*alignment, *width),
+        };
+        Ok(first_x + line_alignment::alignment_origin_x(alignment, width, inset, extent)?)
+    }
+
+    /// 同一外层场景下，Composer 仍必须消费各自真正捕获的正文或显示来源。
+    fn source(&self, key: &NativeMarkdownPagedSceneKey) -> MarkdownLayoutTextAuthority {
+        match self {
+            Self::Body => key.source.clone(),
+            Self::TableCell { display, .. } => display.authority(),
+        }
+    }
+
+    /// 显示格的局部坐标只到实际转换后的长度；canonical Input 长度不授予内层范围权限。
+    fn utf16_len(&self, key: &NativeMarkdownPagedSceneKey) -> usize {
+        match self {
+            Self::Body => key.request.input.utf16_len,
+            Self::TableCell { display, .. } => display.source().utf16_len(),
+        }
+    }
+
+    /// 图形裁剪属于同一次真实格框与正文视口的交集，不能扩大成整张表的离屏 backing。
+    fn clip(&self, key: &NativeMarkdownPagedSceneKey) -> NSRect {
+        match self {
+            Self::Body => key.request.viewport,
+            Self::TableCell { clip, .. } => *clip,
+        }
+    }
+
+    /// 先归还 Doc 租约再允许 Native/current 重入；冻结显示快照不延长旧 publication 编辑权限。
+    fn require(&self, key: &NativeMarkdownPagedSceneKey) -> Result<()> {
+        if let Self::TableCell { display, .. } = self {
+            let owner = key
+                .request
+                .document
+                .upgrade()
+                .ok_or(NativeMarkdownComposedViewportError::Revoked)?;
+            let document = owner
+                .try_borrow()
+                .map_err(|_| NativeMarkdownComposedViewportError::Busy)?;
+            display
+                .require_for(&document)
+                .map_err(NativeMarkdownComposedViewportError::Table)?;
+        }
+        Ok(())
+    }
 }
 
 impl NativeMarkdownComposedViewport {
+    /// 字形、代码底色和装饰共用同一part基线；选择与caret继续占真实整行槽，不能随脚本字形越出行框。
+    fn part_baseline(&self, line: &Line, part: &Part) -> CGPoint {
+        let mut baseline = line.baseline;
+        baseline.y += super::text_attributes::native_markdown_baseline_offset(
+            part.handle.facts().presentation,
+            self.key.presentation_mode == omni_markdown_core::MarkdownPresentationMode::Source,
+        )
+        .unwrap_or(0.0);
+        baseline
+    }
+
     /// 在原coalesced准备阶段安装有限连续Line；首top只能来自原virtual-scroll生产者的真实锚点。
     ///
-    /// 坐标使用实际正文的y-up空间，后续行仅从同palette真实ascent/descent/leading计算。
-    /// 本组件尚未合入段落间距、缩进和lineHeightMultiple，不能作为完整预览对等证据。
+    /// 坐标使用实际正文的y-up空间；Source保原CT浮点，Preview与Producer共用同Font系统行槽/段落结果。
     ///
     /// # Errors
     /// 行/part元数据超预算、未封存/失效输出、外来handle、缺失字体和无效几何均拒绝整个候选。
@@ -96,11 +220,35 @@ impl NativeMarkdownComposedViewport {
         output: Rc<RefCell<MarkdownComposedLines>>,
         key: NativeMarkdownPagedSceneKey,
         palette: Vec<Rc<NativeMarkdownLineFont>>,
-        handles: impl IntoIterator<Item = MarkdownComposedLine>,
+        handles: impl IntoIterator<Item = impl Into<NativeMarkdownMeasuredLine>>,
         first_top: NSPoint,
         current: &dyn Fn() -> bool,
     ) -> Result<Self> {
-        require_output(&output, &key, current)?;
+        Self::prepare_domain(
+            output,
+            key,
+            LayoutDomain::Body,
+            palette,
+            handles,
+            first_top,
+            current,
+        )
+    }
+
+    /// 内层格只由同模块的具体 cell consumer 构造；不把显示局部行暴露给 Body 输入。
+    fn prepare_domain(
+        output: Rc<RefCell<MarkdownComposedLines>>,
+        key: NativeMarkdownPagedSceneKey,
+        domain: LayoutDomain,
+        palette: Vec<Rc<NativeMarkdownLineFont>>,
+        handles: impl IntoIterator<Item = impl Into<NativeMarkdownMeasuredLine>>,
+        first_top: NSPoint,
+        current: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        require_output(&output, &key, &domain, current)?;
+        let source = domain.source(&key);
+        let extent = domain.utf16_len(&key);
+        let clip = domain.clip(&key);
         // palette只包含当前真实Native字体；空表或超槽表不能靠名字重建旧part的字体。
         if palette.is_empty() || palette.len() > MARKDOWN_LINE_FONT_SLOTS {
             return Err(NativeMarkdownComposedViewportError::FontMissing);
@@ -121,15 +269,18 @@ impl NativeMarkdownComposedViewport {
         let mut top = first_top.y;
         let mut parts = 0usize;
         let mut glyphs = 0usize;
+        let mut fonts: Vec<FontUse> = Vec::new();
         // 只接收本次有限窗口；预算不足时整个候选归还，producer可另行准备下一批。
-        for handle in handles {
+        for measured in handles {
+            let measured: NativeMarkdownMeasuredLine = measured.into();
+            let (handle, alignment_extent) = measured.into_parts();
             if lines.len() == NATIVE_MARKDOWN_COMPOSED_VIEWPORT_LINES
                 || handle.facts().parts
                     > NATIVE_MARKDOWN_COMPOSED_VIEWPORT_PARTS.saturating_sub(parts)
             {
                 return Err(NativeMarkdownComposedViewportError::Pending);
             }
-            if handle.facts().source_utf16.end > key.request.input.utf16_len {
+            if handle.facts().source_utf16.end > extent {
                 return Err(NativeMarkdownComposedViewportError::InvalidCoverage);
             }
             // 连续handle同时要求真实源坐标与真实行ordinal相邻，不能拼接有空洞的缓存行。
@@ -140,9 +291,18 @@ impl NativeMarkdownComposedViewport {
             {
                 return Err(NativeMarkdownComposedViewportError::InvalidCoverage);
             }
+            let table_row =
+                handle.facts().kind == omni_markdown_core::MarkdownComposedLineKind::TableRow;
+            if table_row
+                && (key.presentation_mode != MarkdownPresentationMode::InlinePreview
+                    || !matches!(domain, LayoutDomain::Body))
+            {
+                return Err(NativeMarkdownComposedViewportError::InvalidCoverage);
+            } // 真实表格块行只存在于正文 flow，不能进入 Source 字面路径或另一个格的局部布局。
             let mut prepared = Vec::with_capacity(handle.facts().parts);
             let glyphs_before = glyphs;
-            let (mut ascent, mut descent, mut leading) = (0.0_f64, 0.0_f64, f64::NEG_INFINITY);
+            let mut metrics =
+                super::preview_paragraph::PreviewLineMetrics::new(key.presentation_mode);
             // 每个part只有弱handle和font索引；不把glyph、GCB或源文字装进这个Vec。
             for ordinal in 0..handle.facts().parts {
                 // 只在纯Core读取期借Reader；字体/Native和可重入current全部在借用结束后运行。
@@ -150,12 +310,15 @@ impl NativeMarkdownComposedViewport {
                     let mut reader = output
                         .try_borrow_mut()
                         .map_err(|_| NativeMarkdownComposedViewportError::Busy)?;
-                    reader.require(&key.source)?;
-                    reader
+                    reader.require(&source)?;
+                    let part = reader
                         .part(&handle, ordinal)?
-                        .ok_or(NativeMarkdownComposedViewportError::InvalidCoverage)?
+                        .ok_or(NativeMarkdownComposedViewportError::InvalidCoverage)?;
+                    // 原输出/注册映射在封存前认证一次；封存后复用不再对每个 part 重读空字形批次。
+                    reader.read_batch(&part, 0..0, &mut [])?;
+                    part
                 };
-                require_output(&output, &key, current)?;
+                require_output(&output, &key, &domain, current)?;
                 // 原注册票定位同一个Font payload，名称/字号相同的另一次Native capture不能冒充。
                 let authority = part.font_registration().authority()?;
                 let font = palette
@@ -163,10 +326,46 @@ impl NativeMarkdownComposedViewport {
                     .position(|font| font.native().core_font().permits(&authority))
                     .ok_or(NativeMarkdownComposedViewportError::FontMissing)?;
                 palette[font].require(part.font_registration())?;
-                let metrics = palette[font].metrics()?;
-                ascent = ascent.max(metrics.ascent);
-                descent = descent.max(metrics.descent);
-                leading = leading.max(metrics.leading); // 保留真实leading符号，不补固定行高或按ordinal推测全局y。
+                if !fonts.iter().any(|used| used.index == font) {
+                    fonts.push(FontUse {
+                        index: font,
+                        registration: part.font_registration().clone(),
+                    });
+                } // 同一个输出 catalog 对活 Core payload 只有一个注册值，原弱票不因 part 数重复持有。
+                if table_row {
+                    if part.facts().kind
+                        != omni_markdown_core::MarkdownComposedLinePartKind::TableRow
+                        || part.facts().glyphs != 0
+                    {
+                        return Err(NativeMarkdownComposedViewportError::InvalidCoverage);
+                    }
+                } else {
+                    if !palette[font]
+                        .native()
+                        .accepts_shaping_size(part.facts().points)
+                    {
+                        // 准备阶段保留真实字号错配的数值，不能让后续像素错误掩盖原字体事实。
+                        #[cfg(feature = "native-markdown-runtime-probe")]
+                        eprintln!(
+                            "native_line_font_size_mismatch phase=viewport part_points={} native_points={} core_points={:?} kind={:?}",
+                            part.facts().points,
+                            palette[font].native().point_size(),
+                            palette[font].native().core_font().shaping_point_size(),
+                            part.facts().kind,
+                        );
+                        return Err(NativeMarkdownLineGeometryError::FontSizeMismatch.into());
+                    } // 字号与封存 part 一起认证；真实 TableRow 的零字号不属于文字整形合同。
+                    let font_metrics = palette[font].metrics()?;
+                    metrics
+                        .add(
+                            part.facts(),
+                            font_metrics,
+                            (key.presentation_mode
+                                == omni_markdown_core::MarkdownPresentationMode::InlinePreview)
+                                .then(|| palette[font].preview_metrics()),
+                        )
+                        .ok_or(NativeMarkdownComposedViewportError::InvalidGeometry)?;
+                }
                 glyphs = glyphs
                     .checked_add(part.facts().glyphs)
                     .ok_or(NativeMarkdownComposedViewportError::InvalidGeometry)?;
@@ -176,20 +375,58 @@ impl NativeMarkdownComposedViewport {
                 return Err(NativeMarkdownComposedViewportError::InvalidCoverage);
             }
             // 同行字体共用实际baseline；leading分在上下，下一行top只从真实度量累计。
-            let height = ascent + descent + leading;
+            let geometry = if table_row {
+                let height = handle.facts().y_advance_26_6 as f64 / 64.0;
+                if !height.is_finite() || height <= 0.0 || height >= MAX_POINT {
+                    return Err(NativeMarkdownComposedViewportError::InvalidGeometry);
+                }
+                // 这是同一行全部格真正完成后的块高度，不由注册字体的17pt行槽替代。
+                super::preview_paragraph::PreviewLineGeometry {
+                    advance: height,
+                    baseline_from_top: 0.0,
+                    text_height: height,
+                    before: 0.0,
+                    after: 0.0,
+                }
+            } else {
+                metrics
+                    .geometry(handle.facts())
+                    .ok_or(NativeMarkdownComposedViewportError::InvalidGeometry)?
+            };
+            let height = geometry.advance;
             let baseline = CGPoint {
-                x: first_top.x,
-                y: top - ascent - leading / 2.0,
+                x: domain.line_origin_x(
+                    &key,
+                    first_top.x,
+                    metrics.paragraph.inset,
+                    alignment_extent.as_ref(),
+                )?,
+                y: if key.presentation_mode == omni_markdown_core::MarkdownPresentationMode::Source
+                {
+                    top - metrics.ascent - metrics.leading / 2.0 // 字面 Source 保持原浮点运算次序。
+                } else {
+                    top - geometry.baseline_from_top
+                },
             };
             let frame = NSRect::new(
-                NSPoint::new(key.request.viewport.origin.x, top - height),
-                NSSize::new(key.request.viewport.size.width, height),
+                NSPoint::new(clip.origin.x, top - height),
+                NSSize::new(clip.size.width, height),
             );
             if !point(baseline) || !rect(frame) {
                 return Err(NativeMarkdownComposedViewportError::InvalidGeometry);
             } // 空字体行或非有限高度不能产生占位行框。
             parts += prepared.len();
             top -= height;
+            let (ascent, descent) = if table_row {
+                (0.0, 0.0) // 块行没有可用的文字插入点，真实格几何由Scene另行消费。
+            } else if key.presentation_mode
+                == omni_markdown_core::MarkdownPresentationMode::InlinePreview
+            {
+                let ascent = geometry.baseline_from_top - geometry.before;
+                (ascent, geometry.text_height - ascent)
+            } else {
+                (metrics.ascent, metrics.descent) // Source保原CT选择/命中高度；Preview沿同一个实际行槽。
+            };
             lines.push(Line {
                 handle,
                 parts: prepared,
@@ -197,17 +434,27 @@ impl NativeMarkdownComposedViewport {
                 baseline,
                 ascent,
                 descent,
+                paragraph: metrics.paragraph,
+                geometry,
             });
         }
         if lines.is_empty() {
             return Err(NativeMarkdownComposedViewportError::Pending);
         } // 没有真实行的窗口不签Ready；空文档仍须真实控制part/字体生产者。
+        // SAFETY: Core Graphics 的公开命名常量静态有效；只捕获色空间，不读取或复制正文。
+        let paint_space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }));
+        require_output(&output, &key, &domain, current)?; // Native 返回后仍让真实 Source 错误优先。
+        let paint_space =
+            paint_space.ok_or(NativeMarkdownComposedViewportError::ColorSpaceUnavailable)?;
         let candidate = Self {
             output,
             key,
+            domain,
             palette,
+            fonts: fonts.into_boxed_slice(),
             lines,
             glyphs,
+            paint_space,
         };
         candidate.require(current)?; // 发布前再次核原Source和scene nonce，不把部分metadata当成功。
         Ok(candidate)
@@ -240,49 +487,74 @@ impl NativeMarkdownComposedViewport {
         self.lines.get(ordinal_in_window).map(|line| line.frame)
     }
 
-    /// 复用已发布像素前核原输出、全部有限part和真实字体，不重新排版或读取正文。
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    /// 只观察已安装的至多256条原行；不推进布局、读取正文或重算 Native 排版。
+    pub(in crate::native_surface) fn probe_line_geometry(
+        &self,
+        current: &dyn Fn() -> bool,
+    ) -> Result<Vec<super::preview_paragraph::PreviewLineObservation>> {
+        self.require(current)?;
+        let values = self
+            .lines
+            .iter()
+            .map(|line| {
+                let facts = line.handle.facts();
+                super::preview_paragraph::PreviewLineObservation {
+                    source: facts.source_utf16.clone(),
+                    paragraph: facts.paragraph_utf16.clone(),
+                    frame: line.frame,
+                    baseline: NSPoint::new(line.baseline.x, line.baseline.y),
+                    text_height: line.geometry.text_height,
+                    before: line.geometry.before,
+                    after: line.geometry.after,
+                }
+            })
+            .collect();
+        self.require(current)?;
+        Ok(values)
+    }
+
+    /// 封存时已经逐 part 认证真实字号与输出映射；复用只检查实际共享资源，不能按字形批次重扫整图。
     ///
-    /// 此门不能由Scene nonce或bool current替代：Source首错、Reader关闭/失效、旧字体
-    /// 注册和实际字号不符都必须撤销旧像素复用。零glyph批次仍沿原Reader健康和part
-    /// 身份合同检查，不构造字符串、字形副本或新的Source捕获。
-    ///
-    /// # Errors
-    /// 原Scene/Source/Reader/Font失效或借用冲突时拒绝；真实Source错误优先于布尔撤权。
+    /// 原注册弱票按实际 Font 去重，源/Reader/publication 和每个 Font 的撤销仍须在回调前后生效。
+    /// 新 draw 继续由原 part 读取检查其字形，零 glyph 的像素复用也不能绕过资源失败。
     pub fn validate_ready(&self, current: &dyn Fn() -> bool) -> Result<()> {
         self.require(current)?;
-        for line in &self.lines {
-            for part in &line.parts {
-                let validation = (|| -> Result<()> {
-                    let font = &self.palette[part.font];
-                    font.require(part.handle.font_registration())?;
-                    if !font
-                        .native()
-                        .accepts_shaping_size(part.handle.facts().points)
-                    {
-                        return Err(NativeMarkdownLineGeometryError::FontSizeMismatch.into());
-                    } // 相同注册名称或近似字号不能给原封存输出补签另一个Native字体。
-                    font.metrics()?; // 度量本身仍须绑定原Font authority，不能用纯数值缓存续权。
-                    let mut reader = self
-                        .output
-                        .try_borrow_mut()
-                        .map_err(|_| NativeMarkdownComposedViewportError::Busy)?;
-                    reader.require(&self.key.source)?;
-                    reader.read_batch(&part.handle, 0..0, &mut [])?;
-                    Ok(())
-                })();
-                self.require(current)?; // Reader和注册临时租约均已归还，再允许current重入；Source首错优先。
-                validation?;
-            }
+        for used in &self.fonts {
+            let validation = (|| -> Result<()> {
+                let font = &self.palette[used.index];
+                font.require(&used.registration)?;
+                font.metrics()?;
+                Ok(())
+            })();
+            self.require(current)?; // Native/current 可重入；原 Source 首错先于刚取得的字体失败。
+            validation?;
         }
         self.require(current)
     }
 
-    fn require(&self, current: &dyn Fn() -> bool) -> Result<()> {
-        require_output(&self.output, &self.key, current)
+    /// 原窗口的单项消费只核同一Source/Reader/publication；字体全图复核留在量子边界。
+    pub(in crate::native_surface) fn require(&self, current: &dyn Fn() -> bool) -> Result<()> {
+        require_output(&self.output, &self.key, &self.domain, current)
+    }
+
+    /// 所有 glyph/GCB/几何读取都沿同一实际布局来源；外层 SceneKey 继续表示真实 canonical 场景。
+    fn source(&self) -> MarkdownLayoutTextAuthority {
+        self.domain.source(&self.key)
+    }
+
+    /// 范围门沿当前实际布局域，不能用外层正文长度验证显示格局部端点。
+    fn utf16_len(&self) -> usize {
+        self.domain.utf16_len(&self.key)
+    }
+
+    /// 绘图、命中和选择共用同一次实际视口交集。
+    fn clip(&self) -> NSRect {
+        self.domain.clip(&self.key)
     }
 
     fn visible(&self, frame: NSRect) -> bool {
-        intersects(frame, self.key.request.viewport)
+        intersects(frame, self.clip())
     }
 }
 
@@ -290,6 +562,7 @@ impl NativeMarkdownComposedViewport {
 fn require_output(
     output: &RefCell<MarkdownComposedLines>,
     key: &NativeMarkdownPagedSceneKey,
+    domain: &LayoutDomain,
     current: &dyn Fn() -> bool,
 ) -> Result<()> {
     let before = current();
@@ -297,15 +570,17 @@ fn require_output(
         let reader = output
             .try_borrow()
             .map_err(|_| NativeMarkdownComposedViewportError::Busy)?;
-        reader.require(&key.source)?;
+        reader.require(&domain.source(key))?;
     }
+    domain.require(key)?;
     let after = current(); // 首次检查可能重入；下面仍读原Source，不通过新capture恢复权限。
     {
         let reader = output
             .try_borrow()
             .map_err(|_| NativeMarkdownComposedViewportError::Busy)?;
-        reader.require(&key.source)?;
+        reader.require(&domain.source(key))?;
     }
+    domain.require(key)?;
     if !before || !after || !key.nonce.same(&key.nonce) {
         return Err(NativeMarkdownComposedViewportError::Revoked);
     }

@@ -6,10 +6,44 @@ use super::*;
 /// 查询只含原发布的弱身份和真实origin成员；目标ordinal尚未经过源验证，不能据此编辑。
 pub struct MarkdownTableViewportRequiredRowQuery {
     publication: Weak<Publication>,
-    origin: Weak<WindowRecord>,
+    origin: QueryOrigin,
     header: usize,
     origin_row: usize,
     requested_row: usize,
+}
+
+/// 两条实际生产路径各保原弱票；结构导航不为复用旧窗口入口构造投影或替身 WindowRecord。
+enum QueryOrigin {
+    Window(Weak<WindowRecord>),
+    Structure(Weak<MarkdownTableStructuralWindow>),
+}
+
+/// 在途请求只保已准入的真实 origin，取消后随原 RequiredState 一并释放共享 checkpoint 页。
+enum RequiredOrigin {
+    Window(Rc<WindowRecord>),
+    Structure(Rc<MarkdownTableStructuralWindow>),
+}
+
+impl RequiredOrigin {
+    fn header(&self) -> usize {
+        match self {
+            Self::Window(record) => record.window.presentation.header_byte_range.start,
+            Self::Structure(ticket) => ticket.header.header_byte_start,
+        }
+    }
+
+    fn replay(&self) -> Option<&ReplayAnchors> {
+        match self {
+            Self::Window(record) => record.window.replay.as_ref(),
+            Self::Structure(ticket) => ticket.replay.as_ref(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::markdown_document_buffer::table_window_request) enum RequiredLocation {
+    Window(usize),
+    Structure(usize),
 }
 
 /// 结果只借同一Ready的窗口索引或真实End；不存在独立Window的所有权转换。
@@ -24,19 +58,19 @@ pub enum MarkdownTableViewportRequiredRowResult<'a> {
     },
 }
 
-pub(super) enum RequiredPublication {
+pub(in crate::markdown_document_buffer::table_window_request) enum RequiredPublication {
     Row {
-        window_index: usize,
+        location: RequiredLocation,
         row_ordinal: usize,
     },
     End {
         end: VerifiedTableEnd,
-        terminal_window_index: usize,
+        terminal: RequiredLocation,
     },
 }
 
 pub(super) struct RequiredState {
-    origin: Rc<WindowRecord>,
+    origin: RequiredOrigin,
     requested_row: usize,
     resolved: bool,
     end: Option<VerifiedTableEnd>,
@@ -45,9 +79,8 @@ pub(super) struct RequiredState {
 impl RequiredState {
     pub(super) fn keeps(&self, record: &Rc<WindowRecord>) -> bool {
         // origin保留草稿的实际源行；目标行或真实末行必须同样保留，不能prune成悬空索引。
-        Rc::ptr_eq(record, &self.origin)
-            || (record.window.presentation.header_byte_range.start
-                == self.origin.window.presentation.header_byte_range.start
+        matches!(&self.origin, RequiredOrigin::Window(origin) if Rc::ptr_eq(record, origin))
+            || (record.window.presentation.header_byte_range.start == self.origin.header()
                 && (record.window.presentation.row(self.requested_row).is_some()
                     || self.end.as_ref().is_some_and(|end| {
                         record
@@ -57,6 +90,21 @@ impl RequiredState {
                             .is_some()
                     })))
     }
+
+    pub(super) fn keeps_structure(&self, ticket: &Rc<MarkdownTableStructuralWindow>) -> bool {
+        // 目标和真实 terminal 即使离开视觉范围仍属于本次导航结果；不能在发布前按视口裁掉。
+        matches!(&self.origin, RequiredOrigin::Structure(origin) if Rc::ptr_eq(ticket, origin))
+            || (ticket.header.header_byte_start == self.origin.header()
+                && (contains_structure_row(ticket, self.requested_row)
+                    || self.end.as_ref().is_some_and(|end| {
+                        contains_structure_row(ticket, end.last_body_row_ordinal().unwrap_or(0))
+                    })))
+    }
+}
+
+fn contains_structure_row(ticket: &MarkdownTableStructuralWindow, ordinal: usize) -> bool {
+    (ordinal == 0 && ticket.include_header)
+        || ticket.body.iter().any(|row| row.row_ordinal == ordinal)
 }
 
 impl VerifiedMarkdownTableViewport {
@@ -79,7 +127,7 @@ impl VerifiedMarkdownTableViewport {
         }
         Ok(MarkdownTableViewportRequiredRowQuery {
             publication: Rc::downgrade(&self.publication),
-            origin: Rc::downgrade(record),
+            origin: QueryOrigin::Window(Rc::downgrade(record)),
             header: record.window.presentation.header_byte_range.start,
             origin_row,
             requested_row,
@@ -91,22 +139,62 @@ impl VerifiedMarkdownTableViewport {
         document: &MarkdownDocumentBuffer,
     ) -> Result<Option<MarkdownTableViewportRequiredRowResult<'_>>, MarkdownTableRequestError> {
         self.check(document)?;
-        Ok(self.required.as_ref().map(|result| match result {
-            RequiredPublication::Row {
-                window_index,
-                row_ordinal,
-            } => MarkdownTableViewportRequiredRowResult::Row {
-                window_index: *window_index,
-                row_ordinal: *row_ordinal,
-            },
-            RequiredPublication::End {
-                end,
-                terminal_window_index,
-            } => MarkdownTableViewportRequiredRowResult::TableEnd {
-                end,
-                terminal_window_index: *terminal_window_index,
-            },
-        }))
+        self.required
+            .as_ref()
+            .map(|result| match result {
+                RequiredPublication::Row {
+                    location: RequiredLocation::Window(window_index),
+                    row_ordinal,
+                } => Ok(MarkdownTableViewportRequiredRowResult::Row {
+                    window_index: *window_index,
+                    row_ordinal: *row_ordinal,
+                }),
+                RequiredPublication::End {
+                    end,
+                    terminal: RequiredLocation::Window(terminal_window_index),
+                } => Ok(MarkdownTableViewportRequiredRowResult::TableEnd {
+                    end,
+                    terminal_window_index: *terminal_window_index,
+                }),
+                _ => Err(MarkdownTableRequestError::InvalidRequest), // 结构结果只能移交原 Source 行，不伪造完整窗口索引。
+            })
+            .transpose()
+    }
+
+    /// 正式来源只接受本批实际结构成员；目标整数仍是内部请求，必须等原 Replay 返回真实 Row/End。
+    pub(in crate::markdown_document_buffer::table_window_request) fn required_structure_query_for(
+        &self,
+        document: &MarkdownDocumentBuffer,
+        origin: &Rc<MarkdownTableStructuralWindow>,
+        origin_row: usize,
+        requested_row: usize,
+    ) -> Result<MarkdownTableViewportRequiredRowQuery, MarkdownTableRequestError> {
+        self.check(document)?;
+        if !self
+            .structures
+            .iter()
+            .any(|ticket| Rc::ptr_eq(ticket, origin))
+            || !contains_structure_row(origin, origin_row)
+            || origin.replay.is_none()
+        {
+            return Err(MarkdownTableRequestError::PublicationSuperseded);
+        }
+        Ok(MarkdownTableViewportRequiredRowQuery {
+            publication: Rc::downgrade(&self.publication),
+            origin: QueryOrigin::Structure(Rc::downgrade(origin)),
+            header: origin.header.header_byte_start,
+            origin_row,
+            requested_row,
+        })
+    }
+
+    /// Source 层凭同一不可变发布把真实结构位置封装成 opaque 行；不公开裸目录索引或 End。
+    pub(in crate::markdown_document_buffer::table_window_request) fn required_publication_for(
+        &self,
+        document: &MarkdownDocumentBuffer,
+    ) -> Result<Option<&RequiredPublication>, MarkdownTableRequestError> {
+        self.check(document)?;
+        Ok(self.required.as_ref())
     }
 
     /// End只关联本批真实末行；单个窗口没有End时也不能借另一表或旧发布的终点追加。
@@ -122,7 +210,7 @@ impl VerifiedMarkdownTableViewport {
             .ok_or(MarkdownTableRequestError::InvalidRequest)?;
         if let Some(RequiredPublication::End {
             end,
-            terminal_window_index: index,
+            terminal: RequiredLocation::Window(index),
         }) = &self.required
             && *index == window_index
             && end.header_byte_start() == window.window.presentation.header_byte_range.start
@@ -150,23 +238,32 @@ impl MarkdownTableViewportRequest {
         {
             return Err(MarkdownTableRequestError::PublicationSuperseded);
         }
-        let origin = previous
-            .windows
-            .iter()
-            .find(|record| {
-                query.origin.ptr_eq(&Rc::downgrade(record))
-                    && record.window.presentation.header_byte_range.start == query.header
-                    && record.window.presentation.row(query.origin_row).is_some()
-            })
-            .ok_or(MarkdownTableRequestError::PublicationSuperseded)?;
+        let origin = match &query.origin {
+            QueryOrigin::Window(identity) => previous
+                .windows
+                .iter()
+                .find(|record| {
+                    identity.ptr_eq(&Rc::downgrade(record))
+                        && record.window.presentation.header_byte_range.start == query.header
+                        && record.window.presentation.row(query.origin_row).is_some()
+                })
+                .map(|record| RequiredOrigin::Window(Rc::clone(record))),
+            QueryOrigin::Structure(identity) => previous
+                .structures
+                .iter()
+                .find(|ticket| {
+                    identity.ptr_eq(&Rc::downgrade(ticket))
+                        && ticket.header.header_byte_start == query.header
+                        && contains_structure_row(ticket, query.origin_row)
+                })
+                .map(|ticket| RequiredOrigin::Structure(Rc::clone(ticket))),
+        }
+        .ok_or(MarkdownTableRequestError::PublicationSuperseded)?;
         let anchors = origin
-            .window
-            .replay
-            .as_ref()
+            .replay()
             .ok_or(MarkdownTableRequestError::CoverageRequiresCheckpoint)?;
         // 在改变请求前构造纯续体；来源封闭且只克隆cp标量/同一spine，不申请源或历史正文。
         let replay = ReplayRequest::new(self.source.clone(), anchors.clone(), query.requested_row)?;
-        let origin = Rc::clone(origin);
         self.extend_from_ready(document, previous, viewport)?;
         // 原previous仍全额预扣；此处另外预留一个回放状态与固定cursor工作区，不按每行重置预算。
         let metadata = std::mem::size_of::<RequiredState>() + 4096;
@@ -175,6 +272,7 @@ impl MarkdownTableViewportRequest {
             self.failed = Some(MarkdownTableRequestError::Window(error));
             self.structure = None;
             self.windows = Vec::new();
+            self.structures = Vec::new();
             self.gaps = Vec::new();
             self.queries = None;
             return Err(MarkdownTableRequestError::Window(error));
@@ -209,6 +307,13 @@ impl MarkdownTableViewportRequest {
                         return (true, work);
                     }
                 }
+            }
+        }
+        for ticket in &self.structures {
+            work += 1 + ticket.body.len();
+            if ticket.header.header_byte_start == header && contains_structure_row(ticket, ordinal)
+            {
+                return (true, work);
             }
         }
         for job in &self.jobs {
@@ -246,10 +351,7 @@ impl MarkdownTableViewportRequest {
                 .required
                 .as_ref()
                 .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-            (
-                required.origin.window.presentation.header_byte_range.start,
-                required.requested_row,
-            )
+            (required.origin.header(), required.requested_row)
         };
         let (prepared, lookup_work) = self.contains_prepared_row(header, target);
         let mut control = SWEEP_CONTROL_BASE + lookup_work;
@@ -289,8 +391,12 @@ impl MarkdownTableViewportRequest {
                     control += ticket.body.len() * SWEEP_ROW_ADMISSION_COST;
                     // 与视觉job同一query库存、同一累计额度；不让命令额外取得一份行/cell/run上限。
                     let cost = self.admit_ticket(&ticket)?;
-                    self.job_costs.push(cost);
-                    self.jobs.push(Some(self.semantic_job(ticket)));
+                    if self.source_structures {
+                        control += self.insert_required_structure(ticket);
+                    } else {
+                        self.job_costs.push(cost);
+                        self.jobs.push(Some(self.semantic_job(ticket)));
+                    }
                 }
                 ReplayOutcome::End { end, terminal } => {
                     let terminal_row = end.last_body_row_ordinal().unwrap_or(0);
@@ -302,9 +408,14 @@ impl MarkdownTableViewportRequest {
                         let terminal = *terminal;
                         control += terminal.body.len() * SWEEP_ROW_ADMISSION_COST;
                         let cost = self.admit_ticket(&terminal)?;
-                        self.job_costs.push(cost);
-                        self.jobs.push(Some(self.semantic_job(terminal)));
+                        if self.source_structures {
+                            control += self.insert_required_structure(terminal);
+                        } else {
+                            self.job_costs.push(cost);
+                            self.jobs.push(Some(self.semantic_job(terminal)));
+                        }
                     }
+                    // 真 End 由本次 RequiredPublication 保留并封入 terminal 行票；不替换已有可见多行票。
                     self.required.as_mut().unwrap().end = Some(end);
                 }
             }
@@ -330,37 +441,66 @@ impl MarkdownTableViewportRequest {
         if !required.resolved {
             return Err(MarkdownTableRequestError::Window(Error::ContextPending));
         }
-        let header = required.origin.window.presentation.header_byte_range.start;
+        let header = required.origin.header();
         if let Some(end) = required.end {
             let row = end.last_body_row_ordinal().unwrap_or(0);
-            let terminal_window_index = self
-                .windows
+            let terminal = self.required_location(header, row)?;
+            return Ok(Some(RequiredPublication::End { end, terminal }));
+        }
+        let location = self.required_location(header, required.requested_row)?;
+        Ok(Some(RequiredPublication::Row {
+            location,
+            row_ordinal: required.requested_row,
+        }))
+    }
+
+    /// 只查已准入的真实成员；结构模式不为目录位置补一个完整窗口，也不按 ordinal 猜测来源。
+    fn required_location(
+        &self,
+        header: usize,
+        ordinal: usize,
+    ) -> Result<RequiredLocation, MarkdownTableRequestError> {
+        if self.source_structures {
+            self.structures
+                .iter()
+                .position(|ticket| {
+                    ticket.header.header_byte_start == header
+                        && contains_structure_row(ticket, ordinal)
+                })
+                .map(RequiredLocation::Structure)
+        } else {
+            self.windows
                 .iter()
                 .position(|record| {
                     record.window.presentation.header_byte_range.start == header
-                        && record.window.presentation.row(row).is_some()
+                        && record.window.presentation.row(ordinal).is_some()
                 })
-                .ok_or(MarkdownTableRequestError::Window(Error::ContextPending))?;
-            return Ok(Some(RequiredPublication::End {
-                end,
-                terminal_window_index,
-            }));
+                .map(RequiredLocation::Window)
         }
-        let window_index = self
-            .windows
+        .ok_or(MarkdownTableRequestError::Window(Error::ContextPending))
+    }
+
+    /// Replay 可以逆向返回较早行；仍按实际物理起点插入同一目录，供覆盖证明和后续 flow 线性消费。
+    /// 只申请已由 admit_ticket 预扣的一个句柄槽；比较与 Rc 移动计入本次原 control，不另造索引。
+    fn insert_required_structure(&mut self, ticket: MarkdownTableStructuralWindow) -> usize {
+        let start = structure_range(&ticket, 0)
+            .expect("原 Replay 只移交实际行或 H/D")
+            .start;
+        let mut inspected = 0;
+        let index = self
+            .structures
             .iter()
-            .position(|record| {
-                record.window.presentation.header_byte_range.start == header
-                    && record
-                        .window
-                        .presentation
-                        .row(required.requested_row)
-                        .is_some()
+            .position(|existing| {
+                inspected += 1;
+                structure_range(existing, 0)
+                    .expect("原结构目录只保真实成员")
+                    .start
+                    > start
             })
-            .ok_or(MarkdownTableRequestError::Window(Error::ContextPending))?;
-        Ok(Some(RequiredPublication::Row {
-            window_index,
-            row_ordinal: required.requested_row,
-        }))
+            .unwrap_or(self.structures.len());
+        let moved = self.structures.len() - index;
+        self.structures.reserve_exact(1);
+        self.structures.insert(index, Rc::new(ticket));
+        inspected + moved + 1
     }
 }

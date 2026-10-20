@@ -30,6 +30,7 @@ struct QuotaState {
     max_runs: usize,
     max_metadata: usize,
     underline_reserved: std::cell::Cell<bool>,
+    cell_inline_reserved: std::cell::Cell<bool>,
 }
 impl MarkdownTableWindowQuota {
     pub(crate) fn new(max_runs: usize, max_metadata: usize) -> Self {
@@ -40,14 +41,28 @@ impl MarkdownTableWindowQuota {
             max_runs,
             max_metadata,
             underline_reserved: false.into(),
+            cell_inline_reserved: false.into(),
         }))
+    }
+    /// 同一 SourceRequest 只允许一个活动 CellInline；其固定作业与4KiB读窗只占一次活库存。
+    /// 外带每格的发布、样式、block 和真实 Vec 仍另行逐份准入，不能借串行工作区漏算共活输出。
+    pub(crate) fn reserve_cell_inline_workspace(
+        &self,
+        bytes: usize,
+    ) -> Result<(), MarkdownTableWindowError> {
+        if !self.0.cell_inline_reserved.get() {
+            self.admit_metadata(bytes)?;
+            self.0.cell_inline_reserved.set(true);
+        }
+        Ok(())
     }
     pub(crate) fn reserve_underline_workspace(&self) -> Result<(), MarkdownTableWindowError> {
         if !self.0.underline_reserved.get() {
             // 批次串行投影时只活一份原underline库存；在创建它之前预留其已有最大pair容量。
             self.admit_metadata(
                 (MAX_MARKDOWN_PRESENTATION_DECORATIONS / 3)
-                    * std::mem::size_of::<MarkdownTableUnderline>(),
+                    * std::mem::size_of::<MarkdownTableUnderline>()
+                    + crate::markdown_document_buffer::MarkdownDocumentBuffer::underline_code_workspace_bytes(),
             )?;
             self.0.underline_reserved.set(true);
         }
@@ -342,6 +357,7 @@ struct OriginSegment<'a> {
 ///
 /// # Errors
 /// 任何预算、源行、Parser或上下文不一致都拒绝整批；不产生部分结果或全文fallback。
+#[cfg(test)]
 pub(crate) fn project_table_window(
     input: &MarkdownTableWindowInput<'_>,
 ) -> Result<MarkdownProjectedTableWindow, MarkdownTableWindowError> {

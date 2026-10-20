@@ -1,12 +1,12 @@
 use super::arabic::ArabicShapePlan;
 use super::syllabic::*;
 use super::*;
-use crate::ShaperFont;
 use crate::algs::*;
 use crate::ot::layout::*;
 use crate::ot::map::*;
 use crate::plan::ShapePlan;
 use crate::unicode::{CharExt, Codepoint};
+use crate::ShaperFont;
 use crate::{GlyphInfo, Mask, Script, Tag};
 use alloc::boxed::Box;
 

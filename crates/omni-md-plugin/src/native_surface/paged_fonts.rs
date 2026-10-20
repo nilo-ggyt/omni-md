@@ -27,6 +27,8 @@ pub enum NativeMarkdownPagedFontError {
     CoreFaceMismatch,
     #[error("原生字体轴请求重复、过多或没有被实际接受")]
     InvalidVariation,
+    #[error("无法为原生字体的有界水平度量分配存储")]
+    HorizontalMetricsAllocation,
     #[error("无法捕获原生字体的不可变字节")]
     Bytes(#[from] MarkdownLayoutFontBytesError),
     #[error("无法解析原生字体的精确Core face")]
@@ -51,6 +53,7 @@ fn step<T>(current: &(impl Fn() -> bool + ?Sized), operation: impl FnOnce() -> T
 ///
 /// CTFont/CGFont是框架共享的不可变字体值，其系统缓存销毁尚未由本模块证明。自有
 /// snapshot的observer只证明本项目实际close/munmap结果；共享字体缓存和整产品验收仍独立验证。
+#[derive(Clone)]
 pub struct NativeMarkdownPagedFont {
     native: CFRetained<CTFont>,
     constructor_graphics: CFRetained<CGFont>,
@@ -62,6 +65,35 @@ pub struct NativeMarkdownPagedFont {
     source_path: PathBuf,
     point_size: f64,
     _main_thread: MainThreadMarker,
+}
+
+/// 本次候选的新快照与已有活动 owner 的借用具有不同释放义务；不以共享映射尚活误报泄漏。
+pub(crate) enum NativeMarkdownFontCapture {
+    Fresh(NativeMarkdownPagedFont),
+    Reused(NativeMarkdownPagedFont),
+}
+impl NativeMarkdownFontCapture {
+    /// 两类候选都使用同一个不可变 Native/Core 字体，原 GCB 仍必须完成真实整形试次。
+    pub(crate) fn font(&self) -> &NativeMarkdownPagedFont {
+        match self {
+            Self::Fresh(font) | Self::Reused(font) => font,
+        }
+    }
+
+    /// Selected 把这一真实强边移交给 Body；复用结果保留原 Core payload 注册身份。
+    pub(crate) fn into_font(self) -> NativeMarkdownPagedFont {
+        match self {
+            Self::Fresh(font) | Self::Reused(font) => font,
+        }
+    }
+
+    /// 只有本次新建的映射须在拒绝/失败时立即归还；复用映射由原 Body 的最终关闭结算。
+    pub(crate) fn fresh_bytes_observer(&self) -> Option<MarkdownLayoutFontBytesResourceObserver> {
+        match self {
+            Self::Fresh(font) => Some(font.bytes_observer()),
+            Self::Reused(_) => None,
+        }
+    }
 }
 
 impl NativeMarkdownPagedFont {
@@ -76,17 +108,63 @@ impl NativeMarkdownPagedFont {
         current: &(impl Fn() -> bool + ?Sized),
     ) -> Result<Self> {
         let original = metadata::read(font, current)?;
+        Self::capture_metadata(font, original, maximum_font_bytes, mtm, current)
+    }
+
+    /// 只在系统已选出的实际候选内复用；不重排级联、不按名字猜字体，也不跳过后续原 GCB 试次。
+    pub(crate) fn capture_reusing(
+        font: &CTFont,
+        palette: &[std::rc::Rc<super::paged_line_fonts::NativeMarkdownLineFont>],
+        maximum_font_bytes: u64,
+        mtm: MainThreadMarker,
+        current: &(impl Fn() -> bool + ?Sized),
+    ) -> Result<NativeMarkdownFontCapture> {
+        let original = metadata::read(font, current)?;
+        for registered in palette {
+            let captured = registered.native();
+            if original.matches_capture(font, captured, current)? {
+                // Clone 只保同一 CTFont/Core payload/匿名映射；不再次打开文件、resolve 或占注册槽。
+                return step(current, || {
+                    NativeMarkdownFontCapture::Reused(captured.clone())
+                });
+            }
+        }
+        Self::capture_metadata(font, original, maximum_font_bytes, mtm, current)
+            .map(NativeMarkdownFontCapture::Fresh)
+    }
+
+    /// 只有未命中原实际字体时进入真实文件快照边界；精确 face/轴/尺寸仍由原解析器核验。
+    fn capture_metadata(
+        font: &CTFont,
+        original: metadata::Metadata,
+        maximum_font_bytes: u64,
+        mtm: MainThreadMarker,
+        current: &(impl Fn() -> bool + ?Sized),
+    ) -> Result<Self> {
         let bytes = step(current, || {
             MarkdownLayoutFontBytes::capture_file(&original.path, maximum_font_bytes)
         })??;
         let name_table = step(current, || original.name_bytes())??;
+        let horizontal = metadata::horizontal_advances(font, original.glyph_count, current)?;
         let core = step(current, || {
-            MarkdownLayoutFont::resolve_name_table_at_size(
-                bytes.blob(),
-                name_table,
-                &original.axes,
-                original.point_size,
-            )
+            // 同一个实际字体实例的彩色字形推进随Core payload封存，排版与Native绘制不再使用两套宽度。
+            match horizontal {
+                Some(advances) => {
+                    MarkdownLayoutFont::resolve_name_table_at_size_with_horizontal_advances(
+                        bytes.blob(),
+                        name_table,
+                        &original.axes,
+                        original.point_size,
+                        advances,
+                    )
+                }
+                None => MarkdownLayoutFont::resolve_name_table_at_size(
+                    bytes.blob(),
+                    name_table,
+                    &original.axes,
+                    original.point_size,
+                ),
+            }
         })??;
         original.verify_core(&core)?;
         let native = step(current, || font.retain())?;
@@ -165,13 +243,26 @@ impl NativeMarkdownPagedFont {
             return Err(NativeMarkdownPagedFontError::GraphicsSourceMismatch); // 派生不能重新匹配另一字体文件。
         }
         let name_table = step(current, || actual.name_bytes())??;
+        let horizontal = metadata::horizontal_advances(&native, actual.glyph_count, current)?;
         let core = step(current, || {
-            MarkdownLayoutFont::resolve_name_table_at_size(
-                self.bytes.blob(),
-                name_table,
-                &actual.axes,
-                actual.point_size,
-            )
+            // 轴实例的真实Native度量重新捕获；不能借旧轴快照或继承原字形宽度。
+            match horizontal {
+                Some(advances) => {
+                    MarkdownLayoutFont::resolve_name_table_at_size_with_horizontal_advances(
+                        self.bytes.blob(),
+                        name_table,
+                        &actual.axes,
+                        actual.point_size,
+                        advances,
+                    )
+                }
+                None => MarkdownLayoutFont::resolve_name_table_at_size(
+                    self.bytes.blob(),
+                    name_table,
+                    &actual.axes,
+                    actual.point_size,
+                ),
+            }
         })??;
         actual.verify_core(&core)?;
         if core.metadata().face_index != self.core.metadata().face_index

@@ -2,18 +2,18 @@
 
 use core::ops::{Index, IndexMut};
 
-use super::GlyphInfo;
 use super::apply::ApplyContext;
 use super::buffer::*;
 use super::set_digest::SetDigest;
-use crate::BufferFlags;
-use crate::ShaperFont;
+use super::GlyphInfo;
 use crate::aat::AatData;
-use crate::ot::OtData;
 use crate::ot::apply::check_glyph_property;
 use crate::ot::lookup::LookupInfo;
+use crate::ot::OtData;
 use crate::plan::ShapePlan;
-use crate::unicode::{GeneralCategory, space_fallback};
+use crate::unicode::{space_fallback, GeneralCategory};
+use crate::BufferFlags;
+use crate::ShaperFont;
 
 impl GlyphInfo {
     declare_buffer_var!(u16, 1, 0, GLYPH_PROPS_VAR, glyph_props, set_glyph_props);

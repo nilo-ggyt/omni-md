@@ -119,6 +119,10 @@ pub(crate) struct MarkdownShapingFrontierJob {
     unicode: Option<Box<unicode::UnicodeState>>,
     // 开放SCX只授予独立字素中心，最后一个真实GCB始终作为未发布支持域。
     open_scope: bool,
+    // 原 UBA 分项事实只裁定实际 shape 输入/上下文；从不登记为全局编辑 GCB。
+    shaping_seams: [Option<crate::markdown_line_composer::ResolvedBidiShapingSeam>; 2],
+    partial_grapheme: [bool; 2],
+    context_bounds: Option<Range<usize>>,
 }
 
 /// 一次真实Ready子任务与唯一归还票；复制公开范围不能构造这个值。
@@ -127,6 +131,7 @@ pub(crate) struct MarkdownShapingFrontierPart {
     continuation: MarkdownShapingFrontierContinuation,
     original: Range<usize>,
     scope_complete: bool,
+    shaping_seams: [Option<crate::markdown_line_composer::ResolvedBidiShapingSeam>; 2],
 }
 
 /// 只含弱身份与标量，不保活Source/Font/原子任务。票不能Clone或交给另一个owner。
@@ -181,6 +186,23 @@ impl MarkdownShapingTerminalGrapheme {
 }
 
 impl MarkdownShapingFrontierPart {
+    pub(crate) fn shaping_seams(
+        &self,
+    ) -> &[Option<crate::markdown_line_composer::ResolvedBidiShapingSeam>; 2] {
+        &self.shaping_seams
+    }
+    /// 只借此真实part的原Source身份；不能由其公开范围重新签发另一个Source的审核。
+    pub(crate) fn source_authority(&self) -> &MarkdownLayoutTextAuthority {
+        &self.job.source_authority
+    }
+    /// 审核与重形保原同次取消位，不从调用方另建一个可脱离原任务的生命周期。
+    pub(crate) fn cancellation(&self) -> MarkdownShapingCancellation {
+        self.job.cancellation.clone()
+    }
+    /// 原Job实际参与整形的有限支持区；含中心外真实上下文，不从段落或预算猜边界。
+    pub(crate) fn shaping_range(&self) -> Range<usize> {
+        self.job.source_utf16.clone()
+    }
     pub(crate) fn certified_range(&self) -> Range<usize> {
         self.job.source_range()
     }
@@ -204,11 +226,11 @@ pub(crate) enum MarkdownShapingFrontierScope<'a, 'job> {
     /// 只认证原样式范围的坐标；不授予开放Script、独立字形或真实段末权限。
     CertifiedCoordinates {
         original: Range<usize>,
-        endpoints: [&'a crate::markdown_layout_breaks::MarkdownCertifiedGraphemeEndpoint; 2],
+        endpoints: [&'a crate::markdown_line_composer::CertifiedShapingEndpoint; 2],
     },
     Open {
         original: Range<usize>,
-        endpoints: [&'a crate::markdown_layout_breaks::MarkdownCertifiedGraphemeEndpoint; 2],
+        endpoints: [&'a crate::markdown_line_composer::CertifiedShapingEndpoint; 2],
         script: &'a crate::markdown_scripts::MarkdownStableScriptPrefix<'job>,
     },
 }
@@ -234,6 +256,10 @@ impl MarkdownShapingFrontierJob {
         Ok(self.unicode.as_ref().and_then(|state| {
             state
                 .terminal_grapheme(self.original.end)
+                .filter(|(utf16, _)| {
+                    !(utf16.start == self.original.start && self.partial_grapheme[0])
+                        && !(utf16.end == self.original.end && self.partial_grapheme[1])
+                }) // 局部 shaping GB1/GB2 不是完整外 GCB，不能发给原 terminal GCB 交接。
                 .map(|(utf16, bytes)| MarkdownShapingTerminalGrapheme {
                     owner: Arc::downgrade(&self.identity),
                     source: self.source.clone(),
@@ -444,17 +470,36 @@ impl MarkdownShapingFrontierJob {
             | MarkdownShapingFrontierScope::CertifiedCoordinates { endpoints, .. } => {
                 let start = endpoints[0].boundary(authority)?;
                 let end = endpoints[1].boundary(authority)?;
+                endpoints[0].require_pair(endpoints[1], authority)?;
                 if start.utf16 != original.start
                     || end.utf16 != original.end
                     || start.byte >= end.byte
                     || end.byte > source.byte_len()
-                    || !endpoints[0].same_scope(endpoints[1])
                 {
                     return Err(MarkdownShapingError::InvalidRange.into());
                 }
                 start.byte..end.byte
             }
         };
+        let (shaping_seams, partial_grapheme) = match &scope {
+            MarkdownShapingFrontierScope::Closed(_) => ([None, None], [false; 2]),
+            MarkdownShapingFrontierScope::Open { endpoints, .. }
+            | MarkdownShapingFrontierScope::CertifiedCoordinates { endpoints, .. } => (
+                std::array::from_fn(|index| endpoints[index].seam().cloned()),
+                std::array::from_fn(|index| !endpoints[index].is_grapheme()),
+            ),
+        };
+        let context_bounds = shaping_seams.iter().any(Option::is_some).then(|| {
+            (if shaping_seams[0].is_some() {
+                original_bytes.start
+            } else {
+                0
+            })..(if shaping_seams[1].is_some() {
+                original_bytes.end
+            } else {
+                source.byte_len()
+            })
+        }); // 原 Style 请求消费后，唯一前沿继续持真实 seam，不从有限字节窗猜段落边界。
         let options = ValidatedOptions::new(options, &font)?;
         if cancellation.requested() {
             return Err(MarkdownShapingError::Cancelled.into());
@@ -526,6 +571,9 @@ impl MarkdownShapingFrontierJob {
             resources: None,
             unicode,
             open_scope: false,
+            shaping_seams,
+            partial_grapheme,
+            context_bounds,
         };
         if let MarkdownShapingFrontierScope::Open { script, .. } = scope {
             result.bind_open_script(script)?;
@@ -822,6 +870,9 @@ impl MarkdownShapingFrontierJob {
             match breaks.grapheme_query(source, at, MarkdownGraphemeQuery::IsBoundary)? {
                 MarkdownGraphemeAnswer::Pending => return Ok(step),
                 MarkdownGraphemeAnswer::Known(Some(boundary)) if boundary.utf16 == at => {}
+                MarkdownGraphemeAnswer::Known(None)
+                    if (at == self.original.start && self.partial_grapheme[0])
+                        || (at == self.original.end && self.partial_grapheme[1]) => {}
                 MarkdownGraphemeAnswer::Known(_) => {
                     self.answer = MarkdownShapingFrontierAnswer::NeedsFrontier(
                         MarkdownShapingFrontierReason::NotGraphemeBoundary,
@@ -860,12 +911,19 @@ impl MarkdownShapingFrontierJob {
             let mut options = payload.options.clone();
             options.beginning_of_text &= support.start == self.original.start;
             options.end_of_text &= support.end == self.original.end;
-            let mut child = MarkdownShapingJob::assemble(
+            let prepared = self
+                .context_bounds
+                .clone()
+                .map(|bounds| {
+                    input::prepare_context(&payload.source, support_bytes.clone(), Some(bounds))
+                })
+                .transpose()?;
+            let mut child = MarkdownShapingJob::assemble_with_context(
                 payload.source.clone(),
                 source,
                 payload.font.clone(),
                 font,
-                (support, support_bytes),
+                (support, support_bytes, prepared),
                 options,
                 self.cancellation.clone(),
             )?;
@@ -957,6 +1015,7 @@ impl MarkdownShapingFrontierJob {
             let child = Arc::downgrade(&job.identity);
             self.outstanding = Some(child.clone());
             Ok(MarkdownShapingFrontierPart {
+                shaping_seams: self.shaping_seams.clone(), // 原上下文支持域也可能到达真实 seam，审核仍需保有它。
                 scope_complete: range.end == self.original.end
                     || (self.open_scope
                         && self

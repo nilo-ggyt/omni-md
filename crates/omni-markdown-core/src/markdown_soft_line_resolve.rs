@@ -152,6 +152,10 @@ pub enum MarkdownSoftLineResolveAnswer {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownSoftLineResolveStep {
     pub input_bytes: usize,
+    /// 原整形输入本次实际消费的标量；与正文 bytes 分开传递，不由 UTF-8 长度估算。
+    pub input_scalars: usize,
+    /// 本次新建实际重排 Job 时读取的相邻上下文；不与后继正文输入重复结算。
+    pub context_bytes: usize,
     pub glyphs: usize,
     pub candidates: usize,
     pub shapes: usize,
@@ -584,6 +588,8 @@ impl MarkdownSoftLineResolveJob {
         }
         let mut step = MarkdownSoftLineResolveStep {
             input_bytes: 0,
+            input_scalars: 0,
+            context_bytes: 0,
             glyphs: 0,
             candidates: 0,
             shapes: 0,
@@ -633,8 +639,12 @@ impl MarkdownSoftLineResolveJob {
                         _ => return Err(MarkdownSoftLineResolveError::InconsistentCoverage),
                     } // 真实选择必须仍是同一原GCB边界，低代理项或字素内部从不获得授权。
                     if end == payload.seed.item.end && end != payload.seed.source.utf16_len() {
-                        pending(payload, MarkdownSoftLineResolvePending::NextItem);
-                        break; // item末尾没有后项flags；不把它设成段落EOF或越过字体/字典缺口。
+                        let following = provider
+                            .following_item_flags(&payload.seed.authority, &payload.seed.font)?;
+                        if following.is_none_or(|flags| flags & UNSAFE != 0) {
+                            pending(payload, MarkdownSoftLineResolvePending::NextItem);
+                            break; // 没有真实安全后继仍拒绝；不能用Store/Script末端伪造段落EOF或跳过unsafe边界。
+                        } // 同Store已存后项的首cluster提供实际右侧见证；原Source、Font、GCB及上下文合同均不变。
                     }
                     step.candidates += 1;
                     payload.candidate = end;
@@ -650,7 +660,8 @@ impl MarkdownSoftLineResolveJob {
                                 facts: None,
                             });
                             if end == payload.limit {
-                                choose_best(payload, provider, &self.resources.facts)?;
+                                step.context_bytes =
+                                    choose_best(payload, provider, &self.resources.facts)?;
                                 break;
                             }
                             continue; // 同一原数组、完整cluster端点和安全flags已证明精确有符号advance。
@@ -666,11 +677,13 @@ impl MarkdownSoftLineResolveJob {
                                     facts: None,
                                 });
                             } // 第一个完整GCB也超宽时保留整个GCB，并明确overflow；绝不切开组合符。
-                            choose_best(payload, provider, &self.resources.facts)?;
+                            step.context_bytes =
+                                choose_best(payload, provider, &self.resources.facts)?;
                             break; // 安全超宽候选的真实重形宽度相同，不再造一个相同前缀来确认。
                         }
                     }
-                    start_current(payload, provider, &self.resources.facts, false)?;
+                    step.context_bytes =
+                        start_current(payload, provider, &self.resources.facts, false)?;
                     break; // unsafe/cluster内部或超宽候选先实际shape，不用估算宽度终止搜索。
                 }
             }
@@ -691,6 +704,7 @@ impl MarkdownSoftLineResolveJob {
                     },
                 )?;
                 step.input_bytes = input.bytes;
+                step.input_scalars = input.scalars;
                 if input.status == MarkdownShapingStatus::AwaitingShape {
                     payload.stage = if tail { Stage::TailShape } else { Stage::Shape };
                 }
@@ -764,7 +778,8 @@ impl MarkdownSoftLineResolveJob {
                     } else if tail {
                         finish(payload)?;
                     } else {
-                        accept_current(payload, provider, &self.resources.facts)?;
+                        step.context_bytes =
+                            accept_current(payload, provider, &self.resources.facts)?;
                     }
                 }
             }
@@ -923,12 +938,15 @@ fn start_current(
     provider: &mut dyn ResolutionProvider,
     resources: &Arc<ResourceFacts>,
     final_prefix: bool,
-) -> Result<()> {
-    let job = provider.reshape_subrange(
+) -> Result<usize> {
+    let mut job = provider.reshape_subrange(
         &payload.seed.authority,
         &payload.seed.font,
         payload.seed.start..payload.candidate,
     )?;
+    // 构造成功且尚未 ingest；原 Job 的实读总数此刻只含本次真实相邻上下文。
+    // 失败沿原错误立即结束，不能拿请求范围或固定 halo 大小补造成功工作量。
+    let context_bytes = job.profile()?.source_bytes_read;
     let status = job.status();
     payload.current = Some(OwnedShape::new(job, resources)?);
     payload.final_prefix = final_prefix;
@@ -937,13 +955,13 @@ fn start_current(
     } else {
         Stage::Shape
     };
-    Ok(())
+    Ok(context_bytes)
 }
 fn accept_current(
     payload: &mut Payload,
     provider: &mut dyn ResolutionProvider,
     resources: &Arc<ResourceFacts>,
-) -> Result<()> {
+) -> Result<usize> {
     if payload.final_prefix {
         if payload.expected_width != Some(payload.scan.width) {
             return Err(MarkdownSoftLineResolveError::InconsistentCoverage);
@@ -971,7 +989,7 @@ fn accept_current(
         payload.stage = Stage::Choose; // 实际重排超宽后重新按真实GCB搜索，不沿原估计签行。
     } else if payload.best.is_some() {
         drop(payload.current.take());
-        choose_best(payload, provider, resources)?;
+        return choose_best(payload, provider, resources);
     } else {
         payload.kind = MarkdownSoftLineResolvedKind::OverflowingGrapheme;
         payload.best = Some(Fit {
@@ -980,15 +998,16 @@ fn accept_current(
             shape: payload.current.take(),
             facts: Some(payload.scan),
         });
-        choose_best(payload, provider, resources)?; // 第一整个GCB也超宽：保留完整字素并明确overflow，绝不切开。
+        // 第一整个 GCB 也超宽时保留完整字素；若启动新 Job，原样交回它的真实上下文费用。
+        return choose_best(payload, provider, resources);
     }
-    Ok(())
+    Ok(0) // 只移交已有候选或改变选择阶段，没有新 Job，也没有额外上下文读取。
 }
 fn choose_best(
     payload: &mut Payload,
     provider: &mut dyn ResolutionProvider,
     resources: &Arc<ResourceFacts>,
-) -> Result<()> {
+) -> Result<usize> {
     let mut best = payload
         .best
         .take()
@@ -1005,7 +1024,7 @@ fn choose_best(
     if payload.reuse_safe && best.shape.is_none() {
         payload.expected_width = Some(best.width);
         payload.stage = Stage::Reusable;
-        return Ok(()); // 权限仍在原selector内；wrapper须再核真实GCB/索引/原票才签字形切片。
+        return Ok(0); // 只移交原候选权限；wrapper 仍核真实 GCB/索引，不读取新的整形上下文。
     }
     match best.shape.take() {
         Some(shape) => {
@@ -1026,24 +1045,26 @@ fn start_tail(
     payload: &mut Payload,
     provider: &mut dyn ResolutionProvider,
     resources: &Arc<ResourceFacts>,
-) -> Result<()> {
+) -> Result<usize> {
     #[cfg(feature = "paged-safe-glyph-slices")]
     if payload.defer_tail {
         if payload.line.is_none() || payload.tail.is_some() {
             return Err(MarkdownSoftLineResolveError::InconsistentCoverage);
         }
         payload.stage = Stage::ShapedPrefix;
-        return Ok(()); // 只交真实已整形prefix；余文仅保私有源cursor，没有虚构glyph/flags/Ready。
+        return Ok(0); // 只交真实已整形 prefix；余文仍是私有源 cursor，没有新上下文读取。
     }
     if payload.selected_end == payload.seed.item.end {
         payload.scan = GlyphFacts::default();
-        return finish(payload); // 真空余项没有假Job或假释放收据；原非空前缀仍实际Ready。
+        return finish(payload).map(|()| 0); // 真空余项只封存已有前缀，不创建 Job 或上下文。
     }
-    let job = provider.reshape_subrange(
+    let mut job = provider.reshape_subrange(
         &payload.seed.authority,
         &payload.seed.font,
         payload.selected_end..payload.seed.item.end,
     )?;
+    // 余项 Job 的构造读取也属于当前步骤；后续 ingest 的 bytes/scalars 由其实际 step 返回。
+    let context_bytes = job.profile()?.source_bytes_read;
     let status = job.status();
     payload.tail = Some(OwnedShape::new(job, resources)?);
     payload.stage = if status == MarkdownShapingStatus::Ingesting {
@@ -1051,7 +1072,7 @@ fn start_tail(
     } else {
         Stage::TailShape
     };
-    Ok(())
+    Ok(context_bytes)
 }
 fn finish(payload: &mut Payload) -> Result<()> {
     if payload.selected_end <= payload.seed.start || payload.selected_end > payload.seed.item.end {

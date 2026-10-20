@@ -207,14 +207,6 @@ impl Drop for NativeMarkdownTableCellRequest {
 }
 
 impl NativeMarkdownTableCellRequest {
-    pub(super) fn pointer(&self) -> Option<Rc<NativeMarkdownTableCellPointer>> {
-        match &*self.action.borrow() {
-            NativeMarkdownTableCellAction::ActivateOriginalClick { pointer, .. } => {
-                pointer.as_ref().map(Rc::clone)
-            }
-            _ => None, // 程序命令和键盘导航从未占用原鼠标载荷。
-        }
-    }
     #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn finish_observer(&self, outcome: NativeMarkdownTableCellOutcome) {
         if let Some(observer) = &self.observer {
@@ -485,11 +477,6 @@ impl PieceBackedMarkdownTextView {
                     .map_err(|_| "原表格物理行已改变")?
             }
         };
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        let observer = observer.or_else(|| {
-            // 真实 product gate 已取得同源 key/intent；预签菜单观察只能绑定该同 Rc 字符后果。
-            self.probe_bind_table_insertion_observation(&document, key, target, &intent)
-        });
         let request = NativeMarkdownTableCellRequest::new(
             &document,
             key,

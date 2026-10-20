@@ -85,6 +85,7 @@ pub fn next_lines(
                                 range,
                                 font.registered(),
                                 MarkdownLineComposeStyle {
+                                    presentation: Default::default(),
                                     points: font.native().point_size() as f32,
                                     language: None,
                                     features: Vec::new(),
@@ -108,6 +109,10 @@ pub fn next_lines(
                 panic!("有限单段前缀出现未完成的真实解析")
             }
             MarkdownLineComposeAnswer::NeedsControl(_) => panic!("无控制符夹具出现控制请求"),
+            // 本夹具未启用真实表格 flow，出现块行请求必须报错，不能吞作普通文字完成。
+            MarkdownLineComposeAnswer::NeedsTableRow(_) => {
+                panic!("非表格夹具出现真实表格行请求")
+            }
             MarkdownLineComposeAnswer::NeedsTabPlacement(_) => panic!("无制表符夹具出现Tab请求"),
         }
     }

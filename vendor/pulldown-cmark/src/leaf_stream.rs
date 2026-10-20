@@ -266,7 +266,7 @@ impl LeafProbe {
             Phase::HtmlUnquoted => {
                 match byte {
                     Some(byte) if crate::scanners::is_valid_unquoted_attr_value_char(byte) => {
-                        return true
+                        return true;
                     }
                     _ => self.phase = Phase::HtmlBetween { space: false },
                 }

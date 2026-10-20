@@ -57,6 +57,7 @@ fn font() -> MarkdownLayoutFont {
 
 fn style() -> MarkdownLineComposeStyle {
     MarkdownLineComposeStyle {
+        presentation: Default::default(),
         points: 16.0,
         language: None,
         features: Vec::new(),
@@ -84,6 +85,150 @@ fn respond(
     worker
         .provide_style(request.respond_registered(range, font, style()).unwrap())
         .unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn same_source_style_reset_reuses_dependencies_and_replaces_real_glyph_output() {
+    // 完成一次真实小字号布局后改变显隐字号；检查原字形、索引和FD，不把新样式值当成输出证明。
+    let fixture = Fixture::new("hello αλφα world");
+    let catalog = MarkdownLineFontCatalog::new();
+    let registered = catalog.register(&font()).unwrap();
+    let mut worker = MarkdownLineComposer::new_with_frontier(
+        fixture.source.clone(),
+        &fixture.source.authority(),
+        catalog.clone(),
+        80 * 64,
+        MarkdownLineComposeCancellation::new(),
+    )
+    .unwrap();
+    let complete = |worker: &mut MarkdownLineComposer, points: f32| {
+        for _ in 0..100_000 {
+            let step = worker
+                .step(MarkdownLineComposeBudget {
+                    bytes: 1,
+                    scalars: 1,
+                    records: 1,
+                    metadata_units: 1,
+                })
+                .unwrap();
+            assert!(
+                step.bytes <= 1
+                    && step.scalars <= 1
+                    && step.records <= 1
+                    && step.metadata_units <= 1
+                    && step.shapes <= 1
+            );
+            match step.answer {
+                MarkdownLineComposeAnswer::NeedStyle(request) => {
+                    let range = request.source_range();
+                    worker
+                        .provide_style(
+                            request
+                                .respond_registered(
+                                    range,
+                                    &registered,
+                                    MarkdownLineComposeStyle {
+                                        presentation: if points == 0.1 {
+                                            crate::MarkdownPresentationStyles::HIDDEN_MARKER
+                                        } else {
+                                            crate::MarkdownPresentationStyles::UNDERLINE.union(
+                                                crate::MarkdownPresentationStyles::STRIKETHROUGH,
+                                            )
+                                        },
+                                        points,
+                                        language: None,
+                                        features: Vec::new(),
+                                    },
+                                )
+                                .unwrap(),
+                        )
+                        .unwrap();
+                }
+                MarkdownLineComposeAnswer::Complete => return,
+                MarkdownLineComposeAnswer::Yielded | MarkdownLineComposeAnswer::LineReady(_) => {}
+                MarkdownLineComposeAnswer::NeedsResolution(_) => {} // 原内部resolver在下一量子继续；真实缺能力仍会在原上限内未Complete而失败。
+                other => panic!(
+                    "有限无控制源的真实样式重排不能丢功能：{:?}",
+                    std::mem::discriminant(&other)
+                ),
+            }
+        }
+        panic!("有限样式重排没有交付真实Complete");
+    };
+    complete(&mut worker, 0.1);
+    let old_writer = worker.resource_observer().unwrap();
+    let mut old = worker.publish_ready_prefix().unwrap().unwrap();
+    let old_reader = old.resource_observer();
+    let line = old.last_line().unwrap().unwrap();
+    assert_eq!(line.facts().source_utf16, 0..fixture.source.utf16_len());
+    assert!(old.previous_line(&line).unwrap().is_none()); // 小字号原图只有一条完整行。
+    assert_eq!(old.part(&line, 0).unwrap().unwrap().facts().points, 0.1);
+    old.close().unwrap(); // 重排之前真实归还旧prefix，不保留第二glyph图。
+    let before = worker
+        .payload
+        .as_mut()
+        .unwrap()
+        .coordinator
+        .style_dependency_source_reads();
+    assert!(before.0 > 0); // 非ASCII夹具确实消费了Script源，不能以Dense全零读量伪证复用。
+    let graphemes = worker
+        .worker_resource_observer()
+        .snapshot()
+        .unwrap()
+        .graphemes
+        .unwrap();
+    worker.reset_styles(catalog).unwrap();
+    assert!(worker.source_authority() == &fixture.source.authority());
+    assert!(!old_writer.snapshot().file_open && !old_reader.snapshot().file_open);
+    {
+        let coordinator = &mut worker.payload.as_mut().unwrap().coordinator;
+        assert_eq!(coordinator.style_dependency_source_reads(), before);
+        assert_eq!(
+            worker
+                .worker_resource_observer()
+                .snapshot()
+                .unwrap()
+                .graphemes
+                .unwrap(),
+            graphemes
+        );
+    } // 重置本身不调用任何索引step或读取源；后继仍沿原公开量子组合真实行。
+    complete(&mut worker, 24.0);
+    assert_eq!(
+        worker
+            .payload
+            .as_mut()
+            .unwrap()
+            .coordinator
+            .style_dependency_source_reads(),
+        before
+    );
+    let mut output = worker.into_output().unwrap();
+    let mut line = output.last_line().unwrap();
+    let mut start = fixture.source.utf16_len();
+    let mut count = 0;
+    while let Some(actual) = line {
+        assert_eq!(actual.facts().source_utf16.end, start);
+        assert!(actual.facts().source_utf16.start < start);
+        assert!(actual.facts().x_advance_26_6 <= 80 * 64); // 此夹具每个GCB都小于80pt，不能用整词溢出假装换行。
+        for index in 0..actual.facts().parts {
+            let part = output.part(&actual, index).unwrap().unwrap();
+            assert_eq!(part.facts().points, 24.0);
+            assert_eq!(
+                part.facts().presentation,
+                crate::MarkdownPresentationStyles::UNDERLINE
+                    .union(crate::MarkdownPresentationStyles::STRIKETHROUGH)
+            );
+            assert!(part.facts().glyphs > 0);
+        }
+        start = actual.facts().source_utf16.start;
+        count += 1;
+        line = output.previous_line(&actual).unwrap();
+    }
+    assert_eq!(start, 0); // 新完整输出必须重新覆盖原canonical，不能只伪造远端marker的字体元数据。
+    assert!(count > 1); // 真实字号变大必须折行，不沿用旧0.1pt单行几何。
+    output.close().unwrap();
 }
 
 #[cfg(target_os = "macos")]
@@ -421,6 +566,7 @@ fn actual_body14_natural_and_unbroken_first_line_lb_work_is_equal_for_4k_8k_4m()
                                         range,
                                         &registered,
                                         MarkdownLineComposeStyle {
+                                            presentation: Default::default(),
                                             points: 14.0,
                                             language: None,
                                             features: Vec::new(),

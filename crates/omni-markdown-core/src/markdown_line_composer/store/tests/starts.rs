@@ -52,6 +52,7 @@ impl Prepared {
             .next_with_style(
                 &mut coordinator,
                 MarkdownLineComposeStyle {
+                    presentation: Default::default(),
                     points: 16.0,
                     language: None,
                     features: Vec::new(),

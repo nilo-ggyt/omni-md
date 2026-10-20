@@ -52,6 +52,21 @@ fn seed(prefix: &str, full: &str) -> TableContinuationState {
             missing_cells: 0,
         },
         options: dialect(),
+        header_inline: cell::TableInlineRow {
+            ordinal: 0,
+            start: prefix.as_bytes()[..seed.header_byte_start]
+                .iter()
+                .rposition(|byte| matches!(byte, b'\r' | b'\n'))
+                .map_or(0, |index| index + 1),
+            content_start: seed.header_byte_start,
+            content_end: prefix[seed.header_byte_start..]
+                .find(['\r', '\n'])
+                .map_or(prefix.len(), |index| seed.header_byte_start + index),
+            end: prefix[seed.header_byte_start..]
+                .find('\n')
+                .map_or(prefix.len(), |index| seed.header_byte_start + index + 1),
+        },
+        last_inline: None,
     })
 }
 

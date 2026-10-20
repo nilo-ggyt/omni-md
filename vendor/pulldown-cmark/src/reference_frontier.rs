@@ -315,7 +315,7 @@ impl ReferenceDefinitionScanner {
                             return Ok(self.step(consumed));
                         }
                         SpaceStep::NeedInput => {
-                            return Ok(self.wait_step(consumed, frame.bytes.len()))
+                            return Ok(self.wait_step(consumed, frame.bytes.len()));
                         }
                     }
                 }
@@ -341,7 +341,7 @@ impl ReferenceDefinitionScanner {
                             return Ok(self.step(consumed));
                         }
                         DestinationResult::NeedInput => {
-                            return Ok(self.wait_step(consumed, frame.bytes.len()))
+                            return Ok(self.wait_step(consumed, frame.bytes.len()));
                         }
                     }
                 }
@@ -373,7 +373,7 @@ impl ReferenceDefinitionScanner {
                             return Ok(self.step(consumed));
                         }
                         SpaceStep::NeedInput => {
-                            return Ok(self.wait_step(consumed, frame.bytes.len()))
+                            return Ok(self.wait_step(consumed, frame.bytes.len()));
                         }
                     }
                 }
@@ -397,7 +397,7 @@ impl ReferenceDefinitionScanner {
                             return Ok(self.step(consumed));
                         }
                         TitleStep::NeedInput => {
-                            return Ok(self.wait_step(consumed, frame.bytes.len()))
+                            return Ok(self.wait_step(consumed, frame.bytes.len()));
                         }
                     }
                 }
@@ -549,7 +549,7 @@ mod tests {
                 .unwrap();
             match step {
                 ReferenceStep::Candidate { candidate, .. } => {
-                    return (Some(candidate), scanner.next_byte())
+                    return (Some(candidate), scanner.next_byte());
                 }
                 ReferenceStep::Rejected { replay_from, .. } => {
                     assert_eq!(replay_from, 0);

@@ -24,14 +24,20 @@ pub use matching::backend::run_native_paged_find_backend_control;
 ))]
 pub use matching::backend::run_native_paged_find_body_transaction_control;
 pub(super) use matching::backend::{NativeMarkdownFindBackend, execute_find_backend};
-#[cfg(feature = "native-paged-find-probe")]
+#[cfg(feature = "native-paged-production")]
 pub(super) use matching::backend::{
     NativeMarkdownFindExecution, NativeMarkdownFindExecutionError, NativeMarkdownPagedFindBackend,
     NativeMarkdownPagedFindRevealPort, NativeMarkdownPagedFindRevealProgress,
     NativeMarkdownPagedFindRevealRequest,
 };
 use matching::*;
-pub(super) use viewport::{NativeMarkdownFindHighlightBatch, NativeMarkdownFindViewportFeedback};
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+pub(super) use viewport::NativeMarkdownFindHighlightBatch;
+pub(super) use viewport::NativeMarkdownFindViewportFeedback;
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+pub(super) use viewport::{MAX_DECORATION_VIEWPORT_UNITS, MAX_SPECIAL_CHARACTER_MARKERS};
+#[cfg(feature = "native-paged-production")]
+pub(super) use viewport::{NativeMarkdownFindVisibleSource, NativeMarkdownPagedFindHighlightError};
 
 #[cfg(feature = "native-markdown-runtime-probe")]
 mod probe;
@@ -83,10 +89,10 @@ pub(super) fn dispatch_markdown_find_key_command(
                 active
                     .as_ref()
                     .and_then(|surface| surface.editor.as_ref())
-                    .is_some_and(|editor| editor.find_bar.borrow().is_some())
+                    .is_some_and(|editor| editor.find_bar().borrow().is_some())
             });
             if exists {
-                perform_native_markdown_find_action(action)
+                perform_native_markdown_find_action(action).map(|_| ())
             } else {
                 show_native_markdown_find_bar(true)
             }
@@ -112,7 +118,7 @@ pub(super) fn markdown_find_return_action(
         active
             .as_ref()
             .and_then(|surface| surface.editor.as_ref())
-            .and_then(|editor| editor.find_bar.borrow().clone())
+            .and_then(|editor| editor.find_bar().borrow().clone())
     })?;
     if !bar.is_visible() {
         // 隐藏栏不夺取正文、sidebar 或表格的 Return。
@@ -172,12 +178,12 @@ impl MarkdownFindAction {
     }
 }
 
-/// 每笔记唯一强 owner；回调 target 是窗口仍拥有的 weak Objective-C target。
+/// 同一栏只弱绑定实际显示后端，模式交接不能同时保留两张正文图的绘图权限。
 pub(super) struct NativeMarkdownFindBar {
     /// 创建栏时固定原文稿的弱身份；输入排队前取得代次，不能在后继笔记上重新领票。
     document: WeakMarkdownDocument,
-    /// 正式 TextKit 装配只弱观察原 view；Paged 栏没有该后端，也不会为反馈创建旧正文图。
-    textkit_view: OnceCell<Weak<PieceBackedMarkdownTextView>>,
+    /// 正式装配只弱观察原图；Paged 栏不会为反馈创建旧 TextKit 正文。
+    presentation_body: RefCell<Option<std::rc::Weak<super::paged_body::NativeMarkdownPagedBody>>>,
     /// 只标记一次真实输入尚待反馈的原intent；滚动重建高亮不能覆盖显式导航文案。
     viewport_feedback_intent: Cell<Option<u64>>,
     /// 只记录两个真实字段的组合状态，不保存候选文字或另建输入历史。
@@ -199,6 +205,23 @@ pub(super) struct NativeMarkdownFindBar {
 }
 
 impl NativeMarkdownFindBar {
+    /// Find 仅弱绑定当前正文；模式切换不重建栏，也不保活 Body 或另一张 Native 图。
+    pub(super) fn bind_body(
+        self: &Rc<Self>,
+        body: std::rc::Weak<super::paged_body::NativeMarkdownPagedBody>,
+        controller: &NativeMarkdownController,
+    ) {
+        let previous = self.presentation_body.replace(Some(body.clone()));
+        if let Some(previous) = previous.as_ref().and_then(std::rc::Weak::upgrade) {
+            previous.unbind_find_highlights(&Rc::downgrade(self));
+        }
+        drop(previous);
+        self.viewport_feedback_intent.set(None);
+        if let Some(body) = body.upgrade() {
+            body.bind_find_highlights(Rc::downgrade(self), controller);
+        }
+    }
+
     /// query/选项请求一次计数反馈，替换输入只清旧文案；不增加第二套输入代次。
     pub(super) fn stage_viewport_feedback(&self, intent: u64, refresh: bool) {
         self.viewport_feedback_intent.set(refresh.then_some(intent));
@@ -375,7 +398,7 @@ impl NativeMarkdownFindBar {
         // 控件装配完成后仅登记原bar的Rust Weak；Controller不能成为第二个栏或文稿owner。
         let bar = Rc::new(Self {
             document,
-            textkit_view: OnceCell::new(),
+            presentation_body: RefCell::new(None),
             viewport_feedback_intent: Cell::new(None),
             query_marked: Cell::new(false),
             replacement_marked: Cell::new(false),
@@ -665,7 +688,7 @@ impl NativeMarkdownFindBar {
     }
 
     /// 隐藏只结束当前客户端并回到正文；活动笔记内仍保留查询/选项供 Cmd-G 使用。
-    fn hide(
+    pub(super) fn hide(
         &self,
         scroll: &NSScrollView,
         view: &NSView,
@@ -727,6 +750,11 @@ impl NativeMarkdownFindBar {
     /// accepted 才清空业务值与全部项目回调；正常失败预检不调用此不可逆路径。
     pub(super) fn finish_accepted(&self) {
         self.closed.set(true);
+        let binding = self.presentation_body.borrow_mut().take();
+        if let Some(body) = binding.as_ref().and_then(std::rc::Weak::upgrade) {
+            body.clear_find_highlights_binding();
+        }
+        drop(binding); // Native weak 的归还不跨栏或 Body 的 RefCell 借用。
         self.viewport_feedback_intent.set(None);
         self.query_marked.set(false);
         self.replacement_marked.set(false);
@@ -765,26 +793,28 @@ impl NativeMarkdownFindBar {
 pub(super) fn show_native_markdown_find_bar(replace: bool) -> Result<(), String> {
     with_active_native_markdown_surface(|surface| {
         let editor = surface.editor.as_ref().ok_or("当前没有打开的笔记")?;
-        let _payload = PayloadUseGuard::enter(&editor.backend.text_view.ivars().payload_use_depth);
-        let existing = editor.find_bar.borrow().clone();
+        // 字段取得焦点前结束原活动格，预填查询使用真实清洗后的 canonical 选择。
+        editor
+            .body
+            .finish_cell_before_find(&surface.controller, surface.controller.find_input_intent())
+            .map_err(|cause| cause.to_string())?;
+        let existing = editor.find_bar().borrow().clone();
         let bar = match existing {
             Some(bar) => bar, // 同一笔记重复显示保留原查询和历史。
             None => {
                 // 所有构造角色登记成功后才发布；外层唯一 owner lease 拒绝构造期重入关闭。
                 let bar = NativeMarkdownFindBar::new(
                     &surface.controller,
-                    &editor.backend.owned_ledger,
+                    &editor.find_owned_ledger(),
                     Rc::downgrade(editor.document()),
                     surface.panel.mtm(),
                 )?;
-                *editor.find_bar.borrow_mut() = Some(Rc::clone(&bar));
+                bar.bind_body(Rc::downgrade(&editor.body), &surface.controller);
+                *editor.find_bar().borrow_mut() = Some(Rc::clone(&bar));
                 bar
             }
         };
-        // 同一笔记的原栏只绑定一次真实 view；弱边不延长正文或 Native 图的寿命。
-        // 借出 owner 仍在本栈，不能从随后可变的 Active 槽重新领取输入目标。
-        bar.textkit_view
-            .get_or_init(|| Weak::from(&*editor.backend.text_view));
+        // 重复显示借原栏与原布局反馈；只有上方首次装配或明确模式交接才改正文弱绑定。
         if !native_markdown_controller_has_foreground_authority(&surface.controller)
             || bar.closed.get()
         {
@@ -797,7 +827,11 @@ pub(super) fn show_native_markdown_find_bar(replace: bool) -> Result<(), String>
             return Err("查找栏所属笔记窗口正在关闭".into());
         }
         if query_is_idle {
-            let selection = editor.backend.text_view.selectedRange();
+            let selection = editor
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?
+                .primary_range;
             if selection.length > 0 && selection.length <= 100 {
                 // 与原编辑器相同：离开正文后打开 Find，以至多 100 units 的选择预填，不读全局 Find pasteboard。
                 let selected = editor
@@ -823,7 +857,7 @@ pub(super) fn show_native_markdown_find_bar(replace: bool) -> Result<(), String>
                 }
             }
         }
-        bar.show(&editor.backend.scroll_view, replace, &surface.controller)?;
+        bar.show(editor.scroll_view(), replace, &surface.controller)?;
         editor.capture_find_resources()
     })
 }
@@ -831,55 +865,37 @@ pub(super) fn show_native_markdown_find_bar(replace: bool) -> Result<(), String>
 /// 同步动作只借用活笔记；所有 native getter/匹配调用均在状态借用结束后执行。
 pub(super) fn perform_native_markdown_find_action(
     action: MarkdownFindAction,
-) -> Result<(), String> {
-    let (bar, scroll, view, controller, intent, original) =
-        with_active_native_markdown_surface(|surface| {
-            let editor = surface.editor.as_ref().ok_or("当前没有打开的笔记")?;
-            let bar = editor.find_bar.borrow().clone().ok_or("查找栏尚未打开")?;
-            // 在任何Native retain前固定本次意图，后续getter重入不能替旧命令领取新代次。
-            let intent = surface.controller.advance_find_input_intent();
-            bar.viewport_feedback_intent.set(None); // 显式动作接管反馈；后续scroll只重建同查询高亮。
-            let original = NativeMarkdownFindViewportFeedback::capture(
-                &bar,
-                &surface.controller,
-                intent,
-                false,
-            )
-            .ok_or("原查找文稿已失效")?; // 首Native retain前固定原Doc弱票，擦旧像素不能借后继图。
-            Ok((
-                bar,
-                editor.backend.scroll_view.clone(),
-                editor.backend.text_view.clone(),
-                surface.controller.clone(),
-                intent,
-                original,
-            ))
-        })?;
-    let _payload = PayloadUseGuard::enter(&view.ivars().payload_use_depth);
-    if bar.closed.get() || view.ivars().textkit_graph_teardown.get() {
-        return Err("笔记编辑器正在关闭".into()); // 迟到动作不获得新的查找或编辑权限。
-    }
-    view.invalidate_find_highlights(&|| original.current(&controller));
-    if !original.current(&controller) {
-        return Err("原查找输入已变化".into()); // 原重绘请求发生重入时不继续旧显式动作。
-    }
+) -> Result<NativeMarkdownFindExecution, String> {
+    let (bar, body, scroll, controller, intent) = with_active_native_markdown_surface(|surface| {
+        let editor = surface.editor.as_ref().ok_or("当前没有打开的笔记")?;
+        let bar = editor.find_bar.borrow().clone().ok_or("查找栏尚未打开")?;
+        let intent = surface.controller.advance_find_input_intent();
+        bar.viewport_feedback_intent.set(None);
+        Ok((
+            bar,
+            Rc::clone(&editor.body),
+            editor.scroll_view.clone(),
+            surface.controller.clone(),
+            intent,
+        ))
+    })?;
     if action == MarkdownFindAction::Hide {
-        let controller = with_active_native_markdown_surface(|surface| {
-            // Native retain不跨TLS借用；旧bar不能向后继窗口借取新的关闭/布局权限。
-            let same_bar = surface.editor.as_ref().is_some_and(|editor| {
-                editor
-                    .find_bar
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|actual| Rc::ptr_eq(actual, &bar))
-            });
-            if !same_bar {
-                return Err("查找栏所属笔记已变化".into());
-            }
-            Ok(surface.controller.clone())
-        })?;
-        bar.hide(&scroll, &view, &controller)?;
-        return Ok(()); // 隐藏无需搜索或改变 canonical 内容。
+        // 隐藏沿原 Body 锚保留真实视口；不能因关闭栏改变 clip 而将已测前缀误当全文末端。
+        body.finish_cell_before_find(&controller, intent)
+            .map_err(|cause| cause.to_string())?;
+        body.hide_find_bar(&bar, &scroll, &controller)?;
+        return Ok(NativeMarkdownFindExecution::Complete);
     }
-    execute_find_action(&bar, &view, &controller, intent, action)
+    match body.execute_paged_find_action(&bar, &controller, intent, action) {
+        Ok(NativeMarkdownFindExecution::Complete) => Ok(NativeMarkdownFindExecution::Complete),
+        Ok(NativeMarkdownFindExecution::Pending(request)) => {
+            // 返回原在途请求；验收观察真实发布终点，普通界面可忽略已接纳结果。
+            if let Some(cause) = request.take_failure() {
+                Err(cause.to_string())
+            } else {
+                Ok(NativeMarkdownFindExecution::Pending(request))
+            }
+        }
+        Err(cause) => Err(cause.to_string()),
+    }
 }

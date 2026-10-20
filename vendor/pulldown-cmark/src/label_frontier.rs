@@ -134,7 +134,7 @@ impl LabelScanner {
             let byte = bytes[consumed];
             match self.phase {
                 Phase::Complete | Phase::Rejected | Phase::AwaitContinuation => {
-                    return Ok(self.step(consumed))
+                    return Ok(self.step(consumed));
                 }
                 Phase::Backslash => {
                     match label_lexeme(b'\\', None, Some(byte), true, self.in_table) {

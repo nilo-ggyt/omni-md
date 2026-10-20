@@ -20,6 +20,19 @@ pub(in crate::markdown_line_composer) struct StoredGlyphBorrow<'a> {
 impl provider::sealed::Sealed for StoredGlyphBorrow<'_> {}
 
 impl GlyphProvider for StoredGlyphBorrow<'_> {
+    /// 本次原目录已由 borrow/require 核对；只回读独占 kind，不产生新的源或范围权限。
+    fn folded_section(&self) -> Option<Range<usize>> {
+        (self.directory.kind == super::super::MarkdownComposedLinePartKind::FoldedSection)
+            .then(|| self.directory.facts.source_utf16.clone())
+    }
+
+    /// 仅原 ValidatedControl 写成的真实零字形换段可终止前行；TableRow 与普通 glyph 不获此能力。
+    fn ends_paragraph_control(&self) -> bool {
+        self.directory.kind == super::super::MarkdownComposedLinePartKind::ParagraphBreak
+            && self.directory.glyph_count == 0
+            && !self.directory.facts.source_utf16.is_empty()
+    }
+
     fn origin(&self) -> provider::GlyphProviderOrigin {
         let (store, origin) = StoredGlyphBorrow::origin(self);
         provider::GlyphProviderOrigin::Stored { store, origin }
@@ -75,8 +88,10 @@ impl GlyphProvider for StoredGlyphBorrow<'_> {
                 return Err(MarkdownSoftLineMeasureError::InvalidRequest);
             };
             value.x_advance_26_6 = advance_26_6;
+            GlyphProvider::require(self, source, font)?; // Tab另读原style/placement，须在这次额外IO后核原权限。
         }
-        GlyphProvider::require(self, source, font)?;
+        // 普通cluster已由内层require_current及finish核过真实Font、取消和Source首错；
+        // 此后仅移动本次结果，没有Native、回调或另一借用，不重复完整catalog/来源扫描。
         Ok(MarkdownGlyphClusterAnswer::Known(answer))
     }
     #[cfg(feature = "paged-shaping-frontier")]
@@ -89,6 +104,17 @@ impl GlyphProvider for StoredGlyphBorrow<'_> {
         let end = self.directory.frontier_word_end;
         GlyphProvider::require(self, source, font)?;
         Ok(end) // 只回读原producer写入同origin的事实，不重建已Drop Job或扩大当前source_range。
+    }
+    #[cfg(feature = "paged-shaping-frontier")]
+    fn bidi_shaping_end(
+        &mut self,
+        source: &MarkdownLayoutTextAuthority,
+        font: &MarkdownLayoutFontAuthority,
+    ) -> std::result::Result<Option<usize>, MarkdownSoftLineMeasureError> {
+        GlyphProvider::require(self, source, font)?;
+        let end = self.directory.shaping_seams[1].map(|_| self.directory.facts.source_utf16.end);
+        GlyphProvider::require(self, source, font)?;
+        Ok(end) // 私有目录只由原 Item 的 sealed seam 写入；公开整数不能补签该事实。
     }
     fn committed_line_start(
         &mut self,
@@ -381,6 +407,43 @@ impl StoredGlyphBorrow<'_> {
 impl provider::ResolutionProvider for StoredGlyphBorrow<'_> {
     fn shaping_cancellation(&self) -> crate::MarkdownShapingCancellation {
         self.store.cancellation.shaping()
+    }
+    fn following_item_flags(
+        &mut self,
+        source: &MarkdownLayoutTextAuthority,
+        font: &MarkdownLayoutFontAuthority,
+    ) -> std::result::Result<Option<u32>, crate::MarkdownSoftLineResolveError> {
+        GlyphProvider::require(self, source, font)?;
+        let result = (|| {
+            let end = self.directory.facts.source_utf16.end;
+            let Some(proof) = self.store.item_at(end)? else {
+                return Ok(None);
+            };
+            let next = self.store.directory(&proof)?; // 同Store真实proof同时核原Source、弱Font注册及完整目录。
+            if next.kind != super::super::MarkdownComposedLinePartKind::Glyphs
+                || next.facts.source_utf16.start != end
+                || next.cluster_count == 0
+            {
+                return Ok(None); // 未完成、控制或缺口没有后继glyph见证，仍交原NextItem能力出口。
+            }
+            let row = self
+                .store
+                .index
+                .as_mut()
+                .ok_or(Error::Poisoned)?
+                .read(next.cluster_start)?;
+            let cluster = decode_cluster(row)?;
+            if cluster.source_utf16.start != end
+                || cluster.source_utf16.end > next.facts.source_utf16.end
+                || cluster.glyphs.end > next.glyph_count
+            {
+                return Err(Error::InconsistentCoverage);
+            } // 错目录/记录不得被当作“安全后继”；只消费同一真实首cluster，不扫描整项。
+            Ok((cluster.missing_glyphs == 0).then_some(cluster.flags))
+        })();
+        let value = self.store.finish(result).map_err(measure_error)?;
+        GlyphProvider::require(self, source, font)?;
+        Ok(value)
     }
     fn reshape_subrange(
         &mut self,

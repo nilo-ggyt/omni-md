@@ -13,6 +13,7 @@ use crate::{structural_spine::StructuralSpineSnapshot, HeadingLevel, Options};
 pub enum InlineBlockKind {
     Paragraph,
     SetextHeading(HeadingLevel),
+    TableCell,
 }
 
 #[derive(Debug)]
@@ -39,13 +40,13 @@ impl VerifiedGlobalInlineBlock {
     /// seed 只证明真实来源，后继仍须完成 Plain/完整 inline 与 Core 上下文才能授予样式权限。
     pub fn into_origins_and_semantic_seed(
         self,
-        limits: super::InlineOriginLimits,
+        limits: super::BlockOriginLimits,
     ) -> Result<
-        (super::InlineOriginCursor, super::VerifiedInlineSemanticSeed),
+        (super::BlockOriginCursor, super::VerifiedInlineSemanticSeed),
         super::GlobalFrontierError,
     > {
         let seed = super::VerifiedInlineSemanticSeed::from_verified(&self);
-        let origins = super::InlineOriginCursor::from_verified(self, limits)?;
+        let origins = super::BlockOriginCursor::from_verified(self, limits)?;
         Ok((origins, seed))
     }
 
@@ -53,9 +54,9 @@ impl VerifiedGlobalInlineBlock {
     /// 限额在整个游标生命周期内累计，原结构页的 role fuel 仍与真实 producer 共享。
     pub fn into_line_origins(
         self,
-        limits: super::InlineOriginLimits,
-    ) -> Result<super::InlineOriginCursor, super::GlobalFrontierError> {
-        super::InlineOriginCursor::from_verified(self, limits)
+        limits: super::BlockOriginLimits,
+    ) -> Result<super::BlockOriginCursor, super::GlobalFrontierError> {
+        super::BlockOriginCursor::from_verified(self, limits)
     }
 
     pub fn source_revision(&self) -> u64 {

@@ -49,7 +49,7 @@ pub enum NativeInputTraceKind {
     Empty,
     /// Entry to the actual text responder's keyDown: stack.
     KeyDownBegin,
-    /// Return from that exact superclass keyDown: dispatch.
+    /// 同一真实客户keyDown返回；不把延后解释误记为仍在原同步事件栈内。
     KeyDownEnd,
     /// Entry to a standard input selector, including nested selectors.
     SelectorBegin,
@@ -119,7 +119,7 @@ pub struct NativeInputTraceRecord {
     pub removed_utf16_units: usize,
     /// Inserted code-unit count, with no replacement text.
     pub inserted_utf16_units: usize,
-    /// Actual superclass marked state at scope entry/exit; canonical-decision records leave it None.
+    /// 实际NSTextInputClient的marked状态；canonical结果记录没有独立协议状态，因此为None。
     pub native_marked: Option<bool>,
     /// Explicit commit/provisional interpretation, never inferred from a draw callback.
     pub outcome: NativeInputTraceOutcome,
@@ -185,6 +185,6 @@ pub enum NativeInputTraceAccessError {
     ClockUnavailable,
 }
 
-/// Shared only by one foreground view/storage pair; no global history or reverse native link exists.
+/// 只归当前原输入owner及同步scope；没有全局历史、Doc或反向Native引用。
 #[cfg(any(target_os = "macos", test))]
 pub(crate) type SharedNativeInputTrace = Rc<RefCell<state::NativeInputTrace>>;

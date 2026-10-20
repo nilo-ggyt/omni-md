@@ -14,6 +14,7 @@ const HEIGHT: usize = 32;
 
 mod paired;
 mod regions;
+mod resize;
 
 /// 固定小型对照图，不保存文稿；context先于原像素Vec归还。
 struct Canvas {
@@ -124,6 +125,7 @@ fn fixture(source: &mut Canvas, counters: Arc<NativeMarkdownViewportPixels>) -> 
 
 /// 所有异常都先实际detach并记录资源，再返回失败；不提前panic跳过清理。
 pub(in crate::native_surface::paged_text_view) fn run(_mtm: MainThreadMarker) -> Result<()> {
+    resize::run()?;
     for mutation in [
         Mutation::None,
         Mutation::Mask,
@@ -156,11 +158,19 @@ pub(in crate::native_surface::paged_text_view) fn run(_mtm: MainThreadMarker) ->
             let successor = CALayer::new();
             weaks.push(layer_weak(&successor));
             let foreign_color = CGColor::new_srgb(0.2, 0.3, 0.4, 1.0);
-            let [container, foreground, mask] = pool.groups[0].slots[0].diagnostic_layers();
+            let attempt = pool.attempt()?;
+            let publication = match pool.publish(&backing, &frame, &attempt, bounds, 1.0, &|| true)
+            {
+                Ok(publication) => publication,
+                Err(error) => {
+                    pool.detach(&backing); // 发布失败也先归还已建候选，不能靠测试提前返回跳过真实清理。
+                    return Err(error);
+                }
+            };
+            weaks.extend(pool.weaks());
+            let [container, foreground, mask] =
+                pool.groups[0].slots.borrow()[0].diagnostic_layers();
             let result = (|| -> Result<(bool, bool)> {
-                let attempt = pool.attempt()?;
-                let publication =
-                    pool.publish(&backing, &frame, &attempt, bounds, 1.0, &|| true)?;
                 pool.validate(&backing, &publication, &|| true)?;
                 pool.mount().renderInContext(&rendered.context);
                 CGContext::flush(Some(&rendered.context));

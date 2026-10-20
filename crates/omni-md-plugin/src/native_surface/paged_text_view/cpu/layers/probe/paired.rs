@@ -266,12 +266,19 @@ fn visible_graphs(case: PaletteCase) -> Result<()> {
             let successor = CALayer::new();
             weaks.push(layer_weak(&successor));
             let foreign_color = CGColor::new_srgb(0.2, 0.3, 0.4, 1.0);
+            let attempt = pool.attempt()?;
+            let publication = match pool.publish(&backing, &frame, &attempt, bounds, 1.0, &|| true)
+            {
+                Ok(publication) => publication,
+                Err(error) => {
+                    pool.detach(&backing); // 发布失败也先归还已建候选，不能靠测试提前返回跳过真实清理。
+                    return Err(error);
+                }
+            };
+            weaks.extend(pool.weaks());
             let [container, first, mask, second, second_mask] =
-                pool.groups[0].slots[0].diagnostic_all_layers();
+                pool.groups[0].slots.borrow()[0].diagnostic_all_layers();
             let result = (|| -> Result<(bool, bool)> {
-                let attempt = pool.attempt()?;
-                let publication =
-                    pool.publish(&backing, &frame, &attempt, bounds, 1.0, &|| true)?;
                 pool.validate(&backing, &publication, &|| true)?;
                 pool.mount().renderInContext(&rendered.context);
                 CGContext::flush(Some(&rendered.context));
@@ -429,7 +436,7 @@ fn interrupted_installations(case: PaletteCase) -> Result<()> {
             let mut source = Canvas::new()?;
             let frame = fixture(&mut source, counters.clone(), case)?;
             let image = &frame.tiles[0];
-            let slot = Slot::new(&|| true)?;
+            let slot = Slot::new(image.presentation, &|| true)?;
             let palette = Palette::new(&|| true)?;
             let group = CALayer::new();
             let mut weaks = Vec::new();

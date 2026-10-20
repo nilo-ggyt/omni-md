@@ -1,11 +1,13 @@
 //! 与view/fold同生灭的有限选择事实；不持正文、Native对象或异步执行权限。
 
-use super::{MarkdownTextSelection, NSRange};
+use super::MarkdownTextSelection;
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+use super::NSRange;
 use std::cell::Cell;
 
 /// 原L1/L2光标所属的真实level与逻辑字素侧；不表示soft-wrap换行侧或屏幕左右。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(feature = "native-paged-layout-probe")]
+#[cfg(feature = "native-paged-production")]
 pub struct NativeMarkdownBidiCaretSide {
     pub level: u8,
     /// true绑定位置后的字素，false绑定位置前的字素。
@@ -48,28 +50,28 @@ impl NativeMarkdownVerticalGoal {
     }
 
     /// 原行片段内的真实偏移；它与container_x属于不同坐标，不可互换。
-    #[cfg(feature = "native-paged-layout-probe")]
+    #[cfg(feature = "native-paged-production")]
     #[must_use]
     pub fn line_offset(self) -> f64 {
         self.line_offset
     }
 
     /// 原文本容器的实际横坐标；短行返回的目标位置不能覆盖这个连续垂直目标。
-    #[cfg(feature = "native-paged-layout-probe")]
+    #[cfg(feature = "native-paged-production")]
     #[must_use]
     pub fn container_x(self) -> f64 {
         self.container_x
     }
 
     /// 原文本容器实际行宽的键，不等于带边距的窗口或滚动视口宽度。
-    #[cfg(feature = "native-paged-layout-probe")]
+    #[cfg(feature = "native-paged-production")]
     #[must_use]
     pub fn width_key(self) -> i64 {
         self.width_key
     }
 
     /// 原producer的排版坐标代次，随Source、样式或布局宽度变化失效。
-    #[cfg(feature = "native-paged-layout-probe")]
+    #[cfg(feature = "native-paged-production")]
     #[must_use]
     pub fn layout_epoch(self) -> u64 {
         self.geometry_epoch
@@ -78,6 +80,7 @@ impl NativeMarkdownVerticalGoal {
 
 /// 只有原收据声明的两个范围属于本次安装；其他通知必须交回真实输入路径。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) enum NativeMarkdownSelectionInstallObservation {
     OwnDeclared,
     Foreign,
@@ -88,11 +91,12 @@ struct KnownSelection {
     selection: MarkdownTextSelection,
     head_is_upstream: Option<bool>,
     vertical_goal: Option<NativeMarkdownVerticalGoal>,
-    #[cfg(feature = "native-paged-layout-probe")]
+    #[cfg(feature = "native-paged-production")]
     bidi_side: Option<NativeMarkdownBidiCaretSide>,
 }
 
 #[derive(Clone, Copy)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct NativeInstall {
     id: u64,
     generation: u64,
@@ -102,12 +106,15 @@ struct NativeInstall {
     selection: MarkdownTextSelection,
 }
 
-/// 事实和栈内安装租约分别存放；已知方向本身不能授权旧动作跨Native重入继续。
+/// 两种客户共用选择事实；只有独立 TextKit 客户需要原生选区通知的栈内安装租约。
+/// 正式 Paged 输入直接发布同一 Core 事实，不创建 TextKit before/after 安装槽。
 pub(super) struct NativeMarkdownSelectionState {
     generation: Cell<u64>,
     serial: Cell<u64>,
     known: Cell<Option<KnownSelection>>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     install: Cell<Option<NativeInstall>>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     next_install_id: Cell<u64>,
     sealed: Cell<bool>,
 }
@@ -121,10 +128,12 @@ impl NativeMarkdownSelectionState {
                 selection,
                 head_is_upstream: None,
                 vertical_goal: None,
-                #[cfg(feature = "native-paged-layout-probe")]
+                #[cfg(feature = "native-paged-production")]
                 bidi_side: None,
             })),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             install: Cell::new(None),
+            #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
             next_install_id: Cell::new(0),
             sealed: Cell::new(false),
         }
@@ -162,7 +171,7 @@ impl NativeMarkdownSelectionState {
             .and_then(|known| known.vertical_goal)
     }
 
-    #[cfg(feature = "native-paged-layout-probe")]
+    #[cfg(feature = "native-paged-production")]
     pub(super) fn known_bidi_side(
         &self,
         generation: u64,
@@ -196,13 +205,14 @@ impl NativeMarkdownSelectionState {
         vertical_goal: Option<NativeMarkdownVerticalGoal>,
     ) -> u64 {
         self.generation.set(generation);
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         self.discard_install();
         let known = (proven_head || selection.anchor_utf16 == selection.head_utf16).then_some(
             KnownSelection {
                 selection,
                 head_is_upstream,
                 vertical_goal: vertical_goal.filter(|goal| goal.is_finite()),
-                #[cfg(feature = "native-paged-layout-probe")]
+                #[cfg(feature = "native-paged-production")]
                 bidi_side: None, // 普通输入/历史没有原视觉侧的继承权。
             },
         );
@@ -211,7 +221,7 @@ impl NativeMarkdownSelectionState {
     }
 
     /// 同一次纯Core选择提交签入真实视觉侧；没有额外serial、回调或后置修补窗口。
-    #[cfg(feature = "native-paged-layout-probe")]
+    #[cfg(feature = "native-paged-production")]
     pub(super) fn publish_with_bidi_side(
         &self,
         generation: u64,
@@ -237,10 +247,12 @@ impl NativeMarkdownSelectionState {
 
     /// 实际新输入只撤销旧安装/动作权限；当前Core方向事实仍可供新动作捕获。
     pub(super) fn revoke_install(&self) {
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         self.discard_install();
         self.advance_serial();
     }
 
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) fn discard_install(&self) {
         self.install.set(None);
     }
@@ -250,10 +262,21 @@ impl NativeMarkdownSelectionState {
             // 布局变化不改逻辑anchor/head，但旧行内偏移不能应用到新几何。
             known.vertical_goal = None;
             known.head_is_upstream = None;
-            #[cfg(feature = "native-paged-layout-probe")]
+            #[cfg(feature = "native-paged-production")]
             {
                 known.bidi_side = None;
             } // 原Source/宽度/样式的part侧不能用于下一套实际视觉行。
+            self.known.set(Some(known));
+        }
+    }
+
+    /// 同一来源仅因选择显隐重排样式时，原 head 的显式上下游仍是这次逻辑选择的事实。
+    /// 旧目标列与 BiDi part 则依赖已退休的字形图，必须撤销，不能延续到新样式的视觉行。
+    #[cfg(feature = "native-paged-production")]
+    pub(super) fn clear_style_geometry(&self) {
+        if let Some(mut known) = self.known.get() {
+            known.vertical_goal = None;
+            known.bidi_side = None;
             self.known.set(Some(known));
         }
     }
@@ -271,6 +294,7 @@ impl NativeMarkdownSelectionState {
     }
 
     /// 收据已经认证后才建立唯一栈内lease；覆盖前一个id使旧guard的Drop不能清掉后继。
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) fn begin_install(
         &self,
         generation: u64,
@@ -303,6 +327,7 @@ impl NativeMarkdownSelectionState {
         Some(id)
     }
 
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) fn install_matches(&self, generation: u64, serial: u64, id: u64) -> bool {
         !self.sealed.get()
             && self.generation.get() == generation
@@ -312,6 +337,7 @@ impl NativeMarkdownSelectionState {
             })
     }
 
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) fn observe_install(
         &self,
         range: NSRange,
@@ -327,6 +353,7 @@ impl NativeMarkdownSelectionState {
         })
     }
 
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) fn install_core_is_current(
         &self,
         generation: u64,
@@ -338,6 +365,7 @@ impl NativeMarkdownSelectionState {
         })
     }
 
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) fn finish_install(&self, serial: u64, id: u64) {
         if self
             .install
@@ -361,6 +389,7 @@ impl NativeMarkdownSelectionState {
 }
 
 /// 这里只验证有限声明，不把旧Native before范围误当当前正文的可读授权。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn valid_declared_range(range: NSRange) -> bool {
     range.location != objc2_foundation::NSNotFound as usize
         && range.location.checked_add(range.length).is_some()

@@ -83,6 +83,8 @@ impl NativeMarkdownPagedInput {
             fold_revision: Cell::new(0),
             closed: Cell::new(false),
             busy: Cell::new(false),
+            #[cfg(feature = "native-input-trace")]
+            input_trace: RefCell::new(None),
         }))
     }
 

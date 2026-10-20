@@ -396,7 +396,10 @@ fn middle_fallback_run_budget_does_not_create_a_false_font_boundary() {
                 prefix.push(glyphs(worker.take_item().unwrap()));
             }
             MarkdownLineItemAnswer::NeedsFrontier(reason) => {
-                assert_eq!(reason, crate::MarkdownLineFrontierReason::UnsupportedPlan);
+                assert_eq!(
+                    reason,
+                    crate::MarkdownLineFrontierReason::FontRunBeyondBudget
+                );
                 rejected = true;
                 break;
             }

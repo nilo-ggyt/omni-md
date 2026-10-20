@@ -13,15 +13,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 mod authority;
 mod body_layer;
 mod geometry;
-mod line_string_diagnostic;
 mod native;
 mod paint;
 mod pixels;
 mod value_observation;
 pub(super) use authority::NativeMarkdownRasterOriginPermit;
 pub(in crate::native_surface) use body_layer::NativeMarkdownRasterBodyLayerLease;
-use line_string_diagnostic::LineStringDiagnosticStore;
-pub(in crate::native_surface) use line_string_diagnostic::NativeMarkdownRasterLineStringOrigin;
 use native::{NativeMarkdownRasterImageView, NativeMarkdownRasterViewportProxy};
 pub(super) use pixels::Bitmap as NativeMarkdownRasterAuxiliaryBitmap;
 
@@ -29,7 +26,6 @@ pub(super) use pixels::Bitmap as NativeMarkdownRasterAuxiliaryBitmap;
 #[derive(Clone)]
 pub(super) struct NativeMarkdownRasterAuxiliaryResources {
     counters: Arc<ResourceCounters>,
-    owner: std::rc::Weak<NativeMarkdownRasterSurface>,
 }
 
 /// 同步辅助绘制沿原收据登记在途操作；析构只归还标量，不执行 Native。
@@ -43,18 +39,12 @@ impl NativeMarkdownRasterAuxiliaryResources {
     }
 
     pub(super) fn fail(&self) {
-        // 辅助路径同样终止原首帧等待；只有主线程 Weak owner 可通知，原子收据不持回调。
+        // 辅助绘制的真实失败仍进入原共享资源收据；不保已无消费者的首帧通知回链。
         self.counters.fail();
-        if let Some(owner) = self.owner.upgrade() {
-            owner.notify_failed_first_paint();
-        }
     }
 
     pub(super) fn invalidate_geometry(&self) {
         self.counters.invalidate_geometry(); // 仍撤同一原票，不另设 gutter 代次或调度器。
-        if let Some(owner) = self.owner.upgrade() {
-            owner.notify_failed_first_paint(); // 代次耗尽也是失败终点，不能遗失已注册的等待。
-        }
     }
 
     pub(super) fn operation(&self) -> Result<NativeMarkdownRasterAuxiliaryOperation, String> {
@@ -130,13 +120,11 @@ fn take_fragment_registry_for_close(
     }
 }
 
-/// 资源收据仍只含原子标量；另一个主线程槽只保留有限业务值Weak及来源标量，
-/// 不保活像素、文档或Native图。最后一份收据归还时同时清掉这份诊断容量。
+/// 资源收据只持原像素/操作的原子事实，不保活 Native 图、文档或旧诊断目录。
+/// 关闭成功仍由实际 provider/context 归还决定，不以 view 析构或时间流逝代替。
 #[derive(Clone)]
 pub(super) struct NativeMarkdownRasterReleaseReceipt {
     resources: Arc<ResourceCounters>,
-    #[cfg(feature = "native-close-stage-diagnostic")]
-    line_string_diagnostic: Rc<LineStringDiagnosticStore>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -220,24 +208,6 @@ impl NativeMarkdownRasterReleaseReceipt {
             && s.live_pixel_bytes == 0
             && !s.pixel_release_failed
     }
-
-    #[cfg(feature = "native-close-stage-diagnostic")]
-    pub(in crate::native_surface) fn diagnostic_line_string_origins(
-        &self,
-        string: &NSString,
-    ) -> Result<Vec<NativeMarkdownRasterLineStringOrigin>, String> {
-        // 只能匹配原捕获Weak身份；查询不读取正文，也不能把无匹配解释为已释放或空来源。
-        self.line_string_diagnostic.find(string)
-    }
-}
-
-/// 先发布失败再交付纯 Rust 终点；调用方必须先归还状态借用，回调只排原验证事件。
-fn record_first_paint_failure(
-    counters: &ResourceCounters,
-    observer: &super::probe::ProbeTerminalObserver,
-) {
-    counters.fail();
-    observer.notify();
 }
 
 /// 同步 Native 操作只递增标量；析构不调用 Native，也不把延迟释放改写为成功。
@@ -269,7 +239,6 @@ struct NativeOwners {
     observers: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     observed: [ObservedView; 2],
     counters: Arc<ResourceCounters>,
-    owner: std::rc::Weak<NativeMarkdownRasterSurface>,
 }
 
 struct ObservedView {
@@ -293,9 +262,6 @@ impl Drop for NativeOwners {
             && proxy.restore_original_delegate().is_err()
         {
             self.counters.fail();
-            if let Some(owner) = self.owner.upgrade() {
-                owner.notify_failed_first_paint();
-            }
         }
         drop(proxy);
         // 代理关系已撤，再撤真实通知、恢复原通知开关并清除图像内容。
@@ -336,43 +302,13 @@ pub(super) struct NativeMarkdownRasterSurface {
     painting: Cell<bool>,
     fragments: CacheOwner<FragmentRegistry>,
     fragment_epoch: Cell<u64>,
-    line_string_diagnostic: Rc<LineStringDiagnosticStore>,
-    first_paint_observer: super::probe::ProbeTerminalObserver,
 }
 
 impl NativeMarkdownRasterSurface {
-    /// 只观察同一光栅实例的首个真实发布终点；回调只能投递后继验证，不同步访问 Native。
-    pub(super) fn observe_first_paint(
-        &self,
-        observer: impl FnOnce() + 'static,
-    ) -> Result<bool, String> {
-        let completed = if self.closed.get() || self.counters.sticky_failure.load(Ordering::Acquire)
-        {
-            Some(false) // 已封闭或已有失败也是真实终点，后继验证仍须明确拒绝。
-        } else if self.counters.actual_paints.load(Ordering::Acquire) != 0 {
-            Some(true) // 原实例已有真正 publish，不再等待或伪造另一帧。
-        } else {
-            None // 尚无帧时让真实 AppKit/CA 回调完成；不靠延时或重复 display 推进。
-        };
-        self.first_paint_observer.observe(completed, observer)
-    }
-
     /// 只给同一 editor 的附属视口共享既有收据，不把私有计数器或 Native owner 暴露出去。
     pub(super) fn auxiliary_resources(self: &Rc<Self>) -> NativeMarkdownRasterAuxiliaryResources {
         NativeMarkdownRasterAuxiliaryResources {
             counters: Arc::clone(&self.counters),
-            owner: Rc::downgrade(self),
-        }
-    }
-
-    /// 同步失败先进入真实终点，再在无状态借用时通知一次；通知仍须由原验证拒绝失败。
-    fn fail_first_paint(&self) {
-        record_first_paint_failure(&self.counters, &self.first_paint_observer);
-    }
-
-    fn notify_failed_first_paint(&self) {
-        if self.counters.sticky_failure.load(Ordering::Acquire) {
-            self.first_paint_observer.notify();
         }
     }
 
@@ -435,8 +371,6 @@ impl NativeMarkdownRasterSurface {
                 counters: Some(Arc::clone(&counters)),
             }),
             fragment_epoch: Cell::new(0),
-            line_string_diagnostic: Rc::new(LineStringDiagnosticStore::new()),
-            first_paint_observer: super::probe::ProbeTerminalObserver::default(),
         });
         let body_layer = if view.uses_raster_layer_updates() {
             Some(Rc::new(NativeMarkdownRasterBodyLayerLease::install(
@@ -463,7 +397,6 @@ impl NativeMarkdownRasterSurface {
             observers: Vec::with_capacity(4),
             observed,
             counters: Arc::clone(&counters),
-            owner: Rc::downgrade(&owner),
         };
         ledger.include("editor.raster.image", native.image())?;
         if let Some(layer) = native.image().layer() {
@@ -475,16 +408,12 @@ impl NativeMarkdownRasterSurface {
         )?;
         let weak_view = MainThreadBound::new(Weak::from(view), mtm);
         let notify_counters = Arc::clone(&counters);
-        let notify_owner = MainThreadBound::new(Rc::downgrade(&owner), mtm);
         let callback = block2::RcBlock::new(move |_notification: NonNull<NSNotification>| {
             notify_counters.invalidate_geometry(); // 先撤票；最后一个 getter 内发生滚动也不能逃过原 epoch。
             let Some(mtm) = MainThreadMarker::new() else {
                 notify_counters.fail();
                 return;
             };
-            if let Some(owner) = notify_owner.get(mtm).upgrade() {
-                owner.notify_failed_first_paint(); // 主线程确认后才交付耗尽终点，不跨线程保存观察者。
-            }
             if notify_counters.closed.load(Ordering::Acquire) {
                 return;
             }
@@ -666,14 +595,13 @@ impl NativeMarkdownRasterSurface {
     ) -> Result<Option<NativeMarkdownRasterOriginPermit>, String> {
         let result = NativeMarkdownRasterOriginPermit::begin(self, view);
         if result.is_err() {
-            self.fail_first_paint();
+            self.counters.fail();
         }
         result
     }
 
     pub(super) fn invalidate_geometry(&self) {
         self.counters.invalidate_geometry(); // Root 的公开 Native 几何回调只调用此纯标量入口。
-        self.notify_failed_first_paint(); // 原序号耗尽须终止等待；普通撤票不制造任何完成。
     }
 
     pub(super) fn settle_layout(
@@ -750,7 +678,7 @@ impl NativeMarkdownRasterSurface {
             return Ok(false);
         } // 合法撤权只取消，不重签或制造完成。
         if result.is_err() {
-            self.fail_first_paint();
+            self.counters.fail();
         }
         result
     }
@@ -765,7 +693,7 @@ impl NativeMarkdownRasterSurface {
             return Ok(false);
         }
         if result.is_err() {
-            self.fail_first_paint();
+            self.counters.fail();
         }
         result
     }
@@ -776,7 +704,7 @@ impl NativeMarkdownRasterSurface {
         permit: &NativeMarkdownRasterOriginPermit,
     ) -> Result<bool, String> {
         if !view.uses_raster_layer_updates() {
-            self.fail_first_paint(); // 入口合同错误是真实失败，不能让原首帧等待悬挂。
+            self.counters.fail(); // 入口合同错误仍进入原真实失败收据。
             return Err("正文未显式启用真实layer绘制入口".into());
         }
         let result = paint::paint_layer(self, view, permit);
@@ -784,20 +712,18 @@ impl NativeMarkdownRasterSurface {
             return Ok(false); // 与原drawRect同样只取消原操作，绝不从后继状态补领发布票据。
         }
         if result.is_err() {
-            self.fail_first_paint();
+            self.counters.fail();
         }
         result
     }
 
     pub(super) fn fail_layer_update_sequence(&self) {
-        self.fail_first_paint(); // 只记不可回绕序号耗尽，不读取Native或制造后继显示任务。
+        self.counters.fail(); // 只记不可回绕序号耗尽，不读取Native或制造后继显示任务。
     }
 
     pub(super) fn release_receipt(&self) -> NativeMarkdownRasterReleaseReceipt {
         NativeMarkdownRasterReleaseReceipt {
             resources: Arc::clone(&self.counters),
-            #[cfg(feature = "native-close-stage-diagnostic")]
-            line_string_diagnostic: Rc::clone(&self.line_string_diagnostic),
         }
     }
 
@@ -808,7 +734,6 @@ impl NativeMarkdownRasterSurface {
             return Ok(());
         }
         self.counters.closed.store(true, Ordering::Release);
-        self.line_string_diagnostic.seal(); // 不再捕获；现有Weak来源只留给原失败观察收据。
         let registry = take_fragment_registry_for_close(&self.fragments);
         let active = self.counters.active_operations.load(Ordering::Acquire);
         // 封闭标量先拒绝绘制和代理配置，再撤原Native proxy和观察者；不持RefCell借用。
@@ -825,9 +750,8 @@ impl NativeMarkdownRasterSurface {
         };
         drop(registry); // 最后真实归还 Weak 数组容量后，FragmentRegistry::drop 才报告 detached。
         if result.is_err() {
-            self.fail_first_paint();
+            self.counters.fail();
         }
-        self.first_paint_observer.notify(); // 无帧关闭也终止等待；通知本身不能让 verify_open 通过。
         result
     }
 
@@ -897,53 +821,6 @@ impl Drop for NativeMarkdownRasterSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn first_paint_failure_notifies_pending_once_after_publishing_failure() {
-        let counters = Arc::new(ResourceCounters::default());
-        let observer = Rc::new(super::super::probe::ProbeTerminalObserver::default());
-        let calls = Rc::new(Cell::new(0));
-        let callback_counters = Arc::clone(&counters);
-        let callback_observer = Rc::clone(&observer);
-        let callback_calls = Rc::clone(&calls);
-        assert!(
-            !observer
-                .observe(None, move || {
-                    assert!(callback_counters.sticky_failure.load(Ordering::Acquire));
-                    assert_eq!(callback_counters.actual_paints.load(Ordering::Acquire), 0);
-                    callback_calls.set(callback_calls.get() + 1);
-                    // 原失败回调可同步重入；观察槽必须已经取出，不能二次派发或借用冲突。
-                    record_first_paint_failure(&callback_counters, &callback_observer);
-                })
-                .unwrap()
-        );
-        assert_eq!(calls.get(), 0);
-        record_first_paint_failure(&counters, &observer);
-        record_first_paint_failure(&counters, &observer);
-        assert_eq!(calls.get(), 1);
-        assert_eq!(counters.actual_paints.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn first_paint_failure_before_registration_is_terminal_without_callback_replay() {
-        let counters = ResourceCounters::default();
-        let observer = super::super::probe::ProbeTerminalObserver::default();
-        record_first_paint_failure(&counters, &observer);
-        let calls = Rc::new(Cell::new(0));
-        let callback_calls = Rc::clone(&calls);
-        let completed = counters
-            .sticky_failure
-            .load(Ordering::Acquire)
-            .then_some(false);
-        assert!(
-            observer
-                .observe(completed, move || callback_calls.set(1))
-                .unwrap()
-        );
-        record_first_paint_failure(&counters, &observer);
-        assert_eq!(calls.get(), 0); // 调用方只消费同步终点，不能再收到同一次失败的延后回调。
-        assert_eq!(counters.actual_paints.load(Ordering::Acquire), 0);
-    }
 
     #[test]
     fn shutdown_registry_receipt_waits_for_real_extracted_payload_drop() {

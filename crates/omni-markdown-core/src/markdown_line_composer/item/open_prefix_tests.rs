@@ -86,6 +86,10 @@ fn ordinary_han_first_style_uses_original_stable_script_and_gcb_without_complete
         let probe = worker.font_probe(&request).unwrap();
         assert_eq!(probe.source_range(), 0..1);
         assert!(probe.accepts_request(&request).unwrap());
+        // 原长文只为优先候选读取首 scalar 的三字节；长度增加不能令 Native 提示重新定位远端选择。
+        let (read, first) = probe.first_scalar();
+        assert_eq!(first.unwrap(), '中');
+        assert_eq!(read, '中'.len_utf8());
     }
     assert!(observed.windows(2).all(|pair| pair[0] == pair[1]));
 }
@@ -133,6 +137,10 @@ fn non_bmp_first_probe_uses_real_utf16_cluster_and_quota_one_makes_progress() {
     assert!(bytes < fixture.source.byte_len());
     let probe = worker.font_probe(&request).unwrap();
     assert_eq!(probe.source_range(), 0..2); // 原非BMP标量是一个GCB、两个UTF16单位。
+    // 真实四字节 Unicode scalar 必须完整交给系统，不能按两个 UTF16 单元分别选择字体。
+    let (read, first) = probe.first_scalar();
+    assert_eq!(first.unwrap(), '𠮷');
+    assert_eq!(read, '𠮷'.len_utf8());
     assert!(request.source_range().end >= 3);
     assert_eq!(request.paragraph_range(), 0..384);
 }

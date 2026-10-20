@@ -94,6 +94,7 @@ mod entities;
 mod firstpass;
 #[cfg(feature = "omni-block-frontier")]
 pub mod global_frontier;
+pub mod inline_emphasis;
 #[cfg(feature = "omni-block-frontier")]
 pub mod inline_frontier;
 mod inline_scan;

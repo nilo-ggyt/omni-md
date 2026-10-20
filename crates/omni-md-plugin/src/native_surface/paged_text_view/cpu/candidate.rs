@@ -40,6 +40,7 @@ impl Ticket {
             state: self.state,
             epoch: self.epoch,
             geometry_epoch: self.geometry_epoch,
+            interpreted: false, // CPU候选只核绘图票，不能认领原IME解释回调的输入收据。
         };
         origin.current(view) && origin.delegate.scene_current(key) && origin.current(view)
     }

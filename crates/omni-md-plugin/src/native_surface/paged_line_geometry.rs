@@ -80,6 +80,15 @@ fn require(
     }
     font.require(part.font_registration())?;
     if !font.native().accepts_shaping_size(part.facts().points) {
+        // 只在真实拒绝点记录原封存字号与绑定值；不读取正文或替不一致输出更换字体。
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        eprintln!(
+            "native_line_font_size_mismatch phase=geometry part_points={} native_points={} core_points={:?} kind={:?}",
+            part.facts().points,
+            font.native().point_size(),
+            font.native().core_font().shaping_point_size(),
+            part.facts().kind,
+        );
         return Err(NativeMarkdownLineGeometryError::FontSizeMismatch);
     }
     {
@@ -98,6 +107,50 @@ fn require(
         .map_err(|_| NativeMarkdownLineGeometryError::Busy)?;
     lines.require(part.source_authority())?;
     Ok(())
+}
+
+/// 仅用于已经认证 part 的绘制包络；这个几何边缘不授予字素、选择或输入光标权限。
+#[derive(Clone, Copy)]
+pub(in crate::native_surface) enum ComposedPartSourceEdge {
+    Start,
+    End,
+}
+
+/// UBA 可在完整字素内部拆分整形项；绘制需要其真实边缘，公开 caret 仍必须经过原 GCB 目录。
+/// 返回纯坐标而不是带源位置的 Caret，避免内部 scalar seam 被输入消费者误用。
+pub(in crate::native_surface) fn composed_part_extent_edge(
+    output: &RefCell<MarkdownComposedLines>,
+    part: &MarkdownComposedLinePart,
+    font: &NativeMarkdownLineFont,
+    edge: ComposedPartSourceEdge,
+    line_baseline: CGPoint,
+    current: &dyn Fn() -> bool,
+) -> Result<CGPoint> {
+    require(output, part, font, current)?;
+    let facts = part.facts();
+    let backward = match facts.direction {
+        MarkdownShapingDirection::LeftToRight => false,
+        MarkdownShapingDirection::RightToLeft => true,
+        MarkdownShapingDirection::TopToBottom | MarkdownShapingDirection::BottomToTop => {
+            return Err(NativeMarkdownLineGeometryError::UnsupportedDirection);
+        }
+    };
+    // 此端点只能从原 part 的实际起/终侧选择，调用方不能传裸 scalar 下标补签权限。
+    let advance = matches!(edge, ComposedPartSourceEdge::End) != backward;
+    let x = facts
+        .origin_x_26_6
+        .checked_add(if advance { facts.x_advance_26_6 } else { 0 })
+        .ok_or(NativeMarkdownLineGeometryError::InvalidCoordinate)?;
+    let y = facts
+        .origin_y_26_6
+        .checked_add(if advance { facts.y_advance_26_6 } else { 0 })
+        .ok_or(NativeMarkdownLineGeometryError::InvalidCoordinate)?;
+    let baseline = CGPoint {
+        x: axis(line_baseline.x, x, 0.0)?,
+        y: axis(line_baseline.y, y, 0.0)?,
+    };
+    require(output, part, font, current)?;
+    Ok(baseline)
 }
 
 /// 只计算原part内一个已认证GCB边界的实际插入点，不同步扫描字素、读取段落或shape。

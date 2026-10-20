@@ -1,16 +1,16 @@
 use super::layout::DELETED_GLYPH;
 use super::map::RangeFlags;
+use crate::buffer::{Buffer, HB_BUFFER_SCRATCH_FLAG_SHAPER0};
+use crate::ot::apply::MappingCache;
+use crate::plan::ShapePlan;
 use crate::LayoutData;
 use crate::Mask;
 use crate::Scale;
 use crate::U32Set;
-use crate::buffer::{Buffer, HB_BUFFER_SCRATCH_FLAG_SHAPER0};
-use crate::ot::apply::MappingCache;
-use crate::plan::ShapePlan;
 use alloc::vec::Vec;
-use read_fonts::FontData;
 use read_fonts::tables::aat::*;
 use read_fonts::types::{FixedSize, GlyphId};
+use read_fonts::FontData;
 
 pub const HB_BUFFER_SCRATCH_FLAG_AAT_HAS_DELETED: u32 = HB_BUFFER_SCRATCH_FLAG_SHAPER0;
 

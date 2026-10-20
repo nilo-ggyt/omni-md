@@ -12,11 +12,25 @@ enum PendingNode {
         prefix: Option<u8>,
     },
     Leaf(MarkdownPiece, usize),
+    // 显示 ASCII 区间前方的 raw 前缀仍可能含 Unicode；仅保一个 scalar 残余定位真实字节。
+    ScopedLeaf {
+        piece: MarkdownPiece,
+        utf16: usize,
+        byte: usize,
+        pending: [u8; 4],
+        used: usize,
+        needed: usize,
+        located: bool,
+    },
 }
 
 /// 只在原Source已认证Dense GCB时消费；不保Source、正文映射或派生Reader。
 pub(crate) struct MarkdownAsciiWordRun {
     authority: crate::MarkdownLayoutTextAuthority,
+    // raw run 仅能读取已密封显示 run 的原区间；其外隐藏标点不能终止显示词组。
+    scope: Option<Range<usize>>,
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    projection: Option<Box<display_projection::algorithms::ProjectionAsciiWordRun>>,
     pending: Vec<PendingNode>,
     position: usize,
     forward: bool,
@@ -52,11 +66,69 @@ impl MarkdownAsciiWordRun {
         });
         Self {
             authority,
+            scope: None,
+            #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+            projection: None,
             pending,
             position,
             forward,
             complete: false,
         }
+    }
+
+    /// 仅原 Frozen gateway 用真实显示 run 的 raw 区间装配；不重新扫描已密封的 ASCII 事实。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(in crate::markdown_document_buffer) fn new_range(
+        root: &PieceTreeLink,
+        position: usize,
+        forward: bool,
+        authority: crate::MarkdownLayoutTextAuthority,
+        range: Range<usize>,
+    ) -> Self {
+        let mut run = Self::new(root, position, forward, authority);
+        run.scope = Some(range);
+        run
+    }
+
+    /// 显示坐标始终留在原目录游标内，不拿空 raw root 伪造 BOF/EOF。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(in crate::markdown_document_buffer) fn new_display(
+        position: usize,
+        forward: bool,
+        authority: crate::MarkdownLayoutTextAuthority,
+    ) -> Self {
+        Self {
+            projection: Some(Box::new(
+                display_projection::algorithms::ProjectionAsciiWordRun::new(position, forward),
+            )),
+            scope: None,
+            authority,
+            pending: Vec::new(),
+            position,
+            forward,
+            complete: false,
+        }
+    }
+
+    /// 目录和原树续算共用同一额度；Source gateway 在前后核对原身份及真实资源健康。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(in crate::markdown_document_buffer) fn advance_display(
+        &mut self,
+        projection: &display_projection::DisplayProjection,
+        maximum_bytes: usize,
+        maximum_scalars: usize,
+        maximum_metadata: usize,
+    ) -> Result<MarkdownAsciiWordStep, MarkdownDocumentBufferError> {
+        self.projection
+            .as_mut()
+            .expect("显示 Word 游标由原显示 gateway 装配")
+            .advance(
+                projection,
+                &self.authority,
+                maximum_bytes,
+                maximum_scalars,
+                maximum_metadata,
+            )
     }
 
     pub(crate) fn authority(&self) -> &crate::MarkdownLayoutTextAuthority {
@@ -79,10 +151,152 @@ impl MarkdownAsciiWordRun {
             complete: self.complete,
         };
         while !self.complete {
+            if self.scope.as_ref().is_some_and(|range| {
+                if self.forward {
+                    self.position == range.end
+                } else {
+                    self.position == range.start
+                }
+            }) {
+                self.complete = true;
+                break;
+            } // 已到密封 run 的真实边界，不能再访问隐藏原字符或后继 raw sibling。
             let Some(next) = self.pending.last() else {
                 self.complete = true;
                 break; // 实际有序栈已经耗尽，才是本方向的原树端点。
             };
+            if matches!(next, PendingNode::ScopedLeaf { .. }) {
+                if step.bytes == maximum_bytes || step.scalars == maximum_scalars {
+                    break;
+                }
+                let Some(PendingNode::ScopedLeaf {
+                    piece,
+                    mut utf16,
+                    mut byte,
+                    mut pending,
+                    mut used,
+                    mut needed,
+                    mut located,
+                }) = self.pending.pop()
+                else {
+                    unreachable!("同一路径的实际 scoped leaf")
+                };
+                located |= utf16 == self.position && used == 0;
+                if !located {
+                    let count = (maximum_bytes - step.bytes)
+                        .min(maximum_scalars - step.scalars)
+                        .min(crate::MARKDOWN_LAYOUT_SOURCE_BYTES)
+                        .min(piece.byte_len - byte);
+                    let bytes = source.piece_range_bytes(&piece, byte..byte + count)?;
+                    step.bytes += bytes.len();
+                    let mut failure = None;
+                    for &value in &*bytes {
+                        if used == 0 {
+                            needed = match value {
+                                0..=0x7f => 1,
+                                0xc2..=0xdf => 2,
+                                0xe0..=0xef => 3,
+                                0xf0..=0xf4 => 4,
+                                _ => {
+                                    failure =
+                                        Some(MarkdownDocumentBufferError::InvalidUtf8Document);
+                                    break;
+                                }
+                            };
+                        }
+                        pending[used] = value;
+                        used += 1;
+                        byte += 1;
+                        if used != needed {
+                            continue;
+                        }
+                        let Some(scalar) = std::str::from_utf8(&pending[..used])
+                            .ok()
+                            .and_then(|text| text.chars().next())
+                        else {
+                            failure = Some(MarkdownDocumentBufferError::InvalidUtf8Document);
+                            break;
+                        };
+                        step.scalars += 1;
+                        utf16 += scalar.len_utf16();
+                        used = 0;
+                        if utf16 >= self.position {
+                            if utf16 != self.position {
+                                failure = Some(MarkdownDocumentBufferError::NotUnicodeBoundary);
+                            } else {
+                                located = true;
+                            }
+                            break;
+                        }
+                    }
+                    bytes.finish()?;
+                    source.source_health()?;
+                    if let Some(error) = failure {
+                        return Err(error);
+                    }
+                } else {
+                    let scope = self.scope.as_ref().expect("受控显示原区间已装配");
+                    let available = if self.forward {
+                        (piece.byte_len - byte).min(scope.end - self.position)
+                    } else {
+                        byte.min(self.position - scope.start)
+                    };
+                    let count = (maximum_bytes - step.bytes)
+                        .min(maximum_scalars - step.scalars)
+                        .min(crate::MARKDOWN_LAYOUT_SOURCE_BYTES)
+                        .min(available);
+                    if count != 0 {
+                        let range = if self.forward {
+                            byte..byte + count
+                        } else {
+                            byte - count..byte
+                        };
+                        let bytes = source.piece_range_bytes(&piece, range)?;
+                        step.bytes += bytes.len();
+                        for offset in 0..bytes.len() {
+                            let index = if self.forward {
+                                offset
+                            } else {
+                                bytes.len() - 1 - offset
+                            };
+                            step.scalars += 1;
+                            if !bytes[index].is_ascii_alphanumeric() {
+                                self.complete = true;
+                                break;
+                            }
+                            if self.forward {
+                                self.position += 1;
+                                byte += 1;
+                            } else {
+                                self.position -= 1;
+                                byte -= 1;
+                            }
+                        }
+                        bytes.finish()?;
+                        source.source_health()?;
+                    }
+                }
+                // 未定位前保原 UTF8 续算；定位后只保实际仍未耗尽的方向内区间。
+                if !self.complete
+                    && (!located
+                        || if self.forward {
+                            byte < piece.byte_len
+                        } else {
+                            byte != 0
+                        })
+                {
+                    self.pending.push(PendingNode::ScopedLeaf {
+                        piece,
+                        utf16,
+                        byte,
+                        pending,
+                        used,
+                        needed,
+                        located,
+                    });
+                }
+                continue;
+            }
             if matches!(next, PendingNode::Leaf(..)) {
                 if step.bytes == maximum_bytes || step.scalars == maximum_scalars {
                     break;
@@ -92,9 +306,13 @@ impl MarkdownAsciiWordRun {
                 };
                 let local = self.position - base;
                 let available = if self.forward {
-                    piece.byte_len - local
+                    self.scope.as_ref().map_or(piece.byte_len - local, |range| {
+                        (piece.byte_len - local).min(range.end - self.position)
+                    })
                 } else {
-                    local
+                    self.scope
+                        .as_ref()
+                        .map_or(local, |range| local.min(self.position - range.start))
                 };
                 let count = (maximum_bytes - step.bytes)
                     .min(maximum_scalars - step.scalars)
@@ -157,7 +375,13 @@ impl MarkdownAsciiWordRun {
                         return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
                     }
                     if all_alnum(node.metrics()) {
-                        self.position = if self.forward { end } else { base };
+                        self.position = if self.forward {
+                            self.scope.as_ref().map_or(end, |range| end.min(range.end))
+                        } else {
+                            self.scope
+                                .as_ref()
+                                .map_or(base, |range| base.max(range.start))
+                        };
                         continue; // 只消费原建叶/joined的严格正事实，不把可打印直接当Word。
                     }
                     match node.as_ref() {
@@ -189,9 +413,7 @@ impl MarkdownAsciiWordRun {
                                 prefix: (target != 0).then_some(0),
                             });
                         }
-                        MarkdownPieceTreeNode::Leaf(piece) => {
-                            self.pending.push(PendingNode::Leaf(piece.clone(), base))
-                        }
+                        MarkdownPieceTreeNode::Leaf(piece) => self.push_leaf(piece.clone(), base),
                     }
                 }
                 PendingNode::Span {
@@ -265,16 +487,41 @@ impl MarkdownAsciiWordRun {
                         continue;
                     }
                     if all_alnum(piece.metrics) {
-                        self.position = if self.forward { end } else { base };
+                        self.position = if self.forward {
+                            self.scope.as_ref().map_or(end, |range| end.min(range.end))
+                        } else {
+                            self.scope
+                                .as_ref()
+                                .map_or(base, |range| base.max(range.start))
+                        };
                     } else {
-                        self.pending.push(PendingNode::Leaf(piece, base));
+                        self.push_leaf(piece, base);
                     } // 目录每次只取一条真实compact记录，不把16条展开藏成一次metadata。
                 }
-                PendingNode::Leaf(..) => unreachable!("叶字节由上方独立预算分支消费"),
+                PendingNode::Leaf(..) | PendingNode::ScopedLeaf { .. } => {
+                    unreachable!("叶字节由上方独立预算分支消费")
+                }
             }
         }
         step.position = self.position;
         step.complete = self.complete;
         Ok(step)
+    }
+
+    /// 原全 ASCII 叶继续直接寻址；只有显示范围所在混合 raw 叶需要真实前缀解码。
+    fn push_leaf(&mut self, piece: MarkdownPiece, base: usize) {
+        if self.scope.is_some() && !piece.metrics.all_printable_ascii.is_printable() {
+            self.pending.push(PendingNode::ScopedLeaf {
+                piece,
+                utf16: base,
+                byte: 0,
+                pending: [0; 4],
+                used: 0,
+                needed: 0,
+                located: false,
+            });
+        } else {
+            self.pending.push(PendingNode::Leaf(piece, base));
+        }
     }
 }

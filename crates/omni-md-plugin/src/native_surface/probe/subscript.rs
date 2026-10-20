@@ -4,7 +4,7 @@ use super::*;
 
 /// 纯测试权限只借原surface/controller；root只有Weak，允许的模式/选区转换须在首Native前声明。
 struct Permission<'a> {
-    surface: &'a NativeMarkdownEditorSurface,
+    surface: &'a NativeMarkdownTextKitEditorSurface,
     controller: &'a Retained<NativeMarkdownController>,
     document: WeakMarkdownDocument,
     generation: u64,
@@ -236,7 +236,7 @@ impl Permission<'_> {
 
 /// 由现有ProbeEditingOwnerLease内调用；失败也尝试按原许可恢复模式/完整选择，保留首因。
 pub(super) fn verify(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
     fixture: &str,
 ) -> Result<(), String> {

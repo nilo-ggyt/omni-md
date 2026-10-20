@@ -5,108 +5,18 @@ use std::sync::Weak;
 use super::*;
 use crate::markdown_viewport_presentation::table_window::{
     MarkdownTableUnderline, MarkdownTableWindowError,
-    context::{MarkdownTableContextFrame, MarkdownTableUnderlineContext},
 };
 
 #[cfg(test)]
-use crate::markdown_viewport_presentation::table_window::references::MarkdownTableReferenceQueries;
+use crate::markdown_viewport_presentation::table_window::{
+    MarkdownTableWindowQuota, references::MarkdownTableReferenceQueries,
+};
 
 const MAX_TABLE_SOURCE_FRAME_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct MarkdownTableUnderlineRequestStep {
-    pub source_bytes: usize,
-    pub utf8_validation_bytes: usize,
-    pub source_tree_steps: usize,
-    pub ready: bool,
-}
-
-#[derive(Debug)]
-pub(crate) struct MarkdownTableUnderlineRequest {
-    source: MarkdownTableSourceIdentity,
-    context: Option<MarkdownTableUnderlineContext>,
-    pairs: Vec<MarkdownTableUnderline>,
-    ready: bool,
-}
-
-impl MarkdownTableUnderlineRequest {
-    /// 每step只借一片源并同步计量UTF16；完成时移交有限metadata，无逐pair源前缀查询。
-    pub(crate) fn advance(
-        &mut self,
-        document: &MarkdownDocumentBuffer,
-        budget: usize,
-    ) -> Result<MarkdownTableUnderlineRequestStep, MarkdownTableWindowError> {
-        if !self.source.is_current(document) {
-            return Err(MarkdownTableWindowError::InvalidSource);
-        }
-        if budget == 0 || budget > MAX_TABLE_SOURCE_FRAME_BYTES {
-            return Err(MarkdownTableWindowError::SourceLimit);
-        }
-        if self.ready {
-            return Ok(MarkdownTableUnderlineRequestStep {
-                source_bytes: 0,
-                utf8_validation_bytes: 0,
-                source_tree_steps: 0,
-                ready: true,
-            });
-        }
-        let context = self
-            .context
-            .as_mut()
-            .ok_or(MarkdownTableWindowError::InvalidSource)?;
-        if let Some(pairs) = context.take_ready_utf16_pairs() {
-            // 配对时已按原源frame同步计量UTF16；这里只有Vec所有权转移，没有隐藏的N次leaf解码。
-            self.pairs = pairs;
-            let previous = self.context.take();
-            drop(previous);
-            self.ready = true;
-            return Ok(MarkdownTableUnderlineRequestStep {
-                source_bytes: 0,
-                utf8_validation_bytes: 0,
-                source_tree_steps: 0,
-                ready: true,
-            });
-        }
-        let frame = document
-            .table_source_frame(context.next_byte(), budget)
-            .map_err(|_| MarkdownTableWindowError::InvalidSource)?;
-        let step = context.advance(
-            MarkdownTableContextFrame {
-                generation: frame.generation,
-                byte_start: frame.byte_start,
-                bytes: &frame.bytes,
-                real_eof: frame.real_eof,
-            },
-            budget,
-        );
-        // 回收成功后才消费step，不能让原parser提前终止遮住真实映射错误。
-        frame
-            .finish()
-            .map_err(|_| MarkdownTableWindowError::InvalidSource)?;
-        let step = step?;
-        Ok(MarkdownTableUnderlineRequestStep {
-            source_bytes: step.consumed,
-            utf8_validation_bytes: step.utf8_validation_bytes,
-            // 每次frame借用都会沿真实AVL路径找leaf；这项与scalar解码字节分开计费。
-            source_tree_steps: document
-                .root
-                .as_ref()
-                .map_or(0, |root| usize::from(root.height())),
-            ready: false,
-        })
-    }
-
-    /// 读取完成值仍核同root/代次；旧请求即使已经Ready也不能服务切换后的另一个note。
-    pub(crate) fn ready_pairs_for(
-        &self,
-        document: &MarkdownDocumentBuffer,
-    ) -> Result<Option<&[MarkdownTableUnderline]>, MarkdownTableWindowError> {
-        if !self.source.is_current(document) {
-            return Err(MarkdownTableWindowError::InvalidSource);
-        }
-        Ok(self.ready.then_some(self.pairs.as_slice()))
-    }
-}
+mod inline_code;
+mod underline;
+pub(crate) use underline::{MarkdownTableUnderlineRequest, MarkdownTableUnderlineRequestStep};
 
 pub(crate) struct BorrowedMarkdownTableSourceFrame<'a> {
     pub generation: u64,
@@ -173,6 +83,10 @@ impl MarkdownTableSourceIdentity {
 }
 
 impl MarkdownDocumentBuffer {
+    /// 单一 code 权限 owner 与固定小块输入的真实直接库存；巨段不申请段落正文缓冲。
+    pub(crate) fn underline_code_workspace_bytes() -> usize {
+        inline_code::workspace_bytes()
+    }
     /// 先凭真实scanner的ASCII计数排除无关definition，再复制并规范化有限完整label。
     /// candidate的真实block/scope身份仍由global producer负责，不能用本结果倒推成员权限。
     #[cfg(test)]
@@ -244,24 +158,6 @@ impl MarkdownDocumentBuffer {
         String::from_utf8(bytes).map_err(|_| MarkdownDocumentBufferError::RangeOutsideDocument)
     }
 
-    /// 只有当前非空piece root创建请求；该请求不强持document、映射、history或源帧。
-    pub(crate) fn table_underline_request(
-        &self,
-        byte_coverage: &[Range<usize>],
-    ) -> Result<MarkdownTableUnderlineRequest, MarkdownTableWindowError> {
-        Ok(MarkdownTableUnderlineRequest {
-            source: self
-                .table_source_identity()
-                .ok_or(MarkdownTableWindowError::InvalidSource)?,
-            context: Some(MarkdownTableUnderlineContext::new(
-                self.generation(),
-                self.byte_len(),
-                byte_coverage,
-            )?),
-            pairs: Vec::new(),
-            ready: false,
-        })
-    }
     /// 空源没有表，无需创建可外带的cursor。非空请求仅持root Weak，不延长映射/编辑段生命。
     pub(crate) fn table_source_identity(&self) -> Option<MarkdownTableSourceIdentity> {
         self.root.as_ref().map(|root| MarkdownTableSourceIdentity {
@@ -356,6 +252,31 @@ mod tests {
         std::fs::write(&path, source).unwrap();
         let document = MarkdownDocumentBuffer::open(&path, 32 * 1024 * 1024).unwrap();
         (directory, document)
+    }
+
+    /// 配对事务临时重放同一真实Global；独立夹具的初始Root本身就是合法可恢复边界。
+    fn underline_global(
+        document: &MarkdownDocumentBuffer,
+    ) -> pulldown_cmark::global_frontier::GlobalFrontier {
+        use pulldown_cmark::global_frontier::{
+            GlobalFrontier, GlobalFrontierLimits, StructuralSpineLimits,
+        };
+        GlobalFrontier::new(
+            document.generation(),
+            document.byte_len(),
+            crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+            GlobalFrontierLimits {
+                spine: StructuralSpineLimits {
+                    max_depth: 16_384,
+                    max_live_page_bytes: 4 * 1024 * 1024,
+                    max_page_allocations: 1_000_000,
+                    max_role_work: document.byte_len() * 2048 + 1024 * 1024,
+                },
+                max_byte_work: document.byte_len() * 256 + 1024 * 1024,
+                max_transitions: document.byte_len() * 2048 + 1024 * 1024,
+            },
+        )
+        .unwrap()
     }
 
     fn reference(document: &MarkdownDocumentBuffer, maximum: usize) -> ReferenceCandidate {
@@ -500,11 +421,20 @@ mod tests {
         let (_directory, mut document) = fixture(&source);
         let coverage = 4..10;
         let mut request = document
-            .table_underline_request(std::slice::from_ref(&coverage))
+            .table_underline_request(
+                std::slice::from_ref(&coverage),
+                MarkdownTableWindowQuota::new(8192, 1024 * 1024),
+            )
             .unwrap();
+        let mut global = underline_global(&document);
         while request.ready_pairs_for(&document).unwrap().is_none() {
-            let step = request.advance(&document, 4096).unwrap();
-            assert!(step.ready || step.source_bytes > 0 || step.utf8_validation_bytes > 0);
+            let step = request.advance(&document, &mut global, 65536).unwrap();
+            assert!(
+                step.ready
+                    || step.source_bytes > 0
+                    || step.utf8_validation_bytes > 0
+                    || step.structural_transitions > 0
+            );
             assert!(step.source_bytes <= 4096);
             assert!(step.utf8_validation_bytes <= step.source_bytes * 4);
         }
@@ -528,8 +458,8 @@ mod tests {
             Err(MarkdownTableWindowError::InvalidSource)
         );
         assert_eq!(
-            request.advance(&document, 1),
-            Err(MarkdownTableWindowError::InvalidSource)
+            request.advance(&document, &mut global, 1),
+            Err(MarkdownTableRequestError::SourceSuperseded)
         );
     }
 
@@ -543,13 +473,17 @@ mod tests {
             .unwrap();
         let coverage = 0..document.byte_len();
         let mut request = document
-            .table_underline_request(std::slice::from_ref(&coverage))
+            .table_underline_request(
+                std::slice::from_ref(&coverage),
+                MarkdownTableWindowQuota::new(8192, 1024 * 1024),
+            )
             .unwrap();
         let mut reads = 0;
         let mut validations = 0;
         let mut tree_steps = 0;
+        let mut global = underline_global(&document);
         loop {
-            let step = request.advance(&document, 4096).unwrap();
+            let step = request.advance(&document, &mut global, 65536).unwrap();
             reads += step.source_bytes;
             validations += step.utf8_validation_bytes;
             tree_steps += step.source_tree_steps;
@@ -570,6 +504,37 @@ mod tests {
         assert_eq!(
             request.ready_pairs_for(&document).unwrap().unwrap().len(),
             128
+        );
+    }
+
+    #[test]
+    fn no_html_viewport_keeps_the_original_global_untouched_and_reads_only_its_prefix() {
+        let (_directory, document) = fixture(&"中😀普通正文\n".repeat(40_000));
+        let mut global = underline_global(&document);
+        let initial = global.total_work();
+        let coverage = 0..128;
+        let mut request = document
+            .table_underline_request(
+                std::slice::from_ref(&coverage),
+                MarkdownTableWindowQuota::new(8192, 1024 * 1024),
+            )
+            .unwrap();
+        let mut reads = 0;
+        while request.ready_pairs_for(&document).unwrap().is_none() {
+            let step = request.advance(&document, &mut global, 4096).unwrap();
+            reads += step.source_bytes;
+            assert_eq!(step.global_source_bytes, 0);
+            assert_eq!(step.global_source_tree_steps, 0);
+            assert!(step.source_bytes + step.structural_transitions <= 4096);
+        }
+        // UTF8端点向真实scalar尾计量；快路既不结构重放巨段，也不把整个source解码为String。
+        assert!(reads >= coverage.end && reads <= coverage.end + 3);
+        assert_eq!(global.total_work(), initial);
+        assert_eq!(global.next_byte(), 0);
+        assert!(!global.semantic_boundary_retained());
+        assert_eq!(
+            request.ready_pairs_for(&document).unwrap(),
+            Some([].as_slice())
         );
     }
 }

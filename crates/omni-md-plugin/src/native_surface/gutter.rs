@@ -3,28 +3,34 @@
 //! Geometry is prepared in the existing coalesced TextKit transaction. Painting reads a bounded
 //! snapshot only; fold state contains canonical intervals and is invalidated by any text generation.
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use super::*;
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use objc2_app_kit::{
     NSAttributedStringNSStringDrawing, NSRulerOrientation, NSRulerView,
     NSTextLayoutFragmentEnumerationOptions,
 };
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use omni_markdown_core::markdown_folding::{markdown_fold_region, markdown_line_may_fold};
 
-#[cfg(feature = "native-paged-body-probe")]
+#[cfg(feature = "native-paged-production")]
 mod labels;
-#[cfg(feature = "native-paged-body-probe")]
+#[cfg(feature = "native-paged-production")]
 pub(super) mod paged;
 #[cfg(feature = "native-raster-surface-probe")]
 mod raster;
 
 /// A finite viewport cap bounds ruler metadata even with unusually small or overlapping line heights.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 const MAX_GUTTER_LINES: usize = 256;
 /// Explicit nested folds are presentation metadata, bounded independently of document size.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 const MAX_ACTIVE_FOLDS: usize =
     omni_markdown_core::markdown_folding::anchor_mapping::MAX_MARKDOWN_FOLD_ANCHORS;
 
 /// One logical source line has one number, irrespective of how many wrapped visual rows it occupies.
 #[derive(Clone, PartialEq)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct GutterLine {
     number: usize,
     document_y: f64,
@@ -34,6 +40,7 @@ struct GutterLine {
 }
 
 /// 缓存只借用本次已验证片段的身份与有限几何；弱引用不延长 TextKit 或正文寿命。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct GutterFragmentProof {
     fragment: Weak<objc2_app_kit::NSTextLayoutFragment>,
     source: std::ops::Range<usize>,
@@ -42,6 +49,7 @@ struct GutterFragmentProof {
 
 /// 行号不能仅凭同一 Core 代次继续使用：滚动与 Find 可在代次不变时替换整批 Native 几何。
 /// 每个 ruler 至多保留当前视口的 256 片元数据，没有正文副本、原生强引用或第二布局索引。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct GutterGeometryProof {
     generation: u64,
     geometry_epoch: u64,
@@ -64,6 +72,7 @@ thread_local! {
 
 /// 只复用原校验已经取得的固定标量；None 表示原短路路径未读取，不能为日志补做 getter。
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct GutterProofDiagnostic {
     epochs: Option<(u64, u64, Option<u64>, u64, u64)>,
     viewport: Option<(NSRect, NSPoint)>,
@@ -77,6 +86,7 @@ struct GutterProofDiagnostic {
 }
 
 /// 失败后只打印原结果；固定 trace 开关关闭时不改变证明、计数或任何 Native 调用。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn report_gutter_proof_failure(
     site: &'static str,
     reason: &'static str,
@@ -103,6 +113,7 @@ fn report_gutter_proof_failure(
 
 #[cfg(feature = "native-raster-surface-probe")]
 /// 一次原标签循环的有限事实；仅几何/计数，不缓存正文、标签字符串或另一个行数组。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct GutterDrawFacts {
     dirty: NSRect,
     viewport: NSRect,
@@ -112,6 +123,7 @@ struct GutterDrawFacts {
 }
 
 /// Only the scroll surface owns the ruler; the backlink never prolongs its editor or canonical model.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct GutterIvars {
     text_view: Weak<PieceBackedMarkdownTextView>,
     lines: RefCell<Vec<GutterLine>>,
@@ -125,6 +137,7 @@ pub(super) struct GutterIvars {
     raster: RefCell<Option<Rc<raster::GutterRaster>>>,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 define_class!(
     // SAFETY: NSRulerView initialization and drawing stay on the main thread; all Rust ivars are
     // initialized before AppKit calls overrides, and the client backlink is weak.
@@ -346,19 +359,23 @@ define_class!(
 );
 
 /// 配平原同步绘图栈；即使权限撤销也必须恢复，不能把新 clip 留给下一个控件。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct GutterGraphicsState;
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl GutterGraphicsState {
     fn save() -> Self {
         NSGraphicsContext::saveGraphicsState_class();
         Self
     }
 }
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl Drop for GutterGraphicsState {
     fn drop(&mut self) {
         NSGraphicsContext::restoreGraphicsState_class();
     }
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownGutter {
     #[cfg(feature = "native-raster-surface-probe")]
     /// 两个公开 Native 入口共用普通 Rust 边界，避免直接调用带隐藏 selector 的覆写实现。
@@ -827,6 +844,7 @@ impl NativeMarkdownGutter {
 }
 
 /// 原逻辑行只裁掉屏外部分；标签仍用未裁剪基线绘制，不把行号挪到视口顶端。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn visible_gutter_line(top: f64, height: f64, viewport: NSRect) -> Option<NSRect> {
     if !top.is_finite() || !height.is_finite() {
         return None; // 无法认证的 native 行几何不能产生绘制或折叠命中权限。
@@ -839,6 +857,7 @@ fn visible_gutter_line(top: f64, height: f64, viewport: NSRect) -> Option<NSRect
 }
 
 /// 使用左闭右开的同一可见区域，防止边缘事件落入相邻 Find/header 控件。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn gutter_contains_point(rect: NSRect, point: NSPoint) -> bool {
     point.x.is_finite()
         && point.y.is_finite()
@@ -848,6 +867,7 @@ fn gutter_contains_point(rect: NSRect, point: NSPoint) -> bool {
         && point.y < rect.origin.y + rect.size.height
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl PieceBackedMarkdownTextView {
     /// TextKit/坐标调用返回后重新验证派生数据仍属于同一活 canonical 代次。
     pub(super) fn projection_generation_is_current(&self, expected: u64) -> bool {
@@ -1491,6 +1511,7 @@ impl PieceBackedMarkdownTextView {
 /// 同一真实 viewport 的下一片必须连续推进源，且排版 frame 不能倒退或重叠。
 /// 只检查有限标量；零高折叠片仍可推进覆盖，真正离屏/隐藏标签由原绘制交集决定。
 #[cfg(test)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn gutter_viewport_fragment_frontier(
     viewport: &std::ops::Range<usize>,
     covered: Option<usize>,
@@ -1509,6 +1530,7 @@ fn gutter_viewport_fragment_frontier(
 }
 
 /// Native可以完全省略显式折叠片；只有同原票证明hidden联合覆盖才跨源空洞。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn gutter_viewport_fragment_frontier_with_hidden(
     viewport: &std::ops::Range<usize>,
     covered: Option<usize>,
@@ -1538,6 +1560,7 @@ fn gutter_viewport_fragment_frontier_with_hidden(
 }
 
 /// 普通片与真实 EOF 片共享有限 frame 校验；不通过改 y、排序或估计高度修补失效布局。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn gutter_frame_bottom(frame: NSRect, previous_bottom: Option<f64>) -> Option<f64> {
     if ![
         frame.origin.x,
@@ -1560,11 +1583,13 @@ fn gutter_frame_bottom(frame: NSRect, previous_bottom: Option<f64>) -> Option<f6
 }
 
 /// 只允许活的同代次投影发布，窗口可见性和已经排队均不是权限。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn projection_can_publish(sealed: bool, expected: u64, current: Option<u64>) -> bool {
     !sealed && current == Some(expected)
 }
 
 /// 有限纯 metadata 的最后提交点；拒收时 prepared Vec 在无状态借用处完整 drop。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn publish_gutter_lines(
     target: &RefCell<Vec<GutterLine>>,
     prepared: Vec<GutterLine>,

@@ -5,6 +5,105 @@
 
 use crate::scanners::is_ascii_whitespace_no_nl;
 
+#[derive(Debug)]
+/// 原分隔行的逐字节续体；列计数和列对齐共用这里的真实 colon/pipe 转换。
+/// 调用者必须已由原 LineStart 排除容器前缀和缩进，并在真实 content_end 才结束。
+pub struct TableDelimiterScanner {
+    // 无效是本行终态；后继字节不能把已经失败的分隔语法重新拼成表格。
+    valid: bool,
+    initial: bool,
+    start_col: bool,
+    found_pipe: bool,
+    found_hyphen: bool,
+    col_hyphen: bool,
+    columns: usize,
+    // 仅保当前列，已关闭列由真实消费者立即取走；不会按巨行长度分配数组。
+    alignment: crate::Alignment,
+}
+
+impl TableDelimiterScanner {
+    pub fn new() -> Self {
+        // 默认方向只表示原 Parser 的无 colon 列；不是未知输入已经获得 Left 权限。
+        Self {
+            valid: true,
+            initial: true,
+            start_col: true,
+            found_pipe: false,
+            found_hyphen: false,
+            col_hyphen: false,
+            columns: 0,
+            alignment: crate::Alignment::None,
+        }
+    }
+
+    /// 返回本次真实 pipe 关闭的列；未到真实末尾时它不授整行有效或列数完整权限。
+    pub fn push(&mut self, byte: u8) -> Option<(usize, crate::Alignment)> {
+        if !self.valid {
+            // 原物理行仍可继续被 LineReader 消费，分隔语义不再产生任何候选。
+            return None;
+        }
+        if self.initial {
+            self.initial = false;
+            if byte == b'|' {
+                // 唯一可选 leading pipe 不关闭空列；之后每条 pipe 才结束一个真实列。
+                self.found_pipe = true;
+                return None;
+            }
+        }
+        match byte {
+            b' ' => (), // 原语法仅略过 ASCII space；tab 等输入仍按原 scan_table_head 拒绝。
+            b':' => {
+                // 保原 scan_table_head 的非常规连续 colon 规则，不另用首尾字符猜方向。
+                self.alignment = match (self.start_col, self.alignment) {
+                    (true, crate::Alignment::None) => crate::Alignment::Left,
+                    (false, crate::Alignment::Left) => crate::Alignment::Center,
+                    (false, crate::Alignment::None) => crate::Alignment::Right,
+                    _ => self.alignment,
+                };
+                self.start_col = false;
+            }
+            b'-' => {
+                // 一列至少有一个 hyphen 才能被后继 pipe 关闭，整行也至少需一个 hyphen。
+                self.start_col = false;
+                self.found_hyphen = true;
+                self.col_hyphen = true;
+            }
+            b'|' => {
+                self.found_pipe = true;
+                let closed = (self.columns, self.alignment);
+                // 先交旧列再重置新列，不能让新列起始 colon 继承上一列的 Left/Center。
+                self.columns += 1;
+                self.start_col = true;
+                self.alignment = crate::Alignment::None;
+                if !self.col_hyphen {
+                    self.valid = false;
+                }
+                self.col_hyphen = false;
+                return Some(closed);
+            }
+            _ => self.valid = false,
+        }
+        None
+    }
+
+    /// 只观察真实行末，不改变游标；末列可以没有尾 pipe，但仍须整行有效才准入。
+    pub fn final_column(&self) -> Option<(usize, crate::Alignment)> {
+        (!self.start_col).then_some((self.columns, self.alignment))
+    }
+
+    pub fn columns(&self) -> Option<usize> {
+        // 真正 EOF 或 content_end 才可据此授整行列数；调用者不能把分片边缘当结束。
+        (self.valid && self.found_pipe && self.found_hyphen)
+            .then_some(self.columns + usize::from(!self.start_col))
+    }
+}
+
+impl Default for TableDelimiterScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LineFacts {
     pub start: usize,
@@ -43,13 +142,7 @@ pub(crate) struct LineReader {
     setext_marker: Option<u8>,
     setext_spaces: bool,
     setext_valid: bool,
-    delimiter_valid: bool,
-    delimiter_initial: bool,
-    delimiter_start_col: bool,
-    delimiter_found_pipe: bool,
-    delimiter_found_hyphen: bool,
-    delimiter_col_hyphen: bool,
-    delimiter_columns: usize,
+    delimiter: TableDelimiterScanner,
     done: Option<LineFacts>,
     metadata_marker: Option<u8>,
     metadata_count: usize,
@@ -75,13 +168,7 @@ impl LineReader {
             setext_marker: None,
             setext_spaces: false,
             setext_valid: true,
-            delimiter_valid: true,
-            delimiter_initial: true,
-            delimiter_start_col: true,
-            delimiter_found_pipe: false,
-            delimiter_found_hyphen: false,
-            delimiter_col_hyphen: false,
-            delimiter_columns: 0,
+            delimiter: TableDelimiterScanner::new(),
             done: None,
             metadata_marker: None,
             metadata_count: 0,
@@ -201,44 +288,14 @@ impl LineReader {
                 }
             }
         }
-        if !self.delimiter_valid {
-            return;
-        }
-        if self.delimiter_initial {
-            self.delimiter_initial = false;
-            if byte == b'|' {
-                self.delimiter_found_pipe = true;
-                return;
-            }
-        }
-        match byte {
-            b' ' => (),
-            b':' => self.delimiter_start_col = false,
-            b'-' => {
-                self.delimiter_start_col = false;
-                self.delimiter_found_hyphen = true;
-                self.delimiter_col_hyphen = true;
-            }
-            b'|' => {
-                self.delimiter_found_pipe = true;
-                self.delimiter_columns += 1;
-                self.delimiter_start_col = true;
-                if !self.delimiter_col_hyphen {
-                    self.delimiter_valid = false;
-                }
-                self.delimiter_col_hyphen = false;
-            }
-            _ => self.delimiter_valid = false,
-        }
+        let _ = self.delimiter.push(byte);
     }
 
     fn complete(&mut self) {
         let first_pipe = self.first_content == Some(b'|');
         let columns =
             self.pipes.saturating_sub(usize::from(first_pipe)) + usize::from(!self.last_pipe_blank);
-        let delimiter_columns =
-            (self.delimiter_valid && self.delimiter_found_pipe && self.delimiter_found_hyphen)
-                .then_some(self.delimiter_columns + usize::from(!self.delimiter_start_col));
+        let delimiter_columns = self.delimiter.columns();
         self.done = Some(LineFacts {
             start: self.start,
             content_end: self.content_end.unwrap_or(self.next),

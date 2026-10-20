@@ -45,6 +45,575 @@ pub(super) fn leaf_sources(
 }
 
 #[test]
+fn forward_small_leaf_windows_keep_far_directed_selection_under_original_work_limit() {
+    // 固定普通单段落混合中文、ASCII和非BMP；每组13B/7UTF16，完全没有Markdown marker。
+    // 远端有向选择是真实用户状态，后继只滚动小窗口，不能每批重读其两个已认证端点。
+    let source = "中文abc😀".repeat(16_384);
+    let (directory, mut doc) = document(&source);
+    let backing = doc.original_backing_observer().unwrap();
+    let selection = MarkdownTextSelection {
+        anchor_utf16: 83_055,
+        head_utf16: 83_050,
+    }; // 两端由固定7-unit组声明：a的起点到完整emoji末端，不落在代理对内部。
+    doc.set_selection(selection).unwrap();
+    let mut request = doc
+        .viewport_leaf_source_request(0..7, 57, selection)
+        .unwrap();
+    finish_sources(&mut request, &doc).unwrap();
+    let mut previous = request
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    // 连续真实发布直到远端选区后的完整组；不能只到13K/18K就外推产品83K定位。
+    // 每个窗口仍只消费原4096量子和同一请求累计fuel，没有扩大语义视口或提前解析全文。
+    // 不读取私有定位器、不按调用数判断优化，能否完成全部真实样式就是本回归的结果。
+    for block in 0..=selection.anchor_utf16 / 7 {
+        let range = block * 7..block * 7 + 7;
+        if block != 0 {
+            request
+                .continue_forward(&doc, &previous, range.clone(), authority(&doc))
+                .unwrap();
+            drop(previous); // 原Ready联合准入后立即归还，不人为保留整串publication。
+            finish_sources(&mut request, &doc).unwrap_or_else(|cause| {
+                panic!(
+                    "真实小窗未完成：range={range:?} cause={cause:?} work={:?}",
+                    request.total_work(),
+                );
+            });
+            previous = request
+                .take_sources_for(&doc, authority(&doc))
+                .unwrap()
+                .unwrap();
+        }
+        let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = previous
+            .ordinary_semantics_for(&doc, authority(&doc))
+            .unwrap()
+        else {
+            panic!("同一真实普通段落的小窗必须完成样式，range={range:?}");
+        };
+        for local in [0, 1, 2, 3, 4, 5] {
+            let at = range.start + local;
+            let query = leaf.query_for(&doc, authority(&doc), at).unwrap().unwrap();
+            assert!(query.utf16_range.contains(&at));
+            assert_eq!(query.styles, MarkdownPresentationStyles::default());
+        } // 每个固定scalar必须真正有覆盖；未知页不能借空样式或裸viewport范围通过。
+    }
+    assert_eq!(doc.generation(), 0);
+    assert_eq!(doc.selection(), selection);
+    assert!(!doc.can_undo() && !doc.can_redo());
+    assert_eq!(
+        std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+        source.as_bytes()
+    );
+    drop((previous, request, doc));
+    assert_eq!(backing.mapped_bytes(), 0);
+    assert_eq!(backing.managed_resident_bytes(), 0);
+}
+
+#[test]
+fn forward_leaf_windows_keep_scalar_floor_and_ceil_across_pieces_and_reposition() {
+    // 每组固定10B/4UTF16：甲、完整emoji、乙。窗口故意停在代理对中间，
+    // 公开语义必须仍剪回原请求，不能把前一ceil已经读过的后半代理项当成新floor。
+    let source = "甲😀乙".repeat(900);
+    let (directory, mut doc) = document(&source);
+    let backing = doc.original_backing_observer().unwrap();
+    let selection = MarkdownTextSelection {
+        anchor_utf16: 3_599,
+        head_utf16: 1,
+    };
+    doc.set_selection(selection).unwrap();
+    let mut request = doc
+        .viewport_leaf_source_request(0..2, 57, selection)
+        .unwrap();
+    finish_sources(&mut request, &doc).unwrap();
+    let mut previous = request
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    let mut previous_start = 0;
+    // 409/410和819/820组跨过原4KiB读片边界；端点由固定字面长度决定，
+    // 不读取定位器或候选Source的私有片目录来反造预期。
+    for block in [0, 409, 410, 819, 820, 899] {
+        let start = block * 4;
+        for range in [
+            start..start + 2,
+            start + 1..start + 2,
+            start + 1..start + 3,
+            start + 2..start + 4,
+        ] {
+            request
+                .continue_forward(&doc, &previous, range.clone(), authority(&doc))
+                .unwrap();
+            finish_sources(&mut request, &doc).unwrap_or_else(|cause| {
+                panic!(
+                    "真实UTF16窗口未完成：range={range:?} cause={cause:?} work={:?}",
+                    request.total_work()
+                );
+            });
+            let current = request
+                .take_sources_for(&doc, authority(&doc))
+                .unwrap()
+                .unwrap();
+            let MarkdownOrdinarySemanticState::RootLeafReady(ready) = current
+                .ordinary_semantics_for(&doc, authority(&doc))
+                .unwrap()
+            else {
+                panic!("固定普通正文必须有真实语义，range={range:?}");
+            };
+            for index in range.clone() {
+                let query = ready
+                    .query_for(&doc, authority(&doc), index)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    range.start <= query.utf16_range.start && query.utf16_range.end <= range.end
+                );
+                assert!(query.utf16_range.contains(&index));
+                assert_eq!(query.styles, MarkdownPresentationStyles::default());
+            }
+            // 新窗口实际发布后，仍持有的旧Ready必须继续按自己的原覆盖读取；
+            // 复用owner不能改写旧结果，也不能把旧publication强留成链。
+            let MarkdownOrdinarySemanticState::RootLeafReady(old) = previous
+                .ordinary_semantics_for(&doc, authority(&doc))
+                .unwrap()
+            else {
+                panic!("上一普通窗口必须仍可读");
+            };
+            assert_eq!(
+                old.query_for(&doc, authority(&doc), previous_start)
+                    .unwrap()
+                    .unwrap()
+                    .styles,
+                MarkdownPresentationStyles::default()
+            );
+            previous = current;
+            previous_start = range.start;
+        }
+    }
+    // 真正逆向必须走原重定位，而非沿原前沿倒退；其结果仍保留同一完整有向选择。
+    request
+        .reposition(&doc, &previous, 1..3, authority(&doc))
+        .unwrap();
+    drop(previous);
+    finish_sources(&mut request, &doc).unwrap();
+    let previous = request
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    let MarkdownOrdinarySemanticState::RootLeafReady(ready) = previous
+        .ordinary_semantics_for(&doc, authority(&doc))
+        .unwrap()
+    else {
+        panic!("逆向恢复必须重新取得真实emoji覆盖");
+    };
+    for index in 1..3 {
+        assert_eq!(
+            ready
+                .query_for(&doc, authority(&doc), index)
+                .unwrap()
+                .unwrap()
+                .utf16_range,
+            1..3
+        );
+    }
+    request
+        .continue_forward(&doc, &previous, 1_636..1_640, authority(&doc))
+        .unwrap();
+    request.cancel();
+    assert_eq!(
+        request.advance(&doc, authority(&doc), 4096),
+        Err(MarkdownTableRequestError::Cancelled)
+    );
+    assert!(ready.query_for(&doc, authority(&doc), 1).unwrap().is_some());
+    assert_eq!(doc.selection(), selection);
+    assert_eq!(doc.generation(), 0);
+    assert!(!doc.can_undo() && !doc.can_redo());
+    assert_eq!(
+        std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+        source.as_bytes()
+    );
+    drop((previous, request, doc));
+    assert_eq!(backing.mapped_bytes(), 0);
+    assert_eq!(backing.managed_resident_bytes(), 0);
+}
+
+#[test]
+fn production_literal_html_and_metadata_keep_original_values_and_exact_underline_allowlist() {
+    for source in [
+        "<div>\n**字面粗体** `字面代码` [字面链接](https://example.com) <a href=\"https://example.com\">网页字面</a>\n<u>实际下划线😀</u> <U>大写字面</U> <u class=x>属性字面</u>\n</div>\n",
+        "  <div>\n**字面粗体** `字面代码` [字面链接](https://example.com)\n<u>实际下划线😀</u>\n</div>\n",
+        "<!-- **字面粗体** `字面代码` [字面链接](https://example.com) <u>实际下划线😀</u> -->\n",
+        "<script>\n**字面粗体** `字面代码` [字面链接](https://example.com) <u>实际下划线😀</u>\n</script>\n",
+        "> <div>\r\n> **字面粗体** `字面代码` [字面链接](https://example.com)\r\n> <u>实际下划线😀</u>\r\n> </div>\r\n",
+        "- <div>\n  **字面粗体** `字面代码` [字面链接](https://example.com)\n  <u>实际下划线😀</u>\n  </div>\n",
+        "> - <div>\n>   **字面粗体** `字面代码` [字面链接](https://example.com)\n>   <u>实际下划线😀</u>\n>   </div>\n",
+        "---\ntitle: '**字面粗体** `字面代码` [字面链接](https://example.com)'\nvalue: '<u>实际下划线😀</u>'\n---\n",
+        "---\r\ntitle: '**字面粗体** `字面代码` [字面链接](https://example.com)'\r\nvalue: '<u>实际下划线😀</u>'\r\n...  \r\n",
+    ] {
+        // 独立完整 Parser 决定真实叶种类和末端；metadata closing EOL 不属于该叶，
+        // 不能为了让整窗 Ready 把 consumed_end 或后继行前缀伪装成已证明字面。
+        let parsed = Parser::new_ext(
+            source,
+            crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+        )
+        .into_offset_iter()
+        .find_map(|(event, range)| {
+            matches!(event, Event::Start(Tag::HtmlBlock | Tag::MetadataBlock(_))).then_some(range)
+        })
+        .expect("夹具必须由原 Parser 真正识别为 HTML 或 metadata 叶");
+        let requested = units(source, 0..parsed.end);
+        for selection in [
+            MarkdownTextSelection::caret(0),
+            MarkdownTextSelection::caret(source.encode_utf16().count()),
+            MarkdownTextSelection {
+                anchor_utf16: requested.end,
+                head_utf16: requested.start,
+            },
+        ] {
+            let (directory, mut doc) = document(source);
+            let observer = doc.original_backing_observer().unwrap();
+            doc.set_selection(selection).unwrap();
+            let (request, sources) = leaf_sources(&doc, requested.clone());
+            let MarkdownOrdinarySemanticState::RootLeafReady(ready) = sources
+                .ordinary_semantics_for(&doc, authority(&doc))
+                .unwrap()
+            else {
+                panic!("真实字面叶须完成原字面与 allowlist 语义，source={source:?}");
+            };
+            assert_oracle(ready, &doc, source, &requested);
+
+            // 源码值也由同一个公开文档流式写出；样式 Ready 不能意味着删掉 HTML、
+            // YAML marker、Markdown 拼写或容器前缀，更不能产生一个伪链接目标。
+            let mut actual = Vec::new();
+            doc.write_utf16_range_to(requested.clone(), &mut actual)
+                .unwrap();
+            assert_eq!(actual, source.as_bytes()[..parsed.end]);
+            for literal in ["字面粗体", "字面代码", "字面链接"] {
+                let at = source.find(literal).unwrap();
+                for index in units(source, at..at + literal.len()) {
+                    let styles = ready
+                        .query_for(&doc, authority(&doc), index)
+                        .unwrap()
+                        .unwrap()
+                        .styles;
+                    for unexpected in [
+                        MarkdownPresentationStyles::STRONG,
+                        MarkdownPresentationStyles::INLINE_CODE,
+                        MarkdownPresentationStyles::LINK,
+                    ] {
+                        assert!(!styles.contains(unexpected));
+                    }
+                    assert!(
+                        ready
+                            .link_at_for(&doc, authority(&doc), index)
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+            }
+            let underline = source.find("实际下划线😀").unwrap();
+            for index in units(source, underline..underline + "实际下划线😀".len()) {
+                assert!(
+                    ready
+                        .query_for(&doc, authority(&doc), index)
+                        .unwrap()
+                        .unwrap()
+                        .styles
+                        .contains(MarkdownPresentationStyles::UNDERLINE)
+                );
+            }
+            // 非精确标签绝不进入 allowlist；这些值仍与原 Parser 一样保持可见字面。
+            for literal in ["网页字面", "大写字面", "属性字面"] {
+                if let Some(at) = source.find(literal) {
+                    let index = units(source, at..at).start;
+                    let styles = ready
+                        .query_for(&doc, authority(&doc), index)
+                        .unwrap()
+                        .unwrap()
+                        .styles;
+                    assert!(!styles.contains(MarkdownPresentationStyles::UNDERLINE));
+                    assert!(
+                        ready
+                            .link_at_for(&doc, authority(&doc), index)
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+            }
+            assert_eq!(request.total_work().copied_source_bytes, 0);
+            assert_eq!(request.total_work().parser_input_bytes, 0);
+            assert_eq!(request.total_work().allocated_source_capacity, 0);
+            assert_eq!(
+                std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+                source.as_bytes()
+            );
+            drop(sources);
+            drop(request);
+            drop(doc);
+            assert_eq!(observer.mapped_bytes(), 0);
+            assert_eq!(observer.managed_resident_bytes(), 0);
+        }
+    }
+}
+
+#[test]
+fn production_giant_literal_html_keeps_real_underline_and_only_publishes_viewport() {
+    // 完整合成串仅归测试 oracle；生产只沿原映射和同一 Global 的 4KiB 量子，
+    // 不能因 HTML 正文没有 Markdown inline 就复制超过 2MiB 的整段来查找 </u>。
+    let opening = "<div><u>\n";
+    let source = format!("{opening}{}\n</u></div>\n", "中😀".repeat(310_000));
+    let (directory, mut doc) = document(&source);
+    let observer = doc.original_backing_observer().unwrap();
+    doc.set_selection(MarkdownTextSelection::caret(doc.utf16_len()))
+        .unwrap();
+    let byte_start = opening.len() + 170_000 * "中😀".len();
+    let byte_end = byte_start + 19 * "中😀".len();
+    let requested = units(&source, byte_start..byte_end);
+    let (request, sources) = leaf_sources(&doc, requested.clone());
+    let MarkdownOrdinarySemanticState::RootLeafReady(ready) = sources
+        .ordinary_semantics_for(&doc, authority(&doc))
+        .unwrap()
+    else {
+        panic!("巨型 HTML 中间窗口须等待真实 allowlist 配对后完成，不得直接签默认样式");
+    };
+    assert_oracle(ready, &doc, &source, &requested);
+    for index in requested.clone() {
+        assert!(
+            ready
+                .query_for(&doc, authority(&doc), index)
+                .unwrap()
+                .unwrap()
+                .styles
+                .contains(MarkdownPresentationStyles::UNDERLINE)
+        );
+    }
+    let mut actual = Vec::new();
+    doc.write_utf16_range_to(requested, &mut actual).unwrap();
+    assert_eq!(actual, source.as_bytes()[byte_start..byte_end]);
+    assert_eq!(request.total_work().copied_source_bytes, 0);
+    assert_eq!(request.total_work().parser_input_bytes, 0);
+    assert_eq!(request.total_work().allocated_source_capacity, 0);
+    assert_eq!(
+        std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+        source.as_bytes()
+    );
+    drop(sources);
+    drop(request);
+    drop(doc);
+    assert_eq!(observer.mapped_bytes(), 0);
+    assert_eq!(observer.managed_resident_bytes(), 0);
+}
+
+#[test]
+fn production_scoped_leaf_prefixes_headings_and_code_match_original_parser() {
+    for source in [
+        "> ## 引用标题😀\n",
+        "- ## 列表标题😀\n",
+        "> - ## 引用列表标题😀\n",
+        "- > ## 列表引用标题😀\n",
+        "1. > ## 有序列表引用标题😀\n",
+        "> -\t## Tab列表标题😀\n",
+        "> ```text\r\n> 中文😀\r\n> 第二行\r\n> ```\r\n",
+        "- ```text\n  中文😀\n  \t保留Tab\n  ```\n",
+        ">     中文😀\n>     第二行\n",
+        "> ````\n> 正文\n> ```",
+        "> ```\n> 正文\n> ~~~",
+        "> ```\n> 正文\n> ```不是closer",
+        "> ```\n> 真实容器退出\n退出正文\n",
+    ] {
+        let parsed = Parser::new_ext(
+            source,
+            crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+        )
+        .into_offset_iter()
+        .find_map(|(event, range)| {
+            matches!(event, Event::Start(Tag::Heading { .. } | Tag::CodeBlock(_))).then_some(range)
+        })
+        .unwrap();
+        // 首行实际 quote/item prefix 也必须得到真容器语义；不能只核 marker 后的正文。
+        let requested = units(source, 0..parsed.end);
+        for selection in [
+            MarkdownTextSelection::caret(0),
+            MarkdownTextSelection::caret(source.encode_utf16().count()),
+            MarkdownTextSelection {
+                anchor_utf16: requested.end,
+                head_utf16: requested.start,
+            },
+        ] {
+            let (directory, mut doc) = document(source);
+            let observer = doc.original_backing_observer().unwrap();
+            doc.set_selection(selection).unwrap();
+            let (request, sources) = leaf_sources(&doc, requested.clone());
+            let MarkdownOrdinarySemanticState::RootLeafReady(ready) = sources
+                .ordinary_semantics_for(&doc, authority(&doc))
+                .unwrap()
+            else {
+                panic!("真实容器 Leaf 必须完成，source={source:?}");
+            };
+            assert_oracle(ready, &doc, source, &requested);
+            assert_eq!(
+                std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+                source.as_bytes()
+            );
+            drop(sources);
+            drop(request);
+            drop(doc);
+            assert_eq!(observer.mapped_bytes(), 0);
+            assert_eq!(observer.managed_resident_bytes(), 0);
+        }
+    }
+}
+
+#[test]
+fn production_footnote_leaf_origins_keep_labels_literal_and_real_child_scope() {
+    for source in [
+        "[^123]: ## 中文标题😀\n",
+        "> [^123]: ## 引用脚注标题😀\n",
+        "[^外层]: > [^456]: ## 嵌套脚注标题😀\n",
+        "[^123]: ```text\n    中文😀<u>代码字面</u>\n    ```\n",
+        "> [^123]: ```text\r\n>     中文😀<u>代码字面</u>\r\n>     ```\r\n",
+        "[^123]:\n        缩进代码😀\n",
+        "[^123]: <div>\n    **字面粗体** <u>实际下划线😀</u>\n    </div>\n",
+    ] {
+        let parsed = Parser::new_ext(
+            source,
+            crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+        )
+        .into_offset_iter()
+        .find_map(|(event, range)| {
+            matches!(
+                event,
+                Event::Start(Tag::Heading { .. } | Tag::CodeBlock(_) | Tag::HtmlBlock)
+            )
+            .then_some(range)
+        })
+        .expect("独立原 Parser 必须确认真实脚注子叶");
+        // 空 opening 行不是下一代码叶的内容；首行 label 只有与实际 child 同一物理行才随前缀发布。
+        let physical = source[..parsed.start].rfind('\n').map_or(0, |at| at + 1);
+        let requested = units(source, physical..parsed.end);
+        for selection in [
+            MarkdownTextSelection::caret(0),
+            MarkdownTextSelection::caret(source.encode_utf16().count()),
+            MarkdownTextSelection {
+                anchor_utf16: requested.end,
+                head_utf16: requested.start,
+            },
+        ] {
+            let (directory, mut doc) = document(source);
+            let observer = doc.original_backing_observer().unwrap();
+            doc.set_selection(selection).unwrap();
+            let (request, sources) = leaf_sources(&doc, requested.clone());
+            let MarkdownOrdinarySemanticState::RootLeafReady(ready) = sources
+                .ordinary_semantics_for(&doc, authority(&doc))
+                .unwrap()
+            else {
+                panic!("真实脚注 child 必须保原 opening 和 Origin，source={source:?}")
+            };
+            assert_oracle(ready, &doc, source, &requested);
+            assert_eq!(
+                std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+                source.as_bytes()
+            );
+            drop(sources);
+            drop(request);
+            drop(doc);
+            assert_eq!(observer.mapped_bytes(), 0);
+            assert_eq!(observer.managed_resident_bytes(), 0);
+        }
+    }
+}
+
+#[test]
+fn production_giant_footnote_code_keeps_mapped_body_and_only_visible_semantics() {
+    // 标签 opening、四列续行和真围栏都由原 producer/Origin 证明；>2MiB 正文只有测试 oracle 持有。
+    // 当前窗口不含首行 label，也不能因为它离屏就换一份 Root 源、配额或整段缓冲。
+    let source = format!("[^123]: ```text\n    {}\n    ```\n", "中😀".repeat(310_000));
+    let (directory, doc) = document(&source);
+    let observer = doc.original_backing_observer().unwrap();
+    let requested = 500_001..500_065;
+    let (request, sources) = leaf_sources(&doc, requested.clone());
+    let MarkdownOrdinarySemanticState::RootLeafReady(ready) = sources
+        .ordinary_semantics_for(&doc, authority(&doc))
+        .unwrap()
+    else {
+        panic!("真实脚注代码必须沿原映射发布可见交集，不能复制整块或跳过其祖先");
+    };
+    assert_oracle(ready, &doc, &source, &requested);
+    assert_eq!(request.total_work().copied_source_bytes, 0);
+    assert_eq!(request.total_work().parser_input_bytes, 0);
+    assert_eq!(request.total_work().allocated_source_capacity, 0);
+    assert_eq!(
+        std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+        source.as_bytes()
+    );
+    drop(sources);
+    drop(request);
+    drop(doc);
+    assert_eq!(observer.mapped_bytes(), 0);
+    assert_eq!(observer.managed_resident_bytes(), 0);
+}
+
+#[test]
+fn production_root_eof_false_closers_remain_literal_without_losing_code_coverage() {
+    for source in [
+        "````\n正文\n```",
+        "```\n正文\n~~~",
+        "```\n正文\n```不是closer",
+    ] {
+        let (directory, doc) = document(source);
+        let observer = doc.original_backing_observer().unwrap();
+        let requested = units(source, first_leaf_range(source));
+        let (request, sources) = leaf_sources(&doc, requested.clone());
+        let MarkdownOrdinarySemanticState::RootLeafReady(ready) = sources
+            .ordinary_semantics_for(&doc, authority(&doc))
+            .unwrap()
+        else {
+            panic!("EOF 假围栏属于真实代码正文，不能因旧末行猜测拒绝整块");
+        };
+        assert_oracle(ready, &doc, source, &requested);
+        assert_eq!(
+            std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+            source.as_bytes()
+        );
+        drop(sources);
+        drop(request);
+        drop(doc);
+        assert_eq!(observer.mapped_bytes(), 0);
+        assert_eq!(observer.managed_resident_bytes(), 0);
+    }
+}
+
+#[test]
+fn production_scoped_giant_code_publishes_only_viewport_without_copying_canonical_body() {
+    // 只有独立 oracle 测试持完整合成串；生产请求只借原映射小帧，单段代码超过 2MiB。
+    let source = format!("> ```text\n> {}\n> ```\n", "中😀".repeat(310_000));
+    let (directory, mut doc) = document(&source);
+    let observer = doc.original_backing_observer().unwrap();
+    doc.set_selection(MarkdownTextSelection::caret(0)).unwrap();
+    let requested = 500_001..500_065;
+    let (request, sources) = leaf_sources(&doc, requested.clone());
+    let MarkdownOrdinarySemanticState::RootLeafReady(ready) = sources
+        .ordinary_semantics_for(&doc, authority(&doc))
+        .unwrap()
+    else {
+        panic!("巨大容器代码仍须发布可见交集，不能整段复制或把合法块留作 Pending");
+    };
+    assert_oracle(ready, &doc, &source, &requested);
+    assert_eq!(request.total_work().copied_source_bytes, 0);
+    assert_eq!(request.total_work().parser_input_bytes, 0);
+    assert_eq!(request.total_work().allocated_source_capacity, 0);
+    assert_eq!(
+        std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+        source.as_bytes()
+    );
+    drop(sources);
+    drop(request);
+    drop(doc);
+    assert_eq!(observer.mapped_bytes(), 0);
+    assert_eq!(observer.managed_resident_bytes(), 0);
+}
+
+#[test]
 fn production_leaf_factory_uses_original_publication_and_matches_complete_projection() {
     for source in [
         "前言\n\n```rust\n中文😀<u>代码</u>\n```\n\n结尾\n",
@@ -79,7 +648,6 @@ fn production_leaf_factory_uses_original_publication_and_matches_complete_projec
                     .iter()
                     .any(|record| Rc::ptr_eq(record, &ready.coverage.get(0).unwrap().record))
             );
-            assert!(request.leaf_semantic.is_none());
             assert!(request.semantic.is_none());
             assert!(request.records.is_empty());
             assert_eq!(request.total_work().copied_source_bytes, 0);
@@ -101,6 +669,265 @@ fn production_leaf_factory_uses_original_publication_and_matches_complete_projec
             );
         }
     }
+}
+
+#[test]
+/// closing-EOL 的真实控制票不扩张原代码语义；只请求 EOL 时也沿原公开工厂的同一 Root 来源。
+fn production_closing_fence_separator_keeps_its_own_publication_and_original_plain_style() {
+    for ending in ["\n", "\r\n"] {
+        let source =
+            format!("前言😀{ending}{ending}```text{ending}代码😀{ending}```  {ending}后文{ending}");
+        let end = source.rfind("```  ").unwrap() + 5;
+        let separator = units(&source, end..end + ending.len());
+        for requested in [0..source.encode_utf16().count(), separator.clone()] {
+            let (_directory, mut doc) = document(&source);
+            let (request, sources) = leaf_sources(&doc, requested);
+            assert_eq!(
+                sources
+                    .root_fence_separator_for(&doc, authority(&doc), &separator)
+                    .unwrap(),
+                Some(separator.clone())
+            );
+            let mut original = MarkdownViewportPresentation::default();
+            original
+                .rebuild(doc.generation(), 0..doc.utf16_len(), &source)
+                .unwrap();
+            for index in separator.clone() {
+                // 旧完整 Parser 在 closing scanner 外确实只发布普通样式，不能借最后代码/隐藏 run 的字体。
+                assert_eq!(
+                    original.query(index).unwrap().styles,
+                    MarkdownPresentationStyles::default()
+                );
+                if let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = &sources.semantic {
+                    assert!(
+                        leaf.query_for(&doc, authority(&doc), index)
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+            }
+            for other in [
+                separator.start - 1..separator.end,
+                separator.end..separator.end + 1,
+                separator.end..separator.end,
+            ] {
+                assert!(
+                    sources
+                        .root_fence_separator_for(&doc, authority(&doc), &other)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            if ending.len() == 2 {
+                for half in [
+                    separator.start..separator.start + 1,
+                    separator.start + 1..separator.end,
+                ] {
+                    assert!(
+                        sources
+                            .root_fence_separator_for(&doc, authority(&doc), &half)
+                            .unwrap()
+                            .is_none()
+                    );
+                } // 同一 CRLF 不拆成两份控制权限，也不在 getter 读取任何正文。
+            }
+            assert_eq!(request.total_work().copied_source_bytes, 0);
+            assert_eq!(request.total_work().parser_input_bytes, 0);
+            assert_eq!(request.total_work().allocated_source_capacity, 0);
+            doc.insert_utf16(0, "新", MarkdownTextSelection::caret(1))
+                .unwrap();
+            assert_eq!(
+                sources.root_fence_separator_for(&doc, authority(&doc), &separator),
+                Err(MarkdownTableRequestError::SourceSuperseded)
+            ); // 源换代后即使仍是相同数字范围，也不能复活旧 closing-EOL 控制票。
+        }
+    }
+
+    let source = "> ```text\n> 代码\n> ```\n\n尾\n";
+    let (_directory, doc) = document(source);
+    let (_, sources) = leaf_sources(&doc, 0..doc.utf16_len());
+    let end = source.rfind("```").unwrap() + 3;
+    assert!(
+        sources
+            .root_fence_separator_for(&doc, authority(&doc), &units(source, end..end + 1))
+            .unwrap()
+            .is_none()
+    ); // 容器自己的前缀与换行归原容器；不能借同形 closing marker 冒充 Root 控制。
+}
+
+#[test]
+/// 原 Native 字形、EOL、空行的真实续批顺序不能消费后丢失下一份 fence/heading Fact。
+fn production_native_control_windows_keep_the_original_next_leaf_across_blank_lines() {
+    let source = "# Title\n\n```text\nlet value = 1;\n```\n\n## Next\n";
+    let (_directory, doc) = document(source);
+    let (mut request, mut previous) = leaf_sources(&doc, 0..7);
+    let global = request.batch.source_probe_state().0;
+    let mut ahead = None;
+    for requested in [
+        7..8,
+        8..9,
+        9..16,
+        16..17,
+        17..31,
+        31..32,
+        32..35,
+        35..36,
+        36..37,
+        37..44,
+        44..45,
+    ] {
+        request
+            .continue_forward(&doc, &previous, requested.clone(), authority(&doc))
+            .unwrap();
+        finish_sources(&mut request, &doc).unwrap();
+        previous = request
+            .take_sources_for(&doc, authority(&doc))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.batch.source_probe_state().0, global);
+        if requested == (8..9) || requested == (36..37) {
+            assert_eq!(previous.records.len(), 1);
+            ahead = Some(Rc::downgrade(&previous.records[0]));
+            assert!(
+                previous
+                    .ordinary_leaves_for(&doc, authority(&doc))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            ); // 原下一叶的 metadata 只为续体保留；本空白窗口没有该叶的 getter 或样式权限。
+            continue;
+        }
+        if requested == (9..16) || requested == (37..44) {
+            let actual = previous.records.first().unwrap();
+            assert!(ahead.take().unwrap().ptr_eq(&Rc::downgrade(actual)));
+        } // 后继借回的必须是原 Fact 的同一个 Rc，不重判、复制或重新准入另一份 opaque 叶。
+        if requested == (35..36) {
+            assert_eq!(
+                previous
+                    .root_fence_separator_for(&doc, authority(&doc), &requested)
+                    .unwrap(),
+                Some(requested)
+            );
+            continue;
+        }
+        let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = &previous.semantic else {
+            panic!("合法原 Native 范围 {requested:?} 未沿同一来源完成 RootLeaf 语义");
+        };
+        assert_oracle(leaf, &doc, source, &requested);
+    }
+    assert_eq!(request.total_work().copied_source_bytes, 0);
+    assert_eq!(request.total_work().parser_input_bytes, 0);
+    assert_eq!(request.total_work().allocated_source_capacity, 0);
+}
+
+#[test]
+/// 窗后普通行也须保同一语义 seed；只保行坐标会让下一窗口再次丢失真实 inline 来源。
+fn production_blank_control_preserves_the_next_ordinary_line_and_its_original_seed() {
+    let source = "# Title\n\nplain words\n\n## Next\n";
+    let (_directory, doc) = document(source);
+    let (mut request, mut previous) = leaf_sources(&doc, 0..8);
+    request
+        .continue_forward(&doc, &previous, 8..9, authority(&doc))
+        .unwrap();
+    finish_sources(&mut request, &doc).unwrap();
+    previous = request
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    assert_eq!(previous.records.len(), 1);
+    let SourceRecord::Line(line) = previous.records[0].as_ref() else {
+        panic!("该固定空行之后必须保原普通行，不是另一种叶块");
+    };
+    let seed = Rc::downgrade(line.semantic_block.as_ref().unwrap());
+    assert!(
+        previous
+            .ordinary_lines_for(&doc, authority(&doc))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    request
+        .continue_forward(&doc, &previous, 9..20, authority(&doc))
+        .unwrap();
+    finish_sources(&mut request, &doc).unwrap();
+    let current = request
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    let line = current
+        .ordinary_lines_for(&doc, authority(&doc))
+        .unwrap()
+        .next()
+        .unwrap();
+    assert!(seed.ptr_eq(&Rc::downgrade(line.semantic_block.as_ref().unwrap())));
+    let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = &current.semantic else {
+        panic!("原普通行不能因上次窗口只有空白而失去语义 seed");
+    };
+    assert_oracle(leaf, &doc, source, &(9..20));
+    assert_eq!(request.total_work().copied_source_bytes, 0);
+    assert_eq!(request.total_work().parser_input_bytes, 0);
+}
+
+#[test]
+/// 正文/EOL/Setext标记/EOL由Native分开取样时，同一 terminal 来源仍须授权原完整 heading 尾部。
+fn production_native_setext_control_windows_keep_the_original_terminal_owner_through_underline() {
+    let source = "outside\n\nHeading alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau\n---\n\nend\n";
+    let (_directory, doc) = document(source);
+    let (mut request, mut previous) = leaf_sources(&doc, 0..7);
+    let global = request.batch.source_probe_state().0;
+    let mut heading = None;
+    for requested in [
+        7..8,
+        8..9,
+        9..114,
+        114..115,
+        115..118,
+        118..119,
+        119..120,
+        120..123,
+        123..124,
+    ] {
+        request
+            .continue_forward(&doc, &previous, requested.clone(), authority(&doc))
+            .unwrap();
+        finish_sources(&mut request, &doc).unwrap();
+        previous = request
+            .take_sources_for(&doc, authority(&doc))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.batch.source_probe_state().0, global);
+        if requested == (8..9) {
+            heading = Some(Rc::downgrade(&previous.records[0]));
+            continue;
+        }
+        if requested == (119..120) {
+            continue; // 真实空行没有 heading 样式，不借后继普通行补签已证交集。
+        }
+        if requested.start >= 9 && requested.end <= 119 {
+            assert!(
+                heading
+                    .as_ref()
+                    .unwrap()
+                    .ptr_eq(&Rc::downgrade(&previous.records[0]))
+            );
+        }
+        if requested.start >= 115 && requested.end <= 119 {
+            assert!(
+                previous
+                    .ordinary_lines_for(&doc, authority(&doc))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            ); // underline 由原 Setext seed 证明；不能捏造一条正文 BlockOriginLine。
+        }
+        let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = &previous.semantic else {
+            panic!("原 Setext 分段范围 {requested:?} 丢失自己的 terminal owner");
+        };
+        assert_oracle(leaf, &doc, source, &requested);
+    }
+    assert_eq!(request.total_work().copied_source_bytes, 0);
+    assert_eq!(request.total_work().parser_input_bytes, 0);
+    assert_eq!(request.total_work().allocated_source_capacity, 0);
 }
 
 #[test]
@@ -127,21 +954,233 @@ fn production_leaf_giant_line_has_finite_runs_without_copy_or_parser_input() {
             MarkdownPresentationStyles::FENCED_CODE
         );
     }
-    assert!(request.leaf_semantic.is_none());
     assert_eq!(request.total_work().copied_source_bytes, 0);
     assert_eq!(request.total_work().parser_input_bytes, 0);
     assert_eq!(request.total_work().allocated_source_capacity, 0);
 }
 
 #[test]
-fn production_leaf_forward_charges_old_pages_and_runs_without_retaining_old_publication() {
+/// 原首行物理空白与正文属于同一Root代码owner；Composer不能把可见缩进替换成语义空洞。
+fn production_indented_code_keeps_the_original_physical_prefix_in_semantic_coverage() {
+    let source = "outside\n\n    <u>中文😀</u>\n\n";
+    let (_directory, doc) = document(source);
+    let (_request, sources) = leaf_sources(&doc, 0..doc.utf16_len());
+    let leaf = sources
+        .records
+        .iter()
+        .find_map(|record| match record.as_ref() {
+            SourceRecord::Leaf(leaf) if leaf.kind() == LeafBlockKind::IndentedCode => Some(leaf),
+            _ => None,
+        })
+        .expect("真实Global必须识别缩进代码块");
+    assert_eq!(leaf.physical_start(), 9);
+    assert_eq!(leaf.source_range().start, 13);
+    assert_eq!(leaf.block.scope_depth(), 0);
+    let MarkdownOrdinarySemanticState::RootLeafReady(ready) = &sources.semantic else {
+        panic!("普通Root和缩进代码应完成真实有限语义");
+    };
+    for position in 9..13 {
+        assert_eq!(
+            ready
+                .query_for(&doc, authority(&doc), position)
+                .unwrap()
+                .expect("Composer实际请求的原四格缩进不能成为未授权空洞")
+                .styles,
+            MarkdownPresentationStyles::default()
+        );
+    }
+}
+
+#[test]
+/// 请求只碰首行前缀时仍需原Root代码票；范围剪裁和Tab不能丢字符、借邻块或越过默认样式。
+fn production_root_code_prefix_clipping_matches_the_original_parser_without_copying() {
+    for (source, prefix) in [
+        ("outside\n\n    <u>中文😀</u>\n\n", 9..13),
+        ("outside\n\n  ```text\n<u>中文😀</u>\n  ```\n\n", 9..11),
+        ("outside\r\n\r\n\t<u>中文😀</u>\r\n\r\n", 11..12),
+    ] {
+        let (_directory, doc) = document(source);
+        let prefix = units(source, prefix);
+        let mut baseline = MarkdownViewportPresentation::default();
+        baseline.set_active_selection(ordered_selection(doc.selection()));
+        baseline
+            .rebuild(doc.generation(), 0..doc.utf16_len(), source)
+            .unwrap();
+        for requested in [
+            0..doc.utf16_len(),
+            prefix.clone(),
+            prefix.end - 1..prefix.end,
+        ] {
+            let (request, sources) = leaf_sources(&doc, requested.clone());
+            let MarkdownOrdinarySemanticState::RootLeafReady(ready) = &sources.semantic else {
+                panic!("首行物理前缀必须沿原Root代码来源完成");
+            };
+            for position in prefix.start.max(requested.start)..prefix.end.min(requested.end) {
+                let query = ready
+                    .query_for(&doc, authority(&doc), position)
+                    .unwrap()
+                    .expect("视口内真实缩进字符没有语义覆盖");
+                assert_eq!(query.styles, MarkdownPresentationStyles::default());
+                assert_eq!(query.styles, baseline.query(position).unwrap().styles);
+            }
+            assert_eq!(request.total_work().copied_source_bytes, 0);
+            assert_eq!(request.total_work().parser_input_bytes, 0);
+            assert_eq!(request.total_work().allocated_source_capacity, 0);
+        }
+    }
+}
+
+#[test]
+fn production_underline_probe_restores_future_code_facts_for_the_same_forward_owner() {
+    let source = "<u>外部开标签\r\n\r\n标题一😀\r\n===\r\n\r\n```text\r\n</u><u>代码😀\r\n```\r\n\r\n标题二\r\n---\r\n\r\n    </u><u>缩进代码\r\n\r\n标题三\r\n===\r\n\r\n外部真关闭</u>\r\n";
+    let (_directory, doc) = document(source);
+    let options =
+        crate::markdown_viewport_presentation::parser::markdown_presentation_options(true);
+    // 独立完整Parser只用于这个有限夹具；后继四个范围必须由原生产Global重新交付，不能缓存前探Fact。
+    let ranges = Parser::new_ext(source, options)
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            matches!(event, Event::Start(Tag::Heading { .. } | Tag::CodeBlock(_)))
+                .then(|| units(source, range))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ranges.len(), 5);
+    let (mut request, mut previous) = leaf_sources(&doc, ranges[0].clone());
+    let global = request.batch.source_probe_state().0;
+    for (index, requested) in ranges.iter().enumerate() {
+        if index != 0 {
+            // 主来源仍从原恢复点继续；前探中已读过的代码块不能变成缺失来源或被替换成普通段落。
+            request
+                .continue_forward(&doc, &previous, requested.clone(), authority(&doc))
+                .unwrap();
+            finish_sources(&mut request, &doc).unwrap();
+            previous = request
+                .take_sources_for(&doc, authority(&doc))
+                .unwrap()
+                .unwrap();
+        }
+        let ready = match &previous.semantic {
+            MarkdownOrdinarySemanticState::RootLeafReady(ready) => ready,
+            MarkdownOrdinarySemanticState::LeafPending(reason) => {
+                panic!("视口{index}原Root来源仍未完成：{reason:?}")
+            }
+            _ => panic!("视口{index}没有原Root语义结果"),
+        };
+        assert_oracle(ready, &doc, source, requested);
+        assert_eq!(request.batch.source_probe_state().0, global);
+        assert!(
+            !request
+                .batch
+                .source_global_mut()
+                .unwrap()
+                .semantic_boundary_retained()
+        );
+        assert_eq!(request.total_work().copied_source_bytes, 0);
+        assert_eq!(request.total_work().parser_input_bytes, 0);
+        assert_eq!(request.total_work().allocated_source_capacity, 0);
+    }
+}
+
+#[test]
+fn production_underline_probe_source_reclaim_failure_releases_the_saved_global_and_scratch() {
     let source = format!(
-        "前言\n\n```text\n{}\n```\n\n尾\n",
-        "<u>中文😀</u>".repeat(160)
+        "<u>原开标签\n\n标题😀\n===\n\n{}\n\n原真关闭</u>\n",
+        "中".repeat(100_000)
     );
+    let heading = source.find("标题").unwrap();
+    let requested = units(&source, heading..heading + "标题😀\n===\n".len());
     let (_directory, doc) = document(&source);
-    let block = units(&source, first_leaf_range(&source));
-    let first_range = block.start + 50..block.start + 700;
+    let observer = doc.original_backing_observer().unwrap();
+    let mut request = doc
+        .viewport_leaf_source_request(requested, 57, doc.selection())
+        .unwrap();
+    while !request
+        .batch
+        .source_global_mut()
+        .unwrap()
+        .semantic_boundary_retained()
+    {
+        let MarkdownViewportSourceStep::Progress { work } =
+            request.advance(&doc, authority(&doc), 4096).unwrap()
+        else {
+            panic!("远端close尚未证明，不能先发布语义");
+        };
+        assert_step(work);
+    }
+    // 已真实创建主恢复点，再让后继换页归还失败；不是直接伪造业务错误或把取消当作I/O。
+    let attempts = observer.reclaim_attempts();
+    observer.fail_next_reclaim_for_test();
+    let error = loop {
+        match request.advance(&doc, authority(&doc), 4096) {
+            Ok(MarkdownViewportSourceStep::Progress { work }) => assert_step(work),
+            Ok(MarkdownViewportSourceStep::SourcesAvailable { .. }) => {
+                panic!("未完成真实回收不能取得Ready")
+            }
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(
+        error,
+        MarkdownTableRequestError::Source(
+            crate::MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
+        )
+    );
+    assert!(observer.reclaim_attempts() > attempts);
+    assert_eq!(observer.first_errno(), Some(libc::EIO));
+    assert!(request.leaf_semantic.is_none() && request.semantic.is_none());
+    assert!(request.batch.source_global_mut().is_err());
+    assert_eq!(
+        request.advance(&doc, authority(&doc), 4096).err(),
+        Some(error)
+    );
+    drop(request);
+    drop(doc);
+    assert_eq!(observer.mapped_bytes(), 0);
+    assert_eq!(observer.managed_resident_bytes(), 0);
+}
+
+#[test]
+fn production_cancel_during_underline_probe_releases_the_main_boundary_without_poisoning_source() {
+    let source = format!(
+        "<u>开标签\n\n标题\n===\n\n{}\n\n真关闭</u>\n",
+        "中".repeat(100_000)
+    );
+    let heading = source.find("标题").unwrap();
+    let requested = units(&source, heading..heading + "标题\n===\n".len());
+    let (_directory, doc) = document(&source);
+    let observer = doc.original_backing_observer().unwrap();
+    let mut request = doc
+        .viewport_leaf_source_request(requested, 57, doc.selection())
+        .unwrap();
+    while !request
+        .batch
+        .source_global_mut()
+        .unwrap()
+        .semantic_boundary_retained()
+    {
+        request.advance(&doc, authority(&doc), 4096).unwrap();
+    }
+    // 取消属于整个来源owner，必须同时结束前探与主恢复义务；原健康文档仍可供后继请求读取。
+    request.cancel();
+    assert!(request.batch.source_global_mut().is_err());
+    assert!(request.leaf_semantic.is_none() && request.semantic.is_none());
+    assert_eq!(
+        request.advance(&doc, authority(&doc), 4096).err(),
+        Some(MarkdownTableRequestError::Cancelled)
+    );
+    assert_eq!(observer.first_errno(), None);
+    assert!(doc.original_backing_health().is_ok());
+    drop(request);
+    drop(doc);
+    assert_eq!(observer.mapped_bytes(), 0);
+    assert_eq!(observer.managed_resident_bytes(), 0);
+}
+
+#[test]
+fn production_leaf_forward_charges_old_pages_and_runs_without_retaining_old_publication() {
+    let (source, expected) = code_page_fixture(40);
+    let (_directory, doc) = document(&source);
+    let first_range = 0..expected[29].end;
     let (mut request, previous) = leaf_sources(&doc, first_range.clone());
     let MarkdownOrdinarySemanticState::RootLeafReady(old) = &previous.semantic else {
         panic!("旧来源必须有真实页和 run");
@@ -160,7 +1199,7 @@ fn production_leaf_forward_charges_old_pages_and_runs_without_retaining_old_publ
         global, 0,
         "必须实际保留原结构前沿，两个空槽不能证明同一 Global"
     );
-    let next = block.start + 100..block.start + 900;
+    let next = expected[10].start..expected[39].end;
     request
         .continue_forward(&doc, &previous, next.clone(), authority(&doc))
         .unwrap();
@@ -174,7 +1213,6 @@ fn production_leaf_forward_charges_old_pages_and_runs_without_retaining_old_publ
     );
     finish_sources(&mut request, &doc).unwrap();
     assert_eq!(request.batch.source_probe_state().0, global);
-    assert!(request.leaf_semantic.is_none());
     let next_sources = request
         .take_sources_for(&doc, authority(&doc))
         .unwrap()
@@ -182,8 +1220,8 @@ fn production_leaf_forward_charges_old_pages_and_runs_without_retaining_old_publ
     let MarkdownOrdinarySemanticState::RootLeafReady(ready) = &next_sources.semantic else {
         panic!("原 Global 续批必须完成同源代码交集");
     };
-    assert_oracle(ready, &doc, &source, &next);
-    assert_oracle(old, &doc, &source, &first_range);
+    super::partial::assert_partial_oracle(&source, &doc, ready, next.clone(), &expected[10..]);
+    super::partial::assert_partial_oracle(&source, &doc, old, first_range, &expected[..30]);
     // 后继只共享原 immutable Leaf 记录；不保父 SourcePublication 链或旧 Ready 的页。
     drop(previous);
     assert!(old_publication.upgrade().is_none());
@@ -288,30 +1326,20 @@ fn production_leaf_edit_undo_and_cancel_cannot_reauthorize_same_root_or_keep_doc
 }
 
 #[test]
-fn production_leaf_unknown_scope_inline_and_false_eof_never_become_ready() {
+fn production_leaf_unsupported_scope_and_general_inline_never_become_ready() {
+    // giant强调已接原规则；未知范围保留尚未接通的真实 giant link。
+    let complex = format!(
+        "只有**{}**，[未知链接](https://example.com)，没有已证代码或分隔线\n",
+        "复杂行内正文".repeat(140)
+    );
     for (source, whole_document, expected) in [
         (
-            "> ```\n> 中文\n> ```\n\n尾\n",
+            "> ***\n\n尾\n",
             false,
             MarkdownRootLeafPendingReason::NonRootScope,
         ),
         (
-            "````\n正文\n```",
-            false,
-            MarkdownRootLeafPendingReason::LegacyFenceBoundaryMismatch,
-        ),
-        (
-            "```\n正文\n~~~",
-            false,
-            MarkdownRootLeafPendingReason::LegacyFenceBoundaryMismatch,
-        ),
-        (
-            "```\n正文\n```不是closer",
-            false,
-            MarkdownRootLeafPendingReason::LegacyFenceBoundaryMismatch,
-        ),
-        (
-            "只有**复杂行内正文**，没有已证代码或分隔线\n",
+            complex.as_str(),
             true,
             MarkdownRootLeafPendingReason::NeedsGeneralInline,
         ),
@@ -345,9 +1373,12 @@ fn production_joint_plain_blocks_keep_exact_ranges_and_original_leaf_identity() 
     let first = "中文普通段落😀。\r\n第二行仍是普通文本。\r\n";
     let setext = "第二个普通闭合块😀\n=====\n";
     let last = "末段中文与 emoji 😀。\n";
-    let source = format!(
-        "# 标题\n\n{first}\r\n{setext}\n**复杂正文仍未知**\n\n```text\n代码\n```\n\n{last}"
+    let complex = format!(
+        "**复杂正文仍未知{}** [未知链接](https://example.com)",
+        "中".repeat(700)
     );
+    let source =
+        format!("# 标题\n\n{first}\r\n{setext}\n{complex}\n\n```text\n代码\n```\n\n{last}");
     let (_directory, doc) = document(&source);
     let requested = 0..doc.utf16_len();
     let (request, sources) = leaf_sources(&doc, requested.clone());
@@ -397,7 +1428,6 @@ fn production_joint_plain_blocks_keep_exact_ranges_and_original_leaf_identity() 
             .unwrap()
             .is_none()
     );
-    assert!(request.leaf_semantic.is_none());
     assert_eq!(request.total_work().copied_source_bytes, 0);
     assert_eq!(request.total_work().parser_input_bytes, 0);
     assert_eq!(request.total_work().allocated_source_capacity, 0);
@@ -495,7 +1525,7 @@ fn joint_bounds_coalesce_short_endpoints_inside_original_quantum() {
     assert!(!job.preparing());
     assert_eq!(job.position_index, 4);
     assert_eq!(job.byte_coverage, Some(6..10));
-    assert_eq!(job.selection_bytes, 22..25);
+    assert_eq!(job.selection_bytes, Some(22..25));
     assert!(request.ready.is_none());
     assert_eq!(
         request.batch.source_probe_state().1,
@@ -572,7 +1602,7 @@ fn joint_bounds_long_prefix_remains_pending_and_reclaims_source_errors() {
         let job = request.leaf_semantic.as_ref().unwrap();
         assert!(!job.preparing());
         assert_eq!(job.byte_coverage, Some(0..2));
-        assert_eq!(job.selection_bytes, 3000..3001);
+        assert_eq!(job.selection_bytes, Some(3000..3001));
         assert_eq!(request.batch.source_probe_state().1, 0);
     }
 }
@@ -626,7 +1656,7 @@ fn joint_bounds_reuse_actual_piece_prefixes_with_far_selection_and_preserve_fail
         let job = request.leaf_semantic.as_ref().unwrap();
         assert!(!job.preparing());
         assert_eq!(job.byte_coverage, Some(161..501));
-        assert_eq!(job.selection_bytes, 31215..31226);
+        assert_eq!(job.selection_bytes, Some(31215..31226));
         assert_eq!(request.batch.source_probe_state().1, 0);
         let mut independent_bytes = 0;
         for (target, ceil) in [(161, false), (501, true), (31215, false), (31226, true)] {

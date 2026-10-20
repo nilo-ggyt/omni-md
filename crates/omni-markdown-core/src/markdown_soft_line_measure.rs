@@ -186,6 +186,8 @@ struct Payload {
     advance: i64,
     fitting: Option<Fit>,
     selected: Option<MarkdownSoftLineMeasureChoice>,
+    #[cfg(feature = "paged-line-compose")]
+    folded_boundary: Option<usize>,
     #[cfg(feature = "paged-shaping-frontier")]
     word_probe: Option<frontier::WordClusterProbe>,
     #[cfg(feature = "paged-shaping-frontier")]
@@ -381,6 +383,8 @@ impl MarkdownSoftLineMeasureJob {
                 advance: 0,
                 fitting: None,
                 selected: None,
+                #[cfg(feature = "paged-line-compose")]
+                folded_boundary: None,
                 #[cfg(feature = "paged-shaping-frontier")]
                 word_probe: None,
                 #[cfg(feature = "paged-shaping-frontier")]
@@ -536,6 +540,68 @@ impl MarkdownSoftLineMeasureJob {
         } // 字体、词典、未完成和NeedNextItem都不能借该入口变成已解决的软行。
     }
 
+    /// 已选整行完全属于同Store的较早item时，恢复它的真实Font/来源作为重排锚点。
+    /// 调用方须先用当前provider取得resolution_permit；交接只借同一个Store一次，绝不拼造跨item正文。
+    #[cfg(feature = "paged-line-compose")]
+    pub(crate) fn restore_selected_item(
+        &mut self,
+        previous: &mut dyn GlyphProvider,
+        previous_font: &MarkdownLayoutFontAuthority,
+    ) -> Result<()> {
+        let result = (|| {
+            self.require_live_line()?;
+            self.require_resolution()?;
+            let profile = previous.require(&self.source, previous_font)?;
+            if !matches!(self.origin, provider::GlyphProviderOrigin::Stored { .. })
+                || !self.origin.same_provider_family(&profile.origin)
+            {
+                return Err(MarkdownSoftLineMeasureError::JobMismatch);
+            } // 只有原Store的真实旧目录可交接；同源另一个Store和任意Job均没有此权限。
+            let payload = self
+                .payload
+                .as_ref()
+                .ok_or(MarkdownSoftLineMeasureError::Poisoned)?;
+            let selected = match payload.selected.as_ref() {
+                Some(MarkdownSoftLineMeasureChoice::NeedsEmergencyBreak(value)) => {
+                    &value.source_utf16
+                }
+                Some(MarkdownSoftLineMeasureChoice::NeedsReshape { source_utf16, .. }) => {
+                    source_utf16
+                }
+                #[cfg(feature = "paged-shaping-frontier")]
+                Some(MarkdownSoftLineMeasureChoice::NeedsFrontierEmergencyPrefix {
+                    source_utf16,
+                    ..
+                }) => source_utf16,
+                _ => return Err(MarkdownSoftLineMeasureError::InvalidRequest),
+            };
+            if selected.start != self.start
+                || selected.is_empty()
+                || selected.start < profile.source_utf16.start
+                || selected.end > profile.source_utf16.end
+                || profile.source_utf16.end > self.item.start
+                || profile.generation != self.generation
+            {
+                return Err(MarkdownSoftLineMeasureError::InvalidRequest);
+            } // 只支持选中范围完整落在这一个真实旧item；跨Font/Script的组合范围仍需自己的组合能力。
+            #[cfg(feature = "paged-safe-glyph-slices")]
+            {
+                self.proof_revoked.store(true, Ordering::Release);
+                self.proof_revoked = Arc::new(AtomicBool::new(false));
+            } // 旧current-item票撤销，整行nonce、选择、宽度和alive不变，不能重新签一张独立Measure。
+            self.font = previous_font.clone();
+            self.origin = profile.origin;
+            self.glyph_count = profile.glyphs;
+            self.direction = profile.direction;
+            self.item = profile.source_utf16;
+            self.guard_provider(previous)
+        })();
+        if let Err(error) = &result {
+            self.fail(error);
+        }
+        result
+    }
+
     /// 在明确请求后继item时继续原软行；方向、字体或样式的边界不会重置原累计宽度。
     ///
     /// 两个真实Ready任务必须在同一Source上严格相邻。原任务只借本次核验，成功后不再
@@ -605,6 +671,8 @@ impl MarkdownSoftLineMeasureJob {
             self.require_next_item()?;
             breaks.require_source(&self.source)?;
             let profile = next.require(&self.source, next_font)?;
+            #[cfg(feature = "paged-line-compose")]
+            let folded = next.folded_section();
             if !self.origin.same_provider_family(&profile.origin) {
                 return Err(MarkdownSoftLineMeasureError::JobMismatch);
             } // Store目录只在原同一个Store内交接；同源的第二文件不是已认证历史的延续。
@@ -626,6 +694,13 @@ impl MarkdownSoftLineMeasureJob {
             {
                 return Err(MarkdownSoftLineMeasureError::InvalidRequest);
             } // 真实全局相邻坐标不得有缺口或重叠，item末尾仍不等于段落EOF。
+            #[cfg(feature = "paged-line-compose")]
+            if folded
+                .as_ref()
+                .is_some_and(|hidden| hidden != &range || profile.glyphs != 0)
+            {
+                return Err(MarkdownSoftLineMeasureError::InvalidRequest);
+            } // 隐区只能由同 Store 的真实零 glyph 控制签入，普通 shaping item 没有跳读权限。
             self.require_live_line()?;
             #[cfg(feature = "paged-safe-glyph-slices")]
             {
@@ -648,6 +723,28 @@ impl MarkdownSoftLineMeasureJob {
                 .as_mut()
                 .ok_or(MarkdownSoftLineMeasureError::Poisoned)?
                 .selected = None;
+            #[cfg(feature = "paged-line-compose")]
+            if let Some(hidden) = folded {
+                // 已测 header 的累计宽度保持原值；跳过隐区内部的原机会，但必须查询其真实
+                // 末端 Mandatory。后继 cluster flags 仍走原 NeedNextItem/SelectedPermit 链。
+                let payload = self
+                    .payload
+                    .as_mut()
+                    .ok_or(MarkdownSoftLineMeasureError::Poisoned)?;
+                payload.cursor = Some(breaks.cursor(
+                    MarkdownLayoutBreakUnit::Utf16,
+                    hidden.end,
+                    MarkdownLayoutBreakQuery::At,
+                )?);
+                payload.candidate = None;
+                payload.next_query = hidden.start;
+                payload.scan = hidden.end;
+                payload.folded_boundary = Some(hidden.end);
+                #[cfg(feature = "paged-shaping-frontier")]
+                {
+                    payload.word_safe = None;
+                }
+            }
             // cursor、候选、累计advance及last fitting不变。接缝的真实后继cluster flags
             // 仍在下一step中读取，不把item切分位置当安全断点。
             self.guard_provider(next)
@@ -867,6 +964,13 @@ impl MarkdownSoftLineMeasureJob {
                         {
                             return Err(MarkdownSoftLineMeasureError::InconsistentCoverage);
                         }
+                        #[cfg(feature = "paged-line-compose")]
+                        if let Some(end) = payload.folded_boundary.take()
+                            && (candidate.utf16 != end
+                                || candidate.kind != MarkdownLineBreakKind::Mandatory)
+                        {
+                            return Err(MarkdownSoftLineMeasureError::InconsistentCoverage);
+                        } // 显式隐藏意图也不能把非换段坐标伪装成 Mandatory 或文档 EOF。
                         payload.cursor = None;
                         payload.candidate = Some(candidate);
                     }
@@ -936,8 +1040,15 @@ impl MarkdownSoftLineMeasureJob {
                 payload.scan = value.source_utf16.end;
                 continue;
             }
+            #[cfg(feature = "paged-line-compose")]
+            let paragraph_control = candidate.kind == MarkdownLineBreakKind::Mandatory
+                && provider.ends_paragraph_control();
+            #[cfg(not(feature = "paged-line-compose"))]
+            let paragraph_control = false;
             if candidate.utf16 > self.item.end
-                || (candidate.utf16 == self.item.end && self.item.end != payload.source.utf16_len())
+                || (candidate.utf16 == self.item.end
+                    && self.item.end != payload.source.utf16_len()
+                    && !paragraph_control)
             {
                 if payload.advance > self.width
                     && let Some(fit) = payload.fitting.take()
@@ -967,7 +1078,7 @@ impl MarkdownSoftLineMeasureJob {
                     _ => return Err(MarkdownSoftLineMeasureError::InconsistentCoverage),
                 }
             } else {
-                (0, target..target) // 仅实际文档EOF；item末尾即使是mandatory也没有原后继flags证明。
+                (0, target..target) // 真实 EOF 或原 zero-glyph 段落控制末端；普通 glyph item 仍要求真实后继 flags。
             };
             let fit = Fit {
                 measured: MarkdownSoftLineMeasuredBreak {

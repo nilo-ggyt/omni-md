@@ -8,7 +8,7 @@ use std::cell::OnceCell;
 #[derive(Debug)]
 pub enum NativeMarkdownPagedCloseFailure {
     View(NativeMarkdownPagedTextViewError),
-    #[cfg(feature = "native-paged-body-probe")]
+    #[cfg(feature = "native-paged-production")]
     Body(crate::native_surface::paged_body::NativeMarkdownPagedBodyError),
     ViewClose(Rc<NativeMarkdownPagedCloseReceipt>),
 }
@@ -18,7 +18,7 @@ pub enum NativeMarkdownPagedCloseFailure {
 pub struct NativeMarkdownPagedCloseReceipt {
     cohort: RefCell<NativeMarkdownDeallocationCohort>,
     pixels: RefCell<Vec<NativeMarkdownViewportPixelObserver>>,
-    #[cfg(feature = "native-paged-body-probe")]
+    #[cfg(feature = "native-paged-production")]
     gutter: OnceCell<crate::native_surface::gutter::paged::PagedGutterRelease>,
     failure: OnceCell<NativeMarkdownPagedCloseFailure>,
     sealed: Cell<bool>,
@@ -40,7 +40,7 @@ impl NativeMarkdownPagedCloseReceipt {
         Rc::new(Self {
             cohort: RefCell::new(NativeMarkdownDeallocationCohort::new(mtm)),
             pixels: RefCell::new(Vec::new()),
-            #[cfg(feature = "native-paged-body-probe")]
+            #[cfg(feature = "native-paged-production")]
             gutter: OnceCell::new(),
             failure: OnceCell::new(),
             sealed: Cell::new(false),
@@ -68,7 +68,7 @@ impl NativeMarkdownPagedCloseReceipt {
     }
 
     /// 行号只有一个真实装配槽；实际像素仍归原cohort，缓存Native空壳由具体typed Weak核载荷。
-    #[cfg(feature = "native-paged-body-probe")]
+    #[cfg(feature = "native-paged-production")]
     pub(in crate::native_surface) fn track_gutter(
         &self,
         gutter: crate::native_surface::gutter::paged::PagedGutterRelease,
@@ -113,7 +113,7 @@ impl NativeMarkdownPagedCloseReceipt {
         self.verify_resources_released()?;
         match self.failure.get() {
             Some(NativeMarkdownPagedCloseFailure::View(error)) => Err(error.to_string()),
-            #[cfg(feature = "native-paged-body-probe")]
+            #[cfg(feature = "native-paged-production")]
             Some(NativeMarkdownPagedCloseFailure::Body(error)) => Err(error.to_string()),
             Some(NativeMarkdownPagedCloseFailure::ViewClose(view)) => view.verify_released(),
             None => Ok(()),
@@ -130,7 +130,7 @@ impl NativeMarkdownPagedCloseReceipt {
                 return Err(format!("原正文像素没有真实归还：{:?}", pixels.snapshot()));
             }
         }
-        #[cfg(feature = "native-paged-body-probe")]
+        #[cfg(feature = "native-paged-production")]
         if let Some(gutter) = self.gutter.get() {
             gutter.verify_released()?;
         } // 原像素已经实际归还后，仍须证明活着的框架空壳没有项目载荷、回调或图层关系。

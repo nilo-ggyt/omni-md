@@ -1,187 +1,210 @@
-//! 原 Find 动作的巨型代码段背景验收；只保存原 Native Weak、文档 Weak 和有限源坐标。
+//! 原 Find 动作的长代码背景验收；取当前已发布分页视图的有限像素，不另画一张候选 Scene。
 
 use super::*;
-use crate::native_surface::preview_blocks::diagnostic::{
-    CodePaintReceipt, MAX_PROBE_CODE_REQUEST_UTF16, NativeMarkdownPreviewBlockProbeSnapshot,
-    code_paint_sequence, code_snapshot_matches, matching_code_paint, observe_code_paint,
+use crate::native_surface::paged_text_view::{
+    NativeMarkdownPagedSceneKey, NativeMarkdownPagedTextView,
 };
 
+/// 本次动作只保原视图弱身份、输入前 CPU 序号与一处固定源标记；没有正文、图像或 Reader 强边。
 pub(super) struct ExpectedCodePaint {
-    body: Rc<Weak<PieceBackedMarkdownTextView>>,
-    identity: WeakMarkdownDocument,
-    owner: usize,
-    generation: u64,
-    target: std::ops::Range<usize>,
-    after: u64,
+    view: Rc<Weak<NativeMarkdownPagedTextView>>,
     facts: MemoryWorkloadFacts,
     epoch: MemoryActionEpoch,
-    bound: RefCell<Option<NativeMarkdownPreviewBlockProbeSnapshot>>,
+    target: std::ops::Range<usize>,
+    after: usize,
+    bound: RefCell<Option<(NativeMarkdownPagedSceneKey, usize)>>,
     binding_started: Cell<bool>,
     failure: RefCell<Option<String>>,
 }
 
 impl ExpectedCodePaint {
-    /// 在原动作首 Native 之前固定 Weak 和序号；前次背景不能冒充本次 Find 的实际 paint。
+    /// 原三秒期限已经失败后，仅报告此前同步采样留下的有限事实；不重新取图或推进原请求。
+    pub(super) fn diagnose_deadline(&self) {
+        let failure = self.failure.borrow().clone();
+        let bound = self.bound.borrow().is_some();
+        eprintln!(
+            "native_memory_code_background_deadline binding_started={} original_frame_bound={bound} original_failure={failure:?}",
+            self.binding_started.get(),
+        );
+    }
+
+    /// 首个 Native 动作前固定原视图和实际 CPU 基线；旧帧不能冒充后一次 Find 的背景发布。
     pub(super) fn capture(
-        view: &Retained<PieceBackedMarkdownTextView>,
+        view: &NativeMarkdownPagedTextView,
         facts: &MemoryWorkloadFacts,
         epoch: MemoryActionEpoch,
         target: &std::ops::Range<usize>,
         current: &impl Fn() -> bool,
     ) -> Result<Self, String> {
-        let after = code_paint_sequence()?;
-        let end = target.start.checked_add(1).ok_or("代码背景目标范围溢出")?;
-        if end > target.end {
-            return Err("代码背景目标缺少实际首字符".into());
+        let start = target.end.checked_sub(1).ok_or("代码背景目标范围溢出")?;
+        if start < target.start {
+            return Err("代码背景目标缺少原固定中文末字符".into());
         }
-        let body = native_markdown_table_intent_step(current, || Weak::from_retained(view))
-            .map_err(|_| "代码背景原正文弱身份构造时已撤权")?;
+        let (_, after) = view
+            .probe_cpu_published_frame()
+            .ok_or("代码背景缺少原动作前 CPU 帧")?;
+        let view = native_markdown_table_intent_step(current, || Weak::from(view))
+            .map_err(|_| "代码背景原视图弱身份构造时已撤权")?;
         Ok(Self {
-            body: Rc::new(body),
-            identity: facts.document.clone(),
-            owner: std::ptr::from_ref(&**view).addr(),
-            generation: facts.generation,
-            target: target.start..end, // 原固定中文查询的首标量；不要求整个匹配一次出现在视口内。
-            after,
+            view: Rc::new(view),
             facts: facts.clone(),
             epoch,
+            // 固定夹具每次命中是十一字BMP中文，后面恰有一个不命中的等宽空格。
+            // 首字右侧仍在同一命中内，不能拿它要求代码底色；末字右侧才是真正未高亮的对照。
+            target: start..target.end,
+            after,
             bound: RefCell::new(None),
             binding_started: Cell::new(false),
             failure: RefCell::new(None),
         })
     }
 
-    /// 原Find终点之后只捕获一次背景准备，随后仅同一实际paint能通知原验证。
+    /// 原 Find 终点观察已包括同 Input 的完整 CPU 帧；此处只采这一帧，不等没有生产者的下一帧。
     pub(super) fn after_find_terminal(
         self: Rc<Self>,
-        request: Option<Rc<NativeMarkdownFindRevealRequest>>,
+        request: Rc<MemoryFindObservation>,
         observer: Box<dyn FnOnce()>,
     ) {
-        if self.binding_started.replace(true) {
-            self.reject("原代码背景终点不能重复绑定".to_owned());
-            observer();
-            return;
-        }
-        let Some(request) = request else {
-            self.reject("原Find终点票已释放，不能改用后继请求".to_owned());
-            observer();
-            return;
-        };
-        let completed = request.probe_completed();
-        if completed != Some(true) {
-            println!(
-                "native_code_paint_endpoint find_terminal={completed:?} background_binding=false"
-            );
-            self.reject("原Find没有真实成功终点，禁止等待背景paint".to_owned());
-            observer();
-            return;
-        }
-        let snapshot = with_active_native_markdown_surface(|surface| {
-            let current = || {
-                memory_workload_facts_current(surface, &self.facts)
-                    && self.epoch.permits(surface)
-                    && request.probe_completed() == Some(true)
-            };
-            self.snapshot(surface, &current)
-        }); // Native图与局部getter强claim均先归还，再安装纯弱等待或通知Host。
-        let snapshot = match snapshot {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.reject(error);
-                observer();
-                return;
+        let result: Result<(), String> = (|| {
+            if self.binding_started.replace(true) {
+                return Err("原代码背景终点不能重复绑定".into());
             }
-        };
-        *self.bound.borrow_mut() = Some(snapshot.clone()); // 仅这一次原终点可绑定，后继paint不能换票。
-        let after = self.after;
-        observe_code_paint(snapshot, after, move |successful| {
-            if !successful {
-                self.reject("原代码背景准备或视口已撤权，或实际绘制收据无效".to_owned());
+            request.completed()?;
+            let bound = with_active_native_markdown_surface(|surface| {
+                request.completed_at(surface)?;
+                let current = || {
+                    memory_workload_facts_current(surface, &self.facts)
+                        && self.epoch.permits(surface)
+                        && surface.editor.as_ref().is_some_and(|paged| {
+                            paged.body.presentation_mode() == request.mode
+                                && paged.text_view.input_state().ok() == Some(request.input)
+                        })
+                };
+                let result = self.snapshot(surface, &current)?;
+                // 完整帧的 Native/Source 核验放在有限采样前后；逐像素 current 只核原纯值权限，避免递归取景。
+                request.completed_at(surface)?;
+                Ok(result)
+            })?;
+            *self.bound.borrow_mut() = Some(bound);
+            Ok(())
+        })();
+        if let Err(cause) = result {
+            let mut failure = self.failure.borrow_mut();
+            if failure.is_none() {
+                *failure = Some(cause);
             }
-            observer(); // 实际paint返回/明确取消只提供一次原验证事件权限。
-        });
+        }
+        observer(); // 只回交同一个原终点；Host 的既有调度决定后继检查，不在这里推进事件队列。
     }
 
-    fn reject(&self, error: String) {
-        let mut failure = self.failure.borrow_mut();
-        if failure.is_none() {
-            *failure = Some(error); // 后来的清理或取消不能覆盖原失败。
-        }
-    }
-
-    /// 只取得当前同原body的有限准备事实；Native getter前后继续使用原Find权限。
+    /// 同原 Doc、Body、视图与 Preview 输入下读取实际画面；临时 Native claim 在同步栈归还。
     fn snapshot(
         &self,
         surface: &NativeMarkdownWindowSurface,
         current: &impl Fn() -> bool,
-    ) -> Result<NativeMarkdownPreviewBlockProbeSnapshot, String> {
-        let editor = surface.editor.as_ref().ok_or("代码背景验收缺少原编辑器")?;
-        let original = native_markdown_table_intent_step(current, || self.body.load())
-            .map_err(|_| "代码背景原正文弱引用读取时已撤权")?
-            .ok_or("代码背景的原正文已经释放")?;
-        let same_body = std::ptr::eq(&*original, &*editor.backend.text_view)
-            && std::ptr::from_ref(&*original).addr() == self.owner;
-        drop(original); // 不把 Native 强 claim 留到 cache getter 或下一事件；析构后再核原权限。
-        if !current() || !same_body {
-            return Err("代码背景当前正文不属于原 Find 动作".into());
+    ) -> Result<(NativeMarkdownPagedSceneKey, usize), String> {
+        if !current() {
+            return Err("代码背景原 Find 权限已失效".into());
         }
-        let snapshot = native_markdown_table_intent_step(current, || {
-            editor
-                .backend
-                .text_view
-                .preview_block_probe_snapshot(&self.target)
-        })
-        .map_err(|_| "代码背景 cache 观察时原 Find 权限已失效")?
-        .ok_or("原 Find 可见目标没有同批代码背景准备 cache")?;
-        if !WeakMarkdownDocument::ptr_eq(&snapshot.identity, &self.identity)
-            || snapshot.key.body_owner != self.owner
-            || snapshot.key.generation != self.generation
-            || snapshot.key.mode != MarkdownPresentationMode::InlinePreview
-            || snapshot.kind != NativeMarkdownPreviewBlockKind::Code as u8
-            || snapshot.fragment_source.len() <= MAX_PROBE_CODE_REQUEST_UTF16
-            || snapshot.semantic_window.is_empty()
-            || snapshot.semantic_window.len() > MAX_PROBE_CODE_REQUEST_UTF16
-            || snapshot.semantic_source.start > self.target.start
-            || self.target.end > snapshot.semantic_source.end
+        let editor = surface.editor.as_ref().ok_or("代码背景缺少原编辑器")?;
+        let paged = editor;
+        let original = native_markdown_table_intent_step(current, || self.view.load())
+            .map_err(|_| "代码背景原视图弱引用读取时已撤权")?
+            .ok_or("代码背景原视图已经释放")?;
+        let same = std::ptr::eq(&*original, &**paged.text_view)
+            && std::rc::Weak::ptr_eq(&self.facts.body, &Rc::downgrade(&paged.body));
+        drop(original);
+        if !same || !current() {
+            return Err("代码背景当前正文不属于原动作".into());
+        }
+        let sample = find_highlights::PixelSample::capture(
+            &paged.text_view,
+            &paged.body,
+            self.target.clone(),
+            current,
+        )?;
+        let (key, paints) = paged
+            .text_view
+            .probe_cpu_published_frame()
+            .ok_or("代码背景缺少已发布帧")?;
+        if !key.same(&sample.key)
+            || key.presentation_mode != MarkdownPresentationMode::InlinePreview
+            || key.request.input.generation != self.facts.generation
+            || paints <= self.after
         {
-            return Err("代码背景不是原巨型 fragment 的有限可见语义准备".into());
+            return Err("代码背景未来自本次原 Preview Find 后的真实完整 CPU 帧".into());
         }
-        Ok(snapshot)
+        // 调色板是实际产品外观契约；只有目标外侧真有底色且目标内有不同的字形墨迹才通过。
+        // 这不是检查 Rust 的 styles/cache：丢画背景、全透明 bitmap 或只显示单色都不能通过。
+        let expected = crate::native_surface::text_attributes::NATIVE_MARKDOWN_CODE_BACKGROUND;
+        let mut background = 0;
+        let mut ink_low = [f64::INFINITY; 3];
+        let mut ink_high = [f64::NEG_INFINITY; 3];
+        let mut ink_samples = 0;
+        for (color, inside) in sample.colors.iter().zip(sample.in_match) {
+            let near_background = color
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (*actual - expected).abs() <= 0.025);
+            if !inside && near_background {
+                background += 1;
+            }
+            if inside {
+                for channel in 0..3 {
+                    ink_low[channel] = ink_low[channel].min(color[channel]);
+                    ink_high[channel] = ink_high[channel].max(color[channel]);
+                }
+                ink_samples += 1;
+            }
+        }
+        let ink = ink_samples >= 4
+            && ink_low
+                .into_iter()
+                .zip(ink_high)
+                .any(|(low, high)| high - low > 0.12);
+        if background < 4 || !ink {
+            // 失败时只附原128点中的两端颜色与最后对照点的真实格式/颜色空间/原分量；
+            // 不再截屏、重画或改tag，也不以这些诊断替换原背景与墨迹判定。
+            let controls = || {
+                sample
+                    .colors
+                    .iter()
+                    .zip(sample.in_match)
+                    .filter(|(_, inside)| !inside)
+            };
+            let first_control = controls().next().map(|(color, _)| color);
+            let last_control = controls().next_back().map(|(color, _)| color);
+            return Err(format!(
+                "原代码目标没有真实底色或字形墨迹：background_samples={background} ink_samples={ink_samples} glyph_contrast={ink} first_control={first_control:?} last_control={last_control:?} expected={expected:?} color_diagnostic=({})",
+                sample.color_diagnostic
+            ));
+        }
+        if !current() {
+            return Err("代码背景实际像素归还后原动作已撤权".into());
+        }
+        Ok((key, paints))
     }
 
-    /// cache 只是准备证据；真正通过还需要原动作之后同 key/source/viewport 的实际绘图收据。
+    /// 绑定后仍须是同一原发布帧；同文本、后继查询或新视口都不能替换本次实际画面。
     pub(super) fn verify(
         &self,
         surface: &NativeMarkdownWindowSurface,
         current: &impl Fn() -> bool,
     ) -> Result<(), String> {
-        if let Some(error) = self.failure.borrow().clone() {
-            return Err(error);
+        if let Some(cause) = self.failure.borrow().clone() {
+            return Err(cause);
         }
         let bound = self
             .bound
             .borrow()
             .clone()
-            .ok_or("代码背景缺少原Find终点绑定")?;
-        let snapshot = self.snapshot(surface, current)?;
-        if !code_snapshot_matches(&bound, &snapshot) {
-            return Err("代码背景当前key、源或viewport已不属于原等待票".to_owned());
-        }
-        let paint: CodePaintReceipt = matching_code_paint(&bound, self.after)?
-            .ok_or("原 Find 的巨型代码背景尚无同 key、源与视口的真实绘图收据")?;
-        if !current() {
-            return Err("代码背景实际绘制收据读取后原权限已失效".into());
+            .ok_or("代码背景缺少原 Find 终点绑定")?;
+        let (key, paints) = self.snapshot(surface, current)?;
+        if !key.same(&bound.0) || paints != bound.1 {
+            return Err("代码背景当前 CPU 帧已不属于原终点".into());
         }
         println!(
-            "native_memory_code_background verified=true fragment_units={} semantic_request_units={} semantic_source_units={} paint_sequence={} paint_width={} paint_height={} viewport_width={} viewport_height={} same_native_owner=true same_source=true actual_paint_returned=true",
-            snapshot.fragment_source.len(),
-            snapshot.semantic_window.len(),
-            snapshot.semantic_source.len(),
-            paint.sequence,
-            paint.paint.size.width,
-            paint.paint.size.height,
-            snapshot.viewport.size.width,
-            snapshot.viewport.size.height,
+            "native_memory_code_background verified=true actual_paged_cpu_frame=true actual_view_pixels=true code_background=true glyph_ink=true finite_pixel_samples=128 same_native_owner=true same_source=true screen_present_verified=false"
         );
         Ok(())
     }

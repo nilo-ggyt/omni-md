@@ -22,7 +22,7 @@ struct CoreState {
 }
 
 impl CoreState {
-    fn read(surface: &NativeMarkdownEditorSurface) -> Result<Self, String> {
+    fn read(surface: &NativeMarkdownTextKitEditorSurface) -> Result<Self, String> {
         let document = surface.document().borrow();
         // revision读取失败不能形成CoreState；调用方必须传播错误或撤销原权限。
         Ok(Self {
@@ -45,7 +45,7 @@ impl CoreState {
 
 /// 原票只允许此次输入入口推进一代；失败后不领取新 capture 来观察旧动作的后果。
 struct Permission<'a> {
-    surface: &'a NativeMarkdownEditorSurface,
+    surface: &'a NativeMarkdownTextKitEditorSurface,
     capture: NativeMarkdownSelectionCapture,
     document: WeakMarkdownDocument,
     before: CoreState,
@@ -103,7 +103,7 @@ impl Permission<'_> {
 }
 
 /// 输入 primitive、最终成功与 autosave 都观察实际入口计数，不能以空 timer 推测未排队。
-fn input_counts(surface: &NativeMarkdownEditorSurface) -> [u64; 4] {
+fn input_counts(surface: &NativeMarkdownTextKitEditorSurface) -> [u64; 4] {
     let state = surface.backend.text_storage.ivars();
     [
         state.character_process_count.get(),
@@ -114,7 +114,7 @@ fn input_counts(surface: &NativeMarkdownEditorSurface) -> [u64; 4] {
 }
 
 /// 只用于已经建立“中😀文”及相对 1..3 选择的 Native9 小场景；失败不修复测试现场。
-pub(super) fn verify(surface: &NativeMarkdownEditorSurface) -> Result<(), String> {
+pub(super) fn verify(surface: &NativeMarkdownTextKitEditorSurface) -> Result<(), String> {
     // 只有显式隔离场景调用本函数；标量阶段让超时诊断保留真实最后进度，不输出候选。
     eprintln!("omni_input_capacity phase=verify_enter bytes={NATIVE9_DOCUMENT_MAX_BYTES}");
     let capture = surface

@@ -385,6 +385,7 @@ impl Store {
             self.poisoned = true;
             return Err(error.into());
         }
+        self.io.resources.page_loaded();
         self.cancellation.check()?; // 已完成真实IO，但取消后仍不发布新的页身份。
         page.number = number;
         page.used = self.clock;

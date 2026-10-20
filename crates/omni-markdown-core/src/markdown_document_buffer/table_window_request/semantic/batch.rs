@@ -7,12 +7,13 @@ use crate::markdown_viewport_presentation::table_window::{
 use std::rc::{Rc, Weak};
 
 mod required;
+use required::RequiredState;
 pub use required::{MarkdownTableViewportRequiredRowQuery, MarkdownTableViewportRequiredRowResult};
-use required::{RequiredPublication, RequiredState};
+pub(in crate::markdown_document_buffer::table_window_request) use required::{
+    RequiredLocation, RequiredPublication,
+};
 
-const MAX_RUNS: usize = 8192;
 const MAX_COLUMN_SLOTS: usize = 1024;
-const MAX_METADATA_BYTES: usize = 1024 * 1024;
 // 本层先保留最坏收尾额度，未使用的额度不能再伪记为已消耗转换。
 const SWEEP_CONTROL_RESERVE: usize = 1024;
 // 支付固定目标/结束事实检查、gap边界判断、至多一次票据/作业移交和phase更新。
@@ -48,11 +49,18 @@ pub enum MarkdownTableViewportCoverage {
         gap_index: usize,
         utf16_range: Range<usize>,
     },
+    /// 只证明真实物理行与 H/D 上下文；单格 inline 必须沿同请求另行完成。
+    Structure {
+        table_index: usize,
+        utf16_range: Range<usize>,
+    },
 }
 impl MarkdownTableViewportCoverage {
     pub fn utf16_range(&self) -> &Range<usize> {
         match self {
-            Self::Table { utf16_range, .. } | Self::Gap { utf16_range, .. } => utf16_range,
+            Self::Table { utf16_range, .. }
+            | Self::Gap { utf16_range, .. }
+            | Self::Structure { utf16_range, .. } => utf16_range,
         }
     }
 }
@@ -102,6 +110,7 @@ pub struct VerifiedMarkdownTableViewport {
     source: MarkdownTableSourceIdentity,
     requested: Range<usize>,
     windows: Vec<Rc<WindowRecord>>,
+    structures: Vec<Rc<MarkdownTableStructuralWindow>>,
     gaps: Vec<Rc<VerifiedMarkdownTableGap>>,
     coverage: Vec<MarkdownTableViewportCoverage>,
     budget: MarkdownTableViewportBudget,
@@ -111,6 +120,12 @@ pub struct VerifiedMarkdownTableViewport {
     required: Option<RequiredPublication>,
 }
 impl VerifiedMarkdownTableViewport {
+    /// 结构出口只借原票；没有投影 String、Parser 图或默认 inline 样式。
+    pub(in crate::markdown_document_buffer::table_window_request) fn structural_tables(
+        &self,
+    ) -> &[Rc<MarkdownTableStructuralWindow>] {
+        &self.structures
+    }
     fn check(&self, document: &MarkdownDocumentBuffer) -> Result<(), MarkdownTableRequestError> {
         self.source
             .is_current(document)
@@ -178,17 +193,31 @@ impl VerifiedMarkdownTableViewport {
         let mut tables = self
             .windows
             .iter()
-            .flat_map(|record| record.window.coverage.iter())
+            .flat_map(|record| record.window.coverage.iter().cloned())
             .peekable();
-        let mut gaps = self.gaps.iter().map(|gap| &gap.utf16).peekable();
+        let mut structures = self
+            .structures
+            .iter()
+            .flat_map(|ticket| (0..2).filter_map(move |index| structure_range(ticket, index)))
+            .peekable();
+        let mut gaps = self.gaps.iter().map(|gap| gap.utf16.clone()).peekable();
         let mut covered = required.start;
-        // 两个目录按真实源序归并。每个已保留范围只访问一次，未知洞立即拒绝，不造凸包。
-        while let Some(range) = match (tables.peek(), gaps.peek()) {
-            (Some(table), Some(gap)) if table.start <= gap.start => tables.next(),
-            (Some(_), Some(_)) | (None, Some(_)) => gaps.next(),
-            (Some(_), None) => tables.next(),
-            (None, None) => None,
-        } {
+        // 三个原目录按真实物理范围归并；结构票同样可证明覆盖，但省略 H context 或行间洞仍不能补齐。
+        // 这里只复制固定 Range 标量，不分配目录、不读取正文，也不把 clipped requested 当整行来源。
+        while let Some((_, kind)) = [
+            tables.peek().map(|range| (range.start, 0)),
+            structures.peek().map(|range| (range.start, 1)),
+            gaps.peek().map(|range| (range.start, 2)),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        {
+            let range = match kind {
+                0 => tables.next().unwrap(),
+                1 => structures.next().unwrap(),
+                _ => gaps.next().unwrap(),
+            };
             if range.end <= covered {
                 continue;
             }
@@ -218,6 +247,7 @@ enum BatchPhase {
     Project,
     Insert,
     PruneWindows,
+    PruneStructures,
     PruneGaps,
     Coverage,
     Ready,
@@ -240,10 +270,14 @@ pub struct MarkdownTableViewportRequest {
     index: usize,
     queries: Option<MarkdownTableReferenceQueries>,
     windows: Vec<Rc<WindowRecord>>,
+    source_structures: bool,
+    structures: Vec<Rc<MarkdownTableStructuralWindow>>,
     gaps: Vec<Rc<VerifiedMarkdownTableGap>>,
     coverage: Vec<MarkdownTableViewportCoverage>,
     coverage_window: usize,
     coverage_range: usize,
+    coverage_structure: usize,
+    coverage_structure_range: usize,
     coverage_gap: usize,
     covered_until: usize,
     prune_index: usize,
@@ -299,10 +333,14 @@ impl MarkdownDocumentBuffer {
                 quota.clone(),
             ))),
             windows: Vec::new(),
+            source_structures: false,
+            structures: Vec::new(),
             gaps: Vec::new(),
             coverage: Vec::new(),
             coverage_window: 0,
             coverage_range: 0,
+            coverage_structure: 0,
+            coverage_structure_range: 0,
             coverage_gap: 0,
             covered_until: viewport.start,
             prune_index: 0,
@@ -351,6 +389,7 @@ impl MarkdownTableViewportRequest {
             self.job_costs = Vec::new();
             self.queries = None;
             self.windows = Vec::new();
+            self.structures = Vec::new();
             self.gaps = Vec::new();
             self.coverage = Vec::new();
             self.ready = None;
@@ -477,12 +516,17 @@ impl MarkdownTableViewportRequest {
                     if matches!(job.phase, Phase::AwaitReferences) {
                         job.phase = Phase::Underline;
                     }
-                    work = step_work(job.advance_with_references(
-                        document,
-                        false,
-                        budget,
-                        self.queries.as_ref(),
-                    )?);
+                    work = step_work(
+                        job.advance_with_references(
+                            document,
+                            false,
+                            budget,
+                            self.queries.as_ref(),
+                            self.structure
+                                .as_mut()
+                                .and_then(|structure| structure.global.as_mut()),
+                        )?,
+                    );
                     if matches!(job.phase, Phase::Ready) {
                         let window = job
                             .take_ready_for(document)?
@@ -561,6 +605,31 @@ impl MarkdownTableViewportRequest {
                 } else {
                     self.prune_index = 0;
                     self.prune_keep = 0;
+                    self.phase = BatchPhase::PruneStructures;
+                }
+            }
+            BatchPhase::PruneStructures => {
+                if self.prune_index < self.structures.len() {
+                    let ticket = &self.structures[self.prune_index];
+                    if (0..2)
+                        .filter_map(|index| structure_range(ticket, index))
+                        .any(|range| intersects(&range, &self.viewport))
+                        || self
+                            .required
+                            .as_ref()
+                            .is_some_and(|required| required.keeps_structure(ticket))
+                    {
+                        self.records = add_budget(self.records, structural_budget(ticket))?;
+                        self.structures.swap(self.prune_keep, self.prune_index);
+                        self.prune_keep += 1;
+                    }
+                    self.prune_index += 1;
+                } else if self.structures.len() > self.prune_keep {
+                    work.structural_transitions = PRUNE_LAST_SPINE_COST;
+                    drop(self.structures.pop());
+                } else {
+                    self.prune_index = 0;
+                    self.prune_keep = 0;
                     self.phase = BatchPhase::PruneGaps;
                 }
             }
@@ -584,7 +653,7 @@ impl MarkdownTableViewportRequest {
             }
             BatchPhase::Coverage => {
                 // required结果只扫描当前有限句柄目录；把索引解析的上界单列进本层控制fuel。
-                work.structural_transitions += self.windows.len() * 2;
+                work.structural_transitions += (self.windows.len() + self.structures.len()) * 2;
                 self.advance_coverage(document)?;
             }
             BatchPhase::Ready | BatchPhase::Consumed => {
@@ -729,8 +798,13 @@ impl MarkdownTableViewportRequest {
                 done = true;
             }
             let cost = self.admit_ticket(&ticket)?;
-            self.job_costs.push(cost);
-            self.jobs.push(Some(self.semantic_job(ticket)));
+            if self.source_structures {
+                self.structures.reserve_exact(1);
+                self.structures.push(Rc::new(ticket)); // 原行票直接移交，巨行不进入 LineCopy 或完整 table Parser。
+            } else {
+                self.job_costs.push(cost);
+                self.jobs.push(Some(self.semantic_job(ticket)));
+            }
         }
         let structure = self.structure.as_ref().unwrap();
         let outside_header = structure
@@ -821,22 +895,30 @@ impl MarkdownTableViewportRequest {
         let cells = (ticket.body.len() + 1)
             .checked_mul(columns)
             .ok_or(MarkdownTableRequestError::WorkLimit)?;
-        let bytes = ticket
-            .body
-            .iter()
-            .try_fold(
-                ticket.header.separator_byte_end - ticket.header.header_byte_start,
-                |n, row| n.checked_add(row.byte_end - row.byte_start),
-            )
-            .ok_or(MarkdownTableRequestError::WorkLimit)?;
-        let units = ticket
-            .body
-            .iter()
-            .try_fold(
-                ticket.delimiter_utf16.end - ticket.header_utf16.start,
-                |n, row| n.checked_add(row.utf16_end - row.utf16_start),
-            )
-            .ok_or(MarkdownTableRequestError::WorkLimit)?;
+        let bytes = if self.source_structures {
+            0
+        } else {
+            ticket
+                .body
+                .iter()
+                .try_fold(
+                    ticket.header.separator_byte_end - ticket.header.header_byte_start,
+                    |n, row| n.checked_add(row.byte_end - row.byte_start),
+                )
+                .ok_or(MarkdownTableRequestError::WorkLimit)?
+        };
+        let units = if self.source_structures {
+            0
+        } else {
+            ticket
+                .body
+                .iter()
+                .try_fold(
+                    ticket.delimiter_utf16.end - ticket.header_utf16.start,
+                    |n, row| n.checked_add(row.utf16_end - row.utf16_start),
+                )
+                .ok_or(MarkdownTableRequestError::WorkLimit)?
+        };
         let cost = MarkdownTableViewportBudget {
             row_slots: rows,
             cells,
@@ -860,8 +942,13 @@ impl MarkdownTableViewportRequest {
             return Err(MarkdownTableRequestError::Window(Error::SourceLimit));
         }
         // 逻辑结构与最终cell/row/origin的保留容量先准入；source Strings随后由LineCopy逐行创建。
-        let metadata = rows
+        let metadata = if self.source_structures {
+            structural_budget(ticket).metadata_bytes
+                + std::mem::size_of::<Rc<MarkdownTableStructuralWindow>>()
+        } else {
+            rows
             * (std::mem::size_of::<TableRowFact>()
+                + std::mem::size_of::<VerifiedTableInlineRow>()
                 + std::mem::size_of::<
                     crate::markdown_viewport_presentation::table_window::MarkdownTableWindowRow,
                 >()
@@ -876,7 +963,8 @@ impl MarkdownTableViewportRequest {
             + std::mem::size_of::<WindowRecord>()
             + 2 * std::mem::size_of::<usize>()
             + std::mem::size_of::<Rc<WindowRecord>>()
-            + std::mem::size_of::<MarkdownTableViewportBudget>();
+            + std::mem::size_of::<MarkdownTableViewportBudget>()
+        };
         self.quota
             .admit_metadata(metadata)
             .map_err(MarkdownTableRequestError::Window)?;
@@ -888,7 +976,7 @@ impl MarkdownTableViewportRequest {
         MarkdownTableWindowRequest {
             source: self.source.clone(),
             batch: true,
-            quota: Some(self.quota.clone()),
+            quota: self.quota.clone(),
             structure: None,
             ticket: Some(ticket),
             scope_cursor: None,
@@ -922,11 +1010,26 @@ impl MarkdownTableViewportRequest {
             self.coverage_window += 1;
             self.coverage_range = 0;
         }
-        let table = self
-            .windows
-            .get(self.coverage_window)
-            .and_then(|record| record.window.coverage.get(self.coverage_range))
-            .cloned();
+        while self.coverage_structure < self.structures.len()
+            && structure_range(
+                &self.structures[self.coverage_structure],
+                self.coverage_structure_range,
+            )
+            .is_none()
+        {
+            self.coverage_structure += 1;
+            self.coverage_structure_range = 0;
+        }
+        let table = if self.source_structures {
+            self.structures
+                .get(self.coverage_structure)
+                .and_then(|ticket| structure_range(ticket, self.coverage_structure_range))
+        } else {
+            self.windows
+                .get(self.coverage_window)
+                .and_then(|record| record.window.coverage.get(self.coverage_range))
+                .cloned()
+        };
         let gap = self
             .gaps
             .get(self.coverage_gap)
@@ -938,12 +1041,23 @@ impl MarkdownTableViewportRequest {
         };
         let (range, part) = if take_table {
             let range = table.unwrap();
-            self.coverage_range += 1;
+            if self.source_structures {
+                self.coverage_structure_range += 1;
+            } else {
+                self.coverage_range += 1;
+            }
             (
                 range.clone(),
-                MarkdownTableViewportCoverage::Table {
-                    window_index: self.coverage_window,
-                    utf16_range: range,
+                if self.source_structures {
+                    MarkdownTableViewportCoverage::Structure {
+                        table_index: self.coverage_structure,
+                        utf16_range: range,
+                    }
+                } else {
+                    MarkdownTableViewportCoverage::Table {
+                        window_index: self.coverage_window,
+                        utf16_range: range,
+                    }
                 },
             )
         } else if let Some(range) = gap {
@@ -969,6 +1083,8 @@ impl MarkdownTableViewportRequest {
                         + self.coverage.len()
                             * std::mem::size_of::<MarkdownTableViewportCoverage>()
                         + self.windows.len() * std::mem::size_of::<Rc<WindowRecord>>()
+                        + self.structures.len()
+                            * std::mem::size_of::<Rc<MarkdownTableStructuralWindow>>()
                         + self.gaps.len() * std::mem::size_of::<Rc<VerifiedMarkdownTableGap>>(),
                     ..MarkdownTableViewportBudget::default()
                 },
@@ -984,6 +1100,7 @@ impl MarkdownTableViewportRequest {
                 source: self.source.clone(),
                 requested: self.viewport.clone(),
                 windows: std::mem::take(&mut self.windows),
+                structures: std::mem::take(&mut self.structures),
                 gaps: std::mem::take(&mut self.gaps),
                 coverage: std::mem::take(&mut self.coverage),
                 budget: self.budget,
@@ -1015,6 +1132,12 @@ impl MarkdownTableViewportRequest {
             MarkdownTableViewportCoverage::Gap { gap_index, .. } => {
                 MarkdownTableViewportCoverage::Gap {
                     gap_index,
+                    utf16_range: clipped,
+                }
+            }
+            MarkdownTableViewportCoverage::Structure { table_index, .. } => {
+                MarkdownTableViewportCoverage::Structure {
+                    table_index,
                     utf16_range: clipped,
                 }
             }
@@ -1055,11 +1178,113 @@ impl MarkdownTableViewportRequest {
         self.total
     }
 
+    /// 原来源发布被新目标接管后重放唯一Global；旧窗口只预扣同活库存，不复制内容或重发扫描fuel。
+    pub(in crate::markdown_document_buffer::table_window_request) fn reposition_source(
+        &mut self,
+        document: &MarkdownDocumentBuffer,
+        previous: &VerifiedMarkdownTableViewport,
+        viewport: Range<usize>,
+    ) -> Result<(), MarkdownTableRequestError> {
+        previous.check(document)?;
+        if !matches!(self.phase, BatchPhase::Consumed)
+            || !self
+                .last_publication
+                .as_ref()
+                .is_some_and(|last| last.ptr_eq(&Rc::downgrade(&previous.publication)))
+        {
+            return Err(MarkdownTableRequestError::PublicationSuperseded);
+        }
+        let quota = super::prefixes::BatchQuota::new(MAX_RUNS, MAX_METADATA_BYTES);
+        quota
+            .admit_retained(previous.retained.runs, previous.retained.metadata_bytes)
+            .and_then(|()| quota.admit_metadata(publication_metadata()))
+            .map_err(MarkdownTableRequestError::Window)?;
+        let structure = self.structure.as_mut().expect("来源发布保留唯一结构续体");
+        // 未作任何新源借用，仍先保真实mmap首错；相同revision不能替代原DocRoot健康。
+        document
+            .byte_offset_for_utf16(0)
+            .map_err(MarkdownTableRequestError::Source)?;
+        let work = structure
+            .global
+            .as_mut()
+            .expect("continuous来源保留原Global")
+            .restart_from_root(
+                GlobalSourceAuthority {
+                    current_revision: document.generation(),
+                    cancelled: false,
+                },
+                4096,
+            )
+            .map_err(MarkdownTableRequestError::Global)?;
+        structure.total.transitions = structure
+            .total
+            .transitions
+            .checked_add(work.transitions)
+            .ok_or(MarkdownTableRequestError::WorkLimit)?;
+        // 这些未发布派生值只属于旧目标；根重放会重新给出真实表头、math与ordinary Fact。
+        structure.viewport = viewport.clone();
+        structure.target = MarkdownTableWindowTarget::FirstTableInViewport;
+        structure.continuous_body_limit = None;
+        structure.pending = None;
+        structure.ordinary_pending = None;
+        structure.coordinates = None;
+        structure.current = None;
+        structure.math = None;
+        structure.ready = None;
+        structure.no_table = false;
+        structure.required_row_end = None;
+        self.jobs = Vec::new();
+        self.job_costs = Vec::new();
+        self.windows = Vec::new();
+        self.structures = Vec::new();
+        self.gaps = Vec::new();
+        self.coverage = Vec::new();
+        self.index = 0;
+        self.coverage_window = 0;
+        self.coverage_range = 0;
+        self.coverage_structure = 0;
+        self.coverage_structure_range = 0;
+        self.coverage_gap = 0;
+        self.covered_until = viewport.start;
+        self.prune_index = 0;
+        self.prune_keep = 0;
+        self.between_start = (0, 0);
+        self.active_header = None;
+        self.resume_boundary = (0, 0);
+        self.source_origin_floor = 0;
+        self.ready = None;
+        self.required = None;
+        self.pending_record = None;
+        self.last_publication = None;
+        self.records = MarkdownTableViewportBudget::default();
+        self.budget = MarkdownTableViewportBudget {
+            metadata_bytes: quota.metadata_used(),
+            ..Default::default()
+        };
+        self.queries = Some(MarkdownTableReferenceQueries::for_batch(Some(
+            quota.clone(),
+        )));
+        self.quota = quota;
+        self.viewport = viewport;
+        self.phase = BatchPhase::Sweep;
+        self.account_source_work(SemanticWork {
+            structural_transitions: work.transitions + SWEEP_CONTROL_RESERVE,
+            ..Default::default()
+        })
+    }
+
     /// 只有同模块的 opt-in 包装入口开启截留；原 table-only factory 与 advance 语义不变。
     pub(in crate::markdown_document_buffer::table_window_request) fn enable_source_capture(
         &mut self,
     ) {
         self.structure.as_mut().unwrap().capture_ordinary = true;
+    }
+
+    /// 原生分页只需要结构行；单格语义另沿同 Global 完成，不复制整行后才交出第一帧来源。
+    pub(in crate::markdown_document_buffer::table_window_request) fn enable_structural_tables(
+        &mut self,
+    ) {
+        self.source_structures = true;
     }
 
     pub(in crate::markdown_document_buffer::table_window_request) fn set_source_origin_floor(
@@ -1094,6 +1319,16 @@ impl MarkdownTableViewportRequest {
             global.map_or(0, GlobalFrontier::next_byte),
             self.quota.metadata_used(),
         )
+    }
+
+    /// 只短借原结构Global；语义前探在返回Ready前恢复它，不产生另一个源或初始化图。
+    pub(in crate::markdown_document_buffer::table_window_request) fn source_global_mut(
+        &mut self,
+    ) -> Result<&mut GlobalFrontier, MarkdownTableRequestError> {
+        self.structure
+            .as_mut()
+            .and_then(|structure| structure.global.as_mut())
+            .ok_or(MarkdownTableRequestError::InvalidRequest)
     }
 
     /// 来源内的串行语义 job 取得原批次同一份额度；不重建 quota、不退款或重发库存。
@@ -1174,6 +1409,7 @@ impl MarkdownTableViewportRequest {
         self.job_costs = Vec::new();
         self.queries = None;
         self.windows = Vec::new();
+        self.structures = Vec::new();
         self.gaps = Vec::new();
         self.coverage = Vec::new();
         self.ready = None;
@@ -1202,13 +1438,16 @@ impl MarkdownTableViewportRequest {
         {
             return Err(MarkdownTableRequestError::PublicationSuperseded);
         }
-        let records = previous.windows.iter().try_fold(
+        let mut records = previous.windows.iter().try_fold(
             MarkdownTableViewportBudget {
                 metadata_bytes: previous.gaps.len() * gap_metadata(),
                 ..MarkdownTableViewportBudget::default()
             },
             |sum, record| add_budget(sum, record.retained),
         )?;
+        for ticket in &previous.structures {
+            records = add_budget(records, structural_budget(ticket))?;
+        }
         let quota = super::prefixes::BatchQuota::new(MAX_RUNS, MAX_METADATA_BYTES);
         quota
             .admit_retained(previous.retained.runs, previous.retained.metadata_bytes)
@@ -1217,6 +1456,8 @@ impl MarkdownTableViewportRequest {
             .admit_metadata(
                 publication_metadata()
                     + previous.windows.len() * std::mem::size_of::<Rc<WindowRecord>>()
+                    + previous.structures.len()
+                        * std::mem::size_of::<Rc<MarkdownTableStructuralWindow>>()
                     + previous.gaps.len() * std::mem::size_of::<Rc<VerifiedMarkdownTableGap>>(),
             )
             .map_err(MarkdownTableRequestError::Window)?;
@@ -1228,6 +1469,7 @@ impl MarkdownTableViewportRequest {
             self.selection.clone(),
         )?;
         self.windows = previous.windows.clone();
+        self.structures = previous.structures.clone();
         self.gaps = previous.gaps.clone();
         self.budget = MarkdownTableViewportBudget {
             metadata_bytes: quota.metadata_used(),
@@ -1267,13 +1509,16 @@ impl MarkdownTableViewportRequest {
         self.check_extension(document, previous, &viewport)?;
         // 元数据只按仍同活的不可变载荷预扣，不恢复已经释放的旧 refs/underline 工作区。
         // 后缀收齐自身新 query 后仍需从源 0 做 first-wins 扫描；这里没有全局 refs 索引。
-        let records = previous.windows.iter().try_fold(
+        let mut records = previous.windows.iter().try_fold(
             MarkdownTableViewportBudget {
                 metadata_bytes: previous.gaps.len() * gap_metadata(),
                 ..MarkdownTableViewportBudget::default()
             },
             |sum, record| add_budget(sum, record.retained),
         )?;
+        for ticket in &previous.structures {
+            records = add_budget(records, structural_budget(ticket))?;
+        }
         let quota = super::prefixes::BatchQuota::new(MAX_RUNS, MAX_METADATA_BYTES);
         quota
             .admit_retained(previous.retained.runs, previous.retained.metadata_bytes)
@@ -1282,6 +1527,8 @@ impl MarkdownTableViewportRequest {
             .admit_metadata(
                 publication_metadata()
                     + previous.windows.len() * std::mem::size_of::<Rc<WindowRecord>>()
+                    + previous.structures.len()
+                        * std::mem::size_of::<Rc<MarkdownTableStructuralWindow>>()
                     + previous.gaps.len() * std::mem::size_of::<Rc<VerifiedMarkdownTableGap>>(),
             )
             .map_err(MarkdownTableRequestError::Window)?;
@@ -1309,10 +1556,13 @@ impl MarkdownTableViewportRequest {
         self.phase = BatchPhase::Sweep;
         self.index = 0;
         self.windows = windows;
+        self.structures = previous.structures.clone();
         self.gaps = gaps;
         self.coverage = Vec::new();
         self.coverage_window = 0;
         self.coverage_range = 0;
+        self.coverage_structure = 0;
+        self.coverage_structure_range = 0;
         self.coverage_gap = 0;
         self.covered_until = viewport.start;
         self.budget = MarkdownTableViewportBudget {
@@ -1410,6 +1660,8 @@ impl MarkdownTableViewportRequest {
         self.covered_until = viewport.start;
         self.coverage_window = 0;
         self.coverage_range = 0;
+        self.coverage_structure = 0;
+        self.coverage_structure_range = 0;
         self.coverage_gap = 0;
         self.prune_index = 0;
         self.prune_keep = 0;
@@ -1441,6 +1693,32 @@ fn intersects(left: &Range<usize>, right: &Range<usize>) -> bool {
 
 fn gap_metadata() -> usize {
     std::mem::size_of::<VerifiedMarkdownTableGap>() + 2 * std::mem::size_of::<usize>()
+}
+
+/// 结构票至多 H/D 与连续真实 body 两段；省略的 header context 不能贡献可见 flow 权限。
+fn structure_range(ticket: &MarkdownTableStructuralWindow, index: usize) -> Option<Range<usize>> {
+    if ticket.include_header && index == 0 {
+        return Some(ticket.header_utf16.start..ticket.delimiter_utf16.end);
+    }
+    if index != usize::from(ticket.include_header) {
+        return None;
+    }
+    Some(ticket.body.first()?.utf16_start..ticket.body.last()?.utf16_end)
+}
+
+/// 只计真正保留的原行、数学与 scope 句柄；没有复制源，因此不挪用完整 Parser 的源输入额度。
+fn structural_budget(ticket: &MarkdownTableStructuralWindow) -> MarkdownTableViewportBudget {
+    MarkdownTableViewportBudget {
+        row_slots: ticket.body.len() + 2,
+        cells: (ticket.body.len() + 1) * ticket.header.columns,
+        column_slots: ticket.header.columns,
+        metadata_bytes: std::mem::size_of::<MarkdownTableStructuralWindow>()
+            + 2 * std::mem::size_of::<usize>()
+            + ticket.body.capacity() * std::mem::size_of::<TableRowFact>()
+            + ticket.inline_rows.capacity() * std::mem::size_of::<VerifiedTableInlineRow>()
+            + ticket.math_rows.capacity() * std::mem::size_of::<MarkdownTableRowMathContext>(),
+        ..MarkdownTableViewportBudget::default()
+    }
 }
 
 fn retained_window_budget(

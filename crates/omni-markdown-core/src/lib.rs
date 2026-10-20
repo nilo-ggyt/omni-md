@@ -8,6 +8,14 @@ mod immutable_snapshot;
 mod original_backing;
 pub use original_backing::MarkdownOriginalBackingObserver;
 
+#[cfg(feature = "s2-table-window-prototype")]
+mod markdown_table_cell_display;
+#[cfg(feature = "s2-table-window-prototype")]
+pub use markdown_table_cell_display::{
+    MarkdownTableCellDisplayAnswer, MarkdownTableCellDisplayCursor, MarkdownTableCellDisplayInput,
+    MarkdownTableCellDisplayScalar, MarkdownTableCellDisplayStep,
+};
+
 // 一个冻结源胶囊供独立布局算法共用；只捕获资源引用，不触发算法或Native排版。
 #[cfg(any(
     feature = "paged-graphemes",
@@ -46,7 +54,14 @@ mod markdown_layout_source;
 ))]
 pub use markdown_layout_source::{
     MARKDOWN_LAYOUT_SOURCE_BYTES, MarkdownLayoutTextAuthority, MarkdownLayoutTextSource,
-    MarkdownLayoutTextSourceObserver,
+    MarkdownLayoutTextSourceDomain, MarkdownLayoutTextSourceObserver,
+};
+#[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+pub use markdown_layout_source::{
+    MarkdownTableCellDisplayPreparation, MarkdownTableCellDisplayPreparationStep,
+    MarkdownTableCellDisplayResourceObserver, MarkdownTableCellDisplayResources,
+    MarkdownTableCellDisplaySource, MarkdownTableCellVisibleSourceRanges,
+    VerifiedMarkdownLayoutTableRow, VerifiedMarkdownRootLeafStyleBoundary,
 };
 
 // 精确字体解析与分页字形仅在显式候选路径编译，AppKit不进入这个纯Core依赖图。
@@ -115,15 +130,17 @@ pub use markdown_line_composer::{
     MarkdownComposedLineLookupAnswer, MarkdownComposedLineLookupStep,
     MarkdownComposedLineLookupTarget, MarkdownComposedLinePart, MarkdownComposedLinePartFacts,
     MarkdownComposedLinePartKind, MarkdownComposedLineResourceObserver,
-    MarkdownComposedLineResources, MarkdownComposedLines, MarkdownComposedVisualAnswer,
-    MarkdownComposedVisualGraphemeAnswer, MarkdownComposedVisualGraphemeQuery,
-    MarkdownComposedVisualGraphemeStep, MarkdownComposedVisualQuery, MarkdownComposedVisualStep,
-    MarkdownLineComposeAnswer, MarkdownLineComposeBudget, MarkdownLineComposeCancellation,
-    MarkdownLineComposeError, MarkdownLineComposeStep, MarkdownLineComposeStyle,
-    MarkdownLineComposer, MarkdownLineComposerClusterResources,
-    MarkdownLineComposerResolveResources, MarkdownLineComposerShapeResources,
-    MarkdownLineComposerWorkerResourceObserver, MarkdownLineComposerWorkerResources,
-    MarkdownLineControlResponse, MarkdownLineFontCatalog, MarkdownLineFontProbe,
+    MarkdownComposedLineResources, MarkdownComposedLineTrailingWhitespace,
+    MarkdownComposedLineTrailingWhitespaceStep, MarkdownComposedLines,
+    MarkdownComposedVisualAnswer, MarkdownComposedVisualGraphemeAnswer,
+    MarkdownComposedVisualGraphemeQuery, MarkdownComposedVisualGraphemeStep,
+    MarkdownComposedVisualQuery, MarkdownComposedVisualStep, MarkdownLineComposeAnswer,
+    MarkdownLineComposeBudget, MarkdownLineComposeCancellation, MarkdownLineComposeError,
+    MarkdownLineComposeStep, MarkdownLineComposeStyle, MarkdownLineComposer,
+    MarkdownLineComposerClusterResources, MarkdownLineComposerResolveResources,
+    MarkdownLineComposerShapeResources, MarkdownLineComposerWorkerResourceObserver,
+    MarkdownLineComposerWorkerResources, MarkdownLineControlResponse, MarkdownLineFontCatalog,
+    MarkdownLineFontProbe, MarkdownLineFontProbeSegmentAnswer, MarkdownLineFontProbeSegmentStep,
     MarkdownLineFontRegistration, MarkdownLineInlineControl, MarkdownLineInlineControlKind,
     MarkdownLineItem, MarkdownLineItemAnswer, MarkdownLineItemCoordinator, MarkdownLineItemFacts,
     MarkdownLineItemStep, MarkdownLineParagraphStyle, MarkdownLineRegisteredFont,
@@ -132,9 +149,11 @@ pub use markdown_line_composer::{
 };
 #[cfg(feature = "paged-shaping-frontier")]
 pub use markdown_line_composer::{
-    MarkdownLineFrontierReason, MarkdownLineFrontierWork, MarkdownWordDeleteAnswer,
-    MarkdownWordDeleteDirection, MarkdownWordDeleteStep, MarkdownWordGroupAction,
-    MarkdownWordGroupAnswer, MarkdownWordGroupStep, MarkdownWordMovePreparation,
+    MarkdownComposedVisualWordAnswer, MarkdownComposedVisualWordQuery,
+    MarkdownComposedVisualWordStep, MarkdownLineFrontierReason, MarkdownLineFrontierWork,
+    MarkdownWordDeleteAnswer, MarkdownWordDeleteDirection, MarkdownWordDeleteStep,
+    MarkdownWordGroupAction, MarkdownWordGroupAnswer, MarkdownWordGroupStep,
+    MarkdownWordMovePreparation, MarkdownWordMoveScope,
 };
 #[cfg(feature = "paged-soft-line-measure")]
 pub use markdown_soft_line_measure::{
@@ -169,9 +188,9 @@ mod markdown_graphemes;
 pub use markdown_graphemes::{
     MARKDOWN_GRAPHEME_INDEX_BYTES, MARKDOWN_GRAPHEME_SOURCE_BYTES, MarkdownGraphemeAnswer,
     MarkdownGraphemeBoundary, MarkdownGraphemeBudget, MarkdownGraphemeError, MarkdownGraphemeJob,
-    MarkdownGraphemeQuery, MarkdownGraphemeResourceObserver, MarkdownGraphemeResourceSnapshot,
-    MarkdownGraphemeStatus, MarkdownGraphemeStep, MarkdownGraphemeStorageProfile,
-    MarkdownGraphemeUnit,
+    MarkdownGraphemeOrdinalDomain, MarkdownGraphemeQuery, MarkdownGraphemeResourceObserver,
+    MarkdownGraphemeResourceSnapshot, MarkdownGraphemeStatus, MarkdownGraphemeStep,
+    MarkdownGraphemeStorageProfile, MarkdownGraphemeUnit,
 };
 
 // 默认UAX14机会独立opt-in；它不代替字素过滤、词典或Native宽度布局。
@@ -249,21 +268,23 @@ pub use markdown_document_buffer::{
 pub use markdown_document_buffer::{
     MarkdownOrdinaryPendingReason, MarkdownOrdinarySemanticState, MarkdownRootLeafPendingReason,
     MarkdownViewportSourceAuthority, MarkdownViewportSourceRequest,
-    MarkdownViewportSourceRequiredRowQuery, MarkdownViewportSourceStep,
-    VerifiedMarkdownOrdinaryLeaf, VerifiedMarkdownOrdinaryLine, VerifiedMarkdownPlainViewport,
-    VerifiedMarkdownRootLeafViewport, VerifiedMarkdownViewportSources,
+    MarkdownViewportSourceRequiredRowQuery, MarkdownViewportSourceRequiredRowResult,
+    MarkdownViewportSourceStep, VerifiedMarkdownOrdinaryLeaf, VerifiedMarkdownOrdinaryLine,
+    VerifiedMarkdownPlainViewport, VerifiedMarkdownRootLeafViewport,
+    VerifiedMarkdownViewportSources,
 };
 
 // 单格草稿只公开独立权限、有限读取和提交收据；不把未提交候选冒充canonical Source。
 #[cfg(feature = "s2-table-window-prototype")]
 pub use markdown_document_buffer::{
     MARKDOWN_CELL_DRAFT_COMMIT_UTF16_UNITS, MARKDOWN_CELL_DRAFT_MAX_DELTA_BYTES, MarkdownCellDraft,
-    MarkdownCellDraftCommitError, MarkdownCellDraftCommitResult, MarkdownCellDraftEditCapsule,
-    MarkdownCellDraftError, MarkdownCellDraftFacts, MarkdownCellDraftHistoryDirection,
-    MarkdownCellDraftHistoryEdit, MarkdownCellDraftHistoryFacts, MarkdownCellDraftInputIntent,
-    MarkdownCellDraftInputKind, MarkdownCellDraftPreparedCommit, MarkdownCellDraftReadAuthority,
-    MarkdownCellDraftReadCapsule, MarkdownCellDraftResourceObserver,
-    MarkdownCellDraftResourceSnapshot, MarkdownCellDraftSourceAuthority,
+    MarkdownCellDraftCommit, MarkdownCellDraftCommitError, MarkdownCellDraftCommitReceipt,
+    MarkdownCellDraftCommitResult, MarkdownCellDraftEditCapsule, MarkdownCellDraftError,
+    MarkdownCellDraftFacts, MarkdownCellDraftHistoryDirection, MarkdownCellDraftHistoryEdit,
+    MarkdownCellDraftHistoryFacts, MarkdownCellDraftInputIntent, MarkdownCellDraftInputKind,
+    MarkdownCellDraftPreparedCommit, MarkdownCellDraftReadAuthority, MarkdownCellDraftReadCapsule,
+    MarkdownCellDraftResourceObserver, MarkdownCellDraftResourceSnapshot,
+    MarkdownCellDraftSourceAuthority, MarkdownCellDraftWordAnchor,
 };
 
 #[cfg(feature = "native-markdown-candidate")]
@@ -277,8 +298,20 @@ pub use markdown_document_buffer::changes::{
 pub use markdown_viewport_presentation::{
     MARKDOWN_PRESENTATION_OVERSCAN_UTF16_UNITS, MarkdownBulletMarker, MarkdownPresentationMode,
     MarkdownPresentationQuery, MarkdownPresentationRun, MarkdownPresentationStyles,
-    MarkdownPreviewListMarker, MarkdownPreviewListMarkerKind, MarkdownTableAlignment,
-    MarkdownTableCellPrototype, MarkdownTablePrototype, MarkdownTableRowPrototype,
-    MarkdownViewportPresentation, MarkdownViewportPresentationError,
+    MarkdownPreviewListMarker, MarkdownPreviewListMarkerKind, MarkdownSourceLink,
+    MarkdownTableAlignment, MarkdownTableCellPrototype, MarkdownTablePrototype,
+    MarkdownTableRowPrototype, MarkdownViewportPresentation, MarkdownViewportPresentationError,
     MarkdownViewportPresentationSnapshot,
 };
+
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-shaping-frontier"
+))]
+pub use markdown_line_composer::{MarkdownLineTableRowRequest, MarkdownLineTableRowResponse};
+
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-shaping-frontier"
+))]
+pub use markdown_line_composer::MarkdownLineComposerTableResources;

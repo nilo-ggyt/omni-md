@@ -14,14 +14,16 @@ mod ordinary_source;
 use ordinary_source::CapturedOrdinary;
 pub use ordinary_source::{
     MarkdownOrdinaryPendingReason, MarkdownOrdinarySemanticState, MarkdownRootLeafPendingReason,
-    MarkdownViewportSourceAuthority, MarkdownViewportSourceRequest,
-    MarkdownViewportSourceRequiredRowQuery, MarkdownViewportSourceStep,
-    VerifiedMarkdownOrdinaryLeaf, VerifiedMarkdownOrdinaryLine, VerifiedMarkdownPlainViewport,
-    VerifiedMarkdownRootLeafViewport, VerifiedMarkdownViewportSources,
+    MarkdownTableCellInlineStep, MarkdownViewportSourceAuthority, MarkdownViewportSourceRequest,
+    MarkdownViewportSourceRequiredRowQuery, MarkdownViewportSourceRequiredRowResult,
+    MarkdownViewportSourceStep, VerifiedMarkdownOrdinaryLeaf, VerifiedMarkdownOrdinaryLine,
+    VerifiedMarkdownPlainViewport, VerifiedMarkdownRootLeafViewport,
+    VerifiedMarkdownTableCellInline, VerifiedMarkdownTableRowSource,
+    VerifiedMarkdownViewportSources,
 };
 
 use pulldown_cmark::{
-    block_frontier::{SourceFrame, TableCheckpoint, TableRowFact},
+    block_frontier::{SourceFrame, TableCheckpoint, TableRowFact, VerifiedTableInlineRow},
     global_frontier::{
         GlobalFact, GlobalFrontier, GlobalFrontierError, GlobalFrontierLimits,
         GlobalSourceAuthority, GlobalStep, GlobalTableFact, GlobalWork, StructuralSpineLimits,
@@ -48,6 +50,8 @@ pub enum MarkdownTableWindowTarget {
 pub enum MarkdownTableRequestError {
     /// 原源读取/归还真实失败；取消和结构坐标错误不得遮住它。
     Source(MarkdownDocumentBufferError),
+    /// 同一Root行内任务的匿名匹配栈真实IO首错；不返回半份样式或把短读改为空目录。
+    InlineStorageUnavailable(i32),
     InvalidRequest,
     SourceSuperseded,
     /// 续体只接受本请求最后一次发布的 opaque 权限，不能借同代次的另一批或旧发布续读。
@@ -87,6 +91,7 @@ pub(crate) struct MarkdownTableStructuralWindow {
     header_utf16: Range<usize>,
     delimiter_utf16: Range<usize>,
     body: Vec<TableRowFact>,
+    inline_rows: Vec<VerifiedTableInlineRow>,
     math_rows: Vec<MarkdownTableRowMathContext>,
     include_header: bool,
     next_required_row: Option<usize>,
@@ -128,6 +133,7 @@ struct ActiveTable {
     context: MathContext,
     header_context: Option<MathContext>,
     body: Vec<TableRowFact>,
+    inline_rows: Vec<VerifiedTableInlineRow>,
     math_rows: Vec<MarkdownTableRowMathContext>,
     found: bool,
     include_header: bool,
@@ -540,6 +546,14 @@ impl MarkdownTableWindowStructureRequest {
                             current.chunk_halo = current.halo_boundary.clone();
                         }
                         current.body.push(row);
+                        // 与刚发布 Row 同一 accepted checkpoint 捕原行，不以窗口范围重造 TableCell 来源。
+                        current.inline_rows.push(
+                            self.global
+                                .as_ref()
+                                .and_then(GlobalFrontier::table_checkpoint)
+                                .and_then(|checkpoint| checkpoint.last_inline_row())
+                                .ok_or(MarkdownTableRequestError::InvalidRequest)?,
+                        );
                         current.math_rows.push(MarkdownTableRowMathContext {
                             row_ordinal: row.row_ordinal,
                             context: current.context,
@@ -650,6 +664,7 @@ impl MarkdownTableWindowStructureRequest {
             context: MathContext::default(),
             header_context: None,
             body: Vec::new(),
+            inline_rows: Vec::new(),
             math_rows: Vec::new(),
             found,
             include_header,
@@ -825,6 +840,7 @@ impl MarkdownTableWindowStructureRequest {
             header_utf16: current.header_utf16.clone(),
             delimiter_utf16: current.delimiter_utf16.clone(),
             body: std::mem::take(&mut current.body),
+            inline_rows: std::mem::take(&mut current.inline_rows),
             math_rows: std::mem::take(&mut current.math_rows),
             include_header: current.include_header,
             next_required_row: next_required_row.or(current.first_overflow),
@@ -849,7 +865,7 @@ impl MarkdownTableWindowStructureRequest {
             }),
         });
         if !self.continuous {
-            self.global = None;
+            // standalone仍须同源代码分类；语义事务结束时再释放原Global，不能另建第二个producer。
             self.current = None;
         } else if self
             .ready

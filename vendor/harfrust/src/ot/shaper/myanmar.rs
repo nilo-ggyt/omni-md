@@ -1,10 +1,10 @@
 use super::indic::{category, position};
 use super::syllabic::*;
 use super::*;
-use crate::ShaperFont;
 use crate::ot::map::*;
 use crate::ot::shaper::indic::category::OT_VPre;
 use crate::plan::ShapePlan;
+use crate::ShaperFont;
 use crate::{GlyphInfo, Tag};
 
 pub const MYANMAR_SHAPER: OtShaper = OtShaper {

@@ -4,7 +4,7 @@ use core::ops::Range;
 
 use super::buffer::{Buffer, GlyphFlags};
 use super::layout::LayoutTableKind;
-use super::{Language, Mask, Script, Tag, tag};
+use super::{tag, Language, Mask, Script, Tag};
 use crate::plan::ShapePlan;
 use crate::tag::TagExt;
 use crate::{LayoutData, ShaperFont};

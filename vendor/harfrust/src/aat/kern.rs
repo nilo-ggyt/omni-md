@@ -8,12 +8,8 @@ use read_fonts::{
     types::{GlyphId, GlyphId16},
 };
 
-use crate::LayoutData;
-use crate::Mask;
-use crate::Scale;
-use crate::U32Set;
 use crate::aat::common::{
-    AatApplyContext, ClassCache, START_OF_TEXT, SafeToBreakAccel, SafeToBreakSubtable,
+    AatApplyContext, ClassCache, SafeToBreakAccel, SafeToBreakSubtable, START_OF_TEXT,
 };
 use crate::aat::kerx::SimpleKerning;
 use crate::buffer::*;
@@ -22,6 +18,10 @@ use crate::ot::gpos::attach_type;
 use crate::ot::layout::LayoutTableKind;
 use crate::ot::lookup_flags;
 use crate::plan::ShapePlan;
+use crate::LayoutData;
+use crate::Mask;
+use crate::Scale;
+use crate::U32Set;
 
 pub(crate) fn get_class(machine: &aat::StateTable, glyph_id: GlyphId, cache: &ClassCache) -> u8 {
     if let Some(klass) = cache.get(glyph_id.to_u32()) {

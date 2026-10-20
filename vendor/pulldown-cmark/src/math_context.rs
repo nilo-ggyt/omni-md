@@ -32,6 +32,25 @@ impl PartialEq for MathContext {
 }
 impl Eq for MathContext {}
 
+/// 同一原 lexer 的逐 byte 数学转移；行窗口和单格入口捕获共用，不能各自猜 brace/escape 语义。
+pub(crate) fn observe_math_byte(context: &mut MathContext, escaped: &mut bool, byte: u8) {
+    if *escaped {
+        *escaped = false;
+        if crate::scanners::is_ascii_punctuation(byte) {
+            return; // 原反斜杠吞掉 punctuation；被额外跳过的 pipe/backtick 不含数学 token。
+        }
+    }
+    match byte {
+        b'\\' => *escaped = true,
+        b'$' => {
+            context.dollar();
+        }
+        b'{' => context.open(),
+        b'}' => context.close(),
+        _ => {} // 其他字节也由所属调用方计费，但不会改变数学上下文。
+    }
+}
+
 impl Default for MathContext {
     fn default() -> Self {
         Self {

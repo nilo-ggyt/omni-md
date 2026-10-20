@@ -17,9 +17,9 @@ use core::cell::Cell;
 
 use super::machine_cursor::MachineCursor;
 use super::use_::category;
-use crate::GlyphInfo;
 use crate::buffer::{Buffer, HB_BUFFER_SCRATCH_FLAG_HAS_BROKEN_SYLLABLE};
 use crate::mapped_pod_vec::CheckpointHandle;
+use crate::GlyphInfo;
 
 static _use_syllable_machine_trans_keys: [u8; 256] = [
     35, 37, 0, 42, 5, 42, 5, 42, 1, 39, 8, 34, 8, 33, 8, 33, 8, 33, 8, 32, 8, 32, 8, 8, 8, 34, 8,

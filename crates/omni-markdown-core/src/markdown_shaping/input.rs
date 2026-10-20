@@ -141,10 +141,25 @@ pub(super) fn install_context(
     range: Range<usize>,
     buffer: &mut Buffer,
 ) -> Result<(usize, usize)> {
-    let before = range.start.saturating_sub(20)..range.start;
-    let after = range.end..range.end.saturating_add(20).min(source.byte_len());
+    Ok(prepare_context(source, range, None)?.install(buffer))
+}
+
+/// 同一个上下文 decoder 接收原 Bidi 已证明的有限可达范围；不会跨不同 level 借入邻接字符。
+/// 普通公开 Job 不带此范围，保留原至多两侧 20B 的真实上下文合同。
+pub(super) fn prepare_context(
+    source: &MarkdownLayoutTextSource,
+    range: Range<usize>,
+    bounds: Option<Range<usize>>,
+) -> Result<PreparedContext> {
+    let bounds = bounds.unwrap_or(0..source.byte_len());
+    if bounds.start > range.start || bounds.end < range.end || bounds.end > source.byte_len() {
+        return Err(Error::InvalidRange);
+    }
+    let before = range.start.saturating_sub(20).max(bounds.start)..range.start;
+    let after = range.end..range.end.saturating_add(20).min(bounds.end);
     let mut read = 0;
     let mut maximum = 0;
+    let mut decoded = [([0_u32; 5], 0); 2];
     for (range, preceding) in [(before, true), (after, false)] {
         let mut bytes = [0u8; 20];
         let mut used = 0;
@@ -156,14 +171,14 @@ pub(super) fn install_context(
             Ok(())
         })?;
         read += used;
-        let (context, count) = decode_context(&bytes[..used], preceding)?;
-        if preceding {
-            buffer.set_pre_context_codepoints(&context[..count]);
-        } else {
-            buffer.set_post_context_codepoints(&context[..count]);
-        } // 原同步入口和已收费上下文共用同一个纯解码/逆序合同。
+        decoded[usize::from(!preceding)] = decode_context(&bytes[..used], preceding)?;
     }
-    Ok((read, maximum))
+    Ok(PreparedContext {
+        before: decoded[0],
+        after: decoded[1],
+        bytes: read,
+        maximum_borrow: maximum,
+    }) // 原同步入口、试次及已收费闭项共用一套解码/逆序合同，不复制正文解析器。
 }
 
 /// 只解释已经取得的至多20byte；原邻接范围、UTF8边缘与五标量次序不因读取方式改变。

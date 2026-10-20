@@ -1,11 +1,11 @@
 use super::arabic_table::{LIGATURE_3_TABLE, LIGATURE_MARK_TABLE, LIGATURE_TABLE, SHAPING_TABLE};
-use crate::ShaperFont;
 use crate::buffer::Buffer;
 use crate::ot::apply::ApplyContext;
-use crate::ot::layout::{LayoutTableKind, apply_synthesized_subst_lookup};
+use crate::ot::layout::{apply_synthesized_subst_lookup, LayoutTableKind};
 use crate::ot::lookup::LookupInfo;
 use crate::ot::lookup_flags;
 use crate::plan::ShapePlan;
+use crate::ShaperFont;
 use crate::{Mask, Tag};
 use alloc::vec::Vec;
 

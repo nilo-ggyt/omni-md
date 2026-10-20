@@ -12,6 +12,8 @@ pub enum ReferencePrefixPurpose {
     Label,
     Whitespace,
     Title,
+    /// 原闭合段落的续行：同 Origin 执行祖先前缀、Space(4) 和 AllSpace。
+    Paragraph,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReferencePrefixStep {
@@ -47,6 +49,7 @@ pub struct ReferencePrefixScanner {
     purpose: ReferencePrefixPurpose,
     phase: ScopePhase,
     prefix: Option<ContainerPrefix>,
+    allocated_workspace_bytes: usize,
     failure: Option<GlobalFrontierError>,
 }
 impl std::fmt::Debug for ReferencePrefixScanner {
@@ -80,6 +83,7 @@ impl VerifiedGlobalReference {
             purpose,
             phase: ScopePhase::Anchor,
             prefix: None,
+            allocated_workspace_bytes: 0,
             failure: None,
         })
     }
@@ -95,7 +99,79 @@ impl VerifiedGlobalReference {
             .normalized_label(raw_with_closer, continuation_prefix)
     }
 }
+
+impl VerifiedInlineSemanticSeed {
+    /// 原块和实际 EOL 共同决定续行权限；裸位置不能越过该闭合块或借另一个 scope。
+    pub(crate) fn continuation_prefix_scanner(
+        &self,
+        line_start: usize,
+        purpose: ReferencePrefixPurpose,
+    ) -> Result<ReferencePrefixScanner, GlobalFrontierError> {
+        if !matches!(
+            purpose,
+            ReferencePrefixPurpose::Paragraph | ReferencePrefixPurpose::ContainerOnly
+        ) || self.kind != InlineBlockKind::Paragraph
+            || line_start <= self.physical_start
+            || line_start >= self.lexical_end
+        {
+            return Err(GlobalFrontierError::InvalidFrame);
+        }
+        Ok(ReferencePrefixScanner {
+            revision: self.revision,
+            source_end: self.source_end,
+            origin: line_start,
+            spine: self.spine.clone(),
+            options: self.options,
+            purpose,
+            phase: ScopePhase::Anchor,
+            prefix: None,
+            allocated_workspace_bytes: 0,
+            failure: None,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+/// 仅原 scope/前缀游标签发的源事实；候选词法不能从 Range 制造跳过正文的权限。
+pub struct VerifiedInlinePrefix {
+    pub(crate) revision: u64,
+    pub(crate) source_end: usize,
+    pub(crate) range: std::ops::Range<usize>,
+    pub(crate) block_source: std::ops::Range<usize>,
+    pub(crate) purpose: Option<ReferencePrefixPurpose>,
+}
+impl VerifiedInlinePrefix {
+    /// 保留 canonical 字节坐标；不返回去前缀后的第二份正文。
+    pub fn source_range(&self) -> std::ops::Range<usize> {
+        self.range.clone()
+    }
+    /// 仅同一原块的真实 Origin 可交付物理行 owner；代码续行只去容器，普通段落另含原空白阶段。
+    pub fn matches_origin(&self, origin: &BlockOriginLine) -> bool {
+        if origin.revision != self.revision
+            || origin.source_end != self.source_end
+            || origin.block_source != self.block_source
+        {
+            return false;
+        }
+        let expected = match self.purpose {
+            None if origin.kind() == BlockOriginLineKind::First => origin.prefix_range(),
+            Some(ReferencePrefixPurpose::Paragraph) => origin.prefix_range(),
+            Some(ReferencePrefixPurpose::ContainerOnly) => {
+                let state = origin.container_state();
+                origin.physical_range().start..state.source_origin + state.relative_byte
+            }
+            _ => return false,
+        };
+        self.range == expected
+    }
+}
+
 impl ReferencePrefixScanner {
+    /// 记录本次续行解析真正取得的目录payload；完成后prefix归还也不抹掉本次实际分配。
+    pub fn allocated_workspace_bytes(&self) -> usize {
+        self.allocated_workspace_bytes
+    }
+
     pub fn next_byte(&self) -> usize {
         match &self.phase {
             ScopePhase::Anchor => self.origin - 1,
@@ -185,7 +261,7 @@ impl ReferencePrefixScanner {
                     Some(b'\n') => self.start_containers(),
                     Some(b'\r') => self.phase = ScopePhase::AfterCr,
                     Some(_) | None if frame.real_eof => {
-                        return Err(GlobalFrontierError::InvalidFrame)
+                        return Err(GlobalFrontierError::InvalidFrame);
                     }
                     None => {
                         need = true;
@@ -212,11 +288,14 @@ impl ReferencePrefixScanner {
                 }
             }
             ScopePhase::Containers => {
-                let (step, child) = self
+                let prefix = self
                     .prefix
                     .as_mut()
-                    .ok_or(GlobalFrontierError::InvalidFrame)?
-                    .advance(&frame, fuel, fuel)?;
+                    .ok_or(GlobalFrontierError::InvalidFrame)?;
+                let before = prefix.allocated_workspace_bytes();
+                let (step, child) = prefix.advance(&frame, fuel, fuel)?;
+                // 保留真实容量增量后才能清prefix，否则同量子完成时会把已分配目录错误记为零。
+                self.allocated_workspace_bytes += prefix.allocated_workspace_bytes() - before;
                 work.byte_reads = child.byte_reads;
                 work.transitions += child.transitions;
                 match step {
@@ -257,7 +336,11 @@ impl ReferencePrefixScanner {
                 work.transitions += step.work.transitions;
                 match step.progress {
                     LineStartProgress::Complete { state, .. } => {
-                        if self.purpose == ReferencePrefixPurpose::Title && !title {
+                        if matches!(
+                            self.purpose,
+                            ReferencePrefixPurpose::Title | ReferencePrefixPurpose::Paragraph
+                        ) && !title
+                        {
                             self.phase = ScopePhase::TitleSpace(LineStartStream::new(
                                 self.revision,
                                 self.origin,

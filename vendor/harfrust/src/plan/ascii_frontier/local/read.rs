@@ -1,9 +1,9 @@
 //! 证书只读真实OpenType记录；不缓存字体表副本，也不另写整形算法。
 use super::Rejection;
 use read_fonts::{
-    FontData, FontRead,
     tables::layout::{ClassDef, CoverageTable},
     types::GlyphId,
+    FontData, FontRead,
 };
 
 pub(super) struct Read<'a>(pub(super) &'a [u8]);

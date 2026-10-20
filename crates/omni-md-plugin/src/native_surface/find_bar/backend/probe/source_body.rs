@@ -89,10 +89,12 @@ impl Rig {
             expected_lines,
             cell,
             omni_markdown_core::MarkdownPresentationMode::Source,
+            cell,
         )
     }
 
-    /// 新RootLeaf控制显式InlinePreview；所有旧Body/Cell构造仍经上方Source入口。
+    /// 新RootLeaf控制显式InlinePreview；expected_complete来自固定夹具要求，长文首屏仍只允许真实前缀。
+    /// 所有旧Body/Cell构造继续同一Source入口，不用当前progress反算期望或为了测试强迫全文准备。
     fn attach_mode(
         mtm: MainThreadMarker,
         file: tempfile::NamedTempFile,
@@ -100,6 +102,7 @@ impl Rig {
         expected_lines: usize,
         cell: bool,
         presentation_mode: omni_markdown_core::MarkdownPresentationMode,
+        expected_complete: bool,
     ) -> Result<Self, String> {
         let document = Rc::new(RefCell::new(
             MarkdownDocumentBuffer::open(file.path(), 8 * 1024 * 1024)
@@ -208,9 +211,7 @@ impl Rig {
             receipts: Vec::new(),
             retired: Vec::new(),
         };
-        let first_result = if rig.cell.is_some()
-            || presentation_mode == omni_markdown_core::MarkdownPresentationMode::InlinePreview
-        {
+        let first_result = if expected_complete {
             frame::wait_complete_frame("cell_first_frame", &rig.body, first)
         } else {
             wait_frame("first_frame", &rig.body, first)

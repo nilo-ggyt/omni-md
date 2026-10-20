@@ -40,6 +40,7 @@ fn compose(
                                 range,
                                 font.registered(),
                                 MarkdownLineComposeStyle {
+                                    presentation: Default::default(),
                                     points: font.native().point_size() as f32,
                                     language: None,
                                     features: Vec::new(),
@@ -60,6 +61,7 @@ fn compose(
             }
             // 此有限夹具有真实空格断点；未处理的控制/unsafe不能被测试当作成功行吞掉。
             MarkdownLineComposeAnswer::NeedsControl(_)
+            | MarkdownLineComposeAnswer::NeedsTableRow(_)
             | MarkdownLineComposeAnswer::NeedsTabPlacement(_)
             | MarkdownLineComposeAnswer::NeedsResolution(_) => {
                 panic!("正式Native接线夹具尚未产生完整真实软行");

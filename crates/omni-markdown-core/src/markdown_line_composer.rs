@@ -9,10 +9,13 @@ pub use controls::{
     MarkdownComposedLinePartKind, MarkdownLineControlResponse, MarkdownLineParagraphStyle,
     MarkdownLineTabAlignment, MarkdownLineTabPlacement, MarkdownLineTabStop,
 };
+mod folds;
 mod item;
 
 #[cfg(feature = "paged-shaping-frontier")]
-pub(crate) use item::closed_item::ClosedItem;
+pub(crate) use item::closed_item::{ClosedItem, ClosedShapingInput};
+#[cfg(feature = "paged-shaping-frontier")]
+pub(crate) use item::{CertifiedShapingEndpoint, ResolvedBidiShapingSeam};
 
 #[cfg(feature = "paged-shaping-frontier")]
 pub use item::{MarkdownLineFrontierReason, MarkdownLineFrontierWork};
@@ -25,7 +28,7 @@ pub use engine::{MarkdownLineComposeAnswer, MarkdownLineComposeStep, MarkdownLin
 pub use engine::{
     MarkdownWordDeleteAnswer, MarkdownWordDeleteDirection, MarkdownWordDeleteStep,
     MarkdownWordGroupAction, MarkdownWordGroupAnswer, MarkdownWordGroupStep,
-    MarkdownWordMovePreparation,
+    MarkdownWordMovePreparation, MarkdownWordMoveScope,
 };
 pub use store::output::{
     MarkdownComposedCaretAssociation, MarkdownComposedCaretSide,
@@ -33,10 +36,16 @@ pub use store::output::{
     MarkdownComposedLineFacts, MarkdownComposedLineKind, MarkdownComposedLineLookup,
     MarkdownComposedLineLookupAnswer, MarkdownComposedLineLookupStep,
     MarkdownComposedLineLookupTarget, MarkdownComposedLinePart, MarkdownComposedLinePartFacts,
-    MarkdownComposedLineResourceObserver, MarkdownComposedLineResources, MarkdownComposedLines,
-    MarkdownComposedVisualAnswer, MarkdownComposedVisualGraphemeAnswer,
+    MarkdownComposedLineResourceObserver, MarkdownComposedLineResources,
+    MarkdownComposedLineTrailingWhitespace, MarkdownComposedLineTrailingWhitespaceStep,
+    MarkdownComposedLines, MarkdownComposedVisualAnswer, MarkdownComposedVisualGraphemeAnswer,
     MarkdownComposedVisualGraphemeQuery, MarkdownComposedVisualGraphemeStep,
     MarkdownComposedVisualQuery, MarkdownComposedVisualStep,
+};
+#[cfg(feature = "paged-shaping-frontier")]
+pub use store::output::{
+    MarkdownComposedVisualWordAnswer, MarkdownComposedVisualWordQuery,
+    MarkdownComposedVisualWordStep,
 };
 pub use worker_resources::{
     MarkdownLineComposerClusterResources, MarkdownLineComposerResolveResources,
@@ -51,11 +60,23 @@ pub use font::{
 
 pub use item::{
     MarkdownLineComposeBudget, MarkdownLineComposeCancellation, MarkdownLineComposeError,
-    MarkdownLineComposeStyle, MarkdownLineFontProbe, MarkdownLineInlineControl,
-    MarkdownLineInlineControlKind, MarkdownLineItem, MarkdownLineItemAnswer,
-    MarkdownLineItemCoordinator, MarkdownLineItemFacts, MarkdownLineItemStep,
-    MarkdownLineStyleRequest, MarkdownLineStyleResponse,
+    MarkdownLineComposeStyle, MarkdownLineFontProbe, MarkdownLineFontProbeSegmentAnswer,
+    MarkdownLineFontProbeSegmentStep, MarkdownLineInlineControl, MarkdownLineInlineControlKind,
+    MarkdownLineItem, MarkdownLineItemAnswer, MarkdownLineItemCoordinator, MarkdownLineItemFacts,
+    MarkdownLineItemStep, MarkdownLineStyleRequest, MarkdownLineStyleResponse,
 };
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-shaping-frontier"
+))]
+pub use engine::{MarkdownLineTableRowRequest, MarkdownLineTableRowResponse};
+
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-shaping-frontier"
+))]
+pub use worker_resources::MarkdownLineComposerTableResources;

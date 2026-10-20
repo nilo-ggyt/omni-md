@@ -18,7 +18,8 @@ mod replacement;
 mod resources;
 mod state;
 pub use commit::{
-    MarkdownCellDraftCommitError, MarkdownCellDraftCommitResult, MarkdownCellDraftPreparedCommit,
+    MarkdownCellDraftCommit, MarkdownCellDraftCommitError, MarkdownCellDraftCommitReceipt,
+    MarkdownCellDraftCommitResult, MarkdownCellDraftPreparedCommit, MarkdownCellDraftWordAnchor,
 };
 pub use edit::MarkdownCellDraftEditCapsule;
 pub(super) use guard::FrozenDraftGuard;

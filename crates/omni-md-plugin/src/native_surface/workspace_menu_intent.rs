@@ -1,353 +1,156 @@
 //! 正文菜单只消费点击时的原文档与真实正文或格内选择；排队期间的新输入撤销原动作。
 
 use super::*;
-use objc2_foundation::NSUndoManager;
 
-/// 队列只转运 Rust 票据、正文/字段 weak 和标量，不保活 Native 图或另一个正文 root。
-pub(super) struct NativeMarkdownWorkspaceEditIntent {
+/// 菜单绑定点击时的正文owner和实际输入客户，不把后继同位置的格或正文当作原客户。
+pub(super) struct NativeMarkdownWorkspacePagedEditIntent {
     owner: usize,
-    view_identity: usize,
     document: WeakMarkdownDocument,
-    source: NativeMarkdownSelectionCapture,
-    input_epoch: u64,
-    table: Option<NativeMarkdownTableMenuSelection>,
-    committed: RefCell<Option<Rc<NativeMarkdownCommittedSelection>>>,
+    body: std::rc::Weak<super::paged_body::NativeMarkdownPagedBody>,
+    input: super::paged_input::NativeMarkdownPagedInputState,
+    cell: Option<NativeMarkdownWorkspacePagedCellIntent>,
 }
 
-/// 格内坐标属于同一实际字段会话；weak 不把 AppKit 的共享 field editor 保活到队列之后。
-struct NativeMarkdownTableMenuSelection {
-    coordinate: NativeMarkdownTableCellCoordinate,
-    source_range: std::ops::Range<usize>,
-    authority_identity: usize,
-    selection: Option<(Weak<NSTextView>, NSRange)>,
-    history: Option<Weak<NSUndoManager>>,
+/// Weak保留实际草稿owner身份，避免取消后重开同一格时因地址和相同选区复用旧菜单。
+struct NativeMarkdownWorkspacePagedCellIntent {
+    body: std::rc::Weak<super::paged_body::NativeMarkdownPagedBody>,
+    input: super::paged_input::NativeMarkdownPagedInputState,
 }
-
-impl NativeMarkdownWorkspaceEditIntent {
-    /// 必须先于 sender 的第一个 Native getter 捕获；此过程不改变选择或输入代次。
+impl NativeMarkdownWorkspacePagedEditIntent {
+    /// 原source capture只读Rust身份，先于sender getter；不创建Native Weak或保活Body。
     pub(super) fn capture(controller: &NativeMarkdownController) -> Option<Self> {
-        let (mut intent, table) = ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
+        ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
             let surface = active.as_ref()?;
+            let editor = surface.editor.as_ref()?;
             if !std::ptr::eq(&*surface.controller, controller)
                 || !native_markdown_controller_has_foreground_authority(controller)
-                || native_markdown_operation_is_busy(
-                    surface.pending_note_switch.is_some(),
-                    surface.pending_file_mutation.is_some(),
-                )
+                || surface.pending_note_switch.is_some()
+                || surface.pending_file_mutation.is_some()
             {
-                // 旧窗口、借出或交接中的菜单不能等到新正文出现后再领取编辑权限。
                 return None;
             }
-            let editor = surface.editor.as_ref()?; // 空态不能把点击时不存在的正文授权给后继文档。
-            let view = &editor.backend.text_view;
-            if view.ivars().textkit_graph_teardown.get() {
-                return None; // accepted 清理后的空壳不再产生排队正文动作。
-            }
-            let table = view
-                .ivars()
-                .active_table_cell
-                .borrow()
-                .as_ref()
-                .map(|cell| {
-                    (
-                        cell.coordinate,
-                        cell.source_utf16_range.clone(),
-                        cell.authority
-                            .as_ref()
-                            .map(|authority| Rc::as_ptr(authority).addr()),
-                    )
-                }); // 只投影坐标和原 authority 身份，不复制单格草稿或跨 Native 持状态借用。
-            Some((
-                Self {
-                    owner: std::ptr::from_ref(controller).addr(),
-                    view_identity: std::ptr::from_ref(&**view).addr(),
-                    document: Rc::downgrade(editor.document()),
-                    source: view.ivars().folds.capture_selection().ok()?, // 失效原 owner 不以新 capture 重试。
-                    input_epoch: view.ivars().table_input_intent_epoch.get(),
-                    table: None,
-                    committed: RefCell::new(None),
-                },
-                table,
-            ))
-        })?;
-        match table {
-            Some((coordinate, source_range, Some(authority_identity))) => {
-                // 原纯票先于任何 Native getter；离开 surface 借用后才观察同一现存字段。
-                let view = active_document_view().ok()?;
-                let _payload = PayloadUseGuard::enter(&view.ivars().payload_use_depth);
-                let current = || intent.current();
-                let selection = (|| {
-                    let field = native_markdown_table_intent_step(&current, || {
-                        view.existing_table_cell_editor()
+            let cell = match editor.body.active_cell_body() {
+                Some(body) => {
+                    // view()只借现存Rust owner；捕获过程中不创建Native Weak、不调用sender getter。
+                    Some(NativeMarkdownWorkspacePagedCellIntent {
+                        input: body.view().ok()?.input_state().ok()?,
+                        body: Rc::downgrade(&body),
                     })
-                    .ok()??;
-                    let editor =
-                        native_markdown_table_intent_step(&current, || field.currentEditor())
-                            .ok()??
-                            .downcast::<NSTextView>()
-                            .ok()?;
-                    let selection =
-                        native_markdown_table_intent_step(&current, || editor.selectedRange())
-                            .ok()?;
-                    if selection.location == NSNotFound as NSUInteger
-                        || selection.location.checked_add(selection.length).is_none()
-                    {
-                        return None; // 无真实选区只撤格内格式权限；插表/正文块仍有各自原提交语义。
-                    }
-                    let weak = native_markdown_table_intent_step(&current, || {
-                        Weak::from_retained(&editor)
-                    })
-                    .ok()?;
-                    Some((weak, selection))
-                })(); // 不保活 field/editor；全部局部析构后仍核同一原菜单票。
-                if !intent.current() {
-                    return None;
                 }
-                let history = if selection.is_some() {
-                    // 历史按钮只能使用点击时已有的原字段manager；格式菜单的只读捕获也不创建新历史。
-                    let manager = native_markdown_table_intent_step(&current, || {
-                        controller
-                            .ivars()
-                            .undo
-                            .cached_manager(&controller.ivars().owned)
-                    })
-                    .ok()?;
-                    match manager {
-                        Some(manager) => {
-                            let weak = native_markdown_table_intent_step(&current, || {
-                                Weak::from_retained(&manager)
-                            })
-                            .ok()?;
-                            drop(manager); // 队列只留Weak，原claim的release也不能跨越已撤销的原票。
-                            if !intent.current() {
-                                return None;
-                            }
-                            Some(weak)
-                        }
-                        None => None, // 尚无字段历史时按钮是原生空操作，不借正文历史替代。
-                    }
-                } else {
-                    None // 原字段已辞任时，没有可授权的字段历史客户端。
-                };
-                intent.table = Some(NativeMarkdownTableMenuSelection {
-                    coordinate,
-                    source_range,
-                    authority_identity,
-                    selection,
-                    history,
-                });
-            }
-            Some((_, _, None)) => return None, // 活动格缺少已验证源权限时保留草稿，不误作正文菜单。
-            None => {}                         // 原正文菜单不创建或查询任何表格字段。
-        }
-        Some(intent)
-    }
-
-    /// 活动格只消费其原生输入历史；没有活动field editor时才走原正文canonical历史。
-    pub(super) fn restore_history(
-        &self,
-        direction: MarkdownHistoryDirection,
-    ) -> Result<(), String> {
-        if !self.current() {
-            return Ok(()); // 后继正文或输入撤销旧按钮，不重新捕获另一个字段作为目标。
-        }
-        let view = active_document_view()?;
-        let _payload = PayloadUseGuard::enter(&view.ivars().payload_use_depth);
-        let Some(table) = self
-            .table
-            .as_ref()
-            .filter(|table| table.selection.is_some())
-        else {
-            if self.current() {
-                view.restore_history(direction); // 正文继续原Cell/IME提交、唯一历史与选择收据流程。
-            }
-            return Ok(());
-        };
-        let Some(history) = &table.history else {
-            return Ok(()); // 捕获时本格没有历史，不能查询后来的manager或改为撤销正文。
-        };
-        let expired = || "表格输入或其撤销记录已经改变，本次操作已取消".to_owned();
-        let current = || self.current() && self.table_input_current(&view);
-        let (editor, _) = table.selection.as_ref().expect("上方已限定原实际字段选择");
-        let editor = native_markdown_table_intent_step(&current, || editor.load())
-            .map_err(|_| expired())?
-            .ok_or_else(expired)?;
-        let manager = native_markdown_table_intent_step(&current, || history.load())
-            .map_err(|_| expired())?
-            .ok_or_else(expired)?;
-        let current = || {
-            current()
-                && ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
-                    let Some(surface) = active.as_ref() else {
-                        return false;
-                    };
-                    // manager必须仍属于同一controller；原具体field editor的Weak能力也须仍指向它。
-                    surface.controller.ivars().undo.preflight().is_ok()
-                        && surface
-                            .controller
-                            .ivars()
-                            .undo
-                            .owns_observed_manager(&manager)
-                        && editor
-                            .downcast_ref::<NativeMarkdownSessionFieldEditor>()
-                            .is_some_and(|editor| {
-                                editor.belongs_to(
-                                    &surface.controller.ivars().undo,
-                                    &surface.controller.ivars().owned,
-                                )
-                            })
-                })
-        };
-        let input = ProtocolObject::<dyn NSTextInputClient>::from_ref(&*editor);
-        if native_markdown_table_intent_step(&current, || input.hasMarkedText())
-            .map_err(|_| expired())?
-        {
-            return Err("请先完成当前表格单元格的输入，再撤销或重做".into()); // 不强制确认或取消中文组合输入。
-        }
-        let actual = native_markdown_table_intent_step(&current, || editor.undoManager())
-            .map_err(|_| expired())?
-            .ok_or_else(expired)?;
-        if !std::ptr::eq(&*actual, &*manager) {
-            return Err(expired()); // 已缓存原manager存在才调用getter，拒绝外部或被换掉的实际历史。
-        }
-        let busy = native_markdown_table_intent_step(&current, || {
-            manager.isUndoing() || manager.isRedoing() || manager.groupingLevel() > 1
+                None => None,
+            };
+            Some(Self {
+                owner: std::ptr::from_ref(controller).addr(),
+                document: Rc::downgrade(editor.document()),
+                body: Rc::downgrade(&editor.body),
+                input: editor.text_view.input_state().ok()?,
+                cell,
+            })
         })
-        .map_err(|_| expired())?;
-        if busy {
-            return Err("表格单元格的撤销或重做仍在完成中".into()); // 不手工结束嵌套组或插入第二个历史动作。
-        }
-        let available = native_markdown_table_intent_step(&current, || match direction {
-            MarkdownHistoryDirection::Undo => manager.canUndo(),
-            MarkdownHistoryDirection::Redo => manager.canRedo(),
-        })
-        .map_err(|_| expired())?;
-        if !available {
-            return Ok(()); // 本字段空栈仍保留编辑与焦点，不能降为正文Undo/Redo。
-        }
-        if !current() {
-            return Err(expired()); // canUndo/canRedo会触发checkpoint，执行前仍须核原选区与客户。
-        }
-        match direction {
-            MarkdownHistoryDirection::Undo => manager.undo(),
-            MarkdownHistoryDirection::Redo => manager.redo(),
-        }
-        // 原生动作自行发布真实字段变化及选择；它可推进输入epoch，不以旧before复核误报已完成的操作。
-        Ok(())
     }
 
-    pub(super) fn has_table_selection(&self) -> bool {
-        self.table.is_some() // 活动格是原菜单目标；选区不可得也不能把行内格式降为正文命令。
-    }
-
-    /// 同一单格提交消费原正文 before；不在菜单 getter 或 IME 确认之后重新 capture。
-    pub(super) fn source_capture(&self) -> NativeMarkdownSelectionCapture {
-        self.source.clone()
-    }
-
-    /// 一次 canonical 提交的 pre-notify 收据续接同一菜单；后续 Native 仅检查这份 after。
-    pub(super) fn accept_table_commit(&self, receipt: &Rc<NativeMarkdownCommittedSelection>) {
-        *self.committed.borrow_mut() = Some(Rc::clone(receipt));
-    }
-
-    /// 原生重入可能只移动格内选区而不改文本；每个提交前步骤仍核原实际字段。
-    pub(super) fn table_input_current(&self, view: &PieceBackedMarkdownTextView) -> bool {
-        if self.committed.borrow().is_some()
-            && view
-                .ivars()
-                .active_table_cell
-                .borrow()
-                .as_ref()
-                .is_none_or(|cell| cell.authority.is_none())
-        {
-            // 本次字符提交已撤旧格 authority，或字段已正常结束，才不再读取旧格。
-            // 同代 body 多选收拢仍保留原 authority，后续步骤继续核真实 field 子选区。
-            return self.current();
-        }
-        let current = || self.current();
-        let result = (|| {
-            let field =
-                native_markdown_table_intent_step(&current, || view.existing_table_cell_editor())
-                    .ok()??;
-            let actual = native_markdown_table_intent_step(&current, || field.currentEditor())
-                .ok()??
-                .downcast::<NSTextView>()
-                .ok()?;
-            self.table_selection_for(view, &actual).ok()?;
-            Some(())
-        })(); // 所有临时 Native claim 先析构，再决定原动作能否继续。
-        result.is_some() && self.current()
-    }
-
-    /// 原实际 field editor、源 authority 和子选区必须同时相同；文本相同不能补签选择。
-    pub(super) fn table_selection_for(
-        &self,
-        view: &PieceBackedMarkdownTextView,
-        editor: &NSTextView,
-    ) -> Result<NSRange, String> {
-        let expired = || "表格选区已经改变，草稿将保持打开".to_owned();
-        let table = self.table.as_ref().ok_or_else(expired)?;
-        let (original_editor, selection) = table.selection.as_ref().ok_or_else(expired)?;
-        if !self.current()
-            || view
-                .ivars()
-                .active_table_cell
-                .borrow()
-                .as_ref()
-                .is_none_or(|cell| {
-                    cell.coordinate != table.coordinate
-                        || cell.source_utf16_range != table.source_range
-                        || cell.authority.as_ref().is_none_or(|authority| {
-                            Rc::as_ptr(authority).addr() != table.authority_identity
-                        })
-                })
-        {
-            return Err(expired()); // 原字段重新激活或 authority 更换后不能复用旧子选区。
-        }
-        let current = || self.current();
-        let original = native_markdown_table_intent_step(&current, || original_editor.load())
-            .map_err(|_| expired())?
-            .ok_or_else(expired)?;
-        let same = std::ptr::eq(&*original, editor);
-        drop(original); // Weak claim 的 release 也在原票核验范围内。
-        if !same || !self.current() {
-            return Err(expired());
-        }
-        let actual = native_markdown_table_intent_step(&current, || editor.selectedRange())
-            .map_err(|_| expired())?;
-        if actual != *selection {
-            return Err(expired()); // 排队期间仅移动格内选区也撤销旧命令，不套用后来选中的文字。
-        }
-        Ok(actual)
-    }
-
-    /// 同一原票跨菜单 getter 与队列消费复核，拒绝后不 capture 当前选择作为替补。
+    /// 同名文档重开、同caret重新选择、IME变化或旧owner撤权均不能恢复这次菜单权限。
     pub(super) fn current(&self) -> bool {
         ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
-            let Some(surface) = active.as_ref() else {
-                return false; // 关闭或暂借 owner 期间没有可消费原菜单动作的当前正文。
-            };
-            let Some(editor) = surface.editor.as_ref() else {
-                return false; // 原文档已经离开，后继空态不能承接旧动作。
-            };
-            let view = &editor.backend.text_view;
-            self.owner == std::ptr::from_ref(&*surface.controller).addr()
-                && native_markdown_controller_has_foreground_authority(&surface.controller)
-                && !native_markdown_operation_is_busy(
-                    surface.pending_note_switch.is_some(),
-                    surface.pending_file_mutation.is_some(),
-                )
-                && self.view_identity == std::ptr::from_ref(&**view).addr()
-                && std::rc::Weak::ptr_eq(&self.document, &Rc::downgrade(editor.document()))
-                && !view.ivars().textkit_graph_teardown.get()
-                && view.ivars().table_input_intent_epoch.get() == self.input_epoch
-                && self
-                    .committed
-                    .borrow()
-                    .as_ref()
-                    .map_or_else(|| self.source.current(), |receipt| receipt.current())
-            // source 同时核原 generation、长度、完整选择、serial、fold、mode 和 owner；
-            // 正文选择 A→B→A 也不能复活原票；格内另核真实 field editor 和 selectedRange。
+            active.as_ref().is_some_and(|surface| {
+                self.owns(surface)
+                    && surface.editor.as_ref().is_some_and(|editor| {
+                        editor
+                            .text_view
+                            .input_state()
+                            .is_ok_and(|state| state == self.input)
+                            && match (&self.cell, editor.body.active_cell_body()) {
+                                (None, None) => true,
+                                (Some(original), Some(actual)) => {
+                                    std::rc::Weak::ptr_eq(&original.body, &Rc::downgrade(&actual))
+                                        && actual.view().is_ok_and(|view| {
+                                            view.input_state()
+                                                .is_ok_and(|state| state == original.input)
+                                        })
+                                }
+                                _ => false, // 新开、结束或重开草稿都撤销旧菜单，不重新捕获客户。
+                            }
+                    })
+            })
         })
+    }
+
+    /// 原格提交只允许更新输入事实；窗口、文稿和分页owner的归属在提交前后保持同一张弱票。
+    fn owns(&self, surface: &NativeMarkdownWindowSurface) -> bool {
+        self.owner == std::ptr::from_ref(&*surface.controller).addr()
+            && native_markdown_controller_has_foreground_authority(&surface.controller)
+            && surface.pending_note_switch.is_none()
+            && surface.pending_file_mutation.is_none()
+            && surface.editor.as_ref().is_some_and(|editor| {
+                std::rc::Weak::ptr_eq(&self.document, &Rc::downgrade(editor.document()))
+                    && std::rc::Weak::ptr_eq(&self.body, &Rc::downgrade(&editor.body))
+            })
+    }
+
+    /// 明确的正文命令直接进原Input；public command仍会把已接纳导航后的后继命令排在原队列。
+    pub(super) fn perform(&self, action: isize) -> Result<(), String> {
+        if !self.current() {
+            return Err("正文菜单对应的笔记或选择已经改变".into());
+        }
+        let body = ACTIVE_NATIVE_MARKDOWN_SURFACE
+            .with_borrow(|active| {
+                active
+                    .as_ref()?
+                    .editor
+                    .as_ref()
+                    .map(|editor| Rc::clone(&editor.body))
+            })
+            .ok_or("正文编辑器已经关闭")?;
+        if !self.current() {
+            return Err("正文菜单对应的输入已经改变".into());
+        }
+        // 原字段的历史与八项行内格式都留在原草稿，不能先提交而改掉历史或丢失有向子选区。
+        let local = self.cell.is_some() && matches!(action, 22 | 23 | 103..=108 | 113..=114);
+        let mut committed = None;
+        let target = if local {
+            body.active_cell_body().ok_or("原单元格已经关闭")?
+        } else {
+            // 块格式和插表保持旧交互：结束原格后作用于同一正文；未完成或marked失败直接保留草稿。
+            if self.cell.is_some() {
+                committed = Some(
+                    body.commit_active_cell()
+                        .map_err(|cause| cause.to_string())?
+                        .ok_or("原单元格已经改变，正文命令已取消")?,
+                );
+            }
+            Rc::clone(&body)
+        };
+        let view = target.view().map_err(|cause| cause.to_string())?;
+        if let Some(committed) = committed {
+            // 自己的提交已推进输入代次，只消费该次after；Native重入不得让旧菜单捕获后继caret。
+            let current = || {
+                ACTIVE_NATIVE_MARKDOWN_SURFACE
+                    .with_borrow(|active| active.as_ref().is_some_and(|surface| self.owns(surface)))
+                    && body.active_cell_body().is_none()
+                    && view.session_is_current()
+            };
+            match committed.outcome {
+                super::paged_input::NativeMarkdownPagedInputOutcome::Committed(after) => {
+                    after.check_current(&|_| current()).map_err(|cause| {
+                        format!("单元格已提交，后续正文命令因输入改变而取消：{cause}")
+                    })?;
+                }
+                super::paged_input::NativeMarkdownPagedInputOutcome::Unchanged(after) => {
+                    if !current() || !view.input_state().is_ok_and(|state| state == after) {
+                        return Err("单元格已结束，后续正文命令因输入改变而取消".into());
+                    }
+                }
+            }
+        } else if !self.current() {
+            return Err("原菜单对应的输入已经改变".into());
+        }
+        match action {
+            22 => view.command(sel!(undo:)),
+            23 => view.command(sel!(redo:)),
+            118 => view.insert_default_table(),
+            100..=117 => view.apply_format(native_markdown_format_action(action)?),
+            _ => return Err("该动作不是正文编辑命令".into()),
+        }
+        .map_err(|cause| cause.to_string())
     }
 }

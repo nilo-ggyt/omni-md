@@ -116,6 +116,62 @@ pub(super) struct Machine {
 }
 
 impl Machine {
+    /// 原 row 票证明 BOF/完整换行之后的 GB1/GB4 首边界；未读内部不产生任何字素记录。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(super) fn begin_table(
+        &mut self,
+        span: crate::markdown_layout_source::table_rows::TableSpan,
+        index: &mut BoundaryIndex,
+        step: &mut Step,
+        records: usize,
+    ) -> Result<bool> {
+        if self
+            .last_boundary
+            .is_none_or(|last| last.byte < span.start.byte)
+        {
+            if step.records == records {
+                return Ok(false);
+            }
+            index.push(span.start)?;
+            self.last_boundary = Some(span.start);
+            step.records += 1;
+        }
+        // 已读短前缀只保其真实历史记录；剩余正文没有要恢复的 GCB 上下文，末 CR/LF 将实际重入 DFA。
+        self.byte = span.tail.byte;
+        self.utf16 = span.tail.utf16;
+        self.used = 0;
+        self.needed = 0;
+        self.pending = [0; 4];
+        self.state = State::default();
+        Ok(true)
+    }
+
+    /// 真末 CR/LF 已完整消费后才提交 GB4 尾端，未终止的真实 Source EOF 则由 GB2 认证。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(super) fn finish_table(
+        &mut self,
+        span: crate::markdown_layout_source::table_rows::TableSpan,
+        index: &mut BoundaryIndex,
+        step: &mut Step,
+    ) -> Result<()> {
+        if self.byte != span.end.byte
+            || self.utf16 != span.end.utf16
+            || self.used != 0
+            || !span.eof && !matches!(self.state.previous, Some(1 | 2))
+        {
+            return Err(Error::CorruptMetadata);
+        }
+        if span.eof {
+            return self.finish(index, step);
+        }
+        if self.last_boundary != Some(span.end) {
+            index.push(span.end)?;
+            self.last_boundary = Some(span.end);
+            step.records += 1;
+        }
+        self.frontier = Some(span.end);
+        Ok(())
+    }
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn last_committed_boundary(&self) -> Option<Boundary> {
         self.last_boundary
@@ -126,6 +182,28 @@ impl Machine {
         byte: u8,
         index: &mut BoundaryIndex,
         step: &mut Step,
+    ) -> Result<()> {
+        self.push_scalar_byte(byte, index, step, false)
+    }
+
+    /// 末尾真实 CR/LF 只恢复规则后缀；隐藏内部不能写边界或扩大已分类前沿。
+    #[cfg(feature = "paged-line-compose")]
+    pub(super) fn push_fold_tail(
+        &mut self,
+        byte: u8,
+        index: &mut BoundaryIndex,
+        step: &mut Step,
+    ) -> Result<()> {
+        self.push_scalar_byte(byte, index, step, true)
+    }
+
+    /// 原 UTF8 解码和规则状态始终只有一份；opaque_tail 仅允许已证明隐区末端的真实控制字节。
+    fn push_scalar_byte(
+        &mut self,
+        byte: u8,
+        index: &mut BoundaryIndex,
+        step: &mut Step,
+        opaque_tail: bool,
     ) -> Result<()> {
         let position = self.byte;
         // 此byte已经从真实piece解引用；即使下面发现UTF8错误，也要计入实际消耗后永久失败。
@@ -152,12 +230,15 @@ impl Machine {
             .ok()
             .and_then(|value| value.chars().next())
             .ok_or(Error::InvalidUtf8)?;
+        if opaque_tail && !matches!(scalar, '\r' | '\n') {
+            return Err(Error::CorruptMetadata);
+        } // 只有实际硬控制能切断任意长 RI/emoji/Indic 后缀，不能拿任意隐藏标量重置状态。
         let boundary = Boundary {
             byte: self.scalar_start,
             utf16: self.utf16,
         };
         let value = properties(scalar);
-        if self.state.break_before(value) {
+        if !opaque_tail && self.state.break_before(value) && self.last_boundary != Some(boundary) {
             // 只有实际规则确认的边界才写索引；IO失败不会继续更新或假装发布这一记录。
             index.push(boundary)?;
             self.last_boundary = Some(boundary);
@@ -167,7 +248,9 @@ impl Machine {
                 .ok_or(Error::CoordinateOverflow)?;
         }
         self.state.advance(value);
-        self.frontier = Some(boundary);
+        if !opaque_tail {
+            self.frontier = Some(boundary);
+        }
         self.utf16 = self
             .utf16
             .checked_add(scalar.len_utf16())
@@ -177,6 +260,32 @@ impl Machine {
             .scalars
             .checked_add(1)
             .ok_or(Error::CoordinateOverflow)?;
+        Ok(())
+    }
+
+    /// 已完整读取首分隔符后才允许跨过隐区；坐标跳跃不产生任何读取、标量或边界计数。
+    #[cfg(feature = "paged-line-compose")]
+    pub(super) fn jump_fold(
+        &mut self,
+        from: Boundary,
+        to: Boundary,
+        visible_start: Boundary,
+    ) -> Result<()> {
+        if self.used != 0
+            || self.byte != from.byte
+            || self.utf16 != from.utf16
+            || to.byte < from.byte
+            || to.utf16 < from.utf16
+            || self.last_boundary != Some(visible_start)
+            || !matches!(self.state.previous, Some(1 | 2))
+        {
+            return Err(Error::CorruptMetadata);
+        }
+        self.byte = to.byte;
+        self.utf16 = to.utf16;
+        self.frontier = Some(visible_start);
+        // 保留真实首控制后缀，随后只消费真实末控制；两者均由 GB4/5 切断隐藏文本上下文。
+        // 无终止符的真正 EOF 不再查询后继，只能由原 finish 发布 GB2。
         Ok(())
     }
 

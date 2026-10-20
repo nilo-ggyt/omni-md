@@ -168,7 +168,11 @@ impl GeneralCategory {
 
     #[inline(always)]
     pub(crate) const fn flag_unsafe(self) -> u32 {
-        if self.0 < 32 { 1 << self.0 } else { 0 }
+        if self.0 < 32 {
+            1 << self.0
+        } else {
+            0
+        }
     }
 
     #[inline(always)]
@@ -670,11 +674,11 @@ mod icu {
         CanonicalCompositionBorrowed, CanonicalDecompositionBorrowed, Decomposed,
     };
     use icu_properties::{
-        CodePointMapData, PropertyNamesShort,
         props::{
             BidiMirroringGlyph, CanonicalCombiningClass as IcuCanonicalCombiningClass,
             GeneralCategory as IcuGeneralCategory, Script as IcuScript,
         },
+        CodePointMapData, PropertyNamesShort,
     };
 
     pub(crate) fn script_for(c: u32) -> Script {
@@ -765,7 +769,7 @@ mod icu {
 #[cfg(not(feature = "icu"))]
 #[expect(clippy::manual_range_contains)]
 mod builtin {
-    use super::{super::algs::*, Codepoint, GeneralCategory, Script, ucd_table::ucd::*};
+    use super::{super::algs::*, ucd_table::ucd::*, Codepoint, GeneralCategory, Script};
 
     pub(crate) fn script_for(c: u32) -> Script {
         ucd_sc_map[ucd_sc(c as usize) as usize]
@@ -823,7 +827,11 @@ mod builtin {
             HB_CODEPOINT_DECODE3_3(v?)
         };
 
-        if u == 0 { None } else { Some(u) }
+        if u == 0 {
+            None
+        } else {
+            Some(u)
+        }
     }
 
     pub(crate) fn decompose_impl(ab: Codepoint) -> Option<(Codepoint, Codepoint)> {
@@ -941,12 +949,8 @@ mod tests {
     fn general_category_ranges() {
         use super::GeneralCategory as Gc;
         assert!(!Gc::CONTROL.in_range_inclusive(Gc::FORMAT, Gc::NON_SPACING_MARK));
-        assert!(
-            Gc::LOWERCASE_LETTER.in_range_inclusive(Gc::LOWERCASE_LETTER, Gc::UPPERCASE_LETTER)
-        );
-        assert!(
-            Gc::UPPERCASE_LETTER.in_range_inclusive(Gc::LOWERCASE_LETTER, Gc::UPPERCASE_LETTER)
-        );
+        assert!(Gc::LOWERCASE_LETTER.in_range_inclusive(Gc::LOWERCASE_LETTER, Gc::UPPERCASE_LETTER));
+        assert!(Gc::UPPERCASE_LETTER.in_range_inclusive(Gc::LOWERCASE_LETTER, Gc::UPPERCASE_LETTER));
         assert!(!Gc::SPACING_MARK.in_range_inclusive(Gc::LOWERCASE_LETTER, Gc::UPPERCASE_LETTER));
     }
 

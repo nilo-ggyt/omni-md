@@ -2,7 +2,7 @@
 
 use super::*;
 
-fn counts(surface: &NativeMarkdownEditorSurface) -> [u64; 4] {
+fn counts(surface: &NativeMarkdownTextKitEditorSurface) -> [u64; 4] {
     let storage = surface.backend.text_storage.ivars();
     [
         storage.character_process_count.get(),
@@ -14,7 +14,7 @@ fn counts(surface: &NativeMarkdownEditorSurface) -> [u64; 4] {
 
 /// 方向来自产品当前 Known/原 capture；真实单范围也须一致，不能用协议适配值假装 Native 已安装。
 fn require_selection(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     expected: MarkdownTextSelection,
 ) -> Result<(), String> {
     let captured = surface
@@ -41,7 +41,7 @@ fn require_selection(
     Ok(())
 }
 
-pub(super) fn verify(surface: &NativeMarkdownEditorSurface) -> Result<(), String> {
+pub(super) fn verify(surface: &NativeMarkdownTextKitEditorSurface) -> Result<(), String> {
     let original = surface
         .backend
         .text_view

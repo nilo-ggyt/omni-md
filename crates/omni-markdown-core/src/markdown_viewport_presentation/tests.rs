@@ -516,6 +516,129 @@ fn only_the_active_inline_structure_reveals_its_markers() {
 }
 
 #[test]
+/// 原CodeMirror只取选区端点祖先，双侧边缘可编辑，完整跨过的内层结构不因此显露。
+fn inline_markers_follow_inclusive_endpoints_instead_of_selection_overlap() {
+    let source = "前😀 **粗体😀** 后";
+    let origin = 191;
+    let start = origin + utf16_offset_at_byte(source, source.find("**").unwrap());
+    let end = start + "**粗体😀**".encode_utf16().count();
+    let source_end = origin + source.encode_utf16().count();
+    for (selection, active) in [
+        (origin..source_end, false),
+        (origin..start, true),
+        (end..source_end, true),
+        (start..end, true),
+        (start..start, true),
+        (end..end, true),
+        (start + 2..source_end, true),
+    ] {
+        let forward = rebuilt_presentation(source, origin, selection.clone());
+        let reverse = rebuilt_presentation(source, origin, selection.end..selection.start);
+        assert_eq!(forward.runs(), reverse.runs());
+        for marker in [start, end - 2] {
+            assert_eq!(
+                forward
+                    .query(marker)
+                    .unwrap()
+                    .styles
+                    .contains(MarkdownPresentationStyles::HIDDEN_MARKER),
+                !active,
+                "原端点选择={selection:?}，marker={marker}"
+            );
+        }
+    }
+    let source = "a **outer *inner* outer** z";
+    let start = source.find("**").unwrap();
+    let end = source.rfind("**").unwrap() + 2;
+    let selected = rebuilt_presentation(source, 0, start..end);
+    assert!(
+        !selected
+            .query(start)
+            .unwrap()
+            .styles
+            .contains(MarkdownPresentationStyles::HIDDEN_MARKER)
+    );
+    assert!(
+        selected
+            .query(source.find("*inner*").unwrap())
+            .unwrap()
+            .styles
+            .contains(MarkdownPresentationStyles::HIDDEN_MARKER)
+    );
+}
+
+#[test]
+/// 围栏仅由本物理行端点激活；代码正文、跨块选择与后继行都不能显露首尾语法。
+fn fenced_code_markers_follow_endpoint_lines_and_preserve_unterminated_eof() {
+    for source in [
+        "前😀\n\n```text\n中文😀\nmore\n```  \n\n后\n",
+        "前😀\n\n  ```text\n中文😀\nmore\n  ```  \n\n后\n",
+        "前😀\r\n\r\n```text\r\n中文😀\r\nmore\r\n```  ",
+    ] {
+        let origin = 83;
+        let opening = source.find("```").unwrap();
+        let physical_opening = source[..opening].rfind('\n').map_or(0, |offset| offset + 1);
+        let closing = source.rfind("```").unwrap();
+        let next_line = opening + source[opening..].find('\n').unwrap() + 1;
+        let closing_end = source[closing..]
+            .find(['\r', '\n'])
+            .map_or(source.len(), |offset| closing + offset);
+        let position = |byte| origin + utf16_offset_at_byte(source, byte);
+        let opening = position(opening);
+        let closing = position(closing);
+        let body = position(source.find("中文").unwrap());
+        for (selection, open_active, close_active) in [
+            (opening + 1..opening + 1, true, false),
+            (
+                position(physical_opening)..position(physical_opening),
+                true,
+                false,
+            ),
+            (body..body, false, false),
+            (position(next_line)..position(next_line), false, false),
+            (closing + 1..closing + 1, false, true),
+            (position(closing_end)..position(closing_end), false, true),
+            (
+                origin..position(source.len()),
+                false,
+                !source.ends_with('\n'),
+            ),
+        ] {
+            let actual = rebuilt_presentation(source, origin, selection.clone());
+            let reverse = rebuilt_presentation(source, origin, selection.end..selection.start);
+            assert_eq!(actual.runs(), reverse.runs());
+            for (marker, active) in [(opening, open_active), (closing, close_active)] {
+                assert_eq!(
+                    actual
+                        .query(marker)
+                        .unwrap()
+                        .styles
+                        .contains(MarkdownPresentationStyles::HIDDEN_MARKER),
+                    !active,
+                    "物理行选择={selection:?}，marker={marker}"
+                );
+            }
+        }
+    }
+    for (source, active) in [
+        ("```text", true),
+        ("```text\n", false),
+        ("```text\n正文", false),
+    ] {
+        let eof = source.encode_utf16().count();
+        let actual = rebuilt_presentation(source, 0, eof..eof);
+        assert_eq!(
+            actual
+                .query(0)
+                .unwrap()
+                .styles
+                .contains(MarkdownPresentationStyles::HIDDEN_MARKER),
+            !active
+        );
+    }
+}
+
+#[test]
 /// Project parser byte ranges through Unicode into correctly offset absolute native coordinates.
 fn unicode_byte_offsets_become_absolute_utf16_ranges_inside_the_window() {
     // Combine a surrogate-pair prefix, CJK strong text, and a combining suffix at a nonzero viewport origin.
@@ -590,6 +713,50 @@ fn setext_markers_are_hidden_without_underlining_the_heading_text() {
             .styles
             .contains(MarkdownPresentationStyles::HIDDEN_MARKER)
     );
+}
+
+#[test]
+/// 原同一事件栈还须保空 label、图片及 autolink；不能只修普通 Link 后破坏已有语法。
+fn link_markers_follow_real_child_events_for_images_and_empty_labels() {
+    for (source, visible) in [
+        ("[](https://example.com/empty)", ""),
+        ("![a [b] c](https://example.com/image)", "a [b] c"),
+        ("<https://example.com/auto>", "https://example.com/auto"),
+        ("[![alt](image) tail](https://example.com/outer)", " tail"),
+    ] {
+        let length = source.encode_utf16().count();
+        let presentation = rebuilt_presentation(source, 0, length + 1..length + 1);
+        assert!(
+            presentation
+                .query(0)
+                .unwrap()
+                .styles
+                .contains(MarkdownPresentationStyles::HIDDEN_MARKER),
+            "source={source:?}"
+        );
+        if visible.is_empty() {
+            for index in 0..length {
+                assert!(
+                    presentation
+                        .query(index)
+                        .unwrap()
+                        .styles
+                        .contains(MarkdownPresentationStyles::HIDDEN_MARKER)
+                );
+            }
+        } else {
+            let start = source.find(visible).unwrap();
+            let start = source[..start].encode_utf16().count();
+            for index in start..start + visible.encode_utf16().count() {
+                let styles = presentation.query(index).unwrap().styles;
+                assert!(styles.contains(MarkdownPresentationStyles::LINK));
+                assert!(
+                    !styles.contains(MarkdownPresentationStyles::MARKER),
+                    "source={source:?} index={index}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1359,4 +1526,93 @@ fn underline_reserves_completed_list_marker_records_before_pushing_pair() {
     // 空underline只有两个marker；精确剩余容量可以完整容纳，不能把空正文凭空计成第三条。
     super::add_sanitized_underline_structures("<u></u>", &mut decorations, 0).unwrap();
     assert_eq!(decorations.len(), limit);
+}
+
+#[test]
+fn underline_tokens_and_ink_never_interpret_parser_proven_code() {
+    for (source, code_style) in [
+        (
+            "```text\n<u>中文😀</u>\n```\ntail",
+            MarkdownPresentationStyles::FENCED_CODE,
+        ),
+        (
+            "    <u>中文😀</u>\n\ntail",
+            MarkdownPresentationStyles::FENCED_CODE,
+        ),
+        (
+            "`<u>中文😀</u>` tail",
+            MarkdownPresentationStyles::INLINE_CODE,
+        ),
+    ] {
+        let length = source.encode_utf16().count();
+        let presentation = rebuilt_presentation(source, 0, length..length);
+        let start = source.find("<u>").unwrap();
+        let end = source.find("</u>").unwrap() + 4;
+        for index in utf16_offset_at_byte(source, start)..utf16_offset_at_byte(source, end) {
+            let styles = presentation.query(index).unwrap().styles;
+            assert!(styles.contains(code_style));
+            assert!(!styles.contains(MarkdownPresentationStyles::UNDERLINE));
+            assert!(!styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER));
+            assert!(!styles.contains(MarkdownPresentationStyles::MARKER));
+        } // 标签、中文与emoji全部保持真实代码字符；不能只让末端line属性不画线。
+    }
+}
+
+#[test]
+fn code_fake_closers_do_not_consume_outer_underline_or_hide_code_characters() {
+    for source in [
+        "before <u>outside\n\n```text\n</u><u>literal</u>\n```\n\nafter</u> tail",
+        "before <u>outside `</u><u>literal</u>` after</u> tail",
+        "before <u>outside\n\n    </u><u>literal</u>\n\nafter</u> tail",
+    ] {
+        let length = source.encode_utf16().count();
+        let presentation = rebuilt_presentation(source, 0, length..length);
+        for word in ["outside", "after"] {
+            let index = utf16_offset_at_byte(source, source.find(word).unwrap());
+            assert!(
+                presentation
+                    .query(index)
+                    .unwrap()
+                    .styles
+                    .contains(MarkdownPresentationStyles::UNDERLINE)
+            );
+        }
+        let literal = utf16_offset_at_byte(source, source.find("literal").unwrap());
+        let styles = presentation.query(literal).unwrap().styles;
+        assert!(!styles.contains(MarkdownPresentationStyles::UNDERLINE));
+        assert!(!styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER));
+        let fake_close = utf16_offset_at_byte(source, source.find("</u>").unwrap());
+        assert!(
+            !presentation
+                .query(fake_close)
+                .unwrap()
+                .styles
+                .contains(MarkdownPresentationStyles::HIDDEN_MARKER)
+        );
+        let real_close = utf16_offset_at_byte(source, source.rfind("</u>").unwrap());
+        assert!(
+            presentation
+                .query(real_close)
+                .unwrap()
+                .styles
+                .contains(MarkdownPresentationStyles::HIDDEN_MARKER)
+        );
+        let tail = utf16_offset_at_byte(source, source.find("tail").unwrap());
+        assert!(
+            !presentation
+                .query(tail)
+                .unwrap()
+                .styles
+                .contains(MarkdownPresentationStyles::UNDERLINE)
+        );
+    } // 末端丢弃含代码的pair会丢after，盲扫描则会提前闭合；两种错误都由原外部close验证。
+    let source = "before `<u>` after</u> tail";
+    let length = source.encode_utf16().count();
+    let presentation = rebuilt_presentation(source, 0, length..length);
+    assert!(
+        presentation
+            .runs()
+            .iter()
+            .all(|run| !run.styles.contains(MarkdownPresentationStyles::UNDERLINE))
+    );
 }

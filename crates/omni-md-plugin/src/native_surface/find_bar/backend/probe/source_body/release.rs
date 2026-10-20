@@ -322,6 +322,11 @@ impl Retirement {
                     return Err("原Find实际字体/字节映射未归还".into());
                 }
             }
+            // 同次正文收据也保原可见/在途格的真实弱观察，不能只核主Reader而漏过派生显示目录。
+            // Cell仍用其实际原worker与FD事实，没有额外cache计数、资源账本或释放轮询。
+            for cell in &receipt.cells {
+                cell.verify_released()?;
+            }
         }
         for retired in &self.retired {
             let writer = retired.writer.snapshot();

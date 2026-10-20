@@ -5,6 +5,7 @@ use super::super::{
 };
 use super::*;
 const TAB_STOP: u8 = 14;
+pub(super) const TABLE_WIDTHS: u8 = 15;
 const CONTROL_ROWS: usize = 68;
 
 pub(super) struct ControlCapture {
@@ -37,21 +38,42 @@ impl GlyphStore {
                 }
             }
             let glyph_start = self.record_count()?;
-            let cluster_count = usize::from(!value.facts.source_utf16.is_empty());
+            let cluster_count = usize::from(
+                !value.facts.source_utf16.is_empty()
+                    && value.request.kind != MarkdownLineInlineControlKind::TableRow,
+            );
             let style_start = glyph_start
                 .checked_add(cluster_count)
                 .ok_or(Error::Overflow)?;
-            let kind = if value.request.kind == MarkdownLineInlineControlKind::Tab {
-                MarkdownComposedLinePartKind::Tab
-            } else {
-                MarkdownComposedLinePartKind::ParagraphBreak
+            let kind = match value.request.kind {
+                MarkdownLineInlineControlKind::Tab => MarkdownComposedLinePartKind::Tab,
+                MarkdownLineInlineControlKind::TableRow => MarkdownComposedLinePartKind::TableRow,
+                MarkdownLineInlineControlKind::FoldedSection => {
+                    MarkdownComposedLinePartKind::FoldedSection
+                }
+                _ => MarkdownComposedLinePartKind::ParagraphBreak,
             };
             let stops = if kind == MarkdownComposedLinePartKind::Tab {
                 value.paragraph.tab_stops.len()
             } else {
                 0
             };
-            let record = style_start.checked_add(stops).ok_or(Error::Overflow)?;
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            let table_rows = value
+                .table
+                .as_ref()
+                .map_or(0, |geometry| 1 + geometry.columns.len().div_ceil(7));
+            #[cfg(not(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            )))]
+            let table_rows = 0;
+            let record = style_start
+                .checked_add(stops + table_rows)
+                .ok_or(Error::Overflow)?;
             let origin = self.origins.checked_add(1).ok_or(Error::Overflow)?;
             let key = ItemKey { record, origin };
             let mut rows = Box::new([[0; 64]; CONTROL_ROWS]);
@@ -81,8 +103,29 @@ impl GlyphStore {
                 rows[length][56] = TAB_STOP;
                 length += 1;
             }
+            #[cfg(all(
+                feature = "s2-table-window-prototype",
+                feature = "paged-shaping-frontier"
+            ))]
+            if let Some(geometry) = &value.table {
+                // 列宽是已完成 Grid 的真实布局事实；每条固定 record 最多保存七列，无逐行常驻表。
+                rows[length][..8].copy_from_slice(&number(geometry.columns.len())?.to_le_bytes());
+                rows[length][56] = TABLE_WIDTHS;
+                length += 1;
+                for columns in geometry.columns.chunks(7) {
+                    for (index, width) in columns.iter().enumerate() {
+                        rows[length][index * 8..index * 8 + 8]
+                            .copy_from_slice(&width.to_le_bytes());
+                    }
+                    rows[length][56] = TABLE_WIDTHS;
+                    length += 1;
+                }
+            }
             let directory = Directory {
+                shaping_seams: [None; 2], // Tab、段分隔及表格控制只有原完整边界，没有字符整形 seam。
+                paragraph_inset_26_6: value.paragraph_inset_26_6,
                 facts: value.facts.clone(),
+                presentation: value.presentation, // 控制只接原响应自己的语义，不借相邻 glyph 或较新选择。
                 font: value.registered.registration().key(),
                 glyph_start,
                 glyph_count: 0,
@@ -91,11 +134,41 @@ impl GlyphStore {
                 previous: self.last_item,
                 origin,
                 style_start,
-                style_rows: stops,
+                style_rows: stops + table_rows,
                 features: stops,
                 language_bytes: 0,
-                x_advance: 0,
-                y_advance: 0,
+                x_advance: {
+                    #[cfg(all(
+                        feature = "s2-table-window-prototype",
+                        feature = "paged-shaping-frontier"
+                    ))]
+                    {
+                        value.table.as_ref().map_or(0, |geometry| geometry.width)
+                    }
+                    #[cfg(not(all(
+                        feature = "s2-table-window-prototype",
+                        feature = "paged-shaping-frontier"
+                    )))]
+                    {
+                        0
+                    }
+                },
+                y_advance: {
+                    #[cfg(all(
+                        feature = "s2-table-window-prototype",
+                        feature = "paged-shaping-frontier"
+                    ))]
+                    {
+                        value.table.as_ref().map_or(0, |geometry| geometry.height)
+                    }
+                    #[cfg(not(all(
+                        feature = "s2-table-window-prototype",
+                        feature = "paged-shaping-frontier"
+                    )))]
+                    {
+                        0
+                    }
+                },
                 kind,
                 tab_interval: if kind == MarkdownComposedLinePartKind::Tab {
                     value.paragraph.default_tab_interval_26_6

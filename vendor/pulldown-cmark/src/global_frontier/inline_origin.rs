@@ -1,13 +1,13 @@
 // Copyright 2015 Google Inc. All rights reserved.
 // 物理行来源沿固定 pulldown-cmark 0.13.4 paragraph 路径；完整 MIT 条款见 LICENSE。
 
-//! 真实闭合 InlineBlock 的逐物理行来源；不发布 inline 样式、Ready 或省略正文权限。
+//! 原闭合 Inline/Leaf 共用逐物理行内核；只发布源坐标，不授予样式、Ready或省略正文权限。
 
 use std::ops::Range;
 
 use super::{
     ContainerPrefix, GlobalFrontierError, GlobalSourceAuthority, GlobalWork, InlineBlockKind,
-    PrefixProgress, VerifiedGlobalInlineBlock,
+    LeafBlockKind, PrefixProgress, VerifiedGlobalInlineBlock, VerifiedGlobalLeafBlock,
 };
 use crate::block_frontier::{SourceFrame, MAX_FRONTIER_STEP_BYTES};
 use crate::line_start_stream::{
@@ -21,14 +21,14 @@ const PREFIX_WORKSPACE_WORK: usize = 1024;
 
 #[derive(Clone, Copy, Debug)]
 /// 同一游标从首行到终行累计的独立上限；advance 与后继行均不得重新发放总 fuel。
-pub struct InlineOriginLimits {
+pub struct BlockOriginLimits {
     pub max_byte_work: usize,
     pub max_transitions: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// 四个 LineStart 标量仍相对其实际 source_origin，不能把 ix 当作归一化文本偏移。
-pub struct InlineOriginState {
+pub struct BlockOriginState {
     pub source_origin: usize,
     pub relative_byte: usize,
     pub tab_start: usize,
@@ -36,7 +36,7 @@ pub struct InlineOriginState {
     pub min_hrule_offset: usize,
 }
 
-impl InlineOriginState {
+impl BlockOriginState {
     fn capture(source_origin: usize, state: LineStartState) -> Self {
         Self {
             source_origin,
@@ -50,30 +50,128 @@ impl InlineOriginState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// 首行直接消费真实 opening 后的 capture；续行才重新匹配原容器与 paragraph 空白。
-pub enum InlineOriginLineKind {
+pub enum BlockOriginLineKind {
     First,
     Continuation,
+}
+
+/// 行的真实块种类随原票保留；Leaf不能伪装成Paragraph取得另一个语法入口。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockOriginKind {
+    Inline(InlineBlockKind),
+    Leaf(LeafBlockKind),
+}
+
+/// 两种真正闭合的source owner共享原spine和行算法，不建立第二套正文或可构造的范围协议。
+enum OriginBlock {
+    Inline(VerifiedGlobalInlineBlock),
+    Leaf(VerifiedGlobalLeafBlock),
+}
+
+impl OriginBlock {
+    fn revision(&self) -> u64 {
+        match self {
+            Self::Inline(block) => block.revision,
+            Self::Leaf(block) => block.source_revision(),
+        }
+    }
+    fn source_end(&self) -> usize {
+        match self {
+            Self::Inline(block) => block.source_end,
+            Self::Leaf(block) => block.source_end(),
+        }
+    }
+    fn start(&self) -> usize {
+        match self {
+            Self::Inline(block) => block.start,
+            Self::Leaf(block) => block.source_range().start,
+        }
+    }
+    fn end(&self) -> usize {
+        match self {
+            Self::Inline(block) => block.end,
+            Self::Leaf(block) => block.source_range().end,
+        }
+    }
+    fn lexical_end(&self) -> usize {
+        match self {
+            Self::Inline(block) => block.lexical_end,
+            Self::Leaf(block) => block.source_range().end,
+        }
+    }
+    fn options(&self) -> crate::Options {
+        match self {
+            Self::Inline(block) => block.options,
+            Self::Leaf(block) => block.options(),
+        }
+    }
+    fn first_state_origin(&self) -> usize {
+        match self {
+            Self::Inline(block) => block.first_state_origin,
+            Self::Leaf(block) => block.first_state_origin,
+        }
+    }
+    fn spine(&self) -> &crate::structural_spine::StructuralSpineSnapshot {
+        match self {
+            Self::Inline(block) => &block.spine,
+            Self::Leaf(block) => &block.spine,
+        }
+    }
+    fn kind(&self) -> BlockOriginKind {
+        match self {
+            Self::Inline(block) => BlockOriginKind::Inline(block.kind),
+            Self::Leaf(block) => BlockOriginKind::Leaf(block.kind()),
+        }
+    }
+    fn terminal_matches(&self, content_end: usize, line_end: usize) -> bool {
+        match self {
+            Self::Inline(block) => {
+                content_end == block.last_content_end && line_end == block.last_line_end
+            }
+            Self::Leaf(block) => line_end == block.source_range().end,
+        }
+    }
+    fn continuation_space(&self) -> usize {
+        match self {
+            Self::Inline(_) => 4,
+            Self::Leaf(block) => match block.details() {
+                super::LeafBlockDetails::FencedCode { indent, .. } => *indent,
+                super::LeafBlockDetails::IndentedCode { .. } => 4,
+                _ => 0,
+            },
+        }
+    }
+    fn paragraph_space(&self) -> bool {
+        matches!(self, Self::Inline(_))
+    }
+    fn has_closed_line_end(&self) -> bool {
+        matches!(self, Self::Leaf(_))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// 只含绝对源 byte 元数据。终行 EOL 仍是真实 separator，不代表最终 Soft/HardBreak。
 /// Setext underline 不属于本记录；终行 kind 与 block_kind 也不授予 inline 配对权限。
-pub struct InlineOriginLine {
+pub struct BlockOriginLine {
+    // 同一真实闭合块的固定归属随行交付；语义游标不得拿另一块相似的 prefix/content 续权。
+    pub(super) revision: u64,
+    pub(super) source_end: usize,
+    pub(super) block_source: Range<usize>,
     physical: Range<usize>,
     prefix: Range<usize>,
     content: Range<usize>,
     eol: Range<usize>,
     ordinal: usize,
-    kind: InlineOriginLineKind,
+    kind: BlockOriginLineKind,
     terminal: bool,
-    block_kind: InlineBlockKind,
+    block_kind: BlockOriginKind,
     matched_depth: usize,
     total_depth: usize,
-    container_state: InlineOriginState,
-    content_state: InlineOriginState,
+    container_state: BlockOriginState,
+    content_state: BlockOriginState,
 }
 
-impl InlineOriginLine {
+impl BlockOriginLine {
     pub fn physical_range(&self) -> Range<usize> {
         self.physical.clone()
     }
@@ -89,13 +187,13 @@ impl InlineOriginLine {
     pub fn line_ordinal(&self) -> usize {
         self.ordinal
     }
-    pub fn kind(&self) -> InlineOriginLineKind {
+    pub fn kind(&self) -> BlockOriginLineKind {
         self.kind
     }
     pub fn is_terminal(&self) -> bool {
         self.terminal
     }
-    pub fn block_kind(&self) -> InlineBlockKind {
+    pub fn block_kind(&self) -> BlockOriginKind {
         self.block_kind
     }
     pub fn matched_depth(&self) -> usize {
@@ -105,17 +203,17 @@ impl InlineOriginLine {
         self.total_depth
     }
     /// First 返回真实 opening 后原状态；Continuation 返回容器匹配结束时的原状态。
-    pub fn container_state(&self) -> InlineOriginState {
+    pub fn container_state(&self) -> BlockOriginState {
         self.container_state
     }
     /// First 与 container_state 相同；Continuation 额外经过原 Space(4) 与 AllSpace。
-    pub fn content_state(&self) -> InlineOriginState {
+    pub fn content_state(&self) -> BlockOriginState {
         self.content_state
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum InlineOriginStep {
+pub enum BlockOriginStep {
     Progress {
         next_byte: usize,
         work: GlobalWork,
@@ -125,7 +223,7 @@ pub enum InlineOriginStep {
         work: GlobalWork,
     },
     Line {
-        line: InlineOriginLine,
+        line: BlockOriginLine,
         work: GlobalWork,
     },
     Complete {
@@ -149,9 +247,9 @@ enum Phase {
 /// 独占一个真实 capture，另保一个固定 prefix 游标与一个 LineStart 续体；
 /// 没有 source/整行 String、角色 Vec、行集合或 source/root 强 owner。
 /// Core 仍必须绑定实际 DocRoot Weak；本 vendor 只能核 source revision 与真实源尾。
-pub struct InlineOriginCursor {
-    block: VerifiedGlobalInlineBlock,
-    limits: InlineOriginLimits,
+pub struct BlockOriginCursor {
+    block: OriginBlock,
+    limits: BlockOriginLimits,
     total: GlobalWork,
     phase: Phase,
     prefix: Option<ContainerPrefix>,
@@ -164,27 +262,28 @@ pub struct InlineOriginCursor {
     container_state: LineStartState,
     content_state: LineStartState,
     failure: Option<GlobalFrontierError>,
+    allocated: usize,
 }
 
-impl std::fmt::Debug for InlineOriginCursor {
+impl std::fmt::Debug for BlockOriginCursor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // 不沿共享页递归展开，也不读取正文生成诊断。
         formatter
-            .debug_struct("InlineOriginCursor")
-            .field("revision", &self.block.revision)
+            .debug_struct("BlockOriginCursor")
+            .field("revision", &self.block.revision())
             .field("next_byte", &self.next_byte())
             .field("line_ordinal", &self.ordinal)
-            .field("scope_depth", &self.block.spine.len())
+            .field("scope_depth", &self.block.spine().len())
             .field("work", &self.total)
             .field("failure", &self.failure)
             .finish()
     }
 }
 
-impl InlineOriginCursor {
+impl BlockOriginCursor {
     pub(super) fn from_verified(
         block: VerifiedGlobalInlineBlock,
-        limits: InlineOriginLimits,
+        limits: BlockOriginLimits,
     ) -> Result<Self, GlobalFrontierError> {
         if limits.max_byte_work == 0 || limits.max_transitions < MIN_STEP {
             return Err(GlobalFrontierError::InvalidBudget);
@@ -210,13 +309,50 @@ impl InlineOriginCursor {
             matched: block.spine.len(),
             container_state: block.first_state,
             content_state: block.first_state,
-            block,
+            block: OriginBlock::Inline(block),
             limits,
             total: GlobalWork::default(),
             phase: Phase::First,
             prefix: None,
             operation: None,
             failure: None,
+            allocated: 0,
+        })
+    }
+
+    /// 只有同producer的真实Leaf能签发；首行状态直接继承opening，不重扫容器或按字节数猜Tab列。
+    pub(super) fn from_leaf(
+        block: &VerifiedGlobalLeafBlock,
+        limits: BlockOriginLimits,
+    ) -> Result<Self, GlobalFrontierError> {
+        let source = block.source_range();
+        if limits.max_byte_work == 0 || limits.max_transitions < MIN_STEP {
+            return Err(GlobalFrontierError::InvalidBudget);
+        }
+        if block.physical_start() > source.start
+            || source.start > source.end
+            || source.end > block.source_end()
+            || block.first_state_origin.checked_add(block.first_state.ix) != Some(source.start)
+            || block.first_state.tab_start > block.first_state.ix
+        {
+            return Err(GlobalFrontierError::InvalidFrame);
+        }
+        Ok(Self {
+            physical_start: block.physical_start(),
+            content_start: source.start,
+            next: source.start,
+            ordinal: 0,
+            matched: block.scope_depth(),
+            container_state: block.first_state,
+            content_state: block.first_state,
+            block: OriginBlock::Leaf(block.clone()),
+            limits,
+            total: GlobalWork::default(),
+            phase: Phase::First,
+            prefix: None,
+            operation: None,
+            failure: None,
+            allocated: 0,
         })
     }
 
@@ -234,6 +370,11 @@ impl InlineOriginCursor {
                 .map_or(self.next, LineStartStream::next_byte),
             _ => self.next,
         }
+    }
+
+    /// 记录每条真实 prefix 临时目录的实际新增容量；归还旧目录不会重置原请求的累计费用。
+    pub fn allocated_workspace_bytes(&self) -> usize {
+        self.allocated
     }
 
     pub fn total_work(&self) -> GlobalWork {
@@ -262,14 +403,14 @@ impl InlineOriginCursor {
         frame: SourceFrame<'_>,
         authority: GlobalSourceAuthority,
         budget: usize,
-    ) -> Result<InlineOriginStep, GlobalFrontierError> {
+    ) -> Result<BlockOriginStep, GlobalFrontierError> {
         if let Some(error) = self.failure {
             return Err(error);
         }
         if authority.cancelled {
             return Err(self.fail(GlobalFrontierError::Cancelled));
         }
-        if authority.current_revision != self.block.revision {
+        if authority.current_revision != self.block.revision() {
             return Err(self.fail(GlobalFrontierError::SourceSuperseded));
         }
         if !(MIN_STEP..=MAX_FRONTIER_STEP_BYTES).contains(&budget) {
@@ -280,13 +421,13 @@ impl InlineOriginCursor {
         // 已取消、源 authority 撤销及内部/fuel 失败则在各自入口保存 sticky 首因。
         crate::source_frontier::admitted_bytes(
             &frame,
-            self.block.revision,
-            self.block.source_end,
+            self.block.revision(),
+            self.block.source_end(),
             self.next_byte(),
             budget,
         )?;
         if matches!(self.phase, Phase::Complete) {
-            return Ok(InlineOriginStep::Complete {
+            return Ok(BlockOriginStep::Complete {
                 work: GlobalWork::default(),
             });
         }
@@ -300,7 +441,7 @@ impl InlineOriginCursor {
         &mut self,
         frame: SourceFrame<'_>,
         budget: usize,
-    ) -> Result<InlineOriginStep, GlobalFrontierError> {
+    ) -> Result<BlockOriginStep, GlobalFrontierError> {
         let remaining_transitions = self
             .limits
             .max_transitions
@@ -319,7 +460,7 @@ impl InlineOriginCursor {
         // 最小2048仍可给原共享操作224 fuel；未使用的1024不能在零字节阶段反复累计。
         let child_fuel = (step_fuel - PREFIX_WORKSPACE_WORK - CONTROL_WORK) / 4;
         let byte_fuel = remaining_bytes.min(child_fuel);
-        let spine_before = self.block.spine.work_used();
+        let spine_before = self.block.spine().work_used();
         let mut work = GlobalWork {
             byte_reads: 0,
             transitions: CONTROL_WORK,
@@ -334,7 +475,7 @@ impl InlineOriginCursor {
                 self.phase = Phase::Content;
             }
             Phase::BeginContinuation => {
-                if self.next >= self.block.lexical_end {
+                if self.next >= self.block.lexical_end() {
                     return Err(GlobalFrontierError::InvalidFrame);
                 }
                 if self.prefix.is_some() {
@@ -344,20 +485,20 @@ impl InlineOriginCursor {
                 self.physical_start = self.next;
                 record_workspace_operation(&mut workspace_work)?;
                 self.prefix = Some(ContainerPrefix::new(
-                    self.block.revision,
+                    self.block.revision(),
                     self.physical_start,
-                    self.block.source_end,
-                    &self.block.spine,
-                    self.block.options,
+                    self.block.source_end(),
+                    self.block.spine(),
+                    self.block.options(),
                 ));
                 self.phase = Phase::Containers;
             }
             Phase::Containers => {
-                let (progress, child) = self
-                    .prefix
-                    .as_mut()
-                    .expect("真实 prefix 已创建")
-                    .advance(&frame, byte_fuel, child_fuel)?;
+                let prefix = self.prefix.as_mut().expect("真实 prefix 已创建");
+                let before = prefix.allocated_workspace_bytes();
+                let result = prefix.advance(&frame, byte_fuel, child_fuel);
+                self.allocated += prefix.allocated_workspace_bytes() - before;
+                let (progress, child) = result?;
                 work.byte_reads += child.byte_reads;
                 work.transitions += child.transitions;
                 match progress {
@@ -366,7 +507,11 @@ impl InlineOriginCursor {
                         self.matched = matched;
                         record_workspace_operation(&mut workspace_work)?;
                         self.prefix = None;
-                        self.start_space(state, LineStartOperation::Space(4), Phase::Space)?;
+                        self.start_space(
+                            state,
+                            LineStartOperation::Space(self.block.continuation_space()),
+                            Phase::Space,
+                        )?;
                     }
                     PrefixProgress::Progress => (),
                     PrefixProgress::NeedInput { .. } => need_input = true,
@@ -389,7 +534,7 @@ impl InlineOriginCursor {
                 match step.progress {
                     LineStartProgress::Complete { state, .. } => {
                         self.operation = None;
-                        if all_space {
+                        if all_space || !self.block.paragraph_space() {
                             // 原 parse_paragraph 在 scan_space(4) 的部分消费结果上再 scan_all_space；
                             // 未匹配完的容器仍是 lazy continuation，matched 不被改成总深度。
                             self.content_state = state;
@@ -410,8 +555,11 @@ impl InlineOriginCursor {
             Phase::Content => {
                 let limit = frame.bytes.len().min(byte_fuel).min(child_fuel);
                 for &byte in &frame.bytes[..limit] {
+                    if self.next == self.block.lexical_end() && self.block.has_closed_line_end() {
+                        break; // 真Leaf closure允许停在closer尾，不能读取后继物理行前缀或虚构其EOF。
+                    }
                     // 本层只识别 ASCII EOL；Unicode byte 保留绝对源坐标，不复制、归一化或切片为 str。
-                    if self.next >= self.block.lexical_end {
+                    if self.next >= self.block.lexical_end() {
                         return Err(GlobalFrontierError::InvalidFrame);
                     }
                     work.byte_reads += 1;
@@ -436,13 +584,18 @@ impl InlineOriginCursor {
                     }
                 }
                 if matches!(self.phase, Phase::Content) {
-                    let consumed = self.next - frame.byte_start;
-                    if consumed == frame.bytes.len() {
-                        if frame.real_eof {
-                            // 无 EOL 的最后一行只由真实 source_end EOF 关闭；lexical_end 不是伪 EOF。
-                            line = Some(self.finish_line(self.next, self.next)?);
-                        } else {
-                            need_input = true;
+                    if self.next == self.block.lexical_end() && self.block.has_closed_line_end() {
+                        // Leaf闭合末端来自原producer，可在显式closer尾处结束原行；这不是frame尾或伪EOF。
+                        line = Some(self.finish_line(self.next, self.next)?);
+                    } else {
+                        let consumed = self.next - frame.byte_start;
+                        if consumed == frame.bytes.len() {
+                            if frame.real_eof {
+                                // 无 EOL 的最后一行只由真实 source_end EOF 关闭；lexical_end 不是伪 EOF。
+                                line = Some(self.finish_line(self.next, self.next)?);
+                            } else {
+                                need_input = true;
+                            }
                         }
                     }
                 }
@@ -472,7 +625,7 @@ impl InlineOriginCursor {
         }
         let role_work = self
             .block
-            .spine
+            .spine()
             .work_used()
             .checked_sub(spine_before)
             .ok_or(GlobalFrontierError::ArithmeticOverflow)?;
@@ -499,14 +652,14 @@ impl InlineOriginCursor {
             return Err(GlobalFrontierError::WorkFuel); // 失败时本次 line 不会移交给调用方。
         }
         if let Some(line) = line {
-            Ok(InlineOriginStep::Line { line, work })
+            Ok(BlockOriginStep::Line { line, work })
         } else if need_input {
-            Ok(InlineOriginStep::NeedInput {
+            Ok(BlockOriginStep::NeedInput {
                 next_byte: self.next_byte(),
                 work,
             })
         } else {
-            Ok(InlineOriginStep::Progress {
+            Ok(BlockOriginStep::Progress {
                 next_byte: self.next_byte(),
                 work,
             })
@@ -520,9 +673,9 @@ impl InlineOriginCursor {
         phase: Phase,
     ) -> Result<(), GlobalFrontierError> {
         self.operation = Some(LineStartStream::new(
-            self.block.revision,
+            self.block.revision(),
             self.physical_start,
-            self.block.source_end,
+            self.block.source_end(),
             state,
             operation,
         )?);
@@ -534,40 +687,41 @@ impl InlineOriginCursor {
         &mut self,
         content_end: usize,
         line_end: usize,
-    ) -> Result<InlineOriginLine, GlobalFrontierError> {
-        let terminal = line_end == self.block.lexical_end;
+    ) -> Result<BlockOriginLine, GlobalFrontierError> {
+        let terminal = line_end == self.block.lexical_end();
         if self.physical_start > self.content_start
             || self.content_start > content_end
             || content_end > line_end
-            || line_end > self.block.lexical_end
-            || (terminal
-                && (content_end != self.block.last_content_end
-                    || line_end != self.block.last_line_end))
+            || line_end > self.block.lexical_end()
+            || (terminal && !self.block.terminal_matches(content_end, line_end))
         {
             return Err(GlobalFrontierError::InvalidFrame);
         }
         let origin = if self.ordinal == 0 {
-            self.block.first_state_origin
+            self.block.first_state_origin()
         } else {
             self.physical_start
         };
-        let line = InlineOriginLine {
+        let line = BlockOriginLine {
+            revision: self.block.revision(),
+            source_end: self.block.source_end(),
+            block_source: self.block.start()..self.block.end(),
             physical: self.physical_start..line_end,
             prefix: self.physical_start..self.content_start,
             content: self.content_start..content_end,
             eol: content_end..line_end,
             ordinal: self.ordinal,
             kind: if self.ordinal == 0 {
-                InlineOriginLineKind::First
+                BlockOriginLineKind::First
             } else {
-                InlineOriginLineKind::Continuation
+                BlockOriginLineKind::Continuation
             },
             terminal,
-            block_kind: self.block.kind,
+            block_kind: self.block.kind(),
             matched_depth: self.matched,
-            total_depth: self.block.spine.len(),
-            container_state: InlineOriginState::capture(origin, self.container_state),
-            content_state: InlineOriginState::capture(origin, self.content_state),
+            total_depth: self.block.spine().len(),
+            container_state: BlockOriginState::capture(origin, self.container_state),
+            content_state: BlockOriginState::capture(origin, self.content_state),
         };
         self.ordinal = self
             .ordinal

@@ -163,6 +163,15 @@ impl CpuSurface {
         self.paints.get()
     }
 
+    /// 正式Source验收只借实际已发布key和原paint计数；不克隆像素、层或候选帧。
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    pub(super) fn published_frame(&self) -> Option<(NativeMarkdownPagedSceneKey, usize)> {
+        self.published
+            .borrow()
+            .as_ref()
+            .map(|published| (published.key.clone(), self.paints.get()))
+    }
+
     pub(super) fn reuses(&self) -> usize {
         self.reuses.get()
     }

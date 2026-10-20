@@ -1,4 +1,4 @@
-use crate::{Tag, tag::TagExt};
+use crate::{tag::TagExt, Tag};
 use core::str::FromStr;
 
 // In harfbuzz, despite having `Script`, script can actually have any tag.

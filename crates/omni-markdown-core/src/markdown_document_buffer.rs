@@ -26,12 +26,13 @@ mod cell_draft;
 #[cfg(feature = "s2-table-window-prototype")]
 pub use cell_draft::{
     MARKDOWN_CELL_DRAFT_COMMIT_UTF16_UNITS, MARKDOWN_CELL_DRAFT_MAX_DELTA_BYTES, MarkdownCellDraft,
-    MarkdownCellDraftCommitError, MarkdownCellDraftCommitResult, MarkdownCellDraftEditCapsule,
-    MarkdownCellDraftError, MarkdownCellDraftFacts, MarkdownCellDraftHistoryDirection,
-    MarkdownCellDraftHistoryEdit, MarkdownCellDraftHistoryFacts, MarkdownCellDraftInputIntent,
-    MarkdownCellDraftInputKind, MarkdownCellDraftPreparedCommit, MarkdownCellDraftReadAuthority,
-    MarkdownCellDraftReadCapsule, MarkdownCellDraftResourceObserver,
-    MarkdownCellDraftResourceSnapshot, MarkdownCellDraftSourceAuthority,
+    MarkdownCellDraftCommit, MarkdownCellDraftCommitError, MarkdownCellDraftCommitReceipt,
+    MarkdownCellDraftCommitResult, MarkdownCellDraftEditCapsule, MarkdownCellDraftError,
+    MarkdownCellDraftFacts, MarkdownCellDraftHistoryDirection, MarkdownCellDraftHistoryEdit,
+    MarkdownCellDraftHistoryFacts, MarkdownCellDraftInputIntent, MarkdownCellDraftInputKind,
+    MarkdownCellDraftPreparedCommit, MarkdownCellDraftReadAuthority, MarkdownCellDraftReadCapsule,
+    MarkdownCellDraftResourceObserver, MarkdownCellDraftResourceSnapshot,
+    MarkdownCellDraftSourceAuthority, MarkdownCellDraftWordAnchor,
 };
 mod editing_commands;
 mod formatting;
@@ -41,6 +42,10 @@ mod replacements;
 mod table_cell_edit;
 #[cfg(feature = "s2-table-window-prototype")]
 pub use table_cell_edit::MarkdownTableCellEditPlan;
+#[cfg(feature = "s2-table-window-prototype")]
+mod table_cell_source;
+#[cfg(feature = "s2-table-window-prototype")]
+pub use table_cell_source::VerifiedMarkdownTableCellSource;
 #[cfg(feature = "s2-table-window-prototype")]
 mod table_reference_request;
 #[cfg(feature = "s2-table-window-prototype")]
@@ -54,15 +59,17 @@ mod table_window_request;
 #[cfg(feature = "s2-table-window-prototype")]
 pub use table_window_request::{
     MarkdownOrdinaryPendingReason, MarkdownOrdinarySemanticState, MarkdownRootLeafPendingReason,
-    MarkdownTableCellEditRequest, MarkdownTableCellEditStep, MarkdownTableRequestError,
-    MarkdownTableViewportBudget, MarkdownTableViewportCoverage, MarkdownTableViewportRequest,
-    MarkdownTableViewportRequiredRowQuery, MarkdownTableViewportRequiredRowResult,
-    MarkdownTableViewportStep, MarkdownTableWindowRequest, MarkdownTableWindowStep,
-    MarkdownTableWindowTarget, MarkdownViewportSourceAuthority, MarkdownViewportSourceRequest,
-    MarkdownViewportSourceRequiredRowQuery, MarkdownViewportSourceStep, SemanticWork,
+    MarkdownTableCellEditRequest, MarkdownTableCellEditStep, MarkdownTableCellInlineStep,
+    MarkdownTableRequestError, MarkdownTableViewportBudget, MarkdownTableViewportCoverage,
+    MarkdownTableViewportRequest, MarkdownTableViewportRequiredRowQuery,
+    MarkdownTableViewportRequiredRowResult, MarkdownTableViewportStep, MarkdownTableWindowRequest,
+    MarkdownTableWindowStep, MarkdownTableWindowTarget, MarkdownViewportSourceAuthority,
+    MarkdownViewportSourceRequest, MarkdownViewportSourceRequiredRowQuery,
+    MarkdownViewportSourceRequiredRowResult, MarkdownViewportSourceStep, SemanticWork,
     VerifiedMarkdownOrdinaryLeaf, VerifiedMarkdownOrdinaryLine, VerifiedMarkdownPlainViewport,
-    VerifiedMarkdownRootLeafViewport, VerifiedMarkdownTableGap, VerifiedMarkdownTableViewport,
-    VerifiedMarkdownTableWindow, VerifiedMarkdownViewportSources,
+    VerifiedMarkdownRootLeafViewport, VerifiedMarkdownTableCellInline, VerifiedMarkdownTableGap,
+    VerifiedMarkdownTableRowSource, VerifiedMarkdownTableViewport, VerifiedMarkdownTableWindow,
+    VerifiedMarkdownViewportSources,
 };
 
 pub use editing_commands::{MarkdownEditingCommand, MarkdownEditingOutcome};
@@ -77,6 +84,8 @@ pub(crate) use piece_tree::ascii_word::{MarkdownAsciiWordRun, MarkdownAsciiWordS
 mod canonical_unicode_properties;
 pub(crate) use canonical_unicode_properties::MarkdownUnicodeProperties;
 // 冻结文本只分享不可变正文资源；不携带活动文档、历史或保存权限。
+#[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+pub(crate) mod display_projection;
 mod frozen_text;
 pub use frozen_text::MarkdownTextSnapshot;
 #[cfg(feature = "paged-shaping-frontier")]
@@ -1550,6 +1559,9 @@ impl From<&Metadata> for MarkdownFileIdentity {
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 /// Stable rejection categories for safe storage, Unicode boundaries, and bounded editing.
 pub enum MarkdownDocumentBufferError {
+    /// 只读显示来源的匿名坐标目录真实失败；None 表示索引撤权或同步状态损坏，不伪造 errno。
+    #[error("显示坐标存储不可用（系统错误 {0:?}）")]
+    DisplayStorageUnavailable(Option<i32>),
     /// 本次匿名候选尚未发布时的真实创建、写入、封存或读取失败；不撤销未改原Source。
     #[error("编辑候选存储不可用（系统错误 {0}）")]
     EditStorageUnavailable(i32),

@@ -193,7 +193,9 @@ pub(super) struct NativeMarkdownEditorReleaseBarrier {
 
 /// 具体编辑客户端留下的弱资源事实；不拥有或等待外层canonical文稿。
 /// 这份收据由最终destroy实际消费，modal-only路径也保留其真实字段与事件证据。
-struct NativeMarkdownEditorNativeReleaseResources {
+pub(super) struct NativeMarkdownEditorNativeReleaseResources {
+    paged_close:
+        Option<Result<Rc<super::paged_text_view::NativeMarkdownPagedCloseReceipt>, String>>,
     // 只持固定家族计数，不保正文；原Native copy逃出活动图后也必须等其payload真实析构。
     #[cfg(any(
         test,
@@ -208,15 +210,26 @@ struct NativeMarkdownEditorNativeReleaseResources {
     raster_release: Option<super::raster_surface::NativeMarkdownRasterReleaseReceipt>,
     cohort: NativeMarkdownDeallocationCohort,
     owned: NativeMarkdownOwnedSnapshot,
+    /// 查找控件属于当前笔记会话，不跟随已释放的上一种排版图结束。
+    find_owned: NativeMarkdownOwnedSnapshot,
     find: NativeMarkdownFindResources,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     render: std::rc::Weak<MarkdownStorageRenderPayload>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     text_storage: Weak<PieceBackedMarkdownTextStorage>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     scroll_view: Weak<NSScrollView>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     text_view: Weak<PieceBackedMarkdownTextView>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     gutter: Weak<NativeMarkdownGutter>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     content: Weak<objc2_app_kit::NSTextContentStorage>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     manager: Weak<NSTextLayoutManager>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     container: Weak<NSTextContainer>,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     cell: Option<Weak<NSTextField>>,
     session_field_editor: Option<Weak<NativeMarkdownSessionFieldEditor>>,
 }
@@ -264,6 +277,7 @@ impl NativeMarkdownEditorReleaseBarrier {
             document_resources: NativeMarkdownOwnedSnapshot::default(),
             borrowed,
             native: NativeMarkdownEditorNativeReleaseResources {
+                paged_close: None,
                 #[cfg(any(
                     test,
                     all(
@@ -276,15 +290,25 @@ impl NativeMarkdownEditorReleaseBarrier {
                 raster_release: None,
                 cohort,
                 owned,
+                find_owned: NativeMarkdownOwnedSnapshot::default(),
                 find,
+                #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
                 render: std::rc::Weak::new(),
+                #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
                 text_storage: Weak::default(),
+                #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
                 scroll_view: Weak::default(),
+                #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
                 text_view: Weak::default(),
+                #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
                 gutter: Weak::default(),
+                #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
                 content: Weak::default(),
+                #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
                 manager: Weak::default(),
+                #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
                 container: Weak::default(),
+                #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
                 cell: None,
                 session_field_editor,
             },
@@ -294,6 +318,13 @@ impl NativeMarkdownEditorReleaseBarrier {
     /// 实际默认角色事件完成后排队一次验证，具体空壳还需逐字段检查。
     pub(super) fn when_released(&self, work: impl FnOnce() + 'static) {
         self.native.cohort.when_released(work);
+    }
+
+    /// 验收只观察同一真实释放端点，不占用已登记的唯一生产完成槽，也不创建第二个关闭过程。
+    /// 通知不授予新文稿身份；调用方必须退栈后核原窗口、预声明目标及实际完整帧。
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    pub(super) fn probe_when_released(&self, wake: impl FnOnce() + 'static) {
+        self.native.cohort.probe_when_released(wake);
     }
 
     /// 默认要求实际销毁的项目根及字段参与事件；具体空壳角色另做字段与公开关系证明。
@@ -322,6 +353,7 @@ impl NativeMarkdownEditorReleaseBarrier {
             cohort.track_frozen_values(family, role);
         }
         self.native.owned.track_remaining(cohort, mtm);
+        self.native.find_owned.track_remaining(cohort, mtm);
         if let Some(editor) = self
             .native
             .session_field_editor
@@ -365,8 +397,16 @@ impl NativeMarkdownEditorReleaseBarrier {
 }
 
 impl NativeMarkdownEditorNativeReleaseResources {
+    /// 捕获者已真实归还旧owner后才封闭资源集合；不能在Drop之前发送完成。
+    pub(super) fn finish_owner_drop(&mut self) {
+        self.cohort.seal();
+    }
+
     /// 严格保留具体Native、Find、render、冻结值和字段编辑器的原释放要求。
-    fn verify_released(&self) -> Result<(), String> {
+    pub(super) fn verify_released(&self) -> Result<(), String> {
+        if let Some(close) = &self.paged_close {
+            close.as_ref().map_err(Clone::clone)?.verify_released()?;
+        }
         if !self.cohort.has_completed() {
             // 默认根/字段仍依赖实际事件，排队一轮和时间流逝不构成完成证据。
             return Err("笔记原生资源的释放尚未完成".into());
@@ -386,6 +426,7 @@ impl NativeMarkdownEditorNativeReleaseResources {
             }
         }
         self.owned.verify_released()?;
+        self.find_owned.verify_released()?;
         #[cfg(feature = "native-raster-surface-probe")]
         if let Some(raster) = &self.raster_release {
             if !raster.is_released() {
@@ -401,6 +442,7 @@ impl NativeMarkdownEditorNativeReleaseResources {
                 snapshot.sticky_failure, snapshot.actual_paints, snapshot.configured_fragments,
             ); // 释放事实与绘制功能事实分别报告，不能把已清空的失败绘图当作功能通过。
         }
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         if self.render.upgrade().is_some() {
             // 字典/字体 payload 的项目 Rc 本身也须结束，不能只取走 ivar 而保留栈外副本。
             return Err("关闭后笔记渲染数据仍未释放".into());
@@ -416,18 +458,21 @@ impl NativeMarkdownEditorNativeReleaseResources {
         {
             return Err("关闭后笔记会话输入控件仍未释放".into());
         }
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         if self.scroll_view.load().is_some()
             || self.cell.as_ref().is_some_and(|cell| cell.load().is_some())
         {
             // 项目 scroll 根和标准 cell field 未实现空壳边界，不能按类型名称豁免。
             return Err("关闭后笔记滚动容器或表格控件仍未释放".into());
         }
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         if self.text_storage.load().is_some_and(|storage| {
             // 该具体 storage 的文档链接、缓存容量和原生字符串必须同时为空。
             !storage.payload_is_empty() || storage.as_super().string().length() != 0
         }) {
             return Err("关闭后的文本存储仍保留笔记数据".into());
         }
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         if let Some(view) = self.text_view.load()
             && !view.payload_is_empty()
         {
@@ -440,6 +485,7 @@ impl NativeMarkdownEditorNativeReleaseResources {
             #[cfg(not(feature = "native-markdown-runtime-probe"))]
             return Err("关闭后的文本视图仍保留笔记数据".into());
         }
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         if self
             .gutter
             .load()
@@ -448,6 +494,7 @@ impl NativeMarkdownEditorNativeReleaseResources {
             // ruler 必须释放 Vec 容量、属性和 client 关系。
             return Err("关闭后的行号控件仍保留笔记数据".into());
         }
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         if self.content.load().is_some_and(|content| {
             let observer = ProtocolObject::<dyn NSTextStorageObserving>::from_ref(&*content);
             // AppKit 允许有限 TextKit 组合状态存活，但任何旧文本或项目 delegate/manager 都失败。
@@ -461,6 +508,7 @@ impl NativeMarkdownEditorNativeReleaseResources {
         }) {
             return Err("笔记内容存储仍保留正文或回调关联".into());
         }
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         if self.manager.load().is_some_and(|manager| {
             // 仅该构造角色的公开空关系可返回收据，不能忽略未知 TextKit 对象。
             manager.textContentManager().is_some()
@@ -472,6 +520,7 @@ impl NativeMarkdownEditorNativeReleaseResources {
         }) {
             return Err("笔记排版管理器仍保留项目关联".into());
         }
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         if self.container.load().is_some_and(|container| {
             // container 已由其拥有者解除 view/manager，不能再连回旧业务。
             container
@@ -485,9 +534,10 @@ impl NativeMarkdownEditorNativeReleaseResources {
     }
 }
 
-/// 最终销毁先消费具体后端，再同步结束唯一模型；收据只保留Weak与原子资源事实。
-pub(super) fn destroy_native_markdown_editor(
-    mut editor: NativeMarkdownEditorSurface,
+/// 独立 TextKit 机制夹具归还自己的完整图；正式正文只消费 Paged 的真实关闭收据。
+#[cfg(feature = "native-markdown-runtime-probe")]
+pub(super) fn destroy_native_markdown_textkit_editor(
+    mut editor: NativeMarkdownTextKitEditorSurface,
 ) -> NativeMarkdownEditorReleaseBarrier {
     // 临时持同一allocation，保留原Native局部池排空前的弱读；不是第二Doc或新的长期owner。
     let document_owner = Rc::clone(editor.document());
@@ -512,9 +562,107 @@ pub(super) fn destroy_native_markdown_editor(
     }
 }
 
-/// 原会话仍活时捕获实际TextKit与会话控件的弱收据；本函数不消费模型或封闭cohort builder。
-fn capture_native_markdown_textkit_release(
+/// 源码沿真实Body关闭事件归还像素、字体和源读取；Find/scroll仍由原Native cohort独立核验。
+pub(super) fn destroy_native_markdown_editor(
+    mut editor: NativeMarkdownEditorSurface,
+) -> NativeMarkdownEditorReleaseBarrier {
+    let document_owner = Rc::clone(editor.model.document());
+    let document = Rc::downgrade(&document_owner);
+    let mut document_resources = std::mem::take(&mut editor.document_resources);
+    document_resources.capture_document_backings(document_owner.borrow().backing_observers());
+    let mut native = capture_native_markdown_paged_release(&editor);
+    autoreleasepool(|_| drop(editor));
+    drop(document_owner);
+    native.finish_owner_drop();
+    NativeMarkdownEditorReleaseBarrier {
+        document_released_synchronously: document.upgrade().is_none(),
+        document,
+        document_resources,
+        borrowed: None,
+        native,
+    }
+}
+
+/// 模式交换仅捕获原Native图；canonical继续归目标模式，不能把它当作已销毁文稿。
+pub(super) fn capture_native_markdown_paged_release(
     editor: &NativeMarkdownEditorSurface,
+) -> NativeMarkdownEditorNativeReleaseResources {
+    let close = editor.begin_close();
+    editor.scroll_view.removeFromSuperview();
+    let mtm = editor.scroll_view.mtm();
+    let bar = editor.find_bar.borrow().clone();
+    let captured = NativeMarkdownFindResources::from_fields(
+        bar.as_ref().map(|bar| bar.fields()).into_iter().flatten(),
+    );
+    let mut find = editor
+        .find_resources
+        .replace(NativeMarkdownFindResources::default());
+    if find.merge(captured).is_err() {
+        find.mark_failed(); // 源码模式也不能用空字段集合掩盖真实Find资源观察失败。
+    }
+    find.finish_accepted();
+    let session_field_editor = editor.session_field_editor.borrow_mut().take();
+    let mut owned = editor.owned_ledger.snapshot();
+    owned.seal();
+    let ledger = editor.find_ledger.borrow().clone();
+    let mut find_owned = ledger
+        .as_ref()
+        .map_or_else(NativeMarkdownOwnedSnapshot::default, |ledger| {
+            ledger.snapshot()
+        });
+    find_owned.seal(); // 已交接的旧模式没有Find账本；最终owner必须核同一栏的完整身份清单。
+    let mut cohort = NativeMarkdownDeallocationCohort::new(mtm);
+    owned.track_remaining(&mut cohort, mtm);
+    find_owned.track_remaining(&mut cohort, mtm);
+    if let Some(field) = session_field_editor.as_ref().and_then(Weak::load) {
+        cohort.track(&field, mtm);
+    }
+    if let Ok(close) = &close {
+        let claim = cohort.resource_claim();
+        close.when_released(move || claim.release()); // 原像素真实完成才释放父义务，不以Drop或等一轮代替。
+    }
+    NativeMarkdownEditorNativeReleaseResources {
+        paged_close: Some(close),
+        #[cfg(any(
+            test,
+            all(
+                feature = "native-block-fragment-diagnostic",
+                feature = "native-markdown-runtime-probe"
+            )
+        ))]
+        frozen_values: None,
+        #[cfg(feature = "native-raster-surface-probe")]
+        raster_release: None,
+        cohort,
+        owned,
+        find_owned,
+        find,
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+        render: std::rc::Weak::new(),
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+        text_storage: Weak::default(),
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+        scroll_view: Weak::default(),
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+        text_view: Weak::default(),
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+        gutter: Weak::default(),
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+        content: Weak::default(),
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+        manager: Weak::default(),
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+        container: Weak::default(),
+        #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+        cell: None,
+        session_field_editor,
+    }
+}
+
+/// 原会话仍活时捕获实际TextKit与会话控件的弱收据；本函数不消费模型或封闭cohort builder。
+#[cfg(feature = "native-markdown-runtime-probe")]
+pub(super) fn capture_native_markdown_textkit_release(
+    editor: &NativeMarkdownTextKitEditorSurface,
 ) -> NativeMarkdownEditorNativeReleaseResources {
     let backend = &editor.backend;
     let mtm = MainThreadMarker::new().expect("native Markdown destruction uses the main thread");
@@ -565,6 +713,13 @@ fn capture_native_markdown_textkit_release(
     let raster_release = backend.raster_release.clone();
     let mut owned = backend.owned_ledger.snapshot();
     owned.seal();
+    let ledger = editor.find_ledger.borrow().clone();
+    let mut find_owned = ledger
+        .as_ref()
+        .map_or_else(NativeMarkdownOwnedSnapshot::default, |ledger| {
+            ledger.snapshot()
+        });
+    find_owned.seal(); // 不按可见性筛选字段；仅真实模式交接可移走整个会话账本。
     // 显式角色 ledger 的默认根/字段使用实际销毁事件；TextKit/custom 对象只在其具体空壳证明通过时放行。
     let mut cohort = NativeMarkdownDeallocationCohort::new(mtm);
     #[cfg(any(
@@ -581,12 +736,14 @@ fn capture_native_markdown_textkit_release(
         );
     }
     owned.track_remaining(&mut cohort, mtm);
+    find_owned.track_remaining(&mut cohort, mtm);
     if let Some(editor) = session_field_editor.as_ref().and_then(Weak::load) {
         // 在项目 owner 已移出后观察真实 editor 生命周期，不强持有它跨越最终 drop。
         cohort.track(&editor, mtm);
     }
     // 捕获结束只移交Weak/原子事实；外层随后真实Drop完整会话并seal，不能靠排队或轮询补签。
     NativeMarkdownEditorNativeReleaseResources {
+        paged_close: None,
         #[cfg(any(
             test,
             all(
@@ -599,6 +756,7 @@ fn capture_native_markdown_textkit_release(
         raster_release,
         cohort,
         owned,
+        find_owned,
         find,
         render,
         text_storage,
@@ -760,7 +918,7 @@ pub(super) fn finish_native_markdown_note_switch() -> Result<(), String> {
     ))]
     if result.is_ok() {
         // 只通知已真实安装的后继；验收不得用队列轮次或旧图关闭请求推断handoff完成。
-        NativeMarkdownTableAppendWorkload::observe_conflict_note_installed();
+        NativeMarkdownHostedTableProbe::observe_conflict_note_installed();
     }
     result
 }
@@ -860,7 +1018,7 @@ fn request_native_markdown_close_inner(request: PluginCloseRequest) -> Result<()
             .preflight_modal_boundary()
     })?;
     let save_result = with_active_native_markdown_surface(|surface| {
-        surface.commit_marked_text()?;
+        surface.commit_marked_text(true)?;
         surface.save_current_document()?;
         // Actual responder refusal vetoes the close before the Host accepts its scope or destination.
         surface.resign_editor_responder()
@@ -888,9 +1046,7 @@ fn request_native_markdown_close_inner(request: PluginCloseRequest) -> Result<()
         let _ = with_active_native_markdown_surface(|surface| {
             if let Some(editor) = &surface.editor {
                 // No close was accepted, so restoring focus does not revive a discarded document.
-                surface
-                    .panel
-                    .makeFirstResponder(Some(editor.backend.input_view()));
+                surface.panel.makeFirstResponder(Some(editor.input_view()));
             }
             Ok(())
         });

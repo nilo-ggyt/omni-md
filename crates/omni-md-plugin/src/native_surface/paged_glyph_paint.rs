@@ -14,9 +14,9 @@ use super::paged_fonts::NativeMarkdownPagedFont;
 
 mod spool;
 pub use spool::paint_paged_spool_glyphs;
-#[cfg(feature = "native-paged-compose-probe")]
+#[cfg(feature = "native-paged-production")]
 mod composed;
-#[cfg(feature = "native-paged-compose-probe")]
+#[cfg(feature = "native-paged-production")]
 pub use composed::paint_composed_glyphs;
 
 /// 一次同步调用的固定栈预算；较长可见结果须由调度者保存原票并明确分批。
@@ -63,13 +63,13 @@ pub enum NativeMarkdownPagedGlyphPaintCause {
     Shaping(#[from] MarkdownShapingError),
     #[error("无法读取原sealed字形：{0}")]
     Spool(#[from] MarkdownShapedSpoolError),
-    #[cfg(feature = "native-paged-compose-probe")]
+    #[cfg(feature = "native-paged-production")]
     #[error("原分页行输出正在被使用，不能重入读取")]
     OutputBusy,
-    #[cfg(feature = "native-paged-compose-probe")]
+    #[cfg(feature = "native-paged-production")]
     #[error("无法读取原分页行输出：{0}")]
     Composed(#[from] omni_markdown_core::MarkdownLineComposeError),
-    #[cfg(feature = "native-paged-compose-probe")]
+    #[cfg(feature = "native-paged-production")]
     #[error("这个原part是布局控制，不能当作字形批次绘制")]
     NonGlyphPart,
 }

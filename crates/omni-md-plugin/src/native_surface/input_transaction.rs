@@ -2,10 +2,6 @@
 
 use super::*;
 
-// 与标准 workspace 的 32MiB 单会话追加上限一致；这里只限制本次输入副本，累积余量仍由 Core 核验。
-pub(in crate::native_surface) const NATIVE_MARKDOWN_INPUT_TRANSACTION_MAX_BYTES: usize =
-    32 * 1024 * 1024;
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum InputPhase {
     Pending,
@@ -306,60 +302,6 @@ impl Drop for NativeMarkdownInputCallbackGuard<'_> {
 }
 
 /// incoming 始终是本次系统传入的候选；类型查询、转换与池释放都受原票前后检查。
-pub(in crate::native_surface) fn copy_native_markdown_input_text(
-    string: &AnyObject,
-    current: &impl Fn() -> bool,
-) -> Result<String, String> {
-    copy_native_markdown_input_text_with_limit(string, current, &|bytes| {
-        bytes <= NATIVE_MARKDOWN_INPUT_TRANSACTION_MAX_BYTES
-    })
-}
-
-/// 延后输入只借原转换实现；先在同票下预留本次字节额度，才复制新增候选。
-/// 预留回调只在已确定的字符串分支调用一次，失败由调用方归还本次预留；
-/// 后置current可重入，故额度不能等本函数返回后才登记。
-pub(in crate::native_surface) fn copy_native_markdown_input_text_with_limit(
-    string: &AnyObject,
-    current: &impl Fn() -> bool,
-    reserve_bytes: &impl Fn(usize) -> bool,
-) -> Result<String, String> {
-    native_markdown_table_intent_step(current, || {
-        autoreleasepool(|pool| {
-            if let Some(value) = string.downcast_ref::<NSString>() {
-                if !current() {
-                    return Err("输入文本类型查询已撤权".to_owned());
-                }
-                // SAFETY: 借用在当前池内结束，只复制有上限的本次新增输入。
-                let plain = unsafe { value.to_str(pool) };
-                if !current() || !reserve_bytes(plain.len()) {
-                    return Err("输入文本已失效或超过当前会话上限".to_owned());
-                }
-                return Ok(plain.to_owned());
-            }
-            if !current() {
-                return Err("输入文本类型查询已撤权".to_owned());
-            }
-            if let Some(value) = string.downcast_ref::<NSAttributedString>() {
-                if !current() {
-                    return Err("输入文本类型查询已撤权".to_owned());
-                }
-                let plain = value.string();
-                if !current() {
-                    return Err("读取属性候选字符串时已撤权".to_owned());
-                }
-                // SAFETY: Native claim 与 UTF8 借用均在本池内结束，外层还会检查原权限。
-                let plain = unsafe { plain.to_str(pool) };
-                if !current() || !reserve_bytes(plain.len()) {
-                    return Err("输入文本已失效或超过当前会话上限".to_owned());
-                }
-                return Ok(plain.to_owned());
-            }
-            Err("输入对象不是受支持的文本类型".to_owned())
-        })
-    })
-    .map_err(|_| "读取候选时原输入票已失效")?
-}
-
 /// 固定缓冲比较真实 canonical 范围；既不复制正文，也不把删除非空范围当作无变化。
 pub(in crate::native_surface) fn native_markdown_input_equals_source(
     document: &MarkdownDocumentBuffer,

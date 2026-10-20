@@ -1,13 +1,37 @@
 //! 输入变化撤旧反馈与像素；原settled刷新同次生成有限计数、源范围与真实字面高亮。
 
 use super::*;
-use crate::native_surface::source_decorations::{
-    MAX_DECORATION_VIEWPORT_UNITS, MAX_SPECIAL_CHARACTER_MARKERS,
-};
+/// 即时可见反馈共享同一有限窗口与结果上限，不随文稿长度增加工作。
+pub(in crate::native_surface) const MAX_DECORATION_VIEWPORT_UNITS: usize = 16_384;
+pub(in crate::native_surface) const MAX_SPECIAL_CHARACTER_MARKERS: usize = 128;
 use omni_markdown_core::MarkdownDocumentBufferError;
 use omni_markdown_core::markdown_find::{
     MarkdownLiteralFindOptions, visit_markdown_literal_matches_cancellable,
 };
+
+/// 一次原Scene准备中的两种真实来源；格只借窗口，canonical包络用于排序而不授匹配权限。
+#[cfg(feature = "native-paged-production")]
+pub(in crate::native_surface) enum NativeMarkdownFindVisibleSource<'a> {
+    Body(std::ops::Range<usize>),
+    Cell {
+        canonical: std::ops::Range<usize>,
+        window: &'a crate::native_surface::paged_line_viewport::NativeMarkdownComposedTableCell,
+    },
+}
+
+/// 显示窗口与canonical源是两个真实失败边界；交原Body映射时保留Source首错和原几何错误。
+#[cfg(feature = "native-paged-production")]
+pub(in crate::native_surface) enum NativeMarkdownPagedFindHighlightError {
+    Source(MarkdownDocumentBufferError),
+    Window(crate::native_surface::paged_line_viewport::NativeMarkdownComposedViewportError),
+}
+
+#[cfg(feature = "native-paged-production")]
+impl From<MarkdownDocumentBufferError> for NativeMarkdownPagedFindHighlightError {
+    fn from(cause: MarkdownDocumentBufferError) -> Self {
+        Self::Source(cause)
+    }
+}
 
 /// 排队只保原bar/Doc弱身份和输入时的纯代次；不保存查询值、正文或Native强引用。
 #[derive(Clone)]
@@ -81,131 +105,45 @@ impl NativeMarkdownFindViewportFeedback {
             return;
         }
         let Some(bar) = self.bar.upgrade() else {
-            return; // 原栏已释放，没有可接收这次输入的后端。
-        };
-        let Some(original_view) = bar.textkit_view.get() else {
-            return; // 真正的 Paged 栏沿其原后端；不能为输入反馈临时装配 TextKit。
-        };
-        let Ok(view) = native_markdown_table_intent_step(&|| self.current(controller), || {
-            original_view.load()
-        }) else {
-            return; // Weak 升级期间若已换笔记或关闭，不能使用随后取得的 Native claim。
-        };
-        let Some(view) = view else {
-            return; // 原 view 已销毁，不从当前窗口寻找替代 view。
-        };
-        let Some(document) = self.document.upgrade() else {
             return;
         };
-        let table_epoch = view.ivars().table_input_intent_epoch.get();
-        let current = || {
-            self.current(controller)
-                && !view.ivars().textkit_graph_teardown.get()
-                && view.ivars().folds.matches_document(&document)
-                && view.ivars().table_input_intent_epoch.get() == table_epoch
-        };
-        if !current() {
-            return; // 弱 view 活着仍不等于持有原文稿、输入或关闭前权限。
+        let binding = bar.presentation_body.borrow().clone();
+        if let Some(body) = binding.and_then(|body| body.upgrade()) {
+            body.refresh_find_highlights(&bar, controller, self);
         }
-        let _payload = PayloadUseGuard::enter(&view.ivars().payload_use_depth);
-        view.cancel_find_reveal_before_input(self.intent);
-        // 输入已经换代，旧矩形必须同步撤权；这里只删有限几何并排队，不读取候选或布局正文。
-        view.invalidate_find_highlights(&current);
-        if self.visible && current() {
-            let _ = native_markdown_table_intent_step(&current, || {
-                view.schedule_visible_table_layout_update()
-            });
-        } // 隐藏栏只擦除旧像素；可见栏由原 executor 在稳定事务核真实 marked、Source 与 glyph。
     }
 
-    /// 只有原Active图可提供实际viewport；无图、换笔记或旧队列均不产生替代搜索。
+    /// 可见匹配由原 Scene 发布完成；输入反馈只校验正则语法，不创建临时正文图。
     pub(in crate::native_surface) fn run(&self, controller: &NativeMarkdownController) {
         if !self.current(controller) {
             return;
         }
         let Some(bar) = self.bar.upgrade() else {
-            return; // 原栏释放后没有反馈接收者，也不能构造一个新栏。
-        };
-        let view = with_active_native_markdown_surface(|surface| {
-            let editor = surface.editor.as_ref().ok_or("原查找文稿已关闭")?;
-            if !self.current(controller)
-                || !std::ptr::eq(&*surface.controller, controller)
-                || !WeakMarkdownDocument::ptr_eq(&self.document, &Rc::downgrade(editor.document()))
-                || !editor
-                    .find_bar
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|actual| Rc::ptr_eq(actual, &bar))
-            {
-                return Err("原查找反馈已撤销".into());
-            }
-            Ok(editor.backend.text_view.clone())
-        });
-        let Ok(view) = view else {
-            return; // Borrowed或后继Doc不给旧请求重新签发view，清空后的状态保持待输入。
-        };
-        let _payload = PayloadUseGuard::enter(&view.ivars().payload_use_depth);
-        if !self.current(controller) || view.ivars().textkit_graph_teardown.get() {
-            return;
-        }
-        view.cancel_find_reveal_before_input(self.intent); // 仅回收原输入之前的旧目标，不动较新显式动作或模式。
-        let table_epoch = view.ivars().table_input_intent_epoch.get();
-        let current = || {
-            self.current(controller)
-                && !view.ivars().textkit_graph_teardown.get()
-                && view.ivars().table_input_intent_epoch.get() == table_epoch
-        };
-        // 协议通知与先前已排队的布局可能交错；先核真实查询组合状态，不读取候选字符串。
-        let Ok(editor) = native_markdown_table_intent_step(&current, || bar.query.currentEditor())
-        else {
             return;
         };
-        let committed = match editor.as_ref() {
-            Some(editor) => editor.downcast_ref::<NSTextView>().is_some_and(|editor| {
-                matches!(
-                    native_markdown_table_intent_step(&current, || !editor.hasMarkedText()),
-                    Ok(true)
-                )
-            }),
-            None => true, // 查询已正常结束编辑，控件中的值是已提交查询。
-        };
-        drop(editor);
-        if !current() {
-            return; // 原生 claim 析构也可能交接；旧反馈不能借后继客户保留或删除几何。
+        if bar.presentation_body.borrow().is_none() {
+            return;
         }
-        if committed {
-            view.invalidate_stale_find_highlights(controller, &current);
-        } else {
-            view.invalidate_find_highlights(&current); // 真实 marked 或未知输入上下文不能复用旧像素。
-        }
-        if !self.visible || !current() {
-            return; // 隐藏栏只清实际旧像素，不扫描或重建高亮。
-        }
-        if self.refresh {
-            // 这里只及时验证正则输入；literal的范围、计数与几何由同一次settled刷新消费。
-            let syntax = (|| -> Result<(), String> {
-                let regex = native_markdown_table_intent_step(&current, || bar.regex.state() != 0)
-                    .map_err(|_| "原查询选项已变化")?;
-                if regex && let Some(query) = read_visible_query(&bar, &current)? {
+        let current = || self.current(controller);
+        if self.visible && self.refresh {
+            let result = (|| -> Result<(), String> {
+                if let Some(query) = read_visible_query(&bar, &current)?
+                    && query.regex
+                {
                     native_markdown_table_intent_step(&current, || query.compiled_regex())
                         .map_err(|_| "原正则输入已变化")??;
                     self.consume_status(&bar, &current, "");
                 }
                 Ok(())
             })();
-            if let Err(error) = syntax {
-                self.consume_status(&bar, &current, &error);
+            if let Err(cause) = result {
+                self.consume_status(&bar, &current, &cause);
             }
-        }
-        if current() {
-            // 替换输入也需按同查询恢复几何；pending标记为空，不能擅自发布计数或执行替换。
-            let _ = native_markdown_table_intent_step(&current, || {
-                view.schedule_visible_table_layout_update()
-            });
         }
     }
 
-    /// settled事务只扫描一次真实源范围；该次结果同时用于反馈和后续实际glyph几何。
+    /// 独立 TextKit 机制夹具借其已存在的实际图观察字面高亮，正式入口不调用此路径。
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(in crate::native_surface) fn prepare_highlights(
         &self,
         bar: &NativeMarkdownFindBar,
@@ -228,6 +166,7 @@ impl NativeMarkdownFindViewportFeedback {
     }
 
     /// 查询只活本次刷新；Source直接使用原文，Preview只允许后续证明可见的语义区间。
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     fn read_highlight_matches(
         &self,
         bar: &NativeMarkdownFindBar,
@@ -291,6 +230,7 @@ impl NativeMarkdownFindViewportFeedback {
                 whole_word: query.word,
                 overlapping: true,
             },
+            MAX_SPECIAL_CHARACTER_MARKERS,
             current,
         )
         .map_err(|cause| {
@@ -317,6 +257,122 @@ impl NativeMarkdownFindViewportFeedback {
                 frames: Vec::new(),
             },
         }))
+    }
+
+    /// 分页发布只借有序的真实可见源域；所有行和格共用16K单元/128匹配，不给每格重领预算。
+    /// 查询只活本次调用。原Source读取错误保类型返回，不能洗成零匹配或成功反馈。
+    #[cfg(feature = "native-paged-production")]
+    pub(in crate::native_surface) fn prepare_paged_highlights(
+        &self,
+        bar: &NativeMarkdownFindBar,
+        document: &Rc<RefCell<MarkdownDocumentBuffer>>,
+        sources: &[NativeMarkdownFindVisibleSource<'_>],
+        current: &impl Fn() -> bool,
+    ) -> Result<Box<[std::ops::Range<usize>]>, NativeMarkdownPagedFindHighlightError> {
+        if !self.visible || !current() {
+            return Ok(Box::new([]));
+        }
+        let query = match read_visible_query(bar, current) {
+            Ok(Some(query)) => query,
+            Ok(None) => return Ok(Box::new([])), // 真实marked输入既不读候选，也不沿旧查询留像素。
+            Err(message) => {
+                self.consume_status(bar, current, &message);
+                return Ok(Box::new([]));
+            }
+        };
+        if query.search.is_empty() {
+            self.consume_status(bar, current, "");
+            return Ok(Box::new([]));
+        }
+        if query.regex || sources.is_empty() {
+            return Ok(Box::new([])); // 正则只在原输入队列核语法；不能对截断视口执行lookaround冒充全文语义。
+        }
+        let search = unquote(&query.search);
+        let options = MarkdownLiteralFindOptions {
+            case_sensitive: query.case_sensitive,
+            whole_word: query.word,
+            overlapping: true,
+        };
+        let mut outcome = VisibleLiteralMatches {
+            count: 0,
+            ranges: Vec::new(),
+            source_limited: false,
+            count_limited: false,
+        };
+        let mut remaining = MAX_DECORATION_VIEWPORT_UNITS;
+        for (ordinal, source) in sources.iter().enumerate() {
+            let maximum_units = remaining;
+            // 每个原raw连续域只匹配一次。格迭代器按同一remaining夹display末端，
+            // 只逐原sealed记录前进；不会先收齐巨格的全部raw片段或给每格重领16K额度。
+            let limited = {
+                let mut consume =
+                    |range: std::ops::Range<usize>| -> Result<bool, MarkdownDocumentBufferError> {
+                        let end = {
+                            let document = document.borrow();
+                            markdown_utf16_boundary_down(
+                                &document,
+                                range.start.saturating_add(remaining).min(range.end),
+                            )?
+                        };
+                        let found = visible_literal_matches(
+                            &document.borrow(),
+                            &search,
+                            range.start..end,
+                            options,
+                            MAX_SPECIAL_CHARACTER_MARKERS - outcome.count,
+                            current,
+                        )?;
+                        remaining -= end - range.start;
+                        outcome.count += found.count;
+                        outcome.ranges.extend(found.ranges);
+                        outcome.count_limited = found.count_limited;
+                        outcome.source_limited |= end < range.end;
+                        Ok(!outcome.count_limited && !outcome.source_limited && remaining != 0)
+                    };
+                match source {
+                    NativeMarkdownFindVisibleSource::Body(range) => {
+                        consume(range.clone())?;
+                        false
+                    }
+                    NativeMarkdownFindVisibleSource::Cell { window, .. } => {
+                        let ranges = window
+                            .visible_find_ranges(maximum_units, current)
+                            .map_err(NativeMarkdownPagedFindHighlightError::Window)?;
+                        if let Some(ranges) = ranges {
+                            let limited = ranges.source_limited();
+                            for range in ranges {
+                                if !consume(range?)? {
+                                    break;
+                                }
+                            }
+                            limited
+                        } else {
+                            false // 同票下确实没有与clip相交的文字，不制造空显示源。
+                        }
+                    }
+                }
+            };
+            outcome.source_limited |= limited;
+            if outcome.count_limited || outcome.source_limited || remaining == 0 {
+                outcome.source_limited |= ordinal + 1 < sources.len();
+                break;
+            }
+        }
+        if current() {
+            self.consume_status(bar, current, &outcome.status());
+        }
+        // 重叠搜索仍按实际命中数反馈；绘图只覆盖匹配域的并集，避免同一像素叠两次半透明黄色。
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(outcome.ranges.len());
+        for range in outcome.ranges {
+            if let Some(last) = merged.last_mut()
+                && range.start <= last.end
+            {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+        Ok(merged.into_boxed_slice())
     }
 
     /// 只有该次真实输入仍待反馈才发布文案；scroll/显式动作不重新领取状态写入权。
@@ -355,12 +411,14 @@ fn read_visible_query(
 }
 
 /// 源范围只活本次settled准备；几何发布后不继续保存匹配表或查询串。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(in crate::native_surface) struct NativeMarkdownFindHighlightPreparation {
     pub(in crate::native_surface) ranges: Vec<std::ops::Range<usize>>,
     pub(in crate::native_surface) batch: NativeMarkdownFindHighlightBatch,
 }
 
 /// 同一原装饰Vec拥有有限矩形和弱票；不持Doc、TextKit、查询文字或第二份布局。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(in crate::native_surface) struct NativeMarkdownFindHighlightBatch {
     feedback: NativeMarkdownFindViewportFeedback,
     mode: MarkdownPresentationMode,
@@ -372,6 +430,7 @@ pub(in crate::native_surface) struct NativeMarkdownFindHighlightBatch {
     pub(in crate::native_surface) frames: Vec<NSRect>,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownFindHighlightBatch {
     /// 已准备矩形必须仍属于原栏、原Doc与原模式/字体/折叠/可见几何；绘制不枚举正文。
     pub(in crate::native_surface) fn current(
@@ -466,6 +525,7 @@ fn visible_literal_matches(
     search: &str,
     viewport: std::ops::Range<usize>,
     options: MarkdownLiteralFindOptions,
+    maximum_matches: usize,
     keep_searching: impl FnMut() -> bool,
 ) -> Result<VisibleLiteralMatches, MarkdownDocumentBufferError> {
     let end = markdown_utf16_boundary_down(
@@ -490,7 +550,7 @@ fn visible_literal_matches(
         |found| {
             result.count += 1;
             result.ranges.push(found.range_utf16); // 同一次visitor交付计数和坐标，几何不能重新扫描。
-            result.count_limited = result.count == MAX_SPECIAL_CHARACTER_MARKERS;
+            result.count_limited = result.count == maximum_matches;
             Ok(!result.count_limited) // 精确总数未知时停止原visitor，不继续为了文案扫描更多源。
         },
     )?;
@@ -520,7 +580,15 @@ mod tests {
         };
         for (query, range, count) in [("bar", 3..6, 0), ("foo", 0..3, 0), ("foo", 7..10, 1)] {
             // 窗口边缘不是词边界：左右真实邻接能拒绝截断单词，完整末词仍应命中。
-            let found = visible_literal_matches(&document, query, range, options, || true).unwrap();
+            let found = visible_literal_matches(
+                &document,
+                query,
+                range,
+                options,
+                MAX_SPECIAL_CHARACTER_MARKERS,
+                || true,
+            )
+            .unwrap();
             assert_eq!(found.count, count);
             assert!(!found.source_limited);
             assert!(!found.count_limited);
@@ -538,6 +606,7 @@ mod tests {
             "😀",
             0..document.utf16_len(),
             MarkdownLiteralFindOptions::default(),
+            MAX_SPECIAL_CHARACTER_MARKERS,
             || true,
         )
         .unwrap();
@@ -557,6 +626,7 @@ mod tests {
             "x",
             0..document.utf16_len(),
             MarkdownLiteralFindOptions::default(),
+            MAX_SPECIAL_CHARACTER_MARKERS,
             || true,
         )
         .unwrap();
@@ -575,6 +645,7 @@ mod tests {
             "不存在",
             0..document.utf16_len(),
             MarkdownLiteralFindOptions::default(),
+            MAX_SPECIAL_CHARACTER_MARKERS,
             || false,
         );
         assert!(matches!(
@@ -599,6 +670,7 @@ mod tests {
                 query,
                 0..document.utf16_len(),
                 MarkdownLiteralFindOptions::default(),
+                MAX_SPECIAL_CHARACTER_MARKERS,
                 || true,
             )
             .unwrap();

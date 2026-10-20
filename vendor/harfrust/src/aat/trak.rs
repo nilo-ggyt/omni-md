@@ -3,12 +3,12 @@
 #[allow(unused_imports)]
 use core_maths::CoreFloat as _;
 
-use read_fonts::FontData;
 use read_fonts::tables::trak::TrackTableEntry;
 use read_fonts::types::{BigEndian, Fixed};
+use read_fonts::FontData;
 
 use crate::LayoutData;
-use crate::{Scale, buffer::Buffer, plan::ShapePlan};
+use crate::{buffer::Buffer, plan::ShapePlan, Scale};
 
 pub fn apply(
     _plan: &ShapePlan,

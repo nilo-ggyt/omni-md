@@ -77,6 +77,7 @@ fn pending(
                                     request.source_range(),
                                     font,
                                     MarkdownLineComposeStyle {
+                                        presentation: Default::default(),
                                         points: 14.0,
                                         language: None,
                                         features: Vec::new(),
@@ -115,6 +116,7 @@ fn owner(
         &font.core_font().authority(),
         NativeMarkdownProbedFontFallbackRequest {
             style: MarkdownLineComposeStyle {
+                presentation: Default::default(),
                 points: font.point_size() as f32,
                 language: None,
                 features: Vec::new(),
@@ -148,7 +150,7 @@ fn selected(
     base: &NativeMarkdownPagedFont,
     mtm: MainThreadMarker,
     transfer_allowed: bool,
-) {
+) -> NativeMarkdownFontOrigin {
     let (file, document, source) = source(text);
     let observer = source.resource_observer();
     let mapping = document.original_backing_observer().unwrap();
@@ -156,15 +158,16 @@ fn selected(
     assert!(probe.accepts_request(&request).unwrap());
     let range = probe.source_range();
     let mut fallback = owner(probe, base, mtm);
-    let mut selected = false;
-    // 原系统列表最多256候选，另有唯一Base；不能用任意32次限制截掉真实emoji字体。
-    for _ in 0..=omni_md_plugin::native_surface::paged_font_cascade::NATIVE_MARKDOWN_CASCADE_MAX_CANDIDATES {
+    let mut selected = None;
+    // 原系统列表最多256候选，另有唯一 Base 与首 scalar 的系统候选；仍保留完整原级联的每个真实项。
+    for _ in 0..=omni_md_plugin::native_surface::paged_font_cascade::NATIVE_MARKDOWN_CASCADE_MAX_CANDIDATES + 1 {
         let trial = match fallback
-            .next_trial_probed(base, &base.core_font().authority(), &|| true)
+            .next_trial_probed(base, &base.core_font().authority(), &[], &|| true)
             .unwrap()
         {
             NativeMarkdownFontFallbackStep::Trial(trial) => trial,
-            NativeMarkdownFontFallbackStep::UnavailableCandidate { .. } => continue,
+            NativeMarkdownFontFallbackStep::UnavailableCandidate { .. }
+            | NativeMarkdownFontFallbackStep::UnavailableForString { .. } => continue,
             NativeMarkdownFontFallbackStep::Exhausted { .. } => {
                 panic!("实际系统级联必须支持该有限中文/组合/emoji字素")
             }
@@ -177,11 +180,13 @@ fn selected(
         match fallback
             .complete_trial_probed(base, &base.core_font().authority(), result, &|| true)
             .unwrap()
+            .expect("该固定普通 GCB 的真实 probe 只有一个 shaping 段")
         {
             NativeMarkdownFontFallbackCompletion::Rejected { .. } => {}
             NativeMarkdownFontFallbackCompletion::Selected(choice) => {
                 assert_eq!(choice.source_range(), range);
                 assert_eq!(choice.facts().missing_glyphs, 0);
+                let origin = choice.origin();
                 let chosen = choice.font(base, &source).unwrap();
                 let selected_authority = chosen.core_font().authority();
                 let selected_bytes = chosen.bytes_observer();
@@ -213,12 +218,12 @@ fn selected(
                     assert_eq!(selected_bytes.mapped_bytes(), 0);
                     assert!(!selected_bytes.failed());
                 } // Base仍由调用方持活，不能因本选择结束就把它记为已释放。
-                selected = true;
+                selected = Some(origin);
                 break;
             }
         }
     }
-    assert!(selected);
+    let selected = selected.expect("原真实完整 GCB 必须取得无缺字字体");
     fallback.close();
     worker.close();
     drop(source);
@@ -226,6 +231,7 @@ fn selected(
     drop(file);
     assert!(observer.payload_released() && mapping.unmap_succeeded() && !mapping.failed());
     assert_eq!(mapping.mapped_bytes(), 0);
+    selected
 }
 
 fn stale_trial(base: &NativeMarkdownPagedFont, mtm: MainThreadMarker, before_shape: bool) {
@@ -235,7 +241,7 @@ fn stale_trial(base: &NativeMarkdownPagedFont, mtm: MainThreadMarker, before_sha
     let (worker, _request, probe) = pending(source.clone());
     let mut fallback = owner(probe, base, mtm);
     let NativeMarkdownFontFallbackStep::Trial(trial) = fallback
-        .next_trial_probed(base, &base.core_font().authority(), &|| true)
+        .next_trial_probed(base, &base.core_font().authority(), &[], &|| true)
         .unwrap()
     else {
         panic!("真实完整Latin GCB应得到唯一Base试次");
@@ -287,7 +293,7 @@ fn reentrant_request_consumption(base: &NativeMarkdownPagedFont, mtm: MainThread
         false
     };
     assert!(matches!(
-        fallback.next_trial_probed(base, &base.core_font().authority(), &current),
+        fallback.next_trial_probed(base, &base.core_font().authority(), &[], &current),
         Err(NativeMarkdownFontFallbackError::Compose(
             MarkdownLineComposeError::Poisoned
         ))
@@ -316,4 +322,19 @@ pub(super) fn verify(mtm: MainThreadMarker) {
     println!(
         "paged_composed_font single_original_dependency=true selected=3 stale=3 actual_capture_transfer=3 transfer_revoked=1 actual_source_unmapped=true full_product_pass=false"
     );
+    // 原引用行被全角逗号错误的全局候选撑高；真实 Base 缺字后必须先验证系统 for_string 的完整 GCB。
+    // 复用上面的同源转移与 FD/mmap 严格释放流程，不以非空候选或 cmap 覆盖冒充实际字形。
+    let mono = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.0);
+    let mono =
+        NativeMarkdownPagedFont::capture(mono.as_ref(), MAX_FONT_BYTES, mtm, &|| true).unwrap();
+    let bytes = mono.bytes_observer();
+    assert_eq!(
+        selected("，", &mono, mtm, true),
+        NativeMarkdownFontOrigin::ForString
+    );
+    drop(mono);
+    assert!(bytes.mapping_drop_completed() && bytes.unmap_succeeded());
+    assert!(bytes.source_descriptor_closed() && bytes.backing_descriptor_closed());
+    assert_eq!(bytes.mapped_bytes(), 0);
+    assert!(!bytes.failed());
 }

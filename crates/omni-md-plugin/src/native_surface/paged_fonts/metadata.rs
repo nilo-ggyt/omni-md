@@ -2,10 +2,12 @@
 use std::{ffi::c_void, os::unix::ffi::OsStrExt, path::PathBuf, ptr::NonNull};
 
 use objc2_core_foundation::{
-    CFData, CFNumber, CFRetained, CFString, CFStringBuiltInEncodings, CFType, CFURL,
+    CFData, CFNumber, CFRetained, CFString, CFStringBuiltInEncodings, CFType, CFURL, CGSize,
 };
 use objc2_core_graphics::CGFont;
-use objc2_core_text::{CTFont, CTFontDescriptor, kCTFontURLAttribute};
+use objc2_core_text::{
+    CTFont, CTFontDescriptor, CTFontOrientation, CTFontSymbolicTraits, kCTFontURLAttribute,
+};
 use omni_markdown_core::{MarkdownLayoutFont, MarkdownLayoutFontAxis};
 
 use super::{NativeMarkdownPagedFontError as Error, Result, step};
@@ -18,12 +20,47 @@ pub(super) struct Metadata {
     design_coordinates: Vec<([u8; 4], f64)>,
     pub point_size: f64,
     units_per_em: u32,
-    glyph_count: usize,
+    pub(super) glyph_count: usize,
 }
 impl Metadata {
     pub(super) fn name_bytes(&self) -> Result<&[u8]> {
         name_bytes(&self.name_table)
     }
+    /// 系统 CFEqual 必须先认证实际 CTFont 相同，再核原文件/face/尺寸/轴/矩阵事实；不使用 PSName。
+    pub(super) fn matches_capture(
+        &self,
+        font: &CTFont,
+        captured: &super::NativeMarkdownPagedFont,
+        current: &(impl Fn() -> bool + ?Sized),
+    ) -> Result<bool> {
+        // CTFont 的 PartialEq 沿公开 CFEqual；阴性结果只表示不可复用，继续原真实捕获。
+        if !step(current, || font == captured.native.as_ref())?
+            || self.path != captured.source_path
+            || self.point_size.to_bits() != captured.point_size.to_bits()
+            || self.name_bytes()? != name_bytes(&captured.name_table)?
+            || !step(current, || *self.graphics == *captured.constructor_graphics)?
+        {
+            return Ok(false);
+        }
+        // SAFETY: 两个强持的不可变 CTFont 都来自原主线程；只读取 Copy 标量，不进入正文布局。
+        let matrix = step(current, || unsafe { font.matrix() })?;
+        // SAFETY: captured 持原 CTFont 到本次比较完成，公开 getter 不产生外部指针借用。
+        let original_matrix = step(current, || unsafe { captured.native.matrix() })?;
+        // SAFETY: traits 来自同一实际候选，不能把普通字体复用给有粗体/斜体/等宽属性的请求。
+        let traits = step(current, || unsafe { font.symbolic_traits() })?;
+        // SAFETY: 原 owner 保活实际 Native face，比较全 trait 位而非语义期望或字体名称。
+        let original_traits = step(current, || unsafe { captured.native.symbolic_traits() })?;
+        if matrix != original_matrix
+            || traits != original_traits
+            || self.design_coordinates != read_axes(&captured.native, current)?
+        {
+            return Ok(false);
+        }
+        // 原 f64 轴位须仍对应这份 Core 实际归一化位置，完整 name 表与 glyph 数也继续核对。
+        self.verify_core(&captured.core)?;
+        step(current, || true)
+    }
+
     pub(super) fn verify_core(&self, core: &MarkdownLayoutFont) -> Result<()> {
         let metadata = core.metadata();
         if self.units_per_em != u32::from(metadata.units_per_em)
@@ -34,6 +71,53 @@ impl Metadata {
         core.verify_design_coordinates(&self.design_coordinates)?;
         Ok(())
     }
+}
+
+/// 位图彩色字体的实际推进由平台字体实例决定，不能以文件hmtx的em缩放代替。
+/// 这里只捕获与原Font同寿命的固定glyph域元数据；不接收文本、Source或排版结果。
+pub(super) fn horizontal_advances(
+    font: &CTFont,
+    glyph_count: usize,
+    current: &(impl Fn() -> bool + ?Sized),
+) -> Result<Option<Box<[f64]>>> {
+    // SAFETY: 调用方在原主线程持有此不可变CTFont；只读取实际trait，不按名称猜字体种类。
+    let traits = step(current, || unsafe { font.symbolic_traits() })?;
+    if !traits.contains(CTFontSymbolicTraits::TraitColorGlyphs) {
+        return Ok(None); // 普通轮廓字体继续由原文件与变体表提供真实度量。
+    }
+    let count = glyph_count;
+    if !(1..=usize::from(u16::MAX) + 1).contains(&count) {
+        return Err(Error::MetadataUnavailable); // CoreGraphics的真实glyph输入是u16，不能截断编号域。
+    }
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(count)
+        .map_err(|_| Error::HorizontalMetricsAllocation)?;
+    let mut glyphs = [0_u16; 256];
+    let mut advances = [CGSize::ZERO; 256];
+    for start in (0..count).step_by(glyphs.len()) {
+        let used = glyphs.len().min(count - start);
+        for (offset, glyph) in glyphs[..used].iter_mut().enumerate() {
+            *glyph = u16::try_from(start + offset).map_err(|_| Error::MetadataUnavailable)?;
+        }
+        // SAFETY: 两个固定栈数组各有used个完整槽，所有glyph编号已在同Font真实域内。
+        // 一批至多256个glyph；原current在每次Native返回后复核，撤权立即丢弃整个候选表。
+        step(current, || unsafe {
+            font.advances_for_glyphs(
+                CTFontOrientation::Horizontal,
+                NonNull::new(glyphs.as_mut_ptr()).expect("固定glyph数组非空"),
+                advances.as_mut_ptr(),
+                used as _,
+            )
+        })?;
+        for advance in &advances[..used] {
+            if !advance.width.is_finite() || !advance.height.is_finite() || advance.height != 0.0 {
+                return Err(Error::MetadataUnavailable); // 非水平或无效平台度量不能伪成文件默认值。
+            }
+            result.push(advance.width);
+        }
+    }
+    step(current, || Some(result.into_boxed_slice())) // 原Font已失权时，完整表仍只在本栈归还，不交给后继capture。
 }
 
 /// CGFont公开返回不可变表的+1引用；借用仅活在本metadata owner内，不复制整个字体。

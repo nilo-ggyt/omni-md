@@ -1,10 +1,10 @@
 //! 实际活动计划的单字素独立性元数据；不修改GSUB、tracking或字形结果。
 use super::{AsciiFrontierRejection as Rejection, ShapePlan};
 use crate::{
-    Direction, Font, ShaperFont,
     normalize::NormalizationMode,
     ot::{layout::LayoutTableKind, lookup::SubtableKind},
     unicode::{CharExt, GeneralCategory},
+    Direction, Font, ShaperFont,
 };
 
 /// 完成游标只交付固定事实；原Source/GCB/Font owner仍须由上层封闭认证。

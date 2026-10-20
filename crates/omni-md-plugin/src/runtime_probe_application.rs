@@ -13,20 +13,6 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::time::Instant;
 
-// 内存工作负载复用真实application/router，阶段和owner独立，不进入原9case状态。
-mod memory_workload;
-pub use memory_workload::{
-    NativeMarkdownMemoryStopAfter, run_native_markdown_memory_workload_application,
-    write_native_markdown_giant_paragraph_fixture, write_native_markdown_memory_fixture,
-};
-
-#[cfg(feature = "native-table-row-append")]
-pub(crate) use memory_workload::post_table_append_terminal;
-#[cfg(feature = "native-table-row-append")]
-pub(crate) use memory_workload::post_table_cell_activation_terminal;
-#[cfg(feature = "native-table-row-append")]
-pub use memory_workload::run_native_markdown_table_append_workload_application;
-
 /// 全驱动最多192条；最后一条专用于明确溢出，不能将不完整诊断当完整阶段证据。
 const MAX_PROBE_STAGE_RECORDS: u16 = 208;
 
@@ -121,8 +107,6 @@ struct ProbeIvars {
     pending_release: RefCell<Option<crate::NativeMarkdownRuntimeProbeCompletion>>,
     release_deadline: RefCell<Option<Retained<objc2_foundation::NSTimer>>>,
     result: RefCell<Option<Result<(), String>>>,
-    resource_case: Cell<usize>,
-    resource_probe: RefCell<Option<crate::native_surface::NativeMarkdownResourceProbe>>,
     running: Cell<bool>,
     deferred_table_terminal: Cell<Option<i16>>,
     expected_table_terminal: Cell<Option<i16>>,
@@ -132,18 +116,6 @@ struct ProbeIvars {
 pub(crate) fn post_runtime_table_cell_terminal(stage: i16) {
     let mtm = MainThreadMarker::new().expect("表格终点位于真实主线程");
     post_probe_event(stage, None, mtm);
-}
-
-pub(crate) fn post_table_resource_activation(case: usize) {
-    let mtm = MainThreadMarker::new().expect("资源表格终点位于真实主线程");
-    post_probe_event(202, Some(case), mtm);
-}
-
-/// 原菜单观察的 once callback 已进入主队列；负例取消与正例激活各投递自己的唯一终点。
-pub(crate) fn post_table_toolbar_activation() {
-    let mtm = MainThreadMarker::new().expect("菜单表格终点位于真实主线程");
-    trace_probe_stage(Some(0), 205, ProbeStageBoundary::DispatchEntered, None);
-    post_probe_event(205, Some(0), mtm); // 成功、失败和取消共享真实终点，结果由原 Native 收据核验。
 }
 
 define_class!(
@@ -191,11 +163,7 @@ impl OmniMarkdownProbeDelegate {
             );
             return;
         }
-        if matches!(stage, 111..=113 | 205) {
-            if stage == 205 && self.ivars().resource_case.get() != 0 {
-                self.finish_probe(Err("菜单表格终点不属于原资源场景".into()), self.mtm());
-                return;
-            }
+        if matches!(stage, 111..=113) {
             if self.ivars().expected_table_terminal.take() != Some(stage) {
                 self.finish_probe(Err("原生表格终点与原阶段不符".into()), self.mtm());
                 return;
@@ -216,20 +184,11 @@ impl OmniMarkdownProbeDelegate {
         if self.ivars().result.borrow().is_none()
             && let Some(next) = deferred
         {
-            post_probe_event(
-                next,
-                matches!(next, 202 | 205).then(|| self.ivars().resource_case.get()),
-                self.mtm(),
-            );
+            post_probe_event(next, None, self.mtm());
         }
     }
 
     fn run_stage_inner(&self, stage: i16) {
-        if (200..=205).contains(&stage) {
-            // 资源场景具有预定的 mount/configure/input/close/receipt 事件，不以失败后的多等一轮求通过。
-            self.run_resource_stage(stage);
-            return;
-        }
         let mtm = self.mtm();
         // Local native temporaries drain before the stage result is published or the successor queued.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -326,8 +285,8 @@ impl OmniMarkdownProbeDelegate {
                 self.cancel_release_failure_deadline();
                 match self.ivars().scenario {
                     ProbeScenario::Full => {
-                        // 完整正文合同通过后，原九个资源场景仍逐一执行，不降低原门禁。
-                        post_probe_event(200, Some(self.ivars().resource_case.get()), mtm);
+                        // 独立 TextKit 机制参考至此完成；九项真实资源场景由正式 Host 组合根逐案执行。
+                        self.finish_probe(Ok(()), mtm);
                     }
                     ProbeScenario::SemanticSnapshot => {
                         // 只有上一阶段真实关闭且本阶段严格弱图验证成功，才发布独立场景收据。
@@ -371,161 +330,6 @@ impl OmniMarkdownProbeDelegate {
         );
     }
 
-    /// 每个资源场景以实际产品 lifecycle 收据推进，没有字段缓存轮询或弱图重试。
-    fn run_resource_stage(&self, stage: i16) {
-        let mtm = self.mtm();
-        // 204会推进原Cell；本阶段与已排回调只复制入口case，不新增owner或独立状态机。
-        let resource_case = self.ivars().resource_case.get();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            autoreleasepool(|_| {
-                if stage == 200 {
-                    // callback 只保存 driver weak，实际产品 native owner 仍由自己的前台槽独占。
-                    let weak = dispatch2::MainThreadBound::new(Weak::from(self), mtm);
-                    let probe = crate::native_surface::NativeMarkdownResourceProbe::start(
-                        &self.ivars().path,
-                        resource_case,
-                        move || {
-                            let mtm = MainThreadMarker::new()
-                                .expect("resource receipt uses AppKit main thread");
-                            if weak.get(mtm).load().is_some() {
-                                // SDK 精确 finish_close 已发生；下一真实事件只消费这一次收据。
-                                post_probe_event(204, Some(resource_case), mtm);
-                            }
-                        },
-                        mtm,
-                    )?;
-                    *self.ivars().resource_probe.borrow_mut() = Some(probe);
-                    return Ok(());
-                }
-                let probe = self
-                    .ivars()
-                    .resource_probe
-                    .borrow_mut()
-                    .take()
-                    .ok_or("resource probe owner is missing")?;
-                if stage == 204 {
-                    // take 后再检查产品槽和 portable 状态，native getter 不与 driver RefMut 重叠。
-                    return probe.finish();
-                }
-                let result = match stage {
-                    201 => {
-                        if resource_case == 0 && probe.toolbar_menu_needed() {
-                            // 先于 configure 内的首个菜单 Native 动作声明原终点；同步重入也不能抢领普通后继。
-                            self.ivars().expected_table_terminal.set(Some(205));
-                        } else if matches!(resource_case, 4 | 7) {
-                            self.ivars().expected_table_terminal.set(Some(202));
-                        }
-                        probe.configure(mtm)
-                    }
-                    202 => probe.input(),
-                    205 => probe.finish_toolbar_menu(),
-                    203 => probe.request_close(),
-                    _ => Err("unknown resource probe stage".into()),
-                };
-                *self.ivars().resource_probe.borrow_mut() = Some(probe);
-                result
-            })
-        }))
-        .unwrap_or_else(|_| Err("resource probe panicked in an AppKit callback".into()));
-        if self.ivars().result.borrow().is_some() {
-            return;
-        } // 嵌套失败已终止，不能再排新资源阶段。
-        let succeeded = result.is_ok(); // 错误正文不进trace，原失败路径保持原样。
-        match result {
-            Err(error) => self.finish_probe(Err(format!("resource stage {stage}: {error}")), mtm),
-            Ok(())
-                if stage == 201
-                    && resource_case == 0
-                    && self
-                        .ivars()
-                        .resource_probe
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|probe| probe.toolbar_waiting()) =>
-            {
-                // 原菜单观察/RequiredRow 的 once callback 是唯一205来源，不由排队轮数推断完成。
-                self.arm_release_failure_deadline(stage); // 现有期限只能报告缺少终点，不能推进产品或授权成功。
-            }
-            Ok(()) if stage == 205 => {
-                // 原取消终点后回201开启新正例；正例激活终点后再回201继续原搜索与关闭断言。
-                dispatch2::DispatchQueue::main().exec_async(move || {
-                    let mtm =
-                        MainThreadMarker::new().expect("search probe follows toolbar completion");
-                    trace_probe_stage(
-                        Some(resource_case),
-                        201,
-                        ProbeStageBoundary::DispatchEntered,
-                        None,
-                    );
-                    post_probe_event(201, Some(resource_case), mtm);
-                });
-            }
-            Ok(()) if stage == 201 && matches!(resource_case, 4 | 7) => {
-                self.arm_release_failure_deadline(stage); // 原激活callback是唯一202来源。
-            }
-            Ok(()) if stage == 202 && matches!(resource_case, 4 | 7) => {
-                self.ivars().expected_table_terminal.set(None);
-                self.cancel_release_failure_deadline();
-                post_probe_event(203, Some(resource_case), mtm);
-            }
-            Ok(())
-                if stage == 202
-                    && self
-                        .ivars()
-                        .resource_probe
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|probe| probe.more_input_events()) =>
-            {
-                // case8 的声明步骤恰好再输入一次，不按资源/时间/焦点轮询，也不重复失败动作。
-                post_probe_event(202, Some(resource_case), mtm);
-            }
-            Ok(())
-                if stage == 202
-                    && self
-                        .ivars()
-                        .resource_probe
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|probe| probe.input_started_close()) =>
-            {
-                // 预定的 handoff→close 同事务场景已接受唯一关闭，等待真实收据而不再投递重复请求。
-                self.arm_release_failure_deadline(stage);
-            }
-            Ok(()) if stage == 203 => {
-                // 只设置一次 fail-only 期限，不根据时钟/队列推断成功。
-                self.arm_release_failure_deadline(stage);
-            }
-            Ok(()) if stage == 204 => {
-                self.cancel_release_failure_deadline();
-                let next = self.ivars().resource_case.get() + 1;
-                self.ivars().resource_case.set(next);
-                if next == crate::native_surface::NATIVE_MARKDOWN_RESOURCE_PROBE_CASES {
-                    self.finish_probe(Ok(()), mtm);
-                } else {
-                    // 已验证旧场景完成才允许下一次产品激活；没有重用其 controller 或文档。
-                    post_probe_event(200, Some(next), mtm);
-                }
-            }
-            Ok(()) => dispatch2::DispatchQueue::main().exec_async(move || {
-                let mtm = MainThreadMarker::new().expect("resource phase uses AppKit main queue");
-                trace_probe_stage(
-                    Some(resource_case),
-                    stage + 1,
-                    ProbeStageBoundary::DispatchEntered,
-                    None,
-                );
-                post_probe_event(stage + 1, Some(resource_case), mtm);
-            }),
-        }
-        trace_probe_stage(
-            Some(resource_case),
-            stage,
-            ProbeStageBoundary::StageReturned,
-            Some(succeeded),
-        );
-    }
-
     /// 在每个已完成场景撤销唯一期限，不把历史 timer 留到后面的场景误报失败。
     fn cancel_release_failure_deadline(&self) {
         let deadline = self.ivars().release_deadline.borrow_mut().take();
@@ -551,14 +355,7 @@ impl OmniMarkdownProbeDelegate {
                 let completion = delegate.ivars().pending_release.borrow_mut().take();
                 let diagnostic = completion
                     .as_ref()
-                    .map(|completion| completion.failure_diagnostic(mtm))
-                    .or_else(|| {
-                        // 只复制当前 private probe owner，原生 weak 检查不在 RefCell 借用中执行。
-                        let probe = delegate.ivars().resource_probe.borrow_mut().take();
-                        let diagnostic = probe.as_ref().map(|probe| probe.failure_diagnostic());
-                        *delegate.ivars().resource_probe.borrow_mut() = probe;
-                        diagnostic
-                    });
+                    .map(|completion| completion.failure_diagnostic(mtm));
                 // 期限同样用于单元格激活：必须带原阶段，不能把尚未关闭时的激活超时误报成资源泄漏。
                 // 2秒门槛、一次终止和无成功重试规则均保持，诊断不授予任何产品权限。
                 delegate.finish_probe(Err(format!("native probe stage={originating_stage} missed its original terminal within the probe's 2 s failure deadline; {}", diagnostic.as_deref().unwrap_or("terminal evidence missing"))), mtm);
@@ -612,11 +409,8 @@ define_class!(
     impl OmniMarkdownProbeApplication {
         #[unsafe(method(sendEvent:))]
         fn send_probe_event(&self, event: &NSEvent) {
-            if memory_workload::route_event(event) {
-                return; // 仅独立工作负载的有限event编号由其原driver消费。
-            }
             // Only four isolated fixture events belong to the test; every stage executes once.
-            if event.r#type() == NSEventType::ApplicationDefined && ((100..=103).contains(&event.subtype().0) || (110..=113).contains(&event.subtype().0) || (200..=205).contains(&event.subtype().0)) {
+            if event.r#type() == NSEventType::ApplicationDefined && ((100..=103).contains(&event.subtype().0) || (110..=113).contains(&event.subtype().0)) {
                 let weak_owner = PROBE_DELEGATE.with_borrow(|slot| {
                     // 仅增加Rust Rc计数；不克隆Native Weak、不升级或释放任何Native对象。
                     slot.as_ref().map(Rc::clone)
@@ -630,7 +424,7 @@ define_class!(
                 };
                 // The router borrow ended before callbacks can reenter native or project state.
                 let stage = event.subtype().0;
-                let case = (200..=205).contains(&stage).then(|| delegate.ivars().resource_case.get());
+                let case = None;
                 trace_probe_stage(case, stage, ProbeStageBoundary::DeliveryEnter, None);
                 delegate.run_stage(stage);
                 return;
@@ -729,8 +523,6 @@ unsafe fn run_native_markdown_probe_application(
         pending_session: RefCell::new(None),
         release_deadline: RefCell::new(None),
         result: RefCell::new(None),
-        resource_case: Cell::new(0),
-        resource_probe: RefCell::new(None),
         running: Cell::new(false),
         deferred_table_terminal: Cell::new(None),
         expected_table_terminal: Cell::new(None),
@@ -794,36 +586,4 @@ fn native_markdown_probe_fixture(scenario: ProbeScenario) -> String {
     );
     // 夹具只交给测试自有的临时文件；闲置插件目录不会保存该 String。
     fixture
-}
-
-#[cfg(test)]
-mod stage_trace_tests {
-    use super::*;
-
-    #[test]
-    fn trace_budget_reports_one_explicit_exhaustion_then_stays_silent() {
-        let mut budget = ProbeStageBudget::default();
-        let accepted: Vec<_> = (0..1_000).filter_map(|_| budget.admit()).collect();
-        assert_eq!(accepted.len(), usize::from(MAX_PROBE_STAGE_RECORDS));
-        assert!(
-            accepted[..accepted.len() - 1]
-                .iter()
-                .all(|(_, exhausted)| !exhausted)
-        );
-        assert_eq!(accepted.last(), Some(&(MAX_PROBE_STAGE_RECORDS, true))); // 满额必须明确标不完整，不能静默截断成完整证据。
-        assert_eq!(budget.admit(), None); // case切换或更多事件都不能恢复额度。
-    }
-
-    #[test]
-    fn fixed_nine_case_plan_fits_without_losing_case_eight_second_input() {
-        // 原49个阶段保留；负例和正例各追加一次205及其后201，合计53个固定阶段。
-        let delivered_stages = 4 + 9 * 5 - 1 + 1 + 4;
-        // 每stage三个记录；两份菜单终点及后继201各有dispatch记录，仍保留原case5差异。
-        let expected = delivered_stages * 3 + 2 + (9 * 3 - 1) + 1 + 4;
-        assert_eq!(expected, 192); // 最后1点仍是原stop后的wake post0；208预算留出真实观察余量。
-        let mut budget = ProbeStageBudget::default();
-        for _ in 0..expected {
-            assert!(budget.admit().is_some_and(|(_, exhausted)| !exhausted));
-        }
-    }
 }

@@ -147,12 +147,13 @@ fn published_and_inherited_backings_remain_document_owned() {
     replace(&mut document, &token, &"x".repeat(80_000));
     let resources = document.cell_draft_resource_observer(&token).unwrap();
     let prepared = document
-        .prepare_cell_draft_commit(document.capture_cell_draft_edit(&token).unwrap())
+        .prepare_cell_draft_commit(document.capture_cell_draft_edit(&token).unwrap(), None)
         .unwrap();
     let mapping = prepared.replacement_backing_observer().unwrap();
     document
         .commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap()
+        .edit
         .unwrap();
     assert!(resources.is_released()); // raw与未发布候选的义务均结束，Doc仍合法拥有最终文件。
     assert_eq!(mapping.mapped_bytes(), 80_000);
@@ -180,7 +181,7 @@ fn trimmed_inline_candidate_finishes_its_file_obligation_before_publish() {
     );
     let resources = document.cell_draft_resource_observer(&token).unwrap();
     let prepared = document
-        .prepare_cell_draft_commit(document.capture_cell_draft_edit(&token).unwrap())
+        .prepare_cell_draft_commit(document.capture_cell_draft_edit(&token).unwrap(), None)
         .unwrap();
     assert!(prepared.replacement_backing_observer().is_none());
     assert!(document.cancel_cell_draft(&token));

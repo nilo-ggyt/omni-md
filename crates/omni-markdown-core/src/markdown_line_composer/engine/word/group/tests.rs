@@ -14,8 +14,15 @@ pub(super) fn drive(
         assert!(step.scalars <= budget.scalars.min(256));
         assert!(step.records <= budget.records.min(256));
         assert!(step.metadata_units <= budget.metadata_units.min(256));
-        if let MarkdownWordGroupAnswer::Ready(range) = step.answer {
-            return range;
+        match step.answer {
+            MarkdownWordGroupAnswer::Ready(range) => return range,
+            MarkdownWordGroupAnswer::Yielded => {}
+            MarkdownWordGroupAnswer::NeedsFoldExpansion(_) => {
+                panic!("无 fold 的原逻辑 oracle 不得要求展开")
+            }
+            MarkdownWordGroupAnswer::UnsupportedVisualOrder => {
+                panic!("原逻辑 oracle 不请求视觉证书")
+            }
         }
     }
     panic!("原有界词组没有到达真实边界");

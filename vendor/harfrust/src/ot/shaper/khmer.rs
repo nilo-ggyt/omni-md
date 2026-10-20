@@ -1,10 +1,10 @@
 use super::indic::category;
 use super::syllabic::*;
 use super::*;
-use crate::ShaperFont;
 use crate::ot::map::*;
 use crate::plan::ShapePlan;
 use crate::unicode::{CharExt, Codepoint};
+use crate::ShaperFont;
 use crate::{GlyphInfo, Mask, Tag};
 use alloc::boxed::Box;
 

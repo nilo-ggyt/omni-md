@@ -127,9 +127,12 @@ impl GlyphStore {
                 .item_at(range.end.checked_sub(1).ok_or(Error::Overflow)?)?
                 .ok_or(Error::InconsistentCoverage)?;
             let last_item = self.directory(&last_proof)?;
-            let hard_break = (last_item.kind
-                == super::super::MarkdownComposedLinePartKind::ParagraphBreak)
-                .then_some((last_proof, last_item));
+            let hard_break = matches!(
+                last_item.kind,
+                super::super::MarkdownComposedLinePartKind::ParagraphBreak
+                    | super::super::MarkdownComposedLinePartKind::FoldedSection
+            )
+            .then_some((last_proof, last_item));
             let paragraph = if hard_break.is_some() {
                 self.source
                     .snapshot_for_bidi()
@@ -181,6 +184,7 @@ impl GlyphStore {
                 MarkdownComposedLineKind::Mandatory => 1,
                 MarkdownComposedLineKind::Emergency => 2,
                 MarkdownComposedLineKind::Overflow => 3,
+                MarkdownComposedLineKind::TableRow => return Err(Error::InvalidRequest),
             };
             head[58] = base_level; // 原64B头的保留位；不另建段落索引或扩大记录。
             self.index.as_mut().ok_or(Error::Poisoned)?.append(head)?;
@@ -326,7 +330,7 @@ impl GlyphStore {
         self.finish(result)
     }
 
-    /// 仅供本次已认证整行的视觉分段；line两端沿原外层GCB结论，内部端点仍查真实索引。
+    /// 整行两端仍是 GCB；内部视觉分段还可消费原 item 同来源的 UBA 标量 seam。
     fn append_selected_part(
         &mut self,
         proof: &StoredItemProof,
@@ -337,12 +341,18 @@ impl GlyphStore {
         totals: &mut Totals,
     ) -> Result<()> {
         self.guard()?;
-        // 两处调用都沿本次append_selected_line已认证的完整line端点进入；
-        // 只复用这一次原GCB结论，内部UBA/item端点仍须实际查同一索引。
-        if (source.start != line.start && !self.is_grapheme(source.start)?)
-            || (source.end != line.end && !self.is_grapheme(source.end)?)
-        {
-            return Err(Error::InconsistentCoverage);
+        // 非 GCB 只允许原 Store 签入的 item 本端，不能让任意视觉范围绕过字素校验。
+        // 原相邻 resolved levels 已在捕获与目录解码复核；这里没有重写 level 或拆分字形。
+        for (index, endpoint, line_endpoint, item_endpoint) in [
+            (0, source.start, line.start, item.facts.source_utf16.start),
+            (1, source.end, line.end, item.facts.source_utf16.end),
+        ] {
+            if endpoint != line_endpoint
+                && !self.is_grapheme(endpoint)?
+                && (endpoint != item_endpoint || item.shaping_seams[index].is_none())
+            {
+                return Err(Error::InconsistentCoverage);
+            }
         }
         if item.kind != super::super::MarkdownComposedLinePartKind::Glyphs {
             if source != item.facts.source_utf16 {

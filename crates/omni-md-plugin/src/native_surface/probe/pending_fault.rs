@@ -275,7 +275,7 @@ impl NativeMarkdownPendingSelectionFault {
     }
 }
 
-fn counts(surface: &NativeMarkdownEditorSurface) -> [u64; 4] {
+fn counts(surface: &NativeMarkdownTextKitEditorSurface) -> [u64; 4] {
     let state = surface.backend.text_storage.ivars();
     [
         state.character_process_count.get(),
@@ -286,7 +286,7 @@ fn counts(surface: &NativeMarkdownEditorSurface) -> [u64; 4] {
 }
 
 fn require_single(
-    surface: &NativeMarkdownEditorSurface,
+    surface: &NativeMarkdownTextKitEditorSurface,
     expected: MarkdownTextSelection,
 ) -> Result<(), String> {
     let captured = surface
@@ -314,7 +314,7 @@ fn require_single(
 }
 
 /// 每个场景只增加一笔实际字符编辑；标准 selectAll 重建显示后，一次真实 Undo 必须恢复原 root。
-pub(super) fn verify(surface: &NativeMarkdownEditorSurface) -> Result<(), String> {
+pub(super) fn verify(surface: &NativeMarkdownTextKitEditorSurface) -> Result<(), String> {
     if std::env::var_os("OMNI_NATIVE_PROBE_PENDING_SELECTION_FAULT").is_none() {
         return Ok(());
     }

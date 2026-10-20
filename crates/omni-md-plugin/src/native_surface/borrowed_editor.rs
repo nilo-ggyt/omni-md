@@ -10,6 +10,7 @@ use objc2_foundation::NSUndoManager;
 
 use super::*;
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 mod control_abort;
 
 /// 提供或清理栈结束时仅归还标量权限；不在 Drop 清理用户历史。

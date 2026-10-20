@@ -1,6 +1,7 @@
 //! 原Find请求只绑定一次正常Producer的Source；不以选择提交或旧Ready替代真正可见性。
 
 use super::*;
+use crate::native_surface::paged_input::NativeMarkdownPagedInputOutcome;
 use crate::native_surface::{
     NativeMarkdownController,
     find_bar::{
@@ -15,7 +16,8 @@ use target::SourceTargetRequest;
 
 pub(super) struct PendingFind {
     request: Rc<NativeMarkdownPagedFindRevealRequest>,
-    width: f64,
+    layout_width: f64,
+    layout_origin_x: f64,
     bound: Cell<bool>,
     target: RefCell<Option<Rc<SourceTargetRequest>>>,
 }
@@ -61,7 +63,8 @@ impl NativeMarkdownPagedFindRevealPort for NativeMarkdownPagedBody {
         }
         let pending = Rc::new(PendingFind {
             request,
-            width: actual.bounds_width,
+            layout_width: actual.virtual_viewport.layout_width,
+            layout_origin_x: actual.virtual_viewport.layout_origin_x,
             bound: Cell::new(false),
             target: RefCell::new(None),
         });
@@ -78,6 +81,45 @@ impl NativeMarkdownPagedFindRevealPort for NativeMarkdownPagedBody {
 }
 
 impl NativeMarkdownPagedBody {
+    /// 查找读取正文前结束当前真实单格；同次提交后的输入票仍须有效，不能借后继选区继续旧动作。
+    pub(in crate::native_surface) fn finish_cell_before_find(
+        &self,
+        controller: &NativeMarkdownController,
+        intent: u64,
+    ) -> Result<()> {
+        if self.active_cell_body().is_none() {
+            return Ok(()); // 普通正文查找不承担单格提交义务，不因正在绘图而额外拒绝原查找入口。
+        }
+        let Some(committed) = self.commit_active_cell()? else {
+            return Err(ViewError::Revoked.into()); // 原草稿只能完成或失权，不能在提交边界消失后捕获后继输入。
+        };
+        let current = |epoch| {
+            self.current(epoch)
+                && self.active_cell_body().is_none()
+                && controller.find_input_intent() == intent
+                && crate::native_surface::native_markdown_controller_has_foreground_authority(
+                    controller,
+                )
+        };
+        // detach会调用原生焦点入口；这些入口重入后必须继续核原after，不能重新捕获当前选择补权。
+        let result = match committed.outcome {
+            NativeMarkdownPagedInputOutcome::Committed(after) => {
+                after.check_current(&current).map_err(ViewError::Input)
+            }
+            NativeMarkdownPagedInputOutcome::Unchanged(after) => {
+                if current(self.configuration.epoch)
+                    && self.input.state().is_ok_and(|state| state == after)
+                {
+                    Ok(())
+                } else {
+                    Err(ViewError::Revoked)
+                }
+            }
+        };
+        // 草稿已经封闭；后续失权不得被调用方当成未提交而重试同一编辑。
+        result.map_err(|cause| ViewError::CommittedEffect(Box::new(cause)).into())
+    }
+
     /// 实际composition root可借原Body的唯一Input执行既有后端；不暴露第二Input owner，
     /// 也不改变旧默认Find入口、中文按钮或命令。参数只在本同步动作中借用。
     pub(in crate::native_surface) fn execute_paged_find_action(
@@ -87,6 +129,9 @@ impl NativeMarkdownPagedBody {
         intent: u64,
         action: MarkdownFindAction,
     ) -> std::result::Result<NativeMarkdownFindExecution, NativeMarkdownFindExecutionError> {
+        // 既有查找栏可在编辑单格后继续使用；所有匹配/替换入口都读取本次真实提交后的正文。
+        self.finish_cell_before_find(controller, intent)
+            .map_err(|cause| NativeMarkdownFindExecutionError::Rejected(cause.to_string()))?;
         let view = self
             .view()
             .map_err(|cause| NativeMarkdownFindExecutionError::Rejected(cause.to_string()))?;
@@ -229,7 +274,8 @@ impl NativeMarkdownPagedBody {
         self.find_source_health()?;
         let current = self.find_scope_current(&pending)
             && actual.input == pending.request.input_state()
-            && actual.bounds_width == pending.width
+            && actual.virtual_viewport.layout_width == pending.layout_width
+            && actual.virtual_viewport.layout_origin_x == pending.layout_origin_x
             && Weak::ptr_eq(&actual.document, &pending.request.document());
         self.find_source_health()?;
         let goal_revoked = pending.bound.get()
@@ -262,7 +308,8 @@ impl NativeMarkdownPagedBody {
         let scope = || {
             self.find_scope_current(&pending)
                 && self.serial.get() == original_serial
-                && actual.bounds_width == pending.width
+                && actual.virtual_viewport.layout_width == pending.layout_width
+                && actual.virtual_viewport.layout_origin_x == pending.layout_origin_x
                 && actual.input == pending.request.input_state()
                 && self.view().is_ok_and(|view| {
                     view.capture_scene_request()

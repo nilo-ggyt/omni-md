@@ -2,31 +2,31 @@
 
 use super::*;
 use omni_markdown_core::markdown_document_buffer::{
-    MarkdownTableCellEditPlan, VerifiedMarkdownTableWindow,
+    MarkdownTableCellEditPlan, VerifiedMarkdownTableCellSource,
 };
 use omni_markdown_core::{
     MarkdownCellDraft, MarkdownCellDraftEditCapsule, MarkdownCellDraftFacts,
-    MarkdownCellDraftInputIntent, MarkdownCellDraftInputKind, MarkdownCellDraftResourceObserver,
-    MarkdownCellDraftSourceAuthority, MarkdownLayoutTextSource,
+    MarkdownCellDraftHistoryFacts, MarkdownCellDraftInputIntent, MarkdownCellDraftInputKind,
+    MarkdownCellDraftResourceObserver, MarkdownCellDraftSourceAuthority, MarkdownLayoutTextSource,
 };
 
 /// 控制器只持同源计划生成的唯一草稿token；退出先撤Scene，再显式close并检查原资源票。
 pub struct NativeMarkdownPagedCellSession {
     document: Weak<RefCell<MarkdownDocumentBuffer>>,
     token: MarkdownCellDraft,
+    // 与开始草稿的原格票同时捕获；局部编辑改变文字，不改变所属表列的方向。
+    alignment: omni_markdown_core::MarkdownTableAlignment,
     closed: Cell<bool>,
 }
 
 impl NativeMarkdownPagedCellSession {
-    /// 从原RequiredRow生产的verified窗口开始局部会话，不读取或复制完整单元格。
+    /// 消费正式 Cell Display 或原 RequiredRow 的封闭格票开始局部会话，不读取完整格。
     ///
     /// # Errors
-    /// 原Doc、窗口/行列、Source或唯一草稿槽不再有效时拒绝，不改变canonical正文。
+    /// 原 Doc、格来源或唯一草稿槽不再有效时拒绝，不改变 canonical 正文。
     pub fn begin(
         document: Weak<RefCell<MarkdownDocumentBuffer>>,
-        window: Rc<VerifiedMarkdownTableWindow>,
-        row_ordinal: usize,
-        column: usize,
+        source: VerifiedMarkdownTableCellSource,
     ) -> Result<Rc<Self>> {
         let original = document
             .upgrade()
@@ -34,8 +34,8 @@ impl NativeMarkdownPagedCellSession {
         let plan = original
             .try_borrow()
             .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?
-            .plan_verified_table_cell_edit(&window, row_ordinal, column, "")
-            .map_err(omni_markdown_core::MarkdownCellDraftError::from)?;
+            .plan_verified_table_cell_draft(source)
+            .map_err(NativeMarkdownPagedInputError::CellSource)?;
         drop(original);
         Self::begin_prepared(document, plan)
     }
@@ -51,16 +51,27 @@ impl NativeMarkdownPagedCellSession {
         let original = document
             .upgrade()
             .ok_or(NativeMarkdownPagedInputError::DocumentReleased)?;
-        let token = original
-            .try_borrow_mut()
-            .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?
-            .begin_prepared_cell_draft(plan)?;
+        let (token, alignment) = {
+            let mut document = original
+                .try_borrow_mut()
+                .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
+            let alignment = plan
+                .alignment_for(&document)
+                .map_err(NativeMarkdownPagedInputError::CellSource)?;
+            (document.begin_prepared_cell_draft(plan)?, alignment)
+        };
         drop(original); // 长期只保原Doc弱引用，计划也不保正文或Native图。
         Ok(Rc::new(Self {
             document,
             token,
+            alignment,
             closed: Cell::new(false),
         }))
+    }
+
+    /// 只供同一已核实的 TargetDomain 捕获，不提供从裸列序号重建方向的入口。
+    pub(super) fn alignment(&self) -> omni_markdown_core::MarkdownTableAlignment {
+        self.alignment
     }
 
     pub(super) fn document(&self) -> Result<Rc<RefCell<MarkdownDocumentBuffer>>> {
@@ -83,6 +94,18 @@ impl NativeMarkdownPagedCellSession {
 
     pub(super) fn mark_committed(&self) {
         self.closed.set(true); // 只在Core已成功发布并真实Drop原分支之后记录，不提前签资源释放。
+    }
+
+    fn history_facts(&self) -> Result<MarkdownCellDraftHistoryFacts> {
+        let original = self.document()?;
+        let document = original
+            .try_borrow()
+            .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
+        let facts = document.cell_draft_history_facts(&self.token)?;
+        if self.closed.get() {
+            return Err(NativeMarkdownPagedInputError::Closed);
+        } // 与原facts相同，先保Core Source首因；只读真实局部栈，不读取canonical历史作为回退。
+        Ok(facts)
     }
 
     pub(super) fn capture(self: &Rc<Self>) -> Result<CellPermit> {
@@ -153,6 +176,21 @@ impl Drop for NativeMarkdownPagedCellSession {
             document.cancel_cell_draft(&self.token);
             document.drain_cancelled_cell_draft();
         }
+    }
+}
+
+impl NativeMarkdownPagedInput {
+    /// 当前Cell的真实局部历史可用性；Body没有局部栈，返回None，不自动改查正文历史。
+    /// marked时原栈事实仍保留，菜单应结合原state.marked禁用，实际history入口同样拒绝组合中操作。
+    ///
+    /// # Errors
+    /// 原Input状态、Doc、Source或会话不再有效时拒绝，不以空栈掩盖关闭或借用失败。
+    pub fn cell_history_facts(&self) -> Result<Option<MarkdownCellDraftHistoryFacts>> {
+        self.state()?;
+        self.target
+            .cell()?
+            .map(|session| session.history_facts())
+            .transpose()
     }
 }
 

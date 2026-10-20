@@ -199,30 +199,30 @@ impl<'a> Assignment<'a> {
 
         if self.touched(AssignmentPoint::Image) {
             let target = match self.presentation {
-                PixelPresentation::Image => &self.slot.container,
+                PixelPresentation::Image => &*self.slot.container,
                 PixelPresentation::OpaqueNeutralMask
-                | PixelPresentation::OpaquePairedMasks { .. } => &self.slot.mask,
+                | PixelPresentation::OpaquePairedMasks { .. } => self.slot.primary().1,
             };
             clear_image(target, &self.image);
         }
         if self.touched(AssignmentPoint::SecondaryImage)
             && let Some(image) = &self.secondary
         {
-            clear_image(&self.slot.second_mask, image);
+            clear_image(self.slot.secondary().1, image);
         }
         if self.touched(AssignmentPoint::Mask) {
-            clear_mask(&self.slot.foreground, &self.slot.mask);
+            clear_mask(self.slot.primary().0, self.slot.primary().1);
         }
         if self.touched(AssignmentPoint::SecondMask) {
-            clear_mask(&self.slot.second_foreground, &self.slot.second_mask);
+            clear_mask(self.slot.secondary().0, self.slot.secondary().1);
         }
         if self.touched(AssignmentPoint::Children) {
-            clear_parent(&self.slot.foreground, &self.slot.container);
+            clear_parent(self.slot.primary().0, &self.slot.container);
             if matches!(
                 self.presentation,
                 PixelPresentation::OpaquePairedMasks { .. }
             ) {
-                clear_parent(&self.slot.second_foreground, &self.slot.container);
+                clear_parent(self.slot.secondary().0, &self.slot.container);
             }
         }
         if let Some(colors) = &self.colors {
@@ -230,10 +230,10 @@ impl<'a> Assignment<'a> {
                 clear_color(&self.slot.container, &colors.background);
             }
             if self.touched(AssignmentPoint::ForegroundColor) {
-                clear_color(&self.slot.foreground, &colors.foreground);
+                clear_color(self.slot.primary().0, &colors.foreground);
             }
             if self.touched(AssignmentPoint::SecondColor) {
-                clear_color(&self.slot.second_foreground, &colors.secondary_foreground);
+                clear_color(self.slot.secondary().0, &colors.secondary_foreground);
             }
         }
         drop(payload); // CFRelease与原token归还发生在所有RefCell借用之外，也不持业务状态借用。

@@ -153,7 +153,7 @@ fn private_scope_fixture_preserves_every_role_and_original_depth_without_tag_inv
         },
         StructuralKind::Item { indent: 7 },
         StructuralKind::Definition { indent: 3 },
-        StructuralKind::Footnote,
+        StructuralKind::Footnote { body_start: None },
         StructuralKind::Paragraph,
         StructuralKind::Table,
         StructuralKind::Other,
@@ -177,7 +177,7 @@ fn private_scope_fixture_preserves_every_role_and_original_depth_without_tag_inv
         },
         CapturedScopeRole::Item { indent: 7 },
         CapturedScopeRole::Definition { indent: 3 },
-        CapturedScopeRole::Footnote,
+        CapturedScopeRole::Footnote { body_start: None },
         CapturedScopeRole::Paragraph,
         CapturedScopeRole::Table,
         CapturedScopeRole::Other,
@@ -241,7 +241,13 @@ fn real_inline_and_setext_keep_the_original_paragraph_self_capture() {
     assert_eq!(
         collect(&mut cursor),
         vec![
-            (0, 0, CapturedScopeRole::Footnote),
+            (
+                0,
+                0,
+                CapturedScopeRole::Footnote {
+                    body_start: Some("[^f]: ".len()),
+                },
+            ),
             (
                 1,
                 blocks[0].source_range().start,

@@ -333,9 +333,6 @@ fn paint_visible(
                 value_observation::VisibleLineObservation {
                     content: &auth.content,
                     manager: &auth.manager,
-                    element_range: &fragment.element_range,
-                    generation: auth.generation(),
-                    diagnostic: &owner.line_string_diagnostic,
                 },
                 &fragment.native,
                 fragment.frame,
@@ -383,10 +380,6 @@ fn paint_visible(
         return Err("光栅发布返回后原票失效".into());
     }
     let count = owner.counters.actual_paints.fetch_add(1, Ordering::AcqRel) + 1;
-    if count == 1 {
-        // 同源图像已经发布并再次核票，才交还原首屏观察的排队权限；验证运行于后继事件。
-        owner.first_paint_observer.notify();
-    }
     if count <= 8 {
         eprintln!(
             "native_raster_surface event=paint_returned fragments={} outflow_added={} terminal_viewport={} width={} height={} actual_paints={} live_pixel_buffers={} live_pixel_bytes={} formal=false",

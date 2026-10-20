@@ -1,7 +1,7 @@
-//! 原来源请求内 Root 普通闭合块、ATX、代码块与分隔线有限语义；不复制正文或另建结构前沿。
+//! 原来源请求内闭合块、ATX、代码块与分隔线有限语义；容器沿原 capture/Origin，不另建结构前沿。
 //!
-//! 只接父请求的真实 opaque Leaf/Inline seed、同一 quota 和 SourcePublication。复杂 inline、容器或旧 fence
-//! 边界行为未证明的区间保持未知；没有任何成功交集时才整体Pending，不伪造全窗口Ready。
+//! 只接父请求的真实 opaque Leaf/Inline seed、同一 quota 和 SourcePublication。未接完整的复杂 inline/角色
+//! 保持未知；只有真实成功的交集才发布，绝不把 source 范围或已解析相邻块当作全窗口 Ready。
 
 use super::semantic::PositionLocator;
 use super::*;
@@ -12,7 +12,11 @@ use crate::markdown_viewport_presentation::parser::{
 use crate::markdown_viewport_presentation::table_window::MarkdownTableWindowQuota;
 use crate::markdown_viewport_presentation::{
     MarkdownPresentationQuery, MarkdownPresentationRun, MarkdownPresentationStyles,
+    MarkdownSourceLink, markdown_physical_line_is_active,
 };
+
+pub(super) mod scoped;
+use scoped::ScopedLeaf;
 
 const CONTROL: usize = 128;
 const PAGE_RUNS: usize = 64;
@@ -97,9 +101,7 @@ pub enum MarkdownRootLeafPendingReason {
     MissingClosedLeaf,
     IncompleteCoverage,
     NonRootScope,
-    UnsupportedKind,
     NeedsGeneralInline,
-    LegacyFenceBoundaryMismatch,
 }
 
 pub(super) enum RootLeafSemanticPublication {
@@ -216,6 +218,7 @@ pub struct VerifiedMarkdownRootLeafViewport {
     requested: Range<usize>,
     coverage: LeafPages<LeafCoverage>,
     runs: RunPages,
+    links: Vec<MarkdownSourceLink>,
 }
 
 impl VerifiedMarkdownRootLeafViewport {
@@ -336,6 +339,36 @@ impl VerifiedMarkdownRootLeafViewport {
         std::mem::size_of::<Self>()
             + self.coverage.retained_metadata()
             + self.runs.retained_metadata()
+            + self.links.capacity() * std::mem::size_of::<MarkdownSourceLink>()
+            + self
+                .links
+                .iter()
+                .map(|link| link.destination.capacity())
+                .sum::<usize>()
+    }
+    /// 原有限Parser已证明的完整label可独立返回正链接；它不授予窗口外样式或负证明。
+    /// 没有正事实时，只有原发布覆盖内的None才证明无链接，未知空洞仍是ContextPending。
+    pub fn link_at_for(
+        &self,
+        document: &MarkdownDocumentBuffer,
+        authority: MarkdownViewportSourceAuthority,
+        index: usize,
+    ) -> Result<Option<&MarkdownSourceLink>, MarkdownTableRequestError> {
+        self.check(document, authority)?;
+        if let Some(link) = self
+            .links
+            .iter()
+            .find(|link| link.label_utf16_range.contains(&index))
+        {
+            // label与decoded目标已由同源闭合块全量有限事件证明并付配额；不能被当前小窗裁掉。
+            return Ok(Some(link));
+        }
+        if self.query_for(document, authority, index)?.is_none() {
+            return Err(MarkdownTableRequestError::Window(
+                MarkdownTableWindowError::ContextPending,
+            ));
+        }
+        Ok(None)
     }
     pub(super) fn run_count(&self) -> usize {
         self.runs.len
@@ -345,8 +378,10 @@ impl VerifiedMarkdownRootLeafViewport {
 #[derive(Clone, Copy)]
 enum Phase {
     Bounds,
+    ResumeUnderline,
     AwaitSource,
     NextLeaf,
+    Scope,
     HeadingMarkers,
     Heading,
     Coverage,
@@ -354,8 +389,10 @@ enum Phase {
     Coordinates,
     Underline,
     Build,
+    AtxInline,
     Ordinary,
     OrdinaryRuns,
+    DiscardOrdinary,
     FinishLeaf,
     Done,
     Published,
@@ -371,7 +408,8 @@ pub(super) struct RootLeafSemanticJob {
     positions: [PositionLocator; 4],
     position_index: usize,
     byte_coverage: Option<Range<usize>>,
-    selection_bytes: Range<usize>,
+    // 只接受父同源请求已经完成的两个选择端点；None才需要在本冷窗口实际定位。
+    selection_bytes: Option<Range<usize>>,
     candidates: LeafPages<Rc<SourceRecord>>,
     candidate_index: usize,
     coverage: LeafPages<LeafCoverage>,
@@ -380,6 +418,8 @@ pub(super) struct RootLeafSemanticJob {
     active_coverage: Option<Range<usize>>,
     saw_intersection: bool,
     boundary: Option<FenceBoundaryProof>,
+    scoped: Option<Box<ScopedLeaf>>,
+    ordinary_run: Option<MarkdownPresentationRun>,
     heading_next: Option<usize>,
     heading_tail: Option<AtxMarkerTail>,
     raw_markers: [Option<Range<usize>>; 2],
@@ -391,6 +431,7 @@ pub(super) struct RootLeafSemanticJob {
     ordinary_run_index: usize,
     run_next: usize,
     runs: RunPages,
+    links: Vec<MarkdownSourceLink>,
     quota: MarkdownTableWindowQuota,
     pending: Option<MarkdownRootLeafPendingReason>,
     failed: Option<MarkdownTableRequestError>,
@@ -398,10 +439,10 @@ pub(super) struct RootLeafSemanticJob {
 }
 
 impl RootLeafSemanticJob {
-    /// 父发布移走结果后立即释放该固定续体；此费用只在实际 Drop 的发布步骤归账。
+    /// Pending发布或逆向重定位真正释放固定续体时归账；Ready移交不虚报一次Drop。
     pub(super) fn completed_owner_drop_control() -> usize {
-        // run页和两组小页目录各自遍历；候选Rc最坏256项的析构同样预付，不能漏掉旧来源库存。
-        CONTROL + PAGE_COUNT + 2 * LEAF_PAGE_COUNT + MAX_SOURCE_RECORDS
+        // publish已计量清候选并移走输出；这里只遍历空run目录和两组小页目录，不再虚付256个候选。
+        CONTROL + PAGE_COUNT + 2 * LEAF_PAGE_COUNT
     }
 
     pub(super) fn construction_work() -> SemanticWork {
@@ -416,6 +457,8 @@ impl RootLeafSemanticJob {
         context_revision: u64,
         selection: MarkdownTextSelection,
         requested: Range<usize>,
+        selection_bytes: Option<Range<usize>>,
+        underline: Option<MarkdownTableUnderlineRequest>,
         quota: MarkdownTableWindowQuota,
     ) -> Result<Self, MarkdownTableRequestError> {
         if requested.start >= requested.end || requested.len() > 64 * 1_024 {
@@ -443,7 +486,7 @@ impl RootLeafSemanticJob {
             run_next: requested.start,
             requested,
             byte_coverage: None,
-            selection_bytes: 0..0,
+            selection_bytes,
             candidates: LeafPages::new(),
             candidate_index: 0,
             coverage: LeafPages::new(),
@@ -452,19 +495,73 @@ impl RootLeafSemanticJob {
             active_coverage: None,
             saw_intersection: false,
             boundary: None,
+            scoped: None,
+            ordinary_run: None,
             heading_next: None,
             heading_tail: None,
             raw_markers: [None, None],
             projection: None,
             markers: None,
-            underline: None,
+            underline,
             underline_index: 0,
             ordinary_run_index: 0,
             runs: RunPages::new(),
+            links: Vec::new(),
             quota,
             pending: None,
             failed: None,
             phase: Phase::Bounds,
+        })
+    }
+
+    /// Ready已移走全部输出后复用父原唯一槽；新窗口仍从Bounds领取自己的真实byte覆盖。
+    /// 这里只保两个小片定位前沿和不可变Source/完整选择，绝不保旧publication或未来语义。
+    pub(super) fn continue_forward(
+        &mut self,
+        requested: Range<usize>,
+        underline: Option<MarkdownTableUnderlineRequest>,
+        quota: MarkdownTableWindowQuota,
+    ) -> Result<SemanticWork, MarkdownTableRequestError> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        if !matches!(self.phase, Phase::Published)
+            || requested.start < self.requested.start
+            || requested.end < self.requested.end
+            || requested.is_empty()
+            || requested.len() > 64 * 1_024
+        {
+            return Err(MarkdownTableRequestError::InvalidRequest);
+        }
+        // 原Ready仍占联合库存；固定job也必须进入最新同batch额度，不能沿用上一批准入。
+        quota
+            .admit_metadata(
+                std::mem::size_of::<Self>()
+                    + std::mem::size_of::<VerifiedMarkdownRootLeafViewport>(),
+            )
+            .map_err(MarkdownTableRequestError::Window)?;
+        let first = self.positions[0].retarget_forward(requested.start, false);
+        let last = self.positions[1].retarget_forward(requested.end, true);
+        self.run_next = requested.start;
+        self.requested = requested;
+        self.position_index = 0;
+        self.byte_coverage = None;
+        self.candidate_index = 0;
+        self.saw_intersection = false;
+        self.underline = underline;
+        self.underline_index = 0;
+        self.ordinary_run_index = 0;
+        self.quota = quota;
+        self.pending = None;
+        self.phase = Phase::Bounds;
+        // 页目录已在publish真正移走/清空，本步没有重建页数组或Box；只计实际固定重定位。
+        // 选择端点仍属原完整选择，新窗口的两个locator必须再次完成，旧样式不授任何覆盖。
+        Ok(SemanticWork {
+            structural_transitions: CONTROL
+                + first.structural_transitions
+                + last.structural_transitions,
+            metadata_bytes: first.metadata_bytes + last.metadata_bytes,
+            ..SemanticWork::default()
         })
     }
     fn check(
@@ -491,11 +588,14 @@ impl RootLeafSemanticJob {
         self.active_byte_coverage = None;
         self.active_coverage = None;
         self.boundary = None;
+        self.scoped = None;
+        self.ordinary_run = None;
         self.heading_next = None;
         self.heading_tail = None;
         self.projection = None;
         self.underline = None;
         self.runs = RunPages::new(); // 只释放有限派生页；旧外带publication不在job中，也不被改写。
+        self.links = Vec::new(); // 取消时同步归还本发布尚未移交的 URL 字节与目录。
     }
     pub(super) fn cancel(&mut self) {
         if self.failed.is_none() {
@@ -503,17 +603,28 @@ impl RootLeafSemanticJob {
         }
     }
     pub(super) fn preparing(&self) -> bool {
-        matches!(self.phase, Phase::Bounds)
+        matches!(self.phase, Phase::Bounds | Phase::ResumeUnderline)
     }
     pub(super) fn done(&self) -> bool {
         matches!(self.phase, Phase::Done)
     }
 
-    /// 原四端点完成后只为实际 byte 交集截留 seed，不扩展窗口或保留离屏正文。
-    pub(super) fn considers(&self, physical: &Range<usize>) -> bool {
+    /// 仅归还原四端点定位实际完成后的选择边界；父请求继续拥有相同 Source 与完整选择。
+    pub(super) fn verified_selection_bytes(&self) -> Option<Range<usize>> {
+        self.selection_bytes.clone()
+    }
+
+    /// 发布只移交样式库存；原请求接回唯一scanner，后继窗口仍消费其真实UTF16/标签前沿。
+    pub(super) fn return_underline(&mut self) -> Option<MarkdownTableUnderlineRequest> {
+        self.underline.take()
+    }
+
+    /// 原来源可能为跨过空白而先消费下一行；保它的同一 seed，后继才能沿原 Global 解析该正文。
+    /// 前方无交集的旧块仍立即释放；此票不授予当前窗口任何额外语义覆盖。
+    pub(super) fn retains_inline_seed(&self, physical: &Range<usize>) -> bool {
         self.byte_coverage
             .as_ref()
-            .is_some_and(|coverage| physical.start < coverage.end && coverage.start < physical.end)
+            .is_some_and(|coverage| coverage.start < physical.end)
     }
 
     /// 父owner只移交自己的真实来源Rc；与该页不相交的记录不进入本job库存。
@@ -555,6 +666,9 @@ impl RootLeafSemanticJob {
                         {
                             return Ok(work); // 同一多行闭合块只证明一次，不能按物理行重复覆盖。
                         }
+                        if Rc::ptr_eq(previous, record) {
+                            return Ok(work); // 同一容器行续批只交付一次，不重复占候选或语义库存。
+                        }
                         block.seed.source_range().start
                     }
                 };
@@ -571,28 +685,22 @@ impl RootLeafSemanticJob {
         Ok(work)
     }
 
-    /// 首四端点与后继Leaf阶段共用此入口；source/选择/取消逐次核验，真实失权固定首因。
+    /// 首四端点与后继Leaf阶段共用此入口；父owner只在原来源批次Ready后推进非Bounds阶段。
+    /// source/选择/取消逐次核验，真实失权固定首因；不再用重复布尔值描述父调用位置。
     pub(super) fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
         authority: MarkdownViewportSourceAuthority,
-        sources_complete: bool,
         budget: usize,
         limits: (usize, usize),
         ordinary: &mut Option<PlainSemanticJob>,
+        global: Option<&mut GlobalFrontier>,
     ) -> Result<SemanticWork, MarkdownTableRequestError> {
         let result = self.check(document, authority).and_then(|()| {
             if !(4096..=65536).contains(&budget) || matches!(self.phase, Phase::Published) {
                 return Err(MarkdownTableRequestError::InvalidRequest);
             }
-            self.advance_inner(
-                document,
-                authority,
-                sources_complete,
-                budget,
-                limits,
-                ordinary,
-            )
+            self.advance_inner(document, authority, budget, limits, ordinary, global)
         });
         if let Err(error) = result {
             *ordinary = None; // 父槽属于同一失败请求，错误不能留下旧 cursor 或未移交的 underline。
@@ -604,10 +712,10 @@ impl RootLeafSemanticJob {
         &mut self,
         document: &MarkdownDocumentBuffer,
         authority: MarkdownViewportSourceAuthority,
-        sources_complete: bool,
         budget: usize,
         limits: (usize, usize),
         ordinary: &mut Option<PlainSemanticJob>,
+        global: Option<&mut GlobalFrontier>,
     ) -> Result<SemanticWork, MarkdownTableRequestError> {
         let mut work = SemanticWork {
             structural_transitions: CONTROL,
@@ -615,12 +723,56 @@ impl RootLeafSemanticJob {
         };
         match self.phase {
             Phase::Bounds => work = self.advance_bounds(document, authority, budget)?,
-            Phase::AwaitSource if !sources_complete => {} // 等同一个Global/来源owner闭合，不另造Parser或假EOF。
+            Phase::ResumeUnderline => {
+                // 四端点或父已证选择已经齐备；只在独立原量子内转换这一个scanner的覆盖。
+                // 新范围若不能续读，旧owner立即归还，后继Underline阶段沿原冷工厂从根认证。
+                let mut underline = self.underline.take().expect("续批持原唯一scanner");
+                if underline.continue_source(
+                    document,
+                    self.byte_coverage.as_ref().unwrap().clone(),
+                    self.requested.clone(),
+                    self.quota.clone(),
+                )? {
+                    self.underline = Some(underline);
+                }
+                work.metadata_bytes = 2 * std::mem::size_of::<Range<usize>>();
+                self.phase = Phase::AwaitSource;
+            }
             Phase::AwaitSource => {
                 self.phase = Phase::NextLeaf; // 完整来源只结束收集；下一量子才开始第一份真实Leaf证明。
             }
             Phase::NextLeaf => {
-                work = self.begin_next_leaf(document)?;
+                work = self.begin_next_leaf(document, limits, ordinary)?;
+            }
+            Phase::Scope => {
+                let scoped = self.scoped.as_mut().unwrap();
+                let (measured, done) = scoped.advance(document, &self.quota, budget - CONTROL)?;
+                work = measured;
+                work.structural_transitions += CONTROL;
+                if done {
+                    if scoped.unsupported() {
+                        self.pending
+                            .get_or_insert(MarkdownRootLeafPendingReason::NonRootScope);
+                        self.clear_active_leaf();
+                        self.phase = Phase::NextLeaf;
+                    } else {
+                        let SourceRecord::Leaf(leaf) = self.record.as_ref().unwrap().as_ref()
+                        else {
+                            unreachable!("Scope 只消费真实 Leaf");
+                        };
+                        self.phase = match leaf.kind() {
+                            LeafBlockKind::AtxHeading(_) if self.heading_tail.is_some() => {
+                                Phase::HeadingMarkers
+                            }
+                            LeafBlockKind::AtxHeading(_) => Phase::Coverage,
+                            LeafBlockKind::FencedCode => Phase::Boundary,
+                            LeafBlockKind::IndentedCode
+                            | LeafBlockKind::Html
+                            | LeafBlockKind::Metadata(_) => Phase::Coverage,
+                            _ => return Err(MarkdownTableRequestError::InvalidRequest),
+                        };
+                    }
+                } // 原 capture 与本窗口逐行 prefix 全部完成之后，才允许标题/代码语义继续。
             }
             Phase::HeadingMarkers => {
                 let tail = self.heading_tail.as_mut().unwrap();
@@ -649,6 +801,12 @@ impl RootLeafSemanticJob {
                         self.run_next = start;
                         self.projection = None;
                         self.phase = match self.record.as_ref().unwrap().as_ref() {
+                            SourceRecord::Leaf(leaf)
+                                if matches!(leaf.kind(), LeafBlockKind::AtxHeading(_))
+                                    && self.heading_next.is_some() =>
+                            {
+                                Phase::AtxInline
+                            }
                             SourceRecord::Leaf(_) => Phase::Coordinates,
                             SourceRecord::Line(_) => Phase::Underline,
                         }; // 普通块复用同一已计量交集；其样式仍须原 Plain cursor 真正证明。
@@ -667,32 +825,31 @@ impl RootLeafSemanticJob {
             }
             Phase::Boundary => {
                 let boundary = self.boundary.as_mut().unwrap();
-                work = boundary.advance(document, budget - CONTROL)?;
+                work = boundary.advance(document)?;
                 work.structural_transitions += CONTROL;
                 if boundary.done {
-                    if boundary.mismatch {
-                        self.pending.get_or_insert(
-                            MarkdownRootLeafPendingReason::LegacyFenceBoundaryMismatch,
-                        );
-                        self.clear_active_leaf();
-                        self.phase = Phase::NextLeaf; // 此Leaf不签兼容Ready；其他独立Root Leaf仍可继续证明。
-                    } else {
-                        self.raw_markers =
-                            [Some(boundary.opening.clone()), boundary.closing.clone()];
-                        self.phase = Phase::Coverage;
-                    }
+                    self.raw_markers = [Some(boundary.opening.clone()), boundary.closing.clone()];
+                    self.phase = Phase::Coverage;
                 }
             }
             Phase::Coordinates => {
                 if self.projection.is_none() {
                     let coverage = self.active_byte_coverage.as_ref().unwrap();
-                    let first = self.raw_markers[0].as_ref().map_or(
-                        coverage.start..coverage.start,
-                        |range| {
-                            range.start.clamp(coverage.start, coverage.end)
-                                ..range.end.clamp(coverage.start, coverage.end)
-                        },
-                    );
+                    let empty_start = match self.record.as_ref().unwrap().as_ref() {
+                        SourceRecord::Leaf(leaf) if leaf.kind() == LeafBlockKind::IndentedCode => {
+                            leaf.source_range()
+                                .start
+                                .clamp(coverage.start, coverage.end)
+                        }
+                        _ => coverage.start,
+                    }; // 缩进代码没有围栏；空marker仍保原正文起点，给已证首行物理缩进一个准确样式切点。
+                    let first =
+                        self.raw_markers[0]
+                            .as_ref()
+                            .map_or(empty_start..empty_start, |range| {
+                                range.start.clamp(coverage.start, coverage.end)
+                                    ..range.end.clamp(coverage.start, coverage.end)
+                            });
                     let last =
                         self.raw_markers[1]
                             .as_ref()
@@ -719,37 +876,53 @@ impl RootLeafSemanticJob {
                     if let Some(values) = values {
                         self.markers = Some([values[0]..values[1], values[2]..values[3]]);
                         self.projection = None;
-                        self.phase = Phase::Underline;
+                        self.phase = match self.record.as_ref().unwrap().as_ref() {
+                            SourceRecord::Leaf(leaf)
+                                if matches!(
+                                    leaf.kind(),
+                                    LeafBlockKind::FencedCode | LeafBlockKind::IndentedCode
+                                ) =>
+                            {
+                                Phase::Build
+                            }
+                            _ => Phase::Underline, // 非代码块继续等待同一全源配对，不能默认已知不存在标签。
+                        }; // 真实代码本体始终字面；不为它创建或推进全源HTML配对，旧共享owner留给后继块。
                     }
                 }
             }
             Phase::Underline => {
                 if let Some(underline) = self.underline.as_mut() {
-                    if underline
+                    if matches!(
+                        self.record.as_ref().unwrap().as_ref(),
+                        SourceRecord::Line(_)
+                    ) {
+                        // 当前闭合块先取得原配对 owner，再收集自己的有限引用；
+                        // 否则 code 前的引用会在尚未有查询权限时阻止配对，而配对又阻止查询准备。
+                        work = self.begin_ordinary(ordinary, budget)?;
+                    } else if underline
                         .ready_pairs_for(document)
                         .map_err(MarkdownTableRequestError::Window)?
                         .is_some()
                     {
-                        // 全源first-open→next-close真实配对完成，code中同样保留原allowlist行为。
-                        if matches!(
-                            self.record.as_ref().unwrap().as_ref(),
-                            SourceRecord::Line(_)
-                        ) {
-                            work = self.begin_ordinary(ordinary, budget)?;
-                        } else {
-                            self.phase = Phase::Build;
-                        } // 只把同一已闭合 underline 移给当前普通块，下一块再取回原对象。
+                        // 非代码块才消费全源配对；代码本体不解释HTML，也不改变本共享游标。
+                        self.phase = Phase::Build;
                     } else {
                         // 未完成时只推进原有请求的有限 frame；不重建上下文，也不循环等到 Ready。
-                        let measured = underline
-                            .advance(document, (budget - CONTROL) / 16)
-                            .map_err(MarkdownTableRequestError::Window)?;
-                        work.source_bytes = measured.source_bytes;
+                        let measured = underline.advance(
+                            document,
+                            global.ok_or(MarkdownTableRequestError::InvalidRequest)?,
+                            budget - CONTROL,
+                        )?;
+                        work.source_bytes = measured.source_bytes + measured.global_source_bytes;
                         work.utf8_validation_bytes = measured.utf8_validation_bytes;
-                        work.source_tree_steps = measured.source_tree_steps;
-                        work.structural_transitions += measured.source_bytes
-                            + measured.utf8_validation_bytes
-                            + measured.source_tree_steps;
+                        work.source_tree_steps =
+                            measured.source_tree_steps + measured.global_source_tree_steps;
+                        work.structural_transitions += measured.structural_transitions;
+                        work.copied_source_bytes = measured.copied_source_bytes;
+                        work.metadata_bytes = measured.metadata_bytes;
+                        work.normalizer_input_bytes = measured.normalizer_input_bytes;
+                        work.parser_input_bytes = measured.parser_input_bytes;
+                        work.allocated_source_capacity = measured.allocated_source_capacity;
                     }
                 } else {
                     // 与table/Plain共享原唯一underline工作区；必须先准入再创建context/pair库存。
@@ -758,19 +931,30 @@ impl RootLeafSemanticJob {
                         .map_err(MarkdownTableRequestError::Window)?;
                     self.underline = Some(
                         document
-                            .table_underline_request(std::slice::from_ref(
-                                self.byte_coverage.as_ref().unwrap(),
-                            ))
+                            .table_source_underline_request(
+                                self.byte_coverage.as_ref().unwrap().clone(),
+                                self.quota.clone(),
+                            )
                             .map_err(MarkdownTableRequestError::Window)?,
                     );
                 }
             }
             Phase::Build => work = self.build_one(document, budget)?,
+            Phase::AtxInline => work = self.begin_atx_inline(ordinary, budget)?,
             Phase::Ordinary => {
                 let job = ordinary.as_mut().unwrap();
-                let cleanup = PlainSemanticJob::completed_drop_control();
-                let (measured, _) =
-                    job.advance_after_sources(document, budget - CONTROL - cleanup, limits)?;
+                let (measured, _) = match self.record.as_ref().unwrap().as_ref() {
+                    SourceRecord::Leaf(leaf) => job.advance_atx_after_sources(
+                        document,
+                        &leaf.block,
+                        budget - CONTROL,
+                        limits,
+                        global,
+                    )?,
+                    SourceRecord::Line(_) => {
+                        job.advance_after_sources(document, budget - CONTROL, limits, global)?
+                    }
+                };
                 work = measured;
                 work.structural_transitions += CONTROL;
                 if job.done() {
@@ -789,11 +973,7 @@ impl RootLeafSemanticJob {
                                 MarkdownRootLeafPendingReason::NonRootScope
                             }
                         });
-                        self.underline = job.return_underline();
-                        *ordinary = None;
-                        self.clear_active_leaf();
-                        self.phase = Phase::NextLeaf; // 真实负证明保留未知空洞，其他独立已证块仍可发布。
-                        work.structural_transitions += cleanup;
+                        self.phase = Phase::DiscardOrdinary; // 下一量子真实归还旧 owner，不挤占引用 scanner 的最小工作。
                     } else {
                         self.phase = Phase::OrdinaryRuns;
                     } // 固定 scratch 中的 run 尚未取得输出库存，下一量子才逐条联合准入。
@@ -801,17 +981,58 @@ impl RootLeafSemanticJob {
             }
             Phase::OrdinaryRuns => {
                 let job = ordinary.as_mut().unwrap();
-                if let Some(run) = job.take_proven_run(self.ordinary_run_index)? {
-                    let measured = self.runs.append(run, &self.quota, budget - CONTROL)?;
-                    self.ordinary_run_index += 1;
+                if self.ordinary_run.is_none() {
+                    self.ordinary_run = job.take_proven_run(self.ordinary_run_index)?;
+                }
+                if let Some(run) = self.ordinary_run.as_mut() {
+                    let query = self
+                        .scoped
+                        .as_ref()
+                        .map(|scoped| scoped.query(run.utf16_range.start, run.utf16_range.end));
+                    let end = query
+                        .as_ref()
+                        .map_or(run.utf16_range.end, |query| query.utf16_range.end);
+                    let styles = query.map_or(run.styles, |query| run.styles.union(query.styles));
+                    let measured = self.runs.append(
+                        MarkdownPresentationRun {
+                            utf16_range: run.utf16_range.start..end,
+                            styles,
+                        },
+                        &self.quota,
+                        budget - CONTROL,
+                    )?;
+                    run.utf16_range.start = end;
+                    if run.utf16_range.is_empty() {
+                        self.ordinary_run = None;
+                        self.ordinary_run_index += 1;
+                    }
                     work.structural_transitions += measured.structural_transitions;
                     work.metadata_bytes = measured.metadata_bytes;
+                } else if let Some(link) = job.take_proven_link()? {
+                    // URL 字节只移动归属；新目录容量与旧 job 共活，仍须独立联合准入。
+                    self.quota
+                        .admit_metadata(std::mem::size_of::<MarkdownSourceLink>())
+                        .map_err(MarkdownTableRequestError::Window)?;
+                    self.links.reserve_exact(1);
+                    self.links.push(link);
+                    work.metadata_bytes = std::mem::size_of::<MarkdownSourceLink>();
                 } else {
                     self.underline = job.return_underline();
-                    *ordinary = None; // 原配对对象已移回；清空父固定槽，绝不再分配第二份 scratch。
+                    // 真正完成的普通前缀留在父原唯一槽；下一块仍须核同一个 seed 才能继续。
+                    // 复杂语义不保留历史工作区，原配对 owner 已归还后在本量子真正析构。
+                    if !job.retains_plain_prefix() {
+                        *ordinary = None;
+                        work.structural_transitions += PlainSemanticJob::completed_drop_control();
+                    }
                     self.phase = Phase::FinishLeaf;
-                    work.structural_transitions += PlainSemanticJob::completed_drop_control();
                 }
+            }
+            Phase::DiscardOrdinary => {
+                self.underline = ordinary.as_mut().unwrap().return_underline();
+                *ordinary = None;
+                self.clear_active_leaf();
+                self.phase = Phase::NextLeaf;
+                work.structural_transitions += PlainSemanticJob::completed_drop_control();
             }
             Phase::FinishLeaf => {
                 let record = Rc::clone(self.record.as_ref().unwrap());
@@ -849,7 +1070,11 @@ impl RootLeafSemanticJob {
     ) -> Result<SemanticWork, MarkdownTableRequestError> {
         let mut work = SemanticWork::default();
         let mut remaining = budget;
-        while self.position_index < self.positions.len() {
+        // 父请求的Source/context/完整选择从创建到续批均不变；上一真实发布已认证的选择
+        // 字节端点可以原样交接，不能为每个小样式窗口重新解码远处选择所在的源片。
+        // 冷路径仍跑完整四端点；热路径只跑当前窗口两端，始终使用原定位器和原预算。
+        let position_limit = if self.selection_bytes.is_some() { 2 } else { 4 };
+        while self.position_index < position_limit {
             let locator = &mut self.positions[self.position_index];
             let may_reuse = self.position_index != 0 && locator.needs_location();
             let reuse_reservation = if may_reuse {
@@ -890,12 +1115,18 @@ impl RootLeafSemanticJob {
             }
             // 每步至少支付原PLAIN_CONTROL，且必然完成定位/读入byte/给出结果之一；余额严格减少，不空转。
         }
-        if self.position_index == self.positions.len() {
+        if self.position_index == position_limit {
             self.byte_coverage =
                 Some(self.positions[0].result().unwrap()..self.positions[1].result().unwrap());
-            self.selection_bytes =
-                self.positions[2].result().unwrap()..self.positions[3].result().unwrap();
-            self.phase = Phase::AwaitSource; // 四个真实端点全齐；本量子不顺带推进下一结构阶段。
+            if self.selection_bytes.is_none() {
+                self.selection_bytes =
+                    Some(self.positions[2].result().unwrap()..self.positions[3].result().unwrap());
+            }
+            self.phase = if self.underline.is_some() {
+                Phase::ResumeUnderline
+            } else {
+                Phase::AwaitSource
+            }; // 本窗口和选择端点全齐；原scanner覆盖接续仍占下一独立量子。
         }
         Ok(work)
     }
@@ -904,6 +1135,8 @@ impl RootLeafSemanticJob {
     fn begin_next_leaf(
         &mut self,
         document: &MarkdownDocumentBuffer,
+        limits: (usize, usize),
+        ordinary: &mut Option<PlainSemanticJob>,
     ) -> Result<SemanticWork, MarkdownTableRequestError> {
         let mut work = SemanticWork {
             structural_transitions: CONTROL,
@@ -920,6 +1153,19 @@ impl RootLeafSemanticJob {
             self.phase = Phase::Done;
             return Ok(work);
         };
+        if ordinary.as_ref().is_some_and(|job| match record.as_ref() {
+            SourceRecord::Line(line) => line
+                .semantic_block
+                .as_ref()
+                .is_none_or(|block| !job.retains_plain_block(block)),
+            SourceRecord::Leaf(_) => true,
+        }) {
+            // 新真实块不能继承上一普通块的前缀；只付本次旧 owner 的实际释放，
+            // candidate 尚未前移，下一原量子再处理这条来源，不把析构和新构造挤在一起。
+            *ordinary = None;
+            work.structural_transitions += PlainSemanticJob::completed_drop_control();
+            return Ok(work);
+        }
         self.candidate_index += 1;
         let SourceRecord::Leaf(leaf) = record.as_ref() else {
             let SourceRecord::Line(line) = record.as_ref() else {
@@ -930,9 +1176,23 @@ impl RootLeafSemanticJob {
             let requested = self.byte_coverage.as_ref().unwrap();
             let intersection = physical.start.max(requested.start)..physical.end.min(requested.end);
             if !intersection.is_empty() {
+                let complete_window = intersection == *requested;
                 self.active_byte_coverage = Some(intersection);
                 self.record = Some(record);
-                self.phase = Phase::Coverage;
+                if complete_window {
+                    // Bounds 已在原 Source 上逐量子证明请求两端的 floor/ceil 字节位置。
+                    // 普通块完整包含这个外包时，原 Coverage 解码后再 max/min requested
+                    // 必然得到同一 requested；包括非BMP中间UTF16端点，也不能把scalar外包扩大发布。
+                    self.active_coverage = Some(self.requested.clone());
+                    self.run_next = self.requested.start;
+                    self.phase = Phase::Underline;
+                    work.metadata_bytes += std::mem::size_of::<Range<usize>>()
+                        + std::mem::size_of::<Option<Range<usize>>>()
+                        + std::mem::size_of::<usize>();
+                } else {
+                    // 只有一部分请求属于这个真实块时，仍须独立解码交集的UTF16端点。
+                    self.phase = Phase::Coverage;
+                }
             } // 原闭合 Inline 的物理范围仍由 seed 提供，不能把行外邻段合成一个块。
             return Ok(work);
         };
@@ -946,14 +1206,36 @@ impl RootLeafSemanticJob {
         {
             return Err(MarkdownTableRequestError::InvalidRequest);
         } // 其他解析选项的opaque事实不能为当前产品语义补签。
-        if leaf.block.scope_depth() != 0 {
+        let scoped = leaf.block.scope_depth() != 0;
+        if scoped
+            && !matches!(
+                leaf.kind(),
+                LeafBlockKind::AtxHeading(_)
+                    | LeafBlockKind::FencedCode
+                    | LeafBlockKind::IndentedCode
+                    | LeafBlockKind::Html
+                    | LeafBlockKind::Metadata(_)
+            )
+        {
             self.pending
                 .get_or_insert(MarkdownRootLeafPendingReason::NonRootScope);
-            return Ok(work); // 容器仍未知；跳过的是本候选，不是把其区间转成Plain。
+            return Ok(work); // 未接容器语法仍保留空洞，不从相似 marker 补造权限。
         }
         let source = leaf.source_range();
         let requested = self.byte_coverage.as_ref().unwrap();
-        let intersection = source.start.max(requested.start)..source.end.min(requested.end);
+        let start = if scoped
+            || matches!(
+                leaf.kind(),
+                LeafBlockKind::FencedCode
+                    | LeafBlockKind::IndentedCode
+                    | LeafBlockKind::Html
+                    | LeafBlockKind::Metadata(_)
+            ) {
+            leaf.physical_start()
+        } else {
+            source.start
+        }; // 真实代码/字面叶保留首行物理空白；不扩大到 consumed_end 的邻行前缀或未证明容器。
+        let intersection = start.max(requested.start)..source.end.min(requested.end);
         if intersection.is_empty() {
             return Ok(work); // physical范围可能碰到后继prefix，该prefix没有本Leaf的语义权限。
         }
@@ -963,6 +1245,7 @@ impl RootLeafSemanticJob {
                 let LeafBlockDetails::AtxHeading {
                     opening_marker,
                     lexical_content,
+                    attributes,
                     ..
                 } = leaf.details()
                 else {
@@ -980,30 +1263,54 @@ impl RootLeafSemanticJob {
                 }
                 self.raw_markers = [Some(opening), None];
                 self.heading_next = Some(lexical_content.start);
-                self.heading_tail = Some(AtxMarkerTail::new(source));
-                self.phase = Phase::HeadingMarkers;
+                if attributes.is_some() {
+                    if PlainSemanticJob::supports_closed_atx(&leaf.block) {
+                        self.phase = Phase::Coverage;
+                    } else {
+                        self.pending
+                            .get_or_insert(MarkdownRootLeafPendingReason::NeedsGeneralInline);
+                        return Ok(work);
+                    }
+                } else {
+                    self.heading_tail = Some(AtxMarkerTail::new(source));
+                    self.phase = Phase::HeadingMarkers;
+                } // 属性语法必须走原完整短标题入口，不能在 plain 探针中忽略或返回装配错误。
             }
             LeafBlockKind::FencedCode => {
                 self.boundary = Some(FenceBoundaryProof::new(leaf)?);
                 self.phase = Phase::Boundary;
             }
             LeafBlockKind::IndentedCode => self.phase = Phase::Coverage,
+            LeafBlockKind::Html | LeafBlockKind::Metadata(_) => {
+                // 原完整 Parser 对这两类真实叶保持 canonical 字面：没有 Markdown inline 样式、
+                // HTML 执行、metadata marker 隐藏或 anchor。唯一 <u> allowlist 仍经原共享 Underline，
+                // 因而这里仅选择 Coverage，绝不能略过后继配对就发布默认样式。
+                self.phase = Phase::Coverage;
+            }
             LeafBlockKind::ThematicBreak => {
                 self.raw_markers[0] = Some(source);
                 self.phase = Phase::Coverage;
             }
-            _ => {
-                self.pending
-                    .get_or_insert(MarkdownRootLeafPendingReason::UnsupportedKind);
-                return Ok(work); // HTML等仍需其他真实语义，不能借相交来源猜样式。
-            }
         }
+        if scoped {
+            self.scoped = Some(ScopedLeaf::new(
+                &leaf.block,
+                intersection.clone(),
+                self.selection_bytes
+                    .clone()
+                    .expect("Leaf Bounds已完成同一完整选择的字节定位"),
+                limits,
+                &self.quota,
+            )?);
+            work.metadata_bytes += std::mem::size_of::<ScopedLeaf>();
+            self.phase = Phase::Scope;
+        } // Leaf 的原 capture、opening state 与逐行 Origin 必须实际消费，不能仅删除 NonRootScope。
         self.active_byte_coverage = Some(intersection);
         self.record = Some(record);
         Ok(work)
     }
 
-    /// 原 byte/UTF16 交集与全源配对已经完成；仅为当前真实闭合块创建一份固定 Plain scratch。
+    /// 原 byte/UTF16 交集已完成；将唯一配对 owner 移给当前真实闭合块，查询准备先于其后继前探。
     fn begin_ordinary(
         &mut self,
         ordinary: &mut Option<PlainSemanticJob>,
@@ -1016,14 +1323,62 @@ impl RootLeafSemanticJob {
         let SourceRecord::Line(line) = self.record.as_ref().unwrap().as_ref() else {
             return Err(MarkdownTableRequestError::InvalidRequest);
         };
-        let job = PlainSemanticJob::for_closed_block(
-            self.active_coverage.as_ref().unwrap().clone(),
-            self.selection,
-            self.active_byte_coverage.as_ref().unwrap().clone(),
-            self.selection_bytes.clone(),
-            line.semantic_block.as_ref().unwrap(),
-            self.underline.take().unwrap(),
-        )?;
+        let requested = self.active_coverage.as_ref().unwrap().clone();
+        let byte_coverage = self.active_byte_coverage.as_ref().unwrap().clone();
+        if let Some(job) = ordinary.as_mut() {
+            if job.continue_closed_block(
+                requested.clone(),
+                byte_coverage.clone(),
+                self.selection_bytes
+                    .clone()
+                    .expect("Leaf Bounds已完成同一完整选择的字节定位"),
+                line.semantic_block.as_ref().unwrap(),
+                &mut self.underline,
+                self.quota.clone(),
+            ) {
+                // 原固定 scratch 只换本批端点、输出与 quota；沿原构造的固定元数据上界收费，
+                // 真正前缀读取仍由后继 cursor.extend_to/advance 逐量子归账，没有预取新正文。
+                self.ordinary_run_index = 0;
+                self.phase = Phase::Ordinary;
+                return Ok(SemanticWork {
+                    structural_transitions: CONTROL,
+                    metadata_bytes: bytes,
+                    ..Default::default()
+                });
+            }
+            // 同 seed 但范围重叠/回退仍走冷路径；先归还旧完成前缀，再由下一量子构造原 job。
+            *ordinary = None;
+            return Ok(SemanticWork {
+                structural_transitions: CONTROL + PlainSemanticJob::completed_drop_control(),
+                ..Default::default()
+            });
+        }
+        let underline = self.underline.take().unwrap();
+        let job = if line.semantic_block.as_ref().unwrap().is_scoped_paragraph() {
+            PlainSemanticJob::for_closed_origin(
+                requested,
+                self.selection,
+                byte_coverage,
+                self.selection_bytes
+                    .clone()
+                    .expect("Leaf Bounds已完成同一完整选择的字节定位"),
+                line,
+                underline,
+                self.quota.clone(),
+            )?
+        } else {
+            PlainSemanticJob::for_closed_block(
+                requested,
+                self.selection,
+                byte_coverage,
+                self.selection_bytes
+                    .clone()
+                    .expect("Leaf Bounds已完成同一完整选择的字节定位"),
+                line.semantic_block.as_ref().unwrap(),
+                underline,
+                self.quota.clone(),
+            )?
+        };
         *ordinary = Some(job); // 同一父槽的内联载荷，不申请 Box，也不重复初始化空的4KiB游标页。
         self.ordinary_run_index = 0;
         self.phase = Phase::Ordinary;
@@ -1034,12 +1389,47 @@ impl RootLeafSemanticJob {
         })
     }
 
+    /// 只接当前已计量交集的真 ATX，借用父语义槽；scope 仍由本原 Leaf owner 负责。
+    fn begin_atx_inline(
+        &mut self,
+        ordinary: &mut Option<PlainSemanticJob>,
+        budget: usize,
+    ) -> Result<SemanticWork, MarkdownTableRequestError> {
+        let bytes = PlainSemanticJob::closed_block_metadata();
+        if bytes > budget {
+            return Err(MarkdownTableRequestError::WorkLimit);
+        }
+        let SourceRecord::Leaf(leaf) = self.record.as_ref().unwrap().as_ref() else {
+            return Err(MarkdownTableRequestError::InvalidRequest);
+        };
+        *ordinary = Some(PlainSemanticJob::for_closed_atx(
+            self.active_coverage.as_ref().unwrap().clone(),
+            self.selection,
+            self.active_byte_coverage.as_ref().unwrap().clone(),
+            self.selection_bytes
+                .clone()
+                .expect("Leaf Bounds已完成同一完整选择的字节定位"),
+            &leaf.block,
+            self.underline.take(),
+            self.quota.clone(),
+        )?);
+        self.ordinary_run_index = 0;
+        self.phase = Phase::Ordinary;
+        Ok(SemanticWork {
+            structural_transitions: CONTROL,
+            metadata_bytes: bytes,
+            ..Default::default()
+        })
+    }
+
     /// 只撤本Leaf临时坐标；已成功段及全请求唯一underline工作区继续保留原quota和源身份。
     fn clear_active_leaf(&mut self) {
         self.record = None;
         self.active_byte_coverage = None;
         self.active_coverage = None;
         self.boundary = None;
+        self.scoped = None;
+        self.ordinary_run = None;
         self.heading_next = None;
         self.heading_tail = None;
         self.projection = None;
@@ -1096,10 +1486,14 @@ impl RootLeafSemanticJob {
         work.source_tree_steps = tree;
         work.structural_transitions += measured.transitions + tree;
         if general {
-            self.pending
-                .get_or_insert(MarkdownRootLeafPendingReason::NeedsGeneralInline);
-            self.clear_active_leaf();
-            self.phase = Phase::NextLeaf; // 该标题完全不发布run；其他独立Leaf的真实覆盖仍可完成。
+            if PlainSemanticJob::supports_closed_atx(&leaf.block) {
+                self.phase = Phase::Coverage; // 小块仍须完整原 Parser；heading_next 保留本次已见候选的阶段事实。
+            } else {
+                self.pending
+                    .get_or_insert(MarkdownRootLeafPendingReason::NeedsGeneralInline);
+                self.clear_active_leaf();
+                self.phase = Phase::NextLeaf; // 未支持的巨大标题不发布run；独立Leaf仍可完成真实覆盖。
+            }
         } else {
             self.heading_next = Some(next + measured.byte_reads);
         }
@@ -1119,13 +1513,22 @@ impl RootLeafSemanticJob {
             self.phase = Phase::FinishLeaf;
             return Ok(work);
         }
-        let pairs = self
-            .underline
-            .as_ref()
-            .unwrap()
-            .ready_pairs_for(document)
-            .map_err(MarkdownTableRequestError::Window)?
-            .ok_or(MarkdownTableRequestError::InvalidRequest)?;
+        let SourceRecord::Leaf(leaf) = self.record.as_ref().unwrap().as_ref() else {
+            unreachable!("原Leaf不可变");
+        };
+        let pairs = if matches!(
+            leaf.kind(),
+            LeafBlockKind::FencedCode | LeafBlockKind::IndentedCode
+        ) {
+            &[][..] // 已证代码没有HTML语义，不能借外部pair隐藏原<u>字符或给代码画下划线。
+        } else {
+            self.underline
+                .as_ref()
+                .unwrap()
+                .ready_pairs_for(document)
+                .map_err(MarkdownTableRequestError::Window)?
+                .ok_or(MarkdownTableRequestError::InvalidRequest)?
+        };
         if pairs
             .get(self.underline_index)
             .is_some_and(|pair| pair.close.end <= self.run_next)
@@ -1133,9 +1536,6 @@ impl RootLeafSemanticJob {
             self.underline_index += 1;
             return Ok(work); // 每次只跳过一个已过去的真实pair，不隐藏一次无预算大循环。
         }
-        let SourceRecord::Leaf(leaf) = self.record.as_ref().unwrap().as_ref() else {
-            unreachable!("原Leaf不可变");
-        };
         let mut styles = match leaf.kind() {
             // 原Leaf的真实level只映射既有六个样式位，不从标题文字或#数量重新识别。
             LeafBlockKind::AtxHeading(level) => match level {
@@ -1150,10 +1550,28 @@ impl RootLeafSemanticJob {
             LeafBlockKind::FencedCode | LeafBlockKind::IndentedCode => {
                 MarkdownPresentationStyles::FENCED_CODE
             }
-            _ => return Err(MarkdownTableRequestError::InvalidRequest), // 未获本job语义证明的叶种类绝不默认当作代码。
+            // 原源中的 ** / backtick / link spelling 在真实 HTML/metadata 内仍是字面。
+            // 这是实际 Leaf kind 的既定显示语义，不是为未知或失败候选提供默认 fallback。
+            LeafBlockKind::Html | LeafBlockKind::Metadata(_) => {
+                MarkdownPresentationStyles::default()
+            }
         };
+        if (self.scoped.is_some()
+            || matches!(
+                leaf.kind(),
+                LeafBlockKind::FencedCode | LeafBlockKind::IndentedCode
+            ))
+            && self.run_next < self.markers.as_ref().unwrap()[0].start
+        {
+            styles = MarkdownPresentationStyles::default();
+        } // 原Parser代码source从首行缩进之后开始；前缀仍画canonical空白，不能隐藏或强加代码语义。
         let mut end = coverage.end;
-        for marker in self.markers.as_ref().unwrap() {
+        if let Some(scoped) = self.scoped.as_ref() {
+            let query = scoped.query(self.run_next, end);
+            end = query.utf16_range.end;
+            styles = styles.union(query.styles);
+        }
+        for (index, marker) in self.markers.as_ref().unwrap().iter().enumerate() {
             for boundary in [marker.start, marker.end] {
                 if boundary > self.run_next {
                     end = end.min(boundary);
@@ -1161,7 +1579,32 @@ impl RootLeafSemanticJob {
             }
             if marker.contains(&self.run_next) {
                 styles = styles.union(MarkdownPresentationStyles::MARKER);
-                if !markdown_selection_intersects(&self.selection_bytes, &leaf.source_range()) {
+                let active = if leaf.kind() == LeafBlockKind::FencedCode {
+                    let boundary = self.boundary.as_ref().unwrap();
+                    // 活动归属使用原完整物理行，不能把视口裁剪后的marker端点当成可编辑边界。
+                    // closing scanner明确停在EOL之前；opening是否包含EOL已由同Boundary实际读过。
+                    let raw = self.raw_markers[index].as_ref().unwrap();
+                    let owner = if index == 0 {
+                        leaf.physical_start()..raw.end
+                    } else {
+                        raw.clone()
+                    }; // opening行首缩进同属原端点行，但这些canonical空白不因此变成隐藏marker。
+                    markdown_physical_line_is_active(
+                        self.selection_bytes
+                            .as_ref()
+                            .expect("Leaf Bounds已完成同一完整选择的字节定位"),
+                        &owner,
+                        index != 0 || boundary.opening_includes_end,
+                    )
+                } else {
+                    markdown_selection_intersects(
+                        self.selection_bytes
+                            .as_ref()
+                            .expect("Leaf Bounds已完成同一完整选择的字节定位"),
+                        &leaf.source_range(),
+                    )
+                };
+                if !active {
                     styles = styles.union(MarkdownPresentationStyles::HIDDEN_MARKER);
                 }
             }
@@ -1218,18 +1661,19 @@ impl RootLeafSemanticJob {
             // 未走完真实阶段时没有可计费的发布终点，更不能由父来源完成状态替代。
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
-        let cleanup = self.underline.as_ref().map_or(Ok(0), |underline| {
-            underline
+        if let Some(underline) = &self.underline {
+            // 保原来源检查；pair/scanner不在此析构，它们由父请求接回后串行移交。
+            let _ = underline
                 .ready_pairs_for(document)
-                .map_err(MarkdownTableRequestError::Window)
-                .map(|pairs| pairs.map_or(0, <[_]>::len))
-        })?;
+                .map_err(MarkdownTableRequestError::Window)?;
+        }
         Ok(SemanticWork {
             structural_transitions: CONTROL
                 + 2 * PAGE_COUNT
                 + 2 * LEAF_PAGE_COUNT
                 + self.candidates.len
-                + cleanup,
+                // 空覆盖没有可续Ready；父发布Pending后实际归还固定owner，先在此预付其Drop。
+                + usize::from(self.coverage.len == 0) * Self::completed_owner_drop_control(),
             metadata_bytes: if self.coverage.len != 0 {
                 std::mem::size_of::<VerifiedMarkdownRootLeafViewport>()
             } else {
@@ -1266,8 +1710,10 @@ impl RootLeafSemanticJob {
         if work.structural_transitions > budget || work.metadata_bytes > budget {
             return Err(MarkdownTableRequestError::WorkLimit);
         }
-        self.underline = None; // 实际pair清理先付费；Ready不携带context、pair Vec或临时源读取器。
+        // Ready不携带context或pair Vec；父请求在本次发布后接回同一个scanner，不建立第二图。
         self.boundary = None;
+        self.scoped = None;
+        self.ordinary_run = None;
         self.projection = None;
         self.candidates = LeafPages::new(); // 原候选目录的Rc与小页清理已在本发布步收费，不留第二份来源库存。
         let result = if self.coverage.len == 0 {
@@ -1287,6 +1733,7 @@ impl RootLeafSemanticJob {
                 requested: self.requested.clone(),
                 coverage: std::mem::replace(&mut self.coverage, LeafPages::new()),
                 runs: std::mem::replace(&mut self.runs, RunPages::new()),
+                links: std::mem::take(&mut self.links),
             }))
         };
         self.phase = Phase::Published;
@@ -1352,28 +1799,13 @@ impl AtxMarkerTail {
     }
 }
 
-#[derive(Clone, Copy)]
-enum FencePhase {
-    OpeningEol,
-    ClosingEol,
-    LastLine,
-    LastPrefix,
-    Done,
-}
-
-/// 只核旧helper实际使用的首末raw-LF行与真实closer的一致性；不建立物理行Vec或正文String。
+/// 原 producer 已证明 opening、body 与真实 closer；这里只读取 opening 的实际 EOL 归属。
+/// 不重扫最后正文、不把 EOF 字面 fence 当作 closing，也不保留旧显示 helper 的错误分支。
 struct FenceBoundaryProof {
-    source: Range<usize>,
     opening: Range<usize>,
+    opening_includes_end: bool,
     closing: Option<Range<usize>>,
-    reverse_next: usize,
-    last_start: usize,
-    prefix_next: usize,
-    prefix_byte: u8,
-    prefix_len: usize,
-    mismatch: bool,
     done: bool,
-    phase: FencePhase,
 }
 
 impl FenceBoundaryProof {
@@ -1406,148 +1838,31 @@ impl FenceBoundaryProof {
             {
                 Some(body_enclosure.end..*end)
             }
-            (None, None) if leaf.close_reason() == LeafBlockCloseReason::TrueEof => None,
-            _ => return Err(MarkdownTableRequestError::InvalidRequest), // Root不可能借ContainerExit/虚拟EOF伪造closer。
+            (None, None)
+                if matches!(
+                    leaf.close_reason(),
+                    LeafBlockCloseReason::TrueEof | LeafBlockCloseReason::ContainerExit
+                ) =>
+            {
+                None
+            }
+            _ => return Err(MarkdownTableRequestError::InvalidRequest),
         };
         Ok(Self {
-            reverse_next: source.end,
-            last_start: source.start,
-            prefix_next: source.start,
-            source,
             opening: opening_line.clone(),
+            opening_includes_end: false,
             closing,
-            prefix_byte: 0,
-            prefix_len: 0,
-            mismatch: false,
             done: false,
-            phase: FencePhase::OpeningEol,
         })
     }
-    fn complete(&mut self, mismatch: bool) {
-        self.mismatch = mismatch;
-        self.done = true;
-        self.phase = FencePhase::Done;
-    }
+
     fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
-        budget: usize,
     ) -> Result<SemanticWork, MarkdownTableRequestError> {
-        let mut work = SemanticWork {
-            structural_transitions: CONTROL,
-            ..SemanticWork::default()
-        };
-        match self.phase {
-            FencePhase::OpeningEol => {
-                if self.opening.end == self.source.end && self.closing.is_none() {
-                    self.complete(false); // 只有一条opening行，旧首末重复marker不构成第二个真实closer。
-                } else {
-                    let (byte, measured) = peek(document, self.opening.end - 1)?;
-                    work = measured;
-                    if byte != b'\n' {
-                        self.complete(true);
-                    }
-                    // 不能证明旧helper的raw-LF边界与真实opening_line一致时明确Pending。
-                    else {
-                        self.phase = if self.closing.is_some() {
-                            FencePhase::ClosingEol
-                        } else {
-                            FencePhase::LastLine
-                        };
-                    }
-                }
-            }
-            FencePhase::ClosingEol => {
-                let closing = self.closing.as_ref().unwrap();
-                let previous = closing
-                    .start
-                    .checked_sub(1)
-                    .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-                let (byte, measured) = peek(document, previous)?;
-                work = measured;
-                self.complete(byte != b'\n'); // 正常Root closer两侧已由原producer确定，不重扫其正文。
-            }
-            FencePhase::LastLine => {
-                let tree = tree_height(document);
-                let wanted = child_budget(budget - CONTROL, tree)? / 4;
-                let (start, bytes) =
-                    backward_frame(document, self.reverse_next, self.source.start, wanted)?;
-                work.source_tree_steps = tree;
-                work.structural_transitions += tree;
-                for (offset, byte) in bytes.iter().enumerate().rev() {
-                    let absolute = start + offset;
-                    work.source_bytes += 1;
-                    work.structural_transitions += 2;
-                    if absolute + 1 == self.source.end && *byte == b'\n' {
-                        continue;
-                    } // split_inclusive保留最后LF在前一行，不产生空末行。
-                    if *byte == b'\n' {
-                        self.last_start = absolute + 1;
-                        self.prefix_next = self.last_start;
-                        self.phase = FencePhase::LastPrefix;
-                        break;
-                    }
-                }
-                bytes
-                    .finish()
-                    .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
-                if matches!(self.phase, FencePhase::LastLine) {
-                    self.reverse_next = start;
-                    if start == self.source.start {
-                        self.last_start = start;
-                        self.prefix_next = start;
-                        self.phase = FencePhase::LastPrefix;
-                    }
-                }
-            }
-            FencePhase::LastPrefix => {
-                let tree = tree_height(document);
-                let child = child_budget(budget - CONTROL, tree)? / 4;
-                let wanted = child.min(self.source.end - self.prefix_next);
-                if wanted == 0 {
-                    self.complete(false);
-                    return Ok(work);
-                }
-                let frame = document
-                    .table_source_frame(self.prefix_next, wanted)
-                    .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
-                work.source_tree_steps = tree;
-                work.structural_transitions += tree;
-                for &byte in frame.bytes.iter() {
-                    self.prefix_next += 1;
-                    work.source_bytes += 1;
-                    work.structural_transitions += 2;
-                    if self.prefix_len == 0 && matches!(byte, b' ' | b'\t') {
-                        continue;
-                    } // 与旧trim_start的确切ASCII allowlist一致。
-                    if self.prefix_len == 0 {
-                        if !matches!(byte, b'`' | b'~') {
-                            self.complete(false);
-                            break;
-                        }
-                        self.prefix_byte = byte;
-                    } else if byte != self.prefix_byte {
-                        self.complete(false);
-                        break;
-                    }
-                    self.prefix_len += 1;
-                    if self.prefix_len == 3 {
-                        self.complete(self.last_start != self.opening.start); // EOF假fence不能伪造真实closing；只有原opening自身允许合并重复标记。
-                        break;
-                    }
-                }
-                frame
-                    .finish()
-                    .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
-                if !self.done && self.prefix_next == self.source.end {
-                    self.complete(false);
-                }
-            }
-            FencePhase::Done => {} // 完成只保固定范围与布尔结果，不再借源。
-        }
-        if work.source_bytes > budget || work.structural_transitions > budget {
-            return Err(MarkdownTableRequestError::WorkLimit);
-        }
+        let (byte, work) = peek(document, self.opening.end - 1)?;
+        self.opening_includes_end = !matches!(byte, b'\r' | b'\n');
+        self.done = true;
         Ok(work)
     }
 }

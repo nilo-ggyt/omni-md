@@ -81,19 +81,19 @@ fn clamp_i64_to_i32(value: i64) -> i32 {
 pub(crate) type U32Set = read_fonts::collections::int_set::U32Set;
 
 pub use cooperative::{
-    CancellationToken, CooperativeCheckpoint, CooperativeCheckpointKind, CooperativeControl,
-    CooperativePhase, CooperativeSourceHealth, with_cooperative_control,
+    with_cooperative_control, CancellationToken, CooperativeCheckpoint, CooperativeCheckpointKind,
+    CooperativeControl, CooperativePhase, CooperativeSourceHealth,
 };
 pub use error::ShapeError;
 pub use options::ShapeOptions;
 #[doc(hidden)]
 pub use parse_setting::ParseSetting;
 pub use plan::{
-    AsciiFrontierCapability, AsciiFrontierRejection, AsciiGlyphClosure, AsciiGlyphClosureJob,
-    AsciiLocalFrontierCapability, AsciiLocalFrontierCertificate, AsciiLocalFrontierJob,
-    AsciiPositionedAdvance, AsciiPositionedAdvanceJob, ShapePlan, ShapePlanKey,
-    SimpleGcbFrontierCapability, SimpleGcbFrontierJob, simple_gcb_nominal,
-    simple_gcb_output_is_base,
+    simple_gcb_nominal, simple_gcb_output_is_base, AsciiFrontierCapability, AsciiFrontierRejection,
+    AsciiGlyphClosure, AsciiGlyphClosureJob, AsciiLocalFrontierCapability,
+    AsciiLocalFrontierCertificate, AsciiLocalFrontierJob, AsciiPositionedAdvance,
+    AsciiPositionedAdvanceJob, ShapePlan, ShapePlanKey, SimpleGcbFrontierCapability,
+    SimpleGcbFrontierJob,
 };
 pub(crate) use planner::ShapePlanner;
 pub use scale::Scale;

@@ -24,6 +24,9 @@ enum Pending {
 /// 起点到调用方真实端点的原树事实；Weak只认证原Frozen，路径不会增加正文或Reader所有权。
 pub(crate) struct FrozenPrintableAsciiSuffix {
     origin: std::sync::Weak<FrozenText>,
+    // 显示正文的删符与样式目录独立于原树；不会把其空 root 认证为全 ASCII。
+    #[cfg(feature = "s2-table-window-prototype")]
+    projection: Option<Box<display_projection::algorithms::ProjectionPrintableAsciiSuffix>>,
     pending: Vec<Pending>,
     range: Range<usize>,
     rejected: bool,
@@ -45,8 +48,28 @@ pub(crate) struct FrozenPrintableAsciiSuffixStep {
 
 impl FrozenPrintableAsciiSuffix {
     pub(in super::super) fn new(snapshot: &MarkdownTextSnapshot, range: Range<usize>) -> Self {
+        #[cfg(feature = "s2-table-window-prototype")]
+        if let Some(projection) = snapshot.display_projection() {
+            return Self {
+                origin: Arc::downgrade(&snapshot.text),
+                projection: Some(Box::new(
+                    display_projection::algorithms::ProjectionPrintableAsciiSuffix::new(
+                        projection,
+                        range.clone(),
+                    ),
+                )),
+                pending: Vec::new(),
+                range,
+                rejected: false,
+                answer: None,
+                minimum: 0,
+                maximum: 0,
+            };
+        }
         Self {
             origin: Arc::downgrade(&snapshot.text),
+            #[cfg(feature = "s2-table-window-prototype")]
+            projection: None,
             pending: snapshot
                 .text
                 .root
@@ -83,6 +106,17 @@ impl FrozenPrintableAsciiSuffix {
         if !std::sync::Weak::ptr_eq(&self.origin, &Arc::downgrade(&snapshot.text)) {
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         } // 同文本的另一Frozen不能替换实际来源及其资源健康。
+        #[cfg(feature = "s2-table-window-prototype")]
+        if let Some(cursor) = &mut self.projection {
+            return cursor.advance(
+                snapshot
+                    .display_projection()
+                    .expect("显示游标保留原冻结值身份"),
+                maximum_bytes,
+                maximum_scalars,
+                maximum_metadata,
+            );
+        }
         let mut step = FrozenPrintableAsciiSuffixStep {
             bytes: 0,
             scalars: 0,

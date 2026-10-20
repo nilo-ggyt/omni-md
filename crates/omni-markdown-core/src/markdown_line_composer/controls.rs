@@ -94,6 +94,10 @@ pub enum MarkdownComposedLinePartKind {
     Glyphs,
     Tab,
     ParagraphBreak,
+    /// 原折叠控制覆盖的 canonical 隐区；没有内部可见 glyph 或可命中的 caret。
+    FoldedSection,
+    /// 已按最终列宽完成真实格排版的表格块行，不包含正文 glyph。
+    TableRow,
 }
 impl MarkdownComposedLinePartKind {
     pub(super) fn code(self) -> u8 {
@@ -101,6 +105,8 @@ impl MarkdownComposedLinePartKind {
             Self::Glyphs => 0,
             Self::Tab => 1,
             Self::ParagraphBreak => 2,
+            Self::FoldedSection => 3,
+            Self::TableRow => 4,
         }
     }
     pub(super) fn decode(code: u8) -> Result<Self> {
@@ -108,6 +114,8 @@ impl MarkdownComposedLinePartKind {
             0 => Ok(Self::Glyphs),
             1 => Ok(Self::Tab),
             2 => Ok(Self::ParagraphBreak),
+            3 => Ok(Self::FoldedSection),
+            4 => Ok(Self::TableRow),
             _ => Err(Error::InconsistentCoverage),
         }
     }
@@ -119,6 +127,23 @@ pub struct MarkdownLineControlResponse {
     pub(super) registered: MarkdownLineRegisteredFont,
     pub(super) points: f32,
     pub(super) paragraph: MarkdownLineParagraphStyle,
+    pub(super) presentation: crate::MarkdownPresentationStyles,
+    pub(super) paragraph_inset_26_6: i32,
+}
+impl MarkdownLineControlResponse {
+    /// 原控制范围也消费同一来源语义；换行不画墨迹，但其字体和段落不得把隐藏围栏重新撑高。
+    pub fn with_presentation(
+        mut self,
+        styles: crate::MarkdownPresentationStyles,
+        inset_26_6: i32,
+    ) -> Result<Self> {
+        if inset_26_6 < 0 {
+            return Err(Error::InvalidRequest);
+        }
+        self.presentation = styles;
+        self.paragraph_inset_26_6 = inset_26_6;
+        Ok(self)
+    }
 }
 impl super::MarkdownLineInlineControl {
     /// 原控制nonce和源票随响应一起归还；公开事实的改写不能替代实际仍待处理的请求。
@@ -138,6 +163,8 @@ impl super::MarkdownLineInlineControl {
             registered: registered.clone(),
             points,
             paragraph,
+            presentation: crate::MarkdownPresentationStyles::default(),
+            paragraph_inset_26_6: 0,
         })
     }
     pub fn source(&self) -> &MarkdownLayoutTextAuthority {

@@ -3,6 +3,9 @@
 use super::{MarkdownLineBreakKind as BreakKind, unicode_data::Class};
 use Class::*;
 
+#[cfg(feature = "paged-line-compose")]
+use crate::markdown_layout_source::folds::FoldSpan;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Break {
     pub byte_offset: u64,
@@ -306,6 +309,42 @@ impl Default for Machine {
 }
 
 impl Machine {
+    /// 原 row 起点之前的 pending token 属于正文义务，不能随表格内容一起丢弃。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(super) fn has_before_table(&self, byte: usize) -> bool {
+        self.pending
+            .first()
+            .and_then(|token| *token)
+            .is_some_and(|token| token.byte_start < byte as u64)
+    }
+
+    /// 只使用原 decision 和已有真实 lookahead，逐个结算表格之前的待决规则。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(super) fn drain_before_table(&mut self, byte: usize) -> Option<Break> {
+        if !self.has_before_table(byte) {
+            return None;
+        }
+        let mut event = None;
+        self.consume_boundary(&mut |actual| event = Some(actual));
+        event
+    }
+
+    /// 封闭物理票证明硬换行切断规则上下文；只把原机器移到真实末控制之前，不制造断点。
+    #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+    pub(super) fn begin_table_tail(
+        &mut self,
+        span: crate::markdown_layout_source::table_rows::TableSpan,
+    ) {
+        self.left = Left::default();
+        self.pending = [None; 3];
+        self.pending_len = 0;
+        self.decoder = [0; 4];
+        self.decoder_len = 0;
+        self.decoder_expected = 0;
+        self.byte_offset = span.tail.byte as u64;
+        self.utf16_offset = span.tail.utf16 as u64;
+        self.scalar_byte_start = self.byte_offset;
+    }
     pub(super) fn new() -> Self {
         Self {
             left: Left::default(),
@@ -334,6 +373,66 @@ impl Machine {
     }
     pub(super) fn needs_dictionary(&self) -> bool {
         self.dictionary_required
+    }
+
+    /// 只有真实 header CR/LF 已经进入原解码器，才允许逐个结清它之前的待决规则。
+    #[cfg(feature = "paged-line-compose")]
+    pub(super) fn fold_header_drained(&self) -> Result<bool, Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        if self.finished {
+            return Err(Error::Closed);
+        }
+        if self.decoder_len != 0 {
+            return Err(Error::InvalidUtf8);
+        }
+        let last = if self.pending_len == 0 {
+            self.left.last
+        } else {
+            self.pending[self.pending_len - 1]
+        };
+        if !last.is_some_and(|token| matches!(token.meta.class, Cr | Lf)) {
+            return Err(Error::OutOfOrder);
+        }
+        Ok(self.pending_len == 0)
+    }
+
+    /// 真换行已经给早前 token 提供完整 lookahead；共用原 decision，不用 EOF 补齐队列。
+    #[cfg(feature = "paged-line-compose")]
+    pub(super) fn drain_fold_header_one(&mut self) -> Result<Option<Break>, Error> {
+        if self.fold_header_drained()? {
+            return Ok(None);
+        }
+        let mut event = None;
+        self.consume_boundary(&mut |value| event = Some(value));
+        Ok(event)
+    }
+
+    /// 私有同 Source 证明只跳过两次真实硬换行之间的隐区；末端字节仍必须正常 push。
+    #[cfg(feature = "paged-line-compose")]
+    pub(super) fn resume_at_fold_tail(&mut self, span: FoldSpan) -> Result<(), Error> {
+        if !self.fold_header_drained()?
+            || self.byte_offset != span.header_end.byte as u64
+            || self.utf16_offset != span.header_end.utf16 as u64
+            || span.tail_start.byte <= span.header_end.byte
+            || span.tail_start.byte > span.end.byte
+            || span.tail_start.utf16 > span.end.utf16
+            || span.tail_start.byte == span.end.byte && !span.eof
+        {
+            return Err(Error::OutOfOrder);
+        }
+        // 原规则的所有跨段后缀都被实际 CR/LF 截断；不保留未读隐区的类别或 SA 结论。
+        self.left = Left::default();
+        self.pending = [None; 3];
+        self.pending_len = 0;
+        self.decoder = [0; 4];
+        self.decoder_len = 0;
+        self.decoder_expected = 0;
+        self.byte_offset = span.tail_start.byte as u64;
+        self.utf16_offset = span.tail_start.utf16 as u64;
+        self.scalar_byte_start = self.byte_offset;
+        Ok(())
     }
 
     fn consume_boundary(&mut self, emit: &mut impl FnMut(Break)) {

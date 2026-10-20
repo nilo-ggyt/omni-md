@@ -2,9 +2,6 @@
 
 use super::*;
 
-mod insertion;
-pub(in crate::native_surface) use insertion::NativeMarkdownTableInsertionObservation;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native_surface) enum NativeMarkdownTableCellOutcome {
     Activated,
@@ -39,16 +36,6 @@ pub(in crate::native_surface) struct NativeMarkdownTableCellReceipt {
 impl NativeMarkdownTableCellReceipt {
     pub(in crate::native_surface) fn outcome(&self) -> Option<NativeMarkdownTableCellOutcome> {
         self.outcome.get()
-    }
-    #[cfg(feature = "native-table-row-append")]
-    pub(in crate::native_surface) fn original_generation(&self) -> u64 {
-        self.key.document_generation
-    }
-    #[cfg(feature = "native-table-row-append")]
-    pub(in crate::native_surface) fn original_coordinate(
-        &self,
-    ) -> NativeMarkdownTableCellCoordinate {
-        self.coordinate
     }
     /// 激活终点之后、下一实际输入之前仍守同一原票；只读Rust值，不升级Native weak。
     pub(in crate::native_surface) fn current_for(

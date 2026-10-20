@@ -5,6 +5,7 @@ use std::io::Write;
 
 mod cell;
 mod composition;
+mod folding;
 mod formatting;
 mod navigation;
 mod replacements;

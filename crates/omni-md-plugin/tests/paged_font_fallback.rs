@@ -258,6 +258,10 @@ fn selected_case(
                 continue; // 本控制明确采用首个可捕获且真实shape无缺字策略；不等同首个系统字体。
             }
             NativeMarkdownFontFallbackStep::PendingDependencies => panic!("实际索引已完成"),
+            #[cfg(feature = "native-paged-production")]
+            NativeMarkdownFontFallbackStep::UnavailableForString { .. } => {
+                panic!("原显式 GCB/Script 工厂没有协调器首 scalar 票，不能走 probed 字体分支")
+            }
             NativeMarkdownFontFallbackStep::Exhausted { tried } => {
                 panic!("真实候选全部缺字，不能伪称选择成功: tried={tried}")
             }

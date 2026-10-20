@@ -76,6 +76,11 @@ struct Scan {
     before2: Option<Run>,
     after2: Option<Run>,
     first_control: Option<usize>,
+    folded_end: Option<usize>,
+    #[cfg(feature = "paged-shaping-frontier")]
+    folded_range: Option<Range<usize>>,
+    #[cfg(feature = "paged-shaping-frontier")]
+    paragraph_break: bool,
 }
 impl Scan {
     fn new(line: MarkdownComposedLine) -> Self {
@@ -91,6 +96,11 @@ impl Scan {
             before2: None,
             after2: None,
             first_control: None,
+            folded_end: None,
+            #[cfg(feature = "paged-shaping-frontier")]
+            folded_range: None,
+            #[cfg(feature = "paged-shaping-frontier")]
+            paragraph_break: false,
         }
     }
     /// Join only source-contiguous font slices at the same actual level; control parts add no visual glyph.
@@ -104,8 +114,23 @@ impl Scan {
     ) {
         let f = part.facts();
         let ordinal = self.part.ordinal;
-        if f.kind == crate::MarkdownComposedLinePartKind::ParagraphBreak {
+        if matches!(
+            f.kind,
+            crate::MarkdownComposedLinePartKind::ParagraphBreak
+                | crate::MarkdownComposedLinePartKind::FoldedSection
+        ) {
             self.first_control.get_or_insert(ordinal);
+            if f.kind == crate::MarkdownComposedLinePartKind::FoldedSection {
+                self.folded_end = Some(f.source_utf16.end);
+            }
+            #[cfg(feature = "paged-shaping-frontier")]
+            {
+                if f.kind == crate::MarkdownComposedLinePartKind::FoldedSection {
+                    self.folded_range = Some(f.source_utf16.clone());
+                } else {
+                    self.paragraph_break |= !f.source_utf16.is_empty();
+                }
+            } // 原控制记录区分真实段分隔与 opaque 折叠，Word 不能把隐藏正文当普通空白。
             return;
         }
         let at = if right == (f.level & 1 == 0) {
@@ -183,7 +208,24 @@ impl Scan {
     }
 }
 
-/// Hold only weak output identity, the authenticated line and fixed records; suspension owns no text/font/FD.
+/// 跨整形 part 的字素只沿现成视觉次序前进；保留原合法 caret，不能在内部 seam 停留。
+#[derive(Clone, Copy)]
+struct ShapingSeamWalk {
+    utf16: usize,
+    side: MarkdownComposedCaretSide,
+    #[cfg(feature = "paged-shaping-frontier")]
+    boundary: Option<(usize, crate::MarkdownGraphemeBoundary)>,
+}
+
+/// 相邻 run 的视觉入口仍须是原 GCB；若落在内部 seam，仅沿这个真实 part 继续找边界。
+struct CandidateCaret {
+    utf16: usize,
+    side: MarkdownComposedCaretSide,
+    part: usize,
+    boundary: graphemes::BoundarySearch,
+}
+
+/// 只保弱输出身份、原行和固定记录；暂停不持正文、字体或额外 FD。
 pub struct MarkdownComposedVisualQuery {
     output: Weak<()>,
     source: MarkdownLayoutTextAuthority,
@@ -191,17 +233,52 @@ pub struct MarkdownComposedVisualQuery {
     head_search: Option<graphemes::BoundarySearch>,
     side: Option<MarkdownComposedCaretSide>,
     right: bool,
+    /// 首个真实段确定一次文档前后；软行或新段的局部屏幕方向由各自实际 base 换算。
+    pub(super) flow_forward: Option<bool>,
     lookup: Option<MarkdownComposedLineLookup>,
     scan: Option<Scan>,
     selected: Option<PartRead>,
     run: Option<Run>,
     adjacent: Option<Run>,
-    gcb: Option<MarkdownComposedVisualGraphemeQuery>,
+    pub(super) gcb: Option<MarkdownComposedVisualGraphemeQuery>,
+    seam_walk: Option<ShapingSeamWalk>,
+    /// 进入相邻 run 前的合法位置与侧；仅当真实入口不是 GCB 时才用于跨 seam 的收口。
+    run_origin: Option<ShapingSeamWalk>,
+    entered_part: bool,
+    #[cfg(feature = "paged-shaping-frontier")]
+    head_boundary: Option<(usize, crate::MarkdownGraphemeBoundary)>,
+    candidate: Option<CandidateCaret>,
     entry: bool,
     edge_only: bool,
     answer: Option<MarkdownComposedVisualAnswer>,
     failed: bool,
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(super) crossed_break: bool,
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub(super) crossed_fold: Option<Range<usize>>,
 }
+#[cfg(feature = "paged-shaping-frontier")]
+impl MarkdownComposedVisualQuery {
+    /// Word 分类可以晚于本次目录查询；转交的仍是原五个弱字体票，不保活 Font 或另一份 Reader。
+    pub(super) fn word_registrations(&self) -> [Option<MarkdownLineFontRegistration>; 5] {
+        [
+            self.run.as_ref().and_then(|run| run.registration.clone()),
+            self.adjacent
+                .as_ref()
+                .and_then(|run| run.registration.clone()),
+            self.scan
+                .as_ref()
+                .and_then(|scan| scan.center.as_ref())
+                .and_then(|run| run.registration.clone()),
+            self.scan
+                .as_ref()
+                .and_then(|scan| scan.previous.as_ref())
+                .and_then(|run| run.registration.clone()),
+            self.gcb.as_ref().map(|gcb| gcb.registration.clone()),
+        ]
+    }
+}
+
 impl MarkdownComposedLines {
     /// Use position/soft-wrap affinity for the original line lookup; match bidi side against actual L1/L2 runs.
     ///
@@ -223,16 +300,27 @@ impl MarkdownComposedLines {
             head_search: Some(graphemes::BoundarySearch::offset(utf16)),
             side,
             right,
+            flow_forward: None,
             lookup: Some(lookup),
             scan: None,
             selected: None,
             run: None,
             adjacent: None,
             gcb: None,
+            seam_walk: None,
+            run_origin: None,
+            entered_part: false,
+            #[cfg(feature = "paged-shaping-frontier")]
+            head_boundary: None,
+            candidate: None,
             entry: false,
             edge_only: false,
             answer: None,
             failed: false,
+            #[cfg(feature = "paged-shaping-frontier")]
+            crossed_break: false,
+            #[cfg(feature = "paged-shaping-frontier")]
+            crossed_fold: None,
         })
     }
 
@@ -308,6 +396,11 @@ impl MarkdownComposedLines {
                             break;
                         }
                         MarkdownComposedLineLookupAnswer::Found(line) => {
+                            let forward = *query
+                                .flow_forward
+                                .get_or_insert(query.right == (line.base_level == 0));
+                            query.right = forward == (line.base_level == 0);
+                            // 原相邻行有自己的段方向；保持这一次动作的文档流向，不能每跨一行反转邻接。
                             query.scan = Some(Scan::new(line));
                             query.lookup = None;
                         }
@@ -322,14 +415,49 @@ impl MarkdownComposedLines {
                         self.row(record)
                     })?;
                     remaining -= step.records;
-                    let Some((_, boundary)) = step.answer else {
+                    let Some((_ordinal, boundary)) = step.answer else {
                         break;
                     };
                     if boundary.is_none_or(|boundary| boundary.utf16 != query.head) {
                         return Err(Error::InvalidRequest);
                     }
+                    #[cfg(feature = "paged-shaping-frontier")]
+                    {
+                        query.head_boundary = boundary.map(|boundary| (_ordinal, boundary));
+                    }
                     query.head_search = None;
                     continue; // Crossing lines cannot bypass GCB authentication inside CRLF or a combining sequence.
+                }
+                if let Some(candidate) = query.candidate.as_mut() {
+                    let source = &self.payload.as_ref().ok_or(Error::Poisoned)?.source;
+                    let step = candidate.boundary.step(
+                        self.graphemes,
+                        source.byte_len(),
+                        source.utf16_len(),
+                        remaining,
+                        |record| self.row(record),
+                    )?;
+                    remaining -= step.records;
+                    let Some((_, boundary)) = step.answer else {
+                        break;
+                    };
+                    if boundary.is_some_and(|boundary| boundary.utf16 == candidate.utf16) {
+                        let scan = query.scan.as_ref().ok_or(Error::InconsistentCoverage)?;
+                        query.answer = Some(MarkdownComposedVisualAnswer::Found {
+                            utf16: candidate.utf16,
+                            side: candidate.side,
+                            line: scan.line.facts.source_utf16.clone(),
+                            ordinal: scan.line.facts.ordinal,
+                        });
+                        query.candidate = None;
+                        continue;
+                    }
+                    let part = candidate.part;
+                    query.candidate = None;
+                    self.begin_shaping_seam_walk(query)?;
+                    query.selected = Some(PartRead::new(part));
+                    query.gcb = None;
+                    continue; // 内部标量不能作为下一合法 caret，也不能借向上取整跳过实际视觉顺序。
                 }
                 let scan = query.scan.as_mut().ok_or(Error::InconsistentCoverage)?;
                 // Stream visual parts in original L1/L2 order; only fixed neighboring run facts survive a turn.
@@ -345,13 +473,18 @@ impl MarkdownComposedLines {
                 }
                 if query.run.is_none() {
                     scan.close(query.head, query.side, query.right, query.entry);
+                    #[cfg(feature = "paged-shaping-frontier")]
+                    if query.entry && query.flow_forward == Some(false) {
+                        query.crossed_break |= scan.paragraph_break;
+                        query.crossed_fold = scan.folded_range.clone();
+                    } // 空控制行同样属于原文档的前一显示行，不能遗漏实际换行后误当正文端点。
                     let center = scan.center.clone();
                     if center.is_none() {
                         if scan.first_control.is_none() {
                             return Err(Error::InvalidRequest);
                         } // A foreign caret side cannot become a cross-line permission.
                         if query.entry {
-                            if query.right && !query.edge_only {
+                            if query.flow_forward == Some(true) && !query.edge_only {
                                 // 软折行入口本身没有字符；若下一行只有真实换行控制，仍须在同一
                                 // 动作和剩余配额内越过该控制，不能先交付一个零距离的亲和性变化。
                                 self.visual_cross(query)?;
@@ -384,14 +517,24 @@ impl MarkdownComposedLines {
                     };
                     if query.entry {
                         query.head = run.edge(!query.right);
-                        // 右移是否已跨硬换行来自上一行；左移则由刚认证的前行控制确认。
+                        // 向后继行的硬换行来自上一行；文档后退则由刚认证的前行控制确认。
                         // 纯软折行继续同一GCB查询，不能把显示行入口当成一次字符移动。
-                        query.edge_only |= !query.right && scan.first_control.is_some();
+                        query.edge_only |=
+                            query.flow_forward == Some(false) && scan.first_control.is_some();
                     } else if query.head == run.edge(query.right) {
                         let Some(next) = adjacent.take() else {
                             self.visual_cross(query)?;
                             continue;
                         };
+                        query.run_origin = Some(ShapingSeamWalk {
+                            utf16: query.head,
+                            side: query
+                                .side
+                                .unwrap_or_else(|| run.side(query.head < run.source.end)),
+                            #[cfg(feature = "paged-shaping-frontier")]
+                            boundary: query.head_boundary,
+                        });
+                        query.entered_part = true;
                         run = next;
                         query.head = run.edge(!query.right);
                         adjacent = if query.right {
@@ -416,9 +559,19 @@ impl MarkdownComposedLines {
                     let Some(part) = self.visual_part(&scan.line, read, &mut remaining)? else {
                         break;
                     };
-                    query.gcb = Some(self.visual_grapheme_query(
+                    let position = if query.seam_walk.is_some() {
+                        // 已消费的原字素跨 part；从相邻实际 part 的视觉入口找第一个真 GCB。
+                        if query.right == (part.facts.level & 1 == 0) {
+                            part.facts.source_utf16.start
+                        } else {
+                            part.facts.source_utf16.end
+                        }
+                    } else {
+                        query.head
+                    };
+                    let mut gcb = self.visual_grapheme_query(
                         &part,
-                        query.head,
+                        position,
                         if query.edge_only {
                             // Authenticate the actual entry endpoint, including a control-only empty line.
                             (query.head != part.facts.source_utf16.start)
@@ -426,7 +579,17 @@ impl MarkdownComposedLines {
                         } else {
                             query.right
                         },
-                    )?);
+                    )?;
+                    if query.seam_walk.is_some() || query.entry || query.entered_part {
+                        gcb.start = GraphemeQueryStart::PartEntry {
+                            inclusive: query.seam_walk.is_some(),
+                        };
+                    }
+                    #[cfg(feature = "paged-shaping-frontier")]
+                    if let Some(walk) = query.seam_walk.as_ref().or(query.run_origin.as_ref()) {
+                        gcb.origin = walk.boundary;
+                    }
+                    query.gcb = Some(gcb);
                     continue;
                 }
                 let step = self.step_visual_grapheme(
@@ -442,21 +605,49 @@ impl MarkdownComposedLines {
                         run.side(run.registration.is_none() || query.right == (run.level & 1 == 0)),
                     ),
                     MarkdownComposedVisualGraphemeAnswer::Edge => {
-                        return Err(Error::InconsistentCoverage);
+                        let part_count = scan.line.facts.parts;
+                        self.begin_shaping_seam_walk(query)?;
+                        let ordinal = query
+                            .selected
+                            .as_ref()
+                            .ok_or(Error::InconsistentCoverage)?
+                            .ordinal;
+                        let next = if query.right {
+                            ordinal.checked_add(1)
+                        } else {
+                            ordinal.checked_sub(1)
+                        };
+                        if let Some(next) = next.filter(|next| *next < part_count) {
+                            // 同一剩余 records 预算继续读真正邻接 part，不重扫文字或复制视觉顺序表。
+                            query.selected = Some(PartRead::new(next));
+                            query.gcb = None;
+                            continue;
+                        }
+                        self.visual_cross(query)?;
+                        continue;
                     }
                     MarkdownComposedVisualGraphemeAnswer::Found { utf16, side } => {
                         if query.edge_only {
                             return Err(Error::InconsistentCoverage);
                         }
-                        if utf16 == run.edge(query.right)
+                        if query.seam_walk.is_none()
+                            && utf16 == run.edge(query.right)
                             && let Some(adjacent) = &query.adjacent
                             && usize::from(adjacent.level) + usize::from(!query.right)
                                 < usize::from(run.level)
                         {
-                            (
-                                adjacent.edge(!query.right),
-                                adjacent.side(query.right == (adjacent.level & 1 == 0)),
-                            )
+                            let target = adjacent.edge(!query.right);
+                            query.candidate = Some(CandidateCaret {
+                                utf16: target,
+                                side: adjacent.side(query.right == (adjacent.level & 1 == 0)),
+                                part: if query.right {
+                                    adjacent.first
+                                } else {
+                                    adjacent.last
+                                },
+                                boundary: graphemes::BoundarySearch::offset(target),
+                            });
+                            continue; // 只有实际侧调整才额外认证目标；普通单 part 热路不增加目录读取。
                         } else {
                             (utf16, side)
                         }
@@ -514,16 +705,42 @@ impl MarkdownComposedLines {
         self.finish(result)
     }
 
-    /// Cross only to the original adjacent ordinal; unknown prefixes stay pending and only real BOF/EOF clamp.
+    /// 只在原整行实际 part 边缘接管；暂停继续同一输出，没有第二份 bidi 或字素目录。
+    fn begin_shaping_seam_walk(&self, query: &mut MarkdownComposedVisualQuery) -> Result<()> {
+        if query.seam_walk.is_none() {
+            if let Some(origin) = query.run_origin.take() {
+                query.seam_walk = Some(origin);
+                return Ok(());
+            }
+            let run = query.run.as_ref().ok_or(Error::InconsistentCoverage)?;
+            query.seam_walk = Some(ShapingSeamWalk {
+                utf16: query.head,
+                side: query
+                    .side
+                    .unwrap_or_else(|| run.side(query.head < run.source.end)),
+                #[cfg(feature = "paged-shaping-frontier")]
+                boundary: query.gcb.as_ref().and_then(|gcb| gcb.origin),
+            });
+        }
+        Ok(())
+    }
+
+    /// 本次动作按首段确定的原文档流向跨相邻 ordinal；未知前缀仍等待，只有真正 BOF/EOF 才停下。
     fn visual_cross(&mut self, query: &mut MarkdownComposedVisualQuery) -> Result<()> {
         let scan = query.scan.as_ref().ok_or(Error::InconsistentCoverage)?;
+        let forward = query.flow_forward.ok_or(Error::InconsistentCoverage)?;
+        #[cfg(feature = "paged-shaping-frontier")]
+        if forward {
+            query.crossed_break |= scan.paragraph_break;
+            query.crossed_fold = scan.folded_range.clone();
+        } // trace 仅来自本次真正越过的原行控制；软折行没有此权限。
         let ordinal = scan.line.facts.ordinal;
-        let next = if query.right {
+        let next = if forward {
             ordinal.checked_add(1)
         } else {
             ordinal.checked_sub(1)
         };
-        let terminal = if query.right {
+        let terminal = if forward {
             ordinal.checked_add(1) == Some(self.count)
                 && self.range.end
                     == self
@@ -532,7 +749,7 @@ impl MarkdownComposedLines {
                         .ok_or(Error::Poisoned)?
                         .source
                         .utf16_len()
-                && scan.first_control.is_none()
+                && (scan.first_control.is_none() || scan.folded_end == Some(self.range.end))
                 || scan.line.facts.source_utf16.is_empty()
         } else {
             ordinal == 0
@@ -543,7 +760,19 @@ impl MarkdownComposedLines {
             } else {
                 scan.center.as_ref().or(scan.previous.as_ref())
             };
-            let (utf16, side) = if let Some(run) = run {
+            let (utf16, side) = if let Some(walk) = &query.seam_walk {
+                // 本行在所选视觉方向已无另一个真 GCB；只保原合法位置与侧，不能返回末 part 的标量 seam。
+                (walk.utf16, walk.side)
+            } else if forward && scan.folded_end == Some(self.range.end) {
+                // 未终止正文被折到真实 EOF 时只越过原隐区，不查询一个并不存在的后继行。
+                (
+                    self.range.end,
+                    MarkdownComposedCaretSide {
+                        level: scan.line.base_level,
+                        association: MarkdownComposedCaretAssociation::Before,
+                    },
+                )
+            } else if let Some(run) = run {
                 (
                     run.edge(query.right),
                     run.side(query.right != (run.level & 1 == 0)),
@@ -566,17 +795,25 @@ impl MarkdownComposedLines {
             return Ok(());
         }
         let next = next.ok_or(Error::InconsistentCoverage)?;
-        let crossed_hard = query.right && scan.first_control.is_some();
+        let crossed_hard = forward && scan.first_control.is_some();
         query.lookup = Some(self.line_lookup(MarkdownComposedLineLookupTarget::Ordinal(next))?);
         query.scan = None;
         query.head_search = None;
         query.run = None;
         query.selected = None;
         query.gcb = None;
+        query.seam_walk = None;
+        query.run_origin = None;
+        query.entered_part = false;
+        #[cfg(feature = "paged-shaping-frontier")]
+        {
+            query.head_boundary = None;
+        }
+        query.candidate = None;
         query.adjacent = None;
         query.entry = true;
         // 只有真实ParagraphBreak才消耗本次字符动作；可见范围或soft line末端不授予此事实。
-        // 左移的硬换行需等前行真实part认证完成后才能判定，不从两个range相接猜测。
+        // 文档后退的硬换行需等前行真实part认证完成，不从屏幕左右或两个range相接猜测。
         query.edge_only = crossed_hard;
         Ok(())
     }

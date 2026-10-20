@@ -2,7 +2,7 @@
 //!
 //! 本模块不创建线程。调用方将trial packet移入真实worker并join后，才在主线程消费结果。
 //! 试次只捕获同一Source/CoreFont；!Send的ShapeJob在worker内部构造和析构，绝不跨线程移动。
-use std::{ops::Range, sync::Arc};
+use std::{ops::Range, rc::Rc, sync::Arc};
 
 use objc2_foundation::MainThreadMarker;
 use omni_markdown_core::{
@@ -20,17 +20,20 @@ use super::{
     paged_font_cascade::{
         NativeMarkdownFontCascade, NativeMarkdownFontCascadeBudget, NativeMarkdownFontCascadeError,
     },
-    paged_fonts::{NativeMarkdownPagedFont, NativeMarkdownPagedFontError},
+    paged_fonts::{
+        NativeMarkdownFontCapture, NativeMarkdownPagedFont, NativeMarkdownPagedFontError,
+    },
+    paged_line_fonts::NativeMarkdownLineFont,
 };
 
 // 这里只拦住Core原语言标签预算之外的复制；64字节以内的语法仍由Core唯一校验器决定。
 // 该上界与MarkdownShapingOptions的既有语言预算一致，不截断标签或改成默认语言。
 const MAX_TRIAL_LANGUAGE_BYTES: usize = 64;
 
-#[cfg(feature = "native-paged-compose-probe")]
+#[cfg(feature = "native-paged-production")]
 mod compose;
 mod trial;
-#[cfg(feature = "native-paged-compose-probe")]
+#[cfg(feature = "native-paged-production")]
 pub use compose::NativeMarkdownProbedFontFallbackRequest;
 pub use trial::{
     NATIVE_MARKDOWN_FONT_TRIAL_GLYPHS, NativeMarkdownFontTrialBudget,
@@ -41,6 +44,9 @@ pub use trial::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeMarkdownFontOrigin {
     Base,
+    /// 原 Base 已经完整试次缺字后，系统针对同 GCB 首 scalar 选择的真实优先候选。
+    #[cfg(feature = "native-paged-production")]
+    ForString,
     Cascade(usize),
 }
 #[derive(Clone)]
@@ -54,7 +60,7 @@ pub struct NativeMarkdownFontFallbackRequest {
 }
 #[derive(Debug, Error)]
 pub enum NativeMarkdownFontFallbackError {
-    #[cfg(feature = "native-paged-compose-probe")]
+    #[cfg(feature = "native-paged-production")]
     #[error("原组合器字体试次权限失效：{0}")]
     Compose(#[source] omni_markdown_core::MarkdownLineComposeError),
     #[error("原字体回退权限已撤销")]
@@ -99,6 +105,9 @@ pub enum NativeMarkdownFontFallbackError {
         #[source]
         error: NativeMarkdownFontCascadeError,
     },
+    #[cfg(feature = "native-paged-production")]
+    #[error("系统首字符优先候选无法捕获同源字体：{0}")]
+    ForStringCapture(#[source] NativeMarkdownPagedFontError),
     #[error("实际字体整形失败")]
     Shaping(#[from] MarkdownShapingError),
 }
@@ -117,7 +126,7 @@ impl NativeMarkdownFontFallbackError {
             | Self::Shaping(MarkdownShapingError::Source(
                 MarkdownDocumentBufferError::PreparedTextInputStale,
             )) => true,
-            #[cfg(feature = "native-paged-compose-probe")]
+            #[cfg(feature = "native-paged-production")]
             Self::Compose(
                 omni_markdown_core::MarkdownLineComposeError::Cancelled
                 | omni_markdown_core::MarkdownLineComposeError::Source(
@@ -135,7 +144,7 @@ impl NativeMarkdownFontFallbackError {
             | Self::Shaping(MarkdownShapingError::Source(
                 MarkdownDocumentBufferError::OriginalBackingUnavailable(errno),
             )) => Some(*errno),
-            #[cfg(feature = "native-paged-compose-probe")]
+            #[cfg(feature = "native-paged-production")]
             Self::Compose(omni_markdown_core::MarkdownLineComposeError::Source(
                 MarkdownDocumentBufferError::OriginalBackingUnavailable(errno),
             )) => Some(*errno),
@@ -155,7 +164,7 @@ impl NativeMarkdownFontFallbackError {
                 MarkdownDocumentBufferError::OriginalBackingUnavailable(_)
                 | MarkdownDocumentBufferError::EditStorageUnavailable(_),
             )) => true,
-            #[cfg(feature = "native-paged-compose-probe")]
+            #[cfg(feature = "native-paged-production")]
             Self::Compose(omni_markdown_core::MarkdownLineComposeError::Source(
                 MarkdownDocumentBufferError::OriginalBackingUnavailable(_)
                 | MarkdownDocumentBufferError::EditStorageUnavailable(_),
@@ -209,7 +218,9 @@ impl NativeMarkdownFontChoice {
         base: &'a NativeMarkdownPagedFont,
         source: &MarkdownLayoutTextSource,
     ) -> Result<&'a NativeMarkdownPagedFont> {
-        source.byte_offset_for_utf16(self.source_utf16.start)?;
+        // Choice 只能由原完整 worker 结果创建，两端已在同一不可变 Source 核准。
+        // 消费时只需再次核真实健康与原 authority，不能为借字体重读远端 UTF16 起点的整条前缀。
+        source.byte_offset_for_utf16(0)?;
         if source.authority() != self.source {
             return Err(NativeMarkdownFontFallbackError::SourceMismatch);
         }
@@ -246,7 +257,7 @@ impl NativeMarkdownFontChoice {
 
 /// Send packet只含原纯Core值和固定试次身份；没有CTFont、Native闭包或ShapeJob。
 pub struct NativeMarkdownFontTrial {
-    #[cfg(feature = "native-paged-compose-probe")]
+    #[cfg(feature = "native-paged-production")]
     probe: Option<omni_markdown_core::MarkdownLineFontProbe>,
     source: MarkdownLayoutTextSource,
     source_authority: MarkdownLayoutTextAuthority,
@@ -271,13 +282,14 @@ impl NativeMarkdownFontTrialResult {
     pub fn resources(&self) -> Option<MarkdownShapingResourceSnapshot> {
         self.resources
     }
-    /// 旧试次不再参与字体选择时仍消费真实终态；关闭、换源和迟到结果都不能裸丢清理错误。
-    pub(in crate::native_surface) fn retire(self) -> Result<()> {
+    /// 任何退出都消费同一真实快照；只有拥有者主动退休时才可忽略其已请求的正常取消。
+    /// 活动候选接纳失败必须保留原 TypedErr，包括取消，不能把结果错误伪装成成功退休。
+    pub(in crate::native_surface) fn retire(self, preserve_cancelled: bool) -> Result<()> {
         let cancelled = self.cancellation.requested();
         let mut cause = self
             .outcome
             .err()
-            .filter(|error| !error.is_cancelled_retirement(cancelled));
+            .filter(|error| preserve_cancelled || !error.is_cancelled_retirement(cancelled));
         // 先完整读取本次真实Job的资源事实；Source已经失败也不能提前返回、漏掉不在Composer账内的试次。
         let cleanup = self.resources.and_then(|resources| {
             let unreleased = resources.files_open != 0
@@ -354,7 +366,7 @@ impl NativeMarkdownFontTrialResult {
         same_trial: bool,
     ) -> NativeMarkdownFontFallbackError {
         let cancelled = self.cancellation.requested();
-        match self.retire() {
+        match self.retire(false) {
             Ok(()) => cause,
             Err(cleanup) => {
                 if cause.is_cancelled_retirement(cancelled) {
@@ -367,7 +379,7 @@ impl NativeMarkdownFontTrialResult {
                     if repeated_source {
                         return cleanup; // 保留退休已组成的完整链，不能为去掉重复Source而丢掉真实shaper次因。
                     }
-                    #[cfg(feature = "native-paged-compose-probe")]
+                    #[cfg(feature = "native-paged-production")]
                     if matches!(
                         (&cause, &cleanup),
                         (
@@ -412,6 +424,11 @@ pub enum NativeMarkdownFontFallbackStep {
         ordinal: usize,
         cause: NativeMarkdownFontCascadeError,
     },
+    /// 优先候选没有本地文件，尚未形成任何完整 GCB 覆盖结论；下一量子才进入原全局级联。
+    #[cfg(feature = "native-paged-production")]
+    UnavailableForString {
+        cause: NativeMarkdownPagedFontError,
+    },
     /// 仅在真正启动一次试次时分配其独占包；待决和耗尽状态不占整份整形输入的栈空间。
     Trial(Box<NativeMarkdownFontTrial>),
     Exhausted {
@@ -428,14 +445,27 @@ pub enum NativeMarkdownFontFallbackCompletion {
 struct Active {
     identity: Arc<()>,
     cancellation: MarkdownShapingCancellation,
-    font: Option<NativeMarkdownPagedFont>,
+    font: Option<NativeMarkdownFontCapture>,
     authority: MarkdownLayoutFontAuthority,
     origin: NativeMarkdownFontOrigin,
+    #[cfg(feature = "native-paged-production")]
+    phase: ProbeTrialPhase,
+    #[cfg(feature = "native-paged-production")]
+    facts: Option<NativeMarkdownFontGlyphFacts>,
+}
+
+/// 原候选只有一个真实段在途；成功段归还后才允许原协调器前进，不能并行保留多个 Job。
+#[cfg(feature = "native-paged-production")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProbeTrialPhase {
+    Worker,
+    NextSegment,
+    SegmentReady,
 }
 
 /// 一个显式激活阶段的候选消费器；只有一个实际试次在途，不缓存所有Font。
 pub struct NativeMarkdownFontFallback {
-    #[cfg(feature = "native-paged-compose-probe")]
+    #[cfg(feature = "native-paged-production")]
     probe: Option<omni_markdown_core::MarkdownLineFontProbe>,
     source: Option<MarkdownLayoutTextSource>,
     authority: MarkdownLayoutTextAuthority,
@@ -445,6 +475,9 @@ pub struct NativeMarkdownFontFallback {
     cascade: Option<NativeMarkdownFontCascade>,
     active: Option<Active>,
     tried: usize,
+    // 仅本 owner 实际首 scalar 读取尚未交回的工作量；错误或 unavailable 出口同样由 Producer 领取。
+    #[cfg(feature = "native-paged-production")]
+    probe_source_bytes: usize,
     stopped: bool,
     mtm: MainThreadMarker,
 }
@@ -485,7 +518,7 @@ impl NativeMarkdownFontFallback {
         source.byte_offset_for_utf16(request.source_utf16.end)?; // 真实标量端点，不接受低代理项。
         let backing = source.original_backing_observer();
         Ok(Self {
-            #[cfg(feature = "native-paged-compose-probe")]
+            #[cfg(feature = "native-paged-production")]
             probe: None,
             source: Some(source),
             authority: authority.clone(),
@@ -495,6 +528,8 @@ impl NativeMarkdownFontFallback {
             cascade: None,
             active: None,
             tried: 0,
+            #[cfg(feature = "native-paged-production")]
+            probe_source_bytes: 0,
             stopped: false,
             mtm,
         })
@@ -517,7 +552,7 @@ impl NativeMarkdownFontFallback {
         if source.authority() != self.authority {
             return Err(NativeMarkdownFontFallbackError::SourceMismatch);
         }
-        #[cfg(feature = "native-paged-compose-probe")]
+        #[cfg(feature = "native-paged-production")]
         if let Some(probe) = &self.probe {
             probe.validate().map_err(compose::error)?;
         } // 原Source健康先行；已经消费的Style scope不能借仍存活的Source继续字体试次。
@@ -527,7 +562,7 @@ impl NativeMarkdownFontFallback {
         let valid = !self.stopped && current();
         // current可重入并消费原样式票；回调返回后必须重新核原Source及scope，不能只沿旧bool。
         source.byte_offset_for_utf16(0)?;
-        #[cfg(feature = "native-paged-compose-probe")]
+        #[cfg(feature = "native-paged-production")]
         if let Some(probe) = &self.probe {
             probe.validate().map_err(compose::error)?;
         }
@@ -540,7 +575,7 @@ impl NativeMarkdownFontFallback {
         &self,
         dependencies: Option<(&mut MarkdownGraphemeJob, &mut MarkdownScriptJob)>,
     ) -> Result<bool> {
-        #[cfg(feature = "native-paged-compose-probe")]
+        #[cfg(feature = "native-paged-production")]
         if let Some(probe) = &self.probe {
             probe.validate().map_err(compose::error)?;
             return Ok(true); // 不重新扫描GCB/Script，私有构造已绑定原协调器同一真实单字素票。
@@ -589,7 +624,7 @@ impl NativeMarkdownFontFallback {
             drop(active);
         }
         drop(self.cascade.take());
-        #[cfg(feature = "native-paged-compose-probe")]
+        #[cfg(feature = "native-paged-production")]
         drop(self.probe.take());
         drop(self.source.take()); // worker仅持纯Core clone；调用方仍须join，不能在这里声称已释放。
     }
@@ -603,7 +638,7 @@ impl NativeMarkdownFontFallback {
         scripts: &mut MarkdownScriptJob,
         current: &(impl Fn() -> bool + ?Sized),
     ) -> Result<NativeMarkdownFontFallbackStep> {
-        let result = self.issue(base, authority, Some((graphemes, scripts)), current);
+        let result = self.issue(base, authority, Some((graphemes, scripts)), &[], current);
         if result.is_err() {
             self.stop();
             if let Some(errno) = self
@@ -621,16 +656,47 @@ impl NativeMarkdownFontFallback {
         base: &NativeMarkdownPagedFont,
         authority: &MarkdownLayoutFontAuthority,
         dependencies: Option<(&mut MarkdownGraphemeJob, &mut MarkdownScriptJob)>,
+        palette: &[Rc<NativeMarkdownLineFont>],
         current: &(impl Fn() -> bool + ?Sized),
     ) -> Result<NativeMarkdownFontFallbackStep> {
         self.guard(base, authority, current)?;
         if self.active.is_some() {
+            #[cfg(feature = "native-paged-production")]
+            if self.probe.is_some() {
+                return self.continue_trial(base, authority, current);
+            }
             return Err(NativeMarkdownFontFallbackError::InvalidState);
         }
         if !self.cluster(dependencies)? {
             return Ok(NativeMarkdownFontFallbackStep::PendingDependencies);
         }
         self.guard(base, authority, current)?;
+        #[cfg(feature = "native-paged-production")]
+        if self.tried == 1 && self.probe.is_some() {
+            // tried 只在真实试次结束或明确不可捕获后前进；Base 首次缺字才轮到系统原首字符候选。
+            // 首 scalar 不证明完整 GCB，后面的 start_trial 仍发送同一完整原范围到唯一 worker。
+            let font = match self.for_string_font(base, authority, palette, current) {
+                Ok(font) => font,
+                Err(NativeMarkdownFontFallbackError::ForStringCapture(
+                    cause @ NativeMarkdownPagedFontError::FileSourceUnavailable,
+                )) => {
+                    self.tried = self
+                        .tried
+                        .checked_add(1)
+                        .ok_or(NativeMarkdownFontFallbackError::Overflow)?;
+                    self.guard(base, authority, current)?;
+                    return Ok(NativeMarkdownFontFallbackStep::UnavailableForString { cause });
+                }
+                Err(cause) => return Err(cause),
+            };
+            return self.start_trial(
+                base,
+                authority,
+                NativeMarkdownFontOrigin::ForString,
+                Some(font),
+                current,
+            );
+        }
         let (origin, font) = if self.tried == 0 {
             (NativeMarkdownFontOrigin::Base, None)
         } else {
@@ -661,7 +727,13 @@ impl NativeMarkdownFontFallback {
                 self.stop();
                 return Ok(NativeMarkdownFontFallbackStep::Exhausted { tried });
             };
-            let font = candidate.capture(base, authority, self.request.maximum_font_bytes, &valid);
+            let font = candidate.capture_reusing(
+                base,
+                authority,
+                palette,
+                self.request.maximum_font_bytes,
+                &valid,
+            );
             self.guard(base, authority, current)?;
             let font = match font {
                 Ok(font) => font,
@@ -695,12 +767,27 @@ impl NativeMarkdownFontFallback {
                 Some(font),
             )
         };
-        let selected = font.as_ref().unwrap_or(base);
+        self.start_trial(base, authority, origin, font, current)
+    }
+
+    /// 一个实际候选占据原唯一在途槽；来源差异只影响候选顺序，不绕过完整 GCB 整形或资源收据。
+    fn start_trial(
+        &mut self,
+        base: &NativeMarkdownPagedFont,
+        authority: &MarkdownLayoutFontAuthority,
+        origin: NativeMarkdownFontOrigin,
+        font: Option<NativeMarkdownFontCapture>,
+        current: &(impl Fn() -> bool + ?Sized),
+    ) -> Result<NativeMarkdownFontFallbackStep> {
+        let selected = font
+            .as_ref()
+            .map(NativeMarkdownFontCapture::font)
+            .unwrap_or(base);
         let font_authority = selected.core_font().authority();
         let identity = Arc::new(());
         let cancellation = MarkdownShapingCancellation::default();
         let trial = NativeMarkdownFontTrial {
-            #[cfg(feature = "native-paged-compose-probe")]
+            #[cfg(feature = "native-paged-production")]
             probe: self.probe.clone(),
             source: self
                 .source
@@ -721,6 +808,10 @@ impl NativeMarkdownFontFallback {
             font,
             authority: font_authority,
             origin,
+            #[cfg(feature = "native-paged-production")]
+            phase: ProbeTrialPhase::Worker,
+            #[cfg(feature = "native-paged-production")]
+            facts: None,
         });
         self.tried = self
             .tried
@@ -740,7 +831,7 @@ impl NativeMarkdownFontFallback {
         self.active
             .as_ref()
             .and_then(|active| active.font.as_ref())
-            .map(NativeMarkdownPagedFont::bytes_observer)
+            .map(|capture| capture.font().bytes_observer())
     }
 
     /// 必须在真实worker完成/join后调用；结果只授权这个原GCB的字体选择。
@@ -753,8 +844,9 @@ impl NativeMarkdownFontFallback {
         result: NativeMarkdownFontTrialResult,
         current: &(impl Fn() -> bool + ?Sized),
     ) -> Result<NativeMarkdownFontFallbackCompletion> {
-        let completion =
-            self.complete(base, authority, Some((graphemes, scripts)), result, current);
+        let completion = self
+            .complete(base, authority, Some((graphemes, scripts)), result, current)
+            .and_then(|completion| completion.ok_or(NativeMarkdownFontFallbackError::InvalidState));
         completion.map_err(|cause| self.stop_preserving_error(cause))
     }
     /// 同一字体入口失败后结束原Native字段；已携真实Source的完整错误链必须原样保留。
@@ -788,17 +880,18 @@ impl NativeMarkdownFontFallback {
         dependencies: Option<(&mut MarkdownGraphemeJob, &mut MarkdownScriptJob)>,
         result: NativeMarkdownFontTrialResult,
         current: &(impl Fn() -> bool + ?Sized),
-    ) -> Result<NativeMarkdownFontFallbackCompletion> {
+    ) -> Result<Option<NativeMarkdownFontFallbackCompletion>> {
         // 首个Native/current前固定原试次身份；只有同nonce才证明后续两个Source错误来自同一观察。
         let same_trial = self
             .active
             .as_ref()
             .is_some_and(|active| Arc::ptr_eq(&active.identity, &result.identity));
+        // Fresh 的唯一新映射须随失败试次归还；Reused 只退出本次强边，最终释放仍由原 Body 严格验收。
         let bytes = if same_trial {
             self.active
                 .as_ref()
                 .and_then(|active| active.font.as_ref())
-                .map(NativeMarkdownPagedFont::bytes_observer)
+                .and_then(NativeMarkdownFontCapture::fresh_bytes_observer)
         } else {
             None // A foreign result cannot prove that this active packet's legitimate font owners have ended.
         };
@@ -840,7 +933,7 @@ impl NativeMarkdownFontFallback {
         result: NativeMarkdownFontTrialResult,
         current: &(impl Fn() -> bool + ?Sized),
         same_trial: bool,
-    ) -> Result<NativeMarkdownFontFallbackCompletion> {
+    ) -> Result<Option<NativeMarkdownFontFallbackCompletion>> {
         let admission = (|| {
             self.guard(base, authority, current)?;
             if !self.cluster(dependencies)? {
@@ -859,13 +952,23 @@ impl NativeMarkdownFontFallback {
             self.stop(); // 原同次取消先置位，旧Cell/Style的精确正常撤权才能在退休时被辨认。
             return Err(result.retire_after(cause, same_trial));
         }
+        if result.outcome.is_err() {
+            // 同结果的资源快照必须先完整消费；Source 首因和实际 glyph 归还次因沿原退休路径组合。
+            // preserve_cancelled=true 保证这里已观察到的错误不能被“主动退休取消”规则过滤为 Ok。
+            return Err(result
+                .retire(true)
+                .expect_err("保留原错误的结果退休不能成功"));
+        }
         let facts = result.outcome?;
+        #[cfg(feature = "native-paged-production")]
+        let mut facts = facts;
         let resources = result
             .resources
             .ok_or(NativeMarkdownFontFallbackError::GlyphStoresNotReleased)?;
         if resources.files_open != 0
             || resources.mappings_open != 0
             || resources.mapped_bytes != 0
+            || resources.work_bytes != 0
             || resources.cleanup_failed
             || resources.first_error.is_some()
             || !resources.shaper_access_certified
@@ -877,11 +980,37 @@ impl NativeMarkdownFontFallback {
             .active
             .take()
             .ok_or(NativeMarkdownFontFallbackError::InvalidState)?;
+        #[cfg(feature = "native-paged-production")]
+        let mut active = active;
+        #[cfg(feature = "native-paged-production")]
+        if self.probe.is_some() {
+            if active.phase != ProbeTrialPhase::Worker {
+                return Err(NativeMarkdownFontFallbackError::InvalidState);
+            }
+            if let Some(previous) = active.facts {
+                // 累计的每项都来自已经真实检查并释放的段；不是把首段结果伪装成整个外 GCB。
+                for (value, addition) in [
+                    (&mut facts.glyph_count, previous.glyph_count),
+                    (&mut facts.missing_glyphs, previous.missing_glyphs),
+                    (&mut facts.input_scalars, previous.input_scalars),
+                    (&mut facts.source_bytes_read, previous.source_bytes_read),
+                ] {
+                    *value = value
+                        .checked_add(addition)
+                        .ok_or(NativeMarkdownFontFallbackError::Overflow)?;
+                }
+                facts.flags_union |= previous.flags_union;
+                facts.source_borrow_max_bytes = facts
+                    .source_borrow_max_bytes
+                    .max(previous.source_borrow_max_bytes);
+            }
+        }
         if facts.missing_glyphs > 0 {
+            // 真实缺字仍推进原有序级联；共享原字体也要重新 shape，不能把旧 GCB 的成功挪到这里。
             let bytes = active
                 .font
                 .as_ref()
-                .map(NativeMarkdownPagedFont::bytes_observer);
+                .and_then(NativeMarkdownFontCapture::fresh_bytes_observer);
             let origin = active.origin;
             drop(active);
             if let Some(bytes) = bytes
@@ -895,13 +1024,36 @@ impl NativeMarkdownFontFallback {
                 return Err(NativeMarkdownFontFallbackError::FontBytesNotReleased);
             }
             self.guard(base, authority, current)?;
-            return Ok(NativeMarkdownFontFallbackCompletion::Rejected { origin, facts });
+            return Ok(Some(NativeMarkdownFontFallbackCompletion::Rejected {
+                origin,
+                facts,
+            }));
         }
+        #[cfg(feature = "native-paged-production")]
+        if let Some(probe) = &self.probe
+            && !probe.complete_single_segment().map_err(compose::error)?
+        {
+            active.facts = Some(facts);
+            active.phase = ProbeTrialPhase::NextSegment;
+            self.active = Some(active);
+            return Ok(None); // 外 GCB 仍有同候选真实段，不能在这里签 Choice 或切下一 Font。
+        }
+        self.select_choice(base, active, facts, current).map(Some)
+    }
+
+    /// 只有整个候选的所有真实段都无缺字并已归还 Job 后，才转移原 Font capture。
+    fn select_choice(
+        &mut self,
+        base: &NativeMarkdownPagedFont,
+        active: Active,
+        facts: NativeMarkdownFontGlyphFacts,
+        current: &(impl Fn() -> bool + ?Sized),
+    ) -> Result<NativeMarkdownFontFallbackCompletion> {
         let choice = NativeMarkdownFontChoice {
             origin: active.origin,
             source_utf16: self.request.source_utf16.clone(),
             facts,
-            font: active.font,
+            font: active.font.map(NativeMarkdownFontCapture::into_font),
             base: self.base.clone(),
             selected: active.authority,
             source: self.authority.clone(),
@@ -910,13 +1062,13 @@ impl NativeMarkdownFontFallback {
             .source
             .take()
             .ok_or(NativeMarkdownFontFallbackError::InvalidState)?;
-        #[cfg(feature = "native-paged-compose-probe")]
+        #[cfg(feature = "native-paged-production")]
         let probe = self.probe.take(); // 最后Native/current回调以后还要核原票，不能先丢最后Source读claim。
         self.stop(); // 已选择字体转交结果；先归还级联，再核原Source与调用票，不在idle藏业务缓存。
-        source.byte_offset_for_utf16(choice.source_utf16.start)?;
+        source.byte_offset_for_utf16(0)?;
         let valid = current() && base.core_font().permits(&self.base);
-        source.byte_offset_for_utf16(choice.source_utf16.start)?; // 可重入current之后仍优先核原Source首错。
-        #[cfg(feature = "native-paged-compose-probe")]
+        source.byte_offset_for_utf16(0)?; // 原两端已认证；这里只核健康，不重复解码远端 GCB 前缀。
+        #[cfg(feature = "native-paged-production")]
         if let Some(probe) = &probe {
             probe.validate().map_err(compose::error)?;
         }
@@ -924,7 +1076,7 @@ impl NativeMarkdownFontFallback {
             return Err(NativeMarkdownFontFallbackError::Revoked);
         }
         drop(source);
-        #[cfg(feature = "native-paged-compose-probe")]
+        #[cfg(feature = "native-paged-production")]
         drop(probe);
         if let Some(errno) = self
             .backing

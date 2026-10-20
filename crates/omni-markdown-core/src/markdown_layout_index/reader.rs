@@ -8,7 +8,6 @@ use super::{Error, LayoutIndexObserver, PAGE, ResourceState, Result, close_file,
 pub(crate) struct LayoutIndexReader<const N: usize> {
     file: Option<File>,
     count: usize,
-    poisoned: bool,
     resources: Arc<ResourceState>,
     #[cfg(feature = "paged-shaping-frontier")]
     upstream: Option<Arc<ResourceState>>,
@@ -24,7 +23,6 @@ impl<const N: usize> LayoutIndexReader<N> {
         Self {
             file: Some(file),
             count,
-            poisoned: false,
             resources,
             #[cfg(feature = "paged-shaping-frontier")]
             upstream,
@@ -40,7 +38,6 @@ impl<const N: usize> LayoutIndexReader<N> {
         Self {
             file: Some(file),
             count,
-            poisoned: false,
             resources,
             upstream: Some(upstream),
             prefix_claim: true,
@@ -59,9 +56,8 @@ impl<const N: usize> LayoutIndexReader<N> {
         }
     }
 
-    fn healthy(&self) -> Result<()> {
-        if self.poisoned
-            || self.file.is_none()
+    pub(crate) fn healthy(&self) -> Result<()> {
+        if self.file.is_none()
             || self.resources.reader_failed.load(super::Ordering::Acquire)
             || self.resources.cleanup_failed.load(super::Ordering::Acquire)
             || self.upstream_has_failed()
@@ -87,7 +83,8 @@ impl<const N: usize> LayoutIndexReader<N> {
         }
     }
 
-    pub(crate) fn read(&mut self, record: usize) -> Result<[u8; N]> {
+    /// 固定 EOF 和 File 均不可变；失败使用原 reader_failed 原子撤权，读者可在锁外共享。
+    pub(crate) fn read(&self, record: usize) -> Result<[u8; N]> {
         self.healthy()?;
         let end = match record.checked_add(1) {
             Some(end) => end,
@@ -105,7 +102,7 @@ impl<const N: usize> LayoutIndexReader<N> {
     /// 一次最多读取256条且不超过16KiB，调用方必须提供恰好覆盖原范围的输出。
     ///
     /// IO错误可能已写入输出前缀；调用方必须丢弃本次完整候选，不能发布部分结果。
-    pub(crate) fn read_batch(&mut self, range: Range<usize>, output: &mut [[u8; N]]) -> Result<()> {
+    pub(crate) fn read_batch(&self, range: Range<usize>, output: &mut [[u8; N]]) -> Result<()> {
         self.healthy()?;
         let result = self.read_batch_inner(range, output);
         #[cfg(feature = "paged-shaping-frontier")]
@@ -146,8 +143,7 @@ impl<const N: usize> LayoutIndexReader<N> {
         })
     }
 
-    fn fail(&mut self) {
-        self.poisoned = true;
+    fn fail(&self) {
         self.resources
             .reader_failed
             .store(true, super::Ordering::Release);
@@ -165,6 +161,10 @@ impl<const N: usize> LayoutIndexReader<N> {
                         .fetch_sub(1, super::Ordering::AcqRel);
                     self.prefix_claim = false;
                 } else if closed.is_err() {
+                    // 旧前缀退出后仍由原索引收据保留真实 close 失败，后继出版物不能洗掉它。
+                    upstream
+                        .cleanup_failed
+                        .store(true, super::Ordering::Release);
                     upstream
                         .producer_failed
                         .store(true, super::Ordering::Release);
@@ -181,9 +181,7 @@ impl<const N: usize> LayoutIndexReader<N> {
 
     pub(crate) fn close(mut self) -> Result<()> {
         self.close_resources()?;
-        if self.poisoned
-            || self.resources.reader_failed.load(super::Ordering::Acquire)
-            || self.upstream_has_failed()
+        if self.resources.reader_failed.load(super::Ordering::Acquire) || self.upstream_has_failed()
         {
             // 资源已真实归还仍不能洗掉先前的读取失败；观察者可分别核对IO与清理事实。
             Err(Error::Poisoned)

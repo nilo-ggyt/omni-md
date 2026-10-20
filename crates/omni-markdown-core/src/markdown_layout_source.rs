@@ -11,8 +11,49 @@ use std::{
 
 use crate::{MarkdownDocumentBuffer, MarkdownDocumentBufferError, MarkdownTextSnapshot};
 
+#[cfg(feature = "paged-line-compose")]
+pub(crate) mod folds;
+
+#[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+mod table_row;
+#[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+pub use table_row::VerifiedMarkdownLayoutTableRow;
+#[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+mod root_leaf_boundary;
+#[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+pub use root_leaf_boundary::VerifiedMarkdownRootLeafStyleBoundary;
+#[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+pub(crate) mod table_rows;
+
 #[cfg(feature = "s2-table-window-prototype")]
 mod cell_draft;
+#[cfg(feature = "s2-table-window-prototype")]
+mod table_cell;
+#[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
+pub use table_cell::{
+    MarkdownTableCellDisplayPreparation, MarkdownTableCellDisplayPreparationStep,
+    MarkdownTableCellDisplayResourceObserver, MarkdownTableCellDisplayResources,
+    MarkdownTableCellDisplaySource, MarkdownTableCellVisibleSourceRanges,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 布局源的坐标域；只读格不具 canonical 输入权限，活动草稿也不能借局部坐标修改正文。
+pub enum MarkdownLayoutTextSourceDomain {
+    Canonical,
+    #[cfg(feature = "s2-table-window-prototype")]
+    ReadOnlyCell,
+    #[cfg(feature = "s2-table-window-prototype")]
+    ActiveCellDraft,
+}
+
+enum SourceDomain {
+    Canonical,
+    #[cfg(feature = "s2-table-window-prototype")]
+    // 只读格单独持有固定结构 metadata；所有普通正文 capture 不必为最大格上下文放大 payload。
+    ReadOnlyCell(Box<crate::markdown_document_buffer::VerifiedMarkdownTableCellSource>),
+    #[cfg(feature = "s2-table-window-prototype")]
+    ActiveCellDraft(crate::markdown_document_buffer::MarkdownCellDraftSourceAuthority),
+}
 
 /// 所有布局算法的单次正文借用上限；不因piece或软行长度变大而扩大。
 pub const MARKDOWN_LAYOUT_SOURCE_BYTES: usize = 4096;
@@ -26,8 +67,7 @@ struct Payload {
     generation: u64,
     bytes: usize,
     utf16: usize,
-    #[cfg(feature = "s2-table-window-prototype")]
-    draft: Option<crate::markdown_document_buffer::MarkdownCellDraftSourceAuthority>,
+    domain: SourceDomain,
     dropped: PayloadDrop,
 }
 struct PayloadDrop(Arc<AtomicBool>);
@@ -94,14 +134,24 @@ impl MarkdownLayoutTextSource {
             generation: document.generation(),
             bytes: document.byte_len(),
             utf16: document.utf16_len(),
-            #[cfg(feature = "s2-table-window-prototype")]
-            draft: None,
+            domain: SourceDomain::Canonical,
             dropped: PayloadDrop(Arc::new(AtomicBool::new(false))),
         }))
     }
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.0.generation
+    }
+    /// 只交付真实构造路径的域类别；不能凭没有 draft 票就把只读局部源当成完整正文。
+    #[must_use]
+    pub fn domain(&self) -> MarkdownLayoutTextSourceDomain {
+        match &self.0.domain {
+            SourceDomain::Canonical => MarkdownLayoutTextSourceDomain::Canonical,
+            #[cfg(feature = "s2-table-window-prototype")]
+            SourceDomain::ReadOnlyCell(_) => MarkdownLayoutTextSourceDomain::ReadOnlyCell,
+            #[cfg(feature = "s2-table-window-prototype")]
+            SourceDomain::ActiveCellDraft(_) => MarkdownLayoutTextSourceDomain::ActiveCellDraft,
+        }
     }
     #[must_use]
     pub fn byte_len(&self) -> usize {

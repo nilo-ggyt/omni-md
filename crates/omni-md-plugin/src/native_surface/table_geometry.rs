@@ -3,15 +3,21 @@
 use super::*;
 
 /// 当前视口及两侧 overscan 的行高元数据上限；不随整张表的行数增长。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 const MAX_PROJECTED_TABLE_ROWS: usize = 256;
 // 这些数值只限制当前可见投影的准备峰值，超限显示完整原文，不代表最终大表功能规格。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 const MAX_PREPARED_TABLE_CELLS: usize = 1_024;
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 const MAX_PREPARED_TABLE_SOURCE_UTF16_UNITS: usize = 64 * 1_024;
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 const MAX_PREPARED_TABLE_COLUMNS: usize = 256;
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 const MAX_PREPARED_TABLE_COLUMN_SLOTS: usize = 1_024;
 
 /// 纯标量预算先于任何原生单元格/列宽数组；旧快照与新批次各自受相同上限约束。
 #[derive(Debug, Default, Eq, PartialEq)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownTablePreparationBudget {
     pub(super) row_slots: usize,
     pub(super) cells: usize,
@@ -20,6 +26,7 @@ pub(super) struct NativeMarkdownTablePreparationBudget {
 }
 
 /// 表头定义列数，不能由未显示行的任意column_index扩大后续列宽数组。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_column_count(table: &MarkdownTablePrototype) -> Option<usize> {
     let header = table.rows.first()?;
     let count = header
@@ -31,6 +38,7 @@ pub(super) fn native_markdown_table_column_count(table: &MarkdownTablePrototype)
 }
 
 /// 语义 overscan 可带离屏表；只有真实源范围与本批半开窗口相交才需要表格布局。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_window_requires_layout(
     tables: &[MarkdownTablePrototype],
     window: &std::ops::Range<usize>,
@@ -52,6 +60,7 @@ pub(super) fn native_markdown_table_window_requires_layout(
 }
 
 /// 在全批任何cell原生对象构造前检查可见/overscan总量，不创建预算Vec或正文副本。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_preparation_budget(
     tables: &[MarkdownTablePrototype],
     viewport: &std::ops::Range<usize>,
@@ -385,12 +394,14 @@ mod preparation_budget_tests {
 
 /// 一行完整源范围与最终列宽下测得的高度，不保留单元格正文或原生对象。
 #[derive(Clone, Debug, PartialEq)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownTableRowHeight {
     pub(super) source_utf16_range: std::ops::Range<usize>,
     pub(super) height: f64,
 }
 
 /// 有限行高属于一个精确文档/代次/宽度；epoch 绑定属性与最终绘制几何。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownTableRowHeightProjection {
     pub(super) document_identity: WeakMarkdownDocument,
     pub(super) document_generation: u64,
@@ -399,6 +410,7 @@ pub(super) struct NativeMarkdownTableRowHeightProjection {
     pub(super) rows: Vec<NativeMarkdownTableRowHeight>,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownTableRowHeightProjection {
     /// 数值代次相同不等于同一正文，宽度和epoch也必须同时匹配。
     pub(super) fn matches(
@@ -537,6 +549,7 @@ impl NativeMarkdownTableRowHeightProjection {
 }
 
 /// 同一行以最高完整单元格为准；向上取整防止最后一行字形被小数误差裁掉。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_measured_table_row_height(
     cell_heights: impl IntoIterator<Item = f64>,
 ) -> Option<f64> {
@@ -755,6 +768,7 @@ pub(super) enum MarkdownHistoryDirection {
 
 /// Identifies a semantic cell after reparsing; no cached byte offset survives a preceding cell edit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownTableCellCoordinate {
     pub(super) table_utf16_start: usize,
     pub(super) row_index: usize,
@@ -763,6 +777,7 @@ pub(super) struct NativeMarkdownTableCellCoordinate {
 
 /// Owns only one visible cell's derived geometry and immutable attributed display text.
 #[derive(Clone)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownVisibleTableCellLayout {
     pub(super) coordinate: NativeMarkdownTableCellCoordinate,
     pub(super) source_utf16_range: std::ops::Range<usize>,
@@ -777,7 +792,23 @@ pub(super) struct NativeMarkdownVisibleTableCellLayout {
     pub(super) source_spans: Rc<[super::text_storage::NativeMarkdownTableCellSourceSpan]>,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownVisibleTableCellLayout {
+    /// 与命中相反的同源映射只消费原有限run，返回实际CTFrame中同一scalar的字形框。
+    pub(super) fn source_scalar_rect(&self, source: &std::ops::Range<usize>) -> Option<NSRect> {
+        let span = self.source_spans.iter().find(|span| {
+            span.source_utf16_range.start <= source.start
+                && source.end <= span.source_utf16_range.end
+        })?;
+        let start = span
+            .display_utf16_range
+            .start
+            .checked_add(source.start.checked_sub(span.source_utf16_range.start)?)?;
+        let end = start.checked_add(source.len())?;
+        self.text_layout
+            .display_scalar_rect(start..end, self.text_frame)
+    }
+
     /// 原 preview 的实际 glyph 坐标先映射到 display，再沿同流生成的有限 run 回到源码。
     pub(super) fn source_index_at_point(&self, point: NSPoint) -> Option<usize> {
         let display = self.text_layout.display_index_at_point(
@@ -798,6 +829,7 @@ impl NativeMarkdownVisibleTableCellLayout {
 }
 
 /// 隐藏标记产生的断点向下一个可见 scalar 取亲和；EOF 保留末个真实可见字符的尾端。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn native_markdown_table_cell_source_index(
     spans: &[super::text_storage::NativeMarkdownTableCellSourceSpan],
     display: usize,
@@ -842,7 +874,41 @@ mod table_cell_source_pointer_tests {
     }
 }
 
+/// 表格显示文字只由原CTFrame授权；行占位与隐藏语法不能冒充原scalar字形。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+pub(super) fn native_markdown_table_scalar_frame(
+    tables: &[NativeMarkdownVisibleTableLayout],
+    probe: &std::ops::Range<usize>,
+) -> Result<Option<NSRect>, NativeMarkdownStableTableFailure> {
+    if probe.is_empty() {
+        return Ok(None);
+    } // EOF caret保留原Native插入点合同，不伪造一个可见字符。
+    for table in tables {
+        if !table
+            .rows
+            .iter()
+            .any(|row| row.source_utf16_range.contains(&probe.start))
+        {
+            continue;
+        }
+        let cell = table
+            .cells
+            .iter()
+            .find(|cell| {
+                cell.source_utf16_range.start <= probe.start
+                    && probe.end <= cell.source_utf16_range.end
+            })
+            .ok_or(NativeMarkdownStableTableFailure::AnchorUnavailable)?;
+        return cell
+            .source_scalar_rect(probe)
+            .map(Some)
+            .ok_or(NativeMarkdownStableTableFailure::AnchorUnavailable);
+    }
+    Ok(None)
+}
+
 /// Supplies background/header geometry for a row already selected by bounded viewport culling.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownVisibleTableRowLayout {
     pub(super) row_index: usize,
     // 行高投影与实际 TextKit fragment 必须指向同一 canonical 行。
@@ -852,6 +918,7 @@ pub(super) struct NativeMarkdownVisibleTableRowLayout {
 }
 
 /// Groups visible row/cell geometry under one table source identity and column coordinate system.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownVisibleTableLayout {
     pub(super) table_utf16_start: usize,
     // delimiter也只有在同一完整批次获准后才隐藏，准备失败时保留可读原文。
@@ -866,6 +933,7 @@ pub(super) struct NativeMarkdownVisibleTableLayout {
 /// TextKit may reenter drawRect: repeatedly. Unchanged generation, viewport and width
 /// perform at most one layout, including empty/failure results, to avoid idle wakeups.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownTableLayoutRequestKey {
     pub(super) document_generation: u64,
     pub(super) document_length: usize,
@@ -882,6 +950,7 @@ pub(super) struct NativeMarkdownTableLayoutRequestKey {
 }
 
 /// 用已验证的cell真实矩形计算最小滚动；超高/超宽格显示其起点而非隐藏开头。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_minimal_cell_scroll_origin(
     cell: NSRect,
     visible: NSRect,
@@ -929,6 +998,7 @@ pub(super) fn native_markdown_minimal_cell_scroll_origin(
 }
 
 /// 一次同步动作的几何连续性；只含Weak与标量，不保活正文或原生段落。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownTableMutationAnchor {
     pub(super) identity: WeakMarkdownDocument,
     pub(super) generation: u64,
@@ -940,6 +1010,7 @@ pub(super) struct NativeMarkdownTableMutationAnchor {
     pub(super) screen_y: f64,
 }
 
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownTableMutationAnchor {
     /// 仅同一文档、代次与显示合同拥有消费权限；Weak地址不能代替存活owner。
     pub(super) fn matches(
@@ -977,6 +1048,7 @@ impl NativeMarkdownTableMutationAnchor {
 }
 
 /// 修改完全位于内部或外部才有明确映射；部分删除边界的范围失效。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_map_surviving_range(
     source: &std::ops::Range<usize>,
     replaced: &std::ops::Range<usize>,
@@ -1170,13 +1242,21 @@ mod mutation_anchor_tests {
 pub(super) enum NativeMarkdownStableTableFailure {
     /// 新事件/文档/宽度已撤权，旧局部结果只能丢弃，不能恢复clip或发布literal覆盖新状态。
     InputIntentExpired,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     MissingGeometry,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     InvalidSourceAssociation,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     NonMonotonicFrames,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     UnstableFrames,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     AnchorUnavailable,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     AnchorUnstable,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     CoverageOutsideBudget,
+    #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     PreparationPassLimit,
 }
 
@@ -1339,6 +1419,7 @@ mod input_intent_tests {
 
 /// 原生getter后的标量与Weak；每次只局部load认证活对象，不强持fragment/正文/属性。
 #[derive(Clone, Debug)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownResolvedTableRow {
     pub(super) source: std::ops::Range<usize>,
     pub(super) fragment_source: std::ops::Range<usize>,
@@ -1348,12 +1429,14 @@ pub(super) struct NativeMarkdownResolvedTableRow {
 
 /// 只描述可视/命中纵向band；不能反馈为Native占位高度，也不改变完整列宽。
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownTableHeaderBand {
     pub(super) origin_y: f64,
     pub(super) height: f64,
 }
 
 /// 输入先经共享paragraph reader和两矩阵身份认证；这里只组合实际相接的隐藏delimiter。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_header_band(
     header: &NativeMarkdownResolvedTableRow,
     delimiter: &NativeMarkdownResolvedTableRow,
@@ -1393,6 +1476,7 @@ pub(super) fn native_markdown_table_header_band(
 }
 
 /// 内容始终来自原Native行槽；可视band吸收delimiter也不能改变字形/输入控件的纵向空间。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_native_content_y_height(frame: NSRect) -> Option<(f64, f64)> {
     let y = frame.origin.y + NATIVE_MARKDOWN_TABLE_CELL_VERTICAL_PADDING;
     let height = frame.size.height - NATIVE_MARKDOWN_TABLE_CELL_VERTICAL_PADDING * 2.0;
@@ -1400,6 +1484,7 @@ pub(super) fn native_markdown_table_native_content_y_height(frame: NSRect) -> Op
 }
 
 /// Native完整paragraph仅可比语义行多一个合法换行；delimiter与可见行共用同一source规则。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_paragraph_tail_is_valid(
     source: &std::ops::Range<usize>,
     native: &std::ops::Range<usize>,
@@ -1417,6 +1502,7 @@ pub(super) fn native_markdown_table_paragraph_tail_is_valid(
 }
 
 /// 完整 delimiter 的每个 run 都必须由原不可变发布证明隐藏，不能只查两端或后继可变缓存。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_delimiter_semantics_are_hidden(
     presentation: &MarkdownViewportPresentationSnapshot,
     generation: u64,
@@ -1624,6 +1710,7 @@ mod delimiter_band_tests {
 }
 
 /// 同一批必须按source严格有序且不重叠，不能仅凭每行height足够接受拼接frame。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_matrix_is_ordered(
     rows: &[NativeMarkdownResolvedTableRow],
 ) -> bool {
@@ -1653,6 +1740,7 @@ pub(super) fn native_markdown_table_matrix_is_ordered(
 }
 
 /// 不扩大既有准备预算；连续ensure与两次union都必须在相同source单位上限内。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_bounded_table_layout_range(
     first: &std::ops::Range<usize>,
     second: &std::ops::Range<usize>,
@@ -1665,6 +1753,7 @@ pub(super) fn native_markdown_bounded_table_layout_range(
 }
 
 /// 完成投影后的可视band必须相接；delimiter已经纳入header，不再为header放宽间隙。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_rows_have_contiguous_frames(
     rows: &[NativeMarkdownVisibleTableRowLayout],
 ) -> bool {
@@ -1681,6 +1770,7 @@ pub(super) fn native_markdown_table_rows_have_contiguous_frames(
 }
 
 /// 有序连续row索引必须覆盖整个新可见区，防止旧批次尾部空白仍被发布。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_rows_cover(
     rows: &[NativeMarkdownVisibleTableRowLayout],
     first: usize,
@@ -1814,6 +1904,7 @@ mod stable_matrix_tests {
 ///
 /// 不实现 Clone，防止绘制或测量重新深复制 tables/rows/cells 及逐格原生属性引用。
 /// 唯一 cache slot 在失效或 accepted release 时取走；局部快照不能排队或跨会话保活。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownVisibleTableLayoutCache {
     // Weak 保留分配身份而不保留正文；同 generation 的另一笔记不得复用本投影。
     pub(super) document_identity: WeakMarkdownDocument,
@@ -1829,6 +1920,7 @@ pub(super) struct NativeMarkdownVisibleTableLayoutCache {
 
 /// Stores the active single-cell draft and source range until explicit commit or cancellation.
 #[derive(Clone)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) struct NativeMarkdownTableCellEditorState {
     // 只有真实RequiredRow的Ready可发布；一次提交后原窗口失效，不用相同整数范围补签。
     pub(super) authority: Option<Rc<NativeMarkdownTableCellAuthority>>,
@@ -1843,6 +1935,7 @@ pub(super) struct NativeMarkdownTableCellEditorState {
 }
 
 /// 原字段的实际范围只续接已证明方向；未知非空范围不猜测其主端点。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_field_selection(
     previous: Option<MarkdownTextSelection>,
     range: NSRange,
@@ -1952,6 +2045,7 @@ mod field_selection_tests {
 
 /// Encodes spreadsheet-style movement without coupling semantic coordinates to native controls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) enum NativeMarkdownTableNavigation {
     Next,
     Previous,
@@ -1959,6 +2053,7 @@ pub(super) enum NativeMarkdownTableNavigation {
 }
 
 /// Normalizes viewport coordinates into a stable, finite cache-key metric.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_layout_metric(value: f64) -> i64 {
     if value.is_finite() {
         // Quantize AppKit's point coordinates to sixteenths. This filters tiny floating-point
@@ -1971,6 +2066,7 @@ pub(super) fn native_markdown_layout_metric(value: f64) -> i64 {
 }
 
 /// Finds visible rows by ordered UTF-16 intervals and adds at most one overscan row per edge.
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_visible_table_row_range(
     rows: &[omni_markdown_core::MarkdownTableRowPrototype],
     viewport_utf16_window: &std::ops::Range<usize>,
@@ -1999,6 +2095,7 @@ pub(super) fn native_markdown_visible_table_row_range(
 
 /// Resolves Tab, Shift-Tab or Enter against current parsed cells, preserving ragged-table boundaries.
 #[cfg(test)]
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_table_navigation_target(
     table: &MarkdownTablePrototype,
     current: NativeMarkdownTableCellCoordinate,
@@ -2139,11 +2236,13 @@ pub(super) fn native_markdown_table_column_widths(
 }
 
 /// 普通单格提交消费唯一序列化扫描；没有选区时仍保持原字符串入口不失败。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_sanitize_table_cell_input(source: &str) -> String {
     sanitize_table_cell_source(source, None).0
 }
 
 /// 行内格式沿相同序列化输出映射真实 scalar 端点；非法 UTF16 中点不能向邻字取整。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn native_markdown_sanitize_table_cell_input_with_selection(
     source: &str,
     selection: std::ops::Range<usize>,
@@ -2158,6 +2257,7 @@ pub(super) fn native_markdown_sanitize_table_cell_input_with_selection(
 }
 
 /// 单次实际发出源字节的 producer 同步记录可选端点；不存在第二份转义、换行或 trim 规则。
+#[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn sanitize_table_cell_source(
     source: &str,
     selection: Option<std::ops::Range<usize>>,

@@ -8,7 +8,6 @@ use lookup::{LookupCache, LookupInfo};
 use read_fonts::tables::layout::{ClassRangeRecord, RangeRecord};
 use read_fonts::types::GlyphId16;
 use read_fonts::{
-    FontData, FontRead, ReadError, TableProvider,
     tables::{
         gdef::Gdef,
         gpos::{AnchorTable, DeviceOrVariationIndex, Gpos},
@@ -18,6 +17,7 @@ use read_fonts::{
         variations::{DeltaSetIndex, ItemVariationStore},
     },
     types::{BigEndian, F2Dot14, GlyphId},
+    FontData, FontRead, ReadError, TableProvider,
 };
 
 pub(crate) mod apply;
@@ -30,9 +30,9 @@ pub(crate) mod map;
 pub(crate) mod shaper;
 
 #[allow(unused_imports)]
-use super::{Direction, Feature, GlyphInfo, Language, Mask, Script, clamp_i64_to_i32};
-#[allow(unused_imports)]
 use super::{aat, buffer, cache, set_digest, tag};
+#[allow(unused_imports)]
+use super::{clamp_i64_to_i32, Direction, Feature, GlyphInfo, Language, Mask, Script};
 
 #[allow(dead_code)]
 pub(crate) mod lookup_flags {

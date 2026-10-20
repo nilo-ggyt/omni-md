@@ -1,4 +1,4 @@
-//! 同源GCB按实际排版前缀迁入唯一输出FD；原BreakJob仍是唯一字素算法与全局ordinal权威。
+//! 同源GCB按实际排版前缀迁入唯一输出FD；显式可见ordinal域不冒充未解析隐区的原全源序号。
 use super::*;
 use crate::{MarkdownGraphemeBoundary, MarkdownLayoutBreakJob};
 
@@ -13,6 +13,7 @@ pub(super) const GRAPHEME: u8 = 12;
 /// 不连续record的固定目录；count是原全局ordinal前缀，covered不是glyph布局范围。
 #[derive(Clone, Copy)]
 pub(super) struct GraphemeDirectory {
+    pub domain: crate::MarkdownGraphemeOrdinalDomain,
     pub last: usize,
     pub count: usize,
     pub total: Option<usize>,
@@ -37,22 +38,32 @@ impl GraphemeDirectory {
 }
 
 pub(super) struct GraphemeCapture {
+    domain: crate::MarkdownGraphemeOrdinalDomain,
     total: Option<usize>,
     written: usize,
+    read_ordinal: usize,
+    source_total: Option<usize>,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    skip_search: Option<(usize, usize)>,
     last: Option<(usize, MarkdownGraphemeBoundary)>,
     pending: Option<MarkdownGraphemeBoundary>,
     ancestors: Ancestors,
 }
 
 impl GraphemeCapture {
-    /// 一个已读取但尚未写入的记录仍属于本次迁移；不能在它之前开始另一producer。
-    pub(super) fn has_buffered_record(&self) -> bool {
-        self.pending.is_some()
+    /// 未来 GCB 可由一个真实 UBA seam 隔开；只有本 item 应先写入的边界仍阻止 glyph 捕获。
+    pub(super) fn has_buffered_through(&self, through: usize) -> bool {
+        self.pending
+            .is_some_and(|boundary| boundary.utf16 <= through)
     }
 
     fn directory(&self) -> Result<GraphemeDirectory> {
         let (last, covered) = self.last.ok_or(Error::InvalidRequest)?;
         Ok(GraphemeDirectory {
+            domain: self.domain,
             last,
             covered,
             count: self.written,
@@ -69,6 +80,22 @@ pub(in crate::markdown_line_composer) struct GraphemeCaptureStep {
     pub ready: bool,
 }
 
+/// 普通控制仍只请求真实 GCB；内部整形端点必须借原 ItemScan 签发的同 Source 票。
+#[derive(Clone, Copy)]
+enum CaptureEnd<'a> {
+    Grapheme(usize),
+    BidiSeam(&'a crate::markdown_line_composer::item::ResolvedBidiShapingSeam),
+}
+
+impl CaptureEnd<'_> {
+    fn utf16(self, authority: &MarkdownLayoutTextAuthority) -> Result<usize> {
+        match self {
+            Self::Grapheme(end) => Ok(end),
+            Self::BidiSeam(proof) => Ok(proof.boundary(authority)?.1),
+        }
+    }
+}
+
 impl GlyphStore {
     /// 只迁入截至原实际item/control端点的边界；不读正文、不把配额边界当GCB或EOF。
     pub(in crate::markdown_line_composer) fn capture_graphemes_through(
@@ -78,8 +105,40 @@ impl GlyphStore {
         records: usize,
         metadata_units: usize,
     ) -> Result<GraphemeCaptureStep> {
+        self.capture_graphemes_until(
+            breaks,
+            CaptureEnd::Grapheme(through_utf16),
+            records,
+            metadata_units,
+        )
+    }
+
+    /// 字形 item 的内部 UBA seam 不进入 GCB 目录；保留真实后继边界供下一 item 完成后迁入。
+    pub(in crate::markdown_line_composer) fn capture_item_graphemes(
+        &mut self,
+        breaks: &mut MarkdownLayoutBreakJob,
+        item: &MarkdownLineItem,
+        records: usize,
+        metadata_units: usize,
+    ) -> Result<GraphemeCaptureStep> {
+        item_shaping_seams(item, &self.authority)?;
+        let target = match &item.shaping_seams()[1] {
+            Some(proof) => CaptureEnd::BidiSeam(proof),
+            None => CaptureEnd::Grapheme(item.facts().source_utf16.end),
+        };
+        self.capture_graphemes_until(breaks, target, records, metadata_units)
+    }
+
+    fn capture_graphemes_until(
+        &mut self,
+        breaks: &mut MarkdownLayoutBreakJob,
+        target: CaptureEnd<'_>,
+        records: usize,
+        metadata_units: usize,
+    ) -> Result<GraphemeCaptureStep> {
         let result = (|| {
             self.guard()?;
+            let through_utf16 = target.utf16(&self.authority)?;
             if records == 0
                 || metadata_units == 0
                 || records > STEP
@@ -96,6 +155,7 @@ impl GlyphStore {
                 metadata_units: 0,
                 ready: false,
             };
+            let domain = breaks.grapheme_ordinal_domain(&self.authority)?;
             #[cfg(feature = "paged-shaping-frontier")]
             let (known, total) = {
                 let prefix = breaks.grapheme_prefix_facts(&self.authority)?;
@@ -122,16 +182,34 @@ impl GlyphStore {
                 return Ok(step);
             }
             let capture = self.graphemes.get_or_insert_with(|| GraphemeCapture {
-                total,
+                domain,
+                total: if domain == crate::MarkdownGraphemeOrdinalDomain::TableVisible {
+                    None
+                } else {
+                    total
+                },
                 written: 0,
+                read_ordinal: 0,
+                source_total: total,
+                #[cfg(all(
+                    feature = "s2-table-window-prototype",
+                    feature = "paged-shaping-frontier"
+                ))]
+                skip_search: None,
                 last: None,
                 pending: None,
                 ancestors: Ancestors::new(),
             });
-            if capture.total.is_some() && total != capture.total {
+            if capture.domain != domain
+                || capture.source_total.is_some() && total != capture.source_total
+            {
                 return Err(Error::InconsistentCoverage);
             }
-            capture.total = total; // None只表示总数未封存；不能由已知前缀长度推断末ordinal。
+            capture.source_total = total;
+            if domain != crate::MarkdownGraphemeOrdinalDomain::TableVisible {
+                capture.total = total;
+            }
+            // 可见域的总数只在真实 EOF record 经过筛选并写入后封存，原 raw count 不等于可见 count。
             let file = self.index.as_mut().ok_or(Error::Poisoned)?;
             loop {
                 if let Some((_, covered)) = capture.last
@@ -143,37 +221,87 @@ impl GlyphStore {
                     step.ready = true;
                     break;
                 }
+                #[cfg(all(
+                    feature = "s2-table-window-prototype",
+                    feature = "paged-shaping-frontier"
+                ))]
+                if let Some((mut low, mut high)) = capture.skip_search {
+                    if low < high {
+                        if step.metadata_units == metadata_units {
+                            break;
+                        }
+                        let middle = low + (high - low) / 2;
+                        let mut value = [MarkdownGraphemeBoundary { byte: 0, utf16: 0 }];
+                        step.metadata_units += 1;
+                        if !breaks.read_grapheme_prefix(
+                            &self.authority,
+                            middle..middle + 1,
+                            &mut value,
+                        )? {
+                            break;
+                        }
+                        let span = self.table_skip.ok_or(Error::InconsistentCoverage)?;
+                        if value[0].utf16 < span.end.utf16 {
+                            low = middle + 1;
+                        } else {
+                            high = middle;
+                        }
+                        capture.skip_search = Some((low, high));
+                        continue;
+                    }
+                    capture.read_ordinal = low;
+                    capture.skip_search = None;
+                }
                 if capture.pending.is_none() {
                     if step.metadata_units == metadata_units {
                         break;
                     }
-                    if total == Some(capture.written) {
+                    if total == Some(capture.read_ordinal) {
                         return Err(Error::InconsistentCoverage);
                     }
                     let mut value = [MarkdownGraphemeBoundary { byte: 0, utf16: 0 }];
-                    let end = capture.written.checked_add(1).ok_or(Error::Overflow)?;
+                    let end = capture.read_ordinal.checked_add(1).ok_or(Error::Overflow)?;
                     step.metadata_units += 1;
                     #[cfg(feature = "paged-shaping-frontier")]
                     let read = breaks.read_grapheme_prefix(
                         &self.authority,
-                        capture.written..end,
+                        capture.read_ordinal..end,
                         &mut value,
                     )?;
                     #[cfg(not(feature = "paged-shaping-frontier"))]
                     let read = breaks.read_ready_graphemes(
                         &self.authority,
-                        capture.written..end,
+                        capture.read_ordinal..end,
                         &mut value,
                     )?;
                     if !read {
                         break;
                     } // 原ordinal尚未提交，保留同capture并让下一量子推进原GCB。
+                    capture.read_ordinal = end;
                     capture.pending = Some(value[0]); // 写预算用尽时只保一条实际已读记录，不重读计费。
+                }
+                let value = capture.pending.ok_or(Error::InconsistentCoverage)?;
+                if value.utf16 > through_utf16 && matches!(target, CaptureEnd::BidiSeam(_)) {
+                    // 原 BreakJob 已交付真实下一 GCB，但它在本 item 的 UBA 端点之后。
+                    // 本轮不写一个伪边界、不丢已读记录；唯一后继 item 会继续消费同 pending。
+                    step.ready = true;
+                    break;
+                }
+                #[cfg(all(
+                    feature = "s2-table-window-prototype",
+                    feature = "paged-shaping-frontier"
+                ))]
+                if self.table_skip.is_some_and(|span| {
+                    span.start.utf16 < value.utf16 && value.utf16 < span.end.utf16
+                }) {
+                    // 旧短行可能已被原 job 看过；只二分它的真实已知前缀，不迁入内部 raw GCB。
+                    capture.pending = None;
+                    capture.skip_search = Some((capture.read_ordinal, known));
+                    continue;
                 }
                 if step.records == records {
                     break;
                 }
-                let value = capture.pending.ok_or(Error::InconsistentCoverage)?;
                 if value.byte > self.source.byte_len()
                     || value.utf16 > self.source.utf16_len()
                     || capture.last.is_some_and(|(_, previous)| {
@@ -196,7 +324,7 @@ impl GlyphStore {
                 capture.last = Some((record, value));
                 capture.pending = None;
                 step.records += 1;
-                if total == Some(capture.written)
+                if total == Some(capture.read_ordinal)
                     && value
                         != (MarkdownGraphemeBoundary {
                             byte: self.source.byte_len(),
@@ -204,7 +332,10 @@ impl GlyphStore {
                         })
                 {
                     return Err(Error::InconsistentCoverage);
-                } // 只有原全局count与真实byte/UTF16尾都一致，才有完整EOF。
+                } // 只有原全局 count 与真实 byte/UTF16 尾都一致，才有完整 EOF。
+                if total == Some(capture.read_ordinal) {
+                    capture.total = Some(capture.written);
+                }
             }
             breaks.require_source(&self.authority)?;
             Ok(step)

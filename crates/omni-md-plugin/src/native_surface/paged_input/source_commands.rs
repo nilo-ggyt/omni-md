@@ -4,6 +4,100 @@ use super::*;
 use omni_markdown_core::{MarkdownEditingCommand, MarkdownEditingOutcome};
 
 impl NativeMarkdownPagedInput {
+    /// 源码插表复用原中文模板，一次正文事务同时发布首格caret；不复制被替换的正文。
+    ///
+    /// # Errors
+    /// 组合、多选或Cell客户不具备块插入权限；原票、源IO、准备或发布失败保留旧正文和历史。
+    pub fn insert_default_table(
+        self: &Rc<Self>,
+        permit: &NativeMarkdownPagedInputPermit,
+        current: &(impl Fn(u64) -> bool + ?Sized),
+    ) -> Result<NativeMarkdownPagedInputCommit> {
+        let _mutation = self.begin(permit, current)?;
+        if self.is_cell() {
+            return Err(NativeMarkdownPagedInputError::BodyTargetRequired);
+        } // 单元格草稿不能通过插表按钮把局部偏移当作canonical块位置。
+        if permit.before.marked.is_some() {
+            return Err(NativeMarkdownPagedInputError::CompositionActive);
+        } // 候选仍归系统输入法；按钮不得强制确认或取消后再领取另一份选择。
+        if !permit.before.selection_is_directed {
+            return Err(NativeMarkdownPagedInputError::MultipleSelectionInput);
+        }
+        let range = permit.before.primary_range;
+        let end = range
+            .location
+            .checked_add(range.length)
+            .ok_or(NativeMarkdownPagedInputError::InvalidRange)?;
+        let original = self
+            .document_identity()
+            .upgrade()
+            .ok_or(NativeMarkdownPagedInputError::DocumentReleased)?;
+        let observer = self.observer(permit.before)?;
+        let (token, prepared) = {
+            let mut document = original
+                .try_borrow_mut()
+                .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
+            // 只读取原选择两端相邻的UTF16单位；真实IO错误必须传播，不能当成普通非换行。
+            let needs_prefix = range.location > 0
+                && !matches!(document.utf16_code_unit_at(range.location - 1)?, 10 | 13);
+            let needs_suffix =
+                end < document.utf16_len() && !matches!(document.utf16_code_unit_at(end)?, 10 | 13);
+            let markdown =
+                super::super::native_markdown_default_table_source(needs_prefix, needs_suffix);
+            let first = range
+                .location
+                .checked_add(usize::from(needs_prefix) * 2 + 2)
+                .ok_or(NativeMarkdownPagedInputError::InvalidRange)?;
+            document.prepare_text_input_observed(
+                range.location..end,
+                &markdown,
+                permit.before.selection,
+                MarkdownTextSelection::caret(first),
+                observer,
+            )?
+        };
+        // 准备不发布正文；归还Doc借用后才调用可重入的前台门，失权只取消本nonce。
+        if let Err(cause) = self.check_permit(permit, current) {
+            return Err(self.cancel(&original, &token, cause));
+        }
+        let mut document = match original.try_borrow_mut() {
+            Ok(document) => document,
+            Err(_) => {
+                return Err(self.cancel(
+                    &original,
+                    &token,
+                    NativeMarkdownPagedInputError::Borrowed,
+                ));
+            }
+        };
+        let mut folds = match self.folds.try_borrow_mut() {
+            Ok(folds) => folds,
+            Err(_) => {
+                drop(document);
+                return Err(self.cancel(
+                    &original,
+                    &token,
+                    NativeMarkdownPagedInputError::Borrowed,
+                ));
+            }
+        };
+        let edit = match document.publish_text_input(&token) {
+            Ok(edit) => edit,
+            Err(cause) => {
+                drop(folds);
+                drop(document);
+                return Err(self.cancel(&original, &token, cause.into()));
+            }
+        };
+        // Core发布后只交换已准备好的选择/折叠metadata，无Native调用或第二次caret事务。
+        let commit = self.publish(permit, &document, prepared, None, Some(edit), &mut folds);
+        drop(folds);
+        drop(document);
+        drop(original);
+        drop(token);
+        Ok(commit)
+    }
+
     /// 用原票提交一次源码命令；普通Backspace只消费调用方同Scene认证的真实GCB范围。
     ///
     /// 返回None仅表示Core没有适用标记规则、且本次没有可用GCB计划；调用方须保留原
@@ -19,7 +113,6 @@ impl NativeMarkdownPagedInput {
         current: &(impl Fn(u64) -> bool + ?Sized),
     ) -> Result<Option<NativeMarkdownPagedInputOutcome>> {
         let _mutation = self.begin(permit, current)?;
-        self.check_permit(permit, current)?;
         if self.is_cell() {
             return Err(NativeMarkdownPagedInputError::BodyTargetRequired);
         } // 表格Tab/Return归原客户控制器，不把局部草稿位置用于canonical块命令。
@@ -56,14 +149,7 @@ impl NativeMarkdownPagedInput {
                 MarkdownEditingOutcome::Changed(edit) => {
                     // Core已经成功；此后只交换原fold/选择metadata，不调用Native或后置可失败IO。
                     return Ok(Some(NativeMarkdownPagedInputOutcome::Committed(
-                        self.publish(
-                            permit,
-                            document.generation(),
-                            prepared,
-                            None,
-                            Some(edit),
-                            &mut folds,
-                        ),
+                        self.publish(permit, &document, prepared, None, Some(edit), &mut folds),
                     )));
                 }
                 MarkdownEditingOutcome::Unchanged => {

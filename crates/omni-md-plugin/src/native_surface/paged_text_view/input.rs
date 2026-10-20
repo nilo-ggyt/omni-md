@@ -4,7 +4,7 @@ use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{AnyThread, DefinedClass};
+use objc2::{AnyThread, ClassType, DefinedClass};
 use objc2_foundation::{NSAttributedString, NSPoint, NSRange, NSString};
 
 use super::{
@@ -16,6 +16,52 @@ use super::{
 const SUBSTRING_UNITS: usize = 4096;
 
 impl NativeMarkdownPagedTextView {
+    /// 附件链接先由原Input发布，再确认同一provisional文件，最后才发可重入Native通知。
+    /// Core拒绝时不调用确认闭包；调用方仍拥有原文件回滚责任，已提交显示失败不能删除附件。
+    pub(in crate::native_surface) fn insert_attachment_link(
+        &self,
+        before: super::NativeMarkdownPagedInputState,
+        text: &str,
+        interpreted: bool,
+        confirm_attachment: impl FnOnce(),
+    ) -> Result<()> {
+        let _use = crate::payload_use::PayloadUseGuard::enter(&self.ivars().depth);
+        let mut origin = self.origin()?;
+        origin.interpreted = interpreted; // 只有队首附件调用方传true；外部工具栏不能从共享depth冒领原Word收据。
+        if origin.state != before {
+            return Err(NativeMarkdownPagedTextViewError::Revoked);
+        }
+        let current = |epoch| epoch == origin.epoch && origin.current(self);
+        let permit = origin.input.capture(origin.epoch, &current)?;
+        let commit =
+            origin
+                .input
+                .insert_text_isolated(&permit, text, super::not_found(), &current)?;
+        confirm_attachment(); // 本步只确认已经在canonical中的文件，不在显示回调之后才建立其持久归属。
+        self.finish_edit_commit(&origin, commit)
+    }
+
+    /// 保存/模式交接仍由真实NSTextInputClient结束组合；不复制或丢弃尚未提交的marked文字。
+    pub(in crate::native_surface) fn commit_composition_before_release(&self) -> Result<()> {
+        if self.is_busy() {
+            return Err(NativeMarkdownPagedTextViewError::Busy);
+        }
+        let input = self
+            .ivars()
+            .input
+            .borrow()
+            .clone()
+            .ok_or(NativeMarkdownPagedTextViewError::Closed)?;
+        if input.state()?.marked.is_none() {
+            return Ok(()); // 没有组合就没有提交事务；排版失败不应阻止原canonical保存与正常关闭。
+        }
+        self.apply_unmark()?;
+        if input.state()?.marked.is_some() {
+            return Err(super::NativeMarkdownPagedInputError::CompositionActive.into());
+        }
+        Ok(())
+    }
+
     /// 延后导航只能通知已提交的原收据；此处新origin仅供显示副作用，不重签导航before或位置。
     pub(in crate::native_surface) fn finish_navigation_commit(
         &self,
@@ -42,7 +88,11 @@ impl NativeMarkdownPagedTextView {
         replacement: NSRange,
         selected: Option<NSRange>,
     ) -> Result<()> {
-        let origin = self.origin()?;
+        self.cancel_cell_pointer_intent(); // 直接 Native Client 插字/候选也撤旧终点，不借 keyDown 是否经过来判断取消。
+        self.cancel_link_intent(); // 真实IME/插字到达已晚于原click，不能让异步链接越过这个输入。
+        let mut origin = self.origin()?;
+        origin.interpreted =
+            self.ivars().interpreting_key.get() && self.ivars().input_callback_depth.get() == 1;
         let current = |epoch| epoch == origin.epoch && origin.current(self);
         let permit = origin.input.capture(origin.epoch, &current)?;
         if selected.is_none()
@@ -52,8 +102,8 @@ impl NativeMarkdownPagedTextView {
         {
             return Ok(()); // 只表示按真实顺序接纳；不得立即在删除前的旧caret插字或报告已经提交。
         }
-        // 显式替换仍按原范围立即接管。marked也保原同步协议，不能排队后向系统谎报旧hasMarked；
-        // pending Word后开始组合的顺序尚未接通，不能据普通输入保序宣称IME已完成。
+        // 显式替换始终按原范围执行；只有真实key解释栈的同步回调能交接后继事件。
+        // marked本身从不排队，也不向系统谎报尚未发布的组合；外部直接调用仍会撤原任务。
         let commit = match selected {
             Some(selected) => {
                 origin
@@ -68,7 +118,10 @@ impl NativeMarkdownPagedTextView {
     }
 
     pub(super) fn apply_unmark(&self) -> Result<()> {
-        let origin = self.origin()?;
+        self.cancel_link_intent(); // 组合提交或客户交接同样结束原指针的外部激活权限。
+        let mut origin = self.origin()?;
+        origin.interpreted =
+            self.ivars().interpreting_key.get() && self.ivars().input_callback_depth.get() == 1;
         let current = |epoch| epoch == origin.epoch && origin.current(self);
         let permit = origin.input.capture(origin.epoch, &current)?;
         let outcome = origin.input.unmark(&permit, &current)?;
@@ -82,7 +135,7 @@ impl NativeMarkdownPagedTextView {
     ) -> Result<()> {
         match outcome {
             NativeMarkdownPagedInputOutcome::Committed(commit) => {
-                self.finish_commit_ref(origin, &commit)
+                self.finish_owned_commit(origin, commit, false)
             }
             NativeMarkdownPagedInputOutcome::Unchanged(state) => {
                 if state != origin.state || !origin.current(self) {
@@ -93,7 +146,7 @@ impl NativeMarkdownPagedTextView {
         }
     }
 
-    /// 字符输入/组合/删除/历史动作才请求Cell活动端可见；普通程序选区仍只发布原收据。
+    /// 字符输入/组合/删除/历史动作请求实际活动端可见；普通程序选区仍只发布原收据。
     pub(super) fn finish_edit_outcome(
         &self,
         origin: &Origin,
@@ -107,22 +160,167 @@ impl NativeMarkdownPagedTextView {
         }
     }
 
-    /// 同一真实编辑收据先完成Native通知，再让原Cell的唯一Producer定位postcommit caret。
+    /// 同一真实编辑收据先完成Native通知，再让原Body/Cell唯一Producer定位postcommit caret。
     pub(super) fn finish_edit_commit(
         &self,
         origin: &Origin,
         commit: NativeMarkdownPagedInputCommit,
     ) -> Result<()> {
+        self.finish_owned_commit(origin, commit, true)
+    }
+
+    /// 原同步回调先交实际Rc收据，再发通知；外部mouse/find origin没有解释权限。
+    pub(super) fn finish_owned_commit(
+        &self,
+        origin: &Origin,
+        commit: impl Into<std::rc::Rc<NativeMarkdownPagedInputCommit>>,
+        reveal: bool,
+    ) -> Result<()> {
+        // 普通输入转交唯一 owned 收据；插表还需把同一 Rc 交给后继首格激活，不能重取选择补票。
+        let commit = commit.into();
+        let interpreted = origin.interpreted
+            && origin
+                .delegate
+                .begin_interpreted_commit(origin.state, std::rc::Rc::clone(&commit))
+                .map_err(|cause| {
+                    NativeMarkdownPagedTextViewError::CommittedEffect(Box::new(cause))
+                })?;
         self.finish_commit_ref(origin, &commit)?;
-        if origin.input.is_cell() {
+        if interpreted {
+            return origin
+                .delegate
+                .finish_interpreted_commit(&commit, reveal)
+                .map_err(|cause| {
+                    NativeMarkdownPagedTextViewError::CommittedEffect(Box::new(cause))
+                });
+        }
+        if reveal {
             origin
                 .delegate
                 .reveal_committed_selection(&commit)
                 .map_err(|cause| {
                     NativeMarkdownPagedTextViewError::CommittedEffect(Box::new(cause))
                 })?;
-        } // Body原行为保持；Cell显示失败仍明确是已提交后果，绝不重放输入或重捕后继票。
+        } // 普通直接输入继续沿原收据显示；没有屏障就没有新增默认事件owner。
         Ok(())
+    }
+
+    /// 队首原event只解释一次；false只表示解释前焦点已移交，原Body应撤该链而非认作回调失败。
+    pub(in crate::native_surface) fn interpret_queued_key(
+        &self,
+        event: &objc2_app_kit::NSEvent,
+    ) -> Result<bool> {
+        let origin = self.origin()?;
+        let window = origin
+            .step(self, || self.window())?
+            .ok_or(NativeMarkdownPagedTextViewError::Revoked)?;
+        let responder = origin.step(self, || window.firstResponder())?;
+        if !responder.is_some_and(|responder| {
+            std::ptr::eq::<objc2_app_kit::NSResponder>(&*responder, self.as_super().as_super())
+        }) {
+            // 延后期间焦点可能已交给Find或其他窗口；原正文没有权限把后续key写到旧文稿。
+            // 此处只撤原未解释事件，不重放到新客户，也不改写系统给出的replacementRange。
+            return Ok(false);
+        }
+        let (_, context) = self.foreground_context()?;
+        self.with_interpreted_input(|| {
+            if !origin.session_current(self, origin.epoch) {
+                return Err(NativeMarkdownPagedTextViewError::Revoked);
+            }
+            // 延后key仍只进入原客户context一次；真实IME回调沿原解释栈和Commit交接，
+            // 不能改用legacy interpretKeyEvents直出字符，也不能在消费后按旧选择补签权限。
+            let consumed = context.0.handleEvent(event);
+            if !origin.session_current(self, origin.epoch) {
+                return Err(NativeMarkdownPagedTextViewError::Revoked);
+            }
+            if !consumed {
+                // NO只授予原super传播，不授予另一轮文本解释；with_interpreted_input仍保原callback首错。
+                // SAFETY: 原主线程活NSView和保留的同一NSEvent覆盖同步super keyDown:调用。
+                unsafe {
+                    let _: () = objc2::msg_send![super(self), keyDown: event];
+                }
+                if !origin.session_current(self, origin.epoch) {
+                    return Err(NativeMarkdownPagedTextViewError::Revoked);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
+    /// 公开菜单延后后沿同一typed实现执行；不重新走公开排队入口产生循环。
+    pub(in crate::native_surface) fn perform_queued_command(
+        &self,
+        selector: objc2::runtime::Sel,
+    ) -> Result<()> {
+        self.with_interpreted_input(|| {
+            let _callback =
+                crate::payload_use::PayloadUseGuard::enter(&self.ivars().input_callback_depth);
+            self.command_from_input_context(selector)
+        })
+    }
+
+    /// 队首格式借同一Core实现，并显式授权本次原Commit交回后继输入；公开UI不从depth推断归属。
+    pub(in crate::native_surface) fn perform_queued_format(
+        &self,
+        action: omni_markdown_core::MarkdownFormatAction,
+    ) -> Result<()> {
+        self.with_interpreted_input(|| {
+            let _callback =
+                crate::payload_use::PayloadUseGuard::enter(&self.ivars().input_callback_depth);
+            let _use = crate::payload_use::PayloadUseGuard::enter(&self.ivars().depth);
+            self.cancel_link_intent();
+            let mut origin = self.origin()?;
+            origin.interpreted = true; // 仅此受控队首入口认证本event；不把共享depth授给外部toolbar重入。
+            self.apply_format_at(&origin, action)
+        })
+    }
+
+    /// 原插表语义在前步收据之后生成模板和首格caret，不排预计算字符串或旧anchor。
+    pub(in crate::native_surface) fn perform_queued_table_insertion(&self) -> Result<()> {
+        self.with_interpreted_input(|| {
+            let _callback =
+                crate::payload_use::PayloadUseGuard::enter(&self.ivars().input_callback_depth);
+            let _use = crate::payload_use::PayloadUseGuard::enter(&self.ivars().depth);
+            self.cancel_link_intent();
+            let mut origin = self.origin()?;
+            origin.interpreted = true; // 原Native槽只执行一次；公开插表按钮必须另排其到达位置。
+            self.insert_default_table_at(&origin)
+        })
+    }
+
+    /// 到达时已经复制的Paste只借原String，本回调不再读取clipboard或构造NSString。
+    pub(in crate::native_surface) fn perform_queued_paste(&self, text: &str) -> Result<()> {
+        self.with_interpreted_input(|| {
+            let _callback =
+                crate::payload_use::PayloadUseGuard::enter(&self.ivars().input_callback_depth);
+            let mut origin = self.origin()?;
+            origin.interpreted = self.ivars().input_callback_depth.get() == 1;
+            let current = |epoch| epoch == origin.epoch && origin.current(self);
+            let permit = origin.input.capture(origin.epoch, &current)?;
+            let commit =
+                origin
+                    .input
+                    .insert_text_isolated(&permit, text, super::not_found(), &current)?;
+            self.finish_edit_commit(&origin, commit)
+        })
+    }
+
+    /// 仅一次原key/菜单解释栈持此标记；同步回调失败保原typed首因，不能假报IME完成。
+    pub(super) fn with_interpreted_input(
+        &self,
+        operation: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.ivars().interpreting_key.replace(true) {
+            return Err(NativeMarkdownPagedTextViewError::Busy);
+        }
+        let result = operation();
+        self.ivars().interpreting_key.set(false);
+        let callback = self.ivars().interpretation_failure.borrow_mut().take();
+        if let Some(cause) = callback {
+            return Err(cause);
+        }
+        result
     }
 
     /// Find延后定位仍保同一收据；显示通知只借原Commit，不移动后再重签。
@@ -295,5 +493,128 @@ impl NativeMarkdownPagedTextView {
         let index = scene.scene.hit(local)?;
         self.range_in_source(&scene, NSRange::new(index, 0))?;
         Ok(index)
+    }
+}
+
+#[cfg(feature = "native-input-trace")]
+impl NativeMarkdownPagedTextView {
+    /// 显式arm只借当前View所属的原Input；不触发焦点、系统按键或输入源变更。
+    pub(in crate::native_surface) fn arm_input_trace(
+        &self,
+        ticks: u64,
+        numer: u32,
+        denom: u32,
+    ) -> std::result::Result<(), crate::NativeInputTraceAccessError> {
+        if self.ivars().closed.get() {
+            return Err(crate::NativeInputTraceAccessError::NoEditor);
+        }
+        if self.is_busy() {
+            return Err(crate::NativeInputTraceAccessError::Busy);
+        }
+        let input = self
+            .ivars()
+            .input
+            .borrow()
+            .clone()
+            .ok_or(crate::NativeInputTraceAccessError::NoEditor)?;
+        input.arm_input_trace(ticks, numer, denom)
+    }
+
+    /// View没有独立记录器；复制原Input句柄后结束槽借用，scope只持原有限标量payload。
+    pub(in crate::native_surface) fn input_trace(
+        &self,
+    ) -> Option<crate::native_input_trace::SharedNativeInputTrace> {
+        let input = self.ivars().input.borrow().clone()?;
+        input.input_trace()
+    }
+
+    /// 原显式drain不派生新的Input或Native图；活动selector由原TraceScope返回ActiveScope。
+    pub(in crate::native_surface) fn drain_input_trace(
+        &self,
+    ) -> std::result::Result<crate::NativeInputTraceSnapshot, crate::NativeInputTraceAccessError>
+    {
+        let input = self
+            .ivars()
+            .input
+            .borrow()
+            .clone()
+            .ok_or(crate::NativeInputTraceAccessError::NoEditor)?;
+        input.drain_input_trace()
+    }
+
+    /// 同步范围只观察本客户公开marked语义的原事实，不调用NSTextInputContext或读取正文。
+    fn input_trace_observation(&self) -> (Option<crate::NativeInputTraceDocument>, bool) {
+        let input = self.ivars().input.borrow().clone();
+        input.map_or((None, false), |input| input.input_trace_observation())
+    }
+
+    /// 只在真正keyDown栈内建立事件来源；后继排队解释不会把旧event猜成仍在当前栈中。
+    pub(super) fn begin_input_trace_event(
+        &self,
+        event: &objc2_app_kit::NSEvent,
+    ) -> Option<crate::native_input_trace::TraceScope> {
+        let trace = self.input_trace()?;
+        let ticks = crate::native_surface::input_trace::native_input_trace_now();
+        let timestamp_bits = event.timestamp().to_bits(); // Native getter时没有Doc或RefCell借用存活。
+        let (document, marked) = self.input_trace_observation();
+        crate::native_input_trace::TraceScope::event(
+            &trace,
+            ticks,
+            timestamp_bits,
+            document,
+            marked,
+        )
+    }
+
+    /// 系统IME异步调用同一协议入口时照实记录selector，缺少当前event则保持None。
+    pub(super) fn begin_input_trace_selector(
+        &self,
+        selector: crate::NativeInputTraceSelector,
+    ) -> Option<crate::native_input_trace::TraceScope> {
+        let trace = self.input_trace()?;
+        let (document, marked) = self.input_trace_observation();
+        crate::native_input_trace::TraceScope::selector(
+            &trace,
+            selector,
+            crate::native_surface::input_trace::native_input_trace_now(),
+            document,
+            marked,
+        )
+    }
+
+    /// 原selector与其后果实际返回后关闭同一scope；不输出、不注册observer或安排后继回调。
+    pub(super) fn finish_input_trace_scope(
+        &self,
+        scope: Option<crate::native_input_trace::TraceScope>,
+    ) {
+        if let Some(scope) = scope {
+            if self.input_trace().is_none() {
+                return; // 原Input.close已撤payload；Drop标记aborted，不能拿marked消失伪报组合已确认。
+            }
+            let (document, marked) = self.input_trace_observation();
+            scope.finish(
+                crate::native_surface::input_trace::native_input_trace_now(),
+                document,
+                marked,
+            );
+        }
+    }
+
+    /// admission失败只转成既有有限类别；不把typed错误或敏感业务字符串写入记录。
+    pub(super) fn reject_input_trace(&self, cause: &NativeMarkdownPagedTextViewError) {
+        let Some(input) = self.ivars().input.borrow().clone() else {
+            return;
+        };
+        let rejection = match cause {
+            NativeMarkdownPagedTextViewError::Closed
+            | NativeMarkdownPagedTextViewError::Input(
+                super::NativeMarkdownPagedInputError::Closed,
+            ) => crate::NativeInputTraceRejection::Closing,
+            NativeMarkdownPagedTextViewError::Input(
+                super::NativeMarkdownPagedInputError::DocumentReleased,
+            ) => crate::NativeInputTraceRejection::DocumentUnavailable,
+            _ => crate::NativeInputTraceRejection::CanonicalError,
+        };
+        input.reject_input_trace(rejection);
     }
 }

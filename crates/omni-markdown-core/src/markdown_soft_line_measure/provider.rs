@@ -60,6 +60,16 @@ pub(crate) trait GlyphProvider: sealed::Sealed {
         font: &MarkdownLayoutFontAuthority,
         offset: usize,
     ) -> Result<MarkdownGlyphClusterAnswer>;
+    /// 只有原 Store 的已签折叠控制可省略隐区；普通 Job 不能从公开范围声明隐藏许可。
+    #[cfg(feature = "paged-line-compose")]
+    fn folded_section(&self) -> Option<Range<usize>> {
+        None
+    }
+    /// 原 Store 已签入的真实段落控制没有字形后继 flags；普通 shaping Job 不取得此末端能力。
+    #[cfg(feature = "paged-line-compose")]
+    fn ends_paragraph_control(&self) -> bool {
+        false
+    }
     /// 只由真实Store适配器从最新完整LineEnd读取；Job或普通范围没有已提交行权限。
     #[cfg(feature = "paged-line-compose")]
     fn committed_line_start(
@@ -92,6 +102,17 @@ pub(crate) trait GlyphProvider: sealed::Sealed {
         self.require(source, font)?;
         Ok(None) // 旧Job和没有原producer证书的目录不能从公开范围补签能力。
     }
+    /// 普通 Job 没有原 Bidi 分段票；只有经原 Store/Proof 核过的目录才能提供内部整形末端。
+    /// 返回值只许测量继续累计，不能成为字素、软行或紧急断点的许可。
+    #[cfg(feature = "paged-shaping-frontier")]
+    fn bidi_shaping_end(
+        &mut self,
+        source: &MarkdownLayoutTextAuthority,
+        font: &MarkdownLayoutFontAuthority,
+    ) -> Result<Option<usize>> {
+        self.require(source, font)?;
+        Ok(None)
+    }
 }
 
 /// 重排能力只由实际原Job或已认证Store目录提供，不能用公开Range/Choice自行实现。
@@ -100,6 +121,15 @@ pub(crate) trait GlyphProvider: sealed::Sealed {
 #[cfg(feature = "paged-soft-line-resolve")]
 pub(crate) trait ResolutionProvider: GlyphProvider {
     fn shaping_cancellation(&self) -> crate::MarkdownShapingCancellation;
+    /// 同Store可提供已认证后继item的真实首cluster flags；普通Job没有后项见证，不能把末端当EOF。
+    fn following_item_flags(
+        &mut self,
+        source: &MarkdownLayoutTextAuthority,
+        font: &MarkdownLayoutFontAuthority,
+    ) -> std::result::Result<Option<u32>, crate::MarkdownSoftLineResolveError> {
+        self.require(source, font)?;
+        Ok(None)
+    }
     fn reshape_subrange(
         &mut self,
         source: &MarkdownLayoutTextAuthority,

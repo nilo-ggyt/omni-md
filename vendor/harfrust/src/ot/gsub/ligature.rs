@@ -1,11 +1,11 @@
 use crate::buffer::GlyphInfo;
 use crate::ot::apply::ApplyContext;
 use crate::ot::apply::{
-    Apply, LigatureSubstFormat1Cache, LigatureSubstFormat1SmallCache, MaySkip, SkippingIterator,
-    SubtableExternalCache, SubtableExternalCacheMode, WouldApply, WouldApplyContext, ligate_input,
-    match_always, match_glyph, match_input,
+    ligate_input, match_always, match_glyph, match_input, Apply, LigatureSubstFormat1Cache,
+    LigatureSubstFormat1SmallCache, MaySkip, SkippingIterator, SubtableExternalCache,
+    SubtableExternalCacheMode, WouldApply, WouldApplyContext,
 };
-use crate::ot::{CoverageInfo, coverage_index, coverage_index_cached};
+use crate::ot::{coverage_index, coverage_index_cached, CoverageInfo};
 use crate::set_digest::SetDigest;
 use alloc::boxed::Box;
 use read_fonts::tables::gsub::{Ligature, LigatureSet, LigatureSubstFormat1};

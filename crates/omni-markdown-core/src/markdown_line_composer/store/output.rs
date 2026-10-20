@@ -7,6 +7,11 @@ use super::*;
 use crate::MarkdownLayoutTextSourceObserver;
 
 mod grapheme_queries;
+#[cfg(all(
+    feature = "s2-table-window-prototype",
+    feature = "paged-shaping-frontier"
+))]
+mod table_row;
 pub use grapheme_queries::MarkdownComposedGraphemeOrdinalAnswer;
 mod visual_caret;
 pub use visual_caret::{
@@ -14,10 +19,19 @@ pub use visual_caret::{
     MarkdownComposedVisualGraphemeAnswer, MarkdownComposedVisualGraphemeQuery,
     MarkdownComposedVisualGraphemeStep, MarkdownComposedVisualQuery, MarkdownComposedVisualStep,
 };
+#[cfg(feature = "paged-shaping-frontier")]
+pub use visual_caret::{
+    MarkdownComposedVisualWordAnswer, MarkdownComposedVisualWordQuery,
+    MarkdownComposedVisualWordStep,
+};
 mod lookup;
+mod trailing_whitespace;
 pub use lookup::{
     MarkdownComposedLineAffinity, MarkdownComposedLineLookup, MarkdownComposedLineLookupAnswer,
     MarkdownComposedLineLookupStep, MarkdownComposedLineLookupTarget,
+};
+pub use trailing_whitespace::{
+    MarkdownComposedLineTrailingWhitespace, MarkdownComposedLineTrailingWhitespaceStep,
 };
 
 pub(super) const LINE: u8 = 8;
@@ -31,6 +45,8 @@ pub enum MarkdownComposedLineKind {
     Mandatory,
     Emergency,
     Overflow,
+    /// 原 canonical 结构行；高度来自同一真实 Grid consumer 的最终排版。
+    TableRow,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,6 +63,10 @@ pub struct MarkdownComposedLineFacts {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkdownComposedLinePartFacts {
+    /// 同一字体响应已经封存的左右缩进；不增加目录记录或重读活文档样式。
+    pub paragraph_inset_26_6: i32,
+    /// 来自本part原item封存记录，不能由平台按字符范围事后猜测。
+    pub presentation: crate::MarkdownPresentationStyles,
     pub kind: super::super::MarkdownComposedLinePartKind,
     pub source_utf16: Range<usize>,
     pub direction: MarkdownShapingDirection,
@@ -107,12 +127,21 @@ struct Payload {
     reader: LayoutIndexReader<64>,
     source: MarkdownLayoutTextSource,
     fonts: MarkdownLineFontCatalog,
+    folds: Option<crate::markdown_layout_source::folds::FoldPlan>,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    tables: Option<crate::markdown_layout_source::table_rows::TablePlan>,
 }
 
 /// 单一只读FD的真实owner；不持完整glyph、item、Line、Font或正文Vec。
 pub struct MarkdownComposedLines {
     payload: Option<Payload>,
     identity: Arc<()>,
+    // 只认证同一 writer 的追加前缀，不让旧 Line/Part 身份跨快照生效。
+    #[cfg(feature = "paged-shaping-frontier")]
+    lineage: Weak<()>,
     authority: MarkdownLayoutTextAuthority,
     cancellation: MarkdownLineComposeCancellation,
     last: Option<usize>,
@@ -174,10 +203,19 @@ pub(super) struct OutputSeal {
     pub cancellation: MarkdownLineComposeCancellation,
     pub reader: LayoutIndexReader<64>,
     pub identity: Arc<()>,
+    // 原 GlyphStore 在实际 LineEnd 移交时提供；Word 续算不为布局重置或外来 writer 续权。
+    #[cfg(feature = "paged-shaping-frontier")]
+    pub lineage: Weak<()>,
     pub last: Option<usize>,
     pub count: usize,
     pub range: Range<usize>,
     pub graphemes: GraphemeDirectory,
+    pub folds: Option<crate::markdown_layout_source::folds::FoldPlan>,
+    #[cfg(all(
+        feature = "s2-table-window-prototype",
+        feature = "paged-shaping-frontier"
+    ))]
+    pub tables: Option<crate::markdown_layout_source::table_rows::TablePlan>,
 }
 
 impl MarkdownComposedLines {
@@ -212,8 +250,16 @@ impl MarkdownComposedLines {
                 reader: seal.reader,
                 source: seal.source,
                 fonts: seal.fonts,
+                folds: seal.folds,
+                #[cfg(all(
+                    feature = "s2-table-window-prototype",
+                    feature = "paged-shaping-frontier"
+                ))]
+                tables: seal.tables,
             }),
             identity: seal.identity,
+            #[cfg(feature = "paged-shaping-frontier")]
+            lineage: seal.lineage,
             authority: seal.authority,
             cancellation: seal.cancellation,
             last: seal.last,
@@ -267,6 +313,14 @@ impl MarkdownComposedLines {
         Ok(())
     }
     fn finish<T>(&mut self, result: Result<T>) -> Result<T> {
+        if matches!(&result, Err(Error::FoldedRange(_) | Error::TableRange)) {
+            // 隐区缺少本记录域的内部 GCB 是可恢复显示状态；健康失败仍永久撤回实际 reader。
+            if let Err(error) = self.require(&self.authority) {
+                drop(self.payload.take());
+                return Err(error);
+            }
+            return result;
+        }
         let result = result.and_then(|value| {
             self.require(&self.authority)?;
             Ok(value)
@@ -335,6 +389,7 @@ impl MarkdownComposedLines {
             1 => MarkdownComposedLineKind::Mandatory,
             2 => MarkdownComposedLineKind::Emergency,
             3 => MarkdownComposedLineKind::Overflow,
+            4 => MarkdownComposedLineKind::TableRow,
             _ => return Err(Error::InconsistentCoverage),
         };
         let facts = MarkdownComposedLineFacts {
@@ -478,15 +533,32 @@ impl MarkdownComposedLines {
                 .checked_mul(2)
                 .and_then(|value| line.header.checked_add(1)?.checked_add(value))
                 .ok_or(Error::Overflow)?;
-            let row = self.row(record)?;
-            let meta = self.row(record.checked_add(1).ok_or(Error::Overflow)?)?;
+            self.require(&self.authority)?;
+            let mut part_records = [[0; 64]; 2];
+            // 原Part头与meta本来都须完整读取后才能认证；合并同一128B范围，不预读其他part或增加缓存。
+            self.payload
+                .as_mut()
+                .ok_or(Error::Poisoned)?
+                .reader
+                .read_batch(
+                    record..record.checked_add(2).ok_or(Error::Overflow)?,
+                    &mut part_records,
+                )?;
+            let [row, meta] = part_records;
             Self::part_header(line, &row, &meta)?;
             let item_record = usize_at(&meta, 40)?;
-            let item = decode_directory([
-                self.row(item_record)?,
-                self.row(item_record.checked_add(1).ok_or(Error::Overflow)?)?,
-                self.row(item_record.checked_add(2).ok_or(Error::Overflow)?)?,
-            ])?;
+            self.require(&self.authority)?;
+            let mut item_records = [[0; 64]; 3];
+            // 只有已认证的Part才能给出原Directory位置；仍读精确三条192B，再共同解码、核覆盖与弱Font。
+            self.payload
+                .as_mut()
+                .ok_or(Error::Poisoned)?
+                .reader
+                .read_batch(
+                    item_record..item_record.checked_add(3).ok_or(Error::Overflow)?,
+                    &mut item_records,
+                )?;
+            let item = decode_directory(item_records)?;
             self.decode_part(line, row, meta, item).map(Some)
         })();
         self.finish(result)
@@ -523,6 +595,8 @@ impl MarkdownComposedLines {
             _ => return Err(Error::InconsistentCoverage),
         };
         let facts = MarkdownComposedLinePartFacts {
+            paragraph_inset_26_6: item.paragraph_inset_26_6,
+            presentation: item.presentation,
             kind: super::super::MarkdownComposedLinePartKind::decode(meta[59])?,
             source_utf16: usize_at(&row, 0)?..usize_at(&row, 8)?,
             glyphs: usize_at(&row, 24)?,
@@ -556,7 +630,8 @@ impl MarkdownComposedLines {
             || facts.script != item.facts.script
             || facts.points != item.facts.points
             || !facts.points.is_finite()
-            || facts.points <= 0.0
+            || (facts.points <= 0.0
+                && facts.kind != super::super::MarkdownComposedLinePartKind::TableRow)
             || facts.level > 126
             || facts.level & 1 != u8::from(direction == MarkdownShapingDirection::RightToLeft)
             || original_start

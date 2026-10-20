@@ -114,7 +114,7 @@ fn existing_two_mib_cell_edits_and_saves_without_whole_cell_materialization() {
         .unwrap();
     assert_eq!(String::from_utf16(&tail).unwrap(), "中😀尾");
     let prepared = doc
-        .prepare_cell_draft_commit(doc.capture_cell_draft_edit(&token).unwrap())
+        .prepare_cell_draft_commit(doc.capture_cell_draft_edit(&token).unwrap(), None)
         .unwrap();
     let candidate = prepared.replacement_backing_observer().unwrap();
     assert!(matches!(
@@ -126,11 +126,12 @@ fn existing_two_mib_cell_edits_and_saves_without_whole_cell_materialization() {
     assert!(candidate.unmap_succeeded());
     drop((first, second)); // 同一原读取值真正归还后重新准备，不能重复消费旧准入票。
     let prepared = doc
-        .prepare_cell_draft_commit(doc.capture_cell_draft_edit(&token).unwrap())
+        .prepare_cell_draft_commit(doc.capture_cell_draft_edit(&token).unwrap(), None)
         .unwrap();
     let mapping = prepared.replacement_backing_observer().unwrap();
     doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap()
+        .edit
         .unwrap();
     let expected = source.replacen("中😀 |", "中😀尾 |", 1);
     access.save_document_buffer(&mut doc).unwrap();
@@ -155,7 +156,7 @@ fn document_backing_observers_follow_published_file_through_undo_redo_and_drop()
     let text = "x".repeat(80_000);
     replace(&mut doc, &token, &text);
     let prepared = doc
-        .prepare_cell_draft_commit(doc.capture_cell_draft_edit(&token).unwrap())
+        .prepare_cell_draft_commit(doc.capture_cell_draft_edit(&token).unwrap(), None)
         .unwrap();
     let candidate = prepared.replacement_backing_observer().unwrap();
     // 两个尚未发布的实际文件都不能成为canonical文档的释放责任。
@@ -165,6 +166,7 @@ fn document_backing_observers_follow_published_file_through_undo_redo_and_drop()
     );
     doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap()
+        .edit
         .unwrap();
     let expected = SOURCE.replacen("| a |", &format!("| {text} |"), 1);
     assert_eq!(canonical(&doc), expected);
@@ -254,15 +256,52 @@ fn long_trimmed_input_releases_file_before_retaining_a_small_inline_result() {
     let token = begin(&mut doc);
     let raw = format!("中😀{}", " ".repeat(2 * 1024 * 1024));
     replace(&mut doc, &token, &raw);
+    let facts = doc.cell_draft_facts(&token).unwrap();
+    doc.set_cell_draft_selection(
+        doc.capture_cell_draft_edit(&token).unwrap(),
+        MarkdownTextSelection {
+            anchor_utf16: facts.utf16_len,
+            head_utf16: 0,
+        },
+    )
+    .unwrap();
     let prepared = doc
-        .prepare_cell_draft_commit(doc.capture_cell_draft_edit(&token).unwrap())
+        .prepare_cell_draft_commit(
+            doc.capture_cell_draft_edit(&token).unwrap(),
+            Some(MarkdownCellDraftWordAnchor {
+                range: MarkdownTextSelection {
+                    anchor_utf16: facts.utf16_len - 1,
+                    head_utf16: 0,
+                },
+                origin_utf16: facts.utf16_len - 1,
+            }),
+        )
         .unwrap();
     assert!(prepared.replacement_backing_observer().is_none());
     let observer = doc.cell_draft_resource_observer(&token).unwrap();
     assert!(observer.snapshot().prepared_commit_bytes <= EDIT_SEGMENT_BYTES);
-    doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
-        .unwrap()
+    let committed = doc
+        .commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap();
+    assert!(committed.edit.is_some());
+    // 两MiB尾空白确实已截去；反向选择的旧末端落在留下的“中😀”之后，不保整格映射表。
+    assert_eq!(
+        committed.receipt.selection,
+        MarkdownTextSelection {
+            anchor_utf16: facts.canonical_range.start + 3,
+            head_utf16: facts.canonical_range.start,
+        }
+    );
+    assert_eq!(
+        committed.receipt.word_anchor,
+        Some(MarkdownCellDraftWordAnchor {
+            range: MarkdownTextSelection {
+                anchor_utf16: facts.canonical_range.start + 3,
+                head_utf16: facts.canonical_range.start
+            },
+            origin_utf16: facts.canonical_range.start + 3
+        })
+    );
     let expected = SOURCE.replacen("| a |", "| 中😀 |", 1);
     assert_eq!(canonical(&doc), expected);
     doc.undo_text_edit().unwrap();
@@ -270,4 +309,629 @@ fn long_trimmed_input_releases_file_before_retaining_a_small_inline_result() {
     doc.redo_text_edit().unwrap();
     assert_eq!(canonical(&doc), expected);
     assert!(observer.is_released());
+}
+
+/// 真实 RootLeaf 请求先发布结构行，再沿同一个 owner 完成 CellInline 和显示目录。
+/// 只交回原 Parser 的格票；实际显示 Source/匿名目录均在激活之前归还，不保留另一张读图。
+#[cfg(feature = "paged-line-compose")]
+fn displayed_cell(
+    document: &MarkdownDocumentBuffer,
+    row_start: usize,
+    column: usize,
+) -> VerifiedMarkdownTableCellSource {
+    use crate::{MarkdownTableCellDisplayPreparation, MarkdownTableCellDisplayPreparationStep};
+    let authority = MarkdownViewportSourceAuthority {
+        context_revision: 92,
+        selection: document.selection(),
+        cancelled: false,
+    };
+    let mut request = document
+        .viewport_leaf_source_request(
+            0..document.utf16_len().min(128),
+            authority.context_revision,
+            authority.selection,
+        )
+        .unwrap();
+    let publication = loop {
+        request.advance(document, authority, 4096).unwrap();
+        if let Some(publication) = request.take_sources_for(document, authority).unwrap() {
+            break publication;
+        }
+    };
+    let row = publication
+        .table_row_at_for(document, authority, row_start)
+        .unwrap()
+        .unwrap();
+    let mut preparation =
+        MarkdownTableCellDisplayPreparation::from_row_source(document, row, authority, column)
+            .unwrap();
+    let display = loop {
+        let step = preparation
+            .advance_with_source_request(document, &mut request, false)
+            .unwrap();
+        let (ready, work) = match step {
+            MarkdownTableCellDisplayPreparationStep::Progress { work } => (false, work),
+            MarkdownTableCellDisplayPreparationStep::Ready { work } => (true, work),
+        };
+        // 原 Parser 和转换器各步都须真实遵守公开输入量子；巨格不能在一个步骤中暗读全文。
+        assert!(work.source_bytes <= 4096);
+        assert!(work.copied_source_bytes <= 4096);
+        assert!(work.structural_transitions <= 4096);
+        if ready {
+            break preparation.take_ready_for(document).unwrap().unwrap();
+        }
+    };
+    let source = display.canonical_raw_cell().clone();
+    let observer = display.resource_observer();
+    request.cancel();
+    drop((display, preparation, publication, request));
+    let released = observer.snapshot();
+    assert!(released.source_payload_released);
+    assert!(!released.origin_file_open);
+    assert_eq!(released.origin_buffer_bytes, 0);
+    assert!(!released.origin_cleanup_failed);
+    assert!(!released.origin_reader_failed);
+    source
+}
+
+#[cfg(feature = "paged-line-compose")]
+#[test]
+/// 正式Display原票激活后，CRLF合并、管道转义、代理对和首尾trim必须同时保住原选择方向。
+fn original_display_commit_maps_directed_selection_in_the_actual_sanitize_transaction() {
+    for (raw, expected, anchor, head, mapped_anchor, mapped_head, word_start, mapped_start) in [
+        ("  中|😀\r\n尾 \u{2003}", "中\\|😀 尾", 11, 4, 7, 3, 7, 6),
+        ("\u{2003}\t\r\n  ", "", 1, 6, 0, 0, 6, 0),
+        (r"x\\|中\|z", r"x\\\|中\|z", 3, 7, 3, 8, 4, 5),
+        ("a\r\n\nb", "a b", 2, 4, 2, 2, 3, 2),
+        ("😀|x", "😀\\|x", 2, 3, 2, 4, 2, 2),
+        ("  x|", "x\\|", 2, 4, 0, 3, 0, 0),
+    ] {
+        let (_directory, mut doc) = document(SOURCE);
+        let mapping = doc.original_backing_observer().unwrap();
+        let source = displayed_cell(&doc, SOURCE.find("| a |").unwrap(), 0);
+        let plan = doc.plan_verified_table_cell_draft(source).unwrap();
+        let token = doc.begin_prepared_cell_draft(plan).unwrap();
+        let before = doc.cell_draft_facts(&token).unwrap();
+        let resources = doc.cell_draft_resource_observer(&token).unwrap();
+        edit(
+            &mut doc,
+            &token,
+            0..before.utf16_len,
+            raw,
+            MarkdownTextSelection {
+                anchor_utf16: anchor,
+                head_utf16: head,
+            },
+            None,
+        )
+        .unwrap();
+        let first = doc.capture_cell_draft(&token).unwrap();
+        let second = doc.capture_cell_draft(&token).unwrap();
+        let prepared = doc
+            .prepare_cell_draft_commit(
+                doc.capture_cell_draft_edit(&token).unwrap(),
+                Some(MarkdownCellDraftWordAnchor {
+                    range: MarkdownTextSelection {
+                        anchor_utf16: word_start,
+                        head_utf16: raw.encode_utf16().count(),
+                    },
+                    origin_utf16: word_start,
+                }),
+            )
+            .unwrap();
+        assert_eq!(canonical(&doc), SOURCE); // 原两个显示读取仍活，准备不能提前发布或移动正文选择。
+        assert_eq!(doc.selection(), MarkdownTextSelection::default());
+        drop((first, second));
+        let committed = doc
+            .commit_prepared_cell_draft_observed(prepared, NoopObserver)
+            .unwrap();
+        assert!(committed.edit.is_some());
+        assert_eq!(
+            committed.receipt.selection,
+            MarkdownTextSelection {
+                anchor_utf16: before.canonical_range.start + mapped_anchor,
+                head_utf16: before.canonical_range.start + mapped_head,
+            },
+            "raw={raw:?}"
+        );
+        assert_eq!(committed.receipt.next_cell, None);
+        // 原首组两端独立于当前选区；CRLF、管道转义和尾trim在同一趟映射中保留组范围。
+        assert_eq!(
+            committed.receipt.word_anchor,
+            Some(MarkdownCellDraftWordAnchor {
+                range: MarkdownTextSelection {
+                    anchor_utf16: before.canonical_range.start + mapped_start,
+                    head_utf16: before.canonical_range.start + expected.encode_utf16().count()
+                },
+                origin_utf16: before.canonical_range.start + mapped_start
+            }),
+            "raw={raw:?}"
+        );
+        let after = SOURCE.replacen("| a |", &format!("| {expected} |"), 1);
+        assert_eq!(canonical(&doc), after);
+        // 端点收据不暗改旧成功选择合同；一次canonical事务仍将caret放在实际替换正文后。
+        assert_eq!(
+            doc.selection(),
+            MarkdownTextSelection::caret(
+                before.canonical_range.start + expected.encode_utf16().count()
+            )
+        );
+        assert!(resources.is_released());
+        assert_eq!(std::fs::read(doc.path()).unwrap(), SOURCE.as_bytes());
+        assert!(doc.undo_text_edit_observed(NoopObserver).unwrap().is_some());
+        assert_eq!(canonical(&doc), SOURCE);
+        assert!(doc.undo_text_edit_observed(NoopObserver).unwrap().is_none());
+        assert!(doc.redo_text_edit_observed(NoopObserver).unwrap().is_some());
+        assert_eq!(canonical(&doc), after);
+        drop(doc);
+        assert!(mapping.unmap_succeeded() && !mapping.failed());
+    }
+}
+
+#[cfg(feature = "paged-line-compose")]
+#[test]
+/// 未改内容仍交付真实trim端点却不动Doc；缺格补分隔符后的正文位置不能误当原插入锚点。
+fn original_display_commit_receipts_distinguish_unchanged_and_implicit_cell_positions() {
+    let (_directory, mut doc) = document(SOURCE);
+    let mapping = doc.original_backing_observer().unwrap();
+    doc.set_selection(MarkdownTextSelection::caret(1)).unwrap();
+    let source = displayed_cell(&doc, SOURCE.find("| a |").unwrap(), 0);
+    let plan = doc.plan_verified_table_cell_draft(source).unwrap();
+    let token = doc.begin_prepared_cell_draft(plan).unwrap();
+    let before = doc.cell_draft_facts(&token).unwrap();
+    let resources = doc.cell_draft_resource_observer(&token).unwrap();
+    let profile = doc.storage_profile();
+    edit(
+        &mut doc,
+        &token,
+        0..before.utf16_len,
+        "  a  ",
+        MarkdownTextSelection {
+            anchor_utf16: 5,
+            head_utf16: 2,
+        },
+        None,
+    )
+    .unwrap();
+    let committed = doc
+        .commit_prepared_cell_draft_observed(
+            doc.prepare_cell_draft_commit(
+                doc.capture_cell_draft_edit(&token).unwrap(),
+                Some(MarkdownCellDraftWordAnchor {
+                    range: MarkdownTextSelection::caret(2),
+                    origin_utf16: 2,
+                }),
+            )
+            .unwrap(),
+            NoopObserver,
+        )
+        .unwrap();
+    assert!(committed.edit.is_none());
+    assert_eq!(
+        committed.receipt.word_anchor,
+        Some(MarkdownCellDraftWordAnchor {
+            range: MarkdownTextSelection::caret(before.canonical_range.start),
+            origin_utf16: before.canonical_range.start
+        })
+    );
+    assert_eq!(
+        committed.receipt.selection,
+        MarkdownTextSelection {
+            anchor_utf16: before.canonical_range.start + 1,
+            head_utf16: before.canonical_range.start,
+        }
+    );
+    assert_eq!(committed.receipt.next_cell, None);
+    assert_eq!(doc.selection(), MarkdownTextSelection::caret(1));
+    assert_eq!(doc.generation(), 0);
+    assert_eq!(doc.storage_profile(), profile);
+    assert_eq!(canonical(&doc), SOURCE);
+    assert!(!doc.can_undo());
+    assert!(resources.is_released());
+    drop(doc);
+    assert!(mapping.unmap_succeeded() && !mapping.failed());
+
+    const IMPLICIT: &str = "| H | E | M | N |\r\n| --- | --- | --- | --- |\r\n| a ||\r\n";
+    const EXPECTED: &str = "| H | E | M | N |\r\n| --- | --- | --- | --- |\r\n| a || | 中\\|😀\r\n";
+    let (_directory, mut doc) = document(IMPLICIT);
+    let mapping = doc.original_backing_observer().unwrap();
+    let source = displayed_cell(&doc, IMPLICIT.find("| a ||").unwrap(), 3);
+    let plan = doc.plan_verified_table_cell_draft(source).unwrap();
+    let token = doc.begin_prepared_cell_draft(plan).unwrap();
+    let resources = doc.cell_draft_resource_observer(&token).unwrap();
+    edit(
+        &mut doc,
+        &token,
+        0..0,
+        " \t中|😀  ",
+        MarkdownTextSelection {
+            anchor_utf16: 8,
+            head_utf16: 3,
+        },
+        None,
+    )
+    .unwrap();
+    let prepared = doc
+        .prepare_cell_draft_commit(doc.capture_cell_draft_edit(&token).unwrap(), None)
+        .unwrap();
+    let committed = doc
+        .commit_prepared_cell_draft_observed(prepared, NoopObserver)
+        .unwrap();
+    let text_start = EXPECTED[..EXPECTED.find('中').unwrap()]
+        .encode_utf16()
+        .count();
+    assert!(committed.edit.is_some());
+    assert_eq!(
+        committed.receipt.selection,
+        MarkdownTextSelection {
+            anchor_utf16: text_start + 5,
+            head_utf16: text_start + 1,
+        }
+    );
+    assert_eq!(canonical(&doc), EXPECTED);
+    assert_eq!(std::fs::read(doc.path()).unwrap(), IMPLICIT.as_bytes());
+    assert!(resources.is_released());
+    assert!(doc.undo_text_edit_observed(NoopObserver).unwrap().is_some());
+    assert_eq!(canonical(&doc), IMPLICIT);
+    assert!(doc.undo_text_edit_observed(NoopObserver).unwrap().is_none());
+    drop(doc);
+    assert!(mapping.unmap_succeeded() && !mapping.failed());
+}
+
+#[cfg(feature = "paged-line-compose")]
+#[test]
+/// 原首词组两端都属于当前草稿serial和真实标量；任一端点无效都不能发布或取消分支。
+fn original_display_word_group_rejects_surrogate_and_stale_input_then_commits_once() {
+    let (_directory, mut doc) = document(SOURCE);
+    let mapping = doc.original_backing_observer().unwrap();
+    let source = displayed_cell(&doc, SOURCE.find("| a |").unwrap(), 0);
+    let plan = doc.plan_verified_table_cell_draft(source).unwrap();
+    let token = doc.begin_prepared_cell_draft(plan).unwrap();
+    let before = doc.cell_draft_facts(&token).unwrap();
+    let resources = doc.cell_draft_resource_observer(&token).unwrap();
+    edit(
+        &mut doc,
+        &token,
+        0..before.utf16_len,
+        " \t😀|中 \u{2003}",
+        MarkdownTextSelection::caret(8),
+        None,
+    )
+    .unwrap();
+    let facts = doc.cell_draft_facts(&token).unwrap();
+    for (group, origin, expected) in [
+        (
+            MarkdownTextSelection {
+                anchor_utf16: 3,
+                head_utf16: 4,
+            },
+            4,
+            MarkdownDocumentBufferError::NotUnicodeBoundary,
+        ),
+        (
+            MarkdownTextSelection {
+                anchor_utf16: 4,
+                head_utf16: 3,
+            },
+            4,
+            MarkdownDocumentBufferError::NotUnicodeBoundary,
+        ),
+        (
+            MarkdownTextSelection {
+                anchor_utf16: 9,
+                head_utf16: 4,
+            },
+            4,
+            MarkdownDocumentBufferError::RangeOutsideDocument,
+        ),
+        (
+            MarkdownTextSelection {
+                anchor_utf16: 4,
+                head_utf16: 9,
+            },
+            4,
+            MarkdownDocumentBufferError::RangeOutsideDocument,
+        ),
+        (
+            MarkdownTextSelection {
+                anchor_utf16: 2,
+                head_utf16: 6,
+            },
+            3,
+            MarkdownDocumentBufferError::NotUnicodeBoundary,
+        ),
+        (
+            MarkdownTextSelection {
+                anchor_utf16: 2,
+                head_utf16: 6,
+            },
+            9,
+            MarkdownDocumentBufferError::RangeOutsideDocument,
+        ),
+    ] {
+        let prepared = doc.prepare_cell_draft_commit(
+            doc.capture_cell_draft_edit(&token).unwrap(),
+            Some(MarkdownCellDraftWordAnchor {
+                range: group,
+                origin_utf16: origin,
+            }),
+        );
+        assert!(matches!(
+            prepared,
+            Err(MarkdownCellDraftError::Document(error)) if error == expected
+        ));
+        // 两类真实输入错误都保留同一可编辑草稿；不能把无效首组端点钳到另一字素冒充原Word动作。
+        assert_eq!(doc.cell_draft_facts(&token).unwrap(), facts);
+        assert_eq!(canonical(&doc), SOURCE);
+        assert!(!doc.can_undo());
+    }
+    let stale = doc.capture_cell_draft_edit(&token).unwrap();
+    doc.set_cell_draft_selection(
+        doc.capture_cell_draft_edit(&token).unwrap(),
+        MarkdownTextSelection::caret(2),
+    )
+    .unwrap();
+    assert!(matches!(
+        doc.prepare_cell_draft_commit(
+            stale,
+            Some(MarkdownCellDraftWordAnchor {
+                range: MarkdownTextSelection {
+                    anchor_utf16: 4,
+                    head_utf16: 5
+                },
+                origin_utf16: 4
+            })
+        ),
+        Err(MarkdownCellDraftError::Stale)
+    )); // 相同正文和合法scalar也不能给旧输入serial补签首词组。
+    let prepared = doc
+        .prepare_cell_draft_commit(
+            doc.capture_cell_draft_edit(&token).unwrap(),
+            Some(MarkdownCellDraftWordAnchor {
+                range: MarkdownTextSelection {
+                    anchor_utf16: 4,
+                    head_utf16: 5,
+                },
+                origin_utf16: 4,
+            }),
+        )
+        .unwrap();
+    let committed = doc
+        .commit_prepared_cell_draft_observed(prepared, NoopObserver)
+        .unwrap();
+    assert!(committed.edit.is_some());
+    assert_eq!(
+        committed.receipt.word_anchor,
+        Some(MarkdownCellDraftWordAnchor {
+            range: MarkdownTextSelection {
+                anchor_utf16: before.canonical_range.start + 2,
+                head_utf16: before.canonical_range.start + 4
+            },
+            origin_utf16: before.canonical_range.start + 2
+        })
+    );
+    assert_eq!(
+        committed.receipt.selection,
+        MarkdownTextSelection::caret(before.canonical_range.start)
+    );
+    assert_eq!(canonical(&doc), SOURCE.replacen("| a |", "| 😀\\|中 |", 1));
+    assert_eq!(std::fs::read(doc.path()).unwrap(), SOURCE.as_bytes());
+    assert!(resources.is_released());
+    assert!(doc.undo_text_edit_observed(NoopObserver).unwrap().is_some());
+    assert_eq!(canonical(&doc), SOURCE);
+    assert!(doc.undo_text_edit_observed(NoopObserver).unwrap().is_none());
+    drop(doc);
+    assert!(mapping.unmap_succeeded() && !mapping.failed());
+}
+
+#[cfg(feature = "paged-line-compose")]
+#[test]
+fn original_display_cell_ticket_edits_explicit_and_missing_cells_with_one_canonical_undo() {
+    let header = "| H | E | M | N |\r\n| --- | --- | --- | --- |\r\n";
+    let text = format!("{header}| a ||\r\n");
+    for (column, row_after) in [
+        (1, "| a |中\\|文 尾|\r\n"),
+        (2, "| a ||中\\|文 尾\r\n"),
+        (3, "| a || | 中\\|文 尾\r\n"),
+    ] {
+        // 相同零长显示分别覆盖显式空格、首个缺格和中间尚缺一列的目标；预期来自固定原文件。
+        let (_directory, mut document) = document(&text);
+        let original = document.original_backing_observer().unwrap();
+        let source = displayed_cell(&document, header.len(), column);
+        // 相同文件、长度和行列不构成同 Doc 权限；原封闭格票不能激活另一个映射的草稿。
+        let foreign = MarkdownDocumentBuffer::open(document.path(), 32 * 1024 * 1024).unwrap();
+        assert!(matches!(
+            foreign.plan_verified_table_cell_draft(source.clone()),
+            Err(MarkdownTableRequestError::SourceSuperseded)
+        ));
+        drop(foreign);
+        let plan = document.plan_verified_table_cell_draft(source).unwrap();
+        let token = document.begin_prepared_cell_draft(plan).unwrap();
+        let draft_resources = document.cell_draft_resource_observer(&token).unwrap();
+        let edit = document.capture_cell_draft_edit(&token).unwrap();
+        let input = "中|文\n尾";
+        document
+            .replace_cell_draft(
+                edit,
+                0..0,
+                input,
+                MarkdownTextSelection::caret(input.encode_utf16().count()),
+                None,
+            )
+            .unwrap();
+        let prepared = document
+            .prepare_cell_draft_commit(document.capture_cell_draft_edit(&token).unwrap(), None)
+            .unwrap();
+        document
+            .commit_prepared_cell_draft_observed(prepared, NoopObserver)
+            .unwrap()
+            .edit
+            .unwrap();
+        let mut actual = Vec::new(); // 固定短表可输出独立 oracle；巨格在下一项只用固定窗口比较。
+        document.write_to(&mut actual).unwrap();
+        assert_eq!(actual, format!("{header}{row_after}").as_bytes());
+        assert!(draft_resources.is_released());
+        assert_eq!(std::fs::read(document.path()).unwrap(), text.as_bytes());
+        // canonical 只需一次 Undo 恢复精确原字节；第二次没有事务，不能先提交再补列。
+        assert!(
+            document
+                .undo_text_edit_observed(NoopObserver)
+                .unwrap()
+                .is_some()
+        );
+        actual.clear();
+        document.write_to(&mut actual).unwrap();
+        assert_eq!(actual, text.as_bytes());
+        assert!(
+            document
+                .undo_text_edit_observed(NoopObserver)
+                .unwrap()
+                .is_none()
+        );
+        drop(document);
+        assert!(original.unmap_succeeded());
+        assert!(!original.failed());
+    }
+}
+
+#[cfg(feature = "paged-line-compose")]
+#[test]
+fn original_two_mib_display_ticket_commits_and_undoes_without_a_whole_cell_string() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    const HEADER: &str = "| H | C |\r\n| --- | --- |\r\n| ";
+    const TAIL: &str = "中😀 | other |\r\n";
+    const BODY_BYTES: usize = 2 * 1024 * 1024;
+    let ascii_bytes = BODY_BYTES - "中😀".len();
+    let page = [b'a'; 4096];
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(HEADER.as_bytes()).unwrap();
+    for _ in 0..ascii_bytes / page.len() {
+        file.write_all(&page).unwrap();
+    }
+    file.write_all(&page[..ascii_bytes % page.len()]).unwrap();
+    file.write_all(TAIL.as_bytes()).unwrap();
+    file.flush().unwrap();
+    // 文件按页生成；测试也不构造 2MiB payload/String 或通过有限完整窗口激活巨格。
+    let mut document = MarkdownDocumentBuffer::open(file.path(), 32 * 1024 * 1024).unwrap();
+    let original = document.original_backing_observer().unwrap();
+    let source = displayed_cell(&document, HEADER.len() - 2, 0);
+    let plan = document
+        .plan_verified_table_cell_draft(source.clone())
+        .unwrap();
+    let token = document.begin_prepared_cell_draft(plan).unwrap();
+    let draft_resources = document.cell_draft_resource_observer(&token).unwrap();
+    let facts = document.cell_draft_facts(&token).unwrap();
+    assert_eq!(facts.byte_len, BODY_BYTES);
+    let edit = document.capture_cell_draft_edit(&token).unwrap();
+    document
+        .replace_cell_draft(
+            edit,
+            facts.utf16_len..facts.utf16_len,
+            "尾",
+            MarkdownTextSelection::caret(facts.utf16_len + 1),
+            None,
+        )
+        .unwrap();
+    let prepared = document
+        .prepare_cell_draft_commit(document.capture_cell_draft_edit(&token).unwrap(), None)
+        .unwrap();
+    document
+        .commit_prepared_cell_draft_observed(prepared, NoopObserver)
+        .unwrap()
+        .edit
+        .unwrap();
+    assert!(draft_resources.is_released());
+
+    // 每个实际 canonical 字符都与独立的生成规则比较，工作数组固定 4KiB；不只核首尾或长度。
+    let assert_canonical = |document: &MarkdownDocumentBuffer, tail: &str| {
+        let mut units = [0; 2048];
+        document
+            .copy_utf16_code_units(0, &mut units[..HEADER.len()])
+            .unwrap();
+        assert!(
+            units[..HEADER.len()]
+                .iter()
+                .copied()
+                .eq(HEADER.encode_utf16())
+        );
+        let mut at = HEADER.len();
+        while at < HEADER.len() + ascii_bytes {
+            let count = units.len().min(HEADER.len() + ascii_bytes - at);
+            document
+                .copy_utf16_code_units(at, &mut units[..count])
+                .unwrap();
+            assert!(units[..count].iter().all(|unit| *unit == u16::from(b'a')));
+            at += count;
+        }
+        let tail_len = tail.encode_utf16().count();
+        document
+            .copy_utf16_code_units(at, &mut units[..tail_len])
+            .unwrap();
+        assert!(units[..tail_len].iter().copied().eq(tail.encode_utf16()));
+        assert_eq!(document.utf16_len(), at + tail_len);
+    };
+    assert_canonical(&document, "中😀尾 | other |\r\n");
+    assert!(matches!(
+        document.plan_verified_table_cell_draft(source.clone()),
+        Err(MarkdownTableRequestError::SourceSuperseded)
+    ));
+    assert!(
+        document
+            .undo_text_edit_observed(NoopObserver)
+            .unwrap()
+            .is_some()
+    );
+    assert_canonical(&document, TAIL);
+    // Undo 恢复原内容也没有恢复旧手势/原票的权限，下一次必须消费新的正式来源发布。
+    assert!(matches!(
+        document.plan_verified_table_cell_draft(source.clone()),
+        Err(MarkdownTableRequestError::SourceSuperseded)
+    ));
+    assert!(
+        document
+            .undo_text_edit_observed(NoopObserver)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        document
+            .redo_text_edit_observed(NoopObserver)
+            .unwrap()
+            .is_some()
+    );
+    assert_canonical(&document, "中😀尾 | other |\r\n");
+    assert!(
+        document
+            .redo_text_edit_observed(NoopObserver)
+            .unwrap()
+            .is_none()
+    );
+
+    // 编辑、Undo/Redo 均未保存；原磁盘仍按每个真实页比对，不能改写原文件冒充低内存编辑。
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut disk = [0; 4096];
+    file.read_exact(&mut disk[..HEADER.len()]).unwrap();
+    assert_eq!(&disk[..HEADER.len()], HEADER.as_bytes());
+    let mut remaining = ascii_bytes;
+    while remaining != 0 {
+        let count = disk.len().min(remaining);
+        file.read_exact(&mut disk[..count]).unwrap();
+        assert_eq!(&disk[..count], &page[..count]);
+        remaining -= count;
+    }
+    file.read_exact(&mut disk[..TAIL.len()]).unwrap();
+    assert_eq!(&disk[..TAIL.len()], TAIL.as_bytes());
+    assert_eq!(file.read(&mut disk[..1]).unwrap(), 0);
+    let backings: Vec<_> = document.backing_observers().collect();
+    drop(document);
+    // 保留的原 raw 票和 observer 只能认原身份，不能延长实际 mmap 或提交文件的寿命。
+    assert!(original.unmap_succeeded());
+    assert!(!original.failed());
+    for backing in backings {
+        assert!(backing.unmap_succeeded());
+        assert_eq!(backing.mapped_bytes(), 0);
+        assert!(!backing.failed());
+    }
+    drop(source);
 }
