@@ -313,7 +313,7 @@ pub struct NativeMarkdownPagedBody {
     find_highlights: RefCell<Option<find_highlights::Binding>>,
     pending_link: RefCell<Option<link::PendingLink>>,
     pending_word_delete: RefCell<Option<Rc<word::PendingWordDelete>>>,
-    input_observer: RefCell<Option<Weak<dyn NativeMarkdownPagedBodyInputObserver>>>,
+    input_observers: RefCell<Vec<Weak<dyn NativeMarkdownPagedBodyInputObserver>>>,
     paint_observation: RefCell<Option<PaintObservation>>,
     #[cfg(feature = "native-markdown-runtime-probe")]
     preparation_probe: RefCell<Option<Weak<dyn NativeMarkdownPagedBodyPreparationProbe>>>,
@@ -503,7 +503,7 @@ impl NativeMarkdownPagedBody {
             find_highlights: RefCell::new(None),
             pending_link: RefCell::new(None),
             pending_word_delete: RefCell::new(None),
-            input_observer: RefCell::new(None),
+            input_observers: RefCell::new(Vec::new()),
             paint_observation: RefCell::new(None),
             #[cfg(feature = "native-markdown-runtime-probe")]
             preparation_probe: RefCell::new(None),
@@ -570,7 +570,7 @@ impl NativeMarkdownPagedBody {
             .ok_or(NativeMarkdownPagedBodyError::Closed)
     }
 
-    /// 正式窗口与原生验收借同一真实提交出口；弱注册不会延长控制器、输入法或文稿生命。
+    /// 正式保存、历史状态与输入观察共用真实提交出口；追加弱订阅不能替换已有业务消费者。
     pub fn observe_input(
         &self,
         observer: Weak<dyn NativeMarkdownPagedBodyInputObserver>,
@@ -578,8 +578,15 @@ impl NativeMarkdownPagedBody {
         if !self.current_body() {
             return Err(NativeMarkdownPagedBodyError::Closed);
         }
-        let previous = self.input_observer.replace(Some(observer));
-        drop(previous); // 结束槽借用后归还旧客户；没有第二条输入或自动保存管线。
+        let mut observers = self.input_observers.borrow_mut();
+        // 已退出的输入会话不留目录项；只保真实仍活着的消费者，不缓存提交或业务正文。
+        observers.retain(|registered| registered.strong_count() != 0);
+        if !observers
+            .iter()
+            .any(|registered| Weak::ptr_eq(registered, &observer))
+        {
+            observers.push(observer);
+        }
         Ok(())
     }
 
@@ -1445,12 +1452,11 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         self.clear_scene()?;
         self.schedule().map_err(|_| ViewError::Revoked)?;
         commit.check_current(&|epoch| self.current(epoch))?;
-        let observer = self
-            .input_observer
-            .borrow()
-            .as_ref()
-            .and_then(Weak::upgrade);
-        if let Some(observer) = observer {
+        let observers = self.input_observers.borrow().clone();
+        for observer in observers
+            .into_iter()
+            .filter_map(|observer| observer.upgrade())
+        {
             observer.committed(commit); // 原收据只借本同步栈；客户重入后必须继续核同张票，不能补签较新输入。
             commit.check_current(&|epoch| self.current(epoch))?;
         }

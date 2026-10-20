@@ -175,12 +175,12 @@ impl NativeMarkdownPagedBody {
     }
 
     pub(super) fn notify_local_cell_input(&self) {
-        let observer = self
-            .input_observer
-            .borrow()
-            .as_ref()
-            .and_then(Weak::upgrade);
-        if let Some(observer) = observer {
+        // 通知前归还订阅目录借用；局部状态消费者可同步关闭自身，不会挤掉正式历史更新。
+        let observers = self.input_observers.borrow().clone();
+        for observer in observers
+            .into_iter()
+            .filter_map(|observer| observer.upgrade())
+        {
             observer.local_input_changed();
         }
     }
