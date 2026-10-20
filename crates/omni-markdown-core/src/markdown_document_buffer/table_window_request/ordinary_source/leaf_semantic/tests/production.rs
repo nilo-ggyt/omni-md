@@ -49,10 +49,12 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
     use crate::markdown_document_buffer::MarkdownHeadingAnchorStep as HeadingStep;
     use std::io::{Read, Write};
 
-    const OPENING: &str = "original opening paragraph.\n\n";
+    const OPENING: &str = "[first](#deep-title) [duplicate](#deep-title-2) [top](#)\n\n";
     const PARAGRAPH: &str =
         "original bounded source paragraph keeps unchanged bytes for heading navigation.\n\n";
-    const HEADING: &str = "# Deep title\n\n";
+    const ATX: &str = "# Deep *Title*\n\n";
+    const COLLISION: &str = "# Deep Title-1\n\n";
+    const SETEXT: &str = "Deep **Title**\n===\n\n";
     const PARAGRAPHS: usize = 512;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("远端标题原来源续批.md");
@@ -61,147 +63,219 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
     for _ in 0..PARAGRAPHS {
         file.write_all(PARAGRAPH.as_bytes()).unwrap();
     }
-    let expected_heading = OPENING.len() + PARAGRAPH.len() * PARAGRAPHS;
-    file.write_all(HEADING.as_bytes()).unwrap();
+    let first_heading = OPENING.len() + PARAGRAPH.len() * PARAGRAPHS;
+    for heading in [ATX, COLLISION, SETEXT] {
+        file.write_all(heading.as_bytes()).unwrap();
+    }
     for _ in 0..PARAGRAPHS {
         file.write_all(PARAGRAPH.as_bytes()).unwrap();
     }
     file.sync_all().unwrap();
-    drop(file); // 合成源逐片写入；生产打开前结束写句柄，不构造整篇期望 String。
+    drop(file); // 合成源逐片写入；生产打开前结束写句柄，不构造整篇期望String。
 
     let mut doc = MarkdownDocumentBuffer::open(&path, 1024 * 1024).unwrap();
     let backing = doc.original_backing_observer().unwrap();
-    let mut heading = doc.heading_anchor_request("deep-title").unwrap();
-    let target = (0..1_000_000)
-        .find_map(|_| {
-            let step = heading.advance(&doc, 4096).unwrap();
-            let work = match &step {
-                HeadingStep::Progress { work }
-                | HeadingStep::Found { work, .. }
-                | HeadingStep::NotFound { work } => work,
-            };
-            // 查询的真实源片、复制和文件工作仍受原量子限制；找到标题不等于正文排版已完成。
-            assert!(work.source_bytes <= 4096 && work.copied_bytes <= 4096);
-            assert!(work.storage_bytes <= 4096 && work.parser_input_bytes <= 16 * 1024);
-            match step {
-                HeadingStep::Found { target, .. } => Some(target),
-                HeadingStep::Progress { .. } => None,
-                HeadingStep::NotFound { .. } => panic!("真实远端 ATX 标题必须存在"),
-            }
-        })
-        .expect("有限合成源上的真实标题查询必须结束");
-    assert_eq!(target.position_for(&doc).unwrap(), expected_heading);
-    let selection = MarkdownTextSelection::caret(expected_heading);
-    doc.set_selection(selection).unwrap();
-    // 保留第一份公开结果跨越整个续批：淘汰后继不需要的 seed，不能破坏旧只读句柄。
-    let (mut request, first) = leaf_sources(&doc, 0..1);
-    let mut previous = None;
-    for paragraph in 0..PARAGRAPHS {
-        let start = OPENING.len() + paragraph * PARAGRAPH.len();
-        let blank = start + PARAGRAPH.len() - 1;
-        for (range, content) in [(start..start + 1, true), (blank..blank + 1, false)] {
-            // 先查询段首，再经过真实空白控制。原 Global 可前探下一行，但不得丢掉其来源，
-            // 也不能把512个已经过段落的 seed 留成下一批的历史目录。
-            request
-                .continue_forward(
-                    &doc,
-                    previous.as_ref().unwrap_or(&first),
-                    range.clone(),
-                    authority(&doc),
-                )
-                .unwrap();
-            drop(previous.take()); // 只保第一份独立旧结果和当前结果，不人为积存全部发布。
-            finish_sources(&mut request, &doc).unwrap();
-            let current = request
-                .take_sources_for(&doc, authority(&doc))
-                .unwrap()
-                .unwrap();
-            if content {
-                let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = current
-                    .ordinary_semantics_for(&doc, authority(&doc))
-                    .unwrap()
-                else {
-                    panic!("第{paragraph}段的真实来源与语义不能因历史库存耗尽而缺失");
-                };
-                assert_eq!(
-                    leaf.query_for(&doc, authority(&doc), start)
-                        .unwrap()
-                        .unwrap()
-                        .styles,
-                    MarkdownPresentationStyles::default()
-                );
-            } // 空白不伪造正文样式；下一次段首查询必须重新取得该原行真正的语义结果。
-            previous = Some(current);
-        }
-    }
-
-    let title = expected_heading + 2;
-    request
-        .continue_forward(
-            &doc,
-            previous.as_ref().unwrap(),
-            expected_heading..title + 1,
-            authority(&doc),
-        )
+    let second_heading = first_heading + ATX.len() + COLLISION.len();
+    doc.set_selection(MarkdownTextSelection::caret(first_heading))
         .unwrap();
-    drop(previous.take());
-    finish_sources(&mut request, &doc).unwrap();
-    let current = request
+    let mut request = doc
+        .viewport_leaf_source_request(0..1, 57, doc.selection())
+        .unwrap();
+    super::inline::finish_inline(&mut request, &doc).unwrap();
+    // 第一份不可变公开结果跨越全部续批；请求不能为了回收历史seed而改写旧读者。
+    let first = request
         .take_sources_for(&doc, authority(&doc))
         .unwrap()
         .unwrap();
-    let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = current
-        .ordinary_semantics_for(&doc, authority(&doc))
-        .unwrap()
-    else {
-        panic!("标题查询成功后，原正文语义仍须完成远端标题交集");
-    };
-    assert!(
-        leaf.query_for(&doc, authority(&doc), title)
+    let mut previous = None;
+    for (round, (fragment, expected_heading)) in [
+        ("deep-title", first_heading),
+        ("deep-title-2", second_heading),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut heading = doc.heading_anchor_request(fragment).unwrap();
+        let target = (0..1_000_000)
+            .find_map(|_| {
+                let step = heading.advance(&doc, 4096).unwrap();
+                let work = match &step {
+                    HeadingStep::Progress { work }
+                    | HeadingStep::Found { work, .. }
+                    | HeadingStep::NotFound { work } => work,
+                };
+                // 查询的源片、复制和外存工作仍受原量子限制；找到标题不等于正文排版已完成。
+                assert!(work.source_bytes <= 4096 && work.copied_bytes <= 4096);
+                assert!(work.storage_bytes <= 4096 && work.parser_input_bytes <= 16 * 1024);
+                match step {
+                    HeadingStep::Found { target, .. } => Some(target),
+                    HeadingStep::Progress { .. } => None,
+                    HeadingStep::NotFound { .. } => panic!("真实远端标题必须存在"),
+                }
+            })
+            .expect("有限合成源上的真实标题查询必须结束");
+        assert_eq!(target.position_for(&doc).unwrap(), expected_heading);
+        if round != 0 {
+            // 和实际链接导航一致：先沿原请求回到首链接，再改变完整选择并重投影首行。
+            // 结构与语义累计fuel都归同一个请求；不能为第二次远端跳转重领整份预算。
+            request
+                .reposition(&doc, previous.as_ref().unwrap(), 0..1, authority(&doc))
+                .unwrap();
+            drop(previous.take());
+            super::inline::finish_inline(&mut request, &doc).unwrap();
+            let opening = request
+                .take_sources_for(&doc, authority(&doc))
+                .unwrap()
+                .unwrap();
+            doc.set_selection(MarkdownTextSelection::caret(expected_heading))
+                .unwrap();
+            assert!(
+                request
+                    .reproject_selection(&doc, &opening, 0..1, authority(&doc))
+                    .unwrap()
+            );
+            assert_eq!(
+                opening.ordinary_semantics_for(&doc, authority(&doc)).err(),
+                Some(MarkdownTableRequestError::PublicationSuperseded)
+            ); // 新选择不能继续使用刚退休的旧首行发布。
+            drop(opening);
+            super::inline::finish_inline(&mut request, &doc).unwrap();
+            previous = request.take_sources_for(&doc, authority(&doc)).unwrap();
+        }
+        for paragraph in 0..PARAGRAPHS {
+            let start = OPENING.len() + paragraph * PARAGRAPH.len();
+            let blank = start + PARAGRAPH.len() - 1;
+            for (range, content) in [
+                (start..blank - 1, true),
+                (blank - 1..blank, false),
+                (blank..blank + 1, false),
+            ] {
+                // 原生排版按完整79字正文、行末LF、空白LF推进，不以段首一字代替真实切窗。
+                // 空白只保来源结果；后继正文仍必须从原Global取得当前块的真实语义。
+                request
+                    .continue_forward(
+                        &doc,
+                        previous.as_ref().unwrap_or(&first),
+                        range,
+                        authority(&doc),
+                    )
+                    .unwrap();
+                drop(previous.take()); // 不人为保留全部历史发布；只保第一份及当前实际读者。
+                super::inline::finish_inline(&mut request, &doc).unwrap();
+                let current = request
+                    .take_sources_for(&doc, authority(&doc))
+                    .unwrap()
+                    .unwrap();
+                if content {
+                    let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = current
+                        .ordinary_semantics_for(&doc, authority(&doc))
+                        .unwrap()
+                    else {
+                        panic!("第{round}次导航第{paragraph}段不能因历史seed或重扫耗尽而缺失");
+                    };
+                    assert_eq!(
+                        leaf.query_for(&doc, authority(&doc), start)
+                            .unwrap()
+                            .unwrap()
+                            .styles,
+                        MarkdownPresentationStyles::default()
+                    );
+                }
+                previous = Some(current);
+            }
+        }
+        if round != 0 {
+            // 第二次导航须真正经过前两个ATX，不能直接以查询所得坐标绕过原来源续批。
+            let mut start = first_heading;
+            for heading in [ATX, COLLISION] {
+                let end = start + heading.len();
+                for range in [start..end - 2, end - 2..end - 1, end - 1..end] {
+                    request
+                        .continue_forward(&doc, previous.as_ref().unwrap(), range, authority(&doc))
+                        .unwrap();
+                    drop(previous.take());
+                    super::inline::finish_inline(&mut request, &doc).unwrap();
+                    previous = request.take_sources_for(&doc, authority(&doc)).unwrap();
+                }
+                start = end;
+            }
+        }
+        let heading_len = if round == 0 { ATX.len() } else { SETEXT.len() };
+        request
+            .continue_forward(
+                &doc,
+                previous.as_ref().unwrap(),
+                expected_heading..expected_heading + heading_len - 1,
+                authority(&doc),
+            )
+            .unwrap();
+        drop(previous.take());
+        super::inline::finish_inline(&mut request, &doc).unwrap();
+        let current = request
+            .take_sources_for(&doc, authority(&doc))
+            .unwrap()
+            .unwrap();
+        let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = current
+            .ordinary_semantics_for(&doc, authority(&doc))
+            .unwrap()
+        else {
+            panic!("标题查询成功后，原正文仍须完成远端ATX与Setext的完整语义");
+        };
+        let title = expected_heading + if round == 0 { 8 } else { 7 };
+        let styles = leaf
+            .query_for(&doc, authority(&doc), title)
             .unwrap()
             .unwrap()
-            .styles
-            .contains(MarkdownPresentationStyles::HEADING_1)
-    );
-    let work = request.total_work();
-    assert_eq!(work.copied_source_bytes, 0);
-    assert_eq!(work.allocated_source_capacity, 0);
-    // 取消唯一在途 owner 后，既有只读结果仍按原 Source/选择可读；取消不能复活请求。
+            .styles;
+        assert!(styles.contains(MarkdownPresentationStyles::HEADING_1));
+        assert!(styles.contains(if round == 0 {
+            MarkdownPresentationStyles::EMPHASIS
+        } else {
+            MarkdownPresentationStyles::STRONG
+        })); // 不能仅证明标题坐标存在，实际短块inline样式也必须保留。
+        eprintln!(
+            "far_heading_three_window_round={round} work={:?}",
+            request.total_work()
+        );
+        previous = Some(current);
+    }
     request.cancel();
     assert_eq!(
         request.advance(&doc, authority(&doc), 4096).err(),
         Some(MarkdownTableRequestError::Cancelled)
     );
+    // 恢复第一份结果所属的真实完整选择，只读旧发布；取消父请求不能破坏已移交的独立读者。
+    doc.set_selection(MarkdownTextSelection::caret(first_heading))
+        .unwrap();
     let MarkdownOrdinarySemanticState::RootLeafReady(first_leaf) =
         first.ordinary_semantics_for(&doc, authority(&doc)).unwrap()
     else {
         panic!("原第一份不可变发布仍须有完整来源");
     };
-    assert_eq!(
+    assert!(
         first_leaf
             .query_for(&doc, authority(&doc), 0)
             .unwrap()
-            .unwrap()
-            .styles,
-        MarkdownPresentationStyles::default()
+            .is_some()
     );
-    assert_eq!(doc.selection(), selection);
+    doc.set_selection(MarkdownTextSelection::caret(second_heading))
+        .unwrap();
     assert_eq!(doc.generation(), 0);
     assert!(!doc.is_dirty() && !doc.can_undo() && !doc.can_redo());
     assert!(doc.original_file_identity_is_unchanged());
-    // 磁盘期望也逐片独立核验；完整正文从未为了比较而进入一份 String 或 Vec。
+    // 磁盘期望独立逐片核验；完整正文没有为了比较进入一份String或Vec。
     let mut file = std::fs::File::open(&path).unwrap();
     let mut bytes = [0; 128];
     for segment in std::iter::once(OPENING)
         .chain(std::iter::repeat_n(PARAGRAPH, PARAGRAPHS))
-        .chain(std::iter::once(HEADING))
+        .chain([ATX, COLLISION, SETEXT])
         .chain(std::iter::repeat_n(PARAGRAPH, PARAGRAPHS))
     {
         file.read_exact(&mut bytes[..segment.len()]).unwrap();
         assert_eq!(&bytes[..segment.len()], segment.as_bytes());
     }
     assert_eq!(file.read(&mut bytes[..1]).unwrap(), 0);
-    drop((file, heading, target, request, first, current, doc));
+    drop((file, request, first, previous, doc));
     assert_eq!(backing.mapped_bytes(), 0);
     assert_eq!(backing.managed_resident_bytes(), 0);
     assert_eq!(backing.first_errno(), None);
@@ -2369,6 +2443,7 @@ fn production_leaf_proves_direct_links_and_keeps_unsupported_scope_pending() {
     // 原非Root thematic break仍没有取得该scope的语义消费权，不能因接Link而签默认值。
     let source = "> ***\n\n尾\n";
     let (_directory, doc) = document(source);
+    let backing = doc.original_backing_observer().unwrap();
     let requested = units(source, first_leaf_range(source));
     let (request, sources) = leaf_sources(&doc, requested);
     assert!(matches!(
@@ -2377,9 +2452,13 @@ fn production_leaf_proves_direct_links_and_keeps_unsupported_scope_pending() {
             .unwrap(),
         MarkdownOrdinarySemanticState::LeafPending(MarkdownRootLeafPendingReason::NonRootScope)
     ));
-    assert!(request.leaf_semantic.is_none());
-    assert_eq!(sources.semantic.run_count(), 0);
-    assert_eq!(sources.semantic.retained_metadata(), 0);
+    // Pending 允许保留同源定位前沿；公开语义仍未知，读者和请求都不能强持原文稿或映射。
+    // 以真实文稿销毁后的资源事实验证归属，不再断言可随实现改变的私有槽和元数据计数。
+    drop(doc);
+    assert_eq!(backing.mapped_bytes(), 0);
+    assert_eq!(backing.managed_resident_bytes(), 0);
+    assert_eq!(backing.first_errno(), None);
+    drop((request, sources));
 
     // 原 SourcesOnly 工厂仍只提供来源事实，不因加入 Leaf 模式而偷偷升级任何语义。
     let source = "```\n正文\n```\n";

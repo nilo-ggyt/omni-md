@@ -470,7 +470,7 @@ pub(super) struct RootLeafSemanticJob {
 }
 
 impl RootLeafSemanticJob {
-    /// Pending发布或逆向重定位真正释放固定续体时归账；Ready移交不虚报一次Drop。
+    /// 逆向重定位等真正释放固定续体时归账；Ready与Pending移交均不虚报一次Drop。
     pub(super) fn completed_owner_drop_control() -> usize {
         // publish已计量清候选并移走输出；这里只遍历空run目录和两组小页目录，不再虚付256个候选。
         CONTROL + PAGE_COUNT + 2 * LEAF_PAGE_COUNT
@@ -773,6 +773,22 @@ impl RootLeafSemanticJob {
                 self.phase = Phase::NextLeaf; // 完整来源只结束收集；下一量子才开始第一份真实Leaf证明。
             }
             Phase::NextLeaf => {
+                if self.candidate_index == self.candidates.len
+                    && let Some(underline) = self.underline.as_mut()
+                {
+                    if underline
+                        .ready_pairs_for(document)
+                        .map_err(MarkdownTableRequestError::Window)?
+                        .is_none()
+                    {
+                        // 空LF没有Leaf消费者，但ResumeUnderline已为它打开原扫描事务。
+                        // 必须沿同一Global逐量子完成，不能把未Ready的owner交回后让下窗
+                        // 因无法续读而丢弃，再从文首重复扫描所有已处理段落。
+                        return self.advance_underline(document, global, budget);
+                    }
+                    // 无覆盖发布同样结束原inline文件事务；关闭失败沿原请求首因返回。
+                    underline.close_inline_stack()?;
+                }
                 work = self.begin_next_leaf(document, limits, ordinary)?;
             }
             Phase::Scope => {
@@ -939,21 +955,7 @@ impl RootLeafSemanticJob {
                         self.phase = Phase::Build;
                     } else {
                         // 未完成时只推进原有请求的有限 frame；不重建上下文，也不循环等到 Ready。
-                        let measured = underline.advance(
-                            document,
-                            global.ok_or(MarkdownTableRequestError::InvalidRequest)?,
-                            budget - CONTROL,
-                        )?;
-                        work.source_bytes = measured.source_bytes + measured.global_source_bytes;
-                        work.utf8_validation_bytes = measured.utf8_validation_bytes;
-                        work.source_tree_steps =
-                            measured.source_tree_steps + measured.global_source_tree_steps;
-                        work.structural_transitions += measured.structural_transitions;
-                        work.copied_source_bytes = measured.copied_source_bytes;
-                        work.metadata_bytes = measured.metadata_bytes;
-                        work.normalizer_input_bytes = measured.normalizer_input_bytes;
-                        work.parser_input_bytes = measured.parser_input_bytes;
-                        work.allocated_source_capacity = measured.allocated_source_capacity;
+                        work = self.advance_underline(document, global, budget)?;
                     }
                 } else {
                     // 与table/Plain共享原唯一underline工作区；必须先准入再创建context/pair库存。
@@ -1097,6 +1099,31 @@ impl RootLeafSemanticJob {
             Phase::Published => return Err(MarkdownTableRequestError::InvalidRequest),
         }
         Ok(work)
+    }
+
+    /// 普通Leaf与无覆盖终结共用原唯一事务；每次只推进一次，全部真实工作归父batch。
+    fn advance_underline(
+        &mut self,
+        document: &MarkdownDocumentBuffer,
+        global: Option<&mut GlobalFrontier>,
+        budget: usize,
+    ) -> Result<SemanticWork, MarkdownTableRequestError> {
+        let measured = self.underline.as_mut().unwrap().advance(
+            document,
+            global.ok_or(MarkdownTableRequestError::InvalidRequest)?,
+            budget - CONTROL,
+        )?;
+        Ok(SemanticWork {
+            source_bytes: measured.source_bytes + measured.global_source_bytes,
+            utf8_validation_bytes: measured.utf8_validation_bytes,
+            source_tree_steps: measured.source_tree_steps + measured.global_source_tree_steps,
+            structural_transitions: CONTROL + measured.structural_transitions,
+            copied_source_bytes: measured.copied_source_bytes,
+            metadata_bytes: measured.metadata_bytes,
+            normalizer_input_bytes: measured.normalizer_input_bytes,
+            parser_input_bytes: measured.parser_input_bytes,
+            allocated_source_capacity: measured.allocated_source_capacity,
+        })
     }
 
     /// 冷窗口的四个端点共用原4096量子，不把每次树定位、短scalar或发布坐标拆成一轮主队列。
@@ -1712,9 +1739,7 @@ impl RootLeafSemanticJob {
             structural_transitions: CONTROL
                 + 2 * PAGE_COUNT
                 + 2 * LEAF_PAGE_COUNT
-                + self.candidates.len
-                // 空覆盖没有可续Ready；父发布Pending后实际归还固定owner，先在此预付其Drop。
-                + usize::from(self.coverage.len == 0) * Self::completed_owner_drop_control(),
+                + self.candidates.len,
             metadata_bytes: if self.coverage.len != 0 {
                 std::mem::size_of::<VerifiedMarkdownRootLeafViewport>()
             } else {

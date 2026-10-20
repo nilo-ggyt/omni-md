@@ -865,8 +865,9 @@ impl MarkdownViewportSourceRequest {
             self.source_underline = job.return_underline();
             match published {
                 RootLeafSemanticPublication::Pending(reason) => {
-                    // 未知语义不保停车owner；publication_work已包含本次真实固定析构费用。
-                    self.leaf_semantic = None;
+                    // Pending只表示本窗没有可发布语义，不撤同源/完整选择下的已证坐标。
+                    // 原唯一job已移走输出且进入Published；后继仍须认证自己的范围与来源，
+                    // 不能因每个空LF都丢掉小片前沿，再从同一片首重解下一段的UTF8前缀。
                     MarkdownOrdinarySemanticState::LeafPending(reason)
                 }
                 RootLeafSemanticPublication::Ready(ready) => {
