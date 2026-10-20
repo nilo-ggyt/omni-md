@@ -71,21 +71,30 @@ pub(super) fn capture_han(
     Ok(units)
 }
 
-/// 每次只用 4 KiB 栈缓冲核完整原文；原文首字为 X，其余为中，插入值来自同次实际提交。
-pub(super) fn verify(
-    document: &Weak<RefCell<MarkdownDocumentBuffer>>,
-    inserted: &[u16],
-) -> Result<(), String> {
-    let document = document.upgrade().ok_or("流式核对的原文稿已释放")?;
-    let document = document.borrow();
+/// 原四 MiB 与有限实际汉字共同决定精确字节数；磁盘映射上限与流式核对消费同一事实。
+/// UTF-16 只解码这次提交，不读取或复制原前后缀；半个代理项不能形成合法保存预期。
+pub(super) fn expected_bytes(inserted: &[u16]) -> Result<usize, String> {
     let bytes =
         char::decode_utf16(inserted.iter().copied()).try_fold(0usize, |total, scalar| {
             scalar
                 .map(|value| total + value.len_utf8())
                 .map_err(|_| "实际汉字提交不是完整字符")
         })?;
+    ORIGINAL_BYTES
+        .checked_add(bytes)
+        .ok_or_else(|| "实际汉字保存长度超出可表示范围".into())
+}
+
+/// 每次只用 4 KiB 栈缓冲核完整原文；原文首字为 X，其余为中，插入值来自同次实际提交。
+pub(super) fn verify(
+    document: &Weak<RefCell<MarkdownDocumentBuffer>>,
+    inserted: &[u16],
+) -> Result<(), String> {
+    let expected_bytes = expected_bytes(inserted)?;
+    let document = document.upgrade().ok_or("流式核对的原文稿已释放")?;
+    let document = document.borrow();
     if document.utf16_len() != ORIGINAL_UTF16 + inserted.len()
-        || document.byte_len() != ORIGINAL_BYTES + bytes
+        || document.byte_len() != expected_bytes
     {
         return Err("实际提交后的原文长度不符".into());
     }

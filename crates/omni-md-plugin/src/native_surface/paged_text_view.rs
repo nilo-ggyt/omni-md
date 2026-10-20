@@ -612,11 +612,10 @@ define_class!(
                 Err(NativeMarkdownPagedTextViewError::Pending) => self.composition_screen_rect(range),
                 result => result,
             };
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            eprintln!("native_ime_rect requested={range:?} resolved={}", result.is_ok());
             match result {
                 Ok(value) => {
-                    // SAFETY: 仅成功的同源scene结果写出实际范围，不伪造输入候选坐标。
+                    // SAFETY: 只写当前 Scene 的真实范围，或当前组合输入原起点的空 caret 范围；
+                    // 后者只给候选框定位，不能冒充尚未完成的新字形布局。
                     unsafe { write_actual(actual, value.actual_range); }
                     value.rect
                 }

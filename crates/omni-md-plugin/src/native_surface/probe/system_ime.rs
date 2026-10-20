@@ -30,6 +30,7 @@ pub enum NativeMarkdownHostedImeStep {
     VerifyTarget,
     BeginInput,
     VerifyCommit,
+    VerifyCommitSave,
     VerifyUndo,
     VerifyRedo,
     VerifyRestoreSave,
@@ -41,6 +42,7 @@ impl NativeMarkdownHostedImeStep {
         Self::VerifyTarget,
         Self::BeginInput,
         Self::VerifyCommit,
+        Self::VerifyCommitSave,
         Self::VerifyUndo,
         Self::VerifyRedo,
         Self::VerifyRestoreSave,
@@ -85,6 +87,13 @@ struct Frame {
     signal: ProbeTerminalObserver,
 }
 
+/// 同一次系统提交的完整输入后态与至多 128 字节汉字；不保原文、映射或 Native 客户。
+/// 保存前后必须仍是这张后态，不能从后来内容相同的输入重新领取一次提交证明。
+struct HanCommit {
+    input: NativeMarkdownPagedInputState,
+    units: Vec<u16>,
+}
+
 impl NativeMarkdownPagedBodyPaintObserver for Frame {
     fn frame_published(&self, key: &NativeMarkdownPagedSceneKey, paints: usize) {
         *self.key.borrow_mut() = Some((key.clone(), paints));
@@ -104,7 +113,7 @@ pub struct NativeMarkdownHostedImeProbe {
     frame: RefCell<Option<Rc<Frame>>>,
     target: RefCell<Option<NativeMarkdownPagedBodySourceTarget>>,
     composition: RefCell<Option<Rc<Composition>>>,
-    committed: RefCell<Option<Vec<u16>>>,
+    committed: RefCell<Option<HanCommit>>,
     completed: Cell<bool>,
 }
 
@@ -191,13 +200,19 @@ impl NativeMarkdownHostedImeProbe {
         let key = view
             .capture_ready_scene_key()
             .map_err(|cause| cause.to_string())?;
-        if view.cpu_paint_pending() != Some(false) {
-            return Err("中文验收原 CPU 尚未完成".into());
+        let (actual, paints) = view
+            .probe_cpu_published_frame()
+            .ok_or("中文验收原 CPU 尚未发布")?;
+        if !actual.same(&key)
+            || view.cpu_paints() != Some(paints)
+            || view.cpu_paint_pending() != Some(false)
+        {
+            return Err("中文验收原 Ready 与实际 CPU 完整帧不一致".into());
         }
         if let Some(frame) = self.frame.borrow_mut().take() {
             let published = frame.key.borrow();
             let (original, paints) = published.as_ref().ok_or("中文验收未收到原完整帧通知")?;
-            if !original.same(&key) || view.cpu_paints() != Some(*paints) {
+            if !original.same(&actual) || view.cpu_paints() != Some(*paints) {
                 return Err("中文验收完整帧被后继输入或几何替换".into());
             }
         }
@@ -260,15 +275,40 @@ impl NativeMarkdownHostedImeProbe {
                 observer,
             );
         }
-        if step == NativeMarkdownHostedImeStep::VerifyOpen && self.frame.borrow().is_none() {
+        if matches!(
+            step,
+            NativeMarkdownHostedImeStep::VerifyOpen | NativeMarkdownHostedImeStep::VerifyCommitSave
+        ) && self.frame.borrow().is_none()
+        {
             let (body, view) = self.current()?;
-            if let Ok(key) = view.capture_ready_scene_key()
+            if step == NativeMarkdownHostedImeStep::VerifyCommitSave {
+                let expected = self
+                    .committed
+                    .borrow()
+                    .as_ref()
+                    .map(|commit| commit.input)
+                    .ok_or("保存观察缺少原实际汉字提交")?;
+                if view.input_state().map_err(|cause| cause.to_string())? != expected {
+                    return Err("保存观察前原实际汉字输入后态已被替换".into());
+                }
+            }
+            // 系统提交通知可以早于真实 CPU 完成；只接纳同一原客户已经完成的帧，
+            // 否则订阅它下一次真实发布。Source 或资源错误不能伪装成普通等帧。
+            let ready = match view.capture_ready_scene_key() {
+                Ok(key) => Some(key),
+                Err(crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Pending) => None,
+                Err(cause) => return Err(cause.to_string()),
+            };
+            if let Some(key) = ready
+                && let Some((published, paints)) = view.probe_cpu_published_frame()
+                && published.same(&key)
+                && view.cpu_paints() == Some(paints)
                 && view.cpu_paint_pending() == Some(false)
-                && let Some(paints) = view.cpu_paints()
             {
-                // 初次已经实际发布时仍保存这张原票，排队期间的新输入不能换一张 Ready 补签。
+                // Ready 可能早于 CPU 候选建立；必须取得实际 published key，不能把
+                // 旧像素的计数配到新 Scene。排队期间的新输入也不能替原帧补签。
                 *self.frame.borrow_mut() = Some(Rc::new(Frame {
-                    key: RefCell::new(Some((key, paints))),
+                    key: RefCell::new(Some((published, paints))),
                     signal: ProbeTerminalObserver::default(),
                 }));
                 return Ok(true);
@@ -366,7 +406,35 @@ impl NativeMarkdownHostedImeProbe {
                     .take()
                     .ok_or("原系统组合不存在")?;
                 let actual = composition.finish()?;
-                self.verify_history(&view, &actual)?;
+                self.verify_history(&view, &actual.units)?;
+                if view.input_state().map_err(|cause| cause.to_string())? != actual.input {
+                    return Err("实际中文提交后态在保存前已经被替换".into());
+                }
+                *self.committed.borrow_mut() = Some(actual);
+                // 本步只接系统提交收据。下一步先等这一提交的完整 CPU，再实际保存；
+                // 不在组合回调内写盘，也不抢在保存验证之前撤销唯一汉字输入。
+            }
+            NativeMarkdownHostedImeStep::VerifyCommitSave => {
+                let actual = self
+                    .committed
+                    .borrow_mut()
+                    .take()
+                    .ok_or("保存缺少原实际汉字提交")?;
+                self.verify_history(&view, &actual.units)?;
+                if view.input_state().map_err(|cause| cause.to_string())? != actual.input {
+                    return Err("实际中文保存前原完整输入后态已撤销".into());
+                }
+                // 实际提交保存在局部 owner，结束槽借用后才进入产品保存及其 Native 回调。
+                // 重新映射磁盘并逐块核原前缀、这次实际汉字和原后缀，不能只核保存返回值。
+                with_active_native_markdown_surface(|surface| surface.save_current_document())?;
+                self.verify_disk(&actual.units)?;
+                if view.input_state().map_err(|cause| cause.to_string())? != actual.input {
+                    return Err("实际中文保存后原完整输入后态已被替换".into());
+                }
+                println!(
+                    "system_ime stage=committed_save actual_han=true exact_prefix_suffix=true reopened_mmap=true saved=true inserted_utf16_units={}",
+                    actual.units.len()
+                );
                 *self.committed.borrow_mut() = Some(actual);
                 self.arm_frame(&body)?;
                 view.command(sel!(undo:))
@@ -380,7 +448,10 @@ impl NativeMarkdownHostedImeProbe {
             }
             NativeMarkdownHostedImeStep::VerifyRedo => {
                 let committed = self.committed.borrow();
-                self.verify_history(&view, committed.as_deref().ok_or("原实际汉字收据丢失")?)?;
+                self.verify_history(
+                    &view,
+                    &committed.as_ref().ok_or("原实际汉字收据丢失")?.units,
+                )?;
                 drop(committed);
                 self.arm_frame(&body)?;
                 view.command(sel!(undo:))
@@ -397,10 +468,10 @@ impl NativeMarkdownHostedImeProbe {
                     return Err("真实中文撤销没有恢复原光标".into());
                 }
                 with_active_native_markdown_surface(|surface| surface.save_current_document())?;
-                self.verify_disk()?;
+                self.verify_disk(&[])?;
                 self.completed.set(true);
                 println!(
-                    "system_ime stage=hosted_result passed=true actual_han=true visible_candidate_near_caret=true exact_four_mebibytes=true undo_redo_restore=true saved=true viewport_lazy=true input_source_selected=false physical_keyboard=false"
+                    "system_ime stage=hosted_result passed=true actual_han=true visible_candidate_near_caret=true committed_save_reopened=true exact_four_mebibytes=true undo_redo_restore=true saved=true viewport_lazy=true input_source_selected=false physical_keyboard=false"
                 );
             }
         }
@@ -409,12 +480,15 @@ impl NativeMarkdownHostedImeProbe {
     }
 
     /// 打开的是合成文件；保存后重新映射并逐块核对，不读取用户库或构造整篇字符串。
-    fn verify_disk(&self) -> Result<(), String> {
+    fn verify_disk(&self, inserted: &[u16]) -> Result<(), String> {
+        // 新映射的上限来自这次有限实际提交的精确 UTF-8 长度；不能仍用原四 MiB
+        // 上限拒绝正确的汉字保存，也不为验收放开任意文件大小或建立整篇副本。
+        let expected_bytes = validation::expected_bytes(inserted)?;
         let saved = Rc::new(RefCell::new(
-            MarkdownDocumentBuffer::open(&self.path, 4 * 1024 * 1024)
+            MarkdownDocumentBuffer::open(&self.path, expected_bytes as u64)
                 .map_err(|_| "无法重新映射保存后的合成原文")?,
         ));
-        validation::verify(&Rc::downgrade(&saved), &[])
+        validation::verify(&Rc::downgrade(&saved), inserted)
     }
 
     /// 原成功末端或失败收尾均只调用产品既有返回动作，不能关闭后来的会话。
@@ -438,7 +512,7 @@ impl NativeMarkdownHostedImeProbe {
         if !self.completed.get() {
             return Err("中文验收尚未完成候选、历史和保存".into());
         }
-        self.verify_disk()
+        self.verify_disk(&[])
     }
 }
 
@@ -453,7 +527,7 @@ struct Composition {
     focus: RefCell<Option<FocusNotifications>>,
     timer: RefCell<Option<Retained<NSTimer>>>,
     marked: Cell<bool>,
-    result: RefCell<Option<Result<Vec<u16>, String>>>,
+    result: RefCell<Option<Result<HanCommit, String>>>,
     signal: ProbeTerminalObserver,
 }
 
@@ -571,7 +645,7 @@ impl Composition {
     }
 
     /// 首个实际成功或失败保留，清理产生的组合回调不能改写这次结局。
-    fn complete(&self, result: Result<Vec<u16>, String>) {
+    fn complete(&self, result: Result<HanCommit, String>) {
         if self.result.borrow().is_some() {
             return;
         }
@@ -583,7 +657,7 @@ impl Composition {
     }
 
     /// 先固定原候选终点，再撤通知、按键和 context；清理成功不能覆盖实际组合失败。
-    fn finish(&self) -> Result<Vec<u16>, String> {
+    fn finish(&self) -> Result<HanCommit, String> {
         let result = self
             .result
             .borrow_mut()
@@ -634,7 +708,12 @@ impl NativeMarkdownPagedBodyInputObserver for Composition {
         let result = if Instant::now() >= driver.deadline {
             Err("实际中文提交超过原期限".into())
         } else {
-            validation::capture_han(&self.document, &self.body, commit).map_err(str::to_owned)
+            validation::capture_han(&self.document, &self.body, commit)
+                .map(|units| HanCommit {
+                    input: commit.state,
+                    units,
+                })
+                .map_err(str::to_owned)
         };
         self.complete(result);
     }
