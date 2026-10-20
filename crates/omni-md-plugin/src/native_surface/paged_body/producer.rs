@@ -2448,8 +2448,9 @@ impl Producer {
             // 回退字体探针仅允许原有限切片；过大请求不得退回整格字符串测量。
             return Err(Error::Unsupported);
         }
-        let fonts = owner.fonts.borrow().clone();
-        let base = &fonts[semantic_base];
+        // 本次只使用一个真实 Base；取出该 Rc 就结束 palette 借用，不为每个样式请求
+        // 复制整份 Vec 或延长无关字体的强生命期。原 Base 仍贯穿后续校验和 Native 试次。
+        let base = Rc::clone(&owner.fonts.borrow()[semantic_base]);
         // continuation 属于 Core 的当前整形段，不是语义字体偏好的替代品。
         // 后继完整 GCB 按同一语义 Base、系统 for_string、系统级联顺序真实试字；
         // Base 再次可用时返回它，才能保留中英混排中的空格宽度与原始换行位置。
@@ -2459,7 +2460,7 @@ impl Producer {
         // probe 的前后 Source/scope 校验仍在原 capture 内；命中后下方 ticket.require 会重新
         // 完整核 Native 几何，未命中后的 fallback 也继续逐 Native 步守原票，不跨重入复用权限。
         let (read, key) =
-            super::font_choice::FontChoiceKey::capture(&probe, &selection.style, base, &|| {
+            super::font_choice::FontChoiceKey::capture(&probe, &selection.style, &base, &|| {
                 ticket.pure_current(owner, &self.source)
             });
         // 有限 key 的读取同样属于真实工作；Source、取消或 scope 后验失败也不能把已读量抹成零。
@@ -2478,7 +2479,7 @@ impl Producer {
             ticket.require(owner, &self.source)?;
             probe.validate()?;
             let response =
-                selected_font_response(owner, &layout_source, request, selection, base, &font)?;
+                selected_font_response(owner, &layout_source, request, selection, &base, &font)?;
             self.layout_composer(target).provide_style(response)?;
             // 命中没有worker事件；调用方或在原剩余额度内续一次Core，或按原Grid/语义边界调度。
             // 此返回只带本次实际读取，不持原probe/Selection/响应，更不能冒充后台试次结果。
@@ -2587,8 +2588,9 @@ impl Producer {
             0
         };
         ticket.require(owner, &self.source)?;
-        let fonts = owner.fonts.borrow().clone();
-        let font = &fonts[index];
+        // 控制项同样只需原选定字体；Rc 独立保活到响应交回，RefCell 借用不跨后续调用。
+        // palette 的其余字体继续由原 Body 拥有，无需为这个控制项另建临时 Vec。
+        let font = Rc::clone(&owner.fonts.borrow()[index]);
         let mut response = request.clone().respond(
             font.registered(),
             font.native().point_size() as f32,

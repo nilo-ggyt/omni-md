@@ -28,12 +28,23 @@ enum Pending {
 struct Leaf {
     piece: MarkdownPiece,
     utf16: usize,
+    end: usize,
     byte: usize,
     source_byte: usize,
     pending: [u8; 4],
     used: usize,
     needed: usize,
     previous: Option<(usize, usize)>,
+}
+
+/// 仅来自已完成的真实 scalar 解码；不保 lease、正文或尚未认证的 UTF8 残余。
+struct ScalarPoint {
+    piece: MarkdownPiece,
+    utf16: usize,
+    // 同一次命中叶的全局末端；不能按 UTF8 byte 差推测剩余 UTF16 范围。
+    end: usize,
+    byte: usize,
+    source_byte: usize,
 }
 
 /// 只保原冻结树的路径与一个scalar残余；Weak标记原Frozen身份，不增加正文或Reader owner。
@@ -51,6 +62,9 @@ pub(crate) struct FrozenBidiParagraphCursor {
     end_byte: usize,
     content_end: usize,
     seek: Seek,
+    // 原 B 段已就绪后，只认证新的前进端点；段范围和这个点均出自本游标的同次查询。
+    boundary_only: bool,
+    forward: Option<ScalarPoint>,
 }
 
 pub(crate) struct FrozenBidiParagraphStep {
@@ -85,6 +99,8 @@ impl FrozenBidiParagraphCursor {
                 end_byte: metrics.byte_len,
                 content_end: metrics.utf16_len,
                 seek: Seek::Complete,
+                boundary_only: false,
+                forward: None,
             };
         }
         let metrics = piece_tree_metrics(&snapshot.text.root);
@@ -101,6 +117,8 @@ impl FrozenBidiParagraphCursor {
             end_byte: metrics.byte_len,
             content_end: metrics.utf16_len,
             seek: Seek::Boundary,
+            boundary_only: false,
+            forward: None,
         };
         // 每字符都只占一个UTF16单位时任意整数端点均合法；否则沿同树验证命中scalar。
         if position == 0
@@ -116,6 +134,76 @@ impl FrozenBidiParagraphCursor {
 
     pub(crate) fn position(&self) -> usize {
         self.position
+    }
+
+    /// 仅在本游标真实交付 Ready 后由拥有者移交；投影没有 canonical 前进点证明，原路释放。
+    pub(crate) fn into_forward_range(self) -> Option<Self> {
+        #[cfg(feature = "s2-table-window-prototype")]
+        if self.projection.is_some() {
+            return None;
+        }
+        Some(self)
+    }
+
+    /// 同 Frozen、同 B 段的向前请求只续算标量边界；范围覆盖本身不能授权代理项内部。
+    /// 后退、在途、另一段与显示投影不借用这个点，仍由调用方创建原冷游标。
+    pub(crate) fn advance_position(
+        &mut self,
+        snapshot: &MarkdownTextSnapshot,
+        position: usize,
+    ) -> Result<bool, MarkdownDocumentBufferError> {
+        snapshot.text.source_health()?;
+        if !std::sync::Weak::ptr_eq(&self.origin, &Arc::downgrade(&snapshot.text)) {
+            return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
+        }
+        #[cfg(feature = "s2-table-window-prototype")]
+        if self.projection.is_some() {
+            return Ok(false); // 投影的输出目录与 canonical piece 不共享此端点证明。
+        }
+        if self.seek != Seek::Complete
+            || position <= self.position
+            || !(self.start..self.end).contains(&position)
+        {
+            return Ok(false);
+        }
+        // 已封闭的同段范围保持不变；这里只更换尚未交付的新位置，未验证前没有 Ready。
+        self.position = position;
+        self.boundary_only = true;
+        if let Some(point) = &self.forward
+            && point.utf16 < position
+            && position <= point.end
+        {
+            // 只从原已认证点顺读同叶剩余字节；跨叶仍支付原树路径与命中叶的 Boundary 量子。
+            self.pending.clear();
+            self.seek = Seek::Boundary;
+            self.pending.push(Pending::Leaf(Leaf {
+                piece: point.piece.clone(),
+                utf16: point.utf16,
+                end: point.end,
+                byte: point.byte,
+                source_byte: point.source_byte,
+                pending: [0; 4],
+                used: 0,
+                needed: 0,
+                previous: None,
+            }));
+        } else {
+            self.restart(Seek::Boundary);
+        }
+        snapshot.text.source_health()?;
+        Ok(true)
+    }
+
+    fn finish_boundary(&mut self, point: ScalarPoint) {
+        self.forward = Some(point);
+        if self.boundary_only {
+            // 新点与旧 B 两端属于同一不可变 Frozen；无需再次 Previous/Next 扫描端点叶。
+            self.pending.clear();
+            self.seek = Seek::Complete;
+        } else {
+            // 冷查询只认证了这个 scalar，仍须完成原 B 范围定位才可对外交付。
+            self.restart(Seek::Previous);
+        }
     }
 
     fn restart(&mut self, seek: Seek) {
@@ -194,13 +282,26 @@ impl FrozenBidiParagraphCursor {
                 let mut found = None;
                 let mut failure = None;
                 if self.seek == Seek::Boundary && leaf.utf16 == self.position {
-                    self.restart(Seek::Previous);
+                    self.finish_boundary(ScalarPoint {
+                        piece: leaf.piece,
+                        utf16: leaf.utf16,
+                        end: leaf.end,
+                        byte: leaf.byte,
+                        source_byte: leaf.source_byte,
+                    });
                     continue; // 叶首原本就是scalar边界，无需借正文重新证明。
                 }
-                let count = (maximum_bytes - step.bytes)
+                let mut count = (maximum_bytes - step.bytes)
                     .min(maximum_scalars - step.scalars)
                     .min(crate::MARKDOWN_LAYOUT_SOURCE_BYTES)
                     .min(leaf.piece.byte_len - leaf.byte);
+                if self.seek == Seek::Boundary && self.boundary_only {
+                    // 每 UTF16 单位最多三个 UTF8 字节。只借到目标附近，避免每个小 GCB
+                    // 虽少解码却反复借满整个量子；低代理项仍必须读完真实 scalar 才能拒绝。
+                    count = count.min(
+                        (self.position - leaf.utf16).min(crate::MARKDOWN_LAYOUT_SOURCE_BYTES) * 3,
+                    );
+                }
                 let bytes = snapshot
                     .text
                     .piece_range_bytes(&leaf.piece, leaf.byte..leaf.byte + count)?;
@@ -235,9 +336,17 @@ impl FrozenBidiParagraphCursor {
                     step.scalars += 1;
                     let end = leaf.utf16 + scalar.len_utf16();
                     if self.seek == Seek::Boundary {
-                        if self.position < end {
+                        if self.position <= end {
                             complete = true;
-                            found = Some(self.position == leaf.utf16);
+                            let valid = self.position == leaf.utf16 || self.position == end;
+                            // lease 可以预读到目标之后，保存点仍严格对应目标的已认证 byte，
+                            // 不能把预读量或刚解码出的 scalar 末端移交给另一个 UTF16 位置。
+                            let byte = if self.position == leaf.utf16 {
+                                leaf.byte - leaf.used
+                            } else {
+                                leaf.byte
+                            };
+                            found = Some((valid, byte));
                         }
                     } else if UnicodeBidiData.bidi_class(scalar) == BidiClass::B {
                         if self.seek == Seek::Previous && leaf.utf16 < self.position {
@@ -263,13 +372,26 @@ impl FrozenBidiParagraphCursor {
                 if let Some(error) = failure {
                     return Err(error);
                 }
-                if let Some(valid) = found {
+                if let Some((valid, byte)) = found {
                     if !valid {
                         return Err(MarkdownDocumentBufferError::NotUnicodeBoundary);
                     }
-                    self.restart(Seek::Previous);
+                    // lease.finish 与原 Source 健康核验已经完成，才保留这个实际解码端点。
+                    self.finish_boundary(ScalarPoint {
+                        piece: leaf.piece,
+                        utf16: self.position,
+                        end: leaf.end,
+                        byte,
+                        source_byte: leaf.source_byte,
+                    });
                 } else if self.seek == Seek::Boundary && leaf.utf16 == self.position {
-                    self.restart(Seek::Previous);
+                    self.finish_boundary(ScalarPoint {
+                        piece: leaf.piece,
+                        utf16: leaf.utf16,
+                        end: leaf.end,
+                        byte: leaf.byte,
+                        source_byte: leaf.source_byte,
+                    });
                 } else if self.seek == Seek::Next && complete {
                     self.seek = Seek::Complete;
                 } else if complete || leaf.byte == leaf.piece.byte_len {
@@ -351,6 +473,7 @@ impl FrozenBidiParagraphCursor {
                             self.pending.push(Pending::Leaf(Leaf {
                                 piece: piece.clone(),
                                 utf16: base,
+                                end: base + piece.metrics.utf16_len,
                                 byte: 0,
                                 source_byte,
                                 pending: [0; 4],
@@ -441,6 +564,7 @@ impl FrozenBidiParagraphCursor {
                                 metrics,
                             },
                             utf16: start,
+                            end: start + metrics.utf16_len,
                             byte: 0,
                             source_byte: source_start,
                             pending: [0; 4],
@@ -454,6 +578,7 @@ impl FrozenBidiParagraphCursor {
             }
         }
         if self.seek == Seek::Complete {
+            self.pending.clear(); // 就绪后仅保原 root、单点与单段事实，不保已经用完的遍历路径。
             step.range = Some(self.start..self.end);
             step.byte_range = Some(self.start_byte..self.end_byte);
             step.content_end = self.content_end;
