@@ -126,7 +126,13 @@ impl NativeMarkdownComposedViewport {
                                     &mut cursor.native_draw_returned,
                                     current,
                                 )?;
-                                cursor.cursor = Decoration::BackgroundPart { line, part: 0 };
+                                // 原行收费及块背景已完成；封存事实证明全部 part 都无代码底色
+                                // 时直接前进。只跳过零绘制循环，不用行框猜测任何字形墨迹。
+                                cursor.cursor = if actual.has_inline_code_background {
+                                    Decoration::BackgroundPart { line, part: 0 }
+                                } else {
+                                    Decoration::BackgroundLine(line + 1)
+                                };
                             } else {
                                 cursor.cursor = Decoration::BackgroundLine(line + 1);
                             }
@@ -423,11 +429,7 @@ impl NativeMarkdownComposedViewport {
         // 原part已经绑定真实字体与来源，这里只判断这一项是否有代码底色面积。
         // 零advance不造占位矩形；隐藏marker也不能借INLINE_CODE位着色。
         let facts = part.handle.facts();
-        let styles = facts.presentation;
-        if styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER)
-            || !styles.contains(MarkdownPresentationStyles::INLINE_CODE)
-            || facts.x_advance_26_6 == 0
-        {
+        if !part.has_inline_code_background() {
             return Ok(()); // 隐藏语法、硬分隔和零宽字符都没有可绘制的代码底色面积。
         }
         self.require(current)?;

@@ -8,7 +8,8 @@ use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use omni_markdown_core::{
     MARKDOWN_LINE_FONT_SLOTS, MarkdownComposedLine, MarkdownComposedLinePart,
     MarkdownComposedLines, MarkdownLayoutTextAuthority, MarkdownLineComposeError,
-    MarkdownLineFontRegistration, MarkdownPresentationMode, MarkdownTableCellDisplaySource,
+    MarkdownLineFontRegistration, MarkdownPresentationMode, MarkdownPresentationStyles,
+    MarkdownTableCellDisplaySource,
 };
 
 use super::{
@@ -80,6 +81,21 @@ struct Part {
     handle: MarkdownComposedLinePart,
     font: usize,
 }
+
+impl Part {
+    /// 代码背景有面积的原精确谓词；准备和实际绘制共用，不由字形墨迹或相邻样式推断。
+    fn has_inline_code_background(&self) -> bool {
+        let facts = self.handle.facts();
+        !facts
+            .presentation
+            .contains(MarkdownPresentationStyles::HIDDEN_MARKER)
+            && facts
+                .presentation
+                .contains(MarkdownPresentationStyles::INLINE_CODE)
+            && facts.x_advance_26_6 != 0
+    }
+}
+
 /// 每个实际使用的 Font 只保同输出的原弱注册票；同名或另一 catalog 的活 Font 不能代替它续权。
 struct FontUse {
     index: usize,
@@ -89,6 +105,9 @@ struct FontUse {
 struct Line {
     handle: MarkdownComposedLine,
     parts: Vec<Part>,
+    // 与同一封存 parts 共生命周期；false 证明逐 part 背景循环不会产生任何像素。
+    // 不保存正文、字形或额外资源，也不代替行块背景与后继 Source/Font 健康门。
+    has_inline_code_background: bool,
     frame: NSRect,
     baseline: CGPoint,
     ascent: f64,
@@ -300,6 +319,7 @@ impl NativeMarkdownComposedViewport {
                 return Err(NativeMarkdownComposedViewportError::InvalidCoverage);
             } // 真实表格块行只存在于正文 flow，不能进入 Source 字面路径或另一个格的局部布局。
             let mut prepared = Vec::with_capacity(handle.facts().parts);
+            let mut has_inline_code_background = false;
             let glyphs_before = glyphs;
             let mut metrics =
                 super::preview_paragraph::PreviewLineMetrics::new(key.presentation_mode);
@@ -369,7 +389,11 @@ impl NativeMarkdownComposedViewport {
                 glyphs = glyphs
                     .checked_add(part.facts().glyphs)
                     .ok_or(NativeMarkdownComposedViewportError::InvalidGeometry)?;
-                prepared.push(Part { handle: part, font });
+                let part = Part { handle: part, font };
+                // 顺带消费本次已经认证的原 part 事实，不为后继每个 tile 再扫普通文字。
+                // 负 advance 仍可能有背景面积，零 advance 和隐藏标记严格沿实际绘制谓词。
+                has_inline_code_background |= part.has_inline_code_background();
+                prepared.push(part);
             }
             if glyphs.checked_sub(glyphs_before) != Some(handle.facts().glyphs) {
                 return Err(NativeMarkdownComposedViewportError::InvalidCoverage);
@@ -430,6 +454,7 @@ impl NativeMarkdownComposedViewport {
             lines.push(Line {
                 handle,
                 parts: prepared,
+                has_inline_code_background,
                 frame,
                 baseline,
                 ascent,
