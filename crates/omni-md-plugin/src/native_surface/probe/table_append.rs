@@ -211,6 +211,340 @@ struct FindReplacementQueuedButton {
     before_intent: u64,
     after_intent: u64,
     before_input: NativeMarkdownPagedInputState,
+    paint: Rc<FindButtonPaint>,
+}
+
+/// 四次具体 Find 鼠标动作的完成收据；kind 和点击前后唯一 intent 标识原动作，
+/// 不冒充生产 FindRevealRequest。跨事件仅保弱拥有者及原输入标量，不延长 Native/Source 生命周期。
+struct FindButtonPaint {
+    weak: std::rc::Weak<Self>,
+    controller: Weak<NativeMarkdownController>,
+    view: Weak<NativeMarkdownPagedTextView>,
+    facts: AppendFacts,
+    bar: std::rc::Weak<NativeMarkdownFindBar>,
+    route: Option<(usize, u64)>,
+    action: MarkdownFindAction,
+    terminal_step: NativeMarkdownHostedTableStep,
+    before_intent: u64,
+    after_intent: u64,
+    before_input: NativeMarkdownPagedInputState,
+    generation: u64,
+    selection: MarkdownTextSelection,
+    utf16_len: usize,
+    started: Instant,
+    down: Weak<objc2_app_kit::NSEvent>,
+    window_number: isize,
+    dispatched: Cell<bool>,
+    action_returned: Cell<bool>,
+    terminal: RefCell<Option<Result<(NativeMarkdownPagedSceneKey, usize), String>>>,
+    observer: terminal::ProbeTerminalObserver,
+}
+
+impl FindButtonPaint {
+    /// 原 controller/bar/客户路由与原 Body/Doc/View 缺一即撤权；不从当前窗口重采新拥有者。
+    fn current(&self, surface: &NativeMarkdownWindowSurface) -> bool {
+        let Some(controller) = self.controller.load() else {
+            return false;
+        };
+        std::ptr::eq(&*controller, &*surface.controller)
+            && std::ptr::from_ref(&*controller).addr() == self.facts.owner
+            && native_markdown_controller_has_foreground_authority(&controller)
+            && controller
+                .ivars()
+                .field_editor_provider
+                .current_input_client_identity()
+                == self.route
+            && surface.editor.as_ref().is_some_and(|editor| {
+                std::rc::Weak::ptr_eq(&self.facts.body, &Rc::downgrade(&editor.body))
+                    && WeakMarkdownDocument::ptr_eq(
+                        &self.facts.document,
+                        &Rc::downgrade(editor.document()),
+                    )
+                    && editor.presentation_mode() == MarkdownPresentationMode::InlinePreview
+                    && self
+                        .view
+                        .load()
+                        .is_some_and(|view| std::ptr::eq(&*view, &**editor.text_view))
+                    && editor
+                        .find_bar
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|bar| std::rc::Weak::ptr_eq(&self.bar, &Rc::downgrade(bar)))
+            })
+    }
+
+    /// 早于原动作的真实帧只能等下一次真实发布；这里不交付旧帧、不触发绘制，也不重发输入。
+    fn rearm(&self) -> Result<(), String> {
+        let body = self.facts.body.upgrade().ok_or("Find 原 Body 已释放")?;
+        let observer: Rc<dyn NativeMarkdownPagedBodyPaintObserver> =
+            self.weak.upgrade().ok_or("Find 原帧观察已释放")?;
+        body.observe_next_cpu_frame(Rc::downgrade(&observer))
+            .map_err(|cause| cause.to_string())
+    }
+
+    /// 通知只授予下一验证事件排队权；该事件仍须消费当时保存的同一完整 CPU 帧。
+    fn completed(&self) -> Result<(), String> {
+        if !self.dispatched.get() || !self.action_returned.get() {
+            return Err("原 Find 鼠标派发或正式 action 尚未返回".into());
+        }
+        let (key, paints) = self
+            .terminal
+            .borrow()
+            .clone()
+            .ok_or("原 Find 按钮尚未到达真实 CPU 终点")??;
+        with_active_native_markdown_surface(|surface| {
+            if !self.current(surface) || surface.controller.find_input_intent() != self.after_intent
+            {
+                return Err("原 Find 完成通知后的客户或意图已撤销".into());
+            }
+            let view = &surface
+                .editor
+                .as_ref()
+                .ok_or("原 Find 正文已释放")?
+                .text_view;
+            if view.input_state().map_err(|cause| cause.to_string())? != key.request.input
+                || !view
+                    .capture_ready_scene_key()
+                    .map_err(|cause| cause.to_string())?
+                    .same(&key)
+                || view
+                    .probe_cpu_published_frame()
+                    .is_none_or(|(actual, count)| !actual.same(&key) || count != paints)
+                || view.cpu_paints() != Some(paints)
+                || view.cpu_paint_pending() != Some(false)
+                || !self.current(surface)
+            {
+                return Err("原 Find CPU 终点已被后继发布替换".into());
+            }
+            Ok(())
+        })
+    }
+
+    /// 新帧和只读拒绝验证共用原后态契约；调用方决定是否必须有新的 CPU 发布。
+    fn check_frame(
+        &self,
+        key: &NativeMarkdownPagedSceneKey,
+        paints: usize,
+    ) -> Result<bool, String> {
+        with_active_native_markdown_surface(|surface| {
+            if !self.current(surface) {
+                return Err("Find 帧发布时原客户、栏或文稿已撤销".into());
+            }
+            let editor = surface.editor.as_ref().ok_or("Find 原正文已释放")?;
+            if let Some(cause) = editor.body.take_failure() {
+                return Err(format!("Find 原正文失败：{cause}"));
+            }
+            if let Some(cause) = editor.text_view.take_failure()
+                && !matches!(cause, crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Pending)
+            {
+                return Err(format!("Find 原输入失败：{cause}"));
+            }
+            // Source 健康错误先于等待分类；端点零只验证原存储，不读取正文或新建 Source。
+            editor
+                .document()
+                .borrow()
+                .byte_offset_for_utf16(0)
+                .map_err(|cause| cause.to_string())?;
+            let input = editor
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            let intent = surface.controller.find_input_intent();
+            if !WeakMarkdownDocument::ptr_eq(&key.request.document, &self.facts.document)
+                || !key.request.target.is_body(&self.facts.document)
+                || key.presentation_mode != MarkdownPresentationMode::InlinePreview
+                || key.request.input != input
+            {
+                return Err("Find 回调不是原 Doc 的当前完整 Input 帧".into());
+            }
+            if self.started.elapsed() > Duration::from_secs(3) {
+                return Err("原 Find 按钮没有在原三秒期限内发布目标帧".into());
+            }
+            if (intent == self.before_intent || intent == self.after_intent)
+                && input == self.before_input
+                && self.terminal_step
+                    != NativeMarkdownHostedTableStep::VerifyReplaceRejectedAndCommit
+            {
+                return Ok(false); // 本次动作尚未发布选择/编辑；只订阅下一真实帧，不把前态当完成。
+            }
+            if intent != self.after_intent {
+                return Err("Find 帧不属于原按钮唯一后继意图".into());
+            }
+            let range = NSRange::new(
+                self.selection.anchor_utf16,
+                self.selection.head_utf16 - self.selection.anchor_utf16,
+            );
+            let replacing =
+                self.terminal_step == NativeMarkdownHostedTableStep::VerifyReplacedAndUndo;
+            let rejected =
+                self.terminal_step == NativeMarkdownHostedTableStep::VerifyReplaceRejectedAndCommit;
+            let fold_revision = self
+                .before_input
+                .fold_revision
+                .checked_add(u64::from(replacing))
+                .ok_or("Find 原 fold 代次溢出")?;
+            if input.generation != self.generation
+                || input.selection != self.selection
+                || !input.selection_is_directed
+                || input.selection_range_count != 1
+                || input.primary_range != range
+                || input.marked != self.before_input.marked
+                || input.utf16_len != self.utf16_len
+                || input.fold_revision != fold_revision
+                || (rejected && input != self.before_input)
+                || input.selection_serial
+                    != self
+                        .before_input
+                        .selection_serial
+                        .checked_add(u64::from(!rejected))
+                        .ok_or("Find 原选择代次溢出")?
+            {
+                return Err("Find 完整 Input 不符合原按钮预声明的选择、编辑或拒绝后态".into());
+            }
+            {
+                let document = editor.document().borrow();
+                if document.generation() != self.generation
+                    || document.selection() != self.selection
+                    || document.utf16_len() != self.utf16_len
+                {
+                    return Err("Find CPU 输入与原 canonical 后态不一致".into());
+                }
+            }
+            if rejected {
+                if self.action != MarkdownFindAction::ReplaceNext {
+                    return Err("组合拒绝不属于原 ReplaceNext 按钮".into());
+                }
+                let current = || {
+                    self.current(surface)
+                        && surface.controller.find_input_intent() == self.after_intent
+                        && editor
+                            .text_view
+                            .input_state()
+                            .is_ok_and(|actual| actual == input)
+                };
+                let status = surface
+                    .controller
+                    .ivars()
+                    .status_label
+                    .get()
+                    .ok_or("原替换拒绝缺少状态控件")?;
+                if !step(&current, || {
+                    status
+                        .stringValue()
+                        .isEqualToString(ns_string!("请先完成当前输入法组合，再执行查找或替换"))
+                })? {
+                    return Ok(false); // 同一输入可有较早发布；仍须等真实拒绝反馈后的完整帧。
+                }
+            }
+            let view = &editor.text_view;
+            if editor.body.is_preparing()
+                || !view
+                    .capture_ready_scene_key()
+                    .map_err(|cause| cause.to_string())?
+                    .same(key)
+                || paints == 0
+                || view.cpu_paints() != Some(paints)
+                || view.cpu_paint_pending() != Some(false)
+                || view
+                    .probe_cpu_published_frame()
+                    .is_none_or(|(actual, count)| !actual.same(key) || count != paints)
+            {
+                return Err("Find 通知没有同一 Ready 和完整 CPU 发布终点".into());
+            }
+            view.verify_find_target_visible(key, range)
+                .map_err(|cause| cause.to_string())?;
+            if !self.current(surface)
+                || surface.controller.find_input_intent() != self.after_intent
+                || view.input_state().map_err(|cause| cause.to_string())? != input
+            {
+                return Err("Find 可见性 Native 查询后原完整输入已撤销".into());
+            }
+            Ok(true)
+        })
+    }
+
+    /// 仅在实际 Down 调用返回后，FIFO 排在原正式 action 之后执行一次。
+    /// 组合拒绝不改正文，没有新帧也能由真实 action 终点证明；其它动作仍必须等原新帧。
+    fn after_action(&self) {
+        let checked = with_active_native_markdown_surface(|surface| {
+            if !self.current(surface)
+                || surface.controller.find_input_intent() != self.after_intent
+                || self.started.elapsed() > Duration::from_secs(3)
+            {
+                return Err("原 Find action 返回后客户、唯一意图或三秒期限不符".into());
+            }
+            if self.terminal_step != NativeMarkdownHostedTableStep::VerifyReplaceRejectedAndCommit {
+                return Ok(None); // action 返回不等于像素完成，绝不能从当前旧图补一份新帧收据。
+            }
+            let editor = surface.editor.as_ref().ok_or("原 Find 拒绝正文已释放")?;
+            if editor
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?
+                != self.before_input
+            {
+                return Err("原组合拒绝改变了完整正文 Input".into());
+            }
+            let key = editor
+                .text_view
+                .capture_ready_scene_key()
+                .map_err(|cause| cause.to_string())?;
+            let (actual, paints) = editor
+                .text_view
+                .probe_cpu_published_frame()
+                .ok_or("原组合拒绝缺少实际完整 CPU 帧")?;
+            if !actual.same(&key) {
+                return Err("原组合拒绝的 Ready 与实际 CPU 不同".into());
+            }
+            Ok(Some((key, paints)))
+        });
+        // Active 租约结束后才复用真实帧验证，避免在一个 SurfaceLease 内递归借活窗口。
+        let checked = match checked {
+            Ok(Some((key, paints))) => match self.check_frame(&key, paints) {
+                Ok(true) => Some(Ok((key, paints))),
+                Ok(false) => Some(Err("原拒绝 action 返回后没有准确拒绝终态".into())),
+                Err(cause) => Some(Err(cause)),
+            },
+            Ok(None) => None,
+            Err(cause) => Some(Err(cause)),
+        };
+        if let Some(checked) = checked {
+            let mut terminal = self.terminal.borrow_mut();
+            // 原 CPU 首错优先保留；action 身份失败也不能被较早成功帧掩盖。
+            if terminal.as_ref().is_none_or(Result::is_ok) {
+                *terminal = Some(checked);
+            }
+        }
+        self.action_returned.set(true); // 最后才打开通知门，所有 Native 查询与 Active 租约已经结束。
+        self.notify_if_complete();
+    }
+
+    fn notify_if_complete(&self) {
+        let completed = self.action_returned.get() && self.terminal.borrow().is_some();
+        if completed {
+            self.observer.notify();
+        } // 不在 NSButton tracking 里发 Host 事件；两个真实边界都结束后才交付一次。
+    }
+}
+
+impl NativeMarkdownPagedBodyPaintObserver for FindButtonPaint {
+    fn frame_published(&self, key: &NativeMarkdownPagedSceneKey, paints: usize) {
+        if self.terminal.borrow().is_some() {
+            return; // 已写入的成功或失败都只交付一次，后继帧不能改写原动作结论。
+        }
+        let checked = match self.check_frame(key, paints) {
+            Ok(false) => match self.rearm() {
+                Ok(()) => return,
+                Err(cause) => Err(cause),
+            },
+            Ok(true) => Ok((key.clone(), paints)),
+            Err(cause) => Err(cause),
+        };
+        *self.terminal.borrow_mut() = Some(checked);
+        // 先归还 Active、Native claim 和全部 RefCell，再通知 Host；失败同样唤醒严格验证，
+        // 不吞首错或丢弃原 Host 信号，也不提前解除尚无终点的原三秒 deadline。
+        self.notify_if_complete();
+    }
 }
 
 /// 查找组合回归只跨事件保弱身份和预声明坐标；不保活栏、字段或共享 editor。
@@ -497,8 +831,8 @@ impl NativeMarkdownHostedTableProbe {
         }
     }
 
-    /// 只订阅上一真实冲突动作的原终点；已经完成的收据可同步交回，不能重新执行按钮。
-    /// 其它步骤自己沿原3秒客户/CPU观察结束，宿主仍在下一独立事件调用它们。
+    /// 只订阅上一原动作的真实终点；查找按钮同时等待原 Down/action 返回和精确 CPU 后态。
+    /// 已结束的成功或失败均可交回排队权，后继验证必须消费该结论，不能重新执行按钮。
     pub fn observe_step_terminal(
         &self,
         action: NativeMarkdownHostedTableStep,
@@ -507,6 +841,27 @@ impl NativeMarkdownHostedTableProbe {
         MainThreadMarker::new().ok_or("Hosted 表格终点必须在 AppKit 主线程")?;
         if !self.case.steps().contains(&action) {
             return Err("该表格场景不拥有此终点".into());
+        }
+        if matches!(
+            action,
+            NativeMarkdownHostedTableStep::VerifyFindNextAndPrevious
+                | NativeMarkdownHostedTableStep::VerifyFindPreviousAndRejectReplace
+                | NativeMarkdownHostedTableStep::VerifyReplaceRejectedAndCommit
+                | NativeMarkdownHostedTableStep::VerifyReplacedAndUndo
+        ) {
+            let paint = self
+                .find_replacement
+                .borrow()
+                .as_ref()
+                .and_then(|probe| probe.queued_button.as_ref())
+                .map(|button| Rc::clone(&button.paint))
+                .ok_or("Find 终点没有点击前固定的原动作")?;
+            if paint.terminal_step != action {
+                return Err("Find 终点不属于原按钮 kind 和唯一意图".into());
+            }
+            let completed =
+                (paint.action_returned.get() && paint.terminal.borrow().is_some()).then_some(true);
+            return paint.observer.observe(completed, observer);
         }
         if !matches!(
             action,
@@ -535,6 +890,46 @@ impl NativeMarkdownHostedTableProbe {
         }
         *operation.signal.borrow_mut() = Some(Box::new(observer));
         Ok(false)
+    }
+
+    /// 只由验收 NSApplication 的 super.sendEvent 原 Down 返回边界调用。
+    /// 同一 NSButton 已消费自己的 Up 并排出正式 action；同主队列的一次被动观察因此在其后，
+    /// 不接管 production target/selector，也不重发鼠标、执行查找或制造绘图。
+    pub fn did_dispatch_hosted_event(&self, event: &objc2_app_kit::NSEvent) -> Result<(), String> {
+        let mtm = MainThreadMarker::new().ok_or("Find 鼠标终点必须在 AppKit 主线程")?;
+        if event.r#type() != objc2_app_kit::NSEventType::LeftMouseDown {
+            return Ok(());
+        }
+        let paint = self
+            .find_replacement
+            .borrow()
+            .as_ref()
+            .and_then(|probe| probe.queued_button.as_ref())
+            .map(|button| Rc::clone(&button.paint));
+        let Some(paint) = paint else {
+            return Ok(()); // 其它表格/工具栏事件没有这个具体 Find 动作的后继权限。
+        };
+        let Some(down) = paint.down.load() else {
+            return Ok(());
+        };
+        if !std::ptr::eq(&*down, event) {
+            return Ok(());
+        }
+        if event.windowNumber() != paint.window_number {
+            return Err("原 Find Down 返回了不同窗口".into());
+        }
+        drop(down); // 精确事件只作弱身份比较，不跨主队列保活 Native event 或窗口。
+        if paint.dispatched.replace(true) {
+            return Err("原 Find Down 不能重复交付".into());
+        }
+        let weak = dispatch2::MainThreadBound::new(Rc::downgrade(&paint), mtm);
+        enqueue_native_markdown_main_task(move || {
+            let mtm = MainThreadMarker::new().expect("Find action 终点只在原主队列观察");
+            if let Some(paint) = weak.get(mtm).upgrade() {
+                paint.after_action();
+            }
+        });
+        Ok(())
     }
 
     fn facts(&self) -> Result<AppendFacts, String> {
@@ -1600,7 +1995,12 @@ impl NativeMarkdownHostedTableProbe {
                 action_started: Instant::now(),
             })
         })?;
-        self.click_find_replacement_button(&facts, &mut probe, MarkdownFindAction::Next)?;
+        self.click_find_replacement_button(
+            &facts,
+            &mut probe,
+            MarkdownFindAction::Next,
+            NativeMarkdownHostedTableStep::VerifyFindNextAndPrevious,
+        )?;
         self.find_replacement.replace(Some(probe));
         Ok(())
     }
@@ -1639,11 +2039,45 @@ impl NativeMarkdownHostedTableProbe {
         facts: &AppendFacts,
         probe: &mut FindReplacementProbeFacts,
         action: MarkdownFindAction,
+        terminal_step: NativeMarkdownHostedTableStep,
     ) -> Result<(), String> {
         if probe.queued_button.is_some() {
             return Err("原查找按钮尚未消费真实终点".into());
         }
-        let (events, before_input, mtm) = with_active_native_markdown_surface(|surface| {
+        let (generation, selection, utf16_len) = match (action, terminal_step) {
+            (
+                MarkdownFindAction::Next,
+                NativeMarkdownHostedTableStep::VerifyFindNextAndPrevious,
+            ) => (
+                facts.generation,
+                probe.first,
+                FIND_REPLACEMENT_BEFORE.encode_utf16().count(),
+            ),
+            (
+                MarkdownFindAction::Previous,
+                NativeMarkdownHostedTableStep::VerifyFindPreviousAndRejectReplace,
+            )
+            | (
+                MarkdownFindAction::ReplaceNext,
+                NativeMarkdownHostedTableStep::VerifyReplaceRejectedAndCommit,
+            ) => (
+                facts.generation,
+                probe.last,
+                FIND_REPLACEMENT_BEFORE.encode_utf16().count(),
+            ),
+            (
+                MarkdownFindAction::ReplaceNext,
+                NativeMarkdownHostedTableStep::VerifyReplacedAndUndo,
+            ) => (
+                facts.generation.checked_add(1).ok_or("替换目标代次溢出")?,
+                probe.first,
+                FIND_REPLACEMENT_AFTER.encode_utf16().count(),
+            ),
+            _ => return Err("原 Find kind 没有该预声明后态".into()),
+        };
+        let next = probe.intent.checked_add(1).ok_or("查找按钮意图溢出")?;
+        let started = Instant::now(); // 在任何排队和观察登记之前固定；后继不会重置原三秒。
+        let (events, before_input, paint, mtm) = with_active_native_markdown_surface(|surface| {
             let original = || {
                 self.find_replacement_current(surface, facts, probe, facts.generation, probe.intent)
             };
@@ -1667,16 +2101,60 @@ impl NativeMarkdownHostedTableProbe {
                 return Err("原查找按钮会夺取字段组合焦点".into());
             }
             let events = button_mouse::prepare(button, &surface.panel, &current)?;
-            Ok((events, input, surface.panel.mtm()))
+            let down = step(&current, || Weak::from_retained(&events[0]))?;
+            let window_number = step(&current, || events[0].windowNumber())?;
+            let view = step(&current, || {
+                Weak::from_retained(&surface.editor.as_ref().unwrap().text_view)
+            })?;
+            let controller = step(&current, || Weak::from_retained(&surface.controller))?;
+            let paint = Rc::new_cyclic(|weak| FindButtonPaint {
+                weak: weak.clone(),
+                controller,
+                view,
+                facts: facts.clone(),
+                bar: probe.bar.clone(),
+                route: probe.route,
+                action,
+                terminal_step,
+                before_intent: probe.intent,
+                after_intent: next,
+                before_input: input,
+                generation,
+                selection,
+                utf16_len,
+                started,
+                down,
+                window_number,
+                dispatched: Cell::new(false),
+                action_returned: Cell::new(false),
+                terminal: RefCell::new(None),
+                observer: terminal::ProbeTerminalObserver::default(),
+            });
+            if terminal_step != NativeMarkdownHostedTableStep::VerifyReplaceRejectedAndCommit {
+                // 真正选择/编辑在点击前订阅原下一完整帧；组合拒绝没有新像素义务，
+                // 它只走实际 action 返回后的同 Input/Ready/CPU 验证，不遗留空等帧观察槽。
+                let erased: Rc<dyn NativeMarkdownPagedBodyPaintObserver> = paint.clone();
+                surface
+                    .editor
+                    .as_ref()
+                    .unwrap()
+                    .body
+                    .observe_next_cpu_frame(Rc::downgrade(&erased))
+                    .map_err(|cause| cause.to_string())?;
+            }
+            if !current() {
+                return Err("登记 Find 原动作观察时完整 Input 已变化".into());
+            }
+            Ok((events, input, paint, surface.panel.mtm()))
         })?;
-        let next = probe.intent.checked_add(1).ok_or("查找按钮意图溢出")?;
-        probe.action_started = Instant::now(); // 入原 selector 前固定期限，不从后来 Ready 重置时钟。
+        probe.action_started = started;
         // 鼠标队列和正式controller工作都尚可未执行，下一Host事件与主GCD队列没有先后保证。
         // 保存原票允许精确前态暂等；预声明后态仍只有这次按钮应推进的一次意图。
         probe.queued_button = Some(FindReplacementQueuedButton {
             before_intent: probe.intent,
             after_intent: next,
             before_input,
+            paint,
         });
         button_mouse::post(events, mtm); // 原栏/按钮/Doc强claim均已退还，实际窗口负责命中与tracking。
         probe.intent = next;
@@ -1692,6 +2170,14 @@ impl NativeMarkdownHostedTableProbe {
         probe: &mut FindReplacementProbeFacts,
         stage: u8,
     ) -> Result<(), String> {
+        if stage <= 4 {
+            probe
+                .queued_button
+                .as_ref()
+                .ok_or("Find 原按钮收据已丢失")?
+                .paint
+                .completed()?;
+        } // Host 只有真实终点才能排此事件；这里不再用 runloop 等待补成一次按钮成功。
         let (before_delta, after_delta, expected) = match stage {
             1 => (0, 0, probe.first),
             2 | 3 => (0, 0, probe.last),
@@ -1811,6 +2297,9 @@ impl NativeMarkdownHostedTableProbe {
             if ready && probe.action_started.elapsed() <= Duration::from_secs(3) {
                 let _ = probe.queued_button.take(); // 只有原严格终点通过才消费前态，后继历史动作没有排队宽限。
                 return Ok(());
+            }
+            if stage <= 4 {
+                return Err("Find 原真实终点在后继验证前已撤销".into());
             }
             let remaining = Duration::from_secs(3)
                 .checked_sub(probe.action_started.elapsed())
@@ -1979,11 +2468,13 @@ impl NativeMarkdownHostedTableProbe {
                     &facts,
                     &mut probe,
                     MarkdownFindAction::Previous,
+                    NativeMarkdownHostedTableStep::VerifyFindPreviousAndRejectReplace,
                 ),
                 2 => self.click_find_replacement_button(
                     &facts,
                     &mut probe,
                     MarkdownFindAction::ReplaceNext,
+                    NativeMarkdownHostedTableStep::VerifyReplaceRejectedAndCommit,
                 ),
                 3 => {
                     with_active_native_markdown_surface(|surface| {
@@ -2018,6 +2509,7 @@ impl NativeMarkdownHostedTableProbe {
                         &facts,
                         &mut probe,
                         MarkdownFindAction::ReplaceNext,
+                        NativeMarkdownHostedTableStep::VerifyReplacedAndUndo,
                     )
                 }
                 4 => {
