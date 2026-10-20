@@ -188,6 +188,17 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
                 .filter(|children| children.len() == 1)
                 .map(|children| children.objectAtIndex(0))
                 .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
+            // 从已经完整显示的真实数组取得两个槽的弱身份；不借私有 slots 或强持
+            // 被替换的旧容器，否则会干扰后面的实际析构与 provider 释放证明。
+            let original_slots = {
+                let children = unsafe { original_group.sublayers() }
+                    .filter(|children| children.len() == 2)
+                    .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
+                [
+                    layer_weak(&children.objectAtIndex(0)),
+                    layer_weak(&children.objectAtIndex(1)),
+                ]
+            };
             let same = fixture_with_prior(
                 &mut source,
                 counters.clone(),
@@ -210,7 +221,6 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
                 children.len() == 1
                     && std::ptr::eq::<CALayer>(&*children.objectAtIndex(0), &*original_group)
             });
-            drop(original_group);
             weaks.extend(pool.weaks());
             let changed = fixture_with_prior(
                 &mut source,
@@ -229,6 +239,28 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
                 Some(&same_publication),
             )?;
             weaks.extend(pool.weaks());
+            // 同几何只有左格真实变色；右格除了 CGImage 相同，还必须保持原 Native
+            // 容器及 parent。整组重建虽然像素也能正确，仍不能满足本次资源复用契约。
+            let partial_group_same = unsafe { pool.mount().sublayers() }.is_some_and(|children| {
+                children.len() == 1
+                    && std::ptr::eq::<CALayer>(&*children.objectAtIndex(0), &*original_group)
+            });
+            let partial_slots = unsafe { original_group.sublayers() }
+                .filter(|children| children.len() == 2)
+                .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
+            let changed_slot = partial_slots.objectAtIndex(0);
+            let retained_slot = partial_slots.objectAtIndex(1);
+            let changed_slot_is_new = original_slots[0]
+                .load()
+                .is_none_or(|old| !std::ptr::eq::<AnyObject>(&*old, &*changed_slot as &AnyObject));
+            let retained_slot_same = original_slots[1]
+                .load()
+                .is_some_and(|old| std::ptr::eq::<AnyObject>(&*old, &*retained_slot as &AnyObject))
+                && retained_slot
+                    .superlayer()
+                    .as_deref()
+                    .is_some_and(|parent| std::ptr::eq::<CALayer>(parent, &*original_group));
+            drop((changed_slot, retained_slot, partial_slots, original_group));
             let left = &original.tiles[0];
             let equal = &same.tiles[0];
             let altered = &changed.tiles[0];
@@ -253,6 +285,9 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
                     .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?,
             );
             let valid = same_native_group
+                && partial_group_same
+                && changed_slot_is_new
+                && retained_slot_same
                 && same.reused_images == 2
                 && changed.reused_images == 1
                 && first_equal
@@ -260,7 +295,7 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
                 && first_changed
                 && second_changed;
             println!(
-                "paged_paired_reuse case={case:?} actual_same_tile_reuses={} actual_changed_tile_reuses={} actual_both_equal={first_equal}/{second_equal} actual_both_changed={first_changed}/{second_changed} actual_same_native_group={same_native_group} all_three_native_frames_pixel_exact=true shared_surface_calibration=true formal=false",
+                "paged_paired_reuse case={case:?} actual_same_tile_reuses={} actual_changed_tile_reuses={} actual_both_equal={first_equal}/{second_equal} actual_both_changed={first_changed}/{second_changed} actual_same_native_group={same_native_group} partial_group_same={partial_group_same} changed_slot_is_new={changed_slot_is_new} unchanged_native_slot_and_parent_same={retained_slot_same} all_three_native_frames_pixel_exact=true shared_surface_calibration=true formal=false",
                 same.reused_images, changed.reused_images
             );
             if !valid {
@@ -305,8 +340,19 @@ fn render_exact(
     let publication = match reused {
         Some(publication) => publication,
         None => {
-            let attempt = pool.attempt()?;
-            pool.publish(backing, frame, &attempt, bounds, 1.0, &|| true)?
+            let mut attempt = pool.attempt()?;
+            // 同一原前序先交生产部分发布；只有它明确没有适用资格才用完整双组路径。
+            // 任何实际替换后的错误直接返回，不能以完整重发覆盖部分提交的真实后果。
+            let partial = previous
+                .map(|previous| {
+                    pool.publish_partial(backing, frame, previous, &mut attempt, &|| true)
+                })
+                .transpose()?
+                .flatten();
+            match partial {
+                Some(publication) => publication,
+                None => pool.publish(backing, frame, &attempt, bounds, 1.0, &|| true)?,
+            }
         }
     };
     pool.validate(backing, &publication, &|| true)?;
@@ -316,6 +362,178 @@ fn render_exact(
         return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
     }
     Ok(publication)
+}
+
+/// 只有真实第一次槽替换发生后才由外方迁走 mount；清理必须保外方 parent，
+/// 同时归还这次已显示新槽、未变旧槽和未提交候选的全部原图像义务。
+fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
+    let counters = Arc::new(NativeMarkdownViewportPixels::default());
+    let observer = counters.observer();
+    let (passed, weaks) = autoreleasepool(|_| -> Result<_> {
+        let bounds = NSRect::new(NSPoint::ZERO, NSSize::new(WIDTH as f64, HEIGHT as f64));
+        let successor = CALayer::new();
+        successor.setFrame(bounds);
+        successor.setBounds(bounds);
+        let foreign_owner = layer_weak(&successor);
+        let (passed, weaks) = autoreleasepool(|_| -> Result<_> {
+            let mut source = Canvas::new()?;
+            let backing = CALayer::new();
+            backing.setFrame(bounds);
+            backing.setBounds(bounds);
+            let pool = LayerPool::new(&|| true)?;
+            backing.addSublayer(pool.mount());
+            let observed = RefCell::new(pool.weaks());
+            let backing_weak = layer_weak(&backing);
+            observed.borrow_mut().push(backing_weak);
+            let mut calibrations = Calibrations::default();
+            // 此布尔只记已观察到的真实模型图变化；不以调用次数或私有 serial 决定撤权阶段。
+            let actual_replacement_seen = Cell::new(false);
+            let result = (|| -> Result<bool> {
+                let original = fixture_with_prior(
+                    &mut source,
+                    counters.clone(),
+                    None,
+                    false,
+                    case,
+                    &mut calibrations,
+                )?;
+                let previous = render_exact(&pool, &backing, &original, &source, bounds, None)?;
+                let roles = pool.weaks();
+                observed.borrow_mut().extend(roles);
+                // 原图已通过完整像素对照；只从公开 Native 数组取得其原 group 和两格身份。
+                let group = unsafe { pool.mount().sublayers() }
+                    .filter(|children| children.len() == 1)
+                    .map(|children| children.objectAtIndex(0))
+                    .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
+                let original_slots = {
+                    let children = unsafe { group.sublayers() }
+                        .filter(|children| children.len() == 2)
+                        .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
+                    [
+                        layer_weak(&children.objectAtIndex(0)),
+                        layer_weak(&children.objectAtIndex(1)),
+                    ]
+                };
+                let changed = fixture_with_prior(
+                    &mut source,
+                    counters.clone(),
+                    Some(&original),
+                    true,
+                    case,
+                    &mut calibrations,
+                )?;
+                // 原 platform current 边界只看实际图。构造候选时左格仍旧，不触发迁移；
+                // 首个 replace 真正装入新左格且右格仍原样，才发生一次真实外方接管。
+                let current = || {
+                    if !parent_is(pool.mount(), &backing) {
+                        return false;
+                    }
+                    let children = unsafe { group.sublayers() };
+                    if !actual_replacement_seen.get()
+                        && let Some(children) = children.filter(|children| children.len() == 2)
+                    {
+                        let left = children.objectAtIndex(0);
+                        let right = children.objectAtIndex(1);
+                        let replaced = original_slots[0].load().is_none_or(|old| {
+                            !std::ptr::eq::<AnyObject>(&*old, &*left as &AnyObject)
+                        });
+                        let unchanged = original_slots[1].load().is_some_and(|old| {
+                            std::ptr::eq::<AnyObject>(&*old, &*right as &AnyObject)
+                        });
+                        if replaced && unchanged {
+                            // 先结束所有观察槽借用，再进入真正的 Native 迁移。额外登记
+                            // 实际已挂载新容器，不依赖内部 pending 是否正确参与 Weak 账本。
+                            let roles = pool.weaks();
+                            let actual_slot = layer_weak(&left);
+                            observed.borrow_mut().extend(roles);
+                            observed.borrow_mut().push(actual_slot);
+                            actual_replacement_seen.set(true);
+                            successor.addSublayer(pool.mount());
+                        }
+                    }
+                    parent_is(pool.mount(), &backing)
+                };
+                let mut attempt = pool.attempt()?;
+                let published =
+                    pool.publish_partial(&backing, &changed, &previous, &mut attempt, &current);
+                let rejected = matches!(published, Err(NativeMarkdownPagedTextViewError::Revoked));
+                let old_refused = matches!(
+                    pool.validate(&backing, &previous, &|| true),
+                    Err(NativeMarkdownPagedTextViewError::Revoked)
+                );
+                let foreign_preserved = parent_is(pool.mount(), &successor);
+                // 失败不是“从未提交”：真实外方树曾装入新槽。回滚后实际渲染必须不再
+                // 含任何旧/新正文像素，不能仅凭 Err 或本地清理标志声称资源已经归还。
+                let empty = Canvas::new()?;
+                empty.blue(bounds);
+                let rendered = Canvas::new()?;
+                rendered.blue(bounds);
+                successor.renderInContext(&rendered.context);
+                CGContext::flush(Some(&rendered.context));
+                let cleared_pixels = rendered.pixels == empty.pixels;
+                println!(
+                    "paged_partial_interrupted case={case:?} actual_replacement_seen={} actual_revoked={rejected} original_publication_rejected={old_refused} foreign_parent_preserved={foreign_preserved} actual_foreign_tree_empty_rgba={cleared_pixels} source_failure_claim=false formal=false",
+                    actual_replacement_seen.get(),
+                );
+                Ok(actual_replacement_seen.get()
+                    && rejected
+                    && old_refused
+                    && foreign_preserved
+                    && cleared_pixels)
+            })();
+            // 无论差分或构造在哪里失败，都走同一实际清理；外方 parent 不归本池拆除。
+            // 所有原/新 Frame 已退局部栈，不能用继续持图造成的 provider 占用放宽验收。
+            let detached = pool.detach(&backing);
+            let weaks = std::mem::take(&mut *observed.borrow_mut());
+            println!(
+                "paged_partial_interrupted case={case:?} actual_result={result:?} actual_detach_intact={detached} formal=false"
+            );
+            let passed = result.is_ok_and(|passed| passed) && !detached;
+            drop((calibrations, pool, backing, source));
+            CATransaction::flush();
+            Ok((passed, weaks))
+        })?;
+        // 原 owner 和 Native 临时数组先实际归还；保活 foreign 时检查全部 provider/
+        // mmap 及其它角色，防止误靠先销毁接管者释放被遗漏的业务图像。
+        CATransaction::flush();
+        let pixels_released = observer.is_released();
+        let original_mount = weaks[0].load();
+        let original_mount_alive = original_mount.is_some();
+        // 每次真实发布都可能再观察到同一个 mount；它由 foreign 保活是预期事实，
+        // 只按实际对象身份排除这一角色，不能把其它空图层的存活也一并豁免。
+        let other_roles_released = weaks.iter().all(|weak| {
+            weak.load().is_none_or(|actual| {
+                original_mount
+                    .as_deref()
+                    .is_some_and(|mount| std::ptr::eq::<AnyObject>(&*actual, mount))
+            })
+        });
+        let foreign_alive = foreign_owner.load().is_some();
+        println!(
+            "paged_partial_interrupted case={case:?} original_pixels_released_with_foreign_alive={pixels_released} original_mount_alive={original_mount_alive} foreign_owner_alive={foreign_alive} other_native_roles_released={other_roles_released} actual_pixels={:?} formal=false",
+            observer.snapshot(),
+        );
+        drop(original_mount); // 弱验收产生的临时 claim 不得阻止外方归还后的最终 nil 检查。
+        // 只有观察完原 owner 的归还后，外方才释放它自己接管的空 mount。
+        // SAFETY: successor 只属于本合成对照，None 不接管或删除任何产品 Native 关系。
+        unsafe { successor.setSublayers(None) };
+        drop(successor);
+        CATransaction::flush();
+        let foreign_released = foreign_owner.load().is_none();
+        Ok((
+            passed
+                && pixels_released
+                && original_mount_alive
+                && foreign_alive
+                && other_roles_released
+                && foreign_released,
+            weaks,
+        ))
+    })?;
+    if !passed || !weaks.iter().all(|weak| weak.load().is_none()) || !observer.is_released() {
+        return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -601,6 +819,7 @@ pub(super) fn run(_mtm: MainThreadMarker) -> Result<()> {
     for case in [PaletteCase::CoverageRamp, PaletteCase::GlyphColors] {
         // 两种实际合成顺序各走相同复用、外方修改与setter间隙撤权，不借另一模式的通过结果。
         paired_reuse(case)?;
+        interrupted_partial_publication(case)?;
         visible_graphs(case)?;
         interrupted_installations(case)?;
     }

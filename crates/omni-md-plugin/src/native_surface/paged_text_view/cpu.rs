@@ -547,21 +547,38 @@ impl CpuSurface {
                         .as_ref()
                         .and_then(|published| published.frame.borrow_mut().take());
                     drop(retired); // 原slot仍保旧可见图片；仅先归还frame cache，旧metadata/Ready到原提交点才换。
-                    drop(prior); // 即使别处短持Published，它的帧槽也已空，不拖旧provider到transaction之后。
                     let publication = match reused {
                         Some(publication) => Ok(publication),
-                        None => self.layers.publish(
-                            &self.layer,
-                            &completed.frame,
-                            &publication_use
-                                .as_ref()
+                        None => (|| {
+                            let attempt = &mut publication_use
+                                .as_mut()
                                 .expect("新图发布持有原补偿票")
-                                .attempt,
-                            completed.geometry.backing,
-                            completed.geometry.scale,
-                            &current,
-                        ),
+                                .attempt;
+                            // 部分变化同样是真实Native提交，必须先有原PublicationUse补偿票。
+                            // 旧帧像素槽已归还；只借当前发布的身份元数据，不持历史Scene或provider。
+                            if let Some(prior) = &prior
+                                && prior.geometry == completed.geometry
+                                && let Some(publication) = self.layers.publish_partial(
+                                    &self.layer,
+                                    &completed.frame,
+                                    &prior.publication,
+                                    attempt,
+                                    &current,
+                                )?
+                            {
+                                return Ok(publication);
+                            }
+                            self.layers.publish(
+                                &self.layer,
+                                &completed.frame,
+                                attempt,
+                                completed.geometry.backing,
+                                completed.geometry.scale,
+                                &current,
+                            )
+                        })(),
                     };
+                    drop(prior); // 真实Native结果先暂存；Source/Font首错仍由下方同一次validate裁决。
                     completed.validate(self, view)?; // Source首错先于Native撤权；不可给较新scene补签。
                     let publication = publication?;
                     self.layer_current(view, &current)?;

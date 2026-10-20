@@ -8,6 +8,7 @@ use objc2_core_graphics::CGImage;
 use objc2_foundation::NSSize;
 use objc2_quartz_core::{kCAContentsFormatGray8Uint, kCAContentsFormatRGBA8Uint, kCAGravityResize};
 
+mod partial;
 #[cfg(feature = "native-markdown-runtime-probe")]
 pub(super) mod probe;
 mod slot;
@@ -31,6 +32,9 @@ pub(super) struct Publication {
 struct LayerGroup {
     layer: Retained<CALayer>,
     slots: RefCell<Vec<Rc<slot::Slot>>>,
+    // 部分更新只暂存本次新建的变化槽；原完整slots在真实替换前保持不变。
+    // Native构造/安装可重入，关闭和Weak收据必须同样看见这份有限、唯一的资源拥有者。
+    pending: RefCell<Vec<Rc<slot::Slot>>>,
     retired: RefCell<Vec<Weak<AnyObject>>>,
     palette: slot::Palette,
 }
@@ -82,7 +86,8 @@ impl LayerPool {
             values.push(layer_weak(&group.layer));
             values.extend(group.retired.borrow().iter().cloned());
             let slots = group.slots.borrow().clone();
-            for slot in slots {
+            let pending = group.pending.borrow().clone();
+            for slot in slots.into_iter().chain(pending) {
                 slot.add_weaks(&mut values);
             }
         }
@@ -102,10 +107,15 @@ impl LayerPool {
     }
     /// 只撤销本次已经实际挂载、仍是原mount/group的图片；不能回滚成“从未提交”。
     pub(super) fn revoke_attempt(&self, attempt: &Attempt, backing: &CALayer) -> bool {
-        if !std::ptr::eq(attempt.pool, self)
-            || self.serial.get() != attempt.serial
-            || self.active.get() != Some(attempt.index)
-        {
+        if !std::ptr::eq(attempt.pool, self) || self.serial.get() != attempt.serial {
+            return false;
+        }
+        if self.active.get().is_none() {
+            // 同一真实后继serial已经由事务内补偿撤图；外层仍须退休旧Published元数据。
+            // serial只有Native提交后才推进，不能将未提交的候选或另一个后继误认成此事实。
+            return true;
+        }
+        if self.active.get() != Some(attempt.index) {
             return false;
         }
         let group = &self.groups[attempt.index];
@@ -437,14 +447,46 @@ impl LayerGroup {
         Ok(Self {
             layer,
             slots: RefCell::new(Vec::new()),
+            pending: RefCell::new(Vec::new()),
             retired: RefCell::new(Vec::new()),
             palette: slot::Palette::new(current)?,
         })
     }
     fn clear(&self) -> bool {
-        let mut intact = true;
         // 先移出有限槽，再发 Native 清理；关闭重入不会再次清同一槽或保留历史空层。
-        let slots = std::mem::take(&mut *self.slots.borrow_mut());
+        let mut slots = std::mem::take(&mut *self.slots.borrow_mut());
+        let pending = std::mem::take(&mut *self.pending.borrow_mut());
+        slots.extend(pending);
+        let mut intact = self.retire_slots(slots);
+        // 本组从不安装背景、mask、contents或delegate；外方后来设置的内容保持原样并拒绝复用。
+        // SAFETY: own slot已逐一移除；剩余children只能归属外方，不能清空整个数组夺走它们。
+        let contents = unsafe { self.layer.contents() };
+        // SAFETY: 同上，只读原标准图层的数组，不遍历外方对象或取得其资源权限。
+        let children = unsafe { self.layer.sublayers() };
+        intact &= contents.is_none()
+            && children.as_ref().is_none_or(|children| children.is_empty())
+            && !self.layer.isHidden()
+            && self.layer.opacity() == 1.0
+            && self.layer.zPosition() == 0.0
+            && self.layer.backgroundColor().is_none()
+            && self.layer.mask().is_none()
+            && self.layer.delegate().is_none();
+        intact // 没有本项目设置的layer delegate；外方后设delegate不属于本owner，不能擅自清理。
+    }
+
+    /// 失败前只归还尚未接管的变化槽；原完整画面和原published serial保持原样。
+    fn clear_pending(&self) -> bool {
+        let pending = std::mem::take(&mut *self.pending.borrow_mut());
+        if pending.is_empty() {
+            return true;
+        }
+        self.retire_slots(pending)
+    }
+
+    /// 完整退场和部分替换共用真实槽归还；先登记Weak，再清各自图片/颜色/父关系。
+    /// 传入值是已从本组拥有槽移出的唯一有限列表，不增加历史强引用或闲置角色池。
+    fn retire_slots(&self, slots: Vec<Rc<slot::Slot>>) -> bool {
+        let mut intact = true;
         let mut retired = std::mem::take(&mut *self.retired.borrow_mut());
         // 历史身份只保 Weak；框架或外方仍持空角色时，关闭收据仍须观察它的真实生命周期。
         objc2::rc::autoreleasepool(|_| retired.retain(|weak| weak.load().is_some()));
@@ -460,20 +502,7 @@ impl LayerGroup {
             intact &= slot.clear(&self.layer, &self.palette);
         }
         drop(slots); // 旧帧及缩窗淘汰的角色在本事务结束前归还，不成为闲置图层缓存。
-        // 本组从不安装背景、mask、contents或delegate；外方后来设置的内容保持原样并拒绝复用。
-        // SAFETY: 标准CALayer getter只核空值，不把外方opaque内容解引用为CGImage。
-        let contents = unsafe { self.layer.contents() };
-        // SAFETY: own slot已逐一移除；剩余children只能归属外方，不能清空整个数组夺走它们。
-        let children = unsafe { self.layer.sublayers() };
-        intact &= contents.is_none()
-            && children.as_ref().is_none_or(|children| children.is_empty())
-            && !self.layer.isHidden()
-            && self.layer.opacity() == 1.0
-            && self.layer.zPosition() == 0.0
-            && self.layer.backgroundColor().is_none()
-            && self.layer.mask().is_none()
-            && self.layer.delegate().is_none();
-        intact // 没有本项目设置的layer delegate；外方后设delegate不属于本owner，不能擅自清理。
+        intact
     }
 }
 

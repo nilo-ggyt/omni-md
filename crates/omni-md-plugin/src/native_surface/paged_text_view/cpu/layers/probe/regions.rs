@@ -203,7 +203,8 @@ fn render_exact(
     CGContext::flush(Some(&baseline.context));
     let rendered = Canvas::sized(REGION_WIDTH, REGION_HEIGHT)?;
     rendered.blue(bounds);
-    // 分区边界和尾列也沿同一生产准入；一像素变化必须回正常发布，不用复用结果作颜色 oracle。
+    // 分区边界和尾列也沿同一生产准入；只有真实相同槽才保留 Native 图，
+    // 单像素变化仍交生产部分发布，完整颜色结果继续由独立 RGBA 图决定。
     let reused = previous
         .map(|previous| pool.reuse_publication(backing, frame, previous, bounds, 1.0, &|| true))
         .transpose()?
@@ -211,8 +212,17 @@ fn render_exact(
     let publication = match reused {
         Some(publication) => publication,
         None => {
-            let attempt = pool.attempt()?;
-            pool.publish(backing, frame, &attempt, bounds, 1.0, &|| true)?
+            let mut attempt = pool.attempt()?;
+            let partial = previous
+                .map(|previous| {
+                    pool.publish_partial(backing, frame, previous, &mut attempt, &|| true)
+                })
+                .transpose()?
+                .flatten();
+            match partial {
+                Some(publication) => publication,
+                None => pool.publish(backing, frame, &attempt, bounds, 1.0, &|| true)?,
+            }
         }
     };
     pool.validate(backing, &publication, &|| true)?;
