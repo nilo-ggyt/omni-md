@@ -207,13 +207,19 @@ impl MemoryFrameObservation {
             return Err("CPU 帧原文稿或动作代次已撤销".into());
         }
         let paged = surface.editor.as_ref().ok_or("CPU 帧原分页客户已释放")?;
-        if paged.body.presentation_mode() != self.mode
-            || paged
-                .text_view
-                .input_state()
-                .map_err(|cause| cause.to_string())?
-                != self.input
-        {
+        let actual_mode = paged.body.presentation_mode();
+        let actual_input = paged
+            .text_view
+            .input_state()
+            .map_err(|cause| cause.to_string())?;
+        if actual_mode != self.mode || actual_input != self.input {
+            // 只在原终点拒绝处留下同一次读取的模式和输入元数据；不读正文、不另采样，
+            // 也不接纳后继输入替换原票。这样可区分模式、选择、组合或文稿代次的真实变化。
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            eprintln!(
+                "native_memory_frame_replaced expected_mode={:?} actual_mode={:?} expected_input={:?} actual_input={:?}",
+                self.mode, actual_mode, self.input, actual_input
+            );
             return Err("CPU 帧模式或完整 Input 已被后继动作替换".into());
         }
         let ready = match paged.text_view.capture_ready_scene_key() {
