@@ -16,6 +16,8 @@ pub(super) struct EncodedImage {
     pub presentation: PixelPresentation,
     pub storage: SealedPixels,
     pub secondary_storage: Option<SealedPixels>,
+    // 只记录本次已完成编码是否借回原活帧；不增长paint，也不为旧Scene延长权限。
+    pub reused_image: bool,
     #[cfg(test)]
     pub allocation: Arc<PixelAllocation>,
     #[cfg(test)]
@@ -438,11 +440,12 @@ pub(super) fn prepare(
     })
 }
 
+#[cfg(test)]
 pub(super) fn finish_prepared(
     prepared: PreparedImage,
     pairs: Option<&CertifiedMaskPairs>,
 ) -> Result<EncodedImage, PixelError> {
-    finish_with_allocations(prepared, pairs, None)
+    finish_with_allocations(prepared, pairs, None, None)
 }
 
 /// 私有子区先申请全部实际输出页；封存阶段不再申请页，也不把局部区域误退成整块RGBA。
@@ -479,22 +482,45 @@ fn finish_with_allocations(
     prepared: PreparedImage,
     pairs: Option<&CertifiedMaskPairs>,
     mut allocations: Option<OutputAllocations>,
+    prior: Option<&TileFrame>,
 ) -> Result<EncodedImage, PixelError> {
-    let encoded = finish_prepared_inner(prepared, pairs, &mut allocations)?;
+    let encoded = finish_prepared_inner(prepared, pairs, &mut allocations, prior)?;
     if allocations
         .as_ref()
         .is_some_and(|allocations| allocations.0.iter().any(Option::is_some))
     {
         return Err(PixelError::InvalidGeometry); // 多余输出页说明计划与实际格式不一致，不能隐藏未消费的claim。
     }
+    if encoded.reused_image && encoded.storage.release_failed() {
+        return Err(PixelError::Backend("等值候选像素页未能真实归还"));
+    } // 内层返回后新编码的所有局部Arc均已Drop；复用不能吞真实munmap失败。
     Ok(encoded)
 }
 
 fn finish_prepared_inner(
-    prepared: PreparedImage,
+    mut prepared: PreparedImage,
     pairs: Option<&CertifiedMaskPairs>,
     allocations: &mut Option<OutputAllocations>,
+    prior: Option<&TileFrame>,
 ) -> Result<EncodedImage, PixelError> {
+    drop(prepared.regions.take()); // 独立单块封存不需要分区摘要，进入CF构造前先归还这份纯metadata。
+    if pairs.is_some() && !matches!(&prepared.plan, Plan::Indexed(_)) {
+        return Err(PixelError::InvalidGeometry); // 透明、固色或中性原表示不能领用其他调色板的颜色票。
+    }
+    if let (Some(pairs), Plan::Indexed(palette)) = (pairs, &prepared.plan) {
+        let request = MaskPaletteRequest::new(&palette.colors[..palette.count])
+            .ok_or(PixelError::InvalidGeometry)?;
+        if !pairs.permits(&request) {
+            return Err(PixelError::InvalidGeometry); // 外调色板的颜色票不能签本瓦片，即使端点相同。
+        }
+        if let Some(encoded) = encode_paired(&prepared, pairs, allocations, prior)? {
+            drop(prepared);
+            if encoded.storage.release_failed() {
+                return Err(PixelError::Backend("双遮罩原RGBA未能真实归还"));
+            }
+            return Ok(encoded);
+        } // 只有额外像素页预算不足允许保原Indexed/RGBA；真实释放/构造失败仍返回原错误。
+    }
     let PreparedImage {
         original,
         width,
@@ -502,40 +528,24 @@ fn finish_prepared_inner(
         row_bytes,
         first_row,
         plan,
-        regions,
+        regions: _,
         #[cfg(test)]
             observed_pixels: _,
     } = prepared;
-    drop(regions); // 独立单块封存不需要分区摘要，进入CF构造前先归还这份纯metadata。
-    if pairs.is_some() && !matches!(&plan, Plan::Indexed(_)) {
-        return Err(PixelError::InvalidGeometry); // 透明、固色或中性原表示不能领用其他调色板的颜色票。
-    }
-    if let (Some(pairs), Plan::Indexed(palette)) = (pairs, &plan) {
-        let request = MaskPaletteRequest::new(&palette.colors[..palette.count])
-            .ok_or(PixelError::InvalidGeometry)?;
-        if !pairs.permits(&request) {
-            return Err(PixelError::InvalidGeometry); // 外调色板的颜色票不能签本瓦片，即使端点相同。
-        }
-        if let Some(encoded) = encode_paired(
-            &original,
-            width,
-            height,
-            row_bytes,
-            first_row,
-            pairs,
-            allocations,
-        )? {
-            drop(original);
-            if encoded.storage.release_failed() {
-                return Err(PixelError::Backend("双遮罩原RGBA未能真实归还"));
-            }
-            return Ok(encoded);
-        } // 只有额外像素页预算不足允许保原Indexed/RGBA；真实释放/构造失败仍返回原错误。
-    }
     let (image_width, image_height, encoded_row, palette, solid, presentation) = match plan {
-        Plan::Rgba if first_row == 0 => return rgba(original, width, height, row_bytes),
+        Plan::Rgba if first_row == 0 => return rgba(original, width, height, row_bytes, prior),
         Plan::Rgba => return Err(PixelError::InvalidGeometry),
-        Plan::Rgb24 => return rgb24(original, width, height, row_bytes, first_row, allocations),
+        Plan::Rgb24 => {
+            return rgb24(
+                original,
+                width,
+                height,
+                row_bytes,
+                first_row,
+                allocations,
+                prior,
+            );
+        }
         Plan::Solid(value) => (1, 1, 4, None, Some(value), PixelPresentation::Image),
         Plan::Neutral => (
             width,
@@ -561,7 +571,7 @@ fn finish_prepared_inner(
     let allocation = match output_allocation(&original, length, allocations, 0) {
         Ok(value) => value,
         Err(PixelError::BudgetExceeded) if allocations.is_none() && first_row == 0 => {
-            return rgba(original, width, height, row_bytes);
+            return rgba(original, width, height, row_bytes, prior);
         }
         Err(error) => return Err(error), // 真分配/清理错误不洗成成功或换来源重试。
     };
@@ -632,41 +642,53 @@ fn finish_prepared_inner(
     {
         return Err(PixelError::Backend("原RGBA像素页未能真实归还"));
     } // 实际释放失败先终止，不创建新Native图掩盖原资源首错或重放已经完成的像素编码。
-    let (image, format) = if presentation == PixelPresentation::OpaqueNeutralMask {
-        (
-            seal_neutral_mask(&allocation, image_width, image_height, encoded_row)?,
-            Format::NeutralMask,
-        )
+    // 先把本次实际编码页密封并记录格式；只有真byte相等才可借原图，不能先建一份
+    // 新provider/索引色空间/CGImage再立即扔掉。该比较不改变上面的格式选择和像素生成。
+    let mut colors = [0u8; 768];
+    let format = if presentation == PixelPresentation::OpaqueNeutralMask {
+        Format::NeutralMask
+    } else if let Some(palette) = &palette {
+        for (out, color) in colors
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(&palette.colors[..palette.count])
+        {
+            *out = [(color >> 16) as u8, (color >> 8) as u8, *color as u8];
+        }
+        Format::Indexed(colors[..palette.count * 3].into())
+    } else {
+        Format::Rgba
+    };
+    let storage = SealedPixels::new(
+        Arc::clone(&allocation),
+        image_width,
+        image_height,
+        encoded_row,
+        format,
+    )?;
+    if let Some(reused) =
+        prior.and_then(|prior| prior.reuse_image(width, height, presentation, &storage, None))
+    {
+        return Ok(reused); // 新页的局部Arc在返回前真实归还；外层继续检查同页账的release首错。
+    }
+    let image = if presentation == PixelPresentation::OpaqueNeutralMask {
+        seal_neutral_mask(&allocation, image_width, image_height, encoded_row)?
     } else {
         // SAFETY: sRGB常量静态有效；色表只存精确RGB，不切换灰阶gamma或以近似色换内存。
         let base = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))
             .ok_or(PixelError::Backend("无法建立原sRGB空间"))?;
-        let (color, bits, info, format) = if let Some(palette) = palette {
-            let mut colors = [0u8; 768];
-            for (out, color) in colors
-                .as_chunks_mut::<3>()
-                .0
-                .iter_mut()
-                .zip(&palette.colors[..palette.count])
-            {
-                *out = [(color >> 16) as u8, (color >> 8) as u8, *color as u8];
-            }
+        let (color, bits, info) = if let Some(palette) = palette {
             // SAFETY: 有限色数2..=256，表在同步构造期完整覆盖3*count byte；CoreGraphics复制原表。
             let indexed = unsafe {
                 CGColorSpace::new_indexed(Some(&base), palette.count - 1, colors.as_ptr())
             }
             .ok_or(PixelError::Backend("无法建立精确索引色表"))?;
-            let table = colors[..palette.count * 3].into();
-            (
-                indexed,
-                8,
-                CGBitmapInfo(CGImageAlphaInfo::None.0),
-                Format::Indexed(table),
-            )
+            (indexed, 8, CGBitmapInfo(CGImageAlphaInfo::None.0))
         } else {
-            (base, 32, rgba_info(), Format::Rgba)
+            (base, 32, rgba_info())
         };
-        let image = seal_format(
+        seal_format(
             &allocation,
             ImageFormat {
                 width: image_width,
@@ -676,17 +698,8 @@ fn finish_prepared_inner(
                 color: &color,
                 info,
             },
-        )?;
-        (image, format)
+        )?
     };
-    // 原image已实际封存且provider持同一映射；仅记录真实格式与色表，不保原RGBA副本。
-    let storage = SealedPixels::new(
-        Arc::clone(&allocation),
-        image_width,
-        image_height,
-        encoded_row,
-        format,
-    )?;
     // Native封存期间其它原provider仍可真正退还；保留原出口检查，不让前置释放检查替代后置首错。
     if allocation
         .counters
@@ -701,6 +714,7 @@ fn finish_prepared_inner(
         presentation,
         storage,
         secondary_storage: None,
+        reused_image: false,
         #[cfg(test)]
         allocation,
         #[cfg(test)]
@@ -713,8 +727,8 @@ fn rgba(
     width: usize,
     height: usize,
     row_bytes: usize,
+    prior: Option<&TileFrame>,
 ) -> Result<EncodedImage, PixelError> {
-    let image = seal(&allocation, width, height, row_bytes)?;
     let storage = SealedPixels::new(
         Arc::clone(&allocation),
         width,
@@ -722,12 +736,19 @@ fn rgba(
         row_bytes,
         Format::Rgba,
     )?;
+    if let Some(reused) = prior.and_then(|prior| {
+        prior.reuse_image(width, height, PixelPresentation::Image, &storage, None)
+    }) {
+        return Ok(reused);
+    }
+    let image = seal(&allocation, width, height, row_bytes)?;
     Ok(EncodedImage {
         image,
         secondary_image: None,
         presentation: PixelPresentation::Image,
         storage,
         secondary_storage: None,
+        reused_image: false,
         #[cfg(test)]
         allocation,
         #[cfg(test)]
@@ -743,6 +764,7 @@ fn rgb24(
     row_bytes: usize,
     first_row: usize,
     allocations: &mut Option<OutputAllocations>,
+    prior: Option<&TileFrame>,
 ) -> Result<EncodedImage, PixelError> {
     let encoded_row = width
         .checked_mul(3)
@@ -755,7 +777,7 @@ fn rgb24(
     let allocation = match output_allocation(&original, length, allocations, 0) {
         Ok(value) => value,
         Err(PixelError::BudgetExceeded) if allocations.is_none() && first_row == 0 => {
-            return rgba(original, width, height, row_bytes);
+            return rgba(original, width, height, row_bytes, prior);
         }
         Err(error) => return Err(error), // 可选压缩仅允许额外页不足回退，真实映射故障不能洗成成功。
     };
@@ -789,6 +811,18 @@ fn rgb24(
     {
         return Err(PixelError::Backend("原RGB24编码后的RGBA页未能真实归还"));
     }
+    let storage = SealedPixels::new(
+        Arc::clone(&allocation),
+        width,
+        height,
+        encoded_row,
+        Format::Rgb24,
+    )?;
+    if let Some(reused) = prior.and_then(|prior| {
+        prior.reuse_image(width, height, PixelPresentation::Image, &storage, None)
+    }) {
+        return Ok(reused);
+    }
     // SAFETY: 原sRGB常量静态有效，RGB24与原RGBA使用完全相同的真实颜色空间。
     let color = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))
         .ok_or(PixelError::Backend("无法建立原RGB24的sRGB空间"))?;
@@ -803,13 +837,6 @@ fn rgb24(
             info: CGBitmapInfo(CGImageAlphaInfo::None.0),
         },
     )?;
-    let storage = SealedPixels::new(
-        Arc::clone(&allocation),
-        width,
-        height,
-        encoded_row,
-        Format::Rgb24,
-    )?;
     // 与原实现相同，封存后的归还首错仍须核验；前移原RGBA只缩短所有权，不缩减资源门槛。
     if storage.release_failed() {
         return Err(PixelError::Backend("原RGB24编码后的RGBA页未能真实归还"));
@@ -820,6 +847,7 @@ fn rgb24(
         presentation: PixelPresentation::Image,
         storage,
         secondary_storage: None,
+        reused_image: false,
         #[cfg(test)]
         allocation,
         #[cfg(test)]
@@ -829,14 +857,19 @@ fn rgb24(
 
 /// 两个独立provider各有一次callback义务；不能让两个图像共享同一分配的一次归还标志。
 fn encode_paired(
-    original: &Arc<PixelAllocation>,
-    width: usize,
-    height: usize,
-    row_bytes: usize,
-    first_row: usize,
+    prepared: &PreparedImage,
     pairs: &CertifiedMaskPairs,
     allocations: &mut Option<OutputAllocations>,
+    prior: Option<&TileFrame>,
 ) -> Result<Option<EncodedImage>, PixelError> {
+    // 两plane读取同一个已完成原区；借实际PreparedImage，避免拆散其唯一映射与行范围事实。
+    let original = &prepared.original;
+    let (width, height, row_bytes, first_row) = (
+        prepared.width,
+        prepared.height,
+        prepared.row_bytes,
+        prepared.first_row,
+    );
     let encoded_row = (width + 15) & !15;
     let length = encoded_row
         .checked_mul(height)
@@ -887,8 +920,6 @@ fn encode_paired(
             *b = second_alpha;
         }
     }
-    let image = seal_neutral_mask(&first, width, height, encoded_row)?;
-    let secondary_image = seal_neutral_mask(&second, width, height, encoded_row)?;
     let storage = SealedPixels::new(
         Arc::clone(&first),
         width,
@@ -897,18 +928,33 @@ fn encode_paired(
         Format::PairedMask(pairs.blend()),
     )?;
     let secondary_storage = SealedPixels::new(
-        second,
+        Arc::clone(&second),
         width,
         height,
         encoded_row,
         Format::PairedMask(pairs.blend()),
     )?;
+    let presentation = pairs.presentation();
+    if let Some(reused) = prior.and_then(|prior| {
+        prior.reuse_image(
+            width,
+            height,
+            presentation,
+            &storage,
+            Some(&secondary_storage),
+        )
+    }) {
+        return Ok(Some(reused)); // 必须两plane与端点/blend都相同，不能只复用第一张mask。
+    }
+    let image = seal_neutral_mask(&first, width, height, encoded_row)?;
+    let secondary_image = seal_neutral_mask(&second, width, height, encoded_row)?;
     Ok(Some(EncodedImage {
         image,
         secondary_image: Some(secondary_image),
-        presentation: pairs.presentation(),
+        presentation,
         storage,
         secondary_storage: Some(secondary_storage),
+        reused_image: false,
         #[cfg(test)]
         allocation: first,
         #[cfg(test)]

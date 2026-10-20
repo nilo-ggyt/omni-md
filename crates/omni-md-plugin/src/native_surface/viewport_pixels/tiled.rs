@@ -61,6 +61,58 @@ pub(in crate::native_surface) struct TileFrame {
     pub reused_images: usize,
 }
 
+impl TileFrame {
+    /// 只在本次已认证活帧里借图；新绘制和编码已完成，两个plane均已真实只读。
+    /// 先前在seal_region中才判等，会先创建随后立刻扔掉的provider/CGImage及索引色空间。
+    /// 这里仍逐格式、尺寸、stride、端点解释和有效byte核对，不凭hash或主题猜相同画面。
+    pub(super) fn reuse_image(
+        &self,
+        width: usize,
+        height: usize,
+        presentation: PixelPresentation,
+        storage: &encoding::SealedPixels,
+        secondary: Option<&encoding::SealedPixels>,
+    ) -> Option<encoding::EncodedImage> {
+        if self.tiles.len() > MAX_TILE_SLOTS
+            || self.tiles.iter().any(|tile| {
+                !tile.storage.same_owner(storage)
+                    || tile
+                        .secondary_storage
+                        .as_ref()
+                        .is_some_and(|other| !other.same_owner(storage))
+            })
+        {
+            // 非法原帧不作为优化命中；后面的原seal_region仍在同一位置返回其真实错误。
+            return None;
+        }
+        let original = self.tiles.iter().find(|original| {
+            original.tile.width == width
+                && original.tile.height == height
+                && original.presentation == presentation
+                && original.storage.identical(storage)
+                && match (&original.secondary_storage, secondary) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => left.identical(right),
+                    _ => false,
+                }
+        })?;
+        // 只克隆原实际图和同一provider页；新编码页仍由调用者局部Arc归还，既不保新旧副本，
+        // 也不继承旧坐标、Ready或完整Input。父CPU发布仍按新Scene核原Native图和原子提交。
+        Some(encoding::EncodedImage {
+            image: original.image.clone(),
+            secondary_image: original.secondary_image.clone(),
+            presentation,
+            storage: original.storage.clone(),
+            secondary_storage: original.secondary_storage.clone(),
+            reused_image: true,
+            #[cfg(test)]
+            allocation: Arc::clone(&original.allocation),
+            #[cfg(test)]
+            row_bytes: original.row_bytes,
+        })
+    }
+}
+
 /// 只有有限实际mmap与context强边；Drop可在取消时归还，不拥有Scene或正文。
 pub(in crate::native_surface) struct WritableTile {
     context: Option<CFRetained<CGContext>>,
@@ -301,7 +353,7 @@ impl TiledBitmap {
         }
         let original = prepared.tile;
         let planned = prepared.pixels.count();
-        let regions = prepared.pixels.finish(pairs)?;
+        let regions = prepared.pixels.finish(pairs, prior)?;
         if regions.is_empty()
             || regions.len() > planned
             || self.tiles.len() + regions.len() > MAX_TILE_SLOTS
@@ -355,8 +407,8 @@ impl TiledBitmap {
         encoded: encoding::EncodedImage,
         prior: Option<&TileFrame>,
     ) -> Result<(SealedTile, bool), PixelError> {
-        let mut reused = false;
-        let mut sealed = SealedTile {
+        let reused = encoded.reused_image;
+        let sealed = SealedTile {
             tile,
             image: encoded.image,
             secondary_image: encoded.secondary_image,
@@ -381,46 +433,9 @@ impl TiledBitmap {
             }) {
                 return Err(PixelError::InvalidGeometry); // 外会话像素不能绕开当前32MiB真实账本，即使内容逐byte相同。
             }
-            for original in &prior.tiles {
-                if original.tile.width == tile.width
-                    && original.tile.height == tile.height
-                    && original.presentation == sealed.presentation
-                    && original.storage.identical(&sealed.storage)
-                    && match (&original.secondary_storage, &sealed.secondary_storage) {
-                        (None, None) => true,
-                        (Some(left), Some(right)) => left.identical(right),
-                        _ => false,
-                    }
-                {
-                    // 只有新paint完整封存并逐byte相同才能借原不可变图像；坐标仍取新tile，不继承旧Ready。
-                    let old_image = std::mem::replace(&mut sealed.image, original.image.clone());
-                    let old_storage =
-                        std::mem::replace(&mut sealed.storage, original.storage.clone());
-                    let old_secondary_image = std::mem::replace(
-                        &mut sealed.secondary_image,
-                        original.secondary_image.clone(),
-                    );
-                    let old_secondary_storage = std::mem::replace(
-                        &mut sealed.secondary_storage,
-                        original.secondary_storage.clone(),
-                    );
-                    #[cfg(test)]
-                    {
-                        sealed.allocation = Arc::clone(&original.allocation);
-                        sealed.row_bytes = original.row_bytes;
-                    }
-                    drop(old_image);
-                    drop(old_storage); // 无槽借用，真实释放新provider及其最后Arc，不能留下等值像素副本。
-                    drop(old_secondary_image);
-                    drop(old_secondary_storage); // 两plane配对替换；不允许只复用其中一个图像或遗留第二provider。
-                    if self.counters.pixel_release_failed.load(Ordering::Acquire) {
-                        return Err(PixelError::Backend("等值候选像素页未能真实归还"));
-                    } // 复用不是隐藏真实munmap失败的出口，仍交原候选首错路径处理。
-                    reused = true;
-                    break;
-                } // 色表、透明、stride或任一有效byte不同保新图，不用hash碰撞授权。
-            }
         }
+        // 编码器已在创建provider前完整判等；这里仅接新tile坐标和本次真实复用收据。
+        // 原帧的有限槽及页账门仍留在原位置，优化不把非法原帧洗成普通miss或合法发布。
         Ok((sealed, reused))
     }
 

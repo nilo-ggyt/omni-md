@@ -114,6 +114,7 @@ impl PreparedRegions {
     pub(in crate::native_surface::viewport_pixels) fn finish(
         self,
         pairs: &[Option<&CertifiedMaskPairs>],
+        prior: Option<&TileFrame>,
     ) -> Result<Vec<EncodedRegion>, PixelError> {
         if pairs.len() != self.count() {
             return Err(PixelError::InvalidGeometry);
@@ -123,7 +124,7 @@ impl PreparedRegions {
             fragments,
         } = self;
         if fragments.is_empty() {
-            return single(original, pairs[0]);
+            return single(original, pairs[0], prior);
         }
         let counters = Arc::clone(&original.original.counters);
         let mut allocations = Vec::with_capacity(fragments.len());
@@ -153,7 +154,7 @@ impl PreparedRegions {
                                     "分区预算回退时临时像素页未能真实归还",
                                 ));
                             }
-                            return single(original, None); // 尚无子区provider，原RGBA未改；只预算不足回整块RGB24。
+                            return single(original, None, prior); // 尚无子区provider，原RGBA未改；只预算不足回整块RGB24。
                         }
                         Err(error) => return Err(error), // 真映射失败不能被压缩回退掩盖，已有临时页照常析构。
                     }
@@ -174,7 +175,7 @@ impl PreparedRegions {
                 #[cfg(test)]
                 observed_pixels: 0,
             };
-            let image = finish_with_allocations(prepared, *pairs, Some(allocations))?;
+            let image = finish_with_allocations(prepared, *pairs, Some(allocations), prior)?;
             encoded.push(EncodedRegion {
                 first_row: fragment.first_row,
                 height: fragment.height,
@@ -192,9 +193,10 @@ impl PreparedRegions {
 fn single(
     original: PreparedImage,
     pairs: Option<&CertifiedMaskPairs>,
+    prior: Option<&TileFrame>,
 ) -> Result<Vec<EncodedRegion>, PixelError> {
     let height = original.height;
-    let encoded = finish_prepared(original, pairs)?;
+    let encoded = finish_with_allocations(original, pairs, None, prior)?;
     Ok(std::iter::once(EncodedRegion {
         first_row: 0,
         height,

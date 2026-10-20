@@ -24,7 +24,8 @@ pub(in crate::native_surface::viewport_pixels) struct SealedPixels {
 }
 
 impl SealedPixels {
-    /// 只能在真实seal成功之后构造；传入格式来自同一次原CGImage构造，不接受外部主题或范围授权。
+    /// 只接受已结束context的实际编码页；先真实改为只读，再记录本次编码的格式和有效字节。
+    /// 此事实尚不代表CGImage已创建，也不授予Source/Scene权限；允许在建provider前比较原活帧。
     pub(super) fn new(
         allocation: Arc<PixelAllocation>,
         width: usize,
@@ -59,6 +60,7 @@ impl SealedPixels {
         {
             return Err(PixelError::InvalidGeometry);
         }
+        super::super::paired::readonly(&allocation)?;
         let mut result = Self {
             allocation,
             width,
@@ -125,6 +127,11 @@ impl SealedPixels {
         counters: &Arc<NativeMarkdownViewportPixels>,
     ) -> bool {
         Arc::ptr_eq(&self.allocation.counters, counters)
+    }
+
+    /// 仅核同一实际页账；旧帧全部plane都须属于本候选，不能靠相等字节借外会话provider。
+    pub(in crate::native_surface::viewport_pixels) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.allocation.counters, &other.allocation.counters)
     }
 
     pub(in crate::native_surface::viewport_pixels) fn release_failed(&self) -> bool {

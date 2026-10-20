@@ -399,7 +399,7 @@ fn actual_cgimage_decode_matches_all_original_rgba_pixels_after_summary_planning
         let observer = source.counters.observer();
         let planned = PreparedRegions::plan(original, 4).unwrap();
         let count = planned.count();
-        let images = planned.finish(&[None; 4][..count]).unwrap();
+        let images = planned.finish(&[None; 4][..count], None).unwrap();
         let decoded = Bitmap::new(width, height, Arc::clone(&source.counters)).unwrap();
         CGContext::set_interpolation_quality(
             Some(decoded.context()),
