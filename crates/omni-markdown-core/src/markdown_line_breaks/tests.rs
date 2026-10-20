@@ -468,6 +468,131 @@ fn cross_page_queries_and_many_no_breaks_keep_one_buffer_and_no_scalar_inventory
 }
 
 #[test]
+fn unicode_cross_page_strict_queries_keep_pending_prefix_and_sealed_eof() {
+    // 固定字面每组只有一个emoji和一个空格，真实断行机会在空格之后（LB18）；
+    // 原文每组恰为5个UTF8字节、3个UTF16单元，不能由待测索引反推期望坐标。
+    // 1027组跨过两个512-record页，最后三条仍处于未满的真实追加页。
+    let text = "😀 ".repeat(1027);
+    let original = source(text.as_bytes());
+    let authority = original.authority();
+    let mut job = MarkdownLineBreakJob::new(original).unwrap();
+    let observer = job.resource_observer();
+
+    // 在旧页恰满、下一页首条和第三页首条分别暂停。这里只通过公开查询判断前缀
+    // 已交付，不读取私有页号、记录槽或machine位置来制造准备完成的事实。
+    for ordinal in [512, 513, 1025] {
+        for _ in 0..text.len() * 4 {
+            if matches!(
+                job.query(
+                    &authority,
+                    MarkdownLineBreakUnit::Utf16,
+                    ordinal * 3,
+                    MarkdownLineBreakQuery::IsBoundary,
+                )
+                .unwrap(),
+                MarkdownLineBreakAnswer::Known(Some(_))
+            ) {
+                break;
+            }
+            let step = job.step(&authority, TINY).unwrap();
+            assert!(
+                step.bytes <= TINY.bytes
+                    && step.scalars <= TINY.scalars
+                    && step.records <= TINY.records
+            );
+        }
+        for (unit, stride) in [
+            (MarkdownLineBreakUnit::Byte, 5),
+            (MarkdownLineBreakUnit::Utf16, 3),
+        ] {
+            let at = ordinal * stride;
+            // 页首相等时Previous必须交付旧页的真实前一条；Next不能以当前机会自身
+            // 或尚未发布的未来记录作答。字节/代理项坐标不相同，但两边属于同一机会。
+            for (offset, query, expected) in [
+                (
+                    at,
+                    MarkdownLineBreakQuery::IsBoundary,
+                    Some((ordinal * 5, ordinal * 3)),
+                ),
+                (
+                    at,
+                    MarkdownLineBreakQuery::Previous,
+                    Some(((ordinal - 1) * 5, (ordinal - 1) * 3)),
+                ),
+                (
+                    at - 1,
+                    MarkdownLineBreakQuery::Next,
+                    Some((ordinal * 5, ordinal * 3)),
+                ),
+                (at - 1, MarkdownLineBreakQuery::IsBoundary, None),
+            ] {
+                match job.query(&authority, unit, offset, query).unwrap() {
+                    MarkdownLineBreakAnswer::Known(actual) => assert_eq!(
+                        actual.map(position),
+                        expected,
+                        "ordinal={ordinal} unit={unit:?} offset={offset} query={query:?}"
+                    ),
+                    MarkdownLineBreakAnswer::Pending => panic!("已知前缀中的机会不能退回Pending"),
+                }
+            }
+            assert_eq!(
+                job.query(&authority, unit, at, MarkdownLineBreakQuery::Next)
+                    .unwrap(),
+                MarkdownLineBreakAnswer::Pending
+            );
+            // 全文EOF仍在未读尾部，不能因追加页已含机会便签出其Previous或非边界。
+            for query in [
+                MarkdownLineBreakQuery::IsBoundary,
+                MarkdownLineBreakQuery::Previous,
+            ] {
+                assert_eq!(
+                    job.query(&authority, unit, 1027 * stride, query).unwrap(),
+                    MarkdownLineBreakAnswer::Pending
+                );
+            }
+        }
+    }
+
+    finish(&mut job, &authority);
+    // 封口后再从新旧页来回查询；零位置、真实EOF与页首两侧都保严格小于/大于，
+    // 并确认半页保留不会改变同一源的完整查询结果。
+    for ordinal in [0, 1, 511, 512, 513, 1023, 1024, 1025, 1026, 1027] {
+        for (unit, stride) in [
+            (MarkdownLineBreakUnit::Byte, 5),
+            (MarkdownLineBreakUnit::Utf16, 3),
+        ] {
+            for query in [
+                MarkdownLineBreakQuery::IsBoundary,
+                MarkdownLineBreakQuery::Previous,
+                MarkdownLineBreakQuery::Next,
+            ] {
+                let expected: Option<usize> = match query {
+                    MarkdownLineBreakQuery::IsBoundary => (ordinal != 0).then_some(ordinal),
+                    MarkdownLineBreakQuery::Previous => {
+                        ordinal.checked_sub(1).filter(|value| *value != 0)
+                    }
+                    MarkdownLineBreakQuery::Next => (ordinal < 1027).then_some(ordinal + 1),
+                };
+                match job
+                    .query(&authority, unit, ordinal * stride, query)
+                    .unwrap()
+                {
+                    MarkdownLineBreakAnswer::Known(actual) => assert_eq!(
+                        actual.map(position),
+                        expected.map(|value| (value * 5, value * 3)),
+                        "ordinal={ordinal} unit={unit:?} query={query:?}"
+                    ),
+                    MarkdownLineBreakAnswer::Pending => panic!("真实EOF封口后不能仍Pending"),
+                }
+            }
+        }
+    }
+    // 原资源观察随同一生产任务close核归还，不额外保存Source、页或FD的强owner。
+    job.close().unwrap();
+    released(&observer, true);
+}
+
+#[test]
 #[ignore = "需要ROOT官方Unicode18 LineBreakTest及显式OMNI_LB18_TEST_FILE"]
 fn official_19346_every_byte_split_and_real_core_global_queries() {
     let path = std::env::var_os("OMNI_LB18_TEST_FILE").expect("需要官方ROOT fixture路径");

@@ -429,7 +429,7 @@ impl<const N: usize> PagedLayoutIndex<N> {
     }
 
     /// 只描述原唯一追加buffer已初始化的record；不加载旧页，也不创建另一份读取缓存。
-    #[cfg(feature = "paged-graphemes")]
+    #[cfg(any(feature = "paged-graphemes", feature = "paged-line-breaks"))]
     pub(crate) fn append_page_records(&mut self) -> Result<Option<std::ops::Range<usize>>> {
         self.healthy()?;
         let result = (|| {

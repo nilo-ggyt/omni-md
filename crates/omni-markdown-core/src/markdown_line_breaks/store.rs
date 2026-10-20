@@ -91,6 +91,13 @@ impl LineBreakIndex {
     pub(super) fn len(&self) -> usize {
         self.page.len()
     }
+
+    /// 只借原唯一追加页已写完的record范围；不复制页，也不把空余容量当作断行机会。
+    /// 页内记录仍经get解码验证，旧页则继续由原FD及其首错、撤权规则负责。
+    pub(super) fn append_page_records(&mut self) -> Result<Option<std::ops::Range<usize>>> {
+        self.page.append_page_records().map_err(Into::into)
+    }
+
     pub(super) fn page_loads(&self) -> u64 {
         self.page.page_loads()
     }

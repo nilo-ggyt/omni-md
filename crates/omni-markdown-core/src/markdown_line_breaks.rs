@@ -547,22 +547,46 @@ impl MarkdownLineBreakJob {
         .map_err(|_| MarkdownLineBreakError::CoordinateOverflow)?;
         let mut low = 0;
         let mut high = self.index.len();
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if position(self.index.get(middle)?) < offset {
-                low = middle + 1;
+        // 只保本次查询实际读到的两侧机会；下界收敛后直接交付，避免再读同一record。
+        // 这些局部值不跨query生存，不能替代原Source健康检查或发布尚未认证的后继。
+        let mut previous = None;
+        let mut following = None;
+        if let Some(page) = self.index.append_page_records()?
+            && !page.is_empty()
+        {
+            // 前向排版通常查询原追加页附近。先读该页首条真实机会，便可只在其已初始化
+            // 区间二分；旧区域仍访问原FD，不增加页缓存，也不提前读取正文或未知记录。
+            let first = self.index.get(page.start)?;
+            if position(first) < offset {
+                low = page.start + 1;
+                high = page.end;
+                previous = Some(first);
             } else {
-                high = middle;
+                high = page.start;
+                following = Some(first); // 旧区域的严格Next也可能恰好是追加页首机会。
+                if position(first) == offset {
+                    low = page.start;
+                    if matches!(query, MarkdownLineBreakQuery::Previous) && page.start != 0 {
+                        // 页首自身不是严格前驱；前一条必须沿原FD读取，不能靠页锚点推算。
+                        previous = Some(self.index.get(page.start - 1)?);
+                    }
+                }
             }
         }
-        let exact = if low < self.index.len() {
-            Some(self.index.get(low)?)
-        } else {
-            None
-        };
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let boundary = self.index.get(middle)?;
+            if position(boundary) < offset {
+                low = middle + 1;
+                previous = Some(boundary);
+            } else {
+                high = middle;
+                following = Some(boundary);
+            }
+        }
         match query {
             MarkdownLineBreakQuery::IsBoundary => {
-                if let Some(value) = exact.filter(|value| position(*value) == offset) {
+                if let Some(value) = following.filter(|value| position(*value) == offset) {
                     return Ok(MarkdownLineBreakAnswer::Known(Some(value)));
                 }
                 if self.ready || offset < frontier || (offset == 0 && self.source.byte_len() != 0) {
@@ -575,14 +599,14 @@ impl MarkdownLineBreakJob {
                 if !self.ready && offset > frontier {
                     return Ok(MarkdownLineBreakAnswer::Pending);
                 }
-                Ok(MarkdownLineBreakAnswer::Known(if low == 0 {
-                    None
-                } else {
-                    Some(self.index.get(low - 1)?)
-                }))
+                Ok(MarkdownLineBreakAnswer::Known(previous))
             }
             MarkdownLineBreakQuery::Next => {
-                if exact.is_some_and(|value| position(value) == offset) {
+                if let Some(boundary) = following {
+                    if position(boundary) != offset {
+                        return Ok(MarkdownLineBreakAnswer::Known(Some(boundary)));
+                    }
+                    // Next保留严格大于语义；仅相等时再读取真实后一条，不能复用自身。
                     low += 1;
                 }
                 if low < self.index.len() {
