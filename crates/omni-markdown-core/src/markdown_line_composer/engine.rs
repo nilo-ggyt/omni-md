@@ -876,7 +876,8 @@ impl MarkdownLineComposer {
                         payload.stage = Stage::Complete;
                         result.answer = MarkdownLineComposeAnswer::Complete;
                     }
-                } else if let Some(proof) = payload.store.item_at(payload.start)? {
+                } else if let Some(located) = payload.store.item_at(payload.start)? {
+                    let proof = located.proof;
                     if let Some(placement) = payload.store.tab_placement(&proof, 0)?
                         && !matches!(placement, MarkdownLineTabPlacement::Left { .. })
                     {
@@ -1005,7 +1006,7 @@ impl MarkdownLineComposer {
                         } => {
                             payload.next_pen = x_advance_26_6;
                             if let Some(next) = payload.store.item_at(source_utf16.end)? {
-                                payload.next = Some(next);
+                                payload.next = Some(next.proof);
                                 payload.stage = Stage::Continue;
                             } else {
                                 payload.stage = Stage::Item;

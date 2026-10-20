@@ -67,6 +67,13 @@ pub(super) struct StoredItemProof {
     job: Option<Weak<()>>,
 }
 
+/// 一次实际定位同时取得的原票与完整目录；调用方只在本次借用内消费，不留作后继缓存。
+/// proof-only 客户直接移走原票；行组合则复用已解码的三条不可变记录，仍逐次核 Source/字体。
+pub(super) struct LocatedItem {
+    pub(super) proof: StoredItemProof,
+    directory: Directory,
+}
+
 #[derive(Clone)]
 pub(super) struct StoredItemFacts {
     pub paragraph_inset_26_6: i32,
@@ -816,10 +823,9 @@ impl GlyphStore {
         range: &Range<usize>,
     ) -> Result<Option<StoredItemProof>> {
         let result = (|| {
-            let Some(proof) = self.item_at(range.start)? else {
+            let Some(LocatedItem { proof, directory }) = self.item_at(range.start)? else {
                 return Ok(None);
             };
-            let directory = self.directory(&proof)?;
             Ok(
                 (directory.kind == super::MarkdownComposedLinePartKind::Glyphs
                     && range.start >= directory.facts.source_utf16.start
@@ -861,6 +867,7 @@ impl GlyphStore {
         self.finish(result)
     }
 
+    #[cfg(test)]
     pub(super) fn cluster(
         &mut self,
         proof: &StoredItemProof,
@@ -891,6 +898,28 @@ impl GlyphStore {
             }
             if offset == directory.facts.source_utf16.end {
                 return Ok(None);
+            }
+            // 真实目录已给出首末 ordinal；查询恰在 item 两端时不必二分相同记录。
+            // 这里只选择读取位置，结果仍来自原64B记录，并逐项解码、核覆盖与 glyph 范围。
+            let endpoint = if offset == directory.facts.source_utf16.start {
+                Some(0)
+            } else if offset.checked_add(1) == Some(directory.facts.source_utf16.end) {
+                Some(
+                    directory
+                        .cluster_count
+                        .checked_sub(1)
+                        .ok_or(Error::InconsistentCoverage)?,
+                )
+            } else {
+                None
+            };
+            if let Some(ordinal) = endpoint {
+                self.guard()?;
+                let value = self.cluster_record_in_directory(directory, ordinal)?;
+                if !value.source_utf16.contains(&offset) {
+                    return Err(Error::InconsistentCoverage);
+                }
+                return Ok(Some((ordinal, value)));
             }
             let (mut low, mut high) = (0, directory.cluster_count);
             while low < high {
@@ -1079,7 +1108,7 @@ impl GlyphStore {
     pub(super) fn observer(&self) -> LayoutIndexObserver {
         self.observer.clone()
     }
-    pub(super) fn item_at(&mut self, offset: usize) -> Result<Option<StoredItemProof>> {
+    pub(super) fn item_at(&mut self, offset: usize) -> Result<Option<LocatedItem>> {
         let result = (|| {
             self.guard()?;
             if offset > self.source_end {
@@ -1099,10 +1128,11 @@ impl GlyphStore {
                 #[cfg(test)]
                 job: None,
             };
-            if !self.directory(&proof)?.facts.source_utf16.contains(&offset) {
+            let directory = self.directory(&proof)?;
+            if !directory.facts.source_utf16.contains(&offset) {
                 return Err(Error::InconsistentCoverage);
             }
-            Ok(Some(proof))
+            Ok(Some(LocatedItem { proof, directory }))
         })();
         self.finish(result)
     }

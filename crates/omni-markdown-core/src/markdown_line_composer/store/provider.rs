@@ -416,10 +416,11 @@ impl provider::ResolutionProvider for StoredGlyphBorrow<'_> {
         GlyphProvider::require(self, source, font)?;
         let result = (|| {
             let end = self.directory.facts.source_utf16.end;
-            let Some(proof) = self.store.item_at(end)? else {
+            let Some(located) = self.store.item_at(end)? else {
                 return Ok(None);
             };
-            let next = self.store.directory(&proof)?; // 同Store真实proof同时核原Source、弱Font注册及完整目录。
+            // 定位已经用同 Store 原票核过完整目录；只在本次 provider 借用内复用。
+            let next = located.directory;
             if next.kind != super::super::MarkdownComposedLinePartKind::Glyphs
                 || next.facts.source_utf16.start != end
                 || next.cluster_count == 0

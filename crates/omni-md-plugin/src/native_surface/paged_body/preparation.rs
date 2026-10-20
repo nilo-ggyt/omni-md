@@ -34,7 +34,7 @@ impl PreparationTicket {
         }
     }
 
-    fn pure_current(&self, owner: &Owner, source: &MarkdownLayoutTextSource) -> bool {
+    pub(super) fn pure_current(&self, owner: &Owner, source: &MarkdownLayoutTextSource) -> bool {
         owner.current_body()
             && owner.serial.get() == self.serial
             && source.authority() == self.source

@@ -47,6 +47,30 @@ impl BoundarySearch {
         }
     }
 
+    /// 同一次范围查询先查右端，再从已经解码的原记录查左端；不跨调用保留游标或来源。
+    /// 只接受已完成的 offset 查询及更早目标，原 current 必须仍在目标右侧；后续每条
+    /// previous/skip 仍由 step 核 ordinal、字节/UTF16 严格顺序，不从旧答案猜新边界。
+    pub(in crate::markdown_line_composer::store) fn preceding_offset(
+        &mut self,
+        offset: usize,
+    ) -> Result<()> {
+        let Target::Offset(previous) = self.target else {
+            return Err(Error::InvalidRequest);
+        };
+        if offset > previous
+            || self.answer.is_none()
+            || self
+                .current
+                .is_none_or(|current| current.value.utf16 < offset)
+        {
+            return Err(Error::InvalidRequest);
+        }
+        self.target = Target::Offset(offset);
+        self.answer = None;
+        self.next = Next::Choose;
+        Ok(())
+    }
+
     /// Authenticate each original skip/previous rank and source order; quota one retains the decoded current record.
     pub(in crate::markdown_line_composer::store) fn step(
         &mut self,

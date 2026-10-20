@@ -93,11 +93,8 @@ impl GlyphStore {
             {
                 return Err(Error::InconsistentCoverage);
             }
-            self.grapheme_directory()?;
-            for endpoint in [range.start, range.end] {
-                if !self.is_grapheme(endpoint)? {
-                    return Err(Error::InconsistentCoverage);
-                }
+            if !self.is_grapheme_range(&range)? {
+                return Err(Error::InconsistentCoverage);
             }
             #[cfg(feature = "paged-shaping-frontier")]
             if matches!(
@@ -111,7 +108,8 @@ impl GlyphStore {
                     .item_at(range.end)?
                     .ok_or(Error::InconsistentCoverage)?;
                 let cluster = self
-                    .cluster(&after, range.end)?
+                    .cluster_in_directory(&after.directory, range.end)?
+                    .map(|(_, cluster)| cluster)
                     .ok_or(Error::InconsistentCoverage)?;
                 if cluster.source_utf16.start != range.end
                     || cluster.flags & harfrust::GlyphFlags::UNSAFE_TO_BREAK.to_bits() != 0
@@ -123,10 +121,12 @@ impl GlyphStore {
             if bidi.source_range() != (0..self.source.utf16_len()) {
                 return Err(Error::SourceMismatch);
             }
-            let last_proof = self
+            let LocatedItem {
+                proof: last_proof,
+                directory: last_item,
+            } = self
                 .item_at(range.end.checked_sub(1).ok_or(Error::Overflow)?)?
                 .ok_or(Error::InconsistentCoverage)?;
-            let last_item = self.directory(&last_proof)?;
             let hard_break = matches!(
                 last_item.kind,
                 super::super::MarkdownComposedLinePartKind::ParagraphBreak
@@ -219,8 +219,11 @@ impl GlyphStore {
                         } else {
                             at
                         };
-                        let proof = self.item_at(point)?.ok_or(Error::InconsistentCoverage)?;
-                        let item = self.directory(&proof)?;
+                        // 同一 forest 定位已完整核过这份目录；本回调不再读取相同三条记录。
+                        let LocatedItem {
+                            proof,
+                            directory: item,
+                        } = self.item_at(point)?.ok_or(Error::InconsistentCoverage)?;
                         let segment = visual.start.max(item.facts.source_utf16.start)
                             ..visual.end.min(item.facts.source_utf16.end);
                         if (backwards && segment.end != at) || (!backwards && segment.start != at) {
@@ -343,16 +346,18 @@ impl GlyphStore {
         self.guard()?;
         // 非 GCB 只允许原 Store 签入的 item 本端，不能让任意视觉范围绕过字素校验。
         // 原相邻 resolved levels 已在捕获与目录解码复核；这里没有重写 level 或拆分字形。
-        for (index, endpoint, line_endpoint, item_endpoint) in [
-            (0, source.start, line.start, item.facts.source_utf16.start),
-            (1, source.end, line.end, item.facts.source_utf16.end),
-        ] {
-            if endpoint != line_endpoint
-                && !self.is_grapheme(endpoint)?
-                && (endpoint != item_endpoint || item.shaping_seams[index].is_none())
-            {
-                return Err(Error::InconsistentCoverage);
-            }
+        let check_start = source.start != line.start
+            && (source.start != item.facts.source_utf16.start || item.shaping_seams[0].is_none());
+        let check_end = source.end != line.end
+            && (source.end != item.facts.source_utf16.end || item.shaping_seams[1].is_none());
+        let boundaries = match (check_start, check_end) {
+            (true, true) => self.is_grapheme_range(&source)?,
+            (true, false) => self.is_grapheme(source.start)?,
+            (false, true) => self.is_grapheme(source.end)?,
+            (false, false) => true,
+        };
+        if !boundaries {
+            return Err(Error::InconsistentCoverage);
         }
         if item.kind != super::super::MarkdownComposedLinePartKind::Glyphs {
             if source != item.facts.source_utf16 {
@@ -383,12 +388,18 @@ impl GlyphStore {
         }
         // item已在当前视觉段中由原opaque proof真实读取并验证；三个端点共用这份目录，
         // 每次cluster仍读取自己的真实64B记录并核活Source/字体，不能据目录猜字形或安全flags。
-        let (_, first) = self
+        let (first_ordinal, first) = self
             .cluster_in_directory(item, source.start)?
             .ok_or(Error::InconsistentCoverage)?;
-        let (last_ordinal, last) = self
-            .cluster_in_directory(item, source.end.checked_sub(1).ok_or(Error::Overflow)?)?
-            .ok_or(Error::InconsistentCoverage)?;
+        let last_offset = source.end.checked_sub(1).ok_or(Error::Overflow)?;
+        let (last_ordinal, last) = if first.source_utf16.contains(&last_offset) {
+            // 同一实际 cluster 已证明覆盖两端；复用本次读取的 flags/glyphs/advance，
+            // 不按 UTF16 长度猜一个 cluster，也不跨 Source 或后继调用保留这份值。
+            (first_ordinal, first.clone())
+        } else {
+            self.cluster_in_directory(item, last_offset)?
+                .ok_or(Error::InconsistentCoverage)?
+        };
         if first.source_utf16.start != source.start || last.source_utf16.end != source.end {
             return Err(Error::NeedsBidiAssembly);
         }

@@ -397,4 +397,40 @@ impl GlyphStore {
         self.guard()?;
         Ok(value.is_some_and(|value| value.utf16 == offset))
     }
+
+    /// 范围的两个端点共用本次原查询游标，不向 Store 增加字段或预取任何未请求记录。
+    /// 右端完成后只沿同一目录向左；非精确命中仍为 false，内部标量 seam 不因此变成 GCB。
+    pub(super) fn is_grapheme_range(&mut self, range: &Range<usize>) -> Result<bool> {
+        let directory = self.grapheme_directory()?;
+        if range.start > range.end || range.end > self.source.utf16_len() {
+            return Err(Error::InvalidRequest);
+        }
+        if range.end > directory.covered.utf16 {
+            return Err(Error::GraphemePrefixPending);
+        }
+        let bytes = self.source.byte_len();
+        let units = self.source.utf16_len();
+        let mut query = BoundarySearch::offset(range.end);
+        let right = query
+            .step(directory, bytes, units, usize::MAX, |record| {
+                self.guard()?;
+                Ok(self.index.as_mut().ok_or(Error::Poisoned)?.read(record)?)
+            })?
+            .answer
+            .ok_or(Error::InconsistentCoverage)?
+            .1;
+        self.guard()?; // 第一次真实 IO 后仍核原 Source；没有用共享路径跳过取消或首错。
+        query.preceding_offset(range.start)?;
+        let left = query
+            .step(directory, bytes, units, usize::MAX, |record| {
+                self.guard()?;
+                Ok(self.index.as_mut().ok_or(Error::Poisoned)?.read(record)?)
+            })?
+            .answer
+            .ok_or(Error::InconsistentCoverage)?
+            .1;
+        self.guard()?;
+        Ok(left.is_some_and(|value| value.utf16 == range.start)
+            && right.is_some_and(|value| value.utf16 == range.end))
+    }
 }

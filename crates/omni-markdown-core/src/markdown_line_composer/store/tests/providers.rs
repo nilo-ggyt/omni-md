@@ -156,7 +156,7 @@ fn immutable_forest_finds_many_real_items_without_a_resident_item_vector() {
         assert!(observer.snapshot().mapped_bytes <= 16 * 1024);
     }
     for offset in (0..fixture.source.utf16_len()).rev() {
-        let proof = store.item_at(offset).unwrap().unwrap();
+        let proof = store.item_at(offset).unwrap().unwrap().proof;
         let facts = store.facts(&proof).unwrap();
         assert_eq!(
             facts.facts.source_utf16,
@@ -202,7 +202,7 @@ fn stored_selected_permit_builds_mixed_script_lines_across_real_item_boundaries(
     let mut lines = 0;
     let mut crossed_items = false;
     while start < fixture.source.utf16_len() {
-        let mut proof = store.item_at(start).unwrap().unwrap();
+        let mut proof = store.item_at(start).unwrap().unwrap().proof;
         let mut measure = {
             let mut provider = store.borrow(&proof).unwrap();
             MarkdownSoftLineMeasureJob::new_with_provider(
@@ -222,7 +222,7 @@ fn stored_selected_permit_builds_mixed_script_lines_across_real_item_boundaries(
         loop {
             match selected(&mut measure, &mut store, &proof, &mut breaks) {
                 MarkdownSoftLineMeasureChoice::NeedNextItem { source_utf16, .. } => {
-                    let next = store.item_at(source_utf16.end).unwrap().unwrap();
+                    let next = store.item_at(source_utf16.end).unwrap().unwrap().proof;
                     let continuation = {
                         let mut old = store.borrow(&proof).unwrap();
                         measure.prepare_continue(&mut old).unwrap()

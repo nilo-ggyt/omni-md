@@ -236,6 +236,93 @@ fn true_empty_and_terminal_empty_line_keep_eof_affinity_without_creating_a_next_
 }
 
 #[test]
+fn paged_selected_lines_keep_remote_unicode_clusters_and_release_original_resources() {
+    // 字面 GCB 包含组合附标与真实非 BMP 字符；不同脚本使一条实际软行跨多个原 item。
+    // 有限重复样本让原 glyph/GCB/目录真正换页，不复制生产输出作为边界期望。
+    const TEXT: &str = "office e\u{301} \u{1f16a} αλφα ";
+    const UNITS: usize = 18;
+    const BOUNDARIES: &[usize] = &[0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 12, 13, 14, 15, 16, 17];
+    let text = TEXT.repeat(96);
+    let fixture = Fixture::new(&text);
+    let source = fixture.source.resource_observer();
+    let mapping = fixture.source.original_backing_observer().unwrap();
+    let font = fixture.font.font().resource_observer();
+    let mut composer = MarkdownLineComposer::new(
+        fixture.source.clone(),
+        &fixture.source.authority(),
+        fixture.catalog.clone(),
+        80 * 64,
+        fixture.cancellation.clone(),
+    )
+    .unwrap();
+    let worker = composer.worker_resource_observer();
+    while fixture.next_line(&mut composer).is_some() {}
+    let mut output = composer.into_output().unwrap();
+    let resources = output.resource_observer();
+    let mut expected_end = text.encode_utf16().count();
+    let mut line = output.last_line().unwrap();
+    while let Some(actual) = line {
+        let facts = actual.facts();
+        assert_eq!(facts.source_utf16.end, expected_end);
+        for endpoint in [facts.source_utf16.start, facts.source_utf16.end] {
+            assert!(BOUNDARIES.contains(&(endpoint % UNITS)));
+        }
+        for ordinal in 0..facts.parts {
+            let part = output.part(&actual, ordinal).unwrap().unwrap();
+            let range = part.facts().source_utf16.clone();
+            let mut at = range.start;
+            while at < range.end {
+                let crate::MarkdownGlyphClusterAnswer::Known(Some(cluster)) =
+                    output.cluster(&part, at).unwrap()
+                else {
+                    panic!("已签出的原软行必须保留真实完整 glyph cluster");
+                };
+                assert_eq!(cluster.source_utf16.start, at);
+                assert!(cluster.source_utf16.end <= range.end);
+                assert_eq!(cluster.missing_glyphs, 0);
+                at = cluster.source_utf16.end;
+            }
+        }
+        expected_end = facts.source_utf16.start;
+        line = output.previous_line(&actual).unwrap();
+    }
+    assert_eq!(expected_end, 0);
+
+    // 远端组合字与代理项内部仍明确拒绝 caret；失败只结束原查询，不毒化健康输出。
+    // 这一公开结果同时核共享查找的非精确命中不能被当作真正 GCB。
+    for at in [95 * UNITS + 8, 95 * UNITS + 11] {
+        let mut query = output
+            .visual_query(at, MarkdownComposedLineAffinity::Downstream, None, true)
+            .unwrap();
+        let mut rejected = false;
+        for _ in 0..32_768 {
+            match output.step_visual(&mut query, 1) {
+                Err(Error::InvalidRequest) => {
+                    rejected = true;
+                    break;
+                }
+                Ok(step) => assert_eq!(step.answer, crate::MarkdownComposedVisualAnswer::Pending),
+                Err(cause) => panic!("簇内 caret 应保留原边界错误：{cause:?}"),
+            }
+        }
+        assert!(rejected);
+    }
+    assert!(output.last_line().unwrap().is_some());
+    assert_eq!(
+        std::fs::read(fixture._directory.path().join("真实行查找.md")).unwrap(),
+        text.as_bytes()
+    );
+    assert!(!fixture.document.is_dirty() && !fixture.document.can_undo());
+    output.close().unwrap();
+    drop(fixture);
+    let actual = resources.snapshot();
+    assert!(!actual.file_open && actual.mapped_bytes == 0 && !actual.cleanup_failed);
+    assert!(worker.snapshot().unwrap().is_released());
+    assert!(source.payload_released() && font.payload_released());
+    assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0 && !mapping.failed());
+}
+
+#[test]
 fn utf16_inside_non_bmp_scalar_only_locates_its_real_line_without_caret_authority() {
     // 原固定字体 cmap 的 format 12 真实覆盖这两个非 BMP 符号；emoji 缺字单独验证
     // typed 阻塞，不能用 .notdef 产出的行来冒充代理项查找的成功样本。

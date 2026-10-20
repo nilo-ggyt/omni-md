@@ -2374,9 +2374,13 @@ impl Producer {
         // 后继完整 GCB 按同一语义 Base、系统 for_string、系统级联顺序真实试字；
         // Base 再次可用时返回它，才能保留中英混排中的空格宽度与原始换行位置。
         selection.style.points = base.native().point_size() as f32;
+        // Key 捕获区间只读原 Core probe、认证字节包络与已捕获字体标量，没有 Native 调用。
+        // 因而沿原纯票核当前 Input/来源即可；不能为这三次纯检查重复读取整组 AppKit 几何。
+        // probe 的前后 Source/scope 校验仍在原 capture 内；命中后下方 ticket.require 会重新
+        // 完整核 Native 几何，未命中后的 fallback 也继续逐 Native 步守原票，不跨重入复用权限。
         let (read, key) =
             super::font_choice::FontChoiceKey::capture(&probe, &selection.style, base, &|| {
-                ticket.current(owner, &self.source)
+                ticket.pure_current(owner, &self.source)
             });
         // 有限 key 的读取同样属于真实工作；Source、取消或 scope 后验失败也不能把已读量抹成零。
         self.trial_source_bytes = self
