@@ -359,7 +359,7 @@ impl VerifiedMarkdownRootLeafViewport {
             + self
                 .links
                 .iter()
-                .map(|link| link.destination.capacity())
+                .map(|link| link.destination.retained_metadata())
                 .sum::<usize>()
     }
     /// 原有限Parser已证明的完整label可独立返回正链接；它不授予窗口外样式或负证明。

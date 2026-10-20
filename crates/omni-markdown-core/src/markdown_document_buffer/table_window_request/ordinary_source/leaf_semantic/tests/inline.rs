@@ -54,7 +54,9 @@ fn offscreen_finite_reference_before_code_keeps_target_semantics_and_original_gl
                             .link_at_for(&doc, authority(&doc), index)
                             .unwrap()
                             .unwrap()
-                            .destination,
+                            .destination
+                            .clone()
+                            .into_string(),
                         "https://example.com/current",
                         "补收前置块查询不能替换当前目标已解析的链接值"
                     );
@@ -98,7 +100,9 @@ fn multiple_offscreen_reference_blocks_preserve_target_links_and_finish_all_repl
             .link_at_for(&doc, authority(&doc), units(source, label..label).start)
             .unwrap()
             .unwrap()
-            .destination,
+            .destination
+            .clone()
+            .into_string(),
         "https://example.com/current"
     );
 }
@@ -222,7 +226,10 @@ fn closed_root_reference_before_code_uses_verified_resolution_for_html_priority(
             if definitions.is_empty() {
                 assert!(link.is_none()); // 只有真实EOF才能证明这个query缺失；未收集label不在此豁免。
             } else {
-                assert_eq!(link.unwrap().destination, "https://example.com/first");
+                assert_eq!(
+                    link.unwrap().destination.clone().into_string(),
+                    "https://example.com/first"
+                );
             }
         }
     }
@@ -297,7 +304,10 @@ fn closed_root_inline_is_production_ready_and_has_decoded_source_bound_links() {
         .link_at_for(&doc, authority(&doc), index)
         .unwrap()
         .unwrap();
-    assert_eq!(link.destination, "https://example.com/a?x=1&y=2");
+    assert_eq!(
+        link.destination.clone().into_string(),
+        "https://example.com/a?x=1&y=2"
+    );
     assert_eq!(link.label_utf16_range, index..index + 2);
     assert!(
         ready
@@ -376,7 +386,10 @@ fn hit_point_reposition_keeps_complete_links_without_requesting_the_following_ta
             .unwrap()
             .unwrap();
         assert_eq!(link.label_utf16_range, label);
-        assert_eq!(link.destination, "https://example.com/a?x=1&y=2");
+        assert_eq!(
+            link.destination.clone().into_string(),
+            "https://example.com/a?x=1&y=2"
+        );
         // 原有限Parser已完整证明同块另一个链接，正label事实不依赖当前1-unit样式覆盖。
         // 样式和无链接结论仍受原coverage限制，不能据此把后方整表或其它块冒充Ready。
         assert!(
@@ -390,7 +403,7 @@ fn hit_point_reposition_keeps_complete_links_without_requesting_the_following_ta
             .unwrap()
             .unwrap();
         assert_eq!(other.label_utf16_range, other_label);
-        assert_eq!(other.destination, "../同块.md");
+        assert_eq!(other.destination.clone().into_string(), "../同块.md");
         assert_eq!(
             ready.link_at_for(&doc, authority(&doc), table_index),
             Err(MarkdownTableRequestError::Window(
@@ -507,7 +520,10 @@ fn closed_root_links_preserve_real_label_boundaries_and_targets() {
             .link_at_for(&doc, authority(&doc), clickable)
             .unwrap()
             .unwrap();
-        assert_eq!(target.destination, "https://example.com/target");
+        assert_eq!(
+            target.destination.clone().into_string(),
+            "https://example.com/target"
+        );
         assert_eq!(
             target.label_utf16_range,
             units(&source, start..start + label.len())
@@ -545,7 +561,9 @@ fn closed_root_links_resolve_global_first_definition_and_preserve_old_publicatio
             .link_at_for(&doc, authority(&doc), index)
             .unwrap()
             .unwrap()
-            .destination,
+            .destination
+            .clone()
+            .into_string(),
         "https://example.com/first"
     );
     assert_eq!(request.batch.source_probe_state().0, original_global);
@@ -698,7 +716,9 @@ fn short_root_atx_inline_uses_real_leaf_and_original_parser() {
                         .link_at_for(&doc, authority(&doc), at)
                         .unwrap()
                         .unwrap()
-                        .destination,
+                        .destination
+                        .clone()
+                        .into_string(),
                     "https://example.com/atx"
                 );
                 assert!(request.total_work().copied_source_bytes > 0);
@@ -761,7 +781,9 @@ fn short_scoped_rich_atx_keeps_original_inline_references_prefixes_and_canonical
                     .link_at_for(&doc, authority(&doc), label)
                     .unwrap()
                     .unwrap()
-                    .destination,
+                    .destination
+                    .clone()
+                    .into_string(),
                 "https://example.com/first"
             );
             assert_eq!(
@@ -864,7 +886,9 @@ fn short_scoped_paragraph_and_setext_preserve_original_inline_and_physical_prefi
                     .link_at_for(&doc, authority(&doc), label)
                     .unwrap()
                     .unwrap()
-                    .destination,
+                    .destination
+                    .clone()
+                    .into_string(),
                 "https://example.com/first"
             );
             if let Some(at) = block.find("跨行链接") {
@@ -874,7 +898,9 @@ fn short_scoped_paragraph_and_setext_preserve_original_inline_and_physical_prefi
                         .link_at_for(&doc, authority(&doc), at)
                         .unwrap()
                         .unwrap()
-                        .destination,
+                        .destination
+                        .clone()
+                        .into_string(),
                     "https://example.com/across",
                     "跨行 destination 不能把真实 quote prefix 当成 URL 文字"
                 );
@@ -944,7 +970,9 @@ fn short_footnotes_preserve_real_numeric_labels_nested_openings_and_rich_childre
                     .link_at_for(&doc, authority(&doc), label)
                     .unwrap()
                     .unwrap()
-                    .destination,
+                    .destination
+                    .clone()
+                    .into_string(),
                 "https://example.com/first"
             );
             // 真实 raw 值从原文档流式输出；标签、实体和未归一化 code 都必须原样保存，
@@ -991,7 +1019,9 @@ fn short_root_setext_rich_inline_preserves_real_heading_and_reference() {
             .link_at_for(&doc, authority(&doc), at)
             .unwrap()
             .unwrap()
-            .destination,
+            .destination
+            .clone()
+            .into_string(),
         "https://example.com/first"
     );
 }

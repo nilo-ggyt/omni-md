@@ -4,7 +4,9 @@
 //! No text body, HTML/AST, or AppKit object is retained; native adapters map runs
 //! to attributes while the piece tree remains the sole authoritative text model.
 
+mod link_destination;
 pub(crate) mod parser;
+pub use link_destination::MarkdownLinkDestination;
 mod prefixes;
 // S2原型只在显式feature中提供已验证窗口和导航；默认产品不公开候选构造接口。
 #[cfg(feature = "s2-table-window-prototype")]
@@ -178,7 +180,7 @@ pub struct MarkdownPresentationQuery {
 /// 原 Parser 已解析的可见链接；目标经过原 escape/entity 规则，范围仍属于 canonical UTF16。
 pub struct MarkdownSourceLink {
     pub label_utf16_range: Range<usize>,
-    pub destination: String,
+    pub destination: MarkdownLinkDestination,
 }
 
 /// Parser确认的无序列表原字符；glyph消费者不能据此改写正文。

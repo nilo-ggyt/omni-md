@@ -1,4 +1,4 @@
-//! 部分覆盖必须与完整语义oracle相符，同时逐字符拒绝窗口中的复杂 inline、容器和未知空洞。
+//! 部分覆盖必须与完整语义oracle相符；已证Root Link真实消费，块间separator/未知scope仍拒绝。
 
 use super::production::{finish_sources, leaf_sources};
 use super::*;
@@ -23,6 +23,28 @@ pub(super) fn assert_partial_oracle(
     baseline
         .rebuild(document.generation(), 0..document.utf16_len(), source)
         .unwrap();
+    // LeafBlockKind只描述原producer的Leaf来源；新接通的普通段落仍是Line来源，不应
+    // 冒成代码块。分类来自独立完整Parser，不能把返回None与未覆盖的semanticGap混淆。
+    let blocks: Vec<_> = Parser::new_ext(
+        source,
+        crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+    )
+    .into_offset_iter()
+    .filter_map(|(event, range)| {
+        let kind = match event {
+            Event::Start(Tag::Paragraph | Tag::Heading { .. }) => None,
+            Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(_))) => {
+                Some(LeafBlockKind::FencedCode)
+            }
+            Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Indented)) => {
+                Some(LeafBlockKind::IndentedCode)
+            }
+            Event::Rule => Some(LeafBlockKind::ThematicBreak),
+            _ => return None,
+        };
+        Some((units(source, range), kind))
+    })
+    .collect();
     let actual: Vec<_> = ready
         .covered_ranges_for(document, authority(document))
         .unwrap()
@@ -47,11 +69,18 @@ pub(super) fn assert_partial_oracle(
             assert!(
                 query.utf16_range.start >= coverage.start && query.utf16_range.end <= coverage.end
             );
-            assert!(
+            // quote代码的原prefix在显式golden coverage内；按相交的同一Parser块确认其
+            // Leaf类别。真正separator既不在expected内，也仍须同时拒绝样式和block查询。
+            let (_, expected_kind) = blocks
+                .iter()
+                .find(|(range, _)| range.start < coverage.end && coverage.start < range.end)
+                .expect("每份显式已证coverage必须对应真实Parser块，不可由空隙造权");
+            assert_eq!(
                 ready
                     .block_kind_at_for(document, authority(document), index)
-                    .unwrap()
-                    .is_some()
+                    .unwrap(),
+                *expected_kind,
+                "index={index}"
             );
         } else {
             assert!(
@@ -106,7 +135,7 @@ fn assert_fence_separator_is_unknown(
 }
 
 #[test]
-fn mixed_window_publishes_proven_root_and_nested_code_without_claiming_unknown_inline() {
+fn mixed_window_publishes_real_root_links_and_nested_code_without_covering_separators() {
     let code = "```rust\r\n中文😀<u>代码</u>\r\n```\r\n";
     let rule = "***\n";
     let unknown = format!(
@@ -133,17 +162,18 @@ fn mixed_window_publishes_proven_root_and_nested_code_without_claiming_unknown_i
             Event::End(pulldown_cmark::TagEnd::BlockQuote(_)) => quote_start = None,
             Event::Start(Tag::CodeBlock(_)) => {
                 // 新能力包含原 quote 首行 prefix；末端仍是原 Parser 的真正 CodeBlock 末端。
-                // giant link 的普通段落没有进入这个预期库存，未知洞的逐字符拒绝保持原断言。
                 expected.push(units(
                     &source,
                     quote_start.unwrap_or(range.start)..range.end,
                 ));
             }
+            Event::Start(Tag::Paragraph) => expected.push(units(&source, range)),
             Event::Rule => expected.push(units(&source, range)),
             _ => {}
         }
     }
     let (_directory, mut doc) = document(&source);
+    let backing = doc.original_backing_observer().unwrap();
     // 完整方向仍进入同一语义票据，不能按有序范围补签相反方向。
     doc.set_selection(MarkdownTextSelection {
         anchor_utf16: doc.utf16_len(),
@@ -153,7 +183,9 @@ fn mixed_window_publishes_proven_root_and_nested_code_without_claiming_unknown_i
     let requested = 0..doc.utf16_len();
     let (request, sources) = leaf_sources(&doc, requested.clone());
     let ready = ready(&sources);
-    assert_partial_oracle(&source, &doc, ready, requested, &expected);
+    // 原来被称为未知的direct link现已获原流式Parser证明；同一原字面必须逐位置迁正，
+    // 而真正块间separator仍不获得邻块权限，不能把整窗笼统签成一份Ready。
+    assert_partial_oracle(&source, &doc, ready, requested.clone(), &expected);
     assert_fence_separator_is_unknown(
         &source,
         &doc,
@@ -169,21 +201,31 @@ fn mixed_window_publishes_proven_root_and_nested_code_without_claiming_unknown_i
         ready.block_kind_for(&doc, authority(&doc)),
         Err(MarkdownTableRequestError::InvalidRequest)
     );
+    let rule_start = source.rfind(rule).unwrap();
     assert_eq!(
         ready
-            .block_kind_at_for(&doc, authority(&doc), expected[0].start)
+            .block_kind_at_for(
+                &doc,
+                authority(&doc),
+                units(&source, code_start..code_start).start
+            )
             .unwrap(),
         Some(LeafBlockKind::FencedCode)
     );
     assert_eq!(
         ready
-            .block_kind_at_for(&doc, authority(&doc), expected.last().unwrap().start)
+            .block_kind_at_for(
+                &doc,
+                authority(&doc),
+                units(&source, rule_start..rule_start).start,
+            )
             .unwrap(),
         Some(LeafBlockKind::ThematicBreak)
     );
-    assert_eq!(request.total_work().copied_source_bytes, 0);
-    assert_eq!(request.total_work().parser_input_bytes, 0);
-    assert_eq!(request.total_work().allocated_source_capacity, 0);
+    assert_short_link_payload_work(&request, &doc, &source, &requested, ready);
+    drop((request, sources, doc));
+    assert_eq!(backing.mapped_bytes(), 0);
+    assert_eq!(backing.managed_resident_bytes(), 0);
 }
 
 #[test]
@@ -193,7 +235,6 @@ fn viewport_edges_clip_only_true_leaf_source_and_preserve_unicode_half_unit_quer
         "**前言{unknown}** [未知](https://example.com)\n\n```text\n中文😀<u>强调</u>\n```\n\n**尾部{unknown}** [未知](https://example.com)\n"
     );
     let source = source.as_str();
-    let code = units(source, first_leaf_range(source));
     let emoji = source.find('😀').unwrap();
     let emoji_utf16 = source[..emoji].encode_utf16().count();
     for requested in [
@@ -201,19 +242,27 @@ fn viewport_edges_clip_only_true_leaf_source_and_preserve_unicode_half_unit_quer
         emoji_utf16..source.encode_utf16().count(),
     ] {
         let (_directory, doc) = document(source);
-        let expected = code.start.max(requested.start)..code.end.min(requested.end);
+        let backing = doc.original_backing_observer().unwrap();
+        let expected: Vec<_> = Parser::new_ext(
+            source,
+            crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+        )
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            matches!(event, Event::Start(Tag::Paragraph | Tag::CodeBlock(_)))
+                .then(|| units(source, range))
+        })
+        .filter_map(|range| {
+            let clipped = range.start.max(requested.start)..range.end.min(requested.end);
+            (!clipped.is_empty()).then_some(clipped)
+        })
+        .collect();
         let (request, sources) = leaf_sources(&doc, requested.clone());
         let ready = ready(&sources);
-        assert_partial_oracle(
-            source,
-            &doc,
-            ready,
-            requested,
-            std::slice::from_ref(&expected),
-        );
+        assert_partial_oracle(source, &doc, ready, requested.clone(), &expected);
         assert_eq!(
-            ready.coverage_for(&doc, authority(&doc)).unwrap(),
-            &expected
+            ready.coverage_for(&doc, authority(&doc)),
+            Err(MarkdownTableRequestError::InvalidRequest)
         );
         // NSString可查询emoji第二个UTF16单位，真实交集内的样式必须保持同一Unicode语义。
         assert_eq!(
@@ -228,18 +277,22 @@ fn viewport_edges_clip_only_true_leaf_source_and_preserve_unicode_half_unit_quer
                 .unwrap()
                 .styles
         );
-        assert_eq!(request.total_work().copied_source_bytes, 0);
+        assert_short_link_payload_work(&request, &doc, source, &requested, ready);
+        drop((request, sources, doc));
+        assert_eq!(backing.mapped_bytes(), 0);
+        assert_eq!(backing.managed_resident_bytes(), 0);
     }
 }
 
 #[test]
-fn unknown_link_keeps_its_gap_while_real_eof_code_is_independently_proven() {
+fn root_link_and_real_eof_code_publish_only_independently_proven_intersections() {
     let first = "```text\n首块中文\n```\n";
     let source = format!(
         "{first}\n**普通正文{}** [未知](https://example.com)\n\n````\n未闭合正文\n```",
         "中".repeat(700)
     );
     let (_directory, doc) = document(&source);
+    let backing = doc.original_backing_observer().unwrap();
     let (request, sources) = leaf_sources(&doc, 0..doc.utf16_len());
     let ready = ready(&sources);
     let marker_end = first.rfind("```").unwrap() + 3;
@@ -250,12 +303,16 @@ fn unknown_link_keeps_its_gap_while_real_eof_code_is_independently_proven() {
     )
     .into_offset_iter()
     .filter_map(|(event, range)| {
-        matches!(event, Event::Start(Tag::CodeBlock(_))).then(|| units(&source, range))
+        matches!(event, Event::Start(Tag::Paragraph | Tag::CodeBlock(_)))
+            .then(|| units(&source, range))
     })
     .collect::<Vec<_>>();
     assert_partial_oracle(&source, &doc, ready, 0..doc.utf16_len(), &expected);
     assert_fence_separator_is_unknown(&source, &doc, ready, marker_end..first.len(), "\n");
-    assert_eq!(request.total_work().allocated_source_capacity, 0);
+    assert_short_link_payload_work(&request, &doc, &source, &(0..doc.utf16_len()), ready);
+    drop((request, sources, doc));
+    assert_eq!(backing.mapped_bytes(), 0);
+    assert_eq!(backing.managed_resident_bytes(), 0);
 }
 
 #[test]

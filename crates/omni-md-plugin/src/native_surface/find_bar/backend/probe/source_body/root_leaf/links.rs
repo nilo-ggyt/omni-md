@@ -2,6 +2,7 @@
 
 use super::*;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+use std::io::Read;
 
 const PREFIX: &str = "outside\n\n[cached](#cached)\n\n";
 const PARAGRAPH: &str =
@@ -213,6 +214,233 @@ fn verify(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
+const DIRECT_HEAD: &str = "outside `code` **strong** *italic* ***both*** ";
+const DIRECT_PADDING: &str = "plain paragraph keeps the same original source and native viewport. ";
+const DIRECT_PREFIX_REPEATS: usize = 1_024;
+const DIRECT_LABEL: &str = "native link label ";
+const DIRECT_LABEL_REPEATS: usize = 192;
+// 期望 URI 来自原固定 Markdown 的转义和实体语义：括号去反斜线，amp 实体还原。
+// 它不从 Core 已解析目标、点击结果或当前 Scene 回填；末尾 fragment 亦须完整保留。
+const DIRECT_CLOSE: &str = "](https://example.com/a\\(b\\)?first=1&amp;last=2#native-long) ";
+const DIRECT_URI: &str = "https://example.com/a(b)?first=1&last=2#native-long";
+const DIRECT_TAIL_REPEATS: usize = 256;
+const DIRECT_LABEL_START: usize =
+    DIRECT_HEAD.len() + DIRECT_PADDING.len() * DIRECT_PREFIX_REPEATS + 1;
+const DIRECT_LABEL_UNITS: usize = DIRECT_LABEL.len() * DIRECT_LABEL_REPEATS;
+const DIRECT_UNITS: usize = DIRECT_LABEL_START
+    + DIRECT_LABEL_UNITS
+    + DIRECT_CLOSE.len()
+    + DIRECT_PADDING.len() * DIRECT_TAIL_REPEATS;
+
+/// 所有片段均为固定 ASCII，字节数就是独立 canonical UTF16 长度；没有换行，始终是
+/// 一个超过 64KiB 的 Root 段落。生成器只逐片借字面，不先聚合全文 String 或 attributed 图。
+fn direct_segments() -> impl Iterator<Item = &'static str> {
+    std::iter::once(DIRECT_HEAD)
+        .chain(std::iter::repeat_n(DIRECT_PADDING, DIRECT_PREFIX_REPEATS))
+        .chain(std::iter::once("["))
+        .chain(std::iter::repeat_n(DIRECT_LABEL, DIRECT_LABEL_REPEATS))
+        .chain(std::iter::once(DIRECT_CLOSE))
+        .chain(std::iter::repeat_n(DIRECT_PADDING, DIRECT_TAIL_REPEATS))
+}
+
+/// 导航和 URI 查询只能读取原源；全文逐个固定栈片核 canonical 与独立文件句柄，
+/// 同时保空历史、原 generation 和磁盘身份，不能靠删语法、截尾或保存后的新文件过门。
+fn direct_unchanged(rig: &Rig) -> Result<(), String> {
+    let owner = rig.document.upgrade().ok_or("长直接链接原 Doc 已归还")?;
+    let document = owner.borrow();
+    if document.generation() != 0
+        || document.utf16_len() != DIRECT_UNITS
+        || document.byte_len() != DIRECT_UNITS
+        || document.selection() != MarkdownTextSelection::caret(0)
+        || document.can_undo()
+        || document.can_redo()
+        || document.is_dirty()
+        || !document.original_file_identity_is_unchanged()
+    {
+        return Err("长直接链接只读导航改变了原文稿、选择、历史或磁盘身份".into());
+    }
+    let mut expected = direct_segments().flat_map(str::bytes);
+    let mut units = [0_u16; 256];
+    for start in (0..DIRECT_UNITS).step_by(units.len()) {
+        let used = units.len().min(DIRECT_UNITS - start);
+        document
+            .copy_utf16_code_units(start, &mut units[..used])
+            .map_err(|cause| cause.to_string())?;
+        if units[..used]
+            .iter()
+            .any(|actual| expected.next().map(u16::from) != Some(*actual))
+        {
+            return Err("长直接链接显示改变了原 canonical 字符".into());
+        }
+    }
+    if expected.next().is_some() {
+        return Err("长直接链接原 canonical 尾部未完整保留".into());
+    }
+    drop(document);
+    drop(owner); // 原文稿借用和临时强边先归还，文件验证不跨任何 Native 或 runloop。
+    let mut file = std::fs::File::open(rig._file.path()).map_err(|cause| cause.to_string())?;
+    let mut bytes = [0_u8; 128];
+    for segment in direct_segments() {
+        file.read_exact(&mut bytes[..segment.len()])
+            .map_err(|cause| cause.to_string())?;
+        if &bytes[..segment.len()] != segment.as_bytes() {
+            return Err("长直接链接只读流程改变了原磁盘字节".into());
+        }
+    }
+    if file
+        .read(&mut bytes[..1])
+        .map_err(|cause| cause.to_string())?
+        != 0
+    {
+        return Err("长直接链接原磁盘出现额外尾部".into());
+    }
+    Ok(())
+}
+
+/// 同一长物理行的代码和粗斜体先进入真实封存帧，再沿原 SourceTarget 滚动至链接首中尾。
+/// 每次只借当前 Scene 的实际字符框、hit 与 link_target；不点击外链、不调用 NSWorkspace，
+/// 也不借已知 URI 去补当前尚未具备的语义权限。任一 Pending 都是本用例的真实失败。
+fn verify_direct(rig: &mut Rig) -> Result<(), String> {
+    let initial = rig
+        .view
+        .capture_ready_scene_key()
+        .map_err(|cause| cause.to_string())?;
+    if rig.backing.mapped_bytes() == 0 {
+        return Err("长直接链接没有保持原真实源映射".into());
+    }
+    let parts = rig
+        .body
+        .probe_root_leaf_parts()
+        .map_err(|cause| cause.to_string())?;
+    // 只借原首屏已经实际 sealed 的字体/样式事实，不能为检查远端链接先索取整篇 parts。
+    // 固定 head 的四个字面范围给出独立期望；角色必须随真正 glyph 发布而非仅 Parser 分词。
+    for (literal, styles) in [
+        ("code", MarkdownPresentationStyles::INLINE_CODE),
+        ("strong", MarkdownPresentationStyles::STRONG),
+        ("italic", MarkdownPresentationStyles::EMPHASIS),
+        ("both", MarkdownPresentationStyles::STRONG),
+        ("both", MarkdownPresentationStyles::EMPHASIS),
+    ] {
+        let start = DIRECT_HEAD.find(literal).expect("固定长段落保原样式字面");
+        for index in start..start + literal.len() {
+            if parts
+                .iter()
+                .find(|part| part.source.contains(&index))
+                .is_none_or(|part| !part.presentation.contains(styles))
+            {
+                return Err(format!(
+                    "长直接链接前缀的真实封存样式缺失：source={index} expected={styles:?}"
+                ));
+            }
+        }
+    }
+    drop(parts); // 字体弱观察只核本帧；后继导航不保存整段 Font/Source 图或第二份行目录。
+    direct_unchanged(rig)?;
+    let mut previous: Option<NativeMarkdownPagedSceneKey> = None;
+    for (stage, index) in [
+        ("root_leaf_long_direct_link_start", DIRECT_LABEL_START),
+        (
+            "root_leaf_long_direct_link_middle",
+            DIRECT_LABEL_START + DIRECT_LABEL_UNITS / 2,
+        ),
+        (
+            "root_leaf_long_direct_link_end",
+            DIRECT_LABEL_START + DIRECT_LABEL_UNITS - 2,
+        ),
+    ] {
+        // label 横跨数个真实 viewport；原首、中、尾字面位置独立于候选 run/可见范围。
+        // 先登记原完整 CPU 通知再请求滚动，三秒内还须消费同一次 SourceTarget 可见证明。
+        reveal(rig, stage, index)?;
+        let key = rig
+            .view
+            .capture_ready_scene_key()
+            .map_err(|cause| cause.to_string())?;
+        // 正常 SourceTarget 不编辑选择；跨窗口只换真实几何。旧 key 即使弱对象仍活，
+        // 也必须被当前 Body 撤权，不能凭同文稿或相同 URI 将上一帧复用成这次成功。
+        if key.source != initial.source
+            || key.request.input != initial.request.input
+            || previous.as_ref().is_some_and(|previous| {
+                key.same(previous)
+                    || key.request.virtual_viewport.document_origin
+                        == previous.request.virtual_viewport.document_origin
+                    || NativeMarkdownPagedTextViewDelegate::scene_current(&*rig.body, previous)
+            })
+        {
+            return Err("长链接跨窗口导航没有保原输入、Source或撤销旧几何".into());
+        }
+        let scene = NativeMarkdownPagedTextViewDelegate::ready_scene(&*rig.body, &key.request)
+            .map_err(|cause| cause.to_string())?;
+        let first = scene
+            .first_rect(NSRange::new(index, 1))
+            .map_err(|cause| cause.to_string())?;
+        if first.actual_range != NSRange::new(index, 1)
+            || first.rect.size.width <= 0.0
+            || first.rect.size.height <= 1.0
+        {
+            return Err(format!("{stage}: 原标签字符没有完整非空 canonical 框"));
+        }
+        let local = NSPoint::new(
+            first.rect.origin.x + first.rect.size.width * 0.25,
+            first.rect.origin.y + first.rect.size.height * 0.5,
+        );
+        // 固定 ASCII label 的内部四分之一点应命中原左端 canonical 单元。查询沿原
+        // Scene 的 Source/publication/完整 Input 许可进行；不直接调 Core 来替 Native 过门。
+        if scene.hit(local).map_err(|cause| cause.to_string())? != index
+            || scene
+                .link_target(local)
+                .map_err(|cause| cause.to_string())?
+                .as_deref()
+                != Some(DIRECT_URI)
+        {
+            return Err(format!(
+                "{stage}: 长标签真实命中没有返回原转义和实体规范化后的完整 URI"
+            ));
+        }
+        drop(scene); // Reader/Font/Source 的同步借用在下个原生导航与严格关闭前结束。
+        previous = Some(key);
+        direct_unchanged(rig)?;
+    }
+    rig.remember_receipt()?;
+    println!(
+        "native_root_long_direct_link original_root_bytes={DIRECT_UNITS} original_label_units={DIRECT_LABEL_UNITS} mapped_source=true code_strong_emphasis_combined=true actual_scene_hit_uri_start_middle_end=true native_viewport_navigation=true normalized_complete_uri=true canonical_disk_history_unchanged=true external_url_open_tested=false whole_product=false formal=false"
+    );
+    Ok(())
+}
+
+/// 短点击/撤销场景的整图已经释放后才装配这个长段；失败仍先完成相同的严格拆图，
+/// 再报告业务错误。关闭票继续检查所有 Native、Doc/Input、Font、worker、FD、mmap 和像素。
+fn direct_case(mtm: MainThreadMarker) -> Result<(), String> {
+    let (retirement, publication, result) = autoreleasepool(|_| -> Result<_, String> {
+        let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
+        for segment in direct_segments() {
+            file.write_all(segment.as_bytes())
+                .map_err(|cause| cause.to_string())?;
+        }
+        file.flush().map_err(|cause| cause.to_string())?;
+        let mut rig = Rig::attach_mode(
+            mtm,
+            file,
+            DIRECT_UNITS,
+            1,
+            false,
+            MarkdownPresentationMode::InlinePreview,
+            false,
+        )?;
+        let result = verify_direct(&mut rig);
+        let publication = rig
+            .body
+            .probe_root_leaf_publication()
+            .map_err(|cause| cause.to_string());
+        let retirement = release::close(rig, false)?;
+        Ok((retirement, publication, result))
+    })?;
+    retirement.verify(false)?;
+    if publication?.upgrade().is_some() {
+        return Err("长直接链接关闭后原语义 publication 仍被强持有".into());
+    }
+    result
+}
+
 pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, publication, result) = autoreleasepool(|_| -> Result<_, String> {
         let (file, units, lines) = fixture()?;
@@ -237,5 +465,6 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
     if publication?.upgrade().is_some() {
         return Err("旧cache链接关闭后原有限Ready仍被持有".into());
     }
-    result
+    result?;
+    direct_case(mtm)
 }

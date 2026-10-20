@@ -286,6 +286,8 @@ impl InlinePermission {
                     | InlineCodeStep::Span { work, .. }
                     | InlineCodeStep::Prefix { work, .. }
                     | InlineCodeStep::Emphasis { work, .. }
+                    | InlineCodeStep::Link { work, .. }
+                    | InlineCodeStep::LinkEnd { work, .. }
                     | InlineCodeStep::Proven { work, .. }
                     | InlineCodeStep::NeedsGeneralInline { work } => *work,
                 };

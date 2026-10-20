@@ -734,7 +734,9 @@ impl NativeMarkdownPagedTextScene for Scene {
                 .link_at(&owner, &self.key, index)?
         }; // 原Doc/Producer借用已结束，后继Native URL初始化不跨Core资源借用。
         self.require()?;
-        Ok(link.map(|link| link.destination))
+        // 此处是原指针URL查询出口，已退还Doc/Producer借用并核同一key；有限目标的连续
+        // 表示只交给后继Native URL调用，不缓存为第二份CPU语义或借旧Source补权。
+        Ok(link.map(|link| link.destination.into_string()))
     }
     fn cpu_frame_published(&self, paints: usize) {
         // CPU owner 已真正提交完整帧；这里只排同一个原 key 的弱通知，不在绘图栈调用外方。

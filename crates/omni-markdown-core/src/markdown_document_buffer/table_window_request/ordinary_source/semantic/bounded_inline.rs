@@ -540,12 +540,16 @@ fn collect_links(
                     let start = absolute_start + source[..range.start].encode_utf16().count();
                     let end = start + source[range].encode_utf16().count();
                     quota
-                        .admit_metadata(std::mem::size_of::<MarkdownSourceLink>())
+                        .admit_metadata(
+                            std::mem::size_of::<MarkdownSourceLink>()
+                                + crate::MarkdownLinkDestination::publication_metadata()
+                                + std::mem::size_of::<Vec<u8>>(),
+                        )
                         .map_err(MarkdownTableRequestError::Window)?;
                     links.reserve_exact(1);
                     links.push(MarkdownSourceLink {
                         label_utf16_range: start..end,
-                        destination: link.destination,
+                        destination: crate::MarkdownLinkDestination::from_string(link.destination),
                     });
                 }
             }

@@ -26,8 +26,9 @@ pub use inline_origin::{
 mod inline_semantic;
 pub(crate) use inline_semantic::TableCellInlineContext;
 pub use inline_semantic::{
-    InlineCodeCursor, InlineCodeStep, InlinePlainContainers, InlinePlainCursor, InlinePlainLimits,
-    InlinePlainStep, InlinePlainTerminal, VerifiedInlineCodeSpan, VerifiedInlineEmphasisRun,
+    InlineCodeCursor, InlineCodeStep, InlineLinkDestinationDecoder, InlineLinkDestinationStep,
+    InlinePlainContainers, InlinePlainCursor, InlinePlainLimits, InlinePlainStep,
+    InlinePlainTerminal, VerifiedInlineCodeSpan, VerifiedInlineEmphasisRun, VerifiedInlineLink,
     VerifiedInlinePlainProof, VerifiedInlineSemanticSeed,
 };
 mod leaf_block;

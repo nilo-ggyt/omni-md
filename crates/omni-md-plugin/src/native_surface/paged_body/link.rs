@@ -78,7 +78,10 @@ impl NativeMarkdownPagedBody {
             }
             Ok(Some(link)) => {
                 if let Some(link) = link {
-                    view.finish_link_activation(&pending.key, &pending.intent, &link.destination);
+                    // 语义页保有的只是原有限URI；原owner/key已复核且Producer已归槽，
+                    // 仅在真正URL副作用边界物化String，不让排版量子搬移整个目标。
+                    let destination = link.destination.into_string();
+                    view.finish_link_activation(&pending.key, &pending.intent, &destination);
                 } else {
                     view.retire_link_intent(&pending.intent);
                 } // 真正覆盖而无link是一次完成；未知空洞不得被伪装成None或消耗第一次click。

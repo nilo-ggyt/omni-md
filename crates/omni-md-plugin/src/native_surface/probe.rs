@@ -892,6 +892,46 @@ impl NativeMarkdownMemoryWorkload {
                 || !receipt.epoch.permits(surface)
                 || surface.presentation_mode != mode
             {
+                // 只在原严格拒绝处读取现成标量，区分目标模式、完整 Input、弱正文身份及
+                // 原动作代次的真实撤权。原 request 的字段仍只借值，不重签票或保活旧客户。
+                #[cfg(feature = "native-markdown-runtime-probe")]
+                {
+                    let actual_epoch = MemoryActionEpoch::capture(surface);
+                    let editor = surface.editor.as_ref();
+                    let actual_input = editor.map(|editor| {
+                        editor
+                            .text_view
+                            .input_state()
+                            .map_err(|cause| std::mem::discriminant(&cause))
+                    });
+                    let facts_document_same = editor.is_some_and(|editor| {
+                        std::rc::Weak::ptr_eq(&facts.document, &Rc::downgrade(editor.document()))
+                    });
+                    let request_document_same = editor.is_some_and(|editor| {
+                        std::rc::Weak::ptr_eq(
+                            &receipt.request.document,
+                            &Rc::downgrade(editor.document()),
+                        )
+                    });
+                    let facts_body_same = editor.is_some_and(|editor| {
+                        std::rc::Weak::ptr_eq(&facts.body, &Rc::downgrade(&editor.body))
+                    });
+                    let request_body_same = editor.is_some_and(|editor| {
+                        std::rc::Weak::ptr_eq(&receipt.request.body, &Rc::downgrade(&editor.body))
+                    });
+                    eprintln!(
+                        "native_memory_mode_replaced expected_mode={mode:?} actual_mode={:?} actual_body_mode={:?} expected_input={:?} actual_input={actual_input:?} facts_document_same={facts_document_same} request_document_same={request_document_same} facts_body_same={facts_body_same} request_body_same={request_body_same} expected_find={} actual_find={} expected_workspace={} actual_workspace={} expected_header={} actual_header={}",
+                        surface.presentation_mode,
+                        editor.map(|editor| editor.body.presentation_mode()),
+                        receipt.request.input,
+                        receipt.epoch.find,
+                        actual_epoch.find,
+                        receipt.epoch.workspace,
+                        actual_epoch.workspace,
+                        receipt.epoch.header,
+                        actual_epoch.header,
+                    );
+                }
                 return Err("模式工作负载实际模式或原正文不一致".into());
             }
             receipt.request.verify(surface)?;

@@ -301,7 +301,7 @@ fn giant_unicode_line_proves_only_actual_finite_byte_coverage() {
 }
 
 #[test]
-fn forward_prefix_keeps_true_seed_origin_and_semantic_fuel_then_refuses_complex_suffix() {
+fn forward_prefix_keeps_original_publications_and_streams_later_direct_link() {
     let mut source = (0..120)
         .map(|line| format!("第{line}行中😀\r\n"))
         .collect::<String>();
@@ -311,7 +311,8 @@ fn forward_prefix_keeps_true_seed_origin_and_semantic_fuel_then_refuses_complex_
         .map(|(byte, _)| byte)
         .collect::<Vec<_>>();
     let units = |byte| source[..byte].encode_utf16().count();
-    let (_directory, doc) = document(&source);
+    let (directory, doc) = document(&source);
+    let backing = doc.original_backing_observer().unwrap();
     let mut request = doc
         .viewport_plain_source_request(units(starts[20])..units(starts[25]), 41, doc.selection())
         .unwrap();
@@ -387,11 +388,101 @@ fn forward_prefix_keeps_true_seed_origin_and_semantic_fuel_then_refuses_complex_
         )
         .unwrap();
     finish(&mut request, &doc).unwrap();
-    let third = request.sources_for(&doc, authority(&doc)).unwrap().unwrap();
+    let third = request
+        .take_sources_for(&doc, authority(&doc))
+        .unwrap()
+        .unwrap();
+    let MarkdownOrdinarySemanticState::PlainReady(ready) =
+        third.ordinary_semantics_for(&doc, authority(&doc)).unwrap()
+    else {
+        panic!("后缀的真实直接链接已接流式语法，不得保留旧General断言");
+    };
+    let requested = units(starts[110])..doc.utf16_len();
+    let expected_owner = Parser::new_ext(
+        &source,
+        crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+    )
+    .into_offset_iter()
+    .find_map(|(event, range)| match event {
+        Event::Start(Tag::Link { dest_url, .. }) => Some((range, dest_url.into_string())),
+        _ => None,
+    })
+    .unwrap();
+    let label = Parser::new_ext(
+        &source,
+        crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+    )
+    .into_offset_iter()
+    .find_map(|(event, range)| match event {
+        Event::Text(text) if text.as_ref() == "复杂语法" => {
+            Some(units(range.start)..units(range.end))
+        }
+        _ => None,
+    })
+    .unwrap();
+    let mut baseline = MarkdownViewportPresentation::default();
+    baseline.set_active_selection(ordered_selection(doc.selection()));
+    baseline
+        .rebuild(doc.generation(), 0..doc.utf16_len(), &source)
+        .unwrap();
+    assert_eq!(
+        ready.coverage_for(&doc, authority(&doc)).unwrap(),
+        &requested
+    );
+    assert_eq!(
+        ready.block_source_range_for(&doc, authority(&doc)).unwrap(),
+        0..source.len()
+    );
+    // 从完整Parser取得owner和真实child label；新pub逐位置保护marker/目标显隐与点击权限。
+    // 首两批旧pub仍只对自己原覆盖有效，不能因同源后缀Ready而扩大旧票权限。
+    for index in requested.clone() {
+        assert_eq!(
+            ready
+                .query_for(&doc, authority(&doc), index)
+                .unwrap()
+                .unwrap()
+                .styles,
+            baseline.query(index).unwrap().styles,
+            "index={index}"
+        );
+        let link = ready.link_at_for(&doc, authority(&doc), index).unwrap();
+        if label.contains(&index) {
+            let link = link.unwrap();
+            assert_eq!(link.label_utf16_range, label);
+            assert_eq!(link.destination.clone().into_string(), expected_owner.1);
+        } else {
+            assert!(link.is_none());
+        }
+    }
+    let owner_start = units(expected_owner.0.start);
+    assert!(
+        ready
+            .query_for(&doc, authority(&doc), owner_start)
+            .unwrap()
+            .unwrap()
+            .styles
+            .contains(MarkdownPresentationStyles::MARKER)
+    );
+    let MarkdownOrdinarySemanticState::PlainReady(second_ready) = second
+        .ordinary_semantics_for(&doc, authority(&doc))
+        .unwrap()
+    else {
+        panic!("原中间pub仍须有效");
+    };
     assert!(matches!(
-        third.ordinary_semantics_for(&doc, authority(&doc)).unwrap(),
-        MarkdownOrdinarySemanticState::Pending(MarkdownOrdinaryPendingReason::NeedsGeneralInline)
+        second_ready.link_at_for(&doc, authority(&doc), label.start),
+        Err(MarkdownTableRequestError::Window(
+            MarkdownTableWindowError::ContextPending
+        ))
     ));
+    assert!(matches!(
+        request.continue_forward(&doc, &first, requested.clone(), authority(&doc)),
+        Err(MarkdownTableRequestError::PublicationSuperseded)
+    ));
+    assert_eq!(
+        ready.coverage_for(&doc, authority(&doc)).unwrap(),
+        &requested
+    );
     let MarkdownOrdinarySemanticState::PlainReady(old) =
         first.ordinary_semantics_for(&doc, authority(&doc)).unwrap()
     else {
@@ -404,18 +495,144 @@ fn forward_prefix_keeps_true_seed_origin_and_semantic_fuel_then_refuses_complex_
             .styles,
         MarkdownPresentationStyles::default()
     );
+    assert_eq!(doc.generation(), 0);
+    assert!(!doc.can_undo() && !doc.can_redo());
+    assert_eq!(
+        std::fs::read(directory.path().join("有限普通语义验收.md")).unwrap(),
+        source.as_bytes()
+    );
+    // source/pub只保Weak及不可变URI；即使三份pub与请求仍活，真正Doc退休也必须释放mmap。
+    drop(doc);
+    assert_eq!(backing.mapped_bytes(), 0);
+    assert_eq!(backing.managed_resident_bytes(), 0);
+    drop((first, second, third, request));
 }
 
 #[test]
-fn complex_nonroot_and_cross_block_holes_stay_pending_and_source_entry_stays_source_only() {
-    // 一般强调现已真实支持；该负例保留尚未完成的 giant link，不能退回默认样式。
+fn direct_links_match_parser_while_unknown_forms_and_cross_block_holes_stay_pending() {
+    // 保留原长段落字面；过去的直接链接Pending已过期，必须保护真实owner/label/选择显隐。
+    // reference/image仍没有本组流式Global证明，下方负例不会因direct支持而被抹掉。
     let complex = format!(
         "普通 **{}** [未决链接](https://example.com)\n",
         "粗体".repeat(400)
     );
+    let (owner, target) = Parser::new_ext(
+        &complex,
+        crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+    )
+    .into_offset_iter()
+    .find_map(|(event, range)| match event {
+        Event::Start(Tag::Link { dest_url, .. }) => Some((range, dest_url.into_string())),
+        _ => None,
+    })
+    .unwrap();
+    let units = |byte| complex[..byte].encode_utf16().count();
+    let label = Parser::new_ext(
+        &complex,
+        crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+    )
+    .into_offset_iter()
+    .find_map(|(event, range)| match event {
+        Event::Text(text) if text.as_ref() == "未决链接" => {
+            Some(units(range.start)..units(range.end))
+        }
+        _ => None,
+    })
+    .unwrap();
+    for selection in [
+        MarkdownTextSelection::caret(0),
+        MarkdownTextSelection::caret(label.start + 1),
+        MarkdownTextSelection {
+            anchor_utf16: label.end,
+            head_utf16: label.start,
+        },
+    ] {
+        let (directory, mut doc) = document(&complex);
+        let backing = doc.original_backing_observer().unwrap();
+        doc.set_selection(selection).unwrap();
+        let mut request = doc
+            .viewport_plain_source_request(0..doc.utf16_len(), 41, selection)
+            .unwrap();
+        finish(&mut request, &doc).unwrap();
+        let sources = request
+            .take_sources_for(&doc, authority(&doc))
+            .unwrap()
+            .unwrap();
+        let MarkdownOrdinarySemanticState::PlainReady(ready) = sources
+            .ordinary_semantics_for(&doc, authority(&doc))
+            .unwrap()
+        else {
+            panic!("原合法direct语法必须产生完整真实语义");
+        };
+        let mut baseline = MarkdownViewportPresentation::default();
+        baseline.set_active_selection(ordered_selection(selection));
+        baseline
+            .rebuild(doc.generation(), 0..doc.utf16_len(), &complex)
+            .unwrap();
+        assert_eq!(
+            ready.block_source_range_for(&doc, authority(&doc)).unwrap(),
+            0..complex.len()
+        );
+        for index in 0..doc.utf16_len() {
+            assert_eq!(
+                ready
+                    .query_for(&doc, authority(&doc), index)
+                    .unwrap()
+                    .unwrap()
+                    .styles,
+                baseline.query(index).unwrap().styles,
+                "index={index}, selection={selection:?}"
+            );
+            let actual = ready.link_at_for(&doc, authority(&doc), index).unwrap();
+            if label.contains(&index) {
+                let actual = actual.unwrap();
+                assert_eq!(actual.label_utf16_range, label);
+                assert_eq!(actual.destination.clone().into_string(), target);
+            } else {
+                assert!(actual.is_none());
+            }
+        }
+        // owner包括完整[]和目标，只有真实label可激活；标记显隐仍由原完整selection控制。
+        let marker = ready
+            .query_for(&doc, authority(&doc), units(owner.start))
+            .unwrap()
+            .unwrap();
+        assert!(marker.styles.contains(MarkdownPresentationStyles::MARKER));
+        assert_eq!(
+            marker
+                .styles
+                .contains(MarkdownPresentationStyles::HIDDEN_MARKER),
+            selection.head_utf16 == 0
+        );
+        let mut revoked = authority(&doc);
+        revoked.context_revision += 1;
+        assert!(matches!(
+            ready.link_at_for(&doc, revoked, label.start),
+            Err(MarkdownTableRequestError::PublicationSuperseded)
+        ));
+        assert_eq!(doc.selection(), selection);
+        assert_eq!(doc.generation(), 0);
+        assert!(!doc.can_undo() && !doc.can_redo());
+        assert_eq!(
+            std::fs::read(directory.path().join("有限普通语义验收.md")).unwrap(),
+            complex.as_bytes()
+        );
+        drop((sources, request, doc));
+        assert_eq!(backing.mapped_bytes(), 0);
+        assert_eq!(backing.managed_resident_bytes(), 0);
+    }
+    let unknown_reference = format!("{} [未知引用][T]\n", "普通正文 ".repeat(400));
+    let unknown_image = format!(
+        "{} ![图片](https://example.com/image)\n",
+        "普通正文 ".repeat(400)
+    );
     for (source, expected) in [
         (
-            complex.as_str(),
+            unknown_reference.as_str(),
+            MarkdownOrdinaryPendingReason::NeedsGeneralInline,
+        ),
+        (
+            unknown_image.as_str(),
             MarkdownOrdinaryPendingReason::NeedsGeneralInline,
         ),
         (
@@ -441,7 +658,7 @@ fn complex_nonroot_and_cross_block_holes_stay_pending_and_source_entry_stays_sou
         assert_eq!(sources.retained_metadata, expected_metadata);
     }
     // 引用/列表短块已经接同源 context；保留原夹具，改为与独立完整 Parser 逐位置验证真实新行为。
-    // 未覆盖洞的负例仍在上面断言 Pending，不把新 Ready 能力外推成任意跨块或长链接支持。
+    // 未覆盖洞仍断言Pending；直接链接Ready不会给reference/image或任意跨块范围补权。
     for source in ["> 引用中文\n> 第二行\n", "- 列表中文\n  第二行\n"] {
         let (directory, doc) = document(source);
         let observer = doc.original_backing_observer().unwrap();

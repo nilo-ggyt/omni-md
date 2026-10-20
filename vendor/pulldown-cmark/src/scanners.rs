@@ -1025,52 +1025,218 @@ fn scan_attribute_value(
     Some(i)
 }
 
-// Remove backslash escapes and resolve entities
-pub(crate) fn unescape<'a, I: Into<CowStr<'a>>>(input: I, is_in_table: bool) -> CowStr<'a> {
-    let input = input.into();
-    let mut result = String::new();
-    let mut mark = 0;
-    let mut i = 0;
-    let bytes = input.as_bytes();
-    while i < bytes.len() {
-        match bytes[i..] {
-            // Tables are special, because they're parsed as-if the tables
-            // were parsed in a discrete pass, changing `\|` to `|`, and then
-            // passing the changed string to the inline parser.
-            [b'\\', b'\\', b'|', ..] if is_in_table => {
-                // even number of `\`s before pipe
-                // odd number is handled in the normal way below
-                result.push_str(&input[mark..i]);
-                mark = i + 2;
-                i += 3;
-            }
-            [b'\\', cx, ..] if is_ascii_punctuation(cx) => {
-                result.push_str(&input[mark..i]);
-                mark = i + 1;
-                i += 2;
-            }
-            [b'&', ..] => match scan_entity(&bytes[i..]) {
-                (n, Some(value)) => {
-                    result.push_str(&input[mark..i]);
-                    result.push_str(&value);
-                    i += n;
-                    mark = i;
-                }
-                _ => i += 1,
-            },
-            [b'\r', ..] => {
-                result.push_str(&input[mark..i]);
-                i += 1;
-                mark = i;
-            }
-            _ => i += 1,
+#[derive(Clone, Copy, Debug)]
+enum UnescapePhase {
+    Text,
+    Backslash,
+    TableBackslash,
+    Entity,
+}
+
+#[derive(Debug)]
+/// whole Parser 与源帧消费者共用唯一规范化内核；固定carry只装一个反斜杠/实体，不装URL。
+pub(crate) struct UnescapeStream {
+    phase: UnescapePhase,
+    table: bool,
+    entity: crate::inline_scan::EntityScanner,
+    pending: [u8; crate::entities::MAX_ENTITY_NAME_BYTES + 8],
+    length: usize,
+    emitted: usize,
+    flushing: bool,
+    pub(crate) changed: bool,
+}
+
+impl UnescapeStream {
+    pub(crate) fn new(table: bool) -> Self {
+        Self {
+            phase: UnescapePhase::Text,
+            table,
+            entity: crate::inline_scan::EntityScanner::new(),
+            pending: [0; crate::entities::MAX_ENTITY_NAME_BYTES + 8],
+            length: 0,
+            emitted: 0,
+            flushing: false,
+            changed: false,
         }
     }
-    if mark == 0 {
-        input
-    } else {
-        result.push_str(&input[mark..]);
-        result.into()
+
+    /// 输入消耗、输出复制、实体表比较均受同份fuel约束；不足只归还当前位置，不假造EOF。
+    /// 返回(consumed,written,transition_work,complete)，输出可停在UTF8内部，外层负责小carry。
+    pub(crate) fn feed(
+        &mut self,
+        input: &[u8],
+        real_end: bool,
+        output: &mut [u8],
+        fuel: usize,
+    ) -> (usize, usize, usize, bool) {
+        use crate::inline_scan::{EntityTransition, EntityValue};
+        let mut read = 0;
+        let mut written = 0;
+        let mut work = 0;
+        loop {
+            if read + work + 4 > fuel || written == output.len() {
+                return (read, written, work, false);
+            }
+            if self.flushing {
+                if self.emitted < self.length {
+                    output[written] = self.pending[self.emitted];
+                    written += 1;
+                    self.emitted += 1;
+                    work += 1;
+                    continue;
+                }
+                self.length = 0;
+                self.emitted = 0;
+                self.flushing = false;
+            }
+            let Some(&byte) = input.get(read) else {
+                if !real_end {
+                    return (read, written, work, false);
+                }
+                match self.phase {
+                    UnescapePhase::Text => return (read, written, work, true),
+                    UnescapePhase::TableBackslash => {
+                        self.length = 1;
+                        self.changed = true;
+                    }
+                    UnescapePhase::Backslash | UnescapePhase::Entity => {}
+                }
+                self.phase = UnescapePhase::Text;
+                self.flushing = true;
+                work += 1;
+                continue;
+            };
+            work += 1;
+            match self.phase {
+                UnescapePhase::Text => match byte {
+                    b'\\' | b'&' => {
+                        self.pending[0] = byte;
+                        self.length = 1;
+                        self.phase = if byte == b'\\' {
+                            UnescapePhase::Backslash
+                        } else {
+                            self.entity = crate::inline_scan::EntityScanner::new();
+                            UnescapePhase::Entity
+                        };
+                        read += 1;
+                    }
+                    b'\r' => {
+                        self.changed = true;
+                        read += 1;
+                    }
+                    _ => {
+                        output[written] = byte;
+                        written += 1;
+                        read += 1;
+                        work += 1;
+                    }
+                },
+                UnescapePhase::Backslash => {
+                    if self.table && byte == b'\\' {
+                        self.pending[1] = byte;
+                        self.length = 2;
+                        self.phase = UnescapePhase::TableBackslash;
+                        read += 1;
+                    } else if is_ascii_punctuation(byte) {
+                        output[written] = byte;
+                        written += 1;
+                        read += 1;
+                        self.length = 0;
+                        self.phase = UnescapePhase::Text;
+                        self.changed = true;
+                        work += 1;
+                    } else {
+                        self.phase = UnescapePhase::Text;
+                        self.flushing = true; // 非punctuation不被反斜杠消费；原byte留给Text。
+                    }
+                }
+                UnescapePhase::TableBackslash => {
+                    // 与原table双层转义一致：两个反斜杠后若接pipe，两者均删；否则正常缩成一个。
+                    self.pending[0] = if byte == b'|' { b'|' } else { b'\\' };
+                    self.length = 1;
+                    read += usize::from(byte == b'|');
+                    self.phase = UnescapePhase::Text;
+                    self.flushing = true;
+                    self.changed = true;
+                }
+                UnescapePhase::Entity => {
+                    #[cfg(feature = "omni-block-frontier")]
+                    let lookup = self.entity.lookup_work_bound(byte);
+                    #[cfg(not(feature = "omni-block-frontier"))]
+                    let lookup = 0;
+                    if read + work + lookup + self.pending.len() + 4 > fuel {
+                        return (read, written, work, false);
+                    }
+                    work += lookup;
+                    match self.entity.push(byte) {
+                        EntityTransition::Continue => {
+                            self.pending[self.length] = byte;
+                            self.length += 1;
+                            read += 1;
+                        }
+                        EntityTransition::Matched(value) => {
+                            let mut scalar = [0; 4];
+                            let bytes = match value {
+                                EntityValue::Named(value) => value.as_bytes(),
+                                EntityValue::Scalar(value) => {
+                                    value.encode_utf8(&mut scalar).as_bytes()
+                                }
+                            };
+                            // lookup与小结果复制都是真实工作；前置预留固定carry上界，
+                            // 否则小budget可能在查表后才发现没有空间为结果copy付费。
+                            self.pending[..bytes.len()].copy_from_slice(bytes);
+                            work += bytes.len();
+                            self.length = bytes.len();
+                            self.phase = UnescapePhase::Text;
+                            self.flushing = true;
+                            self.changed = true;
+                            read += 1;
+                        }
+                        EntityTransition::Rejected => {
+                            self.phase = UnescapePhase::Text;
+                            self.flushing = true; // 不吞拒绝byte；它可能另起一个&或反斜杠。
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Parser仍保无变化Cow借用；只有共享内核实际改变字节时才创建原本就需要的owned值。
+pub(crate) fn unescape<'a, I: Into<CowStr<'a>>>(input: I, is_in_table: bool) -> CowStr<'a> {
+    let input = input.into();
+    if !input
+        .bytes()
+        .any(|byte| matches!(byte, b'\\' | b'&' | b'\r'))
+    {
+        return input;
+    }
+    let mut cursor = UnescapeStream::new(is_in_table);
+    let mut output = Vec::new();
+    let mut read = 0;
+    let mut produced = 0;
+    let mut chunk = [0; 256];
+    loop {
+        let (consumed, written, _, complete) =
+            cursor.feed(&input.as_bytes()[read..], true, &mut chunk, usize::MAX);
+        if cursor.changed {
+            if output.is_empty() && produced > 0 {
+                output.extend_from_slice(&input.as_bytes()[..produced]);
+            }
+            output.extend_from_slice(&chunk[..written]);
+        }
+        read += consumed;
+        produced += written;
+        if complete {
+            return if cursor.changed {
+                String::from_utf8(output)
+                    .expect("原UTF8及原实体值的规范化仍为UTF8")
+                    .into()
+            } else {
+                input
+            };
+        }
     }
 }
 

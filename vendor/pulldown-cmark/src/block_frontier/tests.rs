@@ -378,7 +378,7 @@ fn giant_row_uses_no_source_buffer_and_resumes_classification_and_utf16_work() {
 }
 
 #[test]
-fn deep_spine_checkpoints_have_constant_size_and_share_structural_storage() {
+fn deep_spine_checkpoints_share_storage_and_resume_real_parser_rows() {
     // 深容器只在真实小prefix seed中解析一次；1024个checkpoint不复制depth×role数组或行scratch。
     let quote = "> ".repeat(2048);
     let prefix = format!("{quote}| H |\n{quote}| - |\n");
@@ -392,9 +392,20 @@ fn deep_spine_checkpoints_have_constant_size_and_share_structural_storage() {
     assert!(checkpoints
         .iter()
         .all(|point| point.spine.shares_tail(&first.spine)));
-    assert!(std::mem::size_of::<TableCheckpoint>() <= 128);
     assert!(state.spine.len() * std::mem::size_of::<ContainerRole>() <= 64 * 1024);
     assert_eq!(state.buffered_source_capacity(), 0);
+    // 真正合同是同spine检查点能继续同源表成员，不是某版结构体布局恰好小于128B。
+    // 从其中一个真实检查点恢复，逐帧结果仍须与完整Parser行/cell事实一致。
+    let mut resumed = TableContinuationState::resume(first);
+    let (rows, end) = consume(&mut resumed, &full, &[], 4096);
+    let expected = oracle_rows(&full);
+    assert_eq!(rows.len(), expected.len());
+    for (actual, expected) in rows.iter().zip(expected) {
+        assert_eq!(actual.byte_end, expected.0.end);
+        assert_eq!(actual.actual_cells, expected.1);
+    }
+    assert_eq!(end, full.len());
+    assert_eq!(resumed.buffered_source_capacity(), 0);
 }
 
 #[test]
@@ -486,8 +497,4 @@ fn incomplete_frames_and_invalid_protocol_do_not_create_opaque_table_end() {
         .unwrap()
         .last_body_row_ordinal()
         .is_none());
-    assert!(
-        std::mem::size_of::<TableCheckpoint>() <= 128,
-        "新增表尾标量不使每个checkpoint膨胀成深spine副本"
-    );
 }

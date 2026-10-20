@@ -2,11 +2,13 @@
 
 use super::*;
 use pulldown_cmark::global_frontier::{
-    InlineCodeCursor, InlineCodeStep, VerifiedInlineEmphasisRun,
+    InlineCodeCursor, InlineCodeStep, VerifiedInlineEmphasisRun, VerifiedInlineLink,
 };
 mod emphasis;
+mod link;
 mod prefix;
 use emphasis::EmphasisJob;
+use link::LinkJob;
 pub(in super::super) use prefix::PrefixDecoration;
 
 #[derive(Eq, PartialEq)]
@@ -36,7 +38,13 @@ pub(super) struct CodeJob {
     done: bool,
     emphasis: Option<Box<EmphasisJob>>,
     incoming: Option<VerifiedInlineEmphasisRun>,
+    incoming_link: Option<VerifiedInlineLink>,
+    link: Option<Box<LinkJob>>,
+    pub(super) links: Vec<MarkdownSourceLink>,
+    target_bytes: usize,
     options: pulldown_cmark::Options,
+    // 强调的外层域来自原 seed；Link label 会临时成为独立内层域，不用视口边缘代替语法边界。
+    source_range: Range<usize>,
     visible: Option<VisibleSpan>,
     visible_index: usize,
     query: Option<MarkdownPresentationQuery>,
@@ -93,7 +101,12 @@ impl CodeJob {
             done: false,
             emphasis: None,
             incoming: None,
+            incoming_link: None,
+            link: None,
+            links: Vec::new(),
+            target_bytes: 0,
             options: block.seed.options(),
+            source_range: block.seed.source_range(),
             visible: None,
             visible_index: 0,
             query: None,
@@ -184,12 +197,76 @@ impl CodeJob {
             }
             return Ok((work, false));
         }
+        if let Some(proof) = self.incoming_link.take() {
+            if self.emphasis.is_none() {
+                quota
+                    .admit_metadata(std::mem::size_of::<EmphasisJob>())
+                    .map_err(MarkdownTableRequestError::Window)?;
+                self.emphasis = Some(Box::new(EmphasisJob::new(
+                    self.options,
+                    self.source_range.clone(),
+                )));
+                self.incoming_link = Some(proof);
+                return Ok((
+                    SemanticWork {
+                        metadata_bytes: std::mem::size_of::<EmphasisJob>(),
+                        structural_transitions: PLAIN_CONTROL,
+                        ..Default::default()
+                    },
+                    false,
+                ));
+            }
+            self.emphasis.as_mut().unwrap().enter_link(&proof)?;
+            let source = proof.source_range();
+            let metadata = if source.start < self.coverage.end && self.coverage.start < source.end {
+                quota
+                    .admit_metadata(std::mem::size_of::<LinkJob>())
+                    .map_err(MarkdownTableRequestError::Window)?;
+                self.link = Some(Box::new(LinkJob::new(
+                    proof,
+                    crate::markdown_viewport_presentation::table_window::TABLE_WINDOW_MAX_REFERENCE_BYTES
+                        .saturating_sub(self.target_bytes),
+                )));
+                std::mem::size_of::<LinkJob>()
+            } else {
+                0 // 离屏 label 仍隔离强调，但不为它复制 URL 或创建点击目标库存。
+            };
+            return Ok((
+                SemanticWork {
+                    metadata_bytes: metadata,
+                    structural_transitions: PLAIN_CONTROL,
+                    ..Default::default()
+                },
+                false,
+            ));
+        }
+        if let Some(link) = self.link.as_mut() {
+            let (mut work, projection) = link.advance(document, selection, quota, budget)?;
+            if let Some(projection) = projection {
+                self.link = None;
+                if let Some(link) = projection.link {
+                    quota
+                        .admit_metadata(std::mem::size_of::<MarkdownSourceLink>())
+                        .map_err(MarkdownTableRequestError::Window)?;
+                    self.target_bytes += link.destination.byte_len();
+                    self.links.reserve_exact(1);
+                    self.links.push(link);
+                    work.metadata_bytes += std::mem::size_of::<MarkdownSourceLink>();
+                }
+                self.visible = Some(projection.span);
+                self.visible_index = 0;
+            }
+            return Ok((work, false));
+        }
         if let Some(run) = self.incoming.take() {
             if self.emphasis.is_none() {
                 quota
                     .admit_metadata(std::mem::size_of::<EmphasisJob>())
                     .map_err(MarkdownTableRequestError::Window)?;
-                self.emphasis = Some(Box::new(EmphasisJob::new(self.options)));
+                self.emphasis = Some(Box::new(EmphasisJob::new(
+                    self.options,
+                    self.source_range.clone(),
+                )));
                 self.incoming = Some(run);
                 return Ok((
                     SemanticWork {
@@ -200,7 +277,7 @@ impl CodeJob {
                     false,
                 ));
             }
-            self.emphasis.as_mut().unwrap().start(run);
+            self.emphasis.as_mut().unwrap().start(run)?;
             return Ok((
                 SemanticWork {
                     structural_transitions: PLAIN_CONTROL,
@@ -271,6 +348,8 @@ impl CodeJob {
             | InlineCodeStep::Span { work, .. }
             | InlineCodeStep::Prefix { work, .. }
             | InlineCodeStep::Emphasis { work, .. }
+            | InlineCodeStep::Link { work, .. }
+            | InlineCodeStep::LinkEnd { work, .. }
             | InlineCodeStep::Proven { work, .. }
             | InlineCodeStep::NeedsGeneralInline { work } => *work,
         };
@@ -292,6 +371,13 @@ impl CodeJob {
                 } // 真物理行 owner 由原 SourceRequest 交回；不按裁剪范围决定显隐。
             }
             InlineCodeStep::Emphasis { run, .. } => self.incoming = Some(run),
+            InlineCodeStep::Link { proof, .. } => self.incoming_link = Some(proof),
+            InlineCodeStep::LinkEnd { source, label, .. } => {
+                self.emphasis
+                    .as_mut()
+                    .ok_or(MarkdownTableRequestError::InvalidRequest)?
+                    .leave_link(&source, &label)?;
+            }
             InlineCodeStep::Proven {
                 requires_general_styles,
                 ..
@@ -409,6 +495,11 @@ impl CodeJob {
         self.output.push(Some(run));
         Ok(())
     }
+
+    /// 与父 Leaf 的既有链接移交口相同；只移动已完成、当前覆盖内的真实目标，不另复制 String。
+    pub(super) fn take_link(&mut self) -> Option<MarkdownSourceLink> {
+        self.links.pop()
+    }
     /// 发布前真实归还可见 code 证明和坐标 scratch，仅保已经封存的输出 run。
     pub(super) fn release_scratch(&mut self) {
         self.spans = Vec::new();
@@ -417,6 +508,8 @@ impl CodeJob {
         self.cursor = None;
         self.emphasis = None;
         self.incoming = None;
+        self.incoming_link = None;
+        self.link = None;
         self.visible = None;
         self.query = None;
         self.query_cached = None;

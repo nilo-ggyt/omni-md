@@ -298,10 +298,10 @@ pub use markdown_document_buffer::changes::{
 
 #[cfg(feature = "native-markdown-candidate")]
 pub use markdown_viewport_presentation::{
-    MARKDOWN_PRESENTATION_OVERSCAN_UTF16_UNITS, MarkdownBulletMarker, MarkdownPresentationMode,
-    MarkdownPresentationQuery, MarkdownPresentationRun, MarkdownPresentationStyles,
-    MarkdownPreviewListMarker, MarkdownPreviewListMarkerKind, MarkdownSourceLink,
-    MarkdownTableAlignment, MarkdownTableCellPrototype, MarkdownTablePrototype,
+    MARKDOWN_PRESENTATION_OVERSCAN_UTF16_UNITS, MarkdownBulletMarker, MarkdownLinkDestination,
+    MarkdownPresentationMode, MarkdownPresentationQuery, MarkdownPresentationRun,
+    MarkdownPresentationStyles, MarkdownPreviewListMarker, MarkdownPreviewListMarkerKind,
+    MarkdownSourceLink, MarkdownTableAlignment, MarkdownTableCellPrototype, MarkdownTablePrototype,
     MarkdownTableRowPrototype, MarkdownViewportPresentation, MarkdownViewportPresentationError,
     MarkdownViewportPresentationSnapshot,
 };

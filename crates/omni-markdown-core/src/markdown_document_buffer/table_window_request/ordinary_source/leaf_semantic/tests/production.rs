@@ -251,7 +251,9 @@ fn selection_reprojection_recomputes_real_markers_links_and_underlines() {
             leaf.link_at_for(&doc, authority(&doc), link)
                 .unwrap()
                 .unwrap()
-                .destination,
+                .destination
+                .clone()
+                .into_string(),
             "https://example.com/a?x=1&y=2"
         );
     }
@@ -1961,38 +1963,63 @@ fn production_leaf_edit_undo_and_cancel_cannot_reauthorize_same_root_or_keep_doc
 }
 
 #[test]
-fn production_leaf_unsupported_scope_and_general_inline_never_become_ready() {
-    // giant强调已接原规则；未知范围保留尚未接通的真实 giant link。
+fn production_leaf_proves_direct_links_and_keeps_unsupported_scope_pending() {
+    // 保留原来判Pending的同一巨段落；现在必须由原完整Parser逐位置验证新增真实能力，
+    // 包括外部caret、label内部caret与反向选择，不能换样本躲开marker显隐。
     let complex = format!(
         "只有**{}**，[未知链接](https://example.com)，没有已证代码或分隔线\n",
         "复杂行内正文".repeat(140)
     );
-    for (source, whole_document, expected) in [
-        (
-            "> ***\n\n尾\n",
-            false,
-            MarkdownRootLeafPendingReason::NonRootScope,
-        ),
-        (
-            complex.as_str(),
-            true,
-            MarkdownRootLeafPendingReason::NeedsGeneralInline,
-        ),
+    let label = complex.find("未知链接").unwrap();
+    let label = units(&complex, label..label + "未知链接".len());
+    for selection in [
+        MarkdownTextSelection::caret(complex.encode_utf16().count()),
+        MarkdownTextSelection::caret(label.start + 1),
+        MarkdownTextSelection {
+            anchor_utf16: label.end,
+            head_utf16: label.start,
+        },
     ] {
-        let (_directory, doc) = document(source);
-        let requested = if whole_document {
-            0..doc.utf16_len()
-        } else {
-            units(source, first_leaf_range(source))
+        let (directory, mut doc) = document(&complex);
+        let backing = doc.original_backing_observer().unwrap();
+        doc.set_selection(selection).unwrap();
+        let requested = 0..doc.utf16_len();
+        let (request, sources) = leaf_sources(&doc, requested.clone());
+        let MarkdownOrdinarySemanticState::RootLeafReady(ready) = sources
+            .ordinary_semantics_for(&doc, authority(&doc))
+            .unwrap()
+        else {
+            panic!("原长direct-link样本必须拥有真实语义，不能维持过期Pending");
         };
-        let (request, sources) = leaf_sources(&doc, requested);
-        assert!(
-            matches!(&sources.semantic, MarkdownOrdinarySemanticState::LeafPending(reason) if *reason == expected)
+        assert_oracle(ready, &doc, &complex, &requested);
+        assert_short_link_payload_work(&request, &doc, &complex, &requested, ready);
+        assert_eq!(doc.selection(), selection);
+        assert_eq!(doc.generation(), 0);
+        assert!(!doc.can_undo() && !doc.can_redo());
+        assert_eq!(
+            std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+            complex.as_bytes()
         );
-        assert!(request.leaf_semantic.is_none());
-        assert_eq!(sources.semantic.run_count(), 0);
-        assert_eq!(sources.semantic.retained_metadata(), 0);
+        drop((request, sources, doc));
+        assert_eq!(backing.mapped_bytes(), 0);
+        assert_eq!(backing.managed_resident_bytes(), 0);
     }
+
+    // 原非Root thematic break仍没有取得该scope的语义消费权，不能因接Link而签默认值。
+    let source = "> ***\n\n尾\n";
+    let (_directory, doc) = document(source);
+    let requested = units(source, first_leaf_range(source));
+    let (request, sources) = leaf_sources(&doc, requested);
+    assert!(matches!(
+        sources
+            .ordinary_semantics_for(&doc, authority(&doc))
+            .unwrap(),
+        MarkdownOrdinarySemanticState::LeafPending(MarkdownRootLeafPendingReason::NonRootScope)
+    ));
+    assert!(request.leaf_semantic.is_none());
+    assert_eq!(sources.semantic.run_count(), 0);
+    assert_eq!(sources.semantic.retained_metadata(), 0);
+
     // 原 SourcesOnly 工厂仍只提供来源事实，不因加入 Leaf 模式而偷偷升级任何语义。
     let source = "```\n正文\n```\n";
     let (_directory, doc) = document(source);
@@ -2014,7 +2041,8 @@ fn production_joint_plain_blocks_keep_exact_ranges_and_original_leaf_identity() 
     );
     let source =
         format!("# 标题\n\n{first}\r\n{setext}\n{complex}\n\n```text\n代码\n```\n\n{last}");
-    let (_directory, doc) = document(&source);
+    let (directory, doc) = document(&source);
+    let backing = doc.original_backing_observer().unwrap();
     let requested = 0..doc.utf16_len();
     let (request, sources) = leaf_sources(&doc, requested.clone());
     let MarkdownOrdinarySemanticState::RootLeafReady(ready) = &sources.semantic else {
@@ -2023,11 +2051,23 @@ fn production_joint_plain_blocks_keep_exact_ranges_and_original_leaf_identity() 
     let mut baseline = MarkdownViewportPresentation::default();
     baseline.set_active_selection(ordered_selection(doc.selection()));
     baseline
-        .rebuild(doc.generation(), requested, &source)
+        .rebuild(doc.generation(), requested.clone(), &source)
         .unwrap();
-    for text in [first, setext, last] {
+    for text in [first, setext, complex.as_str(), last] {
         let start = source.find(text).unwrap();
-        let range = units(&source, start..start + text.len());
+        // 完整Parser给出闭合块真实末端（含其原换行/Setext marker），不拿text搜索
+        // 的子串末端冒充段落coverage；尤其新接入的complex原字面自身不含末换行。
+        let range = Parser::new_ext(
+            &source,
+            crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+        )
+        .into_offset_iter()
+        .find_map(|(event, range)| {
+            (matches!(event, Event::Start(Tag::Paragraph | Tag::Heading { .. }))
+                && range.start == start)
+                .then(|| units(&source, range))
+        })
+        .unwrap();
         assert!(
             ready
                 .covered_ranges_for(&doc, authority(&doc))
@@ -2052,20 +2092,16 @@ fn production_joint_plain_blocks_keep_exact_ranges_and_original_leaf_identity() 
             );
         }
     }
-    let unknown = source.find("**复杂").unwrap();
-    assert!(
-        ready
-            .query_for(
-                &doc,
-                authority(&doc),
-                units(&source, unknown..unknown).start
-            )
-            .unwrap()
-            .is_none()
+    assert_short_link_payload_work(&request, &doc, &source, &requested, ready);
+    assert_eq!(doc.generation(), 0);
+    assert!(!doc.can_undo() && !doc.can_redo());
+    assert_eq!(
+        std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
+        source.as_bytes()
     );
-    assert_eq!(request.total_work().copied_source_bytes, 0);
-    assert_eq!(request.total_work().parser_input_bytes, 0);
-    assert_eq!(request.total_work().allocated_source_capacity, 0);
+    drop((request, sources, doc));
+    assert_eq!(backing.mapped_bytes(), 0);
+    assert_eq!(backing.managed_resident_bytes(), 0);
 }
 
 #[test]

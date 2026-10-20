@@ -364,7 +364,10 @@ fn structural_row_uses_same_request_real_cell_parser_reference_links_and_display
         .encode_utf16()
         .count();
     let link = display.link_at_for(&document, index).unwrap().unwrap();
-    assert_eq!(link.destination, "https://example.com/actual");
+    assert_eq!(
+        link.destination.clone().into_string(),
+        "https://example.com/actual"
+    );
     assert!(
         display
             .styles_at(0)

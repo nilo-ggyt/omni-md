@@ -22,7 +22,8 @@ const WORKSPACE_WORK: usize = 1024;
 #[path = "inline_code.rs"]
 mod code;
 pub use code::{
-    InlineCodeCursor, InlineCodeStep, VerifiedInlineCodeSpan, VerifiedInlineEmphasisRun,
+    InlineCodeCursor, InlineCodeStep, InlineLinkDestinationDecoder, InlineLinkDestinationStep,
+    VerifiedInlineCodeSpan, VerifiedInlineEmphasisRun, VerifiedInlineLink,
 };
 
 /// Plain 与 ATX 共用原 special-bytes 表及逐 byte 规则；候选只要求完整 inline，绝不自行配对。

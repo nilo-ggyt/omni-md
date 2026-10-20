@@ -79,7 +79,7 @@ impl MarkdownOrdinarySemanticState {
                     + ready
                         .links
                         .iter()
-                        .map(|link| link.destination.capacity())
+                        .map(|link| link.destination.retained_metadata())
                         .sum::<usize>()
             }
             Self::RootLeafReady(ready) => ready.retained_metadata(),
@@ -482,10 +482,13 @@ impl PlainSemanticJob {
         if !self.done() || self.pending.is_some() {
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
-        Ok(self
-            .bounded
-            .as_mut()
-            .and_then(|bounded| bounded.links.pop()))
+        Ok(if let Some(code) = self.code.as_mut() {
+            code.take_link()
+        } else {
+            self.bounded
+                .as_mut()
+                .and_then(|bounded| bounded.links.pop())
+        })
     }
 
     /// 原全源配对请求在一个活动块完成后归还 RootLeaf，下一块复用同一已闭合上下文。
@@ -1316,7 +1319,12 @@ impl PlainSemanticJob {
         self.projection = None;
         self.projected = None;
         let (rich_runs, links) = if let Some(code) = self.code.as_mut() {
-            (std::mem::take(&mut code.output), Vec::new())
+            // 长段落的样式与完整点击目标由同一Code作业签发，普通发布也必须一起移交。
+            // 这些Vec和不可变URI已在原quota付费；take只搬句柄，不复制目标或重领metadata。
+            (
+                std::mem::take(&mut code.output),
+                std::mem::take(&mut code.links),
+            )
         } else {
             self.bounded.as_mut().map_or_else(
                 || (Vec::new(), Vec::new()),

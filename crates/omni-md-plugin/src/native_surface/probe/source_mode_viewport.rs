@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 
 /// 只保原会话弱身份、完整输入事实和一个 scalar 的屏幕锚点；等待不会保活正文、Native 图或目录。
 pub(super) struct ModeViewportExpectation {
-    document: WeakMarkdownDocument,
-    body: std::rc::Weak<NativeMarkdownPagedBody>,
+    pub(super) document: WeakMarkdownDocument,
+    pub(super) body: std::rc::Weak<NativeMarkdownPagedBody>,
     controller: Weak<NativeMarkdownController>,
     generation: u64,
     selection: MarkdownTextSelection,
-    input: NativeMarkdownPagedInputState,
+    pub(super) input: NativeMarkdownPagedInputState,
     probe: NSRange,
     screen_top: f64,
     viewport_top: f64,

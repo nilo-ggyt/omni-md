@@ -2,6 +2,7 @@
 
 mod atx;
 mod giant_emphasis;
+mod giant_links;
 mod inline;
 mod partial;
 mod production;
@@ -132,9 +133,60 @@ fn assert_step(work: SemanticWork) {
     assert!(work.source_bytes <= 4096);
     assert!(work.structural_transitions <= 4096);
     assert!(work.metadata_bytes <= 4096);
-    assert_eq!(work.copied_source_bytes, 0);
+    // 单步只准一个真实URL输出片；fixture终点另与完整Parser精确核累计copy，正文仍零复制。
+    assert!(work.copied_source_bytes <= 1024);
     assert_eq!(work.parser_input_bytes, 0);
-    assert_eq!(work.allocated_source_capacity, 0);
+    assert!(work.allocated_source_capacity <= 1024);
+}
+
+/// 这些真实长段落走流式内核，唯一正文外的复制是当前视口所需的已规范化URL。
+/// 完整Parser只在测试中给出独立目标及owner；精确总量相等才能证明没有夹带label/正文复制。
+fn assert_short_link_payload_work(
+    request: &MarkdownViewportSourceRequest,
+    document: &MarkdownDocumentBuffer,
+    source: &str,
+    requested: &Range<usize>,
+    ready: &VerifiedMarkdownRootLeafViewport,
+) {
+    let mut expected_bytes = 0;
+    let mut active_link = None;
+    for (event, range) in Parser::new_ext(
+        source,
+        crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
+    )
+    .into_offset_iter()
+    {
+        match event {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                let owner = units(source, range);
+                if owner.start < requested.end && requested.start < owner.end {
+                    // 计的是独立Parser输出的目标，不是原Markdown owner或Core自己的copy字段。
+                    // 实体/escape的规范化结果可短于原字节，不能以原URL词法长度蒙混这份账。
+                    assert!(dest_url.len() <= 1024, "这些原fixture只有短URL");
+                    expected_bytes += dest_url.len();
+                    active_link = Some(dest_url.into_string());
+                }
+            }
+            Event::End(pulldown_cmark::TagEnd::Link) => active_link = None,
+            Event::Text(_) | Event::Code(_) => {
+                if let Some(destination) = active_link.as_ref() {
+                    let index = units(source, range).start;
+                    let actual = ready
+                        .link_at_for(document, authority(document), index)
+                        .unwrap()
+                        .expect("真实完整label的文字/代码必须拥有同源点击目标");
+                    assert_eq!(&actual.destination.clone().into_string(), destination);
+                }
+            }
+            _ => {}
+        }
+    }
+    let work = request.total_work();
+    assert_eq!(work.copied_source_bytes, expected_bytes);
+    assert_eq!(work.parser_input_bytes, 0);
+    // 本组短目标在一个实际输出片完成，末页容量也应恰等于目标，不保每条1KiB空尾。
+    // 这份独立字节数同时排除正文分配；真正长目标另由giant_links按原每步量子验收。
+    assert_eq!(work.allocated_source_capacity, expected_bytes);
 }
 fn finish_job(
     request: &mut MarkdownViewportSourceRequest,

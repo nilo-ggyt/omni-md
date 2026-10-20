@@ -673,7 +673,7 @@ impl PieceBackedMarkdownTextStorage {
 mod tests {
     use super::*;
 
-    /// 区分RootLeaf零复制与真实表格的有限Parser工作，不能把前者的契约错误套到表格负例。
+    /// 分别记录真实载荷复制与 Parser 输入；RootLeaf 可拥有已规范化 URI，正文仍不复制。
     struct SourceWork {
         copied_source_bytes: usize,
         parser_input_bytes: usize,
@@ -721,7 +721,7 @@ mod tests {
                     && work.parser_input_bytes <= SOURCE_STEP
             );
             if let Some(sources) = request.take_sources_for(document, authority).unwrap() {
-                // 表格语义会按原预算复制有限行并执行Parser；只由无表格用例另核精确零复制。
+                // 表格按原预算复制有限行；RootLeaf 只准许真实 URI 输出片，具体用例核精确来源。
                 let total = request.total_work();
                 return (
                     sources,
@@ -820,17 +820,21 @@ mod tests {
     }
 
     #[test]
-    /// 同一无表窗口分别核来源票与真实语义票；普通块已证不能替复杂 inline 的空洞补签。
+    /// 同一无表窗口分别核来源票与真实语义票；已支持的直接链接必须取得自身完整语义，
+    /// 来源专用工厂即使持相同 Gap，也不能借这个已完成的邻请求替自己补签语义。
     fn gap_proof_and_plain_semantics_keep_independent_authority() {
-        // 长强调已由原分页语义续体证明；此处改用尚未授权的超限链接，继续核无表票不能补签语义。
+        // 保留原长 label、目标和代码夹具。直接链接现已真实支持，不能继续把旧 Unsupported
+        // 当作权限负例；唯一复制是规范化目标，绝不能把 label 或整个 Root 文本混入该账。
+        const DESTINATION: &str = "https://example.invalid";
         let source = format!(
             "普通正文\n\n[复杂{}仍未知](https://example.invalid)\n\n```text\n中文😀\n```\n\n尾部\n",
             "正文".repeat(400)
         );
-        let (_directory, document, sources, work) = sources(&source);
+        let (directory, document, sources, work) = sources(&source);
+        let backing = document.original_backing_observer().unwrap();
         let authority = authority(&document);
         let window = 0..document.utf16_len();
-        assert_eq!(work.copied_source_bytes, 0);
+        assert_eq!(work.copied_source_bytes, DESTINATION.len());
         assert_eq!(work.parser_input_bytes, 0);
         assert!(no_tables_covered(&sources, &document, authority, &window));
         assert!(!no_tables_covered(&sources, &document, authority, &(0..0)));
@@ -855,15 +859,69 @@ mod tests {
             omni_markdown_core::MarkdownPresentationStyles::default(),
             "普通块由原 Plain proof 授权，不能再把真实证明误判成仅有gap"
         );
-        let unknown = source[..source.find("[复杂").unwrap()]
+        let link_open = source[..source.find("[复杂").unwrap()]
             .encode_utf16()
             .count();
+        let label_start = link_open + 1;
+        let label_end = source[..source.find("](https://example.invalid)").unwrap()]
+            .encode_utf16()
+            .count();
+        let link = ready
+            .link_at_for(&document, authority, label_start)
+            .unwrap()
+            .expect("原完整长标签必须取得自己的真实直接链接");
+        assert_eq!(link.label_utf16_range, label_start..label_end);
+        assert_eq!(link.destination.clone().into_string(), DESTINATION);
+        for index in [link_open, label_end, label_end + 2] {
+            assert!(
+                ready
+                    .link_at_for(&document, authority, index)
+                    .unwrap()
+                    .is_none()
+            );
+        } // bracket 和 URI 本身只有原 marker 样式，不属于可点击 label；不能借 owner 包络扩权。
+
+        // 独立完整 Parser 仅消费这份既有有限夹具，核长 label 与 marker 的实际样式；
+        // 它不参与分页生产或复制计量，也不从待测 RootLeaf 的默认样式反造期望。
+        let mut original = MarkdownViewportPresentation::default();
+        original.rebuild(0, window.clone(), &source).unwrap();
+        for index in link_open..label_end + 2 + DESTINATION.len() + 1 {
+            assert_eq!(
+                ready
+                    .query_for(&document, authority, index)
+                    .unwrap()
+                    .unwrap()
+                    .styles,
+                original.query(index).unwrap().styles,
+                "原直接链接的 label/marker 样式必须符合完整 Parser：source={index}"
+            );
+        }
+        let mut stale = authority;
+        stale.context_revision += 1;
+        assert!(ready.link_at_for(&document, stale, label_start).is_err());
+        let cancelled = MarkdownViewportSourceAuthority {
+            cancelled: true,
+            ..authority
+        };
         assert!(
             ready
-                .query_for(&document, authority, unknown)
+                .link_at_for(&document, cancelled, label_start)
+                .is_err()
+        );
+        let changed_selection = MarkdownViewportSourceAuthority {
+            selection: MarkdownTextSelection::caret(1),
+            ..authority
+        };
+        assert!(
+            ready
+                .link_at_for(&document, changed_selection, label_start)
+                .is_err()
+        );
+        assert!(
+            ready
+                .link_at_for(&document, authority, label_start)
                 .unwrap()
-                .is_none(),
-            "同一无表gap中的复杂inline仍未知，不能从邻块Plain或gap票补签"
+                .is_some()
         );
 
         // 来源专用工厂确有相同无表事实，却没有任何语义Ready；两种权限不能相互转换。
@@ -884,6 +942,17 @@ mod tests {
         ));
         assert_eq!(work.copied_source_bytes, 0);
         assert_eq!(work.parser_input_bytes, 0);
+        assert_eq!(document.generation(), 0);
+        assert_eq!(document.selection(), authority.selection);
+        assert!(!document.can_undo() && !document.can_redo() && !document.is_dirty());
+        assert!(document.original_file_identity_is_unchanged());
+        assert_eq!(
+            std::fs::read(directory.path().join("原来源无表证明.md")).unwrap(),
+            source.as_bytes()
+        );
+        drop((gap_only, request, sources, document));
+        assert_eq!(backing.mapped_bytes(), 0);
+        assert_eq!(backing.managed_resident_bytes(), 0);
     }
 
     #[test]

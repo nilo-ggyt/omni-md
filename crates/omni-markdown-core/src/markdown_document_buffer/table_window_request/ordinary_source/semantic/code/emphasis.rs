@@ -1,7 +1,7 @@
 //! 一个真实 Root 块的强调匹配栈；记录追加到匿名文件，RAM 只保固定2KiB尾页和当前匹配。
 
 use super::*;
-use pulldown_cmark::global_frontier::VerifiedInlineEmphasisRun;
+use pulldown_cmark::global_frontier::{VerifiedInlineEmphasisRun, VerifiedInlineLink};
 use pulldown_cmark::inline_emphasis::{self, EmphasisBounds, EmphasisStyle};
 use std::{fs::File, io, os::fd::IntoRawFd, os::unix::fs::FileExt};
 
@@ -152,7 +152,19 @@ enum Phase {
     Finish,
 }
 
+/// Link label 的 delimiter 只能在自己的真实范围内配对；外层只停放固定匹配头，文件仍唯一。
+/// 有效 Link 不能嵌套，因此只需一层；不复制 delimiter 记录、正文或原源权限。
+struct LinkScope {
+    source: Range<usize>,
+    label: Range<usize>,
+    head: usize,
+    depth: usize,
+    bounds: EmphasisBounds,
+}
+
 pub(super) struct EmphasisJob {
+    source: Range<usize>,
+    link: Option<LinkScope>,
     file: StackFile,
     bounds: EmphasisBounds,
     head: usize,
@@ -171,8 +183,10 @@ pub(super) struct EmphasisJob {
 
 impl EmphasisJob {
     /// 仅为真实顺序delimiter分配固定匹配状态；匿名页仍延迟到第一次opener入栈。
-    pub(super) fn new(options: pulldown_cmark::Options) -> Self {
+    pub(super) fn new(options: pulldown_cmark::Options, source: Range<usize>) -> Self {
         Self {
+            source,
+            link: None,
             file: StackFile::new(),
             bounds: EmphasisBounds::default(),
             head: 0,
@@ -191,7 +205,19 @@ impl EmphasisJob {
     }
 
     /// run来自同一个Root游标的最终顺序，HTML/code内容没有进入此栈的入口。
-    pub(super) fn start(&mut self, proof: VerifiedInlineEmphasisRun) {
+    pub(super) fn start(
+        &mut self,
+        proof: VerifiedInlineEmphasisRun,
+    ) -> Result<(), MarkdownTableRequestError> {
+        let scope = self.link.as_ref().map_or(&self.source, |link| &link.label);
+        let range = proof.source_range();
+        if self.busy()
+            || proof.scope_range() != *scope
+            || range.start < scope.start
+            || range.end > scope.end
+        {
+            return Err(MarkdownTableRequestError::InvalidRequest);
+        } // scope 来自原 cursor 的已认证 Root/Link label，不能跨 label 与外层 opener 配对。
         let both = proof.can_open() && proof.can_close();
         self.run = Some(Run {
             start: proof.source_range().start,
@@ -207,6 +233,55 @@ impl EmphasisJob {
         } else {
             Phase::Finish
         };
+        Ok(())
+    }
+
+    /// 原 Link proof 先于其 label 发出，停放外层已完成 run 的匹配头，再用同文件开始独立配对。
+    /// 没有新的 FD/正文 owner；label 未匹配 opener 在 LinkEnd 被丢弃，绝不泄露到外层。
+    pub(super) fn enter_link(
+        &mut self,
+        proof: &VerifiedInlineLink,
+    ) -> Result<(), MarkdownTableRequestError> {
+        let source = proof.source_range();
+        if self.busy()
+            || self.link.is_some()
+            || source.start < self.source.start
+            || source.end > self.source.end
+        {
+            return Err(MarkdownTableRequestError::InvalidRequest);
+        }
+        self.link = Some(LinkScope {
+            source,
+            label: proof.label_range(),
+            head: self.head,
+            depth: self.depth,
+            bounds: std::mem::take(&mut self.bounds),
+        });
+        self.head = 0;
+        self.depth = 0;
+        Ok(())
+    }
+
+    /// 只接原 cursor 对同 owner/label 的真实结束事件；回到外层前，本 label 的 run 必须已处理完。
+    /// 恢复真实 prev 链而不是把 label 剩余 opener 接到外层，保持原 Parser 的配对隔离。
+    pub(super) fn leave_link(
+        &mut self,
+        source: &Range<usize>,
+        label: &Range<usize>,
+    ) -> Result<(), MarkdownTableRequestError> {
+        if self.busy()
+            || self
+                .link
+                .as_ref()
+                .is_none_or(|scope| &scope.source != source || &scope.label != label)
+        {
+            return Err(MarkdownTableRequestError::InvalidRequest);
+        }
+        let outer = self.link.take().unwrap();
+        self.head = outer.head;
+        self.depth = outer.depth;
+        self.bounds = outer.bounds;
+        Ok(())
     }
 
     /// 每次重新匹配都用剩余栈的真实深度和原run_length，不以消费后的count改变mod3规则。
@@ -358,6 +433,7 @@ impl EmphasisJob {
 
     /// 原块真实结束后未匹配opener继续字面；关闭私有文件成功才允许父owner发布有限输出。
     pub(super) fn finish(&mut self) -> Result<(), MarkdownTableRequestError> {
+        self.link = None; // 失败/General 也归还固定停放状态；不能在后继任务恢复旧 label 权限。
         self.file.close()
     }
 

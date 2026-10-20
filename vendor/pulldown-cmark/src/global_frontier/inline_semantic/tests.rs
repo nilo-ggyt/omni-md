@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::global_frontier::{
-    BlockOriginLimits, GlobalFact, GlobalFrontier, GlobalFrontierLimits, GlobalStep,
-    StructuralSpineLimits,
+    BlockOriginLimits, GlobalFact, GlobalFrontier, GlobalFrontierError, GlobalFrontierLimits,
+    GlobalStep, StructuralSpineLimits,
 };
 use crate::{Event, Parser, Tag};
 
@@ -73,6 +73,8 @@ fn verified_code_spans_match_original_parser_at_split_frames_without_history() {
                         | InlineCodeStep::Span { work, .. }
                         | InlineCodeStep::Prefix { work, .. }
                         | InlineCodeStep::Emphasis { work, .. }
+                        | InlineCodeStep::Link { work, .. }
+                        | InlineCodeStep::LinkEnd { work, .. }
                         | InlineCodeStep::Proven { work, .. }
                         | InlineCodeStep::NeedsGeneralInline { work } => *work,
                     };
@@ -515,6 +517,8 @@ fn scoped_code_normal_probe_and_trim_share_actual_origin_at_split_frames() {
                         | InlineCodeStep::Span { work, .. }
                         | InlineCodeStep::Prefix { work, .. }
                         | InlineCodeStep::Emphasis { work, .. }
+                        | InlineCodeStep::Link { work, .. }
+                        | InlineCodeStep::LinkEnd { work, .. }
                         | InlineCodeStep::Proven { work, .. }
                         | InlineCodeStep::NeedsGeneralInline { work } => *work,
                     };
@@ -557,5 +561,317 @@ fn scoped_code_normal_probe_and_trim_share_actual_origin_at_split_frames() {
                 );
             }
         }
+    }
+}
+
+#[test]
+/// 原完整Parser独立决定Link owner与目标；源帧从单byte切分，不能借截段Parser补签标签。
+/// 标签里的code、强调和escape仍由同顺序cursor产生，目标标点不会成为强调run。
+fn streamed_direct_links_match_complete_parser_and_keep_label_scope() {
+    let long = format!(
+        "{} [中文{} **粗体** `a]b`](/{}/中文&amp;😀) 后",
+        "前文 mixed ".repeat(512),
+        "标签".repeat(700),
+        "a".repeat(5000),
+    );
+    for source in [
+        "pre [中文 **粗体** `a]b` \\[转义](https://example.invalid/a\\(b\\)?x=&amp; \"题&amp;\") post",
+        "outer *[内**粗**与`code`](../x)* trailing",
+        "[](a)[x](b)",
+        "[a ` b](x)",
+        "[<span title='['>中文</span>](<目标>)",
+        "[x](<a>\r\n\"多行\r\n标题\")",
+        &long,
+    ] {
+        // 不是从candidate的range反造expected：完整原Parser真正的Start事件有完整owner。
+        let expected: Vec<_> = Parser::new_ext(source, options())
+            .into_offset_iter()
+            .filter_map(|(event, owner)| match event {
+                Event::Start(Tag::Link { dest_url, .. }) => Some((owner, dest_url.into_string())),
+                _ => None,
+            })
+            .collect();
+        assert!(!expected.is_empty());
+        for width in [1, 7, 1024] {
+            let seed = seed(source, options());
+            let outer = seed.source_range();
+            let mut cursor = seed
+                .emphasis_cursor(outer.end, limits(source))
+                .unwrap()
+                .unwrap();
+            let mut actual = Vec::new();
+            let mut active = None;
+            let mut ended = false;
+            for _ in 0..source.len() * 100 + 10000 {
+                let start = cursor.next_byte();
+                let end = (start + width).min(source.len());
+                let step = cursor
+                    .advance(
+                        SourceFrame {
+                            source_revision: 41,
+                            byte_start: start,
+                            bytes: &source.as_bytes()[start..end],
+                            real_eof: end == source.len(),
+                        },
+                        authority(),
+                        4096,
+                    )
+                    .unwrap();
+                let work = match &step {
+                    InlineCodeStep::Progress { work }
+                    | InlineCodeStep::NeedInput { work }
+                    | InlineCodeStep::Span { work, .. }
+                    | InlineCodeStep::Prefix { work, .. }
+                    | InlineCodeStep::Emphasis { work, .. }
+                    | InlineCodeStep::Link { work, .. }
+                    | InlineCodeStep::LinkEnd { work, .. }
+                    | InlineCodeStep::Proven { work, .. }
+                    | InlineCodeStep::NeedsGeneralInline { work } => work,
+                };
+                assert!(work.byte_reads + work.transitions <= 4096);
+                match step {
+                    InlineCodeStep::Link { proof, .. } => {
+                        assert!(active.is_none());
+                        assert_eq!(proof.source_revision(), 41);
+                        assert_eq!(proof.source_end(), source.len());
+                        let owner = proof.source_range();
+                        let label = proof.label_range();
+                        assert_eq!(source.as_bytes()[owner.start], b'[');
+                        assert_eq!(label.start, owner.start + 1);
+                        assert_eq!(source.as_bytes()[label.end], b']');
+                        let target = proof.destination_range();
+                        assert!(target.start > label.end && target.end < owner.end);
+                        if let Some(title) = proof.title_range() {
+                            assert!(title.start > target.end && title.end < owner.end);
+                        }
+                        // 原目标字节只分帧借入共享unescape续体；每次输出必须独立为完整UTF8。
+                        // 到target末端可能还有实体/UTF8 carry，空帧不伪称Doc EOF。
+                        let mut decoder = proof.destination_decoder();
+                        let mut destination = String::new();
+                        let mut complete = false;
+                        for _ in 0..source.len() * 10 + 1000 {
+                            let at = decoder.next_byte();
+                            let to = (at + width).min(target.end);
+                            let mut output = [0; 31];
+                            let step = decoder
+                                .advance(
+                                    SourceFrame {
+                                        source_revision: 41,
+                                        byte_start: at,
+                                        bytes: &source.as_bytes()[at..to],
+                                        real_eof: to == source.len(),
+                                    },
+                                    authority(),
+                                    &mut output,
+                                    2048,
+                                )
+                                .unwrap();
+                            assert!(step.work.byte_reads + step.work.transitions <= 2048);
+                            destination.push_str(std::str::from_utf8(&output[..step.written]).unwrap());
+                            if step.complete {
+                                complete = true;
+                                break;
+                            }
+                        }
+                        assert!(complete, "目标不能在跨帧实体/UTF8处无限Pending");
+                        active = Some((owner.clone(), label));
+                        actual.push((owner, destination));
+                    }
+                    InlineCodeStep::Emphasis { run, .. } => {
+                        let scope = active.as_ref().map_or(&outer, |(_, label)| label);
+                        assert_eq!(run.scope_range(), *scope);
+                        let range = run.source_range();
+                        assert!(range.start >= scope.start && range.end <= scope.end);
+                    }
+                    InlineCodeStep::LinkEnd { source, label, .. } => {
+                        assert_eq!(active.take(), Some((source, label)));
+                    }
+                    InlineCodeStep::Proven { .. } => {
+                        assert!(active.is_none());
+                        ended = true;
+                        break;
+                    }
+                    InlineCodeStep::NeedsGeneralInline { .. } => {
+                        panic!("已认证的Root直接链接不应退回整段路径");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(ended);
+            assert_eq!(actual, expected, "split={width}");
+        }
+    }
+}
+
+#[test]
+/// 未完成的Global引用与image/嵌套链接仍明确未知；不能为绕过大块限制签假Link/Ready。
+fn streamed_link_unknown_forms_and_source_revocation_remain_explicit() {
+    for source in [
+        "[reference]",
+        "![image](x)",
+        "[outer [inner](x)](y)",
+        "[x](<bad",
+    ] {
+        let seed = seed(source, options());
+        let mut cursor = seed
+            .code_cursor(seed.source_range().end, limits(source))
+            .unwrap()
+            .unwrap();
+        let mut unknown = false;
+        for _ in 0..10000 {
+            let at = cursor.next_byte();
+            let to = (at + 7).min(source.len());
+            match cursor
+                .advance(
+                    SourceFrame {
+                        source_revision: 41,
+                        byte_start: at,
+                        bytes: &source.as_bytes()[at..to],
+                        real_eof: to == source.len(),
+                    },
+                    authority(),
+                    2048,
+                )
+                .unwrap()
+            {
+                InlineCodeStep::NeedsGeneralInline { .. } => {
+                    unknown = true;
+                    break;
+                }
+                InlineCodeStep::Proven { .. } | InlineCodeStep::Link { .. } => {
+                    panic!("未认证语法不得签正面链接")
+                }
+                _ => {}
+            }
+        }
+        assert!(unknown);
+        let at = cursor.next_byte();
+        let frame = SourceFrame {
+            source_revision: 41,
+            byte_start: at,
+            bytes: &[],
+            real_eof: false,
+        };
+        assert!(matches!(
+            cursor.advance(
+                frame,
+                GlobalSourceAuthority {
+                    current_revision: 41,
+                    cancelled: true
+                },
+                2048
+            ),
+            Err(GlobalFrontierError::Cancelled)
+        ));
+    }
+}
+
+#[test]
+/// 目标值断言来自固定URL字面含义，不从同一个共享decoder反算expected；完整Parser也必须相符。
+/// 原命名/数字实体、未知实体和非punctuation反斜杠都保原规则，不能为流式化顺便改URL。
+fn streamed_link_destination_preserves_original_url_values_and_sticky_revocation() {
+    for (source, expected) in [
+        (r"[x](/a\(b\))", "/a(b)"),
+        ("[x](</a&amp;&#x1f600;>)", "/a&😀"),
+        ("[x](</a&unknown;z>)", "/a&unknown;z"),
+        (r"[x](</a\q>)", r"/a\q"),
+        ("[x](</a&#0;>)", "/a�"),
+        ("[x]()", ""),
+    ] {
+        let original: Vec<_> = Parser::new_ext(source, options())
+            .filter_map(|event| match event {
+                Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url.into_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(original, [expected]);
+        let seed = seed(source, options());
+        let mut cursor = seed
+            .code_cursor(seed.source_range().end, limits(source))
+            .unwrap()
+            .unwrap();
+        let proof = loop {
+            let at = cursor.next_byte();
+            let to = (at + 2).min(source.len());
+            match cursor
+                .advance(
+                    SourceFrame {
+                        source_revision: 41,
+                        byte_start: at,
+                        bytes: &source.as_bytes()[at..to],
+                        real_eof: to == source.len(),
+                    },
+                    authority(),
+                    2048,
+                )
+                .unwrap()
+            {
+                InlineCodeStep::Link { proof, .. } => break proof,
+                InlineCodeStep::Proven { .. } | InlineCodeStep::NeedsGeneralInline { .. } => {
+                    panic!("原Parser的正面直接链接不可丢失")
+                }
+                _ => {}
+            }
+        };
+        let mut decoder = proof.destination_decoder();
+        let mut actual = String::new();
+        for _ in 0..source.len() * 100 + 100 {
+            let at = decoder.next_byte();
+            let to = (at + 1).min(proof.destination_range().end);
+            let mut output = [0; 8];
+            let step = decoder
+                .advance(
+                    SourceFrame {
+                        source_revision: 41,
+                        byte_start: at,
+                        bytes: &source.as_bytes()[at..to],
+                        real_eof: to == source.len(),
+                    },
+                    authority(),
+                    &mut output,
+                    2048,
+                )
+                .unwrap();
+            actual.push_str(std::str::from_utf8(&output[..step.written]).unwrap());
+            if step.complete {
+                break;
+            }
+        }
+        assert_eq!(actual, expected);
+        // 取消和换代均在任何写output前拒绝；已经撤销的decoder不能借新票恢复原部分结果。
+        let mut decoder = proof.destination_decoder();
+        let at = decoder.next_byte();
+        let mut output = [0; 8];
+        assert!(matches!(
+            decoder.advance(
+                SourceFrame {
+                    source_revision: 41,
+                    byte_start: at,
+                    bytes: &[],
+                    real_eof: false
+                },
+                GlobalSourceAuthority {
+                    current_revision: 42,
+                    cancelled: false
+                },
+                &mut output,
+                2048
+            ),
+            Err(GlobalFrontierError::SourceSuperseded)
+        ));
+        assert!(matches!(
+            decoder.advance(
+                SourceFrame {
+                    source_revision: 41,
+                    byte_start: at,
+                    bytes: &[],
+                    real_eof: false
+                },
+                authority(),
+                &mut output,
+                2048
+            ),
+            Err(GlobalFrontierError::SourceSuperseded)
+        ));
     }
 }
