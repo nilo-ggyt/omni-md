@@ -960,7 +960,18 @@ impl PixelSample {
             } else {
                 controls += 1;
                 if delta.into_iter().any(|value| value.abs() > 0.025) {
-                    return Err("高亮误染了相邻非命中区域".into());
+                    // 只在原首个失败点保留已有几何和同点颜色；不另取图、不读查询或正文。
+                    // 完整范围与像素阈值仍原样拒绝，供区分真正越界绘制和边缘采样前提。
+                    return Err(format!(
+                        "高亮误染了相邻非命中区域：source={:?} frame={:?} rect={:?} bitmap={}x{} index={index} before={:?} after={:?} delta={delta:?}",
+                        self.source,
+                        self.frame,
+                        self.rect,
+                        self.width,
+                        self.height,
+                        self.colors[index],
+                        actual.colors[index],
+                    ));
                 }
             }
         }
