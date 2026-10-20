@@ -483,7 +483,7 @@ struct Scan {
     cursor: Option<MarkdownComposedLine>,
     bottom: f64,
     first_top: f64,
-    handles: VecDeque<NativeMarkdownMeasuredLine>,
+    handles: VecDeque<ScannedLine>,
     ranges: VecDeque<std::ops::Range<usize>>,
     paragraphs: VecDeque<std::ops::Range<usize>>,
     folded_ends: VecDeque<Option<usize>>,
@@ -491,6 +491,41 @@ struct Scan {
     metrics: Option<LineMetrics>,
     /// 仅当前窗口的真实表格行顶，来自本次完整 LineMetrics，不估计历史行高。
     table_rows: VecDeque<(usize, f64)>,
+}
+
+/// 只随原有限扫描保留本次已完成的 Native 行高；不保存正文或历史行坐标。
+/// 经过原目标锚时，下方已收集格的位置须沿这些真实行高前向恢复，不能平移一个舍入差值。
+struct ScannedLine {
+    handle: NativeMarkdownMeasuredLine,
+    height: f64,
+}
+
+impl Scan {
+    /// 当前行的原 top/bottom 已由完整目标请求认证；下方窗口不能继续保留旧 prefix 逆减坐标。
+    /// 这里只重放原有限窗口的纯度量值，不再读 Source、目录或 Font，也不创建额外 Reader。
+    fn reanchor_table_rows(&mut self, anchor: &MeasuredLineAnchor) -> Result<()> {
+        let mut top = anchor.bottom;
+        let mut rows = self.table_rows.iter_mut();
+        for measured in &self.handles {
+            if measured.handle.facts().kind
+                == omni_markdown_core::MarkdownComposedLineKind::TableRow
+            {
+                let (ordinal, row_top) = rows.next().ok_or(Error::Unsupported)?;
+                if *ordinal != measured.handle.facts().ordinal {
+                    return Err(Error::Unsupported); // 原行与格目录必须一一对应，不能以另一格填补缺项。
+                }
+                *row_top = top;
+            }
+            top += measured.height;
+            if !top.is_finite() || top >= (1_u64 << 46) as f64 {
+                return Err(ViewError::InvalidGeometry.into());
+            }
+        }
+        if rows.next().is_some() {
+            return Err(Error::Unsupported); // 不遗留没有原弱行及真实行高的表格位置。
+        }
+        Ok(())
+    }
 }
 
 /// 原 Reader 的真实查询与恢复格同寿；没有另一个正文、Parser、Input 或全表坐标缓存。
@@ -3296,7 +3331,21 @@ impl Producer {
             let ltr = metrics.ltr;
             let folded_end = metrics.folded_end;
             let handle = metrics.into_measured()?;
-            let line_top = scan.bottom - height;
+            // 同一可见行不能随视口下方 prefix 变长而从另一串逆减重新取得坐标。
+            // 只在仍有完整原请求的真实目标行上重接它的实测边界；裸历史锚不具备此权限。
+            let anchor = self.target.as_ref().and_then(|target| {
+                target
+                    .current_line_anchor(owner, request, self.source.authority())
+                    .filter(|anchor| anchor.ordinal == handle.facts().ordinal)
+                    .cloned()
+            });
+            let line_top = if let Some(anchor) = anchor {
+                scan.reanchor_table_rows(&anchor)?;
+                scan.bottom = anchor.bottom;
+                anchor.top
+            } else {
+                scan.bottom - height
+            };
             let previous = output.borrow_mut().previous_line(handle.handle())?;
             if scan.bottom >= top && line_top <= bottom {
                 if scan.handles.len() == MAX_WINDOW_LINES {
@@ -3313,7 +3362,7 @@ impl Producer {
                     scan.table_rows
                         .push_front((handle.facts().ordinal, line_top));
                 }
-                scan.handles.push_front(handle);
+                scan.handles.push_front(ScannedLine { handle, height });
             }
             scan.bottom = line_top;
             // 一旦已覆盖真实视口顶部，后续更早行没有进入本次有限窗口的资格。
@@ -3356,6 +3405,7 @@ impl Producer {
             .handles
             .front()
             .ok_or(Error::Unsupported)?
+            .handle
             .facts()
             .ordinal;
         let first_top = NSPoint::new(
@@ -3363,19 +3413,12 @@ impl Producer {
                 - request.virtual_viewport.document_origin.x,
             request.viewport.size.height + top - scan.first_top,
         );
-        // 临时几何归因只打印本次已完成扫描的原值；不重新查询行、Source 或 Native。
-        // 同一行在栏高变化前后的 seed 与局部起点可据此区分逆扫误差和后续 baseline 运算。
-        #[cfg(feature = "native-close-stage-diagnostic")]
-        eprintln!(
-            "native_line_geometry_seed first_ordinal={first_ordinal} prefix_height={prefix_height:?} scan_first_top={:?} first_top_y={:?} document_origin_y={top:?} viewport_height={:?}",
-            scan.first_top, first_top.y, request.viewport.size.height,
-        );
         let window = Rc::new(
             NativeMarkdownComposedViewport::prepare(
                 output.clone(),
                 key.clone(),
                 palette,
-                scan.handles,
+                scan.handles.into_iter().map(|measured| measured.handle),
                 first_top,
                 &|| ticket.current(owner, &self.source) && geometry.is_current(),
             )
@@ -3561,6 +3604,7 @@ impl Producer {
             let handle = scan
                 .handles
                 .iter()
+                .map(|line| &line.handle)
                 .find(|line| line.facts().ordinal == *ordinal)
                 .expect("表格行顶只来自同一窗口真实 handle");
             let height = handle.facts().y_advance_26_6 as f64 / 64.0;

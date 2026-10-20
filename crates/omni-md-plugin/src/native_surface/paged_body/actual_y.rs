@@ -86,6 +86,22 @@ impl ActualTarget {
     pub(super) fn has_anchor(&self) -> bool {
         self.anchor.is_some()
     }
+
+    /// 只借原目标已经实际量得的行边界；普通 last_target_anchor 没有完整 Input 票，
+    /// 不能据它重置新扫描。原请求仍须核同 Body/Doc、Source、宽度和完整输入。
+    /// 模式/字体换代会推进原 serial/layout_epoch，matches 因而也拒绝跨模式坐标。
+    pub(super) fn current_line_anchor(
+        &self,
+        owner: &Owner,
+        request: &NativeMarkdownPagedSceneRequest,
+        source: omni_markdown_core::MarkdownLayoutTextAuthority,
+    ) -> Option<&MeasuredLineAnchor> {
+        if self.request.source != source || !self.request.matches(owner, request) {
+            return None;
+        }
+        self.anchor.as_ref()
+    }
+
     fn new(request: Rc<SourceTargetRequest>) -> Self {
         Self {
             request,
