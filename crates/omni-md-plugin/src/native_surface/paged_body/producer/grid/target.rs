@@ -102,7 +102,8 @@ impl Grid {
         target: &mut RowTarget,
     ) -> Result<Option<Advance>> {
         // 只走本行有限列 metadata；未知格先交原串行准备量子，不抢先读取整行内容。
-        for _ in 0..self.cells.len() {
+        let columns = self.cells.len();
+        for _ in 0..columns {
             let column = target.column;
             let cell = self.cells.get_mut(column).ok_or_else(|| unsupported())?;
             let document = owner
@@ -137,6 +138,17 @@ impl Grid {
             let belongs = range.contains(&canonical)
                 || target.request.range.length == 0 && canonical == range.end;
             if !belongs {
+                #[cfg(feature = "native-markdown-runtime-probe")]
+                eprintln!(
+                    "native_grid_target_outside_cell target_range={:?} target_first_end={} column={} columns={} cell_range={range:?} row_range={:?} empty={} display={}",
+                    target.request.range,
+                    target.request.first_end,
+                    column,
+                    columns,
+                    self.row.source_range(),
+                    cell.empty.is_some(),
+                    cell.display.is_some(),
+                ); // 仅观察本轮已认证的纯坐标，排除格后仍按原规则推进，绝不夹取管道或补默认目标。
                 // 格间管道和分隔行不属于显示正文；仅前进列游标，不夹到邻格伪造命中。
                 target.column += 1;
                 continue;
