@@ -34,8 +34,17 @@ struct Plan {
     resource: Arc<Mutex<Option<LayoutIndexObserver>>>,
 }
 struct Publication {
-    reader: Option<Arc<LayoutIndexReader<RECORD_BYTES>>>,
+    rows: Option<PublishedRows>,
     failure: Option<MarkdownDocumentBufferError>,
+}
+
+#[derive(Clone)]
+/// 首尾与 reader 在同一锁内出版，只描述该不可变前缀实际包含的结构行。
+/// 包络外查询不必逐字形重读整张目录；包络内的间隙仍须由原二分证明，不能补签无表权限。
+struct PublishedRows {
+    reader: Arc<LayoutIndexReader<RECORD_BYTES>>,
+    start: MarkdownGraphemeBoundary,
+    end: MarkdownGraphemeBoundary,
 }
 
 /// 原 Coordinator 唯一持有追加页；样式重排继续移动该 owner，不复制 writer 或另建目录。
@@ -60,7 +69,7 @@ impl TablePlanWriter {
             plan: TablePlan(Arc::new(Plan {
                 source: source.authority(),
                 publication: Mutex::new(Publication {
-                    reader: None,
+                    rows: None,
                     failure: None,
                 }),
                 resource: Arc::new(Mutex::new(None)),
@@ -88,15 +97,16 @@ impl TablePlanWriter {
         source: &MarkdownLayoutTextSource,
     ) -> Result<(Option<TableSpan>, usize)> {
         self.plan.require(source)?;
-        let Some(reader) = self.plan.reader()? else {
+        let Some(published) = self.plan.published()? else {
             return Ok((None, 0));
         };
+        let reader = &published.reader;
         if self.next >= reader.len() {
             self.plan.require(source)?;
             return Ok((None, 0));
         }
         // 锁内只借真实不可变 reader；原记录 I/O、错误记忆与临时 FD 引用归还都在锁外。
-        let span = self.plan.read_from(&reader, self.next);
+        let span = self.plan.read_from(reader, self.next);
         self.plan.require(source)?;
         Ok((Some(span?), 1))
     }
@@ -113,11 +123,11 @@ impl TablePlanWriter {
         }
         let span = row.span();
         // 重排仍从第零条结构记录前进；一次只读当前原记录，不在无预算入口二分读整张目录。
-        let published = self.plan.reader()?;
-        let count = published.as_ref().map_or(0, |reader| reader.len());
+        let published = self.plan.published()?;
+        let count = published.as_ref().map_or(0, |rows| rows.reader.len());
         if self.next < count {
             let actual = self.plan.read_from(
-                published.as_ref().expect("非空前缀持真实 reader"),
+                &published.as_ref().expect("非空前缀持真实 reader").reader,
                 self.next,
             )?;
             if actual != span {
@@ -191,7 +201,17 @@ impl TablePlanWriter {
                 drop(reader); // 实际 close 必须位于共享锁之外。
                 return Err(error);
             }
-            publication.reader.replace(reader)
+            // 原有首行不能随追加或样式 rewind 改写；新尾只来自本次刚成功 flush/dup 的行票。
+            // 两个坐标系与同一 reader 一起替换，查询不会把新包络误用于较短的旧前缀。
+            let start = publication
+                .rows
+                .as_ref()
+                .map_or(span.start, |rows| rows.start);
+            publication.rows.replace(PublishedRows {
+                reader,
+                start,
+                end: span.end,
+            })
         };
         drop(old); // 只移出旧 Arc；最后一个读者退出时执行原 reader 的唯一 close 责任。
         self.next += 1;
@@ -223,7 +243,7 @@ impl TablePlan {
     }
 
     /// 短锁仅复制当前不可变出版物；返回的 Arc 是实际 pread 期间原 FD 的释放边界。
-    fn reader(&self) -> Result<Option<Arc<LayoutIndexReader<RECORD_BYTES>>>> {
+    fn published(&self) -> Result<Option<PublishedRows>> {
         let publication = self
             .0
             .publication
@@ -232,19 +252,20 @@ impl TablePlan {
         if let Some(error) = publication.failure {
             return Err(error);
         }
-        Ok(publication.reader.clone())
+        Ok(publication.rows.clone())
     }
 
     /// 一次只读一条固定原记录；尚未出版不意味着整个 Source 已到 EOF。
     pub(crate) fn read(&self, ordinal: usize) -> Result<Option<TableSpan>> {
-        let Some(reader) = self.reader()? else {
+        let Some(published) = self.published()? else {
             return Ok(None);
         };
+        let reader = &published.reader;
         if ordinal >= reader.len() {
             self.health()?;
             return Ok(None);
         }
-        self.read_from(&reader, ordinal).map(Some)
+        self.read_from(reader, ordinal).map(Some)
     }
 
     /// canonical 行内部没有原 Unicode 布局权限，两端仍是原 Source 的真实硬边界。
@@ -262,28 +283,39 @@ impl TablePlan {
         if range.is_empty() {
             return self.contains_character(range.start, true);
         }
-        let Some(reader) = self.reader()? else {
+        let Some(published) = self.published()? else {
             return Ok(false);
         };
+        let reader = &published.reader;
+        // 原包络只是当前前缀的真实首尾，不依赖文档 EOF。未来行尚未出版时，与原二分的
+        // 有限前缀合同一致；首错仍先核原 reader，再核同目录现行健康，不能用快路洗掉失败。
+        if range.end <= published.start.utf16 || range.start >= published.end.utf16 {
+            reader
+                .healthy()
+                .map_err(|error| self.remember(storage_error(error)))?;
+            self.health()?;
+            return Ok(false);
+        }
         let mut low = 0;
         let mut high = reader.len();
         while low < high {
             let middle = low + (high - low) / 2;
-            if self.read_from(&reader, middle)?.end.utf16 <= range.start {
+            if self.read_from(reader, middle)?.end.utf16 <= range.start {
                 low = middle + 1;
             } else {
                 high = middle;
             }
         }
-        let result = low < reader.len() && self.read_from(&reader, low)?.start.utf16 < range.end;
+        let result = low < reader.len() && self.read_from(reader, low)?.start.utf16 < range.end;
         self.health()?;
         Ok(result)
     }
 
     /// 原 observer 的原子健康检查也覆盖旧前缀的真实 I/O/close 失败，不用新出版物洗掉首错。
     pub(crate) fn health(&self) -> Result<()> {
-        if let Some(reader) = self.reader()? {
-            reader
+        if let Some(published) = self.published()? {
+            published
+                .reader
                 .healthy()
                 .map_err(|error| self.remember(storage_error(error)))?;
         }
@@ -292,14 +324,34 @@ impl TablePlan {
 
     /// 同一二分服务字符与边界查询；端点规则来自真实调用职责而非第二套表格协议。
     fn contains_position(&self, position: usize, utf16: bool, include_start: bool) -> Result<bool> {
-        let Some(reader) = self.reader()? else {
+        let Some(published) = self.published()? else {
             return Ok(false);
         };
+        let reader = &published.reader;
+        let start = if utf16 {
+            published.start.utf16
+        } else {
+            published.start.byte
+        };
+        let end = if utf16 {
+            published.end.utf16
+        } else {
+            published.end.byte
+        };
+        if !(start..end).contains(&position) || !include_start && position == start {
+            // 代码块等真正位于所有已出版表行之后的字符极多。这里使用 writer 已证明的
+            // 首尾元数据，不新增热缓存或逐字符 pread；范围内的每一处空隙仍走原精确查询。
+            reader
+                .healthy()
+                .map_err(|error| self.remember(storage_error(error)))?;
+            self.health()?;
+            return Ok(false);
+        }
         let mut low = 0;
         let mut high = reader.len();
         while low < high {
             let middle = low + (high - low) / 2;
-            let span = self.read_from(&reader, middle)?;
+            let span = self.read_from(reader, middle)?;
             let end = if utf16 { span.end.utf16 } else { span.end.byte };
             if end <= position {
                 low = middle + 1;
@@ -311,7 +363,7 @@ impl TablePlan {
             self.health()?;
             return Ok(false);
         }
-        let span = self.read_from(&reader, low)?;
+        let span = self.read_from(reader, low)?;
         let start = if utf16 {
             span.start.utf16
         } else {
