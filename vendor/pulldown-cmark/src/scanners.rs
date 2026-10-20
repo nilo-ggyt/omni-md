@@ -33,6 +33,11 @@ use crate::{BlockQuoteKind, HeadingLevel};
 
 use memchr::memchr;
 
+mod inline_html;
+pub(crate) use inline_html::{
+    InlineHtmlKind, InlineHtmlMode, InlineHtmlProgress, InlineHtmlScanner,
+};
+
 // sorted for binary search
 const HTML_TAGS: [&str; 62] = [
     "address",
@@ -406,16 +411,8 @@ pub(crate) fn is_ascii_whitespace_no_nl(c: u8) -> bool {
     c == b'\t' || c == 0x0b || c == 0x0c || c == b' '
 }
 
-fn is_ascii_alpha(c: u8) -> bool {
-    c.is_ascii_alphabetic()
-}
-
 fn is_ascii_alphanumeric(c: u8) -> bool {
     matches!(c, b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
-}
-
-fn is_ascii_letterdigitdash(c: u8) -> bool {
-    c == b'-' || is_ascii_alphanumeric(c)
 }
 
 fn is_digit(c: u8) -> bool {
@@ -460,10 +457,6 @@ pub(crate) fn scan_ch_repeat(data: &[u8], c: u8) -> usize {
 // a different function.
 pub(crate) fn scan_whitespace_no_nl(data: &[u8]) -> usize {
     scan_while(data, is_ascii_whitespace_no_nl)
-}
-
-fn scan_attr_value_chars(data: &[u8]) -> usize {
-    scan_while(data, is_valid_unquoted_attr_value_char)
 }
 
 pub(crate) fn scan_eol(bytes: &[u8]) -> Option<usize> {
@@ -875,156 +868,6 @@ pub(crate) fn scan_link_dest(
     }
 }
 
-/// Returns bytes scanned
-fn scan_attribute_name(data: &[u8]) -> Option<usize> {
-    let (&c, tail) = data.split_first()?;
-    if is_ascii_alpha(c) || c == b'_' || c == b':' {
-        Some(
-            1 + scan_while(tail, |c| {
-                is_ascii_alphanumeric(c) || c == b'_' || c == b'.' || c == b':' || c == b'-'
-            }),
-        )
-    } else {
-        None
-    }
-}
-
-/// Returns the index immediately following the attribute on success.
-/// The argument `buffer_ix` refers to the index into `data` from which we
-/// should copy into `buffer` when we find bytes to skip.
-fn scan_attribute(
-    data: &[u8],
-    mut ix: usize,
-    newline_handler: Option<&dyn Fn(&[u8]) -> usize>,
-    buffer: &mut Vec<u8>,
-    buffer_ix: &mut usize,
-) -> Option<usize> {
-    ix += scan_attribute_name(&data[ix..])?;
-    let ix_after_attribute = ix;
-    ix = scan_whitespace_with_newline_handler_without_buffer(data, ix, newline_handler)?;
-    if data.get(ix) == Some(&b'=') {
-        ix = scan_whitespace_with_newline_handler(
-            data,
-            ix_after_attribute,
-            newline_handler,
-            buffer,
-            buffer_ix,
-        )?;
-        ix += 1;
-        ix = scan_whitespace_with_newline_handler(data, ix, newline_handler, buffer, buffer_ix)?;
-        ix = scan_attribute_value(data, ix, newline_handler, buffer, buffer_ix)?;
-        Some(ix)
-    } else {
-        // Leave whitespace for next attribute.
-        Some(ix_after_attribute)
-    }
-}
-
-/// Scans whitespace and possibly newlines according to the
-/// behavior defined by the newline handler. When bytes are skipped,
-/// all preceding non-skipped bytes are pushed to the buffer.
-fn scan_whitespace_with_newline_handler(
-    data: &[u8],
-    mut i: usize,
-    newline_handler: Option<&dyn Fn(&[u8]) -> usize>,
-    buffer: &mut Vec<u8>,
-    buffer_ix: &mut usize,
-) -> Option<usize> {
-    while i < data.len() {
-        if !is_ascii_whitespace(data[i]) {
-            return Some(i);
-        }
-        if let Some(eol_bytes) = scan_eol(&data[i..]) {
-            let handler = newline_handler?;
-            i += eol_bytes;
-            let skipped_bytes = handler(&data[i..]);
-
-            if skipped_bytes > 0 {
-                buffer.extend(&data[*buffer_ix..i]);
-                *buffer_ix = i + skipped_bytes;
-            }
-
-            i += skipped_bytes;
-        } else {
-            i += 1;
-        }
-    }
-
-    Some(i)
-}
-
-/// Scans whitespace and possible newlines according to the behavior defined
-/// by the newline handler.
-///
-/// Unlike [`scan_whitespace_with_newline_handler`], this function doesn't
-/// copy skipped data into a buffer. Typically, if this function
-/// returns `Some`, a call to `scan_whitespace_with_newline_handler` will
-/// soon follow.
-fn scan_whitespace_with_newline_handler_without_buffer(
-    data: &[u8],
-    mut i: usize,
-    newline_handler: Option<&dyn Fn(&[u8]) -> usize>,
-) -> Option<usize> {
-    while i < data.len() {
-        if !is_ascii_whitespace(data[i]) {
-            return Some(i);
-        }
-        if let Some(eol_bytes) = scan_eol(&data[i..]) {
-            let handler = newline_handler?;
-            i += eol_bytes;
-            let skipped_bytes = handler(&data[i..]);
-            i += skipped_bytes;
-        } else {
-            i += 1;
-        }
-    }
-
-    Some(i)
-}
-
-/// Returns the index immediately following the attribute value on success.
-fn scan_attribute_value(
-    data: &[u8],
-    mut i: usize,
-    newline_handler: Option<&dyn Fn(&[u8]) -> usize>,
-    buffer: &mut Vec<u8>,
-    buffer_ix: &mut usize,
-) -> Option<usize> {
-    match *data.get(i)? {
-        b @ b'"' | b @ b'\'' => {
-            i += 1;
-            while i < data.len() {
-                if data[i] == b {
-                    return Some(i + 1);
-                }
-                if let Some(eol_bytes) = scan_eol(&data[i..]) {
-                    let handler = newline_handler?;
-                    i += eol_bytes;
-                    let skipped_bytes = handler(&data[i..]);
-
-                    if skipped_bytes > 0 {
-                        buffer.extend(&data[*buffer_ix..i]);
-                        *buffer_ix = i + skipped_bytes;
-                    }
-                    i += skipped_bytes;
-                } else {
-                    i += 1;
-                }
-            }
-            return None;
-        }
-        b' ' | b'=' | b'>' | b'<' | b'`' | b'\n' | b'\r' => {
-            return None;
-        }
-        _ => {
-            // unquoted attribute value
-            i += scan_attr_value_chars(&data[i..]);
-        }
-    }
-
-    Some(i)
-}
-
 #[derive(Clone, Copy, Debug)]
 enum UnescapePhase {
     Text,
@@ -1329,269 +1172,102 @@ pub(crate) fn scan_html_type_7(data: &[u8]) -> Option<usize> {
     Some(i)
 }
 
-/// Assumes that `data` starts with `<`.
-/// Returns the number of bytes scanned and the html in case of
-/// success.
-/// When some bytes were skipped, because the html was split over
-/// multiple leafs (e.g. over multiple lines in a blockquote),
-/// the html is returned as a vector of bytes.
-/// If no bytes were skipped, the buffer will be empty.
+/// 原输入以'<'开始；成功返回真实物理末端。仅当跨容器行实际跳过prefix时
+/// 才返回去前缀的HTML副本，普通连续输入仍保持空Vec与原字节借用合同。
 pub(crate) fn scan_html_block_inner(
     data: &[u8],
     newline_handler: Option<&dyn Fn(&[u8]) -> usize>,
 ) -> Option<(Vec<u8>, usize)> {
+    scan_html_whole(
+        &mut InlineHtmlScanner::new(InlineHtmlMode::Tag, 0, &HtmlScanGuard::default()),
+        data,
+        newline_handler,
+    )
+}
+
+/// whole-slice适配仍保原容器去前缀的Vec合同；词法只由同一个有限续体决定。
+/// 未跳prefix时不复制任何HTML；handler在完整EOL后调用，CRLF跨帧也不能提前切行。
+fn scan_html_whole(
+    scanner: &mut InlineHtmlScanner,
+    data: &[u8],
+    newline_handler: Option<&dyn Fn(&[u8]) -> usize>,
+) -> Option<(Vec<u8>, usize)> {
     let mut buffer = Vec::new();
-    let mut last_buf_index = 0;
-
-    let close_tag_bytes = scan_ch(&data[1..], b'/');
-    let l = scan_while(&data[(1 + close_tag_bytes)..], is_ascii_alpha);
-    if l == 0 {
-        return None;
-    }
-    let mut i = 1 + close_tag_bytes + l;
-    i += scan_while(&data[i..], is_ascii_letterdigitdash);
-
-    if close_tag_bytes == 0 {
-        loop {
-            let old_i = i;
-            loop {
-                i += scan_whitespace_no_nl(&data[i..]);
-                if let Some(eol_bytes) = scan_eol(&data[i..]) {
-                    if eol_bytes == 0 {
-                        return None;
-                    }
-                    let handler = newline_handler?;
-                    i += eol_bytes;
-                    let skipped_bytes = handler(&data[i..]);
-
-                    let data_len = data.len() - i;
-
-                    debug_assert!(
-                        skipped_bytes <= data_len,
-                        "Handler tried to skip too many bytes, fed {}, skipped {}",
-                        data_len,
-                        skipped_bytes
-                    );
-
-                    if skipped_bytes > 0 {
-                        buffer.extend(&data[last_buf_index..i]);
-                        i += skipped_bytes;
-                        last_buf_index = i;
-                    }
-                } else {
-                    break;
-                }
-            }
-            if let Some(b'/') | Some(b'>') = data.get(i) {
-                break;
-            }
-            if old_i == i {
-                // No whitespace, which is mandatory.
-                return None;
-            }
-            i = scan_attribute(data, i, newline_handler, &mut buffer, &mut last_buf_index)?;
-        }
-    }
-
-    i += scan_whitespace_no_nl(&data[i..]);
-
-    if close_tag_bytes == 0 {
-        i += scan_ch(&data[i..], b'/');
-    }
-
-    if data.get(i) != Some(&b'>') {
-        None
-    } else {
-        i += 1;
-        if !buffer.is_empty() {
-            buffer.extend(&data[last_buf_index..i]);
-        }
-        Some((buffer, i))
-    }
-}
-
-/// Returns (next_byte_offset, uri, type)
-pub(crate) fn scan_autolink(text: &str, start_ix: usize) -> Option<(usize, CowStr<'_>, LinkType)> {
-    scan_uri(text, start_ix)
-        .map(|(bytes, uri)| (bytes, uri, LinkType::Autolink))
-        .or_else(|| scan_email(text, start_ix).map(|(bytes, uri)| (bytes, uri, LinkType::Email)))
-}
-
-/// Returns (next_byte_offset, uri)
-fn scan_uri(text: &str, start_ix: usize) -> Option<(usize, CowStr<'_>)> {
-    let bytes = &text.as_bytes()[start_ix..];
-
-    // scheme's first byte must be an ascii letter
-    if bytes.is_empty() || !is_ascii_alpha(bytes[0]) {
-        return None;
-    }
-
-    let mut i = 1;
-
-    while i < bytes.len() {
-        let c = bytes[i];
-        i += 1;
-        match c {
-            c if is_ascii_alphanumeric(c) => (),
-            b'.' | b'-' | b'+' => (),
-            b':' => break,
-            _ => return None,
-        }
-    }
-
-    // scheme length must be between 2 and 32 characters long. scheme
-    // must be followed by colon
-    if !(3..=33).contains(&i) {
-        return None;
-    }
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'>' => return Some((start_ix + i + 1, text[start_ix..(start_ix + i)].into())),
-            b'\0'..=b' ' | b'<' => return None,
-            _ => (),
-        }
-        i += 1;
-    }
-
-    None
-}
-
-/// Returns (next_byte_offset, email)
-fn scan_email(text: &str, start_ix: usize) -> Option<(usize, CowStr<'_>)> {
-    // using a regex library would be convenient, but doing it by hand is not too bad
-    let bytes = &text.as_bytes()[start_ix..];
-    let mut i = 0;
-
-    while i < bytes.len() {
-        let c = bytes[i];
-        i += 1;
-        match c {
-            c if is_ascii_alphanumeric(c) => (),
-            b'.' | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'/' | b'=' | b'?'
-            | b'^' | b'_' | b'`' | b'{' | b'|' | b'}' | b'~' | b'-' => (),
-            b'@' if i > 1 => break,
-            _ => return None,
-        }
-    }
-
+    let mut copied_from = 0;
+    let mut next = 0;
     loop {
-        let label_start_ix = i;
-        let mut fresh_label = true;
-
-        while i < bytes.len() {
-            match bytes[i] {
-                c if is_ascii_alphanumeric(c) => (),
-                b'-' if fresh_label => {
+        let step = scanner.feed(&data[next..], true, usize::MAX);
+        next += step.consumed;
+        match step.progress {
+            InlineHtmlProgress::Accepted { byte_count, .. } => {
+                if !buffer.is_empty() {
+                    buffer.extend_from_slice(&data[copied_from..next]);
+                }
+                return Some((buffer, byte_count));
+            }
+            InlineHtmlProgress::NeedLine => {
+                let skip = newline_handler?(&data[next..]);
+                debug_assert!(skip <= data.len() - next, "原HTML容器prefix超出当前输入");
+                if skip != 0 {
+                    buffer.extend_from_slice(&data[copied_from..next]);
+                    next += skip;
+                    copied_from = next;
+                }
+                if !scanner.continue_line(skip) {
                     return None;
                 }
-                b'-' => (),
-                _ => break,
             }
-            fresh_label = false;
-            i += 1;
+            InlineHtmlProgress::Rejected => return None,
+            InlineHtmlProgress::Progress => unreachable!("whole输入与无限本地fuel必须产生词法终点"),
         }
-
-        if i == label_start_ix || i - label_start_ix > 63 || bytes[i - 1] == b'-' {
-            return None;
-        }
-
-        if bytes.get(i) != Some(&b'.') {
-            break;
-        }
-        i += 1;
     }
-
-    if bytes.get(i) != Some(&b'>') {
-        return None;
-    }
-
-    Some((start_ix + i + 1, text[start_ix..(start_ix + i)].into()))
 }
 
-/// Scan comment, declaration, or CDATA section, with initial "<!" already consumed.
-/// Returns byte offset on match.
-pub(crate) fn scan_inline_html_comment(
-    bytes: &[u8],
-    mut ix: usize,
-    scan_guard: &mut HtmlScanGuard,
-) -> Option<usize> {
-    let c = *bytes.get(ix)?;
-    ix += 1;
-    match c {
-        // An HTML comment consists of `<!-->`, `<!--->`, or  `<!--`, a string of characters not
-        // including the string `-->`, and `-->`.
-        b'-' if ix > scan_guard.comment => {
-            // HTML comment needs two hyphens after the !.
-            if *bytes.get(ix)? != b'-' {
-                return None;
-            }
-            // Yes, we're intentionally going backwards.
-            // We want the cursor to point here:
-            //
-            //     <!--
-            //       ^
-            //
-            // This way, the `<!-->` case is covered by the loop below.
-            ix -= 1;
-
-            while let Some(x) = memchr(b'-', &bytes[ix..]) {
-                ix += x + 1;
-                scan_guard.comment = ix;
-                if bytes.get(ix) == Some(&b'-') && bytes.get(ix + 1) == Some(&b'>') {
-                    return Some(ix + 2);
-                }
-            }
-            None
-        }
-        // A CDATA section consists of the string `<![CDATA[`, a string of characters not
-        // including the string `]]>`, and the string `]]>`.
-        b'[' if bytes[ix..].starts_with(b"CDATA[") && ix > scan_guard.cdata => {
-            ix += b"CDATA[".len();
-            ix = memchr(b']', &bytes[ix..]).map_or(bytes.len(), |x| ix + x);
-            let close_brackets = scan_ch_repeat(&bytes[ix..], b']');
-            ix += close_brackets;
-
-            if close_brackets == 0 || bytes.get(ix) != Some(&b'>') {
-                scan_guard.cdata = ix;
-                None
-            } else {
-                Some(ix + 1)
-            }
-        }
-        // A declaration consists of the string `<!`, an ASCII letter, zero or more characters not
-        // including the character >, and the character >.
-        _ if c.is_ascii_alphabetic() && ix > scan_guard.declaration => {
-            ix = memchr(b'>', &bytes[ix..]).map_or(bytes.len(), |x| ix + x);
-            if bytes.get(ix) != Some(&b'>') {
-                scan_guard.declaration = ix;
-                None
-            } else {
-                Some(ix + 1)
-            }
+/// 原'<'之后的URI/邮件保持完整UTF8借用，返回原物理末端与实际链接类型。
+pub(crate) fn scan_autolink(text: &str, start_ix: usize) -> Option<(usize, CowStr<'_>, LinkType)> {
+    let start = start_ix.checked_sub(1)?;
+    let mut scanner =
+        InlineHtmlScanner::new(InlineHtmlMode::Autolink, start, &HtmlScanGuard::default());
+    let step = scanner.feed(&text.as_bytes()[start..], true, usize::MAX);
+    match step.progress {
+        InlineHtmlProgress::Accepted { kind, byte_count } => {
+            let end = start + byte_count;
+            let link_type = match kind {
+                InlineHtmlKind::UriAutolink => LinkType::Autolink,
+                InlineHtmlKind::EmailAutolink => LinkType::Email,
+                InlineHtmlKind::Html => unreachable!("autolink入口不启动HTML分支"),
+            };
+            // 继续借用原UTF8目标，不复制URI或替它做实体/percent解码。
+            Some((end, text[start_ix..end - 1].into(), link_type))
         }
         _ => None,
     }
 }
 
-/// Scan processing directive, with initial "<?" already consumed.
-/// Returns the next byte offset on success.
-pub(crate) fn scan_inline_html_processing(
+/// 原'<!'已被Parser识别；同一续体区分comment/declaration/CDATA并维护原失败前沿。
+pub(crate) fn scan_inline_html_comment(
     bytes: &[u8],
-    mut ix: usize,
+    ix: usize,
     scan_guard: &mut HtmlScanGuard,
 ) -> Option<usize> {
-    if ix <= scan_guard.processing {
-        return None;
-    }
-    while let Some(offset) = memchr(b'?', &bytes[ix..]) {
-        ix += offset + 1;
-        if bytes.get(ix) == Some(&b'>') {
-            return Some(ix + 1);
-        }
-    }
-    scan_guard.processing = ix;
-    None
+    let start = ix.checked_sub(2)?;
+    let mut scanner = InlineHtmlScanner::new(InlineHtmlMode::Comment, start, scan_guard);
+    let result = scan_html_whole(&mut scanner, &bytes[start..], Some(&|_| 0));
+    scanner.record_failure(scan_guard);
+    result.map(|(_, end)| start + end)
+}
+
+/// 原'<?'已被Parser识别；只在原'?>'闭合时返回真实末端，未闭合记录原负事实。
+pub(crate) fn scan_inline_html_processing(
+    bytes: &[u8],
+    ix: usize,
+    scan_guard: &mut HtmlScanGuard,
+) -> Option<usize> {
+    let start = ix.checked_sub(2)?;
+    let mut scanner = InlineHtmlScanner::new(InlineHtmlMode::Processing, start, scan_guard);
+    let result = scan_html_whole(&mut scanner, &bytes[start..], Some(&|_| 0));
+    scanner.record_failure(scan_guard);
+    result.map(|(_, end)| start + end)
 }
 
 #[cfg(test)]
@@ -1663,7 +1339,7 @@ mod test {
             "<a@sixty-three-letters-in-this-identifier-----------------------63>",
         ];
         for email in EMAILS {
-            assert!(scan_email(email, 1).is_some());
+            assert!(scan_autolink(email, 1).is_some_and(|(_, _, kind)| kind == LinkType::Email));
         }
     }
 
@@ -1679,7 +1355,7 @@ mod test {
             "<a@sixty-four-letters-in-this-identifier-------------------------64>",
         ];
         for email in EMAILS {
-            assert!(scan_email(email, 1).is_none());
+            assert!(scan_autolink(email, 1).is_none());
         }
     }
 }

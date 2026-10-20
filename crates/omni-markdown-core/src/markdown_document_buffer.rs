@@ -36,6 +36,13 @@ pub use cell_draft::{
 };
 mod editing_commands;
 mod formatting;
+#[cfg(feature = "s2-table-window-prototype")]
+mod heading_anchor;
+#[cfg(feature = "s2-table-window-prototype")]
+pub use heading_anchor::{
+    MarkdownHeadingAnchorError, MarkdownHeadingAnchorRequest, MarkdownHeadingAnchorStep,
+    MarkdownHeadingAnchorTarget, MarkdownHeadingAnchorWork,
+};
 mod replacements;
 // 原生运行启用有限表格权限；默认视口的迁移仍须分别完成语义、几何和功能门禁。
 #[cfg(feature = "s2-table-window-prototype")]

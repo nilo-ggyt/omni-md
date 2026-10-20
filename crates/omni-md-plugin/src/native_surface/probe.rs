@@ -10,6 +10,7 @@ use crate::native_surface::paged_input::{NativeMarkdownPagedInput, NativeMarkdow
 use crate::native_surface::paged_text_view::NativeMarkdownPagedSceneKey;
 use std::time::{Duration, Instant};
 
+mod button_mouse;
 mod clipboard;
 pub use clipboard::{
     read_native_markdown_clipboard_control, run_native_markdown_clipboard_control,

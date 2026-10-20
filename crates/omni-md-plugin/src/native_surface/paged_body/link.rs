@@ -1,9 +1,30 @@
 //! 原链接click只保弱权限和源坐标；目标沿唯一RootLeaf有界恢复，Ready之后才允许一次系统副作用。
 
 use super::*;
+mod heading;
+
+/// 同一次真实链接动作只有一个续体；标题解析不另建排版、Doc或永久slug目录。
+pub(super) struct PendingLink {
+    task: LinkTask,
+}
+
+enum LinkTask {
+    Click(PendingClick),
+    Heading(Box<heading::PendingHeading>),
+}
+
+impl PendingLink {
+    /// 清槽后的唯一取消出口；标题任务必须显式结算scratch关闭失败，不能藏进Drop。
+    pub(super) fn retire(mut self) -> std::result::Result<(), ViewError> {
+        match &mut self.task {
+            LinkTask::Click(_) => Ok(()),
+            LinkTask::Heading(pending) => pending.query.cancel().map_err(ViewError::HeadingAnchor),
+        }
+    }
+}
 
 /// 不保Scene、Reader、Doc或Native对象；View放弃该手势后Weak立即失效。
-pub(super) struct PendingLink {
+struct PendingClick {
     key: NativeMarkdownPagedSceneKey,
     index: usize,
     intent: Weak<()>,
@@ -20,11 +41,16 @@ impl NativeMarkdownPagedBody {
         if !self.scene_current(key) || intent.strong_count() == 0 {
             return Err(ViewError::Revoked);
         }
-        *self.pending_link.borrow_mut() = Some(PendingLink {
-            key: key.clone(),
-            index,
-            intent,
-        });
+        let previous = self.pending_link.replace(Some(PendingLink {
+            task: LinkTask::Click(PendingClick {
+                key: key.clone(),
+                index,
+                intent,
+            }),
+        }));
+        if let Some(previous) = previous {
+            previous.retire()?;
+        }
         self.schedule().map_err(|_| ViewError::Revoked)
     }
 
@@ -32,6 +58,10 @@ impl NativeMarkdownPagedBody {
     pub(super) fn advance_link(&self, request: &NativeMarkdownPagedSceneRequest) -> Result<bool> {
         let Some(pending) = self.pending_link.borrow_mut().take() else {
             return Ok(false);
+        };
+        let pending = match pending.task {
+            LinkTask::Click(pending) => pending,
+            LinkTask::Heading(pending) => return self.advance_heading(*pending, request),
         };
         let view = self.view()?;
         let current = || view.link_intent_current(&pending.key, &pending.intent);
@@ -70,7 +100,9 @@ impl NativeMarkdownPagedBody {
             Ok(None) => {
                 // 同步Native重入可以接纳较新click；旧量子只能放回仍未被替换的槽，不覆写新意图。
                 if self.pending_link.borrow().is_none() {
-                    *self.pending_link.borrow_mut() = Some(pending);
+                    *self.pending_link.borrow_mut() = Some(PendingLink {
+                        task: LinkTask::Click(pending),
+                    });
                 }
                 if !waiting_font {
                     self.schedule()?;

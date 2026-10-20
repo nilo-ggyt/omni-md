@@ -111,6 +111,7 @@ impl ReferenceLabel {
         };
         let source_bytes = frame.as_ref().map_or(0, |frame| frame.bytes.len());
         let mut output = [0; 1024];
+        let allocated_before = self.decoder.allocated_workspace_bytes();
         let step = self.decoder.advance(
             SourceFrame {
                 source_revision: document.generation(),
@@ -135,6 +136,11 @@ impl ReferenceLabel {
             0
         };
         let step = step.map_err(Error::Global)?;
+        // 只有同一真实scope续行实际取得的新页才收费；浅Arc共享并不复制或再次物化正文。
+        let prefix_allocated = self.decoder.allocated_workspace_bytes() - allocated_before;
+        quota
+            .admit_metadata(prefix_allocated)
+            .map_err(Error::Window)?;
         if self.len.saturating_add(step.written) > MAX_REFERENCE_NORMALIZED_LABEL_BYTES {
             return Err(Error::Window(MarkdownTableWindowError::ReferenceLimit));
         }
@@ -200,7 +206,7 @@ impl ReferenceLabel {
                 + 128
                 + bytes.len()
                 + directory_moved,
-            metadata_bytes: allocated + directory_allocated,
+            metadata_bytes: allocated + directory_allocated + prefix_allocated,
             allocated_source_capacity: allocated,
             copied_source_bytes: bytes.len(),
             normalizer_input_bytes: step.work.byte_reads,

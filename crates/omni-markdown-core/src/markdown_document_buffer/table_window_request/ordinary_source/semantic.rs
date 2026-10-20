@@ -14,7 +14,7 @@ use pulldown_cmark::global_frontier::{
 };
 mod bounded_inline;
 use bounded_inline::BoundedInline;
-mod code;
+pub(in crate::markdown_document_buffer) mod code;
 use code::CodeJob;
 pub(super) use code::{PrefixDecoration, SpanProof};
 

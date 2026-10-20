@@ -673,8 +673,25 @@ impl SourceSession {
 
     /// 原工具栏Undo/Redo仍走controller，逐笔history结果在后继帧事件独立核对。
     fn history(&self, redo: bool) -> Result<(), String> {
-        let button = with_active_native_markdown_surface(|surface| {
+        let (events, mtm) = with_active_native_markdown_surface(|surface| {
             self.owns(surface)?;
+            let editor = surface.editor.as_ref().ok_or("正式Source历史没有原正文")?;
+            editor
+                .document()
+                .borrow()
+                .byte_offset_for_utf16(0)
+                .map_err(|cause| cause.to_string())?;
+            let before = editor
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            let current = || {
+                self.owns(surface).is_ok()
+                    && editor
+                        .text_view
+                        .input_state()
+                        .is_ok_and(|actual| actual == before)
+            };
             let controls = surface
                 .controller
                 .ivars()
@@ -692,12 +709,28 @@ impl SourceSession {
             {
                 return Err("正式Source原Undo/Redo按钮不可用或会夺取焦点".into());
             }
-            Ok(button)
+            let result = super::button_mouse::prepare(&button, &surface.panel, &current);
+            // Native命中/坐标转换后再取真实Source首错和完整Input；不能把来源失效
+            // 隐成鼠标按钮不可用。所有Doc/Surface借用在NSApp接纳事件前归还。
+            editor
+                .document()
+                .borrow()
+                .byte_offset_for_utf16(0)
+                .map_err(|cause| cause.to_string())?;
+            self.owns(surface)?;
+            if editor
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?
+                != before
+            {
+                return Err("正式Source历史鼠标准备期间完整Input已变化".into());
+            }
+            Ok((result?, surface.panel.mtm()))
         })?;
-        // SAFETY: 使用原装配按钮及其真实target/action；归还Active后点击，原controller按对象归属捕获Input。
-        unsafe {
-            button.performClick(None);
-        }
+        // Down/Up都构造并核准后才入同一原窗口队列；NSButton真实tracking消费Up，
+        // 不是直接performClick或调用action。后继仍用原generation/历史/CPU终点确认一次操作。
+        super::button_mouse::post(events, mtm);
         Ok(())
     }
 

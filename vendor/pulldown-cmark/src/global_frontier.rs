@@ -31,11 +31,13 @@ pub use inline_semantic::{
     InlineLinkStorageOperation, InlineLinkStorageReply, InlineLinkStorageRequest,
     InlineLinkStorageStep, InlineLinkTarget, InlinePlainContainers, InlinePlainCursor,
     InlinePlainLimits, InlinePlainStep, InlinePlainTerminal, InlineReferenceDecoder,
-    InlineReferenceKind, InlineReferenceResolution, VerifiedInlineCodeSpan,
-    VerifiedInlineEmphasisRun, VerifiedInlineLink, VerifiedInlinePlainProof,
-    VerifiedInlineReferenceRequest, VerifiedInlineSemanticSeed,
+    InlineReferenceKind, InlineReferenceResolution, VerifiedHeadingFootnote, VerifiedHeadingHtml,
+    VerifiedHeadingLineTrim, VerifiedInlineCodeSpan, VerifiedInlineEmphasisRun, VerifiedInlineLink,
+    VerifiedInlinePlainProof, VerifiedInlineReferenceRequest, VerifiedInlineSemanticSeed,
 };
+mod inline_text;
 mod leaf_block;
+pub use inline_text::{InlineTextDecodeStep, InlineTextDecoder};
 pub use leaf_block::{
     HtmlLeafTermination, LeafBlockCloseReason, LeafBlockDetails, LeafBlockKind,
     VerifiedGlobalLeafBlock,
@@ -289,7 +291,7 @@ mod producer;
 pub(crate) use producer::VerifiedGlobalTable;
 pub use producer::{
     GlobalFact, GlobalFrontier, GlobalFrontierLimits, GlobalSourceAuthority, GlobalStep,
-    GlobalTableFact, GlobalWork, VerifiedGlobalReference,
+    GlobalTableFact, GlobalWork, VerifiedGlobalFootnoteDefinition, VerifiedGlobalReference,
 };
 mod reference_scope;
 pub use reference_scope::{

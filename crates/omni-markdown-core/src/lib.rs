@@ -268,12 +268,13 @@ pub use markdown_document_buffer::{
 pub use markdown_document_buffer::MarkdownSelectionStyleInvariant;
 #[cfg(feature = "s2-table-window-prototype")]
 pub use markdown_document_buffer::{
-    MarkdownOrdinaryPendingReason, MarkdownOrdinarySemanticState, MarkdownRootLeafPendingReason,
-    MarkdownViewportSourceAuthority, MarkdownViewportSourceRequest,
-    MarkdownViewportSourceRequiredRowQuery, MarkdownViewportSourceRequiredRowResult,
-    MarkdownViewportSourceStep, VerifiedMarkdownOrdinaryLeaf, VerifiedMarkdownOrdinaryLine,
-    VerifiedMarkdownPlainViewport, VerifiedMarkdownRootLeafViewport,
-    VerifiedMarkdownViewportSources,
+    MarkdownHeadingAnchorError, MarkdownHeadingAnchorRequest, MarkdownHeadingAnchorStep,
+    MarkdownHeadingAnchorTarget, MarkdownHeadingAnchorWork, MarkdownOrdinaryPendingReason,
+    MarkdownOrdinarySemanticState, MarkdownRootLeafPendingReason, MarkdownViewportSourceAuthority,
+    MarkdownViewportSourceRequest, MarkdownViewportSourceRequiredRowQuery,
+    MarkdownViewportSourceRequiredRowResult, MarkdownViewportSourceStep,
+    VerifiedMarkdownOrdinaryLeaf, VerifiedMarkdownOrdinaryLine, VerifiedMarkdownPlainViewport,
+    VerifiedMarkdownRootLeafViewport, VerifiedMarkdownViewportSources,
 };
 
 // 单格草稿只公开独立权限、有限读取和提交收据；不把未提交候选冒充canonical Source。

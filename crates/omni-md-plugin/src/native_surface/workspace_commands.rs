@@ -166,7 +166,9 @@ pub(super) fn activate_native_markdown_sidebar_row(row_index: usize) -> Result<(
     })?;
     match row.kind {
         // Selecting a note retains the existing save/release/switch contract.
-        NativeMarkdownSidebarEntryKind::Note => switch_native_markdown_note(&row.relative_path)?,
+        NativeMarkdownSidebarEntryKind::Note => {
+            switch_native_markdown_note(&row.relative_path, None)?
+        }
         // Directory selection toggles a subtree projection and restarts its bounded traversal.
         NativeMarkdownSidebarEntryKind::Directory => {
             with_active_native_markdown_surface(|surface| {

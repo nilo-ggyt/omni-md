@@ -168,9 +168,8 @@ impl NativeMarkdownPagedBody {
             drop(self.selection_reveal.borrow_mut().take());
             drop(self.pending_vertical.borrow_mut().take());
             drop(self.pending_page_scroll.borrow_mut().take());
-            drop(self.pending_link.borrow_mut().take());
             view.prepare_presentation_change()?;
-            self.clear_scene();
+            self.clear_scene()?;
             view.release_scene_readers()?;
             let producer = self.producer.borrow_mut().take();
             let worker = self.worker.borrow_mut().take();

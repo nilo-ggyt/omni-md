@@ -10,7 +10,7 @@ mod cell_edit;
 pub use cell_edit::{MarkdownTableCellEditRequest, MarkdownTableCellEditStep};
 mod checkpoint;
 use checkpoint::{Boundary, ReplayAnchors};
-mod ordinary_source;
+pub(in crate::markdown_document_buffer) mod ordinary_source;
 use ordinary_source::CapturedOrdinary;
 #[cfg(feature = "paged-line-compose")]
 pub use ordinary_source::MarkdownSelectionStyleInvariant;
@@ -546,7 +546,7 @@ impl MarkdownTableWindowStructureRequest {
                 // 目标不属于此table；drop旧checkpoint/metadata后继续真实全局frontier，不保历史表目录。
                 self.current = None;
             }
-            GlobalFact::Reference(_) => {} // 结构查找不存全文ref目录；有限查询库存形成后另从真实源顺序解析。
+            GlobalFact::Reference(_) | GlobalFact::Footnote(_) => {} // 结构查找不存全文ref目录；有限查询库存形成后另从真实源顺序解析。
             GlobalFact::InlineBlock(block) => {
                 if self.capture_ordinary {
                     // 保留同一真实前沿的 opaque capture；后继只能消费它，不能从 gap 重建 paragraph。

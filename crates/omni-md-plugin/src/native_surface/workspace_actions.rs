@@ -1154,13 +1154,14 @@ fn relative_note_link_path(note: &str, path: &str) -> Result<String, String> {
         .ok_or_else(|| "笔记链接没有有效的目标路径".into())
 }
 
-/// 真click只排一个弱续体；原Body的排版/输入栈退出后才调用既有保存、拆图和切换流程。
+/// 真相对链接只排一个弱续体；fragment作为同次切换的有限值，不能在新文稿安装后重取旧URI。
 #[cfg(feature = "native-paged-production")]
 pub(super) fn queue_native_markdown_relative_note_link(
     view: &super::paged_text_view::NativeMarkdownPagedTextView,
     key: &super::paged_text_view::NativeMarkdownPagedSceneKey,
     click: &std::rc::Weak<()>,
     path: &str,
+    fragment: Option<String>,
 ) -> Result<(), super::paged_text_view::NativeMarkdownPagedTextViewError> {
     use super::paged_text_view::NativeMarkdownPagedTextViewError as LinkError;
     let note = ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
@@ -1196,12 +1197,19 @@ pub(super) fn queue_native_markdown_relative_note_link(
     }
     // Native Weak本身也不能保活原正文；跨主队列只转运原弱key/click、文件身份和有限相对目标。
     let pending = MainThreadBound::new(
-        (Weak::from(view), key.clone(), click.clone(), note, target),
+        (
+            Weak::from(view),
+            key.clone(),
+            click.clone(),
+            note,
+            target,
+            fragment,
+        ),
         view.mtm(),
     );
     enqueue_native_markdown_main_task(move || {
         let mtm = MainThreadMarker::new().expect("相对笔记链接只在原AppKit主队列消费");
-        let (weak, key, click, note, target) = pending.get(mtm);
+        let (weak, key, click, note, target, fragment) = pending.get(mtm);
         let Some(view) = weak.load() else { return };
         let result = (|| {
             let current = match view.link_intent_current(key, click) {
@@ -1233,7 +1241,7 @@ pub(super) fn queue_native_markdown_relative_note_link(
         match result {
             Ok(true) => {
                 drop(view); // 不把临时Native claim保到旧图resource barrier，否则会阻塞它自己的真实dealloc。
-                if let Err(cause) = switch_native_markdown_note(target)
+                if let Err(cause) = switch_native_markdown_note(target, fragment.clone())
                     && let Some(view) = weak.load()
                 {
                     view.report_link_failure(key, LinkError::RelativeNoteLink(cause));
@@ -1253,13 +1261,13 @@ pub(super) fn queue_native_markdown_relative_note_link(
 #[cfg(feature = "native-paged-production")]
 pub(super) fn present_native_markdown_paged_link_error(
     view: &super::paged_text_view::NativeMarkdownPagedTextView,
-    key: &super::paged_text_view::NativeMarkdownPagedSceneKey,
+    request: &super::paged_text_view::NativeMarkdownPagedSceneRequest,
     cause: &super::paged_text_view::NativeMarkdownPagedTextViewError,
 ) {
     let _ = with_active_native_markdown_surface(|surface| {
         if surface.editor.as_ref().is_some_and(|editor| {
             std::ptr::eq(editor.input_view(), view.as_super())
-                && std::rc::Weak::ptr_eq(&key.request.document, &Rc::downgrade(editor.document()))
+                && std::rc::Weak::ptr_eq(&request.document, &Rc::downgrade(editor.document()))
         }) && native_markdown_controller_has_foreground_authority(&surface.controller)
         {
             surface.controller.present_error(&cause.to_string());
@@ -1381,6 +1389,7 @@ fn replace_active_editor_from_disk(
             previous_relative_path,
             release_barrier,
             recovery_handoff,
+            fragment: None,
         });
         Ok::<_, String>(surface.controller.clone())
     })?;
@@ -1455,7 +1464,7 @@ pub(super) fn import_native_markdown_note_to_directory(
         )
     })?;
     // 原生命周期再次保存或打开失败时仍报告真实导入结果，不重放复制或回滚成功文件。
-    switch_native_markdown_note(&receipt.relative_path).map_err(|error| {
+    switch_native_markdown_note(&receipt.relative_path, None).map_err(|error| {
         format!(
             "笔记已导入到“{}”，但打开未完成：{error}",
             receipt.relative_path

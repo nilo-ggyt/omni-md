@@ -64,6 +64,10 @@ pub(super) enum ReplayStep {
         next: usize,
         suppressed_close: Option<usize>,
     },
+    Footnote {
+        source: Range<usize>,
+        next: usize,
+    },
     None,
 }
 
@@ -73,10 +77,16 @@ pub(super) enum ReplayStep {
 /// 已关闭的子项也留在原文件 source-order 链，既不建括号 Vec，也不存一份 Parser 事件图。
 /// 每个存储暂停保原请求，不能在另一 Source/请求回复上继续；真实 errno 归文件拥有者。
 pub(super) struct LinkProbe {
+    heading: bool,
     revision: u64,
     source_end: usize,
     block: Range<usize>,
     options: crate::Options,
+    // 同一真实 seed 仅持结构元数据；前瞻和引用重读各自逐行借原 prefix，不保正文/行表。
+    scope: Option<std::sync::Arc<super::super::VerifiedInlineSemanticSeed>>,
+    prefix: Option<crate::global_frontier::ReferencePrefixScanner>,
+    continuation: Option<(usize, bool)>,
+    prefix_start: usize,
     next: usize,
     phase: LinkPhase,
     decision: crate::inline_scan::LinkStackDecision,
@@ -92,13 +102,17 @@ pub(super) struct LinkProbe {
     reference_kind: InlineReferenceKind,
     reference_first: Option<u8>,
     reference_footnote: bool,
+    // '^'可能独占一个真实piece；只保这一byte的未决事实，不能因片尾猜普通key或脚注。
+    reference_caret: bool,
+    // 脚注成功沿原Parser清全部祖先；serial水位不影响后来真正新开的Link/Image。
+    cleared_through: usize,
     suppressed_close: Option<usize>,
     ticks: usize,
     tick_start: usize,
     escaped_tick: bool,
     code: Option<CodeSpanProbe>,
-    html: [u8; HTML_BYTES],
-    html_len: usize,
+    html: Option<crate::scanners::InlineHtmlScanner>,
+    html_start: usize,
     destination: DestinationScanner,
     destination_start: usize,
     destination_range: Range<usize>,
@@ -123,12 +137,19 @@ impl LinkProbe {
         image: bool,
         options: crate::Options,
         suppressed_close: Option<usize>,
+        scope: Option<std::sync::Arc<super::super::VerifiedInlineSemanticSeed>>,
+        heading: bool,
     ) -> Result<Self, Error> {
         let mut probe = Self {
+            heading,
             revision,
             source_end,
             block,
             options,
+            scope,
+            prefix: None,
+            continuation: None,
+            prefix_start: 0,
             next: start + if image { 2 } else { 1 },
             phase: LinkPhase::Label,
             decision: Default::default(),
@@ -144,13 +165,15 @@ impl LinkProbe {
             reference_kind: InlineReferenceKind::Shortcut,
             reference_first: None,
             reference_footnote: false,
+            reference_caret: false,
+            cleared_through: 0,
             suppressed_close,
             ticks: 0,
             tick_start: 0,
             escaped_tick: false,
             code: None,
-            html: [0; HTML_BYTES],
-            html_len: 0,
+            html: None,
+            html_start: 0,
             destination: DestinationScanner::new(crate::parse::LINK_MAX_NESTED_PARENS),
             destination_start: 0,
             destination_range: 0..0,
@@ -168,6 +191,12 @@ impl LinkProbe {
         Ok(probe)
     }
     pub(super) fn next_byte(&self) -> usize {
+        if let Some(prefix) = &self.prefix {
+            return prefix.next_byte();
+        }
+        if let Some((at, _)) = self.continuation {
+            return at;
+        }
         self.code
             .as_ref()
             .map_or(self.next, CodeSpanProbe::next_byte)
@@ -381,6 +410,7 @@ impl LinkProbe {
             label: record.label_start..record.label_end,
             reference,
             kind,
+            scope: self.scope.clone(),
         })
     }
     /// Core 已在同 Source/Queries 完成真实查询后恢复；请求不匹配立即失败，
@@ -390,12 +420,19 @@ impl LinkProbe {
         request: &VerifiedInlineReferenceRequest,
         resolution: InlineReferenceResolution,
     ) -> Result<(), Error> {
+        // 请求比较还包含同一Arc scope身份；相同label字符串或相同范围不能恢复别的暂停事务。
+        // Found/Missing由Core真实全源查询给出，这里只执行原LinkStack后果，不做第二次定义查找。
         if self.reference_request.as_ref() != Some(request) {
             return Err(Error::InvalidFrame);
         }
         self.reference_request = None;
         let (_, record) = self.current.as_mut().ok_or(Error::InvalidFrame)?;
         record.status = match resolution {
+            InlineReferenceResolution::Resolved
+                if request.kind == InlineReferenceKind::Footnote =>
+            {
+                InlineLinkRecordStatus::Footnote
+            }
             InlineReferenceResolution::Resolved => InlineLinkRecordStatus::Reference,
             InlineReferenceResolution::Missing => InlineLinkRecordStatus::Literal,
         };
@@ -403,6 +440,10 @@ impl LinkProbe {
             // 原 Full reference 失败不吞第二个标签。它的 closing 不再尝试 shortcut/collapsed，
             // 但紧随其后的真实 (destination) 仍可使第二标签成为直接链接。
             self.next = record.label_end + 1;
+        } else if record.status == InlineLinkRecordStatus::Footnote {
+            // 原Parser的脚注成功会清空全部LinkStack，Image祖先也不能在后文恢复。
+            // serial只撤销当时已存在的祖先；后续新opener仍有真实更大的身份。
+            self.cleared_through = record.serial;
         } else if record.kind == InlineLinkKind::Link {
             self.decision.accept_link();
         }
@@ -448,6 +489,7 @@ impl LinkProbe {
         self.reference_scanner = Some(crate::linklabel::LabelScanner::new());
         self.reference_first = None;
         self.reference_footnote = false;
+        self.reference_caret = false;
         self.phase = LinkPhase::ReferenceLabel;
         Ok(())
     }
@@ -487,19 +529,53 @@ impl LinkProbe {
             .bytes
             .get(self.next.saturating_sub(frame.byte_start)..)
             .unwrap_or(&[]);
-        if self.reference_first.is_none() && !available.is_empty() {
-            self.reference_first = Some(available[0]);
-        }
-        if self.reference_first == Some(b'^')
+        if self.reference_first.is_none()
+            && available.first() == Some(&b'^')
             && self.options.contains(crate::Options::ENABLE_FOOTNOTES)
         {
-            // '^]' 仍是普通 key；只有原 scanner 的真实第二字符才能区分 Footnote。
-            let second = if self.next == self.reference_start {
-                available.get(1).copied()
-            } else {
-                available.first().copied()
+            // '^'可能与']'分属两个真实piece；只保已读取的这一byte，下一片才决定'^]'普通key。
+            self.reference_first = Some(b'^');
+            self.reference_caret = true;
+            self.next += 1;
+            work.byte_reads += 1;
+            work.transitions += 1;
+            return Ok(LinkStep::Progress);
+        }
+        if self.reference_caret {
+            // 原GFM只有'^]'是普通key；其它后继才打开脚注key，'^'本身不进入它的规范化内容。
+            // 此分支可能跨SourceFrame，仍使用刚读取的真实后继，不从外部字符串重建label。
+            let Some(&byte) = available.first() else {
+                if self.next == self.block.end {
+                    // 全标签只有'^'便到真实块末端；原候选已无后继，回退外label而非等待不存在的帧。
+                    self.reference_caret = false;
+                    if self.reference_kind == InlineReferenceKind::Full {
+                        self.begin_reference(false)?;
+                    } else {
+                        self.literal()?;
+                    }
+                    return Ok(LinkStep::Progress);
+                }
+                return Ok(LinkStep::NeedInput);
             };
-            self.reference_footnote |= second.is_some_and(|byte| byte != b']');
+            self.reference_caret = false;
+            if byte == b']' {
+                // 原已消费的'^'仍交同一个LabelScanner；固定carry不是新源或合成业务输入。
+                let mut output = [0; 8];
+                let before = scanner.transitions;
+                let (read, written, _) = scanner.feed(b"^", false, &mut output);
+                work.transitions += scanner.transitions - before + read + written;
+            } else if self.reference_kind == InlineReferenceKind::Full {
+                self.begin_reference(false)?; // 原UnexpectedFootnote仍回到外label尝试shortcut。
+                return Ok(LinkStep::Progress);
+            } else {
+                // 原LabelScanner尚未读入内容，此时才把真实key起点越过已经消费的'^'。
+                // 空白/空key是否合法仍由原scanner决定，不能靠看到caret直接签发Footnote。
+                self.reference_start += 1;
+                self.reference_footnote = true;
+            }
+        }
+        if self.reference_first.is_none() && !available.is_empty() {
+            self.reference_first = Some(available[0]);
         }
         let child = budget.saturating_sub(work.byte_reads + work.transitions + 16) / 8;
         if child == 0 {
@@ -518,26 +594,35 @@ impl LinkProbe {
         work.transitions += scanner.transitions - before + written;
         match step {
             crate::linklabel::LabelStep::NeedLine => {
-                scanner.continue_line(0).ok_or(Error::InvalidFrame)?;
+                if self.reference_footnote && self.options.has_gfm_footnotes() {
+                    self.literal()?; // GFM脚注key不能跨逻辑行，不能借普通reference的容器续行权限。
+                    return Ok(LinkStep::Progress);
+                }
+                if self.scope.is_some() {
+                    self.arm_line(false);
+                } else {
+                    scanner.continue_line(0).ok_or(Error::InvalidFrame)?;
+                }
                 Ok(LinkStep::Progress)
             }
             crate::linklabel::LabelStep::Complete => {
                 if self.reference_footnote {
-                    // 原 scan_reference 的 UnexpectedFootnote 不会吞掉后继标签；先试外层
-                    // shortcut。真正外层 Footnote 则保自己的语义路径，不能伪普通引用。
-                    if self.reference_kind == InlineReferenceKind::Full {
-                        self.begin_reference(false)?;
-                        return Ok(LinkStep::Progress);
+                    if !self.heading {
+                        return Ok(LinkStep::General);
                     }
-                    return Ok(LinkStep::General);
+                    self.reference_kind = InlineReferenceKind::Footnote;
                 }
                 let (id, record) = self.current.as_mut().ok_or(Error::InvalidFrame)?;
                 if self.reference_kind == InlineReferenceKind::Full {
                     self.suppressed_close = Some(self.next - 1);
                 }
+                // 只有原closing bracket闭合后才把完整key范围落入原记录；后继replay不再重判种类。
+                // Footnote只消费首标签，Full第二标签和Collapsed后缀分别沿它们原有的结束范围。
                 record.reference = Some((self.reference_kind, self.reference_start..self.next));
                 record.source_end = match self.reference_kind {
-                    InlineReferenceKind::Shortcut => record.label_end + 1,
+                    InlineReferenceKind::Shortcut | InlineReferenceKind::Footnote => {
+                        record.label_end + 1
+                    }
                     InlineReferenceKind::Collapsed => self.reference_owner_end,
                     InlineReferenceKind::Full => self.next,
                 };
@@ -589,6 +674,7 @@ impl LinkProbe {
         frame: &SourceFrame<'_>,
         budget: usize,
         work: &mut GlobalWork,
+        html_guard: &mut crate::parse::HtmlScanGuard,
     ) -> Result<LinkStep, Error> {
         if let Some((request, _)) = &self.pending {
             return Ok(LinkStep::Storage(request.clone()));
@@ -599,10 +685,37 @@ impl LinkProbe {
         if self.replaying() {
             return Ok(LinkStep::Replay);
         }
+        if let Some(step) = self.advance_prefix(frame, budget, work)? {
+            return Ok(step);
+        }
         if matches!(self.phase, LinkPhase::ReferenceLabel) {
             return self.advance_reference(frame, budget, work);
         }
-        if let Some(probe) = self.code.as_mut() {
+        if matches!(self.phase, LinkPhase::Html) {
+            return self.advance_html(frame, budget, work, html_guard);
+        }
+        if self.code.is_some() {
+            let mut count = frame.bytes.len();
+            let mut boundary = None;
+            if self.scope.is_some() {
+                let available = budget.saturating_sub(
+                    work.byte_reads
+                        + work.transitions
+                        + crate::inline_frontier::MIN_INLINE_STEP_WORK
+                        + 1,
+                ) / 4;
+                count = count.min(available);
+                for (offset, &byte) in frame.bytes[..count].iter().enumerate() {
+                    work.byte_reads += 1;
+                    work.transitions += 1;
+                    if matches!(byte, b'\r' | b'\n') {
+                        count = offset + 1;
+                        boundary = Some((frame.byte_start + count, byte));
+                        break;
+                    }
+                }
+            }
+            let probe = self.code.as_mut().unwrap();
             let child = budget.saturating_sub(work.byte_reads + work.transitions);
             if child < crate::inline_frontier::MIN_INLINE_STEP_WORK + 1 {
                 return Ok(LinkStep::Progress);
@@ -612,8 +725,8 @@ impl LinkProbe {
                     SourceFrame {
                         source_revision: frame.source_revision,
                         byte_start: frame.byte_start,
-                        bytes: frame.bytes,
-                        real_eof: frame.real_eof,
+                        bytes: &frame.bytes[..count],
+                        real_eof: frame.real_eof && count == frame.bytes.len(),
                     },
                     child,
                 )
@@ -626,6 +739,16 @@ impl LinkProbe {
             };
             work.byte_reads += measured.byte_reads;
             work.transitions += measured.transitions + measured.entity_lookup_byte_work_bound;
+            if let Some((at, byte)) = boundary {
+                if probe.next_byte() == at
+                    && matches!(
+                        &step,
+                        CodeSpanStep::NeedInput { .. } | CodeSpanStep::Progress { .. }
+                    )
+                {
+                    self.continuation = Some((at, byte == b'\r'));
+                }
+            }
             match step {
                 CodeSpanStep::Candidate { candidate, .. } => {
                     self.next = candidate.range().end;
@@ -644,11 +767,6 @@ impl LinkProbe {
         }
         while work.byte_reads + work.transitions + 16 <= budget {
             if self.next == self.block.end {
-                if matches!(self.phase, LinkPhase::Html) {
-                    // 尚未完成原 HTML 优先级证明，label_end 也尚不存在；不能跳去目标
-                    // 回退并用零坐标重读块前方。保留原独立 General 路径处理该语法。
-                    return Ok(LinkStep::General);
-                }
                 if matches!(
                     self.phase,
                     LinkPhase::Label | LinkPhase::Bang | LinkPhase::Escape | LinkPhase::Ticks
@@ -692,10 +810,15 @@ impl LinkProbe {
                     }
                     b'`' => self.begin_ticks(false),
                     b'<' => {
-                        self.html[0] = byte;
-                        self.html_len = 1;
-                        self.next += 1;
+                        // 与父游标共用原失败 guard，所有候选都由同一个真实 HTML 内核闭合。
+                        self.html_start = self.next;
+                        self.html = Some(crate::scanners::InlineHtmlScanner::new(
+                            crate::scanners::InlineHtmlMode::Any,
+                            self.next,
+                            html_guard,
+                        ));
                         self.phase = LinkPhase::Html;
+                        return Ok(LinkStep::Progress);
                     }
                     b'!' => {
                         self.next += 1;
@@ -711,16 +834,23 @@ impl LinkProbe {
                         let (_, record) = self.current.as_mut().ok_or(Error::InvalidFrame)?;
                         record.label_end = self.next;
                         self.next += 1;
-                        if !self
-                            .decision
-                            .enabled(record.serial, record.kind == InlineLinkKind::Image)
+                        if record.serial <= self.cleared_through
+                            || !self
+                                .decision
+                                .enabled(record.serial, record.kind == InlineLinkKind::Image)
                         {
                             self.literal()?;
                             return Ok(LinkStep::Progress);
                         }
                         self.phase = LinkPhase::OpenTarget;
                     }
-                    _ => self.next += 1,
+                    _ => {
+                        self.next += 1;
+                        if matches!(byte, b'\r' | b'\n') && self.scope.is_some() {
+                            self.arm_line(byte == b'\r');
+                            return Ok(LinkStep::Progress);
+                        }
+                    }
                 },
                 // '!' 只在后继真实 '[' 时成为 Image opener；其它位置仍按原字面保留。
                 // 两字节可跨帧，但不把第一帧尾的 '!' 当新语义边界。
@@ -770,29 +900,6 @@ impl LinkProbe {
                         return Ok(LinkStep::Progress);
                     }
                 }
-                LinkPhase::Html => {
-                    if self.html_len == HTML_BYTES {
-                        return Ok(LinkStep::General);
-                    }
-                    if byte == b'>' {
-                        let cost = (self.html_len + 1) * 4;
-                        if work.byte_reads + work.transitions + cost > budget {
-                            return Ok(LinkStep::Progress);
-                        }
-                        work.transitions += cost;
-                    }
-                    self.html[self.html_len] = byte;
-                    self.html_len += 1;
-                    self.next += 1;
-                    if byte == b'>' {
-                        if let Some(autolink) = root_html(&self.html[..self.html_len]) {
-                            if autolink {
-                                return Ok(LinkStep::General);
-                            }
-                            self.phase = LinkPhase::Label;
-                        }
-                    }
-                }
                 // 直接目标的 '(' 必须紧邻 ']'；空白不是自由跳过的 reference 前缀。
                 // 直接目标失败后仍按原规则试引用，不能仅因后文像 URL 就签 Direct。
                 LinkPhase::OpenTarget => {
@@ -812,6 +919,10 @@ impl LinkProbe {
                 | LinkPhase::AfterDestination
                 | LinkPhase::AfterTitle => {
                     if self.separator(byte) {
+                        if matches!(byte, b'\r' | b'\n') && self.scope.is_some() {
+                            self.arm_line(byte == b'\r');
+                            return Ok(LinkStep::Progress);
+                        }
                         continue;
                     }
                     match self.phase {
@@ -868,7 +979,14 @@ impl LinkProbe {
                             self.fallback_reference()?;
                             return Ok(LinkStep::Progress);
                         }
-                        TitleStep::NeedLine { .. } => self.title.continue_line(0),
+                        TitleStep::NeedLine { .. } => {
+                            if self.scope.is_some() {
+                                self.arm_line(false);
+                            } else {
+                                self.title.continue_line(0);
+                            }
+                            return Ok(LinkStep::Progress);
+                        }
                         TitleStep::Complete { byte_count, .. } => {
                             self.title_range =
                                 Some(self.title_start + 1..self.title_start + byte_count - 1);
@@ -893,6 +1011,182 @@ impl LinkProbe {
                     return Ok(LinkStep::Progress);
                 }
                 _ => return Err(Error::InvalidFrame),
+            }
+        }
+        Ok(LinkStep::Progress)
+    }
+    /// 只有本语法阶段真实消费EOL后才排队；无scope的Root不需要第二套行起点逻辑。
+    fn arm_line(&mut self, after_cr: bool) {
+        if self.scope.is_some() && self.next < self.block.end {
+            self.continuation = Some((self.next, after_cr));
+        }
+    }
+
+    /// lookahead的前缀与最终源序replay分开消费，同样借原seed和原PrefixScanner。
+    /// code/HTML/reference仅跳容器；普通标签与title沿原正文行起点去缩进，不猜固定前缀宽度。
+    fn advance_prefix(
+        &mut self,
+        frame: &SourceFrame<'_>,
+        budget: usize,
+        work: &mut GlobalWork,
+    ) -> Result<Option<LinkStep>, Error> {
+        use crate::global_frontier::{
+            ReferencePrefixPurpose, ReferencePrefixStep, VerifiedInlinePrefix,
+        };
+        let Some(scope) = self.scope.as_ref() else {
+            return Ok(None);
+        };
+        if let Some((at, after_cr)) = self.continuation.take() {
+            if after_cr {
+                let Some(&byte) = frame.bytes.first() else {
+                    self.continuation = Some((at, after_cr));
+                    return Ok(Some(LinkStep::NeedInput));
+                };
+                work.byte_reads += 1;
+                work.transitions += 1;
+                // 原消费者仍须实际消费CRLF的LF；这里不越过词法状态直接跳prefix。
+                if byte == b'\n' {
+                    return Ok(None);
+                }
+            }
+            self.prefix_start = at;
+            let purpose = if self.code.is_some()
+                || matches!(
+                    self.phase,
+                    LinkPhase::Html
+                        | LinkPhase::ReferenceLabel
+                        | LinkPhase::BeforeDestination
+                        | LinkPhase::AfterDestination
+                        | LinkPhase::AfterTitle
+                ) {
+                ReferencePrefixPurpose::ContainerOnly
+            } else {
+                ReferencePrefixPurpose::Paragraph
+            };
+            self.prefix = Some(scope.continuation_prefix_scanner(at, purpose)?);
+            return Ok(Some(LinkStep::Progress));
+        }
+        let Some(prefix) = self.prefix.as_mut() else {
+            return Ok(None);
+        };
+        let child = budget.saturating_sub(work.byte_reads + work.transitions);
+        if child < 2048 {
+            return Ok(Some(LinkStep::Progress));
+        }
+        let step = prefix.advance(
+            SourceFrame {
+                source_revision: frame.source_revision,
+                byte_start: frame.byte_start,
+                bytes: frame.bytes,
+                real_eof: frame.real_eof,
+            },
+            GlobalSourceAuthority {
+                current_revision: self.revision,
+                cancelled: false,
+            },
+            child,
+        )?;
+        let (measured, end) = match step {
+            ReferencePrefixStep::Progress { work: measured, .. } => {
+                work.byte_reads += measured.byte_reads;
+                work.transitions += measured.transitions;
+                return Ok(Some(LinkStep::Progress));
+            }
+            ReferencePrefixStep::NeedInput { work: measured, .. } => {
+                work.byte_reads += measured.byte_reads;
+                work.transitions += measured.transitions;
+                return Ok(Some(LinkStep::NeedInput));
+            }
+            ReferencePrefixStep::Complete { prefix_bytes, work } => {
+                (work, self.prefix_start + prefix_bytes)
+            }
+        };
+        work.byte_reads += measured.byte_reads;
+        work.transitions += measured.transitions;
+        if end > self.block.end {
+            return Err(Error::InvalidFrame);
+        }
+        self.prefix = None;
+        let proof = VerifiedInlinePrefix {
+            revision: self.revision,
+            source_end: self.source_end,
+            range: self.prefix_start..end,
+            block_source: scope.source_range(),
+            purpose: Some(ReferencePrefixPurpose::ContainerOnly),
+        };
+        // 前缀只在原Scanner Complete之后交给当前实际消费者；四种续体各自保原偏移计量。
+        // lookahead不发布可见Prefix，最终源序replay会再次从同一Source借原规则取得它。
+        if let Some(code) = self.code.as_mut() {
+            code.skip_prefix(&proof).map_err(inline_error)?;
+        } else if matches!(self.phase, LinkPhase::Html) {
+            if !self
+                .html
+                .as_mut()
+                .ok_or(Error::InvalidFrame)?
+                .continue_line(proof.range.len())
+            {
+                return Err(Error::InvalidFrame);
+            }
+        } else if matches!(self.phase, LinkPhase::ReferenceLabel) {
+            self.reference_scanner
+                .as_mut()
+                .ok_or(Error::InvalidFrame)?
+                .continue_line(proof.range.len())
+                .ok_or(Error::InvalidFrame)?;
+        } else if matches!(self.phase, LinkPhase::Title) {
+            self.title.continue_line(proof.range.len());
+        }
+        self.next = end;
+        Ok(Some(LinkStep::Progress))
+    }
+
+    /// 先完成同一 HTML/autolink 优先级，再读括号；长属性和注释只保固定词法状态。
+    /// 真 autolink 禁用普通 Link 祖先，与原 LinkStack 相同；Image 祖先仍可容纳可见标签。
+    fn advance_html(
+        &mut self,
+        frame: &SourceFrame<'_>,
+        budget: usize,
+        work: &mut GlobalWork,
+        guard: &mut crate::parse::HtmlScanGuard,
+    ) -> Result<LinkStep, Error> {
+        use crate::scanners::{InlineHtmlKind, InlineHtmlProgress};
+        let child = budget.saturating_sub(work.byte_reads + work.transitions + 16);
+        if child == 0 {
+            return Ok(LinkStep::Progress);
+        }
+        let count = frame.bytes.len().min(self.block.end - self.next);
+        let step = self.html.as_mut().ok_or(Error::InvalidFrame)?.feed(
+            &frame.bytes[..count],
+            self.next + count == self.block.end,
+            child,
+        );
+        self.next += step.consumed;
+        work.byte_reads += step.byte_reads;
+        work.transitions += step.transitions;
+        match step.progress {
+            InlineHtmlProgress::Progress => {}
+            InlineHtmlProgress::NeedLine => {
+                if self.scope.is_some() {
+                    self.arm_line(false);
+                } else if !self.html.as_mut().unwrap().continue_line(0) {
+                    return Err(Error::InvalidFrame);
+                }
+            }
+            InlineHtmlProgress::Rejected => {
+                self.html.as_ref().unwrap().record_failure(guard);
+                self.html = None;
+                self.next = self.html_start + 1;
+                self.phase = LinkPhase::Label;
+            }
+            InlineHtmlProgress::Accepted { kind, byte_count } => {
+                if self.html_start.checked_add(byte_count) != Some(self.next) {
+                    return Err(Error::InvalidFrame);
+                }
+                if !matches!(kind, InlineHtmlKind::Html) {
+                    self.decision.accept_link();
+                }
+                self.html = None;
+                self.phase = LinkPhase::Label;
             }
         }
         Ok(LinkStep::Progress)
@@ -1004,6 +1298,16 @@ impl LinkProbe {
                         InlineLinkStorageOperation::Read(after),
                         StoragePurpose::ReplayNext,
                     )?;
+                }
+                if record.status == InlineLinkRecordStatus::Footnote {
+                    // 定义已Found的脚注没有普通Link label/样式scope；原'![^x]'中的'!'仍留字面。
+                    // 对应省略事实在原Source位置交付，不能在lookahead阶段提前隐藏它或跳过祖先内容。
+                    let start =
+                        record.source_start + usize::from(record.kind == InlineLinkKind::Image);
+                    return Ok(ReplayStep::Footnote {
+                        source: start..record.source_end,
+                        next: record.source_end,
+                    });
                 }
                 if matches!(
                     record.status,

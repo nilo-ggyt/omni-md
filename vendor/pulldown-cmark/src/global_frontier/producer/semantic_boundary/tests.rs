@@ -114,6 +114,11 @@ fn signature(fact: &GlobalFact) -> String {
                 .map(|index| reference.spine.entry(index).unwrap())
                 .collect::<Vec<_>>()
         ),
+        GlobalFact::Footnote(definition) => format!(
+            "footnote {:?} {:?}",
+            definition.source_range(),
+            definition.reference_range()
+        ),
         GlobalFact::InlineBlock(block) => format!(
             "inline {:?} {:?} {:?} {:?} {} {:?} {:?}",
             block.kind(),

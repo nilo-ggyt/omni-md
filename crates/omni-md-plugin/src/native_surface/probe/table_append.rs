@@ -5,7 +5,6 @@ use super::*;
 use crate::native_surface::paged_text_view::{
     NativeMarkdownPagedTextView, NativeMarkdownPagedTextViewDelegate,
 };
-use objc2::Message;
 
 /// 仅等待原鼠标或 Tab 实际创建的下一张格正文；不激活格、不推进执行器，也不补发输入。
 /// 每轮只借一次正式窗口，核同一父 Body、文稿和完整 Input，退租后才进入原主 runloop。
@@ -145,6 +144,7 @@ enum ConflictProbeAction {
 struct ConflictProbeOperation {
     controller: Weak<NativeMarkdownController>,
     original: NativeMarkdownCurrentNoteIntent,
+    input: NativeMarkdownPagedInputState,
     action: ConflictProbeAction,
     destination: String,
     expected_terminal: NativeMarkdownHostedTableStep,
@@ -276,6 +276,8 @@ pub enum NativeMarkdownHostedTableStep {
     VerifyReplacementUndoAndRedo,
     VerifyReplacementRedoAndSave,
     VerifyReplacementSaved,
+    VerifyInformationClosedAndReopen,
+    RefreshInformationCard,
 }
 
 impl NativeMarkdownHostedTableCase {
@@ -327,6 +329,8 @@ impl NativeMarkdownHostedTableCase {
                 ActivateCell,
                 BeginLocalHistory,
                 VerifyFirstLocalAndTypeSecond,
+                VerifyInformationClosedAndReopen,
+                RefreshInformationCard,
                 UndoSecondLocal,
                 VerifyLocalUndoAndRedo,
                 VerifyLocalRedoAndUndo,
@@ -467,6 +471,8 @@ impl NativeMarkdownHostedTableProbe {
             FormatActiveCell => self.verify_format(),
             BeginLocalHistory => self.advance_toolbar_field_history(0),
             VerifyFirstLocalAndTypeSecond => self.advance_toolbar_field_history(1),
+            VerifyInformationClosedAndReopen => self.reopen_information_card(),
+            RefreshInformationCard => self.refresh_information_card(),
             UndoSecondLocal => self.advance_toolbar_field_history(2),
             VerifyLocalUndoAndRedo => self.advance_toolbar_field_history(3),
             VerifyLocalRedoAndUndo => self.advance_toolbar_field_history(4),
@@ -1312,10 +1318,6 @@ impl NativeMarkdownHostedTableProbe {
         if stage != 0 {
             self.settle_cell(Instant::now())?;
             self.verify_information_card(&facts, stage != 4)?;
-            if stage == 2 {
-                self.click_information_control(&facts, true)?;
-                self.verify_information_card(&facts, true)?;
-            }
         }
         self.with_cell(|_, view| {
             let expected = match stage {
@@ -1373,11 +1375,7 @@ impl NativeMarkdownHostedTableProbe {
         self.verify_formatted_revision(0, SELECTED_BEFORE, false, false)?;
         match stage {
             0 => self.click_toolbar_button(0, 6),
-            1 => {
-                self.click_information_control(&facts, false)?;
-                self.verify_information_card(&facts, false)?;
-                self.click_toolbar_button(0, 6)
-            }
+            1 => self.click_information_control(&facts, false),
             3 => {
                 self.click_toolbar_button(0, 23)?;
                 self.click_toolbar_button(0, 6)
@@ -1390,6 +1388,21 @@ impl NativeMarkdownHostedTableProbe {
             6 => self.commit_cell(),
             _ => Ok(()),
         }
+    }
+
+    /// 关闭按钮必须先经过真实鼠标事件，再由下一Host步骤核移除和清空；本步骤才重开。
+    fn reopen_information_card(&self) -> Result<(), String> {
+        let facts = self.facts()?;
+        self.verify_information_card(&facts, false)?;
+        self.click_toolbar_button(0, 6)
+    }
+
+    /// 刷新也是独立用户动作；后继局部历史步骤核同一卡与canonical，不在排队后立即冒充完成。
+    fn refresh_information_card(&self) -> Result<(), String> {
+        let facts = self.facts()?;
+        self.settle_cell(Instant::now())?;
+        self.verify_information_card(&facts, true)?;
+        self.click_information_control(&facts, true)
     }
 
     /// 独立小表场景预先固定两处真实源坐标，再沿原字段协议开始组合和真实按钮导航。
@@ -1620,7 +1633,7 @@ impl NativeMarkdownHostedTableProbe {
             })
     }
 
-    /// 原实际按钮在 Active 借用结束后点击；只预声明这次显式动作应推进的一次意图。
+    /// 原实际按钮在Active借用结束后接收鼠标对；只预声明本次动作应推进的一次意图。
     fn click_find_replacement_button(
         &self,
         facts: &AppendFacts,
@@ -1630,30 +1643,42 @@ impl NativeMarkdownHostedTableProbe {
         if probe.queued_button.is_some() {
             return Err("原查找按钮尚未消费真实终点".into());
         }
-        let (button, before_input) = with_active_native_markdown_surface(|surface| {
-            let current = || {
+        let (events, before_input, mtm) = with_active_native_markdown_surface(|surface| {
+            let original = || {
                 self.find_replacement_current(surface, facts, probe, facts.generation, probe.intent)
             };
             let bar = probe.bar.upgrade().ok_or("原查找栏已释放")?;
-            let button = step(&current, || bar.probe_button(action).retain())?;
-            let input = step(&current, || {
+            let input = step(&original, || {
                 surface.editor.as_ref().unwrap().text_view.input_state()
             })?
             .map_err(|cause| cause.to_string())?;
-            Ok((button, input))
+            let current = || {
+                original()
+                    && surface
+                        .editor
+                        .as_ref()
+                        .unwrap()
+                        .text_view
+                        .input_state()
+                        .is_ok_and(|actual| actual == input)
+            };
+            let button = bar.probe_button(action);
+            if !step(&current, || button.refusesFirstResponder())? {
+                return Err("原查找按钮会夺取字段组合焦点".into());
+            }
+            let events = button_mouse::prepare(button, &surface.panel, &current)?;
+            Ok((events, input, surface.panel.mtm()))
         })?;
         let next = probe.intent.checked_add(1).ok_or("查找按钮意图溢出")?;
         probe.action_started = Instant::now(); // 入原 selector 前固定期限，不从后来 Ready 重置时钟。
-        // performClick只排正式controller工作，下一Host事件与主GCD队列没有先后保证。
+        // 鼠标队列和正式controller工作都尚可未执行，下一Host事件与主GCD队列没有先后保证。
         // 保存原票允许精确前态暂等；预声明后态仍只有这次按钮应推进的一次意图。
         probe.queued_button = Some(FindReplacementQueuedButton {
             before_intent: probe.intent,
             after_intent: next,
             before_input,
         });
-        // SAFETY: 只点击原栏当前具体按钮；原 target/action 自己排队执行，不伪造完成或直接调用后端。
-        unsafe { button.performClick(None) };
-        drop(button);
+        button_mouse::post(events, mtm); // 原栏/按钮/Doc强claim均已退还，实际窗口负责命中与tracking。
         probe.intent = next;
         Ok(())
     }
@@ -2159,16 +2184,45 @@ impl NativeMarkdownHostedTableProbe {
                 result.is_err() || operation.action == ConflictProbeAction::CancelReload;
             *operation.modal_result.borrow_mut() = Some(result);
             let button = if use_cancel { cancel } else { confirm };
-            if let Some(button) = button.load() {
-                // SAFETY: 只点击原alert已登记按钮；保留NSAlert自有target/action与实际返回码，失败也走真实取消。
-                unsafe { button.performClick(None) };
-            } else {
-                *operation.modal_result.borrow_mut() = Some(Err("原对话框按钮已释放".into()));
+            let events = (|| {
+                let window = window.load().ok_or("原冲突对话框已释放")?;
+                let button = button.load().ok_or("原对话框按钮已释放")?;
+                let current = || {
+                    operation.active.get()
+                        && NSApplication::sharedApplication(mtm)
+                            .modalWindow()
+                            .is_some_and(|actual| std::ptr::eq(&*actual, &*window))
+                        && (use_cancel
+                            || (operation.original.current()
+                                && with_active_native_markdown_surface(|surface| {
+                                    let editor =
+                                        surface.editor.as_ref().ok_or("原modal正文已释放")?;
+                                    Ok(editor
+                                        .text_view
+                                        .input_state()
+                                        .map_err(|cause| cause.to_string())?
+                                        == operation.input)
+                                })
+                                .unwrap_or(false)))
+                };
+                // 失败只能取消这一个仍在真实modal中的旧窗口；确认还必须保持原Doc完整Input。
+                // 先准备完整鼠标对，所有控件/窗口临时claim退栈后才入原NSApp队列。
+                button_mouse::prepare(&button, &window, &current)
+            })();
+            match events {
+                Ok(events) => button_mouse::post(events, mtm),
+                Err(cause) => *operation.modal_result.borrow_mut() = Some(Err(cause)),
             }
             let completion = MainThreadBound::new(Rc::clone(operation), mtm);
             enqueue_native_markdown_main_task(move || {
                 let mtm = MainThreadMarker::new().expect("原modal栈退回后沿主队列交付");
                 let operation = completion.get(mtm);
+                if NSApplication::sharedApplication(mtm)
+                    .modalWindow()
+                    .is_some()
+                {
+                    return; // 鼠标尚未被原modal消费时不能把排队当作实际取消；原超时仍报告失败。
+                }
                 if operation.action == ConflictProbeAction::CancelReload
                     || operation
                         .modal_result
@@ -2229,7 +2283,7 @@ impl NativeMarkdownHostedTableProbe {
         if self.conflict_operation.borrow().is_some() {
             return Err("上一冲突操作的实际终点尚未消费".into());
         }
-        let (original, controller) = with_active_native_markdown_surface(|surface| {
+        let (original, controller, input) = with_active_native_markdown_surface(|surface| {
             let editor = surface.editor.as_ref().ok_or("冲突动作没有实际原文稿")?;
             let path = surface
                 .current_note_relative_path
@@ -2241,11 +2295,16 @@ impl NativeMarkdownHostedTableProbe {
                 editor.document(),
                 path,
             );
-            Ok((original, Weak::from_retained(&surface.controller)))
+            let input = editor
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            Ok((original, Weak::from_retained(&surface.controller), input))
         })?;
         let operation = Rc::new(ConflictProbeOperation {
             controller,
             original,
+            input,
             action,
             destination: destination.to_owned(),
             expected_terminal,
@@ -2396,7 +2455,7 @@ impl NativeMarkdownHostedTableProbe {
             &self.relative_path,
             NativeMarkdownHostedTableStep::VerifyConflictOriginalAndReload,
         )?;
-        switch_native_markdown_note(&self.relative_path)
+        switch_native_markdown_note(&self.relative_path, None)
     }
 
     /// 520已真实回到同名A2；旧A票必须因Doc身份失效，随后才允许这次A2真实重载。
@@ -2600,7 +2659,41 @@ impl NativeMarkdownHostedTableProbe {
 
     /// 始终点击这条实际安装的按钮；不调用perform_resolution代替用户入口。
     fn click_conflict_button(&self, tag: isize) -> Result<(), String> {
-        let button = with_active_native_markdown_surface(|surface| {
+        let operation = self
+            .conflict_operation
+            .borrow()
+            .clone()
+            .ok_or("原冲突操作未武装")?;
+        let owner = operation
+            .controller
+            .load()
+            .ok_or("原冲突controller已释放")?;
+        let owner_identity = std::ptr::from_ref(&*owner).addr();
+        drop(owner); // 只留下原controller标量；真实Native临时claim不跨ACTIVE租约。
+        let (events, mtm) = with_active_native_markdown_surface(|surface| {
+            let editor = surface.editor.as_ref().ok_or("原冲突正文已释放")?;
+            let before = editor
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            let body = Rc::downgrade(&editor.body);
+            let publication = surface.controller.conflict_publication();
+            let current = || {
+                operation.active.get()
+                    && !operation.delivered.get()
+                    && std::ptr::from_ref(&*surface.controller).addr() == owner_identity
+                    && native_markdown_controller_has_foreground_authority(&surface.controller)
+                    && WeakMarkdownDocument::ptr_eq(
+                        &operation.original.document,
+                        &Rc::downgrade(editor.document()),
+                    )
+                    && std::rc::Weak::ptr_eq(&body, &Rc::downgrade(&editor.body))
+                    && surface.controller.conflict_publication() == publication
+                    && editor
+                        .text_view
+                        .input_state()
+                        .is_ok_and(|actual| actual == before)
+            };
             let (_, message, buttons) = surface
                 .controller
                 .ivars()
@@ -2608,19 +2701,22 @@ impl NativeMarkdownHostedTableProbe {
                 .get()
                 .unwrap()
                 .probe_controls();
-            if !message.stringValue().isEqualToString(ns_string!(
+            if !step(&current, || message.stringValue())?.isEqualToString(ns_string!(
                 "检测到磁盘版本变化，本地草稿已保留。请选择处理方式。"
-            )) {
+            )) || !current()
+            {
                 return Err("真实保存结果没有发布准确中文冲突提示".into());
             }
             let button = &buttons[if tag == 4 { 0 } else { 1 }];
-            if button.tag() != tag || !button.isEnabled() || !button.refusesFirstResponder() {
+            if step(&current, || button.tag())? != tag
+                || !step(&current, || button.refusesFirstResponder())?
+            {
                 return Err("实际冲突处理按钮不可用或夺取输入焦点".into());
             }
-            Ok(button.clone())
+            let events = button_mouse::prepare(button, &surface.panel, &current)?;
+            Ok((events, surface.panel.mtm()))
         })?;
-        // SAFETY: 原按钮的target/action由生产装配；释放Active后才让它捕获原票并入原队列。
-        unsafe { button.performClick(None) };
+        button_mouse::post(events, mtm); // 动作结果仍由原modal/新Doc安装终点交付，入队不等于保存成功。
         Ok(())
     }
 
@@ -2901,8 +2997,41 @@ impl NativeMarkdownHostedTableProbe {
         facts: &AppendFacts,
         refresh_words: bool,
     ) -> Result<(), String> {
-        let button = with_active_native_markdown_surface(|surface| {
-            let current = || self.current(surface, facts, facts.generation);
+        let (events, mtm) = with_active_native_markdown_surface(|surface| {
+            let editor = surface.editor.as_ref().ok_or("信息卡没有原正文")?;
+            let before = editor
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            let child = editor.body.active_cell_body();
+            let child_view = child
+                .as_ref()
+                .map(|child| child.view())
+                .transpose()
+                .map_err(|cause| cause.to_string())?;
+            let child_before = child_view
+                .as_ref()
+                .map(|view| view.input_state())
+                .transpose()
+                .map_err(|cause| cause.to_string())?;
+            // 信息动作不能结束格内组合或切换客户；原父子强claim只活本次鼠标准备同步栈。
+            let current = || {
+                self.current(surface, facts, facts.generation)
+                    && editor
+                        .text_view
+                        .input_state()
+                        .is_ok_and(|actual| actual == before)
+                    && match (&child, editor.body.active_cell_body()) {
+                        (Some(original), Some(actual)) => Rc::ptr_eq(original, &actual),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                    && child_view
+                        .as_ref()
+                        .map(|view| view.input_state())
+                        .transpose()
+                        .is_ok_and(|actual| actual == child_before)
+            };
             let panel = surface
                 .controller
                 .ivars()
@@ -2912,11 +3041,13 @@ impl NativeMarkdownHostedTableProbe {
                 .ok_or("信息卡尚未真实打开")?;
             let (_, _, _, close, refresh) = panel.probe_controls();
             let button = if refresh_words { refresh } else { close };
-            step(&current, || button.retain())
+            if !step(&current, || button.refusesFirstResponder())? {
+                return Err("信息卡按钮会夺取原输入焦点".into());
+            }
+            let events = button_mouse::prepare(button, &surface.panel, &current)?;
+            Ok((events, surface.panel.mtm()))
         })?;
-        // SAFETY: 实际已装配的原按钮仅借用同一主线程controller，不伪造selector或Native结果。
-        unsafe { button.performClick(None) };
-        drop(button);
+        button_mouse::post(events, mtm); // 下一个具名Host步骤核真实刷新/关闭，不在本栈补发action。
         Ok(())
     }
 
@@ -3135,30 +3266,7 @@ impl NativeMarkdownHostedTableProbe {
                         step(&current, || button.scrollRectToVisible(bounds))?;
                         // 只显露原按钮并命中它的真实可见中心；不能用离屏坐标或直接action替代失败点击。
                         // 这不是正文Reveal，原有Source目标和canonical选择均不获得新权限。
-                        let point = NSPoint::new(
-                            bounds.origin.x + bounds.size.width * 0.5,
-                            bounds.origin.y + bounds.size.height * 0.5,
-                        );
-                        if !step(&current, || NSPointInRect(point, button.visibleRect()))? {
-                            return Err("原工具栏按钮中心没有实际可见命中区域".into());
-                        }
-                        let window =
-                            step(&current, || button.window())?.ok_or("原工具栏按钮已脱离窗口")?;
-                        let original_window: &objc2_app_kit::NSWindow = &surface.panel;
-                        if !std::ptr::eq::<objc2_app_kit::NSWindow>(&*window, original_window) {
-                            return Err("原工具栏按钮不属于当前文稿窗口".into());
-                        }
-                        // NSEvent要求窗口坐标；同一原按钮负责转换，不从屏幕或窗口固定尺寸猜点击点。
-                        let point = step(&current, || button.convertPoint_toView(point, None))?;
-                        let number = step(&current, || window.windowNumber())?;
-                        let event = |kind, sequence, pressure| {
-                            NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-                            kind, point, NSEventModifierFlags::empty(), 1.0, number, None,
-                            sequence, 1, pressure,
-                        ).ok_or("无法创建原工具栏窗口鼠标事件".to_owned())
-                        };
-                        let down = event(NSEventType::LeftMouseDown, 1, 1.0)?;
-                        let up = event(NSEventType::LeftMouseUp, 2, 0.0)?;
+                        let [down, up] = button_mouse::prepare(button, &surface.panel, &current)?;
                         // 两事件都构造成功才可发布；失败不能只留一个Down把原按钮tracking悬挂。
                         // 显露横向工具栏只允许几何变化；父/子客户、组合态和完整选择不能借此重采。
                         let same_child = match (&child, editor.body.active_cell_body()) {
@@ -3200,7 +3308,7 @@ impl NativeMarkdownHostedTableProbe {
                                 return Ok(None);
                             }
                         }
-                        return Ok(Some((down, up, window.mtm())));
+                        return Ok(Some((down, up, surface.panel.mtm())));
                     }
                 }
                 Err("实际工具栏没有所需按钮".into())
@@ -3211,9 +3319,7 @@ impl NativeMarkdownHostedTableProbe {
                 }
                 // ACTIVE、原按钮和父子客户强claim已归还；先把完整事件对放进同一AppKit队列，
                 // NSButton.mouseDown的真实tracking才可取到对应Up，不需全局事件权限或嵌套等待。
-                let application = NSApplication::sharedApplication(mtm);
-                application.postEvent_atStart(&down, false);
-                application.postEvent_atStart(&up, false);
+                button_mouse::post([down, up], mtm);
                 return Ok(());
             }
             let remaining = Duration::from_secs(3)

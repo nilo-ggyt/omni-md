@@ -79,6 +79,7 @@ impl GlobalFrontier {
                     && self.table.is_none()
                     && self.reference.is_none()
                     && self.reference_fact.is_none()
+                    && self.footnote_fact.is_none()
                     && self.inline_fact.is_none()
                     && self.leaf_fact.is_none()
                     && self.prefix.is_none() =>
@@ -94,6 +95,7 @@ impl GlobalFrontier {
                     && self.table.is_none()
                     && self.reference.is_none()
                     && self.reference_fact.is_none()
+                    && self.footnote_fact.is_none()
                     && self.inline_fact.is_none()
                     && self.leaf_fact.is_none()
                     && self.prefix.is_none() =>
@@ -230,6 +232,7 @@ impl GlobalFrontier {
         self.table = None;
         self.reference = None;
         self.reference_fact = None;
+        self.footnote_fact = None; // 前探未交付的定义只属于前探；原主恢复点不得收到未来Fact。
         self.reference_line = None;
         self.reference_spine = None;
         self.inline_block = None;

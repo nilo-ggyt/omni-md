@@ -124,6 +124,18 @@ impl NativeMarkdownPagedFont {
         mtm: MainThreadMarker,
         current: &(impl Fn() -> bool + ?Sized),
     ) -> Result<NativeMarkdownFontCapture> {
+        // 系统级联可为后继字素返回同一个不可变 CTFont。原 palette 已在首次捕获时
+        // 核过这个对象的 CGFont、完整名称表、轴位、字号和矩阵；对象身份相同便保有
+        // 同一份事实，不必为每个小字素重新创建文件 URL、descriptor 和名称表临时值。
+        // 这里只借原 Body 的有限 palette，仍受原调用票约束，也继续原 GCB 整形试次。
+        for registered in palette {
+            let captured = registered.native();
+            if step(current, || std::ptr::eq(font, captured.native_font()))? {
+                return step(current, || {
+                    NativeMarkdownFontCapture::Reused(captured.clone())
+                });
+            }
+        }
         let original = metadata::read(font, current)?;
         for registered in palette {
             let captured = registered.native();

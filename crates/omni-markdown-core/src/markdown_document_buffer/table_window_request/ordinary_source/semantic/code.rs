@@ -5,7 +5,7 @@ use pulldown_cmark::global_frontier::{
     InlineCodeCursor, InlineCodeStep, InlineLinkStorageRequest, InlineLinkStorageStep,
     InlineReferenceResolution, VerifiedInlineEmphasisRun, VerifiedInlineLink,
 };
-mod emphasis;
+pub(in crate::markdown_document_buffer) mod emphasis;
 mod link;
 mod prefix;
 use crate::markdown_document_buffer::table_source::inline_reference::ReferenceLabel;
@@ -23,10 +23,10 @@ struct VisibleSpan {
 }
 
 /// 单个实际code证明或原强调kernel真实匹配的范围；从不收集整块历史range目录。
-pub(in super::super) struct SpanProof {
-    pub(in super::super) whole: Range<usize>,
-    pub(in super::super) body: Range<usize>,
-    pub(in super::super) styles: MarkdownPresentationStyles,
+pub(in crate::markdown_document_buffer) struct SpanProof {
+    pub(in crate::markdown_document_buffer) whole: Range<usize>,
+    pub(in crate::markdown_document_buffer) body: Range<usize>,
+    pub(in crate::markdown_document_buffer) styles: MarkdownPresentationStyles,
 }
 
 pub(super) struct CodeJob {

@@ -720,6 +720,13 @@ impl NativeMarkdownPagedTextScene for Scene {
         let owner = self.owner.upgrade().ok_or(Error::Revoked)?;
         owner.follow_link(&self.key, index, intent)
     }
+    /// 原Scene先核Source/Font/输出健康，再把fragment交回同一弱Body；
+    /// 不经Workspace全局槽寻找另一个正文，也不在鼠标回调同步扫描整个文稿。
+    fn follow_heading(&self, fragment: &str, intent: Weak<()>) -> Result<()> {
+        self.require()?;
+        let owner = self.owner.upgrade().ok_or(Error::Revoked)?;
+        owner.follow_heading(&self.key, intent, fragment)
+    }
     /// 先证原可见链接part和真实GCB侧，再从同一Source/选择/publication取得有限目标副本。
     fn link_target(&self, local: NSPoint) -> Result<Option<String>> {
         let Some((_, index)) = self.link_hit(local)? else {

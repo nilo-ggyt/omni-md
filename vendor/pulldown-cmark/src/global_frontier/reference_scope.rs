@@ -110,8 +110,10 @@ impl VerifiedInlineSemanticSeed {
         if !matches!(
             purpose,
             ReferencePrefixPurpose::Paragraph | ReferencePrefixPurpose::ContainerOnly
-        ) || self.kind != InlineBlockKind::Paragraph
-            || line_start <= self.physical_start
+        ) || !matches!(
+            self.kind,
+            InlineBlockKind::Paragraph | InlineBlockKind::SetextHeading(_)
+        ) || line_start <= self.physical_start
             || line_start >= self.lexical_end
         {
             return Err(GlobalFrontierError::InvalidFrame);

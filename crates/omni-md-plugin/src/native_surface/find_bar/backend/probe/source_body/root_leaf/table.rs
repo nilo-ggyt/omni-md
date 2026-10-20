@@ -471,8 +471,8 @@ fn link(rig: &mut Rig) -> Result<(), String> {
         return Err("表格链接mouseDown提前改写了选择或吞掉原拖动入口".into());
     }
     links::command_mouse(rig, window_point, NSEventType::LeftMouseUp)?;
-    if !matches!(links::settle(rig)?, Some(ViewError::LinkAnchorUnsupported)) {
-        return Err("表格链接真实mouseUp没有按现片段导航边界交付typed结果".into());
+    if !matches!(links::settle(rig)?, Some(ViewError::LinkAnchorNotFound)) {
+        return Err("表格链接真实mouseUp没有明确拒绝不存在的标题目标".into());
     }
     unchanged(rig)
 }

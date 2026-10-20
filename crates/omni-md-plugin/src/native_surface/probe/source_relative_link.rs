@@ -10,8 +10,11 @@ use std::path::PathBuf;
 
 const DIRECTORY: &str = "相对链接验收";
 const TARGET_NOTE: &str = "相对链接验收/目标笔记.md";
-const TARGET_TEXT: &str = "相对链接目标中文😀\n\n这个目标文件必须保持原字节。\n";
-const PREFIX: &str = "未保存的中文😀前缀。\n\n[打开目标](相对链接验收/目标笔记.md)\n\n";
+const TARGET_HEADING_PREFIX: &str = "相对链接目标中文😀\n\n";
+const TARGET_TEXT: &str =
+    "相对链接目标中文😀\n\n## Linked Target\n\n这个目标文件必须保持原字节。\n";
+const PREFIX: &str =
+    "未保存的中文😀前缀。\n\n[打开目标](相对链接验收/目标笔记.md#linked-target)\n\n";
 const LABEL: &str = "打开目标";
 
 /// 两个文件各有自己的磁盘身份；保存只能替换源文件，目标不能因打开或关闭被重写。
@@ -141,6 +144,8 @@ struct Target {
     document: WeakMarkdownDocument,
     body: std::rc::Weak<NativeMarkdownPagedBody>,
     input: NativeMarkdownPagedInputState,
+    /// 安装票与真正导航完成票分开；只在独立标题位置、原Doc和CPU都通过时绑定一次后态。
+    navigated_input: Cell<Option<NativeMarkdownPagedInputState>>,
 }
 
 /// 这个场景只有一个原鼠标动作和一个目标；实际释放通知只绑定预声明文件，不发现任意后继文稿。
@@ -243,7 +248,9 @@ impl RelativeLink {
                 body: RefCell::new(std::rc::Weak::new()),
                 generation: Cell::new(0),
                 mode: Cell::new(MarkdownPresentationMode::InlinePreview),
-                fold_revision: Cell::new(Some(0)),
+                // 安装后的真实fragment选择会推进fold发布代次；这里只筛原g0/模式，
+                // 终点由下方准确标题位置与同一完整Input/Scene/CPU联合认证，不能假定fold0。
+                fold_revision: Cell::new(None),
                 failure: RefCell::new(None),
                 key: RefCell::new(None),
                 signal: RefCell::new(None),
@@ -572,7 +579,11 @@ impl RelativeLink {
                 .input_state()
                 .map_err(|cause| cause.to_string())?;
             if input.marked.is_some()
-                || input.primary_range != NSRange::new(0, 0)
+                || ![
+                    NSRange::new(0, 0),
+                    NSRange::new(TARGET_HEADING_PREFIX.encode_utf16().count(), 0),
+                ]
+                .contains(&input.primary_range)
                 || paged.body.presentation_mode() != MarkdownPresentationMode::InlinePreview
             {
                 return Err("相对链接目标初始输入或模式不同".into());
@@ -583,6 +594,7 @@ impl RelativeLink {
                     document: Rc::downgrade(editor.document()),
                     body: Rc::downgrade(&paged.body),
                     input,
+                    navigated_input: Cell::new(None),
                 },
             )))
         })?;
@@ -591,12 +603,7 @@ impl RelativeLink {
         };
         *self.frame.body.borrow_mut() = target.body.clone();
         *self.target.borrow_mut() = Some(target);
-        let weak = self.weak.clone();
-        *self.frame.signal.borrow_mut() = Some(Box::new(move || {
-            if let Some(case) = weak.upgrade() {
-                case.deliver();
-            }
-        }));
+        self.arm_target_frame();
         let view = body.view().map_err(|cause| cause.to_string())?;
         if let Some((key, paints)) = view.probe_cpu_published_frame()
             && paints != 0
@@ -612,6 +619,110 @@ impl RelativeLink {
                 .map_err(|cause| cause.to_string())?;
         }
         Ok(true)
+    }
+
+    /// 仍使用原SourceFrame观察者；首屏可能在fragment接管前发布，只有明确标题后态才能交终点。
+    /// 注册与后继帧共用实际mouseup时钟，没有重发点击、重开Doc或补做导航。
+    fn arm_target_frame(&self) {
+        let weak = self.weak.clone();
+        *self.frame.signal.borrow_mut() = Some(Box::new(move || {
+            if let Some(case) = weak.upgrade()
+                && let Err(cause) = case.target_frame_ready()
+            {
+                case.fail(cause);
+            }
+        }));
+    }
+
+    fn target_frame_ready(&self) -> Result<(), String> {
+        use crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError as ViewError;
+        if let Some(cause) = self.frame.failure.borrow().as_ref() {
+            return Err(cause.clone());
+        }
+        let key = self
+            .frame
+            .key
+            .borrow_mut()
+            .take()
+            .ok_or("相对锚点没有实际CPU帧")?;
+        let expected = NSRange::new(TARGET_HEADING_PREFIX.encode_utf16().count(), 0);
+        let (document_identity, body_identity, opening_input) = {
+            let target = self.target.borrow();
+            let target = target.as_ref().ok_or("相对锚点没有原安装票")?;
+            (target.document.clone(), target.body.clone(), target.input)
+        }; // 这里只复制弱身份与标量，后续Native getter不持任何probe RefCell借用。
+        let ready = with_active_native_markdown_surface(|surface| {
+            let editor = surface.editor.as_ref().ok_or("相对锚点原目标已关闭")?;
+            if !WeakMarkdownDocument::ptr_eq(&document_identity, &Rc::downgrade(editor.document()))
+                || !std::rc::Weak::ptr_eq(&body_identity, &Rc::downgrade(&editor.body))
+                || surface.current_note_relative_path.as_deref() != Some(TARGET_NOTE)
+            {
+                return Err("相对锚点后继帧不是原目标文稿".into());
+            }
+            editor
+                .document()
+                .borrow()
+                .byte_offset_for_utf16(0)
+                .map_err(|cause| cause.to_string())?;
+            if let Some(cause) = editor.body.take_failure() {
+                return Err(cause.to_string());
+            }
+            if let Some(cause) = editor.text_view.take_failure()
+                && !matches!(cause, ViewError::Pending)
+            {
+                return Err(cause.to_string());
+            }
+            let actual = editor
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            if actual.generation != opening_input.generation
+                || actual.utf16_len != opening_input.utf16_len
+                || actual.marked.is_some()
+                || (actual != opening_input && actual.primary_range != expected)
+            {
+                return Err("相对锚点准备期间发生非预声明输入".into());
+            }
+            let ready_key = match editor.text_view.capture_ready_scene_key() {
+                Ok(ready) => Some(ready),
+                Err(ViewError::Pending) => None,
+                Err(cause) => return Err(cause.to_string()),
+            };
+            let complete = key.request.input == actual
+                && actual.primary_range == expected
+                && ready_key.is_some_and(|ready| ready.same(&key))
+                && editor
+                    .text_view
+                    .probe_cpu_published_frame()
+                    .is_some_and(|(cpu, paints)| cpu.same(&key) && paints != 0)
+                && editor.text_view.cpu_paint_pending() == Some(false);
+            if complete {
+                let target = self.target.borrow();
+                let target = target.as_ref().ok_or("相对锚点安装票已退出")?;
+                if target.navigated_input.get().is_some() {
+                    return Err("相对锚点完成票重复绑定".into());
+                }
+                target.navigated_input.set(Some(actual));
+            }
+            Ok(complete)
+        })?;
+        if ready {
+            *self.frame.key.borrow_mut() = Some(key);
+            self.deliver();
+        } else {
+            // 只等原目标的下一次真实CPU发布；中间文首帧不是标题成功，也不替新输入续权。
+            self.arm_target_frame();
+            let body = self
+                .frame
+                .body
+                .borrow()
+                .upgrade()
+                .ok_or("相对锚点Body已释放")?;
+            let erased: Rc<dyn NativeMarkdownPagedBodyPaintObserver> = self.frame.clone();
+            body.observe_next_cpu_frame(Rc::downgrade(&erased))
+                .map_err(|cause| cause.to_string())?;
+        }
+        Ok(())
     }
 
     /// 场景终点只订阅一次；注册时已经到达的同一个真实安装/CPU结果可以立即消费。
@@ -741,8 +852,18 @@ impl RelativeLink {
         {
             return Err("相对链接从原mouseup到完整CPU帧超过三秒".into());
         }
-        let target = self.target.borrow();
-        let target = target.as_ref().ok_or("相对链接没有准确目标安装")?;
+        let (document_identity, body_identity, navigated) = {
+            let target = self.target.borrow();
+            let target = target.as_ref().ok_or("相对链接没有准确目标安装")?;
+            (
+                target.document.clone(),
+                target.body.clone(),
+                target
+                    .navigated_input
+                    .get()
+                    .ok_or("相对链接标题导航没有完整后态")?,
+            )
+        };
         let key = self
             .frame
             .key
@@ -752,14 +873,14 @@ impl RelativeLink {
         with_active_native_markdown_surface(|surface| {
             let editor = surface.editor.as_ref().ok_or("相对链接目标已关闭")?;
             let paged = editor;
-            if !WeakMarkdownDocument::ptr_eq(&target.document, &Rc::downgrade(editor.document()))
-                || !std::rc::Weak::ptr_eq(&target.body, &Rc::downgrade(&paged.body))
-                || key.request.input != target.input
+            if !WeakMarkdownDocument::ptr_eq(&document_identity, &Rc::downgrade(editor.document()))
+                || !std::rc::Weak::ptr_eq(&body_identity, &Rc::downgrade(&paged.body))
+                || key.request.input != navigated
                 || paged
                     .text_view
                     .input_state()
                     .map_err(|cause| cause.to_string())?
-                    != target.input
+                    != navigated
                 || key.presentation_mode != MarkdownPresentationMode::InlinePreview
                 || !paged
                     .text_view
@@ -773,6 +894,13 @@ impl RelativeLink {
             {
                 return Err("相对链接目标CPU帧已被后继Doc/Input/几何替换".into());
             }
+            paged
+                .text_view
+                .verify_find_target_visible(
+                    &key,
+                    NSRange::new(TARGET_HEADING_PREFIX.encode_utf16().count(), 0),
+                )
+                .map_err(|cause| cause.to_string())?;
             let document = editor.document().borrow();
             let mut bytes = [0_u8; TARGET_TEXT.len()];
             let written = {
@@ -790,7 +918,7 @@ impl RelativeLink {
             Ok(())
         })?;
         println!(
-            "native_relative_note_link actual_mouseup=true original_window=true exact_target_revision=true original_dirty_edit=true target_cpu_frame=true action_to_frame_ms={:.3} whole_product=false formal=false",
+            "native_relative_note_link actual_mouseup=true original_window=true exact_target_revision=true original_dirty_edit=true target_heading_anchor_visible=true target_cpu_frame=true action_to_frame_ms={:.3} whole_product=false formal=false",
             self.started.get().unwrap().elapsed().as_secs_f64() * 1000.0
         );
         Ok(())

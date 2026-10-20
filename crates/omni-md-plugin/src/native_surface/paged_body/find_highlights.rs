@@ -66,8 +66,12 @@ impl NativeMarkdownPagedBody {
 
     fn refresh_bound_find_highlights(&self) {
         if self.current_body() {
-            self.clear_scene(); // 立即撤 CPU 候选原nonce，不能等下一帧时再判旧查询像素过期。
-            if let Err(cause) = self.schedule() {
+            // 立即撤CPU候选；标题查询的显式取消关闭失败也由同一Body首错边界处理。
+            if let Err(cause) = self
+                .clear_scene()
+                .map_err(Into::into)
+                .and_then(|()| self.schedule())
+            {
                 self.fail(cause);
             }
         }

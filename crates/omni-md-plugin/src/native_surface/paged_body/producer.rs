@@ -147,6 +147,31 @@ fn source_io(error: &Error) -> bool {
 pub(super) fn view_source_io(error: &ViewError) -> bool {
     use crate::native_surface::paged_input::NativeMarkdownPagedInputError as Input;
     use omni_markdown_core::MarkdownDocumentBufferError as Document;
+    // 标题查询也读同一原Source；其匿名slug/mask存储不冒充正文I/O。
+    // 仅沿这个新错误的实际Cleanup包装识别原Source首因，不能因查询取消改变先后顺序。
+    fn heading_source_io(error: &omni_markdown_core::MarkdownHeadingAnchorError) -> bool {
+        use omni_markdown_core::MarkdownHeadingAnchorError as Heading;
+        use omni_markdown_core::markdown_document_buffer::MarkdownTableRequestError as Semantic;
+        match error {
+            Heading::Source(
+                Document::OriginalBackingUnavailable(_)
+                | Document::EditStorageUnavailable(_)
+                | Document::DisplayStorageUnavailable(Some(_)),
+            )
+            | Heading::Semantic(Semantic::Source(
+                Document::OriginalBackingUnavailable(_)
+                | Document::EditStorageUnavailable(_)
+                | Document::DisplayStorageUnavailable(Some(_)),
+            )) => true,
+            Heading::Cleanup { primary, cleanup } => {
+                heading_source_io(primary) || heading_source_io(cleanup)
+            }
+            _ => false,
+        }
+    }
+    if let ViewError::HeadingAnchor(error) = error {
+        return heading_source_io(error);
+    }
     matches!(
         error,
         ViewError::Document(
@@ -1236,7 +1261,7 @@ impl Producer {
                     presentation: part.facts().presentation,
                     points: part.facts().points,
                     native_points: fonts[index].native().point_size(),
-                    role: typography.role_at(index),
+                    role: typography.role_at(index, part.facts().presentation),
                     traits: fonts[index].traits(),
                     metrics: fonts[index].metrics()?,
                     font_owner: Rc::downgrade(&fonts[index]),

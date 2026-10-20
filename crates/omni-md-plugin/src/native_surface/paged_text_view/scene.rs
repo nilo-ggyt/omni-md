@@ -377,6 +377,11 @@ pub trait NativeMarkdownPagedTextScene {
     fn follow_link(&self, _index: usize, _intent: Weak<()>) -> Result<()> {
         Err(super::NativeMarkdownPagedTextViewError::UnsupportedCommand)
     }
+    /// 同文档标题只沿本张真实Scene的原正文owner解析；不要求存在全局工作区Surface。
+    /// 成功是接纳原click查询，最终仍须由新选择的SourceTarget与完整CPU帧完成可见性。
+    fn follow_heading(&self, _fragment: &str, _intent: Weak<()>) -> Result<()> {
+        Err(super::NativeMarkdownPagedTextViewError::UnsupportedCommand)
+    }
     /// 仅真实链接producer可在当前命中位置给出已解析目标；普通Source/Cell不从可见文字猜URL。
     fn link_target(&self, _local: NSPoint) -> Result<Option<String>> {
         Ok(None)

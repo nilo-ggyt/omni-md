@@ -21,7 +21,7 @@ mod cell_inline;
 pub use cell_inline::{MarkdownTableCellInlineStep, VerifiedMarkdownTableCellInline};
 #[cfg(feature = "paged-line-compose")]
 mod selection_prefix;
-mod semantic;
+pub(in crate::markdown_document_buffer) mod semantic;
 #[cfg(feature = "paged-line-compose")]
 pub use selection_prefix::MarkdownSelectionStyleInvariant;
 pub use semantic::{

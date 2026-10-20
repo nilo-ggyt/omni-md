@@ -28,7 +28,7 @@ enum Phase {
     Finish,
 }
 
-pub(super) struct EmphasisJob {
+pub(in crate::markdown_document_buffer) struct EmphasisJob {
     source: Range<usize>,
     link: Option<Scope>,
     bounds: EmphasisBounds,
@@ -48,7 +48,10 @@ pub(super) struct EmphasisJob {
 
 impl EmphasisJob {
     /// 仅为真实顺序delimiter分配固定匹配状态；匿名页仍延迟到第一次opener入栈。
-    pub(super) fn new(options: pulldown_cmark::Options, source: Range<usize>) -> Self {
+    pub(in crate::markdown_document_buffer) fn new(
+        options: pulldown_cmark::Options,
+        source: Range<usize>,
+    ) -> Self {
         Self {
             source,
             link: None,
@@ -69,7 +72,7 @@ impl EmphasisJob {
     }
 
     /// run来自同一个Root游标的最终顺序，HTML/code内容没有进入此栈的入口。
-    pub(super) fn start(
+    pub(in crate::markdown_document_buffer) fn start(
         &mut self,
         proof: VerifiedInlineEmphasisRun,
     ) -> Result<(), MarkdownTableRequestError> {
@@ -102,7 +105,7 @@ impl EmphasisJob {
 
     /// 原 Link proof 先于其 label 发出，停放外层已完成 run 的匹配头，再用同文件开始独立配对。
     /// 没有新的 FD/正文 owner；label 未匹配 opener 在 LinkEnd 被丢弃，绝不泄露到外层。
-    pub(super) fn enter_link(
+    pub(in crate::markdown_document_buffer) fn enter_link(
         &mut self,
         proof: &VerifiedInlineLink,
         quota: &MarkdownTableWindowQuota,
@@ -152,7 +155,7 @@ impl EmphasisJob {
 
     /// End必须与当前真实owner/label严格相同；只从同文件恢复一个原scope，不搜索祖先或重建AST。
     /// 先成功读取旧checkpoint再移交RAM状态，短读/IO失败不会把部分恢复状态交给后继run。
-    pub(super) fn leave_link(
+    pub(in crate::markdown_document_buffer) fn leave_link(
         &mut self,
         source: &Range<usize>,
         label: &Range<usize>,
@@ -199,12 +202,12 @@ impl EmphasisJob {
     }
 
     /// Source游标只在本run完全处理后继续；不能把中途匹配当成全块样式已经闭合。
-    pub(super) fn busy(&self) -> bool {
+    pub(in crate::markdown_document_buffer) fn busy(&self) -> bool {
         !matches!(self.phase, Phase::Idle)
     }
 
     /// 一步最多一次record读写或一个真实匹配span；不在量子内遍历整栈或整条巨大delimiter run。
-    pub(super) fn advance(
+    pub(in crate::markdown_document_buffer) fn advance(
         &mut self,
         quota: &MarkdownTableWindowQuota,
         budget: usize,
@@ -350,7 +353,7 @@ impl EmphasisJob {
     }
 
     /// 原块结束后算法状态不再授予任何span；唯一文件由共同underline事务在最后消费者后关闭。
-    pub(super) fn finish(&mut self) {
+    pub(in crate::markdown_document_buffer) fn finish(&mut self) {
         self.link = None;
     }
 }

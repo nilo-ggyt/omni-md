@@ -70,9 +70,44 @@ pub enum GlobalFact {
     Row(TableRowFact),
     TableEnd(crate::block_frontier::VerifiedTableEnd),
     Reference(VerifiedGlobalReference),
+    /// 原容器路径已经确认的GFM脚注定义；存在性不要求body非空，也不授正文inline权限。
+    Footnote(VerifiedGlobalFootnoteDefinition),
     InlineBlock(VerifiedGlobalInlineBlock),
     /// 真实 leaf offset 可能含后继行 prefix，不能据此推进无表水位或 parser cursor。
     LeafBlock(VerifiedGlobalLeafBlock),
+}
+
+#[derive(Clone, Debug)]
+/// 只由原FootnoteSpace之前的真实label与closing-colon路径创建，字段不允许外部拼造。
+/// 票据不保Doc/spine/正文；调用方仍须核原Source身份、健康与取消，才能借标签字节解码。
+pub struct VerifiedGlobalFootnoteDefinition {
+    revision: u64,
+    source_end: usize,
+    source: std::ops::Range<usize>,
+    reference: std::ops::Range<usize>,
+}
+
+impl VerifiedGlobalFootnoteDefinition {
+    /// 同原Global的修订；不能替代外层DocRoot/原文件健康守卫。
+    pub fn source_revision(&self) -> u64 {
+        self.revision
+    }
+    /// 真正整篇Source末端，不是定义标签、body或当前frame的末端。
+    pub fn source_end(&self) -> usize {
+        self.source_end
+    }
+    /// 原'[^'开头至已确认colon之后；不含body与随后容器空白。
+    pub fn source_range(&self) -> std::ops::Range<usize> {
+        self.source.clone()
+    }
+    /// key从'^'后开始，包含真正closing bracket，供原有限LabelScanner确认结束。
+    pub fn reference_range(&self) -> std::ops::Range<usize> {
+        self.reference.clone()
+    }
+    /// 原GFM定义禁止换行；解码借同一真实label内核，不建立全源footdefs Map。
+    pub fn reference_decoder(&self) -> super::InlineReferenceDecoder {
+        super::InlineReferenceDecoder::from_footnote(self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -341,6 +376,8 @@ pub struct GlobalFrontier {
     separator: Option<LineFacts>,
     reference: Option<ReferenceDefinitionScanner>,
     reference_fact: Option<VerifiedGlobalReference>,
+    // closing colon确认后暂持唯一未发布定义；原FootnoteSpace完成scope归属后才交Fact。
+    footnote_fact: Option<VerifiedGlobalFootnoteDefinition>,
     reference_line: Option<ReferenceLinePurpose>,
     reference_spine: Option<StructuralSpineSnapshot>,
     begin_list_item: Option<usize>,
@@ -429,6 +466,7 @@ impl GlobalFrontier {
             separator: None,
             reference: None,
             reference_fact: None,
+            footnote_fact: None,
             reference_line: None,
             reference_spine: None,
             begin_list_item: None,
@@ -1155,6 +1193,11 @@ impl GlobalFrontier {
             self.origin = self.position.byte;
             self.state = LineStartState::default();
             self.operation(LineStartOperation::AllSpace, OpAfter::ReferenceTailSpace)?;
+        }
+        if matches!(self.phase, Phase::Ready(Ready::Opening)) && self.footnote_fact.is_some() {
+            // body可以为空，定义存在性在这次原容器接纳后已经成立；不等待后继段落。
+            // 只移交这一条Fact，不复制label、不读取body，也不推进消费者的普通inline水位。
+            fact = self.footnote_fact.take().map(GlobalFact::Footnote);
         }
         if matches!(self.phase, Phase::Ready(Ready::PublishInlineBlock)) {
             // 只有semantic commit已经到达闭合点才能交付；lookahead即使走得更远也不是块end。
@@ -1892,6 +1935,13 @@ impl GlobalFrontier {
             }
             2 => {
                 if bytes.first() == Some(&b':') {
+                    let opening = self.origin + self.saved.ix;
+                    self.footnote_fact = Some(VerifiedGlobalFootnoteDefinition {
+                        revision: self.revision,
+                        source_end: self.source_end,
+                        source: opening..start + 1,
+                        reference: opening + 2..start,
+                    });
                     self.state.ix += 1;
                     self.operation(LineStartOperation::AllSpace, OpAfter::FootnoteSpace)?;
                 } else {

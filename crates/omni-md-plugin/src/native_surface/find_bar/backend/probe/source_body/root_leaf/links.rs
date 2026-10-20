@@ -1,8 +1,10 @@
-//! 同一长文旧sealed窗口的真实单击回查与取消；片段目标只核解析/消费，不冒充内部anchor导航。
+//! 同一长文旧sealed窗口的真实单击回查、标题导航与取消；不存在标题仍明确拒绝。
 
 use super::*;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
 use std::io::Read;
+#[path = "links/headings.rs"]
+mod headings;
 
 const PREFIX: &str = "outside\n\n[cached](#cached)\n\n";
 const PARAGRAPH: &str =
@@ -196,8 +198,8 @@ fn verify(rig: &mut Rig) -> Result<(), String> {
         return Err("原链接mousedown在确认单击前改写选择或抢走拖选".into());
     }
     command_mouse(rig, press, NSEventType::LeftMouseUp)?;
-    if !matches!(settle(rig)?, Some(ViewError::LinkAnchorUnsupported)) {
-        return Err("真实片段链接没有明确报告尚无稳定anchor导航".into());
+    if !matches!(settle(rig)?, Some(ViewError::LinkAnchorNotFound)) {
+        return Err("原片段目标不存在时没有明确报告标题未找到".into());
     }
     let recovered = rig
         .view
@@ -251,7 +253,7 @@ fn verify(rig: &mut Rig) -> Result<(), String> {
     }
     rig.remember_receipt()?;
     println!(
-        "native_body_root_leaf_link cached_scene_real_pending=true first_mouseup_restored_target=true anchor_typed_rejection=true command_click=true released_command_cancelled=true plain_click_caret=true successor_menu_and_focus_revoked=true original_drag_selection=true original_source=true external_url_open_tested=false internal_anchor_navigation_tested=false whole_product=false formal=false"
+        "native_body_root_leaf_link cached_scene_real_pending=true first_mouseup_restored_target=true missing_anchor_rejected=true command_click=true released_command_cancelled=true plain_click_caret=true successor_menu_and_focus_revoked=true original_drag_selection=true original_source=true external_url_open_tested=false whole_product=false formal=false"
     );
     Ok(())
 }
@@ -508,5 +510,6 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
         return Err("旧cache链接关闭后原有限Ready仍被持有".into());
     }
     result?;
-    direct_case(mtm)
+    direct_case(mtm)?;
+    headings::run(mtm)
 }

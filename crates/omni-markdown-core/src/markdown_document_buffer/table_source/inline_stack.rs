@@ -434,6 +434,7 @@ fn encode_link(record: &InlineLinkRecord) -> [u8; 2 * SLOT] {
         Some((InlineReferenceKind::Full, _)) => 1,
         Some((InlineReferenceKind::Collapsed, _)) => 2,
         Some((InlineReferenceKind::Shortcut, _)) => 3,
+        Some((InlineReferenceKind::Footnote, _)) => 4,
     };
     bytes[108] = match record.kind {
         InlineLinkKind::Link => 0,
@@ -444,6 +445,7 @@ fn encode_link(record: &InlineLinkRecord) -> [u8; 2 * SLOT] {
         InlineLinkRecordStatus::Literal => 1,
         InlineLinkRecordStatus::Direct => 2,
         InlineLinkRecordStatus::Reference => 3,
+        InlineLinkRecordStatus::Footnote => 4,
     };
     bytes[SLOT - 1] = LINK;
     bytes[2 * SLOT - 1] = CONTINUATION;
@@ -456,6 +458,7 @@ fn decode_link(bytes: &[u8; 2 * SLOT]) -> Result<InlineLinkRecord, MarkdownTable
         1 => Some(InlineReferenceKind::Full),
         2 => Some(InlineReferenceKind::Collapsed),
         3 => Some(InlineReferenceKind::Shortcut),
+        4 => Some(InlineReferenceKind::Footnote),
         _ => return Err(MarkdownTableRequestError::InvalidRequest),
     };
     Ok(InlineLinkRecord {
@@ -486,6 +489,7 @@ fn decode_link(bytes: &[u8; 2 * SLOT]) -> Result<InlineLinkRecord, MarkdownTable
             1 => InlineLinkRecordStatus::Literal,
             2 => InlineLinkRecordStatus::Direct,
             3 => InlineLinkRecordStatus::Reference,
+            4 => InlineLinkRecordStatus::Footnote,
             _ => return Err(MarkdownTableRequestError::InvalidRequest),
         },
     })

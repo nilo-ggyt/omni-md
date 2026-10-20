@@ -815,12 +815,12 @@ fn verify(
         super::links::command_mouse(rig, press, objc2_app_kit::NSEventType::LeftMouseUp)?;
         // CJK末块完成后，先由同块开头的真实片段click驱动原唯一请求恢复；绝不点击原https目标。
         // 原有限闭合块的 Parser 同时提取了 recover 与 go 的真实标签、解码目标；
-        // 正链接事实不依赖样式窗口扩大。typed拒绝只证明完成，不冒充anchor导航。
+        // 正链接事实不依赖样式窗口扩大；本夹具没有同名标题，只核真实来源查完后明确NotFound。
         if !matches!(
             super::links::settle(rig)?,
-            Some(ViewError::LinkAnchorUnsupported)
+            Some(ViewError::LinkAnchorNotFound)
         ) {
-            return Err("inline真实片段click没有完成原目标恢复及明确anchor拒绝".into());
+            return Err("inline真实片段click没有完成原目标恢复及明确标题未找到".into());
         }
         let recovered = rig
             .view
@@ -951,7 +951,7 @@ fn verify(
         stage.set("remember_receipt");
         rig.remember_receipt()?;
         println!(
-            "native_root_inline actual_traits=true strong_emphasis_combined=true cjk_original_textkit_run_fonts=true cjk_original_run_matrix=true whitespace_original_textkit_run_font=true scoped_quote_cjk_run_fonts=true scoped_quote_actual_ink_background=true scoped_quote_canonical_boxes_and_hits=true scoped_quote_physical_marker_find_reveal_hide=true source_and_disk_unchanged=true inline_code_monospace=true code_background_pixels={code_pixels} link_color_pixels={link_pixels} actual_source_bound_target=true target_recovered_by_original_click=true marker_not_clickable=true selection_over_code=true actual_backing_scale={scale} paint_steps={steps} external_url_open_tested=false internal_anchor_navigation_tested=false whole_product=false formal=false"
+            "native_root_inline actual_traits=true strong_emphasis_combined=true cjk_original_textkit_run_fonts=true cjk_original_run_matrix=true whitespace_original_textkit_run_font=true scoped_quote_cjk_run_fonts=true scoped_quote_actual_ink_background=true scoped_quote_canonical_boxes_and_hits=true scoped_quote_physical_marker_find_reveal_hide=true source_and_disk_unchanged=true inline_code_monospace=true code_background_pixels={code_pixels} link_color_pixels={link_pixels} actual_source_bound_target=true target_recovered_by_original_click=true marker_not_clickable=true selection_over_code=true actual_backing_scale={scale} paint_steps={steps} external_url_open_tested=false whole_product=false formal=false"
         );
         Ok((
             owners,

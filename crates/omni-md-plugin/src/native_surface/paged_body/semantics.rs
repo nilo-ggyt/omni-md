@@ -21,7 +21,7 @@ use omni_markdown_core::markdown_viewport_presentation::table_window::MarkdownTa
 use super::preparation::PreparationTicket;
 use super::{NativeMarkdownPagedBody as Owner, NativeMarkdownPagedBodyError as Error, Result};
 use crate::native_surface::{
-    paged_fonts::NativeMarkdownPagedFont,
+    paged_fonts::{NativeMarkdownFontCapture, NativeMarkdownPagedFont},
     paged_line_fonts::NativeMarkdownLineFont,
     text_attributes::{MarkdownTextAttributePalette, native_markdown_base_font},
 };
@@ -458,17 +458,41 @@ impl Selection {
             let native = native_markdown_base_font(self.styles, &typography.palette);
             ticket.require(owner, source)?;
             let current = || ticket.current(owner, source);
-            let captured = NativeMarkdownPagedFont::capture(
+            // 只借同一 Body 已注册的有限字体；先结束槽借用，再进入可能交付重入的 Native。
+            // 角色槽描述语义，实际字体可相同；不能为每个新角色重建同一文件快照与 Core payload。
+            let palette = owner.fonts.borrow().clone();
+            let captured = NativeMarkdownPagedFont::capture_reusing(
                 native.as_ref(),
+                &palette,
                 owner.configuration.maximum_font_bytes,
                 owner.mtm,
                 &current,
-            )?;
-            let registered = Rc::new(
-                NativeMarkdownLineFont::register(captured, &owner.catalog, &current)?
-                    .capture_preview_metrics(&typography.metrics_owner, &current)?,
             );
             ticket.require(owner, source)?;
+            let (existing_index, registered) = match captured? {
+                NativeMarkdownFontCapture::Reused(captured) => {
+                    // Reused 只可能来自上述原 palette 的同 Core 身份，不按名称、字号或槽号猜匹配。
+                    // 原 Rc 已捕同模式的实际行度量；复用它同时保留原 catalog 注册和资源释放归属。
+                    let authority = captured.core_font().authority();
+                    let index = palette
+                        .iter()
+                        .position(|font| font.native().core_font().permits(&authority))
+                        .expect("复用字体来自同一原 Body palette");
+                    (Some(index), palette[index].clone())
+                }
+                NativeMarkdownFontCapture::Fresh(captured)
+                | NativeMarkdownFontCapture::SharedBytes(captured) => {
+                    // 共享冻结字节不等于共享实例：新字号或轴位仍注册自己的 Core 并捕真实 Preview 行槽。
+                    let registered =
+                        NativeMarkdownLineFont::register(captured, &owner.catalog, &current);
+                    ticket.require(owner, source)?;
+                    let registered =
+                        registered?.capture_preview_metrics(&typography.metrics_owner, &current);
+                    ticket.require(owner, source)?;
+                    (None, Rc::new(registered?))
+                }
+            };
+            ticket.require(owner, source)?; // 候选临时强边归还后仍核原票，关闭或原 Source 首错不发布角色槽。
             // 原策略可在系统无法构造斜体时交回基础face；分页不能把该失败缓存成已实现的强调。
             let mut required = objc2_core_text::CTFontSymbolicTraits::empty();
             if self.role != Role::Hidden {
@@ -489,8 +513,14 @@ impl Selection {
                 return Err(crate::native_surface::paged_line_fonts::NativeMarkdownLineFontError::StyleUnavailable.into());
             } // 真face不能满足样式时归还候选，不发布普通字体冒充的strong/emphasis/code。
             self.style.points = registered.native().point_size() as f32;
-            let index = owner.fonts.borrow().len();
-            owner.fonts.borrow_mut().push(registered);
+            let index = if let Some(index) = existing_index {
+                index // 同实例只接纳新角色槽，不重复占据字体数组或 catalog 注册。
+            } else {
+                let mut fonts = owner.fonts.borrow_mut();
+                let index = fonts.len();
+                fonts.push(registered);
+                index
+            };
             typography.slots[slot] = Some(index);
             Ok(index)
         })();
@@ -1635,17 +1665,27 @@ pub(in crate::native_surface) struct RootLeafPart {
 
 #[cfg(feature = "native-markdown-runtime-probe")]
 impl Typography {
-    pub(super) fn role_at(&self, index: usize) -> &'static str {
-        if self.slots[40] == Some(index) {
-            "hidden"
-        } else {
-            // 槽是有限字体组合事实；下标只改变字号，仍归原基础角色，不从PSName猜字体用途。
-            match self.slots.iter().position(|slot| *slot == Some(index)) {
-                Some(slot) if (4..16).contains(&(slot % 20)) => "heading",
-                Some(slot) if (16..18).contains(&(slot % 20)) => "code",
-                Some(slot) if (18..20).contains(&(slot % 20)) => "table",
-                _ => "body-or-fallback",
-            }
+    pub(super) fn role_at(
+        &self,
+        index: usize,
+        presentation: MarkdownPresentationStyles,
+    ) -> &'static str {
+        // 一个实际 Font 可被正文、表头或代码角色共用，索引自身没有唯一语义。
+        // 只用原 sealed part 的样式选槽，再核该槽确实发布了当前实际注册 Font；
+        // 不能扫描首个同索引槽，也不能只按样式把另一回退 Font 诊断成原角色字体。
+        let role = Role::from_styles(presentation);
+        let Some(slot) = role.slot(presentation) else {
+            return "body-or-fallback";
+        };
+        if self.slots[slot] != Some(index) {
+            return "body-or-fallback";
+        }
+        match role {
+            Role::Hidden => "hidden",
+            Role::Heading(_) => "heading",
+            Role::Code => "code",
+            Role::Table => "table",
+            Role::Body => "body-or-fallback",
         }
     }
 }

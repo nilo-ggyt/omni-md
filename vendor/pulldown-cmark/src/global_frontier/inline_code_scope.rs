@@ -13,7 +13,7 @@ use crate::structural_spine::{StructuralCursorStep, StructuralKind, StructuralSp
 pub(super) struct ScopedCode {
     // 原 seed 唯一保留闭合块与祖先来源；角色目录仅在初始化量子活跃，随后逐续行临时建立。
     // 它不持 mmap、String 或原文档；源寿命仍由外层 SourceRequest 和原 Doc 管理。
-    seed: VerifiedInlineSemanticSeed,
+    pub(super) seed: std::sync::Arc<VerifiedInlineSemanticSeed>,
     scope: Option<StructuralSpineCursor>,
     scope_seen: bool,
     containers: InlinePlainContainers,
@@ -37,7 +37,7 @@ impl ScopedCode {
     pub(super) fn new(seed: VerifiedInlineSemanticSeed) -> Self {
         Self {
             scope: Some(seed.spine.cursor()),
-            seed,
+            seed: std::sync::Arc::new(seed),
             scope_seen: false,
             containers: InlinePlainContainers::default(),
             continuation: None,
@@ -95,6 +95,8 @@ impl InlineCodeCursor {
                             _ => return Err(Error::InvalidFrame),
                         },
                         StructuralKind::Item { .. } => {}
+                        // 标题投影不绘制脚注容器样式；来源仍由原seed及原Footnote前缀规则完整证明。
+                        StructuralKind::Footnote { .. } if self.heading => {}
                         _ => self.phase = Phase::General,
                     }
                 }
@@ -178,7 +180,7 @@ impl InlineCodeCursor {
             scope.prefix_start = at;
             // 原 make_code_span 只跳容器；code 中额外空白和 Tab 是正文，必须参与真实 trim。
             // 普通段落才执行 Space4/AllSpace；选择来自当前实际阶段，不接受外部语法布尔量。
-            let purpose = if matches!(self.phase, Phase::Probe | Phase::Trim) {
+            let purpose = if matches!(self.phase, Phase::Probe | Phase::Trim | Phase::Html) {
                 ReferencePrefixPurpose::ContainerOnly
             } else {
                 ReferencePrefixPurpose::Paragraph
@@ -227,11 +229,13 @@ impl InlineCodeCursor {
             source_end: self.source_end,
             range: scope.prefix_start..end,
             block_source: scope.seed.source_range(),
-            purpose: Some(if matches!(self.phase, Phase::Probe | Phase::Trim) {
-                ReferencePrefixPurpose::ContainerOnly
-            } else {
-                ReferencePrefixPurpose::Paragraph
-            }),
+            purpose: Some(
+                if matches!(self.phase, Phase::Probe | Phase::Trim | Phase::Html) {
+                    ReferencePrefixPurpose::ContainerOnly
+                } else {
+                    ReferencePrefixPurpose::Paragraph
+                },
+            ),
         };
         scope.prefix = None;
         if matches!(self.phase, Phase::Probe) {
@@ -245,7 +249,17 @@ impl InlineCodeCursor {
         }
         // Normal 和 Trim 已真实消费换行，仍保原前一个 Unicode scalar/逻辑空格状态。
         // 跳过结构前缀不能把 >、* 或 tab 注入 flanking，也不能改变 code 的 all-spaces 判定。
-        if matches!(self.phase, Phase::Trim) {
+        if matches!(self.phase, Phase::Html) {
+            if !self
+                .html_scanner
+                .as_mut()
+                .ok_or(Error::InvalidFrame)?
+                .continue_line(proof.range.len())
+            {
+                return Err(Error::InvalidFrame);
+            }
+            self.next = end;
+        } else if matches!(self.phase, Phase::Trim) {
             self.trim.as_mut().ok_or(Error::InvalidFrame)?.next = end;
         } else if matches!(self.phase, Phase::Normal | Phase::Backslash) {
             self.next = end;

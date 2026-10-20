@@ -65,6 +65,8 @@ pub(super) struct PendingNativeMarkdownNoteSwitch {
     pub(super) release_barrier: Option<NativeMarkdownEditorReleaseBarrier>,
     /// 仅明确恢复决定携带一次性小票据；普通切换没有跳过旧草稿的权限。
     pub(super) recovery_handoff: Option<omni_markdown_core::MarkdownRecoveryHandoff>,
+    /// 仅该次链接切换携带已解码片段；旧图释放后移交目标Body，不保旧Doc或Scene。
+    pub(super) fragment: Option<String>,
 }
 
 /// A mutation waits for editor release while retaining the saved authority revision and recovery identity.
@@ -1429,7 +1431,11 @@ impl NativeMarkdownWindowSurface {
     }
 
     /// Save the old authority and stage a single note switch only after safely releasing its editor.
-    pub(super) fn begin_note_switch(&mut self, relative_path: &str) -> Result<bool, String> {
+    pub(super) fn begin_note_switch(
+        &mut self,
+        relative_path: &str,
+        fragment: Option<String>,
+    ) -> Result<bool, String> {
         // 即便选择相同笔记也不能抢走当前modal的responder。
         self.preflight_modal_boundary()?;
         // Sidebar pages are bounded discovery views, not an authorization registry. Imported/new
@@ -1441,7 +1447,9 @@ impl NativeMarkdownWindowSurface {
         }
         if let Some(pending_switch) = &self.pending_note_switch {
             // Coalesce the same destination while preserving the first accepted transition.
-            return if pending_switch.relative_path == relative_path {
+            return if pending_switch.relative_path == relative_path
+                && pending_switch.fragment == fragment
+            {
                 // The existing deferred finalizer remains responsible for this requested destination.
                 Ok(false)
             } else {
@@ -1457,6 +1465,12 @@ impl NativeMarkdownWindowSurface {
             if let Some(editor) = &self.editor {
                 // This branch has already established live editor ownership for the current note.
                 self.panel.makeFirstResponder(Some(editor.input_view()));
+                if let Some(fragment) = fragment.as_deref() {
+                    editor
+                        .body
+                        .navigate_heading(fragment)
+                        .map_err(|cause| cause.to_string())?;
+                }
             }
             return Ok(false);
         }
@@ -1473,6 +1487,7 @@ impl NativeMarkdownWindowSurface {
             previous_relative_path,
             release_barrier,
             recovery_handoff: None,
+            fragment,
         });
         Ok(true)
     }
@@ -1535,6 +1550,15 @@ impl NativeMarkdownWindowSurface {
                 self.sidebar_list
                     .select_directory(&native_markdown_note_parent(&pending_switch.relative_path));
                 self.install_editor(&content_view, editor, pending_switch.relative_path);
+                if let Some(fragment) = pending_switch.fragment.as_deref() {
+                    // 已安装目标才绑定其自己的完整Input；旧屏障和旧Source不能签标题位置。
+                    self.editor
+                        .as_ref()
+                        .expect("刚安装的唯一目标正文")
+                        .body
+                        .navigate_heading(fragment)
+                        .map_err(|cause| cause.to_string())?;
+                }
                 if let Some(recording) = recording {
                     // 已打开目标与恢复决定的持久化是两个事实，记录故障不能伪装成功。
                     match recording {

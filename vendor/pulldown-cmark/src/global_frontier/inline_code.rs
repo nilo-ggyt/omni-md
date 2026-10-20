@@ -27,7 +27,44 @@ mod link_group;
 use link_group::{LinkProbe, LinkStep, ReplayStep};
 
 const CONTROL: usize = 128;
-const HTML_BYTES: usize = 256;
+const HTML_BYTES: usize = 4;
+
+#[derive(Debug)]
+/// 仅原 HTML/autolink scanner 完整闭合后存在；不从首个 '>' 或裸范围制造隐藏权限。
+pub struct VerifiedHeadingHtml {
+    source: Range<usize>,
+    autolink: bool,
+}
+impl VerifiedHeadingHtml {
+    pub fn source_range(&self) -> Range<usize> {
+        self.source.clone()
+    }
+    pub fn is_autolink(&self) -> bool {
+        self.autolink
+    }
+}
+
+#[derive(Debug)]
+/// 原inline主顺序真实消费的行末空白；实体/代码/HTML中的空白不属于这个事实。
+pub struct VerifiedHeadingLineTrim {
+    source: Range<usize>,
+}
+impl VerifiedHeadingLineTrim {
+    pub fn source_range(&self) -> Range<usize> {
+        self.source.clone()
+    }
+}
+
+#[derive(Debug)]
+/// 只有原GFM脚注语法及同源全局Found回答共同签发；Missing仍是原可见字面。
+pub struct VerifiedHeadingFootnote {
+    source: Range<usize>,
+}
+impl VerifiedHeadingFootnote {
+    pub fn source_range(&self) -> Range<usize> {
+        self.source.clone()
+    }
+}
 
 #[derive(Debug)]
 /// 原 Root 顺序中、排除 HTML/code 后的真实 delimiter run；尚未配对，不能单独当样式证明。
@@ -166,6 +203,12 @@ struct Trim {
 
 #[derive(Debug)]
 pub struct InlineCodeCursor {
+    // 仅标题文本消费者领取原 HTML 事实；普通视口不分配事件目录或保额外输出。
+    heading: bool,
+    heading_html: Option<VerifiedHeadingHtml>,
+    heading_trim: Option<VerifiedHeadingLineTrim>,
+    heading_footnote: Option<VerifiedHeadingFootnote>,
+    heading_spaces: Option<usize>,
     revision: u64,
     source_end: usize,
     end: usize,
@@ -179,6 +222,10 @@ pub struct InlineCodeCursor {
     run_escaped: bool,
     html: [u8; HTML_BYTES],
     html_len: usize,
+    html_scanner: Option<crate::scanners::InlineHtmlScanner>,
+    html_start: usize,
+    // 原 Parser 的失败边界只保四个索引；重读无效 comment/PI 不会退化成平方扫描。
+    html_guard: crate::parse::HtmlScanGuard,
     probe: Option<CodeSpanProbe>,
     trim: Option<Trim>,
     general_styles: bool,
@@ -233,7 +280,11 @@ impl super::VerifiedInlineSemanticSeed {
     ) -> Result<Option<InlineCodeCursor>, Error> {
         let scoped = if let Some(origin) = origin {
             if self.cell.is_some()
-                || self.kind != super::super::InlineBlockKind::Paragraph
+                || !matches!(
+                    self.kind,
+                    super::super::InlineBlockKind::Paragraph
+                        | super::super::InlineBlockKind::SetextHeading(_)
+                )
                 || self.spine.len() <= 1
                 || origin.revision != self.revision
                 || origin.source_end != self.source_end
@@ -246,9 +297,14 @@ impl super::VerifiedInlineSemanticSeed {
             Some(ScopedCode::new(self.clone()))
         } else {
             if self.cell.is_none() && self.spine.len() != 1 {
-                return Ok(None);
+                if matches!(self.kind, super::super::InlineBlockKind::SetextHeading(_)) {
+                    Some(ScopedCode::new(self.clone()))
+                } else {
+                    return Ok(None);
+                }
+            } else {
+                None
             }
-            None
         };
         if requested_end < self.physical_start || requested_end > self.end {
             return Err(Error::InvalidFrame);
@@ -257,6 +313,11 @@ impl super::VerifiedInlineSemanticSeed {
             return Err(Error::InvalidBudget);
         }
         Ok(Some(InlineCodeCursor {
+            heading: false,
+            heading_html: None,
+            heading_trim: None,
+            heading_footnote: None,
+            heading_spaces: None,
             revision: self.revision,
             source_end: self.source_end,
             end: self.lexical_end,
@@ -270,6 +331,9 @@ impl super::VerifiedInlineSemanticSeed {
             run_escaped: false,
             html: [0; HTML_BYTES],
             html_len: 0,
+            html_scanner: None,
+            html_start: 0,
+            html_guard: Default::default(),
             probe: None,
             trim: None,
             general_styles: false,
@@ -306,6 +370,29 @@ impl super::VerifiedInlineSemanticSeed {
 }
 
 impl crate::global_frontier::VerifiedGlobalInlineBlock {
+    /// Setext 仍使用原 Paragraph 的 scope/capture；真实标题种类只收窄最后正文末端，不扫描 underline。
+    pub fn into_heading_code_cursor(
+        self,
+        limits: InlinePlainLimits,
+    ) -> Result<InlineCodeCursor, Error> {
+        if !matches!(
+            self.kind(),
+            crate::global_frontier::InlineBlockKind::SetextHeading(_)
+        ) {
+            return Err(Error::InvalidFrame);
+        }
+        let seed = super::VerifiedInlineSemanticSeed::from_verified(&self);
+        let end = self.terminal_eol_range().start;
+        let mut cursor = seed
+            .emphasis_cursor(end, limits)?
+            .ok_or(Error::InvalidFrame)?;
+        cursor.heading = true;
+        cursor.end = end;
+        cursor.requested_end = end;
+        cursor.scope_range.end = end; // 原最后正文末端才是 inline 匹配域，Setext underline 不能进入链接前瞻。
+        Ok(cursor)
+    }
+
     /// 全局语义前探直接消费一个真实块票据；不建立第二个 Global 或假范围证明。
     pub fn into_code_cursor(
         self,
@@ -316,7 +403,157 @@ impl crate::global_frontier::VerifiedGlobalInlineBlock {
     }
 }
 
+impl crate::global_frontier::VerifiedGlobalLeafBlock {
+    /// 真 ATX 的同一 firstpass 已证明 lexical/trim 范围；这里直接接原 inline 顺序内核，不伪造 Paragraph。
+    pub fn heading_code_cursor(
+        &self,
+        limits: InlinePlainLimits,
+    ) -> Result<InlineCodeCursor, Error> {
+        let crate::global_frontier::LeafBlockDetails::AtxHeading {
+            lexical_content,
+            trim_target,
+            attributes,
+            ..
+        } = self.details()
+        else {
+            return Err(Error::InvalidFrame);
+        };
+        if attributes.is_some() || limits.max_byte_work == 0 || limits.max_transitions < 2048 {
+            return Err(Error::InvalidFrame);
+        }
+        let range = lexical_content.start..*trim_target;
+        Ok(InlineCodeCursor {
+            heading: true,
+            heading_html: None,
+            heading_trim: None,
+            heading_footnote: None,
+            heading_spaces: None,
+            revision: self.source_revision(),
+            source_end: self.source_end(),
+            end: range.end,
+            scope_range: range.clone(),
+            requested_end: range.end,
+            options: self.options(),
+            next: range.start,
+            phase: Phase::Normal,
+            run_start: 0,
+            run_count: 0,
+            run_escaped: false,
+            html: [0; HTML_BYTES],
+            html_len: 0,
+            html_scanner: None,
+            html_start: 0,
+            html_guard: Default::default(),
+            probe: None,
+            trim: None,
+            general_styles: false,
+            limits,
+            total: GlobalWork::default(),
+            failure: None,
+            // ATX 原文永远只有一个真实物理行；祖先前缀已在 lexical_content 之前，不重建一张容器树。
+            spine: None,
+            table_cell: false,
+            scoped: None,
+            emphasis: true,
+            previous: None,
+            previous_bytes: [0; 4],
+            previous_len: 0,
+            delimiter: 0,
+            delimiter_before: None,
+            link_probe: None,
+            link_outer_end: None,
+            suppressed_reference_close: None,
+        })
+    }
+}
+
 impl InlineCodeCursor {
+    /// 原whole Parser与本游标共享同一HTML状态机；输入只有当前frame，不保整tag、URI或注释。
+    fn advance_html(
+        &mut self,
+        frame: &SourceFrame<'_>,
+        budget: usize,
+    ) -> Result<InlineCodeStep, Error> {
+        use crate::scanners::{InlineHtmlKind, InlineHtmlProgress};
+        let end = self.scan_end();
+        let count = frame.bytes.len().min(end - self.next);
+        let step = self.html_scanner.as_mut().ok_or(Error::InvalidFrame)?.feed(
+            &frame.bytes[..count],
+            self.next + count == end,
+            budget - CONTROL,
+        );
+        self.next += step.consumed;
+        let work = GlobalWork {
+            byte_reads: step.byte_reads,
+            transitions: step.transitions + CONTROL,
+        };
+        match step.progress {
+            InlineHtmlProgress::Progress => Ok(InlineCodeStep::Progress { work }),
+            InlineHtmlProgress::NeedLine => {
+                if self.scoped.is_some() {
+                    // Scanner已完整消费真实CRLF；原scope只在这个真实EOL后取得续行prefix权限。
+                    self.arm_continuation(self.next, b'\n');
+                } else if !self.html_scanner.as_mut().unwrap().continue_line(0) {
+                    return Err(Error::InvalidFrame);
+                }
+                Ok(InlineCodeStep::Progress { work })
+            }
+            InlineHtmlProgress::Rejected => {
+                self.html_scanner
+                    .as_ref()
+                    .unwrap()
+                    .record_failure(&mut self.html_guard);
+                self.html_scanner = None;
+                if self.heading {
+                    // 无效HTML只有原'<'为本次候选；后续真实字符重放给原inline优先级，不能吞掉code/link。
+                    self.next = self.html_start + 1;
+                    self.previous = Some('<');
+                    self.previous_len = 0;
+                    self.phase = Phase::Normal;
+                    Ok(InlineCodeStep::Progress { work })
+                } else {
+                    self.phase = Phase::General;
+                    Ok(InlineCodeStep::NeedsGeneralInline { work })
+                }
+            }
+            InlineHtmlProgress::Accepted { kind, byte_count } => {
+                if self.html_start.checked_add(byte_count) != Some(self.next) {
+                    return Err(Error::InvalidFrame);
+                }
+                let autolink = !matches!(kind, InlineHtmlKind::Html);
+                self.general_styles |= autolink;
+                self.html_scanner = None;
+                self.previous = Some('>');
+                self.previous_len = 0;
+                self.phase = Phase::Normal;
+                if self.heading
+                    && self
+                        .heading_html
+                        .replace(VerifiedHeadingHtml {
+                            source: self.html_start..self.next,
+                            autolink,
+                        })
+                        .is_some()
+                {
+                    return Err(Error::InvalidFrame);
+                }
+                Ok(InlineCodeStep::Progress { work })
+            }
+        }
+    }
+
+    /// 一次 advance 最多发布一条真实 HTML；消费者取走后继续，不积累整块事件表。
+    pub fn take_heading_html(&mut self) -> Option<VerifiedHeadingHtml> {
+        self.heading_html.take()
+    }
+    /// 每次只领当前真实行末的原空白；投影在解实体前按Source范围隐藏它。
+    pub fn take_heading_line_trim(&mut self) -> Option<VerifiedHeadingLineTrim> {
+        self.heading_trim.take()
+    }
+    /// 同一源序replay的一条已证脚注省略；不是拿标记样式或裸'^'猜测。
+    pub fn take_heading_footnote(&mut self) -> Option<VerifiedHeadingFootnote> {
+        self.heading_footnote.take()
+    }
     /// 文件借用端已经结束本次 I/O 并首先完成 SourceFrame.finish 后，才可恢复这个原请求。
     /// 实际存储错误不进入这里；调用者保 Core errno 并停止游标，不把错误解释成字面。
     pub fn accept_storage(
@@ -404,6 +641,8 @@ impl InlineCodeCursor {
             image,
             self.options,
             self.suppressed_reference_close,
+            self.scoped.as_ref().map(|scope| scope.seed.clone()),
+            self.heading,
         )?);
         Ok(())
     }
@@ -418,6 +657,7 @@ impl InlineCodeCursor {
             ReplayStep::Progress => Some(InlineCodeStep::Progress { work }),
             ReplayStep::Begin(proof) => {
                 self.next = proof.label.start;
+                self.heading_spaces = None;
                 self.previous = Some('[');
                 self.previous_len = 0;
                 Some(InlineCodeStep::Link { proof, work })
@@ -429,6 +669,7 @@ impl InlineCodeCursor {
                 previous,
             } => {
                 self.next = next;
+                self.heading_spaces = None;
                 self.previous = Some(previous);
                 self.previous_len = 0;
                 Some(InlineCodeStep::LinkEnd {
@@ -445,6 +686,14 @@ impl InlineCodeCursor {
                 self.suppressed_reference_close = suppressed_close;
                 self.link_probe = None;
                 self.requested_end = self.link_outer_end.take().ok_or(Error::InvalidFrame)?;
+                Some(InlineCodeStep::Progress { work })
+            }
+            ReplayStep::Footnote { source, next } => {
+                self.next = next;
+                self.heading_spaces = None;
+                self.previous = Some(']');
+                self.previous_len = 0;
+                self.heading_footnote = Some(VerifiedHeadingFootnote { source });
                 Some(InlineCodeStep::Progress { work })
             }
             ReplayStep::None => None,
@@ -591,6 +840,9 @@ impl InlineCodeCursor {
         if matches!(self.phase, Phase::Scope) {
             return self.advance_scope();
         }
+        if matches!(self.phase, Phase::Html) {
+            return self.advance_html(&frame, budget);
+        }
         if matches!(self.phase, Phase::Init) {
             if self.scoped.is_some() {
                 self.spine = None;
@@ -622,7 +874,7 @@ impl InlineCodeCursor {
             .is_some_and(|probe| !probe.replaying())
         {
             let probe = self.link_probe.as_mut().unwrap();
-            let step = probe.advance(&frame, budget, &mut work)?;
+            let step = probe.advance(&frame, budget, &mut work, &mut self.html_guard)?;
             return Ok(match step {
                 LinkStep::Progress => InlineCodeStep::Progress { work },
                 LinkStep::NeedInput => InlineCodeStep::NeedInput { work },
@@ -789,6 +1041,11 @@ impl InlineCodeCursor {
                 && self.link_probe.is_none()
                 && matches!(self.phase, Phase::Normal | Phase::Backslash | Phase::Bang)
             {
+                if let Some(start) = self.heading_spaces.take() {
+                    self.heading_trim = Some(VerifiedHeadingLineTrim {
+                        source: start..self.next,
+                    });
+                }
                 self.phase = Phase::Proven;
                 return Ok(InlineCodeStep::Proven {
                     requires_general_styles: self.general_styles,
@@ -799,10 +1056,6 @@ impl InlineCodeCursor {
                 if matches!(self.phase, Phase::Run) {
                     self.begin_probe()?;
                     return Ok(InlineCodeStep::Progress { work });
-                }
-                if matches!(self.phase, Phase::Html) {
-                    self.phase = Phase::General;
-                    return Ok(InlineCodeStep::NeedsGeneralInline { work });
                 }
                 if matches!(self.phase, Phase::EmphasisRun) {
                     self.html_len = 0;
@@ -858,6 +1111,19 @@ impl InlineCodeCursor {
                     }
                 }
                 Phase::Normal => {
+                    if self.heading {
+                        if crate::scanners::is_ascii_whitespace_no_nl(byte) {
+                            self.heading_spaces.get_or_insert(self.next);
+                        } else if matches!(byte, b'\r' | b'\n') {
+                            if let Some(start) = self.heading_spaces.take() {
+                                self.heading_trim = Some(VerifiedHeadingLineTrim {
+                                    source: start..self.next,
+                                });
+                            }
+                        } else {
+                            self.heading_spaces = None;
+                        }
+                    }
                     if byte == b'`' {
                         self.start_run(false);
                         self.next += 1;
@@ -867,20 +1133,25 @@ impl InlineCodeCursor {
                         self.next += 1;
                         self.phase = Phase::Backslash;
                     } else if byte == b'<' {
-                        self.html[0] = byte;
-                        self.html_len = 1;
-                        self.next += 1;
+                        // 同一共享HTML词法从真实'<'起读；不保存属性/URI，也不按首个'>'猜闭合。
+                        self.html_start = self.next;
+                        self.html_scanner = Some(crate::scanners::InlineHtmlScanner::new(
+                            crate::scanners::InlineHtmlMode::Any,
+                            self.next,
+                            &self.html_guard,
+                        ));
                         self.phase = Phase::Html;
+                        return Ok(InlineCodeStep::Progress { work });
                     } else if byte == b'['
                         && self.link_probe.is_none()
-                        && self.scoped.is_none()
+                        && (self.scoped.is_none() || self.heading)
                         && !self.table_cell
                     {
                         self.start_link(false)?;
                         return Ok(InlineCodeStep::Progress { work });
                     } else if byte == b'!'
                         && self.link_probe.is_none()
-                        && self.scoped.is_none()
+                        && (self.scoped.is_none() || self.heading)
                         && !self.table_cell
                     {
                         // 只有随后真实 '[' 才建立 Image opener；普通感叹号仍是原字面。
@@ -889,8 +1160,8 @@ impl InlineCodeCursor {
                         self.phase = Phase::Bang;
                     } else if (matches!(byte, b'[' | b']')
                         && self.link_probe.is_none()
-                        && (self.scoped.is_some() || self.table_cell))
-                        || (self.scoped.is_some() && byte == b'&')
+                        && ((self.scoped.is_some() && !self.heading) || self.table_cell))
+                        || (self.scoped.is_some() && !self.heading && byte == b'&')
                         || (self.options.contains(crate::Options::ENABLE_MATH)
                             && matches!(byte, b'$' | b'{' | b'}'))
                     {
@@ -925,9 +1196,13 @@ impl InlineCodeCursor {
                         self.next += 1;
                         self.observe_previous(byte)?;
                         work.transitions += usize::from(self.emphasis) * 4;
-                        if self.scoped.is_some() && matches!(byte, b'\r' | b'\n') {
-                            self.arm_continuation(self.next, byte);
-                            return Ok(InlineCodeStep::Progress { work });
+                        if matches!(byte, b'\r' | b'\n') {
+                            if self.scoped.is_some() {
+                                self.arm_continuation(self.next, byte);
+                            }
+                            if self.scoped.is_some() || self.heading {
+                                return Ok(InlineCodeStep::Progress { work });
+                            }
                         }
                     }
                 }
@@ -935,37 +1210,7 @@ impl InlineCodeCursor {
                     self.run_count += 1;
                     self.next += 1;
                 }
-                Phase::Html => {
-                    if self.scoped.is_some() && matches!(byte, b'\r' | b'\n') {
-                        self.phase = Phase::General;
-                        return Ok(InlineCodeStep::NeedsGeneralInline { work });
-                    } // 多行 HTML 尚未完成原 origin 投影时保留真实未知，不把容器标记拼进 HTML。
-                    if self.html_len == HTML_BYTES {
-                        self.phase = Phase::General;
-                        return Ok(InlineCodeStep::NeedsGeneralInline { work });
-                    }
-                    if byte == b'>' {
-                        let cost = (self.html_len + 1) * 4;
-                        if work.byte_reads + work.transitions + cost > budget {
-                            return Ok(InlineCodeStep::Progress { work });
-                        }
-                        work.transitions += cost;
-                        self.html[self.html_len] = byte;
-                        let length = self.html_len + 1;
-                        if let Some(autolink) = root_html(&self.html[..length]) {
-                            self.general_styles |= autolink;
-                            self.next += 1;
-                            self.previous = Some('>');
-                            self.previous_len = 0;
-                            self.html_len = 0;
-                            self.phase = Phase::Normal;
-                            continue;
-                        }
-                    }
-                    self.html[self.html_len] = byte;
-                    self.html_len += 1;
-                    self.next += 1;
-                }
+                Phase::Html => return Err(Error::InvalidFrame), // 专属续体在本循环前推进。
                 _ => return Err(Error::InvalidFrame),
             }
         }
@@ -1065,21 +1310,6 @@ impl InlineCodeCursor {
         };
         Ok(())
     }
-}
-
-/// 使用原 autolink/HTML/comment/PI scanner 的确切接受条件；超固定 scratch 的 HTML 保持未知。
-fn root_html(bytes: &[u8]) -> Option<bool> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    if crate::scanners::scan_autolink(text, 1).is_some_and(|(end, _, _)| end == bytes.len()) {
-        return Some(true);
-    }
-    let mut guard = crate::parse::HtmlScanGuard::default();
-    let end = match bytes.get(1) {
-        Some(b'!') => crate::scanners::scan_inline_html_comment(bytes, 2, &mut guard),
-        Some(b'?') => crate::scanners::scan_inline_html_processing(bytes, 2, &mut guard),
-        _ => crate::scanners::scan_html_block_inner(bytes, Some(&|_| 0)).map(|(_, end)| end),
-    }?;
-    (end == bytes.len()).then_some(false)
 }
 
 /// 子 lexical 游标错误保留真实失效种类，不把预算、取消或坐标错误伪装成未匹配代码。

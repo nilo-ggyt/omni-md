@@ -26,8 +26,9 @@ pub use code::{
     InlineLinkKind, InlineLinkRecord, InlineLinkRecordId, InlineLinkRecordStatus,
     InlineLinkStorageOperation, InlineLinkStorageReply, InlineLinkStorageRequest,
     InlineLinkStorageStep, InlineLinkTarget, InlineReferenceDecoder, InlineReferenceKind,
-    InlineReferenceResolution, VerifiedInlineCodeSpan, VerifiedInlineEmphasisRun,
-    VerifiedInlineLink, VerifiedInlineReferenceRequest,
+    InlineReferenceResolution, VerifiedHeadingFootnote, VerifiedHeadingHtml,
+    VerifiedHeadingLineTrim, VerifiedInlineCodeSpan, VerifiedInlineEmphasisRun, VerifiedInlineLink,
+    VerifiedInlineReferenceRequest,
 };
 
 /// Plain 与 ATX 共用原 special-bytes 表及逐 byte 规则；候选只要求完整 inline，绝不自行配对。

@@ -846,7 +846,10 @@ pub(super) fn set_active_native_markdown_presentation_mode(
 }
 
 /// Saves and releases the old note before scheduling installation of the requested successor.
-pub(super) fn switch_native_markdown_note(relative_path: &str) -> Result<(), String> {
+pub(super) fn switch_native_markdown_note(
+    relative_path: &str,
+    fragment: Option<String>,
+) -> Result<(), String> {
     MainThreadMarker::new()
         .ok_or_else(|| "原生 Markdown 笔记必须在 AppKit 主线程切换".to_owned())?;
     if CLOSING_NATIVE_MARKDOWN_SURFACE.with_borrow(|surface| surface.is_some()) {
@@ -859,7 +862,7 @@ pub(super) fn switch_native_markdown_note(relative_path: &str) -> Result<(), Str
 
     let (switch_started, controller) = autoreleasepool(|_| {
         with_active_native_markdown_surface(|surface| {
-            let switch_result = surface.begin_note_switch(relative_path);
+            let switch_result = surface.begin_note_switch(relative_path, fragment);
             if let Err(error) = &switch_result {
                 // Rejected switch/open recovery is visible while the retained original draft stays authoritative.
                 surface.controller.present_error(error);

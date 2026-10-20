@@ -987,7 +987,7 @@ impl NativeMarkdownPagedBody {
         if needs_prefix {
             // publish 已标脏这一中间 Scene；位置还未恢复，必须先撤票，不能让 CPU observer
             // 抢在补前缀续体前把它当作模式完成帧。原测量与唯一 Producer 均继续保留。
-            self.clear_scene();
+            self.clear_scene()?;
             self.schedule()?;
             return Ok(true);
         }

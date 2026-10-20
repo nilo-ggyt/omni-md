@@ -2093,12 +2093,19 @@ impl NativeMarkdownPagedTextView {
                 return Ok(false);
             }
             if scheme.is_none() {
-                let fragment = url.fragment();
+                // 从原URI的首个#后取encoded片段，再标准解码一次。不能对Foundation已解码值
+                // 再反转义，让%2520被误当空格；URI的有限目标仍来自同一Source发布。
+                let fragment = destination.split_once('#').map(|(_, value)| value);
+                let fragment = fragment
+                    .map(|value| {
+                        objc2_foundation::NSString::from_str(value)
+                            .stringByRemovingPercentEncoding()
+                            .map(|value| value.to_string())
+                            .ok_or(NativeMarkdownPagedTextViewError::LinkAnchorInvalid)
+                    })
+                    .transpose()?;
                 if !self.link_intent_current(key, intent)? {
                     return Ok(false);
-                }
-                if fragment.is_some() {
-                    return Err(NativeMarkdownPagedTextViewError::LinkAnchorUnsupported);
                 }
                 let query = url.query();
                 if !self.link_intent_current(key, intent)? {
@@ -2122,13 +2129,23 @@ impl NativeMarkdownPagedTextView {
                 if !self.link_intent_current(key, intent)? {
                     return Ok(false);
                 }
+                if path.as_ref().is_none_or(|path| path.is_empty())
+                    && let Some(fragment) = fragment.as_deref()
+                {
+                    let scene = self.scene()?;
+                    if !scene.key.same(key) || !self.link_intent_current(key, intent)? {
+                        return Ok(false);
+                    }
+                    scene.scene.follow_heading(fragment, intent.clone())?;
+                    return Ok(true); // 原click随唯一标题任务延续；它实际解析完成后才消费票并定位。
+                }
                 let path = path.filter(|path| !path.is_empty()).ok_or_else(|| {
                     NativeMarkdownPagedTextViewError::RelativeNoteLink(
                         "笔记链接没有有效的相对路径".into(),
                     )
                 })?;
                 crate::native_surface::queue_native_markdown_relative_note_link(
-                    self, key, intent, &path,
+                    self, key, intent, &path, fragment,
                 )?;
                 return Ok(true); // 队列只借原click弱票；当前栈退出后才允许旧正文保存和资源barrier切换。
             }
@@ -2171,8 +2188,49 @@ impl NativeMarkdownPagedTextView {
         key: &super::NativeMarkdownPagedSceneKey,
         cause: NativeMarkdownPagedTextViewError,
     ) {
-        crate::native_surface::present_native_markdown_paged_link_error(self, key, &cause);
+        crate::native_surface::present_native_markdown_paged_link_error(self, &key.request, &cause);
         self.failure(cause); // 链接失败不销毁仍可编辑的正文/Source，也不会自动重放系统副作用。
+    }
+
+    /// 标题结果只认查询开始时的完整Input；真实选择命令保留generation/Undo，原提交
+    /// 链负责必要fold展开、旧CPU退休和SourceTarget可见终点，不以Find重放或裸滚动代替。
+    pub(in crate::native_surface) fn navigate_to_heading(
+        &self,
+        expected: super::NativeMarkdownPagedInputState,
+        position: usize,
+    ) -> Result<()> {
+        let origin = self.origin()?;
+        if origin.state != expected || origin.input.is_cell() {
+            return Err(NativeMarkdownPagedTextViewError::Revoked);
+        }
+        let current = |epoch| epoch == origin.epoch && origin.current(self);
+        let permit = origin.input.capture(origin.epoch, &current)?;
+        let outcome = origin.input.set_selection_intent(
+            &permit,
+            MarkdownTextSelection {
+                anchor_utf16: position,
+                head_utf16: position,
+            },
+            Some(false),
+            None,
+            &current,
+        )?;
+        self.finish_edit_outcome(&origin, outcome)
+    }
+
+    /// 新Doc尚无首屏时也能明确回报找不到标题；只回写同一完整客户，不清空可编辑正文。
+    pub(in crate::native_surface) fn report_heading_failure(
+        &self,
+        request: &super::NativeMarkdownPagedSceneRequest,
+        cause: NativeMarkdownPagedTextViewError,
+    ) {
+        if self
+            .input_state()
+            .is_ok_and(|actual| actual == request.input)
+        {
+            crate::native_surface::present_native_markdown_paged_link_error(self, request, &cause);
+            self.failure(cause);
+        }
     }
 }
 

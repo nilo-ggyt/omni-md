@@ -421,6 +421,15 @@ impl MarkdownTableUnderlineRequest {
                     GlobalFact::Table(header) => (header.separator_byte_end, None), // 完整H/D已由原Global提交。
                     GlobalFact::Row(row) => (row.byte_end, None), // 只包含真实成员行，不吞后继候选。
                     GlobalFact::TableEnd(end) => (end.byte_end(), None), // 失败候选留待后继块重新分类。
+                    GlobalFact::Footnote(_) => {
+                        // 定义存在性不是可解释正文水位；保原phase，只交还这一步真实Global工作。
+                        return Ok(MarkdownTableUnderlineRequestStep {
+                            global_source_bytes: work.byte_reads,
+                            global_source_tree_steps: tree,
+                            structural_transitions: work.transitions + tree + 64,
+                            ..Default::default()
+                        });
+                    }
                     GlobalFact::Reference(reference) => {
                         let end = reference.candidate().span_end;
                         if self.references_pending() {

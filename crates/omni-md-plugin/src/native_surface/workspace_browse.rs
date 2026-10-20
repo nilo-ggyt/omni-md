@@ -505,7 +505,7 @@ pub(super) fn deliver_native_markdown_directory_result(
         .unwrap_or(false);
         if current {
             // 既有switch在当前surface内报告首因；外层不重复显示可能已过期的错误。
-            let _ = switch_native_markdown_note(&path);
+            let _ = switch_native_markdown_note(&path, None);
         }
     }
 }

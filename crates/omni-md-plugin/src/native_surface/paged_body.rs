@@ -816,15 +816,17 @@ impl NativeMarkdownPagedBody {
         drop(self.selection_reveal.borrow_mut().take());
         drop(self.pending_vertical.borrow_mut().take());
         drop(self.pending_page_scroll.borrow_mut().take());
-        drop(self.pending_link.borrow_mut().take());
         let _ = self.cancel_word_delete(); // 首错已保留；仍显式归还局部重入Rc可能保活的新增输入槽。
         self.revoke_source_target();
         drop(self.paint_observation.borrow_mut().take());
         #[cfg(feature = "native-markdown-runtime-probe")]
         drop(self.preparation_probe.borrow_mut().take());
-        self.clear_scene();
+        let scene_result = self.clear_scene().map_err(Into::into);
         let producer = self.producer.borrow_mut().take();
-        let producer_result = producer.map_or(Ok(()), Producer::retire);
+        let producer_result = producer::merge_preparation_cleanup(
+            scene_result,
+            producer.map_or(Ok(()), Producer::retire),
+        );
         // 失败退出仍清完整线程及排队结果；主因先保存，真实清理次因必须进入同一错误链。
         let worker_result = self
             .worker
@@ -930,7 +932,7 @@ impl NativeMarkdownPagedBody {
             });
         drop(selection_scene); // 只比较原同票Scene；临时claim在后续Source/Reader交接前退出。
         if !keep_word_selection_scene {
-            self.clear_scene();
+            self.clear_scene()?;
         } // 选词未改正文时保留原真实命中图供拖动；任何输入/几何变化与删除仍归还旧Reader。
         let old = self.producer.borrow_mut().take();
         let mut producer = match old {
@@ -1049,7 +1051,7 @@ impl NativeMarkdownPagedBody {
             // 仅原前台票撤权可交实际后继；Producer 已先核原 Source 首错。整份旧候选
             // 取消并归还，worker 的旧完成仍按旧 serial 消费，不能给新 Source 补签。
             producer.retire()?;
-            self.clear_scene();
+            self.clear_scene()?;
             self.serial.set(
                 self.serial
                     .get()
@@ -1146,7 +1148,6 @@ impl NativeMarkdownPagedBody {
             receipt.follow_view(cell_close);
         } // 仅跟随仍在释放的上一张有限像素票，不保退休格列表、Source或业务文档。
         drop(self.mode_viewport.borrow_mut().take());
-        drop(self.pending_link.borrow_mut().take());
         drop(self.selection_reveal.borrow_mut().take());
         drop(self.pending_vertical.borrow_mut().take());
         drop(self.pending_page_scroll.borrow_mut().take());
@@ -1166,7 +1167,9 @@ impl NativeMarkdownPagedBody {
             receipt.record(NativeMarkdownPagedCloseFailure::View(error));
         }
         drop(gutter);
-        self.clear_scene();
+        if let Err(cause) = self.clear_scene() {
+            receipt.record(NativeMarkdownPagedCloseFailure::View(cause));
+        }
         let producer = self.producer.borrow_mut().take();
         let producer_result = producer.map_or(Ok(()), Producer::retire);
         // 先结束槽借用并真正退休唯一续体，再join；前一步失败也不能跳过线程及排队结果归还。
@@ -1225,7 +1228,7 @@ impl NativeMarkdownPagedBody {
     /// 所有正文Scene失权出口同时退休未发布CPU候选与行号弱快照。
     /// 格关闭等动作可以保留相同Input/几何；不能等新Scene发布才撤旧候选，否则旧续绘
     /// 会在两次有限准备之间把正常退休误报为永久输入失败。已发布像素仍归原CPU owner。
-    fn clear_scene(&self) {
+    fn clear_scene(&self) -> std::result::Result<(), ViewError> {
         let pending_link = self.pending_link.borrow_mut().take();
         let scene = self.scene.borrow_mut().take();
         // 这里只克隆本Body实际持有的Rust Rc，不调用Native retain、查询或重新领取Scene。
@@ -1234,12 +1237,15 @@ impl NativeMarkdownPagedBody {
         if let Some(view) = view {
             view.retire_scene_candidate();
         }
-        drop(pending_link); // 同一旧Scene的click意图不再持Reader，也不能给后继publication补票。
+        // 查询任务也先退槽；即使scratch关闭失败，后面的gutter/Scene归还仍全部执行。
+        // 调用方按原失败收据或既有cleanup链保首因，不以取消吞掉真实资源错误。
+        let link_result = pending_link.map_or(Ok(()), link::PendingLink::retire);
         let gutter = self.gutter.borrow().clone();
         if let Some(gutter) = gutter {
             gutter.clear_snapshot();
         }
         drop(scene);
+        link_result
     }
 
     /// 行号回调的真实失败属于原Body首错，不能另起重试或签一个更新的Scene。
@@ -1402,7 +1408,7 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         drop(self.selection_reveal.borrow_mut().take());
         drop(self.pending_vertical.borrow_mut().take());
         drop(self.pending_page_scroll.borrow_mut().take());
-        self.clear_scene();
+        self.clear_scene()?;
         self.schedule().map_err(|_| ViewError::Revoked)?;
         commit.check_current(&|epoch| self.current(epoch))?;
         let observer = self

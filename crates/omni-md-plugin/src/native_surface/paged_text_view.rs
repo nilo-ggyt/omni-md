@@ -86,8 +86,12 @@ pub enum NativeMarkdownPagedTextViewError {
     AttachmentRollback { cause: Box<Self>, cleanup: String },
     #[error("系统未能打开该链接")]
     LinkOpenFailed,
-    #[error("当前编辑器尚未提供稳定的标题锚点导航，无法跳转到该锚点")]
-    LinkAnchorUnsupported,
+    #[error("当前笔记中没有找到该标题锚点")]
+    LinkAnchorNotFound,
+    #[error("标题锚点不是有效的UTF-8片段")]
+    LinkAnchorInvalid,
+    #[error("标题锚点查询失败：{0}")]
+    HeadingAnchor(#[from] omni_markdown_core::MarkdownHeadingAnchorError),
     #[error("无法打开笔记链接：{0}")]
     RelativeNoteLink(String),
     #[error("原链接来源查询失败")]

@@ -220,6 +220,9 @@ pub struct Parser<'input, F = DefaultBrokenLinkCallback> {
     cell_root: Option<TreeIndex>,
     #[cfg(feature = "omni-block-frontier")]
     paragraph_context: Option<&'input crate::global_frontier::InlineParagraphContext>,
+    #[cfg(feature = "omni-block-frontier")]
+    // 只借当前有限标题已经查得的全源脚注答案，不复制定义表、正文或跨迭代强持Source。
+    footnote_lookup: Option<&'input dyn Fn(&str) -> Option<bool>>,
 }
 
 impl<'input, F> std::fmt::Debug for Parser<'input, F> {
@@ -383,7 +386,18 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             cell_root: None,
             #[cfg(feature = "omni-block-frontier")]
             paragraph_context: None,
+            #[cfg(feature = "omni-block-frontier")]
+            footnote_lookup: None,
         }
+    }
+
+    #[cfg(feature = "omni-block-frontier")]
+    /// 有界seed并未读取全源定义；本次纯迭代只借实际查询结果，不在Parser回调同步I/O。
+    /// Some(true/false)分别表示原全源Found/Missing；None是未知，来源owner必须先结束
+    /// 本次迭代并准备真实查询后再发布，不能把片段中没定义误授为完整标题文本。
+    pub fn with_footnote_lookup(mut self, lookup: &'input dyn Fn(&str) -> Option<bool>) -> Self {
+        self.footnote_lookup = Some(lookup);
+        self
     }
 
     /// Returns a reference to the internal `RefDefs` object, which provides access
@@ -874,9 +888,14 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                                 {
                                     def.use_count += 1;
                                 }
-                                if !self.options.has_gfm_footnotes()
-                                    || self.allocs.footdefs.contains(&self.allocs.cows[footref.0])
-                                {
+                                let defined =
+                                    self.allocs.footdefs.contains(&self.allocs.cows[footref.0]);
+                                #[cfg(feature = "omni-block-frontier")]
+                                let defined = defined
+                                    || self.footnote_lookup.is_some_and(|lookup| {
+                                        lookup(&self.allocs.cows[footref.0]) == Some(true)
+                                    });
+                                if !self.options.has_gfm_footnotes() || defined {
                                     // If this came from a MaybeImage, then the `!` prefix
                                     // isn't part of the footnote reference.
                                     let footnote_ix = if tos.ty == LinkStackTy::Image {
@@ -2094,7 +2113,7 @@ impl<'a> Index<HeadingIndex> for Allocations<'a> {
 /// elements (`<?`) and declarations (`<!DECLARATION`). The respectives usizes
 /// represent the indices before which a scan will always fail and can hence
 /// be skipped.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct HtmlScanGuard {
     pub cdata: usize,
     pub processing: usize,
