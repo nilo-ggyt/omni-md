@@ -2923,107 +2923,311 @@ impl NativeMarkdownHostedTableProbe {
     /// 工具栏点击走原窗口命中路由；一次准备完整 Down/Up，不能在 Down 的 tracking 栈里才发送 Up。
     /// 原controller仍自行捕获意图并排队，事件入队不代表格式、历史或信息卡已经完成。
     fn click_toolbar_button(&self, delta: u64, tag: isize) -> Result<(), String> {
+        use crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError as ViewError;
+
+        let started = Instant::now();
         let facts = self.facts()?;
         let generation = facts
             .generation
             .checked_add(delta)
             .ok_or("工具栏代次溢出")?;
-        let (down, up, mtm) = with_active_native_markdown_surface(|surface| {
-            let current = || self.current(surface, &facts, generation);
-            if !current() {
-                return Err("工具栏点击前原文档已改变".into());
-            }
-            let editor = surface.editor.as_ref().unwrap();
-            let before = editor
-                .text_view
-                .input_state()
-                .map_err(|cause| cause.to_string())?;
-            // 格草稿与父canonical是两个真实客户；工具栏滚动不能确认组合或偷偷切换活动格。
-            // 这些临时claim只服务本次Native坐标准备，不进入事件或下一轮观察槽。
-            let child = editor.body.active_cell_body();
-            let child_view = child
-                .as_ref()
-                .map(|child| child.view())
-                .transpose()
-                .map_err(|cause| cause.to_string())?;
-            let child_before = child_view
-                .as_ref()
-                .map(|view| view.input_state())
-                .transpose()
-                .map_err(|cause| cause.to_string())?;
-            let controls = surface.controller.ivars().workspace_controls.get().unwrap();
-            for control in controls.iter().skip(NATIVE_MARKDOWN_TOOLBAR_START) {
-                let Some(button) = control.downcast_ref::<NSButton>() else {
-                    continue; // 非按钮不代发动作；实际格式与历史仍按原自有按钮身份和tag发送。
-                };
-                if step(&current, || button.tag())? == tag {
-                    if !step(&current, || button.isEnabled())?
-                        || !step(&current, || button.refusesFirstResponder())?
+        // canonical历史先完成，实际按钮的enable通知仍可能排在主队列；只固定原客户和按钮弱票，
+        // 不把较新的Input重采为本次前态，也不让等待保活已经移走的格、按钮或窗口。
+        let (before, child_identity, child_before, button_identity) =
+            with_active_native_markdown_surface(|surface| {
+                let current = || self.current(surface, &facts, generation);
+                if !current() {
+                    return Err("工具栏点击前原文档已改变".into());
+                }
+                let editor = surface.editor.as_ref().unwrap();
+                let before = editor
+                    .text_view
+                    .input_state()
+                    .map_err(|cause| cause.to_string())?;
+                let child = editor.body.active_cell_body();
+                let child_before = child
+                    .as_ref()
+                    .map(|body| body.view())
+                    .transpose()
+                    .map_err(|cause| cause.to_string())?
+                    .as_ref()
+                    .map(|view| view.input_state())
+                    .transpose()
+                    .map_err(|cause| cause.to_string())?;
+                let controls = surface.controller.ivars().workspace_controls.get().unwrap();
+                for control in controls.iter().skip(NATIVE_MARKDOWN_TOOLBAR_START) {
+                    if let Some(button) = control.downcast_ref::<NSButton>()
+                        && step(&current, || button.tag())? == tag
                     {
-                        return Err("工具栏按钮不可用或会夺取文本焦点".into());
+                        return Ok((
+                            before,
+                            child.as_ref().map(Rc::downgrade),
+                            child_before,
+                            Weak::from(button),
+                        ));
                     }
-                    let bounds = step(&current, || button.bounds())?;
-                    step(&current, || button.scrollRectToVisible(bounds))?;
-                    // 只显露原按钮并命中它的真实可见中心；不能用离屏坐标或直接action替代失败点击。
-                    // 这不是正文Reveal，原有Source目标和canonical选择均不获得新权限。
-                    let point = NSPoint::new(
-                        bounds.origin.x + bounds.size.width * 0.5,
-                        bounds.origin.y + bounds.size.height * 0.5,
-                    );
-                    if !step(&current, || NSPointInRect(point, button.visibleRect()))? {
-                        return Err("原工具栏按钮中心没有实际可见命中区域".into());
+                }
+                Err("实际工具栏没有所需按钮".into())
+            })?;
+        loop {
+            let events = with_active_native_markdown_surface(|surface| {
+                let current = || self.current(surface, &facts, generation);
+                if !current() {
+                    return Err("工具栏准入期间原文档已改变".into());
+                }
+                let editor = surface.editor.as_ref().unwrap();
+                if let Some(cause) = editor.body.take_failure() {
+                    return Err(format!("工具栏等待时原正文失败：{cause}"));
+                }
+                if let Some(cause) = editor.text_view.take_failure()
+                    && !matches!(cause, ViewError::Pending)
+                {
+                    return Err(format!("工具栏等待时原输入失败：{cause}"));
+                }
+                // Pending前仍核原Source健康；零端点只触健康/身份，不借正文页或复制内容。
+                editor
+                    .document()
+                    .borrow()
+                    .byte_offset_for_utf16(0)
+                    .map_err(|cause| cause.to_string())?;
+                // 格草稿与父canonical是两个真实客户；工具栏滚动不能确认组合或偷偷切换活动格。
+                // 这些临时claim只服务本次Native坐标准备，不进入事件或下一轮观察槽。
+                let child = editor.body.active_cell_body();
+                let same_child = match (&child_identity, &child) {
+                    (Some(before), Some(after)) => {
+                        std::rc::Weak::ptr_eq(before, &Rc::downgrade(after))
                     }
-                    let window =
-                        step(&current, || button.window())?.ok_or("原工具栏按钮已脱离窗口")?;
-                    let original_window: &objc2_app_kit::NSWindow = &surface.panel;
-                    if !std::ptr::eq::<objc2_app_kit::NSWindow>(&*window, original_window) {
-                        return Err("原工具栏按钮不属于当前文稿窗口".into());
-                    }
-                    // NSEvent要求窗口坐标；同一原按钮负责转换，不从屏幕或窗口固定尺寸猜点击点。
-                    let point = step(&current, || button.convertPoint_toView(point, None))?;
-                    let number = step(&current, || window.windowNumber())?;
-                    let event = |kind, sequence, pressure| {
-                        NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-                            kind, point, NSEventModifierFlags::empty(), 1.0, number, None,
-                            sequence, 1, pressure,
-                        ).ok_or("无法创建原工具栏窗口鼠标事件".to_owned())
-                    };
-                    let down = event(NSEventType::LeftMouseDown, 1, 1.0)?;
-                    let up = event(NSEventType::LeftMouseUp, 2, 0.0)?;
-                    // 两事件都构造成功才可发布；失败不能只留一个Down把原按钮tracking悬挂。
-                    // 显露横向工具栏只允许几何变化；父/子客户、组合态和完整选择不能借此重采。
-                    let same_child = match (&child, editor.body.active_cell_body()) {
-                        (Some(before), Some(after)) => Rc::ptr_eq(before, &after),
-                        (None, None) => true,
-                        _ => false,
-                    };
-                    if !current()
-                        || !same_child
-                        || editor
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same_child {
+                    return Err("工具栏等待时原活动格已换走".into());
+                }
+                let child_view = child
+                    .as_ref()
+                    .map(|child| child.view())
+                    .transpose()
+                    .map_err(|cause| cause.to_string())?;
+                if let Some(child) = &child
+                    && let Some(cause) = child.take_failure()
+                {
+                    return Err(format!("工具栏等待时原格正文失败：{cause}"));
+                }
+                if let Some(view) = &child_view
+                    && let Some(cause) = view.take_failure()
+                    && !matches!(cause, ViewError::Pending)
+                {
+                    return Err(format!("工具栏等待时原格输入失败：{cause}"));
+                }
+                if editor
+                    .text_view
+                    .input_state()
+                    .map_err(|cause| cause.to_string())?
+                    != before
+                    || child_view
+                        .as_ref()
+                        .map(|view| view.input_state())
+                        .transpose()
+                        .map_err(|cause| cause.to_string())?
+                        != child_before
+                {
+                    return Err("工具栏等待改变了原父子完整Input".into());
+                }
+                let current = || {
+                    current()
+                        && editor
                             .text_view
                             .input_state()
-                            .map_err(|cause| cause.to_string())?
-                            != before
-                        || child_view
+                            .is_ok_and(|state| state == before)
+                        && match (&child_identity, editor.body.active_cell_body()) {
+                            (Some(original), Some(actual)) => {
+                                std::rc::Weak::ptr_eq(original, &Rc::downgrade(&actual))
+                            }
+                            (None, None) => true,
+                            _ => false,
+                        }
+                        && child_view
                             .as_ref()
                             .map(|view| view.input_state())
                             .transpose()
-                            .map_err(|cause| cause.to_string())?
-                            != child_before
-                    {
-                        return Err("工具栏命中准备改变了原父子客户或完整Input".into());
+                            .is_ok_and(|state| state == child_before)
+                };
+                let original_button = button_identity.load().ok_or("原工具栏按钮已释放")?;
+                let controls = surface.controller.ivars().workspace_controls.get().unwrap();
+                for control in controls.iter().skip(NATIVE_MARKDOWN_TOOLBAR_START) {
+                    let Some(button) = control.downcast_ref::<NSButton>() else {
+                        continue; // 非按钮不代发动作；实际格式与历史仍按原自有按钮身份和tag发送。
+                    };
+                    if step(&current, || button.tag())? == tag {
+                        if !std::ptr::eq(button, &*original_button) {
+                            return Err("工具栏等待期间原按钮被替换".into());
+                        }
+                        if !step(&current, || button.refusesFirstResponder())? {
+                            return Err("工具栏按钮不可用或会夺取文本焦点".into());
+                        }
+                        let enabled = step(&current, || button.isEnabled())?;
+                        let target_view = child_view.as_ref().unwrap_or(&editor.text_view);
+                        let target_body = child.as_ref().unwrap_or(&editor.body);
+                        let mut history_frame = None;
+                        if matches!(tag, 22 | 23) {
+                            // 只有真实历史已经可用，才把尚未到达的UI发布作为等待。marked、空历史、
+                            // 其它disabled按钮都仍是立即失败，不能刷新控件或代发命令让验收通过。
+                            let target_input = child_before.unwrap_or(before);
+                            let available = if target_input.marked.is_some() {
+                                false
+                            } else if child.is_some() {
+                                let history = target_view
+                                    .cell_history_facts()
+                                    .map_err(|cause| cause.to_string())?
+                                    .ok_or("工具栏原格没有真实局部历史")?;
+                                if tag == 22 {
+                                    history.can_undo
+                                } else {
+                                    history.can_redo
+                                }
+                            } else {
+                                let document = editor.document().borrow();
+                                if tag == 22 {
+                                    document.can_undo()
+                                } else {
+                                    document.can_redo()
+                                }
+                            };
+                            if !available {
+                                return Err("工具栏原客户没有所需真实历史".into());
+                            }
+                            if target_body.is_preparing() {
+                                return Ok(None);
+                            }
+                            let key = match target_view.capture_ready_scene_key() {
+                                Ok(key) => key,
+                                Err(ViewError::Pending) => return Ok(None),
+                                Err(cause) => return Err(cause.to_string()),
+                            };
+                            let scene = NativeMarkdownPagedTextViewDelegate::ready_scene(
+                                &**target_body,
+                                &key.request,
+                            )
+                            .map_err(|cause| cause.to_string())?;
+                            scene
+                                .validate_ready(&current)
+                                .map_err(|cause| cause.to_string())?;
+                            if key.request.input != target_input {
+                                return Err("工具栏历史帧不属于原完整Input".into());
+                            }
+                            let Some((cpu, paints)) = target_view.probe_cpu_published_frame()
+                            else {
+                                return Ok(None);
+                            };
+                            if !enabled
+                                || !cpu.same(&key)
+                                || paints == 0
+                                || target_view.cpu_paints() != Some(paints)
+                                || target_view.cpu_paint_pending() != Some(false)
+                            {
+                                return Ok(None);
+                            }
+                            history_frame = Some((scene, key, paints));
+                        } else if !enabled {
+                            return Err("工具栏按钮不可用或会夺取文本焦点".into());
+                        }
+                        let bounds = step(&current, || button.bounds())?;
+                        step(&current, || button.scrollRectToVisible(bounds))?;
+                        // 只显露原按钮并命中它的真实可见中心；不能用离屏坐标或直接action替代失败点击。
+                        // 这不是正文Reveal，原有Source目标和canonical选择均不获得新权限。
+                        let point = NSPoint::new(
+                            bounds.origin.x + bounds.size.width * 0.5,
+                            bounds.origin.y + bounds.size.height * 0.5,
+                        );
+                        if !step(&current, || NSPointInRect(point, button.visibleRect()))? {
+                            return Err("原工具栏按钮中心没有实际可见命中区域".into());
+                        }
+                        let window =
+                            step(&current, || button.window())?.ok_or("原工具栏按钮已脱离窗口")?;
+                        let original_window: &objc2_app_kit::NSWindow = &surface.panel;
+                        if !std::ptr::eq::<objc2_app_kit::NSWindow>(&*window, original_window) {
+                            return Err("原工具栏按钮不属于当前文稿窗口".into());
+                        }
+                        // NSEvent要求窗口坐标；同一原按钮负责转换，不从屏幕或窗口固定尺寸猜点击点。
+                        let point = step(&current, || button.convertPoint_toView(point, None))?;
+                        let number = step(&current, || window.windowNumber())?;
+                        let event = |kind, sequence, pressure| {
+                            NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                            kind, point, NSEventModifierFlags::empty(), 1.0, number, None,
+                            sequence, 1, pressure,
+                        ).ok_or("无法创建原工具栏窗口鼠标事件".to_owned())
+                        };
+                        let down = event(NSEventType::LeftMouseDown, 1, 1.0)?;
+                        let up = event(NSEventType::LeftMouseUp, 2, 0.0)?;
+                        // 两事件都构造成功才可发布；失败不能只留一个Down把原按钮tracking悬挂。
+                        // 显露横向工具栏只允许几何变化；父/子客户、组合态和完整选择不能借此重采。
+                        let same_child = match (&child, editor.body.active_cell_body()) {
+                            (Some(before), Some(after)) => Rc::ptr_eq(before, &after),
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        if !current()
+                            || !same_child
+                            || editor
+                                .text_view
+                                .input_state()
+                                .map_err(|cause| cause.to_string())?
+                                != before
+                            || child_view
+                                .as_ref()
+                                .map(|view| view.input_state())
+                                .transpose()
+                                .map_err(|cause| cause.to_string())?
+                                != child_before
+                        {
+                            return Err("工具栏命中准备改变了原父子客户或完整Input".into());
+                        }
+                        if let Some((scene, key, paints)) = history_frame {
+                            // 按钮显露和坐标转换也会进入AppKit；返回后先保Source/Font首错，再核
+                            // 原CPU仍同key。只有这一次完整前态能发点击，几何换代仍沿同期限等待。
+                            scene
+                                .validate_ready(&current)
+                                .map_err(|cause| cause.to_string())?;
+                            if !NativeMarkdownPagedTextViewDelegate::scene_current(
+                                &**target_body,
+                                &key,
+                            ) || !target_view
+                                .probe_cpu_published_frame()
+                                .is_some_and(|(cpu, actual)| cpu.same(&key) && actual == paints)
+                                || target_view.cpu_paints() != Some(paints)
+                                || target_view.cpu_paint_pending() != Some(false)
+                            {
+                                return Ok(None);
+                            }
+                        }
+                        return Ok(Some((down, up, window.mtm())));
                     }
-                    return Ok((down, up, window.mtm()));
                 }
+                Err("实际工具栏没有所需按钮".into())
+            })?; // 本轮ACTIVE、按钮、父子客户和Scene强claim全部先退租，才允许下次主循环。
+            if let Some((down, up, mtm)) = events {
+                if started.elapsed() > Duration::from_secs(3) {
+                    return Err("工具栏原按钮准入超过三秒期限".into());
+                }
+                // ACTIVE、原按钮和父子客户强claim已归还；先把完整事件对放进同一AppKit队列，
+                // NSButton.mouseDown的真实tracking才可取到对应Up，不需全局事件权限或嵌套等待。
+                let application = NSApplication::sharedApplication(mtm);
+                application.postEvent_atStart(&down, false);
+                application.postEvent_atStart(&up, false);
+                return Ok(());
             }
-            Err("实际工具栏没有所需按钮".into())
-        })?;
-        // ACTIVE、原按钮和父子客户强claim已归还；先把完整事件对放进同一AppKit队列，
-        // NSButton.mouseDown的真实tracking才可取到对应Up，不需全局事件权限或嵌套等待。
-        let application = NSApplication::sharedApplication(mtm);
-        application.postEvent_atStart(&down, false);
-        application.postEvent_atStart(&up, false);
-        Ok(())
+            let remaining = Duration::from_secs(3)
+                .checked_sub(started.elapsed())
+                .ok_or("工具栏原历史和UI没有在三秒内同时就绪")?;
+            // SAFETY: 复用原主runloop等待；同一次准入只有这一份剩余期限，没有补发点击或刷新UI。
+            unsafe {
+                objc2_core_foundation::CFRunLoop::run_in_mode(
+                    objc2_core_foundation::kCFRunLoopDefaultMode,
+                    remaining.as_secs_f64(),
+                    true,
+                )
+            };
+        }
     }
 
     /// 字段激活前由真实窗口resize通知完成布局，往返后正文、选择和历史必须仍是同一基线。
