@@ -1,4 +1,4 @@
-//! 字形元数据先用固定小工作块，真实溢出才文件分页；原字形算法与输入语义不变。
+//! 字形元数据先按实际容量使用小工作块，真实溢出才文件分页；原字形算法与输入语义不变。
 //!
 //! 工作块和映射都只保存算法元数据，不建立原文镜像。逐项访问保留固定窗口；调用者拿到
 //! 整片借用时，必须在真实循环内使用配套checkpoint，不能把阶段结束当峰值证明。
@@ -22,8 +22,6 @@ use std::{
 };
 
 const BUCKET_BYTES: usize = 64 * 1024;
-// 很短的原整形项只分配实际小工作区；64KiB仍是转文件的唯一上界，不设池或跨任务库存。
-const MIN_WORK_BYTES: usize = 4 * 1024;
 const WINDOWS: usize = 8;
 mod platform;
 mod resources;
@@ -147,7 +145,7 @@ impl ResidentSpan {
 struct PageState {
     base: NonNull<u8>,
     bytes: usize,
-    // None是固定工作块，不具备mmap页对齐或回写义务；Some只来自真实文件映射。
+    // None是heap工作块，不具备mmap页对齐或回写义务；Some只来自真实文件映射。
     page: Option<usize>,
     poison: Cell<Option<i32>>,
     scope: PagingScope,
@@ -593,7 +591,9 @@ impl<T: Pod> MappedPodVec<T> {
             let Some(bytes) = required_bytes.checked_next_power_of_two() else {
                 return self.fail();
             };
-            let bytes = bytes.max(MIN_WORK_BYTES);
+            // Work由alloc_zeroed和原T的Layout拥有，不需要文件页的4KiB地板。非零
+            // required已大于旧capacity，故bytes至少覆盖一条T，也满足T原对齐所需大小。
+            // 首个字素不再为两个20B数组各预留4KiB；后续仍按原幂次增长到64KiB再转File。
             if crate::cooperative::poll_boundary().is_err() {
                 return self.fail();
             }
@@ -1290,6 +1290,79 @@ mod tests {
     }
 
     #[test]
+    fn public_small_unicode_buffers_keep_values_zeroed_positions_and_release_real_work() {
+        for text in ["中", "a\u{301}", "👩\u{200d}👩\u{200d}👧\u{200d}👦"] {
+            // 只走原公开Buffer输入/读取；中文、组合标记和ZWJ的实际scalar与UTF8 cluster
+            // 都须保留，不能以缩小容量为由截断字素或跳过真实positions数组。
+            let mut buffer = crate::Buffer::new();
+            let observer = buffer.paging_resource_observer();
+            buffer.push_str(text);
+            assert!(buffer.allocation_successful());
+            assert_eq!(buffer.len(), text.chars().count());
+            // 先核完整长度再逐项zip，末尾scalar或多字节cluster丢失不能靠截短迭代通过。
+            for (actual, (cluster, scalar)) in buffer.glyph_infos().iter().zip(text.char_indices())
+            {
+                assert_eq!(actual.glyph_id, u32::from(scalar));
+                assert_eq!(actual.cluster, cluster as u32);
+            }
+            // 未整形时的公开positions入口仍须交付完整零值数组；给它写入非零推进和
+            // 偏移，才能在下方验证clear后真正重置原字节，而非恰巧读到从未写过的新页。
+            for position in buffer.glyph_positions_mut() {
+                assert_eq!(
+                    [
+                        position.x_advance,
+                        position.y_advance,
+                        position.x_offset,
+                        position.y_offset
+                    ],
+                    [0; 4]
+                );
+                position.x_advance = 123;
+                position.y_offset = -45;
+            }
+            // 记录本次两个真实工作数组的资源，不以规划容量或分配次数冒充实际字节。
+            // 小输入最多用不到两倍其有效Pod载荷；没有任何FD、mmap或跨任务库存。
+            let payload_bytes =
+                buffer.len() * (size_of::<crate::GlyphInfo>() + size_of::<crate::GlyphPosition>());
+            let active = observer.snapshot();
+            assert!(active.work_bytes > 0 && active.work_bytes <= payload_bytes * 2);
+            assert_eq!((active.files_created, active.mappings_created), (0, 0));
+            // clear只结束本内容，允许同一个Buffer保留容量；新输入重新从cluster0开始，
+            // 不把保留的旧字形、推进或偏移当成新内容，也不改为跨Job共享工作块。
+            buffer.clear();
+            buffer.push_str("新");
+            assert!(buffer.allocation_successful());
+            assert_eq!(buffer.len(), 1);
+            assert_eq!(buffer.glyph_infos()[0].glyph_id, u32::from('新'));
+            assert_eq!(buffer.glyph_infos()[0].cluster, 0);
+            let position = &buffer.glyph_positions_mut()[0];
+            assert_eq!(
+                [
+                    position.x_advance,
+                    position.y_advance,
+                    position.x_offset,
+                    position.y_offset
+                ],
+                [0; 4]
+            ); // clear后复用的原字节必须真正归零，不能把上个输入的推进/偏移带入新内容。
+               // 原observer只有资源原子状态，不拥有数组；必须在实际Buffer析构后观察四类
+               // 资源归零，不能用clear成功或输入已经更换来代替真正的dealloc/close完成。
+            drop(buffer);
+            let ended = observer.snapshot();
+            assert_eq!(
+                (
+                    ended.work_bytes,
+                    ended.files_open,
+                    ended.mappings_open,
+                    ended.mapped_bytes
+                ),
+                (0, 0, 0, 0)
+            );
+            assert!(!ended.cleanup_failed && ended.first_error.is_none());
+        }
+    }
+
+    #[test]
     fn workspace_cast_and_spill_keep_original_layout_initialized_tail_and_weak_permissions() {
         // u128保证真实16字节对齐，覆盖GPOS记录的要求；分配不是align1的byte Box。
         let mut values = MappedPodVec::<[u128; 4]>::new();
@@ -1298,9 +1371,12 @@ mod tests {
         assert!(values.prepare_resize(3, [1; 4]));
         values.commit_len(3);
         values[0] = [u128::MAX; 4];
+        let first_work = observer.snapshot().work_bytes;
         assert!(values.prepare_resize(7, [9; 4]));
         let active = observer.snapshot();
-        assert!(active.work_bytes > 0 && active.work_bytes <= BUCKET_BYTES);
+        assert!(active.work_bytes > first_work && active.work_bytes <= BUCKET_BYTES);
+        // 小容量现在确实跨过原块边界；迁移期间新旧两块同时活着，峰值必须完整收费。
+        assert_eq!(active.peak_work_bytes, first_work + active.work_bytes);
         assert_eq!(
             (active.files_open, active.mappings_open, active.mapped_bytes),
             (0, 0, 0)
@@ -1326,7 +1402,7 @@ mod tests {
         }
         let spilled = observer.snapshot();
         assert_eq!(spilled.work_bytes, 0);
-        assert_eq!(spilled.peak_work_bytes, active.work_bytes);
+        assert_eq!(spilled.peak_work_bytes, active.peak_work_bytes);
         assert_eq!((spilled.files_open, spilled.mappings_open), (1, 1));
         assert!(spilled.mapped_bytes > BUCKET_BYTES);
         let proof = values.read_witness(&scope, 0..3).unwrap();
