@@ -140,13 +140,16 @@ impl NativeMarkdownPagedFont {
         mtm: MainThreadMarker,
         current: &(impl Fn() -> bool + ?Sized),
     ) -> Result<NativeMarkdownFontCapture> {
-        // 系统级联可为后继字素返回同一个不可变 CTFont。原 palette 已在首次捕获时
-        // 核过这个对象的 CGFont、完整名称表、轴位、字号和矩阵；对象身份相同便保有
-        // 同一份事实，不必为每个小字素重新创建文件 URL、descriptor 和名称表临时值。
+        // 系统级联可为后继字素返回同一不可变字体值的不同引用。原 palette 首次捕获时
+        // 已核 CGFont、完整名称表、轴位、字号和矩阵；Core Foundation 的字体值相等
+        // 可以复用同一份捕获，不必为每个字素再次创建 URL、descriptor 和临时字体。
+        // 仍只查当前 Body 的有限 palette，不建立跨文稿缓存或按字体名猜测同源。
+        // Apple CFEqual 按各 CF 类型定义相等；Skia 的 CoreText face 复用同样比较 CTFont。
+        // https://skia.googlesource.com/skia/+/e24127ce05ed26a1651235f268cc9a39840f924a/src/ports/SkTypeface_mac_ct.cpp
         // 这里只借原 Body 的有限 palette，仍受原调用票约束，也继续原 GCB 整形试次。
         for registered in palette {
             let captured = registered.native();
-            if step(current, || std::ptr::eq(font, captured.native_font()))? {
+            if step(current, || font == captured.native_font())? {
                 return step(current, || {
                     NativeMarkdownFontCapture::Reused(captured.clone())
                 });
