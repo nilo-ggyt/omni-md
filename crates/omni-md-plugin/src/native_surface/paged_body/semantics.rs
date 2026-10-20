@@ -1106,9 +1106,29 @@ impl RootLeaf {
             return Err(super::ViewError::Revoked.into());
         }
         if self.pending || self.cell_navigation.is_some() {
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            eprintln!(
+                "native_selection_invariant stage=semantic_pending pending={} cell_navigation={} capability=unattempted composer=unattempted reproject=unattempted window={}..{} context={} anchor={} head={}",
+                self.pending,
+                self.cell_navigation.is_some(),
+                self.window.start,
+                self.window.end,
+                self.context,
+                selection.anchor_utf16,
+                selection.head_utf16,
+            ); // 只记录本次选择移交的原有限事实，不推进语义或把Pending冒充能力缺失。
             return Ok(false); // 原请求/格作业尚在途，仍由原重排路径取消并等待真实归还。
         }
         let (Some(parser), Some(previous)) = (self.request.as_mut(), self.ready.as_ref()) else {
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            eprintln!(
+                "native_selection_invariant stage=missing_publication capability=unattempted composer=unattempted reproject=unattempted window={}..{} context={} anchor={} head={}",
+                self.window.start,
+                self.window.end,
+                self.context,
+                selection.anchor_utf16,
+                selection.head_utf16,
+            );
             return Ok(false);
         };
         let document = owner
@@ -1132,14 +1152,41 @@ impl RootLeaf {
             let Some(capability) =
                 parser.selection_style_invariant(&document, previous, authority)?
             else {
+                #[cfg(feature = "native-markdown-runtime-probe")]
+                eprintln!(
+                    "native_selection_invariant stage=capability capability=none composer=unattempted reproject=unattempted window={}..{} context={} anchor={} head={}",
+                    self.window.start,
+                    self.window.end,
+                    self.context,
+                    selection.anchor_utf16,
+                    selection.head_utf16,
+                ); // 工厂确实返回None才记此分支，原Source/权限错误仍由?直接返回。
                 return Ok(false);
             };
             if !composer.can_retain_selection_styles(&capability)? {
+                #[cfg(feature = "native-markdown-runtime-probe")]
+                eprintln!(
+                    "native_selection_invariant stage=composer capability=some composer=false reproject=unattempted window={}..{} context={} anchor={} head={}",
+                    self.window.start,
+                    self.window.end,
+                    self.context,
+                    selection.anchor_utf16,
+                    selection.head_utf16,
+                ); // 原Store/Font/活跃支持域门完全未改；不用显示行数猜拒绝原因。
                 return Ok(false);
             }
         } // 借用先结束，才允许原唯一请求改变选择、退休 publication；没有跨 Native 或挂起保存 cap。
         ticket.require_pure(owner, source)?;
         if !parser.reproject_selection(&document, previous, self.window.clone(), authority)? {
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            eprintln!(
+                "native_selection_invariant stage=reproject capability=some composer=true reproject=false window={}..{} context={} anchor={} head={}",
+                self.window.start,
+                self.window.end,
+                self.context,
+                selection.anchor_utf16,
+                selection.head_utf16,
+            );
             return Ok(false); // Core 资格不满足保证原 owner/发布不变，交原 reset_styles 冷路径。
         }
         self.work = parser.total_work();
@@ -1150,6 +1197,15 @@ impl RootLeaf {
         self.row_repositioned = None;
         // 后继样式必须由新选择正常 advance 生成的新发布提供，不能借旧 Boundary 给新 Input 补票。
         ticket.require_pure(owner, source)?;
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        eprintln!(
+            "native_selection_invariant stage=reproject capability=some composer=true reproject=true window={}..{} context={} anchor={} head={}",
+            self.window.start,
+            self.window.end,
+            self.context,
+            selection.anchor_utf16,
+            selection.head_utf16,
+        ); // 本栈只在实际最终返回点打印一次；不持publication或新增跨回合诊断状态。
         Ok(true)
     }
 

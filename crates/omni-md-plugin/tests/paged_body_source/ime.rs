@@ -14,9 +14,8 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFNumber, CFString, CFType};
 use objc2_core_graphics::{
-    CGEvent, CGEventField, CGEventFlags, CGRectMakeWithDictionaryRepresentation,
-    CGWindowListCreateDescriptionFromArray, kCGWindowAlpha, kCGWindowBounds, kCGWindowIsOnscreen,
-    kCGWindowNumber, kCGWindowOwnerPID,
+    CGRectMakeWithDictionaryRepresentation, CGWindowListCreateDescriptionFromArray, kCGWindowAlpha,
+    kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use objc2_foundation::{
     NSContainsRect, NSNotification, NSNotificationCenter, NSObjectProtocol, NSPointInRect,
@@ -193,8 +192,9 @@ impl FocusNotifications {
             && original_responder
             && original_context;
         // Spaces状态可迟于真实显示通知；以WindowServer的原单窗显示事实配合原输入焦点授权。
-        // 仅在实际焦点已经齐备的这次通知取一份描述，不增加轮询、计时或另一事件循环。
-        let server_onscreen = focused && original_window_is_onscreen(window);
+        // 每次既有通知独立查询原单窗；focused为false不能把“尚未查询”写成WindowServer的false。
+        // 这只补齐真实诊断，最终准入仍同时要求原AppKit焦点、Visible位和实际上屏事实。
+        let server_onscreen = original_window_is_onscreen(window);
         // 记录同一次真实交接缺少的具体权限；主循环退出后的状态不能反推早期通知已就绪。
         println!(
             "system_ime stage=focus_permissions active={active} visible={visible} key={key} on_space={on_space} occlusion={occlusion:?} original_responder={original_responder} original_context={original_context} window_server_onscreen={server_onscreen} system_frontmost_is_original={system_frontmost_is_original}",
@@ -357,7 +357,7 @@ struct SoftwareInput {
     waiting: Cell<Option<(usize, u64)>>,
     // 最后一个字母只等待该完整Input的真实CPU；面板结果仅保纯身份/几何，不保活系统窗口。
     panel_input: Cell<Option<NativeMarkdownPagedInputState>>,
-    // 最后一个字母的原帧从首次观察一直守到Space真正post；Missing不能换新帧补权。
+    // 最后一个字母的原帧从首次观察一直守到Space真正交付；Missing不能换新帧补权。
     // key只有Source/Scene弱身份，不保正文；Space取走本槽后，Host通知不能再查旧组合。
     panel_frame: RefCell<Option<(NativeMarkdownPagedSceneKey, usize)>>,
     // firstRect/系统查询可同步发Host通知；只阻止本次Native栈的递归查询，不代表面板完成。
@@ -422,39 +422,48 @@ impl SoftwareInput {
             return;
         }
         let index = self.next.get();
-        let keys = [0x06, 0x04, 0x1f, 0x2d, 0x05, 0x0d, 0x0e, 0x2d, 0x31];
-        assert!(index < keys.len());
+        let presses: [(u16, &str); 9] = [
+            (0x06, "z"),
+            (0x04, "h"),
+            (0x1f, "o"),
+            (0x2d, "n"),
+            (0x05, "g"),
+            (0x0d, "w"),
+            (0x0e, "e"),
+            (0x2d, "n"),
+            (0x31, " "),
+        ];
+        assert!(index < presses.len());
         assert!(self.pending.borrow().is_none() && self.waiting.get().is_none());
-        // AppKit的keyEventWithType构造不保证走IME；由公开CG键盘事件形成真正backing，
-        // 再桥接NSEvent。只给原虚拟键码，不设置Unicode文字、私有window字段或输入源。
-        // 事件仍只post到本进程NSApp；这里绝不CGEventPost、PostToPid或模拟物理键盘。
+        // 固定ASCII按键只构造AppKit事件，原windowNumber负责本进程窗口路由。
+        // 不创建/投递Quartz事件，也不需要或申请全局事件权限；实际IME是否解释按键，
+        // 仍只能由原客户收到的marked、中文提交及真实面板收据证明，不能由构造成功代签。
+        let (keycode, characters) = presses[index];
+        let characters = NSString::from_str(characters);
         let created = (|| -> Result<[Retained<NSEvent>; 2], &'static str> {
             let create = |key_down: bool| -> Result<Retained<NSEvent>, &'static str> {
-                let event = CGEvent::new_keyboard_event(None, keys[index], key_down)
-                    .ok_or("系统拒绝创建本次Quartz软件键盘事件")?;
-                CGEvent::set_flags(Some(&event), CGEventFlags::empty());
-                CGEvent::set_integer_value_field(
-                    Some(&event),
-                    CGEventField::KeyboardEventAutorepeat,
-                    0,
-                );
-                // 分别保留两个事件的真实创建时刻；CG以纳秒计，不人为制造按压时长或等待。
-                let uptime = NSProcessInfo::processInfo().systemUptime();
-                CGEvent::set_timestamp(Some(&event), (uptime * 1_000_000_000.0) as u64);
-                let event = NSEvent::eventWithCGEvent(&event)
-                    .ok_or("系统拒绝桥接本次Quartz软件键盘事件")?;
-                if event.CGEvent().is_none() {
-                    return Err("本次软件键盘事件没有真实CGEvent backing");
-                }
+                let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+                    if key_down { NSEventType::KeyDown } else { NSEventType::KeyUp },
+                    NSPoint::ZERO,
+                    NSEventModifierFlags::empty(),
+                    NSProcessInfo::processInfo().systemUptime(),
+                    self.window,
+                    None,
+                    &characters,
+                    &characters,
+                    false,
+                    keycode,
+                )
+                .ok_or("系统拒绝创建本次AppKit软件键盘事件")?;
                 println!(
-                    "system_ime stage=software_key_prepared index={index} key_down={key_down} event_window_number={} cg_backed=true timestamp_seconds={} software_events=true physical_keyboard=false",
+                    "system_ime stage=software_key_prepared index={index} key_down={key_down} event_window_number={} timestamp_seconds={} transport=nsapplication_send_event software_events=true physical_keyboard=false",
                     event.windowNumber(),
                     event.timestamp(),
                 );
-                Ok(event) // NSEvent保留其真实CGEvent；局部CF owner随本同步构造栈归还。
+                Ok(event)
             };
             // 一个keycode的按下与释放必须全部创建成功才交pending；up失败时down也归还，
-            // 不能先post半个press，再用后继构造或重试补其释放。
+            // 不能先交付半个press，再用后继构造或重试补其释放。
             let down = create(true)?;
             let up = create(false)?;
             Ok([down, up])
@@ -477,7 +486,8 @@ impl SoftwareInput {
             self.weak.clone(),
             self.application.mtm(),
         ));
-        // 标准run负责真实事件；一次性续体只取本地槽，晚到时弱票/停止状态不能复活输入会话。
+        // 退原marked/CPU回调栈后只交付这个press；此时没有Surface租约、文稿或本地槽借用。
+        // 一次性续体只取本地槽，晚到时弱票/停止状态不能复活输入会话，也不自行重放事件。
         dispatch2::DispatchQueue::main().exec_async(move || {
             autoreleasepool(|_| {
                 let mtm = MainThreadMarker::new().unwrap();
@@ -490,13 +500,13 @@ impl SoftwareInput {
         });
     }
 
-    /// 原loop栈顶取走一个完整press，核原客户后按down/up顺序入队；不把posted写成delivered。
+    /// 原loop栈顶取走一个完整press，核原客户后经NSApp同步路由；不把send返回当IME已消费。
     fn dispatch_pending(&self, view: &NativeMarkdownPagedTextView) -> bool {
         let Some((index, [down, up])) = self.pending.borrow_mut().take() else {
             return false;
         }; // 槽借用先结束，系统分发后的真实marked回调可安全准备后继槽。
         if self.stopped.get() || self.failed.get().is_some() {
-            return true; // 已撤权的本地key直接归还，不进入系统队列或发送给后继客户。
+            return true; // 已撤权的本地key直接归还，不发送给后继客户。
         }
         // Space只接收最后一个字母已实际发布的原CPU票，不以面板可见性作为确认前置。
         // 先把弱帧移到本同步栈再做Native查询；否则pending.take后的重入通知会再次看到
@@ -506,16 +516,41 @@ impl SoftwareInput {
         } else {
             None
         };
+        // 该press绑定原文稿此刻的完整Input；后续Native焦点查询不能替旧按键重采新选择。
+        // 请求只持弱文稿身份，所有读取在sendEvent前退栈，不跨系统回调借文稿或Body。
+        let original_input = match view.capture_scene_request() {
+            Ok(request) if std::rc::Weak::ptr_eq(&request.document, &self.document) => {
+                request.input
+            }
+            _ => {
+                if self.failed.get().is_none() {
+                    self.failed.set(Some("原软件key文稿身份或完整Input已失效"));
+                }
+                stop(&self.application);
+                return true;
+            }
+        };
         let admitted = || {
             let current = NSTextInputContext::currentInputContext(self.application.mtm());
             let client = self.context.client();
             let Some(original_window) = self.window_owner.load() else {
                 return false;
             };
+            // 实际上屏单独查询；既不拿失败的焦点布尔代写WS结果，也不放松Visible位。
+            // 此有限查询不读图像、正文或别的窗口，不能为本地同步路由省掉原显示门。
+            let server_onscreen = original_window_is_onscreen(&original_window);
             std::ptr::eq(
                 Retained::as_ptr(&client).cast::<AnyObject>(),
                 std::ptr::from_ref(view).cast::<AnyObject>(),
             ) && self.application.isActive()
+                && original_window.isVisible()
+                && original_window
+                    .occlusionState()
+                    .contains(NSWindowOcclusionState::Visible)
+                && server_onscreen
+                && view
+                    .window()
+                    .is_some_and(|actual| std::ptr::eq(&*actual, &*original_window))
                 && self.application.keyWindow().is_some_and(|window| {
                     std::ptr::eq(&*window, &*original_window)
                         && window.windowNumber() == self.window
@@ -528,6 +563,14 @@ impl SoftwareInput {
                         })
                 })
                 && current.is_some_and(|current| std::ptr::eq(&*current, &*self.context))
+                && self.body.upgrade().is_some_and(|body| {
+                    body.view().is_ok_and(|owner| {
+                        std::ptr::eq::<NativeMarkdownPagedTextView>(&**owner, view)
+                    })
+                })
+                && view
+                    .capture_scene_request()
+                    .is_ok_and(|request| std::rc::Weak::ptr_eq(&request.document, &self.document))
         };
         if !admitted() {
             if self.failed.get().is_none() {
@@ -548,20 +591,20 @@ impl SoftwareInput {
             stop(&self.application);
             return true;
         }
-        // CG桥接事件的windowNumber可为0，系统将按真正keyWindow分发；Native查询后
-        // 再核原窗口对象/context/输入源，不能把本事件改投到刚切换的客户或别的窗口。
+        // 事件显式携带原windowNumber；Native查询后仍核原窗口对象/context/输入源，
+        // 号码相同或NSApp.sendEvent可调用，都不能把本事件改投给后继客户。
         if !admitted()
             || self.context.selectedKeyboardInputSource().as_deref() != Some(&*self.initial_source)
         {
             if self.failed.get().is_none() {
                 self.failed
-                    .set(Some("软件key入队前原窗口或输入context已撤销"));
+                    .set(Some("软件key交付前原窗口或输入context已撤销"));
             }
             stop(&self.application);
             return true;
         }
         if index == 8 {
-            // 面板观察后还有一次真实主队列间隔；投递前不能给新输入或新几何重新捕generation。
+            // 面板观察后还有一次真实主队列间隔；交付前不能给新输入或新几何重新捕generation。
             // 原窗口的Native查询结束后最后核同Input/Scene/CPU，撤权只终止而不重试Space。
             if composition_frame
                 .as_ref()
@@ -575,22 +618,54 @@ impl SoftwareInput {
                 return true;
             }
         }
-        let generation = view.input_state().unwrap().generation;
+        if !view
+            .input_state()
+            .is_ok_and(|input| input == original_input)
+        {
+            if self.failed.get().is_none() {
+                self.failed
+                    .set(Some("软件key焦点查询期间原完整Input已变化"));
+            }
+            stop(&self.application);
+            return true;
+        }
+        let generation = original_input.generation;
         self.waiting.set(Some((index, generation)));
         self.next.set(index + 1);
-        // waiting先于入队安装且按press推进一次；系统后继marked仍决定下一press，
-        // 不因up创建/入队就推进输入，也不把释放误当中文提交或面板显示完成。
-        // currentEvent属于真正从队列取出的事件，不能用直接sendEvent假装它已经经过run。
-        // CG桥接事件未必带windowNumber；只在原keyWindow/context仍属本客户时post，
-        // 原run再沿NSApplication→原keyWindow/responder→输入context解释，
-        // 不直接调用文本协议，也不在系统未产生marked时重试、切模式或替换输入源。
-        // 同一主线程同步栈内相邻post，期间不插入getter、回调或等待。两事件都入原队尾，
-        // 后继marked才能准备下一press，因此其down入队时这次up已经在前。
-        // 仅记录实际posted；末SpaceDown提交即stop时，其up仍可能尚未由run取走。
-        self.application.postEvent_atStart(&down, false);
-        self.application.postEvent_atStart(&up, false);
+        // waiting先于同步send登记；原PagedView.keyDown仍经真实context.handleEvent解释，
+        // 这里只选择本进程AppKit分发入口，不直接调用setMarkedText或插入目标中文。
+        // down可同步产生marked/commit并准备下一press，但prepare_next只排退栈续体，
+        // 因而当前down返回并完成up核验前，不会在同一Native栈递归交付下一字母。
+        self.application.sendEvent(&down);
+        // 真实preedit允许改变generation/selection，不能要求down前的Input仍相等；
+        // up只继续核原Doc/Body/View/窗口/context及原输入源，不向已撤权的客户补送释放。
+        // 正常Space可在down里stop原run，此时driver尚未清理，仍给同原客户一次真实up。
+        if self.stopped.get()
+            || self.failed.get().is_some()
+            || !admitted()
+            || self.context.selectedKeyboardInputSource().as_deref() != Some(&*self.initial_source)
+        {
+            if self.failed.get().is_none() {
+                self.failed
+                    .set(Some("软件key按下后原客户或输入源已撤销，不能交付释放"));
+            }
+            stop(&self.application);
+            return true;
+        }
+        self.application.sendEvent(&up);
+        // sendEvent返回只证明本地同步路由已执行；marked/中文/面板仍由各自真实终点核验。
+        // 末端失权保首错，不能以本press已发出为理由把后继客户当原会话继续验收。
+        if !admitted()
+            || self.context.selectedKeyboardInputSource().as_deref() != Some(&*self.initial_source)
+        {
+            if self.failed.get().is_none() {
+                self.failed.set(Some("软件key释放后原客户或输入源已撤销"));
+            }
+            stop(&self.application);
+            return true;
+        }
         println!(
-            "system_ime stage=software_key_posted index={index} posted_events_for_press=2 before_generation={generation} original_input_source=true software_events=true physical_keyboard=false"
+            "system_ime stage=software_key_dispatched index={index} send_event_returns_for_press=2 before_generation={generation} original_input_source=true transport=nsapplication_send_event software_events=true physical_keyboard=false"
         );
         true
     }
@@ -714,7 +789,7 @@ impl SoftwareInput {
             && pure()
     }
 
-    /// 仅原组合仍待确认时接受真实Host更新；Space的准备、入队和后继换代均不再查旧帧。
+    /// 仅原组合仍待确认时接受真实Host更新；Space的准备、交付和后继换代均不再查旧帧。
     fn host_updated(&self) {
         if self.stopped.get()
             || self.failed.get().is_some()
@@ -835,7 +910,7 @@ impl SoftwareInput {
                     "system_ime stage=composition_confirmation_admitted panel_observed={} original_input_cpu=true panel_not_a_precondition=true final_panel_gate_preserved=true deadline_unchanged=true software_events=true physical_keyboard=false",
                     observation.is_some(),
                 );
-                // 创建CG事件也可能同步通知；原递归保护要守到pending真实安装，不能在
+                // 创建AppKit事件也可能同步通知；原递归保护要守到pending真实安装，不能在
                 // Missing分支提前放开而让同一Host更新再次创建Space。它不跨异步队列。
                 self.prepare_next();
             }
@@ -861,7 +936,7 @@ impl SoftwareInput {
                 // stop会让后面的真实marked被首错门挡掉。保留原waiting，不发送下一字母；
                 // 若原事件始终没有marked，仍由既有30秒期限失败，不续期或另排检查任务。
                 println!(
-                    "system_ime stage=intermediate_unmarked index={index} generation={} utf16_len={} marked={:?} waiting_preserved=true next_press_posted=false deadline_unchanged=true software_events=true physical_keyboard=false",
+                    "system_ime stage=intermediate_unmarked index={index} generation={} utf16_len={} marked={:?} waiting_preserved=true next_press_dispatched=false deadline_unchanged=true software_events=true physical_keyboard=false",
                     commit.state.generation, commit.state.utf16_len, commit.state.marked,
                 );
                 return;
@@ -881,7 +956,7 @@ impl SoftwareInput {
         let panel_frame = self.panel_frame.borrow_mut().take();
         drop(panel_frame); // 原弱Scene票也随本次输入结束，不留给后来客户或后继Space。
         let pending = self.pending.borrow_mut().take();
-        // 本地槽只含尚未post的key，归还它不会撤销已入系统队列的事件；这里不丢弃用户事件。
+        // 本地槽只含尚未交付的key，归还它不会撤销已经同步分发的事件；这里不丢弃用户事件。
         // stopped先撤后继投递权，原窗口/context的真实关闭继续由本用例既有资源收尾负责。
         drop(pending);
         let source_unchanged =
@@ -1343,18 +1418,19 @@ pub(super) fn run(
         .as_ref()
         .map(|driver| driver.panel_observation.get().is_some());
     if let Some(driver) = &software {
-        let presses_posted = driver.next.get();
-        let events_posted = presses_posted * 2; // 原固定九个press，每次只在同一同步栈投递一对。
+        // next在down之前登记以接同步marked，故只表示已开始的press，不能推算实际交付次数。
+        // 每对sendEvent均正常返回才有software_key_dispatched；中途失权由原首错阻止成功。
+        let presses_started = driver.next.get();
         let cleaned = driver.cleanup();
         let original_failure = driver.failed.get(); // 清理发现源身份变化也须保留为本次真实失败。
         if failure.is_none()
             && !(completed_before_cleanup
                 && original_failure.is_none()
-                && presses_posted == 9
+                && presses_started == 9
                 && cleaned)
         {
             failure = Some(format!(
-                "当前IME软件事件序列失败：completed={completed_before_cleanup} original_failure={original_failure:?} presses_posted={presses_posted} events_posted={events_posted} panel_observed={panel_observed:?} local_input_cleaned={cleaned}",
+                "当前IME软件事件序列失败：completed={completed_before_cleanup} original_failure={original_failure:?} presses_started={presses_started} panel_observed={panel_observed:?} local_input_cleaned={cleaned}",
             ));
         }
     }

@@ -1907,6 +1907,31 @@ impl Producer {
             return self.publish(owner, request, ticket);
         }
         if self.complete {
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            {
+                // EOF 仍缺目标前缀与行提交失配是不同失败；只读取当前槽内已保存的范围，
+                // 不为诊断查询 Source 或领取 Reader，也不把 complete 改签成可见证明。
+                let source_target = owner.source_target.borrow();
+                let source_target = source_target.as_ref();
+                eprintln!(
+                    "native_body_unsupported phase=complete_needs_prefix serial={} prepared_lines={} height={} source_utf16={} output_range={:?} visual={:?} target={:?} vertical={:?} page_scroll={} cell_word={} target_pending={} target_range={:?} target_first_end={:?}",
+                    self.serial,
+                    self.lines,
+                    self.height,
+                    self.source.utf16_len(),
+                    self.output
+                        .as_ref()
+                        .map(|output| output.borrow().source_range()),
+                    std::mem::discriminant(&visual),
+                    std::mem::discriminant(&target),
+                    std::mem::discriminant(&vertical),
+                    page_scroll.is_some(),
+                    self.cell_word.is_some(),
+                    source_target.is_some_and(|target| target.pending()),
+                    source_target.map(|target| target.range),
+                    source_target.map(|target| target.first_end),
+                );
+            }
             return Err(Error::Unsupported);
         }
         let quantum = MarkdownLineComposeBudget {
@@ -2905,6 +2930,18 @@ impl Producer {
                 || grid.source_range() != facts.source_utf16
                 || (grid.height() * 64.0).round() as i64 != facts.y_advance_26_6
             {
+                #[cfg(feature = "native-markdown-runtime-probe")]
+                eprintln!(
+                    "native_body_unsupported phase=table_line_identity serial={} submitted={} row_range={:?} line_range={:?} row_height_26_6={} line_height_26_6={} expected_line={} actual_line={}",
+                    self.serial,
+                    grid.submitted,
+                    grid.source_range(),
+                    facts.source_utf16,
+                    (grid.height() * 64.0).round() as i64,
+                    facts.y_advance_26_6,
+                    self.lines,
+                    facts.ordinal,
+                ); // 只比较刚归还的真实 Grid 与 LineEnd；不读原文或借别行几何掩盖不一致。
                 return Err(Error::Unsupported);
             }
             self.grids.push_back(grid); // 下一原回合按真实视口退休；旧行几何已封存在原输出目录中。
