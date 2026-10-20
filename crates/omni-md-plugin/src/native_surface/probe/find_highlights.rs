@@ -54,6 +54,15 @@ pub(super) struct PixelSample {
     pub(super) color_diagnostic: String,
 }
 
+/// 同一View原生对齐返回的有限几何纯值；不拥有bitmap、Scene、Source或Native对象。
+/// 候选与实际采样必须消费这同一套完整像素边界，点坐标ROI可见并不等于向外对齐后仍可见。
+struct PixelSampleArea {
+    proposed: NSRect,
+    rect: NSRect,
+    backing: NSRect,
+    glyph_backing: NSRect,
+}
+
 impl NativeMarkdownMemoryWorkload {
     /// 每次取走原观察状态再进入Native；无RefMut跨字段输入、绘制、滚动或模式回调。
     pub(crate) fn exercise_find_highlights(&self, stage: i16) -> Result<(), String> {
@@ -550,10 +559,11 @@ impl FindHighlightsProbe {
         for source in &self.chinese {
             // 只读已声明的有限源位置；不ensure离屏段落或把未知结构默认成普通正文。
             let frame = PixelSample::source_frame(view, &paged.body, source, &current)?;
-            if let Some(frame) = frame
-                && sample_rect(frame, visible).is_some()
-            {
-                return Ok(source.clone());
+            if let Some(frame) = frame {
+                let area = PixelSampleArea::measure(view, frame, visible, &current)?;
+                if area.fits(frame, visible) {
+                    return Ok(source.clone());
+                }
             }
             if !current() {
                 return Err("中文glyph定位期间原票已撤销".into());
@@ -629,7 +639,11 @@ impl FindHighlightsProbe {
                 .map_err(|cause| cause.to_string())?;
             if let Some(frame) = frame {
                 last_frame = Some(frame);
-                if sample_rect(frame, visible).is_some() {
+                let area = PixelSampleArea::measure(view, frame, visible, &current)?;
+                scene
+                    .validate_ready(&current)
+                    .map_err(|cause| cause.to_string())?;
+                if area.fits(frame, visible) {
                     return Ok(source);
                 }
             }
@@ -788,56 +802,19 @@ impl PixelSample {
         let frame = Self::source_frame(view, body, &source, current)?
             .ok_or("有限像素目标没有当前完整同软行字形")?;
         let visible = step(current, || view.visibleRect())?;
-        let proposed = sample_rect(frame, visible).ok_or("实际字形和对照条不在有限可见区域")?;
-        // 缓存区域必须先由同一个真实 View 对齐完整 backing 像素。此前把小数 ROI 的宽度
-        // 平摊到整数 bitmap，会把 emoji 左缘的部分覆盖像素误签成相邻未命中点：其中心
-        // 虽在字框外，原像素仍与字框相交。这里保留原左右各 8pt 对照，再向外像素对齐，
-        // 不挪字形、不改颜色阈值，也不让 AppKit 隐含取整决定我们未记录的采样原点。
-        let rect = step(current, || {
-            view.backingAlignedRect_options(proposed, NSAlignmentOptions::AlignAllEdgesOutward)
-        })?;
-        let backing = step(current, || view.convertRectToBacking(rect))?;
-        let glyph_backing = step(current, || view.convertRectToBacking(frame))?;
-        // 向外对齐最多补足边缘像素，但仍须支付原 ROI/可见区上限，不能借对齐扩大观察预算。
-        // backing 原点和边长必须确为整数；后续每个 getPixel 才对应一个完整单位像素，
-        // 而不是按显示器倍率或 bitmap 与小数 rect 的宽度比推测坐标。
-        if ![
-            rect.origin.x,
-            rect.origin.y,
-            rect.size.width,
-            rect.size.height,
-            backing.origin.x,
-            backing.origin.y,
-            backing.size.width,
-            backing.size.height,
-            glyph_backing.origin.x,
-            glyph_backing.origin.y,
-            glyph_backing.size.width,
-            glyph_backing.size.height,
-        ]
-        .into_iter()
-        .all(f64::is_finite)
-            || rect.size.width <= 0.0
-            || rect.size.height <= 0.0
-            || rect.size.width > 64.0
-            || rect.size.height > 32.0
-            || rect.origin.x < visible.origin.x
-            || rect.origin.y < visible.origin.y
-            || rect.origin.x + rect.size.width > visible.origin.x + visible.size.width
-            || rect.origin.y + rect.size.height > visible.origin.y + visible.size.height
-            || backing.size.width <= 0.0
-            || backing.size.height <= 0.0
-            || [
-                backing.origin.x,
-                backing.origin.y,
-                backing.size.width,
-                backing.size.height,
-            ]
-            .into_iter()
-            .any(|value| value.fract() != 0.0)
-        {
-            return Err("像素对齐后的原字形采样区不在有限可见 backing 范围".into());
+        let area = PixelSampleArea::measure(view, frame, visible, current)?;
+        if !area.fits(frame, visible) {
+            return Err(format!(
+                "像素对齐后的原字形采样区不在有限可见 backing 范围：source={source:?} frame={frame:?} proposed={:?} rect={:?} backing={:?} glyph_backing={:?} visible={visible:?}",
+                area.proposed, area.rect, area.backing, area.glyph_backing,
+            ));
         }
+        let PixelSampleArea {
+            rect,
+            backing,
+            glyph_backing,
+            ..
+        } = area;
         let sample = autoreleasepool(|_| {
             let bitmap = step(current, || view.bitmapImageRepForCachingDisplayInRect(rect))?
                 .ok_or("AppKit 未创建原视图有限 bitmap")?;
@@ -1230,6 +1207,91 @@ impl PixelSample {
             actual.width,
             actual.height,
         ))
+    }
+}
+
+impl PixelSampleArea {
+    /// 只测量原View的完整backing边界；不创建图像，也不把对齐后的部分像素裁小来迁就clip。
+    /// 坐标/整数像素合同错误必须返回首因，不能被候选搜索吞成“换一个中文就能通过”。
+    fn measure(
+        view: &NativeMarkdownPagedTextView,
+        frame: NSRect,
+        visible: NSRect,
+        current: &impl Fn() -> bool,
+    ) -> Result<Self, String> {
+        let proposed = NSRect::new(
+            NSPoint::new(frame.origin.x - 8.0, frame.origin.y),
+            NSSize::new(frame.size.width + 16.0, frame.size.height),
+        );
+        if ![frame, proposed, visible]
+            .into_iter()
+            .flat_map(|rect| {
+                [
+                    rect.origin.x,
+                    rect.origin.y,
+                    rect.size.width,
+                    rect.size.height,
+                ]
+            })
+            .all(f64::is_finite)
+        {
+            return Err(format!(
+                "原字形采样坐标不是有限值：frame={frame:?} proposed={proposed:?} visible={visible:?} rect=None backing=None glyph_backing=None"
+            ));
+        }
+        // 缓存区域必须先由同一个真实View向外对齐完整像素。小数ROI不能线性平摊到整数
+        // bitmap，否则字框外的像素中心仍可能有部分字形覆盖。左右各8pt对照与原框都不移动。
+        let rect = step(current, || {
+            view.backingAlignedRect_options(proposed, NSAlignmentOptions::AlignAllEdgesOutward)
+        })?;
+        let backing = step(current, || view.convertRectToBacking(rect))?;
+        let glyph_backing = step(current, || view.convertRectToBacking(frame))?;
+        if ![rect, backing, glyph_backing]
+            .into_iter()
+            .flat_map(|rect| {
+                [
+                    rect.origin.x,
+                    rect.origin.y,
+                    rect.size.width,
+                    rect.size.height,
+                ]
+            })
+            .all(f64::is_finite)
+            || rect.size.width <= 0.0
+            || rect.size.height <= 0.0
+            || backing.size.width <= 0.0
+            || backing.size.height <= 0.0
+            || [
+                backing.origin.x,
+                backing.origin.y,
+                backing.size.width,
+                backing.size.height,
+            ]
+            .into_iter()
+            .any(|value| value.fract() != 0.0)
+        {
+            return Err(format!(
+                "原字形采样没有完整整数backing像素：frame={frame:?} proposed={proposed:?} rect={rect:?} backing={backing:?} glyph_backing={glyph_backing:?} visible={visible:?}"
+            ));
+        }
+        Ok(Self {
+            proposed,
+            rect,
+            backing,
+            glyph_backing,
+        })
+    }
+
+    /// 点坐标字形和对照、向外对齐后的整像素区域，都必须满足同一个原可见区与64×32上限。
+    /// 这只决定候选能否取样；真正bitmap尺寸/格式和128点颜色仍由capture原严格门验证。
+    fn fits(&self, frame: NSRect, visible: NSRect) -> bool {
+        sample_rect(frame, visible).is_some()
+            && self.rect.size.width <= 64.0
+            && self.rect.size.height <= 32.0
+            && self.rect.origin.x >= visible.origin.x
+            && self.rect.origin.y >= visible.origin.y
+            && self.rect.origin.x + self.rect.size.width <= visible.origin.x + visible.size.width
+            && self.rect.origin.y + self.rect.size.height <= visible.origin.y + visible.size.height
     }
 }
 
