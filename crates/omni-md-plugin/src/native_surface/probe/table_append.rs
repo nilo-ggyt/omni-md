@@ -214,8 +214,34 @@ struct FindReplacementQueuedButton {
     paint: Rc<FindButtonPaint>,
 }
 
+/// 原实际构造事件的完整公开值身份；AppKit可复制事件，allocation地址不是其交付合同。
+/// eventNumber由鼠标入口单调分配，其余字段从构造后的原NSEvent读取，不能从后继状态补采。
+#[derive(Clone, Copy, PartialEq)]
+struct FindButtonDownIdentity {
+    kind: objc2_app_kit::NSEventType,
+    number: isize,
+    timestamp: f64,
+    window: isize,
+    location: NSPoint,
+    modifiers: objc2_app_kit::NSEventModifierFlags,
+}
+
+impl FindButtonDownIdentity {
+    /// 只读本次仍存活的不可变鼠标元数据，不取得Window、Context、Doc或Source对象。
+    fn capture(event: &objc2_app_kit::NSEvent) -> Self {
+        Self {
+            kind: event.r#type(),
+            number: event.eventNumber(),
+            timestamp: event.timestamp(),
+            window: event.windowNumber(),
+            location: event.locationInWindow(),
+            modifiers: event.modifierFlags(),
+        }
+    }
+}
+
 /// 四次具体 Find 鼠标动作的完成收据；kind 和点击前后唯一 intent 标识原动作，
-/// 不冒充生产 FindRevealRequest。跨事件仅保弱拥有者及原输入标量，不延长 Native/Source 生命周期。
+/// 不冒充生产 FindRevealRequest。业务拥有者保持弱边，仅原有限Down活到真实派发返回。
 struct FindButtonPaint {
     weak: std::rc::Weak<Self>,
     controller: Weak<NativeMarkdownController>,
@@ -232,8 +258,8 @@ struct FindButtonPaint {
     selection: MarkdownTextSelection,
     utf16_len: usize,
     started: Instant,
-    down: Weak<objc2_app_kit::NSEvent>,
-    window_number: isize,
+    down: RefCell<Option<Retained<objc2_app_kit::NSEvent>>>,
+    down_identity: FindButtonDownIdentity,
     dispatched: Cell<bool>,
     action_returned: Cell<bool>,
     // 临时定位只限本场景首个 Next 的三个实际边界；早帧/外来 Down 不重复刷日志。
@@ -958,34 +984,39 @@ impl NativeMarkdownHostedTableProbe {
         let Some(paint) = paint else {
             return Ok(()); // 其它表格/工具栏事件没有这个具体 Find 动作的后继权限。
         };
-        let down = paint.down.load();
+        let identity = FindButtonDownIdentity::capture(event);
         #[cfg(feature = "native-close-stage-diagnostic")]
         if paint.action == MarkdownFindAction::Next && !paint.dispatch_diagnosed.replace(true) {
+            let down = paint.down.borrow();
             eprintln!(
-                "native_find_button_terminal phase=dispatch kind={} weak_alive={} ptr_same={} window_same={} before_intent={} after_intent={} dispatched={}",
+                "native_find_button_terminal phase=dispatch kind={} event_lease={} ptr_same={} value_same={} number_same={} timestamp_same={} window_same={} location_same={} modifiers_same={} before_intent={} after_intent={} dispatched={}",
                 paint.action as isize,
                 down.is_some(),
                 down.as_ref()
                     .is_some_and(|down| std::ptr::eq(&**down, event)),
-                event.windowNumber() == paint.window_number,
+                identity == paint.down_identity,
+                identity.number == paint.down_identity.number,
+                identity.timestamp == paint.down_identity.timestamp,
+                identity.window == paint.down_identity.window,
+                identity.location == paint.down_identity.location,
+                identity.modifiers == paint.down_identity.modifiers,
                 paint.before_intent,
                 paint.after_intent,
                 paint.dispatched.get(),
-            ); // 必须在中性忽略之前记录原弱票事实，才能区分释放/事件副本与回调未到达。
+            ); // allocation只作诊断，真正接纳由整组精确公开值决定；没有裸地址或正文。
         }
-        let Some(down) = down else {
-            return Ok(());
-        };
-        if !std::ptr::eq(&*down, event) {
+        if identity != paint.down_identity {
             return Ok(());
         }
-        if event.windowNumber() != paint.window_number {
-            return Err("原 Find Down 返回了不同窗口".into());
-        }
-        drop(down); // 精确事件只作弱身份比较，不跨主队列保活 Native event 或窗口。
         if paint.dispatched.replace(true) {
             return Err("原 Find Down 不能重复交付".into());
         }
+        let down = paint
+            .down
+            .borrow_mut()
+            .take()
+            .ok_or("原 Find Down 的有限事件租约已丢失")?;
+        drop(down); // 原派发已返回；先退槽再释放唯一事件租约，不跨FIFO观察保留Native事件。
         let weak = dispatch2::MainThreadBound::new(Rc::downgrade(&paint), mtm);
         enqueue_native_markdown_main_task(move || {
             let mtm = MainThreadMarker::new().expect("Find action 终点只在原主队列观察");
@@ -2165,8 +2196,8 @@ impl NativeMarkdownHostedTableProbe {
                 return Err("原查找按钮会夺取字段组合焦点".into());
             }
             let events = button_mouse::prepare(button, &surface.panel, &current)?;
-            let down = step(&current, || Weak::from_retained(&events[0]))?;
-            let window_number = step(&current, || events[0].windowNumber())?;
+            let down_identity = step(&current, || FindButtonDownIdentity::capture(&events[0]))?;
+            let down = events[0].clone(); // 只租原有限鼠标Down，不持正文/输入context，匹配返回即释放。
             let view = step(&current, || {
                 Weak::from_retained(&surface.editor.as_ref().unwrap().text_view)
             })?;
@@ -2187,8 +2218,8 @@ impl NativeMarkdownHostedTableProbe {
                 selection,
                 utf16_len,
                 started,
-                down,
-                window_number,
+                down: RefCell::new(Some(down)),
+                down_identity,
                 dispatched: Cell::new(false),
                 action_returned: Cell::new(false),
                 #[cfg(feature = "native-close-stage-diagnostic")]

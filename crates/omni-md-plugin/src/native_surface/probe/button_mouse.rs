@@ -3,6 +3,11 @@
 use super::*;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType, NSWindow};
 
+thread_local! {
+    /// 只为本主线程构造的实际鼠标对编号；不保存事件或客户，耗尽时拒绝而不回绕复用。
+    static EVENT_NUMBER: Cell<isize> = const { Cell::new(0) };
+}
+
 /// 只为已经可见的原按钮准备窗口坐标。调用方持自己的Doc/Input/意图守卫，
 /// 本函数不显露控件、移动焦点或直接调用action，也不替原用例采集新的输入前态。
 pub(super) fn prepare(
@@ -10,6 +15,7 @@ pub(super) fn prepare(
     window: &NSWindow,
     current: &impl Fn() -> bool,
 ) -> Result<[Retained<NSEvent>; 2], String> {
+    MainThreadMarker::new().ok_or("原按钮鼠标事件必须在 AppKit 主线程构造")?;
     if !step(current, || button.isEnabled())?
         || step(current, || button.isHiddenOrHasHiddenAncestor())?
         || !step(current, || button.window())?.is_some_and(|actual| std::ptr::eq(&*actual, window))
@@ -42,15 +48,27 @@ pub(super) fn prepare(
         return Err("原鼠标按钮的文稿或完整Input已变化".into());
     }
     let number = step(current, || window.windowNumber())?;
+    let event_number = EVENT_NUMBER.with(|number| {
+        let next = number.get().checked_add(1).ok_or("原鼠标事件编号已耗尽")?;
+        number.set(next);
+        Ok::<_, String>(next)
+    })?;
+    let timestamp = step(current, || {
+        objc2_foundation::NSProcessInfo::processInfo().systemUptime()
+    })?;
+    if !timestamp.is_finite() || timestamp < 0.0 {
+        return Err("原鼠标事件没有有效系统运行时间".into());
+    }
     let event = |kind, pressure| {
         step(current, || {
             NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-                kind, point, NSEventModifierFlags::empty(), 1.0, number, None, 1, 1, pressure,
+                kind, point, NSEventModifierFlags::empty(), timestamp, number, None, event_number, 1, pressure,
             )
         })?
         .ok_or("无法创建原窗口鼠标事件".to_owned())
     };
-    // 一对事件使用同一eventNumber和窗口；必须都已构造成功，才能让Down进入真实tracking。
+    // 同一对事件使用唯一编号及同次真实系统时间，Down/Up均成功后才进入tracking。
+    // 公开值身份允许后继识别AppKit事件副本，不再用固定1.0/1把不同按钮动作混在一起。
     let down = event(NSEventType::LeftMouseDown, 1.0)?;
     let up = event(NSEventType::LeftMouseUp, 0.0)?;
     Ok([down, up])
