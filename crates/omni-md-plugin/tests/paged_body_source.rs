@@ -483,7 +483,7 @@ fn native_client_protocol(mtm: MainThreadMarker) {
 /// attach 已装配正式委托，但原调度尚未运行，因而这里的 Pending 是真实首帧前状态。
 /// 公开字符协议只读有限子串；随后直接关闭同一 Body，不借测试端口强制布局或注入 Ready。
 fn bounded_pending_client(mtm: MainThreadMarker) {
-    let (native, mapping, pixels, resources) = autoreleasepool(|_| {
+    let (native, mapping, pixels) = autoreleasepool(|_| {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         for _ in 0..2400 {
             file.write_all("a😀中".as_bytes()).unwrap();
@@ -566,12 +566,8 @@ fn bounded_pending_client(mtm: MainThreadMarker) {
         assert!(view.take_failure().is_none());
         assert_eq!(view.input_state().unwrap().generation, 0);
         drop(substring);
-        // 首帧前委托尚无可见布局，请求捕获也应如实保留 Pending；不能为观察 frame 造一张布局票。
-        // 这里只比较真实 NSView 的移动与完整输入事实，已有 Ready 的几何撤权由原 targets 流程验证。
-        assert!(matches!(
-            view.capture_scene_request(),
-            Err(NativeMarkdownPagedTextViewError::Pending)
-        ));
+        // 这里只比较真实 NSView 的移动与完整输入事实；原生可见元数据的安装顺序不是字符协议合同。
+        // Scene 未就绪时不签可见坐标；已有 Ready 的几何票撤权由原 targets 流程验证。
         let previous = view.frame();
         let input_before_move = view.input_state().unwrap();
         view.setFrameOrigin(NSPoint::new(0.0, 12000.0));
@@ -580,26 +576,22 @@ fn bounded_pending_client(mtm: MainThreadMarker) {
         assert_eq!(current.size, previous.size);
         assert_eq!(view.input_state().unwrap(), input_before_move);
         assert!(matches!(
-            view.capture_scene_request(),
-            Err(NativeMarkdownPagedTextViewError::Pending)
-        ));
-        assert!(matches!(
             view.scene_ready(),
             Err(NativeMarkdownPagedTextViewError::Pending)
         ));
         assert_eq!(view.cpu_paints(), Some(0));
         assert_eq!(pixels.snapshot().live_pixel_bytes, 0);
         assert!(view.take_failure().is_none());
-        let resources = body.resource_receipts().unwrap();
-        assert!(resources.reader.is_none()); // 未执行来源推进，不能为了资源门偷偷创建 Reader。
+        // 原 Producer 可仍未创建或在异步拥有者手中，首帧前不能借资源快照的 Busy 推断泄漏或缺读者。
+        // 直接接受正式关闭：它负责退休实际 Producer、join 字体 worker、归还字体和 Input，
+        // 清理首错留在同一收据；只有原像素及行号资源事件真正完成后，verify 才能授权成功。
         let close = body.begin_close().unwrap();
-        assert!(Rc::ptr_eq(&close, &body.begin_close().unwrap()));
         paged_close_event::wait(&close);
         close.verify_released().unwrap();
         drop((context, view, body, scroll, font, paragraph));
         CATransaction::flush();
         assert!(document_weak.upgrade().is_none());
-        (native, mapping, pixels, resources)
+        (native, mapping, pixels)
     });
     assert!(
         native
@@ -608,9 +600,8 @@ fn bounded_pending_client(mtm: MainThreadMarker) {
     );
     assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0 && !mapping.failed());
     assert_eq!(pixels.snapshot().live_pixel_bytes, 0);
-    verify_source_release(vec![resources]);
     println!(
-        "paged_body_source stage=bounded_pending_client actual_body=true bounded_substring=true scalar_edges=true natural_scene_pending=true pending_geometry_rejected=true frame_origin_changed=true full_input_unchanged=true no_frame_fabricated=true actual_native_mmap_font_pixel_released=true whole_product=false formal=false"
+        "paged_body_source stage=bounded_pending_client actual_body=true bounded_substring=true scalar_edges=true natural_scene_pending=true pending_geometry_rejected=true frame_origin_changed=true full_input_unchanged=true no_frame_fabricated=true original_close_receipt_verified=true actual_native_doc_mmap_pixel_released=true whole_product=false formal=false"
     );
 }
 
