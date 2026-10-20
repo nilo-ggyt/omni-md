@@ -215,6 +215,7 @@ impl NativeMarkdownPagedTextView {
         }
         // 显式替换始终按原范围执行；只有真实key解释栈的同步回调能交接后继事件。
         // marked本身从不排队，也不向系统谎报尚未发布的组合；外部直接调用仍会撤原任务。
+        let composition_anchor = selected.and_then(|_| self.capture_composition_anchor(&origin));
         let commit = match selected {
             Some(selected) => {
                 origin
@@ -225,6 +226,7 @@ impl NativeMarkdownPagedTextView {
                 .input
                 .insert_native(&permit, text, replacement, &current)?,
         };
+        self.bind_composition_anchor(&origin, &commit, composition_anchor);
         self.finish_edit_commit(&origin, commit)
     }
 
@@ -458,6 +460,7 @@ impl NativeMarkdownPagedTextView {
         let result = (|| {
             let current = |epoch| origin.session_current(self, epoch);
             commit.check_current(&current)?;
+            self.retire_other_composition_anchor(commit.state);
             let cpu = self.ivars().cpu.borrow().clone();
             if let Some(cpu) = cpu {
                 cpu.cancel_candidate();

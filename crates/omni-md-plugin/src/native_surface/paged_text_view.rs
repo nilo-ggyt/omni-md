@@ -35,6 +35,7 @@ mod cpu;
 mod find;
 mod folding;
 mod formatting;
+mod ime_geometry;
 mod input;
 mod paste;
 mod pointer_scroll;
@@ -132,6 +133,7 @@ pub struct PagedTextViewIvars {
     epoch: u64,
     geometry_epoch: Cell<u64>,
     geometry_failed: Cell<bool>,
+    composition_anchor: Cell<Option<ime_geometry::CompositionAnchor>>,
     closed: Cell<bool>,
     depth: Cell<usize>,
     last_failure: RefCell<Option<NativeMarkdownPagedTextViewError>>,
@@ -159,6 +161,7 @@ pub struct PagedTextViewIvars {
 }
 
 /// 原callback栈的完整输入事实；delegate强claim只活同步栈，不保存到View或后继事件。
+#[derive(Clone)]
 struct Origin {
     input: Rc<NativeMarkdownPagedInput>,
     delegate: Rc<dyn NativeMarkdownPagedTextViewDelegate>,
@@ -605,15 +608,21 @@ define_class!(
             let _use = PayloadUseGuard::enter(&self.ivars().depth);
             // SAFETY: out参数按协议可写或null，零rect同时带NotFound，从不表示几何Ready。
             unsafe { write_actual(actual, not_found()); }
-            match self.screen_rect(range) {
+            let result = match self.screen_rect(range) {
+                Err(NativeMarkdownPagedTextViewError::Pending) => self.composition_screen_rect(range),
+                result => result,
+            };
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            eprintln!("native_ime_rect requested={range:?} resolved={}", result.is_ok());
+            match result {
                 Ok(value) => {
                     // SAFETY: 仅成功的同源scene结果写出实际范围，不伪造输入候选坐标。
                     unsafe { write_actual(actual, value.actual_range); }
                     value.rect
                 }
                 Err(NativeMarkdownPagedTextViewError::Pending) => {
-                    // 原提交到新帧之间系统可同步询问候选坐标；负坐标协议不代表已接纳输入失败。
-                    NSRect::ZERO // actualRange保持上方NotFound，不借旧scene伪造候选框位置。
+                    // 没有本次组合的真实插入点时才报告尚无坐标；这不代表 Core 接纳失败。
+                    NSRect::ZERO
                 }
                 Err(error) => { self.failure(error); NSRect::ZERO }
             }
@@ -755,6 +764,7 @@ impl NativeMarkdownPagedTextView {
             context: RefCell::new(None),
             epoch,
             geometry_epoch: Cell::new(0),
+            composition_anchor: Cell::new(None),
             geometry_failed: Cell::new(false),
             closed: Cell::new(false),
             depth: Cell::new(0),
@@ -981,6 +991,7 @@ impl NativeMarkdownPagedTextView {
         if self.ivars().closed.get() {
             return Err(NativeMarkdownPagedTextViewError::Closed);
         }
+        self.ivars().composition_anchor.set(None); // 真实几何换代结束原组字插入点坐标的交接。
         self.cancel_link_intent(); // 宽度、滚动或frame换代使原鼠标命中失效，不能给旧click补签新坐标。
         let result = advance_geometry(&self.ivars().geometry_epoch, &self.ivars().geometry_failed);
         let cpu = self.ivars().cpu.borrow().clone();
@@ -1033,6 +1044,7 @@ impl NativeMarkdownPagedTextView {
     pub fn scene_ready(&self) -> Result<()> {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         let scene = self.scene()?;
+        self.refresh_composition_anchor(&scene);
         let cpu = self.ivars().cpu.borrow().clone();
         if let Some(cpu) = cpu {
             cpu.cancel_if_not_key(&scene.key);
@@ -1097,6 +1109,7 @@ impl NativeMarkdownPagedTextView {
         let receipt = NativeMarkdownPagedCloseReceipt::new(self.mtm());
         *self.ivars().close_receipt.borrow_mut() = Some(Rc::clone(&receipt));
         self.ivars().closed.set(true);
+        self.ivars().composition_anchor.set(None); // 系统缓存即使保留空视图，也不能保留原文稿位置或输入状态。
         self.close_context_menu(); // 跟踪中的原菜单先结束且失去target/action，不能在关闭后路由到另一篇笔记。
         self.unregisterDraggedTypes(); // 封闭后不再接收新路径或文本，原队列的已有载荷由Body同步归还。
         self.ivars().drag_anchor.set(None);
