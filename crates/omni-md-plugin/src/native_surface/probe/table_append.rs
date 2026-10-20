@@ -255,6 +255,7 @@ impl FindButtonDownIdentity {
 struct FindButtonPaint {
     weak: std::rc::Weak<Self>,
     controller: Weak<NativeMarkdownController>,
+    button: Weak<NSButton>,
     view: Weak<NativeMarkdownPagedTextView>,
     facts: AppendFacts,
     bar: std::rc::Weak<NativeMarkdownFindBar>,
@@ -271,6 +272,8 @@ struct FindButtonPaint {
     down: RefCell<Option<Retained<objc2_app_kit::NSEvent>>>,
     down_identity: FindButtonDownIdentity,
     dispatched: Cell<bool>,
+    selector_returned: Cell<bool>,
+    after_queued: Cell<bool>,
     action_returned: Cell<bool>,
     // 临时派发/帧诊断只限首个 Next；action 返回各记原四次动作的一条，均不重复刷早帧。
     #[cfg(feature = "native-close-stage-diagnostic")]
@@ -314,6 +317,24 @@ impl FindButtonPaint {
             })
     }
 
+    /// Down/tracking 返回与原 selector 返回可任意先后；两张真实收据齐备才排一次观察。
+    /// selector 返回证明其 enqueue_owned 已入同一主队列，不能再用 Down 返回猜这个先序。
+    fn queue_after_action_if_ready(&self, mtm: MainThreadMarker) {
+        if !self.dispatched.get()
+            || !self.selector_returned.get()
+            || self.after_queued.replace(true)
+        {
+            return;
+        }
+        let weak = dispatch2::MainThreadBound::new(self.weak.clone(), mtm);
+        enqueue_native_markdown_main_task(move || {
+            let mtm = MainThreadMarker::new().expect("Find action 终点只在原主队列观察");
+            if let Some(paint) = weak.get(mtm).upgrade() {
+                paint.after_action();
+            }
+        });
+    }
+
     /// 早于原动作的真实帧只能等下一次真实发布；这里不交付旧帧、不触发绘制，也不重发输入。
     fn rearm(&self) -> Result<(), String> {
         let body = self.facts.body.upgrade().ok_or("Find 原 Body 已释放")?;
@@ -325,7 +346,7 @@ impl FindButtonPaint {
 
     /// 通知只授予下一验证事件排队权；该事件仍须消费当时保存的同一完整 CPU 帧。
     fn completed(&self) -> Result<(), String> {
-        if !self.dispatched.get() || !self.action_returned.get() {
+        if !self.dispatched.get() || !self.selector_returned.get() || !self.action_returned.get() {
             return Err("原 Find 鼠标派发或正式 action 尚未返回".into());
         }
         let (key, paints) = self
@@ -504,7 +525,7 @@ impl FindButtonPaint {
         })
     }
 
-    /// 仅在实际 Down 调用返回后，FIFO 排在原正式 action 之后执行一次。
+    /// 原 Down 与具体 selector 均已返回，才沿同主队列 FIFO 排在正式 action 之后执行一次。
     /// 组合拒绝不改正文，没有新帧也能由真实 action 终点证明；其它动作仍必须等原新帧。
     fn after_action(&self) {
         #[cfg(feature = "native-close-stage-diagnostic")]
@@ -631,7 +652,10 @@ impl FindButtonPaint {
     }
 
     fn notify_if_complete(&self) {
-        let completed = self.action_returned.get() && self.terminal.borrow().is_some();
+        let completed = self.dispatched.get()
+            && self.selector_returned.get()
+            && self.action_returned.get()
+            && self.terminal.borrow().is_some();
         if completed {
             self.observer.notify();
         } // 不在 NSButton tracking 里发 Host 事件；两个真实边界都结束后才交付一次。
@@ -1024,8 +1048,8 @@ impl NativeMarkdownHostedTableProbe {
     }
 
     /// 只由验收 NSApplication 的 super.sendEvent 原 Down 返回边界调用。
-    /// 同一 NSButton 已消费自己的 Up 并排出正式 action；同主队列的一次被动观察因此在其后，
-    /// 不接管 production target/selector，也不重发鼠标、执行查找或制造绘图。
+    /// 这只证明原鼠标 tracking 已返回，不推断 AppKit 已交付 selector；另一个真实边界
+    /// 证明原 selector 返回，两者齐备才被动观察。不重发鼠标、执行查找或制造绘图。
     pub fn did_dispatch_hosted_event(&self, event: &objc2_app_kit::NSEvent) -> Result<(), String> {
         let mtm = MainThreadMarker::new().ok_or("Find 鼠标终点必须在 AppKit 主线程")?;
         if event.r#type() != objc2_app_kit::NSEventType::LeftMouseDown {
@@ -1073,13 +1097,53 @@ impl NativeMarkdownHostedTableProbe {
             .take()
             .ok_or("原 Find Down 的有限事件租约已丢失")?;
         drop(down); // 原派发已返回；先退槽再释放唯一事件租约，不跨FIFO观察保留Native事件。
-        let weak = dispatch2::MainThreadBound::new(Rc::downgrade(&paint), mtm);
-        enqueue_native_markdown_main_task(move || {
-            let mtm = MainThreadMarker::new().expect("Find action 终点只在原主队列观察");
-            if let Some(paint) = weak.get(mtm).upgrade() {
-                paint.after_action();
-            }
+        paint.queue_after_action_if_ready(mtm);
+        Ok(())
+    }
+
+    /// 仅验收 App 的公开 sendAction:to:from: 完整返回后调用；参数就是原系统派发值。
+    /// 只认事前原按钮、controller 与具体 selector，不读取 tag、字段或后继文稿来重签权限。
+    pub fn did_dispatch_hosted_action(
+        &self,
+        action: objc2::runtime::Sel,
+        target: Option<&AnyObject>,
+        sender: Option<&AnyObject>,
+        sent: bool,
+    ) -> Result<(), String> {
+        let mtm = MainThreadMarker::new().ok_or("Find selector 终点必须在 AppKit 主线程")?;
+        if action != sel!(performMarkdownFindAction:) {
+            return Ok(());
+        }
+        let paint = self
+            .find_replacement
+            .borrow()
+            .as_ref()
+            .and_then(|probe| probe.queued_button.as_ref())
+            .map(|button| Rc::clone(&button.paint));
+        let Some(paint) = paint else {
+            return Ok(()); // 非这次原排队按钮的 action 没有具体终点订阅。
+        };
+        let Some((target, sender)) = target.zip(sender) else {
+            return Ok(()); // 本按钮已显式绑定 controller，不从 responder 链猜目标。
+        };
+        let same_controller = paint.controller.load().is_some_and(|controller| {
+            std::ptr::eq(AsRef::<AnyObject>::as_ref(&*controller), target)
         });
+        let same_button = paint
+            .button
+            .load()
+            .is_some_and(|button| std::ptr::eq(AsRef::<AnyObject>::as_ref(&*button), sender));
+        if !same_controller || !same_button {
+            return Ok(()); // kind 由事前那个具体按钮固定，外来 sender 不能借相同 selector 接续。
+        }
+        if !sent {
+            return Err("原 Find 按钮的实际 selector 未成功交付".into());
+        }
+        if paint.selector_returned.replace(true) {
+            return Err("原 Find 按钮的实际 selector 不能重复交付".into());
+        }
+        // 只保存系统派发已返回的标量；临时 Native weak claim 已结束，不保 sender/target。
+        paint.queue_after_action_if_ready(mtm);
         Ok(())
     }
 
@@ -2252,6 +2316,7 @@ impl NativeMarkdownHostedTableProbe {
                 return Err("原查找按钮会夺取字段组合焦点".into());
             }
             let events = button_mouse::prepare(button, &surface.panel, &current)?;
+            let button = step(&current, || Weak::from(button))?;
             let down_identity = step(&current, || FindButtonDownIdentity::capture(&events[0]))?;
             let down = events[0].clone(); // 只租原有限鼠标Down，不持正文/输入context，匹配返回即释放。
             let view = step(&current, || {
@@ -2261,6 +2326,7 @@ impl NativeMarkdownHostedTableProbe {
             let paint = Rc::new_cyclic(|weak| FindButtonPaint {
                 weak: weak.clone(),
                 controller,
+                button,
                 view,
                 facts: facts.clone(),
                 bar: probe.bar.clone(),
@@ -2277,6 +2343,8 @@ impl NativeMarkdownHostedTableProbe {
                 down: RefCell::new(Some(down)),
                 down_identity,
                 dispatched: Cell::new(false),
+                selector_returned: Cell::new(false),
+                after_queued: Cell::new(false),
                 action_returned: Cell::new(false),
                 #[cfg(feature = "native-close-stage-diagnostic")]
                 dispatch_diagnosed: Cell::new(false),
