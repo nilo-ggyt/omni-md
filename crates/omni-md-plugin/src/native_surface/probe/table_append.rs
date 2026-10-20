@@ -526,7 +526,8 @@ impl FindButtonPaint {
     }
 
     /// 原 Down 与具体 selector 均已返回，才沿同主队列 FIFO 排在正式 action 之后执行一次。
-    /// 组合拒绝不改正文，没有新帧也能由真实 action 终点证明；其它动作仍必须等原新帧。
+    /// 组合拒绝不改正文：原完整帧仍健康时直接验证；反馈使 Scene/CPU 真 Pending
+    /// 时才登记一次真实发布。拒绝没有新帧义务，不能预订阅后遗留无人消费的弱槽。
     fn after_action(&self) {
         #[cfg(feature = "native-close-stage-diagnostic")]
         let mut authority = None;
@@ -593,6 +594,21 @@ impl FindButtonPaint {
                 return Ok(None); // action 返回不等于像素完成，绝不能从当前旧图补一份新帧收据。
             }
             let editor = surface.editor.as_ref().ok_or("原 Find 拒绝正文已释放")?;
+            // 等待只适用于真实 Pending；正文、输入及原文件的失败必须先沿本次原动作返回，
+            // 不能把已失败的生产者留作“稍后有帧”或从后继 Source 取得替代权限。
+            if let Some(cause) = editor.body.take_failure() {
+                return Err(format!("Find 原正文失败：{cause}"));
+            }
+            if let Some(cause) = editor.text_view.take_failure()
+                && !matches!(cause, crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Pending)
+            {
+                return Err(format!("Find 原输入失败：{cause}"));
+            }
+            editor
+                .document()
+                .borrow()
+                .byte_offset_for_utf16(0)
+                .map_err(|cause| cause.to_string())?;
             if editor
                 .text_view
                 .input_state()
@@ -601,10 +617,38 @@ impl FindButtonPaint {
             {
                 return Err("原组合拒绝改变了完整正文 Input".into());
             }
-            let key = editor
-                .text_view
-                .capture_ready_scene_key()
-                .map_err(|cause| cause.to_string())?;
+            let key = match editor.text_view.capture_ready_scene_key() {
+                Ok(key) => Some(key),
+                Err(crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Pending) => None,
+                Err(cause) => return Err(cause.to_string()),
+            };
+            if key.is_none() || editor.text_view.cpu_paint_pending() == Some(true) {
+                // 拒绝反馈可以改变原窗口布局而保持完整 Input；只在这一确切未完成状态
+                // 登记。登记只读原 Rust/Weak/CPU 计数，没有发布交付点或 Native 布局调用。
+                let current = || {
+                    self.current(surface)
+                        && surface.controller.find_input_intent() == self.after_intent
+                        && editor
+                            .text_view
+                            .input_state()
+                            .is_ok_and(|actual| actual == self.before_input)
+                        && self.started.elapsed() <= Duration::from_secs(3)
+                };
+                if !current() {
+                    return Err("原组合拒绝等待前完整客户、输入或期限已撤销".into());
+                }
+                self.rearm()?;
+                editor
+                    .document()
+                    .borrow()
+                    .byte_offset_for_utf16(0)
+                    .map_err(|cause| cause.to_string())?;
+                if !current() {
+                    return Err("原组合拒绝登记后完整客户、输入或期限已撤销".into());
+                }
+                return Ok(None); // 保原三秒与同一 Paint；只有后继真实发布才能交付准确拒绝终态。
+            }
+            let key = key.expect("非 Pending 拒绝保有原 Ready key");
             let (actual, paints) = editor
                 .text_view
                 .probe_cpu_published_frame()
@@ -2355,7 +2399,7 @@ impl NativeMarkdownHostedTableProbe {
             });
             if terminal_step != NativeMarkdownHostedTableStep::VerifyReplaceRejectedAndCommit {
                 // 真正选择/编辑在点击前订阅原下一完整帧；组合拒绝没有新像素义务，
-                // 它只走实际 action 返回后的同 Input/Ready/CPU 验证，不遗留空等帧观察槽。
+                // 仅 after_action 证实原 Scene/CPU 真 Pending 才登记，不遗留无帧消费的观察槽。
                 let erased: Rc<dyn NativeMarkdownPagedBodyPaintObserver> = paint.clone();
                 surface
                     .editor
