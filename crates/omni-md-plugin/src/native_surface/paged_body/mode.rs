@@ -22,6 +22,16 @@ pub(super) struct PendingModeViewport {
     // 只有同 Source/宽度的真实 Scene 已测得首字形后才存在；不是滚动已完成的标志。
     // 模式保有它直到新 Scene 核准原屏内位置，普通整行导航不得覆盖这个实际字形锚。
     measured_glyph: Option<MeasuredModeGlyph>,
+    // Find 只归还栏高，原文稿坐标必须逐位保留；不能经字形局部坐标逆推后再写回。
+    // Source/Input/换行宽度仍由同一个 target 认证，模式另由这份原实际值约束。
+    find_origin: Option<FindLayoutOrigin>,
+}
+
+/// 只属于原 Find 高度布局的两个纯值；不保存 Scene、原生视图或另一份 Source 强边。
+#[derive(Clone, Copy)]
+struct FindLayoutOrigin {
+    position: NSPoint,
+    presentation_mode: MarkdownPresentationMode,
 }
 
 /// 同一 Scene 的文档上沿和完整字形高度；只保有限实际几何，不保字体、行或 Source。
@@ -703,6 +713,10 @@ impl NativeMarkdownPagedBody {
             target: Some(Rc::clone(&target)),
             controller: Some(Rc::clone(scope)),
             measured_glyph: Some(measured),
+            find_origin: Some(FindLayoutOrigin {
+                position: key.request.virtual_viewport.document_origin,
+                presentation_mode: key.presentation_mode,
+            }),
         });
         Ok(target)
     }
@@ -730,6 +744,7 @@ impl NativeMarkdownPagedBody {
             target: None,
             controller: None,
             measured_glyph: None,
+            find_origin: None, // 模式/字号交换仍沿原真实 glyph 锚，不借 Find 的绝对位置。
         });
         self.schedule()
     }
@@ -895,10 +910,17 @@ impl NativeMarkdownPagedBody {
             .filter(|actual| Rc::ptr_eq(actual, target))?;
         // 首 Scene 前只能沿真实行顶补前缀；测得格内字形后必须使用它的实际文档位置。
         // 目标可能在超高格中部，整行顶部不能证明原屏内锚下方的可见内容已准备完成。
-        let origin = pending.measured_glyph.map_or_else(
-            || (line_top - pending.anchor.screen_y).max(0.0),
-            |glyph| glyph.requested_origin(pending.anchor.screen_y, viewport_height),
-        );
+        let origin = if let Some(original) = pending.find_origin
+            && original.presentation_mode == self.presentation_mode()
+        {
+            // 同 Source/Input/宽度的目标只补原坐标下方新增的可见高度；原值不参与加减回环。
+            original.position.y
+        } else {
+            pending.measured_glyph.map_or_else(
+                || (line_top - pending.anchor.screen_y).max(0.0),
+                |glyph| glyph.requested_origin(pending.anchor.screen_y, viewport_height),
+            )
+        };
         Some(origin + viewport_height)
     }
 
@@ -919,7 +941,7 @@ impl NativeMarkdownPagedBody {
 
     /// 首目标真正排版后只用真实glyph框恢复屏内Y；滚动后的旧Scene绝不签发最终可见收据。
     pub(super) fn finish_mode_viewport(&self) -> Result<bool> {
-        let (anchor, state, target) = {
+        let (anchor, state, target, find_origin, measured_glyph) = {
             let slot = self.mode_viewport.borrow();
             let Some(pending) = slot.as_ref() else {
                 return Ok(false);
@@ -928,6 +950,8 @@ impl NativeMarkdownPagedBody {
                 pending.anchor.clone(),
                 pending.state,
                 pending.target.clone(),
+                pending.find_origin,
+                pending.measured_glyph,
             )
         }; // 实际glyph/clip查询不持初始化槽，失败清理也不递归借用同一RefCell。
 
@@ -971,17 +995,29 @@ impl NativeMarkdownPagedBody {
             );
             let _ = cause;
         })?;
-        let glyph_top = request.virtual_viewport.document_origin.y
-            + request.viewport.origin.y
-            + request.viewport.size.height
-            - first.rect.origin.y
-            - first.rect.size.height;
-        let maximum = (geometry.content_height - geometry.body_frame.size.height).max(0.0);
-        let measured = MeasuredModeGlyph {
-            document_top: glyph_top,
-            height: first.rect.size.height,
+        // 原 target 已证明同 Source、完整 Input 和换行宽；仅同一实际模式允许 Find 原值恢复。
+        // 字号/模式转换继续测新 glyph，不拿旧坐标阻止它按原屏内锚重新排版。
+        let find_origin = find_origin
+            .filter(|original| original.presentation_mode == scene.key().presentation_mode);
+        let measured = if find_origin.is_some() {
+            // Find 构造时已在同一真实 Scene 测得此字形；纯高度布局不能用新局部Y再反求文稿顶端。
+            measured_glyph.expect("Find 布局原点始终伴随原 Scene 的真实字形测量")
+        } else {
+            MeasuredModeGlyph {
+                document_top: request.virtual_viewport.document_origin.y
+                    + request.viewport.origin.y
+                    + request.viewport.size.height
+                    - first.rect.origin.y
+                    - first.rect.size.height,
+                height: first.rect.size.height,
+            }
         };
-        let requested = measured.requested_origin(anchor.screen_y, geometry.body_frame.size.height);
+        let glyph_top = measured.document_top;
+        let maximum = (geometry.content_height - geometry.body_frame.size.height).max(0.0);
+        let requested = find_origin.map_or_else(
+            || measured.requested_origin(anchor.screen_y, geometry.body_frame.size.height),
+            |original| original.position.y,
+        );
         let desired = requested.min(maximum);
         if !glyph_top.is_finite() || !desired.is_finite() {
             return Err(ViewError::InvalidGeometry.into());
@@ -1014,7 +1050,11 @@ impl NativeMarkdownPagedBody {
         }
         let changed = viewport.reveal_document_rect(
             NSRect::new(
-                NSPoint::new(geometry.body_frame.origin.x, desired),
+                NSPoint::new(
+                    find_origin
+                        .map_or(geometry.body_frame.origin.x, |original| original.position.x),
+                    desired,
+                ),
                 NSSize::new(
                     1.0,
                     geometry.body_frame.size.height.min(geometry.content_height),

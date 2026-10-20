@@ -471,7 +471,7 @@ impl SoftwareInput {
                     return Err("实际CG包装事件的字符与本次ASCII按键不符");
                 } // down/up 均须带同一次预期字符；缺失或不符不交 pending，也不冒充有效字母。
                 println!(
-                    "system_ime stage=software_key_prepared index={index} key_down={key_down} event_type={:?} event_key_code={} event_modifier_flags={:?} event_window_number={} timestamp_seconds={} cg_backed={cg_backed} unicode_payload_set=false global_event_posted=false transport=nsapplication_send_event software_events=true physical_keyboard=false",
+                    "system_ime stage=software_key_prepared index={index} key_down={key_down} event_type={:?} event_key_code={} event_modifier_flags={:?} event_window_number={} timestamp_seconds={} cg_backed={cg_backed} unicode_payload_set=false global_event_posted=false transport=nsapplication_event_queue software_events=true physical_keyboard=false",
                     event.r#type(),
                     event.keyCode(),
                     event.modifierFlags(),
@@ -512,14 +512,14 @@ impl SoftwareInput {
                 if let Some(driver) = weak.get(mtm).upgrade()
                     && let Some(view) = driver.view.load()
                 {
-                    driver.dispatch_pending(&view);
+                    driver.post_pending(&view);
                 }
             });
         });
     }
 
-    /// 原loop栈顶取走一个完整press，核原客户后经NSApp同步路由；不把send返回当IME已消费。
-    fn dispatch_pending(&self, view: &NativeMarkdownPagedTextView) -> bool {
+    /// 核原客户后把完整press交原应用队列，由唯一run正常取出；入队不代表IME消费。
+    fn post_pending(&self, view: &NativeMarkdownPagedTextView) -> bool {
         let Some((index, [down, up])) = self.pending.borrow_mut().take() else {
             return false;
         }; // 槽借用先结束，系统分发后的真实marked回调可安全准备后继槽。
@@ -535,7 +535,7 @@ impl SoftwareInput {
             None
         };
         // 该press绑定原文稿此刻的完整Input；后续Native焦点查询不能替旧按键重采新选择。
-        // 请求只持弱文稿身份，所有读取在sendEvent前退栈，不跨系统回调借文稿或Body。
+        // 请求只持弱文稿身份，所有读取在入队前退栈，不跨系统回调借文稿或Body。
         let original_input = match view.capture_scene_request() {
             Ok(request) if std::rc::Weak::ptr_eq(&request.document, &self.document) => {
                 request.input
@@ -609,9 +609,9 @@ impl SoftwareInput {
             self.stop_sequence();
             return true;
         }
-        // 原始 CG 包装事件的 windowNumber 可以为0，由 NSApplication 的真实 keyWindow 路由。
-        // 不私写窗口号或直投 NSWindow；Native 查询后仍核原窗口对象/context/输入源，
-        // 不能因为 AppKit 可分发事件就把它交给后来取得焦点的客户。
+        // 原始CG包装事件的windowNumber可以为0；只交原应用队列，不私写窗口号或直投NSWindow。
+        // 入队前仍核原窗口/context/输入源，实际分发由AppKit的原唯一run承担。
+        // 这里不预言排队后的IME处理或焦点；后继marked和最终中文仍须属于原客户才可通过。
         if !admitted()
             || self.context.selectedKeyboardInputSource().as_deref() != Some(&*self.initial_source)
         {
@@ -648,7 +648,7 @@ impl SoftwareInput {
             self.stop_sequence();
             return true;
         }
-        // 所有可重入焦点/Source查询都已归还；Space只能在同一原期限内真正交付，
+        // 所有可重入焦点/Source查询都已归还；本press只能在原期限内入队，真正提交仍有原末端期限门。
         // 不能因面板较晚上屏而把30秒以后的确认或中文提交算作成功。
         if Instant::now() >= self.deadline {
             self.failed
@@ -659,40 +659,15 @@ impl SoftwareInput {
         let generation = original_input.generation;
         self.waiting.set(Some((index, generation)));
         self.next.set(index + 1);
-        // waiting先于同步send登记；原PagedView.keyDown仍经真实context.handleEvent解释，
-        // 这里只选择本进程AppKit分发入口，不直接调用setMarkedText或插入目标中文。
-        // down可同步产生marked/commit并准备下一press，但prepare_next只排退栈续体，
-        // 因而当前down返回并完成up核验前，不会在同一Native栈递归交付下一字母。
-        self.application.sendEvent(&down);
-        // 真实preedit允许改变generation/selection，不能要求down前的Input仍相等；
-        // up只继续核原Doc/Body/View/窗口/context及原输入源，不向已撤权的客户补送释放。
-        // 正常Space可在down里stop原run，此时driver尚未清理，仍给同原客户一次真实up。
-        if self.stopped.get()
-            || self.failed.get().is_some()
-            || !admitted()
-            || self.context.selectedKeyboardInputSource().as_deref() != Some(&*self.initial_source)
-        {
-            if self.failed.get().is_none() {
-                self.failed
-                    .set(Some("软件key按下后原客户或输入源已撤销，不能交付释放"));
-            }
-            self.stop_sequence();
-            return true;
-        }
-        self.application.sendEvent(&up);
-        // sendEvent返回只证明本地同步路由已执行；marked/中文/面板仍由各自真实终点核验。
-        // 末端失权保首错，不能以本press已发出为理由把后继客户当原会话继续验收。
-        if !admitted()
-            || self.context.selectedKeyboardInputSource().as_deref() != Some(&*self.initial_source)
-        {
-            if self.failed.get().is_none() {
-                self.failed.set(Some("软件key释放后原客户或输入源已撤销"));
-            }
-            self.stop_sequence();
-            return true;
-        }
+        // waiting先于入队登记；不能在GCD续体里直接sendEvent，跳过原run的取事件阶段。
+        // 两个原事件按down/up顺序追加到同一FIFO，由AppKit保活，既不走全局Quartz也不写中文。
+        // 下一字母仍只由真实marked回调准备；它入队时本press的up已经在队列中，不反插到队首。
+        self.application.postEvent_atStart(&down, false);
+        self.application.postEvent_atStart(&up, false);
+        // 返回仅说明已交原本地队列，不证明分发、释放键或IME处理完成；这些不能由本日志补签。
+        // marked、候选面板、中文提交和原文/历史仍沿原独立实际终点严格验收。
         println!(
-            "system_ime stage=software_key_dispatched index={index} send_event_returns_for_press=2 before_generation={generation} original_input_source=true cg_backed=true unicode_payload_set=false global_event_posted=false transport=nsapplication_send_event software_events=true physical_keyboard=false"
+            "system_ime stage=software_key_queued index={index} queued_events_for_press=2 before_generation={generation} original_input_source=true cg_backed=true unicode_payload_set=false global_event_posted=false transport=nsapplication_event_queue software_events=true physical_keyboard=false"
         );
         true
     }
@@ -1529,8 +1504,8 @@ pub(super) fn run(
         .as_ref()
         .map(|driver| driver.panel_observation.get().is_some());
     if let Some(driver) = &software {
-        // next在down之前登记以接同步marked，故只表示已开始的press，不能推算实际交付次数。
-        // 每对sendEvent均正常返回才有software_key_dispatched；中途失权由原首错阻止成功。
+        // next在入队前登记以接实际marked，故只表示已开始的press，不能推算真实分发或keyup次数。
+        // 成功仍同时要求原marked、中文和面板终点；software_key_queued不能替代其中任何一项。
         let presses_started = driver.next.get();
         let cleaned = driver.cleanup();
         let original_failure = driver.failed.get(); // 清理发现源身份变化也须保留为本次真实失败。
