@@ -179,8 +179,15 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
                 case,
                 &mut calibrations,
             )?;
-            render_exact(&pool, &backing, &original, &source, bounds)?;
+            let original_publication =
+                render_exact(&pool, &backing, &original, &source, bounds, None)?;
             weaks.extend(pool.weaks());
+            // 从真实挂载点取原组身份；等值重绘应保持这张 Native 图，而非另建空壳换组。
+            // SAFETY: 前一步完整 Native 验证已核本 mount 的标准 CALayer 子数组。
+            let original_group = unsafe { pool.mount().sublayers() }
+                .filter(|children| children.len() == 1)
+                .map(|children| children.objectAtIndex(0))
+                .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
             let same = fixture_with_prior(
                 &mut source,
                 counters.clone(),
@@ -189,7 +196,21 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
                 case,
                 &mut calibrations,
             )?;
-            render_exact(&pool, &backing, &same, &source, bounds)?;
+            let same_publication = render_exact(
+                &pool,
+                &backing,
+                &same,
+                &source,
+                bounds,
+                Some(&original_publication),
+            )?;
+            // 仍逐像素核真实合成；Native 组身份不变同时证明没有重交一组等值图层。
+            // SAFETY: 同上，只从原 mount 的实际标准子层取得身份，不读取私有计数。
+            let same_native_group = unsafe { pool.mount().sublayers() }.is_some_and(|children| {
+                children.len() == 1
+                    && std::ptr::eq::<CALayer>(&*children.objectAtIndex(0), &*original_group)
+            });
+            drop(original_group);
             weaks.extend(pool.weaks());
             let changed = fixture_with_prior(
                 &mut source,
@@ -199,7 +220,14 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
                 case,
                 &mut calibrations,
             )?;
-            render_exact(&pool, &backing, &changed, &source, bounds)?;
+            render_exact(
+                &pool,
+                &backing,
+                &changed,
+                &source,
+                bounds,
+                Some(&same_publication),
+            )?;
             weaks.extend(pool.weaks());
             let left = &original.tiles[0];
             let equal = &same.tiles[0];
@@ -224,14 +252,15 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
                     .as_deref()
                     .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?,
             );
-            let valid = same.reused_images == 2
+            let valid = same_native_group
+                && same.reused_images == 2
                 && changed.reused_images == 1
                 && first_equal
                 && second_equal
                 && first_changed
                 && second_changed;
             println!(
-                "paged_paired_reuse case={case:?} actual_same_tile_reuses={} actual_changed_tile_reuses={} actual_both_equal={first_equal}/{second_equal} actual_both_changed={first_changed}/{second_changed} all_three_native_frames_pixel_exact=true shared_surface_calibration=true formal=false",
+                "paged_paired_reuse case={case:?} actual_same_tile_reuses={} actual_changed_tile_reuses={} actual_both_equal={first_equal}/{second_equal} actual_both_changed={first_changed}/{second_changed} actual_same_native_group={same_native_group} all_three_native_frames_pixel_exact=true shared_surface_calibration=true formal=false",
                 same.reused_images, changed.reused_images
             );
             if !valid {
@@ -258,7 +287,8 @@ fn render_exact(
     frame: &TileFrame,
     source: &Canvas,
     bounds: NSRect,
-) -> Result<()> {
+    previous: Option<&Publication>,
+) -> Result<Publication> {
     let reference = CGBitmapContextCreateImage(Some(&source.context))
         .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
     let baseline = Canvas::new()?;
@@ -267,15 +297,25 @@ fn render_exact(
     CGContext::flush(Some(&baseline.context));
     let rendered = Canvas::new()?;
     rendered.blue(bounds);
-    let attempt = pool.attempt()?;
-    let publication = pool.publish(backing, frame, &attempt, bounds, 1.0, &|| true)?;
+    // 消费同一生产准入；不等值时仍真实换帧，复用成功也必须下方完整渲染并逐字节比较。
+    let reused = previous
+        .map(|previous| pool.reuse_publication(backing, frame, previous, bounds, 1.0, &|| true))
+        .transpose()?
+        .flatten();
+    let publication = match reused {
+        Some(publication) => publication,
+        None => {
+            let attempt = pool.attempt()?;
+            pool.publish(backing, frame, &attempt, bounds, 1.0, &|| true)?
+        }
+    };
     pool.validate(backing, &publication, &|| true)?;
     pool.mount().renderInContext(&rendered.context);
     CGContext::flush(Some(&rendered.context));
     if rendered.pixels != baseline.pixels {
         return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
     }
-    Ok(())
+    Ok(publication)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -388,13 +428,12 @@ fn visible_graphs(case: PaletteCase) -> Result<()> {
                     Mutation::MountOpacity => pool.mount().setOpacity(0.5),
                     Mutation::MountZPosition => pool.mount().setZPosition(1.0),
                 }
+                let reused =
+                    pool.reuse_publication(&backing, &frame, &publication, bounds, 1.0, &|| true);
                 let rejected = if matches!(mutation, Mutation::None) {
-                    pool.validate(&backing, &publication, &|| true).is_ok()
+                    matches!(reused, Ok(Some(_)))
                 } else {
-                    matches!(
-                        pool.validate(&backing, &publication, &|| true),
-                        Err(NativeMarkdownPagedTextViewError::Revoked)
-                    )
+                    matches!(reused, Err(NativeMarkdownPagedTextViewError::Revoked))
                 };
                 Ok((exact, rejected))
             })();

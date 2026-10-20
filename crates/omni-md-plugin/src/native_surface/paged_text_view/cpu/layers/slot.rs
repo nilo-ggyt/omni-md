@@ -70,7 +70,7 @@ struct Payload {
     paired_colors: Option<PairedColors>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) struct Receipt {
     pub(super) tile: PixelTile,
     image: usize,

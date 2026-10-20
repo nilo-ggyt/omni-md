@@ -20,6 +20,7 @@ pub(super) struct LayerPool {
 }
 
 /// 只记录本池实际发布的有限身份，不保CGImage、正文、Source或Scene强边。
+#[derive(Clone)]
 pub(super) struct Publication {
     index: usize,
     serial: usize,
@@ -136,6 +137,45 @@ impl LayerPool {
             self.active.set(None);
         }
         true // private serial证明本次提交发生过；调用者必须废除旧weakMetadata。
+    }
+
+    /// 新候选已经完成真实绘图；只有全部瓦片仍是当前原图，才沿用现存 Native 图。
+    /// 收据最多复制64项身份标量，不新增图层、图像或历史帧；任一表示/位置/主次图不同
+    /// 都交回正常发布。像素相等由上游封存器逐字节证明，这里只消费其真实复用身份。
+    pub(super) fn reuse_publication(
+        &self,
+        backing: &CALayer,
+        frame: &TileFrame,
+        previous: &Publication,
+        bounds: NSRect,
+        scale: f64,
+        current: &impl Fn() -> bool,
+    ) -> Result<Option<Publication>> {
+        if frame.tiles.is_empty()
+            || frame.tiles.len() > MAX_TILE_SLOTS
+            || dimension(bounds.size.width, scale)? != frame.width
+            || dimension(bounds.size.height, scale)? != frame.height
+        {
+            return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
+        }
+        if previous.bounds != bounds
+            || previous.scale != scale
+            || previous.tiles.len() != frame.tiles.len()
+            || previous.tiles.iter().zip(&frame.tiles).any(|(old, image)| {
+                *old != slot::Receipt::new(
+                    image.tile,
+                    &image.image,
+                    image.secondary_image.as_deref(),
+                    image.presentation,
+                )
+            })
+        {
+            return Ok(None);
+        }
+        // 相同 CGImage 不代表它仍装在原槽中。完整核原 mount、serial、各层关系、
+        // 颜色和主次图片；外方修改或 Native/current 重入失权必须失败，不能降成 miss。
+        self.validate(backing, previous, current)?;
+        Ok(Some(previous.clone()))
     }
 
     pub(super) fn publish(

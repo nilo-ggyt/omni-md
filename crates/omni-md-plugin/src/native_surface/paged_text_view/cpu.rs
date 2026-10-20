@@ -512,21 +512,56 @@ impl CpuSurface {
                     completed.validate(self, view)?;
                     let current = || completed.current(self, view);
                     self.layer_current(view, &current)?;
-                    let mut publication_use = PublicationUse::new(self)?;
                     let prior = self.published.borrow().clone();
+                    let reused = if let Some(prior) = &prior
+                        && prior.geometry == completed.geometry
+                    {
+                        self.layers.reuse_publication(
+                            &self.layer,
+                            &completed.frame,
+                            &prior.publication,
+                            completed.geometry.backing,
+                            completed.geometry.scale,
+                            &current,
+                        )
+                    } else {
+                        Ok(None)
+                    };
+                    completed.validate(self, view)?; // 原 Source/Font 首错仍优先于 Native 图验证失败。
+                    let reused = reused?;
+                    if reused.is_some()
+                        && !self.published.borrow().as_ref().is_some_and(|actual| {
+                            prior
+                                .as_ref()
+                                .is_some_and(|prior| Rc::ptr_eq(actual, prior))
+                        })
+                    {
+                        return Err(NativeMarkdownPagedTextViewError::Revoked);
+                    } // Native getter 后仍须是同一个当前发布，不能拿旧图收据给后继 owner 补签。
+                    let mut publication_use = if reused.is_none() {
+                        Some(PublicationUse::new(self)?)
+                    } else {
+                        None // 复用没有 Native setter 效果，失败不撤掉仍属旧帧的原图。
+                    };
                     let retired = prior
                         .as_ref()
                         .and_then(|published| published.frame.borrow_mut().take());
                     drop(retired); // 原slot仍保旧可见图片；仅先归还frame cache，旧metadata/Ready到原提交点才换。
                     drop(prior); // 即使别处短持Published，它的帧槽也已空，不拖旧provider到transaction之后。
-                    let publication = self.layers.publish(
-                        &self.layer,
-                        &completed.frame,
-                        &publication_use.attempt,
-                        completed.geometry.backing,
-                        completed.geometry.scale,
-                        &current,
-                    );
+                    let publication = match reused {
+                        Some(publication) => Ok(publication),
+                        None => self.layers.publish(
+                            &self.layer,
+                            &completed.frame,
+                            &publication_use
+                                .as_ref()
+                                .expect("新图发布持有原补偿票")
+                                .attempt,
+                            completed.geometry.backing,
+                            completed.geometry.scale,
+                            &current,
+                        ),
+                    };
                     completed.validate(self, view)?; // Source首错先于Native撤权；不可给较新scene补签。
                     let publication = publication?;
                     self.layer_current(view, &current)?;
@@ -546,7 +581,11 @@ impl CpuSurface {
                     drop(old);
                     self.paints.set(count);
                     self.active_serial.set(None);
-                    publication_use.commit(); // 已核完所有Source/几何事实；此后只交付提交观察，不再产生可回滚失败。
+                    if let Some(publication_use) = &mut publication_use {
+                        publication_use.commit();
+                    } // 已核完所有Source/几何事实；此后只交付提交观察，不再产生可回滚失败。
+                    // 两条路径都只在原 Candidate 完成整帧真实绘制后提交新 key，并沿原尾部
+                    // 增长一次 paint、通知一次。图层复用本身不冒充额外绘制或补发旧 Scene。
                     completed.scene.cpu_frame_published(count); // 只通知真实整帧提交事实；此后不新增可回滚Result或重领新scene。
                     Ok(())
                 }

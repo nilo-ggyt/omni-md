@@ -194,6 +194,7 @@ fn render_exact(
     frame: &TileFrame,
     source: &Canvas,
     bounds: NSRect,
+    previous: Option<&Publication>,
 ) -> Result<Publication> {
     let reference = CGBitmapContextCreateImage(Some(&source.context)).ok_or_else(invalid)?;
     let baseline = Canvas::sized(REGION_WIDTH, REGION_HEIGHT)?;
@@ -202,8 +203,18 @@ fn render_exact(
     CGContext::flush(Some(&baseline.context));
     let rendered = Canvas::sized(REGION_WIDTH, REGION_HEIGHT)?;
     rendered.blue(bounds);
-    let attempt = pool.attempt()?;
-    let publication = pool.publish(backing, frame, &attempt, bounds, 1.0, &|| true)?;
+    // 分区边界和尾列也沿同一生产准入；一像素变化必须回正常发布，不用复用结果作颜色 oracle。
+    let reused = previous
+        .map(|previous| pool.reuse_publication(backing, frame, previous, bounds, 1.0, &|| true))
+        .transpose()?
+        .flatten();
+    let publication = match reused {
+        Some(publication) => publication,
+        None => {
+            let attempt = pool.attempt()?;
+            pool.publish(backing, frame, &attempt, bounds, 1.0, &|| true)?
+        }
+    };
     pool.validate(backing, &publication, &|| true)?;
     pool.mount().renderInContext(&rendered.context);
     CGContext::flush(Some(&rendered.context));
@@ -257,7 +268,9 @@ pub(super) fn run(_mtm: MainThreadMarker) -> Result<()> {
             let mut publication = None;
             let result = (|| -> Result<usize> {
                 frames.push(encode(&source, counters.clone(), None)?);
-                publication = Some(render_exact(&pool, &backing, &frames[0], &source, bounds)?);
+                publication = Some(render_exact(
+                    &pool, &backing, &frames[0], &source, bounds, None,
+                )?);
                 // 只登记该次真实发布的瓦片；后继缩窗/换组的旧角色仍须按原 Weak 验证已归还。
                 for group in &pool.groups {
                     let slots = group.slots.borrow().clone();
@@ -269,7 +282,14 @@ pub(super) fn run(_mtm: MainThreadMarker) -> Result<()> {
                 let same_reused = same.reused_images == 3
                     && (0..3).all(|index| same_images(&frames[0], &same, index));
                 frames.push(same);
-                publication = Some(render_exact(&pool, &backing, &frames[1], &source, bounds)?);
+                publication = Some(render_exact(
+                    &pool,
+                    &backing,
+                    &frames[1],
+                    &source,
+                    bounds,
+                    publication.as_ref(),
+                )?);
                 // 只登记该次真实发布的瓦片；后继缩窗/换组的旧角色仍须按原 Weak 验证已归还。
                 for group in &pool.groups {
                     let slots = group.slots.borrow().clone();
@@ -293,7 +313,14 @@ pub(super) fn run(_mtm: MainThreadMarker) -> Result<()> {
                     && changed_images(&frames[0], &changed, 0)
                     && (1..3).all(|index| same_images(&frames[0], &changed, index));
                 frames.push(changed);
-                publication = Some(render_exact(&pool, &backing, &frames[2], &source, bounds)?);
+                publication = Some(render_exact(
+                    &pool,
+                    &backing,
+                    &frames[2],
+                    &source,
+                    bounds,
+                    publication.as_ref(),
+                )?);
                 // 只登记该次真实发布的瓦片；后继缩窗/换组的旧角色仍须按原 Weak 验证已归还。
                 for group in &pool.groups {
                     let slots = group.slots.borrow().clone();
