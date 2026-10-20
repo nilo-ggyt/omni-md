@@ -2887,11 +2887,19 @@ impl NativeMarkdownHostedTableProbe {
 
     /// 字段激活前由真实窗口resize通知完成布局，往返后正文、选择和历史必须仍是同一基线。
     fn verify_toolbar_resize(&self, facts: &AppendFacts) -> Result<(), String> {
-        let panel = with_active_native_markdown_surface(|surface| {
+        let started = Instant::now();
+        let (panel, input) = with_active_native_markdown_surface(|surface| {
             if !self.current(surface, facts, facts.generation) {
                 return Err("缩放前原窗口已改变".into());
             }
-            Ok(surface.panel.clone())
+            let input = surface
+                .editor
+                .as_ref()
+                .unwrap()
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            Ok((surface.panel.clone(), input))
         })?;
         let original = panel
             .contentView()
@@ -2917,6 +2925,26 @@ impl NativeMarkdownHostedTableProbe {
         drop(panel);
         result?;
         restored?;
+        // 控件frame同步正确不代表正文已完成异步重排；restore同样会撤旧几何和CPU票。
+        // 原panel强claim及ACTIVE租约均已归还，才沿本次三尺寸动作的同一三秒期限
+        // 等待当前Ready与真实CPU同key；true要求字段尚未激活，不把后来子格当父终点。
+        self.wait_parent(facts, facts.generation, started, true)?;
+        self.verify_actual_toolbar_frames(facts, original)?;
+        with_active_native_markdown_surface(|surface| {
+            if !self.current(surface, facts, facts.generation)
+                || surface
+                    .editor
+                    .as_ref()
+                    .unwrap()
+                    .text_view
+                    .input_state()
+                    .map_err(|cause| cause.to_string())?
+                    != input
+            {
+                return Err("窗口缩放等待改变了原完整正文输入".into());
+            }
+            Ok(())
+        })?;
         println!(
             "native_toolbar_resize actual_delegate=true minimum=900x600 larger=1400x900 original_size_restored=true source_selection_history_unchanged=true formal=false"
         );
