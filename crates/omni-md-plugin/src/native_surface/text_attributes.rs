@@ -264,10 +264,9 @@ pub(super) fn native_markdown_base_font(
                 .then_some(&palette.table_header_font)
             })
             .or_else(|| {
-                // Code and formula spans require stable monospaced glyph widths.
+                // 只有代码语义使用等宽字体，普通美元文字保留其原有正文或强调字体。
                 (styles.contains(MarkdownPresentationStyles::INLINE_CODE)
-                    || styles.contains(MarkdownPresentationStyles::FENCED_CODE)
-                    || styles.contains(MarkdownPresentationStyles::FORMULA))
+                    || styles.contains(MarkdownPresentationStyles::FENCED_CODE))
                 .then_some(&palette.fixed_font)
             })
             .or_else(|| {
@@ -767,7 +766,7 @@ pub(super) fn build_markdown_text_attributes_with_row_height(
     MarkdownTextAttributes::from_slices(&keys, &values)
 }
 
-/// 基线以pt表达同一原属性规则；隐藏语法和Source没有内容偏移，两个脚本样式同时存在时保原下标优先级。
+/// 基线以pt表达原下标属性；普通文字、隐藏语法和Source不产生内容偏移。
 pub(super) fn native_markdown_baseline_offset(
     styles: MarkdownPresentationStyles,
     source_mode: bool,
@@ -779,8 +778,6 @@ pub(super) fn native_markdown_baseline_offset(
         && !styles.contains(MarkdownPresentationStyles::MARKER)
     {
         Some(-3.0)
-    } else if styles.contains(MarkdownPresentationStyles::SUPERSCRIPT) {
-        Some(4.0)
     } else {
         None // 普通文字和显露的下标marker保持原字体基线，不新增一个零值Native属性。
     }

@@ -67,7 +67,6 @@ impl Role {
         }
         if styles.contains(MarkdownPresentationStyles::INLINE_CODE)
             || styles.contains(MarkdownPresentationStyles::FENCED_CODE)
-            || styles.contains(MarkdownPresentationStyles::FORMULA)
         {
             Self::Code
         } else {

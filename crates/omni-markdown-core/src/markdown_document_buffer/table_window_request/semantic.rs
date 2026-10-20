@@ -617,7 +617,6 @@ impl MarkdownTableWindowRequest {
             container_prefix_runs: &self.prefix_runs,
             global,
             active_selection: self.selection.clone(),
-            math_rows: Some(&ticket.math_rows),
         })
         .map_err(MarkdownTableRequestError::Window)
     }

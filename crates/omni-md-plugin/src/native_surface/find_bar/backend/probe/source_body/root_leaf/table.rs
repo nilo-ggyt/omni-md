@@ -441,7 +441,7 @@ fn syntax_carets(rig: &mut Rig) -> Result<(), String> {
     unchanged(rig)
 }
 
-/// 原链接只在真实mouseUp消费，固定片段目标保typed拒绝；不打开浏览器或改变产品手势。
+/// 链接只在真实 Command mouseUp 消费，固定片段目标保 typed 拒绝；不打开浏览器。
 fn link(rig: &mut Rig) -> Result<(), String> {
     rig.panel.makeKeyWindow();
     rig.panel.makeFirstResponder(Some(&**rig.view));
@@ -466,11 +466,11 @@ fn link(rig: &mut Rig) -> Result<(), String> {
         return Err("真实格链接没有命中可见标签或丢失原Parser目标".into());
     }
     drop(scene);
-    links::mouse(rig, window_point, NSEventType::LeftMouseDown)?;
+    links::command_mouse(rig, window_point, NSEventType::LeftMouseDown)?;
     if rig.view.input_state().map_err(|cause| cause.to_string())? != key.request.input {
         return Err("表格链接mouseDown提前改写了选择或吞掉原拖动入口".into());
     }
-    links::mouse(rig, window_point, NSEventType::LeftMouseUp)?;
+    links::command_mouse(rig, window_point, NSEventType::LeftMouseUp)?;
     if !matches!(links::settle(rig)?, Some(ViewError::LinkAnchorUnsupported)) {
         return Err("表格链接真实mouseUp没有按现片段导航边界交付typed结果".into());
     }

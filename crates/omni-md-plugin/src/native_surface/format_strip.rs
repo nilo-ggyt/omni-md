@@ -10,28 +10,25 @@ const HORIZONTAL_PADDING: f64 = 8.0;
 const SIDE_PADDING: f64 = 12.0;
 const GAP: f64 = 2.0;
 
-/// 附件后保持原React的十九项顺序；tag只进入已有命令分派，不在本层实现格式规则。
+/// 原横滚格式栏保留日常编辑动作和顺序；既有 tag 不重编号，也不为已删除动作保留别名。
 const BUTTONS: &[(isize, &str, &str)] = &[
     (3, "附件", "导入附件并在原光标处插入链接"),
-    (100, "H1", "一级标题"),
-    (101, "H2", "二级标题"),
-    (102, "H3", "三级标题"),
-    (103, "B", "加粗"),
-    (104, "I", "斜体"),
-    (105, "U", "下划线"),
-    (106, "S", "删除线"),
-    (107, "</>", "行内代码"),
-    (108, "↗", "链接"),
-    (110, "•", "无序列表"),
-    (111, "1.", "有序列表"),
-    (112, "☑", "任务列表"),
-    (109, "❞", "引用"),
-    (118, "▦", "表格"),
-    (113, "ƒ", "行内公式"),
-    (117, "∑", "块级公式"),
-    (114, "x²", "上标"),
-    (116, "{ }", "代码块"),
-    (115, "—", "分隔线"),
+    (100, "标题一", "一级标题"),
+    (101, "标题二", "二级标题"),
+    (102, "标题三", "三级标题"),
+    (103, "加粗", "加粗"),
+    (104, "斜体", "斜体"),
+    (105, "下划线", "下划线"),
+    (106, "删除线", "删除线"),
+    (107, "行内代码", "行内代码"),
+    (108, "链接", "链接"),
+    (110, "无序列表", "无序列表"),
+    (111, "有序列表", "有序列表"),
+    (112, "任务列表", "任务列表"),
+    (109, "引用", "引用"),
+    (118, "表格", "表格"),
+    (116, "代码块", "代码块"),
+    (115, "分隔线", "分隔线"),
 ];
 
 /// 构造唯一横向格式区，将按钮交回原controls所有者；返回根控件只供已有页眉布局观察。
@@ -62,8 +59,7 @@ pub(super) fn install(
 
     // SAFETY: AppKit固定字体权重常量在进程内始终有效，只用于这些静态短标签的标准字体。
     let weight = unsafe { NSFontWeightSemibold };
-    let format_font = NSFont::monospacedSystemFontOfSize_weight(11.0, weight);
-    let attachment_font = NSFont::systemFontOfSize_weight(11.0, weight);
+    let font = NSFont::systemFontOfSize_weight(11.0, weight);
     let tint = NSColor::colorWithSRGBRed_green_blue_alpha(0.61, 0.65, 0.72, 1.0);
     let mut x = SIDE_PADDING;
     for (index, &(tag, title, explanation)) in BUTTONS.iter().enumerate() {
@@ -84,12 +80,10 @@ pub(super) fn install(
         button.setToolTip(Some(&NSString::from_str(explanation)));
         button.setAccessibilityLabel(Some(&NSString::from_str(explanation)));
         button.setContentTintColor(Some(&tint));
-        if index == 0 {
-            // 附件沿原独立中文入口使用系统字体；常驻边框保留与后续格式符号的原分隔。
-            button.setFont(Some(&attachment_font));
-        } else {
-            // 格式符号保持原等宽字形与hover边框；鼠标点击不会将输入焦点转到按钮。
-            button.setFont(Some(&format_font));
+        // 所有动作直接显示中文职责，系统字体保证中文实际宽度；不靠符号或悬停才能发现功能。
+        button.setFont(Some(&font));
+        if index != 0 {
+            // 附件仍保原常驻边框，其他动作只在悬停时显示边框；输入焦点仍属于正文。
             button.setShowsBorderOnlyWhileMouseInside(true);
         }
         // 只测实际按钮的固定短标题；真实字体宽加原左右8pt，不以字符数估计或读取正文。

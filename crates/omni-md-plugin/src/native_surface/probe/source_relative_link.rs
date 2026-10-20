@@ -427,9 +427,9 @@ impl RelativeLink {
         let application = NSApplication::sharedApplication(window.mtm());
         for kind in [NSEventType::LeftMouseDown, NSEventType::LeftMouseUp] {
             let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-                kind, point, NSEventModifierFlags::empty(), 1.0, window.windowNumber(), None, 1, 1, 1.0,
+                kind, point, NSEventModifierFlags::Command, 1.0, window.windowNumber(), None, 1, 1, 1.0,
             ).ok_or("无法建立本次有限真实鼠标语义")?;
-            // 原窗口号和真实命中坐标只各入队一次；由NSApplication→原NSWindow→原View派发。
+            // Command 单击沿原窗口号和真实命中坐标各入队一次；由NSApplication→原NSWindow→原View派发。
             // 不直接调用View selector或切笔记实现；这里不手动pump、重播或补点击。
             application.postEvent_atStart(&event, false);
         }

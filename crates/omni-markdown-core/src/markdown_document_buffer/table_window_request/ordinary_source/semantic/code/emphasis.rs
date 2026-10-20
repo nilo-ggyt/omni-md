@@ -363,6 +363,7 @@ fn presentation_style(style: EmphasisStyle) -> Option<MarkdownPresentationStyles
         EmphasisStyle::Strong => MarkdownPresentationStyles::STRONG,
         EmphasisStyle::Strikethrough => MarkdownPresentationStyles::STRIKETHROUGH,
         EmphasisStyle::Subscript => MarkdownPresentationStyles::SUBSCRIPT,
-        EmphasisStyle::Superscript => MarkdownPresentationStyles::SUPERSCRIPT,
+        // 原kernel只可由启用的选项签发此标签；本产品不启用该扩展，也不将其伪装成普通完成态。
+        EmphasisStyle::Superscript => unreachable!("未启用上标扩展"),
     })
 }

@@ -561,7 +561,6 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
         Format::Blockquote,
         Format::Divider,
         Format::CodeBlock,
-        Format::FormulaBlock,
         Format::Table,
     ] {
         let before = owner.state().unwrap();

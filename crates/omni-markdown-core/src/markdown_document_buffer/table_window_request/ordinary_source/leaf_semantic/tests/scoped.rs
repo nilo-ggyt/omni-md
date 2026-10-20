@@ -32,6 +32,11 @@ fn production_scoped_plain_origins_preserve_content_markers_and_canonical_file()
             ["开头", "懒续行中文", ""],
             MarkdownPresentationStyles::BLOCK_QUOTE,
         ),
+        (
+            "- $中文金额😀$和花括号{}\n",
+            ["$中文金额😀$和花括号{}", "", ""],
+            MarkdownPresentationStyles::UNORDERED_LIST,
+        ),
     ] {
         let (directory, mut doc) = document(source);
         // 选择放在文尾，避免测试把当前 item 的字面显露误认成另一份解析来源。
@@ -169,7 +174,6 @@ fn production_scoped_plain_uses_same_request_for_long_viewports_and_rejects_fore
 fn production_scoped_long_links_and_other_roles_keep_real_unknown_intersections() {
     for source in [
         format!("> [{}](https://example.com)\n", "长链接正文".repeat(180)),
-        format!("- $仍需数学{}$\n", "长正文".repeat(250)),
         format!(
             "[^脚注]: [{}](https://example.com)\n",
             "长链接正文".repeat(180)

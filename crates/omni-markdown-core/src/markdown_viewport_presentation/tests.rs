@@ -154,8 +154,6 @@ fn commonmark_gfm_and_confirmed_extensions_receive_semantic_styles() {
         MarkdownPresentationStyles::HORIZONTAL_RULE,
         MarkdownPresentationStyles::FENCED_CODE,
         MarkdownPresentationStyles::TABLE,
-        MarkdownPresentationStyles::FORMULA,
-        MarkdownPresentationStyles::SUPERSCRIPT,
         MarkdownPresentationStyles::UNDERLINE,
     ] {
         // Check each independent feature bit rather than allowing a nonempty aggregate to hide a missing extension.
@@ -164,7 +162,59 @@ fn commonmark_gfm_and_confirmed_extensions_receive_semantic_styles() {
 }
 
 #[test]
-/// 单~下标、双~~删除线和上标独立；组合样式不能把中文或emoji重新解释成删除线。
+/// 普通美元文字和原公式源均可直接编辑；预览不得隐藏美元或强制改为等宽公式字体。
+fn dollars_remain_literal_in_paragraphs_and_multiline_source() {
+    for source in [
+        "价格 $10，另一项 $20。\n",
+        "$中文😀$\n",
+        "$$\n中文 + **加粗**\n$$\n",
+    ] {
+        let presentation = rebuilt_presentation(source, 0, usize::MAX..usize::MAX);
+        for (byte, _) in source.match_indices('$') {
+            let at = utf16_offset_at_byte(source, byte);
+            let styles = presentation
+                .query(at)
+                .expect("美元原文必须有当前展示属性")
+                .styles;
+            assert!(!styles.contains(MarkdownPresentationStyles::MARKER));
+            assert!(!styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER));
+            assert!(!styles.contains(MarkdownPresentationStyles::INLINE_CODE));
+            assert!(!styles.contains(MarkdownPresentationStyles::FENCED_CODE));
+        }
+    }
+}
+
+#[test]
+/// 停用非核心上标语法后保留所有^及Unicode上下标字符，不把数学文字转换成另一份正文。
+fn carets_and_unicode_scripts_remain_literal_without_superscript_styles() {
+    let source = "^中文😀^ x^2^ 原生字符²₃ **粗体^内部^** `^代码^`\n";
+    let presentation = rebuilt_presentation(source, 0, usize::MAX..usize::MAX);
+    for (byte, character) in source
+        .char_indices()
+        .filter(|(_, value)| matches!(value, '^' | '²' | '₃'))
+    {
+        let at = utf16_offset_at_byte(source, byte);
+        let styles = presentation
+            .query(at)
+            .expect("原字符必须保留展示范围")
+            .styles;
+        assert!(
+            !styles.contains(MarkdownPresentationStyles::MARKER),
+            "{character}"
+        );
+        assert!(
+            !styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER),
+            "{character}"
+        );
+        assert!(
+            !styles.contains(MarkdownPresentationStyles::SUBSCRIPT),
+            "{character}"
+        );
+    }
+}
+
+#[test]
+/// 单~下标与双~~删除线独立；普通^字面不能获得marker或下标样式。
 fn subscript_is_distinct_from_strike_and_composes_with_inline_styles() {
     let source = "H~2~O ~~删除~~ ^上标^ ~**中文😀**~ ~*斜体*~ ~[链接](https://example.test)~";
     let length = source.encode_utf16().count();
@@ -172,7 +222,6 @@ fn subscript_is_distinct_from_strike_and_composes_with_inline_styles() {
     for (text, expected) in [
         ("2", MarkdownPresentationStyles::SUBSCRIPT),
         ("删除", MarkdownPresentationStyles::STRIKETHROUGH),
-        ("上标", MarkdownPresentationStyles::SUPERSCRIPT),
         (
             "中文",
             MarkdownPresentationStyles::SUBSCRIPT.union(MarkdownPresentationStyles::STRONG),

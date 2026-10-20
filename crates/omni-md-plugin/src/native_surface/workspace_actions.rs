@@ -237,7 +237,7 @@ pub(super) fn install_native_markdown_workspace_controls(
         controls.push(button(title, explanation, tag, action, role));
     }
 
-    // 原附件与十九项格式按钮只装配一次；局部位置归实际横滚内容，页眉只布局整个视口。
+    // 原附件与日常格式按钮只装配一次；局部位置归实际横滚内容，页眉只布局整个视口。
     let strip = super::format_strip::install(
         controller,
         content,
@@ -1531,8 +1531,9 @@ pub(super) fn perform_native_markdown_workspace_action(action: isize) -> Result<
             insert_native_markdown_paged_attachment(&session, note, &path, &view, false)
                 .map_err(|cause| cause.to_string())
         }
-        // 普通查找直接保留原完整替换面板；字段和真实editor/Undo仍属于本会话。
-        7 | 8 => show_native_markdown_find_bar(true),
+        // 普通查找不展开替换字段；替换沿独立菜单入口，二者共用本会话原栏和字段历史。
+        7 => show_native_markdown_find_bar(false),
+        8 => show_native_markdown_find_bar(true),
         // 折叠只改变当前分页客户的显示事实，不提交字符或改写历史。
         20 | 21 => {
             let view = ACTIVE_NATIVE_MARKDOWN_SURFACE
@@ -1561,7 +1562,7 @@ pub(super) fn perform_native_markdown_workspace_action(action: isize) -> Result<
         // 真实菜单和独立插表 action 共用一次提交、明确首格选择及 RequiredRow 激活，不落旧格式器分支。
         118 => insert_table_into_active_native_markdown_editor(),
         // 其余格式仍沿同一已捕获选择和 canonical 事务处理。
-        100..=117 | 22 | 23 => {
+        100..=112 | 115..=116 | 22 | 23 => {
             let intent = NativeMarkdownWorkspacePagedEditIntent::capture(&controller)
                 .ok_or("格式操作的原文档或选择已经改变")?;
             intent.perform(action)
@@ -1698,16 +1699,10 @@ pub(super) fn native_markdown_format_action(action: isize) -> Result<MarkdownFor
         111 => MarkdownFormatAction::OrderedList,
         // 任务列表为每条所选行插入未勾选的源复选框。
         112 => MarkdownFormatAction::TaskList,
-        // 行内公式的成对标记继续进入唯一 canonical 正文。
-        113 => MarkdownFormatAction::InlineFormula,
-        // 上标用明确的 canonical HTML 标签表示。
-        114 => MarkdownFormatAction::Superscript,
         // 分隔线模板按原默认内容插在真实 head，不删除原选择。
         115 => MarkdownFormatAction::Divider,
         // 代码围栏保留原占位选区与周围换行。
         116 => MarkdownFormatAction::CodeBlock,
-        // 块公式以一个历史编辑插入原有限模板。
-        117 => MarkdownFormatAction::FormulaBlock,
         // 未知 tag 不具有任何正文修改权限。
         _ => return Err("无法识别的格式命令".into()),
     })

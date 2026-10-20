@@ -95,6 +95,17 @@ pub(super) struct PressedLink {
     index: usize,
 }
 
+/// 链接跟随只接受明确的 Command 单击；普通点击和选择修饰键始终保留原文字定位语义。
+/// 忽略 Caps Lock 等非手势标志，但 Shift、Option 或 Control 不能被误解释成打开目标。
+fn link_activation_modifiers(flags: NSEventModifierFlags) -> bool {
+    flags
+        & (NSEventModifierFlags::Command
+            | NSEventModifierFlags::Shift
+            | NSEventModifierFlags::Option
+            | NSEventModifierFlags::Control)
+        == NSEventModifierFlags::Command
+}
+
 fn navigation(selector: Sel) -> Option<(Nav, bool)> {
     // 这些都是既有Cocoa文本语义动作；方向与视觉侧仍须由原Source真实Bidi证明。
     for (normal, extending, action) in [
@@ -1502,7 +1513,7 @@ impl NativeMarkdownPagedTextView {
             let clicks = usize::try_from(clicks)
                 .map_err(|_| NativeMarkdownPagedTextViewError::InvalidGeometry)?;
             let extend = dragging || flags.contains(NSEventModifierFlags::Shift);
-            if !dragging && !extend && clicks == 1 {
+            if !dragging && !extend && clicks == 1 && link_activation_modifiers(flags) {
                 let selected = origin.state.primary_range;
                 let inside_selection = if selected.length == 0 {
                     false
@@ -1515,7 +1526,7 @@ impl NativeMarkdownPagedTextView {
                     if !scene.current(self) {
                         return Err(NativeMarkdownPagedTextViewError::Revoked);
                     }
-                    // 链接 Down 仍是一次真实的选择手势：只登记原身份，不改 canonical 或提前打开目标。
+                    // Command 链接 Down 只登记原身份，不改 canonical 或提前打开目标；普通单击已走原选择主线。
                     // 后续 Drag 可以撤链接权限后沿此 Down 继续，不能等到 Drag 才为旧锚点补造身份。
                     let _intent = self.claim_cell_pointer_intent();
                     *self.ivars().link_intent.borrow_mut() = Some(std::rc::Rc::new(()));
@@ -1949,6 +1960,12 @@ impl NativeMarkdownPagedTextView {
             let scene = self.scene()?;
             if !scene.key.same(&pressed.key) {
                 return Err(NativeMarkdownPagedTextViewError::Revoked);
+            }
+            // 按下后放开 Command 就取消跟随，不让旧手势在抬起时凭先前修饰键打开目标。
+            let modifiers = scene.step(self, || event.modifierFlags())?;
+            if !link_activation_modifiers(modifiers) {
+                self.retire_link_intent(&intent);
+                return Ok(());
             }
             let point = scene.step(self, || event.locationInWindow())?;
             let local = scene.step(self, || self.convertPoint_fromView(point, None))?;

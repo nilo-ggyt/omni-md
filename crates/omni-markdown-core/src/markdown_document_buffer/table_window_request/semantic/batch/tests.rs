@@ -708,10 +708,6 @@ fn required_previous_replays_same_table_math_and_offsets_without_restarting_main
         oracle.coverage_for(&doc).unwrap()
     );
     assert_eq!(
-        actual.replay.as_ref().unwrap().chunk.math,
-        oracle.replay.as_ref().unwrap().chunk.math
-    );
-    assert_eq!(
         global,
         request.structure.as_ref().unwrap().global.as_ref().unwrap() as *const GlobalFrontier
     );

@@ -65,11 +65,26 @@ impl CpuSurface {
         Ok(())
     }
     pub(super) fn wake_deferred(self: &Rc<Self>, view: &NativeMarkdownPagedTextView) -> Result<()> {
-        if let Some(serial) = self.deferred.take()
+        let continuation = if let Some(serial) = self.deferred.take()
             && self.active_serial.get() == Some(serial)
         {
-            self.schedule(view, serial)?;
-        }
-        Ok(())
+            self.schedule(view, serial)
+        } else {
+            Ok(())
+        };
+        // 原同步栈已经归还 PaintUse，才能让 AppKit 重新交付 updateLayer。
+        // 此处只标脏当前真实客户，不领取 Scene，也不把旧票重新签给已接受的新输入。
+        let repaint = if self.repaint_requested.replace(false) && !view.ivars().closed.get() {
+            (|| {
+                let origin = view.origin()?;
+                self.layer_current(view, &|| origin.current(view))?;
+                origin.step(view, || view.setNeedsDisplay(true))
+            })()
+        } else {
+            Ok(())
+        };
+        // 两项都执行，保证原 serial 的调度错误不会丢掉较新 Scene 的重绘请求。
+        // 原 continuation 首错仍优先，调用者再保留原 paint/Source 的更早失败。
+        continuation.and(repaint)
     }
 }

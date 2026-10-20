@@ -104,8 +104,6 @@ fn cell_inline_formats_match_original_plan_and_keep_one_local_undo_with_exact_se
         MarkdownFormatAction::Underline,
         MarkdownFormatAction::Strikethrough,
         MarkdownFormatAction::InlineCode,
-        MarkdownFormatAction::InlineFormula,
-        MarkdownFormatAction::Superscript,
         MarkdownFormatAction::Link,
     ] {
         for selection in [
@@ -115,7 +113,7 @@ fn cell_inline_formats_match_original_plan_and_keep_one_local_undo_with_exact_se
             },
             MarkdownTextSelection::caret(2),
         ] {
-            // 小样本直接由原正文格式计划作oracle；不再维护八套预期标记或格内格式算法。
+            // 小样本直接由原正文格式计划作oracle；格内不另存一套日常格式标记或包裹算法。
             let (_oracle_dir, mut oracle) = document(raw);
             let expected_edit = oracle.apply_format(action, selection).unwrap();
             let expected = canonical(&oracle);
@@ -195,7 +193,6 @@ fn cell_block_formats_and_active_composition_preserve_the_original_draft() {
         MarkdownFormatAction::Blockquote,
         MarkdownFormatAction::Divider,
         MarkdownFormatAction::CodeBlock,
-        MarkdownFormatAction::FormulaBlock,
         MarkdownFormatAction::Table,
     ] {
         let edit = doc.capture_cell_draft_edit(&token).unwrap();
@@ -204,7 +201,7 @@ fn cell_block_formats_and_active_composition_preserve_the_original_draft() {
             Err(MarkdownCellDraftError::FormatRequiresDocument)
         );
         assert_eq!(doc.cell_draft_facts(&token).unwrap(), before);
-    } // 原11项仍须由Native先完成单格生命周期，再分派正文；不能在格内造块语法。
+    } // 块动作仍须由Native先完成单格生命周期，再分派正文；不能在格内造块语法。
     edit(
         &mut doc,
         &token,

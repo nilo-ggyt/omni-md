@@ -10,7 +10,7 @@ use streaming::{prepare_dense_line_prefix, scan_heading_whitespace};
 /// Shared-marker insertion is finite; dense selections use a chunked canonical replacement instead.
 const MAX_SPARSE_PREFIX_LINES: usize = 4096;
 
-/// Product formatting commands, preserving the original editor's primary-selection behavior.
+/// 日常编辑动作只提供具有完整正文与预览语义的格式；不生成缺少排版实现的公式或上标模板。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownFormatAction {
     Bold,
@@ -18,8 +18,6 @@ pub enum MarkdownFormatAction {
     Underline,
     Strikethrough,
     InlineCode,
-    InlineFormula,
-    Superscript,
     Link,
     Heading1,
     Heading2,
@@ -30,7 +28,6 @@ pub enum MarkdownFormatAction {
     Blockquote,
     Divider,
     CodeBlock,
-    FormulaBlock,
     Table,
 }
 
@@ -44,8 +41,6 @@ impl MarkdownFormatAction {
             Self::Underline => Some(("<u>", "</u>", "下划线文字")), // 下划线继续使用 canonical HTML。
             Self::Strikethrough => Some(("~~", "~~", "删除线文字")), // GFM 成对波浪线。
             Self::InlineCode => Some(("`", "`", "code")),           // 空 caret 保留原 code 占位。
-            Self::InlineFormula => Some(("$", "$", "x^2")),         // 行内公式只包裹表达式。
-            Self::Superscript => Some(("<sup>", "</sup>", "上标")), // 上标仍为明确 HTML 源。
             Self::Link => Some(("[", "](https://)", "链接文字")),   // URL 模板不进入标签选区。
             _ => None, // 标题、列表与模板保持各自正文块计划，不伪造表格行内表达。
         }
@@ -135,9 +130,8 @@ impl MarkdownDocumentBuffer {
             Ok(wrap_plan(start..end, opening, closing, placeholder))
         };
         match action {
-            Bold | Italic | Underline | Strikethrough | InlineCode | InlineFormula
-            | Superscript | Link => {
-                // 此分支按相同八种 enum 准入；与单格格式消费同一领域投影，不维护第二套标记。
+            Bold | Italic | Underline | Strikethrough | InlineCode | Link => {
+                // 正文与单格消费同一组日常行内标记，不为菜单另存模板或生成不可预览的语法。
                 let (opening, closing, placeholder) = action
                     .inline_markers()
                     .expect("行内格式分支必须具有领域标记");
@@ -166,8 +160,6 @@ impl MarkdownDocumentBuffer {
                 5,
                 9,
             )),
-            // Select the formula expression inside the two display-math fences.
-            FormulaBlock => Ok(template_plan(selection.head_utf16, "\n$$\nx^2\n$$\n", 4, 7)),
             // The format-menu template retains the baseline's two-column table and header selection.
             Table => Ok(template_plan(
                 selection.head_utf16,

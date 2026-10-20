@@ -63,8 +63,8 @@ pub(super) fn markdown_find_key_command(event: &NSEvent) -> Option<MarkdownFindK
             | NSEventModifierFlags::Shift);
     match (event.keyCode(), relevant) {
         (3, flags) if flags == NSEventModifierFlags::Command => {
-            Some(MarkdownFindKeyCommand::Show(true))
-        } // Cmd-F。
+            Some(MarkdownFindKeyCommand::Show(false))
+        } // Cmd-F 只打开查找；替换由原独立命令显式展开。
         (3, flags) if flags == (NSEventModifierFlags::Command | NSEventModifierFlags::Option) => {
             Some(MarkdownFindKeyCommand::Show(true))
         } // Option-Cmd-F。
@@ -94,7 +94,7 @@ pub(super) fn dispatch_markdown_find_key_command(
             if exists {
                 perform_native_markdown_find_action(action).map(|_| ())
             } else {
-                show_native_markdown_find_bar(true)
+                show_native_markdown_find_bar(false)
             }
         }
     }

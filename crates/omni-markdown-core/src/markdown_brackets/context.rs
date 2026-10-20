@@ -19,7 +19,6 @@ pub(super) enum Context {
     Strong,
     Strike,
     Subscript,
-    Superscript,
     Link,
     Image,
     LinkMark,
@@ -47,8 +46,7 @@ pub(super) fn classify_contexts(source: &str) -> Option<Vec<Context>> {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_SUBSCRIPT
-        | Options::ENABLE_SUPERSCRIPT;
+        | Options::ENABLE_SUBSCRIPT;
     // Lezer recognizes unresolved shortcut/reference links syntactically, without consulting a vault.
     let mut broken_link = |_link: pulldown_cmark::BrokenLink<'_>| {
         Some((
@@ -97,8 +95,6 @@ pub(super) fn classify_contexts(source: &str) -> Option<Vec<Context>> {
                     Tag::Strikethrough => Context::Strike,
                     // The preserved extended language gives subscript its own context identity.
                     Tag::Subscript => Context::Subscript,
-                    // Superscript does not share ordinary Paragraph nesting despite similar source positions.
-                    Tag::Superscript => Context::Superscript,
                     Tag::Link { link_type, .. } | Tag::Image { link_type, .. } => {
                         let image = source.as_bytes().get(range.start) == Some(&b'!');
                         links.push(LinkRegion {
@@ -200,7 +196,6 @@ fn inline_context(context: Context) -> bool {
             | Context::Strong
             | Context::Strike
             | Context::Subscript
-            | Context::Superscript
             | Context::Link
             | Context::Image
             | Context::TableCell

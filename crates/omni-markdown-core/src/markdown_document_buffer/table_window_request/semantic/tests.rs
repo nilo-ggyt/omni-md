@@ -108,7 +108,7 @@ fn complete_request_preserves_full_physical_container_prefix_and_unicode_styles(
 }
 
 #[test]
-fn global_reference_underline_and_math_context_are_all_required_before_ready() {
+fn global_reference_and_underline_remain_required_around_literal_dollars() {
     let hidden = format!("$x${}", "{}".repeat(255));
     let source = format!(
         "<u>opening\n\n| H | C |\n| - | - |\n| {hidden} | skipped |\n| $}}x{{y$ [r] | 中文😀 |\n\n</u>\n\n[r]: /real \"title\"\n"

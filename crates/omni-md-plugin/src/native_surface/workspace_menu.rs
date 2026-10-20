@@ -50,8 +50,6 @@ pub(super) const GROUPS: &[WorkspaceMenuGroup] = &[
             (106, "删除线"),
             (107, "行内代码"),
             (108, "链接"),
-            (113, "行内公式标记"),
-            (114, "上标"),
         ],
     },
     WorkspaceMenuGroup {
@@ -63,7 +61,6 @@ pub(super) const GROUPS: &[WorkspaceMenuGroup] = &[
             (112, "任务列表"),
             (115, "分隔线"),
             (116, "代码块"),
-            (117, "公式块标记"),
             (118, "表格"),
         ],
     },
@@ -136,7 +133,7 @@ pub(super) fn install_native_markdown_workspace_menu(
         let submenu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(group.title));
         submenu.setAutoenablesItems(false);
         for &(tag, title) in group.items {
-            // 所有19种格式与文件动作仍使用原tag，只有展示位置变化。
+            // 保留的日常格式与文件动作仍使用原 tag；已删除的功能没有可执行叶项。
             let item = workspace_menu_item(title, tag, controller, mtm);
             if tag == 118 {
                 // 表格仅在真实文档存在时启用，后续install/empty沿原controller方法更新此item。
@@ -233,7 +230,7 @@ pub(super) fn native_markdown_workspace_menu_action(
         let tag = button.tag();
         // 只有实际安装的这些动作按钮可直达；外方改tag不能把header按钮变成任意文件命令。
         return (owned
-            && matches!(tag, 3 | 6 | 7 | 22 | 23 | 100..=118)
+            && matches!(tag, 3 | 6 | 7 | 22 | 23 | 100..=112 | 115..=116 | 118)
             && native_markdown_controller_is_current(controller)
             && !controller.ivars().close_finalizer_scheduled.get())
         .then_some(tag);
@@ -314,45 +311,5 @@ pub(super) fn detach_native_markdown_workspace_menu(controller: &NativeMarkdownC
                 item.setAction(None);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeSet;
-
-    #[test]
-    /// 文档与原“更多”动作都保持唯一菜单入口，表格仍在原插入分组。
-    fn grouped_menu_preserves_every_existing_command_without_duplicates() {
-        let tags = std::iter::once(1)
-            .chain(CURRENT_NOTE_ACTIONS.iter().map(|item| item.0))
-            .chain(
-                GROUPS
-                    .iter()
-                    .flat_map(|group| group.items.iter().map(|item| item.0)),
-            )
-            .collect::<Vec<_>>();
-        let expected = (1..=8)
-            .chain([20, 21])
-            .chain(30..=34)
-            .chain(100..=118)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(tags.iter().copied().collect::<BTreeSet<_>>(), expected);
-        assert_eq!(tags.len(), expected.len());
-        assert!(
-            GROUPS
-                .iter()
-                .all(|group| group.items.len() <= 8 && !group.title.is_empty())
-        );
-        assert!(
-            GROUPS
-                .iter()
-                .find(|group| group.title == "段落与插入")
-                .unwrap()
-                .items
-                .iter()
-                .any(|item| item.0 == 118)
-        );
     }
 }

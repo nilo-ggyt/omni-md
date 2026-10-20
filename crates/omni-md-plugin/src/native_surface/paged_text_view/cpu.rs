@@ -28,6 +28,8 @@ pub(super) struct CpuSurface {
     pixels: Arc<NativeMarkdownViewportPixels>,
     paints: Cell<usize>,
     painting: Cell<bool>,
+    // 同步 Native 重入只合并一次重绘请求；不把较新 Scene/Input 或像素留在旧绘图栈中。
+    repaint_requested: Cell<bool>,
     published: RefCell<Option<Rc<Published>>>,
     reuses: Cell<usize>,
     candidate: RefCell<Option<candidate::Candidate>>,
@@ -131,6 +133,7 @@ impl CpuSurface {
             pixels: Arc::default(),
             paints: Cell::new(0),
             painting: Cell::new(false),
+            repaint_requested: Cell::new(false),
             published: RefCell::new(None),
             reuses: Cell::new(0),
             candidate: RefCell::new(None),
@@ -209,7 +212,21 @@ impl CpuSurface {
         view: &NativeMarkdownPagedTextView,
         scene: &SceneUse,
     ) -> Result<()> {
-        let painting = PaintUse::enter(&self.painting)?;
+        let painting = match PaintUse::enter(&self.painting) {
+            Ok(painting) => painting,
+            Err(NativeMarkdownPagedTextViewError::Pending) => {
+                // updateLayer 可在 CoreText/AppKit 的同步回调里重入。这里只拒绝第二个写入者，
+                // 原候选仍由外层独占；健康的显示请求不应成为永久输入失败。
+                let current = || scene.current(view);
+                scene.scene.validate_ready(&current)?;
+                let layer = self.layer_current(view, &current);
+                scene.scene.validate_ready(&current)?;
+                layer?; // 真实 Source、字体和 Native 所有权错误仍原样失败，不能被合并请求掩盖。
+                self.repaint_requested.set(true);
+                return Ok(());
+            }
+            Err(cause) => return Err(cause),
+        };
         let result = self.paint_inner(view, scene);
         drop(painting);
         let wake = self.wake_deferred(view); // 若真实嵌套主队列让出了延续，只在原绘图栈退出后重排同serial。
@@ -501,6 +518,7 @@ impl CpuSurface {
     }
 
     pub(super) fn detach(&self, view: &NativeMarkdownPagedTextView) -> Result<()> {
+        self.repaint_requested.set(false); // 关闭不复活较早的显示请求；标量本身没有异步业务强边。
         self.cancel_candidate(); // 先归还所有Pending session/context，不让真实业务数据躲在主队列任务里。
         let published = self.published.borrow_mut().take();
         drop(published);

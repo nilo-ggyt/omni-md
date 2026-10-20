@@ -702,16 +702,16 @@ fn streaming_output_visits_piece_sized_chunks() {
 }
 
 #[test]
-/// Protect descriptor-time type, encoding, and size checks before a document is published.
+/// 打开前统一核实文件类型、UTF-8 编码与大小；拒绝后不能改写源文件或发布半成品文档。
 fn secure_open_rejects_symlinks_non_files_invalid_utf8_and_oversize_documents() {
-    // Use real, linked, and directory entries inside one isolated temporary tree.
+    // 全部输入属于同一个隔离临时目录，真实笔记库不参与这些失败与清理操作。
     let directory = tempdir().expect("secure open fixture");
     let note = directory.path().join("Note.md");
     let linked = directory.path().join("Linked.md");
     fs::write(&note, "safe").unwrap();
     symlink(&note, &linked).unwrap();
 
-    // Links and nonregular files must fail instead of becoming mapped documents.
+    // 符号链接与非普通文件不取得正文映射，避免把外部目标或特殊设备交给编辑会话。
     assert!(matches!(
         MarkdownDocumentBuffer::open(&linked, 1_024),
         Err(MarkdownDocumentBufferError::OpenUnavailable)
@@ -721,13 +721,22 @@ fn secure_open_rejects_symlinks_non_files_invalid_utf8_and_oversize_documents() 
         Err(MarkdownDocumentBufferError::NotRegularFile)
     ));
 
-    // Invalid UTF-8 and oversized files must retain distinct errors and publish no usable buffer.
+    // UTF-16 的两种字节序和损坏的 UTF-8 都明确拒绝；不猜测编码、不替换坏字节，
+    // 更不能在打开时偷偷转码覆盖原文件。逐例复用同一隔离路径，不建立第二份编码状态。
     let invalid = directory.path().join("Invalid.md");
-    fs::write(&invalid, [0xff, 0xfe]).unwrap();
-    assert!(matches!(
-        MarkdownDocumentBuffer::open(&invalid, 1_024),
-        Err(MarkdownDocumentBufferError::InvalidUtf8Document)
-    ));
+    for bytes in [
+        &[0xff, 0xfe, 0x2d, 0x4e][..],
+        &[0xfe, 0xff, 0x4e, 0x2d][..],
+        &[0xe4, 0xb8][..],
+    ] {
+        fs::write(&invalid, bytes).unwrap();
+        assert!(matches!(
+            MarkdownDocumentBuffer::open(&invalid, 1_024),
+            Err(MarkdownDocumentBufferError::InvalidUtf8Document)
+        ));
+        assert_eq!(fs::read(&invalid).unwrap(), bytes);
+    }
+    // 文件大小仍是独立的准入结果，不能把超限误报为编码问题。
     assert!(matches!(
         MarkdownDocumentBuffer::open(&note, 3),
         Err(MarkdownDocumentBufferError::DocumentTooLarge)

@@ -100,8 +100,6 @@ impl MarkdownPresentationStyles {
     pub const HORIZONTAL_RULE: Self = Self(1 << 15);
     pub const FENCED_CODE: Self = Self(1 << 16);
     pub const TABLE: Self = Self(1 << 17);
-    pub const FORMULA: Self = Self(1 << 18);
-    pub const SUPERSCRIPT: Self = Self(1 << 19);
     pub const UNDERLINE: Self = Self(1 << 20);
     pub const MARKER: Self = Self(1 << 21);
     pub const HIDDEN_MARKER: Self = Self(1 << 22);

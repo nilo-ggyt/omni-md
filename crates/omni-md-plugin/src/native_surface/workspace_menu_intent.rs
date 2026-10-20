@@ -104,8 +104,8 @@ impl NativeMarkdownWorkspacePagedEditIntent {
         if !self.current() {
             return Err("正文菜单对应的输入已经改变".into());
         }
-        // 原字段的历史与八项行内格式都留在原草稿，不能先提交而改掉历史或丢失有向子选区。
-        let local = self.cell.is_some() && matches!(action, 22 | 23 | 103..=108 | 113..=114);
+        // 原字段的历史与六项行内格式都留在原草稿，不能先提交而改掉历史或丢失有向子选区。
+        let local = self.cell.is_some() && matches!(action, 22 | 23 | 103..=108);
         let mut committed = None;
         let target = if local {
             body.active_cell_body().ok_or("原单元格已经关闭")?
@@ -148,7 +148,7 @@ impl NativeMarkdownWorkspacePagedEditIntent {
             22 => view.command(sel!(undo:)),
             23 => view.command(sel!(redo:)),
             118 => view.insert_default_table(),
-            100..=117 => view.apply_format(native_markdown_format_action(action)?),
+            100..=112 | 115..=116 => view.apply_format(native_markdown_format_action(action)?),
             _ => return Err("该动作不是正文编辑命令".into()),
         }
         .map_err(|cause| cause.to_string())

@@ -55,38 +55,27 @@ pub(crate) struct MarkdownTableReferenceQueries {
 }
 
 impl MarkdownTableReferenceQueries {
-    /// 只解析有限投影；本层不把“投影里没有定义”误判为真实全文里不存在定义。
-    #[cfg(test)]
+    /// 只解析有限投影；缺失引用由同源全局查询补齐，不创建第二份正文或公式上下文。
     pub(crate) fn from_projection(
         projection: &str,
         actual_document_start: bool,
     ) -> Result<Self, MarkdownTableWindowError> {
-        Self::from_projection_with_math(projection, actual_document_start, None)
-    }
-
-    /// 查询库存与最终渲染必须使用同一数学seed，否则省略row可能令一个链接被错误math吞掉。
-    pub(crate) fn from_projection_with_math(
-        projection: &str,
-        actual_document_start: bool,
-        math_seeds: Option<&[pulldown_cmark::math_context::TableMathSeed]>,
-    ) -> Result<Self, MarkdownTableWindowError> {
         let mut result = Self::for_batch(None);
-        result.collect_projection_with_math(projection, actual_document_start, math_seeds)?;
+        result.collect_projection(projection, actual_document_start)?;
         result.seal_batch();
         Ok(result)
     }
 
-    /// 同批直接向唯一库存收集；不先建第二窗Map再检测总key预算。
-    pub(crate) fn collect_projection_with_math(
+    /// 同批直接向唯一库存收集；Parser选项与最终显示保持一致，美元符号按原文处理。
+    pub(crate) fn collect_projection(
         &mut self,
         projection: &str,
         actual_document_start: bool,
-        math_seeds: Option<&[pulldown_cmark::math_context::TableMathSeed]>,
     ) -> Result<(), MarkdownTableWindowError> {
         self.collect_with_options(
             projection,
             markdown_presentation_options(actual_document_start),
-            math_seeds.map(MarkdownParserSeed::TableRows),
+            None,
         )
     }
 
@@ -156,10 +145,6 @@ impl MarkdownTableReferenceQueries {
             }
             Some(MarkdownParserSeed::Scoped(context)) => {
                 Parser::new_with_inline_block_seed(projection, context, Some(&mut observe))
-                    .map_err(|_| MarkdownTableWindowError::ParserMismatch)?
-            }
-            Some(MarkdownParserSeed::TableRows(seeds)) => {
-                Parser::new_with_table_math_seeds(projection, options, Some(&mut observe), seeds)
                     .map_err(|_| MarkdownTableWindowError::ParserMismatch)?
             }
             None => Parser::new_with_broken_link_callback(projection, options, Some(&mut observe)),

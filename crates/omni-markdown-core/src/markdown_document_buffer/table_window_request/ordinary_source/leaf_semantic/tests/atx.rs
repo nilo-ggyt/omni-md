@@ -187,9 +187,7 @@ fn production_atx_large_general_inline_stays_unpublished() {
         "&amp; 实体",
         "\\*转义",
         "<u>下划线</u>",
-        "$公式$",
         "~~删除线~~",
-        "^上标^",
         "~下标~",
         "普通中文之后才有 **强调**",
     ] {
@@ -226,6 +224,29 @@ fn production_atx_large_general_inline_stays_unpublished() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn production_atx_long_literal_dollars_and_carets_keep_heading_layout() {
+    // 已删除的扩展不能继续让普通美元与插入符触发GeneralInline等待。
+    // 长标题仍经正式有界工厂产生样式，并与同一语法选项的独立完整Parser核对。
+    for text in ["$普通美元$", "^普通字符^ ²₃"] {
+        let source = format!("## {}\n\n尾\n", text.repeat(2049));
+        let (_directory, doc) = document(&source);
+        let requested = heading_range(&source);
+        let (request, sources) = leaf_sources(&doc, requested.clone());
+        let MarkdownOrdinarySemanticState::RootLeafReady(ready) = sources
+            .ordinary_semantics_for(&doc, authority(&doc))
+            .unwrap()
+        else {
+            panic!("美元和插入符字面标题必须沿原RootLeaf排版完成");
+        };
+        assert_oracle(ready, &doc, &source, &requested);
+        // 样式判定继续流式读原Source，不能因支持长字面标题而复制整段到Parser。
+        assert_eq!(request.total_work().copied_source_bytes, 0);
+        assert_eq!(request.total_work().parser_input_bytes, 0);
+        assert_eq!(request.total_work().allocated_source_capacity, 0);
+    }
 }
 
 #[test]

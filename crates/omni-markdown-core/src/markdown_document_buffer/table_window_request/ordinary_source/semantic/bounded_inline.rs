@@ -490,11 +490,6 @@ fn collect_links(
                 |_| MarkdownTableRequestError::Window(MarkdownTableWindowError::ParserMismatch),
             )?
         }
-        Some(MarkdownParserSeed::TableRows(seeds)) => {
-            Parser::new_with_table_math_seeds(source, options, Some(&mut callback), seeds).map_err(
-                |_| MarkdownTableRequestError::Window(MarkdownTableWindowError::ParserMismatch),
-            )?
-        }
         None => Parser::new_with_broken_link_callback(source, options, Some(&mut callback)),
     };
     let mut active: Vec<ActiveLink> = Vec::new();

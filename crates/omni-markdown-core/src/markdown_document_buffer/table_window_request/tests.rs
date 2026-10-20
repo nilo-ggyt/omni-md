@@ -67,14 +67,13 @@ fn real_large_table_request_keeps_only_absolute_requested_rows_and_no_source_own
     );
     assert!(!window.includes_header());
     assert!(window.table_end().is_none());
-    assert_eq!(window.math_rows().len(), 6); // H context+五个真实body，未存前4499行metadata。
     assert_eq!(Arc::strong_count(doc.root.as_ref().unwrap()), owners);
     assert!(request.total_work().byte_reads >= end_byte);
     assert!(window.rows().len() <= TABLE_WINDOW_MAX_ROWS);
 }
 
 #[test]
-fn real_source_math_ticket_restores_original_omitted_row_styles() {
+fn literal_dollars_and_braces_keep_omitted_row_projection_equal_to_full_source() {
     let hidden = format!("$x${}", "{}".repeat(255));
     let source = format!("| H |\n| - |\n| {hidden} |\n| $}}x{{y$ |\n");
     let start = source.rfind("| $}x{y$ |").unwrap();
@@ -137,7 +136,6 @@ fn real_source_math_ticket_restores_original_omitted_row_styles() {
             underline: &[],
         },
         active_selection: usize::MAX..usize::MAX,
-        math_rows: Some(ticket.math_rows()),
     })
     .unwrap();
     let mut oracle = MarkdownViewportPresentation::default();

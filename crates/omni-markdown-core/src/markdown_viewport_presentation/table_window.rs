@@ -184,14 +184,6 @@ pub(crate) enum MarkdownTableGlobalContext<'a> {
     },
 }
 
-#[cfg(feature = "s2-table-window-prototype")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 真实source按原block/row顺序扫描所得入口状态，ordinal不使用窗口Vec位置。
-pub(crate) struct MarkdownTableRowMathContext {
-    pub row_ordinal: usize,
-    pub context: pulldown_cmark::math_context::MathContext,
-}
-
 #[derive(Debug)]
 /// 仅借用本批真实行。header/delimiter必须相邻；body可从任意已证实的绝对ordinal开始。
 pub(crate) struct MarkdownTableWindowInput<'a> {
@@ -205,8 +197,6 @@ pub(crate) struct MarkdownTableWindowInput<'a> {
     pub container_prefix_runs: &'a [MarkdownPresentationRun],
     pub global: MarkdownTableGlobalContext<'a>,
     pub active_selection: Range<usize>,
-    #[cfg(feature = "s2-table-window-prototype")]
-    pub math_rows: Option<&'a [MarkdownTableRowMathContext]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -420,17 +410,13 @@ pub(crate) fn project_table_window_with_quota(
     }
     let (projection, origins, utf16, columns) = prepare_table_projection(input)?;
     let projected_selection = project_selection(&origins, &input.active_selection);
-    #[cfg(feature = "s2-table-window-prototype")]
-    let math_seeds = prepare_math_seeds(input, &origins)?;
-    let built = build_markdown_presentation_with_seeded_reference_context(
+    let built = build_markdown_presentation_with_reference_context(
         &projection,
         0,
         &projected_selection,
         input.header.byte_start == 0,
         reference_context,
         false,
-        #[cfg(feature = "s2-table-window-prototype")]
-        math_seeds.as_deref(),
     )
     .map_err(|_| MarkdownTableWindowError::SemanticLimit)?;
     let [table] = built.tables.as_slice() else {
@@ -742,12 +728,10 @@ fn prepare_table_projection<'a>(
 pub(crate) fn table_window_reference_queries(
     input: &MarkdownTableWindowInput<'_>,
 ) -> Result<references::MarkdownTableReferenceQueries, MarkdownTableWindowError> {
-    let (projection, origins, _, _) = prepare_table_projection(input)?;
-    let seeds = prepare_math_seeds(input, &origins)?;
-    references::MarkdownTableReferenceQueries::from_projection_with_math(
+    let (projection, _, _, _) = prepare_table_projection(input)?;
+    references::MarkdownTableReferenceQueries::from_projection(
         &projection,
         input.header.byte_start == 0,
-        seeds.as_deref(),
     )
 }
 
@@ -757,47 +741,9 @@ pub(crate) fn collect_table_window_reference_queries(
     input: &MarkdownTableWindowInput<'_>,
     queries: &mut references::MarkdownTableReferenceQueries,
 ) -> Result<usize, MarkdownTableWindowError> {
-    let (projection, origins, _, _) = prepare_table_projection(input)?;
-    let seeds = prepare_math_seeds(input, &origins)?;
-    queries.collect_projection_with_math(
-        &projection,
-        input.header.byte_start == 0,
-        seeds.as_deref(),
-    )?;
+    let (projection, _, _, _) = prepare_table_projection(input)?;
+    queries.collect_projection(&projection, input.header.byte_start == 0)?;
     Ok(projection.len())
-}
-
-#[cfg(feature = "s2-table-window-prototype")]
-/// seed只映射H和本批body；D不进入inline lexer，省略row不得靠投影位置补造状态。
-fn prepare_math_seeds(
-    input: &MarkdownTableWindowInput<'_>,
-    origins: &[OriginSegment<'_>],
-) -> Result<Option<Vec<pulldown_cmark::math_context::TableMathSeed>>, MarkdownTableWindowError> {
-    let Some(rows) = input.math_rows else {
-        return Ok(None);
-    };
-    if rows.len() != input.body.len() + 1 || rows.len() > TABLE_WINDOW_MAX_ROWS + 1 {
-        // 每个实际投影row都必须有原源seed，不能只种入最后一行掩盖前行对Parser的影响。
-        return Err(MarkdownTableWindowError::ContextPending);
-    }
-    let mut result = Vec::with_capacity(rows.len());
-    for (origin, row) in origins
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != 1)
-        .map(|(_, origin)| origin)
-        .zip(rows)
-    {
-        if origin.source.row_ordinal != row.row_ordinal {
-            // source ordinal是经过实际producer证明的身份；错位/重复seed拒绝整批。
-            return Err(MarkdownTableWindowError::ParserMismatch);
-        }
-        result.push(pulldown_cmark::math_context::TableMathSeed::new(
-            origin.projected_bytes.start,
-            row.context,
-        ));
-    }
-    Ok(Some(result))
 }
 
 /// 检查声明的完整行、顺序和预算；成员证明仍由document producer负责。

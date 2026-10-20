@@ -1,45 +1,37 @@
-//! 真实行边界上的单表回放；只保结构与数学状态，不重建全局前沿或保存源正文。
+//! 真实行边界上的单表回放；只保结构checkpoint，不重建全局前沿或保存源正文。
 
 use super::*;
 use pulldown_cmark::block_frontier::{TableContinuationState, TableStep};
 
 #[derive(Clone, Debug)]
-/// checkpoint 与数学状态来自同一已完成行边界；物理行号仅由 opaque checkpoint 保存并恢复。
+/// checkpoint 来自同一已接受行边界；物理行号仅由 opaque checkpoint 保存并恢复。
 /// Core 只另记真实 fact 的后继 ordinal/byte/UTF16，不从窗口局部下标或 EOF 行尾推算坐标。
 pub(super) struct Boundary {
     pub(super) checkpoint: TableCheckpoint,
-    pub(super) math: MathContext,
     pub(super) next_row_ordinal: usize,
     pub(super) next_byte: usize,
     pub(super) next_utf16: usize,
 }
 
 impl Boundary {
-    /// H/D 已由真实 Global 接受，且 H 的 HeaderActive 扫描完成后，才能保存首条 body 的入口。
+    /// H/D由真实Global接受后保存首条body入口，不再为公式状态重复扫描header。
     pub(super) fn after_delimiter(
         checkpoint: TableCheckpoint,
         header: &GlobalTableFact,
         delimiter_utf16_end: usize,
-        math: MathContext,
     ) -> Self {
         Self {
             checkpoint,
-            math,
             next_row_ordinal: 1,
             next_byte: header.separator_byte_end,
             next_utf16: delimiter_utf16_end,
         }
     }
 
-    /// Row fact 后的 checkpoint 已接受本行；math 必须同样扫完本行，不能提前绑定前一行状态。
-    pub(super) fn after_row(
-        checkpoint: TableCheckpoint,
-        row: TableRowFact,
-        math: MathContext,
-    ) -> Self {
+    /// Row fact和checkpoint来自同一次结构接受；后继坐标不依赖额外正文重放。
+    pub(super) fn after_row(checkpoint: TableCheckpoint, row: TableRowFact) -> Self {
         Self {
             checkpoint,
-            math,
             next_row_ordinal: row.row_ordinal + 1,
             next_byte: row.byte_end,
             next_utf16: row.utf16_end,
@@ -53,7 +45,6 @@ pub(super) struct ReplayAnchors {
     pub(super) header: GlobalTableFact,
     pub(super) header_utf16: Range<usize>,
     pub(super) delimiter_utf16: Range<usize>,
-    pub(super) header_math: MathContext,
     pub(super) base: Boundary,
     pub(super) chunk: Boundary,
     pub(super) halo: Option<Boundary>,
@@ -69,12 +60,6 @@ pub(super) enum ReplayOutcome {
     },
 }
 
-struct PendingRow {
-    fact: TableRowFact,
-    checkpoint: TableCheckpoint,
-    scanner: MathContextScan,
-}
-
 /// 临时续体只回放一张已验证表；结束后不接管或删除批次仍持有的主 Global。
 pub(super) struct ReplayRequest {
     source: MarkdownTableSourceIdentity,
@@ -83,8 +68,7 @@ pub(super) struct ReplayRequest {
     boundary: Boundary,
     previous: Option<Boundary>,
     table: Option<TableContinuationState>,
-    pending: Option<PendingRow>,
-    // 只保最后完成行的metadata和before seed，供不存在目标时签真实terminal窗口。
+    // 只保最后完成行与它的真实前驱边界，供不存在目标时签真实terminal窗口。
     last_completed: Option<(TableRowFact, Boundary, Option<Boundary>)>,
     consumed: bool,
     failed: Option<MarkdownTableRequestError>,
@@ -134,7 +118,7 @@ impl ReplayRequest {
             }
         }
         let boundary = if target == 0 {
-            // Header 已有独立真实 math seed；H-only 不需要让续体读取第一条 body。
+            // H/D已有独立真实结构事实；H-only不需要让续体读取第一条body。
             anchors.base.clone()
         } else {
             selected
@@ -157,7 +141,6 @@ impl ReplayRequest {
             boundary,
             previous,
             table,
-            pending: None,
             last_completed: None,
             consumed: false,
             failed: None,
@@ -182,9 +165,8 @@ impl ReplayRequest {
             self.advance_inner(document, budget)
         };
         if let Err(error) = result {
-            // 临时行扫描和续体一并释放；主 Global 由调用方持有，不会在失败后从源起点重建。
+            // 失败时释放续体与末行metadata；主Global由调用方持有，不从源起点重建。
             self.failed = Some(error);
-            self.pending = None;
             self.last_completed = None;
             self.table = None;
         }
@@ -199,7 +181,7 @@ impl ReplayRequest {
         if self.target == 0 {
             // H-only 只移交既有真实 metadata；不运行 body 分类，也不把 context-only H 混入 body。
             self.consumed = true;
-            let ticket = self.window(None, self.anchors.header_math);
+            let ticket = self.window(None);
             return Ok((
                 semantic::SemanticWork {
                     structural_transitions: 64,
@@ -207,10 +189,6 @@ impl ReplayRequest {
                 },
                 Some(ReplayOutcome::Window(Box::new(ticket))),
             ));
-        }
-        if self.pending.is_some() {
-            // 上一步只接受了结构行；本步必须完成原源 math 扫描，才能移动可公开边界。
-            return self.advance_math(document, budget);
         }
         let tree = tree_height(document);
         let child = child_budget(budget, tree)?;
@@ -260,23 +238,24 @@ impl ReplayRequest {
                 let checkpoint = table
                     .checkpoint()
                     .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-                let start = fact
-                    .byte_start
-                    .checked_add(fact.container_prefix_bytes)
-                    .filter(|start| *start <= fact.byte_end)
-                    .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-                let scanner = MathContextScan::new(
-                    self.source.generation(),
-                    self.source.byte_len(),
-                    start..fact.byte_end,
-                    self.boundary.math,
-                )
-                .map_err(MarkdownTableRequestError::Math)?;
-                self.pending = Some(PendingRow {
-                    fact,
-                    checkpoint,
-                    scanner,
-                });
+                // 原TableContinuation已完成本行与容器词法；直接消费同一checkpoint，不重读正文。
+                if fact.row_ordinal == self.target {
+                    self.anchors.chunk = self.boundary.clone();
+                    self.anchors.halo = self.previous.take();
+                    self.boundary = Boundary::after_row(checkpoint, fact);
+                    self.consumed = true;
+                    self.table = None;
+                    return Ok((
+                        work,
+                        Some(ReplayOutcome::Window(Box::new(self.window(Some(fact))))),
+                    ));
+                }
+                // 非目标行只替换固定metadata，真实前行/前驱边界仍可供末行窗口复用。
+                self.last_completed = Some((fact, self.boundary.clone(), self.previous.clone()));
+                self.previous = Some(std::mem::replace(
+                    &mut self.boundary,
+                    Boundary::after_row(checkpoint, fact),
+                ));
                 Ok((work, None))
             }
             TableStep::Ended { .. } => {
@@ -293,12 +272,12 @@ impl ReplayRequest {
                 }
                 // 超界目标本身不能授权append。额外保留真实末行票，随后仍走同批语义/配额。
                 let mut terminal = if let Some((row, before, halo)) = self.last_completed.take() {
-                    self.anchors.chunk = before.clone();
+                    self.anchors.chunk = before;
                     self.anchors.halo = halo;
-                    self.window(Some(row), before.math)
+                    self.window(Some(row))
                 } else if end.last_body_row_ordinal().is_none() {
-                    // H/D-only也有真实H事实和header seed，不把空body投影冒充虚构row1。
-                    let mut window = self.window(None, self.anchors.header_math);
+                    // H/D-only仍保留真实H事实，不把空body投影冒充虚构row1。
+                    let mut window = self.window(None);
                     window.include_header = true;
                     window
                 } else {
@@ -322,102 +301,10 @@ impl ReplayRequest {
         }
     }
 
-    fn advance_math(
-        &mut self,
-        document: &MarkdownDocumentBuffer,
-        budget: usize,
-    ) -> Result<(semantic::SemanticWork, Option<ReplayOutcome>), MarkdownTableRequestError> {
-        let tree = tree_height(document);
-        let child = child_budget(budget, tree)?;
-        let row = self
-            .pending
-            .as_mut()
-            .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-        let frame = document
-            .table_source_frame(row.scanner.next_byte(), child)
-            .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
-        let step = row
-            .scanner
-            .advance(
-                SourceFrame {
-                    source_revision: frame.generation,
-                    byte_start: frame.byte_start,
-                    bytes: &frame.bytes,
-                    real_eof: frame.real_eof,
-                },
-                MathSourceAuthority {
-                    current_revision: document.generation(),
-                    cancelled: false,
-                },
-                child,
-            )
-            .map_err(MarkdownTableRequestError::Math);
-        // 回收成功后才消费step，不能让原parser提前终止遮住真实映射错误。
-        frame
-            .finish()
-            .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
-        let step = step?;
-        let (measured, complete) = match step {
-            MathContextStep::Progress { work, .. } | MathContextStep::NeedInput { work, .. } => {
-                (work, None)
-            }
-            MathContextStep::Complete { context, work } => (work, Some(context)),
-        };
-        let work = semantic::SemanticWork {
-            source_bytes: measured.byte_reads,
-            source_tree_steps: tree,
-            structural_transitions: measured.transitions + tree + 64,
-            ..semantic::SemanticWork::default()
-        };
-        let Some(context) = complete else {
-            // math 状态还未覆盖完整物理行；保留原 before-row 边界，不能提交部分结果。
-            return Ok((work, None));
-        };
-        let row = self
-            .pending
-            .take()
-            .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-        if row.fact.row_ordinal == self.target {
-            // 目标 seed 是扫描本行之前的真实状态；after-row 仅供 scope 和后继续行使用。
-            self.anchors.chunk = self.boundary.clone();
-            self.anchors.halo = self.previous.take();
-            let before = self.boundary.math;
-            self.boundary = Boundary::after_row(row.checkpoint, row.fact, context);
-            self.consumed = true;
-            self.table = None;
-            return Ok((
-                work,
-                Some(ReplayOutcome::Window(Box::new(
-                    self.window(Some(row.fact), before),
-                ))),
-            ));
-        }
-        // 非目标行也真实扫描且收费；仅覆盖最后一行metadata，不随已扫行数增长。
-        self.last_completed = Some((row.fact, self.boundary.clone(), self.previous.clone()));
-        self.previous = Some(std::mem::replace(
-            &mut self.boundary,
-            Boundary::after_row(row.checkpoint, row.fact, context),
-        ));
-        Ok((work, None))
-    }
-
-    fn window(
-        &self,
-        row: Option<TableRowFact>,
-        before: MathContext,
-    ) -> MarkdownTableStructuralWindow {
-        let mut math_rows = Vec::with_capacity(if row.is_some() { 2 } else { 1 });
-        math_rows.push(MarkdownTableRowMathContext {
-            row_ordinal: 0,
-            context: self.anchors.header_math,
-        });
+    fn window(&self, row: Option<TableRowFact>) -> MarkdownTableStructuralWindow {
         let mut body = Vec::with_capacity(usize::from(row.is_some()));
         if let Some(row) = row {
             // 只物化目标这一条真实 body；H/D 作为独立语法上下文，绝不补齐中间省略行。
-            math_rows.push(MarkdownTableRowMathContext {
-                row_ordinal: row.row_ordinal,
-                context: before,
-            });
             body.push(row);
         }
         MarkdownTableStructuralWindow {
@@ -436,7 +323,6 @@ impl ReplayRequest {
                 })
                 .into_iter()
                 .collect(),
-            math_rows,
             include_header: self.target == 0,
             next_required_row: None,
             table_end: None,

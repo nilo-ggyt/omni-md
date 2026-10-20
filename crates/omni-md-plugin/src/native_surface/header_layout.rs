@@ -38,7 +38,7 @@ impl NativeMarkdownHeaderControls {
         }
     }
 
-    /// 页眉只观察格式栏实际scroll根，内部十九按钮由原controls和视图树持有。
+    /// 页眉只观察格式栏实际scroll根，内部各格式按钮由原controls和视图树持有。
     pub(super) fn new(controls: [&NSView; 8], toolbar: [Weak<NSView>; 6]) -> Self {
         let [
             title,

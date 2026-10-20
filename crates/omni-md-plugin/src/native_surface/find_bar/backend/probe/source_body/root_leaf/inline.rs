@@ -811,8 +811,8 @@ fn verify(
         drop((actual, scene)); // 先归还绘图Reader和位图，目标恢复仍只借原sealed Scene，不把测试图带入后继量子。
         stage.set("restore_link_targets");
         let press = super::links::point(rig, source_range("recover").start)?;
-        super::links::mouse(rig, press, objc2_app_kit::NSEventType::LeftMouseDown)?;
-        super::links::mouse(rig, press, objc2_app_kit::NSEventType::LeftMouseUp)?;
+        super::links::command_mouse(rig, press, objc2_app_kit::NSEventType::LeftMouseDown)?;
+        super::links::command_mouse(rig, press, objc2_app_kit::NSEventType::LeftMouseUp)?;
         // CJK末块完成后，先由同块开头的真实片段click驱动原唯一请求恢复；绝不点击原https目标。
         // 原有限闭合块的 Parser 同时提取了 recover 与 go 的真实标签、解码目标；
         // 正链接事实不依赖样式窗口扩大。typed拒绝只证明完成，不冒充anchor导航。

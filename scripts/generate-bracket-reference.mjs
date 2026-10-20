@@ -147,7 +147,10 @@ const reference = {
     configuration: "bracketMatching(); markdown({base:markdownLanguage,completeHTMLTags:false})",
     native_scope: "bounded admitted ASCII handles, not full Lezer/HTML parity",
   },
-  cases: [...supported.map((text) => recordCase(text, true)), ...unsupported.map((text) => recordCase(text, false))],
+  // 产品不再解释上标扩展；只保留同一真实 oracle 中不依赖该扩展的用例，
+  // 字面 ^、转义和代码中的 ^ 仍保留，不能在 Rust 测试运行时过滤不一致的结果。
+  cases: [...supported.map((text) => recordCase(text, true)), ...unsupported.map((text) => recordCase(text, false))]
+    .filter((record) => !record.tree.includes("Superscript")),
 };
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputPath = resolve(repository, "crates/omni-markdown-core/src/markdown_brackets/reference.json");

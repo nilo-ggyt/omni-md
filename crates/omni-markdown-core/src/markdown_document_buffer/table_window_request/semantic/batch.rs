@@ -774,8 +774,7 @@ impl MarkdownTableViewportRequest {
         }
         let structure = self.structure.as_mut().unwrap();
         // 目标已经完整落在已证实成员中即可封窗；不为寻找一个无关的下条巨行先扫描整行。
-        let reached = structure.math.is_none()
-            && structure.ready.is_none()
+        let reached = structure.ready.is_none()
             && structure.current.as_ref().is_some_and(|table| {
                 table.found
                     && (table.include_header && table.delimiter_utf16.end >= self.viewport.end
@@ -1317,7 +1316,7 @@ impl MarkdownTableViewportRequest {
             .transitions
             .checked_add(work.transitions)
             .ok_or(MarkdownTableRequestError::WorkLimit)?;
-        // 这些未发布派生值只属于旧目标；根重放会重新给出真实表头、math与ordinary Fact。
+        // 这些未发布派生值只属于旧目标；根重放会重新给出真实表头与ordinary Fact。
         structure.viewport = viewport.clone();
         structure.target = MarkdownTableWindowTarget::FirstTableInViewport;
         structure.continuous_body_limit = None;
@@ -1325,7 +1324,6 @@ impl MarkdownTableViewportRequest {
         structure.ordinary_pending = None;
         structure.coordinates = None;
         structure.current = None;
-        structure.math = None;
         structure.ready = None;
         structure.no_table = false;
         structure.required_row_end = None;
@@ -1811,7 +1809,7 @@ fn structure_range(ticket: &MarkdownTableStructuralWindow, index: usize) -> Opti
     Some(ticket.body.first()?.utf16_start..ticket.body.last()?.utf16_end)
 }
 
-/// 只计真正保留的原行、数学与 scope 句柄；没有复制源，因此不挪用完整 Parser 的源输入额度。
+/// 只计真正保留的原行与scope句柄；没有复制源，因此不挪用完整Parser的源输入额度。
 fn structural_budget(ticket: &MarkdownTableStructuralWindow) -> MarkdownTableViewportBudget {
     MarkdownTableViewportBudget {
         row_slots: ticket.body.len() + 2,
@@ -1820,8 +1818,7 @@ fn structural_budget(ticket: &MarkdownTableStructuralWindow) -> MarkdownTableVie
         metadata_bytes: std::mem::size_of::<MarkdownTableStructuralWindow>()
             + 2 * std::mem::size_of::<usize>()
             + ticket.body.capacity() * std::mem::size_of::<TableRowFact>()
-            + ticket.inline_rows.capacity() * std::mem::size_of::<VerifiedTableInlineRow>()
-            + ticket.math_rows.capacity() * std::mem::size_of::<MarkdownTableRowMathContext>(),
+            + ticket.inline_rows.capacity() * std::mem::size_of::<VerifiedTableInlineRow>(),
         ..MarkdownTableViewportBudget::default()
     }
 }

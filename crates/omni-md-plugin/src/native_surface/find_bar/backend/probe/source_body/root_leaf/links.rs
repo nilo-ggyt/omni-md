@@ -61,11 +61,26 @@ pub(super) fn point(rig: &Rig, index: usize) -> Result<NSPoint, String> {
     Ok(rig.view.convertPoint_toView(local, None))
 }
 
-/// 交付既有三种公开鼠标语义；不调用测试专用点击入口，不提前解析target。
+/// 普通指针沿现有公开事件进入正文，用于定位和拖选；不预先解析或打开目标。
 pub(super) fn mouse(rig: &Rig, point: NSPoint, kind: NSEventType) -> Result<(), String> {
+    mouse_with_modifiers(rig, point, kind, NSEventModifierFlags::empty())
+}
+
+/// 链接激活使用产品约定的 Command 单击；仍由原 NSResponder 收到真实修饰键和窗口坐标。
+pub(super) fn command_mouse(rig: &Rig, point: NSPoint, kind: NSEventType) -> Result<(), String> {
+    mouse_with_modifiers(rig, point, kind, NSEventModifierFlags::Command)
+}
+
+/// 共用原三种公开鼠标事件的交付，普通点击与链接点击只在系统修饰键事实不同。
+fn mouse_with_modifiers(
+    rig: &Rig,
+    point: NSPoint,
+    kind: NSEventType,
+    modifiers: NSEventModifierFlags,
+) -> Result<(), String> {
     let window = rig.view.window().ok_or("原链接窗口已归还")?;
     let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-        kind, point, NSEventModifierFlags::empty(), 1.0, window.windowNumber(), None, 1, 1, 1.0,
+        kind, point, modifiers, 1.0, window.windowNumber(), None, 1, 1, 1.0,
     ).ok_or("无法构造原链接鼠标事件")?;
     // SAFETY: 原主线程NSResponder、真实窗口点和同步活事件；没有虚构selector或跨线程对象。
     unsafe {
@@ -142,8 +157,8 @@ fn verify(rig: &mut Rig) -> Result<(), String> {
     }
     let press = point(rig, LABEL)?;
     for focus in [false, true] {
-        mouse(rig, press, NSEventType::LeftMouseDown)?;
-        mouse(rig, press, NSEventType::LeftMouseUp)?;
+        command_mouse(rig, press, NSEventType::LeftMouseDown)?;
+        command_mouse(rig, press, NSEventType::LeftMouseUp)?;
         if focus {
             rig.panel.makeFirstResponder(Some(&*rig.bar.query));
         } else {
@@ -166,11 +181,21 @@ fn verify(rig: &mut Rig) -> Result<(), String> {
         }
         rig.panel.makeFirstResponder(Some(&**rig.view));
     }
-    mouse(rig, press, NSEventType::LeftMouseDown)?;
+    // 松开 Command 再抬起鼠标必须取消激活，保持 canonical 选择和旧 cache 的真实 Pending。
+    command_mouse(rig, press, NSEventType::LeftMouseDown)?;
+    mouse(rig, press, NSEventType::LeftMouseUp)?;
+    if let Some(cause) = settle(rig)? {
+        return Err(format!("已松开 Command 的链接点击仍报告失败：{cause}"));
+    }
+    pending_target(rig)?;
+    if rig.view.input_state().map_err(|cause| cause.to_string())? != cached.request.input {
+        return Err("取消链接跟随改变了原 canonical 输入".into());
+    }
+    command_mouse(rig, press, NSEventType::LeftMouseDown)?;
     if rig.view.input_state().map_err(|cause| cause.to_string())? != cached.request.input {
         return Err("原链接mousedown在确认单击前改写选择或抢走拖选".into());
     }
-    mouse(rig, press, NSEventType::LeftMouseUp)?;
+    command_mouse(rig, press, NSEventType::LeftMouseUp)?;
     if !matches!(settle(rig)?, Some(ViewError::LinkAnchorUnsupported)) {
         return Err("真实片段链接没有明确报告尚无稳定anchor导航".into());
     }
@@ -193,6 +218,23 @@ fn verify(rig: &mut Rig) -> Result<(), String> {
         return Err("第一次真实mouseup未恢复原Source解析的片段target".into());
     }
     drop(scene);
+    // 标签上的普通单击必须真的把 caret 放进标签，不请求导航，也不返回片段拒绝错误。
+    let frame = observe(&rig.body)?;
+    mouse(rig, press, NSEventType::LeftMouseDown)?;
+    mouse(rig, press, NSEventType::LeftMouseUp)?;
+    wait_frame("root_leaf_link_plain_click_caret", &rig.body, frame)?;
+    if let Some(cause) = settle(rig)? {
+        return Err(format!("普通标签单击不应触发链接：{cause}"));
+    }
+    let positioned = rig.view.input_state().map_err(|cause| cause.to_string())?;
+    if positioned.generation != cached.request.input.generation
+        || positioned.primary_range != NSRange::new(LABEL, 0)
+        || positioned.marked.is_some()
+    {
+        return Err("普通标签单击没有定位到真实字符，或改变了正文与组合输入".into());
+    }
+    // 选择显露标记可能局部重排；拖选使用同一标签现在的真实点，不能借旧几何冒充命中。
+    let press = point(rig, LABEL)?;
     // 随后真实拖动仍走原caret选择；即使从链接开始，也不能在mousedown提前激活外部目标。
     let frame = observe(&rig.body)?;
     let end = point(rig, PREFIX.len() + 12)?;
@@ -209,7 +251,7 @@ fn verify(rig: &mut Rig) -> Result<(), String> {
     }
     rig.remember_receipt()?;
     println!(
-        "native_body_root_leaf_link cached_scene_real_pending=true first_mouseup_restored_target=true anchor_typed_rejection=true successor_menu_and_focus_revoked=true original_drag_selection=true original_source=true external_url_open_tested=false internal_anchor_navigation_tested=false whole_product=false formal=false"
+        "native_body_root_leaf_link cached_scene_real_pending=true first_mouseup_restored_target=true anchor_typed_rejection=true command_click=true released_command_cancelled=true plain_click_caret=true successor_menu_and_focus_revoked=true original_drag_selection=true original_source=true external_url_open_tested=false internal_anchor_navigation_tested=false whole_product=false formal=false"
     );
     Ok(())
 }

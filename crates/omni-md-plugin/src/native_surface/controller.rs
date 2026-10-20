@@ -374,7 +374,7 @@ define_class!(
             // sender 类型与菜单 getter 都可能重入；先纯捕获原正文票，不从 getter 后的新选择领权。
             let original_paged = NativeMarkdownWorkspacePagedEditIntent::capture(self);
             if let Some(action) = native_markdown_workspace_menu_action(self, sender) {
-                if (100..=118).contains(&action) || matches!(action, 22 | 23) {
+                if matches!(action, 22 | 23 | 100..=112 | 115..=116 | 118) {
                     if let Some(intent) = original_paged.filter(NativeMarkdownWorkspacePagedEditIntent::current)
                         && let Err(cause) = intent.perform(action)
                     { self.present_error(&cause); }

@@ -86,9 +86,7 @@ pub(crate) fn markdown_presentation_options(actual_document_start: bool) -> Opti
     let mut options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_MATH
         | Options::ENABLE_GFM
-        | Options::ENABLE_SUPERSCRIPT
         | Options::ENABLE_SUBSCRIPT
         | Options::ENABLE_FOOTNOTES;
     if actual_document_start {
@@ -133,30 +131,6 @@ pub(super) fn build_markdown_presentation_with_reference_context<'a>(
     reference_context: Option<MarkdownPresentationReferenceContext<'a>>,
     local_underline: bool,
 ) -> Result<MarkdownPresentationBuild, MarkdownViewportPresentationError> {
-    build_markdown_presentation_with_seeded_reference_context(
-        source,
-        absolute_utf16_start,
-        active_selection,
-        actual_document_start,
-        reference_context,
-        local_underline,
-        #[cfg(feature = "s2-table-window-prototype")]
-        None,
-    )
-}
-
-/// 真实source producer提供每个投影row的数学入口状态；普通路径不提供seed，沿原Parser行为。
-pub(super) fn build_markdown_presentation_with_seeded_reference_context<'a>(
-    source: &'a str,
-    absolute_utf16_start: usize,
-    active_selection: &Range<usize>,
-    actual_document_start: bool,
-    reference_context: Option<MarkdownPresentationReferenceContext<'a>>,
-    local_underline: bool,
-    #[cfg(feature = "s2-table-window-prototype")] math_seeds: Option<
-        &'a [pulldown_cmark::math_context::TableMathSeed],
-    >,
-) -> Result<MarkdownPresentationBuild, MarkdownViewportPresentationError> {
     build_presentation_with_options(
         source,
         absolute_utf16_start,
@@ -165,7 +139,7 @@ pub(super) fn build_markdown_presentation_with_seeded_reference_context<'a>(
         local_underline,
         markdown_presentation_options(actual_document_start),
         #[cfg(feature = "s2-table-window-prototype")]
-        math_seeds.map(MarkdownParserSeed::TableRows),
+        None,
     )
 }
 
@@ -195,7 +169,6 @@ pub(crate) fn build_bounded_inline_presentation<'a>(
 /// 真实源入口互斥；所有实际 Parser 消费者共用同一原 seed，不复制其来源字段或 grammar。
 #[derive(Clone, Copy)]
 pub(crate) enum MarkdownParserSeed<'a> {
-    TableRows(&'a [pulldown_cmark::math_context::TableMathSeed]),
     Cell(&'a pulldown_cmark::global_frontier::VerifiedInlineSemanticSeed),
     Atx(&'a pulldown_cmark::global_frontier::VerifiedGlobalLeafBlock),
     Scoped(&'a pulldown_cmark::global_frontier::InlineParagraphContext),
@@ -258,10 +231,6 @@ fn build_presentation_with_options<'a>(
     let callback = reference_context.map(|_| &mut resolve_reference);
     #[cfg(feature = "s2-table-window-prototype")]
     let parser = match parser_seed {
-        Some(MarkdownParserSeed::TableRows(seeds)) => {
-            Parser::new_with_table_math_seeds(source, options, callback, seeds)
-                .map_err(|_| MarkdownViewportPresentationError::InvalidParserBoundary)?
-        }
         Some(MarkdownParserSeed::Cell(seed)) => {
             Parser::new_with_table_cell_seed(source, seed, callback)
                 .map_err(|_| MarkdownViewportPresentationError::InvalidParserBoundary)?
@@ -429,16 +398,8 @@ fn build_presentation_with_options<'a>(
                         &mut decorations,
                     )?;
                 }
-                // Superscript tracks its paired caret markers.
-                Tag::Superscript => {
-                    add_delimited_inline_structure(
-                        source,
-                        &byte_range,
-                        MarkdownPresentationStyles::SUPERSCRIPT,
-                        &["^"],
-                        &mut decorations,
-                    )?;
-                }
+                // 上标扩展未启用；保留vendor枚举的穷尽匹配，不产生独立样式或隐藏原字符。
+                Tag::Superscript => unreachable!("未启用上标扩展"),
                 // Links and images share link styling and editable source-destination marker spans.
                 Tag::Link { .. } | Tag::Image { .. } => {
                     push_markdown_decoration(
@@ -502,10 +463,8 @@ fn build_presentation_with_options<'a>(
                 prefixes.content(byte_range.start, &decorations)?;
                 add_backtick_code_structure(source, &byte_range, &mut decorations)?;
             }
-            // Math remains source text with formula styling and tracked dollar delimiters.
-            Event::InlineMath(_) | Event::DisplayMath(_) => {
-                add_math_structure(source, &byte_range, &mut decorations)?;
-            }
+            // 产品未启用数学扩展；上游枚举仍保留该事件，正常文本分支保留所有美元原字符。
+            Event::InlineMath(_) | Event::DisplayMath(_) => unreachable!("未启用数学扩展"),
             // A thematic break receives rule styling and a source-marker owner.
             Event::Rule => {
                 push_markdown_decoration(
@@ -727,47 +686,6 @@ pub(super) fn add_backtick_code_structure(
         || !fragment.ends_with(&"`".repeat(delimiter_bytes))
     {
         // Unmatched or incomplete delimiter runs remain visible source rather than fabricated marker spans.
-        return Ok(());
-    }
-    push_markdown_marker(
-        decorations,
-        byte_range.start..byte_range.start + delimiter_bytes,
-        byte_range,
-    )?;
-    push_markdown_marker(
-        decorations,
-        byte_range.end - delimiter_bytes..byte_range.end,
-        byte_range,
-    )
-}
-
-/// Track formula styling and complete matching dollar delimiters as literal editable source.
-pub(super) fn add_math_structure(
-    source: &str,
-    byte_range: &Range<usize>,
-    decorations: &mut Vec<MarkdownByteDecoration>,
-) -> Result<(), MarkdownViewportPresentationError> {
-    push_markdown_decoration(
-        decorations,
-        byte_range.clone(),
-        MarkdownPresentationStyles::FORMULA,
-    )?;
-    let Some(fragment) = source.get(byte_range.clone()) else {
-        // Parser offsets must describe a scalar-aligned slice of the supplied bounded source.
-        return Err(MarkdownViewportPresentationError::InvalidParserBoundary);
-    };
-    let delimiter_bytes = fragment
-        .bytes()
-        .take_while(|byte| {
-            // The opening dollar run determines the formula delimiter width.
-            *byte == b'$'
-        })
-        .count();
-    if delimiter_bytes == 0
-        || fragment.len() < delimiter_bytes.saturating_mul(2)
-        || !fragment.ends_with(&"$".repeat(delimiter_bytes))
-    {
-        // Without a complete matching dollar pair only the formula style is retained.
         return Ok(());
     }
     push_markdown_marker(

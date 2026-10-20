@@ -249,15 +249,13 @@ impl MarkdownTableCellEditRequest {
                     .cloned()
                     .ok_or(MarkdownTableRequestError::InvalidRequest)?
             };
-            let math = ticket
-                .math_rows
-                .iter()
-                .find(|row| row.row_ordinal == self.row)
-                .ok_or(MarkdownTableRequestError::InvalidRequest)?
-                .context;
+            // 数学扩展未启用；原vendor单格API仍接收中性上下文，格边界来自原pipe/escape词法。
             self.scanner = Some(
                 inline_row
-                    .cell_scanner(self.column, math)
+                    .cell_scanner(
+                        self.column,
+                        pulldown_cmark::math_context::MathContext::default(),
+                    )
                     .map_err(|cause| MarkdownTableRequestError::Global(cause.into()))?,
             );
             self.context = Some(TableCellEditContext {
@@ -393,7 +391,7 @@ impl MarkdownTableCellEditRequest {
                 work: SemanticWork {
                     source_bytes: used,
                     source_tree_steps: tree,
-                    structural_transitions: used * 5 + 64, // 原格词法/UTF16之外，同源 math 的两个逐字节转换也真实收费。
+                    structural_transitions: used * 5 + 64, // vendor格扫描内部仍处理有限通用状态，真实逐字节工作不因停用展示扩展而漏计。
                     ..SemanticWork::default()
                 },
             });

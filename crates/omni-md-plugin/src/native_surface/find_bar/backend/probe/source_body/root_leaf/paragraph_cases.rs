@@ -29,7 +29,7 @@ const CASES: [(&str, &str); 11] = [
         "outside\n\nwater H~2~O and x^2^ with **bold~sub~** and _italic^up^_.\n\nend\n",
     ),
     ("only_subscript", "~subscript~\n"),
-    ("only_superscript", "^superscript^\n"),
+    ("literal_carets", "^superscript^\n"),
     (
         "scoped_quote_plain",
         "outside\n\n> 中文引用段落保留真实字体与缩进，混合 emoji 😀 和 English words，在原可用列宽内自然换行。中文继续验证实际软行来源、基线、上下边距和段落边框的占位。\n\nend\n",

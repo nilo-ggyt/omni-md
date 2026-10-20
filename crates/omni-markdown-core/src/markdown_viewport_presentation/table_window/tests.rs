@@ -48,8 +48,6 @@ fn input<'a>(
             underline: &[],
         },
         active_selection: usize::MAX..usize::MAX,
-        #[cfg(feature = "s2-table-window-prototype")]
-        math_rows: None,
     }
 }
 
@@ -235,76 +233,27 @@ fn external_reference_uses_parser_label_rules_and_footnotes_remain_literal() {
 }
 
 #[test]
-fn omitted_rows_math_context_keeps_negative_control_and_shared_seed_matches_original() {
-    // 此纯反例明确保留prototype缺口：原lexer的u8 brace context在整table block内跨行累计。
-    // 省略行的255次平衡brace会使后继context标签碰到root值，不能用投影重置状态后称等价。
+fn omitted_rows_do_not_change_literal_dollars_or_ordinary_inline_styles() {
+    // 美元和花括号属于普通UTF8内容；省略前行不应再改变后行的字重、代码或链接语义。
     let hidden = format!("$x${}", "{}".repeat(255));
-    let source = format!("| H |\n| - |\n| {hidden} |\n| $}}x{{y$ |\n");
+    let source = format!(
+        "| H |\n| - |\n| {hidden} |\n| $}}x{{y$ **加粗** `代码` [链接](https://example.test) |\n"
+    );
     let all = lines(&source, 0, 0);
     let request = input(&all, 3..4);
-    let oracle = build_markdown_presentation(&source, 0, &request.active_selection).unwrap();
-    let window = project_table_window(&request).unwrap();
-    let at = source.find("$}x{y$").unwrap() + 2;
-    assert_ne!(styles_at(&window.runs, at), styles_at(&oracle.runs, at));
+    let window = compare_with_full_source(&source, &request);
+    for (byte, _) in source
+        .match_indices('$')
+        .filter(|(at, _)| *at >= all[3].byte_start)
+    {
+        let at = source[..byte].encode_utf16().count();
+        assert!(!styles_at(&window.runs, at).contains(MarkdownPresentationStyles::MARKER));
+        assert!(!styles_at(&window.runs, at).contains(MarkdownPresentationStyles::HIDDEN_MARKER));
+    }
     #[cfg(feature = "s2-table-window-prototype")]
     {
-        use pulldown_cmark::{block_frontier::SourceFrame, math_context::*};
-        // 负控制仍证明不带真实context会错；实际桥必须从原源逐行扫描后恢复完整样式。
-        let scan_row = |line: MarkdownTableSourceLine<'_>, context| {
-            let mut scanner = MathContextScan::new(
-                7,
-                source.len(),
-                line.byte_start + line.container_prefix_bytes..line.byte_start + line.text.len(),
-                context,
-            )
-            .unwrap();
-            loop {
-                let start = scanner.next_byte();
-                let end = (start + 3).min(source.len());
-                match scanner
-                    .advance(
-                        SourceFrame {
-                            source_revision: 7,
-                            byte_start: start,
-                            bytes: &source.as_bytes()[start..end],
-                            real_eof: end == source.len(),
-                        },
-                        MathSourceAuthority {
-                            current_revision: 7,
-                            cancelled: false,
-                        },
-                        13,
-                    )
-                    .unwrap()
-                {
-                    MathContextStep::Complete { context, .. } => break context,
-                    MathContextStep::Progress { .. } | MathContextStep::NeedInput { .. } => {}
-                }
-            }
-        };
-        // 原header首次Scan先更新context，随后Active重解析header，二者不能合并或重置。
-        let header_context = scan_row(all[0], MathContext::default());
-        let after_header = scan_row(all[0], header_context);
-        let target_context = scan_row(all[2], after_header);
-        let contexts = [
-            MarkdownTableRowMathContext {
-                row_ordinal: 0,
-                context: header_context,
-            },
-            MarkdownTableRowMathContext {
-                row_ordinal: all[3].row_ordinal,
-                context: target_context,
-            },
-        ];
-        let mut fixed_request = input(&all, 3..4);
-        fixed_request.math_rows = Some(&contexts);
-        compare_with_full_source(&source, &fixed_request);
-        // 同一桥也用于引用查询库存，不能让错误math范围先吞掉一个需要全局解析的link。
-        assert!(
-            table_window_reference_queries(&fixed_request)
-                .unwrap()
-                .is_ready()
-        );
+        // 同一普通Parser也收集链接引用，美元文字不再吞掉后继真实链接。
+        assert!(table_window_reference_queries(&request).unwrap().is_ready());
     }
 }
 

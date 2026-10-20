@@ -518,7 +518,7 @@ fn format_selection(rig: &Rig) -> Result<(), String> {
     unchanged(rig)
 }
 
-/// 固定短夹具覆盖其余七种行内格式；每次单步Undo还原原中文，不复制或缩小后续大草稿。
+/// 固定短夹具覆盖其余日常行内格式；每次单步Undo还原原中文，不复制或缩小后续大草稿。
 fn format_inline_variants(rig: &Rig) -> Result<(), String> {
     use MarkdownFormatAction as Action;
     for (action, expected, opening_units, stage) in [
@@ -526,18 +526,6 @@ fn format_inline_variants(rig: &Rig) -> Result<(), String> {
         (Action::Underline, "<u>你</u>", 3, "cell_format_underline"),
         (Action::Strikethrough, "~~你~~", 2, "cell_format_strike"),
         (Action::InlineCode, "`你`", 1, "cell_format_inline_code"),
-        (
-            Action::InlineFormula,
-            "$你$",
-            1,
-            "cell_format_inline_formula",
-        ),
-        (
-            Action::Superscript,
-            "<sup>你</sup>",
-            5,
-            "cell_format_superscript",
-        ),
         (Action::Link, "[你](https://)", 1, "cell_format_link"),
     ] {
         // 上次真实Undo应仍选中原中文；每个动作都从同一个局部状态取得新权限，不能继承旧Scene。

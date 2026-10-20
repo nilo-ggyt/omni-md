@@ -324,8 +324,6 @@ mod tests {
                 underline: &[],
             },
             active_selection: usize::MAX..usize::MAX,
-            #[cfg(feature = "s2-table-window-prototype")]
-            math_rows: None,
         })
     }
 

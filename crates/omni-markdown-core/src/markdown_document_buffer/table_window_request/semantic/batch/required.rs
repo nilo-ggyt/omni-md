@@ -327,7 +327,7 @@ impl MarkdownTableViewportRequest {
             if ordinal == 0 {
                 work += 1;
                 if ticket.include_header {
-                    return (true, work); // H必须确实将在该job发布，math_rows/header_context不能代替。
+                    return (true, work); // H必须由该job真实发布，保留的结构checkpoint不能代替可见语义。
                 }
             } else {
                 for row in &ticket.body {

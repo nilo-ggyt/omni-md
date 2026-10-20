@@ -3132,7 +3132,7 @@ impl NativeMarkdownHostedTableProbe {
                     return Err("空历史的撤销或重做按钮仍显示可用".into());
                 } // 原Doc已确认无Undo/Redo，不因文档存在就启用历史。
             }
-            // 这里按原React动作顺序读取真实装配按钮，不把生产布局结果当作oracle。
+            // 直接核对当前日常编辑入口与中文语义，不将生产布局结果当作oracle。
             let expected = [
                 (3, "导入附件并在原光标处插入链接"),
                 (100, "一级标题"),
@@ -3149,15 +3149,12 @@ impl NativeMarkdownHostedTableProbe {
                 (112, "任务列表"),
                 (109, "引用"),
                 (118, "表格"),
-                (113, "行内公式"),
-                (117, "块级公式"),
-                (114, "上标"),
                 (116, "代码块"),
                 (115, "分隔线"),
             ];
             let formats = &controls[NATIVE_MARKDOWN_TOOLBAR_START + 5..];
             if formats.len() != expected.len() {
-                return Err("原附件或十九项一击格式入口有缺失或重复".into());
+                return Err("附件或日常格式入口有缺失或重复".into());
             }
             let strip = formats[0]
                 .enclosingScrollView()
@@ -3186,7 +3183,7 @@ impl NativeMarkdownHostedTableProbe {
                     || frame.origin.y + frame.size.height > document_view.frame().size.height
                     || frame.origin.x + frame.size.width > document_view.frame().size.width
                 {
-                    return Err("原十九格式顺序、局部按钮几何、焦点或中文AX不同".into());
+                    return Err("日常格式顺序、局部按钮几何、焦点或中文AX不同".into());
                 }
                 previous_end = frame.origin.x + frame.size.width;
             }

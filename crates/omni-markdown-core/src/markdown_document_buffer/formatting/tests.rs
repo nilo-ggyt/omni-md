@@ -33,8 +33,6 @@ fn action_named(name: &str) -> MarkdownFormatAction {
         ("underline", Underline),
         ("strikethrough", Strikethrough),
         ("inline-code", InlineCode),
-        ("inline-formula", InlineFormula),
-        ("superscript", Superscript),
         ("link", Link),
         ("heading-1", Heading1),
         ("heading-2", Heading2),
@@ -45,7 +43,6 @@ fn action_named(name: &str) -> MarkdownFormatAction {
         ("blockquote", Blockquote),
         ("divider", Divider),
         ("code-block", CodeBlock),
-        ("formula-block", FormulaBlock),
         ("table", Table),
     ];
     ACTIONS
@@ -67,7 +64,7 @@ fn text(document: &MarkdownDocumentBuffer) -> String {
 /// Every command matches the original editor's text and UTF-16 selection over diverse primary ranges.
 #[test]
 fn matches_original_editor_differential_corpus() {
-    // The corpus is generated from unchanged original source, not a second Rust formatting algorithm.
+    // 保留动作的预期仍取自原编辑器真实输出；已删除的公式与上标动作不再属于产品契约。
     let corpus: ReferenceCorpus =
         serde_json::from_str(include_str!("reference_cases.json")).unwrap();
     assert_eq!(
@@ -75,7 +72,6 @@ fn matches_original_editor_differential_corpus() {
         "e30bf8c8b9933e647d5971bcfb6a8760561228164960581de2e120d5587d3746"
     );
     assert_eq!(corpus.codemirror_version, "6.7.1");
-    assert_eq!(corpus.cases.len(), 4180);
     let directory = tempdir().unwrap();
     let path = directory.path().join("reference.md");
     for case in corpus.cases {

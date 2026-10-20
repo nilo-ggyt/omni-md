@@ -3,8 +3,8 @@
 use super::table_source::MarkdownTableSourceIdentity;
 use super::*;
 use crate::markdown_viewport_presentation::table_window::{
-    MarkdownTableRowMathContext, MarkdownTableWindowError, TABLE_WINDOW_MAX_CELLS,
-    TABLE_WINDOW_MAX_COLUMNS, TABLE_WINDOW_MAX_ROWS,
+    MarkdownTableWindowError, TABLE_WINDOW_MAX_CELLS, TABLE_WINDOW_MAX_COLUMNS,
+    TABLE_WINDOW_MAX_ROWS,
 };
 mod cell_edit;
 pub use cell_edit::{MarkdownTableCellEditRequest, MarkdownTableCellEditStep};
@@ -30,9 +30,6 @@ use pulldown_cmark::{
         GlobalFact, GlobalFrontier, GlobalFrontierError, GlobalFrontierLimits,
         GlobalSourceAuthority, GlobalStep, GlobalTableFact, GlobalWork, StructuralSpineLimits,
         VerifiedTableEnd,
-    },
-    math_context::{
-        MathContext, MathContextError, MathContextScan, MathContextStep, MathSourceAuthority,
     },
 };
 
@@ -63,7 +60,6 @@ pub enum MarkdownTableRequestError {
     Cancelled,
     WorkLimit,
     Global(GlobalFrontierError),
-    Math(MathContextError),
     Window(MarkdownTableWindowError),
 }
 
@@ -85,7 +81,7 @@ pub(crate) enum MarkdownTableStructureStep {
 
 #[derive(Debug)]
 /// 只有本模块消费真实GlobalFact的路径能构造；不公开可伪造的字段或From转换。
-/// 它仅证明成员/坐标/math，尚未证明ref/underline/继承样式，不可直接交Native隐藏正文。
+/// 它仅证明成员与坐标，尚未证明引用、下划线和继承样式，不可直接交Native隐藏正文。
 pub(crate) struct MarkdownTableStructuralWindow {
     source: MarkdownTableSourceIdentity,
     header: GlobalTableFact,
@@ -94,7 +90,6 @@ pub(crate) struct MarkdownTableStructuralWindow {
     delimiter_utf16: Range<usize>,
     body: Vec<TableRowFact>,
     inline_rows: Vec<VerifiedTableInlineRow>,
-    math_rows: Vec<MarkdownTableRowMathContext>,
     include_header: bool,
     next_required_row: Option<usize>,
     table_end: Option<VerifiedTableEnd>,
@@ -113,9 +108,6 @@ impl MarkdownTableStructuralWindow {
     pub fn rows(&self) -> &[TableRowFact] {
         &self.body
     }
-    pub fn math_rows(&self) -> &[MarkdownTableRowMathContext] {
-        &self.math_rows
-    }
     pub fn includes_header(&self) -> bool {
         self.include_header
     }
@@ -132,11 +124,8 @@ struct ActiveTable {
     checkpoint: TableCheckpoint,
     header_utf16: Range<usize>,
     delimiter_utf16: Range<usize>,
-    context: MathContext,
-    header_context: Option<MathContext>,
     body: Vec<TableRowFact>,
     inline_rows: Vec<VerifiedTableInlineRow>,
-    math_rows: Vec<MarkdownTableRowMathContext>,
     found: bool,
     include_header: bool,
     first_overflow: Option<usize>,
@@ -146,20 +135,6 @@ struct ActiveTable {
     halo_boundary: Option<Boundary>,
     chunk_boundary: Option<Boundary>,
     chunk_halo: Option<Boundary>,
-    pending_row_boundary: Option<(TableCheckpoint, TableRowFact)>,
-}
-
-enum MathJob {
-    HeaderScan(MathContextScan),
-    HeaderActive(MathContextScan),
-    Body(MathContextScan),
-}
-impl MathJob {
-    fn scanner(&mut self) -> &mut MathContextScan {
-        match self {
-            Self::HeaderScan(scan) | Self::HeaderActive(scan) | Self::Body(scan) => scan,
-        }
-    }
 }
 
 /// 请求不持document、mapping或正文String；每次advance由当前owner借一片真实源。
@@ -177,7 +152,6 @@ pub(crate) struct MarkdownTableWindowStructureRequest {
     ordinary_pending: Option<CapturedOrdinary>,
     coordinates: Option<HeaderCoordinates>,
     current: Option<ActiveTable>,
-    math: Option<MathJob>,
     ready: Option<MarkdownTableStructuralWindow>,
     no_table: bool,
     required_row_end: Option<VerifiedTableEnd>,
@@ -247,7 +221,6 @@ impl MarkdownDocumentBuffer {
             ordinary_pending: None,
             coordinates: None,
             current: None,
-            math: None,
             ready: None,
             no_table: false,
             required_row_end: None,
@@ -307,7 +280,7 @@ impl MarkdownTableWindowStructureRequest {
                 if self.total.byte_reads > self.max_byte_work
                     || self.total.transitions > self.max_transitions
                 {
-                    // 元数据、spine与math重放共享请求总fuel，不因切换子scanner重置累计量。
+                    // 元数据与spine共享请求总fuel，不因切换结构子阶段重置累计量。
                     self.fail(MarkdownTableRequestError::WorkLimit);
                     return Err(MarkdownTableRequestError::WorkLimit);
                 }
@@ -329,7 +302,6 @@ impl MarkdownTableWindowStructureRequest {
         self.ordinary_pending = None;
         self.coordinates = None;
         self.current = None;
-        self.math = None;
         self.ready = None;
         self.required_row_end = None;
     }
@@ -374,11 +346,8 @@ impl MarkdownTableWindowStructureRequest {
         if self.coordinates.is_some() {
             return self.advance_coordinates(document, budget);
         }
-        if self.math.is_some() {
-            return self.advance_math(document, budget);
-        }
         if let Some(fact) = self.pending.take() {
-            // 一个Fact只包含有限metadata；可能产生下一段math job，但不在本step顺带扫描正文。
+            // 一个Fact只包含有限metadata；消费它不重复读取已经完成结构扫描的原行。
             return self.consume_fact(document, fact, budget);
         }
         let source_tree_steps = tree_height(document);
@@ -533,17 +502,9 @@ impl MarkdownTableWindowStructureRequest {
                             return Ok(MarkdownTableStructureStep::StructureReady { work });
                         }
                     }
-                    if current.first_overflow.is_none() && current.math_rows.is_empty() {
-                        current.math_rows.push(MarkdownTableRowMathContext {
-                            row_ordinal: 0,
-                            context: current
-                                .header_context
-                                .ok_or(MarkdownTableRequestError::InvalidRequest)?,
-                        });
-                    }
                     if current.first_overflow.is_none() {
                         if current.body.is_empty() {
-                            // 当前Row尚未扫描math；此处保留的仍是本行之前已接受的精确状态。
+                            // 当前Row的前一真实边界用于后续定位回放，不按窗口位置重造checkpoint。
                             current.chunk_boundary = current.boundary.clone();
                             current.chunk_halo = current.halo_boundary.clone();
                         }
@@ -556,28 +517,16 @@ impl MarkdownTableWindowStructureRequest {
                                 .and_then(|checkpoint| checkpoint.last_inline_row())
                                 .ok_or(MarkdownTableRequestError::InvalidRequest)?,
                         );
-                        current.math_rows.push(MarkdownTableRowMathContext {
-                            row_ordinal: row.row_ordinal,
-                            context: current.context,
-                        });
                     }
                 }
-                // 被省略的真实row也必须更新math；不保正文、不跳过超列cell或按brace净计数猜状态。
+                // 同一Global已经接受完整行与checkpoint；不为不存在的公式渲染再读一次源。
                 let checkpoint = self
                     .global
                     .as_ref()
                     .and_then(GlobalFrontier::table_checkpoint)
                     .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-                current.pending_row_boundary = Some((checkpoint, row));
-                self.math = Some(MathJob::Body(
-                    MathContextScan::new(
-                        document.generation(),
-                        document.byte_len(),
-                        row.byte_start + row.container_prefix_bytes..row.byte_end,
-                        current.context,
-                    )
-                    .map_err(MarkdownTableRequestError::Math)?,
-                ));
+                current.halo_boundary = current.boundary.take();
+                current.boundary = Some(Boundary::after_row(checkpoint, row));
             }
             GlobalFact::TableEnd(end) => {
                 if self.current.as_ref().is_some_and(|table| table.found) {
@@ -616,7 +565,6 @@ impl MarkdownTableWindowStructureRequest {
 
     fn install_header(
         &mut self,
-        document: &MarkdownDocumentBuffer,
         header: GlobalTableFact,
         coordinates: [usize; 4],
     ) -> Result<(), MarkdownTableRequestError> {
@@ -648,35 +596,23 @@ impl MarkdownTableWindowStructureRequest {
         if found {
             validate_columns(header.columns)?;
         }
-        // 每个真实table独立reset；首次H Scan与后续Active H都使用真实prefix后的源。
-        self.math = Some(MathJob::HeaderScan(
-            MathContextScan::new(
-                document.generation(),
-                document.byte_len(),
-                header.header_byte_start + header.header_prefix_bytes..header.header_byte_end,
-                MathContext::default(),
-            )
-            .map_err(MarkdownTableRequestError::Math)?,
-        ));
+        // H/D的坐标与原Global checkpoint已完成，直接建立首条body的真实回放入口。
+        let boundary = Boundary::after_delimiter(checkpoint.clone(), &header, delimiter_utf16.end);
         self.current = Some(ActiveTable {
             header,
             checkpoint,
             header_utf16,
             delimiter_utf16,
-            context: MathContext::default(),
-            header_context: None,
             body: Vec::new(),
             inline_rows: Vec::new(),
-            math_rows: Vec::new(),
             found,
             include_header,
             first_overflow: None,
-            base_boundary: None,
-            boundary: None,
+            base_boundary: Some(boundary.clone()),
+            boundary: Some(boundary),
             halo_boundary: None,
             chunk_boundary: None,
             chunk_halo: None,
-            pending_row_boundary: None,
         });
         Ok(())
     }
@@ -711,106 +647,9 @@ impl MarkdownTableWindowStructureRequest {
                 .coordinates
                 .take()
                 .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-            self.install_header(document, coordinate.header, coordinate.values)?;
+            self.install_header(coordinate.header, coordinate.values)?;
         }
         Ok(MarkdownTableStructureStep::Progress { work })
-    }
-
-    fn advance_math(
-        &mut self,
-        document: &MarkdownDocumentBuffer,
-        budget: usize,
-    ) -> Result<MarkdownTableStructureStep, MarkdownTableRequestError> {
-        let job = self
-            .math
-            .as_mut()
-            .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-        let scanner = job.scanner();
-        let source_tree_steps = tree_height(document);
-        let child_budget = child_budget(budget, source_tree_steps)?;
-        let frame = document
-            .table_source_frame(scanner.next_byte(), child_budget)
-            .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
-        let step = scanner
-            .advance(
-                SourceFrame {
-                    source_revision: frame.generation,
-                    byte_start: frame.byte_start,
-                    bytes: &frame.bytes,
-                    real_eof: frame.real_eof,
-                },
-                MathSourceAuthority {
-                    current_revision: document.generation(),
-                    cancelled: false,
-                },
-                child_budget,
-            )
-            .map_err(MarkdownTableRequestError::Math);
-        // 回收成功后才消费step，不能让原parser提前终止遮住真实映射错误。
-        frame
-            .finish()
-            .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
-        let step = step?;
-        let (work, complete) = match step {
-            MathContextStep::Progress { work, .. } | MathContextStep::NeedInput { work, .. } => {
-                (work, None)
-            }
-            MathContextStep::Complete { context, work } => (work, Some(context)),
-        };
-        if let Some(context) = complete {
-            let previous = self
-                .math
-                .take()
-                .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-            let table = self
-                .current
-                .as_mut()
-                .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-            match previous {
-                MathJob::HeaderScan(_) => {
-                    table.header_context = Some(context);
-                    self.math = Some(MathJob::HeaderActive(
-                        MathContextScan::new(
-                            document.generation(),
-                            document.byte_len(),
-                            table.header.header_byte_start + table.header.header_prefix_bytes
-                                ..table.header.header_byte_end,
-                            context,
-                        )
-                        .map_err(MarkdownTableRequestError::Math)?,
-                    ));
-                }
-                MathJob::HeaderActive(_) => {
-                    table.context = context;
-                    // D后的cp来自成功Table事实；只有两轮真实H math完成后才能配成body起点。
-                    let boundary = Boundary::after_delimiter(
-                        table.checkpoint.clone(),
-                        &table.header,
-                        table.delimiter_utf16.end,
-                        context,
-                    );
-                    table.base_boundary = Some(boundary.clone());
-                    table.boundary = Some(boundary);
-                }
-                MathJob::Body(_) => {
-                    let (checkpoint, row) = table
-                        .pending_row_boundary
-                        .take()
-                        .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-                    // Global的after-row cp先暂存；本行math成功后才推进联合接受边界。
-                    table.halo_boundary = table.boundary.take();
-                    table.boundary = Some(Boundary::after_row(checkpoint, row, context));
-                    table.context = context;
-                }
-            }
-        }
-        Ok(MarkdownTableStructureStep::Progress {
-            work: MarkdownTableRequestWork {
-                byte_reads: work.byte_reads,
-                transitions: work.transitions + source_tree_steps + 64,
-                source_tree_steps,
-            },
-        })
     }
 
     fn finish(
@@ -825,15 +664,7 @@ impl MarkdownTableWindowStructureRequest {
         if !current.found {
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
-        if current.math_rows.is_empty() {
-            current.math_rows.push(MarkdownTableRowMathContext {
-                row_ordinal: 0,
-                context: current
-                    .header_context
-                    .ok_or(MarkdownTableRequestError::InvalidRequest)?,
-            });
-        }
-        // 连续消费者仅移交本窗metadata；同一frontier、H上下文和真实前一行math留在活动表。
+        // 连续消费者仅移交本窗metadata；同一frontier与已接受行边界继续归活动表所有。
         // first未消费Row已由调用者保留pending，下一窗先消费它，不能从越过该行的checkpoint跳过。
         self.ready = Some(MarkdownTableStructuralWindow {
             source: self.source.clone(),
@@ -843,7 +674,6 @@ impl MarkdownTableWindowStructureRequest {
             delimiter_utf16: current.delimiter_utf16.clone(),
             body: std::mem::take(&mut current.body),
             inline_rows: std::mem::take(&mut current.inline_rows),
-            math_rows: std::mem::take(&mut current.math_rows),
             include_header: current.include_header,
             next_required_row: next_required_row.or(current.first_overflow),
             table_end,
@@ -851,9 +681,6 @@ impl MarkdownTableWindowStructureRequest {
                 header: current.header,
                 header_utf16: current.header_utf16.clone(),
                 delimiter_utf16: current.delimiter_utf16.clone(),
-                header_math: current
-                    .header_context
-                    .ok_or(MarkdownTableRequestError::InvalidRequest)?,
                 base: current
                     .base_boundary
                     .clone()

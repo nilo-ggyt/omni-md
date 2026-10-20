@@ -100,6 +100,28 @@ fn admitted_contexts_and_every_caret_match_the_frozen_real_editor() {
 }
 
 #[test]
+fn literal_carets_do_not_split_ordinary_bracket_contexts_or_change_unicode_source() {
+    let source = "(^中文😀)^ ²₃";
+    let (directory, buffer) = document(source);
+    // ^只是普通UTF8文字；跨越其位置的正文括号仍处于同一真实Paragraph上下文。
+    let closing_byte = source.find(')').unwrap();
+    let closing_utf16 = source[..closing_byte].encode_utf16().count();
+    assert_eq!(
+        markdown_bracket_match(&buffer, 1).unwrap(),
+        MarkdownBracketQuery::Match(MarkdownBracketMatch {
+            start_utf16: 0..1,
+            end_utf16: Some(closing_utf16..closing_utf16 + 1),
+            matched: true,
+        })
+    );
+    // 线索查询只观察映射源，不能删除^或将Unicode上下标标量转成HTML标记。
+    assert_eq!(
+        fs::read(directory.path().join("note.md")).unwrap(),
+        source.as_bytes()
+    );
+}
+
+#[test]
 fn live_piece_joins_undo_redo_and_unicode_validation_do_not_use_a_stale_context_cache() {
     let (_directory, mut buffer) = document("😀(a `)` b)");
     let initial = markdown_bracket_match(&buffer, 3).unwrap();
