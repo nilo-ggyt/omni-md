@@ -1224,6 +1224,7 @@ impl NativeMarkdownPagedTextView {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         self.foreground().is_ok()
     }
+    #[cfg_attr(feature = "native-markdown-runtime-probe", track_caller)]
     fn failure(&self, error: NativeMarkdownPagedTextViewError) {
         let mut slot = self.ivars().last_failure.borrow_mut();
         if slot.is_none()
@@ -1242,7 +1243,29 @@ impl NativeMarkdownPagedTextView {
                     | NativeMarkdownPagedTextViewError::FoldAction(_)
             ))
         {
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            let revoked = matches!(&error, NativeMarkdownPagedTextViewError::Revoked);
             *slot = Some(error);
+            #[cfg(feature = "native-markdown-runtime-probe")]
+            {
+                drop(slot); // 首错槽先归还；诊断不持RefMut，也不再访问Source、Native或正文。
+                if revoked {
+                    // 临时定位原真实写入点；普通Rust调用链传播site，不改变ObjC方法的ABI。
+                    // 只输出静态代码位置和原有纯值，不用日志充当撤权、恢复或再次调度的状态。
+                    let caller = std::panic::Location::caller();
+                    eprintln!(
+                        "native_paged_view_failure error=revoked file={} line={} depth={} callback_depth={} interpreting_key={} closed={} epoch={} geometry_epoch={} formal=false",
+                        caller.file(),
+                        caller.line(),
+                        self.ivars().depth.get(),
+                        self.ivars().input_callback_depth.get(),
+                        self.ivars().interpreting_key.get(),
+                        self.ivars().closed.get(),
+                        self.ivars().epoch,
+                        self.ivars().geometry_epoch.get(),
+                    );
+                }
+            }
         } // Pending/外部文件拒绝不能挡住真实源、资源或已提交后果首错；真实首错不被后续普通拒绝覆盖。
     }
     /// 入队前的外部文件拒绝与队首复制失败共用原反馈边；状态栏改变不能撤权已接纳的Word输入。
@@ -1261,6 +1284,7 @@ impl NativeMarkdownPagedTextView {
         } // 没有原链时才显示当前原窗口；关闭或换笔记后不复活旧反馈。
     }
     /// 只有顶层真实mutation/command的void回调决定原解释结果；候选坐标Pending保协议负值。
+    #[cfg_attr(feature = "native-markdown-runtime-probe", track_caller)]
     fn record_input(&self, result: Result<()>) {
         if let Err(cause) = result {
             #[cfg(feature = "native-input-trace")]
@@ -1286,12 +1310,14 @@ impl NativeMarkdownPagedTextView {
             }
         }
     }
+    #[cfg_attr(feature = "native-markdown-runtime-probe", track_caller)]
     fn record(&self, result: Result<()>) {
         if let Err(error) = result {
             self.report_attachment_rejection(&error);
             self.failure(error);
         }
     }
+    #[cfg_attr(feature = "native-markdown-runtime-probe", track_caller)]
     fn boolean_result(&self, result: Result<()>) -> bool {
         match result {
             Ok(()) => true,
