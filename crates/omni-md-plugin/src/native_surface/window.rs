@@ -1116,6 +1116,32 @@ impl NativeMarkdownWindowSurface {
         // 查找字段也可能正处于中文组合；先走原窗口辞任预检，不把候选迁到另一输入客户。
         let previous = self.panel.firstResponder();
         let find_focus = self.capture_mode_find_focus();
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        {
+            // 只记录原捕获的有限选区与真实客户关系，不读取字段值或以诊断结果授权恢复。
+            // 由 capture/restore/verify 三个既有出口区分捕获前变化、当场恢复失败及后继失焦。
+            let actual = find_focus.as_ref().and_then(|(field, _)| {
+                field
+                    .currentEditor()
+                    .and_then(|editor| editor.downcast::<NSTextView>().ok())
+            });
+            let responder_same = actual.as_ref().is_some_and(|actual| {
+                previous.as_ref().is_some_and(|responder| {
+                    std::ptr::from_ref(&**responder).addr() == std::ptr::from_ref(&**actual).addr()
+                })
+            });
+            let marked = actual.as_ref().map(|actual| {
+                ProtocolObject::<dyn NSTextInputClient>::from_ref(&**actual).hasMarkedText()
+            });
+            eprintln!(
+                "native_mode_find_focus phase=capture from={:?} to={mode:?} captured={} saved_range={:?} responder_same={responder_same} marked={marked:?} key_window={} app_active={}",
+                self.presentation_mode,
+                find_focus.is_some(),
+                find_focus.as_ref().and_then(|(_, selected)| *selected),
+                self.panel.isKeyWindow(),
+                NSApplication::sharedApplication(self.panel.mtm()).isActive(),
+            );
+        }
         self.commit_marked_text(false)?;
         self.resign_editor_responder()?;
         if let Some(editor) = &mut self.editor
@@ -1229,6 +1255,19 @@ impl NativeMarkdownWindowSurface {
                 return Err("原查找输入在模式交接期间改变，未套用过期选区".into());
             }
             editor.setSelectedRange(selected);
+        }
+        #[cfg(feature = "native-markdown-runtime-probe")]
+        {
+            // 公开 setter 的返回不是焦点或选区收据；这里只观察恢复当场的标量，不补设焦点或重试。
+            let responder_same = self.panel.firstResponder().is_some_and(|responder| {
+                std::ptr::from_ref(&*responder).addr() == std::ptr::from_ref(&*editor).addr()
+            });
+            eprintln!(
+                "native_mode_find_focus phase=restore saved_range={selected:?} actual_range={:?} responder_same={responder_same} key_window={} app_active={}",
+                editor.selectedRange(),
+                self.panel.isKeyWindow(),
+                NSApplication::sharedApplication(self.panel.mtm()).isActive(),
+            );
         }
         Ok(())
     }

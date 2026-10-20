@@ -501,6 +501,15 @@ impl SourceSession {
                 != std::ptr::from_ref(&*input).cast::<()>()
                 || input.selectedRange() != FIELD_RANGE
             {
+                // 只在原严格失败处分辨焦点与选区；不读取查询/正文，不改变后态或领取后继输入。
+                #[cfg(feature = "native-markdown-runtime-probe")]
+                eprintln!(
+                    "native_mode_find_focus phase=verify source={source} responder_same={} expected_range={FIELD_RANGE:?} actual_range={:?} key_window={} app_active={}",
+                    std::ptr::from_ref(&*responder).addr() == std::ptr::from_ref(&*input).addr(),
+                    input.selectedRange(),
+                    surface.panel.isKeyWindow(),
+                    NSApplication::sharedApplication(surface.panel.mtm()).isActive(),
+                );
                 return Err("模式交接没有保持原Find焦点及NSRange".into());
             }
             if !source {
