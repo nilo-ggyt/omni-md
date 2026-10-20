@@ -214,9 +214,9 @@ struct FindReplacementQueuedButton {
     paint: Rc<FindButtonPaint>,
 }
 
-/// 原实际构造事件的完整公开值身份；AppKit可复制事件，allocation地址不是其交付合同。
+/// 原实际构造事件的公开派发身份；AppKit可复制事件，allocation地址不是其交付合同。
 /// eventNumber由鼠标入口单调分配，其余字段从构造后的原NSEvent读取，不能从后继状态补采。
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 struct FindButtonDownIdentity {
     kind: objc2_app_kit::NSEventType,
     number: isize,
@@ -227,6 +227,16 @@ struct FindButtonDownIdentity {
 }
 
 impl FindButtonDownIdentity {
+    /// 实测AppKit派发副本会改timestamp，公开合同也未承诺保留该浮点值。
+    /// 时间只作诊断；原动作期限由started约束，派发严格按唯一编号和原窗口/位置/类型/修饰键关联。
+    fn same_dispatch(self, other: Self) -> bool {
+        self.kind == other.kind
+            && self.number == other.number
+            && self.window == other.window
+            && self.location == other.location
+            && self.modifiers == other.modifiers
+    }
+
     /// 只读本次仍存活的不可变鼠标元数据，不取得Window、Context、Doc或Source对象。
     fn capture(event: &objc2_app_kit::NSEvent) -> Self {
         Self {
@@ -994,7 +1004,7 @@ impl NativeMarkdownHostedTableProbe {
                 down.is_some(),
                 down.as_ref()
                     .is_some_and(|down| std::ptr::eq(&**down, event)),
-                identity == paint.down_identity,
+                identity.same_dispatch(paint.down_identity),
                 identity.number == paint.down_identity.number,
                 identity.timestamp == paint.down_identity.timestamp,
                 identity.window == paint.down_identity.window,
@@ -1003,9 +1013,9 @@ impl NativeMarkdownHostedTableProbe {
                 paint.before_intent,
                 paint.after_intent,
                 paint.dispatched.get(),
-            ); // allocation只作诊断，真正接纳由整组精确公开值决定；没有裸地址或正文。
+            ); // allocation和timestamp仅作诊断，接纳仍核其余精确派发值；没有裸地址或正文。
         }
-        if identity != paint.down_identity {
+        if !identity.same_dispatch(paint.down_identity) {
             return Ok(());
         }
         if paint.dispatched.replace(true) {
