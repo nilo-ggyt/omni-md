@@ -1,7 +1,7 @@
 //! 当前有限投影实际需要的引用查询和值；不创建全文definition目录。
 
 use crate::markdown_viewport_presentation::parser::MarkdownParserSeed;
-use std::{cell::Cell, collections::HashMap};
+use std::{cell::Cell, collections::HashMap, sync::Arc};
 
 use pulldown_cmark::{BrokenLink, Parser};
 use unicase::UniCase;
@@ -13,13 +13,31 @@ use super::{
 use crate::markdown_viewport_presentation::parser::markdown_presentation_options;
 
 const MAX_REFERENCE_QUERIES: usize = 1_024;
-const MAX_REFERENCE_NORMALIZED_LABEL_BYTES: usize = TABLE_WINDOW_MAX_REFERENCE_BYTES + 1_000;
+pub(crate) const MAX_REFERENCE_NORMALIZED_LABEL_BYTES: usize =
+    TABLE_WINDOW_MAX_REFERENCE_BYTES + 1_000;
 
-#[derive(Debug)]
 enum ReferenceValue {
     Pending,
     Missing,
-    Resolved { destination: String, title: String },
+    Resolved {
+        destination: Arc<String>,
+        title: String,
+    },
+}
+
+impl std::fmt::Debug for ReferenceValue {
+    /// 查询诊断只报告决议及有限尺度；不把私人URL或title泄露到错误文本。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => formatter.write_str("Pending"),
+            Self::Missing => formatter.write_str("Missing"),
+            Self::Resolved { destination, title } => formatter
+                .debug_struct("Resolved")
+                .field("destination_bytes", &destination.len())
+                .field("title_bytes", &title.len())
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -199,6 +217,24 @@ impl MarkdownTableReferenceQueries {
         Ok(())
     }
 
+    /// 同一个原流式cursor已经完成label语法后补收有限identifier；不重建旧Resolved/Missing。
+    /// 仍只调用原UniCase/folded_label及同一HashMap，超原key库存限额即撤销整次查询。
+    pub(crate) fn collect_verified_label(
+        &mut self,
+        normalized: &str,
+    ) -> Result<(), MarkdownTableWindowError> {
+        if self.failed {
+            return Err(MarkdownTableWindowError::ReferenceLimit);
+        }
+        self.collecting = true;
+        let result = self.admit_query(normalized);
+        self.seal_batch();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
     /// 已验证首个候选解析失败后撤销整个库存，不能忽略子请求错误再采用后继定义。
     pub(crate) fn fail_verified_resolution(&mut self) {
         self.failed = true;
@@ -314,10 +350,12 @@ impl MarkdownTableReferenceQueries {
             return Err(MarkdownTableWindowError::ReferenceLimit);
         }
         if let Some(quota) = &self.quota {
-            quota.admit_metadata(bytes)?;
+            quota.admit_metadata(bytes + crate::MarkdownLinkDestination::whole_metadata())?;
         }
         *value = ReferenceValue::Resolved {
-            destination: destination.to_owned(),
+            // 从原有限definition的&str复制一次，形成Map唯一拥有的目标String，再移入Arc。
+            // 后续流式/短块链接只浅共享此值，不能在CPU量子再复制一份16KiB目标。
+            destination: Arc::new(destination.to_owned()),
             title: title.to_owned(),
         };
         self.value_bytes += bytes;
@@ -349,7 +387,7 @@ impl MarkdownTableReferenceQueries {
         }
         let folded = folded_label(normalized_label).ok()?;
         match self.entries.get(&folded)? {
-            ReferenceValue::Resolved { destination, title } => Some((destination, title)),
+            ReferenceValue::Resolved { destination, title } => Some((destination.as_str(), title)),
             ReferenceValue::Pending | ReferenceValue::Missing => None,
         }
     }
@@ -364,7 +402,28 @@ impl MarkdownTableReferenceQueries {
         }
         let folded = folded_label(normalized_label)?;
         match self.entries.get(&folded) {
-            Some(ReferenceValue::Resolved { destination, title }) => Ok(Some((destination, title))),
+            Some(ReferenceValue::Resolved { destination, title }) => {
+                Ok(Some((destination.as_str(), title)))
+            }
+            Some(ReferenceValue::Missing) => Ok(None),
+            Some(ReferenceValue::Pending) | None => Err(MarkdownTableWindowError::ContextPending),
+        }
+    }
+
+    /// 只有原库存的真实Resolved值才能移交点击目标；Missing与未收集绝不混为同一种None。
+    /// Arc只保有限值，不持Source/Global；新SourceLink仍必须由原proof/publication授予权限。
+    pub(crate) fn resolved_destination(
+        &self,
+        normalized_label: &str,
+    ) -> Result<Option<crate::MarkdownLinkDestination>, MarkdownTableWindowError> {
+        if !self.is_ready() {
+            return Err(MarkdownTableWindowError::ContextPending);
+        }
+        let folded = folded_label(normalized_label)?;
+        match self.entries.get(&folded) {
+            Some(ReferenceValue::Resolved { destination, .. }) => Ok(Some(
+                crate::MarkdownLinkDestination::from_shared_string(Arc::clone(destination)),
+            )),
             Some(ReferenceValue::Missing) => Ok(None),
             Some(ReferenceValue::Pending) | None => Err(MarkdownTableWindowError::ContextPending),
         }

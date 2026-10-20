@@ -7,6 +7,7 @@ mod inline;
 mod partial;
 mod production;
 mod scoped;
+mod streamed_references;
 
 use super::*;
 use crate::markdown_viewport_presentation::MarkdownViewportPresentation;

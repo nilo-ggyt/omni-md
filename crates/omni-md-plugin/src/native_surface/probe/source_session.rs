@@ -1020,11 +1020,13 @@ impl NativeMarkdownMemoryWorkload {
                 });
             }
             let edits = match stage {
-                443 | 446 | 563 => 0,
+                // 模式验证本身也必须等原Source帧；后继443/460继续严格核同key、
+                // 原完整Input与viewport，不从登记时尚存的Preview模式取得替代终点。
+                442 | 443 | 446 | 563 => 0,
                 448 => 1,
                 450 => 2,
                 452 => 3,
-                454 | 460 => 4,
+                454 | 459 | 460 => 4,
                 462..=469 => {
                     u64::try_from(stage - 455).expect("正式附件事件连续对应七至十四次字符提交")
                 }

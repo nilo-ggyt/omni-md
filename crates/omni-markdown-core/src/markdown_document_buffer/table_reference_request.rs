@@ -233,7 +233,11 @@ impl Request {
                 // 原Parser只接已匹配的≤16KiB完整定义，继续负责entity/escape/title/首定义解码。
                 // parser_input_bytes是独立oracle输入上限，不声称其内部工作逐token服从available。
                 work.parser_input_bytes = value.len();
-                queries.admit_verified_definition(label, value)?;
+                if queries.admit_verified_definition(label, value)? {
+                    // 原whole-definition oracle的目标分配仍单列其有限输入；本轮新增的是
+                    // 实际Arc<String>固定拥有头，独立报告而不假称整个Parser已经逐token计费。
+                    work.metadata_bytes += crate::MarkdownLinkDestination::whole_metadata();
+                }
                 self.release_payload();
                 self.phase = Phase::Complete;
             }

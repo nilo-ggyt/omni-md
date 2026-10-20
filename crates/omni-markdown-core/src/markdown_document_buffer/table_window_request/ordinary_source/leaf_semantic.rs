@@ -1045,12 +1045,20 @@ impl RootLeafSemanticJob {
             }
             Phase::DiscardOrdinary => {
                 self.underline = ordinary.as_mut().unwrap().return_underline();
+                // General/Pending已经结束本次普通语义消费者；此出口不经过FinishLeaf，
+                // 因而必须在抛弃scratch前归还同一外存栈，并保留真实close错误。
+                if let Some(underline) = self.underline.as_mut() {
+                    underline.close_inline_stack()?;
+                }
                 *ordinary = None;
                 self.clear_active_leaf();
                 self.phase = Phase::NextLeaf;
                 work.structural_transitions += PlainSemanticJob::completed_drop_control();
             }
             Phase::FinishLeaf => {
+                if let Some(underline) = self.underline.as_mut() {
+                    underline.close_inline_stack()?;
+                }
                 let record = Rc::clone(self.record.as_ref().unwrap());
                 let utf16 = self.active_coverage.as_ref().unwrap().clone();
                 if self

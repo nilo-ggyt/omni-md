@@ -1044,6 +1044,10 @@ pub(crate) struct UnescapeStream {
     emitted: usize,
     flushing: bool,
     pub(crate) changed: bool,
+    #[cfg(any(test, feature = "omni-block-frontier"))]
+    utf8: [u8; 4],
+    #[cfg(any(test, feature = "omni-block-frontier"))]
+    utf8_len: usize,
 }
 
 impl UnescapeStream {
@@ -1057,7 +1061,40 @@ impl UnescapeStream {
             emitted: 0,
             flushing: false,
             changed: false,
+            #[cfg(any(test, feature = "omni-block-frontier"))]
+            utf8: [0; 4],
+            #[cfg(any(test, feature = "omni-block-frontier"))]
+            utf8_len: 0,
         }
+    }
+
+    /// 有限目标消费者必须逐片交完整 UTF8，不能等整个 URL 结束再全量复制/验证。
+    /// 该入口复用下面唯一 unescape 算法，只把原 decoder 的至多三字节尾部放回同一 owner。
+    /// output 至少四字节，调用者先留出验证/carry 的实际费用；返回 work 包括本次 UTF8 验证。
+    #[cfg(any(test, feature = "omni-block-frontier"))]
+    pub(crate) fn feed_utf8(
+        &mut self,
+        input: &[u8],
+        real_end: bool,
+        output: &mut [u8],
+        fuel: usize,
+    ) -> Result<(usize, usize, usize, bool), std::str::Utf8Error> {
+        output[..self.utf8_len].copy_from_slice(&self.utf8[..self.utf8_len]);
+        let (consumed, written, work, complete) =
+            self.feed(input, real_end, &mut output[self.utf8_len..], fuel);
+        let produced = self.utf8_len + written;
+        let valid = match std::str::from_utf8(&output[..produced]) {
+            Ok(_) => produced,
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(error) => return Err(error),
+        };
+        self.utf8_len = produced - valid;
+        if complete && self.utf8_len != 0 {
+            // complete 时不允许遗落最后一个 scalar；返回真实 UTF8 首错，不造空结果。
+            return Err(std::str::from_utf8(&output[valid..produced]).unwrap_err());
+        }
+        self.utf8[..self.utf8_len].copy_from_slice(&output[valid..produced]);
+        Ok((consumed, valid, work + produced, complete))
     }
 
     /// 输入消耗、输出复制、实体表比较均受同份fuel约束；不足只归还当前位置，不假造EOF。
@@ -1560,6 +1597,51 @@ pub(crate) fn scan_inline_html_processing(
 #[cfg(test)]
 mod test {
     use super::*;
+    #[test]
+    /// 正式目标 decoder 调用的同一 UTF8 framing，按单 byte 输入/八 byte 输出验证 carry。
+    /// 固定目标字面保原实体/escape/未知实体含义，完整 Parser 是独立 owner/URI 事件对照。
+    fn streamed_destination_values_keep_utf8_entities_and_escape_at_small_frames() {
+        for (raw, expected) in [
+            (r"/a\(b\)", "/a(b)"),
+            ("/a&amp;&#x1f600;", "/a&😀"),
+            ("/a&unknown;z", "/a&unknown;z"),
+            (r"/a\q", r"/a\q"),
+            ("/a&#0;", "/a�"),
+            ("", ""),
+            ("中文/😀&NotEqualTilde;/尾", "中文/😀≂̸/尾"),
+        ] {
+            for width in [1, 7, 1024] {
+                let mut stream = UnescapeStream::new(false);
+                let mut at = 0;
+                let mut actual = String::new();
+                loop {
+                    let end = (at + width).min(raw.len());
+                    let mut output = [0u8; 8];
+                    let (consumed, written, work, complete) = stream
+                        .feed_utf8(&raw.as_bytes()[at..end], end == raw.len(), &mut output, 960)
+                        .unwrap();
+                    assert!(consumed + work <= 2048);
+                    actual.push_str(std::str::from_utf8(&output[..written]).unwrap());
+                    at += consumed;
+                    if complete {
+                        break;
+                    }
+                }
+                assert_eq!(actual, expected);
+            }
+            let source = format!("[标签](<{raw}>)");
+            let targets: Vec<_> = crate::Parser::new(&source)
+                .filter_map(|event| match event {
+                    crate::Event::Start(crate::Tag::Link { dest_url, .. }) => {
+                        Some(dest_url.into_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(targets, [expected]);
+        }
+    }
+
     #[test]
     fn overflow_list() {
         assert!(

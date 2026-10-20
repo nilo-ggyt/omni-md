@@ -5,6 +5,34 @@
 
 use crate::{entities, CowStr};
 
+#[derive(Clone, Debug, Default)]
+/// 原 LinkStack 的禁用规则：成功 Link 使当时所有尚存的 Link opener 失效，Image 不受影响。
+/// serial 是真实 opener 身份，不是工作计数；因此外存栈无需重写所有祖先记录。
+/// 后来打开的 opener 拥有更大的 serial，不会被上一次成功链接误禁用。
+pub(crate) struct LinkStackDecision {
+    opened: usize,
+    disabled_through: usize,
+}
+
+impl LinkStackDecision {
+    pub(crate) fn open(&mut self) -> Option<usize> {
+        self.opened = self.opened.checked_add(1)?;
+        Some(self.opened)
+    }
+
+    pub(crate) fn enabled(&self, serial: usize, image: bool) -> bool {
+        image || serial > self.disabled_through
+    }
+
+    pub(crate) fn accept_link(&mut self) {
+        self.disabled_through = self.opened;
+    }
+
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntityValue {
     Named(&'static str),

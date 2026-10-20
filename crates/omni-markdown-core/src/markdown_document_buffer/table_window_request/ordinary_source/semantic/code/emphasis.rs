@@ -1,138 +1,14 @@
 //! 一个真实 Root 块的强调匹配栈；记录追加到匿名文件，RAM 只保固定2KiB尾页和当前匹配。
 
 use super::*;
+use crate::markdown_document_buffer::table_source::inline_stack::{
+    Entry, RecordStep, Scope, StackFile,
+};
 use pulldown_cmark::global_frontier::{VerifiedInlineEmphasisRun, VerifiedInlineLink};
 use pulldown_cmark::inline_emphasis::{self, EmphasisBounds, EmphasisStyle};
-use std::{fs::File, io, os::fd::IntoRawFd, os::unix::fs::FileExt};
-
-const PAGE: usize = 2048;
 const RECORD: usize = 64;
 #[cfg(test)]
 mod tests;
-
-#[derive(Clone, Copy)]
-struct Entry {
-    previous: usize,
-    depth: usize,
-    start: usize,
-    count: usize,
-    run_length: usize,
-    delimiter: u8,
-    both: bool,
-}
-
-/// 不可变prev链只追加；退栈不改旧record，也不复制或截取历史目录。
-struct StackFile {
-    file: Option<File>,
-    page: Option<Box<[u8; PAGE]>>,
-    count: usize,
-}
-impl StackFile {
-    /// 未遇有效opener时不分配页或FD；未知语法不为备用能力占资源。
-    fn new() -> Self {
-        Self {
-            file: None,
-            page: None,
-            count: 0,
-        }
-    }
-
-    /// 只在实际换页时写出旧尾页；源正文从不写进这个固定record文件。
-    fn append(
-        &mut self,
-        entry: Entry,
-        quota: &MarkdownTableWindowQuota,
-    ) -> Result<(usize, SemanticWork), MarkdownTableRequestError> {
-        let mut work = SemanticWork {
-            structural_transitions: PLAIN_CONTROL + RECORD,
-            ..Default::default()
-        };
-        let slot = self.count % (PAGE / RECORD);
-        if let Some(page) = self.page.as_ref() {
-            if slot == 0 {
-                if self.file.is_none() {
-                    self.file = Some(tempfile::tempfile().map_err(storage_error)?);
-                }
-                let offset = (self.count * RECORD - PAGE) as u64;
-                self.file
-                    .as_ref()
-                    .unwrap()
-                    .write_all_at(page.as_slice(), offset)
-                    .map_err(storage_error)?;
-                work.structural_transitions += PAGE;
-            }
-        } else {
-            quota
-                .admit_metadata(PAGE)
-                .map_err(MarkdownTableRequestError::Window)?;
-            self.page = Some(Box::new([0; PAGE]));
-            work.metadata_bytes = PAGE;
-        }
-        let bytes = &mut self.page.as_mut().unwrap()[slot * RECORD..(slot + 1) * RECORD];
-        for (index, value) in [
-            entry.previous,
-            entry.depth,
-            entry.start,
-            entry.count,
-            entry.run_length,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            bytes[index * 8..index * 8 + 8].copy_from_slice(&(value as u64).to_le_bytes());
-        }
-        bytes[40] = entry.delimiter;
-        bytes[41] = u8::from(entry.both);
-        self.count += 1;
-        Ok((self.count, work))
-    }
-
-    /// 历史只读一个固定record；命中当前尾页时借原页，不建立第二页缓存。
-    fn read(&self, index: usize) -> Result<Entry, MarkdownTableRequestError> {
-        let offset = (index - 1) * RECORD;
-        let mut copied = [0; RECORD];
-        let bytes = if offset / PAGE == (self.count - 1) * RECORD / PAGE {
-            &self.page.as_ref().unwrap()[offset % PAGE..offset % PAGE + RECORD]
-        } else {
-            self.file
-                .as_ref()
-                .unwrap()
-                .read_exact_at(&mut copied, offset as u64)
-                .map_err(storage_error)?;
-            &copied
-        };
-        let field = |at: usize| {
-            usize::try_from(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())).unwrap()
-        };
-        Ok(Entry {
-            previous: field(0),
-            depth: field(8),
-            start: field(16),
-            count: field(24),
-            run_length: field(32),
-            delimiter: bytes[40],
-            both: bytes[41] != 0,
-        })
-    }
-
-    /// 成功发布之前显式归还唯一FD；close失败不重试可能已被内核复用的descriptor。
-    fn close(&mut self) -> Result<(), MarkdownTableRequestError> {
-        self.page = None;
-        if let Some(file) = self.file.take() {
-            let descriptor = file.into_raw_fd();
-            // SAFETY: into_raw_fd移交此匿名文件的唯一close义务；不存在克隆FD或后续读取者。
-            if unsafe { libc::close(descriptor) } != 0 {
-                return Err(storage_error(io::Error::last_os_error()));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// OS首错进入原请求的sticky错误槽；无errno的真实短读按IO错误报告，不恢复成空record。
-fn storage_error(error: io::Error) -> MarkdownTableRequestError {
-    MarkdownTableRequestError::InlineStorageUnavailable(error.raw_os_error().unwrap_or(libc::EIO))
-}
 
 #[derive(Clone, Copy)]
 struct Run {
@@ -152,20 +28,9 @@ enum Phase {
     Finish,
 }
 
-/// Link label 的 delimiter 只能在自己的真实范围内配对；外层只停放固定匹配头，文件仍唯一。
-/// 有效 Link 不能嵌套，因此只需一层；不复制 delimiter 记录、正文或原源权限。
-struct LinkScope {
-    source: Range<usize>,
-    label: Range<usize>,
-    head: usize,
-    depth: usize,
-    bounds: EmphasisBounds,
-}
-
 pub(super) struct EmphasisJob {
     source: Range<usize>,
-    link: Option<LinkScope>,
-    file: StackFile,
+    link: Option<Scope>,
     bounds: EmphasisBounds,
     head: usize,
     depth: usize,
@@ -187,7 +52,6 @@ impl EmphasisJob {
         Self {
             source,
             link: None,
-            file: StackFile::new(),
             bounds: EmphasisBounds::default(),
             head: 0,
             depth: 0,
@@ -241,34 +105,60 @@ impl EmphasisJob {
     pub(super) fn enter_link(
         &mut self,
         proof: &VerifiedInlineLink,
-    ) -> Result<(), MarkdownTableRequestError> {
+        quota: &MarkdownTableWindowQuota,
+        budget: usize,
+        file: &mut StackFile,
+    ) -> Result<(SemanticWork, bool), MarkdownTableRequestError> {
         let source = proof.source_range();
-        if self.busy()
-            || self.link.is_some()
-            || source.start < self.source.start
-            || source.end > self.source.end
-        {
+        let parent = self
+            .link
+            .as_ref()
+            .map_or(&self.source, |scope| &scope.label);
+        if self.busy() || source.start < parent.start || source.end > parent.end {
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
-        self.link = Some(LinkScope {
+        let mut work = SemanticWork {
+            structural_transitions: PLAIN_CONTROL,
+            ..Default::default()
+        };
+        // 嵌套Image/Link保存的是原外层scope完整匹配头与九个失败下界；只把最顶层留RAM。
+        // 页刷写未完成时不改变当前scope，后继仍消费同一proof，绝不再次接纳另一个Begin。
+        let previous = if let Some(outer) = self.link.as_ref() {
+            match file.append_scope(outer, quota, budget)? {
+                RecordStep::Progress { work } => return Ok((work, false)),
+                RecordStep::Ready {
+                    value,
+                    work: measured,
+                } => {
+                    work = measured;
+                    Some(value)
+                }
+            }
+        } else {
+            None
+        };
+        self.link = Some(Scope {
             source,
             label: proof.label_range(),
             head: self.head,
             depth: self.depth,
             bounds: std::mem::take(&mut self.bounds),
+            previous,
         });
         self.head = 0;
         self.depth = 0;
-        Ok(())
+        Ok((work, true))
     }
 
-    /// 只接原 cursor 对同 owner/label 的真实结束事件；回到外层前，本 label 的 run 必须已处理完。
-    /// 恢复真实 prev 链而不是把 label 剩余 opener 接到外层，保持原 Parser 的配对隔离。
+    /// End必须与当前真实owner/label严格相同；只从同文件恢复一个原scope，不搜索祖先或重建AST。
+    /// 先成功读取旧checkpoint再移交RAM状态，短读/IO失败不会把部分恢复状态交给后继run。
     pub(super) fn leave_link(
         &mut self,
         source: &Range<usize>,
         label: &Range<usize>,
-    ) -> Result<(), MarkdownTableRequestError> {
+        budget: usize,
+        file: &mut StackFile,
+    ) -> Result<SemanticWork, MarkdownTableRequestError> {
         if self.busy()
             || self
                 .link
@@ -277,11 +167,25 @@ impl EmphasisJob {
         {
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
+        let mut work = SemanticWork {
+            structural_transitions: PLAIN_CONTROL,
+            ..Default::default()
+        };
+        let previous = if let Some(id) = self.link.as_ref().unwrap().previous {
+            work.structural_transitions += 3 * RECORD;
+            if work.structural_transitions > budget {
+                return Err(MarkdownTableRequestError::WorkLimit);
+            }
+            Some(file.read_scope(id)?)
+        } else {
+            None
+        };
         let outer = self.link.take().unwrap();
         self.head = outer.head;
         self.depth = outer.depth;
         self.bounds = outer.bounds;
-        Ok(())
+        self.link = previous;
+        Ok(work)
     }
 
     /// 每次重新匹配都用剩余栈的真实深度和原run_length，不以消费后的count改变mod3规则。
@@ -303,6 +207,8 @@ impl EmphasisJob {
     pub(super) fn advance(
         &mut self,
         quota: &MarkdownTableWindowQuota,
+        budget: usize,
+        file: &mut StackFile,
     ) -> Result<(SemanticWork, Option<SpanProof>), MarkdownTableRequestError> {
         let mut work = SemanticWork {
             structural_transitions: PLAIN_CONTROL,
@@ -317,7 +223,7 @@ impl EmphasisJob {
                         .failed(run.delimiter, run.run_length, run.both, self.depth);
                     self.phase = Phase::Finish;
                 } else {
-                    let entry = self.file.read(self.search)?;
+                    let entry = file.read(self.search)?;
                     work.structural_transitions += RECORD;
                     let run = self.run.as_ref().unwrap();
                     if entry.depth < self.lower {
@@ -378,10 +284,10 @@ impl EmphasisJob {
                 }
             }
             Phase::Remainder => {
-                let entry = self.matched.take().unwrap();
+                let entry = *self.matched.as_ref().unwrap();
                 if entry.count > self.match_count {
                     self.bounds.before_push(entry.delimiter, self.depth);
-                    let (head, measured) = self.file.append(
+                    let stored = file.append(
                         Entry {
                             previous: self.head,
                             depth: self.depth,
@@ -389,11 +295,17 @@ impl EmphasisJob {
                             ..entry
                         },
                         quota,
+                        budget,
                     )?;
+                    let (head, measured) = match stored {
+                        RecordStep::Progress { work } => return Ok((work, None)),
+                        RecordStep::Ready { value, work } => (value, work),
+                    };
                     self.head = head;
                     self.depth += 1;
                     work = measured;
                 }
+                self.matched = None;
                 let run = self.run.as_mut().unwrap();
                 run.start += self.match_count;
                 run.count -= self.match_count;
@@ -406,10 +318,10 @@ impl EmphasisJob {
                 }
             }
             Phase::Finish => {
-                let run = self.run.take().unwrap();
+                let run = *self.run.as_ref().unwrap();
                 if run.can_open && run.count > 0 {
                     self.bounds.before_push(run.delimiter, self.depth);
-                    let (head, measured) = self.file.append(
+                    let stored = file.append(
                         Entry {
                             previous: self.head,
                             depth: self.depth,
@@ -420,34 +332,26 @@ impl EmphasisJob {
                             both: run.both,
                         },
                         quota,
+                        budget,
                     )?;
+                    let (head, measured) = match stored {
+                        RecordStep::Progress { work } => return Ok((work, None)),
+                        RecordStep::Ready { value, work } => (value, work),
+                    };
                     self.head = head;
                     self.depth += 1;
                     work = measured;
                 }
+                self.run = None;
                 self.phase = Phase::Idle;
             }
         }
         Ok((work, None))
     }
 
-    /// 原块真实结束后未匹配opener继续字面；关闭私有文件成功才允许父owner发布有限输出。
-    pub(super) fn finish(&mut self) -> Result<(), MarkdownTableRequestError> {
-        self.link = None; // 失败/General 也归还固定停放状态；不能在后继任务恢复旧 label 权限。
-        self.file.close()
-    }
-
-    /// 测试只借fd数值观察真实关闭，不克隆文件或取得第二份close归属。
-    #[cfg(test)]
-    pub(super) fn descriptor_for_test(&self) -> Option<std::os::fd::RawFd> {
-        use std::os::fd::AsRawFd;
-        self.file.file.as_ref().map(AsRawFd::as_raw_fd)
-    }
-
-    /// 真实只读FD替换私有测试文件，使后继原分页写入报告系统错误；生产没有此入口。
-    #[cfg(test)]
-    pub(super) fn replace_file_for_test(&mut self, file: File) {
-        self.file.file = Some(file);
+    /// 原块结束后算法状态不再授予任何span；唯一文件由共同underline事务在最后消费者后关闭。
+    pub(super) fn finish(&mut self) {
+        self.link = None;
     }
 }
 

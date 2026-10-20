@@ -23,7 +23,11 @@ const WORKSPACE_WORK: usize = 1024;
 mod code;
 pub use code::{
     InlineCodeCursor, InlineCodeStep, InlineLinkDestinationDecoder, InlineLinkDestinationStep,
-    VerifiedInlineCodeSpan, VerifiedInlineEmphasisRun, VerifiedInlineLink,
+    InlineLinkKind, InlineLinkRecord, InlineLinkRecordId, InlineLinkRecordStatus,
+    InlineLinkStorageOperation, InlineLinkStorageReply, InlineLinkStorageRequest,
+    InlineLinkStorageStep, InlineLinkTarget, InlineReferenceDecoder, InlineReferenceKind,
+    InlineReferenceResolution, VerifiedInlineCodeSpan, VerifiedInlineEmphasisRun,
+    VerifiedInlineLink, VerifiedInlineReferenceRequest,
 };
 
 /// Plain 与 ATX 共用原 special-bytes 表及逐 byte 规则；候选只要求完整 inline，绝不自行配对。
@@ -81,6 +85,16 @@ pub(crate) struct TableCellInlineContext {
 }
 
 impl VerifiedInlineSemanticSeed {
+    /// 原闭合 Fact 捕获的 Source 修订；消费者仍须核同源健康与取消，数值不能复活旧票。
+    pub fn source_revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// 原文档真实 byte 末端，保持与该 seed 同次捕获；块的 source_range.end 不是 Doc EOF。
+    pub fn source_end(&self) -> usize {
+        self.source_end
+    }
+
     /// 有限完整块的原 Parser 入口使用本 Fact 的真实选项；调用方不能补造容器或开启另一套语法。
     pub fn options(&self) -> Options {
         self.options

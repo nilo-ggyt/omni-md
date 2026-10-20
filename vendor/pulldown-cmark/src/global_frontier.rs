@@ -27,9 +27,13 @@ mod inline_semantic;
 pub(crate) use inline_semantic::TableCellInlineContext;
 pub use inline_semantic::{
     InlineCodeCursor, InlineCodeStep, InlineLinkDestinationDecoder, InlineLinkDestinationStep,
-    InlinePlainContainers, InlinePlainCursor, InlinePlainLimits, InlinePlainStep,
-    InlinePlainTerminal, VerifiedInlineCodeSpan, VerifiedInlineEmphasisRun, VerifiedInlineLink,
-    VerifiedInlinePlainProof, VerifiedInlineSemanticSeed,
+    InlineLinkKind, InlineLinkRecord, InlineLinkRecordId, InlineLinkRecordStatus,
+    InlineLinkStorageOperation, InlineLinkStorageReply, InlineLinkStorageRequest,
+    InlineLinkStorageStep, InlineLinkTarget, InlinePlainContainers, InlinePlainCursor,
+    InlinePlainLimits, InlinePlainStep, InlinePlainTerminal, InlineReferenceDecoder,
+    InlineReferenceKind, InlineReferenceResolution, VerifiedInlineCodeSpan,
+    VerifiedInlineEmphasisRun, VerifiedInlineLink, VerifiedInlinePlainProof,
+    VerifiedInlineReferenceRequest, VerifiedInlineSemanticSeed,
 };
 mod leaf_block;
 pub use leaf_block::{

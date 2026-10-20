@@ -554,7 +554,10 @@ impl NativeMarkdownHostedWorkload {
                     self.workload.observe_memory_terminal(stage, observer)?;
                     true
                 }
+                // 原模式按钮只接纳异步动作；先等同一Source完整帧，再核模式与字段焦点。
+                // 442/459不能仅让出一个事件便视为完成，旧Preview帧也无权唤醒它们。
                 441
+                | 442
                 | 443
                 | 445
                 | 446
@@ -564,6 +567,7 @@ impl NativeMarkdownHostedWorkload {
                 | 454
                 | 457
                 | 458
+                | 459
                 | 460
                 | 462..=469
                 | 561

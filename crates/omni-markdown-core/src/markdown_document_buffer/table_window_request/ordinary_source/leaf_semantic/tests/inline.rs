@@ -246,7 +246,11 @@ pub(super) fn finish_inline(
             request.advance(document, authority(document), 4096)?;
         assert!(work.source_bytes <= 4096);
         assert!(work.structural_transitions <= 4096);
-        assert!(work.metadata_bytes <= 4096);
+        assert!(
+            work.metadata_bytes <= 4096,
+            "本步真实metadata超原量子: work={work:?}, total={:?}",
+            request.total_work()
+        );
         assert!(work.parser_input_bytes <= 2048);
         assert!(work.copied_source_bytes <= 2048);
         assert!(work.allocated_source_capacity <= 2048);

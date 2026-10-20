@@ -1,99 +1,141 @@
-//! 已规范化链接目标的唯一拥有值；分页只是有限URI载荷，不是正文索引或缓存。
+//! 已规范化链接目标的唯一拥有值；连续值与小页都是实际producer的载荷，不是正文缓存。
 
 use std::sync::Arc;
 
 #[derive(Clone)]
-/// 目标值由真实Parser或流式Link解码器构造，整个值始终是有效UTF8；clone只分享不可变目标。
-/// CPU发布不要求连续String。只有实际点击/NSURL边界才显式物化，不在排版量子内搬移完整目标。
-pub struct MarkdownLinkDestination(Arc<Payload>);
+/// 原Parser已经拥有的String直接共享；流式解码器移交有限小页。两条路径均保持有效UTF8，
+/// clone只分享原载荷，CPU发布不要求连续表示；真正URL I/O边界才显式物化String。
+pub struct MarkdownLinkDestination(Storage);
 
-struct Payload {
+#[derive(Clone)]
+enum Storage {
+    Whole(Arc<String>),
+    Paged(Arc<Pages>),
+}
+struct Pages {
     chunks: Vec<Vec<u8>>,
     len: usize,
 }
 
 impl MarkdownLinkDestination {
-    /// 原有小块Parser已经生成合法String；move其分配为一个目标片，不重新解码或复制URL。
+    /// 原小块Parser已生成合法String；只move到一个小Arc，不再复制其字节或换成第二份页。
     #[cfg(feature = "s2-table-window-prototype")]
     pub(crate) fn from_string(value: String) -> Self {
-        Self::from_chunks(vec![value.into_bytes()])
+        Self::from_shared_string(Arc::new(value))
     }
 
-    /// 只允许同crate已验证每个规范化输出片的拥有者调用；拼接顺序保持原解码流的UTF8证明。
-    /// 此处只移动有限目录与小Arc载荷，不复制片内容；不公开裸bytes构造以免外部伪造该证明。
+    /// 原引用Map与SourceLink共享同一次规范化输出；String本身已证明UTF8，不接受裸字节。
+    /// 该入口只分享值，不包含Source/pub权限；真正激活仍由原发布票与点击意图核验。
+    #[cfg(feature = "s2-table-window-prototype")]
+    pub(crate) fn from_shared_string(value: Arc<String>) -> Self {
+        Self(Storage::Whole(value))
+    }
+
+    /// 只允许同crate已逐片验证解码输出的拥有者调用；移交目录而不复制目标内容。
     #[cfg(feature = "s2-table-window-prototype")]
     pub(crate) fn from_chunks(chunks: Vec<Vec<u8>>) -> Self {
         let len = chunks.iter().map(Vec::len).sum();
-        Self(Arc::new(Payload { chunks, len }))
+        Self(Storage::Paged(Arc::new(Pages { chunks, len })))
     }
 
-    /// 实际目标库存准入使用已规范化字节数，不从chunk容量或原URL拼写猜长度。
+    /// 库存准入使用规范化字节数，不从片容量或原URL词法拼写猜长度。
     pub fn byte_len(&self) -> usize {
-        self.0.len
+        match &self.0 {
+            Storage::Whole(value) => value.len(),
+            Storage::Paged(value) => value.len,
+        }
     }
 
-    /// 点击出口取得独立连续目标；只处理原有限URI，不读取Doc/Source或触发Native回调。
-    /// 唯一单片直接移交原分配；共享/多片则在I/O边界一次物化，不保另一份目标缓存。
+    /// 只有实际URL出口取得连续目标；不读取Doc/Source或触发Native回调。
+    /// 独占Whole/单页可直接移交原分配，共享/多页仅在该I/O边界物化且不缓存结果。
     pub fn into_string(self) -> String {
-        let bytes = match Arc::try_unwrap(self.0) {
-            Ok(mut payload) if payload.chunks.len() == 1 => {
-                return String::from_utf8(payload.chunks.pop().unwrap())
-                    .expect("私有目标构造器只接原Parser或已验证UTF8解码流");
+        let pages = match self.0 {
+            Storage::Whole(value) => {
+                return Arc::try_unwrap(value).unwrap_or_else(|value| value.as_ref().clone());
             }
-            Ok(payload) => {
-                let mut bytes = Vec::with_capacity(payload.len);
-                for chunk in payload.chunks {
+            Storage::Paged(value) => value,
+        };
+        let bytes = match Arc::try_unwrap(pages) {
+            Ok(mut pages) if pages.chunks.len() == 1 => {
+                return String::from_utf8(pages.chunks.pop().unwrap())
+                    .expect("私有目标构造器只接已验证UTF8解码流");
+            }
+            Ok(pages) => {
+                let mut bytes = Vec::with_capacity(pages.len);
+                for chunk in pages.chunks {
                     bytes.extend_from_slice(&chunk);
                 }
                 bytes
             }
-            Err(payload) => {
-                let mut bytes = Vec::with_capacity(payload.len);
-                for chunk in &payload.chunks {
+            Err(pages) => {
+                let mut bytes = Vec::with_capacity(pages.len);
+                for chunk in &pages.chunks {
                     bytes.extend_from_slice(chunk);
                 }
                 bytes
             }
         };
-        String::from_utf8(bytes).expect("私有目标构造器只接原Parser或已验证UTF8解码流")
+        String::from_utf8(bytes).expect("私有目标构造器只接已验证UTF8解码流")
     }
 
     #[cfg(feature = "s2-table-window-prototype")]
-    pub(crate) fn publication_metadata() -> usize {
-        std::mem::size_of::<Payload>() + 2 * std::mem::size_of::<usize>()
+    pub(crate) fn whole_metadata() -> usize {
+        std::mem::size_of::<String>() + 2 * std::mem::size_of::<usize>()
     }
 
-    /// 原publication按真实保有容量计费，包含目录、各片与Arc；外带clone不复制这些分配。
+    #[cfg(feature = "s2-table-window-prototype")]
+    pub(crate) fn paged_metadata() -> usize {
+        std::mem::size_of::<Pages>() + 2 * std::mem::size_of::<usize>()
+    }
+
+    /// 按真实表示保有容量计量；Arc浅clone不会制造另一份String或目录。
     #[cfg(feature = "s2-table-window-prototype")]
     pub(crate) fn retained_metadata(&self) -> usize {
-        Self::publication_metadata()
-            + self.0.chunks.capacity() * std::mem::size_of::<Vec<u8>>()
-            + self.0.chunks.iter().map(Vec::capacity).sum::<usize>()
+        match &self.0 {
+            Storage::Whole(value) => Self::whole_metadata() + value.capacity(),
+            Storage::Paged(value) => {
+                Self::paged_metadata()
+                    + value.chunks.capacity() * std::mem::size_of::<Vec<u8>>()
+                    + value.chunks.iter().map(Vec::capacity).sum::<usize>()
+            }
+        }
+    }
+
+    /// 相等比较只顺序借现有字节；内部迭代器没有连续String副本或任何源读取权限。
+    fn bytes(&self) -> impl Iterator<Item = &u8> {
+        let (whole, chunks): (&[u8], &[Vec<u8>]) = match &self.0 {
+            Storage::Whole(value) => (value.as_bytes(), &[]),
+            Storage::Paged(value) => (&[], &value.chunks),
+        };
+        whole.iter().chain(chunks.iter().flatten())
     }
 }
 
 impl std::fmt::Debug for MarkdownLinkDestination {
-    /// 默认诊断只暴露有限载荷尺度，绝不将私人URL、查询串或原字节写入日志。
+    /// 诊断只报告尺度，绝不输出私人URL、title或查询串。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("MarkdownLinkDestination")
-            .field("len", &self.0.len)
-            .field("chunks", &self.0.chunks.len())
+            .field("len", &self.byte_len())
+            .field(
+                "chunks",
+                &match &self.0 {
+                    Storage::Whole(_) => 1,
+                    Storage::Paged(value) => value.chunks.len(),
+                },
+            )
             .finish()
     }
 }
-
 impl PartialEq for MarkdownLinkDestination {
-    /// 同一个URI的片边界不是业务差异；比较原不可变字节序，不物化String或读取正文。
+    /// 真实目标的表示不同不构成业务差异；同一Arc先快速相等，其余逐字节比较。
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-            || self.0.len == other.0.len
-                && self
-                    .0
-                    .chunks
-                    .iter()
-                    .flatten()
-                    .eq(other.0.chunks.iter().flatten())
+        let shared = match (&self.0, &other.0) {
+            (Storage::Whole(left), Storage::Whole(right)) => Arc::ptr_eq(left, right),
+            (Storage::Paged(left), Storage::Paged(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        };
+        shared || self.byte_len() == other.byte_len() && self.bytes().eq(other.bytes())
     }
 }
 impl Eq for MarkdownLinkDestination {}

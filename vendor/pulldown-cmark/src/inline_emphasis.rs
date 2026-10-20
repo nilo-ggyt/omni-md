@@ -86,6 +86,17 @@ pub struct EmphasisBounds {
     values: [usize; 9],
 }
 impl EmphasisBounds {
+    /// 嵌套 label 切换时保存真实的九个失败下界；外存拥有者负责其 I/O 与空间费用。
+    /// 不能清零后重新搜索，否则会改变同一解析事务的累计工作量和失败剪枝语义。
+    pub fn checkpoint(&self) -> [usize; 9] {
+        self.values
+    }
+
+    /// 只恢复同一解析拥有者保存的固定标量，不从文件位置或当前深度推测旧边界。
+    pub fn restore(values: [usize; 9]) -> Self {
+        Self { values }
+    }
+
     const UNDERSCORE_NOT_BOTH: usize = 0;
     const ASTERISK_NOT_BOTH: usize = 1;
     const ASTERISK_BASE: usize = 2;

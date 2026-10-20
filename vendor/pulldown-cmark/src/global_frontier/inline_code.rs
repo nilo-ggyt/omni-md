@@ -15,8 +15,16 @@ mod scope;
 use scope::ScopedCode;
 #[path = "inline_code_link.rs"]
 mod link;
-pub use link::{InlineLinkDestinationDecoder, InlineLinkDestinationStep, VerifiedInlineLink};
-use link::{LinkProbe, LinkStep};
+pub use link::{
+    InlineLinkDestinationDecoder, InlineLinkDestinationStep, InlineLinkKind, InlineLinkRecord,
+    InlineLinkRecordId, InlineLinkRecordStatus, InlineLinkStorageOperation, InlineLinkStorageReply,
+    InlineLinkStorageRequest, InlineLinkStorageStep, InlineLinkTarget, InlineReferenceDecoder,
+    InlineReferenceKind, InlineReferenceResolution, VerifiedInlineLink,
+    VerifiedInlineReferenceRequest,
+};
+#[path = "inline_code_link_group.rs"]
+mod link_group;
+use link_group::{LinkProbe, LinkStep, ReplayStep};
 
 const CONTROL: usize = 128;
 const HTML_BYTES: usize = 256;
@@ -107,6 +115,14 @@ pub enum InlineCodeStep {
         proof: VerifiedInlineLink,
         work: GlobalWork,
     },
+    Storage {
+        request: InlineLinkStorageRequest,
+        work: GlobalWork,
+    },
+    Reference {
+        request: VerifiedInlineReferenceRequest,
+        work: GlobalWork,
+    },
     LinkEnd {
         source: Range<usize>,
         label: Range<usize>,
@@ -127,6 +143,7 @@ enum Phase {
     Scope,
     Normal,
     Backslash,
+    Bang,
     Run,
     Html,
     Probe,
@@ -177,10 +194,11 @@ pub struct InlineCodeCursor {
     previous_len: usize,
     delimiter: u8,
     delimiter_before: Option<char>,
-    // 链接前瞻只保有限语法状态；真正闭合后再借原帧扫描label，不复制其正文。
-    // active_link同时保存外层请求末端，label结束后恢复外层而不是签发局部EOF。
+    // 链接前瞻只保当前记录/真实暂停；完整决定后按同文件源序链重借 label，不复制正文。
+    // 外层请求末端独立保留，所有嵌套 End 后才恢复它，不能签发一个局部 label EOF。
     link_probe: Option<LinkProbe>,
-    active_link: Option<(VerifiedInlineLink, usize)>,
+    link_outer_end: Option<usize>,
+    suppressed_reference_close: Option<usize>,
 }
 
 impl super::VerifiedInlineSemanticSeed {
@@ -268,7 +286,8 @@ impl super::VerifiedInlineSemanticSeed {
             delimiter: 0,
             delimiter_before: None,
             link_probe: None,
-            active_link: None,
+            link_outer_end: None,
+            suppressed_reference_close: None,
         }))
     }
 
@@ -298,6 +317,139 @@ impl crate::global_frontier::VerifiedGlobalInlineBlock {
 }
 
 impl InlineCodeCursor {
+    /// 文件借用端已经结束本次 I/O 并首先完成 SourceFrame.finish 后，才可恢复这个原请求。
+    /// 实际存储错误不进入这里；调用者保 Core errno 并停止游标，不把错误解释成字面。
+    pub fn accept_storage(
+        &mut self,
+        request: &InlineLinkStorageRequest,
+        step: InlineLinkStorageStep,
+        authority: GlobalSourceAuthority,
+        budget: usize,
+    ) -> Result<GlobalWork, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let result = (|| {
+            if authority.cancelled {
+                return Err(Error::Cancelled);
+            }
+            if authority.current_revision != self.revision {
+                return Err(Error::SourceSuperseded);
+            }
+            let (work, reply) = match step {
+                InlineLinkStorageStep::Progress { work } => (work, None),
+                InlineLinkStorageStep::Ready { reply, work } => (work, Some(reply)),
+            };
+            if work.byte_reads != 0 || work.transitions > budget || budget > MAX_FRONTIER_STEP_BYTES
+            {
+                return Err(Error::InvalidBudget);
+            }
+            let probe = self.link_probe.as_mut().ok_or(Error::InvalidFrame)?;
+            if probe.pending.as_ref().map(|(pending, _)| pending) != Some(request) {
+                return Err(Error::InvalidFrame);
+            }
+            let scanning = !probe.replaying();
+            if let Some(reply) = reply {
+                probe.accept_storage(request, reply)?;
+            }
+            if scanning && probe.replaying() {
+                self.next = self.run_start;
+                self.previous_len = 0;
+                self.phase = Phase::Normal;
+            }
+            self.account(work)?;
+            Ok(work)
+        })();
+        result.map_err(|error| self.fail(error))
+    }
+    /// 只接受原请求在同一 Queries/Global 中真正得到的 Resolved/Missing；不能以局部未见代替 Missing。
+    pub fn accept_reference(
+        &mut self,
+        request: &VerifiedInlineReferenceRequest,
+        resolution: InlineReferenceResolution,
+        authority: GlobalSourceAuthority,
+    ) -> Result<GlobalWork, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let result = (|| {
+            if authority.cancelled {
+                return Err(Error::Cancelled);
+            }
+            if authority.current_revision != self.revision {
+                return Err(Error::SourceSuperseded);
+            }
+            self.link_probe
+                .as_mut()
+                .ok_or(Error::InvalidFrame)?
+                .accept_reference(request, resolution)?;
+            let work = GlobalWork {
+                byte_reads: 0,
+                transitions: CONTROL,
+            };
+            self.account(work)?;
+            Ok(work)
+        })();
+        result.map_err(|error| self.fail(error))
+    }
+    fn start_link(&mut self, image: bool) -> Result<(), Error> {
+        let start = if image { self.run_start } else { self.next };
+        self.run_start = start;
+        self.link_outer_end = Some(self.requested_end);
+        self.link_probe = Some(LinkProbe::new(
+            self.revision,
+            self.source_end,
+            self.scope_range.clone(),
+            start,
+            image,
+            self.options,
+            self.suppressed_reference_close,
+        )?);
+        Ok(())
+    }
+    fn advance_link_replay(&mut self, work: GlobalWork) -> Result<Option<InlineCodeStep>, Error> {
+        let step = self
+            .link_probe
+            .as_mut()
+            .ok_or(Error::InvalidFrame)?
+            .replay(self.next)?;
+        Ok(match step {
+            ReplayStep::Storage(request) => Some(InlineCodeStep::Storage { request, work }),
+            ReplayStep::Progress => Some(InlineCodeStep::Progress { work }),
+            ReplayStep::Begin(proof) => {
+                self.next = proof.label.start;
+                self.previous = Some('[');
+                self.previous_len = 0;
+                Some(InlineCodeStep::Link { proof, work })
+            }
+            ReplayStep::End {
+                source,
+                label,
+                next,
+                previous,
+            } => {
+                self.next = next;
+                self.previous = Some(previous);
+                self.previous_len = 0;
+                Some(InlineCodeStep::LinkEnd {
+                    source,
+                    label,
+                    work,
+                })
+            }
+            ReplayStep::Done {
+                next,
+                suppressed_close,
+            } => {
+                self.next = next;
+                self.suppressed_reference_close = suppressed_close;
+                self.link_probe = None;
+                self.requested_end = self.link_outer_end.take().ok_or(Error::InvalidFrame)?;
+                Some(InlineCodeStep::Progress { work })
+            }
+            ReplayStep::None => None,
+        })
+    }
     /// 返回真实下一次所需源字节；lookahead/trim 都不会假装 canonical 已提交到此处。
     pub fn next_byte(&self) -> usize {
         if let Some(prefix) = self
@@ -306,7 +458,7 @@ impl InlineCodeCursor {
             .and_then(|scoped| scoped.prefix.as_ref())
         {
             prefix.next_byte()
-        } else if let Some(probe) = self.link_probe.as_ref() {
+        } else if let Some(probe) = self.link_probe.as_ref().filter(|probe| !probe.replaying()) {
             probe.next_byte()
         } else if let Some(probe) = self.probe.as_ref() {
             probe.next_byte()
@@ -341,7 +493,7 @@ impl InlineCodeCursor {
         self.probe = None;
         self.trim = None;
         self.link_probe = None;
-        self.active_link = None;
+        self.link_outer_end = None;
         self.html_len = 0;
         self.spine = None;
         self.scoped = None;
@@ -403,6 +555,8 @@ impl InlineCodeCursor {
                     | InlineCodeStep::Prefix { work, .. }
                     | InlineCodeStep::Emphasis { work, .. }
                     | InlineCodeStep::Link { work, .. }
+                    | InlineCodeStep::Storage { work, .. }
+                    | InlineCodeStep::Reference { work, .. }
                     | InlineCodeStep::LinkEnd { work, .. }
                     | InlineCodeStep::Proven { work, .. }
                     | InlineCodeStep::NeedsGeneralInline { work } => *work,
@@ -462,29 +616,39 @@ impl InlineCodeCursor {
             self.phase = Phase::Normal;
             return Ok(InlineCodeStep::Progress { work });
         }
-        if let Some(probe) = self.link_probe.as_mut() {
+        if self
+            .link_probe
+            .as_ref()
+            .is_some_and(|probe| !probe.replaying())
+        {
+            let probe = self.link_probe.as_mut().unwrap();
             let step = probe.advance(&frame, budget, &mut work)?;
             return Ok(match step {
                 LinkStep::Progress => InlineCodeStep::Progress { work },
                 LinkStep::NeedInput => InlineCodeStep::NeedInput { work },
+                LinkStep::Storage(request) => InlineCodeStep::Storage { request, work },
+                LinkStep::Reference(request) => InlineCodeStep::Reference { request, work },
                 LinkStep::General => {
                     self.link_probe = None;
                     self.phase = Phase::General;
                     InlineCodeStep::NeedsGeneralInline { work }
                 }
-                LinkStep::Complete(proof) => {
-                    // 必须先完成真实owner，再扫描label内的code/强调；目标中的标点不会入强调栈。
-                    // 外层只保存原请求上限；链接后续仍使用同seed/authority与累计fuel。
-                    self.link_probe = None;
-                    self.active_link = Some((proof.clone(), self.requested_end));
-                    self.requested_end = proof.label.end;
-                    self.next = proof.label.start;
-                    self.previous = Some('[');
+                LinkStep::Replay => {
+                    // 语法先完整决定，原 main cursor 才重借 opener 起点；不以闭合顺序发嵌套样式。
+                    self.next = self.run_start;
                     self.previous_len = 0;
                     self.phase = Phase::Normal;
-                    InlineCodeStep::Link { proof, work }
+                    InlineCodeStep::Progress { work }
                 }
             });
+        }
+        // replay 的元数据回复也只在真实 Source guard 后消费。普通源扫描不跨一个未完成的文件操作。
+        if self.link_probe.as_ref().is_some_and(LinkProbe::replaying)
+            && matches!(self.phase, Phase::Normal | Phase::Backslash | Phase::Bang)
+        {
+            if let Some(step) = self.advance_link_replay(work)? {
+                return Ok(step);
+            }
         }
         if matches!(self.phase, Phase::Probe) {
             let (probe_frame, boundary) = self.probe_frame(&frame, budget, &mut work)?;
@@ -586,7 +750,11 @@ impl InlineCodeCursor {
         }
         if matches!(self.phase, Phase::EmphasisContext) {
             if self.next == self.scan_end() {
-                let boundary = self.active_link.as_ref().map(|_| ']');
+                let boundary = self
+                    .link_probe
+                    .as_ref()
+                    .and_then(LinkProbe::label_range)
+                    .map(|_| ']');
                 return Ok(self.finish_emphasis(boundary, work));
             }
             while work.byte_reads + work.transitions + 8 <= budget {
@@ -610,23 +778,17 @@ impl InlineCodeCursor {
             return Ok(InlineCodeStep::Progress { work });
         }
         loop {
-            if self.next >= self.requested_end
-                && matches!(self.phase, Phase::Normal | Phase::Backslash)
+            if self.link_probe.as_ref().is_some_and(LinkProbe::replaying)
+                && matches!(self.phase, Phase::Normal | Phase::Backslash | Phase::Bang)
             {
-                if let Some((proof, outer_end)) = self.active_link.take() {
-                    // LinkEnd含同一owner和label，消费者可核对后只恢复原外层匹配栈。
-                    // 两次读取之间没有label String/局部Parser，也没有把viewport尾部当块尾。
-                    self.next = proof.source.end;
-                    self.requested_end = outer_end;
-                    self.previous = Some(')');
-                    self.previous_len = 0;
-                    self.phase = Phase::Normal;
-                    return Ok(InlineCodeStep::LinkEnd {
-                        source: proof.source,
-                        label: proof.label,
-                        work,
-                    });
+                if let Some(step) = self.advance_link_replay(work)? {
+                    return Ok(step);
                 }
+            }
+            if self.next >= self.requested_end
+                && self.link_probe.is_none()
+                && matches!(self.phase, Phase::Normal | Phase::Backslash | Phase::Bang)
+            {
                 self.phase = Phase::Proven;
                 return Ok(InlineCodeStep::Proven {
                     requires_general_styles: self.general_styles,
@@ -673,6 +835,15 @@ impl InlineCodeCursor {
                         .ok_or(Error::ArithmeticOverflow)?;
                     self.next += 1;
                 }
+                Phase::Bang => {
+                    self.phase = Phase::Normal;
+                    if byte == b'[' {
+                        self.start_link(true)?;
+                        return Ok(InlineCodeStep::Progress { work });
+                    }
+                    self.previous = Some('!');
+                    self.previous_len = 0;
+                }
                 Phase::Backslash => {
                     if byte == b'`' {
                         self.start_run(true);
@@ -701,25 +872,30 @@ impl InlineCodeCursor {
                         self.next += 1;
                         self.phase = Phase::Html;
                     } else if byte == b'['
-                        && self.active_link.is_none()
+                        && self.link_probe.is_none()
                         && self.scoped.is_none()
                         && !self.table_cell
                     {
-                        self.link_probe = Some(LinkProbe::new(
-                            self.revision,
-                            self.source_end,
-                            self.end,
-                            self.next,
-                        ));
+                        self.start_link(false)?;
                         return Ok(InlineCodeStep::Progress { work });
-                    } else if (matches!(byte, b'[' | b']') && self.active_link.is_none())
-                        || byte == b'!'
+                    } else if byte == b'!'
+                        && self.link_probe.is_none()
+                        && self.scoped.is_none()
+                        && !self.table_cell
+                    {
+                        // 只有随后真实 '[' 才建立 Image opener；普通感叹号仍是原字面。
+                        self.run_start = self.next;
+                        self.next += 1;
+                        self.phase = Phase::Bang;
+                    } else if (matches!(byte, b'[' | b']')
+                        && self.link_probe.is_none()
+                        && (self.scoped.is_some() || self.table_cell))
                         || (self.scoped.is_some() && byte == b'&')
                         || (self.options.contains(crate::Options::ENABLE_MATH)
                             && matches!(byte, b'$' | b'{' | b'}'))
                     {
                         self.phase = Phase::General;
-                        return Ok(InlineCodeStep::NeedsGeneralInline { work }); // 未决 link/math 可先消费 backticks，不能颠倒原 pass1 优先级。
+                        return Ok(InlineCodeStep::NeedsGeneralInline { work });
                     } else if self.emphasis
                         && (matches!(byte, b'*' | b'_')
                             || byte == b'~'
@@ -830,10 +1006,11 @@ impl InlineCodeCursor {
         let valid = self.delimiter != b'~' || self.run_count <= 2;
         let run = VerifiedInlineEmphasisRun {
             source: self.run_start..self.next,
-            scope: self.active_link.as_ref().map_or_else(
-                || self.scope_range.clone(),
-                |(proof, _)| proof.label.clone(),
-            ),
+            scope: self
+                .link_probe
+                .as_ref()
+                .and_then(LinkProbe::label_range)
+                .unwrap_or_else(|| self.scope_range.clone()),
             delimiter: self.delimiter,
             can_open: valid
                 && crate::inline_emphasis::can_open(
@@ -864,9 +1041,10 @@ impl InlineCodeCursor {
     }
     /// 只有完整认证过的label可以收窄匹配域；请求窗和短帧绝不能成为code的闭合边界。
     fn scan_end(&self) -> usize {
-        self.active_link
+        self.link_probe
             .as_ref()
-            .map_or(self.end, |(proof, _)| proof.label.end)
+            .and_then(LinkProbe::label_range)
+            .map_or(self.end, |label| label.end)
     }
     fn begin_probe(&mut self) -> Result<(), Error> {
         self.previous = Some('`');

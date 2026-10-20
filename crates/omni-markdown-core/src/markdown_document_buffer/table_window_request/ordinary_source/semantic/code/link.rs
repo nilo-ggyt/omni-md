@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::MarkdownLinkDestination;
-use pulldown_cmark::global_frontier::{InlineLinkDestinationDecoder, VerifiedInlineLink};
+use pulldown_cmark::global_frontier::{
+    InlineLinkDestinationDecoder, InlineLinkKind, InlineLinkTarget, VerifiedInlineLink,
+};
 
 const OUTPUT_BYTES: usize = 1024;
 // 原16KiB目标上限最多形成16个页句柄；只为小目录可能的真实搬移留量，不给目标正文另领预算。
@@ -13,6 +15,7 @@ const DIRECTORY_COPY_RESERVE: usize =
 
 enum Phase {
     Destination,
+    Reference,
     Coordinates,
 }
 
@@ -20,7 +23,9 @@ enum Phase {
 /// label 可以跨任意多帧；不会把 label 或 URL/title 所在的整个 owner 搬入 RAM。
 pub(super) struct LinkJob {
     proof: VerifiedInlineLink,
-    decoder: InlineLinkDestinationDecoder,
+    decoder: Option<InlineLinkDestinationDecoder>,
+    reference: Option<ReferenceLabel>,
+    shared_destination: Option<MarkdownLinkDestination>,
     destination: Vec<Vec<u8>>,
     destination_len: usize,
     maximum_destination_bytes: usize,
@@ -37,14 +42,27 @@ pub(super) struct LinkProjection {
 
 impl LinkJob {
     pub(super) fn new(proof: VerifiedInlineLink, maximum_destination_bytes: usize) -> Self {
-        let phase = if proof.destination_range().is_empty() {
-            Phase::Coordinates
+        let mut reference = None;
+        let decoder = proof.destination_decoder();
+        let phase = if proof.kind() == InlineLinkKind::Image {
+            Phase::Coordinates // 原Image只贡献样式/marker，不为其目标创建点击权限或复制URI。
         } else {
-            Phase::Destination
+            match proof.target() {
+                InlineLinkTarget::Direct { destination, .. } if destination.is_empty() => {
+                    Phase::Coordinates
+                }
+                InlineLinkTarget::Direct { .. } => Phase::Destination,
+                InlineLinkTarget::Reference { request } => {
+                    reference = Some(ReferenceLabel::new(request));
+                    Phase::Reference
+                }
+            }
         };
         Self {
-            decoder: proof.destination_decoder(),
+            decoder,
             proof,
+            reference,
+            shared_destination: None,
             destination: Vec::new(),
             destination_len: 0,
             maximum_destination_bytes,
@@ -63,6 +81,7 @@ impl LinkJob {
         selection: &Range<usize>,
         quota: &MarkdownTableWindowQuota,
         budget: usize,
+        queries: Option<&MarkdownTableReferenceQueries>,
     ) -> Result<(SemanticWork, Option<LinkProjection>), MarkdownTableRequestError> {
         document
             .original_backing_health()
@@ -74,6 +93,36 @@ impl LinkJob {
         } // proof 来自父作业同一 seed/cursor；这里也不让编辑或 Undo 换代借旧范围继续复制目标。
         match self.phase {
             Phase::Destination => self.advance_destination(document, quota, budget),
+            Phase::Reference => {
+                let reference = self.reference.as_mut().unwrap();
+                if reference.label().is_none() {
+                    return reference
+                        .advance(document, quota, budget)
+                        .map(|work| (work, None));
+                }
+                let label = reference.label().unwrap();
+                let destination = queries
+                    .ok_or(MarkdownTableRequestError::InvalidRequest)?
+                    .resolved_destination(label)
+                    .map_err(MarkdownTableRequestError::Window)?
+                    .ok_or(MarkdownTableRequestError::Window(
+                        MarkdownTableWindowError::ParserMismatch,
+                    ))?;
+                if destination.byte_len() > self.maximum_destination_bytes {
+                    return Err(MarkdownTableRequestError::Window(
+                        MarkdownTableWindowError::ReferenceLimit,
+                    ));
+                }
+                let work = SemanticWork {
+                    structural_transitions: PLAIN_CONTROL,
+                    normalizer_input_bytes: label.len(),
+                    ..Default::default()
+                };
+                self.shared_destination = Some(destination);
+                self.reference = None;
+                self.phase = Phase::Coordinates;
+                Ok((work, None))
+            }
             Phase::Coordinates => {
                 if let Some(coordinates) = self.coordinates.as_mut() {
                     let (work, values) = coordinates.advance(document, budget)?;
@@ -89,10 +138,15 @@ impl LinkJob {
                     let values = self.projected;
                     let label = values[1]..values[2];
                     let mut work = work;
-                    let link = if label.is_empty() {
+                    let link = if label.is_empty() || self.proof.kind() == InlineLinkKind::Image {
                         None
+                    } else if let Some(destination) = self.shared_destination.take() {
+                        Some(MarkdownSourceLink {
+                            label_utf16_range: label.clone(),
+                            destination,
+                        })
                     } else {
-                        let metadata = MarkdownLinkDestination::publication_metadata();
+                        let metadata = MarkdownLinkDestination::paged_metadata();
                         quota
                             .admit_metadata(metadata)
                             .map_err(MarkdownTableRequestError::Window)?;
@@ -150,10 +204,11 @@ impl LinkJob {
         if child < 2048 {
             return Err(MarkdownTableRequestError::WorkLimit);
         }
-        let next = self.decoder.next_byte();
+        let next = self.decoder.as_ref().unwrap().next_byte();
         let maximum = self
             .proof
             .destination_range()
+            .ok_or(MarkdownTableRequestError::InvalidRequest)?
             .end
             .checked_sub(next)
             .ok_or(MarkdownTableRequestError::InvalidRequest)?
@@ -170,7 +225,7 @@ impl LinkJob {
         };
         let mut output = [0; OUTPUT_BYTES];
         let source_bytes = frame.as_ref().map_or(0, |frame| frame.bytes.len());
-        let step = self.decoder.advance(
+        let step = self.decoder.as_mut().unwrap().advance(
             SourceFrame {
                 source_revision: document.generation(),
                 byte_start: next,

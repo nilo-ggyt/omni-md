@@ -418,6 +418,9 @@ impl MarkdownTableWindowRequest {
                 }
             }
             Phase::Project => {
+                if let Some(underline) = self.underline.as_mut() {
+                    underline.close_inline_stack()?;
+                }
                 let presentation =
                     self.with_input_references(document, true, references, |input| {
                         project_table_window_with_quota(input, Some(&self.quota))

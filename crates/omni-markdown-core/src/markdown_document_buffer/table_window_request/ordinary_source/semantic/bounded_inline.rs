@@ -456,7 +456,7 @@ impl BoundedInline {
 }
 
 struct ActiveLink {
-    destination: String,
+    destination: crate::MarkdownLinkDestination,
     source: MarkdownLinkMarkers,
 }
 
@@ -507,7 +507,12 @@ fn collect_links(
             }
         } // 自己的 End 携带 URL/title owner；它不能扩大自己的 label，其他真实 child 都保完整范围。
         match event {
-            Event::Start(Tag::Link { dest_url, .. }) => {
+            Event::Start(Tag::Link {
+                dest_url,
+                link_type,
+                id,
+                ..
+            }) => {
                 target_bytes = target_bytes
                     .checked_add(dest_url.len())
                     .ok_or(MarkdownTableRequestError::WorkLimit)?;
@@ -516,14 +521,39 @@ fn collect_links(
                         MarkdownTableWindowError::ReferenceLimit,
                     ));
                 }
+                // Unknown类型正是原broken-link callback从唯一Queries解析的引用；其目标
+                // 可以长于这个短块，必须分享同一Arc，不能让Cow::into_string再复制16KiB。
+                // 普通Inline/块内定义仍用本次完整Parser真正产出的值，不借另一个query改写它。
+                let reference = matches!(
+                    link_type,
+                    pulldown_cmark::LinkType::ReferenceUnknown
+                        | pulldown_cmark::LinkType::CollapsedUnknown
+                        | pulldown_cmark::LinkType::ShortcutUnknown
+                );
+                let metadata = std::mem::size_of::<ActiveLink>()
+                    + if reference {
+                        0
+                    } else {
+                        dest_url.len() + crate::MarkdownLinkDestination::whole_metadata()
+                    };
                 quota
-                    .admit_metadata(dest_url.len() + std::mem::size_of::<ActiveLink>())
+                    .admit_metadata(metadata)
                     .map_err(MarkdownTableRequestError::Window)?;
+                let destination = if reference {
+                    queries
+                        .resolved_destination(&id)
+                        .map_err(MarkdownTableRequestError::Window)?
+                        .ok_or(MarkdownTableRequestError::Window(
+                            MarkdownTableWindowError::ParserMismatch,
+                        ))?
+                } else {
+                    crate::MarkdownLinkDestination::from_string(dest_url.into_string())
+                };
                 if active.len() == active.capacity() {
                     active.reserve_exact(1); // 原事件栈只扩一项，实际容量与已付元数据一致。
                 }
                 active.push(ActiveLink {
-                    destination: dest_url.into_string(),
+                    destination,
                     source: MarkdownLinkMarkers::new(source, range).map_err(|_| {
                         MarkdownTableRequestError::Window(MarkdownTableWindowError::ParserMismatch)
                     })?,
@@ -540,16 +570,12 @@ fn collect_links(
                     let start = absolute_start + source[..range.start].encode_utf16().count();
                     let end = start + source[range].encode_utf16().count();
                     quota
-                        .admit_metadata(
-                            std::mem::size_of::<MarkdownSourceLink>()
-                                + crate::MarkdownLinkDestination::publication_metadata()
-                                + std::mem::size_of::<Vec<u8>>(),
-                        )
+                        .admit_metadata(std::mem::size_of::<MarkdownSourceLink>())
                         .map_err(MarkdownTableRequestError::Window)?;
                     links.reserve_exact(1);
                     links.push(MarkdownSourceLink {
                         label_utf16_range: start..end,
-                        destination: crate::MarkdownLinkDestination::from_string(link.destination),
+                        destination: link.destination,
                     });
                 }
             }

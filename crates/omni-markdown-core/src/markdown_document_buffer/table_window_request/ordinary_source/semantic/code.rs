@@ -2,11 +2,14 @@
 
 use super::*;
 use pulldown_cmark::global_frontier::{
-    InlineCodeCursor, InlineCodeStep, VerifiedInlineEmphasisRun, VerifiedInlineLink,
+    InlineCodeCursor, InlineCodeStep, InlineLinkStorageRequest, InlineLinkStorageStep,
+    InlineReferenceResolution, VerifiedInlineEmphasisRun, VerifiedInlineLink,
 };
 mod emphasis;
 mod link;
 mod prefix;
+use crate::markdown_document_buffer::table_source::inline_reference::ReferenceLabel;
+use crate::markdown_viewport_presentation::table_window::references::MarkdownTableReferenceQueries;
 use emphasis::EmphasisJob;
 use link::LinkJob;
 pub(in super::super) use prefix::PrefixDecoration;
@@ -27,7 +30,18 @@ pub(in super::super) struct SpanProof {
 }
 
 pub(super) struct CodeJob {
-    cursor: Option<InlineCodeCursor>,
+    // 大游标是同一算法的真实独占子owner，后继单独构造；不能把其固定载荷塞进本Box
+    // 令一次4632B分配越过4096，再以字段收费假装已经分量子。
+    cursor: Option<Box<InlineCodeCursor>>,
+    cursor_initialized: bool,
+    pending_storage: Option<InlineLinkStorageRequest>,
+    reference: Option<Box<ReferenceLabel>>,
+    reference_collected: bool,
+    references_attached: bool,
+    queries: Option<MarkdownTableReferenceQueries>,
+    incoming_end: Option<(Range<usize>, Range<usize>)>,
+    revision: u64,
+    source_end: usize,
     pending: Option<SpanProof>,
     coordinates: Option<Coordinates>,
     spans: Vec<VisibleSpan>,
@@ -60,11 +74,10 @@ impl CodeJob {
     /// 只接原闭合 Root Paragraph；完整 Setext 标记/容器仍须其自身 origin 规则，不造普通段落权限。
     pub(super) fn new(
         block: &OrdinaryBlockRecord,
-        origin: Option<&BlockOriginLine>,
         coverage: Range<usize>,
         requested: Range<usize>,
-        limits: (usize, usize),
         quota: &MarkdownTableWindowQuota,
+        budget: usize,
     ) -> Result<Option<Box<Self>>, MarkdownTableRequestError> {
         if !matches!(
             block.seed.kind(),
@@ -72,25 +85,23 @@ impl CodeJob {
         ) {
             return Ok(None);
         }
-        let limits = InlinePlainLimits {
-            max_byte_work: limits.0,
-            max_transitions: limits.1,
-        };
-        let cursor = match origin {
-            Some(origin) => block
-                .seed
-                .emphasis_origin_cursor(origin, coverage.end, limits),
-            None => block.seed.emphasis_cursor(coverage.end, limits),
+        if std::mem::size_of::<Self>() > budget {
+            return Err(MarkdownTableRequestError::WorkLimit);
         }
-        .map_err(MarkdownTableRequestError::Global)?;
-        let Some(cursor) = cursor else {
-            return Ok(None);
-        };
         quota
             .admit_metadata(std::mem::size_of::<Self>())
             .map_err(MarkdownTableRequestError::Window)?;
         Ok(Some(Box::new(Self {
-            cursor: Some(cursor),
+            cursor: None,
+            cursor_initialized: false,
+            pending_storage: None,
+            reference: None,
+            reference_collected: false,
+            references_attached: false,
+            queries: None,
+            incoming_end: None,
+            revision: block.seed.source_revision(),
+            source_end: block.seed.source_end(),
             pending: None,
             coordinates: None,
             spans: Vec::new(),
@@ -118,6 +129,55 @@ impl CodeJob {
         })))
     }
 
+    pub(super) fn preparing(&self) -> bool {
+        !self.cursor_initialized
+    }
+
+    /// 父事务仍持同一个真实block/origin，只有本次实际构造游标才借它们，不保存第二份seed。
+    /// 小CodeJob与大cursor分别各有一次完整Box分配/准入；没有空Yield、摊费或第二条游标。
+    pub(super) fn prepare_cursor(
+        &mut self,
+        block: &OrdinaryBlockRecord,
+        origin: Option<&BlockOriginLine>,
+        limits: (usize, usize),
+        quota: &MarkdownTableWindowQuota,
+        budget: usize,
+    ) -> Result<SemanticWork, MarkdownTableRequestError> {
+        let metadata = std::mem::size_of::<InlineCodeCursor>();
+        if metadata > budget {
+            return Err(MarkdownTableRequestError::WorkLimit);
+        }
+        let limits = InlinePlainLimits {
+            max_byte_work: limits.0,
+            max_transitions: limits.1,
+        };
+        let cursor = match origin {
+            Some(origin) => block
+                .seed
+                .emphasis_origin_cursor(origin, self.coverage.end, limits),
+            None => block.seed.emphasis_cursor(self.coverage.end, limits),
+        }
+        .map_err(MarkdownTableRequestError::Global)?;
+        let metadata = if let Some(cursor) = cursor {
+            quota
+                .admit_metadata(metadata)
+                .map_err(MarkdownTableRequestError::Window)?;
+            self.cursor = Some(Box::new(cursor));
+            metadata
+        } else {
+            // 原工厂的真实负证明仍交General；仅结束这次未获权限的子owner，不签默认Ready。
+            self.general = true;
+            self.done = true;
+            0
+        };
+        self.cursor_initialized = true;
+        Ok(SemanticWork {
+            metadata_bytes: metadata,
+            structural_transitions: PLAIN_CONTROL,
+            ..Default::default()
+        })
+    }
+
     /// code probe 真实越过视口寻找 closer；只有已闭合 proof 的可见端点才进行有限 UTF16 转换。
     pub(super) fn advance(
         &mut self,
@@ -125,7 +185,63 @@ impl CodeJob {
         selection: &Range<usize>,
         quota: &MarkdownTableWindowQuota,
         budget: usize,
+        underline: &mut MarkdownTableUnderlineRequest,
+        global: Option<&mut GlobalFrontier>,
     ) -> Result<(SemanticWork, bool), MarkdownTableRequestError> {
+        document
+            .original_backing_health()
+            .map_err(MarkdownTableRequestError::Source)?;
+        if self.revision != document.generation() || self.source_end != document.byte_len() {
+            return Err(MarkdownTableRequestError::SourceSuperseded);
+        }
+        if let Some(request) = self.pending_storage.as_ref() {
+            let result = underline
+                .stack
+                .storage(request, quota, budget - PLAIN_CONTROL);
+            document
+                .original_backing_health()
+                .map_err(MarkdownTableRequestError::Source)?;
+            let (step, metadata) = result?;
+            let completed = matches!(&step, InlineLinkStorageStep::Ready { .. });
+            let work = self
+                .cursor
+                .as_mut()
+                .ok_or(MarkdownTableRequestError::InvalidRequest)?
+                .accept_storage(
+                    request,
+                    step,
+                    GlobalSourceAuthority {
+                        current_revision: document.generation(),
+                        cancelled: false,
+                    },
+                    budget - PLAIN_CONTROL,
+                )
+                .map_err(MarkdownTableRequestError::Global)?;
+            if completed {
+                self.pending_storage = None;
+            }
+            return Ok((
+                SemanticWork {
+                    structural_transitions: work.transitions + PLAIN_CONTROL,
+                    metadata_bytes: metadata,
+                    ..Default::default()
+                },
+                false,
+            ));
+        }
+        if self.reference.is_some() {
+            return self
+                .advance_reference(document, quota, budget, underline, global)
+                .map(|work| (work, false));
+        }
+        if let Some((source, label)) = self.incoming_end.take() {
+            let work = self
+                .emphasis
+                .as_mut()
+                .ok_or(MarkdownTableRequestError::InvalidRequest)?
+                .leave_link(&source, &label, budget, &mut underline.stack)?;
+            return Ok((work, false));
+        }
         if self.done {
             return Ok((SemanticWork::default(), true));
         }
@@ -216,7 +332,16 @@ impl CodeJob {
                     false,
                 ));
             }
-            self.emphasis.as_mut().unwrap().enter_link(&proof)?;
+            let (work, entered) = self.emphasis.as_mut().unwrap().enter_link(
+                &proof,
+                quota,
+                budget,
+                &mut underline.stack,
+            )?;
+            if !entered {
+                self.incoming_link = Some(proof);
+                return Ok((work, false));
+            }
             let source = proof.source_range();
             let metadata = if source.start < self.coverage.end && self.coverage.start < source.end {
                 quota
@@ -233,15 +358,15 @@ impl CodeJob {
             };
             return Ok((
                 SemanticWork {
-                    metadata_bytes: metadata,
-                    structural_transitions: PLAIN_CONTROL,
-                    ..Default::default()
+                    metadata_bytes: work.metadata_bytes + metadata,
+                    ..work
                 },
                 false,
             ));
         }
         if let Some(link) = self.link.as_mut() {
-            let (mut work, projection) = link.advance(document, selection, quota, budget)?;
+            let (mut work, projection) =
+                link.advance(document, selection, quota, budget, self.queries.as_ref())?;
             if let Some(projection) = projection {
                 self.link = None;
                 if let Some(link) = projection.link {
@@ -289,7 +414,7 @@ impl CodeJob {
         if let Some(emphasis) = self.emphasis.as_mut()
             && emphasis.busy()
         {
-            let (work, span) = emphasis.advance(quota)?;
+            let (work, span) = emphasis.advance(quota, budget, &mut underline.stack)?;
             if let Some(span) = span
                 && span.whole.start < self.coverage.end
                 && self.coverage.start < span.whole.end
@@ -300,8 +425,8 @@ impl CodeJob {
         }
         if self.cursor.is_none() {
             if let Some(mut emphasis) = self.emphasis.take() {
-                emphasis.finish()?;
-            } // 真正close原FD之后才结束；源失败/取消则由原请求drop释放同一owner。
+                emphasis.finish();
+            } // 这里只结束算法；共同文件待同underline最后消费者结束后由父事务显式close。
             self.done = true;
             return Ok((
                 SemanticWork {
@@ -320,6 +445,7 @@ impl CodeJob {
         let frame = document
             .table_source_frame(cursor.next_byte(), child)
             .map_err(MarkdownTableRequestError::Source)?;
+        let source_bytes = frame.bytes.len();
         let workspace_before = cursor.allocated_workspace_bytes();
         let step = cursor
             .advance(
@@ -338,7 +464,7 @@ impl CodeJob {
             .map_err(MarkdownTableRequestError::Global);
         frame.finish().map_err(MarkdownTableRequestError::Source)?;
         let step = step?;
-        let allocated = cursor.allocated_workspace_bytes() - workspace_before;
+        let mut allocated = cursor.allocated_workspace_bytes() - workspace_before;
         quota
             .admit_metadata(allocated)
             .map_err(MarkdownTableRequestError::Window)?;
@@ -350,6 +476,8 @@ impl CodeJob {
             | InlineCodeStep::Emphasis { work, .. }
             | InlineCodeStep::Link { work, .. }
             | InlineCodeStep::LinkEnd { work, .. }
+            | InlineCodeStep::Storage { work, .. }
+            | InlineCodeStep::Reference { work, .. }
             | InlineCodeStep::Proven { work, .. }
             | InlineCodeStep::NeedsGeneralInline { work } => *work,
         };
@@ -373,10 +501,16 @@ impl CodeJob {
             InlineCodeStep::Emphasis { run, .. } => self.incoming = Some(run),
             InlineCodeStep::Link { proof, .. } => self.incoming_link = Some(proof),
             InlineCodeStep::LinkEnd { source, label, .. } => {
-                self.emphasis
-                    .as_mut()
-                    .ok_or(MarkdownTableRequestError::InvalidRequest)?
-                    .leave_link(&source, &label)?;
+                self.incoming_end = Some((source, label));
+            }
+            InlineCodeStep::Storage { request, .. } => self.pending_storage = Some(request),
+            InlineCodeStep::Reference { request, .. } => {
+                quota
+                    .admit_metadata(std::mem::size_of::<ReferenceLabel>())
+                    .map_err(MarkdownTableRequestError::Window)?;
+                allocated += std::mem::size_of::<ReferenceLabel>();
+                self.reference = Some(Box::new(ReferenceLabel::new(request)));
+                self.reference_collected = false;
             }
             InlineCodeStep::Proven {
                 requires_general_styles,
@@ -409,7 +543,8 @@ impl CodeJob {
         }
         Ok((
             SemanticWork {
-                source_bytes: measured.byte_reads,
+                // Storage/Reference可在帧前缀立即暂停，真实借片的尾部仍是本次源读取，不能漏账。
+                source_bytes,
                 metadata_bytes: allocated,
                 structural_transitions: measured.transitions + tree + PLAIN_CONTROL,
                 source_tree_steps: tree,
@@ -417,6 +552,119 @@ impl CodeJob {
             },
             self.done,
         ))
+    }
+
+    /// 原cursor暂停时只移动唯一Queries，不复制Map；只有同Global首定义或真实EOF才恢复。
+    fn advance_reference(
+        &mut self,
+        document: &MarkdownDocumentBuffer,
+        quota: &MarkdownTableWindowQuota,
+        budget: usize,
+        underline: &mut MarkdownTableUnderlineRequest,
+        global: Option<&mut GlobalFrontier>,
+    ) -> Result<SemanticWork, MarkdownTableRequestError> {
+        let reference = self.reference.as_mut().unwrap();
+        if reference.label().is_none() {
+            return reference.advance(document, quota, budget);
+        }
+        if !self.reference_collected {
+            if self.queries.is_none() {
+                self.queries = if underline
+                    .ready_pairs_for(document)
+                    .map_err(MarkdownTableRequestError::Window)?
+                    .is_some()
+                {
+                    underline.take_resolved_references()?
+                } else {
+                    None
+                };
+                if self.queries.is_none() {
+                    let mut queries = MarkdownTableReferenceQueries::for_batch(Some(quota.clone()));
+                    queries.seal_batch();
+                    self.queries = Some(queries);
+                }
+            }
+            let label = reference.label().unwrap();
+            let before = quota.metadata_used();
+            self.queries
+                .as_mut()
+                .unwrap()
+                .collect_verified_label(label)
+                .map_err(MarkdownTableRequestError::Window)?;
+            self.reference_collected = true;
+            return Ok(SemanticWork {
+                structural_transitions: PLAIN_CONTROL,
+                normalizer_input_bytes: label.len(),
+                metadata_bytes: quota.metadata_used() - before,
+                ..Default::default()
+            });
+        }
+        if self.references_attached {
+            if underline
+                .ready_pairs_for(document)
+                .map_err(MarkdownTableRequestError::Window)?
+                .is_some()
+            {
+                self.queries = underline.take_resolved_references()?;
+                self.references_attached = false;
+                return Ok(SemanticWork {
+                    structural_transitions: PLAIN_CONTROL,
+                    ..Default::default()
+                });
+            }
+            return underline
+                .advance(
+                    document,
+                    global.ok_or(MarkdownTableRequestError::InvalidRequest)?,
+                    budget - PLAIN_CONTROL,
+                )
+                .map(|work| {
+                    let mut work = underline_work(work);
+                    work.structural_transitions += PLAIN_CONTROL;
+                    work
+                });
+        }
+        let queries = self
+            .queries
+            .as_ref()
+            .ok_or(MarkdownTableRequestError::InvalidRequest)?;
+        if !queries.is_ready() {
+            let allocated = underline.resolve_references(self.queries.take().unwrap())?;
+            self.references_attached = true;
+            return Ok(SemanticWork {
+                structural_transitions: PLAIN_CONTROL,
+                metadata_bytes: allocated,
+                ..Default::default()
+            });
+        }
+        let outcome = if queries
+            .resolve_for_classification(reference.label().unwrap())
+            .map_err(MarkdownTableRequestError::Window)?
+            .is_some()
+        {
+            InlineReferenceResolution::Resolved
+        } else {
+            InlineReferenceResolution::Missing
+        };
+        let work = self
+            .cursor
+            .as_mut()
+            .ok_or(MarkdownTableRequestError::InvalidRequest)?
+            .accept_reference(
+                &reference.request,
+                outcome,
+                GlobalSourceAuthority {
+                    current_revision: document.generation(),
+                    cancelled: false,
+                },
+            )
+            .map_err(MarkdownTableRequestError::Global)?;
+        self.reference = None;
+        self.reference_collected = false;
+        Ok(SemanticWork {
+            structural_transitions: work.transitions + PLAIN_CONTROL,
+            ..Default::default()
+        })
     }
 
     /// 查询只遍历当前 viewport 的已证交集；无交集的区间只有最终 plain/code prefix 成功后才可默认。
@@ -506,9 +754,15 @@ impl CodeJob {
         self.pending = None;
         self.coordinates = None;
         self.cursor = None;
+        self.pending_storage = None;
+        self.reference = None;
+        self.reference_collected = false;
+        self.references_attached = false;
+        self.queries = None;
         self.emphasis = None;
         self.incoming = None;
         self.incoming_link = None;
+        self.incoming_end = None;
         self.link = None;
         self.visible = None;
         self.query = None;
@@ -569,9 +823,8 @@ mod tests {
                 if let Some(descriptor) = request
                     .semantic
                     .as_ref()
-                    .and_then(|job| job.code.as_ref())
-                    .and_then(|job| job.emphasis.as_ref())
-                    .and_then(|job| job.descriptor_for_test())
+                    .and_then(|job| job.underline.as_ref())
+                    .and_then(|job| job.stack.descriptor())
                 {
                     break descriptor;
                 }
@@ -580,18 +833,16 @@ mod tests {
             let descriptor = if scenario == "storage" {
                 let read_only = directory.path().join("read-only-index");
                 std::fs::write(&read_only, b"unchanged").unwrap();
-                let emphasis = request
+                let stack = &mut request
                     .semantic
                     .as_mut()
                     .unwrap()
-                    .code
+                    .underline
                     .as_mut()
                     .unwrap()
-                    .emphasis
-                    .as_mut()
-                    .unwrap();
-                emphasis.replace_file_for_test(std::fs::File::open(read_only).unwrap());
-                emphasis.descriptor_for_test().unwrap()
+                    .stack;
+                stack.replace_file(std::fs::File::open(read_only).unwrap());
+                stack.descriptor().unwrap()
             } else {
                 descriptor
             };

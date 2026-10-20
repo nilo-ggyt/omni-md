@@ -509,9 +509,9 @@ fn forward_prefix_keeps_original_publications_and_streams_later_direct_link() {
 }
 
 #[test]
-fn direct_links_match_parser_while_unknown_forms_and_cross_block_holes_stay_pending() {
+fn root_links_references_and_images_match_parser_while_cross_block_holes_stay_pending() {
     // 保留原长段落字面；过去的直接链接Pending已过期，必须保护真实owner/label/选择显隐。
-    // reference/image仍没有本组流式Global证明，下方负例不会因direct支持而被抹掉。
+    // 引用Missing与Image已沿同Global/唯一文件接入，下方保原字面改验真实Parser结果。
     let complex = format!(
         "普通 **{}** [未决链接](https://example.com)\n",
         "粗体".repeat(400)
@@ -626,20 +626,67 @@ fn direct_links_match_parser_while_unknown_forms_and_cross_block_holes_stay_pend
         "{} ![图片](https://example.com/image)\n",
         "普通正文 ".repeat(400)
     );
-    for (source, expected) in [
-        (
-            unknown_reference.as_str(),
-            MarkdownOrdinaryPendingReason::NeedsGeneralInline,
-        ),
-        (
-            unknown_image.as_str(),
-            MarkdownOrdinaryPendingReason::NeedsGeneralInline,
-        ),
-        (
-            "第一段\n\n第二段\n",
-            MarkdownOrdinaryPendingReason::IncompleteCoverage,
-        ),
-    ] {
+    for source in [unknown_reference.as_str(), unknown_image.as_str()] {
+        // 原未知引用在真实EOF后仍是字面；Image保LINK/marker样式但不取得点击URI。
+        // 不能仅把旧Pending删掉：完整每个位置、实际目标、磁盘/历史和释放都须成立。
+        let (directory, doc) = document(source);
+        let observer = doc.original_backing_observer().unwrap();
+        let mut request = doc
+            .viewport_plain_source_request(0..doc.utf16_len(), 41, doc.selection())
+            .unwrap();
+        finish(&mut request, &doc).unwrap();
+        let sources = request
+            .take_sources_for(&doc, authority(&doc))
+            .unwrap()
+            .unwrap();
+        let MarkdownOrdinarySemanticState::PlainReady(ready) = sources
+            .ordinary_semantics_for(&doc, authority(&doc))
+            .unwrap()
+        else {
+            panic!("原Root引用/图片字面必须沿真实端口完成，不得保留过期General断言");
+        };
+        let mut baseline = MarkdownViewportPresentation::default();
+        baseline.set_active_selection(ordered_selection(doc.selection()));
+        baseline
+            .rebuild(doc.generation(), 0..doc.utf16_len(), source)
+            .unwrap();
+        assert!(
+            !Parser::new_ext(
+                source,
+                crate::markdown_viewport_presentation::parser::markdown_presentation_options(true)
+            )
+            .any(|event| matches!(event, Event::Start(Tag::Link { .. })))
+        );
+        for index in 0..doc.utf16_len() {
+            assert_eq!(
+                ready
+                    .query_for(&doc, authority(&doc), index)
+                    .unwrap()
+                    .unwrap()
+                    .styles,
+                baseline.query(index).unwrap().styles,
+                "index={index}"
+            );
+            assert!(
+                ready
+                    .link_at_for(&doc, authority(&doc), index)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(doc.generation(), 0);
+        assert!(!doc.can_undo() && !doc.can_redo());
+        assert_eq!(
+            std::fs::read(directory.path().join("有限普通语义验收.md")).unwrap(),
+            source.as_bytes()
+        );
+        drop((sources, request, doc));
+        assert_eq!(observer.mapped_bytes(), 0);
+        assert_eq!(observer.managed_resident_bytes(), 0);
+    }
+    {
+        let source = "第一段\n\n第二段\n";
+        let expected = MarkdownOrdinaryPendingReason::IncompleteCoverage;
         let (_directory, doc) = document(source);
         let mut request = doc
             .viewport_plain_source_request(0..doc.utf16_len(), 41, doc.selection())
@@ -658,7 +705,7 @@ fn direct_links_match_parser_while_unknown_forms_and_cross_block_holes_stay_pend
         assert_eq!(sources.retained_metadata, expected_metadata);
     }
     // 引用/列表短块已经接同源 context；保留原夹具，改为与独立完整 Parser 逐位置验证真实新行为。
-    // 未覆盖洞仍断言Pending；直接链接Ready不会给reference/image或任意跨块范围补权。
+    // 未覆盖洞仍断言Pending；Root引用/Image的Ready不会给任意跨块范围补权。
     for source in ["> 引用中文\n> 第二行\n", "- 列表中文\n  第二行\n"] {
         let (directory, doc) = document(source);
         let observer = doc.original_backing_observer().unwrap();

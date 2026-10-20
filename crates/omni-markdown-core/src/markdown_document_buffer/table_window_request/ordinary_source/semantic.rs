@@ -701,7 +701,10 @@ impl PlainSemanticJob {
         }
     }
     pub(super) fn needs_underline_workspace(&self) -> bool {
-        matches!(self.phase, SemanticPhase::Underline) && self.underline.is_none()
+        // Code先取得共同owner以驱动Storage/Reference，必须沿父原唯一入口预留工作区；
+        // 不能等到Underline已有Some才检查，从而跳过普通Source/首Cell的真实分配准入。
+        matches!(self.phase, SemanticPhase::Code | SemanticPhase::Underline)
+            && self.underline.is_none()
     }
 
     pub(super) fn retarget(&mut self, requested: Range<usize>) -> SemanticWork {
@@ -988,12 +991,38 @@ impl PlainSemanticJob {
                 }
             }
             SemanticPhase::Code => {
+                if self.underline.is_none() {
+                    self.underline = Some(if let Some(cell) = &self.cell {
+                        document.table_cell_underline_request(cell, self.quota.clone())?
+                    } else {
+                        document
+                            .table_underline_request(
+                                std::slice::from_ref(self.byte_coverage.as_ref().unwrap()),
+                                self.quota.clone(),
+                            )
+                            .map_err(MarkdownTableRequestError::Window)?
+                    });
+                    return Ok((work, 0)); // 共同真实资源先构造，后继量子才驱动原Code游标。
+                }
                 if let Some(code) = self.code.as_mut() {
+                    if code.preparing() {
+                        work = code.prepare_cursor(
+                            self.block.as_ref().unwrap(),
+                            self.line.as_ref(),
+                            limits,
+                            &self.quota,
+                            budget - PLAIN_CONTROL,
+                        )?;
+                        work.structural_transitions += PLAIN_CONTROL;
+                        return Ok((work, 0)); // 真实cursor分配后归还，不能在同量子再读取Source。
+                    }
                     let (measured, complete) = code.advance(
                         document,
                         &self.selection_bytes,
                         &self.quota,
                         budget - PLAIN_CONTROL,
+                        self.underline.as_mut().unwrap(),
+                        global,
                     )?;
                     work = measured;
                     work.structural_transitions += PLAIN_CONTROL;
@@ -1022,17 +1051,17 @@ impl PlainSemanticJob {
                 } else {
                     self.code = CodeJob::new(
                         self.block.as_ref().unwrap(),
-                        self.line.as_ref(),
                         self.byte_coverage.as_ref().unwrap().clone(),
                         self.requested.clone(),
-                        limits,
                         &self.quota,
+                        budget - PLAIN_CONTROL,
                     )?;
                     if self.code.is_none() {
                         self.pending = Some(MarkdownOrdinaryPendingReason::NeedsGeneralInline);
                         self.phase = SemanticPhase::Done;
                     }
-                    work.metadata_bytes = std::mem::size_of::<CodeJob>();
+                    work.metadata_bytes =
+                        usize::from(self.code.is_some()) * std::mem::size_of::<CodeJob>();
                 }
             }
             SemanticPhase::Coordinates => {
@@ -1123,6 +1152,9 @@ impl PlainSemanticJob {
             }
             SemanticPhase::Build => {
                 if self.run_next == self.requested.end {
+                    if let Some(underline) = self.underline.as_mut() {
+                        underline.close_inline_stack()?;
+                    }
                     // 每个可查询位置都有真实样式段后才结束；覆盖外仍是None而非默认样式。
                     self.phase = SemanticPhase::Done;
                     if let Some(bounded) = self.bounded.as_mut() {
@@ -1307,6 +1339,9 @@ impl PlainSemanticJob {
     ) -> Result<MarkdownOrdinarySemanticState, MarkdownTableRequestError> {
         if !self.done() {
             return Err(MarkdownTableRequestError::InvalidRequest);
+        }
+        if let Some(underline) = self.underline.as_mut() {
+            underline.close_inline_stack()?;
         }
         if let Some(reason) = self.pending {
             return Ok(MarkdownOrdinarySemanticState::Pending(reason));

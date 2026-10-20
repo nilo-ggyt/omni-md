@@ -15,6 +15,8 @@ use crate::markdown_viewport_presentation::table_window::{
 const MAX_TABLE_SOURCE_FRAME_BYTES: usize = 64 * 1024;
 
 mod inline_code;
+pub(super) mod inline_reference;
+pub(super) mod inline_stack;
 mod underline;
 pub(crate) use underline::{MarkdownTableUnderlineRequest, MarkdownTableUnderlineRequestStep};
 

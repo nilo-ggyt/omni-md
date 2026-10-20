@@ -1754,33 +1754,37 @@ fn scan_reference<'b>(
 
 #[derive(Clone, Default)]
 struct LinkStack {
-    inner: Vec<LinkStackEl>,
-    disabled_ix: usize,
+    inner: Vec<(LinkStackEl, usize)>,
+    decision: crate::inline_scan::LinkStackDecision,
 }
 
 impl LinkStack {
     fn push(&mut self, el: LinkStackEl) {
-        self.inner.push(el);
+        // 普通 Parser 与分帧游标共用同一个真实禁用规则；这里仅保原树节点栈。
+        // 每个 opener 已经占真实树节点，usize 身份溢出在此前便不可能成功分配。
+        let serial = self
+            .decision
+            .open()
+            .expect("真实 LinkStack opener 身份溢出");
+        self.inner.push((el, serial));
     }
 
     fn pop(&mut self) -> Option<LinkStackEl> {
-        let el = self.inner.pop();
-        self.disabled_ix = std::cmp::min(self.disabled_ix, self.inner.len());
-        el
+        self.inner.pop().map(|(mut el, serial)| {
+            if !self.decision.enabled(serial, el.ty == LinkStackTy::Image) {
+                el.ty = LinkStackTy::Disabled;
+            }
+            el
+        })
     }
 
     fn clear(&mut self) {
         self.inner.clear();
-        self.disabled_ix = 0;
+        self.decision.clear();
     }
 
     fn disable_all_links(&mut self) {
-        for el in &mut self.inner[self.disabled_ix..] {
-            if el.ty == LinkStackTy::Link {
-                el.ty = LinkStackTy::Disabled;
-            }
-        }
-        self.disabled_ix = self.inner.len();
+        self.decision.accept_link();
     }
 }
 

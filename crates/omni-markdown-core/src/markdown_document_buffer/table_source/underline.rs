@@ -1,6 +1,7 @@
 //! 一个有限窗口的真实源配对事务；结构前探临时使用原Global，完成前恢复原来源位置。
 
-use super::inline_code::InlinePermission;
+use super::inline_code::{InlinePermission, ReferenceInput};
+use super::inline_stack::StackFile;
 use super::*;
 use crate::markdown_document_buffer::table_reference_request;
 use crate::markdown_document_buffer::table_window_request::MarkdownTableRequestError as Error;
@@ -11,8 +12,8 @@ use crate::markdown_viewport_presentation::table_window::context::{
 use crate::markdown_viewport_presentation::table_window::references::MarkdownTableReferenceQueries;
 use pulldown_cmark::block_frontier::SourceFrame;
 use pulldown_cmark::global_frontier::{
-    GlobalFact, GlobalFrontier, GlobalSourceAuthority, GlobalStep, LeafBlockKind,
-    VerifiedGlobalReference,
+    GlobalFact, GlobalFrontier, GlobalSourceAuthority, GlobalStep, InlineReferenceResolution,
+    LeafBlockKind, VerifiedGlobalReference,
 };
 use std::rc::Rc;
 
@@ -63,6 +64,7 @@ enum UnderlineContextUse {
 #[derive(Debug)]
 pub(crate) struct MarkdownTableUnderlineRequest {
     source: MarkdownTableSourceIdentity,
+    pub(in crate::markdown_document_buffer) stack: StackFile,
     quota: MarkdownTableWindowQuota,
     pub(super) context: Option<MarkdownTableUnderlineContext>,
     context_use: UnderlineContextUse,
@@ -137,11 +139,21 @@ impl MarkdownDocumentBuffer {
             phase: Phase::BeforeHtml,
             references: None,
             inline: None,
+            stack: StackFile::new(),
         })
     }
 }
 
 impl MarkdownTableUnderlineRequest {
+    /// 原事务的最后inline消费者已经完成才关闭唯一文件；Ready本身不意味着外层CodeJob已结束。
+    /// 父job在发布前显式调用，close错误进入原首因；跨窗保留scanner时只留下空的文件owner。
+    pub(in crate::markdown_document_buffer) fn close_inline_stack(&mut self) -> Result<(), Error> {
+        if self.inline.is_some() {
+            return Err(Error::InvalidRequest);
+        }
+        self.stack.close()
+    }
+
     /// 原单格完成后沿同一 Source 接下一个格；这里只变更实际覆盖和 quota，不重置扫描位置或标签状态。
     /// 新覆盖向后时明确归还 false，调用方会释放这一旧 owner 并重新从原文首取得真实上下文。
     pub(crate) fn continue_cell(
@@ -390,6 +402,7 @@ impl MarkdownTableUnderlineRequest {
             )
             .map_err(Error::Global);
         frame.finish().map_err(Error::Source)?; // 真实回收失败优先，不能恢复旧边界后伪作读取成功。
+        let mut metadata = 0;
         let (measured, permission) = match step? {
             GlobalStep::Progress { work, .. } | GlobalStep::NeedInput { work, .. } => (work, None),
             GlobalStep::Complete { work } => {
@@ -425,6 +438,10 @@ impl MarkdownTableUnderlineRequest {
                                 !context.is_ready() && context.next_byte() < end
                             })
                         {
+                            metadata = std::mem::size_of::<InlinePermission>();
+                            if metadata > budget {
+                                return Err(Error::WorkLimit);
+                            }
                             self.inline = Some(Box::new(InlinePermission::new(block)?));
                             self.phase = Phase::Inline;
                         }
@@ -438,12 +455,17 @@ impl MarkdownTableUnderlineRequest {
                                 !context.is_ready() && context.next_byte() < end
                             })
                         {
+                            let metadata = std::mem::size_of::<InlinePermission>();
+                            if metadata > budget {
+                                return Err(Error::WorkLimit);
+                            }
                             self.inline = Some(Box::new(InlinePermission::from_atx(block)?));
                             self.phase = Phase::Inline;
                             return Ok(MarkdownTableUnderlineRequestStep {
                                 global_source_bytes: work.byte_reads,
                                 global_source_tree_steps: tree,
                                 structural_transitions: work.transitions + tree + 64,
+                                metadata_bytes: metadata,
                                 ..Default::default()
                             }); // 真 Leaf 下逐个 Code 事件先交唯一 scanner，不能让标题代码中的假 HTML 改外部配对。
                         }
@@ -482,6 +504,7 @@ impl MarkdownTableUnderlineRequest {
             global_source_bytes: measured.byte_reads,
             global_source_tree_steps: tree,
             structural_transitions: measured.transitions + tree + 64,
+            metadata_bytes: metadata,
             ..Default::default()
         })
     }
@@ -506,24 +529,62 @@ impl MarkdownTableUnderlineRequest {
                 }); // owner分配与后继有限Parser收集分开，保持原单量子工作上限。
             }
             let inline = self.inline.as_mut().unwrap();
-            let (source, options) = inline.reference_input()?.unwrap();
-            let length = source.len();
+            let input = inline.reference_input()?.unwrap();
             let state = self.references.as_mut().unwrap();
-            Rc::get_mut(&mut state.queries)
-                .expect("当前小块尚未向Parser借出原引用库存")
-                .collect_for_classification(source, options)
-                .map_err(Error::Window)?;
+            let queries =
+                Rc::get_mut(&mut state.queries).expect("当前inline尚未向Parser借出原查询库存");
+            let before = self.quota.metadata_used();
             let mut work = MarkdownTableUnderlineRequestStep {
-                parser_input_bytes: length,
                 structural_transitions: 64,
                 ..Default::default()
             };
+            let streamed = match input {
+                ReferenceInput::Bounded { source, options } => {
+                    work.parser_input_bytes = source.len();
+                    queries
+                        .collect_for_classification(source, options)
+                        .map_err(Error::Window)?;
+                    None
+                }
+                ReferenceInput::Streamed(label) => {
+                    work.normalizer_input_bytes = label.len();
+                    queries
+                        .collect_verified_label(label)
+                        .map_err(Error::Window)?;
+                    Some(if queries.is_ready() {
+                        Some(
+                            if queries
+                                .resolve_for_classification(label)
+                                .map_err(Error::Window)?
+                                .is_some()
+                            {
+                                InlineReferenceResolution::Resolved
+                            } else {
+                                InlineReferenceResolution::Missing
+                            },
+                        )
+                    } else {
+                        None
+                    })
+                }
+            };
+            work.metadata_bytes = self.quota.metadata_used() - before;
             if state.queries.is_ready() {
-                // 旧Resolved/Missing仍有效；无新增未知时，下一量子才创建实际code Parser。
-                inline.accept_references(Rc::clone(&state.queries));
+                if let Some(Some(resolution)) = streamed {
+                    let accepted = inline.accept_reference(
+                        resolution,
+                        GlobalSourceAuthority {
+                            current_revision: document.generation(),
+                            cancelled: false,
+                        },
+                    )?;
+                    work.structural_transitions += accepted.transitions;
+                } else {
+                    inline.accept_references(Rc::clone(&state.queries));
+                }
             } else {
-                // 保留scanner当前位置和原主恢复票据，只归还当前有限scratch；
-                // 同一Global从Root按源序解析新增查询，重到此块后才允许解释code/HTML。
+                // 原分类子cursor尚无外带结果；归还它后沿同Global重新走到该块，原Map的
+                // 新查询和已决值始终唯一。外层CodeJob自己的暂停cursor/records不受影响。
                 self.inline = None;
                 self.phase = Phase::Rewind;
                 work.structural_transitions += 2048;
@@ -531,7 +592,7 @@ impl MarkdownTableUnderlineRequest {
             return Ok(work);
         }
         let inline = self.inline.as_mut().unwrap();
-        let step = inline.advance(document, budget)?;
+        let step = inline.advance(document, &mut self.stack, &self.quota, budget)?;
         if let Some(literal) = step.literal {
             self.phase = Phase::Read {
                 end: literal.end,
@@ -552,6 +613,8 @@ impl MarkdownTableUnderlineRequest {
             metadata_bytes: step.work.metadata_bytes,
             parser_input_bytes: step.work.parser_input_bytes,
             allocated_source_capacity: step.work.allocated_source_capacity,
+            normalizer_input_bytes: step.work.normalizer_input_bytes,
+            utf8_validation_bytes: step.work.utf8_validation_bytes,
             structural_transitions: step.work.structural_transitions,
             ..Default::default()
         })
