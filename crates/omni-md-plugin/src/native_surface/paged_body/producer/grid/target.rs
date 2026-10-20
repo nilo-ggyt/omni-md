@@ -104,7 +104,7 @@ impl Grid {
         // 只走本行有限列 metadata；未知格先交原串行准备量子，不抢先读取整行内容。
         for _ in 0..self.cells.len() {
             let column = target.column;
-            let cell = self.cells.get_mut(column).ok_or(Error::Unsupported)?;
+            let cell = self.cells.get_mut(column).ok_or_else(|| unsupported())?;
             let document = owner
                 .document
                 .borrow()
@@ -147,14 +147,14 @@ impl Grid {
                     let position = display
                         .canonical_to_display(canonical, MarkdownComposedLineAffinity::Downstream)
                         .map_err(ViewError::Document)?
-                        .ok_or(Error::Unsupported)?;
+                        .ok_or_else(|| unsupported())?;
                     let first_end = display
                         .canonical_to_display(
                             target.request.first_end,
                             MarkdownComposedLineAffinity::Downstream,
                         )
                         .map_err(ViewError::Document)?
-                        .ok_or(Error::Unsupported)?;
+                        .ok_or_else(|| unsupported())?;
                     cell.target = Some(CellTarget {
                         position,
                         first_end,
@@ -245,7 +245,7 @@ impl Grid {
             }
             return Ok(None); // 原目标所在行已在真实 band；其他可见列仍须按同一视口完成再发布。
         }
-        Err(Error::Unsupported) // 表格管道和delimiter不属于可见格，不能夹到相邻正文伪造目标框。
+        Err(unsupported()) // 表格管道和delimiter不属于可见格，不能夹到相邻正文伪造目标框。
     }
 }
 
@@ -331,7 +331,7 @@ impl Cell {
             }
             if walk.target_top.is_none() {
                 if walk.metrics.is_none() {
-                    let handle = walk.cursor.take().ok_or(Error::Unsupported)?;
+                    let handle = walk.cursor.take().ok_or_else(|| unsupported())?;
                     walk.metrics = Some(LineMetrics::new(
                         handle,
                         omni_markdown_core::MarkdownPresentationMode::InlinePreview,
@@ -366,7 +366,7 @@ impl Cell {
                 let part = output
                     .borrow_mut()
                     .part(&metrics.handle, ordinal)?
-                    .ok_or(Error::Unsupported)?;
+                    .ok_or_else(|| unsupported())?;
                 walk.target_part += 1;
                 budget.metadata_units -= 1;
                 budget.records -= 7;
@@ -385,7 +385,7 @@ impl Cell {
                 let font = palette
                     .iter()
                     .find(|font| font.native().core_font().permits(&authority))
-                    .ok_or(Error::Unsupported)?;
+                    .ok_or_else(|| unsupported())?;
                 let content_width = native_markdown_table_content_width(self.width)
                     .ok_or(ViewError::InvalidGeometry)?;
                 let baseline =

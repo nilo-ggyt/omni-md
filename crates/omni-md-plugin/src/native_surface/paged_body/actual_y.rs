@@ -224,7 +224,7 @@ impl Producer {
                             Some(LineMetrics::new(line, owner.presentation_mode(), false));
                         target.lookup = None;
                     }
-                    _ => return Err(Error::Unsupported), // 已度量前缀缺失原ordinal是源/目录错误，不签空目标。
+                    _ => return Err(unsupported()), // 已度量前缀缺失原ordinal是源/目录错误，不签空目标。
                 }
             }
             let mut metrics = target.metrics.take().ok_or(Error::Closed)?;
@@ -388,7 +388,7 @@ impl Producer {
                 || (!at_eof && target.request.range.location >= covered)
             {
                 if self.complete {
-                    return Err(Error::Unsupported);
+                    return Err(unsupported());
                 }
                 return Ok(TargetAdvance::NeedPrefix);
             }
@@ -470,7 +470,7 @@ impl Producer {
                         target.lookup = None;
                     }
                     MarkdownComposedLineLookupAnswer::PrefixNotCovered => {
-                        return Err(Error::Unsupported);
+                        return Err(unsupported());
                     }
                 }
             }
@@ -478,7 +478,7 @@ impl Producer {
             if target.walk.is_none() {
                 // 选择实际已度量且位于目标之后的最近锚；所有锚只活在原Source/宽度Producer中。
                 let mut seed = BottomSeed {
-                    ordinal: self.lines.checked_sub(1).ok_or(Error::Unsupported)?,
+                    ordinal: self.lines.checked_sub(1).ok_or_else(|| unsupported())?,
                     bottom: self.height + self.padding,
                 };
                 if let Some(top) = &self.top
@@ -525,7 +525,7 @@ impl Producer {
                     }
                     MarkdownComposedLineLookupAnswer::Found(line) => {
                         if line.facts().ordinal != seed.ordinal {
-                            return Err(Error::Unsupported);
+                            return Err(unsupported());
                         }
                         target.walk = Some(Walk {
                             cursor: Some(line),
@@ -535,7 +535,7 @@ impl Producer {
                         target.seed = None;
                     }
                     MarkdownComposedLineLookupAnswer::PrefixNotCovered => {
-                        return Err(Error::Unsupported);
+                        return Err(unsupported());
                     }
                 }
             }
@@ -544,7 +544,7 @@ impl Producer {
             for _ in 0..METADATA_PER_TURN {
                 if walk.metrics.is_none() {
                     walk.metrics = Some(LineMetrics::new(
-                        walk.cursor.take().ok_or(Error::Unsupported)?,
+                        walk.cursor.take().ok_or_else(|| unsupported())?,
                         owner.presentation_mode(),
                         false,
                     ));
@@ -597,7 +597,7 @@ impl Producer {
                     break;
                 }
                 if metrics.handle.facts().ordinal < ordinal {
-                    return Err(Error::Unsupported);
+                    return Err(unsupported());
                 }
                 if records_left < 4 {
                     // 度量虽已完成，前驱认证仍需四条原record；保留完成游标，下一轮不重读part。

@@ -968,7 +968,7 @@ impl Cell {
                             facts.ordinal,
                             handle.facts() == &facts,
                         );
-                        return Err(Error::Unsupported);
+                        return Err(unsupported());
                     }
                     self.pending = Some(LineMetrics::new(
                         handle,
@@ -1023,7 +1023,7 @@ impl Cell {
                 }
                 #[cfg(not(feature = "native-markdown-runtime-probe"))]
                 let _ = answer;
-                Err(Error::Unsupported) // 未解决的 Unicode/Tab/Frontier 不得截成假 EOF。
+                Err(unsupported()) // 未解决的 Unicode/Tab/Frontier 不得截成假 EOF。
             }
         }
     }
@@ -1124,7 +1124,7 @@ impl Cell {
             if scan.bottom >= top && line_top <= bottom {
                 if scan.handles.len() == MAX_WINDOW_LINES {
                     // 当前窗口超过原有限句柄容量时真实报错，不截断渲染当成完成帧。
-                    return Err(Error::Unsupported);
+                    return Err(unsupported());
                 }
                 scan.first_top = line_top;
                 scan.handles.push_front(handle);
@@ -1145,7 +1145,7 @@ impl Cell {
                 "native_cell_unsupported phase=uncovered_window column={} row_top={row_top} text_window_top={top} text_window_bottom={bottom} actual_prefix_height={} actual_prefix_lines={}",
                 self.column, self.height, self.lines,
             );
-            return Err(Error::Unsupported);
+            return Err(unsupported());
         }
         Ok(scan.ready)
     }

@@ -50,7 +50,7 @@ impl Producer {
         {
             return Ok(None);
         }
-        let semantics = self.semantics.as_mut().ok_or(Error::Unsupported)?;
+        let semantics = self.semantics.as_mut().ok_or_else(|| unsupported())?;
         if !semantics.request_started() || semantics.navigating_cell() {
             return Ok(None);
         }

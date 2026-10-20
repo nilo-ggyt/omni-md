@@ -24,7 +24,7 @@ use super::{
     NativeMarkdownPagedBody as Owner, NativeMarkdownPagedBodyError as Error,
     NativeMarkdownPagedBodyProgress, NativeMarkdownPagedBodyResourceReceipts,
     NativeMarkdownPagedSceneKey, NativeMarkdownPagedSceneRequest,
-    NativeMarkdownPagedTextViewDelegate, Result, Scene, ViewError,
+    NativeMarkdownPagedTextViewDelegate, Result, Scene, ViewError, unsupported,
 };
 use crate::native_surface::{
     paged_font_cascade::NativeMarkdownFontCascadeBudget,
@@ -1086,7 +1086,7 @@ impl Producer {
         action: crate::native_surface::paged_text_view::NativeMarkdownPagedCellAction,
     ) -> Result<super::semantics::CellNavigationStep> {
         self.target_source_health()?;
-        let semantics = self.semantics.as_mut().ok_or(Error::Unsupported)?;
+        let semantics = self.semantics.as_mut().ok_or_else(|| unsupported())?;
         if !semantics.request_started()
             || !semantics.navigating_cell()
                 && (self.trial.is_some()
@@ -1138,7 +1138,7 @@ impl Producer {
         next_row: bool,
     ) -> Result<super::semantics::CellNavigationStep> {
         self.target_source_health()?;
-        let semantics = self.semantics.as_mut().ok_or(Error::Unsupported)?;
+        let semantics = self.semantics.as_mut().ok_or_else(|| unsupported())?;
         if !semantics.request_started()
             || !semantics.navigating_cell()
                 && (self.trial.is_some()
@@ -1185,7 +1185,7 @@ impl Producer {
         let mut output = output.borrow_mut();
         let fonts = owner.fonts.borrow();
         let typography = owner.typography.borrow();
-        let typography = typography.as_ref().ok_or(Error::Unsupported)?;
+        let typography = typography.as_ref().ok_or_else(|| unsupported())?;
         let mut line = output.last_line()?;
         let mut result = Vec::new();
         let mut count = 0;
@@ -1201,14 +1201,16 @@ impl Producer {
         }; 256];
         while let Some(actual) = line {
             if count == 32 {
-                return Err(Error::Unsupported);
+                return Err(unsupported());
             }
             count += 1;
             for ordinal in 0..actual.facts().parts {
                 if result.len() == 256 {
-                    return Err(Error::Unsupported);
+                    return Err(unsupported());
                 }
-                let part = output.part(&actual, ordinal)?.ok_or(Error::Unsupported)?;
+                let part = output
+                    .part(&actual, ordinal)?
+                    .ok_or_else(|| unsupported())?;
                 if part.facts().glyphs == 0 {
                     continue;
                 } // 原Newline/空行不是假字形字体断言。
@@ -1216,7 +1218,7 @@ impl Producer {
                 let index = fonts
                     .iter()
                     .position(|font| font.native().core_font().permits(&authority))
-                    .ok_or(Error::Unsupported)?;
+                    .ok_or_else(|| unsupported())?;
                 fonts[index].require(part.font_registration())?;
                 // 只读取原LineEnd已经封存的glyph。大part保留原metadata观察能力，
                 // 但明确没有完整glyph结果；不能扩容或重形后把另一结果当原输出。
@@ -1309,7 +1311,7 @@ impl Producer {
                 return Ok(Some(link));
             }
         }
-        let semantic = self.semantics.as_mut().ok_or(Error::Unsupported)?;
+        let semantic = self.semantics.as_mut().ok_or_else(|| unsupported())?;
         let result = semantic.advance_link(owner, &self.source, index, &ticket);
         self.source
             .byte_offset_for_utf16(0)
@@ -1932,7 +1934,7 @@ impl Producer {
                     source_target.map(|target| target.first_end),
                 );
             }
-            return Err(Error::Unsupported);
+            return Err(unsupported());
         }
         let quantum = MarkdownLineComposeBudget {
             bytes: 4096,
@@ -2084,7 +2086,7 @@ impl Producer {
                         "native_body_unsupported phase=resolution serial={} reason={_reason:?}",
                         self.serial
                     ); // 仅记录原Core范围/原因，不输出正文；真实缺字不能伪装成一般Pending。
-                    return Err(Error::Unsupported);
+                    return Err(unsupported());
                 }
                 MarkdownLineComposeAnswer::NeedsTabPlacement(_reason) => {
                     #[cfg(feature = "native-markdown-runtime-probe")]
@@ -2092,7 +2094,7 @@ impl Producer {
                         "native_body_unsupported phase=tab serial={} reason={_reason:?}",
                         self.serial
                     );
-                    return Err(Error::Unsupported);
+                    return Err(unsupported());
                 }
                 MarkdownLineComposeAnswer::NeedsFrontier(_reason) => {
                     #[cfg(feature = "native-markdown-runtime-probe")]
@@ -2100,9 +2102,9 @@ impl Producer {
                         "native_body_unsupported phase=frontier serial={} reason={_reason:?}",
                         self.serial
                     );
-                    return Err(Error::Unsupported);
+                    return Err(unsupported());
                 }
-                MarkdownLineComposeAnswer::NeedsTableRow(_) => return Err(Error::Unsupported),
+                MarkdownLineComposeAnswer::NeedsTableRow(_) => return Err(unsupported()),
             }
             break;
         }
@@ -2293,7 +2295,7 @@ impl Producer {
                     restoring.lookup = None;
                 }
                 MarkdownComposedLineLookupAnswer::PrefixNotCovered => {
-                    return Err(Error::Unsupported);
+                    return Err(unsupported());
                 }
             }
             owner.schedule()?;
@@ -2446,7 +2448,7 @@ impl Producer {
         let probe = self.layout_composer(target).font_probe(&request)?;
         if probe.source_range().len() > 4096 {
             // 回退字体探针仅允许原有限切片；过大请求不得退回整格字符串测量。
-            return Err(Error::Unsupported);
+            return Err(unsupported());
         }
         let fonts = owner.fonts.borrow().clone();
         let base = &fonts[semantic_base];
@@ -2798,7 +2800,7 @@ impl Producer {
                 // 原字体依赖尚未交付时不能冒充缺字或 Ready；诊断只记录阶段，不保留正文。
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 eprintln!("native_body_font_trial outcome=pending_dependencies");
-                Err(Error::Unsupported)
+                Err(unsupported())
             }
             NativeMarkdownFontFallbackStep::Exhausted { tried } => {
                 // 真实有序候选全部试完仍失败才报告耗尽；不能用默认字体替换未知字形。
@@ -2806,7 +2808,7 @@ impl Producer {
                 eprintln!("native_body_font_trial outcome=exhausted actual_tried={tried}");
                 #[cfg(not(feature = "native-markdown-runtime-probe"))]
                 let _ = tried;
-                Err(Error::Unsupported)
+                Err(unsupported())
             }
         }
     }
@@ -2942,7 +2944,7 @@ impl Producer {
                     self.lines,
                     facts.ordinal,
                 ); // 只比较刚归还的真实 Grid 与 LineEnd；不读原文或借别行几何掩盖不一致。
-                return Err(Error::Unsupported);
+                return Err(unsupported());
             }
             self.grids.push_back(grid); // 下一原回合按真实视口退休；旧行几何已封存在原输出目录中。
         }
@@ -2974,7 +2976,7 @@ impl Producer {
                     .ok_or(Error::CounterExhausted)?
                 || batch.count == MAX_TARGET_BATCH_LINES
             {
-                return Err(Error::Unsupported);
+                return Err(unsupported());
             }
             batch.count += 1;
             batch.last = facts.clone();
@@ -2991,9 +2993,12 @@ impl Producer {
         // 本槽仅保上一条度量完成的候选。先实际归还，再领取同 writer 的下一前缀，
         // 不让中间候选和旧业务 Scene 一起占用两个 Reader 后再请求第三个 FD。
         let output = self.checkpoint_prefix(owner.source_target_pending())?;
-        let handle = output.borrow_mut().last_line()?.ok_or(Error::Unsupported)?;
+        let handle = output
+            .borrow_mut()
+            .last_line()?
+            .ok_or_else(|| unsupported())?;
         if handle.facts() != facts || facts.ordinal != self.lines {
-            return Err(Error::Unsupported);
+            return Err(unsupported());
         }
         self.pending_line = Some(PendingLine {
             output,
@@ -3026,24 +3031,27 @@ impl Producer {
             self.target_checkpoint_attempts = attempts;
             self.target_checkpoint_elapsed += started.elapsed();
         }
-        Ok(Rc::new(RefCell::new(result?.ok_or(Error::Unsupported)?)))
+        Ok(Rc::new(RefCell::new(result?.ok_or_else(|| unsupported())?)))
     }
 
     fn checkpoint_batch(&mut self) -> Result<()> {
         let batch = self.queued_lines.take().ok_or(Error::Closed)?;
         if batch.count == 0 || batch.count > MAX_TARGET_BATCH_LINES || batch.first != self.lines {
-            return Err(Error::Unsupported);
+            return Err(unsupported());
         }
         // 每条LineReady已令原Composer进入下一原阶段，publish不是继续step的许可。
         // 到此仅将这些既有LineEnd签入唯一prefix Reader，绝不制造行或复用旧Output身份。
         let output = self.checkpoint_prefix(true)?;
-        let last = output.borrow_mut().last_line()?.ok_or(Error::Unsupported)?;
+        let last = output
+            .borrow_mut()
+            .last_line()?
+            .ok_or_else(|| unsupported())?;
         self.target_batch_index_records = self
             .target_batch_index_records
             .checked_add(2)
             .ok_or(Error::CounterExhausted)?;
         if last.facts() != &batch.last {
-            return Err(Error::Unsupported);
+            return Err(unsupported());
         }
         self.pending_batch = Some(PendingBatch {
             output,
@@ -3062,10 +3070,10 @@ impl Producer {
             // previous_line实际包含四条64B读取；至多31次前驱加原末行已在checkpoint读过，
             // 本轮不会同时度量part，保持原Native元数据量子，不一次展开任意长前缀。
             for _ in 0..MAX_TARGET_BATCH_LINES {
-                let handle = batch.cursor.take().ok_or(Error::Unsupported)?;
+                let handle = batch.cursor.take().ok_or_else(|| unsupported())?;
                 let expected = batch.first + batch.count - batch.handles.len() - 1;
                 if handle.facts().ordinal != expected {
-                    return Err(Error::Unsupported);
+                    return Err(unsupported());
                 }
                 let previous = if expected == batch.first {
                     None
@@ -3092,7 +3100,7 @@ impl Producer {
         // 已收集目录至多32行；逐行消费原handle也限制了零part/控制行，既不预读新行也不另建Reader。
         while let Some(handle) = batch.handles.pop_front() {
             if handle.facts().ordinal != self.lines {
-                return Err(Error::Unsupported);
+                return Err(unsupported());
             }
             self.pending_line = Some(PendingLine {
                 output: batch.output.clone(),
@@ -3136,7 +3144,7 @@ impl Producer {
             return Ok(false);
         }
         if line.metrics.handle.facts().ordinal != self.lines {
-            return Err(Error::Unsupported); // 累计Y只接受原顺序的下一条真实行，拒绝遗漏或重复度量。
+            return Err(unsupported()); // 累计Y只接受原顺序的下一条真实行，拒绝遗漏或重复度量。
         }
         let old_height = self.height;
         self.height += line.metrics.height()?;
@@ -3190,7 +3198,7 @@ impl Producer {
         let needed_bottom = request.virtual_viewport.document_origin.y
             + request.viewport.size.height
             + self.padding;
-        let output = self.output.as_ref().cloned().ok_or(Error::Unsupported)?;
+        let output = self.output.as_ref().cloned().ok_or_else(|| unsupported())?;
         let top_prefix = self.top.as_ref().filter(|top| needed_bottom <= top.height);
         // 已度量目标行的bottom覆盖真实viewport底边即可作为逆扫起点；不必从遥远EOF重走，
         // 也不需要padding以外的行参与本次实际绘制。锚始终属于这个Source/字体/宽度Producer。
@@ -3242,13 +3250,13 @@ impl Producer {
                     }
                     MarkdownComposedLineLookupAnswer::Found(line) => {
                         if line.facts().ordinal != last_ordinal {
-                            return Err(Error::Unsupported);
+                            return Err(unsupported());
                         }
                         self.top_lookup = None;
                         Some(line)
                     }
                     MarkdownComposedLineLookupAnswer::PrefixNotCovered => {
-                        return Err(Error::Unsupported); // 已实测首屏应在最新前缀内，缺失是失配而非空 Ready。
+                        return Err(unsupported()); // 已实测首屏应在最新前缀内，缺失是失配而非空 Ready。
                     }
                 }
             } else {
@@ -3310,7 +3318,7 @@ impl Producer {
             let previous = output.borrow_mut().previous_line(handle.handle())?;
             if scan.bottom >= top && line_top <= bottom {
                 if scan.handles.len() == MAX_WINDOW_LINES {
-                    return Err(Error::Unsupported);
+                    return Err(unsupported());
                 }
                 scan.first_top = line_top;
                 scan.simple_ltr &= ltr;
@@ -3365,7 +3373,7 @@ impl Producer {
         let first_ordinal = scan
             .handles
             .front()
-            .ok_or(Error::Unsupported)?
+            .ok_or_else(|| unsupported())?
             .facts()
             .ordinal;
         let first_top = NSPoint::new(
@@ -3547,7 +3555,7 @@ impl Producer {
         owner.mode_scene_published();
         if self.top.is_none() && top == 0.0 {
             self.top = Some(TopPrefix {
-                last_ordinal: self.lines.checked_sub(1).ok_or(Error::Unsupported)?,
+                last_ordinal: self.lines.checked_sub(1).ok_or_else(|| unsupported())?,
                 height: self.height,
             });
         }
@@ -3888,7 +3896,7 @@ impl LineMetrics {
             let part = output
                 .borrow_mut()
                 .part(&self.handle, self.part)?
-                .ok_or(Error::Unsupported)?;
+                .ok_or_else(|| unsupported())?;
             budget.metadata_units -= 1;
             budget.records -= 7; // Line认证2条、Part2条和真实Directory3条，仍沿原part交易计费。
             match part.facts().kind {
@@ -3911,7 +3919,7 @@ impl LineMetrics {
             let font = palette
                 .iter()
                 .find(|font| font.native().core_font().permits(&authority))
-                .ok_or(Error::Unsupported)?;
+                .ok_or_else(|| unsupported())?;
             font.require(part.font_registration())?;
             let metrics = font.metrics()?;
             self.geometry

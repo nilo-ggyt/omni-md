@@ -108,6 +108,22 @@ pub enum NativeMarkdownPagedBodyError {
     ),
 }
 
+/// 临时定位原未支持错误的真实构造处；只记录静态源码位置，不输出正文、URI 或出版物。
+/// 返回仍是原 Unsupported，不新增语义许可、业务状态或错误种类；普通构建没有这条日志。
+#[track_caller]
+pub(super) fn unsupported() -> NativeMarkdownPagedBodyError {
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    {
+        let caller = std::panic::Location::caller();
+        eprintln!(
+            "native_body_unsupported_origin file={} line={}",
+            caller.file(),
+            caller.line(),
+        );
+    }
+    NativeMarkdownPagedBodyError::Unsupported
+}
+
 impl From<omni_markdown_core::markdown_document_buffer::MarkdownTableRequestError>
     for NativeMarkdownPagedBodyError
 {
@@ -460,7 +476,7 @@ impl NativeMarkdownPagedBody {
                 if configuration.presentation_mode
                     != omni_markdown_core::MarkdownPresentationMode::Source
                 {
-                    return Err(NativeMarkdownPagedBodyError::Unsupported);
+                    return Err(unsupported());
                 } // 草稿局部坐标不借原 Doc 的 RootLeaf 语义。
                 let input = NativeMarkdownPagedInput::new_cell(Rc::downgrade(&session))
                     .map_err(ViewError::Input)?;

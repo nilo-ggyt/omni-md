@@ -18,8 +18,10 @@ use omni_markdown_core::{
 use omni_markdown_core::markdown_document_buffer::{MarkdownTableRequestError, SemanticWork};
 use omni_markdown_core::markdown_viewport_presentation::table_window::MarkdownTableWindowError;
 
+#[cfg(feature = "native-markdown-runtime-probe")]
+use super::NativeMarkdownPagedBodyError as Error;
 use super::preparation::PreparationTicket;
-use super::{NativeMarkdownPagedBody as Owner, NativeMarkdownPagedBodyError as Error, Result};
+use super::{NativeMarkdownPagedBody as Owner, Result, unsupported};
 use crate::native_surface::{
     paged_fonts::NativeMarkdownPagedFont,
     paged_line_fonts::NativeMarkdownLineFont,
@@ -313,7 +315,7 @@ impl Selection {
                     range.end,
                     display.source().utf16_len(),
                 );
-                return Err(Error::Unsupported);
+                return Err(unsupported());
             };
             let end = range.end.min(query.utf16_range.end);
             if end <= range.start {
@@ -323,7 +325,7 @@ impl Selection {
                     "native_cell_unsupported phase=style_empty range_start={} range_end={} covered_end={}",
                     range.start, range.end, query.utf16_range.end,
                 );
-                return Err(Error::Unsupported);
+                return Err(unsupported());
             }
             (end, query.styles)
         };
@@ -384,7 +386,7 @@ impl Selection {
                 let query = display
                     .styles_at(self.coverage.start)
                     .map_err(super::ViewError::Document)?
-                    .ok_or(Error::Unsupported)?;
+                    .ok_or_else(|| unsupported())?;
                 if query.utf16_range.end < self.coverage.end || query.styles != self.styles {
                     return Err(super::ViewError::Revoked.into());
                 }
@@ -412,11 +414,11 @@ impl Selection {
             let MarkdownOrdinarySemanticState::RootLeafReady(leaf) =
                 publication.ordinary_semantics_for(&document, *authority)?
             else {
-                return Err(Error::Unsupported);
+                return Err(unsupported());
             };
             let query = leaf
                 .query_for(&document, *authority, self.coverage.start)?
-                .ok_or(Error::Unsupported)?;
+                .ok_or_else(|| unsupported())?;
             if query.utf16_range.end < self.coverage.end
                 || query.styles != self.styles
                 || Role::from_styles(query.styles) != self.role
@@ -674,7 +676,7 @@ impl RootLeaf {
         }
         if self.row_repositioned == Some(position) {
             // 同一原查询已经完整重放仍没有实际行，不把裸坐标升级成来源权限或反复重试。
-            return Err(Error::Unsupported);
+            return Err(unsupported());
         }
         // 恢复一行只需要行首完整scalar的查询窗；原Scanner仍负责认证整条物理行及H/D来源。
         // 额外带上后方16K会把无关普通尾段塞进256条来源页，并让每格反复重扫同一大表前缀。
@@ -774,7 +776,7 @@ impl RootLeaf {
             let local = match action {
                 Action::Next if column + 1 < columns => Some(column + 1),
                 Action::Previous if column > 0 => Some(column - 1),
-                Action::Cancel => return Err(Error::Unsupported),
+                Action::Cancel => return Err(unsupported()),
                 _ => None,
             };
             if let Some(column) = local {
@@ -1404,7 +1406,7 @@ impl RootLeaf {
         )? {
             None => Ok(None),
             Some(StyleDecision::Font(selection)) => Ok(Some(selection)),
-            Some(StyleDecision::Table(_)) => Err(Error::Unsupported),
+            Some(StyleDecision::Table(_)) => Err(unsupported()),
         }
     }
 
@@ -1575,7 +1577,7 @@ impl RootLeaf {
         {
             let row = source.verified_table_layout_row_from_source(&document, row, authority)?;
             if row.source_range().start != range.start {
-                return Err(Error::Unsupported);
+                return Err(unsupported());
             } // 原 NeedStyle 必须正处于真实块起点，不能在已消费的半行里事后跳过正文。
             return Ok(Some(StyleDecision::Table(row)));
         } // TABLE 样式位、同值范围及离屏 header context 均不能补造可绘制行。
@@ -1601,7 +1603,7 @@ impl RootLeaf {
                     MarkdownOrdinarySemanticState::RootLeafReady(_) => unreachable!(),
                 }
             );
-            return Err(Error::Unsupported); // SourcesOnly/未知inline不签默认Body样式。
+            return Err(unsupported()); // SourcesOnly/未知inline不签默认Body样式。
         };
         let query = match leaf.query_for(&document, authority, range.start)? {
             Some(query) => query,
@@ -1620,12 +1622,12 @@ impl RootLeaf {
                     leaf.covered_ranges_for(&document, authority)?
                         .collect::<Vec<_>>()
                 );
-                return Err(Error::Unsupported);
+                return Err(unsupported());
             }
         };
         let end = range.end.min(query.utf16_range.end);
         if end <= range.start {
-            return Err(Error::Unsupported);
+            return Err(unsupported());
         }
         Ok(Some(StyleDecision::Font(Selection {
             coverage: range.start..end,
