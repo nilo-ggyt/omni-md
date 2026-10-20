@@ -73,6 +73,9 @@ pub(super) struct StoredItemProof {
 pub(super) struct LocatedItem {
     pub(super) proof: StoredItemProof,
     directory: Directory,
+    // 只来自同次 forest 降树已读的紧邻右子树；没有 Font、Source、FD 强引用。
+    // 行组合只在上一目录的精确末端短借它，不能用于逆向或下一次 line/step。
+    following: Option<forest::Root>,
 }
 
 #[derive(Clone)]
@@ -824,7 +827,10 @@ impl GlyphStore {
         range: &Range<usize>,
     ) -> Result<Option<StoredItemProof>> {
         let result = (|| {
-            let Some(LocatedItem { proof, directory }) = self.item_at(range.start)? else {
+            let Some(LocatedItem {
+                proof, directory, ..
+            }) = self.item_at(range.start)?
+            else {
                 return Ok(None);
             };
             Ok(
@@ -1118,14 +1124,14 @@ impl GlyphStore {
             if offset == self.source_end {
                 return Ok(None);
             } // 仅已签入前缀的末端，调用者另核真正文档EOF。
-            let key = forest::lookup(
+            let located = forest::lookup(
                 self.index.as_mut().ok_or(Error::Poisoned)?,
                 &self.forest,
                 offset,
             )?;
             let proof = StoredItemProof {
                 store: Arc::downgrade(&self.identity),
-                key,
+                key: located.key,
                 #[cfg(test)]
                 job: None,
             };
@@ -1133,7 +1139,56 @@ impl GlyphStore {
             if !directory.facts.source_utf16.contains(&offset) {
                 return Err(Error::InconsistentCoverage);
             }
-            Ok(Some(LocatedItem { proof, directory }))
+            Ok(Some(LocatedItem {
+                proof,
+                directory,
+                following: located.following,
+            }))
+        })();
+        self.finish(result)
+    }
+
+    /// 只供同一次整行的正向邻接消费；原行入口已停止 capture，后续只追加 Line/Part，
+    /// 不会修改原 forest/Directory，也没有 Native 或挂起点让另一份 Source/FD 接管它。
+    fn item_following(&mut self, previous: &LocatedItem) -> Result<Option<LocatedItem>> {
+        let result = (|| {
+            self.guard()?; // 先核原 Source、取消和 index observer，不能用已读 Root 掩盖失权或 poison。
+            if !Weak::ptr_eq(&previous.proof.store, &Arc::downgrade(&self.identity)) {
+                return Err(Error::SourceMismatch);
+            }
+            let offset = previous.directory.facts.source_utf16.end;
+            if offset > self.source_end {
+                return Err(Error::InconsistentCoverage);
+            }
+            if offset == self.source_end {
+                return Ok(None);
+            }
+            let located = forest::lookup_following(
+                self.index.as_mut().ok_or(Error::Poisoned)?,
+                &self.forest,
+                previous.following,
+                offset,
+            )?;
+            let Some(located) = located else {
+                return Ok(None); // 没有原邻接子树或精确根事实时，调用者仍作普通完整查询。
+            };
+            let proof = StoredItemProof {
+                store: Arc::downgrade(&self.identity),
+                key: located.key,
+                #[cfg(test)]
+                job: None,
+            };
+            let directory = self.directory(&proof)?; // 三条真实记录、Font 弱注册及前后健康门全部保留。
+            if directory.facts.source_utf16.start != offset
+                || !directory.facts.source_utf16.contains(&offset)
+            {
+                return Err(Error::InconsistentCoverage);
+            }
+            Ok(Some(LocatedItem {
+                proof,
+                directory,
+                following: located.following,
+            }))
         })();
         self.finish(result)
     }

@@ -78,6 +78,7 @@ impl GlyphStore {
             let anchor = LocatedItem {
                 proof: current.clone(),
                 directory: self.directory(current)?,
+                following: None, // 原 measure 票没有借过 forest，不能给它猜一个邻接子树。
             };
             if !self
                 .fonts
@@ -221,6 +222,9 @@ impl GlyphStore {
                     }
                     let backwards = run.level & 1 != 0;
                     let mut at = if backwards { visual.end } else { visual.start };
+                    // 只保本次视觉 run 上一次实际定位，跨 run/行即结束；没有历史 item 目录。
+                    // RTL 与非邻接点不消费其右子树，仍沿原 forest 完整定位。
+                    let mut previous: Option<LocatedItem> = None;
                     while if backwards {
                         at > visual.start
                     } else {
@@ -233,8 +237,9 @@ impl GlyphStore {
                             at
                         };
                         // 只复用本次已经真实读取的 anchor/末项；contains 选择原票，不从范围新造权限。
-                        // 其他 item 仍走原 forest。复用前照核实际 Font 与 Source/取消，不能让目录
-                        // 不可变掩盖弱注册撤权；后续 part 的 GCB、UBA seam 和 unsafe 检查保持原样。
+                        // 其他 item 先试原行内的精确右邻事实，无此事实仍走原 forest；实际 Directory
+                        // 和 Font 仍重新读取/核验，不能让目录不可变掩盖弱注册撤权。后续 part 的
+                        // GCB、UBA seam 和 unsafe 检查保持原样。
                         let reusable = if anchor.directory.facts.source_utf16.contains(&point) {
                             Some(&anchor)
                         } else if last_item.facts.source_utf16.contains(&point) {
@@ -242,18 +247,34 @@ impl GlyphStore {
                         } else {
                             None
                         };
-                        let located;
+                        let located = match reusable {
+                            Some(_) => None,
+                            None => {
+                                let adjacent = match previous.as_ref() {
+                                    Some(previous)
+                                        if !backwards
+                                            && previous.directory.facts.source_utf16.end
+                                                == point =>
+                                    {
+                                        self.item_following(previous)?
+                                    }
+                                    _ => None,
+                                };
+                                Some(match adjacent {
+                                    Some(actual) => actual,
+                                    None => {
+                                        self.item_at(point)?.ok_or(Error::InconsistentCoverage)?
+                                    }
+                                })
+                            }
+                        };
                         let actual = match reusable {
                             Some(actual) => {
                                 self.fonts.resolve(actual.directory.font)?;
                                 self.guard()?;
                                 actual
                             }
-                            None => {
-                                located =
-                                    self.item_at(point)?.ok_or(Error::InconsistentCoverage)?;
-                                &located
-                            }
+                            None => located.as_ref().ok_or(Error::InconsistentCoverage)?,
                         };
                         let item = &actual.directory;
                         let segment = visual.start.max(item.facts.source_utf16.start)
@@ -277,6 +298,7 @@ impl GlyphStore {
                         } else {
                             segment.end
                         };
+                        previous = located; // 原 part 已完成才移交下一邻接事实，失败仍撤整条未发布行。
                     }
                     Ok(())
                 })();

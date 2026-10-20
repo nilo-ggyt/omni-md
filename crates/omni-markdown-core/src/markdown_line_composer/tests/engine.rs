@@ -82,46 +82,96 @@ pub(super) fn drive(
 }
 #[test]
 fn production_worker_composes_mixed_items_into_real_lines_and_unique_readonly_output() {
-    let fixture = Fixture::new("office αλφα слово office βητα текст office gamma конец ");
-    let (mut worker, registered) =
-        composer(&fixture, 140 * 64, MarkdownLineComposeCancellation::new());
-    let count = drive(&mut worker, &registered, false);
-    assert!(count >= 3);
-    let mut lines = worker.into_output().unwrap();
-    let observer = lines.resource_observer();
-    assert_eq!(lines.source_range(), 0..fixture.source.utf16_len());
-    let mut line = lines.last_line().unwrap();
-    let mut actual = 0;
-    let mut end = fixture.source.utf16_len();
-    let mut mixed = false;
-    while let Some(current) = line {
-        assert_eq!(current.facts().source_utf16.end, end);
-        mixed |= current.facts().parts > 1;
-        for ordinal in 0..current.facts().parts {
-            let part = lines.part(&current, ordinal).unwrap().unwrap();
-            assert!(
-                part.font_registration()
-                    .lease()
-                    .unwrap()
-                    .font()
-                    .permits(&registered.font().authority())
-            );
-            lines.read_batch(&part, 0..0, &mut []).unwrap();
+    // 同一真实字体覆盖三种脚本。保留原窄行，再以较宽行完整消费多次脚本切换；
+    // 只证明连续源、完整实际字形和资源收尾，不读取内部 forest 或断言定位调用次数。
+    let text = "office αλφα слово office βητα текст office gamma конец ".repeat(17);
+    for width in [140, 800] {
+        let fixture = Fixture::new(&text);
+        let source_mapping = fixture.source.original_backing_observer().unwrap();
+        let before = fixture.document.generation();
+        let (mut worker, registered) =
+            composer(&fixture, width * 64, MarkdownLineComposeCancellation::new());
+        let resources = worker.worker_resource_observer();
+        let count = drive(&mut worker, &registered, false);
+        assert!(count >= 3);
+        let mut lines = worker.into_output().unwrap();
+        let observer = lines.resource_observer();
+        assert_eq!(lines.source_range(), 0..fixture.source.utf16_len());
+        let mut line = lines.last_line().unwrap();
+        let mut actual = 0;
+        let mut end = fixture.source.utf16_len();
+        let mut mixed = false;
+        while let Some(current) = line {
+            assert_eq!(current.facts().source_utf16.end, end);
+            mixed |= current.facts().parts > 1;
+            let mut covered = current.facts().source_utf16.start;
+            for ordinal in 0..current.facts().parts {
+                let part = lines.part(&current, ordinal).unwrap().unwrap();
+                assert_eq!(part.facts().source_utf16.start, covered);
+                assert!(
+                    part.font_registration()
+                        .lease()
+                        .unwrap()
+                        .font()
+                        .permits(&registered.font().authority())
+                );
+                // 原只读输出分小批读回全部字形；不能用零长读取或 .notdef 冒称完整渲染。
+                // 三种脚本均为 LTR，视觉 part 的源顺序必须同时完整覆盖原行。
+                let mut glyphs = [crate::MarkdownShapedGlyph {
+                    glyph_id: 0,
+                    source_utf16_cluster: 0,
+                    flags: 0,
+                    x_advance: 0,
+                    y_advance: 0,
+                    x_offset: 0,
+                    y_offset: 0,
+                }; 16];
+                for start in (0..part.facts().glyphs).step_by(glyphs.len()) {
+                    let end = (start + glyphs.len()).min(part.facts().glyphs);
+                    let batch = &mut glyphs[..end - start];
+                    lines.read_batch(&part, start..end, batch).unwrap();
+                    assert!(batch.iter().all(|glyph| {
+                        glyph.glyph_id != 0
+                            && part
+                                .facts()
+                                .source_utf16
+                                .contains(&glyph.source_utf16_cluster)
+                    }));
+                }
+                covered = part.facts().source_utf16.end;
+            }
+            assert_eq!(covered, current.facts().source_utf16.end);
+            end = current.facts().source_utf16.start;
+            actual += 1;
+            line = lines.previous_line(&current).unwrap();
         }
-        end = current.facts().source_utf16.start;
-        actual += 1;
-        line = lines.previous_line(&current).unwrap();
+        assert_eq!((actual, end), (count, 0));
+        assert!(mixed);
+        assert_eq!(fixture.document.generation(), before);
+        assert!(
+            !fixture.document.is_dirty()
+                && !fixture.document.can_undo()
+                && !fixture.document.can_redo()
+        );
+        assert_eq!(
+            std::fs::read(fixture._directory.path().join("真实分项.md")).unwrap(),
+            text.as_bytes()
+        );
+        lines.close().unwrap();
+        let closed = observer.snapshot();
+        assert!(
+            !closed.file_open
+                && closed.mapped_bytes == 0
+                && !closed.cleanup_failed
+                && !closed.reader_failed
+        );
+        // 原输出关闭不等于原 Source 已释放；归还真实注册和文档后再核全部 worker 与映射。
+        drop((registered, fixture));
+        assert!(resources.is_released());
+        assert!(source_mapping.unmap_succeeded());
+        assert_eq!(source_mapping.mapped_bytes(), 0);
+        assert!(!source_mapping.failed());
     }
-    assert_eq!((actual, end), (count, 0));
-    assert!(mixed);
-    lines.close().unwrap();
-    let closed = observer.snapshot();
-    assert!(
-        !closed.file_open
-            && closed.mapped_bytes == 0
-            && !closed.cleanup_failed
-            && !closed.reader_failed
-    );
 }
 #[test]
 fn production_worker_can_seal_only_its_real_line_prefix_without_claiming_the_tail() {

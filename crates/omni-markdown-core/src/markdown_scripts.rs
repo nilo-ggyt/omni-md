@@ -563,23 +563,43 @@ impl MarkdownScriptJob {
             return Err(MarkdownScriptError::InvalidRange);
         }
         // 只对连续已完成run做二分；当前候选即使已有primary仍不是已发布完整run。
+        let position = |run: MarkdownScriptRun| match unit {
+            MarkdownScriptUnit::Byte => run.end_byte,
+            MarkdownScriptUnit::Utf16 => run.end_utf16,
+        };
         let mut low = 0;
-        let mut high = self.store.run_count();
+        let count = self.store.run_count();
+        let mut high = count;
+        let mut following = None;
+        if let Some(page) = self.store.run_append_page()?
+            && !page.is_empty()
+        {
+            // 原追加页的首条完整run已经实际写入。根据它的真实末端，可把前向查询
+            // 限在这个已初始化范围；旧区域仍走原FD，不能用当前候选或页容量补覆盖。
+            let first = self.store.run(page.start)?;
+            if position(first) <= offset {
+                low = page.start + 1;
+                high = page.end;
+            } else {
+                high = page.start;
+                following = Some(first); // 旧区全部在offset左侧时，页首本身仍可能是目标run。
+            }
+        }
         while low < high {
             let middle = low + (high - low) / 2;
             let run = self.store.run(middle)?;
-            let end = match unit {
-                MarkdownScriptUnit::Byte => run.end_byte,
-                MarkdownScriptUnit::Utf16 => run.end_utf16,
-            };
-            if end <= offset {
+            if position(run) <= offset {
                 low = middle + 1;
             } else {
                 high = middle;
+                following = Some(run);
             }
         }
-        if low < self.store.run_count() {
-            return Ok(MarkdownScriptAnswer::Known(Some(self.store.run(low)?)));
+        if low < count {
+            // 本次upper_bound已经完整解码了最终run；只保本栈Copy结果，不再读取同一
+            // 记录，也不跨query存续。相等末端仍属于后一run，原byte/UTF16语义不变。
+            let run = following.ok_or(MarkdownScriptError::CorruptMetadata)?;
+            return Ok(MarkdownScriptAnswer::Known(Some(run)));
         }
         // 未读后继和未闭合run不能通过空结果冒充已知不存在；只有真EOF授予Known(None)。
         Ok(if self.machine.ready {

@@ -254,6 +254,202 @@ fn pending_prefix_and_every_byte_split_preserve_global_utf16_coverage() {
 }
 
 #[test]
+fn cross_page_run_queries_keep_exact_unicode_ranges_and_unfinished_frontier() {
+    // 三种明确脚本逐字交替；Deseret占四个UTF8字节、两个UTF16单元，不能把两种坐标
+    // 混成记录序号。1029个真实run跨过四个完整追加页，最终还保留五条有效尾记录。
+    let text = "a𐐀中".repeat(343);
+    let (directory, document) = fixture(&text);
+    let mapping = document.original_backing_observer().unwrap();
+    let source = MarkdownLayoutTextSource::capture(&document);
+    let authority = source.authority();
+    let mut job =
+        MarkdownScriptJob::new(source, &authority, MarkdownScriptCancellation::new()).unwrap();
+    let observer = job.resource_observer();
+    let budget = MarkdownScriptBudget {
+        bytes: 1,
+        scalars: 1,
+        records: 1,
+        stack_ops: 1,
+    };
+    // 期望直接来自三个原字符的编码与公开Script tag；不读取内部Store或改写分页状态。
+    let segments = [
+        (0..1, 0..1, *b"Latn"),
+        (1..5, 1..3, *b"Dsrt"),
+        (5..8, 3..4, *b"Hani"),
+    ];
+    let assert_run = |job: &mut MarkdownScriptJob, ordinal: usize| {
+        let group = ordinal / 3;
+        let (bytes, utf16, tag) = &segments[ordinal % 3];
+        let bytes = group * 8 + bytes.start..group * 8 + bytes.end;
+        let utf16 = group * 4 + utf16.start..group * 4 + utf16.end;
+        // 同一run内的首末单元都须归于完整原run；代理对内部的UTF16单元不另造脚本边界。
+        for (unit, offset) in [
+            (MarkdownScriptUnit::Byte, bytes.start),
+            (MarkdownScriptUnit::Byte, bytes.end - 1),
+            (MarkdownScriptUnit::Utf16, utf16.start),
+            (MarkdownScriptUnit::Utf16, utf16.end - 1),
+        ] {
+            let MarkdownScriptAnswer::Known(Some(run)) =
+                job.run_at(&authority, unit, offset).unwrap()
+            else {
+                panic!("已完成的真实脚本范围必须可查询");
+            };
+            assert_eq!(run.start_byte..run.end_byte, bytes);
+            assert_eq!(run.start_utf16..run.end_utf16, utf16);
+            assert_eq!(run.script.iso15924_tag(), *tag);
+            #[cfg(feature = "paged-shaping-frontier")]
+            {
+                // Frontier也消费同一已封存run；本次借用结束后才允许继续扫描或再查询。
+                let MarkdownScriptPrefixAnswer::Known(Some(prefix)) =
+                    job.stable_prefix_at(&authority, unit, offset).unwrap()
+                else {
+                    panic!("已完成run不能退成开放脚本前缀");
+                };
+                assert_eq!(prefix.facts().unwrap(), run);
+                assert_eq!(prefix.kind().unwrap(), MarkdownScriptPrefixKind::ClosedRun);
+            }
+        }
+    };
+    for ordinal in [255, 256, 511, 512, 1023, 1024] {
+        let group = ordinal / 3;
+        let (bytes, utf16, _) = &segments[ordinal % 3];
+        let end_byte = group * 8 + bytes.end;
+        let end_utf16 = group * 4 + utf16.end;
+        // 只沿公开逐字节配额推进到这个run实际发布。查询不能替任务读完后继正文，
+        // records=1也让本次发布边缘不被同一步的后一记录掩盖。
+        let mut closed = false;
+        for _ in 0..text.len() * 8 {
+            if matches!(
+                job.run_at(&authority, MarkdownScriptUnit::Byte, end_byte - 1)
+                    .unwrap(),
+                MarkdownScriptAnswer::Known(Some(_))
+            ) {
+                closed = true;
+                break;
+            }
+            let step = job.step(&authority, budget).unwrap();
+            assert!(step.bytes <= 1 && step.scalars <= 1);
+            assert!(step.records <= 1 && step.stack_ops <= 1);
+            assert_eq!(step.status, MarkdownScriptStatus::Pending);
+        }
+        assert!(closed, "有限原输入必须能到达这个真实发布边界");
+        // 查询页首前后及旧文件区域；相等末端须进入下一run，而尚未发布时仍为Pending。
+        for known in [0, ordinal - 1, ordinal] {
+            assert_run(&mut job, known);
+        }
+        for (unit, offset) in [
+            (MarkdownScriptUnit::Byte, end_byte),
+            (MarkdownScriptUnit::Utf16, end_utf16),
+            (MarkdownScriptUnit::Byte, text.len()),
+            (MarkdownScriptUnit::Utf16, text.encode_utf16().count()),
+        ] {
+            assert_eq!(
+                job.run_at(&authority, unit, offset).unwrap(),
+                MarkdownScriptAnswer::Pending
+            );
+        }
+    }
+    // 真EOF后再逆序查询尾部半页、旧页末及页首；不存在只能在完整任务结束后确认。
+    finish(&mut job, &authority, budget);
+    for ordinal in [1028, 0, 1024, 1023, 512, 511, 256, 255, 1] {
+        assert_run(&mut job, ordinal);
+    }
+    for (unit, offset) in [
+        (MarkdownScriptUnit::Byte, text.len()),
+        (MarkdownScriptUnit::Utf16, text.encode_utf16().count()),
+    ] {
+        assert_eq!(
+            job.run_at(&authority, unit, offset).unwrap(),
+            MarkdownScriptAnswer::Known(None)
+        );
+    }
+    assert_eq!(
+        std::fs::read(directory.path().join("scripts.md")).unwrap(),
+        text.as_bytes()
+    );
+    assert_eq!(document.generation(), 0);
+    assert!(!document.can_undo() && !document.can_redo());
+    // 真实close归还两索引及原Source；观察者只有弱资源事实，不把关闭标志冒充释放。
+    job.close().unwrap();
+    drop(document);
+    let facts = observer.snapshot();
+    assert!(!facts.run_file_open && !facts.stack_file_open);
+    assert_eq!(facts.buffer_bytes, 0);
+    assert_eq!(facts.mapped_bytes, 0);
+    assert!(!facts.cleanup_failed && facts.source_payload_released);
+    assert!(mapping.unmap_succeeded() && !mapping.failed());
+}
+
+#[test]
+fn sealed_run_queries_keep_foreign_source_cancel_and_invalid_offset_errors() {
+    // 每次都通过公开入口真正写过多个metadata页，再验证新旧查询区域的撤权结果；
+    // 不用私有记录突变、替代reader或预设缓存命中来制造错误。
+    enum Failure {
+        Cancelled,
+        ForeignSource,
+        InvalidOffset,
+    }
+    let text = "a𐐀中".repeat(343);
+    for failure in [
+        Failure::Cancelled,
+        Failure::ForeignSource,
+        Failure::InvalidOffset,
+    ] {
+        let (_directory, document) = fixture(&text);
+        let mapping = document.original_backing_observer().unwrap();
+        let source = MarkdownLayoutTextSource::capture(&document);
+        let authority = source.authority();
+        let cancellation = MarkdownScriptCancellation::new();
+        let mut job = MarkdownScriptJob::new(source, &authority, cancellation.clone()).unwrap();
+        let observer = job.resource_observer();
+        finish(&mut job, &authority, MarkdownScriptBudget::default());
+        match failure {
+            Failure::Cancelled => {
+                cancellation.cancel();
+                // 尾追加页和旧FD区域都必须先观察同一取消，不能由原页内记录复活权限。
+                for offset in [text.len() - 1, 0] {
+                    assert!(matches!(
+                        job.run_at(&authority, MarkdownScriptUnit::Byte, offset),
+                        Err(MarkdownScriptError::Cancelled)
+                    ));
+                }
+            }
+            Failure::ForeignSource => {
+                let (_other_directory, other_document) = fixture(&text);
+                let foreign = MarkdownLayoutTextSource::capture(&other_document).authority();
+                assert!(matches!(
+                    job.run_at(&foreign, MarkdownScriptUnit::Utf16, 0),
+                    Err(MarkdownScriptError::SourceMismatch)
+                ));
+                assert!(matches!(
+                    job.run_at(&authority, MarkdownScriptUnit::Byte, text.len() - 1),
+                    Err(MarkdownScriptError::Poisoned)
+                ));
+            }
+            Failure::InvalidOffset => {
+                assert!(matches!(
+                    job.run_at(&authority, MarkdownScriptUnit::Byte, text.len() + 1),
+                    Err(MarkdownScriptError::InvalidRange)
+                ));
+                assert!(matches!(
+                    job.run_at(&authority, MarkdownScriptUnit::Byte, 0),
+                    Err(MarkdownScriptError::Poisoned)
+                ));
+            }
+        }
+        // 撤权不妨碍原owner清理；错误后同样要求Source及匿名文件实际终结。
+        job.close().unwrap();
+        drop(document);
+        let facts = observer.snapshot();
+        assert!(!facts.run_file_open && !facts.stack_file_open);
+        assert_eq!(facts.buffer_bytes, 0);
+        assert_eq!(facts.mapped_bytes, 0);
+        assert!(!facts.cleanup_failed && facts.source_payload_released);
+        assert!(mapping.unmap_succeeded() && !mapping.failed());
+    }
+}
+
+#[test]
 fn authority_cancel_source_failure_and_real_release_are_not_replaced_by_cached_runs() {
     let (directory, document) = fixture("a(א)世界");
     let source = MarkdownLayoutTextSource::capture(&document);

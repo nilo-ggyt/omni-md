@@ -13,6 +13,13 @@ pub(super) struct Root {
     items: usize,
     level: u8,
 }
+
+/// 同一次降树实际取得的叶与紧邻右子树；只随本次 LocatedItem 借用，不保存历史路径。
+/// following 的首端必须正好是该叶末端，不能把任意祖先或相近数值当成后继权限。
+pub(super) struct Located {
+    pub(super) key: ItemKey,
+    pub(super) following: Option<Root>,
+}
 pub(super) struct Build {
     key: ItemKey,
     start: usize,
@@ -167,18 +174,51 @@ fn decode(row: [u8; 64], record: usize) -> Result<DecodedNode> {
         })
     }
 }
-/// 在同一个原forest查询中消费已读取节点；保留父子覆盖，不把局部解码结果保成后继查询缓存。
+/// 在原 forest 中定位实际叶；父子覆盖和紧邻右子树只随本次行内 LocatedItem 返回。
 pub(super) fn lookup(
     rows: &mut Rows,
     forest: &[Option<Root>; 64],
     offset: usize,
-) -> Result<ItemKey> {
+) -> Result<Located> {
     let root = forest
         .iter()
         .flatten()
         .find(|root| offset >= root.start && offset < root.end)
         .copied()
         .ok_or(Error::InconsistentCoverage)?;
+    lookup_root(rows, root, offset)
+}
+
+/// 仅原行内上一项的真实末端可借已认证右子树；跨树时只接受原固定根的精确首端。
+/// 没有该事实就交回 None，由调用方保留普通 lookup；不增加目录、路径栈或跨调用缓存。
+pub(super) fn lookup_following(
+    rows: &mut Rows,
+    forest: &[Option<Root>; 64],
+    following: Option<Root>,
+    offset: usize,
+) -> Result<Option<Located>> {
+    let root = following.or_else(|| {
+        forest
+            .iter()
+            .flatten()
+            .find(|root| root.start == offset)
+            .copied()
+    });
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    if root.start != offset {
+        return Err(Error::InconsistentCoverage);
+    } // 已带出的邻接事实错位不能悄悄退回普通查询，把原目录错误洗成成功。
+    lookup_root(rows, root, offset).map(Some)
+}
+
+/// 原根与带出的右子树共用同一真实读取、解码和父子覆盖认证。
+/// 即使 Root 已读过，仍从原 Rows 读取它，保留 index 的健康/poison 与 IO 首错。
+fn lookup_root(rows: &mut Rows, root: Root, offset: usize) -> Result<Located> {
+    if offset < root.start || offset >= root.end {
+        return Err(Error::InconsistentCoverage);
+    }
     let mut node = decode(rows.read(root.record)?, root.record)?;
     if node.root.start != root.start
         || node.root.end != root.end
@@ -187,6 +227,7 @@ pub(super) fn lookup(
     {
         return Err(Error::InconsistentCoverage); // 首条实际根必须匹配本次原forest的已发布覆盖。
     }
+    let mut following = None;
     loop {
         let DecodedNode {
             root,
@@ -194,7 +235,13 @@ pub(super) fn lookup(
             item,
         } = node;
         if let Some(item) = item {
-            return Ok(item);
+            if following.is_some_and(|next: Root| next.start != root.end) {
+                return Err(Error::InconsistentCoverage);
+            }
+            return Ok(Located {
+                key: item,
+                following,
+            });
         }
         let (left, right) = children.ok_or(Error::InconsistentCoverage)?;
         let left = decode(rows.read(left)?, left)?;
@@ -207,8 +254,15 @@ pub(super) fn lookup(
         {
             return Err(Error::InconsistentCoverage);
         }
-        // 两个孩子均已真实读取并完整解码，选中后只移交这份局部结果；
-        // 严格降一层且不跨调用保留，不为下一轮重读相同record或扩大读取范围。
-        node = if offset < left.root.end { left } else { right };
+        // 完整 DecodedNode 只在本次降树中移交，选中孩子后不重读相同 record。
+        // 仅带出的相邻 Root 可供本次视觉 run 借用，不跨 run/行缓存或扩大读取范围。
+        node = if offset < left.root.end {
+            // 两个孩子已经在本次查询中完整读过；越靠近叶的右孩子就是更近的真实后继。
+            // 向右下降时保留上层候选；最终只带出首端与当前叶末端完全相同的那一棵。
+            following = Some(right.root);
+            left
+        } else {
+            right
+        };
     }
 }

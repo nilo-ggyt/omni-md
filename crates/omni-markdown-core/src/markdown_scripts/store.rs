@@ -98,6 +98,12 @@ impl Store {
     pub(super) fn run_count(&self) -> usize {
         self.runs.len()
     }
+    /// 只借原唯一追加页已初始化的记录范围；不复制页、不读旧文件，也不创建后继缓存。
+    /// 调用方仍须用 run 完整解码选中的实际记录，取消及已知索引首错不能被范围查询绕过。
+    pub(super) fn run_append_page(&mut self) -> Result<Option<std::ops::Range<usize>>> {
+        self.cancellation.check()?;
+        self.runs.append_page_records().map_err(Into::into)
+    }
     pub(super) fn frame_count(&self) -> usize {
         self.frames.len()
     }
