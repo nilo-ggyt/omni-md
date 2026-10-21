@@ -1396,9 +1396,9 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
     fn current(&self, epoch: u64) -> bool {
         epoch == self.configuration.epoch && self.current_body()
     }
-    fn cursor_rects_retired(&self) -> bool {
+    fn close_accepted(&self) -> bool {
         // preflight通过才安装本次唯一close receipt，随后active先撤、View稍后才封闭。
-        // 这段同步Native拆图可触发resetCursorRects；原Source/Font错误仍归同关闭收据结算。
+        // 同步Native拆图可触发updateLayer/resetCursorRects；原资源错误仍归同关闭收据结算。
         self.close_receipt.borrow().is_some()
     }
     fn user_scroll(&self, epoch: u64) -> std::result::Result<(), ViewError> {

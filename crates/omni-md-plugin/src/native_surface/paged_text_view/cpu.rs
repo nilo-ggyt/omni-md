@@ -239,10 +239,14 @@ impl CpuSurface {
     }
 
     /// AppKit 显示回调获取的是此刻画面；获取期间旧输入或几何已换代时，只放弃该次请求。
-    /// 原客户捕获失败、真正的资源错误以及 Ready 后的 CPU/图层检查仍由原失败边界处理。
+    /// 未接受关闭的客户捕获失败、真正资源错误以及 Ready 后的 CPU/图层检查仍原样处理。
     pub(super) fn paint_current(self: &Rc<Self>, view: &NativeMarkdownPagedTextView) -> Result<()> {
         let result = (|| {
-            let origin = view.origin()?;
+            let Some(origin) = view.display_origin()? else {
+                // 原Body已接受关闭、先撤活动票而View尚在Native拆图；不领取新Scene或发布像素。
+                // 这里只结束Origin获取，后继资源与Native失败仍走下方原严格边界。
+                return Ok(());
+            };
             let ticket = candidate::Ticket::new(&origin);
             let scene = match view.scene_for_origin(origin) {
                 Ok(scene) => scene,

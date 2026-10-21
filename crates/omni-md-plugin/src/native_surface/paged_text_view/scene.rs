@@ -5,7 +5,7 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use objc2::rc::Retained;
+use objc2::{DefinedClass, rc::Retained};
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::CGContext;
 
@@ -16,8 +16,36 @@ use omni_markdown_core::{
 };
 pub use paint::*;
 
-use super::{NativeMarkdownPagedInputCommit, NativeMarkdownPagedInputState, Result};
+use super::{
+    NativeMarkdownPagedInputCommit, NativeMarkdownPagedInputState, NativeMarkdownPagedTextView,
+    NativeMarkdownPagedTextViewError, Origin, Result,
+};
 use crate::native_surface::paged_input::{NativeMarkdownBidiCaretSide, NativeMarkdownVerticalGoal};
+
+impl NativeMarkdownPagedTextView {
+    /// Body接受关闭后先撤活动权限，再调用Native拆图，最后才封闭本View。
+    /// 这段同步回调窗口已经没有可供显示领取的Origin；CPU与光标都只退休本次查询。
+    pub(super) fn display_origin(&self) -> Result<Option<Origin>> {
+        match self.origin() {
+            Ok(origin) => Ok(Some(origin)),
+            Err(NativeMarkdownPagedTextViewError::Revoked) => {
+                let delegate = self.ivars().delegate.borrow().clone();
+                let delegate = delegate.and_then(|delegate| delegate.upgrade());
+                // 槽借用已经归还；只向同一弱owner询问既有accepted-close事实。
+                // 不以!current或Scene缺失代签退休，也不新增状态、后继Source或重试。
+                let retired = delegate.is_some_and(|delegate| delegate.close_accepted());
+                if retired {
+                    Ok(None)
+                } else {
+                    Err(NativeMarkdownPagedTextViewError::Revoked)
+                }
+            }
+            // 只处理取得Origin时的裸撤权；真实Input错误及后继Scene/Font/Layer错误仍失败。
+            // 本入口不签发关闭成功：Source、Font与像素释放继续由原关闭收据结算。
+            Err(cause) => Err(cause),
+        }
+    }
+}
 
 #[derive(Clone)]
 /// 每次真实Ready发布使用独立nonce；相同Doc/g/宽度的后继scene不能冒充旧回调。
@@ -471,7 +499,7 @@ pub trait NativeMarkdownPagedTextViewDelegate {
     fn current(&self, epoch: u64) -> bool;
     /// 只报告原owner已经接受关闭，不把current=false、暂缺Scene或准备中推断为退出。
     /// 非Body客户没有Body关闭事务，默认false；这不授予输入、绘图或资源归还成功。
-    fn cursor_rects_retired(&self) -> bool {
+    fn close_accepted(&self) -> bool {
         false
     }
     /// bounds_width是本次真实有限正文宽；无滚动owner的独立组件直接消费此输入，不填默认宽。
