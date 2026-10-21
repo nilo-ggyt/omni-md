@@ -139,7 +139,6 @@ fn finite_revision_matches_original_hash_and_budget_rejects_before_callback() {
     fs::write(&path, &text).unwrap();
     let inspected = inspect_bounded_markdown(&path, MAX_SEARCH_FILE_BYTES, |_| Ok(())).unwrap();
     assert_eq!(inspected.revision, revision_for_bytes(text.as_bytes()));
-    assert_eq!(inspected.byte_count, text.len() as u64);
     let called = std::cell::Cell::new(false);
     let result = inspect_bounded_markdown_text_cancellable(
         &path,

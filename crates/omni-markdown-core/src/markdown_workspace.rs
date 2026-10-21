@@ -5,7 +5,9 @@ use std::ffi::CString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(feature = "native-markdown-candidate")]
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
@@ -48,9 +50,13 @@ use super::markdown_document_buffer::{MarkdownDocumentBuffer, MarkdownDocumentBu
 pub const MARKDOWN_ROOT_DIRECTORY_NAME: &str = "OMNI";
 
 const ATTACHMENTS_DIRECTORY_NAME: &str = "attachments";
+#[cfg(feature = "native-markdown-candidate")]
 const CONFLICT_RECOVERY_DIRECTORY_NAME: &str = "markdown-conflict-recovery";
+#[cfg(feature = "native-markdown-candidate")]
 const CONFLICT_DRAFT_MAGIC: &[u8; 8] = b"OMNIMD1\0";
+#[cfg(feature = "native-markdown-candidate")]
 const CONFLICT_DRAFT_HEADER_BYTES: usize = 20;
+#[cfg(feature = "native-markdown-candidate")]
 const MAX_RECOVERY_RELATIVE_PATH_BYTES: usize = 4_096;
 const MAX_DOCUMENT_BYTES: u64 = 32 * 1_024 * 1_024;
 const MAX_ATTACHMENT_BYTES: u64 = 256 * 1_024 * 1_024;
@@ -63,6 +69,7 @@ const MAX_ATTACHMENT_NAME_CHARACTERS: usize = 200;
 const SNIPPET_CONTEXT_CHARACTERS: usize = 72;
 const SEARCH_CANCELLATION_BYTE_INTERVAL: usize = 16 * 1_024;
 const ATTACHMENT_COPY_BUFFER_BYTES: usize = 64 * 1_024;
+#[cfg(feature = "native-markdown-candidate")]
 const TEMPORARY_SAVE_ATTEMPTS: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -123,11 +130,15 @@ pub struct MarkdownSearchResult {
 /// Configured session authority; paths and atomic counters own no idle filesystem or worker resources.
 pub struct MarkdownWorkspace {
     configured_root: PathBuf,
+    /// Only the native editor owns historical recovery acquisition and resolution.
+    #[cfg(feature = "native-markdown-candidate")]
     conflict_recovery_directory: PathBuf,
     active_root: Mutex<Option<PathBuf>>,
     search_generation: Arc<AtomicU64>,
     /// 目录刷新独立于搜索；文件集合/排序身份变化与会话结束撤销目录权限，同路径正文保存保留。
     browse_generation: Arc<AtomicU64>,
+    /// Native persistence shares one exclusive temporary-name sequence across access clones.
+    #[cfg(feature = "native-markdown-candidate")]
     save_sequence: Arc<AtomicU64>,
 }
 
@@ -135,41 +146,55 @@ pub struct MarkdownWorkspace {
 /// Lightweight active-session access; its owner must cancel and join any caller-created workers.
 pub struct MarkdownSessionAccess {
     canonical_root: PathBuf,
+    /// Only the native editor owns historical recovery acquisition and resolution.
+    #[cfg(feature = "native-markdown-candidate")]
     conflict_recovery_directory: PathBuf,
     search_generation: Arc<AtomicU64>,
     /// 克隆会话只共享撤权计数，不持目录句柄或目录索引。
     browse_generation: Arc<AtomicU64>,
+    /// Native persistence shares one exclusive temporary-name sequence across access clones.
+    #[cfg(feature = "native-markdown-candidate")]
     save_sequence: Arc<AtomicU64>,
 }
 
 impl MarkdownWorkspace {
     #[must_use]
     /// Configure vault and recovery paths without creating directories or activating the plugin.
-    pub fn new(configured_root: PathBuf, app_data_directory: PathBuf) -> Self {
+    pub fn new(configured_root: PathBuf, _app_data_directory: PathBuf) -> Self {
+        // Portable workspace operations need only the vault; recovery configuration belongs
+        // to the native editor feature and allocates no otherwise-unused path or sequence.
         Self::with_storage_locations(
             configured_root,
-            app_data_directory.join(CONFLICT_RECOVERY_DIRECTORY_NAME),
+            #[cfg(feature = "native-markdown-candidate")]
+            _app_data_directory.join(CONFLICT_RECOVERY_DIRECTORY_NAME),
         )
     }
 
     #[cfg(test)]
     /// Create isolated recovery storage beneath a test vault without touching application data.
     fn with_root(configured_root: PathBuf) -> Self {
+        #[cfg(feature = "native-markdown-candidate")]
         let recovery_directory = configured_root.join(".omni-md-test-conflict-recovery");
-        Self::with_storage_locations(configured_root, recovery_directory)
+        Self::with_storage_locations(
+            configured_root,
+            #[cfg(feature = "native-markdown-candidate")]
+            recovery_directory,
+        )
     }
 
     /// Initialize path and generation ownership without opening files or starting background work.
     fn with_storage_locations(
         configured_root: PathBuf,
-        conflict_recovery_directory: PathBuf,
+        #[cfg(feature = "native-markdown-candidate")] conflict_recovery_directory: PathBuf,
     ) -> Self {
         Self {
             configured_root,
+            #[cfg(feature = "native-markdown-candidate")]
             conflict_recovery_directory,
             active_root: Mutex::new(None),
             search_generation: Arc::new(AtomicU64::new(0)),
             browse_generation: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "native-markdown-candidate")]
             save_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -233,9 +258,11 @@ impl MarkdownWorkspace {
     fn session_access(&self, canonical_root: PathBuf) -> MarkdownSessionAccess {
         MarkdownSessionAccess {
             canonical_root,
+            #[cfg(feature = "native-markdown-candidate")]
             conflict_recovery_directory: self.conflict_recovery_directory.clone(),
             search_generation: Arc::clone(&self.search_generation),
             browse_generation: Arc::clone(&self.browse_generation),
+            #[cfg(feature = "native-markdown-candidate")]
             save_sequence: Arc::clone(&self.save_sequence),
         }
     }

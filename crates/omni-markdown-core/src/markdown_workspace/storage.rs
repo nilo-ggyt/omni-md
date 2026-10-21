@@ -10,14 +10,22 @@ pub(super) use bounded_text::BoundedMarkdownText;
 pub(super) struct InspectedMarkdown<T> {
     pub(super) value: T,
     pub(super) revision: String,
+    /// Native save receipts bind their exact persisted extent to this inspection.
+    #[cfg(feature = "native-markdown-candidate")]
     pub(super) byte_count: u64,
+    /// Native saves expose this persisted display timestamp; portable callers need value/revision.
+    #[cfg(feature = "native-markdown-candidate")]
     pub(super) modified_at_ms: i64,
 }
 
 /// Owned callback result after transient mapping and path identity checks complete.
 pub(super) struct ValidatedMarkdownText<T> {
     pub(super) value: T,
+    /// Carry the validated extent only to the native persistence receipt, never as a second source.
+    #[cfg(feature = "native-markdown-candidate")]
     pub(super) byte_count: u64,
+    /// Native saves expose this persisted display timestamp; portable callers need the callback result.
+    #[cfg(feature = "native-markdown-candidate")]
     pub(super) modified_at_ms: i64,
 }
 
@@ -88,7 +96,9 @@ pub(super) fn inspect_bounded_markdown_text_cancellable<T>(
     }
     Ok(ValidatedMarkdownText {
         value,
+        #[cfg(feature = "native-markdown-candidate")]
         byte_count: after.len(),
+        #[cfg(feature = "native-markdown-candidate")]
         modified_at_ms: modified_at_ms(&after),
     })
 }
@@ -124,7 +134,9 @@ pub(super) fn inspect_bounded_markdown<T>(
     Ok(InspectedMarkdown {
         value,
         revision,
+        #[cfg(feature = "native-markdown-candidate")]
         byte_count: inspected.byte_count,
+        #[cfg(feature = "native-markdown-candidate")]
         modified_at_ms: inspected.modified_at_ms,
     })
 }
@@ -198,6 +210,7 @@ pub(super) fn sync_directory(path: &Path) -> Result<(), MarkdownWorkspaceError> 
 }
 
 /// Validate a recovery identifier without requiring the original note to remain present.
+#[cfg(feature = "native-markdown-candidate")]
 pub(super) fn validate_conflict_draft_relative_path(
     relative_path: &str,
 ) -> Result<(), MarkdownWorkspaceError> {
@@ -218,6 +231,7 @@ pub(super) fn validate_conflict_draft_relative_path(
 }
 
 /// Map an untrusted relative identifier to a fixed-length private recovery filename.
+#[cfg(feature = "native-markdown-candidate")]
 pub(super) fn conflict_draft_path(recovery_directory: &Path, relative_path: &str) -> PathBuf {
     let digest = Sha256::digest(relative_path.as_bytes());
     let mut file_name = String::with_capacity(digest.len() * 2 + ".draft".len());
@@ -231,6 +245,7 @@ pub(super) fn conflict_draft_path(recovery_directory: &Path, relative_path: &str
 }
 
 /// Accept only a real owner-private recovery directory and distinguish absence from unsafe storage.
+#[cfg(feature = "native-markdown-candidate")]
 pub(super) fn existing_conflict_recovery_directory(
     recovery_directory: &Path,
 ) -> Result<bool, MarkdownWorkspaceError> {
@@ -253,6 +268,7 @@ pub(super) fn existing_conflict_recovery_directory(
 }
 
 /// Create owner-private recovery storage only when an explicit draft write requires it.
+#[cfg(feature = "native-markdown-candidate")]
 pub(super) fn ensure_conflict_recovery_directory(
     recovery_directory: &Path,
 ) -> Result<(), MarkdownWorkspaceError> {
@@ -294,6 +310,7 @@ pub(super) fn ensure_conflict_recovery_directory(
 }
 
 /// Require a regular owner-private file before mapping, replacing, or deleting a recovery record.
+#[cfg(feature = "native-markdown-candidate")]
 pub(super) fn validate_conflict_draft_file(
     metadata: &Metadata,
 ) -> Result<(), MarkdownWorkspaceError> {
@@ -379,6 +396,7 @@ pub(super) fn write_conflict_draft(
 }
 
 /// 固定header只决定合法范围与预算；此函数不借用正文，也不把未固定的源文件声明为不可变。
+#[cfg(feature = "native-markdown-candidate")]
 pub(super) fn conflict_draft_payload_extent(
     header: &[u8],
     record_bytes: usize,
@@ -422,6 +440,7 @@ pub(super) fn conflict_draft_payload_extent(
 }
 
 /// Sync recovery directory metadata with its dedicated user-visible persistence failure.
+#[cfg(feature = "native-markdown-candidate")]
 pub(super) fn sync_conflict_recovery_directory(path: &Path) -> Result<(), MarkdownWorkspaceError> {
     File::open(path)
         .and_then(|directory| {
@@ -435,12 +454,14 @@ pub(super) fn sync_conflict_recovery_directory(path: &Path) -> Result<(), Markdo
 }
 
 /// Exclusive private recovery temporary with descriptor ownership and best-effort rollback.
+#[cfg(feature = "native-markdown-candidate")]
 pub(super) struct TemporaryConflictDraft {
     pub(super) path: PathBuf,
     pub(super) file: File,
     pub(super) armed: bool,
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 impl TemporaryConflictDraft {
     /// Acquire a new owner-private temporary file exclusively and arm rollback before returning it.
     pub(super) fn create(path: &Path) -> std::io::Result<Self> {
@@ -464,6 +485,7 @@ impl TemporaryConflictDraft {
 }
 
 /// Acquire a bounded-attempt private draft temporary without overwriting another in-flight save.
+#[cfg(feature = "native-markdown-candidate")]
 pub(super) fn create_temporary_conflict_draft(
     recovery_directory: &Path,
     save_sequence: &AtomicU64,
@@ -487,6 +509,7 @@ pub(super) fn create_temporary_conflict_draft(
     Err(MarkdownWorkspaceError::ConflictRecoveryUnavailable)
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 impl Drop for TemporaryConflictDraft {
     /// Best-effort rollback of an unpublished temporary file without panicking during teardown.
     fn drop(&mut self) {
@@ -498,12 +521,14 @@ impl Drop for TemporaryConflictDraft {
 }
 
 /// Same-parent save temporary whose ownership transfers only after atomic publication.
+#[cfg(feature = "native-markdown-candidate")]
 pub(super) struct TemporaryMarkdownSave {
     pub(super) path: PathBuf,
     pub(super) file: File,
     pub(super) armed: bool,
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 impl TemporaryMarkdownSave {
     /// Acquire a new owner-private temporary file exclusively and arm rollback before returning it.
     pub(super) fn create(path: &Path) -> std::io::Result<Self> {
@@ -527,6 +552,7 @@ impl TemporaryMarkdownSave {
 }
 
 /// Acquire a same-directory save temporary so final publication can use atomic rename.
+#[cfg(feature = "native-markdown-candidate")]
 pub(super) fn create_temporary_markdown_save(
     parent: &Path,
     save_sequence: &AtomicU64,
@@ -550,6 +576,7 @@ pub(super) fn create_temporary_markdown_save(
     Err(MarkdownWorkspaceError::StorageUnavailable)
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 impl Drop for TemporaryMarkdownSave {
     /// Best-effort rollback of an unpublished temporary file without panicking during teardown.
     fn drop(&mut self) {

@@ -1,6 +1,7 @@
 //! Regression tests preserved with their owning document/workspace boundary.
 
 use std::fs;
+#[cfg(feature = "native-markdown-candidate")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

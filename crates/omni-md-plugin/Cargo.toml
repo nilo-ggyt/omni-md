@@ -10,11 +10,11 @@ repository.workspace = true
 publish = false
 
 [features]
-# 正式源码和预览共用分页 AppKit 输入与有界 Source；验收功能单独显式启用。
+# Source and preview share paged AppKit input and bounded sources; verification requires explicit features.
 default = ["native-markdown-runtime", "native-table-row-append"]
-# 原生运行时启用有界 Core 表格接口；Foundation 读取失败保留原异常 ABI。
+# The native runtime selects bounded Core tables and preserves Foundation's real exception ABI.
 native-markdown-runtime = ["omni-markdown-core/native-markdown-candidate", "omni-markdown-core/s2-table-window-prototype", "objc2/exception", "dep:libc", "native-paged-production"]
-# 正式两种模式直接装配同一有界分页图；只启用产品所需 API，不启用验收入口。
+# Both product modes compose the same bounded paged graph, without enabling verification entry points.
 native-paged-production = [
   "omni-markdown-core/paged-shaping",
   "omni-markdown-core/paged-scripts",
@@ -35,23 +35,23 @@ native-paged-production = [
   "objc2-core-graphics/CGImage",
   "objc2-core-graphics/CGDataProvider",
 ]
-# 显式增加原生验收入口与观察 API；正式分页后端由生产特性装配，不依赖验收开关。
+# Add explicit native verification and observations; the product paged backend does not depend on them.
 native-markdown-runtime-probe = [
   "native-markdown-runtime",
   "objc2-core-text/CTLine",
   "objc2-core-text/CTRun",
   "objc2-core-text/CTTypesetter",
   "objc2/exception",
-  # 原行号鼠标验收在库内读取系统运行时钟，不能借测试依赖的特性合并掩盖缺失绑定。
+  # Native gutter verification needs the real process clock, independent of dev-dependency feature unification.
   "objc2-foundation/NSProcessInfo",
-  # 注释验收借临时公开文本检查控制器，观察完成后必须使其失效并归还。
+  # Annotation verification temporarily owns a public text-checking controller and must invalidate it afterwards.
   "objc2-app-kit/NSTextCheckingController",
   "objc2-app-kit/NSTextCheckingClient",
-  # 合成鼠标验收只观察一个可见格的像素；正式产品不分配验收位图。
+  # Synthetic mouse verification observes one visible cell; product builds allocate no verification bitmap.
   "objc2-app-kit/NSBitmapImageRep",
   "objc2-app-kit/NSImageRep",
-  # 系统组合专项只读原输入法窗口元数据，并创建交给本应用队列的本地 CG 按键。
-  # 明确启用所用绑定，不能依赖独立测试的 dev-dependency 特性合并。
+  # System composition reads the current input-method window metadata and posts local events to this app only.
+  # Declare every required binding here rather than relying on standalone tests' dev dependencies.
   "objc2-app-kit/NSScreen",
   "objc2-app-kit/libc",
   "objc2-core-graphics/CGEvent",
@@ -63,10 +63,10 @@ native-markdown-runtime-probe = [
   "objc2-core-graphics/CGRemoteOperation",
   "dep:libc",
 ]
-# 独立光栅适配实验仍需显式环境开关才分配资源，不成为正式正文的隐式路径。
+# The independent raster comparison requires an explicit environment switch before allocating resources.
 native-raster-surface-probe = [
   "native-markdown-runtime-probe",
-  # 旧TextKit光栅机制对照仍需显式开关，不改变正式Source唯一分页图。
+  # TextKit raster comparison never replaces the product's single paged source graph.
   "dep:objc2-quartz-core",
   "objc2-app-kit/objc2-quartz-core",
   "objc2-foundation/NSOperation",
@@ -77,13 +77,13 @@ native-raster-surface-probe = [
   "objc2-core-graphics/CGAffineTransform",
   "objc2-core-graphics/CGGeometry",
 ]
-# 仅在原表格真实末端接纳追加行；原属性与可见表格生产者继续拥有布局。
+# Append at the actual table endpoint; its existing attributes and visible-window producer retain layout ownership.
 native-table-row-append = ["native-markdown-runtime", "omni-markdown-core/s2-table-window-prototype"]
 native-input-trace = ["native-markdown-runtime"]
 native-table-edit-diagnostic = ["native-markdown-runtime"]
 native-block-fragment-diagnostic = ["native-markdown-runtime"]
 native-close-stage-diagnostic = ["native-markdown-runtime"]
-# 显式观察原生字体来源，不改变正式编辑图或字体资源归属。
+# Observe native font provenance explicitly without replacing the editor graph or its font owners.
 native-paged-font-probe = [
   "native-markdown-runtime",
   "omni-markdown-core/paged-shaping",
@@ -93,19 +93,19 @@ native-paged-font-probe = [
   "objc2-core-foundation/CFNumber",
   "objc2-core-graphics/CGFont",
 ]
-# 同一 Source 的完整字素使用真实候选字体整形；验收入口不替换正式编辑器。
+# Shape complete graphemes from the same source with actual candidate fonts, without replacing the editor.
 native-paged-font-fallback-probe = [
   "native-paged-font-probe",
   "omni-markdown-core/paged-scripts",
-  # 复用原绑定检验真实描述符耗尽与释放，不增加产品进程或另一测试包。
+  # Reuse native bindings to verify descriptor exhaustion and release, without another process or test package.
   "dep:libc",
 ]
-# 只增加分页输入/布局的显式验收入口；实际Source能力由native-paged-production装配。
+# Add explicit paged-input/layout verification; native-paged-production owns the actual source capabilities.
 native-paged-layout-probe = [
   "native-paged-font-probe",
   "omni-markdown-core/paged-layout-breaks",
   "dep:libc",
-  # 分页 NSView 实现公开输入协议，不构造整段 TextKit 字符串。
+  # The paged NSView implements the public input protocol without constructing a whole-paragraph TextKit string.
   "objc2-app-kit/NSTextInputContext",
   "objc2-foundation/NSOperation",
   "dep:objc2-quartz-core",
@@ -115,21 +115,21 @@ native-paged-layout-probe = [
   "objc2-core-graphics/CGImage",
   "objc2-core-graphics/CGDataProvider",
 ]
-# 分页 Find 验收保真实输入和可见性合同；行尚未完成时必须保留 Pending。
+# Find verification preserves actual input and visibility contracts; unfinished lines remain Pending.
 native-paged-find-probe = [
   "native-paged-layout-probe",
 ]
-# 原生客户只消费真实分页行；部分准备不能替代已经封存的 LineEnd。
+# Native clients consume actual paged lines; partial preparation cannot stand in for a sealed LineEnd.
 native-paged-compose-probe = [
   "native-paged-find-probe",
   "omni-markdown-core/paged-line-compose",
 ]
-# 同一个活动行生产者逐步发布前缀，不以整段输出替代真实续体。
+# One active line producer publishes incremental prefixes instead of substituting whole-paragraph output.
 native-paged-frontier-probe = [
   "native-paged-compose-probe",
   "omni-markdown-core/paged-shaping-frontier",
 ]
-# 显式验收同一分页正文与字体回退；正式源码和预览已经直接使用该生产后端。
+# Verify the same paged body and font fallback explicitly; product source and preview already use this backend.
 native-paged-body-probe = [
   "native-paged-frontier-probe",
   "native-paged-font-fallback-probe",
