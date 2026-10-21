@@ -1,8 +1,8 @@
 //! Observes actual native deallocation without retaining any tracked graph object.
 //!
 //! Public Objective-C associations retain timestamp/counter markers, never their source object.
-//! A unique-identity cohort queues one main-thread callback after the last actual release stack.
-//! The callback still has to perform the complete strict weak graph verification.
+//! A unique-identity cohort coalesces its zero-claim notification onto the main thread after the release stack.
+//! The consumer must still reject sticky resource failure and perform complete strict weak graph verification.
 
 #[cfg(any(
     test,
@@ -30,19 +30,19 @@ unsafe extern "C" {
     );
 
     #[cfg(feature = "native-markdown-runtime-probe")]
-    /// 仅原生合同检查自身关联是否仍存在；不读取正文或推断原对象类型。
+    /// Lets the isolated Native contract inspect its own association, without reading text or inferring source-object types.
     fn objc_getAssociatedObject(object: *const AnyObject, key: *const c_void) -> *const AnyObject;
 }
 
-/// 共同 ledger 至多登记1024身份，另有少量显式TextKit根；cohort额外设有限防御上限。
-/// 超限保持观察失败，绝不能截断清单后认证关闭；这里不增加第二份业务或Native强owner。
+/// The shared ledger admits at most 1024 identities, with a few explicit TextKit roots; the cohort adds a finite observation ceiling.
+/// Overflow permanently fails observation rather than certifying a truncated set, without adding business or Native strong ownership.
 const MAX_NATIVE_COHORT_IDENTITIES: usize = 2_048;
 
 /// Main-thread completion metadata contains no view, document, mapping or worker owner.
 struct NativeDeallocationCallback {
     work: RefCell<Option<Box<dyn FnOnce()>>>,
     consumed: Cell<bool>,
-    // 显式原生验收只唤醒一个原场景，不消费父close唯一的生产handler。
+    // Explicit Native acceptance wakes one original scenario without consuming the parent close's sole production handler.
     #[cfg(feature = "native-markdown-runtime-probe")]
     probe_wake: RefCell<Option<Box<dyn FnOnce()>>>,
 }
@@ -52,14 +52,14 @@ struct NativeDeallocationSignals {
     remaining: AtomicUsize,
     relay_queued: AtomicBool,
     cancelled: AtomicBool,
-    // 外部不可变值登记失败仍保留事实；最终零计数不能修复不完整的资源观察。
+    // Retains external-resource registration/release failure; a final zero count cannot repair incomplete resource evidence.
     external_failed: AtomicBool,
     callback: MainThreadBound<std::rc::Weak<NativeDeallocationCallback>>,
     started: Instant,
     completed_after_ns: AtomicU64,
 }
 
-/// 家族只持这个原子观察者，既不保Native对象，也不捕获正文、映射或主线程业务闭包。
+/// The family retains only this atomic observer, without Native objects, document text, mappings, or main-thread business closures.
 #[cfg(any(
     test,
     all(
@@ -82,25 +82,25 @@ struct FrozenValueCohortObserver {
 impl FrozenValueReleaseObserver for FrozenValueCohortObserver {
     fn released(&self) {
         if self.delivered.swap(true, Ordering::AcqRel) {
-            // 同一原子观察槽只能消费一次真实家族析构事件；重复不能再减计数冒充资源释放。
+            // Consumes the actual family-destruction event once; duplicates cannot decrement claims again and impersonate resource release.
             self.signals.external_failed.store(true, Ordering::Release);
             return;
         }
-        // seal且所有具体源/值claim真实Drop后，家族才发此事件。它只归还本cohort的外部观察claim。
-        // 此处可能在Foundation后台析构栈中；原signals仅排主线程续体，仍须核完整既有弱图。
+        // The family emits this event only after sealing and actual Drop of all source/value claims; releases only this cohort's external observation claim.
+        // This may run on a Foundation background destruction stack; signals queues only the main-thread continuation, which must still verify the original weak graph.
         self.signals.release_claim();
     }
 
     fn is_cancelled(&self) -> bool {
-        self.signals.cancelled.load(Ordering::Acquire) // 不获取家族锁或访问任何Native/正文对象。
+        self.signals.cancelled.load(Ordering::Acquire) // Reads only atomics, without the family lock or any Native/document object.
     }
 }
 
 impl NativeDeallocationSignals {
-    /// Release one builder/marker claim; only the final actual claim makes completion eligible.
+    /// Releases one registered claim; reaching zero permits a relay, while final release validation still checks failure and the original weak graph.
     fn release_claim(self: &Arc<Self>) {
-        // The builder contributes one claim and each unique associated marker contributes exactly
-        // one more; the runtime removes each marker once, so the previous count is always positive.
+        // The builder, each unique associated marker, and each admitted external obligation own
+        // one claim. Their consuming release paths balance exactly once, so the prior count is positive.
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             // Publish timing before making a relay eligible, including a concurrent handler installation.
             self.completed_after_ns.store(
@@ -115,7 +115,8 @@ impl NativeDeallocationSignals {
         }
     }
 
-    /// Coalesce a completed cohort into one callback, including completion before handler installation.
+    /// Coalesces a terminal claim count into one relay, including retirement before handler installation.
+    /// The consumer separately checks actual completion and the original graph before accepting release.
     fn queue_if_complete(self: &Arc<Self>) {
         if self.cancelled.load(Ordering::Acquire)
             || self.remaining.load(Ordering::Acquire) != 0
@@ -152,8 +153,8 @@ impl NativeDeallocationSignals {
             #[cfg(feature = "native-markdown-runtime-probe")]
             let probe_wake = {
                 let wake = callback.probe_wake.borrow_mut().take();
-                // 两个原槽都已取出且没有借用；验收先消费真实完成后，未来父close仍可
-                // 给尚未消费的生产槽安装handler，并从同一remaining==0事实重新排原relay。
+                // Both slots are taken outside their borrows. After this probe consumes the terminal observation,
+                // a later parent close may still install its unconsumed production handler and relay the same zero-claim fact.
                 signals.relay_queued.store(false, Ordering::Release);
                 wake
             };
@@ -168,12 +169,12 @@ impl NativeDeallocationSignals {
             }
             #[cfg(feature = "native-markdown-runtime-probe")]
             if let Some(wake) = probe_wake {
-                // relay入口已核真实释放，且本次观察已从原槽取出。生产handler正常消费
-                // 原cohort会执行Drop并撤销后续观察，却不能抹掉本次已经发生的释放事实。
-                // 只有work正常返回才到这里；panic不经finally交付。观察者仍须核自己原弱
-                // owner与在途终点，不能借此通知复活已关闭的业务或把资源完成当作安装成功。
+                // Relay entry observed the original terminal claim count and removed this wake from its slot.
+                // A production handler may drop the cohort and cancel future observations without erasing this terminal observation.
+                // Delivery requires work to return normally; panic does not deliver through a finally path. The listener must
+                // still check its original weak owner and terminal resource facts, without reviving closed work or inferring installation success.
                 wake();
-            } // 进入relay以前的取消仍在上方拒绝；所有闭包始终在槽借用之外归还。
+            } // Cancellation before relay entry is rejected above; all closures are released outside slot borrows.
         });
     }
 }
@@ -207,12 +208,12 @@ pub(super) struct NativeMarkdownDeallocationCohort {
     callback: Rc<NativeDeallocationCallback>,
     signals: Arc<NativeDeallocationSignals>,
     identities: HashSet<usize>,
-    // 这些Weak仅用于cohort结束时卸载自己的marker；原对象寿命不受本集合影响。
+    // These Weak references permit removing this cohort's own markers at retirement without extending source-object lifetime.
     observed: Vec<Weak<AnyObject>>,
     sealed: bool,
 }
 
-/// 一份真实外部资源的归还义务；只保cohort原子事实，不保资源本身或主线程业务图。
+/// Owns one actual external resource's return obligation, retaining only cohort atomics rather than the resource or main-thread business graph.
 #[cfg(any(
     feature = "native-raster-surface-probe",
     feature = "native-paged-production"
@@ -226,7 +227,7 @@ pub(in crate::native_surface) struct NativeMarkdownDeallocationClaim {
     feature = "native-paged-production"
 ))]
 impl NativeMarkdownDeallocationClaim {
-    /// 调用方已经完成真实资源归还；取走原claim后，重复析构不能再发送完成。
+    /// The caller already returned the actual resource; consumes its claim so later Drop cannot signal completion again.
     pub(in crate::native_surface) fn release(mut self) {
         self.signals
             .take()
@@ -242,7 +243,7 @@ impl NativeMarkdownDeallocationClaim {
 impl Drop for NativeMarkdownDeallocationClaim {
     fn drop(&mut self) {
         if let Some(signals) = self.signals.take() {
-            // 未获真实归还就丢弃观察是失败，不把元数据Drop冒充资源成功结束。
+            // Dropping an unreturned obligation records failure; metadata Drop cannot stand in for successful resource release.
             signals.external_failed.store(true, Ordering::Release);
             signals.release_claim();
         }
@@ -250,7 +251,7 @@ impl Drop for NativeMarkdownDeallocationClaim {
 }
 
 impl NativeMarkdownDeallocationCohort {
-    /// 在seal前接纳一个外部资源义务；最后真实归还仍走同一主线程一次relay。
+    /// Admits an external resource obligation before sealing; its final return participates in the same coalesced main-thread relay.
     #[cfg(any(
         feature = "native-raster-surface-probe",
         feature = "native-paged-production"
@@ -262,7 +263,7 @@ impl NativeMarkdownDeallocationCohort {
             signals: Some(Arc::clone(&self.signals)),
         }
     }
-    /// cfg只读signals；没有fetch/sub/swap、回调安装或释放授权，不替代has_completed。
+    /// Reads diagnostic atomics only, without counter mutation, callback installation, or release authority; does not replace has_completed.
     #[cfg(feature = "native-close-stage-diagnostic")]
     pub(super) fn diagnostic_state(&self) -> (usize, bool, bool) {
         (
@@ -298,7 +299,7 @@ impl NativeMarkdownDeallocationCohort {
         }
     }
 
-    /// 在原角色cohort中登记一个完整家族事实；动态派生值由家族的真实claim逐一结算。
+    /// Registers one complete family observation in the original role's cohort; actual family claims account for dynamically derived values.
     #[cfg(any(
         test,
         all(
@@ -320,7 +321,7 @@ impl NativeMarkdownDeallocationCohort {
             })
             .is_err()
         {
-            // 计数不再精确时不能签发关闭完成；不制造没有对应计数的新观察者。
+            // An unrepresentable count cannot certify closure; creates no observer without its corresponding claim.
             self.signals.external_failed.store(true, Ordering::Release);
             return;
         }
@@ -329,30 +330,30 @@ impl NativeMarkdownDeallocationCohort {
             delivered: AtomicBool::new(false),
         });
         if family.observe(role, observer).is_err() {
-            // 登记没有成立，归还的是该次临时登记claim。失败标量永久禁止把此cohort认证为完成。
+            // Failed registration returns only its temporary admission claim; the sticky failure permanently prevents successful completion certification.
             self.signals.external_failed.store(true, Ordering::Release);
             self.signals.release_claim();
         }
     }
 
-    /// 每个实际原生身份安装本cohort自己的关联；保留Weak只为对称卸载，绝不保活原对象。
+    /// Installs this cohort's own association on each actual Native identity; Weak records support symmetric removal without retaining the source.
     pub(super) fn track(&mut self, object: &AnyObject, mtm: MainThreadMarker) {
         assert!(!self.sealed, "native cohort registration already ended");
         let address = std::ptr::from_ref(object).addr();
         if self.identities.contains(&address) {
-            // 构造阶段地址也可能复用；只有同地址的旧Weak仍真活着才是同一原生生命周期。
+            // Addresses may be reused even during construction; only the actual original live Weak proves the same Native lifetime.
             let duplicate = self.observed.iter().any(|weak| {
                 weak.load()
                     .as_deref()
                     .is_some_and(|actual| std::ptr::eq(actual, object))
             });
             if duplicate {
-                return; // 同一对象的多个角色只产生一个marker/真实析构claim。
+                return; // Multiple roles for the same object share one marker and actual-deallocation claim.
             }
         }
         if self.observed.len() >= MAX_NATIVE_COHORT_IDENTITIES {
             self.signals.external_failed.store(true, Ordering::Release);
-            return; // 失败是永久事实，不安装无法在结束时精确卸载的新关联。
+            return; // Failure remains sticky; installs no association that cannot be removed precisely at retirement.
         }
         if self
             .signals
@@ -363,20 +364,20 @@ impl NativeMarkdownDeallocationCohort {
             .is_err()
         {
             self.signals.external_failed.store(true, Ordering::Release);
-            return; // 计数无法表达时不制造没有配对claim的marker。
+            return; // An unrepresentable count creates no marker without a matching claim.
         }
-        // 入集合在安装关联之前完成；Native构造/释放可重入，最终Drop仍能找到本次原身份。
+        // Records identity before installing the association; Native construction/release may reenter, and final Drop must still find this original identity.
         self.identities.insert(address);
         self.observed.push(Weak::new(object));
         let marker =
             NativeMarkdownDeallocationMarker::alloc(mtm).set_ivars(NativeDeallocationMarkerIvars {
                 signals: Arc::clone(&self.signals),
             });
-        // SAFETY: 标准NSObject初始化前全部ivars已安装；marker仅含Send/Sync原子元数据。
+        // SAFETY: All ivars precede standard NSObject initialization; the marker holds only Send/Sync atomic metadata.
         let marker: Retained<NativeMarkdownDeallocationMarker> =
             unsafe { msg_send![super(marker), init] };
-        // SAFETY: 公开runtime ABI；唯一Arc地址只标识本cohort的key。原对象retain marker，
-        // marker没有原对象回链；Drop卸载也只移除此key，不能触碰其他cohort或原对象内容。
+        // SAFETY: The public runtime ABI uses the unique live Arc address solely as this cohort's key. The source retains its marker,
+        // which has no reverse source edge; Drop removes only this key, preserving other cohorts and source contents.
         unsafe {
             objc_setAssociatedObject(
                 std::ptr::from_ref(object),
@@ -391,7 +392,7 @@ impl NativeMarkdownDeallocationCohort {
     pub(super) fn seal(&mut self) {
         assert!(!self.sealed, "native cohort registration ended twice");
         self.sealed = true;
-        // 地址索引只服务构造去重；剩余有限Weak保留到cohort结束，以便卸载未析构原值上的本marker。
+        // The address index serves construction deduplication only; bounded Weak records survive until retirement to remove markers from still-live values.
         self.identities = HashSet::new();
         self.signals.release_claim();
     }
@@ -411,7 +412,7 @@ impl NativeMarkdownDeallocationCohort {
         self.signals.queue_if_complete();
     }
 
-    /// 只给既有Source场景安装一次有限唤醒；实际零claim沿同一relay交付，生产完成槽仍归父close。
+    /// Installs one bounded wake for the existing Source scenario; the same relay reports zero claims while the production slot remains owned by parent close.
     #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn probe_when_released(&self, wake: impl FnOnce() + 'static) {
         assert!(
@@ -440,7 +441,7 @@ impl NativeMarkdownDeallocationCohort {
         let probe_wake = self.callback.probe_wake.borrow_mut().take();
         #[cfg(feature = "native-markdown-runtime-probe")]
         drop(probe_wake);
-        drop(work); // 回调捕获的析构允许重新借槽或调用Native；此时全部RefCell借用已经结束。
+        drop(work); // Callback-capture destruction may borrow slots or call Native; all RefCell borrows have ended first.
         if let Some(panel) = panel {
             // SAFETY: the caller transiently owns this live main-thread panel. The stable Arc key
             // identifies only this observer's association; nil removes that marker, not another
@@ -496,7 +497,7 @@ impl NativeMarkdownDeallocationCohort {
 
 impl Drop for NativeMarkdownDeallocationCohort {
     fn drop(&mut self) {
-        // 先撤权，再析构任何回调捕获或关联marker；主动卸载只完成观察清理，不是原对象析构收据。
+        // Revokes authority before dropping callback captures or markers; explicit removal cleans observation but cannot certify source-object destruction.
         self.signals.cancelled.store(true, Ordering::Release);
         let work = self.callback.work.borrow_mut().take();
         self.callback.consumed.set(true);
@@ -504,12 +505,12 @@ impl Drop for NativeMarkdownDeallocationCohort {
         let probe_wake = self.callback.probe_wake.borrow_mut().take();
         #[cfg(feature = "native-markdown-runtime-probe")]
         drop(probe_wake);
-        drop(work); // 必须在借用外释放，捕获的Drop可能重入同一原生/资源边界。
+        drop(work); // Releases outside borrows because captured Drop may reenter the same Native/resource boundary.
         let observed = std::mem::take(&mut self.observed);
         for weak in observed {
             if let Some(object) = weak.load() {
-                // SAFETY: 原Weak本次临时升级保证接收者活着；只清稳定原signals地址的本key。
-                // 本marker真实析构会配平自己的计数，但cancelled已经永久禁止完成与relay授权。
+                // SAFETY: This temporary original Weak upgrade keeps the receiver live; removes only the stable signals-address key.
+                // Actual marker destruction balances its claim, while cancellation permanently revokes completion and relay authority.
                 unsafe {
                     objc_setAssociatedObject(
                         std::ptr::from_ref(&*object),
@@ -518,16 +519,17 @@ impl Drop for NativeMarkdownDeallocationCohort {
                         1,
                     );
                 }
-            } // 已真实nil的对象无需清理；cancel_observation已移除的key也不会再次析构marker。
+            } // An actually nil object needs no removal; a key already removed by cancel_observation cannot destroy its marker again.
         }
         if !self.sealed {
-            // 构造失败仍要配平builder；取消已在所有Native清理之前生效，不能产生成功完成信号。
+            // Failed construction still balances its builder claim; cancellation preceded all Native cleanup and prevents a successful completion signal.
             self.signals.release_claim();
         }
     }
 }
 
-/// Verify actual runtime marker destruction and duplicate-role accounting before constructing TextKit.
+/// Verifies project marker lifetime rules using isolated actual NSObject associations.
+/// This scoped runtime contract does not certify document UI, whole-product release, or peak RSS.
 #[cfg(feature = "native-markdown-runtime-probe")]
 pub(super) fn verify_native_markdown_deallocation_accounting(
     mtm: MainThreadMarker,
@@ -607,8 +609,8 @@ pub(super) fn verify_native_markdown_deallocation_accounting(
         )
     ))]
     {
-        // 普通probe没有冻结值构造者；只在真实家族路径或同源单测验证这两个释放反例。
-        // 三个关闭角色必须等待同一真实家族，不能只等原始SourceClaim或任意一个父对象结束。
+        // Ordinary probes have no frozen-value constructor; exercise these cases only where the actual family path is compiled.
+        // All three close roles must wait for the same actual family, not merely the original SourceClaim or an arbitrary parent object.
         let family = FrozenValueFamily::new();
         let source = family.claim_source().map_err(|error| error.to_string())?;
         let value = source
@@ -632,7 +634,7 @@ pub(super) fn verify_native_markdown_deallocation_accounting(
         if !editor.has_completed() || !full.has_completed() || !resources.has_completed() {
             return Err("真实冻结值析构没有完成三个原资源角色".into());
         }
-        // 同一角色的旧观察只有明确取消才可替换；不会把旧取消收据重新解释为释放。
+        // Replaces an old observation for the same role only after explicit cancellation; never relabels its cancelled receipt as release.
         let family = FrozenValueFamily::new();
         let source = family.claim_source().map_err(|error| error.to_string())?;
         let mut earlier = NativeMarkdownDeallocationCohort::new(mtm);
@@ -659,14 +661,14 @@ pub(super) fn verify_native_markdown_deallocation_accounting(
         )) {
             " frozen_value_three_roles frozen_value_cancelled_role"
         } else {
-            "" // 未编译的家族检查不进入成功标签，原Native marker检查仍完整执行。
+            "" // Uncompiled family checks contribute no success label; the actual Native marker checks still run in full.
         }
     );
     Ok(())
 }
 
 #[cfg(feature = "native-markdown-runtime-probe")]
-/// 回调取消的实际析构检查；只持Rust弱槽与有限标量，不持被观察Native或业务正文。
+/// Observes actual callback-capture destruction during cancellation, retaining only Rust weak slots and finite scalars, not Native sources or document text.
 struct CancelledCallbackDropProbe {
     callback: std::rc::Weak<NativeDeallocationCallback>,
     dropped: Rc<Cell<bool>>,
@@ -680,27 +682,27 @@ impl Drop for CancelledCallbackDropProbe {
         let clear = self.callback.upgrade().is_some_and(|callback| {
             callback.work.try_borrow_mut().is_ok() && callback.probe_wake.try_borrow_mut().is_ok()
         });
-        self.borrow_clear.set(clear); // 真正在捕获析构中借槽，不能靠源码顺序或标量假设通过。
+        self.borrow_clear.set(clear); // Actually borrows the slots during capture destruction rather than inferring safety from source order or an assumed flag.
     }
 }
 
 #[cfg(feature = "native-markdown-runtime-probe")]
-/// 只取得原对象上本key实际marker的Weak；调用期间原对象和关联本身提供临时生命期。
+/// Obtains Weak only to this key's actual marker; the live source and association provide its lifetime during this synchronous call.
 fn associated_marker_weak(
     object: &AnyObject,
     signals: &Arc<NativeDeallocationSignals>,
 ) -> Result<Weak<AnyObject>, String> {
-    // SAFETY: 接收者为本合同持有的活NSObject，key为仍活Arc的原地址；仅读取本观察关联。
+    // SAFETY: The contract retains this live NSObject; the key is the original live Arc address, and only this observation's association is read.
     let marker = unsafe {
         objc_getAssociatedObject(std::ptr::from_ref(object), Arc::as_ptr(signals).cast())
     };
-    // SAFETY: 非空结果仍由活原对象的同key关联拥有，本同步调用内不移除该关联。
+    // SAFETY: The live source's same-key association still owns the nonnull result and is not removed during this synchronous call.
     let marker = unsafe { marker.as_ref() }.ok_or("原生合同没有取得实际关联marker")?;
     Ok(Weak::new(marker))
 }
 
 #[cfg(feature = "native-markdown-runtime-probe")]
-/// 在仍活原对象上Drop一份cohort，核其marker与signals真正归还且另一cohort仍独立等待。
+/// Drops one cohort while the actual source lives, checking real marker/signal release while another cohort independently waits.
 fn verify_dropped_cohort_unloads_own_marker(mtm: MainThreadMarker) -> Result<(), String> {
     for explicitly_cancelled in [false, true] {
         let object = NSObject::new();
@@ -725,7 +727,7 @@ fn verify_dropped_cohort_unloads_own_marker(mtm: MainThreadMarker) -> Result<(),
         };
         let called = Rc::clone(&callback_called);
         discarded.when_released(move || {
-            // 此闭包绝不该执行；捕获probe的真实Drop验证取消不会在RefCell借用内析构业务捕获。
+            // This cancelled callback must never execute; the captured probe's actual Drop checks that cancellation releases captures outside RefCell borrows.
             drop(probe);
             called.set(true);
         });
@@ -739,7 +741,7 @@ fn verify_dropped_cohort_unloads_own_marker(mtm: MainThreadMarker) -> Result<(),
         };
         let called = Rc::clone(&wake_called);
         discarded.probe_when_released(move || {
-            // 原对象仍活时取消观察，验收槽同样只归还捕获，不能投递一次伪完成。
+            // Cancelling observation of a live source also releases probe captures without delivering a fabricated completion.
             drop(wake_probe);
             called.set(true);
         });
@@ -748,7 +750,7 @@ fn verify_dropped_cohort_unloads_own_marker(mtm: MainThreadMarker) -> Result<(),
             if discarded.has_completed() || signals.remaining.load(Ordering::Acquire) != 0 {
                 return Err("显式取消被错误解释为原对象实际析构".into());
             }
-        } // 另一分支直接Drop仍在等待的cohort，不能依赖调用者先显式取消。
+        } // The other branch directly drops the waiting cohort, without assuming callers explicitly cancel first.
         drop(discarded);
         if discarded_marker.load().is_some()
             || !signals.cancelled.load(Ordering::Acquire)

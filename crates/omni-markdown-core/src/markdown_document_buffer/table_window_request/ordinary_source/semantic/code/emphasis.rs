@@ -1,4 +1,5 @@
-//! 一个真实 Root 块的强调匹配栈；记录追加到匿名文件，RAM 只保固定2KiB尾页和当前匹配。
+//! Emphasis matching for one actual root block. Records append to the shared anonymous file;
+//! retained RAM consists of its fixed 2-KiB tail page and the current matching state.
 
 use super::*;
 use crate::markdown_document_buffer::table_source::inline_stack::{
@@ -47,7 +48,8 @@ pub(in crate::markdown_document_buffer) struct EmphasisJob {
 }
 
 impl EmphasisJob {
-    /// 仅为真实顺序delimiter分配固定匹配状态；匿名页仍延迟到第一次opener入栈。
+    /// Initialize fixed state for the original ordered delimiter stream. The anonymous storage page
+    /// remains lazy until the first opener is actually pushed.
     pub(in crate::markdown_document_buffer) fn new(
         options: pulldown_cmark::Options,
         source: Range<usize>,
@@ -71,7 +73,8 @@ impl EmphasisJob {
         }
     }
 
-    /// run来自同一个Root游标的最终顺序，HTML/code内容没有进入此栈的入口。
+    /// Consume final-order runs from the same root cursor; HTML and code contents never enter this
+    /// matching stack as emphasis delimiters.
     pub(in crate::markdown_document_buffer) fn start(
         &mut self,
         proof: VerifiedInlineEmphasisRun,
@@ -84,7 +87,7 @@ impl EmphasisJob {
             || range.end > scope.end
         {
             return Err(MarkdownTableRequestError::InvalidRequest);
-        } // scope 来自原 cursor 的已认证 Root/Link label，不能跨 label 与外层 opener 配对。
+        } // The cursor proved this root/link-label scope; matching cannot cross its original boundary.
         let both = proof.can_open() && proof.can_close();
         self.run = Some(Run {
             start: proof.source_range().start,
@@ -103,8 +106,9 @@ impl EmphasisJob {
         Ok(())
     }
 
-    /// 原 Link proof 先于其 label 发出，停放外层已完成 run 的匹配头，再用同文件开始独立配对。
-    /// 没有新的 FD/正文 owner；label 未匹配 opener 在 LinkEnd 被丢弃，绝不泄露到外层。
+    /// Before a verified link's label arrives, suspend the outer completed-run matching head and
+    /// start independent matching in the same file. No second descriptor/body owner is created;
+    /// unmatched label openers are discarded at LinkEnd rather than leaking into the outer scope.
     pub(in crate::markdown_document_buffer) fn enter_link(
         &mut self,
         proof: &VerifiedInlineLink,
@@ -124,8 +128,9 @@ impl EmphasisJob {
             structural_transitions: PLAIN_CONTROL,
             ..Default::default()
         };
-        // 嵌套Image/Link保存的是原外层scope完整匹配头与九个失败下界；只把最顶层留RAM。
-        // 页刷写未完成时不改变当前scope，后继仍消费同一proof，绝不再次接纳另一个Begin。
+        // Nested image/link scopes preserve the complete outer head and nine failure bounds in the
+        // file, retaining only the top scope in RAM. An unfinished page flush leaves the current
+        // scope unchanged so the next quantum resumes this proof instead of admitting another Begin.
         let previous = if let Some(outer) = self.link.as_ref() {
             match file.append_scope(outer, quota, budget)? {
                 RecordStep::Progress { work } => return Ok((work, false)),
@@ -153,8 +158,9 @@ impl EmphasisJob {
         Ok((work, true))
     }
 
-    /// End必须与当前真实owner/label严格相同；只从同文件恢复一个原scope，不搜索祖先或重建AST。
-    /// 先成功读取旧checkpoint再移交RAM状态，短读/IO失败不会把部分恢复状态交给后继run。
+    /// Match End against the exact current owner/label and restore one original scope from the same
+    /// file, without searching ancestors or rebuilding an AST. Read its checkpoint before moving RAM
+    /// state so a short read/I/O error cannot expose a partially restored scope to subsequent runs.
     pub(in crate::markdown_document_buffer) fn leave_link(
         &mut self,
         source: &Range<usize>,
@@ -191,7 +197,8 @@ impl EmphasisJob {
         Ok(work)
     }
 
-    /// 每次重新匹配都用剩余栈的真实深度和原run_length，不以消费后的count改变mod3规则。
+    /// Restart with the remaining stack's actual depth and original run_length; consumed count must
+    /// not change the delimiter's mod3 classification.
     fn begin_search(&mut self) {
         let run = self.run.as_ref().unwrap();
         self.search = self.head;
@@ -201,12 +208,14 @@ impl EmphasisJob {
             .min(self.depth);
     }
 
-    /// Source游标只在本run完全处理后继续；不能把中途匹配当成全块样式已经闭合。
+    /// The source cursor resumes only after this run completes. An intermediate match does not prove
+    /// that all block styles have closed.
     pub(in crate::markdown_document_buffer) fn busy(&self) -> bool {
         !matches!(self.phase, Phase::Idle)
     }
 
-    /// 一步最多一次record读写或一个真实匹配span；不在量子内遍历整栈或整条巨大delimiter run。
+    /// Perform at most one record read/write or emit one actual matched span; never traverse the
+    /// entire stack or a giant delimiter run inside one quantum.
     pub(in crate::markdown_document_buffer) fn advance(
         &mut self,
         quota: &MarkdownTableWindowQuota,
@@ -274,7 +283,7 @@ impl EmphasisJob {
                     let body = if width <= count {
                         whole.start + width..whole.end - width
                     } else {
-                        whole.clone() // 原presentation无法识别这个delimiter宽度时只保style，绝不猜marker。
+                        whole.clone() // Preserve the style without inventing marker width when presentation cannot identify it.
                     };
                     return Ok((
                         work,
@@ -352,13 +361,15 @@ impl EmphasisJob {
         Ok((work, None))
     }
 
-    /// 原块结束后算法状态不再授予任何span；唯一文件由共同underline事务在最后消费者后关闭。
+    /// End algorithmic scope authority for the completed block. The shared underline transaction
+    /// closes the unique file after its last consumer finishes.
     pub(in crate::markdown_document_buffer) fn finish(&mut self) {
         self.link = None;
     }
 }
 
-/// 只映射原kernel签发的标签类别；Source权限和完整块终点仍由父job保有。
+/// Map only categories issued by the original kernel. The parent retains Source authority and the
+/// complete block endpoint.
 fn presentation_style(style: EmphasisStyle) -> Option<MarkdownPresentationStyles> {
     Some(match style {
         EmphasisStyle::Literal => return None,
@@ -366,7 +377,8 @@ fn presentation_style(style: EmphasisStyle) -> Option<MarkdownPresentationStyles
         EmphasisStyle::Strong => MarkdownPresentationStyles::STRONG,
         EmphasisStyle::Strikethrough => MarkdownPresentationStyles::STRIKETHROUGH,
         EmphasisStyle::Subscript => MarkdownPresentationStyles::SUBSCRIPT,
-        // 原kernel只可由启用的选项签发此标签；本产品不启用该扩展，也不将其伪装成普通完成态。
+        // The kernel can issue this tag only for an enabled option. The product disables the
+        // extension, so reaching it is a programming error rather than a plain successful result.
         EmphasisStyle::Superscript => unreachable!("未启用上标扩展"),
     })
 }

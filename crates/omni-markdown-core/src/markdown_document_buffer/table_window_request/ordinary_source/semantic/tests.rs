@@ -1,10 +1,11 @@
-//! 完整旧投影仅作为有限合成夹具的独立样式 oracle，不进入产品请求。
+//! Complete reference projection is an independent style oracle for finite synthetic fixtures, not part of product requests.
 
 use super::*;
 use crate::markdown_viewport_presentation::MarkdownViewportPresentation;
 use pulldown_cmark::{Event, Parser, Tag};
 
 fn document(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+    // Use a private real UTF-8 file and the public buffer opener; the returned directory retains responsibility for fixture cleanup.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("有限普通语义验收.md");
     std::fs::write(&path, source).unwrap();
@@ -20,7 +21,7 @@ fn authority(document: &MarkdownDocumentBuffer) -> MarkdownViewportSourceAuthori
     }
 }
 
-/// 测试只推进原单端点，不启用同片续用；真实读入字节作为联合请求减少重复读取的独立对照。
+/// Drive one original endpoint without subpiece reuse, providing independent actual-read totals for the joint request's reuse comparison.
 fn finish_position(document: &MarkdownDocumentBuffer, locator: &mut PositionLocator) -> usize {
     let mut source_bytes = 0;
     for _ in 0..100 {
@@ -35,7 +36,7 @@ fn finish_position(document: &MarkdownDocumentBuffer, locator: &mut PositionLoca
 }
 
 #[test]
-/// 同一OriginalSpan节点仍有多个真实ordinal；附近不同片和远处同ordinal都不能继承原前缀。
+/// One OriginalSpan node has multiple actual ordinals; neither nearby different pieces nor distant equal ordinals inherit its prefix.
 fn position_prefix_reuse_requires_original_leaf_ordinal_and_logical_coordinates() {
     let (_directory, doc) = document(&"a".repeat(100_000));
     let mut first = PositionLocator::new(161, false);
@@ -76,7 +77,7 @@ fn position_prefix_reuse_requires_original_leaf_ordinal_and_logical_coordinates(
 }
 
 #[test]
-/// 半代理项的floor结果不等于读到的scalar尾，ceil也不能把目标仍在scalar内的另一票提升到尾端。
+/// Surrogate-interior floor differs from the consumed scalar end; ceil cannot promote another target inside that scalar to its tail.
 fn position_prefix_reuse_preserves_non_bmp_floor_ceil_and_incomplete_scalar() {
     let (_directory, doc) = document("😀z\n");
     let mut floor = PositionLocator::new(1, false);
@@ -116,7 +117,7 @@ fn finish(
     request: &mut MarkdownViewportSourceRequest,
     document: &MarkdownDocumentBuffer,
 ) -> Result<(), MarkdownTableRequestError> {
-    // 最小公开4096量子必须真实推进；每个实际来源/转换/输出步骤仍受单步硬上限约束。
+    // The minimum public 4096-unit step must progress while each source/conversion/output field stays within its step limit.
     for _ in 0..document
         .byte_len()
         .saturating_mul(100)
@@ -139,6 +140,7 @@ fn finish(
 }
 
 #[test]
+// The default style is a positive semantic result inside this exact coverage, while adjacent positions remain unproved.
 fn root_plain_finite_query_matches_complete_projection() {
     let source = "普通中文😀第一行\r\n第二行没有特殊符号\r\n";
     let (_directory, doc) = document(source);
@@ -164,7 +166,7 @@ fn root_plain_finite_query_matches_complete_projection() {
         &requested
     );
     for index in requested.clone() {
-        // 完整 pinned Parser 的旧投影给出期望值，不能由新 runs 反推自身正确性。
+        // The complete pinned Parser's reference projection supplies expectations independently of the new runs.
         assert_eq!(
             ready
                 .query_for(&doc, authority(&doc), index)
@@ -193,6 +195,7 @@ fn root_plain_finite_query_matches_complete_projection() {
 }
 
 #[test]
+// Original Setext ownership and distant underline context jointly determine marker visibility for both active and inactive selection.
 fn setext_marker_crlf_and_real_global_underline_match_complete_projection() {
     for source in [
         "   中文标题😀  \r\n  ===  \r\n\r\n另一段\n",
@@ -212,7 +215,7 @@ fn setext_marker_crlf_and_real_global_underline_match_complete_projection() {
         let requested = source[..heading.start].encode_utf16().count()
             ..source[..heading.end].encode_utf16().count();
         for caret in [requested.start, source.encode_utf16().count()] {
-            // 两个真实 Core 选区分别覆盖 active/inactive owner；不只检查样式位存在。
+            // Two actual Core selections exercise active/inactive owners, rather than checking only that a style bit exists.
             let (_directory, mut doc) = document(source);
             doc.set_selection(MarkdownTextSelection::caret(caret))
                 .unwrap();
@@ -233,7 +236,7 @@ fn setext_marker_crlf_and_real_global_underline_match_complete_projection() {
                 .rebuild(doc.generation(), 0..doc.utf16_len(), source)
                 .unwrap();
             for index in requested.clone() {
-                // 远处 <u> 配对与 Setext owner 都来自完整原源；省略段不能重设其上下文。
+                // Distant underline pairs and Setext ownership come from the complete original source; omitted text cannot reset context.
                 assert_eq!(
                     ready
                         .query_for(&doc, authority(&doc), index)
@@ -255,6 +258,7 @@ fn setext_marker_crlf_and_real_global_underline_match_complete_projection() {
 }
 
 #[test]
+// A finite viewport in a giant line proves only its actual scanned prefix and must not copy that line into a bounded-context Parser.
 fn giant_unicode_line_proves_only_actual_finite_byte_coverage() {
     let source = format!("{}\r\n", "中".repeat(100_000));
     let (_directory, doc) = document(&source);
@@ -264,7 +268,7 @@ fn giant_unicode_line_proves_only_actual_finite_byte_coverage() {
         .unwrap();
     finish(&mut request, &doc).unwrap();
     let semantic = request.semantic.as_ref().unwrap();
-    // 独立按固定三字节中文 scalar 计算边界；300KiB 原行不能被整块交给256KiB上下文入口。
+    // Derive boundaries independently from fixed three-byte CJK scalars; the 300-KiB line cannot enter the 256-KiB context path whole.
     assert_eq!(
         semantic.byte_coverage,
         Some(requested.start * 3..requested.end * 3)
@@ -301,6 +305,7 @@ fn giant_unicode_line_proves_only_actual_finite_byte_coverage() {
 }
 
 #[test]
+// Continue the original plain prefix into later real direct-link syntax while keeping all earlier immutable publications limited to their old coverage.
 fn forward_prefix_keeps_original_publications_and_streams_later_direct_link() {
     let mut source = (0..120)
         .map(|line| format!("第{line}行中😀\r\n"))
@@ -357,7 +362,7 @@ fn forward_prefix_keeps_original_publications_and_streams_later_direct_link() {
         .as_ref()
         .unwrap()
         .total_work();
-    // 真实 child 累计读取只增加原前缀到新末端的差；固定内存地址相同不足以证明未重建游标。
+    // Actual cumulative child reads grow only by the original-prefix/new-end difference; equal addresses alone cannot prove cursor reuse.
     assert_eq!(
         after.byte_reads - before.byte_reads,
         starts[31] - starts[25]
@@ -433,8 +438,8 @@ fn forward_prefix_keeps_original_publications_and_streams_later_direct_link() {
         ready.block_source_range_for(&doc, authority(&doc)).unwrap(),
         0..source.len()
     );
-    // 从完整Parser取得owner和真实child label；新pub逐位置保护marker/目标显隐与点击权限。
-    // 首两批旧pub仍只对自己原覆盖有效，不能因同源后缀Ready而扩大旧票权限。
+    // Obtain owner and actual child label from the complete Parser; compare each new-publication position's visibility and click authority.
+    // The first two publications retain only their own coverage; a Ready suffix on the same Source cannot expand old tickets.
     for index in requested.clone() {
         assert_eq!(
             ready
@@ -501,7 +506,7 @@ fn forward_prefix_keeps_original_publications_and_streams_later_direct_link() {
         std::fs::read(directory.path().join("有限普通语义验收.md")).unwrap(),
         source.as_bytes()
     );
-    // source/pub只保Weak及不可变URI；即使三份pub与请求仍活，真正Doc退休也必须释放mmap。
+    // Source/publications retain Weak identity and immutable URIs only; closing the actual document must release mmap despite all three live results.
     drop(doc);
     assert_eq!(backing.mapped_bytes(), 0);
     assert_eq!(backing.managed_resident_bytes(), 0);
@@ -509,9 +514,10 @@ fn forward_prefix_keeps_original_publications_and_streams_later_direct_link() {
 }
 
 #[test]
+// Match the complete Parser for supported links/images, while independently preserving unsupported cross-block coverage as Pending.
 fn root_links_references_and_images_match_parser_while_cross_block_holes_stay_pending() {
-    // 保留原长段落字面；过去的直接链接Pending已过期，必须保护真实owner/label/选择显隐。
-    // 引用Missing与Image已沿同Global/唯一文件接入，下方保原字面改验真实Parser结果。
+    // Keep the original long literal and verify actual direct-link owner/label/selection visibility rather than an obsolete Pending expectation.
+    // Missing references and images now use the same Global/file path; unchanged fixtures must match actual complete Parser results below.
     let complex = format!(
         "普通 **{}** [未决链接](https://example.com)\n",
         "粗体".repeat(400)
@@ -592,7 +598,7 @@ fn root_links_references_and_images_match_parser_while_cross_block_holes_stay_pe
                 assert!(actual.is_none());
             }
         }
-        // owner包括完整[]和目标，只有真实label可激活；标记显隐仍由原完整selection控制。
+        // The owner includes brackets and destination, but only the actual label activates; original complete selection controls marker visibility.
         let marker = ready
             .query_for(&doc, authority(&doc), units(owner.start))
             .unwrap()
@@ -627,8 +633,8 @@ fn root_links_references_and_images_match_parser_while_cross_block_holes_stay_pe
         "普通正文 ".repeat(400)
     );
     for source in [unknown_reference.as_str(), unknown_image.as_str()] {
-        // 原未知引用在真实EOF后仍是字面；Image保LINK/marker样式但不取得点击URI。
-        // 不能仅把旧Pending删掉：完整每个位置、实际目标、磁盘/历史和释放都须成立。
+        // An unresolved reference stays literal after actual EOF; images keep LINK/marker styles without click URI authority.
+        // Replacing an old Pending assertion requires full position, destination, disk/history, and release checks rather than deleting it alone.
         let (directory, doc) = document(source);
         let observer = doc.original_backing_observer().unwrap();
         let mut request = doc
@@ -697,15 +703,15 @@ fn root_links_references_and_images_match_parser_while_cross_block_holes_stay_pe
             matches!(sources.ordinary_semantics_for(&doc, authority(&doc)).unwrap(), MarkdownOrdinarySemanticState::Pending(actual) if *actual == expected),
             "不能给 {source:?} 签错误的有限默认样式"
         );
-        // Pending 的实际库存不包含从未分配的 Plain Box，最坏预留不会冒充实际metadata。
+        // Pending inventory excludes a Plain Box that was never allocated; worst-case reservation is not actual retained metadata.
         let expected_metadata = sources.records.len() * record_metadata()
             + publication_metadata()
             + sources.blocks.len() * block_metadata()
             + sources.blocks.capacity() * std::mem::size_of::<Rc<OrdinaryBlockRecord>>();
         assert_eq!(sources.retained_metadata, expected_metadata);
     }
-    // 引用/列表短块已经接同源 context；保留原夹具，改为与独立完整 Parser 逐位置验证真实新行为。
-    // 未覆盖洞仍断言Pending；Root引用/Image的Ready不会给任意跨块范围补权。
+    // Short quote/list blocks use same-source context; compare unchanged fixtures position by position with an independent complete Parser.
+    // Coverage holes stay Pending; Ready Root references/images cannot authorize arbitrary intervals across blocks.
     for source in ["> 引用中文\n> 第二行\n", "- 列表中文\n  第二行\n"] {
         let (directory, doc) = document(source);
         let observer = doc.original_backing_observer().unwrap();
@@ -770,10 +776,11 @@ fn root_links_references_and_images_match_parser_while_cross_block_holes_stay_pe
 }
 
 #[test]
+// Mutable authority failures end the current owner; exported finite semantics remains readable only under its original live context and weak source.
 fn mutable_authority_failures_are_sticky_but_old_plain_metadata_does_not_own_source() {
     for failure in 0..3 {
         let (_directory, mut doc) = document("中文😀纯文本第一行\n第二行\n第三行\n");
-        // “中/文/😀”的 UTF-16 末端依次为1/2/4；选择完整 emoji，避免在权限验收前被代理对边界校验拒绝。
+        // The fixed CJK/CJK/emoji prefix ends at UTF-16 positions 1/2/4; select the complete emoji so scalar validation does not preempt authority checks.
         doc.set_selection(MarkdownTextSelection {
             anchor_utf16: 1,
             head_utf16: 4,
@@ -799,7 +806,7 @@ fn mutable_authority_failures_are_sticky_but_old_plain_metadata_does_not_own_sou
                 MarkdownTableRequestError::PublicationSuperseded
             }
             _ => {
-                // 有序范围相同的反向选择仍是另一完整上下文，不能替原请求续权。
+                // Reversing an equal ordered range creates another complete context and cannot renew the original request.
                 rejected.selection = MarkdownTextSelection {
                     anchor_utf16: doc.selection().head_utf16,
                     head_utf16: doc.selection().anchor_utf16,
@@ -848,6 +855,7 @@ fn mutable_authority_failures_are_sticky_but_old_plain_metadata_does_not_own_sou
 }
 
 #[test]
+// Equal bytes and a restored root cannot bypass document identity or generation checks for either queries or result transfer.
 fn edit_undo_same_root_and_other_document_revoke_true_plain_publication() {
     let source = "中文😀纯文本\r\n第二行\r\n";
     let (_directory, mut doc) = document(source);
@@ -896,6 +904,7 @@ fn edit_undo_same_root_and_other_document_revoke_true_plain_publication() {
 }
 
 #[test]
+// Old semantic payload and runs remain admitted while a successor prepares; joint exhaustion must preserve the old independent result.
 fn previous_plain_runs_and_real_box_payload_share_new_batch_inventory_before_allocation() {
     let source = (0..30)
         .map(|line| format!("普通{line}行\n"))
@@ -932,7 +941,7 @@ fn previous_plain_runs_and_real_box_payload_share_new_batch_inventory_before_all
                 + source_workspace_metadata()
                 + publication_reservation_metadata()
     );
-    // 通过同一个真实配额入口预留其余同活使用者的run槽；新Plain一段也不能绕过旧结果占用。
+    // Reserve coexisting consumers' run slots through the actual shared quota; even one new Plain run must respect old retained results.
     request.batch.admit_source_runs(8192 - old_runs).unwrap();
     assert_eq!(
         finish(&mut request, &doc).err(),

@@ -1,4 +1,5 @@
-//! 已布局行的元数据认证；避免按文字位置反查再次复制完整物理段落。
+//! Authenticate already laid-out line metadata without looking up a text
+//! position through another complete physical-paragraph copy.
 
 use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{
@@ -19,7 +20,8 @@ pub enum NativeMarkdownLineMetadataError {
     Geometry,
 }
 
-/// 全部借用只覆盖当前同步调用；外部原票仍负责文档、模式、选择与manager的身份。
+/// Borrow only for this synchronous observation. The caller's original ticket
+/// still owns document, mode, selection, and manager identity.
 pub struct NativeMarkdownLineMetadataRequest<'a> {
     pub fragment: &'a NSTextLayoutFragment,
     pub line: &'a NSTextLineFragment,
@@ -32,7 +34,8 @@ pub struct NativeMarkdownLineMetadataRequest<'a> {
     pub bounds: NSRect,
 }
 
-/// 每个可重入getter前后都核同一票；getter返回的临时对象由调用栈独占，不进入缓存。
+/// Check the same authority before and after every reentrant getter. Returned
+/// Native temporaries stay on this stack and never enter a cache.
 fn step<T>(
     current: &impl Fn() -> bool,
     operation: impl FnOnce() -> T,
@@ -47,13 +50,16 @@ fn step<T>(
     Ok(value)
 }
 
-/// 通过原行的真实属性值坐标、竖向精确命中与provider两端往返认证来源，不读取正文。
+/// Authenticate the original line through its actual attributed-value extent,
+/// exact vertical hit, and provider endpoint round trips, without reading text.
 ///
-/// 调用方须先认证原manager/element/fragment源范围，并在本函数返回及局部Native claim
-/// 析构后继续核原图与几何。空EOF视觉行使用其独立document.end合同，不进入普通字符行。
+/// The caller must first authenticate manager/element/fragment source ranges,
+/// then recheck the original graph and geometry after this call's Native claims
+/// end. Empty visual EOF uses its separate document.end contract.
 ///
 /// # Errors
-/// 原票、范围或几何失效均拒绝；不主动ensure布局，不改用后继段落或重新采集原票。
+/// Reject revoked authority or changed ranges/geometry. Never force layout,
+/// substitute a successor paragraph, or recapture permission for stale output.
 pub fn verify_native_markdown_line_metadata(
     request: NativeMarkdownLineMetadataRequest<'_>,
     current: &impl Fn() -> bool,
@@ -72,7 +78,7 @@ pub fn verify_native_markdown_line_metadata(
             bounds,
         } = request;
         if step(current, || fragment.state())? != NSTextLayoutFragmentState::LayoutAvailable {
-            return Err(Error::Geometry); // estimated或无效片段不得由查询补排后冒充原布局。
+            return Err(Error::Geometry); // Estimated/invalid fragments cannot acquire original layout authority by forcing a query.
         }
         let element_length = element_source
             .end
@@ -88,11 +94,11 @@ pub fn verify_native_markdown_line_metadata(
             || element_source.start.checked_add(local_range.location) != Some(source.start)
             || element_source.start.checked_add(local_end) != Some(source.end)
         {
-            return Err(Error::Source); // 两端必须采用同一element原点；不按fragment起点猜偏移。
+            return Err(Error::Source); // Both endpoints use the same actual element origin, without inferring offsets from a fragment start.
         }
         let attributed = step(current, || line.attributedString())?;
         if step(current, || attributed.length())? != element_length {
-            return Err(Error::Source); // characterRange属于这份真实属性值，不能把局部slice误认为整个element。
+            return Err(Error::Source); // characterRange belongs to this actual value; a local slice cannot stand in for the entire element.
         }
         if ![
             bounds.origin.x,
@@ -104,7 +110,7 @@ pub fn verify_native_markdown_line_metadata(
         .all(|value| value.is_finite())
             || bounds.size.height <= 0.0
         {
-            return Err(Error::Geometry); // 不用非有限中点或零高占位行生成一次成功命中。
+            return Err(Error::Geometry); // Nonfinite coordinates or zero-height placeholders cannot certify an exact hit.
         }
         let y = bounds.origin.y + bounds.size.height * 0.5;
         if !y.is_finite() {
@@ -118,7 +124,7 @@ pub fn verify_native_markdown_line_metadata(
             || step(current, || exact.characterRange())? != local_range
             || step(current, || exact.typographicBounds())? != bounds
         {
-            return Err(Error::Geometry); // 同一原生行身份与实际值同时匹配；无需遍历巨段落的整个line数组。
+            return Err(Error::Geometry); // Require actual line identity and values, without traversing a giant paragraph's complete line array.
         }
         for endpoint in [source.start, source.end] {
             let offset = isize::try_from(endpoint).map_err(|_| Error::Source)?;
@@ -130,17 +136,17 @@ pub fn verify_native_markdown_line_metadata(
                 content.offsetFromLocation_toLocation(document_start, &location)
             })? != offset
             {
-                return Err(Error::Source); // 同一provider的真实全局端点必须精确往返，绝不clamp或容差。
+                return Err(Error::Source); // The same provider's global endpoint must round-trip exactly, without clamping or tolerance.
             }
         }
         if step(current, || line.characterRange())? != local_range
             || step(current, || line.typographicBounds())? != bounds
             || step(current, || fragment.state())? != NSTextLayoutFragmentState::LayoutAvailable
         {
-            return Err(Error::Geometry); // 后一个getter可重入，发布前再核最初的行和可用布局。
+            return Err(Error::Geometry); // Later getters may reenter; recheck original line values and available layout before completion.
         }
         Ok(())
-    })(); // 属性值、精确行及每个位置claim在这里先归还，随后核最后一次析构是否撤权。
+    })(); // Return attributed-value/line/location claims before checking whether final destruction revoked authority.
     if !current() {
         return Err(Error::Revoked);
     }

@@ -1,9 +1,10 @@
-//! 匿名匹配栈的真实分页、读取和首错；不以模拟结果代替File IO。
+//! Actual anonymous-stack paging, history reads, and descriptor release through real file I/O.
 
 use super::*;
 
 #[test]
-/// 旧页落盘后仍沿原FD读到准确record，关闭不遗留文件占用。
+/// Read exact historical records through the original descriptor after paging, then verify close
+/// against the actual inode rather than a reusable descriptor number.
 fn stack_file_reads_real_history_and_closes_original_descriptor() {
     let quota = MarkdownTableWindowQuota::new(10000, 1024 * 1024);
     let mut file = StackFile::new();
@@ -43,7 +44,7 @@ fn stack_file_reads_real_history_and_closes_original_descriptor() {
     let identity = super::super::tests::descriptor_identity(descriptor).unwrap();
     file.close().unwrap();
     assert!(file.descriptor().is_none());
-    // close已经真实成功；同进程其他测试复用这个数值也必须指向不同的实际inode。
+    // Close has succeeded. Another test may reuse this number, but it must refer to a different inode.
     assert_ne!(
         super::super::tests::descriptor_identity(descriptor),
         Some(identity)

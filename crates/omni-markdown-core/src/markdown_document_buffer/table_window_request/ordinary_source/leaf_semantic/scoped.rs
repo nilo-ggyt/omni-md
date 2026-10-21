@@ -1,4 +1,5 @@
-//! 原 Leaf capture 与逐行 Origin 的有限消费；只保存当前视口的前缀样式，不保存代码正文。
+//! Bounded consumption of the original Leaf capture and line Origins. Retain this viewport's prefix
+//! styles, without retaining the code body.
 
 use super::super::semantic::{PrefixDecoration, SpanProof};
 use super::*;
@@ -7,8 +8,9 @@ use pulldown_cmark::global_frontier::{
     CapturedScopeStep,
 };
 
-/// 同一 Leaf 的两类真实只读证明按次序消费；源寿命仍完全属于父 SourceRequest。
-/// scope 完成即归还目录，Origin 只前进到本窗口末行；没有全文行表、字符串或第二 Global。
+/// Consume two actual proofs for the same Leaf in order; the parent SourceRequest owns source
+/// lifetime. Return scope storage when complete and advance Origins only to this window's final
+/// line, without a whole-document line table, string, or second Global.
 pub(in super::super) struct ScopedLeaf {
     scope: Option<CapturedScopeCursor>,
     origins: Option<BlockOriginCursor>,
@@ -19,8 +21,8 @@ pub(in super::super) struct ScopedLeaf {
     selection_bytes: Range<usize>,
     containers: ContainerPositions,
     prefixes: Vec<MarkdownPresentationRun>,
-    // 只保存实际祖先 opening 的字面区间；它们不带正文，不参与容器样式继承。
-    // 短 Paragraph 路径直接借原 context 中同一事实，不再复制这组 metadata。
+    // Keep actual ancestor opening ranges as literal facts, not body text or inherited container
+    // styles. The finite paragraph path borrows those same facts from its original context.
     footnote_openings: Vec<Range<usize>>,
     line_reaches_end: bool,
     unsupported: bool,
@@ -28,7 +30,8 @@ pub(in super::super) struct ScopedLeaf {
     inline_index: usize,
 }
 
-/// 每种视觉继承只保最早真实祖先 anchor；坐标转换前后互斥，不复制一张角色或来源目录。
+/// Retain each style's earliest actual ancestor anchor. Byte/UTF-16 states are mutually exclusive,
+/// without a duplicated role or source directory.
 #[derive(Clone, Copy)]
 enum ContainerPositions {
     Bytes([Option<usize>; 3]),
@@ -83,8 +86,8 @@ impl ScopedLeaf {
         self.unsupported
     }
 
-    /// 短 scoped 段落复用同一前缀样式消费者；scope 和行状态只借原 context 的已完成事实。
-    /// 原 context 由 BoundedInline 独占持有，本对象不克隆其 seed、spine 或行目录。
+    /// Reuse prefix styling for finite scoped paragraphs by borrowing completed context facts.
+    /// BoundedInline uniquely owns that context; clone no seed, spine, or line directory here.
     pub(in super::super) fn for_inline(
         context: &pulldown_cmark::global_frontier::InlineParagraphContext,
         coverage: Range<usize>,
@@ -129,7 +132,8 @@ impl ScopedLeaf {
         self.advance_with_context(document, quota, budget, Some(context))
     }
 
-    /// 每量子只推进一个原角色、Origin 或前缀片；所有实际分配与读取交回父请求累计计量。
+    /// Advance one original role, Origin, or prefix fragment per quantum and report actual
+    /// allocation/read work to the parent request's cumulative accounting.
     pub(super) fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -192,8 +196,9 @@ impl ScopedLeaf {
                         CapturedScopeRole::Footnote {
                             body_start: Some(end),
                         } => {
-                            // producer 已证明 label、colon 和其后空白；数字/嵌套标点仍保持字面。
-                            // 保实际完整端点，让 prefix 游标能越过可见区之前的同一个 opening。
+                            // The producer proved label/colon/following whitespace; digits and
+                            // nested punctuation remain literal. Keep complete actual endpoints so
+                            // prefix traversal can skip this same opening even before the viewport.
                             let bytes = std::mem::size_of::<Range<usize>>();
                             quota
                                 .admit_metadata(bytes)
@@ -216,14 +221,14 @@ impl ScopedLeaf {
                         starts[index] = Some(starts[index].map_or(source_byte_start, |previous| {
                             previous.min(source_byte_start)
                         }));
-                    } // 子 List 不能污染其 opening 之前的外层 Quote prefix，真实 source anchor 必须保留。
+                    } // Keep the actual source anchor so a child list cannot style earlier outer quote prefixes.
                 }
                 CapturedScopeStep::Complete { .. } => {
                     self.scope = None;
                     if self.unsupported {
                         self.origins = None;
                         self.done = true;
-                    } // 仍缺 opening 的角色或未接定义继续未知，不能当作普通列表。
+                    } // Missing openings/unsupported definitions stay unknown, without a plain-list substitution.
                 }
                 _ => {}
             }
@@ -235,7 +240,7 @@ impl ScopedLeaf {
                     .unwrap_or(self.coverage.end)
                     .clamp(self.coverage.start, self.coverage.end)
             });
-            at.sort_unstable(); // 原四边界游标只沿源前进；固定排序不重排容器或制造新的 source anchor。
+            at.sort_unstable(); // Fixed sorting serves the forward coordinate cursor, without reordering roles or inventing anchors.
             if let Some(coordinates) = self.coordinates.as_mut() {
                 let (measured, values) = coordinates.advance(document, budget - CONTROL)?;
                 work = measured;
@@ -256,7 +261,7 @@ impl ScopedLeaf {
                 work.structural_transitions += CONTROL;
             }
             return Ok((work, false));
-        } // 只转换固定三个真实起点；不按祖先层数分配，也不为每条 prefix 重扫这些端点。
+        } // Convert only three actual anchors, without depth-sized allocation or per-prefix rescanning.
         if let Some(proof) = self.pending.as_ref() {
             if let Some(coordinates) = self.coordinates.as_mut() {
                 let (measured, values) = coordinates.advance(document, budget - CONTROL)?;
@@ -277,7 +282,8 @@ impl ScopedLeaf {
                 }
                 return Ok((work, false));
             }
-            // 只转换可见交集；离屏 opener、整条代码行或中间正文不会被复制进坐标任务。
+            // Convert only the visible intersection; offscreen openers, complete code lines, and
+            // intervening body text never enter a copied coordinate buffer.
             let start = proof.whole.start.max(self.coverage.start);
             let end = proof.whole.end.min(self.coverage.end);
             let (coordinates, measured) =
@@ -309,7 +315,8 @@ impl ScopedLeaf {
             let had_origin_cursor = self.origins.take().is_some();
             self.done = true;
             work.structural_transitions += usize::from(had_origin_cursor) * 1024;
-            // 仅原 Leaf cursor 真的持目录时收归还费；短段落 context 的释放归其唯一 BoundedInline owner。
+            // Account directory disposal only for an actual Leaf cursor. The sole BoundedInline
+            // owner remains responsible for releasing a finite paragraph context.
             return Ok((work, true));
         }
         if let Some(context) = context {
@@ -328,7 +335,7 @@ impl ScopedLeaf {
             }
             work.structural_transitions += std::mem::size_of_val(line);
             return Ok((work, false));
-        } // 原 Leaf 继续驱动原 Origin cursor；短段落只借其唯一 context 的已证行。
+        } // Leaf uses its original Origin cursor; finite paragraphs borrow proven lines from their sole context.
         let cursor = self.origins.as_mut().unwrap();
         let tree = tree_height(document);
         let child = budget - CONTROL - tree;
@@ -383,7 +390,8 @@ impl ScopedLeaf {
         Ok((work, self.done))
     }
 
-    /// 原前缀段有序且互不重叠；每次只给当前 run 的下一真实切点，继承样式不会抹去代码/标题。
+    /// Original prefix spans are ordered and nonoverlapping. Return the current run's next actual
+    /// boundary, merging inherited styles without erasing code/heading styles.
     pub(in super::super) fn query(&self, index: usize, end: usize) -> MarkdownPresentationQuery {
         let ContainerPositions::Utf16(starts) = self.containers else {
             unreachable!("只有原 scope 与 prefix 完成后的 query 才能发布");

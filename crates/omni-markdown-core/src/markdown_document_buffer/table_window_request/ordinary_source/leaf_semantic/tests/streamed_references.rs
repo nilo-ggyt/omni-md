@@ -1,10 +1,12 @@
-//! 原生产Source请求驱动括号文件、唯一引用库存与Global；完整Parser只作为测试中的独立oracle。
+//! Production Source requests drive the bracket file, unique reference inventory, and original
+//! Global; the full parser supplies only an independent test oracle.
 
 use super::*;
 use pulldown_cmark::TagEnd;
 
-/// 原定义oracle有独立16KiB上限；这里只让真实匹配定义使用该既有边界，
-/// 不把长段落整体交给Parser，也不把该whole-definition例外伪装成2048小块。
+/// Reference-definition parsing has its existing independent 16-KiB limit. Only actual matching
+/// definitions may use it; a long paragraph cannot enter the parser under that allowance, and a
+/// whole-definition exception is not a 2048-byte finite-block parse.
 fn finish_references(
     request: &mut MarkdownViewportSourceRequest,
     doc: &MarkdownDocumentBuffer,
@@ -47,8 +49,9 @@ fn finish_references(
     panic!("原有限引用定义与流式段落未在真实累计额度内完成");
 }
 
-/// 所有真实Link文字/代码都与原Parser的规范化目标核对；Image本身不取得点击目标，
-/// 但其label内真实Link仍由原嵌套决策授权。这里只消费公开结果，不遍历私有记录/槽。
+/// Compare actual link text/code with the parser's normalized targets through public results.
+/// Images have no click target, while real links within their labels retain the original nesting
+/// decision; inspect no private record or slot directory.
 fn assert_parser_links(
     ready: &VerifiedMarkdownRootLeafViewport,
     doc: &MarkdownDocumentBuffer,
@@ -89,8 +92,9 @@ fn assert_parser_links(
 
 #[test]
 fn streamed_reference_variants_nested_images_and_first_definitions_match_complete_parser() {
-    // 只有合成fixture在测试中物化；正文/label超原2KiB门，不能让短块Parser代替新流式端口。
-    // 真实Image内嵌Link、Full/Collapsed/Shortcut与EOF Missing在同一原段落相互影响。
+    // Materialize only the synthetic test fixture. Body/label exceed the original 2-KiB finite-block
+    // limit, requiring streaming for interacting nested image links, reference variants, and true
+    // EOF-missing outcomes in the same paragraph.
     let target = format!("https://example.invalid/{}", "path&amp;😀".repeat(300));
     let paragraph = format!(
         "{}*outer ![alt **粗体** [内链](../nested)](image.png) after* \
@@ -134,7 +138,8 @@ fn streamed_reference_variants_nested_images_and_first_definitions_match_complet
         };
         assert_oracle(ready, &doc, &source, &requested);
         assert_parser_links(ready, &doc, &source, &requested);
-        // Map只共享首定义的真实规范化目标。输出URL大于2048仍是有限URI，不加载正文。
+        // Share the actual first definition's normalized target. A URL over 2048 bytes is still
+        // bounded destination output, not a loaded paragraph.
         let actual = ready
             .link_at_for(&doc, authority(&doc), inside)
             .unwrap()
@@ -155,8 +160,9 @@ fn streamed_reference_variants_nested_images_and_first_definitions_match_complet
 
 #[test]
 fn streamed_references_resume_forward_windows_and_undo_rejects_all_old_publications() {
-    // 两窗都属于同一真实长Root段落；定义在后方，第二窗新增查询必须reopen原库存并恢复Global。
-    // 原已发布第一窗继续可读；真正编辑后即使Undo回原字节也不能复活旧Source权限。
+    // Both windows belong to the same long root paragraph. Later definitions require reopening the
+    // original inventory/restoring Global for newly queried labels. Old publication remains readable
+    // until an actual edit; undo restores bytes, never the old Source generation.
     let source = format!(
         "{}[第一处][A] {}[第二处][B] ![图像 [点击][C]](image) tail\n\n\
          [A]: ../first\n[B]: ../second\n[C]: ../nested\n",
@@ -215,8 +221,8 @@ fn streamed_references_resume_forward_windows_and_undo_rejects_all_old_publicati
 
 #[test]
 fn streamed_reference_pause_keeps_cancel_sticky_and_releases_source() {
-    // 未定义引用仍交原Global确认真实EOF；本用例只证明真实暂停后的取消，
-    // 不借测试注入标志把人工错误冒称内核Source EIO。
+    // Missing references still require the original Global's true EOF. This case proves cancellation
+    // after an actual reference pause, without presenting an injected flag as a kernel Source EIO.
     let source = format!(
         "{}[等待][MISSING] {} tail\n",
         "*a ".repeat(100),
@@ -269,9 +275,9 @@ fn streamed_reference_pause_keeps_cancel_sticky_and_releases_source() {
 fn streamed_reference_storage_write_failure_preserves_real_errno_and_releases_source() {
     const CHILD: &str = "OMNI_STREAMED_REFERENCE_STORAGE_CHILD";
     if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
-        // rlimit与signal是进程资源，必须由当前测试exe的独占--exact子进程承受。
-        // 父cargo/其他并行测试不改限制，也不共享下面创建的Doc、文件或请求。
-        // libtest的名称不含crate前缀；由当前真实模块名导出，不能传错exact名字空跑。
+        // Isolate process-wide rlimit/signal changes in this test executable's exact child. Parent
+        // Cargo/parallel tests share neither limits nor this child's document/files/request. Derive
+        // libtest's exact name without the crate prefix so the child actually executes this case.
         let exact = concat!(
             module_path!(),
             "::streamed_reference_storage_write_failure_preserves_real_errno_and_releases_source"
@@ -290,8 +296,9 @@ fn streamed_reference_storage_write_failure_preserves_real_errno_and_releases_so
         );
         return;
     }
-    // 原长前缀/正文仍在，首引用后新增真正的直接链接令同一个文件继续跨页；
-    // 失败来自原StackFile的pwrite，而不是从测试私态替换FD或伪造返回errno。
+    // Keep the original long prefix/body and add real links after the first reference to continue
+    // paging the same file. Failure must come from StackFile's actual pwrite, without replacing a
+    // private descriptor or manufacturing errno.
     let source = format!(
         "{}[等待][MISSING] {} {} tail\n",
         "*a ".repeat(100),
@@ -301,7 +308,8 @@ fn streamed_reference_storage_write_failure_preserves_real_errno_and_releases_so
     let (directory, doc) = document(&source);
     let observer = doc.original_backing_observer().unwrap();
     let at = source.find("[等待]").unwrap();
-    // 实际窗口确实覆盖这些后继链接；不能指望游标越过原requested_end主动写离屏记录。
+    // Cover the later links in the actual viewport; the cursor need not write offscreen records
+    // beyond its original requested_end.
     let requested = units(&source, at..source.find("中文😀").unwrap());
     let mut request = doc
         .viewport_leaf_source_request(requested, 57, doc.selection())
@@ -331,18 +339,18 @@ fn streamed_reference_storage_write_failure_preserves_real_errno_and_releases_so
         rlim_max: 0,
     };
     assert_eq!(
-        // SAFETY: 本--exact子进程只有此测试；getrlimit只向完整有效的栈结构写入。
+        // SAFETY: this exact child runs only this test; getrlimit writes a complete valid stack struct.
         unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut original) },
         0
     );
-    // SAFETY: SIGXFSZ只在该独占子进程临时忽略，让真实系统写返回EFBIG；不触父进程信号。
+    // SAFETY: only this exclusive child temporarily ignores SIGXFSZ so real writes return EFBIG.
     let handler = unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
     assert_ne!(handler, libc::SIG_ERR);
     let limited = libc::rlimit {
         rlim_cur: 0,
         rlim_max: original.rlim_max,
     };
-    // SAFETY: 只降低本子进程软限额，硬限额保持原值，所有夹具写入已在此前完成。
+    // SAFETY: lower only this child's soft limit, retaining its hard limit after all fixture writes complete.
     let admitted = unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limited) };
     let mut failure = None;
     if admitted == 0 {
@@ -357,9 +365,9 @@ fn streamed_reference_storage_write_failure_preserves_real_errno_and_releases_so
             }
         }
     }
-    // SAFETY: 在任何业务结果断言前恢复原软/硬限制；后继检查、失败日志和资源归还不再受限。
+    // SAFETY: restore original limits before result assertions, logging, checks, and resource cleanup.
     let restored = unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &original) };
-    // SAFETY: handler来自本次signal的原真实返回值，此时唯一受限操作已经终止。
+    // SAFETY: handler is the actual previous signal handler; the sole limited operation has ended.
     let signal_restored = unsafe { libc::signal(libc::SIGXFSZ, handler) };
     assert_eq!(admitted, 0);
     assert_eq!(restored, 0);

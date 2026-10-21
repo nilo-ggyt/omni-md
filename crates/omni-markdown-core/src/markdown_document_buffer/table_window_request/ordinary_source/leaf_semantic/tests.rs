@@ -1,4 +1,5 @@
-//! 真实来源请求与固定完整Parser作为独立oracle；所有全文样本和oracle只存在于测试。
+//! Real source requests checked against an independent full-parser oracle. Complete fixture strings
+//! and full-document parsing belong only to tests.
 
 mod atx;
 mod giant_emphasis;
@@ -42,7 +43,8 @@ fn first_leaf_range(source: &str) -> Range<usize> {
     .unwrap()
 }
 
-/// 多页资源用真实围栏/正文样式分段制造；代码中的HTML字面不能充当装饰数量来源。
+/// Produce real fence/body style boundaries for multipage output, rather than counting literal HTML
+/// inside code as decoration.
 fn code_page_fixture(count: usize) -> (String, Vec<Range<usize>>) {
     let mut source = String::new();
     let mut ranges = Vec::new();
@@ -61,7 +63,7 @@ fn code_page_fixture(count: usize) -> (String, Vec<Range<usize>>) {
     .filter(|(event, _)| matches!(event, Event::Start(Tag::CodeBlock(_))))
     .map(|(_, range)| units(&source, range))
     .collect();
-    assert_eq!(ranges, parser); // 显式末围栏端点另与同版本完整Parser核对，不能从被测Ready反造预期。
+    assert_eq!(ranges, parser); // Independently check explicit fence endpoints, without deriving expected ranges from Ready.
     (source, ranges)
 }
 fn source_request(
@@ -134,14 +136,16 @@ fn assert_step(work: SemanticWork) {
     assert!(work.source_bytes <= 4096);
     assert!(work.structural_transitions <= 4096);
     assert!(work.metadata_bytes <= 4096);
-    // 单步只准一个真实URL输出片；fixture终点另与完整Parser精确核累计copy，正文仍零复制。
+    // Allow one actual URL output fragment per step. The full parser independently determines
+    // cumulative target bytes below, so body copies cannot hide in this allowance.
     assert!(work.copied_source_bytes <= 1024);
     assert_eq!(work.parser_input_bytes, 0);
     assert!(work.allocated_source_capacity <= 1024);
 }
 
-/// 这些真实长段落走流式内核，唯一正文外的复制是当前视口所需的已规范化URL。
-/// 完整Parser只在测试中给出独立目标及owner；精确总量相等才能证明没有夹带label/正文复制。
+/// Long paragraphs use the streaming kernel; only normalized URLs required by this viewport may be
+/// copied. The full parser independently supplies owners/targets in tests; exact totals reject
+/// hidden label or paragraph copies.
 fn assert_short_link_payload_work(
     request: &MarkdownViewportSourceRequest,
     document: &MarkdownDocumentBuffer,
@@ -161,8 +165,8 @@ fn assert_short_link_payload_work(
             Event::Start(Tag::Link { dest_url, .. }) => {
                 let owner = units(source, range);
                 if owner.start < requested.end && requested.start < owner.end {
-                    // 计的是独立Parser输出的目标，不是原Markdown owner或Core自己的copy字段。
-                    // 实体/escape的规范化结果可短于原字节，不能以原URL词法长度蒙混这份账。
+                    // Count the independent parser's normalized target, not the Markdown owner or
+                    // Core's copy counter. Entity/escape output can be shorter than lexical URL bytes.
                     assert!(dest_url.len() <= 1024, "这些原fixture只有短URL");
                     expected_bytes += dest_url.len();
                     active_link = Some(dest_url.into_string());
@@ -185,8 +189,9 @@ fn assert_short_link_payload_work(
     let work = request.total_work();
     assert_eq!(work.copied_source_bytes, expected_bytes);
     assert_eq!(work.parser_input_bytes, 0);
-    // 本组短目标在一个实际输出片完成，末页容量也应恰等于目标，不保每条1KiB空尾。
-    // 这份独立字节数同时排除正文分配；真正长目标另由giant_links按原每步量子验收。
+    // These short targets finish in one output fragment and retain exactly their destination bytes,
+    // without a 1-KiB empty tail each. The independent total also rejects body allocation; giant_links
+    // separately covers long targets under the original per-step budgets.
     assert_eq!(work.allocated_source_capacity, expected_bytes);
 }
 fn finish_job(
@@ -326,7 +331,8 @@ fn root_code_and_rule_match_complete_projection_without_interpreting_literal_cod
 }
 
 #[test]
-/// 同一有界代码owner沿原未裁物理行显隐，正文caret和跨块选择不能打开两端围栏。
+/// The bounded code owner uses original unclipped physical lines for visibility; body carets and
+/// cross-block selections cannot activate both endpoint fences.
 fn root_fenced_code_uses_only_actual_endpoint_lines_for_marker_visibility() {
     for source in [
         "前😀\n\n```text\n中文😀\nmore\n```  \n\n后\n",
@@ -431,7 +437,7 @@ fn root_code_keeps_html_characters_literal_without_creating_global_underline_own
         let (mut request, sources) = source_request(&doc, requested.clone());
         let mut job = prepare_job(&mut request, &sources, &doc);
         finish_job(&mut request, &mut job, &doc).unwrap();
-        assert!(job.underline.is_none()); // 本代码窗口不应构造全源pair，不能只在发布时过滤假样式。
+        assert!(job.underline.is_none()); // Literal code must avoid constructing full-source pairing, not merely filter false styles later.
         let RootLeafSemanticPublication::Ready(ready) =
             publish(&mut request, &mut job, &sources, &doc)
         else {
@@ -447,7 +453,7 @@ fn root_code_keeps_html_characters_literal_without_creating_global_underline_own
                     .styles,
                 MarkdownPresentationStyles::FENCED_CODE
             );
-        } // 标签、中文和emoji都保留原Source与字面代码角色，没有隐藏或<u>线条。
+        } // Tags, Chinese text, and emoji preserve original Source/literal-code roles without hiding or underline.
         assert_oracle(&ready, &doc, source, &requested);
         assert_eq!(request.total_work().copied_source_bytes, 0);
         assert_eq!(request.total_work().parser_input_bytes, 0);
@@ -555,7 +561,7 @@ fn paged_runs_consume_original_joint_quota_and_limit_before_page_allocation() {
     let source = "前言\n\n```\n正文\n```\n\n尾\n";
     let (mut request, sources) = source_request(&doc, units(source, first_leaf_range(source)));
     let quota = request.batch.source_semantic_quota().unwrap();
-    quota.admit_retained(quota.remaining_runs(), 0).unwrap(); // 与原table/来源同一个库存，不能另开Leaf额度。
+    quota.admit_retained(quota.remaining_runs(), 0).unwrap(); // Exhaust the original table/source inventory, without a fresh Leaf allowance.
     let mut job = prepare_job(&mut request, &sources, &doc);
     assert_eq!(
         finish_job(&mut request, &mut job, &doc),
@@ -563,7 +569,7 @@ fn paged_runs_consume_original_joint_quota_and_limit_before_page_allocation() {
             MarkdownTableWindowError::SemanticLimit
         ))
     );
-    assert_eq!(job.runs.page_count(), 0); // 原quota拒绝发生在任何新run页分配前。
+    assert_eq!(job.runs.page_count(), 0); // Original quota rejection precedes any new run-page allocation.
     assert!(matches!(
         sources
             .ordinary_semantics_for(&doc, authority(&doc))

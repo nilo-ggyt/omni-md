@@ -1,9 +1,9 @@
-//! 合成真实文件与完整 Parser 是测试 oracle；正文副本和事件 Vec 不进入产品请求。
+//! Synthetic real files and a complete Parser provide independent test oracles; their body copies and event Vecs are not product requests.
 
 use super::*;
 use crate::MarkdownPresentationStyles;
 
-/// 巨格在原 LineCopy 的 256KiB 上限之前交真实结构行；首份发布只保 metadata 与同一 Global。
+/// Publish a giant cell's real structural row without entering the 256-KiB LineCopy path; retain metadata and the same Global only.
 #[test]
 fn first_giant_table_row_publishes_real_structure_without_copying_or_reparsing_the_row() {
     use std::io::Write;
@@ -75,26 +75,26 @@ fn first_giant_table_row_publishes_real_structure_without_copying_or_reparsing_t
     assert_eq!(request.total_work().parser_input_bytes, 0);
 }
 
-/// 恢复长表最后一行只沿原请求逐行续读；每行四格仍真正完成inline，不把后方普通段落纳入来源页。
+/// Recover the last row through one request, completing all four cells' actual inline semantics without admitting unrelated tail paragraphs.
 #[test]
 fn narrow_row_source_windows_keep_long_table_forward_and_unrelated_tail_outside() {
     assert_long_table_row_recovery(false);
 }
 
-/// Find 已选中最后一格时，恢复每一行仍共用原累计额度；远端选区不能被每份后继来源重新扫描。
+/// A Find selection in the last cell shares the original cumulative budget; successor publications must not repeatedly relocate that distant selection.
 #[test]
 fn narrow_row_source_windows_keep_last_cell_find_selection_within_original_work_limit() {
     assert_long_table_row_recovery(true);
 }
 
-// 两个真实选择场景共用同一完整来源、四格 inline 与尾部隔离流程；不以不同的轻量路径替代 Find。
+// Both actual selection cases use the same source, four-cell inline preparation, and tail exclusion rather than a lighter Find substitute.
 fn assert_long_table_row_recovery(last_cell_find: bool) {
-    // 四种真实inline沿同一表格来源准备；裸结构行成功不能代替实际加粗、斜体和代码格完成。
+    // Prepare four inline forms from one table source; structural rows alone cannot prove bold, italic, or code-cell readiness.
     let header = "| 普通 | 粗体 | 斜体 | 代码 |\r\n| --- | --- | --- | --- |\r\n";
     let mut source = String::from(header);
     let mut rows = Vec::new();
     let mut next_utf16 = header.encode_utf16().count();
-    // 期望行坐标只从固定输入字面计算，不从待测publication或Parser结果倒推。
+    // Derive expected row coordinates from fixed input, independently of the tested publication and Parser output.
     for ordinal in 1..=240 {
         let row = format!("| 中文{ordinal} | **粗体** | *斜体* | `a\\|b` |\r\n");
         let end = next_utf16 + row.encode_utf16().count();
@@ -102,13 +102,13 @@ fn assert_long_table_row_recovery(last_cell_find: bool) {
         next_utf16 = end;
         source.push_str(&row);
     }
-    // 旧16K恢复窗口会顺带纳入这些普通块；保持真实尾部，让来源页过量的问题可见。
+    // Retain the real tail that an earlier 16K recovery window over-admitted, making accidental source-page growth observable.
     for _ in 0..600 {
         source.push_str("\r\n后方普通段落不能为表格查找预先解析\r\n");
     }
     let (_directory, mut doc) = document(&source);
     if last_cell_find {
-        // 选区来自固定最后一行的代码格字面；后方六百段只是无关尾部，不能据总长度猜出目标。
+        // Select the last row's fixed code literal; the six hundred unrelated tail paragraphs cannot determine this target.
         let byte_start = source.rfind("`a\\|b`").unwrap() + 1;
         let anchor = source[..byte_start].encode_utf16().count();
         doc.set_selection(MarkdownTextSelection {
@@ -118,14 +118,14 @@ fn assert_long_table_row_recovery(last_cell_find: bool) {
         .unwrap();
     }
     let authority = authority(&doc);
-    // 唯一请求先公开真实表头；后继行只能借最后一份publication前向续读，不重建Global或配额。
+    // Publish the actual header first; each later row continues from the latest publication without rebuilding Global or quota.
     let mut request = doc
         .viewport_leaf_source_request(0..1, 41, authority.selection)
         .unwrap();
     finish(&mut request, &doc).unwrap();
     let mut publication = request.take_sources_for(&doc, authority).unwrap().unwrap();
     for (physical, ordinal) in rows {
-        // 查询头尚未定位时只推进原4096量子；完整标量窗口就绪才改变真实来源视口。
+        // Advance original 4096-unit steps until the complete first-scalar window is ready before changing source coverage.
         let viewport = loop {
             if let Some(viewport) = request
                 .table_row_source_viewport(&doc, authority, physical.start, 4096)
@@ -140,7 +140,7 @@ fn assert_long_table_row_recovery(last_cell_find: bool) {
             .unwrap();
         finish(&mut request, &doc).unwrap();
         publication = request.take_sources_for(&doc, authority).unwrap().unwrap();
-        // 窄查询必须仍给出完整物理行身份，不能把一字符视口冒充裁切后残缺的行。
+        // A narrow query must still yield the complete physical row identity, not a truncated one-character row.
         assert_eq!(
             publication.requested_for(&doc, authority).unwrap(),
             &viewport
@@ -157,7 +157,7 @@ fn assert_long_table_row_recovery(last_cell_find: bool) {
             row.physical_utf16_range_for(&doc, authority).unwrap(),
             physical
         );
-        // 每格都消费自己的原opaque来源和语义；完成后立即归还，下一格仍复用同一请求。
+        // Each cell consumes its original opaque source and semantics, then returns the active slot before the next cell uses this request.
         for column in 0..4 {
             request
                 .prepare_cell_inline(&doc, row.clone(), authority, column)
@@ -170,7 +170,7 @@ fn assert_long_table_row_recovery(last_cell_find: bool) {
                     break;
                 }
             }
-            // 成功消费实际单格语义，才能串行启动下一格；测试不读取或突变请求内部游标。
+            // Consume actual cell semantics before starting the next cell, without reading or mutating the request's private cursors.
             let inline = request
                 .take_cell_inline_ready_for(&doc, authority)
                 .unwrap()
@@ -185,7 +185,7 @@ fn assert_long_table_row_recovery(last_cell_find: bool) {
                 column
             );
         }
-        // 这一页只服务当前真实表行；后方普通尾部不能作为“已经准备好”的隐藏库存。
+        // This page serves only the actual table row; unrelated tail paragraphs cannot become hidden prepared inventory.
         assert_eq!(
             publication
                 .ordinary_lines_for(&doc, authority)
@@ -196,7 +196,7 @@ fn assert_long_table_row_recovery(last_cell_find: bool) {
     }
 }
 
-/// Native 长表的同一固定配方必须真正生成显示来源，不能只用更长尾部扩大原总 fuel 后证明 inline。
+/// The fixed Native long-table recipe must produce actual display sources; a longer tail must not merely inflate fuel for an inline-only proof.
 #[test]
 fn actual_cell_displays_keep_native_long_table_find_within_original_work_limit() {
     use std::io::Write;
@@ -239,7 +239,7 @@ fn actual_cell_displays_keep_native_long_table_find_within_original_work_limit()
     let mut publication = request.take_sources_for(&doc, authority).unwrap().unwrap();
     for (physical, ordinal) in ranges {
         if ordinal != 0 {
-            // 与真实 NeedStyle 一样查询本物理行正文，CRLF 控制仍由它们自己的原来源处理。
+            // Query this physical row's body as NeedStyle does; CRLF controls retain their own original source handling.
             request
                 .continue_forward(
                     &doc,
@@ -261,7 +261,7 @@ fn actual_cell_displays_keep_native_long_table_find_within_original_work_limit()
         );
         let mut displays = Vec::new();
         for column in 0..4 {
-            // 同一行四个显示来源真实共活；每次调用都经过原 CellInline、逐标量转换及磁盘投影目录。
+            // Keep four actual display sources alive together, each prepared through CellInline, scalar conversion, and the disk projection index.
             displays.push(prepare_actual_cell_display(
                 &mut request,
                 &doc,
@@ -287,7 +287,7 @@ fn actual_cell_displays_keep_native_long_table_find_within_original_work_limit()
     }
 }
 
-/// 宽表首行自然测宽后会再次准备显示；已归还的临时语义库存不能在同一来源 quota 内单调累积。
+/// Preparing a wide header again after natural-width measurement must not accumulate already returned semantic workspace in the same quota.
 #[test]
 fn actual_wide_header_displays_release_serial_preparation_inventory() {
     use std::io::Write;
@@ -363,7 +363,7 @@ fn actual_wide_header_displays_release_serial_preparation_inventory() {
                 column,
             ));
         }
-        // 两次真实用途各只保当前行；归还后才开始第二轮，不把已经销毁的工作区当作活库存。
+        // Each real use retains only the current row; release it before the next pass rather than treating destroyed workspace as live inventory.
         let observers: Vec<_> = displays
             .iter()
             .map(|display| display.resource_observer())
@@ -381,11 +381,11 @@ fn actual_wide_header_displays_release_serial_preparation_inventory() {
     }
 }
 
-/// 跨格闭合和嵌套开启必须保留原 first-open→next-close；反向恢复仍从真实根重建 HTML 上下文。
+/// Preserve original first-open/next-close behavior across cells and nested opens; backward recovery rebuilds HTML context from the real root.
 #[test]
 fn cell_displays_keep_cross_cell_underline_markers_during_forward_and_backward_recovery() {
-    // 第一对跨表头两格，第二对跨表头与下一行；已有 open 时的嵌套 <u> 和多余 close
-    // 都按旧产品解析，不能为了只保最后一项而隐藏它们或把两个真实 pair 合并。
+    // One pair crosses header cells and another crosses into the next row. Preserve nested opens and surplus closes
+    // under the existing product grammar rather than hiding them or merging two actual pairs to retain only one item.
     let source = concat!(
         "| <u>头甲 | <u>头乙 </u> | 后丙 </u> | <u>尾丁 |\r\n",
         "| --- | --- | --- | --- |\r\n",
@@ -411,7 +411,7 @@ fn cell_displays_keep_cross_cell_underline_markers_during_forward_and_backward_r
         let (_directory, mut doc) = document(source);
         doc.set_selection(selection).unwrap();
         let authority = authority(&doc);
-        // 完整 Parser 只读这个固定短夹具，独立决定原标签样式；期望不来自新 scanner 或实际输出。
+        // The complete Parser independently styles this fixed short fixture; expected values do not come from the new scanner or tested output.
         let mut original = crate::MarkdownViewportPresentation::default();
         original.set_active_selection(selection.head_utf16..selection.head_utf16);
         original.rebuild(0, 0..source_len, source).unwrap();
@@ -420,8 +420,8 @@ fn cell_displays_keep_cross_cell_underline_markers_during_forward_and_backward_r
             .unwrap();
         finish(&mut request, &doc).unwrap();
         let mut publication = request.take_sources_for(&doc, authority).unwrap().unwrap();
-        // 后两次回到已完成的表头再前进；沿最近 publication 进行真实 reposition，
-        // 不用新请求掩盖旧 scanner 已经过了 close 的状态，也不保旧行票跨发布使用。
+        // Return to the completed header and move forward again through real reposition from the latest publication.
+        // Do not replace the request to hide an advanced scanner, or reuse stale row tickets across publications.
         for (step, row_index) in [0, 1, 2, 0, 1].into_iter().enumerate() {
             let row_start = row_starts[row_index];
             if step != 0 {
@@ -469,7 +469,7 @@ fn cell_displays_keep_cross_cell_underline_markers_during_forward_and_backward_r
                 for index in raw.clone() {
                     let actual = inline.query_for(&doc, authority, index).unwrap().unwrap();
                     let expected = original.query(index).unwrap();
-                    // 表格/表头等继承样式有自己的真实来源；这里只比较迁移可能影响的三个标签角色。
+                    // Table/header inheritance has its own source; compare the three tag roles affected by this migration.
                     for role in [
                         MarkdownPresentationStyles::UNDERLINE,
                         MarkdownPresentationStyles::MARKER,
@@ -483,8 +483,8 @@ fn cell_displays_keep_cross_cell_underline_markers_during_forward_and_backward_r
                     }
                 }
                 drop(inline);
-                // 同格显示会再次取得实际语义，覆盖保持不变时必须完整交回所有原 pair，
-                // 随后真正落盘投影并释放，不能仅靠 query 结果声称 Display 生命周期正确。
+                // Preparing display for the same coverage must return all original pairs and acquire actual semantics again.
+                // Then create and release the disk projection; query results alone cannot prove the Display lifecycle.
                 let display =
                     prepare_actual_cell_display(&mut request, &doc, row.clone(), authority, column);
                 let observer = display.resource_observer();
@@ -498,7 +498,7 @@ fn cell_displays_keep_cross_cell_underline_markers_during_forward_and_backward_r
     }
 }
 
-/// 只复用公开生产准备流程；返回真正完成的显示 Source，不能用 raw/inline Ready 替代显示目录完成。
+/// Use public production preparation to return an actual completed display Source; raw/inline readiness cannot substitute for its finished index.
 fn prepare_actual_cell_display(
     request: &mut MarkdownViewportSourceRequest,
     document: &MarkdownDocumentBuffer,
@@ -537,20 +537,20 @@ fn prepare_actual_cell_display(
     display
 }
 
-/// 无前导管道的真实表格行可从补充平面字符开始；首标量窗口必须同时包含两项UTF16，不能截半个代理对。
+/// A row without a leading pipe can begin with a supplementary scalar; its first-scalar window must include both UTF-16 units.
 #[test]
 fn row_source_window_preserves_supplementary_scalar_and_rejects_surrogate_interior() {
     let source = "H | C\r\n--- | ---\r\n😀原格 | 中文\r\n";
     let (_directory, doc) = document(source);
     let authority = authority(&doc);
     let row_start = source[..source.find('😀').unwrap()].encode_utf16().count();
-    // 不加前导管道，确保真实行首就是两个UTF16单元的字符，不能碰巧靠ASCII令测试通过。
+    // Omit a leading pipe so the actual row starts with a two-unit scalar, preventing an ASCII prefix from making the case trivial.
     let mut request = doc
         .viewport_leaf_source_request(0..1, 41, authority.selection)
         .unwrap();
     finish(&mut request, &doc).unwrap();
     let initial = request.take_sources_for(&doc, authority).unwrap().unwrap();
-    // 真标量窗口由原来源定位器确认；预期长度来自固定字符，而非实现返回值。
+    // The original locator proves the scalar window; its expected length comes from the fixed character rather than the returned value.
     let viewport = loop {
         if let Some(viewport) = request
             .table_row_source_viewport(&doc, authority, row_start, 4096)
@@ -570,7 +570,7 @@ fn row_source_window_preserves_supplementary_scalar_and_rejects_surrogate_interi
         .unwrap()
         .unwrap();
     assert_eq!(row.coordinate_for(&doc, authority).unwrap(), (0, 1, 2));
-    // 低代理项位置不是另一条合法行首；错误必须保留，不能静默floor回前一单元补造权限。
+    // A low-surrogate position is not another valid row start; preserve failure instead of flooring it into fabricated authority.
     let failure = loop {
         match request.table_row_source_viewport(&doc, authority, row_start + 1, 4096) {
             Ok(None) => {}
@@ -582,6 +582,7 @@ fn row_source_window_preserves_supplementary_scalar_and_rejects_surrogate_interi
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
 fn document(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+    // TempDir owns only this synthetic file; retain it alongside the actual public document buffer until each case ends.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("普通来源验收.md");
     std::fs::write(&path, source).unwrap();
@@ -601,6 +602,7 @@ fn finish(
     request: &mut MarkdownViewportSourceRequest,
     document: &MarkdownDocumentBuffer,
 ) -> Result<(), MarkdownTableRequestError> {
+    // Drive the existing request rather than another parsing path; this finite test loop observes each field's separate step bound.
     for _ in 0..document
         .byte_len()
         .saturating_mul(100)
@@ -636,7 +638,7 @@ fn ordinary_text_ranges(source: &str) -> Vec<Range<usize>> {
     let mut atx = false;
     let mut ranges = Vec::new();
     for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
-        // 仅用有限无 inline markup 样本，使真实 Text offsets 独立约束物理正文边界。
+        // These finite fixtures omit inline markup so original Text offsets independently constrain physical content boundaries.
         match event {
             Event::Start(Tag::Table(_)) => table = true,
             Event::End(TagEnd::Table) => table = false,
@@ -645,7 +647,7 @@ fn ordinary_text_ranges(source: &str) -> Vec<Range<usize>> {
             Event::Start(Tag::Heading { .. }) => atx = source.as_bytes()[range.start] == b'#',
             Event::End(TagEnd::Heading(_)) => atx = false,
             Event::Text(_) if !table && !code && !atx => ranges.push(range),
-            _ => (), // HTML、标记与 break 不属于这里的普通正文 oracle。
+            _ => (), // HTML, markers, and breaks do not belong to this ordinary-content oracle.
         }
     }
     ranges
@@ -658,7 +660,7 @@ fn assert_line_oracle(
 ) {
     assert_eq!(lines.len(), expected.len());
     for (actual, content) in lines.iter().zip(expected) {
-        // 独立按原字节找真实 CR/LF，不使用新 origin 输出生成期望值。
+        // Find actual CR/LF in the input bytes rather than deriving expectations from the new origin output.
         let physical = source.as_bytes()[..content.start]
             .iter()
             .rposition(|byte| matches!(byte, b'\r' | b'\n'))
@@ -700,6 +702,7 @@ fn assert_line_oracle(
 }
 
 #[test]
+// Reposition replays the same actual Global, preserves old read-only publications, and charges replay to original cumulative work.
 fn root_leaf_reposition_replays_same_global_keeps_old_permissions_and_cumulative_work() {
     let source = format!("# 开头\n\n{}\n# 结尾\n", "中文 ascii\n".repeat(1200));
     let (_directory, doc) = document(&source);
@@ -731,7 +734,7 @@ fn root_leaf_reposition_replays_same_global_keeps_old_permissions_and_cumulative
         panic!("重放文首必须取得真实RootLeaf权限");
     };
     assert!(leaf.query_for(&doc, authority(&doc), 2).unwrap().is_some());
-    old.ordinary_semantics_for(&doc, authority(&doc)).unwrap(); // 原不可变发布没有因重定位偷换身份或选择。
+    old.ordinary_semantics_for(&doc, authority(&doc)).unwrap(); // Reposition does not replace the old immutable publication's identity or selection.
     request
         .continue_forward(&doc, &first, tail, authority(&doc))
         .unwrap();
@@ -743,6 +746,7 @@ fn root_leaf_reposition_replays_same_global_keeps_old_permissions_and_cumulative
 }
 
 #[test]
+// An unrelated publication fails before mutation, while cancellation actually retires the request instead of leaving a resumable frontier.
 fn root_leaf_reposition_rejects_foreign_publication_without_destroying_original_owner() {
     let (_directory, doc) = document("# 头\n\n正文\n\n# 尾\n");
     let mut request = doc
@@ -783,10 +787,11 @@ fn root_leaf_reposition_rejects_foreign_publication_without_destroying_original_
         request.reposition(&doc, &ready, 4..8, cancelled),
         Err(MarkdownTableRequestError::Cancelled)
     );
-    assert_eq!(request.batch.source_probe_state().0, 0); // 真实取消释放原Global，不可拿新范围复活旧owner。
+    assert_eq!(request.batch.source_probe_state().0, 0); // Actual cancellation releases the original Global; a new range cannot revive this owner.
 }
 
 #[test]
+// Compare original physical line/leaf facts with a complete finite Parser oracle while checking their shared metadata adds no strong root owner.
 fn mixed_real_ordinary_table_and_leaf_sources_match_full_parser_and_physical_bytes() {
     let source = "前段😀\r\n续行\r\n\r\n> 引用一\r\n> 引用二\r\n\r\n- [x] 任务一\n  任务二\n\n| H | C |\n| - | - |\n| a | b |\n\n# 原生标题\n\n```rust\nlet value = 1;\n```\n\nSetext 中\r\n===\r\n\r\n末段";
     let (_directory, doc) = document(source);
@@ -844,6 +849,7 @@ fn mixed_real_ordinary_table_and_leaf_sources_match_full_parser_and_physical_byt
 }
 
 #[test]
+// Overlapping forward coverage within one unfinished paragraph must continue original origin work rather than restarting classification.
 fn middle_of_long_paragraph_keeps_same_unfinished_origin_and_global_for_forward_extension() {
     let source = (0..1200)
         .map(|line| format!("第{line}行中😀\r\n"))
@@ -930,6 +936,7 @@ fn middle_of_long_paragraph_keeps_same_unfinished_origin_and_global_for_forward_
 }
 
 #[test]
+// Continuous byte-to-UTF-16 conversion must cross actual line/block gaps once, including empty lines and supplementary scalars.
 fn continuous_coordinates_visit_short_line_bytes_once_across_paragraph_boundaries() {
     let source = "中😀\r\n\r\n短\n".repeat(80);
     let (_directory, doc) = document(&source);
@@ -970,6 +977,7 @@ fn continuous_coordinates_visit_short_line_bytes_once_across_paragraph_boundarie
 }
 
 #[test]
+// A giant physical line has one origin descriptor; scalar conversion remains incremental without copying its full text.
 fn giant_unicode_line_has_one_origin_record_and_bounded_real_coordinate_steps() {
     let source = "中😀e\u{301}".repeat(10000);
     let (_directory, doc) = document(&source);
@@ -991,7 +999,7 @@ fn giant_unicode_line_has_one_origin_record_and_bounded_real_coordinate_steps() 
     assert_eq!(lines[0].content_utf16_range(), 0..doc.utf16_len());
     assert_eq!(request.total_work().copied_source_bytes, 0);
     assert_eq!(request.total_work().allocated_source_capacity, 0);
-    // 独立桥接预算取多个不同切点，迫使 frame 可在 scalar 中部结束，读取总量仍恰为真实源长。
+    // Different bridge budgets force frames to end inside scalars while total actual reads still equal the source length.
     for budget in [2048, 2051, 4096] {
         let (mut coordinates, _) =
             Coordinates::new(&doc, [0, 0, source.len(), source.len()], budget).unwrap();
@@ -1010,6 +1018,7 @@ fn giant_unicode_line_has_one_origin_record_and_bounded_real_coordinate_steps() 
 }
 
 #[test]
+// Repeated successful publications cannot renew this request's transition total; exhaustion leaves the last exported result independently readable.
 fn repeated_real_source_publications_exhaust_original_total_fuel_without_reset() {
     let source = "one\ntwo\n";
     let (_directory, doc) = document(source);
@@ -1065,6 +1074,7 @@ fn repeated_real_source_publications_exhaust_original_total_fuel_without_reset()
 }
 
 #[test]
+// Context revision and directed selection are independent authority; restoring old values cannot revive an already failed mutable owner.
 fn context_and_full_reverse_selection_are_checked_and_mutating_failure_is_sticky() {
     let source = "first\nsecond\n\nthird\n";
     let (_directory, mut doc) = document(source);
@@ -1135,6 +1145,7 @@ fn context_and_full_reverse_selection_are_checked_and_mutating_failure_is_sticky
 }
 
 #[test]
+// Cancelling transfer must release the pending result and prevent a later take with valid-looking authority from reviving it.
 fn cancelled_take_releases_pending_payload_and_cannot_be_revived_by_correct_authority() {
     let source = "first\nsecond\nthird\n";
     let (_directory, doc) = document(source);
@@ -1160,6 +1171,7 @@ fn cancelled_take_releases_pending_payload_and_cannot_be_revived_by_correct_auth
 }
 
 #[test]
+// Another note with equal bytes and Undo to the same tree remain distinct source authorities because identity and generation are both required.
 fn edit_undo_same_root_new_generation_and_other_document_cannot_reuse_sources() {
     let source = "中文😀\nsecond\n\nthird";
     let (_directory, mut doc) = document(source);
@@ -1198,6 +1210,7 @@ fn edit_undo_same_root_new_generation_and_other_document_cannot_reuse_sources() 
 }
 
 #[test]
+// Synchronous coordinate setup and later publication are separate actual work boundaries, including cancellation immediately after location.
 fn publication_is_a_separate_counted_step_and_coordinate_setup_is_counted_before_cancel() {
     let source = "first\nsecond\nthird\n";
     let (_directory, doc) = document(source);
@@ -1253,6 +1266,7 @@ fn publication_is_a_separate_counted_step_and_coordinate_setup_is_counted_before
 }
 
 #[test]
+// A successor shares quota with still-live previous records; finite page failure retires only current work, not the old immutable directory.
 fn source_records_are_bounded_without_losing_the_original_immutable_publication() {
     let source = (0..300)
         .map(|line| format!("x{line}\n"))
@@ -1298,7 +1312,7 @@ fn source_records_are_bounded_without_losing_the_original_immutable_publication(
             .count(),
         100
     );
-    // 单页超限返回 typed 失败；不能以 Source fallback 或部分 ordinary Ready 掩盖缺行。
+    // A page over limit returns a typed failure; source fallback or partial ordinary readiness cannot hide missing lines.
     let mut excessive = doc
         .viewport_source_request(0..doc.utf16_len(), 41, doc.selection())
         .unwrap();
@@ -1326,6 +1340,7 @@ fn table_source(rows: usize, columns: usize) -> String {
 }
 
 #[test]
+// A forward jump must admit the old large table and new table together before publishing, even when the latter is independently legal.
 fn forward_jump_still_admits_live_previous_table_inventory_before_new_table() {
     let old = table_source(60, 16);
     let later = table_source(4, 16);
@@ -1359,7 +1374,7 @@ fn forward_jump_still_admits_live_previous_table_inventory_before_new_table() {
             .len(),
         1
     );
-    // 新表独立确实合法；拒绝由旧大表与新表同活的联合库存触发，而非测试输入本身损坏。
+    // The new table is independently valid; rejection must come from its coexistence with the old large table, not malformed input.
     let mut independent = doc
         .viewport_source_request(viewport, 41, doc.selection())
         .unwrap();
@@ -1378,6 +1393,7 @@ fn forward_jump_still_admits_live_previous_table_inventory_before_new_table() {
 }
 
 #[test]
+// Retained source descriptions and shared scope metadata must not keep the actual document root alive after its owner closes.
 fn request_and_sources_never_keep_document_root_alive_after_close_owner_drop() {
     let source = "> first😀\r\n> second\r\n\r\n# leaf\r\n";
     let (_directory, doc) = document(source);

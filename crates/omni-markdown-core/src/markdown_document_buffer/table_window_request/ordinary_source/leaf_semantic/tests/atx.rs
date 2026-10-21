@@ -1,9 +1,10 @@
-//! 原生产工厂与固定完整Parser差分；只在测试构造全文oracle，不引入产品第二Parser。
+//! Differential checks between the production factory and an independent full parser used only in
+//! tests, without another product parser.
 
 use super::production::{finish_sources, leaf_sources};
 use super::*;
 
-/// 请求坐标来自独立完整Parser，不能用待测Leaf范围自证自己的边界。
+/// Obtain request coordinates from the independent parser, not the Leaf bounds under test.
 fn heading_range(source: &str) -> Range<usize> {
     let bytes = Parser::new_ext(
         source,
@@ -41,7 +42,8 @@ fn production_atx_plain_levels_markers_unicode_and_line_endings_match_original_p
                 ] {
                     let (_directory, mut doc) = document(&source);
                     doc.set_selection(selection).unwrap();
-                    // 与旧Native source_leaf_query相同，只消费公开工厂实际RootLeafReady及其query。
+                    // Match Native source_leaf_query: consume the public factory's actual Ready
+                    // publication and its authorized query.
                     let (request, sources) = leaf_sources(&doc, requested.clone());
                     let MarkdownOrdinarySemanticState::RootLeafReady(ready) = sources
                         .ordinary_semantics_for(&doc, authority(&doc))
@@ -141,7 +143,8 @@ fn production_atx_fixed_tail_tab_spans_preserve_known_marker_visibility() {
         ),
     ] {
         let (_directory, mut doc) = document(source);
-        // 固定非活动选择使隐藏结果也有独立预期；不能只对比同一个共享tail的两名消费者。
+        // A fixed inactive selection gives independent hidden-marker expectations; comparing two
+        // consumers of the same shared tail alone would not establish correctness.
         let inactive = if owner.start > 0 { 0 } else { doc.utf16_len() };
         doc.set_selection(MarkdownTextSelection::caret(inactive))
             .unwrap();
@@ -162,7 +165,7 @@ fn production_atx_fixed_tail_tab_spans_preserve_known_marker_visibility() {
                     .union(MarkdownPresentationStyles::MARKER)
                     .union(MarkdownPresentationStyles::HIDDEN_MARKER)
             } else {
-                heading // closing前的Tab仍是内容，CRLF反例中的尾#也照旧不隐藏。
+                heading // A tab before the closer stays content; the CRLF fixture's trailing hashes remain visible.
             };
             assert_eq!(baseline.query(index).unwrap().styles, expected);
             assert_eq!(
@@ -204,7 +207,7 @@ fn production_atx_large_general_inline_stays_unpublished() {
                 MarkdownOrdinarySemanticState::LeafPending(
                     MarkdownRootLeafPendingReason::NeedsGeneralInline
                 )
-            )); // 局部未见符号也不够：原标题的后续候选可能决定前面文字的配对与样式。
+            )); // A locally plain prefix cannot rule out later heading candidates that affect earlier pairing/styles.
         }
     }
     let source = format!(
@@ -228,8 +231,8 @@ fn production_atx_large_general_inline_stays_unpublished() {
 
 #[test]
 fn production_atx_long_literal_dollars_and_carets_keep_heading_layout() {
-    // 已删除的扩展不能继续让普通美元与插入符触发GeneralInline等待。
-    // 长标题仍经正式有界工厂产生样式，并与同一语法选项的独立完整Parser核对。
+    // Disabled extensions cannot make literal dollars/carets wait for GeneralInline. The actual
+    // bounded factory must style long literal headings against the same-option full-parser oracle.
     for text in ["$普通美元$", "^普通字符^ ²₃"] {
         let source = format!("## {}\n\n尾\n", text.repeat(2049));
         let (_directory, doc) = document(&source);
@@ -242,7 +245,8 @@ fn production_atx_long_literal_dollars_and_carets_keep_heading_layout() {
             panic!("美元和插入符字面标题必须沿原RootLeaf排版完成");
         };
         assert_oracle(ready, &doc, &source, &requested);
-        // 样式判定继续流式读原Source，不能因支持长字面标题而复制整段到Parser。
+        // Continue streaming the original Source; supporting long literal headings permits no
+        // complete-body copy into a parser.
         assert_eq!(request.total_work().copied_source_bytes, 0);
         assert_eq!(request.total_work().parser_input_bytes, 0);
         assert_eq!(request.total_work().allocated_source_capacity, 0);
@@ -266,7 +270,7 @@ fn production_atx_joint_quota_cancel_edit_and_mapping_error_release_original_own
     assert_eq!(
         ready.query_for(&doc, authority(&doc), requested.start),
         Err(MarkdownTableRequestError::SourceSuperseded)
-    ); // Undo回到原root仍是另一代，不能借相同bytes/坐标复活旧发布。
+    ); // Undo may restore the root/bytes but advances generation, so equal coordinates cannot revive publication.
     assert_eq!(
         request.advance(&doc, authority(&doc), 4096).err(),
         Some(MarkdownTableRequestError::SourceSuperseded)
@@ -278,7 +282,8 @@ fn production_atx_joint_quota_cancel_edit_and_mapping_error_release_original_own
     assert_eq!(original.managed_resident_bytes(), 0);
 
     for fault in [false, true] {
-        // 大于原64KiB窗口，使在途正文扫描真实换页并执行msync；缓存命中不能消费注入。
+        // Exceed the original 64-KiB window so body scanning really pages/reclaims through msync;
+        // a cache hit alone would not consume the armed fault.
         let source = format!("## {} ##\n\n尾\n", "中".repeat(100_000));
         let (_directory, doc) = document(&source);
         let observer = doc.original_backing_observer().unwrap();
@@ -306,7 +311,7 @@ fn production_atx_joint_quota_cancel_edit_and_mapping_error_release_original_own
             assert_eq!(
                 finish_job(&mut request, &mut job, &doc).err(),
                 Some(MarkdownTableRequestError::InvalidRequest)
-            ); // 原真实源帧归还执行后注入一次EIO，不直接伪造语义job的失败。
+            ); // Exercise EIO during an actual source-frame return rather than directly failing the semantic job.
             assert!(observer.reclaim_attempts() > attempts);
             assert!(observer.reclaim_successes() > successes);
             assert_eq!(observer.first_errno(), Some(libc::EIO));
@@ -321,7 +326,7 @@ fn production_atx_joint_quota_cancel_edit_and_mapping_error_release_original_own
                 )
                 .err(),
                 Some(MarkdownTableRequestError::InvalidRequest)
-            ); // sticky源错误已结束此job，后继参数不能将首因改称取消或重新签Ready。
+            ); // The sticky source failure ended this job; later arguments cannot rename it cancellation or revive Ready.
         } else {
             let mut cancelled = authority(&doc);
             cancelled.cancelled = true;
@@ -348,7 +353,7 @@ fn production_atx_joint_quota_cancel_edit_and_mapping_error_release_original_own
                 )
                 .err(),
                 Some(MarkdownTableRequestError::Cancelled)
-            ); // 取消后的恢复参数不续读原ATX，且不会污染健康backing的I/O事实。
+            ); // Healthy arguments after cancellation cannot resume ATX or contaminate healthy backing I/O facts.
             assert_eq!(observer.first_errno(), None);
         }
         assert!(job.heading_next.is_none());
@@ -359,7 +364,7 @@ fn production_atx_joint_quota_cancel_edit_and_mapping_error_release_original_own
         assert_eq!(observer.mapped_bytes(), 0);
         assert_eq!(observer.managed_resident_bytes(), 0);
         if fault {
-            assert_eq!(observer.first_errno(), Some(libc::EIO)); // 实际munmap成功不会清掉已记录的源失败。
+            assert_eq!(observer.first_errno(), Some(libc::EIO)); // Actual successful munmap does not erase the original source failure.
         }
     }
 
@@ -374,7 +379,7 @@ fn production_atx_joint_quota_cancel_edit_and_mapping_error_release_original_own
         Some(MarkdownTableRequestError::Window(
             MarkdownTableWindowError::SemanticLimit
         ))
-    ); // 耗尽原联合库存时不为ATX新开预算，不发布无run的Ready。
+    ); // Exhausted joint inventory grants no fresh ATX budget or empty-run Ready.
     assert!(request.leaf_semantic.is_none());
     assert!(request.records.is_empty());
 }

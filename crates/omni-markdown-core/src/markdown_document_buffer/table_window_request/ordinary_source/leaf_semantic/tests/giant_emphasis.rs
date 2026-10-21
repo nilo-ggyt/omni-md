@@ -1,10 +1,12 @@
-//! 真 Source 请求验证巨大强调：原完整 Parser 只作测试 oracle，产品沿 mmap 小帧与匿名匹配栈。
+//! Giant emphasis through real Source requests: the full parser supplies a test oracle while the
+//! product consumes small mmap frames and its anonymous matching stack.
 
 use super::inline::finish_inline;
 use super::*;
 
 #[test]
-/// 远处closer、嵌套强调和code真正进入原请求；前移同Global且编辑/Undo不能复活旧证明。
+/// Resolve distant closers/nested emphasis/code on the original request and Global; editing/undo
+/// must not revive proofs retained from earlier forward windows.
 fn giant_root_emphasis_code_and_forward_publication_match_original_parser_without_copy() {
     let source = format!(
         "prefix ***{} `code *literal* 😀` ~~删除~~ ~下标~ ^上标^ _斜体_*** tail\n",
@@ -69,7 +71,7 @@ fn giant_root_emphasis_code_and_forward_publication_match_original_parser_withou
 }
 
 #[test]
-/// 同源Unicode邻接、mod3、失败opener与HTML/code优先序均与原Parser逐位置一致。
+/// Compare same-source Unicode flanking, mod3, failed openers, and HTML/code priority position by position.
 fn giant_root_emphasis_flanking_and_priority_match_complete_parser() {
     for (before, after) in [
         ("a_", "_b"),
@@ -109,7 +111,8 @@ fn giant_root_emphasis_flanking_and_priority_match_complete_parser() {
 }
 
 #[test]
-/// 多页prev链有真正磁盘历史，巨量离屏嵌套不能变成内存中的range或opener目录。
+/// Exercise real multipage previous-record history; offscreen nesting must not become a RAM
+/// directory of ranges/openers.
 fn giant_root_emphasis_uses_paged_history_and_finite_visible_output() {
     let source = format!(
         "{}{}{}\n",
@@ -138,9 +141,11 @@ fn giant_root_emphasis_uses_paged_history_and_finite_visible_output() {
 }
 
 #[test]
-/// 选区是真UTF16输入，owner是真byte范围；端点在可见区外仍能激活整条巨大结构的marker。
+/// Real UTF-16 selection endpoints outside the viewport still activate markers owned by the
+/// complete byte-range construct.
 fn giant_emphasis_owner_selection_is_not_clipped_to_visible_coordinates() {
-    // 非空白尾字符让真正右delimiter成立，不能以原Parser也视作字面的样本伪证marker活动。
+    // A nonwhitespace tail makes the right delimiter real; a parser-literal fixture would not
+    // establish marker activity.
     let source = format!("prefix **{}尾** tail\n", "中😀 ".repeat(1500));
     let (_directory, mut doc) = document(&source);
     doc.set_selection(MarkdownTextSelection::caret(3000))

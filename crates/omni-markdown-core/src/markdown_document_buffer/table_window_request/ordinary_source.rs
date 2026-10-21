@@ -1,4 +1,4 @@
-//! 同一真实结构请求的有限普通来源出口；来源完成不代表 ordinary Ready、样式或隐藏权限。
+//! Export finite ordinary-source facts from the same structural request; source completion alone grants no styles or hidden-marker authority.
 
 use super::*;
 use pulldown_cmark::global_frontier::{
@@ -32,7 +32,7 @@ mod leaf_semantic;
 pub use leaf_semantic::{MarkdownRootLeafPendingReason, VerifiedMarkdownRootLeafViewport};
 use leaf_semantic::{RootLeafSemanticJob, RootLeafSemanticPublication};
 
-// 一个来源页只保有限行/叶描述；总段落行数不变成正文缓存或历史目录。
+// Retain a finite page of line/leaf descriptors, not a text cache or directory of every paragraph line.
 const MAX_SOURCE_RECORDS: usize = 256;
 const CONTROL_COST: usize = 64;
 
@@ -42,7 +42,7 @@ pub(super) enum CapturedOrdinary {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 每次调用由真实 owner 提供的当前上下文；有序 range 不足以代替 anchor/head。
+/// Current context supplied by the real owner on each call; an ordered range cannot replace directed anchor/head identity.
 pub struct MarkdownViewportSourceAuthority {
     pub context_revision: u64,
     pub selection: MarkdownTextSelection,
@@ -55,14 +55,14 @@ pub enum MarkdownViewportSourceStep {
     SourcesAvailable { work: SemanticWork },
 }
 
-/// 物理行来源来自原 BlockOriginCursor；UTF16 坐标按同一真实源逐 byte 计量。
-/// 此记录没有可用于隐藏 Markdown 标记、inline 配对或 Native 编辑的权限。
+/// Physical lines come from the original BlockOriginCursor; UTF-16 coordinates are measured from that same source.
+/// A line record grants no Markdown hiding, inline matching, or Native edit authority.
 pub struct VerifiedMarkdownOrdinaryLine {
     block_kind: InlineBlockKind,
     block_lexical: Range<usize>,
     origin: BlockOriginLine,
     utf16: [usize; 4],
-    /// 原 terminal 行可另拥有 Setext 标记尾部；这个已计量端点只用于续批，公开 Origin 仍是原物理行。
+    /// A terminal line may also own a measured Setext tail; use that endpoint only for continuation while exposing the original physical Origin.
     semantic_utf16_end: usize,
     semantic_block: Option<Rc<OrdinaryBlockRecord>>,
 }
@@ -93,8 +93,8 @@ impl VerifiedMarkdownOrdinaryLine {
     }
 }
 
-/// 保留原 opaque LeafBlock，不能把 enclosure 当作已经去掉容器 prefix 的正文。
-/// consumed_end 与 item source_range.end 可能不同，二者按原 producer 语义分别保留。
+/// Retain the original opaque LeafBlock; its enclosure is not content stripped of container prefixes.
+/// Preserve consumed_end separately from source_range.end because the original producer gives them distinct meanings.
 pub struct VerifiedMarkdownOrdinaryLeaf {
     block: VerifiedGlobalLeafBlock,
     physical_utf16: Range<usize>,
@@ -102,8 +102,8 @@ pub struct VerifiedMarkdownOrdinaryLeaf {
     root_code_body: Option<RootCodeBody>,
 }
 
-/// 只在原 Root Code Leaf 的四端点转换完成时建立，不接受外部范围或推测正文末端。
-/// 关闭围栏整条物理行与后继块都在半开 body 外；两个选择的四端点均须留在正文内。
+/// Construct only after converting the original Root Code leaf's four endpoints, without accepting caller ranges or guessed body ends.
+/// The closing-fence line and following block lie outside the half-open body; all four endpoints of both selections must remain inside it.
 #[cfg(feature = "paged-line-compose")]
 struct RootCodeBody {
     utf16: Range<usize>,
@@ -116,8 +116,8 @@ impl RootCodeBody {
     }
 }
 
-/// 同一 opaque Leaf 的真实 Root scope 与种类共同决定正文，容器内同形代码不借此能力。
-/// 这里只借已完成 producer 的元数据；Coordinates 仍负责原字节到 UTF16 的真实计量。
+/// Derive the body from this opaque leaf's actual Root scope and kind; visually similar code inside containers grants no such capability.
+/// Borrow completed producer metadata only; Coordinates still measures actual source bytes into UTF-16.
 fn root_code_body(block: &VerifiedGlobalLeafBlock) -> Option<&Range<usize>> {
     if block.scope_depth() != 0 {
         return None;
@@ -150,7 +150,7 @@ impl VerifiedMarkdownOrdinaryLeaf {
     pub fn details(&self) -> &LeafBlockDetails {
         self.block.details()
     }
-    /// 仅为真实 physical_start..consumed_end 的计量，不宣称覆盖 enclosure 的额外尾 prefix。
+    /// Measure only physical_start..consumed_end, without claiming the enclosure's additional trailing prefix.
     pub fn physical_utf16_range(&self) -> &Range<usize> {
         &self.physical_utf16
     }
@@ -174,13 +174,13 @@ struct SourcePublication {
     source: MarkdownTableSourceIdentity,
     context_revision: u64,
     selection: MarkdownTextSelection,
-    // 只有原请求明确接受新的选择投影时才撤销本次发布。旧 Rc 即使仍被调用方保留，
-    // 也不能在文档以后选回相同 anchor/head 时恢复旧样式权限；结构记录本身仍可共享。
+    // Retire this publication only when the original request accepts selection reprojection. Retained old Rc handles
+    // cannot regain style authority if anchor/head later return to the same values; structural records may still be shared.
     retired: Cell<bool>,
 }
 
 impl SourcePublication {
-    /// 真实源、取消和完整选择的原错误优先；退休状态只撤销这份发布，不能掩盖 Source 首因。
+    /// Preserve source/cancellation/complete-selection checks before retirement; retiring this publication cannot mask the original source failure.
     fn check(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -196,7 +196,7 @@ impl SourcePublication {
         self.require_live()
     }
 
-    /// 弱语义票先保原 Source/取消优先顺序，再沿其真实发布核同一撤权事实。
+    /// A weak semantic ticket checks original source/cancellation first, then this actual publication's retirement.
     fn require_live(&self) -> Result<(), MarkdownTableRequestError> {
         if self.retired.get() {
             return Err(MarkdownTableRequestError::PublicationSuperseded);
@@ -205,8 +205,8 @@ impl SourcePublication {
     }
 }
 
-/// 同一真实请求生成的表格结果与有限普通来源；整个类型仍然不是 ordinary 语义 Ready。
-/// 只保不可变来源 metadata、原共享 scope 页及 source Weak，不持正文 owner。
+/// Table results and finite ordinary facts produced by one request; this aggregate alone does not imply ordinary semantic readiness.
+/// Retain immutable metadata, original shared scope pages, and weak source identity without owning document text.
 pub struct VerifiedMarkdownViewportSources {
     table: VerifiedMarkdownTableViewport,
     records: Vec<Rc<SourceRecord>>,
@@ -218,14 +218,14 @@ pub struct VerifiedMarkdownViewportSources {
 }
 
 impl VerifiedMarkdownViewportSources {
-    /// 派生的冻结 Source 样式边界已经自行核源健康；仍须沿原出版物拒绝显式退休。
-    /// 这里只观察该 Rc 自身的生命周期，不替代有活 Doc 时的完整 Source/选择/context 校验。
+    /// Derived frozen-Source style boundaries check their own health but must still reject the original publication's retirement.
+    /// This observes only the Rc lifetime state, not the full Source/selection/context contract of a live document.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn require_live_publication(&self) -> Result<(), MarkdownTableRequestError> {
         self.publication.require_live()
     }
 
-    /// SourcesOnly/Pending 不代表默认样式已验证；两个 Ready variant 各自只授权真实有限覆盖。
+    /// SourcesOnly and Pending prove no default style; each Ready variant grants only its actual finite coverage.
     pub fn ordinary_semantics_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -280,7 +280,7 @@ impl VerifiedMarkdownViewportSources {
                 {
                     Some(line)
                 }
-                SourceRecord::Line(_) => None, // 原下一行只为同一续体保留；当前窗口不能从 getter 提前借它的来源。
+                SourceRecord::Line(_) => None, // Retain the next line for continuation without exposing it outside this window's coverage.
                 SourceRecord::Leaf(_) => None,
             }))
     }
@@ -304,13 +304,13 @@ impl VerifiedMarkdownViewportSources {
                 {
                     Some(leaf)
                 }
-                SourceRecord::Leaf(_) => None, // 窗后原 Fact 只等待后继真实交集，不扩展本次发布包络。
+                SourceRecord::Leaf(_) => None, // A future original fact waits for an actual successor intersection rather than widening this publication.
                 SourceRecord::Line(_) => None,
             }))
     }
 
-    /// 原 closing fence 的 LF/CRLF 由 producer 消费，却不属于 Parser 的 CodeBlock 样式。
-    /// 只给完整控制范围借出同一 Root 叶的实际 separator；它不扩充 inline coverage 或隐藏权限。
+    /// The producer consumes closing-fence LF/CRLF outside the Parser's CodeBlock style range.
+    /// Lend the same Root leaf's actual separator only for a complete control range, without extending inline coverage or hiding authority.
     pub fn root_fence_separator_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -320,7 +320,7 @@ impl VerifiedMarkdownViewportSources {
         self.check(document, authority)?;
         if range.is_empty() || range.start < self.requested.start || range.end > self.requested.end
         {
-            return Ok(None); // 请求包络外的实际行也不能借当前 publication 取得控制权限。
+            return Ok(None); // Even a real line outside the requested envelope cannot obtain control authority from this publication.
         }
         for record in &self.records {
             let SourceRecord::Leaf(leaf) = record.as_ref() else {
@@ -330,18 +330,18 @@ impl VerifiedMarkdownViewportSources {
                 || leaf.kind() != LeafBlockKind::FencedCode
                 || leaf.close_reason() != LeafBlockCloseReason::ExplicitMarker
             {
-                continue; // 容器、EOF 与其他叶的 consumed cursor 不代表这份 Root closing-EOL 合同。
+                continue; // Container, EOF, and other leaf cursors do not satisfy this Root closing-EOL contract.
             }
             let length = leaf.consumed_end() - leaf.source_range().end;
             if length == 0 {
-                continue; // 真实 EOF closer 没有 separator，不能凭期望合成一条空控制。
+                continue; // A closer at actual EOF has no separator; never fabricate an empty control.
             }
-            // firstpass 的 closing scanner 停在 CR/LF 前，scan_blank_line 只再消费同一 LF/CRLF。
-            // 这些 ASCII 字节与 UTF16 单位一一对应；使用已计量 physical 端点，不再读取或复制正文。
+            // The firstpass closer stops before CR/LF; scan_blank_line consumes only that same LF/CRLF.
+            // These ASCII bytes map one-to-one to UTF-16 units, so measured physical endpoints need no text reread or copy.
             let end = leaf.physical_utf16.end;
             let separator = end - length..end;
             if *range == separator {
-                return Ok(Some(separator)); // CRLF 是同一个真实控制；只请求半个不能获得另一半的票。
+                return Ok(Some(separator)); // CRLF is one actual control; requesting only half cannot authorize its other half.
             }
         }
         Ok(None)
@@ -353,7 +353,7 @@ struct InlineJob {
     kind: InlineBlockKind,
     lexical: Range<usize>,
     semantic_end: usize,
-    // Setext终行不属于正文origin；仍须真实计量其原闭合尾部，才能释放唯一来源游标。
+    // The Setext terminal line is outside content Origin; measure its actual closing tail before releasing the sole origin cursor.
     tail_pending: bool,
     terminal_coordinates: Option<[usize; 4]>,
     pending_line: Option<BlockOriginLine>,
@@ -373,16 +373,16 @@ enum SourcePhase {
     Consumed,
 }
 
-/// opt-in owner 包住一份原 table batch；没有第二个结构 Global 或从 gap 重启的 Parser。
-/// 分类水位属于 table batch，origin_floor 属于原唯一来源 cursor，二者从不相互替代。
+/// Wrap one original table batch without a second structural Global or a Parser restarted from a gap.
+/// The table batch owns classification progress; the sole origin cursor owns origin_floor, and neither substitutes for the other.
 pub struct MarkdownViewportSourceRequest {
     batch: MarkdownTableViewportRequest,
     source: MarkdownTableSourceIdentity,
     context_revision: u64,
     selection: MarkdownTextSelection,
-    // 完整选择在本请求中不可变；只保原定位器已证明的两个 byte 端点，不持正文或另一份目录。
+    // Complete selection is immutable for this request; retain only two proved byte endpoints rather than text or another directory.
     selection_bytes: Option<Range<usize>>,
-    // 恢复真实行来源只定位当前一个查询点；原定位器与Source共用同一累计账，不保行范围副本。
+    // Row-source recovery locates one active query point with the same cumulative source account, without copying row ranges.
     row_source_position: Option<semantic::PositionLocator>,
     viewport: Range<usize>,
     job: Option<OrdinaryJob>,
@@ -392,7 +392,7 @@ pub struct MarkdownViewportSourceRequest {
     records: Vec<Rc<SourceRecord>>,
     blocks: Vec<Rc<OrdinaryBlockRecord>>,
     semantic: Option<PlainSemanticJob>,
-    // 独立Plain与联合RootLeaf互斥；Ready后只保原固定job坐标，样式页和publication均已移交。
+    // Standalone Plain and joint RootLeaf modes are exclusive; after readiness retain fixed job coordinates only, with styles/publication transferred.
     leaf_mode: bool,
     leaf_semantic: Option<Box<RootLeafSemanticJob>>,
     leaf_offer_index: usize,
@@ -401,16 +401,16 @@ pub struct MarkdownViewportSourceRequest {
     phase: SourcePhase,
     failed: Option<MarkdownTableRequestError>,
     cell_inline: Option<Box<cell_inline::CellInlineJob>>,
-    // Leaf/格语义发布只取走样式；原 HTML 扫描前沿在同 Source 请求内串行移交，不从零重扫。
+    // Leaf/cell publication moves styles out; serially transfer the original HTML frontier within this Source request instead of restarting it.
     source_underline:
         Option<crate::markdown_document_buffer::table_source::MarkdownTableUnderlineRequest>,
 }
 
 impl MarkdownDocumentBuffer {
-    /// 同一真实来源请求内准备 Root 普通闭合块、标题、代码块与分隔线的逐段真实交集。
+    /// Prepare actual intersections of ordinary blocks, headings, code, and separators within this same source request.
     ///
-    /// Ready 只授权 `covered_ranges_for` 列出的范围；混合窗口里的未知语法仍是空洞，
-    /// 没有任何已证交集时才返回 LeafPending，不能根据原请求包络推断全部语义完成。
+    /// Ready grants only `covered_ranges_for`; unknown syntax in a mixed window remains a hole.
+    /// LeafPending means no intersection was proved, and the requested envelope alone never establishes complete semantics.
     pub fn viewport_leaf_source_request(
         &self,
         viewport: Range<usize>,
@@ -425,7 +425,7 @@ impl MarkdownDocumentBuffer {
         Ok(request)
     }
 
-    /// 仅显式实验入口准备 Root Plain/Setext；复杂语法和非 Root 仍保留明确 Pending。
+    /// Explicit Plain/Setext entry; unsupported complex syntax or non-Root cases remain explicitly Pending where no verified path applies.
     pub fn viewport_plain_source_request(
         &self,
         viewport: Range<usize>,
@@ -442,7 +442,7 @@ impl MarkdownDocumentBuffer {
         Ok(request)
     }
 
-    /// 显式 opt-in 才截留普通来源；完整选择必须与当前 Core 事实相同，不能传有序主范围代替。
+    /// Capture ordinary sources only by explicit opt-in, with the exact current Core selection rather than its ordered primary range.
     pub fn viewport_source_request(
         &self,
         viewport: Range<usize>,
@@ -458,7 +458,7 @@ impl MarkdownDocumentBuffer {
             ordered_selection(selection),
         )?;
         batch.enable_source_capture();
-        // 工作区只预留一次，页/allocator 实际内存仍由整产品验证，不能以本逻辑量代替。
+        // Reserve workspace once; this logical amount does not replace whole-product verification of resident pages or allocator memory.
         batch.admit_source_metadata(
             source_workspace_metadata() + publication_reservation_metadata(),
         )?;
@@ -510,7 +510,7 @@ impl MarkdownViewportSourceRequest {
     }
 
     fn fail(&mut self, error: MarkdownTableRequestError) {
-        // 只撤销 owner 的后续动作；外带 immutable metadata 仍按原 source/context 检查可读。
+        // Retire only this owner's continuation; exported immutable metadata retains its original source/context read checks.
         self.failed = Some(error);
         self.cell_inline = None;
         self.source_underline = None;
@@ -524,7 +524,7 @@ impl MarkdownViewportSourceRequest {
         if error == MarkdownTableRequestError::Cancelled
             && let Some(job) = self.leaf_semantic.as_mut()
         {
-            // 显式取消也撤销叶续体自身的首因；其派生页随后与请求一起立即释放。
+            // Explicit cancellation retires the leaf continuation too; its derived pages are released with the request's active state.
             job.cancel();
         }
         self.leaf_semantic = None;
@@ -536,7 +536,7 @@ impl MarkdownViewportSourceRequest {
 
     pub fn cancel(&mut self) {
         if self.failed.is_none() {
-            // 已失败时保留首因；显式取消释放全部新派生容量，不给旧 generation 复活入口。
+            // Preserve an existing first failure while cancellation releases new derived capacity; old generations cannot revive this owner.
             self.fail(MarkdownTableRequestError::Cancelled);
         }
     }
@@ -545,9 +545,9 @@ impl MarkdownViewportSourceRequest {
         self.batch.total_work()
     }
 
-    /// 为原行来源恢复取得完整首标量的查询窗口；窗口本身不证明这里存在表格或任何格。
-    /// 定位沿当前请求的原piece树分量子推进，最多四字节的标量读取同样计入原总账。
-    /// 完成后调用方仍须用本请求最新publication执行continue/reposition，再取得真实行票。
+    /// Obtain a complete first-scalar query window for row recovery; the window itself proves no table or cell membership.
+    /// Locate incrementally on this request's original piece tree, charging even the at-most-four-byte scalar read to its account.
+    /// The caller must then continue/reposition from this request's latest publication to acquire an actual row ticket.
     pub fn table_row_source_viewport(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -582,7 +582,7 @@ impl MarkdownViewportSourceRequest {
                 .get_or_insert_with(|| semantic::PositionLocator::new(position, false));
             let (work, result) = locator.advance_row_source_viewport(document, quantum);
             let charged = self.batch.account_source_work(work);
-            // 帧归还后的真实Source首错优先；即使解码/归还失败，已借出的标量字节也先进入同一账。
+            // Original source failure takes priority after frame return; charge actual scalar reads even when decoding or return fails.
             document
                 .original_backing_health()
                 .map_err(MarkdownTableRequestError::Source)?;
@@ -594,12 +594,12 @@ impl MarkdownViewportSourceRequest {
             Ok(viewport)
         })();
         if let Err(error) = result {
-            self.fail(error); // 定位失败与普通来源失败同属一个owner，不能重发fuel或留下半份查询续体。
+            self.fail(error); // Location and ordinary-source failures share this owner; preserve neither half a query nor reissued fuel.
         }
         result
     }
 
-    /// 只有真实 ordinary 行/leaf 已完成计量才能推进；不是 Global 的分类水位。
+    /// Report only measured ordinary-line/leaf progress, independently of Global's classification frontier.
     pub fn origin_forward_floor(&self) -> usize {
         self.origin_floor
     }
@@ -612,17 +612,17 @@ impl MarkdownViewportSourceRequest {
     ) -> Result<MarkdownViewportSourceStep, MarkdownTableRequestError> {
         let result = self.check(document, authority).and_then(|()| {
             if !(4096..=65536).contains(&budget) {
-                // 公开 quantum 必须为内部真实控制/坐标步骤留出最小额度；非法调用不能取得输出权限。
+                // A public step must cover minimum actual control/coordinate work; an invalid budget grants no output authority.
                 return Err(MarkdownTableRequestError::InvalidRequest);
             }
             if matches!(self.phase, SourcePhase::Available) {
-                // 已发布的同一份来源可再次观察，不重复分配、计量或授予普通样式 Ready。
+                // Observe the same completed source publication without reallocating, recounting, or granting ordinary style readiness.
                 return Ok(MarkdownViewportSourceStep::SourcesAvailable {
                     work: SemanticWork::default(),
                 });
             }
             if matches!(self.phase, SourcePhase::Consumed) {
-                // 结果已移交后必须用原 publication 显式续批；普通 advance 不能绕过续权检查。
+                // After transfer, resume explicitly with the original publication; ordinary advance cannot bypass continuation checks.
                 return Err(MarkdownTableRequestError::InvalidRequest);
             }
             let (max_bytes, max_transitions) = self.batch.source_limits()?;
@@ -631,13 +631,13 @@ impl MarkdownViewportSourceRequest {
                 .min(max_bytes.saturating_sub(total.source_bytes))
                 .min(max_transitions.saturating_sub(total.structural_transitions));
             if quantum < 4096 {
-                // 余下累计 fuel 不足一个合法公开步骤时明确终止，不按下一批或下一行重新发放总额。
+                // Fail when remaining cumulative fuel cannot cover a legal public step; later rows/batches do not renew the total.
                 return Err(MarkdownTableRequestError::WorkLimit);
             }
             self.advance_inner(document, quantum)
         });
         if let Err(error) = result {
-            // 可变控制入口固定首个失败并释放新派生资源，恢复取消值/旧代号不能复活该 owner。
+            // This mutating boundary fixes the first failure and releases derived state; restoring old flags/revisions cannot revive it.
             self.fail(error);
         }
         result
@@ -649,7 +649,7 @@ impl MarkdownViewportSourceRequest {
         budget: usize,
     ) -> Result<MarkdownViewportSourceStep, MarkdownTableRequestError> {
         if matches!(self.phase, SourcePhase::RestartLeaf) {
-            // 重定位的Global控制与新Leaf库存分开付原4096量子，不能把两次固定构造挤在一起。
+            // Charge Global reposition control and new Leaf inventory in separate original 4096-unit steps rather than combining both constructions.
             self.install_leaf_semantic(self.viewport.clone())?;
             self.phase = SourcePhase::Produce;
             return Ok(MarkdownViewportSourceStep::Progress {
@@ -663,7 +663,7 @@ impl MarkdownViewportSourceRequest {
                 .filter(|job| !job.done())
                 .and_then(PlainSemanticJob::prefix_origin_record_index)
         {
-            // 只借原页当前一条来源；没有复制 Origin 目录或第二个 parser，未匹配则下量子继续前进。
+            // Borrow one current source record without copying the Origin directory or creating another Parser; resume next step if unmatched.
             let record = self
                 .records
                 .get(index)
@@ -681,7 +681,7 @@ impl MarkdownViewportSourceRequest {
             .as_ref()
             .is_some_and(|job| job.preparing())
         {
-            // 四端点仍由原 piece root 分步计量；未定位前不能猜测哪个 opaque Leaf 拥有覆盖。
+            // Measure all four endpoints incrementally through the original piece root before deciding which opaque leaf owns coverage.
             let authority = self.current_authority();
             let limits = self.remaining_source_limits()?;
             let work = self.leaf_semantic.as_mut().unwrap().advance(
@@ -698,7 +698,7 @@ impl MarkdownViewportSourceRequest {
         if let Some(job) = self.leaf_semantic.as_mut()
             && self.leaf_offer_index < self.records.len()
         {
-            // 续批保留的目录与新来源都每次只移交一条，不能在一个量子内遍历全部256条记录。
+            // Offer retained and newly captured records one per step instead of traversing the whole 256-record page in one call.
             let work = job.offer_record(&self.records[self.leaf_offer_index])?;
             self.leaf_offer_index += 1;
             self.batch.account_source_work(work)?;
@@ -710,7 +710,7 @@ impl MarkdownViewportSourceRequest {
                 .as_ref()
                 .is_some_and(PlainSemanticJob::preparing)
         {
-            // 先分步定位实际viewport/选择端点；后继只为有限byte覆盖保留原Fact种子与全局u上下文。
+            // Locate actual viewport/selection endpoints first, then retain original Fact seeds and global underline context for finite byte coverage.
             let mut work = self
                 .semantic
                 .as_mut()
@@ -731,7 +731,7 @@ impl MarkdownViewportSourceRequest {
         }
         if self.batch.ready_for(document)?.is_some() {
             if self.leaf_semantic.as_ref().is_some_and(|job| !job.done()) {
-                // 原 table/source 已闭合才准备 Leaf 的语义；一次只推进一个有界阶段，费用回原总账。
+                // Prepare leaf semantics only after table/source closure, advancing one bounded stage and charging the original account.
                 let authority = self.current_authority();
                 let limits = self.remaining_source_limits()?;
                 let work = self.leaf_semantic.as_mut().unwrap().advance(
@@ -751,7 +751,7 @@ impl MarkdownViewportSourceRequest {
                     .as_ref()
                     .is_some_and(|semantic| !semantic.done())
             {
-                // 表格与来源已完成后再付独立语义步骤；不把来源水位或空styles偷换成PlainReady。
+                // Pay semantic steps after table/source completion; source progress or empty styles cannot substitute for PlainReady.
                 if self.semantic.as_ref().unwrap().needs_underline_workspace() {
                     self.batch.reserve_source_underline_workspace()?;
                 }
@@ -766,31 +766,31 @@ impl MarkdownViewportSourceRequest {
                     ),
                     Some(self.batch.source_global_mut()?),
                 )?;
-                // 新run仍只在已预留固定scratch里；通过同quota准入前不会移交给任何消费者。
+                // Newly built runs remain private until the same quota admits them; no consumer receives an unadmitted result.
                 self.batch.admit_source_runs(runs)?;
                 self.batch.account_source_work(work)?;
                 return Ok(MarkdownViewportSourceStep::Progress { work });
             }
-            // 表格子阶段可能刚好用满上一 quantum；来源 publication 必须另付本步控制/元数据费用。
+            // A table stage may consume the preceding step entirely; source publication pays its own control and metadata work.
             return self.publish_sources(document, budget);
         }
         if self.job.is_some() && self.origin_floor < self.viewport.end {
-            // 先推进原唯一来源 cursor；Global 的无表分类水位即使已到 EOF，也不能跳过这些真实行。
+            // Advance the sole original origin cursor first; even Global's no-table classification reaching EOF cannot skip its physical lines.
             let work = self.advance_ordinary(document, budget)?;
             self.batch.account_source_work(work)?;
             return Ok(MarkdownViewportSourceStep::Progress { work });
         }
         if let Some(captured) = self.batch.take_ordinary_source() {
-            // 只接管同一实际 Global 发出的 opaque Fact，不从 gap 范围另造 paragraph/leaf 种子。
+            // Accept only opaque facts from this actual Global, never paragraph/leaf seeds manufactured from gap coordinates.
             if self.job.is_some() {
-                // 原未完来源已覆盖本视口时应由分类水位封批，不能把另一个 Fact 塞进第二个活动游标。
+                // Classification should seal the batch when unfinished origin covers the viewport; another Fact cannot create a second active cursor.
                 return Err(MarkdownTableRequestError::InvalidRequest);
             }
             let work = self.install_job(captured)?;
             self.batch.account_source_work(work)?;
             return Ok(MarkdownViewportSourceStep::Progress { work });
         }
-        // 没有待消费来源才推进原 table batch；其中已有 Global/refs/math 的工作由它自己累计。
+        // Advance the original table batch only when no captured source waits; it accounts for its own Global/reference work.
         let step = self.batch.advance(document, false, budget)?;
         let work = match step {
             MarkdownTableViewportStep::Progress { work }
@@ -810,12 +810,12 @@ impl MarkdownViewportSourceRequest {
             .map_or(Ok(SemanticWork::default()), |job| {
                 job.publication_work(document)
             })?;
-        // Leaf 的 semantic 槽只保已移交输出的普通前缀，不另发布 Plain Box 或重复清理配对。
+        // A leaf's semantic slot retains an already transferred Plain prefix; do not publish another Plain Box or clean pairs twice.
         let plain = (!self.leaf_mode)
             .then_some(self.semantic.as_ref())
             .flatten();
         let work = SemanticWork {
-            // Box Plain 载荷只有实际创建时另付固定控制费；配额已在原发布预留中包含载荷和句柄。
+            // Charge fixed Plain Box control only for actual creation; original publication reservation already covers its payload and handle.
             structural_transitions: 2 * CONTROL_COST
                 + plain.map_or(Ok(0), |job| job.publication_control(document))?
                 + leaf_work.structural_transitions,
@@ -825,11 +825,11 @@ impl MarkdownViewportSourceRequest {
             ..SemanticWork::default()
         };
         if work.structural_transitions > budget || work.metadata_bytes > budget {
-            // 本步必须先容纳真实 publication 迁移和元数据登记；不足时不创建 Rc 或移走表格结果。
+            // Admit actual publication transfer and metadata first; insufficient work budget must not create Rc or move table results.
             return Err(MarkdownTableRequestError::WorkLimit);
         }
         self.batch.account_source_work(work)?;
-        // 表格结果与来源目录在同一个实际 batch 成功后移交；整体名称仍是 Sources，不授 ordinary Ready。
+        // Transfer table results and the source directory after the same batch succeeds; Sources still grants no implicit ordinary readiness.
         let table = self
             .batch
             .take_ready_for(document)?
@@ -840,8 +840,8 @@ impl MarkdownViewportSourceRequest {
             selection: self.selection,
             retired: Cell::new(false),
         });
-        // 移交语义 owner 前接回同源、同完整选择的真实端点。后续每格仍须核当前发布，
-        // 但无需为远处 Find 选区反复解码从根到选区的 UTF8；这些标量不授予额外语义覆盖。
+        // Recover this source/complete selection's actual endpoints before transferring semantics. Later cells still check publication,
+        // but need not repeatedly decode prefixes to a distant Find selection; these scalars grant no extra semantic coverage.
         if self.selection_bytes.is_none() {
             self.selection_bytes = self
                 .leaf_semantic
@@ -855,19 +855,19 @@ impl MarkdownViewportSourceRequest {
         }
         let authority = self.current_authority();
         let semantic = if let Some(job) = self.leaf_semantic.as_mut() {
-            // 同一SourcePublication才授权Ready；输出移交后只留固定坐标owner，不持旧发布链。
+            // Bind readiness to this SourcePublication; after output transfer retain fixed coordinates without an old publication chain.
             let (published, measured) =
                 job.publish(document, authority, Rc::downgrade(&publication), budget)?;
             if measured != leaf_work {
-                // 纯 Core 发布间没有回调；费用不一致表示内部阶段失配，禁止移交部分成功。
+                // No callback occurs between these Core publication steps; inconsistent work means an internal stage mismatch, not partial success.
                 return Err(MarkdownTableRequestError::InvalidRequest);
             }
             self.source_underline = job.return_underline();
             match published {
                 RootLeafSemanticPublication::Pending(reason) => {
-                    // Pending只表示本窗没有可发布语义，不撤同源/完整选择下的已证坐标。
-                    // 原唯一job已移走输出且进入Published；后继仍须认证自己的范围与来源，
-                    // 不能因每个空LF都丢掉小片前沿，再从同一片首重解下一段的UTF8前缀。
+                    // Pending means this window has no publishable semantics, without revoking coordinates for the same source/selection.
+                    // The sole job has transferred output and reached Published; successors still prove their own ranges/source.
+                    // Retain its subpiece frontier rather than restarting UTF-8 prefix decoding after every empty LF.
                     MarkdownOrdinarySemanticState::LeafPending(reason)
                 }
                 RootLeafSemanticPublication::Ready(ready) => {
@@ -921,7 +921,7 @@ impl MarkdownViewportSourceRequest {
         };
         self.job = Some(match captured {
             CapturedOrdinary::Inline(block) => {
-                // 仅真实已闭合票据可构造 origin；子游标上限取同一请求剩余额，最终费用仍回写父总账。
+                // Only a real closed ticket creates origin; the child uses this request's remaining limits and returns work to its account.
                 let kind = block.kind();
                 let lexical = block.lexical_range();
                 let semantic_end = block.source_range().end;
@@ -946,7 +946,7 @@ impl MarkdownViewportSourceRequest {
                             MarkdownTableWindowError::SemanticLimit,
                         ));
                     }
-                    // 在任何新Rc/目录容量前联合准入；完整正文、角色集合与source强owner均不进入seed。
+                    // Admit joint inventory before allocating Rc/directory capacity; seeds retain neither full text, role sets, nor strong Source owners.
                     self.batch.admit_source_metadata(
                         block_metadata() + std::mem::size_of::<Rc<OrdinaryBlockRecord>>(),
                     )?;
@@ -961,13 +961,13 @@ impl MarkdownViewportSourceRequest {
                         && let Some(semantic) = self.semantic.as_mut()
                     {
                         semantic.consider(&record);
-                    } // 联合模式由原物理行交付同一 seed，不另建第二份 Plain 请求。
+                    } // Joint mode receives the same seed from its original physical line instead of creating another Plain request.
 
                     self.blocks.reserve_exact(1);
                     self.blocks.push(Rc::clone(&record));
                     (cursor, Some(record))
                 } else {
-                    // 原SourcesOnly与窗口外来源保原factory，不为无关块建立语义库存。
+                    // Preserve the original factory for SourcesOnly/out-of-window facts without allocating semantics for unrelated blocks.
                     (
                         block
                             .into_line_origins(limits)
@@ -987,7 +987,7 @@ impl MarkdownViewportSourceRequest {
                 })
             }
             CapturedOrdinary::Leaf(block) => {
-                // Leaf 不重分类或重扫正文；保留原 opaque 块直到真实源坐标转换完成再移交。
+                // Retain the opaque leaf until actual source coordinates finish, without reclassification or a body rescan.
                 OrdinaryJob::Leaf(block)
             }
         });
@@ -1001,13 +1001,13 @@ impl MarkdownViewportSourceRequest {
     ) -> Result<SemanticWork, MarkdownTableRequestError> {
         let needs_coordinates = match self.job.as_ref().unwrap() {
             OrdinaryJob::Inline(job) => {
-                // 已拿到一条真实物理行时先完成该行坐标，避免新行覆盖唯一待移交记录。
+                // Finish coordinates for the pending physical line before another line could replace that sole transfer slot.
                 job.pending_line.is_some() || job.tail_pending
             }
-            OrdinaryJob::Leaf(_) => true, // Leaf 原票据已完整闭合，只缺同源 UTF16 坐标。
+            OrdinaryJob::Leaf(_) => true, // The actual leaf ticket is already closed and only needs this source's UTF-16 coordinates.
         };
         if needs_coordinates {
-            // 同一连续坐标游标优先消费已有边界，不能逐行重建后反复扫描同 leaf 前缀。
+            // Prefer the continuous coordinate cursor's existing boundaries instead of rebuilding and rescanning the same leaf prefix per line.
             return self.advance_coordinates(document, budget);
         }
         let tree = tree_height(document);
@@ -1034,32 +1034,32 @@ impl MarkdownViewportSourceRequest {
                 child,
             )
             .map_err(MarkdownTableRequestError::Global);
-        // 回收成功后才消费step，不能让原parser提前终止遮住真实映射错误。
+        // Consume parser progress only after successful frame return, so early parser completion cannot mask a mapping failure.
         frame
             .finish()
             .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
         let step = step?;
         let (measured, complete) = match step {
             BlockOriginStep::Progress { work, .. } => {
-                // 原唯一游标仍在匹配容器/正文；真实工作入账，但没有完整物理行可发布。
+                // The sole cursor is still matching container/content; charge actual work without publishing an incomplete physical line.
                 (work, false)
             }
             BlockOriginStep::NeedInput { work, .. } => {
-                // frame 尾只要求从原位置借下一段；不能当作 source EOF 或完成来源覆盖。
+                // A frame end requests another borrow at the original position; it is neither source EOF nor completed coverage.
                 (work, false)
             }
             BlockOriginStep::Line { line, work } => {
-                // 只保留这一条有限来源元数据；先转换真实绝对边界，再决定是否属于当前视口。
+                // Retain this one finite origin record, convert actual absolute boundaries, then decide whether it intersects the viewport.
                 job.pending_line = Some(line);
                 (work, false)
             }
             BlockOriginStep::Complete { work } => {
-                // 真实闭合块来源耗尽，不授予普通 inline 样式或编辑 Ready。
+                // Exhausting a real closed block's origin grants neither ordinary inline styles nor edit readiness.
                 (work, true)
             }
         };
         if complete {
-            // 原 capture 已完整消费才释放；后继块仍从同一个 Global 的实际位置继续。
+            // Release the capture only after actual consumption; subsequent blocks continue from the same Global frontier.
             self.job = None;
         }
         Ok(SemanticWork {
@@ -1078,9 +1078,9 @@ impl MarkdownViewportSourceRequest {
         if !self.coordinate_active {
             let boundaries = match self.job.as_ref().unwrap() {
                 OrdinaryJob::Inline(job) => {
-                    // prefix/content/EOL 四个原字节边界按单调顺序转换，不归一化 CRLF 或 Unicode。
+                    // Convert the four original prefix/content/EOL byte boundaries monotonically, without normalizing CRLF or Unicode.
                     if job.tail_pending {
-                        // 原Setext Fact已证明尾部范围；只测量闭合尾端，不制造一条正文物理行。
+                        // The Setext fact already proves its tail range; measure only that closing end without inventing a content line.
                         [job.semantic_end; 4]
                     } else {
                         let line = job.pending_line.as_ref().unwrap();
@@ -1093,9 +1093,9 @@ impl MarkdownViewportSourceRequest {
                     }
                 }
                 OrdinaryJob::Leaf(block) => {
-                    // source_range.end 可能含后继行 prefix；只按真实返回 cursor 推进共享坐标游标。
-                    // Root Code 复用原四端点中间的两个位置计量正文，不再从可见 marker
-                    // 裁剪范围猜整叶边界，也不为选择等效检查另外建立 locator 或读取正文。
+                    // source_range.end may include the next line's prefix, so advance shared coordinates only to the actual consumed cursor.
+                    // Root Code measures its body with the middle two original endpoints, rather than inferring full-leaf boundaries
+                    // from clipped markers or creating another locator/text read for selection invariance.
                     let body = root_code_body(block);
                     [
                         block.physical_start(),
@@ -1106,10 +1106,10 @@ impl MarkdownViewportSourceRequest {
                 }
             };
             let mut work = if let Some(coordinates) = self.coordinates.as_mut() {
-                // 后继行/块沿同一 byte→UTF16 位置继续，仅移交新的四边界而不重做 AVL 首定位。
+                // Continue following lines/blocks from the same byte-to-UTF-16 frontier, replacing four boundaries without another AVL lookup.
                 coordinates.continue_at(boundaries)?
             } else {
-                // 首次真实 AVL 定位已同步发生；本步接回其费用，取消或 Drop 也不能漏记。
+                // Initial AVL location has happened synchronously; return its cost now even if cancellation or Drop follows.
                 let (coordinates, work) =
                     Coordinates::new(document, boundaries, budget - CONTROL_COST)?;
                 self.coordinates = Some(coordinates);
@@ -1120,7 +1120,7 @@ impl MarkdownViewportSourceRequest {
                 .structural_transitions
                 .checked_add(CONTROL_COST)
                 .ok_or(MarkdownTableRequestError::WorkLimit)?;
-            return Ok(work); // 同步定位已经发生，必须当步归账，不能等下次 advance 才补报。
+            return Ok(work); // Account for synchronous location in this call rather than deferring its report to another advance.
         }
         let (mut work, values) = self
             .coordinates
@@ -1128,10 +1128,10 @@ impl MarkdownViewportSourceRequest {
             .unwrap()
             .advance(document, budget - CONTROL_COST)?;
         let Some(values) = values else {
-            // 有限 frame 尚未覆盖全部四边界，只返回真实读取费用，不推进来源覆盖水位。
+            // An incomplete four-boundary conversion returns actual read work without advancing origin coverage.
             return Ok(work);
         };
-        // 发布行/Rc 仍在父 quantum 内：子转换器预留了这份真实移交控制费用。
+        // Row/Rc publication remains in the parent's step; the child reserved this actual transfer control work.
         work.structural_transitions = work
             .structural_transitions
             .checked_add(CONTROL_COST)
@@ -1142,8 +1142,8 @@ impl MarkdownViewportSourceRequest {
             && job.pending_line.as_ref().unwrap().is_terminal()
             && job.pending_line.as_ref().unwrap().eol_range().end < job.semantic_end
         {
-            // 原正文 terminal 行仍持自己的四端点；下一量子只沿同坐标游标计量其已证 Setext 尾部。
-            // 完整 owner 尚未移交，origin_floor 也不能先封窗，否则下一批会丢掉 underline 的唯一 seed。
+            // The terminal content line keeps its own four endpoints; next step measures the proved Setext tail through the same cursor.
+            // Do not close origin_floor before transferring the complete owner, or the next batch would lose the sole underline seed.
             job.terminal_coordinates = Some(values);
             job.tail_pending = true;
             return Ok(work);
@@ -1152,7 +1152,7 @@ impl MarkdownViewportSourceRequest {
         self.batch.set_source_origin_floor(self.origin_floor);
         let (record, complete) = match self.job.as_mut().unwrap() {
             OrdinaryJob::Inline(job) => {
-                // 原行与四个坐标成对移交；只有 terminal 行已转换时才能释放未完 origin owner。
+                // Transfer the original line with its four coordinates; release unfinished origin only after converting the terminal line.
                 let origin = job.pending_line.take().unwrap();
                 let complete = origin.is_terminal();
                 let physical = if job.tail_pending {
@@ -1160,7 +1160,7 @@ impl MarkdownViewportSourceRequest {
                         .take()
                         .expect("原 Setext 尾部与自己的 terminal 行四端点一起移交")
                 } else {
-                    values // 普通行的物理末端与本次已计量末端相同，没有额外语法尾部。
+                    values // An ordinary line's physical and measured endpoints coincide; it has no additional syntax tail.
                 };
                 (
                     SourceRecord::Line(VerifiedMarkdownOrdinaryLine {
@@ -1175,7 +1175,7 @@ impl MarkdownViewportSourceRequest {
                 )
             }
             OrdinaryJob::Leaf(_) => {
-                // 移走原 opaque Leaf 而不是重建票据，原 source/consumed 范围保持独立且可追溯。
+                // Move the original opaque leaf instead of rebuilding a ticket, preserving its distinct source/consumed ranges.
                 let Some(OrdinaryJob::Leaf(block)) = self.job.take() else {
                     unreachable!()
                 };
@@ -1195,9 +1195,9 @@ impl MarkdownViewportSourceRequest {
             }
         };
         let range = record.utf16_range();
-        // 前方旧行仍随原扫描释放；跨空白封窗时，下一份已消费原 Fact 不能跟着丢掉。
-        // 原 origin_floor 已越过它，若在这里释放，后继同 Global 无法重新交付其来源。
-        // 只保首份越过窗口的原行/叶，仍付原256目录配额；后继保留过滤与语义覆盖只消费真实交集。
+        // Retire earlier lines as scanning advances, but keep the first already consumed fact beyond a whitespace window boundary.
+        // origin_floor already passed that fact, so dropping it would prevent the same Global from delivering its source again.
+        // Retain only this first future line/leaf within the original 256-record quota; getters and semantic coverage still filter actual intersections.
         if self.viewport.start < range.end {
             work.metadata_bytes = work
                 .metadata_bytes
@@ -1206,7 +1206,7 @@ impl MarkdownViewportSourceRequest {
             self.admit_record(record)?;
         }
         if complete {
-            // 本块已到真实终行/Leaf 末端；释放游标后才允许同一 Global 交付后继普通事实。
+            // Release the cursor at the actual terminal line/leaf before allowing the same Global to deliver another ordinary fact.
             self.job = None;
         }
         Ok(work)
@@ -1214,12 +1214,12 @@ impl MarkdownViewportSourceRequest {
 
     fn admit_record(&mut self, record: SourceRecord) -> Result<(), MarkdownTableRequestError> {
         if self.records.len() == MAX_SOURCE_RECORDS {
-            // 单次来源目录到达256条即明确拒绝，不能把整篇段落的所有物理行积存在请求内。
+            // Reject a source page beyond 256 records rather than accumulating every physical line of an entire paragraph.
             return Err(MarkdownTableRequestError::Window(
                 MarkdownTableWindowError::SemanticLimit,
             ));
         }
-        // 原 previous 载荷已在续批预扣；每条新记录先联合准入后 Rc 分配，不为大段落保行集合。
+        // Continuation already charged previous payload; jointly admit each new record before Rc allocation without retaining a giant line collection.
         self.batch.admit_source_metadata(record_metadata())?;
         self.records.push(Rc::new(record));
         Ok(())
@@ -1250,12 +1250,12 @@ impl MarkdownViewportSourceRequest {
         Ok(sources)
     }
 
-    /// 同一文档只有选择改变时，重投影原有限来源页保留的闭合普通行或真实 Root Code 叶。
-    /// Ok(false) 只表示当前库存不能覆盖目标，完全不改变原 owner、发布或证明；
-    /// 成功仍须逐量子 advance 认证新选择并取得新发布，不能把旧 Ready/Reader 改名使用。
+    /// Reproject retained closed ordinary lines or a real Root Code leaf when only this document's selection changes.
+    /// Ok(false) means retained inventory cannot cover the target and changes no owner, publication, or proof.
+    /// Success still requires incremental advance and a new publication for the new selection; old Ready/Reader handles cannot be relabeled.
     ///
     /// # Errors
-    /// Source 健康、取消、当前完整选择和最新发布分别核验；准入后的真实失败固定首因并结束原请求。
+    /// Check source health, cancellation, complete current selection, and latest publication separately; post-admission failure fixes the first cause and ends the request.
     pub fn reproject_selection(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -1266,8 +1266,8 @@ impl MarkdownViewportSourceRequest {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        // 根端点只触原健康门。旧选择此时已经不是 Doc 当前选择，不能调用旧 check
-        // 后把 PublicationSuperseded 吞成能力缺失，更不能绕过真实映射首错与取消。
+        // The root endpoint invokes original health only. The old selection is no longer current, so an old-selection check
+        // must not turn PublicationSuperseded into absence of capability or bypass the actual mapping failure/cancellation.
         let current = document
             .byte_offset_for_utf16(0)
             .map_err(MarkdownTableRequestError::Source)
@@ -1309,7 +1309,7 @@ impl MarkdownViewportSourceRequest {
                 MarkdownOrdinarySemanticState::RootLeafReady(_)
             )
         {
-            return Ok(false); // 活跃来源/格作业有自己的归还义务，不能借选择变更截掉它们。
+            return Ok(false); // Active source/cell jobs own their cleanup obligations; selection changes cannot truncate them.
         }
         let Some((index, record)) = previous.records.iter().enumerate().find(|(_, record)| {
             let range = record.utf16_range();
@@ -1320,12 +1320,12 @@ impl MarkdownViewportSourceRequest {
                     SourceRecord::Leaf(leaf) => root_code_body(&leaf.block).is_some(),
                 }
         }) else {
-            return Ok(false); // 旧 prefix 已释放或跨了未知块时仍走原冷路径，不补造历史行目录。
+            return Ok(false); // A released prefix or unknown intervening block needs the original cold path, not an invented historical line directory.
         };
         let block = match record.as_ref() {
             SourceRecord::Line(line) => line.semantic_block.as_ref(),
-            // Code 不冒充 OrdinaryBlock seed。保同一个 opaque Leaf Rc，后继仍由
-            // RestartLeaf 原坐标/语义流程签新选择；marker 显隐也须重新得到正常发布。
+            // Code is not an OrdinaryBlock seed. Retain the same opaque leaf Rc and use RestartLeaf's original
+            // coordinate/semantic flow to publish the new selection, including renewed marker visibility.
             SourceRecord::Leaf(_) => None,
         };
         let result = (|| {
@@ -1338,8 +1338,8 @@ impl MarkdownViewportSourceRequest {
             )? {
                 return Ok(false);
             }
-            // 原 previous 仍活到调用返回；共享行/seed 只增加有限 Rc 目录，新 Leaf 固定槽
-            // 和新发布按原 workspace/reservation 联合准入，既不复制正文也不重发累计 fuel。
+            // previous remains live until return. Shared rows/seeds add only a finite Rc directory; jointly admit the new
+            // Leaf slot/publication through original workspace reservations without copying text or renewing cumulative fuel.
             self.batch.admit_source_metadata(
                 previous.retained_metadata
                     + std::mem::size_of::<Rc<SourceRecord>>()
@@ -1364,8 +1364,8 @@ impl MarkdownViewportSourceRequest {
                         * PlainSemanticJob::completed_drop_control(),
                 ..Default::default()
             })?;
-            // 所有可失败的准入已完成，紧接着退休原发布。外带旧 Rc/弱语义票以后即使
-            // 遇到相同选择值也不能复活；新 SourcePublication 只由正常发布步骤生成。
+            // After all fallible admissions succeed, retire the original publication. Old Rc/weak semantic tickets cannot
+            // revive when selection values recur; only normal publication creates the new SourcePublication.
             previous.publication.retired.set(true);
             if !keep_plain {
                 self.semantic = None;
@@ -1375,14 +1375,14 @@ impl MarkdownViewportSourceRequest {
             self.blocks = block.map_or_else(Vec::new, |block| vec![Rc::clone(block)]);
             self.selection = authority.selection;
             self.context_revision = authority.context_revision;
-            self.selection_bytes = None; // 新选择必须重新通过原四端点定位，旧 byte pair 不授后继权限。
+            self.selection_bytes = None; // Locate the new selection's four endpoints; an old byte pair grants no successor authority.
             self.viewport = viewport;
             self.ready = None;
             self.last_publication = None;
             self.leaf_offer_index = 0;
             self.phase = SourcePhase::RestartLeaf;
-            // 唯一 underline 继续按原 ResumeUnderline 协议处理：反向覆盖必拒绝续读，
-            // 在其独立量子归还旧 scanner 后冷准备；绝不把已有空 pair 当全文负证明。
+            // Preserve the sole underline owner's ResumeUnderline protocol: backward coverage rejects continuation and
+            // returns the old scanner in its own step before cold preparation; empty pairs never prove document-wide absence.
             Ok(true)
         })();
         if let Err(error) = result {
@@ -1391,7 +1391,7 @@ impl MarkdownViewportSourceRequest {
         result
     }
 
-    /// 只复用原最后 publication 与唯一未完 origin cursor；逆向且无 checkpoint 明确拒绝。
+    /// Reuse only the latest original publication and sole unfinished origin cursor; backward coverage without a checkpoint is rejected.
     pub fn continue_forward(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -1402,15 +1402,15 @@ impl MarkdownViewportSourceRequest {
         self.check_forward_sources(document, previous, &viewport, authority)?;
         let result = self.begin_forward(document, previous, viewport);
         if let Err(error) = result {
-            self.fail(error); // 已开始联合准入/状态迁移后失败不能留半份续体。
+            self.fail(error); // Failure after joint admission/state transition cannot leave a half-accepted continuation.
         }
         result
     }
 
-    /// 为旧缓存视口恢复真实RootLeaf语义；同一Global从根重放，后继advance仍按原量子推进。
+    /// Restore real RootLeaf semantics for an older viewport by replaying the same Global from root through normal incremental steps.
     ///
     /// # Errors
-    /// 只接受本请求最近移交的来源及同Source/完整选择；非法外来票不改原请求，真实失权或重放失败固定首因。
+    /// Require this request's latest transferred source, same Source, and complete selection; reject foreign tickets without mutation, while actual revocation/replay failure remains sticky.
     pub fn reposition(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -1419,9 +1419,9 @@ impl MarkdownViewportSourceRequest {
         authority: MarkdownViewportSourceAuthority,
     ) -> Result<(), MarkdownTableRequestError> {
         if let Some(error) = self.failed {
-            return Err(error); // 已结束请求保留原首因，不让后来的源健康变化改写它。
+            return Err(error); // A finished request preserves its first cause rather than replacing it with later source-health changes.
         }
-        // 真实源IO首错先于旧数值权限；根端点检查不读取正文，也不能把EIO洗成普通SourceSuperseded。
+        // Original source I/O failure precedes stale numeric authority; the root endpoint reads no text and must not wash EIO into SourceSuperseded.
         if let Err(cause) = document.byte_offset_for_utf16(0) {
             let error = MarkdownTableRequestError::Source(cause);
             self.fail(error);
@@ -1460,20 +1460,20 @@ impl MarkdownViewportSourceRequest {
             self.batch
                 .admit_source_runs(previous.semantic.run_count())?;
             if self.semantic.is_some() {
-                // 反向重定位真正释放父槽的已完成前缀；batch 的结构重放费用不代付这一资源析构。
+                // Backward reposition releases the parent's completed prefix; structural replay work does not pay for that resource teardown.
                 self.batch.account_source_work(SemanticWork {
                     structural_transitions: PlainSemanticJob::completed_drop_control(),
                     ..Default::default()
                 })?;
             }
             if self.leaf_semantic.is_some() {
-                // 逆向不能续原小片前沿；释放已移走输出的唯一固定job同样属于本次实际控制工作。
+                // Backward movement cannot reuse the subpiece frontier; releasing the sole transferred-output job is actual control work too.
                 self.batch.account_source_work(SemanticWork {
                     structural_transitions: RootLeafSemanticJob::completed_owner_drop_control(),
                     ..Default::default()
                 })?;
             }
-            // 外带旧Ready仍可按原Source读取；请求不保旧正文origin、语义工作区或第二个结构前沿。
+            // Exported old Ready remains readable under its original Source; this request retains no old text origin, semantic scratch, or second frontier.
             self.job = None;
             self.coordinates = None;
             self.coordinate_active = false;
@@ -1495,7 +1495,7 @@ impl MarkdownViewportSourceRequest {
         result
     }
 
-    /// source 与 required-row 共用前置门禁；真实 owner 失权 sticky，外来 previous 或请求范围不改原状态。
+    /// Source and required-row continuation share preflight: actual owner revocation is sticky, while foreign previous/coverage arguments leave state unchanged.
     fn check_forward_sources(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -1503,9 +1503,9 @@ impl MarkdownViewportSourceRequest {
         viewport: &Range<usize>,
         authority: MarkdownViewportSourceAuthority,
     ) -> Result<(), MarkdownTableRequestError> {
-        // 所有参数/身份 preflight 在改状态前完成；错误 publication 不损坏可重试的原 owner。
+        // Complete argument/identity preflight before mutation; an incorrect publication cannot damage an otherwise usable original owner.
         if let Err(error) = self.check(document, authority) {
-            // 当前 owner 的真实 source/context 已失效；恢复旧数值不能给该续体续权。
+            // This owner's actual source/context is invalid; restoring old numeric values cannot renew its continuation.
             self.fail(error);
             return Err(error);
         }
@@ -1539,7 +1539,7 @@ impl MarkdownViewportSourceRequest {
         viewport: Range<usize>,
     ) -> Result<(), MarkdownTableRequestError> {
         if viewport.start > self.batch.forward_resume_floor() {
-            // 显式跳向后方仍保原 Global；中间普通块由原前沿真实消费，不重建 Global(0)。
+            // An explicit forward jump keeps the original Global, which actually consumes intermediate blocks instead of rebuilding Global(0).
             self.batch
                 .resume_source_from_ready(document, &previous.table, viewport.clone())?;
         } else {
@@ -1549,7 +1549,7 @@ impl MarkdownViewportSourceRequest {
         self.retain_forward_sources(document, previous, viewport)
     }
 
-    /// 原 batch 已接受唯一后继后，联合准入同活普通来源和固定工作区；不重建未完 origin。
+    /// After the batch accepts its sole successor, jointly admit coexisting ordinary facts and fixed workspace without rebuilding unfinished origin.
     fn retain_forward_sources(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -1585,14 +1585,14 @@ impl MarkdownViewportSourceRequest {
         )?;
         self.batch
             .admit_source_runs(previous.semantic.run_count())?;
-        // previous 仍占联合配额；这里只 clone 有界 Rc 目录，不复制原记录或保父 publication 链。
+        // previous still occupies joint quota; clone only a bounded Rc directory, without copying records or retaining a parent-publication chain.
         self.records = previous
             .records
             .iter()
             .filter(|record| {
                 let range = record.utf16_range();
-                // Leaf 可能为跨空白封窗先消费唯一下一行。它的原 origin 已越过 Global，
-                // 因此只淘汰前方记录；未来记录仍待真实交集，公开 getter 不扩充当前请求范围。
+                // A leaf may have consumed the sole next line before sealing a whitespace window. Original origin already passed it,
+                // so retire only earlier records; future ones await an actual intersection and public getters still clip to the request.
                 viewport.start < range.end && (self.leaf_mode || range.start < viewport.end)
             })
             .cloned()
@@ -1603,9 +1603,9 @@ impl MarkdownViewportSourceRequest {
             control
         } else {
             self.blocks = previous.blocks.clone();
-            2 * previous.blocks.len() // Plain 的既有 Bounds 阶段另按实际 byte 覆盖淘汰块。
+            2 * previous.blocks.len() // Plain's existing Bounds stage separately prunes blocks against actual byte coverage.
         };
-        // 旧 table 目录的库存 fold/句柄复制同样收费；仅 ordinary 目录收费会遗漏 source-aware resume 工作。
+        // Charge old table inventory folding/handle copies too; charging ordinary records alone would omit source-aware resume work.
         let control = previous
             .records
             .len()
@@ -1628,7 +1628,7 @@ impl MarkdownViewportSourceRequest {
             self.batch.account_source_work(work)?;
         }
         if self.leaf_mode {
-            // 原 batch 已联合预扣旧 Ready；新 job 只借当前同一 quota，不复用上一批失效的额度句柄。
+            // The batch already charged old Ready jointly; the new job borrows the current quota rather than the previous batch's obsolete handle.
             self.install_leaf_semantic(viewport.clone())?;
         }
         self.viewport = viewport;
@@ -1637,8 +1637,8 @@ impl MarkdownViewportSourceRequest {
         Ok(())
     }
 
-    /// Leaf 续批只保实际记录、在途 origin 或原 Plain 前缀仍持有的 opaque seed。
-    /// previous 保持不可变，旧公开句柄/分叉仍有原权限；这里只克隆后继真正需要的 Rc。
+    /// Retain only opaque seeds still owned by real records, in-flight origin, or the original Plain prefix during leaf continuation.
+    /// previous stays immutable and old handles retain their original rights; clone only Rc handles the successor actually needs.
     fn retained_leaf_blocks(
         &self,
         previous: &VerifiedMarkdownViewportSources,
@@ -1649,12 +1649,12 @@ impl MarkdownViewportSourceRequest {
             .iter()
             .filter_map(|record| match record.as_ref() {
                 SourceRecord::Line(line) => line.semantic_block.as_ref(),
-                SourceRecord::Leaf(_) => None, // 真 Leaf 不持 Inline seed，不能凭相邻范围补一个。
+                SourceRecord::Leaf(_) => None, // Actual leaves own no inline seed; adjacent coordinates cannot manufacture one.
             });
         let mut next_record = records.next();
         let mut control = 0;
-        // 两个目录都沿同一 Global 的真实来源顺序产生；双游标只跳过已到前方的记录，
-        // 坐标仅用于归并，不授予身份。最终保留必须命中原 Rc 或实际在途拥有者。
+        // Both directories follow the same Global's real source order. The two cursors skip earlier records and use coordinates
+        // only for merging, never identity; retention requires the original Rc or an actual in-flight owner.
         for block in &previous.blocks {
             let start = block.seed.physical_range().start;
             while let Some(record) = next_record {
@@ -1674,16 +1674,16 @@ impl MarkdownViewportSourceRequest {
                 .semantic
                 .as_ref()
                 .is_some_and(|job| job.retains_plain_block(block));
-            control += 3; // 三条实际拥有关系各核一次，没有全历史目录的嵌套扫描。
+            control += 3; // Check three actual ownership relationships once each, without nested scans of historical directories.
             if retained_record || pending_origin || plain_prefix {
                 blocks.push(Rc::clone(block));
                 control += 1;
-            } // 已无后继拥有者的前方 seed 随旧 previous 归还，不占下一批256条来源库存。
+            } // An earlier seed without a successor owner leaves with old previous instead of occupying the next 256-record page.
         }
         (blocks, control)
     }
 
-    /// 只由显式 Leaf 工厂与已接受的原 forward 路径调用，不会额外创建 source request。
+    /// Called only by the explicit Leaf factory and accepted original forward path, without creating an additional source request.
     fn install_leaf_semantic(
         &mut self,
         viewport: Range<usize>,
@@ -1693,13 +1693,13 @@ impl MarkdownViewportSourceRequest {
             .as_ref()
             .is_some_and(|job| !job.retains_plain_prefix())
         {
-            // 只有已移走输出与 underline 的普通前缀可以驻留父原槽；活动语义不能并行，
-            // 新 Leaf 仍先核来源与 Bounds，直到同 seed 匹配后才重新使用这个唯一槽。
+            // Only a Plain prefix whose output and underline were transferred may remain in the parent slot; active semantics cannot run in parallel.
+            // The new Leaf first checks Source and Bounds, then reuses this sole slot only after matching the same seed.
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
         let quota = self.batch.source_semantic_quota()?;
         let work = if let Some(job) = self.leaf_semantic.as_mut() {
-            // 父forward已核原Source/完整选择与最近publication；只能重用这个已发布的唯一槽。
+            // Parent forward preflight checked original Source, complete selection, and latest publication; only this published slot may be reused.
             job.continue_forward(viewport, self.source_underline.take(), quota)?
         } else {
             let job = RootLeafSemanticJob::new(
@@ -1719,7 +1719,7 @@ impl MarkdownViewportSourceRequest {
         Ok(())
     }
 
-    /// 子语义续体使用原 batch 尚未消耗的累计额度；新块不能重新获得整份扫描预算。
+    /// Child semantic continuations use only the original batch's remaining cumulative fuel; new blocks cannot regain its full scan budget.
     fn remaining_source_limits(&self) -> Result<(usize, usize), MarkdownTableRequestError> {
         let limits = self.batch.source_limits()?;
         let total = self.batch.total_work();
@@ -1729,7 +1729,7 @@ impl MarkdownViewportSourceRequest {
         ))
     }
 
-    /// 外层 advance 已核调用者与当前 Core 选择；内层仍逐阶段核同一完整 anchor/head。
+    /// Outer advance checks caller context against current Core selection; inner stages still check the same complete anchor/head pair.
     fn current_authority(&self) -> MarkdownViewportSourceAuthority {
         MarkdownViewportSourceAuthority {
             context_revision: self.context_revision,
@@ -1747,18 +1747,18 @@ fn check_authority(
     authority: MarkdownViewportSourceAuthority,
 ) -> Result<(), MarkdownTableRequestError> {
     if authority.cancelled {
-        // 实际取消先于其它数值检查；外层可变入口把该首因固定并立即释放派生状态。
+        // Actual cancellation precedes numeric checks; the mutating outer entry fixes that first cause and releases derived state.
         return Err(MarkdownTableRequestError::Cancelled);
     }
     if !source.is_current(document) {
-        // Weak allocation 身份、generation 与长度必须同时相同；同字节另一个文档和 Undo 新代均拒绝。
+        // Weak allocation identity, generation, and lengths must all match; another equal-content document or a new Undo generation is rejected.
         return Err(MarkdownTableRequestError::SourceSuperseded);
     }
     if context_revision != authority.context_revision
         || selection != authority.selection
         || selection != document.selection()
     {
-        // 同有序 range 的反向选择也不同；当前 Core 事实与调用方上下文不能给旧来源补签。
+        // Reversing an equal ordered range changes selection identity; current Core facts/caller context cannot reauthorize old sources.
         return Err(MarkdownTableRequestError::PublicationSuperseded);
     }
     Ok(())
@@ -1776,7 +1776,7 @@ fn publication_metadata() -> usize {
 }
 
 fn publication_reservation_metadata() -> usize {
-    // 准入提前覆盖最坏 Plain 分支；实际工作/旧库存仍按 publication 的真实 variant 单独计算。
+    // Reserve for the worst Plain branch upfront; actual work and retained inventory still depend on the real publication variant.
     publication_metadata() + semantic::plain_publication_metadata()
 }
 

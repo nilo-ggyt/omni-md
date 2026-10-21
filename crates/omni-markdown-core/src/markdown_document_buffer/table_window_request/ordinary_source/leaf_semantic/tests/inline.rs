@@ -1,9 +1,11 @@
-//! 从真实 Source 工厂验收已接入 inline；小块原 Parser 和 giant code 使用不同真实资源口径。
+//! Inline behavior through the real Source factory. Finite full-parser inputs and giant streaming
+//! code retain their distinct actual copy/resource costs.
 
 use super::*;
 
 #[test]
-/// 视口前另一真实小块的引用也必须先解析；当前普通/富文本目标与已解析链接库存均不能被丢掉。
+/// Resolve references from an actual preceding finite block without losing the current plain/rich
+/// target or its already resolved links.
 fn offscreen_finite_reference_before_code_keeps_target_semantics_and_original_global() {
     for prefix in ["", "## "] {
         for target in ["target 普通正文\n", "target **粗体** [当前][T]\n"] {
@@ -67,7 +69,8 @@ fn offscreen_finite_reference_before_code_keeps_target_semantics_and_original_gl
 }
 
 #[test]
-/// 两个不同前置块分次增加查询时仍复用原Global与Map，第二次重放不能覆盖当前目标已解析的T。
+/// Adding queries from two preceding blocks reuses the original Global/map; the second replay
+/// cannot overwrite the target's already resolved T.
 fn multiple_offscreen_reference_blocks_preserve_target_links_and_finish_all_replays() {
     let source = "<u>open\n\n[第一处][U] `</u>` first offscreen\n\n## [第二处][V] `</u>` second offscreen\n\ntarget **粗体** [当前][T]\n\ntrue close</u>\n\n[U]: https://example.com/u-first\n[U]: https://example.com/u-later\n[V]: https://example.com/v-first\n[V]: https://example.com/v-later\n[T]: https://example.com/current\n";
     let (_directory, mut doc) = document(source);
@@ -108,10 +111,12 @@ fn multiple_offscreen_reference_blocks_preserve_target_links_and_finish_all_repl
 }
 
 #[test]
-/// 新增前置查询后的取消和真实映射回收失败都必须释放原恢复义务，且后续操作不能覆盖首因。
+/// Cancellation or actual reclaim failure after query preparation must release the original restore
+/// obligation and preserve the first failure across later operations.
 fn offscreen_reference_preparation_cancel_and_real_source_error_release_original_owners() {
     let prefix = "[前置][U] `</u>` offscreen after\n";
-    // 真定义放到超过原64KiB驻留窗口的后方；新增查询必须实际换页，回收故障才有真实触发点。
+    // Place real definitions beyond the original 64-KiB resident window so new queries actually
+    // page/reclaim, rather than merely arming a fault with no I/O trigger.
     let distant = "中".repeat(40_000);
     let source = format!(
         "<u>open\n\n{prefix}\ntarget **粗体** [当前][T]\n\ntrue close</u>\n\n{distant}\n\n[U]: https://example.com/first\n[T]: https://example.com/current\n"
@@ -131,7 +136,7 @@ fn offscreen_reference_preparation_cancel_and_real_source_error_release_original
                 request.advance(&doc, authority(&doc), 4096).unwrap();
             assert!(work.metadata_bytes <= 4096 && work.parser_input_bytes <= 2048);
             if work.parser_input_bytes == prefix.len() {
-                prepared = true; // 实际前置块的原Parser已收查询，尚未把未知引用当Missing解释HTML。
+                prepared = true; // The preceding block's parser collected queries before unknown references can affect HTML as Missing.
                 break;
             }
         }
@@ -163,7 +168,7 @@ fn offscreen_reference_preparation_cancel_and_real_source_error_release_original
             );
             assert!(observer.reclaim_attempts() > attempts);
             assert_eq!(observer.first_errno(), Some(libc::EIO));
-            request.cancel(); // 真实I/O首因已经固定，迟到的取消不得把它替换成普通取消。
+            request.cancel(); // A late cancellation cannot replace the established real I/O failure.
             error
         } else {
             request.cancel();
@@ -185,7 +190,8 @@ fn offscreen_reference_preparation_cancel_and_real_source_error_release_original
 }
 
 #[test]
-/// 引用位于code之前时，真实定义/缺失先由同一Global闭合；code中的假闭标签不能截断外层下划线。
+/// Resolve references before code on the same Global; literal closing tags inside code cannot
+/// truncate an outer underline owner.
 fn closed_root_reference_before_code_uses_verified_resolution_for_html_priority() {
     for prefix in ["", "## "] {
         for definitions in [
@@ -224,7 +230,7 @@ fn closed_root_reference_before_code_uses_verified_resolution_for_html_priority(
             let label = units(&source, label..label).start;
             let link = ready.link_at_for(&doc, authority(&doc), label).unwrap();
             if definitions.is_empty() {
-                assert!(link.is_none()); // 只有真实EOF才能证明这个query缺失；未收集label不在此豁免。
+                assert!(link.is_none()); // Only true EOF proves this query missing; an uncollected label is no substitute.
             } else {
                 assert_eq!(
                     link.unwrap().destination.clone().into_string(),
@@ -235,7 +241,8 @@ fn closed_root_reference_before_code_uses_verified_resolution_for_html_priority(
     }
 }
 
-/// 每个4096量子真实交还调用者；有界 Parser 的有限输入单独计量，不放宽旧零复制用例。
+/// Return every real 4096 quantum to the caller. Account bounded parser input separately, without
+/// weakening streaming zero-copy expectations.
 pub(super) fn finish_inline(
     request: &mut MarkdownViewportSourceRequest,
     document: &MarkdownDocumentBuffer,
@@ -265,7 +272,8 @@ pub(super) fn finish_inline(
 }
 
 #[test]
-/// 新路径必须实际触发原 Parser，逐位置保留粗斜体、删除、代码、链接和中文/emoji 坐标。
+/// Exercise the original parser and preserve bold/italic/strike/code/link semantics plus
+/// Chinese/emoji coordinates position by position.
 fn closed_root_inline_is_production_ready_and_has_decoded_source_bound_links() {
     let source = "中文 **粗体**、*斜体*、~~删除~~、`代码😀`、[链接](https://example.com/a?x=1&amp;y=2) end\n";
     let (_directory, mut doc) = document(source);
@@ -331,7 +339,8 @@ fn closed_root_inline_is_production_ready_and_has_decoded_source_bound_links() {
 }
 
 #[test]
-/// 命中点的窄查询仍取得原闭合块的完整链接；后方整表不能成为打开首行链接的前置语义工作。
+/// A narrow hit-point request still returns the original closed block's complete links, without
+/// requiring semantic preparation of the entire following table.
 fn hit_point_reposition_keeps_complete_links_without_requesting_the_following_table() {
     let prefix = "未保存的中文😀前缀。\n\n[甲😀乙][目标] 和 [同块](../同块.md)\n\n";
     let mut source = String::from(prefix);
@@ -344,7 +353,8 @@ fn hit_point_reposition_keeps_complete_links_without_requesting_the_following_ta
         )
         .unwrap();
     }
-    // 引用定义在表后，窄窗口仍须按原Global解决完整引用，不能把窗口结束当作真实EOF。
+    // Definitions follow the table; even this narrow window resolves them on the original Global,
+    // without treating the viewport end as source EOF.
     source.push_str("\n[目标]: https://example.com/a?x=1&amp;y=2 \"真实标题\"\n\n末尾独立正文。\n");
     let (directory, mut doc) = document(&source);
     let backing = doc.original_backing_observer().unwrap();
@@ -369,8 +379,8 @@ fn hit_point_reposition_keeps_complete_links_without_requesting_the_following_ta
         .unwrap()
         .unwrap();
     for index in [label.start, label.start + 1, label.end - 1] {
-        // 三次都沿同一个已发布SourceRequest重定位，既覆盖首/尾文字，也覆盖emoji的真实起点。
-        // index+1只请求命中单位；Parser的闭合块和引用定义仍必须真实读取、解析和收费。
+        // Reposition the same published SourceRequest at label endpoints and the actual emoji start.
+        // A one-unit viewport still requires actual closed-block/reference reads and parser work.
         request
             .reposition(&doc, &previous, index..index + 1, authority(&doc))
             .unwrap();
@@ -394,8 +404,9 @@ fn hit_point_reposition_keeps_complete_links_without_requesting_the_following_ta
             link.destination.clone().into_string(),
             "https://example.com/a?x=1&y=2"
         );
-        // 原有限Parser已完整证明同块另一个链接，正label事实不依赖当前1-unit样式覆盖。
-        // 样式和无链接结论仍受原coverage限制，不能据此把后方整表或其它块冒充Ready。
+        // The finite parser proved another complete link in this block independently of the one-unit
+        // style coverage. Styles and negative link results remain coverage-bound; these positive
+        // label facts do not make the following table or another block Ready.
         assert!(
             ready
                 .query_for(&doc, authority(&doc), other_label.start)
@@ -425,9 +436,10 @@ fn hit_point_reposition_keeps_complete_links_without_requesting_the_following_ta
             Err(MarkdownTableRequestError::Window(
                 MarkdownTableWindowError::ContextPending
             ))
-        ); // 取得完整目标不扩大已发布的可查询范围，也不为窗口外文字补默认语义。
+        ); // Complete targets do not widen style coverage or provide default semantics outside it.
     }
-    // 同字节文件仍是另一个真实Doc/Source；正链接不能绕过原根身份而跨文档续权。
+    // Identical bytes in another file still belong to another Doc/Source; positive links cannot
+    // bypass root identity to acquire cross-document authority.
     let (_other_directory, other_doc) = document(&source);
     let other_backing = other_doc.original_backing_observer().unwrap();
     let MarkdownOrdinarySemanticState::RootLeafReady(ready) = previous
@@ -459,7 +471,8 @@ fn hit_point_reposition_keeps_complete_links_without_requesting_the_following_ta
 }
 
 #[test]
-/// 实际 label 内的嵌套括号、转义和 code 不截断可见文字；首尾原空白也不能被目标 marker 吞掉。
+/// Nested brackets, escapes, and code do not truncate the actual label, and target markers cannot
+/// consume its original leading/trailing whitespace.
 fn closed_root_links_preserve_real_label_boundaries_and_targets() {
     for label in [
         "a [b] c",
@@ -490,7 +503,7 @@ fn closed_root_links_preserve_real_label_boundaries_and_targets() {
         let start = "before [".len();
         for (relative, scalar) in label.char_indices() {
             if scalar == '`' {
-                continue; // 真正 Code delimiter 自己仍由原 code owner 控制显隐，不能当普通 label。
+                continue; // The real code owner controls its delimiters; they are not plain label text.
             }
             let index = units(&source, start + relative..start + relative).start;
             let query = ready
@@ -536,7 +549,8 @@ fn closed_root_links_preserve_real_label_boundaries_and_targets() {
 }
 
 #[test]
-/// 引用定义在视口之前或之后都沿原 Global first-wins；不能用 block-only Parser 把它们判缺失。
+/// Definitions before/after the viewport keep the original Global's first-definition rule; a
+/// block-only parser cannot declare them missing.
 fn closed_root_links_resolve_global_first_definition_and_preserve_old_publication() {
     let body = "正文 **粗体** 和 [链接][TARGET]。\n";
     let source = format!(
@@ -582,7 +596,8 @@ fn closed_root_links_resolve_global_first_definition_and_preserve_old_publicatio
 }
 
 #[test]
-/// 真实 giant 单段落可以跨视口查到远处 closer，code 的假 HTML 不改变全局 underline 配对。
+/// A giant paragraph can prove a distant closer beyond the viewport; literal HTML inside code
+/// cannot alter global underline pairing.
 fn giant_inline_code_and_cross_block_underline_match_original_parser_without_copy() {
     let body = format!(
         "code prefix ` {} </u> 😀 end ` after\n",
@@ -613,7 +628,7 @@ fn giant_inline_code_and_cross_block_underline_match_original_parser_without_cop
         .unwrap()
         .styles;
     assert!(styles.contains(MarkdownPresentationStyles::INLINE_CODE));
-    assert!(!styles.contains(MarkdownPresentationStyles::UNDERLINE)); // 原投影跨过 code 保留配对，但不在代码本体画下划线。
+    assert!(!styles.contains(MarkdownPresentationStyles::UNDERLINE)); // Pairing crosses code without drawing underline on literal code.
     let pointer = request.batch.source_probe_state().0;
     let next = code_middle + 20..code_middle + 55;
     request
@@ -658,7 +673,8 @@ fn giant_inline_code_and_cross_block_underline_match_original_parser_without_cop
 }
 
 #[test]
-/// 短块原 Parser 的 code 事件实际交给同一 scanner，外部开标记不得被 code 中的假 closer 截断。
+/// Feed finite-parser code events to the same scanner; a literal closer inside code cannot end an
+/// external opening tag.
 fn bounded_inline_code_cannot_close_an_external_underline() {
     let source = "<u>outside open\n\nshort `</u>` **粗体** after\n\ntrue close</u> tail\n";
     let (_directory, mut doc) = document(source);
@@ -682,7 +698,8 @@ fn bounded_inline_code_cannot_close_an_external_underline() {
 }
 
 #[test]
-/// 真 Root ATX 的小块复用完整 Parser；级别、缩进、闭合 #、选择显隐与 inline/目标共同接受差分。
+/// Finite root ATX uses the full parser; compare level, indentation, closing hashes, selection-based
+/// visibility, inline styles, and destinations together.
 fn short_root_atx_inline_uses_real_leaf_and_original_parser() {
     for level in 1..=6 {
         for ending in ["\n", "\r\n", ""] {
@@ -804,7 +821,8 @@ fn short_scoped_rich_atx_keeps_original_inline_references_prefixes_and_canonical
 }
 
 #[test]
-/// 同一原 Global 的 ATX code 事件必须先排除假 HTML；代码后的普通标题文字仍继承外部配对。
+/// Original-Global ATX code events exclude literal HTML; ordinary heading text after code still
+/// inherits the actual external pairing.
 fn short_atx_code_does_not_close_external_underline() {
     let source = "outside <u>open\n\n## code `</u>` **粗体** after\n\ntrue close</u> tail\n";
     let (_directory, mut doc) = document(source);
@@ -836,7 +854,8 @@ fn short_atx_code_does_not_close_external_underline() {
 }
 
 #[test]
-/// 真短容器段落和 Setext 共用原续行算法；独立完整 Parser 验每个源位置、链接及活动前缀。
+/// Finite scoped paragraphs/Setext share original continuation rules; an independent full parser
+/// checks source positions, links, and active prefixes.
 fn short_scoped_paragraph_and_setext_preserve_original_inline_and_physical_prefixes() {
     for block in [
         "> 中文 **粗体** *斜体* `代码😀` [引用][T] &amp; $公式$\n> 第二行 ~~删除~~ 和 [行内](https://example.com/a?x=1&amp;y=2)\n",
@@ -935,8 +954,8 @@ fn short_footnotes_preserve_real_numeric_labels_nested_openings_and_rich_childre
         "[^123]: 中文 **Setext** [链接][T]\n    ===\n",
         "[^123]: 中文 **EOF粗体** [链接][T]",
     ] {
-        // 原引用定义仍在真实块之外，由同 Global 证明 first-wins；不能把 label 当 ordered marker，
-        // 也不能把 footnote 的后继 quote/list 风格反向加给其字面 opening。
+        // Definitions outside the block retain same-Global first-wins. Footnote labels cannot become
+        // ordered markers, nor can later quote/list styles propagate backward into literal openings.
         let source =
             format!("[T]: https://example.com/first\n[T]: https://example.com/later\n\n{block}");
         let byte_start = source.find(block).unwrap();
@@ -979,8 +998,9 @@ fn short_footnotes_preserve_real_numeric_labels_nested_openings_and_rich_childre
                     .into_string(),
                 "https://example.com/first"
             );
-            // 真实 raw 值从原文档流式输出；标签、实体和未归一化 code 都必须原样保存，
-            // 不因视觉前缀消费、反向选择或引用解析而产生磁盘写入/第二份正文。
+            // Stream raw values from the original document, preserving tags/entities/raw code.
+            // Prefix presentation, reverse selection, and reference resolution must cause neither
+            // disk writes nor another canonical body.
             let mut actual = Vec::new();
             doc.write_utf16_range_to(requested.clone(), &mut actual)
                 .unwrap();
@@ -999,7 +1019,8 @@ fn short_footnotes_preserve_real_numeric_labels_nested_openings_and_rich_childre
 }
 
 #[test]
-/// Setext 原 Fact 仍持 Paragraph self，完整小块包含真实下划线行；不能只按段落样式成功。
+/// The original Setext fact retains Paragraph self and the finite block's actual underline row;
+/// plain paragraph styling alone is not successful heading presentation.
 fn short_root_setext_rich_inline_preserves_real_heading_and_reference() {
     let source = "[target]: https://example.com/first\n\n中文 **粗体** *斜体* `代码` [链接][TARGET]\n===\n\n[target]: https://example.com/wrong\n";
     let (_directory, doc) = document(source);
@@ -1030,7 +1051,7 @@ fn short_root_setext_rich_inline_preserves_real_heading_and_reference() {
     );
 }
 
-/// 请求范围来自独立完整 Parser 的真实 heading 事件，不能用待测工厂范围反造预期。
+/// Obtain bounds from the independent parser's actual heading event, not the factory under test.
 fn rich_heading_range(source: &str) -> Range<usize> {
     let range = Parser::new_ext(
         source,

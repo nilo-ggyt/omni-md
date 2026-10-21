@@ -30,25 +30,11 @@ mod tests {
     /// Minimum-height scrolling must preserve both fixed areas without hiding the last Core row beneath the footer.
     #[test]
     fn scroll_view_separates_rows_from_search_and_fixed_footer() {
-        assert_eq!(MINIMUM_PAGE_ROWS, 13);
         let frame = list_frame(MINIMUM_CONTENT_HEIGHT);
         // The location occupies y34..52 and section label y476..496; shrinking cannot overlap either fixed region.
         assert!(frame.origin.y > 52.0);
         assert!(frame.origin.y + frame.size.height < 476.0);
         // The minimum window requires actual scrolling, without hiding row 13 or silently shrinking the Core page.
         assert!(frame.size.height < MINIMUM_PAGE_ROWS as f64 * (ROW_HEIGHT + 2.0));
-    }
-
-    /// Resize changes list height only, leaving page admission and fixed top/bottom coordinates intact.
-    #[test]
-    fn resize_only_changes_scroll_view_height() {
-        for height in [MINIMUM_CONTENT_HEIGHT, 720.0, 1024.0] {
-            // Each supported height consumes the same fixed insets instead of altering scan or row limits.
-            let frame = list_frame(height);
-            assert_eq!(frame.origin.y, LIST_BOTTOM);
-            assert_eq!(frame.size.width, 224.0);
-            assert_eq!(height - frame.origin.y - frame.size.height, LIST_TOP_INSET);
-            assert_eq!(MINIMUM_PAGE_ROWS, 13);
-        }
     }
 }

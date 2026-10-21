@@ -1,19 +1,19 @@
-//! 同一 SourcePublication 的真实结构行；不把 raw 行或 H/D 上下文升级成单格 inline Ready。
+//! Real structural rows bound to one SourcePublication; raw rows and header/delimiter context do not grant cell inline readiness.
 
 use super::*;
 
 #[derive(Clone)]
-/// 原结构票与原来源发布各只保共享 metadata；没有文档、映射、正文 String 或另一个 Global。
+/// Share only the original structural ticket and publication metadata, without a document, mapping, body String, or second Global.
 pub struct VerifiedMarkdownTableRowSource {
     pub(super) ticket: Rc<MarkdownTableStructuralWindow>,
     pub(super) publication: Rc<SourcePublication>,
     pub(super) ordinal: usize,
-    /// 同一次真实结构发布或 RequiredRow 的 End；不为附终点复制、替换原多行结构票。
+    /// An End from the original structural publication or RequiredRow replay; attaching it preserves the original multirow ticket.
     pub(super) terminal: Option<VerifiedTableEnd>,
 }
 
 impl VerifiedMarkdownTableRowSource {
-    /// 当前 Source/root、完整选择与 context 都必须仍属同一发布；冻结源不授新编辑权限。
+    /// Require the original Source/root, complete selection, and context; frozen source data alone grants no new edit authority.
     pub fn require_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -38,7 +38,7 @@ impl VerifiedMarkdownTableRowSource {
         ))
     }
 
-    /// 只让原 Doc 的提交边界借真正 terminal End；普通 Row/EOF 坐标不提供追加权限。
+    /// Lend a real terminal End to the document's commit boundary; ordinary row or EOF coordinates cannot authorize appending.
     pub(in crate::markdown_document_buffer) fn terminal_end_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -56,7 +56,7 @@ impl VerifiedMarkdownTableRowSource {
         Ok(Some(end))
     }
 
-    /// H 与 D 是同一个 flow 元素，body 保原物理行的完整 EOL 或真实 EOF；不按当前 frame 尾推结束。
+    /// Header and delimiter form one flow element; body rows retain their complete physical EOL or actual EOF, independent of frame ends.
     pub fn physical_utf16_range_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -99,7 +99,7 @@ impl VerifiedMarkdownTableRowSource {
 }
 
 impl VerifiedMarkdownViewportSources {
-    /// 查询只遍历当前有限来源页，不能扫整表或从 TABLE 样式位补造成员；范围外仍然未知。
+    /// Search only this finite source page. TABLE styles cannot manufacture membership, and positions outside coverage remain unknown.
     pub fn table_row_at_for(
         &self,
         document: &MarkdownDocumentBuffer,

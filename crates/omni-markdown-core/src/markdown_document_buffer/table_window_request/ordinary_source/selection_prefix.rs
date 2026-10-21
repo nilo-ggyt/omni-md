@@ -1,10 +1,10 @@
-//! 原请求证明的选择样式不变性只在同步移交中借用，不延长旧发布或字形句柄的权限。
+//! Borrow selection-style invariance only during synchronous handoff, without extending old publication or glyph-handle authority.
 
 use super::*;
 
-/// 原 Plain 前缀或同一 Root Code 正文内的选择移动，不会改变已证明范围内的样式。
-/// 借用同时约束请求、当前 Doc 和最后一次发布，不能跨修改/重投影留存为历史缓存。
-/// 此能力不认证 GCB、软行或可编辑范围，也不能代替新选择的语义发布。
+/// Selection movement within a proved Plain prefix or the same Root Code body leaves the proved styles unchanged.
+/// Joint borrows of the request, document, and last publication prevent retaining this proof across edits or reprojection.
+/// This capability proves no grapheme boundary, soft line, or editable range and does not replace publication for the new selection.
 pub struct MarkdownSelectionStyleInvariant<'a> {
     request: &'a MarkdownViewportSourceRequest,
     document: &'a MarkdownDocumentBuffer,
@@ -13,10 +13,9 @@ pub struct MarkdownSelectionStyleInvariant<'a> {
     kind: InvariantKind<'a>,
 }
 
-/// Root Code 的闭合 owner 来自原 producer，正文内没有可随选择变化的 inline marker；
-/// Root scope 也排除了 quote/list 的逐行前缀。其它结构与 underline owner 对两个正文
-/// 端点要么都包含、要么都不包含，所以此例可覆盖同 Source 已捕获的整个字形库存。
-/// Plain 仍只授原 scanner 已真实读完的末端，绝不借 Code 例扩大未知段落的权限。
+/// The original producer supplies a closed Root Code owner with no selection-sensitive inline markers or quote/list prefixes.
+/// Other structural and underline owners contain both body endpoints or neither, so this case covers the same Source's captured glyph store.
+/// Plain remains restricted to the scanner's actually read prefix; the Code case grants no authority over an unknown paragraph suffix.
 enum InvariantKind<'a> {
     PlainPrefix {
         utf16_end: usize,
@@ -27,11 +26,11 @@ enum InvariantKind<'a> {
 }
 
 impl MarkdownViewportSourceRequest {
-    /// 借出真实选择样式不变能力，供同 Source Composer 核全部已捕获字形和支持范围。
-    /// None 完全不改变请求/发布；成功也不退休旧发布，调用方必须紧接原 reproject_selection。
+    /// Lend the actual invariant so the same Source's Composer can check its captured glyphs and supported domain.
+    /// None changes nothing; success also leaves the old publication live, and the caller must immediately use reproject_selection.
     ///
     /// # Errors
-    /// 真实 Source 首错、取消、异 Doc/代次、完整选择或非最新发布失权不降为能力缺失。
+    /// Preserve source failure, cancellation, foreign document/generation, complete-selection mismatch, and stale publication errors.
     pub fn selection_style_invariant<'a>(
         &'a self,
         document: &'a MarkdownDocumentBuffer,
@@ -45,7 +44,7 @@ impl MarkdownViewportSourceRequest {
             || self.cell_inline.is_some()
             || self.row_source_position.is_some()
         {
-            return Ok(None); // 活跃作业仍有其原归还义务，不因新选择截断其输入或输出。
+            return Ok(None); // Active jobs still own their cleanup obligations; a new selection cannot truncate their work.
         }
         let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = &previous.semantic else {
             return Ok(None);
@@ -53,7 +52,7 @@ impl MarkdownViewportSourceRequest {
         if previous.table.windows_for(document)?.next().is_some()
             || !previous.table.structural_tables().is_empty()
         {
-            return Ok(None); // 当前表格窗口另有投影 owner，不能拿普通 Leaf 填满其凸包。
+            return Ok(None); // Table windows have their own projection owners; ordinary leaves cannot fill the hull between them.
         }
         let kind = if let Some(code) = leaf.root_code_leaf() {
             let body = code.root_code_body.as_ref().unwrap();
@@ -64,8 +63,8 @@ impl MarkdownViewportSourceRequest {
             {
                 return Ok(None);
             }
-            // 无表事实只认证这次有限窗口可以沿原 batch 重投影；全 Store 的样式
-            // 不变性来自真实 Root Code owner，不能要求当前 Gap 伪装成全文无表证明。
+            // The no-table fact admits reprojection of this finite window through the original batch.
+            // Store-wide style invariance comes from the real Root Code owner, not a fabricated document-wide gap.
             let mut covered = false;
             for gap in previous.table.gaps_for(document)? {
                 let range = gap.utf16_range_for(document)?;
@@ -93,7 +92,7 @@ impl MarkdownViewportSourceRequest {
                     && end.utf16 <= utf16.end;
             }
             if !covered {
-                return Ok(None); // 空目录不是负证明；Plain 仍须原 Gap 覆盖整个已读前缀。
+                return Ok(None); // An empty directory proves no absence; Plain requires the original gap to cover the whole read prefix.
             }
             InvariantKind::PlainPrefix {
                 utf16_end: end.utf16,
@@ -108,8 +107,8 @@ impl MarkdownViewportSourceRequest {
         }))
     }
 
-    /// 旧发布仍按旧完整选择绑定，但 Doc 已处于新选择；只在此显式移交入口分别核这两项事实。
-    /// 所有检查均为原 owner 的只读观察，没有 Native 回调、源片借用或新的生命周期状态。
+    /// The old publication retains its complete old selection while the document has the new one; this explicit handoff checks both.
+    /// These checks only observe original owners, without Native callbacks, source leases, or another lifecycle state.
     fn require_selection_invariant_publication(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -145,8 +144,8 @@ impl MarkdownViewportSourceRequest {
 }
 
 impl MarkdownSelectionStyleInvariant<'_> {
-    /// Composer 只消费同一 Canonical Source 的已证末端，不把裸 Range 交给 Native 当授权。
-    /// Doc 的不可变借用挡住同栈换选择，Request 借用挡住退休/取消；仍在消费紧前复核原首错。
+    /// Let Composer consume a proved endpoint for the same Canonical Source, without turning a naked range into Native authority.
+    /// Immutable borrows prevent same-stack selection changes or request retirement; recheck original health immediately before consumption.
     pub(crate) fn end_for(
         &self,
         source: &crate::MarkdownLayoutTextSource,
@@ -167,8 +166,8 @@ impl MarkdownSelectionStyleInvariant<'_> {
         match &self.kind {
             InvariantKind::PlainPrefix { utf16_end } => Ok(*utf16_end),
             InvariantKind::RootCode { leaf } => {
-                // 全域能力仍由这一真实闭合 Leaf 绑定原 Doc 末端；不是 usize::MAX 或
-                // 调用者提供的全局布尔。支持域检查、原 Font/Source 健康仍由 Composer 执行。
+                // The real closed leaf binds this wider capability to the original document end.
+                // Composer still checks its supported domain and original Font/Source health; no global boolean substitutes for the leaf.
                 if leaf.block.source_end() != self.document.byte_len() {
                     return Err(MarkdownTableRequestError::SourceSuperseded);
                 }

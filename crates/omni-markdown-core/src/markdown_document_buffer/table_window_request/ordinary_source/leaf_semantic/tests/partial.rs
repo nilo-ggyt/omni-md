@@ -1,4 +1,5 @@
-//! 部分覆盖必须与完整语义oracle相符；已证Root Link真实消费，块间separator/未知scope仍拒绝。
+//! Compare partial coverage with a complete semantic oracle: proven root links are usable while
+//! separators and unknown scopes retain no neighboring authority.
 
 use super::production::{finish_sources, leaf_sources};
 use super::*;
@@ -10,7 +11,8 @@ fn ready(sources: &VerifiedMarkdownViewportSources) -> &VerifiedMarkdownRootLeaf
     ready
 }
 
-/// 完整parser只存在于测试；按显式预期交集逐字符比较，空洞连默认styles也不能获得。
+/// Compare every position against explicit expected intersections using a test-only full parser;
+/// holes cannot receive even default styles.
 pub(super) fn assert_partial_oracle(
     source: &str,
     document: &MarkdownDocumentBuffer,
@@ -23,8 +25,9 @@ pub(super) fn assert_partial_oracle(
     baseline
         .rebuild(document.generation(), 0..document.utf16_len(), source)
         .unwrap();
-    // LeafBlockKind只描述原producer的Leaf来源；新接通的普通段落仍是Line来源，不应
-    // 冒成代码块。分类来自独立完整Parser，不能把返回None与未覆盖的semanticGap混淆。
+    // LeafBlockKind describes original Leaf sources; ordinary paragraphs remain Line sources,
+    // without a fabricated code kind. Independent parser classification distinguishes a proven
+    // ordinary block's None kind from an uncovered semantic gap.
     let blocks: Vec<_> = Parser::new_ext(
         source,
         crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
@@ -69,8 +72,9 @@ pub(super) fn assert_partial_oracle(
             assert!(
                 query.utf16_range.start >= coverage.start && query.utf16_range.end <= coverage.end
             );
-            // quote代码的原prefix在显式golden coverage内；按相交的同一Parser块确认其
-            // Leaf类别。真正separator既不在expected内，也仍须同时拒绝样式和block查询。
+            // Explicit coverage includes the quote-code prefix. Its intersecting parser block
+            // supplies the actual Leaf kind; real separators stay outside expected coverage and
+            // must reject both style and block-kind queries.
             let (_, expected_kind) = blocks
                 .iter()
                 .find(|(range, _)| range.start < coverage.end && coverage.start < range.end)
@@ -97,8 +101,9 @@ pub(super) fn assert_partial_oracle(
     }
 }
 
-/// closing marker后的物理separator只推进producer cursor，不属于Parser的CodeBlock语义范围。
-/// 两套独立证据都必须成立：完整Parser没有给它代码样式，部分覆盖也没有授予它读取权限。
+/// A physical separator after the closing marker advances the producer but lies outside the parser's
+/// CodeBlock range. Independently require both the full parser's non-code style and partial
+/// publication's absence of query authority.
 fn assert_fence_separator_is_unknown(
     source: &str,
     document: &MarkdownDocumentBuffer,
@@ -146,7 +151,8 @@ fn mixed_window_publishes_real_root_links_and_nested_code_without_covering_separ
         "前面的{unknown}\n\n{code}\n中间{unknown}\n\n> ```\n> 容器代码\n> ```\n\n{rule}\n尾部{unknown}\n"
     );
     let code_start = source.find(code).unwrap();
-    // 显式golden止于末尾三个反引号；CRLF由consumed_end消费，不能扩张source_range。
+    // Explicit coverage stops at the final three backticks; consumed_end may consume CRLF without
+    // enlarging source_range.
     let code_marker_end = code_start + code.rfind("```").unwrap() + 3;
     assert_eq!(first_leaf_range(&source), code_start..code_marker_end);
     let mut expected = Vec::new();
@@ -161,7 +167,7 @@ fn mixed_window_publishes_real_root_links_and_nested_code_without_covering_separ
             Event::Start(Tag::BlockQuote(_)) => quote_start = Some(range.start),
             Event::End(pulldown_cmark::TagEnd::BlockQuote(_)) => quote_start = None,
             Event::Start(Tag::CodeBlock(_)) => {
-                // 新能力包含原 quote 首行 prefix；末端仍是原 Parser 的真正 CodeBlock 末端。
+                // Include the actual first quote prefix while retaining the parser's true CodeBlock end.
                 expected.push(units(
                     &source,
                     quote_start.unwrap_or(range.start)..range.end,
@@ -174,7 +180,7 @@ fn mixed_window_publishes_real_root_links_and_nested_code_without_covering_separ
     }
     let (_directory, mut doc) = document(&source);
     let backing = doc.original_backing_observer().unwrap();
-    // 完整方向仍进入同一语义票据，不能按有序范围补签相反方向。
+    // Keep full selection direction in the semantic ticket; equal ordered ranges cannot authorize reversal.
     doc.set_selection(MarkdownTextSelection {
         anchor_utf16: doc.utf16_len(),
         head_utf16: 0,
@@ -183,8 +189,8 @@ fn mixed_window_publishes_real_root_links_and_nested_code_without_covering_separ
     let requested = 0..doc.utf16_len();
     let (request, sources) = leaf_sources(&doc, requested.clone());
     let ready = ready(&sources);
-    // 原来被称为未知的direct link现已获原流式Parser证明；同一原字面必须逐位置迁正，
-    // 而真正块间separator仍不获得邻块权限，不能把整窗笼统签成一份Ready。
+    // The original streaming parser now proves these direct links. Compare the unchanged source
+    // position by position while retaining real separator gaps rather than blessing the whole window.
     assert_partial_oracle(&source, &doc, ready, requested.clone(), &expected);
     assert_fence_separator_is_unknown(
         &source,
@@ -264,7 +270,8 @@ fn viewport_edges_clip_only_true_leaf_source_and_preserve_unicode_half_unit_quer
             ready.coverage_for(&doc, authority(&doc)),
             Err(MarkdownTableRequestError::InvalidRequest)
         );
-        // NSString可查询emoji第二个UTF16单位，真实交集内的样式必须保持同一Unicode语义。
+        // NSString may query the emoji's second UTF-16 unit; both units within actual coverage must
+        // retain the same scalar's semantic style.
         assert_eq!(
             ready
                 .query_for(&doc, authority(&doc), emoji_utf16)
@@ -327,14 +334,15 @@ fn multiple_coverage_pages_share_one_global_and_forward_quota_with_live_old_publ
         source.push_str(&block);
         expected.push(first..source[..marker_end].encode_utf16().count());
         separators.push(marker_end..source.len());
-        // 短 scoped 链接已经接原 Parser；这个分页/累计配额负例保留真实 >2KiB 的长链接空洞。
-        // marker goldens、两页覆盖和零复制断言都不变，不能再把新支持的小块当作应当未知。
+        // Short scoped links use the original parser. Keep actual >2-KiB long-link holes in this
+        // paging/cumulative-quota case, retaining marker goldens/two-page/zero-copy coverage rather
+        // than treating newly supported finite blocks as unknown.
         source.push_str(&format!(
             "\n> 间隔[{}](https://example.com)\n\n",
             "真实未知链接".repeat(128)
         ));
     }
-    // golden来自显式marker端点，并独立对照完整Parser，而不是从Core覆盖反推预期。
+    // Derive goldens from explicit marker endpoints and check the independent parser, not Core coverage.
     let parser_ranges: Vec<_> = Parser::new_ext(
         &source,
         crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),

@@ -1,3 +1,5 @@
+//! Compare actual file-backed structural windows with fixed source coordinates and a finite independent complete-Parser oracle.
+
 use super::*;
 use crate::markdown_viewport_presentation::table_window::{
     MarkdownTableGlobalContext, MarkdownTableSourceLine, MarkdownTableWindowInput,
@@ -8,6 +10,7 @@ use crate::markdown_viewport_presentation::{
 };
 
 fn document(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+    // The returned TempDir owns this synthetic file; the buffer uses the same public open path as a normal note.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("S2-structure-fixture.md");
     std::fs::write(&path, source).unwrap();
@@ -19,7 +22,7 @@ fn finish(
     request: &mut MarkdownTableWindowStructureRequest,
     doc: &MarkdownDocumentBuffer,
 ) -> MarkdownTableStructureStep {
-    // 测试驱动才循环推进；产品一次scheduler回调只能调用一次advance并在事件栈外续接。
+    // Only the test driver loops synchronously; the product scheduler advances once and resumes outside the current event stack.
     for _ in 0..doc.byte_len().saturating_mul(32).saturating_add(10000) {
         let step = request.advance(doc, false, 4096).unwrap();
         let work = match step {
@@ -37,6 +40,7 @@ fn finish(
 }
 
 #[test]
+// Request a few distant rows and retain absolute ordinals, while exported metadata adds no strong document-root owner.
 fn real_large_table_request_keeps_only_absolute_requested_rows_and_no_source_owner() {
     let mut source = String::from("| H | C |\n| - | - |\n");
     for row in 1..=5000 {
@@ -73,6 +77,7 @@ fn real_large_table_request_keeps_only_absolute_requested_rows_and_no_source_own
 }
 
 #[test]
+// Grammar inside an omitted row must not change the projected later row when compared with the unchanged complete source.
 fn literal_dollars_and_braces_keep_omitted_row_projection_equal_to_full_source() {
     let hidden = format!("$x${}", "{}".repeat(255));
     let source = format!("| H |\n| - |\n| {hidden} |\n| $}}x{{y$ |\n");
@@ -88,6 +93,7 @@ fn literal_dollars_and_braces_keep_omitted_row_projection_equal_to_full_source()
     let ticket = request.structural_window_for(&doc).unwrap().unwrap();
     let header = ticket.header;
     let row = ticket.body[0];
+    // Copy only this finite fixture's proved header, delimiter, and target row for the public projection boundary.
     let h = doc
         .copy_table_source_range(header.header_byte_start..header.header_byte_end, 65536)
         .unwrap();
@@ -139,6 +145,7 @@ fn literal_dollars_and_braces_keep_omitted_row_projection_equal_to_full_source()
     })
     .unwrap();
     let mut oracle = MarkdownViewportPresentation::default();
+    // Whole-source parsing is confined to this finite test oracle, independently of the window-under-test's metadata.
     oracle.set_active_selection(usize::MAX..usize::MAX);
     oracle
         .rebuild(doc.generation(), 0..source.encode_utf16().count(), &source)
@@ -155,6 +162,7 @@ fn literal_dollars_and_braces_keep_omitted_row_projection_equal_to_full_source()
 }
 
 #[test]
+// Exhausting one cell batch cannot masquerade as table End; a separate real required-row replay establishes actual EOF membership.
 fn membership_end_and_window_batch_boundary_are_separate_permissions() {
     let h = format!("|{}\n", " h |".repeat(256));
     let d = format!("|{}\n", " - |".repeat(256));
@@ -170,7 +178,7 @@ fn membership_end_and_window_batch_boundary_are_separate_permissions() {
         .unwrap();
     finish(&mut request, &doc);
     let window = request.structural_window_for(&doc).unwrap().unwrap();
-    assert_eq!(window.rows().len(), 3); // 256*(H+3body)=1024本批cell，绝不把后17行禁用。
+    assert_eq!(window.rows().len(), 3); // Header plus three 256-column rows consumes this batch's 1024 cells, without disabling later rows.
     assert_eq!(window.next_required_row(), Some(4));
     assert!(window.table_end().is_none());
     let mut after = doc
@@ -193,6 +201,7 @@ fn membership_end_and_window_batch_boundary_are_separate_permissions() {
 }
 
 #[test]
+// Scan through a giant opaque prefix incrementally, then compare the actual quoted table's UTF-16 coordinates with original bytes.
 fn giant_opaque_prefix_and_utf16_coordinates_remain_bounded_and_true() {
     let source = format!(
         "```\n{}\n```\n\n> | 标题😀 |\r\n> | - |\r\n> | 内容😀 |\r\n",
@@ -239,6 +248,7 @@ fn giant_opaque_prefix_and_utf16_coordinates_remain_bounded_and_true() {
 }
 
 #[test]
+// Equal text, restored roots, and cleared cancellation flags cannot renew a request after its original authority fails.
 fn stale_source_ready_cancel_and_undo_cannot_revive_structure_authority() {
     let source = "| H |\n| - |\n| body |\n";
     let (_directory, mut doc) = document(source);
@@ -251,7 +261,7 @@ fn stale_source_ready_cancel_and_undo_cannot_revive_structure_authority() {
         request.advance(&other, false, 4096),
         Err(MarkdownTableRequestError::SourceSuperseded)
     );
-    // 错误sticky，换回原note也不能把已撤权请求当成新状态。
+    // Failure is sticky: returning to the original note cannot revive this retired request.
     assert_eq!(
         request.advance(&doc, false, 4096),
         Err(MarkdownTableRequestError::SourceSuperseded)
@@ -280,6 +290,7 @@ fn stale_source_ready_cancel_and_undo_cannot_revive_structure_authority() {
 }
 
 #[test]
+// A probe within a table must still recover earlier visible rows and header from that same actual table, without widening requested authority.
 fn probe_in_middle_covers_earlier_visible_rows_and_header_from_the_same_table() {
     let source = "| H |\n| - |\n| first |\n| second |\n| third |\n| fourth |\n";
     let (_directory, doc) = document(source);
@@ -299,7 +310,7 @@ fn probe_in_middle_covers_earlier_visible_rows_and_header_from_the_same_table() 
             .collect::<Vec<_>>(),
         vec![1, 2, 3]
     );
-    // 定位点必须在请求视口；不能返回与外部显示范围毫不相关的完整性声明。
+    // The probe must lie within the requested viewport; an unrelated display range cannot receive this structural claim.
     assert!(
         doc.table_window_structure_request(MarkdownTableWindowTarget::AtUtf16(at), 0..12)
             .is_err()
@@ -307,6 +318,7 @@ fn probe_in_middle_covers_earlier_visible_rows_and_header_from_the_same_table() 
 }
 
 #[test]
+// A full front batch is not proof of membership at a later target; retain actual batch continuation and withhold table End.
 fn row_limit_includes_context_header_and_full_front_batch_waits_for_real_target_membership() {
     let mut source = String::from("| H |\n| - |\n");
     for row in 1..=300 {
@@ -320,7 +332,7 @@ fn row_limit_includes_context_header_and_full_front_batch_waits_for_real_target_
     finish(&mut request, &doc);
     let ticket = request.structural_window_for(&doc).unwrap().unwrap();
     assert!(ticket.includes_header());
-    assert_eq!(ticket.rows().len(), 255); // H+255body正好256，符合投影入口同一上限。
+    assert_eq!(ticket.rows().len(), 255); // The header and 255 body rows reach the same 256-row projection limit.
     assert_eq!(ticket.rows().first().unwrap().row_ordinal, 1);
     assert_eq!(ticket.rows().last().unwrap().row_ordinal, 255);
     assert_eq!(ticket.next_required_row(), Some(256));

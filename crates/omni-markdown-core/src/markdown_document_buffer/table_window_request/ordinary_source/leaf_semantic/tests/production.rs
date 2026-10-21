@@ -1,4 +1,5 @@
-//! 从公开 Leaf 工厂进入原来源 owner，验证发布、续批和失效；不直接构造语义 job。
+//! Enter the original source owner through the public Leaf factory to verify publication,
+//! continuation, and revocation, without directly constructing semantic jobs.
 
 use super::*;
 
@@ -11,7 +12,8 @@ pub(super) fn finish_sources(
         .saturating_mul(100)
         .saturating_add(10000)
     {
-        // 真实最小量子逐次交还给调用方；没有函数内推进到 EOF 或 Ready 的生产捷径。
+        // Return each original minimum quantum to the caller; production has no internal shortcut
+        // that loops until EOF or Ready.
         let (MarkdownViewportSourceStep::Progress { work }
         | MarkdownViewportSourceStep::SourcesAvailable { work }) =
             request.advance(document, authority(document), 4096)?;
@@ -71,7 +73,7 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
         file.write_all(PARAGRAPH.as_bytes()).unwrap();
     }
     file.sync_all().unwrap();
-    drop(file); // 合成源逐片写入；生产打开前结束写句柄，不构造整篇期望String。
+    drop(file); // Write fixture segments and close before production open, without a whole-document expected String.
 
     let mut doc = MarkdownDocumentBuffer::open(&path, 1024 * 1024).unwrap();
     let backing = doc.original_backing_observer().unwrap();
@@ -82,7 +84,8 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
         .viewport_leaf_source_request(0..1, 57, doc.selection())
         .unwrap();
     super::inline::finish_inline(&mut request, &doc).unwrap();
-    // 第一份不可变公开结果跨越全部续批；请求不能为了回收历史seed而改写旧读者。
+    // Keep the first immutable public result across all continuations; reclaiming historical seeds
+    // must not rewrite an existing reader.
     let first = request
         .take_sources_for(&doc, authority(&doc))
         .unwrap()
@@ -104,7 +107,8 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
                     | HeadingStep::Found { work, .. }
                     | HeadingStep::NotFound { work } => work,
                 };
-                // 查询的源片、复制和外存工作仍受原量子限制；找到标题不等于正文排版已完成。
+                // Original per-step limits still bound source/copy/storage work; finding an anchor
+                // does not prove that the destination body has completed layout.
                 assert!(work.source_bytes <= 4096 && work.copied_bytes <= 4096);
                 assert!(work.storage_bytes <= 4096 && work.parser_input_bytes <= 16 * 1024);
                 match step {
@@ -116,8 +120,9 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
             .expect("有限合成源上的真实标题查询必须结束");
         assert_eq!(target.position_for(&doc).unwrap(), expected_heading);
         if round != 0 {
-            // 和实际链接导航一致：先沿原请求回到首链接，再改变完整选择并重投影首行。
-            // 结构与语义累计fuel都归同一个请求；不能为第二次远端跳转重领整份预算。
+            // Match link navigation: return to the first link on the original request, change full
+            // selection, and reproject. Structural/semantic totals remain owned by that same
+            // request; a second distant jump receives no fresh cumulative allowance.
             request
                 .reposition(&doc, previous.as_ref().unwrap(), 0..1, authority(&doc))
                 .unwrap();
@@ -137,7 +142,7 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
             assert_eq!(
                 opening.ordinary_semantics_for(&doc, authority(&doc)).err(),
                 Some(MarkdownTableRequestError::PublicationSuperseded)
-            ); // 新选择不能继续使用刚退休的旧首行发布。
+            ); // The new selection cannot reuse the just-retired opening-line publication.
             drop(opening);
             super::inline::finish_inline(&mut request, &doc).unwrap();
             previous = request.take_sources_for(&doc, authority(&doc)).unwrap();
@@ -150,8 +155,9 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
                 (blank - 1..blank, false),
                 (blank..blank + 1, false),
             ] {
-                // 原生排版按完整79字正文、行末LF、空白LF推进，不以段首一字代替真实切窗。
-                // 空白只保来源结果；后继正文仍必须从原Global取得当前块的真实语义。
+                // Follow Native's complete body/end-LF/blank-LF windows, not a one-character
+                // paragraph sample. Blank space keeps source facts only; later body windows still
+                // require actual current-block semantics from the original Global.
                 request
                     .continue_forward(
                         &doc,
@@ -160,7 +166,7 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
                         authority(&doc),
                     )
                     .unwrap();
-                drop(previous.take()); // 不人为保留全部历史发布；只保第一份及当前实际读者。
+                drop(previous.take()); // Retain the first and actual current reader, not every historical publication.
                 super::inline::finish_inline(&mut request, &doc).unwrap();
                 let current = request
                     .take_sources_for(&doc, authority(&doc))
@@ -185,7 +191,8 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
             }
         }
         if round != 0 {
-            // 第二次导航须真正经过前两个ATX，不能直接以查询所得坐标绕过原来源续批。
+            // Traverse both earlier ATX headings during the second navigation; the anchor coordinate
+            // cannot bypass actual source continuation.
             let mut start = first_heading;
             for heading in [ATX, COLLISION] {
                 let end = start + heading.len();
@@ -232,7 +239,7 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
             MarkdownPresentationStyles::EMPHASIS
         } else {
             MarkdownPresentationStyles::STRONG
-        })); // 不能仅证明标题坐标存在，实际短块inline样式也必须保留。
+        })); // Existing coordinates alone are insufficient; preserve the actual finite heading's inline styles.
         eprintln!(
             "far_heading_three_window_round={round} work={:?}",
             request.total_work()
@@ -244,7 +251,8 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
         request.advance(&doc, authority(&doc), 4096).err(),
         Some(MarkdownTableRequestError::Cancelled)
     );
-    // 恢复第一份结果所属的真实完整选择，只读旧发布；取消父请求不能破坏已移交的独立读者。
+    // Restore the first result's full selection to read it. Cancelling the parent cannot invalidate
+    // an independently transferred immutable reader.
     doc.set_selection(MarkdownTextSelection::caret(first_heading))
         .unwrap();
     let MarkdownOrdinarySemanticState::RootLeafReady(first_leaf) =
@@ -263,7 +271,7 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
     assert_eq!(doc.generation(), 0);
     assert!(!doc.is_dirty() && !doc.can_undo() && !doc.can_redo());
     assert!(doc.original_file_identity_is_unchanged());
-    // 磁盘期望独立逐片核验；完整正文没有为了比较进入一份String或Vec。
+    // Independently compare disk segments without loading the complete expected body into String/Vec.
     let mut file = std::fs::File::open(&path).unwrap();
     let mut bytes = [0; 128];
     for segment in std::iter::once(OPENING)
@@ -283,8 +291,9 @@ fn production_far_heading_survives_more_than_256_paragraph_and_blank_line_window
 
 #[test]
 fn selection_reprojection_reuses_true_prefix_and_stops_at_later_inline() {
-    // 原单段落先真实准备83K远端窗口，再改变完整有向选择返回首窗。未来的 ** 仍在同一
-    // 闭合 seed 中，但初次 Plain proof 尚未读到它；重投影不能把 proven_end 扩成全文证明。
+    // Prepare the actual distant 83K window, change directed selection, then return to the beginning.
+    // Later ** remains in the same closed seed but beyond the first Plain proof; reprojection
+    // cannot enlarge proven_end into a whole-paragraph proof.
     let mut source = "中文abc😀".repeat(12_000);
     let suffix_start = source.encode_utf16().count();
     source.push_str(" **真实粗体**");
@@ -320,8 +329,8 @@ fn selection_reprojection_reuses_true_prefix_and_stops_at_later_inline() {
             .unwrap(),
         "真正完成来源坐标和发布的单物理行必须能沿原结构重投影"
     );
-    // 保留旧公开句柄后选回同值，旧样式仍必须拒绝。这不是只靠当前数值不同的暂时失配，
-    // 也不能让旧 readonly 句柄为新请求续权；canonical/history 全程保持原始文稿。
+    // Even restoring old selection values cannot revive the retained old handle. Rejection must
+    // reflect retired authority, not a temporary numeric mismatch; canonical text/history stay intact.
     doc.set_selection(original_selection).unwrap();
     assert!(matches!(
         old.ordinary_semantics_for(&doc, authority(&doc)),
@@ -338,8 +347,8 @@ fn selection_reprojection_reuses_true_prefix_and_stops_at_later_inline() {
         .take_sources_for(&doc, authority(&doc))
         .unwrap()
         .unwrap();
-    // 每个后继仍使用4096原量子和本请求累计上限；实际完成全部83K小窗才证明 prefix
-    // 能供后续用户样式消费，而不是只检验一个保留对象或一次true返回值。
+    // Complete every small window through 83K under the original 4096 quanta/cumulative limits.
+    // Actual styles establish usable prefix reuse, beyond retaining an object or returning true once.
     for start in (0..83_076).step_by(7) {
         let range = start..start + 7;
         if start != 0 {
@@ -509,8 +518,8 @@ fn selection_reprojection_recomputes_real_markers_links_and_underlines() {
 #[cfg(feature = "paged-line-compose")]
 #[test]
 fn root_code_selection_invariant_reprojects_real_leaf_and_retires_previous_publication() {
-    // 四份原文分别保显式关闭/EOF、CRLF/缩进代码。正文中的 '</u>' 与 '**' 是
-    // literal，不能改变外部 underline owner 或生成 inline marker；期望仍来自完整 Parser。
+    // Cover explicit closure/EOF and CRLF/indented code. Literal '</u>' and '**' cannot alter the
+    // external underline owner or create inline markers; the full parser remains the independent oracle.
     for source in [
         "<u>外部\r\n\r\n  ```text\r\nliteral alpha 中文😀 **标记** </u><u> omega\r\n  ```\r\n\r\n外部关闭</u>\r\n",
         "前方 **真实粗体**\n\n```text\nliteral alpha 中文😀 **标记** omega",
@@ -538,8 +547,9 @@ fn root_code_selection_invariant_reprojects_real_leaf_and_retires_previous_publi
         doc.set_selection(original).unwrap();
         let (mut request, previous) = leaf_sources(&doc, requested.clone());
 
-        // 独立解析旧/新选择的整份短夹具，证明其它 Root 块也不受这次正文内选择影响；
-        // 生产能力只借同一个真实 Leaf，不能靠 requested 的7字符范围签整个 Store。
+        // Independently parse the short fixture under both selections, including other root blocks.
+        // Production capability borrows the same real Leaf; its seven-character requested range
+        // cannot authorize the whole store.
         let mut before = MarkdownViewportPresentation::default();
         before.set_active_selection(ordered_selection(original));
         before.rebuild(0, 0..doc.utf16_len(), source).unwrap();
@@ -553,7 +563,8 @@ fn root_code_selection_invariant_reprojects_real_leaf_and_retires_previous_publi
                 after.query(index).unwrap().styles
             );
         }
-        // 撤销、外来 Doc 和错误上下文沿原强类型错误返回，不能误降为“能力不存在”。
+        // Cancellation, foreign documents, and wrong contexts retain typed errors rather than
+        // degrading to an absent capability.
         let current = authority(&doc);
         let mut cancelled = current;
         cancelled.cancelled = true;
@@ -584,7 +595,8 @@ fn root_code_selection_invariant_reprojects_real_leaf_and_retires_previous_publi
                 .unwrap()
         );
 
-        // 新选择接管后旧发布永久失权。恢复旧选择数值只能验证 ABA 拒绝，不能给旧 Rc 续权。
+        // New selection retires old publication permanently; restoring numeric values checks ABA
+        // rejection rather than reauthorizing an old Rc.
         doc.set_selection(original).unwrap();
         assert!(matches!(
             previous.ordinary_semantics_for(&doc, authority(&doc)),
@@ -623,8 +635,9 @@ fn root_code_selection_invariant_reprojects_real_leaf_and_retires_previous_publi
 #[cfg(feature = "paged-line-compose")]
 #[test]
 fn root_code_selection_invariant_declines_real_marker_owner_edges_and_container_prefixes() {
-    // 关闭行的两个空格不是 marker 字节，却属于该物理行的显隐 owner；不能仅排除反引号。
-    // 缩进代码尾端可能就是后继 Root 段落起点，EOF 末端也保守排除，不以裸 close_reason 放行。
+    // Closing-line spaces are not marker bytes but share its physical visibility owner. Indented
+    // code end may be a following root paragraph; conservatively exclude EOF/end boundaries instead
+    // of granting authority from a bare close_reason.
     for source in [
         "前方\r\n\r\n  ```text\r\nliteral alpha omega\r\n  ```\r\n\r\n后继\r\n",
         "前方\n\n```text\nliteral alpha omega",
@@ -663,7 +676,8 @@ fn root_code_selection_invariant_declines_real_marker_owner_edges_and_container_
                     .unwrap()
                     .is_none()
             );
-            // 只读拒绝没有退休原 publication；恢复真实旧选择后原有限样式仍可正常读取。
+            // A read-only decline does not retire publication; restoring its real selection still
+            // permits its original finite styles.
             doc.set_selection(original).unwrap();
             let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = previous
                 .ordinary_semantics_for(&doc, authority(&doc))
@@ -694,7 +708,8 @@ fn root_code_selection_invariant_declines_real_marker_owner_edges_and_container_
         let (request, previous) = leaf_sources(&doc, first..first + 7);
         doc.set_selection(MarkdownTextSelection::caret(second))
             .unwrap();
-        // 容器的逐行 prefix 会随端点移动显隐；同形 Code、同 Leaf 与同 Root 参数均不能替代真scope。
+        // Container prefixes change visibility with actual endpoints. Matching code/Leaf/root
+        // parameters cannot replace the real scope's per-line obligations.
         assert!(
             request
                 .selection_style_invariant(&doc, &previous, authority(&doc))
@@ -723,7 +738,8 @@ fn selection_reprojection_declines_missing_records_and_keeps_real_failure_author
             .reproject_selection(&doc, &previous, 0..1, authority(&doc))
             .unwrap()
     );
-    // 资格缺失没有退休旧票或消费旧前沿：真实选择恢复后，原发布与原forward都继续有效。
+    // Missing eligibility neither retires the ticket nor consumes its frontier; restore selection
+    // and verify both old publication and original forward continuation.
     doc.set_selection(original).unwrap();
     assert!(
         previous
@@ -746,8 +762,8 @@ fn selection_reprojection_declines_missing_records_and_keeps_real_failure_author
     );
     drop((current, request));
 
-    // 取消、换代和异Doc都是真实失权，不能因前面的目标不在记录中而误返回false；
-    // 首因固定后，恢复数值参数也不得恢复已经结束的请求。
+    // Cancellation, generation changes, and foreign documents revoke authority even if the requested
+    // target lacks records. Once failure ends the request, restored numeric parameters cannot revive it.
     for cause in [
         MarkdownTableRequestError::Cancelled,
         MarkdownTableRequestError::SourceSuperseded,
@@ -788,8 +804,9 @@ fn selection_reprojection_declines_missing_records_and_keeps_real_failure_author
 #[cfg(feature = "paged-line-compose")]
 #[test]
 fn plain_selection_prefix_declines_markup_and_preserves_original_publication() {
-    // 每个负例仍经过真实 Global/Leaf/Parser 完成并移交输出；不能靠构造一个空目录
-    // 测出 None。能力缺失后恢复原选择，原公开语义与正常重投影继续工作，证明没有偷偷退休。
+    // Every negative fixture completes actual Global/Leaf/parser output, rather than an empty
+    // fabricated directory. Restored selection must preserve public semantics and reprojection,
+    // showing that capability absence did not silently retire publication.
     for source in [
         "普通 **粗体** 尾\n",
         "<u>下划线😀</u> 尾\n",
@@ -882,7 +899,8 @@ fn plain_selection_prefix_keeps_real_source_cancellation_and_context_errors() {
             Err(cause) if cause == expected
         ));
     }
-    // 只读能力检查不修改原请求；错误参数移除后仍能按真正新选择重投影同一已发布窗口。
+    // Read-only capability checks leave the request intact; removing bad arguments still permits
+    // reprojection of the same published window under the actual new selection.
     assert!(
         request
             .selection_style_invariant(&doc, &previous, current)
@@ -927,15 +945,16 @@ fn plain_selection_prefix_keeps_real_source_cancellation_and_context_errors() {
 
 #[test]
 fn forward_small_leaf_windows_keep_far_directed_selection_under_original_work_limit() {
-    // 固定普通单段落混合中文、ASCII和非BMP；每组13B/7UTF16，完全没有Markdown marker。
-    // 远端有向选择是真实用户状态，后继只滚动小窗口，不能每批重读其两个已认证端点。
+    // Each plain Chinese/ASCII/non-BMP group is 13 bytes/7 UTF-16 units with no Markdown markers.
+    // Keep the distant directed user selection while scrolling small windows; its two authenticated
+    // endpoints must not require rereading per batch.
     let source = "中文abc😀".repeat(16_384);
     let (directory, mut doc) = document(&source);
     let backing = doc.original_backing_observer().unwrap();
     let selection = MarkdownTextSelection {
         anchor_utf16: 83_055,
         head_utf16: 83_050,
-    }; // 两端由固定7-unit组声明：a的起点到完整emoji末端，不落在代理对内部。
+    }; // Fixed seven-unit groups put endpoints at a's start and after the complete emoji, not inside its surrogate pair.
     doc.set_selection(selection).unwrap();
     let mut request = doc
         .viewport_leaf_source_request(0..7, 57, selection)
@@ -945,16 +964,17 @@ fn forward_small_leaf_windows_keep_far_directed_selection_under_original_work_li
         .take_sources_for(&doc, authority(&doc))
         .unwrap()
         .unwrap();
-    // 连续真实发布直到远端选区后的完整组；不能只到13K/18K就外推产品83K定位。
-    // 每个窗口仍只消费原4096量子和同一请求累计fuel，没有扩大语义视口或提前解析全文。
-    // 不读取私有定位器、不按调用数判断优化，能否完成全部真实样式就是本回归的结果。
+    // Publish every small window through the complete group beyond the distant selection; short
+    // 13K/18K runs cannot establish 83K behavior. Keep original quanta/totals without widening the
+    // viewport or eager parsing; actual complete style results, not private locator/call counts,
+    // establish this regression's outcome.
     for block in 0..=selection.anchor_utf16 / 7 {
         let range = block * 7..block * 7 + 7;
         if block != 0 {
             request
                 .continue_forward(&doc, &previous, range.clone(), authority(&doc))
                 .unwrap();
-            drop(previous); // 原Ready联合准入后立即归还，不人为保留整串publication。
+            drop(previous); // Return old Ready after joint admission, without an artificial historical publication chain.
             finish_sources(&mut request, &doc).unwrap_or_else(|cause| {
                 panic!(
                     "真实小窗未完成：range={range:?} cause={cause:?} work={:?}",
@@ -972,8 +992,9 @@ fn forward_small_leaf_windows_keep_far_directed_selection_under_original_work_li
         else {
             panic!("同一真实普通段落的小窗必须完成样式，range={range:?}");
         };
-        // 同一发布的结构层只证明无表：连续小窗必须各自裁剪真实 Gap，不能把整个段落
-        // 或上一窗的覆盖当成本窗结果；真正的默认样式仍由下方原 Leaf 查询独立证明。
+        // Structure proves only absence of tables. Each small window needs its own clipped Gap,
+        // not the whole paragraph or previous coverage; actual default styles still require the
+        // separate original Leaf query below.
         let table = previous.table_sources_for(&doc, authority(&doc)).unwrap();
         assert!(table.windows_for(&doc).unwrap().next().is_none());
         let [
@@ -990,7 +1011,7 @@ fn forward_small_leaf_windows_keep_far_directed_selection_under_original_work_li
             let query = leaf.query_for(&doc, authority(&doc), at).unwrap().unwrap();
             assert!(query.utf16_range.contains(&at));
             assert_eq!(query.styles, MarkdownPresentationStyles::default());
-        } // 每个固定scalar必须真正有覆盖；未知页不能借空样式或裸viewport范围通过。
+        } // Each fixed scalar needs real coverage; unknown pages cannot pass with empty styles or bare viewport bounds.
     }
     assert_eq!(doc.generation(), 0);
     assert_eq!(doc.selection(), selection);
@@ -1006,8 +1027,9 @@ fn forward_small_leaf_windows_keep_far_directed_selection_under_original_work_li
 
 #[test]
 fn forward_structure_and_gap_pruning_preserve_real_cell_semantics_after_reposition() {
-    // 原 Global 先交普通 Gap，再交真正结构表；每次只请求行首一个单元，不把物理行截短。
-    // 最后从尾 Gap 返回粗体格，必须沿公开 reposition 恢复原来源与内联语义。
+    // The original Global yields a plain Gap, then an actual table. One-unit row-start requests must
+    // retain full physical rows; returning from the tail Gap requires public reposition to restore
+    // original source and cell semantics.
     let source =
         "前段甲😀乙\n\n| H |\n| --- |\n| **粗体** |\n| *斜体* |\n| `代码` |\n\n尾段甲😀乙xyz\n";
     let (directory, mut doc) = document(source);
@@ -1016,8 +1038,9 @@ fn forward_structure_and_gap_pruning_preserve_real_cell_semantics_after_repositi
     let mut previous_start = 0;
     let header_byte = source.find("| H |").unwrap();
     let tail = source.find("尾段").unwrap();
-    // None是实际普通尾段；其余固定原行既核公开物理身份，也核实际每格的强/弱/代码样式。
-    // 重复的粗体行有明确用户行为意义：它位于尾段之前，不能沿前向游标假签旧行。
+    // None selects the actual plain tail; fixed table rows verify physical identity plus cell
+    // strong/emphasis/code styles. Repeating the earlier bold row requires a real backward user
+    // navigation, not false authorization from the forward cursor.
     for cell in [
         Some((
             "| **粗体** |\n",
@@ -1057,7 +1080,7 @@ fn forward_structure_and_gap_pruning_preserve_real_cell_semantics_after_repositi
                 .continue_forward(&doc, &previous, range.clone(), authority(&doc))
                 .unwrap();
         }
-        drop(previous); // 已准入的旧发布归还后，仍只推进原唯一请求及累计额度。
+        drop(previous); // Return admitted old publication while retaining the unique request and cumulative allowance.
         finish_sources(&mut request, &doc).unwrap();
         previous = request
             .take_sources_for(&doc, authority(&doc))
@@ -1068,7 +1091,8 @@ fn forward_structure_and_gap_pruning_preserve_real_cell_semantics_after_repositi
             &range
         );
         let Some((line, word, ordinal, expected)) = cell else {
-            // 表已离开当前窗口时，结构表目录不能被空阶段选择遗漏，仍须真正裁掉。
+            // Leaving the table must actually prune its structure directory, even through an
+            // otherwise empty phase-selection path.
             assert!(
                 previous
                     .table_row_at_for(&doc, authority(&doc), start)
@@ -1106,7 +1130,8 @@ fn forward_structure_and_gap_pruning_preserve_real_cell_semantics_after_repositi
         request
             .prepare_cell_inline(&doc, row, authority(&doc), 0)
             .unwrap();
-        // 单格真正借原 scope/raw source/Parser 完成；结构行 Ready 不能代替实际字符样式。
+        // Complete the cell through actual scope/raw source/parser work; structural row Ready is
+        // not proof of character styles.
         let mut complete = false;
         for _ in 0..source.len() * 100 {
             let step = request
@@ -1134,7 +1159,8 @@ fn forward_structure_and_gap_pruning_preserve_real_cell_semantics_after_repositi
         assert!(query.utf16_range.contains(&at) && query.styles.contains(expected));
         previous_start = start;
     }
-    // 在恢复的非空结构页上取消后继，旧真实发布仍可读，但任务不能再产生新来源。
+    // Cancel a continuation from the restored nonempty table page: old publication stays readable,
+    // while the ended task produces no new source result.
     request
         .continue_forward(
             &doc,
@@ -1156,7 +1182,8 @@ fn forward_structure_and_gap_pruning_preserve_real_cell_semantics_after_repositi
     );
     assert_eq!(doc.generation(), 0);
     assert!(!doc.can_undo() && !doc.can_redo());
-    // 真实编辑再Undo虽恢复字面值，仍是新代次；已取消的请求和旧结构发布都不能补签新来源。
+    // Actual edit/undo restores bytes in a new generation; neither the cancelled request nor old
+    // table publication can authorize new source facts.
     doc.replace_utf16_range(0..1, "新", MarkdownTextSelection::caret(1))
         .unwrap();
     doc.undo().unwrap();
@@ -1175,7 +1202,8 @@ fn forward_structure_and_gap_pruning_preserve_real_cell_semantics_after_repositi
         std::fs::read(directory.path().join("有界叶块验收.md")).unwrap(),
         source.as_bytes()
     );
-    // 所有请求、原 publication 与文档都归还后，再核真实映射；不观察私有 phase 或句柄计数。
+    // Check real mapping facts after dropping all original requests/publications/document, without
+    // substituting private phase or handle counts for release.
     drop((previous, request, doc));
     assert!(backing.unmap_succeeded() && !backing.failed());
     assert_eq!(backing.mapped_bytes(), 0);
@@ -1184,8 +1212,9 @@ fn forward_structure_and_gap_pruning_preserve_real_cell_semantics_after_repositi
 
 #[test]
 fn forward_leaf_windows_keep_scalar_floor_and_ceil_across_pieces_and_reposition() {
-    // 每组固定10B/4UTF16：甲、完整emoji、乙。窗口故意停在代理对中间，
-    // 公开语义必须仍剪回原请求，不能把前一ceil已经读过的后半代理项当成新floor。
+    // Each 10-byte/four-unit group contains Chinese, a complete emoji, and Chinese. Windows end
+    // inside a surrogate pair; coverage must clip to requested rather than treating the previous
+    // ceil's already-read second surrogate as a new floor.
     let source = "甲😀乙".repeat(900);
     let (directory, mut doc) = document(&source);
     let backing = doc.original_backing_observer().unwrap();
@@ -1203,8 +1232,8 @@ fn forward_leaf_windows_keep_scalar_floor_and_ceil_across_pieces_and_reposition(
         .unwrap()
         .unwrap();
     let mut previous_start = 0;
-    // 409/410和819/820组跨过原4KiB读片边界；端点由固定字面长度决定，
-    // 不读取定位器或候选Source的私有片目录来反造预期。
+    // Groups 409/410 and 819/820 cross original 4-KiB read boundaries. Fixed literal lengths define
+    // expected endpoints without inspecting private locator/candidate piece directories.
     for block in [0, 409, 410, 819, 820, 899] {
         let start = block * 4;
         for range in [
@@ -1243,8 +1272,8 @@ fn forward_leaf_windows_keep_scalar_floor_and_ceil_across_pieces_and_reposition(
                 assert!(query.utf16_range.contains(&index));
                 assert_eq!(query.styles, MarkdownPresentationStyles::default());
             }
-            // 新窗口实际发布后，仍持有的旧Ready必须继续按自己的原覆盖读取；
-            // 复用owner不能改写旧结果，也不能把旧publication强留成链。
+            // A retained old Ready must remain readable under its own coverage after new output;
+            // owner reuse cannot rewrite results or retain a strong publication chain.
             let MarkdownOrdinarySemanticState::RootLeafReady(old) = previous
                 .ordinary_semantics_for(&doc, authority(&doc))
                 .unwrap()
@@ -1262,7 +1291,8 @@ fn forward_leaf_windows_keep_scalar_floor_and_ceil_across_pieces_and_reposition(
             previous_start = range.start;
         }
     }
-    // 真正逆向必须走原重定位，而非沿原前沿倒退；其结果仍保留同一完整有向选择。
+    // Actual backward navigation uses original reposition, not a reversed forward cursor; retain
+    // the same complete directed selection.
     request
         .reposition(&doc, &previous, 1..3, authority(&doc))
         .unwrap();
@@ -1322,8 +1352,9 @@ fn production_literal_html_and_metadata_keep_original_values_and_exact_underline
         "---\ntitle: '**字面粗体** `字面代码` [字面链接](https://example.com)'\nvalue: '<u>实际下划线😀</u>'\n---\n",
         "---\r\ntitle: '**字面粗体** `字面代码` [字面链接](https://example.com)'\r\nvalue: '<u>实际下划线😀</u>'\r\n...  \r\n",
     ] {
-        // 独立完整 Parser 决定真实叶种类和末端；metadata closing EOL 不属于该叶，
-        // 不能为了让整窗 Ready 把 consumed_end 或后继行前缀伪装成已证明字面。
+        // The independent parser determines actual kind/end. A metadata closing EOL lies outside
+        // that Leaf; consumed_end or a later prefix cannot become proven literal coverage merely
+        // to make the whole viewport Ready.
         let parsed = Parser::new_ext(
             source,
             crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
@@ -1354,8 +1385,8 @@ fn production_literal_html_and_metadata_keep_original_values_and_exact_underline
             };
             assert_oracle(ready, &doc, source, &requested);
 
-            // 源码值也由同一个公开文档流式写出；样式 Ready 不能意味着删掉 HTML、
-            // YAML marker、Markdown 拼写或容器前缀，更不能产生一个伪链接目标。
+            // Stream raw values from the same public document. Ready styles cannot remove HTML,
+            // YAML markers, Markdown spelling, or container prefixes, nor create false link targets.
             let mut actual = Vec::new();
             doc.write_utf16_range_to(requested.clone(), &mut actual)
                 .unwrap();
@@ -1394,7 +1425,7 @@ fn production_literal_html_and_metadata_keep_original_values_and_exact_underline
                         .contains(MarkdownPresentationStyles::UNDERLINE)
                 );
             }
-            // 非精确标签绝不进入 allowlist；这些值仍与原 Parser 一样保持可见字面。
+            // Nonexact tags never enter the allowlist; preserve their visible literal parser values.
             for literal in ["网页字面", "大写字面", "属性字面"] {
                 if let Some(at) = source.find(literal) {
                     let index = units(source, at..at).start;
@@ -1430,8 +1461,8 @@ fn production_literal_html_and_metadata_keep_original_values_and_exact_underline
 
 #[test]
 fn production_giant_literal_html_keeps_real_underline_and_only_publishes_viewport() {
-    // 完整合成串仅归测试 oracle；生产只沿原映射和同一 Global 的 4KiB 量子，
-    // 不能因 HTML 正文没有 Markdown inline 就复制超过 2MiB 的整段来查找 </u>。
+    // Only the test oracle owns the complete synthetic string. Production uses original mappings
+    // and same-Global 4-KiB quanta; literal HTML permits no >2-MiB body copy to search for </u>.
     let opening = "<div><u>\n";
     let source = format!("{opening}{}\n</u></div>\n", "中😀".repeat(310_000));
     let (directory, mut doc) = document(&source);
@@ -1502,7 +1533,7 @@ fn production_scoped_leaf_prefixes_headings_and_code_match_original_parser() {
             matches!(event, Event::Start(Tag::Heading { .. } | Tag::CodeBlock(_))).then_some(range)
         })
         .unwrap();
-        // 首行实际 quote/item prefix 也必须得到真容器语义；不能只核 marker 后的正文。
+        // Verify actual first-line quote/item prefixes as well as body text after their markers.
         let requested = units(source, 0..parsed.end);
         for selection in [
             MarkdownTextSelection::caret(0),
@@ -1560,7 +1591,8 @@ fn production_footnote_leaf_origins_keep_labels_literal_and_real_child_scope() {
             .then_some(range)
         })
         .expect("独立原 Parser 必须确认真实脚注子叶");
-        // 空 opening 行不是下一代码叶的内容；首行 label 只有与实际 child 同一物理行才随前缀发布。
+        // An empty opening line is not part of the next code Leaf. Publish its label with the prefix
+        // only when it shares the actual child's physical line.
         let physical = source[..parsed.start].rfind('\n').map_or(0, |at| at + 1);
         let requested = units(source, physical..parsed.end);
         for selection in [
@@ -1597,8 +1629,9 @@ fn production_footnote_leaf_origins_keep_labels_literal_and_real_child_scope() {
 
 #[test]
 fn production_giant_footnote_code_keeps_mapped_body_and_only_visible_semantics() {
-    // 标签 opening、四列续行和真围栏都由原 producer/Origin 证明；>2MiB 正文只有测试 oracle 持有。
-    // 当前窗口不含首行 label，也不能因为它离屏就换一份 Root 源、配额或整段缓冲。
+    // The original producer/Origin proves the opening, four-column continuation, and fences. Only
+    // the oracle holds the >2-MiB body; an offscreen first-line label permits no substitute root,
+    // fresh quota, or whole-block buffer.
     let source = format!("[^123]: ```text\n    {}\n    ```\n", "中😀".repeat(310_000));
     let (directory, doc) = document(&source);
     let observer = doc.original_backing_observer().unwrap();
@@ -1657,7 +1690,8 @@ fn production_root_eof_false_closers_remain_literal_without_losing_code_coverage
 
 #[test]
 fn production_scoped_giant_code_publishes_only_viewport_without_copying_canonical_body() {
-    // 只有独立 oracle 测试持完整合成串；生产请求只借原映射小帧，单段代码超过 2MiB。
+    // Only the independent oracle holds this complete >2-MiB code fixture; production borrows
+    // small frames from the original mapping.
     let source = format!("> ```text\n> {}\n> ```\n", "中😀".repeat(310_000));
     let (directory, mut doc) = document(&source);
     let observer = doc.original_backing_observer().unwrap();
@@ -1726,7 +1760,8 @@ fn production_leaf_factory_uses_original_publication_and_matches_complete_projec
             assert_eq!(request.total_work().parser_input_bytes, 0);
             assert_eq!(request.total_work().allocated_source_capacity, 0);
 
-            // 取出实际 Ready 后结束原 SourcePublication，孤立的语义不能重新借相同 g 取得权限。
+            // End the original SourcePublication after extracting Ready. Isolated semantics cannot
+            // reacquire authority merely from the same generation number.
             let state = std::mem::replace(
                 &mut sources.semantic,
                 MarkdownOrdinarySemanticState::SourcesOnly,
@@ -1744,7 +1779,8 @@ fn production_leaf_factory_uses_original_publication_and_matches_complete_projec
 }
 
 #[test]
-/// closing-EOL 的真实控制票不扩张原代码语义；只请求 EOL 时也沿原公开工厂的同一 Root 来源。
+/// Actual closing-EOL control tickets do not extend code semantics; an EOL-only request still uses
+/// the public factory's same original root source.
 fn production_closing_fence_separator_keeps_its_own_publication_and_original_plain_style() {
     for ending in ["\n", "\r\n"] {
         let source =
@@ -1765,7 +1801,8 @@ fn production_closing_fence_separator_keeps_its_own_publication_and_original_pla
                 .rebuild(doc.generation(), 0..doc.utf16_len(), &source)
                 .unwrap();
             for index in separator.clone() {
-                // 旧完整 Parser 在 closing scanner 外确实只发布普通样式，不能借最后代码/隐藏 run 的字体。
+                // Outside the closing scanner the full parser gives plain style; do not inherit
+                // the final code/hidden run's font.
                 assert_eq!(
                     original.query(index).unwrap().styles,
                     MarkdownPresentationStyles::default()
@@ -1801,7 +1838,7 @@ fn production_closing_fence_separator_keeps_its_own_publication_and_original_pla
                             .unwrap()
                             .is_none()
                     );
-                } // 同一 CRLF 不拆成两份控制权限，也不在 getter 读取任何正文。
+                } // One CRLF grants no split control tickets, and the getter reads no body.
             }
             assert_eq!(request.total_work().copied_source_bytes, 0);
             assert_eq!(request.total_work().parser_input_bytes, 0);
@@ -1811,7 +1848,7 @@ fn production_closing_fence_separator_keeps_its_own_publication_and_original_pla
             assert_eq!(
                 sources.root_fence_separator_for(&doc, authority(&doc), &separator),
                 Err(MarkdownTableRequestError::SourceSuperseded)
-            ); // 源换代后即使仍是相同数字范围，也不能复活旧 closing-EOL 控制票。
+            ); // A new source generation cannot revive an old closing-EOL ticket with equal coordinates.
         }
     }
 
@@ -1824,11 +1861,12 @@ fn production_closing_fence_separator_keeps_its_own_publication_and_original_pla
             .root_fence_separator_for(&doc, authority(&doc), &units(source, end..end + 1))
             .unwrap()
             .is_none()
-    ); // 容器自己的前缀与换行归原容器；不能借同形 closing marker 冒充 Root 控制。
+    ); // Container prefixes/newlines retain their original owner; a similar closer cannot authorize root control.
 }
 
 #[test]
-/// 原 Native 字形、EOL、空行的真实续批顺序不能消费后丢失下一份 fence/heading Fact。
+/// Native's actual body/EOL/blank continuation order must not consume and lose the next fence or
+/// heading fact.
 fn production_native_control_windows_keep_the_original_next_leaf_across_blank_lines() {
     let source = "# Title\n\n```text\nlet value = 1;\n```\n\n## Next\n";
     let (_directory, doc) = document(source);
@@ -1866,13 +1904,13 @@ fn production_native_control_windows_keep_the_original_next_leaf_across_blank_li
                     .unwrap()
                     .next()
                     .is_none()
-            ); // 原下一叶的 metadata 只为续体保留；本空白窗口没有该叶的 getter 或样式权限。
+            ); // Keep next-leaf metadata only for continuation; this blank viewport gains no getter/style authority for it.
             continue;
         }
         if requested == (9..16) || requested == (37..44) {
             let actual = previous.records.first().unwrap();
             assert!(ahead.take().unwrap().ptr_eq(&Rc::downgrade(actual)));
-        } // 后继借回的必须是原 Fact 的同一个 Rc，不重判、复制或重新准入另一份 opaque 叶。
+        } // Continuation borrows the same original-fact Rc, without reparsing/copying/admitting a replacement Leaf.
         if requested == (35..36) {
             assert_eq!(
                 previous
@@ -1893,7 +1931,8 @@ fn production_native_control_windows_keep_the_original_next_leaf_across_blank_li
 }
 
 #[test]
-/// 窗后普通行也须保同一语义 seed；只保行坐标会让下一窗口再次丢失真实 inline 来源。
+/// Preserve the following ordinary line's same semantic seed; coordinates alone would lose the
+/// original inline source on the next viewport.
 fn production_blank_control_preserves_the_next_ordinary_line_and_its_original_seed() {
     let source = "# Title\n\nplain words\n\n## Next\n";
     let (_directory, doc) = document(source);
@@ -1941,7 +1980,8 @@ fn production_blank_control_preserves_the_next_ordinary_line_and_its_original_se
 }
 
 #[test]
-/// 正文/EOL/Setext标记/EOL由Native分开取样时，同一 terminal 来源仍须授权原完整 heading 尾部。
+/// When Native samples body/EOL/Setext-marker/EOL separately, the same terminal source must still
+/// authorize the actual heading tail.
 fn production_native_setext_control_windows_keep_the_original_terminal_owner_through_underline() {
     let source = "outside\n\nHeading alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau\n---\n\nend\n";
     let (_directory, doc) = document(source);
@@ -1973,7 +2013,7 @@ fn production_native_setext_control_windows_keep_the_original_terminal_owner_thr
             continue;
         }
         if requested == (119..120) {
-            continue; // 真实空行没有 heading 样式，不借后继普通行补签已证交集。
+            continue; // Real blank lines have no heading style and cannot borrow later body coverage.
         }
         if requested.start >= 9 && requested.end <= 119 {
             assert!(
@@ -1990,7 +2030,7 @@ fn production_native_setext_control_windows_keep_the_original_terminal_owner_thr
                     .unwrap()
                     .next()
                     .is_none()
-            ); // underline 由原 Setext seed 证明；不能捏造一条正文 BlockOriginLine。
+            ); // The original Setext seed proves its underline; no invented body BlockOriginLine is needed.
         }
         let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = &previous.semantic else {
             panic!("原 Setext 分段范围 {requested:?} 丢失自己的 terminal owner");
@@ -2032,7 +2072,8 @@ fn production_leaf_giant_line_has_finite_runs_without_copy_or_parser_input() {
 }
 
 #[test]
-/// 原首行物理空白与正文属于同一Root代码owner；Composer不能把可见缩进替换成语义空洞。
+/// The original root-code owner includes physical first-line whitespace; Composer cannot replace
+/// visible indentation with a semantic hole.
 fn production_indented_code_keeps_the_original_physical_prefix_in_semantic_coverage() {
     let source = "outside\n\n    <u>中文😀</u>\n\n";
     let (_directory, doc) = document(source);
@@ -2064,7 +2105,8 @@ fn production_indented_code_keeps_the_original_physical_prefix_in_semantic_cover
 }
 
 #[test]
-/// 请求只碰首行前缀时仍需原Root代码票；范围剪裁和Tab不能丢字符、借邻块或越过默认样式。
+/// Prefix-only windows still need the original root-code ticket; clipping/tabs cannot lose
+/// characters, borrow a neighboring block, or override the actual plain-prefix style.
 fn production_root_code_prefix_clipping_matches_the_original_parser_without_copying() {
     for (source, prefix) in [
         ("outside\n\n    <u>中文😀</u>\n\n", 9..13),
@@ -2108,7 +2150,8 @@ fn production_underline_probe_restores_future_code_facts_for_the_same_forward_ow
     let (_directory, doc) = document(source);
     let options =
         crate::markdown_viewport_presentation::parser::markdown_presentation_options(true);
-    // 独立完整Parser只用于这个有限夹具；后继四个范围必须由原生产Global重新交付，不能缓存前探Fact。
+    // The full parser is only this finite fixture's oracle. Original production Global must deliver
+    // later ranges again rather than reusing cached lookahead facts as source output.
     let ranges = Parser::new_ext(source, options)
         .into_offset_iter()
         .filter_map(|(event, range)| {
@@ -2121,7 +2164,8 @@ fn production_underline_probe_restores_future_code_facts_for_the_same_forward_ow
     let global = request.batch.source_probe_state().0;
     for (index, requested) in ranges.iter().enumerate() {
         if index != 0 {
-            // 主来源仍从原恢复点继续；前探中已读过的代码块不能变成缺失来源或被替换成普通段落。
+            // Resume the main source at its original checkpoint; code visited during lookahead
+            // must neither disappear nor become an ordinary paragraph.
             request
                 .continue_forward(&doc, &previous, requested.clone(), authority(&doc))
                 .unwrap();
@@ -2179,7 +2223,8 @@ fn production_underline_probe_source_reclaim_failure_releases_the_saved_global_a
         };
         assert_step(work);
     }
-    // 已真实创建主恢复点，再让后继换页归还失败；不是直接伪造业务错误或把取消当作I/O。
+    // Establish the actual main restore point before failing a later page return; do not directly
+    // manufacture a business error or present cancellation as I/O failure.
     let attempts = observer.reclaim_attempts();
     observer.fail_next_reclaim_for_test();
     let error = loop {
@@ -2232,7 +2277,8 @@ fn production_cancel_during_underline_probe_releases_the_main_boundary_without_p
     {
         request.advance(&doc, authority(&doc), 4096).unwrap();
     }
-    // 取消属于整个来源owner，必须同时结束前探与主恢复义务；原健康文档仍可供后继请求读取。
+    // Cancellation owns the entire source operation: end both lookahead and main restore duties
+    // while leaving the healthy document available to future requests.
     request.cancel();
     assert!(request.batch.source_global_mut().is_err());
     assert!(request.leaf_semantic.is_none() && request.semantic.is_none());
@@ -2294,7 +2340,8 @@ fn production_leaf_forward_charges_old_pages_and_runs_without_retaining_old_publ
     };
     super::partial::assert_partial_oracle(&source, &doc, ready, next.clone(), &expected[10..]);
     super::partial::assert_partial_oracle(&source, &doc, old, first_range, &expected[..30]);
-    // 后继只共享原 immutable Leaf 记录；不保父 SourcePublication 链或旧 Ready 的页。
+    // Continuation shares immutable Leaf records only, without retaining a parent publication
+    // chain or the old Ready pages.
     drop(previous);
     assert!(old_publication.upgrade().is_none());
     assert!(
@@ -2399,8 +2446,9 @@ fn production_leaf_edit_undo_and_cancel_cannot_reauthorize_same_root_or_keep_doc
 
 #[test]
 fn production_leaf_proves_direct_links_and_keeps_unsupported_scope_pending() {
-    // 保留原来判Pending的同一巨段落；现在必须由原完整Parser逐位置验证新增真实能力，
-    // 包括外部caret、label内部caret与反向选择，不能换样本躲开marker显隐。
+    // Keep the original giant Pending fixture and independently verify its now-supported semantics
+    // under outside/inside/reverse selections. Replacing the sample would avoid marker-visibility
+    // behavior rather than establish the actual capability.
     let complex = format!(
         "只有**{}**，[未知链接](https://example.com)，没有已证代码或分隔线\n",
         "复杂行内正文".repeat(140)
@@ -2440,7 +2488,8 @@ fn production_leaf_proves_direct_links_and_keeps_unsupported_scope_pending() {
         assert_eq!(backing.managed_resident_bytes(), 0);
     }
 
-    // 原非Root thematic break仍没有取得该scope的语义消费权，不能因接Link而签默认值。
+    // A nonroot thematic break still lacks supported scope semantics; link support cannot give it
+    // default styles.
     let source = "> ***\n\n尾\n";
     let (_directory, doc) = document(source);
     let backing = doc.original_backing_observer().unwrap();
@@ -2452,15 +2501,16 @@ fn production_leaf_proves_direct_links_and_keeps_unsupported_scope_pending() {
             .unwrap(),
         MarkdownOrdinarySemanticState::LeafPending(MarkdownRootLeafPendingReason::NonRootScope)
     ));
-    // Pending 允许保留同源定位前沿；公开语义仍未知，读者和请求都不能强持原文稿或映射。
-    // 以真实文稿销毁后的资源事实验证归属，不再断言可随实现改变的私有槽和元数据计数。
+    // Pending may retain same-source lookup state but grants no semantics or strong document/mmap
+    // ownership. Check actual mapping release after document destruction rather than implementation
+    // details of private slots or metadata totals.
     drop(doc);
     assert_eq!(backing.mapped_bytes(), 0);
     assert_eq!(backing.managed_resident_bytes(), 0);
     assert_eq!(backing.first_errno(), None);
     drop((request, sources));
 
-    // 原 SourcesOnly 工厂仍只提供来源事实，不因加入 Leaf 模式而偷偷升级任何语义。
+    // SourcesOnly remains a source-fact factory; adding Leaf mode cannot silently upgrade its semantics.
     let source = "```\n正文\n```\n";
     let (_directory, doc) = document(source);
     let (_, sources) = source_request(&doc, 0..doc.utf16_len());
@@ -2495,8 +2545,9 @@ fn production_joint_plain_blocks_keep_exact_ranges_and_original_leaf_identity() 
         .unwrap();
     for text in [first, setext, complex.as_str(), last] {
         let start = source.find(text).unwrap();
-        // 完整Parser给出闭合块真实末端（含其原换行/Setext marker），不拿text搜索
-        // 的子串末端冒充段落coverage；尤其新接入的complex原字面自身不含末换行。
+        // The full parser supplies the actual closed-block end, including EOL/Setext markers.
+        // Substring-search ends cannot stand in for paragraph coverage; the complex literal itself
+        // intentionally excludes its final newline.
         let range = Parser::new_ext(
             &source,
             crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
@@ -2583,7 +2634,8 @@ fn production_joint_active_plain_cancel_and_run_limit_release_real_scratch() {
         let mut request = doc
             .viewport_leaf_source_request(0..doc.utf16_len(), 57, doc.selection())
             .unwrap();
-        // 等到真实 Plain scratch 接管原 underline 后再注入业务取消或联合库存耗尽。
+        // Wait until actual Plain scratch owns the original underline before cancelling or
+        // exhausting the joint inventory.
         for _ in 0..10_000 {
             if request.semantic.is_some() {
                 break;
@@ -2613,7 +2665,8 @@ fn production_joint_active_plain_cancel_and_run_limit_release_real_scratch() {
 }
 
 #[test]
-/// 一次冷准备可在原量子装下短端点；surrogate内的视口末端仍沿真实scalar向上取整。
+/// Short cold endpoints can fit one original quantum; a surrogate-interior viewport end still
+/// rounds up through the actual scalar boundary.
 fn joint_bounds_coalesce_short_endpoints_inside_original_quantum() {
     let source = "中文😀普通段落。\n";
     let (_directory, mut doc) = document(source);
@@ -2646,7 +2699,8 @@ fn joint_bounds_coalesce_short_endpoints_inside_original_quantum() {
 }
 
 #[test]
-/// 远端片内前缀仍可跨量子，真实byte进度/Source错误保留，不为冷显示扩大读窗或预算。
+/// A distant piece prefix may span quanta, preserving actual byte progress/Source errors without
+/// enlarging read windows or budgets for cold display.
 fn joint_bounds_long_prefix_remains_pending_and_reclaims_source_errors() {
     for fault in [false, true] {
         let source = format!("{}\n", "a".repeat(4000));
@@ -2668,7 +2722,8 @@ fn joint_bounds_long_prefix_remains_pending_and_reclaims_source_errors() {
         assert!(work.source_bytes + work.structural_transitions + work.metadata_bytes <= 4096);
         assert!(request.leaf_semantic.as_ref().unwrap().preparing());
         if fault {
-            // 原Bounds先真实读入同页并保留未完成端点；归还pin不会驱逐缓存页，不能把注入标志当成I/O失败。
+            // Bounds already read this page and retains unfinished endpoints. Returning a pin does
+            // not evict cached pages; an armed flag alone cannot establish I/O failure.
             let observer = doc.original_backing_observer().unwrap();
             let attempts = observer.reclaim_attempts();
             let successes = observer.reclaim_successes();
@@ -2680,7 +2735,8 @@ fn joint_bounds_long_prefix_remains_pending_and_reclaims_source_errors() {
             assert!(observer.reclaim_attempts() > attempts);
             assert!(observer.reclaim_successes() > successes);
             assert_eq!(observer.first_errno(), Some(libc::EIO));
-            // 量子之间的真实回收失败先撤销原Source健康权限；下次入口必须固定SourceSuperseded并释放未发布资源。
+            // Actual reclaim failure between quanta revokes Source health first. The next entry
+            // must retain SourceSuperseded and return unpublished resources.
             assert_eq!(
                 request.advance(&doc, authority(&doc), 4096).err(),
                 Some(MarkdownTableRequestError::SourceSuperseded)
@@ -2695,7 +2751,7 @@ fn joint_bounds_long_prefix_remains_pending_and_reclaims_source_errors() {
                 request.advance(&doc, authority(&doc), 4096).err(),
                 Some(MarkdownTableRequestError::SourceSuperseded)
             );
-            continue; // 真正读窗归还失败固定首因，不能用同坐标重试或发布半份来源。
+            continue; // Actual read-window return failure stays primary; equal coordinates cannot retry or publish partial sources.
         }
         for _ in 0..100 {
             if !request.leaf_semantic.as_ref().unwrap().preparing() {
@@ -2719,7 +2775,8 @@ fn joint_bounds_long_prefix_remains_pending_and_reclaims_source_errors() {
 }
 
 #[test]
-/// 真实长源的窗口端点与远选区各在自己的小片内续用；源工作少于四次独立前缀解码，不读取两端之间正文。
+/// Reuse actual local piece prefixes for viewport/distant-selection endpoints, reading less than
+/// four independent prefix decodes without scanning the body between them.
 fn joint_bounds_reuse_actual_piece_prefixes_with_far_selection_and_preserve_failure() {
     let source = "a".repeat(100_000);
     for fault in [false, true] {
@@ -2741,7 +2798,8 @@ fn joint_bounds_reuse_actual_piece_prefixes_with_far_selection_and_preserve_fail
         assert!(work.source_bytes + work.structural_transitions + work.metadata_bytes <= 4096);
         assert!(request.leaf_semantic.as_ref().unwrap().preparing());
         if fault {
-            // 两端点仍归同一可取消请求；取消后不能用已认证小片标量恢复任何读取或发布。
+            // Both endpoints belong to the same cancellable request; authenticated piece scalars
+            // cannot restore reading or publication after it ends.
             request.cancel();
             assert_eq!(request.failed, Some(MarkdownTableRequestError::Cancelled));
             assert!(request.leaf_semantic.is_none());

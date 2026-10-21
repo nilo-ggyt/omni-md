@@ -1,4 +1,4 @@
-//! 正式结构来源的同请求导航；只核真实行、表尾、失权与映射释放，不观察私有游标或调用次数。
+//! Exercise same-request structural navigation through real rows, End, revocation, and mapping release rather than private cursor counts.
 
 use super::*;
 
@@ -17,7 +17,7 @@ fn authority(document: &MarkdownDocumentBuffer) -> MarkdownViewportSourceAuthori
     }
 }
 
-/// 一个测试驱动循环只推进原生产量子；来源 Ready 不是 ordinary 样式或完整窗口 Ready。
+/// Drive original production steps; source readiness grants neither ordinary styles nor a completed semantic table window.
 fn finish(
     request: &mut MarkdownViewportSourceRequest,
     document: &MarkdownDocumentBuffer,
@@ -65,7 +65,7 @@ fn start(
     (request, sources)
 }
 
-/// 查询只收原行票与方向；视觉范围不移动时也必须保住离屏目标，不用整数坐标签发来源。
+/// Request navigation with an original row ticket and direction, preserving offscreen targets even when visual coverage stays fixed.
 fn navigate(
     request: &mut MarkdownViewportSourceRequest,
     document: &MarkdownDocumentBuffer,
@@ -102,6 +102,7 @@ fn navigate(
 }
 
 #[test]
+// Keep visual coverage fixed while actual neighboring-row queries walk to the header and then the real table terminal.
 fn structural_navigation_walks_backward_to_header_forward_to_true_end_and_releases_mapping() {
     let text = "前段\r\n\r\n| H | C |\r\n| - | - |\r\n| 第一行中😀 | 一 |\r\n| second | 二 |\r\n| third | 三 |\r\n\r\n后继正文\r\n";
     let (file, document) = document(text);
@@ -203,13 +204,14 @@ fn structural_navigation_walks_backward_to_header_forward_to_true_end_and_releas
     assert_eq!(std::fs::read(file.path()).unwrap(), text.as_bytes());
     request.cancel();
     drop((request, sources, row, document));
-    // 外带 terminal 只持原弱身份和 checkpoint 页，不能在 Doc 释放后继续保活文件映射。
+    // An exported terminal retains weak identity/checkpoint metadata only; it cannot keep the closed document's mapping alive.
     assert!(mapping.unmap_succeeded());
     assert!(!mapping.failed());
     drop(terminal);
 }
 
 #[test]
+// Foreign query rejection is recoverable preflight; actual document generation changes revoke previously issued row authority.
 fn structural_navigation_rejects_foreign_publication_document_and_undo_stale_origins() {
     let text = "| H | C |\n| - | - |\n| a | b |\n| c | d |\n";
     let (_file, mut document) = document(text);
@@ -219,7 +221,7 @@ fn structural_navigation_rejects_foreign_publication_document_and_undo_stale_ori
         .table_row_at_for(&document, authority(&document), position)
         .unwrap()
         .unwrap();
-    // 合法相邻行请求也不能扩大旧视觉来源到未知左侧；真正逆向行由原 checkpoint 在原视口外返回。
+    // Neighbor navigation cannot extend visual coverage into the unknown left side; the original checkpoint resolves that row offscreen.
     let query = sources
         .required_row_query_for(
             &document,
@@ -282,7 +284,7 @@ fn structural_navigation_rejects_foreign_publication_document_and_undo_stale_ori
         ),
         Err(MarkdownTableRequestError::SourceSuperseded)
     ));
-    // 外来查询前置拒绝不损坏原 owner；原真实查询随后仍得到正确下一行。
+    // Foreign-query preflight rejection preserves the owner, which must still resolve its legitimate next-row query.
     let (_next, result) = navigate(
         &mut request,
         &document,
@@ -306,11 +308,12 @@ fn structural_navigation_rejects_foreign_publication_document_and_undo_stale_ori
 }
 
 #[test]
+// Adding terminal evidence must preserve all previously visible members, so backward navigation still resolves their original coordinates.
 fn structural_navigation_end_preserves_original_multirow_physical_coverage() {
     let text = "| H | C |\r\n| - | - |\r\n| first | 一 |\r\n| second | 二 |\r\n| third | 三 |\r\n\r\n后继正文\r\n";
     let (_file, document) = document(text);
     let last = text[..text.find("| third").unwrap()].encode_utf16().count();
-    // 视口在末行中途封闭：原票同时包含 H 和三行，但此时尚未分类下一物理行确认 End。
+    // Close coverage within the last row: the ticket already includes the header and three rows, but End still needs the next physical line.
     let mut request = document
         .viewport_leaf_source_request(0..last + 1, 71, document.selection())
         .unwrap();
@@ -350,7 +353,7 @@ fn structural_navigation_end_preserves_original_multirow_physical_coverage() {
             ordinal
         );
     }
-    // 附加真实 End 不得用一张 terminal-only 票替换原可见多行票；后续逆向仍直接消费同 owner。
+    // Attaching real End preserves the visible multirow ticket; subsequent backward navigation still consumes this same owner.
     let (_sources, result) = navigate(
         &mut request,
         &document,

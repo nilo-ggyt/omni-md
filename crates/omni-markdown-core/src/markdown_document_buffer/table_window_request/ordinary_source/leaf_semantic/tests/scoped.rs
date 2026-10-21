@@ -1,4 +1,5 @@
-//! 原 Global/Origin 容器行通过公开 SourceRequest 发布；不构造 scope、私有 job 或假完成票。
+//! Publish original Global/Origin container lines through the public SourceRequest, without
+//! constructing scopes, private jobs, or artificial completion tickets.
 
 use super::production::{finish_sources, leaf_sources};
 use super::*;
@@ -39,7 +40,8 @@ fn production_scoped_plain_origins_preserve_content_markers_and_canonical_file()
         ),
     ] {
         let (directory, mut doc) = document(source);
-        // 选择放在文尾，避免测试把当前 item 的字面显露误认成另一份解析来源。
+        // Keep selection at document end so active-item literal visibility is not mistaken for
+        // another parsing source.
         doc.set_selection(MarkdownTextSelection::caret(doc.utf16_len()))
             .unwrap();
         let observer = doc.original_backing_observer().unwrap();
@@ -66,7 +68,8 @@ fn production_scoped_plain_origins_preserve_content_markers_and_canonical_file()
                 assert_eq!(actual.styles, baseline.query(index).unwrap().styles);
             }
         }
-        // 只用公开 Origin 的真实 prefix 核结构位；lazy continuation 的空 prefix 不得到假标记。
+        // Check structural flags only on public Origin prefixes; an empty lazy-continuation prefix
+        // must not gain invented markers.
         for line in sources.ordinary_lines_for(&doc, authority(&doc)).unwrap() {
             for index in line.prefix_utf16_range() {
                 let actual = ready
@@ -189,7 +192,7 @@ fn production_scoped_long_links_and_other_roles_keep_real_unknown_intersections(
                 MarkdownRootLeafPendingReason::NeedsGeneralInline
                     | MarkdownRootLeafPendingReason::NonRootScope
             )
-        )); // 长富文本不进有限 whole-slice Parser；脚注原 opening 也不能补造尚未完成的长链接语义。
+        )); // Long rich text cannot enter the finite whole-slice parser; a footnote opening cannot prove unfinished link semantics.
     }
 }
 
@@ -205,8 +208,9 @@ fn production_scoped_code_and_emphasis_cross_real_prefixes_match_original_parser
         "> ` 代码\r\n> \t跨行😀 ` 后面 **正文**\r\n",
         "> ` \n> \t ` 正文\n",
         "> - ` \r\n>   \t ` 后文\r\n",
-        // 这三个固定源同时用于真实原生几何回归；这里独立确认 SourceRequest 的每个正文 scalar
-        // 与结构前缀已发布原 Parser 语义，不将后继字体整形失败误归为语义缺失。
+        // These fixed sources also serve Native geometry regression. Independently establish body
+        // scalar/prefix semantics here so later font-shaping failure is not misdiagnosed as missing
+        // SourceRequest semantics.
         "outside\n\n> 中文引用段落保留真实字体与缩进，混合 emoji 😀 和 English words，在原可用列宽内自然换行。中文继续验证实际软行来源、基线、上下边距和段落边框的占位。\n\nend\n",
         "outside\r\n\r\n> **引用中文粗体\r\n> 续行粗体** 与 *引用斜体*、`引用代码\r\n> 跨行代码😀` 和普通中文保持同一实际容器来源。\r\n\r\nend\r\n",
         "outside\n\n> - **嵌套列表中文\n>   续行粗体** 与 ` 代码\n>   \t跨行代码😀 ` 后面普通中文。\n\nend\n",
@@ -227,7 +231,8 @@ fn production_scoped_code_and_emphasis_cross_real_prefixes_match_original_parser
         oracle
             .rebuild(doc.generation(), 0..doc.utf16_len(), source)
             .unwrap();
-        // 只把独立完整 Parser 真正交付的正文 scalar 作为比较对象，不从被测 source run 反造期望。
+        // Compare body scalars actually emitted by the independent parser, without deriving expected
+        // values from the source runs under test.
         for (event, range) in Parser::new_ext(
             source,
             crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),
@@ -395,7 +400,8 @@ fn production_scoped_quote_prefix_visibility_uses_actual_physical_line_endpoints
                 }
             }
         }
-        // Code 原事件跨过真实 quote/list prefix；其中 Tab 与额外缩进仍须保持原代码样式和宽度权限。
+        // Actual code events cross quote/list prefixes; their tabs and extra indentation still retain
+        // the original code styling and width authority.
         for (event, range) in Parser::new_ext(
             source,
             crate::markdown_viewport_presentation::parser::markdown_presentation_options(true),

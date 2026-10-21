@@ -1,4 +1,4 @@
-//! 原 SourceRequest 中串行的单格语义；RequiredRow、math、inline、引用和 underline 共用原源与总预算。
+//! Prepare one cell at a time in the original SourceRequest, sharing its source, Global context, and cumulative budget.
 
 use super::super::checkpoint::{ReplayOutcome, ReplayRequest};
 use super::*;
@@ -10,7 +10,7 @@ pub enum MarkdownTableCellInlineStep {
     Ready { work: SemanticWork },
 }
 
-/// 只有原语义 job 完整结束后才创建；结构行和 raw seed 都不能构造可查询的样式或链接。
+/// Publish only after the original semantic job completes; a structural row or raw seed alone grants no queryable styles or links.
 pub struct VerifiedMarkdownTableCellInline {
     cell: VerifiedMarkdownTableCellSource,
     publication: Rc<SourcePublication>,
@@ -73,16 +73,16 @@ pub(super) struct CellInlineJob {
     scope: Option<TableScopeCursor>,
     inherited: MarkdownPresentationStyles,
     cell: Option<VerifiedMarkdownTableCellSource>,
-    // 只有同一 SourceRequest 已完成的实际选择定位才能移交；SourcesOnly 首格仍自行定位。
+    // Reuse only selection endpoints actually located by this SourceRequest; the first SourcesOnly cell still locates them itself.
     selection_bytes: Option<Range<usize>>,
-    // 同一请求的上一格已真正归还此原 scanner；当前语义独占它，发布后交回父槽。
+    // The previous cell returned this original scanner; current semantics owns it exclusively until publication returns it to the parent.
     underline: Option<crate::markdown_document_buffer::table_source::MarkdownTableUnderlineRequest>,
     semantic: Option<PlainSemanticJob>,
     ready: Option<VerifiedMarkdownTableCellInline>,
 }
 
 impl MarkdownViewportSourceRequest {
-    /// 原来源发布必须仍是本 owner 最后一次消费的发布；准备只建立同 checkpoint 回放，不读取正文。
+    /// Require this owner's last consumed publication. Preparation creates replay from its checkpoint without reading text.
     pub fn prepare_cell_inline(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -113,8 +113,8 @@ impl MarkdownViewportSourceRequest {
             .ok_or(MarkdownTableRequestError::CoverageRequiresCheckpoint)?
             .clone();
         let replay = ReplayRequest::new(self.source.clone(), anchors, origin.ordinal)?;
-        // 前一个作业已经 take/drop 才能进入此处；固定槽不能按已完成格数单调重复收费。
-        // 每个 Ready 以后可被不同 Display 强持，因此这些实际发布仍逐格占联合库存。
+        // The previous job was taken/dropped before this entry, so its fixed workspace must not accumulate per completed cell.
+        // Each Ready may remain owned by another Display; its actual published payload still occupies joint inventory.
         self.batch
             .source_semantic_quota()?
             .reserve_cell_inline_workspace(std::mem::size_of::<CellInlineJob>() + 4096)
@@ -144,7 +144,7 @@ impl MarkdownViewportSourceRequest {
         Ok(())
     }
 
-    /// 只推进一个实际子阶段；原 Global 由本 request 短借，任何失败都撤销该任务和父 owner 的后续动作。
+    /// Advance one actual child stage through a short borrow of the original Global; failure retires the job and parent continuation.
     pub fn advance_cell_inline(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -173,8 +173,8 @@ impl MarkdownViewportSourceRequest {
             )?;
             self.batch.account_source_work(work)?;
             if self.selection_bytes.is_none() {
-                // SourcesOnly 没有父语义定位阶段；首个非空格付完真实定位费用后，
-                // 把同请求的固定端点归还原 owner，后续列和后续行复用，绝不另建缓存。
+                // SourcesOnly has no parent semantic-location stage. After the first nonempty cell pays for real location,
+                // return its fixed endpoints to this owner for later columns/rows instead of building another cache.
                 self.selection_bytes = job.selection_bytes.clone();
             }
             if job.ready.is_some() {
@@ -212,7 +212,7 @@ impl MarkdownViewportSourceRequest {
 }
 
 impl CellInlineJob {
-    /// 结构回放只保目标一行；scanner、scope 与语义各用独立量子，选择端点沿原请求归属复用。
+    /// Replay retains only the target row; scanner, scope, and semantics use separate steps and reuse this request's proved endpoints.
     fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -290,8 +290,8 @@ impl CellInlineJob {
                 let cell = raw
                     .take_cell_source_for(document)?
                     .expect("原 Ready 格来源只消费一次");
-                // 原 separator 方向已经和 raw 格同票封存；所有软行/隐藏标记共享此语义，
-                // 不因只读显示与活动草稿使用不同 Source 而丢掉列对齐。
+                // The raw cell ticket already seals delimiter alignment. Carry it through all soft lines and hidden markers,
+                // even though read-only display and the active draft use different Source objects.
                 self.inherited = self.inherited.union(match cell.alignment_for(document)? {
                     crate::MarkdownTableAlignment::Left => {
                         MarkdownPresentationStyles::TABLE_ALIGN_LEFT
@@ -307,7 +307,7 @@ impl CellInlineJob {
                 if cell.range.is_empty() {
                     self.finish(cell, None);
                 } else {
-                    // 原 ready scanner 只在新格真实单调覆盖时续用；回到前列仍重新取得原文首上下文。
+                    // Reuse the original ready scanner only for truly monotonic cell coverage; earlier columns need original prefix context again.
                     let mut underline = self.underline.take();
                     if let Some(original) = underline.as_mut()
                         && !original.continue_cell(document, &cell, quota.clone())?
@@ -329,12 +329,12 @@ impl CellInlineJob {
         let semantic = self.semantic.as_mut().expect("非空原格必有唯一语义任务");
         if semantic.preparing() {
             let work = semantic.advance_bounds(document, budget)?;
-            // 只在四个真实端点都齐全后移交；仍在途时不把默认 0..0 当成已证选择。
+            // Transfer only four completed actual endpoints; an in-flight default 0..0 is not a proved selection.
             self.selection_bytes = semantic.verified_selection_bytes();
             return Ok(work);
         }
         if semantic.done() {
-            // 原临时配对目录清理与真实 Box 发布先计费；不能让完成动作绕过当前量子与总配额。
+            // Charge temporary-pair cleanup and actual Box publication before completion, within this step and the original quota.
             let work = SemanticWork {
                 structural_transitions: CONTROL_COST + semantic.publication_control(document)?,
                 metadata_bytes: semantic.publication_payload_metadata(),
@@ -346,7 +346,7 @@ impl CellInlineJob {
             quota
                 .admit_metadata(work.metadata_bytes)
                 .map_err(MarkdownTableRequestError::Window)?;
-            // 先结束本格所有读取与样式构建，再把原前沿移交；finish 只发布实际样式，不销毁 raw 上下文。
+            // Finish cell reads/style construction before returning the original frontier; finish publishes actual styles without discarding raw context.
             self.underline = semantic.return_underline();
             let result = semantic.finish(
                 self.origin.publication.source.clone(),

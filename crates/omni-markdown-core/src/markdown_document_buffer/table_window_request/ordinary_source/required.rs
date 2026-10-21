@@ -1,17 +1,17 @@
-//! 普通来源 owner 内的真实单行续权；沿原 batch 回放，不产生第二份 Global 或 ordinary Ready。
+//! Resolve an actual neighboring row within the original source owner and batch, without a second Global or implied ordinary readiness.
 
 use super::super::semantic::{RequiredLocation, RequiredPublication};
 use super::*;
 use crate::markdown_document_buffer::MarkdownTableViewportRequiredRowQuery;
 use crate::markdown_viewport_presentation::table_window::navigation::MarkdownTableWindowNavigation;
 
-/// 两层 publication 都固定在签发时；同一表坐标不能借另一份 source publication 续权。
+/// Capture both publication identities at issuance; equal table coordinates cannot renew another source publication's authority.
 pub struct MarkdownViewportSourceRequiredRowQuery {
     publication: Weak<SourcePublication>,
     table_query: MarkdownTableViewportRequiredRowQuery,
 }
 
-/// Row 与真正 End 都交原来源行票；没有 window index、裸 End 或可以自行签发来源的整数。
+/// Return an original source row ticket for either a row or real End, rather than an index or integer that could manufacture authority.
 pub enum MarkdownViewportSourceRequiredRowResult {
     Row {
         row: VerifiedMarkdownTableRowSource,
@@ -22,8 +22,8 @@ pub enum MarkdownViewportSourceRequiredRowResult {
 }
 
 impl VerifiedMarkdownViewportSources {
-    /// origin 必须是本 publication 实际结构行，方向只产生待解析目标，不能以整数获得行权限。
-    /// None 仅表示表头向前的真实 TableStart；Next/NextRow 都查询后一物理表行，列策略由原格负责。
+    /// Require an actual structural member of this publication; direction selects a target that still needs replay.
+    /// None means Previous at the header. Next and NextRow request the next physical row; the cell owns column policy.
     pub fn required_row_query_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -58,7 +58,7 @@ impl VerifiedMarkdownViewportSources {
         }))
     }
 
-    /// Some 只表示原 Replay 完成后的实际 Row/terminal；目标离开视觉范围也交同一 publication 的封闭票。
+    /// Expose only a completed replay's row or terminal ticket, even when the target lies outside visual coverage.
     pub fn required_row_result_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -107,9 +107,9 @@ impl VerifiedMarkdownViewportSources {
 }
 
 impl MarkdownViewportSourceRequest {
-    /// 同一 source publication 的单行需求加入原 batch；视口逆向或缺原 checkpoint 明确拒绝。
+    /// Add a neighboring-row requirement to the original batch; reject backward visual coverage or a missing original checkpoint.
     ///
-    /// 成功仅启动 Pending，后续仍须逐次 advance 并取得 SourcesAvailable，再读取实际 Row/End。
+    /// Success starts Pending work. Advance to SourcesAvailable before consuming the actual Row or End.
     pub fn continue_forward_with_required_row(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -125,32 +125,32 @@ impl MarkdownViewportSourceRequest {
         {
             return Err(MarkdownTableRequestError::PublicationSuperseded);
         }
-        // 内层继续核其原 TablePublication 和实际 origin 成员；不以 source 目录身份替代表格票。
+        // The inner batch independently checks its TablePublication and origin membership; source directory identity cannot replace either.
         match self.batch.extend_from_ready_with_required_row(
             document,
             &previous.table,
             viewport.clone(),
             query.table_query,
         ) {
-            Ok(()) => {} // 原 batch 已接住查询；后面仍须联合准入同活 ordinary，不能在这里提前返回成功。
+            Ok(()) => {} // The batch accepted the query; coexisting ordinary metadata still needs joint admission below.
             Err(
                 error @ (MarkdownTableRequestError::PublicationSuperseded
                 | MarkdownTableRequestError::CoverageRequiresCheckpoint
                 | MarkdownTableRequestError::InvalidRequest),
             ) => {
-                // 这些是内层状态迁移之前的 query/覆盖前置拒绝；原 owner 仍可接合法原 publication。
+                // These query/coverage preconditions fail before the inner transition; the original owner can still accept a valid query.
                 return Err(error);
             }
             Err(error) => {
-                self.fail(error); // quota 或真实 source 失败不能保留半份 required 回放；原外带结果仍只读。
+                self.fail(error); // Quota or source failure retires this incomplete replay; exported results retain only their original read rights.
                 return Err(error);
             }
         }
-        // 只有原 batch 接受后才准入额外 previous ordinary 目录；仍使用同一 quota 和累计 work。
-        // retain 不重置 job、坐标转换和 origin_floor，未完 ordinary 始终先于其视口后继推进。
+        // Admit the previous ordinary directory only after batch acceptance, using the same quota and cumulative work.
+        // Retention preserves the job, coordinates, and origin_floor; unfinished ordinary work precedes its viewport successor.
         let result = self.retain_forward_sources(document, previous, viewport);
         if let Err(error) = result {
-            self.fail(error); // 联合库存超限即撤本次后继，不能退回另一 request 重发额度。
+            self.fail(error); // Joint inventory failure retires this successor; another request must not silently reissue its budget.
         }
         result
     }

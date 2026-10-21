@@ -1,4 +1,5 @@
-//! 超长 Root 段落的原 code 证明与可见交集；正文只借 mmap 小帧，输出库存只随当前 viewport 增长。
+//! Original code proofs and visible intersections for long root paragraphs. Body reads borrow small
+//! mmap frames; retained presentation output is bounded by the current viewport.
 
 use super::*;
 use pulldown_cmark::global_frontier::{
@@ -22,7 +23,7 @@ struct VisibleSpan {
     styles: MarkdownPresentationStyles,
 }
 
-/// 单个实际code证明或原强调kernel真实匹配的范围；从不收集整块历史range目录。
+/// One actual code proof or matched emphasis span, without a directory of the block's past ranges.
 pub(in crate::markdown_document_buffer) struct SpanProof {
     pub(in crate::markdown_document_buffer) whole: Range<usize>,
     pub(in crate::markdown_document_buffer) body: Range<usize>,
@@ -30,8 +31,8 @@ pub(in crate::markdown_document_buffer) struct SpanProof {
 }
 
 pub(super) struct CodeJob {
-    // 大游标是同一算法的真实独占子owner，后继单独构造；不能把其固定载荷塞进本Box
-    // 令一次4632B分配越过4096，再以字段收费假装已经分量子。
+    // Construct the larger exclusive cursor in a later quantum. Embedding it here would make one
+    // 4632-byte allocation exceed 4096; accounting for its fields separately would not split that work.
     cursor: Option<Box<InlineCodeCursor>>,
     cursor_initialized: bool,
     pending_storage: Option<InlineLinkStorageRequest>,
@@ -57,7 +58,8 @@ pub(super) struct CodeJob {
     pub(super) links: Vec<MarkdownSourceLink>,
     target_bytes: usize,
     options: pulldown_cmark::Options,
-    // 强调的外层域来自原 seed；Link label 会临时成为独立内层域，不用视口边缘代替语法边界。
+    // The seed defines the outer emphasis scope. A link label temporarily supplies its own inner
+    // scope; viewport edges never substitute for syntax boundaries.
     source_range: Range<usize>,
     visible: Option<VisibleSpan>,
     visible_index: usize,
@@ -66,12 +68,13 @@ pub(super) struct CodeJob {
     query_cached: Option<MarkdownPresentationQuery>,
     containers: MarkdownPresentationStyles,
     prefix: Option<PrefixDecoration>,
-    // 同一来源页按原源序只前进；每条 prefix 不能从零重扫所有已证明的 Origin。
+    // Advance through the same source page in order instead of rescanning all prior origins per prefix.
     prefix_record_index: usize,
 }
 
 impl CodeJob {
-    /// 只接原闭合 Root Paragraph；完整 Setext 标记/容器仍须其自身 origin 规则，不造普通段落权限。
+    /// Accept the original supported paragraph/cell seed. Setext markers and container prefixes still
+    /// require their own origin facts; constructing this owner does not grant plain-text authority.
     pub(super) fn new(
         block: &OrdinaryBlockRecord,
         coverage: Range<usize>,
@@ -133,8 +136,9 @@ impl CodeJob {
         !self.cursor_initialized
     }
 
-    /// 父事务仍持同一个真实block/origin，只有本次实际构造游标才借它们，不保存第二份seed。
-    /// 小CodeJob与大cursor分别各有一次完整Box分配/准入；没有空Yield、摊费或第二条游标。
+    /// Borrow the parent's actual block/origin only to construct this cursor, without retaining a
+    /// second seed. The small job and larger cursor each have one complete allocation/admission;
+    /// neither an empty yield nor amortized field accounting pretends to split an allocation.
     pub(super) fn prepare_cursor(
         &mut self,
         block: &OrdinaryBlockRecord,
@@ -165,7 +169,8 @@ impl CodeJob {
             self.cursor = Some(Box::new(cursor));
             metadata
         } else {
-            // 原工厂的真实负证明仍交General；仅结束这次未获权限的子owner，不签默认Ready。
+            // Preserve the factory's actual unsupported result as General. Ending this child does
+            // not authorize a default Ready publication.
             self.general = true;
             self.done = true;
             0
@@ -178,7 +183,8 @@ impl CodeJob {
         })
     }
 
-    /// code probe 真实越过视口寻找 closer；只有已闭合 proof 的可见端点才进行有限 UTF16 转换。
+    /// Probe beyond the viewport for a real closer, then convert only a proven span's visible
+    /// endpoints to UTF-16 through the original source tree.
     pub(super) fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -280,7 +286,9 @@ impl CodeJob {
                         active: markdown_selection_intersects(selection, &proof.whole),
                         styles: proof.styles,
                     };
-                    self.visible = Some(span); // 去重必须在后继有限量子逐项进行，不能隐藏一次无界Vec遍历。
+                    // Deduplicate in subsequent bounded quanta; do not hide a complete Vec scan
+                    // inside coordinate completion.
+                    self.visible = Some(span);
                     self.visible_index = 0;
                     self.coordinates = None;
                     self.pending = None;
@@ -290,7 +298,8 @@ impl CodeJob {
             let whole = &proof.whole;
             let body = &proof.body;
             let clamp = |at: usize| at.clamp(self.coverage.start, self.coverage.end);
-            // 远处 opener/closer 只取 AVL 计量后的可见交集，绝不解码两端之间的整个 giant code body。
+            // Clamp distant delimiters to the visible intersection before AVL coordinate lookup;
+            // never decode the entire giant code body between those endpoints.
             let (coordinates, work) = Coordinates::new(
                 document,
                 [
@@ -305,7 +314,8 @@ impl CodeJob {
             return Ok((work, false));
         }
         if let Some(prefix) = self.prefix.as_mut() {
-            // 此流式 kernel 仍只接已消费的 Quote/List/Item；Footnote 先走有真实 opening 的短块入口。
+            // This streaming kernel consumes proven Quote/List/Item prefixes. Footnotes use the
+            // finite-block path with their real opening facts instead.
             let (work, marker, done) = prefix.advance(document, budget, &[])?;
             self.pending = marker;
             if done {
@@ -354,7 +364,7 @@ impl CodeJob {
                 )));
                 std::mem::size_of::<LinkJob>()
             } else {
-                0 // 离屏 label 仍隔离强调，但不为它复制 URL 或创建点击目标库存。
+                0 // Offscreen labels still isolate emphasis, without copying a URL or retaining a click target.
             };
             return Ok((
                 SemanticWork {
@@ -426,7 +436,7 @@ impl CodeJob {
         if self.cursor.is_none() {
             if let Some(mut emphasis) = self.emphasis.take() {
                 emphasis.finish();
-            } // 这里只结束算法；共同文件待同underline最后消费者结束后由父事务显式close。
+            } // Only finish the algorithm here; the parent closes the shared file after its last underline consumer.
             self.done = true;
             return Ok((
                 SemanticWork {
@@ -496,7 +506,7 @@ impl CodeJob {
                 let range = proof.source_range();
                 if range.start < self.coverage.end && self.coverage.start < range.end {
                     self.prefix = Some(PrefixDecoration::new(proof));
-                } // 真物理行 owner 由原 SourceRequest 交回；不按裁剪范围决定显隐。
+                } // The original SourceRequest supplies the physical-line owner; clipped coverage does not decide visibility.
             }
             InlineCodeStep::Emphasis { run, .. } => self.incoming = Some(run),
             InlineCodeStep::Link { proof, .. } => self.incoming_link = Some(proof),
@@ -532,7 +542,7 @@ impl CodeJob {
                     if present {
                         self.containers = self.containers.union(style);
                     }
-                } // 只有原 scope 与 inline 都完成后才发布继承样式，不从 marker 拼写猜祖先。
+                } // Publish inherited styles only after the original scope and inline proof complete, without guessing ancestors from marker spelling.
                 self.cursor = None;
             }
             InlineCodeStep::NeedsGeneralInline { .. } => {
@@ -543,7 +553,8 @@ impl CodeJob {
         }
         Ok((
             SemanticWork {
-                // Storage/Reference可在帧前缀立即暂停，真实借片的尾部仍是本次源读取，不能漏账。
+                // Storage/reference events can pause at a frame prefix. Charge the entire actual
+                // borrowed frame, including its unread tail, rather than omitting that acquisition.
                 source_bytes,
                 metadata_bytes: allocated,
                 structural_transitions: measured.transitions + tree + PLAIN_CONTROL,
@@ -554,7 +565,8 @@ impl CodeJob {
         ))
     }
 
-    /// 原cursor暂停时只移动唯一Queries，不复制Map；只有同Global首定义或真实EOF才恢复。
+    /// Move the unique Queries while the original cursor is paused, without copying its map.
+    /// Resume only after the same Global resolves the first definition or proves true EOF.
     fn advance_reference(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -667,7 +679,8 @@ impl CodeJob {
         })
     }
 
-    /// 查询只遍历当前 viewport 的已证交集；无交集的区间只有最终 plain/code prefix 成功后才可默认。
+    /// Query proven spans for this viewport. Unmatched intervals obtain plain/container styles only
+    /// after the original plain/code prefix has completed successfully.
     pub(super) fn advance_query(
         &mut self,
         index: usize,
@@ -744,11 +757,12 @@ impl CodeJob {
         Ok(())
     }
 
-    /// 与父 Leaf 的既有链接移交口相同；只移动已完成、当前覆盖内的真实目标，不另复制 String。
+    /// Move a completed real target to the parent's existing handoff without another String copy.
     pub(super) fn take_link(&mut self) -> Option<MarkdownSourceLink> {
         self.links.pop()
     }
-    /// 发布前真实归还可见 code 证明和坐标 scratch，仅保已经封存的输出 run。
+    /// Return proof, coordinate, parser, and lookup scratch before publication; retain sealed output
+    /// runs and targets already awaiting the parent's ownership transfer.
     pub(super) fn release_scratch(&mut self) {
         self.spans = Vec::new();
         self.pending = None;
@@ -775,14 +789,15 @@ impl CodeJob {
 mod tests {
     use super::*;
 
-    /// 只查询本进程descriptor当前实际inode；并发测试可复用fd数值，不能把新文件误报为旧占用。
+    /// Observe this process's actual descriptor inode without acquiring close ownership. Parallel
+    /// tests may reuse the descriptor number for a different file after the original owner closes it.
     pub(super) fn descriptor_identity(
         descriptor: std::os::fd::RawFd,
     ) -> Option<(libc::dev_t, libc::ino_t)> {
         let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: fstat只写完整stat到有效栈槽，不创建File或取得descriptor的close权限。
+        // SAFETY: fstat writes a complete stat into valid stack storage; it creates no File or close owner.
         if unsafe { libc::fstat(descriptor, status.as_mut_ptr()) } == 0 {
-            // SAFETY: 只有fstat成功后才读取它已完整初始化的系统结构。
+            // SAFETY: a successful fstat initialized the complete structure before this read.
             let status = unsafe { status.assume_init() };
             Some((status.st_dev, status.st_ino))
         } else {
@@ -795,7 +810,8 @@ mod tests {
     }
 
     #[test]
-    /// 原文件栈已换页后分别取消、源EIO、索引EBADF；首错永久保留并真实归还唯一FD。
+    /// After actual stack paging, cancellation, source EIO, and index EBADF must preserve their first
+    /// failure and close the unique file descriptor.
     fn active_emphasis_file_is_closed_on_cancel_and_real_source_or_storage_errors() {
         for scenario in ["cancel", "source", "storage"] {
             let directory = tempfile::tempdir().unwrap();
@@ -803,7 +819,8 @@ mod tests {
             let source = format!(
                 "{}{}{}\n",
                 "*a ".repeat(200),
-                // 超过原64KiB驻留槽后才有真实msync驱逐；短文件只武装注入不能证明源首错处理。
+                // Exceed the original 64-KiB resident slot so reclaim really executes msync; merely
+                // arming an injection on a short file would not exercise source-failure handling.
                 "中".repeat(40_000),
                 " a*".repeat(200)
             );
@@ -875,7 +892,8 @@ mod tests {
                 request.advance(&document, authority, 4096).err(),
                 Some(error)
             );
-            // 原fd必须已经关闭或被内核复用为其他inode；仍指向原inode就是实际泄漏，不能放行。
+            // The old descriptor must be closed or reused for another inode; the same inode would
+            // mean the actual resource is still retained.
             assert_ne!(descriptor_identity(descriptor), Some(original_inode));
             assert!(request.semantic.is_none());
             drop(request);
@@ -886,7 +904,8 @@ mod tests {
     }
 
     #[test]
-    /// 真实 giant probe 在远处 closer 之前被取消或换页失败时，不能发布半份样式或保住原映射。
+    /// Cancelling or failing a giant probe before its distant closer must publish no partial styles
+    /// and must not retain the document mapping.
     fn active_giant_code_probe_releases_source_and_owner_on_cancel_and_reclaim_error() {
         for cancel in [true, false] {
             let directory = tempfile::tempdir().unwrap();

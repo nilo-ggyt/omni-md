@@ -1,4 +1,5 @@
-//! 原正文内文档信息卡；只投影有限身份和树根聚合，不接管输入、文稿或窗口生命周期。
+//! Document information within the original body. Project finite identity and
+//! tree aggregates without taking over input, document, or window lifetime.
 
 use super::*;
 use objc2_app_kit::NSScrollerStyle;
@@ -8,8 +9,9 @@ const PADDING: f64 = 13.0;
 const LABEL_WIDTH: f64 = 48.0;
 const GAP: f64 = 8.0;
 
-/// 固定控件在首次明确打开后复用；隐藏时归还原票、清空业务文字并移出视图树。
-/// 只有会话controller拥有此值；Weak票不延长Doc、scroll、编辑器或源映射生命周期。
+/// Reuse fixed controls after the first explicit open. Hide revokes the original
+/// ticket, clears business text, and detaches the card from its parent. Only the
+/// session controller owns it; Weak intent cannot prolong document/editor/mapping life.
 pub(super) struct NativeMarkdownInformationPanel {
     root: Retained<NSBox>,
     scroll: Retained<NSScrollView>,
@@ -33,7 +35,8 @@ struct Counts {
     bytes: usize,
 }
 impl Counts {
-    /// 四项都是canonical树聚合；调用方必须在Native展示前结束这份只读借用。
+    /// Capture canonical tree aggregates, ending this read-only borrow before
+    /// the caller presents any Native values.
     fn capture(document: &MarkdownDocumentBuffer) -> Self {
         Self {
             characters: document.character_count(),
@@ -46,7 +49,8 @@ impl Counts {
 
 impl NativeMarkdownInformationPanel {
     #[cfg(feature = "native-markdown-runtime-probe")]
-    /// 原生回归只借用这张卡已装配的实际控件；不创建观察目录、正文owner或替身。
+    /// Lend this card's actually assembled controls to Native acceptance without
+    /// constructing substitute controls or another document/observation owner.
     pub(super) fn probe_controls(
         &self,
     ) -> (
@@ -65,7 +69,8 @@ impl NativeMarkdownInformationPanel {
         )
     }
 
-    /// 一次装配所有固定角色；账本拒绝时candidate局部析构，不发布不完整资源图。
+    /// Assemble every fixed role once. A ledger rejection drops the local
+    /// candidate instead of publishing an incompletely registered resource graph.
     fn new(controller: &NativeMarkdownController) -> Result<Self, String> {
         let mtm = controller.mtm();
         let ledger = &controller.ivars().owned;
@@ -103,13 +108,15 @@ impl NativeMarkdownInformationPanel {
         content.addSubview(&heading);
         let labels = ["标题", "路径", "字符", "词数快照", "行数", "字节", "修改"]
             .map(|text| Self::label(text, false, controller));
-        // 固定七项逐项传播真实登记错误；不因后项失败丢掉先前已登记的weak证据。
+        // Propagate each real registration failure; rejecting a later field
+        // cannot erase Weak evidence of previously constructed roles.
         let labels: [Retained<NSTextField>; 7] = labels
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .expect("信息卡有固定七个标签");
-        // 词数只在打开/显式刷新时统计；四字标签保原48pt列，悬停解释不会新增正文读取或计时器。
+        // Words update on open/explicit refresh. The four-character label fits
+        // the original column; its tooltip starts no text reads or timer.
         labels[3].setToolTip(Some(ns_string!("显示上次统计结果；编辑后点击刷新词数更新")));
         let values: [Retained<NSTextField>; 7] = (0..7)
             .map(|_| Self::label("", true, controller))
@@ -117,7 +124,8 @@ impl NativeMarkdownInformationPanel {
             .try_into()
             .expect("信息卡有固定七个值");
         for (label, value) in labels.iter().zip(&values) {
-            // 只有标题/路径/数字/时间的短展示值，行高按实际文本测量；绝不设置正文内容。
+            // These fields contain only finite title/path/count/time values;
+            // their actual text determines height, without copying document content.
             content.addSubview(label);
             content.addSubview(value);
         }
@@ -154,7 +162,8 @@ impl NativeMarkdownInformationPanel {
         })
     }
 
-    /// 标准只读多行字段只解释显示身份；不参与共享field editor、IME或Undo。
+    /// Standard read-only multiline labels display identity only and never join
+    /// the shared field editor, IME, or document Undo chain.
     fn label(
         text: &str,
         value: bool,
@@ -170,7 +179,8 @@ impl NativeMarkdownInformationPanel {
             1.0,
         )));
         label.setSelectable(false);
-        // 路径与长标题也需完整展示；按字符换行避免无空格路径越过卡片宽度。
+        // Preserve complete paths/titles. Character wrapping keeps unspaced
+        // paths inside the card without truncating their displayed identity.
         label
             .cell()
             .expect("原生只读字段已有cell")
@@ -182,14 +192,16 @@ impl NativeMarkdownInformationPanel {
         Ok(label)
     }
 
-    /// 两个原有卡片动作借用同一controller，关闭会话时对称断开target/action。
+    /// Existing card actions borrow the same controller; session teardown
+    /// symmetrically removes target/action before returning control ownership.
     fn button(
         title: &str,
         explanation: &str,
         action: Sel,
         controller: &NativeMarkdownController,
     ) -> Result<Retained<NSButton>, String> {
-        // SAFETY: controller在当前主线程会话中存活，实现此固定action ABI；detach先清借用边。
+        // SAFETY: The live main-thread controller implements this fixed action
+        // ABI. Detach removes borrowed targets before its owner ends.
         let button = unsafe {
             NSButton::buttonWithTitle_target_action(
                 &NSString::from_str(title),
@@ -208,7 +220,8 @@ impl NativeMarkdownInformationPanel {
         Ok(button)
     }
 
-    /// 先撤销纯标量权限，再做可重入清理；反复开关只复用这一组空控件。
+    /// Revoke scalar authority before reentrant cleanup. Repeated open/hide
+    /// cycles reuse this one set of empty controls.
     fn hide(&self) {
         self.visible.set(false);
         self.revision.set(
@@ -223,7 +236,7 @@ impl NativeMarkdownInformationPanel {
         self.root.removeFromSuperview();
         for value in &self.values {
             if !clearing() {
-                return; // 清理中的Native重入已重新打开，旧hide不能抹掉后继显示值。
+                return; // Reentry reopened the card; old cleanup cannot erase successor values.
             }
             value.setStringValue(ns_string!(""));
             if !clearing() {
@@ -237,14 +250,16 @@ impl NativeMarkdownInformationPanel {
         }
     }
 
-    /// 只接受同一次显示；原生setter触发关闭或后继打开后，不再发布旧值。
+    /// Accept only the same display revision. Native setters that close/reopen
+    /// the card revoke any remaining old-value publication.
     fn current(&self, revision: u64, controller: &NativeMarkdownController) -> bool {
         self.visible.get()
             && self.revision.get() == revision
             && native_markdown_controller_has_foreground_authority(controller)
     }
 
-    /// caller已核对原Doc；本方法只展示四个聚合，词数遵循原卡片的明确刷新动作。
+    /// The caller already authenticated the document. Render four finite
+    /// aggregates while preserving explicit word-refresh semantics.
     fn render_counts(&self, counts: Counts, refresh_words: bool, current: &impl Fn() -> bool) {
         for (index, value) in [
             (2, counts.characters),
@@ -253,7 +268,7 @@ impl NativeMarkdownInformationPanel {
             (5, counts.bytes),
         ] {
             if index == 3 && !refresh_words {
-                continue; // 原页面词数在打开/刷新时采样，普通编辑不偷换该按钮的语义。
+                continue; // Ordinary edits cannot silently replace the word snapshot sampled on open/refresh.
             }
             if !current() {
                 return;
@@ -262,7 +277,8 @@ impl NativeMarkdownInformationPanel {
         }
     }
 
-    /// 原浮层固定270pt并留正文上12/right14；窄高区域用卡片自身滚动，不压缩编辑区。
+    /// Preserve the 270-point overlay and existing top/right margins. Short
+    /// body regions scroll within the card rather than compressing the editor.
     fn position(&self, parent: &NSView, body: NSRect, current: &impl Fn() -> bool) {
         if !self.visible.get() || !current() {
             return;
@@ -281,9 +297,12 @@ impl NativeMarkdownInformationPanel {
         let from_top = if self.reset_scroll.get() {
             0.0
         } else {
-            // 卡片内部滚动位置按距顶偏移保存；resize/字符统计刷新不把用户拉回标题。
+            // Preserve distance from the card's top, so resizing or refreshing
+            // counts does not unexpectedly move the user back to its heading.
             (old_height - old_bounds.origin.y - old_bounds.size.height).max(0.0)
         };
+        // Measure only the seven finite display values at the actual column
+        // width. The document's logical height never participates in this card.
         let value_width = WIDTH - 2.0 * PADDING - LABEL_WIDTH - GAP;
         let mut heights = [16.0_f64; 7];
         for (index, value) in self.values.iter().enumerate() {
@@ -296,6 +315,8 @@ impl NativeMarkdownInformationPanel {
                 .ceil()
                 .max(16.0);
         }
+        // Retain natural content height for internal scrolling while clipping
+        // the overlay to the current body. Each Native setter may revoke current.
         let natural_height =
             PADDING * 2.0 + 22.0 + 10.0 + heights.iter().sum::<f64>() + 6.0 * GAP + 11.0 + 28.0;
         let height = natural_height.min((body.size.height - 24.0).max(1.0));
@@ -323,6 +344,8 @@ impl NativeMarkdownInformationPanel {
             NSPoint::ZERO,
             NSSize::new(WIDTH - 2.0, natural_height),
         ));
+        // Lay out heading/actions before the independent label/value rows; the
+        // close button remains a card action under the same display revision.
         let mut top = natural_height - PADDING;
         for (view, frame) in [
             (
@@ -345,6 +368,8 @@ impl NativeMarkdownInformationPanel {
             }
             view.setFrame(frame);
         }
+        // Allocate each actual measured value height without shrinking long
+        // paths or overlapping the following row.
         top -= 32.0;
         for (index, height) in heights.into_iter().enumerate() {
             if !current() {
@@ -373,6 +398,8 @@ impl NativeMarkdownInformationPanel {
         if !current() {
             return;
         }
+        // Restore the previous top-relative position only after final content
+        // geometry is installed, then let the actual scroller reflect it.
         let bounds = clip.bounds();
         if !current() {
             return;
@@ -389,15 +416,18 @@ impl NativeMarkdownInformationPanel {
             return;
         }
         self.reset_scroll.set(false);
-        // 本卡只在首次打开加入parent，resize不重新排序或把其他控件带到前台。
-        // SAFETY: 只在主线程读取本卡既有父关系，不跨getter持有状态借用。
+        // Attach only when absent. Resize does not reorder siblings or bring
+        // unrelated controls to the front.
+        // SAFETY: Read this card's existing parent on the main thread, without
+        // holding a state borrow across the Native getter.
         if unsafe { self.root.superview() }.is_none() && current() {
             parent.addSubview(&self.root);
         }
     }
 }
 
-/// 元数据只在打开和成功保存时读取，时间展示用本机区域与时区；失败明确显示未获取。
+/// Read file metadata only on open/successful save. Failure remains unavailable;
+/// presentation uses the current local locale and time zone.
 fn modified_time(document: &MarkdownDocumentBuffer) -> Option<std::time::SystemTime> {
     document
         .path()
@@ -405,13 +435,14 @@ fn modified_time(document: &MarkdownDocumentBuffer) -> Option<std::time::SystemT
         .and_then(|metadata| metadata.modified())
         .ok()
 }
+/// Format this finite metadata value without opening the document or reading text.
 fn display_time(time: Option<std::time::SystemTime>) -> String {
     let Some(time) = time else {
         return "未获取".to_owned();
     };
     let seconds = match time.duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs_f64(), // 正向时间保留亚秒值，不额外复制文件或正文。
-        Err(error) => -error.duration().as_secs_f64(), // Unix epoch以前同样是合法时间。
+        Ok(duration) => duration.as_secs_f64(), // Preserve fractional time without another file/text read.
+        Err(error) => -error.duration().as_secs_f64(), // Dates before Unix epoch remain legitimate metadata.
     };
     let date = objc2_foundation::NSDate::dateWithTimeIntervalSince1970(seconds);
     objc2_foundation::NSDateFormatter::localizedStringFromDate_dateStyle_timeStyle(
@@ -422,7 +453,8 @@ fn display_time(time: Option<std::time::SystemTime>) -> String {
     .to_string()
 }
 
-/// 原菜单已在首getter之前捕获笔记票；信息完全只读，不经过通用IME/Cell提交前置流程。
+/// The original menu captured note intent before sender getters. Read-only
+/// information does not require committing IME composition or the active cell.
 pub(super) fn toggle(intent: &NativeMarkdownCurrentNoteIntent) -> Result<(), String> {
     if !intent.current() {
         return Ok(());
@@ -433,7 +465,7 @@ pub(super) fn toggle(intent: &NativeMarkdownCurrentNoteIntent) -> Result<(), Str
     let existing = controller.ivars().information_panel.borrow().clone();
     if let Some(panel) = existing.as_ref().filter(|panel| panel.visible.get()) {
         panel.hide();
-        return Ok(()); // 再点原“信息”按钮只收起卡片，编辑器焦点和草稿保持原状。
+        return Ok(()); // Repeated Information hides only the card, preserving editor focus and draft.
     }
     let panel = match existing {
         Some(panel) => panel,
@@ -441,7 +473,7 @@ pub(super) fn toggle(intent: &NativeMarkdownCurrentNoteIntent) -> Result<(), Str
             let panel = Rc::new(NativeMarkdownInformationPanel::new(&controller)?);
             if !intent.current() {
                 return Ok(());
-            } // 构造重入失权时局部candidate自行释放。
+            } // Reentrant construction revocation drops this still-local candidate.
             *controller.ivars().information_panel.borrow_mut() = Some(Rc::clone(&panel));
             panel
         }
@@ -453,10 +485,12 @@ pub(super) fn toggle(intent: &NativeMarkdownCurrentNoteIntent) -> Result<(), Str
         let document = document.borrow();
         (Counts::capture(&document), modified_time(&document))
     };
-    drop(document); // 原生日期/字段setter之前结束Doc借用和临时强引用。
+    drop(document); // End document borrows and transient ownership before Native date/field calls.
     if !intent.current() {
         return Ok(());
     }
+    // Publish the original weak note intent and a fresh display revision before
+    // Native formatting/setters can reenter and supersede this open action.
     *panel.original.borrow_mut() = Some(intent.clone());
     panel.revision.set(
         panel
@@ -497,7 +531,8 @@ pub(super) fn toggle(intent: &NativeMarkdownCurrentNoteIntent) -> Result<(), Str
 }
 
 impl NativeMarkdownController {
-    /// accepted文稿交接和关闭都同步撤原票、文本和父关系，不等待队列或下一次打开。
+    /// Accepted document handoff/close synchronously revokes the original intent,
+    /// text, and parent relation without waiting for another open or queue turn.
     pub(super) fn hide_information_panel(&self) {
         let panel = self.ivars().information_panel.borrow().clone();
         if let Some(panel) = panel {
@@ -505,13 +540,15 @@ impl NativeMarkdownController {
         }
     }
 
-    /// 真正结束会话先断两个target；空卡片owner随后随controller释放，不逃到进程缓存。
+    /// End both borrowed targets before returning this session's card owner;
+    /// no project card owner escapes into a process-wide cache.
     pub(super) fn detach_information_panel(&self) {
         let panel = self.ivars().information_panel.borrow_mut().take();
         if let Some(panel) = panel {
             panel.hide();
             for button in [&panel.close, &panel.refresh] {
-                // SAFETY: 当前主线程仍持有controller和按钮，先断借用再归还各自强引用。
+                // SAFETY: Controller/buttons remain live on this main thread.
+                // Disconnect borrowed callbacks before releasing their owners.
                 unsafe {
                     button.setTarget(None);
                     button.setAction(None);
@@ -521,7 +558,8 @@ impl NativeMarkdownController {
         }
     }
 
-    /// 消费真实编辑完成通知或原“刷新词数”按钮；隐藏卡片不读metadata或构造Native值。
+    /// Consume actual edit completion or explicit word refresh. A hidden card
+    /// reads no metadata and constructs no Native display value.
     pub(super) fn refresh_information_panel(&self, refresh_words: bool) {
         let panel = self.ivars().information_panel.borrow().clone();
         let Some(panel) = panel.filter(|panel| panel.visible.get()) else {
@@ -544,7 +582,8 @@ impl NativeMarkdownController {
         }
     }
 
-    /// caller持有原surface的独占用例；仅相同Doc Weak可更新成功保存的时间，不重新领取Active。
+    /// The caller owns the original surface operation. Only the same document
+    /// Weak may refresh successful-save time, without reacquiring Active authority.
     pub(super) fn refresh_saved_information(&self, document: &SharedMarkdownDocument) {
         let panel = self.ivars().information_panel.borrow().clone();
         let Some(panel) = panel.filter(|panel| panel.visible.get()) else {
@@ -556,7 +595,7 @@ impl NativeMarkdownController {
             });
         if !matches {
             return;
-        } // 旧Doc完成保存不能把后来笔记的卡片覆盖成旧统计。
+        } // A late save from an old document cannot overwrite a successor note's information.
         let (counts, modified) = {
             let document = document.borrow();
             (Counts::capture(&document), modified_time(&document))
@@ -577,7 +616,8 @@ impl NativeMarkdownController {
         }
     }
 
-    /// 原正文布局提供唯一parent/frame；仅局部克隆空控件owner，不跨Native持RefCell借用。
+    /// Original body layout supplies the parent/frame. Clone the fixed control
+    /// owner locally, without holding a RefCell borrow across Native positioning.
     pub(super) fn position_information_panel(
         &self,
         parent: &NSView,

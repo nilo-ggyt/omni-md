@@ -1,4 +1,4 @@
-//! 真实闭合小块的完整 inline 事件投影；Root、原格与 ATX 各保自己的真实入口，先守 2048-byte 上限。
+//! Project complete inline events only for actual closed blocks of at most 2048 bytes, preserving Root, cell, and ATX entry authority.
 
 use super::super::leaf_semantic::scoped::ScopedLeaf;
 use super::*;
@@ -28,7 +28,7 @@ pub(super) struct BoundedInline {
     presentation_complete: bool,
 }
 
-/// 原闭合来源保持互斥；ATX 原 scope 由父 Leaf 续体消费，Parser 只执行原单行标题入口。
+/// Keep closed-source kinds exclusive; the parent consumes actual ATX scope while Parser uses its original single-line heading entry.
 enum BoundedSource {
     Root,
     Cell(Rc<OrdinaryBlockRecord>),
@@ -40,12 +40,12 @@ enum BoundedSource {
 }
 
 impl BoundedInline {
-    /// 原源定位、有限复制和查询移交完成前，父调度不能提前驱动 code/HTML 的引用解释。
+    /// Do not drive code/HTML reference interpretation before original location, bounded copy, and query transfer finish.
     pub(super) fn references_attached(&self) -> bool {
         self.references_attached
     }
 
-    /// 范围只来自 seed 的 Root/真实闭合限制；大段落不进入这个 whole-slice 原 Parser 入口。
+    /// Accept only the seed's actual closed bounded range; giant paragraphs never enter this whole-slice Parser entry.
     pub(super) fn new(
         cursor: &InlinePlainCursor,
         block: &Rc<OrdinaryBlockRecord>,
@@ -61,7 +61,7 @@ impl BoundedInline {
         Ok(Some(bounded))
     }
 
-    /// ATX 权限来自真正闭合 Leaf；容器 scope 由父原续体验证，不把任意行或裸 Range 转成 seed。
+    /// Derive ATX authority from an actual closed leaf with parent-verified scope, never an arbitrary line or naked range.
     pub(super) fn supports_atx(
         leaf: &pulldown_cmark::global_frontier::VerifiedGlobalLeafBlock,
     ) -> bool {
@@ -69,7 +69,7 @@ impl BoundedInline {
             && leaf.source_range().end - leaf.physical_start() <= 2048
     }
 
-    /// 保留真实物理前缀和完整标题闭合末端；同一完整 Parser 继续负责标题和所有 inline 优先级。
+    /// Preserve actual physical prefixes and the complete heading end; the same Parser owns heading and inline precedence.
     pub(super) fn for_atx(
         leaf: &pulldown_cmark::global_frontier::VerifiedGlobalLeafBlock,
         quota: &MarkdownTableWindowQuota,
@@ -89,7 +89,7 @@ impl BoundedInline {
         Ok(bounded)
     }
 
-    /// scoped 完整 Parser 只处理原闭合短块；先保 raw 物理前缀，再分量子消费原 scope 和续行状态。
+    /// Parse only original closed short scoped blocks, retaining raw physical prefixes while incrementally consuming original scope/continuation state.
     pub(super) fn supports_scoped(block: &OrdinaryBlockRecord) -> bool {
         block.seed.scope_depth() > 1
             && matches!(
@@ -134,7 +134,7 @@ impl BoundedInline {
         matches!(&self.source, BoundedSource::Scoped { context, .. } if context.is_unsupported())
     }
 
-    /// 各真实来源共用唯一小块库存；容量先联合准入，正文仍只在后继量子逐帧复制。
+    /// All source kinds share one bounded job; admit workspace here and copy text frame by frame only in later steps.
     fn allocate(
         range: Range<usize>,
         options: pulldown_cmark::Options,
@@ -160,7 +160,7 @@ impl BoundedInline {
         }))
     }
 
-    /// 活动 ATX 只保这份原叶票及短块句柄；额外 Box 的真实 metadata 由父首次构造步骤计量。
+    /// Active ATX retains this original leaf ticket and bounded-job handle; the parent charges the extra Box during initial construction.
     pub(super) fn atx_metadata() -> usize {
         std::mem::size_of::<Self>()
             + std::mem::size_of::<pulldown_cmark::global_frontier::VerifiedGlobalLeafBlock>()
@@ -175,7 +175,7 @@ impl BoundedInline {
         }
     }
 
-    /// 每步只定位、借一个有限源片或执行一次有固定输入上限的原 Parser；归还失败不发布结果。
+    /// Each step locates, borrows one bounded frame, or runs one input-bounded original Parser; source-return failure publishes no result.
     pub(super) fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -192,7 +192,7 @@ impl BoundedInline {
             && !context.is_complete()
             && (!context.requires_source() || self.bytes.len() == self.range.len())
         {
-            // 不支持的 scope 在正文分配和复制之前终止；真正需要 source 后才进入原小块复制阶段。
+            // Reject unsupported scope before allocating/copying text; enter bounded source copying only when actual context needs input.
             let source = std::str::from_utf8(&self.bytes)
                 .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
             let before = context.allocated_workspace_bytes();
@@ -226,6 +226,7 @@ impl BoundedInline {
             ));
         }
         if self.start.is_none() {
+            // Obtain the absolute UTF-16 origin through original source coordinates, not a byte-offset approximation.
             if let Some(coordinates) = self.coordinates.as_mut() {
                 let (work, result) = coordinates.advance(document, budget)?;
                 if let Some(values) = result {
@@ -239,6 +240,7 @@ impl BoundedInline {
             return Ok((work, false));
         }
         if self.bytes.len() < self.range.len() {
+            // Only an admitted short closed block reaches this copy. Preserve actual capacity accounting separately from bytes copied this step.
             let allocation = if self.bytes.capacity() == 0 {
                 quota
                     .admit_metadata(self.range.len())
@@ -302,6 +304,7 @@ impl BoundedInline {
             }
         }
         if !self.references_attached {
+            // Transfer bounded queries to the same underline/Global owner, which must close the real reference context before parsing styles.
             let queries = MarkdownTableReferenceQueries::from_bounded_inline(
                 source,
                 self.options,
@@ -337,7 +340,7 @@ impl BoundedInline {
             .map_err(MarkdownTableRequestError::Window)?
             .is_none()
         {
-            return Ok((SemanticWork::default(), false)); // 唯一 Global 的引用/underline 前探由父步骤驱动。
+            return Ok((SemanticWork::default(), false)); // The parent drives reference/underline lookahead through the sole Global.
         }
         if self.queries.is_none() {
             self.queries = context.take_resolved_references()?;
@@ -347,6 +350,7 @@ impl BoundedInline {
             .as_ref()
             .ok_or(MarkdownTableRequestError::InvalidRequest)?;
         if !self.presentation_complete {
+            // The complete bounded Parser supplies precedence and marker visibility; only its actual run allocation enters retained metadata.
             self.parsed = build_bounded_inline_presentation(
                 source,
                 self.start.unwrap(),
@@ -392,16 +396,16 @@ impl BoundedInline {
         ))
     }
 
-    /// 解析输入和查询值在实际输出建完后释放；外带 publication 仅保源坐标、样式与可点击目标。
+    /// Release parse input and queries after actual output construction; exported publication retains coordinates, styles, and click targets only.
     pub(super) fn release_scratch(&mut self) {
         self.bytes = Vec::new();
         self.queries = None;
         self.parsed = Vec::new();
         self.coordinates = None;
-        self.source = BoundedSource::Root; // 真正归还短块 context 和 prefix metadata，发布只保已封存输出。
+        self.source = BoundedSource::Root; // Return bounded context/prefix metadata; publication retains only sealed output.
     }
 
-    /// 原投影只存带样式的段；真正闭合块内的其余位置是已证明的普通正文，不能把稀疏输出当作空洞。
+    /// Original projection stores styled segments only; other positions in the genuinely closed parsed block are proved ordinary text, not holes.
     pub(super) fn query(&self, index: usize, requested_end: usize) -> MarkdownPresentationQuery {
         let scoped = match &self.source {
             BoundedSource::Scoped {
@@ -438,7 +442,7 @@ impl BoundedInline {
         }
     }
 
-    /// 输出每次只增长一条，并以真实 capacity 而非逻辑元素个数登记 RAM 库存。
+    /// Admit one output slot before requesting single-slot growth; this logical metadata charge is not allocator overhead or RSS.
     pub(super) fn push_output(
         &mut self,
         run: MarkdownPresentationRun,
@@ -460,7 +464,7 @@ struct ActiveLink {
     source: MarkdownLinkMarkers,
 }
 
-/// 链接目标只取原 Parser 的解码结果；label 范围来自真实 child 事件，不能用 find(']') 猜闭括号。
+/// Use original Parser destinations and actual child-event label ranges rather than guessing a closing bracket with find(']').
 fn collect_links(
     source: &str,
     absolute_start: usize,
@@ -500,7 +504,7 @@ fn collect_links(
             for link in &mut active {
                 link.source.observe(&range);
             }
-        } // 自己的 End 携带 URL/title owner；它不能扩大自己的 label，其他真实 child 都保完整范围。
+        } // A link's own End includes URL/title ownership and cannot enlarge its label; actual child events retain their complete ranges.
         match event {
             Event::Start(Tag::Link {
                 dest_url,
@@ -516,9 +520,9 @@ fn collect_links(
                         MarkdownTableWindowError::ReferenceLimit,
                     ));
                 }
-                // Unknown类型正是原broken-link callback从唯一Queries解析的引用；其目标
-                // 可以长于这个短块，必须分享同一Arc，不能让Cow::into_string再复制16KiB。
-                // 普通Inline/块内定义仍用本次完整Parser真正产出的值，不借另一个query改写它。
+                // Unknown types are references resolved by the original broken-link callback through the sole Queries.
+                // Their targets can exceed this short block, so share the original Arc instead of copying up to 16 KiB with into_string.
+                // Direct links and in-block definitions retain this Parser's actual value rather than replacing it with another query result.
                 let reference = matches!(
                     link_type,
                     pulldown_cmark::LinkType::ReferenceUnknown
@@ -545,7 +549,7 @@ fn collect_links(
                     crate::MarkdownLinkDestination::from_string(dest_url.into_string())
                 };
                 if active.len() == active.capacity() {
-                    active.reserve_exact(1); // 原事件栈只扩一项，实际容量与已付元数据一致。
+                    active.reserve_exact(1); // Request one additional original-event stack slot after admitting its logical metadata.
                 }
                 active.push(ActiveLink {
                     destination,
@@ -574,7 +578,7 @@ fn collect_links(
                     });
                 }
             }
-            _ => {} // 其他容器不创建链接权限；其真实文字 child 仍按原事件顺序处理。
+            _ => {} // Other containers grant no link authority; actual text children still follow original event order.
         }
     }
     Ok(links)
