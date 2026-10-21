@@ -686,20 +686,26 @@ impl MarkdownComposedLines {
                 .glyph_start
                 .checked_add(range.end)
                 .ok_or(Error::Overflow)?;
-            let mut rows = [[0; 64]; STEP];
-            payload
-                .reader
-                .read_batch(start..end, &mut rows[..output.len()])?;
-            for (row, slot) in rows.into_iter().zip(output.iter_mut()) {
-                let glyph = decode_glyph(row)?;
-                if !part
-                    .facts
-                    .source_utf16
-                    .contains(&glyph.source_utf16_cluster)
-                {
-                    return Err(Error::InconsistentCoverage);
+            if output.is_empty() {
+                // 空批仍是原绘图边界的实际权限核验，必须进入同一 Reader 检查健康、FD 与
+                // 精确空范围；这里只省去没有任何字形要解码的 16KiB 临时数组，不提前成功。
+                payload.reader.read_batch(start..end, &mut [])?;
+            } else {
+                let mut rows = [[0; 64]; STEP];
+                payload
+                    .reader
+                    .read_batch(start..end, &mut rows[..output.len()])?;
+                for (row, slot) in rows.into_iter().zip(output.iter_mut()) {
+                    let glyph = decode_glyph(row)?;
+                    if !part
+                        .facts
+                        .source_utf16
+                        .contains(&glyph.source_utf16_cluster)
+                    {
+                        return Err(Error::InconsistentCoverage);
+                    }
+                    *slot = glyph;
                 }
-                *slot = glyph;
             }
             payload.fonts.require_registration(&part.registration)?;
             Ok(())

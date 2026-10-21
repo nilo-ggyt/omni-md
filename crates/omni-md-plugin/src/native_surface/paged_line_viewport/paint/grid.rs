@@ -224,7 +224,15 @@ impl NativeMarkdownComposedViewport {
                         // 一个selection可以跨多条已准备软行；每条真实行先单独付费，再查看其parts。
                         // 行的可见性与原同步selection_rects完全一致，不用选区包络代替真实clip。
                         if let Some(actual) = self.lines.get(line) {
-                            cursor.cursor = if self.visible(actual.frame) {
+                            let selected =
+                                cursor.selected.as_ref().expect("逐行绘制保同一已映射选区");
+                            let source = &actual.handle.facts().source_utf16;
+                            // 原Reader已认证每个part的源范围包含于本行；整行与选区不相交时，
+                            // 后续每个part的求交都必为空。仍支付本行费用，只省零绘制的part循环。
+                            // 这里使用真实源端点，不按视觉次序或墨迹包络猜测，RTL与跨段GCB不变。
+                            let intersects =
+                                selected.start < source.end && source.start < selected.end;
+                            cursor.cursor = if intersects && self.visible(actual.frame) {
                                 Decoration::SelectionPart {
                                     selection,
                                     line,

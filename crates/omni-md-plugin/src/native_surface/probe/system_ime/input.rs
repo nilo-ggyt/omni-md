@@ -654,6 +654,23 @@ impl SoftwareInput {
 
     /// 当前票只接受真正后继marked变化；一个key的多个通知不能重复发送下一字符。
     pub(super) fn marked(&self, commit: &NativeMarkdownPagedInputCommit) {
+        // 只观察Body已经交付的真实收据；首marked清waiting后到达的更新也记录，
+        // 用于区分合法组合连续提交与其他输入撤权，不读取当前状态或替原CPU票续权。
+        // Input仅含代次和范围等纯值，日志不含组合原文、候选、Source或Native对象身份。
+        println!(
+            "system_ime stage=marked_commit next_press={} waiting={:?} stopped={} failure_recorded={} input={:?} replaced={:?} utf16_delta={} characters_changed={} selection_changed={} marked_changed={} folds_changed={}",
+            self.next.get(),
+            self.waiting.get(),
+            self.stopped.get(),
+            self.failed.get().is_some(),
+            commit.state,
+            commit.invalidation.replaced_utf16_range,
+            commit.invalidation.change_in_utf16_length,
+            commit.invalidation.characters_changed,
+            commit.invalidation.selection_changed,
+            commit.invalidation.marked_changed,
+            commit.invalidation.folds_changed,
+        );
         if self.stopped.get() || self.failed.get().is_some() {
             return; // 同一IME事件可先insert再marked；首错之后的回调不能登记CPU或覆盖失败。
         }
@@ -1085,6 +1102,21 @@ impl NativeMarkdownPagedBodyPaintObserver for SoftwareInput {
             return;
         }
         if key.request.input != input {
+            // 只比较原marked收据与Body实际完整CPU通知，不从Ready/current重采任一替代票。
+            // 失败仍按原路径处理；这些有限字段揭示差异来自文字、选择、组合还是折叠代次。
+            let actual = key.request.input;
+            eprintln!(
+                "system_ime stage=composition_cpu_input_mismatch expected={input:?} actual={actual:?} same_generation={} same_selection={} same_marked={} same_utf16_len={} same_selection_serial={} same_fold_revision={}",
+                input.generation == actual.generation,
+                input.selection == actual.selection
+                    && input.selection_is_directed == actual.selection_is_directed
+                    && input.selection_range_count == actual.selection_range_count
+                    && input.primary_range == actual.primary_range,
+                input.marked == actual.marked,
+                input.utf16_len == actual.utf16_len,
+                input.selection_serial == actual.selection_serial,
+                input.fold_revision == actual.fold_revision,
+            );
             self.failed.set(Some("原组合CPU终点已被后继Input替代"));
             self.stop_sequence();
             return;
