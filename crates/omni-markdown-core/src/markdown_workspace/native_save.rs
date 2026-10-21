@@ -30,13 +30,15 @@ impl MarkdownSessionAccess {
         document: &mut MarkdownDocumentBuffer,
         synchronize_directory: impl FnOnce(&Path) -> Result<(), MarkdownWorkspaceError>,
     ) -> Result<MarkdownSaveReceipt, MarkdownWorkspaceError> {
-        // 原生输入尚未发布时拒绝保存；不能先覆盖磁盘，再在baseline采用处发现busy。
+        // Reject an unpublished native input before touching disk. Discovering
+        // a busy baseline only after overwrite would publish the wrong text.
         document
             .ensure_text_input_idle()
             .map_err(markdown_document_buffer_save_error)?;
         let expected_revision = document
             .original_revision()
-            // 旧record不含历史base；任何普通save/autosave/close均在文件检查或写入前拒绝。
+            // Recovery records have no verified historical baseline. Reject ordinary
+            // save, autosave, and close-save before inspecting or writing files.
             .ok_or(MarkdownWorkspaceError::PendingLegacyRecovery)?
             .encode_hex();
         let relative_path =
@@ -117,7 +119,8 @@ impl MarkdownSessionAccess {
             .map_err(markdown_document_buffer_save_error)?;
         let saved_revision = replacement
             .original_revision()
-            // 新打开的普通保存临时文件应有基线；意外pending也不能进入发布。
+            // A newly opened save temporary must have a real baseline; an unexpected
+            // pending-recovery state cannot authorize publication.
             .ok_or(MarkdownWorkspaceError::PendingLegacyRecovery)?
             .encode_hex();
         let rechecked = inspect_markdown_save_baseline(&path)?;
@@ -140,7 +143,8 @@ impl MarkdownSessionAccess {
             MarkdownWorkspaceError::StorageUnavailable
         })?;
         temporary.disarm();
-        // rename已发布，后续sync/metadata即使失败也须立即撤旧正文搜索；同路径目录键不变。
+        // Rename already published new bytes. Revoke old content-search authority
+        // immediately even if later sync or metadata fails; the directory key stays.
         self.invalidate_content_search();
         replacement
             .adopt_atomic_save_destination(&path)
@@ -184,7 +188,8 @@ impl MarkdownSessionAccess {
         parent_directory: &str,
         title: &str,
     ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
-        // 生产另存始终使用真实目录sync，不暴露故障开关。
+        // Production save-as always performs real directory synchronization; no
+        // runtime failure switch is exposed.
         self.save_document_buffer_as_new_with_directory_sync(
             document,
             parent_directory,
@@ -193,7 +198,8 @@ impl MarkdownSessionAccess {
         )
     }
 
-    /// 另存后的私有同步边界，真实rename之后失败仍由原rollback和终态撤权负责。
+    /// Private durability boundary after save-as publication. Rollback and terminal
+    /// authority revocation still own failures after the real rename.
     #[cfg(feature = "native-markdown-candidate")]
     pub(super) fn save_document_buffer_as_new_with_directory_sync(
         &self,
@@ -202,11 +208,13 @@ impl MarkdownSessionAccess {
         title: &str,
         mut synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
     ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
-        // 另存也须等当前输入落定，避免把旧canonical作为用户正在提交的候选保存出去。
+        // Save-as also waits for input publication, so the old canonical root is
+        // never saved as though it were the candidate the user is committing.
         document
             .ensure_text_input_idle()
             .map_err(markdown_document_buffer_save_error)?;
-        // 终态撤权必须晚于pending文件rollback，不把另存误判为同路径正文保存。
+        // Terminal invalidation follows pending-file rollback. Save-as is a
+        // structure change, not an overwrite of the current note's content key.
         let publication = WorkspaceStructurePublication::new(self);
         let result = (|| {
             // Require a buffer originating in this vault without reopening a now-conflicted file.
@@ -214,7 +222,8 @@ impl MarkdownSessionAccess {
             let parent = resolve_existing_directory(&self.canonical_root, parent_directory)?;
             let title = validated_note_title(title)?;
 
-            // 在临时文件之前pin同一父目录，rename之后沿用此身份而不认领可能替换的路径。
+            // Pin the original parent before creating the temporary. After rename,
+            // retain this identity rather than adopting a possibly replaced path.
             let parent_descriptor = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -234,7 +243,8 @@ impl MarkdownSessionAccess {
                 .current_revision()
                 .map_err(markdown_document_buffer_save_error)?
                 .encode_hex();
-            // 取得者身份在rename之前固定；发布后只更新完整metadata封值，不改变dev/ino来源。
+            // Freeze acquisition identity before rename. Publication may seal complete
+            // metadata but cannot change the original device/inode authority.
             let temporary_identity = FileIdentity::from(
                 &temporary
                     .file
@@ -256,9 +266,11 @@ impl MarkdownSessionAccess {
                     Ok(()) => {
                         // The final file now owns the bytes; the temporary-path cleanup is obsolete.
                         temporary.disarm();
-                        // 新笔记名称已发布，原查询续页失效；既有失败清理仍由pending guard负责。
+                        // The new note name invalidates old query continuations. The pending
+                        // guard remains responsible for cleanup on subsequent failure.
                         publication.changed();
-                        // rename后再从原FD封ctime；复制FD失败时不得重新按路径认领替换文件。
+                        // Seal post-rename ctime from the original descriptor. If cloning
+                        // that descriptor fails, never reacquire a replacement by path.
                         let acquired_destination = temporary
                             .file
                             .try_clone()
@@ -284,7 +296,9 @@ impl MarkdownSessionAccess {
                         synchronize_directory(&parent)?;
                         let receipt =
                             mutation_receipt(&self.canonical_root, &destination, revision)?;
-                        // 目录同步回调后仍须核原FD/path/parent封值；外部替换不能借旧同步成功变成新保存的receipt。
+                        // Recheck original descriptor, path, and parent after directory sync.
+                        // An external replacement cannot borrow that sync success as a
+                        // receipt for a different saved file.
                         pending.verify_for_commit()?;
                         pending.disarm();
                         return Ok(receipt);
@@ -301,7 +315,8 @@ impl MarkdownSessionAccess {
             // Exhaustion drops the unpublished temporary while preserving every preexisting entry.
             Err(MarkdownWorkspaceError::NameCollisionLimitExceeded)
         })();
-        // 先完成pending析构，保留可能发生的外部修改和原始保存错误。
+        // Finish pending-file destruction before terminal invalidation, preserving
+        // any external modification and the original save failure.
         publication.finish(result)
     }
 }
@@ -543,7 +558,9 @@ mod tests {
         assert!(document.can_redo());
         let called = Cell::new(false);
 
-        // 实际发布前同时持有目录末页和正文搜索，后续故障不能错误恢复旧搜索权限。
+        // Hold a directory continuation and content-search authority before real
+        // publication. A later durability failure must not restore stale content
+        // search while the unchanged directory continuation remains valid.
         let mut pager = access.open_workspace_pager().unwrap();
         let super::paging::MarkdownWorkspacePageProgress::Ready(browse_page) = pager
             .next_page_cancellable(
@@ -570,7 +587,8 @@ mod tests {
             called.set(true);
             assert_eq!(parent, root.canonicalize().unwrap());
             assert_eq!(fs::read_to_string(&path).unwrap(), draft);
-            // 在真实rename之后、故意返回fsync错误之前就必须完成内容搜索撤权。
+            // Content-search revocation must follow the real rename immediately,
+            // before this deliberate directory-sync failure is returned.
             assert!(!search_page.authority.is_current(&access, "before"));
             assert!(
                 browse_page

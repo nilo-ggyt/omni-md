@@ -1,8 +1,10 @@
-//! Body组合只合并同一当前marked中的实际替换；历史保首个root，通知仍描述本次变化。
+//! Body composition merges only real replacements inside the same current marked
+//! range. History retains its first root; notifications describe this exact edit.
 
 use super::*;
 
-/// 由同一Input的原marked状态翻译；新client的Start不继承旧client留在Doc里的历史标记。
+/// Translates the same input owner's original marked state. A new client's start
+/// cannot inherit a historical composition marker left by an earlier client.
 pub enum MarkdownTextInputComposition {
     Start,
     Update { marked_before: Range<usize> },
@@ -12,7 +14,8 @@ pub enum MarkdownTextInputComposition {
 pub(in crate::markdown_document_buffer) struct CompositionGroup {
     generation: u64,
     marked: Range<usize>,
-    // 同次实际append决定文件独占或Heap前缀边界；子范围留下的旧两侧仍归canonical。
+    // The actual append establishes file exclusivity or heap-prefix bounds.
+    // Unreplaced sides of a subrange remain owned by the canonical document.
     allocation: Option<piece_tree::CompositionAllocation>,
 }
 
@@ -21,7 +24,8 @@ struct MergedHistory {
     changes: change_journal::Entry,
 }
 
-/// 净日志始终inline；Heap重排候选只持至多两个64KiB段，取消不触碰旧正文或历史。
+/// The net journal remains inline. Heap-rebase preparation owns at most two
+/// 64-KiB segments, and cancellation changes neither old text nor history.
 pub(super) struct CompositionPlan {
     merged: Option<MergedHistory>,
     marked: Option<Range<usize>>,
@@ -33,10 +37,12 @@ pub(super) struct CompositionPlan {
 }
 
 impl MarkdownDocumentBuffer {
-    /// 同步组合开始、更新及确认复用原唯一候选；空候选也结束组合。
+    /// Synchronous composition start, update, and commit reuse the sole prepared
+    /// candidate. An empty candidate also terminates the composition.
     ///
     /// # Errors
-    /// 范围、Unicode、容量、观察者、原Source和候选清理失败均保留原root、组合组和两侧历史。
+    /// Range, Unicode, admission, observer, original-source, and candidate-cleanup
+    /// failures preserve the original root, composition group, undo, and redo.
     pub fn prepare_composition_text_input_observed<O: MarkdownTextChangeObserver>(
         &mut self,
         range: Range<usize>,
@@ -56,17 +62,20 @@ impl MarkdownDocumentBuffer {
         )
     }
 
-    /// unmark确认只结束当前组合历史归属；正文、generation、选择、Undo/Redo和日志均不改变。
+    /// Unmark ends only this composition's history authority. It changes no text,
+    /// generation, selection, undo/redo entry, or journal.
     ///
     /// # Errors
-    /// 原Source失败或尚有候选时保留组；不能绕过唯一候选来提前结束后继组合。
+    /// Source failure or a pending candidate preserves the group. The unique
+    /// candidate cannot be bypassed to end a later composition prematurely.
     pub fn finish_text_input_composition(&mut self) -> Result<(), MarkdownDocumentBufferError> {
         self.ensure_text_input_idle()?;
         self.text_input_composition = None;
         Ok(())
     }
 
-    /// 原范围、标量端点和结果长度已由唯一prepare检验；这里只准备当前组的净历史。
+    /// The sole prepare path already validated range, scalar endpoints, and final
+    /// length. This phase prepares only the current group's net history.
     pub(super) fn plan_composition<E>(
         &self,
         range: &Range<usize>,
@@ -74,7 +83,7 @@ impl MarkdownDocumentBuffer {
         composition: MarkdownTextInputComposition,
     ) -> Result<CompositionPlan, MarkdownObservedEditError<E>> {
         let (marked_before, marked) = match composition {
-            MarkdownTextInputComposition::Start => (None, true), // 原Input无marked，永远建立独立组。
+            MarkdownTextInputComposition::Start => (None, true), // Input had no marked range, so always start a separate group.
             MarkdownTextInputComposition::Update { marked_before } => (Some(marked_before), true),
             MarkdownTextInputComposition::Commit { marked_before } => (Some(marked_before), false),
         };
@@ -105,8 +114,10 @@ impl MarkdownDocumentBuffer {
                 previous.replacement.removed_utf16_length,
                 net,
             )?;
-            // 显式子范围只更新当前marked的一部分，净日志仍覆盖最初整组替换及保留下来的候选片。
-            // baseline从原Undo root聚合读取；不能把本次局部日志冒充首个root到最终root的变化。
+            // A subrange updates only part of the marked text. The net journal still
+            // covers the first group replacement plus retained candidate pieces.
+            // Read the baseline from original undo-root aggregates. This local edit
+            // cannot stand in for the full first-root-to-final-root change.
             let changes = change_journal::Entry::single_replacement(
                 piece_tree_metrics(&previous.root).utf16_len,
                 change_journal::Record {
@@ -120,12 +131,12 @@ impl MarkdownDocumentBuffer {
                 changes,
             })
         } else {
-            None // 明确跨出marked或原组已断开：本次独立成项，不吞掉外部正文的历史。
+            None // Outside the original marked group, start a new item and preserve external-text history.
         };
         Ok(CompositionPlan {
             merged,
             marked: next_marked,
-            allocation: None, // 真实append成功后才能登记，不根据待输入长度猜段编号。
+            allocation: None, // Register only after actual append; input length cannot predict a segment identity.
             retire_previous,
             heap_before,
             heap_cow: None,
@@ -135,7 +146,9 @@ impl MarkdownDocumentBuffer {
 }
 
 impl CompositionPlan {
-    /// 原append先提供真实候选读取；完整旧Heap替换另准备等价COW，失败或取消绝不写回旧段。
+    /// The original append first supplies real candidate reads. Replacing an entire
+    /// old heap allocation prepares equivalent copy-on-write storage separately;
+    /// failure or cancellation never writes back into the old segment.
     pub(super) fn append(
         &mut self,
         edits: &mut MarkdownEditSegments,
@@ -148,14 +161,15 @@ impl CompositionPlan {
         if let Some(previous) = self.heap_before {
             let cow = edits.prepare_composition_heap_cow(previous, text, before_segments);
             if text.len() <= EDIT_SEGMENT_BYTES {
-                self.allocation = cow.allocation(); // 新Heap叶的物理offset将随同一候选切到此真实COW。
+                self.allocation = cow.allocation(); // The candidate's heap-leaf offsets switch to this actual copy-on-write allocation.
             }
             self.heap_cow = Some(cow);
         }
         Ok(pieces)
     }
 
-    /// 只重建本次插入和原split取得的前后缀连接路径；不扫描全树、历史或旧候选正文。
+    /// Rebuilds only this insertion and the split prefix/suffix join paths. It scans
+    /// neither the entire tree, undo history, nor earlier candidate text.
     pub(super) fn prepare_rebased_root(&mut self, prefix: &PieceTreeLink, suffix: &PieceTreeLink) {
         if let Some(cow) = &mut self.heap_cow
             && let Some(inserted) = cow.take_inserted()
@@ -167,7 +181,8 @@ impl CompositionPlan {
         }
     }
 
-    /// 所有真实端点与observer已在原append候选验证完毕；下一次读取只能在对应字节安装后发生。
+    /// All endpoints and observer output were verified against the original append
+    /// candidate. Further reads must wait until corresponding bytes are installed.
     pub(super) fn finish_prepared(&mut self, prepared: &mut SealedCommand) {
         if let Some(root) = self.rebased_root.take() {
             prepared.command.root = root;
@@ -175,7 +190,8 @@ impl CompositionPlan {
     }
 }
 
-/// 所有净日志和候选都已准备；发布不调用外部代码，随后旧payload真实Drop的首错由原票保留。
+/// Net journals and candidate text are fully prepared. Publication invokes no
+/// external code; the original receipt retains failures from later payload drop.
 pub(super) fn publish(
     document: &mut MarkdownDocumentBuffer,
     prepared: SealedCommand,
@@ -186,7 +202,8 @@ pub(super) fn publish(
         .take()
         .and_then(|group| plan.retire_previous.then_some(group.allocation).flatten());
     if let Some(cow) = plan.heap_cow.take() {
-        // 此处无Native、current、observer或可失败I/O；canonical与实际字节在同一发布栈内切换。
+        // No native callback, currentness callback, observer, or fallible I/O runs
+        // here. Canonical identity and actual bytes change in one publication stack.
         cow.publish(&mut document.edits);
     }
     let edit = if let Some(merged) = plan.merged {
@@ -205,9 +222,9 @@ pub(super) fn publish(
         previous.counterpart_selection = Some(after);
         let old_changes = std::mem::replace(&mut previous.changes, merged.changes);
         document.change_journal.release(old_changes);
-        document.change_journal.release(changes); // 本次局部日志已由真实净日志代替，不拖住中间页。
+        document.change_journal.release(changes); // The real net journal replaces this local one; release its intermediate pages.
         document.edits.publish();
-        document.root = root; // 首个历史root/selection仍在原尾项，中间root没有新历史owner。
+        document.root = root; // The tail entry keeps the first root/selection; no history owner retains intermediate roots.
         document.selection = after;
         document.generation = document.generation.wrapping_add(1);
         #[cfg(any(test, feature = "native-markdown-candidate"))]
@@ -215,7 +232,7 @@ pub(super) fn publish(
             .block_checkpoints
             .get_mut()
             .invalidate_after(metrics.location);
-        metrics.redo_text_edit(after) // Native通知必须描述这次真实替换，不能使用组合的累计包络。
+        metrics.redo_text_edit(after) // Native notification describes this actual replacement, not the cumulative composition envelope.
     } else {
         let edit = command_transaction::publish_command(document, prepared);
         document
@@ -231,14 +248,17 @@ pub(super) fn publish(
         allocation: plan.allocation,
     });
     if let Some(allocation) = previous_allocation {
-        // canonical、净历史和新Input后态已经确定；此处才结束旧payload强边，不能回报未提交。
-        // 最后Snapshot可合法延迟真实释放，原编号的observer仍保存其归还结果与首错。
+        // Canonical text, net history, and the input post-state are now final.
+        // Release the old payload's strong edge only now; cleanup cannot uncommit it.
+        // A final frozen reader may legitimately delay physical release. The
+        // original slot's observer retains its release result and first failure.
         allocation.retire(&mut document.edits);
     }
     edit
 }
 
-/// 真正零字符变化仍可结束marked或移动组的最终选区；不创建空Undo，不改旧普通历史。
+/// A true zero-character change can end marked text or move the group's final
+/// selection, without creating an empty undo item or changing ordinary history.
 pub(super) fn publish_selection(
     document: &mut MarkdownDocumentBuffer,
     plan: Option<CompositionPlan>,
@@ -251,7 +271,8 @@ pub(super) fn publish_selection(
             .expect("同一活动组保留首个历史项")
             .counterpart_selection = Some(after);
     }
-    // SelectionOnly只来自空range+空输入，绝无可新建的marked；普通选择和空候选都结束旧组。
+    // Selection-only means empty range plus empty input, so it cannot establish
+    // marked text. Both ordinary selection and empty input end the old group.
     document.text_input_composition = None;
 }
 

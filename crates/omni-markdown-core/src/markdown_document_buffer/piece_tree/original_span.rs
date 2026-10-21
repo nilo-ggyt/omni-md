@@ -1,9 +1,11 @@
-//! 原始4KiB逻辑片的不可变小目录；物理树叶合组，正文借用与编辑片大小保持原合同。
+//! Compact immutable directories for original 4-KiB logical pieces. Grouping
+//! physical leaves changes neither read-lease limits nor edited-piece boundaries.
 
 use super::*;
 
 pub(in crate::markdown_document_buffer) const ORIGINAL_SPAN_PIECES: usize = 16;
-// 路径成本含定位共享目录起点与至多16项查找；不把目录工作藏进一次AVL步骤。
+// Charge locating the shared directory start and visiting up to 16 records;
+// directory work must not disappear inside one reported AVL traversal step.
 #[cfg(feature = "s2-table-window-prototype")]
 pub(in crate::markdown_document_buffer) const ORIGINAL_SPAN_METADATA_STEPS: usize =
     ORIGINAL_SPAN_PIECES * 2;
@@ -19,19 +21,22 @@ struct CompactMetrics {
     first: u16,
     last: u16,
     flags: u16,
-    // 按字节保存u32集合，避免为每个4KiB逻辑片引入额外对齐空洞。
+    // Byte-encode the u32 set to avoid alignment padding for every 4-KiB piece.
     bidi_classes: [u8; 4],
-    // 每个4KiB逻辑片仅增两字节域包络；原目录没有正文副本或字符位集。
+    // Two bytes per logical piece describe the character-domain envelope; this
+    // directory contains no copied text or per-character bitset.
     printable_ascii: [u8; 2],
 }
 impl CompactMetrics {
     fn capture(metrics: MarkdownDocumentMetrics) -> Result<Self, MarkdownDocumentBufferError> {
-        // 仅局部≤4KiB片可压缩；全树metrics继续usize，不因此引入文件长度上限。
+        // Compress only a nonempty local piece up to 4 KiB. Whole-tree aggregates
+        // remain `usize`, so local compression adds no file-length limit.
         if metrics.byte_len == 0 || metrics.byte_len > ORIGINAL_PIECE_BYTES {
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         let small = |value: usize| {
-            // 紧凑字段必须逐项可表示；内部计量失配立即拒绝，不用截断换取较小索引。
+            // Every compact field must be representable. Reject inconsistent metrics
+            // rather than truncating values to obtain a smaller index.
             u16::try_from(value).map_err(|_| MarkdownDocumentBufferError::RangeOutsideDocument)
         };
         let mut flags = 0_u16;
@@ -49,12 +54,15 @@ impl CompactMetrics {
         .into_iter()
         .enumerate()
         {
-            // 位序在恢复处一一对应；跨片的单词、CRLF与语法风险仍交原joined规则处理。
+            // Decoding uses this exact bit order. Cross-piece words, CRLF boundaries,
+            // and syntax properties still follow the original aggregate join rules.
             flags |= u16::from(value) << bit;
         }
-        // 原flags第9..14位保存六种精确分隔字符，未挤占既有边界与ASCII三态事实。
+        // Bits 9-14 preserve six exact separator classes without replacing existing
+        // boundary facts or the printable-ASCII three-state classification.
         flags |= u16::from(metrics.unicode_properties.separators) << 9;
-        // 终止符保存原offset+1编码，零仍表示None；不能把CR与LF合并成物理行计数。
+        // Terminators retain offset-plus-one encoding, with zero meaning absent.
+        // Raw CR/LF facts must not collapse into a physical-line count.
         Ok(Self {
             bytes: small(metrics.byte_len)?,
             utf16: small(metrics.utf16_len)?,
@@ -81,7 +89,8 @@ impl CompactMetrics {
         })
     }
     fn full(self) -> MarkdownDocumentMetrics {
-        // 只恢复一个已验证小片的值；所有上层累计仍为usize，不受u16局部压缩限制。
+        // Decode one already validated small piece. Higher aggregates remain
+        // `usize` and are not constrained by these local u16 fields.
         let flag = |bit: u32| self.flags & (1_u16 << bit) != 0;
         MarkdownDocumentMetrics {
             byte_len: usize::from(self.bytes),
@@ -105,7 +114,7 @@ impl CompactMetrics {
                 PrintableAsciiClass::WithLetters
             } else {
                 PrintableAsciiClass::WithoutLetters
-            }, // 原第8位继续保存字母事实；新属性不改变原三态判定。
+            }, // Bit 8 still stores the letter fact; added properties preserve the three states.
             unicode_properties: MarkdownUnicodeProperties {
                 bidi_classes: u32::from_le_bytes(self.bidi_classes),
                 separators: ((self.flags >> 9) & 0x3f) as u8,
@@ -116,7 +125,8 @@ impl CompactMetrics {
     }
 }
 
-/// 独立Arc目录不放进Node最大variant；所有条目只描述同一原始payload的连续标量片。
+/// A separate `Arc` directory keeps the node's largest variant small. Every
+/// entry describes contiguous scalar-aligned pieces of one original payload.
 #[derive(Debug)]
 struct OriginalSpanBlock {
     byte_start: usize,
@@ -134,20 +144,22 @@ pub(in crate::markdown_document_buffer) struct OriginalSpan {
 
 pub(in crate::markdown_document_buffer) struct OriginalSpanPosition {
     pub(in crate::markdown_document_buffer) piece: MarkdownPiece,
-    /// 相对命中小片的位置；单位与调用byte/UTF16查询一致。
+    /// Position within the hit piece, measured in the caller's byte or UTF-16 units.
     pub(in crate::markdown_document_buffer) local: usize,
     pub(in crate::markdown_document_buffer) prefix: MarkdownDocumentMetrics,
     pub(in crate::markdown_document_buffer) ordinal: u8,
 }
 
 impl OriginalSpan {
-    /// Word游标按量子逐条计量原目录前缀，不调用piece里至多16条的内部前缀累计。
+    /// Word cursors charge original-directory prefix records per quantum instead
+    /// of hiding up to 16 prefix records inside a piece lookup.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(in crate::markdown_document_buffer) fn word_block_byte_start(&self) -> usize {
         self.block.byte_start
     }
 
-    /// 一次只恢复一条真实compact记录；原目录前缀只用于物理字节定位，不授予正文范围。
+    /// Decodes one actual compact record. Directory prefixes locate physical bytes
+    /// only and grant no authority to borrow a document range.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(in crate::markdown_document_buffer) fn word_record_metrics(
         &self,
@@ -165,10 +177,12 @@ impl OriginalSpan {
         end: u8,
     ) -> Result<Self, MarkdownDocumentBufferError> {
         if start >= end || end > block.count {
-            // 不允许空或越过真实目录尾的Span；空树由None表达，避免伪造非空叶。
+            // Reject empty spans and ranges beyond the real directory. `None`
+            // represents an empty tree without manufacturing a nonempty leaf.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
-        // 子Span重用原目录范围；最多16个缓存计量合并，不读取正文或构造临时子树。
+        // Reuse the original directory for subspans. At most 16 cached metrics are
+        // joined, without reading document bytes or constructing temporary trees.
         let metrics = block.records[usize::from(start)..usize::from(end)]
             .iter()
             .fold(MarkdownDocumentMetrics::default(), |sum, value| {
@@ -189,10 +203,12 @@ impl OriginalSpan {
         ordinal: u8,
     ) -> Result<MarkdownPiece, MarkdownDocumentBufferError> {
         if !self.record_range().contains(&ordinal) {
-            // 目录虽共享，当前Span只能给出自己仍拥有的条目，不能越过编辑后的逻辑边界。
+            // Shared directory ownership does not grant records outside this span
+            // or across logical boundaries established by edits.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
-        // 目录至多16项，只有计数相加；不读取Source、不展开临时树或分配每小片Arc。
+        // Sum metadata across at most 16 entries. This reads no source bytes,
+        // expands no temporary tree, and allocates no per-piece `Arc`.
         let prefix =
             self.block.records[..usize::from(ordinal)]
                 .iter()
@@ -233,7 +249,8 @@ impl OriginalSpan {
         measure: impl Fn(MarkdownDocumentMetrics) -> usize,
     ) -> Result<OriginalSpanPosition, MarkdownDocumentBufferError> {
         let mut prefix = MarkdownDocumentMetrics::default();
-        // 先定位共享目录的实际源起点，再单次前行；避免每个候选重复累计先前条目。
+        // Locate the shared directory's actual source start once, then advance
+        // forward without recomputing preceding entries for every candidate.
         let mut byte_start = self.piece(self.start)?.byte_start;
         for ordinal in self.record_range() {
             let metrics = self.block.records[usize::from(ordinal)].full();
@@ -245,7 +262,8 @@ impl OriginalSpan {
             };
             let length = measure(metrics);
             if offset < length || (include_end && offset == length) {
-                // 编辑边界可归前片尾，单元读取必须落在真实片内；两种合同由调用者显式选择。
+                // Editing may include a preceding piece's end, while unit reads must
+                // land inside real bytes. Callers explicitly choose that contract.
                 return Ok(OriginalSpanPosition {
                     piece,
                     local: offset,
@@ -253,14 +271,16 @@ impl OriginalSpan {
                     ordinal,
                 });
             }
-            // 完整跳过当前小片时只累计缓存值；byte源坐标与所查单位分别前进。
+            // Skipping a complete piece joins cached metrics only. Source-byte
+            // coordinates advance independently of the queried coordinate unit.
             offset -= length;
             byte_start = byte_start
                 .checked_add(metrics.byte_len)
                 .ok_or(MarkdownDocumentBufferError::RangeOutsideDocument)?;
             prefix = MarkdownDocumentMetrics::joined(prefix, metrics);
         }
-        // 包括不允许的EOF单元读取；不能用最后一个条目或截断坐标代替真实拒绝。
+        // This includes forbidden EOF unit reads. Never substitute the last
+        // record or clamp an invalid position to avoid a real rejection.
         Err(MarkdownDocumentBufferError::RangeOutsideDocument)
     }
     pub(in crate::markdown_document_buffer) fn subrange(
@@ -268,20 +288,23 @@ impl OriginalSpan {
         range: Range<u8>,
     ) -> Result<PieceTreeLink, MarkdownDocumentBufferError> {
         if range.start > range.end || range.start < self.start || range.end > self.end {
-            // 子范围只能缩小当前来源权限，不能重新取回已从该Span删除的目录条目。
+            // A subrange can only narrow authority; it cannot regain directory
+            // entries already removed from this logical span.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         if range.is_empty() {
-            // 空的一侧不占树叶、目录Arc或任何正文资源。
+            // An empty side owns no leaf, directory `Arc`, or document-byte resource.
             return Ok(None);
         }
         if range.end - range.start == 1 {
-            // 单小片沿原Leaf路径；不为仅一个条目额外保留整个Block强边。
+            // A single piece uses the ordinary leaf representation rather than
+            // retaining an entire directory block for one record.
             return Ok(Some(Arc::new(MarkdownPieceTreeNode::Leaf(
                 self.piece(range.start)?,
             ))));
         }
-        // 多小片仅新建固定Span值，目录Arc与旧root/Undo/Frozen继续共享不可变记录。
+        // Multiple pieces allocate only a fixed span; prior roots, undo history,
+        // and frozen readers share the same immutable directory records.
         let span = Self::new(Arc::clone(&self.block), range.start, range.end)?;
         Ok(Some(Arc::new(MarkdownPieceTreeNode::OriginalSpan(span))))
     }
@@ -306,14 +329,17 @@ impl OriginalSpanBuilder {
             || (self.count != 0
                 && self.byte_start.checked_add(self.bytes) != Some(piece.byte_start))
         {
-            // 合组仅接受同一原始payload中连续且计量一致的小片；编辑片保持原追加段路径。
+            // Group only contiguous, consistently measured pieces from one original
+            // payload. Edited pieces retain their append-segment representation.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         if self.count == 0 {
-            // 新组的源起点只由第一片确定；后续片必须通过上面的连续性检查。
+            // The first piece fixes this group's source start; every subsequent
+            // piece must pass the contiguity check above.
             self.byte_start = piece.byte_start;
         }
-        // 只保存紧凑元数据，不保留当前Source借用或指向正文页的切片。
+        // Store compact metadata only, retaining neither the current source lease
+        // nor slices pointing into document pages.
         self.records[usize::from(self.count)] = compact;
         self.count += 1;
         self.bytes = self
@@ -321,7 +347,8 @@ impl OriginalSpanBuilder {
             .checked_add(piece.byte_len)
             .ok_or(MarkdownDocumentBufferError::RangeOutsideDocument)?;
         if usize::from(self.count) == ORIGINAL_SPAN_PIECES {
-            // 固定16项即发布一个物理树叶，构造期间也不累计整份原始小片Vec。
+            // Publish one physical leaf at 16 records. Construction never retains
+            // a whole-document vector of original logical pieces.
             self.flush(output)?;
         }
         Ok(())
@@ -331,11 +358,12 @@ impl OriginalSpanBuilder {
         output: &mut Vec<Arc<MarkdownPieceTreeNode>>,
     ) -> Result<(), MarkdownDocumentBufferError> {
         if self.count == 0 {
-            // 恰好满组后的EOF无需额外空叶，重复flush也保持无副作用。
+            // EOF after a full group needs no empty leaf; repeated flush is harmless.
             return Ok(());
         }
         if self.count == 1 {
-            // 极小文稿或单个尾片复用原Leaf布局，避免小文稿为目录增加一次Arc分配。
+            // Tiny documents and a single trailing piece reuse the ordinary leaf
+            // layout, avoiding an unnecessary directory allocation.
             let metrics = self.records[0].full();
             output.push(Arc::new(MarkdownPieceTreeNode::Leaf(MarkdownPiece {
                 source: MarkdownPieceSource::Original,
@@ -344,7 +372,8 @@ impl OriginalSpanBuilder {
                 metrics,
             })));
         } else {
-            // 多片目录在Node之外独立分配，防止所有普通编辑节点的枚举载荷一起变大。
+            // Allocate multi-piece directories outside the node enum so ordinary
+            // edited nodes do not all inherit the directory's larger payload.
             let block = Arc::new(OriginalSpanBlock {
                 byte_start: self.byte_start,
                 records: std::mem::take(&mut self.records),
@@ -354,7 +383,8 @@ impl OriginalSpanBuilder {
                 OriginalSpan::new(block, 0, self.count)?,
             )));
         }
-        // 发布后仅清空有限构造状态；真实目录与正文寿命分别归新root与原Backing所有。
+        // Clear only bounded builder state. The new root owns directory lifetime;
+        // the original backing separately owns document-byte lifetime.
         self.count = 0;
         self.bytes = 0;
         Ok(())
@@ -430,7 +460,7 @@ mod tests {
         for text in ["", "XaXa", "fi", "中文Xa\r\n", "!\u{301}😀~"] {
             if text.is_empty() {
                 continue;
-            } // 真实compact目录不存空片，空集合由树默认聚合负责。
+            } // Compact directories contain no empty pieces; tree identity handles empty text.
             let metrics = MarkdownDocumentMetrics::from_text(text);
             assert_eq!(CompactMetrics::capture(metrics).unwrap().full(), metrics);
         }

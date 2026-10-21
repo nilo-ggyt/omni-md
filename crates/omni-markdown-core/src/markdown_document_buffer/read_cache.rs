@@ -1,4 +1,5 @@
-//! 单个8KiB派生UTF-16窗口；原piece树与匿名映射仍是唯一正文来源。
+//! One derived 8-KiB UTF-16 window. The piece tree and anonymous mapping remain
+//! the sole text authority; scrolling does not accumulate visited windows.
 
 use std::sync::Weak;
 
@@ -6,7 +7,8 @@ use super::*;
 
 pub(super) const READ_WINDOW_UTF16_UNITS: usize = 4096;
 
-/// Weak保留控制块身份而不保留树；即使分配器复用其他地址也不能误认旧root。
+/// A weak key retains allocation identity without retaining the tree. Reuse of
+/// another allocation address cannot make an old root authoritative.
 struct ReadKey {
     root: Option<Weak<MarkdownPieceTreeNode>>,
     generation: u64,
@@ -15,21 +17,24 @@ struct ReadKey {
 
 impl ReadKey {
     fn matches(&self, root: &PieceTreeLink, generation: u64, utf16_len: usize) -> bool {
-        // generation和真实聚合长度都必须一致；root比较不升级Weak或读取正文。
+        // Both generation and real aggregate length must agree. Comparing the root
+        // never upgrades the weak reference or reads document bytes.
         if self.generation != generation || self.utf16_len != utf16_len {
             return false;
         }
         match (&self.root, root) {
             (Some(weak), Some(root)) => std::ptr::eq(weak.as_ptr(), Arc::as_ptr(root)),
             (None, None) => true,
-            // 空/非空root的权限不可互换，即使两者恰有相同的外部代次。
+            // Empty and nonempty roots cannot exchange authority even when an external
+            // generation happens to match.
             _ => false,
         }
     }
 }
 
 #[derive(Default)]
-/// 未读时没有正文分配；替换窗口原地复用同一box，不累计已访问页。
+/// Allocates no text before the first read. Refills reuse the same box rather
+/// than keeping an ever-growing collection of visited pages.
 pub(super) struct Utf16ReadCache {
     key: Option<ReadKey>,
     units: Option<Box<[u16; READ_WINDOW_UTF16_UNITS]>>,
@@ -39,7 +44,8 @@ pub(super) struct Utf16ReadCache {
 impl Utf16ReadCache {
     #[cfg(test)]
     pub(super) fn allocated_window_for_test(&self) -> Option<(usize, usize)> {
-        // 仅测试观察同一个实际Box与其固定容量，不导出正文、指针或生产保活句柄。
+        // Tests inspect this actual box and fixed capacity only; this does not expose
+        // document bytes or create a production retention handle.
         self.units
             .as_ref()
             .map(|units| (units.as_ptr().addr(), std::mem::size_of_val(units.as_ref())))
@@ -59,7 +65,8 @@ impl Utf16ReadCache {
             .checked_add(destination.len())
             .ok_or(MarkdownDocumentBufferError::RangeOutsideDocument)?;
         if end > utf16_len {
-            // 在写入调用方内存或分配窗口之前拒绝全部非法范围，不静默截断。
+            // Reject the entire invalid request before changing caller memory or
+            // allocating a window; never silently truncate the requested range.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         if !self
@@ -67,7 +74,8 @@ impl Utf16ReadCache {
             .as_ref()
             .is_some_and(|key| key.matches(root, generation, utf16_len))
         {
-            // 真实root/generation任一变化就撤销旧窗口；Weak不保活旧正文或历史。
+            // Either root or generation change revokes the old window. The weak key
+            // retains neither the previous text nor its undo history.
             self.valid = 0..0;
             self.key = Some(ReadKey {
                 root: root.as_ref().map(Arc::downgrade),
@@ -77,11 +85,13 @@ impl Utf16ReadCache {
         }
         let mut written = 0;
         while written < destination.len() {
-            // 每轮先核共享源健康；其他线程在旧窗口填满后发生的回收错误也必须传播。
+            // Check shared source health on every iteration, including a reclamation
+            // failure recorded by another thread after the last refill.
             source.source_health()?;
             let current = offset + written;
             if !self.valid.contains(&current) {
-                // 对齐的是UTF-16单元而非标量，允许代理对跨两个真实读取窗口。
+                // Align by UTF-16 units rather than scalars. A surrogate pair may span
+                // two real windows without changing its external coordinates.
                 let start = current - current % READ_WINDOW_UTF16_UNITS;
                 let end = start.saturating_add(READ_WINDOW_UTF16_UNITS).min(utf16_len);
                 self.refill(source, root, start..end)?;
@@ -92,11 +102,13 @@ impl Utf16ReadCache {
                 .units
                 .as_ref()
                 .ok_or(MarkdownDocumentBufferError::Utf16ReadCacheUnavailable)?;
-            // 只复制调用方请求的交集；预取窗口不会改变外部length或实际UTF-16坐标。
+            // Copy only the requested intersection. Prefetching changes neither the
+            // caller-visible length nor actual UTF-16 positions.
             destination[written..written + count].copy_from_slice(&units[local..local + count]);
             written += count;
         }
-        // 空范围也有健康检查；不能让hit或无字符操作绕过原共享源的永久失败。
+        // Even an empty request checks health; a cache hit or zero-character read
+        // cannot bypass a permanent failure of the shared original source.
         source.source_health()
     }
 
@@ -106,7 +118,8 @@ impl Utf16ReadCache {
         root: &PieceTreeLink,
         range: Range<usize>,
     ) -> Result<(), MarkdownDocumentBufferError> {
-        // 先撤销原权限再原地覆盖；任何读取/真实回收失败都只留下不可发布的存储。
+        // Revoke validity before overwriting the box. A read or real reclamation
+        // failure leaves storage that cannot be published as a valid window.
         self.valid = 0..0;
         let units = self
             .units
@@ -121,7 +134,8 @@ impl Utf16ReadCache {
             &mut written,
         )?;
         if written != range.len() {
-            // 树必须精确覆盖全部窗口；短读不能发布有效range或补零伪造正文。
+            // The tree must cover the complete window. A short read cannot publish
+            // validity or fill the missing document text with invented zeroes.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         source.source_health()?;

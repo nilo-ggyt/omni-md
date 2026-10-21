@@ -1,4 +1,5 @@
-//! 模式及Find栏布局只保有限原源锚点；位置恢复仍使用唯一Producer及其原Source目标续体。
+//! Mode and Find layouts retain finite original Source anchors; restoration uses
+//! the sole Producer and its original Source target continuation.
 
 use super::NativeMarkdownPagedBodyError as Error;
 use super::*;
@@ -13,28 +14,35 @@ use objc2::{ClassType, DefinedClass};
 use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use omni_markdown_core::MarkdownPresentationMode;
 
-/// 没有Source/Reader/Scene/Native强引用；目标票也只持弱身份和有限标量。
+/// Retains no Source, reader, Scene, or Native strong reference; target tickets contain weak identities
+/// and finite scalar facts.
 pub(super) struct PendingModeViewport {
     anchor: ModeSourceAnchor,
     state: NativeMarkdownPagedInputState,
     target: Option<Rc<target::SourceTargetRequest>>,
     controller: Option<Rc<ModeController>>,
-    // 只有同 Source/宽度的真实 Scene 已测得首字形后才存在；不是滚动已完成的标志。
-    // 模式保有它直到新 Scene 核准原屏内位置，普通整行导航不得覆盖这个实际字形锚。
+    // Present only after the same Source and wrapping width produced a real glyph measurement; it does
+    // not certify scroll completion.
+    // Keep it until a new Scene certifies the original on-screen position; whole-row navigation must
+    // not replace this glyph anchor.
     measured_glyph: Option<MeasuredModeGlyph>,
-    // Find 只归还栏高，原文稿坐标必须逐位保留；不能经字形局部坐标逆推后再写回。
-    // Source/Input/换行宽度仍由同一个 target 认证，模式另由这份原实际值约束。
+    // Hiding Find returns only bar height; retain exact document coordinates without a round trip
+    // through local glyph coordinates.
+    // The same target certifies Source, Input, and wrapping width; the original mode separately
+    // constrains coordinate reuse.
     find_origin: Option<FindLayoutOrigin>,
 }
 
-/// 只属于原 Find 高度布局的两个纯值；不保存 Scene、原生视图或另一份 Source 强边。
+/// Pure facts for the original Find-height change; these retain no Scene, Native view, or additional
+/// Source owner.
 #[derive(Clone, Copy)]
 struct FindLayoutOrigin {
     position: NSPoint,
     presentation_mode: MarkdownPresentationMode,
 }
 
-/// 同一 Scene 的文档上沿和完整字形高度；只保有限实际几何，不保字体、行或 Source。
+/// Measured document top and complete glyph height from one Scene; retains geometry without fonts,
+/// lines, or Source.
 #[derive(Clone, Copy)]
 struct MeasuredModeGlyph {
     document_top: f64,
@@ -42,8 +50,10 @@ struct MeasuredModeGlyph {
 }
 
 impl MeasuredModeGlyph {
-    /// 模式字号/行高改变时只做完整显示所必需的最近调整；原位置可显示则精确保留。
-    /// 超过视口的真实字形只能露出首部，不缩小字形或伪造一个较矮的测量框。
+    /// After font or mode changes, make only the nearest adjustment needed for full visibility; retain
+    /// a valid original position exactly.
+    /// A glyph taller than the viewport exposes its top; never shrink the glyph or invent a shorter
+    /// measurement.
     fn requested_origin(self, screen_y: f64, viewport_height: f64) -> f64 {
         let last_top = (viewport_height - self.height).max(0.0);
         let visible_y = screen_y.clamp(0.0, last_top);
@@ -51,7 +61,8 @@ impl MeasuredModeGlyph {
     }
 }
 
-/// 模式位置属于原窗口的本次真实输入；只有弱Native身份和原controller已有revision。
+/// Mode position belongs to the original window input; retain only weak Native identity and existing
+/// controller revisions.
 struct ModeController {
     controller: objc2::rc::Weak<NativeMarkdownController>,
     find_input: u64,
@@ -59,7 +70,8 @@ struct ModeController {
     workspace_input: u64,
 }
 impl ModeController {
-    /// 只核原控制器的纯代次；调用方已经持有这一个真实controller，不在Native步骤之间另领弱票。
+    /// Check pure epochs of the controller already held by the caller; do not acquire a new weak ticket
+    /// between Native operations.
     fn permits(&self, controller: &NativeMarkdownController) -> bool {
         native_markdown_controller_has_foreground_authority(controller)
             && controller.find_input_intent() == self.find_input
@@ -67,7 +79,8 @@ impl ModeController {
             && controller.workspace_query_intent() == self.workspace_input
     }
 
-    /// 仅在Native边界借原controller；纯Core current不调用Weak.load，也不重领较新的输入票。
+    /// Load the original controller only at a Native boundary; pure Core checks neither load it nor
+    /// capture successor input.
     fn current_native(&self) -> bool {
         self.controller
             .load()
@@ -75,8 +88,10 @@ impl ModeController {
     }
 }
 
-/// 模式按钮尚待原排版Ready时唯一保留的业务动作；没有Scene、Source、Reader或Native强边。
-/// publication只记录真实发布的弱key，queued只表示这一次已交原主队列，二者都不代表切换完成。
+/// The sole mode-button action waiting for its original layout to become Ready; it retains no Scene,
+/// Source, reader, or Native strong edge.
+/// Publication records an actual weak Scene key and queued records one submission; neither means the
+/// mode switch finished.
 pub(super) struct PendingModeAction {
     original: Rc<NativeMarkdownWorkspacePagedEditIntent>,
     controller: Rc<ModeController>,
@@ -90,7 +105,8 @@ pub(super) struct PendingModeAction {
 }
 
 impl PendingModeAction {
-    /// 输入撤销后只允许补偿这个仍在前台的原Doc/Body按钮，不把同控制器后继笔记当作旧目标。
+    /// After revocation, compensate only the original foreground Doc/Body button; a successor note on
+    /// the same controller is a different target.
     fn owns_surface(
         &self,
         owner: &NativeMarkdownPagedBody,
@@ -108,7 +124,8 @@ impl PendingModeAction {
         })
     }
 
-    /// 排队期间必须仍是原文稿、完整父子Input、原模式和几何；当前Ready不能替旧意图补权。
+    /// Queued work requires the original document, complete parent/child Input, mode, and geometry;
+    /// current Ready cannot renew old intent.
     fn current(
         &self,
         owner: &NativeMarkdownPagedBody,
@@ -131,15 +148,18 @@ impl PendingModeAction {
 }
 
 impl NativeMarkdownPagedBody {
-    /// 点击在首Native前已绑定原Input；这里只取同一原几何和真实按钮状态，Pending不先辞任或提交。
+    /// The click binds its original Input before Native work; capture that geometry and button state
+    /// without resigning or committing while Pending.
     pub(in crate::native_surface) fn accept_presentation_mode_click(
         &self,
         controller: &NativeMarkdownController,
         original: NativeMarkdownWorkspacePagedEditIntent,
         sender: &objc2::runtime::AnyObject,
     ) {
-        // 模式点击是独立于文字输入的真实意图；原getter内再次点击同一按钮也必须撤销外层动作。
-        // 代次在首Native前推进，仅用来确认最后一次点击，不表示模式/排版已经完成。
+        // A mode click is independent input; a reentrant click from a getter must revoke the enclosing
+        // action even on the same button.
+        // Advance the epoch before the first Native call to identify the latest click; it does not
+        // certify mode or layout completion.
         let revision = self
             .mode_action_revision
             .get()
@@ -157,8 +177,10 @@ impl NativeMarkdownPagedBody {
             workspace_input,
             controller: objc2::rc::Weak::from(controller),
         });
-        // 首次Native weak构造前已固定全部代次；旧weak的析构同样可能重入，不能在drop后重领输入。
-        // 新点击撤上一动作，包括选回当前实际模式；此时不恢复按钮而覆盖刚收到的新状态。
+        // Freeze all epochs before constructing the first Native weak reference; releasing an old weak
+        // reference may reenter and cannot renew input.
+        // Every new click revokes its predecessor, including a return to the current mode; do not
+        // overwrite the newly received button state.
         drop(old);
         let admitted = self.prepare_presentation_mode_click(
             controller,
@@ -168,7 +190,8 @@ impl NativeMarkdownPagedBody {
             sender,
         );
         if let Err(cause) = admitted {
-            // 同步拒绝同样只能反馈原Input/原Doc；新输入或getter内后继点击不能被旧错误回滚按钮。
+            // Synchronous rejection also belongs to the original Input/Doc; an old error cannot roll
+            // back the button after newer or reentrant input.
             let current = || {
                 self.mode_action_revision.get() == revision
                     && original.current()
@@ -184,7 +207,8 @@ impl NativeMarkdownPagedBody {
         }
     }
 
-    /// 原几何与真实目标完整捕获后才安装一个动作；尚无Ready只登记等待，不执行模式事务。
+    /// Install one action only after capturing its actual target and geometry; before Ready, wait
+    /// without running the mode transaction.
     fn prepare_presentation_mode_click(
         &self,
         controller: &NativeMarkdownController,
@@ -205,7 +229,8 @@ impl NativeMarkdownPagedBody {
             return Err("展示模式动作已失效".into());
         }
         let view = self.view().map_err(|cause| cause.to_string())?;
-        // 这是原View公开的请求捕获，不要求Scene存在；无合法几何仍真实拒绝，不能猜一个旧锚点。
+        // Capture through the original View API without requiring a Scene; invalid geometry remains an
+        // error rather than an invented old anchor.
         let request = crate::native_surface::native_markdown_table_intent_step(&current, || {
             view.capture_scene_request()
         })
@@ -255,7 +280,7 @@ impl NativeMarkdownPagedBody {
         *self.pending_mode_action.borrow_mut() = Some(Rc::clone(&pending));
         match view.capture_ready_scene_key() {
             Ok(key) => *pending.publication.borrow_mut() = Some(key),
-            Err(ViewError::Pending) => {} // 原ready_scene已唤醒唯一Producer，只等它真实发布，不再排重试。
+            Err(ViewError::Pending) => {} // The original ready_scene already woke the sole Producer; wait for actual publication without retry polling.
             Err(cause) => {
                 drop(self.take_mode_action(&pending));
                 return Err(cause.to_string());
@@ -265,7 +290,8 @@ impl NativeMarkdownPagedBody {
         Ok(())
     }
 
-    /// 只由两个原Scene成功发布出口调用；记录Copy/弱key，不在Producer或Native借用栈切换模式。
+    /// Called only from the two successful Scene publication exits; record a weak key without switching
+    /// mode inside a Producer or Native borrow.
     pub(super) fn mode_scene_published(&self) {
         let pending = self.pending_mode_action.borrow().clone();
         let Some(pending) =
@@ -278,11 +304,13 @@ impl NativeMarkdownPagedBody {
             .borrow()
             .as_ref()
             .map(|scene| scene.key().clone());
-        // 后继输入的真实发布也只是一条通知；下面交付时仍按原request核对，不能接纳它的新权限。
+        // A successor publication is only a notification; delivery still validates the original request
+        // and cannot acquire successor authority.
         *pending.publication.borrow_mut() = key;
     }
 
-    /// 原advance和所有同步借用归还后才交一次owned队列；没有真实发布就无操作，不轮询Ready。
+    /// Submit one owned task after advance and synchronous borrows end; without actual publication
+    /// there is no work and no Ready polling.
     pub(super) fn deliver_pending_mode_action(&self) {
         if self.preparing.get() {
             return;
@@ -303,10 +331,14 @@ impl NativeMarkdownPagedBody {
         let body = MainThreadBound::new(self.weak.clone(), self.mtm);
         let pending = MainThreadBound::new(Rc::downgrade(&pending), self.mtm);
         let key = MainThreadBound::new(key, self.mtm);
-        // 原模式动作已经由本 Body 的弱文稿、完整 Input、几何和 revision 接纳。
-        // AppKit 嵌套循环可暂借 Active；通用 enqueue_owned 只认槽内 owner，会在本闭包之前
-        // 静默丢掉合法动作并留下 queued=true。这里直交原主队列，由下面原 pending/槽身份
-        // 完整裁定执行或取消；真正 Busy 仍沿原事务失败，不重放、延时或借后继票补权。
+        // The Body already admitted this action using its weak document identity, complete Input,
+        // geometry, and revision.
+        // An AppKit nested loop may temporarily borrow Active; generic enqueue_owned recognizes only
+        // the slotted owner and could
+        // discard valid work before this closure while leaving queued=true. Submit directly to the
+        // original main queue and let
+        // the pending identity and slot decide execution or cancellation. Busy remains a real
+        // transaction failure without replay or renewed tickets.
         crate::native_surface::enqueue_native_markdown_main_task(move || {
             let mtm = MainThreadMarker::new().expect("原模式动作只在主队列交付");
             let (Some(owner), Some(pending)) =
@@ -329,7 +361,8 @@ impl NativeMarkdownPagedBody {
                         })
                 })
                 && pending.current(&owner, &controller);
-            // 槽身份是最后的接纳门；getter重入的新click已经替换它，旧闭包绝不能清掉新动作。
+            // Slot identity is the final admission check: a reentrant new click replaces it, and this
+            // old closure must not remove that successor.
             let Some(accepted) = owner.take_mode_action(&pending) else {
                 return;
             };
@@ -342,22 +375,26 @@ impl NativeMarkdownPagedBody {
                 }
                 return;
             }
-            // 从这里才执行原辞任、单格提交和模式事务一次；失败沿原入口呈现，不重复本动作。
+            // Only now run the original resignation, Cell commit, and mode transaction once; report
+            // failure through the original entry without replay.
             if let Err(cause) = crate::native_surface::set_active_native_markdown_presentation_mode(
                 pending.destination,
             ) && pending.owns_surface(&owner, &controller)
                 && owner.mode_action_revision.get() == pending.revision
                 && owner.pending_mode_action.borrow().is_none()
             {
-                // 本事务可合法推进Input/Find；失败反馈只核原Doc/Body与本次click，不能写入后继笔记。
+                // This transaction may legitimately advance Input or Find; failure feedback checks the
+                // original Doc/Body and click, never a successor note.
                 controller.present_error(&cause);
             }
         });
-        // 与原 owned 入队保持相同临时强边；原队列只携弱身份，控制器析构在所有槽借用之外。
+        // Keep the same temporary strong edge as owned enqueue; the queue carries weak identities and
+        // controller destruction happens outside slot borrows.
         drop(controller);
     }
 
-    /// 只取走本动作的原槽；返回值在槽借用结束后析构，避免Native weak控制块跨RefMut释放。
+    /// Remove only this action identity; destroy the returned owner after the slot borrow ends, keeping
+    /// Native weak release outside RefMut.
     fn take_mode_action(&self, original: &Rc<PendingModeAction>) -> Option<Rc<PendingModeAction>> {
         let mut slot = self.pending_mode_action.borrow_mut();
         if slot
@@ -370,8 +407,10 @@ impl NativeMarkdownPagedBody {
         }
     }
 
-    /// 真实输入或外部滚动只撤旧业务票；仍保同一槽到原队列消费，才能核定是否有后继点击并恢复按钮。
-    /// 这里只安排一次取消反馈；失败/关闭直接释放该槽，不创建另一条模式或重试排版管线。
+    /// Real input or external scroll revokes the old ticket but retains its slot until delivery can
+    /// detect a successor click and restore the button safely.
+    /// Queue cancellation feedback once; failure and close release the slot without another mode
+    /// pipeline or layout retry.
     pub(super) fn cancel_pending_mode_action(&self) {
         let pending = self.pending_mode_action.borrow().clone();
         if let Some(pending) = pending {
@@ -382,7 +421,8 @@ impl NativeMarkdownPagedBody {
         }
     }
 
-    /// 当前Ready图只借一个实际字形；捕获不推进排版、不按行号估算，也不移动文稿选择。
+    /// Borrow one actual glyph from the current Ready Scene without advancing layout, estimating by
+    /// line number, or changing selection.
     pub(in crate::native_surface) fn capture_mode_viewport(
         &self,
     ) -> Result<(ModeSourceAnchor, NativeMarkdownPagedSceneKey)> {
@@ -395,8 +435,9 @@ impl NativeMarkdownPagedBody {
         let document = self.document.borrow().clone().ok_or(ViewError::Revoked)?;
         let clip = key.request.viewport;
         for offset in scene.mode_source_candidates() {
-            let offset = offset?; // 格显示目录的真实I/O错误不能被跳过候选的控制流掩盖。
-            // 非空候选最多读取一个scalar；GCB几何仍由同一sealed Scene认证，绝不读取整行。
+            let offset = offset?; // Do not hide a real Cell-directory I/O failure by skipping to another candidate.
+            // Read at most one scalar for a nonempty candidate; the same sealed Scene certifies
+            // grapheme geometry without reading a whole line.
             let probe = {
                 let document = document.borrow();
                 if offset > key.request.input.utf16_len {
@@ -446,7 +487,8 @@ impl NativeMarkdownPagedBody {
                 .location
                 .checked_add(first.actual_range.length)
                 .ok_or(ViewError::InvalidRange)?;
-            // 顶部偏移采用完整字形框；部分裁切行可继续找下一真实行，不能把裁切交集当完整glyph。
+            // Use the complete glyph rectangle for top offset; skip clipped lines instead of treating
+            // the clip intersection as a complete glyph.
             if first.actual_range.location > probe.start
                 || end < probe.end
                 || ![
@@ -460,7 +502,8 @@ impl NativeMarkdownPagedBody {
                 .into_iter()
                 .all(f64::is_finite)
                 || frame.size.height <= 0.0
-                // 与原TextKit minimal-scroll合同一致，半点只消除真实clip/glyph的浮点边缘取整。
+                // The original minimal-scroll contract allows half a point only for floating-point
+                // rounding at real clip and glyph edges.
                 || frame.origin.y < clip.origin.y - 0.5
                 || frame.origin.y + frame.size.height > clip.origin.y + clip.size.height + 0.5
                 || frame.origin.x + frame.size.width < clip.origin.x
@@ -503,7 +546,8 @@ impl NativeMarkdownPagedBody {
                     length: key.request.input.utf16_len,
                     selection: key.request.input.selection,
                     probe,
-                    // Source为非翻转CG坐标，TextKit为向下源坐标；统一记录真实正文顶部偏移。
+                    // Source uses unflipped Core Graphics coordinates; retain the actual top offset
+                    // consistently with downward text coordinates.
                     screen_y: clip.origin.y + clip.size.height - frame.origin.y - frame.size.height,
                 },
                 key,
@@ -512,8 +556,10 @@ impl NativeMarkdownPagedBody {
         Err(ViewError::Pending.into())
     }
 
-    /// Find隐藏增高视口时保留同源真实字形；已测前缀不能被原生clip误当全文尾部夹滚。
-    /// 同步布局只借原preparing准入，后续补前缀及恢复仍归同一个PendingModeViewport和Composer。
+    /// Preserve the same Source glyph when hiding Find increases viewport height; Native clipping must
+    /// not mistake a measured prefix for EOF.
+    /// Synchronous layout borrows existing preparation admission; prefix growth and restoration stay
+    /// with the same pending viewport and Composer.
     pub(in crate::native_surface) fn hide_find_bar(
         &self,
         bar: &Rc<NativeMarkdownFindBar>,
@@ -524,8 +570,10 @@ impl NativeMarkdownPagedBody {
             return Ok(false);
         }
         let view = self.view().map_err(|cause| cause.to_string())?;
-        // 已有producer借出时仍允许原Hide布局；不能取得别人的preparing后再擅自归还。
-        // 只有本次真正取得准入才创建原guard，退出后用户滚动继续按原通知撤锚。
+        // Hiding may proceed while the Producer is borrowed, but this scope must not release another
+        // scope's preparation admission.
+        // Create a release guard only when this operation acquires admission; later user scroll still
+        // revokes the anchor through existing notifications.
         let was_preparing = self.preparing.replace(true);
         let preparation =
             (!was_preparing).then(|| super::presentation::PresentationUse(&self.preparing));
@@ -541,7 +589,8 @@ impl NativeMarkdownPagedBody {
                 return Err(ViewError::Revoked.to_string());
             }
             self.cancel_pending_mode_action();
-            // 正在恢复的真实位置属于原Source请求；Hide只移交本次Find权限，不重挑锚点或重建来源。
+            // The restoring position belongs to the original Source request; Hide transfers its Find
+            // scope without choosing another anchor or Source.
             let inherited = self.inherit_find_layout_anchor(&scope, controller);
             self.cancel_pending_find()
                 .map_err(|cause| cause.to_string())?;
@@ -549,7 +598,8 @@ impl NativeMarkdownPagedBody {
                 match self.begin_find_layout_anchor(&scope, controller) {
                     Ok(target) => installed = Some(target),
                     Err(Error::View(ViewError::Pending | ViewError::Busy | ViewError::Revoked)) => {
-                        // 尚无可认证的当前字形时，Hide本身仍执行；不宣称恢复一个从未捕获的位置。
+                        // Hide still executes without a certifiable glyph, but never claims to restore
+                        // a position that was not captured.
                     }
                     Err(cause) => return Err(cause.to_string()),
                 }
@@ -563,16 +613,20 @@ impl NativeMarkdownPagedBody {
             }
             Ok(hidden)
         })();
-        drop(preparation); // 所有同步Native及槽借用结束后，才恢复原唯一主队列量子。
+        drop(preparation); // Resume the sole original main-queue quantum only after synchronous Native calls and slot borrows end.
         if was_preparing {
-            // 外层原owner继续消费其worker完成和deferred；本次布局仅请求同一后继，不能清别人的槽。
+            // The outer owner retains its worker completions and deferred work; this layout requests
+            // the same successor without clearing another scope's slots.
             self.deferred.set(true);
             return result;
         }
-        // 此准入只归本次布局；下面的一次原schedule同时消费布局和所有已登记deferred，
-        // worker通知仍留在原队列，由正常schedule完成出口逐项领取，不在这里自行处理。
+        // This layout owns the admission; one original schedule consumes its layout request and
+        // registered deferred work.
+        // Worker notices remain on their original queue for normal completion handling, rather than
+        // being consumed by this layout scope.
         self.deferred.set(false);
-        // Native取消不得掩盖原冻结Source错误；真实失败沿Body统一失败/退休路径归还全部资源。
+        // Native cancellation cannot hide the frozen Source error; actual failure retires resources
+        // through the Body's existing failure path.
         let health = self
             .producer
             .borrow()
@@ -593,7 +647,7 @@ impl NativeMarkdownPagedBody {
                     .is_some_and(|actual| Rc::ptr_eq(actual, target))
             });
             if owns {
-                self.cancel_mode_viewport(); // 只撤本次已安装票；重入后继动作不得被旧失败清掉。
+                self.cancel_mode_viewport(); // Revoke only this operation's installed ticket; an old failure cannot clear reentrant successor work.
             }
         }
         if self.current_body() {
@@ -602,7 +656,8 @@ impl NativeMarkdownPagedBody {
         result
     }
 
-    /// 已有实际锚只移交同窗口Hide的Find scope；不改变原Source、target、测量或原字形位置。
+    /// Transfer only the same-window Hide scope of an existing anchor; Source, target, measurement, and
+    /// glyph position remain original.
     fn inherit_find_layout_anchor(
         &self,
         scope: &Rc<ModeController>,
@@ -619,7 +674,8 @@ impl NativeMarkdownPagedBody {
         let Some((anchor, state, target, Some(original))) = captured else {
             return false;
         };
-        // 弱Native加载在槽借用外；返回后还必须核原scope Rc及target身份，不能复活已替换或撤销的票。
+        // Load the weak Native owner outside the slot borrow, then verify the original scope Rc and
+        // target so replaced or revoked tickets stay revoked.
         if !original
             .controller
             .load()
@@ -651,11 +707,12 @@ impl NativeMarkdownPagedBody {
             }
             pending.controller.replace(Rc::clone(scope))
         };
-        drop(previous); // 原NativeWeak控制块归还不跨mode槽借用；后继输入仍能撤原固定槽。
+        drop(previous); // Release the old Native weak control block outside the mode borrow; successor input may still revoke the fixed original slot.
         true
     }
 
-    /// 只在实际Ready图中创建这次Find布局锚；既有Producer及来源保留，不另建Doc或Parser。
+    /// Create this Find anchor only from an actual Ready Scene; retain the existing Producer and Source
+    /// without another document or parser.
     fn begin_find_layout_anchor(
         &self,
         scope: &Rc<ModeController>,
@@ -666,8 +723,10 @@ impl NativeMarkdownPagedBody {
         if !scene.key().same(&key) {
             return Err(ViewError::Revoked.into());
         }
-        // 测量必须来自捕获锚点的同一nonce；字号、marker显隐和字形高度不从源范围或行号猜测。
-        // 保存真实文档上沿后，Hide造成的短prefix夹滚不会覆盖这份原位置意图。
+        // Measure from the same Scene nonce as the anchor; source ranges and line numbers cannot
+        // determine font, marker visibility, or glyph height.
+        // Retain the actual document top so temporary clipping to a short prefix during Hide cannot
+        // replace the original position intent.
         let first = scene.first_rect(NSRange::new(anchor.probe.start, anchor.probe.len()))?;
         let measured = MeasuredModeGlyph {
             document_top: key.request.virtual_viewport.document_origin.y
@@ -677,7 +736,7 @@ impl NativeMarkdownPagedBody {
                 - first.rect.size.height,
             height: first.rect.size.height,
         };
-        drop(scene); // 跨布局只保原实际标量，旧Scene/Reader不因锚点而继续保活。
+        drop(scene); // Keep only actual scalar measurements across layout; the anchor must not retain the old Scene or reader.
         if !scope.permits(controller)
             || !self
                 .view()?
@@ -686,8 +745,10 @@ impl NativeMarkdownPagedBody {
         {
             return Err(ViewError::Revoked.into());
         }
-        // 原Producer公开入口先核Source健康和完整请求，再借身份；没有复制映射或另起解析请求。
-        // 新视口需要的bottom仍由原目标按真实测量计算，只有Composer真EOF可以结束补前缀。
+        // The original Producer API verifies Source health and the complete request before lending
+        // identity; no mapping copy or parser request is created.
+        // The original target computes the new viewport bottom from measurements; only actual Composer
+        // EOF may stop prefix growth.
         let source = self
             .producer
             .borrow()
@@ -702,7 +763,8 @@ impl NativeMarkdownPagedBody {
         )?;
         self.cancel_mode_viewport();
         self.install_source_target(Rc::clone(&target))?;
-        // 安装只撤旧Reader并排原任务；若这一步重入已换输入，撤本票而不把新状态装回旧锚。
+        // Installation releases the old reader and queues original work; reentrant input revokes this
+        // ticket instead of attaching successor state to an old anchor.
         if !target.current(self) || !scope.permits(controller) {
             target.revoke();
             return Err(ViewError::Revoked.into());
@@ -721,7 +783,8 @@ impl NativeMarkdownPagedBody {
         Ok(target)
     }
 
-    /// 候选尚未首Ready时登记一次；正式创建失败保旧图，不用临时选择或伪Undo驱动定位。
+    /// Register once before first Ready; creation failure keeps the previous frame without temporary
+    /// selections or synthetic undo for positioning.
     pub(in crate::native_surface) fn restore_mode_viewport(
         &self,
         anchor: ModeSourceAnchor,
@@ -744,12 +807,13 @@ impl NativeMarkdownPagedBody {
             target: None,
             controller: None,
             measured_glyph: None,
-            find_origin: None, // 模式/字号交换仍沿原真实 glyph 锚，不借 Find 的绝对位置。
+            find_origin: None, // Mode and font changes retain their real glyph anchor instead of borrowing Find's absolute origin.
         });
         self.schedule()
     }
 
-    /// 唯一新scroll已完成原布局/Find焦点交接；此处只签原controller权限，不再初始化正文图。
+    /// The sole new scroll root already completed layout and Find focus transfer; bind controller
+    /// authority without initializing another body Scene.
     pub(in crate::native_surface) fn bind_mode_viewport(
         &self,
         controller: &Retained<NativeMarkdownController>,
@@ -763,7 +827,8 @@ impl NativeMarkdownPagedBody {
         if !scope.current_native() {
             self.cancel_mode_viewport();
             if self.current_body() {
-                // 外层焦点/挂载失败也可能已消费首个准备任务；取消旧锚点后显式恢复当前同模式。
+                // Outer focus or mount failure may have consumed initial preparation; after cancelling
+                // the old anchor, resume the current mode explicitly.
                 self.schedule()?;
             }
             return Err(ViewError::Revoked.into());
@@ -774,11 +839,12 @@ impl NativeMarkdownPagedBody {
             .borrow_mut()
             .as_mut()
             .and_then(|pending| pending.controller.replace(Rc::clone(&scope)));
-        drop(previous); // 旧scope中的Objective-C弱槽在RefCell借用结束后销毁，不在槽内调用weak-copy或析构原语。
+        drop(previous); // Destroy the previous Objective-C weak slot after the RefCell borrow ends; weak-copy and deallocation must not run inside the slot borrow.
         self.schedule()
     }
 
-    /// Native装配尚在本次挂载栈时不发布文首；旧controller输入则只撤旧mode目标，保留新输入。
+    /// Do not publish document start while Native mounting is active; stale controller input revokes
+    /// only the old mode target, retaining successor input.
     pub(super) fn mode_viewport_waits_for_mount(&self) -> bool {
         let scope = {
             let slot = self.mode_viewport.borrow();
@@ -796,7 +862,8 @@ impl NativeMarkdownPagedBody {
         false
     }
 
-    /// 只有原mode自己的target受此窗口票约束，普通Find/导航仍走它们自己的原始权限。
+    /// This window scope constrains only its original mode target; Find and navigation retain their own
+    /// original authority.
     pub(super) fn mode_target_current_native(&self, target: &target::SourceTargetRequest) -> bool {
         let scope = {
             let slot = self.mode_viewport.borrow();
@@ -815,7 +882,8 @@ impl NativeMarkdownPagedBody {
         scope.is_some_and(|scope| scope.current_native())
     }
 
-    /// 原clip的用户滚动/外部resize只能撤这一旧票；自有prepare中的真实高度/滚动不走这里。
+    /// User scroll or external resize revokes this old clip ticket; preparation-owned height and
+    /// scrolling do not use this path.
     pub(super) fn cancel_mode_for_external_clip(&self) {
         if self.preparing.get() {
             return;
@@ -831,7 +899,8 @@ impl NativeMarkdownPagedBody {
         }
     }
 
-    /// 先移出有限旧票，再只撤同指针target；不能清掉用户后来安装的Find或另一个Source动作。
+    /// Detach the finite old ticket, then revoke only the identical target; never clear a later Find or
+    /// another Source action.
     pub(super) fn cancel_mode_viewport(&self) {
         self.cancel_pending_mode_action();
         let pending = self.mode_viewport.borrow_mut().take();
@@ -853,7 +922,8 @@ impl NativeMarkdownPagedBody {
         drop(previous);
     }
 
-    /// 第一个真实Producer负责签发同Source目标；没有额外capture或文首Ready作为中转。
+    /// The first real Producer issues the same-Source target without another capture or an intermediate
+    /// Ready frame at document start.
     pub(super) fn prepare_mode_viewport(
         &self,
         producer: &mut Producer,
@@ -869,11 +939,11 @@ impl NativeMarkdownPagedBody {
                 pending.anchor.clone(),
                 pending.target.clone(),
             )
-        }; // 先结束初始化槽借用，后续Native调度和撤权可安全重入。
+        }; // End the initialization-slot borrow before Native scheduling or revocation may reenter.
 
         if request.input != state || !anchor.current_document() {
             drop(self.mode_viewport.borrow_mut().take());
-            return Ok(()); // 后继真实输入撤销旧位置；不从当前选择重新签发原模式动作。
+            return Ok(()); // Successor input revokes the old position; current selection cannot renew the original mode action.
         }
         if let Some(target) = target {
             if !target.matches(self, request) {
@@ -895,7 +965,8 @@ impl NativeMarkdownPagedBody {
         Ok(())
     }
 
-    /// 已实测目标行上沿决定所需下方正文；布局不足时续原前缀，不能用短prefix夹到页底冒充恢复。
+    /// The measured target top determines the required lower body; continue the original prefix instead
+    /// of declaring restoration after clamping to a short page.
     pub(super) fn mode_viewport_required_bottom(
         &self,
         target: &Rc<target::SourceTargetRequest>,
@@ -908,12 +979,15 @@ impl NativeMarkdownPagedBody {
             .target
             .as_ref()
             .filter(|actual| Rc::ptr_eq(actual, target))?;
-        // 首 Scene 前只能沿真实行顶补前缀；测得格内字形后必须使用它的实际文档位置。
-        // 目标可能在超高格中部，整行顶部不能证明原屏内锚下方的可见内容已准备完成。
+        // Before a Scene exists, extend from the real line top; once measured, use the Cell glyph's
+        // actual document position.
+        // A target may lie inside a tall Cell; the row top cannot prove content below the original
+        // on-screen anchor is prepared.
         let origin = if let Some(original) = pending.find_origin
             && original.presentation_mode == self.presentation_mode()
         {
-            // 同 Source/Input/宽度的目标只补原坐标下方新增的可见高度；原值不参与加减回环。
+            // For the same Source, Input, and width, extend only the new visible height below the exact
+            // original coordinate; avoid coordinate round trips.
             original.position.y
         } else {
             pending.measured_glyph.map_or_else(
@@ -924,8 +998,10 @@ impl NativeMarkdownPagedBody {
         Some(origin + viewport_height)
     }
 
-    /// 只在原模式目标已有真实字形锚时接管后继滚动；首次远端定位仍由原目标准备路径完成。
-    /// 此方法只查同指针票与有限测量值，不授予 Ready、可见性或外部操作已完成的证明。
+    /// Take over subsequent scroll only after the original mode target has a measured glyph; initial
+    /// remote positioning remains with target preparation.
+    /// This checks identical tickets and finite measurements only; it certifies neither Ready,
+    /// visibility, nor completion of external operations.
     pub(super) fn mode_retains_measured_glyph(
         &self,
         target: &Rc<target::SourceTargetRequest>,
@@ -939,7 +1015,8 @@ impl NativeMarkdownPagedBody {
         })
     }
 
-    /// 首目标真正排版后只用真实glyph框恢复屏内Y；滚动后的旧Scene绝不签发最终可见收据。
+    /// Restore on-screen Y from the measured glyph after actual target layout; a pre-scroll Scene can
+    /// never issue final visibility proof.
     pub(super) fn finish_mode_viewport(&self) -> Result<bool> {
         let (anchor, state, target, find_origin, measured_glyph) = {
             let slot = self.mode_viewport.borrow();
@@ -953,16 +1030,19 @@ impl NativeMarkdownPagedBody {
                 pending.find_origin,
                 pending.measured_glyph,
             )
-        }; // 实际glyph/clip查询不持初始化槽，失败清理也不递归借用同一RefCell。
+        }; // Query glyph and clip geometry outside the initialization slot; failure cleanup must not recursively borrow that RefCell.
 
         let Some(target) = target else {
             return Ok(false);
         };
         let scene = self.scene.borrow().clone();
         let Some(scene) = scene else {
-            // 本回合的原controller/Input/Source撤权已由prepare及Producer原票负责，
-            // 没有Scene就无真实glyph可完成，也不执行Native滚动；不为每个Core量子再捕整组几何。
-            // 一旦发布Scene，下面仍完整核原输入和target，实际副作用前后的守卫不变。
+            // Preparation and the original Producer ticket already own controller, Input, and Source
+            // revocation for this turn.
+            // Without a Scene, there is no measured glyph and no Native scroll; do not capture all
+            // Native geometry for each Core quantum.
+            // Once a Scene is published, the full original Input and target checks still guard both
+            // sides of each real side effect.
             return Ok(false);
         };
         if self.input.state().map_err(ViewError::Input)? != state || !target.current_native(self) {
@@ -976,7 +1056,8 @@ impl NativeMarkdownPagedBody {
             Ok(first) => first,
             Err(ViewError::Pending) => return Ok(false),
             Err(cause) => {
-                // 只标明既有失败出口；不额外查询原 Scene/current，也不把旧坐标拒绝改成重试。
+                // Label the existing failure exit only; avoid additional Scene/current queries and do
+                // not turn rejected old coordinates into a retry.
                 #[cfg(feature = "native-close-stage-diagnostic")]
                 eprintln!(
                     "native_mode_phase_failure phase=first_rect cause={:?}",
@@ -995,12 +1076,15 @@ impl NativeMarkdownPagedBody {
             );
             let _ = cause;
         })?;
-        // 原 target 已证明同 Source、完整 Input 和换行宽；仅同一实际模式允许 Find 原值恢复。
-        // 字号/模式转换继续测新 glyph，不拿旧坐标阻止它按原屏内锚重新排版。
+        // The original target certifies Source, complete Input, and width; only the same actual mode
+        // may reuse the exact Find origin.
+        // Font and mode changes measure a new glyph; old coordinates must not prevent layout around the
+        // original on-screen anchor.
         let find_origin = find_origin
             .filter(|original| original.presentation_mode == scene.key().presentation_mode);
         let measured = if find_origin.is_some() {
-            // Find 构造时已在同一真实 Scene 测得此字形；纯高度布局不能用新局部Y再反求文稿顶端。
+            // Find already measured this glyph in the same Scene; a pure height change must not derive
+            // document top again from a new local Y.
             measured_glyph.expect("Find 布局原点始终伴随原 Scene 的真实字形测量")
         } else {
             MeasuredModeGlyph {
@@ -1022,8 +1106,9 @@ impl NativeMarkdownPagedBody {
         if !glyph_top.is_finite() || !desired.is_finite() {
             return Err(ViewError::InvalidGeometry.into());
         }
-        // first_rect 已由当前同票 Scene 认证，才交接后继滚动的唯一归属。
-        // Native reveal 可能换几何票；保留实际测量而不提前消费 mode，下一 Scene 仍须重新核验。
+        // Transfer subsequent scrolling only after the current same-ticket Scene certifies first_rect.
+        // Native reveal may change geometry; retain measurements without consuming the mode, and
+        // revalidate the next Scene.
         if let Some(pending) = self.mode_viewport.borrow_mut().as_mut()
             && pending
                 .target
@@ -1032,8 +1117,10 @@ impl NativeMarkdownPagedBody {
         {
             pending.measured_glyph = Some(measured);
         }
-        // 当前 Scene 可能刚好封存在长格中段；临时页底不能替代用户原来的屏内位置。
-        // 先让唯一 Producer 补到实际目标下方的可见区，EOF 以外不接受 clamp 后的假完成。
+        // A Scene may end midway through a tall Cell; its temporary page bottom must not replace the
+        // original on-screen position.
+        // Let the sole Producer prepare the visible area below the actual target; clamping before
+        // actual EOF never means completion.
         let required_bottom = requested + geometry.body_frame.size.height;
         let needs_prefix = self
             .producer
@@ -1042,8 +1129,10 @@ impl NativeMarkdownPagedBody {
             .expect("模式 Scene 仍归唯一实际 Producer")
             .needs_document_prefix(required_bottom);
         if needs_prefix {
-            // publish 已标脏这一中间 Scene；位置还未恢复，必须先撤票，不能让 CPU observer
-            // 抢在补前缀续体前把它当作模式完成帧。原测量与唯一 Producer 均继续保留。
+            // Publication dirtied this intermediate Scene before restoration completed. Revoke its
+            // ticket before the CPU observer can
+            // mistake it for a completed mode frame ahead of prefix work; retain the measurements and
+            // sole Producer.
             self.clear_scene()?;
             self.schedule()?;
             return Ok(true);
@@ -1062,13 +1151,15 @@ impl NativeMarkdownPagedBody {
             ),
             &|| target.current_native(self),
         );
-        // 普通前台取消不能盖掉原Source的首个I/O错误；Native操作已经消费，绝不重放。
+        // Ordinary foreground cancellation cannot hide the original Source I/O error; the Native
+        // operation was consumed and must never replay.
         if let Some(producer) = self.producer.borrow().as_ref() {
             producer.target_source_health()?;
         }
         #[cfg(feature = "native-close-stage-diagnostic")]
         if let Err(cause) = &changed {
-            // 原 Source 首错仍在上方优先返回；此处不提前消费或重放已发生的 Native reveal。
+            // The original Source error still takes precedence above; this diagnostic neither consumes
+            // nor replays the Native reveal.
             eprintln!(
                 "native_mode_phase_failure phase=reveal cause={:?}",
                 std::mem::discriminant(cause)

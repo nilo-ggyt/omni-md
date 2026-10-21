@@ -1,4 +1,5 @@
-//! 布局算法共享同一个冻结正文payload；身份与代次固定，有限借用不授予Native活文档权限。
+//! Layout algorithms share one frozen text payload with fixed capture identity
+//! and generation. Bounded reads grant no native live-document mutation authority.
 use std::{
     hash::{Hash, Hasher},
     io::Write,
@@ -37,7 +38,8 @@ pub use table_cell::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 布局源的坐标域；只读格不具 canonical 输入权限，活动草稿也不能借局部坐标修改正文。
+/// Coordinate domain of a layout source. Read-only cells have no canonical
+/// input authority, and active drafts cannot edit body text using local offsets.
 pub enum MarkdownLayoutTextSourceDomain {
     Canonical,
     #[cfg(feature = "s2-table-window-prototype")]
@@ -49,20 +51,24 @@ pub enum MarkdownLayoutTextSourceDomain {
 enum SourceDomain {
     Canonical,
     #[cfg(feature = "s2-table-window-prototype")]
-    // 只读格单独持有固定结构 metadata；所有普通正文 capture 不必为最大格上下文放大 payload。
+    // Read-only cells own their structural metadata separately, avoiding a
+    // largest-cell payload cost for every ordinary body capture.
     ReadOnlyCell(Box<crate::markdown_document_buffer::VerifiedMarkdownTableCellSource>),
     #[cfg(feature = "s2-table-window-prototype")]
     ActiveCellDraft(crate::markdown_document_buffer::MarkdownCellDraftSourceAuthority),
 }
 
-/// 所有布局算法的单次正文借用上限；不因piece或软行长度变大而扩大。
+/// Per-read text limit shared by layout algorithms. Longer pieces or soft lines
+/// never enlarge the permitted lease.
 pub const MARKDOWN_LAYOUT_SOURCE_BYTES: usize = 4096;
 
-/// 同一个payload只含原Snapshot与固定聚合；Clone只共享Arc，不另捕获或复制正文资源。
+/// Contains the original frozen snapshot and fixed aggregates only. Cloning
+/// shares its `Arc`, without recapturing or copying document text.
 #[derive(Clone)]
 pub struct MarkdownLayoutTextSource(Arc<Payload>);
 struct Payload {
-    // 按字段声明顺序析构：最后的标记只能在这个Snapshot已经交还后发布完成事实。
+    // Fields drop in declaration order. The final marker publishes release
+    // only after this payload has actually returned its snapshot ownership.
     snapshot: MarkdownTextSnapshot,
     generation: u64,
     bytes: usize,
@@ -77,7 +83,8 @@ impl Drop for PayloadDrop {
     }
 }
 
-/// 只标识原不可变payload，不保活Snapshot、mmap、编辑段、活动文档或历史。
+/// Identifies the original immutable payload without retaining its snapshot,
+/// mapping, edit segments, live document, or history.
 #[derive(Clone)]
 pub struct MarkdownLayoutTextAuthority {
     source: Weak<Payload>,
@@ -85,7 +92,8 @@ pub struct MarkdownLayoutTextAuthority {
 
 impl PartialEq for MarkdownLayoutTextAuthority {
     fn eq(&self, other: &Self) -> bool {
-        // Weak保留原控制块身份，销毁后也不把地址复用或相同正文误判为同一次capture。
+        // Weak control-block identity survives payload destruction, so equal text
+        // or a reused address cannot masquerade as the original capture.
         Weak::ptr_eq(&self.source, &other.source)
     }
 }
@@ -97,25 +105,30 @@ impl PartialOrd for MarkdownLayoutTextAuthority {
 }
 impl Ord for MarkdownLayoutTextAuthority {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // 这只是不同原payload键的稳定总序，不表示正文顺序、代次更新或仍有活动权限。
-        // Weak保留控制块期间地址不能重用，故与eq/hash保持一致；同源文本位置另按UTF16比较。
+        // This total order sorts original payload keys only. It represents neither
+        // text order, newer generations, nor active input authority.
+        // Weak ownership prevents control-block reuse, keeping order consistent
+        // with equality/hash. Same-source text positions compare UTF-16 separately.
         self.source.as_ptr().cmp(&other.source.as_ptr())
     }
 }
 impl Hash for MarkdownLayoutTextAuthority {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // 仅用于Native位置等有限键；hash不暴露正文，且相等值始终使用同一原payload地址。
+        // Finite native-position keys hash identity only, exposing no text. Equal
+        // keys always use the same original payload address.
         self.source.as_ptr().hash(state);
     }
 }
 
-/// 只保留固定析构标记；它不参与源保活，也不把Weak失效提前冒充字段实际析构。
+/// Retains a fixed destruction marker only. It does not retain source storage or
+/// treat weak-reference expiry as proof that all payload fields have dropped.
 #[derive(Clone)]
 pub struct MarkdownLayoutTextSourceObserver {
     dropped: Arc<AtomicBool>,
 }
 impl MarkdownLayoutTextSourceObserver {
-    /// 仅证明本payload已经交还Snapshot，不声称其他Snapshot或Native值也已释放共享mmap。
+    /// Proves only that this payload returned its snapshot. Other snapshots or
+    /// native values may still own the shared mapping.
     #[must_use]
     pub fn payload_released(&self) -> bool {
         self.dropped.load(Ordering::Acquire)
@@ -123,10 +136,12 @@ impl MarkdownLayoutTextSourceObserver {
 }
 
 impl MarkdownLayoutTextSource {
-    /// 在同一次不可变文档借用中捕获generation与原Snapshot；没有可重入调用或全文扫描。
+    /// Captures generation and the original snapshot under one immutable document
+    /// borrow, without reentrant calls or a whole-text scan.
     ///
-    /// 后续编辑、Undo/Redo和文档销毁不会改变这个值。generation只描述捕获事实，
-    /// 不能取代Native消费时原owner/当前代次的权限检查。
+    /// Later edits, undo/redo, and document destruction cannot alter this value.
+    /// Generation records capture-time facts only;
+    /// native consumption must still verify the original owner and current generation.
     #[must_use]
     pub fn capture(document: &MarkdownDocumentBuffer) -> Self {
         Self(Arc::new(Payload {
@@ -142,7 +157,8 @@ impl MarkdownLayoutTextSource {
     pub fn generation(&self) -> u64 {
         self.0.generation
     }
-    /// 只交付真实构造路径的域类别；不能凭没有 draft 票就把只读局部源当成完整正文。
+    /// Reports the domain from its actual construction path. Absence of a draft
+    /// ticket does not turn a local read-only cell into a full canonical source.
     #[must_use]
     pub fn domain(&self) -> MarkdownLayoutTextSourceDomain {
         match &self.0.domain {
@@ -161,7 +177,8 @@ impl MarkdownLayoutTextSource {
     pub fn utf16_len(&self) -> usize {
         self.0.utf16
     }
-    /// 空文档也按真实payload allocation隔离；同文本/代次不能冒充同一源。
+    /// Even empty documents have distinct payload allocations. Equal text and
+    /// generation cannot impersonate the same source.
     #[must_use]
     pub fn authority(&self) -> MarkdownLayoutTextAuthority {
         MarkdownLayoutTextAuthority {
@@ -174,10 +191,12 @@ impl MarkdownLayoutTextSource {
             dropped: Arc::clone(&self.0.dropped.0),
         }
     }
-    /// 同payload端点转换；即使首尾或缓存命中也验证真实源健康，不另capture或读取整段。
+    /// Converts endpoints in this payload, checking real source health even at
+    /// endpoints or cache hits. It never recaptures or reads the entire paragraph.
     ///
     /// # Errors
-    /// 原映射失败、位置越界或切入代理项时保留原错误；只定位原树的有限叶，不返回正文借用。
+    /// Preserves mapping, range, and surrogate-boundary failures. Only a bounded
+    /// leaf is located, and no document-text borrow escapes.
     #[cfg(any(feature = "paged-shaping", test))]
     pub fn byte_offset_for_utf16(
         &self,
@@ -185,8 +204,10 @@ impl MarkdownLayoutTextSource {
     ) -> Result<usize, MarkdownDocumentBufferError> {
         self.0.snapshot.byte_offset_for_utf16(position)
     }
-    /// 原冻结payload的精确字符域谓词；不另捕获文档或把整item读入临时缓冲。
-    /// 原owner仍须在调用前后核对同一authority，本方法与端点转换复用原错误类型。
+    /// Exact character-domain predicate on the frozen payload, without another
+    /// document capture or copying an entire item into temporary memory.
+    /// The owner still checks the same authority around this operation; endpoint
+    /// conversion and this predicate share the original error type.
     #[cfg(any(feature = "paged-shaping-frontier", test))]
     pub(crate) fn is_printable_ascii_range(
         &self,
@@ -195,7 +216,8 @@ impl MarkdownLayoutTextSource {
         self.0.snapshot.is_printable_ascii_range(range)
     }
 
-    /// 原Script后缀证明只借本payload的Frozen，不另捕获Source或读取端点。
+    /// Begins the script suffix proof using this payload's frozen value only,
+    /// without another source capture or endpoint read.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn begin_printable_ascii_suffix(
         &self,
@@ -207,7 +229,8 @@ impl MarkdownLayoutTextSource {
         self.0.snapshot.begin_printable_ascii_suffix(range)
     }
 
-    /// 字节、标量和目录分别按当前原量子收费；真实来源失败保持原错误。
+    /// Charges bytes, scalars, and directory records separately against this
+    /// quantum, preserving actual source errors.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn advance_printable_ascii_suffix(
         &self,
@@ -224,7 +247,8 @@ impl MarkdownLayoutTextSource {
             .advance_printable_ascii_suffix(cursor, bytes, scalars, metadata)
     }
 
-    /// 原Dense GCB消费者使用的同源树游标；不创建第二Source或Reader，也不提供裸正文。
+    /// Same-source tree cursor for the dense grapheme consumer. It creates no
+    /// second source/reader and exposes no raw document text.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn begin_ascii_word_run(
         &self,
@@ -237,7 +261,8 @@ impl MarkdownLayoutTextSource {
             .begin_ascii_word_run(position, forward, self.authority())
     }
 
-    /// 游标不能借相同文本或共享root跨Source复用；源失败先于身份拒绝，访问后再保最后I/O首因。
+    /// Equal text or shared roots cannot transfer a cursor between sources. Source
+    /// failure precedes identity rejection and is rechecked after the actual read.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn advance_ascii_word_run(
         &self,
@@ -260,7 +285,8 @@ impl MarkdownLayoutTextSource {
         self.health()?;
         result.map_err(Into::into)
     }
-    /// 同一冻结全源的三态精确提示；脚本消费者仍须在纯 Core 交接前后核原 authority。
+    /// Exact three-state hint for the same frozen complete source. Script consumers
+    /// still verify original authority around pure-Core handoff.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn printable_ascii_has_letters(
         &self,
@@ -268,22 +294,28 @@ impl MarkdownLayoutTextSource {
         self.0.snapshot.printable_ascii_has_letters()
     }
 
-    /// 读取同一冻结payload的真实永久I/O状态，不能以Weak身份或旧索引命中替代此门。
+    /// Reads the same frozen payload's sticky I/O state. Weak identity or a stale
+    /// index hit cannot substitute for this health gate.
     pub(crate) fn health(&self) -> Result<(), MarkdownDocumentBufferError> {
         self.0.snapshot.original_backing_health()
     }
-    /// 取消检查只持原子事实，不为观察原始I/O失败而捕获冻结正文的强owner。
+    /// Cancellation checks retain atomic facts only, avoiding a strong frozen-text
+    /// owner merely to observe an original-source I/O failure.
     #[must_use]
     pub fn original_backing_observer(&self) -> Option<crate::MarkdownOriginalBackingObserver> {
         self.0.snapshot.original_backing_observer()
     }
 
-    /// 将同一Body/Cell来源的UTF-16范围按原UTF-8片段写出，不复制整段或整格正文。
+    /// Streams a body/cell UTF-16 range as original UTF-8 pieces without copying
+    /// an entire paragraph or cell into memory.
     ///
     /// # Errors
-    /// 真实源健康、范围次序和两个标量端点均在首次writer调用前核验；空范围也不绕过健康门。
-    /// 写入失败可留下部分目标，但不改变来源或其输入状态；原lease回收及Cell内容撤权
-    /// 仍沿同一Snapshot门传播，实际源错误优先于writer失败。
+    /// Checks source health, range order, and both scalar endpoints before the
+    /// first writer call. Even an empty range passes the health gate.
+    /// Writer failure may leave partial output but changes neither source nor its
+    /// input state. Original lease cleanup and cell-content revocation
+    /// propagate through the same snapshot gate; actual source failure takes
+    /// precedence over writer failure.
     pub fn write_utf16_range_to(
         &self,
         range: Range<usize>,
@@ -292,21 +324,24 @@ impl MarkdownLayoutTextSource {
         self.health()?;
         if range.start > range.end {
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
-        } // 不夹取或倒置用户选择，两个位置的界限和标量边界继续由原Snapshot转换核验。
+        } // Never clamp or reverse a user selection; snapshot conversion validates both endpoints.
         let start = self.0.snapshot.byte_offset_for_utf16(range.start)?;
         let end = self.0.snapshot.byte_offset_for_utf16(range.end)?;
-        // Snapshot visitor只借相交的原piece，每次回调最多4KiB；大选择不扩大单次源借用。
-        // 不经布局的4KiB单次查询入口，也不为显式大复制构造选区String或反复读取已写正文。
+        // The snapshot visitor leases intersecting original pieces only, at most
+        // 4 KiB per callback. Large selections never enlarge one source lease.
+        // Streaming intentionally avoids the single-query layout API; explicit
+        // large copies need neither a selected-text string nor repeated output reads.
         let result = self.0.snapshot.visit_byte_range(start..end, |bytes| {
             destination
                 .write_all(bytes)
                 .map_err(|_| MarkdownDocumentBufferError::WriteUnavailable)
         });
-        self.health()?; // 最后一个编辑片的writer也可触发撤权或Source首错，不能因无后继叶而漏核。
+        self.health()?; // Recheck even after the final writer; no later leaf may exist to discover source failure.
         result
     }
 
-    /// UBA与其他分页阶段共享原冻结值；只增加原Arc引用，不重捕文档或复制正文。
+    /// Shares the original frozen value with bidi and later paging stages, adding
+    /// an `Arc` reference without recapturing the document or copying text.
     #[cfg(feature = "paged-layout-breaks")]
     pub(crate) fn snapshot_for_bidi(&self) -> MarkdownTextSnapshot {
         self.0.snapshot.clone()
@@ -316,7 +351,8 @@ impl MarkdownLayoutTextSource {
         Weak::ptr_eq(&authority.source, &Arc::downgrade(&self.0))
     }
 
-    /// 交付原piece的有限借用，不复制正文；UTF8内部端点由各算法的同一状态机续接。
+    /// Visits bounded original pieces without copying text. Each algorithm's own
+    /// continuation state handles byte endpoints inside UTF-8 scalars.
     pub(crate) fn visit_byte_range(
         &self,
         range: Range<usize>,
@@ -324,11 +360,13 @@ impl MarkdownLayoutTextSource {
     ) -> Result<(), MarkdownDocumentBufferError> {
         self.health()?;
         if range.start > range.end || range.end > self.byte_len() {
-            // 倒置/越界是源坐标错误，不把它伪装成可以重试更大配额的问题。
+            // Reversed or out-of-source coordinates are range errors, not a reason
+            // to retry with a larger read budget.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         if range.len() > MARKDOWN_LAYOUT_SOURCE_BYTES {
-            // 预算不能作为建议值；非法大请求在借用任何正文之前拒绝。
+            // The budget is mandatory. Reject an oversized request before borrowing
+            // any document bytes.
             return Err(MarkdownDocumentBufferError::MaterializationLimitExceeded);
         }
         self.0.snapshot.visit_byte_range(range, visit)
@@ -369,7 +407,7 @@ mod tests {
         assert_eq!(document.generation(), generation);
         assert_eq!(document.selection(), selection);
         assert!(document.is_dirty() && document.can_undo() && !document.can_redo());
-        drop(document); // 冻结Body来源只保原字节，不保活动Doc及其历史。
+        drop(document); // Frozen body source retains bytes, never the active document or its history.
         directory.close().unwrap();
         bytes.clear();
         source.write_utf16_range_to(range, &mut bytes).unwrap();
@@ -399,7 +437,7 @@ mod tests {
                 source.write_utf16_range_to(range, &mut bytes),
                 Err(expected)
             );
-            assert_eq!(bytes, b"existing"); // 部分输出不能在非法端点被发现前触及真实writer。
+            assert_eq!(bytes, b"existing"); // Invalid endpoints must be rejected before any real writer output.
         }
     }
 
@@ -443,7 +481,8 @@ mod tests {
         }
         impl Write for ReclaimingWriter<'_> {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                // 写入目标仍是真实只读FD；先使已读原页的真实回收操作发生EIO。
+                // The destination remains a real read-only descriptor. First make the
+                // actual reclamation of an already-read original page report EIO.
                 self.document.fail_next_original_reclaim_for_test();
                 assert_eq!(
                     self.document.reclaim_original_read_windows_for_test(),
@@ -475,7 +514,8 @@ mod tests {
                 document: &document,
                 readonly: std::fs::File::open("/dev/null").unwrap(),
             };
-            // 选择仅含编辑片；最后叶没有Original lease，仍须在返回writer失败前核原Source健康。
+            // The selection contains edited pieces only. Its last leaf has no
+            // original lease, but source health must still precede writer failure.
             assert_eq!(
                 source.write_utf16_range_to(0..2, &mut writer),
                 Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(
@@ -507,7 +547,8 @@ mod tests {
             .insert_utf16(2, "\t", crate::MarkdownTextSelection::caret(3))
             .unwrap();
         let edited = MarkdownLayoutTextSource::capture(&document);
-        // byte与UTF16等长仍可能含C0；独立capture不能替换原payload的精确字符域事实。
+        // Equal byte/UTF-16 lengths can still contain C0 controls. A separate
+        // capture cannot replace the original payload's exact domain facts.
         assert_eq!(edited.byte_len(), edited.utf16_len());
         assert_eq!(
             edited.is_printable_ascii_range(0..edited.utf16_len()),
@@ -580,9 +621,9 @@ mod tests {
         identities.insert(authority.clone());
         identities.insert(clone.authority());
         identities.insert(other.authority());
-        assert_eq!(identities.len(), 2); // hash与实际Weak身份一致，相同文本的独立capture仍各有键。
+        assert_eq!(identities.len(), 2); // Hash follows weak identity; independent equal-text captures keep separate keys.
         let ordered: std::collections::BTreeSet<_> = identities.into_iter().collect();
-        assert_eq!(ordered.len(), 2); // Native位置的跨源总序不能把不同源折叠为相同位置。
+        assert_eq!(ordered.len(), 2); // Cross-source native-position ordering cannot collapse distinct source identities.
         assert!(clone.permits(&source.authority()));
         assert!(!other.permits(&source.authority()));
     }

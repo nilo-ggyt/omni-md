@@ -29,26 +29,31 @@ pub(super) fn is_word_character(character: char) -> bool {
 }
 
 #[derive(Default)]
-/// 会话追加段按原编号寻址；冻结值可共享旧段，只有真正追加的有限尾段需要写时复制。
+/// Session append segments retain stable IDs. Frozen readers share earlier
+/// segments; only the bounded tail actually receiving bytes needs copy-on-write.
 pub(super) struct MarkdownEditSegments {
     pub(super) segments: Vec<Arc<MarkdownEditSegment>>,
     pub(super) used_bytes: usize,
-    // 只有原事务发布才推进；候选文件失败不能被记成尚未改变的原正文Source故障。
+    // Advance only at transaction publication. A failed candidate file cannot
+    // become a failure of the still-unchanged canonical text source.
     pub(super) published_segments: usize,
 }
 
 #[derive(Clone)]
-/// 同一编辑段编号只决定字节归属；小输入保原COW尾段，大输入保独立不可变匿名映射。
+/// Stable segment IDs identify byte ownership. Small inputs use the bounded
+/// copy-on-write tail; large inputs use private immutable anonymous mappings.
 pub(super) enum MarkdownEditSegment {
     Heap(Vec<u8>),
     Frozen(Arc<OriginalBacking>),
-    // 原编号保留真实释放票；这里只持固定原子事实，不再保活旧候选文件或映射。
+    // Retain the original slot's release facts only. Fixed atomics do not keep
+    // an earlier candidate file or mapping alive.
     RetiredFrozen(Arc<crate::MarkdownOriginalBackingObserver>),
 }
 
 #[cfg(test)]
 impl std::fmt::Debug for MarkdownEditSegment {
-    /// 测试失败只给存储类别与实际长度，不因格式化诊断把整格正文读取出来。
+    /// Failure diagnostics expose storage kind and real length only, never reading
+    /// an entire cell's text just to format a failed assertion.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Heap(bytes) => formatter.debug_tuple("Heap").field(&bytes.len()).finish(),
@@ -66,13 +71,14 @@ impl std::fmt::Debug for MarkdownEditSegment {
 
 #[cfg(test)]
 impl PartialEq for MarkdownEditSegment {
-    /// 旧堆快照仍比较全部字节；文件段不可变，回滚必须保留原backing身份而非另造同字节文件。
+    /// Heap snapshots compare their actual bytes. Frozen-file rollback must retain
+    /// original backing identity rather than create another file with equal bytes.
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Heap(left), Self::Heap(right)) => left == right,
             (Self::Frozen(left), Self::Frozen(right)) => Arc::ptr_eq(left, right),
             (Self::RetiredFrozen(left), Self::RetiredFrozen(right)) => Arc::ptr_eq(left, right),
-            _ => false, // 同一失败事务不能悄悄把原堆段换成文件或把文件复制回堆。
+            _ => false, // Failed transactions cannot silently replace heap storage with a file or copy files back to heap.
         }
     }
 }
@@ -81,22 +87,25 @@ impl PartialEq for MarkdownEditSegment {
 impl Eq for MarkdownEditSegment {}
 
 impl MarkdownEditSegment {
-    /// 长度是该段真实extent；封存段不暴露完整slice，也不能转回可写尾段。
+    /// Returns the actual segment extent. Frozen storage exposes no full slice
+    /// and cannot become a writable tail again.
     pub(super) fn len(&self) -> usize {
         match self {
-            Self::Heap(bytes) => bytes.len(), // 原尾段的有效字节继续决定可追加空间。
-            Self::Frozen(backing) => backing.len(), // 映射只提供计量，读取必须另取有限lease。
-            Self::RetiredFrozen(_) => 0,      // 退休槽没有可读字节，编号仍为最终释放观察保留。
+            Self::Heap(bytes) => bytes.len(), // Actual tail bytes determine remaining append capacity.
+            Self::Frozen(backing) => backing.len(), // Length grants no byte access; reads need a bounded lease.
+            Self::RetiredFrozen(_) => 0, // A retired slot has no readable bytes; its ID retains final release facts.
         }
     }
 
-    /// 缓存命中与空范围同样核真实映射首错；堆段没有文件资源需要查询。
+    /// Hits and empty reads still check the mapping's first failure. Heap segments
+    /// own no file resource requiring a health query.
     pub(super) fn health(&self) -> Result<(), MarkdownDocumentBufferError> {
         match self {
             Self::Heap(_) => Ok(()),
             Self::Frozen(backing) => backing.health().map_err(Into::into),
             Self::RetiredFrozen(observer) => observer.first_errno().map_or(Ok(()), |errno| {
-                // 最后快照的延迟Drop仍可能失败；退休不能把原已发布Source首错遗忘。
+                // A final frozen reader's delayed drop can fail. Retirement cannot
+                // erase the first failure of an already published source.
                 Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(
                     errno,
                 ))
@@ -104,7 +113,8 @@ impl MarkdownEditSegment {
         }
     }
 
-    /// piece偏移仍属于原EditSegment编号；映射分支严格沿原4KiB lease及真实归还错误。
+    /// Piece offsets belong to their original segment ID. Mapped reads preserve
+    /// the 4-KiB lease limit and propagate actual release failures.
     pub(super) fn read(
         &self,
         range: Range<usize>,
@@ -126,7 +136,8 @@ impl MarkdownEditSegment {
     }
 
     #[cfg(test)]
-    /// 只计堆字节容量；封存映射驻留与最终释放由其真实backing observer分别验证。
+    /// Counts heap capacity only. Real backing observers separately verify
+    /// frozen-mapping residency and final release.
     pub(super) fn capacity(&self) -> usize {
         match self {
             Self::Heap(bytes) => bytes.capacity(),
@@ -135,7 +146,8 @@ impl MarkdownEditSegment {
     }
 
     #[cfg(test)]
-    /// 旧COW测试只能观察已知堆段；不得借此给封存段增加整段读取入口。
+    /// Copy-on-write regressions inspect known heap segments only; they must not
+    /// introduce a whole-segment reading API for frozen storage.
     pub(super) fn as_slice(&self) -> &[u8] {
         match self {
             Self::Heap(bytes) => bytes,
@@ -145,18 +157,20 @@ impl MarkdownEditSegment {
 }
 
 impl MarkdownEditSegments {
-    /// 按原累计预算追加标量对齐的UTF-8叶；旧快照共享的尾段保持不可变。
+    /// Appends scalar-aligned UTF-8 leaves under the cumulative session budget.
+    /// Tails shared by previous frozen readers remain immutable.
     pub(super) fn append(
         &mut self,
         text: &str,
         maximum_session_edit_bytes: usize,
     ) -> Result<Vec<Arc<MarkdownPieceTreeNode>>, MarkdownDocumentBufferError> {
         if text.is_empty() {
-            // 空插入没有新增字节，不分配段、文件或合成零长叶。
+            // Empty input adds no bytes and allocates no segment, file, or empty leaf.
             return Ok(Vec::new());
         }
         if text.len() > EDIT_SEGMENT_BYTES {
-            // 超过原单尾段的显式输入不再复制成整份堆库存；调用者的str不被保留。
+            // Input larger than one tail segment is frozen rather than copied into
+            // a document-sized heap inventory. The caller's string is not retained.
             let backing = self.freeze_input(text, maximum_session_edit_bytes)?;
             return self.append_frozen(backing, maximum_session_edit_bytes);
         }
@@ -164,17 +178,21 @@ impl MarkdownEditSegments {
         let mut leaves = Vec::with_capacity(text.len().div_ceil(ORIGINAL_PIECE_BYTES));
         let mut consumed = 0;
         while consumed < text.len() {
-            // 每轮消费一个完整标量小片；其字节只进入当前真实可写堆尾一次。
+            // Consume one scalar-aligned bounded piece per turn, copying its bytes
+            // into the actual writable tail only once.
             if self.segments.last().is_none_or(|segment| {
-                // 只有尚有空间的堆尾可追加；封存文件从来不重新取得写权限。
+                // Only a heap tail with space is appendable; a frozen file never
+                // regains write authority.
                 !matches!(segment.as_ref(), MarkdownEditSegment::Heap(bytes) if bytes.len() < EDIT_SEGMENT_BYTES)
             }) {
-                // 没有可写尾段才建立原64KiB堆段，已有不可变段编号保持不变。
+                // Allocate a 64-KiB segment only when no writable tail remains, keeping
+                // every existing immutable segment ID stable.
                 self.segments
                     .push(Arc::new(MarkdownEditSegment::Heap(Vec::with_capacity(EDIT_SEGMENT_BYTES))));
             }
             let segment_index = self.segments.len() - 1;
-            // 先只读取尾长，避免剩余空间不足一个标量时无意义地复制共享段。
+            // Inspect tail length first, avoiding a copy of shared storage when its
+            // remaining space cannot fit even the next complete scalar.
             let segment_start = self.segments[segment_index].len();
             let available = EDIT_SEGMENT_BYTES - segment_start;
             let requested = ORIGINAL_PIECE_BYTES
@@ -182,18 +200,21 @@ impl MarkdownEditSegments {
                 .min(text.len() - consumed);
             let mut chunk_end = consumed + requested;
             while !text.is_char_boundary(chunk_end) {
-                // 尾端回退到UTF-8标量边界；下一叶从完整标量开始。
+                // Retreat to a UTF-8 scalar boundary so the next leaf starts with a
+                // complete scalar.
                 chunk_end -= 1;
             }
             if chunk_end == consumed {
-                // 当前剩余空间容不下下个完整标量时放弃这点尾隙，新段保证输入继续前进。
+                // Abandon a tiny tail gap that cannot fit the next scalar. A fresh
+                // segment guarantees forward progress without splitting UTF-8.
                 self.segments
                     .push(Arc::new(MarkdownEditSegment::Heap(Vec::with_capacity(
                         EDIT_SEGMENT_BYTES,
                     ))));
                 continue;
             }
-            // 仅当前尾段会发生COW；历史根与冻结根继续按相同编号读取各自的原段。
+            // Only the current tail may copy-on-write. Historical and frozen roots
+            // retain their original segment bytes at the same stable IDs.
             let segment = Self::writable_segment(&mut self.segments[segment_index]);
             let chunk = &text.as_bytes()[consumed..chunk_end];
             segment.extend_from_slice(chunk);
@@ -215,7 +236,8 @@ impl MarkdownEditSegments {
         Ok(leaves)
     }
 
-    /// 显式长输入沿同一4KiB工厂封存；尚未进入段表，原事务可先接管实际释放票。
+    /// Freezes explicit long input through the same 4-KiB factory. Before installing
+    /// it in the segment table, the transaction can take its actual release receipt.
     pub(super) fn freeze_input(
         &self,
         text: &str,
@@ -226,10 +248,11 @@ impl MarkdownEditSegments {
             .map_err(edit_snapshot_error)?;
         let mut consumed = 0;
         while consumed < text.len() {
-            // 每次只交付一个完整UTF-8小片；匿名文件写失败前段表与预算仍未改变。
+            // Write complete bounded UTF-8 chunks only. A failed anonymous-file write
+            // leaves both the segment table and cumulative budget unchanged.
             let mut end = (consumed + ORIGINAL_PIECE_BYTES).min(text.len());
             while !text.is_char_boundary(end) {
-                end -= 1; // 最多回退一个多字节标量，不把不完整UTF-8写进候选。
+                end -= 1; // Retreat over at most one scalar; never write incomplete UTF-8 into the candidate.
             }
             output
                 .write_all(&text.as_bytes()[consumed..end])
@@ -243,7 +266,8 @@ impl MarkdownEditSegments {
         Ok(Arc::new(backing))
     }
 
-    /// 真实累计预算必须先于堆追加或匿名文件副作用；删除和保存不能补充会话库存。
+    /// Checks cumulative admission before heap appends or anonymous-file effects.
+    /// Deletion and saving never replenish the session append inventory.
     fn require_append_capacity(
         &self,
         bytes: usize,
@@ -259,7 +283,8 @@ impl MarkdownEditSegments {
         Ok(())
     }
 
-    /// 同一段表接管一个已封存的真实文件；全部有限叶读取成功后才发布描述符与累计预算。
+    /// Installs a real frozen file in the same segment table. Publish its descriptor
+    /// and cumulative byte count only after every bounded leaf read succeeds.
     pub(super) fn append_frozen(
         &mut self,
         backing: Arc<OriginalBacking>,
@@ -272,7 +297,8 @@ impl MarkdownEditSegments {
             .used_bytes
             .checked_add(backing.len())
             .filter(|used| {
-                // 与堆append共用原累计字节预算；删除、Undo或保存都不补充会话库存。
+                // Share heap append's cumulative budget; deletion, undo, and save do
+                // not replenish session storage admission.
                 *used <= maximum_session_edit_bytes
             })
             .ok_or(MarkdownDocumentBufferError::EditBufferLimitExceeded)?;
@@ -280,7 +306,8 @@ impl MarkdownEditSegments {
         let mut leaves = Vec::with_capacity(backing.len().div_ceil(ORIGINAL_PIECE_BYTES));
         let mut offset = 0;
         while offset < backing.len() {
-            // 固定请求可能结束在标量内部；只把前面的完整UTF-8前缀建成同一个普通piece。
+            // A fixed lease may end inside a scalar. Build the ordinary piece from
+            // its complete UTF-8 prefix only.
             let lease = backing
                 .lease(offset..(offset + ORIGINAL_PIECE_BYTES).min(backing.len()))
                 .map_err(|error| edit_read_error(error.into(), false))?;
@@ -295,10 +322,11 @@ impl MarkdownEditSegments {
             let measured = text.map(|text| (text.len(), MarkdownDocumentMetrics::from_text(text)));
             lease
                 .finish()
-                .map_err(|error| edit_read_error(error.into(), false))?; // 真实回收失败压过正文验证；候选描述符尚未进入文档。
+                .map_err(|error| edit_read_error(error.into(), false))?; // Real reclamation failure takes precedence; this candidate is not installed yet.
             let (length, metrics) = measured?;
             if length == 0 {
-                // 输出工厂接受任意字节；不完整或非法UTF-8不能制造零长叶或无限重试。
+                // The output factory accepts bytes. Incomplete or invalid UTF-8 must
+                // fail rather than create an empty leaf or retry forever.
                 return Err(MarkdownDocumentBufferError::InvalidUtf8Document);
             }
             leaves.push(Arc::new(MarkdownPieceTreeNode::Leaf(MarkdownPiece {
@@ -318,15 +346,17 @@ impl MarkdownEditSegments {
         Ok(leaves)
     }
 
-    /// 原始映射之后再核所有会话封存段；元数据路径也不能复活已失败的编辑源。
+    /// Checks published frozen edit segments after the original mapping. Metadata
+    /// reads cannot revive an edited source whose real storage has failed.
     pub(super) fn health(&self) -> Result<(), MarkdownDocumentBufferError> {
         for segment in &self.segments[..self.published_segments] {
-            segment.health()?; // 单个真实文件失败即中止，不以其他可读段替代原输入。
+            segment.health()?; // One real file failure stops reads; readable neighbors cannot replace it.
         }
         Ok(())
     }
 
-    /// 候选仍归原事务；真实文件错误拒绝本次输入，不把尚未发布的资源归入旧Source首因。
+    /// Pending files still belong to their preparing transaction. Their failure
+    /// rejects this input without poisoning an unchanged canonical source.
     pub(super) fn pending_health(&self) -> Result<(), MarkdownDocumentBufferError> {
         for segment in &self.segments[self.published_segments..] {
             segment
@@ -336,12 +366,14 @@ impl MarkdownEditSegments {
         Ok(())
     }
 
-    /// 原root发布点只移交段的Source归属，不做I/O、分配或可失败验证。
+    /// Transfers segment source ownership at root publication without I/O,
+    /// allocation, or fallible validation.
     pub(super) fn publish(&mut self) {
         self.published_segments = self.segments.len();
     }
 
-    /// 同一段表决定其当前归属；外部不传公开编号来给候选补签Source身份。
+    /// The segment table determines publication ownership itself. External numeric
+    /// IDs cannot retroactively authorize a candidate as canonical source storage.
     pub(super) fn read(
         &self,
         index: usize,
@@ -359,20 +391,23 @@ impl MarkdownEditSegments {
         self.segments.iter().map(|segment| segment.capacity()).sum()
     }
 
-    /// Arc复制Vec时只保留有效字节；补足原固定段容量，避免COW后每个小输入重复扩容。
+    /// `Arc::make_mut` copies a shared heap segment's live bytes on write. Restore
+    /// fixed tail capacity so later small inputs do not repeatedly grow that copy.
     pub(super) fn writable_segment(segment: &mut Arc<MarkdownEditSegment>) -> &mut Vec<u8> {
         let MarkdownEditSegment::Heap(writable) = Arc::make_mut(segment) else {
             unreachable!("封存段不能进入可写堆尾路径");
         };
         if writable.capacity() < EDIT_SEGMENT_BYTES {
-            // 新分配仍仅限原64KiB段；累计append预算与段编号不因快照发生变化。
+            // Capacity remains bounded to the original 64-KiB segment. Frozen readers
+            // change neither cumulative append admission nor stable segment IDs.
             writable.reserve_exact(EDIT_SEGMENT_BYTES - writable.len());
         }
         writable
     }
 }
 
-/// 匿名输出的真实系统错误保持errno；工厂的取消/extent错误不能被解释成一次成功append。
+/// Preserves real anonymous-output errno. Cancellation or extent failure cannot
+/// be interpreted as a successful append.
 pub(super) fn edit_snapshot_error(error: SnapshotError) -> MarkdownDocumentBufferError {
     match error {
         SnapshotError::Storage(error) => MarkdownDocumentBufferError::EditStorageUnavailable(
@@ -385,7 +420,8 @@ pub(super) fn edit_snapshot_error(error: SnapshotError) -> MarkdownDocumentBuffe
     }
 }
 
-/// 只有实际发布过的映射才能撤销原Source；准备期间同一系统错误属于本次候选存储失败。
+/// Only published mappings can revoke canonical-source health. During prepare,
+/// the same system error belongs to this candidate's storage failure.
 pub(super) fn edit_read_error(
     error: MarkdownDocumentBufferError,
     published: bool,
@@ -394,11 +430,12 @@ pub(super) fn edit_read_error(
         MarkdownDocumentBufferError::OriginalBackingUnavailable(errno) if !published => {
             MarkdownDocumentBufferError::EditStorageUnavailable(errno)
         }
-        other => other, // 范围与lease限额仍保原具体错误，不伪装成存储成功或默认空值。
+        other => other, // Keep specific range/lease-limit failures; never substitute success or empty text.
     }
 }
 
-/// 树只请求有限叶；回调结果须在归还原pin、完成必要页驱逐并核源健康后才能发布。
+/// Trees request bounded leaves only. Return the original pin, complete required
+/// reclamation, and verify source health before publishing visitor output.
 pub(super) trait PieceByteSource {
     fn source_health(&self) -> Result<(), MarkdownDocumentBufferError>;
 
@@ -407,7 +444,8 @@ pub(super) trait PieceByteSource {
         piece: &MarkdownPiece,
     ) -> Result<PieceBytes<'_>, MarkdownDocumentBufferError>;
 
-    /// 借用原叶内的实际字节范围；Word量子不能以只检查一字节掩盖整叶lease请求。
+    /// Borrows an actual range within the original leaf. A word quantum cannot
+    /// charge one byte while secretly leasing an entire leaf.
     #[cfg(feature = "paged-shaping-frontier")]
     fn piece_range_bytes(
         &self,
@@ -422,13 +460,15 @@ pub(super) trait PieceByteSource {
     ) -> Result<R, MarkdownDocumentBufferError> {
         let bytes = self.piece_bytes(piece)?;
         let result = visit(&bytes);
-        // 先交还原pin并完成本次必要驱逐，再传播回调错误；sentinel不能遮住真实I/O失败。
+        // Return pins and complete required cleanup before propagating visitor
+        // errors. A sentinel result must not hide an actual I/O failure.
         bytes.finish()?;
         result
     }
 }
 
-/// 编辑段只借原Arc字节；原文件片段另持真实回收lease，不允许裸slice越过lease寿命。
+/// Heap edits borrow their original `Arc` bytes; mapped pieces carry real
+/// reclamation leases. No raw slice may outlive its lease authority.
 pub(super) enum PieceBytes<'a> {
     Original(crate::original_backing::OriginalReadLease<'a>),
     MappedEdit(crate::original_backing::OriginalReadLease<'a>, bool),
@@ -452,7 +492,7 @@ impl PieceBytes<'_> {
             Self::MappedEdit(lease, published) => lease
                 .finish()
                 .map_err(|error| edit_read_error(error.into(), published)),
-            // 编辑段没有文件驻留页；生命周期仍由调用方持有的Arc控制。
+            // Heap edits own no resident file pages; the caller's `Arc` controls lifetime.
             Self::Edited(_) => Ok(()),
         }
     }
@@ -474,7 +514,8 @@ pub(super) struct MarkdownPiece {
     pub(super) metrics: MarkdownDocumentMetrics,
 }
 
-/// 一个字节保存完整字符域与 ASCII 字母存在性；空文本采用可打印且无字母的合并单位元。
+/// One byte records complete character-domain and ASCII-letter facts. Empty
+/// input is the printable, letterless identity for aggregate joins.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum PrintableAsciiClass {
@@ -489,37 +530,43 @@ impl PrintableAsciiClass {
     }
     pub(super) fn has_letters(self) -> Option<bool> {
         match self {
-            Self::NonPrintable => None, // 混合 Unicode/控制符不授予脚本快路，不能只报告是否曾见字母。
+            Self::NonPrintable => None, // Mixed Unicode/controls grant no script fast path, even if letters occurred.
             Self::WithoutLetters => Some(false),
             Self::WithLetters => Some(true),
         }
     }
     fn scalar(scalar: char) -> Self {
         if !(' '..='~').contains(&scalar) {
-            // 任一控制符或 Unicode 立即撤销整个聚合的可打印域权限。
+            // Any control or non-ASCII scalar revokes printable-ASCII authority for
+            // the complete aggregate.
             Self::NonPrintable
         } else if scalar.is_ascii_alphabetic() {
-            // Latin 事实仅由真实 ASCII 字母授予；数字和标点不能代替。
+            // Only an actual ASCII letter grants the Latin fact; digits and
+            // punctuation cannot substitute for it.
             Self::WithLetters
         } else {
-            // 可打印数字、空格和标点保持 Common 候选，等待其它子树的字母事实。
+            // Printable digits, spaces, and punctuation remain Common candidates
+            // until another subtree contributes an actual letter.
             Self::WithoutLetters
         }
     }
     fn joined(self, other: Self) -> Self {
         match (self, other) {
-            // 非可打印事实具有吸收性，不能因另一侧有字母而恢复快路权限。
+            // Nonprintable facts absorb the join; letters on the other side cannot
+            // restore fast-path authority.
             (Self::NonPrintable, _) | (_, Self::NonPrintable) => Self::NonPrintable,
-            // 两侧均已属于可打印域时，任一真实字母使合并结果具有 Latin 事实。
+            // Once both sides are printable, either side's actual letter grants
+            // the joined Latin fact.
             (Self::WithLetters, _) | (_, Self::WithLetters) => Self::WithLetters,
-            // 空文本和纯数字/标点共同组成无字母的合并单位元。
+            // Empty text and printable digits/punctuation form the letterless identity.
             _ => Self::WithoutLetters,
-        } // 任一负面字符域保守传播；只有两侧可打印时才按 OR 合并字母存在性。
+        } // Propagate negative domain facts; OR letter presence only inside a printable domain.
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 结合跨片 CRLF、单词边界与精确字符域的可合并文本聚合。
+/// Joinable text aggregates preserving cross-piece CRLF, word boundaries,
+/// and exact character-domain facts.
 pub(super) struct MarkdownDocumentMetrics {
     pub(super) byte_len: usize,
     pub(super) utf16_len: usize,
@@ -528,9 +575,11 @@ pub(super) struct MarkdownDocumentMetrics {
     pub(super) starts_in_word: bool,
     pub(super) ends_in_word: bool,
     pub(super) line_breaks: usize,
-    // 文本检查的段落终止单元独立计数：CRLF为两个，PS也计入，NEL/LS不计入。
+    // Text-checking terminators are counted independently: CRLF has two units;
+    // paragraph separator counts, while NEL and line separator do not.
     pub(super) text_checking_terminators: usize,
-    // 以UTF-16 offset+1编码首尾终止符；None不占额外tag，也不建立每叶字符索引。
+    // UTF-16 offset-plus-one encodes first/last terminators. `None` needs no
+    // extra tag, and no per-leaf character index is allocated.
     pub(super) first_text_checking_terminator: Option<NonZeroUsize>,
     pub(super) last_text_checking_terminator: Option<NonZeroUsize>,
     pub(super) starts_with_line_feed: bool,
@@ -539,15 +588,18 @@ pub(super) struct MarkdownDocumentMetrics {
     pub(super) contains_crlf: bool,
     /// A raw '<' anywhere can introduce an inherited HTML block outside a local cue envelope.
     pub(super) contains_ascii_less_than: bool,
-    /// 复用一个字节区分非可打印、可打印无字母、可打印含字母；不增加每个树节点的尺寸。
+    /// Reuses one byte for nonprintable, printable-letterless, and printable-with-
+    /// letters states without growing every tree node.
     pub(super) all_printable_ascii: PrintableAsciiClass,
-    // 仅附记真实Unicode属性集合；不包含Bidi/分项支持策略或任何Source读取权限。
+    // Records actual Unicode properties only, not bidi/run support policy or
+    // authority to read source bytes.
     pub(super) unicode_properties: MarkdownUnicodeProperties,
 }
 
 impl Default for MarkdownDocumentMetrics {
     fn default() -> Self {
-        // 空文本不包含风险字符，但满足“所有字符均可打印ASCII”；不能沿用bool默认false。
+        // Empty input has no risky character and vacuously satisfies the printable
+        // ASCII domain; a default false flag would break aggregate identity.
         Self {
             byte_len: 0,
             utf16_len: 0,
@@ -586,7 +638,8 @@ impl MarkdownDocumentMetrics {
         };
         let mut previous_was_carriage_return = false;
         for character in text.chars() {
-            // 原4KiB建叶遍历同时收集通用属性；后继布局不为确认未读后缀再次顺扫正文。
+            // Collect properties in the same bounded leaf pass, so later layout does
+            // not rescan an unread suffix merely to establish its domain.
             metrics.unicode_properties.observe(character);
             // Visit each Unicode scalar once; only the previous CR and word state cross iterations.
             // Normalize a CRLF pair to one visible character, including across piece joins below.
@@ -601,18 +654,22 @@ impl MarkdownDocumentMetrics {
                 metrics.word_count += 1;
             }
             metrics.ends_in_word = in_word;
-            // 复用原标量遍历；C0、DEL及全部非ASCII均使聚合为false，不再补扫正文。
+            // Reuse this scalar pass. C0, DEL, and every non-ASCII scalar revoke the
+            // domain without an additional text scan.
             metrics.all_printable_ascii = metrics
                 .all_printable_ascii
                 .joined(PrintableAsciiClass::scalar(character));
             if matches!(character, '\r' | '\n' | '\u{2029}') {
-                // 同一已有标量遍历取得段落端点，不为新查询再次扫描原始正文。
-                // 记录发生在长度累加前，因此低代理项等请求坐标不影响终止符自身的位置。
+                // Capture paragraph endpoints in this existing scalar pass instead of
+                // scanning original text again for each later query.
+                // Record before advancing length, so an interior-surrogate query cannot
+                // redefine the terminator's own UTF-16 position.
                 let offset = NonZeroUsize::new(metrics.utf16_len + 1)
                     .expect("a UTF-16 terminator offset plus one is nonzero");
                 metrics.text_checking_terminators += 1;
                 if metrics.first_text_checking_terminator.is_none() {
-                    // 首个终止符只记录一次；后续终止符只更新尾端点与原始单元数。
+                    // Capture the first terminator once; later ones update only the final
+                    // endpoint and raw terminator-unit count.
                     metrics.first_text_checking_terminator = Some(offset);
                 }
                 metrics.last_text_checking_terminator = Some(offset);
@@ -664,15 +721,18 @@ impl MarkdownDocumentMetrics {
                 - usize::from(left.ends_in_word && right.starts_in_word),
             starts_in_word: left.starts_in_word,
             ends_in_word: right.ends_in_word,
-            // 只有两侧都满足才可为未读正文签同一精确字符域，不能以byte_len==utf16_len代替。
+            // Both sides must prove the exact domain. Equal byte/UTF-16 lengths
+            // cannot authorize the same fast path for unread text.
             all_printable_ascii: left.all_printable_ascii.joined(right.all_printable_ascii),
             unicode_properties: left.unicode_properties.joined(right.unicode_properties),
             line_breaks: left.line_breaks + right.line_breaks - usize::from(boundary_is_crlf),
-            // 该查询必须区分CR与紧随的LF，不继承物理行计数的跨叶CRLF合并。
+            // This query distinguishes CR from a following LF; it does not inherit
+            // physical line counting's cross-leaf CRLF merge.
             text_checking_terminators: left.text_checking_terminators
                 + right.text_checking_terminators,
             first_text_checking_terminator: left.first_text_checking_terminator.or_else(|| {
-                // 右端点相对右子树；移到合并坐标时只加左侧UTF-16长度，保留offset+1编码。
+                // Shift the right endpoint by left UTF-16 length only, preserving its
+                // offset-plus-one encoding in the joined coordinate space.
                 right.first_text_checking_terminator.map(|offset| {
                     NonZeroUsize::new(left.utf16_len + offset.get())
                         .expect("a shifted terminator offset remains nonzero")
@@ -681,7 +741,8 @@ impl MarkdownDocumentMetrics {
             last_text_checking_terminator: right
                 .last_text_checking_terminator
                 .map(|offset| {
-                    // 右侧存在终止符时它必为合并尾端点；否则直接保留左侧原坐标。
+                    // A right-side terminator is necessarily the joined final endpoint;
+                    // otherwise retain the left endpoint in its original coordinates.
                     NonZeroUsize::new(left.utf16_len + offset.get())
                         .expect("a shifted terminator offset remains nonzero")
                 })
@@ -704,7 +765,8 @@ pub(super) type PieceTreeLink = Option<Arc<MarkdownPieceTreeNode>>;
 /// Persistent AVL node; Arc ownership lets history share unchanged immutable subtrees.
 pub(super) enum MarkdownPieceTreeNode {
     Leaf(MarkdownPiece),
-    /// 物理原始叶共享有限小目录；读者仍只能取得其中一个≤4KiB逻辑片。
+    /// Grouped physical leaves share a small directory; readers still borrow
+    /// only one logical piece up to 4 KiB at a time.
     OriginalSpan(OriginalSpan),
     Branch {
         left: Arc<MarkdownPieceTreeNode>,
@@ -720,7 +782,8 @@ impl MarkdownPieceTreeNode {
         match self {
             // A leaf owns the metrics of its immutable byte slice.
             Self::Leaf(piece) => piece.metrics,
-            // 合组叶保留原joined计量，调用方不必展开目录才能读取全文聚合。
+            // Grouped leaves retain joined metrics; whole-tree aggregates require
+            // no expansion of their directory.
             Self::OriginalSpan(span) => span.metrics,
             // A branch stores the already-reconciled aggregate of its children.
             Self::Branch { metrics, .. } => *metrics,
@@ -732,7 +795,8 @@ impl MarkdownPieceTreeNode {
         match self {
             // A leaf is the nonempty tree height base case.
             Self::Leaf(_) => 1,
-            // 小目录是一个真实物理叶，内部4KiB记录不增加AVL层级。
+            // The small directory is one physical leaf; internal 4-KiB records add
+            // no AVL levels.
             Self::OriginalSpan(_) => 1,
             // A branch carries its height so balancing never walks the whole subtree.
             Self::Branch { height, .. } => *height,
@@ -747,8 +811,10 @@ pub(super) struct OriginalTreeBuild {
     pub(super) checkpoints: MarkdownBlockCheckpointIndex,
 }
 
-/// 初开在同一不可变映射上逐4KiB借用，UTF-8尾标量留在原映射供下一片读取。
-/// 每个有限片在hash、metrics与checkpoint事实消费后真实回收，不形成完整str或正文副本。
+/// Initial open leases the same immutable mapping in 4-KiB chunks. A partial
+/// trailing UTF-8 scalar remains in backing for the following chunk.
+/// Each bounded chunk completes real lease cleanup after hashing, metrics, and
+/// checkpoint consumption, without a whole-document string or text copy.
 pub(super) fn build_original_backing_tree(
     backing: Option<&crate::original_backing::OriginalBacking>,
     range: Range<usize>,
@@ -771,7 +837,8 @@ pub(super) fn build_original_backing_tree(
         let consumed = backing.with_bytes(byte_start..end, |bytes| {
             let text = match std::str::from_utf8(bytes) {
                 Ok(text) => text,
-                // 唯一可续接的错误是块尾不完整标量；真实EOF或非法序列必须立即拒绝。
+                // Only an incomplete scalar at a nonfinal chunk boundary can continue.
+                // Actual EOF or an invalid byte sequence must fail immediately.
                 Err(error)
                     if error.error_len().is_none()
                         && end < range.end
@@ -1061,10 +1128,12 @@ pub(super) fn split_piece_tree(
             ))
         }),
         MarkdownPieceTreeNode::OriginalSpan(span) => {
-            // 分裂先定位真实小片；完整目录前缀不借入Source，也不扩大原Leaf的正文大小。
+            // Locate the real logical piece first. Complete directory prefixes
+            // require no source leases and do not enlarge the bounded leaf.
             let hit = span.locate_byte(byte_offset, true)?;
             if hit.local == hit.piece.byte_len {
-                // 小片边界只切共享目录范围，不读取正文或把完整Span降成普通大Leaf。
+                // A piece-boundary split only narrows directory ranges. It neither
+                // reads text nor turns the full span into one oversized leaf.
                 return Ok((
                     span.subrange(span.record_range().start..hit.ordinal + 1)?,
                     span.subrange(hit.ordinal + 1..span.record_range().end)?,
@@ -1072,7 +1141,8 @@ pub(super) fn split_piece_tree(
             }
             let before = span.subrange(span.record_range().start..hit.ordinal)?;
             let after = span.subrange(hit.ordinal + 1..span.record_range().end)?;
-            // 只有一个真实≤4KiB小片复用原Unicode分裂；前后完整小片继续共享同一目录。
+            // Split only one actual piece up to 4 KiB through the Unicode-aware
+            // path; complete pieces on either side keep their shared directory.
             let (left, right) = split_piece_tree(
                 document,
                 Some(Arc::new(MarkdownPieceTreeNode::Leaf(hit.piece))),
@@ -1125,7 +1195,8 @@ pub(super) fn markdown_piece_subrange(
     }
 }
 
-/// 通过缓存子树长度和至多一个叶扫描翻译UTF-16标量边界；字节来源不持有文档权限。
+/// Translates UTF-16 scalar boundaries using cached subtree lengths and at most
+/// one leaf scan. Byte providers hold no document-mutation authority.
 pub(super) fn byte_offset_for_utf16_in_tree(
     document: &impl PieceByteSource,
     root: Option<&MarkdownPieceTreeNode>,
@@ -1134,12 +1205,15 @@ pub(super) fn byte_offset_for_utf16_in_tree(
 ) -> Result<usize, MarkdownDocumentBufferError> {
     document.source_health()?;
     if utf16_offset == 0 {
-        // 同一子树的起点必是已验证UTF8边界。健康门仍先行，但不能为查询固定起点
-        // 再借首叶、验证整4KiB或触碰原映射页目录，扰动远端正在使用的有界窗口。
+        // The subtree start is already a verified UTF-8 boundary. Check health,
+        // but do not lease its first leaf merely to query that fixed position:
+        // revalidating 4 KiB would needlessly disturb the bounded page directory
+        // currently serving a distant viewport.
         return Ok(accumulated_bytes);
     }
     let Some(root) = root else {
-        // 空树的唯一起点已在上方处理；剩余正位置不可能属于空子树。
+        // The empty tree's only boundary was handled above. No positive position
+        // belongs to an absent subtree.
         return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
     };
     match root {
@@ -1169,7 +1243,8 @@ pub(super) fn byte_offset_for_utf16_in_tree(
             }
         }),
         MarkdownPieceTreeNode::OriginalSpan(span) => {
-            // 目录只给出命中小片及缓存前缀，标量边界判断仍复用原4KiB解码路径。
+            // Directory metadata selects one logical piece and cached prefix; scalar
+            // validation still follows the same bounded decoding path.
             let hit = span.locate_utf16(utf16_offset, true)?;
             let leaf = MarkdownPieceTreeNode::Leaf(hit.piece);
             byte_offset_for_utf16_in_tree(
@@ -1230,7 +1305,8 @@ pub(super) fn byte_offset_for_utf16_text(
     }
 }
 
-/// 翻译标量对齐的字节位置；活动文档与冻结值使用相同边界拒绝规则。
+/// Translates scalar-aligned byte positions. Live documents and frozen readers
+/// share exactly the same invalid-boundary rejection rules.
 pub(super) fn utf16_offset_for_byte_in_tree(
     document: &impl PieceByteSource,
     root: Option<&MarkdownPieceTreeNode>,
@@ -1259,7 +1335,8 @@ pub(super) fn utf16_offset_for_byte_in_tree(
             Ok(accumulated_utf16 + text[..byte_offset].encode_utf16().count())
         }),
         MarkdownPieceTreeNode::OriginalSpan(span) => {
-            // 字节到UTF16只解码命中小片；完整目录前缀不借入Source。
+            // Decode only the selected piece for byte-to-UTF-16 conversion; complete
+            // directory prefixes require no source lease.
             let hit = span.locate_byte(byte_offset, true)?;
             let leaf = MarkdownPieceTreeNode::Leaf(hit.piece);
             utf16_offset_for_byte_in_tree(
@@ -1292,7 +1369,8 @@ pub(super) fn utf16_offset_for_byte_in_tree(
     }
 }
 
-/// 读取单个UTF-16单元；NSString允许读取代理对的任意半边，不要求编辑边界。
+/// Reads one UTF-16 unit. NSString may read either surrogate half and does not
+/// require an edit-valid scalar boundary.
 pub(super) fn utf16_code_unit_in_tree(
     document: &impl PieceByteSource,
     root: Option<&MarkdownPieceTreeNode>,
@@ -1309,7 +1387,8 @@ pub(super) fn utf16_code_unit_in_tree(
                 .ok_or(MarkdownDocumentBufferError::RangeOutsideDocument)
         }),
         MarkdownPieceTreeNode::OriginalSpan(span) => {
-            // 原始单元必须真实包含在一片内，片尾与EOF不能借前一个字符冒充。
+            // The requested unit must lie in an actual piece. A piece end or EOF
+            // cannot masquerade as the preceding character.
             let hit = span.locate_utf16(utf16_offset, false)?;
             let leaf = MarkdownPieceTreeNode::Leaf(hit.piece);
             utf16_code_unit_in_tree(document, Some(&leaf), hit.local)
@@ -1331,7 +1410,8 @@ pub(super) fn utf16_code_unit_in_tree(
     }
 }
 
-/// 只将请求范围复制到调用方缓冲，剪除所有不相交子树，不建立完整UTF-16镜像。
+/// Copies the requested range into caller storage, pruning every disjoint
+/// subtree without creating a whole-document UTF-16 mirror.
 pub(super) fn copy_utf16_tree_range(
     document: &impl PieceByteSource,
     root: Option<&MarkdownPieceTreeNode>,
@@ -1376,7 +1456,8 @@ pub(super) fn copy_utf16_tree_range(
             Ok(())
         }),
         MarkdownPieceTreeNode::OriginalSpan(span) => {
-            // 只沿有限目录按序提交相交小片；递归入口先剪枝，再借用至多4KiB正文。
+            // Visit intersecting bounded pieces in directory order. Recursive calls
+            // prune disjoint ranges before leasing at most 4 KiB of text.
             let mut base = accumulated_utf16;
             for ordinal in span.record_range() {
                 let piece = span.piece(ordinal)?;
@@ -1461,7 +1542,8 @@ pub(super) fn find_line_break_end(
             Err(MarkdownDocumentBufferError::RangeOutsideDocument)
         }),
         MarkdownPieceTreeNode::OriginalSpan(span) => {
-            // 小片计量确定唯一命中的逻辑换行；跨小片CRLF需要返回LF之后的真实端点。
+            // Piece aggregates select one logical break. A cross-piece CRLF must
+            // return the actual endpoint after LF.
             let mut prefix = MarkdownDocumentMetrics::default();
             for ordinal in span.record_range() {
                 let piece = span.piece(ordinal)?;
@@ -1477,7 +1559,7 @@ pub(super) fn find_line_break_end(
                         && span.piece(ordinal + 1)?.metrics.starts_with_line_feed
                     {
                         return Ok(accumulated_bytes + prefix.byte_len + piece.byte_len + 1);
-                    } // CRLF可跨目录小片，仍只有一个逻辑换行且端点在LF之后。
+                    } // Cross-piece CRLF is one logical break ending after LF.
                     return find_line_break_end(
                         document,
                         &MarkdownPieceTreeNode::Leaf(piece),
@@ -1570,7 +1652,8 @@ pub(super) fn metrics_for_tree_prefix(
             Ok(MarkdownDocumentMetrics::from_text(&text[..byte_count]))
         }),
         MarkdownPieceTreeNode::OriginalSpan(span) => {
-            // 完整小片使用缓存，只有末端部分仍交原叶函数检查Unicode并计算计量。
+            // Complete pieces use cached metrics. Only the partial tail enters the
+            // ordinary leaf path for Unicode validation and measurement.
             let hit = span.locate_byte(byte_count, true)?;
             let leaf = MarkdownPieceTreeNode::Leaf(hit.piece);
             let tail = metrics_for_tree_prefix(document, Some(&leaf), hit.local)?;
@@ -1597,7 +1680,8 @@ pub(super) fn metrics_for_tree_prefix(
     }
 }
 
-/// 按正文顺序借用请求范围内的原有有限叶；每次回调都不超过该叶的字节边界。
+/// Borrows bounded pieces in text order inside the requested range. Every
+/// visitor remains within the actual byte bounds of its one logical leaf.
 pub(super) fn visit_piece_tree_range(
     document: &impl PieceByteSource,
     root: Option<&MarkdownPieceTreeNode>,
@@ -1624,7 +1708,8 @@ pub(super) fn visit_piece_tree_range(
             visit(&bytes[local_start..local_end])
         }),
         MarkdownPieceTreeNode::OriginalSpan(span) => {
-            // Span不成为大正文切片；每个实际回调仍由一个真实4KiB逻辑片产生。
+            // A span never becomes one oversized text slice; each actual callback
+            // still comes from a real bounded logical piece.
             let mut base = accumulated_bytes;
             for ordinal in span.record_range() {
                 let piece = span.piece(ordinal)?;
@@ -1670,12 +1755,14 @@ pub(super) fn write_piece_tree(
         // Write an immutable backing slice directly; I/O failure aborts the caller's save transaction.
         MarkdownPieceTreeNode::Leaf(piece) => document.with_piece_bytes(piece, |bytes| {
             destination.write_all(bytes).map_err(|_| {
-                // 写入失败保留原模型；真实映射回收在传播此错误前完成。
+                // Writer failure preserves the source model; actual lease cleanup
+                // completes before this error propagates.
                 MarkdownDocumentBufferError::WriteUnavailable
             })
         }),
         MarkdownPieceTreeNode::OriginalSpan(span) => {
-            // 保存仍逐4KiB原片直接写入；任一写入或lease回收失败即停止，不改保存事务语义。
+            // Save writes original bounded pieces directly. Stop on the first write
+            // or lease-cleanup failure, preserving save-transaction semantics.
             for ordinal in span.record_range() {
                 write_piece_tree(
                     document,
@@ -1701,7 +1788,7 @@ pub(super) fn hash_piece_tree(
 ) -> Result<(), MarkdownDocumentBufferError> {
     document.source_health()?;
     let Some(root) = root else {
-        // 空树不读取正文，仍是SHA-256的真实空输入。
+        // An empty tree reads no text and is still the real empty SHA-256 input.
         return Ok(());
     };
     match root {
@@ -1711,7 +1798,8 @@ pub(super) fn hash_piece_tree(
             Ok(())
         }),
         MarkdownPieceTreeNode::OriginalSpan(span) => {
-            // 摘要按原源字节序消费有限片；压缩元数据与树形不会进入文档revision。
+            // Hash bounded pieces in original byte order. Compressed metadata and
+            // tree shape never enter the document revision.
             for ordinal in span.record_range() {
                 hash_piece_tree(
                     document,

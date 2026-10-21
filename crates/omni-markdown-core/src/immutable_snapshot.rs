@@ -54,7 +54,8 @@ pub(crate) fn snapshot_file(
     snapshot_file_inner(source, expected_bytes, &is_current, true, None)
 }
 
-/// 仅字体Blob可消费的冻结只读文件票据；没有借用、克隆或写入File的安全入口。
+/// Frozen read-only file receipt consumed only by a font blob. No safe API
+/// borrows, clones, or writes its private file.
 #[cfg(feature = "paged-shaping")]
 pub(crate) struct FrozenFontFile {
     file: File,
@@ -65,21 +66,23 @@ impl FrozenFontFile {
     pub(crate) fn len(&self) -> usize {
         self.bytes
     }
-    /// 将唯一descriptor的关闭义务移交字体专用VM owner；不保留第二个可写句柄。
+    /// Transfers the sole descriptor-close obligation to the font VM owner,
+    /// retaining no second writable handle.
     pub(crate) fn into_raw_fd(self) -> std::os::fd::RawFd {
         use std::os::fd::IntoRawFd;
         self.file.into_raw_fd()
     }
 }
 
-/// 复用独立匿名inode获取策略，但不先创建Mmap，避免字体再包一层时产生第二个映射。
+/// Reuses private anonymous-inode acquisition without first creating an `Mmap`,
+/// so the font owner does not acquire a second redundant mapping.
 #[cfg(feature = "paged-shaping")]
 pub(crate) fn snapshot_font_file(
     source: &File,
     expected_bytes: u64,
 ) -> Result<Option<FrozenFontFile>, SnapshotError> {
     if expected_bytes == 0 {
-        return Ok(None); // FontBytes的公开捕获入口另以EmptyFile拒绝，不映射零extent。
+        return Ok(None); // The public FontBytes entry rejects EmptyFile; never map a zero extent.
     }
     let bytes = usize::try_from(expected_bytes)
         .ok()
@@ -87,11 +90,13 @@ pub(crate) fn snapshot_font_file(
         .ok_or_else(|| SnapshotError::Storage(io::Error::from(io::ErrorKind::InvalidInput)))?;
     let mut directory = SnapshotDirectory::new()?;
     let file = directory.acquire_with_strategy(source, expected_bytes, &|| true, true)?;
-    // factory已经核实独立无名regular inode和完整extent，所有fallback写者都已结束。
+    // The factory verified a private unnamed regular inode and its complete
+    // extent; every fallback-copy writer has ended.
     Ok(file.map(|file| FrozenFontFile { file, bytes }))
 }
 
-/// canonical捕获直接采用受控只读映射，不先暴露或扫描旧Mmap的完整slice。
+/// Acquires canonical backing for controlled read leases, without
+/// exposing or scanning an intermediate whole-document `Mmap` slice.
 #[cfg(feature = "native-markdown-candidate")]
 pub(crate) fn snapshot_canonical(
     source: &File,
@@ -100,7 +105,8 @@ pub(crate) fn snapshot_canonical(
 ) -> Result<Option<crate::original_backing::OriginalBacking>, SnapshotError> {
     ensure_current(&is_current)?;
     if expected_bytes == 0 {
-        // 空source没有正文资源，不为它建立短暂目录或descriptor。
+        // Empty input owns no text resource and needs no temporary directory or
+        // descriptor merely to represent absence.
         return Ok(None);
     }
 
@@ -108,7 +114,8 @@ pub(crate) fn snapshot_canonical(
     directory.capture_backing(source, expected_bytes, &is_current)
 }
 
-/// 流式变换的独占匿名输出；只持文件与长度，不缓存正文或泄露可写句柄。
+/// Exclusive anonymous output for streaming transformations. Owns a file and
+/// length only, without caching text or exposing a writable handle.
 #[cfg(feature = "native-markdown-candidate")]
 pub(crate) struct CanonicalSnapshotOutput {
     file: File,
@@ -117,15 +124,18 @@ pub(crate) struct CanonicalSnapshotOutput {
 
 #[cfg(feature = "native-markdown-candidate")]
 impl CanonicalSnapshotOutput {
-    /// 新建已经 unlink 的独立 inode；取消或失败时由唯一 File 直接释放。
+    /// Creates an already unlinked private inode. Its sole `File` releases storage
+    /// directly when preparation fails or is cancelled.
     pub(crate) fn new() -> Result<Self, SnapshotError> {
         let file = tempfile::tempfile().map_err(SnapshotError::Storage)?;
         Ok(Self { file, bytes: 0 })
     }
 
-    /// 顺序写入调用方的有限块；计量只在整块写入成功后前进。
+    /// Sequentially writes a caller-bounded chunk; the completed-byte measure
+    /// advances only after the entire chunk is written.
     pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
-        // 候选最终必须可由本进程寻址；溢出在实际写入前拒绝，不产生不可表示的 extent。
+        // The final candidate must be addressable in this process. Reject overflow
+        // before writing rather than creating an unrepresentable extent.
         let next = self
             .bytes
             .checked_add(bytes.len())
@@ -141,15 +151,18 @@ impl CanonicalSnapshotOutput {
         Ok(())
     }
 
-    /// 返回已完整写入的字节数；不读取文件正文或创建长度相同的内存副本。
+    /// Returns completely written bytes without reading text or allocating an
+    /// equally sized memory copy.
     pub(crate) fn len(&self) -> usize {
         self.bytes
     }
 
-    /// 仅截去输出尾部并把下一次写入定位到新末尾，供全局 trim 丢弃尾随空白。
+    /// Removes only an output tail and positions the next write at its new end;
+    /// global trimming uses this to discard trailing whitespace.
     pub(crate) fn truncate(&mut self, bytes: usize) -> Result<(), SnapshotError> {
         if bytes > self.bytes {
-            // 此操作不能以稀疏扩展补出未写正文，错误不改变文件与当前计量。
+            // Truncation cannot invent unwritten text by sparse extension. Reject
+            // before changing either the file or completed-byte measure.
             return Err(SnapshotError::Storage(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "匿名输出截尾位置超出已写范围",
@@ -161,50 +174,62 @@ impl CanonicalSnapshotOutput {
         self.file
             .seek(SeekFrom::Start(bytes as u64))
             .map_err(SnapshotError::Storage)?;
-        // 若真实截尾或定位失败，调用方丢弃候选；只有两步成功才发布新的顺序写入计量。
+        // Failure of truncate or seek makes the caller discard this candidate.
+        // Publish the new sequential-write measure only after both succeed.
         self.bytes = bytes;
         Ok(())
     }
 
-    /// 消费唯一写者，沿既有有界映射 owner 封存；成功后没有可写 File 留在调用方。
+    /// Consumes the sole writer and freezes it through the bounded mapping owner.
+    /// No writable file remains with the caller after success.
     pub(crate) fn freeze(
         self,
     ) -> Result<Option<crate::original_backing::OriginalBacking>, SnapshotError> {
         let Self { file, bytes } = self;
         let metadata = file.metadata().map_err(SnapshotError::Storage)?;
         if !metadata.is_file() || metadata.nlink() != 0 {
-            // 只对独立匿名 regular inode 授予不变字节权限，不映射可经路径改写的文件。
+            // Immutable-byte authority requires a private unnamed regular inode. A
+            // named file that another process can rewrite must never back a Rust slice.
             return Err(SnapshotError::Storage(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "匿名输出必须是无文件名的普通文件",
             )));
         }
         if metadata.len() != bytes as u64 {
-            // 不接受失败写入留下的额外尾部或任何不符合完成计量的实际 extent。
+            // Reject extra bytes left by a failed write and every extent differing
+            // from the completed-write measure.
             return Err(SnapshotError::SourceChanged);
         }
         if bytes == 0 {
-            // 空输出实际关闭唯一 descriptor，不创建零长映射或虚构映射释放收据。
+            // Empty output closes its actual sole descriptor. It creates neither a
+            // zero-length mapping nor an invented mapping-release receipt.
             use std::os::fd::IntoRawFd;
             let descriptor = file.into_raw_fd();
-            // SAFETY: into_raw_fd 移交唯一 descriptor，关闭只执行一次，不遗留可写文件别名。
+            // SAFETY: `into_raw_fd` transfers the sole descriptor. Close it exactly
+            // once, leaving no writable file aliases.
             if unsafe { libc::close(descriptor) } != 0 {
-                // 此处没有映射 owner 代为报告关闭结果，不能由 File::drop 静默吞掉真实错误。
+                // No mapping owner exists to report this close result. Do not let
+                // `File::drop` silently hide an actual descriptor failure.
                 return Err(SnapshotError::Storage(io::Error::last_os_error()));
             }
             return Ok(None);
         }
-        // SAFETY: tempfile 创建独立且已 unlink 的 inode，私有 File 从未借出或克隆。
-        // 所有顺序写入和截尾均已结束，实际 regular/匿名/extent 刚完成核验；消费 self
-        // 后只把唯一 File 交给原映射 owner，由其在映射成功时立即关闭 descriptor。
+        // SAFETY: The temporary inode is private and already unlinked; its `File`
+        // has never been lent out or cloned.
+        // All writes and truncations ended, and regular-file, anonymity, and extent
+        // facts were just verified. Consuming this owner transfers its sole file
+        // to the bounded mapping owner, which closes the descriptor immediately
+        // after acquiring a mapping.
         unsafe { crate::original_backing::OriginalBacking::map(file, bytes) }
             .map(Some)
             .map_err(|error| {
-                // 映射及真实 descriptor 关闭错误保留原 errno，不退回堆正文或另建快照。
+                // Preserve mapping and descriptor-close errno. Never fall back to heap
+                // text or acquire another snapshot to disguise a failed resource action.
                 let errno = match error {
-                    // mmap、close 和系统页参数查询失败沿原 owner 的实际错误返回。
+                    // Propagate the original owner's mmap, close, or page-query failure.
                     crate::original_backing::OriginalBackingError::Unavailable(errno) => errno,
-                    // 工厂已排除零长和越界；其余 owner 准入错误仍作为非法映射输入失败。
+                    // The factory excludes empty/out-of-range input; any other owner
+                    // admission failure remains an invalid mapping request.
                     _ => libc::EINVAL,
                 };
                 SnapshotError::Storage(io::Error::from_raw_os_error(errno))
@@ -251,7 +276,8 @@ impl SnapshotDirectory {
         })
     }
 
-    /// 同一查询目录内取得受控映射；取消、clone、fallback和身份验证沿原factory。
+    /// Captures bounded backing in this query's private directory, using the same
+    /// factory for cancellation, clone/copy fallback, and identity validation.
     pub(crate) fn capture_backing(
         &mut self,
         source: &File,
@@ -260,7 +286,8 @@ impl SnapshotDirectory {
     ) -> Result<Option<crate::original_backing::OriginalBacking>, SnapshotError> {
         let Some(file) = self.acquire_with_strategy(source, expected_bytes, is_current, true)?
         else {
-            // 空源不分配映射；不能建立零地址slice或假VM清理收据。
+            // Empty input allocates no mapping, zero-address slice, or fabricated
+            // VM-release receipt.
             return Ok(None);
         };
         let length = usize::try_from(expected_bytes).map_err(|_| {
@@ -269,11 +296,13 @@ impl SnapshotDirectory {
                 "snapshot too large",
             ))
         })?;
-        // SAFETY: acquire_with_strategy已经核验独立、匿名、固定extent；所有fallback写者已结束且FD独占移交。
+        // SAFETY: Acquisition verified a private, unnamed, fixed extent and ended
+        // every fallback writer. The sole descriptor transfers to the mapping owner.
         unsafe { crate::original_backing::OriginalBacking::map(file, length) }
             .map(Some)
             .map_err(|error| {
-                // 此层仍保持旧factory错误类型；真实映射errno不改写为成功或稀疏fallback。
+                // Preserve this factory's error type and the real mapping errno; never
+                // convert failure into success or sparse fallback storage.
                 let errno = match error {
                     crate::original_backing::OriginalBackingError::Unavailable(errno) => errno,
                     _ => libc::EINVAL,
@@ -294,7 +323,8 @@ impl SnapshotDirectory {
         let Some(backing) =
             self.acquire_with_strategy(source, expected_bytes, is_current, allow_clone)?
         else {
-            // 空源没有匿名inode或映射；旧Vault/Font接口继续返回None。
+            // Empty input owns neither an anonymous inode nor a mapping; fixture
+            // callers observe absence rather than an invented resource.
             return Ok(None);
         };
         let length = usize::try_from(expected_bytes).map_err(|_| {
@@ -357,7 +387,8 @@ impl SnapshotDirectory {
             // A clone from a changed extent cannot satisfy the caller's observed source baseline.
             return Err(SnapshotError::SourceChanged);
         }
-        // 此处不读取正文；所有写者均已结束，调用方只获得此独立inode的独占descriptor。
+        // No text is read here. All writers have ended; the caller receives only
+        // the exclusive descriptor of this private inode.
         Ok(Some(backing))
     }
 }

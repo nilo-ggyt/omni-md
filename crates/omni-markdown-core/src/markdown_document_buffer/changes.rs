@@ -1,4 +1,5 @@
-//! 文本提交前的纯变化观察合同；原生通知仍使用独立TextKit包络，不能反过来代替真实变化。
+//! Pure change observation before text publication. Native notifications retain
+//! their separate TextKit envelope and cannot substitute for actual text changes.
 
 use std::convert::Infallible;
 use std::ops::Range;
@@ -9,14 +10,16 @@ use super::*;
 pub use change_journal::{MarkdownChangeJournalError, MarkdownChangeJournalIoFailure};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// 真实旧坐标的一项变化；调用顺序保留相邻replacement及同位置插入的独立边界。
+/// One change in real pre-edit coordinates. Emission order preserves separate
+/// boundaries for adjacent replacements and insertions at the same position.
 pub struct MarkdownTextChange {
     pub old_utf16_range: Range<usize>,
     pub inserted_utf16_len: usize,
 }
 
 #[derive(Debug)]
-/// 正文、日志和观察者错误保留独立typed原因；双失败保存首因而不产生递归derive约束。
+/// Retains typed document, journal, and observer failures. A rollback failure
+/// preserves the original cause without recursive derive requirements.
 pub enum MarkdownObservedEditError<E> {
     Document(MarkdownDocumentBufferError),
     Journal(MarkdownChangeJournalError),
@@ -42,7 +45,8 @@ impl<E: std::fmt::Display> std::fmt::Display for MarkdownObservedEditError<E> {
             Self::Document(error) => error.fmt(formatter),
             Self::Journal(error) => error.fmt(formatter),
             Self::Observer(error) => error.fmt(formatter),
-            // 同一已知impl递归展示首因，不要求Box<Self>:Display作为自身的额外where约束。
+            // This known implementation recursively displays the cause without
+            // requiring an additional recursive `Box<Self>: Display` bound.
             Self::RollbackUnconfirmed { cause, cleanup } => write!(formatter, "{cause}；{cleanup}"),
         }
     }
@@ -58,7 +62,8 @@ impl<E: std::error::Error + 'static> std::error::Error for MarkdownObservedEditE
     }
 }
 
-/// Undo/Redo在无历史时返回None；有历史则同时返回通知包络与观察结果，错误不移动任何票据。
+/// Undo/redo returns `None` for empty history. Otherwise it returns the native
+/// notification envelope with derived output; failure moves no history receipts.
 pub type MarkdownObservedHistoryResult<O> = Result<
     Option<(
         MarkdownHistoryTextEdit,
@@ -67,7 +72,8 @@ pub type MarkdownObservedHistoryResult<O> = Result<
     MarkdownObservedEditError<<O as MarkdownTextChangeObserver>::Error>,
 >;
 
-/// 空替换流没有通知包络，但观察者仍可完成纯候选校验；两者的缺省语义不能混淆。
+/// An empty replacement stream has no notification envelope, but its observer
+/// can still validate a pure candidate. These absent-result meanings differ.
 pub type MarkdownObservedReplacementsResult<O> = Result<
     (
         Option<MarkdownHistoryTextEdit>,
@@ -76,33 +82,40 @@ pub type MarkdownObservedReplacementsResult<O> = Result<
     MarkdownObservedEditError<<O as MarkdownTextChangeObserver>::Error>,
 >;
 
-/// 仅借候选root和已有canonical source，不是第二份文档、快照正文或可逃逸的原生对象。
+/// Borrows the candidate root and existing canonical source only. This is not
+/// another document, copied snapshot, or escaping native object.
 pub struct MarkdownPreparedText<'a> {
     pub(super) document: &'a MarkdownDocumentBuffer,
     pub(super) root: &'a PieceTreeLink,
 }
 
 impl MarkdownPreparedText<'_> {
-    /// 只读候选聚合长度，不访问映射正文或借用可变文档状态。
+    /// Reads candidate aggregate length without touching mapped bytes or borrowing
+    /// mutable document state.
     #[must_use]
     pub fn utf16_len(&self) -> usize {
         piece_tree_metrics(self.root).utf16_len
     }
 
-    /// 在实际候选树上校验scalar边界并定位行；fold header_line可在提交前一并准备。
+    /// Validates a scalar boundary in the actual candidate tree and locates its line,
+    /// allowing fold-header coordinates to be prepared before publication.
     ///
     /// # Errors
-    /// 越界或surrogate内部位置拒绝；不临时交换document.root，也不复制正文。
+    /// Rejects out-of-range and interior-surrogate positions. Validation neither
+    /// temporarily swaps the canonical root nor copies document text.
     pub fn line_for_utf16(&self, position: usize) -> Result<usize, MarkdownDocumentBufferError> {
         let byte = byte_offset_for_utf16_in_tree(self.document, self.root.as_deref(), position, 0)?;
         Ok(metrics_for_tree_prefix(self.document, self.root.as_deref(), byte)?.line_breaks)
     }
 }
 
-/// 回调只可执行纯Rust，不得调用Native、重入document或提前发布前台fold。
+/// Callbacks must remain pure Rust: no native calls, document reentry, or early
+/// publication of foreground folds.
 ///
-/// changed可流式准备至多256个fold；finish在完整输入/候选选区验证后执行并可以失败。
-/// Output须是拥有的结果，不能持有PreparedText借用。原owner/root/代次权限仍由Native调用方确认。
+/// `changed` can stream preparation for at most 256 folds. `finish` runs only
+/// after complete input and candidate-selection validation and may still fail.
+/// `Output` must own its values and cannot retain a `PreparedText` borrow. The
+/// native caller still verifies its original owner, root, and generation authority.
 pub trait MarkdownTextChangeObserver {
     type Output;
     type Error;
@@ -121,7 +134,7 @@ impl MarkdownTextChangeObserver for NoopObserver {
     type Error = Infallible;
 
     fn changed(&mut self, _: MarkdownTextChange) -> Result<(), Infallible> {
-        Ok(()) // 旧API也必须写真实journal；这里只省略外部派生结果。
+        Ok(()) // Unobserved callers still write the real journal; only derived output is omitted.
     }
     fn finish(
         self,
@@ -143,7 +156,8 @@ pub(super) fn emit<O: MarkdownTextChangeObserver>(
         .checked_sub(range.start)
         .ok_or(MarkdownDocumentBufferError::RangeOutsideDocument)?;
     if removed == 0 && inserted == 0 {
-        // CM标准ChangeSet过滤真正空段；不能凭delete user event为内部fold捏造一次删除。
+        // A true empty change has no ChangeSet segment. A delete user event cannot
+        // invent a deletion merely to update internal fold state.
         return Ok(());
     }
     observer

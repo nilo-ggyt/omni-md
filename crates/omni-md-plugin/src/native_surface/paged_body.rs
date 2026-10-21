@@ -1,7 +1,9 @@
-//! Source正文的正式分页owner，只消费同一canonical和有界视口管线。
+//! Production paginated body owner using the same canonical document and bounded viewport pipeline.
 //!
-//! 没有TextKit、整篇字符串或第二文档；原生预览grid等尚未迁移的能力仍明确拒绝，
-//! 不能把Source接入或局部绘图结果当作完整产品的功能与内存验收。
+//! Body and table-Cell preparation share the same source-aware pipeline, without TextKit, a
+//! whole-document string, or another document.
+//! A local frame or Source integration alone does not establish whole-product feature or memory
+//! acceptance.
 
 use std::{
     cell::{Cell, RefCell},
@@ -112,7 +114,8 @@ pub enum NativeMarkdownPagedBodyError {
 impl From<omni_markdown_core::markdown_document_buffer::MarkdownTableRequestError>
     for NativeMarkdownPagedBodyError
 {
-    /// 原Core错误是完整的typed事实而非std::error::Error；保留枚举供诊断，界面只显示上方中文。
+    /// The Core enum is a complete typed fact rather than std::error::Error; retain it for diagnostics
+    /// while UI uses the Chinese message above.
     fn from(
         error: omni_markdown_core::markdown_document_buffer::MarkdownTableRequestError,
     ) -> Self {
@@ -122,26 +125,31 @@ impl From<omni_markdown_core::markdown_document_buffer::MarkdownTableRequestErro
 
 type Result<T> = std::result::Result<T, NativeMarkdownPagedBodyError>;
 
-/// 装配只转交实际owner；两类输入共用下方唯一原生初始化图，不提供公开范围造Cell的入口。
+/// Assembly transfers actual owners into one Native initialization graph; a raw public range cannot
+/// construct a Cell.
 enum Attachment {
     Body(Rc<RefCell<MarkdownDocumentBuffer>>),
     Cell(Rc<NativeMarkdownPagedCellSession>),
 }
 
-/// 颜色由原界面样式调用方提供；候选不另造主题，也不改变正文和选区的颜色语义。
+/// The existing UI style supplies colors; this component creates no separate theme and preserves
+/// body/selection color semantics.
 #[derive(Clone, Copy)]
 pub struct NativeMarkdownPagedBodyColors {
     pub background: [f64; 4],
-    /// Source活动逻辑行的原界面底色；不在绘图阶段推导主题或调整正文颜色。
+    /// Original UI background for the active Source logical line; drawing neither infers a theme nor
+    /// changes text colors.
     pub active_line: [f64; 4],
     pub text: [f64; 4],
     pub selection: [f64; 4],
     pub caret: [f64; 4],
 }
 
-/// 全部字段均为有限配置；字号取实际 CTFont，不另按名字重建系统字体。
+/// All fields are finite configuration; point size comes from the actual CTFont without reconstructing
+/// a named system font.
 pub struct NativeMarkdownPagedBodyConfiguration {
-    /// Source保持字面路径；InlinePreview候选消费已认证RootLeaf字体及显隐/下划线，不代表GeneralInline完整预览。
+    /// Source preserves literal text; InlinePreview consumes certified RootLeaf font, visibility, and
+    /// underline facts without claiming complete GeneralInline support.
     pub presentation_mode: omni_markdown_core::MarkdownPresentationMode,
     pub epoch: u64,
     pub maximum_font_bytes: u64,
@@ -149,8 +157,10 @@ pub struct NativeMarkdownPagedBodyConfiguration {
     pub colors: NativeMarkdownPagedBodyColors,
 }
 
-/// 基础字体是显式的 Native 资源用途；不预建第二套 Core palette 或排版续体。
-/// 通用挂载严格沿调用方同一字体，产品编辑器才分别指定源码与预览的文稿字体。
+/// Base fonts have explicit Native roles without prebuilding another Core palette or layout
+/// continuation.
+/// Generic attachment uses the caller's same font; only the product editor explicitly supplies separate
+/// Source and preview document fonts.
 enum BaseFonts {
     Single(CFRetained<CTFont>),
     Presentation {
@@ -159,6 +169,7 @@ enum BaseFonts {
     },
 }
 impl BaseFonts {
+    /// Select an already-owned font role without allocating or reconstructing a font.
     fn for_mode(&self, mode: omni_markdown_core::MarkdownPresentationMode) -> &CTFont {
         match self {
             Self::Single(font) => font,
@@ -170,7 +181,8 @@ impl BaseFonts {
     }
 }
 
-/// 只读原 composer 的实际计数；缺少 Ready 或采样不能由这些字段推断产品验收通过。
+/// Read-only actual Composer counters cannot establish product acceptance without Ready and independent
+/// measurement.
 #[derive(Debug)]
 pub struct NativeMarkdownPagedBodyProgress {
     pub phase: &'static str,
@@ -186,7 +198,8 @@ pub struct NativeMarkdownPagedBodyProgress {
     pub prepared_height: f64,
     pub frontier_source_bytes: usize,
     pub shaped_input_bytes: usize,
-    /// 原 step 的累计读取包含 Bidi/Script/GCB/LB 流式扫描；不是唯一字节数或 heap 容量。
+    /// Cumulative step reads include streaming bidi/script/grapheme/line-break scans; this is neither
+    /// unique Source bytes nor heap capacity.
     pub composer_step_bytes: usize,
     pub composer_step_scalars: usize,
     pub composer_step_metadata_units: usize,
@@ -194,7 +207,8 @@ pub struct NativeMarkdownPagedBodyProgress {
     pub maximum_step_scalars: usize,
     pub maximum_step_metadata_units: usize,
     pub trial_source_bytes: usize,
-    /// 当前唯一语义上下文的原累计工作；独立于Composer计量，Source模式始终为零。
+    /// Actual cumulative work of the sole semantic context, separate from Composer accounting and
+    /// always zero in Source mode.
     pub semantic_work: omni_markdown_core::markdown_document_buffer::SemanticWork,
     pub source_total_bytes: usize,
     pub complete: bool,
@@ -202,35 +216,48 @@ pub struct NativeMarkdownPagedBodyProgress {
     pub target_metric_parts: usize,
     pub target_walk_lines: usize,
     pub target_index_records: usize,
-    /// 仅远端批次尚未完成真实字体度量的行数；普通逐行准备不计入此目标工作量。
+    /// Only remote-batch lines awaiting actual font metrics; ordinary line-by-line preparation is
+    /// excluded from target work.
     pub target_unmeasured_lines: usize,
-    /// 原队列末行的真实来源范围；只读既有 LineReady 事实，不触发排版或保留来源对象。
+    /// Actual Source range of the last queued line; reads existing LineReady facts without advancing
+    /// layout or retaining its Source object.
     pub target_unmeasured_last_source: Option<std::ops::Range<usize>>,
     pub target_max_batch_lines: usize,
-    /// 只计原目标准备期间实际调用的checkpoint，不包含之前普通首屏/滚动调用。
+    /// Actual checkpoint calls during target preparation only, excluding previous first-frame or
+    /// ordinary scroll checkpoints.
     pub target_checkpoint_attempts: usize,
-    /// 实际checkpoint入口累计耗时，含guard/sync/dup；不能解释为单独fsync的测量。
+    /// Accumulated actual checkpoint-entry time, including guards/sync/dup; this does not measure fsync
+    /// alone.
     pub target_checkpoint_millis: f64,
-    /// 批次末行、前驱和part访问实际读取的64B记录数，不与旧前缀Y回溯混计。
+    /// Actual 64-byte record reads for batch-end, predecessor, and part access, separate from
+    /// old-prefix Y backtracking.
     pub target_batch_index_records: usize,
 }
 
-/// 一个实际表格格的原资源观察者；只保弱身份和原子事实，不延长显示Source、目录FD或worker。
-/// 尚未创建的资源为None；已经开始的Display转换也观察其真实writer，不漏掉未发布目录。
+/// Observers of one actual Cell retain only weak identity and atomic facts, without extending display
+/// Source, directory FD, or worker lifetimes.
+/// None means the role was never created; started display conversion observes its actual writer,
+/// including unpublished directories.
 pub struct NativeMarkdownPagedCellResourceReceipts {
-    /// 原显示转换准备中或已完成时观察其Source与坐标目录；不创建额外读者。
+    /// Observe Source and coordinate-directory ownership during or after display conversion without
+    /// creating another reader.
     pub display: Option<omni_markdown_core::MarkdownTableCellDisplayResourceObserver>,
-    /// 仍有实际Composer时观察原writer；完成后已移交Reader的格不伪造一个writer。
+    /// Observe the original writer while a Composer exists; a completed Cell that transferred its
+    /// reader does not invent a writer.
     pub writer: Option<omni_markdown_core::MarkdownComposedLineResourceObserver>,
-    /// 已封存可见前缀的实际Reader，旧Scene短期持有同一资源时此收据仍能观察其最终归还。
+    /// Observe the sealed visible-prefix reader through its final release, including a temporary old
+    /// Scene claim on the same resource.
     pub reader: Option<omni_markdown_core::MarkdownComposedLineResourceObserver>,
-    /// 原Composer的真实各角色观察；没有Composer的格不建立worker来满足收据形状。
+    /// Observe actual Composer roles; a Cell without a Composer creates no worker merely to fill the
+    /// receipt.
     pub worker: Option<omni_markdown_core::MarkdownLineComposerWorkerResourceObserver>,
 }
 
 impl NativeMarkdownPagedCellResourceReceipts {
-    /// 只核本次实际取得的格资源：Source载荷、投影FD/工作页、原排版目录和真实worker都须归还。
-    /// 原存储错误和观察失败同样拒绝；None仅代表该阶段未持此角色，不能补签未观察的历史资源。
+    /// Verify every Cell resource actually acquired: Source payload, projection FD/work pages, layout
+    /// directory, and real worker must be returned.
+    /// Storage and observation failures remain errors; None means this stage held no role and cannot
+    /// certify unobserved historical resources.
     pub fn verify_released(&self) -> std::result::Result<(), String> {
         if let Some(display) = &self.display {
             let actual = display.snapshot();
@@ -243,7 +270,8 @@ impl NativeMarkdownPagedCellResourceReceipts {
                 return Err(format!("原表格显示Source/投影目录未归还：{actual:?}"));
             }
         }
-        // Reader与writer分别观察实际原目录；不以Cell对象消失或一个取消位代替FD与映射归还。
+        // Reader and writer observe their actual original directories; disappearance of the Cell or a
+        // cancellation flag cannot prove FD/mapping return.
         for observer in self.reader.iter().chain(self.writer.iter()) {
             let actual = observer.snapshot();
             if actual.file_open
@@ -260,7 +288,8 @@ impl NativeMarkdownPagedCellResourceReceipts {
         if let Some(worker) = &self.worker {
             let actual = worker.snapshot().ok_or("原表格worker观察者已poison")?;
             if !actual.is_released() {
-                // 原worker已包含各实际角色的FD/map/Source覆盖；不能在这里造第二张角色表。
+                // The original worker already covers each actual FD/mapping/Source role; do not
+                // introduce another role ledger here.
                 return Err(format!("原表格worker资源未归还：{actual:?}"));
             }
         }
@@ -268,10 +297,12 @@ impl NativeMarkdownPagedCellResourceReceipts {
     }
 }
 
-/// 原构造资源的固定观察者；没有 Doc、Source、字体或文件强边。
+/// Fixed observers of the constructed resources hold no document, Source, font, or file strong
+/// references.
 pub struct NativeMarkdownPagedBodyResourceReceipts {
     pub source: omni_markdown_core::MarkdownLayoutTextSourceObserver,
-    /// 尚未创建任何prefix Reader时为None；正在度量的原pending Reader同样返回真实观察者。
+    /// None before any prefix reader exists; an original pending reader under measurement still returns
+    /// its actual observer.
     pub reader: Option<omni_markdown_core::MarkdownComposedLineResourceObserver>,
     pub writer: omni_markdown_core::MarkdownComposedLineResourceObserver,
     pub worker: omni_markdown_core::MarkdownLineComposerWorkerResourceObserver,
@@ -279,18 +310,22 @@ pub struct NativeMarkdownPagedBodyResourceReceipts {
         omni_markdown_core::MarkdownLayoutFontBytesResourceObserver,
         omni_markdown_core::MarkdownLayoutFontResourceObserver,
     )>,
-    /// 当前实际Grid、可见Grid及恢复中的格观察；不登记历史、不复制Source或新建读取者。
+    /// Observe current, visible, and restoring Grid Cells without retaining history, copying Source, or
+    /// creating readers.
     pub cells: Vec<NativeMarkdownPagedCellResourceReceipts>,
 }
 
-/// 当前窗口只观察原Input已经发布的收据；通知不持正文，也不代表像素或磁盘保存已完成。
+/// The current window observes receipts already published by its original Input; notifications retain
+/// no text and certify neither pixels nor disk-save completion.
 pub trait NativeMarkdownPagedBodyInputObserver {
     fn committed(&self, commit: &NativeMarkdownPagedInputCommit);
-    /// 局部草稿的输入或客户切换只改变工具栏事实，不能伪装成canonical编辑而启动保存。
+    /// Local draft input and client switching update toolbar facts only; they cannot masquerade as
+    /// canonical edits that trigger save.
     fn local_input_changed(&self);
 }
 
-/// composition root 持唯一 Rc；View 的委托和异步延续都只保 Weak。
+/// The composition root owns the Body Rc; View delegation and async continuations retain weak
+/// references only.
 pub struct NativeMarkdownPagedBody {
     weak: Weak<Self>,
     document: RefCell<Option<Rc<RefCell<MarkdownDocumentBuffer>>>>,
@@ -304,36 +339,44 @@ pub struct NativeMarkdownPagedBody {
     >,
     off_main_notice: std::sync::Arc<std::sync::atomic::AtomicBool>,
     fonts: RefCell<Vec<Rc<NativeMarkdownLineFont>>>,
-    // Rc 只让同步装配在槽借用外借用两份不可变 Native 字体；关闭会取走实际强 claim。
+    // Rc lends immutable Native fonts outside slot borrows during synchronous assembly; close removes
+    // the actual strong claims.
     base_fonts: RefCell<Option<Rc<BaseFonts>>>,
-    // 只复用同真实Font与完整小GCB输入的已完成选择；弱字体票不延长原palette资源寿命。
+    // Reuse completed choices for the same actual font and complete small grapheme only; weak font
+    // tickets do not extend palette resource lifetimes.
     font_choices: RefCell<font_choice::FontChoices>,
     typography: RefCell<Option<semantics::Typography>>,
     catalog: MarkdownLineFontCatalog,
-    // 同一父子图借原已捕获段落事实；活动格不会重新读取系统样式或复制字体文件。
+    // Parent and child borrow the same captured paragraph facts; active Cells neither reread system
+    // style nor copy font files.
     paragraph: Rc<super::paged_paragraph_style::NativeMarkdownLineParagraph>,
     active_cell: RefCell<Option<Rc<cell::ActiveCell>>>,
     cell_close: RefCell<Option<Rc<NativeMarkdownPagedCloseReceipt>>>,
     cell_parent: RefCell<Weak<Self>>,
     pending_cell: RefCell<Option<Rc<cell::PendingCell>>>,
-    // 原续体只分配一次；每轮借出和放回移动唯一Box，避免反复搬运整份排版工作状态。
+    // Allocate the original continuation once; each turn moves its sole Box out and back instead of
+    // moving the entire layout state.
     producer: RefCell<Option<Box<Producer>>>,
     close_receipt: RefCell<Option<Rc<NativeMarkdownPagedCloseReceipt>>>,
-    // 模式只保上一份实际退场的 Source/目录/worker/样式字体观察，不累积历史 Native 图。
+    // Retain only observers for the last actual retired Source/directory/worker/style-font set, never a
+    // history of Native graphs.
     mode_retirement: RefCell<Option<NativeMarkdownPagedBodyResourceReceipts>>,
     worker: RefCell<Option<FontWorker>>,
     scene: RefCell<Option<Rc<Scene>>>,
     source_target: RefCell<Option<Rc<target::SourceTargetRequest>>>,
     mode_viewport: RefCell<Option<mode::PendingModeViewport>>,
-    // 按钮点击只保这一份原弱意图；排版Pending时不辞任输入、不预先更改真实模式。
+    // A button click retains one original weak intent; Pending layout neither resigns input nor changes
+    // the actual mode early.
     pending_mode_action: RefCell<Option<Rc<mode::PendingModeAction>>>,
-    // 真实按钮每次点击都撤旧意图；它不推进文稿或布局代次，也不是切换完成标记。
+    // Each actual button click revokes its predecessor without advancing document/layout epochs or
+    // certifying switch completion.
     mode_action_revision: Cell<u64>,
     selection_reveal: RefCell<Option<NativeMarkdownPagedSceneRequest>>,
     pending_vertical: RefCell<Option<Rc<navigation::PendingVertical>>>,
     pending_page_scroll: RefCell<Option<Rc<page_scroll::PendingPageScroll>>>,
     pending_find: RefCell<Option<Rc<find::PendingFind>>>,
-    // 栏与controller都只弱绑定；Scene只保存当次有限匹配，不让查询或Native owner进入字形目录。
+    // Bar and controller bind weakly; a Scene holds only current finite matches, keeping query and
+    // Native owners out of the glyph directory.
     find_highlights: RefCell<Option<find_highlights::Binding>>,
     pending_link: RefCell<Option<link::PendingLink>>,
     pending_word_delete: RefCell<Option<Rc<word::PendingWordDelete>>>,
@@ -342,7 +385,8 @@ pub struct NativeMarkdownPagedBody {
     #[cfg(feature = "native-markdown-runtime-probe")]
     preparation_probe: RefCell<Option<Weak<dyn NativeMarkdownPagedBodyPreparationProbe>>>,
     revoked_preparations: Cell<usize>,
-    // 模式属于当前正文会话；启动配置只提供初值，切换不重建 Input、历史或折叠集合。
+    // The current body session owns its mode; configuration supplies only the initial value, and
+    // switching preserves Input, history, and folds.
     presentation: Cell<omni_markdown_core::MarkdownPresentationMode>,
     configuration: NativeMarkdownPagedBodyConfiguration,
     active: Cell<bool>,
@@ -359,17 +403,20 @@ pub struct NativeMarkdownPagedBody {
 }
 
 impl NativeMarkdownPagedBody {
-    /// 当前模式由同一个正文会话拥有；窗口和后继 Producer 都读取这一实际事实。
+    /// Window UI and successor Producers read the actual mode owned by this same body session.
     pub(in crate::native_surface) fn presentation_mode(
         &self,
     ) -> omni_markdown_core::MarkdownPresentationMode {
         self.presentation.get()
     }
 
-    /// 移交原文档 owner 并挂在原 NSScrollView；失败时局部候选沿原释放边归还。
+    /// Transfer the original document owner into its NSScrollView; failure returns the partial
+    /// candidate through existing release ownership.
     ///
-    /// 调用方在业务关闭后仍须核实 Native Weak、映射和关闭收据；本方法只挂载传入滚动区，
-    /// 展示模式由配置和同一 Body 的后续模式事务拥有，不新增窗口、快捷键或标题栏。
+    /// After business close, the caller must still verify Native weak identities, mappings, and the
+    /// close receipt. This method mounts only the supplied scroll root;
+    /// configuration and subsequent same-Body transactions own presentation mode, without new windows,
+    /// shortcuts, or title bars.
     pub fn attach(
         document: Rc<RefCell<MarkdownDocumentBuffer>>,
         scroll: &NSScrollView,
@@ -388,8 +435,9 @@ impl NativeMarkdownPagedBody {
         )
     }
 
-    /// 产品编辑器显式区分两种文稿用途；普通 attach 的单字体合同不因此改变。
-    /// 初次模式只捕获对应的一份 Core 字体，另一用途只保留 Native 字体 claim。
+    /// The product editor explicitly distinguishes two document roles while ordinary attach retains its
+    /// single-font contract.
+    /// Capture one Core font for the initial mode; the other role retains only its Native font claim.
     pub(in crate::native_surface) fn attach_with_presentation_fonts(
         document: Rc<RefCell<MarkdownDocumentBuffer>>,
         scroll: &NSScrollView,
@@ -412,7 +460,8 @@ impl NativeMarkdownPagedBody {
         )
     }
 
-    /// 真实Cell会话沿同一视口渲染；原Doc继续归外层model，不复制草稿或创建隐藏TextKit。
+    /// Render an actual Cell session through the same viewport; the outer model retains the document
+    /// without copied drafts or hidden TextKit.
     pub fn attach_cell(
         session: Rc<NativeMarkdownPagedCellSession>,
         scroll: &NSScrollView,
@@ -431,6 +480,7 @@ impl NativeMarkdownPagedBody {
         )
     }
 
+    /// Capture one actual font/paragraph set before transferring it into the sole mount graph.
     fn attach_target(
         target: Attachment,
         scroll: &NSScrollView,
@@ -439,7 +489,8 @@ impl NativeMarkdownPagedBody {
         configuration: NativeMarkdownPagedBodyConfiguration,
         mtm: MainThreadMarker,
     ) -> Result<Rc<Self>> {
-        // 配置出错在创建 Native 图之前拒绝；非有限颜色不能被静默夹成别的主题。
+        // Reject invalid configuration before Native graph creation; nonfinite colors cannot silently
+        // clamp into a different theme.
         if configuration.epoch == 0
             || !configuration.padding.is_finite()
             || configuration.padding < 0.0
@@ -475,7 +526,7 @@ impl NativeMarkdownPagedBody {
         let registered = Rc::new(if let Some(typography) = &typography {
             registered.capture_preview_metrics(&typography.metrics_owner, &|| true)?
         } else {
-            registered // Source 沿原 CT 行高/基线，不构造系统 paragraph metrics owner。
+            registered // Source retains original Core Text line height/baseline without constructing a system paragraph-metrics owner.
         });
         Self::mount_target(
             target,
@@ -489,8 +540,10 @@ impl NativeMarkdownPagedBody {
         )
     }
 
-    /// 两类输入只在此建立原生图。活动格借父亲已经注册的实际字体与段落，
-    /// 与公开独立 Cell 附着共用此处的视口、通知、输入和失败释放，不再复制一套挂载流程。
+    /// Both input types construct their Native graph only here. Active Cells borrow their parent's
+    /// actual registered font and paragraph
+    /// and share viewport, notification, input, and failure cleanup with public Cell attachment rather
+    /// than duplicating the mount flow.
     #[expect(
         clippy::too_many_arguments,
         reason = "唯一挂载边明确接管输入、字体、段落与视口资源，不以参数袋隐藏实际所有权"
@@ -517,7 +570,7 @@ impl NativeMarkdownPagedBody {
                     != omni_markdown_core::MarkdownPresentationMode::Source
                 {
                     return Err(NativeMarkdownPagedBodyError::Unsupported);
-                } // 草稿局部坐标不借原 Doc 的 RootLeaf 语义。
+                } // Draft-local coordinates cannot borrow RootLeaf semantics from the original document.
                 let input = NativeMarkdownPagedInput::new_cell(Rc::downgrade(&session))
                     .map_err(ViewError::Input)?;
                 (None, Some(session), input)
@@ -592,7 +645,8 @@ impl NativeMarkdownPagedBody {
         if owner.document.borrow().is_some()
             && owner.presentation_mode() == omni_markdown_core::MarkdownPresentationMode::Source
         {
-            // 行号在挂正文前占用真实ruler宽度，Source/Cell的原padding不混入此布局。
+            // Reserve actual ruler width before mounting the body; original Source/Cell padding is
+            // independent of this layout.
             let lines = owner
                 .document
                 .borrow()
@@ -610,7 +664,8 @@ impl NativeMarkdownPagedBody {
             *owner.gutter.borrow_mut() = Some(gutter.clone());
             gutter.mount()?;
         }
-        // 初始高度只使用真实 clip 的最小可见范围；没有按字数估计或声称这是整篇高度。
+        // Initial height uses only the actual clip's minimum visible range, without estimating from
+        // character count or claiming whole-document height.
         let viewport = NativeMarkdownPagedViewport::attach(scroll, &view, frame.size.height, mtm)?;
         *owner.viewport.borrow_mut() = Some(viewport);
         owner.observe_clip(&scroll.contentView());
@@ -618,7 +673,8 @@ impl NativeMarkdownPagedBody {
         Ok(owner)
     }
 
-    /// 临时取得实际正文视图；调用方不能把它保存在关闭完成票中延长业务资源。
+    /// Borrow the actual body View temporarily; a caller must not retain it in a close-completion
+    /// ticket and extend business resources.
     pub fn view(&self) -> Result<Rc<Retained<NativeMarkdownPagedTextView>>> {
         self.view
             .borrow()
@@ -626,7 +682,8 @@ impl NativeMarkdownPagedBody {
             .ok_or(NativeMarkdownPagedBodyError::Closed)
     }
 
-    /// 正式保存、历史状态与输入观察共用真实提交出口；追加弱订阅不能替换已有业务消费者。
+    /// Save, history state, and input observation share the actual commit boundary; additional weak
+    /// observers do not replace existing consumers.
     pub fn observe_input(
         &self,
         observer: Weak<dyn NativeMarkdownPagedBodyInputObserver>,
@@ -635,7 +692,8 @@ impl NativeMarkdownPagedBody {
             return Err(NativeMarkdownPagedBodyError::Closed);
         }
         let mut observers = self.input_observers.borrow_mut();
-        // 已退出的输入会话不留目录项；只保真实仍活着的消费者，不缓存提交或业务正文。
+        // Remove departed input consumers and retain only live weak subscriptions, without caching
+        // receipts or document text.
         observers.retain(|registered| registered.strong_count() != 0);
         if !observers
             .iter()
@@ -646,12 +704,14 @@ impl NativeMarkdownPagedBody {
         Ok(())
     }
 
-    /// 保存或模式交接不能越过已接纳、尚未发布的键盘动作；普通像素准备不冒充未完成编辑。
+    /// Save or mode transfer cannot overtake admitted unpublished keyboard actions; ordinary pixel
+    /// preparation is not an unfinished edit.
     pub(in crate::native_surface) fn has_pending_input(&self) -> bool {
         self.pending_word_delete.borrow().is_some() || self.pending_vertical.borrow().is_some()
     }
 
-    /// 新挂载的实际模式以当前完整输入票定位；不为定位伪造选择提交或增加Undo。
+    /// Position a newly mounted actual mode using current complete Input authority, without synthetic
+    /// selection commits or undo entries.
     pub(in crate::native_surface) fn reveal_current_selection(&self) -> Result<()> {
         let request = self.view()?.capture_scene_request()?;
         if !self.current_body() || !self.input.state().is_ok_and(|state| state == request.input) {
@@ -661,12 +721,15 @@ impl NativeMarkdownPagedBody {
         self.schedule()
     }
 
+    /// Transfer the first failure to its final handling boundary once.
     pub fn take_failure(&self) -> Option<NativeMarkdownPagedBodyError> {
         self.failure.borrow_mut().take()
     }
 
-    /// 目标用途先消费原票再捕获；有限活字体只用于真实实例/冻结映射复用，不持旧 Scene。
-    /// Native 调用前已结束所有 Body 槽借用，失败由原调用方保留 Source 与资源首错。
+    /// Consume the original role ticket before capture; finite live fonts serve
+    /// actual-instance/frozen-mapping reuse without retaining an old Scene.
+    /// End all Body slot borrows before Native calls; the original caller preserves the first Source
+    /// and resource failures.
     fn capture_base_font(
         &self,
         mode: omni_markdown_core::MarkdownPresentationMode,
@@ -693,7 +756,8 @@ impl NativeMarkdownPagedBody {
         Ok(captured.into_font())
     }
 
-    /// 只有实际已封存前缀的高度；它不代表尚未排版的文档尾部。
+    /// Actual sealed-prefix height only; it does not represent the document tail that has not been laid
+    /// out.
     pub fn prepared_height(&self) -> Option<f64> {
         self.producer
             .borrow()
@@ -701,6 +765,7 @@ impl NativeMarkdownPagedBody {
             .map(|producer| producer.height())
     }
 
+    /// Observe existing production work without advancing layout or acquiring a new Source.
     pub fn progress(&self) -> Result<NativeMarkdownPagedBodyProgress> {
         let mut progress = self
             .producer
@@ -715,6 +780,7 @@ impl NativeMarkdownPagedBody {
         Ok(progress)
     }
 
+    /// Borrow resource observers from actual owners without retaining their payloads.
     pub fn resource_receipts(&self) -> Result<NativeMarkdownPagedBodyResourceReceipts> {
         let mut receipts = self
             .producer
@@ -736,6 +802,7 @@ impl NativeMarkdownPagedBody {
         Ok(receipts)
     }
 
+    /// Report queued, synchronous, or delivered-worker work still owned by this Body.
     pub fn is_preparing(&self) -> bool {
         self.scheduled.get().is_some()
             || self.preparing.get()
@@ -746,6 +813,7 @@ impl NativeMarkdownPagedBody {
                 .is_some_and(|producer| producer.has_in_flight())
     }
 
+    /// Foreground authority ends after explicit close, sticky failure, or an off-main notice.
     fn current_body(&self) -> bool {
         self.active.get()
             && !self.failed.get()
@@ -792,7 +860,8 @@ impl NativeMarkdownPagedBody {
         Ok(())
     }
 
-    /// Spend a short main-thread slice on already-requested work, preserving every original step boundary.
+    /// Spend a short main-thread slice on already-requested work, preserving every original step
+    /// boundary.
     fn run_preparation_turn(&self, serial: u64) {
         const MAX_TURNS: usize = 8;
         const TIME_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
@@ -868,79 +937,94 @@ impl NativeMarkdownPagedBody {
         self.deliver_pending_mode_action();
     }
 
+    /// Preserve the first typed failure, revoke publication, and retire all actual owned work.
     fn fail(&self, cause: NativeMarkdownPagedBodyError) {
         self.fail_pending_find(&cause);
-        // 首错是 sticky：停止原续体并清掉 Ready，不用再次捕获较新 Source 隐藏错误。
+        // The first failure is sticky: stop the original continuation and clear Ready without capturing
+        // a newer Source to hide the failure.
         if self.failure.borrow().is_none() {
             #[cfg(feature = "native-markdown-runtime-probe")]
             {
-                // 只在原首次失败边界记录枚举分类；后继Busy/Revoked不能替代原准备首因。
-                // 只读这一层已持有的typed cause，不遍历错误链、不展开String/Source或正文路径。
-                // View错误可能持有链接或附件错误文本，因此不对整个ViewError做Debug。
+                // Record enum classes only at the original first-failure boundary; later Busy/Revoked
+                // cannot replace its cause.
+                // Read only the typed cause already held here; do not traverse chains or expand
+                // strings, Source, or document paths.
+                // A View error may contain link or attachment text, so never Debug-format the complete
+                // ViewError.
                 let view = match &cause {
                     NativeMarkdownPagedBodyError::View(error) => {
                         Some(std::mem::discriminant(error))
                     }
                     _ => None,
                 };
-                // Core分类区分权限、覆盖、断行和整形；具体Source与分页资源仍留在原错误中。
+                // Core classes distinguish authority, coverage, line breaks, and shaping; concrete
+                // Source and page resources remain in the original error.
                 let compose = match &cause {
                     NativeMarkdownPagedBodyError::Compose(error) => {
                         Some(std::mem::discriminant(error))
                     }
                     _ => None,
                 };
-                // 字体捕获可携带系统或文件失败信息；这里只识别捕获类型，不打印描述或URL。
+                // Font capture may carry system/file failures; identify only its class without printing
+                // descriptions or URLs.
                 let font = match &cause {
                     NativeMarkdownPagedBodyError::Font(error) => {
                         Some(std::mem::discriminant(error))
                     }
                     _ => None,
                 };
-                // 注册失败属于原真实catalog，不为诊断重新解析、注册或获取字体权限。
+                // Registration failure belongs to the actual catalog; diagnostics do not reparse,
+                // reregister, or acquire font authority.
                 let registration = match &cause {
                     NativeMarkdownPagedBodyError::Registration(error) => {
                         Some(std::mem::discriminant(error))
                     }
                     _ => None,
                 };
-                // 已捕获的段落失败只读枚举；不在错误边界再次调用Native样式getter。
+                // Read only the captured paragraph error class; do not call Native style getters again
+                // at the failure boundary.
                 let paragraph = match &cause {
                     NativeMarkdownPagedBodyError::Paragraph(error) => {
                         Some(std::mem::discriminant(error))
                     }
                     _ => None,
                 };
-                // 滚动几何失败与正文源失败分开标明，不重新捕Scene或领取后继窗口。
+                // Distinguish scroll geometry from body Source failure without recapturing a Scene or
+                // acquiring a successor window.
                 let viewport = match &cause {
                     NativeMarkdownPagedBodyError::Viewport(error) => {
                         Some(std::mem::discriminant(error))
                     }
                     _ => None,
                 };
-                // 候选试次不因观察而继续推进；完整内层原因及资源归还义务仍归原cause。
+                // Observation cannot advance a candidate trial; its original cause retains complete
+                // inner failures and release obligations.
                 let fallback = match &cause {
                     NativeMarkdownPagedBodyError::Fallback(error) => {
                         Some(std::mem::discriminant(error))
                     }
                     _ => None,
                 };
-                // 语义层保留WorkLimit/撤销/Source分类，不输出其可能包含的冻结源错误载荷。
+                // Preserve WorkLimit/revocation/Source classes without outputting any frozen-Source
+                // error payload.
                 let semantics = match &cause {
                     NativeMarkdownPagedBodyError::Semantics(error) => {
                         Some(std::mem::discriminant(error))
                     }
                     _ => None,
                 };
-                // 仅真实std::io::Error可投影errno；不格式化其可能包含外部载荷的message。
+                // Project errno only from an actual std::io::Error without formatting a message that
+                // may contain external payload.
                 let storage_errno = match &cause {
                     NativeMarkdownPagedBodyError::Compose(
                         omni_markdown_core::MarkdownLineComposeError::Storage(error),
                     ) => error.raw_os_error(),
                     _ => None,
                 };
-                // 固定字段仅含Discriminant和可选整数；普通构建完全不编译这条诊断。
-                // 原sticky赋值及下方真实清理继续原样执行，诊断不消费或替换任何错误。
+                // Fixed fields contain only discriminants and optional integers; normal builds compile
+                // out this diagnostic.
+                // Original sticky assignment and real cleanup still run unchanged; diagnostics neither
+                // consume nor replace any error.
                 eprintln!(
                     "native_body_failure body={:?} view={view:?} compose={compose:?} font={font:?} registration={registration:?} paragraph={paragraph:?} viewport={viewport:?} fallback={fallback:?} semantics={semantics:?} storage_errno={storage_errno:?}",
                     std::mem::discriminant(&cause),
@@ -950,15 +1034,15 @@ impl NativeMarkdownPagedBody {
         }
         self.failed.set(true);
         let pending_mode = self.pending_mode_action.borrow_mut().take();
-        drop(pending_mode); // 失败不继续模式点击，也不让旧Native weak在槽借用内析构。
+        drop(pending_mode); // Failure stops mode clicks and releases old Native weak state outside the slot borrow.
         let find_binding = self.find_highlights.borrow_mut().take();
-        drop(find_binding); // NativeWeak归还可能重入；不能跨Body RefMut释放平台控制块。
-        self.font_choices.borrow_mut().clear(); // 失败后不让原字素/context字节留在闲置Body中。
+        drop(find_binding); // Native weak release may reenter; never release platform control blocks while a Body RefMut is held.
+        self.font_choices.borrow_mut().clear(); // Failure returns original grapheme/context bytes instead of retaining them in an idle Body.
         drop(self.mode_viewport.borrow_mut().take());
         drop(self.selection_reveal.borrow_mut().take());
         drop(self.pending_vertical.borrow_mut().take());
         drop(self.pending_page_scroll.borrow_mut().take());
-        let _ = self.cancel_word_delete(); // 首错已保留；仍显式归还局部重入Rc可能保活的新增输入槽。
+        let _ = self.cancel_word_delete(); // The first error is preserved; explicitly return input slots that a local reentrant Rc might still retain.
         self.revoke_source_target();
         drop(self.paint_observation.borrow_mut().take());
         #[cfg(feature = "native-markdown-runtime-probe")]
@@ -969,7 +1053,8 @@ impl NativeMarkdownPagedBody {
             scene_result,
             producer.map_or(Ok(()), Producer::retire),
         );
-        // 失败退出仍清完整线程及排队结果；主因先保存，真实清理次因必须进入同一错误链。
+        // Failure still cleans the complete worker and queued results; preserve the primary cause and
+        // append actual cleanup failure to the same chain.
         let worker_result = self
             .worker
             .borrow_mut()
@@ -987,12 +1072,13 @@ impl NativeMarkdownPagedBody {
         }
     }
 
+    /// Advance one original bounded production quantum, revalidating Source and Native boundaries.
     fn advance(&self) -> Result<()> {
         if self.mode_viewport_waits_for_mount() {
-            return Ok(()); // 同次Native挂载完成后由原bind方法恢复唯一调度，不轮询也不发布文首中间帧。
+            return Ok(()); // Original bind resumes the sole schedule after Native mounting; do not poll or publish an intermediate document-start frame.
         }
         if self.word_input_is_copying() {
-            return Ok(()); // 原Native载荷转换尚在栈内，只由该转换的真实完成恢复原调度。
+            return Ok(()); // The original Native payload conversion is still on-stack; only its actual completion resumes scheduling.
         }
         let gutter = (self.presentation_mode()
             == omni_markdown_core::MarkdownPresentationMode::Source)
@@ -1013,15 +1099,17 @@ impl NativeMarkdownPagedBody {
                     .as_ref()
                     .cloned()
                     .expect("Source行号更新时原滚动正文已经装配");
-                // 原ruler已完成tile，先使唯一有限正文跟随实际clip；结束所有槽借用后才能进入可重入Native几何。
+                // After the ruler updates its tile, synchronize the sole bounded body with the actual
+                // clip; end all slot borrows before reentrant Native geometry.
                 viewport.synchronize()?;
                 self.schedule()?;
-                return Ok(()); // 位数跨界真实改变clip宽度，原后继回合才捕获request，不混用前后几何。
+                return Ok(()); // A digit-width boundary changed the actual clip; capture the request next turn without mixing old and new geometry.
             }
         }
         let view = self.view()?;
         let request = view.capture_scene_request().inspect_err(|cause| {
-            // 临时失败定位只读原 typed cause，不为日志重捕几何或重新进入 Native。
+            // Failure diagnostics read the original typed cause without recapturing geometry or
+            // reentering Native for logging.
             #[cfg(feature = "native-close-stage-diagnostic")]
             eprintln!(
                 "native_body_phase_failure phase=request cause={:?}",
@@ -1038,7 +1126,7 @@ impl NativeMarkdownPagedBody {
             return Err(ViewError::Revoked.into());
         }
         if self.advance_link(&request)? {
-            return Ok(()); // 旧cache的真实click先沿唯一语义续体准备；保留原sealed Scene，不另建排版或字体图。
+            return Ok(()); // An actual click on the old cache first advances its sole semantic continuation; retain the sealed Scene without another layout/font graph.
         }
         self.refresh_source_target(&request);
         self.refresh_pending_find(&request)?;
@@ -1046,7 +1134,7 @@ impl NativeMarkdownPagedBody {
         self.refresh_page_scroll(&request);
         self.refresh_word_delete(&request)?;
         if self.advance_word_typing()? {
-            return Ok(()); // 新增文字已按前步收据提交；本回合不再推进下一Core事务或重绘中间态。
+            return Ok(()); // Text already committed under the previous receipt; this turn neither advances another Core transaction nor draws intermediate state.
         }
         let scene = self.scene.borrow().clone();
         if let Some(scene) = scene
@@ -1058,18 +1146,23 @@ impl NativeMarkdownPagedBody {
             && self.pending_vertical.borrow().is_none()
             && self.pending_page_scroll.borrow().is_none()
             && self.pending_word_delete.borrow().is_none()
-            // Tab/换格只接纳局部动作，提交前父 Input 与几何仍完全同票。
-            // 导航/重挂/关闭必须推进唯一 Producer 的原来源请求，不能复用旧图把动作饿死。
-            // Pointer 只等待已有子图的真实 Ready；它不借父来源，仍复用父图避免重复重排。
+            // Tab/Cell switching admits local work while the parent Input and geometry retain their
+            // complete original ticket before commit.
+            // Navigation, remount, and close must advance the sole Producer's original Source request;
+            // reusing an old frame must not starve the action.
+            // Pointer waits only for actual child Ready without borrowing parent Source, so it may
+            // reuse the parent frame to avoid duplicate layout.
             && self.pending_cell.borrow().as_ref().is_none_or(|pending| {
                 matches!(&**pending, cell::PendingCell::Pointer { .. })
             })
         {
             scene.validate_ready(&|| self.current_body())?;
-            return Ok(()); // 重复 clip 通知只复用原同票窗口，不能不断换 nonce 取消正在绘图的候选。
+            return Ok(()); // Repeated clip notices reuse the same-ticket window rather than repeatedly changing nonce and cancelling an in-flight paint candidate.
         }
-        // 失效业务 Scene 的 Reader 必须在推进新前缀前归还。CPU 已显示的完整帧只持
-        // 原弱 key 和像素，保留旧画面无需继续保活旧 Source/Reader 或占第三份快照。
+        // Return an invalid business Scene reader before extending a new prefix. The complete displayed
+        // CPU frame retains only
+        // its original weak key and pixels; retaining the old image needs neither an old Source/reader
+        // nor a third snapshot.
         let selection_scene = self.scene.borrow().clone();
         let selecting_word = self
             .pending_word_delete
@@ -1080,21 +1173,21 @@ impl NativeMarkdownPagedBody {
             && selection_scene.as_ref().is_some_and(|scene| {
                 scene.key().request.same(&request) && self.scene_current(scene.key())
             });
-        drop(selection_scene); // 只比较原同票Scene；临时claim在后续Source/Reader交接前退出。
+        drop(selection_scene); // Compare only the original same-ticket Scene, releasing the temporary claim before Source/reader transfer.
         if !keep_word_selection_scene {
             self.clear_scene()?;
-        } // 选词未改正文时保留原真实命中图供拖动；任何输入/几何变化与删除仍归还旧Reader。
+        } // While word selection leaves text unchanged, keep the actual hit Scene for drag; edits, geometry changes, and deletion still return the old reader.
         let old = self.producer.borrow_mut().take();
         let mut producer = match old {
             Some(producer) if producer.accepts(&request) => producer,
             old => {
                 if let Some(old) = old {
-                    old.retire()?; // 真归还旧试次及已交付结果；同worker迟到结果仍按原serial独立消费。
+                    old.retire()?; // Actually return the old trial and delivered results; late results from the same worker still use their original serial.
                 }
                 if self.input.is_cell() {
                     self.release_cell_readers()?;
                     if self.input.state().map_err(ViewError::Input)? != request.input {
-                        return self.schedule(); // 真实归还中的重入已产生后继输入，不拿旧request补签新Source。
+                        return self.schedule(); // Reentry during actual release produced successor input; the old request cannot authorize a new Source.
                     }
                 }
                 self.serial.set(
@@ -1109,8 +1202,9 @@ impl NativeMarkdownPagedBody {
                         .checked_add(1)
                         .ok_or(NativeMarkdownPagedBodyError::CounterExhausted)?,
                 );
-                self.input.clear_navigation_geometry(); // 新Source/宽度的换行侧和目标列都须重取真实几何，逻辑选择及历史保持原样。
-                // 同一Input原票选择既有Body/Cell工厂；旧Producer已Drop，不占第三份Cell读取。
+                self.input.clear_navigation_geometry(); // A new Source/width requires actual wrap-side and target-column geometry while preserving logical selection and history.
+                // The same original Input permit selects its existing Body/Cell factory; the old
+                // Producer is gone, avoiding a third Cell reader.
                 let current = |epoch| self.current(epoch);
                 let permit = self
                     .input
@@ -1129,7 +1223,7 @@ impl NativeMarkdownPagedBody {
                         .map_err(ViewError::Input)?
                 } else {
                     Vec::new()
-                }; // Cell/Preview 不继承 Body Source 折叠，也不申请其原段落 proof。
+                }; // Cell and preview do not inherit Body Source folds or acquire its paragraph proof.
                 Box::new(Producer::new(
                     source,
                     &request,
@@ -1141,7 +1235,8 @@ impl NativeMarkdownPagedBody {
                 )?)
             }
         };
-        // 模式初始化在首Ready之前借唯一Producer的原Source，不能先发布文首再追逐旧caret。
+        // Initialize mode from the sole Producer's original Source before first Ready instead of
+        // publishing document start and then chasing an old caret.
         if let Err(cause) = self.prepare_mode_viewport(&mut producer, &request) {
             #[cfg(feature = "native-close-stage-diagnostic")]
             eprintln!(
@@ -1150,7 +1245,8 @@ impl NativeMarkdownPagedBody {
             );
             return producer::merge_preparation_cleanup(Err(cause), producer.retire());
         }
-        // 同源选择可改变marker实际字号；先结束旧字体/Reader并重排，不把已封存的旧图换一张输入票。
+        // Same-Source selection may change actual marker size; return old fonts/readers and recompose
+        // instead of putting a new Input ticket on an old sealed frame.
         let refreshed = match producer.refresh_semantic_selection(self, &request) {
             Ok(refreshed) => refreshed,
             Err(cause) => {
@@ -1160,11 +1256,11 @@ impl NativeMarkdownPagedBody {
                     std::mem::discriminant(&cause)
                 );
                 return producer::merge_preparation_cleanup(Err(cause), producer.retire());
-            } // 清理失败与原重排失败共同保留，不能只靠普通Drop丢失Font/Source退休错误。
+            } // Preserve both recomposition and cleanup failures; ordinary Drop alone could lose font/Source retirement failures.
         };
         if !refreshed {
             *self.producer.borrow_mut() = Some(producer);
-            return Ok(()); // 原Font完成包仍归这个唯一Producer；真实通知到达后才恢复准备。
+            return Ok(()); // The font completion package still belongs to this sole Producer; resume only after its actual notification.
         }
         match self.advance_pending_cell(&mut producer, &request) {
             Ok(true) => {
@@ -1176,17 +1272,21 @@ impl NativeMarkdownPagedBody {
                 return producer::merge_preparation_cleanup(Err(cause), producer.retire());
             }
         }
-        // 已提交Find只在正常唯一Producer已选择原Source后绑定一次；不借旧Ready补签，
-        // 不从begin捕Source，也不等无关首屏先发布后再重新推进目标。
+        // Bind committed Find once after the sole normal Producer selects its original Source, without
+        // borrowing an old Ready ticket,
+        // capturing Source at begin, or waiting for an unrelated first frame before advancing the
+        // target again.
         let binding = self
             .bind_pending_find(&producer, &request)
             .and_then(|()| self.bind_selection_reveal(&producer, &request));
         if let Err(cause) = binding {
             return producer::merge_preparation_cleanup(Err(cause), producer.retire());
-        } // 绑定失败时Producer尚在局部栈，仍须消费已交付字体结果，不能由?裸丢。
+        } // The local Producer must still consume delivered font results on binding failure; a bare ? cannot discard it.
 
-        // producer 在槽借用外运行；Font/Native/current 都可重入，但只能看到真实准备中。
-        // 词组删除只推进原Composer的一个有限量子；布局、字体和Reader不另起第二条管线。
+        // Run the Producer outside its slot borrow; font, Native, and current callbacks may reenter but
+        // observe actual preparation ownership.
+        // Word deletion advances one bounded quantum of the original Composer without another layout,
+        // font, or reader pipeline.
         let deleting_word = self.pending_word_delete.borrow().is_some()
             && !self.native_waits_for_vertical()
             && !self.native_front_needs_scene();
@@ -1197,7 +1297,8 @@ impl NativeMarkdownPagedBody {
         };
         #[cfg(feature = "native-close-stage-diagnostic")]
         if let Err(cause) = &result {
-            // 这里只标识已经返回的原回合；不把可正常退休的 PreparationRevoked 改成另一种错误。
+            // Identify only the original returned turn; PreparationRevoked still follows its ordinary
+            // retirement path.
             eprintln!(
                 "native_body_phase_failure phase=producer_advance cause={:?}",
                 std::mem::discriminant(cause)
@@ -1206,7 +1307,8 @@ impl NativeMarkdownPagedBody {
         let replaced = match producer.replaced_cell_source(&self.input, &request) {
             Ok(replaced) => replaced,
             Err(cause) => {
-                // 原Source复核失败也先实际退休栈内Producer，保主因及同次清理失败，不让?裸丢结果。
+                // Source revalidation failure first retires the local Producer and preserves both
+                // primary and cleanup errors instead of dropping its result via ?.
                 return producer::merge_preparation_cleanup(Err(cause), producer.retire());
             }
         };
@@ -1216,8 +1318,10 @@ impl NativeMarkdownPagedBody {
                 Err(NativeMarkdownPagedBodyError::PreparationRevoked)
             )
         {
-            // 仅原前台票撤权可交实际后继；Producer 已先核原 Source 首错。整份旧候选
-            // 取消并归还，worker 的旧完成仍按旧 serial 消费，不能给新 Source 补签。
+            // Only original foreground revocation may yield to an actual successor; the Producer
+            // already checked the original Source failure. Cancel and return
+            // the complete old candidate; old worker completions retain their serial and cannot
+            // authorize the new Source.
             producer.retire()?;
             self.clear_scene()?;
             self.serial.set(
@@ -1238,7 +1342,7 @@ impl NativeMarkdownPagedBody {
         *self.producer.borrow_mut() = Some(producer);
         result?;
         if deleting_word {
-            return self.finish_word_delete(); // 原Box已放回，Ready才可归还旧读取并消费唯一输入票。
+            return self.finish_word_delete(); // The original Box is back in its slot; only Ready permits returning old reads and consuming the sole input permit.
         }
         self.finish_vertical_navigation()?;
         if self.finish_mode_viewport().inspect_err(|cause| {
@@ -1249,17 +1353,18 @@ impl NativeMarkdownPagedBody {
             );
             let _ = cause;
         })? {
-            return Ok(()); // 真实glyph恢复改变了clip，旧Scene到此结束；下一原续体完成新帧认证。
+            return Ok(()); // Measured glyph restoration changed the clip; the old Scene ends here and the next original continuation certifies the new frame.
         }
         self.finish_source_target()?;
         self.finish_pending_find()?;
         if self.native_front_needs_scene() && self.scene.borrow().is_some() {
-            self.schedule()?; // 原Scene真实发布才唤醒未解释event；字体/IO在途时不轮询空转。
+            self.schedule()?; // Wake uninterpreted events only after actual Scene publication, without polling while font or I/O work is in flight.
         }
         Ok(())
     }
 
-    /// 实际输入、排版和原生几何栈尚未归还时，保存/模式/关闭必须先拒绝而不撤当前owner。
+    /// Save, mode transfer, and close must reject while actual input, layout, or Native geometry stacks
+    /// remain active, preserving their current owner.
     pub(in crate::native_surface) fn preflight_release(&self) -> Result<()> {
         let child = self.active_cell_body();
         if let Some(child) = child {
@@ -1287,18 +1392,19 @@ impl NativeMarkdownPagedBody {
         Ok(())
     }
 
-    /// 原控制器接受拆图后保留同一完成收据；真实像素事件到达后才允许核验释放完成。
+    /// After accepting graph detachment, retain one completion receipt; actual pixel-release events
+    /// alone permit final release verification.
     pub fn begin_close(&self) -> Result<Rc<NativeMarkdownPagedCloseReceipt>> {
         if let Some(receipt) = self.close_receipt.borrow().clone() {
-            return Ok(receipt); // 同次重复只取原metadata，不再join或取消后继业务。
+            return Ok(receipt); // Repeated close returns the original metadata without joining again or cancelling successor business work.
         }
-        self.preflight_release()?; // 同步资源事务未归还时，原Doc/Native图和Find仍完整保留。
+        self.preflight_release()?; // An active synchronous resource transaction retains the complete original document, Native graph, and Find.
         let view = self.view.borrow().clone();
         let receipt = NativeMarkdownPagedCloseReceipt::new(self.mtm);
         *self.close_receipt.borrow_mut() = Some(Rc::clone(&receipt));
         if let Some(pixels) = view.as_ref().and_then(|view| view.pixel_observer()) {
             receipt.track_pixels(&pixels.0);
-        } // 接受后即登记原像素；后续子视图拒绝也不能让失败收据提前声称物理归还。
+        } // Track original pixels immediately on acceptance; a later child rejection cannot let the failed receipt claim early physical return.
         if let Err(error) = self.cancel_pending_find() {
             receipt.record(NativeMarkdownPagedCloseFailure::Body(error));
         }
@@ -1307,7 +1413,7 @@ impl NativeMarkdownPagedBody {
         }
         self.active.set(false);
         let pending_mode = self.pending_mode_action.borrow_mut().take();
-        drop(pending_mode); // accepted close撤原业务动作，队列只有Weak，不能延长正文或关闭资源。
+        drop(pending_mode); // Accepted close revokes original business actions; queued weak identities cannot extend body or closing-resource lifetimes.
         let find_binding = self.find_highlights.borrow_mut().take();
         drop(find_binding);
         drop(self.pending_cell.borrow_mut().take());
@@ -1321,7 +1427,7 @@ impl NativeMarkdownPagedBody {
         }
         if let Some(cell_close) = self.cell_close.borrow_mut().take() {
             receipt.follow_view(cell_close);
-        } // 仅跟随仍在释放的上一张有限像素票，不保退休格列表、Source或业务文档。
+        } // Follow only the previous finite pixel receipt still releasing, without retired-Cell lists, Source, or business documents.
         drop(self.mode_viewport.borrow_mut().take());
         drop(self.selection_reveal.borrow_mut().take());
         drop(self.pending_vertical.borrow_mut().take());
@@ -1334,7 +1440,8 @@ impl NativeMarkdownPagedBody {
         #[cfg(feature = "native-markdown-runtime-probe")]
         drop(self.preparation_probe.borrow_mut().take());
         self.remove_clip_observers();
-        // 行号先撤原Scene/字体/像素/client/ruler，再拆正文viewport；同收据核真实Native与munmap。
+        // First detach gutter Scene/fonts/pixels/client/ruler, then the body viewport; the same receipt
+        // verifies actual Native and munmap facts.
         let gutter = self.gutter.borrow_mut().take();
         if let Some(gutter) = &gutter
             && let Err(error) = gutter.close(&receipt)
@@ -1347,7 +1454,8 @@ impl NativeMarkdownPagedBody {
         }
         let producer = self.producer.borrow_mut().take();
         let producer_result = producer.map_or(Ok(()), Producer::retire);
-        // 先结束槽借用并真正退休唯一续体，再join；前一步失败也不能跳过线程及排队结果归还。
+        // End slot borrows and actually retire the sole continuation before join; earlier failure
+        // cannot skip returning the worker and queued results.
         let worker_result = self
             .worker
             .borrow_mut()
@@ -1369,53 +1477,61 @@ impl NativeMarkdownPagedBody {
                 Ok(view_close) => receipt.follow_view(view_close),
                 Err(error) => receipt.record(NativeMarkdownPagedCloseFailure::View(error)),
             }
-        } // 子视图只交像素原子事实和首错；父收据不等待调用方合法保留的View或Cell parent Doc。
+        } // Child views transfer only atomic pixel facts and first failure; the parent receipt does not wait for caller-retained Views or a Cell parent document.
         drop(self.view.borrow_mut().take());
         drop(view);
         let input_result = self.input.close().map_err(ViewError::Input);
         if let Err(error) = input_result {
             receipt.record(NativeMarkdownPagedCloseFailure::View(error));
         }
-        self.font_choices.borrow_mut().clear(); // 先归还固定复用槽及其有限输入，不保旧Source或字体弱控制块。
-        drop(self.typography.borrow_mut().take()); // 语义原NSFont策略随活动Body归还，不成为idle全局缓存。
+        self.font_choices.borrow_mut().clear(); // Return fixed reuse slots and finite input first, retaining neither old Source nor font weak-control blocks.
+        drop(self.typography.borrow_mut().take()); // Return the semantic NSFont policy with its active Body instead of retaining it in an idle global cache.
         let base_fonts = self.base_fonts.borrow_mut().take();
-        drop(base_fonts); // 两种用途的 Native claim 同步归还，不让已关闭 Body 或框架空壳继续持有。
+        drop(base_fonts); // Return both Native font-role claims synchronously so a closed Body or framework shell cannot retain them.
         let fonts = std::mem::take(&mut *self.fonts.borrow_mut());
-        drop(fonts); // 所有 RefCell 借用先归还，再执行真实 CF/Native 字体释放。
+        drop(fonts); // End every RefCell borrow before actual CF/Native font release can reenter.
         drop(self.document.borrow_mut().take());
         let cell = self.cell_session.borrow_mut().take();
         let cell_result = cell
             .as_ref()
             .map_or(Ok(()), |session| session.close().map_err(ViewError::Input));
-        drop(cell); // 原显示/worker已归还之后才取消同token并drain；不以Input.close冒充草稿结束。
+        drop(cell); // Cancel and drain the original token after display/worker return; Input::close alone does not prove draft completion.
         if let Err(error) = cell_result {
             receipt.record(NativeMarkdownPagedCloseFailure::View(error));
         }
-        // 模式切换归还的是另一份真实 Producer/worker/样式字体；最终关闭不能只证明当前那一份。
-        // 这里仍读取原退休收据，不持旧资源，也不以当前字体、Source 已关闭替旧模式补签。
+        // Mode switching retired a different actual Producer/worker/style-font set; final close must
+        // verify more than the current set.
+        // Read its original retirement receipt without retaining old resources or substituting current
+        // font/Source closure for old-mode proof.
         if self.verify_mode_retirement().is_err() {
             receipt.record(NativeMarkdownPagedCloseFailure::Body(
                 NativeMarkdownPagedBodyError::ResourceReleaseFailed,
             ));
         }
-        receipt.seal(); // 同步业务清理已返回；只有真实全部像素归还才能交付原完成事件。
+        receipt.seal(); // Synchronous business cleanup returned; deliver the original completion event only after all actual pixels are returned.
         Ok(receipt)
     }
 
-    /// 所有正文Scene失权出口同时退休未发布CPU候选与行号弱快照。
-    /// 格关闭等动作可以保留相同Input/几何；不能等新Scene发布才撤旧候选，否则旧续绘
-    /// 会在两次有限准备之间把正常退休误报为永久输入失败。已发布像素仍归原CPU owner。
+    /// Every body Scene revocation also retires unpublished CPU candidates and weak gutter snapshots.
+    /// Cell close may preserve the same Input/geometry. Retire the old candidate before successor Scene
+    /// publication so its pending paint
+    /// cannot mistake ordinary retirement between bounded turns for permanent input failure. Published
+    /// pixels remain with the original CPU owner.
     fn clear_scene(&self) -> std::result::Result<(), ViewError> {
         let pending_link = self.pending_link.borrow_mut().take();
         let scene = self.scene.borrow_mut().take();
-        // 这里只克隆本Body实际持有的Rust Rc，不调用Native retain、查询或重新领取Scene。
-        // 两个槽及view槽的借用均已结束，候选会话/context的真实析构才可进入可重入Native。
+        // Clone only Rust Rc handles actually held by this Body, without Native retain, queries, or
+        // Scene recapture.
+        // End both state-slot and view-slot borrows before candidate/context destruction enters
+        // reentrant Native code.
         let view = self.view.borrow().clone();
         if let Some(view) = view {
             view.retire_scene_candidate();
         }
-        // 查询任务也先退槽；即使scratch关闭失败，后面的gutter/Scene归还仍全部执行。
-        // 调用方按原失败收据或既有cleanup链保首因，不以取消吞掉真实资源错误。
+        // Detach query work first; even scratch-close failure cannot skip subsequent gutter and Scene
+        // return.
+        // The caller preserves the first failure through its existing receipt/cleanup chain;
+        // cancellation never swallows actual resource errors.
         let link_result = pending_link.map_or(Ok(()), link::PendingLink::retire);
         let gutter = self.gutter.borrow().clone();
         if let Some(gutter) = gutter {
@@ -1425,13 +1541,15 @@ impl NativeMarkdownPagedBody {
         link_result
     }
 
-    /// 行号回调的真实失败属于原Body首错，不能另起重试或签一个更新的Scene。
+    /// An actual gutter callback failure belongs to the original Body failure; do not retry or certify
+    /// a newer Scene.
     pub(in crate::native_surface) fn gutter_failed(&self, error: ViewError) {
         self.fail(error.into());
     }
 }
 
 impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
+    /// Route the existing menu to the active Cell while preserving its draft selection and history.
     fn context_menu_client(
         &self,
     ) -> std::result::Result<Option<Rc<Retained<NativeMarkdownPagedTextView>>>, ViewError> {
@@ -1440,24 +1558,31 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         }
         self.active_cell_body()
             .map(|child| child.view().map_err(cell::cell_view_error))
-            .transpose() // 原活动格保自己的选择与草稿历史；不提交草稿，也不借父 Doc 的 Undo 栈。
+            .transpose() // The active Cell retains its selection and draft history without committing the draft or borrowing the parent document undo stack.
     }
 
+    /// Match this same session epoch and foreground Body authority.
     fn current(&self, epoch: u64) -> bool {
         epoch == self.configuration.epoch && self.current_body()
     }
+    /// Report accepted detachment separately from physical resource release.
     fn close_accepted(&self) -> bool {
-        // preflight通过才安装本次唯一close receipt，随后active先撤、View稍后才封闭。
-        // 同步Native拆图可触发updateLayer/resetCursorRects；原资源错误仍归同关闭收据结算。
+        // Install the sole close receipt only after preflight; revoke active authority before the View
+        // closes.
+        // Synchronous Native detachment may call updateLayer/resetCursorRects; resource failures still
+        // settle through the same close receipt.
         self.close_receipt.borrow().is_some()
     }
+    /// Cancel only old mode-position intent before original wheel propagation continues.
     fn user_scroll(&self, epoch: u64) -> std::result::Result<(), ViewError> {
         if !self.current(epoch) {
             return Err(ViewError::Revoked);
         }
-        self.cancel_mode_viewport(); // 只撤旧位置，不改选择或注册新滚动命令；父NSView继续原滚轮交付。
+        self.cancel_mode_viewport(); // Revoke only the old position, preserving selection and original superclass wheel delivery without another scroll command.
         Ok(())
     }
+    /// Scroll the original pointer gesture under stable Input/Down authority, rechecking actual Source
+    /// health.
     fn drag_autoscroll(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1468,12 +1593,14 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             return Err(ViewError::Revoked);
         }
         self.find_source_health().map_err(|cause| {
-            self.fail(cause); // 原Source首错不能被后续视口动作掩盖成普通边界空操作。
+            self.fail(cause); // The original Source failure cannot become an ordinary boundary no-op through later viewport work.
             ViewError::Revoked
         })?;
         let view = self.view().map_err(cell::cell_view_error)?;
-        // 滚动本身会换几何，不能用旧 geometry_epoch 拒绝自己的合法后置状态。
-        // 稳定权限仍是同 Doc/Cell、完整 InputState 与原 Down；每个 Native step 都重新核这三者。
+        // Scrolling itself changes geometry, so its old geometry_epoch cannot reject its own valid
+        // post-state.
+        // Stable authority remains the same Doc/Cell, complete InputState, and original Down; recheck
+        // all three around every Native step.
         let current = || {
             self.current_body()
                 && view.cell_pointer_is_current(intent)
@@ -1491,13 +1618,13 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             return Err(ViewError::Revoked);
         }
         if self.has_pending_pointer_word(intent) {
-            return Err(ViewError::Pending); // Shift 等纯选词也先交回原结果，不用滚动换几何撤掉自己的首查询。
+            return Err(ViewError::Pending); // Pure word-selection gestures first return their original result instead of scrolling and revoking their own initial query.
         }
-        self.cancel_mode_viewport(); // 真实手势撤旧模式锚点，不让它把用户重新拉回原位置。
+        self.cancel_mode_viewport(); // An actual gesture revokes the old mode anchor so it cannot pull the user back.
         let viewport = self.viewport.borrow().clone().ok_or(ViewError::Pending)?;
         let result = viewport.scroll_for_drag(point, &current);
         self.find_source_health().map_err(|cause| {
-            self.fail(cause); // 即使 Native 重入同时撤权，也先保这条真实来源已经发生的错误。
+            self.fail(cause); // Preserve the actual Source failure even if Native reentry simultaneously revokes foreground authority.
             ViewError::Revoked
         })?;
         if !current() {
@@ -1505,6 +1632,7 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         }
         result.map_err(|_| ViewError::Revoked)
     }
+    /// Acquire current bounded body geometry without extending an old geometry ticket.
     fn virtual_viewport(
         &self,
         epoch: u64,
@@ -1514,14 +1642,18 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             return Err(ViewError::Revoked);
         }
         let viewport = self.viewport.borrow().clone().ok_or(ViewError::Pending)?;
-        // 这是领取“此刻”几何的入口，没有调用方交来的旧票。真实同步重入期间只等新
-        // geometry，不能把旧像素或撤掉的矩形当作Ready，也不把正常等候写成永久输入首错。
-        // 其他错误仍按原撤权处理；已签Scene/Geometry的消费继续走原严格current检查。
+        // This API acquires current geometry without an old caller ticket. During synchronous reentry,
+        // await actual new
+        // geometry without treating old pixels or revoked rectangles as Ready, or ordinary waiting as
+        // permanent input failure.
+        // Other failures retain original revocation semantics; consuming signed Scene/Geometry still
+        // requires strict original-current checks.
         let geometry = viewport.geometry().map_err(|cause| match cause {
             super::paged_viewport::NativeMarkdownPagedViewportError::Busy => ViewError::Pending,
             _ => ViewError::Revoked,
         })?;
-        // 正文坐标从扣除真实行号/页眉遮挡后的frame起点算；raw clip曝露区域仍只归滚动所有者。
+        // Body coordinates start at the frame excluding actual ruler/header occlusion; only the scroll
+        // owner interprets the raw exposed clip.
         Ok(NativeMarkdownPagedVirtualViewport {
             document_origin: geometry.body_frame.origin,
             layout_origin_x: geometry.layout_origin_x,
@@ -1529,6 +1661,7 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             scroll_epoch: geometry.scroll_epoch,
         })
     }
+    /// Return only a matching current Scene or request the sole existing Producer and report Pending.
     fn ready_scene(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1553,8 +1686,9 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             return Ok(scene);
         }
         self.schedule().map_err(|_| ViewError::Revoked)?;
-        Err(ViewError::Pending) // 原同一 producer 已排队；这个 Native 事件不保存、不重放。
+        Err(ViewError::Pending) // The same original Producer is queued; this Native event is neither retained nor replayed.
     }
+    /// Certify the same published Scene, complete Input, and actual scroll/body origin.
     fn scene_current(&self, key: &NativeMarkdownPagedSceneKey) -> bool {
         let scene = self.scene.borrow().clone();
         let viewport = self.viewport.borrow().clone();
@@ -1568,25 +1702,28 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
                 viewport.geometry().is_ok_and(|geometry| {
                     geometry.is_current()
                         && geometry.scroll_epoch == key.request.virtual_viewport.scroll_epoch
-                        // 与创建Scene时同一实际正文起点核对，非零上边距不能偷用raw clip原点。
+                        // Match the actual body origin used to create the Scene; nonzero top margins
+                        // cannot borrow the raw clip origin.
                         && geometry.body_frame.origin
                             == key.request.virtual_viewport.document_origin
                 })
             })
     }
+    /// Retire old display after the canonical commit, then notify weak consumers of that same receipt.
     fn committed(
         &self,
         commit: &NativeMarkdownPagedInputCommit,
     ) -> std::result::Result<(), ViewError> {
         commit.check_current(&|epoch| self.current(epoch))?;
-        self.cancel_pending_mode_action(); // 新的真实文字或选择提交撤旧模式点击，不等后继Ready替它补权。
+        self.cancel_pending_mode_action(); // Real text or selection commits revoke old mode clicks without waiting for successor Ready to renew them.
         if !self.owns_word_commit(commit)
             && let Err(cause) = self.cancel_word_delete()
         {
-            self.fail(cause); // 后继真实编辑不能把原Word Source首错洗成普通取消。
+            self.fail(cause); // A successor edit cannot turn the original Word Source failure into ordinary cancellation.
             return Err(ViewError::Revoked);
         }
-        // Canonical 已提交；这里只撤销旧显示并接收同一续体，不假称这次事务尚未发生。
+        // Canonical text already committed; revoke old display and schedule the same continuation
+        // without implying the transaction never happened.
         drop(self.selection_reveal.borrow_mut().take());
         drop(self.pending_vertical.borrow_mut().take());
         drop(self.pending_page_scroll.borrow_mut().take());
@@ -1598,7 +1735,7 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             .into_iter()
             .filter_map(|observer| observer.upgrade())
         {
-            observer.committed(commit); // 原收据只借本同步栈；客户重入后必须继续核同张票，不能补签较新输入。
+            observer.committed(commit); // Borrow the original receipt for this synchronous stack; reentrant consumers must still validate it instead of acquiring newer Input authority.
             commit.check_current(&|epoch| self.current(epoch))?;
         }
         if self.input.is_cell() {
@@ -1609,12 +1746,14 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         }
         Ok(())
     }
+    /// Pass the committed receipt to the existing active-endpoint reveal path.
     fn reveal_committed_selection(
         &self,
         commit: &NativeMarkdownPagedInputCommit,
     ) -> std::result::Result<(), ViewError> {
         self.accept_selection_reveal(commit)
     }
+    /// Activate the inserted table from its actual commit rather than recapturing selection.
     fn activate_inserted_table(
         &self,
         commit: &NativeMarkdownPagedInputCommit,
@@ -1622,6 +1761,7 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         self.accept_inserted_table(commit)
             .map_err(cell::cell_view_error)
     }
+    /// Admit the original vertical-navigation request; its existing continuation publishes the result.
     fn navigate_vertical(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1631,6 +1771,7 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         self.accept_vertical_navigation(request, action, extend)?;
         Ok(true)
     }
+    /// Admit bounded word deletion and retain actual preparation failures at the Body boundary.
     fn delete_word(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1638,14 +1779,15 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         permit: super::paged_input::NativeMarkdownPagedInputPermit,
     ) -> std::result::Result<(), ViewError> {
         match self.accept_word_delete(request, forward, permit) {
-            Ok(()) => Ok(()), // 只表示原动作已接纳；尚未Ready不能声称发生删除。
+            Ok(()) => Ok(()), // Acceptance only; without Ready, do not claim deletion occurred.
             Err(NativeMarkdownPagedBodyError::View(cause)) => Err(cause),
             Err(cause) => {
-                self.fail(cause); // 原Source或准备真实失败保留首因，不降成一次成功删除。
+                self.fail(cause); // Retain actual Source/preparation failure instead of reporting successful deletion.
                 Err(ViewError::Revoked)
             }
         }
     }
+    /// Use original visual-motion authority; a non-View failure becomes the Body's sticky cause.
     fn move_visual(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1662,6 +1804,7 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             }
         }
     }
+    /// Admit one original word-motion request without claiming its boundary is already Ready.
     fn move_word(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1670,14 +1813,15 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         permit: super::paged_input::NativeMarkdownPagedInputPermit,
     ) -> std::result::Result<(), ViewError> {
         match self.accept_word_move(request, motion, extend, permit) {
-            Ok(()) => Ok(()), // 这里只接纳一次系统动作；原Bidi/组边界Ready后才发布选择。
+            Ok(()) => Ok(()), // Admit one system action; publish selection only when the original bidi/group boundary becomes Ready.
             Err(NativeMarkdownPagedBodyError::View(cause)) => Err(cause),
             Err(cause) => {
-                self.fail(cause); // 仅真实Source/资源/调度失败沿原Body首错；非Uniform在队列中单项拒绝。
+                self.fail(cause); // Actual Source/resource/scheduling failures retain the Body cause; nonuniform input rejects its individual queued operation.
                 Err(ViewError::Revoked)
             }
         }
     }
+    /// Keep word selection on the original Source and permit until its query actually completes.
     fn select_word(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1686,20 +1830,21 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         permit: super::paged_input::NativeMarkdownPagedInputPermit,
     ) -> std::result::Result<(), ViewError> {
         match self.accept_word_selection(request, selection, gesture, permit) {
-            Ok(()) => Ok(()), // 接纳真实词组查询；完成选择只由原Source的Ready及同张permit触发。
+            Ok(()) => Ok(()), // Admit the actual word query; only original-Source Ready and the same permit trigger selection completion.
             Err(NativeMarkdownPagedBodyError::View(cause)) => Err(cause),
             Err(cause) => {
-                self.fail(cause); // 源/索引/资源首错仍归原Body，不能把失败伪装成选词成功。
+                self.fail(cause); // Source/index/resource failure remains with the Body and cannot masquerade as successful word selection.
                 Err(ViewError::Revoked)
             }
         }
     }
+    /// Preserve arrival order for an actual Native key without letting an old mode target precede it.
     fn defer_key_down(
         &self,
         event: &objc2_app_kit::NSEvent,
         permit: &super::paged_input::NativeMarkdownPagedInputPermit,
     ) -> std::result::Result<bool, ViewError> {
-        self.cancel_mode_viewport(); // 实际key即使暂由原队列等待caret，也不能让旧模式目标在它之前拉回视口。
+        self.cancel_mode_viewport(); // Even while a real key waits for its caret in the original queue, an old mode target must not pull back the viewport first.
         match self.accept_native_key(event, permit) {
             Ok(accepted) => Ok(accepted),
             Err(NativeMarkdownPagedBodyError::View(cause)) => Err(cause),
@@ -1707,11 +1852,13 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
                 self.fail(cause);
                 Err(ViewError::Revoked)
             }
-        } // 实际Source/资源首错归原Body，额度拒绝保原已接纳event。
+        } // The Body retains actual Source/resource failure; quota rejection preserves already-admitted events.
     }
+    /// Expose the actual existing input barrier, not pixel-preparation activity.
     fn has_native_input_barrier(&self) -> bool {
         self.native_input_pending()
     }
+    /// Queue formatting in the same original Native input chain and retain typed failure ownership.
     fn defer_format(
         &self,
         action: omni_markdown_core::MarkdownFormatAction,
@@ -1726,6 +1873,7 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             }
         }
     }
+    /// Queue table insertion at its actual input position without precomputing stale content.
     fn defer_table_insertion(
         &self,
         permit: &super::paged_input::NativeMarkdownPagedInputPermit,
@@ -1739,6 +1887,7 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             }
         }
     }
+    /// Order Source folding with the same Native input chain rather than changing folds early.
     fn defer_source_fold(
         &self,
         action: super::paged_text_view::NativeMarkdownPagedSourceFoldAction,
@@ -1753,6 +1902,7 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             }
         }
     }
+    /// Admit the original menu selector while preserving key ordering and captured clipboard payload.
     fn defer_native_command(
         &self,
         selector: objc2::runtime::Sel,
@@ -1765,15 +1915,17 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
                 self.fail(cause);
                 Err(ViewError::Revoked)
             }
-        } // 菜单与原key同序；不在未来重读已改变的clipboard载荷。
+        } // Menus retain original key ordering without rereading a changed clipboard payload later.
     }
+    /// Keep attachment paths with the original input chain until its queue head owns copying.
     fn defer_attachments(
         &self,
         paths: Vec<std::path::PathBuf>,
         drop: Option<(u64, usize)>,
         permit: &super::paged_input::NativeMarkdownPagedInputPermit,
     ) -> std::result::Result<bool, ViewError> {
-        // 附件仍由原Word链拥有；文件复制只在队首发生，关闭/撤权会同步释放未处理路径。
+        // The original Word chain owns attachments; copying occurs only at queue head, while
+        // close/revocation synchronously returns unprocessed paths.
         match self.accept_native_edit(
             word::native::NativeInput::Attachments { paths, drop },
             permit,
@@ -1786,9 +1938,11 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             }
         }
     }
+    /// Retain rejection feedback in the existing ordered attachment chain.
     fn defer_attachment_rejection(&self, message: &str) -> bool {
         self.retain_attachment_rejection(message)
     }
+    /// Bind the actual interpreted before-state and Rc receipt to their original input owner.
     fn begin_interpreted_commit(
         &self,
         before: super::paged_input::NativeMarkdownPagedInputState,
@@ -1801,8 +1955,9 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
                 self.fail(cause);
                 Err(ViewError::Revoked)
             }
-        } // 只认证这一解释回调的真实before/Commit，不能以全局depth认领外部提交。
+        } // Certify this interpretation callback's actual before/Commit only; global depth cannot claim an external commit.
     }
+    /// Complete effects for the already-published receipt without replaying its Core transaction.
     fn finish_interpreted_commit(
         &self,
         commit: &NativeMarkdownPagedInputCommit,
@@ -1815,8 +1970,9 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
                 self.fail(cause);
                 Err(ViewError::Revoked)
             }
-        } // 原Commit已经发布，后果错误保留实际首因，由View包装CommittedEffect。
+        } // The original Commit published; retain the actual effect failure for the View to wrap as CommittedEffect.
     }
+    /// Queue document endpoint intent; later receipts supply its actual length and anchor.
     fn defer_document_motion(
         &self,
         end: bool,
@@ -1824,62 +1980,69 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         permit: &super::paged_input::NativeMarkdownPagedInputPermit,
     ) -> std::result::Result<bool, ViewError> {
         match self.accept_document_motion(end, extend, permit) {
-            Ok(accepted) => Ok(accepted), // 只接纳原端点语义；未来长度/anchor仅来自前步真实收据。
+            Ok(accepted) => Ok(accepted), // Admit original endpoint intent; future length/anchor comes only from the preceding actual receipt.
             Err(NativeMarkdownPagedBodyError::View(cause)) => Err(cause),
             Err(cause) => {
-                self.fail(cause); // 实际Source或调度失败保持首因，不伪造端点已到达。
+                self.fail(cause); // Retain actual Source/scheduling failure rather than claiming the endpoint was reached.
                 Err(ViewError::Revoked)
             }
         }
     }
+    /// Queue editing semantics while the existing Core path owns indentation, list continuation, and
+    /// history.
     fn defer_source_command(
         &self,
         command: omni_markdown_core::MarkdownEditingCommand,
         permit: &super::paged_input::NativeMarkdownPagedInputPermit,
     ) -> std::result::Result<bool, ViewError> {
         match self.accept_source_command(command, permit) {
-            Ok(accepted) => Ok(accepted), // 接纳仅固定语义；列表续行、缩进和历史仍由后续原Core结果决定。
+            Ok(accepted) => Ok(accepted), // Admission fixes intent only; later original Core results still determine list continuation, indentation, and history.
             Err(NativeMarkdownPagedBodyError::View(cause)) => Err(cause),
             Err(cause) => {
-                self.fail(cause); // 真正源/资源/调度失败保持首因，不假报命令已执行。
+                self.fail(cause); // Retain actual Source/resource/scheduling failure without reporting command execution.
                 Err(ViewError::Revoked)
             }
         }
     }
+    /// Keep grapheme deletion ordered until the sole Producer certifies its real boundaries.
     fn defer_grapheme_delete(
         &self,
         forward: bool,
         permit: &super::paged_input::NativeMarkdownPagedInputPermit,
     ) -> std::result::Result<bool, ViewError> {
         match self.accept_grapheme_delete(forward, permit) {
-            Ok(accepted) => Ok(accepted), // 仅说明动作保序接纳；真实范围及正文事务仍归原唯一Producer。
+            Ok(accepted) => Ok(accepted), // Ordered admission only; the sole original Producer still owns the actual range and document transaction.
             Err(NativeMarkdownPagedBodyError::View(cause)) => Err(cause),
             Err(cause) => {
-                self.fail(cause); // 原源、资源或调度错误保留首因，不能伪报删除成功。
+                self.fail(cause); // Retain original Source/resource/scheduling failure without reporting successful deletion.
                 Err(ViewError::Revoked)
             }
         }
     }
+    /// Admit only a bounded original insertion payload; synchronous input remains unchanged when not
+    /// deferred.
     fn defer_insert(
         &self,
         text: &objc2::runtime::AnyObject,
         permit: &super::paged_input::NativeMarkdownPagedInputPermit,
     ) -> std::result::Result<bool, ViewError> {
         match self.accept_word_typing(text, permit) {
-            Ok(accepted) => Ok(accepted), // false沿原同步输入；true只表示有限载荷已在原链按序接纳。
+            Ok(accepted) => Ok(accepted), // False keeps the original synchronous path; true means only that the bounded payload entered its original chain in order.
             Err(NativeMarkdownPagedBodyError::View(cause)) => Err(cause),
             Err(cause) => {
-                self.fail(cause); // 真实Source或调度失败保首因，不能假报字符已提交。
+                self.fail(cause); // Retain actual Source/scheduling failure instead of claiming characters committed.
                 Err(ViewError::Revoked)
             }
         }
     }
+    /// Publish the original Source selection through its existing bounded independent output owner.
     fn copy_selection(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
     ) -> std::result::Result<(), ViewError> {
         self.copy_source_selection(request)
     }
+    /// Use the original page-scroll request and retain actual Source/resource failure in this Body.
     fn scroll_page(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1889,11 +2052,12 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             Ok(()) => Ok(()),
             Err(NativeMarkdownPagedBodyError::View(cause)) => Err(cause),
             Err(cause) => {
-                self.fail(cause); // 原Source/资源首错保留在Body；不能把未知内部失败伪装成已完成滚动。
+                self.fail(cause); // Retain the Source/resource failure in the Body; unknown internal failure cannot masquerade as completed scrolling.
                 Err(ViewError::Revoked)
             }
         }
     }
+    /// Route child actions through their actual parent; a standalone Cell only owns cancellation.
     fn cell_action(
         &self,
         action: super::paged_text_view::NativeMarkdownPagedCellAction,
@@ -1907,10 +2071,11 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             super::paged_text_view::NativeMarkdownPagedCellAction::Cancel => {
                 self.cancel_cell(permit)
             }
-            _ => Err(ViewError::Pending), // 正式RequiredRow导航仍由原表格控制器接线，不把Tab/Return插入Cell正文。
+            _ => Err(ViewError::Pending), // The original table controller owns RequiredRow navigation; Tab/Return must not enter Cell body text.
         }
     }
 
+    /// Offer actual marked-text mouse input to the live child without reopening an ended draft.
     fn handle_cell_marked_mouse(
         &self,
         event: &objc2_app_kit::NSEvent,
@@ -1921,19 +2086,21 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         };
         match child.input.state() {
             Err(super::paged_input::NativeMarkdownPagedInputError::Closed) => {
-                // 原 Core 已 seal 而 Native 栈尚未归还时，后续真实 Drag/Up 属于父手势，
-                // 不能再从已结束草稿捕获 IME origin；物理 child 仍由原 queued detach 负责归还。
+                // After Core seals while Native is still on-stack, actual subsequent Drag/Up belongs to
+                // the parent gesture;
+                // an ended draft cannot provide another IME origin. The original queued detach still
+                // returns the physical child.
                 if self
                     .pending_cell
                     .borrow()
                     .as_ref()
                     .is_some_and(|pending| matches!(&**pending, cell::PendingCell::Closing { .. }))
                 {
-                    return Err(ViewError::Pending); // Esc 的同请求归还尚在途，先保原 canonical authority。
+                    return Err(ViewError::Pending); // The same-request Esc cleanup is still in flight; preserve original canonical authority.
                 }
                 return Ok(false);
             }
-            Err(cause) => return Err(cause.into()), // 其它源/输入失败不能被“草稿已结束”掩盖。
+            Err(cause) => return Err(cause.into()), // Other Source/input failures cannot hide behind draft completion.
             Ok(_) => {}
         }
         child
@@ -1942,6 +2109,7 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
             .handle_marked_mouse(event)
     }
 
+    /// Admit the original pointer request against its actual Cell and original input permit.
     fn cell_pointer(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1951,13 +2119,16 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         self.accept_cell_pointer(request, pointer, permit)
     }
 
+    /// Leave pointer lifetime termination with the original View while pending endpoint selection may
+    /// finish.
     fn finish_cell_pointer(
         &self,
         _request: &NativeMarkdownPagedSceneRequest,
     ) -> std::result::Result<(), ViewError> {
-        Ok(()) // Up权威由原View槽立即撤销；在途Ready只完成终点选择，不重新打开指针寿命。
+        Ok(()) // The original View slot immediately revokes Up authority; in-flight Ready completes endpoint selection without renewing pointer lifetime.
     }
 
+    /// Extend selection through the original Cell pointer request and permit.
     fn extend_cell_pointer(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1967,6 +2138,7 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         self.extend_cell_selection(request, extension, permit)
     }
 
+    /// Queue the original finite pointer location without acquiring successor Input authority.
     fn defer_pointer(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1976,10 +2148,12 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
         self.defer_cell_pointer(request, pointer, permit)
     }
 
+    /// Cancel only the existing deferred Cell pointer continuation.
     fn cancel_deferred_pointer(&self) -> bool {
         self.cancel_deferred_cell_pointer()
     }
 
+    /// Transfer an actual child drag to its live original parent without reconstructing that parent.
     fn drag_cell_pointer_outside(
         &self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1995,7 +2169,8 @@ impl NativeMarkdownPagedTextViewDelegate for NativeMarkdownPagedBody {
 
 impl Drop for NativeMarkdownPagedBody {
     fn drop(&mut self) {
-        // 正常业务必须显式begin_close并核验原完成收据；早退只做有限、无重建的兜底断图。
-        let _ = self.begin_close(); // Drop只接受清理，不把未订阅/未核验收据当释放成功。
+        // Normal business explicitly calls begin_close and verifies its receipt; early return only
+        // performs bounded graph detachment without reconstruction.
+        let _ = self.begin_close(); // Drop accepts cleanup without treating an unsubscribed/unverified receipt as release success.
     }
 }

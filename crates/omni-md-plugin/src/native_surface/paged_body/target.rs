@@ -1,4 +1,5 @@
-//! Source目标仅是同一Body/Cell输入域的一次原始意图；实际Y和可见证明均由真实生产路径签发。
+//! A Source target records one original intent in the same Body or Cell input domain.
+//! The production layout path alone certifies its actual position and visibility.
 
 use super::*;
 use crate::native_surface::{
@@ -15,11 +16,12 @@ enum Terminal {
     Revoked,
 }
 
-/// 只保固定请求和弱身份；调用方不能构造实际位置、Source或可见证明。
+/// Retains a fixed request and weak identities; callers cannot manufacture a Source,
+/// measured position, or visibility proof.
 pub struct NativeMarkdownPagedBodySourceTarget(Rc<SourceTargetRequest>);
 
 impl NativeMarkdownPagedBodySourceTarget {
-    /// 仅报告原请求状态；完成/撤销后不会把空proof槽误报成在途工作。
+    /// Report the original terminal state, so a consumed proof never looks pending.
     pub fn is_pending(&self) -> bool {
         self.0.terminal.get() == Terminal::Pending
     }
@@ -42,13 +44,16 @@ pub(super) struct SourceTargetRequest {
 }
 
 impl SourceTargetRequest {
+    /// Revoke this request and discard only its own one-shot visibility proof.
     pub(super) fn revoke(&self) {
         self.terminal.set(Terminal::Revoked);
         drop(self.proof.borrow_mut().take());
     }
+    /// Waiting is an explicit state, independent of whether a proof slot is empty.
     pub(super) fn pending(&self) -> bool {
         self.terminal.get() == Terminal::Pending
     }
+    /// Match the original input domain and wrapping geometry against a Scene request.
     pub(super) fn matches(
         &self,
         owner: &NativeMarkdownPagedBody,
@@ -61,6 +66,7 @@ impl SourceTargetRequest {
             && actual.virtual_viewport.layout_width == self.layout_width
             && actual.virtual_viewport.layout_origin_x == self.layout_origin_x
     }
+    /// Check original Rust-owned epochs and weak identities without loading Native objects.
     pub(super) fn current(&self, owner: &NativeMarkdownPagedBody) -> bool {
         self.terminal.get() != Terminal::Revoked
             && owner.current_body()
@@ -74,6 +80,7 @@ impl SourceTargetRequest {
                 .is_ok_and(|actual| self.domain.same(&actual))
             && owner.input.state().is_ok_and(|state| state == self.state)
     }
+    /// Recheck the original Native geometry around any reentrant view lookup.
     pub(super) fn current_native(&self, owner: &NativeMarkdownPagedBody) -> bool {
         if !self.current(owner)
             || !owner.find_source_target_current(self)
@@ -81,7 +88,8 @@ impl SourceTargetRequest {
         {
             return false;
         }
-        // 稳定目标允许自身滚动；实际Native宽度仍在每个可重入几何动作前后核原值。
+        // A stable target may cause its own scroll; the original wrapping width
+        // must still survive every reentrant geometry operation.
         let matches = owner
             .view()
             .and_then(|view| view.capture_scene_request().map_err(Into::into))
@@ -94,8 +102,9 @@ impl SourceTargetRequest {
 }
 
 impl NativeMarkdownPagedBody {
-    /// 捕获当前真实Ready输入域的一次目标意图，不变更选择，也不授予裸Range实际位置权限。
-    /// 尚无首屏时明确Pending；本显式候选不替代正式Find Bar或导航命令。
+    /// Capture intent in the current Ready input domain without changing selection
+    /// or treating a raw range as a measured location.
+    /// Return Pending until a first frame exists; Find and navigation retain their owners.
     pub fn request_source_target(
         &self,
         range: NSRange,
@@ -119,8 +128,8 @@ impl NativeMarkdownPagedBody {
         Ok(NativeMarkdownPagedBodySourceTarget(request))
     }
 
-    /// 只有原Producer给出的同Source身份和原调用scope可以领取目标。没有Ready也能用于
-    /// 已提交Find的正常后继Source；本入口不捕Source、不领取Reader、不授予可见性。
+    /// Admit only the original Producer Source identity and caller scope. A committed Find
+    /// may use its actual successor before Ready; this acquires no Source, reader, or visibility.
     pub(super) fn admit_source_target(
         &self,
         actual: &NativeMarkdownPagedSceneRequest,
@@ -170,7 +179,8 @@ impl NativeMarkdownPagedBody {
                 return Err(ViewError::InvalidRange.into());
             }
             let width = if (0xd800..=0xdbff).contains(&units[0]) {
-                // 只补读原首scalar的低代理项；不得为长匹配读取或shape整个源范围。
+                // Read only the low surrogate of the first scalar; a long match
+                // does not authorize reading or shaping the complete source range.
                 self.input
                     .copy_utf16_code_units(&permit, range.location + 1, &mut units[1..], &current)
                     .map_err(ViewError::Input)?;
@@ -192,7 +202,8 @@ impl NativeMarkdownPagedBody {
             }
         }
         let accepted = current(self.configuration.epoch);
-        // Cell原scope先核Source首错，再区分普通内容撤权；不从canonical Weak给局部坐标续权。
+        // The Cell scope checks its Source failure before ordinary revocation;
+        // a canonical weak identity cannot renew authority over local coordinates.
         let actual_domain = self.input.target_domain().map_err(ViewError::Input)?;
         if !accepted || !domain.same(&actual_domain) {
             return Err(ViewError::Revoked.into());
@@ -214,16 +225,17 @@ impl NativeMarkdownPagedBody {
         }))
     }
 
+    /// Replace scroll intent only after the new target proves its original ownership.
     pub(super) fn install_source_target(&self, request: Rc<SourceTargetRequest>) -> Result<()> {
         if !request.current(self) {
             return Err(ViewError::Revoked.into());
         }
-        drop(self.pending_page_scroll.borrow_mut().take()); // 只有已认证的新Source目标才撤旧滚动，拒绝的外来请求不能取消当前动作。
+        drop(self.pending_page_scroll.borrow_mut().take()); // Rejected foreign requests must not cancel the currently accepted scroll.
         let old = self.source_target.replace(Some(request.clone()));
         if let Some(old) = old {
             old.revoke();
         }
-        drop(self.scene.borrow_mut().take()); // CPU旧完整帧保留，旧业务Reader先归还再推进新prefix。
+        drop(self.scene.borrow_mut().take()); // Keep the complete CPU frame while returning the previous reader before prefix growth.
         if let Err(cause) = self.schedule() {
             request.revoke();
             return Err(cause);
@@ -231,9 +243,9 @@ impl NativeMarkdownPagedBody {
         Ok(())
     }
 
-    /// 单次取走原View已签发的可见证明，不补发已消费的proof。
-    /// 返回None且is_pending为true表示原续体尚未完成；返回None且is_pending为false
-    /// 表示原proof已经消费，不能据此重发目标或继续等待。撤权/关闭仍返回对应错误。
+    /// Consume the original View visibility proof once; consumed proofs are never reissued.
+    /// None with is_pending=true means the original continuation is unfinished; None
+    /// with false means consumed, not a reason to resubmit. Revocation and close remain errors.
     pub fn take_source_target_visible(
         &self,
         target: &NativeMarkdownPagedBodySourceTarget,
@@ -241,20 +253,23 @@ impl NativeMarkdownPagedBody {
         self.take_source_target_request_visible(&target.0)
     }
 
+    /// Preserve Source health and original Native authority before consuming a proof.
     pub(super) fn take_source_target_request_visible(
         &self,
         target: &Rc<SourceTargetRequest>,
     ) -> Result<Option<NativeMarkdownPagedFindVisibleProof>> {
         if self.input.is_cell() {
-            // 原Cell事实先核共享scope/原映射首错；正常内容换代不读取已过期的旧reader。
+            // Check the Cell scope and original mapping first; a successor content
+            // epoch must not read an obsolete reader merely to diagnose revocation.
             let actual = self.input.target_domain().map_err(ViewError::Input)?;
             if actual.same(&target.domain)
                 && let Some(producer) = self.producer.borrow().as_ref()
             {
                 producer.target_source_health()?;
-            } // 仅借已有Producer，不capture新Source，也不为已换内容的旧目标补签。
+            } // Borrow only the existing Producer; never acquire a Source to renew stale content.
         } else {
-            // Body仍核原canonical零端点，Find的正文入口和数据域不因Cell接线而放开。
+            // Body keeps its canonical endpoint health check; Cell integration
+            // does not relax the Find domain or its original document authority.
             let document = self
                 .document
                 .borrow()
@@ -282,12 +297,14 @@ impl NativeMarkdownPagedBody {
         Ok(proof)
     }
 
+    /// Report only accepted, unfinished target work.
     pub(super) fn source_target_pending(&self) -> bool {
         self.source_target
             .borrow()
             .as_ref()
             .is_some_and(|request| request.pending())
     }
+    /// A new actual request revokes a mismatching target without granting successor rights.
     pub(super) fn refresh_source_target(&self, actual: &NativeMarkdownPagedSceneRequest) {
         let target = self.source_target.borrow().clone();
         if let Some(target) = target
@@ -296,12 +313,14 @@ impl NativeMarkdownPagedBody {
             target.revoke();
         }
     }
+    /// Detach the old owner slot before releasing the request and its proof.
     pub(super) fn revoke_source_target(&self) {
         let target = self.source_target.borrow_mut().take();
         if let Some(target) = target {
             target.revoke();
         }
     }
+    /// Certify visibility only from the same Source and completed production Scene.
     pub(super) fn finish_source_target(&self) -> Result<()> {
         let target = self.source_target.borrow().clone();
         let scene = self.scene.borrow().clone();
@@ -316,9 +335,9 @@ impl NativeMarkdownPagedBody {
             return Ok(());
         }
         let result = if self.reopening_empty_cell_target(&target)? {
-            // 真零长 raw 格没有父显示字形；该导航仍由原目标推进真实行列 reveal，
-            // 仅其当前 Reopen 在退出 preparing 后消费实际 cell_source_hit 内容框。
-            // 不给 Find/模式签空 proof，也不把通用几何 Pending 降成成功。
+            // An empty raw Cell has no parent display glyph. Its original target still
+            // drives real row/column reveal; only the current Reopen consumes the actual
+            // content hit after preparation. Find and mode never receive an empty proof.
             None
         } else {
             Some(
@@ -327,12 +346,12 @@ impl NativeMarkdownPagedBody {
             )
         };
         if let Some(producer) = self.producer.borrow().as_ref() {
-            producer.target_source_health()?; // 原Source首错高于verify期间的普通前台撤权。
+            producer.target_source_health()?; // The original Source fault outranks revocation during visibility verification.
         }
         if !target.current_native(self) {
             target.revoke();
             self.schedule()?;
-            return Ok(()); // 实际编辑/宽度已换代只撤此旧目标；后继显示沿已有原续体前进。
+            return Ok(()); // Revoke only this old target; successor display keeps its existing continuation.
         }
         let Some(result) = result else {
             return Ok(());

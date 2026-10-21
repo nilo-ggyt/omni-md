@@ -1,10 +1,12 @@
-//! 同步拆图与像素真实归还分别记录；框架缓存的行号另按原标准控件空壳合同核实际载荷。
+//! Track synchronous graph detachment separately from actual pixel return; cached gutter shells still
+//! undergo the original standard-control payload checks.
 
 use super::*;
 use crate::native_surface::deallocation::NativeMarkdownDeallocationCohort;
 use std::cell::OnceCell;
 
-/// 保留第一次清理失败的原typed原因；子视图收据只有原子/Weak元数据，不保原图或文档。
+/// Retain the first typed cleanup failure; child-view receipts hold atomic/weak metadata without
+/// retaining the graph or document.
 #[derive(Debug)]
 pub enum NativeMarkdownPagedCloseFailure {
     View(NativeMarkdownPagedTextViewError),
@@ -13,7 +15,8 @@ pub enum NativeMarkdownPagedCloseFailure {
     ViewClose(Rc<NativeMarkdownPagedCloseReceipt>),
 }
 
-/// 只代表本组件实际像素与行号载荷归还；完整文档及其余Native图仍由原控制器barrier核验。
+/// Certifies only this component's actual pixel and gutter-payload return; the controller barrier still
+/// verifies the document and remaining Native graph.
 #[must_use = "接受拆图不是释放完成；须订阅原收据事件并验证真实资源归还"]
 pub struct NativeMarkdownPagedCloseReceipt {
     cohort: RefCell<NativeMarkdownDeallocationCohort>,
@@ -36,6 +39,7 @@ impl std::fmt::Debug for NativeMarkdownPagedCloseReceipt {
 }
 
 impl NativeMarkdownPagedCloseReceipt {
+    /// Create a receipt with one builder claim; later sealing permits real completion.
     pub(in crate::native_surface) fn new(mtm: MainThreadMarker) -> Rc<Self> {
         Rc::new(Self {
             cohort: RefCell::new(NativeMarkdownDeallocationCohort::new(mtm)),
@@ -47,6 +51,7 @@ impl NativeMarkdownPagedCloseReceipt {
         })
     }
 
+    /// Subscribe to the actual pixel owner once, preserving the original release identity.
     pub(in crate::native_surface) fn track_pixels(
         &self,
         pixels: &std::sync::Arc<
@@ -59,15 +64,16 @@ impl NativeMarkdownPagedCloseReceipt {
                 .iter()
                 .any(|observer| std::sync::Arc::ptr_eq(&observer.0, pixels))
             {
-                return; // 正文与行号可共享同一页账；一个真实归还义务不能重复登记。
+                return; // Body and gutter may share one page ledger; register each actual release obligation once.
             }
             observers.push(pixels.observer());
         }
         let claim = self.cohort.borrow_mut().resource_claim();
-        pixels.observe_release(claim); // 登记已零和最后munmap共用原锁；这里只接纳同一原像素事实。
+        pixels.observe_release(claim); // Zero-at-registration and final munmap share the original lock, preserving the same actual pixel-release fact.
     }
 
-    /// 行号只有一个真实装配槽；实际像素仍归原cohort，缓存Native空壳由具体typed Weak核载荷。
+    /// The gutter has one actual assembly slot; pixels remain in the original cohort, while a typed
+    /// weak identity checks cached-shell payload.
     #[cfg(feature = "native-paged-production")]
     pub(in crate::native_surface) fn track_gutter(
         &self,
@@ -78,37 +84,43 @@ impl NativeMarkdownPagedCloseReceipt {
             .unwrap_or_else(|_| panic!("同一正文关闭收据只装配一个源码行号"));
     }
 
+    /// Inherit child pixel obligations and its first cleanup failure without retaining its graph.
     pub(in crate::native_surface) fn follow_view(&self, view: Rc<Self>) {
         let observers = view.pixels.borrow().clone();
         for pixels in observers {
             self.track_pixels(&pixels.0);
-        } // Body已在接受时登记同一像素；只在调用方尚未登记时接纳子收据，避免重复义务。
+        } // Body already tracks accepted pixels; inherit only previously unregistered child obligations to avoid counting one release twice.
         if view.failure.get().is_some() {
             self.record(NativeMarkdownPagedCloseFailure::ViewClose(view));
-        } // 原视图清理已经返回；保留其第一次typed错误，后续Input清理失败不能覆盖它。
+        } // View cleanup already returned; preserve its first typed failure rather than replacing it with a later Input cleanup failure.
     }
 
+    /// Keep the first typed cleanup error for all subsequent verifications.
     pub(in crate::native_surface) fn record(&self, failure: NativeMarkdownPagedCloseFailure) {
-        let _ = self.failure.set(failure); // OnceCell只接第一次；后续错误按真实Drop归还，不覆盖首因。
+        let _ = self.failure.set(failure); // OnceCell retains the first failure; later values follow actual Drop cleanup without replacing that cause.
     }
 
+    /// Close registration once; outstanding real resources alone determine completion.
     pub(in crate::native_surface) fn seal(&self) {
         if !self.sealed.replace(true) {
             self.cohort.borrow_mut().seal();
-        } // 同一次重复关闭不再归还builder，也不会二次完成。
+        } // Repeated close neither returns the builder again nor completes the cohort twice.
     }
 
-    /// 只登记一个原操作续体；完成已先发生时也由原cohort交付，不丢事件、不保业务强边。
+    /// Register an original-operation continuation through the cohort, including already-completed
+    /// release, without losing the event or retaining business owners.
     pub fn when_released(&self, work: impl FnOnce() + 'static) {
         self.cohort.borrow().when_released(work);
     }
 
-    /// 原原因只读借出，重复核验不能取走错误后把失败收据洗成成功。
+    /// Borrow the original failure read-only so repeated verification cannot consume an error and turn
+    /// a failed receipt into success.
     pub fn cleanup_failure(&self) -> Option<&NativeMarkdownPagedCloseFailure> {
         self.failure.get()
     }
 
-    /// 事件只授予核验时机；真实zero、原清理错误和cohort失败仍必须分别通过。
+    /// The event only permits verification; actual zero, the original cleanup error, and cohort
+    /// completion remain separate requirements.
     pub fn verify_released(&self) -> std::result::Result<(), String> {
         self.verify_resources_released()?;
         match self.failure.get() {
@@ -120,7 +132,8 @@ impl NativeMarkdownPagedCloseReceipt {
         }
     }
 
-    /// 故障注入控制另核原Source首错；这里只证明物理资源归还，不将已保存的清理失败改成成功。
+    /// The fault-control path separately verifies the original Source failure; this method proves
+    /// physical return without clearing recorded cleanup failures.
     pub fn verify_resources_released(&self) -> std::result::Result<(), String> {
         if !self.cohort.borrow().has_completed() {
             return Err("原正文组件的资源释放尚未完成".into());
@@ -133,7 +146,7 @@ impl NativeMarkdownPagedCloseReceipt {
         #[cfg(feature = "native-paged-production")]
         if let Some(gutter) = self.gutter.get() {
             gutter.verify_released()?;
-        } // 原像素已经实际归还后，仍须证明活着的框架空壳没有项目载荷、回调或图层关系。
+        } // After actual pixel return, surviving framework shells must still contain no project payload, callback, or layer relationship.
         Ok(())
     }
 }

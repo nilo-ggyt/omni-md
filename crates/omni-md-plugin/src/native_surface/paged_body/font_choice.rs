@@ -1,4 +1,5 @@
-//! 同一Body内复用完整小GCB的真实字体选择；不缓存Source、probe、Job、缺字计数或旧响应。
+//! Reuse actual font choices for complete small graphemes within one Body; retain no Source, probe,
+//! job, missing-glyph count, or old response.
 
 use std::{
     ops::Range,
@@ -12,33 +13,41 @@ use super::{NativeMarkdownLineFont, NativeMarkdownPagedBodyError as Error, Resul
 const CAPACITY: usize = 128;
 const GRAPHEME_BYTES: usize = 32;
 const CONTEXT_BYTES: usize = 20;
-// 原Key的唯一最大Source包络；Producer只借此事实决定当前量子是否还能完整领取Key。
+// The key's maximum Source envelope lets the Producer decide whether this quantum can capture the
+// complete key.
 pub(super) const MAXIMUM_CHOICE_SOURCE_BYTES: usize = GRAPHEME_BYTES + 2 * CONTEXT_BYTES;
 
-/// 原GCB全量与原shaper前后各20byte raw窗；相等必有相同的原五标量上下文，无需另一decoder。
+/// Complete grapheme bytes plus the shaper's 20-byte raw context on each side; equality preserves its
+/// original five-scalar context without another decoder.
 #[derive(Eq, PartialEq)]
 struct ChoiceInput {
-    // 三段在原Source上连续，单个固定包络保留完全相同的raw上下文；长度仍区分各段边界。
-    // 未使用尾部保持零，不从另一位置的相同字节串推断同一字素或BOT/EOT语义。
+    // Three adjacent Source segments share one fixed envelope; explicit lengths retain their boundaries
+    // and exact raw context.
+    // Keep unused tail bytes zero; identical bytes elsewhere do not imply the same grapheme or
+    // beginning/end-of-text semantics.
     bytes: [u8; MAXIMUM_CHOICE_SOURCE_BYTES],
     before_len: usize,
     grapheme_len: usize,
     after_len: usize,
 }
 
-/// 只持主字体弱身份、固定输入及有预算的原options；不以字号或PSName猜另一个实际Font。
+/// Retain weak primary-font identity, fixed input, and bounded original options; point size or
+/// PostScript name cannot identify another actual font.
 pub(super) struct FontChoiceKey {
     primary: Weak<NativeMarkdownLineFont>,
     primary_points: u64,
     options: MarkdownShapingOptions,
-    // feature的起止以全局UTF16 cluster寻址；非空时必须保原位置，不能跨位置套同一掩码。
+    // Feature endpoints use global UTF-16 clusters; nonempty features retain the original range rather
+    // than reusing a mask at another position.
     feature_range: Option<Range<usize>>,
     input: ChoiceInput,
 }
 
 impl FontChoiceKey {
-    /// 在原probe/Source票下读取完整有限输入；大GCB不截断、不入缓存，继续原完整试次。
-    /// 返回已发生的真实源读量，失败也不能漏记；miss的这份≤72byte成本不伪称原Job已读。
+    /// Capture complete bounded input under the original probe/Source ticket; oversized graphemes skip
+    /// caching without truncation and retain the full trial.
+    /// Return actual Source bytes read, including failures; the at-most-72-byte miss cost is not
+    /// credited as input already consumed by the job.
     pub(super) fn capture(
         probe: &MarkdownLineFontProbe,
         style: &MarkdownLineComposeStyle,
@@ -49,12 +58,13 @@ impl FontChoiceKey {
         let result = (|| {
             require_current_probe(probe, current)?;
             if !probe.shaping_segment_ready()? || !probe.complete_single_segment()? {
-                // 整个外 GCB 可能包含多个真实 UBA/Script 段；不能把首段的选项或结果缓存成整簇事实。
+                // An outer grapheme may span several bidi/script segments; the first segment's options
+                // or choice cannot stand in for the whole cluster.
                 return Ok(None);
             }
             let range = probe.byte_range()?;
             if range.len() > GRAPHEME_BYTES {
-                return Ok(None); // 不把超长组合字的前32byte冒充完整输入或已选Font。
+                return Ok(None); // The first 32 bytes of an oversized combining sequence cannot certify complete input or a chosen font.
             }
             let options = probe.shaping_options(style)?;
             let feature_range = (!options.features.is_empty()).then(|| probe.source_range());
@@ -67,15 +77,17 @@ impl FontChoiceKey {
                 grapheme_len: range.len(),
                 after_len: after.len(),
             };
-            // 原三段恰好相接，一次≤72B访问即可取得同样输入，避免每个缓存命中字素做三次pread。
-            // 沿已认证byte端点读取，不能把远端UTF16再定位、整段扫描或新缓存混入这次优化。
+            // The three adjacent segments fit one at-most-72-byte access, avoiding three preads for
+            // each cache lookup.
+            // Use certified byte endpoints; remote UTF-16 lookup, whole-paragraph scanning, or another
+            // cache is outside this optimization.
             let envelope = before.start..after.end;
             require_current_probe(probe, current)?;
             let (used, copied) =
                 probe.copy_choice_bytes(envelope.clone(), &mut input.bytes[..envelope.len()]);
             read = read.checked_add(used).ok_or(Error::CounterExhausted)?;
-            copied?; // 首错仍带原typed链；跨piece后失败也只按真实已交付字节收费。
-            require_current_probe(probe, current)?; // 复制期间无Native重入，回调撤权仍须在发布Key前拒绝。
+            copied?; // Preserve the typed first failure and charge only bytes actually delivered before a cross-piece failure.
+            require_current_probe(probe, current)?; // Copying cannot reenter Native, but callback revocation must still reject key publication.
             Ok(Some(Self {
                 primary: Rc::downgrade(primary),
                 primary_points: primary.native().point_size().to_bits(),
@@ -87,7 +99,8 @@ impl FontChoiceKey {
         (read, result)
     }
 
-    /// 浮点按原协议编码比较，features保原顺序/完整范围；只复用完全相同的真实整形选择输入。
+    /// Compare floating-point protocol bits and the original feature order/ranges; reuse only exactly
+    /// identical shaping-choice input.
     fn same(&self, other: &Self) -> bool {
         Weak::ptr_eq(&self.primary, &other.primary)
             && self.primary_points == other.primary_points
@@ -103,7 +116,8 @@ impl FontChoiceKey {
     }
 }
 
-/// 每次Native/current调用前后核同一原probe；Source错误不能被回调触发的普通撤权覆盖。
+/// Validate the same probe around every Native/current callback so ordinary callback revocation cannot
+/// hide a Source error.
 fn require_current_probe(
     probe: &MarkdownLineFontProbe,
     current: &(impl Fn() -> bool + ?Sized),
@@ -122,14 +136,15 @@ struct Entry {
     selected: Weak<NativeMarkdownLineFont>,
 }
 
-/// 固定128项，满后依次替换；没有全源目录、第二条异步队列或进程级字体状态。
+/// A fixed 128-entry ring has no full-Source index, additional async queue, or process-wide font state.
 pub(super) struct FontChoices {
     entries: Vec<Entry>,
     next: usize,
 }
 
 impl FontChoices {
-    /// 空Body不预留输入载荷，首次真实Selected才分配固定槽位；生命周期始终归同一个Body。
+    /// An empty Body reserves no payload; the first actual Selected result allocates fixed slots owned
+    /// by that Body.
     pub(super) fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -137,8 +152,10 @@ impl FontChoices {
         }
     }
 
-    /// 返回仍由原palette保活的真实注册Font；过期弱值只是miss，不重建字体或借旧结果补票。
-    /// 调用方仍须用当前probe、Source与Selection核验并沿同一个生产响应函数提交。
+    /// Return only an actual registered font still retained by the original palette; an expired weak
+    /// value is a miss, never a reconstructed or renewed result.
+    /// The caller must still validate the current probe, Source, and selection, then submit through the
+    /// same production response path.
     pub(super) fn get(&self, key: &FontChoiceKey) -> Option<Rc<NativeMarkdownLineFont>> {
         self.entries.iter().find_map(|entry| {
             if entry.key.same(key) {
@@ -149,12 +166,14 @@ impl FontChoices {
         })
     }
 
-    /// 仅在原完整trial已Selected且真实glyph/FD/map归还、Font注册完成后调用。
-    /// 不接收TrialResult或缺字计数，缓存不会伪造成功收据；弱Font不延长映射/Native资源寿命。
+    /// Call only after a complete trial selected a font, its glyph/FD/mapping resources were returned,
+    /// and actual font registration completed.
+    /// No TrialResult or missing-glyph count enters this cache; weak fonts neither manufacture success
+    /// receipts nor extend mapping/Native resource lifetimes.
     pub(super) fn remember(&mut self, key: FontChoiceKey, selected: &Rc<NativeMarkdownLineFont>) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key.same(&key)) {
             entry.selected = Rc::downgrade(selected);
-            return; // 原输入已相同，丢弃新key的有限metadata，不增加重复历史。
+            return; // Identical input discards the new finite metadata instead of accumulating duplicate history.
         }
         let entry = Entry {
             key,
@@ -165,13 +184,14 @@ impl FontChoices {
                 self.entries = Vec::with_capacity(CAPACITY);
             }
             self.entries.push(entry);
-            return; // 容量只在第一次Selected取得，此后永远不扩到第129项。
+            return; // Allocate capacity on the first Selected result and never grow beyond 128 entries.
         }
         self.entries[self.next] = entry;
         self.next = (self.next + 1) % CAPACITY;
     }
 
-    /// 清理同时释放所有key及槽位分配；关闭后的Body不保上下文字节、字体弱控制块或容量。
+    /// Release keys and allocated slots together; a closed Body retains no context bytes, font
+    /// weak-control blocks, or entry capacity.
     pub(super) fn clear(&mut self) {
         self.entries = Vec::new();
         self.next = 0;

@@ -1,10 +1,13 @@
-//! 已规范化链接目标的唯一拥有值；连续值与小页都是实际producer的载荷，不是正文缓存。
+//! Owned normalized link destinations. Contiguous values and bounded pages are
+//! actual producer output, never a cache of document text.
 
 use std::sync::Arc;
 
 #[derive(Clone)]
-/// 原Parser已经拥有的String直接共享；流式解码器移交有限小页。两条路径均保持有效UTF8，
-/// clone只分享原载荷，CPU发布不要求连续表示；真正URL I/O边界才显式物化String。
+/// Shares the parser's already-owned string or takes bounded pages from its
+/// streaming decoder. Both paths preserve validated UTF-8;
+/// clones share original payloads. CPU publication needs no contiguous form,
+/// and only the actual URL I/O boundary materializes a string.
 pub struct MarkdownLinkDestination(Storage);
 
 #[derive(Clone)]
@@ -18,27 +21,32 @@ struct Pages {
 }
 
 impl MarkdownLinkDestination {
-    /// 原小块Parser已生成合法String；只move到一个小Arc，不再复制其字节或换成第二份页。
+    /// Moves a small parser's valid string into shared ownership without copying
+    /// bytes or constructing another paged representation.
     #[cfg(feature = "s2-table-window-prototype")]
     pub(crate) fn from_string(value: String) -> Self {
         Self::from_shared_string(Arc::new(value))
     }
 
-    /// 原引用Map与SourceLink共享同一次规范化输出；String本身已证明UTF8，不接受裸字节。
-    /// 该入口只分享值，不包含Source/pub权限；真正激活仍由原发布票与点击意图核验。
+    /// Reference maps and source links share one normalized output. The string
+    /// already proves UTF-8 validity; this entry does not accept raw bytes.
+    /// Sharing a value grants no source/publication authority. Actual activation
+    /// still validates the original publication receipt and current click intent.
     #[cfg(feature = "s2-table-window-prototype")]
     pub(crate) fn from_shared_string(value: Arc<String>) -> Self {
         Self(Storage::Whole(value))
     }
 
-    /// 只允许同crate已逐片验证解码输出的拥有者调用；移交目录而不复制目标内容。
+    /// Only crate-local producers that validated every decoded chunk may transfer
+    /// their page directory here. Destination bytes are not copied.
     #[cfg(feature = "s2-table-window-prototype")]
     pub(crate) fn from_chunks(chunks: Vec<Vec<u8>>) -> Self {
         let len = chunks.iter().map(Vec::len).sum();
         Self(Storage::Paged(Arc::new(Pages { chunks, len })))
     }
 
-    /// 库存准入使用规范化字节数，不从片容量或原URL词法拼写猜长度。
+    /// Admission uses normalized byte length, never page capacity or the original
+    /// URL's lexical spelling as an estimate.
     pub fn byte_len(&self) -> usize {
         match &self.0 {
             Storage::Whole(value) => value.len(),
@@ -46,8 +54,10 @@ impl MarkdownLinkDestination {
         }
     }
 
-    /// 只有实际URL出口取得连续目标；不读取Doc/Source或触发Native回调。
-    /// 独占Whole/单页可直接移交原分配，共享/多页仅在该I/O边界物化且不缓存结果。
+    /// Only the actual URL handoff requests contiguous bytes. This reads no
+    /// document/source and invokes no native callback.
+    /// Exclusive strings/single pages transfer their existing allocation. Shared
+    /// or multiple pages materialize only at this I/O boundary, without caching.
     pub fn into_string(self) -> String {
         let pages = match self.0 {
             Storage::Whole(value) => {
@@ -88,7 +98,8 @@ impl MarkdownLinkDestination {
         std::mem::size_of::<Pages>() + 2 * std::mem::size_of::<usize>()
     }
 
-    /// 按真实表示保有容量计量；Arc浅clone不会制造另一份String或目录。
+    /// Measures retained capacity of the actual representation. A shallow `Arc`
+    /// clone creates no second string or page directory.
     #[cfg(feature = "s2-table-window-prototype")]
     pub(crate) fn retained_metadata(&self) -> usize {
         match &self.0 {
@@ -101,7 +112,8 @@ impl MarkdownLinkDestination {
         }
     }
 
-    /// 相等比较只顺序借现有字节；内部迭代器没有连续String副本或任何源读取权限。
+    /// Equality streams existing bytes only. Its iterator owns no contiguous
+    /// string copy or permission to read document source.
     fn bytes(&self) -> impl Iterator<Item = &u8> {
         let (whole, chunks): (&[u8], &[Vec<u8>]) = match &self.0 {
             Storage::Whole(value) => (value.as_bytes(), &[]),
@@ -112,7 +124,7 @@ impl MarkdownLinkDestination {
 }
 
 impl std::fmt::Debug for MarkdownLinkDestination {
-    /// 诊断只报告尺度，绝不输出私人URL、title或查询串。
+    /// Diagnostics report sizes only, never private URLs, titles, or query strings.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("MarkdownLinkDestination")
@@ -128,7 +140,8 @@ impl std::fmt::Debug for MarkdownLinkDestination {
     }
 }
 impl PartialEq for MarkdownLinkDestination {
-    /// 真实目标的表示不同不构成业务差异；同一Arc先快速相等，其余逐字节比较。
+    /// Storage representation is not a semantic difference. Shared `Arc` identity
+    /// is a fast equality case; other destinations compare actual bytes.
     fn eq(&self, other: &Self) -> bool {
         let shared = match (&self.0, &other.0) {
             (Storage::Whole(left), Storage::Whole(right)) => Arc::ptr_eq(left, right),

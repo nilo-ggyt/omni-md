@@ -1,4 +1,5 @@
-//! 同一准备回合只消费原请求；Native 重入后检查原票，不捕后继请求替旧 Source 签 Scene。
+//! A preparation turn consumes its original request and revalidates that ticket after Native reentry.
+//! A successor request can never authorize publication for the previous Source.
 
 use std::rc::Weak;
 
@@ -9,6 +10,7 @@ use super::{
     NativeMarkdownPagedSceneRequest, Result, ViewError,
 };
 
+/// Immutable authority retained by one preparation attempt; it owns no replacement Source.
 pub(super) struct PreparationTicket {
     pub(super) request: NativeMarkdownPagedSceneRequest,
     source: MarkdownLayoutTextAuthority,
@@ -18,6 +20,7 @@ pub(super) struct PreparationTicket {
 }
 
 impl PreparationTicket {
+    /// Freeze the Source, input, layout width, and owner epoch before preparation starts.
     pub(super) fn new(
         request: &NativeMarkdownPagedSceneRequest,
         source: &MarkdownLayoutTextSource,
@@ -34,6 +37,7 @@ impl PreparationTicket {
         }
     }
 
+    /// Check Rust-owned facts without crossing a reentrant Objective-C boundary.
     pub(super) fn pure_current(&self, owner: &Owner, source: &MarkdownLayoutTextSource) -> bool {
         owner.current_body()
             && owner.serial.get() == self.serial
@@ -53,9 +57,10 @@ impl PreparationTicket {
                 .is_ok_and(|width| width == self.width)
     }
 
+    /// Verify the original geometry at the Native boundary, then recheck pure facts.
     pub(super) fn current(&self, owner: &Owner, source: &MarkdownLayoutTextSource) -> bool {
         if !self.pure_current(owner, source) {
-            return false; // 纯前台事实已变时不再进入 Native，也不读取较新的输入修复旧票。
+            return false; // Changed foreground facts revoke this ticket before any Native getter can reenter.
         }
         let Ok(view) = owner.view() else {
             return false;
@@ -63,12 +68,14 @@ impl PreparationTicket {
         let same = view
             .capture_scene_request()
             .is_ok_and(|actual| actual.same(&self.request));
-        drop(view); // 临时 Native claim 归还后再核纯票，析构回调也没有重签旧请求的权利。
+        drop(view); // Release the temporary Native claim before rechecking; deallocation cannot renew this ticket.
         same && self.pure_current(owner, source)
     }
 
+    /// Preserve the original mapping failure ahead of ordinary foreground revocation.
     pub(super) fn require(&self, owner: &Owner, source: &MarkdownLayoutTextSource) -> Result<()> {
-        // 端点0不需要全文读取；原冻结映射的真实首错始终先于普通前台撤权。
+        // Checking endpoint zero touches no document-wide text and retains the mapping
+        // failure on both sides of potentially reentrant Native validation.
         source
             .byte_offset_for_utf16(0)
             .map_err(ViewError::Document)?;
@@ -82,6 +89,7 @@ impl PreparationTicket {
         Ok(())
     }
 
+    /// Guard a bounded Core quantum that cannot call Native code or reenter the UI.
     pub(super) fn require_pure(
         &self,
         owner: &Owner,
@@ -93,11 +101,12 @@ impl PreparationTicket {
         if !self.pure_current(owner, source) {
             return Err(Error::PreparationRevoked);
         }
-        Ok(()) // 纯Core量子没有Native重入点，不为每256个标量再额外执行整组Native getter。
+        Ok(()) // Pure Core work does not repeat all Native getters for each 256-scalar quantum.
     }
 }
 
 impl Error {
+    /// Classify only errors that may safely yield to a successor foreground request.
     pub(super) fn is_foreground_revocation(&self) -> bool {
         use crate::native_surface::{
             paged_font_cascade::NativeMarkdownFontCascadeError as Cascade,
@@ -118,6 +127,7 @@ impl Error {
                 | Self::Registration(Font::Revoked | Font::Metrics(Metrics::Revoked))
                 | Self::Viewport(Viewport::Revoked | Viewport::Busy)
         ) || matches!(self, Self::Fallback(Fallback::Cascade(cause) | Fallback::CandidateCapture { error: cause, .. }) if cascade_revoked(cause))
-        // EIO、真实字体失败和普通 InvalidRange 等均不在可交后继的白名单中。
+        // I/O faults, actual font failures, and InvalidRange remain real failures,
+        // rather than being hidden by an ordinary successor request.
     }
 }

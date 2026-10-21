@@ -1,4 +1,5 @@
-//! 诊断观察真实完整帧的单次交付；不以 Ready、排队次数或单 tile 完成代替像素发布。
+//! Observe one actual complete-frame publication; Ready, queue activity, or a completed tile never
+//! substitutes for pixel publication.
 
 use std::rc::Weak;
 
@@ -10,8 +11,10 @@ use super::{
     NativeMarkdownPagedTextViewDelegate, Result,
 };
 
-/// 调用方只接收仍属原 key 的真实完整帧；弱观察不延长界面、正文或测试 runloop。
+/// Deliver only an actual complete frame still belonging to the original key; weak observation extends
+/// no UI, document, or probe run-loop lifetime.
 pub trait NativeMarkdownPagedBodyPaintObserver {
+    /// Receive the actual complete publication after the original key passes current checks.
     fn frame_published(&self, key: &NativeMarkdownPagedSceneKey, paints: usize);
 }
 
@@ -21,8 +24,10 @@ pub(super) struct PaintObservation {
 }
 
 impl NativeMarkdownPagedBody {
-    /// 在原生动作之前登记一次观察，基线从实际 surface 捕获，不能由调用者自报。
-    /// 这不会使视图标脏、执行绘图或补发已完成帧；没有新发布就保持真实未完成。
+    /// Register one observation before the Native action and capture its baseline from the real
+    /// surface, never from a caller-supplied count.
+    /// This neither invalidates nor draws the view and never reissues a completed frame; no new
+    /// publication means genuinely unfinished work.
     pub fn observe_next_cpu_frame(
         &self,
         observer: Weak<dyn NativeMarkdownPagedBodyPaintObserver>,
@@ -41,13 +46,15 @@ impl NativeMarkdownPagedBody {
         Ok(())
     }
 
+    /// Defer delivery until Native drawing and owner borrows have returned.
     pub(super) fn queue_cpu_publication(&self, key: &NativeMarkdownPagedSceneKey, paints: usize) {
         if self.paint_observation.borrow().is_none() {
-            return; // 无诊断观察者时不增加产品主队列工作，也不保存已发布帧历史。
+            return; // Without an observer, add no product main-queue work and retain no published-frame history.
         }
         let weak = MainThreadBound::new(self.weak.clone(), self.mtm);
-        // 原 key 含主线程 Rc::Weak；把同一弱票放入 MainThreadBound 再过 Send 队列，
-        // 不做 unsafe Send，也不增加 Scene、View、Source 或像素强边。
+        // The original key contains main-thread Rc::Weak; carry that same weak ticket inside
+        // MainThreadBound across the Send queue
+        // without unsafe Send or additional strong Scene, View, Source, or pixel ownership.
         let key = MainThreadBound::new(key.clone(), self.mtm);
         super::super::enqueue_native_markdown_main_task(move || {
             let mtm = MainThreadMarker::new().expect("完整帧观察只在原主队列交付");
@@ -64,7 +71,7 @@ impl NativeMarkdownPagedBody {
                 return;
             };
             if !owner.scene_current(key) {
-                return; // 原帧已被输入或几何撤销，不能捕获后继 key 给这个通知补签。
+                return; // Input or geometry revoked the original frame; a successor key cannot renew this notification.
             }
             let Ok(view) = owner.view() else {
                 return;
@@ -74,10 +81,10 @@ impl NativeMarkdownPagedBody {
                 || paints <= baseline
                 || !owner.scene_current(key)
             {
-                return; // 真实未完成、被后继取代或计数未增长都不是这次观察的成功。
+                return; // Unfinished work, successor replacement, or an unchanged publication count is not this observation's success.
             }
             let observation = owner.paint_observation.borrow_mut().take();
-            drop(view); // 结束 Native 强 claim 和所有槽借用，再进入可能停止 runloop 的外方回调。
+            drop(view); // Release Native strong claims and all slot borrows before invoking a callback that may stop the run loop.
             if let Some(observer) =
                 observation.and_then(|observation| observation.observer.upgrade())
             {

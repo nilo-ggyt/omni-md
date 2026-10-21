@@ -1,4 +1,5 @@
-//! canonical匿名快照的有限只读借用；完整虚拟地址不授予完整正文slice权限。
+//! Bounded read-only leases over the canonical anonymous snapshot. A complete virtual
+//! mapping never grants a whole-document slice or ownership of all resident pages.
 
 use std::fs::File;
 use std::ops::{Deref, Range};
@@ -7,7 +8,8 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// base映射错误不依赖可选Doc/Unicode功能；默认Vault同样能真实拒绝I/O失败。
+/// Mapping failures remain available without optional document or Unicode features,
+/// so the default workspace can reject actual I/O failures at its own boundary.
 #[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
 pub(crate) enum OriginalBackingError {
     #[error("原始映射读取范围无效")]
@@ -19,7 +21,8 @@ pub(crate) enum OriginalBackingError {
 }
 
 pub(crate) const ORIGINAL_READ_BYTES: usize = 4096;
-// 并发及递归借用也必须有真实驻留上界；不持锁调用业务回调，避免同线程递归死锁。
+// Concurrent and recursive visitors share one admission limit. The directory lock
+// never crosses a visitor, which permits bounded recursion without self-deadlock.
 const MAX_ACTIVE_LEASES: usize = 32;
 
 mod window;
@@ -41,57 +44,68 @@ struct BackingFacts {
 }
 
 #[derive(Clone)]
-/// 仅观察实际VM清理的固定标量，不保活映射、文件、正文、文档或历史。
+/// Observes fixed VM facts without retaining a mapping, file, document, or history.
 pub struct MarkdownOriginalBackingObserver {
     facts: Arc<BackingFacts>,
 }
 
 impl MarkdownOriginalBackingObserver {
     #[must_use]
-    /// 只有最后映射owner真实执行munmap且系统返回成功才为真；普通Drop到达不等同成功。
+    /// True only after the final mapping owner calls `munmap` and the kernel accepts it.
+    /// Reaching `Drop` alone is never a successful release receipt.
     pub fn unmap_succeeded(&self) -> bool {
         self.facts.unmap_succeeded.load(Ordering::Acquire)
     }
 
     #[must_use]
-    /// 返回仍由本owner负责的映射extent；失败时保留负面事实，不伪装成零。
+    /// Returns the extent still owned by this mapping; failed cleanup keeps that extent
+    /// visible instead of reporting an invented zero.
     pub fn mapped_bytes(&self) -> usize {
         self.facts.mapped_bytes.load(Ordering::Acquire)
     }
 
     #[must_use]
-    /// 必要页驱逐或最终unmap失败均永久记录为负面事实，归还pin不冒充物理回收。
+    /// Required eviction or final unmap failure stays sticky. Returning a lease pin
+    /// does not by itself prove physical page reclamation.
     pub fn failed(&self) -> bool {
         self.facts.poison.load(Ordering::Acquire) != 0
     }
 
-    /// 本owner当前管理的系统页预算；不是内核RSS或整产品物理内存证明。
+    /// Reports this owner's managed page budget, not process RSS or total product memory.
     #[must_use]
     pub fn managed_resident_bytes(&self) -> usize {
         self.facts.managed_bytes.load(Ordering::Acquire)
     }
-    /// 真实准入过的槽峰值，始终不超过64KiB；实际RSS另由进程控制验证。
+    /// Reports the peak admitted slots, bounded to 64 KiB. Process RSS requires an
+    /// independent kernel measurement.
     #[must_use]
     pub fn peak_managed_resident_bytes(&self) -> usize {
         self.facts.peak_managed_bytes.load(Ordering::Acquire)
     }
-    /// 实际进入msync系统调用的次数，不把lease结束计成物理回收。
+    /// Counts actual `msync` calls rather than treating lease completion as reclamation.
     #[must_use]
     pub fn reclaim_attempts(&self) -> usize {
         self.facts.reclaim_attempts.load(Ordering::Acquire)
     }
-    /// 只有真实msync返回零才增加；故障注入后的永久错误另由first_errno记录。
+    /// Counts successful kernel `msync` returns; an injected sticky error remains
+    /// independently observable through `first_errno`.
     #[must_use]
     pub fn reclaim_successes(&self) -> usize {
         self.facts.reclaim_successes.load(Ordering::Acquire)
     }
-    /// 请求在下一次真实`MS_SYNC | MS_INVALIDATE`成功后，注入一次合成`EIO`。
+    /// Requests one synthetic `EIO` after the next successful real
+    /// `MS_SYNC | MS_INVALIDATE` call.
     ///
-    /// 仅测试或显式诊断feature提供此入口；这不是内核返回的错误，也不会篡改线程errno。
-    /// 设置标志本身不驱逐页、不撤销活lease或关闭FD；缓存命中不会消费请求。原owner只有
-    /// 在实际msync返回成功后才消费一次并永久记失败，真实内核错误仍保留原先首因。
-    /// 此观察者仅持固定原子事实，不保活Source、映射或文件；owner已释放时标志没有后继作用。
-    /// 最终真实munmap成功与注入sticky失败分别观察，不能以其中一项替代另一项。
+    /// Only tests and an explicit diagnostic feature expose this operation. It does
+    /// not claim a kernel failure or modify thread-local errno.
+    /// Setting the flag does not evict pages, revoke active leases, or close a file.
+    /// Cache hits leave the request intact; only the original owner consumes it
+    /// after a successful real `msync`, then permanently records failure. A real
+    /// kernel error retains precedence as the first cause.
+    /// The observer retains only atomic facts. Once the source owner is gone, this
+    /// flag cannot retain a source, mapping, or file or schedule further work.
+    /// Final unmap success and injected sticky failure are separate facts; neither
+    /// substitutes for the other.
     #[cfg(any(test, feature = "original-backing-reclaim-probe"))]
     pub fn fail_next_reclaim_for_test(&self) {
         self.facts.fail_next_reclaim.store(true, Ordering::Release);
@@ -106,36 +120,44 @@ impl MarkdownOriginalBackingObserver {
     }
 }
 
-/// 此类型没有Deref或whole-slice入口；只有持有效lease才能观察最多4KiB原字节。
+/// Exposes no `Deref` or whole-slice API. An active lease permits at most 4 KiB
+/// of original bytes, while this owner alone controls the mapped extent.
 pub(crate) struct OriginalBacking {
     address: NonNull<u8>,
     length: usize,
     page_size: usize,
     facts: Arc<BackingFacts>,
     mapped: bool,
-    // 同一冻结inode的所有Doc/Snapshot共享此固定目录；锁不跨业务回调。
+    // Every document/snapshot of this frozen inode shares one fixed directory.
+    // Its lock is released before invoking any document visitor.
     windows: Mutex<WindowState>,
     window_slots: usize,
 }
 
-// SAFETY: inode已独立冻结且无写者；映射地址在最后owner析构前稳定，只提供不可变有限借用。
-// msync不改变字节或取消地址；活lease借用owner，Rust阻止它与最后munmap并发。
+// SAFETY: The private inode is frozen with no writers; its mapping stays stable
+// until the final owner drops, and only bounded immutable borrows are exposed.
+// `msync` neither changes bytes nor revokes the address. Active leases borrow the
+// owner, so Rust prevents their use concurrently with its final `munmap`.
 unsafe impl Send for OriginalBacking {}
-// SAFETY: 目录由Mutex串行化，观察事实为原子；只读字节不变，活pin槽不会被本owner驱逐。
+// SAFETY: A mutex serializes directory changes and observer facts are atomic.
+// Bytes are immutable; this owner never evicts a slot while a live lease pins it.
 unsafe impl Sync for OriginalBacking {}
 
 impl OriginalBacking {
-    /// 建立有界读权限所用的完整虚拟映射，不授予完整slice。
+    /// Acquires the virtual mapping used by bounded leases, without exposing a full slice.
     ///
     /// # Safety
-    /// file必须是factory已经验证长度的独立匿名inode，所有写者已结束且没有其他写/截断句柄。
-    /// 此义务由immutable_snapshot工厂在冻结独立源副本或消费独占匿名输出时证明，不能传用户可变文件。
+    /// `file` must be a private anonymous inode whose length the factory has validated.
+    /// All writers must have ended, with no remaining write or truncate handles.
+    /// The `immutable_snapshot` factory proves this when freezing a private copy or
+    /// consuming exclusive anonymous output. A mutable user file is not a valid input.
     pub(crate) unsafe fn map(file: File, length: usize) -> Result<Self, OriginalBackingError> {
         if length == 0 {
-            // 空值不使用mmap；调用者应以None表达没有原文件资源。
+            // Empty input owns no mapping; callers represent that state with `None`.
             return Err(OriginalBackingError::RangeOutsideMapping);
         }
-        // SAFETY: sysconf不借用或转移任何对象；仅查询系统页对齐所需的正整数。
+        // SAFETY: `sysconf` transfers no ownership; it only queries the page-size fact
+        // required for alignment and a finite directory capacity.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page_size = usize::try_from(page_size)
             .ok()
@@ -144,7 +166,8 @@ impl OriginalBacking {
                     && (ORIGINAL_READ_BYTES..=MANAGED_WINDOW_BYTES).contains(size)
             })
             .ok_or(OriginalBackingError::Unavailable(libc::EINVAL))?;
-        // SAFETY: file来自专用匿名冻结factory，extent已核验且无写者；只读共享映射由本类型独占VM析构。
+        // SAFETY: The anonymous frozen-file factory has validated the extent and ended
+        // all writers. This owner alone releases the acquired read-only mapping.
         let raw = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -156,26 +179,34 @@ impl OriginalBacking {
             )
         };
         if raw == libc::MAP_FAILED {
-            // 保留真实errno；没有取得映射时不创建成功清理收据。
+            // Preserve the kernel errno. No mapping was acquired, so no release receipt
+            // or partially initialized owner may be published.
             return Err(OriginalBackingError::Unavailable(last_errno()));
         }
         let Some(address) = NonNull::new(raw.cast::<u8>()) else {
-            // Rust slice不能使用零指针；即使系统给出零地址也必须补偿真实映射。
-            // SAFETY: 此分支已经取得且尚未发布length字节的映射，没有任何活借用。
+            // Rust slices require a non-null address. Even a kernel-provided zero address
+            // must be compensated before rejecting the acquired mapping.
+            // SAFETY: This branch owns an unpublished mapping of `length` bytes, with
+            // no live leases or external references.
             if unsafe { libc::munmap(raw, length) } != 0 {
-                // 补偿也失败时报告真实VM清理错误；不能仅返回地址错误而暗示映射已归还。
+                // Report failed VM compensation rather than implying that the address
+                // error also released the mapping.
                 return Err(OriginalBackingError::Unavailable(last_errno()));
             }
             return Err(OriginalBackingError::Unavailable(libc::EINVAL));
         };
-        // 映射本身保留匿名inode；原只读descriptor在这里实际释放，不成为idle FD。
+        // The VM mapping keeps the anonymous inode alive. Release the original
+        // descriptor now instead of retaining an idle descriptor.
         let fd = file.into_raw_fd();
-        // SAFETY: into_raw_fd转移唯一descriptor，close只调用一次；映射已有独立VM引用。
+        // SAFETY: `into_raw_fd` transfers the sole descriptor, closed exactly once;
+        // the mapping already holds an independent VM reference.
         if unsafe { libc::close(fd) } != 0 {
             let errno = last_errno();
-            // SAFETY: 映射未发布、没有活lease，失败获取必须补偿已取得的VM资源。
+            // SAFETY: Acquisition failed before publication or leases; release the VM
+            // resource already acquired by this local operation.
             if unsafe { libc::munmap(address.as_ptr().cast(), length) } != 0 {
-                // descriptor获取失败后的VM补偿仍是必要资源操作，其失败不能被最初close错误吞掉。
+                // Failed VM compensation is a required cleanup failure and must remain
+                // visible instead of being hidden by the earlier descriptor error.
                 return Err(OriginalBackingError::Unavailable(last_errno()));
             }
             return Err(OriginalBackingError::Unavailable(errno));
@@ -197,7 +228,8 @@ impl OriginalBacking {
         self.length
     }
 
-    /// 原生文稿和真实释放测试借用同一原子观察，不延长文件或映射本身的寿命。
+    /// Native documents and release tests observe these same atomic facts without
+    /// extending the lifetime of the file or mapping.
     #[cfg(any(feature = "native-markdown-candidate", test))]
     pub(crate) fn observer(&self) -> MarkdownOriginalBackingObserver {
         MarkdownOriginalBackingObserver {
@@ -207,13 +239,14 @@ impl OriginalBacking {
 
     #[cfg(test)]
     pub(crate) fn fail_next_reclaim_for_test(&self) {
-        self.observer().fail_next_reclaim_for_test(); // 旧单测沿同一个诊断位，不另设故障算法。
+        self.observer().fail_next_reclaim_for_test(); // Reuse the same diagnostic bit; no separate failure algorithm is installed.
     }
 
     pub(crate) fn health(&self) -> Result<(), OriginalBackingError> {
         match self.facts.poison.load(Ordering::Acquire) {
             0 => Ok(()),
-            // 首次失败永久撤销后继读取，不能靠新的metadata或cache命中重新签发权限。
+            // The first failure permanently revokes later reads. New metadata or a
+            // cache hit cannot restore authority over a failed mapping.
             errno => Err(OriginalBackingError::Unavailable(errno)),
         }
     }
@@ -245,7 +278,7 @@ impl OriginalBacking {
     ) -> Result<OriginalReadLease<'_>, OriginalBackingError> {
         self.health()?;
         if range.start > range.end || range.end > self.length || range.len() > ORIGINAL_READ_BYTES {
-            return Err(OriginalBackingError::RangeOutsideMapping); // 任何字节借用前核完整原范围。
+            return Err(OriginalBackingError::RangeOutsideMapping); // Validate the complete original range before any byte borrow.
         }
         let pins = {
             let mut windows = self.lock_windows()?;
@@ -255,7 +288,7 @@ impl OriginalBacking {
             }
             let mut pages = [0; 2];
             let count = if range.is_empty() {
-                0 // 空读取仍有活lease与健康门，但不取得正文页。
+                0 // An empty read still owns a healthy lease, but pins no document page.
             } else {
                 pages[0] = range.start / self.page_size * self.page_size;
                 pages[1] = (range.end - 1) / self.page_size * self.page_size;
@@ -264,7 +297,9 @@ impl OriginalBacking {
             let pins = windows
                 .plan(&pages[..count], self.window_slots)
                 .ok_or(OriginalBackingError::LeaseLimitExceeded)?;
-            // 计划完整成功才驱逐；所有候选均未pin且不属于本请求，失败不会扩大预算或等待其他lease。
+            // Evict only after admitting the complete request. Candidates are unpinned
+            // and outside this request; failure neither grows the budget nor waits
+            // for another visitor while holding the directory lock.
             for at in 0..pins.count {
                 let id = pins.slots[at];
                 if windows.slots[id].page != Some(pins.pages[at])
@@ -280,7 +315,8 @@ impl OriginalBacking {
             self.facts.active_leases.fetch_add(1, Ordering::AcqRel);
             pins
         };
-        // SAFETY: 原完整范围在固定匿名映射内，活pin与owner借用覆盖返回slice；不向外给whole映射。
+        // SAFETY: The complete range lies in the immutable anonymous extent. Both the
+        // active pins and owner borrow cover this slice; no full mapping is exposed.
         let bytes = unsafe {
             std::slice::from_raw_parts(self.address.as_ptr().add(range.start), range.len())
         };
@@ -290,7 +326,8 @@ impl OriginalBacking {
             pins,
             finished: false,
         };
-        // 其他线程刚发生的错误不能因已取得缓存槽而被忽略；失败时局部lease真实归还pin。
+        // Recheck a concurrent failure after admission. On failure, the local lease
+        // returns its actual pins before any slice reaches the caller.
         self.health()?;
         Ok(lease)
     }
@@ -301,15 +338,17 @@ impl OriginalBacking {
         visit: impl FnOnce(&[u8]) -> R,
     ) -> Result<R, OriginalBackingError> {
         let lease = self.lease(range)?;
-        let result = visit(&lease); // 无目录锁跨业务回调，允许有限递归和并发读取。
-        lease.finish()?; // 先归还本次pin并核真实必要驱逐错误，再允许发布业务值。
+        let result = visit(&lease); // No directory lock crosses the visitor; bounded recursion remains possible.
+        lease.finish()?; // Return pins and propagate required cleanup failures before publishing the result.
         Ok(result)
     }
 
     fn reclaim_page(&self, start: usize) -> Result<(), OriginalBackingError> {
         let length = self.page_size.min(self.length - start);
         bump(&self.facts.reclaim_attempts);
-        // SAFETY: 起点是本映射中完整系统页，尾页length不超过真实extent；只有未pin页或独占最终清理调用。
+        // SAFETY: `start` is a system-page boundary inside this mapping and the final
+        // length stays within its extent. Only an unpinned page or exclusive final
+        // cleanup reaches this call.
         let result = unsafe {
             libc::msync(
                 self.address.as_ptr().add(start).cast(),
@@ -323,7 +362,7 @@ impl OriginalBacking {
         bump(&self.facts.reclaim_successes);
         #[cfg(any(test, feature = "original-backing-reclaim-probe"))]
         if self.facts.fail_next_reclaim.swap(false, Ordering::AcqRel) {
-            return Err(self.fail(libc::EIO)); // 只在真实驱逐msync成功后注入，不能伪造物理操作。
+            return Err(self.fail(libc::EIO)); // Inject only after the real eviction succeeds; never invent a physical operation.
         }
         Ok(())
     }
@@ -333,7 +372,7 @@ impl OriginalBacking {
             Ok(windows) => windows,
             Err(poisoned) => {
                 self.fail(libc::EIO);
-                poisoned.into_inner() // 仅为归还原claim取目录，绝不恢复读取或清除poison。
+                poisoned.into_inner() // Recover only to return the original claim; never clear poison or restore reads.
             }
         };
         for at in 0..pins.count {
@@ -341,7 +380,7 @@ impl OriginalBacking {
             if slot.page == Some(pins.pages[at]) && slot.pins != 0 {
                 slot.pins -= 1;
             } else {
-                self.fail(libc::EINVAL); // 内部claim不配平不能继续签发成功，但仍补偿其他原pin。
+                self.fail(libc::EINVAL); // An unbalanced claim forbids success; still compensate the remaining original pins.
             }
         }
         if self
@@ -357,7 +396,8 @@ impl OriginalBacking {
         self.health()
     }
 
-    /// 仅文稿功能的测试显式驱逐未pin页，以验证真实回收失败和后继读取的首错。
+    /// Document-feature tests explicitly evict unpinned pages to verify real cleanup
+    /// failure and the first error observed by subsequent reads.
     #[cfg(all(test, feature = "native-markdown-candidate"))]
     pub(crate) fn reclaim_unpinned_for_test(&self) -> Result<(), OriginalBackingError> {
         let mut windows = self.lock_windows()?;
@@ -375,7 +415,8 @@ impl OriginalBacking {
         self.health()
     }
 
-    /// 独占消费者最终归还驻留槽和整个VM；共享Doc/Frozen只由最后Arc走同一路径。
+    /// Consumes the exclusive owner to return managed slots and the complete VM extent.
+    /// Shared documents and frozen text reach this path only through the final `Arc`.
     pub(crate) fn close(mut self) -> Result<(), OriginalBackingError> {
         self.release()
     }
@@ -383,7 +424,7 @@ impl OriginalBacking {
     fn release(&mut self) -> Result<(), OriginalBackingError> {
         if !self.mapped {
             return self.health();
-        } // 旧地址的VM释放只尝试一次，不对复用地址重试。
+        } // Release this address only once; never retry after another mapping can reuse it.
         if self.facts.active_leases.load(Ordering::Acquire) != 0 {
             self.fail(libc::EBUSY);
         }
@@ -396,7 +437,8 @@ impl OriginalBacking {
                 }
             };
             for at in 0..self.window_slots {
-                // 独占最终清理即使源已poison也继续真实尝试全部槽；首因不被后续成功重写。
+                // Exclusive final cleanup attempts every acquired slot even after poison.
+                // Later successes cannot replace the original failure.
                 if let Some(page) = windows.slots[at].page
                     && self.reclaim_page(page).is_ok()
                 {
@@ -407,7 +449,8 @@ impl OriginalBacking {
         }
         self.mapped = false;
         self.facts.unmap_attempted.store(true, Ordering::Release);
-        // SAFETY: &mut self/最后owner确保没有活Rust借用，mapped标记禁止对原地址再次munmap。
+        // SAFETY: The exclusive final owner has no live Rust borrows. The `mapped`
+        // marker prevents a second `munmap` of an address that could be reused.
         let result = unsafe { libc::munmap(self.address.as_ptr().cast(), self.length) };
         if result == 0 {
             self.facts.mapped_bytes.store(0, Ordering::Release);
@@ -420,7 +463,8 @@ impl OriginalBacking {
     }
 }
 
-/// 原slice只由活lease授权；结束pin不销毁地址，也不保留活动文档或独立正文副本。
+/// Authorizes an original-byte slice only while its lease is live. Ending a pin
+/// neither destroys the address nor retains a document or independent text copy.
 pub(crate) struct OriginalReadLease<'a> {
     owner: &'a OriginalBacking,
     bytes: &'a [u8],
@@ -435,7 +479,7 @@ impl Deref for OriginalReadLease<'_> {
 }
 impl OriginalReadLease<'_> {
     pub(crate) fn finish(mut self) -> Result<(), OriginalBackingError> {
-        self.finished = true; // 原claim只归还一次；失败也不能由Drop重复扣减。
+        self.finished = true; // Return the original claim once; `Drop` must not decrement it again on failure.
         self.owner.unpin(self.pins)
     }
 }
@@ -455,7 +499,8 @@ fn bump(value: &AtomicUsize) {
 
 impl Drop for OriginalBacking {
     fn drop(&mut self) {
-        // Drop补偿不能返回错误；只由固定observer保存真实系统结果，绝不把到达Drop当作释放成功。
+        // `Drop` cannot return cleanup errors. Fixed observer facts retain the actual
+        // kernel result; merely reaching this function never proves release.
         let _ = self.release();
     }
 }
@@ -475,7 +520,8 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(bytes).unwrap();
         file.sync_all().unwrap();
-        // SAFETY: 此独占匿名测试inode在本调用后没有写者或外部句柄，extent与初始内容完全匹配。
+        // SAFETY: This exclusive anonymous fixture has no writers or external handles
+        // after the call; the validated extent exactly matches the initial bytes.
         unsafe { OriginalBacking::map(file, bytes.len()) }.unwrap()
     }
 
@@ -503,7 +549,8 @@ mod tests {
     fn callback_failure_never_masks_reclaim_failure_or_restores_health() {
         let backing = fixture(&vec![b'x'; MANAGED_WINDOW_BYTES * 2]);
         let observer = backing.observer();
-        // 先装满真实驻留目录；回调中的新页请求才会进入真实驱逐msync。
+        // Fill the real directory first; the visitor's new page must then perform
+        // an actual eviction rather than satisfying the request from an empty slot.
         for at in 0..backing.window_slots {
             backing
                 .with_bytes(at * backing.page_size..at * backing.page_size + 1, |_| ())
@@ -527,7 +574,8 @@ mod tests {
             backing.close(),
             Err(OriginalBackingError::Unavailable(libc::EIO))
         );
-        // 实际VM已释放和本次操作已经失败是两个事实，不能因close成功改写旧错误。
+        // Actual VM release and an earlier operation failure are independent facts;
+        // successful final unmap must not rewrite the earlier failure.
         assert!(observer.unmap_succeeded());
         assert!(observer.failed());
         assert_eq!(observer.mapped_bytes(), 0);
@@ -569,7 +617,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(backing.facts.active_leases.load(Ordering::Acquire), 0);
         let observer = backing.observer();
-        assert_eq!(observer.reclaim_attempts(), 0); // panic只结束原pin，真正回收发生于最终close。
+        assert_eq!(observer.reclaim_attempts(), 0); // Panic returns the pin; actual reclamation occurs on final close.
         backing.close().unwrap();
         assert_eq!(observer.reclaim_attempts(), 1);
         assert!(observer.unmap_succeeded());

@@ -1,8 +1,10 @@
-//! 撤权后仍归还所有原关系；外方后来替换的图像、颜色、遮罩和父层不得被覆盖清除。
+//! Revocation still releases original relationships while preserving images, colors, masks, and parents
+//! installed later by another owner.
 
 use super::*;
 
 impl Slot {
+    /// Detach this slot's original Native relationships without destroying successor ownership.
     pub(in super::super) fn clear(&self, group: &CALayer, palette: &Palette) -> bool {
         let payload = self.payload.borrow_mut().take();
         let mut intact = true;
@@ -14,7 +16,8 @@ impl Slot {
             };
             intact &= clear_image(target, payload.image.as_deref());
             if let Some(second_mask) = self.second_mask.as_deref() {
-                // 第二 provider 只有实际双遮罩才存在；空 claim 仍不能清除外方后来装入的内容。
+                // A second provider exists only for actual paired masks; an empty claim cannot
+                // authorize deleting another owner's later contents.
                 intact &= clear_image(second_mask, payload.secondary_image.as_deref());
             }
         }
@@ -52,14 +55,14 @@ impl Slot {
         if self.second_color_installed.replace(false) {
             intact &= clear_color(self.secondary().0, secondary_foreground);
         }
-        drop(payload); // 关系逐项核对后才归还原图/颜色 claim，不在槽借用中执行 CFRelease。
+        drop(payload); // Return original image/color claims only after checking each relationship, keeping CFRelease outside the slot borrow.
 
         let parent = self.container.superlayer();
         if parent
             .as_deref()
             .is_some_and(|value| !std::ptr::eq(value, group))
         {
-            intact = false; // 外方重挂保留原样，关闭不能抢回后继父层。
+            intact = false; // Preserve another owner's reparenting; close cannot reclaim the successor parent.
         }
         drop(parent);
         if parent_is(&self.container, group) {
@@ -67,35 +70,41 @@ impl Slot {
         }
         intact &= empty(&self.container);
         for layer in self.auxiliary_layers() {
-            // 只检查实际存在的角色；缺席角色没有 Native 资源，不以创建空对象证明释放。
+            // Check only actual roles; absent roles own no Native resource, so never create empty
+            // objects merely to prove release.
             intact &= empty(layer) && layer.superlayer().is_none();
         }
         intact
     }
 }
 
+/// Release only an image relationship whose original identity is still installed.
 fn clear_image(layer: &CALayer, expected: Option<&CGImage>) -> bool {
-    // 读取只交出身份结果；本次+0 getter的临时claim随局部池结束，不能跨帧拖住旧provider。
+    // Return only an identity result; the local pool ends the +0 getter's temporary claim so an old
+    // provider cannot remain retained across frames.
     let same = objc2::rc::autoreleasepool(|_| {
-        // SAFETY: getter只返回opaque身份；原强claim持活时才比较地址，不解引用外方对象。
+        // SAFETY: The getter returns opaque identity only; compare addresses while the original strong
+        // claim is alive, without dereferencing foreign objects.
         let actual = unsafe { layer.contents() };
         match expected {
             Some(expected) => actual.as_deref().is_some_and(|value| {
                 std::ptr::from_ref(value).cast::<()>() == std::ptr::from_ref(expected).cast::<()>()
             }),
-            None => actual.is_none(), // 安装未发生的角色不能据空记录清掉任何后继内容。
+            None => actual.is_none(), // A role never installed by this owner cannot clear successor contents using an empty record.
         }
     });
     if same && expected.is_some() {
-        // SAFETY: 只清仍为本槽原图像的关系，外方等值但不同身份的图像也保持。
+        // SAFETY: Clear only the slot's original image identity; preserve even equal-valued images with
+        // a different owner identity.
         unsafe { layer.setContents(None) };
     }
     same
 }
 
+/// Consume this installation claim once and detach only the original mask.
 fn clear_mask(foreground: &CALayer, mask: &CALayer, installed: &Cell<bool>) -> bool {
     if !installed.replace(false) {
-        return true; // 本次没有装过该关系，不获得清理外方 mask 的权限。
+        return true; // Without installing this relationship, this close operation has no authority over a foreign mask.
     }
     let actual = foreground.mask();
     let same = actual
@@ -103,12 +112,14 @@ fn clear_mask(foreground: &CALayer, mask: &CALayer, installed: &Cell<bool>) -> b
         .is_some_and(|value| std::ptr::eq(value, mask));
     drop(actual);
     if same {
-        // SAFETY: 原固定 mask 的身份仍相同，解除关系不修改外方后来换入的对象。
+        // SAFETY: The installed mask still has its original identity; detaching it cannot modify a
+        // later foreign replacement.
         unsafe { foreground.setMask(None) };
     }
     same
 }
 
+/// Remove an original parent relationship while preserving external reparenting.
 fn clear_parent(layer: &CALayer, parent: &CALayer, installed: &Cell<bool>) -> bool {
     if !installed.replace(false) {
         return true;
@@ -117,10 +128,11 @@ fn clear_parent(layer: &CALayer, parent: &CALayer, installed: &Cell<bool>) -> bo
         layer.removeFromSuperlayer();
         true
     } else {
-        false // 后继改变的父关系必须保留；原关闭收据仍报告撤权。
+        false // Preserve the successor parent relationship while the original close receipt still reports revocation.
     }
 }
 
+/// Clear the actual installed color identity rather than comparing color values.
 fn clear_color(layer: &CALayer, expected: &CGColor) -> bool {
     let actual = layer.backgroundColor();
     let same = actual
@@ -130,13 +142,15 @@ fn clear_color(layer: &CALayer, expected: &CGColor) -> bool {
     if same {
         layer.setBackgroundColor(None);
     }
-    same // 只清安装时记录的原颜色身份，不把外方新建的同值颜色冒认为自己。
+    same // Clear only the color identity recorded at installation; equal-valued foreign colors do not belong to this owner.
 }
 
+/// Verify the actual terminal layer shell after owned relationships were detached.
 fn empty(layer: &CALayer) -> bool {
-    // SAFETY: 公开 getter 只核空值，不向任何外方 opaque 内容发送 CF 或业务消息。
+    // SAFETY: Public getters test emptiness only, without sending CF or business messages to opaque
+    // foreign contents.
     let contents = unsafe { layer.contents() };
-    // SAFETY: 标准 CALayer 的公开 children 数组为空时没有子图资源。
+    // SAFETY: An empty public CALayer children array contains no subgraph resource.
     let children = unsafe { layer.sublayers() };
     contents.is_none()
         && children.as_ref().is_none_or(|value| value.is_empty())
