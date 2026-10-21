@@ -1,4 +1,4 @@
-//! 有限原piece借用和至多一个UTF8标量残余；cluster永远使用原全局UTF16位置。
+//! Borrow bounded original pieces with at most one partial UTF-8 scalar, preserving original global UTF-16 clusters.
 use std::ops::Range;
 
 use harfrust::Buffer;
@@ -38,13 +38,13 @@ impl Input {
                 0xe0..=0xef => 3,
                 0xf0..=0xf4 => 4,
                 _ => return Err(Error::InvalidUtf8),
-            }; // 只记真实单标量长度；不把半个UTF8片丢掉后重新解释下一页。
+            }; // Retain the actual scalar width instead of dropping partial UTF-8 and reinterpreting the next page.
         }
         self.pending[self.used] = byte;
         self.used += 1;
         self.byte = self.byte.checked_add(1).ok_or(Error::CoordinateOverflow)?;
         if self.used < self.needed {
-            return Ok(false); // 真实残余仍占当前step的byte预算，不提前添加半个字符。
+            return Ok(false); // Partial input still consumes this step's byte budget; never append half a character.
         }
         let scalar = std::str::from_utf8(&self.pending[..self.used])
             .ok()
@@ -53,7 +53,7 @@ impl Input {
         let cluster = u32::try_from(self.utf16).map_err(|_| Error::CoordinateOverflow)?;
         buffer.push(u32::from(scalar), cluster);
         if !buffer.allocation_successful() {
-            return Err(Error::ShaperStorage); // 分页写失败后不能继续输入或声称前缀完整。
+            return Err(Error::ShaperStorage); // A paged-write failure prevents further ingestion or claiming a complete prefix.
         }
         self.utf16 = self
             .utf16
@@ -75,7 +75,7 @@ impl MarkdownShapingJob {
     ) -> Result<MarkdownShapingStep> {
         let cancellation = self.cancellation.clone();
         let payload = self.payload.as_mut().ok_or(Error::Poisoned)?;
-        // 每byte最多完成一个scalar；同时取两个余额的最小值，硬保证三个范围上限。
+        // Each byte can finish at most one scalar; the minimum of byte/scalar remainders and fixed source window bounds every read.
         let count = MARKDOWN_LAYOUT_SOURCE_BYTES
             .min(budget.bytes)
             .min(budget.scalars)
@@ -95,16 +95,16 @@ impl MarkdownShapingJob {
                         if index.is_multiple_of(128) && cancellation.requested() {
                             failure = Some(Error::Cancelled);
                             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
-                        } // 实际输入循环有界观察；lease仍先真实回收，回收失败不能被取消遮掉。
-                        // 计入实际解引用字节；即使本次随后失败也不能把已做工作抹成0。
+                        } // Observe cancellation within the actual finite input loop; return the lease first so reclaim failure wins.
+                        // Count actual dereferenced bytes even when a later failure prevents publication.
                         step.bytes += 1;
                         self.source_bytes_read += 1;
                         match self.input.push(byte, &mut payload.buffer) {
                             Ok(true) => step.scalars += 1,
-                            Ok(false) => {} // 一个标量仍跨边界等待，保持同一个decoder。
+                            Ok(false) => {} // Retain this same decoder while a scalar spans the current boundary.
                             Err(error) => {
                                 failure = Some(error);
-                                // visit的错误类型属于源；原始字形错误保存在本地并在返回后复原。
+                                // The visitor uses a Source error type; retain the actual shaping error locally and restore it after lease return.
                                 return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
                             }
                         }
@@ -113,7 +113,7 @@ impl MarkdownShapingJob {
                 });
         let visit = match visit {
             Err(error) if !matches!(error, MarkdownDocumentBufferError::RangeOutsideDocument) => {
-                return Err(error.into()); // 原lease真实回收失败优先于callback内部的取消占位错误。
+                return Err(error.into()); // Actual original-lease return failure precedes the callback's cancellation placeholder.
             }
             result => result,
         };
@@ -123,19 +123,19 @@ impl MarkdownShapingJob {
         visit?;
         if self.input.byte == self.source_bytes.end {
             if self.input.used != 0 || self.input.utf16 != self.source_utf16.end {
-                return Err(Error::InvalidUtf8); // 只有真实run尾且编码和坐标都完整才能shape。
+                return Err(Error::InvalidUtf8); // Only the actual run end with complete encoding and coordinates may enter shaping.
             }
             self.status = Status::AwaitingShape;
             step.status = self.status;
         }
         if !payload.buffer.paged_checkpoint() || !payload.buffer.allocation_successful() {
-            return Err(Error::ShaperStorage); // 同一step真实回写/撤驻留失败永久撤权。
+            return Err(Error::ShaperStorage); // Actual writeback/reclaim failure in this step permanently retires the job.
         }
         Ok(step)
     }
 }
 
-/// shaper按上游合同最多消费邻接5个scalar；只借用20字节固定栈缓冲，不创建段落String。
+/// The upstream shaper consumes at most five adjacent scalars; use a fixed 20-byte stack window instead of a paragraph String.
 pub(super) fn install_context(
     source: &MarkdownLayoutTextSource,
     range: Range<usize>,
@@ -144,8 +144,8 @@ pub(super) fn install_context(
     Ok(prepare_context(source, range, None)?.install(buffer))
 }
 
-/// 同一个上下文 decoder 接收原 Bidi 已证明的有限可达范围；不会跨不同 level 借入邻接字符。
-/// 普通公开 Job 不带此范围，保留原至多两侧 20B 的真实上下文合同。
+/// Reuse the context decoder with an original Bidi-proved reachable range, without borrowing neighbors across its level boundary.
+/// The general public Job omits those bounds and retains the original at-most-20-byte context on each side.
 pub(super) fn prepare_context(
     source: &MarkdownLayoutTextSource,
     range: Range<usize>,
@@ -164,7 +164,7 @@ pub(super) fn prepare_context(
         let mut bytes = [0u8; 20];
         let mut used = 0;
         source.visit_byte_range(range, |piece| {
-            // 源回调累计长度已由20byte请求固定，真实copy不越过栈数组。
+            // The 20-byte request bounds cumulative source callbacks, keeping actual copies within the stack array.
             bytes[used..used + piece.len()].copy_from_slice(piece);
             used += piece.len();
             maximum = maximum.max(piece.len());
@@ -178,14 +178,14 @@ pub(super) fn prepare_context(
         after: decoded[1],
         bytes: read,
         maximum_borrow: maximum,
-    }) // 原同步入口、试次及已收费闭项共用一套解码/逆序合同，不复制正文解析器。
+    }) // Synchronous entry, trials, and prepaid closed items share one decode/reversal contract without another text parser.
 }
 
-/// 只解释已经取得的至多20byte；原邻接范围、UTF8边缘与五标量次序不因读取方式改变。
+/// Decode at most 20 already borrowed bytes, preserving original adjacency, UTF-8 edge handling, and five-scalar order across input methods.
 pub(super) fn decode_context(bytes: &[u8], preceding: bool) -> Result<([u32; 5], usize)> {
     let mut start = 0;
     if preceding {
-        // 固定前窗可从UTF8中部开始，只跳过开头的continuation；真实run首端仍是标量边界。
+        // A fixed preceding window can begin inside UTF-8; skip only leading continuations while the actual run start remains scalar-aligned.
         while start < bytes.len() && bytes[start] & 0xc0 == 0x80 {
             start += 1;
         }
@@ -193,7 +193,7 @@ pub(super) fn decode_context(bytes: &[u8], preceding: bool) -> Result<([u32; 5],
     let text = match std::str::from_utf8(&bytes[start..]) {
         Ok(text) => text,
         Err(error) if !preceding && error.error_len().is_none() => {
-            // 后窗末端允许不完整UTF8，仅交付之前真实完整的邻接标量。
+            // An after-window may end within UTF-8; deliver only the preceding actual complete neighboring scalars.
             std::str::from_utf8(&bytes[start..start + error.valid_up_to()])
                 .map_err(|_| Error::InvalidUtf8)?
         }
@@ -202,7 +202,7 @@ pub(super) fn decode_context(bytes: &[u8], preceding: bool) -> Result<([u32; 5],
     let mut context = [0u32; 5];
     let mut count = 0;
     if preceding {
-        // shaper前上下文以最近前驱在前；不能把源的逻辑顺序直接传入。
+        // Shaper pre-context starts with the nearest predecessor, not the source's forward logical order.
         for scalar in text.chars().rev().take(5) {
             context[count] = u32::from(scalar);
             count += 1;
@@ -227,6 +227,6 @@ impl PreparedContext {
     pub(super) fn install(&self, buffer: &mut Buffer) -> (usize, usize) {
         buffer.set_pre_context_codepoints(&self.before.0[..self.before.1]);
         buffer.set_post_context_codepoints(&self.after.0[..self.after.1]);
-        (self.bytes, self.maximum_borrow) // 只装配已按原配额读取的值，不在构造中重借Source。
+        (self.bytes, self.maximum_borrow) // Install values already read under original budget without borrowing Source again during assembly.
     }
 }

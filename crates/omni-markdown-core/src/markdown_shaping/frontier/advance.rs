@@ -1,4 +1,5 @@
-//! 同一实际字体全部默认水平advance的分步下界；此证明本身不授予软行或源切片权限。
+//! Incremental lower bounds for all default horizontal advances of the same actual font. This
+//! proof alone grants neither soft-line selection nor source-slice authority.
 
 use harfrust::{GlyphId, ShapePlan, ShapePlanKey};
 use std::sync::{Arc, Weak};
@@ -10,7 +11,8 @@ use super::{
 use crate::markdown_layout_font::frontier::FontFrontierPlan;
 use crate::{MarkdownDocumentBufferError, MarkdownOriginalBackingObserver};
 
-/// 单步最多查询128个真实glyph；全字体闭包与一次正文回调的工作量分别计费。
+/// Query at most 128 actual glyphs per step; full-font closure work and body-callback work are
+/// accounted separately, without treating either budget as wall time or RSS.
 const ADVANCE_SCAN_STEP: usize = 128;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,7 +30,8 @@ pub(crate) enum AdvanceScanError {
 }
 type Result<T> = std::result::Result<T, AdvanceScanError>;
 
-/// 构造只借同一个原Source和Font；不可用名称或复制公开范围替换这些身份。
+/// Borrow the same original Source/font for construction; names and copied public ranges cannot
+/// replace these identities.
 pub(super) struct AdvanceScanOrigin<'a> {
     pub source: &'a MarkdownLayoutTextSource,
     pub source_authority: &'a MarkdownLayoutTextAuthority,
@@ -40,7 +43,8 @@ pub(super) struct AdvanceScanOrigin<'a> {
 pub(super) enum AdvanceScanAnswer {
     Pending,
     Complete,
-    /// 一个真实负值足以拒绝非负后缀证明；不把它夹成0或忽略未扫描glyph。
+    /// One actual negative value rejects a nonnegative-suffix proof; never clamp it to zero or
+    /// ignore the remaining glyph domain to manufacture success.
     Negative {
         glyph: u32,
         advance_26_6: i32,
@@ -54,7 +58,7 @@ pub(super) struct AdvanceScanStep {
     pub total_queried: u32,
 }
 
-/// 只持固定元数据与原Font，不保存源字节、glyph列表或正文索引。
+/// Retain fixed metadata and the original font, without source bytes, a glyph list, or a body index.
 pub(super) struct DefaultAdvanceScan {
     font: Option<MarkdownLayoutFont>,
     font_authority: MarkdownLayoutFontAuthority,
@@ -69,8 +73,9 @@ pub(super) struct DefaultAdvanceScan {
     answer: AdvanceScanAnswer,
 }
 
-/// 只有扫描全部真实glyph后才能产生；弱票不会延长Font、计划或Source的生命期。
-/// 未读文本的ASCII、稳定seam和真实GCB仍由原frontier单独认证。
+/// Issued only after all actual glyphs are scanned; weak tickets extend no font/plan/Source lifetime.
+/// The original frontier still independently certifies unread text's ASCII domain, stable seams,
+/// and actual grapheme boundaries.
 pub(super) struct NonnegativeDefaultAdvanceProof {
     font: MarkdownLayoutFontAuthority,
     source: MarkdownLayoutTextAuthority,
@@ -95,7 +100,8 @@ fn same_options(left: &ValidatedOptions, right: &ValidatedOptions) -> bool {
 }
 
 impl DefaultAdvanceScan {
-    /// 实际计划先通过窄ASCII依赖门，再逐glyph查表；不从名字、当前前缀或抽样推导未来下界。
+    /// Require the actual plan's narrow ASCII dependency certificate before querying every glyph;
+    /// names, a current prefix, or samples cannot establish future lower bounds.
     pub(super) fn new(
         origin: AdvanceScanOrigin<'_>,
         options: &ValidatedOptions,
@@ -111,7 +117,7 @@ impl DefaultAdvanceScan {
         }
         if cancellation.requested() {
             return Err(MarkdownShapingError::Cancelled.into());
-        } // 先检查原Source首错，不能把真实EIO伪装为干净取消。
+        } // Check the original Source failure first; a real EIO cannot become a clean cancellation.
         if !plan_owner.permits_font(origin.font) {
             return Err(AdvanceScanError::PlanMismatch);
         }
@@ -127,7 +133,7 @@ impl DefaultAdvanceScan {
         let count = origin.font.metadata().glyph_count;
         if count == 0 || count > u32::from(u16::MAX) {
             return Err(AdvanceScanError::InvalidRequest);
-        } // 实际maxp目录之外的编号不能被当作默认缺字值补入证明。
+        } // Glyph IDs outside actual maxp cannot contribute invented default/missing values to this proof.
         origin.source.health().map_err(MarkdownShapingError::from)?;
         if cancellation.requested() {
             return Err(MarkdownShapingError::Cancelled.into());
@@ -161,7 +167,7 @@ impl DefaultAdvanceScan {
                 MarkdownDocumentBufferError::OriginalBackingUnavailable(errno),
             )
             .into());
-        } // 原Source故障不能被一份健康外来capture或后继取消掩盖。
+        } // A healthy foreign capture or later cancellation cannot conceal original Source failure.
         source.health().map_err(MarkdownShapingError::from)?;
         if authority != &self.source_authority || !source.permits(authority) {
             return Err(MarkdownShapingError::SourceMismatch.into());
@@ -176,7 +182,8 @@ impl DefaultAdvanceScan {
         Ok(())
     }
 
-    /// 每个调用只做固定数量的真实默认metrics查询；调用方须把该成本计入原worker调度。
+    /// Perform a fixed number of actual default-metric queries per call; the caller accounts this
+    /// work in the original worker schedule.
     pub(super) fn step(
         &mut self,
         source: &MarkdownLayoutTextSource,
@@ -187,7 +194,7 @@ impl DefaultAdvanceScan {
             self.guard(source, authority)?;
             if budget == 0 {
                 return Err(AdvanceScanError::InvalidRequest);
-            } // 零配额不算推进，也不能签发完整字体证明。
+            } // A zero budget performs no progress and cannot issue a complete-font proof.
             let end = self
                 .next
                 .saturating_add(budget.min(ADVANCE_SCAN_STEP) as u32)
@@ -199,8 +206,9 @@ impl DefaultAdvanceScan {
                     .shaper_at_scale(self.options.scale)
                     .map_err(|_| AdvanceScanError::InvalidRequest)?;
                 while self.next < end {
-                    // 正文尚未读到的glyph也逐项覆盖；有平台纯值表时与实际shape消费同一张表，
-                    // 无平台表才读真实hmtx。不可证明文件值非负，却在排版时执行另一套advance。
+                    // Cover glyphs not yet encountered in text too. Use the same immutable platform
+                    // table as actual shaping when present; otherwise read actual hmtx. Proving
+                    // file metrics while executing different advances would not certify the output.
                     let raw = shaper.glyph_h_advance(GlyphId::new(self.next));
                     let advance = self.options.quantize(raw);
                     let glyph = self.next;
@@ -212,13 +220,13 @@ impl DefaultAdvanceScan {
                             advance_26_6: advance,
                         };
                         break;
-                    } // 首个真实负值永久拒证；不能靠后续正值抵消来推导任意后缀非负。
+                    } // The first actual negative rejects certification; later positives cannot prove arbitrary suffixes nonnegative.
                 }
                 if self.answer == AdvanceScanAnswer::Pending && self.next == self.count {
                     self.answer = AdvanceScanAnswer::Complete;
                 }
             }
-            self.guard(source, authority)?; // Font元数据读取后的原Source错误仍压过Ready和取消。
+            self.guard(source, authority)?; // Original Source failure after font access still precedes completion/cancellation.
             Ok(AdvanceScanStep {
                 answer: self.answer,
                 queried: (self.next - start) as usize,
@@ -226,12 +234,13 @@ impl DefaultAdvanceScan {
             })
         })();
         if result.is_err() {
-            drop(self.font.take()); // 任一失败永久归还本扫描的原Font，不允许换Source或选项重试。
+            drop(self.font.take()); // Failure permanently returns this scan's font; another Source/options cannot resume it.
         }
         result
     }
 
-    /// 消费完整扫描；负值和未完成状态都不能拿到proof，失败后也没有可继续使用的扫描owner。
+    /// Consume a complete scan. Negative/incomplete states produce no proof and retain no scan
+    /// owner that could later resume after failure.
     pub(super) fn finish(
         self,
         source: &MarkdownLayoutTextSource,
@@ -255,7 +264,8 @@ impl DefaultAdvanceScan {
 }
 
 impl NonnegativeDefaultAdvanceProof {
-    /// 只给原任务核同一Font/计划/完整选项；这个bool不是源切片、紧急换行或Ready许可。
+    /// Check the original font/plan/full options only; this boolean grants no source slice,
+    /// emergency-line selection, or Ready authority.
     pub(super) fn matches(
         &self,
         origin: AdvanceScanOrigin<'_>,
@@ -275,7 +285,7 @@ impl NonnegativeDefaultAdvanceProof {
         origin.source.health().map_err(MarkdownShapingError::from)?;
         if self.cancellation.requested() {
             return Err(MarkdownShapingError::Cancelled.into());
-        } // 完成查表没有豁免原任务取消；旧proof不能被同Font后继操作重新启用。
+        } // Completed lookup does not waive original cancellation or let another same-font operation revive this proof.
         let plan = plan_owner.plan();
         Ok(self.source == *origin.source_authority
             && origin.source.permits(origin.source_authority)

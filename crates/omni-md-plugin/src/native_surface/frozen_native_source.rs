@@ -1,4 +1,5 @@
-//! 冻结源的唯一封装入口：快照不向外泄漏，真实源资源先析构，家族claim最后结算。
+//! Encapsulate one immutable Source for the explicit frozen-value diagnostic graph. The snapshot
+//! never escapes; its actual resources drop before the family's final Source claim settles.
 
 use std::ops::Range;
 use std::sync::{Arc, Weak};
@@ -16,7 +17,8 @@ pub(super) enum FrozenReadKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 只携固定标量；非法请求也保留原参数和checked结果，不截断成另一个合法窗口。
+/// Carry fixed scalars only. Invalid requests retain their original arguments and checked results,
+/// rather than being truncated into another valid window.
 pub(super) struct FrozenReadRequest {
     pub(super) kind: FrozenReadKind,
     pub(super) snapshot_utf16_len: usize,
@@ -30,11 +32,13 @@ pub(super) struct FrozenReadRequest {
     pub(super) request_valid: bool,
 }
 
-/// hook只能观察固定事实；不得捕获owner、调用Native或panic，生产authority由外部诊断sink负责。
+/// The diagnostic sink may observe fixed facts only: no captured owner, Native calls, or panic.
+/// The sink owns that restriction; this function pointer grants no live editing or Source authority.
 pub(super) type FrozenReadHook = fn(FrozenReadRequest);
 
 struct SourceData {
-    // 字段按声明顺序真实析构；snapshot必须先于最后SourceClaim归还mmap/root/编辑段。
+    // Fields drop in declaration order. The snapshot returns its mmap/root/edit-segment ownership
+    // before this last Source claim reports payload destruction to the family.
     snapshot: MarkdownTextSnapshot,
     generation: u64,
     read_hook: Option<FrozenReadHook>,
@@ -42,7 +46,8 @@ struct SourceData {
 }
 
 #[derive(Clone)]
-/// Clone只分享同一个完整SourceData；不会复制裸快照或制造另一份源claim。
+/// Clone shares the same complete SourceData, without copying a bare snapshot or adding another
+/// Source claim for the same payload.
 pub(super) struct FrozenNativeSource {
     data: Arc<SourceData>,
 }
@@ -52,7 +57,8 @@ pub(super) struct FrozenNativeSourceWeak {
     data: Weak<SourceData>,
 }
 
-/// 只在已通知hook且完整验证后产生，私有快照借用不能从此令牌逃逸。
+/// Created only after notifying the diagnostic hook and validating the entire request. The
+/// private snapshot borrow cannot escape through this read token.
 pub(super) struct FrozenNativeRead<'a> {
     snapshot: &'a MarkdownTextSnapshot,
     start: usize,
@@ -65,7 +71,8 @@ impl FrozenNativeSource {
         family: &Arc<FrozenValueFamily>,
         read_hook: Option<FrozenReadHook>,
     ) -> Result<Self, FrozenValueFamilyError> {
-        // 封源先拒绝，不能先创建裸snapshot再试图补签原家族的来源。
+        // Reject sealed-source admission first; never create a bare snapshot and retroactively
+        // attach it to the original family's authority.
         let claim = family.claim_source()?;
         let snapshot = document.text_snapshot();
         let generation = document.generation();
@@ -80,13 +87,14 @@ impl FrozenNativeSource {
     }
 
     pub(super) fn downgrade(&self) -> FrozenNativeSourceWeak {
+        // The live diagnostic cache keeps only this original allocation's weak identity.
         FrozenNativeSourceWeak {
             data: Arc::downgrade(&self.data),
         }
     }
 
     pub(super) fn generation(&self) -> u64 {
-        self.data.generation // 只是捕获时的原代次，不能当作跨文档身份或重新签发live权限。
+        self.data.generation // Capture-time generation only; it is neither cross-document identity nor renewed live authority.
     }
 
     pub(super) fn utf16_len(&self) -> usize {
@@ -97,11 +105,13 @@ impl FrozenNativeSource {
         &self,
         range: Range<usize>,
     ) -> Result<Range<usize>, MarkdownDocumentBufferError> {
-        // 仅代理冻结树的段落元数据查询，不授予或暴露裸snapshot、全文String或live文档权限。
+        // Query only the frozen tree's paragraph metadata. Expose neither its bare snapshot nor
+        // a full-document String or permission to access a live document.
         self.data.snapshot.text_checking_paragraph_range(range)
     }
 
     pub(super) fn claim_string_value(&self) -> Result<FrozenValueClaim, FrozenValueFamilyError> {
+        // Derivation requires this still-live Source claim, including after new-source sealing.
         self.data.claim.claim_string_value()
     }
 
@@ -113,6 +123,8 @@ impl FrozenNativeSource {
         local_start: usize,
         requested_length: usize,
     ) -> Result<FrozenNativeRead<'_>, MarkdownDocumentBufferError> {
+        // Validate receiver-local and snapshot-global coordinates independently with checked
+        // arithmetic; sharing the snapshot never permits reading beyond a substring receiver.
         let snapshot_utf16_len = self.utf16_len();
         let receiver_end = receiver_start.checked_add(receiver_length);
         let local_end = local_start.checked_add(requested_length);
@@ -124,7 +136,8 @@ impl FrozenNativeSource {
             && local_end.is_some_and(|end| end <= receiver_length)
             && checked_global_end.is_some_and(|end| end <= snapshot_utf16_len);
         if let Some(hook) = self.data.read_hook {
-            // 非法请求在异常之前同样交付原事实；只传fn和标量，不借文档或Native业务对象。
+            // Invalid requests report their original facts before the caller raises an exception.
+            // Pass only a function pointer and scalars, without document or native business borrows.
             hook(FrozenReadRequest {
                 kind,
                 snapshot_utf16_len,
@@ -139,7 +152,8 @@ impl FrozenNativeSource {
             });
         }
         if !request_valid {
-            // 不形成原始输出slice，也不发放可读令牌；接收者外的source字符不能被借机读取。
+            // Issue neither a read token nor an output slice. An invalid receiver request cannot
+            // borrow neighboring characters merely because they exist in the same Source.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         Ok(FrozenNativeRead {
@@ -152,7 +166,8 @@ impl FrozenNativeSource {
 
 impl FrozenNativeSourceWeak {
     pub(super) fn upgrade(&self) -> Option<FrozenNativeSource> {
-        // 升级沿用同一Data/SourceClaim；即使seal后也不凭Weak制造第二份snapshot。
+        // Upgrade retains the same Data/Source claim; even after sealing, a Weak cannot construct
+        // another snapshot or revive a payload whose actual strong ownership already ended.
         self.data.upgrade().map(|data| FrozenNativeSource { data })
     }
 }
@@ -169,7 +184,8 @@ impl FrozenNativeRead<'_> {
 
     pub(super) fn code_unit(&self) -> Result<u16, MarkdownDocumentBufferError> {
         if self.length != 1 {
-            // 字符primitive只能消费真实一个UTF-16单元，不能把bulk请求缩成单字符冒充完成。
+            // The character primitive consumes exactly one UTF-16 unit; it cannot shorten a bulk
+            // request into one unit and present that as completion of the original request.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         self.snapshot.utf16_code_unit_at(self.start)
@@ -180,7 +196,8 @@ impl FrozenNativeRead<'_> {
         destination: &mut [u16],
     ) -> Result<(), MarkdownDocumentBufferError> {
         if destination.len() != self.length {
-            // 输出必须覆盖原请求全部单位；不接受短缓冲、不截断或补另一个范围。
+            // The output must cover the entire original request, without a short buffer,
+            // truncation, or substitution of another range.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         self.snapshot.copy_utf16_code_units(self.start, destination)

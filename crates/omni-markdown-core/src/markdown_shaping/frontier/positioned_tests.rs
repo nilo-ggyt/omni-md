@@ -1,4 +1,5 @@
-//! 原UIFont正文定位计划的真实长词；与独立完整任务及独立逐前缀整形比对。
+//! Actual long words under the original UIFont body positioning plan, checked against independent
+//! complete jobs and independently reshaped prefixes.
 use super::*;
 use crate::{
     MarkdownEmergencyGlyphSliceAnswer, MarkdownEmergencyGlyphSliceJob,
@@ -6,6 +7,8 @@ use crate::{
 };
 
 fn body_font() -> MarkdownLayoutFont {
+    // Use the captured actual body role, axes, and 14-point size. This explicit ignored test requires
+    // its real Native input; substituting another role would not establish body-font behavior.
     let root = std::path::PathBuf::from(
         std::env::var_os("OMNI_FRONTIER_UIFONT_FIXTURES").expect("需要真实UIFont输入"),
     );
@@ -133,7 +136,8 @@ fn measured(
     panic!("有界正文前缀未选中首行")
 }
 
-/// 不借前沿证书或原Measure选择器，逐实际有限GCB前缀重新整形，找到这个kern反例的最后可容纳处。
+/// Reshape actual finite GCB prefixes independently of frontier certificates and the measure
+/// selector, locating the last fitting prefix for this kerning regression.
 fn independent_line(fixture: &Fixture, width: i64) -> (usize, i64) {
     let mut last = (0, 0);
     let mut prior = 0;
@@ -184,7 +188,7 @@ fn independent_line(fixture: &Fixture, width: i64) -> (usize, i64) {
 #[test]
 #[ignore = "显式实际Body14pt字体输入与长词工作计量"]
 fn actual_body_positioned_word_first_line_is_constant_and_exact_for_4k_8k_32k() {
-    let mut observed = Vec::new(); // 三条有限标量记录，生产没有按正文长度增长的Vec。
+    let mut observed = Vec::new(); // Three finite scalar observations, not a production Vec growing with body length.
     for size in [4096, 8192, 32768] {
         let mut fixture = Fixture::new(&"A".repeat(size), body_font());
         let source = fixture.source.resource_observer();
@@ -242,6 +246,8 @@ fn actual_body_positioned_word_first_line_is_constant_and_exact_for_4k_8k_32k() 
 #[test]
 #[ignore = "显式实际Body14pt kern链与独立行断点oracle"]
 fn actual_body_kern_chain_does_not_choose_an_earlier_safe_cut() {
+    // Compare the actual selected/resolved line against independent prefix shaping; choosing an
+    // earlier reusable boundary would lose fitting content even if that earlier cut were safe.
     let text = format!("XX{}", "AV".repeat(4095));
     let mut fixture = Fixture::new(&text, body_font());
     let (frontier, mut child, _ticket, _work) = first_word(&mut fixture);

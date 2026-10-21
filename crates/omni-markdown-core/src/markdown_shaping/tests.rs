@@ -1,4 +1,4 @@
-//! 真实冻结piece与真实字体之间的契约回归；不把同一算法对照当成Native功能或总峰值证明。
+//! Verify real frozen pieces and actual font contracts; same-algorithm comparisons do not prove Native functionality or whole-product peak memory.
 use super::*;
 use harfrust::ShaperFont;
 use std::sync::Arc;
@@ -12,6 +12,7 @@ fn font() -> MarkdownLayoutFont {
     MarkdownLayoutFont::resolve(Arc::new(ROBOTO), "Roboto-Regular", &[]).unwrap()
 }
 fn document(text: &str) -> (tempfile::TempDir, crate::MarkdownDocumentBuffer) {
+    // A private real UTF-8 fixture supplies production mmap/tree storage; its returned TempDir owns only this synthetic file.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("bounded-shaping.md");
     std::fs::write(&path, text).unwrap();
@@ -38,6 +39,7 @@ fn fill(
     bytes: usize,
     scalars: usize,
 ) {
+    // Drive actual bounded ingestion and keep AwaitingShape distinct from Ready; shaping remains a separate explicit phase.
     while job.status() == MarkdownShapingStatus::Ingesting {
         let step = job
             .step(source, font, MarkdownShapingBudget { bytes, scalars })
@@ -49,6 +51,7 @@ fn fill(
 }
 
 #[test]
+// Different byte/scalar cuts must retain exact original context and all actual glyph fields, including global UTF-16 clusters.
 fn real_piece_byte_splits_preserve_global_utf16_clusters_and_exact_shaper_fields() {
     let prefix = "外🙂甲乙🙂اب:";
     let run = "office a\u{301}🙂";
@@ -61,7 +64,7 @@ fn real_piece_byte_splits_preserve_global_utf16_clusters_and_exact_shaper_fields
     let font_authority = font.authority();
     let origin = prefix.encode_utf16().count();
     let end = origin + run.encode_utf16().count();
-    // 同一真实run用不同bytes/scalars配额切入组合字符与emoji内部；正文输入没有中途BOT/EOT。
+    // Cut one actual run inside combining characters/emoji with different quotas; intermediate source windows never create BOT/EOT.
     for (bytes, scalars) in [(1, 1), (2, 1), (3, 2), (4, 3), (7, 2), (4096, 1024)] {
         let mut job = MarkdownShapingJob::new(
             source.clone(),
@@ -131,8 +134,8 @@ fn real_piece_byte_splits_preserve_global_utf16_clusters_and_exact_shaper_fields
 
 #[test]
 fn real_short_and_growing_shapes_keep_complete_glyphs_and_release_actual_storage() {
-    // 同一公开Job逐小批输入：极短项、小工作区增长以及真实64KiB溢出都必须保留完整字形。
-    // 只核原文本的实际结果与FD/映射归还，不读取分配器私态或断言内部增长次数。
+    // One public Job ingests small batches while tiny items, growing workspace, and actual 64-KiB spill all retain complete glyphs.
+    // Compare actual text output and FD/map returns, without allocator internals or counts of private growth operations.
     for units in [7, 600, 2400, 4000] {
         let text = "x".repeat(units);
         let (directory, document) = document(&text);
@@ -180,7 +183,7 @@ fn real_short_and_growing_shapes_keep_complete_glyphs_and_release_actual_storage
             assert_eq!((active.files_created, active.mappings_created), (0, 0));
         } else {
             assert!(observer.paging.snapshot().files_created > 0);
-        } // 小项不能因首次块变小而提前落盘；超过原64KiB仍必须走原文件分页。
+        } // Small items must not spill prematurely after reducing the initial block; exceeding original 64 KiB still uses actual file paging.
         assert!(!document.is_dirty() && !document.can_undo() && !document.can_redo());
         assert_eq!(
             std::fs::read(directory.path().join("bounded-shaping.md")).unwrap(),
@@ -207,6 +210,7 @@ fn real_short_and_growing_shapes_keep_complete_glyphs_and_release_actual_storage
 }
 
 #[test]
+// A foreign capture poisons the original job and closes its actual arrays; returning valid-looking authority cannot restart it.
 fn invalid_foreign_authority_poisoning_closes_real_arrays_and_never_recovers() {
     let (_directory, document) = document("office a\u{301}🙂");
     let source = MarkdownLayoutTextSource::capture(&document);
@@ -227,7 +231,7 @@ fn invalid_foreign_authority_poisoning_closes_real_arrays_and_never_recovers() {
     fill(&mut job, &source_authority, &font_authority, 3, 2);
     let active = observer.paging.snapshot();
     assert!(active.work_bytes > 0);
-    assert_eq!((active.files_open, active.mappings_open), (0, 0)); // 短项真实只拥有固定工作块。
+    assert_eq!((active.files_open, active.mappings_open), (0, 0)); // This short item actually owns only its fixed work block.
     assert!(matches!(
         job.shape(&other.authority(), &font_authority),
         Err(MarkdownShapingError::SourceMismatch)
@@ -248,10 +252,11 @@ fn invalid_foreign_authority_poisoning_closes_real_arrays_and_never_recovers() {
     assert_eq!(job.status(), MarkdownShapingStatus::Poisoned);
     drop(source);
     drop(font);
-    assert!(observer.resources_released()); // other是另一payload，不保活原source。
+    assert!(observer.resources_released()); // The other capture has another payload and does not retain this original Source.
 }
 
 #[test]
+// Empty successful output is actual Ready/EOF before cancellation; both empty and partially ingested jobs then reach a terminal cancelled state.
 fn cancelled_and_empty_runs_have_distinct_terminal_states_and_actual_resource_receipts() {
     for text in ["", "a\u{301}🙂text"] {
         let (_directory, document) = document(text);
@@ -309,6 +314,7 @@ fn cancelled_and_empty_runs_have_distinct_terminal_states_and_actual_resource_re
 }
 
 #[test]
+// An old frozen Source may finish its own actual run after document edits, but newer capture authority cannot read that old job.
 fn edits_after_capture_cannot_replace_the_run_or_refresh_its_original_authority() {
     let (_directory, mut document) = document("office🙂");
     let source = MarkdownLayoutTextSource::capture(&document);
@@ -346,6 +352,7 @@ fn edits_after_capture_cannot_replace_the_run_or_refresh_its_original_authority(
 }
 
 #[test]
+// Foreign Font, surrogate-interior range, and invalid input quota must fail explicitly rather than fall back or publish an ingested prefix.
 fn foreign_font_and_invalid_budget_never_fall_back_or_publish_an_input_prefix() {
     let (_directory, document) = document("🙂ffi");
     let source = MarkdownLayoutTextSource::capture(&document);
@@ -364,7 +371,7 @@ fn foreign_font_and_invalid_budget_never_fall_back_or_publish_an_input_prefix() 
         ),
         Err(MarkdownShapingError::FontMismatch)
     ));
-    // 一个低代理项范围不能因起点“很接近”而被修正为整标量。
+    // A low-surrogate range cannot be repaired into a complete scalar merely because its start is nearby.
     assert!(
         MarkdownShapingJob::new(
             source.clone(),
@@ -404,6 +411,7 @@ fn foreign_font_and_invalid_budget_never_fall_back_or_publish_an_input_prefix() 
 }
 
 #[test]
+// The existing deep checkpoint barrier observes actual algorithm entry before cancellation; join the actual worker before checking resources.
 fn deep_shape_cancellation_joins_worker_and_releases_original_source_and_paging() {
     use harfrust::{CooperativeCheckpointKind as Kind, CooperativePhase as Phase};
     use std::sync::{
@@ -416,7 +424,7 @@ fn deep_shape_cancellation_joins_worker_and_releases_original_source_and_paging(
     let barrier = Arc::new(Barrier::new(2));
     let worker_barrier = barrier.clone();
     let worker = std::thread::spawn(move || {
-        // 所有不可Send的job/Font分页工作owner均在worker内构造，不做unsafe线程声明。
+        // Construct all non-Send job/Font paging owners inside the worker rather than adding unsafe thread-safety declarations.
         let text = "office a\u{301}".repeat(2048);
         let (_directory, document) = document(&text);
         let backing = document.original_backing_observer().unwrap();
@@ -445,7 +453,7 @@ fn deep_shape_cancellation_joins_worker_and_releases_original_source_and_paging(
                 && !entered.swap(true, Ordering::AcqRel)
             {
                 entered_tx.send(point).unwrap();
-                worker_barrier.wait(); // 真实Normalize循环已进入后，另一线程才请求同原token。
+                worker_barrier.wait(); // Only after entering the actual Normalize loop does the other thread request this same original token.
             }
         }));
         assert!(matches!(
@@ -481,6 +489,7 @@ fn deep_shape_cancellation_joins_worker_and_releases_original_source_and_paging(
 }
 
 #[test]
+// Source failure on an actual resident-window return must take priority over a later stop request and retire the original job.
 fn actual_source_reclaim_failure_is_not_hidden_by_cancellation_request() {
     let (_directory, document) = document("office a\u{301}🙂");
     let source = MarkdownLayoutTextSource::capture(&document);
@@ -497,7 +506,7 @@ fn actual_source_reclaim_failure_is_not_hidden_by_cancellation_request() {
     )
     .unwrap();
     fill(&mut job, &source_authority, &font_authority, 4096, 1024);
-    // 先真实触达同原窗口，再于真实msync完成后注入永久回收错误，不能只手改状态位。
+    // Touch the actual original window before injecting permanent reclaim failure after real msync, rather than editing a status bit alone.
     source.visit_byte_range(0..1, |_| Ok(())).unwrap();
     document.fail_next_original_reclaim_for_test();
     assert!(document.reclaim_original_read_windows_for_test().is_err());
@@ -513,6 +522,7 @@ fn actual_source_reclaim_failure_is_not_hidden_by_cancellation_request() {
 }
 
 #[test]
+// A stop request revokes already Ready glyphs and releases their arrays without replacing the original output nonce.
 fn cancellation_of_a_previously_ready_job_revokes_cached_glyphs_without_recreating_output() {
     let (_directory, document) = document("office");
     let source = MarkdownLayoutTextSource::capture(&document);
@@ -544,7 +554,7 @@ fn cancellation_of_a_previously_ready_job_revokes_cached_glyphs_without_recreati
     ));
     assert_eq!(job.status(), MarkdownShapingStatus::Cancelled);
     assert!(job.payload.is_none());
-    assert!(std::sync::Weak::ptr_eq(&output, &job.index_identity())); // 失败不能靠换输出nonce续签。
+    assert!(std::sync::Weak::ptr_eq(&output, &job.index_identity())); // Failure cannot renew output by replacing its nonce.
     assert!(matches!(
         job.shape(&source_authority, &font_authority),
         Err(MarkdownShapingError::Cancelled)

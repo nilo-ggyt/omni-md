@@ -1,4 +1,5 @@
-//! 独立不可变属性值只共享冻结NSString和有限run元数据，不通过mutable属性容器复制正文。
+//! Immutable attributed values for the explicit diagnostic experiment. Share the frozen NSString
+//! and captured run metadata without copying document text through a mutable attributed container.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -16,7 +17,8 @@ use super::frozen_value_family::{FrozenValueClaim, FrozenValueFamilyError};
 
 pub(super) type FrozenAnnotationAttributes = NSDictionary<NSAttributedStringKey, AnyObject>;
 
-/// 调用方提供真实source-local UTF-16范围；字典容器在构造时copy，值保留Cocoa浅属性语义。
+/// Caller supplies actual source-local UTF-16 ranges. Construction copies dictionary containers;
+/// their values retain Cocoa's shallow attribute semantics.
 pub(super) struct FrozenAnnotationRun {
     pub(super) range: Range<usize>,
     pub(super) attributes: Retained<FrozenAnnotationAttributes>,
@@ -39,15 +41,18 @@ struct FrozenAnnotationSegment {
     attributes: Retained<FrozenAnnotationAttributes>,
 }
 
-/// Arc只保证实际Native后台copy/substring的元数据引用计数，不承诺任意属性对象线程安全。
+/// Arc supplies atomic metadata ownership for native background copy/substring; it does not make
+/// arbitrary attribute objects thread-safe.
 ///
-/// 字典映射冻结，属性值不deep-copy；外部修改或释放线程须满足标准Cocoa属性对象合同。
-/// 该类型及Native子类不实现Rust Send/Sync，也不保存主线程图、live文档或可撤销票据。
+/// Dictionary mappings are frozen while their values are not deep-copied. External mutation and
+/// release threads must satisfy each Cocoa attribute object's contract. Neither this type nor its
+/// native subclass implements Rust Send/Sync, and neither retains a live document, main-thread graph,
+/// or revocable ticket.
 struct FrozenAnnotationData {
     source: Retained<FrozenMarkdownString>,
     length: usize,
     segments: Box<[FrozenAnnotationSegment]>,
-    // 原字符串与字典payload先实际析构，最后结算共享AnnotationPayload。
+    // The original string and dictionary payloads actually drop before the shared AnnotationPayload claim settles.
     claim: FrozenValueClaim,
 }
 
@@ -61,7 +66,8 @@ impl AnnotationView {
     fn subrange(self, range: NSRange) -> Option<Self> {
         let end = range.location.checked_add(range.length)?;
         if end > self.length {
-            // 原值EOF可产生空substring；不能借共同source读取接收者范围以外的属性。
+            // Receiver EOF permits an empty substring, but the shared Source cannot authorize
+            // reading attributes beyond the actual receiver's range.
             return None;
         }
         Some(Self {
@@ -72,14 +78,15 @@ impl AnnotationView {
 
     fn index(self, index: usize) -> Option<usize> {
         if index >= self.length {
-            // 空值与EOF没有可查询的属性字符；与NSString原语一样明确拒绝。
+            // Empty values and EOF contain no attribute-bearing character at this index;
+            // reject explicitly, just as the NSString primitives reject invalid character positions.
             return None;
         }
         self.start.checked_add(index)
     }
 
     fn end(self) -> usize {
-        self.start + self.length // 只由已校验的真实source范围构造，不接受独立未检查的两端。
+        self.start + self.length // Constructed only from a validated actual Source range, never independently unchecked endpoints.
     }
 }
 
@@ -87,26 +94,26 @@ pub(super) struct FrozenAnnotationIvars {
     data: Arc<FrozenAnnotationData>,
     view: AnnotationView,
     string: Retained<NSString>,
-    // Data与精确string view先释放；每个实际Native属性值独立配平这一个claim。
+    // Data and the exact string view drop first; each actual native attributed value balances its own claim afterward.
     _claim: FrozenValueClaim,
 }
 
 define_class!(
-    // SAFETY: 实现NSAttributedString公开的string/attributes primitive，并保留真实UTF-16范围。
-    // AnyThread仅允许构造，类没有unsafe Send/Sync；共享元数据使用Arc，属性值保持标准浅语义。
+    // SAFETY: Implements public NSAttributedString string/attributes primitives with actual UTF-16 ranges.
+    // AnyThread permits construction only, not unsafe Send/Sync. Metadata uses Arc; attribute values retain shallow semantics.
     #[unsafe(super = NSAttributedString)]
     #[thread_kind = AnyThread]
     #[ivars = FrozenAnnotationIvars]
     pub(super) struct FrozenAnnotation;
 
-    // SAFETY: 保留NSObject继承行为；所有资源随最后值自然释放，不回调活动文档或AppKit。
+    // SAFETY: Preserves inherited NSObject behavior. Last-value destruction releases resources without live-document or AppKit callbacks.
     unsafe impl NSObjectProtocol for FrozenAnnotation {}
 
     impl FrozenAnnotation {
         #[unsafe(method_id(string))]
         #[unsafe(method_family = none)]
         fn annotation_string(&self) -> Retained<NSString> {
-            self.ivars().string.clone() // 只retain真实范围值，不复制或物化字符。
+            self.ivars().string.clone() // Retain the exact range value without copying or materializing characters.
         }
 
         #[unsafe(method(length))]
@@ -117,7 +124,7 @@ define_class!(
         #[unsafe(method_id(attributesAtIndex:effectiveRange:))]
         #[unsafe(method_family = none)]
         /// # Safety
-        /// effective_range须为null或在本同步调用中可写的一个NSRange。
+        /// effective_range must be null or writable for one NSRange throughout this synchronous call.
         unsafe fn annotation_attributes(
             &self,
             index: NSUInteger,
@@ -127,30 +134,33 @@ define_class!(
             let segment = &self.ivars().data.segments[segment_index];
             if !effective_range.is_null() {
                 let local = self.local_segment_range(segment);
-                // SAFETY: caller提供可写输出，真实segment与view相交且包含已校验的index。
+                // SAFETY: Caller supplies writable output; the actual segment intersects this view
+                // and contains the already validated index.
                 unsafe { effective_range.write(local) };
             }
-            segment.attributes.clone() // 非copy返回家族仅移交一个有效字典claim。
+            segment.attributes.clone() // The noncopy return convention transfers one valid dictionary retain.
         }
 
         #[unsafe(method_id(attributesAtIndex:longestEffectiveRange:inRange:))]
         #[unsafe(method_family = none)]
         /// # Safety
-        /// effective_range须为null或在本同步调用中可写的一个NSRange。
+        /// effective_range must be null or writable for one NSRange throughout this synchronous call.
         unsafe fn annotation_longest_attributes(
             &self,
             index: NSUInteger,
             effective_range: *mut NSRange,
             range_limit: NSRange,
         ) -> Retained<FrozenAnnotationAttributes> {
-            // NULL只免除求最大范围，不能免除index和rangeLimit的公开边界校验。
+            // A null output skips longest-range calculation only; it does not exempt index or
+            // rangeLimit from their public receiver-bound checks.
             let segment_index = self.segment_at(index);
             self.ivars().view.subrange(range_limit).unwrap_or_else(|| throw_range());
             let attributes = &self.ivars().data.segments[segment_index].attributes;
             if !effective_range.is_null() {
                 let full = self.longest_attributes_range(segment_index);
                 let clipped = NSIntersectionRange(full, range_limit);
-                // SAFETY: 同一view的最大实际同字典区间按合法limit裁切，caller拥有此输出。
+                // SAFETY: Clip the same view's actual longest equal-dictionary range to the valid
+                // limit; caller owns this writable output.
                 unsafe { effective_range.write(clipped) };
             }
             attributes.clone()
@@ -159,7 +169,7 @@ define_class!(
         #[unsafe(method_id(copyWithZone:))]
         #[unsafe(method_family = copy)]
         fn annotation_copy(&self, _zone: *mut NSZone) -> Retained<Self> {
-            self.retain() // 不可变copy只返回这一个+1，不重新capture run、字典或字符。
+            self.retain() // Immutable copy returns this one +1, without recapturing runs, dictionaries, or characters.
         }
 
         #[unsafe(method_id(attributedSubstringFromRange:))]
@@ -167,18 +177,19 @@ define_class!(
         fn annotation_substring(&self, range: NSRange) -> Retained<NSAttributedString> {
             let view = self.ivars().view.subrange(range).unwrap_or_else(|| throw_range());
             if view == self.ivars().view {
-                self.retain().into_super() // 整范围共享同值；noncopy method_id负责正确返回家族。
+                self.retain().into_super() // The full-range substring shares this value; noncopy method_id handles return ownership.
             } else {
                 Self::from_parts(Arc::clone(&self.ivars().data), view)
                     .unwrap_or_else(|_| throw_storage())
-                    .into_super() // 新值只共享原Data与精确偏移，不保留父substring。
+                    .into_super() // The new value shares original Data and exact offsets, without retaining a parent substring.
             }
         }
     }
 );
 
 impl FrozenAnnotation {
-    /// 创建有序真实runs的不可变值；未覆盖部分具有空字典，不合成正文或分隔字符。
+    /// Construct an immutable value from ordered actual runs. Uncovered intervals have empty
+    /// dictionaries; no document text or separator characters are synthesized.
     pub(super) fn new(
         source: Retained<FrozenMarkdownString>,
         runs: Vec<FrozenAnnotationRun>,
@@ -187,31 +198,35 @@ impl FrozenAnnotation {
         let mut previous_end = 0;
         for run in &runs {
             if run.range.start >= run.range.end || run.range.end > length {
-                // 零长、倒置、越界均在任何字典copy前拒绝，不静默丢掉调用方的属性意图。
+                // Reject empty, reversed, and out-of-bounds runs before copying any dictionary;
+                // never silently discard the caller's original attribute intent.
                 return Err(FrozenAnnotationError::InvalidRunRange);
             }
             if run.range.start < previous_end {
-                // 不排序或裁切原runs来掩盖重叠；原坐标顺序就是唯一属性来源。
+                // Do not sort or clip original runs to conceal overlap. Their original coordinate
+                // order is the sole attribute-range authority.
                 return Err(FrozenAnnotationError::RunsNotOrdered);
             }
             previous_end = run.range.end;
         }
 
-        // 只有原StringClaim能派生共享payload；参数失败尚未签发claim，Native失败沿RAII配平。
+        // Only the original String claim derives this shared payload. Argument failure creates
+        // no claim; subsequent native failure balances installed ownership through RAII.
         let claim = source.claim_annotation_payload()?;
         let empty = FrozenAnnotationAttributes::new();
         let mut segments = Vec::new();
         let mut next = 0;
         for run in runs {
             if next < run.range.start {
-                // 只填range元数据和共享空字典；gap既不读字符，也不制造隐含样式。
+                // Fill only range metadata and a shared empty dictionary. A gap reads no characters
+                // and adds no implicit style.
                 segments.push(FrozenAnnotationSegment {
                     range: next..run.range.start,
                     attributes: empty.clone(),
                 });
             }
-            // SAFETY: NSDictionary公开copy家族冻结容器映射；键仍为NSString，值只retain，
-            // 不深拷贝、不把NSNumber/NSString/NSNull或其他Cocoa属性对象转成另一种类型。
+            // SAFETY: Public NSDictionary copy freezes the container mapping. Keys remain NSString;
+            // values are retained, not deep-copied or converted from NSNumber/NSString/NSNull into another type.
             let attributes: Retained<FrozenAnnotationAttributes> =
                 unsafe { msg_send![&*run.attributes, copy] };
             next = run.range.end;
@@ -221,16 +236,19 @@ impl FrozenAnnotation {
             });
         }
         if next < length {
-            // 尾部未覆盖区间同样保留真实空字典；空source不创建伪字符segment。
+            // The uncovered tail also uses an actual empty dictionary. An empty Source receives
+            // no fabricated character segment.
             segments.push(FrozenAnnotationSegment {
                 range: next..length,
                 attributes: empty,
             });
         }
-        // 同一不可变ObjC值可由Native后台回调派生substring；其共享payload必须原子clone/drop，
-        // 不能换Rc。字典容器已copy，source/范围不可变，claim内部同步；通用属性值仍受Cocoa
-        // 自身线程合同约束，因此不为Data或Native值添加Rust Send/Sync。独立控制在main持有
-        // 原值至worker join，worker只用不可变Foundation属性并核实际weak释放，不概括任意AnyObject。
+        // Native background callbacks may derive substrings from the same immutable ObjC value,
+        // so shared payload clone/drop needs Arc rather than Rc. Containers are copied, Source/ranges
+        // are immutable, and claims synchronize internally. General attribute values still obey Cocoa's
+        // own thread contracts, so Data/native values gain no Rust Send/Sync. The independent control
+        // retains the original on main until worker join and uses immutable Foundation attributes;
+        // that control does not generalize to arbitrary AnyObject payloads.
         #[allow(
             clippy::arc_with_non_send_sync,
             reason = "Native AnyThread回调共享不可变payload需要原子计数；通用Cocoa属性不具Rust Send/Sync"
@@ -248,14 +266,16 @@ impl FrozenAnnotation {
         data: Arc<FrozenAnnotationData>,
         view: AnnotationView,
     ) -> Result<Retained<Self>, FrozenAnnotationError> {
-        // 每个真正new的属性对象先登记原payload血缘，copy(self)不会经过此工厂。
+        // Every genuinely new attributed object registers its original payload lineage before
+        // native allocation. copy(self) retains the existing value and does not enter this factory.
         let claim = data.claim.claim_annotation_value()?;
         let string = if view.start == 0 && view.length == data.length {
-            data.source.clone().into_super() // 完整源直接共享原冻结NSString，绝不经过mutable容器。
+            data.source.clone().into_super() // The full range shares the original frozen NSString directly, without a mutable container.
         } else {
             data.source
                 .substringWithRange(NSRange::new(view.start, view.length))
-            // 真实子串仍由FrozenMarkdownString公开override创建共享快照值，包括单独surrogate。
+            // FrozenMarkdownString's public override creates an actual shared-snapshot substring,
+            // including valid NSString slices containing a single surrogate code unit.
         };
         let allocated = Self::alloc().set_ivars(FrozenAnnotationIvars {
             data,
@@ -263,16 +283,20 @@ impl FrozenAnnotation {
             string,
             _claim: claim,
         });
-        // SAFETY: 两个公开primitive与全部ivars已就绪；父类init不接收或复制正文参数。
+        // SAFETY: Required public primitives and all ivars are ready. Superclass init receives
+        // and copies no document-text argument.
         let value: Retained<Self> = unsafe { msg_send![super(allocated), init] };
         if !std::ptr::eq(value.class(), Self::class()) {
-            // 若class cluster替换对象就不访问Rust ivars，原Retained正常release后报告失败。
+            // If class-cluster initialization replaces the object, do not access Rust ivars;
+            // ordinary Retained release balances it while construction reports failure.
             return Err(FrozenAnnotationError::NativeClassChanged);
         }
         Ok(value)
     }
 
     fn segment_at(&self, index: usize) -> usize {
+        // Resolve receiver-local coordinates to the original segment directory. Binary search
+        // must find one actual run or gap containing this character, not invent missing coverage.
         let global = self
             .ivars()
             .view
@@ -281,7 +305,8 @@ impl FrozenAnnotation {
         let segments = &self.ivars().data.segments;
         let position = segments.partition_point(|segment| segment.range.end <= global);
         if segments.get(position).is_none_or(|segment| {
-            // 每个真实字符必须恰好落在一个显式run或gap中；不把缺失覆盖伪装为空属性成功。
+            // Every actual character belongs to one explicit run or gap; missing coverage is a
+            // storage inconsistency, not successful empty attributes.
             global < segment.range.start || global >= segment.range.end
         }) {
             throw_storage();
@@ -290,6 +315,8 @@ impl FrozenAnnotation {
     }
 
     fn local_segment_range(&self, segment: &FrozenAnnotationSegment) -> NSRange {
+        // Return the segment/view intersection in receiver-local UTF-16 units, preserving the
+        // substring's own start rather than leaking a shared Source's global coordinates.
         let view = self.ivars().view;
         let start = segment.range.start.max(view.start);
         let end = segment.range.end.min(view.end());
@@ -297,6 +324,8 @@ impl FrozenAnnotation {
     }
 
     fn longest_attributes_range(&self, index: usize) -> NSRange {
+        // Extend only through adjacent equal dictionaries inside this view. This compares actual
+        // attribute values; it neither reads characters nor assembles another attributed string.
         let data = &self.ivars().data;
         let view = self.ivars().view;
         let attributes = &data.segments[index].attributes;
@@ -307,7 +336,8 @@ impl FrozenAnnotation {
             if previous.range.end <= view.start
                 || !attributes.isEqualToDictionary(&previous.attributes)
             {
-                // 按实际字典值比较而不是对象地址；跨view或字典不等即是真实最大边界。
+                // Dictionary value equality, not pointer identity, determines continuity; a view
+                // boundary or unequal dictionary ends the actual longest interval.
                 break;
             }
             first -= 1;
@@ -315,7 +345,8 @@ impl FrozenAnnotation {
         while last + 1 < data.segments.len() {
             let next = &data.segments[last + 1];
             if next.range.start >= view.end() || !attributes.isEqualToDictionary(&next.attributes) {
-                // 相邻段即使来自不同原字典也可同值连续；不读字符或生成中间属性串。
+                // Different original dictionary objects may still be equal in adjacent segments;
+                // no character reads or intermediate attributed strings are needed.
                 break;
             }
             last += 1;
@@ -327,6 +358,7 @@ impl FrozenAnnotation {
 }
 
 fn throw_range() -> ! {
+    // Public receiver-bound violations remain Foundation range exceptions.
     throw_named(
         ns_string!("NSRangeException"),
         ns_string!("不可变属性值的UTF-16请求越过接收者范围"),
@@ -334,6 +366,7 @@ fn throw_range() -> ! {
 }
 
 fn throw_storage() -> ! {
+    // Inconsistent validated coverage/resource facts use a distinct internal consistency exception.
     throw_named(
         ns_string!("NSInternalInconsistencyException"),
         ns_string!("不可变属性值的已验证范围或资源不一致"),
@@ -342,10 +375,10 @@ fn throw_storage() -> ! {
 
 fn throw_named(name: &NSString, reason: &NSString) -> ! {
     let class = AnyClass::get(c"NSException").expect("Foundation异常类已链接");
-    // SAFETY: 公开NSException工厂参数类型正确；固定原因不含正文，nil userInfo符合公开合同。
+    // SAFETY: Correct public NSException factory arguments, with a fixed text-free reason and nil userInfo.
     let exception: Retained<objc2::exception::Exception> = unsafe {
         msg_send![class, exceptionWithName: name, reason: reason, userInfo: None::<&AnyObject>]
     };
-    // define_class生成C-unwind入口；仅使用已实测官方ObjC throw/catch，不以Rust panic代替。
+    // define_class supplies C-unwind entries; use the Objective-C throw/catch contract rather than a Rust panic substitute.
     objc2::exception::throw(exception)
 }

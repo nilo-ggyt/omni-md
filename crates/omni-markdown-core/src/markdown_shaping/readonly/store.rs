@@ -1,4 +1,4 @@
-//! 唯一匿名FD，无用户映射、外借File或跨线程可变cursor；seal后只做固定record的pread。
+//! Own one anonymous FD without user mappings, lent Files, or cross-thread mutable cursors; sealed reads use bounded fixed-record pread.
 use super::{MARKDOWN_SHAPED_SPOOL_STEP, RECORD};
 use std::{
     fs::File,
@@ -23,7 +23,7 @@ pub enum MarkdownShapedSpoolIoOperation {
 }
 impl std::fmt::Display for MarkdownShapedSpoolIoOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 枚举和记录码保持稳定，用户可能看到的错误说明统一为简体中文。
+        // Keep enum/record codes stable while user-visible operation descriptions remain Simplified Chinese.
         formatter.write_str(match self {
             Self::Create => "创建匿名字形文件",
             Self::Write => "写入字形批次",
@@ -73,7 +73,7 @@ impl Observer {
                 5 => Operation::Read,
                 6 => Operation::Close,
                 _ => Operation::InvalidState,
-            }; // 原固定标签反解，不用unsafe把任意整数当成enum。
+            }; // Decode original fixed tags explicitly rather than unsafely treating arbitrary integers as enum variants.
             Some(MarkdownShapedSpoolIoError {
                 operation,
                 errno: packed as u32 as i32,
@@ -136,7 +136,7 @@ impl Store {
             .facts
             .first
             .compare_exchange(0, packed, Ordering::AcqRel, Ordering::Acquire);
-        // 永久返回同一个首次事实，清理失败不能换掉原write/read/sync首因。
+        // Return the same permanent first fact; cleanup failure cannot replace the original write/read/sync cause.
         self.observer()
             .snapshot()
             .first_error
@@ -153,7 +153,7 @@ impl Store {
             || bytes.len() > RECORD * MARKDOWN_SHAPED_SPOOL_STEP
             || !bytes.len().is_multiple_of(RECORD)
         {
-            return Err(self.invalid()); // 具体spool协议错误，不冒充已执行的系统IO。
+            return Err(self.invalid()); // A concrete spool-contract error must not pretend a system I/O operation actually ran.
         }
         let result = match self.file.as_mut() {
             Some(file) => file.write_all(bytes),
@@ -166,7 +166,7 @@ impl Store {
                 MarkdownShapedSpoolIoOperation::Write,
                 io::Error::from_raw_os_error(libc::EIO),
             ));
-        } // 真实write完成后注入失败，检验已写候选前缀绝不能发布。
+        } // Existing injection follows actual write, verifying that a written candidate prefix still cannot publish.
         Ok(())
     }
     pub(super) fn seal(&mut self, expected: usize) -> Result<()> {
@@ -190,7 +190,7 @@ impl Store {
                 io::Error::from_raw_os_error(libc::EIO),
             ));
         }
-        self.sealed = true; // 只有全部写入、真实extent和sync成功才撤去writer权限。
+        self.sealed = true; // Revoke write permission only after complete writes, actual extent verification, and successful sync.
         Ok(())
     }
     pub(super) fn read_into(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
@@ -198,7 +198,7 @@ impl Store {
             || bytes.len() > RECORD * MARKDOWN_SHAPED_SPOOL_STEP
             || !bytes.len().is_multiple_of(RECORD)
         {
-            return Err(self.invalid()); // 调用方只可读取固定有界批次，不能借File读取整run。
+            return Err(self.invalid()); // Callers read bounded fixed batches, without borrowing File to read the whole run.
         }
         let file = self.file.as_ref().ok_or_else(|| self.invalid())?;
         let offset = u64::try_from(offset).map_err(|_| self.invalid())?;
@@ -212,7 +212,7 @@ impl Store {
             return Ok(());
         };
         let descriptor = file.into_raw_fd();
-        // SAFETY: File的唯一所有权已消费且未外借/clone FD；close只调用一次，不重试可能复用的描述符。
+        // SAFETY: Consume unique File ownership with no lent/cloned FD; close exactly once, never retrying a possibly reused descriptor.
         let status = unsafe { libc::close(descriptor) };
         if status == 0 {
             self.facts.open.store(false, Ordering::Release);
@@ -231,7 +231,7 @@ impl Store {
                 MarkdownShapedSpoolIoOperation::Close,
                 io::Error::from_raw_os_error(libc::EIO),
             ));
-        } // 真实close成功事实与注入的永久负面事实分别保留，不伪造仍开的FD。
+        } // Retain actual close success separately from the injected permanent negative fact, without pretending the FD remains open.
         Ok(())
     }
     #[cfg(test)]
@@ -254,5 +254,5 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         let _ = self.close();
-    } // fallible事实已原子保存，Drop不panic、不清首错。
+    } // Fallible facts are stored atomically; Drop neither panics nor clears the first error.
 }

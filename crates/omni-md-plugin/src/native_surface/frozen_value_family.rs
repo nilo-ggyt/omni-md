@@ -1,4 +1,5 @@
-//! 不可变值家族只观察真实payload和值析构，不持正文、Native对象或活动会话。
+//! Observe immutable payload/value destruction for explicit frozen-value diagnostics and Rust
+//! contract tests. The family retains no text, native object, or active session.
 
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -7,7 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
-/// 每个claim属于一个实际资源字段或具体值，不能用父对象消失替代所有派生值析构。
+/// Each claim belongs to an actual resource field or concrete value. Expiration of a parent
+/// object cannot stand in for destruction of all derived values.
 pub(super) enum FrozenValueClaimKind {
     SourcePayload,
     AnnotationPayload,
@@ -17,24 +19,28 @@ pub(super) enum FrozenValueClaimKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
-/// 三个既有关闭角色各有一个独立观察槽，不复制资源清单或新增关闭权限。
+/// Each of the three existing close roles has one observation slot, without duplicating resource
+/// inventories or creating additional close authority.
 pub(super) enum FrozenValueObserverRole {
     Editor,
     FullGraph,
     Resources,
 }
 
-/// 实现只能持原子释放信号或弱元数据，不能捕获正文、Native强对象或业务闭包。
+/// Implementations may retain only atomic release signals or weak metadata, without text,
+/// strong native objects, or business closures.
 pub(super) trait FrozenValueReleaseObserver: Send + Sync {
-    /// 在family锁外移交同一真实析构事实；实现还须自行尊重其cohort的取消状态。
+    /// Deliver the same actual destruction fact outside the family mutex; the implementation
+    /// must still honor cancellation of its own cohort.
     fn released(&self);
 
-    /// 只读取取消标量，不回调family、不获取其他锁、不执行Native或业务操作。
+    /// Read cancellation scalars only: no family reentry, other locks, Native, or business work.
     fn is_cancelled(&self) -> bool;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 返回错误不制造claim；已经丢失精确性或父类型错误会永久禁止完成收据。
+/// Errors create no claim. Lost accounting precision or an invalid parent kind permanently
+/// prevents a successful completion receipt.
 pub(super) enum FrozenValueFamilyError {
     SourcesSealed,
     InvalidParentKind,
@@ -50,15 +56,15 @@ pub(super) enum FrozenValueFamilyError {
 impl fmt::Display for FrozenValueFamilyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
-            Self::SourcesSealed => "不可变值家族已停止创建新源", // 旧值的合法派生仍然有效。
-            Self::InvalidParentKind => "不可变值派生的父claim类型无效", // 不允许凭任意活动计数造值。
-            Self::MissingLiveParent => "不可变值派生缺少仍存活的父claim", // 计数矛盾不能当作已释放。
-            Self::CounterOverflow => "不可变值生命周期计数溢出", // 无法精确表示后永久失败。
-            Self::ObserverAlreadyRegistered => "该释放角色已有未取消的观察者", // 不覆盖原关闭权限。
-            Self::ObserverAlreadyConsumed => "该释放角色的观察事实已被消费", // 死Weak不等于明确取消。
-            Self::ObserverCancelled => "不能登记已经取消的释放观察者", // 不建立没有权限的新槽。
-            Self::ObserverPanicked => "不可变值释放观察者未遵守无panic合同", // Drop仍须正常归还资源。
-            Self::Failed => "不可变值家族已失去完整释放证明", // 后续零计数也不能恢复成功。
+            Self::SourcesSealed => "不可变值家族已停止创建新源", // Valid derivation from existing values remains permitted.
+            Self::InvalidParentKind => "不可变值派生的父claim类型无效", // Arbitrary active counts cannot authorize a new value.
+            Self::MissingLiveParent => "不可变值派生缺少仍存活的父claim", // Contradictory accounting is not completed release.
+            Self::CounterOverflow => "不可变值生命周期计数溢出", // Lost precision leaves permanent failure.
+            Self::ObserverAlreadyRegistered => "该释放角色已有未取消的观察者", // Preserve the original close role's authority.
+            Self::ObserverAlreadyConsumed => "该释放角色的观察事实已被消费", // An expired Weak is not explicit cancellation.
+            Self::ObserverCancelled => "不能登记已经取消的释放观察者", // No new slot is granted to an unauthorized observer.
+            Self::ObserverPanicked => "不可变值释放观察者未遵守无panic合同", // Actual resource Drop must still complete.
+            Self::Failed => "不可变值家族已失去完整释放证明", // Later zero counts cannot restore successful evidence.
         };
         formatter.write_str(message)
     }
@@ -67,7 +73,8 @@ impl fmt::Display for FrozenValueFamilyError {
 impl std::error::Error for FrozenValueFamilyError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 只含固定标量；完成仅表示payload和值析构，不声称后台super dealloc已返回。
+/// Fixed scalars only. Completion describes payload/value-field destruction, not return from a
+/// background Objective-C superclass dealloc or release of a complete native graph.
 pub(super) struct FrozenValueFamilySnapshot {
     pub(super) sealed_sources: bool,
     pub(super) payload_value_destructors_complete: bool,
@@ -95,14 +102,16 @@ struct FamilyState {
     observers: [ObserverSlot; 3],
 }
 
-/// 一个editor的家族元数据可跨Foundation调用线程共享，但不因此授予Native类型Send/Sync。
+/// One editor's family metadata may be shared across Foundation callback threads; that does not
+/// grant Rust Send/Sync to any native value type.
 pub(super) struct FrozenValueFamily {
     state: Mutex<FamilyState>,
     failed: AtomicBool,
 }
 
 #[must_use = "claim必须放在真实资源字段之后，并在资源实际析构后由Drop归还"]
-/// 不可Clone且没有手动成功release；遗忘guard会保持未完成，不能伪造释放。
+/// Not Clone and no manual successful release. Forgetting the guard keeps completion pending,
+/// rather than manufacturing evidence that its actual resource was destroyed.
 pub(super) struct FrozenValueClaim {
     family: Arc<FrozenValueFamily>,
     kind: FrozenValueClaimKind,
@@ -112,20 +121,24 @@ type Notifications = [Option<Arc<dyn FrozenValueReleaseObserver>>; 3];
 
 impl FrozenValueFamily {
     pub(super) fn new() -> Arc<Self> {
+        // Allocate metadata only. Actual source admission and observer ownership remain separate
+        // operations; an empty unsealed family has no completed-release authority.
         Arc::new(Self {
             state: Mutex::new(FamilyState::default()),
             failed: AtomicBool::new(false),
         })
     }
 
-    /// 新源必须在活动editor停止发布前登记；调用方负责不向外泄漏裸快照克隆。
+    /// Register a new Source before the active editor stops publication. Callers must not leak
+    /// bare snapshot clones outside their corresponding actual payload claim.
     pub(super) fn claim_source(
         self: &Arc<Self>,
     ) -> Result<FrozenValueClaim, FrozenValueFamilyError> {
         let mut state = self.lock_state();
         self.require_healthy()?;
         if state.sealed_sources {
-            // seal不撤旧值权限，只拒绝没有既存源血缘的新入口。
+            // Sealing preserves existing-value derivation while refusing a new entry with no
+            // still-live original Source lineage.
             return Err(FrozenValueFamilyError::SourcesSealed);
         }
         self.register(&mut state, FrozenValueClaimKind::SourcePayload)?;
@@ -135,17 +148,19 @@ impl FrozenValueFamily {
         })
     }
 
-    /// 只封闭新源入口；现有源、字符串及属性payload仍能正常派生真实值。
+    /// Close new-source admission only. Existing Sources, strings, and annotation payloads may
+    /// still derive actual values through their original live claims.
     pub(super) fn seal_sources(&self) {
         let notifications = {
             let mut state = self.lock_state();
             state.sealed_sources = true;
             self.take_completion(&mut state)
         };
-        self.notify(notifications); // 先结束锁，观察者只能收到真实完成事实。
+        self.notify(notifications); // End the mutex lease first; observers receive only an actual completion fact.
     }
 
-    /// 每个角色只有一个授权槽；明确取消才可替换，不能把Weak已死猜作取消。
+    /// Each role has one authorized slot. Only explicit cancellation permits replacement;
+    /// an expired Weak cannot be guessed to mean cancellation.
     pub(super) fn observe(
         &self,
         role: FrozenValueObserverRole,
@@ -155,15 +170,17 @@ impl FrozenValueFamily {
             let mut state = self.lock_state();
             self.require_healthy()?;
             if self.cancelled(&observer)? {
-                // 新观察者从开始就没有权限，不改变原角色槽。
+                // An already-cancelled observer has no admission authority and leaves the
+                // original role slot unchanged.
                 return Err(FrozenValueFamilyError::ObserverCancelled);
             }
             let index = role as usize;
             let previous = match &state.observers[index] {
-                ObserverSlot::Vacant => None, // 首次角色登记不需要探测其他角色。
+                ObserverSlot::Vacant => None, // First registration for this role need not inspect another role.
                 ObserverSlot::Pending(previous) => Some(Arc::clone(previous)),
                 ObserverSlot::Dispatched(previous) => {
-                    // 已消费且Weak已死时仍拒绝覆盖；调用方不能伪造一个明确取消事件。
+                    // A consumed slot remains nonreplaceable after Weak expiration; callers
+                    // cannot manufacture an explicit cancellation event from that absence.
                     Some(
                         previous
                             .upgrade()
@@ -174,12 +191,14 @@ impl FrozenValueFamily {
             if let Some(previous) = previous
                 && !self.cancelled(&previous)?
             {
-                // 此trait方法合同仅允许原子标量读取，不能覆盖仍授权的原角色。
+                // This trait method permits atomic scalar reads only. An original observer
+                // that remains authorized must not be overwritten.
                 return Err(FrozenValueFamilyError::ObserverAlreadyRegistered);
             }
             self.require_healthy()?;
             if state.completed {
-                // 晚登记消费既有真实事实，不重置计数、不排队等待，也不保留强观察者。
+                // Late registration consumes the existing actual fact, without resetting counts,
+                // scheduling a wait, or retaining another strong observer in the family.
                 state.observers[index] = ObserverSlot::Dispatched(Arc::downgrade(&observer));
                 Some(observer)
             } else {
@@ -192,6 +211,8 @@ impl FrozenValueFamily {
     }
 
     pub(super) fn snapshot(&self) -> FrozenValueFamilySnapshot {
+        // Copy metadata under the same mutex. Sticky failure suppresses successful completion
+        // even if later actual drops bring every counter back to zero.
         let state = self.lock_state();
         let failed = self.failed.load(Ordering::Acquire);
         FrozenValueFamilySnapshot {
@@ -208,7 +229,8 @@ impl FrozenValueFamily {
         match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
-                // 保留真实计数以便后续Drop配平，但poison永远不能恢复为完成证明。
+                // Preserve actual counters so later Drop can balance ownership, but mutex
+                // poison permanently prevents successful completion evidence.
                 self.failed.store(true, Ordering::Release);
                 poisoned.into_inner()
             }
@@ -217,7 +239,7 @@ impl FrozenValueFamily {
 
     fn require_healthy(&self) -> Result<(), FrozenValueFamilyError> {
         if self.failed.load(Ordering::Acquire) {
-            return Err(FrozenValueFamilyError::Failed); // 已丢精确性时拒绝继续签发新claim。
+            return Err(FrozenValueFamilyError::Failed); // Once precision is lost, refuse all further claim admission.
         }
         Ok(())
     }
@@ -227,12 +249,14 @@ impl FrozenValueFamily {
         state: &mut FamilyState,
         kind: FrozenValueClaimKind,
     ) -> Result<(), FrozenValueFamilyError> {
+        // Compute both increments before publication; no fallible operation may leave an active
+        // count without the corresponding constructed count and returned guard.
         let index = kind as usize;
         let next = state.active[index]
             .checked_add(1)
             .zip(state.constructed[index].checked_add(1));
         let Some((active, constructed)) = next else {
-            // 两项先共同验证，再一起提交；失败不留下没有guard的活动计数。
+            // Commit both checked values together. Failure leaves no guardless active count.
             self.failed.store(true, Ordering::Release);
             return Err(FrozenValueFamilyError::CounterOverflow);
         };
@@ -247,15 +271,19 @@ impl FrozenValueFamily {
         required: FrozenValueClaimKind,
         child: FrozenValueClaimKind,
     ) -> Result<FrozenValueClaim, FrozenValueFamilyError> {
+        // The actual parent guard selects the permitted lineage. New-source sealing does not
+        // block this derivation, but invalid kind or missing live-parent accounting is permanent failure.
         let mut state = self.lock_state();
         self.require_healthy()?;
         if parent != required {
-            // 类型错误是工厂的所有权违约，不能以后补零掩盖。
+            // Wrong parent kind violates the factory's ownership contract; later zero counts
+            // cannot conceal that earlier inconsistency.
             self.failed.store(true, Ordering::Release);
             return Err(FrozenValueFamilyError::InvalidParentKind);
         }
         if state.active[parent as usize] == 0 {
-            // &Claim本应使此计数仍为正；矛盾只可能来自内部错误，永久拒绝完成。
+            // The borrowed parent claim must keep this count positive. Contradiction is an
+            // internal failure and permanently prohibits successful completion.
             self.failed.store(true, Ordering::Release);
             return Err(FrozenValueFamilyError::MissingLiveParent);
         }
@@ -267,24 +295,28 @@ impl FrozenValueFamily {
     }
 
     fn drop_claim(&self, kind: FrozenValueClaimKind) {
+        // Actual resource-field destruction reaches this sole settlement path. Continue balancing
+        // metadata even after failure, then move any actual completion notifications outside the lock.
         let notifications = {
             let mut state = self.lock_state();
             let index = kind as usize;
             if let Some(active) = state.active[index].checked_sub(1) {
                 state.active[index] = active;
             } else {
-                // Drop不能panic或回绕；下溢保留永久失败，零也不再有释放权限。
+                // Drop must neither panic nor wrap. Underflow leaves sticky failure; a resulting
+                // zero grants no successful release authority.
                 self.failed.store(true, Ordering::Release);
             }
             if let Some(destructed) = state.destructed[index].checked_add(1) {
                 state.destructed[index] = destructed;
             } else {
-                // 真实析构仍继续，无法表示累计总数时不再签完整收据。
+                // Actual destruction continues, but unrepresentable cumulative counts prevent
+                // a complete successful receipt.
                 self.failed.store(true, Ordering::Release);
             }
             self.take_completion(&mut state)
         };
-        self.notify(notifications); // 所有观察者通知均在真实载荷字段及family锁之外。
+        self.notify(notifications); // Notify after actual payload fields dropped and after releasing the family mutex.
     }
 
     fn take_completion(&self, state: &mut FamilyState) -> Notifications {
@@ -294,18 +326,21 @@ impl FrozenValueFamily {
             || self.failed.load(Ordering::Acquire)
             || state.active != [0; 4]
         {
-            // 未封闭、仍有任一真实claim、失效或已完成，都不能再次产生完成事实。
+            // Unsealed admission, any live claim, sticky failure, or prior completion prevents
+            // creation of another completion fact.
             return notifications;
         }
         if state.constructed != state.destructed {
-            // 真正零活动量必须与全部实际构造/析构配平；损坏的零不能提前签完成。
+            // Zero active ownership must match all actual construction/destruction counts;
+            // a corrupted zero cannot authorize premature completion.
             self.failed.store(true, Ordering::Release);
             return notifications;
         }
         state.completed = true;
         for (slot, notification) in state.observers.iter_mut().zip(&mut notifications) {
             if let ObserverSlot::Pending(observer) = slot {
-                // 仅留下弱身份用于防重复；强观察者随本次通知移出锁，不保留业务资源。
+                // Keep only weak identity for duplicate prevention. Move the strong observer
+                // into this out-of-lock notification, without retaining business resources here.
                 let observer = Arc::clone(observer);
                 *slot = ObserverSlot::Dispatched(Arc::downgrade(&observer));
                 *notification = Some(observer);
@@ -318,10 +353,13 @@ impl FrozenValueFamily {
         &self,
         observer: &Arc<dyn FrozenValueReleaseObserver>,
     ) -> Result<bool, FrozenValueFamilyError> {
+        // Observer cancellation is a scalar-only contract. A violating panic cannot escape a
+        // resource destructor or later turn lost observer evidence into a successful release.
         match catch_unwind(AssertUnwindSafe(|| observer.is_cancelled())) {
             Ok(cancelled) => Ok(cancelled),
             Err(_) => {
-                // 观察者违约也不能让资源Drop再次panic；后续完成检查永久失败。
+                // Even observer violation must not trigger another panic from resource Drop;
+                // subsequent completion checks retain permanent failure.
                 self.failed.store(true, Ordering::Release);
                 Err(FrozenValueFamilyError::ObserverPanicked)
             }
@@ -329,16 +367,19 @@ impl FrozenValueFamily {
     }
 
     fn notify(&self, notifications: Notifications) {
+        // Every callback runs without the family mutex and respects its own cohort's actual
+        // cancellation. Receiving one family event does not complete that cohort's native graph.
         for observer in notifications.into_iter().flatten() {
             match self.cancelled(&observer) {
                 Ok(false) => {
                     if catch_unwind(AssertUnwindSafe(|| observer.released())).is_err() {
-                        // 回调必须只桥原子claim；违约panic不得从析构栈逃逸。
+                        // Callbacks bridge atomic claims only; a contract-violating panic must
+                        // not escape the destruction stack.
                         self.failed.store(true, Ordering::Release);
                     }
                 }
-                Ok(true) => {} // 取消只撤此观察者，不改变家族计数或别的角色。
-                Err(_) => {}   // cancelled已记录永久失败，不能伪造已通知成功。
+                Ok(true) => {} // Cancellation revokes this observer only, without changing family counts or another role.
+                Err(_) => {} // cancelled already recorded sticky failure; do not manufacture successful notification.
             }
         }
     }
@@ -346,6 +387,7 @@ impl FrozenValueFamily {
 
 impl FrozenValueClaim {
     pub(super) fn claim_string_value(&self) -> Result<Self, FrozenValueFamilyError> {
+        // Only a still-live Source payload claim can create an actual string-value claim.
         self.family.derive(
             self.kind,
             FrozenValueClaimKind::SourcePayload,
@@ -354,6 +396,7 @@ impl FrozenValueClaim {
     }
 
     pub(super) fn claim_annotation_payload(&self) -> Result<Self, FrozenValueFamilyError> {
+        // Annotation payload ownership derives from a concrete live string value in this family.
         self.family.derive(
             self.kind,
             FrozenValueClaimKind::StringValue,
@@ -362,6 +405,7 @@ impl FrozenValueClaim {
     }
 
     pub(super) fn claim_annotation_value(&self) -> Result<Self, FrozenValueFamilyError> {
+        // Each concrete annotation object independently derives from its shared actual payload.
         self.family.derive(
             self.kind,
             FrozenValueClaimKind::AnnotationPayload,
@@ -372,7 +416,7 @@ impl FrozenValueClaim {
 
 impl Drop for FrozenValueClaim {
     fn drop(&mut self) {
-        self.family.drop_claim(self.kind); // 唯一结算入口是实际guard析构，没有手动成功release。
+        self.family.drop_claim(self.kind); // Actual guard Drop is the sole settlement path; no manual successful release exists.
     }
 }
 

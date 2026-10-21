@@ -1,4 +1,5 @@
-//! 同一原生动作的检查注解快照；只取真实rendering元数据，正文由原Opaque源共享。
+//! Capture checking annotations for one original native action in the explicit frozen-value
+//! diagnostic graph. Read actual rendering metadata while sharing text through the opaque Source.
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
@@ -35,7 +36,7 @@ static PRE_OWNER_PASSTHROUGH: AtomicUsize = AtomicUsize::new(0);
 static RANGE_REQUEST_DIAGNOSTICS: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) fn pre_owner_passthrough_count() -> usize {
-    PRE_OWNER_PASSTHROUGH.load(Ordering::Relaxed) // 仅固定标量；不能据此掩盖fallback发生的原正文读取。
+    PRE_OWNER_PASSTHROUGH.load(Ordering::Relaxed) // Scalar observation only; superclass fallback's actual text reads remain separate facts.
 }
 
 #[derive(Clone, Copy)]
@@ -47,7 +48,8 @@ enum CaptureFailure {
     Construction,
 }
 
-/// 全部为原动作弱身份与纯标量；不借文档、slot或Native对象跨任何getter。
+/// Original-action weak identities and scalars only. No document/slot borrow or borrowed native
+/// object crosses a getter; later observations cannot recapture another action's authority.
 struct CaptureOrigin {
     selection: NativeMarkdownSelectionCapture,
     identity: WeakMarkdownDocument,
@@ -76,25 +78,27 @@ impl CaptureOrigin {
             || storage.presentation_mode() != self.mode
             || !self.identity.ptr_eq(&storage.ivars().document.borrow())
         {
-            return false; // 原动作撤权后不能采当前g或新manager重新签发同一检查请求。
+            return false; // A revoked action cannot adopt current generation or another manager to renew this checking request.
         }
         let Some(document) = self.identity.upgrade() else {
-            return false; // 原Weak仍保分配身份，但正文已经结束。
+            return false; // Original Weak preserves allocation identity, but actual document ownership already ended.
         };
         let Ok(document) = document.try_borrow() else {
-            return false; // 正文正在独占提交时不重入读取或把暂态当作同一冻结来源。
+            return false; // Do not reenter an exclusive document commit or treat its transient state as the original frozen Source.
         };
         document.generation() == self.generation && document.utf16_len() == self.length
     }
 }
 
-/// 临时controller只用于公开validAnnotations；任何正常、撤权或外来异常出口都对称失效。
+/// The temporary controller serves only public validAnnotations. Normal return, revocation, and
+/// foreign exception unwind all invalidate this exact locally owned controller.
 struct TemporaryCheckingController(Retained<NSTextCheckingController>);
 
 impl Drop for TemporaryCheckingController {
     fn drop(&mut self) {
-        // 即使原业务票已撤销，仍有权限清理本同步栈创建的同一个临时controller。
-        // 不发送检查、不替换view原controller，也不吞掉invalidate或此前Native抛出的异常。
+        // Even revoked business authority may clean the same controller created on this stack.
+        // Do not initiate checking, replace the view's controller, or swallow exceptions from
+        // invalidate or an earlier native operation.
         self.0.invalidate();
     }
 }
@@ -103,12 +107,16 @@ pub(super) fn capture(
     view: &PieceBackedMarkdownTextView,
     proposed: NSRange,
 ) -> FrozenAnnotationCapture {
+    // Disabled sessions preserve the original superclass operation. This experiment must not
+    // alter ordinary checking merely because its two diagnostic features were compiled.
     if !view.ivars().frozen_values_enabled {
-        return FrozenAnnotationCapture::PassThrough; // 原构造门关闭时不碰fold或任何Native getter。
+        return FrozenAnnotationCapture::PassThrough; // A closed constructor gate touches neither folds nor native getters.
     }
     let Ok(selection) = view.ivars().folds.capture_selection() else {
-        // 初始构造尚无原owner票时保留系统原入口；不能猜一个owner或将未验证结果冒充Ready。
-        // 只纯计量已经确定启用的会话，不升级Native Weak；实际super仍完整进入全局读诊断。
+        // Initial construction may have no original owner ticket. Preserve the same system entry
+        // rather than guessing an owner or presenting unverified work as Ready. Count only this
+        // already-enabled session, without Native Weak upgrades; superclass reads remain visible
+        // to the original global read diagnostic.
         let ordinal = PRE_OWNER_PASSTHROUGH
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 count.checked_add(1)
@@ -118,7 +126,7 @@ pub(super) fn capture(
             eprintln!(
                 "frozen_annotation_capture event=pre_owner_passthrough count={ordinal} formal=false"
             );
-        } // 固定上限日志；计数仍保留全部fallback，不将未打印请求当作不存在。
+        } // Bound log emission only; unprinted superclass fallbacks still remain in the full scalar count.
         return FrozenAnnotationCapture::PassThrough;
     };
     let input_epoch = view.ivars().table_input_intent_epoch.get();
@@ -129,26 +137,26 @@ pub(super) fn capture(
         || view.ivars().table_input_intent_epoch.get() != input_epoch
         || view.ivars().preview_block_fold_epoch.get() != fold_epoch
     {
-        return FrozenAnnotationCapture::Cancelled; // 第一Native Weak读取也必须沿首调用前原票。
+        return FrozenAnnotationCapture::Cancelled; // Even the first Native Weak load must preserve the original pre-call ticket.
     }
     let Some(storage) = storage else {
-        return fail(CaptureFailure::NativeGraph); // enabled且已有原票不能静默改走未计量的super回退。
+        return fail(CaptureFailure::NativeGraph); // An enabled, ticketed action cannot silently switch to an unmeasured superclass fallback.
     };
     let Some(values) = &storage.ivars().string.ivars().frozen_values else {
-        return fail(CaptureFailure::Source); // view/storage必须共享同一constructor决定，不重新读环境补签。
+        return fail(CaptureFailure::Source); // View/storage share one constructor decision; rereading the environment cannot repair admission.
     };
     let identity = storage.ivars().document.borrow().clone();
     let Some(document) = identity.upgrade() else {
         return FrozenAnnotationCapture::Cancelled;
     };
     if !view.ivars().folds.matches_document(&document) {
-        return FrozenAnnotationCapture::Cancelled; // 同g的另一storage也不属于这份原动作票。
+        return FrozenAnnotationCapture::Cancelled; // Another storage at equal generation still does not belong to this original action.
     }
     let Some(source) = values.source_for_document(&document) else {
         drop(document);
         return fail(CaptureFailure::Source);
     };
-    drop(document); // 从此直到返回，没有活动Doc强租约或RefCell借用跨Native。
+    drop(document); // From here to return, no live-document strong claim or RefCell borrow crosses Native work.
     let origin = CaptureOrigin {
         selection,
         identity,
@@ -166,13 +174,13 @@ pub(super) fn capture(
     }
     let Some(intersection) = intersect_proposed_range(proposed, source.utf16_len()) else {
         observe_request_range(proposed, source.utf16_len(), None, None);
-        return FrozenAnnotationCapture::Outside; // 完全不相交时不写actualRange，也不创建检查值。
+        return FrozenAnnotationCapture::Outside; // An entirely disjoint request writes no actualRange and creates no checking value.
     };
     let actual = match source.text_checking_paragraph_range(intersection.clone()) {
         Ok(range) => range,
         Err(_) => {
             observe_request_range(proposed, source.utf16_len(), Some(&intersection), None);
-            return fail(CaptureFailure::Source); // 保留真实调整失败，不为诊断读取正文或改走super。
+            return fail(CaptureFailure::Source); // Preserve actual range-adjustment failure without reading text for diagnostics or falling back to super.
         }
     };
     observe_request_range(
@@ -182,7 +190,8 @@ pub(super) fn capture(
         Some(&actual),
     );
     let result = capture_value(view, &storage, &source, actual.clone(), &current);
-    // capture_value的manager、controller、临时字典等Native claims已析构；再核一次原权限。
+    // capture_value's local manager/controller/dictionary claims have dropped. Recheck original
+    // authority once more after their destructors, which may themselves permit native reentry.
     if !current() {
         drop(result);
         return FrozenAnnotationCapture::Cancelled;
@@ -202,14 +211,15 @@ fn observe_request_range(
     intersection: Option<&Range<usize>>,
     actual: Option<&Range<usize>>,
 ) {
-    // 全进程最多8条固定标量事实；只复用当前已完成的范围查询，不请求正文、Native或新权限。
+    // Emit at most eight process-wide scalar facts, reusing the completed range query. Request
+    // no text, Native operation, or new authority merely to report diagnostic coordinates.
     let ordinal = RANGE_REQUEST_DIAGNOSTICS
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             count.checked_add(1)
         })
         .map_or(usize::MAX, |count| count + 1);
     if ordinal > 8 {
-        return; // 预算结束后不格式化或保留任何请求；真实检查和全局primitive诊断仍原样执行。
+        return; // Past the logging budget, retain/format no request; actual checking and global primitive diagnostics still execute unchanged.
     }
     let (intersection_start, intersection_length) =
         intersection.map_or((0, 0), |range| (range.start, range.end - range.start));
@@ -231,8 +241,10 @@ fn capture_value(
     actual: Range<usize>,
     current: &impl Fn() -> bool,
 ) -> Result<Retained<NSAttributedString>, CaptureFailure> {
+    // Actual empty ranges still produce a real immutable empty value. Nonempty ranges capture
+    // rendering metadata before constructing the Source-sharing string and annotation objects.
     let runs = if actual.is_empty() {
-        Vec::new() // 合法空文档或尾caret没有属性字符，仍须返回真实空值而不是nil。
+        Vec::new() // A valid empty document or EOF caret has no attribute character, but still returns an actual empty value rather than nil.
     } else {
         capture_rendering_runs(view, storage, source.utf16_len(), &actual, current)?
     };
@@ -242,7 +254,7 @@ fn capture_value(
     .map_err(|_| CaptureFailure::Construction)?;
     let value = native_step(current, || FrozenAnnotation::new(string, runs))?
         .map_err(|_| CaptureFailure::Construction)?;
-    Ok(value.into_super()) // 不经过mutable属性容器或super检查，不复制正文。
+    Ok(value.into_super()) // No mutable attributed container, superclass checking call, or text copy is introduced.
 }
 
 fn capture_rendering_runs(
@@ -252,6 +264,8 @@ fn capture_rendering_runs(
     actual: &Range<usize>,
     current: &impl Fn() -> bool,
 ) -> Result<Vec<FrozenAnnotationRun>, CaptureFailure> {
+    // Capture only the original synchronous TextKit reference graph. Another manager or a
+    // background layout queue cannot donate annotation metadata to this frozen Source.
     let manager =
         native_step(current, || view.textLayoutManager())?.ok_or(CaptureFailure::NativeGraph)?;
     let expected_manager = native_step(current, || {
@@ -264,7 +278,7 @@ fn capture_rendering_runs(
     if !std::ptr::eq(&*manager, &*expected_manager)
         || native_step(current, || manager.layoutQueue())?.is_some()
     {
-        return Err(CaptureFailure::NativeGraph); // 未认证的另一图或后台布局不能为原请求提供注解快照。
+        return Err(CaptureFailure::NativeGraph); // An unverified graph or background layout cannot supply this action's annotation snapshot.
     }
     let content = native_step(current, || manager.textContentManager())?
         .ok_or(CaptureFailure::NativeGraph)?;
@@ -274,7 +288,7 @@ fn capture_rendering_runs(
     let document_start = native_step(current, || document_range.location())?;
     let document_end = native_step(current, || document_range.endLocation())?;
     if location_offset(provider, &document_start, &document_end, length, current)? != length {
-        return Err(CaptureFailure::NativeRange); // Native全局坐标必须与同一冻结source完整长度相等。
+        return Err(CaptureFailure::NativeRange); // The native global coordinate domain must equal this frozen Source's complete length.
     }
     let keys = valid_annotation_keys(view, current)?;
     let runs = RefCell::new(Vec::new());
@@ -290,9 +304,10 @@ fn capture_rendering_runs(
                     return Err(CaptureFailure::Cancelled);
                 }
                 if !std::ptr::eq(callback_manager.as_ptr(), &*manager) {
-                    return Err(CaptureFailure::NativeGraph); // callback只能属于本次原manager。
+                    return Err(CaptureFailure::NativeGraph); // The callback must belong to this original manager.
                 }
-                // SAFETY: 公开同步enumeration提供的三个nonnull对象在本次block中真实存活；不外借裸指针。
+                // SAFETY: Public synchronous enumeration keeps all three nonnull objects alive
+                // throughout this block; no raw pointer escapes its invocation.
                 let range = unsafe { range.as_ref() };
                 let start_location = native_step(current, || range.location())?;
                 let end_location = native_step(current, || range.endLocation())?;
@@ -301,24 +316,25 @@ fn capture_rendering_runs(
                 let end =
                     location_offset(provider, &document_start, &end_location, length, current)?;
                 if start > end || start < previous_end.get() {
-                    return Err(CaptureFailure::NativeRange); // 不能排序/裁重叠来掩盖真实Native枚举合同损坏。
+                    return Err(CaptureFailure::NativeRange); // Sorting/clipping cannot conceal a broken native enumeration order or overlap.
                 }
                 previous_end.set(end);
                 if start >= actual.end {
-                    return Ok(false); // 已越过真实调整范围，仅终止后继元数据，不截断任何相交run。
+                    return Ok(false); // Past the actual adjusted range, stop later metadata without truncating an intersecting run.
                 }
                 let intersection = start.max(actual.start)..end.min(actual.end);
                 if intersection.start >= intersection.end {
-                    return Ok(true); // 早于目标的run或零范围没有目标属性字符，不能制造空run覆盖。
+                    return Ok(true); // Earlier/empty runs contain no target attribute character and must not fabricate empty coverage.
                 }
-                // SAFETY: 同一同步block保证原属性字典存活；下面只按实际valid键取值，不看正文/描述。
+                // SAFETY: This synchronous block keeps its original dictionary alive. Read only
+                // values for actual valid-annotation keys, without text or object descriptions.
                 let attributes = unsafe { attributes.as_ref() };
                 let filtered = filtered_attributes(attributes, &keys, current)?;
                 if let Some(attributes) = filtered {
                     runs.borrow_mut().push(FrozenAnnotationRun {
                         range: intersection.start - actual.start..intersection.end - actual.start,
                         attributes,
-                    }); // 只持实际非空注解run；未覆盖gap由FrozenAnnotation保留空字典语义。
+                    }); // Retain actual nonempty annotation runs only; FrozenAnnotation preserves empty-dictionary semantics in gaps.
                 }
                 Ok(true)
             })();
@@ -326,13 +342,15 @@ fn capture_rendering_runs(
                 Ok(keep_going) => Bool::new(keep_going),
                 Err(error) => {
                     failure.set(Some(error));
-                    Bool::NO // 原票或坐标失效立即停止；不返回一半结果当作Ready，也不自行重试。
+                    Bool::NO // Invalid original authority/coordinates stop immediately; no partial Ready result or automatic retry follows.
                 }
             }
         },
     );
-    // 从已验证的document origin枚举真实元数据，避免假设API会补回起点之前跨入目标的run。
-    // 这里只读稀疏annotation/rendering范围，不读正文、不要求layout、不限制dense元数据条数。
+    // Enumerate actual metadata from the verified document origin, without assuming the API will
+    // recover a run beginning before the target. Read annotation/rendering ranges only, not text,
+    // and request no layout. Dense metadata has no run-count cap here; this diagnostic path is
+    // therefore not evidence of the production viewport's work or memory bounds.
     native_step(current, || {
         manager.enumerateRenderingAttributesFromLocation_reverse_usingBlock(
             &document_start,
@@ -340,7 +358,7 @@ fn capture_rendering_runs(
             &callback,
         )
     })?;
-    drop(callback); // block不带未归还RefCell借用；其后所有Native析构仍由原current复核。
+    drop(callback); // The block leaves no RefCell borrow; later native destructor reentry remains subject to original-current checks.
     if let Some(error) = failure.get() {
         return Err(error);
     }
@@ -355,6 +373,8 @@ fn verify_graph(
     content: &NSTextContentManager,
     current: &impl Fn() -> bool,
 ) -> Result<(), CaptureFailure> {
+    // Each native getter may reenter independently. Compare the exact original storage,
+    // manager, and content identities before accepting their combined metadata.
     let actual_storage = native_step(current, || view.ivars().text_storage.load())?;
     let actual_manager = native_step(current, || view.textLayoutManager())?;
     let actual_content = native_step(current, || manager.textContentManager())?;
@@ -368,7 +388,7 @@ fn verify_graph(
             .as_deref()
             .is_none_or(|actual| !std::ptr::eq(actual, content))
     {
-        return Err(CaptureFailure::NativeGraph); // Getter同步换图也不能把原源和后继注解拼起来。
+        return Err(CaptureFailure::NativeGraph); // Synchronous graph replacement cannot combine the original Source with successor annotations.
     }
     let content_storage = content
         .downcast_ref::<NSTextContentStorage>()
@@ -380,7 +400,7 @@ fn verify_graph(
         .as_deref()
         .is_none_or(|actual| !std::ptr::eq(actual, expected))
     {
-        return Err(CaptureFailure::NativeGraph); // 真实content provider必须仍观察同一canonical存储。
+        return Err(CaptureFailure::NativeGraph); // The actual content provider must still observe this same canonical storage.
     }
     Ok(())
 }
@@ -389,20 +409,24 @@ fn valid_annotation_keys(
     view: &PieceBackedMarkdownTextView,
     current: &impl Fn() -> bool,
 ) -> Result<Vec<Retained<NSString>>, CaptureFailure> {
+    // Obtain the system's actual valid keys from one temporary controller. Do not replace the
+    // view's controller, perform checking, or maintain a second guessed annotation-key schema.
     let controller = native_step(current, || {
         let client: &NSTextView = view;
-        // SAFETY: 公开initWithClient:接收id<NSTextCheckingClient>，原NSTextView真实提供这些selector；
-        // 绑定未声明Rust conformance，不能伪造trait。离线原生控制已核相同公开调用和注解语义。
+        // SAFETY: Public initWithClient: accepts id<NSTextCheckingClient>; the actual NSTextView
+        // supplies those selectors. The binding omits Rust conformance, so do not fabricate a trait
+        // implementation. This invokes the same public API used by the independent native control.
         let controller: Retained<NSTextCheckingController> =
             unsafe { msg_send![NSTextCheckingController::alloc(), initWithClient: client] };
-        TemporaryCheckingController(controller) // 原init返回即入RAII，撤权也必须invalidate同一对象。
+        TemporaryCheckingController(controller) // Install RAII immediately after init; revocation still invalidates this exact object.
     })?;
     let original_keys = native_step(current, || controller.0.validAnnotations())?;
-    // SAFETY: 公开NSArray copy取得不可变键集合+1；不创建业务controller或读取正文。
+    // SAFETY: Public NSArray copy returns one immutable-key-array +1, without creating another
+    // business controller or reading document text.
     let keys: Retained<NSArray<NSString>> =
         native_step(current, || unsafe { msg_send![&*original_keys, copy] })?;
     drop(original_keys);
-    drop(controller); // 必须在枚举rendering前立即invalidate/drop，不替换原view的默认controller。
+    drop(controller); // Invalidate/drop before rendering enumeration, without replacing the view's default controller.
     if !current() {
         return Err(CaptureFailure::Cancelled);
     }
@@ -410,7 +434,7 @@ fn valid_annotation_keys(
     let mut result = Vec::with_capacity(count);
     for index in 0..count {
         result.push(native_step(current, || keys.objectAtIndex(index))?);
-        // 每项只保真实系统键；不按猜测的固定字符串集合删掉未来系统注解。
+        // Retain actual system keys only; no guessed fixed string list discards future system annotations.
     }
     Ok(result)
 }
@@ -420,16 +444,18 @@ fn filtered_attributes(
     keys: &[Retained<NSString>],
     current: &impl Fn() -> bool,
 ) -> Result<Option<Retained<FrozenAnnotationAttributes>>, CaptureFailure> {
+    // Keep only keys the real checking controller accepts, retaining the actual shallow Cocoa
+    // values. Pure rendering styles must not leak into the checking annotation result.
     let mut kept_keys: Vec<&NSString> = Vec::new();
     let mut values = Vec::new();
     for key in keys {
         if let Some(value) = native_step(current, || attributes.objectForKey(key))? {
             kept_keys.push(key.as_ref());
-            values.push(value); // 实际NSNumber、NSNull、NSString等均按原浅值保留，绝不强转/改写。
+            values.push(value); // Preserve actual NSNumber/NSNull/NSString/etc. shallow values without casting or rewriting them.
         }
     }
     if values.is_empty() {
-        return Ok(None); // 纯视觉run没有有效注解；不能将font、颜色等原storage属性带入检查结果。
+        return Ok(None); // A visual-only run has no valid annotation; font/color storage attributes do not enter this checking result.
     }
     let value_refs: Vec<&AnyObject> = values.iter().map(|value| &**value).collect();
     Ok(Some(native_step(current, || {
@@ -444,12 +470,14 @@ fn location_offset(
     length: usize,
     current: &impl Fn() -> bool,
 ) -> Result<usize, CaptureFailure> {
+    // Require a nonnegative bounded provider offset and an exact inverse location. Numeric
+    // proximity alone cannot certify that a native range belongs to the frozen Source domain.
     let offset = native_step(current, || {
         provider.offsetFromLocation_toLocation(origin, location)
     })?;
     let offset = usize::try_from(offset).map_err(|_| CaptureFailure::NativeRange)?;
     if offset > length {
-        return Err(CaptureFailure::NativeRange); // 仅真实document坐标合法，不能饱和夹取错误Native位置。
+        return Err(CaptureFailure::NativeRange); // Only actual document coordinates are valid; do not clamp an invalid native location.
     }
     let signed = isize::try_from(offset).map_err(|_| CaptureFailure::NativeRange)?;
     let roundtrip = native_step(current, || {
@@ -457,7 +485,7 @@ fn location_offset(
     })?
     .ok_or(CaptureFailure::NativeRange)?;
     if native_step(current, || location.compare(&roundtrip))? != NSComparisonResult::Same {
-        return Err(CaptureFailure::NativeRange); // 正向offset与逆向位置必须精确对应原provider。
+        return Err(CaptureFailure::NativeRange); // Forward offset and inverse location must agree exactly in the original provider.
     }
     Ok(offset)
 }
@@ -466,26 +494,28 @@ fn native_step<T>(
     current: &impl Fn() -> bool,
     action: impl FnOnce() -> T,
 ) -> Result<T, CaptureFailure> {
+    // Carry the original action through each reentrant native operation, without reacquiring
+    // current selection or source authority after the call returns.
     if !current() {
         return Err(CaptureFailure::Cancelled);
     }
     let result = action();
     if !current() {
-        return Err(CaptureFailure::Cancelled); // 返回对象在原栈自然释放，不能借它给新动作补票。
+        return Err(CaptureFailure::Cancelled); // The returned object drops on this stack; it cannot renew another action's authority.
     }
     Ok(result)
 }
 
 fn intersect_proposed_range(proposed: NSRange, length: usize) -> Option<Range<usize>> {
     if proposed.location == NSNotFound as usize && proposed.length == 0 {
-        return Some(0..length); // 协议明确的全文sentinel，不把它改为视口请求。
+        return Some(0..length); // The protocol's explicit full-document sentinel stays full-document, never relabeled as a viewport request.
     }
     if proposed.location > length {
-        return None; // 文档两端是合法caret，只有严格越过EOF才完全不相交。
+        return None; // Both document endpoints are valid carets; only a start strictly beyond EOF is entirely disjoint.
     }
     let start = proposed.location;
     let end = if proposed.length > length - start {
-        length // 标准文档交集按差值比较防溢出；不是为了性能裁短合法段落。
+        length // Standard document intersection compares remaining length to avoid overflow; it does not shorten a valid paragraph for performance.
     } else {
         start + proposed.length
     };
@@ -493,11 +523,14 @@ fn intersect_proposed_range(proposed: NSRange, length: usize) -> Option<Range<us
 }
 
 fn fail(error: CaptureFailure) -> FrozenAnnotationCapture {
+    // Ordinary original-action revocation discards the candidate. Inconsistent graph/range/Source
+    // or construction facts fail explicitly rather than silently taking the superclass path.
     if matches!(error, CaptureFailure::Cancelled) {
         return FrozenAnnotationCapture::Cancelled;
     }
     let class = AnyClass::get(c"NSException").expect("Foundation异常类已链接");
-    // SAFETY: 同一实验入口明确失败；只发送公开工厂和固定诊断，不输出正文/路径或吞异常继续。
+    // SAFETY: Explicit failure in this same experiment uses the public factory and a fixed
+    // diagnostic, without text/path disclosure or swallowing the exception to continue.
     let exception: Retained<objc2::exception::Exception> = unsafe {
         msg_send![class, exceptionWithName: ns_string!("NSInternalInconsistencyException"),
             reason: ns_string!("不可变检查注解无法认证原Native来源或完整范围"), userInfo: None::<&AnyObject>]
@@ -511,6 +544,8 @@ mod tests {
 
     #[test]
     fn proposed_document_intersection_preserves_eof_empty_and_full_sentinel() {
+        // Pure production range arithmetic preserves the full sentinel and real empty endpoints;
+        // these checks do not execute a native checking controller or claim bounded text reads.
         assert_eq!(
             intersect_proposed_range(NSRange::new(NSNotFound as usize, 0), 19),
             Some(0..19)
@@ -529,6 +564,8 @@ mod tests {
 
     #[test]
     fn proposed_document_intersection_clamps_only_standard_bounds_without_overflow() {
+        // Intersect actual document bounds even for overflowing requested lengths, while a
+        // non-sentinel invalid start remains outside instead of gaining full-document permission.
         assert_eq!(
             intersect_proposed_range(NSRange::new(4, 7), 19),
             Some(4..11)

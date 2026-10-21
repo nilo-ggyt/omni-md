@@ -1,8 +1,10 @@
-//! 原GCB坐标与真实完整整形双重差分；字体文件控制不替代Native排版/首屏验收。
+//! Check original GCB coordinates and actual complete shaping independently. Font-file controls
+//! do not establish Native layout or first-screen acceptance.
 use super::*;
 
 fn ready_breaks(fixture: &mut Fixture) {
-    // 此前沿消费协调器已经完成的同一张GCB表；准备工作单独执行，不能冒充首part免费扫描。
+    // This frontier consumes the coordinator's same completed GCB table. Prepare it explicitly;
+    // that work cannot masquerade as free first-part scanning.
     for _ in 0..1_000_000 {
         if fixture
             .breaks
@@ -51,7 +53,7 @@ fn full(
     range: Range<usize>,
     options: MarkdownShapingOptions,
 ) -> MarkdownShapingJob {
-    // 独立完整任务不使用局部plan、center view或Frontier给出的任何glyph结果。
+    // The independent complete job uses no local plan, center view, or glyph result from Frontier.
     let mut job = MarkdownShapingJob::new(
         fixture.source.clone(),
         &fixture.authority,
@@ -92,6 +94,8 @@ fn first(
     bytes: usize,
     metadata: usize,
 ) -> (MarkdownShapingFrontierPart, Work) {
+    // Keep source/input/scalar/context/metadata observations distinct. They bound actual operations
+    // in these fixtures and are not a measurement of Native main-thread duration or kernel RSS.
     let mut work = Work::default();
     for _ in 0..100_000 {
         let step = frontier
@@ -212,7 +216,8 @@ fn one_byte_one_record_preserves_utf8_gcb_fifo_and_exact_glyphs() {
 
 #[test]
 fn actual_multi_scalar_grapheme_is_not_cut_and_decoded_failure_is_counted() {
-    // 这个真实GCB恰好4字节，不能只以byte长度或首标量类别认成独立scalar。
+    // This actual GCB is exactly four bytes; byte length or its first scalar category alone cannot
+    // certify that it contains one independent scalar.
     let mut fixture = Fixture::new("é\u{301}x", independent_font());
     ready_breaks(&mut fixture);
     let mut frontier = begin(
@@ -332,7 +337,8 @@ fn ping_fang() -> (
     MarkdownLayoutFont,
     crate::MarkdownLayoutFontBytesResourceObserver,
 ) {
-    // 这个路径/face/轴值由真实Body14字体回退控制得到；生产证书不按路径或名字放行。
+    // Original Body14 fallback capture supplies path/face/axes; production certificates do not
+    // authorize a font merely by this path or name.
     let path = std::path::PathBuf::from(
         std::env::var_os("OMNI_FRONTIER_CJK_FONT").expect("需要真实CJK字体源"),
     );
@@ -406,7 +412,8 @@ fn actual_cjk_14pt_first_part_shape_work_does_not_grow_with_item() {
         );
         let mut oracle = full(&fixture, range, hani_options());
         compare(&fixture, &mut child, &mut oracle);
-        // 二分定位原GCB索引的记录数可随logN变化；正文/整形输入和字体元数据必须恒定。
+        // Original-index binary search may use logN boundary records; actual body/shaping input
+        // and font-metadata work must remain constant across these finite controls.
         let constant = (
             work.source,
             work.input,
@@ -480,8 +487,8 @@ fn actual_cjk_non_bmp_14pt_first_part_keeps_glyph_ordinals_separate_from_utf16()
     let (font, mapping) = ping_fang();
     let mut previous = None;
     for graphemes in [4096, 8192, 32768] {
-        // U+20BB7由同一真实face的cmap提供glyph37154；这里只把它当固定测试输入，
-        // 生产仍逐原GCB/normalizer/实际最终glyph认证，不能按Han码段或字体名放行。
+        // This actual face maps U+20BB7 to glyph 37154, used only as fixed test input. Production
+        // still certifies original GCB/normalizer/final glyph output, never a Han range or font name.
         let text = format!("前置 {}", "𠮷".repeat(graphemes));
         let mut fixture = Fixture::new(&text, font.clone());
         ready_breaks(&mut fixture);
@@ -498,7 +505,7 @@ fn actual_cjk_non_bmp_14pt_first_part_keeps_glyph_ordinals_separate_from_utf16()
             Err(MarkdownShapingFrontierError::Shaping(
                 MarkdownShapingError::Source(MarkdownDocumentBufferError::NotUnicodeBoundary)
             ))
-        )); // 半个代理项不能由普通Range升级为中心；失败前不分配child。
+        )); // A public range ending inside a surrogate pair cannot become a center or allocate a child.
         let range = 3..fixture.source.utf16_len();
         let mut frontier = begin(&fixture, range.clone(), hani_options());
         let (part, work) = first(&mut fixture, &mut frontier, 7, 1);
@@ -512,7 +519,7 @@ fn actual_cjk_non_bmp_14pt_first_part_keeps_glyph_ordinals_separate_from_utf16()
                 .unwrap()
                 .source_utf16_cluster,
             513,
-        ); // 第255条glyph的cluster按全局UTF16步进2，ordinal仍只步进1。
+        ); // Glyph ordinal 255 advances by one record while its original global UTF-16 cluster advances by two units.
         assert_eq!(work.shapes, 1);
         assert!(
             work.input <= 257 * 4 && work.source <= 257 * 4 + 1,
@@ -553,7 +560,8 @@ fn actual_cjk_non_bmp_14pt_first_part_keeps_glyph_ordinals_separate_from_utf16()
 #[ignore = "需要真实Native字体回退抓取的PingFang源；设置OMNI_FRONTIER_CJK_FONT"]
 fn actual_cjk_non_bmp_bmp_punctuation_centers_cover_source_exactly_and_really_release() {
     let (font, mapping) = ping_fang();
-    // 起点也含非BMP：byte8与UTF16 4并不相同，后继混合中心的长度更不能当glyph数量。
+    // The prefix is non-BMP too: byte 8 differs from UTF-16 unit 4, and mixed center length cannot
+    // stand in for glyph count.
     let text = format!("前🙂 {}𠮷", "中𠮷，文。𠮷汉".repeat(601));
     let mut fixture = Fixture::new(&text, font);
     ready_breaks(&mut fixture);
@@ -601,7 +609,8 @@ fn measure_first(
     child: &mut MarkdownShapingJob,
     width: i64,
 ) -> MarkdownSoftLineMeasureChoice {
-    // 这就是原consumer的同一cluster索引；不为前沿额外造索引或从公开Range伪造安全断点。
+    // Use the actual consumer's cluster index, without another frontier-only index or a safe
+    // boundary manufactured from public ranges.
     let mut clusters =
         MarkdownGlyphClusterIndex::new(child, &fixture.authority, &fixture.font_authority).unwrap();
     while clusters.status() != MarkdownGlyphClusterStatus::Ready {
@@ -661,7 +670,7 @@ fn actual_cjk_measure_finishes_natural_first_line_but_preserves_unproved_punctua
             .unwrap();
         assert!(glyph.x_advance > 0);
         width += i64::from(glyph.x_advance);
-    } // 独立完整结果给出前6个真实GCB宽度，不把字号或汉字码段当advance。
+    } // Independent complete output supplies six actual GCB widths; point size or Han code ranges are not advances.
     let choice = measure_first(&mut fixture, &mut child, width);
     match choice {
         MarkdownSoftLineMeasureChoice::MeasuredBreak(value) => {
@@ -677,8 +686,9 @@ fn actual_cjk_measure_finishes_natural_first_line_but_preserves_unproved_punctua
         .unwrap();
     drop((oracle, frontier, fixture));
 
-    // OP链的UAX14真NoBreak不能由single-GCB shape证书冒充词前缀非负证明。
-    // 当前中心虽早已超宽，原Measure仍须真实后继，不能因测试想要lazy就伪造Emergency。
+    // An OP chain's actual UAX14 NoBreak cannot become a nonnegative word-prefix proof through
+    // single-GCB shaping. Even an overflowing center still needs an actual successor; the test's
+    // desire for lazy completion cannot manufacture an Emergency result.
     let mut fixture = Fixture::new(&format!("前置 {}中", "（".repeat(4096)), font.clone());
     ready_breaks(&mut fixture);
     let mut frontier = begin(&fixture, 3..fixture.source.utf16_len(), hani_options());
@@ -772,7 +782,7 @@ fn ascii_letter_hidden_tail_and_non_simple_plan_keep_original_rejection_paths() 
                 break;
             }
         }
-        assert!(rejected); // 字母领头不借Common标点修复绕过原whole-source SHY/DI门。
+        assert!(rejected); // A letter start cannot borrow Common-punctuation routing to bypass original whole-source SHY/DI checks.
     }
     let actual = MarkdownLayoutFont::resolve(Arc::new(ROBOTO), "Roboto-Regular", &[]).unwrap();
     let mut fixture = Fixture::new("(é中文)", actual);
@@ -810,6 +820,8 @@ fn ascii_letter_hidden_tail_and_non_simple_plan_keep_original_rejection_paths() 
 #[test]
 #[ignore = "需要真实Native字体回退抓取的PingFang源；设置OMNI_FRONTIER_CJK_FONT"]
 fn actual_cjk_ascii_common_prefix_uses_same_plan_and_matches_complete_oracle() {
+    // Common ASCII punctuation may share the actual Hani item, but each center still needs the
+    // same certified plan, original GCBs, and exact full-oracle glyph fields; no word proof follows.
     let (font, mapping) = ping_fang();
     for prefix in ["(", " ", "!?[ "] {
         let text = format!("前🙂 {prefix}{})", "中文𠮷，汉字。".repeat(100));

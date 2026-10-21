@@ -1,19 +1,19 @@
-//! 仅标量的跨线程取消请求；任务和分页数组始终由原worker独占。
+//! Scalar-only cross-thread cancellation requests; the original worker retains exclusive job and paged-array ownership.
 
 use super::{
     MarkdownShapingError as Error, MarkdownShapingJob, MarkdownShapingStatus as Status, Result,
 };
 
-/// 请求停止不等于已退出；调用方必须join原worker并核真实资源收据。
+/// Requesting stop does not prove completion; callers join the original worker and check actual resource receipts.
 #[derive(Clone, Default)]
 pub struct MarkdownShapingCancellation(harfrust::CancellationToken);
 
 impl MarkdownShapingCancellation {
-    /// 永久请求原任务停止；没有复位、重采Source或签发Ready的权限。
+    /// Permanently request this original job to stop, without resetting, recapturing Source, or granting readiness.
     pub fn request(&self) {
         self.0.request();
     }
-    /// 只读请求事实，不代表字形算法已经观察它。
+    /// Observe the request bit only, not whether the shaping algorithm has already seen it.
     #[must_use]
     pub fn requested(&self) -> bool {
         self.0.requested()
@@ -21,7 +21,7 @@ impl MarkdownShapingCancellation {
 }
 
 impl MarkdownShapingJob {
-    /// 只交付原标量请求位，不让Native线程强持worker的Doc、Font或字形数组。
+    /// Share the original scalar request bit without letting Native retain the worker's document, Font, or glyph arrays.
     #[must_use]
     pub fn cancellation(&self) -> MarkdownShapingCancellation {
         self.cancellation.clone()
@@ -33,13 +33,13 @@ impl MarkdownShapingJob {
             .as_ref()
             .and_then(|payload| payload.source.original_backing_observer());
         self.status = Status::Cancelled;
-        drop(self.payload.take()); // owner借用结束后真实归还所有映射，绝不发布部分glyph。
+        drop(self.payload.take()); // End owner borrows before actual mapping return, without publishing partial glyph output.
         if let Some(errno) = backing.as_ref().and_then(|observer| observer.first_errno()) {
             self.status = Status::Poisoned;
             return Err(
                 super::MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into(),
             );
-        } // 最后Source owner的真实munmap失败也不能伪装成干净取消。
+        } // Actual failure when the final Source owner unmaps cannot masquerade as clean cancellation.
         if let Some(error) = self.resources.paging.first_error() {
             self.status = Status::Poisoned;
             return Err(harfrust::ShapeError::Paging {
@@ -47,7 +47,7 @@ impl MarkdownShapingJob {
                 errno: error.errno,
             }
             .into());
-        } // Buffer实际Drop的close/munmap错误保留原scope首因，不被Cancelled遮盖。
+        } // Actual Buffer Drop close/unmap errors retain the original paging scope's first cause rather than being hidden by Cancelled.
         Err(Error::Cancelled)
     }
 
@@ -56,7 +56,7 @@ impl MarkdownShapingJob {
         let observer = payload.source.original_backing_observer();
         #[cfg(test)]
         let hook = self.cancellation_hook.clone();
-        // 只捕获原BackingFacts的Arc；不保活Source、原inode、mmap或任何Native对象。
+        // Capture only original backing-facts receipts, without retaining Source, the inode, mmap, or Native objects.
         let health: harfrust::CooperativeSourceHealth = std::sync::Arc::new(move |point| {
             #[cfg(test)]
             if let Some(hook) = &hook {

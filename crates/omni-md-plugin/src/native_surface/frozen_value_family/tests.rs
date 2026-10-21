@@ -1,4 +1,6 @@
-//! 真实Rust载荷与线程交错验证；不以可见行、对象抽样或等待时间推断完整释放。
+//! Exercise the family's Rust claim/Drop contracts with finite fixture payloads and real threads.
+//! These carriers and observers are test implementations, not actual Frozen NSString/annotation
+//! objects; their counters and Weak checks do not prove Native graph or whole-product release.
 
 use super::*;
 use std::sync::Barrier;
@@ -6,23 +8,23 @@ use std::sync::atomic::AtomicUsize;
 
 struct SourcePayload {
     bytes: Arc<Vec<u8>>,
-    claim: FrozenValueClaim, // 字段顺序使正文引用先归还，claim最后才报告实际payload析构。
+    claim: FrozenValueClaim, // Field order returns fixture byte ownership before its claim reports payload destruction.
 }
 
 struct StringValue {
     source: Arc<SourcePayload>,
-    claim: FrozenValueClaim, // 真实源先drop，值析构不能提前签发完成。
+    claim: FrozenValueClaim, // The fixture Source reference drops first, so this value claim cannot report completion before it.
 }
 
 struct AnnotationPayload {
     source: Arc<StringValue>,
     runs: Arc<Vec<u8>>,
-    claim: FrozenValueClaim, // 有限run载荷与源引用均先归还。
+    claim: FrozenValueClaim, // The finite fixture run payload and Source reference both drop before this claim.
 }
 
 struct AnnotationValue {
     data: Arc<AnnotationPayload>,
-    _claim: FrozenValueClaim, // 最后一个派生值归还共享Data后才结束此值claim。
+    _claim: FrozenValueClaim, // The last derived fixture value returns shared Data before ending this value claim.
 }
 
 struct Observation {
@@ -36,6 +38,8 @@ struct Observation {
 
 impl Observation {
     fn new(family: &Arc<FrozenValueFamily>, payload: Weak<Vec<u8>>) -> Arc<Self> {
+        // This existing test observer retains only atomics and weak fixture/family metadata;
+        // it cannot keep the byte payload alive merely by being registered.
         Arc::new(Self {
             hits: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
@@ -47,7 +51,7 @@ impl Observation {
     }
 
     fn erased(self: &Arc<Self>) -> Arc<dyn FrozenValueReleaseObserver> {
-        self.clone() // 只交付纯原子/Weak观察元数据，不增加真实载荷强引用。
+        self.clone() // Transfer atomic/Weak observation metadata only, without another strong payload reference.
     }
 
     fn hits(&self) -> usize {
@@ -57,7 +61,8 @@ impl Observation {
 
 impl FrozenValueReleaseObserver for Observation {
     fn released(&self) {
-        // 这两项实际Weak观察证明通知没有抢在载荷drop之前，也没有在family锁内回调。
+        // In this fixture, Weak byte observation checks Drop ordering, and snapshot reentry
+        // checks that notification occurs outside the family mutex. Neither observes Native dealloc.
         self.payload_alive_at_release
             .store(self.payload.upgrade().is_some(), Ordering::Release);
         if let Some(family) = self.family.upgrade() {
@@ -70,18 +75,21 @@ impl FrozenValueReleaseObserver for Observation {
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire) // 只有取消标量，没有业务或重入调用。
+        self.cancelled.load(Ordering::Acquire) // Cancellation scalar only, without business or reentrant calls.
     }
 }
 
 fn source(family: &Arc<FrozenValueFamily>) -> Arc<SourcePayload> {
+    // Construct the existing finite Rust fixture carrier and install its real family claim.
+    // This does not capture a Core snapshot or instantiate the native frozen Source adapter.
     Arc::new(SourcePayload {
-        bytes: Arc::new(vec![1, 2, 3, 4]), // 有限真实堆载荷；不读取用户文件或构造正文镜像。
+        bytes: Arc::new(vec![1, 2, 3, 4]), // Finite heap fixture, without user files or a document-text mirror.
         claim: family.claim_source().unwrap(),
     })
 }
 
 fn string(source: &Arc<SourcePayload>) -> Arc<StringValue> {
+    // The fixture retains the parent payload while deriving the corresponding actual family claim.
     Arc::new(StringValue {
         source: Arc::clone(source),
         claim: source.claim.claim_string_value().unwrap(),
@@ -90,6 +98,8 @@ fn string(source: &Arc<SourcePayload>) -> Arc<StringValue> {
 
 #[test]
 fn all_four_real_destructors_and_payload_fields_precede_the_completion_callback() {
+    // Exercise each family's claim kind with actual Rust field Drop. This validates metadata
+    // settlement order for these fixture carriers, not Foundation construction or superclass teardown.
     let family = FrozenValueFamily::new();
     let source = source(&family);
     let source_weak = Arc::downgrade(&source.bytes);
@@ -104,7 +114,8 @@ fn all_four_real_destructors_and_payload_fields_precede_the_completion_callback(
         data: Arc::clone(&data),
         _claim: data.claim.claim_annotation_value().unwrap(),
     };
-    // 字段被真实使用且仍持原source；不能用只有claim的替身冒充完整payload。
+    // Verify that the fixture actually retains its original Source chain rather than carrying
+    // claims alone. The native adapters' own payload layout is a separate verification boundary.
     assert!(Arc::ptr_eq(&value.data.source, &string));
     let observation = Observation::new(&family, source_weak.clone());
     family
@@ -116,7 +127,7 @@ fn all_four_real_destructors_and_payload_fields_precede_the_completion_callback(
     drop(string);
     drop(data);
     assert_eq!(observation.hits(), 0);
-    drop(value); // 最后一份真实字段引用自然结束整条所有权链。
+    drop(value); // The last fixture field reference naturally ends this entire Rust ownership chain.
     assert!(source_weak.upgrade().is_none());
     assert!(runs_weak.upgrade().is_none());
     let snapshot = family.snapshot();
@@ -131,12 +142,14 @@ fn all_four_real_destructors_and_payload_fields_precede_the_completion_callback(
             .complete_seen_inside_callback
             .load(Ordering::Acquire)
     );
-    family.seal_sources(); // 重复封闭没有第二个完成事实或第二次通知。
+    family.seal_sources(); // Repeated sealing creates neither another completion fact nor a second notification.
     assert_eq!(observation.hits(), 1);
 }
 
 #[test]
 fn external_source_handle_keeps_real_bytes_alive_after_all_values_drop() {
+    // An independent fixture Source handle keeps its heap payload and Source claim alive after
+    // derived values end. Closing only the value/root cannot count as complete payload release.
     let family = FrozenValueFamily::new();
     let source = source(&family);
     let external_source = Arc::clone(&source);
@@ -152,13 +165,15 @@ fn external_source_handle_keeps_real_bytes_alive_after_all_values_drop() {
     assert_eq!(family.snapshot().active, [1, 0, 0, 0]);
     assert!(weak_bytes.upgrade().is_some());
     assert_eq!(observation.hits(), 0);
-    drop(external_source); // 外部源句柄被计入同一个payload，而不是提前按窗口根drop结算。
+    drop(external_source); // The external fixture handle belongs to this same payload; a window-root analogy cannot settle it early.
     assert!(weak_bytes.upgrade().is_none());
     assert_eq!(observation.hits(), 1);
 }
 
 #[test]
 fn sealed_sources_still_allow_true_substrings_on_a_foundation_style_worker_thread() {
+    // This is a real Rust worker and barrier sequence, not a Foundation substring invocation.
+    // Existing Source lineage may derive another fixture value after new-source admission seals.
     let family = FrozenValueFamily::new();
     let source = source(&family);
     let parent = string(&source);
@@ -178,11 +193,11 @@ fn sealed_sources_still_allow_true_substrings_on_a_foundation_style_worker_threa
         Err(FrozenValueFamilyError::SourcesSealed)
     ));
     let worker = std::thread::spawn(move || {
-        let child = string(&worker_parent.source); // 先登记子值，父值始终保持真实源存活。
+        let child = string(&worker_parent.source); // Register the child while its parent still retains the original fixture Source.
         drop(worker_parent);
         worker_created.wait();
         worker_release.wait();
-        drop(child); // 最后一次析构在此实际工作线程发生，通知不要求主线程或定时器。
+        drop(child); // Final fixture destruction occurs on this actual worker, without a main-thread requirement or timer.
     });
     child_created.wait();
     drop(parent);
@@ -200,6 +215,8 @@ fn sealed_sources_still_allow_true_substrings_on_a_foundation_style_worker_threa
 
 #[test]
 fn annotation_payload_and_values_can_be_derived_after_source_sealing() {
+    // Direct claim derivation checks allowed lineage after sealing. It creates no native
+    // dictionaries/annotations and therefore establishes no attributed-string behavior.
     let family = FrozenValueFamily::new();
     let source = source(&family);
     let string = string(&source);
@@ -222,7 +239,8 @@ fn annotation_payload_and_values_can_be_derived_after_source_sealing() {
 fn partial_initialization_and_unwinding_balance_real_installed_claims() {
     let family = FrozenValueFamily::new();
     let source = source(&family);
-    // 成功安装字段之后的普通失败，和异常展开，都必须由真实字段Drop补偿。
+    // Ordinary rejection and Rust panic unwind return claims installed in these fixture fields.
+    // This is not an Objective-C initialization failure or a Foundation exception catch.
     let rejected: Result<(), &'static str> = {
         let _partial = string(&source);
         Err("synthetic init rejected")
@@ -243,6 +261,8 @@ fn partial_initialization_and_unwinding_balance_real_installed_claims() {
 
 #[test]
 fn three_observers_cancel_replace_and_late_delivery_share_one_real_completion() {
+    // The existing atomic test observers exercise role admission, explicit cancellation, and
+    // late delivery of one family metadata fact without replaying payload destruction.
     let family = FrozenValueFamily::new();
     let source = source(&family);
     let old_editor = Observation::new(&family, Weak::new());
@@ -264,7 +284,7 @@ fn three_observers_cancel_replace_and_late_delivery_share_one_real_completion() 
         .observe(FrozenValueObserverRole::FullGraph, full.erased())
         .unwrap();
     family.seal_sources();
-    assert_eq!(family.snapshot().active[0], 1); // 取消只改变观察角色，绝不释放任何源claim。
+    assert_eq!(family.snapshot().active[0], 1); // Cancellation changes observation authority only; no Source claim is released.
     drop(source);
     family
         .observe(FrozenValueObserverRole::Resources, resources.erased())
@@ -277,7 +297,8 @@ fn three_observers_cancel_replace_and_late_delivery_share_one_real_completion() 
         family.observe(FrozenValueObserverRole::Resources, resources.erased()),
         Err(FrozenValueFamilyError::ObserverAlreadyRegistered)
     );
-    // 已消费的旧角色仍活着且明确取消时，可向新cohort交付同一事实，不重演析构。
+    // An explicitly cancelled, still-live consumed role may transfer the same completed fact
+    // to its replacement; this does not repeat any payload destructor.
     resources.cancelled.store(true, Ordering::Release);
     let replacement = Observation::new(&family, Weak::new());
     family
@@ -289,6 +310,8 @@ fn three_observers_cancel_replace_and_late_delivery_share_one_real_completion() 
 
 #[test]
 fn dead_consumed_observer_is_not_mistaken_for_explicit_cancellation() {
+    // Expiration alone supplies no cancellation fact, even when family completion occurred
+    // before registration. The consumed role must remain protected from replacement.
     let family = FrozenValueFamily::new();
     family.seal_sources();
     let first = Observation::new(&family, Weak::new());
@@ -296,7 +319,7 @@ fn dead_consumed_observer_is_not_mistaken_for_explicit_cancellation() {
         .observe(FrozenValueObserverRole::Editor, first.erased())
         .unwrap();
     assert_eq!(first.hits(), 1);
-    drop(first); // Weak失效没有提供取消事件，不允许覆盖原角色。
+    drop(first); // Weak expiration supplies no cancellation event and permits no overwrite of the original role.
     let second = Observation::new(&family, Weak::new());
     assert_eq!(
         family.observe(FrozenValueObserverRole::Editor, second.erased()),
@@ -308,6 +331,8 @@ fn dead_consumed_observer_is_not_mistaken_for_explicit_cancellation() {
 
 #[test]
 fn already_cancelled_registration_does_not_consume_the_original_role() {
+    // Reject an unauthorized observer before changing its slot, then allow a fresh authorized
+    // observer to receive the actual later metadata completion.
     let family = FrozenValueFamily::new();
     let cancelled = Observation::new(&family, Weak::new());
     cancelled.cancelled.store(true, Ordering::Release);
@@ -326,6 +351,8 @@ fn already_cancelled_registration_does_not_consume_the_original_role() {
 
 #[test]
 fn invalid_parent_kind_permanently_blocks_completion_after_real_zero() {
+    // This direct invalid claim operation exercises the existing factory contract. Actual
+    // subsequent zero ownership cannot restore evidence after that ownership-kind violation.
     let family = FrozenValueFamily::new();
     let source = family.claim_source().unwrap();
     assert!(matches!(
@@ -341,6 +368,8 @@ fn invalid_parent_kind_permanently_blocks_completion_after_real_zero() {
 
 #[test]
 fn checked_counter_overflow_and_underflow_cannot_turn_into_completion() {
+    // Existing private-state injections expose impossible accounting states. They validate
+    // sticky rejection, not real resource exhaustion or externally delivered destruction events.
     let overflowing = FrozenValueFamily::new();
     overflowing.state.lock().unwrap().constructed[0] = usize::MAX;
     assert!(matches!(
@@ -354,9 +383,10 @@ fn checked_counter_overflow_and_underflow_cannot_turn_into_completion() {
 
     let underflowing = FrozenValueFamily::new();
     let source = underflowing.claim_source().unwrap();
-    underflowing.state.lock().unwrap().active[0] = 0; // 只在测试内部注入不可能的重复归还前态。
+    underflowing.state.lock().unwrap().active[0] = 0; // Test-only impossible pre-state for a repeated settlement.
     underflowing.seal_sources();
-    // 先注入矛盾再归还的Drop不panic；最终零不再有完整析构权限。
+    // Drop after the injected contradiction must not panic; eventual zero cannot recover
+    // permission to report complete payload/value destruction.
     drop(source);
     assert!(underflowing.snapshot().sticky_failure);
     assert!(!underflowing.snapshot().payload_value_destructors_complete);
@@ -377,13 +407,15 @@ fn checked_counter_overflow_and_underflow_cannot_turn_into_completion() {
 
 #[test]
 fn inconsistent_live_parent_is_rejected_without_registering_an_orphan_value() {
+    // This retained test deliberately corrupts a private parent count. A borrowed real claim
+    // cannot reach this contradictory state through the public derivation API.
     let family = FrozenValueFamily::new();
     let source = family.claim_source().unwrap();
     family.state.lock().unwrap().active[0] = 0;
     assert!(matches!(
         source.claim_string_value(),
         Err(FrozenValueFamilyError::MissingLiveParent)
-    )); // 测试故意损坏内部计数；公开API不能构造一个没有父claim的子值。
+    )); // The injected count corruption must not register a child without its required live parent.
     drop(source);
     family.seal_sources();
     assert_eq!(family.snapshot().constructed[2], 0);
@@ -393,6 +425,8 @@ fn inconsistent_live_parent_is_rejected_without_registering_an_orphan_value() {
 
 #[test]
 fn poisoned_state_never_authorizes_release_but_real_payload_drop_still_runs() {
+    // A real Rust thread panic while holding the family mutex poisons actual synchronization.
+    // Fixture bytes still drop, but the lost accounting proof must suppress successful notification.
     let family = FrozenValueFamily::new();
     let source = source(&family);
     let weak_bytes = Arc::downgrade(&source.bytes);
@@ -403,7 +437,7 @@ fn poisoned_state_never_authorizes_release_but_real_payload_drop_still_runs() {
     let worker_family = Arc::clone(&family);
     let worker = std::thread::spawn(move || {
         let _state = worker_family.state.lock().unwrap();
-        panic!("synthetic family poison"); // 真实Mutex毒化，不能只手动设置失败标志代替。
+        panic!("synthetic family poison"); // Actual mutex poison, rather than manually setting only the family's failure flag.
     });
     assert!(worker.join().is_err());
     family.seal_sources();
@@ -419,16 +453,19 @@ struct PanickingObserver;
 
 impl FrozenValueReleaseObserver for PanickingObserver {
     fn released(&self) {
-        panic!("synthetic observer violation"); // 验证第三方违约不会让Drop再次向外panic。
+        panic!("synthetic observer violation"); // Existing violating test observer checks containment of panic on the Drop stack.
     }
 
     fn is_cancelled(&self) -> bool {
+        // Keep this fixture admitted so its deliberate release-callback violation is exercised.
         false
     }
 }
 
 #[test]
 fn observer_panic_is_sticky_and_cannot_escape_the_last_resource_destructor() {
+    // The deliberately panicking test observer must not interrupt final fixture payload Drop.
+    // Its violation leaves a permanently failed metadata receipt despite actual zero ownership.
     let family = FrozenValueFamily::new();
     let source = source(&family);
     let weak_bytes = Arc::downgrade(&source.bytes);

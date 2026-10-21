@@ -1,4 +1,5 @@
-//! 完整局部计划的真实定位下界；原Source/Font/选项与取消票保持同一个owner。
+//! Actual positioning lower bounds for the complete local plan, retaining the original Source,
+//! font, options, and cancellation authority.
 use super::*;
 
 pub(super) struct PositionedNonnegativeProof {
@@ -15,6 +16,8 @@ impl PositionedNonnegativeProof {
         payload: &FrontierPayload,
         authority: &MarkdownLayoutTextAuthority,
     ) -> FrontierResult<()> {
+        // A cached bound remains subordinate to its actual Source, font payload, original plan,
+        // complete options, and cancellation; equal font names or scale alone are insufficient.
         payload
             .source
             .health()
@@ -78,7 +81,8 @@ impl MarkdownShapingFrontierJob {
             .ok_or(MarkdownShapingFrontierError::Poisoned)?;
         let records = scan.checked_records();
         let glyphs = scan.queried_glyphs();
-        // 下界证明借实际执行所用的同Font、同尺度、同不可变水平推进表；vendor不再重建默认hmtx。
+        // Certify using execution's same font, scale, and immutable horizontal-advance table;
+        // the vendor cannot substitute a reconstructed default hmtx for actual nominal metrics.
         let shaper = payload
             .font
             .shaper_at_scale(payload.options.scale)
@@ -87,10 +91,12 @@ impl MarkdownShapingFrontierJob {
         let queried = scan.queried_glyphs() - glyphs;
         step.metadata_glyphs += queried;
         step.plan_records += scan.checked_records() - records - queried;
-        self.guard(source, font)?; // 同共享Source真正首错优先于不适用、取消及元数据完成。
+        self.guard(source, font)?; // Actual shared Source failure precedes unsupported/cancelled/completed metadata results.
         match result {
             Ok(None) => Ok(false),
             Ok(Some(facts)) => {
+                // Quantize the actual positioned bound at the original size. A negative result
+                // remains unsupported; do not clamp it or certify only a favorable prefix.
                 let payload = self
                     .payload
                     .as_ref()

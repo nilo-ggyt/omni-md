@@ -1,7 +1,9 @@
-//! 同一原计划的已认证有限前缀；未读item尾部始终没有glyph或软行权限。
+//! Certified finite prefixes of one original plan. Unread item tails never acquire glyph or
+//! soft-line authority from a completed prefix.
 //!
-//! 此候选仅供显式协调器使用。ASCII局部支持域与真实单scalar GCB各自有封闭证书；
-//! 一个前缀Ready不等于LineReady，多scalar GCB和未认证查表仍保留真实未解析状态。
+//! Used by the explicit coordinator only. Local ASCII support and actual single-scalar graphemes
+//! require separate confined certificates. Prefix Ready is not LineReady; multi-scalar graphemes and
+//! uncertified lookups retain their unresolved result rather than an invented completed line.
 
 mod advance;
 pub(super) mod local;
@@ -23,7 +25,8 @@ use crate::{
     MarkdownLayoutBreakJob, markdown_layout_font::frontier::FontFrontierPlan,
 };
 
-/// 一个中心固定最多256个已认证标量，另读真实支持输入；字节数不是新段落边界。
+/// Certify at most 256 scalars per center, accounting actual support input separately; a byte limit
+/// never creates a new paragraph boundary.
 pub(crate) const MARKDOWN_SHAPING_FRONTIER_UNITS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,7 +84,8 @@ struct FrontierPayload {
     plan: Option<FontFrontierPlan>,
 }
 
-/// 唯一owner保存未解析cursor；没有公开Range→部分item认证构造或重置入口。
+/// The unique owner retains the unresolved cursor; no public Range-to-partial-item certification
+/// constructor or reset entry exists.
 pub(crate) struct MarkdownShapingFrontierJob {
     identity: Arc<()>,
     payload: Option<FrontierPayload>,
@@ -117,15 +121,15 @@ pub(crate) struct MarkdownShapingFrontierJob {
     local_verified: usize,
     resources: Option<crate::markdown_line_composer::worker_resources::ComposerResourceScope>,
     unicode: Option<Box<unicode::UnicodeState>>,
-    // 开放SCX只授予独立字素中心，最后一个真实GCB始终作为未发布支持域。
+    // Open SCX grants independent grapheme centers only, retaining the final actual GCB as support.
     open_scope: bool,
-    // 原 UBA 分项事实只裁定实际 shape 输入/上下文；从不登记为全局编辑 GCB。
+    // Original UBA item facts bound shaping input/context, never global editing grapheme boundaries.
     shaping_seams: [Option<crate::markdown_line_composer::ResolvedBidiShapingSeam>; 2],
     partial_grapheme: [bool; 2],
     context_bounds: Option<Range<usize>>,
 }
 
-/// 一次真实Ready子任务与唯一归还票；复制公开范围不能构造这个值。
+/// One actual Ready child with its unique return ticket; copied public ranges cannot construct it.
 pub(crate) struct MarkdownShapingFrontierPart {
     job: MarkdownShapingJob,
     continuation: MarkdownShapingFrontierContinuation,
@@ -134,7 +138,8 @@ pub(crate) struct MarkdownShapingFrontierPart {
     shaping_seams: [Option<crate::markdown_line_composer::ResolvedBidiShapingSeam>; 2],
 }
 
-/// 只含弱身份与标量，不保活Source/Font/原子任务。票不能Clone或交给另一个owner。
+/// Weak identities and scalars retain no Source/font/child task. The ticket cannot be cloned or
+/// transferred to a different continuation owner.
 pub(crate) struct MarkdownShapingFrontierContinuation {
     owner: Weak<()>,
     serial: u64,
@@ -144,7 +149,8 @@ pub(crate) struct MarkdownShapingFrontierContinuation {
     font_splice: bool,
 }
 
-/// 只有原Unicode游标遇到完整阻塞GCB时签发；不授予任意短Range或新的SCX边界。
+/// Issued only when the original Unicode cursor encounters a complete blocking GCB; it authorizes
+/// neither arbitrary short ranges nor a new SCX boundary.
 pub(crate) struct MarkdownShapingTerminalGrapheme {
     owner: Weak<()>,
     source: MarkdownLayoutTextAuthority,
@@ -191,15 +197,18 @@ impl MarkdownShapingFrontierPart {
     ) -> &[Option<crate::markdown_line_composer::ResolvedBidiShapingSeam>; 2] {
         &self.shaping_seams
     }
-    /// 只借此真实part的原Source身份；不能由其公开范围重新签发另一个Source的审核。
+    /// Borrow this actual part's original Source identity; its public range cannot authorize an
+    /// audit against another source.
     pub(crate) fn source_authority(&self) -> &MarkdownLayoutTextAuthority {
         &self.job.source_authority
     }
-    /// 审核与重形保原同次取消位，不从调用方另建一个可脱离原任务的生命周期。
+    /// Audit/reshaping retain the same original cancellation, without a caller-created lifecycle
+    /// detached from this task.
     pub(crate) fn cancellation(&self) -> MarkdownShapingCancellation {
         self.job.cancellation.clone()
     }
-    /// 原Job实际参与整形的有限支持区；含中心外真实上下文，不从段落或预算猜边界。
+    /// The original job's actual finite support, including context outside the center; paragraph
+    /// assumptions or budgets do not determine these bounds.
     pub(crate) fn shaping_range(&self) -> Range<usize> {
         self.job.source_utf16.clone()
     }
@@ -216,14 +225,16 @@ impl MarkdownShapingFrontierPart {
         self.scope_complete
     }
     pub(crate) fn into_parts(self) -> (MarkdownShapingJob, MarkdownShapingFrontierContinuation) {
-        (self.job, self.continuation) // 真child必须交给原消费者，不能只交元数据后伪称已消费。
+        (self.job, self.continuation) // Transfer the actual child, not metadata presented as completed consumption.
     }
 }
 
-/// 开放分支必须携原SCX借用和两张原GCB端点票；坐标副本本身不能构造这些票。
+/// Open scope carries the original SCX borrow and two certified shaping endpoint tickets; copied
+/// coordinates cannot construct that authority.
 pub(crate) enum MarkdownShapingFrontierScope<'a, 'job> {
     Closed(Range<usize>),
-    /// 只认证原样式范围的坐标；不授予开放Script、独立字形或真实段末权限。
+    /// Certify original style coordinates only, without granting open Script, independent glyph,
+    /// or actual paragraph-end authority.
     CertifiedCoordinates {
         original: Range<usize>,
         endpoints: [&'a crate::markdown_line_composer::CertifiedShapingEndpoint; 2],
@@ -236,7 +247,8 @@ pub(crate) enum MarkdownShapingFrontierScope<'a, 'job> {
 }
 
 impl MarkdownShapingFrontierJob {
-    /// 计划/标量拒绝并不等于缺字；这里只交付已经读到的完整GCB，供原字体试次确认。
+    /// Plan/scalar rejection does not establish a missing glyph. Return only an already-read complete
+    /// GCB for an actual font trial.
     pub(crate) fn terminal_grapheme(
         &self,
         source: &MarkdownLayoutTextAuthority,
@@ -251,7 +263,7 @@ impl MarkdownShapingFrontierJob {
                     ),
                 )
         {
-            return Ok(None); // 构造/查表拒绝和开放SCX不取得这个自然尾部的特殊交接资格。
+            return Ok(None); // Other plan rejections and open SCX do not qualify for this natural-tail handoff.
         }
         Ok(self.unicode.as_ref().and_then(|state| {
             state
@@ -259,7 +271,7 @@ impl MarkdownShapingFrontierJob {
                 .filter(|(utf16, _)| {
                     !(utf16.start == self.original.start && self.partial_grapheme[0])
                         && !(utf16.end == self.original.end && self.partial_grapheme[1])
-                }) // 局部 shaping GB1/GB2 不是完整外 GCB，不能发给原 terminal GCB 交接。
+                }) // Local shaping GB1/GB2 is not a complete outer GCB for this terminal handoff.
                 .map(|(utf16, bytes)| MarkdownShapingTerminalGrapheme {
                     owner: Arc::downgrade(&self.identity),
                     source: self.source.clone(),
@@ -272,7 +284,8 @@ impl MarkdownShapingFrontierJob {
         }))
     }
 
-    /// 同Font只允许自然尾片继续真实shape；不同Font只封口此前已认证的原Font残余。
+    /// The same font may resume only a natural final grapheme; a different font closes only the
+    /// already certified remainder of the original font.
     pub(crate) fn resume_terminal_grapheme(
         &mut self,
         source: &MarkdownLayoutTextAuthority,
@@ -290,7 +303,7 @@ impl MarkdownShapingFrontierJob {
             })
         {
             return Err(MarkdownShapingFrontierError::ContinuationMismatch);
-        } // 原owner和实际阻塞位置必须仍相同；相同范围的另一个请求不能恢复本游标。
+        } // Require the original owner and actual blocked position; equal ranges in another request cannot resume this cursor.
         self.candidate = Some(
             self.unicode
                 .as_mut()
@@ -301,8 +314,9 @@ impl MarkdownShapingFrontierJob {
         Ok(())
     }
 
-    /// 前一真实Font段已经归还后，移交已由原GCB查询确认的下一个字体选择。
-    /// 只继承同owner、同SCX和同取消位；调用者持有真实相邻GCB票及已完成字体试次。
+    /// After the prior actual font run returns, hand off the next choice certified by original GCB
+    /// queries. Preserve owner/SCX/cancellation; the caller supplies actual adjacent endpoint
+    /// tickets and completed font trials.
     pub(crate) fn following_font_grapheme(
         &self,
         source: &MarkdownLayoutTextAuthority,
@@ -325,7 +339,7 @@ impl MarkdownShapingFrontierJob {
             || !endpoints[0].same_scope(endpoints[1])
         {
             return Err(MarkdownShapingFrontierError::ContinuationMismatch);
-        } // 不接受跳过尚未交付的原Font正文，也不把另一个索引的端点借给本续体。
+        } // Do not skip undelivered original-font text or borrow endpoints from another index.
         Ok(MarkdownShapingTerminalGrapheme {
             owner: previous.owner.clone(),
             source: self.source.clone(),
@@ -337,8 +351,9 @@ impl MarkdownShapingFrontierJob {
         })
     }
 
-    /// 完整回退Font段进入原Store前，登记其实际child及唯一归还票。
-    /// 此处不shape、不重建Source；只有真实Ready的原job能推进原Frontier游标。
+    /// Register the actual child and unique return ticket before a fallback font run enters the
+    /// original Store. Perform no shaping/Source reconstruction here; only its actual Ready job can
+    /// advance the original frontier.
     pub(crate) fn lend_font_run(
         &mut self,
         source: &MarkdownLayoutTextAuthority,
@@ -361,7 +376,7 @@ impl MarkdownShapingFrontierJob {
             || job.status() != MarkdownShapingStatus::Ready
         {
             return Err(MarkdownShapingFrontierError::ContinuationMismatch);
-        } // 新Font的真实输出才有交接资格；同Font不能绕过原plan的能力拒绝。
+        } // Only actual new-font output qualifies; the same font cannot bypass the original plan's rejection.
         self.serial = self
             .serial
             .checked_add(1)
@@ -378,7 +393,8 @@ impl MarkdownShapingFrontierJob {
         })
     }
 
-    /// 仅原协调器在验证完整item和样式响应后调用；不对外暴露短Range的升权接口。
+    /// Called only by the coordinator after actual item/style validation, without exposing a public
+    /// short-range authority upgrade.
     pub(crate) fn new(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
@@ -399,7 +415,8 @@ impl MarkdownShapingFrontierJob {
         )
     }
 
-    /// 有端点票的scope只取原GCB坐标；未提供原索引的Closed仍明确走同步定位合同。
+    /// Certified scopes consume original endpoint coordinates. Closed scope without index tickets
+    /// retains the existing synchronous lookup contract.
     pub(crate) fn new_with_scope(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
@@ -428,10 +445,10 @@ impl MarkdownShapingFrontierJob {
                 options,
                 cancellation,
             ),
-        } // 原无索引入口的定位工作保持同步；有票分支不为复用实现而重新读取正文。
+        } // Keep original synchronous lookup explicit; the ticketed route does not reread text merely for code reuse.
     }
 
-    /// 两条构造路径共享原身份、选项和计划装配；只有坐标的实际来源不同。
+    /// Share original identity/options/plan assembly while retaining the two actual coordinate origins.
     fn initialize(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
@@ -441,7 +458,7 @@ impl MarkdownShapingFrontierJob {
         options: MarkdownShapingOptions,
         cancellation: MarkdownShapingCancellation,
     ) -> FrontierResult<Self> {
-        source.health().map_err(MarkdownShapingError::from)?; // 原errno先于取消及权限不符。
+        source.health().map_err(MarkdownShapingError::from)?; // Original errno precedes cancellation or mismatched authority.
         if !source.permits(authority) {
             return Err(MarkdownShapingError::SourceMismatch.into());
         }
@@ -499,7 +516,7 @@ impl MarkdownShapingFrontierJob {
             } else {
                 source.byte_len()
             })
-        }); // 原 Style 请求消费后，唯一前沿继续持真实 seam，不从有限字节窗猜段落边界。
+        }); // Retain actual seams after the Style request ends; finite byte windows do not imply paragraph boundaries.
         let options = ValidatedOptions::new(options, &font)?;
         if cancellation.requested() {
             return Err(MarkdownShapingError::Cancelled.into());
@@ -519,7 +536,7 @@ impl MarkdownShapingFrontierJob {
                     reason,
                 )),
             ),
-        }; // 未认证计划仍有真实typed结果；不改feature或回退整item后冒称lazy。
+        }; // Keep typed plan rejection; changing features or eagerly shaping the item would not establish this lazy proof.
         source.health().map_err(MarkdownShapingError::from)?;
         if cancellation.requested() {
             return Err(MarkdownShapingError::Cancelled.into());
@@ -581,8 +598,9 @@ impl MarkdownShapingFrontierJob {
         Ok(result)
     }
 
-    /// 只有原Script借用证明能将本owner约束为开放支持域；公开短Range不能调用此升权。
-    /// 字体仍需逐记录通过SimpleGcb计划，ASCII local/kern路径不获得此资格。
+    /// Only the original Script borrow can bind this owner to an open support domain; a public
+    /// short range cannot upgrade it. The font still needs per-record SimpleGcb certification;
+    /// ASCII local/kern paths do not acquire this route.
     fn bind_open_script(
         &mut self,
         prefix: &crate::markdown_scripts::MarkdownStableScriptPrefix<'_>,
@@ -634,7 +652,7 @@ impl MarkdownShapingFrontierJob {
             || self.outstanding.is_some()
         {
             return Err(MarkdownShapingError::InvalidOptions.into());
-        } // 先挂原ParentScope，再允许任意child创建；续片不接受新scope补签旧过程。
+        } // Install original parent scope before any child; a later scope cannot retroactively bless continuation work.
         self.resources = Some(
             registration
                 .install()
@@ -668,7 +686,7 @@ impl MarkdownShapingFrontierJob {
             .is_some_and(|plan| !plan.permits_font(&payload.font))
         {
             return Err(MarkdownShapingError::FontMismatch.into());
-        } // 原Font计划弱身份每次消费仍复核，未来接入不能仅用同样的选项key代替owner。
+        } // Recheck actual font-plan weak identity; an equivalent options key cannot replace its owner.
         if self.cancellation.requested() {
             return Err(MarkdownShapingError::Cancelled.into());
         }
@@ -682,21 +700,21 @@ impl MarkdownShapingFrontierJob {
             .and_then(|payload| payload.source.original_backing_observer());
         drop(self.child.take());
         drop(self.advance_scan.take());
-        self.word_closure = None; // 只清固定bitset游标；它没有文件、映射或Source强claim。
-        self.local_scan = None; // 同样仅归还固定字体编号集合，不改实际glyph/Source资源收据。
-        self.local_source_cursor = None; // 取消/Source失败也实际归还尚在途的原树路径，不能靠owner壳留住元数据。
+        self.word_closure = None; // Return a fixed bitset cursor with no file/mapping/strong Source claim.
+        self.local_scan = None; // Return fixed font-ID state without rewriting actual glyph/Source receipts.
+        self.local_source_cursor = None; // Return an unfinished original tree path on cancellation/Source failure too.
         self.local_source_bounds = None;
         self.positioned_scan = None;
         self.positioned_proof = None;
         self.local_certificate = None;
         drop(self.nonnegative.take());
-        drop(self.payload.take()); // 先归还实际资源，旧cursor/票永久失效，不重采Source或样式。
+        drop(self.payload.take()); // Return actual resources first; ended cursors/tickets cannot recapture current Source/style.
         if let Some(errno) = backing.and_then(|observer| observer.first_errno()) {
             return Err(MarkdownShapingError::Source(
                 MarkdownDocumentBufferError::OriginalBackingUnavailable(errno),
             )
             .into());
-        } // 最后Source归还时的实际错误也不能被取消、普通不适用或旧metadata失败覆盖。
+        } // Failure observed on final Source return also precedes cancellation, unsupported results, or old metadata errors.
         Err(error)
     }
 
@@ -717,7 +735,7 @@ impl MarkdownShapingFrontierJob {
                 guarded?;
                 Ok(step)
             }),
-        }; // 包括NeedsFrontier/Pending零工作出口，真实Source首错都不能被成功占位状态吞掉。
+        }; // Even zero-work NeedsFrontier/Pending exits must not conceal actual Source failure as successful progress.
         match result {
             Ok(value) => Ok(value),
             Err(error) => self.fail(error),
@@ -749,7 +767,7 @@ impl MarkdownShapingFrontierJob {
         };
         if self.outstanding.is_some() {
             step.answer = MarkdownShapingFrontierAnswer::PendingConsumer;
-            return Ok(step); // 即使child已死，也必须归还原ticket，不能从外部Range跳过FIFO。
+            return Ok(step); // Even a dropped child needs its original return ticket; external ranges cannot skip FIFO ownership.
         }
         if matches!(
             self.answer,
@@ -762,7 +780,7 @@ impl MarkdownShapingFrontierJob {
         if self.next == self.original.end {
             self.answer = MarkdownShapingFrontierAnswer::Complete;
             step.answer = self.answer;
-            return Ok(step); // 真item端点才Complete；有限缓冲区填满不是EOF。
+            return Ok(step); // Only the actual item endpoint is Complete; a full finite buffer is not EOF.
         }
         if self.unicode.is_some() {
             return self.advance_unicode(source, font, breaks, budget, metadata_budget, step);
@@ -778,7 +796,7 @@ impl MarkdownShapingFrontierJob {
         {
             step.answer = self.answer;
             return Ok(step);
-        } // 连独立GCB资格也没有的计划保持原先验拒绝，不能为它扩展257byte扫描权限。
+        } // A plan without independent-GCB capability keeps its prior rejection, without expanded scan authority.
         if self.candidate.is_none() {
             let needed = (self.original_bytes.end - self.next_byte).min(self.scan.len());
             let count = (needed - self.scanned)
@@ -800,7 +818,7 @@ impl MarkdownShapingFrontierJob {
                 })
                 .map_err(MarkdownShapingError::from)?;
             self.guard(source, font)?;
-            self.scanned += copied; // 真实lease归还成功后才发布已读事实；错误不改成早停成功。
+            self.scanned += copied; // Publish read facts after successful actual lease return, never an error recast as early success.
             step.source_bytes = copied;
             if self.scanned != needed {
                 return Ok(step);
@@ -811,10 +829,11 @@ impl MarkdownShapingFrontierJob {
                 .unwrap_or(needed);
             let eof = self.next_byte + needed == self.original_bytes.end;
             let length = if eof && ascii == needed && needed <= MARKDOWN_SHAPING_FRONTIER_UNITS {
-                needed // 最后短片沿真实item端点；无空间候选不冒充有自然软行机会。
+                needed // A final short part ends at the actual item endpoint, without inventing a natural space break.
             } else {
-                // 在真实非数字space seam结束，另有已读ASCII首未消费标量。未来fraction
-                // slash只能回写连续Decimal串，不能越过此space影响已经签发的前缀。
+                // End at a real nondecimal space seam with an already-read first-unconsumed ASCII
+                // scalar. A later fraction slash can affect its decimal run, not cross this space
+                // into the certified prefix.
                 (1..ascii.min(needed))
                     .rev()
                     .find(|&end| self.scan[end - 1] == b' ')
@@ -827,9 +846,10 @@ impl MarkdownShapingFrontierJob {
                         .as_ref()
                         .and_then(|plan| plan.simple_gcb_job(&payload.font).ok())
                 {
-                    // 仅原≤257byte已收费扫描实际遇到非ASCII、且没有安全space seam时
-                    // 才转到同Font/Options的独立字素认证。不是按字母或字体名猜Unicode可切。
-                    // 原scratch不能充当GCB或编码证明；下一量子逐真实边界重读，读量照实收费。
+                    // Switch only after the charged <=257-byte probe really finds non-ASCII with
+                    // no safe space seam, using the same font/options' independent-GCB capability.
+                    // Scratch is neither a GCB nor encoding proof; reread actual boundaries in later
+                    // quanta and account those reads instead of guessing from spelling/font names.
                     self.unicode = Some(Box::new(unicode::UnicodeState::from_ascii_scan(
                         self.next_byte,
                         self.next,
@@ -848,12 +868,13 @@ impl MarkdownShapingFrontierJob {
                         MarkdownShapingFrontierReason::WordBeyondBudget
                     });
                     step.answer = self.answer;
-                    return Ok(step); // 不替长词强造新BOT/EOT或默认plain功能。
+                    return Ok(step); // No invented BOT/EOT or default plain behavior for an unsupported long word.
                 }
             } else {
                 self.candidate = Some(self.next + length);
-                // 同一个已认证词项的最后短片仍沿原证明延续，不能因本片抵达真实EOF
-                // 就丢掉跨前缀整行的安全GCB候选；这不改变本child的实际Ready范围。
+                // Preserve the same certified word proof on its final short part, including safe
+                // whole-line GCB candidates across prefixes. Reaching real EOF does not widen this
+                // child's actual Ready range.
                 self.word_candidate = self.word_source_checked;
             }
         }
@@ -862,7 +883,7 @@ impl MarkdownShapingFrontierJob {
         {
             step.answer = self.answer;
             return Ok(step);
-        } // 已选择的ASCII候选仍须完整source域与原local计划证书，之后才能签词许可或创建child。
+        } // The selected ASCII candidate still needs full-source/local-plan certificates before word proof or child creation.
         let end = self
             .candidate
             .ok_or(MarkdownShapingFrontierError::Poisoned)?;
@@ -880,7 +901,7 @@ impl MarkdownShapingFrontierJob {
                     step.answer = self.answer;
                     return Ok(step);
                 }
-            } // 字节均为ASCII仍不能假定原item首端未切开一个外部GCB。
+            } // ASCII bytes alone do not prove that the original item starts outside an external grapheme.
         }
         if self.word_candidate
             && !self.prepare_word(source, font, breaks, metadata_budget, &mut step)?
@@ -903,7 +924,7 @@ impl MarkdownShapingFrontierJob {
                 && end < self.original.end
                 && self.scan[end - self.next - 1].is_ascii_digit()
             {
-                return Err(MarkdownShapingError::InvalidRange.into()); // 真whole-item ASCII另证明无U+2044。
+                return Err(MarkdownShapingError::InvalidRange.into()); // The whole-item ASCII proof separately excludes U+2044.
             }
             let support = self.support_range(end)?;
             let support_bytes = (self.original_bytes.start + support.start - self.original.start)
@@ -929,16 +950,17 @@ impl MarkdownShapingFrontierJob {
             )?;
             if let Some(resources) = &self.resources {
                 child.attach_composer_resources(resources)?;
-            } // Buffer刚装配还没有glyph FD/map；计划/词证书、输入和shape的任何失败都带原claim。
-            // 原构造器的固定5标量邻接上下文与实际support ingest分开报告。它不是
-            // 逐步输入预算内的免费读取，也不是将中心256字节伪报成所有Source访问。
+            } // Attach the original claim before glyph storage, ingestion, or shaping can fail.
+            // Report the constructor's fixed five-scalar adjacent context separately from support
+            // ingestion. It is not free work within the input budget, and a 256-byte center does
+            // not describe all actual Source access or main-thread elapsed time.
             step.context_bytes = child.profile()?.source_bytes_read;
             child
                 .payload
                 .as_mut()
                 .ok_or(MarkdownShapingError::Poisoned)?
                 .frontier_plan = Some(plan.plan());
-            self.child = Some(child); // 只有源/GCB/原计划都成立才申请实际glyph分页资源。
+            self.child = Some(child); // Acquire actual glyph storage only after Source/GCB/original-plan certification.
         }
         let child = self
             .child
@@ -981,7 +1003,7 @@ impl MarkdownShapingFrontierJob {
                     .as_mut()
                     .ok_or(MarkdownShapingError::Poisoned)?
                     .frontier_word = Some(proof);
-            } // 局部计划先完成真实中心view；不能把支持区预签成词前缀的公开范围。
+            } // The actual center view must complete first; support cannot become a presigned public word-prefix range.
             self.answer = MarkdownShapingFrontierAnswer::PartReady;
         }
         step.answer = self.answer;
@@ -1015,7 +1037,7 @@ impl MarkdownShapingFrontierJob {
             let child = Arc::downgrade(&job.identity);
             self.outstanding = Some(child.clone());
             Ok(MarkdownShapingFrontierPart {
-                shaping_seams: self.shaping_seams.clone(), // 原上下文支持域也可能到达真实 seam，审核仍需保有它。
+                shaping_seams: self.shaping_seams.clone(), // Actual context support may reach the seam, so audit retains its original proof.
                 scope_complete: range.end == self.original.end
                     || (self.open_scope
                         && self
@@ -1071,11 +1093,11 @@ impl MarkdownShapingFrontierJob {
                     unicode.reset_after_font_run(self.next_byte, self.next);
                 } else {
                     unicode.reset(self.next_byte, self.next);
-                } // 外来Font段的GCB数不能由旧中心长度猜测，原Font子片仍走已知ordinal。
+                } // Foreign font runs cannot infer GCB counts from old center length; original-font parts keep their known ordinal.
             }
             self.outstanding = None;
             self.answer = MarkdownShapingFrontierAnswer::Pending;
-            Ok(()) // 真实child已归还才清有界scratch；未读tail仍只有原owner的私有cursor。
+            Ok(()) // Clear scratch only after the actual child returns; unread tail remains private cursor state.
         })();
         match result {
             Ok(()) => Ok(()),

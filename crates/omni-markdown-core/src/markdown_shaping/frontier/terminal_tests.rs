@@ -1,4 +1,5 @@
-//! 原自然项末GCB的真实shape与续票差分；没有Native替身、假stage或正文产品镜像。
+//! Actual shaping and continuation of original natural item-end GCBs, without Native substitutes,
+//! artificial stages, or another product body representation.
 use super::*;
 use crate::{
     MarkdownLineComposeBudget, MarkdownLineComposeCancellation, MarkdownLineComposeError,
@@ -35,7 +36,7 @@ fn advance(worker: &mut MarkdownLineItemCoordinator) -> MarkdownLineItemAnswer {
 
 fn glyphs(mut item: MarkdownLineItem) -> (MarkdownLineItemFacts, Vec<crate::MarkdownShapedGlyph>) {
     let facts = item.facts().clone();
-    let mut result = Vec::new(); // 最多463个有限oracle记录；不进入产品owner或缓存。
+    let mut result = Vec::new(); // Finite selected-item oracle records, never a product owner or cache.
     while let Some(glyph) = item.glyph(result.len()).unwrap() {
         result.push(glyph);
     }
@@ -49,6 +50,8 @@ fn until_terminal(
     MarkdownLineStyleRequest,
     Vec<(MarkdownLineItemFacts, Vec<crate::MarkdownShapedGlyph>)>,
 ) {
+    // Advance the actual coordinator until it requests the blocking GCB's font trial. Ordinary
+    // prefix text must not create a per-character Native style-selection loop.
     let mut records = Vec::new();
     let mut initial = false;
     for _ in 0..100_000 {
@@ -108,7 +111,7 @@ fn trial(
         assert!(step.bytes <= 1 && step.scalars <= 1);
     }
     job.shape(&fixture.authority, &font.authority()).unwrap();
-    let mut result = Vec::new(); // 原完整GCB实际输出，不以cmap或首尾抽样代替缺字检查。
+    let mut result = Vec::new(); // Inspect complete actual GCB output, not nominal cmap or endpoint samples, for missing glyphs.
     for index in 0..job.profile().unwrap().glyph_count {
         result.push(
             job.glyph(&fixture.authority, &font.authority(), index)
@@ -161,7 +164,7 @@ fn oracle(
 ) -> Vec<crate::MarkdownShapedGlyph> {
     let mut options = fixture.options();
     options.beginning_of_text = range.start == 0;
-    options.end_of_text = false; // 后面还有汉字和真实CRLF，不能把Font边界当成段末。
+    options.end_of_text = false; // Following Han and actual CRLF remain; a font boundary is not paragraph end.
     let mut job = MarkdownShapingJob::new(
         fixture.source.clone(),
         &fixture.authority,
@@ -191,7 +194,8 @@ fn oracle(
 
 #[test]
 fn terminal_same_font_keeps_original_plan_and_all_glyph_fields_without_a_font_boundary() {
-    // CRLF使原SCX真正闭合；后继Han令€成为自然Latn项末端，并非人为短style窗口。
+    // Actual CRLF closes original SCX; following Han makes the euro sign a natural Latn item end,
+    // not an artificially shortened style window.
     let fixture = Fixture::new(&format!("{}€中\r\n", "é".repeat(462)), independent_font());
     let source = fixture.source.resource_observer();
     let backing = fixture.document.original_backing_observer().unwrap();
@@ -259,7 +263,8 @@ fn terminal_actual_missing_font_preserves_206_scalars_before_the_real_emoji_font
             .iter()
             .any(|glyph| glyph.glyph_id == 0)
     );
-    // 当前机器公开字体的真实Core整形；它只证明本有限GCB，不借名称授生产计划权限。
+    // Shape this machine's actual system font in Core. It proves only this finite GCB; its name
+    // grants no production-plan capability.
     let bytes = crate::MarkdownLayoutFontBytes::capture_file(
         std::path::Path::new("/System/Library/Fonts/Apple Color Emoji.ttc"),
         512 * 1024 * 1024,
@@ -314,6 +319,8 @@ fn terminal_actual_missing_font_preserves_206_scalars_before_the_real_emoji_font
 
 #[test]
 fn terminal_cancel_and_late_source_error_cannot_resume_the_paused_owner() {
+    // Pause at a genuine terminal style request, then request cancellation with or without a real
+    // source reclaim failure. Neither a saved response nor probe may resume the ended owner.
     for io in [false, true] {
         let fixture = Fixture::new(&format!("{}€中\r\n", "é".repeat(462)), independent_font());
         let cancel = MarkdownLineComposeCancellation::new();
@@ -364,6 +371,8 @@ fn terminal_cancel_and_late_source_error_cannot_resume_the_paused_owner() {
 
 #[test]
 fn terminal_consumed_style_nonce_cannot_be_replayed_into_the_same_source_owner() {
+    // Clone only the existing request to exercise replay after its actual response is consumed.
+    // Equal source/range/font values must not recreate the retired style nonce.
     let fixture = Fixture::new(&format!("{}€中\r\n", "é".repeat(462)), independent_font());
     let source = fixture.source.resource_observer();
     let backing = fixture.document.original_backing_observer().unwrap();
@@ -499,7 +508,7 @@ fn terminal_same_font_continues_through_original_composer_store_and_real_line_en
     let mut output = worker.into_output().unwrap();
     let reader = output.resource_observer();
     let mut line = output.last_line().unwrap();
-    let mut actual = Vec::new(); // 只有本463glyph输入的有限oracle，按原全局cluster对照。
+    let mut actual = Vec::new(); // Finite output oracle for this 463-glyph input, compared by original global clusters.
     while let Some(current) = line {
         for ordinal in 0..current.facts().parts {
             let part = output.part(&current, ordinal).unwrap().unwrap();
@@ -568,7 +577,7 @@ fn ordinary_shortened_style_and_nonterminal_symbol_do_not_gain_terminal_permissi
                     } else {
                         assert!(!answered);
                         answered = true;
-                    } // 中部同Font虽完整成功，仍不能借此构造不存在的字体边界。
+                    } // A successful same-font middle trial still cannot create a font boundary that does not exist.
                     let range = if shortened {
                         0..463
                     } else {

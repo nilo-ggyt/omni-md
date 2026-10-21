@@ -1,4 +1,5 @@
-//! 真实字体下界与原身份撤销回归；有限完整字形oracle只在测试中遍历。
+//! Actual font lower bounds and original-authority revocation; complete finite glyph traversal
+//! belongs only to the independent test oracle.
 
 use super::super::{
     MarkdownShapingCancellation, MarkdownShapingError, ValidatedOptions,
@@ -52,7 +53,8 @@ fn all_glyphs_are_queried_in_fixed_steps_and_proof_binds_the_original_plan() {
     }
     assert_eq!(total, fixture.font.metadata().glyph_count as usize);
     let proof = scan.finish(&fixture.source, &fixture.authority).unwrap();
-    // 对所有真实glyph做独立默认metrics oracle，不抽样、不用ASCII cmap列表代替完整闭包。
+    // Query every actual glyph with an independent default-metric oracle, without sampling or
+    // substituting the ASCII cmap list for a complete glyph-domain bound.
     let shaper = ShaperFont::new(fixture.font.font()).with_scale(options.scale);
     let minimum = (0..fixture.font.metadata().glyph_count)
         .map(|glyph| options.quantize(shaper.default_glyph_h_advance(GlyphId::new(glyph))))
@@ -85,7 +87,7 @@ fn all_glyphs_are_queried_in_fixed_steps_and_proof_binds_the_original_plan() {
     assert!(matches!(
         proof.matches(origin(&fixture), &options, &plan),
         Err(AdvanceScanError::Shaping(MarkdownShapingError::Cancelled))
-    )); // 原计划与Font仍活着也不能让已取消proof恢复权限。
+    )); // Live original plan/font owners cannot revive a cancelled proof.
 }
 
 #[test]
@@ -102,7 +104,7 @@ fn incomplete_foreign_and_zero_budget_scans_cannot_publish_or_resume() {
     let step = scan
         .step(&fixture.source, &fixture.authority, usize::MAX)
         .unwrap();
-    assert_eq!(step.queried, 128); // 传入极大配额也不得解除固定单步上限。
+    assert_eq!(step.queried, 128); // Even an enormous requested budget retains the production per-step cap.
     assert_eq!(step.answer, AdvanceScanAnswer::Pending);
     assert!(matches!(
         scan.finish(&fixture.source, &fixture.authority),
@@ -159,6 +161,8 @@ fn incomplete_foreign_and_zero_budget_scans_cannot_publish_or_resume() {
 
 #[test]
 fn original_source_io_failure_precedes_cancel_even_with_a_healthy_foreign_source() {
+    // Prime a real source lease, fail its explicit reclaim, then supply healthy foreign authority.
+    // The recorded original EIO must not become SourceMismatch or clean cancellation.
     let fixture = Fixture::new("source health ", independent_font());
     let (options, plan) = options_and_plan(&fixture);
     let backing = fixture.document.original_backing_observer().unwrap();

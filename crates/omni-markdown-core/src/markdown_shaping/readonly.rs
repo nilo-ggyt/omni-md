@@ -1,7 +1,7 @@
-//! 原Ready任务的只读交付：只顺序复制固定glyph元数据，不复制正文或移交可变shaper数组。
+//! Deliver original Ready output by copying fixed glyph records sequentially, without copying text or transferring mutable shaper arrays.
 //!
-//! 这里只证明同一个不可变输出的来源；Native仍须核自己的活动文档、代次和输入权限。
-//! worker完成seal后归还原Job，主线程只持唯一匿名File及必要的原Source/Font共享强边。
+//! This proves immutable output origin only; Native still checks its active document, generation, and input authority.
+//! After sealing, workers return original Jobs while the receiving thread owns the anonymous File and necessary shared Source/Font edges.
 
 use super::{
     MarkdownShapedGlyph, MarkdownShapingCancellation, MarkdownShapingDirection,
@@ -24,7 +24,7 @@ mod tests;
 use store::Store;
 pub use store::{MarkdownShapedSpoolIoError, MarkdownShapedSpoolIoOperation};
 
-/// 单次构建只消费一个固定批次；不在一次主线程调用中隐式扫描任意长run。
+/// Build one finite batch per call rather than implicitly scanning an arbitrarily long run in one main-thread call.
 pub const MARKDOWN_SHAPED_SPOOL_STEP: usize = 256;
 const RECORD: usize = 32;
 
@@ -56,7 +56,7 @@ pub enum MarkdownShapedSpoolError {
 }
 type Result<T> = std::result::Result<T, MarkdownShapedSpoolError>;
 
-/// 指向原Job输出nonce；相同文字、字体、范围的新Job不能取得这张票。
+/// Weak authority for the original Job output nonce; another job with equal text/font/range cannot acquire it.
 #[derive(Clone)]
 pub struct MarkdownShapedSpoolAuthority(Weak<()>);
 
@@ -75,7 +75,7 @@ pub struct MarkdownShapedSpoolStep {
     pub status: MarkdownShapedSpoolStatus,
 }
 
-/// 只有固定事实，不保活File、Source、Font或Job；字体底层其他Blob别名须另核自己的VM收据。
+/// Fixed receipts retain no File, Source, Font, or Job; other font-Blob aliases require their own VM release observations.
 #[derive(Clone)]
 pub struct MarkdownShapedSpoolResourceObserver {
     file: store::Observer,
@@ -94,7 +94,7 @@ pub struct MarkdownShapedSpoolResources {
 }
 impl MarkdownShapedSpoolResourceObserver {
     #[must_use]
-    /// 多个原子字段不是运行中事务快照；worker join/owner close后才核最终资源组合。
+    /// Multiple atomics are not a live transactional snapshot; inspect final resource combinations after worker join/owner close.
     pub fn snapshot(&self) -> MarkdownShapedSpoolResources {
         let file = self.file.snapshot();
         MarkdownShapedSpoolResources {
@@ -109,7 +109,7 @@ impl MarkdownShapedSpoolResourceObserver {
     fn failure(&self) -> Result<()> {
         if let Some(errno) = self.backing.as_ref().and_then(|value| value.first_errno()) {
             return Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
-        } // 原Source错误优先于文件/取消；观察者不需要保活原映射来读取首因。
+        } // Original Source failure precedes file/cancellation errors; observing its first cause does not retain the mapping.
         if let Some(error) = self.file.snapshot().first_error {
             return Err(error.into());
         }
@@ -135,7 +135,7 @@ impl Origin {
         font: &MarkdownLayoutFontAuthority,
     ) -> Result<()> {
         self.source.health()?;
-        // 原输出也服从seal之后收到的同一个请求位，不能靠新reader绕过取消。
+        // Original output still obeys the same cancellation bit after seal; constructing another reader cannot bypass it.
         if self.cancellation.requested() {
             return Err(MarkdownShapedSpoolError::Cancelled);
         }
@@ -146,16 +146,16 @@ impl Origin {
             .is_some_and(|value| value.is_cancelled())
         {
             return Err(MarkdownShapedSpoolError::Cancelled);
-        } // 封口只交接数据owner，不洗掉签发此行时原测量的明确取消请求。
-        // 弱票只比较原allocation；文字/范围/字体相同不能代替原job nonce。
+        } // Sealing transfers data ownership without erasing explicit cancellation of the measure that issued this line.
+        // Weak tickets compare original allocation identity, not equal text/range/font in place of the original job nonce.
         if !Weak::ptr_eq(&authority.0, &Arc::downgrade(&self.nonce)) {
             return Err(MarkdownShapedSpoolError::OutputMismatch);
         }
-        // 同一冻结Source强边是读取资格，活动文档的较新代次仍由Native调用方另核。
+        // Same frozen-Source ownership grants read eligibility; the Native caller separately checks the active document's newer generation.
         if !self.source.permits(source) || !self.source.permits(&self.source_authority) {
             return Err(MarkdownShapedSpoolError::SourceMismatch);
         }
-        // 保留精确Font payload身份；PSName或轴值比较不能授予另一次resolve的权限。
+        // Preserve exact Font payload identity; PSName/axis comparisons cannot authorize another resolved instance.
         if !self.font.permits(font) || !self.font.permits(&self.font_authority) {
             return Err(MarkdownShapedSpoolError::FontMismatch);
         }
@@ -167,7 +167,7 @@ struct Payload {
     origin: Origin,
 }
 
-/// Builder只在原worker逐批推进；只有完整seal后的另一具体类型才能读glyph。
+/// Advance the builder in batches on its original worker; only the distinct fully sealed type can read glyph records.
 pub struct MarkdownShapedSpoolBuilder {
     payload: Option<Payload>,
     resources: MarkdownShapedSpoolResourceObserver,
@@ -186,7 +186,7 @@ pub struct MarkdownShapedSpoolBuilder {
 }
 
 impl MarkdownShapedSpoolBuilder {
-    /// 先核原Ready/EOF再创建唯一FD；此构造不推进shape、不复制正文、不签Native几何。
+    /// Check actual original Ready/EOF before creating a unique FD; construction neither shapes, copies text, nor certifies Native geometry.
     pub fn new(
         job: &mut MarkdownShapingJob,
         source: &MarkdownLayoutTextAuthority,
@@ -194,7 +194,7 @@ impl MarkdownShapedSpoolBuilder {
     ) -> Result<Self> {
         let profile = job.profile()?;
         if job.status() != MarkdownShapingStatus::Ready {
-            return Err(MarkdownShapedSpoolError::Pending); // 未Ready时不创建匿名FD或借用部分Buffer。
+            return Err(MarkdownShapedSpoolError::Pending); // Before Ready, create no anonymous FD and lend no partial Buffer.
         }
         job.glyph(source, font, profile.glyph_count)?;
         let value = job
@@ -243,13 +243,13 @@ impl MarkdownShapedSpoolBuilder {
         })
     }
 
-    /// 消费原工厂签发的安全子范围；不接受公开Range，不新建shaper或复制原剩余run。
+    /// Consume the original factory's safe-subrange ticket, not a public Range, without another shaper or copying the remaining run.
     #[cfg(feature = "paged-safe-glyph-slices")]
     pub fn from_safe_slice(
         job: &mut MarkdownShapingJob,
         mut slice: crate::MarkdownSafeGlyphSlice,
     ) -> Result<Self> {
-        slice.require(job)?; // 在创建FD前核实际原owner，未Ready/撤权的候选不产生输出资源。
+        slice.require(job)?; // Check the actual owner before FD creation; unready/revoked candidates acquire no output resources.
         let facts = slice.facts();
         let mut builder = Self::new(job, &slice.source, &slice.font)?;
         builder.source_range = facts.source_utf16;
@@ -288,7 +288,7 @@ impl MarkdownShapedSpoolBuilder {
             &value.origin.source_authority,
             &value.origin.font_authority,
         )?;
-        // Builder虽可由Rust移动，继续写入始终需要原Job，不能拿另一个Ready结果续接。
+        // A Rust-movable builder still requires its original Job to continue writing; another Ready result cannot substitute.
         if !Arc::ptr_eq(&value.origin.nonce, &job.identity) {
             return Err(MarkdownShapedSpoolError::OutputMismatch);
         }
@@ -298,7 +298,7 @@ impl MarkdownShapedSpoolBuilder {
             self.job_count,
         )?;
         let profile = job.profile()?;
-        // profile只是原job聚合；任一事实改变都不能与已经写入的前缀拼成完整文件。
+        // Profile is the original job's aggregate; changed facts cannot be combined with an already written prefix into a complete file.
         if profile.glyph_count != self.job_count || profile.source_generation != self.generation {
             return Err(MarkdownShapedSpoolError::OutputMismatch);
         }
@@ -310,15 +310,15 @@ impl MarkdownShapedSpoolBuilder {
         } else {
             MarkdownShapedSpoolStatus::Poisoned
         };
-        drop(self.payload.take()); // 先结束借用再真实close和交还必要Source/Font强边。
+        drop(self.payload.take()); // End borrows before actual close and returning required Source/Font strong edges.
         if let Err(cause) = self.resources.failure() {
             self.status = MarkdownShapedSpoolStatus::Poisoned;
-            return Err(cause); // Drop期间的真实首IO也不能被干净取消遮掉。
+            return Err(cause); // Actual first I/O failure observed during Drop cannot be hidden by clean cancellation.
         }
         Err(error)
     }
 
-    /// 明确的原worker预算：失败销毁候选，实际FD归还收据仍可由独立observer核验。
+    /// Use an explicit original-worker batch budget; failure destroys the candidate while independent observers retain actual FD-return receipts.
     pub fn step(
         &mut self,
         job: &mut MarkdownShapingJob,
@@ -345,9 +345,9 @@ impl MarkdownShapedSpoolBuilder {
                     .ok_or(MarkdownShapedSpoolError::InvalidRequest)?;
                 if !self.source_range.contains(&glyph.source_utf16_cluster) {
                     return Err(MarkdownShapedSpoolError::OutputMismatch);
-                } // 子范围仍用全局源cluster；RTL只选择原视觉区间，绝不重编号或吞掉越界记录。
+                } // Subranges retain global source clusters; RTL selects original visual intervals without renumbering or discarding invalid records.
                 bytes[offset * RECORD..(offset + 1) * RECORD].copy_from_slice(&encode(glyph)?);
-            } // 栈上只存本批≤256个真实7字段，任意失败都不把前缀写成完整批次。
+            } // The stack holds at most 256 actual seven-field glyphs; a failed prefix cannot be written as a completed batch.
             self.guard(job)?;
             self.payload
                 .as_mut()
@@ -370,7 +370,7 @@ impl MarkdownShapedSpoolBuilder {
         }
     }
 
-    /// 消费完整writer；调用方随后必须归还原Job并join worker，不能把seal当成Job资源已释放。
+    /// Consume the completed writer; callers still return the original Job and join its worker, since seal does not prove job-resource release.
     pub fn seal(mut self, job: &mut MarkdownShapingJob) -> Result<MarkdownShapedSpool> {
         let result = (|| {
             self.guard(job)?;
@@ -387,7 +387,7 @@ impl MarkdownShapedSpoolBuilder {
                 .ok_or(MarkdownShapedSpoolError::Poisoned)?
                 .file
                 .seal(bytes)?;
-            self.guard(job)?; // 同步IO返回后仍核原Job/token；撤权不签发readonly owner。
+            self.guard(job)?; // Recheck original Job/token after synchronous I/O; revocation cannot issue a read-only owner.
             Ok(())
         })();
         if let Err(error) = result {
@@ -413,7 +413,7 @@ impl MarkdownShapedSpoolBuilder {
     }
 }
 
-/// 只有唯一File owner与immutable Source/Font强边；没有Rc、裸指针或unsafe Send实现。
+/// Own a unique File and immutable Source/Font edges, without Rc, raw pointers, or an unsafe Send implementation.
 pub struct MarkdownShapedSpool {
     #[cfg(feature = "paged-safe-glyph-slices")]
     slice_identity: Arc<()>,
@@ -470,18 +470,18 @@ impl MarkdownShapedSpool {
     ) -> Result<Option<MarkdownShapedGlyph>> {
         if index >= self.count {
             self.read_batch(authority, source, font, self.count..self.count, &mut [])?;
-            return Ok(None); // 已sealed真实EOF同样经过完整原票，绝不把Building前缀当EOF。
+            return Ok(None); // Actual sealed EOF checks all original tickets too; a Building prefix cannot masquerade as EOF.
         }
         let mut output = [empty_glyph(); 1];
         self.read_batch(authority, source, font, index..index + 1, &mut output)?;
         Ok(Some(output[0]))
     }
 
-    /// 一个实际pread批次最多256glyph；没有常驻页缓存或完整run的Vec。
+    /// Read at most 256 glyphs per actual pread batch, without a resident page cache or full-run Vec.
     ///
     /// # Errors
-    /// 任何失败都撤销整个reader；`output`只是调用方候选缓冲，Err时必须全部弃用。
-    /// 即使pread或最后原权限核验失败时已经写过候选，也绝不把部分值签成Ready。
+    /// Failure retires the entire reader; `output` is caller-owned candidate storage and must be discarded in full on Err.
+    /// Even if candidate values were written before a later I/O/authority failure, no partial values become Ready.
     pub fn read_batch(
         &mut self,
         authority: &MarkdownShapedSpoolAuthority,
@@ -505,7 +505,7 @@ impl MarkdownShapedSpool {
                 || range.len() != output.len()
                 || output.len() > MARKDOWN_SHAPED_SPOOL_STEP
             {
-                return Err(MarkdownShapedSpoolError::InvalidRequest); // 在任何record读取前拒绝大批次/裁剪请求。
+                return Err(MarkdownShapedSpoolError::InvalidRequest); // Reject oversized or mismatched batch ranges before reading records.
             }
             let mut bytes = [0u8; RECORD * MARKDOWN_SHAPED_SPOOL_STEP];
             let used = range.len() * RECORD;
@@ -515,19 +515,19 @@ impl MarkdownShapedSpool {
                     .checked_mul(RECORD)
                     .ok_or(MarkdownShapedSpoolError::InvalidRequest)?;
                 value.file.read_into(offset, &mut bytes[..used])?;
-            } // 真实空批次不制造glyph或IO，但末尾原权限门仍适用于canonical EOF。
+            } // An actual empty batch creates neither glyphs nor I/O, but the final original-authority check still applies at EOF.
             for record in bytes[..used].as_chunks::<RECORD>().0 {
                 let glyph = decode(*record)?;
                 if !self.source_range.contains(&glyph.source_utf16_cluster) {
                     return Err(MarkdownShapedSpoolError::InvalidRequest);
                 }
-            } // 完整预检本批后再触碰output，损坏尾record不能发布已知前缀。
+            } // Validate the entire batch before touching output, so a corrupt final record cannot publish a known prefix.
             self.resources.failure()?;
             value.origin.permits(authority, source, font)?;
             for (target, record) in output.iter_mut().zip(bytes[..used].as_chunks::<RECORD>().0) {
                 *target = decode(*record)?;
             }
-            value.origin.permits(authority, source, font)?; // 返回前仍是原票；Err时调用方丢弃整批候选。
+            value.origin.permits(authority, source, font)?; // Recheck original tickets before return; callers discard the whole candidate batch on Err.
             Ok(output.len())
         })();
         match result {
@@ -548,10 +548,10 @@ impl MarkdownShapedSpool {
         }
     }
 
-    /// 只归还本owner资源，不表示功能成功；底层共享Source/Font映射由各自真实收据核验。
+    /// Return this owner's resources without implying operation success; independently observe underlying shared Source/Font mappings.
     pub fn close(mut self) -> Result<()> {
         drop(self.payload.take());
-        self.resources.failure() // 只有实际close返回成功才由observer报告close_succeeded。
+        self.resources.failure() // Check original failure after Drop; observers distinguish actual close success from an earlier operation error.
     }
 }
 
@@ -607,7 +607,7 @@ fn decode(bytes: [u8; RECORD]) -> Result<MarkdownShapedGlyph> {
     })
 }
 
-/// 具体sealed文件的纯弱身份；原Job的多个spool不能互相替代此票。
+/// Weak identity for one concrete sealed file; multiple spools from the same original Job cannot substitute for this ticket.
 #[cfg(feature = "paged-safe-glyph-slices")]
 #[derive(Clone)]
 pub(crate) struct MarkdownShapedSpoolInstance(Weak<()>);
@@ -633,11 +633,11 @@ impl MarkdownShapedSpool {
         let font = payload.origin.font_authority.clone();
         let authority = self.authority.clone();
         self.read_batch(&authority, &source, &font, self.count..self.count, &mut [])?;
-        Ok(()) // 返回弱身份不是Ready；实际使用始终重核原Source/取消/FD首错及原reader状态。
+        Ok(()) // Weak identity alone is not Ready; actual use rechecks original Source/cancellation/FD failure and reader state.
     }
 }
 
-/// 历史item收据只保弱权限和固定事实；具体spool nonce不能由同Job的另一输出替代。
+/// Historical-item receipts retain weak authority and fixed facts; another output of the same Job cannot replace this concrete spool instance.
 #[cfg(feature = "paged-safe-glyph-slices")]
 #[derive(Clone)]
 pub(crate) struct MarkdownSpoolSliceOrigin {
@@ -675,7 +675,7 @@ impl MarkdownShapedSpool {
             generation: self.generation,
             direction: self.direction,
             points: self.points.to_bits(),
-        }) // EOF仍先经过实际Source/Font/文件首错误门，不能从旧裸metadata构造新授权。
+        }) // EOF still checks actual Source/Font/file failure first; old naked metadata cannot construct new authority.
     }
     pub(crate) fn require_safe_slice_origin(
         &mut self,
@@ -701,7 +701,7 @@ impl MarkdownShapedSpool {
             self.count..self.count,
             &mut [],
         )?;
-        Ok(()) // 三种弱权限均重核；同名字体、同Job第二spool或同文字Source没有替代资格。
+        Ok(()) // Recheck all original authorities; same-name Font, another same-job spool, or equal-content Source cannot substitute.
     }
     pub(crate) fn require_safe_slice_job(
         &mut self,
@@ -724,6 +724,6 @@ impl MarkdownShapedSpool {
         if job.profile()?.glyph_count != origin.count {
             return Err(MarkdownShapedSpoolError::OutputMismatch);
         }
-        Ok(()) // 必须在旧Job仍活且真实NeedNextItem时记录，不能日后只凭sameSource补签历史。
+        Ok(()) // Record while the old Job lives at actual NeedNextItem, not later by reauthorizing history from equal Source alone.
     }
 }

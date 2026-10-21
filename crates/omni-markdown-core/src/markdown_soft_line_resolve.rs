@@ -1,7 +1,9 @@
-//! 原测量选择的实际单item重整形；软行不是新的段落，正文始终来自同一冻结Source。
+//! Reshape the original measure's selected item using the same frozen Source
+//! and its original paragraph context across soft-line boundaries.
 //!
-//! 原cluster证明安全的候选可先复用精确advance；unsafe或cluster内部候选必须实际shape。
-//! 最终前缀与余项均保存真实新job，调用方在同一worker推进；本模块不创建线程或Native对象。
+//! Cluster-proven safe candidates can reuse exact advances; unsafe or interior
+//! candidates require actual shaping. Final prefix/remainder retain real jobs
+//! advanced by their existing worker owner; this module starts no execution.
 use std::{
     ops::Range,
     sync::{
@@ -77,7 +79,8 @@ pub enum MarkdownSoftLineResolveError {
 }
 type Result<T> = std::result::Result<T, MarkdownSoftLineResolveError>;
 
-/// 一个解析阶段同时请求原测量位与原shaper位；所有试次沿同一原shaper位，不逐候选复位。
+/// One resolution stage shares the original measure and shaper cancellation
+/// signals across every trial, without resetting permission per candidate.
 #[derive(Clone)]
 pub struct MarkdownSoftLineResolveCancellation {
     measure: MarkdownSoftLineMeasureCancellation,
@@ -86,7 +89,8 @@ pub struct MarkdownSoftLineResolveCancellation {
 impl MarkdownSoftLineResolveCancellation {
     pub fn cancel(&self) {
         self.measure.cancel();
-        self.shape.request(); // 真正深层shape观察这个原位；旧Measure位单独请求仍在量子边界核验。
+        self.shape.request(); // Deep shaping observes this original signal;
+        // measure-only cancellation is also checked at turn boundaries.
     }
 }
 
@@ -129,7 +133,8 @@ pub enum MarkdownSoftLineResolvedSide {
     Remainder,
 }
 
-/// 仅真实已shape的源范围/字形事实；Native几何、跨item合成和BiDi行重排仍在后继阶段。
+/// Actual shaped source/glyph facts leave Native geometry, multi-item line
+/// composition, and line-level bidi ordering to their later owning stages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownSoftLineResolvedBoundary {
     pub source_utf16: Range<usize>,
@@ -152,9 +157,9 @@ pub enum MarkdownSoftLineResolveAnswer {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownSoftLineResolveStep {
     pub input_bytes: usize,
-    /// 原整形输入本次实际消费的标量；与正文 bytes 分开传递，不由 UTF-8 长度估算。
+    /// Actual scalars consumed this turn, accounted independently from UTF-8 bytes.
     pub input_scalars: usize,
-    /// 本次新建实际重排 Job 时读取的相邻上下文；不与后继正文输入重复结算。
+    /// Adjacent context read by newly constructed jobs, separate from later input.
     pub context_bytes: usize,
     pub glyphs: usize,
     pub candidates: usize,
@@ -198,7 +203,8 @@ impl MarkdownSoftLineResolveResourceObserver {
     }
 }
 
-/// 只有这个局部owner能结算子job；先真正Drop，再读取原observer，不提供手动签成功入口。
+/// This local owner settles each child job by actual Drop followed by its
+/// original resource observer, with no manual successful-release operation.
 struct OwnedShape {
     job: Option<MarkdownShapingJob>,
     observer: MarkdownShapingResourceObserver,
@@ -206,6 +212,8 @@ struct OwnedShape {
 }
 impl OwnedShape {
     fn new(job: MarkdownShapingJob, resources: &Arc<ResourceFacts>) -> Result<Self> {
+        // Account only real child jobs. Counter exhaustion leaves a negative
+        // receipt and returns the supplied job through ordinary Rust ownership.
         if resources
             .active
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
@@ -245,7 +253,8 @@ impl Drop for OwnedShape {
             || observed.first_error.is_some()
         {
             self.resources.failed.store(true, Ordering::Release);
-        } // 字体/Source仍可由原owner合法共享；这里只结算本job真实glyph映射与文件。
+        } // Font/Source may still have legitimate independent owners. These
+        // observations settle this job's actual glyph mappings and files only.
         if self
             .resources
             .active
@@ -257,7 +266,8 @@ impl Drop for OwnedShape {
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
                 .is_err()
         {
-            self.resources.failed.store(true, Ordering::Release); // Drop不panic；计数异常永远不能签资源成功。
+            self.resources.failed.store(true, Ordering::Release); // Counter
+            // inconsistency remains negative; Drop does not certify success.
         }
     }
 }
@@ -319,7 +329,8 @@ struct Payload {
     defer_tail: bool,
 }
 
-/// 原Measure/Shape仅Weak签发；每次操作借回真实owner，本层最多保留两个实际分页子job。
+/// Original measure/shape authority is weak and reborrowed for each operation;
+/// resolution retains at most two real paged child jobs.
 pub struct MarkdownSoftLineResolveJob {
     payload: Option<Payload>,
     cancellation: MarkdownSoftLineResolveCancellation,
@@ -327,7 +338,8 @@ pub struct MarkdownSoftLineResolveJob {
     backing: Option<MarkdownOriginalBackingObserver>,
 }
 impl MarkdownSoftLineResolveJob {
-    /// 不创建新shaper；实际子job仅在worker调用step时构造。
+    /// Capture the original selected seed now; child shapers are constructed
+    /// only when the owning worker actually advances the resolver.
     pub fn new(
         measure: &MarkdownSoftLineMeasureJob,
         original: &mut MarkdownShapingJob,
@@ -336,10 +348,12 @@ impl MarkdownSoftLineResolveJob {
         Self::from_seed(
             seed,
             JobGlyphProvider::new(original, None).shaping_cancellation(),
-        ) // 同原Job的取消位，所有producer都从这一能力边界交给共用selector。
+        ) // Every producer supplies its actual original cancellation signal at
+        // this same selector boundary.
     }
 
-    /// 已选原seed和真实producer的原取消位共用唯一装配，Stored不伪造原Ready Job。
+    /// Assemble from an already selected original seed and its actual producer
+    /// signal. Stored output supplies its real provider rather than a fake job.
     fn from_seed(
         seed: MarkdownSoftLineResolveSeed,
         shape: MarkdownShapingCancellation,
@@ -354,6 +368,7 @@ impl MarkdownSoftLineResolveJob {
         };
         let backing = seed.source.original_backing_observer();
         let (mode, limit, pending) = match &seed.choice {
+            // Measured/reshape choices retain the selected actual endpoint.
             MarkdownSoftLineMeasureChoice::MeasuredBreak(value) => {
                 (Mode::Exact, value.source_utf16.end, None)
             }
@@ -366,11 +381,13 @@ impl MarkdownSoftLineResolveJob {
             #[cfg(feature = "paged-shaping-frontier")]
             MarkdownSoftLineMeasureChoice::NeedsFrontierEmergencyPrefix {
                 source_utf16, ..
-            } => (Mode::Emergency, source_utf16.end, None), // 只解析实际provider前缀；原word_end从未成为可shape的范围或伪UAX机会。
+            } => (Mode::Emergency, source_utf16.end, None), // Only this actual
+            // provider prefix is eligible; word_end grants no shaping/UAX edge.
             #[cfg(feature = "paged-shaping-frontier")]
             MarkdownSoftLineMeasureChoice::MeasuredEmergencyBreak { source_utf16, .. } => {
                 (Mode::Emergency, source_utf16.end, None)
-            } // 旧显式resolver仍可重核原选择；生产Store直接消费封闭安全票。
+            } // The explicit resolver can recheck this selection; production
+            // Store consumes its private safe ticket directly.
             MarkdownSoftLineMeasureChoice::NeedsFontFallback {
                 cluster_utf16,
                 missing_glyphs,
@@ -395,10 +412,14 @@ impl MarkdownSoftLineResolveJob {
             MarkdownSoftLineMeasureChoice::EmptySource => (Mode::Exact, seed.start, None),
         };
         let pending = pending.or_else(|| {
+            // A selected interval spanning beyond this actual item still needs
+            // the next item, rather than treating an item edge as paragraph EOF.
             (seed.start < seed.item.start || limit > seed.item.end)
                 .then_some(MarkdownSoftLineResolvePending::NextItem)
         });
         let answer = if matches!(seed.choice, MarkdownSoftLineMeasureChoice::EmptySource) {
+            // Only the original explicit empty-source choice establishes this
+            // terminal outcome without glyph work.
             Some(MarkdownSoftLineResolveAnswer::EmptySource)
         } else {
             pending.map(MarkdownSoftLineResolveAnswer::Pending)
@@ -447,9 +468,11 @@ impl MarkdownSoftLineResolveJob {
         self.resources.clone()
     }
 
-    /// 消费原解析owner，转交两个真实job；公开Copy坐标不能构造后继行首权限。
+    /// Consume the resolver into its actual jobs; public Copy coordinates
+    /// cannot manufacture authority over the following line start.
     ///
-    /// 转交后原Measure可归还；每个具体Shape仍由自己的Source/Font/nonce与原取消位守护。
+    /// After transfer the original measure may retire; each actual shape still
+    /// checks its own Source/font/nonce and original cancellation signal.
     pub fn take_parts(
         mut self,
         measure: &MarkdownSoftLineMeasureJob,
@@ -483,10 +506,12 @@ impl MarkdownSoftLineResolveJob {
                 payload.seed.font.clone(),
                 true,
             )?),
-            None => None, // 真空余项不制造第二个用户文档或假Job。
+            None => None, // An empty remainder creates neither another document
+                          // nor a placeholder shaping job.
         };
         let parts = MarkdownSoftLineResolvedParts::new(boundary, line, remainder);
-        self.guard(measure, original)?; // 所有转移完成后仍需原票；失败时候选parts真实Drop，不发布部分前缀。
+        self.guard(measure, original)?; // Recheck after every transfer. Failure
+        // drops the actual candidate parts without publishing a partial prefix.
         drop(self.payload.take());
         Ok(parts)
     }
@@ -499,6 +524,8 @@ impl MarkdownSoftLineResolveJob {
         self.guard_provider(measure, &mut JobGlyphProvider::new(original, None))
     }
 
+    /// Preserve actual backing/Source failure before matching the original
+    /// provider and measure; later state cannot refresh an obsolete selector.
     fn guard_provider(
         &self,
         measure: &MarkdownSoftLineMeasureJob,
@@ -518,7 +545,8 @@ impl MarkdownSoftLineResolveJob {
         payload.seed.source.health()?;
         if payload.seed.origin != provider.origin() {
             return Err(MarkdownSoftLineMeasureError::JobMismatch.into());
-        } // 同一Measure合法交接后仍是原nonce，但旧selector不能借后项目录重签原字体/范围。
+        } // Valid measure continuation keeps its nonce; an old selector still
+        // cannot adopt a later item's directory to replace its font/range.
         measure.require_resolve_provider(&payload.seed.owner, provider)?;
         if self.resources.facts.failed.load(Ordering::Acquire) {
             return Err(MarkdownSoftLineResolveError::ResourceCleanup);
@@ -526,7 +554,8 @@ impl MarkdownSoftLineResolveJob {
         Ok(())
     }
 
-    /// 每次最多一个真实shape；它是worker同步算法，不冒称主线程有限时延。
+    /// Advance at most one actual shape per turn on the existing worker. The
+    /// synchronous shaping algorithm does not prove a main-thread latency bound.
     pub fn step(
         &mut self,
         measure: &MarkdownSoftLineMeasureJob,
@@ -543,6 +572,8 @@ impl MarkdownSoftLineResolveJob {
         )
     }
 
+    /// Recheck Source after the bounded operation and after failure disposal;
+    /// candidate/cancellation errors cannot hide the original backing errno.
     fn step_provider(
         &mut self,
         measure: &MarkdownSoftLineMeasureJob,
@@ -567,10 +598,13 @@ impl MarkdownSoftLineResolveJob {
             .and_then(|observer| observer.first_errno())
         {
             return Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
-        } // 包括最后Source归还，真实errno不被候选/取消错误或控制占位错误吞掉。
+        } // Final Source return can expose the actual error too; retain it
+        // instead of a candidate, cancellation, or control-state error.
         result
     }
 
+    /// Spend separate input/scalar/glyph/candidate allowances while preserving
+    /// one original candidate and real child jobs across turns.
     fn advance(
         &mut self,
         measure: &MarkdownSoftLineMeasureJob,
@@ -584,6 +618,7 @@ impl MarkdownSoftLineResolveJob {
             || budget.glyphs == 0
             || budget.candidates == 0
         {
+            // Zero allowances cannot advance any admitted stage meaningfully.
             return Err(MarkdownSoftLineResolveError::InvalidRequest);
         }
         let mut step = MarkdownSoftLineResolveStep {
@@ -601,11 +636,15 @@ impl MarkdownSoftLineResolveJob {
             .ok_or(MarkdownSoftLineResolveError::Poisoned)?;
         breaks.require_source(&payload.seed.authority)?;
         if let Some(answer) = &payload.answer {
+            // Return the same established outcome after authority validation;
+            // this observation does not rerun a completed external operation.
             step.answer = answer.clone();
             return Ok(step);
         }
         match payload.stage {
             Stage::Choose => {
+                // Candidate enumeration follows actual grapheme boundaries and
+                // yields on incomplete GCB data instead of inventing an edge.
                 for _ in 0..budget.candidates.min(MARKDOWN_SOFT_LINE_RESOLVE_CANDIDATES) {
                     let end = match payload.mode {
                         Mode::Exact => payload.limit,
@@ -637,14 +676,17 @@ impl MarkdownSoftLineResolveJob {
                         }
                         MarkdownGraphemeAnswer::Known(Some(_)) => {}
                         _ => return Err(MarkdownSoftLineResolveError::InconsistentCoverage),
-                    } // 真实选择必须仍是同一原GCB边界，低代理项或字素内部从不获得授权。
+                    } // The selected endpoint must remain an original GCB
+                    // boundary, excluding surrogate or grapheme interiors.
                     if end == payload.seed.item.end && end != payload.seed.source.utf16_len() {
                         let following = provider
                             .following_item_flags(&payload.seed.authority, &payload.seed.font)?;
                         if following.is_none_or(|flags| flags & UNSAFE != 0) {
                             pending(payload, MarkdownSoftLineResolvePending::NextItem);
-                            break; // 没有真实安全后继仍拒绝；不能用Store/Script末端伪造段落EOF或跳过unsafe边界。
-                        } // 同Store已存后项的首cluster提供实际右侧见证；原Source、Font、GCB及上下文合同均不变。
+                            break; // An unknown/unsafe successor cannot turn an
+                            // item/Store edge into paragraph EOF.
+                        } // The same Store's actual following cluster supplies
+                        // right-side proof under original Source/font/GCB/context.
                     }
                     step.candidates += 1;
                     payload.candidate = end;
@@ -653,6 +695,8 @@ impl MarkdownSoftLineResolveJob {
                         && let Some(width) = safe_width(payload, provider, end)?
                     {
                         if width <= payload.seed.width {
+                            // Safe complete original clusters supply exact
+                            // signed width without creating another trial job.
                             payload.best = Some(Fit {
                                 end,
                                 width,
@@ -664,7 +708,8 @@ impl MarkdownSoftLineResolveJob {
                                     choose_best(payload, provider, &self.resources.facts)?;
                                 break;
                             }
-                            continue; // 同一原数组、完整cluster端点和安全flags已证明精确有符号advance。
+                            continue; // Continue the same original array's
+                            // proven safe endpoints and signed advances.
                         }
                         #[cfg(feature = "paged-safe-glyph-slices")]
                         if payload.reuse_safe {
@@ -676,18 +721,23 @@ impl MarkdownSoftLineResolveJob {
                                     shape: None,
                                     facts: None,
                                 });
-                            } // 第一个完整GCB也超宽时保留整个GCB，并明确overflow；绝不切开组合符。
+                            } // Preserve even the first overwide whole grapheme
+                            // and explicitly report overflow instead of splitting it.
                             step.context_bytes =
                                 choose_best(payload, provider, &self.resources.facts)?;
-                            break; // 安全超宽候选的真实重形宽度相同，不再造一个相同前缀来确认。
+                            break; // A proven safe overwide candidate has the
+                            // same reshaped width; do not duplicate that trial.
                         }
                     }
                     step.context_bytes =
                         start_current(payload, provider, &self.resources.facts, false)?;
-                    break; // unsafe/cluster内部或超宽候选先实际shape，不用估算宽度终止搜索。
+                    break; // Unsafe/interior or other overwide candidates need
+                    // actual shaping before terminating the width search.
                 }
             }
             Stage::Input | Stage::TailInput => {
+                // Prefix and tail each consume their real source through the
+                // same maximum 4 KiB lease and caller's scalar allowance.
                 let tail = matches!(payload.stage, Stage::TailInput);
                 let owned = if tail {
                     payload.tail.as_mut()
@@ -710,6 +760,8 @@ impl MarkdownSoftLineResolveJob {
                 }
             }
             Stage::Shape | Stage::TailShape => {
+                // Run one actual worker-owned synchronous shape. Finite input
+                // leases alone are not evidence of bounded shaping CPU time.
                 let tail = matches!(payload.stage, Stage::TailShape);
                 let owned = if tail {
                     payload.tail.as_mut()
@@ -725,6 +777,8 @@ impl MarkdownSoftLineResolveJob {
                 step.shapes = 1;
             }
             Stage::Scan | Stage::TailScan => {
+                // Accumulate only actual output records in bounded batches;
+                // source character counts cannot predict shaped glyph facts.
                 let tail = matches!(payload.stage, Stage::TailScan);
                 let owned = if tail {
                     payload.tail.as_mut()
@@ -752,8 +806,11 @@ impl MarkdownSoftLineResolveJob {
                     payload.scan.flags |= glyph.flags;
                     payload.scan.missing += usize::from(glyph.glyph_id == 0);
                     step.glyphs += 1;
-                } // 逐实际glyph汇总，不能用输入字符数、cmap或原prefix估计代替真实结果。
+                } // Actual glyph fields retain signed advance and original
+                // flags, without cmap or input-length approximations.
                 if payload.scan.count == profile.glyph_count {
+                    // Confirm actual output EOF and original shaper access
+                    // before deciding fallback, completed tail, or accepted fit.
                     if job
                         .glyph(
                             &payload.seed.authority,
@@ -784,7 +841,8 @@ impl MarkdownSoftLineResolveJob {
                 }
             }
             #[cfg(feature = "paged-safe-glyph-slices")]
-            Stage::Reusable | Stage::ShapedPrefix => {} // 仅显式wrapper消费；旧API不把未解析余文报Ready。
+            Stage::Reusable | Stage::ShapedPrefix => {} // Explicit wrappers
+            // consume these states; unresolved remaining text is never Ready.
             Stage::Finished => return Err(MarkdownSoftLineResolveError::InconsistentCoverage),
         }
         if let Some(answer) = &payload.answer {
@@ -793,7 +851,8 @@ impl MarkdownSoftLineResolveJob {
         Ok(step)
     }
 
-    /// 只读一个真实新glyph；必须仍借原Measure与Shape，不可用同字节新任务重签。
+    /// Read one real new glyph while borrowing the original measure/shape;
+    /// a new same-text job cannot replace this output's original authority.
     pub fn glyph(
         &mut self,
         measure: &MarkdownSoftLineMeasureJob,
@@ -851,7 +910,8 @@ impl MarkdownSoftLineResolveJob {
         result
     }
 
-    /// 归还所有真实子job再结算；原Source可能仍由调用方的原shape/索引合法保活。
+    /// Dispose every real child job before checking receipts. The caller's
+    /// independent original shape/index may still legitimately retain Source.
     pub fn close(mut self) -> Result<MarkdownSoftLineResolveResources> {
         drop(self.payload.take());
         if let Some(errno) = self
@@ -872,14 +932,18 @@ impl MarkdownSoftLineResolveJob {
     }
 }
 
+/// Retire all candidate jobs when real font/dictionary/item work is still
+/// required; none of their glyphs can bypass the unresolved dependency.
 fn pending(payload: &mut Payload, reason: MarkdownSoftLineResolvePending) {
     drop(payload.current.take());
     drop(payload.best.take());
     drop(payload.line.take());
     drop(payload.tail.take());
     payload.answer = Some(MarkdownSoftLineResolveAnswer::Pending(reason));
-    payload.stage = Stage::Finished; // 未解决阶段没有glyph Ready；旧字形不能跨过缺失字体或词典阶段。
+    payload.stage = Stage::Finished;
 }
+/// Recover exact width only across complete safe clusters of the same original
+/// provider, preserving signed prefix differences and explicit unknown results.
 fn safe_width(
     payload: &Payload,
     provider: &mut dyn ResolutionProvider,
@@ -933,6 +997,8 @@ fn safe_width(
             .ok_or(MarkdownSoftLineResolveError::Overflow)?,
     ))
 }
+/// Construct an actual prefix trial from this provider, recording only context
+/// bytes the successful constructor really read before input ingestion starts.
 fn start_current(
     payload: &mut Payload,
     provider: &mut dyn ResolutionProvider,
@@ -944,8 +1010,9 @@ fn start_current(
         &payload.seed.font,
         payload.seed.start..payload.candidate,
     )?;
-    // 构造成功且尚未 ingest；原 Job 的实读总数此刻只含本次真实相邻上下文。
-    // 失败沿原错误立即结束，不能拿请求范围或固定 halo 大小补造成功工作量。
+    // Before ingest, actual job reads contain adjacent context only. Propagate
+    // constructor/profile failure rather than fabricating work from the request
+    // extent or a configured halo size.
     let context_bytes = job.profile()?.source_bytes_read;
     let status = job.status();
     payload.current = Some(OwnedShape::new(job, resources)?);
@@ -957,12 +1024,16 @@ fn start_current(
     };
     Ok(context_bytes)
 }
+/// Accept the completed actual trial or return to GCB search. Width failures
+/// retire only the relevant real child, retaining the best proven complete fit.
 fn accept_current(
     payload: &mut Payload,
     provider: &mut dyn ResolutionProvider,
     resources: &Arc<ResourceFacts>,
 ) -> Result<usize> {
     if payload.final_prefix {
+        // The final real shape must equal the width previously certified by
+        // original safe clusters before it becomes the selected line.
         if payload.expected_width != Some(payload.scan.width) {
             return Err(MarkdownSoftLineResolveError::InconsistentCoverage);
         }
@@ -972,6 +1043,8 @@ fn accept_current(
     }
     let fit = payload.scan.width <= payload.seed.width;
     if fit {
+        // Move the actual successful trial into best; replacing an older fit
+        // returns its job through its existing resource owner.
         payload.best = Some(Fit {
             end: payload.candidate,
             width: payload.scan.width,
@@ -986,7 +1059,8 @@ fn accept_current(
         drop(payload.current.take());
         payload.mode = Mode::Emergency;
         payload.next = payload.seed.start;
-        payload.stage = Stage::Choose; // 实际重排超宽后重新按真实GCB搜索，不沿原估计签行。
+        payload.stage = Stage::Choose; // An overwide actual exact trial restarts
+    // search at real GCBs rather than certifying the original estimate.
     } else if payload.best.is_some() {
         drop(payload.current.take());
         return choose_best(payload, provider, resources);
@@ -998,11 +1072,14 @@ fn accept_current(
             shape: payload.current.take(),
             facts: Some(payload.scan),
         });
-        // 第一整个 GCB 也超宽时保留完整字素；若启动新 Job，原样交回它的真实上下文费用。
+        // Preserve the complete first grapheme when even it overflows. Any new
+        // selected job reports its actual context-read cost through choose_best.
         return choose_best(payload, provider, resources);
     }
-    Ok(0) // 只移交已有候选或改变选择阶段，没有新 Job，也没有额外上下文读取。
+    Ok(0) // Existing candidate transfer or phase changes read no new context.
 }
+/// Move the selected real fit or its private safe proof into the appropriate
+/// next stage without deriving readiness from public coordinates alone.
 fn choose_best(
     payload: &mut Payload,
     provider: &mut dyn ResolutionProvider,
@@ -1024,10 +1101,12 @@ fn choose_best(
     if payload.reuse_safe && best.shape.is_none() {
         payload.expected_width = Some(best.width);
         payload.stage = Stage::Reusable;
-        return Ok(0); // 只移交原候选权限；wrapper 仍核真实 GCB/索引，不读取新的整形上下文。
+        return Ok(0); // The wrapper still checks actual GCB/index authority;
+        // transferring this candidate reads no new context.
     }
     match best.shape.take() {
         Some(shape) => {
+            // Reuse the actual already-shaped fit and its exact glyph facts.
             payload.line = Some(shape);
             payload.line_facts = best
                 .facts
@@ -1035,12 +1114,16 @@ fn choose_best(
             start_tail(payload, provider, resources)
         }
         None => {
+            // Materialize the selected prefix as a real job for subsequent
+            // per-glyph consumption, preserving the certified expected width.
             payload.candidate = best.end;
             payload.expected_width = Some(best.width);
-            start_current(payload, provider, resources, true) // 最终安全候选也保存真实prefix，供后继逐glyph消费。
+            start_current(payload, provider, resources, true)
         }
     }
 }
+/// Retain no placeholder tail. Either defer an explicitly owned continuation,
+/// finish at the real item edge, or construct the actual remainder job.
 fn start_tail(
     payload: &mut Payload,
     provider: &mut dyn ResolutionProvider,
@@ -1052,18 +1135,21 @@ fn start_tail(
             return Err(MarkdownSoftLineResolveError::InconsistentCoverage);
         }
         payload.stage = Stage::ShapedPrefix;
-        return Ok(0); // 只交真实已整形 prefix；余文仍是私有源 cursor，没有新上下文读取。
+        return Ok(0); // Only the actual shaped prefix is transferred; remaining
+        // source stays a private cursor with no new context read.
     }
     if payload.selected_end == payload.seed.item.end {
         payload.scan = GlyphFacts::default();
-        return finish(payload).map(|()| 0); // 真空余项只封存已有前缀，不创建 Job 或上下文。
+        return finish(payload).map(|()| 0); // A truly empty remainder seals the
+        // existing prefix without a new job/context.
     }
     let mut job = provider.reshape_subrange(
         &payload.seed.authority,
         &payload.seed.font,
         payload.selected_end..payload.seed.item.end,
     )?;
-    // 余项 Job 的构造读取也属于当前步骤；后续 ingest 的 bytes/scalars 由其实际 step 返回。
+    // This turn owns actual tail-constructor context reads. Later ingestion
+    // returns its own consumed bytes/scalars rather than counting context twice.
     let context_bytes = job.profile()?.source_bytes_read;
     let status = job.status();
     payload.tail = Some(OwnedShape::new(job, resources)?);
@@ -1074,6 +1160,8 @@ fn start_tail(
     };
     Ok(context_bytes)
 }
+/// Publish exact selected/tail facts only after their real output stages have
+/// completed, retaining the original item boundaries and overflow classification.
 fn finish(payload: &mut Payload) -> Result<()> {
     if payload.selected_end <= payload.seed.start || payload.selected_end > payload.seed.item.end {
         return Err(MarkdownSoftLineResolveError::InconsistentCoverage);
@@ -1097,7 +1185,8 @@ fn finish(payload: &mut Payload) -> Result<()> {
 #[cfg(test)]
 mod tests;
 
-/// 原Job适配不改变已有错误层次；Store专有首因仍保留在Measure::Stored中。
+/// Preserve the existing job error hierarchy; Store-specific first causes
+/// remain represented by the original Measure::Stored error.
 fn provider_error(error: MarkdownSoftLineMeasureError) -> MarkdownSoftLineResolveError {
     match error {
         MarkdownSoftLineMeasureError::Source(error) => error.into(),

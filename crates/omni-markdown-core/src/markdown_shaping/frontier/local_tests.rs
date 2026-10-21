@@ -1,4 +1,5 @@
-//! 有限完整oracle逐glyph比对；独立完整任务不使用局部证书或中心view。
+//! Compare every glyph with a finite complete oracle whose independent job uses no local
+//! certificate or center view.
 use super::*;
 
 fn compare_part(fixture: &Fixture, child: &mut MarkdownShapingJob, full: &mut MarkdownShapingJob) {
@@ -32,8 +33,9 @@ fn compare_part(fixture: &Fixture, child: &mut MarkdownShapingJob, full: &mut Ma
 #[test]
 #[ignore = "显式使用原Native UIFont抓取的有限字体输入；须设置OMNI_FRONTIER_UIFONT_FIXTURES"]
 fn actual_native_ui_fonts_local_centers_match_full_source_glyphs_flags_and_advances() {
-    // 这18组name表/轴位/字号由原Native控制抓取，不以字体名猜face或偷换monospace。
-    // 文件只读：缺少输入明确失败，不能把未运行角色当作零差异通过。
+    // These 18 name-table/axis/point-size cases come from the original Native capture, without
+    // guessing faces from names or substituting monospace. Read fixtures only: missing inputs fail
+    // explicitly, and an unexecuted role is never a zero-difference acceptance result.
     let root = std::path::PathBuf::from(
         std::env::var_os("OMNI_FRONTIER_UIFONT_FIXTURES").expect("需要真实UIFont控制输入"),
     );
@@ -96,7 +98,8 @@ fn actual_native_ui_fonts_local_centers_match_full_source_glyphs_flags_and_advan
         }
         full.shape(&fixture.authority, &fixture.font_authority)
             .unwrap();
-        // 原item在非零源位置，不把它误当Source开头；真正边界选项由同请求继承。
+        // The actual item starts at a nonzero source coordinate; inherit its original boundary
+        // options rather than treating it as the source beginning.
         let mut parts = 0;
         let mut metadata = 0;
         let mut input = 0;
@@ -115,7 +118,7 @@ fn actual_native_ui_fonts_local_centers_match_full_source_glyphs_flags_and_advan
                             records: 1024,
                         },
                     )
-                    .unwrap(); // 此有限全glyph差分不是首行延迟控制；真实GCB可继续推进，不把Pending当EOF。
+                    .unwrap(); // Full-glyph comparison is not first-line latency; advance actual GCB dependencies instead of declaring Pending EOF.
                 let step = frontier
                     .step(
                         &fixture.authority,
@@ -250,7 +253,7 @@ fn original_roboto_complete_ascii_domain_centers_match_full_real_plan() {
             .unwrap()
             .into_parts();
         assert_eq!(child.source_range().start, covered);
-        compare_part(&fixture, &mut child, &mut full); // 保glyphID/flags/cluster/advance/offset，不能只比条数。
+        compare_part(&fixture, &mut child, &mut full); // Compare IDs/flags/clusters/advances/offsets, not only counts.
         covered = child.source_range().end;
         let resources = child.resource_observer();
         drop(child);
@@ -299,12 +302,14 @@ fn reachable_roboto_fi_and_unread_late_fi_keep_the_real_ligature_refusal() {
                 harfrust::AsciiFrontierRejection::CrossInputSubtable
             ))
         );
-        assert!(frontier.child.is_none()); // 真拒证在生产字形前完成，原完整shape功能和feature均未被关闭。
+        assert!(frontier.child.is_none()); // Reject before glyph creation without disabling original full shaping or features.
     }
 }
 
 #[test]
 fn pending_complete_domain_proof_keeps_original_cancel_and_eio_cause_without_live_paths() {
+    // Pause a real complete-domain tree walk, then cancel with or without actual source reclaim
+    // failure. Ending the frontier must return its unfinished tree path and actual source owner.
     for failed_io in [false, true] {
         let font = MarkdownLayoutFont::resolve(Arc::new(ROBOTO), "Roboto-Regular", &[]).unwrap();
         let mut fixture = Fixture::new(&format!("中文\r\nX{}", "a".repeat(1023)), font);

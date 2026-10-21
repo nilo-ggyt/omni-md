@@ -1,4 +1,5 @@
-//! 独立不可变NSString值：真实UTF-16子范围共享Core快照，不借活动文档或可撤销适配器。
+//! Independent immutable NSString values for the explicit frozen-value experiment. Actual UTF-16
+//! subranges share Core's snapshot, without borrowing a live document or revocable adapter.
 
 use std::ops::Range;
 use std::ptr::NonNull;
@@ -15,7 +16,7 @@ use objc2::{AnyThread, ClassType, DefinedClass, Message, define_class, msg_send}
 use objc2_foundation::{NSObjectProtocol, NSRange, NSString, NSUInteger, ns_string, unichar};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-/// Rust构造入口先拒绝非法范围；此时尚未创建任何Foundation值。
+/// Reject invalid ranges at the Rust constructor, before creating any Foundation value.
 pub(super) enum FrozenMarkdownStringError {
     #[error("不可变文本范围越过快照边界")]
     RangeOutsideSnapshot,
@@ -26,7 +27,8 @@ pub(super) enum FrozenMarkdownStringError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 真实快照坐标允许代理对内部端点，保持NSString按UTF-16单元切片的原合同。
+/// Actual snapshot coordinates permit endpoints inside surrogate pairs, preserving NSString's
+/// UTF-16 code-unit slicing contract rather than imposing scalar-safe edit coordinates.
 struct FrozenUtf16Range {
     start: usize,
     length: usize,
@@ -34,7 +36,8 @@ struct FrozenUtf16Range {
 
 impl FrozenUtf16Range {
     fn new(range: Range<usize>, source_length: usize) -> Option<Self> {
-        // 倒置或越界必须先拒绝，不能用饱和运算把非法请求改成空值。
+        // Reject reversed/out-of-bounds intervals first; saturating arithmetic must not turn an
+        // invalid request into a successfully constructed empty value.
         let length = range.end.checked_sub(range.start)?;
         (range.end <= source_length).then_some(Self {
             start: range.start,
@@ -45,7 +48,8 @@ impl FrozenUtf16Range {
     fn subrange(self, range: NSRange) -> Option<Self> {
         let local_end = range.location.checked_add(range.length)?;
         if local_end > self.length {
-            // 接收者的EOF可形成空子串，但不能越过当前子串读取同一快照的后继文本。
+            // Receiver EOF permits an empty substring, but cannot authorize subsequent text
+            // outside this substring merely because it belongs to the same snapshot.
             return None;
         }
         Some(Self {
@@ -61,7 +65,8 @@ impl FrozenUtf16Range {
     dead_code,
     reason = "独立Foundation控制消费观测；库单测只编译同源实现而不启动控制"
 )]
-/// 独立控制的固定标量观测；计数只描述实际primitive请求，不声明框架内部零复制。
+/// Fixed scalar observations for the independent control. Counts describe actual primitive
+/// requests only, without claiming that framework internals perform no copies.
 pub(super) struct FrozenMarkdownStringReadObservation {
     pub(super) character_calls: usize,
     pub(super) bulk_calls: usize,
@@ -74,7 +79,7 @@ pub(super) struct FrozenMarkdownStringReadObservation {
 
 #[cfg(test)]
 #[derive(Default)]
-/// 所有派生子串共享有限计数，不持正文、原生对象或生命周期回调。
+/// Derived substrings share these scalar counters, without text, native objects, or lifetime callbacks.
 struct FrozenReadCounters {
     character_calls: AtomicUsize,
     bulk_calls: AtomicUsize,
@@ -92,7 +97,8 @@ impl FrozenReadCounters {
         reason = "独立Foundation控制分阶段采样；库单测不执行该原生入口"
     )]
     fn observation(&self) -> FrozenMarkdownStringReadObservation {
-        // 观测不调用Native getter，也不为读取计数再读一次正文；控制在各同步阶段后采集。
+        // Read only atomics after each synchronous control phase, without a Native getter or
+        // another text read merely to inspect diagnostic counts.
         FrozenMarkdownStringReadObservation {
             character_calls: self.character_calls.load(Ordering::Relaxed),
             bulk_calls: self.bulk_calls.load(Ordering::Relaxed),
@@ -108,10 +114,11 @@ impl FrozenReadCounters {
 pub(super) struct FrozenMarkdownStringIvars {
     source: FrozenNativeSource,
     range: FrozenUtf16Range,
-    // 局部观测仅独立控制编译；生产试验只有原SourceHook，不多建Arc或原子计数。
+    // Local counters compile only for the independent test control. The enabled runtime experiment
+    // uses the original Source hook and creates no additional counter Arc here.
     #[cfg(test)]
     reads: Arc<FrozenReadCounters>,
-    // 真实source等资源字段先析构，最后才结算此具体Native字符串值。
+    // Actual Source and other resource fields drop before this concrete native string claim settles.
     #[cfg_attr(
         test,
         allow(
@@ -123,51 +130,57 @@ pub(super) struct FrozenMarkdownStringIvars {
 }
 
 define_class!(
-    // SAFETY: 只提供NSString公开的UTF-16primitive、不可变copy与真实substring。
-    // 所有ivars不可变或原子化，Core快照Send+Sync；不包含AppKit或线程绑定资源。
+    // SAFETY: Implements public NSString UTF-16 primitives, immutable copy, and actual substring.
+    // Ivars are immutable or atomic; Core snapshots are Send+Sync, with no AppKit/thread-bound resources.
     #[unsafe(super = NSString)]
     #[thread_kind = AnyThread]
     #[ivars = FrozenMarkdownStringIvars]
     pub(super) struct FrozenMarkdownString;
 
-    // SAFETY: NSObject协议的继承行为保持；类没有可变正文或额外原生资源回调。
+    // SAFETY: Preserves inherited NSObject behavior, without mutable text or additional native resource callbacks.
     unsafe impl NSObjectProtocol for FrozenMarkdownString {}
 
     impl FrozenMarkdownString {
         #[unsafe(method(length))]
         fn frozen_length(&self) -> NSUInteger {
-            self.ivars().range.length // 这是不可变值的真实长度，不随编辑或关闭变为0。
+            self.ivars().range.length // Actual immutable length; editing or closing the live editor cannot turn this value into zero length.
         }
 
         #[unsafe(method(characterAtIndex:))]
         fn frozen_character(&self, index: NSUInteger) -> unichar {
+            // Validate the original receiver-local request through its encapsulated Source before
+            // reading a code unit; invalid coordinates raise Foundation's range exception.
             let read = self.ivars().source.request_read(
                 FrozenReadKind::Character, self.ivars().range.start, self.ivars().range.length, index, 1,
             ).unwrap_or_else(|_| throw_range());
             #[cfg(test)]
             {
-                // 独立控制记录原真实请求；生产原SourceHook已在request_read内完成观测。
+                // The independent control records this actual request. The runtime experiment's
+                // original Source hook already received its facts inside request_read.
                 self.ivars().reads.character_calls.fetch_add(1, Ordering::Relaxed);
                 self.ivars().reads.requested_units.fetch_add(1, Ordering::Relaxed);
             }
             read.code_unit().unwrap_or_else(|_| throw_storage())
-            // 已验证的真实快照读取若失败就是内部不变量故障，不可返回替换字符掩盖错误。
+            // Failure after valid snapshot admission is an internal storage invariant failure;
+            // a replacement character must not hide it as a successful read.
         }
 
         #[unsafe(method(getCharacters:range:))]
         /// # Safety
-        /// destination在本次同步调用中须可写range.length个UTF-16单元且满足u16对齐。
+        /// destination must be writable for range.length UTF-16 units and u16-aligned for this synchronous call.
         unsafe fn frozen_characters_range(&self, destination: NonNull<unichar>, range: NSRange) {
-            // SAFETY: caller提供真实目标容量；helper先通知hook并完整验证，之后才构造Rust slice。
+            // SAFETY: Caller supplies actual capacity. The helper reports the hook and validates
+            // the complete request before constructing a Rust slice over that destination.
             unsafe { self.copy_requested_units(destination, range) };
         }
 
         #[unsafe(method(getCharacters:))]
         /// # Safety
-        /// destination在本次同步调用中须可写接收者完整length个UTF-16单元。
+        /// destination must be writable for the receiver's complete UTF-16 length during this synchronous call.
         unsafe fn frozen_all_characters(&self, destination: NonNull<unichar>) {
-            // 全值请求仍按真实范围完整执行，不截断、不伪造计数；未来调用方必须自行限定工作量。
-            // SAFETY: caller已提供接收者真实length个可写单元，范围来自不可变构造时校验。
+            // A whole-value request executes its entire actual range, without truncation or
+            // fabricated counts. This diagnostic NSString contract is not a bounded-viewport claim.
+            // SAFETY: Caller supplies the receiver's actual writable length; construction validated the range.
             unsafe { self.copy_requested_units(destination, NSRange::new(0, self.ivars().range.length)) };
         }
 
@@ -176,7 +189,7 @@ define_class!(
         fn frozen_copy(&self, _zone: *mut NSZone) -> Retained<Self> {
             #[cfg(test)]
             self.ivars().reads.copy_calls.fetch_add(1, Ordering::Relaxed);
-            self.retain() // 不可变copy只交付这一个+1；不复制字符、快照或资源索引。
+            self.retain() // Immutable copy transfers this one +1, without copying characters, snapshot, or resource index.
         }
 
         #[unsafe(method_id(substringWithRange:))]
@@ -189,7 +202,7 @@ define_class!(
         #[unsafe(method_family = none)]
         fn frozen_substring_from(&self, index: NSUInteger) -> Retained<NSString> {
             let length = self.ivars().range.length.checked_sub(index).unwrap_or_else(|| throw_range());
-            self.substring_value(NSRange::new(index, length)) // EOF返回真实空子串，越界明确异常。
+            self.substring_value(NSRange::new(index, length)) // EOF returns an actual empty substring; out-of-bounds raises explicitly.
         }
 
         #[unsafe(method_id(substringToIndex:))]
@@ -200,20 +213,22 @@ define_class!(
     }
 );
 
-// SAFETY: AnyThread只约束构造，通用NSString可能实为NSMutableString，不能据此自动推断Send。
-// 本类唯一构造入口校验实际class精确Self，正文仅不可变且Send+Sync的Opaque Source；
-// 范围不可变，测试计数原子化；claim家族只持线程安全计数/原子观察者，纯fn hook不捕业务owner。
-// 没有活动文档、可变NSString、AppKit、主线程Drop或原生回调。
-// Apple公开允许不可变NSString及其retain/release跨线程；各线程仍须使用自己的autoreleasepool。
+// SAFETY: AnyThread constrains construction only; arbitrary NSString may actually be NSMutableString,
+// so that marker alone does not establish Send. This class's sole constructor checks exact Self class.
+// Its opaque Source is immutable and Send+Sync, ranges are immutable, and test counters are atomic.
+// The claim family owns synchronized metadata/atomic observers; its function hook captures no business owner.
+// No live document, mutable NSString, AppKit object, main-thread Drop, or native callback is retained.
+// Immutable NSString retain/release may cross threads; each thread still needs its own autorelease pool.
 unsafe impl Send for FrozenMarkdownString {}
 
-// SAFETY: 上述具体不可变类没有可写正文别名；所有继承NSString读取只消费已实现的稳定primitive。
-// copy共享同一不可变值，substring创建同快照的独立范围，测试统计仅用原子操作。异常使用官方
-// ObjC C-unwind/catch合同，不共享异常对象或线程局部池；不能将此实现扩用于live或mutable适配器。
+// SAFETY: This concrete immutable class has no writable text alias. Inherited NSString reads consume
+// its stable primitives; copy shares the value, and substring creates an independent snapshot range.
+// Test observations use atomics. Exceptions follow objc2's C-unwind/catch contract, without sharing an
+// exception object or thread-local pool. This reasoning does not apply to live or mutable adapters.
 unsafe impl Sync for FrozenMarkdownString {}
 
 impl FrozenMarkdownString {
-    /// 创建指定真实全局范围的不可变值；整个Opaque源使用0..source.utf16_len()。
+    /// Construct the exact global immutable range; the whole opaque Source is 0..source.utf16_len().
     pub(super) fn new(
         source: FrozenNativeSource,
         global_utf16_range: Range<usize>,
@@ -228,7 +243,7 @@ impl FrozenMarkdownString {
         )
     }
 
-    /// 读取固定标量，供独立Foundation控制分阶段核对实际请求，不读取正文。
+    /// Read scalar observations for the independent Foundation control's phase checks, without text access.
     #[cfg(test)]
     #[allow(
         dead_code,
@@ -248,6 +263,7 @@ impl FrozenMarkdownString {
     pub(super) fn claim_annotation_payload(
         &self,
     ) -> Result<FrozenValueClaim, FrozenValueFamilyError> {
+        // Only this concrete string claim may derive an annotation payload in the original family.
         self.ivars().claim.claim_annotation_payload()
     }
 
@@ -256,7 +272,8 @@ impl FrozenMarkdownString {
         range: FrozenUtf16Range,
         #[cfg(test)] reads: Arc<FrozenReadCounters>,
     ) -> Result<Retained<Self>, FrozenMarkdownStringError> {
-        // 先从仍活SourceClaim派生；seal之后旧源仍可创建真实不可变子串。
+        // Derive from the still-live Source claim first; sealing new sources does not prevent an
+        // existing Source from constructing another actual immutable substring.
         let claim = source.claim_string_value()?;
         let allocated = Self::alloc().set_ivars(FrozenMarkdownStringIvars {
             source,
@@ -265,17 +282,20 @@ impl FrozenMarkdownString {
             reads,
             claim,
         });
-        // SAFETY: NSString公开子类要求的两个primitive及ivars已完成，父类init仅初始化同一值。
-        // 返回类型必须是实际Self，保持objc2的PartialInit与init所有权合同。
+        // SAFETY: Required NSString primitives and ivars are ready; superclass init initializes this
+        // same value. The returned type preserves objc2's PartialInit and init ownership contract.
         let value: Retained<Self> = unsafe { msg_send![super(allocated), init] };
         if !std::ptr::eq(value.class(), Self::class()) {
-            // class cluster若替换了对象，不再访问Rust ivars；原Retained沿正常release结束。
+            // If class-cluster initialization replaced the object, do not access Rust ivars;
+            // the original Retained follows ordinary release while this constructor reports failure.
             return Err(FrozenMarkdownStringError::NativeClassChanged);
         }
         Ok(value)
     }
 
     fn substring_value(&self, local_range: NSRange) -> Retained<NSString> {
+        // Receiver-local bounds are checked before creating any derived native value or updating
+        // observations. Sharing the same Source cannot extend this receiver's admitted range.
         let range = self
             .ivars()
             .range
@@ -287,9 +307,10 @@ impl FrozenMarkdownString {
             .substring_calls
             .fetch_add(1, Ordering::Relaxed);
         if range == self.ivars().range {
-            self.retain().into_super() // 恰好整个接收者可共享同一值，由noncopy method_id处理返回。
+            self.retain().into_super() // An exact whole-receiver substring shares this value; noncopy method_id handles return ownership.
         } else {
-            // 只分享Opaque源并保存真实全局偏移；不保留父串，也不链式访问原Native对象。
+            // Share only the opaque Source and actual global offset. Do not retain the parent
+            // string or form a native substring chain back through it.
             Self::from_parts(
                 self.ivars().source.clone(),
                 range,
@@ -301,12 +322,14 @@ impl FrozenMarkdownString {
         }
     }
 
-    /// 在范围已验证后完整初始化调用方请求；不分配UTF-16中转或截断Native bulk。
+    /// Initialize the complete validated caller request without allocating a UTF-16 staging
+    /// buffer or truncating a native bulk request.
     ///
     /// # Safety
-    /// destination在本同步调用中覆盖local.length个可写且对齐的UTF-16单元。
+    /// destination covers local.length writable, aligned UTF-16 units during this synchronous call.
     unsafe fn copy_requested_units(&self, destination: NonNull<unichar>, local: NSRange) {
-        // 非法范围也先交原始hook事实；失败在任何目标slice、计数更新或字符读取之前发生。
+        // Invalid ranges still report original hook facts. Failure precedes destination-slice
+        // construction, observation updates, and every character read.
         let read = self
             .ivars()
             .source
@@ -321,7 +344,8 @@ impl FrozenMarkdownString {
         let length = read.length();
         #[cfg(test)]
         {
-            // 仅独立控制累计实际bulk；生产仍由同一request_read的全局hook完整记量。
+            // Only the independent control accumulates local bulk counts. The runtime diagnostic
+            // hook receives the same request_read facts for the full original request.
             let reads = &self.ivars().reads;
             reads.bulk_calls.fetch_add(1, Ordering::Relaxed);
             reads.requested_units.fetch_add(length, Ordering::Relaxed);
@@ -329,27 +353,30 @@ impl FrozenMarkdownString {
                 .maximum_bulk_units
                 .fetch_max(length, Ordering::Relaxed);
             if read.global_start() == 0 && length == self.ivars().source.utf16_len() {
-                // 只记录真实整快照请求；即使是框架要求，也不能隐藏为有限加载成功。
+                // Record an actual full-snapshot request honestly, even when Foundation issued
+                // it; such a request cannot be relabeled as successful bounded loading.
                 reads
                     .full_snapshot_bulk_calls
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
         if length == 0 {
-            // 空范围无需构造slice或解引用destination，包含真实EOF空子串。
+            // Empty ranges, including actual EOF substrings, need no slice or destination dereference.
             return;
         }
-        // SAFETY: 外层公开primitive已验证local/global等长且位于快照内；caller保证这段
-        // 单一可写内存满足UTF-16对齐和长度，期间没有Native重入或其他可写别名。
+        // SAFETY: Admission validated equal local/global length inside the snapshot. Caller supplies
+        // one writable, aligned allocation of that length, without another writable alias or Native reentry here.
         let output = unsafe { std::slice::from_raw_parts_mut(destination.as_ptr(), length) };
         if read.copy_to(output).is_err() {
-            // Core快照不会撤权；不把真实存储不变量故障当成短读成功或替换字符。
+            // Core snapshots do not revoke; an actual storage invariant failure cannot become
+            // short-read success or replacement characters.
             throw_storage();
         }
     }
 }
 
 fn throw_range() -> ! {
+    // Public receiver-bound violations use Foundation's range exception, not a Rust panic.
     throw_named(
         ns_string!("NSRangeException"),
         ns_string!("不可变字符串的UTF-16请求越过接收者范围"),
@@ -357,6 +384,7 @@ fn throw_range() -> ! {
 }
 
 fn throw_storage() -> ! {
+    // A failed already-validated immutable read is a distinct internal consistency exception.
     throw_named(
         ns_string!("NSInternalInconsistencyException"),
         ns_string!("不可变字符串的已验证快照资源不一致"),
@@ -365,11 +393,11 @@ fn throw_storage() -> ! {
 
 fn throw_named(name: &NSString, reason: &NSString) -> ! {
     let class = AnyClass::get(c"NSException").expect("Foundation异常类已链接");
-    // SAFETY: 仅调用公开NSException工厂；固定名称/原因无正文，nil userInfo符合公开ABI。
+    // SAFETY: Public NSException factory with fixed, text-free name/reason and nil userInfo follows its ABI.
     let exception: Retained<objc2::exception::Exception> = unsafe {
         msg_send![class, exceptionWithName: name, reason: reason, userInfo: None::<&AnyObject>]
     };
-    // define_class生成extern C-unwind；只用官方ObjC异常helper，调用方必须以ObjC catch接收。
-    // 独立控制真实验证此边界，不用Rust panic或catch_unwind替代Foundation的异常合同。
+    // define_class supplies extern C-unwind entries. Use objc2's Objective-C exception helper;
+    // callers must receive this with ObjC catch, not Rust panic/catch_unwind as a substitute.
     objc2::exception::throw(exception)
 }

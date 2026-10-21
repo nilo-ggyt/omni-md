@@ -1,4 +1,5 @@
-//! 中部真实Font交接沿原SCX续排；以完整字体作业逐字段对照，不删除emoji或伪造边界。
+//! Actual middle font transitions continue the original SCX. Compare complete font-job fields
+//! without deleting emoji or manufacturing source boundaries.
 use super::*;
 
 fn emoji_font() -> (
@@ -24,7 +25,8 @@ fn emoji_font() -> (
 
 #[test]
 fn middle_pair_and_later_emoji_keep_real_runs_original_plan_and_exactly_once_cursor() {
-    // 两个相邻emoji与后继é仍处于同一自然Latn SCX；真正Han与CRLF封闭原项。
+    // Adjacent emoji and following accented letters remain within one natural Latn SCX; actual
+    // Han and CRLF close the original item.
     let text = format!(
         "{}😀😀{}😀{}中\r\n",
         "é".repeat(462),
@@ -74,7 +76,8 @@ fn middle_pair_and_later_emoji_keep_real_runs_original_plan_and_exactly_once_cur
             MarkdownLineItemAnswer::ItemReady(_) => {
                 let item = worker.take_item().unwrap();
                 if item.facts().source_utf16 == (462..466) {
-                    // Store未归还的实际child阻塞原游标；不能把Ready头部或Weak副本当成完成。
+                    // An actual child still held by Store blocks the original cursor. Ready facts
+                    // or copied weak identities do not establish completed consumption.
                     assert!(!held_once);
                     held_once = true;
                     assert!(matches!(
@@ -184,7 +187,8 @@ fn middle_actual_third_font_seed_closes_two_runs_without_replaying_the_gcb_or_lo
                 let selected = if request.continuation_font().is_some() {
                     let probe = worker.font_probe(&request).unwrap();
                     let mut selected = None;
-                    // 真正完整字形试次按原字体、当前回退、第三字体顺序选择；不靠cmap猜缺字。
+                    // Choose using complete actual glyph trials in original/fallback/third-font
+                    // order, rather than nominal cmap guesses about missing output.
                     for font in [&fixture.font, &emoji, &symbols] {
                         let actual = trial(&fixture, &probe, font);
                         if !actual.is_empty() && actual.iter().all(|glyph| glyph.glyph_id != 0) {
@@ -328,7 +332,7 @@ fn middle_font_run_keeps_its_real_child_alive_until_cancel_or_late_source_failur
             ));
         } else {
             assert!(matches!(failure, Err(MarkdownLineComposeError::Cancelled)));
-        } // Source真实首错优先于取消；两者都不能被PendingConsumer包装为成功。
+        } // Actual Source failure precedes cancellation; PendingConsumer cannot conceal either as success.
         drop((worker, held, fixture, emoji));
 
         assert!(source.payload_released());
@@ -345,6 +349,8 @@ fn middle_font_run_keeps_its_real_child_alive_until_cancel_or_late_source_failur
 
 #[test]
 fn middle_fallback_run_budget_does_not_create_a_false_font_boundary() {
+    // Exceed the actual fallback-run admission while preserving all prior original-font output.
+    // The budget endpoint cannot manufacture a font boundary, item end, or successful EOF.
     let fixture = Fixture::new(
         &format!(
             "{}{}{}中\r\n",

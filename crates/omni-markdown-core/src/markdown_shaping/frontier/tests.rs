@@ -1,4 +1,5 @@
-//! 有限完整oracle用于核真实glyph字段；不把这些测试称为Native排版或整产品峰值通过。
+//! Finite complete oracles check actual glyph fields. These tests do not establish Native layout
+//! acceptance or whole-product peak-memory acceptance.
 #[path = "advance_tests.rs"]
 mod advance_tests;
 #[path = "local_tests.rs"]
@@ -30,8 +31,9 @@ fn read32(bytes: &[u8], at: usize) -> usize {
     u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
 }
 fn independent_font() -> MarkdownLayoutFont {
-    // 仅测试的有限真实字体去掉跨输入表；保留真实cmap/轮廓/metrics/name。测试不借字体名
-    // 作能力白名单，生产仍逐项查询实际计划。原Roboto在下面另作明确负控。
+    // This finite test font omits cross-input tables while retaining actual cmap/outlines/metrics/
+    // names. Names grant no product capability: production inspects the real plan, and unmodified
+    // Roboto remains an explicit negative control below.
     let mut tables = BTreeMap::new();
     for row in 0..read16(ROBOTO, 4) {
         let row = 12 + row * 16;
@@ -78,7 +80,7 @@ impl Fixture {
         let authority = source.authority();
         let font_authority = font.authority();
         let mut breaks = MarkdownLayoutBreakJob::new(source.clone(), &authority).unwrap();
-        // 只推进固定前缀，不把全item断点预处理偷算成首行免费工作量。
+        // Advance only a fixed prefix; complete-item break preprocessing is not free first-line work.
         for _ in 0..4 {
             breaks
                 .step(
@@ -128,6 +130,8 @@ impl Fixture {
         &mut self,
         frontier: &mut MarkdownShapingFrontierJob,
     ) -> (MarkdownShapingFrontierPart, usize, usize) {
+        // Yield each actual input quantum and retain the unresolved answer until a real part can
+        // be taken. The finite loop limit is failure detection, not a fabricated EOF or Ready.
         let mut input = 0;
         let mut reads = 0;
         for _ in 0..4096 {
@@ -163,6 +167,8 @@ impl Fixture {
         panic!("有限样本不应挂起")
     }
     fn oracle(&self, range: Range<usize>) -> MarkdownShapingJob {
+        // Independently shape the finite complete range on the same actual Source/font/options,
+        // without consuming frontier certificates or center-view output as the expected result.
         let mut job = MarkdownShapingJob::new(
             self.source.clone(),
             &self.authority,
@@ -187,7 +193,7 @@ impl Fixture {
 
 #[test]
 fn certified_first_natural_line_work_is_constant_for_4k_8k_32k_original_items() {
-    let mut work = Vec::new(); // 只有三档固定控制元数据，不是长度相关的生产缓存。
+    let mut work = Vec::new(); // Three fixed control observations, not a length-dependent production cache.
     for units in [4096, 8192, 32768] {
         let text = "hello world ".repeat(units / 12 + 1);
         let mut fixture = Fixture::new(&text, independent_font());
@@ -254,6 +260,8 @@ fn certified_first_natural_line_work_is_constant_for_4k_8k_32k_original_items() 
         )
         .unwrap();
         let mut measured = None;
+        // PartReady alone is insufficient: complete actual cluster indexing and soft-line measure,
+        // then compare the selected line across original item lengths.
         for _ in 0..1024 {
             match measure
                 .step(
@@ -308,6 +316,8 @@ fn certified_first_natural_line_work_is_constant_for_4k_8k_32k_original_items() 
 
 #[test]
 fn source_font_cancel_and_io_revocation_are_fail_closed_with_real_release() {
+    // Exercise distinct original-authority failures. Actual Source reclaim EIO must retain priority
+    // over later cancellation, and final cleanup must release the real captured payload/mapping.
     let mut fixture = Fixture::new(&"word ".repeat(256), independent_font());
     let observer = fixture.source.resource_observer();
     let backing = fixture.document.original_backing_observer().unwrap();
@@ -409,7 +419,7 @@ fn unsupported_plan_missing_glyph_and_uncertified_word_do_not_acquire_glyph_read
         }
         assert_eq!(answer, MarkdownShapingFrontierAnswer::Pending);
         assert!(frontier.child.is_none());
-    } // 原Roboto真实可达连字仍拒绝；逐记录证书允许Pending，不能要求构造时提前扫完表。
+    } // Actual reachable Roboto ligatures remain rejected; per-record certification may yield rather than scan the font during construction.
     assert!(rejected);
     assert!(frontier.child.is_none());
     for (text, reason) in [
@@ -473,7 +483,8 @@ fn continuation_requires_original_owner_actual_child_drop_and_global_nonzero_sou
         Err(MarkdownShapingFrontierError::ContinuationMismatch)
     ));
     assert!(foreign.payload.is_none());
-    // 外来owner消费错误ticket不推进原owner；原child仍真实活着，不能偷偷补新ticket。
+    // Consuming the wrong ticket on a foreign owner does not advance the original. Its actual
+    // child remains alive; no replacement ticket can silently bypass consumption.
     assert_eq!(
         frontier
             .step(
@@ -493,7 +504,8 @@ fn continuation_requires_original_owner_actual_child_drop_and_global_nonzero_sou
 
 #[test]
 fn actual_gcb_unknown_mismatch_and_true_item_eof_are_not_chunk_eof() {
-    // Mark后的第一个ASCII标量仍是真GCB；反之在base与Extend之间结束的item没有权限。
+    // ASCII after a mark still needs actual GCB proof; an item ending between base and Extend has
+    // no permission to make that interior position a shaping center boundary.
     let mut fixture = Fixture::new("a\u{301}word ", independent_font());
     let mut frontier = fixture.frontier(0..1);
     let step = frontier
@@ -560,7 +572,8 @@ fn actual_gcb_unknown_mismatch_and_true_item_eof_are_not_chunk_eof() {
             MarkdownShapingError::Source(_)
         ))
     ));
-    // 同一个BreakJob仍是必需依赖；全新索引未知不能因ASCII的通常规则变为Ready。
+    // The original BreakJob remains required; a new unknown index cannot become Ready merely
+    // because common ASCII rules usually allow a boundary.
     fixture.breaks =
         MarkdownLayoutBreakJob::new(fixture.source.clone(), &fixture.authority).unwrap();
     let mut frontier = fixture.frontier(3..8);
@@ -580,7 +593,8 @@ fn actual_gcb_unknown_mismatch_and_true_item_eof_are_not_chunk_eof() {
 #[cfg(target_os = "macos")]
 #[test]
 fn real_system_monospace_active_plan_matches_full_finite_glyph_oracle() {
-    // 系统字体只用于当前机器的实际正控；产品能力仍逐项查计划，不以这条路径或名字放行。
+    // Use this machine's actual system font as a positive control only. Product capability still
+    // checks the plan record by record; neither this path nor its name authorizes a shortcut.
     let bytes: Arc<dyn AsRef<[u8]> + Send + Sync> =
         Arc::new(std::fs::read("/System/Library/Fonts/SFNSMono.ttf").unwrap());
     let font = MarkdownLayoutFont::resolve(bytes, ".SFNSMono-Regular", &[]).unwrap();
@@ -629,7 +643,7 @@ fn real_system_monospace_active_plan_matches_full_finite_glyph_oracle() {
 #[test]
 fn certified_unbroken_ascii_first_emergency_uses_true_gcb_without_word_eof_ingest() {
     use crate::markdown_soft_line_measure::provider::{JobGlyphProvider, SelectedMeasureKind};
-    let mut observed = Vec::new(); // 三档有限记录；生产没有按行或字数增长的向量。
+    let mut observed = Vec::new(); // Three finite observations, without a product vector growing per line or word.
     for size in [4096, 8192, 32768] {
         let mut fixture = Fixture::new(&"A".repeat(size), independent_font());
         let mut frontier = fixture.frontier(0..size);
@@ -716,7 +730,7 @@ fn certified_unbroken_ascii_first_emergency_uses_true_gcb_without_word_eof_inges
             let mut provider = JobGlyphProvider::new(&mut child, Some(&mut clusters));
             let permit = measure.selected_permit(&mut provider).unwrap();
             permit.require(&mut provider).unwrap().selected
-        }; // 实际生产Store消费同一个封闭permit；公开Choice副本不能签这张票。
+        }; // Store consumes the same confined permit; a public Choice copy cannot sign that authority.
         assert_eq!(selected.source_utf16.start, 0);
         assert!(selected.source_utf16.end < 256 && selected.x_advance_26_6 <= 5000);
         assert_eq!(

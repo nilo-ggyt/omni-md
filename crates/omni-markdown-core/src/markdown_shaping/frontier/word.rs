@@ -1,8 +1,10 @@
-//! 原单字体ASCII词的封闭前缀事实；未读尾部既不是新段落，也没有glyphReady权限。
+//! Confined prefix facts for the original single-font ASCII word. Its unread tail is neither a new
+//! paragraph nor glyph-Ready output.
 use super::*;
 use crate::{MarkdownLayoutBreakAnswer, MarkdownLayoutBreakQuery, MarkdownLayoutBreakUnit};
 
-/// 只能装入实际frontier child；公开原Job构造和任意Range都不会取得此字段。
+/// Attach only to an actual frontier child; ordinary public job construction and arbitrary ranges
+/// do not acquire this proof.
 pub(in crate::markdown_shaping) struct WordPrefixProof {
     owner: Weak<()>,
     job: Weak<()>,
@@ -54,7 +56,7 @@ impl WordPrefixProof {
 
     fn require(&self, job: &MarkdownShapingJob) -> Result<usize> {
         let payload = job.payload.as_ref().ok_or(MarkdownShapingError::Poisoned)?;
-        payload.source.health()?; // 旧Source真实错误不能被原取消或另一个同名字体覆盖。
+        payload.source.health()?; // Original Source failure precedes cancellation or another same-named font.
         if !payload.source.permits(&self.source)
             || !payload.font.permits(&self.font)
             || !Weak::ptr_eq(&self.job, &Arc::downgrade(&job.identity))
@@ -72,12 +74,13 @@ impl WordPrefixProof {
         if self.cancellation.requested() {
             return Err(MarkdownShapingError::Cancelled);
         }
-        Ok(self.original.end) // 只报告真实词项末端；不把它扩为本child的可读glyph范围。
+        Ok(self.original.end) // Report the actual word end without enlarging this child's readable glyph range.
     }
 }
 
 impl MarkdownShapingJob {
-    /// 唯一Store producer仅能从这个实际Ready任务消费事实，不能以公开Range自行签认证字段。
+    /// The sole Store producer consumes facts only from this actual Ready job; a public Range
+    /// cannot sign a certified field independently.
     pub(crate) fn frontier_word_end(
         &mut self,
         source: &MarkdownLayoutTextAuthority,
@@ -88,7 +91,7 @@ impl MarkdownShapingJob {
             return Err(MarkdownShapingError::Pending);
         }
         let count = self.profile()?.glyph_count;
-        self.glyph(source, font, count)?; // 完整实际EOF是独立门，不用profile长度替代。
+        self.glyph(source, font, count)?; // Actual EOF is a separate authority gate, not merely a profile length.
         let result = self
             .payload
             .as_ref()
@@ -127,11 +130,12 @@ impl MarkdownShapingFrontierJob {
                 self.answer = MarkdownShapingFrontierAnswer::NeedsFrontier(
                     MarkdownShapingFrontierReason::UncertifiedWord,
                 );
-                return Ok(false); // 当前257B不是未读尾部的字符域证明；全项不满足便保持未知。
+                return Ok(false); // The current 257 bytes cannot prove the unread tail's character domain.
             }
             self.guard(source, font)?;
-            // 一个Font的非负事实不覆盖同词后继别的Font。原item必须闭在真实UAX机会，
-            // 真SourceEOF由已验证长度提供；其他端点只消费原BreakJob的实际查询结果。
+            // This font's nonnegative bound cannot cover a later font in the same word. Require an
+            // actual UAX opportunity at item end: verified source length proves EOF; other endpoints
+            // need the original BreakJob's actual answer.
             if self.original.end != payload.source.utf16_len() {
                 if self.word_end_cursor.is_none() {
                     self.word_end_cursor = Some(breaks.cursor(
@@ -163,7 +167,7 @@ impl MarkdownShapingFrontierJob {
         }
         if self.local_plan() {
             return self.prepare_positioned(source, font, metadata_budget, step);
-        } // 原默认advance证明只适用独立计划；Body须另计真实GPOS/variation/trak下界。
+        } // Default advances certify only an independent plan; local plans need actual GPOS/variation/trak bounds.
         if !self.word_closure_checked {
             let payload = self
                 .payload
@@ -188,7 +192,7 @@ impl MarkdownShapingFrontierJob {
             let before = closure.checked_records();
             let result = closure.step(&actual_plan, payload.font.font(), metadata_budget);
             step.plan_records = closure.checked_records() - before;
-            self.guard(source, font)?; // 即使字体闭包被拒，期间原Source错误仍优先报告。
+            self.guard(source, font)?; // Source failure during closure work still precedes a font rejection.
             match result {
                 Ok(Some(_)) => {}
                 Ok(None) => return Ok(false),
@@ -196,12 +200,12 @@ impl MarkdownShapingFrontierJob {
                     self.answer = MarkdownShapingFrontierAnswer::NeedsFrontier(
                         MarkdownShapingFrontierReason::UncertifiedWord,
                     );
-                    return Ok(false); // 不能从nominal cmap非0猜后续GSUB不会删字或产0。
+                    return Ok(false); // Nonzero nominal cmap alone cannot rule out GSUB deletion or missing output.
                 }
             }
             self.guard(source, font)?;
             self.word_closure_checked = true;
-            self.word_closure = None; // 完成后清固定游标；bitset不含正文，也不是映射释放收据。
+            self.word_closure = None; // Return the fixed cursor; its text-free bitset is no mapping-release receipt.
         }
         if self.nonnegative.is_none() {
             let remaining = metadata_budget - step.plan_records;
@@ -293,7 +297,7 @@ impl MarkdownShapingFrontierJob {
 
 fn advance_error(error: advance::AdvanceScanError) -> MarkdownShapingFrontierError {
     match error {
-        advance::AdvanceScanError::Shaping(error) => error.into(), // 原Source errno保持原Error层级。
-        other => other.into(), // 内部元数据失败保typed cause，不改成可继续的未知或成功。
+        advance::AdvanceScanError::Shaping(error) => error.into(), // Preserve the original Source errno/error layer.
+        other => other.into(), // Metadata failures retain typed causes rather than resumable unknown/success.
     }
 }

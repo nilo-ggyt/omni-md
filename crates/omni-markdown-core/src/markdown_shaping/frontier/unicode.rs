@@ -1,11 +1,13 @@
-//! 同一前沿的真实单scalar字素域；源批次、元数据页与原始段落边界互不混同。
+//! Actual single-scalar grapheme domains for the same frontier. Source batches, metadata pages,
+//! and original paragraph boundaries remain separate facts.
 use super::*;
 use crate::MarkdownGraphemeBoundary;
 
 const EMPTY: MarkdownGraphemeBoundary = MarkdownGraphemeBoundary { byte: 0, utf16: 0 };
 const LIMIT: usize = MARKDOWN_SHAPING_FRONTIER_UNITS;
 
-/// 固定坐标元数据和一个4KiB窗口；不保存全文、不建立第二份GCB/cluster索引。
+/// Fixed coordinate metadata and one 4-KiB scratch window, without a complete body or another
+/// grapheme/cluster index.
 pub(super) struct UnicodeState {
     plan: Option<harfrust::SimpleGcbFrontierJob>,
     certified: bool,
@@ -31,7 +33,8 @@ pub(super) struct UnicodeState {
 }
 
 impl UnicodeState {
-    /// 仅交付已完整读到的阻塞GCB；原自然SCX末端仍限制范围，不把预算边界当末端。
+    /// Return only a completely read blocking GCB within the original natural SCX endpoint; a
+    /// budget boundary cannot establish that endpoint.
     pub(super) fn terminal_grapheme(
         &self,
         original_end: usize,
@@ -50,7 +53,8 @@ impl UnicodeState {
             .then_some((start.utf16..end.utf16, start.byte..end.byte))
     }
 
-    /// 本次scalar在暂停前已计费，恢复只消费原固定scratch，不再次读取或计数。
+    /// This scalar was already accounted before suspension. Resume from the same fixed scratch
+    /// without reading or counting it again.
     pub(super) fn resume_terminal_grapheme(&mut self, same_font: bool) -> usize {
         if same_font {
             let end = self
@@ -61,7 +65,8 @@ impl UnicodeState {
             self.boundaries[self.count] = end;
             self.utf16 = end.utf16;
         } else {
-            // 已证实字体变化时保留旧Font的完整残余；阻塞GCB稍后由新Font单独消费。
+            // A proven font change leaves the old font's complete remainder intact; the new font
+            // consumes the blocking grapheme separately later.
             self.byte = self.boundaries[self.count].byte;
             self.next_boundary = None;
         }
@@ -104,7 +109,7 @@ impl UnicodeState {
         self.boundaries[self.count].utf16
     }
     pub(super) fn require_independent_route(&mut self) {
-        self.first_checked = true; // 路由由原开放SCX票约束，不读取首byte后转入有上下文的ASCII计划。
+        self.first_checked = true; // Original open-SCX authority forbids probing then switching to a contextual ASCII plan.
     }
     pub(super) fn from_ascii_scan(
         byte: usize,
@@ -114,10 +119,11 @@ impl UnicodeState {
         let mut state = Self::new(byte, utf16);
         state.first_checked = true;
         state.plan = Some(plan);
-        state // 仅跳过已发生的路由探针；Source/GCB/normalizer和真实计划仍须原逐项认证。
+        state // Skip only the completed route probe; Source/GCB/normalizer/plan still need their actual certification.
     }
     pub(super) fn reset(&mut self, byte: usize, utf16: usize) {
-        // 仅原child实际归还后的FIFO续票可进入。保留已验Font计划，不保留旧正文scratch。
+        // Only an original FIFO ticket after actual child release can enter. Retain certified font
+        // plan state, not previous body scratch.
         self.ordinal = self.ordinal.map(|start| start + self.center_count);
         self.boundaries[0] = MarkdownGraphemeBoundary { byte, utf16 };
         self.count = 0;
@@ -134,8 +140,9 @@ impl UnicodeState {
         self.verified = 0;
     }
 
-    /// 外来Font段消耗了不同数量的真实GCB，不能继续用旧center_count推算ordinal。
-    /// 保留原Font计划，下一量子在同一原GCB索引中有界定位实际返回点。
+    /// A foreign-font run consumes a different number of actual GCBs; old center_count cannot infer
+    /// its ending ordinal. Keep the original font plan and locate the actual return point in the
+    /// same grapheme index through bounded subsequent steps.
     pub(super) fn reset_after_font_run(&mut self, byte: usize, utf16: usize) {
         self.reset(byte, utf16);
         self.ordinal = None;
@@ -156,7 +163,7 @@ impl UnicodeState {
         if !breaks.read_grapheme_prefix(source, ordinal..ordinal + 1, &mut one)? {
             return Ok(None);
         }
-        Ok(Some(one[0])) // 原页已结束借用；只保留真实byte/UTF16坐标，不持索引或Source owner。
+        Ok(Some(one[0])) // The page borrow ended; retain only actual byte/UTF-16 coordinates, without index/Source ownership.
     }
 
     fn locate(
@@ -174,7 +181,7 @@ impl UnicodeState {
         if self.total != Some(prefix.known_boundary_count) {
             self.total = Some(prefix.known_boundary_count);
             self.locate = Some((0, prefix.known_boundary_count));
-        } // 只在真实已提交的ordinal前缀中定位；这里的count不表示完整总数。
+        } // Search only the actually committed ordinal prefix; this count is not the complete boundary total.
         while Self::remaining(step, budget)? != 0 {
             let (low, high) = self.locate.ok_or(MarkdownShapingError::Pending)?;
             if low >= high {
@@ -185,8 +192,9 @@ impl UnicodeState {
                     && next.utf16 > start.utf16
                     && next.byte > start.byte
                 {
-                    // 本地首点来自原 UBA seam，不是新源 GCB。后继仍取原目录，
-                    // 只在本 shaper 内形成 GB1 片段；Store/LineEnd/caret 保留全局真 GCB。
+                    // This local start is the original UBA seam, not a new source GCB. Successors
+                    // still come from the original directory; only this shaper gets a GB1 fragment,
+                    // while Store/LineEnd/caret retain actual global grapheme boundaries.
                     self.ordinal = Some(
                         ordinal
                             .checked_sub(1)
@@ -201,7 +209,7 @@ impl UnicodeState {
                 }
                 step.boundary_records += 1;
                 Self::boundary(breaks, source, prefix.known_boundary_count)?;
-                return Ok(false); // 未知后继只留下同GCB需求，不从GB2坐标猜ordinal。
+                return Ok(false); // Keep the actual unresolved GCB demand instead of deriving an ordinal from GB2 coordinates.
             }
             let middle = low + (high - low) / 2;
             step.boundary_records += 1;
@@ -231,7 +239,8 @@ impl UnicodeState {
 }
 
 impl MarkdownShapingFrontierJob {
-    /// 与原ASCII分支共享owner/计划/资源scope；新的坐标验证不接受外部公开Range签权。
+    /// Share the ASCII branch's original owner/plan/resource scope. Public external ranges cannot
+    /// authorize this coordinate-certification path.
     pub(super) fn advance_unicode(
         &mut self,
         source: &MarkdownLayoutTextAuthority,
@@ -266,17 +275,18 @@ impl MarkdownShapingFrontierJob {
                 if (first == b' ' || first.is_ascii_punctuation())
                     && let Ok(job) = plan.simple_gcb_job(&payload.font)
                 {
-                    // Common标点/space本来可以与后继Han等同属原item。只有原实际计划
-                    // 确认有窄作业资格才保留本路由；真实GCB、所有stage和glyph仍逐项验证。
+                    // Common punctuation/space may belong to the same item as following Han.
+                    // Keep this route only with the actual plan's narrow-job capability; actual
+                    // GCBs, stages, and final glyphs still need individual verification.
                     state.plan = Some(job);
                 } else {
-                    // 路由探针已经在同一原Source票下取得首byte；转回ASCII时直接移交
-                    // 固定scratch，避免下一步再读同一byte。实际读取仍在本步计费一次，
-                    // 后继step先核原Source/Font再消费，不把探针结果当后续字符的证明。
+                    // The same original Source ticket already read this first byte. Hand fixed
+                    // scratch to ASCII rather than rereading it; account the actual read here,
+                    // then recheck Source/font before later consumption. It proves no future byte.
                     self.scan[0] = first;
                     self.scanned = 1;
                     self.unicode = None;
-                    return Ok(step); // 不可认证计划和字母/数字起点保留原ASCII/Body及SHY负控路径。
+                    return Ok(step); // Uncertified plans and letter/digit starts retain original ASCII/body/SHY rejection routes.
                 }
             }
         }
@@ -344,7 +354,7 @@ impl MarkdownShapingFrontierJob {
                             byte: self.original_bytes.end,
                             utf16: self.original.end,
                         };
-                    } // 只有原类型化 UBA 末端能闭本地片段，预算/窗口边缘绝不截 GCB。
+                    } // Only the original typed UBA endpoint closes a local fragment; budget/viewport edges never cut a GCB.
                     let previous = state.boundaries[state.count];
                     if next.byte <= previous.byte
                         || next.utf16 <= previous.utf16
@@ -357,7 +367,7 @@ impl MarkdownShapingFrontierJob {
                             MarkdownShapingFrontierReason::NonSimpleGrapheme,
                         );
                         step.answer = self.answer;
-                        return Ok(step); // 完整大GCB保持未解析，绝不读取前4字节后冒充可切分。
+                        return Ok(step); // A complete large GCB stays unresolved; reading four bytes cannot make it splittable.
                     }
                     state.next_boundary = Some(next);
                 }
@@ -378,7 +388,8 @@ impl MarkdownShapingFrontierJob {
                                 .byte
                                 - state.byte,
                         );
-                    // 只读同一个已定位GCB的剩余字节；3字节见证后不能预取未知第258个标量。
+                    // Read only the located GCB's remaining bytes; a three-byte witness permits no
+                    // prefetch of an unknown 258th scalar.
                     if count == 0 {
                         break;
                     }
@@ -422,7 +433,7 @@ impl MarkdownShapingFrontierJob {
                 }
                 if state.used != state.needed {
                     continue;
-                } // 1byte量子保留同一个UTF8残余，不当作EOF。
+                } // One-byte quanta retain the same UTF-8 remainder rather than treating it as EOF.
                 if UnicodeState::remaining(&step, metadata_budget)? == 0 {
                     break;
                 }
@@ -430,7 +441,8 @@ impl MarkdownShapingFrontierJob {
                     .ok()
                     .and_then(|s| s.chars().next())
                     .ok_or(MarkdownShapingError::InvalidUtf8)?;
-                // 解码已真实完成，后续GCB或类别拒绝也要保留这次工作，不能把负控记成零scalar。
+                // Actual decoding already occurred. Later GCB/category rejection still accounts
+                // that scalar work instead of reporting zero for a negative control.
                 step.scalars += 1;
                 let next = state.next_boundary.ok_or(MarkdownShapingError::Pending)?;
                 if state.byte != next.byte || state.utf16 + scalar.len_utf16() != next.utf16 {
@@ -438,7 +450,7 @@ impl MarkdownShapingFrontierJob {
                         MarkdownShapingFrontierReason::NonSimpleGrapheme,
                     );
                     step.answer = self.answer;
-                    return Ok(step); // 两个scalar组成的真实字素不能靠single-input字体许可拆开。
+                    return Ok(step); // A single-input font certificate cannot split a real grapheme containing multiple scalars.
                 }
                 step.metadata_glyphs += 1;
                 match harfrust::simple_gcb_nominal(payload.font.font(), scalar) {
@@ -450,7 +462,7 @@ impl MarkdownShapingFrontierJob {
                         step.answer = self.answer;
                         return Ok(step);
                     }
-                } // nominal只是normalizer短路见证；最终无缺字仍必须真实shape逐glyph核。
+                } // Nominal lookup certifies the normalizer route only; actual shaping must still prove nonmissing output per glyph.
                 state.utf16 = next.utf16;
                 state.used = 0;
                 state.needed = 0;
@@ -473,8 +485,9 @@ impl MarkdownShapingFrontierJob {
             if state.center_count == 0 {
                 return Err(MarkdownShapingError::InvalidRange.into());
             }
-            // 除真实item尾，保留一个已证独立的first-unread GCB。tracking逐原grapheme只写自身；
-            // 原fallback mark扫描在这个真实非mark后继处结束，不能借未知未来修改中心flags。
+            // Except at an actual closed item end, retain one certified first-unread GCB as support.
+            // Tracking affects its own original grapheme, and fallback mark scanning stops at this
+            // actual nonmark successor; unknown future input cannot change center flags.
             self.candidate = Some(state.boundaries[state.center_count].utf16);
         }
         let end = self.candidate.ok_or(MarkdownShapingError::Pending)?;
@@ -516,7 +529,7 @@ impl MarkdownShapingFrontierJob {
                 .as_mut()
                 .ok_or(MarkdownShapingError::Poisoned)?
                 .frontier_plan = Some(plan.plan());
-            self.child = Some(child); // 和原ASCII一样在任何ingest/shape前纳入原scope。
+            self.child = Some(child); // As with ASCII, attach original resource scope before ingestion or shaping.
         }
         let child = self.child.as_mut().ok_or(MarkdownShapingError::Poisoned)?;
         if child.status() == MarkdownShapingStatus::Ingesting {
@@ -557,7 +570,7 @@ impl MarkdownShapingFrontierJob {
                         return Err(MarkdownShapingError::InvalidRange.into());
                     }
                     state.verified += 1;
-                } // 逐真实1→1与global cluster核查，非BMP的2个UTF16单位也只有一个真实ordinal。
+                } // Verify actual 1:1/global clusters; a non-BMP scalar's two UTF-16 units still occupy one glyph ordinal.
                 if state.verified != state.count {
                     return Ok(step);
                 }

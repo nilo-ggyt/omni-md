@@ -1,4 +1,4 @@
-//! 真正worker构造与join移交；只比固定字段/流式摘要，不建立全文或glyph Vec镜像。
+//! Build on an actual worker and transfer after join, comparing fixed records/streaming digests without whole-text or glyph-Vec mirrors.
 use super::*;
 use crate::{
     MarkdownDocumentBuffer, MarkdownLayoutFontBytes, MarkdownShapingBudget, MarkdownShapingOptions,
@@ -10,6 +10,7 @@ const ROBOTO: &[u8] = include_bytes!(concat!(
     "/../../vendor/harfrust/benches/fonts/Roboto-Regular.ttf"
 ));
 fn make_job(source: &MarkdownLayoutTextSource, font: &MarkdownLayoutFont) -> MarkdownShapingJob {
+    // Use one actual Source/Font identity and complete the original public input/shape phases before any read-only transfer.
     let sa = source.authority();
     let fa = font.authority();
     let mut job = MarkdownShapingJob::new(
@@ -45,6 +46,7 @@ fn setup(
     MarkdownLayoutFont,
     MarkdownShapingJob,
 ) {
+    // Only this private synthetic file enters the production document/source graph; no user note is used for writes or shaping.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("readonly.md");
     std::fs::write(&path, text).unwrap();
@@ -59,6 +61,7 @@ fn build(
     source: &MarkdownLayoutTextSource,
     font: &MarkdownLayoutFont,
 ) -> MarkdownShapedSpool {
+    // Build finite original-glyph batches, then consume the real writer seal; no duplicate shaping path supplies output records.
     let mut builder =
         MarkdownShapedSpoolBuilder::new(job, &source.authority(), &font.authority()).unwrap();
     while builder.status == MarkdownShapedSpoolStatus::Building {
@@ -68,6 +71,7 @@ fn build(
     builder.seal(job).unwrap()
 }
 fn hash(mut value: u64, glyph: MarkdownShapedGlyph) -> u64 {
+    // Compare all encoded fields through a streaming fixture digest rather than retaining a full glyph mirror.
     for byte in encode(glyph).unwrap() {
         value = value.wrapping_mul(257).wrapping_add(u64::from(byte));
     }
@@ -75,6 +79,7 @@ fn hash(mut value: u64, glyph: MarkdownShapedGlyph) -> u64 {
 }
 
 #[test]
+// Join transfers an actual sealed File/immutable Source/Font graph, after the worker has returned its own paged Job resources.
 fn sealed_owner_auto_send_preserves_exact_glyphs_and_actual_file_font_source_release() {
     fn assert_send<T: Send>() {}
     assert_send::<MarkdownShapedSpool>();
@@ -130,7 +135,7 @@ fn sealed_owner_auto_send_preserves_exact_glyphs_and_actual_file_font_source_rel
         !resources.snapshot().source_payload_released
             && !resources.snapshot().font_payload_released
     );
-    assert!(backing.mapped_bytes() > 0 && mapping.mapped_bytes() > 0); // 强边合法交给主线程，join不是源已释放。
+    assert!(backing.mapped_bytes() > 0 && mapping.mapped_bytes() > 0); // Legitimate strong edges moved to the receiving thread; join does not release their Source.
     let authority = spool.authority();
     let mut actual = 0;
     for index in 0..spool.glyph_count() {
@@ -165,6 +170,7 @@ fn sealed_owner_auto_send_preserves_exact_glyphs_and_actual_file_font_source_rel
 }
 
 #[test]
+// Equal Source/Font does not replace the original Job nonce for writing or reading, and failure closes only the affected candidate.
 fn identical_source_font_cannot_substitute_another_job_nonce() {
     let (_dir, _document, source, font, mut job) = setup("office");
     let mut other = make_job(&source, &font);
@@ -191,6 +197,7 @@ fn identical_source_font_cannot_substitute_another_job_nonce() {
 }
 
 #[test]
+// Recapturing equal text or resolving the same PSName creates different payload authority; read failure retires the entire spool.
 fn same_text_or_postscript_name_cannot_replace_original_source_or_font_authority() {
     for replace_source in [true, false] {
         let (_dir, document, source, font, mut job) = setup("office");
@@ -230,6 +237,7 @@ fn same_text_or_postscript_name_cannot_replace_original_source_or_font_authority
 }
 
 #[test]
+// Incomplete seal and oversized step requests close real partial files without publishing a readable prefix.
 fn early_seal_and_oversized_step_do_not_publish_a_partial_file() {
     let (_dir, _document, source, font, mut job) = setup("office office office");
     let mut partial =
@@ -252,6 +260,7 @@ fn early_seal_and_oversized_step_do_not_publish_a_partial_file() {
 }
 
 #[test]
+// Empty actual output seals an extent of zero and returns verified EOF, without inventing a placeholder glyph.
 fn empty_run_has_a_verified_true_eof_file_without_invented_glyphs() {
     let (_dir, _document, source, font, mut job) = setup("");
     let mut spool = build(&mut job, &source, &font);
@@ -268,6 +277,7 @@ fn empty_run_has_a_verified_true_eof_file_without_invented_glyphs() {
 }
 
 #[test]
+// Existing faults occur after actual write/sync and close operations; retain first operation error separately from successful FD close and cleanup failure.
 fn actual_write_and_sync_failure_prefixes_never_become_readonly_and_cleanup_preserves_first_error()
 {
     for sync in [true, false] {
@@ -310,6 +320,7 @@ fn actual_write_and_sync_failure_prefixes_never_become_readonly_and_cleanup_pres
 }
 
 #[test]
+// Both an actually truncated sealed file and original cancellation revoke the unique reader and return its real FD.
 fn truncated_file_and_post_seal_cancellation_revoke_the_unique_reader() {
     for cancel in [true, false] {
         let (_dir, _document, source, font, mut job) = setup("office");
@@ -334,6 +345,7 @@ fn truncated_file_and_post_seal_cancellation_revoke_the_unique_reader() {
 }
 
 #[test]
+// An actual original-source reclaim error remains prior to cancellation even after sealing, without leaving a readable or open spool.
 fn source_reclaim_error_remains_the_cause_even_after_seal_and_cancel() {
     let (_dir, document, source, font, mut job) = setup("office");
     let mut spool = build(&mut job, &source, &font);
@@ -353,6 +365,7 @@ fn source_reclaim_error_remains_the_cause_even_after_seal_and_cancel() {
 }
 
 #[test]
+// Bounded reads preserve every original glyph field; oversized requests reject before touching output and close the invalid reader.
 fn bounded_batch_preserves_every_field_and_rejects_oversized_reads_before_output() {
     let (_dir, _document, source, font, mut job) = setup(&"office a\u{301} ".repeat(80));
     let mut spool = build(&mut job, &source, &font);

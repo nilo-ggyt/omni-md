@@ -1,7 +1,8 @@
-//! 实际支持区和已验证中心视图。外部公开Range不能构造这个证明。
+//! Actual support ranges and verified center views; public ranges cannot construct these proofs.
 use super::*;
 
-/// view只记录原Job/计划/协调器弱身份和固定范围，不复制glyph或持另一份Source。
+/// Retain original job/plan/coordinator weak identities and fixed ranges without copied glyphs or
+/// another Source owner.
 pub(in crate::markdown_shaping) struct CertifiedCenterView {
     owner: Weak<()>,
     job: Weak<()>,
@@ -11,7 +12,8 @@ pub(in crate::markdown_shaping) struct CertifiedCenterView {
     support: Range<usize>,
 }
 impl CertifiedCenterView {
-    /// 仅封闭frontier在真实GCB、计划与逐glyph核验完成后调用；不存在公开Range签票入口。
+    /// Only the confined frontier calls this after actual GCB/plan/per-glyph verification; no
+    /// public Range-to-certificate constructor exists.
     pub(super) fn new(
         owner: &Arc<()>,
         job: &MarkdownShapingJob,
@@ -57,7 +59,7 @@ impl CertifiedCenterView {
         {
             return Err(MarkdownShapingError::InvalidRange);
         }
-        Ok(()) // Source/Font/原取消和真实分页错误由原Job guard先后复核，不另设权限源。
+        Ok(()) // Original job guards recheck Source/font/cancellation and paging errors; this is no second authority source.
     }
 }
 
@@ -84,7 +86,7 @@ impl MarkdownShapingFrontierJob {
                 || step.metadata_glyphs != 0
                 || step.boundary_records != 0
             {
-                return Ok(false); // 范围证明独占原量子；本回合已有扫描便只保原候选，下一轮继续。
+                return Ok(false); // Domain proof owns its quantum; prior work leaves the candidate pending until the next call.
             }
             let payload = self
                 .payload
@@ -110,7 +112,7 @@ impl MarkdownShapingFrontierJob {
             step.source_bytes = progress.bytes;
             step.scalars = progress.scalars;
             step.plan_records = progress.metadata;
-            self.guard(source, font)?; // 即使聚合拒绝，原lease归还的真实errno仍先于字符域能力结果。
+            self.guard(source, font)?; // Actual lease-return errno precedes even a rejected character-domain result.
             match progress.answer {
                 None => return Ok(false),
                 Some(false) => {
@@ -123,8 +125,8 @@ impl MarkdownShapingFrontierJob {
                 Some(true) => {
                     self.local_source_checked = true;
                     self.local_source_bounds = Some((progress.minimum, progress.maximum));
-                    self.local_source_cursor.take(); // 真正结束的路径Arc立即归还；仅保同owner的两个域标量。
-                    return Ok(false); // 元数据/正文已花原量子，Font闭包在下一轮开始，不另发第二份预算。
+                    self.local_source_cursor.take(); // Return the completed tree path; retain only two same-owner domain scalars.
+                    return Ok(false); // Source/metadata used this quantum; font closure starts later without another allowance.
                 }
             }
         }
@@ -155,7 +157,7 @@ impl MarkdownShapingFrontierJob {
         let before = scan.checked_records();
         let answer = scan.step(&plan.plan(), payload.font.font(), metadata_budget);
         step.plan_records = scan.checked_records() - before;
-        self.guard(source, font)?; // 即使字体元数据拒绝，真实Source首errno仍比不适用优先。
+        self.guard(source, font)?; // Original Source errno still precedes unsupported font metadata.
         match answer {
             Ok(Some(capability)) => {
                 self.local_capability = Some(capability);
@@ -189,7 +191,7 @@ impl MarkdownShapingFrontierJob {
         let right = end
             .saturating_add(capability.support_scalars)
             .min(self.original.end);
-        Ok(left..right) // 字符域已完整证明ASCII，故UTF16/标量/字节偏移一一对应；不跨真实item。
+        Ok(left..right) // The complete domain proved ASCII, so byte/scalar/UTF-16 offsets agree within the actual item.
     }
     pub(super) fn seal_center(
         &mut self,
@@ -234,7 +236,7 @@ impl MarkdownShapingFrontierJob {
             }
             self.local_verified += 1;
             step.metadata_glyphs += 1;
-        } // 支持区真实整形也逐条核1→1与全局cluster；不能从表证书直接伪造实际输出。
+        } // Check actual support output's 1:1/global-cluster facts; a table certificate cannot fabricate glyph output.
         child.guard(source, font)?;
         let payload = child
             .payload
@@ -244,6 +246,8 @@ impl MarkdownShapingFrontierJob {
             return Ok(false);
         }
         let support = child.source_utf16.clone();
+        // Expose only the verified center while retaining actual support bounds in its certificate.
+        // Support glyphs are not an enlarged public range or a second reusable shaping result.
         let glyphs = (self.next - support.start)..(end - support.start);
         payload.frontier_view = Some(CertifiedCenterView {
             owner: Arc::downgrade(&self.identity),

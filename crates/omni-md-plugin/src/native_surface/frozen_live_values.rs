@@ -1,4 +1,5 @@
-//! 显式试验中的live→不可变值边界；只缓存Weak源，不保留活动文档或全文副本。
+//! The explicit diagnostic experiment's live-to-immutable boundary. Cache only a weak Source,
+//! without retaining the live document or a full-text copy; this is absent from the default editor.
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
@@ -28,13 +29,15 @@ pub(super) struct FrozenLiveValues {
 
 impl FrozenLiveValues {
     pub(super) fn new_if_requested() -> Option<Self> {
-        // 开关仅在live适配器构造时读取一次；运行中环境变化不能给既有会话换一种copy语义。
+        // Read the opt-in once at live-adapter construction. Later environment changes cannot
+        // switch an existing session to different copy semantics.
         (std::env::var_os("OMNI_NATIVE_FROZEN_VALUES").as_deref()
             == Some(std::ffi::OsStr::new("1")))
         .then(Self::enabled)
     }
 
     fn enabled() -> Self {
+        // One adapter owns one family and a weak-only cache; an idle cache captures no snapshot.
         Self {
             family: FrozenValueFamily::new(),
             source: RefCell::new(None),
@@ -43,12 +46,13 @@ impl FrozenLiveValues {
     }
 
     pub(super) fn family(&self) -> Arc<FrozenValueFamily> {
-        Arc::clone(&self.family) // 只交出原家族，不创建第二份源/值清单或业务owner。
+        Arc::clone(&self.family) // Share the original family, without another Source/value inventory or business owner.
     }
 
     pub(super) fn seal(&self) {
-        // Native图已在原accepted-release顺序断开；先拒绝live新捕获再归还唯一Weak缓存。
-        // 既有不可变值仍持自己的原SourceClaim，之后合法copy/substring不会被撤空。
+        // The accepted-release sequence already detached the native graph. Reject new live
+        // captures before returning this weak cache. Existing immutable values keep their original
+        // Source claims, so later valid copy/substring does not revoke their contents.
         self.sealed.set(true);
         let obsolete = self.source.borrow_mut().take();
         drop(obsolete);
@@ -56,7 +60,8 @@ impl FrozenLiveValues {
     }
 
     pub(super) fn live_cache_is_released(&self) -> bool {
-        // 只证明live入口已封闭且Weak缓存已实际取走；派生值仍须由原家族独立证明最后析构。
+        // This proves only closed live admission and actual removal of the weak cache. The
+        // original family independently observes final destruction of outstanding derived values.
         self.sealed.get() && self.source.borrow().is_none()
     }
 
@@ -64,13 +69,15 @@ impl FrozenLiveValues {
         &self,
         document: &RefCell<WeakMarkdownDocument>,
     ) -> Retained<NSString> {
+        // Capture one immutable Source before entering Foundation. The full-range value shares
+        // its snapshot; a later native bulk request still executes its actual declared length.
         let source = self.capture_live_source(document);
         match source {
             Some(source) => {
                 let length = source.utf16_len();
                 self.string_value(source, 0..length)
             }
-            None => ns_string!("").retain(), // 原DocWeak确实失效后，live空壳才按原长度0交空值。
+            None => ns_string!("").retain(), // Only an actually expired original document makes the live shell an empty value.
         }
     }
 
@@ -79,6 +86,8 @@ impl FrozenLiveValues {
         document: &RefCell<WeakMarkdownDocument>,
         range: NSRange,
     ) -> Retained<NSString> {
+        // Retain exact receiver coordinates, including UTF-16 positions inside surrogate pairs;
+        // invalid requests do not fall back to another document or an empty successful value.
         let source = self.capture_live_source(document);
         match source {
             Some(source) => {
@@ -89,7 +98,7 @@ impl FrozenLiveValues {
                 self.string_value(source, range.location..end)
             }
             None if range.location == 0 && range.length == 0 => ns_string!("").retain(),
-            None => throw_range(), // 空live接收者不能把旧非空请求重定向到另一源或假装成功。
+            None => throw_range(), // An empty live receiver cannot redirect an old nonempty request to another Source or claim success.
         }
     }
 
@@ -98,19 +107,21 @@ impl FrozenLiveValues {
         document: &RefCell<WeakMarkdownDocument>,
     ) -> Option<FrozenNativeSource> {
         if MainThreadMarker::new().is_none() {
-            // live文档仍为主线程RefCell；后台只能消费已冻结值，不能跨线程升级live owner。
+            // Live documents remain main-thread RefCells. Background consumers may use already
+            // frozen values, but cannot upgrade the live document owner across threads.
             throw_storage();
         }
         let identity = document.borrow().clone();
         let document = identity.upgrade()?;
         if self.sealed.get() {
-            // DocWeak仍可升级时封源绝不等于空文档；这是accepted-release顺序破坏，显式失败。
+            // Sealing while the original DocWeak still upgrades is not an empty document. Report
+            // the accepted-release ordering violation rather than silently returning empty text.
             throw_storage();
         }
         let source = self
             .source_for_document(&document)
             .unwrap_or_else(|| throw_storage());
-        drop(document); // Native构造之前结束唯一活动Doc强租约及其全部RefCell借用。
+        drop(document); // End the live document claim and all RefCell borrows before constructing any native value.
         Some(source)
     }
 
@@ -119,7 +130,7 @@ impl FrozenLiveValues {
         document: &SharedMarkdownDocument,
     ) -> Option<FrozenNativeSource> {
         if self.sealed.get() {
-            return None; // 只拒绝新live捕获，不影响早已派生出来的不可变值读取。
+            return None; // Reject new live captures only; reads of previously derived immutable values stay valid.
         }
         let document_ref = document.try_borrow().ok()?;
         let identity = std::rc::Rc::downgrade(document);
@@ -128,7 +139,8 @@ impl FrozenLiveValues {
         let cached = {
             let slot = self.source.borrow();
             slot.as_ref().and_then(|cached| {
-                // 同代次数值不是文档身份；Weak保留原分配身份，防止另一笔记g0/长度相同的ABA。
+                // Equal numeric generations do not identify a document. Original weak allocation
+                // identity prevents another note's same-generation/same-length ABA from reusing it.
                 (cached.identity.ptr_eq(&identity)
                     && cached.generation == generation
                     && cached.length == length)
@@ -138,10 +150,11 @@ impl FrozenLiveValues {
         };
         if let Some(source) = cached {
             if source.generation() != generation || source.utf16_len() != length {
-                // 命中cache还须核真实Opaque源元数据；损坏或错源不能用重捕获补签掩盖。
+                // A cache hit still checks actual opaque Source metadata. Reject inconsistent
+                // metadata instead of recapturing and masking the wrong Source association.
                 return None;
             }
-            return Some(source); // 只分享原完整OpaqueData和一份SourceClaim，不重新捕获snapshot。
+            return Some(source); // Share the same complete opaque Data and Source claim, without recapturing a snapshot.
         }
         let source = FrozenNativeSource::capture(
             &document_ref,
@@ -156,7 +169,7 @@ impl FrozenLiveValues {
             length,
             source: source.downgrade(),
         }));
-        drop(obsolete); // 缓存只有Weak；旧代次若仍被系统值持有，由原家族等其真实释放。
+        drop(obsolete); // This cache owns only Weak; the family observes actual release of old generations still held by system values.
         Some(source)
     }
 
@@ -164,12 +177,13 @@ impl FrozenLiveValues {
         match FrozenMarkdownString::new(source, range) {
             Ok(value) => value.into_super(),
             Err(FrozenMarkdownStringError::RangeOutsideSnapshot) => throw_range(),
-            Err(_) => throw_storage(), // 真实家族或Native类不变量失败，不能回退整篇复制掩盖失败。
+            Err(_) => throw_storage(), // Actual family/class invariant failure cannot be hidden by a whole-document-copy fallback.
         }
     }
 }
 
 fn throw_range() -> ! {
+    // Receiver-bound errors keep the same public Foundation exception contract as immutable values.
     super::text_storage::throw_markdown_native_exception(
         ns_string!("NSRangeException"),
         ns_string!("live字符串的不可变子范围越过原接收者"),
@@ -177,7 +191,8 @@ fn throw_range() -> ! {
 }
 
 fn throw_storage() -> ! {
-    // 与默认有限属性读取共享同一个公开异常出口，不为实验值复制第二套工厂。
+    // Reuse the existing public storage-unavailable exception boundary instead of another factory
+    // solely for these experimental values.
     super::text_storage::throw_markdown_storage_unavailable()
 }
 
@@ -187,7 +202,8 @@ mod tests {
     use omni_markdown_core::{MarkdownDocumentBuffer, MarkdownTextSelection};
 
     fn fixture(text: &str) -> (tempfile::TempDir, SharedMarkdownDocument) {
-        // 纯Rust控制只写自有有限输入，不创建Foundation值或访问用户笔记。
+        // This Rust-only control writes its own finite input. It neither constructs Foundation
+        // values nor accesses user notes; its family observations do not prove native copy behavior.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("frozen-live-source.md");
         std::fs::write(&path, text).unwrap();
@@ -197,6 +213,8 @@ mod tests {
 
     #[test]
     fn same_generation_reuses_live_source_without_extra_payload_claim() {
+        // Inspect reuse of the actual Core snapshot allocation while values still own it, then
+        // verify that the weak-only cache cannot extend the payload lifetime on its own.
         let (_directory, document) = fixture("前😀后");
         let values = FrozenLiveValues::enabled();
         let source = values.source_for_document(&document).unwrap();
@@ -205,12 +223,14 @@ mod tests {
         assert_eq!(values.family.snapshot().constructed[0], 1);
         drop(source);
         drop(again);
-        assert!(weak.upgrade().is_none()); // Weak缓存不能让源载荷常驻。
+        assert!(weak.upgrade().is_none()); // The weak cache cannot keep the Source payload resident.
         assert_eq!(values.family.snapshot().active, [0; 4]);
     }
 
     #[test]
     fn new_generation_and_same_numeric_generation_other_document_keep_distinct_sources() {
+        // Two independent real documents start at equal numeric generations. Editing one through
+        // Core changes only its Source metadata; neither identity may be inferred from generation alone.
         let (_first_directory, first) = fixture("a😀b");
         let (_second_directory, second) = fixture("c😀d");
         let values = FrozenLiveValues::enabled();
@@ -230,6 +250,8 @@ mod tests {
 
     #[test]
     fn seal_clears_weak_cache_and_blocks_capture_without_revoking_existing_source() {
+        // Source sealing ends live admission while the already captured immutable Source keeps
+        // its content until its last actual claim is dropped.
         let (_directory, document) = fixture("旧😀值");
         let values = FrozenLiveValues::enabled();
         let source = values.source_for_document(&document).unwrap();
@@ -247,6 +269,8 @@ mod tests {
 
     #[test]
     fn upgraded_source_metadata_mismatch_rejects_without_recapture() {
+        // This existing private-cache mutation tests rejection of an inconsistent association.
+        // It is not a Native callback or an externally reachable way to install another Source.
         let (_directory, document) = fixture("a😀b");
         let (_other_directory, other_document) = fixture("other😀");
         let values = FrozenLiveValues::enabled();
@@ -257,6 +281,6 @@ mod tests {
         let before = values.family.snapshot().constructed;
         assert!(values.source_for_document(&document).is_none());
         assert_eq!(values.family.snapshot().constructed, before);
-        assert_eq!(source.utf16_len(), 4); // 原不可变值未被错误cache条目改写或撤权。
+        assert_eq!(source.utf16_len(), 4); // The inconsistent cache entry neither rewrites nor revokes the original immutable value.
     }
 }

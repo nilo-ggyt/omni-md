@@ -1,4 +1,4 @@
-//! 字体run的固定选项；长度相关输入只有分页buffer，样式和语言另有明确小预算。
+//! Fixed options for an itemized font run; source-length-dependent input stays in paged buffers while features/language have separate finite limits.
 use harfrust::{Direction, Feature, Language, Script, Tag};
 
 use super::{MarkdownShapingError as Error, Result};
@@ -14,7 +14,7 @@ pub enum MarkdownShapingDirection {
     BottomToTop,
 }
 
-/// feature范围以原全局UTF16 cluster寻址；半开区间两端不经上游饱和转换改写。
+/// Address feature ranges by original global UTF-16 clusters, preserving half-open endpoints without upstream saturating conversion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MarkdownShapingFeature {
     pub tag: [u8; 4],
@@ -23,17 +23,17 @@ pub struct MarkdownShapingFeature {
     pub source_utf16_end: u32,
 }
 
-/// 明确选择真实字体表的 OpenType 整形；features 之外不追加平台私有的标点替换或留白策略。
-/// 全宽标点的默认字形可能与 CoreText UIFont 不同，几何必须始终消费本任务封存的实际输出，
-/// 不能按字体名、语言或与另一个引擎的宽度差事后补偿，否则绘图、caret 与命中会失去同一来源。
+/// Select OpenType shaping through actual font tables, without adding private platform punctuation/spacing policy beyond explicit features.
+/// Full-width punctuation can differ from CoreText UI-font output; geometry must consume this job's actual sealed glyphs.
+/// Post-hoc adjustments by font name, language, or another engine's width difference would separate drawing, caret, and hit-test authority.
 #[derive(Clone, Debug)]
 pub struct MarkdownShapingOptions {
     pub direction: MarkdownShapingDirection,
-    /// 已完成itemization的ISO15924脚本；本job不会把所有脚本猜为首个字符的脚本。
+    /// ISO15924 script already established by itemization; this job does not guess every script from the first character.
     pub script: [u8; 4],
     pub language: Option<String>,
     pub points: f32,
-    /// 真实段边界由itemization调用方提供；step/piece边界不得设这两个标志。
+    /// Itemization supplies actual text boundaries; step/piece edges must not set these flags.
     pub beginning_of_text: bool,
     pub end_of_text: bool,
     pub features: Vec<MarkdownShapingFeature>,
@@ -62,12 +62,12 @@ impl ValidatedOptions {
             || options.points <= 0.0
             || !options.script.iter().all(u8::is_ascii_alphabetic)
         {
-            // 样式预算在分配转换Vec或任何shaper映射之前拒绝，不以少算feature换通过。
+            // Reject feature limits before allocating conversion Vecs or shaper mappings; do not omit features to fit.
             return Err(Error::InvalidOptions);
         }
         let scale = f64::from(options.points) * 64.0;
         if scale.round() > f64::from(i32::MAX) || scale.round() < 1.0 {
-            return Err(Error::InvalidOptions); // 26.6尺度必须能精确表示为一个有效正整数。
+            return Err(Error::InvalidOptions); // Rounded 26.6 scale must fit a valid positive integer without saturation.
         }
         let (scale, output_divisor) = crate::markdown_layout_font::positioning::scale(
             font,
@@ -86,7 +86,7 @@ impl ValidatedOptions {
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
                 {
-                    // 不合法语言标签不变成默认语言；否则字形可能悄悄选择另一套规则。
+                    // An invalid language tag cannot become default language and silently select another shaping rule set.
                     return Err(Error::InvalidOptions);
                 }
                 Language::new(value.as_bytes())
@@ -97,7 +97,7 @@ impl ValidatedOptions {
             if feature.source_utf16_start > feature.source_utf16_end
                 || !feature.tag.iter().all(|byte| byte.is_ascii_graphic())
             {
-                return Err(Error::InvalidOptions); // 语法或坐标非法不应用可用前缀。
+                return Err(Error::InvalidOptions); // Invalid syntax/coordinates reject the request rather than applying a valid-looking prefix.
             }
             features.push(Feature {
                 tag: Tag::from_be_bytes(feature.tag),
@@ -125,7 +125,7 @@ impl ValidatedOptions {
         })
     }
 
-    /// 仅一次从内部尺度转为公开26.6；负offset同样按最近值、半值离零量化。
+    /// Quantize once from internal scale to public 26.6, rounding negative offsets to nearest with halves away from zero too.
     pub(super) fn quantize(&self, value: i32) -> i32 {
         let value = i64::from(value);
         let divisor = i64::from(self.output_divisor);

@@ -1,7 +1,7 @@
-//! 同一冻结源的分页字形run：逐标量输入、真实字体和全局UTF16 cluster，正文不物化。
+//! Shape paged glyph runs from one frozen source with incremental scalar input, actual Font identity, and global UTF-16 clusters, without materializing text.
 //!
-//! 一个job只描述已经完成字体、脚本和方向itemization的run。它不猜混合字体边界，
-//! 不把完整run当成一条软行，也不因字形成功而声称Native编辑或整产品内存已经验收。
+//! A job describes a run already itemized by font, script, and direction. It does not infer mixed-font boundaries or treat a full run as one soft line.
+//! Successful glyph output alone proves neither Native editing nor whole-product memory acceptance.
 
 use std::{
     ops::Range,
@@ -45,7 +45,7 @@ pub use options::{
     MarkdownShapingOptions,
 };
 
-/// 两个输入维度独立计费；UTF8残余跨step保留，但不会因此多读超过byte配额。
+/// Charge byte/scalar dimensions independently; UTF-8 residual state survives steps without exceeding the byte quota.
 #[derive(Clone, Copy, Debug)]
 pub struct MarkdownShapingBudget {
     pub bytes: usize,
@@ -76,7 +76,7 @@ pub struct MarkdownShapingStep {
     pub scalars: usize,
 }
 
-/// 位置保留shaper的26.6整数，不在Core悄悄改为CoreText另一套advance舍入。
+/// Retain the shaper's 26.6 integer output rather than silently applying another CoreText advance-rounding policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MarkdownShapedGlyph {
     pub glyph_id: u32,
@@ -118,7 +118,7 @@ pub enum MarkdownShapingError {
 
 type Result<T> = std::result::Result<T, MarkdownShapingError>;
 
-/// 输出观察只含计数和真实析构事实；不保活字体、正文、分页映射或历史。
+/// Observe counters and actual teardown facts without retaining fonts, text, paged mappings, or history.
 #[derive(Clone)]
 pub struct MarkdownShapingResourceObserver {
     paging: harfrust::PagingResourceObserver,
@@ -157,7 +157,7 @@ impl From<harfrust::PagingIoError> for MarkdownShapingIoError {
             Input::Sync => Output::Sync,
             Input::Unmap => Output::Unmap,
             Input::Close => Output::Close,
-        }; // 一对一保留实际操作；不靠格式化字符串猜测失败归属。
+        }; // Preserve the actual operation one-to-one, without inferring ownership from formatted error text.
         Self {
             operation,
             errno: error.errno,
@@ -165,12 +165,12 @@ impl From<harfrust::PagingIoError> for MarkdownShapingIoError {
     }
 }
 
-/// 同一原job的真实资源事实；虚拟extent不能替代进程RSS或physical footprint。
+/// Actual resource facts for this original job; virtual extents are not process RSS or physical footprint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MarkdownShapingResourceSnapshot {
     pub source_payload_released: bool,
     pub font_payload_released: bool,
-    /// 字形元数据固定工作块的实际分配字节；原正文始终归Source独立持有。
+    /// Actual allocation of fixed glyph-metadata work blocks; Source independently owns original text.
     pub work_bytes: usize,
     pub peak_work_bytes: usize,
     pub files_open: usize,
@@ -209,13 +209,13 @@ impl MarkdownShapingResourceObserver {
         }
     }
 
-    /// 源/字体payload字段已经交还，且此job全部shaper映射与文件真实关闭，才算已释放。
+    /// Report release only after source/font payloads and this job's actual shaper mappings/files/work blocks are released.
     ///
-    /// 其他job仍可合法共享原字体或Snapshot；此收据不对那些独立owner作虚假归属。
+    /// Other jobs may legitimately share the original Font or snapshot; this receipt cannot falsely claim those independent owners' release.
     #[must_use]
     pub fn resources_released(&self) -> bool {
         let snapshot = self.snapshot();
-        // 首次业务IO错误仍独立保留；它不抹掉成功归还事实，也不能掩盖cleanup_failed。
+        // Keep the first operation I/O failure separately; it neither erases actual return success nor hides cleanup_failed.
         snapshot.source_payload_released
             && snapshot.font_payload_released
             && snapshot.files_open == 0
@@ -233,7 +233,7 @@ pub struct MarkdownShapingProfile {
     pub source_borrow_max_bytes: usize,
     pub input_scalars: usize,
     pub glyph_count: usize,
-    /// 此值只证明shaper的分页访问合同；没有包含Native、字体或源mapping的整产品峰值。
+    /// Certify only shaper paged access, excluding whole-product peaks from Native, fonts, or source mappings.
     pub shaper_access_certified: bool,
     pub shaper_work_bytes: usize,
     pub shaper_peak_work_bytes: usize,
@@ -243,11 +243,11 @@ pub struct MarkdownShapingProfile {
 }
 
 struct Payload {
-    // 真正的分页数组先Drop，再交还同一个冻结源与字体；观察者不参与任何强边。
+    // Drop actual paged arrays before returning the same frozen Source/Font; observers retain no strong resource edges.
     buffer: Buffer,
     source: MarkdownLayoutTextSource,
     font: MarkdownLayoutFont,
-    // 只有封闭frontier认证的子任务复用原计划；普通Job继续按原公开路径构造计划。
+    // Only certified frontier children reuse an original plan; general Jobs construct plans through their existing public path.
     #[cfg(feature = "paged-shaping-frontier")]
     frontier_plan: Option<std::sync::Arc<harfrust::ShapePlan>>,
     #[cfg(feature = "paged-shaping-frontier")]
@@ -256,9 +256,9 @@ struct Payload {
     frontier_view: Option<frontier::local::CertifiedCenterView>,
 }
 
-/// 唯一owner按阶段持有真实buffer；失败/取消立即交还全部job资源，不能重采权限后复活。
+/// A sole owner holds the actual stage buffer; failure/cancellation returns job resources without reviving through recaptured authority.
 pub struct MarkdownShapingJob {
-    // 索引只持此控制块的Weak；相同源、字体和范围的另一job也不能冒用原glyph结果。
+    // Indexes retain Weak identity only; another job with equal Source/Font/range cannot impersonate original glyph output.
     identity: Arc<()>,
     cancellation: MarkdownShapingCancellation,
     #[cfg(test)]
@@ -274,7 +274,7 @@ pub struct MarkdownShapingJob {
     status: MarkdownShapingStatus,
     source_bytes_read: usize,
     source_borrow_max: usize,
-    // 固定账本claim最后Drop：原payload/Buffer和此Job其余字段均先真实归还。
+    // Drop the fixed resource-ledger claim last, after actual payload/Buffer and all other job fields are returned.
     #[cfg(feature = "paged-line-compose")]
     composer_resources: Option<crate::markdown_line_composer::worker_resources::ShapeResourceClaim>,
 }
@@ -310,14 +310,14 @@ impl MarkdownShapingJob {
         {
             scope.incomplete();
             return Err(MarkdownShapingError::InvalidOptions);
-        } // 只在首次glyph工作块或I/O之前安装；后置观察不能冒充内部构造/失败全覆盖。
+        } // Attach before the first glyph work block or I/O; late observation cannot claim construction/failure coverage retroactively.
         self.composer_resources = Some(scope.claim_shape(self.resources.clone()));
         Ok(())
     }
-    /// 捕获调用方交来的原source/font身份；验证范围后只读至多40字节的真实邻接上下文。
+    /// Capture supplied original Source/Font identities, then validate ranges and read at most 40 bytes of actual adjacent context.
     ///
-    /// 这里不执行字形算法。完整run入列以后，调用方显式执行同步`shape`阶段；该阶段
-    /// 可以包含整个run的算法工作量，不能把一次调用包装成“有限主线程耗时”的证明。
+    /// Construction does not shape. After complete ingestion, callers explicitly run synchronous `shape`, which may perform
+    /// the whole item's algorithm work; a single call is not evidence of bounded main-thread latency.
     pub fn new(
         source: MarkdownLayoutTextSource,
         source_authority: &MarkdownLayoutTextAuthority,
@@ -327,18 +327,18 @@ impl MarkdownShapingJob {
         options: MarkdownShapingOptions,
     ) -> Result<Self> {
         if !source.permits(source_authority) {
-            // 外来源在申请shaper资源前拒绝；相同正文或代次都不能代替payload身份。
+            // Reject foreign source before acquiring shaper resources; equal text/generation cannot replace payload identity.
             return Err(MarkdownShapingError::SourceMismatch);
         }
-        source.health()?; // 原映射已撤权时不能仅凭相同Weak身份继续申请新字形任务。
+        source.health()?; // Equal Weak identity cannot authorize a new glyph job after the original mapping becomes unavailable.
         if !font.permits(font_authority) {
-            // 字体名称/face hash相同不代表同一原字体owner。
+            // Equal font names or face hashes do not identify the same original Font owner.
             return Err(MarkdownShapingError::FontMismatch);
         }
         if source_utf16.start > source_utf16.end || source_utf16.end > source.utf16_len() {
             return Err(MarkdownShapingError::InvalidRange);
         }
-        // cluster以全局UTF16保存；拒绝溢出，不截断成另一个有效位置。
+        // Store clusters as global UTF-16; reject overflow rather than truncating into a different valid coordinate.
         u32::try_from(source_utf16.end).map_err(|_| MarkdownShapingError::CoordinateOverflow)?;
         let start = source.byte_offset_for_utf16(source_utf16.start)?;
         let end = source.byte_offset_for_utf16(source_utf16.end)?;
@@ -354,8 +354,8 @@ impl MarkdownShapingJob {
         )
     }
 
-    /// 原 FontProbe 或分项协调器消费已认证的两套坐标，不为远端字素重走定位。
-    /// 这不是公开范围构造口；Source、Font、选项和坐标上界仍按原构造合同验证。
+    /// Original FontProbe/item coordination consumes both certified coordinate domains without relocating distant graphemes.
+    /// This is not a public range constructor; retain original Source/Font/options/extent validation.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn from_certified_item_input(
         source: MarkdownLayoutTextSource,
@@ -397,11 +397,11 @@ impl MarkdownShapingJob {
         )?;
         if job.cancellation.requested() {
             job.guard(source_authority, font_authority)?;
-        } // 和原new_with_cancellation相同：真实Source/资源首错优先，并实际归还取消中的候选载荷。
+        } // Like new_with_cancellation, preserve actual Source/resource failure priority and release an already cancelled candidate payload.
         Ok(job)
     }
 
-    /// 只接收本模块已经验证的样式与原范围；公开构造和真实软行派生共享唯一装配路径。
+    /// Accept this module's validated options/original ranges; public construction and actual soft-line derivation share one assembly path.
     fn assemble(
         source: MarkdownLayoutTextSource,
         source_authority: &MarkdownLayoutTextAuthority,
@@ -419,10 +419,10 @@ impl MarkdownShapingJob {
             (ranges.0, ranges.1, None),
             options,
             cancellation,
-        ) // 公开完整Job及既有前沿仍保持原同步上下文读取合同。
+        ) // General full Jobs and existing frontier entries retain their original synchronous bounded-context reads.
     }
 
-    /// 装配算法只有一份；已收费的闭项上下文与原同步读取仅在输入来源处不同。
+    /// Keep one assembly algorithm; prepaid closed-item context and original synchronous reads differ only in where context is acquired.
     fn assemble_with_context(
         source: MarkdownLayoutTextSource,
         source_authority: &MarkdownLayoutTextAuthority,
@@ -432,13 +432,13 @@ impl MarkdownShapingJob {
         options: options::ValidatedOptions,
         cancellation: MarkdownShapingCancellation,
     ) -> Result<Self> {
-        let (source_utf16, source_bytes, prepared) = ranges; // 两套坐标仍来自同一原票，不重新定位。
+        let (source_utf16, source_bytes, prepared) = ranges; // Both coordinate domains remain from one original ticket, without relocation.
         let mut buffer = Buffer::new();
         buffer.set_direction(options.direction);
         buffer.set_script(Some(options.script));
         buffer.set_language(options.language.clone());
         buffer.set_cluster_level(ClusterLevel::MonotoneGraphemes);
-        // 两端标记仅来自已itemize的真实文本边界；有限step/chunk从不产生新的BOT/EOT。
+        // Edge flags come only from itemized actual text boundaries; finite steps/chunks never create new BOT/EOT.
         let mut flags = BufferFlags::PRODUCE_UNSAFE_TO_CONCAT;
         if options.beginning_of_text {
             flags |= BufferFlags::BEGINNING_OF_TEXT;
@@ -451,7 +451,7 @@ impl MarkdownShapingJob {
             prepared.install(&mut buffer)
         } else {
             input::install_context(&source, source_bytes.clone(), &mut buffer)?
-        }; // 闭项已按前一个Input量子读完，不为安装同一上下文再借Source或重复计费。
+        }; // Closed-item context was already read in its previous input step; installation neither reborrows Source nor charges it twice.
         let resources = MarkdownShapingResourceObserver {
             paging: buffer.paging_resource_observer(),
             source: source.resource_observer(),
@@ -493,7 +493,7 @@ impl MarkdownShapingJob {
         })
     }
 
-    /// 仅原Ready任务能为同一item的真实子范围克隆原字体/样式，不接受外部伪造选项。
+    /// Only the original Ready job derives its actual item subrange with original Font/options, without accepting caller-made replacement options.
     #[cfg(feature = "paged-soft-line-resolve")]
     pub(crate) fn reshape_subrange(
         &mut self,
@@ -502,7 +502,7 @@ impl MarkdownShapingJob {
         range: Range<usize>,
     ) -> Result<Self> {
         let profile = self.profile()?;
-        self.glyph(source, font, profile.glyph_count)?; // EOF原语核真实Ready和原权限，不能只读状态。
+        self.glyph(source, font, profile.glyph_count)?; // Actual EOF validates readiness and original authority, beyond reading local status.
         let public_range = self.source_range();
         if range.start < public_range.start
             || range.end > public_range.end
@@ -517,8 +517,8 @@ impl MarkdownShapingJob {
         let start = payload.source.byte_offset_for_utf16(range.start)?;
         let end = payload.source.byte_offset_for_utf16(range.end)?;
         let mut options = self.options.clone();
-        // 软行分界不是新的段落。仅原item的对应真实端点才能继承BOT/EOT；中部仍保留
-        // 同Source的实际邻接上下文，既不把4KiB读窗设为段落，也不改语言/feature全局范围。
+        // A soft-line edge is not another paragraph. Only matching actual item endpoints inherit BOT/EOT; interiors retain
+        // adjacent same-Source context without turning a 4-KiB window into a paragraph or changing global language/feature ranges.
         options.beginning_of_text &= range.start == self.source_utf16.start;
         options.end_of_text &= range.end == self.source_utf16.end;
         let source_value = payload.source.clone();
@@ -534,12 +534,12 @@ impl MarkdownShapingJob {
             options,
             cancellation,
         )?;
-        child.guard(source, font)?; // 构造中的真实源失败或原取消不能发布一个可运行子任务。
+        child.guard(source, font)?; // Actual source failure or original cancellation during construction cannot publish a runnable child.
         self.guard(source, font)?;
         Ok(child)
     }
 
-    /// 合成控制只在实际深层checkpoint放置确定性barrier；产品不编译此入口或保存闭包。
+    /// Existing synthetic controls place a deterministic barrier at actual deep checkpoints; product builds neither expose this entry nor retain its closure.
     #[cfg(all(test, feature = "paged-soft-line-resolve"))]
     pub(crate) fn resolve_test_checkpoint(
         &mut self,
@@ -548,10 +548,10 @@ impl MarkdownShapingJob {
         self.cancellation_hook = Some(hook);
     }
 
-    /// 纯Core输入包可先跨线程交付，worker再绑定既有取消请求位构造原任务。
+    /// Transfer pure Core inputs across threads before the worker constructs its original job with the existing cancellation bit.
     ///
-    /// 不转移已含非Send分页状态的Job；取消位没有正文或字体强边。构造中的真实Source错误
-    /// 仍由原new先报告，已经请求取消时沿同一guard归还候选资源，不发布可运行的任务。
+    /// Do not transfer an already constructed non-Send paged Job; cancellation retains no text/Font edges. Original new reports
+    /// actual Source construction failures first, then the same guard releases an already cancelled candidate without publishing it runnable.
     pub fn new_with_cancellation(
         source: MarkdownLayoutTextSource,
         source_authority: &MarkdownLayoutTextAuthority,
@@ -571,9 +571,9 @@ impl MarkdownShapingJob {
         )?;
         job.cancellation = cancellation;
         if job.cancellation.requested() {
-            job.guard(source_authority, font_authority)?; // 原IO/Source首因优先，正常取消真实take/drop候选载荷。
+            job.guard(source_authority, font_authority)?; // Original I/O/Source failure wins; clean cancellation actually takes/drops candidate payload.
         }
-        Ok(job) // 未请求取消时仍由后续每次原step/shape/read守同一位，不建立检查与交付之间的复位窗口。
+        Ok(job) // Later original step/shape/read checks the same permanent bit; no reset window separates this check and delivery.
     }
 
     fn guard(
@@ -584,7 +584,7 @@ impl MarkdownShapingJob {
         match self.status {
             MarkdownShapingStatus::Cancelled => return Err(MarkdownShapingError::Cancelled),
             MarkdownShapingStatus::Poisoned => return Err(MarkdownShapingError::Poisoned),
-            // 后续每一步都检查原payload；没有在失效后重捕较新source的恢复分支。
+            // Every later step checks original payload, without recovering an invalid job by capturing a newer source.
             _ => {}
         }
         let payload = self
@@ -592,7 +592,7 @@ impl MarkdownShapingJob {
             .as_ref()
             .ok_or(MarkdownShapingError::Poisoned)?;
         if let Err(error) = payload.source.health() {
-            // 其他共享reader的真实回收失败也撤销这个job，不能使用旧glyph cache续签Ready。
+            // Actual reclaim failure from another shared reader revokes this job too; cached glyphs cannot renew readiness.
             return self.poison(error.into());
         }
         if !payload.source.permits(source) || !payload.source.permits(&self.source_authority) {
@@ -602,7 +602,7 @@ impl MarkdownShapingJob {
             return self.poison(MarkdownShapingError::FontMismatch);
         }
         if !payload.buffer.allocation_successful() {
-            // shape的Ok不包含分页、最大操作数或嵌套预算成功，必须独立拒绝。
+            // Shape success does not establish paging, maximum-operation, or nested-budget success; validate actual storage separately.
             return self.poison(MarkdownShapingError::ShaperStorage);
         }
         #[cfg(feature = "paged-shaping-frontier")]
@@ -610,21 +610,21 @@ impl MarkdownShapingJob {
             && let Err(error) = view.require(self)
         {
             return self.poison(error);
-        } // 支持区不是公开任意裁切入口；具体中心票必须仍属于这个原Job与计划owner。
+        } // Support coverage is no arbitrary public clipping API; the concrete center ticket must still belong to this original Job/plan owner.
         if self.cancellation.requested() {
-            return self.cancelled(); // Source/分页错误已先检查，不让取消遮掉真实首因。
+            return self.cancelled(); // Check Source/paging failures first so cancellation cannot hide their actual cause.
         }
         Ok(())
     }
 
     fn poison<T>(&mut self, error: MarkdownShapingError) -> Result<T> {
         self.status = MarkdownShapingStatus::Poisoned;
-        // take结束内部可变借用以后Drop，真实归还数组、上下文与本job的source/font强边。
+        // End the internal mutable borrow with take, then drop actual arrays/context and this job's Source/Font strong edges.
         drop(self.payload.take());
         Err(error)
     }
 
-    /// 推进原run输入；未知尾部保持Ingesting，真实输入范围结束才允许进入AwaitingShape。
+    /// Advance original run input; unknown suffixes remain Ingesting and only the actual input-range end permits AwaitingShape.
     pub fn step(
         &mut self,
         source: &MarkdownLayoutTextAuthority,
@@ -636,7 +636,7 @@ impl MarkdownShapingJob {
             return self.poison(MarkdownShapingError::InvalidOptions);
         }
         if self.status != MarkdownShapingStatus::Ingesting {
-            // 输入完毕后的空观察不是第二次shape，也不会重新添加相同字符。
+            // A zero-input observation after ingestion neither shapes again nor appends duplicate characters.
             return Ok(MarkdownShapingStep {
                 status: self.status,
                 bytes: 0,
@@ -646,13 +646,13 @@ impl MarkdownShapingJob {
         let result = self.step_input(budget);
         match result {
             Ok(step) => Ok(step),
-            // 即使此step已在有限buffer中加入前缀，也必须整体撤权，禁止发布部分成功。
+            // Retire the whole job even after a finite buffer accepted part of this step; partial input cannot publish success.
             Err(MarkdownShapingError::Cancelled) => self.cancelled(),
             Err(error) => self.poison(error),
         }
     }
 
-    /// 同步执行原run的完整字形算法；IO、实际访问认证和输出元数据分别核验。
+    /// Synchronously shape the original complete run, separately validating I/O, actual paged-access certification, and output metadata.
     pub fn shape(
         &mut self,
         source: &MarkdownLayoutTextAuthority,
@@ -663,7 +663,7 @@ impl MarkdownShapingJob {
             MarkdownShapingStatus::Ingesting => return Err(MarkdownShapingError::Pending),
             MarkdownShapingStatus::Ready => return Ok(MarkdownShapingStatus::Ready),
             MarkdownShapingStatus::AwaitingShape => {}
-            // guard已经处理这两条退出，保留显式匹配避免未来状态被误放入shape。
+            // guard handles these terminal exits; explicit matching prevents another state from accidentally entering shape later.
             MarkdownShapingStatus::Cancelled => return Err(MarkdownShapingError::Cancelled),
             MarkdownShapingStatus::Poisoned => return Err(MarkdownShapingError::Poisoned),
         }
@@ -677,19 +677,19 @@ impl MarkdownShapingJob {
                 .font
                 .shaper_at_scale(self.options.scale)
                 .map_err(|_| MarkdownShapingError::InvalidOptions)?;
-            // 冷Font的OnceLock初始化不在取消scope内；其返回后深层原算法逐批观察原请求。
+            // Cold Font OnceLock initialization is outside cooperative cancellation scope; afterward the original deep algorithm checks requests in batches.
             harfrust::with_cooperative_control(control, || {
                 let shape_options = ShapeOptions::new()
                     .point_size(Some(self.options.points))
                     .features(&self.options.features);
-                // 元数据证书与执行必须指向同一个已编译计划；不在shape时悄悄重建另一计划。
+                // Metadata certification and execution must use the same compiled plan rather than silently rebuilding one during shape.
                 #[cfg(feature = "paged-shaping-frontier")]
                 let shape_options = shape_options.plan(payload.frontier_plan.as_deref());
                 harfrust::shape(&shaper, &mut payload.buffer, shape_options)
             })
         };
         if let Err(error) = result {
-            // 原Source与分页的真实错误先于取消：终态桥不可把IO失败改写成干净取消。
+            // Actual Source/paging failure precedes cancellation; this terminal bridge cannot rewrite I/O failure as clean cancellation.
             let payload = self
                 .payload
                 .as_ref()
@@ -713,13 +713,13 @@ impl MarkdownShapingJob {
         if !buffer.allocation_successful() || !buffer.paged_checkpoint() {
             return self.poison(MarkdownShapingError::ShaperStorage);
         }
-        self.guard(source, font)?; // 真实shape/分页返回后再核原请求，禁止把期间取消发布成Ready。
-        // Linux仍可计算真实字形，但其分页驻留合同尚未实测；profile明确保持false。
+        self.guard(source, font)?; // Recheck original request after actual shape/paging, withholding Ready if cancellation arrived meanwhile.
+        // Linux can compute glyphs but has no verified residency contract here; profile must retain that distinction.
         self.status = MarkdownShapingStatus::Ready;
         Ok(self.status)
     }
 
-    /// 只交付一条Copy glyph。调用方按真实视口范围查询，不能取得整片或正文借用。
+    /// Deliver one Copy glyph for actual viewport queries, without lending an entire array or document text.
     pub fn glyph(
         &mut self,
         source: &MarkdownLayoutTextAuthority,
@@ -745,7 +745,7 @@ impl MarkdownShapingJob {
         let view: Option<Range<usize>> = None;
         let count = view.as_ref().map_or(buffer.len(), Range::len);
         if index >= count {
-            return Ok(None); // 实际EOF明确无记录；这不是未知输入前缀的“暂时为空”。
+            return Ok(None); // Actual EOF has no record; this is not temporary emptiness in an unknown input prefix.
         }
         let actual_index = view.as_ref().map_or(index, |range| range.start + index);
         let Some((info, position)) = buffer.paged_glyph_record(actual_index) else {
@@ -756,10 +756,10 @@ impl MarkdownShapingJob {
         }
         let cluster = info.cluster as usize;
         if !self.source_range().contains(&cluster) {
-            // cluster必须属于本run原全局范围；glyph0等缺字仍是合法结果，不能裁掉。
+            // Clusters must belong to this run's original global range; missing-glyph zero remains valid output and cannot be discarded.
             return self.poison(MarkdownShapingError::InvalidRange);
         }
-        self.guard(source, font)?; // 原Copy记录取回后仍须原Source/Font/token有效，才允许交付一条glyph。
+        self.guard(source, font)?; // After retrieving the Copy record, require original Source/Font/token before delivering it.
         Ok(Some(MarkdownShapedGlyph {
             glyph_id: info.glyph_id,
             source_utf16_cluster: cluster,
@@ -775,11 +775,11 @@ impl MarkdownShapingJob {
     pub fn status(&self) -> MarkdownShapingStatus {
         self.status
     }
-    /// 精确标识本次任务，不能保活字形数组、字体或正文；Core派生索引仍须核原job健康。
+    /// Identify this actual job weakly without retaining arrays/fonts/text; derived Core indexes still check original job health.
     pub(crate) fn index_identity(&self) -> Weak<()> {
         Arc::downgrade(&self.identity)
     }
-    /// 返回原校验选项的方向，不把尚未完成的结果提升为Ready。
+    /// Return original validated direction without promoting unfinished results to Ready.
     #[must_use]
     pub fn direction(&self) -> MarkdownShapingDirection {
         match self.options.direction {
@@ -787,11 +787,11 @@ impl MarkdownShapingJob {
             harfrust::Direction::RightToLeft => MarkdownShapingDirection::RightToLeft,
             harfrust::Direction::TopToBottom => MarkdownShapingDirection::TopToBottom,
             harfrust::Direction::BottomToTop => MarkdownShapingDirection::BottomToTop,
-            // 原构造器只接受四种具体方向；Invalid从不进入本job。
+            // Original construction admits only four concrete directions, never Invalid.
             harfrust::Direction::Invalid => unreachable!("字形任务方向已在构造时校验"),
         }
     }
-    /// 原校验选项中的真实请求字号；仅提供样式事实，不代表任务Ready或原权限仍有效。
+    /// Return actual requested size from validated options as a style fact, not job readiness or current authority.
     #[must_use]
     pub fn points(&self) -> f32 {
         self.options.points
@@ -809,7 +809,7 @@ impl MarkdownShapingJob {
         self.resources.clone()
     }
 
-    /// profile来自同一个存活job；失败或取消不会借“零资源”重新签署成功统计。
+    /// Obtain profile from the same live job; failure/cancellation cannot turn zeroed resources into newly successful statistics.
     pub fn profile(&mut self) -> Result<MarkdownShapingProfile> {
         let source = self.source_authority.clone();
         let font = self.font_authority.clone();
@@ -829,7 +829,7 @@ impl MarkdownShapingJob {
             let ready_count = payload.buffer.len();
             ready_count
         } else {
-            0 // 尚未shape的Buffer长度是输入scalar数，不能冒充最终glyph数。
+            0 // Before shape, Buffer length counts input scalars rather than final glyphs.
         };
         Ok(MarkdownShapingProfile {
             source_generation: payload.source.generation(),
@@ -847,15 +847,15 @@ impl MarkdownShapingJob {
         })
     }
 
-    /// 显式取消是终态；立即交还此job实际资源，外部观察者随后检查真实close/unmap结果。
+    /// Explicit cancellation is terminal and returns this job's resources; independent observers then check actual close/unmap outcomes.
     pub fn cancel(&mut self) {
-        self.cancellation.request(); // 同一个请求位同时覆盖尚在运行的深层算法，不创建第二token。
+        self.cancellation.request(); // The same bit reaches any in-flight deep algorithm without creating another token.
         if matches!(
             self.status,
             MarkdownShapingStatus::Cancelled | MarkdownShapingStatus::Poisoned
         ) {
-            return; // 终态保持原来失败事实，不能把Poisoned清成成功的Cancelled。
+            return; // Preserve terminal failure facts rather than clearing Poisoned into clean Cancelled.
         }
-        let _ = self.cancelled::<()>(); // 原void API保留；cleanup失败仍在Poisoned状态和原资源收据中。
+        let _ = self.cancelled::<()>(); // Preserve the void API; cleanup failure remains in Poisoned state and original resource receipts.
     }
 }

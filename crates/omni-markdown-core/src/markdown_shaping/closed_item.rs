@@ -1,4 +1,4 @@
-//! 消费原协调器的小闭项票；端点不重新定位，实际整形仍只使用原Job装配路径。
+//! Consume the original coordinator's closed-item ticket without relocating endpoints, using the sole original Job assembly path.
 
 use super::*;
 use crate::markdown_line_composer::{ClosedItem, ClosedShapingInput};
@@ -14,7 +14,7 @@ struct Payload {
     cancellation: MarkdownShapingCancellation,
 }
 
-/// 原Style票只移入这一个续体；queue时不创建Buffer，也不读取任何邻接Source。
+/// Move the original Style ticket into this sole continuation; queueing creates no Buffer and reads no adjacent Source.
 pub(crate) struct PendingClosedShaping {
     payload: Option<Payload>,
     context: ContextInput,
@@ -27,7 +27,7 @@ pub(crate) struct ClosedShapingStep {
 }
 
 impl PendingClosedShaping {
-    /// 消费原Style scope时就转交权限；旧probe立即撤销，后续只由唯一owner续进。
+    /// Transfer authority when consuming original Style scope; retire the old probe immediately so only this owner continues.
     pub(crate) fn new(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
@@ -39,10 +39,10 @@ impl PendingClosedShaping {
         source.health()?;
         if !source.permits(authority) {
             return Err(MarkdownShapingError::SourceMismatch);
-        } // 弱Source票仍须由本次同一冻结payload支持，不能凭坐标重新捕获正文。
+        } // Weak Source tickets still require this same frozen payload; coordinates cannot recapture the text.
         if !font.permits(font_authority) {
             return Err(MarkdownShapingError::FontMismatch);
-        } // 原Style选定的真实Font身份不由名字、face编号或相同轴值替代。
+        } // Names, face indices, or equal axes cannot replace the actual Font chosen by original Style authority.
         let ClosedShapingInput {
             source_utf16: utf16,
             source_bytes: bytes,
@@ -51,7 +51,7 @@ impl PendingClosedShaping {
         } = closed.into_input(authority, font_authority, source.byte_len())?;
         if cancellation.requested() {
             return Err(MarkdownShapingError::Cancelled);
-        } // 已取消时不创建Buffer或借邻接上下文；源首错在此之前已经核验。
+        } // An already cancelled request creates no Buffer or context lease; original source failure was checked first.
         let validated = options::ValidatedOptions::new(options, &font)?;
         let context = ContextInput::new(&bytes, context_bounds);
         Ok(Self {
@@ -66,7 +66,7 @@ impl PendingClosedShaping {
                 cancellation,
             }),
             context,
-        }) // 两张原GCB票已在原scope存活时消费；没有新的公开坐标或可替换取消位。
+        }) // Consume both original GCB tickets while scope lives, without new public coordinates or a replaceable cancellation bit.
     }
 
     fn guard(&self) -> Result<()> {
@@ -83,7 +83,7 @@ impl PendingClosedShaping {
         }
         if payload.cancellation.requested() {
             return Err(MarkdownShapingError::Cancelled);
-        } // 每个零工作或Source读取回合都核原位；不能靠已装入的坐标缓存绕过撤权。
+        } // Even zero-work/source-read turns check original authority; retained coordinates cannot bypass revocation.
         Ok(())
     }
 
@@ -91,7 +91,7 @@ impl PendingClosedShaping {
         let result = self.advance(budget);
         if result.is_err() {
             self.payload.take();
-        } // 失败立即归还原Source/Font；外层旧续体不能重新装配较新文档。
+        } // Failure returns original Source/Font immediately; an old continuation cannot assemble a newer document instead.
         result
     }
 
@@ -112,7 +112,7 @@ impl PendingClosedShaping {
                 scalars,
                 job: None,
             });
-        } // 同一个UTF8残余在后继量子继续；未完整准备上下文前不创建Job或字形FD。
+        } // Continue the same partial UTF-8 scalar next step; incomplete context creates neither a Job nor glyph FD.
         let prepared = self.context.prepared()?;
         let payload = self.payload.take().ok_or(MarkdownShapingError::Poisoned)?;
         let mut job = MarkdownShapingJob::assemble_with_context(
@@ -133,7 +133,7 @@ impl PendingClosedShaping {
     }
 }
 
-/// 最多两个20byte邻接窗；不另建Reader、正文镜像或按段落长度增长的残余。
+/// At most two 20-byte adjacent windows, without another reader, text mirror, or paragraph-sized residual state.
 struct ContextInput {
     ranges: [Range<usize>; 2],
     raw: [[u8; 20]; 2],
@@ -169,13 +169,13 @@ impl ContextInput {
             self.phase += 1;
             self.partial_used = 0;
             self.partial_needed = 0;
-        } // 两个固定窗最多转换两次；后窗UTF8尾残余沿原decode_context合同舍弃，非文档EOF。
+        } // At most two fixed-window transitions; discard an after-window's UTF-8 tail per decode_context, not as document EOF.
     }
 
     fn scalar(&mut self, byte: u8) -> Result<usize> {
         if self.partial_used == 0 {
             if self.phase == 0 && self.used[0] < 3 && byte & 0xc0 == 0x80 {
-                return Ok(0); // 原前窗允许落在UTF8中部，只跳过真实开头至多三个continuation。
+                return Ok(0); // A preceding window may start inside UTF-8; skip at most its actual initial three continuation bytes.
             }
             self.partial_needed = match byte {
                 0..=0x7f => 1,
@@ -188,7 +188,7 @@ impl ContextInput {
         self.partial[self.partial_used] = byte;
         self.partial_used += 1;
         if self.partial_used != self.partial_needed {
-            return Ok(0); // 没有完整解码的标量不能提前计数；残余仍是同一固定数组。
+            return Ok(0); // Count no scalar before complete decoding; retain residual bytes in this same fixed array.
         }
         std::str::from_utf8(&self.partial[..self.partial_used])
             .map_err(|_| MarkdownShapingError::InvalidUtf8)?;
@@ -203,7 +203,7 @@ impl ContextInput {
     ) -> Result<(usize, usize)> {
         self.finish_ranges();
         if self.complete() {
-            return Ok((0, 0)); // 实际文档两端无邻接字符，零读即可装配，不能读不存在的EOF。
+            return Ok((0, 0)); // At actual document edges there may be no context; assemble with zero reads rather than reading beyond EOF.
         }
         let phase = self.phase;
         let at = self.ranges[phase].start + self.used[phase];
@@ -238,12 +238,12 @@ impl ContextInput {
                 } else {
                     Err(error)
                 }
-            })?; // 原lease回收失败仍以真实Source错误返回，不被本地解码失败的占位错误遮盖。
+            })?; // Actual original-lease return failure remains a Source error, not hidden by the local decode-error placeholder.
         if let Some(error) = failure {
             return Err(error);
         }
         self.finish_ranges();
-        Ok((count, scalars)) // byte和完整scalar均在读取的同一回合收费，未同时输入中心文字。
+        Ok((count, scalars)) // Charge bytes and complete scalars in this read step, without also ingesting center text.
     }
 
     fn complete(&self) -> bool {
@@ -259,6 +259,6 @@ impl ContextInput {
             after: input::decode_context(&self.raw[1][..self.used[1]], false)?,
             bytes: self.total,
             maximum_borrow: self.maximum_borrow,
-        }) // 纯固定缓冲解码共用原算法；装配不再解引用原Source，也不重复收取字节。
+        }) // Fixed-buffer decoding reuses the original algorithm; assembly neither dereferences Source again nor charges these bytes twice.
     }
 }
