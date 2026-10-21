@@ -1246,15 +1246,19 @@ impl RelativeLink {
         Ok(())
     }
 
-    /// Host的真实GET/pagehide门通过后还须原文稿不变；这一步不认证浏览器内部对象或历史数据库。
+    /// Check the original document after the Host's actual GET/204 receipt; browser cleanup is separate.
     fn verify_http_unchanged(&self) -> Result<(), String> {
         if self.http_input.get().is_none() {
+            // A network receipt cannot substitute for the original Command-click intent.
             return Err("HTTP没有原鼠标动作票".into());
         }
+        // This accessor revalidates the original target, content and history authority.
+        // A published view failure remains a failure even after a server receives its GET.
         let view = self.http_target_view()?;
         if let Some(cause) = view.take_failure() {
             return Err(cause.to_string());
         }
+        // Report only the document facts checked here, without claiming ownership of a browser tab.
         println!(
             "native_external_http_link actual_command_mouse=true original_input_unchanged=true original_source_unchanged=true original_history_unchanged=true both_files_unchanged=true https_verified=false browser_internal_cleanup_verified=false"
         );
