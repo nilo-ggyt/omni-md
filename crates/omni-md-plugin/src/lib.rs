@@ -137,12 +137,9 @@ fn activate_markdown(
     host: &mut dyn OmniBarHostContext,
     _invocation: &PluginInvocation<'_>,
 ) -> Result<PluginActivation, PluginError> {
-    // Activation is the first resource boundary. Keep the Host's configured vault
-    // and application-data authorities; neither metadata nor this adapter selects a new root.
-    let workspace = omni_markdown_core::MarkdownWorkspace::new(
-        host.workspace_root().to_path_buf(),
-        host.application_data_root().to_path_buf(),
-    );
+    // Activation is the first resource boundary. The Host's configured vault is the sole Markdown
+    // source; neither plugin metadata nor application-data storage selects an alternate text root.
+    let workspace = omni_markdown_core::MarkdownWorkspace::new(host.workspace_root().to_path_buf());
     // Opening failure propagates without publishing a partially usable plugin session.
     let session = workspace
         .open_session()

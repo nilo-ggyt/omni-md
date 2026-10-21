@@ -1,10 +1,13 @@
-//! opaque 隐区是原动作的可恢复需求；实际量子、Source 权限和取消归还不因展开而丢失。
+//! Opaque folds yield recoverable expansion needs while retaining actual work and source ownership.
 
 use super::*;
 
 #[test]
-// 巨隐区相邻可见端点绝不是一个原字素；需求带本次真实记录计数且不会毒化原 composer。
+// Adjacent visible endpoints around a large fold are not one original grapheme.
+// The recoverable expansion result must leave the original composer usable.
 fn opaque_grapheme_delete_keeps_real_work_and_the_original_healthy_owner() {
+    // Install a genuine original folded range containing RTL, emoji and physical
+    // CRLF. The delete request starts at its visible boundary, not inside a fake source.
     let body = "אב🙂\r\n".repeat(65_536);
     let text = format!("# H\r\n{body}next");
     let end = 5 + body.encode_utf16().count();
@@ -24,6 +27,8 @@ fn opaque_grapheme_delete_keeps_real_work_and_the_original_healthy_owner() {
     };
     let mut actual_bytes = 0usize;
     let mut found = false;
+    // Continue with unit quotas until the real opaque boundary is encountered;
+    // publishing a Ready deletion across hidden text would lose original GCB semantics.
     for _ in 0..100_000 {
         let step = composer.step_word_delete(budget).unwrap();
         assert!(
@@ -42,6 +47,8 @@ fn opaque_grapheme_delete_keeps_real_work_and_the_original_healthy_owner() {
         }
     }
     assert!(found && actual_bytes < 64);
+    // Return the pending action, then prove the same original worker can process
+    // a visible grapheme without editing bytes or adding an undo operation.
     composer.cancel_word_delete();
     composer
         .begin_grapheme_delete(MarkdownWordDeleteDirection::Forward, 0)
@@ -54,8 +61,11 @@ fn opaque_grapheme_delete_keeps_real_work_and_the_original_healthy_owner() {
 }
 
 #[test]
-// LTR 真 root 证书可保原词移动；抵达 opaque 时只交需求，取消仍沿原资源图真实退出。
+// A genuine zero-level root permits LTR word movement, while an opaque fold
+// still requests expansion and retains the original cancellation/resource graph.
 fn opaque_word_move_retains_true_root_permission_and_preserves_cancellation() {
+    // Prepare actual whole-source direction permission before approaching the fold;
+    // fold expansion must not degrade that permission into a false capability error.
     let (_directory, document, mut composer) = tests::fixture("# H\nbody word\nnext");
     let end = "# H\nbody word\n".len();
     composer
@@ -78,6 +88,8 @@ fn opaque_word_move_retains_true_root_permission_and_preserves_cancellation() {
         .begin_word_group(MarkdownWordGroupAction::Forward, 3)
         .unwrap();
     let mut found = false;
+    // Yield until the original folded boundary is reached. The original record
+    // work remains charged even though the recoverable action cannot yet move.
     for _ in 0..100_000 {
         let step = composer.step_word_group(budget).unwrap();
         assert!(
@@ -98,6 +110,8 @@ fn opaque_word_move_retains_true_root_permission_and_preserves_cancellation() {
         }
     }
     assert!(found);
+    // Global cancellation after the expansion result must terminate the actual
+    // pending work and release all resources after the remaining owners drop.
     composer.cancellation.cancel();
     assert!(matches!(
         composer.step_word_group(budget),

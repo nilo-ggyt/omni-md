@@ -1,15 +1,18 @@
-//! 借用同一Script job的稳定范围；开放前缀不冒充完整run、paragraph或shaping item。
+//! Borrows stable ranges from the same script job. An open prefix is never
+//! reported as a complete run, paragraph, or shaping item.
 use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownScriptPrefixKind {
-    /// 原store中已实际提交的完整run。
+    /// A complete run actually committed to the original store.
     ClosedRun,
-    /// 唯一脚本和完整cluster只覆盖这个稳定前缀，真实run末端仍未知。
+    /// One proven script and complete clusters cover this stable prefix only;
+    /// the actual run endpoint remains unknown.
     StableOpenPrefix,
 }
 
-/// 私有构造且不Clone；借用阻止原job在消费者持有范围时继续改动当前候选。
+/// Private construction and no cloning keep the job borrowed while the consumer
+/// holds this range, preventing mutation of the same pending candidate.
 pub struct MarkdownStableScriptPrefix<'a> {
     job: &'a MarkdownScriptJob,
     authority: MarkdownLayoutTextAuthority,
@@ -23,7 +26,8 @@ pub enum MarkdownScriptPrefixAnswer<'a> {
 }
 
 impl MarkdownStableScriptPrefix<'_> {
-    /// 只读原范围事实；返回前仍核源首错/取消，不能把旧借用当永久权限。
+    /// Reads original range facts, rechecking source failure/cancellation before
+    /// returning. A borrowed value never grants permanent source authority.
     pub fn facts(&self) -> Result<MarkdownScriptRun> {
         self.job.guard(&self.authority)?;
         let result = self.run;
@@ -31,12 +35,15 @@ impl MarkdownStableScriptPrefix<'_> {
         Ok(result)
     }
 
-    /// 类型区分完整run和稳定开放部分；二者都不授予GCB或Native活文档权限。
+    /// Distinguishes a closed run from a stable open portion. Neither grants
+    /// grapheme-boundary authority or native live-document editing permission.
     pub fn kind(&self) -> Result<MarkdownScriptPrefixKind> {
         self.job.guard(&self.authority)?;
         Ok(self.kind)
     }
 
+    /// Lends the original weak payload identity only after the same live job
+    /// confirms cancellation and source health; no document owner is returned.
     pub fn source_authority(&self) -> Result<&MarkdownLayoutTextAuthority> {
         self.job.guard(&self.authority)?;
         Ok(&self.authority)
@@ -44,7 +51,8 @@ impl MarkdownStableScriptPrefix<'_> {
 }
 
 impl MarkdownScriptJob {
-    /// 仅查询原已提交run或已确定脚本的完整cluster前缀；不推进Source或假造末端。
+    /// Queries committed runs or complete-cluster prefixes with an established
+    /// script, without advancing the source or inventing a terminal endpoint.
     pub fn stable_prefix_at(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,
@@ -60,6 +68,8 @@ impl MarkdownScriptJob {
                 }
                 MarkdownScriptAnswer::Known(None) => None,
                 MarkdownScriptAnswer::Pending => {
+                    // Only a stable complete-cluster prefix may answer an unfinished run.
+                    // Its half-open coordinate range must actually contain this query.
                     self.machine.stable_open_prefix().and_then(|run| {
                         let (start, end) = match unit {
                             MarkdownScriptUnit::Byte => (run.start_byte, run.end_byte),
@@ -79,7 +89,7 @@ impl MarkdownScriptJob {
         let result = match self.source.health() {
             Err(error) => Err(error.into()),
             Ok(()) => result,
-        }; // 即使固定metadata读取失败，也不能遮掉同一源已经确认的首errno。
+        }; // Metadata failures cannot hide the same source's already confirmed first errno.
         let (candidate, eof) = match result {
             Ok(value) => value,
             Err(error) => {
@@ -96,6 +106,8 @@ impl MarkdownScriptJob {
                     kind,
                 },
             ))),
+            // Confirmed absence differs from an open candidate that has not yet
+            // established its unique script or reached this source coordinate.
             None if eof => Ok(MarkdownScriptPrefixAnswer::Known(None)),
             None => Ok(MarkdownScriptPrefixAnswer::Pending),
         }

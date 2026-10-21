@@ -1,4 +1,5 @@
-//! 同原Coordinator实际Bidi→Script/GCB→Style链证明含CRLF长源不再先扫描整篇。
+//! Exercise the original coordinator's real bidi→Script/grapheme→Style chain on
+//! long CRLF Sources without scanning the complete suffix before first output.
 
 use super::*;
 use crate::MarkdownDocumentBuffer;
@@ -6,6 +7,8 @@ use std::io::Write;
 
 #[test]
 fn crlf_prefix_of_four_mebibyte_source_reaches_real_first_style_with_bounded_reads() {
+    // Write the synthetic four-mebibyte suffix in fixed blocks. The captured Source
+    // remains mmap-backed; only original bounded preparation can reach NeedStyle.
     let mut file = tempfile::NamedTempFile::new().unwrap();
     file.write_all(b"first\r\nsecond\r\n").unwrap();
     let block = [b'a'; 4096];
@@ -50,8 +53,10 @@ fn crlf_prefix_of_four_mebibyte_source_reaches_real_first_style_with_bounded_rea
             }
         };
         assert_eq!(request.source_range(), 0..5);
-        assert_eq!(request.paragraph_range(), 0..6); // CR是原UBA末B，LF仍为下一个独立B段。
+        assert_eq!(request.paragraph_range(), 0..6); // Original UBA ends at CR; LF begins another B paragraph.
         assert!(bytes < 32 * 1024, "首样式不能先读取四MiB后继段");
+        // Observe the actual original bidi resources before dropping the worker;
+        // Source/payload release is checked independently after all worker rounds.
         let bidi = coordinator
             .payload
             .as_ref()
@@ -88,7 +93,8 @@ fn leading_and_intermediate_crlf_keep_original_dependencies_and_next_real_style(
     let authority = source.authority();
     let mapping = document.original_backing_observer().unwrap();
     let payload = source.resource_observer();
-    // 只用仓库原真实拉丁字体整形有限首两词；四MiB后继仍属于同mmap Source，不作为字体输入。
+    // Use the repository's actual Latin font for the first two finite words only.
+    // The four-mebibyte suffix stays in the same mmap Source, outside font input.
     const ROBOTO: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../vendor/harfrust/benches/fonts/Roboto-Regular.ttf"
@@ -101,7 +107,7 @@ fn leading_and_intermediate_crlf_keep_original_dependencies_and_next_real_style(
         .to_vec();
     let font =
         MarkdownLayoutFont::resolve_name_table_at_size(Arc::new(ROBOTO), &name, &[], 16.0).unwrap();
-    let mut resources = Vec::new(); // 只保两轮原worker的实际析构收据，不能延长Source或文件的生命。
+    let mut resources = Vec::new(); // Two actual worker observers retain no Source/file owner.
     for budget in [
         MarkdownLineComposeBudget {
             bytes: 1,
@@ -122,6 +128,8 @@ fn leading_and_intermediate_crlf_keep_original_dependencies_and_next_real_style(
         )
         .unwrap();
         resources.push(worker.worker_resource_observer());
+        // Assert the externally issued text/control order, including all original
+        // CRLF bytes; private preparation stages are not the expected outcome.
         let mut expected = [
             (true, 0..2),
             (false, 2..7),
@@ -170,7 +178,7 @@ fn leading_and_intermediate_crlf_keep_original_dependencies_and_next_real_style(
                         assert!(range.end > range.start);
                         assert_eq!(request.paragraph_range(), 17..source.utf16_len());
                         reached_tail = true;
-                        break; // 实际跨过首两文本和三个CRLF后才结束，不扫描/整形后继四MiB。
+                        break; // Reached the real suffix after two texts and three CRLFs.
                     }
                 }
                 MarkdownLineComposeAnswer::NeedsControl(request) => {
@@ -197,7 +205,9 @@ fn leading_and_intermediate_crlf_keep_original_dependencies_and_next_real_style(
             }
         }
         assert!(reached_tail && bytes < 32 * 1024);
-        drop((worker, registered)); // 归还未消费的后继请求和同worker原元数据，不保留跨轮缓存。
+        // Release the unconsumed following request and this worker's real metadata;
+        // no cache or consumer survives into the next budget round.
+        drop((worker, registered));
     }
     drop((font, source, document));
     assert!(payload.payload_released());
@@ -211,6 +221,8 @@ fn actual_255_byte_crlf_prefix_and_four_mebibyte_tail_publish_a_real_tail_line_b
         MarkdownLineComposeAnswer, MarkdownLineComposer, MarkdownLineFontCatalog,
         MarkdownLineParagraphStyle,
     };
+    // Keep the actual 255-byte seam that precedes the long continuous suffix;
+    // resizing or inserting another separator would bypass this continuation case.
     let prefix = format!("{}\r\nsecond word\r\n", "alpha ".repeat(40));
     assert_eq!(prefix.len(), 255);
     let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -250,6 +262,8 @@ fn actual_255_byte_crlf_prefix_and_four_mebibyte_tail_publish_a_real_tail_line_b
     .unwrap();
     let resources = worker.worker_resource_observer();
     let mut bytes = 0;
+    // Advance the real full composition chain until a committed soft line starts
+    // in the suffix. A first Style request alone would not prove this regression.
     let mut tail = None;
     for _ in 0..200_000 {
         let budget = MarkdownLineComposeBudget::default();
@@ -331,6 +345,8 @@ fn actual_255_byte_crlf_prefix_and_four_mebibyte_tail_publish_a_real_tail_line_b
     assert_eq!(tail.source_utf16.start, prefix.len());
     assert!(tail.source_utf16.end > prefix.len() && tail.source_utf16.end < source.utf16_len());
     assert!(bytes < 32 * 1024, "真实尾段首行不能先扫描四MiB后继正文");
+    // Close actual published output, worker indexes, fonts, and mapped Source.
+    // Real backing observations remain available without extending their owners.
     worker.into_output().unwrap().close().unwrap();
     drop((registered, font, source, document));
     assert!(resources.is_released() && payload.payload_released());

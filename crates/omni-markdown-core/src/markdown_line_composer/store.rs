@@ -1,7 +1,9 @@
-//! 唯一分页输出的受信producer；原job逐批签入后才发布私有item目录，不存每项强owner。
+//! Trusted producer for the unique paged output. Publish private item directories
+//! only after the original Job is captured in bounded batches, without an owner per item.
 //!
-//! glyph和cluster均是派生元数据。正文只借同一Source，临时原job弱票在完整写入后归还；
-//! 历史读取只接受本Store签发的opaque origin，不接受公开Range、字体slot或相同文字重建。
+//! Glyphs/clusters are derived metadata. Text is borrowed from the same Source and
+//! temporary Job weak proofs retire after complete writes. Historical reads accept
+//! only this Store's opaque origins, never reconstructed ranges, font slots, or text.
 
 use std::{
     ops::Range,
@@ -51,30 +53,35 @@ mod skip;
 use output::{MarkdownComposedLineFacts, MarkdownComposedLineKind, MarkdownComposedLines};
 use skip::LineAncestor;
 
-/// 目录整数只能在本模块中建立；它本身不代表原Source或Font仍有消费权限。
+/// Directory keys are constructed only here. Their integers alone do not prove
+/// that original Source/font consumption authority remains live.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ItemKey {
     record: usize,
     origin: u64,
 }
 
-/// 只在当前查询/行组合借用期保留这一张弱票，不形成按item数增长的Weak集合。
+/// Retain one weak proof for the current query/line-assembly borrow, without a Weak
+/// collection growing with the number of historical items.
 #[derive(Clone)]
 pub(super) struct StoredItemProof {
     store: Weak<()>,
     key: ItemKey,
-    // 当前producer的临时原Job回查票；历史目录回读不保留N个控制块，也不从record重建它。
+    // Temporary original-Job proof for the current producer. Historical directory
+    // reads neither retain per-item control blocks nor reconstruct them from records.
     #[cfg(test)]
     job: Option<Weak<()>>,
 }
 
-/// 一次实际定位同时取得的原票与完整目录；调用方只在本次借用内消费，不留作后继缓存。
-/// proof-only 客户直接移走原票；行组合则复用已解码的三条不可变记录，仍逐次核 Source/字体。
+/// Original proof and complete directory from one actual lookup. Consume them only
+/// during that borrow, not as a later cache. Proof-only callers move the proof out;
+/// line assembly reuses three decoded immutable records while rechecking Source/font.
 pub(super) struct LocatedItem {
     pub(super) proof: StoredItemProof,
     directory: Directory,
-    // 只来自同次 forest 降树已读的紧邻右子树；没有 Font、Source、FD 强引用。
-    // 行组合只在上一目录的精确末端短借它，不能用于逆向或下一次 line/step。
+    // Adjacent right subtree actually read during this same forest descent, without
+    // strong font/Source/FD ownership. Borrow only at the preceding directory's exact
+    // end in this line; never for reverse movement or another line/step.
     following: Option<forest::Root>,
 }
 
@@ -113,9 +120,11 @@ struct Directory {
     y_advance: i64,
     kind: super::MarkdownComposedLinePartKind,
     tab_interval: Option<i64>,
-    // 只来自原frontier ReadyJob的封闭词证书；该端点不是本目录glyphReady范围。
+    // Only an original Ready frontier Job supplies this sealed word proof. Its end
+    // is not this directory's glyph-Ready coverage.
     frontier_word_end: Option<usize>,
-    /// 只来自原 ItemScan 的两端 UBA 分段许可；它们不是编辑、断行或字素边界。
+    /// Original ItemScan endpoint UBA seam permissions, not edit, line-break, or
+    /// grapheme boundaries.
     shaping_seams: [Option<(u8, u8)>; 2],
 }
 
@@ -128,7 +137,8 @@ enum Phase {
     Forest,
 }
 
-/// 移交只替换这一唯一IO owner；无File clone、第二FD或sealed数据重写路径。
+/// Handoff replaces this sole I/O owner, without File cloning, a second FD, or a
+/// path that rewrites sealed records.
 enum Rows {
     Writing(PagedLayoutIndex<64>),
     #[cfg(test)]
@@ -179,7 +189,8 @@ impl Rows {
 
 struct Capture {
     paragraph_inset_26_6: i32,
-    // 只在实际producer工作期持原job弱身份；写完即Drop，不把控制块写成内存历史表。
+    // Retain original Job weak identity only while its producer is active. Drop it
+    // after writing instead of keeping an in-memory history of control blocks.
     job: Weak<()>,
     facts: MarkdownLineItemFacts,
     registration: MarkdownLineFontRegistration,
@@ -198,11 +209,13 @@ struct Capture {
     y_advance: i64,
     tree: Option<forest::Build>,
     frontier_word_end: Option<usize>,
-    /// 捕获期间每批都与原 Item 的封闭票复核，提交后才写入同一私有目录。
+    /// Recheck original sealed Item proofs each capture batch; only commit writes
+    /// their facts into the same private directory.
     shaping_seams: [Option<(u8, u8)>; 2],
 }
 
-/// 只从原 Item 的强类型分段票提取固定元数据；外部范围或相同数值不能登记一个内部边界。
+/// Extract fixed metadata only from the original Item's typed seam proofs. External
+/// ranges or equal coordinates cannot register an internal boundary.
 fn item_shaping_seams(
     item: &MarkdownLineItem,
     authority: &MarkdownLayoutTextAuthority,
@@ -214,7 +227,8 @@ fn item_shaping_seams(
     let facts = item.facts();
     for (index, proof) in item.shaping_seams().iter().enumerate() {
         let Some(proof) = proof else {
-            continue; // 普通端点仍由真实 GCB 目录拥有，不能从未登记推导出标量分段许可。
+            continue; // Ordinary endpoints still require real grapheme metadata;
+            // absence of a registered seam grants no scalar-split authority.
         };
         let (_, utf16) = proof.boundary(authority)?;
         let levels = proof.levels();
@@ -223,6 +237,8 @@ fn item_shaping_seams(
         } else {
             facts.source_utf16.end
         };
+        // A real seam separates two different valid levels and must match this
+        // item's corresponding inside level at its exact original endpoint.
         if utf16 != expected
             || levels.0 == levels.1
             || levels.0 > 126
@@ -236,7 +252,8 @@ fn item_shaping_seams(
     Ok(seams)
 }
 
-/// 只有一页16KiB输出缓存及一个当前capture；任何失败都撤销整个尚未封口的候选。
+/// One 16-KiB output-page buffer and one current capture. Any failure revokes the
+/// complete unsealed candidate rather than retain partially usable directories.
 pub(super) struct GlyphStore {
     index: Option<Rows>,
     identity: Arc<()>,
@@ -269,7 +286,8 @@ pub(super) struct GlyphStore {
         feature = "paged-shaping-frontier"
     ))]
     table_line: Option<table_row::TableLineCapture>,
-    // 只随真实LineEnd提交；后继GCB预取不能扩张旧输出的目录/EOF。
+    // Commit only with an actual LineEnd. Later grapheme prefetch cannot expand an
+    // old output's directory or EOF authority.
     published_graphemes: Option<GraphemeDirectory>,
     line_end: Option<usize>,
     line_source_end: usize,
@@ -279,9 +297,10 @@ pub(super) struct GlyphStore {
 }
 
 impl GlyphStore {
-    /// 选择显隐不变的能力必须覆盖所有已签入 item，而不只是最后一条可见 LineEnd。
-    /// 此处只检查原 writer 的固定事实；不扫描历史目录，也不截断或复制已付费的字形。
-    /// 半 capture 可能已改写 forest，不能把它当作可回退边界，必须交回原冷重排路径。
+    /// Style-invariance proof must cover every captured item, not only the latest
+    /// visible LineEnd. Check original fixed writer facts without historical scans,
+    /// truncation, or glyph copying. Partial capture may have changed the forest;
+    /// it requires normal restyling rather than a fabricated rollback boundary.
     #[cfg(all(
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
@@ -319,6 +338,8 @@ impl GlyphStore {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        // Create the unique actual output index only after original Source and
+        // cancellation checks; all later records belong to this writer identity.
         let index = PagedLayoutIndex::new()?;
         let observer = index.resource_observer();
         Ok(Self {
@@ -373,7 +394,8 @@ impl GlyphStore {
         self.resources = Some(resources);
     }
 
-    /// 只在 composer 构造时分享原有限物理行 proof；输出 reader 不保存第二份范围目录。
+    /// Share the original bounded physical-line proof during composer setup;
+    /// output readers do not retain another range directory.
     pub(super) fn set_fold_plan(
         &mut self,
         folds: Option<crate::markdown_layout_source::folds::FoldPlan>,
@@ -381,7 +403,8 @@ impl GlyphStore {
         self.folds = folds;
     }
 
-    /// 输出与原 Unicode job 共用结构身份；只读查询不会给表格内部原正文补布局权限。
+    /// Output shares original Unicode jobs' structural identity. Read-only queries
+    /// do not grant text-layout authority inside table blocks.
     #[cfg(all(
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
@@ -393,7 +416,7 @@ impl GlyphStore {
         self.tables = plan;
     }
 
-    /// 当前行的迁移范围只来自 sealed row，不接受外部裸 Range。
+    /// Derive this row's migration span only from its sealed row, never a bare range.
     #[cfg(all(
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
@@ -406,7 +429,7 @@ impl GlyphStore {
     }
 
     fn guard(&self) -> Result<()> {
-        self.source.health()?; // 已写目录、EOF和页命中仍先核原始IO，不能只相信输出缓存。
+        self.source.health()?; // Committed directories, EOF, and cache hits still require original I/O health.
         if !self.source.permits(&self.authority) {
             return Err(Error::SourceMismatch);
         }
@@ -416,10 +439,12 @@ impl GlyphStore {
         let rows = self.index.as_ref().ok_or(Error::Poisoned)?;
         let state = self.observer.snapshot();
         let closed = match rows {
-            // 未换页的活writer只有buffer或空状态；真实close收据才代表它退出。
+            // An active writer may only have a buffer/empty state. Its actual
+            // owner-close observation, not lack of mapped pages, proves retirement.
             Rows::Writing(_) => state.owner_closed,
             #[cfg(test)]
-            // 封存移交后的读取必须持有真实FD，不能把writer退出事实误用为reader仍存活。
+            // A sealed reader must own a real FD; writer retirement does not prove
+            // that the transferred reader remains alive.
             Rows::Reading(_) => !state.file_open,
         };
         if closed || state.cleanup_failed || state.reader_failed {
@@ -434,16 +459,19 @@ impl GlyphStore {
             Ok(value)
         });
         if result.is_err() {
-            // 先归还实际临时索引和唯一输出文件；旧Proof只能保持失效Weak，无法重启producer。
+            // Release actual temporary indexes and the sole output file. Old proofs
+            // can retain only expired weak identity, never restart this producer.
             drop(self.capture.take());
             drop(self.control_capture.take());
             drop(self.index.take());
-            self.source.health()?; // 失败清理可能带来真实映射首错，必须在返回原错误前保留它。
+            self.source.health()?; // Cleanup may record the original backing's first failure.
         }
-        result // 成功已由上方guard核健康，其后没有IO或资源转换，不再重复遍历同一Source。
+        result // Success passed guard; no later I/O/resource transition needs another scan.
     }
 
     fn require_capture(&mut self, item: &mut MarkdownLineItem) -> Result<()> {
+        // Every batch authenticates the same actual Job, live font registration,
+        // profile, paragraph facts, and sealed seam permissions before using output.
         self.guard()?;
         let capture = self.capture.as_ref().ok_or(Error::InvalidRequest)?;
         let registered = self.fonts.require_registration(&capture.registration)?;
@@ -464,7 +492,7 @@ impl GlyphStore {
         #[cfg(feature = "paged-shaping-frontier")]
         if item.job.frontier_word_end(&self.authority, &item.font)? != capture.frontier_word_end {
             return Err(Error::SourceMismatch);
-        } // 每批/commit前仍由原实际Job复核，不能把已撤销的私有证书写成永久目录事实。
+        } // Revoked original certificates cannot become permanent directory facts.
         Ok(())
     }
 
@@ -473,7 +501,8 @@ impl GlyphStore {
         self.begin_with_inset(item, 0)
     }
 
-    /// 原捕获和字形记录数不变；缩进只随这一个同 nonce Item 写入既有目录空闲字段。
+    /// Preserve original capture/glyph records. Store the inset in existing spare
+    /// directory fields for this same authenticated Item, without another style table.
     pub(super) fn begin_with_inset(
         &mut self,
         item: &mut MarkdownLineItem,
@@ -493,7 +522,7 @@ impl GlyphStore {
             }
             if paragraph_inset_26_6 < 0 {
                 return Err(Error::InvalidRequest);
-            } // 真正参与行宽运算的封存值不能为负，不能扩大超过原正文列的可用范围。
+            } // A negative captured inset cannot enlarge the actual text column.
             let registration = item.registration.clone().ok_or(Error::FontExpired)?;
             let registered = self.fonts.require_registration(&registration)?;
             if item.authority != self.authority || !registered.font().permits(&item.font) {
@@ -513,7 +542,8 @@ impl GlyphStore {
                 && let Some(resources) = &self.resources
             {
                 resources.incomplete();
-            } // 构造未交出原收据的失败不能据SourceDrop或后续零计数冒签覆盖完整。
+            } // Failure before a real resource observation cannot be erased by
+            // Source drop or a later all-zero resource count.
             let index = super::worker_resources::ClusterResourceOwner::new(
                 created?,
                 self.resources.as_ref(),
@@ -546,7 +576,8 @@ impl GlyphStore {
         self.finish(result)
     }
 
-    /// 每次只写≤256条实际记录；返回Proof只表示完整原item签入，并不表示已选中软行。
+    /// Write at most 256 actual records per step. A returned proof certifies complete
+    /// original-item capture, not a selected soft line.
     pub(super) fn step(
         &mut self,
         item: &mut MarkdownLineItem,
@@ -570,12 +601,16 @@ impl GlyphStore {
         let file = self.index.as_mut().ok_or(Error::Poisoned)?;
         match capture.phase {
             Phase::Index => {
+                // Prepare the actual original Job's cluster index under this same
+                // record quantum before copying any glyph or logical cluster data.
                 let step = capture.index.step(&mut item.job, limit)?;
                 if step.status == MarkdownGlyphClusterStatus::Ready {
                     capture.phase = Phase::Glyphs;
                 }
             }
             Phase::Glyphs => {
+                // Copy bounded records from the same real Job; the exact terminal
+                // glyph query must agree with its captured original profile.
                 for _ in 0..limit {
                     if capture.consumed == capture.count {
                         break;
@@ -604,7 +639,8 @@ impl GlyphStore {
                     if capture.source_cursor == capture.facts.source_utf16.end {
                         break;
                     }
-                    // 已签入数量就是原逻辑源顺序的下一ordinal，不再为顺序复制重复二分同一索引。
+                    // Captured cluster count is the next original logical ordinal;
+                    // sequential copying needs no repeated search of that same index.
                     let value = capture
                         .index
                         .at_ordinal(&mut item.job, capture.cluster_count)?
@@ -630,7 +666,8 @@ impl GlyphStore {
                         .ok_or(Error::Overflow)?;
                 }
                 if capture.source_cursor == capture.facts.source_utf16.end {
-                    // 源范围走到真实末端时，原索引也必须恰好耗尽；不把遗漏记录签入样式目录。
+                    // Reaching actual item end must exhaust the original index
+                    // exactly. Missing clusters cannot become a valid styled item.
                     if capture
                         .index
                         .at_ordinal(&mut item.job, capture.cluster_count)?
@@ -644,7 +681,8 @@ impl GlyphStore {
                 }
             }
             Phase::Style => {
-                // 原样保存有界样式，包含feature全局范围；不能重形时偷偷退回默认feature。
+                // Preserve bounded original style, including global feature ranges.
+                // A later reshape must not silently substitute default features.
                 let language_rows = capture
                     .style
                     .language
@@ -669,7 +707,8 @@ impl GlyphStore {
                         row[12..16].copy_from_slice(&feature.source_utf16_end.to_le_bytes());
                         row[56] = FEATURE;
                     } else {
-                        // 原语言≤64B，因此最多两条；它们与feature共用本次records，不额外越额。
+                        // Language is bounded to 64 bytes, requiring at most two
+                        // records under the same allowance already shared by features.
                         let language = capture
                             .style
                             .language
@@ -704,7 +743,8 @@ impl GlyphStore {
                 }
             }
             Phase::Commit => {
-                // 最后再核原Job/profile/font，不让写入期间撤权后的部分文件产生有效origin。
+                // Recheck original Job/profile/font before issuing an origin. A
+                // partial file whose authority expired during writes cannot commit.
                 self.require_capture(item)?;
                 let capture = self.capture.as_mut().ok_or(Error::InvalidRequest)?;
                 let origin = self.origins.checked_add(1).ok_or(Error::Overflow)?;
@@ -761,6 +801,8 @@ impl GlyphStore {
                 self.capture.as_mut().ok_or(Error::InvalidRequest)?.phase = Phase::Forest;
             }
             Phase::Forest => {
+                // Build the item's immutable same-file lookup path before exposing
+                // its origin/source endpoint. Budget yields preserve the same capture.
                 let capture = self.capture.as_mut().ok_or(Error::InvalidRequest)?;
                 let tree = capture.tree.as_mut().ok_or(Error::InvalidRequest)?;
                 if !tree.step(
@@ -782,7 +824,9 @@ impl GlyphStore {
                     .facts
                     .source_utf16
                     .end;
-                drop(self.capture.take()); // 临时原job Weak与cluster FD在签完目录和搜索树后真实归还。
+                // The complete directory/tree no longer needs the temporary Job
+                // weak proof or actual cluster FD; release both before returning.
+                drop(self.capture.take());
                 return Ok(Some(StoredItemProof {
                     store: Arc::downgrade(&self.identity),
                     key,
@@ -804,7 +848,8 @@ impl GlyphStore {
         let end = proof.key.record.checked_add(3).ok_or(Error::Overflow)?;
         let mut records = [[0; 64]; 3];
         file.read_batch(proof.key.record..end, &mut records)?;
-        // 目录本来就要求完整的三条相邻record；合并同一请求的IO，不扩大语义读取预算。
+        // This directory already requires its three complete adjacent records.
+        // One batched read combines their I/O without enlarging semantic coverage.
         let directory = decode_directory(records)?;
         if directory.origin != proof.key.origin
             || directory.facts.source_utf16.end > self.source_end
@@ -822,7 +867,9 @@ impl GlyphStore {
         {
             return Err(Error::InconsistentCoverage);
         }
-        self.fonts.resolve(directory.font)?; // 过期slot不能给旧glyph新配font；也不以目录整数恢复owner。
+        // An expired slot cannot assign a replacement font to old glyphs; directory
+        // integers do not reconstruct original payload ownership.
+        self.fonts.resolve(directory.font)?;
         self.guard()?;
         Ok(directory)
     }
@@ -848,7 +895,8 @@ impl GlyphStore {
         self.finish(result)
     }
 
-    /// 只为原已选重排范围领取一个真实Glyphs目录；Tab或跨item范围没有单字体重排权限。
+    /// Locate one actual Glyphs directory for the originally selected reshape
+    /// range. Tabs and cross-item ranges grant no single-font reshape authority.
     pub(super) fn resolution_item_at(
         &mut self,
         range: &Range<usize>,
@@ -909,13 +957,16 @@ impl GlyphStore {
     ) -> Result<Option<MarkdownGlyphCluster>> {
         let directory = match self.directory(proof) {
             Ok(directory) => directory,
-            Err(error) => return self.finish(Err(error)), // 外来票或实际目录IO失败立即撤候选，不进入子范围查询。
+            // A foreign proof or actual directory I/O failure revokes this candidate
+            // before a subordinate cluster query can use it.
+            Err(error) => return self.finish(Err(error)),
         };
         self.cluster_in_directory(&directory, offset)
             .map(|located| located.map(|(_, cluster)| cluster))
     }
 
-    /// 仅复用本Store在本次同步调用已验证的目录；不跨让出保存，不重新读同三条不可变record。
+    /// Reuse only a directory authenticated by this Store in the current synchronous
+    /// call, without retention across yields or rereading its three immutable records.
     fn cluster_in_directory(
         &mut self,
         directory: &Directory,
@@ -924,7 +975,7 @@ impl GlyphStore {
         let result = (|| {
             self.guard()?;
             self.fonts.resolve(directory.font)?;
-            self.guard()?; // 目录字节不可变不代表Source或字体仍有效，EOF与同范围查询也先核原票。
+            self.guard()?; // Immutable bytes grant no permanent Source/font authority, even at EOF.
             if offset < directory.facts.source_utf16.start
                 || offset > directory.facts.source_utf16.end
             {
@@ -933,8 +984,9 @@ impl GlyphStore {
             if offset == directory.facts.source_utf16.end {
                 return Ok(None);
             }
-            // 真实目录已给出首末 ordinal；查询恰在 item 两端时不必二分相同记录。
-            // 这里只选择读取位置，结果仍来自原64B记录，并逐项解码、核覆盖与 glyph 范围。
+            // The actual directory already identifies first/last cluster ordinals.
+            // Endpoint queries may select those exact records without binary search;
+            // decoding, Source coverage, and glyph-range checks remain unchanged.
             let endpoint = if offset == directory.facts.source_utf16.start {
                 Some(0)
             } else if offset.checked_add(1) == Some(directory.facts.source_utf16.end) {
@@ -957,7 +1009,7 @@ impl GlyphStore {
             }
             let (mut low, mut high) = (0, directory.cluster_count);
             while low < high {
-                self.guard()?; // 每次真实页读取可取消，二分至多usize::BITS，不按整项线性扫描。
+                self.guard()?; // Each actual read is cancellable; binary search is bounded by usize::BITS.
                 let middle = low + (high - low) / 2;
                 let value = self.cluster_record_in_directory(directory, middle)?;
                 if offset < value.source_utf16.start {
@@ -968,19 +1020,20 @@ impl GlyphStore {
                     return Ok(Some((middle, value)));
                 }
             }
-            Err(Error::InconsistentCoverage) // 完整签入目录内部无覆盖是损坏，不是Pending或零宽空白。
+            Err(Error::InconsistentCoverage) // A gap in committed coverage is corruption, not Pending.
         })();
         self.finish(result)
     }
 
-    /// 调用方已核本次Source/字体；只读原目录中确实需要的一条记录，不预取后继内容。
+    /// The caller checked this query's Source/font. Read exactly the required
+    /// original directory record, without prefetching following content.
     fn cluster_record_in_directory(
         &mut self,
         directory: &Directory,
         ordinal: usize,
     ) -> Result<MarkdownGlyphCluster> {
         if ordinal >= directory.cluster_count {
-            return Err(Error::InconsistentCoverage); // 声称存在的相邻cluster必须确实属于完整目录。
+            return Err(Error::InconsistentCoverage); // A claimed adjacent cluster must exist in the directory.
         }
         let record = directory
             .cluster_start
@@ -991,7 +1044,7 @@ impl GlyphStore {
             || value.source_utf16.end > directory.facts.source_utf16.end
             || value.glyphs.end > directory.glyph_count
         {
-            return Err(Error::InconsistentCoverage); // 原文件坏记录不能变成有效坐标或安全断点。
+            return Err(Error::InconsistentCoverage); // Bad file records cannot certify coordinates or safe breaks.
         }
         Ok(value)
     }
@@ -1012,7 +1065,9 @@ impl GlyphStore {
             {
                 return Err(Error::InconsistentCoverage);
             }
-            let mut features = Vec::with_capacity(directory.features); // 只有已验证≤64条样式，不是正文或逐glyph缓存。
+            // Only validated bounded style records are materialized, never text or
+            // a per-glyph cache. Each feature retains its exact original global range.
+            let mut features = Vec::with_capacity(directory.features);
             for ordinal in 0..directory.features {
                 self.guard()?;
                 let record = directory
@@ -1042,6 +1097,8 @@ impl GlyphStore {
             let language = if directory.language_bytes == 0 {
                 None
             } else {
+                // Reassemble at most 64 actual language bytes, checking every
+                // record's kind/length/reserved bytes before accepting UTF-8.
                 let mut bytes = [0; 64];
                 let mut consumed = 0usize;
                 for ordinal in directory.features..directory.style_rows {
@@ -1124,7 +1181,8 @@ impl GlyphStore {
         self.finish(result)
     }
 
-    /// 只计唯一最终Store已实际写入的record；临时cluster索引不混充为scene输出。
+    /// Count records actually written by the sole final Store. Temporary cluster
+    /// indexes are not counted as scene output.
     pub(super) fn record_count(&self) -> Result<usize> {
         self.guard()?;
         Ok(self.index.as_ref().ok_or(Error::Poisoned)?.len())
@@ -1135,7 +1193,7 @@ impl GlyphStore {
         Ok(output::MarkdownComposedLineResourceObserver::for_source(
             self.observer.clone(),
             &self.source,
-        )) // 这是writer本身的实际FD/映射收据，不能拿prefix reader的独立收据替代。
+        )) // Observe this actual writer's FD/mapping, not a prefix reader's separate owner.
     }
 
     #[cfg(test)]
@@ -1150,7 +1208,7 @@ impl GlyphStore {
             }
             if offset == self.source_end {
                 return Ok(None);
-            } // 仅已签入前缀的末端，调用者另核真正文档EOF。
+            } // This is captured-prefix end only; callers independently establish real EOF.
             let located = forest::lookup(
                 self.index.as_mut().ok_or(Error::Poisoned)?,
                 &self.forest,
@@ -1175,11 +1233,12 @@ impl GlyphStore {
         self.finish(result)
     }
 
-    /// 只供同一次整行的正向邻接消费；原行入口已停止 capture，后续只追加 Line/Part，
-    /// 不会修改原 forest/Directory，也没有 Native 或挂起点让另一份 Source/FD 接管它。
+    /// Forward-adjacent consumption within this same line only. Capture has stopped
+    /// before entry; later Line/Part appends do not mutate forest/directories, and
+    /// no Native call or suspension transfers this Source/FD to another owner.
     fn item_following(&mut self, previous: &LocatedItem) -> Result<Option<LocatedItem>> {
         let result = (|| {
-            self.guard()?; // 先核原 Source、取消和 index observer，不能用已读 Root 掩盖失权或 poison。
+            self.guard()?; // A retained Root cannot hide Source/cancellation/index failure.
             if !Weak::ptr_eq(&previous.proof.store, &Arc::downgrade(&self.identity)) {
                 return Err(Error::SourceMismatch);
             }
@@ -1197,7 +1256,7 @@ impl GlyphStore {
                 offset,
             )?;
             let Some(located) = located else {
-                return Ok(None); // 没有原邻接子树或精确根事实时，调用者仍作普通完整查询。
+                return Ok(None); // Absent original adjacency uses ordinary complete lookup.
             };
             let proof = StoredItemProof {
                 store: Arc::downgrade(&self.identity),
@@ -1205,7 +1264,7 @@ impl GlyphStore {
                 #[cfg(test)]
                 job: None,
             };
-            let directory = self.directory(&proof)?; // 三条真实记录、Font 弱注册及前后健康门全部保留。
+            let directory = self.directory(&proof)?; // Keep real directory reads and live-font/health checks.
             if directory.facts.source_utf16.start != offset
                 || !directory.facts.source_utf16.contains(&offset)
             {
@@ -1220,7 +1279,8 @@ impl GlyphStore {
         self.finish(result)
     }
 
-    /// item目录封口只证明派生数据不可再写，不表示任何软行、行高或Native几何Ready。
+    /// Sealing item directories proves only that derived records are immutable,
+    /// not that soft lines, heights, or Native geometry are Ready.
     #[cfg(test)]
     pub(super) fn seal_items(&mut self) -> Result<()> {
         let result = (|| {
@@ -1238,7 +1298,8 @@ impl GlyphStore {
         self.finish(result)
     }
 
-    /// 输出可能已写入候选前缀才失败；调用方只能在完整Ok后发布整个batch。
+    /// Failure may follow writes into the candidate output slice. Callers may
+    /// publish the complete batch only after full success.
     #[cfg(test)]
     pub(super) fn glyphs(
         &mut self,
@@ -1262,7 +1323,7 @@ impl GlyphStore {
                 .glyph_start
                 .checked_add(range.end)
                 .ok_or(Error::Overflow)?;
-            let mut rows = [[0; 64]; STEP]; // 固定16KiB栈上候选，没有按item/glyph数增长的分配。
+            let mut rows = [[0; 64]; STEP]; // Fixed 16-KiB candidate, independent of item/glyph count.
             self.index
                 .as_mut()
                 .ok_or(Error::Poisoned)?
@@ -1278,7 +1339,7 @@ impl GlyphStore {
                 }
                 *slot = glyph;
             }
-            self.directory(proof)?; // Native/worker消费前仍是原Source/Font/catalog，没有以IO成功代替权限。
+            self.directory(proof)?; // Actual I/O success cannot replace original Source/font authority.
             Ok(())
         })();
         self.finish(result)
@@ -1297,6 +1358,8 @@ impl GlyphStore {
 }
 
 fn number(value: usize) -> Result<u64> {
+    // On-disk coordinates use fixed-width little-endian integers. Refuse loss of
+    // range rather than silently truncate a platform-sized Source coordinate.
     u64::try_from(value).map_err(|_| Error::Overflow)
 }
 fn small(value: usize) -> Result<u32> {
@@ -1316,6 +1379,8 @@ fn i64_at(bytes: &[u8], offset: usize) -> i64 {
 }
 
 fn encode_glyph(value: MarkdownShapedGlyph) -> Result<[u8; 64]> {
+    // Preserve the actual shaper's ID, flags, global Source cluster, and signed
+    // positions. Leave unused bytes zero for strict same-format read validation.
     let mut row = [0; 64];
     row[..4].copy_from_slice(&value.glyph_id.to_le_bytes());
     row[4..8].copy_from_slice(&value.flags.to_le_bytes());
@@ -1335,6 +1400,8 @@ fn encode_glyph(value: MarkdownShapedGlyph) -> Result<[u8; 64]> {
     Ok(row)
 }
 fn decode_glyph(row: [u8; 64]) -> Result<MarkdownShapedGlyph> {
+    // A record must be the exact original glyph kind with zero reserved bytes;
+    // malformed derived metadata cannot become a drawable glyph.
     if row[56] != GLYPH
         || row[32..56]
             .iter()
@@ -1355,6 +1422,8 @@ fn decode_glyph(row: [u8; 64]) -> Result<MarkdownShapedGlyph> {
     })
 }
 fn encode_cluster(value: &MarkdownGlyphCluster) -> Result<[u8; 64]> {
+    // Keep logical Source/glyph ranges and accumulated signed advances together.
+    // Small range fields are checked before the fixed record is ever appended.
     let mut row = [0; 64];
     for (slot, value) in [
         value.source_utf16.start,
@@ -1384,6 +1453,8 @@ fn encode_cluster(value: &MarkdownGlyphCluster) -> Result<[u8; 64]> {
     Ok(row)
 }
 fn decode_cluster(row: [u8; 64]) -> Result<MarkdownGlyphCluster> {
+    // Authenticate the original record before checking its nonempty Source range,
+    // glyph ordering, and actual missing-glyph count against that glyph range.
     if row[56] != CLUSTER || row[57..].iter().any(|value| *value != 0) {
         return Err(Error::InconsistentCoverage);
     }
@@ -1412,6 +1483,9 @@ fn decode_cluster(row: [u8; 64]) -> Result<MarkdownGlyphCluster> {
     Ok(value)
 }
 fn encode_directory(value: &Directory) -> Result<[[u8; 64]; 3]> {
+    // Seal one item across three fixed adjacent records: Source/glyph/cluster
+    // coverage, original style/font registration, and origin/advance/control facts.
+    // No text bytes, strong owner, or second directory representation is stored.
     let mut rows = [[0; 64]; 3];
     for (slot, value) in [
         value.facts.source_utf16.start,
@@ -1469,10 +1543,12 @@ fn encode_directory(value: &Directory) -> Result<[[u8; 64]; 3]> {
             .unwrap_or(0)
             .to_le_bytes(),
     );
-    // 绘制语义与原item同一固定记录封存；不增加正文、样式表或额外IO记录。
+    // Seal presentation in the same original fixed item record, without another
+    // text copy, style table, or I/O record.
     rows[2][40..44].copy_from_slice(&value.presentation.bits().to_le_bytes());
     rows[2][44..48].copy_from_slice(&value.paragraph_inset_26_6.to_le_bytes());
-    // 两个实际 UBA seam 复用既有目录保留位；不扩大记录或新建按 item 增长的内存索引。
+    // Two actual UBA seam facts reuse spare directory bits. Record size stays fixed
+    // and no per-item in-memory seam index is created.
     for (index, levels) in value.shaping_seams.iter().enumerate() {
         if let Some((left, right)) = levels {
             rows[2][48] |= 1 << index;
@@ -1484,6 +1560,8 @@ fn encode_directory(value: &Directory) -> Result<[[u8; 64]; 3]> {
     Ok(rows)
 }
 fn decode_directory(rows: [[u8; 64]; 3]) -> Result<Directory> {
+    // All three record kinds and reserved fields must match this exact format
+    // before their offsets, flags, or registration slots are interpreted.
     if rows[0][56] != ITEM
         || rows[1][56] != STYLE
         || rows[2][56] != ITEM_END
@@ -1517,6 +1595,8 @@ fn decode_directory(rows: [[u8; 64]; 3]) -> Result<Directory> {
     if rows[2][48] > 3 {
         return Err(Error::InconsistentCoverage);
     }
+    // A seam is valid only for actual glyphs and must preserve the original inside
+    // level. An unset seam bit requires empty payload bits, not a guessed endpoint.
     let mut shaping_seams = [None; 2];
     for (index, seam) in shaping_seams.iter_mut().enumerate() {
         let levels = (rows[2][49 + index * 2], rows[2][50 + index * 2]);
@@ -1524,7 +1604,7 @@ fn decode_directory(rows: [[u8; 64]; 3]) -> Result<Directory> {
             if levels != (0, 0) {
                 return Err(Error::InconsistentCoverage);
             }
-            continue; // 无许可的保留位必须仍为空，不能把损坏目录解释成普通端点。
+            continue; // Corrupt ungranted seam payload cannot become an ordinary endpoint.
         }
         if kind != super::MarkdownComposedLinePartKind::Glyphs
             || levels.0 == levels.1
@@ -1536,6 +1616,8 @@ fn decode_directory(rows: [[u8; 64]; 3]) -> Result<Directory> {
         }
         *seam = Some(levels);
     }
+    // Optional control fields have exact kind-specific encodings. A text item
+    // cannot inherit tab placement or extend coverage from a nearby word certificate.
     let tab_interval = match (rows[1][55], i64_at(&rows[2], 24)) {
         (0, 0) => None,
         (1, value) if value >= 0 => Some(value),
@@ -1554,9 +1636,13 @@ fn decode_directory(rows: [[u8; 64]; 3]) -> Result<Directory> {
             || end > facts.paragraph_utf16.end
     }) {
         return Err(Error::InconsistentCoverage);
-    } // 最后真实短片可等于原词末端；任何consumer仍核同Source/Font/origin，不据数字扩大源覆盖。
+    } // A final real short part may reach its original word end. Consumers still
+    // require same Source/font/origin; the number alone cannot extend coverage.
     let paragraph_inset_26_6 =
         i32::from_le_bytes(rows[2][44..48].try_into().expect("固定4B缩进字段"));
+    // Validate relationships actually consumed by layout: paragraph containment,
+    // real nonempty/control ranges, finite style, original bidi parity/BOT/EOT, and
+    // matching nonzero origins. Font liveness remains a separate catalog check.
     if paragraph_inset_26_6 < 0
         || (facts.source_utf16.is_empty()
             && kind != super::MarkdownComposedLinePartKind::ParagraphBreak)
@@ -1615,6 +1701,8 @@ fn decode_directory(rows: [[u8; 64]; 3]) -> Result<Directory> {
 
 impl From<LayoutIndexError> for Error {
     fn from(error: LayoutIndexError) -> Self {
+        // Keep actual storage I/O as its owned cause. Invalid derived records are
+        // coverage failures; neither kind can be converted to a successful empty page.
         match error {
             LayoutIndexError::InvalidRecord => Self::InconsistentCoverage,
             LayoutIndexError::Overflow => Self::Overflow,

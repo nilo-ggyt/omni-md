@@ -1,4 +1,4 @@
-//! 消费式CPU绘图协议；只有真实有界producer可以签完整tile完成票。
+//! Consuming CPU paint protocol: only an actual bounded producer can certify complete tile output.
 
 use super::*;
 use crate::native_surface::paged_glyph_paint::{
@@ -28,7 +28,7 @@ pub struct NativeMarkdownPagedScenePaintWork {
     pub metadata_records: usize,
 }
 
-/// 每个Pending都归还原状态；失败消费它，调用方不能重放失败的原生绘图。
+/// Pending returns its original state; failure consumes it, so callers cannot replay failed Native painting.
 pub trait NativeMarkdownPagedScenePaintSession {
     fn step(
         self: Box<Self>,
@@ -45,8 +45,8 @@ pub enum NativeMarkdownPagedScenePaintOutcome {
     Complete(NativeMarkdownPagedScenePaintCompletion),
 }
 
-/// 私有完成票线性持有原context，防止地址复用ABA；消费后才归还这份真实像素claim。
-/// SceneKey仍是弱身份，不延长窗口、Source或Font生命期。
+/// The private completion linearly owns its original context to prevent address-reuse ABA; consuming it returns that actual pixel claim.
+/// SceneKey remains weak identity, retaining neither window, Source, nor font lifetime.
 pub struct NativeMarkdownPagedScenePaintCompletion {
     key: Box<NativeMarkdownPagedSceneKey>,
     context: CFRetained<CGContext>,
@@ -62,7 +62,7 @@ impl NativeMarkdownPagedScenePaintCompletion {
         self.work
     }
 
-    /// 接受真实组合器完成票，而非调用者自报的glyph计数或成功布尔值。
+    /// Accept actual composer completion, not caller-declared glyph counts or a success boolean.
     #[cfg(feature = "native-paged-production")]
     pub fn from_composed(
         completion: crate::native_surface::paged_line_viewport::NativeMarkdownComposedViewportPaintCompletion,
@@ -84,8 +84,8 @@ impl NativeMarkdownPagedScenePaintCompletion {
         })
     }
 
-    /// 原Scene消费全部真实Text/Cell完成票后转交同一context；空格背景也在该同步栈实际绘完。
-    /// 此入口仅供native_surface内部装配，公开调用者仍必须提交真实组合器完成票。
+    /// Scene transfers the same context after consuming actual Text/Cell completions; empty-cell backgrounds also finish on that synchronous stack.
+    /// Only native_surface assembly uses this entry; public callers still supply actual composer completion.
     pub(in crate::native_surface) fn from_native_composite(
         key: &NativeMarkdownPagedSceneKey,
         context: CFRetained<CGContext>,
@@ -98,8 +98,8 @@ impl NativeMarkdownPagedScenePaintCompletion {
         }
     }
 
-    /// 有限旧spool适配直接执行唯一真实批次，不能用外部receipt或declaredLimit授权任意scene.paint。
-    /// 原输出必须完整不超过256glyph；长正文必须走可续组合器，不会从此入口循环全文。
+    /// The finite spool adapter executes one actual batch; an external receipt/declaredLimit cannot authorize arbitrary scene.paint.
+    /// Complete original output has at most 256 glyphs; long text uses the resumable composer rather than looping through the document here.
     pub fn paint_finite_spool(
         spool: &mut MarkdownShapedSpool,
         output: &MarkdownShapedSpoolAuthority,
@@ -120,14 +120,14 @@ impl NativeMarkdownPagedScenePaintCompletion {
                     ) => super::super::NativeMarkdownPagedTextViewError::Document(cause),
                     other => super::super::NativeMarkdownPagedTextViewError::ShapedSpool(other),
                 })?;
-        } // 实际原Source/Font/输出健康先于调用者范围拒绝；没有Native或current跨Reader借用。
+        } // Actual original Source/font/output health precedes caller-range rejection; no Native/current crosses a reader borrow.
         if count == 0
             || count > 256
             || request.glyph_range != (0..count)
             || request.source != &key.source
         {
             return Err(super::super::NativeMarkdownPagedTextViewError::InvalidRange);
-        } // 预算和范围来自原输出真实profile，不接受调用者把长spool伪报成小批。
+        } // Budget/range come from the actual output profile; callers cannot present a long spool as a small batch.
         let receipt = paint_paged_spool_glyphs(spool, output, request, context, current).map_err(
             |error| match error.cause {
                 NativeMarkdownPagedGlyphPaintCause::Revoked => {

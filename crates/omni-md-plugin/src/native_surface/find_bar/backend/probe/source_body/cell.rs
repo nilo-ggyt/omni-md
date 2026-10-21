@@ -1,4 +1,5 @@
-//! 原已认证单格直接接同一Body/Source/绘图链；大草稿不经过NSTextField或完整NSString。
+//! Attach the authenticated cell to the same Body/Source/paint chain. Large drafts
+//! pass through neither NSTextField nor a complete-draft NSString.
 
 use super::*;
 use crate::native_surface::paged_input::{
@@ -18,7 +19,8 @@ const SCRATCH: usize = 64 * 1024;
 #[path = "cell/word.rs"]
 mod word;
 
-/// Cell的真实canonical宿主和原提交入口；只有这个owner保活Doc，显示Input仍只持Weak。
+/// The actual cell's canonical owner and original commit entry. This owner keeps
+/// the document alive while presentation Input retains only weak identity.
 pub(super) struct Original {
     document: Rc<RefCell<MarkdownDocumentBuffer>>,
     canonical: Rc<NativeMarkdownPagedInput>,
@@ -27,11 +29,14 @@ pub(super) struct Original {
 }
 
 impl Original {
-    /// 读取原token的真实释放事实；只有提交/取消已完成才允许跳过旧草稿的正常辞任读取。
+    /// Observe actual original-token release. Only completed commit/cancellation
+    /// permits skipping normal resignation reads from an ended draft.
     pub(super) fn has_ended(&self) -> bool {
         self.resources.is_released()
     }
 
+    /// Obtain the cell plan through Core's actual incremental request, then begin
+    /// the same prepared session production uses; no manufactured cell window is supplied.
     pub(super) fn new(document: Rc<RefCell<MarkdownDocumentBuffer>>) -> Result<Self, String> {
         let canonical = NativeMarkdownPagedInput::new(Rc::downgrade(&document))
             .map_err(|cause| cause.to_string())?;
@@ -41,7 +46,8 @@ impl Original {
                 .table_cell_edit_request(0, 1, 0)
                 .map_err(|cause| format!("{cause:?}"))?;
             loop {
-                // 同一个原格用例消费真实结构票和4KiB词法端点，不要求整行Parser或手造窗口。
+                // Consume the original cell's actual structural ticket and 4KiB
+                // lexical endpoints, without full-row parsing or a fabricated window.
                 match request
                     .advance(&doc, false, 4096)
                     .map_err(|cause| format!("{cause:?}"))?
@@ -71,7 +77,8 @@ impl Original {
         })
     }
 
-    /// Body关闭已经取消/提交原token并drain；此时原canonical必须仍活且原映射仍健康。
+    /// Body closure has committed/cancelled and drained the original token. The
+    /// parent canonical document must still be alive with a healthy original mapping.
     pub(super) fn verify_closed(&self) -> Result<(), String> {
         if !self.resources.is_released()
             || self
@@ -101,7 +108,8 @@ fn input(rig: &Rig) -> Result<Rc<NativeMarkdownPagedInput>, String> {
         .ok_or("原Cell Input已释放".into())
 }
 
-/// 只设原Cell真实单选并消费原提交收据；没有为Cell伪造Body多选或离屏可见票。
+/// Set this actual cell's single selection and consume its commit receipt, never
+/// inventing Body multi-selection or offscreen visibility authority.
 fn select(rig: &Rig, range: std::ops::Range<usize>) -> Result<(), String> {
     let input = input(rig)?;
     let before = input.state().map_err(|cause| cause.to_string())?;
@@ -133,6 +141,8 @@ fn unspecified() -> NSRange {
     NSRange::new(objc2_foundation::NSNotFound as usize, 0)
 }
 
+/// Read only the caller's fixed cell-local window through actual Input authority,
+/// keeping the draft independent from its parent canonical document.
 fn local<const N: usize>(rig: &Rig, offset: usize) -> Result<[u16; N], String> {
     let input = input(rig)?;
     let permit = input
@@ -145,17 +155,20 @@ fn local<const N: usize>(rig: &Rig, offset: usize) -> Result<[u16; N], String> {
     Ok(units)
 }
 
-/// 同一活动Scene上的复制必须归还本次临时reader；输出NSData独立于原Cell生命周期。
+/// Copying from the active Scene returns its temporary reader. Output NSData is
+/// independently owned and must remain readable after the original cell ends.
 struct Copied {
     board: Retained<NSPasteboard>,
     data: Retained<objc2_foundation::NSData>,
 }
 impl Drop for Copied {
     fn drop(&mut self) {
-        release_board(&self.board); // 后续任一步失败也只清理本case自有板，输出NSData随后真实Drop。
+        release_board(&self.board); // Later failure clears only this case's board; output NSData then drops through its owner.
     }
 }
 
+/// Copy through the actual Body to a unique private board, verifying exact bytes
+/// and unchanged Input/Scene/reader facts before transferring output ownership.
 fn copy(rig: &Rig, large: bool) -> Result<Copied, String> {
     let original = rig.cell.as_ref().ok_or("缺少原Cell owner")?;
     let input = input(rig)?;
@@ -165,12 +178,15 @@ fn copy(rig: &Rig, large: bool) -> Result<Copied, String> {
         .view
         .capture_ready_scene_key()
         .map_err(|cause| cause.to_string())?;
-    let board = NSPasteboard::pasteboardWithUniqueName();
+    // Record this owned name before publication so interrupted controls remain
+    // cleanable; Copied keeps the normal lifetime and exact-output checks below.
+    let board = private_pasteboard()?;
     let result = (|| {
         rig.body
             .copy_source_selection_to(&key.request, &board)
             .map_err(|cause| cause.to_string())?;
-        // SAFETY: 标准静态UTI与生产发布入口相同，不使用general board。
+        // SAFETY: Use production's same static plain-text type on this private
+        // pasteboard, never the user's general board.
         let data = board
             .dataForType(unsafe { NSPasteboardTypeString })
             .ok_or("原Cell复制没有NSData")?;
@@ -197,18 +213,19 @@ fn copy(rig: &Rig, large: bool) -> Result<Copied, String> {
 }
 
 fn verify_output(data: &objc2_foundation::NSData, large: bool) -> Result<(), String> {
-    let expected = if large { LARGE } else { 3 }; // 小样本只选中“你”，大样本是实际两MiB ASCII草稿。
+    let expected = if large { LARGE } else { 3 }; // The short selection is one Chinese scalar; the large draft is actual 2MiB ASCII.
     if data.length() != expected {
         return Err("原Cell输出UTF8长度不符".into());
     }
-    // SAFETY: Retained NSData由调用者覆盖本同步借用；不发任何修改data的Native消息。
+    // SAFETY: The caller's retained NSData outlives this synchronous read; send
+    // no Native message that could mutate its bytes.
     let bytes = unsafe { data.as_bytes_unchecked() };
     if large {
         for chunk in bytes.chunks(SCRATCH) {
             if chunk.iter().any(|byte| *byte != b'x') {
                 return Err("原Cell大草稿输出字节不符".into());
             }
-        } // 固定片检查，不构造第二份整格expected/String/NSString。
+        } // Fixed chunk comparison creates no second complete-cell expected String/NSString.
     } else if bytes != "你".as_bytes() {
         return Err("原Cell部分复制没有保持Unicode".into());
     }
@@ -217,12 +234,14 @@ fn verify_output(data: &objc2_foundation::NSData, large: bool) -> Result<(), Str
 
 fn release_board(board: &NSPasteboard) {
     board.clearContents();
-    // SAFETY: 只归还本case自己创建的唯一私有板，绝不改变用户general board。
+    // SAFETY: Release only this case's uniquely named owned board, never the user's general board.
     unsafe {
         let _: () = objc2::msg_send![board, releaseGlobally];
     }
 }
 
+/// Cell-local edits must leave the fixed parent document and its character history
+/// untouched until the explicit canonical commit.
 fn unchanged(rig: &Rig) -> Result<(), String> {
     let original = rig.cell.as_ref().ok_or("缺少原Cell owner")?;
     let doc = original.document.borrow();
@@ -243,7 +262,8 @@ fn unchanged(rig: &Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 同一canonical原位接收两MiB草稿；固定4KiB缓冲逐块核全文，不创建整格或整篇expected副本。
+/// Verify the same canonical document after accepting the 2MiB draft. Fixed 4KiB
+/// scratch reads compare all contents without a complete-cell/document expected copy.
 fn verify_large_canonical(original: &Original, generation: u64) -> Result<(), String> {
     let (prefix, suffix) = SOURCE.split_once("seed").expect("固定夹具含唯一原格");
     let prefix_units = prefix.encode_utf16().count();
@@ -260,7 +280,8 @@ fn verify_large_canonical(original: &Original, generation: u64) -> Result<(), St
     }
     let mut units = [0_u16; 2048];
     for (offset, expected) in [(0, prefix), (prefix_units + LARGE, suffix)] {
-        // 两端仍须逐unit一致，不能只核中间x而漏掉邻格、分隔符或原EOL损坏。
+        // Compare both ends unit for unit, so checking middle x characters cannot
+        // conceal damaged neighboring cells, separators, or original line endings.
         let length = expected.encode_utf16().count();
         document
             .copy_utf16_code_units(offset, &mut units[..length])
@@ -270,7 +291,8 @@ fn verify_large_canonical(original: &Original, generation: u64) -> Result<(), St
         }
     }
     for offset in (0..LARGE).step_by(units.len()) {
-        // 包括首、中、尾的每一块都读取同一canonical；失败直接保原Source错误，不降为抽样通过。
+        // Every block, including start/middle/end, reads the same canonical source;
+        // preserve read failure instead of downgrading full verification to sampling.
         let length = units.len().min(LARGE - offset);
         document
             .copy_utf16_code_units(prefix_units + offset, &mut units[..length])
@@ -282,7 +304,8 @@ fn verify_large_canonical(original: &Original, generation: u64) -> Result<(), St
     Ok(())
 }
 
-/// 活动端必须真实可见；折叠选择核插入线，原非空选择核高亮，均对照同一实际CPU挂载图。
+/// The active head must actually be visible. Compare insertion-line pixels for a
+/// caret or highlight pixels for a nonempty selection against the same actual CPU mount.
 fn selection_pixels(
     rig: &Rig,
     stage: &str,
@@ -341,13 +364,14 @@ fn selection_pixels(
     CGContext::set_rgb_fill_color(Some(&mask.context), 1.0, 0.0, 0.0, 1.0);
     if primary.length == 0 {
         let mut rect = proof.first_rect();
-        rect.size.width = 1.0; // 真实caret允许零宽；生产Scene也在同位置绘制1pt插入线。
+        rect.size.width = 1.0; // Actual caret geometry permits zero width; production paints its insertion line at 1pt.
         CGContext::fill_rect(Some(&mask.context), rect);
     } else {
         let end = primary.location + primary.length;
         let mut cursor = primary.location;
         while cursor < end {
-            // first_rect按原契约只返回首GCB，不把单字几何伪装整个选区；seed最多四个真实GCB。
+            // first_rect returns only the first grapheme, not geometry for the
+            // entire requested selection; this seed has at most four graphemes.
             let first = scene
                 .first_rect(NSRange::new(cursor, end - cursor))
                 .map_err(|cause| cause.to_string())?;
@@ -361,7 +385,8 @@ fn selection_pixels(
     }
     let bounds = rig.view.bounds();
     let backing = rig.view.layer().ok_or("原Cell缺少实际CPU backing")?;
-    // SAFETY: 本同步栈保活实际主线程CALayer；仅沿原View挂载读取子关系，不创建影子产品图。
+    // SAFETY: This stack keeps the actual main-thread CALayer alive. Observe its
+    // existing view-mounted children without constructing a shadow product graph.
     let children = unsafe { backing.sublayers() }.ok_or("原Cell没有CPU挂载")?;
     if children.len() != 1 {
         return Err("原Cell不是唯一CPU挂载".into());
@@ -381,7 +406,7 @@ fn selection_pixels(
     scene
         .validate_ready(&current)
         .map_err(|cause| cause.to_string())?;
-    let selection_color = selection::selection_pixel()?; // 原独立Native颜色校准，不以手算整数猜选择色。
+    let selection_color = selection::selection_pixel()?; // Independent actual Native calibration, not guessed integer colors.
     let mut locations = 0;
     let mut ink = 0;
     let mut mismatch = None;
@@ -396,7 +421,7 @@ fn selection_pixels(
     {
         if *marker != [255, 0, 0, 255] {
             continue;
-        } // 只比较独立Native遮罩内的真实可见caret，不取全文图。
+        } // Compare only actual visible caret/selection pixels within the independent mask, never a full-document image.
         locations += 1;
         ink += usize::from(if primary.length == 0 {
             expected[3] == 255 && expected[..3].iter().any(|value| *value < 255)
@@ -424,7 +449,8 @@ fn selection_pixels(
     Ok(key)
 }
 
-/// 格式动作经实际View入口触发，再以新Source完整CPU帧核局部选择与历史；不走裸Input代替产品调用。
+/// Format through the actual view entry, then verify local selection/history in
+/// the new Source's complete CPU frame; bare Input cannot substitute for the product action.
 fn format_selection(rig: &Rig) -> Result<(), String> {
     let selected = observe(&rig.body)?;
     select(rig, 0..1)?;
@@ -459,7 +485,7 @@ fn format_selection(rig: &Rig) -> Result<(), String> {
     {
         return Err("View格式没有形成原Cell新Source/选中inner，或无故改变原视口".into());
     }
-    unchanged(rig)?; // 格式只能进入原Cell本地历史，不提前改canonical或邻格。
+    unchanged(rig)?; // Formatting affects cell-local history only, never parent canonical text or neighboring cells early.
     for (selector, stage, formatted) in [
         (sel!(undo:), "cell_format_undo", false),
         (sel!(redo:), "cell_format_redo", true),
@@ -504,9 +530,11 @@ fn format_selection(rig: &Rig) -> Result<(), String> {
         selection_pixels(rig, stage, selection)?;
         unchanged(rig)?;
     }
-    // 其余行内动作也必须经同一个View和真实完整帧；单独的Core标记测试不能证明渲染和选区正确。
+    // Other inline actions also use the same actual view/frame. Core marker
+    // tests alone cannot establish rendering and selection behavior.
     format_inline_variants(rig)?;
-    // 回到旧短样本的原caret，再继续既有IME和两MiB负载；不修改后续输入/EOF/关闭门。
+    // Restore the short fixture's caret before existing composition-protocol and
+    // 2MiB scenarios, preserving subsequent input/EOF/close requirements.
     let restored = observe(&rig.body)?;
     select(rig, 1..1)?;
     frame::wait_complete_frame("cell_format_restored_caret", &rig.body, restored)?;
@@ -518,7 +546,8 @@ fn format_selection(rig: &Rig) -> Result<(), String> {
     unchanged(rig)
 }
 
-/// 固定短夹具覆盖其余日常行内格式；每次单步Undo还原原中文，不复制或缩小后续大草稿。
+/// Cover remaining everyday inline formats with the fixed short fixture. One Undo
+/// restores original Chinese text without copying or shrinking the later large draft.
 fn format_inline_variants(rig: &Rig) -> Result<(), String> {
     use MarkdownFormatAction as Action;
     for (action, expected, opening_units, stage) in [
@@ -528,7 +557,8 @@ fn format_inline_variants(rig: &Rig) -> Result<(), String> {
         (Action::InlineCode, "`你`", 1, "cell_format_inline_code"),
         (Action::Link, "[你](https://)", 1, "cell_format_link"),
     ] {
-        // 上次真实Undo应仍选中原中文；每个动作都从同一个局部状态取得新权限，不能继承旧Scene。
+        // Previous actual Undo must retain selection of the original Chinese
+        // character; acquire each action's authority from that state, not an old Scene.
         let before = selection_pixels(
             rig,
             stage,
@@ -550,7 +580,8 @@ fn format_inline_variants(rig: &Rig) -> Result<(), String> {
                 head_utf16: opening_units + 1,
             },
         )?;
-        // 只读取固定短结果到16单位栈块；真实正文、邻格和全部标记均不能由画面或格式器自身反推。
+        // Read the fixed short result into 16 stack units; neither pixels nor the
+        // formatter under test can supply expected text, neighboring cells, or markers.
         let input = input(rig)?;
         let current = |epoch| epoch == EPOCH;
         let permit = input
@@ -570,9 +601,10 @@ fn format_inline_variants(rig: &Rig) -> Result<(), String> {
         {
             return Err(format!("{stage}: 行内格式的实际源、选区或视口不符"));
         }
-        unchanged(rig)?; // 局部格式不能提前污染canonical或正文历史。
+        unchanged(rig)?; // Local formatting cannot alter parent canonical text/history before commit.
 
-        // 实际Undo必须一次还原全部首尾标记；随后检查同一个CPU挂载中的中文选区，而非只核模型长度。
+        // Actual Undo restores all opening/closing markers in one action, followed
+        // by Chinese-selection pixels in the same CPU mount, not just model length.
         let undone = observe(&rig.body)?;
         rig.view
             .command(sel!(undo:))
@@ -601,6 +633,9 @@ fn format_inline_variants(rig: &Rig) -> Result<(), String> {
     Ok(())
 }
 
+/// Exercise the actual cell protocol, local formatting/history, selected copy,
+/// and large-draft commit/cancellation. Direct marked-text protocol delivery does
+/// not independently verify a system IME candidate window or physical typing.
 fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
     let first = rig
         .view
@@ -609,11 +644,13 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
     if first.request.input.utf16_len != 4 || local::<4>(rig, 0)? != [115, 101, 101, 100] {
         return Err("原Cell首次真实完整帧没有读取seed单格".into());
     }
-    // 原NSTextInputClient先逐次marked候选，再确认中文；每次只借固定小载荷，不写canonical。
+    // Deliver successive marked values and then committed Chinese through the
+    // actual NSTextInputClient, using fixed payloads without writing parent canonical text.
     select(rig, 0..4)?;
     let before_ime = rig.view.input_state().map_err(|cause| cause.to_string())?;
     for candidate in ["n", "ni"] {
-        // SAFETY: 真实View/Input保活；选区相对有限marked载荷，NSNotFound消费原Cell选区。
+        // SAFETY: Actual view/Input remain alive. The marked selection is within
+        // its bounded payload; NSNotFound consumes the original cell selection.
         unsafe {
             client(rig).setMarkedText_selectedRange_replacementRange(
                 &NSString::from_str(candidate),
@@ -623,7 +660,7 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
         }
     }
     let ime = observe(&rig.body)?;
-    // SAFETY: 与上方同一实际client确认输入，载荷仅一个中文scalar。
+    // SAFETY: Commit one Chinese scalar through the same actual client used above.
     unsafe {
         client(rig).insertText_replacementRange(&NSString::from_str("你"), unspecified());
     }
@@ -640,13 +677,15 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
     }
     selection_pixels(rig, "cell_ime_caret", MarkdownTextSelection::caret(1))?;
     unchanged(rig)?;
-    // 同一原生标准命令只操作局部历史，不允许冒泡到canonical或建立第二Undo manager。
+    // Standard Native commands operate only local history, without bubbling into
+    // parent canonical history or constructing another undo manager.
     for (selector, stage) in [
         (sel!(undo:), "cell_local_undo"),
         (sel!(redo:), "cell_local_redo"),
     ] {
         let frame = observe(&rig.body)?;
-        // SAFETY: 真实NSTextInputClient把标准selector交同一View命令入口，没有新快捷键。
+        // SAFETY: Actual NSTextInputClient delivers a standard selector to this
+        // same view's command entry, adding no shortcut.
         unsafe {
             client(rig).doCommandBySelector(selector);
         }
@@ -672,7 +711,8 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
     }
     format_selection(rig)?;
     let marked = observe(&rig.body)?;
-    // SAFETY: 有限同字marked输入仍是实际IME路径；后续cancelOperation只能unmark，不关闭Cell。
+    // SAFETY: This bounded marked-text value uses the actual input protocol.
+    // The following cancelOperation must only unmark, not close the cell session.
     unsafe {
         client(rig).setMarkedText_selectedRange_replacementRange(
             &NSString::from_str("你"),
@@ -699,7 +739,8 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
     }
     let context = observe(&rig.body)?;
     select(rig, 0..1)?;
-    // SAFETY: 真实原生入口先形成含前后邻字的有限草稿，避免整格复制也能通过部分复制期待。
+    // SAFETY: The actual Native entry creates a bounded draft with surrounding
+    // text, so copying the whole cell could not satisfy partial-copy expectations.
     unsafe {
         client(rig).insertText_replacementRange(&NSString::from_str("前你后"), unspecified());
     }
@@ -722,7 +763,8 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
     if local::<3>(rig, 0)? != [0x524d, 0x4f60, 0x540e] {
         return Err("原Cell删除Undo没有恢复前你后".into());
     }
-    // 删除Undo恢复的是原非空选择，活动端仍由同receipt reveal；这里只核范围真实可见，不伪caret。
+    // Undo restores an actual nonempty selection. Reveal its active head through
+    // the same receipt rather than inventing a collapsed caret.
     let restored_key = rig
         .view
         .capture_ready_scene_key()
@@ -739,15 +781,16 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
     drop(copy(rig, false)?);
 
     let large = observe(&rig.body)?;
-    select(rig, 0..3)?; // 下一次真实输入替换完整有限旧草稿，保留两MiB负载的纯x精确期待。
-    let payload = NSString::from_str(&"x".repeat(SCRATCH)); // 唯一固定64KiB新输入载荷，不读取或复制旧草稿。
+    select(rig, 0..3)?; // Replace the complete bounded old draft, preserving the later 2MiB fixture's exact all-x expectation.
+    let payload = NSString::from_str(&"x".repeat(SCRATCH)); // One fixed 64KiB new-input payload, with no old-draft read/copy.
     for _ in 0..LARGE / SCRATCH {
-        // SAFETY: 原client每次消费当前实际选区；第一次替换中文，后续追加同一固定载荷。
+        // SAFETY: The original client consumes its actual selection each time;
+        // first replace Chinese, then append the same fixed payload.
         unsafe {
             client(rig).insertText_replacementRange(&payload, unspecified());
         }
     }
-    drop(payload); // 新输入载荷在等待首帧前归还，产品仅保原delta段。
+    drop(payload); // Return the input payload before frame waiting; product storage retains only its actual delta segments.
     frame::wait_complete_frame("cell_two_mebibyte_eof_frame", &rig.body, large)?;
     let eof = selection_pixels(
         rig,
@@ -767,7 +810,8 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
         }
     }
     unchanged(rig)?;
-    // 真实标准端点命令沿同一大草稿Source往返，不能靠整段重读或文首前缀冒充EOF。
+    // Standard endpoint commands travel through the same large-draft Source.
+    // A whole-paragraph reread or document-start prefix cannot stand in for EOF.
     for (selector, stage, head) in [
         (sel!(moveToBeginningOfDocument:), "cell_document_start", 0),
         (sel!(moveToEndOfDocument:), "cell_document_end", LARGE),
@@ -795,7 +839,8 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
         original.resources.snapshot()
     );
     if cancel {
-        // 真实取消只结束原Cell；关闭由统一Rig释放检查承担，不向用户要求退出应用。
+        // Actual cancellation ends only the original cell. The shared Rig verifies
+        // final closure without requiring the user to quit an application.
         rig.view
             .command(sel!(cancelOperation:))
             .map_err(|cause| cause.to_string())?;
@@ -805,7 +850,8 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
         unchanged(rig)?;
         return Ok(Some(output));
     }
-    // 完整长草稿保持原样进入实际提交；不能先缩短再把小格成功冒充大格已经可保存。
+    // Commit the intact large draft. Shrinking it first would not establish that
+    // the actual large cell can be committed.
     rig.remember_receipt()?;
     let original = rig.cell.as_ref().ok_or("原Cell owner已释放")?;
     let before = original
@@ -853,7 +899,7 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
         let len = doc.utf16_len();
         if len != SOURCE.encode_utf16().count() {
             return Err("一次Undo没有恢复原有限canonical长度".into());
-        } // 先核真实长度，再借有限原文缓冲；失败不能越界读取或分配长篇副本。
+        } // Verify length before the fixed original-text buffer; never read out of bounds or allocate a long copy on failure.
         doc.copy_utf16_code_units(0, &mut restored[..len])
             .map_err(|cause| cause.to_string())?;
         if doc.generation() != 2
@@ -894,6 +940,8 @@ fn exercise(rig: &mut Rig, cancel: bool) -> Result<Option<Copied>, String> {
     Ok(Some(output))
 }
 
+/// Run actual commit and cancel variants in sequence. Keep the independent copy
+/// output through strict resource release, then verify it remains readable before clearing it.
 pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
     for cancel in [false, true] {
         let (retirement, result, output) = autoreleasepool(|_| -> Result<_, String> {
@@ -906,12 +954,13 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
                 Ok(output) => (Ok(()), output),
                 Err(cause) => (Err(cause), None),
             };
-            let retirement = release::close(rig, false)?;
+            let retirement = release::close(rig)?;
             Ok((retirement, result, output))
         })?;
-        retirement.verify(false)?;
+        retirement.verify()?;
         if let Some(output) = output {
-            // 原Doc/Cell/Reader/Native图已实际归还，用户显式输出仍必须保持完整可读。
+            // Original document/cell/readers/Native graph have actually released;
+            // the explicitly copied output must still be complete and readable.
             let retained = verify_output(&output.data, true);
             drop(output);
             retained?;

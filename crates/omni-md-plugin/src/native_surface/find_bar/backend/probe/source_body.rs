@@ -1,10 +1,10 @@
-//! 原FindBar经真实Body/Composer完成远端定位；不复用PendingPort或有限替身Scene。
+//! Exercise original FindBar navigation through the actual Body/Composer for remote
+//! targets, without a substitute reveal port or limited Scene implementation.
 
 use super::*;
 use crate::native_surface::paged_body::{
     NativeMarkdownPagedBody, NativeMarkdownPagedBodyColors, NativeMarkdownPagedBodyConfiguration,
-    NativeMarkdownPagedBodyPaintObserver, NativeMarkdownPagedBodyPreparationProbe,
-    NativeMarkdownPagedBodyPreparationResources, NativeMarkdownPagedBodyProgress,
+    NativeMarkdownPagedBodyPaintObserver, NativeMarkdownPagedBodyProgress,
     NativeMarkdownPagedBodyResourceReceipts,
 };
 use crate::native_surface::text_attributes::native_markdown_document_fixed_font;
@@ -39,6 +39,30 @@ use frame::{observe, wait_frame};
 
 const EPOCH: u64 = 83;
 
+/// Publish a recoverable identity before creating this control's private system
+/// resource. A watchdog can release only this exact name after an aborted child;
+/// neither this process nor its cleanup owner reads the user's general board.
+fn private_pasteboard() -> Result<Retained<NSPasteboard>, String> {
+    use std::io::Write;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|cause| cause.to_string())?
+        .as_nanos();
+    let name = format!("omni-md-find-{}-{timestamp}", std::process::id());
+    // Flush the name before the first Native allocation. An output failure must
+    // leave no anonymous board whose ownership disappears with the test process.
+    let mut output = std::io::stdout().lock();
+    writeln!(output, "native_body_find private_pasteboard_name={name}")
+        .and_then(|()| output.flush())
+        .map_err(|cause| cause.to_string())?;
+    drop(output); // Never retain the output lock across a reentrant Native call.
+    Ok(NSPasteboard::pasteboardWithName(&NSString::from_str(&name)))
+}
+
+/// One synthetic fixture owns its actual window, Body, Input/view, and observations.
+/// Weak document identity prevents this harness from concealing document retention;
+/// explicit close verifies resources before the owned temporary file is removed.
 struct Rig {
     body: Rc<NativeMarkdownPagedBody>,
     view: Rc<Retained<NativeMarkdownPagedTextView>>,
@@ -54,20 +78,19 @@ struct Rig {
     cell: Option<cell::Original>,
     _file: tempfile::NamedTempFile,
     requests: Vec<Rc<NativeMarkdownPagedFindRevealRequest>>,
-    errors: Vec<NativeMarkdownFindExecutionError>,
     receipts: Vec<NativeMarkdownPagedBodyResourceReceipts>,
-    retired: Vec<NativeMarkdownPagedBodyPreparationResources>,
 }
 
 impl Rig {
     fn new(mtm: MainThreadMarker) -> Result<Self, String> {
-        metrics::sample("before_rig")?; // 只查当前进程公开内核字段，不读取Source或Native图。
+        metrics::sample("before_rig")?; // Read this process's public kernel fields, never Source or the Native graph.
         let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
         fixture::write(&mut file)?;
         Self::attach_fixture(mtm, file, fixture::UTF16, 1)
     }
 
-    /// 两种固定输入共享同一实际装配与失败清理；没有第二Input、替身Scene或并存的Rig。
+    /// Fixed input variants share actual assembly and failure cleanup, without a
+    /// second Input, substitute Scene, or simultaneously resident Rig.
     fn attach_fixture(
         mtm: MainThreadMarker,
         file: tempfile::NamedTempFile,
@@ -77,7 +100,8 @@ impl Rig {
         Self::attach_target(mtm, file, expected_utf16, expected_lines, false)
     }
 
-    /// 正文和原Cell会话共用唯一窗口、Input/View/Viewport装配；Cell只额外持原canonical owner。
+    /// Body and actual cell sessions share one window/Input/view/viewport assembly;
+    /// the cell alone additionally retains its original canonical owner.
     fn attach_target(
         mtm: MainThreadMarker,
         file: tempfile::NamedTempFile,
@@ -96,8 +120,10 @@ impl Rig {
         )
     }
 
-    /// 新RootLeaf控制显式InlinePreview；expected_complete来自固定夹具要求，长文首屏仍只允许真实前缀。
-    /// 所有旧Body/Cell构造继续同一Source入口，不用当前progress反算期望或为了测试强迫全文准备。
+    /// RootLeaf explicitly requests InlinePreview. Fixture requirements determine
+    /// expected completeness; a long document's first frame still permits only a
+    /// genuine prefix. Body/cell construction uses the same Source entry rather
+    /// than deriving expectations from current progress or forcing full preparation.
     fn attach_mode(
         mtm: MainThreadMarker,
         file: tempfile::NamedTempFile,
@@ -126,12 +152,14 @@ impl Rig {
             .transpose()?;
         let ledger = Rc::new(NativeMarkdownOwnedLedger::default());
         let panel = NativeMarkdownPanel::new(mtm);
-        // SAFETY: 本控制保留原Retained到close之后，防止系统额外释放同一claim。
+        // SAFETY: This control retains its own panel claim through close; AppKit
+        // must not additionally release the same claim on closure.
         unsafe { panel.setReleasedWhenClosed(false) };
         panel.setContentSize(NSSize::new(720.0, 348.0));
         let controller = NativeMarkdownController::new(&ledger, &panel, mtm);
         let lease = crate::native_surface::probe::ProbeEditingOwnerLease::new(&controller)?;
-        // 原controller在Rig内持活，使用正式公开provider路由，真实查询不能退回系统默认字段编辑器。
+        // The Rig keeps its controller alive and uses the production provider
+        // route; query input must not fall back to a system-default field editor.
         panel.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
         let bounds = NSRect::new(NSPoint::ZERO, NSSize::new(720.0, 348.0));
         let parent = NSView::initWithFrame(NSView::alloc(mtm), bounds);
@@ -149,7 +177,8 @@ impl Rig {
         panel.setContentView(Some(&parent));
         let bar = NativeMarkdownFindBar::new(&controller, &ledger, Rc::downgrade(&document), mtm)?;
         bar.show(&scroll, true, &controller)?;
-        // Rig 与真实编辑器共用同一文稿角色工厂；不能用 UI fallback 代替生产字体接受几何对照。
+        // Use the production document-font role factory, never a UI fallback
+        // that would invalidate font and geometry comparisons.
         let font = native_markdown_document_fixed_font(14.0).map_err(|cause| cause.to_string())?;
         let paragraph = NSParagraphStyle::defaultParagraphStyle();
         let configuration = NativeMarkdownPagedBodyConfiguration {
@@ -165,6 +194,8 @@ impl Rig {
                 caret: [0.0, 0.0, 0.0, 1.0],
             },
         };
+        // Attach the actual cell session when requested; otherwise the Body owns
+        // this same canonical document. Both paths share the Native resource graph.
         let body = if let Some(cell) = &cell {
             NativeMarkdownPagedBody::attach_cell(
                 cell.session.clone(),
@@ -185,7 +216,9 @@ impl Rig {
             )
         }
         .map_err(|cause| cause.to_string())?;
-        drop(document); // Cell由显式原owner保活，Body由自身保活，不能让局部变量遮住释放缺口。
+        // Leave lifetime responsibility with the cell/Body owner; a local strong
+        // document reference must not hide a production release defect.
+        drop(document);
         let view = body.view().map_err(|cause| cause.to_string())?;
         ledger.include("body-find.panel", &panel)?;
         ledger.include("body-find.controller", &controller)?;
@@ -194,7 +227,7 @@ impl Rig {
         ledger.include("body-find.view", &view)?;
         let first = observe(&body)?;
         panel.orderFrontRegardless();
-        panel.makeFirstResponder(Some(&**view)); // 原输入字段正常辞任，不保留隐藏正文或第二输入owner。
+        panel.makeFirstResponder(Some(&**view)); // Resign the previous field normally; retain no hidden body or second Input owner.
         panel.displayIfNeeded();
         let mut rig = Self {
             body,
@@ -211,9 +244,7 @@ impl Rig {
             cell,
             _file: file,
             requests: Vec::new(),
-            errors: Vec::new(),
             receipts: Vec::new(),
-            retired: Vec::new(),
         };
         let first_result = if expected_complete {
             frame::wait_complete_frame("cell_first_frame", &rig.body, first)
@@ -221,12 +252,15 @@ impl Rig {
             wait_frame("first_frame", &rig.body, first)
         };
         if let Err(cause) = first_result.and_then(|_| rig.remember_receipt()) {
-            let _ = release::close(rig, false); // 构造失败也先真正拆掉窗口/正文，不留合成控制图。
+            // Failed first-frame preparation must still dismantle the actual window/Body.
+            let _ = release::close(rig);
             return Err(cause);
         }
         Ok(rig)
     }
 
+    /// Measure the actual synchronous action separately from later composer work.
+    /// Diagnostics use existing kernel/pixel observers and acquire no new source.
     fn action(
         &self,
         action: MarkdownFindAction,
@@ -240,14 +274,14 @@ impl Rig {
             "native_body_find synchronous_action={action:?} pixel_stage=before_execute pixel_snapshot={:?} whole_product=false formal=false",
             pixels.snapshot()
         );
-        let started = Instant::now(); // 只量本次真实同步动作，不读取正文或为续体重捕Source。
+        let started = Instant::now(); // Time this action only; no text read or Source recapture for its continuation.
         let result = self.body.execute_paged_find_action(
             &self.bar,
             &self.controller,
             self.controller.find_input_intent(),
             action,
         );
-        let elapsed = started.elapsed(); // 先固定原execute耗时，再查询公开内核和原像素原子账。
+        let elapsed = started.elapsed(); // Fix action duration before sampling kernel fields or existing pixel atomics.
         let outcome = match &result {
             Ok(NativeMarkdownFindExecution::Pending(_)) => "pending",
             Ok(NativeMarkdownFindExecution::Complete) => "complete",
@@ -266,6 +300,8 @@ impl Rig {
         result
     }
 
+    /// Retain the actual Body's existing resource observations for close-time
+    /// verification without creating another ownership graph.
     fn remember_receipt(&mut self) -> Result<(), String> {
         self.receipts.push(
             self.body
@@ -275,6 +311,8 @@ impl Rig {
         Ok(())
     }
 
+    /// Read exactly the caller's fixed synthetic oracle window, never an entire
+    /// document. End the document borrow before any later Native operation.
     fn copy<const N: usize>(&self, start: usize) -> Result<[u16; N], String> {
         let document = self.document.upgrade().ok_or("原Find文档已释放")?;
         let mut units = [0; N];
@@ -282,40 +320,40 @@ impl Rig {
             .borrow()
             .copy_utf16_code_units(start, &mut units)
             .map_err(|cause| cause.to_string())?;
-        Ok(units) // 原Doc借用到此结束，调用方随后才可进入Native字段/窗口。
+        Ok(units) // The original document borrow ends before the caller accesses Native fields/windows.
     }
 }
 
 pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
-    // 每个控制在完整资源门后才开始下一个owner lease；没有同时存在的第二Body/Doc。
+    // Begin each owner lease only after the preceding control passes full resource
+    // release; no second Body/document is resident concurrently.
     let (retirement, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut rig = Rig::new(mtm)?;
         let result = cases::run(&mut rig);
         let pending = release::hold_target_fixture_pending(&mut rig);
-        let retirement = release::close(rig, false)?;
-        Ok((retirement, pending.and(result))) // 准备失败仍先拆图和核全部资源，不能提前遗留原Rig。
+        let retirement = release::close(rig)?;
+        Ok((retirement, pending.and(result))) // Preparation failure still dismantles and verifies the original Rig first.
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     result?;
-    navigation::run(mtm)?; // 原四MiB完整图已严格释放，才创建独立65,529B导航样本。
-    interleave::run(mtm)?;
-    table_edge::run(mtm)?; // 巨行边缘真实回退及严格释放完成后，才创建下一份RootLeaf文稿。
-    root_leaf::run(mtm)?; // 独立Rig先完成Root语义帧及严格释放，不依赖后继Cell EOF结果。
-    cell::run(mtm)?; // 原Body与RootLeaf已归还，才用同装配实测独立Cell Source及大草稿。
+    navigation::run(mtm)?; // Strictly release the 4MiB graph before creating the separate 65,523-byte navigation fixture.
+    table_edge::run(mtm)?; // Complete actual huge-row fallback and strict release before the RootLeaf fixture.
+    root_leaf::run(mtm)?; // Root semantic frames and release stand independently of later cell EOF results.
+    cell::run(mtm)?; // After Body/RootLeaf release, reuse assembly for independent cell Source and large-draft controls.
     Ok(())
 }
 
-/// 独立诊断g+1事务，不能绕过原fullSequence或据此称远端/整产品已经通过。
+/// Diagnose generation-plus-one transactions independently. This cannot bypass the
+/// full sequence or establish remote-navigation/whole-product acceptance.
 pub(super) fn run_transactions(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut rig = Rig::new(mtm)?;
         let result = cases::transactions(&mut rig);
         let pending = release::hold_target_fixture_pending(&mut rig);
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, pending.and(result)))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     result?;
-    interleave::run(mtm)?;
     Ok(())
 }

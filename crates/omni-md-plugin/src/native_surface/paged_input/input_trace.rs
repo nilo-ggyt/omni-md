@@ -1,4 +1,4 @@
-//! 正式分页输入只保原有限追踪payload；观察不读取正文、不持Doc或Native资源。
+//! Production paged input retains only bounded trace payload; observation reads no text and owns no document/Native resource.
 
 use super::*;
 use crate::native_input_trace::{NativeInputTrace, SharedNativeInputTrace};
@@ -6,7 +6,7 @@ use crate::native_surface::input_trace::native_input_trace_now;
 use crate::{NativeInputTraceAccessError, NativeInputTraceDocument, NativeInputTraceRejection};
 
 impl NativeMarkdownPagedInput {
-    /// 真实Source客户的arm只接当前状态；组合中、已关闭或借用中的输入都不能另起证据区间。
+    /// Arm only the current Source client; composition, closure, or a busy input cannot start another evidence interval.
     pub(in crate::native_surface) fn arm_input_trace(
         &self,
         ticks: u64,
@@ -21,7 +21,7 @@ impl NativeMarkdownPagedInput {
         }
         if self.is_cell() {
             return Err(NativeInputTraceAccessError::SourceRequired);
-        } // 局部格的版本与canonical不同，不能给Source追踪混入另一坐标域。
+        } // Cell versions differ from canonical versions; do not mix local coordinates into the Source trace.
         let state = self.state().map_err(|cause| match cause {
             NativeMarkdownPagedInputError::Closed
             | NativeMarkdownPagedInputError::DocumentReleased => {
@@ -39,18 +39,18 @@ impl NativeMarkdownPagedInput {
             .borrow_mut()
             .arm(ticks, numer, denom, document, state.marked.is_some())?;
         if previous.is_none() {
-            // 失败arm不会留下新heap；成功后唯一Input接管，View和scope都只在同步栈内借它。
+            // A failed arm leaves no new retained allocation; on success Input owns it and View/scopes borrow only synchronously.
             self.input_trace.replace(Some(trace));
         }
         Ok(())
     }
 
-    /// 复制有限记录器句柄时不跨Native或Doc借用；未arm和close后的热路径均立即返回None。
+    /// Clone the bounded recorder handle without crossing Native/document borrows; unarmed/closed hot paths return None.
     pub(in crate::native_surface) fn input_trace(&self) -> Option<SharedNativeInputTrace> {
         self.input_trace.borrow().clone()
     }
 
-    /// 当前Input存在但尚未arm时保持NotArmed；关闭已取走payload时才报告NoEditor。
+    /// A live unarmed Input reports NotArmed; only closed Input whose payload was removed reports NoEditor.
     pub(in crate::native_surface) fn drain_input_trace(
         &self,
     ) -> std::result::Result<crate::NativeInputTraceSnapshot, NativeInputTraceAccessError> {
@@ -64,7 +64,7 @@ impl NativeMarkdownPagedInput {
         Ok(snapshot)
     }
 
-    /// 观察原NSTextInputClient使用的marked真值和O(1)canonical计量，不执行Source读取或外部回调。
+    /// Observe NSTextInputClient's actual marked fact and O(1) canonical totals, without Source reads or external callbacks.
     pub(in crate::native_surface) fn input_trace_observation(
         &self,
     ) -> (Option<NativeInputTraceDocument>, bool) {
@@ -79,7 +79,7 @@ impl NativeMarkdownPagedInput {
         (document, self.marked.get().is_some())
     }
 
-    /// Core成功的原typed回执先于任何可重入显示后果记录；不把显示失败改写成canonical拒绝。
+    /// Record Core's typed success before reentrant presentation effects; display failure cannot rewrite canonical success as rejection.
     pub(super) fn record_input_trace_commit(
         &self,
         commit: &NativeMarkdownPagedInputCommit,
@@ -96,7 +96,7 @@ impl NativeMarkdownPagedInput {
         let inserted = removed
             .checked_add_signed(commit.invalidation.change_in_utf16_length)
             .expect("原Core编辑回执的移除量和长度差必须组成实际新增UTF16量");
-        // 原publish已经拥有Doc租约；只复制三项计量，不重借、不触发Source或Native回调。
+        // publish already owns the document borrow; copy three totals without reborrowing or triggering Source/Native callbacks.
         let document = NativeInputTraceDocument {
             generation: document.generation(),
             utf8_bytes: document.byte_len(),
@@ -108,7 +108,7 @@ impl NativeMarkdownPagedInput {
             .canonical(ticks, Some(document), removed, inserted, None);
     }
 
-    /// 仅记录原回调的有限拒绝类别；没有错误字符串、正文、路径或额外Source查询。
+    /// Record only the callback's bounded rejection category, with no error string, text, path, or extra Source query.
     pub(in crate::native_surface) fn reject_input_trace(
         &self,
         rejection: NativeInputTraceRejection,

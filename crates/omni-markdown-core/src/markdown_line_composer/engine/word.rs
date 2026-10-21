@@ -1,4 +1,5 @@
-//! 词组删除沿原GCB和冻结piece逐量子查找；不以视口、分块或软换行代替真实边界。
+//! Find word-deletion ranges incrementally over original graphemes and frozen
+//! pieces. Viewport, chunk, and soft-line edges never substitute for real boundaries.
 
 use super::*;
 use crate::{MarkdownDocumentBufferError, MarkdownGraphemeBoundary, MarkdownLineBreakBudget};
@@ -10,7 +11,8 @@ pub use group::{
     MarkdownWordMovePreparation, MarkdownWordMoveScope,
 };
 
-/// 同一Composer只拥有一个词组动作；移动/选词与删除共享原GCB，不能并行创建第二套索引。
+/// One word action belongs to this composer. Move/select/delete share original
+/// grapheme metadata rather than create parallel indexes for separate actions.
 pub(super) enum WordJob {
     Delete(WordDelete),
     Group(group::WordGroup),
@@ -25,16 +27,18 @@ pub enum MarkdownWordDeleteDirection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MarkdownWordDeleteAnswer {
     Yielded,
-    /// 同一量子已到真实 opaque 端点；调用方须展开原 fold 并重建读图，不能据此删除隐区。
+    /// This quantum reached a real opaque endpoint. The caller must expand the
+    /// original fold/rebuild its read graph; this grants no deletion of hidden text.
     NeedsFoldExpansion(Range<usize>),
-    /// 只交原Source内的真实删除范围；调用方仍须消费原输入permit，不能据此重签当前正文。
+    /// An actual range in the original Source. The caller still needs its original
+    /// input permit; this result cannot renew authority over current document text.
     Ready(Range<usize>),
 }
 
 pub struct MarkdownWordDeleteStep {
     pub bytes: usize,
     pub scalars: usize,
-    /// GCB记录工作量；Dense的整数记录访问也占量子，不冒充实际pread次数。
+    /// Grapheme-record work, including Dense integer records; not a count of preads.
     pub records: usize,
     pub metadata_units: usize,
     pub answer: MarkdownWordDeleteAnswer,
@@ -60,24 +64,28 @@ pub(in crate::markdown_line_composer) enum Category {
 }
 
 #[derive(Clone, Copy)]
-/// 真实消费者共享GCB游标但保各自停止规则；普通删除不继承词类别，移动不继承单空格特例。
+/// Consumers share a grapheme cursor but retain their own stopping rules. Ordinary
+/// deletion has no word categories; movement has no deletion-specific space exception.
 enum CursorMode {
     Delete,
-    /// 普通删除只消费相邻的一个真实GCB，不读取词类别，也不依赖软换行几何。
+    /// Ordinary deletion uses one adjacent real grapheme, without category reads or
+    /// dependence on soft-line geometry.
     Grapheme,
     Move,
     Seed,
     Expand(Category),
 }
 
-/// 二分只保原稳定ordinal区间；没有读到的边界不得从坐标或EOF长度推算出来。
+/// Binary search retains an original stable ordinal interval. Coordinates and EOF
+/// length cannot infer a boundary record that was never read.
 struct Seek {
     low: usize,
     high: usize,
     candidate: Option<(usize, MarkdownGraphemeBoundary)>,
 }
 
-/// 单个GCB也可远大于4KiB；这里只累计类别和一个UTF8半标量，不保留整簇字节。
+/// A single grapheme can exceed 4 KiB. Accumulate its category and one partial UTF-8
+/// scalar without retaining all grapheme bytes.
 pub(in crate::markdown_line_composer) struct Cluster {
     next_ordinal: usize,
     next: MarkdownGraphemeBoundary,
@@ -104,9 +112,11 @@ impl Cluster {
         } else {
             (next, current)
         };
+        // Adjacent original boundaries must strictly increase on both coordinate
+        // axes before their metadata is allowed to drive Source reads.
         if start.byte >= end.byte || start.utf16 >= end.utf16 {
             return Err(MarkdownLineComposeError::InconsistentCoverage);
-        } // 原相邻GCB必须在byte和UTF16两轴同时严格递增，损坏元数据不能驱动正文借用。
+        }
         Ok(Self {
             next_ordinal,
             next,
@@ -134,17 +144,18 @@ impl Cluster {
                 0xf0..=0xf4 => 4,
                 _ => return Err(MarkdownLineComposeError::InconsistentCoverage),
             };
-        } // 每簇起点来自真实GCB；非法前导字节保留失败，不补替换字符或改动来源。
+        } // A real grapheme start cannot excuse malformed UTF-8 or insert replacements.
         self.pending[self.used] = byte;
         self.used += 1;
         if self.used != self.needed {
-            return Ok(()); // 跨piece/量子的半标量继续留在同一簇，不提前分类或补终止。
+            return Ok(()); // Retain this partial scalar across piece/quantum boundaries.
         }
         let scalar = std::str::from_utf8(&self.pending[..self.used])
             .ok()
             .and_then(|value| value.chars().next())
             .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
-        // 保留原编辑器三类group规则；分类完整GCB，emoji或mark不能按UTF16单元拆开。
+        // Preserve the original editor's three group categories over the complete
+        // grapheme. UTF-16 units cannot independently classify emoji or marks.
         self.word |= scalar.is_alphabetic() || scalar.is_numeric() || scalar == '_';
         self.space &= ecmascript_space(scalar);
         self.newline |= matches!(scalar, '\r' | '\n');
@@ -172,7 +183,7 @@ impl Cluster {
                 if step.scalars == budget.scalars {
                     stopped = true;
                     return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
-                } // 先看配额再解引用，未消费的下个scalar不隐藏到本步读取量之外。
+                } // Check scalar quota before dereferencing the next input byte.
                 if let Err(error) = self.push(*byte, step) {
                     failure = Some(error);
                     return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
@@ -185,14 +196,15 @@ impl Cluster {
             Err(MarkdownDocumentBufferError::RangeOutsideDocument)
                 if stopped || failure.is_some() => {}
             Err(error) => return Err(error.into()),
-        } // 只有本回调的暂停sentinel可消解；实际Source首错仍交原Composer finish优先处理。
+        } // Consume only this callback's pause/failure sentinel. Actual Source
+        // failure still reaches the composer's original first-error boundary.
         if let Some(error) = failure {
             return Err(error);
         }
         if self.byte == self.end.byte {
             if self.used != 0 || self.utf16 != self.end.utf16 {
                 return Err(MarkdownLineComposeError::InconsistentCoverage);
-            } // 原GCB两个坐标必须与实际逐标量内容吻合，短读不能签出完整类别。
+            } // Actual decoded content must match both original endpoint coordinates.
             return Ok(true);
         }
         Ok(false)
@@ -209,7 +221,8 @@ impl Cluster {
     }
 }
 
-/// ECMAScript空白包含BOM而不含NEL，不能以Rust较宽的is_whitespace悄悄改变原group。
+/// Preserve the original ECMAScript whitespace set: it includes BOM and excludes
+/// NEL. Rust's broader is_whitespace would change existing editor group behavior.
 fn ecmascript_space(scalar: char) -> bool {
     matches!(scalar, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}'
         | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}'
@@ -263,17 +276,20 @@ impl WordDelete {
         }
     }
 
-    /// 新逻辑group只改变本游标的停止规则；Source、GCB依赖和量子仍由原Payload唯一持有。
+    /// A logical group changes only this cursor's stopping rule. Original Payload
+    /// ownership still governs Source, grapheme dependencies, and each work quantum.
     fn group(direction: MarkdownWordDeleteDirection, head: usize, mode: CursorMode) -> Self {
         let mut cursor = Self::new(direction, head);
         cursor.mode = mode;
         if let CursorMode::Expand(category) = mode {
-            cursor.category = Some(category); // 两侧扩选必须沿首个真实GCB的类别，不能各自挑一个词。
+            cursor.category = Some(category); // Both sides expand the same seed category.
         }
         cursor
     }
 
     fn finish(&mut self, step: &mut MarkdownWordDeleteStep) -> Result<()> {
+        // Return only the range between original head and the actual current
+        // boundary. This does not apply an edit or renew any Native input permit.
         let position = self
             .at
             .ok_or(MarkdownLineComposeError::InconsistentCoverage)?
@@ -285,7 +301,9 @@ impl WordDelete {
         Ok(())
     }
 
-    /// 只有原全源Dense GCB可借原树摘要跳alnum；混合边叶仍逐标量收费，停止字符交回原规则。
+    /// Only original whole-Source Dense graphemes permit alphanumeric tree-summary
+    /// traversal. Mixed edge leaves still charge scalar work and return the stopping
+    /// character to the original grapheme/category rules.
     fn ascii_alnum(
         &mut self,
         source: &MarkdownLayoutTextSource,
@@ -301,7 +319,7 @@ impl WordDelete {
                 .category
                 .is_some_and(|category| category != Category::Word)
         {
-            return Ok(false); // Space/Other已锁类别时不能跨过下一个词；underscore仍由原GCB分类。
+            return Ok(false); // A locked Space/Other group cannot skip into a later word.
         }
         if self.ascii_ready.is_none() {
             if step.metadata_units == budget.metadata_units {
@@ -311,7 +329,9 @@ impl WordDelete {
             step.metadata_units += 1;
         }
         if self.ascii_ready != Some(true) {
-            return Ok(false); // Unicode/CRLF或未认证Dense均保持原GCB路径，不能只凭局部ASCII叶跳簇。
+            // Unicode/CRLF or uncertified Dense stays on the original grapheme
+            // path. A locally ASCII leaf alone grants no summary traversal.
+            return Ok(false);
         }
         let current = self
             .at
@@ -326,7 +346,7 @@ impl WordDelete {
                     current.utf16,
                     self.direction == MarkdownWordDeleteDirection::Forward,
                 )?);
-                step.metadata_units += 1; // Snapshot建立游标真实读取一次原root字符域和范围事实。
+                step.metadata_units += 1; // Capturing the cursor inspects real root-domain facts.
             }
             let run = self
                 .ascii_run
@@ -342,12 +362,12 @@ impl WordDelete {
             step.scalars += progress.scalars;
             step.metadata_units += progress.metadata;
             if !progress.complete {
-                return Ok(true); // 保存同一原节点/边叶游标，budget1也不必从root重新走完旧路径。
+                return Ok(true); // Preserve this node/edge cursor even under quota one.
             }
-            self.ascii_run = None; // 实际节点Arc栈在本次源权限内归还，不拖到后继Source。
+            self.ascii_run = None; // Release actual node Arcs within this original Source action.
             if progress.position == current.utf16 {
                 self.ascii_skip = true;
-                return Ok(false); // 当前真实字符不是alnum，只检查过它，原GCB仍拥有消费与分类权。
+                return Ok(false); // A non-alphanumeric stopping character still belongs to GCB rules.
             }
             self.ascii_endpoint = Some(progress.position);
         }
@@ -366,12 +386,13 @@ impl WordDelete {
         if endpoint.utf16 != position || endpoint.byte != position {
             return Err(MarkdownLineComposeError::InconsistentCoverage);
         }
-        // ordinal只在原整源Dense整数表示与这张实际端点票同时成立时等于UTF16位置。
+        // Ordinal equals UTF-16 only when both original whole-Source Dense facts and
+        // this actual endpoint proof establish that identity.
         self.at = Some((position, endpoint));
         self.started = true;
         self.category = Some(Category::Word);
         self.ascii_endpoint = None;
-        self.ascii_skip = true; // 下一停止字符必须由原Cluster解释，不在同一位置重启查询。
+        self.ascii_skip = true; // Interpret the stopping character once through Cluster.
         Ok(false)
     }
 
@@ -392,7 +413,8 @@ impl WordDelete {
             if let Some((permitted, through)) = proof {
                 if through <= position || through > cluster.end.utf16 {
                     return Err(MarkdownLineComposeError::InconsistentCoverage);
-                } // 完整 B 段只签真实覆盖终点；不能停在当前点或越过原 GCB 后替它猜范围。
+                } // A real bidi paragraph proof must advance inside this grapheme,
+                // never stay still or infer coverage beyond its original end.
                 self.visual_rejected = !permitted;
                 self.visible_proved = permitted && through == cluster.end.utf16;
                 self.visible_proof_next = (permitted && !self.visible_proved).then_some(through);
@@ -404,11 +426,13 @@ impl WordDelete {
                 metadata_units: actual.metadata_units,
                 answer: MarkdownWordDeleteAnswer::Yielded,
             });
-        } // 端点已由原 GCB 证明；借 Breaks 前先完成同一 Item 的 B 段准备，不并借两个可变角色。
+        } // Complete this item's bidi preparation before borrowing Breaks; both
+        // mutable roles remain sequential under the same grapheme authority.
         let folds = coordinator.fold_plan();
         let breaks = coordinator.word_breaks()?;
         if self.dependency {
-            // 未知边界只推进原GCB一次；本次不再消费类别，避免依赖和调用方各花一份配额。
+            // Advance the original unknown-boundary dependency alone. Classifying
+            // text in this same turn would spend the work allowance a second time.
             let progress = breaks.step_dependency(
                 authority,
                 true,
@@ -431,7 +455,7 @@ impl WordDelete {
         let mut step = MarkdownWordDeleteStep::yielded();
         if let Some(range) = &self.ready {
             step.answer = MarkdownWordDeleteAnswer::Ready(range.clone());
-            return Ok(step); // 终态也已经过原GCB健康门，取消或真实IO失败不能借旧结果复活。
+            return Ok(step); // Even terminal results passed original GCB/Source health checks.
         }
         if self.at.is_none() && self.seek.is_none() {
             if prefix
@@ -442,7 +466,7 @@ impl WordDelete {
                     return Err(MarkdownLineComposeError::InconsistentCoverage);
                 }
                 self.dependency = true;
-                return Ok(step); // 前缀还未到原head；完整源长度不是末ordinal证明。
+                return Ok(step); // Source length cannot prove the unknown head ordinal.
             }
             self.seek = Some(Seek {
                 low: 0,
@@ -458,19 +482,21 @@ impl WordDelete {
                         .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
                     if ordinal != seek.low {
                         return Err(MarkdownLineComposeError::InconsistentCoverage);
-                    } // 已读取候选必须就是二分落点；索引矛盾不能当作普通用户坐标错误。
+                    } // A contradictory candidate/rank is damaged coverage, not a user offset error.
                     if boundary.utf16 != self.head {
                         if !matches!(self.mode, CursorMode::Grapheme) {
                             return Err(MarkdownLineComposeError::InvalidRequest);
-                        } // 词组动作仍要求真实GCB；普通删除保留原Scene对任意合法scalar caret的语义。
+                        } // Word groups require real GCBs. Ordinary deletion keeps
+                        // the original Scene behavior for a valid scalar caret inside one.
                         self.at = Some((ordinal, boundary));
                         self.seek = None;
                         if self.direction == MarkdownWordDeleteDirection::Forward {
-                            // 原Next在簇内部取lower_bound本身；不可多跳一簇，也不擅自扩大到簇左端。
+                            // Inside a grapheme, original Next uses lower_bound
+                            // itself; do not skip another grapheme or expand left.
                             self.finish(&mut step)?;
                             return Ok(step);
                         }
-                        continue; // 原Previous取lower_bound的前驱；后续仍只收费一条真实边界记录。
+                        continue; // Previous uses the real predecessor, charged on its next read.
                     }
                     self.at = Some((ordinal, boundary));
                     self.seek = None;
@@ -478,12 +504,13 @@ impl WordDelete {
                 }
                 if step.records == budget.records || step.metadata_units == budget.metadata_units {
                     return Ok(step);
-                } // 二分的每条原记录也计入同一量子，不把logN查询藏成一次操作。
+                } // Every binary-search record consumes this same quantum.
                 let ordinal = seek.low + (seek.high - seek.low) / 2;
                 let mut record = [MarkdownGraphemeBoundary { byte: 0, utf16: 0 }];
                 if !breaks.read_grapheme_prefix(authority, ordinal..ordinal + 1, &mut record)? {
                     return Err(MarkdownLineComposeError::InconsistentCoverage);
-                } // seek只访问开始时已经提交的不可变前缀，不能把其消失解释为等待更多正文。
+                } // This search only uses its initial committed prefix; losing a
+                // record cannot be reinterpreted as waiting for more text.
                 step.records += 1;
                 step.metadata_units += 1;
                 let boundary = record[0];
@@ -508,7 +535,7 @@ impl WordDelete {
                 };
                 let Some(next) = next else {
                     self.finish(&mut step)?;
-                    return Ok(step); // 原首ordinal没有前驱，是实际BOF而不是视口左界。
+                    return Ok(step); // No predecessor at ordinal zero means real BOF.
                 };
                 if next >= prefix.known_boundary_count {
                     if prefix.complete {
@@ -516,7 +543,7 @@ impl WordDelete {
                     } else {
                         self.dependency = true;
                     }
-                    return Ok(step); // 只有完整GCB表才授予真EOF；未知后继继续同一个原job。
+                    return Ok(step); // Only a complete original GCB table proves EOF.
                 }
                 if step.records == budget.records || step.metadata_units == budget.metadata_units {
                     return Ok(step);
@@ -531,7 +558,8 @@ impl WordDelete {
                     != (record[0].byte < current.byte)
                 {
                     return Err(MarkdownLineComposeError::InconsistentCoverage);
-                } // 原ordinal前后必须对应真实源同方向，损坏记录不能把Backward变成向后删正文。
+                } // Adjacent ordinal direction must match actual Source order;
+                // damaged metadata cannot reverse a backward deletion.
                 if let Some(plan) = &folds
                     && let Some(span) = plan.spans().iter().find(|span| {
                         span.start.utf16 == current.utf16.min(record[0].utf16)
@@ -542,10 +570,12 @@ impl WordDelete {
                         span.start.utf16..span.end.utf16,
                     );
                     return Ok(step);
-                } // 明确交回原展开意图；不按“一个字符”删除整段，也不借 Cluster::read 物化隐区。
+                } // Return the original unfold intent instead of deleting the
+                // hidden section as one character or materializing it for classification.
                 if matches!(self.mode, CursorMode::Grapheme) {
-                    // 相邻ordinal已经由同一GCB目录认证；emoji、CRLF和任意长combining簇
-                    // 均直接使用它的两个真实端点，禁止重新按scalar或视口截取删除范围。
+                    // The same GCB directory certifies these adjacent ordinals.
+                    // Emoji, CRLF, and arbitrarily long combining clusters use their
+                    // real endpoints without scalar/viewport truncation.
                     self.at = Some((next, record[0]));
                     self.finish(&mut step)?;
                     return Ok(step);
@@ -555,11 +585,12 @@ impl WordDelete {
                     self.visible_proved = false;
                     self.visible_proof_next = None;
                     return Ok(step);
-                } // opaque 已先处理；下一回合消费真实 B 段证书后才能读取/分类这个原簇。
+                } // After opaque handling, a later turn obtains the original bidi
+                // paragraph proof before reading/classifying this grapheme.
             }
             if step.bytes == budget.bytes || step.scalars == budget.scalars {
                 return Ok(step);
-            } // 已读的真实簇端点留在同一个续体；不重读正文，也不把本步末尾当group终点。
+            } // Keep actual endpoints in this continuation; a turn end is no group end.
             let cluster = self
                 .cluster
                 .as_mut()
@@ -575,7 +606,8 @@ impl WordDelete {
             self.visible_proof_next = None;
             match self.mode {
                 CursorMode::Seed => {
-                    // 首簇只用于固定真实类别和硬换行事实；即使巨大单GCB也必须读完原簇才完成。
+                    // The seed establishes category and hard-newline facts. Even
+                    // a huge single grapheme must be completely read to classify it.
                     self.category = Some(cluster.category());
                     self.seed_newline = cluster.newline;
                     self.at = Some((cluster.next_ordinal, cluster.next));
@@ -589,7 +621,7 @@ impl WordDelete {
                         .is_some_and(|previous| previous != Category::Space && previous != category)
                     {
                         self.finish(&mut step)?;
-                        return Ok(step); // 任意leading空白之后只消费一个真实Word/Other group。
+                        return Ok(step); // After leading space, consume one Word/Other group.
                     }
                     self.category = Some(category);
                     self.started = true;
@@ -600,7 +632,7 @@ impl WordDelete {
                 CursorMode::Expand(category) => {
                     if cluster.newline || cluster.category() != category {
                         self.finish(&mut step)?;
-                        return Ok(step); // 选词属于同一硬行；Space组也不能吞掉CR/LF/CRLF。
+                        return Ok(step); // Selection stays in one hard line, including Space groups.
                     }
                     self.started = true;
                     self.at = Some((cluster.next_ordinal, cluster.next));
@@ -608,35 +640,39 @@ impl WordDelete {
                     continue;
                 }
                 CursorMode::Grapheme => unreachable!("单GCB动作在取得相邻原边界时已经结束"),
-                CursorMode::Delete => {} // 原删除的单ASCII空格与独立换行规则继续由下方原路径处理。
+                CursorMode::Delete => {} // Preserve deletion's single-space/newline rules below.
             }
             if cluster.newline {
                 if !self.started {
                     self.at = Some((cluster.next_ordinal, cluster.next));
-                } // 只在动作起点就是行边界时删原完整CR/LF/CRLF；先前group不跨真实换行。
+                } // Consume CR/LF/CRLF only at the action's initial boundary;
+                // a previously started group never crosses that hard newline.
                 self.finish(&mut step)?;
                 return Ok(step);
             }
             let category = cluster.category();
             if self.category.is_some_and(|previous| previous != category) {
                 self.finish(&mut step)?;
-                return Ok(step); // 下一真实簇只用于确定终点，保持它及其后正文原样。
+                return Ok(step); // The next-category grapheme remains outside the range.
             }
             if self.started || !cluster.single_space {
                 self.category = Some(category);
-            } // 仅首个ASCII单空格不锁类别；第二空格/TAB按Space锁定，保留原删除手感。
+            } // Only the initial single ASCII space leaves category unlocked;
+            // a second space/tab locks Space, preserving original deletion behavior.
             self.started = true;
             self.at = Some((cluster.next_ordinal, cluster.next));
-            self.ascii_skip = false; // 已经消费了停止字符，可在下一真实GCB尝试后续alnum段。
+            self.ascii_skip = false; // The stopping character was consumed; later ASCII may resume.
         }
     }
 }
 
 impl MarkdownLineComposer {
-    /// 在本worker原冻结源上开始一次词组删除；仅固定方向/位置，不扫描、复制正文或分配资源。
+    /// Begin word deletion on this worker's original frozen Source. Establish only
+    /// direction/position, without scanning/copying text or allocating I/O resources.
     ///
     /// # Errors
-    /// 原Source/取消先于范围错误；未消费的旧词组动作不得被新请求静默覆盖。
+    /// Original Source/cancellation errors precede range errors. An unconsumed word
+    /// action cannot be silently replaced by another request.
     pub fn begin_word_delete(
         &mut self,
         direction: MarkdownWordDeleteDirection,
@@ -645,10 +681,12 @@ impl MarkdownLineComposer {
         self.begin_delete(direction, head_utf16, CursorMode::Delete)
     }
 
-    /// 开始普通前删或退格；原GCB端点取相邻完整簇，簇内部scalar caret保留原严格Next/Previous语义。
+    /// Begin forward-delete/backspace using original adjacent complete graphemes.
+    /// A scalar caret inside a grapheme retains strict original Next/Previous rules.
     ///
     /// # Errors
-    /// 原Source、取消、未完成动作和范围错误与词组删除完全相同，不建立第二份源或索引。
+    /// Source, cancellation, unfinished-action, and range failures share word
+    /// deletion's original boundary without another Source or index.
     pub fn begin_grapheme_delete(
         &mut self,
         direction: MarkdownWordDeleteDirection,
@@ -657,7 +695,8 @@ impl MarkdownLineComposer {
         self.begin_delete(direction, head_utf16, CursorMode::Grapheme)
     }
 
-    /// 两种删除只在实际停止规则上不同；认证和唯一原动作槽沿同一个入口装配。
+    /// The two deletion modes differ only in stopping rules. Authority validation
+    /// and the one original action slot share this entry.
     fn begin_delete(
         &mut self,
         direction: MarkdownWordDeleteDirection,
@@ -673,8 +712,9 @@ impl MarkdownLineComposer {
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
         if matches!(mode, CursorMode::Grapheme) {
-            // 原NSTextInputClient允许GCB内部的scalar caret，但代理对内部不能进入不可逆删除。
-            // 这里复用原源的UTF16→byte合同，不猜测Unicode边界或创建局部正文副本。
+            // NSTextInputClient permits a scalar caret inside a grapheme, but a
+            // surrogate-pair interior cannot drive an irreversible edit. Reuse the
+            // original Source UTF-16-to-byte check without guessing Unicode boundaries.
             payload.source.byte_offset_for_utf16(head_utf16)?;
         }
         let mut cursor = WordDelete::new(direction, head_utf16);
@@ -683,10 +723,12 @@ impl MarkdownLineComposer {
         Ok(())
     }
 
-    /// 只推进本次词组动作的原GCB或正文分类；每步共享4KiB/256标量/256记录上限。
+    /// Advance original grapheme metadata or text classification for this action
+    /// under shared 4-KiB/256-scalar/256-record per-step bounds.
     ///
     /// # Errors
-    /// 实际源、索引、取消和非GCB位置都保留原typed首因；失败沿原Composer释放边界关闭。
+    /// Preserve typed Source, index, cancellation, and non-grapheme-position failures;
+    /// the original composer failure boundary releases actual resources.
     pub fn step_word_delete(
         &mut self,
         budget: MarkdownLineComposeBudget,
@@ -716,7 +758,7 @@ impl MarkdownLineComposer {
                 .ok_or(MarkdownLineComposeError::InvalidRequest)?;
             let WordJob::Delete(word) = word else {
                 return Err(MarkdownLineComposeError::InvalidRequest);
-            }; // 另一个真实group动作不能被错入口消费或冒充删除。
+            }; // A different active group action cannot be consumed through delete.
             word.advance(
                 &payload.source,
                 &mut payload.coordinator,
@@ -727,7 +769,8 @@ impl MarkdownLineComposer {
         self.finish(result)
     }
 
-    /// 原输入撤权时只归还该临时标量续体；字体/排版和同一Source仍归原worker生命周期。
+    /// When original input authority ends, retire only this temporary scalar cursor.
+    /// Font/layout and the same Source remain under the original worker lifecycle.
     pub fn cancel_word_delete(&mut self) {
         if let Some(payload) = self.payload.as_mut()
             && matches!(payload.word_delete, Some(WordJob::Delete(_)))

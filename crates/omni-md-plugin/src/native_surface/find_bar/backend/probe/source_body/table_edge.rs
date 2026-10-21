@@ -1,4 +1,5 @@
-//! 未封存巨行的原行首零caret必须沿真实首格字形返回，不能等待整格EOF或借旧clip签可见。
+//! Return an unsealed giant row's original start caret through actual first-cell
+//! geometry, without waiting for cell EOF or borrowing an old clip's visibility.
 
 use super::*;
 use omni_markdown_core::MarkdownPresentationMode;
@@ -10,13 +11,15 @@ const UNIT: &str = "alpha beta gamma delta ";
 const REPEATS: usize = 8192;
 const ROW_CLOSE: &str = " | side |\n\noutside paragraph\n";
 const ROW_START: usize = HEADER.len();
-const FIRST_VISIBLE: usize = ROW_START + 4; // 固定字面的首个e；前面的两颗星号确实是隐藏语法。
+const FIRST_VISIBLE: usize = ROW_START + 4; // The fixed literal's first e follows two actual hidden bold markers.
 const REMOTE: usize = ROW_START + ROW_PREFIX.len() + UNIT.len() * 128;
 const GIANT_TEXT_BYTES: usize = ROW_PREFIX.len() - 2 + UNIT.len() * REPEATS;
 const UTF16: usize = HEADER.len() + ROW_PREFIX.len() + UNIT.len() * REPEATS + ROW_CLOSE.len();
 
-/// 只生成本用例拥有的临时文件；最大写块2944B，既不构造巨格String，也不增添第二个正文图。
-/// 首列的真实粗体标记检查raw起点的隐藏gap；独立尾段保证完整CPU帧仍不是文档EOF。
+/// Generate only this case's owned temporary file, in blocks of at most 2,944
+/// bytes, without a giant-cell String or second document graph. Actual bold
+/// markers exercise the hidden leading gap; a separate tail keeps complete CPU
+/// frames distinct from document EOF.
 fn fixture() -> Result<tempfile::NamedTempFile, String> {
     let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
     file.write_all(HEADER.as_bytes())
@@ -35,7 +38,8 @@ fn fixture() -> Result<tempfile::NamedTempFile, String> {
     Ok(file)
 }
 
-/// 全部夹具是固定ASCII，字节与UTF16一一对应；预期来自生成规则，不能读取显示映射反推。
+/// Fixed ASCII gives one-to-one byte/UTF-16 coordinates. Derive expectations from
+/// generation rules, never by reading the display projection under test.
 fn expected(index: usize) -> u8 {
     if index < HEADER.len() {
         return HEADER.as_bytes()[index];
@@ -51,8 +55,9 @@ fn expected(index: usize) -> u8 {
     ROW_CLOSE.as_bytes()[index - UNIT.len() * REPEATS]
 }
 
-/// 只读导航不能改canonical、历史或磁盘；两条真实读取链都以固定小片完成精确核对。
-/// 这些完整性读取发生在帧门之后，不把测试校验的读量混成生产排版frontier工作量。
+/// Read-only navigation preserves canonical text, history, and disk. Both actual
+/// read paths compare fixed small chunks after frame acceptance; these integrity
+/// reads do not measure the production layout frontier's source work.
 fn unchanged(rig: &Rig) -> Result<(), String> {
     let document = rig.document.upgrade().ok_or("巨行边缘原Doc已释放")?;
     let document = document.borrow();
@@ -76,7 +81,7 @@ fn unchanged(rig: &Rig) -> Result<(), String> {
             }
         }
     }
-    drop(document); // 真实Doc借用先结束，后面不跨Native或runloop保留租约。
+    drop(document); // End the actual document borrow before any later Native/run-loop operation.
     let mut file = std::fs::File::open(rig._file.path()).map_err(|cause| cause.to_string())?;
     let mut bytes = [0_u8; 4095];
     for start in (0..UTF16).step_by(bytes.len()) {
@@ -99,9 +104,11 @@ fn unchanged(rig: &Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 实际frontier和shape累计仍小于固定正文的一半，且父文档未结束，才证明回退仍属真实前缀。
-/// 不能只和含隐藏标记的raw总长相比，否则排完显示正文后少掉的标记字节也可能误过门。
-/// 显示转换自身可能逐片读完整raw；本门只声明真实排版前缀，不能外推成没有读取整格原源。
+/// Require actual frontier/shaping work below half the fixed text and an incomplete
+/// parent document. Comparing only with raw length could pass after all visible
+/// text was shaped merely because hidden marker bytes remain. Projection itself
+/// may stream the full raw cell; this proves a layout prefix, not that all raw
+/// source reads stopped at the same boundary.
 fn prefix(progress: &NativeMarkdownPagedBodyProgress) -> Result<(), String> {
     if progress.complete
         || progress.frontier_source_bytes >= UNIT.len() * REPEATS / 2
@@ -112,8 +119,9 @@ fn prefix(progress: &NativeMarkdownPagedBodyProgress) -> Result<(), String> {
     Ok(())
 }
 
-/// 唯一原SourceTarget只滚动，不提交选择。原3秒observer必须交付当前完整CPU帧，
-/// 然后才消费同请求proof；范围、完整Input、Source和实际布局宽始终由原票核对。
+/// The original SourceTarget scrolls without committing selection. Its original
+/// three-second observer must receive a current complete CPU frame before proof
+/// consumption; range, full Input, Source, and actual width retain original authority.
 fn reveal(
     rig: &mut Rig,
     stage: &str,
@@ -154,7 +162,7 @@ fn reveal(
         return Err("巨行边缘目标没有保持原canonical实际范围".into());
     }
     prefix(&progress)?;
-    drop(scene); // 后继目标不能借旧Reader补票；只留下无正文的原SceneKey与资源观察。
+    drop(scene); // A successor cannot borrow this reader's authority; retain only source-free key/resource observations.
     rig.remember_receipt()?;
     println!(
         "native_body_table_edge stage={stage} target_location={} target_length={} actual_cpu_frame=true original_source_input_width=true actual_prefix_only=true frontier_bytes={} shaped_input_bytes={} giant_text_bytes={GIANT_TEXT_BYTES} formal=false whole_product=false",
@@ -163,8 +171,10 @@ fn reveal(
     Ok(key)
 }
 
-/// 先把同一未封存巨格的远端真正滚入clip，再回到其原物理行首；旧视口不能替行首签可见。
-/// 首格以隐藏粗体开头，回来的零caret须与真实首个e的caret同位，非空pipe仍没有字符几何。
+/// Scroll a remote position of the same unsealed giant cell into the clip, then
+/// return to its original physical row start. The old viewport cannot prove the
+/// start visible. Its zero caret must coincide with the actual first e after
+/// hidden bold markers; a nonempty pipe still has no character geometry.
 fn exercise(rig: &mut Rig) -> Result<(), String> {
     let original = rig
         .view
@@ -189,7 +199,7 @@ fn exercise(rig: &mut Rig) -> Result<(), String> {
         Err(cause) => return Err(cause.to_string()),
         Ok(_) => return Err("巨行原行首仍可见，夹具没有形成真实返回条件".into()),
     }
-    drop(scene); // 旧远端窗口先归还，原Body才能继续同一个格Source的首行目标。
+    drop(scene); // Return the remote reader before the same Body/cell Source prepares its row-start target.
     let returned = reveal(
         rig,
         "table_giant_edge_row_start",
@@ -225,7 +235,8 @@ fn exercise(rig: &mut Rig) -> Result<(), String> {
     unchanged(rig)
 }
 
-/// 成功与普通Err都先结束原Rig及其唯一Source/Native资源，才报告功能结果或进入下一个夹具。
+/// Both success and ordinary errors end the original Rig and its unique Source/
+/// Native resources before reporting results or creating another fixture.
 pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut rig = Rig::attach_mode(
@@ -238,9 +249,9 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
             false,
         )?;
         let result = exercise(&mut rig);
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, result))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     result
 }

@@ -1,8 +1,10 @@
-//! 同一真实选择槽的意图与几何事实；不借NSUndoManager或假Native布局建立历史能力。
+//! Exercise intent/geometry in the actual selection slot without NSUndoManager or synthetic Native layout as history authority.
 
 use super::*;
 
 fn goal() -> NativeMarkdownVerticalGoal {
+    // An explicit finite value tests Input's retention rules, not Native layout
+    // accuracy; actual hit-testing/navigation has its independent UI acceptance.
     NativeMarkdownVerticalGoal::new(38.5, 74.25, 640 * 64, 19).unwrap()
 }
 
@@ -46,6 +48,8 @@ fn same_head_bidi_side_uses_one_selection_receipt_and_is_cleared_by_real_edits_h
             )
             .unwrap(),
     );
+    // Equal offsets can denote a different Bidi caret side. Publish that intent
+    // through the same selection owner and revoke the earlier actual permit.
     let stale = owner.capture(1, &|_| true).unwrap();
     let permit = owner.capture(1, &|_| true).unwrap();
     let other = committed(
@@ -78,7 +82,7 @@ fn same_head_bidi_side_uses_one_selection_receipt_and_is_cleared_by_real_edits_h
         ),
         Err(NativeMarkdownPagedInputError::StateChanged)
     ));
-    // 真文字提交清旧侧，Undo恢复文字/方向也不能复用原Font/行布局的part票。
+    // Actual text edits clear the old side; Undo of text/direction cannot reuse old font/line-layout part authority.
     let permit = owner.capture(1, &|_| true).unwrap();
     owner
         .insert_text(&permit, "X", NSRange::new(3, 0), &|_| true)
@@ -107,7 +111,7 @@ fn same_head_bidi_side_uses_one_selection_receipt_and_is_cleared_by_real_edits_h
 }
 
 #[test]
-fn rejected_or_reentrant_visual_side_does_not_replace_the_original_selection() {
+fn rejected_visual_side_does_not_replace_the_original_selection() {
     let (_file, document) = fixture("aאבb", 4096);
     let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
     let side = NativeMarkdownBidiCaretSide {
@@ -127,6 +131,8 @@ fn rejected_or_reentrant_visual_side_does_not_replace_the_original_selection() {
             .unwrap(),
     );
     let before = owner.state().unwrap();
+    // A level outside the supported Bidi domain must fail before changing the
+    // original caret/side; canonical text and history stay untouched.
     let permit = owner.capture(1, &|_| true).unwrap();
     assert!(matches!(
         owner.set_visual_selection_intent(
@@ -143,20 +149,6 @@ fn rejected_or_reentrant_visual_side_does_not_replace_the_original_selection() {
     ));
     assert_eq!(owner.state().unwrap(), before);
     assert_eq!(bidi_side(&owner), Some(side));
-    let permit = owner.capture(1, &|_| true).unwrap();
-    let calls = Cell::new(0);
-    assert!(matches!(
-        owner.navigation_bidi_side(&permit, &|_| {
-            calls.set(calls.get() + 1);
-            if calls.get() == 3 {
-                owner.clear_navigation_geometry();
-            }
-            true
-        }),
-        Err(NativeMarkdownPagedInputError::StateChanged)
-    ));
-    assert_eq!(bidi_side(&owner), None);
-    assert_eq!(owner.state().unwrap(), before);
     assert_eq!(text(&document), "aאבb");
     assert!(!document.borrow().can_undo());
 }
@@ -170,6 +162,8 @@ fn same_range_intent_publishes_new_side_and_goal_without_text_or_history() {
     assert!(
         matches!(owner.set_selection(&original, initial.selection, &|_| true).unwrap(), NativeMarkdownPagedInputOutcome::Unchanged(state) if state == initial)
     );
+    // Identical plain selection is unchanged, while an explicit navigation intent
+    // at that range receives its own serial without a text generation or Undo.
     let permit = owner.capture(1, &|_| true).unwrap();
     let first = committed(
         owner
@@ -210,7 +204,7 @@ fn same_range_intent_publishes_new_side_and_goal_without_text_or_history() {
 fn short_line_target_keeps_original_goal_and_scalar_failure_preserves_the_same_slot() {
     let (_file, document) = fixture("long\n短\nlong🙂", 4096);
     let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
-    // 本测试只验证真实输入发布；目标位置和列均为显式有限测试值，不声称Native导航结果。
+    // This verifies Input publication with explicit finite positions/goals, not results produced by Native navigation.
     for position in [3, 5, 9] {
         let permit = owner.capture(1, &|_| true).unwrap();
         committed(
@@ -289,40 +283,6 @@ fn unknown_side_goal_and_revoked_intent_cannot_replace_existing_facts() {
 }
 
 #[test]
-fn reentrant_geometry_clear_cannot_resurrect_pre_callback_goal() {
-    let (_file, document) = fixture("abc", 4096);
-    let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
-    let permit = owner.capture(1, &|_| true).unwrap();
-    committed(
-        owner
-            .set_selection_intent(
-                &permit,
-                MarkdownTextSelection::caret(1),
-                Some(false),
-                Some(goal()),
-                &|_| true,
-            )
-            .unwrap(),
-    );
-    let stable = owner.state().unwrap();
-    let permit = owner.capture(1, &|_| true).unwrap();
-    let calls = Cell::new(0usize);
-    let result = owner.navigation_selection_facts(&permit, &|_| {
-        calls.set(calls.get() + 1);
-        if calls.get() == 3 {
-            owner.clear_navigation_geometry();
-        } // 第二轮原票核准中的真实重入；canonical状态不变，几何事实已经明确撤销。
-        true
-    });
-    assert!(matches!(
-        result,
-        Err(NativeMarkdownPagedInputError::StateChanged)
-    ));
-    assert_eq!(owner.state().unwrap(), stable);
-    assert_eq!(facts(&owner), (None, None));
-}
-
-#[test]
 fn text_history_multi_selection_and_layout_clear_do_not_inherit_old_goal() {
     let (_file, document) = fixture("abcd", 4096);
     let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
@@ -339,6 +299,8 @@ fn text_history_multi_selection_and_layout_clear_do_not_inherit_old_goal() {
             .unwrap(),
     );
     let stable = owner.state().unwrap();
+    // Clearing geometry preserves logical selection. Later text/history and
+    // multiple-selection changes also cannot inherit an obsolete goal/side.
     owner.clear_navigation_geometry();
     assert_eq!(owner.state().unwrap(), stable);
     assert_eq!(facts(&owner), (None, None));

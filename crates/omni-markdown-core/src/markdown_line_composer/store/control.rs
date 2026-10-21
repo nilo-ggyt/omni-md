@@ -1,4 +1,5 @@
-//! 原控制请求的有限记录producer；没有假Job、伪字形、第二正文或按控制数量增长的owner表。
+//! Bounded record production for original control requests, without fabricated
+//! Jobs/glyphs, another text copy, or an owner table growing with control count.
 use super::super::controls::ValidatedControl;
 use super::super::{
     MarkdownComposedLinePartKind, MarkdownLineInlineControlKind, MarkdownLineTabAlignment,
@@ -30,6 +31,8 @@ impl GlyphStore {
             {
                 return Err(Error::InvalidRequest);
             }
+            // The actual validated control and both original grapheme endpoints
+            // must be available before constructing any candidate output record.
             self.grapheme_directory()?;
             value.require(&self.source, &self.authority, &self.fonts)?;
             for end in [value.facts.source_utf16.start, value.facts.source_utf16.end] {
@@ -38,6 +41,8 @@ impl GlyphStore {
                 }
             }
             let glyph_start = self.record_count()?;
+            // Nonempty paragraph/fold/tab controls occupy one real Source cluster
+            // with no drawable glyphs. A Grid block has its separate geometry path.
             let cluster_count = usize::from(
                 !value.facts.source_utf16.is_empty()
                     && value.request.kind != MarkdownLineInlineControlKind::TableRow,
@@ -79,7 +84,8 @@ impl GlyphStore {
             let mut rows = Box::new([[0; 64]; CONTROL_ROWS]);
             let mut length = 0;
             if cluster_count != 0 {
-                // 原真实控制范围可包含CRLF两unit，但不是可画的glyph；不制造.notdef或space。
+                // A real control may span both CRLF units, but is not drawable.
+                // Do not substitute a .notdef glyph or a fabricated space.
                 rows[length] = encode_cluster(&MarkdownGlyphCluster {
                     source_utf16: value.facts.source_utf16.clone(),
                     glyphs: 0..0,
@@ -108,7 +114,8 @@ impl GlyphStore {
                 feature = "paged-shaping-frontier"
             ))]
             if let Some(geometry) = &value.table {
-                // 列宽是已完成 Grid 的真实布局事实；每条固定 record 最多保存七列，无逐行常驻表。
+                // Column widths are completed Grid facts. Each fixed record stores
+                // at most seven columns; no per-row resident width table is retained.
                 rows[length][..8].copy_from_slice(&number(geometry.columns.len())?.to_le_bytes());
                 rows[length][56] = TABLE_WIDTHS;
                 length += 1;
@@ -122,10 +129,10 @@ impl GlyphStore {
                 }
             }
             let directory = Directory {
-                shaping_seams: [None; 2], // Tab、段分隔及表格控制只有原完整边界，没有字符整形 seam。
+                shaping_seams: [None; 2], // Whole control endpoints grant no text-shaping seam.
                 paragraph_inset_26_6: value.paragraph_inset_26_6,
                 facts: value.facts.clone(),
-                presentation: value.presentation, // 控制只接原响应自己的语义，不借相邻 glyph 或较新选择。
+                presentation: value.presentation, // Keep this original response's own semantics.
                 font: value.registered.registration().key(),
                 glyph_start,
                 glyph_count: 0,
@@ -175,7 +182,7 @@ impl GlyphStore {
                 } else {
                     None
                 },
-                frontier_word_end: None, // 控制不是已认证词前缀，不能继承附近字形目录的证书。
+                frontier_word_end: None, // Controls cannot inherit a nearby certified word prefix.
             };
             for row in encode_directory(&directory)? {
                 rows[length] = row;
@@ -211,6 +218,8 @@ impl GlyphStore {
                 .require(&self.source, &self.authority, &self.fonts)?;
             let file = self.index.as_mut().ok_or(Error::Poisoned)?;
             let mut used = 0;
+            // Append only this bounded candidate under the caller's actual record
+            // allowance, keeping its same validated response across yields.
             while capture.written < capture.length && used < records {
                 file.append(capture.rows[capture.written])?;
                 capture.written += 1;
@@ -235,7 +244,7 @@ impl GlyphStore {
                 {
                     return Ok(None);
                 }
-            } // 真空EOF行没有源字符，不插入会覆盖上一项的伪空树节点。
+            } // An empty EOF line has no Source text and creates no fake empty tree node.
             capture
                 .value
                 .require(&self.source, &self.authority, &self.fonts)?;
@@ -252,7 +261,9 @@ impl GlyphStore {
                 #[cfg(test)]
                 job: None,
             };
-            self.directory(&proof)?; // 临时响应归还后，真实外部palette仍须持同Font注册，不能偷偷延寿。
+            // After retiring the temporary response, the actual external palette
+            // must still own this same font registration; no hidden lifetime extension.
+            self.directory(&proof)?;
             Ok(Some(proof))
         })();
         self.finish(result)
@@ -268,6 +279,8 @@ impl GlyphStore {
         {
             return Err(Error::InconsistentCoverage);
         }
+        // Reconstruct only the validated bounded tab-stop style. Read each actual
+        // record with Source/cancellation checks and reject malformed alignment data.
         let mut stops = Vec::with_capacity(item.features);
         for index in 0..item.features {
             self.guard()?;
@@ -306,7 +319,8 @@ impl GlyphStore {
 }
 
 impl GlyphStore {
-    /// EOF空段只消费原空控制producer的私有Proof；不能用任意0长Range制造空行。
+    /// An empty EOF paragraph consumes only its original control producer's private
+    /// proof. An arbitrary zero-length range cannot manufacture an empty line.
     pub(in crate::markdown_line_composer) fn append_empty_line(
         &mut self,
         proof: &StoredItemProof,
@@ -339,8 +353,9 @@ impl GlyphStore {
             self.write_line_skip(&mut rows[0])?;
             rows[0][56] = output::LINE;
             rows[0][57] = 1;
-            // 只有ValidatedControl::empty可生成本Proof；其level已由原段策略/LS的
-            // 实际UBA base认证，不从非空文字part推断空行方向。
+            // Only ValidatedControl::empty produces this proof. Original paragraph
+            // policy or LS's actual UBA base certified its level; a nonempty text
+            // part cannot infer this empty paragraph's direction.
             rows[0][58] = item.facts.level;
             rows[1][..8].copy_from_slice(&number(item.facts.source_utf16.start)?.to_le_bytes());
             rows[1][8..16].copy_from_slice(&number(item.facts.source_utf16.end)?.to_le_bytes());
@@ -368,6 +383,8 @@ impl GlyphStore {
                     .to_le_bytes(),
             );
             rows[3][56] = output::LINE_END;
+            // Commit the fixed line candidate, then revalidate the same item and
+            // grapheme metadata before moving the public LineEnd endpoint.
             for row in rows {
                 self.index.as_mut().ok_or(Error::Poisoned)?.append(row)?;
             }

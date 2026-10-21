@@ -2,6 +2,7 @@
 
 use super::*;
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
 #[cfg(feature = "paged-shaping-frontier")]
@@ -1689,16 +1690,35 @@ pub(super) fn visit_piece_tree_range(
     accumulated_bytes: usize,
     visit: &mut impl FnMut(&[u8]) -> Result<(), MarkdownDocumentBufferError>,
 ) -> Result<(), MarkdownDocumentBufferError> {
+    // Full-range consumers retain their established unit-result contract. They
+    // use the same actual traversal as early-stopping readers, always continuing
+    // after a successful callback rather than maintaining a second algorithm.
+    visit_piece_tree_range_until_break(document, root, range, accumulated_bytes, &mut |bytes| {
+        visit(bytes).map(|()| ControlFlow::Continue(()))
+    })
+    .map(|_| ())
+}
+
+/// Visit original bounded leaves until the consumer explicitly breaks. A normal
+/// break propagates only after the current actual source lease finishes; source
+/// and callback failures remain typed errors, never disguised traversal control.
+pub(super) fn visit_piece_tree_range_until_break(
+    document: &impl PieceByteSource,
+    root: Option<&MarkdownPieceTreeNode>,
+    range: Range<usize>,
+    accumulated_bytes: usize,
+    visit: &mut impl FnMut(&[u8]) -> Result<ControlFlow<()>, MarkdownDocumentBufferError>,
+) -> Result<ControlFlow<()>, MarkdownDocumentBufferError> {
     document.source_health()?;
     let Some(root) = root else {
         // Empty text contributes no bytes or code units and cannot invoke the output callback.
-        return Ok(());
+        return Ok(ControlFlow::Continue(()));
     };
     let node_start = accumulated_bytes;
     let node_end = node_start + root.metrics().byte_len;
     if range.end <= node_start || range.start >= node_end {
         // Prune disjoint subtrees before borrowing any backing bytes.
-        return Ok(());
+        return Ok(ControlFlow::Continue(()));
     }
     match root {
         // Clamp the overlap to the selected leaf and lend it only for this callback.
@@ -1715,21 +1735,37 @@ pub(super) fn visit_piece_tree_range(
                 let piece = span.piece(ordinal)?;
                 let next = base + piece.byte_len;
                 let leaf = MarkdownPieceTreeNode::Leaf(piece);
-                visit_piece_tree_range(document, Some(&leaf), range.clone(), base, visit)?;
+                let progress = visit_piece_tree_range_until_break(
+                    document,
+                    Some(&leaf),
+                    range.clone(),
+                    base,
+                    visit,
+                )?;
+                if progress.is_break() {
+                    // The matched leaf already released its lease. Stop before
+                    // reading another span record or acquiring its source bytes.
+                    return Ok(progress);
+                }
                 base = next;
             }
-            Ok(())
+            Ok(ControlFlow::Continue(()))
         }
         // Visit the left range first, propagating callback failures before entering the right side.
         MarkdownPieceTreeNode::Branch { left, right, .. } => {
-            visit_piece_tree_range(
+            let progress = visit_piece_tree_range_until_break(
                 document,
                 Some(left.as_ref()),
                 range.clone(),
                 node_start,
                 visit,
             )?;
-            visit_piece_tree_range(
+            if progress.is_break() {
+                // A completed left-side result excludes the right subtree;
+                // no later leaf is borrowed merely to return an unused callback result.
+                return Ok(progress);
+            }
+            visit_piece_tree_range_until_break(
                 document,
                 Some(right.as_ref()),
                 range,

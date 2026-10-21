@@ -35,12 +35,7 @@ impl MarkdownSessionAccess {
         document
             .ensure_text_input_idle()
             .map_err(markdown_document_buffer_save_error)?;
-        let expected_revision = document
-            .original_revision()
-            // Recovery records have no verified historical baseline. Reject ordinary
-            // save, autosave, and close-save before inspecting or writing files.
-            .ok_or(MarkdownWorkspaceError::PendingLegacyRecovery)?
-            .encode_hex();
+        let expected_revision = document.original_revision().encode_hex();
         let relative_path =
             relative_markdown_path(&self.canonical_root, document.path()).map_err(|_| {
                 // Unverifiable association or revision state cannot authorize replacing authoritative disk bytes.
@@ -69,8 +64,9 @@ impl MarkdownSessionAccess {
                 // Identical live and external bytes can converge safely without overwriting either version.
                 return adopt_matching_document_buffer_baseline(document, &path, &current.revision);
             }
-            // Even a clean live buffer cannot silently change characters behind TextKit. The UI's
-            // explicit conflict reload owns canonical replacement and native graph/cache notifications.
+            // Even a clean live buffer cannot silently change canonical characters.
+            // Explicit UI reload owns replacement and the native graph/cache notifications;
+            // this persistence operation reports only the conflicting disk observation.
             return Err(MarkdownWorkspaceError::SaveConflict);
         }
         if !document.is_dirty() {
@@ -117,12 +113,7 @@ impl MarkdownSessionAccess {
         // Validate the complete streamed temporary through an independent immutable snapshot before publication.
         let mut replacement = MarkdownDocumentBuffer::open(&temporary.path, MAX_DOCUMENT_BYTES)
             .map_err(markdown_document_buffer_save_error)?;
-        let saved_revision = replacement
-            .original_revision()
-            // A newly opened save temporary must have a real baseline; an unexpected
-            // pending-recovery state cannot authorize publication.
-            .ok_or(MarkdownWorkspaceError::PendingLegacyRecovery)?
-            .encode_hex();
+        let saved_revision = replacement.original_revision().encode_hex();
         let rechecked = inspect_markdown_save_baseline(&path)?;
         if rechecked.revision != expected_revision {
             // A revision change while streaming invalidates the proposed overwrite.
@@ -275,6 +266,8 @@ impl MarkdownSessionAccess {
                             .file
                             .try_clone()
                             .and_then(|file| {
+                                // Clone only the acquired descriptor, then bind its
+                                // complete post-rename value to the original parent owner.
                                 AcquiredMarkdownFile::seal(
                                     file,
                                     temporary_identity,
@@ -285,6 +278,9 @@ impl MarkdownSessionAccess {
                                 )
                             })
                             .map_err(|_| {
+                                // Publication already happened, but cleanup ownership
+                                // could not be sealed. Retain the visible name and report
+                                // the original storage failure with rollback uncertainty.
                                 publication.rollback_unconfirmed();
                                 MarkdownWorkspaceError::StorageUnavailable
                             })?;
@@ -334,7 +330,7 @@ mod tests {
         // The source/destination files are synthetic and confined to a temporary vault.
         let directory = tempfile::tempdir().expect("temporary vault directory");
         let root = directory.path().join("vault");
-        let workspace = MarkdownWorkspace::new(root.clone(), directory.path().join("data"));
+        let workspace = MarkdownWorkspace::new(root.clone());
         let access = workspace.open_session().expect("open synthetic vault");
         fs::write(root.join("Note.md"), "before").expect("seed original");
         fs::write(root.join("Draft.md"), "existing destination").expect("seed collision");
@@ -381,12 +377,6 @@ mod tests {
         assert_eq!(document.generation(), generation);
         assert!(document.is_dirty());
         assert!(document.can_undo());
-        assert!(
-            !directory
-                .path()
-                .join("data/markdown-conflict-recovery")
-                .exists()
-        );
         assert!(fs::read_dir(&root).unwrap().all(|entry| {
             // Successful publication leaves no generated save file alongside user notes.
             !entry
@@ -403,7 +393,7 @@ mod tests {
         // Make one clean source whose bytes must survive every rejected destination.
         let directory = tempfile::tempdir().expect("temporary vault directory");
         let root = directory.path().join("vault");
-        let workspace = MarkdownWorkspace::new(root.clone(), directory.path().join("data"));
+        let workspace = MarkdownWorkspace::new(root.clone());
         let access = workspace.open_session().expect("open synthetic vault");
         fs::write(root.join("Note.md"), "source").expect("seed original");
         fs::create_dir(root.join("attachments")).expect("reserved attachment directory");
@@ -432,7 +422,7 @@ mod tests {
         // Keep all note, snapshot and save resources within one isolated synthetic vault.
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("vault");
-        let workspace = MarkdownWorkspace::new(root.clone(), directory.path().join("data"));
+        let workspace = MarkdownWorkspace::new(root.clone());
         let access = workspace.open_session().unwrap();
         fs::write(root.join("Note.md"), "before").unwrap();
         let mut document = access.open_document_buffer("Note.md").unwrap();
@@ -490,7 +480,7 @@ mod tests {
     fn identical_external_revision_adoption_keeps_history_and_detects_next_conflict() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("vault");
-        let workspace = MarkdownWorkspace::new(root.clone(), directory.path().join("data"));
+        let workspace = MarkdownWorkspace::new(root.clone());
         let access = workspace.open_session().unwrap();
         fs::write(root.join("Note.md"), "before").unwrap();
         let mut document = access.open_document_buffer("Note.md").unwrap();
@@ -535,7 +525,7 @@ mod tests {
         // The fixture has both undo and redo before the save, independently of native UI ownership.
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("vault");
-        let workspace = MarkdownWorkspace::new(root.clone(), directory.path().join("data"));
+        let workspace = MarkdownWorkspace::new(root.clone());
         let access = workspace.open_session().unwrap();
         let path = root.join("Note.md");
         fs::write(&path, "before").unwrap();
@@ -628,7 +618,7 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().ino(), published_inode);
         assert_eq!(receipt.revision, current_revision.encode_hex());
         assert_eq!(receipt.byte_count, draft.len() as u64);
-        assert_eq!(document.original_revision(), Some(current_revision));
+        assert_eq!(document.original_revision(), current_revision);
         assert!(document.original_file_identity_is_unchanged());
         assert!(!document.is_dirty());
         assert_eq!(document.storage_profile(), profile);

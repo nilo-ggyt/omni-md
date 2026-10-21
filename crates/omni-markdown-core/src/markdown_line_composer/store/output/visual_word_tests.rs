@@ -1,9 +1,9 @@
-//! 原视觉目录、实际 Arabic 字体、原 GCB 与正文分类的完整业务回归。
+//! Behavior through the original visual directory, actual Arabic fonts, grapheme boundaries, and Source classification.
 
 use super::*;
 use crate::{MarkdownComposedVisualWordAnswer as WordAnswer, MarkdownComposedVisualWordQuery};
 
-/// 一字节/一记录量子覆盖 UTF8 半标量和目录续算；这里只返回原真正终点或明确缺前缀。
+/// One-byte/record quanta cover partial UTF-8 scalars and directory continuation; return an actual endpoint or explicit missing prefix.
 fn finish_word(
     output: &mut MarkdownComposedLines,
     query: &mut MarkdownComposedVisualWordQuery,
@@ -33,7 +33,7 @@ fn finish_word(
 }
 
 #[test]
-/// RTL 的屏幕左向必须增加此真实 run 的逻辑位置；整词与 leading-space 的终点不能借反向逻辑动作代替。
+/// Screen-left in this actual RTL run increases logical position; complete-word/leading-space endpoints cannot use a substituted logical action.
 fn visual_word_rtl_preserves_real_screen_direction_and_whole_groups() {
     let mut fixture = Fixture::new("سلام عالم");
     use_arabic_font(&mut fixture);
@@ -61,7 +61,7 @@ fn visual_word_rtl_preserves_real_screen_direction_and_whole_groups() {
 }
 
 #[test]
-/// 首个 RTL 段决定本次前后流向；跨 CRLF 后即使段 base 改变，也不能反转原动作或伪造 BOF。
+/// The initial RTL paragraph fixes this query's flow; a new base after CRLF cannot reverse its action or manufacture BOF.
 fn visual_word_keeps_its_original_flow_when_crossing_a_different_paragraph_base() {
     let mut fixture = Fixture::new("سلام\r\n1234");
     use_arabic_font(&mut fixture);
@@ -79,7 +79,7 @@ fn visual_word_keeps_its_original_flow_when_crossing_a_different_paragraph_base(
 }
 
 #[test]
-/// ZWNJ 保实际 Arabic 字素与独立整形边界；首个软行结束仍缺后继，完整词不能在该视口变成 BOF。
+/// ZWNJ retains actual Arabic grapheme/shaping boundaries; an incomplete soft-line prefix cannot turn the whole word into a false document boundary.
 fn visual_word_rtl_crosses_real_soft_lines_and_continues_the_same_prefix() {
     let text = "س\u{200c}".repeat(24);
     let mut fixture = Fixture::new(&text);
@@ -101,6 +101,8 @@ fn visual_word_rtl_crosses_real_soft_lines_and_continues_the_same_prefix() {
         bytes += actual;
         match answer {
             WordAnswer::PrefixNotCovered => {
+                // Return the old reader before publishing another actual prefix.
+                // The same query keeps classified progress without owning output.
                 missing += 1;
                 let old = prefix.resource_observer();
                 drop(prefix);
@@ -114,6 +116,8 @@ fn visual_word_rtl_crosses_real_soft_lines_and_continues_the_same_prefix() {
                 prefix = composer.publish_ready_prefix().unwrap().unwrap();
             }
             WordAnswer::Found { utf16: 48, .. } => {
+                // A complete endpoint must include all previously missing soft
+                // lines once; reversing direction then uses that real directory.
                 assert!(missing > 0, "必须实际经过 prefix 不足，不能只测完整短输出");
                 assert_eq!(
                     bytes,
@@ -138,7 +142,7 @@ fn visual_word_rtl_crosses_real_soft_lines_and_continues_the_same_prefix() {
 }
 
 #[test]
-/// 组合字符保持原 GCB，CRLF 与空行来自已认证控制；leading-space 不得被视口或字节量子截断。
+/// Combining sequences retain their graphemes and verified CRLF/empty-line controls; viewport/byte quanta must not truncate leading-space classification.
 fn visual_word_crosses_actual_crlf_and_combining_boundaries() {
     let fixture = Fixture::new("ae\u{301}\r\n\r\nz");
     let mut output = super::output(&fixture);
@@ -155,7 +159,7 @@ fn visual_word_crosses_actual_crlf_and_combining_boundaries() {
 }
 
 #[test]
-/// 原 writer 的新 prefix 继续已分类空白；同 Source 的另一 writer 不能复用它的宽度/顺序权限。
+/// A new prefix from the same writer continues classified whitespace; another writer sharing Source cannot reuse its width/order authority.
 fn visual_word_continues_the_same_writer_prefix_without_replaying_accepted_text() {
     let fixture = Fixture::new("a \u{2028}word");
     let mut composer = MarkdownLineComposer::new(
@@ -197,7 +201,7 @@ fn visual_word_continues_the_same_writer_prefix_without_replaying_accepted_text(
 }
 
 #[test]
-/// UTF8 分类暂停和已完成缓存都保原弱 Font；实际注册 owner 归还后不得再交旧视觉终点。
+/// Paused UTF-8 classification and completed results retain weak original font identity; dropping its registration revokes old visual endpoints.
 fn visual_word_rejects_actual_font_retirement_before_and_after_completion() {
     for complete in [false, true] {
         let mut fixture = Fixture::new("سلام عالم");
@@ -207,11 +211,15 @@ fn visual_word_rejects_actual_font_retirement_before_and_after_completion() {
             .visual_word_query(0, MarkdownComposedLineAffinity::Downstream, None, false)
             .unwrap();
         if complete {
+            // Even a cached complete answer depends on the original registration;
+            // completion is not an independent lifetime claim on the font.
             assert!(matches!(
                 finish_word(&mut output, &mut query).0,
                 WordAnswer::Found { utf16: 4, .. }
             ));
         } else {
+            // Pause after the first actual byte of a multibyte Arabic scalar,
+            // before classification can finish its current grapheme.
             let mut suspended = false;
             for _ in 0..10_000 {
                 let step = output
@@ -245,6 +253,8 @@ fn visual_word_rejects_actual_font_retirement_before_and_after_completion() {
             &[],
         )
         .unwrap();
+        // Replacing the actual registered owner drops original font authority;
+        // no private liveness bit or fabricated expired-font result is injected.
         fixture.font = fixture.catalog.register(&replacement).unwrap();
         let resources = output.resource_observer();
         assert!(matches!(
@@ -256,7 +266,7 @@ fn visual_word_rejects_actual_font_retirement_before_and_after_completion() {
 }
 
 #[test]
-/// 原 opaque 控制只交回展开需求；不能按数值跳过隐区后再分类或把隐藏内容当空白。
+/// Original opaque controls return fold-expansion requirements; do not skip numeric ranges or classify hidden text as whitespace.
 fn visual_word_returns_the_original_fold_range_before_reading_hidden_text() {
     let fixture = Fixture::new("head\nאבג\nlast");
     let mut composer = MarkdownLineComposer::new(
@@ -281,7 +291,7 @@ fn visual_word_returns_the_original_fold_range_before_reading_hidden_text() {
 }
 
 #[test]
-/// 真 Source 回收 EIO 高于同时取消；视觉查询只持弱进度，失败必须归还原输出 Reader。
+/// Injected EIO from actual Source reclamation precedes cancellation; visual queries retain weak progress and failure returns the original output reader.
 fn visual_word_keeps_original_source_error_before_cancellation() {
     let fixture = Fixture::new("word tail");
     let mut output = super::output(&fixture);
@@ -293,6 +303,8 @@ fn visual_word_keeps_original_source_error_before_cancellation() {
         .text_snapshot()
         .visit_byte_range(0..1, |_| Ok(()))
         .unwrap();
+    // Existing fault control injects EIO through actual source-window reclamation.
+    // Do not call this a kernel I/O failure or let later cancellation hide it.
     fixture.document.fail_next_original_reclaim_for_test();
     assert_eq!(
         fixture.document.reclaim_original_read_windows_for_test(),

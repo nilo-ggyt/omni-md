@@ -1,9 +1,9 @@
-//! 原Input格式用例直接运行Core事务，核真实Unicode选区、历史、失败回退与共享映射。
+//! Exercise Input formatting through Core transactions, checking actual Unicode selection/history, rollback, and shared mappings.
 
 use super::*;
 use omni_markdown_core::MarkdownFormatAction as Format;
 
-/// 行内inner与块格式分别沿Core选择规则，原反向before只由一次真实Undo恢复。
+/// Inline inner/block selections follow their Core rules; one actual Undo restores the original reversed selection.
 #[test]
 fn source_format_body_preserves_core_selection_and_exact_history() {
     for (action, expected, after) in [
@@ -43,13 +43,13 @@ fn source_format_body_preserves_core_selection_and_exact_history() {
             assert!(document.try_borrow_mut().is_ok());
             assert!(owner.folds.try_borrow_mut().is_ok());
             true
-        }; // 任何可重入的权限闭包都必须在Doc/fold借用外执行。
+        }; // Every reentrant authority callback runs outside document/fold borrows.
         let original = owner.state().unwrap();
         let permit = owner.capture(1, &current).unwrap();
         let commit = owner.apply_format(&permit, action, &current).unwrap();
         assert_eq!(text(&document), expected);
         assert_eq!(commit.state.generation, original.generation + 1);
-        // 行内包裹沿原Core约定正向选择inner，不能在Native事后改回方向而破坏历史after。
+        // Inline wrapping selects the inner text forward as Core defines; Native must not alter direction afterward and corrupt history after.
         assert_eq!(commit.state.selection, after);
         assert_eq!(document.borrow().selection(), after);
         assert!(commit.invalidation.characters_changed);
@@ -65,7 +65,7 @@ fn source_format_body_preserves_core_selection_and_exact_history() {
                 .unwrap(),
         );
         assert_eq!(text(&document), "前中😀后");
-        assert_eq!(undo.state.selection, before); // 唯一Undo保留菜单点击前的真实反向选择。
+        assert_eq!(undo.state.selection, before); // The sole Undo restores the actual reversed selection before the menu action.
         assert!(!document.borrow().can_undo());
         let redo = owner.capture(1, &current).unwrap();
         let redo = committed(
@@ -105,7 +105,7 @@ fn source_format_body_preserves_core_selection_and_exact_history() {
         let permit = owner.capture(1, &|_| true).unwrap();
         let commit = owner.apply_format(&permit, action, &|_| true).unwrap();
         assert_eq!(text(&document), expected);
-        assert_eq!(commit.state.selection, after); // 块格式原本保方向，适配层也必须保原反向after。
+        assert_eq!(commit.state.selection, after); // Block formatting retains direction, including the actual reversed after-selection in this adapter.
         let undo = owner.capture(1, &|_| true).unwrap();
         let undo = committed(
             owner
@@ -118,7 +118,7 @@ fn source_format_body_preserves_core_selection_and_exact_history() {
     }
 }
 
-/// 空caret只使用原占位与模板选区，不把格式当作另一次输入后再修正选择。
+/// An empty caret uses the existing placeholder/template selection directly, without another insertion followed by selection correction.
 #[test]
 fn source_format_caret_uses_original_placeholder_and_template_selection() {
     for (action, expected, selection) in [
@@ -173,11 +173,11 @@ fn source_format_caret_uses_original_placeholder_and_template_selection() {
         );
         assert_eq!(text(&document), "前尾");
         assert_eq!(undo.state.selection, MarkdownTextSelection::caret(1));
-        assert!(!document.borrow().can_undo()); // 空caret模板也只有一笔canonical格式历史。
+        assert!(!document.borrow().can_undo()); // An empty-caret template still creates just one canonical formatting transaction.
     }
 }
 
-/// 真实两端插入保留内部fold；候选observer拒绝标量错误时正文与历史一起回退。
+/// Actual endpoint insertions retain interior folds; scalar rejection by the candidate observer rolls back text and history together.
 #[test]
 fn source_format_maps_actual_surround_changes_and_rolls_back_observer_failure() {
     let (_file, document) = fixture("# H\nbody\nend", 4096);
@@ -209,7 +209,7 @@ fn source_format_maps_actual_surround_changes_and_rolls_back_observer_failure() 
             hidden_utf16_range: 5..10
         }]
     );
-    // 真实变化只有两端插入；若错误使用整段envelope，内部fold会被删掉而非平移。
+    // Only endpoint insertions occurred; using a replacement envelope would incorrectly delete the interior fold instead of shifting it.
     let undo = owner.capture(1, &|_| true).unwrap();
     committed(
         owner
@@ -233,7 +233,7 @@ fn source_format_maps_actual_surround_changes_and_rolls_back_observer_failure() 
             head_utf16: 2,
         })
         .unwrap();
-    // 映射器只验整数范围；真实candidate observer还必须拒绝落在代理项内部的旧折叠端点。
+    // The mapper checks integer ranges; the real candidate observer must also reject old fold endpoints inside a surrogate pair.
     let owner = NativeMarkdownPagedInput::with_folds(
         Rc::downgrade(&document),
         vec![MarkdownFoldRegion {
@@ -256,10 +256,10 @@ fn source_format_maps_actual_surround_changes_and_rolls_back_observer_failure() 
     assert_eq!(*owner.folds.borrow(), folds);
     assert!(!document.borrow().can_undo() && !document.borrow().can_redo());
     assert!(!document.borrow().has_prepared_text_input());
-    assert!(!owner.is_busy()); // observer拒绝后，原新增marker候选和Mutation占用均已真实归还。
+    assert!(!owner.is_busy()); // Observer rejection returns both the added-marker candidate and Mutation admission.
 }
 
-/// 格式前置拒绝保原IME、多选及预算，不从主memento或较新权限补一次提交。
+/// Formatting preflight preserves IME/multiple selection/budgets without manufacturing a commit from the primary memento or newer authority.
 #[test]
 fn source_format_rejects_marked_multiple_ranges_stale_permit_and_budget_without_edit() {
     let (_file, document) = fixture("甲🙂乙", 4096);
@@ -313,7 +313,7 @@ fn source_format_rejects_marked_multiple_ranges_stale_permit_and_budget_without_
         owner
             .apply_format(&permit, Format::Bold, &|_| true)
             .is_err()
-    ); // 原live-byte上限不因格式marker很短而放宽。
+    ); // Small formatting markers do not relax the configured live-byte limit.
     assert_eq!(owner.state().unwrap(), before);
     assert_eq!(text(&document), "甲🙂");
     assert!(!document.borrow().can_undo() && !document.borrow().can_redo());
@@ -325,7 +325,7 @@ fn source_format_rejects_marked_multiple_ranges_stale_permit_and_budget_without_
     assert_eq!(owner.state().unwrap(), before);
 }
 
-/// 已提交收据的显示权限撤销不改变canonical事实，旧permit也不能重放格式。
+/// Revoking a committed receipt's display authority changes no canonical facts and never authorizes old-permit replay.
 #[test]
 fn source_format_committed_receipt_revocation_does_not_replay_or_rollback() {
     let (_file, document) = fixture("甲", 4096);
@@ -334,7 +334,7 @@ fn source_format_committed_receipt_revocation_does_not_replay_or_rollback() {
     let current = |expected| expected == epoch.get();
     let permit = owner.capture(1, &current).unwrap();
     let commit = owner.apply_format(&permit, Format::Bold, &current).unwrap();
-    epoch.set(2); // 模拟Core已提交后原窗口权限结束；收据只停止后果，不撤销已发布正文。
+    epoch.set(2); // End original window authority after Core publication; the receipt stops effects without rolling back text.
     assert!(matches!(
         commit.check_current(&current),
         Err(NativeMarkdownPagedInputError::Revoked)
@@ -357,7 +357,7 @@ fn source_format_committed_receipt_revocation_does_not_replay_or_rollback() {
     assert!(!document.borrow().can_undo());
 }
 
-/// 真实Cell格式只发布原局部root/历史；marked、块位置、旧票和Source失败不改canonical。
+/// Cell formatting publishes only its local root/history; marked input, block location, stale authority, and Source failure leave canonical text unchanged.
 #[test]
 fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_canonical() {
     use omni_markdown_core::MarkdownCellDraftError;
@@ -370,7 +370,7 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
     let tail = [b'x'; 4096];
     for _ in 0..32 {
         file.write_all(&tail).unwrap();
-    } // 原映射超过64KiB驻留槽，后续有限读才能触发真实驱逐，而非直接伪置Source错误。
+    } // Exceed the 64 KiB resident slots so bounded reads cause actual eviction rather than directly setting Source failure.
     let document = Rc::new(RefCell::new(
         MarkdownDocumentBuffer::open(file.path(), 256 * 1024).unwrap(),
     ));
@@ -386,7 +386,7 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
                 .iter()
                 .copied()
                 .eq(input.bytes().map(u16::from))
-        ); // 固定短表保留全部原字节；测试不建立大canonical镜像。
+        ); // Verify every byte of the fixed short table without constructing a large canonical mirror.
         let mut offset = input.len();
         let mut actual = [0; 4096];
         while offset < original.utf16_len() {
@@ -396,14 +396,14 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
                 .unwrap();
             assert!(actual[..count].iter().all(|unit| *unit == u16::from(b'x')));
             offset += count;
-        } // 每次仅借用固定窗口，完整核尾部未被局部格式或本地历史改写。
+        } // Use fixed read windows to verify the entire tail remains unchanged by local formatting/history.
     };
     let verified = {
         let document = document.borrow();
         let mut request = document
             .table_window_request(
                 MarkdownTableWindowTarget::AtUtf16(0),
-                0..input.encode_utf16().count(), // 只请求原短表；尾部仅供真实页驱逐，不属于表格视口。
+                0..input.encode_utf16().count(), // Request only the short table; the tail drives actual page eviction and is outside the table viewport.
                 1,
                 0..0,
             )
@@ -458,7 +458,7 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
     owner
         .copy_utf16_code_units(&read, 0, &mut units, &|_| true)
         .unwrap();
-    assert_eq!(units, [0x62, 0x61, 0x73, 0x65]); // 拒绝格式没有插入额外本地Undo，也没有提交canonical。
+    assert_eq!(units, [0x62, 0x61, 0x73, 0x65]); // Rejected formatting adds no local Undo and commits no canonical text.
     let permit = owner.capture(1, &|_| true).unwrap();
     owner
         .insert_text(&permit, "前中😀后", NSRange::new(0, 4), &|_| true)
@@ -480,13 +480,13 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
             original.can_undo(),
             original.can_redo(),
         )
-    }; // 只核当前正式Core公开的canonical事实，不为适配器测试增设存储统计入口。
+    }; // Inspect existing public canonical facts without adding storage counters for adapter tests.
     let baseline = canonical_state();
     let current = |_| {
         assert!(document.try_borrow_mut().is_ok());
         assert!(owner.folds.try_borrow_mut().is_ok());
         true
-    }; // 外部权限回调始终在Core借用外执行；Cell成功发布也不能事后回调并伪装成拒绝。
+    }; // External authority callbacks run outside Core borrows; no callback after successful Cell publication may turn success into rejection.
     let original_source = session.capture_source().unwrap();
     let permit = owner.capture(1, &current).unwrap();
     let commit = owner.apply_format(&permit, Format::Bold, &current).unwrap();
@@ -506,7 +506,7 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
     assert_eq!(
         original_source.byte_offset_for_utf16(0),
         Err(MarkdownDocumentBufferError::PreparedTextInputStale)
-    ); // 原Cell Source按真实content_serial撤权，不能借空DocWeak假装改了正文。
+    ); // Actual content_serial revokes the original Cell Source; an empty document Weak cannot masquerade as a Body edit.
     drop(original_source);
     let read = owner.capture(1, &current).unwrap();
     let mut formatted = [0; 9];
@@ -548,7 +548,7 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
             .unwrap(),
     );
     assert_eq!(redo.state.selection, commit.state.selection);
-    assert_eq!(redo.state.utf16_len, 9); // caret移动不能改写原Isolated格式组的真实after。
+    assert_eq!(redo.state.utf16_len, 9); // Caret movement cannot rewrite the isolated format group's actual after-selection.
     assert_eq!(canonical_state(), baseline);
     assert_canonical_bytes();
     for action in [
@@ -572,7 +572,7 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
             ))
         ));
         assert_eq!(owner.state().unwrap(), before);
-    } // 这里只回报位置错误；不能为支持正文命令而暗中提交Cell或丢掉这些原菜单动作。
+    } // Report the location error without implicitly committing Cell or removing existing Body menu actions.
     let before = owner.state().unwrap();
     let revoked = owner.capture(1, &current).unwrap();
     assert!(matches!(
@@ -591,7 +591,7 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
         Err(NativeMarkdownPagedInputError::Cell(
             MarkdownCellDraftError::Stale
         ))
-    )); // 原edit serial失效先于新的格式位置判断，不能重捕当前caret把旧命令续上。
+    )); // Original edit-serial failure precedes a new format-location check; recapturing the current caret cannot renew an old command.
     assert_eq!(owner.state().unwrap(), before);
     assert_eq!(canonical_state(), baseline);
     assert_canonical_bytes();
@@ -610,8 +610,8 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
         );
         assert_eq!(backing.first_errno(), Some(libc::EIO));
         assert!(backing.reclaim_attempts() > before.0 && backing.reclaim_successes() > before.1);
-        // 前一轮完整有限oracle已读到尾部；回读首个窗口必须驱逐真实原页。
-        // observer只在实际msync成功后注入合成EIO，不把它称作内核故障。
+        // The prior bounded oracle reached the tail; reading the first window again must evict an actual original page.
+        // The observer injects synthetic EIO only after successful actual msync; this is not a kernel failure claim.
         assert!(matches!(
             owner.apply_format(&original, Format::Heading1, &|_| false),
             Err(NativeMarkdownPagedInputError::Cell(
@@ -619,7 +619,7 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
                     MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
                 )
             ))
-        )); // 真实Source EIO先于撤权/块位置，输入拒绝不能被误报成普通菜单失败。
+        )); // Source EIO precedes revocation/block-location checks; input rejection cannot become a generic menu failure.
         assert_eq!(resources.snapshot().first_source_errno, Some(libc::EIO));
         assert_eq!(document.borrow().generation(), 0);
         assert_eq!(canonical_state(), baseline);
@@ -641,17 +641,17 @@ fn source_format_cell_inline_history_and_rejections_preserve_local_domain_and_ca
             assert_eq!(actual, tail);
         }
         assert_eq!(original_file.read(&mut actual).unwrap(), 0);
-    } // 原文件逐块完整比较，源失败与局部取消都不得改写用户持久数据。
+    } // Compare the complete original file in chunks; Source failure/local cancellation must not rewrite persisted input.
 }
 
-/// 大选区只增加有限marker并共享原映射，完整保存逐块核验后确认原资源真实释放。
+/// A large selection adds bounded markers and shares original mapping; verify complete streamed save and actual resource release.
 #[test]
 fn source_format_large_surround_keeps_shared_mapping_and_exact_saved_bytes() {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = tempfile::NamedTempFile::new().unwrap();
     let block = [b'x'; 4096];
     for _ in 0..256 {
-        file.write_all(&block).unwrap(); // 样本与完整保存oracle都按固定4KiB处理，不保留整篇String。
+        file.write_all(&block).unwrap(); // Generate the fixture and inspect complete saved output in fixed 4 KiB blocks without a full-text String.
     }
     let mut original = MarkdownDocumentBuffer::open(file.path(), 2 * 1024 * 1024).unwrap();
     let before = MarkdownTextSelection {
@@ -706,5 +706,5 @@ fn source_format_large_surround_keeps_shared_mapping_and_exact_saved_bytes() {
     assert!(weak.upgrade().is_none());
     assert_eq!(mapping.mapped_bytes(), 0);
     assert!(mapping.unmap_succeeded() && !mapping.failed());
-    assert!(commit.check_current(&|_| true).is_err()); // 原Input、已消费票与收据均不保活Doc或其映射。
+    assert!(commit.check_current(&|_| true).is_err()); // Input, consumed permits, and receipts retain neither document nor mapping.
 }

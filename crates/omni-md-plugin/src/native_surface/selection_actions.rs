@@ -1,22 +1,25 @@
-//! 标准选择动作沿同一原输入票计算、发布和安装；不为 Native 回调补签较新的正文状态。
+//! Compute, publish and install standard selection actions under one original input ticket,
+//! without refreshing a stale native callback from a successor document state.
 
 use super::*;
 use objc2_app_kit::{NSTextSelectionNavigationDestination, NSTextSelectionNavigationDirection};
 
-/// 系统已经解释好的语义动作共用一个权限和发布入口，不在这里重新绑定物理按键。
+/// Share authority/publication for system-interpreted semantic actions, without rebinding physical keys.
 #[derive(Clone, Copy)]
 enum SelectionAction {
     Motion(NativeMarkdownSelectionMotion),
     Expansion(NativeMarkdownSelectionExpansion),
 }
 
-/// 只有同一原动作仍有效时才把标记文本导航交回 IME；返回途中析构不能给旧动作续权。
+/// Return marked-text navigation to the IME only while the same original action remains current;
+/// destruction during return cannot renew stale authority.
 pub(super) struct NativeMarkdownSelectionImeForward {
     capture: NativeMarkdownSelectionCapture,
     input_epoch: u64,
 }
 
 impl NativeMarkdownSelectionImeForward {
+    /// Match the original capture, live graph and exact input epoch immediately before native forwarding.
     pub(super) fn current(&self, view: &PieceBackedMarkdownTextView) -> bool {
         self.capture.current()
             && !view.ivars().textkit_graph_teardown.get()
@@ -25,7 +28,7 @@ impl NativeMarkdownSelectionImeForward {
 }
 
 impl PieceBackedMarkdownTextView {
-    /// 标准方向动作只改变选择；输入法仍拥有其标记文本中的导航，不接管候选交互。
+    /// Standard motion changes selection only; the IME retains navigation inside marked text and candidate interaction.
     pub(super) fn run_semantic_selection_motion(
         &self,
         motion: NativeMarkdownSelectionMotion,
@@ -33,7 +36,7 @@ impl PieceBackedMarkdownTextView {
         self.run_semantic_selection_action(SelectionAction::Motion(motion))
     }
 
-    /// 标准全选、选词和选行沿同一状态入口执行；完整范围由明确动作或原图导航给出。
+    /// Run select-all/word/line through one state entry; explicit actions or the original graph supply complete endpoints.
     pub(super) fn run_semantic_selection_expansion(
         &self,
         expansion: NativeMarkdownSelectionExpansion,
@@ -41,17 +44,20 @@ impl PieceBackedMarkdownTextView {
         self.run_semantic_selection_action(SelectionAction::Expansion(expansion))
     }
 
+    /// Preserve one original action from initial capture through bounded target calculation and receipt installation.
     fn run_semantic_selection_action(
         &self,
         action: SelectionAction,
     ) -> Option<NativeMarkdownSelectionImeForward> {
         let _payload = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
         if self.ivars().textkit_graph_teardown.get() {
-            return None; // 关闭后的系统空壳不能重建选择或延后任务。
+            // An empty framework-retained shell cannot reconstruct selection or deferred work after close.
+            return None;
         }
         self.ivars().folds.invalidate_native_install();
         let initial_capture = self.ivars().folds.capture_selection().ok()?;
         let input_epoch = self.ivars().table_input_intent_epoch.get().checked_add(1)?;
+        // A new semantic action cancels old table continuity without adopting its queued input authority.
         self.cancel_table_continuity_for_new_input();
         let initial = || {
             initial_capture.current()
@@ -69,13 +75,16 @@ impl PieceBackedMarkdownTextView {
             return None;
         };
         if marked {
+            // Inspect neither the marked range nor its text. Super may run once only if this
+            // original ticket remains current after the forwarding payload returns to its caller.
             return Some(NativeMarkdownSelectionImeForward {
                 capture: initial_capture,
                 input_epoch,
-            }); // 不读取或重写 IME 标记范围；super 只在返回后的原票仍有效时执行一次。
+            });
         }
-        // 文档首尾是源坐标的绝对边界，与旧 caret 的软换行侧无关。普通首尾动作和全选
-        // 自行明确新方向；扩选仍须保留原 anchor，不能借绝对目标猜测未知选择的活动端。
+        // Document boundaries are absolute source coordinates, independent of old soft-wrap
+        // affinity. Plain boundary motion and select-all specify a new direction; extension
+        // still preserves the original anchor and cannot infer an unknown active endpoint.
         let document_end = match action {
             SelectionAction::Motion(motion)
                 if motion.destination == NSTextSelectionNavigationDestination::Document =>
@@ -83,17 +92,20 @@ impl PieceBackedMarkdownTextView {
                 match motion.direction {
                     NSTextSelectionNavigationDirection::Backward => Some(false),
                     NSTextSelectionNavigationDirection::Forward => Some(true),
-                    _ => None, // 视觉方向不冒充源文档首尾，仍交原图计算。
+                    // Visual directions are not logical source boundaries; the original graph still resolves them.
+                    _ => None,
                 }
             }
-            _ => None, // 词、行、段落和相对移动依旧需要实际布局。
+            // Word, line, paragraph and relative movements still require actual layout.
+            _ => None,
         };
         let replaces_direction = match action {
             SelectionAction::Expansion(expansion) => !expansion.requires_known_head(),
             SelectionAction::Motion(motion) => document_end.is_some() && !motion.extending,
         };
         let captured = if replaces_direction {
-            // 明确的新方向允许替换未知或多范围；旧 Native 多选不能冒充单 before。
+            // An explicit new direction may replace unknown or multiple ranges; an old native
+            // multi-selection cannot be presented as a single before-range.
             let Ok(Ok(native_before)) = native_markdown_table_intent_step(&initial, || {
                 self.native_ordered_selection_state_for_capture(&initial_capture)
             }) else {
@@ -111,7 +123,8 @@ impl PieceBackedMarkdownTextView {
                 NativeMarkdownOrderedSelection::Multiple => captured,
             }
         } else {
-            // 相对动作必须知道原活动端；未知非空方向不能成为折叠或历史里的猜测 head。
+            // Relative actions require the proven original active endpoint. Unknown nonempty
+            // direction cannot become an invented endpoint in folding or history state.
             let Ok(Ok(captured)) =
                 native_markdown_table_intent_step(&initial, || self.primary_text_selection())
             else {
@@ -128,7 +141,8 @@ impl PieceBackedMarkdownTextView {
             let document = document.borrow();
             (document.generation(), document.utf16_len())
         };
-        drop(document); // 原动作只保 Weak 与标量；Native 导航期间不另保正文 root。
+        // Preserve Weak identity and scalars only; native navigation retains no extra document root.
+        drop(document);
         let width = storage.ivars().table_projection_width_key.get();
         let geometry_epoch = storage.ivars().table_geometry_epoch.get();
         let mode = storage.presentation_mode();
@@ -148,7 +162,8 @@ impl PieceBackedMarkdownTextView {
         };
         let target = (|| -> Result<_, String> {
             if let SelectionAction::Expansion(expansion) = action {
-                // 全选只用有限源长度；词、视觉行和段落才临时取得原生导航图。
+                // Select-all uses finite source length alone; word/visual-line/paragraph
+                // expansion temporarily acquires the original native navigation graph.
                 let graph = expansion
                     .requires_known_head()
                     .then(|| NativeMarkdownSelectionGraph::load(self, &current))
@@ -166,8 +181,9 @@ impl PieceBackedMarkdownTextView {
                 unreachable!("expansion handled above");
             };
             if let Some(at_end) = document_end {
-                // 两个真实端点无需布局正文，也不消费旧换行侧；EOF 取上游，BOF 取下游。
-                // 空文档只有同一个 BOF，不建立无意义的上游侧或垂直目标列。
+                // Actual source endpoints require no body layout or inherited wrap side.
+                // EOF is upstream and BOF downstream; an empty source has only BOF and
+                // establishes neither a fictitious upstream affinity nor a vertical target.
                 let head = if at_end { length } else { 0 };
                 let selection = if motion.extending {
                     MarkdownTextSelection {
@@ -197,6 +213,8 @@ impl PieceBackedMarkdownTextView {
                 .head_is_upstream()
                 .ok_or("当前插入位置的换行侧尚未确定")?;
             let column = if vertical {
+                // Reuse a vertical goal only in its original width and layout epoch; otherwise
+                // derive a fresh column from the actual original caret before moving.
                 if let Some(goal) = captured
                     .vertical_goal()
                     .filter(|goal| goal.width_key == width && goal.geometry_epoch == geometry_epoch)
@@ -215,7 +233,8 @@ impl PieceBackedMarkdownTextView {
                     )?)
                 }
             } else {
-                None // 横向、按词和边界动作建立新的目标列，结束此前的垂直列保持序列。
+                // Horizontal, word and boundary actions end the previous vertical-column sequence.
+                None
             };
             let target = graph.move_selection(
                 captured.selection,
@@ -225,7 +244,8 @@ impl PieceBackedMarkdownTextView {
                 length,
                 &current,
             )?;
-            // 短行返回的实际 head 列不能覆盖原目标列；下一次垂直动作仍尝试原横向位置。
+            // A short line's actual endpoint cannot replace the intended target column;
+            // the next vertical action still attempts the original horizontal position.
             let goal = column.and_then(|column| {
                 NativeMarkdownVerticalGoal::new(
                     column.line_offset,
@@ -235,12 +255,14 @@ impl PieceBackedMarkdownTextView {
                 )
             });
             Ok((target, goal))
-        })(); // graph 与所有临时 Native 结果先结束，再检查原动作是否仍可发布。
+        })();
+        // Release the Graph and temporary native results before checking publication authority.
         if !current() {
             return None;
         }
         let Ok((target, goal)) = target else {
-            return None; // 缺布局或无法证明坐标时不把原选择变成猜测结果，也不重复整个动作。
+            // Missing layout or unproven coordinates preserve selection, without replaying the action.
+            return None;
         };
         let valid_boundaries = identity.upgrade().is_some_and(|document| {
             let document = document.borrow();
@@ -252,7 +274,8 @@ impl PieceBackedMarkdownTextView {
                     .is_ok()
         });
         if !valid_boundaries || !current() {
-            return None; // UTF16 的数值范围合法还不够，两端都必须是 canonical Unicode 边界。
+            // Numerically valid UTF-16 extents still require canonical Unicode boundaries at both endpoints.
+            return None;
         }
         let Ok(captured) = captured.with_selection(target.selection, true) else {
             return None;
@@ -261,7 +284,8 @@ impl PieceBackedMarkdownTextView {
             .with_head_side(Some(target.head_upstream))
             .with_vertical_goal(goal);
         if let Some(committed) = storage.update_active_selection(captured) {
-            // 这份收据在纯发布时生成；属性通知返回后只能使用它，不重新捕获当前 fold 或 generation。
+            // Pure publication created this receipt. Attribute notifications may reenter,
+            // so installation consumes only it, never recapturing current fold/generation state.
             let is_current = || {
                 self.ivars().table_input_intent_epoch.get() == input_epoch
                     && storage.ivars().table_projection_width_key.get() == width
@@ -270,8 +294,9 @@ impl PieceBackedMarkdownTextView {
             if self.apply_committed_selection_if(&committed, is_current)
                 && matches!(action, SelectionAction::Motion(_))
             {
-                // setter 只安装选择；标准移动还须跟随新 head。仅请求零长 caret，不能为扩选布局整个范围。
-                // 全选等展开动作不强制跳至全文末尾，保持用户当前阅读位置。
+                // The setter installs selection only; standard motion also follows its new
+                // active endpoint using a zero-length caret request, never the whole extended
+                // range. Expansion such as select-all preserves the user's reading position.
                 let current = || committed.current() && is_current();
                 let _ = native_markdown_table_intent_step(&current, || {
                     self.scrollRangeToVisible(NSRange::new(target.selection.head_utf16, 0))

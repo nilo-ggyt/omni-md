@@ -1,4 +1,5 @@
-//! 逻辑词组移动与硬行内选词共享同一个原GCB游标；本入口不声称提供Bidi视觉遍历。
+//! Logical word movement and selection within a hard line share one original
+//! grapheme cursor. This entry does not itself implement bidi visual traversal.
 
 use super::*;
 
@@ -6,7 +7,8 @@ use super::*;
 pub enum MarkdownWordGroupAction {
     Backward,
     Forward,
-    /// bias只选择当前位置的左/右相邻组；真正行首/行尾沿实际相邻换行转向存在的本行侧。
+    /// Bias chooses the adjacent left/right group. At an actual hard-line edge,
+    /// real neighboring newline facts redirect selection toward the existing side.
     Select {
         backward_bias: bool,
     },
@@ -15,11 +17,14 @@ pub enum MarkdownWordGroupAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MarkdownWordGroupAnswer {
     Yielded,
-    /// 真实已准备段没有无控制零级证明；该逻辑词组不提供 RTL 视觉遍历，也不毒化健康 Source。
+    /// A prepared range lacks control-free level-zero proof. This logical group
+    /// cannot provide RTL visual traversal, but the healthy Source remains usable.
     UnsupportedVisualOrder,
-    /// 保留原 Step 实际工作；当前逻辑组不能跨尚未展开的隐藏 Source 范围继续读正文。
+    /// Preserve actual step work. This group cannot read across a hidden Source
+    /// range before the original fold has been expanded.
     NeedsFoldExpansion(Range<usize>),
-    /// 原Source真实逻辑范围；移动以方向端点为head，Select使用完整范围，未授予Native提交权。
+    /// Actual logical range in the original Source. Movement chooses its directional
+    /// endpoint and Select uses the full range; Native commit authority is separate.
     Ready(Range<usize>),
 }
 
@@ -34,12 +39,14 @@ pub struct MarkdownWordGroupStep {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownWordMoveScope {
     WholeUniformZero,
-    /// 每个实际 GCB 必须再消费完整原 B 段证书；这项本身不授任何位置的零级权限。
+    /// Each actual grapheme still needs its complete original bidi paragraph proof;
+    /// this scope grants no level-zero authority at an arbitrary position.
     VisibleParagraphScopes,
     Unsupported,
 }
 
-/// 原 UBA 准备的真实工作量；None 仍在准备，Source 方向职责不会被可见子段偷换。
+/// Actual original UBA preparation work. None remains pending; a visible subrange
+/// cannot replace the Source's direction responsibilities.
 pub struct MarkdownWordMovePreparation {
     pub bytes: usize,
     pub scalars: usize,
@@ -56,7 +63,8 @@ enum Phase {
     Unsupported,
 }
 
-/// 两侧依次推进同一游标，阶段转换本身不再花第二份字节/记录量子。
+/// Advance both sides sequentially through one cursor. Phase changes cannot spend
+/// a second byte/record allowance in the same turn.
 pub(in crate::markdown_line_composer::engine) struct WordGroup {
     head: usize,
     category: Option<Category>,
@@ -70,20 +78,23 @@ pub(in crate::markdown_line_composer::engine) struct WordGroup {
 impl WordGroup {
     fn new(action: MarkdownWordGroupAction, head: usize, length: usize) -> Self {
         let (direction, mode, phase) = match action {
-            // 逻辑前/后移动从原head起，跳全部leading空白后消费一个类别；不是删除的单空格规则。
+            // Start at the original head, skip all leading space, then consume one
+            // category. Movement does not use deletion's single-space exception.
             MarkdownWordGroupAction::Backward => (
                 MarkdownWordDeleteDirection::Backward,
                 CursorMode::Move,
                 Phase::Move,
             ),
-            // 向后继方向仍使用同一移动规则，不把连续TAB/换行当成删除的独立一步。
+            // Forward movement follows the same rule; consecutive tabs/newlines
+            // are not split into deletion-specific standalone steps.
             MarkdownWordGroupAction::Forward => (
                 MarkdownWordDeleteDirection::Forward,
                 CursorMode::Move,
                 Phase::Move,
             ),
             MarkdownWordGroupAction::Select { backward_bias } => {
-                // 点击侧只决定首个类别；全源端点强制转向存在的一侧，硬行端点随后由真实换行核准。
+                // Bias chooses the seed category. Whole-Source edges select the
+                // existing side; actual newline facts later verify hard-line edges.
                 let backward = head != 0 && (head == length || backward_bias);
                 (
                     if backward {
@@ -137,7 +148,8 @@ impl WordGroup {
                 metadata_units: actual.metadata_units,
                 answer,
             });
-        } // 两个实际段槽仍由原 Bidi owner 管理；恢复量子不再兼花 GCB/分类预算。
+        } // Original bidi ownership still manages its real paragraph slots. A
+        // restore turn does not also spend grapheme/classification work.
         if matches!(self.phase, Phase::Unsupported) {
             return Ok(self.defer_scoped_answer(MarkdownWordGroupStep {
                 bytes: 0,
@@ -146,7 +158,8 @@ impl WordGroup {
                 metadata_units: 0,
                 answer: MarkdownWordGroupAnswer::UnsupportedVisualOrder,
             }));
-        } // 外层 Composer 已核原 Source 与取消；能力拒绝不重新读取未知方向的正文。
+        } // The outer composer already checked Source/cancellation; capability
+        // refusal does not reread text whose visual direction is unsupported.
         let step = self
             .cursor
             .advance(source, coordinator, authority, budget)?;
@@ -159,7 +172,7 @@ impl WordGroup {
                 metadata_units: step.metadata_units,
                 answer: MarkdownWordGroupAnswer::UnsupportedVisualOrder,
             }));
-        } // 拒绝仍交实际本步工作；不能把同一游标已做的段准备或 I/O 擦成零。
+        } // Preserve actual paragraph preparation/I/O work even on capability refusal.
         let mut answer = match &step.answer {
             MarkdownWordDeleteAnswer::NeedsFoldExpansion(hidden) => {
                 MarkdownWordGroupAnswer::NeedsFoldExpansion(hidden.clone())
@@ -169,12 +182,14 @@ impl WordGroup {
         if let MarkdownWordDeleteAnswer::Ready(range) = step.answer {
             match &self.phase {
                 Phase::Move => {
-                    // 单方向移动已到真实组界；只交源范围，Native仍须持原permit更新选择。
+                    // Movement reached a real group boundary. Return Source facts;
+                    // Native still needs its original permit to change selection.
                     self.phase = Phase::Complete(range.clone());
                     answer = MarkdownWordGroupAnswer::Ready(range);
                 }
                 Phase::Seed { backward, fallback } => {
-                    // 硬行首尾不能选到相邻行；首侧确无本行GCB时只尝试另一侧一次。
+                    // Hard-line selection cannot choose the neighboring line. If
+                    // the biased side has no local grapheme, try the other side once.
                     if range.is_empty() || self.cursor.seed_newline {
                         if !fallback {
                             let backward = !backward;
@@ -195,9 +210,11 @@ impl WordGroup {
                             let range = self.head..self.head;
                             self.phase = Phase::Complete(range.clone());
                             answer = MarkdownWordGroupAnswer::Ready(range);
-                        } // 两侧都是换行/端点才是真空行，不能选取相邻行里的一个词。
+                        } // Both sides being newline/end establishes an empty line,
+                    // without selecting a word from a neighboring line.
                     } else {
-                        // 两侧扩张都锁定这个实际完整GCB的类别，不能左边挑词、右边另挑标点。
+                        // Both expansions use this complete seed grapheme's same
+                        // category, rather than choosing a word left and punctuation right.
                         let category = self
                             .cursor
                             .category
@@ -212,7 +229,8 @@ impl WordGroup {
                     }
                 }
                 Phase::Left => {
-                    // 左端已固定，归还旧半边游标后用同一Source向右；每回合仍只有一份预算。
+                    // With the left edge fixed, retire that cursor and use the same
+                    // Source for the right half under its next single work allowance.
                     self.start = range.start;
                     self.phase = Phase::Right;
                     self.cursor = WordDelete::group(
@@ -225,13 +243,14 @@ impl WordGroup {
                     );
                 }
                 Phase::Right => {
-                    // 两侧都由同一个head和同一类别证实，组合完整硬行内选词范围。
+                    // Both sides were proven from the same head/category; combine
+                    // their actual endpoints into one selection within the hard line.
                     let range = self.start..range.end;
                     self.phase = Phase::Complete(range.clone());
                     answer = MarkdownWordGroupAnswer::Ready(range);
                 }
                 Phase::Complete(range) => {
-                    answer = MarkdownWordGroupAnswer::Ready(range.clone()); // 终态仍经过同原Source/GCB健康门。
+                    answer = MarkdownWordGroupAnswer::Ready(range.clone()); // Original health checks still apply.
                 }
                 Phase::Unsupported => unreachable!("能力拒绝已经在推进原游标前返回"),
             }
@@ -245,7 +264,8 @@ impl WordGroup {
         }))
     }
 
-    /// 只有 scoped 终点先让原布局段恢复；原 Root 快路和所有逻辑组没有额外阶段或读取。
+    /// Scoped terminal results first restore the original layout paragraph. The
+    /// original Root fast path and logical groups need no extra stage or read.
     fn defer_scoped_answer(&mut self, mut step: MarkdownWordGroupStep) -> MarkdownWordGroupStep {
         if self.restore_position.is_some()
             && !matches!(step.answer, MarkdownWordGroupAnswer::Yielded)
@@ -258,10 +278,12 @@ impl WordGroup {
 }
 
 impl MarkdownLineComposer {
-    /// 按词视觉移动先确认原 Coordinator 的实际职责；每次只消费原一份准备量子。
+    /// Establish the original coordinator's actual visual-word responsibility
+    /// through one preparation quantum at a time.
     ///
     /// # Errors
-    /// 原 Source、取消和实际 Bidi 存储错误沿原失败关闭；能力结果只声明后续职责，不签未分析位置。
+    /// Source, cancellation, and real bidi storage failures close through the
+    /// original boundary. Scope only states responsibility, not proof for unread positions.
     pub fn prepare_word_move(
         &mut self,
         budget: MarkdownLineComposeBudget,
@@ -296,10 +318,12 @@ impl MarkdownLineComposer {
         self.finish(result)
     }
 
-    /// 在原Source的完整GCB位置开始一次逻辑移动/选词；不创建新索引、Reader或正文副本。
+    /// Begin logical movement/selection at an original complete-grapheme position
+    /// without another index, reader, or text copy.
     ///
     /// # Errors
-    /// 原Source/取消先于范围错误；现有词组动作尚未取消时不覆盖它。
+    /// Source/cancellation precede range errors. An active word action must be
+    /// cancelled before another replaces it.
     pub fn begin_word_group(
         &mut self,
         action: MarkdownWordGroupAction,
@@ -308,7 +332,8 @@ impl MarkdownLineComposer {
         self.begin_group(action, head_utf16, false)
     }
 
-    /// 原视觉移动在完整 Root 证书下保持快路；显式折叠职责则逐 GCB 核原可见段，绝不据逻辑序猜 RTL。
+    /// Preserve the complete Root certificate's fast visual path. Scoped folded
+    /// layout checks each original visible grapheme; logical order never guesses RTL.
     pub fn begin_visual_word_group(
         &mut self,
         direction: MarkdownWordDeleteDirection,
@@ -321,7 +346,8 @@ impl MarkdownLineComposer {
         self.begin_group(action, head_utf16, true)
     }
 
-    /// 两种实际消费者共享同一个 Source/GCB owner；调用方传视觉意图，权限只能由原 Coordinator 给出。
+    /// Both consumers share one Source/grapheme owner. The caller supplies visual
+    /// intent; only the original coordinator can supply the required authority.
     fn begin_group(
         &mut self,
         action: MarkdownWordGroupAction,
@@ -336,6 +362,8 @@ impl MarkdownLineComposer {
         if payload.word_delete.is_some() || head_utf16 > payload.source.utf16_len() {
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
+        // Visual requests must use an already prepared real scope. Save the current
+        // layout paragraph only when scoped movement may temporarily move that owner.
         let scoped = if visual {
             match payload.coordinator.word_move_scope()? {
                 Some(MarkdownWordMoveScope::WholeUniformZero) => false,
@@ -354,10 +382,12 @@ impl MarkdownLineComposer {
         Ok(())
     }
 
-    /// 每次仅推进当前一侧的一份原4KiB/256标量/GCB记录量子，巨大词或单簇继续让出。
+    /// Advance the current side under one 4-KiB/256-scalar/grapheme-record quantum.
+    /// Huge words or single graphemes continue yielding instead of truncating.
     ///
     /// # Errors
-    /// 非原GCB、实际源/索引失败和取消沿同一Composer真实失败关闭；不拿后继Source续算。
+    /// Non-grapheme positions, actual Source/index failure, and cancellation close
+    /// the same composer; a later Source cannot continue this action.
     pub fn step_word_group(
         &mut self,
         budget: MarkdownLineComposeBudget,
@@ -394,7 +424,8 @@ impl MarkdownLineComposer {
         self.finish(result)
     }
 
-    /// 仅取消本group游标；原Source、字体与布局依赖仍归原Composer关闭，不影响另一个删除动作。
+    /// Cancel only this group cursor. Original Source/fonts/layout dependencies
+    /// retain their composer lifecycle, and a different delete action stays intact.
     pub fn cancel_word_group(&mut self) {
         if let Some(payload) = self.payload.as_mut()
             && matches!(payload.word_delete, Some(WordJob::Group(_)))

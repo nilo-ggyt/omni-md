@@ -1,4 +1,5 @@
-//! 所有位置是固定样本常量；只以不超过4095byte的块生成一篇4MiB中文单段落。
+//! All positions are fixed fixture facts. Stream one 4MiB Chinese paragraph in
+//! blocks no larger than 4,095 bytes instead of materializing the whole text.
 
 use std::io::Write;
 
@@ -11,10 +12,12 @@ pub(super) const LONG_END_BYTES: usize = 237_003;
 pub(super) const LOCAL_FIRST: usize = 2;
 pub(super) const LOCAL_SECOND: usize = 64;
 
+/// Fill exactly the requested count of fixed three-byte/one-UTF-16-unit scalars;
+/// the caller owns the output and cleanup if any write fails.
 pub(super) fn fill(file: &mut impl Write, mut units: usize) -> Result<(), String> {
     let mut block = [0_u8; 4095];
     for scalar in block.as_chunks_mut::<3>().0 {
-        scalar.copy_from_slice(&[0xE4, 0xB8, 0xAD]); // 固定U+4E2D，不从被测Doc或Source重构期望。
+        scalar.copy_from_slice(&[0xE4, 0xB8, 0xAD]); // Fixed U+4E2D, independent of the document/Source under test.
     }
     while units != 0 {
         let count = units.min(block.len() / 3);
@@ -25,6 +28,8 @@ pub(super) fn fill(file: &mut impl Write, mut units: usize) -> Result<(), String
     Ok(())
 }
 
+/// Place independent local/remote markers while streaming filler. Verify the
+/// actual output length before the original file becomes a mapped fixture.
 pub(super) fn write(file: &mut tempfile::NamedTempFile) -> Result<(), String> {
     fill(file, LOCAL_FIRST)?;
     file.write_all("局部".as_bytes())
@@ -56,6 +61,8 @@ pub(super) fn write(file: &mut tempfile::NamedTempFile) -> Result<(), String> {
     Ok(())
 }
 
+/// Construct only the explicit 9,000-unit query value. Its intentional bounded
+/// allocation is separate from the streamed multi-megabyte document.
 pub(super) fn long_query() -> String {
     let mut query = String::with_capacity(LONG * 3);
     query.push_str("目标");
@@ -63,5 +70,5 @@ pub(super) fn long_query() -> String {
         query.push('中');
     }
     query.push_str("终结");
-    query // 这是显式9000unit查询值；正文仍只由上面的固定块流式生成，不物化整篇。
+    query // The document still comes from fixed streamed blocks, never this query allocation.
 }

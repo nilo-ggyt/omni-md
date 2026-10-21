@@ -1,4 +1,5 @@
-//! 输入和模板纯策略回归；不启动 NSApplication 或原生窗口。
+//! Query/template regressions use synthetic files and the actual public Foundation
+//! regex engine without starting NSApplication or a Native window.
 use super::*;
 
 #[test]
@@ -13,7 +14,8 @@ fn actual_codemirror_regex_reference_cases() {
     assert_eq!(reviewed.len(), 51);
     let mut seen = std::collections::HashSet::new();
     for (index, row) in rows.iter().enumerate() {
-        // 每一 oracle row 都实际运行，具名差异使用逐例输入/结果断言，绝不按 query 类别跳过。
+        // Execute every oracle row. Reviewed differences compare the specific
+        // input/result rather than skipping broad query categories.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("Regex.md");
         let source = row["source"].as_str().unwrap();
@@ -43,7 +45,8 @@ fn actual_codemirror_regex_reference_cases() {
         let actual = serde_json::Value::Array(actual);
         let expected = reviewed.iter().find(|entry| entry["row_index"] == index);
         if let Some(expected) = expected {
-            // 输入、flags、baseline 坐标也被锁定；任何 oracle 更新都要求重新解释此差异。
+            // Lock the original input, flags, and baseline coordinates too; an
+            // updated oracle requires this specific difference to be reviewed again.
             assert_eq!(
                 &expected["reference"], row,
                 "reviewed input drift at row {index}"
@@ -59,7 +62,8 @@ fn actual_codemirror_regex_reference_cases() {
                 "native failure at row {index}"
             );
         } else {
-            // 未列出的 1,749 rows 必须与真实保留编辑器完全一致，错误同样判失败。
+            // Every unlisted row must agree with the retained editor's actual
+            // result; an unexpected Native error also fails this comparison.
             assert!(
                 result.is_ok(),
                 "unexpected native error at row {index}: {result:?}"
@@ -78,6 +82,8 @@ fn actual_codemirror_regex_reference_cases() {
     assert_eq!(seen.len(), reviewed.len(), "unexecuted deviation entry");
 }
 
+/// Keep the synthetic TempDir and actual document alive through the synchronous
+/// query; returning or failing drops all fixture resources through their owners.
 fn synthetic_query(source: &str, pattern: &str, budget: Duration) -> Result<Vec<Found>, String> {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("Regex.md");
@@ -85,7 +91,8 @@ fn synthetic_query(source: &str, pattern: &str, budget: Duration) -> Result<Vec<
     let document = Rc::new(RefCell::new(
         MarkdownDocumentBuffer::open(&path, 4 * 1_024 * 1_024).unwrap(),
     ));
-    // 仅测试合成输入允许建立独立 NSString；产品仍传递 piece-backed 虚拟 NSString。
+    // Only this small synthetic fixture creates a separate NSString; production
+    // passes the piece-backed virtual NSString rather than copying the document.
     let string = NSString::from_str(source);
     let query = Query {
         search: pattern.into(),
@@ -113,7 +120,8 @@ fn synthetic_query(source: &str, pattern: &str, budget: Duration) -> Result<Vec<
 
 #[test]
 fn public_regex_progress_interrupts_a_no_match_backtracking_search() {
-    // 必须依靠 progress nil callback 终止无匹配的回溯；不能只在有 result 时检查期限。
+    // The actual engine must interrupt no-match backtracking through nil progress
+    // callbacks; checking only completed matches would never observe the deadline.
     let source = format!("{}!", "a".repeat(32_768));
     let started = Instant::now();
     let result = synthetic_query(&source, "(a+)+$", Duration::from_millis(20));
@@ -126,7 +134,8 @@ fn public_regex_progress_interrupts_a_no_match_backtracking_search() {
 
 #[test]
 fn regex_batches_and_scalar_empty_matches_make_forward_progress() {
-    // 超过单批 1,024 结果不会截断，最终零长匹配也不会在同一位置无限重开。
+    // More than one 1,024-result batch must remain complete. Empty matches advance
+    // over the emoji scalar rather than restarting inside its surrogate pair.
     let source = "a ".repeat(1_100);
     assert_eq!(
         synthetic_query(&source, "a", Duration::from_secs(2))
@@ -146,6 +155,8 @@ fn regex_batches_and_scalar_empty_matches_make_forward_progress() {
 
 #[test]
 fn regex_character_classes_and_capture_coordinates_keep_js_basics() {
+    // Exercise the actual engine's ASCII character classes and original UTF-16
+    // capture coordinates, including fullwidth digits and a supplementary scalar.
     let matches = synthetic_query(
         "中文 ABC_12 １２\u{85}\u{feff}",
         r"\w+",
@@ -173,6 +184,8 @@ fn regex_character_classes_and_capture_coordinates_keep_js_basics() {
 
 #[test]
 fn escapes_and_capture_templates_keep_original_rules() {
+    // Feed the parsed template through a real anonymous spool. Defined escapes,
+    // literal dollars, whole-match references, and absent groups keep their baseline semantics.
     assert_eq!(unquote(r"a\nb\rc\td\\e\q"), "a\nb\rc\td\\e\\q");
     let found = Found {
         range: 2..6,
@@ -199,10 +212,11 @@ fn escapes_and_capture_templates_keep_original_rules() {
 
 #[test]
 fn sole_nonempty_match_wraps_for_both_navigation_directions() {
-    // 真实 CodeMirror 6 oracle：唯一英文、中文/emoji 与 regex 非空匹配都允许再次选中自己。
-    // ReplaceNext 仍直接消费独立候选字段，不调用此普通导航策略。
+    // The actual CodeMirror oracle permits wrapping a sole nonempty Latin,
+    // Chinese/emoji, or regex result. ReplaceNext uses its separate candidate path.
     for range in [4..11, 1..5, 29..36] {
-        // 分别重建方向状态，确保同一轮五个候选足以完成回绕，不重扫正文。
+        // Rebuild each direction independently; this scan's bounded candidates
+        // must suffice for wrapping without another document scan.
         for backwards in [false, true] {
             let mut matches = NavigationMatches::default();
             matches
@@ -225,7 +239,8 @@ fn sole_nonempty_match_wraps_for_both_navigation_directions() {
 
 #[test]
 fn navigation_excludes_current_and_wraps_with_one_scan() {
-    // 包含前/当前/后候选时，双向回绕只需要有界标量；当前空范围也不能成为自身下一处。
+    // Bounded candidates cover preceding/current/following matches. An empty
+    // current range must not become its own next candidate.
     let found = |range| Found {
         range,
         precise: true,

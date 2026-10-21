@@ -1,4 +1,5 @@
-//! 固定短表沿正式 Body/Cell 分页链实绘与查找；不以独立单格原语代替真实 TableRow 接线。
+//! Paint/search a fixed short table through the production Body/cell paging chain.
+//! Independent single-cell primitives cannot substitute for actual TableRow integration.
 
 use super::*;
 use crate::native_surface::{
@@ -26,14 +27,16 @@ const SOURCE: &str = concat!(
     "\r\nafter-table\r\n",
 );
 
-/// 固定字面独立给出 canonical UTF16，不能从待测显示映射反推期望位置。
+/// Fixed literals independently define canonical UTF-16 positions, never inferred
+/// from the display projection under test.
 fn canonical(label: &str) -> usize {
     SOURCE[..SOURCE.find(label).expect("固定表格夹具标签唯一存在")]
         .encode_utf16()
         .count()
 }
 
-/// 源和磁盘都按固定小片核验；表格显示转换、Find和点击均无权改写原 Markdown/CRLF。
+/// Verify source/disk through fixed small chunks. Display projection, Find, and
+/// pointer actions have no authority to change original Markdown or CRLF bytes.
 fn unchanged(rig: &Rig) -> Result<(), String> {
     let document = rig.document.upgrade().ok_or("表格原Doc已提前释放")?;
     let document = document.borrow();
@@ -75,7 +78,8 @@ fn unchanged(rig: &Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 实际格字符框必须映回该独立 canonical 字符，命中不能落进管道、语法标记或邻格。
+/// Actual cell rectangles must map back to their independently known canonical
+/// characters, never a pipe, hidden marker, or neighboring cell.
 fn character(scene: &dyn NativeMarkdownPagedTextScene, offset: usize) -> Result<NSRect, String> {
     let first = scene
         .first_rect(NSRange::new(offset, 1))
@@ -100,7 +104,8 @@ fn character(scene: &dyn NativeMarkdownPagedTextScene, offset: usize) -> Result<
     Ok(first.rect)
 }
 
-/// 当前真实三行格窗口同时检查两列、软换行和CPU墨迹；不从候选row高度反造期望布局。
+/// Check both columns, wrapping, and actual CPU ink in the current three-row
+/// window, without manufacturing expected layout from candidate row heights.
 fn geometry_and_paint(rig: &Rig) -> Result<(), String> {
     let key = rig
         .view
@@ -150,7 +155,8 @@ fn geometry_and_paint(rig: &Rig) -> Result<(), String> {
             .capture_ready_scene_key()
             .is_ok_and(|actual| actual.same(&key))
     };
-    // 同一实际Grid比较原同步完整帧与每步1项预算的异步帧，边线接缝与代码/选区都必须零RGBA差。
+    // Compare the same actual Grid's synchronous frame with item-budgeted painting;
+    // borders, code backgrounds, and selection must all match exactly in RGBA.
     selection::exact_scene_rgba(
         scene.clone(),
         &key,
@@ -192,7 +198,8 @@ fn geometry_and_paint(rig: &Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 查找沿原FindBar→Body→真实Cell可见证明，跨行和表后文字都不能只交付选择而缺实际帧。
+/// Original FindBar/Body/cell visibility proofs cover cross-row and following text.
+/// Selection alone without an actual complete frame cannot satisfy this scenario.
 fn find(
     rig: &mut Rig,
     query: &str,
@@ -217,7 +224,8 @@ fn find(
     if complete {
         frame::wait_complete_frame(stage, &rig.body, frame)?;
     } else {
-        // 长表后保留真实未布局尾部；目标帧不能以完成全篇扫描为代价换取成功。
+        // Preserve the long table's actual unprepared tail; target-frame success
+        // cannot depend on preparing the complete document.
         frame::wait_frame(stage, &rig.body, frame)?;
     }
     let key = rig
@@ -255,8 +263,10 @@ fn find(
     Ok(())
 }
 
-/// 原唯一Input的公开选择意图表达换行侧；只提交选择，再由真实View通知原Body发布完整帧。
-/// 本入口用于行尾上下游业务行为，既不改Doc私态，也不把240文首光标挪进格逃避原Bug。
+/// Express wrap affinity through the sole actual Input's public selection intent,
+/// then let the view notify the original Body for a complete frame. This tests
+/// upstream/downstream behavior without private document mutation or moving the
+/// 240-row fixture's start caret into a cell to evade hidden-pipe geometry.
 fn table_caret_intent(
     rig: &mut Rig,
     position: usize,
@@ -302,11 +312,13 @@ fn table_caret_intent(
         rig.view
             .apply_find_commit(&input, &commit)
             .map_err(|cause| cause.to_string())?;
-    } // permit/原Input临时强边不跨实际帧等待和关闭资源门。
+    } // Return permit/Input claims before actual frame waiting and strict close verification.
     frame::wait_complete_frame(stage, &rig.body, frame)?;
     {
-        // 本次显式换行侧属于原选择意图；同源样式重排可以撤旧字形坐标，不能吞掉刚发布的侧。
-        // 只借原公开Input票核事实，不窥Scene缓存；这样失败能指出亲和在发布前已经丢失。
+        // Explicit affinity belongs to the original selection intent. Same-source
+        // style reflow may invalidate glyph coordinates, but cannot discard that
+        // affinity. Read public Input facts rather than Scene caches so a failure
+        // distinguishes lost selection affinity from later geometry publication.
         let input = rig
             .body
             .probe_find_input_weak()
@@ -335,12 +347,13 @@ fn table_caret_intent(
                 affinity.is_upstream(),
             ));
         }
-    } // 真实Input、permit和key强边在后续资源收据前归还，不改变canonical或补签选择。
+    } // Return Input/permit/key claims before resource observations, without changing text or reauthorizing selection.
     rig.remember_receipt()
 }
 
-/// 固定短表中的管道和delimiter没有文字，但零范围的空间位置必须由真实首/末/相邻格caret提供。
-/// 每次保留原canonical位置，再比较实际公开字符几何；不从TableRow零字号构造任何框。
+/// Pipes/delimiters have no displayed text, but empty-range geometry must come
+/// from actual first/last/neighboring-cell carets. Preserve original canonical
+/// positions while comparing public geometry; a zero-size TableRow part supplies no rectangle.
 fn syntax_carets(rig: &mut Rig) -> Result<(), String> {
     use NativeMarkdownPagedHeadAffinity::{Downstream, Upstream};
     let initial = rig
@@ -351,7 +364,8 @@ fn syntax_carets(rig: &mut Rig) -> Result<(), String> {
     let middle_pipe = canonical("| 内容");
     let delimiter = canonical("| ---");
     let row_end = canonical("| **BoldAlpha");
-    // 字面独立指定语法位置和其真实邻格边界，Source跨度中的CRLF不当作显示字符。
+    // Independent literals specify syntax positions and neighboring-cell
+    // boundaries; source CRLF spans do not become displayed characters.
     for (stage, position, affinity, expected) in [
         (
             "table_header_pipe_caret",
@@ -429,7 +443,8 @@ fn syntax_carets(rig: &mut Rig) -> Result<(), String> {
             rig.panel.backingScaleFactor(),
             &current,
         )?;
-        // 非空管道请求仍没有字符；不能把caret空间投影扩大成可查找/可复制的邻格文字。
+        // A nonempty pipe request still has no character. Caret projection cannot
+        // expand into searchable/copyable neighboring text.
         if !matches!(
             scene.first_rect(NSRange::new(position, 1)),
             Err(ViewError::Pending)
@@ -441,7 +456,8 @@ fn syntax_carets(rig: &mut Rig) -> Result<(), String> {
     unchanged(rig)
 }
 
-/// 链接只在真实 Command mouseUp 消费，固定片段目标保 typed 拒绝；不打开浏览器。
+/// Activate only on actual Command mouse-up, retaining typed rejection for the
+/// fixed missing fragment. This scenario opens no browser.
 fn link(rig: &mut Rig) -> Result<(), String> {
     rig.panel.makeKeyWindow();
     rig.panel.makeFirstResponder(Some(&**rig.view));
@@ -477,7 +493,8 @@ fn link(rig: &mut Rig) -> Result<(), String> {
     unchanged(rig)
 }
 
-/// 失败同样先沿原严格Native/Font/Source/像素门清场，不能靠后续用例关闭当前泄漏图。
+/// Failure also completes original strict Native/font/Source/pixel cleanup; a
+/// later case's closure cannot clean up this scenario's leaked graph.
 pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
@@ -511,17 +528,19 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
             }
             rig.remember_receipt()
         })();
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, result))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     if result.is_ok() {
         println!(
             "native_body_table_row source_and_disk_unchanged=true actual_find_and_link=true strict_original_release=true offscreen_row_restore_tested=false cross_cell_edit_tested=false physical_ime_tested=false whole_product=false formal=false"
         );
     }
-    // 下列场景各自拥有独立文稿与严格关闭边，不共享失败后的状态；保留任一真实失败，
-    // 同时继续核其它用户操作，避免跨格缺陷遮住列对齐、插表、长表或横向滚动的新问题。
+    // Each following scenario owns its document and strict close boundary, sharing
+    // no failed state. Retain every actual failure while checking the other user
+    // actions, so cross-cell defects cannot conceal alignment, insertion, long-
+    // table, or horizontal-scrolling failures.
     let mut failures = Vec::new();
     for (name, result) in [
         ("row", result),
@@ -549,20 +568,23 @@ const LONG_ROWS: usize = 240;
 const LONG_TAIL: &str = "\r\n表后尾部保持按视口读取\r\n";
 const LONG_TAIL_REPEATS: usize = 128;
 
-/// 只保首末两行的独立输入位置；四个源端点来自生成字面而非待测 Parser/显示映射。
+/// Keep independent input positions for the first/last rows only. Four source
+/// endpoints come from generated literals, not the parser/display mapping under test.
 struct LongRowTarget {
     query: String,
     canonical: [usize; 4],
 }
 
-/// 每次仅创建一条固定短行；生成和逐块核对都不聚合整表或整篇字符串。
+/// Construct one fixed short row at a time. Generation and chunked verification
+/// never aggregate a complete table or document string.
 fn long_row(row: usize) -> String {
     format!(
         "| 中文普通{row:04} | **中文粗体{row:04}** | *中文斜体{row:04}* | `中文代码{row:04}` |\r\n"
     )
 }
 
-/// 首末目标以当前固定行模板独立计算 UTF16；实际产品只能从 mmap 和原结构票取得内容。
+/// Independently derive first/last targets from the fixed row template's UTF-16
+/// prefix. Product content still comes only from mmap and its original structural ticket.
 fn long_target(row: usize, offset: usize) -> LongRowTarget {
     let text = long_row(row);
     let labels = [
@@ -581,7 +603,8 @@ fn long_target(row: usize, offset: usize) -> LongRowTarget {
     }
 }
 
-/// 检查整份实际 Doc 与磁盘，仅保一行模板和128单元栈片；原保存位置没有任何写入动作。
+/// Verify actual document/disk contents with one row template and 128-unit stack
+/// chunks, without writing to the original fixture's saved location.
 fn long_unchanged(rig: &Rig) -> Result<(), String> {
     let owner = rig.document.upgrade().ok_or("长表原Doc已提前释放")?;
     let document = owner.borrow();
@@ -598,7 +621,8 @@ fn long_unchanged(rig: &Rig) -> Result<(), String> {
     for piece in pieces {
         let mut expected = piece.encode_utf16();
         loop {
-            // 单行也按固定栈片核原 canonical 内容，不把多字节中文当作 UTF16 单元偏移。
+            // Compare even one row in fixed stack chunks, without treating
+            // multibyte Chinese bytes as UTF-16 offsets.
             let mut used = 0;
             for _ in 0..units.len() {
                 let Some(unit) = expected.next() else {
@@ -638,7 +662,8 @@ fn long_unchanged(rig: &Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 逐列实际字符框/命中、有限 paint 和真实 CPU 帧必须都完成，不能只签末行选择。
+/// Every column requires actual geometry/hits, bounded paint, and complete CPU
+/// pixels; a last-row selection receipt alone is insufficient.
 fn long_frame(rig: &Rig, target: &LongRowTarget) -> Result<(), String> {
     let key = rig
         .view
@@ -658,7 +683,8 @@ fn long_frame(rig: &Rig, target: &LongRowTarget) -> Result<(), String> {
             .capture_ready_scene_key()
             .is_ok_and(|actual| actual.same(&key))
     };
-    // 原同步帧与每步一项的真实预算帧仍须零 RGBA 差，不为长表另造绘制入口。
+    // Synchronous and item-budgeted frames still match exactly; long tables use
+    // no separate painting entry that bypasses the production protocol.
     selection::exact_scene_rgba(
         scene.clone(),
         &key,
@@ -669,7 +695,8 @@ fn long_frame(rig: &Rig, target: &LongRowTarget) -> Result<(), String> {
     selection::paint_scene(scene.clone(), &key, &canvas, &current)?;
     CGContext::flush(Some(&canvas.context));
     for (column, rectangle) in rectangles.iter().enumerate() {
-        // 每列独立遮罩必须都有真实字符墨迹；其它列画对不能掩盖粗体、斜体或代码格空白。
+        // Independent per-column masks each need actual glyph ink. Correct other
+        // columns cannot conceal blank bold, italic, or inline-code cells.
         let mask = selection::Canvas::scaled(key.request.viewport, 1.0)?;
         CGContext::set_rgb_fill_color(Some(&mask.context), 1.0, 0.0, 0.0, 1.0);
         CGContext::fill_rect(Some(&mask.context), *rectangle);
@@ -698,8 +725,9 @@ fn long_frame(rig: &Rig, target: &LongRowTarget) -> Result<(), String> {
     Ok(())
 }
 
-/// 原240行夹具从管道0开始，首帧不准移动初始selection；其空间投影只能来自真实首格caret。
-/// 同时核非空管道仍无显示字符，不能靠给TableRow结构part补假字号使绘图通过。
+/// The 240-row fixture starts at pipe zero; its first frame must preserve that
+/// selection and project geometry through the actual first-cell caret. A nonempty
+/// pipe still has no glyph; assigning artificial font size to TableRow structure cannot pass.
 fn long_initial_caret(rig: &Rig) -> Result<(), String> {
     let key = rig
         .view
@@ -729,7 +757,8 @@ fn long_initial_caret(rig: &Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 末行 Find 必须实际跨过240行再回首行；每次仍使用原三秒帧门，失败也先关闭本轮真实图。
+/// Actual Find crosses 240 rows to the last row and returns to the first. Keep the
+/// original three-second frame gate and close this actual graph even after failure.
 fn long_table(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
@@ -747,7 +776,8 @@ fn long_table(mtm: MainThreadMarker) -> Result<(), String> {
                 .map_err(|cause| cause.to_string())?;
             utf16 += text.encode_utf16().count();
         }
-        // 真正尚未显示的尾部防止把整篇 complete 冒充末行 Find 的视口就绪。
+        // A real unread tail prevents whole-document completion from standing in
+        // for last-row Find's viewport readiness.
         for _ in 0..LONG_TAIL_REPEATS {
             file.write_all(LONG_TAIL.as_bytes())
                 .map_err(|cause| cause.to_string())?;
@@ -785,11 +815,12 @@ fn long_table(mtm: MainThreadMarker) -> Result<(), String> {
             }
             rig.remember_receipt()
         })();
-        // 原 release 遍历每份真实字体 payload/mmap/FD 和 worker；没有为复用放宽资源断言。
-        let retirement = release::close(rig, false)?;
+        // Original release checks each actual font payload/mmap/FD/worker;
+        // resource reuse grants no relaxation of release assertions.
+        let retirement = release::close(rig)?;
         Ok((retirement, result))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     result?;
     println!(
         "native_body_table_240 rows=240 columns=4 cjk_plain_strong_emphasis_code=true actual_canonical_rect_hit=true actual_cpu_frame=true actual_last_find_first_restore=true source_and_disk_unchanged=true strict_original_font_release=true physical_ime_tested=false whole_product=false formal=false"
@@ -806,25 +837,28 @@ const WIDE_RIGHT: &str = "右端末列目标";
 const WIDE_TAIL: &str = "宽表后仍未显示的固定尾段\r\n\r\n";
 const WIDE_TAIL_REPEATS: usize = (1024 * 1024) / WIDE_TAIL.len();
 
-/// 固定20列的表头包含不同长度，真实自然宽必须由产品原解算器取得，不能用均列宽通过往返。
-/// 这里只保一条有限输入行；不读取产品列宽，不生成整表或尾部长文字符串。
+/// Vary the fixed 20-column header lengths so actual natural widths must come from
+/// production layout rather than an equal-width assumption shared by both sides.
+/// Keep one bounded input row, without reading product widths or building full table/tail text.
 fn wide_header() -> String {
     let mut header = String::from("|");
-    // 长度变化只属于固定输入配方；正式列宽仍由真实字体和原表格解算器决定。
-    // 这样左右两端的坐标不会因为测试和生产共用一份均列宽假设而同时算错。
+    // Only the fixture recipe varies label lengths; actual fonts/table layout own
+    // resulting widths. Test/product cannot both obtain matching wrong endpoints
+    // from a shared uniform-column assumption.
     for column in 1..=WIDE_COLUMNS {
         let varying = "宽".repeat(column % 4 + 1);
         header.push_str(&format!(" 表头{column:02}{varying}中文 |"));
     }
     header.push_str("\r\n|");
     for _ in 0..WIDE_COLUMNS {
-        header.push_str(" --- |"); // 每个真实列都有独立GFM分隔格，不能由可见列数反推表格输入。
+        header.push_str(" --- |"); // Each actual column has its own GFM delimiter cell, independent of visible-column counts.
     }
     header.push_str("\r\n");
     header
 }
 
-/// 首行两个独立文字目标落在真实第一/第二十列；其它格同样写入原Markdown，而非空占位。
+/// Independent first-row text targets occupy actual columns one/twenty. Other
+/// cells also contain real original Markdown, never empty placeholders.
 fn wide_row(row: usize) -> String {
     let mut text = String::from("|");
     for column in 1..=WIDE_COLUMNS {
@@ -842,16 +876,19 @@ fn wide_row(row: usize) -> String {
     text
 }
 
-/// 只在完整帧门之后逐个小片核canonical与原磁盘。检查本身可以顺序读尾部，产品仍不得
-/// 为显示目标准备全部尾部；两者由独立生成配方和原实际progress事实分别证明。
+/// Verify canonical/disk contents in bounded chunks after complete-frame acceptance.
+/// Integrity checks may stream the tail, while production target preparation must
+/// not prepare it all; independent generation rules and actual progress prove these separately.
 fn wide_unchanged(rig: &Rig) -> Result<(), String> {
     let document = rig.document.upgrade().ok_or("宽表原Doc已提前释放")?;
     if document.borrow().generation() != 0 {
         return Err("宽表只读Find改变了原文稿代次".into());
     }
     let mut disk = std::fs::File::open(rig._file.path()).map_err(|cause| cause.to_string())?;
-    // 源顺序由输入合同独立重建；每次最多一行和两个128单元栈片，不从显示目录反序列化期望。
-    // 尾部也逐段核验，避免只比较两个标签而漏掉查找意外写回或截短磁盘文件。
+    // Reconstruct source order from the independent input recipe, using at most
+    // one row and fixed stack chunks rather than deserializing expected text from
+    // display indexes. Verify the tail too, exposing unexpected persistence/truncation
+    // that comparing only the two target labels would miss.
     let pieces = (0..WIDE_LEAD_REPEATS)
         .map(|_| WIDE_LEAD.to_owned())
         .chain(std::iter::once(wide_header()))
@@ -874,7 +911,8 @@ fn wide_unchanged(rig: &Rig) -> Result<(), String> {
             if used == 0 {
                 break;
             }
-            // 同一canonical只借这次固定栈片；文件I/O和后续Native操作不跨活RefCell租约。
+            // Borrow this same canonical source for one stack chunk only. Disk
+            // I/O and later Native operations hold no live RefCell lease.
             document
                 .borrow()
                 .copy_utf16_code_units(utf16, &mut actual[..used])
@@ -905,8 +943,9 @@ fn wide_unchanged(rig: &Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 原find已完成同票同步/分步零RGBA；此处核真正发布图的目标墨迹和canonical字符框/命中。
-/// 返回实际字符框供调用方与原clip滚动坐标对照，不读Grid私有字段或推算列宽。
+/// Find already compared same-ticket synchronous/stepped RGBA. Now inspect the
+/// actually published target ink plus canonical geometry/hits. Return the actual
+/// rectangle for clip-coordinate comparison, without private Grid fields or estimated widths.
 fn wide_frame(rig: &Rig, offset: usize) -> Result<NSRect, String> {
     let key = rig
         .view
@@ -922,8 +961,9 @@ fn wide_frame(rig: &Rig, offset: usize) -> Result<NSRect, String> {
                 .capture_ready_scene_key()
                 .is_ok_and(|actual| actual.same(&key))
     };
-    // find已用原三秒通知和独立RGBA对照核同一帧；此处不重复对照，改读真正挂载的CPU图。
-    // 两张画布始终只覆盖当前实际viewport，二十列的整张宽表不会成为离屏图像。
+    // Find already verified the same frame through its actual three-second event
+    // and independent RGBA comparison. Inspect the mounted CPU image here; both
+    // canvases cover only the current viewport, never an offscreen image of all 20 columns.
     let scale = rig.panel.backingScaleFactor();
     let canvas = selection::Canvas::scaled(key.request.viewport, scale)?;
     let mask = selection::Canvas::scaled(key.request.viewport, scale)?;
@@ -932,7 +972,8 @@ fn wide_frame(rig: &Rig, offset: usize) -> Result<NSRect, String> {
     scene
         .validate_ready(&current)
         .map_err(|cause| cause.to_string())?;
-    // SAFETY: 原正文和主线程backing在本同步栈存活；只读取产品实际挂载关系，不构造替身layer。
+    // SAFETY: The original view/main-thread backing remain alive on this stack;
+    // inspect actual mounted children without constructing substitute layers.
     let children = unsafe { backing.sublayers() }.ok_or("宽表CPU帧没有实际挂载点")?;
     if children.len() != 1 {
         return Err("宽表有限正文没有保持唯一实际CPU挂载点".into());
@@ -941,7 +982,8 @@ fn wide_frame(rig: &Rig, offset: usize) -> Result<NSRect, String> {
     if mount.frame() != bounds || mount.bounds() != NSRect::new(NSPoint::ZERO, bounds.size) {
         return Err("宽表CPU挂载几何偏离当前有限正文".into());
     }
-    // 原mount坐标从零开始；恢复当前view bounds后才映到同一scale，不把document全宽画入内存。
+    // Mount coordinates begin at zero. Restore current view bounds before mapping
+    // the same scale, without rendering full document width into memory.
     CGContext::translate_ctm(Some(&canvas.context), bounds.origin.x, bounds.origin.y);
     mount.renderInContext(&canvas.context);
     scene
@@ -951,8 +993,9 @@ fn wide_frame(rig: &Rig, offset: usize) -> Result<NSRect, String> {
     CGContext::fill_rect(Some(&mask.context), rectangle);
     CGContext::flush(Some(&canvas.context));
     CGContext::flush(Some(&mask.context));
-    // mask只选首字符的真实框；白色表底、选区或其它可见列不能替目标字符提供黑色墨迹。
-    // Canvas采用原明确RGBA8顺序，比较的是实际发布图像素，不是字体或layer存在与否。
+    // Mask the actual first-character rectangle only; white background, selection,
+    // or another column cannot supply its black ink. Explicit RGBA8 bytes inspect
+    // actual published pixels rather than mere font/layer existence.
     let ink = canvas
         .pixels
         .as_chunks::<4>()
@@ -966,8 +1009,10 @@ fn wide_frame(rig: &Rig, offset: usize) -> Result<NSRect, String> {
     if ink == 0 || !current() {
         return Err("宽表目标只有选择/几何，当前已发布CPU图没有同一字符墨迹".into());
     }
-    // 完整帧只代表这次视口Ready；原Composer仍须未Complete，实际排版与语义读取也未遍历整源。
-    // 约1MiB未布局尾部不是高度占位或假行；后续滚动仍须按原mmap/目录继续取得真实内容。
+    // A complete frame certifies this viewport only. The original composer must
+    // remain incomplete, with layout/semantic reads below full-source coverage.
+    // The approximately 1MiB unprepared tail is real source, not artificial height
+    // or fake rows; later scrolling still obtains actual data through mmap/indexes.
     let progress = rig.body.progress().map_err(|cause| cause.to_string())?;
     if progress.complete
         || progress.frontier_source_bytes >= progress.source_total_bytes
@@ -984,14 +1029,16 @@ fn wide_frame(rig: &Rig, offset: usize) -> Result<NSRect, String> {
     Ok(rectangle)
 }
 
-/// 首帧是原正文，随后原Find依次进入真实最右列与首列；原scroll的X和flag必须真的变化，
-/// 关闭时在归还临时Native claim后再走原strict资源收据，不能为flag检查保活整个滚动图。
+/// Begin in ordinary text, then use actual Find to reach rightmost/first columns.
+/// The original scroll's x/flag must truly change. Return temporary Native claims
+/// before strict release; a flag observation cannot retain the complete scroll graph.
 fn wide_table(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
         let mut utf16 = 0;
-        // 固定前文让首帧尚未进入表格，因而能在同一真实scroll上记录横向范围改变前的状态。
-        // 不直接设置scroll flag、clip原点或Body高度来制造这个前提。
+        // Fixed preceding text starts outside the table, allowing observation of
+        // this same scroll before its horizontal range changes. Do not manufacture
+        // that premise through scroll flags, clip origins, or Body-height setters.
         for _ in 0..WIDE_LEAD_REPEATS {
             file.write_all(WIDE_LEAD.as_bytes())
                 .map_err(|cause| cause.to_string())?;
@@ -1002,9 +1049,9 @@ fn wide_table(mtm: MainThreadMarker) -> Result<(), String> {
             .map_err(|cause| cause.to_string())?;
         utf16 += header.encode_utf16().count();
         let first = wide_row(1);
-        // 中文源位置按UTF16前缀计算，UTF8字节长度不能替代Find/输入协议的canonical单元。
-        // 行模板至多二十个短格，源写入和独立偏移计算没有聚合后面的长尾。
-        // 两个源位置只按固定输入模板的UTF16前缀计算，完全独立于Parser、显示映射与实际列几何。
+        // Find/input use canonical UTF-16 units, not Chinese UTF-8 byte lengths.
+        // Derive both positions from this fixed 20-short-cell row only, independent
+        // of parsing, display projection, actual column geometry, or the later long tail.
         let left = utf16
             + first[..first.find(WIDE_LEFT).expect("首列固定唯一目标")]
                 .encode_utf16()
@@ -1022,14 +1069,15 @@ fn wide_table(mtm: MainThreadMarker) -> Result<(), String> {
                 .map_err(|cause| cause.to_string())?;
             utf16 += text.encode_utf16().count();
         }
-        // 约1MiB尾部只按固定短片写入；产品寻找这两个表内目标不需要遍历或排版尾部。
+        // Stream the approximately 1MiB tail in fixed fragments. Preparing these
+        // table targets requires no layout of that tail.
         for _ in 0..WIDE_TAIL_REPEATS {
             file.write_all(WIDE_TAIL.as_bytes())
                 .map_err(|cause| cause.to_string())?;
             utf16 += WIDE_TAIL.encode_utf16().count();
         }
         file.flush().map_err(|cause| cause.to_string())?;
-        drop((header, first)); // 表头和首行输入小片也不跨真实Rig生命周期保留。
+        drop((header, first)); // Even header/first-row generation fragments do not survive across the actual Rig lifetime.
         let mut rig = Rig::attach_mode(
             mtm,
             file,
@@ -1041,7 +1089,8 @@ fn wide_table(mtm: MainThreadMarker) -> Result<(), String> {
         )?;
         let original_horizontal = rig.scroll.hasHorizontalScroller();
         let result = (|| {
-            // 初始可见正文没有宽内容；在真实进入表格之前记录原scroll公开状态用于关闭归还。
+            // Initial visible ordinary text needs no horizontal range. Record
+            // the actual public flag before table entry for close-time restoration checks.
             if original_horizontal {
                 return Err("宽表前的原正文已经出现无内容需要的横向滚动条".into());
             }
@@ -1072,12 +1121,14 @@ fn wide_table(mtm: MainThreadMarker) -> Result<(), String> {
             {
                 return Err("宽表最右列Find未通过原NSScrollView真实横向滚动交付".into());
             }
-            // 比较实际document原点与局部字符框的和，不把“第二十列”换算成任何假定列宽。
-            // 同时要求clip确已移动，单纯改Scene坐标或选择范围不能通过这次往返。
+            // Compare actual document origin plus local character position, never
+            // a presumed width for column twenty. The clip must actually move;
+            // changed Scene coordinates/selection alone cannot satisfy this round trip.
             let right_document_x =
                 right_key.request.virtual_viewport.document_origin.x + right_rectangle.origin.x;
             wide_unchanged(&rig)?;
-            // Previous直接回同一行首列；不绕过文件尾部搜索，也不人为设置clip或选择伪造往返。
+            // Actual Previous returns to the first column. No manual clip or
+            // selection setter fabricates the return trip.
             find(
                 &mut rig,
                 WIDE_LEFT,
@@ -1110,22 +1161,25 @@ fn wide_table(mtm: MainThreadMarker) -> Result<(), String> {
             );
             Ok(())
         })();
-        // 这份短期claim只为了读同一scroll的关闭后公开flag；退出pool前立即drop，仍由原
-        // Retirement核真实Native weak nil、Source/mmap/FD/worker/字体/像素，不放宽任一关闭门。
+        // Retain this short claim only to inspect the same scroll's post-close
+        // public flag. Drop it before pool exit; Retirement still checks actual
+        // Native weak identities, Source/mmap/FD/worker/font/pixel release without exemptions.
         let scroll = Retained::clone(&rig.scroll);
-        let retirement = release::close(rig, false)?;
-        // 读取的是同一原scroll的公开属性。close中的正式Viewport清理必须已经归还它，
-        // 测试绝不替产品设置回原值，也不会用后续窗口销毁掩盖仍未归还的flag。
+        let retirement = release::close(rig)?;
+        // Product viewport cleanup must already restore this same scroll's public
+        // flag. The test neither sets its original value itself nor relies on
+        // later window destruction to conceal a missing restoration.
         let restored = if scroll.hasHorizontalScroller() == original_horizontal {
             Ok(())
         } else {
             Err("宽表关闭没有归还原scroll的horizontal flag".to_owned())
         };
         drop(scroll);
-        // 无论动作成功与否都先完成关闭；保留首次业务失败，关闭资源的真实失败由原verify处理。
+        // Close after success or failure, preserving the primary interaction
+        // failure; original verify separately reports actual cleanup errors.
         Ok((retirement, result.and(restored)))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     result?;
     println!(
         "native_body_table_wide horizontal_flag_restored=true strict_original_source_fd_worker_font_native_release=true physical_ime_tested=false whole_product=false formal=false"
@@ -1164,8 +1218,9 @@ const UI_APPENDED: &str = concat!(
     "\r\nafter-ui\r\n",
 );
 
-/// 这份短表只服务真实格UI事务；固定期望独立给出CRLF、管道转义和新增行，绝不拼成长文oracle。
-/// 原文件始终未保存，所有内存事务都必须保原磁盘字节；本函数没有写入或修复文档的权限。
+/// This short fixture covers actual cell UI transactions. Fixed independent
+/// expectations include CRLF, escaped pipes, and added rows, never a long-document
+/// oracle. No save occurred; verification has no authority to write or repair text.
 fn ui_document(rig: &Rig, expected: &str) -> Result<(), String> {
     let owner = rig.document.upgrade().ok_or("格UI原Doc已释放")?;
     let document = owner.borrow();
@@ -1193,7 +1248,8 @@ fn ui_document(rig: &Rig, expected: &str) -> Result<(), String> {
     }
     drop(document);
     drop(owner);
-    // 与生产mmap独立打开真实文件；固定小块读取，不用一份内存全文掩盖未保存的数据变化。
+    // Open the actual file independently of production mmap and read fixed chunks;
+    // a complete memory copy cannot conceal unintended persistence.
     let mut file = std::fs::File::open(rig._file.path()).map_err(|cause| cause.to_string())?;
     let mut bytes = [0_u8; 128];
     for original in UI_SOURCE.as_bytes().chunks(bytes.len()) {
@@ -1213,8 +1269,10 @@ fn ui_document(rig: &Rig, expected: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 只从原系统firstResponder核真正child，再用原CPU已发布key证明像素完成；owner getter同时是菜单实际consumer。
-/// 既不从私有active槽构造场景，也不注册第二个绘图观察者覆盖Body正在完成的真实激活动作。
+/// The actual system firstResponder identifies the child, and its published CPU
+/// key proves complete pixels. active_cell_body is also the real menu consumer;
+/// do not manufacture a scene from private slots or register another paint observer
+/// over the Body's actual activation work.
 fn ui_active(
     rig: &mut Rig,
     previous: Option<&Rc<NativeMarkdownPagedBody>>,
@@ -1264,8 +1322,10 @@ fn ui_active(
                 {
                     return Err(format!("{stage}: 系统焦点没有进入真实Cell输入域"));
                 }
-                // 当前真实Native子图登记进原Rig释放账本；历史格不留生产缓存，测试只保原弱观察者。
-                // 临时Weak升级在这里结束，之后换格与最终close都不能被验收代码强引用遮住。
+                // Add actual child Native roles to the original Rig ledger.
+                // Retired cells have no production cache; retain only weak
+                // observations. End temporary upgrades here so local strong claims
+                // cannot conceal later cell-switch or close-time retention defects.
                 for (role, weak) in body.native_weaks().map_err(|cause| cause.to_string())? {
                     if let Some(object) = weak.load() {
                         rig.ledger.include(role, &object)?;
@@ -1288,17 +1348,20 @@ fn ui_active(
         let remaining = Duration::from_secs(3)
             .checked_sub(started.elapsed())
             .ok_or_else(|| format!("{stage}: 三秒内没有当前系统焦点中的真实Cell完整帧"))?;
-        // SAFETY: 只消费同次动作剩余的原主runloop期限，真实排版/绘图消息唤醒后重核公开结果。
+        // SAFETY: Service the original main run loop only for this action's
+        // remaining deadline; actual layout/paint events permit rechecking public results.
         unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), true) };
     }
 }
 
-/// 读取实际NSTextInputClient当前小草稿，范围来自独立固定期望；不借输入私态或为测试捕第二份Source。
+/// Read the actual NSTextInputClient's short draft using independently fixed
+/// expected ranges, without private Input state or a second test-captured Source.
 fn ui_local(view: &NativeMarkdownPagedTextView, expected: &str) -> Result<(), String> {
     let range = NSRange::new(0, expected.encode_utf16().count());
     let mut actual = NSRange::new(objc2_foundation::NSNotFound as usize, 0);
     let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(view);
-    // SAFETY: 本次实际主线程client和有效out参数；只请求独立固定短夹具明确给出的有限范围。
+    // SAFETY: The actual main-thread client and writable output parameter live
+    // through this call; the independent short fixture supplies a bounded range.
     let value =
         unsafe { client.attributedSubstringForProposedRange_actualRange(range, &mut actual) }
             .ok_or("真实Cell client没有交付当前有限草稿")?;
@@ -1317,7 +1380,8 @@ fn ui_local(view: &NativeMarkdownPagedTextView, expected: &str) -> Result<(), St
     Ok(())
 }
 
-/// 实际鼠标进入显示格，再由系统焦点中的同一NSTextInputClient编辑；组件Rig不宣称正式workspace或整产品通过。
+/// Enter a displayed cell through actual mouse events, then edit through the same
+/// system-focused NSTextInputClient. This component Rig proves no workspace or whole-product acceptance.
 fn ui_flow(rig: &mut Rig) -> Result<(), String> {
     rig.panel.makeKeyWindow();
     if !rig.panel.isKeyWindow() {
@@ -1329,7 +1393,7 @@ fn ui_flow(rig: &mut Rig) -> Result<(), String> {
     let point = links::point(rig, seed)?;
     let started = Instant::now();
     links::mouse(rig, point, NSEventType::LeftMouseDown)?;
-    links::mouse(rig, point, NSEventType::LeftMouseUp)?; // Ready之前真实Up也必须正常结束Down，不复活drag。
+    links::mouse(rig, point, NSEventType::LeftMouseUp)?; // Actual up before Ready still ends down and cannot revive dragging.
     let first = ui_active(rig, None, started, "table_ui_mouse_cell")?;
     let view = first.view().map_err(|cause| cause.to_string())?;
     let before = view.input_state().map_err(|cause| cause.to_string())?;
@@ -1343,7 +1407,8 @@ fn ui_flow(rig: &mut Rig) -> Result<(), String> {
         .generation();
     let frame = observe(&first)?;
     let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**view);
-    // SAFETY: 与实际键盘确认相同的Native输入协议；仅固定新增载荷，不冒充物理中文输入法候选验收。
+    // SAFETY: Use the actual Native input protocol with fixed new text. This
+    // direct protocol call is no physical Chinese IME candidate-window acceptance.
     unsafe {
         client.insertText_replacementRange(&NSString::from_str(UI_INSERTED), NSRange::new(0, 4));
     }
@@ -1354,7 +1419,8 @@ fn ui_flow(rig: &mut Rig) -> Result<(), String> {
         (sel!(undo:), "seed", "table_ui_local_undo"),
         (sel!(redo:), UI_INSERTED, "table_ui_local_redo"),
     ] {
-        // 原标准命令只动当前格局部历史；canonical代次、内容和原磁盘在实际完整帧后仍须不变。
+        // Standard commands affect the current cell's local history only; after
+        // actual complete frames, canonical generation/text and disk remain unchanged.
         let frame = observe(&first)?;
         view.command(selector).map_err(|cause| cause.to_string())?;
         frame::wait_complete_frame(stage, &first, frame)?;
@@ -1400,7 +1466,8 @@ fn ui_flow(rig: &mut Rig) -> Result<(), String> {
     }
     ui_local(&second_view, "other")?;
     ui_document(rig, UI_COMMITTED)?;
-    // 已到真实末行末格；同一Tab必须获得Core真End后追加一次，不把viewport末行冒充表格结尾。
+    // Tab from the actual final row/cell appends once only after Core proves End;
+    // the viewport's last visible row cannot stand in for the table endpoint.
     let started = Instant::now();
     second_view
         .command(sel!(insertTab:))
@@ -1416,8 +1483,10 @@ fn ui_flow(rig: &mut Rig) -> Result<(), String> {
         return Err("末格Tab没有进入真实新增行首个空格".into());
     }
     ui_document(rig, UI_APPENDED)?;
-    // 新空格没有改字，Esc只取消它；随后文档Undo必须一次移除追加行，再一次恢复首格原字。
-    // 全部动作继续走原标准selector，不直接写Doc或手工清除活动槽来帮助资源验证。
+    // The new empty cell is unchanged; Escape cancels it only. Actual document
+    // Undo then removes the appended row once and restores the first cell once.
+    // Keep standard selector routes instead of direct document writes or private
+    // active-slot clearing that would artificially assist resource verification.
     empty_view
         .command(sel!(cancelOperation:))
         .map_err(|cause| cause.to_string())?;
@@ -1426,7 +1495,8 @@ fn ui_flow(rig: &mut Rig) -> Result<(), String> {
         let remaining = Duration::from_secs(3)
             .checked_sub(started.elapsed())
             .ok_or("取消空格超过三秒")?;
-        // SAFETY: 原主线程只等待同次取消剩余期限；没有另开线程、睡眠或替换系统焦点。
+        // SAFETY: The original main thread services only this cancellation's
+        // remaining deadline, without another thread, sleep, or substituted focus.
         unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), true) };
     }
     for (expected, stage) in [
@@ -1441,26 +1511,30 @@ fn ui_flow(rig: &mut Rig) -> Result<(), String> {
         ui_document(rig, expected)?;
         rig.remember_receipt()?;
     }
-    // 测试临时强claim先归还，原严格close还将核这些已换走子格的Native/FD/mmap/worker/字体与像素。
+    // Return temporary strong claims first. Original strict close still verifies
+    // retired child Native/FD/mmap/worker/font/pixel resources.
     drop((empty_view, empty, second_view, second, view, first));
     Ok(())
 }
 
-/// 只把真实鼠标事件交给实际 firstResponder 子 View；跨出后 Cocoa 仍向原接收者交 Drag/Up。
-/// 这里不借父 mouse 入口改写接收者，也不以测试方法直接转移选择或手势所有权。
+/// Deliver actual events to the system-focused child. Cocoa retains the original
+/// receiver for drag/up after crossing outside it; do not redirect through parent
+/// mouse entries or transfer selection/gesture ownership through test-only methods.
 fn ui_child_mouse(
     rig: &Rig,
     view: &NativeMarkdownPagedTextView,
     point: NSPoint,
     kind: NSEventType,
 ) -> Result<(), String> {
-    // 原 child 已 detach 后仍可能是 Cocoa 该手势的接收者；事件继续属于同一个原窗口。
-    // 从实际 Rig 主 View 取活窗口号码，不能要求已关闭的 child 重新挂载来提供 window。
+    // A detached child can remain Cocoa's receiver for this gesture in the same
+    // original window. Obtain that live window number from the Rig's actual parent
+    // view, never remount a closed child merely to supply a window.
     let window = rig.view.window().ok_or("格拖选真实窗口已归还")?;
     let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
         kind, point, NSEventModifierFlags::empty(), 1.0, window.windowNumber(), None, 1, 1, 1.0,
     ).ok_or("无法构造真实格拖选鼠标事件")?;
-    // SAFETY: 同一个主线程实际 Native responder 与真实窗口坐标；每个同步活事件仅交付一次。
+    // SAFETY: Use the same actual main-thread responder and real window
+    // coordinates, delivering each synchronous live event once.
     unsafe {
         if kind == NSEventType::LeftMouseDown {
             let _: () = objc2::msg_send![view, mouseDown: &*event];
@@ -1475,8 +1549,10 @@ fn ui_child_mouse(
     Ok(())
 }
 
-/// 真正编辑后的子格跨入父正文；原 Down、连续 Drag 和 Up 不跑 runloop，终点不能被异步交接丢掉。
-/// 父旧 Scene 在提交前可合法 Ready，这里只验实际选择、单笔历史与源文件，不把内部阶段当用户结果。
+/// Cross from an actually edited child into its parent. Down, successive drag,
+/// and up arrive without loop delivery, so asynchronous handoff must retain the
+/// endpoint. The old parent Scene may legitimately remain Ready before commit;
+/// verify actual selection, one-entry history, and source rather than internal stages.
 fn ui_fast_pointer(rig: &mut Rig) -> Result<(), String> {
     let seed = UI_SOURCE[..UI_SOURCE.find("seed").expect("固定格 seed")]
         .encode_utf16()
@@ -1488,7 +1564,8 @@ fn ui_fast_pointer(rig: &mut Rig) -> Result<(), String> {
         (false, "table_ui_fast_drag_queued_up"),
         (true, "table_ui_fast_drag_new_down_revokes_up"),
     ] {
-        // 每例都从上一笔Undo后的真实原文件布局取点；等长局部修改不会伪造目标的canonical偏移。
+        // Obtain each case's points from actual original layout after prior Undo.
+        // Equal-length local changes preserve independent canonical target offsets.
         let first_point = links::point(rig, after + 1)?;
         let second_point = links::point(rig, after + 3)?;
         let up_point = links::point(rig, after + 6)?;
@@ -1506,10 +1583,12 @@ fn ui_fast_pointer(rig: &mut Rig) -> Result<(), String> {
                 return Err("快拖开始前上一流程仍有未撤销的正文历史".into());
             }
         }
-        // 原NSTextInputClient只改局部草稿；父文档此时不得改代、改字或提前产生正文Undo。
+        // Actual NSTextInputClient changes only the local draft. Parent generation,
+        // text, and character history must remain untouched before handoff commit.
         let edit = observe(&cell)?;
         let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**child);
-        // SAFETY: 当前系统焦点中的真实child，固定seed第2个ASCII字符与有效原替换范围。
+        // SAFETY: The actual system-focused child contains the fixed seed's second
+        // ASCII character, and the original replacement range is valid.
         unsafe {
             client.insertText_replacementRange(&NSString::from_str("E"), NSRange::new(1, 1));
         }
@@ -1537,14 +1616,15 @@ fn ui_fast_pointer(rig: &mut Rig) -> Result<(), String> {
             ),
             None,
         );
-        drop((scene, key)); // 旧Scene不能由验收保活，遮住提交前的退读与后续严格关闭。
+        drop((scene, key)); // Local retention of an old Scene must not conceal precommit reader retirement or strict close.
         ui_child_mouse(rig, &child, down_point, NSEventType::LeftMouseDown)?;
         let frame = observe(&rig.body)?;
         ui_child_mouse(rig, &child, first_point, NSEventType::LeftMouseDragged)?;
         ui_child_mouse(rig, &child, second_point, NSEventType::LeftMouseDragged)?;
         ui_child_mouse(rig, &child, up_point, NSEventType::LeftMouseUp)?;
         if replace_up {
-            // 不等待任何提交/新帧；原父View的新Down必须撤旧Up，脏草稿仍只沿真实点击提交一次。
+            // Wait for no commit/new frame. A new actual parent down revokes the
+            // old up, while its real click still commits the dirty draft only once.
             links::mouse(rig, new_point, NSEventType::LeftMouseDown)?;
             links::mouse(rig, new_point, NSEventType::LeftMouseUp)?;
             ui_child_mouse(rig, &child, second_point, NSEventType::LeftMouseDragged)?;
@@ -1576,14 +1656,16 @@ fn ui_fast_pointer(rig: &mut Rig) -> Result<(), String> {
                 return Err("快拖没有只提交一笔真实修改，或仍保留已被新编辑替代的Redo".into());
             }
         }
-        // 原Up之后，Cocoa仍可能把迟到Drag交给旧child；它不能改变已经完成的父输入事实。
+        // Cocoa may deliver late drag to the old child after up; it cannot change
+        // already completed parent Input facts.
         ui_child_mouse(rig, &child, first_point, NSEventType::LeftMouseDragged)?;
         if rig.view.input_state().map_err(|cause| cause.to_string())? != actual {
             return Err("真实Up后旧child的迟到Drag复活了原手势".into());
         }
         rig.remember_receipt()?;
         drop((child, cell));
-        // 选择交接不应增加正文历史；一次原Undo同时恢复完整原字节、CRLF及编辑前canonical选择。
+        // Selection handoff adds no character history. One actual Undo restores
+        // complete original bytes, CRLF, and the pre-edit canonical selection together.
         let undo = observe(&rig.body)?;
         rig.view
             .command(sel!(undo:))
@@ -1608,6 +1690,8 @@ fn ui_fast_pointer(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
+/// Run actual cell focus/edit/history/navigation and cross-boundary pointer cases
+/// in one synthetic document, then strictly release it before reporting results.
 fn active_table_ui(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
@@ -1626,10 +1710,10 @@ fn active_table_ui(mtm: MainThreadMarker) -> Result<(), String> {
         let result = ui_flow(&mut rig)
             .and_then(|()| ui_fast_pointer(&mut rig))
             .and_then(|()| cell_find::run(&mut rig));
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, result))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     result?;
     println!(
         "native_body_table_cell_ui actual_mouse_and_native_client=true local_history_parent_unchanged=true required_row_navigation=true terminal_append_one_undo=true strict_original_release=true fast_caret_drag_tested=true cross_grid_word_tested=false physical_ime_tested=false whole_product=false formal=false"

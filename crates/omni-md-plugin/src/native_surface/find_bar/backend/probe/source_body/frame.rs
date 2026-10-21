@@ -1,7 +1,10 @@
-//! 单次真实完整CPU帧通知驱动原三秒deadline；Ready或队列执行不算图像完成。
+//! One actual complete CPU-frame notification drives the original three-second
+//! deadline. Ready state or an executed queue callback is not image completion.
 
 use super::*;
 
+/// Observe the production paint endpoint with only its key, count, and duration.
+/// This observer owns no Body/view/document and stops only its own finite wait.
 pub(super) struct Frame {
     started: Instant,
     loop_: CFRetained<CFRunLoop>,
@@ -14,12 +17,13 @@ impl NativeMarkdownPagedBodyPaintObserver for Frame {
         assert!(self.published.borrow().is_none(), "原帧只能交付一次");
         *self.published.borrow_mut() = Some((key.clone(), paints, self.started.elapsed()));
         if self.waiting.get() {
-            self.loop_.stop(); // 只停止这次测试runloop，不调用应用退出或增添产品快捷键。
+            self.loop_.stop(); // Stop only this finite test wait, without quitting the app or adding shortcuts.
         }
     }
 }
 
-/// 同一个真实帧的时钟与runloop装配；特殊动作错误观察仍只注册一次原帧通知。
+/// Bind the same real frame to its clock/run loop. Special action-error observation
+/// still registers only once for the original frame notification.
 pub(super) fn pending() -> Result<Rc<Frame>, String> {
     Ok(Rc::new(Frame {
         started: Instant::now(),
@@ -29,6 +33,8 @@ pub(super) fn pending() -> Result<Rc<Frame>, String> {
     }))
 }
 
+/// Subscribe through the actual Body's weak paint-observer API. The returned Rc
+/// keeps this observation alive without making the Body retain the observer strongly.
 pub(super) fn observe(body: &NativeMarkdownPagedBody) -> Result<Rc<Frame>, String> {
     let frame = pending()?;
     let erased: Rc<dyn NativeMarkdownPagedBodyPaintObserver> = frame.clone();
@@ -45,7 +51,8 @@ pub(super) fn wait_frame(
     wait(stage, body, frame, false)
 }
 
-/// 真EOF导航必须确认唯一Composer已complete；这不是放宽原Find前缀门或延长其deadline。
+/// Actual EOF navigation requires the sole composer to complete. This changes
+/// neither the prefix frame's acceptance gate nor its original deadline.
 pub(super) fn wait_complete_frame(
     stage: &str,
     body: &NativeMarkdownPagedBody,
@@ -70,16 +77,19 @@ fn wait(
             else {
                 break;
             };
-            // 共享主runloop也可能被先前窗口/释放回调stop；Stopped不代表原帧已交付或三秒到期。
-            // 每次只等待同一started期限的剩余时间，且唯一完成条件仍是原frame_published通知。
+            // A prior window/release callback may stop the shared main run loop.
+            // Stopped proves neither this frame nor deadline expiry. Reuse only
+            // the original deadline's remaining time; frame_published alone completes the wait.
             let progress = autoreleasepool(|_| {
-                // SAFETY: 原主线程default mode；没有文稿/Scene/RefCell借用跨真实source交付。
+                // SAFETY: Run the original main-thread default mode with no
+                // document/Scene/RefCell borrow across actual source delivery.
                 unsafe {
                     CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), false)
                 }
             });
             if progress == objc2_core_foundation::CFRunLoopRunResult::Finished {
-                // 无可运行source时重入会立即返回；保明确失败，不空转、不重发观察或生产请求。
+                // With no runnable source, another run returns immediately. Keep
+                // explicit failure rather than spinning or resubmitting observation/production work.
                 finished_without_frame = frame.published.borrow().is_none();
                 break;
             }
@@ -87,7 +97,8 @@ fn wait(
         frame.waiting.set(false);
     }
     if let Some(cause) = body.take_failure() {
-        // 合成验收边界保留具体语义错误类型以定位真实失败，不更改用户公开文案，也不记录正文或链接。
+        // This synthetic acceptance boundary retains the actual semantic error
+        // type without changing public messages or logging document text/links.
         if let crate::native_surface::paged_body::NativeMarkdownPagedBodyError::Semantics(
             semantic,
         ) = &cause
@@ -100,15 +111,16 @@ fn wait(
             omni_markdown_core::MarkdownLineComposeError::Bidi(bidi),
         ) = &cause
         {
-            // 同样保留真实 UBA 错误种类，区分表格域误用、来源失效与实际存储失败。
-            // BidiError 只含类型、坐标或系统错误，不输出文稿字符，也不改变原三秒完成要求。
+            // Preserve the actual UBA error kind to distinguish table-domain
+            // misuse, revoked sources, and storage failures. BidiError contains
+            // types/coordinates/system errors, not document text; retain the same deadline.
             return Err(format!("{stage}: 原Body失败：{cause}；bidi_error={bidi:?}"));
         }
         return Err(format!("{stage}: 原Body失败：{cause}"));
     }
     let view = body.view().map_err(|cause| cause.to_string())?;
     let prior_pending = match view.take_failure() {
-        Some(ViewError::Pending) => true, // 首个Ready之前的暂态通知不能覆盖随后必须实证的完整帧。
+        Some(ViewError::Pending) => true, // Pre-Ready notification cannot replace the required actual complete frame.
         Some(cause) => return Err(format!("{stage}: 原View失败：{cause}")),
         None => false,
     };
@@ -125,6 +137,8 @@ fn wait(
             format!("{stage}: 原三秒内没有真实完整帧通知")
         }
     })?;
+    // The callback's original Scene and paint completion must still match the
+    // actual view. A timely notification alone cannot certify newer/stale pixels.
     let actual = view
         .capture_ready_scene_key()
         .map_err(|cause| cause.to_string())?;
@@ -142,7 +156,7 @@ fn wait(
         "native_body_find stage={stage} actual_action_to_frame_ms={:.3} actual_cpu_paints={paints} original_key_verified=true formal=false",
         elapsed.as_secs_f64() * 1000.0
     );
-    metrics::sample(stage)?; // 原帧timestamp和完整票据门已固定；采样不增加原等待配额。
+    metrics::sample(stage)?; // The original frame timestamp/key are fixed; sampling grants no additional waiting budget.
     if elapsed > Duration::from_secs(3) {
         return Err(format!(
             "{stage}: 真实动作到完整帧耗时{:.3}ms，超过原3000ms门",

@@ -1,4 +1,5 @@
-//! 原候选门下的固定五层校准；只把精确颜色事实带回纯像素编码，不建立Native/Source缓存。
+//! Calibrate a fixed five-layer graph under the original candidate, returning exact color facts without
+//! a Native/Source cache.
 
 use super::*;
 use crate::native_surface::viewport_pixels::{
@@ -19,16 +20,21 @@ struct Entry {
     used_for_frame: bool,
 }
 
-/// Surface仅保最多两组端点、每组两个模式的纯输出表，最多1MiB并计原32MiB页账。
-/// 校准固定sRGB/RGBA8输出、Gray8 mask、256²和1x；不依赖窗口、主题、字体或Source。
-/// 表只证明这些精确RGB端点与blend的合成结果，每个新调色板仍逐色certify。
+/// The surface retains at most two endpoint groups with two pure output tables each, at most 1 MiB in
+/// the existing 32 MiB pixel ledger.
+/// Calibration fixes sRGB/RGBA8 output, Gray8 masks, 256x256 geometry, and 1x scale, independent of
+/// windows, theme, font, or Source.
+/// Tables certify only these exact RGB endpoints and blend; each new palette still needs per-color
+/// certification.
 #[derive(Default)]
 pub(super) struct Calibrations {
     entries: Vec<Entry>,
 }
 impl Calibrations {
-    /// 新候选保留已认证纯表，仅重新开放原两端点的本帧额度；不扩大Native尝试上限。
-    /// 没有表的预算miss只约束旧帧，不能令后来的合法可用预算永久失去校准机会。
+    /// A new candidate retains certified pure tables and renews only the two-endpoint frame quota,
+    /// without increasing Native attempt limits.
+    /// A budget miss without a table belongs to its frame and cannot permanently block a later frame
+    /// with available budget.
     pub(super) fn begin_frame(&mut self) {
         for entry in &mut self.entries {
             entry.used_for_frame = false;
@@ -38,12 +44,15 @@ impl Calibrations {
         }
     }
 
+    /// Report actual retained calibration outputs; attempted misses alone do not consume page storage.
     pub(super) fn has_pages(&self) -> bool {
         self.entries
             .iter()
             .any(|entry| entry.tables.iter().any(Option::is_some))
     }
 
+    /// Reuse or measure the exact endpoint pair under original candidate validation; a miss keeps
+    /// lossless encoding.
     pub(super) fn pairs(
         &mut self,
         request: &MaskPaletteRequest,
@@ -61,10 +70,12 @@ impl Calibrations {
                 if self.entries.len() == MAX_ENDPOINTS {
                     let Some(unused) = self.entries.iter().position(|entry| !entry.used_for_frame)
                     else {
-                        return Ok(None); // 第三组仍走原lossless表示，不为跨帧复用扩大本帧校准额度。
+                        return Ok(None); // A third group keeps its original lossless representation without enlarging this frame calibration quota.
                     };
-                    // 只淘汰本帧尚未消费的旧颜色。纯表在建立新Native图之前实际munmap，
-                    // 两组端点不会永久锁死最早颜色，也不会短暂多保第三组输出页。
+                    // Evict only old colors unused by this frame, actually unmapping their pure tables
+                    // before creating a new Native graph.
+                    // Two slots neither pin the first colors forever nor temporarily retain a third
+                    // output-page group.
                     drop(self.entries.remove(unused));
                     if pixels.observer().snapshot().release_failed {
                         return Err(NativeMarkdownPagedTextViewError::Raster(
@@ -83,7 +94,7 @@ impl Calibrations {
                 });
                 self.entries.len() - 1
             }
-        }; // 模式不是新的端点组；第二组实际颜色仍保留自己的两个固定槽。
+        }; // A blend mode is not another endpoint group; the second actual color pair retains its own two fixed slots.
         self.entries[endpoint].used_for_frame = true;
         for (mode, blend) in [
             MaskPairBlend::ForegroundThenForeground,
@@ -92,7 +103,8 @@ impl Calibrations {
         .into_iter()
         .enumerate()
         {
-            // 每个模式在同候选中只尝试一次；预算不足也保留attempted事实，不逐tile重建原生图。
+            // Attempt each mode once per candidate, including budget misses, instead of rebuilding a
+            // Native graph for every tile.
             if !self.entries[endpoint].attempted[mode] {
                 let table = capture_checked(request, blend, Arc::clone(&pixels), validate)?;
                 validate()?;
@@ -105,13 +117,15 @@ impl Calibrations {
                 .and_then(|table| table.certify(request, blend));
             validate()?;
             if pairs.is_some() {
-                return Ok(pairs); // 先保旧同前景模式；未全色匹配才允许原背景回混的独立实际表。
+                return Ok(pairs); // Prefer the original same-foreground mode; try the independently measured background blend only if full palette matching fails.
             }
         }
-        Ok(None) // 两种固定模式都不全覆盖，原Indexed/RGBA照常保全部颜色和功能。
+        Ok(None) // Without complete coverage from either fixed mode, original Indexed/RGBA preserves every color and existing behavior.
     }
 }
 
+// End the autorelease scope and verify all five actual Native objects before certifying their output
+// table.
 fn capture_checked(
     request: &MaskPaletteRequest,
     blend: MaskPairBlend,
@@ -123,9 +137,9 @@ fn capture_checked(
         let result = capture(request, blend, pixels, validate, &mut weaks);
         (result, weaks)
     });
-    CATransaction::flush(); // 当次五层及provider先实际归还，再允许下一个模式创建新Native图。
+    CATransaction::flush(); // Flush this five-layer graph and provider release before constructing the next mode Native graph.
     let returned = weaks.iter().all(|weak| weak.load().is_none());
-    validate()?; // 原Source/Font失败始终先于Native清理或优化错误。
+    validate()?; // Original Source/font failure precedes Native cleanup or optimization errors.
     let table = result?;
     if !returned {
         return Err(NativeMarkdownPagedTextViewError::Raster(
@@ -158,7 +172,7 @@ fn capture(
         Ok(value) => value,
         Err(PixelError::BudgetExceeded) => return Ok(None),
         Err(error) => return Err(error.into()),
-    }; // 只有额外页预算不足是优化miss，真实Native/context/映射故障仍拒绝原候选。
+    }; // Only optional-page budget exhaustion is an optimization miss; actual Native/context/mapping failures reject the candidate.
     let graph = Graph::new(validate, weaks)?;
     graph.install(request, blend, &pixels, validate)?;
     native(validate, || graph.second.setOpacity(0.0))?;
@@ -166,7 +180,7 @@ fn capture(
         graph.container.renderInContext(pixels.context())
     })?;
     native(validate, || CGContext::flush(Some(pixels.context())))?;
-    let single = pixels.first_row(); // 有限复制已结束，不能把输出slice借用跨过下一次Native。
+    let single = pixels.first_row(); // Complete the bounded copy before the next Native call, without a live output-slice borrow.
     native(validate, || graph.second.setOpacity(1.0))?;
     native(validate, || {
         CGContext::clear_rect(
@@ -178,7 +192,7 @@ fn capture(
         graph.container.renderInContext(pixels.context())
     })?;
     native(validate, || CGContext::flush(Some(pixels.context())))?;
-    drop(graph); // 先实际清mask/contents/颜色/子关系，后归还provider/context；无RefCell借用。
+    drop(graph); // Clear masks, contents, colors, and child relationships before returning providers/contexts, with no live RefCell borrow.
     validate()?;
     let table = pixels.finish(request, blend, &single);
     validate()?;
@@ -190,7 +204,8 @@ fn capture(
     Ok(Some(table?))
 }
 
-/// 与实际发布相同的五角色：container局部背景，两个按模式选色的前景各持独立A8mask。
+/// Use the published five-role composition: local-background container and two mode-selected
+/// foregrounds with independent A8 masks.
 struct Graph {
     container: Retained<CALayer>,
     first: Retained<CALayer>,
@@ -208,7 +223,7 @@ impl Graph {
             let layer = CALayer::new();
             let object: &AnyObject = &layer;
             weaks.push(NativeWeak::from(object));
-            validate()?; // 创建已经发生就先登记Weak，后置撤权也必须观察实际归还。
+            validate()?; // Register the weak observation immediately after creation so post-call revocation still observes actual release.
             Ok(layer)
         };
         Ok(Self {
@@ -237,7 +252,8 @@ impl Graph {
             native(validate, || layer.setBounds(rect))?;
             native(validate, || layer.setFrame(rect))?;
             native(validate, || layer.setContentsScale(1.0))?;
-            // SAFETY: 两个公开QuartzCore格式常量静态有效；只有实际A8mask采用Gray8存储hint。
+            // SAFETY: Both public QuartzCore format constants are static; use the Gray8 storage hint
+            // for actual A8 masks only.
             let format = unsafe {
                 if mask {
                     objc2_quartz_core::kCAContentsFormatGray8Uint
@@ -246,17 +262,19 @@ impl Graph {
                 }
             };
             native(validate, || {
-                // 标准setter只接收上方已取得的公开格式值，不改变原图像像素。
+                // The standard setter receives the acquired public format value without changing
+                // original image pixels.
                 layer.setContentsFormat(format);
             })?;
             let actual = native(validate, || layer.contentsFormat())?;
             if !native(validate, || actual.isEqualToString(format))? {
                 return Err(NativeMarkdownPagedTextViewError::Raster(
                     "双遮罩校准图的实际存储格式不一致".into(),
-                )); // setter成功不代表实际属性相同；拒绝此校准，不能拿旧RGBA格式的表给Gray签票。
+                )); // Setter return does not prove equal actual format; reject calibration instead of certifying Gray with an old RGBA table.
             }
             native(validate, || {
-                // SAFETY: 原A8mask为256²，layer同尺寸；固定resize不丢像素或改变原glyph。
+                // SAFETY: The original A8 mask and layer both measure 256x256; fixed resize neither
+                // discards pixels nor changes glyphs.
                 unsafe { layer.setContentsGravity(objc2_quartz_core::kCAGravityResize) };
             })?;
         }
@@ -281,36 +299,41 @@ impl Graph {
         let second = match blend {
             MaskPairBlend::ForegroundThenForeground => &foreground,
             MaskPairBlend::ForegroundThenBackground => &background,
-        }; // 第二层只选原端点，不引入新颜色或不透明度；资格仍由实际完整RGB表决定。
+        }; // The second layer selects an original endpoint only; the complete actual RGB table still determines certification.
         native(validate, || self.second.setBackgroundColor(Some(second)))?;
         let (first, second) = pixels.images();
         native(validate, || {
-            // SAFETY: 两个CGImage各持独立真实只读provider，局部pixels保持活跃；不向CF发送ObjC消息。
+            // SAFETY: Both CGImages hold independent actual read-only providers retained by local
+            // pixels; send no ObjC message to CF values.
             unsafe {
                 self.first_mask
                     .setContents(Some(&*std::ptr::from_ref(first).cast::<AnyObject>()))
             };
         })?;
         native(validate, || {
-            // SAFETY: 第二mask同样来自独立原provider，不能用第一份allocation的一次callback共享授权。
+            // SAFETY: The second mask has its own original provider; the first allocation callback
+            // cannot certify both allocations.
             unsafe {
                 self.second_mask
                     .setContents(Some(&*std::ptr::from_ref(second).cast::<AnyObject>()))
             };
         })?;
         native(validate, || {
-            // SAFETY: 固定原mask由本局部图独占；不持正文、View、delegate或业务回调。
+            // SAFETY: This local graph exclusively owns its fixed mask, without text, View, delegate,
+            // or business callbacks.
             unsafe { self.first.setMask(Some(&self.first_mask)) };
         })?;
         native(validate, || {
-            // SAFETY: 第二前景只使用自己的原第二mask，主线程下建立有限关系。
+            // SAFETY: Build a bounded main-thread relationship from the second foreground to its own
+            // original mask only.
             unsafe { self.second.setMask(Some(&self.second_mask)) };
         })?;
         let children = native(validate, || {
             NSArray::from_retained_slice(&[self.first.clone(), self.second.clone()])
         })?;
         native(validate, || {
-            // SAFETY: 数组仅含本图两个固定前景，未挂到产品视图，不发布部分画面。
+            // SAFETY: The array contains this graph two fixed foregrounds only; no product View
+            // receives this partial graph.
             unsafe { self.container.setSublayers(Some(&children)) };
         })?;
         Ok(())
@@ -318,8 +341,10 @@ impl Graph {
 }
 impl Drop for Graph {
     fn drop(&mut self) {
-        // 清理只作用本局部从未发布/暴露的独占图；即使current已撤销也必须归还自己的载荷。
-        // SAFETY: 所有对象均在主线程，关系只来自此实例；不清用户视图或后继Owner的图。
+        // Cleanup owns this local unpublished graph only and must release its payload even after
+        // current authority is revoked.
+        // SAFETY: All objects and relationships belong to this main-thread instance, without user View
+        // or successor-owner graph cleanup.
         unsafe {
             self.first.setMask(None);
             self.second.setMask(None);
@@ -333,6 +358,7 @@ impl Drop for Graph {
     }
 }
 
+// Validate around each potentially reentrant Native call; acquired results remain local on failure.
 fn native<T>(validate: &impl Fn() -> Result<()>, call: impl FnOnce() -> T) -> Result<T> {
     validate()?;
     let result = call();

@@ -1,4 +1,5 @@
-//! 把真实分项、唯一Store和原Measure串成可取消worker；任何公开中间状态都不冒充已布局。
+//! Coordinate actual itemization, the unique Store, and original Measure in one
+//! cancellable worker. Public intermediate states never imply completed layout.
 use super::store::resolved::ResolvedCapture;
 use super::{
     item::Result,
@@ -34,7 +35,8 @@ pub(super) mod table_row;
 ))]
 pub use table_row::{MarkdownLineTableRowRequest, MarkdownLineTableRowResponse};
 
-/// LineReady只由真实LineEnd产生；待处理控制或unsafe/词典/缺字都保留原阶段。
+/// Only an actual committed LineEnd produces LineReady. Pending controls, unsafe
+/// boundaries, dictionary work, and missing glyphs retain their original stages.
 #[derive(Clone)]
 pub enum MarkdownLineComposeAnswer {
     Yielded,
@@ -54,10 +56,13 @@ pub enum MarkdownLineComposeAnswer {
 }
 pub struct MarkdownLineComposeStep {
     pub bytes: usize,
-    /// 本次只消费已发布目录或字形；供调度器在原剩余配额内继续，不授予新的源读取额度。
-    /// 未逐项证明的阶段始终为 false，零 bytes 本身不能证明没有原文端点或控制字符读取。
+    /// This step only consumed published directories/glyphs, allowing the scheduler
+    /// to continue under its remaining quota without granting more Source reads.
+    /// Unproven stages stay false: zero reported bytes alone cannot establish that
+    /// no original endpoint or control character was read.
     pub source_free_continuation: bool,
-    /// 真实前沿子任务的邻接上下文读量；和source扫描、带halo输入分别保留。
+    /// Adjacent context read by the real frontier child, accounted separately from
+    /// Source scanning and halo-bearing shaping input.
     #[cfg(feature = "paged-shaping-frontier")]
     pub context_bytes: usize,
     pub scalars: usize,
@@ -119,7 +124,8 @@ enum Stage {
     ))]
     TablePublish,
 }
-/// GCB复制只服务真实Ready item/control；配额暂停保留同一个待消费owner，不重建Job。
+/// Grapheme migration serves only real Ready items/controls. A budget yield retains
+/// the same waiting owner instead of rebuilding its Job.
 #[derive(Clone, Copy)]
 enum GraphemeResume {
     Item,
@@ -128,7 +134,8 @@ enum GraphemeResume {
 struct Payload {
     source: MarkdownLayoutTextSource,
     coordinator: MarkdownLineItemCoordinator,
-    // 词组删除只保原GCB上的临时游标；不持第二Source、Reader或正文副本。
+    // Word actions retain only a temporary cursor over original grapheme metadata,
+    // without another Source, reader, or text copy.
     #[cfg(feature = "paged-shaping-frontier")]
     word_delete: Option<word::WordJob>,
     store: GlyphStore,
@@ -138,7 +145,8 @@ struct Payload {
     ))]
     table: Option<table_row::PendingRow>,
     stage: Stage,
-    // 真实LB Pending后仅留一个恢复标量；下一量子只推进原依赖，原Stage和consumer原样保留。
+    // An actual pending line-break query leaves one resume flag. The next quantum
+    // advances only its original dependency, preserving the stage and consumer.
     #[cfg(feature = "paged-shaping-frontier")]
     line_breaks_pending: bool,
     #[cfg(feature = "paged-shaping-frontier")]
@@ -162,12 +170,14 @@ struct Payload {
     start: usize,
     width: i64,
     style_inset_26_6: i32,
-    // 所有selector和已移出的prefix都先真实归还，最后才结算原selector收据。
+    // Actual selectors and transferred prefixes drop before the resolver claim
+    // settles their original resource observations.
     resolver_resources: Option<super::worker_resources::ResolveResourceClaim>,
 }
 
 impl Payload {
-    /// 原构造与同源样式重排共用唯一组合游标；传入的索引依赖已由调用方确定所有权。
+    /// Initial construction and same-Source restyling share this one composition
+    /// cursor. The caller has already established ownership of its index dependencies.
     fn new(
         source: MarkdownLayoutTextSource,
         coordinator: MarkdownLineItemCoordinator,
@@ -214,11 +224,13 @@ impl Payload {
     }
 }
 
-/// 只保一个实际Job、一个Measure和一个固定页Store；历史item在同一匿名File中检索。
-/// 字体owner由实际注册palette持有，本worker和最终行值只持同一有限catalog的弱注册。
+/// Retains one actual Job, one Measure, and a fixed-page Store. Historical items are
+/// searched in the same anonymous file. The registered palette owns fonts; this
+/// worker and final line values retain weak registrations in its bounded catalog.
 pub struct MarkdownLineComposer {
-    // 固定大续体由本worker唯一持有；取还外壳只移动指针，不反复搬运内联计划工作区。
-    // 分配不随正文长度增长，原Payload字段顺序和失败时整体归还的边界保持不变。
+    // This worker exclusively owns the fixed-size continuation. Taking/returning
+    // its shell moves a pointer, not the inline plan workspace. Allocation stays
+    // independent of text length; field drop order and whole-worker failure remain.
     payload: Option<Box<Payload>>,
     authority: MarkdownLayoutTextAuthority,
     cancellation: MarkdownLineComposeCancellation,
@@ -233,6 +245,8 @@ impl MarkdownLineComposer {
         width_26_6: i64,
         cancellation: MarkdownLineComposeCancellation,
     ) -> Result<Self> {
+        // Validate the original Source/cancellation chain before creating the actual
+        // coordinator and unique writer, then share their resource observation scope.
         source.health()?;
         if !source.permits(authority) {
             return Err(MarkdownLineComposeError::SourceMismatch);
@@ -254,7 +268,8 @@ impl MarkdownLineComposer {
             resources,
         })
     }
-    /// 显式前沿候选只交已认证prefix；原new的整item对照不在运行中切换策略。
+    /// Explicit frontier construction publishes only certified prefixes. A worker
+    /// created for complete-item processing cannot change policy after work starts.
     #[cfg(feature = "paged-shaping-frontier")]
     pub fn new_with_frontier(
         source: MarkdownLayoutTextSource,
@@ -272,7 +287,8 @@ impl MarkdownLineComposer {
             .enable_frontier()?;
         Ok(result)
     }
-    /// 原源健康始终先行；只读固定工作标量，不提前确保布局、读取正文或重签scope。
+    /// Check original Source health before reading fixed work facts; this neither
+    /// forces layout nor reads text or renews a producing scope.
     #[cfg(feature = "paged-shaping-frontier")]
     pub fn frontier_work(&self) -> Result<MarkdownLineFrontierWork> {
         self.guard()?;
@@ -283,6 +299,8 @@ impl MarkdownLineComposer {
             .frontier_work()
     }
     fn guard(&self) -> Result<()> {
+        // The original backing's first failure wins even after payload retirement;
+        // cancellation or an empty continuation must not hide that Source cause.
         if let Some(errno) = self.backing.as_ref().and_then(|value| value.first_errno()) {
             return Err(
                 crate::MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into(),
@@ -302,6 +320,8 @@ impl MarkdownLineComposer {
         Ok(())
     }
     fn finish<T>(&mut self, result: Result<T>) -> Result<T> {
+        // Recheck original authority after actual work. On failure, cancel the same
+        // deep selector before dropping all child allocations and the unique writer.
         let result = match self.guard() {
             Err(error) => {
                 drop(result);
@@ -316,9 +336,9 @@ impl MarkdownLineComposer {
                 .and_then(|value| value.resolver.as_ref())
             {
                 resolver.cancellation().cancel();
-            } // 真实失败先撤同一深层selector位，再归还实际child及唯一File。
+            }
             drop(self.payload.take());
-        } // 所有失败撤整个worker，不留下可重用的半目录或原Job。
+        } // No failure leaves a reusable partial directory or original Job behind.
         if let Some(errno) = self.backing.as_ref().and_then(|value| value.first_errno()) {
             return Err(
                 crate::MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into(),
@@ -330,11 +350,13 @@ impl MarkdownLineComposer {
         &self.authority
     }
 
-    /// 仅在首次 step 之前安装原锚点的有限物理行投影；正文、Source 身份与语言索引保持原样。
-    /// 隐区仍连续覆盖 canonical 坐标，但不会送入字体选择或字形整形。
+    /// Install the original anchors' bounded physical-line projection before the
+    /// first step. Text, Source identity, and language indexes stay unchanged; hidden
+    /// ranges still cover canonical coordinates without entering font selection.
     ///
     /// # Errors
-    /// 超过原折叠上限、端点不是真实物理换行、已开始排版或源失败时撤销本 worker。
+    /// Revoke this worker on excess folds, non-physical-line endpoints, layout that
+    /// has already started, or original Source failure.
     pub fn install_folded_ranges(&mut self, ranges: &[std::ops::Range<usize>]) -> Result<()> {
         let result = (|| {
             self.guard()?;
@@ -346,13 +368,15 @@ impl MarkdownLineComposer {
                 return Err(MarkdownLineComposeError::InvalidRequest);
             }
             payload.coordinator.install_folded_ranges(ranges)?;
-            // 输出保留同一有限端点 proof，公开 GCB 查询必须识别未迁入的隐区，而非答成非字素。
+            // Output shares the same bounded endpoint proof. Queries distinguish an
+            // unmigrated hidden range from a known non-grapheme position.
             payload.store.set_fold_plan(payload.coordinator.fold_plan());
             Ok(())
         })();
         self.finish(result)
     }
-    /// 只观察原writer的实际FD/映射与源释放；快照reader必须另取自身收据。
+    /// Observe the original writer's actual file/mapping and Source release. A
+    /// snapshot reader must obtain its independent resource observation.
     pub fn resource_observer(&self) -> Result<MarkdownComposedLineResourceObserver> {
         self.guard()?;
         self.payload
@@ -361,22 +385,27 @@ impl MarkdownLineComposer {
             .store
             .resource_observer()
     }
-    /// 失败或取消后仍能观察原资源事实；此getter不给正文、字体或布局任何新权限。
+    /// Observe original resource facts after failure/cancellation without granting
+    /// new text, font, or layout authority.
     pub fn worker_resource_observer(&self) -> MarkdownLineComposerWorkerResourceObserver {
         self.resources.observer()
     }
 
-    /// 选择相关的语法显隐变化使旧字形/软行失效；同一Source和已计算语言索引继续使用。
-    /// 调用前必须归还旧prefix Reader及Font试次；本方法不读取正文，也不重建UBA/Script/GCB。
+    /// Selection-sensitive syntax visibility invalidates old glyphs/soft lines while
+    /// retaining the same Source and prepared language indexes. The caller must
+    /// release old prefix readers/font trials first. This method neither reads text
+    /// nor rebuilds UBA, Script, or grapheme metadata.
     ///
     /// # Errors
-    /// 原Source失败、取消、旧派生资源未归还或新输出文件创建失败时撤销本worker。
+    /// Revoke this worker on Source failure, cancellation, retained old derived
+    /// resources, or failure to create the new output file.
     #[cfg(feature = "paged-shaping-frontier")]
     pub fn reset_styles(&mut self, fonts: MarkdownLineFontCatalog) -> Result<()> {
         let old_resources = self.resources.observer();
         let result = (|| {
             self.guard()?;
-            // 这个局部作用域先结束整张旧glyph图；不能在旧Measure/item/Store仍活时创建新writer。
+            // End the old glyph graph before creating another writer. Destructuring
+            // moves reusable indexes out while old Measure/item/Store fields drop.
             let (source, mut coordinator, width, writer) = {
                 let mut payload = self
                     .payload
@@ -393,7 +422,7 @@ impl MarkdownLineComposer {
                 } = *payload;
                 drop(store);
                 (source, coordinator, width, writer)
-            }; // payload在此作用域内声明，未移出的旧item/Measure等字段也在新图创建前析构。
+            };
             coordinator.reset_styles()?;
             let closed = writer.snapshot();
             let retired = old_resources
@@ -414,7 +443,8 @@ impl MarkdownLineComposer {
                 || retired.resolvers.cleanup_failed
             {
                 return Err(MarkdownLineComposeError::Poisoned);
-            } // 真实关闭失败不能被新空writer洗掉；复用中的语言依赖在最终会话关闭时独立验收。
+            } // A fresh empty writer cannot erase real old cleanup failure. Reused
+            // language dependencies are observed separately at final session close.
             let resources = coordinator.resource_scope();
             let mut store = GlyphStore::new(
                 source.clone(),
@@ -431,7 +461,9 @@ impl MarkdownLineComposer {
             Ok(())
         })();
         if let Err(cause) = result {
-            drop(self.payload.take()); // 失败候选先真实退出，随后读取同次Drop刚记录的Source/shape首错。
+            // Release the failed candidate before inspecting the Source/shape first
+            // failure that its actual Drop may just have recorded.
+            drop(self.payload.take());
             if let Some(errno) = self
                 .backing
                 .as_ref()
@@ -449,17 +481,21 @@ impl MarkdownLineComposer {
                     cause: Box::new(cause),
                     operation: error.operation,
                     errno: error.errno,
-                }); // 原操作与真实归还errno共同保留，不能用新空账本或Poisoned覆盖失败详情。
+                }); // Preserve both the operation cause and actual cleanup errno.
             }
-            return Err(cause); // payload已移出时不能调用常规finish，把真实原错改写成“空payload”。
+            // Payload was moved out; ordinary finish would replace this real cause
+            // with an empty-payload error rather than preserve the original failure.
+            return Err(cause);
         }
         self.finish(Ok(()))
     }
-    /// 查询当前已经发布的样式请求，不推进协调器、读取正文或重新签发 nonce。
-    /// 调用方可在本次有限工作结束后保留它，下一回合仍沿原样式响应入口消费。
+    /// Read the currently issued style request without advancing the coordinator,
+    /// reading text, or renewing its nonce. The caller may retain it across turns
+    /// and consume it through the same original response entry.
     ///
     /// # Errors
-    /// 原 Source、取消或 worker 已失效时拒绝；样式阶段缺少原请求仍是真实覆盖错误。
+    /// Reject failed Source, cancellation, or retired worker. Missing the original
+    /// request in Style remains an actual coverage error.
     pub fn pending_style_request(&self) -> Result<Option<MarkdownLineStyleRequest>> {
         self.guard()?;
         let payload = self
@@ -477,11 +513,13 @@ impl MarkdownLineComposer {
             .ok_or(MarkdownLineComposeError::InconsistentCoverage)
     }
 
-    /// 外部响应仍消费原协调器的nonce；同范围、同名字体或新捕文档均不能补签旧请求。
-    /// 只借原协调器的唯一依赖签发一个GCB，不推进排版或构造第二份索引。
+    /// Borrow the original coordinator's sole dependencies for one grapheme trial,
+    /// without advancing layout or creating another index. Responses consume its
+    /// original nonce; equal ranges/font names or a recaptured document cannot renew it.
     ///
     /// # Errors
-    /// 原Source、阶段、请求或取消位失效时整条worker撤权。
+    /// Revoke the complete worker on original Source, stage, request, or cancellation
+    /// failure.
     pub fn font_probe(
         &mut self,
         request: &MarkdownLineStyleRequest,
@@ -500,12 +538,16 @@ impl MarkdownLineComposer {
         self.finish(result)
     }
 
-    /// 同步核原 SourceRequest 的选择样式不变能力能否覆盖这个组合器的实际库存。
-    /// 仅普通完整行刚发布后的行首可准入；不截断 writer，不复制旧输出，也不替换资源 owner。
-    /// 能力不授 GCB/Font 权限，旧 Scene 和 Reader 仍须由 Native 退休并以完整新输入重新发布。
+    /// Check whether the original SourceRequest's style-invariance capability covers
+    /// this composer's actual captured inventory. Admission is limited to a line
+    /// start just after ordinary complete-line publication; no writer truncation,
+    /// output copy, or resource-owner replacement occurs. The capability grants no
+    /// grapheme/font authority: Native still retires old Scene/readers and republishes
+    /// under complete new input.
     ///
     /// # Errors
-    /// 原 Source、取消、出版物和实际 Font 注册失效均返回原错误；false 仅表示当前续体不能复用。
+    /// Preserve original Source, cancellation, publication, and font-registration
+    /// failures. False only means that the current continuation cannot be reused.
     #[cfg(all(
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
@@ -528,9 +570,10 @@ impl MarkdownLineComposer {
                     }
                     cause => MarkdownLineComposeError::RootLeafBoundary(Box::new(cause)),
                 })?;
-            // next_start 只能由本引擎普通 Publish 的真实 selected_permit 创建；该阶段
-            // 同时清 current/measure 并把 start 设为最新 LineEnd.end。重排签包的发布仍在
-            // Resolution，不能拿它残留的范围或旧行首票冒充这个静止边界。
+            // Only ordinary Publish obtains next_start from an actual selected
+            // permit, clears current/measure, and sets start to the latest LineEnd.
+            // Resolved-prefix publication remains in Resolution; its retained ranges
+            // or an old start ticket cannot establish this quiescent boundary.
             if !matches!(payload.stage, Stage::Start)
                 || payload.next_start.is_none()
                 || payload.item.is_some()
@@ -560,9 +603,10 @@ impl MarkdownLineComposer {
             else {
                 return Ok(false);
             };
-            // Store.source_end 包含为测量而已预取的后继 item；只用可见 LineEnd 会漏掉
-            // 仍依赖旧样式的字形。Root Code 可认证同源全域，Plain 仍只认证已读前缀；
-            // 两者都必须让 Coordinator 核同一消费末端、全部支持域与原 Font 注册。
+            // Store coverage includes successor items prefetched for Measure; the
+            // visible LineEnd alone would miss old-style glyphs. Root Code can prove
+            // the same-Source whole domain, while Plain proves only its read prefix.
+            // Both still require original consumed-end/support/font checks below.
             payload
                 .coordinator
                 .retains_selection_styles(captured_end, proven_end)
@@ -571,8 +615,9 @@ impl MarkdownLineComposer {
         result
     }
 
-    /// 原字体候选已真实归还当前 worker 后，借唯一协调器推进同一 GCB 的下一 level 段。
-    /// 只转移实际目录费用，不重建 Bidi/Script 或为平台 worker 创建第二份 owner。
+    /// After the actual font candidate releases its worker, advance the same
+    /// grapheme's next level segment through the sole coordinator. Transfer only
+    /// actual metadata work, without another bidi/Script index or platform owner.
     pub fn step_font_probe_segment(
         &mut self,
         probe: &mut MarkdownLineFontProbe,
@@ -592,7 +637,8 @@ impl MarkdownLineComposer {
         self.finish(result)
     }
 
-    /// 同一候选任一真实段缺字后才重启外层 GCB；原请求、取消与失败责任仍归该 Composer。
+    /// Restart the enclosing grapheme only after this candidate misses a real
+    /// segment. Original request, cancellation, and failure remain this composer's.
     pub fn restart_font_probe(&mut self, probe: &mut MarkdownLineFontProbe) -> Result<()> {
         let result = (|| {
             self.guard()?;
@@ -608,11 +654,13 @@ impl MarkdownLineComposer {
         self.finish(result)
     }
 
-    /// 只借当前右GCB请求的同一RootLeaf票；不把Rc出版物放入必须Send的请求或字体worker。
-    /// 原样式颜色变化不直接封口，后继实际Font响应仍由唯一协调器验证。
+    /// Borrow the same RootLeaf ticket for the current right-grapheme request;
+    /// never put its Rc publication in Send requests/font workers. A color/style
+    /// change alone grants no closure; the sole coordinator checks the actual font.
     ///
     /// # Errors
-    /// 原Source首错、取消、阶段或nonce失效时拒绝，不能借相同数值范围重放。
+    /// Reject original Source failure, cancellation, invalid stage, or stale nonce;
+    /// an identical numeric range cannot replay the ticket.
     #[cfg(all(
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
@@ -632,7 +680,8 @@ impl MarkdownLineComposer {
         payload.coordinator.root_leaf_style_boundary_for(request)
     }
 
-    /// 外部响应消费原协调器的nonce；原完整字体响应仍由唯一coordinator核验。
+    /// Consume the original coordinator nonce and let that same coordinator validate
+    /// the complete font response before resuming item work.
     pub fn provide_style(&mut self, response: MarkdownLineStyleResponse) -> Result<()> {
         let result = (|| {
             self.guard()?;
@@ -669,7 +718,8 @@ impl MarkdownLineComposer {
                     .as_ref()
                     .is_some_and(|request| request.continuation_font().is_some())
                 {
-                    // 原字体交接GCB已持两张收费端点票；同步响应不再查询索引或读正文。
+                    // This font-transfer grapheme already has two charged endpoint
+                    // proofs; consuming its response needs no index query/text read.
                     payload.coordinator.provide_style(response)?;
                 } else {
                     payload.coordinator.queue_style(response)?;
@@ -679,7 +729,8 @@ impl MarkdownLineComposer {
             payload.coordinator.provide_style(response)?;
             if !font_witness {
                 payload.style_inset_26_6 = inset;
-            } // 右GCB只见证Font边界，不能把它的段落缩进写给仍待发布的左项；正常响应保持原合同。
+            } // A right-grapheme witness cannot overwrite the pending left item's
+            // paragraph inset. Ordinary responses retain the original contract.
             payload.request = None;
             payload.stage = Stage::Item;
             Ok(())
@@ -700,6 +751,9 @@ impl MarkdownLineComposer {
             if !matches!(payload.stage, Stage::Control) || !request.accepts(&response) {
                 return Err(MarkdownLineComposeError::SourceMismatch);
             }
+            // Match the one pending control before deriving empty-paragraph facts.
+            // A trailing line separator retains its real UBA base; other EOF empties
+            // follow the existing empty-paragraph policy.
             payload.empty_capture = request.kind == MarkdownLineInlineControlKind::EmptyParagraph;
             let value = if payload.empty_capture {
                 let end = payload.source.utf16_len();
@@ -723,7 +777,8 @@ impl MarkdownLineComposer {
             let at_eof = value.facts.source_utf16.end == payload.source.utf16_len();
             let trailing_separator =
                 if at_eof && value.request.kind == MarkdownLineInlineControlKind::FoldedSection {
-                    // 原 TextKit 仍显示真实尾分隔符之后的空段；折到未终止正文 EOF 则没有后继空行。
+                    // Preserve the original trailing empty paragraph after a real
+                    // separator. A fold ending at unterminated text EOF adds none.
                     matches!(
                         payload
                             .source
@@ -746,7 +801,8 @@ impl MarkdownLineComposer {
         self.finish(result)
     }
 
-    /// 每回合只推进一种有限工作；UBA本身仍是明确可取消的后台整源元数据阶段。
+    /// Advance one kind of bounded work per turn. UBA remains an explicitly
+    /// cancellable Source-wide metadata phase, not a whole-text render copy.
     pub fn step(&mut self, budget: MarkdownLineComposeBudget) -> Result<MarkdownLineComposeStep> {
         let result = self.advance(budget);
         self.finish(result)
@@ -767,8 +823,9 @@ impl MarkdownLineComposer {
             .ok_or(MarkdownLineComposeError::Poisoned)?;
         #[cfg(feature = "paged-shaping-frontier")]
         if payload.line_breaks_pending {
-            // 上个consumer的配额已经结算；本次只做一次原LB推进，不同时重试cursor，
-            // 避免同一bytes/records预算在依赖和消费两边各花一次。
+            // The waiting consumer already spent its previous quota. Advance only
+            // the original line-break dependency now; retrying the consumer here
+            // would spend the same byte/record allowance twice.
             let progress = payload.coordinator.advance_pending_line_breaks(budget)?;
             payload.line_breaks_pending = false;
             result.bytes = progress.bytes;
@@ -783,11 +840,12 @@ impl MarkdownLineComposer {
             result.bytes = progress.bytes;
             result.scalars = progress.scalars;
             result.records = progress.records;
-            return Ok(result); // 同一个原GCB前进一次后交回消费者，不能同量子再读一份预算。
+            return Ok(result); // Resume the consumer later under its own next quota.
         }
-        // 只认可已审核的原 GCB/字形目录消费阶段。Item、行起点和重排封存可能
-        // 隐式读取源端点，不能把它们的零 bytes 误当作可在同一量子继续的证明。
-        // 依赖推进的早返回保持 false；真实读源仍归它本来的独立步骤与错误路径。
+        // Only audited grapheme/glyph directory phases qualify as Source-free.
+        // Item, line-start, and resolved publication may read Source endpoints even
+        // with zero reported bytes. Dependency early returns stay false; their
+        // actual reads keep their original separate step and failure boundary.
         result.source_free_continuation = matches!(
             payload.stage,
             Stage::Graphemes | Stage::Capture | Stage::Measure | Stage::ControlCapture
@@ -816,8 +874,9 @@ impl MarkdownLineComposer {
                     MarkdownLineItemAnswer::Yielded => {}
                     MarkdownLineItemAnswer::NeedStyle(request) => {
                         payload.request = Some(request);
-                        // 样式探测消费原BreakJob，不要求把全源GCB复制到输出。只有真实
-                        // Ready子item产生后，才迁入该子item实际需要的有限前缀。
+                        // Style trials consume the original Break Job without
+                        // copying every Source grapheme into output. Migrate only
+                        // the bounded prefix needed by an actual Ready child.
                         payload.stage = Stage::Style;
                     }
                     MarkdownLineItemAnswer::ItemReady(_) => {
@@ -882,8 +941,9 @@ impl MarkdownLineComposer {
                 result.metadata_units = progress.metadata_units;
                 if progress.ready {
                     payload.graphemes = None;
-                    // 所需GCB真实写完后才开启glyph/control capture，记录可交错但一个
-                    // glyph/cluster/style段内部仍保持其原连续格式和一次producer权限。
+                    // Start glyph/control capture after required graphemes are
+                    // actually written. Interleaved record kinds keep each original
+                    // glyph/cluster/style segment contiguous and producer-authenticated.
                     payload.stage = match resume {
                         GraphemeResume::Item => {
                             payload.store.begin_with_inset(
@@ -917,7 +977,9 @@ impl MarkdownLineComposer {
                         .ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
                     budget.records.min(256),
                 )? {
-                    drop(payload.item.take()); // 写完原实际glyph/cluster/style及origin后才归还Job及其FD。
+                    // Release the actual Job/FD only after complete glyph, cluster,
+                    // style, and opaque origin records have been committed.
+                    drop(payload.item.take());
                     if payload.measure.is_some() {
                         payload.next = Some(proof);
                         payload.stage = Stage::Continue;
@@ -933,6 +995,9 @@ impl MarkdownLineComposer {
                     .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
             }
             Stage::Start => {
+                // The next line starts either from committed Store coverage or
+                // newly prepared original items. A real EOF may still owe its
+                // trailing empty-paragraph control; a prefix end never implies EOF.
                 if payload.start == payload.source.utf16_len() {
                     if payload.empty_due {
                         payload.empty_due = false;
@@ -989,7 +1054,8 @@ impl MarkdownLineComposer {
                             breaks,
                             request,
                         )?
-                    }); // 只有原latest LineEnd私有票可作紧急GCB新行首；普通构造仍须实际UAX机会。
+                    }); // Only the latest private LineEnd ticket admits an emergency
+                    // grapheme start; ordinary construction still needs real UAX evidence.
                     payload.current = Some(proof);
                     payload.pen = 0;
                     payload.stage = Stage::Measure;
@@ -1007,8 +1073,9 @@ impl MarkdownLineComposer {
                     .take()
                     .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
                 let placement = payload.store.tab_placement(&next, payload.next_pen)?;
-                // 对下一已封存项执行一次元数据准入；这是完整语义操作，不是底层记录或 pread 数。
-                // Tab 尚待决时仍交回原控制路径，不能因已经查过目录就获得继续合并的权限。
+                // Charge one semantic admission of the sealed next item, not an
+                // invented count of low-level preads. An unresolved tab still takes
+                // its original control path; reading a directory does not admit it.
                 result.metadata_units = 1;
                 if let Some(placement) = placement
                     && !matches!(placement, MarkdownLineTabPlacement::Left { .. })
@@ -1035,7 +1102,8 @@ impl MarkdownLineComposer {
                 payload.current = Some(next);
                 payload.pen = payload.next_pen;
                 payload.stage = Stage::Measure;
-                // 同 Store 前后项已经真实交接，只读已有目录/字形；失败或提前返回均未到此签发。
+                // The same Store's actual item handoff has completed; only existing
+                // directories/glyphs were consumed. Earlier failure/returns grant none.
                 result.source_free_continuation = true;
             }
             Stage::Measure => {
@@ -1058,7 +1126,7 @@ impl MarkdownLineComposer {
                                 clusters: budget.records.min(256),
                             },
                         )?
-                }; // 结束原Store借用后才查后继目录或写下一项。
+                }; // End the exclusive Store borrow before locating/writing a successor.
                 result.records = progress.clusters;
                 result.metadata_units = progress.break_queries;
                 if let MarkdownSoftLineMeasureAnswer::Selected(choice) = progress.answer {
@@ -1069,7 +1137,8 @@ impl MarkdownLineComposer {
                         #[cfg(feature = "paged-shaping-frontier")]
                         MarkdownSoftLineMeasureChoice::MeasuredEmergencyBreak { .. } => {
                             payload.stage = Stage::Publish
-                        } // 仅原Measure封闭safe许可可复用已测glyph，不把公开紧急Range拿去签行。
+                        } // Reuse measured glyphs only under the original sealed
+                        // Measure permit, never a public emergency range alone.
                         MarkdownSoftLineMeasureChoice::NeedNextItem {
                             source_utf16,
                             x_advance_26_6,
@@ -1085,9 +1154,11 @@ impl MarkdownLineComposer {
                         }
                         blocked @ (MarkdownSoftLineMeasureChoice::NeedsFontFallback { .. }
                         | MarkdownSoftLineMeasureChoice::NeedsDictionary(_)) => {
-                            // 缺字和词典请求还没有可供重排的字形许可。保留原 measure 的选中
-                            // 状态，每次恢复仍核原 Source/Font；不能误入只接受重排的 resolver，
-                            // 更不能把 InvalidRequest 当作缺字处理或伪造已完成软行。
+                            // Missing-font/dictionary requests have no reshape
+                            // glyph permit yet. Keep the original selected Measure
+                            // state and recheck Source/font on resume; do not enter
+                            // the reshape-only resolver or disguise InvalidRequest
+                            // as fallback handling or a completed soft line.
                             result.answer = MarkdownLineComposeAnswer::NeedsResolution(blocked);
                         }
                         other => {
@@ -1118,7 +1189,8 @@ impl MarkdownLineComposer {
                 let next_start = {
                     let mut provider = payload.store.borrow_at(current, payload.pen)?;
                     permit.next_start(&mut provider)?
-                }; // LineEnd已真实写完后再签一次性行首；失败不会把半行或旧票带到下一Measure。
+                }; // Issue a single-use start only after real LineEnd commit; a
+                // failed publication cannot carry a partial line into next Measure.
                 payload.next_start = Some(next_start);
                 payload.start = line.source_utf16.end;
                 payload.measure = None;
@@ -1156,7 +1228,8 @@ impl MarkdownLineComposer {
                             let mut provider = payload.store.borrow_at(current, payload.pen)?;
                             let permit = measure.resolution_permit(&mut provider)?;
                             permit.seed(&mut provider)?.item
-                        }; // 先核原current的真实nonce与选中范围，再归还借用查同Store旧目录。
+                        }; // Authenticate current nonce/selection before releasing
+                        // that borrow to locate an earlier same-Store directory.
                         if selected.start < item.start
                             && let Some(previous) = payload.store.resolution_item_at(&selected)?
                         {
@@ -1167,14 +1240,18 @@ impl MarkdownLineComposer {
                                 &mut provider, &self.authority, &previous_font,
                             )?;
                             if selected.end <= facts.source_utf16.end {
-                                // 只有整个选中范围属于这一旧item才可恢复；实际Font/points由该目录真实注册与样式提供。
+                                // Restore only when this one original item contains
+                                // the complete selected range. Its real registration
+                                // and style provide the actual font and point size.
                                 measure.restore_selected_item(&mut provider, &previous_font)?;
                                 payload.current = Some(previous);
-                                payload.pen = 0; // 已认证Glyphs的cluster/reshape不使用pen；仅Tab依赖它，而上方目录已排除Tab。
-                            } // 跨多个Font/Script的选中范围保留原NextItem能力出口，不借其中一段伪造整段。
+                                payload.pen = 0; // Glyph clusters/reshape ignore pen;
+                                // tabs depend on it and were excluded above.
+                            } // Cross-font/Script selections retain the original
+                            // NextItem exit rather than borrow one fragment as all.
                         }
                     }
-                } // 已启动的原selector保持原锚点，不在每个量子重绑定或重新创建一个重排Job。
+                } // Keep the existing selector's anchor; do not rebind/rebuild it each quantum.
                 let current = payload
                     .current
                     .as_ref()
@@ -1213,7 +1290,8 @@ impl MarkdownLineComposer {
                         )?
                 };
                 result.bytes = progress.input_bytes;
-                // 重排正文与构造 halo 分开归还原量子；不能把只读了上下文的步骤当作零源工作。
+                // Reshaped center input and constructed halo are separately charged;
+                // context-only steps must not be described as zero Source work.
                 result.scalars = progress.input_scalars;
                 #[cfg(feature = "paged-shaping-frontier")]
                 {
@@ -1261,7 +1339,8 @@ impl MarkdownLineComposer {
                         payload.stage = Stage::Start;
                     }
                     MarkdownEmergencyGlyphSliceAnswer::Pending(_) => {
-                        // 词典、缺字或跨item重排仍需真实后继；不把当前字体重签为过去item。
+                        // Dictionary, fallback, or cross-item reshaping still needs
+                        // real successors; the current font cannot bless a past item.
                         result.answer = MarkdownLineComposeAnswer::NeedsResolution(
                             payload
                                 .resolution
@@ -1274,7 +1353,8 @@ impl MarkdownLineComposer {
                     | MarkdownEmergencyGlyphSliceAnswer::ReusableLine(_)
                     | MarkdownEmergencyGlyphSliceAnswer::Reshaped(_) => {
                         return Err(MarkdownLineComposeError::InconsistentCoverage);
-                    } // 本路径只消费真实签包；未归还child或旧fulltail结果均不能冒充成功。
+                    } // This path consumes only real signed prefixes, never an
+                      // unreturned child or an earlier complete-tail result.
                 }
             }
             Stage::ResolvedCapture => {
@@ -1312,7 +1392,7 @@ impl MarkdownLineComposer {
                     payload.start = line.source_utf16.end;
                     payload.stage = Stage::Resolution;
                     result.answer = MarkdownLineComposeAnswer::LineReady(line);
-                } // 同一个原Measure/selector继续FIFO；不为下一行重扫或重形完整剩余tail。
+                } // Continue the same Measure/selector FIFO without reshaping the full suffix.
             }
             Stage::ControlCapture => {
                 let before = payload.store.record_count()?;
@@ -1367,8 +1447,9 @@ impl MarkdownLineComposer {
             if !matches!(result.answer, MarkdownLineComposeAnswer::Yielded) {
                 return Err(MarkdownLineComposeError::InconsistentCoverage);
             }
-            // 只接受原LB query留下的需求；Glyph/GCB Pending、Yielded及缺字/词典结果
-            // 不会设置此位，也不改变其既有blocked路由或把未完成前缀签成EOF。
+            // Only an original line-break query leaves this demand. Other pending
+            // glyph/grapheme/fallback/dictionary results keep their own blocked
+            // routes and cannot reinterpret an incomplete prefix as EOF.
             payload.line_breaks_pending = true;
         }
         #[cfg(feature = "paged-shaping-frontier")]
@@ -1380,7 +1461,8 @@ impl MarkdownLineComposer {
         }
         Ok(result)
     }
-    /// 保留原worker并交付真实已提交行；后继滚动可继续同一cursor，不从源起点重新组合。
+    /// Publish actually committed lines while retaining the original worker. Later
+    /// scrolling continues the same cursor instead of composing again from Source start.
     #[cfg(feature = "paged-shaping-frontier")]
     pub fn publish_ready_prefix(&mut self) -> Result<Option<MarkdownComposedLines>> {
         let result = (|| {
@@ -1391,11 +1473,12 @@ impl MarkdownLineComposer {
                 .ok_or(MarkdownLineComposeError::Poisoned)?;
             if payload.resolved_capture.is_some() {
                 return Ok(None);
-            } // 外部签包转换尚未归还child时不截候选，也不消费原selector/Measure。
+            } // Do not cut a candidate while signed-prefix conversion owns its child.
             payload.store.publish_ready_prefix()
         })();
         if matches!(result, Err(MarkdownLineComposeError::SnapshotBusy)) {
-            // Current与candidate都在用时只拒绝第三份FD；取消或原Source首错仍撤整个worker。
+            // Current and candidate readers impose backpressure on a third FD;
+            // cancellation or original Source failure still revokes the worker.
             if let Err(error) = self.guard() {
                 return self.finish(Err(error));
             }
@@ -1404,7 +1487,8 @@ impl MarkdownLineComposer {
         self.finish(result)
     }
 
-    /// 消费worker只交付已签出的前缀；没有LineEnd或仍在写item时不能构造假空行。
+    /// Consume the worker to deliver its committed prefix only. Missing LineEnd or
+    /// an in-progress item cannot create a fabricated empty line.
     pub fn into_output(mut self) -> Result<MarkdownComposedLines> {
         self.guard()?;
         let mut payload = self
@@ -1413,7 +1497,7 @@ impl MarkdownLineComposer {
             .ok_or(MarkdownLineComposeError::Poisoned)?;
         if payload.resolved_capture.is_some() {
             return Err(MarkdownLineComposeError::InvalidRequest);
-        } // 正在转换的候选没有LineEnd，不能截断为已发布prefix。
+        } // The in-progress conversion has no committed LineEnd to publish.
         close_resolver(&mut payload)?;
         let Payload {
             store,
@@ -1428,6 +1512,8 @@ impl MarkdownLineComposer {
 }
 
 fn close_resolver(payload: &mut Payload) -> Result<()> {
+    // Explicitly close the real selector and verify its actual jobs before settling
+    // its observation claim. The observer itself does not retain the business owner.
     if let Some(resolver) = payload.resolver.take() {
         let observer = resolver.resource_observer();
         let resources = resolver.close()?;
@@ -1437,14 +1523,10 @@ fn close_resolver(payload: &mut Payload) -> Result<()> {
         {
             return Err(MarkdownLineComposeError::Poisoned);
         }
-    } // 原selector结算实际子job后才归还Measure；observer不保活业务owner。
+    }
     drop(payload.resolver_resources.take());
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "engine/lazy_graphemes_tests.rs"]
-mod lazy_graphemes_tests;
 
 #[cfg(all(test, feature = "paged-shaping-frontier"))]
 #[path = "engine/line_prefix_tests.rs"]

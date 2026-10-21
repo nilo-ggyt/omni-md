@@ -1,6 +1,8 @@
-//! 表格语义沿原请求流式认证，字形只续真实视口前缀，字体仍由正文唯一线程处理。
+//! Stream table semantic certification through the original request; glyphs advance the actual viewport
+//! prefix using the body unique font worker.
 //!
-//! 完成行离屏后归还格资源；回滚只从原封存行目录重建当前真实视口。
+//! Return completed offscreen cell resources; backward scrolling reconstructs the actual current
+//! viewport from the original sealed row directory.
 
 use super::super::scene::{GridCellContent, GridCellPublication, GridRowPublication};
 mod target;
@@ -24,34 +26,42 @@ use std::ops::Range;
 use target::{CellTarget, RowTarget};
 pub(super) mod word;
 
-/// 仅这一轮真实格工作；原Request已计CellInline，Display差量与Composer量子单列避免重复。
+/// Measure this turn actual cell work only, separating display deltas from Composer quanta because the
+/// original Request already accounts CellInline.
 #[derive(Default)]
 pub(super) struct Work {
-    /// 原请求未计入的显示转换工作；CellInline 已在同一原请求总账中，不能再加一次。
+    /// Display-conversion work absent from the original request total; do not count its
+    /// already-accounted CellInline work again.
     pub display: SemanticWork,
-    /// Composer 实际读取，不等同原文件唯一字节数；同范围的 Unicode 子任务可分别收费。
+    /// Actual Composer reads are not unique file bytes; independent Unicode subtasks may read the same
+    /// range separately.
     pub bytes: usize,
-    /// 原 Unicode/整形游标实际推进量，用来显示真实工作而非依据文本长度估算。
+    /// Actual Unicode/shaping cursor progress describes work instead of estimating it from text length.
     pub scalars: usize,
-    /// 同目录的实际处理记录；它与源读取、字形数量有不同计量单位。
+    /// Actual directory records use different units from Source reads and glyph counts.
     pub metadata: usize,
-    /// 最大值来自单次原 step，不能把多个串行回合的总量误当单回合预算。
+    /// Maxima come from one original step, rather than treating a sum of serial turns as a single-turn
+    /// allowance.
     pub maximum_bytes: usize,
     pub maximum_scalars: usize,
     pub maximum_metadata: usize,
-    /// 字体试次读取由外层原 FontTrial 单独累计，这里只包含原前沿任务自己的 Source 读取。
+    /// The outer original FontTrial accounts trial reads separately; include original frontier Source
+    /// work only here.
     pub frontier_source_bytes: usize,
-    /// 实际交给整形器的输入量；原源扫描和复制不能冒充已经排完的字符。
+    /// Actual shaper input is distinct from Source scanning/copying, which cannot claim completed
+    /// shaping.
     pub shaped_input_bytes: usize,
 }
 
-/// 同一物理表的列宽在原宽度 epoch 内固定，后续行不因滚动重新分配列宽。
+/// Keep one physical table column widths fixed within their original width epoch, without reallocating
+/// widths when later rows scroll.
 pub(super) struct TableWidths {
     pub(super) header: usize,
     pub(super) widths: Rc<[f64]>,
 }
 
-/// 当前格的真实工作请求仍交 Producer 唯一 FontTrial/FontWorker，不为格新增线程或 Body。
+/// Route actual cell requests to the Producer unique FontTrial/FontWorker, without a per-cell thread or
+/// Body.
 pub(super) enum Advance {
     Progress,
     Style {
@@ -70,60 +80,79 @@ pub(super) enum Advance {
     },
 }
 
-/// 只有最终格高全部完成才给原 Composer 签 TableRow；可见前缀不冒充这一完成条件。
+/// Respond to the original Composer TableRow only after every final cell height completes; a visible
+/// prefix is insufficient.
 pub(super) struct Grid {
-    /// 原 Core 请求 nonce 与结构票同寿；最终几何只能归还这一尚未响应的请求。
+    /// The original Core nonce shares the structural ticket lifetime; final geometry answers this
+    /// outstanding request only.
     request: Option<MarkdownLineTableRowRequest>,
-    /// 恢复行也必须持当前同源的真实结构票；它没有待提交的 Core 请求。
+    /// A restored row still needs an actual current same-Source structural ticket, without an
+    /// outstanding Core response.
     row: omni_markdown_core::VerifiedMarkdownLayoutTableRow,
-    /// 只有原输出真正封存的行才有最终高，格前缀的 EOF 状态仍独立保留。
+    /// Only an actually sealed output row has final height; cell-prefix EOF remains a separate fact.
     sealed_height: Option<f64>,
-    /// y-down 文档坐标，来源是前面真实 LineEnd 的累计高度，不是字符数或预估行数。
+    /// Y-down document position sums actual earlier LineEnd heights, rather than character count or
+    /// estimated lines.
     pub(super) top: f64,
-    /// 原宽度 epoch 的最终列框宽；统一为26.6后才给 Composer 和 Scene 两侧使用。
+    /// Final column boxes belong to the original width epoch and are quantized once to 26.6 for both
+    /// Composer and Scene.
     widths: Rc<[f64]>,
-    /// 只为首次表头测宽；一个格达到真实 cap 就结束该格，不预排巨格全部字形。
+    /// Measure first-header natural widths only; stop a cell at its actual cap without shaping all
+    /// glyphs of a huge cell.
     natural: Option<NaturalWidths>,
-    /// 列数来自原结构票；这些格只随当前可见行或唯一未提交行存活。
+    /// Column count comes from the original structural ticket; cells live with the visible row or
+    /// unique unsubmitted row only.
     cells: Vec<Cell>,
-    /// 在同一行的实际列之间轮转，避免第一列巨段落阻止后面可见列获得准备机会。
+    /// Rotate actual row columns so a huge first-column paragraph cannot starve later visible columns.
     current: usize,
-    /// 仅表示最终几何已归还；Core 后续仍须完成自己的结构/GCB/目录步骤才能产 LineReady。
+    /// This flag means final geometry was returned only; Core must still finish
+    /// structural/grapheme/directory work before LineReady.
     pub(super) submitted: bool,
-    /// Find 保原弱业务请求与有限格游标，不持第二份输入、文档或 Source。
+    /// Find retains original weak business authority and a finite cell cursor, without another Input,
+    /// document, or Source.
     target: Option<RowTarget>,
-    /// 每次 advance 后交给外层，临时自然宽作业退场也不会丢已发生的读取工作。
+    /// Return actual work to the outer owner after advance so retiring natural-width work cannot lose
+    /// performed reads.
     work: Work,
 }
 
-/// 自然宽测量串行复用一个格，达到原 cap 后无需继续排完整个巨格来证明更大的宽度。
+/// Natural-width measurement serially reuses one cell; reaching the cap needs no full huge-cell layout
+/// to prove a larger width.
 struct NaturalWidths {
     values: Vec<f64>,
     active: Cell,
 }
 
-/// 真空格不建 Composer；非空格只持当前可见行所需的真实续体和原输出。
+/// An actually empty cell creates no Composer; nonempty cells own actual continuations/output needed by
+/// the current visible row.
 struct Cell {
-    /// 作业位置不授予来源权限；真正范围仍来自下方的原结构票和显示源。
+    /// Work coordinates grant no Source authority; actual ranges come from original structural tickets
+    /// and display Source.
     column: usize,
-    /// 先借原请求取得真正 CellInline，再逐4KiB转换；Pending 没有可读显示 Source。
+    /// Borrow actual CellInline from the original request, then convert in 4 KiB steps; Pending grants
+    /// no readable display Source.
     preparation: Option<MarkdownTableCellDisplayPreparation>,
-    /// 只读显示目录及其 canonical 映射，不是可写草稿，也不进入正文 Input 域。
+    /// Read-only display directories and canonical mapping are neither writable drafts nor members of
+    /// the body Input domain.
     display: Option<Rc<MarkdownTableCellDisplaySource>>,
-    /// 只有 raw 范围与完成后的显示都为空才进入此分支，未知非空格不能冒充空格。
+    /// Only empty raw range plus completed empty display permits this branch; unknown nonempty cells
+    /// cannot masquerade as empty.
     empty: Option<VerifiedMarkdownTableCellSource>,
-    /// 与正文共享 FontCatalog，保自己实际显示 Source 的行目录，不创建单格 Body 或线程。
+    /// Share the body FontCatalog and own this actual display Source line directory, without a per-cell
+    /// Body or thread.
     composer: Option<MarkdownLineComposer>,
-    /// 生命周期结束先撤原 Core 子任务，防止迟到工作借旧 Source 继续产新字形。
+    /// Revoke original Core subtasks at retirement so late work cannot use old Source to create new
+    /// glyphs.
     cancellation: MarkdownLineComposeCancellation,
-    /// 原 prefix Reader 与 Scene 共享同一实例，复制 Rc 不另开目录 FD。
+    /// Scene shares the same prefix Reader; cloning Rc opens no additional directory descriptor.
     output: Option<Rc<RefCell<MarkdownComposedLines>>>,
-    /// 一条已封存行也可能有很多 part；未完成的真实字体度量必须在原位置续完。
+    /// A sealed line may have many parts; resume its unfinished actual font metrics at the same cursor.
     pending: Option<LineMetrics>,
-    /// 只累已经完整度量的行，未消费的 pending 行不提前参与行高。
+    /// Sum completely measured lines only; unfinished pending lines cannot contribute early height.
     height: f64,
     lines: usize,
-    /// 真实 Composer EOF 或双空证明才完成，视口覆盖不能设置此位。
+    /// Only actual Composer EOF or verified raw/display emptiness completes the cell; viewport coverage
+    /// cannot set this flag.
     complete: bool,
     width: f64,
     natural_line: f64,
@@ -132,11 +161,14 @@ struct Cell {
     target: Option<CellTarget>,
 }
 
-/// 行目录仍只在原 prefix Reader 中；窗口准备只保有限弱句柄和下一条真实度量游标。
+/// Keep line directories in the original prefix Reader; window preparation retains bounded weak handles
+/// and the next actual metric cursor.
 struct CellScan {
-    /// 每个几何请求独立准备窗口；旧宽度/滚动票不能直接给后继 Scene 签 Ready。
+    /// Each geometry request prepares its own window; old width/scroll authority cannot certify a
+    /// successor Scene Ready.
     request: NativeMarkdownPagedSceneRequest,
-    /// 句柄只弱指向原 Reader，不把离屏字形或整格文字搬进 Native 数组。
+    /// Handles weakly identify the original Reader without moving offscreen glyphs or whole-cell text
+    /// into Native arrays.
     cursor: Option<MarkdownComposedLine>,
     metrics: Option<LineMetrics>,
     bottom: f64,
@@ -146,7 +178,8 @@ struct CellScan {
 }
 
 impl Grid {
-    /// 原块起点和原 NeedStyle nonce 已由 Core 接纳；这里不从裸范围制造行或输入图。
+    /// Core accepted the original block start and NeedStyle nonce; do not construct rows or Input
+    /// graphs from bare ranges.
     pub(super) fn new(
         request: MarkdownLineTableRowRequest,
         top: f64,
@@ -155,13 +188,17 @@ impl Grid {
         let columns = request.row().columns();
         let header = request.row().coordinate().0;
         let retained = widths.as_ref().filter(|widths| widths.header == header);
-        // 同表后续行复用已解算列宽，避免每向下滚一行就重新分配列位置。
-        // 缓存属于原 Producer/宽度 epoch，不能在宽度换代或另一张表之间借用。
+        // Reuse solved widths for later rows in the same table instead of reallocating positions
+        // whenever scrolling downward.
+        // These widths belong to the original Producer/width epoch and cannot cross width supersession
+        // or another table.
         let (widths, natural) = match retained {
             Some(retained) => (retained.widths.clone(), None),
             None => {
-                // 原顺序 flow 先经过真实表头；违反这一点是装配错误，不能以默认列宽掩盖。
-                // 旧行恢复需要从真实目录读已封存列宽，不在这里静默重测某条正文行。
+                // Sequential flow must reach the actual header first; violating this assembly rule
+                // cannot be hidden by default widths.
+                // Restoration reads actual sealed column widths instead of silently remeasuring an
+                // arbitrary body row.
                 assert_eq!(
                     request.row().coordinate().1,
                     0,
@@ -177,8 +214,10 @@ impl Grid {
             }
         };
         let cells = if natural.is_none() {
-            // 这里只分配有限列元数据，实际 Source/Composer 在该列被推进时才创建。
-            // 不因原文包含大量格而一次装配整表字形或原生输入对象。
+            // Allocate bounded column metadata only; create actual Source/Composer when that column
+            // advances.
+            // Many source cells do not authorize assembling whole-table glyphs or Native input objects
+            // eagerly.
             widths
                 .iter()
                 .enumerate()
@@ -203,7 +242,8 @@ impl Grid {
         }
     }
 
-    /// 只接原 Reader 认证的最终高度和列宽；恢复不会伪造未响应的 TableRowRequest。
+    /// Accept original Reader-certified final height/widths only; restoration fabricates no outstanding
+    /// TableRowRequest.
     pub(super) fn restored(
         row: omni_markdown_core::VerifiedMarkdownLayoutTableRow,
         top: f64,
@@ -224,16 +264,18 @@ impl Grid {
             natural: None,
             cells,
             current: 0,
-            submitted: true, // 原行已真实封存，当前对象没有新的 Core 提交责任。
+            submitted: true, // The original row was actually sealed; this object owes no new Core response.
             target: None,
             work: Work::default(),
         }
     }
 
-    /// Native 重入前后仍由外层原票约束；纯格作业另核同一结构行与 canonical Source。
+    /// Outer original authority guards Native reentry; pure cell work additionally checks the same
+    /// structural row and canonical Source.
     fn require(&self, owner: &Owner, source: &MarkdownLayoutTextSource) -> Result<()> {
-        // Doc 只在纯 Core 核来源时短借；返回前归还，后续字体/窗口回调才能安全重入。
-        // 同数值范围的新 publication 无权为旧结构行续票。
+        // Borrow the document briefly for pure Core source checks and release before later font/window
+        // callbacks may reenter.
+        // A new publication with equal numeric ranges cannot renew an old structural row ticket.
         let document = owner
             .document
             .borrow()
@@ -244,7 +286,8 @@ impl Grid {
         Ok(())
     }
 
-    /// 当前唯一 FontTrial 指向真实在途格，不从列号重新捕获 Source 或换成另一坐标域。
+    /// The unique current FontTrial names the actual in-flight cell, without recapturing Source by
+    /// column or switching coordinate domains.
     pub(super) fn display(&self, column: usize) -> Rc<MarkdownTableCellDisplaySource> {
         self.cell(column)
             .display
@@ -260,12 +303,14 @@ impl Grid {
             .source()
     }
 
-    /// 已发生的读量在退休Cell前移交原Producer，不能随临时自然宽作业被丢掉。
+    /// Transfer performed reads to the original Producer before cell retirement so temporary
+    /// natural-width work cannot discard them.
     pub(super) fn take_work(&mut self) -> Work {
         std::mem::take(&mut self.work)
     }
 
-    /// 同一请求的响应回到原 Cell Composer；不是把局部 range 注入外层 Body Composer。
+    /// Return the same-request response to its original cell Composer rather than injecting a
+    /// cell-local range into the body Composer.
     pub(super) fn composer(&mut self, column: usize) -> &mut MarkdownLineComposer {
         self.cell_mut(column)
             .composer
@@ -276,7 +321,8 @@ impl Grid {
     fn cell(&self, column: usize) -> &Cell {
         match &self.natural {
             Some(natural) => {
-                // 测宽只有一个活格；异步字体响应必须回这一格，不能落到后继列。
+                // Measurement owns one active cell; asynchronous font responses must return to that
+                // cell rather than its successor column.
                 assert_eq!(natural.active.column, column);
                 &natural.active
             }
@@ -286,7 +332,8 @@ impl Grid {
     fn cell_mut(&mut self, column: usize) -> &mut Cell {
         match &mut self.natural {
             Some(natural) => {
-                // 索引错位属于原作业装配错误，不能返回默认 Cell 或重新捕一份显示源。
+                // A mismatched work index is an assembly error, without a default cell or recaptured
+                // display Source.
                 assert_eq!(natural.active.column, column);
                 &mut natural.active
             }
@@ -294,31 +341,39 @@ impl Grid {
         }
     }
 
-    /// 行高只有真实已结束的 Cell LineEnd 参与；未排后缀和未见格不会签最终 max。
+    /// Only completed actual cell LineEnds contribute height; unlaid suffixes or unseen cells cannot
+    /// certify the final maximum.
     pub(super) fn height(&self) -> f64 {
         if let Some(height) = self.sealed_height {
-            return height; // 原封存几何不随恢复格的可见前缀高度缩短，后续正文位置保持不变。
+            return height; // Original sealed geometry does not shrink to a restored visible prefix, preserving later body positions.
         }
-        // 所有格共享原最小38pt行框；更高内容只有实际行度量结束才抬高当前前缀。
-        // 这里的 max 在 complete 前仍是下界，禁止据此排列后续正文。
+        // Cells share the original minimum 38-point box; taller content increases the prefix only after
+        // actual line metrics complete.
+        // Before complete this maximum remains a lower bound and cannot position subsequent body
+        // content.
         self.cells.iter().fold(MINIMUM_HEIGHT, |height, cell| {
             height.max((cell.height + VERTICAL * 2.0).ceil())
         })
     }
 
     pub(super) fn complete(&self) -> bool {
-        // 测宽完成只固定列位置，不证明实际最终宽度下的字形布局已经结束。
-        // 最终高需要每个真实列都结束，不能只检查当前可见的短格。
+        // Finished measurement fixes column positions only, without certifying complete glyph layout at
+        // final widths.
+        // Final height requires every actual column to finish, not merely currently visible short
+        // cells.
         self.natural.is_none() && self.cells.iter().all(|cell| cell.complete)
     }
 
-    /// 列宽只在真实自然宽solver完成后固定到26.6；零代表测宽尚未完成，不授额外水平范围。
-    /// 原恢复行沿封存目录取得同一widths，滚动不会重新按列数或平均字符宽估算。
+    /// Fix widths in 26.6 only after actual natural-width solving; an unsolved empty width set grants
+    /// no extra horizontal range.
+    /// Restored rows obtain the same widths from the sealed directory, without estimates by column
+    /// count or average characters during scroll.
     pub(super) fn width(&self) -> f64 {
         self.widths.iter().sum()
     }
 
-    /// 只判断当前可见列是否缺真实前缀；封存行高不能冒充尚未恢复的文字已经可读。
+    /// Check missing actual prefixes in visible columns only; sealed row height cannot certify
+    /// readability of unrestored text.
     pub(super) fn needs_visible_work(
         &self,
         scene: &NativeMarkdownPagedSceneRequest,
@@ -335,7 +390,8 @@ impl Grid {
         })
     }
 
-    /// 在途语义准备必须归还原请求单格槽以后才可退休；不以取消布尔替代实际完成。
+    /// Retire in-flight semantic preparation only after the original request cell slot returns; a
+    /// cancellation flag is not actual completion.
     pub(super) fn has_preparation(&self) -> bool {
         self.natural
             .as_ref()
@@ -343,7 +399,8 @@ impl Grid {
             || self.cells.iter().any(|cell| cell.preparation.is_some())
     }
 
-    /// 已定位过的原 Find 请求不重复接管；新请求仍须走该格的真实首标量行几何。
+    /// Do not retake an already located original Find request; new requests still need the cell actual
+    /// first-scalar line geometry.
     pub(super) fn needs_target(
         &self,
         target: &Rc<super::super::target::SourceTargetRequest>,
@@ -355,7 +412,8 @@ impl Grid {
                 .is_some_and(|old| Rc::ptr_eq(&old.request, target))
     }
 
-    /// 收据只观察当前实际资源，不保活来源、文件或任务，也不记录已经退休的历史格。
+    /// Observe current actual resources without retaining Source, files, tasks, or historical retired
+    /// cells.
     pub(super) fn resource_receipts(
         &self,
     ) -> Result<Vec<super::super::NativeMarkdownPagedCellResourceReceipts>> {
@@ -366,7 +424,8 @@ impl Grid {
         cells.map(Cell::resource_receipt).collect()
     }
 
-    /// 原布局字段明确区分全行完成和已测前缀；巨格达到可见底边就暂停整形。
+    /// Keep full-row completion distinct from the measured prefix; pause shaping a huge cell at the
+    /// visible bottom.
     pub(super) fn advance(
         &mut self,
         owner: &Owner,
@@ -380,8 +439,9 @@ impl Grid {
     ) -> Result<Advance> {
         self.require(owner, source)?;
         if let Some(natural) = self.natural.as_mut() {
-            // 原显示认证也按同一量子推进。该分支不在同回合再推进正式列宽下的 Composer。
-            // 达到 cap 的证明来自真实字形 advance，不来自字符个数或字体名称。
+            // Display certification uses the same quantum; this branch never also advances the
+            // final-width Composer in that turn.
+            // Actual glyph advance establishes the cap, rather than character count or font name.
             let result = natural.active.advance(
                 owner,
                 source,
@@ -391,20 +451,25 @@ impl Grid {
                 &mut self.work,
             )?;
             if natural.active.complete || natural.active.natural_maximum >= MAXIMUM_WIDTH {
-                // 栏宽包含左右padding，边线在框内绘制，不额外把边宽加入目录sum。
+                // Column width includes horizontal padding and borders draw inside the box, without
+                // adding border width to the directory sum.
                 let width = natural.active.natural_maximum.min(MAXIMUM_WIDTH) + HORIZONTAL * 2.0;
                 natural.values.push(width);
-                // 这个作业只证明被 cap 后的自然宽，取消剩余字形工作不改变原文或原语义。
+                // This task certifies capped natural width only; cancelling remaining glyph work
+                // changes neither original text nor semantics.
                 natural.active.release_layout();
                 if natural.values.len() == self.row.columns() {
-                    // 窄窗口保有可用的真实列内容宽，超出部分属于表整体水平范围。
-                    // 不能把很多列强夹到padding以内，然后以零宽格丢失内容。
+                    // Narrow windows retain usable actual cell widths, with excess width belonging to
+                    // the table horizontal extent.
+                    // Never force many columns inside their padding and lose contents through
+                    // zero-width cells.
                     let body_width =
                         super::width(scene, owner.configuration.padding)? as f64 / 64.0;
                     let available = body_width.max(natural.values.len() as f64 * 42.0);
                     let mut resolved =
                         native_markdown_table_column_widths(&natural.values, available);
-                    // 真实列框先统一到原目录26.6单位，封存sum与后续绘图完全一致。
+                    // Quantize actual column boxes to directory 26.6 units first so sealed sums agree
+                    // exactly with later painting.
                     for width in &mut resolved {
                         *width = (*width * 64.0).round() / 64.0;
                     }
@@ -421,7 +486,8 @@ impl Grid {
                         .collect();
                     self.natural = None;
                 } else {
-                    // 前一格的 Source/目录已经真实退休后才创建下一格，测宽不并存整行输出。
+                    // Create the next cell after the previous Source/directory retires, without
+                    // simultaneous whole-row measurement output.
                     natural.active = Cell::new(natural.values.len(), MAXIMUM_WIDTH);
                 }
                 return Ok(Advance::Progress);
@@ -433,9 +499,11 @@ impl Grid {
             .iter()
             .position(|cell| cell.preparation.is_some())
         {
-            // 所有格共享原 Request 唯一 CellInline 槽；一列尚在语义/显示准备时，
-            // 不能轮转到另一列启动第二份准备，否则真实原发布会被判为 PublicationSuperseded。
-            // 先把这一列的原准备交付为显示源，再恢复下方字形轮转；不创建第二 Parser 或 owner。
+            // All cells share the original Request unique CellInline slot; while one column prepares
+            // semantics/display,
+            // starting another column preparation would supersede the actual original publication.
+            // Deliver this original preparation as display Source before resuming glyph rotation,
+            // without another parser or owner.
             return self.cells[column].advance(
                 owner,
                 source,
@@ -446,25 +514,29 @@ impl Grid {
             );
         }
         if self.natural.is_none() && self.cells.iter().all(|cell| cell.complete) {
-            // 原 Find 可能刚请求已完成格；仍先给该原目标找真实文字行，不能只返回整row高框。
+            // Find may target an already completed cell; locate its actual text line first instead of
+            // returning the whole row-height box.
             if let Some(step) = self.advance_source_target(owner, source, scene, semantics)? {
                 return Ok(step);
             }
             return Ok(Advance::Complete);
         }
         if let Some(step) = self.advance_source_target(owner, source, scene, semantics)? {
-            // 远端目标可超过当前viewport。只排到它真实首标量所在行，不排完匹配尾部。
+            // A distant target may exceed the viewport; shape through its actual first-scalar line
+            // only, without finishing the match tail.
             return Ok(step);
         }
-        // 已实测的模式字形可能位于超高格中部，原屏内锚下方还缺真实可见前缀。
-        // 在途 Grid 先于普通行目标执行，因此必须在这里续同一格，不能反复发布旧 clip 的短前缀。
+        // A measured mode anchor may lie inside a very tall cell with actual visible-prefix work still
+        // missing beneath it.
+        // In-flight Grid runs before ordinary line targets, so resume that cell here rather than
+        // repeatedly publishing an old short clip prefix.
         let mode_bottom = owner.source_target.borrow().as_ref().and_then(|target| {
             if !target.pending()
                 || target.source != source.authority()
                 || !target.matches(owner, scene)
                 || !owner.mode_retains_measured_glyph(target)
             {
-                return None; // 普通 Find 或已失效模式不扩大本次实际可见前缀。
+                return None; // Ordinary Find or revoked mode authority cannot extend this actual visible-prefix request.
             }
             owner.mode_viewport_required_bottom(target, self.top, scene.viewport.size.height)
         });
@@ -472,7 +544,8 @@ impl Grid {
             + scene.viewport.size.height)
             .max(mode_bottom.unwrap_or(0.0));
         let needed = (required_bottom - self.top - VERTICAL).max(0.0);
-        // 先为所有真正可见列准备同一垂直视口；离屏列最多再保一个实际作业。
+        // Prepare the same vertical viewport for actual visible columns first, retaining at most one
+        // additional offscreen work item.
         for _ in 0..self.cells.len() {
             let column = self.current;
             self.current = (self.current + 1) % self.cells.len();
@@ -481,11 +554,13 @@ impl Grid {
                     && self.cells[column].output.is_some()
                     && self.cells[column].height >= needed
             {
-                // 完成的短格只需画其剩余背景；达到视口底部的长格保原续体等下一次滚动。
+                // Finished short cells need remaining background only; long cells reaching the viewport
+                // bottom keep their cursor for later scroll.
                 continue;
             }
             if !self.column_visible(column, scene, owner.configuration.padding) {
-                // 当前横向裁剪外没有可见墨迹请求，不为它创建原生窗口或像素缓冲。
+                // Without visible ink outside the horizontal clip, create no Native cell window or
+                // pixel buffer there.
                 continue;
             }
             return self.cells[column].advance(
@@ -505,20 +580,27 @@ impl Grid {
                     && target.matches(owner, scene)
                     && target.range.location >= self.source_range().end
             });
-        // 原目标尚在后续结构行时，旧视口已满并不表示这次导航已就绪。
-        // 当前行必须先逐量子取得真实最终高度并交回唯一正文 Composer，才能继续下一行；
-        // 提前返回 Visible 会重复发布旧首屏，并拿它为远端 Find 签首字符可见证明。
-        // 已封存恢复行无需再次提交，原目标在后方也仍可交还这条有限恢复作业。
+        // When the original target lies in a later structural row, filling the old viewport does not
+        // complete navigation.
+        // Obtain actual final height in bounded quanta and return it to the unique body Composer before
+        // advancing to the next row;
+        // premature Visible would republish the old first screen and incorrectly certify a distant Find
+        // first character as visible.
+        // A sealed restored row owes no new response and may return its bounded restoration work even
+        // when the target follows it.
         if self.sealed_height.is_some()
             || !target_follows && self.height() + self.top >= required_bottom
         {
-            // 这一帧只签实际已测前缀。尚未结束的行保持Core暂停，不能生成假的LineReady。
+            // Certify the measured prefix only; unfinished rows keep Core suspended without a
+            // fabricated LineReady.
             return Ok(Advance::Visible);
         }
-        // 可见列都已结束却尚不能确定行尾时，串行测下一真实离屏列，禁止凭空猜 row max。
+        // If visible columns finish without known row end, measure the next actual offscreen column
+        // serially instead of guessing the maximum.
         for column in 0..self.cells.len() {
             if !self.cells[column].complete {
-                // 需要知道真实行尾时继续原列作业；该列的实际内容结束前不推进后续正文。
+                // Continue the original column when final row end is required; do not advance
+                // subsequent text before that actual content ends.
                 return self.cells[column].advance(
                     owner,
                     source,
@@ -532,7 +614,8 @@ impl Grid {
         Ok(Advance::Complete)
     }
 
-    /// 横向范围来自真实列宽之和；裁剪不把其他列的空内容冒充当前列。
+    /// Horizontal extents sum actual column widths; clipping cannot use another column empty content as
+    /// this column.
     fn column_visible(
         &self,
         column: usize,
@@ -547,8 +630,10 @@ impl Grid {
             && left + self.widths[column] > scene.viewport.origin.x
     }
 
-    /// 外层 None 表示没有真实格显示覆盖；Some(None) 是原 Parser 已证明该位置没有链接。
-    /// 两者必须区分，未知格不能吞掉首次点击，已覆盖格也不应被送回普通 RootLeaf 重解释。
+    /// Outer None means no actual cell-display coverage; Some(None) means the original parser certified
+    /// no link at this location.
+    /// Keep them distinct so unknown cells cannot swallow the first click and covered cells cannot be
+    /// reinterpreted by ordinary RootLeaf.
     pub(super) fn link_at(
         &self,
         owner: &Owner,
@@ -566,12 +651,14 @@ impl Grid {
         let document = document.borrow();
         for cell in &self.cells {
             if let Some(display) = &cell.display {
-                // raw 票仍须与活文档匹配；编辑后的旧格不能仅凭数值相交继续打开链接。
+                // Raw authority must still match the live document; old edited cells cannot open links
+                // through numeric range intersection alone.
                 let range = display
                     .canonical_raw_cell()
                     .canonical_range_for(&document)?;
                 if range.contains(&index) {
-                    // 目标保原 Parser 的解码、引用定义和 label 语义；不从画面 URL 猜链接。
+                    // Keep original parser decoding, reference definitions, and label semantics rather
+                    // than guessing links from displayed URLs.
                     return display
                         .link_at_for(&document, index)
                         .map(|link| Some(link.cloned()));
@@ -581,18 +668,21 @@ impl Grid {
         Ok(None)
     }
 
-    /// 返回原表格物理行范围，包含真正 EOL；不得以可见格文本长度替代表格来源坐标。
+    /// Return the original physical table-row range including its actual EOL, without substituting
+    /// visible cell text length for Source coordinates.
     pub(super) fn source_range(&self) -> Range<usize> {
         self.row.source_range()
     }
 
-    /// 可见性只认真实高度前缀；未知行尾不能借估计高度提前排出后继正文。
+    /// Visibility uses the actual height prefix; estimated height cannot position later text past an
+    /// unknown row end.
     pub(super) fn visible(&self, scene: &NativeMarkdownPagedSceneRequest) -> bool {
         self.top < scene.virtual_viewport.document_origin.y + scene.viewport.size.height
             && self.top + self.height() > scene.virtual_viewport.document_origin.y
     }
 
-    /// 多行共用调用者这一轮的元数据余量；已经扫描好的窗口不会重读并饿死后面的行。
+    /// Rows share this caller-turn metadata allowance; completed scans are not repeated in ways that
+    /// starve later rows.
     pub(super) fn scan_windows(
         &mut self,
         owner: &Owner,
@@ -604,22 +694,27 @@ impl Grid {
             <= self.top + VERTICAL;
         for column in 0..self.cells.len() {
             if !self.column_visible(column, request, owner.configuration.padding) {
-                // 横向离屏列不构造 Native 窗口；仍保真实列位置供后继水平视口使用。
+                // Build no Native window for horizontally offscreen columns, retaining actual positions
+                // for later horizontal viewports.
                 continue;
             }
             let cell = &mut self.cells[column];
             if cell.empty.is_some() {
-                // 真空格没有字形目录，背景和 canonical 点击票已足够，不创建空 Composer。
+                // Actual empty cells need background and canonical click authority only, without glyph
+                // directories or empty Composers.
                 continue;
             }
             if before_text && cell.display.is_some() {
-                // 当前窗口只含行顶内边距，真实文字尚在视口之外；保原格票供点击，
-                // 不因没有文字交集而要求该格完成，也不构造裁剪为空的 Native 文字窗口。
+                // The viewport contains top padding only while actual text remains outside; preserve
+                // original cell authority for clicks,
+                // without demanding full cell completion or creating an empty-clipped Native text
+                // window.
                 cell.scan = None;
                 continue;
             }
             if cell.output.is_none() {
-                // 非空格尚无真实 LineEnd 时整帧保持 Pending，不能冒充 Empty 或短格空白。
+                // Without an actual LineEnd in a nonempty cell, keep the frame Pending rather than
+                // presenting Empty or short-cell whitespace.
                 return Ok(false);
             }
             if !cell.scan_window(owner, request, self.top, budget, work)? {
@@ -629,7 +724,8 @@ impl Grid {
         Ok(true)
     }
 
-    /// 所有目录窗口先真实完成，再构造Native格；前格不能反复耗尽后格的预算。
+    /// Complete actual directory windows before constructing Native cells, preventing earlier cells
+    /// from repeatedly consuming later-cell allowance.
     pub(super) fn prepare(
         &mut self,
         owner: &Owner,
@@ -640,7 +736,8 @@ impl Grid {
         let request = &key.request;
         let before_text = request.virtual_viewport.document_origin.y + request.viewport.size.height
             <= self.top + VERTICAL;
-        // Source 采用向下增长的文档 y；Native frame 在这一视口内转换为自底向上的坐标。
+        // Source uses Y-down document coordinates; convert Native frames to Y-up coordinates within
+        // this viewport.
         let row_bottom = request.viewport.size.height + request.virtual_viewport.document_origin.y
             - self.top
             - row_height;
@@ -654,11 +751,14 @@ impl Grid {
         let mut cells = Vec::new();
         let mut x = row_left;
         for (column, width) in self.widths.iter().copied().enumerate() {
-            // 每格完整 frame 共用真实行高，文字框另扣原 padding；列间边界不会累积猜测误差。
+            // All complete cell frames share actual row height; subtract original padding for text
+            // boxes without accumulating guessed boundary errors.
             let cell_frame =
                 NSRect::new(NSPoint::new(x, row_bottom), NSSize::new(width, row_height));
-            // 原实测行框扣固定内边距，后继文字窗口再扣已经分页越过的首行高度。
-            // 原行尚未完成时它只代表当前真实前缀，不授整格高度或 EOF。
+            // Subtract fixed padding from the measured row box, then subtract paged leading-line height
+            // for the later text window.
+            // An unfinished row represents its actual current prefix only, without full-cell height or
+            // EOF authority.
             let content_frame = NSRect::new(
                 NSPoint::new(
                     cell_frame.origin.x + HORIZONTAL,
@@ -672,11 +772,14 @@ impl Grid {
             }
             let cell = &mut self.cells[column];
             let content = if let Some(empty) = &cell.empty {
-                // 只有原 raw/display 双空的真实分支使用 Empty，不持格级字体或匿名映射 FD。
+                // Only verified raw/display emptiness uses Empty, without cell-level font or anonymous
+                // mapping descriptor ownership.
                 GridCellContent::Empty(empty.clone())
             } else if before_text {
-                // 只发布原行顶 padding 的来源语义；真实 raw.start 可供原格点击，
-                // 文字框/链接仍须等视口进入内容区后从原显示映射与实际行目录取得。
+                // Publish original row-top padding semantics only; actual raw.start supports cell
+                // clicks,
+                // while text boxes/links await content-area entry and original display mapping plus
+                // actual line directories.
                 let source = cell
                     .display
                     .as_ref()
@@ -695,7 +798,8 @@ impl Grid {
             } else {
                 let scan = cell.scan.take().expect("所有可见格已完成真实窗口扫描");
                 if scan.handles.is_empty() {
-                    // 只有已完整测过的短格能证明当前区域在正文下方，仍保原 raw 票用于点击。
+                    // Only a completely measured short cell can certify a region below its text; retain
+                    // original raw click authority.
                     assert!(cell.complete, "只有真实完整短格可证明当前视口无文字");
                     let source = cell
                         .display
@@ -710,7 +814,8 @@ impl Grid {
                     });
                     continue;
                 }
-                // 首行 top 来自同一输出目录扫描，不能把可见后缀错误画在格的第一行位置。
+                // First-line top comes from the same output-directory scan, preventing a visible suffix
+                // from being drawn at the cell first-line position.
                 let window_frame = NSRect::new(
                     content_frame.origin,
                     NSSize::new(
@@ -718,7 +823,8 @@ impl Grid {
                         content_frame.size.height - scan.first_top,
                     ),
                 );
-                // 窗口只借这次 Source/output/palette；同一格不再建立第二 Body 或输入所有权图。
+                // The window borrows this Source/output/palette only, without another Body or Input
+                // ownership graph for the same cell.
                 let window = NativeMarkdownComposedTableCell::prepare(
                     cell.output.as_ref().expect("可见格持原prefix").clone(),
                     key.clone(),
@@ -745,13 +851,15 @@ impl Grid {
         })
     }
 
-    /// 最终提交使用原注册 Font 作为目录身份，真实表格高度不从这个 Font 的普通行槽推测。
+    /// Use the original registered font as final directory identity without inferring actual table
+    /// height from its ordinary line slot.
     pub(super) fn response(
         &self,
         owner: &Owner,
     ) -> Result<omni_markdown_core::MarkdownLineTableRowResponse> {
         let fonts = owner.fonts.borrow();
-        // 列宽已在 solver 后量化；目录同时封存每列宽和总宽，重建不得再次运行不同求解。
+        // Widths were quantized after solving; seal each width and their sum so reconstruction cannot
+        // apply a different solver.
         let widths = self
             .widths
             .iter()
@@ -772,7 +880,8 @@ impl Grid {
 }
 
 impl Cell {
-    /// 可见格和唯一选词恢复格观察同一真实资源；收据不持源、FD或历史目录强引用。
+    /// Visible cells and the unique restored word-query cell observe the same actual resources without
+    /// retaining Source, descriptors, or historical directories.
     fn resource_receipt(&self) -> Result<super::super::NativeMarkdownPagedCellResourceReceipts> {
         Ok(super::super::NativeMarkdownPagedCellResourceReceipts {
             display: self
@@ -800,7 +909,8 @@ impl Cell {
         })
     }
 
-    /// 空字段只代表真实作业尚未开始，不提供默认依赖、默认文本或另一个初始化图。
+    /// Empty fields mean actual work has not started, without default dependencies, default text, or
+    /// another initialization graph.
     fn new(column: usize, width: f64) -> Self {
         Self {
             column,
@@ -822,7 +932,8 @@ impl Cell {
         }
     }
 
-    /// 一个回合只做原 4KiB 语义/转换、原 Composer 量子或有限原生 part 度量之一。
+    /// Each turn performs one original 4 KiB semantic/conversion quantum, one Composer quantum, or
+    /// bounded Native part measurement.
     fn advance(
         &mut self,
         owner: &Owner,
@@ -841,14 +952,16 @@ impl Cell {
                 .clone();
             let document = document.borrow();
             if self.preparation.is_none() {
-                // 这里仅取得同 sealed row 的准备票；真正语义扫描仍由原 Request 配额控制。
+                // Acquire a preparation ticket for the same sealed row only; actual semantic scanning
+                // remains under the original Request allowance.
                 self.preparation = semantics.prepare_cell(&document, source, row, self.column)?;
                 return Ok(Advance::Progress);
             }
             let preparation = self.preparation.as_mut().expect("原格准备已安装");
             let before = semantics.current_work();
             let step = semantics.advance_cell(preparation, &document)?;
-            // 返回量包含 CellInline；扣掉原 Request 同轮已累计量后，才把显示转换计入外层。
+            // Returned work includes CellInline; subtract same-turn work already accounted by the
+            // original Request before adding outer display conversion.
             let measured = match &step {
                 MarkdownTableCellDisplayPreparationStep::Progress { work }
                 | MarkdownTableCellDisplayPreparationStep::Ready { work } => *work,
@@ -856,11 +969,13 @@ impl Cell {
             work.display_step(measured, before, semantics.current_work())?;
             match step {
                 MarkdownTableCellDisplayPreparationStep::Progress { .. } => {
-                    // 转换未结束时没有 display authority，不授默认样式，也不启动 Composer。
+                    // Incomplete conversion grants no display authority, default style, or Composer
+                    // admission.
                     return Ok(Advance::Progress);
                 }
                 MarkdownTableCellDisplayPreparationStep::Ready { .. } => {
-                    // 只有原 ready 工厂能取显示源；转换源仍以映射/分页目录持有，非整格 String。
+                    // Only the original ready factory yields display Source, held through
+                    // mappings/paged directories rather than a whole-cell String.
                     let display = preparation
                         .take_ready_for(&document)?
                         .expect("Ready持原显示源");
@@ -870,7 +985,8 @@ impl Cell {
                             .canonical_range_for(&document)?
                             .is_empty()
                     {
-                        // 隐藏语法导致的 display 空不等于 raw 空，不能误删非空格的编辑坐标。
+                        // Hidden syntax can empty display without emptying raw text; preserve edit
+                        // coordinates of nonempty cells.
                         self.empty = Some(display.canonical_raw_cell().clone());
                         self.complete = true;
                     } else {
@@ -887,12 +1003,14 @@ impl Cell {
         if self.composer.is_none() {
             let display = self.display.as_ref().expect("非空格持原显示源");
             let content = if natural {
-                // 首轮自然宽测量沿实际 advance，达到原 cap 即可停止，不为巨格 shape 到 EOF。
+                // Initial natural-width measurement uses actual advances and stops at the original cap,
+                // without shaping huge cells to EOF.
                 self.width
             } else {
                 native_markdown_table_content_width(self.width).ok_or(ViewError::InvalidGeometry)?
             };
-            // 所有列共用 Body catalog，当前格只持自己取消句柄；没有逐格 FontWorker 或 Input。
+            // All columns share the body catalog; each cell holds its own cancellation handle without a
+            // per-cell FontWorker or Input.
             self.composer = Some(MarkdownLineComposer::new_with_frontier(
                 display.source().clone(),
                 &display.authority(),
@@ -906,11 +1024,13 @@ impl Cell {
             let mut budget = LINE_METRIC_BUDGET;
             let output = self.output.as_ref().expect("待度量行持原prefix Reader");
             if !metrics.advance(output, owner, &mut budget, work)? {
-                // 实际 part 尚未度量完整，保留续体；半行高度绝不能进入真实行前缀。
+                // Retain continuation until every actual part metric completes; a partial line height
+                // cannot enter the real prefix.
                 self.pending = Some(metrics);
                 return Ok(Advance::Progress);
             }
-            // 只有完整度量可增长前缀，旧窗口扫描必须废弃，避免复用过期 bottom 和 Reader。
+            // Grow the prefix only with complete metrics and discard old scans to avoid stale
+            // bottom/Reader reuse.
             self.height += metrics.height()?;
             self.lines += 1;
             self.scan = None;
@@ -918,7 +1038,8 @@ impl Cell {
         }
         let composer = self.composer.as_mut().expect("活格持原Composer");
         let before = composer.frontier_work()?;
-        // 每轮固定读取/标量/目录预算；这里不按原始格长放大配额或先读取整段。
+        // Use fixed per-turn read/scalar/directory budgets, without enlarging them for cell length or
+        // reading the whole paragraph first.
         let step = composer.step(MarkdownLineComposeBudget {
             bytes: 4096,
             scalars: 256,
@@ -941,14 +1062,16 @@ impl Cell {
                     target.reset_scan();
                 }
                 if natural {
-                    // soft wrap 的 advance 属于同一物理行；只有真实 mandatory 才重置自然行宽。
+                    // Soft-wrap advances remain in the same physical line; reset natural line width
+                    // only at an actual mandatory break.
                     self.natural_line += facts.x_advance_26_6 as f64 / 64.0;
                     self.natural_maximum = self.natural_maximum.max(self.natural_line);
                     if facts.kind == omni_markdown_core::MarkdownComposedLineKind::Mandatory {
                         self.natural_line = 0.0;
                     }
                 } else {
-                    // 新 prefix 替换旧 Reader；Scene 如仍借旧窗口，由自己的真实租约决定释放时机。
+                    // A new prefix replaces the old Reader; any Scene retaining its old window releases
+                    // it through that actual lease.
                     drop(self.output.take());
                     let output = Rc::new(RefCell::new(
                         self.composer
@@ -959,7 +1082,8 @@ impl Cell {
                     ));
                     let handle = output.borrow_mut().last_line()?.expect("LineReady持原末行");
                     if handle.facts() != &facts || facts.ordinal != self.lines {
-                        // 事实与序号不一致会造成错误行高和文字重叠，必须向上传递真实失败。
+                        // Mismatched facts/ordinals can cause wrong heights and overlapping text;
+                        // propagate actual failure upward.
                         #[cfg(feature = "native-markdown-runtime-probe")]
                         eprintln!(
                             "native_cell_unsupported phase=line_identity column={} expected_line={} actual_line={} original_facts_match={}",
@@ -985,10 +1109,12 @@ impl Cell {
                 }
                 self.complete = true;
                 if natural {
-                    // 自然宽测量产物不参与绘制，完成即取消并归还其源、Reader 和目录资源。
+                    // Natural-width output is not painted; cancel and return its Source, Reader, and
+                    // directory resources on completion.
                     self.release_layout();
                 } else {
-                    // Complete 才取得最终输出；普通前缀不能冒充整格 EOF 或最终 row max。
+                    // Acquire final output only at Complete; an ordinary prefix certifies neither
+                    // full-cell EOF nor final row maximum.
                     drop(self.output.take());
                     self.output = Some(Rc::new(RefCell::new(
                         self.composer
@@ -1000,7 +1126,8 @@ impl Cell {
                 Ok(Advance::Progress)
             }
             answer => {
-                // 只在原合成诊断记录实际未接入的 Core 回答；不输出格正文或链接，也不改失败后果。
+                // The gated synthetic diagnostic records actual unsupported Core answers without cell
+                // text/links or changed failure semantics.
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 match answer {
                     MarkdownLineComposeAnswer::NeedsResolution(reason) => eprintln!(
@@ -1023,12 +1150,13 @@ impl Cell {
                 }
                 #[cfg(not(feature = "native-markdown-runtime-probe"))]
                 let _ = answer;
-                Err(Error::Unsupported) // 未解决的 Unicode/Tab/Frontier 不得截成假 EOF。
+                Err(Error::Unsupported) // Unresolved Unicode/Tab/frontier work cannot be truncated into fabricated EOF.
             }
         }
     }
 
-    /// 自然宽达到 cap 或真实退场时立即取消并释放该格的所有布局/来源；不触碰 canonical 内容。
+    /// At natural-width cap or actual retirement, cancel and release owned layout/Source immediately
+    /// without changing canonical content.
     fn release_layout(&mut self) {
         self.cancellation.cancel();
         self.pending = None;
@@ -1042,7 +1170,8 @@ impl Cell {
         drop(self.preparation.take());
     }
 
-    /// 从原末行逆扫到真实视口顶部；当前窗口外字形只留在原分页目录，绝不展开整格行数组。
+    /// Walk backward from the original last line to the viewport top, leaving offscreen glyphs in paged
+    /// directories without whole-cell line arrays.
     fn scan_window(
         &mut self,
         owner: &Owner,
@@ -1056,12 +1185,14 @@ impl Cell {
             .as_ref()
             .is_some_and(|scan| !scan.request.same(request))
         {
-            // 滚动/尺寸/选择 epoch 改变后旧游标不再代表当前视口，不保留过期可见窗口。
+            // Scroll/size/selection epoch changes invalidate the old viewport cursor; retain no stale
+            // visible window.
             self.scan = None;
         }
         let output = self.output.as_ref().expect("扫描只接受真实已封存prefix");
         if self.scan.is_none() {
-            // 从真实末行开始分页逆扫；handles 只容纳交集窗口，不复制所有历史行。
+            // Begin paged backward scanning at the actual last line; handles contain the intersecting
+            // window only, without historical-line copies.
             let cursor = output.borrow_mut().last_line()?;
             self.scan = Some(CellScan {
                 request: request.clone(),
@@ -1098,7 +1229,8 @@ impl Cell {
             - VERTICAL;
         for _ in 0..METADATA_PER_TURN {
             if budget.metadata_units == 0 || budget.records < 7 {
-                // 余量属于所有可见行共享；保原续体，让后继回合继续而非重扫首格。
+                // Visible rows share this allowance; retain the original cursor for later turns rather
+                // than rescanning the first cell.
                 return Ok(false);
             }
             if scan.metrics.is_none() {
@@ -1113,7 +1245,8 @@ impl Cell {
             }
             let mut metrics = scan.metrics.take().expect("本回合持原行度量");
             if !metrics.advance(output, owner, budget, work)? {
-                // 混合字体 part 可能跨回合，未完成前不累减 bottom 或发布该行几何。
+                // Mixed-font parts may span turns; do not subtract bottom or publish line geometry
+                // until they finish.
                 scan.metrics = Some(metrics);
                 return Ok(false);
             }
@@ -1123,7 +1256,8 @@ impl Cell {
             let previous = output.borrow_mut().previous_line(handle.handle())?;
             if scan.bottom >= top && line_top <= bottom {
                 if scan.handles.len() == MAX_WINDOW_LINES {
-                    // 当前窗口超过原有限句柄容量时真实报错，不截断渲染当成完成帧。
+                    // Exceeding bounded window-handle capacity returns an actual error instead of
+                    // truncating rendering into a supposedly complete frame.
                     return Err(Error::Unsupported);
                 }
                 scan.first_top = line_top;
@@ -1131,7 +1265,8 @@ impl Cell {
             }
             scan.bottom = line_top;
             if line_top <= top {
-                // 已跨过真实视口顶部，早期行只留在分页目录，不继续扫描到格首。
+                // After crossing the actual viewport top, leave earlier lines in paged directories
+                // rather than scanning to cell start.
                 scan.cursor = None;
                 break;
             }
@@ -1139,7 +1274,8 @@ impl Cell {
         }
         scan.ready = scan.cursor.is_none() && scan.metrics.is_none();
         if scan.ready && scan.handles.is_empty() && !self.complete {
-            // 未完成格的空 prefix 无法证明此处没有文字；禁止发布 OutsideText 隐藏缺失内容。
+            // An empty prefix of an unfinished cell cannot prove text absence; OutsideText must not
+            // hide missing content.
             #[cfg(feature = "native-markdown-runtime-probe")]
             eprintln!(
                 "native_cell_unsupported phase=uncovered_window column={} row_top={row_top} text_window_top={top} text_window_bottom={bottom} actual_prefix_height={} actual_prefix_lines={}",
@@ -1151,14 +1287,15 @@ impl Cell {
     }
 }
 impl Drop for Cell {
-    /// 退出时取消仍持有的原组合任务；Reader/Source 由字段的实际最后所有者自然释放。
+    /// On exit cancel original composition tasks; actual last field owners release Readers and Source.
     fn drop(&mut self) {
         self.cancellation.cancel();
     }
 }
 
 impl Work {
-    /// 同一行尾查询交回真实Source/字素目录工作；它没有形状输入，不伪装成已整形字节。
+    /// Trailing-whitespace queries return actual Source/grapheme-directory work without claiming shaper
+    /// input bytes.
     pub(super) fn alignment_step(
         &mut self,
         step: &omni_markdown_core::MarkdownComposedLineTrailingWhitespaceStep,
@@ -1176,7 +1313,8 @@ impl Work {
         Ok(())
     }
 
-    /// 一个显示量子扣去原Request同次已记的CellInline差量，只把真实转换工作交外层累进。
+    /// Subtract same-quantum original Request CellInline deltas so outer totals receive actual
+    /// display-conversion work only.
     fn display_step(
         &mut self,
         measured: SemanticWork,
@@ -1184,7 +1322,8 @@ impl Work {
         after: SemanticWork,
     ) -> Result<()> {
         let remainder = |measured: usize, before: usize, after: usize| {
-            // 实测累计倒退或重复量超过本轮工作会使资源验收失真，作为真实计量失败返回。
+            // Decreasing totals or duplicate work above this turn measurement would corrupt resource
+            // evidence and therefore fail accounting.
             after
                 .checked_sub(before)
                 .and_then(|owned| measured.checked_sub(owned))
@@ -1240,7 +1379,8 @@ impl Work {
         add_semantic_work(&mut self.display, display)
     }
 
-    /// 保留原Composer实际step读量/最大量子与前沿累计差值，不用字符长度推算处理成本。
+    /// Keep actual Composer step reads, maxima, and frontier deltas rather than estimating cost from
+    /// character length.
     fn composer_step(
         &mut self,
         step: &omni_markdown_core::MarkdownLineComposeStep,
@@ -1262,7 +1402,8 @@ impl Work {
             (&mut self.frontier_source_bytes, frontier),
             (&mut self.shaped_input_bytes, shaped),
         ] {
-            // 仅累计原 Composer 返回事实，溢出不得饱和为看似满足上限的小数值。
+            // Add original Composer facts only; overflow must not saturate into a deceptively valid
+            // small measurement.
             *total = total.checked_add(value).ok_or(Error::CounterExhausted)?;
         }
         self.maximum_bytes = self.maximum_bytes.max(step.bytes);

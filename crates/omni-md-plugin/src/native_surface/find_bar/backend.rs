@@ -1,4 +1,5 @@
-//! 同一Find界面选择具体正文后端；查询、正则与匿名替换记录继续复用原实现。
+//! Adapt the same Find interface to its actual document backend while sharing
+//! existing query, regex, and anonymous replacement-spool implementations.
 
 use super::*;
 
@@ -16,23 +17,24 @@ mod paged_reveal;
 #[cfg(feature = "native-paged-production")]
 pub(in crate::native_surface) use paged_reveal::*;
 #[cfg(all(
-    feature = "native-paged-find-probe",
+    feature = "native-paged-body-probe",
     feature = "native-markdown-runtime-probe"
 ))]
 #[path = "backend/probe.rs"]
 mod probe;
 #[cfg(all(
-    feature = "native-paged-find-probe",
+    feature = "native-paged-body-probe",
     feature = "native-markdown-runtime-probe"
 ))]
-pub use probe::run_native_paged_find_backend_control;
+pub use probe::run_native_paged_find_body_control;
 #[cfg(all(
     feature = "native-paged-body-probe",
     feature = "native-markdown-runtime-probe"
 ))]
 pub use probe::run_native_paged_find_body_transaction_control;
 
-/// composition root提供当前实际视图，不以隐藏NSTextView为Paged路径保留第二套正文图。
+/// The composition root supplies the actual current view. The Paged path must not
+/// keep a second document graph alive through a hidden NSTextView.
 pub(in crate::native_surface) enum NativeMarkdownFindBackend<'a> {
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     TextKit {
@@ -44,13 +46,16 @@ pub(in crate::native_surface) enum NativeMarkdownFindBackend<'a> {
     Paged(NativeMarkdownPagedFindBackend<'a>),
 }
 
+/// Completion and an original pending reveal are distinct outcomes; Pending does
+/// not certify that the selected target has reached the visible viewport.
 pub(in crate::native_surface) enum NativeMarkdownFindExecution {
     Complete,
     #[cfg(feature = "native-paged-production")]
     Pending(Rc<NativeMarkdownPagedFindRevealRequest>),
 }
 
-/// 已发布的Core结果必须单独保留；任何后续显示错误都不能把调用方带回可重放的Rejected分支。
+/// Preserve an already published Core result separately. A later presentation
+/// failure cannot return callers to a rejected outcome that might replay an edit.
 pub(in crate::native_surface) enum NativeMarkdownFindExecutionError {
     Rejected(String),
     #[cfg(feature = "native-paged-production")]
@@ -92,6 +97,8 @@ impl std::fmt::Display for NativeMarkdownFindExecutionError {
 }
 impl std::error::Error for NativeMarkdownFindExecutionError {}
 
+/// Dispatch to the actual mounted backend without constructing another editor or
+/// changing which backend owns selection and edit transactions.
 pub(in crate::native_surface) fn execute_find_backend(
     bar: &Rc<NativeMarkdownFindBar>,
     backend: NativeMarkdownFindBackend<'_>,
@@ -104,7 +111,8 @@ pub(in crate::native_surface) fn execute_find_backend(
             controller,
             intent,
         } => {
-            // 旧具体适配器保留其真实通知、原生选择安装和延后Reveal路径。
+            // The independent TextKit adapter keeps its actual notifications,
+            // Native selection installation, and deferred reveal path.
             execute_textkit_find_action(bar, view, controller, intent, action)
                 .map(|()| NativeMarkdownFindExecution::Complete)
                 .map_err(NativeMarkdownFindExecutionError::Rejected)
@@ -115,7 +123,8 @@ pub(in crate::native_surface) fn execute_find_backend(
 }
 
 #[cfg(feature = "native-paged-production")]
-/// 同步动作只借用真实owner；reveal port由原viewport/composer协调器提供。
+/// Synchronous actions borrow actual owners; the original viewport/composer
+/// coordinator provides the reveal port.
 pub(in crate::native_surface) struct NativeMarkdownPagedFindBackend<'a> {
     pub(in crate::native_surface) view: &'a NativeMarkdownPagedTextView,
     pub(in crate::native_surface) input: &'a Rc<NativeMarkdownPagedInput>,
@@ -126,7 +135,8 @@ pub(in crate::native_surface) struct NativeMarkdownPagedFindBackend<'a> {
 }
 
 #[cfg(feature = "native-paged-production")]
-/// 同一明确动作的逻辑目标与反馈相随，权限和已提交状态仍由独立原票认证。
+/// Carry this explicit action's logical target with its feedback. Independent
+/// original tickets still authenticate authority and committed effects.
 struct PagedFindTarget {
     selection: MarkdownTextSelection,
     feedback: NativeMarkdownFindRevealFeedback,
@@ -134,6 +144,8 @@ struct PagedFindTarget {
 
 #[cfg(feature = "native-paged-production")]
 impl NativeMarkdownPagedFindBackend<'_> {
+    /// Retain the first real commit even if later rendering fails, so callers can
+    /// report the committed effect without repeating replacement or selection.
     fn execute(
         &self,
         bar: &Rc<NativeMarkdownFindBar>,
@@ -153,7 +165,9 @@ impl NativeMarkdownPagedFindBackend<'_> {
         action: MarkdownFindAction,
         committed: &mut Option<Rc<NativeMarkdownPagedInputCommit>>,
     ) -> Result<NativeMarkdownFindExecution, String> {
-        self.reveal.cancel_pending(); // 新显式动作先撤旧请求；不能让旧请求借相同查询或视口续权。
+        // Revoke the previous explicit request first; equal query text or viewport
+        // geometry cannot renew an older request's authority.
+        self.reveal.cancel_pending();
         let bar_revision = bar.layout_revision.get();
         let visibility =
             NativeMarkdownFindVisibility::capture(action, bar.visible.get(), bar.closed.get())
@@ -163,6 +177,8 @@ impl NativeMarkdownPagedFindBackend<'_> {
             .view
             .find_geometry_epoch()
             .ok_or("查找正文几何已经失效")?;
+        // Freeze entry-time Input and geometry authority before Native query reads.
+        // A reentrant getter cannot bless this action with a newer selection or Scene.
         let session_current = |epoch| {
             epoch == self.epoch
                 && self
@@ -202,7 +218,8 @@ impl NativeMarkdownPagedFindBackend<'_> {
         let query = native_markdown_table_intent_step(&current, || Query::read(bar, action))
             .map_err(|_| "读取查找输入时原权限已失效")??;
         let document = document_identity.upgrade().ok_or("查找正文已经释放")?;
-        // 独立虚拟NSString只有WeakDoc；Regex不得为了获取字符串而创建NSTextStorage或隐藏View。
+        // The virtual NSString retains only WeakDoc. Regex string access must not
+        // create NSTextStorage or a hidden view as a second document graph.
         let string = if query.regex {
             Some(
                 native_markdown_table_intent_step(&current, || {
@@ -212,7 +229,7 @@ impl NativeMarkdownPagedFindBackend<'_> {
             )
         } else {
             None
-        }; // 字面扫描不需要Foundation正文适配器，只复用Core的有限源窗口。
+        }; // Literal scanning needs only Core's bounded source windows, no Foundation adapter.
         document
             .borrow()
             .byte_offset_for_utf16(0)
@@ -232,13 +249,15 @@ impl NativeMarkdownPagedFindBackend<'_> {
                 selection.anchor_utf16.min(selection.head_utf16)
                     ..selection.anchor_utf16.max(selection.head_utf16)
             },
-        ); // 多选扫描沿旧Core范围，不能从第一真实范围伪造主head。
+        ); // Multi-selection uses its original Core extent; the first actual range is no invented primary head.
         let capture_count = if query.regex {
             query.compiled_regex()?.numberOfCaptureGroups() + 1
         } else {
             0
         };
         let template = ReplacementTemplate::parse(&query.replacement, query.regex, capture_count);
+        // Replace All streams anonymous records rather than accumulating all match
+        // contents in memory. Other actions allocate no replacement spool yet.
         let mut spool = if action == MarkdownFindAction::ReplaceAll {
             Some(ReplacementSpool::new(&template)?)
         } else {
@@ -271,6 +290,8 @@ impl NativeMarkdownPagedFindBackend<'_> {
                 if !current() {
                     return Err("查找期间原选择或输入权限已失效".into());
                 }
+                // Selection is an explicit bounded collection, unlike streaming
+                // navigation/replacement. Reject before publishing an incomplete set.
                 if action == MarkdownFindAction::SelectAll {
                     if matches.len() == 1000 {
                         return Err("全部选中最多支持 1,000 处匹配".into());
@@ -300,21 +321,29 @@ impl NativeMarkdownPagedFindBackend<'_> {
         if !current() {
             return Err("查找期间文档或输入已变更".into());
         }
-        drop(string); // 匹配结束后归还全部Foundation查询对象，再进入canonical可变事务。
+        // Return Foundation query claims before entering a mutable canonical transaction;
+        // their destruction may reenter, so validate original authority again afterward.
+        drop(string);
         drop(document);
         if !current() {
             return Err("查找临时对象释放后原权限已失效".into());
         }
-        let total = navigation.total; // 原完整扫描已成功；异步Reveal仍须沿原Source/Input证明真正可见。
+        // A completed scan establishes totals, but deferred reveal must separately
+        // prove actual visibility through the original Source/Input authority.
+        let total = navigation.total;
         let target = match action {
             MarkdownFindAction::Next => navigation.navigation_target(false),
             MarkdownFindAction::Previous => navigation.navigation_target(true),
             MarkdownFindAction::ReplaceNext => {
                 let target = navigation.next.or(navigation.first);
                 if let Some(found) = navigation.current.filter(|found| found.found.precise) {
-                    let found = found.found; // 编辑后语义可能改变，旧序号和总数不进入替换反馈。
+                    // Editing may change matching semantics; replacement feedback
+                    // cannot retain the pre-edit ordinal or total.
+                    let found = found.found;
                     let mut replacement = ReplacementSpool::new(&template)?;
                     replacement.push(&found)?;
+                    // Map the next original match through this exact replacement.
+                    // With no successor, leave the caret after the inserted UTF-16 text.
                     let after = if let Some(target) = &target {
                         replacement.map_selection(MarkdownTextSelection {
                             anchor_utf16: target.found.range.start,
@@ -355,9 +384,13 @@ impl NativeMarkdownPagedFindBackend<'_> {
                         committed,
                     );
                 }
-                target // 当前并非精确匹配时只导航，不误删NFKD字符内的部分命中。
+                // An imprecise/current mismatch only navigates; do not delete a
+                // partial normalized match inside an original NFKD character.
+                target
             }
             MarkdownFindAction::ReplaceAll => {
+                // Consume the original spool in one Core edit transaction, mapping
+                // the original selection without publishing intermediate replacements.
                 let mut spool = spool.ok_or("全部替换缺少原匿名记录")?;
                 let count = spool.count();
                 let after = spool.map_selection(before.selection)?;
@@ -382,6 +415,7 @@ impl NativeMarkdownPagedFindBackend<'_> {
                 return Ok(NativeMarkdownFindExecution::Complete);
             }
             MarkdownFindAction::SelectAll => {
+                // Only the completed bounded scan may publish all actual ranges.
                 let outcome = self
                     .input
                     .set_selected_ranges(&permit, &matches, &session_current)
@@ -411,7 +445,7 @@ impl NativeMarkdownPagedFindBackend<'_> {
                 })
             } else {
                 NativeMarkdownFindRevealFeedback::Found
-            }; // ReplaceNext即使本轮只导航，也不扩大原替换反馈的计数承诺。
+            }; // ReplaceNext navigation still makes no broader count promise than replacement feedback.
             let after = MarkdownTextSelection {
                 anchor_utf16: target.found.range.start,
                 head_utf16: target.found.range.end,
@@ -445,6 +479,8 @@ impl NativeMarkdownPagedFindBackend<'_> {
         }
     }
 
+    /// Record committed Core state before any reentrant visual consequence. An
+    /// unchanged operation neither creates a receipt nor disturbs undo/redo.
     fn publish_outcome(
         &self,
         outcome: NativeMarkdownPagedInputOutcome,
@@ -453,15 +489,19 @@ impl NativeMarkdownPagedFindBackend<'_> {
         match outcome {
             NativeMarkdownPagedInputOutcome::Committed(commit) => {
                 let commit = Rc::new(commit);
-                *committed = Some(Rc::clone(&commit)); // 先保留真实提交事实，再执行任何可重入显示后果。
+                // Preserve the actual commit before Native presentation can reenter or fail.
+                *committed = Some(Rc::clone(&commit));
                 self.view
                     .apply_find_commit(self.input, &commit)
                     .map_err(|error| error.to_string())
             }
-            NativeMarkdownPagedInputOutcome::Unchanged(_) => Ok(()), // 真空匹配不清redo、不采用after，也不虚构新提交。
+            // No matches preserve redo and the original selection; invent no new commit.
+            NativeMarkdownPagedInputOutcome::Unchanged(_) => Ok(()),
         }
     }
 
+    /// Build and publish status under the original action/commit authority, then
+    /// recheck after releasing the temporary NSString, whose destruction can reenter.
     fn feedback(
         &self,
         bar: &Rc<NativeMarkdownFindBar>,
@@ -482,6 +522,8 @@ impl NativeMarkdownPagedFindBackend<'_> {
             .ok_or_else(|| "原查找反馈结束后权限已经失效".into())
     }
 
+    /// After an edit, use its actual committed Input state; before a commit, use
+    /// the entry state. Neither path reacquires a newer current document selection.
     fn feedback_current(
         &self,
         bar: &NativeMarkdownFindBar,
@@ -512,6 +554,8 @@ impl NativeMarkdownPagedFindBackend<'_> {
                 .is_none_or(|commit| commit.check_current(&current).is_ok())
     }
 
+    /// Hand the original target to the existing composer only when the current
+    /// ready Scene cannot already prove visibility. Every failure cancels this request.
     fn reveal_target(
         &self,
         bar: &Rc<NativeMarkdownFindBar>,
@@ -535,7 +579,8 @@ impl NativeMarkdownPagedFindBackend<'_> {
             committed.clone(),
         )?;
         request.show_pending()?;
-        // 已可见的现成Scene可以立即完成；Pending才请原Composer定位，不同步整段排版。
+        // An existing ready Scene can finish immediately. Only Pending requests
+        // ask the original composer to locate the target, without synchronous paragraph layout.
         let ready = match self.view.capture_ready_scene_key() {
             Ok(key) => match self.view.verify_find_target_visible(&key, request.range()) {
                 Ok(proof) => Some(NativeMarkdownPagedFindRevealProgress::Visible(Box::new(proof))),
@@ -548,7 +593,9 @@ impl NativeMarkdownPagedFindBackend<'_> {
         let progress = match ready.map_or_else(|| self.reveal.begin(Rc::clone(&request)), Ok) {
             Ok(progress) => progress,
             Err(cause) => {
-                request.cancel(); // begin可能已经持原请求；失败后不得让迟到producer再覆盖错误反馈。
+                // Begin may already retain this request; cancellation prevents a
+                // late producer from overwriting the failure feedback.
+                request.cancel();
                 return Err(cause);
             }
         };

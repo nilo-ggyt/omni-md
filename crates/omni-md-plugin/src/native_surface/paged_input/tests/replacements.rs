@@ -1,4 +1,4 @@
-//! 批量替换直接消费生产入口，核对唯一历史、失败回滚和原选择身份。
+//! Exercise the production batch API, checking one history transaction, rollback on failure, and original selection identity.
 
 use super::*;
 use omni_markdown_core::{MarkdownReplacement, MarkdownReplacementPart};
@@ -11,6 +11,8 @@ fn literal(
     range: Range<usize>,
     text: &'static str,
 ) -> std::result::Result<LiteralReplacement, MarkdownDocumentBufferError> {
+    // Supply actual public replacement data, not an observer implementation or
+    // pre-edited document; Core owns validation, atomic publication, and history.
     Ok(MarkdownReplacement {
         range_utf16: range,
         parts: [Ok(MarkdownReplacementPart::Literal(text.into()))],
@@ -29,6 +31,8 @@ fn batch_uses_complete_reversed_before_and_exactly_one_undo_redo_entry() {
     let state = owner.state().unwrap();
     let current = |_| true;
     let permit = owner.capture(5, &current).unwrap();
+    // Replacement ranges use old coordinates; the explicit after-selection uses
+    // final coordinates. Neither may overwrite the reversed history before.
     let after = MarkdownTextSelection {
         anchor_utf16: 4,
         head_utf16: 0,
@@ -57,6 +61,8 @@ fn batch_uses_complete_reversed_before_and_exactly_one_undo_redo_entry() {
         ),
         Err(NativeMarkdownPagedInputError::Consumed)
     ));
+    // Traverse the actual history stack in both directions: a second Undo/Redo
+    // must not be needed for individual matches within this one batch.
     let permit = owner.capture(5, &current).unwrap();
     let restored = committed(
         owner
@@ -83,6 +89,8 @@ fn batch_invalid_stream_order_scalar_and_capacity_roll_back_everything() {
     let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
     let current = |_| true;
     let before = owner.state().unwrap();
+    // Cover a failed stream after earlier data, descending ranges, a surrogate
+    // split, and capacity failure. None may leak an earlier partial replacement.
     let cases = [
         vec![
             literal(0..1, "先追加"),
@@ -130,6 +138,8 @@ fn empty_batch_preserves_selection_generation_and_existing_redo() {
     assert!(document.borrow().can_redo());
     let before = owner.state().unwrap();
     let permit = owner.capture(1, &current).unwrap();
+    // Even an explicit different after-selection is ignored for a genuinely empty
+    // stream; otherwise a no-op could consume Redo or manufacture history.
     let answer =
         owner
             .apply_replacements_observed(
@@ -157,6 +167,8 @@ fn marked_batch_rejects_without_touching_candidate_and_postcommit_revocation_is_
     owner
         .set_marked_text(&permit, "中", NSRange::new(1, 0), unspecified(), &current)
         .unwrap();
+    // Find must not take ownership of the active IME candidate. After real unmark,
+    // a committed batch keeps its canonical effect if display authority is revoked.
     let before = owner.state().unwrap();
     let permit = owner.capture(1, &current).unwrap();
     assert!(matches!(
@@ -203,6 +215,8 @@ fn batch_current_never_crosses_document_or_fold_borrow_and_updates_real_fold_anc
         }],
     )
     .unwrap();
+    // Exercise the actual callback boundary by borrowing both owners there;
+    // observed disjoint edits must retain and shift the interior fold correctly.
     let current = |_| {
         assert!(document.try_borrow_mut().is_ok());
         assert!(owner.folds.try_borrow_mut().is_ok());

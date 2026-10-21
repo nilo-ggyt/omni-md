@@ -1,4 +1,5 @@
-//! 从原段落样式捕获有限制表事实；不读取正文，不以固定空格或猜测间隔代替Native设置。
+//! Capture bounded tab facts from the original paragraph style without reading text or replacing Native
+//! settings with spaces/guessed intervals.
 
 use objc2::rc::Retained;
 use objc2_app_kit::{NSParagraphStyle, NSTabColumnTerminatorsAttributeName, NSTextAlignment};
@@ -18,7 +19,8 @@ pub enum NativeMarkdownParagraphStyleError {
 }
 type Result<T> = std::result::Result<T, NativeMarkdownParagraphStyleError>;
 
-/// Native终止符集合仅供后继真实lookahead查询；Core不能把'.'当作所有语言的decimal边界。
+/// Native terminator sets support actual later lookahead; Core cannot treat a period as the decimal
+/// boundary in every language.
 pub struct NativeMarkdownLineParagraph {
     style: MarkdownLineParagraphStyle,
     terminators: Vec<Option<Retained<NSCharacterSet>>>,
@@ -26,11 +28,13 @@ pub struct NativeMarkdownLineParagraph {
 }
 impl NativeMarkdownLineParagraph {
     #[must_use]
+    /// Borrow frozen Core tab facts without reentering AppKit.
     pub fn core_style(&self) -> &MarkdownLineParagraphStyle {
         &self.style
     }
 
     #[must_use]
+    /// Borrow the original stop's copied Native terminator set for bounded lookahead.
     pub fn terminators_for(&self, stop_ordinal: usize) -> Option<&NSCharacterSet> {
         self.terminators
             .get(stop_ordinal)
@@ -38,30 +42,35 @@ impl NativeMarkdownLineParagraph {
     }
 }
 
+/// Guard one potentially reentrant Native operation with original caller authority.
 fn step<T>(current: &dyn Fn() -> bool, operation: impl FnOnce() -> T) -> Result<T> {
     if !current() {
         return Err(NativeMarkdownParagraphStyleError::Revoked);
     }
     let value = operation();
     if !current() {
-        drop(value); // 即使原getter交出了+1对象，也必须在失败栈归还，不能转交新请求。
+        drop(value); // Even a +1 object returned by the getter belongs to this failed stack and cannot transfer to another request.
         return Err(NativeMarkdownParagraphStyleError::Revoked);
     }
     Ok(value)
 }
 
+/// Convert a finite nonnegative point value once into the shared 26.6 coordinate domain.
 fn fixed(value: f64) -> Result<i64> {
     if !value.is_finite() || !(0.0..(1_u64 << 46) as f64).contains(&value) {
         return Err(NativeMarkdownParagraphStyleError::InvalidMetadata);
     }
-    Ok((value * 64.0).round() as i64) // 同Core公开26.6合同量化一次；后继仍核顺序和正间隔。
+    Ok((value * 64.0).round() as i64) // Quantize once under the Core 26.6 contract; later checks still enforce order and positive intervals.
 }
 
-/// 一次冻结原NSParagraphStyle后只读取≤64个stop；所有Native调用前后均核原调用票。
-/// `paragraph_rtl`只能来自同一Source真实段落方向，None不能猜Natural的实际对齐。
+/// Freeze the original NSParagraphStyle once and read at most 64 stops, checking original caller
+/// authority around all Native operations.
+/// `paragraph_rtl` must come from the same Source's actual paragraph direction; None cannot guess
+/// Natural alignment.
 ///
 /// # Errors
-/// 失权、超预算、未知对齐、无效坐标/类型或量化后stop不递增均拒绝，不截断或排序补救。
+/// Reject revocation, excess budget, unknown alignment, invalid coordinates/types, or nonincreasing
+/// quantized stops without truncation or sorting repairs.
 pub fn capture_paged_paragraph_style(
     paragraph: &NSParagraphStyle,
     paragraph_rtl: Option<bool>,
@@ -85,11 +94,12 @@ pub fn capture_paged_paragraph_style(
             .is_some_and(|prior: &MarkdownLineTabStop| prior.location_26_6 >= location_26_6)
         {
             return Err(NativeMarkdownParagraphStyleError::InvalidMetadata);
-        } // 原顺序/唯一性是布局事实；不能把Native错误或量化碰撞静默改成新停靠表。
+        } // Original order/uniqueness are layout facts; a Native error or quantization collision cannot silently produce another tab table.
         let alignment = step(current, || stop.alignment())?;
         let options = step(current, || stop.options())?;
         let key = step(current, || {
-            // SAFETY: AppKit导出的不可变字典key进程内有效，未借用调用方或正文存储。
+            // SAFETY: The exported immutable AppKit dictionary key is process-long and borrows neither
+            // caller nor text storage.
             unsafe { NSTabColumnTerminatorsAttributeName }
         })?;
         let terminator = step(current, || options.objectForKey(key))?;
@@ -123,7 +133,7 @@ pub fn capture_paged_paragraph_style(
     }
     let interval = step(current, || snapshot.defaultTabInterval())?;
     let default_tab_interval_26_6 = if interval == 0.0 {
-        Some(0) // Native已知0表示没有后续间隔、Tab不推进；None留给尚未取得实际样式的请求。
+        Some(0) // An actual Native zero means no further interval and no Tab advance; None is reserved for requests lacking actual style facts.
     } else {
         let interval = fixed(interval)?;
         if interval == 0 {

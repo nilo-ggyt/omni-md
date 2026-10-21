@@ -1,9 +1,9 @@
-//! 正式折叠意图直接走原 Input/Core；只用短合成正文核 canonical、选择和历史，不建立 Native 图。
+//! Exercise folding through production Input/Core with short synthetic text, checking canonical selection/history without a Native graph.
 
 use super::*;
 
 #[test]
-// 折叠当前段落只改变有限显示锚点；隐区中的 head 沿原交互回到 header，CRLF 完整隐藏。
+// Folding changes bounded display anchors; a hidden head moves to the header using existing interaction and hides complete CRLF terminators.
 fn source_fold_preserves_original_text_history_and_projects_only_real_line_terminators() {
     let original = "# A\r\none\r\ntwo\r\n# B\r\nend";
     let (_file, document) = fixture(original, 4096);
@@ -41,7 +41,7 @@ fn source_fold_preserves_original_text_history_and_projects_only_real_line_termi
 }
 
 #[test]
-// Find 的整个匹配先在同一输入收据中展开，后续几何直接绑定新 fold revision，不丢隐藏命中。
+// Reveal the entire Find match in one receipt so later geometry binds the new fold revision and retains hidden matches.
 fn find_selection_unfolds_its_full_match_in_the_same_original_commit() {
     let original = "# A\nfirst\nneedle\n# B\nlast";
     let (_file, document) = fixture(original, 4096);
@@ -78,11 +78,11 @@ fn find_selection_unfolds_its_full_match_in_the_same_original_commit() {
     assert!(matches!(
         input.select_find_result(&permit, selected, &current).unwrap(),
         NativeMarkdownPagedInputOutcome::Unchanged(state) if state == found.state
-    )); // 相同可见匹配不虚增 fold revision 或选择 serial。
+    )); // Repeating the same visible match advances neither fold revision nor selection serial.
 }
 
 #[test]
-// 被撤销的原票不能折叠新文稿；真正无折叠的“展开全部”也不生成显示收据或一次 Undo。
+// Revoked authority cannot fold another state; Expand All with no folds creates neither a display receipt nor Undo.
 fn source_fold_rejects_revoked_authority_and_keeps_actual_noop_without_history() {
     let (_file, document) = fixture("# A\nbody", 4096);
     let input = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
@@ -103,7 +103,7 @@ fn source_fold_rejects_revoked_authority_and_keeps_actual_noop_without_history()
 }
 
 #[test]
-// 系统程序选区也不能把真实 caret 留在不可命中隐区；端点均在外的跨段选择保留原折叠选择。
+// Programmatic selection cannot leave a caret hidden; selections spanning a fold with both endpoints outside retain it.
 fn original_selection_into_hidden_source_unfolds_without_a_second_selection_receipt() {
     let original = "# A\nbody\n# B\nlast";
     let (_file, document) = fixture(original, 4096);
@@ -141,7 +141,7 @@ fn original_selection_into_hidden_source_unfolds_without_a_second_selection_rece
 }
 
 #[test]
-// 旧菜单允许全选后折叠第一标题；选择两端都在隐区外时不改方向、serial 或正文历史。
+// The existing menu allows folding after Select All; external endpoints retain direction, serial, and text history.
 fn folding_after_select_all_preserves_the_original_single_range_and_memento() {
     let original = "# A\nbody\n# B\nlast";
     let (_file, document) = fixture(original, 4096);

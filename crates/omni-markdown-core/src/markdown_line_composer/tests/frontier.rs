@@ -1,4 +1,5 @@
-//! 真实Coordinator→Store→Measure→LineEnd前沿候选；完整oracle只在有限测试中单独建立。
+//! Real Coordinator→Store→Measure→LineEnd frontier composition. Complete independent
+//! oracles are constructed separately and only for finite synthetic fixtures.
 use super::*;
 
 #[cfg(target_os = "macos")]
@@ -14,7 +15,7 @@ pub(super) fn mono() -> (
     let observer = bytes.resource_observer();
     let font = MarkdownLayoutFont::resolve(bytes.blob(), ".SFNSMono-Regular", &[]).unwrap();
     drop(bytes);
-    (font, observer) // 系统路径仅是当前机器的实际正控，生产仍按完整真实plan认证。
+    (font, observer) // This machine's actual system-font control is not production plan authority.
 }
 pub(super) fn worker(
     fixture: &Fixture,
@@ -39,6 +40,8 @@ pub(super) fn first(
     worker: &mut MarkdownLineComposer,
     font: &MarkdownLineRegisteredFont,
 ) -> MarkdownComposedLineFacts {
+    // Follow the actual original bounded style handshake to a committed LineEnd.
+    // A capability refusal or unhandled resolution cannot be reported as first-line success.
     for _ in 0..100_000 {
         match worker
             .step(MarkdownLineComposeBudget::default())
@@ -70,10 +73,10 @@ pub(super) fn first(
 fn actual_worker_first_line_shapes_constant_prefix_for_4k_8k_32k_source_and_releases_real_resources()
  {
     let (font, font_resources) = mono();
-    let mut work = Vec::new(); // 三档固定元数据，不是产品的历史item或正文缓存。
+    let mut work = Vec::new(); // Three fixed observations, never a product item/text cache.
     for units in [4096usize, 8192, 32768] {
         let mut text = "hello world ".repeat(units.div_ceil(12));
-        text.truncate(units); // 有限ASCII夹具精确4K/8K/32K字节，非产品读取或切段规则。
+        text.truncate(units); // Exact finite ASCII fixture sizes, not product read/split rules.
         let fixture = Fixture::new(&text);
         let source_observer = fixture.source.resource_observer();
         let backing = fixture.document.original_backing_observer().unwrap();
@@ -89,7 +92,8 @@ fn actual_worker_first_line_shapes_constant_prefix_for_4k_8k_32k_source_and_rele
         let output_observer = output.resource_observer();
         let line = output.last_line().unwrap().unwrap();
         let part = output.part(&line, 0).unwrap().unwrap();
-        // 同一实际Font的完整有限oracle在work已记录后单独建立；不把它算成产品前沿输入。
+        // Construct the same actual font's complete finite oracle after recording
+        // candidate work. Oracle whole-input cost is never hidden in frontier metrics.
         let mut oracle = crate::MarkdownShapingJob::new(
             fixture.source.clone(),
             &fixture.source.authority(),
@@ -184,7 +188,7 @@ fn actual_frontier_continuation_keeps_one_soft_line_across_multiple_certified_sp
         output.read_batch(&part, 0..0, &mut []).unwrap();
     }
     assert_eq!(end, line.source_utf16.end);
-    output.close().unwrap(); // 前沿片段的结束不是软行结束，真实Measure选中之后才有唯一LineEnd。
+    output.close().unwrap(); // Only original Measure selection turns frontier parts into a LineEnd.
 }
 
 #[test]
@@ -217,7 +221,8 @@ fn actual_frontier_worker_rejects_unproven_plan_without_whole_item_shape_fallbac
                     ),
                     (0, 0, 0, 0, 0, 0)
                 );
-                // Body闭包确实读取原计划后才能拒绝Roboto；该成本必须报告，不能伪记为零。
+                // The actual plan must be inspected before rejecting Roboto. Report
+                // that real metadata work instead of describing refusal as zero-cost.
                 assert!(work.plan_records > 0);
                 reached = true;
                 break;
@@ -231,6 +236,9 @@ fn actual_frontier_worker_rejects_unproven_plan_without_whole_item_shape_fallbac
 #[cfg(target_os = "macos")]
 #[test]
 fn actual_frontier_unread_non_ascii_suffix_cannot_borrow_ascii_word_proof() {
+    // The distant soft hyphen invalidates a whole-word ASCII certificate even
+    // though the current bounded input starts with ASCII. No glyph fallback or
+    // whole-item completion may silently consume the unresolved suffix.
     let (font, _) = mono();
     let fixture = Fixture::new(&format!("{}\u{ad}{}", "a".repeat(512), "a".repeat(512)));
     let (mut worker, actual) = worker(&fixture, &font, 80 * 64);
@@ -272,7 +280,7 @@ fn actual_frontier_unread_non_ascii_suffix_cannot_borrow_ascii_word_proof() {
 #[test]
 fn authenticated_word_prefix_reaches_first_line_with_constant_glyph_work_and_exact_fields() {
     let (font, _) = mono();
-    let mut comparisons = Vec::new(); // 仅三个有限测试工作量标量，不进入生产item历史。
+    let mut comparisons = Vec::new(); // Three finite work observations, never production item history.
     for units in [4096usize, 8192, 32768] {
         let fixture = Fixture::new(&"a".repeat(units));
         let (mut worker, actual) = worker(&fixture, &font, 80 * 64);
@@ -312,14 +320,15 @@ fn authenticated_word_prefix_reaches_first_line_with_constant_glyph_work_and_exa
             (1, 1, 256)
         );
         assert!(work.source_bytes <= 257 && bytes_after_style < 1024);
-        assert_eq!(shapes, work.shape_calls); // 安全原glyph直接签行，不能再隐藏overflow候选/已fit前缀重形。
+        assert_eq!(shapes, work.shape_calls); // Public shape work must include every real overflow/prefix candidate.
         assert!(facts.source_utf16.end > 0 && facts.source_utf16.end < 256);
         comparisons.push((work, bytes_after_style, shapes, facts.source_utf16.end));
         let mut output = worker.publish_ready_prefix().unwrap().unwrap();
         let line = output.last_line().unwrap().unwrap();
         assert_eq!(line.facts(), &facts);
         let part = output.part(&line, 0).unwrap().unwrap();
-        // 全item只在独立有限oracle建立；产品work已先记录，不能把oracle输入藏进候选计数。
+        // Complete-item input belongs only to this independent finite oracle.
+        // Candidate work was recorded first and cannot borrow the oracle's reads.
         let mut whole = crate::MarkdownShapingJob::new(
             fixture.source.clone(),
             &fixture.source.authority(),
@@ -393,7 +402,7 @@ fn word_prefix_output_snapshots_resume_same_worker_across_real_frontier_continua
     let old_end = first_snapshot.source_range().end;
     let mut current = worker.publish_ready_prefix().unwrap().unwrap();
     assert_eq!(current.source_range().end, end);
-    assert!(old_end < 256 && end > 256); // 同owner真child归还后续片，不能每视口从0复造。
+    assert!(old_end < 256 && end > 256); // The same owner continues after actual child release.
     let work = worker.frontier_work().unwrap();
     assert!(work.parts >= 2 && work.input_bytes <= 512);
     assert_eq!(
@@ -453,6 +462,8 @@ fn private_word_fact_survives_actual_job_return_without_extending_stored_glyph_c
         cancel.clone(),
     )
     .unwrap();
+    // Obtain a real original bounded frontier item, capture it through the unique
+    // production Store, then release the actual Job before reading its stored facts.
     let mut item = None;
     for _ in 0..100_000 {
         match coordinator
@@ -506,7 +517,7 @@ fn private_word_fact_survives_actual_job_return_without_extending_stored_glyph_c
         Some(4096)
     );
     let facts = GlyphProvider::require(&mut provider, &authority, &font.authority()).unwrap();
-    assert_eq!(facts.source_utf16, 0..256); // require已核真实glyphEOF；词尾不能升级为已shape源范围。
+    assert_eq!(facts.source_utf16, 0..256); // A complete word end cannot extend actual shaped coverage.
     cancel.cancel();
     assert!(matches!(
         GlyphProvider::frontier_word_end(&mut provider, &authority, &font.authority()),
@@ -517,6 +528,8 @@ fn private_word_fact_survives_actual_job_return_without_extending_stored_glyph_c
 #[cfg(target_os = "macos")]
 #[test]
 fn word_prefix_preserves_complete_first_grapheme_when_its_actual_advance_overflows() {
+    // A real grapheme wider than the column remains complete and explicitly
+    // Overflow. The composed prefix still exposes its original two GCB endpoints.
     let (font, _) = mono();
     let fixture = Fixture::new(&"a".repeat(4096));
     let (mut worker, actual) = worker(&fixture, &font, 1);

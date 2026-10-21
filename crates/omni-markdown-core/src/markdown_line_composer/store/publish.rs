@@ -1,4 +1,5 @@
-//! 原worker持续追加时，只发布完整LineEnd之前的同inode只读前缀。
+//! While the original worker appends, publish only a same-inode read-only prefix
+//! ending at an actual complete LineEnd.
 
 use super::{output::OutputSeal, *};
 use crate::markdown_layout_index::LayoutIndexSnapshotError;
@@ -8,12 +9,14 @@ impl From<LayoutIndexSnapshotError> for Error {
         match error {
             LayoutIndexSnapshotError::ReadersBusy => Self::SnapshotBusy,
             LayoutIndexSnapshotError::Index(error) => Self::from(error),
-        } // 名额背压只属于此发布入口；其他索引消费者的typed IO分类保持原合同。
+        } // Reader-slot backpressure belongs to this entry only; preserve other
+        // index consumers' original typed I/O classifications.
     }
 }
 
 impl GlyphStore {
-    /// 没有完整行或仍有半写入capture时不交付候选；旧快照不限制后续同源追加。
+    /// Deliver no candidate without a complete line or while capture is partial.
+    /// Existing snapshots do not prevent subsequent same-Source appends.
     pub(in crate::markdown_line_composer) fn publish_ready_prefix(
         &mut self,
     ) -> Result<Option<MarkdownComposedLines>> {
@@ -21,7 +24,7 @@ impl GlyphStore {
             self.guard()?;
             if self.capture.is_some() || self.control_capture.is_some() || self.lines == 0 {
                 return Ok(None);
-            } // 半item不能被截成已提交行；调用者保留worker，下一回合继续原阶段。
+            } // Keep the worker's original stage; a partial item is not a committed line.
             let last = self.line_end.ok_or(Error::InconsistentCoverage)?;
             let records = last.checked_add(1).ok_or(Error::Overflow)?;
             let graphemes = self.published_grapheme_directory()?;
@@ -30,14 +33,17 @@ impl GlyphStore {
                 #[cfg(test)]
                 Rows::Reading(_) => return Err(Error::InvalidRequest),
             };
-            self.guard()?; // 真实checkpoint/dup之后仍核原源与writer，错误候选的FD随值归还。
+            // Recheck original Source/writer after actual checkpoint/dup. An invalid
+            // candidate's owned descriptor is released with that local reader.
+            self.guard()?;
             Ok(Some(MarkdownComposedLines::from_sealed(OutputSeal {
                 source: self.source.clone(),
                 authority: self.authority.clone(),
                 fonts: self.fonts.clone(),
                 cancellation: self.cancellation.clone(),
                 reader,
-                // 每次交付独立输出身份；相同inode、行号或record不能让旧Part跨快照补签。
+                // Each delivery gets its own output identity. Equal inode, line
+                // ordinal, or record cannot renew an old Part across snapshots.
                 identity: Arc::new(()),
                 #[cfg(feature = "paged-shaping-frontier")]
                 lineage: Arc::downgrade(&self.identity),
@@ -54,7 +60,8 @@ impl GlyphStore {
             })?))
         })();
         if matches!(result, Err(Error::SnapshotBusy)) {
-            // 两份实际Reader未还只是发布背压；健康首错仍优先，不能借此绕过源/IO撤权。
+            // Two retained real readers impose publication backpressure. Health
+            // failure still wins; this result cannot bypass Source/I/O revocation.
             if let Err(error) = self.guard() {
                 return self.finish(Err(error));
             }

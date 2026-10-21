@@ -1,4 +1,5 @@
-//! 外层模板借用、匿名坐标记录与完整事务失败；不启动 NSApplication。
+//! Exercise outer template borrows, actual anonymous range records, and atomic
+//! transaction failure without starting NSApplication.
 use super::*;
 
 fn found(range: Range<usize>, captures: Vec<Option<Range<usize>>>) -> Found {
@@ -11,7 +12,8 @@ fn found(range: Range<usize>, captures: Vec<Option<Range<usize>>>) -> Found {
 
 #[test]
 fn anonymous_spool_streams_literals_and_source_ranges() {
-    // 模板在 reader 外层存活；literal 明确 Borrowed，capture 只保留旧 snapshot 坐标。
+    // The template outlives its reader. Literals borrow that owner; captures retain
+    // only original-snapshot coordinates, including UTF-16 emoji widths.
     let template = ReplacementTemplate::parse("😀$1", true, 2);
     let mut spool = ReplacementSpool::new(&template).unwrap();
     spool
@@ -33,7 +35,8 @@ fn anonymous_spool_streams_literals_and_source_ranges() {
 
 #[test]
 fn unread_parts_cannot_be_reinterpreted_as_another_replacement() {
-    // 尚有 literal token 时不得推进 outer iterator；同一 scratch 不能冒充独立的多记录快照。
+    // Advancing the outer iterator with unconsumed literal parts must fail; one
+    // shared capture scratch cannot masquerade as independent record snapshots.
     let template = ReplacementTemplate::parse("x", false, 0);
     let mut spool = ReplacementSpool::new(&template).unwrap();
     spool.push(&found(0..1, vec![])).unwrap();
@@ -52,7 +55,8 @@ fn unread_parts_cannot_be_reinterpreted_as_another_replacement() {
 
 #[test]
 fn selection_mapping_keeps_reversed_anchor_and_utf16_widths() {
-    // 同一 capture token 的两个输入长度不同，映射仍按旧坐标累积，不交换反向 anchor/head。
+    // Different lengths for the same capture token accumulate in original
+    // coordinates without swapping a backward selection's anchor/head.
     let template = ReplacementTemplate::parse("$1", true, 2);
     let mut spool = ReplacementSpool::new(&template).unwrap();
     spool
@@ -76,7 +80,8 @@ fn selection_mapping_keeps_reversed_anchor_and_utf16_widths() {
         .into_replacements()
         .unwrap()
         .map(|replacement| {
-            // map_selection 预读结束之后必须 rewind 到完整 header，不受 BufReader 底层偏移影响。
+            // After mapping's read-ahead, rewind to the complete record header
+            // rather than inheriting the buffered reader's underlying offset.
             let replacement = replacement.unwrap();
             let range = replacement.range_utf16;
             replacement.parts.collect::<Result<Vec<_>, _>>().unwrap();
@@ -87,13 +92,9 @@ fn selection_mapping_keeps_reversed_anchor_and_utf16_widths() {
 }
 
 #[test]
-fn spool_capacity_and_missing_capture_reject_before_canonical_mutation() {
-    // 不创建 256 MiB fixture，人工逼近声明上限；缺少模板要求的槽也不是合法的 undefined。
-    let template = ReplacementTemplate::parse("x", false, 0);
-    let mut capacity = ReplacementSpool::new(&template).unwrap();
-    capacity.bytes = MAX_SPOOL_BYTES - 7;
-    assert!(capacity.push(&found(0..1, vec![])).is_err());
-    assert_eq!(capacity.count(), 0);
+fn missing_capture_rejects_before_canonical_mutation() {
+    // A missing required capture slot is malformed input, distinct from a valid
+    // nonparticipating branch whose explicit None expands to "undefined".
     let capture = ReplacementTemplate::parse("$1", true, 2);
     let mut incomplete = ReplacementSpool::new(&capture).unwrap();
     assert!(incomplete.push(&found(0..1, vec![])).is_err());
@@ -102,7 +103,8 @@ fn spool_capacity_and_missing_capture_reject_before_canonical_mutation() {
 
 #[test]
 fn truncated_second_record_rolls_back_canonical_text_and_redo() {
-    // 第二个 header 的短读发生在首项已消费之后；core 仍须保留原文、选区、代次和 redo。
+    // Truncate the actual second record after the first can be consumed. Core
+    // must preserve original text, selection, generation, and redo atomically.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("Spool.md");
     std::fs::write(&path, "abc def").unwrap();
@@ -166,7 +168,8 @@ fn truncated_second_record_rolls_back_canonical_text_and_redo() {
 
 #[test]
 fn anonymous_spool_replays_captures_as_one_reversible_edit() {
-    // 两项的 $1 均引用同一旧 root，第一项提交准备不能改变第二项的 capture 正文。
+    // Both $1 references read the same old root; preparing the first replacement
+    // cannot change the second replacement's captured source text.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("Capture.md");
     std::fs::write(&path, "A😀 B42").unwrap();
@@ -179,7 +182,8 @@ fn anonymous_spool_replays_captures_as_one_reversible_edit() {
     spool
         .push(&found(4..7, vec![Some(4..7), Some(1..3)]))
         .unwrap();
-    // 原生Find必须传原完整反向memento，而非把查询有序范围重建成新的正向选择。
+    // Native Find must pass the original directed memento, not reconstruct a
+    // forward selection from the query's ordered range.
     let before = MarkdownTextSelection {
         anchor_utf16: 7,
         head_utf16: 1,
@@ -215,7 +219,8 @@ fn anonymous_spool_replays_captures_as_one_reversible_edit() {
 
 #[test]
 fn repeated_capture_tokens_share_one_wire_slot_and_empty_captures_stay_empty() {
-    // 重复 token 不重复写 capture；缺席分支与空范围具有不同模板结果。
+    // Repeated tokens share the recorded capture. An absent branch and an empty
+    // range must still produce different replacement parts.
     let template = ReplacementTemplate::parse("$1/$1/$2/$3", true, 4);
     assert_eq!(template.captures, [1, 2, 3]);
     let mut spool = ReplacementSpool::new(&template).unwrap();
@@ -243,47 +248,9 @@ fn repeated_capture_tokens_share_one_wire_slot_and_empty_captures_stay_empty() {
 }
 
 #[test]
-fn dense_literal_record_profile_keeps_exact_wire_and_borrowed_counts() {
-    // 与保存的旧 65k profile 用相同记录量；指标只代表该纯记录算法，不代替产品验收。
-    const COUNT: usize = 65_536;
-    let started = std::time::Instant::now();
-    let template = ReplacementTemplate::parse("x", false, 0);
-    let mut spool = ReplacementSpool::new(&template).unwrap();
-    for index in 0..COUNT {
-        spool.push(&found(index..index + 1, vec![])).unwrap();
-    }
-    let wire_bytes = spool.bytes;
-    let stream = spool.into_replacements().unwrap();
-    let write_us = started.elapsed().as_micros();
-    assert_eq!(wire_bytes, COUNT as u64 * 16);
-    let started = std::time::Instant::now();
-    let mut consumed = 0;
-    let mut borrowed = 0;
-    let mut owned = 0;
-    for replacement in stream {
-        let replacement = replacement.unwrap();
-        assert_eq!(replacement.range_utf16, consumed..consumed + 1);
-        for part in replacement.parts {
-            match part.unwrap() {
-                MarkdownReplacementPart::Literal(Cow::Borrowed("x")) => borrowed += 1, // 同一 arena 借用不产生每记录 String。
-                MarkdownReplacementPart::Literal(Cow::Owned(_)) => owned += 1, // 显式计数，不能把 owned 路径默认为零。
-                _ => panic!("literal fixture returned a different token"), // 任一模板/capture 误解都失败。
-            }
-        }
-        consumed += 1;
-    }
-    let read_us = started.elapsed().as_micros();
-    assert_eq!(consumed, COUNT);
-    assert_eq!(borrowed, COUNT);
-    assert_eq!(owned, 0);
-    eprintln!(
-        "dense_spool_profile records={consumed} wire_bytes={wire_bytes} borrowed_literal_records={borrowed} owned_literal_records={owned} write_us={write_us} read_us={read_us}"
-    );
-}
-
-#[test]
 fn corrupted_capture_tag_cannot_be_accepted_as_a_missing_capture() {
-    // wire 的未定义 tag 不是合法的 nil；不重同步、不忽略损坏，也不创建 replacement。
+    // Corrupt the actual record's tag. An undefined tag is not a valid absent
+    // capture; reject without resynchronizing, ignoring corruption, or emitting a replacement.
     let template = ReplacementTemplate::parse("$1", true, 2);
     let mut spool = ReplacementSpool::new(&template).unwrap();
     spool

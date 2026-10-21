@@ -1,4 +1,5 @@
-//! 原图、单遮罩和双遮罩分别只建立一个、三个和五个真实角色；不持正文或回调强边。
+//! Image, single-mask, and paired-mask tiles create one, three, and five actual roles respectively,
+//! without document or callback ownership.
 
 use super::*;
 use crate::native_surface::viewport_pixels::{MaskPairBlend, PixelPresentation};
@@ -10,7 +11,8 @@ mod validate;
 use assignment::Assignment;
 pub(super) use assignment::AssignmentPoint;
 
-/// 中性表示共享原白黑端点；配对表示另外持有本次安装的精确颜色身份。
+/// Neutral presentation shares original white/black endpoints; paired presentation retains exact colors
+/// for this installation.
 pub(super) struct Palette {
     white: CFRetained<CGColor>,
     black: CFRetained<CGColor>,
@@ -29,7 +31,8 @@ struct PairedColors {
     secondary_foreground: CFRetained<CGColor>,
 }
 impl PairedColors {
-    /// 端点必须与校准采用完全相同的 byte/255 sRGB 构造；颜色本身不授予编码资格。
+    /// Construct endpoints with the exact byte/255 sRGB rule used by calibration; colors alone do not
+    /// certify an encoding.
     fn new(
         background: [u8; 3],
         foreground: [u8; 3],
@@ -48,7 +51,8 @@ impl PairedColors {
         };
         let background = make(background)?;
         let foreground = make(foreground)?;
-        // 两种表示只分解同一组原RGBA像素；第二次实际合成的颜色身份须随封存证书保存。
+        // Both modes decompose the same original RGBA pixels; retain the second actual blend color
+        // identity with its sealed certificate.
         let secondary_foreground = match blend {
             MaskPairBlend::ForegroundThenForeground => foreground.clone(),
             MaskPairBlend::ForegroundThenBackground => background.clone(),
@@ -61,7 +65,8 @@ impl PairedColors {
     }
 }
 
-/// 两次实际内容安装分别登记；中途撤权也能只归还自己的关系。
+/// Record each actual contents installation separately so mid-install revocation returns only owned
+/// relationships.
 struct Payload {
     token: Rc<()>,
     image: Option<CFRetained<CGImage>>,
@@ -99,7 +104,8 @@ pub(super) struct Layout {
     pub(super) presentation: PixelPresentation,
 }
 
-/// 容器承担背景；只创建当前表示实际需要的前景/遮罩，保持原生精确合成顺序。
+/// The container owns background; create only foreground/mask roles required by actual presentation,
+/// preserving exact Native composition order.
 pub(super) struct Slot {
     container: Retained<CALayer>,
     foreground: Option<Retained<CALayer>>,
@@ -117,7 +123,8 @@ pub(super) struct Slot {
     second_foreground_installed: Cell<bool>,
 }
 impl Slot {
-    /// 只为本瓦片实际采用的表示建立角色；普通图像不预建遮罩，单遮罩不预建第二组。
+    /// Create roles for this tile actual presentation only, without masks for images or a second group
+    /// for single masks.
     pub(super) fn new(
         presentation: PixelPresentation,
         current: &impl Fn() -> bool,
@@ -128,7 +135,7 @@ impl Slot {
             if needed {
                 checked(current, CALayer::new).map(Some)
             } else {
-                Ok(None) // 缺席角色没有 Native 对象，也没有空闲 backing 或关闭义务。
+                Ok(None) // An absent role owns no Native object, idle backing, or close obligation.
             }
         };
         Ok(Self {
@@ -152,7 +159,7 @@ impl Slot {
         &self.container
     }
 
-    /// 只枚举真正建过的角色；观察本身不能为了检查而实例化闲置遮罩。
+    /// Observe actual constructed roles only, without instantiating idle masks merely for verification.
     pub(super) fn add_weaks(&self, values: &mut Vec<Weak<AnyObject>>) {
         values.push(layer_weak(&self.container));
         for layer in self.auxiliary_layers() {
@@ -172,7 +179,8 @@ impl Slot {
     }
 
     fn primary(&self) -> (&CALayer, &CALayer) {
-        // 角色由构造时的封存表示决定，必需角色缺失属于装配错误，不作静默重建。
+        // The sealed construction presentation determines required roles; a missing role is an assembly
+        // error, without silent reconstruction.
         (
             self.foreground.as_deref().expect("遮罩表示拥有前景"),
             self.mask.as_deref().expect("遮罩表示拥有遮罩"),
@@ -180,7 +188,8 @@ impl Slot {
     }
 
     fn secondary(&self) -> (&CALayer, &CALayer) {
-        // 双遮罩表示才可访问第二组，普通图像或单遮罩不会分配这些对象。
+        // Only paired presentation may access this second group; images and single masks allocate no
+        // such objects.
         (
             self.second_foreground
                 .as_deref()
@@ -225,7 +234,8 @@ impl Slot {
         self.install_assigned(image, secondary_image, layout, palette, current, assignment)
     }
 
-    /// 仅诊断入口可在真实setter效果之后、持久账本登记之前撤权，默认产品不保存hook。
+    /// Only the gated diagnostic entry can revoke between the actual setter and persistent
+    /// registration; the default product stores no hook.
     #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn install_with_probe<'a>(
         &'a self,
@@ -242,6 +252,8 @@ impl Slot {
         self.install_assigned(image, secondary_image, layout, palette, current, assignment)
     }
 
+    // The independent assignment retains compensation claims before payload publication and each Native
+    // effect.
     fn install_assigned(
         &self,
         image: &CFRetained<CGImage>,
@@ -256,7 +268,8 @@ impl Slot {
             PixelPresentation::OpaquePairedMasks { .. }
         );
         if paired != secondary_image.is_some() {
-            // 半张配对图或普通表示额外带图都不属于封存器交付的完整瓦片。
+            // A missing paired image or extra image for ordinary presentation is not a complete tile
+            // delivered by the sealer.
             return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
         }
         configure(&self.container, layout.rect, layout.scale, false, current)?;
@@ -268,7 +281,8 @@ impl Slot {
             } => Some(PairedColors::new(background, foreground, blend, current)?),
             PixelPresentation::Image | PixelPresentation::OpaqueNeutralMask => None,
         };
-        // 短期强 claim 在槽借用前取得；后续 Native/current 和真实 CFRelease 均不跨 RefCell 借用。
+        // Acquire temporary strong claims before slot borrowing; later Native/current and actual CF
+        // release cross no RefCell borrow.
         let color_claims = colors.as_ref().map(|value| {
             (
                 value.background.clone(),
@@ -325,7 +339,8 @@ impl Slot {
         configure(self.primary().0, rect, scale, false, current)?;
         configure(self.primary().1, rect, scale, true, current)?;
         if paired {
-            // 第二遮罩使用相同真实局部几何，不能缩放或错位近似原像素。
+            // The second mask uses the same actual local geometry, without approximating original
+            // pixels through scaling or displacement.
             configure(self.secondary().0, rect, scale, false, current)?;
             configure(self.secondary().1, rect, scale, true, current)?;
         }
@@ -349,7 +364,8 @@ impl Slot {
         })?;
         self.foreground_color_installed.set(true);
         if let Some(secondary_foreground) = secondary_foreground {
-            // 回混背景和再次加前景必须使用证书记录的原身份，不能在安装后只据RGB推断。
+            // Background remix and repeated foreground must use certified original identities rather
+            // than RGB inference after installation.
             assignment.apply(AssignmentPoint::SecondColor, current, || {
                 self.secondary()
                     .0
@@ -367,13 +383,15 @@ impl Slot {
         assignment: &Assignment<'_>,
     ) -> Result<()> {
         assignment.apply(AssignmentPoint::Mask, current, || {
-            // SAFETY: 本槽独占的固定标准 CALayer，不持视图、正文或业务回调。
+            // SAFETY: This slot exclusively owns its fixed standard CALayer, without View, document, or
+            // business callback ownership.
             unsafe { self.primary().0.setMask(Some(self.primary().1)) };
         })?;
         self.mask_installed.set(true);
         if paired {
             assignment.apply(AssignmentPoint::SecondMask, current, || {
-                // SAFETY: 第二组同样只归本槽，实际身份和父关系在关闭及验证时分别核对。
+                // SAFETY: This slot also exclusively owns the second group; close and validation check
+                // each actual identity/parent separately.
                 unsafe { self.secondary().0.setMask(Some(self.secondary().1)) };
             })?;
             self.second_mask_installed.set(true);
@@ -386,7 +404,8 @@ impl Slot {
             }
         })?;
         assignment.apply(AssignmentPoint::Children, current, || {
-            // SAFETY: 顺序固定的原前景均完整持活；候选容器尚未显示，不可互换两次合成顺序。
+            // SAFETY: Retain original foregrounds in fixed order; the unpublished candidate container
+            // cannot swap the two composition steps.
             unsafe { self.container.setSublayers(Some(&children)) };
         })?;
         self.foreground_installed.set(true);
@@ -395,6 +414,8 @@ impl Slot {
         Ok(())
     }
 
+    // Register contents only after the actual setter and same-token checks; release displaced claims
+    // outside the payload borrow.
     fn install_contents(
         &self,
         target: &CALayer,
@@ -412,7 +433,8 @@ impl Slot {
             },
             current,
             || {
-                // SAFETY: 原封存 CGImage 完整持活，只以 opaque 内容身份交给 CALayer。
+                // SAFETY: The original sealed CGImage stays retained and is passed to CALayer as opaque
+                // contents identity only.
                 unsafe {
                     target.setContents(Some(&*std::ptr::from_ref(&**image).cast::<AnyObject>()))
                 };
@@ -432,7 +454,7 @@ impl Slot {
                 value.image.replace(claim)
             }
         };
-        drop(previous); // 槽借用已经结束，任何最后 CFRelease 均在其后执行。
+        drop(previous); // The slot borrow ended before any final CF release.
         Ok(())
     }
 }
@@ -449,9 +471,12 @@ fn configure(
         layer.setBounds(NSRect::new(NSPoint::ZERO, rect.size))
     })?;
     checked(current, || layer.setContentsScale(scale))?;
-    // A8遮罩只消费alpha，向系统请求单通道存储；实际收益仍须以真实窗口峰值判断。
-    // 容器和固色层保留RGBA8；遮罩hint已与原格式逐字节校准，不能据此改源像素。
-    // SAFETY: 两个QuartzCore格式常量均为系统静态值，role由当前实际安装目标确定。
+    // A8 masks consume alpha only and request single-channel storage; actual benefit still requires
+    // real-window peak measurement.
+    // Containers and solid colors retain RGBA8; the mask hint was byte-calibrated against the original
+    // format and cannot alter source pixels.
+    // SAFETY: Both QuartzCore format constants are static system values; the actual installation target
+    // determines the role.
     checked(current, || unsafe {
         layer.setContentsFormat(if mask_plane {
             kCAContentsFormatGray8Uint
@@ -459,7 +484,7 @@ fn configure(
             kCAContentsFormatRGBA8Uint
         })
     })?;
-    // SAFETY: 同上，固色和遮罩均消费封存器交付的真实 tile 几何。
+    // SAFETY: Solid colors and masks use the actual tile geometry delivered by the sealer.
     checked(current, || unsafe {
         layer.setContentsGravity(kCAGravityResize)
     })?;

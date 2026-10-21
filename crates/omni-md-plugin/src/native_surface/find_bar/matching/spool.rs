@@ -1,4 +1,5 @@
-//! 匿名替换记录只保存范围；literal arena 属于外层动作，reader 不拥有其借用目标。
+//! Anonymous replacement records store ranges only. The outer action owns the
+//! literal arena, independently of readers that borrow it.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -17,7 +18,8 @@ use omni_markdown_core::{
 const MAX_SPOOL_BYTES: u64 = 256 * 1_024 * 1_024;
 const IO_BYTES: usize = 32 * 1_024;
 
-/// 每个 match 写入主范围和模板实际引用的去重 capture 槽；不复制相同 replacement 字节。
+/// Each match writes its main range and only the deduplicated captures referenced
+/// by the template, never duplicate replacement bytes.
 pub(super) struct ReplacementSpool<'a> {
     file: BufWriter<File>,
     template: &'a ReplacementTemplate,
@@ -27,11 +29,13 @@ pub(super) struct ReplacementSpool<'a> {
 }
 
 impl<'a> ReplacementSpool<'a> {
+    /// Create private unlinked storage before any edit. The File owns its descriptor
+    /// and backing storage on every return, including metadata-verification failure.
     pub(super) fn new(template: &'a ReplacementTemplate) -> Result<Self, String> {
         let file = tempfile::tempfile().map_err(|_| "无法创建匿名替换事务")?;
         let metadata = file.metadata().map_err(|_| "无法验证替换事务")?;
         if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 0 {
-            // 不接受共享访问或有名字的临时记录，失败发生在任何 canonical 编辑之前。
+            // Shared access or a named record is unacceptable; reject before canonical editing.
             return Err("替换事务未满足私有匿名存储要求".into());
         }
         Ok(Self {
@@ -43,6 +47,8 @@ impl<'a> ReplacementSpool<'a> {
         })
     }
 
+    /// Enforce the on-disk record budget before writing. Any partial I/O failure
+    /// rejects the enclosing action; this spool is never resumed as a valid prefix.
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
         let total = self
             .bytes
@@ -54,28 +60,30 @@ impl<'a> ReplacementSpool<'a> {
         Ok(())
     }
 
-    /// 任一失败使调用方丢弃整个 spool；不能继续使用部分 header 或发布部分替换。
+    /// Any failure makes the caller discard this entire spool. A partial header
+    /// cannot be reused or authorize partial replacement.
     pub(super) fn push(&mut self, found: &Found) -> Result<(), String> {
         self.write(&(found.range.start as u64).to_le_bytes())?;
         self.write(&(found.range.end as u64).to_le_bytes())?;
         for &capture in &self.template.captures {
-            // 同一 capture 被模板引用多次也只写一个槽；未参与分支以单字节标记编码。
+            // Repeated references share one capture slot. A nonparticipating
+            // branch is represented by one tag byte rather than a source range.
             match found.captures.get(capture).ok_or("替换捕获记录不完整")? {
                 Some(range) => {
-                    // 仅记录旧 snapshot 坐标；core 最终再检查范围及 scalar 边界。
+                    // Record only original-snapshot coordinates; Core validates ranges/scalar boundaries at commit.
                     self.write(&[1])?;
                     self.write(&(range.start as u64).to_le_bytes())?;
                     self.write(&(range.end as u64).to_le_bytes())?;
                 }
-                None => self.write(&[0])?, // 缺席与空 capture 不同，保留 baseline undefined 语义。
+                None => self.write(&[0])?, // Absent differs from empty; preserve baseline "undefined" expansion.
             }
         }
         let mut inserted = 0usize;
         for token in &self.template.tokens {
             let units = match token {
-                TemplateToken::Literal { utf16, .. } => *utf16, // 宽度在解析时一次计算。
+                TemplateToken::Literal { utf16, .. } => *utf16, // Compute literal width once while parsing.
                 TemplateToken::Capture(slot) => {
-                    // slot 和输入 capture 的映射只读固定模板；没有每个 match 的临时 Vec。
+                    // The fixed template maps slots to captures without allocating a per-match vector.
                     let capture = self.template.captures[*slot];
                     found.captures[capture].as_ref().map_or(9, Range::len)
                 }
@@ -99,7 +107,8 @@ impl<'a> ReplacementSpool<'a> {
         self.count
     }
 
-    /// 同一模板复用一个 capture scratch，坐标映射不保留全量 match/delta 数组。
+    /// Reuse one capture scratch for this template. Mapping retains no complete
+    /// match list or per-match delta array.
     pub(super) fn map_selection(
         &mut self,
         before: MarkdownTextSelection,
@@ -107,7 +116,8 @@ impl<'a> ReplacementSpool<'a> {
         self.file
             .seek(SeekFrom::Start(0))
             .map_err(|_| "无法重置替换事务的读取位置")?;
-        // seek 已 flush，底层 File 在 reader 生命周期内只读，不绕开未提交的写缓冲。
+        // Seek flushed the writer. This reader borrows the underlying File only
+        // while it is read-only, never bypassing pending buffered writes.
         let mut reader = BufReader::with_capacity(IO_BYTES, self.file.get_mut());
         let mut captures = vec![None; self.template.captures.len()];
         let mut after = before;
@@ -133,7 +143,8 @@ impl<'a> ReplacementSpool<'a> {
                 (before.head_utf16, &mut after.head_utf16),
             ] {
                 if original >= range.start {
-                    // 旧坐标位于替换内时关联新片段末尾；之后的位置跟随累计长度变化。
+                    // A position inside replacement follows the inserted fragment's
+                    // end; later positions follow cumulative length changes.
                     let base = if original <= range.end {
                         range.start.checked_add(inserted)
                     } else {
@@ -152,7 +163,8 @@ impl<'a> ReplacementSpool<'a> {
         Ok(after)
     }
 
-    /// template owner 独立于返回值且活得更久；没有自引用 reader 或 unsafe lifetime 延长。
+    /// The independent template owner outlives the returned reader. This needs
+    /// neither a self-referential reader nor an unsafe lifetime extension.
     pub(super) fn into_replacements(mut self) -> Result<SpoolReplacements<'a>, String> {
         self.file
             .seek(SeekFrom::Start(0))
@@ -173,6 +185,8 @@ impl<'a> ReplacementSpool<'a> {
     }
 }
 
+/// One actual File cursor and capture scratch serve the nested iterator. Outstanding
+/// parts must finish before another record can overwrite their capture coordinates.
 struct ReaderState {
     file: BufReader<File>,
     captures: Vec<Option<Range<usize>>>,
@@ -197,11 +211,13 @@ impl<'a> Iterator for SpoolReplacements<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let mut state = self.shared.state.borrow_mut();
         if self.remaining == 0 || state.failed {
-            // 消费完成或任一先前错误之后，流没有重新开始或丢弃错误项的权限。
+            // Completion or prior failure permanently ends this stream; it cannot
+            // restart or skip a failed record.
             return None;
         }
         if state.pending_parts != 0 {
-            // 上一 parts 未消费，禁止覆盖同一 capture scratch 并误读下一 header。
+            // Unconsumed parts still use this capture scratch; reading another
+            // header would overwrite their source coordinates.
             state.failed = true;
             return Some(Err(
                 MarkdownDocumentBufferError::ReplacementInputUnavailable,
@@ -210,7 +226,8 @@ impl<'a> Iterator for SpoolReplacements<'a> {
         let ReaderState { file, captures, .. } = &mut *state;
         match read_record(file, captures) {
             Ok(range_utf16) => {
-                // 只在完整 header/capture 读取后发布此 replacement，借用在 core 处理前结束。
+                // Publish only after the entire header/capture record is read;
+                // release the state borrow before Core consumes the replacement.
                 self.remaining -= 1;
                 state.pending_parts = self.shared.template.tokens.len();
                 Some(Ok(MarkdownReplacement {
@@ -222,7 +239,8 @@ impl<'a> Iterator for SpoolReplacements<'a> {
                 }))
             }
             Err(error) => {
-                // 短读/损坏使整个 canonical 事务失败，不能返回已消费前缀为成功。
+                // Short/corrupt input fails the whole canonical transaction;
+                // the consumed prefix cannot become a successful partial edit.
                 state.failed = true;
                 Some(Err(error))
             }
@@ -237,18 +255,19 @@ impl<'a> Iterator for SpoolParts<'a> {
         let token = template.tokens.get(self.next)?;
         let mut state = self.shared.state.borrow_mut();
         if state.failed {
-            return None; // 外层曾在未完整消费时推进，旧 parts 不再拥有读取权限。
+            return None; // Outer advancement before part completion revoked this old part stream.
         }
         self.next += 1;
         state.pending_parts -= 1;
         Some(Ok(match token {
             TemplateToken::Literal { bytes, .. } => {
-                // 借用目标属于外层 template；不借 RefCell 内容，不分配 String 或复制 literal。
+                // Borrow the outer template, not RefCell-owned storage, without
+                // allocating a String or copying the shared literal.
                 MarkdownReplacementPart::Literal(Cow::Borrowed(&template.arena[bytes.clone()]))
             }
             TemplateToken::Capture(slot) => match &state.captures[*slot] {
-                Some(range) => MarkdownReplacementPart::SourceRange(range.clone()), // 原始正文仍由旧 canonical root 读取。
-                None => MarkdownReplacementPart::Literal(Cow::Borrowed("undefined")), // 缺席 capture 保留既有模板结果。
+                Some(range) => MarkdownReplacementPart::SourceRange(range.clone()), // Core reads original text from its old root.
+                None => MarkdownReplacementPart::Literal(Cow::Borrowed("undefined")), // Preserve existing absent-capture semantics.
             },
         }))
     }
@@ -257,12 +276,15 @@ impl<'a> Iterator for SpoolParts<'a> {
 impl Drop for SpoolParts<'_> {
     fn drop(&mut self) {
         if self.next != self.shared.template.tokens.len() {
-            // 提前丢弃 parts 永久封闭该 reader；剩余 capture 没有变成下一记录的权限。
+            // Dropping parts early permanently seals the reader; remaining capture
+            // data cannot be reinterpreted as the next record.
             self.shared.state.borrow_mut().failed = true;
         }
     }
 }
 
+/// Decode one fixed-width wire coordinate, rejecting truncated input or a value
+/// the target platform cannot represent before it reaches Core.
 fn read_usize(reader: &mut impl Read) -> Result<usize, MarkdownDocumentBufferError> {
     let mut bytes = [0; 8];
     reader
@@ -272,7 +294,8 @@ fn read_usize(reader: &mut impl Read) -> Result<usize, MarkdownDocumentBufferErr
         .map_err(|_| MarkdownDocumentBufferError::ReplacementInputUnavailable)
 }
 
-/// scratch 长度来自固定 template，记录不能自行声明巨型 Vec 或更改下一条记录布局。
+/// The fixed template determines scratch length. Records cannot request a giant
+/// allocation or change the following record's layout.
 fn read_record(
     reader: &mut impl Read,
     captures: &mut [Option<Range<usize>>],
@@ -284,9 +307,9 @@ fn read_record(
             .read_exact(&mut tag)
             .map_err(|_| MarkdownDocumentBufferError::ReplacementInputUnavailable)?;
         *capture = match tag[0] {
-            0 => None,                                           // 合法的未参与分支没有正文坐标。
-            1 => Some(read_usize(reader)?..read_usize(reader)?), // range/scalar 合法性仍由 core 的一次事务验证。
-            _ => return Err(MarkdownDocumentBufferError::ReplacementInputUnavailable), // 私有记录损坏也不忽略或重同步。
+            0 => None, // A valid nonparticipating branch has no source coordinates.
+            1 => Some(read_usize(reader)?..read_usize(reader)?), // One Core transaction still validates ranges/scalars.
+            _ => return Err(MarkdownDocumentBufferError::ReplacementInputUnavailable), // Corruption is neither ignored nor resynchronized.
         };
     }
     Ok(range)

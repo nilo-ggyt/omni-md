@@ -1,4 +1,5 @@
-//! 原 super 前签原票；后继捕获只补 Native 几何，不能重新领取较新的正文或模式权限。
+//! Fix source authority before the superclass callback; later capture adds only original Native geometry.
+//! Geometry capture cannot adopt a newer document, presentation mode, selection, or input transaction.
 
 use super::*;
 use objc2_app_kit::{NSTextContentManager, NSWindow};
@@ -21,6 +22,8 @@ fn geometry_native_step<T>(
     epoch: u64,
     work: impl FnOnce() -> T,
 ) -> Result<T, String> {
+    // A getter, setter, weak upgrade, or temporary release may synchronously deliver geometry events.
+    // Check both the selection capture and the same pre-call epoch before allowing the next primitive.
     if !geometry_epoch_current(owner, epoch) {
         return Err("光栅真实几何事件在 Native 前撤原票".into());
     }
@@ -34,6 +37,8 @@ fn geometry_native_step<T>(
 
 #[derive(Clone, Copy, PartialEq)]
 struct Key {
+    // These scalar identities cover every source/input/presentation fact that can change this paint.
+    // The enclosing permit owns the original Native claims; this key owns no text or layout objects.
     generation: u64,
     selection: MarkdownTextSelection,
     mode: MarkdownPresentationMode,
@@ -51,7 +56,7 @@ struct Key {
     input_depth: usize,
 }
 
-/// 空viewport只代表canonical空文档或真实EOF；内部暂态空范围不能取得绘制完成权限。
+/// An empty viewport certifies completion only at canonical emptiness or true EOF, never an interior gap.
 fn terminal_viewport_matches(
     length: usize,
     provider_length: usize,
@@ -76,6 +81,8 @@ fn capture_terminal_viewport(
     let start = permit.step(owner, view, || range.location())?;
     let end = permit.step(owner, view, || range.endLocation())?;
     let mut offsets = [0_usize; 3];
+    // Round-trip the provider's end and both viewport endpoints through the original document origin.
+    // Comparing empty ranges alone would let an unlaid-out interior viewport erase existing pixels.
     for (slot, location) in offsets.iter_mut().zip([&document_end, &start, &end]) {
         let offset = permit.step(owner, view, || {
             content.offsetFromLocation_toLocation(&origin, location)
@@ -120,7 +127,8 @@ fn key(
         let document = document.try_borrow().ok()?;
         (document.generation(), document.selection())
     };
-    drop(document); // 纯票只存标量；任何 Native 原语之前已经结束正文借用。
+    // A permit retains only these scalars; end the canonical document borrow before Native access.
+    drop(document);
     Some(Key {
         generation,
         selection,
@@ -140,7 +148,8 @@ fn key(
     })
 }
 
-/// 仅存在于本次 begin→super→consume 同步栈；Native claim 不进入持久 Surface 或回调。
+/// Lives only on the synchronous begin → superclass → consume stack.
+/// Its Native claims cannot enter a persistent surface or callback.
 pub(in crate::native_surface) struct NativeMarkdownRasterOriginPermit {
     owner: std::rc::Weak<NativeMarkdownRasterSurface>,
     view: Retained<PieceBackedMarkdownTextView>,
@@ -166,12 +175,15 @@ impl NativeMarkdownRasterOriginPermit {
             return Err("光栅几何事件代次已耗尽".into());
         }
         let viewport_epoch = owner.counters.viewport_epoch.load(Ordering::Acquire);
-        // 首个 Weak/Native 操作前就取得现有纯 Rust 票。构造未绑 owner 或合法撤权只取消本次，
-        // 既不自行重签，也不把尚无 viewport 的首屏当作已经画好。
+        // Capture existing Rust authority before the first weak/Native operation. An unbound owner
+        // or legitimate revocation cancels this attempt; neither can renew its permit or certify
+        // that a first viewport with no layout has already painted.
         let Ok(capture) = view.ivars().folds.capture_selection() else {
             return Ok(None);
         };
         let result = (|| {
+            // Upgrade the original graph under that capture; pointer identity prevents another
+            // body using the same state values from acquiring this surface's publishing rights.
             let original =
                 geometry_native_step(&capture, owner, viewport_epoch, || owner.graph.view.load())?
                     .ok_or("光栅原 view 已释放")?;
@@ -196,6 +208,8 @@ impl NativeMarkdownRasterOriginPermit {
             }
             Ok(Some(permit))
         })();
+        // Revocation during construction is cancellation, even if a guarded getter reported an error.
+        // Preserve structural errors only while the original source and geometry remain authoritative.
         if !capture.current() || !geometry_epoch_current(owner, viewport_epoch) {
             Ok(None)
         } else {
@@ -234,7 +248,7 @@ impl NativeMarkdownRasterOriginPermit {
     }
 }
 
-/// 仅补本次 Native 几何，所有原语均消费 super 之前固定的同一 OriginPermit。
+/// Adds Native geometry to this paint while every primitive consumes the permit fixed before super.
 pub(super) struct Authority<'a> {
     owner: &'a NativeMarkdownRasterSurface,
     permit: &'a NativeMarkdownRasterOriginPermit,
@@ -262,16 +276,18 @@ impl<'a> Authority<'a> {
     }
 
     pub(super) fn generation(&self) -> u64 {
-        self.permit.key.generation // 原super之前已经固定的代次；诊断不能补领后继文档权限。
+        // Diagnostics report the pre-super generation; they cannot authorize a successor document.
+        self.permit.key.generation
     }
 
-    /// 无ink不等于表格占位：只有原行高投影能授权隐藏table源行，空白源码不应等待表格。
+    /// Distinguishes blank source from hidden table rows using the original row-height projection.
+    /// Missing ink alone cannot require a table overlay or authorize publication of an empty image.
     pub(super) fn table_overlay_requirement(&self) -> Result<Option<bool>, String> {
         if !self.current() {
-            return Ok(None); // 原视口已撤权，不能依据后继投影决定本次空图是否完整。
+            return Ok(None); // A successor projection cannot decide completeness for this revoked viewport.
         }
         if self.permit.key.mode == MarkdownPresentationMode::Source {
-            return Ok(Some(false)); // Source属性不使用占位高度；完整实际源流可以只有空白。
+            return Ok(Some(false)); // Source mode has no placeholder heights; its complete source may be blank.
         }
         let provider = ProtocolObject::<dyn NSTextElementProvider>::from_ref(&*self.content);
         let document = self.step(|| provider.documentRange())?;
@@ -299,16 +315,16 @@ impl<'a> Authority<'a> {
             {
                 return Err("占位检查的原视口端点往返不一致".into());
             }
-        } // 只转换两个Native端点；不读取字符，也不扩展到实际paragraph或整篇。
+        } // Convert two Native endpoints only; do not read text or expand to paragraphs/the document.
         if offsets[0] > offsets[1] {
             return Err("占位检查的原视口范围反向".into());
         }
         let requirement = {
             let Ok(projection) = self.permit.storage.ivars().table_row_heights.try_borrow() else {
-                return Ok(None); // 同步准备正在借用投影，只取消本次，不制造第二份缓存。
+                return Ok(None); // Preparation already borrows this projection; cancel without another cache.
             };
             match projection.as_ref() {
-                None => Some(false), // 无行高时属性producer明确保留literal源文，不能隐藏表格行。
+                None => Some(false), // Without row heights the attribute producer retains literal source.
                 Some(projection)
                     if projection.matches(
                         &self.owner.graph.document,
@@ -318,14 +334,15 @@ impl<'a> Authority<'a> {
                     ) =>
                 {
                     Some(projection.rows.iter().any(|row| {
-                        // 只判断有界行高元数据与原视口相交；零宽终端另走独立终端证明。
+                        // Intersect bounded row-height metadata only. A zero-width terminal range
+                        // needs its separate canonical EOF proof, rather than this overlap test.
                         row.source_utf16_range.start < offsets[1]
                             && offsets[0] < row.source_utf16_range.end
                     }))
                 }
-                Some(_) => None, // 旧投影既不能授权占位，也不能证明当前无占位；等待原准备完成。
+                Some(_) => None, // A stale projection proves neither placeholders nor their absence.
             }
-        }; // 借用结束后才复核原票，Native绘制不跨投影借用。
+        }; // End the projection borrow before revalidating authority or making any Native paint call.
         Ok(self.current().then_some(requirement).flatten())
     }
 
@@ -348,10 +365,10 @@ impl<'a> Authority<'a> {
             if document.generation() != permit.key.generation
                 || document.selection() != permit.key.selection
             {
-                return Ok(None); // 只读取原票的长度，不从后继代次或选择补领空文档权限。
+                return Ok(None); // Read only the original permit's length; a successor cannot certify emptiness.
             }
             document.utf16_len()
-        }; // 长度固定后立刻归还Doc借用，后续所有Native原语仍消费原permit。
+        }; // Return the document borrow immediately; every later Native primitive uses the same permit.
         let Some(window) = permit.step(owner, view, || view.window())? else {
             return Ok(None);
         };
@@ -372,6 +389,8 @@ impl<'a> Authority<'a> {
         if !native_markdown_controller_has_foreground_authority(&controller) {
             return Ok(None);
         }
+        // Snapshot only the actual foreground window, viewport, and backing scale. Retained claims
+        // keep this synchronous capture alive, but do not allow it to survive a changed Native relation.
         let visible = permit.step(owner, view, || view.visibleRect())?;
         let origin = permit.step(owner, view, || view.textContainerOrigin())?;
         let scroll = permit
@@ -391,7 +410,7 @@ impl<'a> Authority<'a> {
         if terminal_viewport
             && !capture_terminal_viewport(owner, view, permit, &content, &range, document_length)?
         {
-            return Ok(None); // 未布局的内部空viewport保持Pending，不能假发布空正文或清旧图。
+            return Ok(None); // An unlaid-out interior range stays pending and cannot clear the old image.
         }
         let bounds = permit.step(owner, view, || view.bounds())?;
         let selection = permit.step(owner, view, || view.selectedRanges())?;
@@ -426,6 +445,8 @@ impl<'a> Authority<'a> {
     }
 
     pub(super) fn step<T>(&self, work: impl FnOnce() -> T) -> Result<T, String> {
+        // A new fragment registration invalidates this exact batch even if the source key is unchanged.
+        // A prior functional failure also prevents later Native work from publishing a partial image.
         if self.owner.fragment_epoch.get() != self.fragment_epoch
             || self.owner.counters.sticky_failure.load(Ordering::Acquire)
         {
@@ -445,7 +466,8 @@ impl<'a> Authority<'a> {
     }
 
     pub(super) fn bind_published_image(&self, image: &CGImage) {
-        self.published_image.set(Some(NonNull::from(image))); // 只比身份，不拥有或解引用像素。
+        // The caller keeps this synchronous CGImage alive; store identity only, never dereference pixels.
+        self.published_image.set(Some(NonNull::from(image)));
     }
 
     fn reject(&self, reason: &'static str) -> bool {
@@ -457,10 +479,12 @@ impl<'a> Authority<'a> {
         if count < 8 {
             eprintln!("native_raster_surface event=current_rejected reason={reason} formal=false");
         }
-        false // 原生读取次数与顺序不变，只给已有失败比较固定的无正文原因。
+        false // Preserve getter order; report only a fixed, content-free reason for the failed comparison.
     }
 
     fn check_current(&self) -> Result<bool, String> {
+        // Reject scalar revocation before entering Native. Each subsequent getter still brackets
+        // the same permit so synchronous reentry cannot turn this capture into newer geometry.
         if !self.permit.current(self.owner, self.view) {
             return Ok(self.reject("original_ticket"));
         }
@@ -505,6 +529,8 @@ impl<'a> Authority<'a> {
             return Ok(self.reject("source_selection"));
         }
         let viewport = self.step(|| self.manager.textViewportLayoutController())?;
+        // The original proxy and viewport range must still be installed. Matching dimensions alone
+        // cannot authorize drawing after another delegate or layout has taken ownership.
         let proxy = self
             .native
             .proxy
@@ -535,6 +561,7 @@ impl<'a> Authority<'a> {
             return Ok(self.reject("source_clip_missing"));
         };
         let body: &NSView = self.view;
+        // Certify both ends of the scroll relation, including the exact original clip identity.
         if !self
             .step(|| scroll.documentView())?
             .is_some_and(|v| std::ptr::eq::<NSView>(&*v, body))
@@ -547,7 +574,7 @@ impl<'a> Authority<'a> {
         let image = self.native.image();
         if !self
             .step(|| {
-                // SAFETY: 主线程自有 image 仍由本次 NativeOwners 租约保活，只比较原 superview 身份。
+                // SAFETY: This main-thread image is retained by NativeOwners; compare its superview only.
                 unsafe { image.superview() }
             })?
             .is_some_and(|v| std::ptr::eq::<NSView>(&*v, body))
@@ -572,6 +599,8 @@ impl<'a> Authority<'a> {
         if self.step(|| self.layer.contentsScale())? != self.scale {
             return Ok(self.reject("image_backing_scale"));
         }
+        // Native claim destruction and the final geometry getter can revoke authority as well.
+        // Repeat scalar checks before consulting the optional image that this operation published.
         if !self.permit.current(self.owner, self.view) {
             return Ok(self.reject("ticket_after_geometry"));
         }
@@ -582,7 +611,8 @@ impl<'a> Authority<'a> {
             return Ok(self.reject("failure_after_geometry"));
         }
         if let Some(expected) = self.published_image.get() {
-            // SAFETY: 自有层仅保存公开允许的 CGImage/None；只比身份，caller 保活同一同步 CGImage。
+            // SAFETY: Our layer stores only supported CGImage/None contents. The caller retains
+            // the same synchronous CGImage; compare identity without sending arbitrary messages to it.
             let contents = self.step(|| unsafe { self.layer.contents() })?;
             let same = contents.as_deref().is_some_and(|actual| {
                 std::ptr::eq(
@@ -595,6 +625,8 @@ impl<'a> Authority<'a> {
                 return Ok(self.reject("published_image_identity"));
             }
         }
+        // Returning the temporary contents claim is another Native boundary; it cannot bypass
+        // source/fragment/failure checks merely because the preceding identity comparison matched.
         if !self.permit.current(self.owner, self.view) {
             return Ok(self.reject("ticket_after_contents"));
         }
@@ -614,6 +646,8 @@ mod terminal_tests {
 
     #[test]
     fn only_exact_canonical_empty_or_true_eof_is_a_terminal_viewport() {
+        // Empty source and exact EOF are valid; interior emptiness, provider disagreement, reversed
+        // ranges, and offsets beyond Native's signed range cannot certify a completed viewport.
         assert!(terminal_viewport_matches(0, 0, 0, 0));
         assert!(terminal_viewport_matches(71, 71, 71, 71));
         for (length, provider, start, end) in [

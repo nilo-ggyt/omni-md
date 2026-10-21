@@ -1,4 +1,5 @@
-//! 缩窗后保留当前完整画面，同时验证上一帧真实角色已经销毁，不能把它们变成空闲池。
+//! Keep the complete resized picture while checking actual previous-frame role destruction instead of
+//! an idle role pool.
 
 use super::*;
 
@@ -29,8 +30,10 @@ pub(super) fn run() -> Result<()> {
             for slot in &slots {
                 slot.add_weaks(&mut old_roles);
             }
-            // 完整 Native 验证已证明第一块单遮罩与第二块半透明图的实际挂载关系。
-            // 逐个比对真正分配对象的 Weak 身份，额外预建但未挂载的角色也不能混入此集合。
+            // Complete Native validation certified the actual first single-mask and second
+            // translucent-image mounting relationships.
+            // Compare actual allocated weak identities individually, excluding extra preconstructed but
+            // unmounted roles.
             let [container, foreground, mask] = slots[0].diagnostic_layers();
             let expected = [&*container, &*foreground, &*mask, &**slots[1].container()];
             let matches = |weak: &Weak<AnyObject>, expected: &CALayer| {
@@ -49,7 +52,8 @@ pub(super) fn run() -> Result<()> {
         })?;
         weaks.extend(old_roles.iter().cloned());
 
-        // 缩窄后只绘制原图的左侧真实像素；没有缩放、降采样或删除颜色来制造内存下降。
+        // Draw actual left-side pixels after narrowing, without scaling, downsampling, or deleting
+        // colors to manufacture lower memory.
         let narrow_bounds = NSRect::new(NSPoint::ZERO, NSSize::new(512.0, HEIGHT as f64));
         let mut narrow_bitmap = TiledBitmap::new(512, HEIGHT, Arc::clone(&counters))?;
         let tile = narrow_bitmap
@@ -62,7 +66,8 @@ pub(super) fn run() -> Result<()> {
             return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
         }
         for row in 0..HEIGHT {
-            // SAFETY: 唯一可写 context 覆盖 row_bytes*HEIGHT；每次只复制当前有限瓦片的一行。
+            // SAFETY: The unique writable context covers row_bytes*HEIGHT; each copy contains one
+            // bounded tile row.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     source.pixels.as_ptr().add(row * source.row_bytes),
@@ -73,8 +78,10 @@ pub(super) fn run() -> Result<()> {
         }
         narrow_bitmap.finish_tile(writable, Some(&wide))?;
         let narrow = narrow_bitmap.finish()?;
-        // 完整画面宽度已不同，左侧瓦片却由同一真实像素重新绘制而来。检查实际
-        // CGImage 身份与表示，证明借回了旧只读图片；不能仅凭复用计数声称未再分配。
+        // The complete width changed, but the left tile was redrawn from the same actual pixels.
+        // Compare actual
+        // CGImage identity/presentation to establish old read-only-image reuse, rather than inferring
+        // allocation behavior from a reuse count.
         let unchanged_image_reused =
             narrow
                 .tiles
@@ -101,12 +108,14 @@ pub(super) fn run() -> Result<()> {
             weaks.extend(pool.weaks());
             Ok(())
         })?;
-        drop(wide); // 新帧已经原子提交后才归还调用方的旧像素 claim。
+        drop(wide); // Return the caller old pixel claim only after atomic new-frame publication.
         CATransaction::flush();
         let old_roles_returned = old_roles.iter().all(|weak| weak.load().is_none());
         let retired_group_empty = pool.groups[0].slots.borrow().is_empty();
-        // 再次清理已经分离的旧组，模拟下一次复用；实际 Weak 已归零后，其列表分配也须归还。
-        // 当前窄画面仍保持挂载，后面的逐像素对照继续确认此资源释放没有破坏活帧。
+        // Clear the detached old group again as on later reuse; once actual weak identities are nil,
+        // return their list allocation too.
+        // Keep the narrow picture mounted while subsequent exact pixel comparison checks that resource
+        // release preserved the live frame.
         let retired_storage_returned =
             pool.groups[0].clear() && pool.groups[0].retired.borrow().capacity() == 0;
 

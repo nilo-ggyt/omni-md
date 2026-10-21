@@ -1,4 +1,4 @@
-//! 实际字体、Line/Part与GCB目录的邻接合同；只在有限oracle内列举已知完整字素。
+//! Adjacency through actual fonts, Line/Part output, and GCB directory; enumerate known complete graphemes only in bounded oracles.
 
 use super::*;
 use crate::{
@@ -11,6 +11,8 @@ mod trailing_whitespace_tests;
 mod word_tests;
 
 fn output(fixture: &Fixture) -> MarkdownComposedLines {
+    // Complete actual shaping under a wide finite line width; the resulting parts
+    // and levels come from this font/Source, not hand-authored directory metadata.
     let mut worker = MarkdownLineComposer::new(
         fixture.source.clone(),
         &fixture.source.authority(),
@@ -23,7 +25,7 @@ fn output(fixture: &Fixture) -> MarkdownComposedLines {
     worker.into_output().unwrap()
 }
 
-/// 仅有限真实业务夹具推进到终点；生产客户每个量子后回到原队列。
+/// Only these bounded fixtures drive to completion; production callers return to their original queue after each quantum.
 fn neighbor(
     output: &mut MarkdownComposedLines,
     part: &MarkdownComposedLinePart,
@@ -41,7 +43,7 @@ fn neighbor(
 }
 
 fn use_arabic_font(fixture: &mut Fixture) {
-    // 使用仓库已有真实Arabic字体，不以缺字或强制ASCII方向制造RTL成功。
+    // Use the existing actual Arabic font, without missing-glyph output or forced ASCII direction as RTL success.
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../vendor/harfrust/tests/fonts/in-house/SimpArabicTest.ttf"
@@ -62,12 +64,12 @@ fn use_arabic_font(fixture: &mut Fixture) {
     fixture.font = fixture.catalog.register(&font).unwrap();
 }
 
-/// U+0600 必须使用确实覆盖该字符的原字体；旧 PUA Arabic 样本只有历史字母映射。
+/// U+0600 requires a font that actually covers it; the older PUA Arabic fixture contains only historical letter mappings.
 fn use_prepend_font(fixture: &mut Fixture) {
-    // 未改造的 Amiri 1.002，源提交 04d40ee68cc6b8cb6870eca81a8a7451165aa95a。
+    // Unmodified Amiri 1.002, source commit 04d40ee68cc6b8cb6870eca81a8a7451165aa95a.
     // https://github.com/aliftype/amiri/releases/download/1.002/Amiri-1.002.zip
-    // 原 TTF SHA256：ab391c4147d054c48976e98322ad0eefe1427aa0e0502a12a4c75d80a70cfcd7。
-    // 必要 OFL 与字体同目录；仅作为测试编译输入，不装入正式应用或复制系统字体。
+    // Original TTF SHA256: ab391c4147d054c48976e98322ad0eefe1427aa0e0502a12a4c75d80a70cfcd7.
+    // The required OFL is beside the font; use only as a test compile input, without bundling it in the app or copying system fonts.
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fonts/amiri/Amiri-Regular.ttf"
@@ -115,6 +117,8 @@ fn exact_gcb_steps_preserve_combining_and_actual_rtl_part_directions() {
                 .filter(|at| range.start <= *at && *at <= range.end)
                 .collect();
             for pair in actual.windows(2) {
+                // The same source boundary pair maps opposite screen directions in
+                // RTL; caret association must describe the actual destination side.
                 for (at, expected, right, association) in [
                     (pair[0], pair[1], !rtl, Association::Before),
                     (pair[1], pair[0], rtl, Association::After),
@@ -157,7 +161,7 @@ fn actual_rtl_ls_and_new_paragraph_empty_lines_keep_distinct_original_bases() {
         assert_eq!(output.paragraph_base_level(&empty).unwrap(), empty_base);
         let previous = output.previous_line(&empty).unwrap().unwrap();
         assert_eq!(output.paragraph_base_level(&previous).unwrap(), 1);
-    } // LS的空视觉行仍属原RTL段；真正B之后的新空段按原策略为0，不互相套用。
+    } // An empty LS visual line remains in its RTL paragraph; an actual B starts a new empty paragraph with base zero under the original policy.
 }
 
 #[test]
@@ -171,7 +175,7 @@ fn foreign_part_and_source_first_error_cannot_authorize_visual_navigation() {
         neighbor(&mut foreign, &part, 0, true),
         Err(Error::SourceMismatch)
     ));
-    // 原Source真正失败后，已认证part的缓存和同时取消都不能掩盖首EIO。
+    // Once actual Source reclamation records injected failure, cached part authority and concurrent cancellation cannot hide its first EIO.
     fixture
         .document
         .text_snapshot()
@@ -211,7 +215,7 @@ fn combining_interior_is_rejected_instead_of_becoming_a_visual_step() {
     ));
 }
 
-/// 每回合只读一条原记录；预期来自有限原文，不从私有目录计数反推。
+/// Read one actual record per step; expected results come from bounded source text, not private directory counts.
 fn visual(
     output: &mut MarkdownComposedLines,
     head: usize,
@@ -293,15 +297,15 @@ fn quota_one_visual_uses_actual_soft_lines_and_unknown_prefix_is_not_eof() {
     );
     assert!(
         matches!(visual(&mut output,first.source_utf16.end,false,false),Visual::Found{utf16,ordinal:0,..} if utf16==first.source_utf16.end-1)
-    ); // 软行入口没有字符：原CM的一次Left/Right必须越过真实ASCII GCB，不先消耗亲和性动作。
+    ); // A soft-line entrance is not a character: one Left/Right must cross an actual ASCII grapheme rather than consume affinity alone.
 }
 
 #[test]
 fn quota_one_visual_keeps_prepend_graphemes_across_actual_bidi_shaping_parts() {
     use crate::MarkdownComposedVisualAnswer as Visual;
     for text in ["\u{600}  ", "\u{600}ا"] {
-        // U+0600 与后一个标量属于同一 GCB，但原 UBA 可以在其内部产生不同 level 的整形项。
-        // 使用实际字体和 Composer，不能靠改 level、伪造 glyph 或目录记录构造这条边界。
+        // U+0600 shares a grapheme with the next scalar, while UBA may produce different-level shaping items inside it.
+        // Exercise actual fonts/Composer, without changing levels or fabricating glyph/directory records to manufacture this boundary.
         let mut fixture = Fixture::new(text);
         use_prepend_font(&mut fixture);
         let source = fixture.source.resource_observer();
@@ -310,7 +314,7 @@ fn quota_one_visual_keeps_prepend_graphemes_across_actual_bidi_shaping_parts() {
         let resources = output.resource_observer();
         let last = text.encode_utf16().count();
 
-        // 用户不能把簇内部的标量位置作为箭头起点；拒绝只结束这一次无效请求。
+        // A cluster-interior scalar is not a valid arrow origin; rejection ends only this invalid request.
         let mut invalid = output
             .visual_query(
                 1,
@@ -335,8 +339,8 @@ fn quota_one_visual_keeps_prepend_graphemes_across_actual_bidi_shaping_parts() {
         }
         assert!(rejected, "真实 GCB 校验必须明确拒绝 UTF16=1");
 
-        // 两个屏幕方向都经原真实视觉项和同一条 GCB 目录续算，任何终点都不能停在内部 seam。
-        // 对 RTL 样本保留原方向与亲和性，不拿源下标的正负方向代替屏幕方向。
+        // Both screen directions resume actual visual items/the same grapheme directory; no endpoint may stop at an interior seam.
+        // Retain original RTL direction/affinity rather than substitute increasing/decreasing source offsets for screen direction.
         let mut reached_other_boundary = false;
         for at in [0, 2, last] {
             for right in [false, true] {
@@ -363,7 +367,7 @@ fn quota_one_visual_keeps_prepend_graphemes_across_actual_bidi_shaping_parts() {
             "原同一字素必须能通过实际箭头动作越过"
         );
 
-        // 导航不能改 canonical、历史或磁盘；仍存活的弱查询也不能保活 Reader 和原文件映射。
+        // Navigation changes no canonical text/history/disk; a surviving weak query cannot retain readers or original mapping.
         let path = fixture._directory.path().join("真实行查找.md");
         assert_eq!(std::fs::read(path).unwrap(), text.as_bytes());
         assert!(!fixture.document.is_dirty() && !fixture.document.can_undo());
@@ -395,6 +399,8 @@ fn paused_visual_query_has_no_resource_claim_and_foreign_cancel_or_source_error_
         foreign.step_visual(&mut query, 1),
         Err(Error::SourceMismatch)
     ));
+    // Keep the paused query after both actual outputs and Source owners die. It
+    // may retain coordinate progress only, not a reader or mapped source payload.
     let receipt = original.resource_observer();
     let source = fixture.source.resource_observer();
     drop(original);
@@ -403,6 +409,8 @@ fn paused_visual_query_has_no_resource_claim_and_foreign_cancel_or_source_error_
     assert!(!receipt.snapshot().file_open && source.payload_released());
     drop(query); // The still-live query did not retain the Source, reader or font owner.
 
+    // A separate real cancellation closes its own reader, independently of the
+    // foreign-output rejection above and the Source-error precedence below.
     let cancelled = Fixture::new("abc");
     let mut cancelled_output = self::output(&cancelled);
     let receipt = cancelled_output.resource_observer();
@@ -465,6 +473,8 @@ fn queued_crlf_coordinates_and_punctuation_left_use_the_original_gcb_endpoints()
     let mut upstream = false;
     let mut side = None;
     for index in 0..64 {
+        // Feed each completed caret's actual side/line affinity into the next
+        // request, as queued motion does; CRLF remains one grapheme transition.
         let affinity = if upstream {
             crate::MarkdownComposedLineAffinity::Upstream
         } else {
@@ -500,8 +510,8 @@ fn queued_crlf_coordinates_and_punctuation_left_use_the_original_gcb_endpoints()
     assert_eq!(head, 97);
     drop((output, fixture));
     let fixture = Fixture::new(&format!("{prefix}!{}", "Xa".repeat(128)));
-    // 真实20pt行宽使!后的合法断点与不可断长词竞争，复现原生ASCII尾部独占短行。
-    // 宽窗口不会经过软行入口，不能覆盖之前只换亲和性却没有越过!的真实回归。
+    // Actual 20 pt width makes the legal break after ! compete with an unbreakable word, reproducing the standalone short ASCII tail line.
+    // A wide viewport misses that soft-line entrance and cannot cover the regression where movement changed affinity without crossing !.
     let mut composer = fixture.composer();
     while fixture.next_line(&mut composer).is_some() {}
     let mut output = composer.into_output().unwrap();

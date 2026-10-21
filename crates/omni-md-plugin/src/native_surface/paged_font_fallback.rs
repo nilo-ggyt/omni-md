@@ -1,7 +1,8 @@
-//! 一个真实GCB的实际整形回退；Native候选构造与纯Core worker试次分开持有。
+//! Shape font fallback for one actual grapheme, separating native candidate ownership from pure Core worker trials.
 //!
-//! 本模块不创建线程。调用方将trial packet移入真实worker并join后，才在主线程消费结果。
-//! 试次只捕获同一Source/CoreFont；!Send的ShapeJob在worker内部构造和析构，绝不跨线程移动。
+//! This module starts no threads. The caller moves a trial packet into a real worker,
+//! joins it, then consumes its result on the main thread. Packets capture the same
+//! Source/CoreFont; non-Send ShapeJobs are constructed and destroyed inside that worker.
 use std::{ops::Range, rc::Rc, sync::Arc};
 
 use objc2_foundation::MainThreadMarker;
@@ -26,8 +27,8 @@ use super::{
     paged_line_fonts::NativeMarkdownLineFont,
 };
 
-// 这里只拦住Core原语言标签预算之外的复制；64字节以内的语法仍由Core唯一校验器决定。
-// 该上界与MarkdownShapingOptions的既有语言预算一致，不截断标签或改成默认语言。
+// Bound language-tag copying to Core's existing 64-byte budget. Core alone validates
+// admitted syntax; oversized tags are neither truncated nor replaced with a default language.
 const MAX_TRIAL_LANGUAGE_BYTES: usize = 64;
 
 #[cfg(feature = "native-paged-production")]
@@ -42,23 +43,26 @@ pub use trial::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Identify where the actual ordered font trial obtained its candidate, without substituting a font name for identity.
 pub enum NativeMarkdownFontOrigin {
     Base,
-    /// 原 Base 已经完整试次缺字后，系统针对同 GCB 首 scalar 选择的真实优先候选。
+    /// After a complete Base trial proves missing glyphs, use the system's actual preferred font for this grapheme's first scalar.
     #[cfg(feature = "native-paged-production")]
     ForString,
     Cascade(usize),
 }
 #[derive(Clone)]
+/// Bind one complete grapheme's original shaping context to finite native candidate/capture budgets.
 pub struct NativeMarkdownFontFallbackRequest {
     pub source_utf16: Range<usize>,
-    /// 保留真实itemization决定的script/direction/style/BOT/EOT；不从本GCB或4KiB窗口重猜。
+    /// Preserve real itemization's script/direction/style/BOT/EOT instead of guessing again from this grapheme or a 4-KiB window.
     pub options: MarkdownShapingOptions,
     pub languages: &'static [&'static str],
     pub cascade_budget: NativeMarkdownFontCascadeBudget,
     pub maximum_font_bytes: u64,
 }
 #[derive(Debug, Error)]
+/// Preserve typed source, shaping and resource failures across candidate acquisition, worker completion and retirement.
 pub enum NativeMarkdownFontFallbackError {
     #[cfg(feature = "native-paged-production")]
     #[error("原组合器字体试次权限失效：{0}")]
@@ -114,10 +118,12 @@ pub enum NativeMarkdownFontFallbackError {
 type Result<T> = std::result::Result<T, NativeMarkdownFontFallbackError>;
 
 impl NativeMarkdownFontFallbackError {
-    /// 仅同一个实际试次取消位已经置位时，精确旧权限/取消可以正常结束；不能扩大到任意Source。
+    /// Only this actual trial's requested cancellation permits retiring its exact stale/cancelled
+    /// outcomes normally; arbitrary Source failures remain failures.
     fn is_cancelled_retirement(&self, cancelled: bool) -> bool {
         if !cancelled {
-            return false; // 未见本次取消事实时不把真实失败猜成用户已离开。
+            // Without this trial's actual cancellation, failure cannot be guessed to mean the user left.
+            return false;
         }
         match self {
             Self::Revoked
@@ -133,11 +139,12 @@ impl NativeMarkdownFontFallbackError {
                     MarkdownDocumentBufferError::PreparedTextInputStale,
                 ),
             ) => true,
-            _ => false, // Poisoned、存储errno和其他Source错误继续失败，不允许任意兼容豁免。
+            // Poisoned state, storage errno and other source errors remain failures without a broad exemption.
+            _ => false,
         }
     }
 
-    /// 只辨认链首实际原始文件errno；调用方还必须已证明两者属于同一个Result/原Source。
+    /// Identify only the leading original-backing errno; the caller must separately prove both observations belong to one Result/Source.
     fn original_backing_errno(&self) -> Option<i32> {
         match self {
             Self::Source(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno))
@@ -149,11 +156,12 @@ impl NativeMarkdownFontFallbackError {
                 MarkdownDocumentBufferError::OriginalBackingUnavailable(errno),
             )) => Some(*errno),
             Self::TrialCleanup { cause, .. } => cause.original_backing_errno(),
-            _ => None, // 编辑存储或链中另一项错误不能冒充这个原文件observer的重复首因。
+            // Edit storage or another cause cannot masquerade as this original-file observer's repeated first failure.
+            _ => None,
         }
     }
 
-    /// 退休时只把真实存储errno提到取消/清理之前，旧Cell的权限失效不冒充磁盘故障。
+    /// Prioritize actual source-storage errno during retirement; expired cell authority is not a disk failure.
     pub(in crate::native_surface) fn is_source_io(&self) -> bool {
         match self {
             Self::Source(
@@ -170,12 +178,14 @@ impl NativeMarkdownFontFallbackError {
                 | MarkdownDocumentBufferError::EditStorageUnavailable(_),
             )) => true,
             Self::TrialCleanup { cause, cleanup } => cause.is_source_io() || cleanup.is_source_io(),
-            _ => false, // 不检查字符串，也不把任意Source变体扩大为可忽略的正常撤权。
+            // Match typed causes without string inspection or treating every Source variant as ordinary revocation.
+            _ => false,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Finite counters from actual shaping/output traversal, without retaining glyph records or source text.
 pub struct NativeMarkdownFontGlyphFacts {
     pub glyph_count: usize,
     pub missing_glyphs: usize,
@@ -185,8 +195,8 @@ pub struct NativeMarkdownFontGlyphFacts {
     pub source_borrow_max_bytes: usize,
 }
 
-/// 同一个不可变Native/Core字体的选择结果；它不携带字形数组或Source强边。
-/// 相邻item必须由后继composer重新合并/整形，本结果不能冒充完整run或软行。
+/// Identify the same immutable Native/Core font without retaining glyph arrays or a strong Source claim.
+/// A successor composer still merges/shapes adjacent items; this choice proves neither a whole run nor a soft line.
 pub struct NativeMarkdownFontChoice {
     origin: NativeMarkdownFontOrigin,
     source_utf16: Range<usize>,
@@ -197,29 +207,30 @@ pub struct NativeMarkdownFontChoice {
     source: MarkdownLayoutTextAuthority,
 }
 impl NativeMarkdownFontChoice {
-    /// 只读原候选来源，不能修改结果内部的已认证身份。
+    /// Read the original candidate origin without changing the result's authenticated identity.
     #[must_use]
     pub fn origin(&self) -> NativeMarkdownFontOrigin {
         self.origin
     }
-    /// 返回原全局UTF16范围的副本；修改副本不会把字体证明移到别的正文。
+    /// Copy the original global UTF-16 range; changing the copy cannot transfer font evidence to another source.
     #[must_use]
     pub fn source_range(&self) -> Range<usize> {
         self.source_utf16.clone()
     }
-    /// 真实整形后的固定事实；它不包含glyph数组或cmap推测。
+    /// Return finite actual shaping facts, without a glyph array or cmap-based coverage guess.
     #[must_use]
     pub fn facts(&self) -> NativeMarkdownFontGlyphFacts {
         self.facts
     }
-    /// 只借出实际通过试次的同一字体；Base结果继续要求调用方保留原base。
+    /// Lend the exact font that passed its trial; a Base choice still requires the caller's original base owner.
     pub fn font<'a>(
         &'a self,
         base: &'a NativeMarkdownPagedFont,
         source: &MarkdownLayoutTextSource,
     ) -> Result<&'a NativeMarkdownPagedFont> {
-        // Choice 只能由原完整 worker 结果创建，两端已在同一不可变 Source 核准。
-        // 消费时只需再次核真实健康与原 authority，不能为借字体重读远端 UTF16 起点的整条前缀。
+        // Only an original complete worker result creates Choice, with both endpoints already
+        // validated in the same immutable Source. Recheck health and authority without
+        // decoding the whole prefix up to a remote UTF-16 start merely to borrow the font.
         source.byte_offset_for_utf16(0)?;
         if source.authority() != self.source {
             return Err(NativeMarkdownFontFallbackError::SourceMismatch);
@@ -234,28 +245,32 @@ impl NativeMarkdownFontChoice {
         Ok(font)
     }
 
-    /// 消费选择结果，把真实fallback capture移交当前会话palette；Base返回None以复用原对象。
-    /// 这只转移字体所有权，仍仅证明原单GCB试次，不授予整item无缺字或WholeWord证书。
+    /// Consume the choice and transfer its actual fallback capture into the session palette;
+    /// Base returns None to reuse the original object. This transfers font ownership only,
+    /// proving the original single grapheme rather than whole-item or WholeWord coverage.
     ///
     /// # Errors
-    /// 原Source、base/selected字体身份或调用票变化时拒绝，不按名称重建替代字体。
+    /// Reject changed Source, base/selected font identity or caller authority without reconstructing a substitute by name.
     pub fn into_captured_font(
         mut self,
         base: &NativeMarkdownPagedFont,
         source: &MarkdownLayoutTextSource,
         current: &(impl Fn() -> bool + ?Sized),
     ) -> Result<Option<NativeMarkdownPagedFont>> {
-        self.font(base, source)?; // 真实Source首错优先；外来同长度正文不能取得原capture。
+        // Actual source failure takes precedence; equal-length foreign content cannot acquire this capture.
+        self.font(base, source)?;
         let permitted = current();
-        self.font(base, source)?; // current可进入Native并重入，之后必须重新核原来源与字体。
+        // current may enter Native and reenter; validate original source/font identity after it returns.
+        self.font(base, source)?;
         if !permitted {
             return Err(NativeMarkdownFontFallbackError::Revoked);
         }
-        Ok(self.font.take()) // 这里只移动原实际对象；没有新的Native getter、Source或字形缓存。
+        // Move only the actual original object, without a new native getter, Source or glyph cache.
+        Ok(self.font.take())
     }
 }
 
-/// Send packet只含原纯Core值和固定试次身份；没有CTFont、Native闭包或ShapeJob。
+/// A Send packet carries original pure Core values and fixed trial identity, without CTFont, a native closure or ShapeJob.
 pub struct NativeMarkdownFontTrial {
     #[cfg(feature = "native-paged-production")]
     probe: Option<omni_markdown_core::MarkdownLineFontProbe>,
@@ -268,29 +283,33 @@ pub struct NativeMarkdownFontTrial {
     cancellation: MarkdownShapingCancellation,
     identity: Arc<()>,
 }
+/// Own one trial's actual outcome and terminal observations, identified by the same original packet nonce.
 pub struct NativeMarkdownFontTrialResult {
     identity: Arc<()>,
     outcome: Result<NativeMarkdownFontGlyphFacts>,
     resources: Option<MarkdownShapingResourceSnapshot>,
-    // 原worker最后的probe/Source可能在结果形成后才Drop；只保原子观察与同次取消位，不保正文。
+    // The worker's last probe/Source can drop after result formation. Retain only atomic
+    // observation and this trial's cancellation flag, never body text or its owner.
     backing: Option<MarkdownOriginalBackingObserver>,
     cancellation: MarkdownShapingCancellation,
 }
 impl NativeMarkdownFontTrialResult {
-    /// None明确表示构造未完成，没有资源收据；不能把它当成“零资源已通过”。
+    /// None means construction never acquired a resource receipt, not that zero-resource validation passed.
     #[must_use]
     pub fn resources(&self) -> Option<MarkdownShapingResourceSnapshot> {
         self.resources
     }
-    /// 任何退出都消费同一真实快照；只有拥有者主动退休时才可忽略其已请求的正常取消。
-    /// 活动候选接纳失败必须保留原 TypedErr，包括取消，不能把结果错误伪装成成功退休。
+    /// Every exit consumes the same real snapshot. Only owner-requested retirement may
+    /// ignore its already-requested ordinary cancellation; admission failure preserves
+    /// the original typed error, including cancellation, instead of reporting successful retirement.
     pub(in crate::native_surface) fn retire(self, preserve_cancelled: bool) -> Result<()> {
         let cancelled = self.cancellation.requested();
         let mut cause = self
             .outcome
             .err()
             .filter(|error| preserve_cancelled || !error.is_cancelled_retirement(cancelled));
-        // 先完整读取本次真实Job的资源事实；Source已经失败也不能提前返回、漏掉不在Composer账内的试次。
+        // Read this actual Job's complete resource facts before returning even a Source
+        // failure; this trial's resources are not accounted for by the Composer alone.
         let cleanup = self.resources.and_then(|resources| {
             let unreleased = resources.files_open != 0
                 || resources.mappings_open != 0
@@ -301,7 +320,8 @@ impl NativeMarkdownFontTrialResult {
             match resources.first_error {
                 Some(error) => Some(NativeMarkdownFontFallbackError::GlyphStoreIo(error)),
                 None if unreleased => Some(NativeMarkdownFontFallbackError::GlyphStoresNotReleased),
-                None => None, // 原快照证明真实归还；未创建Job的外层None始终不合成全零快照。
+                // The actual snapshot proves release; an outer None never fabricates an all-zero receipt.
+                None => None,
             }
         });
         if let Some(cleanup) = cleanup {
@@ -318,13 +338,16 @@ impl NativeMarkdownFontTrialResult {
                         )
                     ) =>
                 {
+                    // This same Result's outcome already reflects the identical snapshot failure; report it once.
                     original
-                } // 同一Result原outcome已由同一快照签出的同一资源错误，只记一次。
+                }
                 Some(original) => {
                     let (cause, cleanup) = if original.is_source_io() {
-                        (original, cleanup) // 已有真实Source首因仍排第一，字形资源失败完整作为次因保存。
+                        // Keep actual Source failure first and retain the independent glyph-resource failure.
+                        (original, cleanup)
                     } else {
-                        (cleanup, original) // 资源首错优先于其余真正操作失败，两者都不能被退休吞掉。
+                        // Resource failure precedes other operation failures here; retirement preserves both.
+                        (cleanup, original)
                     };
                     NativeMarkdownFontFallbackError::TrialCleanup {
                         cause: Box::new(cause),
@@ -342,8 +365,9 @@ impl NativeMarkdownFontTrialResult {
                 .as_ref()
                 .is_some_and(|cause| cause.original_backing_errno() == Some(errno));
             if !already_recorded {
-                // 此observer属于同一个实际Result；最后Source Drop的errno成为链首，前面已读取的
-                // shaper分页/归还错误仍保留。只对同一原子首因去重，不按文本或相同整数合并外来结果。
+                // This observer belongs to the same actual Result. Final Source Drop errno
+                // leads the chain while preserving earlier shaper paging/release failures.
+                // Deduplicate this atomic first cause only, never foreign results by text or equal integers.
                 let source = NativeMarkdownFontFallbackError::Source(
                     MarkdownDocumentBufferError::OriginalBackingUnavailable(errno),
                 );
@@ -359,7 +383,7 @@ impl NativeMarkdownFontTrialResult {
         cause.map_or(Ok(()), Err)
     }
 
-    /// 当前选择入口拒绝了结果也先退休它；真实资源次因不能被正常撤权或主错误覆盖。
+    /// Retire even a result rejected by admission; ordinary revocation or the primary error cannot hide actual resource failure.
     fn retire_after(
         self,
         cause: NativeMarkdownFontFallbackError,
@@ -370,14 +394,16 @@ impl NativeMarkdownFontTrialResult {
             Ok(()) => cause,
             Err(cleanup) => {
                 if cause.is_cancelled_retirement(cancelled) {
-                    return cleanup; // 正常撤权不是第二笔失败，真实资源错误必须成为唯一可报告首因。
+                    // Ordinary revocation is no second failure; report the actual resource failure itself.
+                    return cleanup;
                 }
                 if same_trial {
                     let repeated_source = cause
                         .original_backing_errno()
                         .is_some_and(|errno| cleanup.original_backing_errno() == Some(errno));
                     if repeated_source {
-                        return cleanup; // 保留退休已组成的完整链，不能为去掉重复Source而丢掉真实shaper次因。
+                        // Keep the full retirement chain, including its real shaper failure, when eliminating repeated Source reporting.
+                        return cleanup;
                     }
                     #[cfg(feature = "native-paged-production")]
                     if matches!(
@@ -391,15 +417,18 @@ impl NativeMarkdownFontTrialResult {
                             )
                         )
                     ) {
-                        // 同nonce的packet与接纳门都在原probe消费后观察同一Poisoned，且退休没有其他次因。
-                        // 只去掉这次重复报告，仍返回原失败；外来试次或复合清理错误均不走此分支。
+                        // Packet and admission for the same nonce observed the same consumed
+                        // probe's Poisoned outcome, without another cleanup cause. Remove this
+                        // duplicate only; foreign trials and compound failures never use this branch.
                         return cleanup;
                     }
                 }
                 let (cause, cleanup) = if cleanup.is_source_io() && !cause.is_source_io() {
-                    (cleanup, cause) // 最后Source Drop的真实errno成为链首，原操作错误仍保存在同一因果中。
+                    // Final Source Drop errno leads, retaining the original operation in the same error chain.
+                    (cleanup, cause)
                 } else {
-                    (cause, cleanup) // 已有Source首因或两个真正操作错误时保持原主因。
+                    // Preserve an existing Source cause or the original ordering of two real operation failures.
+                    (cause, cleanup)
                 };
                 NativeMarkdownFontFallbackError::TrialCleanup {
                     cause: Box::new(cause),
@@ -409,32 +438,35 @@ impl NativeMarkdownFontTrialResult {
         }
     }
 
-    /// 只读真实worker结果供错误呈现/控制使用；字段私有，不能人工构造缺字通过票。
+    /// Lend the actual worker outcome for reporting/control; private fields prevent manufacturing a successful coverage receipt.
     pub fn outcome(
         &self,
     ) -> std::result::Result<&NativeMarkdownFontGlyphFacts, &NativeMarkdownFontFallbackError> {
         self.outcome.as_ref()
     }
 }
+/// Describe the original candidate cursor's actual progress; pending/unavailable states certify no glyph coverage.
 pub enum NativeMarkdownFontFallbackStep {
     PendingDependencies,
-    /// 原系统候选没有可供本Core整形器捕获的文件；它没有被shape，更没有缺字结论。
-    /// 调用方必须显式决定是否按原cursor继续；成功策略仅能称首个可捕获且无缺字的字体。
+    /// The system candidate has no file capturable by this Core shaper. It was never
+    /// shaped and has no coverage conclusion. The caller explicitly chooses whether to
+    /// continue its cursor; success means the first capturable font with no missing glyphs.
     UnavailableCandidate {
         ordinal: usize,
         cause: NativeMarkdownFontCascadeError,
     },
-    /// 优先候选没有本地文件，尚未形成任何完整 GCB 覆盖结论；下一量子才进入原全局级联。
+    /// The preferred candidate lacks a local file and proves no grapheme coverage; enter the original global cascade next quantum.
     #[cfg(feature = "native-paged-production")]
     UnavailableForString {
         cause: NativeMarkdownPagedFontError,
     },
-    /// 仅在真正启动一次试次时分配其独占包；待决和耗尽状态不占整份整形输入的栈空间。
+    /// Allocate the exclusive packet only for an actual trial; pending/exhausted states do not occupy a full shaping input on the stack.
     Trial(Box<NativeMarkdownFontTrial>),
     Exhausted {
         tried: usize,
     },
 }
+/// Reject a candidate with an actually observed missing glyph, or transfer the fully checked original font choice.
 pub enum NativeMarkdownFontFallbackCompletion {
     Rejected {
         origin: NativeMarkdownFontOrigin,
@@ -442,6 +474,7 @@ pub enum NativeMarkdownFontFallbackCompletion {
     },
     Selected(NativeMarkdownFontChoice),
 }
+/// Own exactly one candidate capture and cancellation authority while its real trial is in flight.
 struct Active {
     identity: Arc<()>,
     cancellation: MarkdownShapingCancellation,
@@ -454,7 +487,7 @@ struct Active {
     facts: Option<NativeMarkdownFontGlyphFacts>,
 }
 
-/// 原候选只有一个真实段在途；成功段归还后才允许原协调器前进，不能并行保留多个 Job。
+/// Keep only one actual segment in flight; the original Composer advances after its successful predecessor returns, without parallel Jobs.
 #[cfg(feature = "native-paged-production")]
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ProbeTrialPhase {
@@ -463,7 +496,7 @@ enum ProbeTrialPhase {
     SegmentReady,
 }
 
-/// 一个显式激活阶段的候选消费器；只有一个实际试次在途，不缓存所有Font。
+/// Consume candidates for one explicit active phase, with one actual trial in flight and no cache of every font.
 pub struct NativeMarkdownFontFallback {
     #[cfg(feature = "native-paged-production")]
     probe: Option<omni_markdown_core::MarkdownLineFontProbe>,
@@ -475,14 +508,15 @@ pub struct NativeMarkdownFontFallback {
     cascade: Option<NativeMarkdownFontCascade>,
     active: Option<Active>,
     tried: usize,
-    // 仅本 owner 实际首 scalar 读取尚未交回的工作量；错误或 unavailable 出口同样由 Producer 领取。
+    // Work actually spent reading this owner's first scalar, not yet returned to Producer.
+    // Failure/unavailable exits retain the same accounting obligation.
     #[cfg(feature = "native-paged-production")]
     probe_source_bytes: usize,
     stopped: bool,
     mtm: MainThreadMarker,
 }
 impl NativeMarkdownFontFallback {
-    /// 捕获原Source/Font身份；字素与脚本待决时不创建任何级联候选。
+    /// Capture original Source/Font identity without constructing cascade candidates while grapheme/script dependencies remain pending.
     pub fn new(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
@@ -504,7 +538,7 @@ impl NativeMarkdownFontFallback {
             .as_ref()
             .is_some_and(|language| language.len() > MAX_TRIAL_LANGUAGE_BYTES)
         {
-            // 在issue克隆options和创建任何试次之前拒绝超预算标签；此处不复制Core语法规则。
+            // Reject oversized tags before issue clones options or creates a trial, without duplicating Core's grammar.
             return Err(MarkdownShapingError::InvalidOptions.into());
         }
         if request.source_utf16.start >= request.source_utf16.end
@@ -512,10 +546,12 @@ impl NativeMarkdownFontFallback {
             || !base.accepts_shaping_size(request.options.points)
             || request.options.features.len() > MARKDOWN_SHAPING_MAX_FEATURES
         {
-            // 字号沿同一Font payload核实际双精度绑定和唯一f32编码，不用有损回转误拒14.3等尺寸。
+            // Validate point size against the same Font payload's double binding and unique
+            // f32 representation; a lossy round-trip must not reject valid sizes such as 14.3.
             return Err(NativeMarkdownFontFallbackError::InvalidCluster);
         }
-        source.byte_offset_for_utf16(request.source_utf16.end)?; // 真实标量端点，不接受低代理项。
+        // Require an actual scalar boundary, excluding a low-surrogate interior endpoint.
+        source.byte_offset_for_utf16(request.source_utf16.end)?;
         let backing = source.original_backing_observer();
         Ok(Self {
             #[cfg(feature = "native-paged-production")]
@@ -534,6 +570,7 @@ impl NativeMarkdownFontFallback {
             mtm,
         })
     }
+    /// Recheck original source health, font identities and style scope before and after potentially reentrant caller authority.
     fn guard(
         &self,
         base: &NativeMarkdownPagedFont,
@@ -547,7 +584,8 @@ impl NativeMarkdownFontFallback {
             .source
             .as_ref()
             .ok_or(NativeMarkdownFontFallbackError::InvalidState)?;
-        // 构造时已在同一不可变Source核过真实两端；此处只问健康，不再借远端叶解码同一位置。
+        // Construction proved both endpoints in this immutable Source. Check health only,
+        // without reborrowing remote leaves to decode the same position again.
         source.byte_offset_for_utf16(0)?;
         if source.authority() != self.authority {
             return Err(NativeMarkdownFontFallbackError::SourceMismatch);
@@ -555,12 +593,15 @@ impl NativeMarkdownFontFallback {
         #[cfg(feature = "native-paged-production")]
         if let Some(probe) = &self.probe {
             probe.validate().map_err(compose::error)?;
-        } // 原Source健康先行；已经消费的Style scope不能借仍存活的Source继续字体试次。
+        }
+        // Original source health comes first; a consumed style scope cannot continue a
+        // font trial merely because the underlying source remains alive.
         if !base.core_font().permits(&self.base) || !base.core_font().permits(authority) {
             return Err(NativeMarkdownFontFallbackError::FontMismatch);
         }
         let valid = !self.stopped && current();
-        // current可重入并消费原样式票；回调返回后必须重新核原Source及scope，不能只沿旧bool。
+        // current may reenter and consume the style ticket. Recheck Source/scope afterward,
+        // rather than continuing solely on the previously returned Boolean.
         source.byte_offset_for_utf16(0)?;
         #[cfg(feature = "native-paged-production")]
         if let Some(probe) = &self.probe {
@@ -571,6 +612,7 @@ impl NativeMarkdownFontFallback {
         }
         Ok(())
     }
+    /// Require one complete grapheme in the original script run, or consume the Composer's already-certified same-source ticket.
     fn cluster(
         &self,
         dependencies: Option<(&mut MarkdownGraphemeJob, &mut MarkdownScriptJob)>,
@@ -578,7 +620,9 @@ impl NativeMarkdownFontFallback {
         #[cfg(feature = "native-paged-production")]
         if let Some(probe) = &self.probe {
             probe.validate().map_err(compose::error)?;
-            return Ok(true); // 不重新扫描GCB/Script，私有构造已绑定原协调器同一真实单字素票。
+            // Private construction bound the Composer's real single-grapheme ticket;
+            // do not rebuild or rescan grapheme/script dependencies.
+            return Ok(true);
         }
         let (graphemes, scripts) =
             dependencies.ok_or(NativeMarkdownFontFallbackError::InvalidState)?;
@@ -604,7 +648,9 @@ impl NativeMarkdownFontFallback {
             MarkdownGraphemeAnswer::Pending => return Ok(false),
             MarkdownGraphemeAnswer::Known(Some(end)) if end.utf16 == range.end => {}
             _ => return Err(NativeMarkdownFontFallbackError::InvalidCluster),
-        } // 两端是边界还不够，必须是严格下一个边界，不能把多个GCB拼成试次。
+        }
+        // Two valid boundaries are insufficient: the end must be the strictly next
+        // boundary, preventing several graphemes from becoming one coverage trial.
         match scripts.run_at(&self.authority, MarkdownScriptUnit::Utf16, range.start)? {
             MarkdownScriptAnswer::Pending => Ok(false),
             MarkdownScriptAnswer::Known(Some(run))
@@ -615,8 +661,11 @@ impl NativeMarkdownFontFallback {
                 Ok(true)
             }
             _ => Err(NativeMarkdownFontFallbackError::InvalidCluster),
-        } // 完整GCB必须属于原script run；不从第一个scalar的cmap或script单独猜测。
+        }
+        // The complete grapheme must belong to its original script run; the first
+        // scalar's cmap or script alone cannot establish that fact.
     }
+    /// Revoke this candidate owner and return its native/source claims; the caller separately owns worker join.
     fn stop(&mut self) {
         self.stopped = true;
         if let Some(active) = self.active.take() {
@@ -626,10 +675,13 @@ impl NativeMarkdownFontFallback {
         drop(self.cascade.take());
         #[cfg(feature = "native-paged-production")]
         drop(self.probe.take());
-        drop(self.source.take()); // worker仅持纯Core clone；调用方仍须join，不能在这里声称已释放。
+        // A worker can still hold pure Core clones. Returning this claim proves no
+        // worker completion; the caller must join and inspect its actual receipt.
+        drop(self.source.take());
     }
 
-    /// 主线程只准备一个候选；实际shape必须消费返回的packet，不在此隐藏同步长算法。
+    /// Prepare one candidate on the main thread; actual shaping consumes its returned
+    /// worker packet instead of hiding a long synchronous algorithm in this entry.
     pub fn next_trial(
         &mut self,
         base: &NativeMarkdownPagedFont,
@@ -647,10 +699,13 @@ impl NativeMarkdownFontFallback {
                 .and_then(|observer| observer.first_errno())
             {
                 return Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
-            } // 最后Source归还的真实失败也优先于表层失权，不以错误出口吞掉cleanup首因。
+            }
+            // A real failure observed during final Source release precedes superficial
+            // revocation; this error exit must not hide the cleanup's source failure.
         }
         result
     }
+    /// Advance only this original ordered candidate cursor, preserving one in-flight trial and its actual capture.
     fn issue(
         &mut self,
         base: &NativeMarkdownPagedFont,
@@ -673,8 +728,9 @@ impl NativeMarkdownFontFallback {
         self.guard(base, authority, current)?;
         #[cfg(feature = "native-paged-production")]
         if self.tried == 1 && self.probe.is_some() {
-            // tried 只在真实试次结束或明确不可捕获后前进；Base 首次缺字才轮到系统原首字符候选。
-            // 首 scalar 不证明完整 GCB，后面的 start_trial 仍发送同一完整原范围到唯一 worker。
+            // tried advances only after a real trial or explicit unavailable capture.
+            // The first-scalar system preference follows an actual Base coverage failure;
+            // it proves no whole grapheme, which start_trial still sends to the same worker.
             let font = match self.for_string_font(base, authority, palette, current) {
                 Ok(font) => font,
                 Err(NativeMarkdownFontFallbackError::ForStringCapture(
@@ -713,8 +769,9 @@ impl NativeMarkdownFontFallback {
                 self.guard(base, authority, current)?;
                 self.cascade = Some(result?);
             }
-            // 临时移出本级联owner，结束self.cascade的可变借用后才调用Native。
-            // 每个原语的current闭包都可复用完整Source端点健康门，不用仅observer替代。
+            // Move the cascade out before Native calls, ending self.cascade's mutable
+            // borrow. Each primitive's callback retains full original Source authority,
+            // rather than substituting an observer-only health approximation.
             let mut cascade = self
                 .cascade
                 .take()
@@ -749,19 +806,24 @@ impl NativeMarkdownFontFallback {
                         .checked_add(1)
                         .ok_or(NativeMarkdownFontFallbackError::Overflow)?;
                     self.guard(base, authority, current)?;
+                    // No Job or coverage receipt was created. Do not replay, rebuild
+                    // the cascade or assign this candidate's identity to a different font.
                     return Ok(NativeMarkdownFontFallbackStep::UnavailableCandidate {
                         ordinal,
                         cause,
-                    }); // 没有创建Job或缺字收据；不自动重试、重建级联或把另一字体改成该身份。
+                    });
                 }
                 Err(error) => {
+                    // Other source, parsing and I/O failures revoke immediately;
+                    // they cannot be reclassified as an unavailable candidate.
                     return Err(NativeMarkdownFontFallbackError::CandidateCapture {
                         ordinal: candidate.ordinal(),
                         error,
-                    }); // 其他来源、解析与IO错误仍立即撤权，不能以“候选不可用”吞掉失败。
+                    });
                 }
             };
-            self.cascade = Some(cascade); // 原签发者持续存活；不重建系统列表或另领候选顺序。
+            // Keep the original issuer and ordered system list instead of acquiring a replacement cursor.
+            self.cascade = Some(cascade);
             (
                 NativeMarkdownFontOrigin::Cascade(candidate.ordinal()),
                 Some(font),
@@ -770,7 +832,8 @@ impl NativeMarkdownFontFallback {
         self.start_trial(base, authority, origin, font, current)
     }
 
-    /// 一个实际候选占据原唯一在途槽；来源差异只影响候选顺序，不绕过完整 GCB 整形或资源收据。
+    /// Place one actual candidate in the sole in-flight slot. Origin changes ordering only,
+    /// bypassing neither complete-grapheme shaping nor actual resource receipts.
     fn start_trial(
         &mut self,
         base: &NativeMarkdownPagedFont,
@@ -834,7 +897,7 @@ impl NativeMarkdownFontFallback {
             .map(|capture| capture.font().bytes_observer())
     }
 
-    /// 必须在真实worker完成/join后调用；结果只授权这个原GCB的字体选择。
+    /// Call only after the actual worker completes and joins; its result authorizes this original grapheme's font choice only.
     pub fn complete_trial(
         &mut self,
         base: &NativeMarkdownPagedFont,
@@ -849,30 +912,34 @@ impl NativeMarkdownFontFallback {
             .and_then(|completion| completion.ok_or(NativeMarkdownFontFallbackError::InvalidState));
         completion.map_err(|cause| self.stop_preserving_error(cause))
     }
-    /// 同一字体入口失败后结束原Native字段；已携真实Source的完整错误链必须原样保留。
+    /// End original native fields after failure while preserving an existing complete real Source error chain.
     fn stop_preserving_error(
         &mut self,
         cause: NativeMarkdownFontFallbackError,
     ) -> NativeMarkdownFontFallbackError {
         self.stop();
         if cause.is_source_io() {
-            return cause; // TrialCleanup里的真实shaper次因不能被外层再次覆盖成单一Source。
+            // Do not replace a TrialCleanup chain's real shaper cause with a single outer Source error.
+            return cause;
         }
         match self
             .backing
             .as_ref()
             .and_then(|backing| backing.first_errno())
         {
+            // Prioritize only a newly observed Source cause after the original stop,
+            // retaining the complete earlier operation failure as the second cause.
             Some(errno) => NativeMarkdownFontFallbackError::TrialCleanup {
                 cause: Box::new(
                     MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into(),
                 ),
                 cleanup: Box::new(cause),
-            }, // 仅原stop之后新出现的Source首因提升优先级；原操作失败仍完整保留。
+            },
             None => cause,
         }
     }
 
+    /// Consume the original result and independently verify any fresh capture's release on failure.
     fn complete(
         &mut self,
         base: &NativeMarkdownPagedFont,
@@ -881,12 +948,14 @@ impl NativeMarkdownFontFallback {
         result: NativeMarkdownFontTrialResult,
         current: &(impl Fn() -> bool + ?Sized),
     ) -> Result<Option<NativeMarkdownFontFallbackCompletion>> {
-        // 首个Native/current前固定原试次身份；只有同nonce才证明后续两个Source错误来自同一观察。
+        // Capture trial identity before the first Native/current call; only the same
+        // nonce proves that later Source errors derive from this one observation.
         let same_trial = self
             .active
             .as_ref()
             .is_some_and(|active| Arc::ptr_eq(&active.identity, &result.identity));
-        // Fresh 的唯一新映射须随失败试次归还；Reused 只退出本次强边，最终释放仍由原 Body 严格验收。
+        // A fresh capture's unique new mapping must end with its failed trial. A reused
+        // font sheds this claim only; its actual final release remains the original Body's obligation.
         let bytes = if same_trial {
             self.active
                 .as_ref()
@@ -949,12 +1018,15 @@ impl NativeMarkdownFontFallback {
             Ok(())
         })();
         if let Err(cause) = admission {
-            self.stop(); // 原同次取消先置位，旧Cell/Style的精确正常撤权才能在退休时被辨认。
+            // Set this trial's actual cancellation before retirement can classify its
+            // exact old-cell/style revocation as an ordinary cancelled retirement.
+            self.stop();
             return Err(result.retire_after(cause, same_trial));
         }
         if result.outcome.is_err() {
-            // 同结果的资源快照必须先完整消费；Source 首因和实际 glyph 归还次因沿原退休路径组合。
-            // preserve_cancelled=true 保证这里已观察到的错误不能被“主动退休取消”规则过滤为 Ok。
+            // Consume the same result's complete snapshot, preserving Source and actual
+            // glyph-release failures through original retirement. preserve_cancelled=true
+            // prevents an already-observed failure from becoming successful voluntary cancellation.
             return Err(result
                 .retire(true)
                 .expect_err("保留原错误的结果退休不能成功"));
@@ -974,7 +1046,8 @@ impl NativeMarkdownFontFallback {
             || !resources.shaper_access_certified
         {
             return Err(NativeMarkdownFontFallbackError::GlyphStoresNotReleased);
-        } // 不以worker返回、shape Ok或假零值代替真实数组/FD释放。
+        }
+        // Worker return, successful shape and guessed zeros cannot substitute for actual array/descriptor release.
         self.guard(base, authority, current)?;
         let active = self
             .active
@@ -988,7 +1061,8 @@ impl NativeMarkdownFontFallback {
                 return Err(NativeMarkdownFontFallbackError::InvalidState);
             }
             if let Some(previous) = active.facts {
-                // 累计的每项都来自已经真实检查并释放的段；不是把首段结果伪装成整个外 GCB。
+                // Accumulate only segments already actually inspected and released;
+                // the first segment's facts alone cannot certify the entire outer grapheme.
                 for (value, addition) in [
                     (&mut facts.glyph_count, previous.glyph_count),
                     (&mut facts.missing_glyphs, previous.missing_glyphs),
@@ -1006,7 +1080,8 @@ impl NativeMarkdownFontFallback {
             }
         }
         if facts.missing_glyphs > 0 {
-            // 真实缺字仍推进原有序级联；共享原字体也要重新 shape，不能把旧 GCB 的成功挪到这里。
+            // Actual missing glyphs advance the original ordered cascade. Even a reused
+            // font needs a new shape; another grapheme's successful coverage cannot transfer here.
             let bytes = active
                 .font
                 .as_ref()
@@ -1036,12 +1111,14 @@ impl NativeMarkdownFontFallback {
             active.facts = Some(facts);
             active.phase = ProbeTrialPhase::NextSegment;
             self.active = Some(active);
-            return Ok(None); // 外 GCB 仍有同候选真实段，不能在这里签 Choice 或切下一 Font。
+            // The same candidate still has real segments in this outer grapheme;
+            // authorize neither Choice nor a different font yet.
+            return Ok(None);
         }
         self.select_choice(base, active, facts, current).map(Some)
     }
 
-    /// 只有整个候选的所有真实段都无缺字并已归还 Job 后，才转移原 Font capture。
+    /// Transfer the original Font capture only after every actual segment has no missing glyph and its Job has returned.
     fn select_choice(
         &mut self,
         base: &NativeMarkdownPagedFont,
@@ -1063,11 +1140,15 @@ impl NativeMarkdownFontFallback {
             .take()
             .ok_or(NativeMarkdownFontFallbackError::InvalidState)?;
         #[cfg(feature = "native-paged-production")]
-        let probe = self.probe.take(); // 最后Native/current回调以后还要核原票，不能先丢最后Source读claim。
-        self.stop(); // 已选择字体转交结果；先归还级联，再核原Source与调用票，不在idle藏业务缓存。
+        let probe = self.probe.take();
+        // Keep the original probe/source through final Native/current revalidation,
+        // while returning the cascade first. Choice receives the selected font;
+        // no business cache remains hidden in this retired candidate owner.
+        self.stop();
         source.byte_offset_for_utf16(0)?;
         let valid = current() && base.core_font().permits(&self.base);
-        source.byte_offset_for_utf16(0)?; // 原两端已认证；这里只核健康，不重复解码远端 GCB 前缀。
+        // Both original endpoints were certified; check health without decoding the remote grapheme prefix again.
+        source.byte_offset_for_utf16(0)?;
         #[cfg(feature = "native-paged-production")]
         if let Some(probe) = &probe {
             probe.validate().map_err(compose::error)?;
@@ -1084,15 +1165,17 @@ impl NativeMarkdownFontFallback {
             .and_then(|observer| observer.first_errno())
         {
             return Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
-        } // 真实最后Source Drop的I/O事实不因已有无缺字结果而被抹掉。
+        }
+        // A successful coverage result cannot hide actual I/O failure during final Source Drop.
         Ok(NativeMarkdownFontFallbackCompletion::Selected(choice))
     }
-    /// 只请求原试次取消并交还Native字段；调用方必须join后核真实worker资源收据。
+    /// Request original-trial cancellation and return native fields; the caller still joins and checks real worker resource receipts.
     pub fn close(mut self) {
         self.stop();
     }
 }
 impl Drop for NativeMarkdownFontFallback {
+    /// Early return retires this same owner rather than leaving a candidate, cascade or strong Source claim resident.
     fn drop(&mut self) {
         self.stop();
     }

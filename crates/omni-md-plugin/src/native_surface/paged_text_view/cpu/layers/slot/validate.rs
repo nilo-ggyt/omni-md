@@ -1,9 +1,10 @@
-//! 每次消费完整槽都核实际图像、颜色、顺序、遮罩和父关系，任何外部替换均撤销原 Ready。
+//! Validate actual images, colors, order, masks, and parents whenever consuming a complete slot;
+//! external replacement revokes original Ready.
 
 use super::*;
 use objc2::rc::autoreleasepool;
 
-/// 这组纯标量只描述一张已封存遮罩，不保 Native 图像或可变槽借用。
+/// These scalar facts describe one sealed mask without retaining Native images or mutable slot borrows.
 struct MaskIdentity {
     rect: NSRect,
     scale: f64,
@@ -12,6 +13,7 @@ struct MaskIdentity {
 }
 
 impl Slot {
+    /// Compare the original finite receipt against the actual graph after ending the payload borrow.
     pub(in super::super) fn validate(
         &self,
         receipt: &Receipt,
@@ -45,7 +47,7 @@ impl Slot {
                     }),
                 )
             })
-        }; // 只提取身份标量，结束槽借用后才进入 Native/current。
+        }; // Extract scalar identities only and end the slot borrow before Native/current calls.
         let Some((presentation, image, secondary, colors)) = facts else {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         };
@@ -68,7 +70,8 @@ impl Slot {
         no_mask(&self.container, current)?;
         match receipt.presentation {
             PixelPresentation::Image => {
-                // 普通图像没有遮罩角色；外来表示不能借已有 payload 访问其他角色。
+                // Ordinary images have no mask roles; another presentation cannot use this payload to
+                // access absent roles.
                 require(
                     self.foreground.is_none() && self.second_foreground.is_none(),
                     current,
@@ -78,7 +81,8 @@ impl Slot {
                 contents(&self.container, receipt.image, current)?;
             }
             PixelPresentation::OpaqueNeutralMask => {
-                // 白黑路径保持原单遮罩行为，不能因新增两层而残留第二张图。
+                // The white/black path retains single-mask behavior without leaving a second image from
+                // paired roles.
                 color(
                     &self.container,
                     std::ptr::from_ref(&*palette.white) as usize,
@@ -145,7 +149,8 @@ impl Slot {
     }
 }
 
-/// 每组前景/遮罩分别验证；实际 mask.superlayer 也必须仍指向原前景。
+/// Validate foreground/mask pairs separately, including the actual mask parent still pointing to its
+/// original foreground.
 fn mask_group(
     container: &CALayer,
     foreground: &CALayer,
@@ -173,11 +178,12 @@ fn mask_group(
 }
 
 fn children(layer: &CALayer, expected: &[&CALayer], current: &impl Fn() -> bool) -> Result<()> {
-    // SAFETY: 公开数组只比较类型正确的原层身份，不向外方层发送业务消息。
+    // SAFETY: Compare type-correct original layer identities from the public array without business
+    // messages to external layers.
     let actual = checked(current, || unsafe { layer.sublayers() })?;
     let same = if let Some(actual) = actual {
         if checked(current, || actual.len())? != expected.len() {
-            false // 数量变化不能用原私有字段仍持活来冒充挂载成功。
+            false // A changed child count cannot be hidden by original objects still retained in private fields.
         } else {
             let mut same = true;
             for (index, expected) in expected.iter().enumerate() {
@@ -202,10 +208,12 @@ fn parent(layer: &CALayer, expected: &CALayer, current: &impl Fn() -> bool) -> R
 }
 
 fn contents(layer: &CALayer, expected: usize, current: &impl Fn() -> bool) -> Result<()> {
-    // 这次读取只需要身份标量；+0 getter 的临时 claim 必须随本次消费结束，不能留在
-    // 外层事件池中继续持有刚验证过的整组像素，延长到后来关闭正文之后才释放。
+    // This read needs scalar identity only; end the +0 getter temporary claim with this consumption,
+    // rather than retaining it in
+    // an outer event pool that would keep validated pixels alive beyond a later document close.
     let same = autoreleasepool(|_| -> Result<bool> {
-        // SAFETY: 只比较原 opaque CGImage 身份，不把外方 contents 当 CF 图像解引用。
+        // SAFETY: Compare original opaque CGImage identity without dereferencing external contents as a
+        // CF image.
         let actual = checked(current, || unsafe { layer.contents() })?;
         Ok(actual
             .as_deref()
@@ -229,10 +237,12 @@ fn common(
     mask_plane: bool,
     current: &impl Fn() -> bool,
 ) -> Result<()> {
-    // 任一辅助层被隐藏或改透明都会改变实际合成，不能仅凭图像和父关系相同继续签 Ready。
+    // Hiding or fading an auxiliary layer changes actual composition; equal images and parents alone
+    // cannot certify Ready.
     require(!checked(current, || layer.isHidden())?, current)?;
     require(checked(current, || layer.opacity())? == 1.0, current)?;
-    // 实际Z顺序会覆盖children的数组顺序；背景回混不能接受仅数组身份不变的反向叠放。
+    // Actual Z order overrides the child-array order; background remix cannot accept reversed stacking
+    // with equal array identities.
     require(checked(current, || layer.zPosition())? == 0.0, current)?;
     require(checked(current, || layer.frame())? == rect, current)?;
     require(
@@ -246,8 +256,10 @@ fn common(
     let format = checked(current, || layer.contentsFormat())?;
     require(
         checked(current, || {
-            // SAFETY: 系统常量静态有效；实际mask只认单通道hint，其余层仍要求RGBA8。
-            // 外部替换hint会撤权，不能只因原图像身份仍相同而签发Ready。
+            // SAFETY: System constants are static; actual masks require the single-channel hint while
+            // other roles still require RGBA8.
+            // An externally changed hint revokes authority even while the original image identity
+            // remains equal.
             unsafe {
                 format.isEqualToString(if mask_plane {
                     kCAContentsFormatGray8Uint
@@ -261,7 +273,8 @@ fn common(
     let gravity = checked(current, || layer.contentsGravity())?;
     require(
         checked(current, || {
-            // SAFETY: 同一 resize 常量只消费原真实瓦片几何，不接受后继截图缩放。
+            // SAFETY: The resize constant consumes original actual tile geometry without accepting a
+            // scaled successor screenshot.
             unsafe { gravity.isEqualToString(kCAGravityResize) }
         })?,
         current,
@@ -287,14 +300,14 @@ fn no_mask(layer: &CALayer, current: &impl Fn() -> bool) -> Result<()> {
     require(checked(current, || layer.mask())?.is_none(), current)
 }
 fn no_children(layer: &CALayer, current: &impl Fn() -> bool) -> Result<()> {
-    // SAFETY: 标准 CALayer 的公开数组只核空值，不进入任何外方绘制。
+    // SAFETY: Test emptiness of the public standard-CALayer array without entering external drawing.
     let actual = checked(current, || unsafe { layer.sublayers() })?;
     let empty = actual.as_ref().is_none_or(|value| value.is_empty());
     drop(actual);
     require(empty, current)
 }
 fn no_contents(layer: &CALayer, current: &impl Fn() -> bool) -> Result<()> {
-    // SAFETY: opaque getter 只核空，不访问外方对象的 CF 内容。
+    // SAFETY: Test opaque getter emptiness without accessing any external object CF contents.
     require(
         checked(current, || unsafe { layer.contents() })?.is_none(),
         current,

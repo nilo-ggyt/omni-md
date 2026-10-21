@@ -1,4 +1,5 @@
-//! 显式诊断负控持真实PaintUse，让既有主队列事件实际命中Busy；产品路径没有嵌套runloop。
+//! This gated negative control holds actual PaintUse while an existing queued event encounters
+//! contention; production creates no nested run loop.
 
 use super::*;
 
@@ -20,13 +21,16 @@ pub(in crate::native_surface::paged_text_view) fn nested_delivery(
         .ok_or(NativeMarkdownPagedTextViewError::Pending)?;
     if surface.scheduled.get() != Some(serial) || surface.candidate.borrow().is_none() {
         return Err(NativeMarkdownPagedTextViewError::Pending);
-    } // 只能观察真实Pending候选；不能强制owner current或伪造一份session。
+    } // Observe an actual Pending candidate only, without forcing owner authority or fabricating a session.
     let before = surface.steps.get();
     let painting = PaintUse::enter(&surface.painting)?;
-    delivery(); // 测试提供一次真实CFRunLoop交付；此回调不进入产品调度或保存为后续任务。
-    // 在原绘图准入仍被同步栈持有时进入真实 Native 显示入口，覆盖 updateLayer 重入。
-    // 观察公开失败结果，而非直接写内部状态；旧实现会把普通显示等待写成 Pending 首错。
-    // SAFETY: 接收者是仍保活的原 NSView；公开无参 updateLayer 只在当前主线程调用。
+    delivery(); // The harness delivers one actual CFRunLoop turn; this callback is neither product scheduling nor a saved continuation.
+    // Enter the actual Native display method while the synchronous stack retains paint admission,
+    // exercising updateLayer reentry.
+    // Observe the public failure result rather than mutating state; the previous implementation
+    // incorrectly stored display waiting as a primary Pending error.
+    // SAFETY: The receiver is the retained original NSView; call its public no-argument updateLayer on
+    // the current main thread only.
     unsafe {
         let _: () = msg_send![view, updateLayer];
     }
@@ -40,7 +44,7 @@ pub(in crate::native_surface::paged_text_view) fn nested_delivery(
     drop(painting);
     if let Err(error) = reentrant {
         surface.cancel_candidate();
-        return Err(error); // 实际绘图/来源错误继续交付；不能靠验收读取清掉真实失败。
+        return Err(error); // Propagate actual paint/Source failures rather than clearing them through a diagnostic read.
     }
     if let Err(error) = validation {
         surface.cancel_candidate();
@@ -52,5 +56,5 @@ pub(in crate::native_surface::paged_text_view) fn nested_delivery(
             "真实嵌套交付没有保留同候选唯一延续".into(),
         ));
     }
-    Ok(()) // 后继主队列事件仍未执行；actual paint/取消/close由原harness独立消费验证。
+    Ok(()) // The successor event has not run; the original harness independently consumes actual paint, cancellation, and close outcomes.
 }

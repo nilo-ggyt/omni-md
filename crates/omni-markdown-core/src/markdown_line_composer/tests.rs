@@ -1,4 +1,5 @@
-//! 有限合成输入验证真实分项；这里的ItemReady不能代替后继整行的LineEnd。
+//! Real itemization over finite synthetic Sources. ItemReady here does not establish
+//! the subsequent complete line's committed LineEnd.
 
 use super::*;
 mod engine;
@@ -35,6 +36,8 @@ struct Fixture {
 }
 impl Fixture {
     fn new(text: &str) -> Self {
+        // Own an isolated actual UTF-8 file and its original captured Source. The
+        // fixture's directory remains alive until every worker/output is retired.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("真实分项.md");
         std::fs::write(&path, text).unwrap();
@@ -67,6 +70,8 @@ fn budget() -> MarkdownLineComposeBudget {
     }
 }
 fn request(coordinator: &mut MarkdownLineItemCoordinator) -> MarkdownLineStyleRequest {
+    // Advance only original public bounded work. Losing progress or issuing another
+    // terminal answer cannot be hidden as a fabricated Style request.
     for _ in 0..100_000 {
         let step = coordinator.step(budget()).unwrap();
         assert!(
@@ -83,7 +88,8 @@ fn request(coordinator: &mut MarkdownLineItemCoordinator) -> MarkdownLineStyleRe
 
 #[test]
 fn mixed_script_item_factory_uses_actual_source_levels_fonts_and_complete_glyphs() {
-    // Roboto固定夹具实际覆盖三种脚本；不是用.notdef、同语言名或伪换行满足mixed条件。
+    // Actual Roboto covers these three scripts. A .notdef glyph, language label,
+    // or invented line break cannot stand in for genuine mixed-script itemization.
     let fixture = Fixture::new("Office Αλφα Привет office");
     let before = (
         fixture.document.generation(),
@@ -116,6 +122,9 @@ fn mixed_script_item_factory_uses_actual_source_levels_fonts_and_complete_glyphs
                     .unwrap();
             }
             MarkdownLineItemAnswer::ItemReady(facts) => {
+                // Read every actual glyph before dropping this finite item. Its
+                // complete Source coverage, original UBA direction, and paragraph
+                // flags must agree with the preceding public request sequence.
                 let mut item = coordinator.take_item().unwrap();
                 assert_eq!(item.facts(), &facts);
                 assert_eq!(facts.source_utf16.start, next);
@@ -150,6 +159,8 @@ fn mixed_script_item_factory_uses_actual_source_levels_fonts_and_complete_glyphs
                 panic!("无控制夹具不应产生{control:?}")
             }
             MarkdownLineItemAnswer::EndOfSource => {
+                // Completion must cover the actual original Source and all three
+                // scripts, without changing document bytes/generation/history.
                 assert_eq!(next, fixture.source.utf16_len());
                 assert!(items >= 3);
                 assert!(
@@ -176,7 +187,8 @@ fn mixed_script_item_factory_uses_actual_source_levels_fonts_and_complete_glyphs
 fn equal_bytes_foreign_request_cannot_authorize_original_coordinator() {
     let fixture = Fixture::new("same data");
     for same_source in [false, true] {
-        // 同源不同request也必须失败，不能让Source相等掩盖nonce检查缺失。
+        // Distinct requests fail even on the same Source; Source identity cannot
+        // substitute for the one current nonce at the response boundary.
         let other_source = if same_source {
             fixture.source.clone()
         } else {
@@ -206,6 +218,8 @@ fn equal_bytes_foreign_request_cannot_authorize_original_coordinator() {
 
 #[test]
 fn duplicate_response_and_grapheme_internal_style_end_are_rejected() {
+    // A real combining sequence establishes the non-splittable right endpoint.
+    // Separately replay a consumed public response, without mutating private state.
     let fixture = Fixture::new("a\u{301}b");
     let mut split = fixture.coordinator(MarkdownLineComposeCancellation::new());
     let pending = request(&mut split);
@@ -238,6 +252,8 @@ fn duplicate_response_and_grapheme_internal_style_end_are_rejected() {
 
 #[test]
 fn cancel_after_style_request_preserves_source_and_never_constructs_an_item() {
+    // Cancel the actual shared request before accepting its response. The typed
+    // cancellation retires the worker while the original document remains unchanged.
     let fixture = Fixture::new("queued style");
     let cancel = MarkdownLineComposeCancellation::new();
     let mut coordinator = fixture.coordinator(cancel.clone());
@@ -258,6 +274,8 @@ fn cancel_after_style_request_preserves_source_and_never_constructs_an_item() {
 
 #[test]
 fn empty_source_has_no_fake_item_and_zero_budget_is_terminal() {
+    // Original empty input reaches actual EOF without an invented nonempty item.
+    // Invalid work budget separately poisons its real candidate rather than resume.
     let empty = Fixture::new("");
     let mut coordinator = empty.coordinator(MarkdownLineComposeCancellation::new());
     for _ in 0..1000 {
@@ -315,7 +333,8 @@ fn registered_font_response_requires_original_catalog_and_live_palette_value() {
         }
     }
     assert!(completed, "有限注册字体输入必须真实达到ItemReady");
-    // Response内部只保原Font而不冒充注册owner；palette真实归还后，旧弱许可仍必须拒绝。
+    // A response retaining its selected font is not the registration's owner. After
+    // the actual palette value drops, the original weak registration must fail.
     let mut expired = fixture.coordinator(MarkdownLineComposeCancellation::new());
     let pending = request(&mut expired);
     let response = pending

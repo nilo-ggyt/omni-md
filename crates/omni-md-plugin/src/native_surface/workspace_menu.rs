@@ -1,8 +1,8 @@
-//! 文档命令按固定职责分组；菜单只持静态标签/有限tag，不保存正文、路径或第二控制器。
+//! Group document commands by fixed responsibility; menus retain static labels/bounded tags, never body text, paths, or another controller.
 
 use super::*;
 
-/// 原“更多”菜单的五个当前笔记动作；它们不使用侧栏行号，也不占用格式分组的位置。
+/// Five existing current-note actions use no sidebar row index and remain separate from format groups.
 pub(super) const CURRENT_NOTE_ACTIONS: &[(isize, &str)] = &[
     (30, "重命名…"),
     (31, "移动…"),
@@ -11,7 +11,7 @@ pub(super) const CURRENT_NOTE_ACTIONS: &[(isize, &str)] = &[
     (34, "删除…"),
 ];
 
-/// 固定两层菜单的数据声明同时驱动真实构造和功能保留测试。
+/// One fixed two-level declaration drives actual construction and retained-feature checks.
 pub(super) struct WorkspaceMenuGroup {
     pub(super) title: &'static str,
     pub(super) items: &'static [(isize, &'static str)],
@@ -66,21 +66,21 @@ pub(super) const GROUPS: &[WorkspaceMenuGroup] = &[
     },
 ];
 
-/// 这里只补菜单实际需要的文稿条件；导入笔记始终可用，表格保留原独立准入拥有者。
-/// 折叠消费已接纳的源码模式，不能仅因打开了笔记就把预览中的折叠操作强行启用。
+/// Supply document prerequisites only; import stays available and table insertion keeps its separate existing admission owner.
+/// Folding consumes the accepted source mode, rather than becoming available in preview merely because a document exists.
 fn document_menu_action_available(
     tag: isize,
     has_document: bool,
     mode: MarkdownPresentationMode,
 ) -> Option<bool> {
     match tag {
-        20 | 21 => Some(has_document && mode == MarkdownPresentationMode::Source),
-        1 | 3..=8 | 30..=34 | 100..=112 | 115..=116 => Some(has_document),
-        _ => None, // 导入、分组、复制和表格继续由原各自入口决定，不改其额外启用条件。
+        20 | 21 => Some(has_document && mode == MarkdownPresentationMode::Source), // Folding is source-only.
+        1 | 3..=8 | 30..=34 | 100..=112 | 115..=116 => Some(has_document), // These require a real document.
+        _ => None, // Import, grouping, copy, and table retain their own availability rules.
     }
 }
 
-/// 创建一个实际叶项，target借用同一controller；父menu拥有它直到accepted清理。
+/// Create one actual leaf borrowing the same controller as target; the parent menu owns it through accepted-close cleanup.
 pub(super) fn workspace_menu_item(
     title: &str,
     tag: isize,
@@ -88,7 +88,7 @@ pub(super) fn workspace_menu_item(
     has_document: bool,
     mtm: MainThreadMarker,
 ) -> Retained<NSMenuItem> {
-    // SAFETY: 固定selector采用NSMenuItem action ABI；controller由当前surface强持有到detach之后。
+    // SAFETY: The fixed selector uses the NSMenuItem action ABI; the surface retains controller through detachment.
     let item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -98,11 +98,11 @@ pub(super) fn workspace_menu_item(
         )
     };
     item.setTag(tag);
-    // SAFETY: target为借用关系，所有此函数创建的item在accepted期间逐项置nil后再释放controller。
+    // SAFETY: Target is nonowning; accepted close clears every created item's target before controller release.
     unsafe {
         item.setTarget(Some(controller));
     }
-    // 初次空库和已打开笔记共用同一规则；标准菜单关闭了自动启停，不能依赖外部 responder 补齐。
+    // Empty/open-note states share the rule; disabled automatic validation cannot rely on external responders to fill it.
     if let Some(available) = document_menu_action_available(
         tag,
         has_document,
@@ -113,7 +113,7 @@ pub(super) fn workspace_menu_item(
     item
 }
 
-/// 文档菜单保留完整文件与格式命令；可见工具栏仍复用这些原selector和tag。
+/// Preserve existing file/format commands; visible toolbar actions reuse the original selectors and tags.
 pub(super) fn install_native_markdown_workspace_menu(
     actions: &NSPopUpButton,
     controller: &NativeMarkdownController,
@@ -122,12 +122,12 @@ pub(super) fn install_native_markdown_workspace_menu(
     mtm: MainThreadMarker,
 ) -> Result<(), String> {
     let root = actions.menu().ok_or("文档菜单不可用")?;
-    // 各叶项明确配置可用性，不能让AppKit按未声明的外部responder猜测启用状态。
+    // Set leaf availability explicitly instead of letting AppKit infer it from undeclared external responders.
     root.setAutoenablesItems(false);
     let save = workspace_menu_item("保存", 1, controller, has_document, mtm);
     save.setKeyEquivalent(ns_string!("s"));
     root.addItem(&save);
-    // SAFETY: 复制沿既有selector直接执行同一显式剪贴板事务，不新增命令或正文镜像。
+    // SAFETY: Copy uses the existing selector and explicit clipboard transaction, without another command or body mirror.
     let copy = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -136,7 +136,7 @@ pub(super) fn install_native_markdown_workspace_menu(
             ns_string!(""),
         )
     };
-    // SAFETY: 同一surface强持controller，accepted时由本模块断开此借用target/action。
+    // SAFETY: The surface retains controller; this module detaches its nonowning target/action on accepted close.
     unsafe {
         copy.setTarget(Some(controller));
     }
@@ -145,28 +145,28 @@ pub(super) fn install_native_markdown_workspace_menu(
     assert!(controller.ivars().copy_document_menu_item.set(copy).is_ok());
     root.addItem(&NSMenuItem::separatorItem(mtm));
     for &(tag, title) in CURRENT_NOTE_ACTIONS {
-        // 当前文档即使不在侧栏的有限页内，也保留原五项直接入口；空态不提供假目标。
+        // Current-note actions work outside the bounded sidebar page; empty state supplies no fabricated note target.
         let item = workspace_menu_item(title, tag, controller, has_document, mtm);
         root.addItem(&item);
     }
     root.addItem(&NSMenuItem::separatorItem(mtm));
     for group in GROUPS {
-        // 分组数固定5，每个子菜单最多8项；没有动态全库/正文扫描或无限层级。
+        // Five fixed groups and at most eight children need no full-workspace/body scan or unbounded hierarchy.
         let submenu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(group.title));
         submenu.setAutoenablesItems(false);
         for &(tag, title) in group.items {
-            // 保留的日常格式与文件动作仍使用原 tag；已删除的功能没有可执行叶项。
+            // Retained daily format/file actions keep original tags; removed features have no executable leaf.
             let item = workspace_menu_item(title, tag, controller, has_document, mtm);
             if tag == 118 {
-                // 表格仅在真实文档存在时启用，后续install/empty沿原controller方法更新此item。
+                // Table requires a real document; later install/empty publication updates this same item through controller.
                 item.setEnabled(has_document);
                 assert!(controller.ivars().table_menu_item.set(item.clone()).is_ok());
             }
             submenu.addItem(&item);
         }
-        // 每个显式menu和其实际item独立登记，不能只跟踪最上层而漏掉子菜单资源。
+        // Register each menu and its items independently; tracking only the root would omit submenu resources.
         ledger.include_menu("workspace.actions.submenu", &submenu)?;
-        // SAFETY: 分组没有action/target，不可作为命令叶执行。
+        // SAFETY: A grouping item has no action/target and cannot execute as a command leaf.
         let section = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
@@ -181,8 +181,8 @@ pub(super) fn install_native_markdown_workspace_menu(
     ledger.include_menu("workspace.actions.menu", &root)
 }
 
-/// 同步原固定两层菜单的文稿叶项；空库、新建成功和最后笔记删除沿同一文稿状态发布。
-/// 表格仍由原独立入口启停；每个 Native getter/setter 后同时拒绝关闭、换文稿或较新的模式。
+/// Synchronize the same two-level leaves for empty workspace, successful creation, and final-note deletion.
+/// Table retains its own owner; native getters/setters recheck close, document availability, and accepted mode.
 pub(super) fn set_current_note_actions_available(
     controller: &NativeMarkdownController,
     available: bool,
@@ -194,7 +194,7 @@ pub(super) fn set_current_note_actions_available(
             && native_markdown_controller_has_foreground_authority(controller)
     };
     if !current() {
-        return; // 构造时叶项已按has_document设置；未发布或已关闭的窗口不补建菜单。
+        return; // Construction already sets availability; unpublished or closed windows cannot reconstruct menus here.
     }
     let controls = controller
         .ivars()
@@ -208,7 +208,7 @@ pub(super) fn set_current_note_actions_available(
         return;
     }
     let Some(menu) = popup.menu() else {
-        return; // 已拆除的菜单没有后继启停权限。
+        return; // A detached menu grants no authority to update a successor menu.
     };
     if !current() {
         return;
@@ -218,6 +218,7 @@ pub(super) fn set_current_note_actions_available(
         return;
     }
     for index in 0..items.count() {
+        // Each native read/setter must preserve this captured availability and mode, without recapturing new document state.
         if !current() {
             return;
         }
@@ -233,7 +234,7 @@ pub(super) fn set_current_note_actions_available(
             item.setEnabled(enabled);
         }
         if !current() {
-            return; // 顶层 setter 也可能重入；旧文稿不能继续修改新的子菜单状态。
+            return; // Top-level setters may reenter; old document state cannot continue updating replacement submenus.
         }
         let submenu = item.submenu();
         if !current() {
@@ -244,7 +245,7 @@ pub(super) fn set_current_note_actions_available(
         if !current() {
             return;
         }
-        // 文档菜单只有既有两层；只访问本项实际子菜单，不递归系统菜单或增加状态库存。
+        // Visit only this item's actual second level, without recursing through system menus or creating another state inventory.
         for child_index in 0..children.count() {
             if !current() {
                 return;
@@ -264,7 +265,7 @@ pub(super) fn set_current_note_actions_available(
     }
 }
 
-/// 仅当前自有工具栏按钮或menu实际leaf可贡献tag，NSPopUpButton本身不发第二次action。
+/// Only current owned toolbar buttons or actual menu leaves supply tags; NSPopUpButton itself cannot issue a duplicate action.
 pub(super) fn native_markdown_workspace_menu_action(
     controller: &NativeMarkdownController,
     sender: &AnyObject,
@@ -272,7 +273,7 @@ pub(super) fn native_markdown_workspace_menu_action(
     if !native_markdown_controller_is_current(controller)
         || controller.ivars().close_finalizer_scheduled.get()
     {
-        // 迟到/外来控制器不因menu仍被框架短暂持有就恢复操作权限。
+        // Framework menu retention cannot restore authority to a late or foreign controller.
         return None;
     }
     let controls = controller.ivars().workspace_controls.get()?;
@@ -282,7 +283,7 @@ pub(super) fn native_markdown_workspace_menu_action(
             .skip(NATIVE_MARKDOWN_TOOLBAR_START)
             .any(|control| std::ptr::eq(&**control, button.as_super()));
         let tag = button.tag();
-        // 只有实际安装的这些动作按钮可直达；外方改tag不能把header按钮变成任意文件命令。
+        // Only installed action buttons may dispatch these tags; a changed header tag cannot authorize arbitrary file commands.
         return (owned
             && matches!(tag, 3 | 6 | 7 | 22 | 23 | 100..=112 | 115..=116 | 118)
             && native_markdown_controller_is_current(controller)
@@ -293,12 +294,12 @@ pub(super) fn native_markdown_workspace_menu_action(
     let mut owned = false;
     for control in controls {
         let Some(popup) = control.downcast_ref::<NSPopUpButton>() else {
-            continue; // 按钮和搜索字段没有菜单，不从任意系统层级寻找可执行tag。
+            continue; // Buttons/search fields grant no menu authority; do not search unrelated system hierarchies for tags.
         };
         let Some(menu) = popup.menu() else { continue };
         let items = menu.itemArray();
         for index in 0..items.count() {
-            // 文档菜单固定两层；只查实际配置的有限菜单，不沿系统responder寻找命令。
+            // Inspect only the configured two-level menu, without discovering commands through system responders.
             let candidate = items.objectAtIndex(index);
             if std::ptr::eq(&*candidate, item) {
                 owned = true;
@@ -307,7 +308,7 @@ pub(super) fn native_markdown_workspace_menu_action(
             if let Some(submenu) = candidate.submenu() {
                 let children = submenu.itemArray();
                 for child in 0..children.count() {
-                    // 仍逐个比较活对象身份，不以标题或tag猜归属。
+                    // Compare live identities, never guessing ownership from title or tag.
                     if std::ptr::eq(&*children.objectAtIndex(child), item) {
                         owned = true;
                         break;
@@ -325,7 +326,7 @@ pub(super) fn native_markdown_workspace_menu_action(
         || GROUPS
             .iter()
             .any(|group| group.items.iter().any(|entry| entry.0 == tag));
-    // 上方Native getter可重入关闭；最后再纯核owner，不能将活item当作新会话权限。
+    // Native getters may reenter close; final pure owner checks prevent a live old item from authorizing a new session.
     (owned
         && known
         && native_markdown_controller_is_current(controller)
@@ -333,33 +334,33 @@ pub(super) fn native_markdown_workspace_menu_action(
     .then_some(tag)
 }
 
-/// accepted后对固定两层项目菜单拆回调；不重建菜单、不触碰未知系统菜单树。
+/// Detach callbacks from the owned two-level menu after close acceptance, without rebuilding or touching unknown system trees.
 pub(super) fn detach_native_markdown_workspace_menu(controller: &NativeMarkdownController) {
     let Some(controls) = controller.ivars().workspace_controls.get() else {
-        // 构造尚未完成时没有已发布菜单，不补建替身。
+        // Incomplete construction has no published menu; cleanup grants no authority to create a replacement.
         return;
     };
     for control in controls {
         let Some(popup) = control.downcast_ref::<NSPopUpButton>() else {
-            continue; // 按钮/搜索字段的借用边已由原controls拆图处理，不查外方菜单。
+            continue; // Existing control teardown owns button/search targets; do not inspect foreign menus.
         };
         let Some(menu) = popup.menu() else { continue };
         let items = menu.itemArray();
         for index in 0..items.count() {
-            // 文档固定两层均为实际自有菜单，不遍历系统私有子树。
+            // Both configured document-menu levels are owned here; never traverse a private system subtree.
             let item = items.objectAtIndex(index);
             if let Some(submenu) = item.submenu() {
                 let children = submenu.itemArray();
                 for child in 0..children.count() {
                     let child = children.objectAtIndex(child);
-                    // SAFETY: 这些全为本模块配置的主线程叶项，置nil只解除项目target/action。
+                    // SAFETY: These are main-thread leaves configured here; nil removes only project target/action edges.
                     unsafe {
                         child.setTarget(None);
                         child.setAction(None);
                     }
                 }
             }
-            // SAFETY: 顶层同属本项目配置，分组和隐藏标题无action时nil清理亦为幂等。
+            // SAFETY: Top-level items are also owned here; nil cleanup is idempotent for groups and inert titles.
             unsafe {
                 item.setTarget(None);
                 item.setAction(None);

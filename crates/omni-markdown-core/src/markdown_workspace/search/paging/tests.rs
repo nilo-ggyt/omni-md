@@ -1,12 +1,14 @@
-//! 使用真实临时库验证续页边界与取消；不读取用户目录。
+//! Verify continuation and cancellation through real isolated temporary vaults.
 use super::*;
 
-/// 每种命中跨过多页边界；文件写入顺序刻意与排名相反。
+/// Cross several pages of each match class with creation order deliberately
+/// reversed from the public title-first/path ordering.
 #[test]
 fn all_pages_preserve_title_priority_and_path_order_without_loss_or_duplicates() {
     let temporary = tempfile::tempdir().unwrap();
     for index in (0..33).rev() {
-        // 正文命中排名较低，标题不含查询，保证跨越score边界后仍能续页。
+        // Body-only hits rank lower, ensuring continuation must cross the score
+        // boundary rather than merely paginate title matches.
         fs::write(
             temporary.path().join(format!("body-{index:02}.md")),
             "合成 needle 正文",
@@ -14,21 +16,22 @@ fn all_pages_preserve_title_priority_and_path_order_without_loss_or_duplicates()
         .unwrap();
     }
     for index in (0..20).rev() {
-        // 标题命中不依赖正文；相同score以完整相对路径排序。
+        // Title hits need no body match; their full relative paths break equal scores.
         fs::write(
             temporary.path().join(format!("needle-title-{index:02}.md")),
             "合成正文",
         )
         .unwrap();
     }
-    let workspace = MarkdownWorkspace::with_root(temporary.path().to_owned());
+    let workspace = MarkdownWorkspace::new(temporary.path().to_owned());
     let session = workspace.open_session().unwrap();
     let cancelled = AtomicBool::new(false);
     let mut cursor = None;
     let mut actual = Vec::new();
     let mut pages = 0;
     loop {
-        // 每次仅13+sentinel候选；总结果超过core旧Vec上限50，不可假装50后已穷尽。
+        // Retain only 13 plus a sentinel per page. The total exceeds the older
+        // complete-vector cap, so reaching 50 cannot masquerade as exhaustion.
         let page = session
             .search_notes_page_cancellable("needle", 13, cursor.as_ref(), &cancelled)
             .unwrap();
@@ -37,7 +40,8 @@ fn all_pages_preserve_title_priority_and_path_order_without_loss_or_duplicates()
         cursor = page.next;
         pages += 1;
         if cursor.is_none() {
-            // 只有真实穷尽结束，测试不能用固定页数提前丢掉尾项。
+            // Stop on actual exhaustion, not a fixed iteration count that could
+            // silently drop valid trailing results.
             break;
         }
         assert!(pages < 6);
@@ -50,11 +54,11 @@ fn all_pages_preserve_title_priority_and_path_order_without_loss_or_duplicates()
     assert_eq!(pages, 5);
 }
 
-/// K、K+1和恰好整页的终止标志不能互相混淆。
+/// Distinguish K, K+1, and an exact multiple of K when proving termination.
 #[test]
 fn continuation_requires_an_observed_extra_match() {
     for count in [12, 13, 14, 26] {
-        // 每个库独立建立查询代次，防止其他测试会话影响cursor。
+        // Each real vault owns independent query generations and cursor authority.
         let temporary = tempfile::tempdir().unwrap();
         for index in 0..count {
             fs::write(
@@ -63,7 +67,7 @@ fn continuation_requires_an_observed_extra_match() {
             )
             .unwrap();
         }
-        let workspace = MarkdownWorkspace::with_root(temporary.path().to_owned());
+        let workspace = MarkdownWorkspace::new(temporary.path().to_owned());
         let session = workspace.open_session().unwrap();
         let cancelled = AtomicBool::new(false);
         let first = session
@@ -72,7 +76,8 @@ fn continuation_requires_an_observed_extra_match() {
         assert_eq!(first.results.len(), count.min(13));
         assert_eq!(first.next.is_some(), count > 13);
         if let Some(cursor) = first.next {
-            // 26条的第二页恰好13，仍必须next=None；14条则只返回最后1条。
+            // The second page of 26 is exactly full yet terminal; 14 returns
+            // just its one actual trailing match.
             let next = session
                 .search_notes_page_cancellable("needle", 13, Some(&cursor), &cancelled)
                 .unwrap();
@@ -82,7 +87,8 @@ fn continuation_requires_an_observed_extra_match() {
     }
 }
 
-/// 错查询、跨库、旧代次与预取消均拒绝，不能重放旧页或取消另一查询。
+/// Reject changed queries, cross-vault credentials, old generations, and
+/// pre-cancelled work without replaying pages or revoking another query.
 #[test]
 fn cursor_is_bound_to_query_root_and_session_generation() {
     let temporary = tempfile::tempdir().unwrap();
@@ -93,19 +99,20 @@ fn cursor_is_bound_to_query_root_and_session_generation() {
         )
         .unwrap();
     }
-    let workspace = MarkdownWorkspace::with_root(temporary.path().to_owned());
+    let workspace = MarkdownWorkspace::new(temporary.path().to_owned());
     let session = workspace.open_session().unwrap();
     let cancelled = AtomicBool::new(false);
     let first = session
         .search_notes_page_cancellable(" needle ", 1, None, &cancelled)
         .unwrap();
     let cursor = first.next.unwrap();
+    // Query and root/session identity are independent continuation preconditions.
     assert!(matches!(
         session.search_notes_page_cancellable("different", 1, Some(&cursor), &cancelled),
         Err(MarkdownWorkspaceError::InvalidSearchCursor)
     ));
     let other_root = tempfile::tempdir().unwrap();
-    let other_workspace = MarkdownWorkspace::with_root(other_root.path().to_owned());
+    let other_workspace = MarkdownWorkspace::new(other_root.path().to_owned());
     let other = other_workspace.open_session().unwrap();
     assert!(matches!(
         other.search_notes_page_cancellable("needle", 1, Some(&cursor), &cancelled),
@@ -117,13 +124,15 @@ fn cursor_is_bound_to_query_root_and_session_generation() {
         Err(MarkdownWorkspaceError::SearchSuperseded)
     ));
     cancelled.store(false, AtomicOrdering::Release);
-    // 预取消没有取得查询权限，因此不能破坏仍有效的同一cursor。
+    // Pre-cancellation acquired no query authority and therefore must preserve
+    // this still-current cursor when the caller resets its own token.
     assert!(
         session
             .search_notes_page_cancellable("needle", 1, Some(&cursor), &cancelled)
             .is_ok()
     );
     session.cancel_search();
+    // Explicit session cancellation permanently revokes the old credentials.
     assert!(matches!(
         session.search_notes_page_cancellable("needle", 1, Some(&cursor), &cancelled),
         Err(MarkdownWorkspaceError::SearchSuperseded)
@@ -133,6 +142,8 @@ fn cursor_is_bound_to_query_root_and_session_generation() {
         .unwrap()
         .next
         .unwrap();
+    // A genuinely new query supersedes the fresh generation even when the old
+    // cursor's root and query text still match its own original values.
     session
         .search_notes_page_cancellable("different", 1, None, &cancelled)
         .unwrap();
@@ -142,7 +153,7 @@ fn cursor_is_bound_to_query_root_and_session_generation() {
     ));
 }
 
-/// 修改与根目录重建也不能复用原查询的排名前缀。
+/// Local mutations and a recreated root cannot reuse the previous query's rank prefix.
 #[test]
 fn local_mutation_and_replaced_root_revoke_continuation() {
     let temporary = tempfile::tempdir().unwrap();
@@ -151,7 +162,7 @@ fn local_mutation_and_replaced_root_revoke_continuation() {
     for index in 0..3 {
         fs::write(root.join(format!("needle-{index}.md")), "needle").unwrap();
     }
-    let workspace = MarkdownWorkspace::with_root(root.clone());
+    let workspace = MarkdownWorkspace::new(root.clone());
     let session = workspace.open_session().unwrap();
     let cancelled = AtomicBool::new(false);
     let cursor = session
@@ -160,6 +171,7 @@ fn local_mutation_and_replaced_root_revoke_continuation() {
         .next
         .unwrap();
     session.create_note("", "needle-new").unwrap();
+    // Use an actual public creation to revoke the original collection's query.
     assert!(matches!(
         session.search_notes_page_cancellable("needle", 1, Some(&cursor), &cancelled),
         Err(MarkdownWorkspaceError::SearchSuperseded)
@@ -170,6 +182,8 @@ fn local_mutation_and_replaced_root_revoke_continuation() {
         .next
         .unwrap();
     fs::rename(&root, temporary.path().join("old-vault")).unwrap();
+    // Reusing the root pathname with a different real inode must invalidate
+    // continuation independently of its matching string path.
     fs::create_dir(&root).unwrap();
     assert!(matches!(
         session.search_notes_page_cancellable("needle", 1, Some(&fresh), &cancelled),
@@ -190,7 +204,7 @@ fn content_publications_revoke_old_cursor_but_clean_save_preserves_it() {
         )
         .unwrap();
     }
-    let workspace = MarkdownWorkspace::with_root(temporary.path().to_owned());
+    let workspace = MarkdownWorkspace::new(temporary.path().to_owned());
     let session = workspace.open_session().unwrap();
     let cancelled = AtomicBool::new(false);
     let mut document = session.open_document_buffer("needle-0.md").unwrap();
@@ -199,6 +213,7 @@ fn content_publications_revoke_old_cursor_but_clean_save_preserves_it() {
         .unwrap();
     let authorization = published.authority;
     let cursor = published.next.unwrap();
+    // A clean save changes no text-derived ranking and preserves current credentials.
     session.save_document_buffer(&mut document).unwrap();
     assert!(authorization.is_current(&session, "needle"));
     assert!(
@@ -214,6 +229,7 @@ fn content_publications_revoke_old_cursor_but_clean_save_preserves_it() {
             crate::MarkdownTextSelection::caret(5),
         )
         .unwrap();
+    // Actual canonical editing and mmap persistence revoke the older query.
     session.save_document_buffer(&mut document).unwrap();
     assert!(matches!(
         session.search_notes_page_cancellable("needle", 1, Some(&cursor), &cancelled),
@@ -241,12 +257,13 @@ fn content_publications_revoke_old_cursor_but_clean_save_preserves_it() {
     assert!(!pending_last.authority.is_current(&session, "needle"));
 }
 
-/// 末页没有next仍须携带可撤销权限；超界查询不能消耗当前有效代次。
+/// A terminal page still needs revocable authority, while rejected raw queries
+/// must not consume the currently valid generation.
 #[test]
 fn last_page_authority_and_raw_query_budget_are_enforced_before_publication() {
     let temporary = tempfile::tempdir().unwrap();
     fs::write(temporary.path().join("needle.md"), "tiny").unwrap();
-    let workspace = MarkdownWorkspace::with_root(temporary.path().to_owned());
+    let workspace = MarkdownWorkspace::new(temporary.path().to_owned());
     let session = workspace.open_session().unwrap();
     let cancelled = AtomicBool::new(false);
     let page = session
@@ -259,7 +276,8 @@ fn last_page_authority_and_raw_query_budget_are_enforced_before_publication() {
         format!("{}needle", " ".repeat(128)),
         format!("needle{}", " ".repeat(128)),
     ] {
-        // 原始padding超过128scalar直接拒绝，不能先trim接受或推进epoch。
+        // Reject padding beyond the 128-scalar raw limit before trim can accept
+        // the query or allocate a new generation.
         assert!(matches!(
             session.search_notes_page_cancellable(&query, 13, None, &cancelled),
             Err(MarkdownWorkspaceError::InvalidSearchCursor)

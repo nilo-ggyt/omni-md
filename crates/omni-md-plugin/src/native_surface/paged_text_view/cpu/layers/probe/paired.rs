@@ -1,4 +1,5 @@
-//! 真实五层配对图的像素差分与安装中途撤权；只用固定合成位图，不接触文稿或产品交互。
+//! Exercise actual five-layer paired composition, pixel differences, and interrupted installation with
+//! fixed synthetic bitmaps only.
 
 use super::super::super::calibration::Calibrations;
 use super::super::slot::{AssignmentPoint, Layout, Palette, Slot};
@@ -19,7 +20,8 @@ impl PaletteCase {
     }
 }
 
-/// 左瓦片逐像素使用实际 sRGB 混色，右瓦片保留半透明彩色；两者必须同帧精确合成。
+/// The left tile uses actual per-pixel sRGB blends and the right retains translucent color; both must
+/// compose exactly in one frame.
 fn fixture(
     source: &mut Canvas,
     counters: Arc<NativeMarkdownViewportPixels>,
@@ -52,7 +54,8 @@ fn fixture_with_prior(
     );
     for y in 0..HEIGHT {
         for x in 0..512 {
-            // 同时改变行和列，错误的顶底翻转、mask 对调或 stride 都不能被恒定行隐藏。
+            // Vary both rows and columns so reversed orientation, exchanged masks, or wrong stride
+            // cannot hide in constant rows.
             let alpha = ((x + y * 7) & 255) as f64 / 255.0;
             CGContext::set_rgb_fill_color(
                 Some(&source.context),
@@ -69,8 +72,10 @@ fn fixture_with_prior(
     }
     CGContext::flush(Some(&source.context));
     if matches!(case, PaletteCase::GlyphColors) {
-        // 这些有限原色取自实际字形输出，含同前景双遮罩无法表示的161820。
-        // 这里仅构造精确像素运输控制，真实字体/选区绘制由独立大窗场景验证。
+        // These bounded colors were observed in actual glyph output, including 161820 that
+        // same-foreground paired masks cannot express.
+        // This controls exact pixel transport only; independent large-window scenarios own actual
+        // font/selection-paint verification.
         let colors = [
             [19, 21, 28, 255],
             [219, 224, 235, 255],
@@ -91,14 +96,16 @@ fn fixture_with_prior(
         ];
         for y in 0..HEIGHT {
             for x in 0..512 {
-                // 原始二维颜色分布不做近似；翻转、交换mask或错误stride都必须被差分发现。
+                // Preserve exact 2D colors so pixel comparison detects flips, swapped masks, and wrong
+                // stride.
                 let pixel = colors[(x + y * 7) % colors.len()];
                 source.pixels[(y * WIDTH + x) * 4..][..4].copy_from_slice(&pixel);
             }
         }
     }
     if change_pixel {
-        // 只把一个真实像素替换成色表内的另一实际颜色；端点、几何和其它瓦片均不变。
+        // Replace one actual pixel with another color already in its palette, preserving endpoints,
+        // geometry, and other tiles.
         let first: [u8; 4] = source.pixels[..4].try_into().unwrap();
         let other: [u8; 4] = source.pixels[4..512 * 4]
             .as_chunks::<4>()
@@ -115,7 +122,7 @@ fn fixture_with_prior(
         }
     }
     let mut bitmap = TiledBitmap::new(WIDTH, HEIGHT, counters.clone())?;
-    calibrations.begin_frame(); // 同一Surface的后继候选只开放本帧额度，原纯表继续逐色认证。
+    calibrations.begin_frame(); // A successor candidate on the same surface opens this frame quota only; original pure tables still certify every color.
     while let Some(tile) = bitmap.next_tile() {
         let writable = bitmap.begin_tile(tile)?;
         let row = CGBitmapContextGetBytesPerRow(Some(writable.context()));
@@ -124,7 +131,8 @@ fn fixture_with_prior(
             return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
         }
         for y in 0..tile.height {
-            // SAFETY: 唯一可写 context 覆盖原 tile 的 stride*height；仅写有效像素，不跨 Native 借用。
+            // SAFETY: The unique writable context covers tile stride*height; write active pixels only
+            // and end borrows before Native calls.
             let target = unsafe {
                 std::slice::from_raw_parts_mut(data.cast::<u8>().add(y * row), tile.width * 4)
             };
@@ -134,7 +142,7 @@ fn fixture_with_prior(
         let prepared = bitmap.prepare_tile(writable)?;
         let pairs = match prepared.mask_request() {
             Some(request) => calibrations.pairs(&request, counters.clone(), &|| Ok(()))?,
-            None => None, // 真透明瓦片不取得任何双遮罩提案，保留原 RGBA。
+            None => None, // An actually transparent tile receives no paired-mask proposal and retains original RGBA.
         };
         bitmap.finish_prepared(prepared, pairs.as_ref(), prior)?;
     }
@@ -153,7 +161,8 @@ fn fixture_with_prior(
     Ok(frame)
 }
 
-/// 等值重绘必须成对复用；只改一像素则两张图都不能借旧身份，即使其中一平面的字节恰好相同。
+/// Equal redraws reuse the pair together; changing one pixel replaces both image identities even if one
+/// plane bytes happen to match.
 fn paired_reuse(case: PaletteCase) -> Result<()> {
     let counters = Arc::new(NativeMarkdownViewportPixels::default());
     let observer = counters.observer();
@@ -167,8 +176,10 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
         backing.addSublayer(pool.mount());
         let mut weaks = pool.weaks();
         weaks.push(layer_weak(&backing));
-        // 原帧、等值后继和真实单像素修改共享同一有限纯表，模拟Surface的真实存活期。
-        // 每次仍走原Native层发布和完整RGBA差分，不能用复用次数证明颜色正确。
+        // Original, equal, and one-pixel-changed frames share bounded pure tables for the same
+        // surface-like lifetime.
+        // Each still uses actual Native publication and full RGBA comparison; reuse counts cannot prove
+        // color correctness.
         let mut calibrations = Calibrations::default();
         let result = (|| -> Result<()> {
             let original = fixture_with_prior(
@@ -182,14 +193,18 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
             let original_publication =
                 render_exact(&pool, &backing, &original, &source, bounds, None)?;
             weaks.extend(pool.weaks());
-            // 从真实挂载点取原组身份；等值重绘应保持这张 Native 图，而非另建空壳换组。
-            // SAFETY: 前一步完整 Native 验证已核本 mount 的标准 CALayer 子数组。
+            // Read original group identity from the actual mount; equal redraw should preserve that
+            // Native graph rather than swap new shells.
+            // SAFETY: Complete Native validation already verified the standard CALayer child array on
+            // this mount.
             let original_group = unsafe { pool.mount().sublayers() }
                 .filter(|children| children.len() == 1)
                 .map(|children| children.objectAtIndex(0))
                 .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
-            // 从已经完整显示的真实数组取得两个槽的弱身份；不借私有 slots 或强持
-            // 被替换的旧容器，否则会干扰后面的实际析构与 provider 释放证明。
+            // Read two weak slot identities from the completely published actual array, without
+            // private-slot access or strong claims on
+            // replaced old containers that would interfere with actual destruction and provider-release
+            // observation.
             let original_slots = {
                 // SAFETY: the retained fixture group is used on main and contains only CALayer
                 // children installed by LayerPool; the returned typed array is inspected synchronously.
@@ -217,8 +232,10 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
                 bounds,
                 Some(&original_publication),
             )?;
-            // 仍逐像素核真实合成；Native 组身份不变同时证明没有重交一组等值图层。
-            // SAFETY: 同上，只从原 mount 的实际标准子层取得身份，不读取私有计数。
+            // Continue exact composition comparison; unchanged actual group identity also establishes
+            // no resubmitted group of equal layers.
+            // SAFETY: Read identities from original mount standard children only, without private
+            // counter inspection.
             let same_native_group = unsafe { pool.mount().sublayers() }.is_some_and(|children| {
                 children.len() == 1
                     && std::ptr::eq::<CALayer>(&*children.objectAtIndex(0), &*original_group)
@@ -241,8 +258,10 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
                 Some(&same_publication),
             )?;
             weaks.extend(pool.weaks());
-            // 同几何只有左格真实变色；右格除了 CGImage 相同，还必须保持原 Native
-            // 容器及 parent。整组重建虽然像素也能正确，仍不能满足本次资源复用契约。
+            // Only the left tile changes color under the same geometry; beyond equal CGImage, the right
+            // tile must retain its original Native
+            // container and parent. Rebuilding the group may render correct pixels but would violate
+            // this resource-reuse contract.
             // SAFETY: this live pool mount belongs to the main-thread fixture and its children
             // were installed exclusively through the CALayer sublayer API.
             let partial_group_same = unsafe { pool.mount().sublayers() }.is_some_and(|children| {
@@ -309,8 +328,8 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
             }
             Ok(())
         })();
-        let detached = pool.detach(&backing); // 任何差分或构造失败都先清原Native关系，不靠早返越过归还。
-        drop((calibrations, source, pool, backing)); // Surface结束同时归还纯表及真实provider/context。
+        let detached = pool.detach(&backing); // Clear original Native relationships after comparison/construction failure instead of bypassing release on early return.
+        drop((calibrations, source, pool, backing)); // Surface-like teardown returns pure tables and actual providers/contexts together.
         CATransaction::flush();
         Ok((result, detached, weaks))
     })?;
@@ -321,7 +340,8 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
     Ok(())
 }
 
-/// 同一实际Native图发布后，完整比较原RGBA图合成结果；配对与半透明右格均不能丢色。
+/// After actual Native publication, compare complete original RGBA composition, preserving paired
+/// colors and the translucent right tile.
 fn render_exact(
     pool: &LayerPool,
     backing: &CALayer,
@@ -338,7 +358,8 @@ fn render_exact(
     CGContext::flush(Some(&baseline.context));
     let rendered = Canvas::new()?;
     rendered.blue(bounds);
-    // 消费同一生产准入；不等值时仍真实换帧，复用成功也必须下方完整渲染并逐字节比较。
+    // Use production admission, actually changing unequal frames; even successful reuse still requires
+    // complete rendering and byte comparison.
     let reused = previous
         .map(|previous| pool.reuse_publication(backing, frame, previous, bounds, 1.0, &|| true))
         .transpose()?
@@ -347,8 +368,10 @@ fn render_exact(
         Some(publication) => publication,
         None => {
             let mut attempt = pool.attempt()?;
-            // 同一原前序先交生产部分发布；只有它明确没有适用资格才用完整双组路径。
-            // 任何实际替换后的错误直接返回，不能以完整重发覆盖部分提交的真实后果。
+            // Offer the same original predecessor to production partial publication first; use full
+            // two-group publication only when explicitly inapplicable.
+            // Return errors after actual replacement directly, without a full replay hiding
+            // partial-commit effects.
             let partial = previous
                 .map(|previous| {
                     pool.publish_partial(backing, frame, previous, &mut attempt, &|| true)
@@ -370,8 +393,10 @@ fn render_exact(
     Ok(publication)
 }
 
-/// 只有真实第一次槽替换发生后才由外方迁走 mount；清理必须保外方 parent，
-/// 同时归还这次已显示新槽、未变旧槽和未提交候选的全部原图像义务。
+/// Transfer mount externally only after the first actual slot replacement; cleanup must preserve the
+/// external parent,
+/// while returning all image obligations from the displayed fresh slot, unchanged old slot, and
+/// uncommitted candidate.
 fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
     let counters = Arc::new(NativeMarkdownViewportPixels::default());
     let observer = counters.observer();
@@ -392,7 +417,8 @@ fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
             let backing_weak = layer_weak(&backing);
             observed.borrow_mut().push(backing_weak);
             let mut calibrations = Calibrations::default();
-            // 此布尔只记已观察到的真实模型图变化；不以调用次数或私有 serial 决定撤权阶段。
+            // This boolean records observed actual model-graph replacement only, without selecting
+            // revocation by call counts or private serials.
             let actual_replacement_seen = Cell::new(false);
             let result = (|| -> Result<bool> {
                 let original = fixture_with_prior(
@@ -406,7 +432,8 @@ fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
                 let previous = render_exact(&pool, &backing, &original, &source, bounds, None)?;
                 let roles = pool.weaks();
                 observed.borrow_mut().extend(roles);
-                // 原图已通过完整像素对照；只从公开 Native 数组取得其原 group 和两格身份。
+                // The original graph passed full pixel comparison; read original group/two-slot
+                // identities from public Native arrays only.
                 // SAFETY: the fixture owns the live main-thread mount and installs only
                 // CALayer children, so the public sublayer array has the declared element type.
                 let group = unsafe { pool.mount().sublayers() }
@@ -415,7 +442,8 @@ fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
                     .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
                 let original_slots = {
                     // SAFETY: the retained fixture group has only CALayer children; this
-                    // synchronous main-thread snapshot lends weak identities without changing ownership.
+                    // synchronous main-thread snapshot lends weak identities without changing
+                    // ownership.
                     let children = unsafe { group.sublayers() }
                         .filter(|children| children.len() == 2)
                         .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
@@ -432,8 +460,10 @@ fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
                     case,
                     &mut calibrations,
                 )?;
-                // 原 platform current 边界只看实际图。构造候选时左格仍旧，不触发迁移；
-                // 首个 replace 真正装入新左格且右格仍原样，才发生一次真实外方接管。
+                // The platform current boundary observes the actual graph only; constructing a
+                // candidate leaves the old left tile and triggers no transfer;
+                // transfer occurs once the first replacement actually installs a new left tile while
+                // the right remains unchanged.
                 let current = || {
                     if !parent_is(pool.mount(), &backing) {
                         return false;
@@ -453,8 +483,10 @@ fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
                             std::ptr::eq::<AnyObject>(&*old, &*right as &AnyObject)
                         });
                         if replaced && unchanged {
-                            // 先结束所有观察槽借用，再进入真正的 Native 迁移。额外登记
-                            // 实际已挂载新容器，不依赖内部 pending 是否正确参与 Weak 账本。
+                            // End observation-slot borrows before actual Native transfer, additionally
+                            // recording
+                            // the actual newly mounted container rather than assuming internal pending
+                            // participates correctly in weak accounting.
                             let roles = pool.weaks();
                             let actual_slot = layer_weak(&left);
                             observed.borrow_mut().extend(roles);
@@ -474,8 +506,9 @@ fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
                     Err(NativeMarkdownPagedTextViewError::Revoked)
                 );
                 let foreign_preserved = parent_is(pool.mount(), &successor);
-                // 失败不是“从未提交”：真实外方树曾装入新槽。回滚后实际渲染必须不再
-                // 含任何旧/新正文像素，不能仅凭 Err 或本地清理标志声称资源已经归还。
+                // Failure is not absence of commit: the external graph actually contained a fresh slot.
+                // After rollback, rendering must contain no
+                // old/new body pixels; Err or a local cleanup flag alone cannot establish release.
                 let empty = Canvas::new()?;
                 empty.blue(bounds);
                 let rendered = Canvas::new()?;
@@ -493,8 +526,10 @@ fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
                     && foreign_preserved
                     && cleared_pixels)
             })();
-            // 无论差分或构造在哪里失败，都走同一实际清理；外方 parent 不归本池拆除。
-            // 所有原/新 Frame 已退局部栈，不能用继续持图造成的 provider 占用放宽验收。
+            // Comparison/construction failure follows the same actual cleanup; this pool cannot detach
+            // the external parent.
+            // All original/new frames have left their local stack; do not relax release checks for
+            // providers retained by test-owned frames.
             let detached = pool.detach(&backing);
             let weaks = std::mem::take(&mut *observed.borrow_mut());
             println!(
@@ -505,14 +540,16 @@ fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
             CATransaction::flush();
             Ok((passed, weaks))
         })?;
-        // 原 owner 和 Native 临时数组先实际归还；保活 foreign 时检查全部 provider/
-        // mmap 及其它角色，防止误靠先销毁接管者释放被遗漏的业务图像。
+        // Return the original owner and temporary Native arrays first; keep the external owner alive
+        // while checking every provider/
+        // mapping and other role so destroying the transferee cannot hide omitted business-image
+        // cleanup.
         CATransaction::flush();
         let pixels_released = observer.is_released();
         let original_mount = weaks[0].load();
         let original_mount_alive = original_mount.is_some();
-        // 每次真实发布都可能再观察到同一个 mount；它由 foreign 保活是预期事实，
-        // 只按实际对象身份排除这一角色，不能把其它空图层的存活也一并豁免。
+        // Each actual publication may observe the same mount again; its external retention is expected,
+        // so exempt that role by exact object identity only, without exempting other live empty layers.
         let other_roles_released = weaks.iter().all(|weak| {
             weak.load().is_none_or(|actual| {
                 original_mount
@@ -525,9 +562,11 @@ fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
             "paged_partial_interrupted case={case:?} original_pixels_released_with_foreign_alive={pixels_released} original_mount_alive={original_mount_alive} foreign_owner_alive={foreign_alive} other_native_roles_released={other_roles_released} actual_pixels={:?} formal=false",
             observer.snapshot(),
         );
-        drop(original_mount); // 弱验收产生的临时 claim 不得阻止外方归还后的最终 nil 检查。
-        // 只有观察完原 owner 的归还后，外方才释放它自己接管的空 mount。
-        // SAFETY: successor 只属于本合成对照，None 不接管或删除任何产品 Native 关系。
+        drop(original_mount); // Temporary weak-observation claims must not block final nil checks after external release.
+        // The external owner returns its transferred empty mount only after original-owner release was
+        // observed.
+        // SAFETY: This synthetic control owns successor exclusively; None takes or deletes no product
+        // Native relationships.
         unsafe { successor.setSublayers(None) };
         drop(successor);
         CATransaction::flush();
@@ -567,7 +606,8 @@ enum Mutation {
     MountZPosition,
 }
 
-/// 所有负例均在完整真实发布后修改第二组或顺序，不能只测旧中性路径的第一张图。
+/// After complete actual publication, controls modify the second group or composition order rather than
+/// exercising the neutral first image alone.
 fn visible_graphs(case: PaletteCase) -> Result<()> {
     for mutation in [
         Mutation::None,
@@ -615,7 +655,7 @@ fn visible_graphs(case: PaletteCase) -> Result<()> {
             {
                 Ok(publication) => publication,
                 Err(error) => {
-                    pool.detach(&backing); // 发布失败也先归还已建候选，不能靠测试提前返回跳过真实清理。
+                    pool.detach(&backing); // Publication failure returns the constructed candidate before exiting the control, preserving actual cleanup.
                     return Err(error);
                 }
             };
@@ -630,7 +670,8 @@ fn visible_graphs(case: PaletteCase) -> Result<()> {
                 match mutation {
                     Mutation::None => {}
                     Mutation::SecondaryImage => {
-                        // SAFETY: 外方保活的完整 RGBA 图仅用于真实替换，不冒充配对 A8。
+                        // SAFETY: The external control retains a complete RGBA replacement, without
+                        // pretending it is paired A8.
                         unsafe {
                             second_mask.setContents(Some(
                                 &*std::ptr::from_ref(&*reference).cast::<AnyObject>(),
@@ -638,14 +679,16 @@ fn visible_graphs(case: PaletteCase) -> Result<()> {
                         };
                     }
                     Mutation::SecondaryMask => {
-                        // SAFETY: 外方独立标准层替换第二 mask，原清理必须保持该后继关系。
+                        // SAFETY: An independent standard layer replaces the second mask; original
+                        // cleanup must preserve that successor relationship.
                         unsafe { second.setMask(Some(&successor)) };
                     }
                     Mutation::SecondaryColor => second.setBackgroundColor(Some(&foreign_color)),
                     Mutation::Background => container.setBackgroundColor(Some(&foreign_color)),
                     Mutation::ReversedChildren => {
                         let reversed = NSArray::from_slice(&[&*second, &*first]);
-                        // SAFETY: 只改变两个真实自有角色的排列，验证顺序本身是合成权限的一部分。
+                        // SAFETY: Reorder the two actual owned roles only, checking that order itself
+                        // belongs to composition authority.
                         unsafe { container.setSublayers(Some(&reversed)) };
                     }
                     Mutation::Hidden => second.setHidden(true),
@@ -670,7 +713,8 @@ fn visible_graphs(case: PaletteCase) -> Result<()> {
             let detached = pool.detach(&backing);
             let preserved = match mutation {
                 Mutation::SecondaryImage => {
-                    // SAFETY: 只核原外方 opaque 身份，不访问已撤权图像的内容。
+                    // SAFETY: Compare the original external opaque identity without reading revoked
+                    // image contents.
                     unsafe { second_mask.contents() }
                         .as_deref()
                         .is_some_and(|actual| {
@@ -706,8 +750,10 @@ fn visible_graphs(case: PaletteCase) -> Result<()> {
                 "paged_paired_slots case={case:?} mutation={mutation:?} actual_result={result:?} actual_detach={detached} expected_detach={detach_expected} successor_preserved={preserved} actual_roles={} formal=false",
                 weaks.len()
             );
-            // 外方控制自行归还替换关系，才能在其后核全部原生 Weak；这不计入被测关闭动作。
-            // SAFETY: 这些五层和外方 successor 只存在于本合成控制，业务清理已完成。
+            // The external control returns its replacements before final Native weak checks; this is
+            // not part of the close action under test.
+            // SAFETY: These five roles and external successor belong to this synthetic control only,
+            // after business cleanup completed.
             unsafe {
                 second.setMask(None);
                 second_mask.setContents(None);
@@ -718,7 +764,8 @@ fn visible_graphs(case: PaletteCase) -> Result<()> {
             second.setHidden(false);
             second.setOpacity(1.0);
             second.setZPosition(0.0);
-            // 仅控制自身在被测关闭结束后收回外方污染；关闭结果已记录，不能靠此修正通过票。
+            // The control restores its own external mutations after close was recorded; restoration
+            // cannot revise the close outcome.
             for layer in [&*pool.groups[0].layer, pool.mount()] {
                 layer.setHidden(false);
                 layer.setOpacity(1.0);
@@ -761,7 +808,8 @@ fn visible_graphs(case: PaletteCase) -> Result<()> {
     Ok(())
 }
 
-/// hook 严格位于真实 setter 效果之后、槽登记之前；外方持槽容器仍不得保住原像素。
+/// The gated hook runs strictly after the actual setter and before slot registration; external
+/// container retention must not keep original pixels.
 fn interrupted_installations(case: PaletteCase) -> Result<()> {
     for point in [
         AssignmentPoint::Image,
@@ -785,7 +833,7 @@ fn interrupted_installations(case: PaletteCase) -> Result<()> {
             let mut weaks = Vec::new();
             slot.add_weaks(&mut weaks);
             weaks.push(layer_weak(&group));
-            let container = slot.container().clone(); // 外方真实持有原层至像素归还验收之后。
+            let container = slot.container().clone(); // The external control retains the actual original layer until after pixel-release verification.
             let fired = Cell::new(false);
             let installed = slot.install_with_probe(
                 &image.image,
@@ -829,7 +877,8 @@ fn interrupted_installations(case: PaletteCase) -> Result<()> {
 
 pub(super) fn run(_mtm: MainThreadMarker) -> Result<()> {
     for case in [PaletteCase::CoverageRamp, PaletteCase::GlyphColors] {
-        // 两种实际合成顺序各走相同复用、外方修改与setter间隙撤权，不借另一模式的通过结果。
+        // Each actual composition order independently exercises reuse, external mutation, and
+        // revocation between setter and registration.
         paired_reuse(case)?;
         interrupted_partial_publication(case)?;
         visible_graphs(case)?;

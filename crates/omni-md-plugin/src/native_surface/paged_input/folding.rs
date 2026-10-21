@@ -1,4 +1,4 @@
-//! Source 折叠只改变唯一输入 owner 的有限锚点；正文、保存与 Undo 历史始终留在原 Core。
+//! Source folding changes bounded anchors in the sole Input owner; canonical text, save, and Undo remain in Core.
 
 use super::*;
 use omni_markdown_core::markdown_folding::{
@@ -6,8 +6,8 @@ use omni_markdown_core::markdown_folding::{
 };
 
 impl NativeMarkdownPagedInput {
-    /// Find 在同一次 canonical 选择提交中展开真实命中隐区；后续请求直接绑定新 fold revision。
-    /// 与普通全选不同，这个业务意图必须让整个匹配可见，不能仅把端点夹到 header。
+    /// Find reveals hidden matches in the same canonical selection commit; subsequent requests bind the resulting fold revision.
+    /// Unlike Select All, this intent must reveal the complete match rather than clamp endpoints to a header.
     pub(in crate::native_surface) fn select_find_result(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -15,7 +15,7 @@ impl NativeMarkdownPagedInput {
         current: &(impl Fn(u64) -> bool + ?Sized),
     ) -> Result<NativeMarkdownPagedInputOutcome> {
         if permit.cell.is_some() {
-            // 单元格查找仍使用草稿局部选择；Body 折叠没有权限更改单元格，原事务保持独立。
+            // Cell Find uses draft-local selection; Body folding has no authority over Cell, so retain its independent transaction.
             return self.set_selection(permit, selection, current);
         }
         let _mutation = self.begin(permit, current)?;
@@ -41,6 +41,8 @@ impl NativeMarkdownPagedInput {
         let mut folds = Vec::with_capacity(old.len());
         for fold in old.iter() {
             let hidden = folded_layout_range(&document, fold)?;
+            // A caret must be strictly hidden; a nonempty Find match reveals
+            // every overlapping hidden span so no part of the result stays hidden.
             let contains = if range.is_empty() {
                 hidden.start < range.start && range.start < hidden.end
             } else {
@@ -56,8 +58,8 @@ impl NativeMarkdownPagedInput {
         self.publish_fold_intent(permit, folds, Some(selection), current)
     }
 
-    /// 原菜单/行号动作消费同一输入票；查询成功后才发布折叠与必要的 header caret。
-    /// 已折叠行只展开自身，嵌套的用户选择保留；不可折叠的上下文返回真实无变化。
+    /// The existing menu/gutter action consumes this permit; publish folds and any required header caret only after a successful query.
+    /// Unfold only the selected folded header, retaining nested user choices; a nonfoldable context is genuinely unchanged.
     pub fn toggle_fold(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -73,6 +75,8 @@ impl NativeMarkdownPagedInput {
             .clone();
         let mut selection = None;
         if let Some(index) = folds.iter().position(|fold| fold.header_line == line) {
+            // Remove only this header's anchor; retained nested choices remain
+            // available if the parent is folded again later.
             folds.remove(index);
         } else {
             if permit.before.selection_range_count > 1 {
@@ -92,6 +96,8 @@ impl NativeMarkdownPagedInput {
             drop(document);
             drop(original);
             let Some(region) = region else {
+                // The query released all borrows before reentry. A nonfoldable
+                // line is unchanged only while the original permit still holds.
                 self.check_permit(permit, current)?;
                 return Ok(NativeMarkdownPagedInputOutcome::Unchanged(permit.before));
             };
@@ -104,13 +110,13 @@ impl NativeMarkdownPagedInput {
                 && permit.before.selection.head_utf16 < hidden.end
             {
                 selection = Some(MarkdownTextSelection::caret(hidden.start));
-            } // 只有已知真实 head 落入隐区才移到 header；未知方向的单范围保留原 metadata 和历史 memento。
+            } // Move only a known head inside the hidden region to its header; unknown direction retains original metadata/history memento.
             folds.push(region);
         }
         self.publish_fold_intent(permit, folds, selection, current)
     }
 
-    /// “展开全部”只撤当前有限锚点，不创建一个文字事务或占用一次 Undo。
+    /// Expand All removes current bounded anchors without a text transaction or Undo entry.
     pub fn expand_folds(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -121,8 +127,8 @@ impl NativeMarkdownPagedInput {
         self.publish_fold_intent(permit, Vec::new(), None, current)
     }
 
-    /// Find/辅助功能定位先展开真实目标所穿过的隐区，再让调用方按提交后的 fold revision 签几何票。
-    /// 不把匹配夹到 header，也不读取或复制匹配以外的正文。
+    /// Find/accessibility reveals intersecting hidden targets before the caller acquires geometry under the committed fold revision.
+    /// Neither clamp the match to a header nor read/copy surrounding document text.
     pub fn reveal_folded_range(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -168,7 +174,7 @@ impl NativeMarkdownPagedInput {
         self.publish_fold_intent(permit, retained, None, current)
     }
 
-    /// 构造原 Source composer 时只借同票的有限端点投影；不暴露可修改的第二 fold owner。
+    /// The Source composer receives bounded endpoint projections under this permit, not a second mutable fold owner.
     pub fn folded_layout_ranges(
         &self,
         permit: &NativeMarkdownPagedInputPermit,
@@ -203,7 +209,7 @@ impl NativeMarkdownPagedInput {
         Ok(ranges)
     }
 
-    /// 行号发布只复制原有限锚点的行号；Native 几何转换前归还借用，不持另一份 fold owner。
+    /// Copy only bounded header line numbers and release borrows before Native geometry conversion; retain no second fold owner.
     pub(in crate::native_surface) fn folded_header_lines(
         &self,
         permit: &NativeMarkdownPagedInputPermit,
@@ -224,7 +230,7 @@ impl NativeMarkdownPagedInput {
         Ok(headers)
     }
 
-    /// 单元格或仍有 marked 的输入没有修改 Body 折叠的权限；正式动作先走原组合提交流程。
+    /// Cell or marked input cannot modify Body folds; the controller must first complete its existing composition flow.
     fn require_fold_action(&self, permit: &NativeMarkdownPagedInputPermit) -> Result<()> {
         if permit.cell.is_some() {
             return Err(NativeMarkdownPagedInputError::BodyTargetRequired);
@@ -235,7 +241,7 @@ impl NativeMarkdownPagedInput {
         Ok(())
     }
 
-    /// 最后一次可重入 current 在所有 Rust 借用外完成；随后只做原 Core 选择与有限 metadata 发布。
+    /// Finish the final reentrant current check outside Rust borrows; then publish only Core selection and bounded metadata.
     fn publish_fold_intent(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -263,6 +269,8 @@ impl NativeMarkdownPagedInput {
             return Ok(NativeMarkdownPagedInputOutcome::Unchanged(permit.before));
         }
         let revision = if folds_changed {
+            // Preflight the revision before changing Core selection or replacing
+            // anchors; exhaustion cannot leave a partially published fold action.
             permit
                 .before
                 .fold_revision
@@ -276,7 +284,7 @@ impl NativeMarkdownPagedInput {
         });
         let mut state = permit.before;
         if let Some(next) = selection {
-            // 原 Core 先验证 scalar、Source 健康与 idle；失败时旧 folds/选择事实均未发布。
+            // Core checks scalar endpoints, Source health, and idle state first; failure publishes neither folds nor selection.
             document.set_selection(next)?;
             if !folds_changed && !selection_changed {
                 return Ok(NativeMarkdownPagedInputOutcome::Unchanged(permit.before));
@@ -316,8 +324,8 @@ impl NativeMarkdownPagedInput {
     }
 }
 
-/// 复用旧 Source delegate 的真实 CRLF-aware 省略合同，仅补被隐藏末行实际 terminator。
-/// 闭包读取失败后仍让原 Doc 再核 Source 首错，不能把 EIO 压成普通无折叠。
+/// Reuse the Source delegate's CRLF-aware omission contract, extending only over the actual last hidden line terminator.
+/// Recheck the original document's Source after closure read failure, so EIO cannot become an ordinary missing fold.
 pub(super) fn folded_layout_range(
     document: &MarkdownDocumentBuffer,
     fold: &MarkdownFoldRegion,
@@ -346,6 +354,8 @@ pub(super) fn folded_layout_range(
             Some((start, end))
         },
     );
+    // Projection callbacks intentionally express missing coordinates as None;
+    // check original Source again before turning that into InvalidRange.
     document.byte_offset_for_utf16(hidden.start)?;
     let end = end.ok_or(NativeMarkdownPagedInputError::InvalidRange)?;
     Ok(hidden.start..end)

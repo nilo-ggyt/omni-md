@@ -1,6 +1,8 @@
-//! 用有限合成候选核全尾部校验、跨窗口KMP、精确摘要与路径撤权；不用大正文复制过门禁。
+//! Use finite synthetic files to verify tail validation, cross-lease KMP,
+//! exact snippets/revisions, and path-identity revocation through real storage.
 use super::*;
 
+/// Exercise the real frozen inspection owner and return only its validated result.
 fn inspect<T>(
     path: &Path,
     current: impl Fn() -> bool,
@@ -12,6 +14,8 @@ fn inspect<T>(
 
 #[test]
 fn early_match_still_rejects_invalid_or_incomplete_utf8_at_the_actual_tail() {
+    // Place a useful hit in the first lease and malformed or unfinished UTF-8
+    // beyond several later leases; neither file can publish that partial success.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("candidate.md");
     let pattern = SearchPattern::new(b"needle");
@@ -31,7 +35,8 @@ fn early_match_still_rejects_invalid_or_incomplete_utf8_at_the_actual_tail() {
 fn boundary_crossing_match_and_normalized_snippet_equal_the_original_whole_text_oracle() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("candidate.md");
-    // 首窗口尾切入CJK/emoji并横跨查询，前后同时含空白、控制符与组合标记。
+    // Shift CJK/emoji and the query across the first lease boundary while context
+    // includes whitespace, a control character, and a combining mark.
     for padding in 4080..4110 {
         let text = format!(
             "{}{}needle中🙂{}",
@@ -41,6 +46,8 @@ fn boundary_crossing_match_and_normalized_snippet_equal_the_original_whole_text_
         );
         fs::write(&path, text.as_bytes()).unwrap();
         for query in ["needle中🙂", "NEEDLE", "文🙂e\u{301}", "不存在"] {
+            // The finite fixture's contiguous oracle isolates the externally
+            // visible result from the production source's window partitioning.
             let pattern = SearchPattern::new(query.as_bytes());
             let expected_start = pattern.find(text.as_bytes(), || true).unwrap();
             let expected =
@@ -49,6 +56,8 @@ fn boundary_crossing_match_and_normalized_snippet_equal_the_original_whole_text_
                 &path,
                 || true,
                 |source| {
+                    // Match and obtain context through the actual finite source
+                    // API; the callback never receives a whole-document slice.
                     pattern
                         .find_bounded(source, &|| true)?
                         .map(|start| {
@@ -65,6 +74,8 @@ fn boundary_crossing_match_and_normalized_snippet_equal_the_original_whole_text_
 
 #[test]
 fn all_valid_utf8_windows_are_bounded_and_cancelled_callbacks_cannot_publish() {
+    // A real file spanning several leases must deliver each exact byte once
+    // without offering more than the source's 4 KiB at any callback.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("candidate.md");
     let text = "中文🙂a\u{301}".repeat(1200);
@@ -85,6 +96,8 @@ fn all_valid_utf8_windows_are_bounded_and_cancelled_callbacks_cannot_publish() {
     .unwrap();
     assert_eq!(visited, text.len());
     let cancelled = AtomicBool::new(false);
+    // Revoke the actual request from its first consumer callback. Later cleanup
+    // cannot restore authority or turn the partial traversal into a successful result.
     let current = || !cancelled.load(AtomicOrdering::Acquire);
     let result = inspect(&path, current, |source| {
         source.visit_validated_bytes(&current, |_, _| {
@@ -100,6 +113,8 @@ fn all_valid_utf8_windows_are_bounded_and_cancelled_callbacks_cannot_publish() {
 
 #[test]
 fn post_callback_identity_change_rejects_results_and_empty_source_is_valid() {
+    // Replace the file's real bytes after frozen inspection but before final
+    // descriptor/path validation; derived success must be discarded.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("candidate.md");
     fs::write(&path, b"original").unwrap();
@@ -117,6 +132,8 @@ fn post_callback_identity_change_rejects_results_and_empty_source_is_valid() {
         Err(MarkdownWorkspaceError::DocumentChangedDuringRead)
     ));
     fs::write(&path, b"").unwrap();
+    // An actual empty file has a valid zero extent, rather than representing
+    // a missing backing for nonempty content.
     assert_eq!(
         inspect(
             &path,
@@ -133,6 +150,8 @@ fn post_callback_identity_change_rejects_results_and_empty_source_is_valid() {
 
 #[test]
 fn finite_revision_matches_original_hash_and_budget_rejects_before_callback() {
+    // Hash original CR/LF and Unicode bytes exactly; presentation normalization
+    // must not influence the persisted revision.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("candidate.md");
     let text = "原字节\r\n🙂e\u{301}".repeat(1000);
@@ -140,6 +159,8 @@ fn finite_revision_matches_original_hash_and_budget_rejects_before_callback() {
     let inspected = inspect_bounded_markdown(&path, MAX_SEARCH_FILE_BYTES, |_| Ok(())).unwrap();
     assert_eq!(inspected.revision, revision_for_bytes(text.as_bytes()));
     let called = std::cell::Cell::new(false);
+    // A real extent exceeding the caller's limit fails before consumer work,
+    // rather than acquiring a large source and discovering its size afterward.
     let result = inspect_bounded_markdown_text_cancellable(
         &path,
         3,
@@ -162,12 +183,15 @@ fn local_inspector_cannot_bypass_complete_utf8_confirmation_or_export_a_whole_sl
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("candidate.md");
     fs::write(&path, [b'a', 0xff]).unwrap();
-    // 泛型callback只看局部或metadata也必须完整验证候选，不能发布开头合法的半结果。
+    // A metadata-only consumer still owes complete candidate UTF-8 validity;
+    // returning a useful scalar cannot bless an invalid unread tail.
     assert!(matches!(
         inspect(&path, || true, |_| Ok(7)),
         Err(MarkdownWorkspaceError::InvalidUtf8Document)
     ));
     fs::write(&path, vec![b'a'; 8192]).unwrap();
+    // Even a valid source rejects a direct request one byte above its lease
+    // limit; the general inspector cannot export a whole-source borrow.
     let result = inspect(
         &path,
         || true,

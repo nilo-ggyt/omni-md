@@ -1,7 +1,9 @@
-//! 同一匿名File的不可变item搜索树；固定64个根，无N个内存目录或第二FD。
+//! Immutable item search trees in the same anonymous file. Sixty-four fixed roots
+//! avoid an in-memory directory per item or another file descriptor.
 //!
-//! 每次签入一个leaf，只把等大小相邻树合并，摊销少于两个node/item。原始目录始终不改，
-//! 回读按原source范围降树，最多64层；不会为每个视觉run从文尾重新扫整串item。
+//! Each inserted leaf merges only equal-sized adjacent trees, amortizing fewer than
+//! two nodes per item. Original directories stay immutable; Source-range lookup
+//! descends at most 64 levels instead of rescanning every item for each visual run.
 use super::*;
 const NODE: u8 = 13;
 
@@ -14,8 +16,9 @@ pub(super) struct Root {
     level: u8,
 }
 
-/// 同一次降树实际取得的叶与紧邻右子树；只随本次 LocatedItem 借用，不保存历史路径。
-/// following 的首端必须正好是该叶末端，不能把任意祖先或相近数值当成后继权限。
+/// Actual leaf and adjacent right subtree from one descent, retained only with the
+/// current LocatedItem borrow. The right subtree starts exactly at the leaf's end;
+/// a nearby coordinate or arbitrary ancestor cannot supply successor authority.
 pub(super) struct Located {
     pub(super) key: ItemKey,
     pub(super) following: Option<Root>,
@@ -44,6 +47,8 @@ impl Build {
         forest: &mut [Option<Root>; 64],
         budget: usize,
     ) -> Result<bool> {
+        // Append the original item's leaf once. Across budget yields, retain its
+        // current merge root while the forest still owns unmerged left roots.
         let mut written = 0;
         if self.current.is_none() {
             let record = rows.len();
@@ -69,7 +74,9 @@ impl Build {
             };
             if written == budget {
                 return Ok(false);
-            } // 本回合不再写额外目录；旧root仍由原forest持有。
+            } // Do not spend another record; the original forest still owns left.
+            // Merge only equal-size, equal-level adjacent Source coverage. Child
+            // records remain immutable and precede the newly appended parent.
             if left.end != current.start
                 || left.items != current.items
                 || left.level != current.level
@@ -94,6 +101,8 @@ impl Build {
     }
 }
 fn encode(root: Root, children: Option<(usize, usize)>, item: Option<ItemKey>) -> Result<[u8; 64]> {
+    // A fixed record stores either actual child pointers or the original opaque
+    // item key. Sentinel fields remain explicit so decoding can reject mixed forms.
     let mut row = [0; 64];
     for (at, value) in [(0, root.start), (8, root.end), (48, root.items)] {
         row[at..at + 8].copy_from_slice(&number(value)?.to_le_bytes());
@@ -123,6 +132,8 @@ struct DecodedNode {
     item: Option<ItemKey>,
 }
 fn decode(row: [u8; 64], record: usize) -> Result<DecodedNode> {
+    // Authenticate the record kind/reserved bytes and balanced-tree cardinality
+    // before any pointer can guide another read from the original file.
     if row[56] != NODE || row[57] > 1 || row[59..].iter().any(|byte| *byte != 0) {
         return Err(Error::InconsistentCoverage);
     }
@@ -140,6 +151,7 @@ fn decode(row: [u8; 64], record: usize) -> Result<DecodedNode> {
         return Err(Error::InconsistentCoverage);
     }
     if row[57] == 1 {
+        // Leaves reference an earlier committed directory with a nonzero origin.
         let key = ItemKey {
             record: usize_at(&row, 32)?,
             origin: u64_at(&row, 40),
@@ -158,6 +170,7 @@ fn decode(row: [u8; 64], record: usize) -> Result<DecodedNode> {
             item: Some(key),
         })
     } else {
+        // Internal nodes reference two earlier nodes and cannot also claim an item.
         let children = (usize_at(&row, 16)?, usize_at(&row, 24)?);
         if root.level == 0
             || children.0 >= record
@@ -174,7 +187,8 @@ fn decode(row: [u8; 64], record: usize) -> Result<DecodedNode> {
         })
     }
 }
-/// 在原 forest 中定位实际叶；父子覆盖和紧邻右子树只随本次行内 LocatedItem 返回。
+/// Locate an actual leaf in the original forest. Return authenticated parent/child
+/// coverage and the adjacent right subtree only for this line-local LocatedItem.
 pub(super) fn lookup(
     rows: &mut Rows,
     forest: &[Option<Root>; 64],
@@ -189,8 +203,9 @@ pub(super) fn lookup(
     lookup_root(rows, root, offset)
 }
 
-/// 仅原行内上一项的真实末端可借已认证右子树；跨树时只接受原固定根的精确首端。
-/// 没有该事实就交回 None，由调用方保留普通 lookup；不增加目录、路径栈或跨调用缓存。
+/// Only the preceding line-local item's real end may use its authenticated right
+/// subtree. Across trees, require the exact start of an original fixed root. Without
+/// that fact, return None for ordinary lookup without adding a cache or path stack.
 pub(super) fn lookup_following(
     rows: &mut Rows,
     forest: &[Option<Root>; 64],
@@ -209,12 +224,13 @@ pub(super) fn lookup_following(
     };
     if root.start != offset {
         return Err(Error::InconsistentCoverage);
-    } // 已带出的邻接事实错位不能悄悄退回普通查询，把原目录错误洗成成功。
+    } // A contradictory carried adjacency is corruption, not a successful fallback.
     lookup_root(rows, root, offset).map(Some)
 }
 
-/// 原根与带出的右子树共用同一真实读取、解码和父子覆盖认证。
-/// 即使 Root 已读过，仍从原 Rows 读取它，保留 index 的健康/poison 与 IO 首错。
+/// Original roots and carried right subtrees share actual reads, decoding, and
+/// coverage authentication. Reread the root from Rows even when its scalar facts
+/// are known, preserving index health/poison and actual first I/O failure.
 fn lookup_root(rows: &mut Rows, root: Root, offset: usize) -> Result<Located> {
     if offset < root.start || offset >= root.end {
         return Err(Error::InconsistentCoverage);
@@ -225,7 +241,7 @@ fn lookup_root(rows: &mut Rows, root: Root, offset: usize) -> Result<Located> {
         || node.root.items != root.items
         || node.root.level != root.level
     {
-        return Err(Error::InconsistentCoverage); // 首条实际根必须匹配本次原forest的已发布覆盖。
+        return Err(Error::InconsistentCoverage); // Match the actual published root facts.
     }
     let mut following = None;
     loop {
@@ -246,6 +262,8 @@ fn lookup_root(rows: &mut Rows, root: Root, offset: usize) -> Result<Located> {
         let (left, right) = children.ok_or(Error::InconsistentCoverage)?;
         let left = decode(rows.read(left)?, left)?;
         let right = decode(rows.read(right)?, right)?;
+        // Both real children must exactly partition their parent at the next level;
+        // a malformed edge cannot turn into a valid item or successor location.
         if left.root.start != root.start
             || right.root.end != root.end
             || left.root.end != right.root.start
@@ -254,11 +272,13 @@ fn lookup_root(rows: &mut Rows, root: Root, offset: usize) -> Result<Located> {
         {
             return Err(Error::InconsistentCoverage);
         }
-        // 完整 DecodedNode 只在本次降树中移交，选中孩子后不重读相同 record。
-        // 仅带出的相邻 Root 可供本次视觉 run 借用，不跨 run/行缓存或扩大读取范围。
+        // Move the already decoded child within this descent instead of rereading
+        // it. Only the adjacent Root may be borrowed by this same visual run; no
+        // cross-run/line cache or expanded Source authority is created.
         node = if offset < left.root.end {
-            // 两个孩子已经在本次查询中完整读过；越靠近叶的右孩子就是更近的真实后继。
-            // 向右下降时保留上层候选；最终只带出首端与当前叶末端完全相同的那一棵。
+            // Both children were read. A deeper right sibling is the nearer actual
+            // successor; rightward descent retains the ancestor candidate. At the
+            // leaf, its start must equal that leaf's exact end.
             following = Some(right.root);
             left
         } else {

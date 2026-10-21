@@ -1,4 +1,4 @@
-//! 固定版本CodeMirror实际有限输出只作oracle；产品仍消费原Source/GCB，不执行脚本。
+//! Finite results from the pinned CodeMirror version are an oracle, never a production script dependency.
 
 use super::super::tests::{ascii_fixture, fixture};
 use super::*;
@@ -7,6 +7,8 @@ pub(super) fn drive(
     composer: &mut MarkdownLineComposer,
     budget: MarkdownLineComposeBudget,
 ) -> Range<usize> {
+    // Drive the same original composer with finite source-derived test bounds.
+    // Only its actual Ready answer supplies a range; yields stay undecided.
     let maximum = composer.payload.as_ref().unwrap().source.byte_len() * 16 + 512;
     for _ in 0..maximum {
         let step = composer.step_word_group(budget).unwrap();
@@ -30,8 +32,9 @@ pub(super) fn drive(
 
 #[test]
 fn logical_ltr_groups_and_hard_line_selection_match_actual_codemirror_6_11_oracle() {
-    // 2026-10-19直接执行Host中commands6.11.0/view6.43.9/state6.7.1的moveByGroup与groupAt。
-    // oracle保持真实LTR视觉序等于逻辑序；混合Bidi没有被这些数值授予视觉移动语义。
+    // The recorded oracle ran moveByGroup/groupAt on 2026-10-19 with Host's
+    // commands 6.11.0, view 6.43.9 and state 6.7.1. These finite LTR values do not
+    // grant visual movement semantics to mixed-bidi text.
     for (text, head, backward, forward, left, right) in [
         ("hello  world", 5, 0, 12, 0..5, 5..7),
         ("hello\t\n\nworld", 5, 0, 13, 0..5, 5..6),
@@ -53,6 +56,8 @@ fn logical_ltr_groups_and_hard_line_selection_match_actual_codemirror_6_11_oracl
         ("one\n\n", 5, 0, 5, 5..5, 5..5),
     ] {
         let (_directory, document, mut composer) = fixture(text);
+        // Exercise both logical directions and each selection bias independently;
+        // cancelling one action must preserve the original source for the next.
         for (action, expected) in [
             (MarkdownWordGroupAction::Backward, backward..head),
             (MarkdownWordGroupAction::Forward, head..forward),
@@ -81,7 +86,7 @@ fn logical_ltr_groups_and_hard_line_selection_match_actual_codemirror_6_11_oracl
                 expected,
                 "{text:?}, {head}, {action:?}"
             );
-            assert_eq!(drive(&mut composer, budget), expected); // Ready仍核同一原Source/GCB，不以旧范围绕过健康门。
+            assert_eq!(drive(&mut composer, budget), expected); // Repeated Ready still checks original source health.
             composer.cancel_word_group();
         }
         assert_eq!(document.generation(), 0);
@@ -91,6 +96,8 @@ fn logical_ltr_groups_and_hard_line_selection_match_actual_codemirror_6_11_oracl
 
 #[test]
 fn select_keeps_physical_crlf_and_logical_mixed_bidi_source_order() {
+    // Selection follows original physical line boundaries and logical category
+    // adjacency. It does not claim visual Left/Right ordering for mixed bidi.
     for (text, head, backward_bias, expected) in [
         ("first\r\nnext", 5, false, 0..5),
         ("first\r\nnext", 7, true, 7..11),
@@ -108,11 +115,13 @@ fn select_keeps_physical_crlf_and_logical_mixed_bidi_source_order() {
         );
         assert_eq!(document.generation(), 0);
         assert!(!document.can_undo());
-    } // Bidi选词只扩实际逻辑相邻类别；没有用它冒充视觉Left/Right移动。
+    } // Querying the logical selection must leave the original document history untouched.
 }
 
 #[test]
 fn original_multi_mebibyte_word_selection_is_bounded_and_releases_the_real_source() {
+    // Generate the actual long word through the existing block writer, then select
+    // from its interior without retaining a second full-word expected body.
     for length in [2 * 1024 * 1024, 4 * 1024 * 1024] {
         let (_directory, document, mut composer) = ascii_fixture(length);
         let resources = composer.worker_resource_observer();
@@ -126,6 +135,8 @@ fn original_multi_mebibyte_word_selection_is_bounded_and_releases_the_real_sourc
             )
             .unwrap();
         let mut ready = None;
+        // Fixed real-operation quotas must reach the complete source interval;
+        // resource checks happen only after both source owners have been dropped.
         for _ in 0..128 {
             let step = composer
                 .step_word_group(MarkdownLineComposeBudget::default())
@@ -151,6 +162,8 @@ fn original_multi_mebibyte_word_selection_is_bounded_and_releases_the_real_sourc
 
 #[test]
 fn group_cancellation_and_original_eio_do_not_leak_or_reuse_a_ready_range() {
+    // Cancel one in-flight group action, then prove the same original composer can
+    // still delete and select before making its actual source unhealthy.
     let (_directory, document, mut composer) = fixture("中文 选择 👩‍👩‍👧‍👦!");
     let backing = document.original_backing_observer().unwrap();
     let resources = composer.worker_resource_observer();
@@ -191,6 +204,8 @@ fn group_cancellation_and_original_eio_do_not_leak_or_reuse_a_ready_range() {
         drive(&mut composer, MarkdownLineComposeBudget::default()),
         0..2
     );
+    // Consume the existing EIO injection through real original-page reclaim. A
+    // previously Ready range cannot hide that first cause behind later cancellation.
     document
         .text_snapshot()
         .visit_byte_range(0..1, |_| Ok(()))
@@ -209,6 +224,8 @@ fn group_cancellation_and_original_eio_do_not_leak_or_reuse_a_ready_range() {
             MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
         ))
     ));
+    // Real worker and mapping release is checked after the entire owner graph
+    // drops; retaining the source failure must not retain its resources.
     drop((composer, document));
     let facts = resources.snapshot().unwrap();
     assert_eq!(facts.first_source_errno, Some(libc::EIO));
@@ -218,6 +235,8 @@ fn group_cancellation_and_original_eio_do_not_leak_or_reuse_a_ready_range() {
 
 #[test]
 fn a_mid_grapheme_group_request_fails_without_publishing_a_partial_selection() {
+    // A scalar offset inside the combining grapheme is not a group boundary.
+    // Drive to the typed failure and verify no canonical edit/history publication.
     let (_directory, document, mut composer) = fixture("xe\u{301}😀y");
     composer
         .begin_word_group(

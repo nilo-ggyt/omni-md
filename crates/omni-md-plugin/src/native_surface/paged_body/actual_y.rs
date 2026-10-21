@@ -1,4 +1,5 @@
-//! 同Producer实际行度量的目标续体；只有有限游标，没有额外Reader、全行索引或估计行高。
+//! Target continuations share actual Producer line metrics through bounded cursors, without another
+//! Reader, full-line index, or estimated heights.
 
 use super::super::navigation::{PendingVertical, VerticalMotion, VerticalSeed};
 use super::super::target::SourceTargetRequest;
@@ -40,7 +41,8 @@ pub(super) struct ActualTarget {
     anchor: Option<MeasuredLineAnchor>,
 }
 
-/// 垂直导航只暂存一个原行查找/度量游标，沿唯一output累加真实相邻行高度。
+/// Vertical navigation retains one original lookup/metric cursor and accumulates actual adjacent-line
+/// heights from the unique output.
 pub(super) struct VerticalTarget {
     request: Rc<PendingVertical>,
     seed: VerticalSeed,
@@ -55,8 +57,10 @@ pub(super) struct VerticalTarget {
 impl VerticalTarget {
     pub(super) fn reset_output(&mut self) {
         self.lookup = None;
-        self.metrics = None; // 新prefix归还原弱游标；已完成的真实边界属于同一Source/宽度，不重读之前的行。
+        self.metrics = None; // A new prefix returns old weak cursors; completed bounds still belong to the same Source/width without rereading earlier lines.
     }
+    // Begin with the actually adjacent ordinal and seed edge; checked bounds retain true BOF/EOF
+    // semantics.
     fn new(request: Rc<PendingVertical>, motion: VerticalMotion) -> Self {
         let seed = request.seed.get();
         let backwards = matches!(motion.action, Nav::Up | Nav::PageUp);
@@ -87,9 +91,12 @@ impl ActualTarget {
         self.anchor.is_some()
     }
 
-    /// 只借原目标已经实际量得的行边界；普通 last_target_anchor 没有完整 Input 票，
-    /// 不能据它重置新扫描。原请求仍须核同 Body/Doc、Source、宽度和完整输入。
-    /// 模式/字体换代会推进原 serial/layout_epoch，matches 因而也拒绝跨模式坐标。
+    /// Borrow actually measured original-target bounds only; ordinary last_target_anchor lacks a
+    /// complete Input ticket,
+    /// so it cannot reset a new scan. The original request still validates the same Body/document,
+    /// Source, width, and complete Input.
+    /// Mode/font supersession advances original serial/layout epoch, allowing matches to reject
+    /// cross-mode coordinates.
     pub(super) fn current_line_anchor(
         &self,
         owner: &Owner,
@@ -113,12 +120,14 @@ impl ActualTarget {
         }
     }
     pub(super) fn reset_output(&mut self) {
-        // 新prefix释放旧Output后不能沿旧弱handle继续；已真实测出的坐标仍属于同Producer。
+        // After a new prefix releases old output, discard old weak handles while actual measured
+        // coordinates remain with the same Producer.
         self.lookup = None;
         self.ordinal = None;
         self.seed = None;
         self.walk = None;
     }
+    /// Record an anchor only when this actual LineEnd contains the target and its entire first scalar.
     pub(super) fn observe_line(
         &mut self,
         facts: &MarkdownComposedLineFacts,
@@ -140,7 +149,8 @@ impl ActualTarget {
 }
 
 impl Producer {
-    /// 一轮只查同一output至多256条真实目录记录和32个part；不足时续原游标，不同步排完整段。
+    /// Each turn reads at most 256 actual directory records and 32 parts from the same output, resuming
+    /// cursors instead of synchronous paragraph layout.
     pub(super) fn advance_vertical_target(
         &mut self,
         owner: &Owner,
@@ -162,6 +172,8 @@ impl Producer {
         }) {
             self.vertical = Some(VerticalTarget::new(pending, motion));
         }
+        // End the target-slot borrow before directory/Native work and restore the same request on every
+        // outcome.
         let mut target = self.vertical.take().ok_or(Error::Closed)?;
         let result = self.advance_vertical_line(owner, ticket, &mut target);
         self.vertical = Some(target);
@@ -190,14 +202,14 @@ impl Producer {
                 return Ok(TargetAdvance::VisibleBand);
             }
             let Some(ordinal) = target.ordinal else {
-                target.anchor = Some(target.previous.clone()); // 真BOF已由原ordinal0证明，不把可见前缀当文首。
+                target.anchor = Some(target.previous.clone()); // Original ordinal zero proves actual BOF; a visible prefix cannot stand in for document start.
                 break;
             };
             if ordinal >= self.lines {
                 if !self.complete {
                     return Ok(TargetAdvance::NeedPrefix);
                 }
-                target.anchor = Some(target.previous.clone()); // 只有原Composer complete才可把末个真实行作为EOF边界。
+                target.anchor = Some(target.previous.clone()); // Only original Composer completion permits its actual final line as the EOF boundary.
                 break;
             }
             let Some(output) = self.output.as_ref().cloned() else {
@@ -240,11 +252,12 @@ impl Producer {
                             Some(LineMetrics::new(line, owner.presentation_mode(), false));
                         target.lookup = None;
                     }
-                    _ => return Err(Error::Unsupported), // 已度量前缀缺失原ordinal是源/目录错误，不签空目标。
+                    _ => return Err(Error::Unsupported), // A missing original ordinal in measured prefix is Source/directory failure, without an empty target certificate.
                 }
             }
             let mut metrics = target.metrics.take().ok_or(Error::Closed)?;
-            // 一个part实际读取Line认证2条、Part2条、Directory3条；只领取本轮真实record余量。
+            // Each part reads two Line checks, two Part records, and three Directory records; use this
+            // turn remaining actual record allowance.
             let allowed = parts.min(records / 7);
             let mut quota = MarkdownLineComposeBudget {
                 metadata_units: allowed,
@@ -291,6 +304,8 @@ impl Producer {
                 top,
                 bottom,
             };
+            // Ordinary Up/Down stops at the adjacent actual line; page motion walks measured heights to
+            // its original desired Y.
             let reached = !page
                 || if backwards {
                     desired_y >= top || ordinal == 0
@@ -310,6 +325,8 @@ impl Producer {
             };
         }
         let anchor = target.anchor.as_ref().ok_or(Error::Closed)?;
+        // Resolution records actual measured coordinates only; viewport geometry and Native reveal
+        // still require original authority below.
         target
             .request
             .resolved
@@ -322,14 +339,14 @@ impl Producer {
                 viewport.set_content_width(self.maximum_content_width)
             })?;
             owner.schedule()?;
-            return Ok(TargetAdvance::Handled); // 先归还旧横向范围，原目标在后继真实geometry继续。
+            return Ok(TargetAdvance::Handled); // Retire old horizontal geometry authority and resume the original target under actual successor geometry.
         }
         if viewport.geometry()?.content_height != self.height() {
             owner.native_preparation_geometry(&ticket.request, &viewport, || {
                 viewport.set_content_height(self.height())
             })?;
             owner.schedule()?;
-            return Ok(TargetAdvance::Handled); // 自有高度更新撤旧geometry，下一真实请求再滚动。
+            return Ok(TargetAdvance::Handled); // An owned height update revokes old geometry; scroll on the next actual request.
         }
         let rect = NSRect::new(
             NSPoint::new(
@@ -341,7 +358,7 @@ impl Producer {
         let revealed = owner.native_preparation_geometry(&ticket.request, &viewport, || {
             viewport.reveal_document_rect(rect, &|| target.request.current_native(owner))
         });
-        self.target_source_health()?; // Native或current重入的普通撤权不得掩盖同一Source首错。
+        self.target_source_health()?; // Ordinary Native/current reentry revocation cannot hide the same Source primary failure.
         if !target.request.current_native(owner) {
             return Err(Error::PreparationRevoked);
         }
@@ -368,6 +385,8 @@ impl Producer {
             self.target = None;
             return Ok(TargetAdvance::VisibleBand);
         };
+        // A different request/Input/Source cannot inherit the old target cursor, even at identical
+        // numeric coordinates.
         if !pending.matches(owner, request) || pending.source != self.source.authority() {
             pending.revoke();
             self.target = None;
@@ -380,8 +399,10 @@ impl Producer {
         {
             self.target = Some(ActualTarget::new(pending));
         }
-        // 先守原 Source/输入票，再借原槽判断真实前缀；尚未覆盖时没有查询要推进，
-        // 不为每个 Composer 回合搬出并放回整份目标。失权仍撤原请求，源首错仍先返回。
+        // Guard original Source/Input before checking actual prefix coverage; uncovered targets have no
+        // query work to advance,
+        // so do not move the entire target every Composer turn. Revoke the original request on stale
+        // authority while preserving Source-error priority.
         ticket.require_pure(owner, &self.source)?;
         let target = self.target.as_ref().ok_or(Error::Closed)?;
         if !target.request.current(owner) {
@@ -409,15 +430,18 @@ impl Producer {
                 return Ok(TargetAdvance::NeedPrefix);
             }
         }
-        // 以上只有纯票与同 Output 的范围观察，借用已结束；真正目录/Native 工作才取槽。
+        // The preceding pure checks observe the same output range and end their borrows; take target
+        // ownership for actual directory/Native work only.
         let mut target = self.target.take().ok_or(Error::Closed)?;
         let result = self.advance_actual_target(owner, ticket, &mut target);
         self.target = Some(target);
         result
     }
 
-    /// 唯一调用处已核原纯票、请求和未定锚点的前缀覆盖；取槽后不再重复这些检查。
-    /// 后续目录读取、Native reveal 及各自前后的当前性复核仍由原消费路径负责。
+    /// The sole caller checked original pure authority, request, and uncovered-anchor prefix coverage;
+    /// do not duplicate them after taking the slot.
+    /// The original consumption path still owns directory reads, Native reveal, and their pre/post
+    /// current checks.
     fn advance_actual_target(
         &mut self,
         owner: &Owner,
@@ -425,13 +449,17 @@ impl Producer {
         target: &mut ActualTarget,
     ) -> Result<TargetAdvance> {
         let at_eof = target.request.range.location == self.source.utf16_len();
-        // 同一量子最多256个真实64B目录读取；每part包含Line认证2条、Part2条和Directory3条，
-        // previous_line也包含原行认证与前驱两条。不能把API调用次数冒充真实record数。
+        // A quantum permits at most 256 actual 64-byte directory reads, with two Line checks, two Part
+        // records, and three Directory records per part;
+        // previous_line also performs original-line and predecessor checks. API call count cannot
+        // replace actual record accounting.
         let mut records_left = 256usize;
         if target.anchor.is_none() {
             let output = self.output.as_ref().cloned().ok_or(Error::Closed)?;
             if target.ordinal.is_none() {
                 if target.lookup.is_none() {
+                    // Only a caret can borrow directed wrap affinity; nonempty Find starts at its
+                    // actual downstream first scalar.
                     let upstream = if target.request.range.length == 0 {
                         let current = |epoch| owner.current(epoch) && target.request.current(owner);
                         let permit = owner
@@ -447,17 +475,21 @@ impl Producer {
                             && upstream == Some(true)
                     } else {
                         false
-                    }; // 普通Find非空首scalar固定Downstream；零caret才能消费同一Input真实换行侧。
+                    }; // Ordinary nonempty Find targets use Downstream; only a zero caret consumes actual same-Input wrap affinity.
                     target.lookup = Some(output.borrow_mut().line_lookup(
                         MarkdownComposedLineLookupTarget::Source {
                             utf16: target.request.range.location,
-                            // 真EOF与caret共用唯一文档末侧；若末尾有CRLF，必须滚入
-                            // 原尾空行，不能把前行的同整数end当作其可见锚点。
+                            // Actual EOF and its caret use the unique document-end side; a trailing
+                            // CRLF must reveal
+                            // the original trailing empty line rather than using the previous line
+                            // equal numeric end as its visible anchor.
                             affinity: if upstream && !at_eof {
                                 MarkdownComposedLineAffinity::Upstream
                             } else {
-                                // 非EOF仍沿原Input的换行侧；EOF下游查询返回真实last行，
-                                // 使有限逆扫窗口包含随后caret/行号必须消费的同一ordinal。
+                                // Non-EOF uses original Input wrap affinity; downstream EOF returns the
+                                // actual final line,
+                                // keeping the later caret/line-number ordinal inside the bounded
+                                // backward-scan window.
                                 MarkdownComposedLineAffinity::Downstream
                             },
                         },
@@ -492,7 +524,8 @@ impl Producer {
             }
             let ordinal = target.ordinal.ok_or(Error::Closed)?;
             if target.walk.is_none() {
-                // 选择实际已度量且位于目标之后的最近锚；所有锚只活在原Source/宽度Producer中。
+                // Choose the nearest actually measured anchor at/after the target; all anchors live in
+                // the original Source/width Producer only.
                 let mut seed = BottomSeed {
                     ordinal: self.lines.checked_sub(1).ok_or(Error::Unsupported)?,
                     bottom: self.height + self.padding,
@@ -556,6 +589,7 @@ impl Producer {
                 }
             }
             let walk = target.walk.as_mut().ok_or(Error::Closed)?;
+            // Share remaining record and part allowances across every measured line in this turn.
             let mut parts = METADATA_PER_TURN;
             for _ in 0..METADATA_PER_TURN {
                 if walk.metrics.is_none() {
@@ -616,7 +650,8 @@ impl Producer {
                     return Err(Error::Unsupported);
                 }
                 if records_left < 4 {
-                    // 度量虽已完成，前驱认证仍需四条原record；保留完成游标，下一轮不重读part。
+                    // Completed metrics still need four predecessor records; retain the complete cursor
+                    // rather than rereading parts next turn.
                     walk.metrics = Some(metrics);
                     owner.schedule()?;
                     return Ok(TargetAdvance::Handled);
@@ -647,7 +682,7 @@ impl Producer {
             )
             .is_some_and(|bottom| self.needs_document_prefix(bottom))
         {
-            return Ok(TargetAdvance::NeedPrefix); // 同一模式目标只补实际下方可见区，不用临时短前缀的页底约束认证原Y。
+            return Ok(TargetAdvance::NeedPrefix); // Extend the same mode target actual lower visible region only, without certifying original Y against temporary short-prefix page limits.
         }
         self.last_target_anchor = Some(anchor.clone());
         ticket.require(owner, &self.source)?;
@@ -657,28 +692,33 @@ impl Producer {
                 viewport.set_content_width(self.maximum_content_width)
             })?;
             owner.schedule()?;
-            return Ok(TargetAdvance::Handled); // 先归还旧横向范围，原目标在后继真实geometry继续。
+            return Ok(TargetAdvance::Handled); // Retire old horizontal geometry authority and resume the original target under actual successor geometry.
         }
         if viewport.geometry()?.content_height != self.height() {
             owner.native_preparation_geometry(&ticket.request, &viewport, || {
                 viewport.set_content_height(self.height())
             })?;
             owner.schedule()?;
-            return Ok(TargetAdvance::Handled); // 自有高度改变后不捕后继request给旧准备票补签。
+            return Ok(TargetAdvance::Handled); // An owned height change cannot let a captured successor request renew old preparation authority.
         }
-        // 原模式已经从真实 Scene 测得格内字形时，由模式恢复它的屏内位置。
-        // 整条表格行可能比首字形更高；再次最小滚入整行会与底边文字锚反复争夺滚动。
-        // 这里只继续当前视口发布，模式仍须在新 Scene 上取得实际字形与可见证明才完成。
+        // Once the original mode measures actual cell glyphs in a real Scene, that mode restores their
+        // on-screen position.
+        // A table row may exceed its first glyph height; repeatedly revealing the whole row would
+        // compete with its bottom text anchor.
+        // Continue current viewport publication only; the mode still needs actual glyph/visibility
+        // evidence from the new Scene before completion.
         if owner.mode_retains_measured_glyph(&target.request) {
             ticket.require(owner, &self.source)?;
             return Ok(TargetAdvance::VisibleBand);
         }
-        // 只有真实文首位置和原ordinal0同时成立才涵盖已有顶部留白；PageUp提交head0后
-        // 与DocStart共用此处，不得把首行top=padding的最小滚入误当文档已经返回y0。
+        // Include original top padding only for actual source position zero and original ordinal zero
+        // together; after PageUp commits head zero,
+        // share this with DocStart rather than treating minimal first-line top=padding reveal as
+        // document y-zero.
         let top = if target.request.range.location == 0 && anchor.ordinal == 0 {
             0.0
         } else {
-            anchor.top // 其他目标仍只滚入其真实行，不扩读前文或按估计行高调整页面。
+            anchor.top // Other targets reveal their actual line only, without earlier-text reads or estimated-height page adjustment.
         };
         let rect = NSRect::new(
             NSPoint::new(
@@ -699,13 +739,15 @@ impl Producer {
             if let Err(cause) = revealed {
                 let cause = Error::Viewport(cause);
                 if !cause.is_foreground_revocation() {
-                    return Err(cause); // 真Native几何错误也不能被同时发生的查询取消吞掉。
+                    return Err(cause); // Concurrent query cancellation cannot swallow an actual Native geometry failure.
                 }
             }
             ticket.require_pure(owner, &self.source)?;
             owner.schedule()?;
-            return Ok(TargetAdvance::Handled); // 自有scroll可能已改变几何；只撤Find，下一回合捕实际请求继续原Source。
+            return Ok(TargetAdvance::Handled); // Owned scroll may have changed geometry; revoke Find only and resume original Source on the next actual request.
         }
+        // Consume the single actual reveal outcome without replay; post-call request checks still
+        // preserve Source-error priority.
         let changed = revealed?;
         let current = target.request.current_native(owner);
         self.target_source_health()?;

@@ -1,8 +1,10 @@
-//! 真正 composer/Store 控制回归：隐藏正文仍在 canonical/mmap 内，只省略布局与内部命中。
+//! Actual composer/Store control regressions. Hidden text remains in canonical
+//! mmap storage while layout and internal hit testing omit it.
 
 use super::*;
 
-/// 经原样式/控制响应完成有限 fixture，记录真实行而不是构造 Store 或伪造 measure permit。
+/// Complete a finite fixture through original style/control responses and record
+/// actual lines, without manufacturing a Store or Measure permit.
 fn folded_output(
     text: &str,
     hidden: std::ops::Range<usize>,
@@ -26,6 +28,8 @@ fn folded_output(
         match progress.answer {
             MarkdownLineComposeAnswer::Yielded | MarkdownLineComposeAnswer::LineReady(_) => {}
             MarkdownLineComposeAnswer::NeedStyle(request) => {
+                // Hidden canonical bytes must never become a font/shaping request,
+                // even though the same original Source still owns those bytes.
                 let range = request.source_range();
                 assert!(
                     range.end <= hidden.start || range.start >= hidden.end,
@@ -70,7 +74,8 @@ fn folded_output(
 }
 
 #[test]
-// 多行隐藏只能成为一个零字形控制片；原 canonical 范围和输出 reader 的真实归还必须保留。
+// A hidden multiline section becomes one zero-glyph control part, preserving its
+// actual canonical range and the output reader's real release responsibility.
 fn folded_section_elides_real_lines_and_keeps_one_zero_glyph_canonical_part() {
     let text = "# H\r\nhidden one\r\nhidden two\r\n# N\r\nvisible";
     let hidden = 3..text.find("# N").unwrap();
@@ -104,7 +109,8 @@ fn folded_section_elides_real_lines_and_keeps_one_zero_glyph_canonical_part() {
 }
 
 #[test]
-// 无终止符的真实 EOF 没有后继软行；左右边界可以跨隐区，内部位置不能获得 caret 或 GCB。
+// Unterminated real EOF has no trailing soft line. Movement may cross only opaque
+// endpoints; positions inside the hidden range receive no caret/grapheme authority.
 fn folded_to_unterminated_eof_visual_right_crosses_only_the_real_opaque_endpoint() {
     let (_fixture, mut output, _font) = folded_output("# H\nbody", 3..8);
     let line = output.last_line().unwrap().unwrap();
@@ -152,7 +158,7 @@ fn folded_to_unterminated_eof_visual_right_crosses_only_the_real_opaque_endpoint
     assert!(matches!(
         output.grapheme_query(3, crate::MarkdownGraphemeQuery::Next).unwrap(),
         crate::MarkdownGraphemeAnswer::Known(Some(boundary)) if boundary.utf16 == 8
-    )); // typed 隐区拒绝不得关闭健康 reader，下一次真实端点查询仍能消费同一输出。
+    )); // A typed hidden-range refusal must preserve this healthy reader for real endpoint queries.
     assert!(matches!(
         output.visual_grapheme_query(&part, 4, true),
         Err(MarkdownLineComposeError::InvalidRequest)
@@ -175,7 +181,8 @@ fn folded_to_unterminated_eof_visual_right_crosses_only_the_real_opaque_endpoint
 }
 
 #[test]
-// 只有源中真实存在最后 CRLF 时才保留空 EOF 行，折叠不得新增或吞掉这个原段落。
+// Retain an empty EOF paragraph only when actual trailing CRLF exists. Folding
+// cannot invent or swallow that original paragraph.
 fn folded_real_trailing_crlf_preserves_the_original_empty_eof_paragraph() {
     let (_fixture, mut output, _font) = folded_output("# H\r\nbody\r\n", 3..11);
     let empty = output.last_line().unwrap().unwrap();
@@ -188,7 +195,8 @@ fn folded_real_trailing_crlf_preserves_the_original_empty_eof_paragraph() {
 
 #[cfg(feature = "paged-shaping-frontier")]
 #[test]
-// 巨型 RTL、组合字符和 emoji 隐区不得送进 Script/UBA/GCB 迁入；原 composer 只发布实际三行。
+// The huge RTL/combining/emoji hidden range never enters Script/UBA/grapheme
+// migration. The original composer publishes only the three actual visible lines.
 fn folded_giant_unicode_body_keeps_only_visible_lines_and_original_opaque_endpoints() {
     let body = "א中🙂e\u{301}\r\n".repeat(131_072);
     let text = format!("# H\r\n{body}# N\r\nafter");

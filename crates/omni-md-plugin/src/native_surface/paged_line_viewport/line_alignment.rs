@@ -1,4 +1,4 @@
-//! 同一真实LineEnd的对齐占位；尾空白只退出对齐宽度，不退出字形、光标或选择域。
+//! Alignment extent for one actual LineEnd; trailing whitespace leaves alignment width, not glyph/caret/selection domains.
 
 use super::*;
 use omni_markdown_core::{
@@ -6,7 +6,7 @@ use omni_markdown_core::{
     MarkdownLineComposeBudget, MarkdownShapingDirection, MarkdownTableAlignment,
 };
 
-/// 只携原弱行句柄及已完成的真实可见推进范围；调用方不能用任意float构造对齐结果。
+/// Carry the original weak line handle/completed actual visible extent; callers cannot manufacture alignment from arbitrary floats.
 pub struct NativeMarkdownMeasuredLine {
     handle: MarkdownComposedLine,
     extent: Option<Extent>,
@@ -22,7 +22,7 @@ impl From<MarkdownComposedLine> for NativeMarkdownMeasuredLine {
         Self {
             handle,
             extent: None,
-        } // 原literal/Left入口无需测尾；Center/Right在消费时必须持真实完成的extent。
+        } // Literal/Left needs no tail measurement; Center/Right requires an actual completed extent at consumption.
     }
 }
 
@@ -46,18 +46,18 @@ pub(super) fn alignment_origin_x(
     inset: f64,
     extent: Option<&Extent>,
 ) -> Result<f64> {
-    // 可用宽仍是本次真实排版 lane，不能用横向 clip 或整个 ScrollDocument 宽代替。
-    // 对齐只平移原封存行：全部尾空白和原选择域仍随同一 baseline 移动。
+    // Available width belongs to this actual layout lane, not the horizontal clip or full ScrollDocument.
+    // Alignment translates the sealed line only; all trailing whitespace/original selection follows that same baseline.
     let available = width - inset * 2.0;
     if !width.is_finite() || !inset.is_finite() || available <= 0.0 || width >= MAX_POINT {
         return Err(NativeMarkdownComposedViewportError::InvalidGeometry);
     }
     if alignment == MarkdownTableAlignment::Left {
-        return Ok(inset); // 左对齐不消费尾空白测量，也不改变原软行推进或选择端点。
+        return Ok(inset); // Left alignment consumes no trailing-whitespace measurement and changes neither soft-line advances nor selection endpoints.
     }
     let extent = extent.ok_or(NativeMarkdownComposedViewportError::Pending)?;
-    // RTL 的逻辑尾空白可能在视觉左侧。除了排可见宽，还必须减真实 left，
-    // 否则绘图看似居中，但该格 caret、Find 和点击会多出尾空白的整段偏移。
+    // Logical RTL trailing whitespace may lie at visual left. Subtract actual left in addition to using visible width,
+    // otherwise paint may look centered while Cell caret/Find/hits retain the whole trailing-space offset.
     let remaining = available - (extent.right - extent.left);
     let offset = match alignment {
         MarkdownTableAlignment::Left => unreachable!("左对齐已经沿原入口返回"),
@@ -71,7 +71,7 @@ pub(super) fn alignment_origin_x(
     Ok(origin)
 }
 
-/// 只归原LineMetrics持有的尾查询；不保Reader、Font、Source强边或另一份行目录。
+/// The original LineMetrics owns this tail query, retaining no reader/font/Source strong claims or second line directory.
 pub(in crate::native_surface) struct NativeMarkdownLineAlignmentMeasure {
     query: MarkdownComposedLineTrailingWhitespace,
     range: Range<usize>,
@@ -87,8 +87,8 @@ impl NativeMarkdownLineAlignmentMeasure {
         output: &RefCell<MarkdownComposedLines>,
         line: &MarkdownComposedLine,
     ) -> Result<Self> {
-        // begin 只封存原弱身份；真正 Source/目录读取全部留给后继有预算的 step。
-        // 这份度量不跨尺寸换代复用，完成后只随当前有限可见 handle 一起发布。
+        // begin captures weak original identity only; actual Source/directory reads occur in later budgeted steps.
+        // Do not reuse this measurement across size changes; publish completion with the current bounded visible handle only.
         let query = output
             .try_borrow()
             .map_err(|_| NativeMarkdownComposedViewportError::Busy)?
@@ -104,7 +104,7 @@ impl NativeMarkdownLineAlignmentMeasure {
         })
     }
 
-    /// 原Source/GCB尾查询使用调用者剩余量子；完成后只保真实UTF16末端，不能从字形id猜空格。
+    /// Use the caller's remaining Source/GCB quantum and retain only actual UTF-16 end; glyph IDs cannot identify whitespace.
     pub(in crate::native_surface) fn step_source(
         &mut self,
         output: &RefCell<MarkdownComposedLines>,
@@ -123,15 +123,15 @@ impl NativeMarkdownLineAlignmentMeasure {
         self.trim_end.is_some()
     }
 
-    /// 离屏Find消费同一完成extent；RTL尾空白在视觉左侧时也使用真实left，而非只减宽度。
+    /// Offscreen Find uses the same completed extent, including actual left for RTL trailing whitespace rather than subtracting width alone.
     pub(in crate::native_surface) fn origin_x(
         &self,
         alignment: MarkdownTableAlignment,
         width: f64,
         inset: f64,
     ) -> Result<f64> {
-        // Find 也等待同一整行量度，不能只遇到目标 part 就用它的局部 advance 居中。
-        // 已完成且全空白的行确实没有可见占位，不把它误判成缺失字体或未知宽度。
+        // Find also waits for complete line measurement; the target part's local advance alone cannot center the line.
+        // A completed all-whitespace line has actual empty visible extent, not a missing font/unknown width.
         if self.observed != self.parts || self.trim_end.is_none() {
             return Err(NativeMarkdownComposedViewportError::Pending);
         }
@@ -149,7 +149,7 @@ impl NativeMarkdownLineAlignmentMeasure {
         alignment_origin_x(alignment, width, inset, self.extent.as_ref())
     }
 
-    /// 复用原字体与原sealed part的caret，不重排或trim正文；逐part沿原metadata预算推进。
+    /// Reuse original font/sealed-part caret without relayout or trimming source text; advance parts under the existing metadata budget.
     pub(in crate::native_surface) fn observe_part(
         &mut self,
         output: &RefCell<MarkdownComposedLines>,
@@ -168,13 +168,13 @@ impl NativeMarkdownLineAlignmentMeasure {
             return Err(NativeMarkdownComposedViewportError::InvalidCoverage);
         }
         if facts.source_utf16.start < trim_end {
-            // 完整 part 的视觉推进由原 sealed facts 给出；这里不读整行文本、字形数组，
-            // 也不按 glyph id、名义 space 宽或 UTF16 长度推测实际空白。
+            // Actual sealed facts supply a full part's visual advance without reading whole-line text or glyph arrays,
+            // or inferring whitespace from glyph ID, nominal space width, or UTF-16 length.
             let mut left = facts.origin_x_26_6 as f64 / 64.0;
             let mut right = left + facts.x_advance_26_6 as f64 / 64.0;
             if trim_end < facts.source_utf16.end {
-                // Core 已将末端提升到原完整 GCB。混合 Prepend/空白整簇全部保留，
-                // 只有纯尾空白退出占位；现 caret 的 GDEF/cluster 规则仍是唯一几何来源。
+                // Core promoted the endpoint to a complete original grapheme, retaining mixed Prepend/whitespace clusters.
+                // Only pure trailing whitespace leaves the extent; existing caret GDEF/cluster rules remain the sole geometry source.
                 let caret = super::super::paged_line_geometry::composed_part_caret(
                     output,
                     part,
@@ -183,7 +183,7 @@ impl NativeMarkdownLineAlignmentMeasure {
                     CGPoint::ZERO,
                     current,
                 );
-                // 字体调用后先核真实Source/Reader首错，不能把同次EIO改写为前台撤权。
+                // After font calls check actual Source/reader failure first, preventing EIO from becoming foreground revocation.
                 output
                     .try_borrow()
                     .map_err(|_| NativeMarkdownComposedViewportError::Busy)?
@@ -199,27 +199,27 @@ impl NativeMarkdownLineAlignmentMeasure {
                 return Err(NativeMarkdownComposedViewportError::InvalidGeometry);
             }
             if let Some(extent) = self.extent.as_mut() {
-                // 原视觉 part 可有混合方向；联合实际左右边缘，不能把多个逻辑 advance
-                // 相加后假定从零开始，也不能用最后一个逻辑 part 代替整行占位。
+                // Visual parts may have mixed directions; union actual left/right edges rather than sum logical advances
+                // from an assumed zero origin or substitute the final logical part for complete line extent.
                 extent.left = extent.left.min(left);
                 extent.right = extent.right.max(right);
             } else {
                 self.extent = Some(Extent { left, right });
             }
         }
-        // 尾部 part 仍被真实遍历和计量，但不参加对齐占位；它的完整 handle/字形保持，
-        // 后继点击、选择和输入法仍能到达这些空格，不在此创建裁剪过的第二条行。
+        // Visit/account trailing parts even though they contribute no alignment extent; keep their complete handles/glyphs
+        // so hits, selection, and IME can reach those spaces without a second cropped line.
         self.observed += 1;
         Ok(())
     }
 
-    /// 完整原行才签具体MeasuredLine；全空白行使用真实空占位，原尾空白glyph仍保留在handle中。
+    /// Only a complete original line produces MeasuredLine; all-whitespace lines use actual empty extent while retaining trailing glyphs.
     pub(in crate::native_surface) fn finish(
         self,
         handle: MarkdownComposedLine,
     ) -> Result<NativeMarkdownMeasuredLine> {
-        // 句柄与完成度在原唯一 producer 内配对，外部不能拿别行或任意浮点值签对齐票。
-        // 关闭输出会自然撤销同一弱句柄；MeasuredLine 不保 Source、FD、字体或 Reader。
+        // The sole producer pairs original handle/completion; another line or arbitrary floats cannot manufacture alignment authority.
+        // Closing output naturally revokes its weak handle; MeasuredLine retains no Source, FD, font, or reader.
         if self.trim_end.is_none()
             || self.observed != self.parts
             || handle.facts().source_utf16 != self.range

@@ -1,4 +1,5 @@
-//! 原 SCX 续体先结清行前义务，表格内部不制造脚本 run；末真实硬控制恢复下一正文上下文。
+//! Settles original SCX obligations before a table row without inventing runs
+//! inside it. Its actual trailing hard control restores subsequent body context.
 
 use super::MarkdownScriptError as Error;
 use super::*;
@@ -12,7 +13,8 @@ pub(super) struct State {
 }
 
 impl MarkdownScriptJob {
-    /// 只分享同 Source 动态结构目录；普通正文仍保原 Printable/frontier 优化。
+    /// Shares a dynamic structural directory from this same source only. Ordinary
+    /// text retains its original printable/frontier optimization.
     pub(crate) fn install_table_plan(&mut self, plan: TablePlan) -> Result<()> {
         plan.require(&self.source)?;
         self.tables = Some(State {
@@ -25,7 +27,8 @@ impl MarkdownScriptJob {
     }
 }
 
-/// 同一量子只处理当前结构行，正文读取、记录和配对栈仍受原三个独立额度控制。
+/// Services only the current structural row in this quantum. Source bytes,
+/// records, and bracket-stack operations retain their independent budgets.
 pub(super) fn advance(
     job: &mut MarkdownScriptJob,
     budget: MarkdownScriptBudget,
@@ -39,13 +42,18 @@ pub(super) fn advance(
         return Ok(false);
     };
     if !state.jumped && job.machine.byte >= span.end.byte {
+        // Ordinary processing already passed this row; retire its cursor entry
+        // without replaying a structural jump or duplicating script coverage.
         state.cursor.finish();
         return Ok(true);
     }
     if job.machine.byte < span.start.byte {
+        // Earlier visible body text still belongs to ordinary SCX processing.
         return Ok(false);
     }
     if !state.jumped {
+        // Settle actual earlier obligations before recording the one structural
+        // hole. Only then may the machine move to the row's real tail controls.
         if !job
             .machine
             .settle_before_table(span, &mut job.store, step, budget)?
@@ -76,6 +84,8 @@ pub(super) fn advance(
         Ok(())
     })?;
     if state.read == size {
+        // Only the complete real CR/LF tail restores grapheme context and consumes
+        // this row. Partial samples remain owned by this same pending state.
         job.machine.finish_table(span, &state.tail[..size])?;
         state.cursor.finish();
         state.jumped = false;
@@ -85,7 +95,8 @@ pub(super) fn advance(
     Ok(true)
 }
 
-/// 普通扫描只到已授权结构行首；尚未取得原行票的地方继续原 Source 解析规则。
+/// Caps ordinary reads at an authorized row start. Positions lacking an original
+/// row receipt continue under the original source-parsing rules.
 pub(super) fn read_end(job: &MarkdownScriptJob, end: usize) -> usize {
     job.tables
         .as_ref()
@@ -93,7 +104,8 @@ pub(super) fn read_end(job: &MarkdownScriptJob, end: usize) -> usize {
         .map_or(end, |span| end.min(span.start.byte))
 }
 
-/// Script 的同步查询不把目录空洞解释成 Common、Latin 或不存在的真实 raw run。
+/// Synchronous script queries never reinterpret a structural-directory hole as
+/// Common, Latin, or an actual raw run that was never produced.
 pub(super) fn hidden(
     job: &MarkdownScriptJob,
     unit: MarkdownScriptUnit,

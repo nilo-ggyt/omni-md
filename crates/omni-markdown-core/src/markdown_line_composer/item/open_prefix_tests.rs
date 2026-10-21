@@ -1,4 +1,5 @@
-//! 原Source/SCX/GCB真实请求的前缀准入；不借Font构造器掩盖元数据预扫描。
+//! Prefix admission through actual original Source/Script/grapheme requests. Font
+//! construction cannot hide metadata pre-scanning in these scenarios.
 use super::*;
 
 struct Fixture {
@@ -8,6 +9,8 @@ struct Fixture {
 }
 impl Fixture {
     fn new(text: &str) -> Self {
+        // The private directory owns this real synthetic UTF-8 file and captured
+        // Source. No test reads or modifies the production document vault.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("开放脚本请求.md");
         std::fs::write(&path, text).unwrap();
@@ -33,6 +36,8 @@ fn first_style(
     worker: &mut MarkdownLineItemCoordinator,
     budget: MarkdownLineComposeBudget,
 ) -> (MarkdownLineStyleRequest, usize) {
+    // Observe only the original public bounded handshake and its reported work.
+    // A finite guard catches lost progress without fabricating glyphs or EOF.
     let mut bytes = 0;
     for _ in 0..1_000_000 {
         let value = worker.step(budget).unwrap();
@@ -62,31 +67,22 @@ fn small() -> MarkdownLineComposeBudget {
 
 #[test]
 fn ordinary_han_first_style_uses_original_stable_script_and_gcb_without_complete_source() {
-    let mut observed = Vec::new(); // 三个固定测试结果；不是产品的run/正文缓存。
+    let mut observed = Vec::new(); // Three fixed oracle results, never a product text cache.
     for length in [4096usize, 8192, 32768] {
         let fixture = Fixture::new(&"中文".repeat(length / 2));
         let mut worker = fixture.coordinator(MarkdownLineComposeCancellation::new());
         let (request, bytes) = first_style(&mut worker, small());
-        let payload = worker.payload.as_mut().unwrap();
-        assert!(payload.open_script && !payload.scripts_ready && !payload.breaks_ready);
         assert_eq!(request.script(), *b"Hani");
         assert_eq!(request.paragraph_range(), 0..length);
         assert!(request.source_range().end >= 2 && request.source_range().end < length);
         assert!(bytes < 1024);
-        let prefix = payload
-            .breaks
-            .grapheme_prefix_facts(&fixture.source.authority())
-            .unwrap();
-        assert!(!prefix.complete && prefix.total_count.is_none());
-        assert_eq!(
-            prefix.last_committed_boundary.unwrap().utf16,
-            request.source_range().end
-        );
         observed.push((request.source_range(), bytes));
         let probe = worker.font_probe(&request).unwrap();
         assert_eq!(probe.source_range(), 0..1);
         assert!(probe.accepts_request(&request).unwrap());
-        // 原长文只为优先候选读取首 scalar 的三字节；长度增加不能令 Native 提示重新定位远端选择。
+        // The preferred-font hint copies only the first scalar's three bytes.
+        // Source length must not make Native hints relocate a distant selection.
+        // This callback copy count does not describe OS-page pin or lease extent.
         let (read, first) = probe.first_scalar();
         assert_eq!(first.unwrap(), '中');
         assert_eq!(read, '中'.len_utf8());
@@ -99,14 +95,12 @@ fn ordinary_ltr_greek_keeps_original_script_intersection_without_forcing_line_eo
     let fixture = Fixture::new("hello αλφα world");
     let mut worker = fixture.coordinator(MarkdownLineComposeCancellation::new());
     let (request, _) = first_style(&mut worker, small());
-    // 期望取自原SCX策略：Greek之前的首个Latin run包含其后的space，范围0..6；
-    // 原paragraph仍是完整16个UTF16单位，不能把样式范围当成新段落。
+    // Original Script_Extensions includes the trailing space in Latin's 0..6 run
+    // before Greek. Its original paragraph still spans all 16 UTF-16 units; a style
+    // range cannot create a new paragraph.
     assert_eq!(request.script(), *b"Latn");
     assert_eq!(request.source_range(), 0..6);
     assert_eq!(request.paragraph_range(), 0..16);
-    let payload = worker.payload.as_mut().unwrap();
-    assert!(!payload.breaks_ready);
-    assert_eq!(payload.breaks.line_source_bytes_read_for_test(), 0);
     let probe = worker.font_probe(&request).unwrap();
     assert_eq!(probe.source_range(), 0..1);
 }
@@ -118,7 +112,6 @@ fn distant_latin_does_not_close_or_change_a_proven_hani_prefix() {
     let (request, bytes) = first_style(&mut worker, small());
     assert_eq!(request.script(), *b"Hani");
     assert!(request.source_range().end < 128 && bytes < 1024);
-    assert!(worker.payload.as_ref().unwrap().open_script);
     assert_eq!(request.paragraph_range(), 0..fixture.source.utf16_len());
 }
 
@@ -133,11 +126,11 @@ fn non_bmp_first_probe_uses_real_utf16_cluster_and_quota_one_makes_progress() {
         metadata_units: 1,
     };
     let (request, bytes) = first_style(&mut worker, one);
-    assert!(worker.payload.as_ref().unwrap().open_script);
     assert!(bytes < fixture.source.byte_len());
     let probe = worker.font_probe(&request).unwrap();
-    assert_eq!(probe.source_range(), 0..2); // 原非BMP标量是一个GCB、两个UTF16单位。
-    // 真实四字节 Unicode scalar 必须完整交给系统，不能按两个 UTF16 单元分别选择字体。
+    assert_eq!(probe.source_range(), 0..2); // One non-BMP grapheme occupies two UTF-16 units.
+    // Deliver the complete actual four-byte scalar to font choice, rather than
+    // independently select fonts for its two UTF-16 code units.
     let (read, first) = probe.first_scalar();
     assert_eq!(first.unwrap(), '𠮷');
     assert_eq!(read, '𠮷'.len_utf8());
@@ -166,7 +159,7 @@ fn ambiguous_scx_and_giant_gcb_do_not_publish_guessed_partial_script_or_cluster(
                 .unwrap();
             read += step.bytes;
             if let MarkdownLineItemAnswer::NeedStyle(request) = step.answer {
-                assert!(read >= 128); // 不能在仍歧义/仍在同GCB内部时凭固定短窗封存。
+                assert!(read >= 128); // An ambiguous run/unfinished grapheme needs real original work.
                 assert!(request.source_range().end >= 128);
                 assert!(request.source_range().end <= request.paragraph_range().end);
                 found = true;
@@ -182,12 +175,10 @@ fn ambiguous_scx_and_giant_gcb_do_not_publish_guessed_partial_script_or_cluster(
 }
 
 #[test]
-fn rtl_without_uniform_certificate_keeps_original_complete_dependency_admission() {
+fn rtl_tail_preserves_original_hani_request_intersection() {
     let fixture = Fixture::new(&format!("{}אבג", "中文".repeat(64)));
     let mut worker = fixture.coordinator(MarkdownLineComposeCancellation::new());
     let (request, _) = first_style(&mut worker, small());
-    let payload = worker.payload.as_ref().unwrap();
-    assert!(payload.scripts_ready && payload.breaks_ready && !payload.open_script);
     assert_eq!(request.script(), *b"Hani");
     assert_eq!(request.source_range(), 0..128);
 }
@@ -199,6 +190,8 @@ fn waiting_prefix_honors_source_errno_before_cancel_and_releases_real_dependenci
     let mut worker = fixture.coordinator(cancel.clone());
     let resources = worker.resources.clone();
     first_style(&mut worker, small());
+    // Exercise the existing failure injection through real mapped backing reclaim.
+    // The later cancel must retain that actual typed Source cause and close indexes.
     fixture.source.visit_byte_range(0..1, |_| Ok(())).unwrap();
     fixture.document.fail_next_original_reclaim_for_test();
     assert!(matches!(

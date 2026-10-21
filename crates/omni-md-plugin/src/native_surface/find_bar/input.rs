@@ -1,8 +1,10 @@
-//! 原字段协议栈与通知共同观察组合输入；只保弱身份和标量，不接管 AppKit 输入或历史。
+//! Observe composition through the original field's protocol stack and notifications.
+//! Keep only weak identities and scalar facts; AppKit retains input and history ownership.
 
 use super::*;
 
-/// 五种真实入口各最多 128 条；仅诊断已取得的标量，不为日志读取候选或添加 Native 操作。
+/// Bound each of the five diagnostic entry categories to 128 records. Log only facts
+/// already obtained by the caller; diagnostics must not read candidates or call Native.
 #[cfg(feature = "native-markdown-runtime-probe")]
 fn trace_find_input(selector: &'static str, stage: &'static str, details: std::fmt::Arguments<'_>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,7 +23,8 @@ fn trace_find_input(selector: &'static str, stage: &'static str, details: std::f
     }
 }
 
-/// 仅在一次真实公开输入协议栈内存在；票不拥有栏、字段、controller 或正文。
+/// Exists only within one actual public input-protocol stack. This ticket owns no
+/// bar, field, controller, or document and cannot keep a closed session alive.
 struct NativeMarkdownFindInputTicket {
     feedback: NativeMarkdownFindViewportFeedback,
     bar: std::rc::Weak<NativeMarkdownFindBar>,
@@ -36,7 +39,8 @@ struct NativeMarkdownFindInputTicket {
 }
 
 impl NativeMarkdownFindInputTicket {
-    /// 输入前固定真实窗口 delegate 和具体客户端，getter 后始终核同一原票。
+    /// Capture the actual window delegate and specific client before input. Recheck
+    /// the original client revision after every potentially reentrant getter.
     fn capture(editor: &NSTextView, _selector: &'static str) -> Option<Self> {
         let session = editor.downcast_ref::<NativeMarkdownSessionFieldEditor>()?;
         let client_revision = session.input_client_revision();
@@ -78,7 +82,8 @@ impl NativeMarkdownFindInputTicket {
                     session.input_client_revision()
                 ),
             );
-            return None; // window getter 已重入重新交付，不能从后继客户端开始领取原输入票。
+            // The window getter reassigned the editor; its successor cannot authorize this input.
+            return None;
         }
         let Some(delegate) = window.delegate() else {
             #[cfg(feature = "native-markdown-runtime-probe")]
@@ -99,7 +104,8 @@ impl NativeMarkdownFindInputTicket {
                     session.input_client_revision()
                 ),
             );
-            return None; // delegate getter 同样可能换客户；此时尚无权限读取任何具体栏字段。
+            // Delegate lookup can also change clients; no specific field is authorized yet.
+            return None;
         }
         let object: &AnyObject = AsRef::<AnyObject>::as_ref(&*delegate);
         #[cfg(feature = "native-markdown-runtime-probe")]
@@ -128,7 +134,8 @@ impl NativeMarkdownFindInputTicket {
                 "capture_foreign_session",
                 format_args!("revision={client_revision}"),
             );
-            return None; // 旧会话 editor 即使暂留在同窗口，也不能借新 controller 的输入能力。
+            // A previous session's editor cannot borrow the new controller's input authority.
+            return None;
         }
         let Some(bar) = controller.current_find_input_bar() else {
             #[cfg(feature = "native-markdown-runtime-probe")]
@@ -156,6 +163,8 @@ impl NativeMarkdownFindInputTicket {
             );
             return None;
         };
+        // Feedback, client revision, and the original undo/resource owners must all agree;
+        // a surviving window or editor address alone cannot establish session identity.
         let current = || {
             feedback.current(controller)
                 && session.input_client_revision() == client_revision
@@ -190,7 +199,7 @@ impl NativeMarkdownFindInputTicket {
         let editor_address = std::ptr::from_ref(editor).addr();
         let mut original = None;
         for field in fields {
-            // 诊断直接标识实际字段；普通构建不保留仅供日志使用的遍历编号。
+            // Identify actual fields in diagnostics without adding a release-build traversal counter.
             #[cfg(feature = "native-markdown-runtime-probe")]
             let field_address = std::ptr::from_ref(&*field).addr();
             let Ok(actual) = native_markdown_table_intent_step(&current, || field.currentEditor())
@@ -232,7 +241,9 @@ impl NativeMarkdownFindInputTicket {
                             "field_address={field_address} editor={editor_address} revision={client_revision}"
                         ),
                     );
-                    return None; // 两字段同时声明同一客户端没有唯一来源，不按遍历顺序任选一个。
+                    // Two fields claiming one editor have no unique source; traversal order
+                    // must not decide which query or replacement field receives this input.
+                    return None;
                 }
                 let Ok(weak) =
                     native_markdown_table_intent_step(&current, || Weak::from_retained(&field))
@@ -284,7 +295,8 @@ impl NativeMarkdownFindInputTicket {
         })
     }
 
-    /// 通知只向原具体 field 的活协议栈归并；此检查无 Native 调用，可在短借用内完成。
+    /// Merge notifications only into the original field's live protocol stack.
+    /// This scalar-only check is safe while the ticket has a short RefCell borrow.
     fn accepts_notification(
         &self,
         controller: &NativeMarkdownController,
@@ -296,7 +308,8 @@ impl NativeMarkdownFindInputTicket {
             && self.feedback.current(controller)
     }
 
-    /// 最外层 super 已结束才读取最终组合状态；绝不从 after 的当前客户重新捕获身份。
+    /// Read final composition only after the outermost super call returns. The
+    /// current client after that call cannot replace the ticket's original identity.
     fn finish(self, original_editor: &NSTextView) {
         #[cfg(feature = "native-markdown-runtime-probe")]
         trace_find_input(
@@ -316,7 +329,8 @@ impl NativeMarkdownFindInputTicket {
             return;
         };
         if std::ptr::from_ref(original_editor).addr() != self.editor_address {
-            return; // 票只能交回仍在原实际协议或事件栈上的 editor 引用，不能由另一个receiver消费。
+            // Only the editor on the original protocol/event stack may consume this ticket.
+            return;
         }
         let Some(controller) = self.controller.load() else {
             #[cfg(feature = "native-markdown-runtime-probe")]
@@ -325,7 +339,8 @@ impl NativeMarkdownFindInputTicket {
                 "finish_controller_none",
                 format_args!("expected_revision={}", self.client_revision),
             );
-            return; // 原窗口已结束，没有可恢复的反馈目标。
+            // The original window ended; there is no feedback destination to recover.
+            return;
         };
         let current = || {
             self.feedback.current(&controller)
@@ -347,7 +362,8 @@ impl NativeMarkdownFindInputTicket {
                     self.feedback.current(&controller)
                 ),
             );
-            return; // getter 重入、关闭或原字段销毁都丢弃本票，不观察后继客户端。
+            // Reentry, closure, or field destruction invalidates this ticket; do not inspect a successor.
+            return;
         };
         let Ok(actual) = native_markdown_table_intent_step(&current, || field.currentEditor())
         else {
@@ -384,7 +400,8 @@ impl NativeMarkdownFindInputTicket {
                 if !self.ended && std::ptr::from_ref(&*actual).addr() == self.editor_address =>
             {
                 let Some(editor) = actual.downcast_ref::<NSTextView>() else {
-                    return; // 只有原实际 NSTextView 能提供公开的组合状态。
+                    // Only the original actual NSTextView can supply the public marked-text state.
+                    return;
                 };
                 let Ok(marked) =
                     native_markdown_table_intent_step(&current, || editor.hasMarkedText())
@@ -404,7 +421,9 @@ impl NativeMarkdownFindInputTicket {
                 };
                 marked
             }
-            None if self.ended => false, // 同 field 的真实 didEnd 已证明结束，且没有重入的新客户端。
+            // The original field's real didEnd notification and absence of a replacement
+            // client together establish that its composition ended.
+            None if self.ended => false,
             _ => {
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 trace_find_input(
@@ -417,7 +436,8 @@ impl NativeMarkdownFindInputTicket {
                         session.input_client_revision()
                     ),
                 );
-                return; // 同 editor 被别的字段复用、或旧 field 重新开始，都不能续接原输入。
+                // Editor reuse by another field or a restarted original field cannot continue this input.
+                return;
             }
         };
         let Ok(confirmed) = native_markdown_table_intent_step(&current, || field.currentEditor())
@@ -436,13 +456,15 @@ impl NativeMarkdownFindInputTicket {
             return;
         };
         let same_client = if self.ended {
-            confirmed.is_none() // 真实结束还须保持无客户端，不能仅凭早先一次 nil 续接。
+            // A completed field must still have no client; the earlier nil result is insufficient.
+            confirmed.is_none()
         } else {
             confirmed
                 .as_ref()
                 .is_some_and(|editor| std::ptr::from_ref(&**editor).addr() == self.editor_address)
         };
-        drop(confirmed); // 当前 editor 的临时 +1 归还也可能重入；最后仍核原票再写标量。
+        // Returning the temporary native claim can reenter too; validate once more before publication.
+        drop(confirmed);
         if !same_client || !current() {
             #[cfg(feature = "native-markdown-runtime-probe")]
             trace_find_input(
@@ -471,7 +493,8 @@ impl NativeMarkdownFindInputTicket {
     }
 }
 
-/// 真实嵌套协议只共享一份弱票；结束后没有常驻事件、文本或第二个编辑 owner。
+/// Nested protocol calls share one weak ticket. No event, text buffer, or second
+/// editing owner remains resident after the actual protocol stack unwinds.
 #[derive(Default)]
 pub(in crate::native_surface) struct NativeMarkdownFindProtocolState {
     depth: Cell<usize>,
@@ -479,7 +502,8 @@ pub(in crate::native_surface) struct NativeMarkdownFindProtocolState {
 }
 
 impl NativeMarkdownFindProtocolState {
-    /// 先建立栈深度再调用可重入 getter；嵌套协议不能覆盖最外层原客户端票。
+    /// Establish nesting before reentrant getters. A nested protocol call must not
+    /// replace the outermost call's original client ticket.
     pub(in crate::native_surface) fn enter<'a>(
         &'a self,
         editor: &'a NSTextView,
@@ -499,12 +523,14 @@ impl NativeMarkdownFindProtocolState {
         if depth == 0 {
             let ticket = NativeMarkdownFindInputTicket::capture(editor, _selector);
             let previous = self.ticket.replace(ticket);
-            drop(previous); // 弱 claim 的析构也在 RefCell 借用结束之后。
+            // Weak-claim destruction occurs after the RefCell borrow has ended.
+            drop(previous);
         }
         scope
     }
 
-    /// 原字段通知只记录一次发生事实，最终是否提交由最外层真实 marked 状态决定。
+    /// Accumulate notification facts for this original field; only the outermost
+    /// call's actual marked-text state decides whether committed feedback is ready.
     pub(in crate::native_surface) fn defer_notification(
         &self,
         controller: &NativeMarkdownController,
@@ -518,7 +544,8 @@ impl NativeMarkdownFindProtocolState {
             .as_mut()
             .filter(|ticket| ticket.accepts_notification(controller, field, client_revision))
         else {
-            return false; // 不属于该原栈的通知继续正常即时路径，不吞掉其他真实输入。
+            // An unrelated notification follows its normal immediate path rather than being swallowed.
+            return false;
         };
         ticket.notified_change |= changed;
         ticket.ended |= ended;
@@ -534,13 +561,15 @@ impl NativeMarkdownFindProtocolState {
         true
     }
 
-    /// accepted 清理撤掉弱票，但深度仍由实际尚未退出的协议栈逐层归还。
+    /// Accepted cleanup revokes the weak ticket. Actual outstanding protocol scopes
+    /// still own, and must return, their nesting depth.
     pub(in crate::native_surface) fn seal(&self) {
         let previous = self.ticket.take();
         drop(previous);
     }
 
-    /// 只有真正最外层退出才移动票；没有 getter、状态借用或输入观察混在深度归还中。
+    /// Move the ticket only when the actual outermost scope leaves. Depth accounting
+    /// performs no Native getters, input observation, or borrowed-state publication.
     fn leave(&self) -> Option<NativeMarkdownFindInputTicket> {
         let depth = self
             .depth
@@ -552,7 +581,8 @@ impl NativeMarkdownFindProtocolState {
     }
 }
 
-/// 本 guard 只配对公开协议调用栈，Rust unwind 时不运行 Native 反馈或伪装成功。
+/// Pair actual public protocol calls. Rust unwinding revokes the ticket without
+/// running Native feedback or pretending the interrupted input completed.
 pub(in crate::native_surface) struct NativeMarkdownFindProtocolScope<'a> {
     state: &'a NativeMarkdownFindProtocolState,
     editor: &'a NSTextView,
@@ -561,7 +591,8 @@ pub(in crate::native_surface) struct NativeMarkdownFindProtocolScope<'a> {
 }
 
 impl NativeMarkdownFindProtocolScope<'_> {
-    /// super 返回后先结束所有栈状态借用，再允许反馈 setter 触发新的输入。
+    /// End stack-state borrows after super returns, before feedback setters may
+    /// reenter and begin a new input protocol.
     pub(in crate::native_surface) fn finish(mut self) {
         self.active = false;
         let ticket = self.state.leave();
@@ -584,13 +615,15 @@ impl NativeMarkdownFindProtocolScope<'_> {
 impl Drop for NativeMarkdownFindProtocolScope<'_> {
     fn drop(&mut self) {
         if self.active {
-            drop(self.state.leave()); // 异常路径只撤原弱能力，不更新组合标量或发布反馈。
+            // Unwinding revokes only the original weak capability; it publishes no composition state.
+            drop(self.state.leave());
         }
     }
 }
 
 impl NativeMarkdownFindBar {
-    /// 先记录本字段最终组合状态，再撤旧反馈；setter 重入不能让外层覆盖后继状态。
+    /// Store this field's final composition state before revoking old feedback, so
+    /// setter reentry cannot let this outer call overwrite a successor's state.
     fn publish_input_state(
         &self,
         controller: &NativeMarkdownController,
@@ -623,14 +656,16 @@ impl NativeMarkdownFindBar {
                 .current_find_input_bar()
                 .filter(|bar| std::ptr::eq(&**bar, self))
         {
-            // 组合开始/结束各撤一次；true→true 候选变化不读值也不反复刷新。
+            // Revoke once at composition start/end. Candidate changes while still
+            // marked neither read field text nor repeatedly refresh the query.
             controller.enqueue_find_input_feedback(&bar, refresh);
         }
     }
 }
 
 impl NativeMarkdownController {
-    /// 项目字段通知与协议栈共用实际状态观察；只认原栏的具体字段，不按 tag 归属。
+    /// Field notifications and protocol calls share actual input-state observation.
+    /// Membership comes from the original bar's field identity, never a numeric tag.
     pub(in crate::native_surface) fn observe_find_control_input(
         &self,
         field: &NSTextField,
@@ -648,7 +683,9 @@ impl NativeMarkdownController {
             .field_editor_provider
             .defer_find_input(self, field, changed, ended)
         {
-            return true; // 历史和字段结束仍由原通知继续执行，仅 Find 延迟到实际最外层协议返回。
+            // History/end-editing keep their original notification path; only Find
+            // feedback waits until the actual outermost protocol call returns.
+            return true;
         }
         let Some(feedback) = NativeMarkdownFindViewportFeedback::capture(
             &bar,
@@ -656,7 +693,8 @@ impl NativeMarkdownController {
             self.find_input_intent(),
             false,
         ) else {
-            return true; // 原栏已封闭或正文已换，不能把通知移到后继查询。
+            // The original bar closed or body changed; the notification cannot migrate to a successor query.
+            return true;
         };
         let current = || feedback.current(self);
         let Ok(actual) = native_markdown_table_intent_step(&current, || field.currentEditor())
@@ -670,10 +708,13 @@ impl NativeMarkdownController {
                 };
                 let Some(session) = editor.downcast_ref::<NativeMarkdownSessionFieldEditor>()
                 else {
-                    return true; // 外来共享 editor 的标量不能写回本会话字段，历史路径仍保留原归属错误。
+                    // A foreign shared editor cannot publish scalars into this session;
+                    // the history path retains responsibility for its ownership error.
+                    return true;
                 };
                 if !session.belongs_to(&self.ivars().undo, &self.ivars().owned) {
-                    return true; // 类型相同也不能借另一窗口的 Undo/ledger 身份读取当前字段状态。
+                    // Matching types do not authorize reading another window's undo/ledger client.
+                    return true;
                 }
                 let address = std::ptr::from_ref(editor).addr();
                 let revision = session.input_client_revision();
@@ -692,8 +733,11 @@ impl NativeMarkdownController {
                 };
                 (marked, Some((address, revision)))
             }
-            None if ended => (false, None), // 真实 didEnd 的原字段没有新客户端，组合状态可以正常结束。
-            None => return true, // begin/change 失去实际 editor 时不猜未 marked，也不读取控件候选值。
+            // A real didEnd with no replacement client can end the original composition.
+            None if ended => (false, None),
+            // Begin/change without the actual editor cannot guess an unmarked state
+            // or inspect the control's still-uncommitted candidate value.
+            None => return true,
         };
         let current = || {
             feedback.current(self)
@@ -712,11 +756,14 @@ impl NativeMarkdownController {
             Some((address, _)) => confirmed
                 .as_ref()
                 .is_some_and(|editor| std::ptr::from_ref(&**editor).addr() == address),
-            None => confirmed.is_none(), // 结束后若已出现新客户端，旧通知不得清其组合状态。
+            // A new client after didEnd must keep its own composition state untouched.
+            None => confirmed.is_none(),
         };
         drop(confirmed);
         if !same_client || !current() {
-            return true; // 最后 Native claim 的析构也已结束，失权时不更新 marked 或安排旧反馈。
+            // Even the last native-claim release has completed; revoked authority
+            // cannot update marked state or enqueue stale feedback.
+            return true;
         }
         if current() {
             bar.publish_input_state(self, field, marked, changed, "notification");
@@ -724,7 +771,8 @@ impl NativeMarkdownController {
         true
     }
 
-    /// 原 Panel 事件后只补状态跃迁；协议 hook 或通知已经完成的输入不会重复推进意图。
+    /// After the original Panel event, fill only missing state transitions. Input
+    /// already observed by protocol hooks/notifications must not advance intent twice.
     pub(in crate::native_surface) fn observe_find_native_editor(&self, editor: &NSTextView) {
         if let Some(ticket) = NativeMarkdownFindInputTicket::capture(editor, "observe")
             && ticket.feedback.current(self)

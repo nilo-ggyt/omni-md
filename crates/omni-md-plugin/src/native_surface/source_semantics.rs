@@ -1,6 +1,9 @@
-//! 一个storage只有一个来源续体；有限step由真实可见准备接入，getter只消费同源已发布结果。
+//! One storage owns one source continuation. Actual visible preparation schedules
+//! bounded steps; getters consume only published results of the same source.
 //!
-//! 首次同步TextKit排版、逆向缺checkpoint及未覆盖语法仍保留旧路径，不能据此声称严格懒加载。
+//! Initial synchronous TextKit layout, reverse requests without checkpoints, and
+//! uncovered syntax still use the existing TextKit/reference path. This adapter
+//! alone therefore does not establish strict viewport-only loading for that path.
 
 use super::*;
 use omni_markdown_core::markdown_document_buffer::{
@@ -14,7 +17,8 @@ const SOURCE_STEP: usize = 4096;
 const MAX_SOURCE_VIEWPORT: usize = 16_384;
 
 #[derive(Clone)]
-/// 原输入上下文与完整方向固定后不可补签；字体scratch和表格几何变化不改变Core来源身份。
+/// Original input context and complete selection direction cannot be reacquired
+/// afterward. Font scratch/table geometry changes do not change Core source identity.
 struct SourceKey {
     document: WeakMarkdownDocument,
     generation: u64,
@@ -24,7 +28,8 @@ struct SourceKey {
     input_epoch: u64,
 }
 
-/// Core完成与Native提交是两个边界；候选不参与getter，旧结果保留到同批Native键一并切换。
+/// Core completion and Native publication are separate boundaries. Getters cannot
+/// see candidates; keep the old result until the same batch switches Native keys.
 #[derive(Default)]
 struct SourcePublications {
     committed: Option<Rc<VerifiedMarkdownViewportSources>>,
@@ -32,15 +37,18 @@ struct SourcePublications {
 }
 
 impl SourcePublications {
+    /// Stage one completed Core result while preserving the last committed getter
+    /// source. A second candidate cannot replace an unfinished Native publication.
     fn stage(&mut self, source: VerifiedMarkdownViewportSources) -> bool {
         if self.staged.is_some() {
-            return false; // 一个原请求只容许一个待提交publication，不覆盖尚未完成Native提交的候选。
+            return false; // One original request permits only one candidate awaiting Native commit.
         }
         self.staged = Some(Rc::new(source));
         true
     }
 
-    /// 调用者须先完成同源/settled核验，随后无Native调用地切换字体和预览键。
+    /// Callers first verify original-source/settled authority, then switch font and
+    /// preview keys without Native calls. Return the prior claim for later destruction.
     fn commit_staged(&mut self) -> Option<Option<Rc<VerifiedMarkdownViewportSources>>> {
         let source = self.staged.take()?;
         Some(self.committed.replace(source))
@@ -48,6 +56,8 @@ impl SourcePublications {
 }
 
 impl SourceKey {
+    /// Scalar equality is necessary but insufficient: weak allocation identity
+    /// separately prevents equal generations in different documents from matching.
     fn matches(&self, other: &Self) -> bool {
         std::rc::Weak::ptr_eq(&self.document, &other.document)
             && self.generation == other.generation
@@ -65,7 +75,8 @@ impl SourceKey {
     }
 }
 
-/// 请求和publication都只由本storage槽保有；排队任务只有Weak，关闭不会被续体保活。
+/// This storage slot owns the request/publications. Queued tasks retain weak
+/// identities only, so a continuation cannot keep the closed graph alive.
 pub(in crate::native_surface) struct NativeMarkdownSourceOwner {
     key: SourceKey,
     view: Weak<PieceBackedMarkdownTextView>,
@@ -80,38 +91,43 @@ pub(in crate::native_surface) struct NativeMarkdownSourceOwner {
 }
 
 impl NativeMarkdownSourceOwner {
+    /// Seal this original continuation immediately. Discard uncommitted output and
+    /// cancel Core scratch locally rather than waiting for a later queued callback.
     fn stop(&self) {
         self.pending.set(false);
         self.publication_pending.set(false);
         self.failed.set(true);
         let staged = self.publications.borrow_mut().staged.take();
-        drop(staged); // 失败候选不得泄漏给getter；旧committed仍只能通过自身原来源核验读取。
+        drop(staged); // Failed candidates never reach getters; old committed output still requires its own original-source checks.
         let mut request = self.request.borrow_mut().take();
         if let Some(request) = request.as_mut() {
-            request.cancel(); // 原Core续体同步固定取消并释放scratch，不等待Weak任务再次运行。
+            request.cancel(); // Core synchronously fixes cancellation and returns scratch without another weak-task turn.
         }
         drop(request);
     }
 }
 
 #[derive(Clone)]
-/// 无表证明只弱持同一Sources publication，既不复制目录也不把普通gap升级为Plain。
+/// A no-table proof weakly identifies the same Sources publication. It neither
+/// copies indexes nor promotes an ordinary gap into proved plain semantics.
 pub(in crate::native_surface) struct NativeMarkdownNoTablesProof {
     source: std::rc::Weak<VerifiedMarkdownViewportSources>,
     window: Range<usize>,
 }
 
 impl NativeMarkdownNoTablesProof {
+    /// Require this exact publication still in the current owner's committed slot
+    /// before consulting its original document coverage. No Native getters are used.
     pub(in crate::native_surface) fn is_current(
         &self,
         storage: &PieceBackedMarkdownTextStorage,
         document: &MarkdownDocumentBuffer,
     ) -> bool {
         let Some(owner) = storage.current_source_owner() else {
-            return false; // 新输入或关闭不能借相同数值保活旧无表收据。
+            return false; // New input or closure cannot preserve an old no-table receipt through equal scalar values.
         };
         let Some(source) = self.source.upgrade() else {
-            return false; // 原publication已离开唯一槽，不重建另一份同坐标来源。
+            return false; // The original publication ended; do not reconstruct another source with equal coordinates.
         };
         let owns = owner
             .publications
@@ -123,7 +139,8 @@ impl NativeMarkdownNoTablesProof {
     }
 }
 
-/// 只接受同一Sources中真实Gap的连续覆盖；相交Table、空洞和覆盖外一律没有无表权限。
+/// Require continuous actual Gap coverage in this same Sources object. An
+/// intersecting table, coverage hole, or out-of-coverage range has no no-table authority.
 fn no_tables_covered(
     sources: &VerifiedMarkdownViewportSources,
     document: &MarkdownDocumentBuffer,
@@ -131,7 +148,7 @@ fn no_tables_covered(
     requested: &Range<usize>,
 ) -> bool {
     if requested.is_empty() {
-        return false; // 空快照不能被当作一份已经完成的可见语义。
+        return false; // Empty snapshots cannot establish completed visible semantics.
     }
     let Ok(table) = sources.table_sources_for(document, authority) else {
         return false;
@@ -143,13 +160,13 @@ fn no_tables_covered(
     for part in coverage {
         let range = part.utf16_range();
         if range.end <= cursor {
-            continue; // 真实目录按源序排列，只跳过当前请求之前的已证段。
+            continue; // Actual coverage is source-ordered; skip only proved segments before this request.
         }
         if range.start > cursor {
-            return false; // 不能用首尾gap的包络填补未知中段。
+            return false; // The envelope of surrounding gaps cannot fill an unknown middle segment.
         }
         let MarkdownTableViewportCoverage::Gap { gap_index, .. } = part else {
-            return false; // 当前位置属于真实Table，必须继续原表格功能路径。
+            return false; // Actual table coverage must retain the existing table feature path.
         };
         let Ok(Some(gap)) = table.gap_at_for(document, *gap_index) else {
             return false;
@@ -158,17 +175,18 @@ fn no_tables_covered(
             return false;
         };
         if actual.start > range.start || actual.end < range.end {
-            return false; // coverage必须仍由这一原gap记录持有，不能只比较几个整数。
+            return false; // Coverage must belong to this original gap record; coordinate comparison alone cannot authorize it.
         }
         cursor = range.end.min(requested.end);
         if cursor == requested.end {
-            return true; // 每个字符都有真实无表证明；仍未声明普通inline样式已完成。
+            return true; // Every requested character has actual no-table coverage, without claiming inline semantics are ready.
         }
     }
     false
 }
 
-/// 来源优化不能撤销正在等待原几何/paint的前台动作；只在真实settled事件后消费一次发布。
+/// Source optimization cannot revoke foreground actions waiting for original
+/// geometry/paint. Consume publication only after an actual settled event.
 fn publication_is_settled(view: &PieceBackedMarkdownTextView) -> bool {
     let settled = !view.ivars().textkit_graph_teardown.get()
         && view.ivars().textkit_input_depth.get() == 0
@@ -185,7 +203,7 @@ fn publication_is_settled(view: &PieceBackedMarkdownTextView) -> bool {
         && view.ivars().pending_table_cell_activation.is_empty();
     #[cfg(feature = "native-table-row-append")]
     {
-        settled && !view.table_append_pending() // 原末格续体尚持提交权时，也不能让新派生键撤旧几何。
+        settled && !view.table_append_pending() // A final-cell continuation still owning commit authority also protects its original geometry.
     }
     #[cfg(not(feature = "native-table-row-append"))]
     {
@@ -194,13 +212,15 @@ fn publication_is_settled(view: &PieceBackedMarkdownTextView) -> bool {
 }
 
 impl PieceBackedMarkdownTextStorage {
+    /// Capture only stable original input metadata. Composition and incomplete
+    /// Native transactions cannot authorize derived source preparation/publication.
     fn source_key(&self) -> Option<SourceKey> {
         if !self.ivars().accepts_edits.get()
             || self.ivars().composition_active.get()
             || self.ivars().native_input_depth.get() != 0
             || self.ivars().input_transaction.borrow().is_some()
         {
-            return None; // 临时输入阶段不推进或发布派生来源，后继原准备事件可重新申请。
+            return None; // A later actual preparation event may request work after this temporary input stage ends.
         }
         let semantic_epoch = self.ivars().presentation_semantic_epoch.get()?;
         let document = self.document()?;
@@ -215,6 +235,8 @@ impl PieceBackedMarkdownTextStorage {
         })
     }
 
+    /// Clone the existing owner only when its complete original key still matches;
+    /// this query never creates a replacement request or expands its budget.
     fn current_source_owner(&self) -> Option<Rc<NativeMarkdownSourceOwner>> {
         let key = self.source_key()?;
         let owner = self
@@ -231,15 +253,17 @@ impl PieceBackedMarkdownTextStorage {
             .is_some_and(|current| Rc::ptr_eq(&current, original))
     }
 
-    /// 实际编辑/选择/模式撤权和accepted release共用取消边界，不在getter重建Global。
+    /// Actual edit/selection/mode revocation and accepted release share this
+    /// cancellation boundary; getters cannot reconstruct a global source request.
     pub(super) fn cancel_source_semantics(&self) {
         let owner = self.ivars().source_semantics.borrow_mut().take();
         if let Some(owner) = owner {
             owner.stop();
-        } // 槽借用先结束，析构有限Core资源也不持正文或Native强引用。
+        } // End the slot borrow first; bounded Core destruction retains no document or Native claim.
     }
 
-    /// 仅由settled可见准备调用；一个活上下文只建一份原SourceRequest，后续复用真实forward。
+    /// Only settled visible preparation calls this entry. One live context creates
+    /// one original SourceRequest; later windows use its actual forward continuation.
     pub(in crate::native_surface) fn prepare_source_semantics(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -250,13 +274,14 @@ impl PieceBackedMarkdownTextStorage {
         };
         if viewport.is_empty() || viewport.len() > MAX_SOURCE_VIEWPORT || viewport.end > key.length
         {
-            return; // 只接受原生可见行得出的有限范围，不扩大到paragraph或文档边界。
+            return; // Admit only bounded ranges from actual Native visible lines, never expanded paragraph/document extents.
         }
         let owner = if let Some(owner) = self.current_source_owner() {
             #[cfg(feature = "native-markdown-runtime-probe")]
             if *owner.desired.borrow() != viewport {
                 native_markdown_trace! {
-                    // 只记录真实请求窗口变化，不在每个 Pending 量子或属性 getter 中输出。
+                    // Diagnose actual requested-window changes, not every Pending
+                    // quantum or attribute getter invocation.
                     eprintln!("native_source_semantics event=prepare_existing generation={} selection={:?} semantic_epoch={} input_epoch={} window={:?} desired={:?} requested={viewport:?} pending={} publication_pending={} failed={} dirty={} formal=false",
                         owner.key.generation, owner.key.selection, owner.key.semantic_epoch, owner.key.input_epoch,
                         *owner.window.borrow(), *owner.desired.borrow(), owner.pending.get(), owner.publication_pending.get(),
@@ -264,7 +289,7 @@ impl PieceBackedMarkdownTextStorage {
                 }
             }
             *owner.desired.borrow_mut() = viewport;
-            owner // 同一上下文的失败/逆向也不会通过重新构造工厂获得新Global和额度。
+            owner // Failure/reverse movement in the same context cannot reconstruct a factory to obtain fresh global work or quota.
         } else {
             self.cancel_source_semantics();
             let request = key.document.upgrade().and_then(|document| {
@@ -300,7 +325,7 @@ impl PieceBackedMarkdownTextStorage {
                 .ivars()
                 .source_semantics
                 .replace(Some(Rc::clone(&owner)));
-            drop(previous); // 新槽已发布且RefCell借用结束，再释放先前纯Core owner。
+            drop(previous); // Publish the new slot and end the RefCell borrow before dropping the previous pure-Core owner.
             #[cfg(feature = "native-markdown-runtime-probe")]
             native_markdown_trace! {
                 eprintln!("native_source_semantics event=prepare_new generation={} length={} selection={:?} semantic_epoch={} input_epoch={} window={:?} desired={:?} pending={} failed={} dirty={} formal=false",
@@ -308,7 +333,7 @@ impl PieceBackedMarkdownTextStorage {
                     *owner.window.borrow(), *owner.desired.borrow(), owner.pending.get(), owner.failed.get(),
                     view.ivars().source_decorations_dirty.get());
             }
-            owner // 失败也保留无payload tombstone，不能每次draw重新发放同一上下文预算。
+            owner // Retain a payload-free failed owner so each draw cannot renew this same context's budget.
         };
         if !owner.pending.get() && !owner.failed.get() {
             self.forward_source_if_needed(&owner);
@@ -316,6 +341,8 @@ impl PieceBackedMarkdownTextStorage {
         self.enqueue_source_step(&owner);
     }
 
+    /// Reuse the committed result and original continuation only after its Native
+    /// publication ended. Reverse gaps require an existing checkpoint, not a new scan from zero.
     fn forward_source_if_needed(&self, owner: &Rc<NativeMarkdownSourceOwner>) {
         if !self.owns_source(owner)
             || owner.pending.get()
@@ -327,7 +354,7 @@ impl PieceBackedMarkdownTextStorage {
         let desired = owner.desired.borrow().clone();
         let window = owner.window.borrow().clone();
         if window.start <= desired.start && desired.end <= window.end {
-            return; // 当前publication已覆盖请求窗口，重复准备没有新工作。
+            return; // The current publication already covers this request; repeated preparation adds no work.
         }
         let Some(previous) = owner
             .publications
@@ -358,15 +385,16 @@ impl PieceBackedMarkdownTextStorage {
         match result {
             Ok(()) => {
                 *owner.window.borrow_mut() = desired;
-                owner.pending.set(true); // 原Global和联合quota已接受唯一后继，不能提前发布Ready。
+                owner.pending.set(true); // Original global/joint quota accepted one successor; this is not Ready publication.
             }
             Err(error @ MarkdownTableRequestError::CoverageRequiresCheckpoint) => {
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 native_markdown_trace! {
                     eprintln!("native_source_semantics event=forward_failed generation={} window={window:?} desired={desired:?} error={error:?} formal=false", owner.key.generation);
                 }
-                let _ = error; // 非诊断构建仍保原具体分支，不改变继续旧功能路径的语义。
-                // 逆向缺checkpoint仍走原功能路径；保留原请求，禁止从0偷偷重建Global。
+                let _ = error; // Keep this specific branch in nondiagnostic builds too.
+                // Missing reverse checkpoints retain the existing TextKit feature
+                // path and original request; never rebuild global work from zero.
             }
             Err(error) => {
                 #[cfg(feature = "native-markdown-runtime-probe")]
@@ -374,18 +402,20 @@ impl PieceBackedMarkdownTextStorage {
                     eprintln!("native_source_semantics event=forward_failed generation={} window={window:?} desired={desired:?} error={error:?} formal=false", owner.key.generation);
                 }
                 let _ = error;
-                owner.stop(); // sticky失败不重发预算；旧只读publication仍由原核验决定权限。
+                owner.stop(); // Failure is sticky, with no fresh budget; original checks still govern old read-only publication access.
             }
         }
     }
 
+    /// Queue at most one bounded continuation for this actual owner. Main-thread
+    /// transfer retains weak Native/Core identities rather than their graphs.
     fn enqueue_source_step(&self, owner: &Rc<NativeMarkdownSourceOwner>) {
         if !self.owns_source(owner)
             || !owner.pending.get()
             || owner.failed.get()
             || owner.queued.replace(true)
         {
-            return; // 一个原owner最多排一个续体，不按属性请求或重复绘制增加任务。
+            return; // Repeated attributes/draw requests cannot add more than one queued continuation for this owner.
         }
         let Some(mtm) = MainThreadMarker::new() else {
             owner.queued.set(false);
@@ -394,7 +424,8 @@ impl PieceBackedMarkdownTextStorage {
         };
         let weak = MainThreadBound::new((Weak::from(self), Rc::downgrade(owner)), mtm);
         enqueue_native_markdown_main_task(move || {
-            // SAFETY: 唯一executor在main queue运行；MainThreadBound只携Weak，不保活旧图或Core资源。
+            // SAFETY: The existing executor runs on the main queue. MainThreadBound
+            // carries weak identities only, retaining no previous graph/Core payload.
             let mtm = unsafe { MainThreadMarker::new_unchecked() };
             let (storage, owner) = weak.get(mtm);
             let (Some(storage), Some(owner)) = (storage.load(), owner.upgrade()) else {
@@ -405,10 +436,12 @@ impl PieceBackedMarkdownTextStorage {
         });
     }
 
+    /// Advance the original Core request by one fixed quantum outside any Native
+    /// borrow. Stage completed output, then leave Native publication to its settled executor.
     fn advance_source_step(&self, owner: &Rc<NativeMarkdownSourceOwner>) {
         let _payload = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
         if !self.owns_source(owner) || !owner.pending.get() || owner.failed.get() {
-            return; // 旧队列不能重新领取新owner或恢复取消的来源。
+            return; // An old queue callback cannot acquire a successor owner or revive a cancelled source.
         }
         let Some(view) = owner.view.load() else {
             owner.stop();
@@ -418,10 +451,12 @@ impl PieceBackedMarkdownTextStorage {
         let same_storage = original_storage.as_ref().is_some_and(|original| {
             std::ptr::eq::<PieceBackedMarkdownTextStorage>(&**original, self)
         });
-        drop(original_storage); // weak临时+1先结束，再核原owner；不把另一套view图当作本来源的发布端。
+        // Return the temporary weak-load claim, then revalidate the original owner;
+        // another view/storage graph cannot become this source's publication target.
+        drop(original_storage);
         if !same_storage || !self.owns_source(owner) || view.ivars().textkit_graph_teardown.get() {
             owner.stop();
-            return; // weak加载也可能释放Native对象；回到纯Core前重新守原票。
+            return; // Weak loads/releases may reenter Native; validate original authority before returning to Core.
         }
         let Some(document) = owner.key.document.upgrade() else {
             owner.stop();
@@ -434,7 +469,7 @@ impl PieceBackedMarkdownTextStorage {
                 .as_mut()
                 .ok_or(MarkdownTableRequestError::InvalidRequest)
                 .and_then(|request| request.advance(&current, owner.key.authority(), SOURCE_STEP))
-        }; // 所有Core/RefCell借用在Native发布或下一个queue之前结束。
+        }; // End every Core/RefCell borrow before Native publication or the next queue turn.
         match step {
             Ok(MarkdownViewportSourceStep::Progress { work }) => {
                 if work.source_bytes == 0
@@ -442,9 +477,9 @@ impl PieceBackedMarkdownTextStorage {
                     && work.metadata_bytes == 0
                 {
                     owner.stop();
-                    return; // 没有真实工作不能排轮询；缺进展明确终止而非等待到Ready。
+                    return; // No actual work means explicit termination, not queued polling until Ready.
                 }
-                self.enqueue_source_step(owner); // 每次只一个有限量子，累计fuel仍属于原Core请求。
+                self.enqueue_source_step(owner); // One bounded quantum per turn; cumulative fuel remains with the original Core request.
             }
             Ok(MarkdownViewportSourceStep::SourcesAvailable { .. }) => {
                 let source = {
@@ -465,7 +500,8 @@ impl PieceBackedMarkdownTextStorage {
                 }
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 native_markdown_trace! {
-                    // 仅读本次真实 SourcesAvailable 的既有语义标签，不解析、物化正文或推进来源。
+                    // Read this actual SourcesAvailable result's existing semantic
+                    // tag only, without parsing/materializing text or advancing source work.
                     let state = document.borrow();
                     let semantic = match source.ordinary_semantics_for(&state, owner.key.authority()) {
                         Ok(MarkdownOrdinarySemanticState::SourcesOnly) => "sources_only",
@@ -485,14 +521,15 @@ impl PieceBackedMarkdownTextStorage {
                 let staged = { owner.publications.borrow_mut().stage(source) };
                 if !staged {
                     owner.stop();
-                    return; // 未消费的候选不能被另一轮完成覆盖；不临时制造第三份同活publication。
+                    return; // Another completion cannot overwrite the unconsumed candidate or create a third live publication.
                 }
                 owner.pending.set(false);
                 owner.publication_pending.set(true);
-                // 只让原settled executor处理Native副作用；这里不能绕开TextKit外层编辑事务检查。
+                // Only the original settled executor applies Native effects;
+                // this callback cannot bypass the outer TextKit edit-transaction checks.
                 if self.owns_source(owner) {
                     view.schedule_visible_table_layout_update();
-                } // 候选尚未提交时不forward；Core最后publication与Native当前publication保持可追溯。
+                } // Do not forward an uncommitted candidate; Core's last output stays traceable to Native's current publication.
             }
             Err(error) => {
                 #[cfg(feature = "native-markdown-runtime-probe")]
@@ -500,11 +537,13 @@ impl PieceBackedMarkdownTextStorage {
                     eprintln!("native_source_semantics event=advance_failed generation={} window={:?} desired={:?} error={error:?} formal=false", owner.key.generation, *owner.window.borrow(), *owner.desired.borrow());
                 }
                 let _ = error;
-                owner.stop(); // 取消、源变化或预算不足都释放续体，不循环重试相同事实。
+                owner.stop(); // Cancellation, source changes, and exhausted budgets release the continuation without retrying the same facts.
             }
         }
     }
 
+    /// Commit original staged metadata only after foreground geometry/input settles.
+    /// Notify bounded affected ranges, preserving authority across Native reentry.
     fn publish_source_ready(
         &self,
         owner: &Rc<NativeMarkdownSourceOwner>,
@@ -515,7 +554,7 @@ impl PieceBackedMarkdownTextStorage {
             || !publication_is_settled(view)
             || !owner.publication_pending.get()
         {
-            return; // 仍在Find/Mode/table输入时只保候选；getter继续读旧committed，不能提前切换语义。
+            return; // During Find/mode/table input, keep the candidate private and getters on the old committed semantics.
         }
         let ranges = owner.key.document.upgrade().and_then(|document| {
             let current = document.borrow();
@@ -532,13 +571,13 @@ impl PieceBackedMarkdownTextStorage {
                         .cloned()
                         .collect::<Vec<_>>(),
                 ),
-                _ => Some(Vec::new()), // Sources/LeafPending只可提供真实表格Gap，不能通知伪普通样式。
+                _ => Some(Vec::new()), // Sources/LeafPending supply actual table gaps, not fabricated ordinary-style notifications.
             }
         });
         let Some(ranges) = ranges else {
             owner.stop();
-            return; // 原publication核验失败不能按空成功发出Native通知。
-        }; // 至多256个有限交集；不复制正文、runs或源目录。
+            return; // Failed original-publication validation cannot emit a successful empty Native notification.
+        }; // At most 256 bounded intersections, with no copied text, runs, or source indexes.
         if !self.owns_source(owner) || !publication_is_settled(view) {
             return;
         }
@@ -551,44 +590,54 @@ impl PieceBackedMarkdownTextStorage {
         let previous = owner.publications.borrow_mut().commit_staged();
         let Some(previous) = previous else {
             owner.stop();
-            return; // 标志不能代替真实候选，绝不重新读取当前getter拼一份成功publication。
+            return; // Flags cannot replace an actual candidate; current getters cannot manufacture a successful publication.
         };
         owner.publication_pending.set(false);
         if !ranges.is_empty() {
-            // 只有真实RootLeaf样式交集才改变Native属性。表格窗口的Sources/LeafPending
-            // 只新增无表/目录证明，没有任何普通样式发布；不能因空通知撤销已验证的表格高度，
-            // 否则getter立即恢复literal，再在下一轮重建相同高度，破坏刚完成的视口几何。
+            // Only actual RootLeaf style intersections change Native attributes.
+            // Sources/LeafPending may add no-table/index proofs without ordinary
+            // styles. An empty style notification must not revoke verified table
+            // heights, temporarily restore literal getters, then rebuild identical
+            // heights and disrupt just-completed viewport geometry.
             self.ivars().font_run_scratch.invalidate();
-            self.advance_table_geometry_epoch(); // 实际代码/分隔线样式可改变前置行高，仍必须撤旧几何。
-            // 字典按style/font/variant区分；只撤在途loan，不能在提交中段触发额外Native析构。
+            self.advance_table_geometry_epoch(); // Actual code/rule styling can change preceding line heights, revoking old geometry.
+            // Style/font/variant distinguish dictionary entries. Revoke in-flight
+            // loans only, without additional Native destruction halfway through commit.
             self.ivars().attribute_cache.invalidate_loans();
-        } // 零样式交集仍正常提交原publication/目录与续体预算，不伪造普通内容Ready或取消来源任务。
-        drop(previous); // 原候选和字体键已同批提交；旧同活库存此时释放，不留下publication历史链。
-        // Preview键本就包含font epoch；旧geometry/attempt同步失权，原scheduler会按新键准备。
-        // 不在此调用release_preview_blocks，以免它的取消回调在首Native通知前清掉重入产生的新准备。
-        // 只发送一次有限窗口metadata通知，避免多个Native通知之间又开始前台动作后补发旧批次。
-        // 中间未知区仍由原功能查询；通知包络不授予任何未覆盖语义，也不会读取其正文。
+        } // Zero style intersections still commit source indexes/budgets without inventing ordinary Ready or cancelling work.
+        drop(previous); // Candidate/font keys committed together; release the old live inventory without a publication history chain.
+        // Preview keys already include font epoch, synchronously revoking old
+        // geometry/attempts before the scheduler prepares the new key. Do not call
+        // release_preview_blocks here: its cancellation callback could erase new
+        // reentrant work before the first Native notification. Emit one bounded
+        // metadata envelope rather than sending an old batch after another Native
+        // notification begins foreground work. Unknown interior ranges retain
+        // their existing query path; the envelope grants no uncovered semantics or source read.
         let invalidated = ranges
             .first()
             .zip(ranges.last())
             .map(|(first, last)| first.start..last.end);
         self.notify_or_defer_attribute_range(invalidated);
         if !self.owns_source(owner) {
-            return; // Native通知重入后只停本批，不给后继上下文重签或回滚已经提交的纯metadata。
+            return; // Native notification reentry ends this batch only, without reauthorizing a successor or rolling back committed metadata.
         }
-        // 真实新覆盖可能刚好补齐旧 Find 查询的未知段；即使查询/视口数值未变，原空矩形批次也已过时。
-        // 只让原 settled executor 重建有限装饰，不在发布栈内排版、执行 Find 或推进别的来源。
+        // Actual new coverage can resolve a prior Find query's unknown range.
+        // Even equal query/viewport values cannot preserve its old empty geometry.
+        // Rebuild bounded decorations through the original settled executor, never
+        // layout, Find execution, or another source continuation on this publication stack.
         view.ivars().source_decorations_dirty.set(true);
-        view.schedule_visible_table_layout_update(); // 继续既有settled executor与Find/Mode流程。
+        view.schedule_visible_table_layout_update(); // Continue the existing settled executor and Find/mode flows.
         if self.owns_source(owner) {
-            // publication只准备了原有限视口，不能用整篇逻辑bounds向AppKit申请新的正文backing。
-            // 原helper取真实visibleRect并拒绝已关闭/异常几何；滚动与后继覆盖仍由同一executor重建。
-            view.invalidate_visible_body(); // 有真实新publication才排绘制，不以draw推进Core或改变布局范围。
+            // Publication covers only the original bounded viewport. Logical full-
+            // document bounds cannot request a new full-body backing from AppKit.
+            // The helper reads actual visibleRect and rejects closed/invalid geometry;
+            // scrolling and later coverage remain with the same executor.
+            view.invalidate_visible_body(); // Actual new publication authorizes drawing, not draw-driven Core advancement or range expansion.
         }
         if self.owns_source(owner) {
             self.forward_source_if_needed(owner);
             self.enqueue_source_step(owner);
-        } // 原Native提交完成后才用这一唯一新publication续原Global，并联合计费旧/新库存。
+        } // Only after Native commit may this unique new publication continue original global work and jointly charge old/new inventory.
         #[cfg(feature = "native-markdown-runtime-probe")]
         native_markdown_trace! {
             eprintln!("native_source_semantics event=publish_end generation={} current={} window={:?} desired={:?} pending={} publication_pending={} failed={} dirty={} formal=false",
@@ -597,7 +646,8 @@ impl PieceBackedMarkdownTextStorage {
         }
     }
 
-    /// 原scheduler只查询一个发布标志；没有真实新publication就不增加背景准备机会。
+    /// The existing scheduler reads one publication flag; no actual new output
+    /// means no additional background preparation opportunity.
     pub(in crate::native_surface) fn source_publication_needs_preparation(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -608,7 +658,8 @@ impl PieceBackedMarkdownTextStorage {
                 .is_some_and(|owner| owner.publication_pending.get())
     }
 
-    /// 仅从既有settled executor调用；迟到Core结果不会在绘制getter内通知或推进来源。
+    /// Only the existing settled executor calls this entry. Late Core results
+    /// neither notify Native nor advance source work from a drawing getter.
     pub(in crate::native_surface) fn finish_source_publication(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -626,10 +677,11 @@ impl PieceBackedMarkdownTextStorage {
         if std::ptr::eq::<PieceBackedMarkdownTextView>(&*original, view) && self.owns_source(&owner)
         {
             self.publish_source_ready(&owner, view);
-        } // 原Weak/view不匹配只放弃本次，不能替换owner的原发布端。
+        } // A mismatched original weak view abandons this attempt; it cannot replace the owner's publication target.
     }
 
-    /// 属性和背景getter只做纯查询；None仍交原功能路径，不新建或推进任何来源请求。
+    /// Attribute/background getters perform pure queries. None retains the existing
+    /// feature path without creating or advancing any source request.
     pub(in crate::native_surface) fn source_leaf_query(
         &self,
         index: usize,
@@ -650,7 +702,8 @@ impl PieceBackedMarkdownTextStorage {
             .flatten()
     }
 
-    /// 单独证明当前窗口无表格；普通gap的inline样式仍未知，不能据此隐藏或改写正文。
+    /// Prove absence of tables in this window only. Ordinary-gap inline styles
+    /// remain unknown, granting no authority to hide or rewrite document text.
     pub(super) fn source_no_tables_proof(
         &self,
         window: &Range<usize>,
@@ -673,12 +726,15 @@ impl PieceBackedMarkdownTextStorage {
 mod tests {
     use super::*;
 
-    /// 分别记录真实载荷复制与 Parser 输入；RootLeaf 可拥有已规范化 URI，正文仍不复制。
+    /// Observe actual payload copying separately from parser input. RootLeaf may
+    /// own normalized URI output while retaining no copied document text.
     struct SourceWork {
         copied_source_bytes: usize,
         parser_input_bytes: usize,
     }
 
+    /// Keep the actual synthetic file/directory alive through its document and
+    /// completed source request. These fixtures never open the user's vault.
     fn sources(
         source: &str,
     ) -> (
@@ -703,7 +759,8 @@ mod tests {
         (directory, document, sources, work)
     }
 
-    /// 一个有限测试驱动共用真实advance/take；同一请求forward后也不能另建Global绕过库存收费。
+    /// Drive actual advance/take within a finite test loop. Forward continuation
+    /// of this request cannot reconstruct global work to evade inventory charging.
     fn complete_request(
         document: &MarkdownDocumentBuffer,
         authority: MarkdownViewportSourceAuthority,
@@ -721,7 +778,8 @@ mod tests {
                     && work.parser_input_bytes <= SOURCE_STEP
             );
             if let Some(sources) = request.take_sources_for(document, authority).unwrap() {
-                // 表格按原预算复制有限行；RootLeaf 只准许真实 URI 输出片，具体用例核精确来源。
+                // Tables copy bounded rows under existing budgets. RootLeaf admits
+                // actual URI output fragments only; each case verifies their precise origin.
                 let total = request.total_work();
                 return (
                     sources,
@@ -744,6 +802,8 @@ mod tests {
     }
 
     #[test]
+    /// Real Core sources exercise this adapter's local stage/commit ownership.
+    /// This does not invoke Native setters or prove a Native layout commit completed.
     fn staged_forward_result_keeps_old_committed_publication_until_native_boundary() {
         let source = "```text\n第一段😀\n```\n\n```text\n第二段中文\n```\n";
         let directory = tempfile::tempdir().unwrap();
@@ -775,7 +835,8 @@ mod tests {
         let original_weak = Rc::downgrade(original);
         let original_publication = Rc::as_ptr(original);
 
-        // 续批始终消费同一真实last_publication；Core在此联合预扣旧结果和候选的metadata/runs。
+        // Continue through the same actual last publication. Core jointly reserves
+        // metadata/run inventory for old output and its candidate before advancing.
         request
             .continue_forward(&document, original, 0..document.utf16_len(), authority)
             .unwrap();
@@ -820,11 +881,14 @@ mod tests {
     }
 
     #[test]
-    /// 同一无表窗口分别核来源票与真实语义票；已支持的直接链接必须取得自身完整语义，
-    /// 来源专用工厂即使持相同 Gap，也不能借这个已完成的邻请求替自己补签语义。
+    /// The same no-table window still needs independent source/semantic authority.
+    /// Supported direct links obtain their own complete semantics; a source-only
+    /// request cannot borrow a neighboring completed request's semantics through an equal gap.
     fn gap_proof_and_plain_semantics_keep_independent_authority() {
-        // 保留原长 label、目标和代码夹具。直接链接现已真实支持，不能继续把旧 Unsupported
-        // 当作权限负例；唯一复制是规范化目标，绝不能把 label 或整个 Root 文本混入该账。
+        // Retain the original long label, target, and code fixture. Direct links
+        // are actually supported, so obsolete Unsupported behavior cannot remain
+        // a negative authority expectation. Only normalized destination bytes may
+        // be copied, never label contents or complete Root text.
         const DESTINATION: &str = "https://example.invalid";
         let source = format!(
             "普通正文\n\n[复杂{}仍未知](https://example.invalid)\n\n```text\n中文😀\n```\n\n尾部\n",
@@ -879,10 +943,11 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
-        } // bracket 和 URI 本身只有原 marker 样式，不属于可点击 label；不能借 owner 包络扩权。
+        } // Brackets/URI have marker styles but no clickable-label authority; the owner's envelope cannot broaden it.
 
-        // 独立完整 Parser 仅消费这份既有有限夹具，核长 label 与 marker 的实际样式；
-        // 它不参与分页生产或复制计量，也不从待测 RootLeaf 的默认样式反造期望。
+        // An independent full parser consumes this bounded fixture only to verify
+        // label/marker styles. It participates in neither paged production nor copy
+        // accounting, and derives no expectations from candidate RootLeaf defaults.
         let mut original = MarkdownViewportPresentation::default();
         original.rebuild(0, window.clone(), &source).unwrap();
         for index in link_open..label_end + 2 + DESTINATION.len() + 1 {
@@ -924,7 +989,8 @@ mod tests {
                 .is_some()
         );
 
-        // 来源专用工厂确有相同无表事实，却没有任何语义Ready；两种权限不能相互转换。
+        // The source-only factory has the same actual no-table fact but no Ready
+        // semantics. Those two capabilities cannot be converted into each other.
         let mut request = document
             .viewport_source_request(
                 window.clone(),
@@ -959,8 +1025,9 @@ mod tests {
     fn actual_table_cannot_be_hidden_by_gap_envelope_or_empty_snapshot() {
         let source = "前言\n\n| 左 | 右 |\n| --- | --- |\n| 中文 | 😀 |\n\n尾部\n";
         let (_directory, document, sources, _) = sources(source);
-        // 无表权限只能来自真实结构覆盖；结构行可在不复制正文、不运行整窗解析时发布。
-        // 此例继续验证表格不能被隐藏，不把某一种复制或解析实现当作表格存在的证据。
+        // Only actual structural coverage grants no-table authority. Structural
+        // rows may publish without copied text/full-window parsing; verify that
+        // tables remain present, independent of the particular copy/parser implementation.
         assert!(!no_tables_covered(
             &sources,
             &document,
@@ -980,7 +1047,8 @@ mod tests {
             authority(&document),
             &(table..table + 1)
         ));
-        // 来源票要实际拥有这一行；不要求先为旧整窗后端物化全部单元格语义。
+        // Source authority must actually own this row without materializing all
+        // cell semantics for the independent full-window reference backend first.
         assert!(
             sources
                 .table_row_at_for(&document, authority(&document), table)
@@ -991,6 +1059,8 @@ mod tests {
     }
 
     #[test]
+    /// Use actual separate files and a real edit/Undo to prove source identity and
+    /// revision revocation; equal restored bytes cannot renew an old publication.
     fn no_table_fact_rejects_cancelled_context_foreign_root_and_post_edit_undo() {
         let source = "普通中文\n\n***\n";
         let (_directory, mut document, sources, work) = sources(source);

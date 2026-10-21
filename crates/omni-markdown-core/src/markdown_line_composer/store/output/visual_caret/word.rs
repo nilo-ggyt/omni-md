@@ -1,4 +1,5 @@
-//! 视觉词组消费原 L1/L2 相邻字素及原分类器；仅一个簇和一个弱视觉查询可跨量子存活。
+//! Visual words consume original L1/L2 neighboring graphemes and the established
+//! classifier. Only one cluster and one weak visual query survive each quantum.
 
 use super::*;
 use crate::markdown_line_composer::engine::word::{Category, Cluster};
@@ -25,7 +26,8 @@ pub struct MarkdownComposedVisualWordStep {
     pub answer: MarkdownComposedVisualWordAnswer,
 }
 
-/// 已分类进度只归原 writer/Source；弱票不保活 Reader、字体、Source 或另一段 UBA。
+/// Classified progress belongs to the original writer/Source. Weak tickets
+/// retain no reader, font payload, Source payload, or another UBA owner.
 pub struct MarkdownComposedVisualWordQuery {
     lineage: Weak<()>,
     output: Weak<()>,
@@ -47,7 +49,8 @@ pub struct MarkdownComposedVisualWordQuery {
 }
 
 impl MarkdownComposedLines {
-    /// 捕获真实屏幕方向；逻辑 Forward/Backward 不使用此入口，也不从段 base 猜字符次序。
+    /// Capture actual screen direction. Logical Forward/Backward use their own
+    /// established query and never infer character order from paragraph base.
     pub fn visual_word_query(
         &mut self,
         utf16: usize,
@@ -77,7 +80,9 @@ impl MarkdownComposedLines {
         })
     }
 
-    /// 每回合只做原目录查询或一个原簇的正文分类；追加 prefix 只重建未完成的弱目录查询。
+    /// Advance either original directory work or classification of one original
+    /// cluster per turn. Appending a same-writer prefix rebuilds only unfinished
+    /// weak directory lookup, preserving accepted caret/classification progress.
     pub fn step_visual_word(
         &mut self,
         query: &mut MarkdownComposedVisualWordQuery,
@@ -88,13 +93,16 @@ impl MarkdownComposedLines {
             query.failed = true;
         }
         if matches!(result, Err(Error::InvalidRequest)) {
+            // Invalid caller input ends this query without destroying a healthy
+            // original output required by other editing operations.
             self.require(&query.source)?;
             return result;
         }
         self.finish(result)
     }
 
-    /// 原正文、writer、字体与取消先于任何缓存；同 Source 的另一宽度/样式管线不能接续旧路径。
+    /// Original Source, writer, fonts, and cancellation outrank cached progress.
+    /// Another width/style pipeline for the same text cannot resume this path.
     fn advance_visual_word(
         &mut self,
         query: &mut MarkdownComposedVisualWordQuery,
@@ -105,6 +113,8 @@ impl MarkdownComposedLines {
             return Err(Error::Poisoned);
         }
         if !Weak::ptr_eq(&query.lineage, &self.lineage) {
+            // Only the original append-only writer can carry classification
+            // progress into another actual sealed prefix.
             return Err(Error::SourceMismatch);
         }
         query.require_fonts(&self.payload.as_ref().ok_or(Error::Poisoned)?.fonts)?;
@@ -124,7 +134,7 @@ impl MarkdownComposedLines {
         if !Weak::ptr_eq(&query.output, &Arc::downgrade(&self.identity)) {
             query.visual = None;
             query.output = Arc::downgrade(&self.identity);
-        } // 已接受的 caret/类别仍由同 writer 的完整原行证明；旧 Part 票没有转给新 prefix。
+        } // Accepted caret/category facts keep same-writer authority; old Part tickets do not transfer.
         let mut step = MarkdownComposedVisualWordStep {
             bytes: 0,
             scalars: 0,
@@ -133,8 +143,11 @@ impl MarkdownComposedLines {
             answer: MarkdownComposedVisualWordAnswer::Pending,
         };
         if let Some(answer) = &query.answer {
+            // Repeated final answers still pass original Source/font checks.
             step.answer = answer.clone();
         } else if let Some(cluster) = &mut query.cluster {
+            // Classify the actual single cluster under the caller's byte/scalar
+            // quantum, without borrowing a whole word or paragraph.
             let source = &self.payload.as_ref().ok_or(Error::Poisoned)?.source;
             let mut actual = MarkdownWordDeleteStep {
                 bytes: 0,
@@ -150,9 +163,11 @@ impl MarkdownComposedLines {
                 let category = cluster.category();
                 query.cluster = None;
                 query.accept(category)?;
-            } // 同一 UTF8 残余可跨一字节预算；未完成簇不会提前提供类别或提交候选 caret。
+            } // Partial UTF-8 survives one-byte quanta without issuing a category or candidate caret early.
         } else {
             if query.visual.is_none() {
+                // Rebuild only unfinished visual lookup on this authenticated
+                // same-writer prefix, retaining the action's original flow.
                 query.visual = Some(self.visual_query(
                     query.position,
                     query.affinity,
@@ -171,6 +186,8 @@ impl MarkdownComposedLines {
             step.records = actual.records;
             step.metadata_units = actual.records;
             if let Some(hidden) = &visual.crossed_fold {
+                // Hidden content needs explicit original fold expansion before
+                // a word classification may inspect or traverse its source.
                 query.candidate_fonts = visual.word_registrations();
                 query.answer = Some(MarkdownComposedVisualWordAnswer::NeedsFoldExpansion(
                     hidden.clone(),
@@ -179,6 +196,7 @@ impl MarkdownComposedLines {
                 match actual.answer {
                     MarkdownComposedVisualAnswer::Pending => {}
                     MarkdownComposedVisualAnswer::PrefixNotCovered => {
+                        // Unprepared prefix is neither EOF nor a completed word.
                         step.answer = MarkdownComposedVisualWordAnswer::PrefixNotCovered;
                     }
                     found @ MarkdownComposedVisualAnswer::Found { .. } => {
@@ -191,16 +209,19 @@ impl MarkdownComposedLines {
                         query.candidate = Some(found);
                         query.visual = None;
                         if hard_break {
-                            // 原 ParagraphBreak 控制只覆盖 LF/CR/CRLF/LS/PS，均属于原 ECMAScript 空白类别。
+                            // Actual LF/CR/CRLF/LS/PS paragraph controls all belong
+                            // to the established ECMAScript whitespace category.
                             query.accept(Category::Space)?;
                         } else if let Some(((_, origin), (ordinal, neighbor))) = pair {
+                            // Only actual original neighboring GCB records may
+                            // establish the single cluster to classify next.
                             query.cluster = Some(Cluster::new(ordinal, origin, neighbor)?);
                         } else {
                             let terminal =
                                 query.candidate.take().ok_or(Error::InconsistentCoverage)?;
                             query.last_fonts = std::mem::take(&mut query.candidate_fonts);
                             query.answer = Some(word_answer(terminal)?);
-                        } // 没有实际跨字素/控制的 Found 只可能是真正 BOF/EOF，不从数值距离造一个正文范围。
+                        } // A Found without actual GCB/control traversal is true BOF/EOF, not a guessed text span.
                     }
                 }
             }
@@ -215,7 +236,8 @@ impl MarkdownComposedLines {
 }
 
 impl MarkdownComposedVisualWordQuery {
-    /// 同一目录结果的弱票在源分类暂停及终态重查时仍有效；槽回收不能给旧视觉次序重新签名。
+    /// Recheck original weak font registrations across classification suspension
+    /// and repeated answers. Reclaimed slots cannot authorize old visual order.
     fn require_fonts(&self, catalog: &MarkdownLineFontCatalog) -> Result<()> {
         for registration in self
             .last_fonts
@@ -228,13 +250,16 @@ impl MarkdownComposedVisualWordQuery {
         Ok(())
     }
 
-    /// 保留原三类别与 leading-space 规则；停止时交上次已接受的真实视觉 caret，而非逻辑 min/max。
+    /// Preserve the established three categories and leading-space policy. On
+    /// stop, return the last accepted actual visual caret, never logical min/max.
     fn accept(&mut self, category: Category) -> Result<()> {
         let candidate = self.candidate.take().ok_or(Error::InconsistentCoverage)?;
         if self
             .category
             .is_some_and(|old| old != Category::Space && old != category)
         {
+            // A category change after non-space text completes the previous
+            // accepted word; the new candidate belongs to the next action.
             let previous = self.last.take().ok_or(Error::InconsistentCoverage)?;
             self.answer = Some(word_answer(previous)?);
             self.candidate_fonts = std::array::from_fn(|_| None);
@@ -244,13 +269,16 @@ impl MarkdownComposedVisualWordQuery {
             utf16, side, line, ..
         } = &candidate
         else {
+            // Pending/uncovered states cannot enter accepted word progress.
             return Err(Error::InconsistentCoverage);
         };
         self.position = *utf16;
         self.side = Some(*side);
         self.affinity = if !line.is_empty() && *utf16 == line.end && *utf16 != 0 {
+            // A real line-end caret retains upstream soft-wrap association.
             MarkdownComposedLineAffinity::Upstream
         } else {
+            // Other actual positions retain downstream line association.
             MarkdownComposedLineAffinity::Downstream
         };
         self.category = Some(category);
@@ -260,7 +288,8 @@ impl MarkdownComposedVisualWordQuery {
     }
 }
 
-/// 只移交原 Found 的位置、真实侧与行身份；Pending/缺前缀从不被包装为词组终点。
+/// Transfer only an original Found position, actual side, and line identity.
+/// Pending or uncovered prefix cannot be packaged as a completed word endpoint.
 fn word_answer(found: MarkdownComposedVisualAnswer) -> Result<MarkdownComposedVisualWordAnswer> {
     match found {
         MarkdownComposedVisualAnswer::Found {

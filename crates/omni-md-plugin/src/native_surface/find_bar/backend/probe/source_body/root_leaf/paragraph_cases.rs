@@ -1,4 +1,5 @@
-//! 同一固定短例分别实际排标准 TextKit 与分页候选；资源图不同时存活，也不共享新几何策略。
+//! Lay out the same fixed short fixture with actual TextKit and the paged candidate sequentially,
+//! without simultaneous graphs or shared new geometry policy.
 
 use super::*;
 use objc2::{runtime::ProtocolObject, sel};
@@ -44,7 +45,8 @@ const CASES: [(&str, &str); 11] = [
     ),
 ];
 
-/// 候选退出后只保有限输入列宽和已经显示的行；标准 oracle 不需要第二张正文图同活。
+/// After candidate retirement retain finite width/displayed-line facts only; the reference needs no
+/// simultaneous second body graph.
 struct Candidate {
     lines: Vec<crate::native_surface::preview_paragraph::PreviewLineObservation>,
     width: f64,
@@ -53,7 +55,8 @@ struct Candidate {
     parts: Vec<super::paragraph_oracle::PartAdvance>,
 }
 
-/// 字符预期只来自固定字面与这一次插入；逐片核完整 canonical，不能用新选区反造期望。
+/// Derive characters from fixed literals and this insertion only, verifying complete canonical chunks
+/// without using new selection as expectation.
 fn punctuation_source(rig: &Rig, source: &str, inserted: Option<usize>) -> Result<(), String> {
     let owner = rig.document.upgrade().ok_or("标点原文稿已释放")?;
     let document = owner.borrow();
@@ -72,7 +75,7 @@ fn punctuation_source(rig: &Rig, source: &str, inserted: Option<usize>) -> Resul
             .map_err(|cause| cause.to_string())?;
         for (offset, actual) in units[..used].iter().enumerate() {
             let expected = if inserted == Some(start + offset) {
-                0x4e2d // 正常 NSTextInputClient 本次唯一输入，不替换标点或后方原文。
+                0x4e2d // This actual NSTextInputClient input inserts one character without replacing punctuation or later source text.
             } else {
                 expected.next().ok_or("标点 canonical 出现额外字符")?
             };
@@ -87,10 +90,11 @@ fn punctuation_source(rig: &Rig, source: &str, inserted: Option<usize>) -> Resul
     if expected.next().is_some() {
         return Err("标点输入或撤销丢失了原 canonical 尾部".into());
     }
-    Ok(()) // 文稿借用在下一次 Native 调用之前结束，不保住旧 Source 或选择权限。
+    Ok(()) // End document borrowing before the next Native call without retaining old Source or selection authority.
 }
 
-/// 独立文件句柄始终只读合成源；显示、鼠标、未保存输入与 Undo 都不能暗中写回磁盘。
+/// A separate descriptor reads synthetic Source only; display, mouse, unsaved input, and undo must not
+/// silently write to disk.
 fn unchanged_disk(rig: &Rig, name: &str, source: &str) -> Result<(), String> {
     let mut file = std::fs::File::open(rig._file.path()).map_err(|cause| cause.to_string())?;
     let mut bytes = [0_u8; 128];
@@ -111,7 +115,8 @@ fn unchanged_disk(rig: &Rig, name: &str, source: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 原 SourceTarget 真滚动但不改选择；取走同一次可见收据，不以范围已存在代替实际帧。
+/// Original SourceTarget performs actual scroll without selection change; consume its visibility
+/// receipt rather than mere range existence.
 fn punctuation_reveal(
     rig: &mut Rig,
     index: usize,
@@ -135,8 +140,10 @@ fn punctuation_reveal(
     rig.remember_receipt()
 }
 
-/// 每次实际按下前重取当前 Scene；字符框和两端 caret 必须来自同一张当前出版物。
-/// 中文标点均为本短例中的独立 BMP 字素；两侧几何不能由另一排版引擎的 advance 推算。
+/// Reacquire current Scene before actual mouse down; the character box and both carets must belong to
+/// the same publication.
+/// These punctuation marks are independent BMP graphemes; neither edge may be inferred from another
+/// layout engine advances.
 fn punctuation_point(rig: &Rig, index: usize, after: bool) -> Result<NSPoint, String> {
     let key = rig
         .view
@@ -153,7 +160,8 @@ fn punctuation_point(rig: &Rig, index: usize, after: bool) -> Result<NSPoint, St
     let right = scene
         .first_rect(NSRange::new(index + 1, 0))
         .map_err(|cause| cause.to_string())?;
-    // 这里的 1/64 仍是原布局坐标的一个单位；不放宽旧 Native 对照的 glyph 或行几何要求。
+    // The fixed 1/64 tolerance is one original layout unit, without relaxing Native glyph/line geometry
+    // requirements.
     if character.actual_range != NSRange::new(index, 1)
         || left.actual_range != NSRange::new(index, 0)
         || right.actual_range != NSRange::new(index + 1, 0)
@@ -184,11 +192,12 @@ fn punctuation_point(rig: &Rig, index: usize, after: bool) -> Result<NSPoint, St
             "标点真实字符两侧命中错误：index={index} after={after} actual={hit} expected={expected}"
         ));
     }
-    drop(scene); // 原 Reader 在 convertPoint 和真实 NSEvent 前归还，不跨点击保旧排版权。
+    drop(scene); // Return the original Reader before convertPoint and actual NSEvent delivery; old layout authority cannot span a click.
     Ok(rig.view.convertPoint_toView(local, None))
 }
 
-/// 真 Down/Up 后再读 canonical caret；随后一次输入沿当前选择提交，不指定已知替换坐标绕开点击。
+/// Read canonical caret after actual Down/Up; subsequent input uses that selection without a known
+/// replacement range bypassing hit testing.
 fn punctuation_click(
     rig: &mut Rig,
     index: usize,
@@ -204,7 +213,8 @@ fn punctuation_click(
         if expected_complete {
             frame::wait_complete_frame("root_leaf_cjk_punctuation_click", &rig.body, event)?;
         } else {
-            // 40pt正文只要求真实当前视口完整，点击重排可合法停在已覆盖前缀，不能强读固定尾段。
+            // The 40-point viewport requires its actual complete visible region only; click
+            // reprojection may stop at covered prefix without forced tail reads.
             frame::wait_frame("root_leaf_cjk_punctuation_click", &rig.body, event)?;
         }
         let state = rig.view.input_state().map_err(|cause| cause.to_string())?;
@@ -217,12 +227,13 @@ fn punctuation_click(
         rig.remember_receipt()?;
     }
     if !insert {
-        return Ok(()); // 尺寸和滚动往返只核真实选择，不为每轮几何观察追加历史事务。
+        return Ok(()); // Resize/scroll round trips verify actual selection without appending history transactions for each geometry observation.
     }
     let before = rig.view.input_state().map_err(|cause| cause.to_string())?;
     let event = observe(&rig.body)?;
     let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**rig.view);
-    // SAFETY: 同主线程的原 client；NSNotFound 表示正常输入采用刚点击出的当前选择。
+    // SAFETY: Use the original main-thread client; NSNotFound selects normal input at the actual
+    // clicked selection.
     unsafe {
         client.insertText_replacementRange(
             &NSString::from_str("中"),
@@ -247,7 +258,8 @@ fn punctuation_click(
     rig.remember_receipt()
 }
 
-/// 原两个引用短例已有这些标点和真实样式，不改字面来避开已观察到的 Native 字形差异。
+/// Keep the original two quote fixtures and their styled punctuation, without changing literals to
+/// avoid observed Native glyph differences.
 fn punctuation_interaction(rig: &mut Rig, name: &str, source: &str) -> Result<(), String> {
     let mut positions = Vec::new();
     for scalar in ['、', '，', '。'] {
@@ -265,7 +277,8 @@ fn punctuation_interaction(rig: &mut Rig, name: &str, source: &str) -> Result<()
     for &index in &positions {
         punctuation_click(rig, index, true, source, true)?;
     }
-    // 同一个真实窗口改变列宽，原字号、源文本与输入 owner 保持；不能用新 Rig 避开重排。
+    // Resize the same actual window while preserving font size, Source, and Input owner; a new Rig
+    // cannot bypass reflow.
     for width in [320.0, 720.0] {
         let before = rig
             .view
@@ -287,7 +300,8 @@ fn punctuation_interaction(rig: &mut Rig, name: &str, source: &str) -> Result<()
             punctuation_click(rig, index, false, source, true)?;
         }
     }
-    // 先前已完整准备的同宽短源缩为40pt正文，真正滚到尾标点再回首屏；不增加未读正文预算。
+    // Shrink the already prepared same-width short Source to 40 points and actually scroll to tail
+    // punctuation/back without extra unread-Source budget.
     let event = observe(&rig.body)?;
     rig.panel.setContentSize(NSSize::new(720.0, 148.0));
     frame::wait_complete_frame("root_leaf_cjk_punctuation_short_viewport", &rig.body, event)?;
@@ -307,8 +321,10 @@ fn punctuation_interaction(rig: &mut Rig, name: &str, source: &str) -> Result<()
     {
         return Err("标点滚动夹具没有实际移出原首屏".into());
     }
-    // 固定字面给出独立尾段位置，再由当前真实字符几何证明它确实在40pt窗口外。
-    // 不读取progress.complete反算期望：之后点击激活样式重置Composer，尾段不属于当前视口需求。
+    // The fixed literal independently supplies the tail position; actual current character geometry
+    // must prove it lies outside the 40-point viewport.
+    // Do not derive expectation from progress.complete; later click-driven style reset need not prepare
+    // a tail outside this viewport.
     let tail = source[..source.rfind("end").ok_or("标点固定短例缺少独立尾段")?]
         .encode_utf16()
         .count();
@@ -319,7 +335,7 @@ fn punctuation_interaction(rig: &mut Rig, name: &str, source: &str) -> Result<()
         Ok(_) => return Err("40pt标点窗口没有把固定原字面尾段移到屏外".into()),
         Err(cause) => return Err(cause.to_string()),
     }
-    drop(scene); // 屏外证明结束即归还Reader，不能跨真实鼠标保旧排版或阻止有限前缀重排。
+    drop(scene); // Return Reader after offscreen proof, before actual mouse input can retain stale layout or block bounded-prefix reflow.
     punctuation_click(rig, index, false, source, false)?;
     punctuation_reveal(rig, 0, "root_leaf_cjk_punctuation_back", false)?;
     let back = rig
@@ -343,7 +359,8 @@ fn punctuation_interaction(rig: &mut Rig, name: &str, source: &str) -> Result<()
     Ok(())
 }
 
-/// 只使用真实 sealed 窗口的纯值；容差固定为同布局格式的一个 26.6 单位，不因失败增大。
+/// Compare pure actual sealed-window facts under the fixed one-unit 26.6 tolerance, without increasing
+/// it after failure.
 fn compare(
     case: &str,
     candidate: &Candidate,
@@ -363,7 +380,7 @@ fn compare(
         let baseline = NSPoint::new(
             actual.baseline.x - 8.0,
             candidate.origin_y + candidate.height - actual.baseline.y - 8.0,
-        ); // 只移除同夹具的外层 padding 并转换 y-up；不从旧结果反算候选行框。
+        ); // Remove fixture padding and convert Y-up coordinates only, without deriving candidate frames from the reference.
         eprintln!(
             "native_paragraph_geometry_observation case={case} ordinal={ordinal} source={:?}/{:?} paragraph={:?}/{:?} candidate_frame={:?} original_frame={:?} original_paragraph_frame={:?} baseline={baseline:?}/{:?} text_height={}/{} before={}/{} after={}/{}",
             actual.source,
@@ -380,7 +397,7 @@ fn compare(
             original.before,
             actual.after,
             original.after
-        ); // 固定短例只输出纯值；失败仍保原容差，不通过后继算式重写旧 Native 结果。
+        ); // Log fixed-fixture pure values only; preserve tolerance on failure without later arithmetic rewriting original Native results.
         if actual.source != original.source
             || actual.paragraph != original.paragraph
             || (actual.text_height - original.frame.size.height).abs() > tolerance
@@ -415,7 +432,8 @@ fn compare(
     }
 }
 
-/// 每个短例先完整关闭分页图；失败也沿同一个真实资源门结束，不把临时窗口留给下一例。
+/// Fully close each paged fixture through the same actual resource checks on failure, leaving no
+/// temporary window for the next case.
 fn run_case(mtm: MainThreadMarker, name: &str, source: &str) -> Result<Option<String>, String> {
     let (retirement, publication, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
@@ -449,8 +467,10 @@ fn run_case(mtm: MainThreadMarker, name: &str, source: &str) -> Result<Option<St
                 .map_err(|cause| cause.to_string())?;
             let mut parts = Vec::new();
             if name.starts_with("scoped_") {
-                // 有上界短例只观察真实注册Font；换行或行槽失败时可核对实际face与系统度量，
-                // 不从语义角色猜字号，也不把字体强引用带到独立TextKit对照阶段。
+                // Observe actual registered fonts from bounded short cases for face/system-metric
+                // checks on line-layout failure,
+                // without guessing size by semantic role or retaining fonts into independent TextKit
+                // measurement.
                 for part in rig
                     .body
                     .probe_root_leaf_parts()
@@ -468,9 +488,11 @@ fn run_case(mtm: MainThreadMarker, name: &str, source: &str) -> Result<Option<St
                         part.advance_26_6,
                     );
                     if name.starts_with("scoped_quote") {
-                        // Reader和Body内部借用已在probe返回前退出；此处只打印同一原Font的
-                        // 已捕获Core元数据与封存glyph纯值，不调用Native另取字体或重形。
-                        // 总推进相等不能排除同宽错字形，因此独立OT对照必须保留真实cluster/id。
+                        // Reader/Body borrows ended before probe return; print the same original font
+                        // captured Core metadata
+                        // and sealed glyph values only, without another Native font capture or reshape.
+                        // Equal total advance cannot exclude equal-width wrong glyphs, so independent
+                        // OpenType observations preserve actual clusters/IDs.
                         eprintln!(
                             "native_paragraph_glyph_observation case={name} source={:?} script={:?} direction={:?} font_metadata={:?} glyphs={:?}",
                             part.source,
@@ -479,8 +501,10 @@ fn run_case(mtm: MainThreadMarker, name: &str, source: &str) -> Result<Option<St
                             font.native().core_font().metadata(),
                             part.glyphs,
                         );
-                        // 只观察本固定引用短例的真实完整 part；旧参考在图关闭后独立创建。
-                        // probe 本身已限制总 part 数，跨关闭只保存有界纯值，不延长任何字体或出版物寿命。
+                        // Observe complete actual parts for this fixed quote fixture only; construct
+                        // the independent reference after graph retirement.
+                        // The probe bounds total parts; retain bounded pure values across close without
+                        // extending font/publication lifetime.
                         parts.push(super::paragraph_oracle::PartAdvance {
                             source: part.source,
                             advance_26_6: part.advance_26_6,
@@ -488,16 +512,19 @@ fn run_case(mtm: MainThreadMarker, name: &str, source: &str) -> Result<Option<St
                     }
                 }
             }
-            // 字体和几何消费只能观察源；按固定小片确认当前文档及原磁盘，不能把渲染成功换成内容改写。
+            // Font/geometry consumers only observe Source; fixed-chunk canonical/disk checks prevent
+            // correct rendering from hiding text mutation.
             let original_document = rig.document.upgrade().ok_or("段落原 Doc 已提前归还")?;
             let document = original_document.borrow();
-            // 此流程没有编辑命令，连内容世代也不得变化；实际显示前缀、软行和 CRLF 仍须保原源。
+            // Before interaction, this flow issues no edits, so generation, displayed prefixes, soft
+            // lines, and CRLF must preserve Source.
             if document.generation() != 0 || document.utf16_len() != source.encode_utf16().count() {
                 return Err(format!("{name}: 段落排版改变了原文档"));
             }
             let mut expected = source.encode_utf16();
             let mut units = [0_u16; 128];
-            // 固定短例也保持生产读取边界，不因 oracle 输入小就回到全文正文复制接口。
+            // Even short reference cases retain bounded production reads instead of a whole-document
+            // copy API.
             for offset in (0..document.utf16_len()).step_by(units.len()) {
                 let used = units.len().min(document.utf16_len() - offset);
                 document
@@ -510,12 +537,14 @@ fn run_case(mtm: MainThreadMarker, name: &str, source: &str) -> Result<Option<St
                     return Err(format!("{name}: 段落显示改写了 canonical 字符"));
                 }
             }
-            drop(document); // 真实文档借用在文件 I/O 和后继 Native 收尾之前归还。
+            drop(document); // End actual document borrowing before file I/O and subsequent Native teardown.
             drop(original_document);
-            // 源缓冲区未改不代表没有误保存；独立文件句柄核每片字节及真实 EOF。
+            // An unchanged buffer cannot exclude an accidental save; a separate descriptor checks each
+            // byte chunk and actual EOF.
             unchanged_disk(&rig, name, source)?;
             if name.starts_with("scoped_quote") {
-                // 原对照的纯值已经冻结；随后真实鼠标/编辑/重排不能改写旧帧的期望或覆盖差异。
+                // Freeze original comparison facts before actual mouse/edit/reflow work can change
+                // expectations or overwrite differences.
                 punctuation_interaction(&mut rig, name, source)?;
             }
             rig.remember_receipt()?;
@@ -531,10 +560,10 @@ fn run_case(mtm: MainThreadMarker, name: &str, source: &str) -> Result<Option<St
             .body
             .probe_root_leaf_publication()
             .map_err(|cause| cause.to_string())?;
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, publication, result))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     if publication.upgrade().is_some() {
         return Err(format!(
             "{name}: 短几何对照结束后原语义 publication 仍未释放"
@@ -542,16 +571,20 @@ fn run_case(mtm: MainThreadMarker, name: &str, source: &str) -> Result<Option<St
     }
     let candidate = result?;
     let mut differences = Vec::new();
-    // 候选已严格关闭；完整旧 TextKit 图先确定真实软行，再归还其全部 owner。
+    // After strict candidate close, the independent TextKit graph determines actual soft lines and
+    // returns every owner.
     let font = crate::native_surface::text_attributes::native_markdown_document_fixed_font(14.0)
         .map_err(|cause| cause.to_string())?;
     let original =
         super::paragraph_oracle::measure(source, candidate.width, &font, &candidate.parts)?;
     if !candidate.parts.is_empty() {
-        // 原 TextKit 真实行内已采字形边缘；这里只合计纯值，不再用 CTLine 的另一套 CJK 行末宽。
-        // 两边现在使用同一公开文稿角色；旧 UI 专用字体的半宽默认策略不再属于本产品对照。
-        // 仍保留逐 part 的实际推进观察，不能用整行总宽相等替代来源、字形和局部几何证明，
-        // 也不能为了追平平台结果改 glyph 或补固定像素。
+        // Actual TextKit lines already supplied glyph edges; sum their pure facts without CTLine
+        // alternative CJK line-end widths.
+        // Both paths use the public document font role, excluding UI-only font half-width defaults from
+        // this product comparison.
+        // Preserve actual per-part advances because equal line width cannot replace Source, glyph, and
+        // local-geometry evidence,
+        // or authorize changed glyphs/fixed pixel adjustments to fit platform results.
         let expected = super::paragraph_oracle::part_advances(source, &original, &candidate.parts)?;
         for (part, expected) in candidate.parts.iter().zip(expected) {
             eprintln!(
@@ -567,7 +600,7 @@ fn run_case(mtm: MainThreadMarker, name: &str, source: &str) -> Result<Option<St
         differences.push(cause);
     }
     if !differences.is_empty() {
-        return Ok(Some(differences.join("\n"))); // 图均已真实释放，完整 part 与几何的独立差异一起保留。
+        return Ok(Some(differences.join("\n"))); // After actual graph release, retain independent full-part and geometry differences together.
     }
     println!(
         "native_body_root_leaf_paragraph case={name} actual_old_native_geometry=true exact_soft_line_source=true same_font=true fixed_tolerance_26_6=1 actual_paged_frame=true formal=false whole_product=false"
@@ -583,7 +616,8 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
             Ok(Some(cause)) => differences.push(cause),
             Ok(None) => {}
             Err(cause) => {
-                // 后继真实装配、交互或资源失败仍立即停止；先前已严格清场的独立差异不能被它吞掉。
+                // Stop on actual later assembly/interaction/resource failure while preserving prior
+                // independent differences from strictly closed cases.
                 differences.push(format!("{name}: {cause}"));
                 return Err(differences.join("\n"));
             }

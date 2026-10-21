@@ -29,7 +29,8 @@ pub(super) struct ValidatedMarkdownText<T> {
     pub(super) modified_at_ms: i64,
 }
 
-/// 冻结同一个文件身份，只允许有限源窗口；callback失败或真实close失败都不能发布结果。
+/// Freeze one file identity and lend only bounded source windows. Callback failure,
+/// validation failure, or a real close failure prevents publishing the derived result.
 pub(super) fn inspect_bounded_markdown_text_cancellable<T>(
     path: &Path,
     maximum_bytes: u64,
@@ -38,8 +39,11 @@ pub(super) fn inspect_bounded_markdown_text_cancellable<T>(
     snapshots: Option<&mut SnapshotDirectory>,
 ) -> Result<ValidatedMarkdownText<T>, MarkdownWorkspaceError> {
     if !is_current() {
+        // Reject cancelled work before opening a source or creating anonymous snapshot storage.
         return Err(MarkdownWorkspaceError::SearchSuperseded);
     }
+    // Do not follow a final symlink or block opening a special file; metadata below
+    // must independently prove a regular file before capture is allowed.
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -49,21 +53,25 @@ pub(super) fn inspect_bounded_markdown_text_cancellable<T>(
         .metadata()
         .map_err(|_| MarkdownWorkspaceError::StorageUnavailable)?;
     if !before.is_file() {
+        // A nonregular descriptor is not a finite Markdown source, even when open succeeded.
         return Err(MarkdownWorkspaceError::StorageUnavailable);
     }
     if before.len() > maximum_bytes {
+        // Enforce the caller's candidate limit before allocating snapshot resources.
         return Err(MarkdownWorkspaceError::DocumentTooLarge);
     }
     let length =
         usize::try_from(before.len()).map_err(|_| MarkdownWorkspaceError::DocumentTooLarge)?;
     let identity = FileIdentity::from(&before);
-    // 只有独立匿名冻结inode可建立有界mapping；每候选共享的只是空scratch目录。
+    // Map only an independently frozen anonymous inode. Candidates may reuse an
+    // empty scratch directory, but never a mutable file or another candidate's bytes.
     let captured = match snapshots {
         Some(directory) => directory.capture_backing(&file, before.len(), &is_current),
         None => SnapshotDirectory::new()
             .and_then(|mut directory| directory.capture_backing(&file, before.len(), &is_current)),
     }
     .map_err(|error| match error {
+        // Preserve source mutation and cancellation as distinct caller-visible outcomes.
         SnapshotError::SourceChanged => MarkdownWorkspaceError::DocumentChangedDuringRead,
         SnapshotError::Cancelled => MarkdownWorkspaceError::SearchSuperseded,
         SnapshotError::Storage(_) => MarkdownWorkspaceError::StorageUnavailable,
@@ -71,17 +79,39 @@ pub(super) fn inspect_bounded_markdown_text_cancellable<T>(
     let text = BoundedMarkdownText::new(captured, length)?;
     let result = inspect(&text);
     let validation = if result.is_ok() {
-        // 搜索已在同一次KMP扫描完成校验；其他局部检查者仍必须证明整个冻结候选有效。
+        // Search validates during its own KMP traversal; a local inspector must
+        // still prove the entire frozen candidate is UTF-8 before publishing success.
         text.ensure_validated(&is_current)
     } else {
-        Ok(()) // 业务失败不再重扫；归还仍由下面同一个显式close完成。
+        // Do not rescan after a consumer failure; the explicit close below still runs.
+        Ok(())
     };
-    text.close()?; // callback错误也先完成实际归还；cleanup失败不能被较早的业务错误吞掉。
-    validation?;
-    let value = result?;
+    // Reclaim the actual source even after consumer or validation failure. Keep
+    // its outcome separate so cleanup cannot replace the earlier operation cause.
+    let cleanup = text.close();
+    let inspected = result.and_then(|value| validation.map(|()| value));
+    let value = match (inspected, cleanup) {
+        // Only successful inspection, complete validation, and reclamation can
+        // release the finite derived result for final source-identity checks.
+        (Ok(value), Ok(())) => value,
+        // A single failure retains its original typed meaning and source chain.
+        (Err(cause), Ok(())) => return Err(cause),
+        (Ok(_), Err(cleanup)) => return Err(cleanup),
+        // Both facts matter: the inspection failed first, and actual cleanup also
+        // failed. Preserve both while exposing the first cause through Error::source.
+        (Err(cause), Err(cleanup)) => {
+            return Err(MarkdownWorkspaceError::InspectionCleanupFailed {
+                cause: Box::new(cause),
+                cleanup: Box::new(cleanup),
+            });
+        }
+    };
     if !is_current() {
+        // Successful inspection and cleanup cannot revive a superseded search request.
         return Err(MarkdownWorkspaceError::SearchSuperseded);
     }
+    // Compare both the still-open descriptor and the current pathname with the
+    // original inode, extent, mtime, and ctime before exposing derived metadata.
     let after = file
         .metadata()
         .map_err(|_| MarkdownWorkspaceError::StorageUnavailable)?;
@@ -91,7 +121,8 @@ pub(super) fn inspect_bounded_markdown_text_cancellable<T>(
         || FileIdentity::from(&after) != identity
         || FileIdentity::from(&path_after) != identity
     {
-        // 原路径或descriptor变化时丢弃全部派生结果，不拿新身份继续旧扫描。
+        // Discard all derived results when either identity changed; never continue
+        // the old scan using a replacement path or descriptor observation.
         return Err(MarkdownWorkspaceError::DocumentChangedDuringRead);
     }
     Ok(ValidatedMarkdownText {
@@ -103,7 +134,8 @@ pub(super) fn inspect_bounded_markdown_text_cancellable<T>(
     })
 }
 
-/// 只需revision的调用者也必须有限校验/散列；不得因callback不读正文而留全片扫描。
+/// Compute a revision through finite validated leases even when the consumer itself
+/// does not read text; a revision-only call receives no whole-source borrow privilege.
 pub(super) fn inspect_bounded_markdown<T>(
     path: &Path,
     maximum_bytes: u64,
@@ -114,6 +146,7 @@ pub(super) fn inspect_bounded_markdown<T>(
         maximum_bytes,
         || true,
         |text| {
+            // Digest the exact original bytes, sharing the traversal with UTF-8 validation.
             let mut digest = Sha256::new();
             text.visit_validated_bytes(&|| true, |_, bytes| {
                 digest.update(bytes);
@@ -122,10 +155,12 @@ pub(super) fn inspect_bounded_markdown<T>(
             let digest = digest.finalize();
             let mut revision = String::with_capacity(digest.len() * 2);
             for byte in digest {
+                // The public revision is fixed-size lowercase hexadecimal, not a text copy.
                 use std::fmt::Write as _;
                 let _ = write!(revision, "{byte:02x}");
             }
-            // 完整UTF8和精确原字节摘要都成功后才进入消费者；消费者仍无全片借用接口。
+            // Enter the consumer only after complete UTF-8 validation and the exact
+            // byte digest succeed; its source API still exposes only finite windows.
             Ok((inspect(text)?, revision))
         },
         None,
@@ -207,317 +242,6 @@ pub(super) fn sync_directory(path: &Path) -> Result<(), MarkdownWorkspaceError> 
             // Translate a failed filesystem stage into the stable vault-storage error category.
             MarkdownWorkspaceError::StorageUnavailable
         })
-}
-
-/// Validate a recovery identifier without requiring the original note to remain present.
-#[cfg(feature = "native-markdown-candidate")]
-pub(super) fn validate_conflict_draft_relative_path(
-    relative_path: &str,
-) -> Result<(), MarkdownWorkspaceError> {
-    let path = validate_relative_path(relative_path, false)?;
-    if targets_reserved_attachments_tree(path) {
-        // Reserved asset paths cannot own note conflict drafts.
-        return Err(MarkdownWorkspaceError::InvalidRelativePath);
-    }
-    if !has_markdown_extension(path) {
-        // Only Markdown note identifiers are eligible for recovery storage.
-        return Err(MarkdownWorkspaceError::NotMarkdown);
-    }
-    if relative_path.len() > MAX_RECOVERY_RELATIVE_PATH_BYTES {
-        // Bound serialized path bytes before encoding the private recovery record.
-        return Err(MarkdownWorkspaceError::InvalidRelativePath);
-    }
-    Ok(())
-}
-
-/// Map an untrusted relative identifier to a fixed-length private recovery filename.
-#[cfg(feature = "native-markdown-candidate")]
-pub(super) fn conflict_draft_path(recovery_directory: &Path, relative_path: &str) -> PathBuf {
-    let digest = Sha256::digest(relative_path.as_bytes());
-    let mut file_name = String::with_capacity(digest.len() * 2 + ".draft".len());
-    for byte in digest {
-        // Hex encoding preserves a filesystem-safe deterministic key without exposing directory syntax.
-        use std::fmt::Write as _;
-        let _ = write!(file_name, "{byte:02x}");
-    }
-    file_name.push_str(".draft");
-    recovery_directory.join(file_name)
-}
-
-/// Accept only a real owner-private recovery directory and distinguish absence from unsafe storage.
-#[cfg(feature = "native-markdown-candidate")]
-pub(super) fn existing_conflict_recovery_directory(
-    recovery_directory: &Path,
-) -> Result<bool, MarkdownWorkspaceError> {
-    match fs::symlink_metadata(recovery_directory) {
-        // A non-symlink directory without group or other permissions can hold private unsaved drafts.
-        Ok(metadata)
-            if !metadata.file_type().is_symlink()
-                && metadata.is_dir()
-                && metadata.permissions().mode() & 0o077 == 0 =>
-        {
-            Ok(true)
-        }
-        // An existing unsafe type or permission mode must not receive draft bytes.
-        Ok(_) => Err(MarkdownWorkspaceError::ConflictRecoveryUnavailable),
-        // A missing directory is a normal no-recovery state that writers may create explicitly.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        // Other lookup failures prevent safe recovery and remain caller-visible.
-        Err(_) => Err(MarkdownWorkspaceError::ConflictRecoveryUnavailable),
-    }
-}
-
-/// Create owner-private recovery storage only when an explicit draft write requires it.
-#[cfg(feature = "native-markdown-candidate")]
-pub(super) fn ensure_conflict_recovery_directory(
-    recovery_directory: &Path,
-) -> Result<(), MarkdownWorkspaceError> {
-    if existing_conflict_recovery_directory(recovery_directory)? {
-        // An already validated directory needs no mutation or permission change.
-        return Ok(());
-    }
-
-    let parent = recovery_directory
-        .parent()
-        .ok_or(MarkdownWorkspaceError::ConflictRecoveryUnavailable)?;
-    fs::create_dir_all(parent).map_err(|_| {
-        // A failed private-storage stage must keep unsaved recovery persistence visibly unsuccessful.
-        MarkdownWorkspaceError::ConflictRecoveryUnavailable
-    })?;
-    match fs::create_dir(recovery_directory) {
-        // This call created the directory and will validate its final type before use.
-        Ok(()) => {}
-        // A concurrent creator is tolerated only because the resulting entry is validated below.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        // Other creation errors prevent reliable draft persistence.
-        Err(_) => return Err(MarkdownWorkspaceError::ConflictRecoveryUnavailable),
-    }
-
-    let metadata = fs::symlink_metadata(recovery_directory).map_err(|_| {
-        // A failed private-storage stage must keep unsaved recovery persistence visibly unsuccessful.
-        MarkdownWorkspaceError::ConflictRecoveryUnavailable
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        // A replaced path or non-directory is rejected before permissions or data writes.
-        return Err(MarkdownWorkspaceError::ConflictRecoveryUnavailable);
-    }
-    fs::set_permissions(recovery_directory, fs::Permissions::from_mode(0o700)).map_err(|_| {
-        // A failed private-storage stage must keep unsaved recovery persistence visibly unsuccessful.
-        MarkdownWorkspaceError::ConflictRecoveryUnavailable
-    })?;
-    sync_conflict_recovery_directory(parent)?;
-    Ok(())
-}
-
-/// Require a regular owner-private file before mapping, replacing, or deleting a recovery record.
-#[cfg(feature = "native-markdown-candidate")]
-pub(super) fn validate_conflict_draft_file(
-    metadata: &Metadata,
-) -> Result<(), MarkdownWorkspaceError> {
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        // Links, special entries, and shared permissions violate the private draft contract.
-        Err(MarkdownWorkspaceError::ConflictDraftCorrupted)
-    } else {
-        // A regular private file is eligible for structural record validation.
-        Ok(())
-    }
-}
-
-/// Generate the one real historical format for isolated recovery regression fixtures.
-#[cfg(all(test, feature = "native-markdown-candidate"))]
-pub(super) fn write_conflict_draft(
-    recovery_directory: &Path,
-    relative_path: &str,
-    content: &str,
-    save_sequence: &AtomicU64,
-) -> Result<(), MarkdownWorkspaceError> {
-    validate_conflict_draft_relative_path(relative_path)?;
-    if content.len() as u64 > MAX_DOCUMENT_BYTES {
-        // Reject an oversized draft without altering any existing recovery record.
-        return Err(MarkdownWorkspaceError::DocumentTooLarge);
-    }
-    ensure_conflict_recovery_directory(recovery_directory)?;
-
-    let destination = conflict_draft_path(recovery_directory, relative_path);
-    match fs::symlink_metadata(&destination) {
-        // Existing draft storage must still be a valid private regular file.
-        Ok(metadata) => validate_conflict_draft_file(&metadata)?,
-        // Absence permits a first draft to be atomically installed.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        // Lookup failures must not be treated as an absent replaceable destination.
-        Err(_) => return Err(MarkdownWorkspaceError::ConflictRecoveryUnavailable),
-    }
-
-    // Serialize bounded big-endian lengths and the exact note identifier before unsaved content.
-    let relative_path_bytes = relative_path.as_bytes();
-    let relative_path_byte_count = u32::try_from(relative_path_bytes.len()).map_err(|_| {
-        // The path length or representation cannot safely fit the bounded recovery identifier contract.
-        MarkdownWorkspaceError::InvalidRelativePath
-    })?;
-    let content_byte_count = u64::try_from(content.len()).map_err(|_| {
-        // The requested extent cannot fit the editor's supported byte or signed-coordinate limit.
-        MarkdownWorkspaceError::DocumentTooLarge
-    })?;
-    let mut header = [0_u8; CONFLICT_DRAFT_HEADER_BYTES];
-    header[..CONFLICT_DRAFT_MAGIC.len()].copy_from_slice(CONFLICT_DRAFT_MAGIC);
-    header[8..12].copy_from_slice(&relative_path_byte_count.to_be_bytes());
-    header[12..20].copy_from_slice(&content_byte_count.to_be_bytes());
-
-    // Write and sync under rollback ownership; rename publishes a complete record in one directory operation.
-    let mut temporary = create_temporary_conflict_draft(recovery_directory, save_sequence)?;
-    temporary
-        .file
-        .write_all(&header)
-        .and_then(|()| {
-            // Serialize the exact note identifier after the fixed header under the same rollback guard.
-            temporary.file.write_all(relative_path_bytes)
-        })
-        .and_then(|()| {
-            // Append unsaved UTF-8 bytes only after the complete identifier has been written.
-            temporary.file.write_all(content.as_bytes())
-        })
-        .and_then(|()| {
-            // Make the complete temporary record durable before its name is atomically published.
-            temporary.file.sync_all()
-        })
-        .map_err(|_| {
-            // A failed private-storage stage must keep unsaved recovery persistence visibly unsuccessful.
-            MarkdownWorkspaceError::ConflictRecoveryUnavailable
-        })?;
-    fs::rename(&temporary.path, &destination).map_err(|_| {
-        // A failed private-storage stage must keep unsaved recovery persistence visibly unsuccessful.
-        MarkdownWorkspaceError::ConflictRecoveryUnavailable
-    })?;
-    temporary.disarm();
-    sync_conflict_recovery_directory(recovery_directory)
-}
-
-/// 固定header只决定合法范围与预算；此函数不借用正文，也不把未固定的源文件声明为不可变。
-#[cfg(feature = "native-markdown-candidate")]
-pub(super) fn conflict_draft_payload_extent(
-    header: &[u8],
-    record_bytes: usize,
-) -> Result<std::ops::Range<usize>, MarkdownWorkspaceError> {
-    if header.len() < CONFLICT_DRAFT_HEADER_BYTES
-        || &header[..CONFLICT_DRAFT_MAGIC.len()] != CONFLICT_DRAFT_MAGIC
-    {
-        // 缺失或错误magic不能授权按后面的不可信长度分配、复制或建立映射。
-        return Err(MarkdownWorkspaceError::ConflictDraftCorrupted);
-    }
-
-    // 仅在20B头完整后解码两个big-endian长度，后续所有端点均使用checked算术。
-    let mut relative_path_length_bytes = [0_u8; 4];
-    relative_path_length_bytes.copy_from_slice(&header[8..12]);
-    let relative_path_byte_count = u32::from_be_bytes(relative_path_length_bytes) as usize;
-    let mut content_length_bytes = [0_u8; 8];
-    content_length_bytes.copy_from_slice(&header[12..20]);
-    let content_byte_count =
-        usize::try_from(u64::from_be_bytes(content_length_bytes)).map_err(|_| {
-            // 无法寻址的正文长度不是可恢复的有界record。
-            MarkdownWorkspaceError::ConflictDraftCorrupted
-        })?;
-    if relative_path_byte_count > MAX_RECOVERY_RELATIVE_PATH_BYTES
-        || content_byte_count as u64 > MAX_DOCUMENT_BYTES
-    {
-        // 路径和正文沿用旧写入格式的上限，防止header诱导无界读取。
-        return Err(MarkdownWorkspaceError::ConflictDraftCorrupted);
-    }
-
-    let relative_path_end = CONFLICT_DRAFT_HEADER_BYTES
-        .checked_add(relative_path_byte_count)
-        .ok_or(MarkdownWorkspaceError::ConflictDraftCorrupted)?;
-    let content_end = relative_path_end
-        .checked_add(content_byte_count)
-        .ok_or(MarkdownWorkspaceError::ConflictDraftCorrupted)?;
-    if content_end != record_bytes {
-        // 丢字节或额外尾字节都不能被当作部分有效的恢复内容。
-        return Err(MarkdownWorkspaceError::ConflictDraftCorrupted);
-    }
-    Ok(relative_path_end..content_end)
-}
-
-/// Sync recovery directory metadata with its dedicated user-visible persistence failure.
-#[cfg(feature = "native-markdown-candidate")]
-pub(super) fn sync_conflict_recovery_directory(path: &Path) -> Result<(), MarkdownWorkspaceError> {
-    File::open(path)
-        .and_then(|directory| {
-            // Persist directory-entry changes before the operation reports a durable receipt.
-            directory.sync_all()
-        })
-        .map_err(|_| {
-            // A failed private-storage stage must keep unsaved recovery persistence visibly unsuccessful.
-            MarkdownWorkspaceError::ConflictRecoveryUnavailable
-        })
-}
-
-/// Exclusive private recovery temporary with descriptor ownership and best-effort rollback.
-#[cfg(feature = "native-markdown-candidate")]
-pub(super) struct TemporaryConflictDraft {
-    pub(super) path: PathBuf,
-    pub(super) file: File,
-    pub(super) armed: bool,
-}
-
-#[cfg(feature = "native-markdown-candidate")]
-impl TemporaryConflictDraft {
-    /// Acquire a new owner-private temporary file exclusively and arm rollback before returning it.
-    pub(super) fn create(path: &Path) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            file,
-            armed: true,
-        })
-    }
-
-    /// Transfer ownership after successful publication so Drop no longer unlinks the committed file.
-    pub(super) fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-/// Acquire a bounded-attempt private draft temporary without overwriting another in-flight save.
-#[cfg(feature = "native-markdown-candidate")]
-pub(super) fn create_temporary_conflict_draft(
-    recovery_directory: &Path,
-    save_sequence: &AtomicU64,
-) -> Result<TemporaryConflictDraft, MarkdownWorkspaceError> {
-    for _ in 0..TEMPORARY_SAVE_ATTEMPTS {
-        // Combine process identity and a monotonic session sequence; collisions consume one bounded retry.
-        let sequence = save_sequence.fetch_add(1, AtomicOrdering::Relaxed);
-        let temporary_path = recovery_directory.join(format!(
-            ".omni-md-conflict-{}-{sequence}.tmp",
-            std::process::id()
-        ));
-        match TemporaryConflictDraft::create(&temporary_path) {
-            // Exclusive creation transfers the temporary file and rollback obligation to the caller.
-            Ok(temporary) => return Ok(temporary),
-            // An occupied name belongs to another writer and must remain untouched.
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            // Other I/O failures stop draft persistence immediately.
-            Err(_) => return Err(MarkdownWorkspaceError::ConflictRecoveryUnavailable),
-        }
-    }
-    Err(MarkdownWorkspaceError::ConflictRecoveryUnavailable)
-}
-
-#[cfg(feature = "native-markdown-candidate")]
-impl Drop for TemporaryConflictDraft {
-    /// Best-effort rollback of an unpublished temporary file without panicking during teardown.
-    fn drop(&mut self) {
-        if self.armed {
-            // Only an armed, unpublished temporary still belongs to this rollback guard.
-            let _ = fs::remove_file(&self.path);
-        }
-    }
 }
 
 /// Same-parent save temporary whose ownership transfers only after atomic publication.

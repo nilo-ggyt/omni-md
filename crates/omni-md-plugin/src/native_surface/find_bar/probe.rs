@@ -1,9 +1,11 @@
-//! 同一Native9图上的真实Find接点；测试权限由原owner/root/epoch签发，不向全局前台槽安装替身。
+//! Exercise actual Find entry points on the same Native9 graph. Original owner,
+//! root, and epoch issue authority without installing a replacement foreground slot.
 
 use super::*;
 use crate::native_surface::NativeMarkdownTextKitEditorSurface;
 
-/// 所有合成 Find 场景复用原 editor 的唯一栏 owner；不另建前台槽或第二份控件实现。
+/// Synthetic Find scenarios share the original editor's sole bar owner, never a
+/// second foreground slot or another control implementation.
 fn find_probe_bar(
     surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
@@ -16,7 +18,8 @@ fn find_probe_bar(
     match original {
         Some(bar) => Ok(bar),
         None => {
-            // 只克隆同一Rust账本owner；Native构造期间不持RefCell借用，真实控件仍走同一总预算。
+            // Clone the same Rust ledger owner. Native construction holds no
+            // RefCell borrow, and actual controls share the existing resource budget.
             let ledger = surface
                 .find_ledger
                 .borrow()
@@ -52,7 +55,8 @@ fn configure_find_probe_x(
         native_markdown_table_intent_step(current, work)
             .map_err(|_| "合成 Find 的原窗口/正文/输入已变更".to_owned())
     };
-    // 固定小查询只用于合成回归；保留生产Next允许的隐藏导航，不额外抢焦点或改变正文可见高度。
+    // This fixed small query belongs only to synthetic regression. Preserve
+    // production Next's hidden navigation without taking focus or changing body height.
     step(&mut || bar.query.setStringValue(ns_string!("x")))?;
     step(&mut || bar.replacement.setStringValue(ns_string!("")))?;
     step(&mut || bar.case.setState(objc2_app_kit::NSControlStateValueOff))?;
@@ -61,6 +65,8 @@ fn configure_find_probe_x(
     Ok(())
 }
 
+/// Begin the actual task-marker Find under its original input intent and return
+/// that same request for later endpoint observation, never a status-text inference.
 pub(in crate::native_surface) fn begin_list_marker_find_probe(
     surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
@@ -69,7 +75,7 @@ pub(in crate::native_surface) fn begin_list_marker_find_probe(
     current: &impl Fn() -> bool,
 ) -> Result<Rc<NativeMarkdownFindRevealRequest>, String> {
     if !current() || controller.find_input_intent() != intent {
-        return Err("任务框 Find 未持有原输入权限".into()); // 旧 intent 在任何栏构造或字段 setter 前拒绝。
+        return Err("任务框 Find 未持有原输入权限".into()); // Reject stale intent before bar creation or field setters.
     }
     let bar = find_probe_bar(surface, controller, current)?;
     configure_find_probe_x(&bar, current)?;
@@ -85,7 +91,8 @@ pub(in crate::native_surface) fn begin_list_marker_find_probe(
     .ok_or_else(|| "任务框真实 Find 缺少原定位请求".into())
 }
 
-/// 只复制原栏的纯 stamp；不读取 Native、不保控件，供外层原票跨 helper 与 pool 保持权限。
+/// Copy original scalar bar facts only, with no Native getters or retained controls,
+/// so the outer ticket can preserve authority across helpers and autorelease pools.
 pub(in crate::native_surface) fn multi_selection_find_probe_bar_stamp(
     surface: &NativeMarkdownTextKitEditorSurface,
 ) -> Option<(u64, bool)> {
@@ -94,7 +101,8 @@ pub(in crate::native_surface) fn multi_selection_find_probe_bar_stamp(
     })
 }
 
-/// 多匹配动作实际挂载生产栏；visible 与布局代次只由原 show 事务更新。
+/// Mount the actual production bar for multiple-match actions. Only its original
+/// show transaction changes visibility and layout revision.
 pub(in crate::native_surface) fn prepare_multi_selection_find_probe(
     surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
@@ -111,6 +119,8 @@ pub(in crate::native_surface) fn prepare_multi_selection_find_probe(
                 .is_some_and(|actual| Rc::ptr_eq(actual, &bar))
     };
     configure_find_probe_x(&bar, &same_bar)?;
+    // Declare this show's exact revision transition before Native setters. Reentry
+    // may observe only these states, never acquire arbitrary successor layout authority.
     let before = (bar.layout_revision.get(), bar.visible.get());
     let revision = before.0.checked_add(1).ok_or("合成 Find 布局代次耗尽")?;
     let entered = (revision, before.1);
@@ -132,12 +142,14 @@ pub(in crate::native_surface) fn prepare_multi_selection_find_probe(
             return Err("合成 Find 栏未达到预声明的实际显示状态".into());
         }
         let root_parent = native_markdown_table_intent_step(&showing, || {
-            // SAFETY: 原产品 root/scroll 主线程存活；公开父视图 getter 不建立新的文本图。
+            // SAFETY: The original product root/scroll are alive on the main
+            // thread; the public parent getter creates no document graph.
             unsafe { bar.root.superview() }
         })
         .map_err(|_| "核对 Find 栏父视图时原权限已撤销")?;
         let scroll_parent = native_markdown_table_intent_step(&showing, || {
-            // SAFETY: 同上，两个结果只在本调用栈比较，未保存外部父视图。
+            // SAFETY: The same live-main-thread condition holds. Compare both
+            // parents on this stack only; retain no external parent afterward.
             unsafe { surface.backend.scroll_view.superview() }
         })
         .map_err(|_| "核对正文父视图时原权限已撤销")?;
@@ -161,6 +173,8 @@ pub(in crate::native_surface) fn prepare_multi_selection_find_probe(
         }
         Ok(())
     });
+    // Autorelease-pool drainage also releases Native claims and can reenter. The
+    // successful mounting observation remains valid only under the original ticket.
     if !showing() {
         return Err("合成 Find 栏临时对象释放后原权限已撤销".into());
     }
@@ -168,7 +182,8 @@ pub(in crate::native_surface) fn prepare_multi_selection_find_probe(
     Ok(bar)
 }
 
-/// 只执行真实匹配器；多选没有 Reveal 收据，Next 则必须交还同一原 Rc 请求。
+/// Execute the actual matcher. SelectAll has no reveal receipt; Next must return
+/// the same original Rc request created by the real action.
 pub(in crate::native_surface) fn execute_multi_selection_find_probe(
     surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
@@ -207,7 +222,7 @@ pub(in crate::native_surface) fn execute_multi_selection_find_probe(
     })
     .map_err(|_| "任务框真实Find执行期间已撤权")??;
     let Some(expected) = expected else {
-        return Ok(None); // SelectAll 必须由调用方核实际 Multiple，不能制造已定位的成功收据。
+        return Ok(None); // The caller verifies actual Multiple selection; invent no successful reveal receipt.
     };
     let request = surface
         .backend
@@ -223,9 +238,10 @@ pub(in crate::native_surface) fn execute_multi_selection_find_probe(
     {
         return Err("真实Find选中的不是预声明任务框内部x".into());
     }
-    drop(context); // 原生storage/controller claims不跨下一有界executor或后续模式转换。
-    // context取得期间可能发生原生重入；坐标相同不能证明仍属于先前保存的request。
-    // 此处只读原槽并比较Rc身份，中间不插入Native调用，后继请求不得替原收据作证。
+    drop(context); // Native storage/controller claims cannot cross the next executor or mode transition.
+    // Context acquisition can reenter. Equal coordinates do not prove identity
+    // with the saved request; compare the original slot's Rc without Native calls
+    // so a successor request cannot certify the original receipt.
     if !surface
         .backend
         .text_view
@@ -240,6 +256,8 @@ pub(in crate::native_surface) fn execute_multi_selection_find_probe(
     Ok(Some(request))
 }
 
+/// Hide through the actual bar transaction while keeping the editor's unique bar
+/// owner; existing strict teardown remains responsible for its eventual release.
 pub(in crate::native_surface) fn finish_list_marker_find_probe(
     surface: &NativeMarkdownTextKitEditorSurface,
     controller: &Retained<NativeMarkdownController>,
@@ -258,7 +276,7 @@ pub(in crate::native_surface) fn finish_list_marker_find_probe(
         )
     })
     .map_err(|_| "任务框Find收尾期间已撤权")??;
-    drop(bar); // editor继续正常拥有同一栏；既有strict teardown负责其控件与查询释放。
+    drop(bar); // The editor still owns the same bar; strict teardown releases controls and query state.
     current()
         .then_some(())
         .ok_or_else(|| "任务框Find收尾后原权限已撤销".into())

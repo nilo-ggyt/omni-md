@@ -1,7 +1,9 @@
-//! 同一冻结源的多行组合管线；输入分项和最终视觉行是两个不同的完成边界。
+//! Compose multiple lines from one frozen source. Completed input items and
+//! completed visual lines are separate publication boundaries.
 //!
-//! 分项阶段只封闭真实UBA、Script、GCB与样式响应的交集，不把item末尾当软行。
-//! 后继组合阶段继续消费原Measure、受控安全切片和实际Resolver结果；没有Native依赖。
+//! Itemization intersects actual bidi, script, grapheme, and style authority;
+//! an item end does not imply a soft line end. Composition consumes the original
+//! measure, safe-slice, and resolver results without introducing native dependencies.
 
 mod controls;
 mod font;

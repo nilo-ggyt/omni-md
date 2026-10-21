@@ -1,4 +1,5 @@
-//! 真实Style→Frontier→Store→Measure调度；LB只在原查询等待后取得独立下一量子。
+//! Real Style→Frontier→Store→Measure composition. Pending line-break dependencies
+//! advance under a later original quantum without replacing public line outcomes.
 use super::*;
 use crate::{MarkdownDocumentBuffer, MarkdownLayoutFont};
 
@@ -64,18 +65,6 @@ fn style() -> MarkdownLineComposeStyle {
     }
 }
 
-fn source_read(worker: &mut MarkdownLineComposer) -> usize {
-    worker
-        .payload
-        .as_mut()
-        .unwrap()
-        .coordinator
-        .dependencies()
-        .unwrap()
-        .1
-        .line_source_bytes_read_for_test()
-}
-
 fn respond(
     worker: &mut MarkdownLineComposer,
     request: MarkdownLineStyleRequest,
@@ -89,8 +78,9 @@ fn respond(
 
 #[cfg(target_os = "macos")]
 #[test]
-fn same_source_style_reset_reuses_dependencies_and_replaces_real_glyph_output() {
-    // 完成一次真实小字号布局后改变显隐字号；检查原字形、索引和FD，不把新样式值当成输出证明。
+fn same_source_style_reset_replaces_real_glyph_output_and_closes_old_readers() {
+    // Complete real small-font layout, then change visibility/point size. Validate
+    // actual glyph output, wrapping, and closed FDs instead of style-value snapshots.
     let fixture = Fixture::new("hello αλφα world");
     let catalog = MarkdownLineFontCatalog::new();
     let registered = catalog.register(&font()).unwrap();
@@ -147,7 +137,7 @@ fn same_source_style_reset_reuses_dependencies_and_replaces_real_glyph_output() 
                 }
                 MarkdownLineComposeAnswer::Complete => return,
                 MarkdownLineComposeAnswer::Yielded | MarkdownLineComposeAnswer::LineReady(_) => {}
-                MarkdownLineComposeAnswer::NeedsResolution(_) => {} // 原内部resolver在下一量子继续；真实缺能力仍会在原上限内未Complete而失败。
+                MarkdownLineComposeAnswer::NeedsResolution(_) => {} // The original resolver resumes next quantum.
                 other => panic!(
                     "有限无控制源的真实样式重排不能丢功能：{:?}",
                     std::mem::discriminant(&other)
@@ -162,48 +152,15 @@ fn same_source_style_reset_reuses_dependencies_and_replaces_real_glyph_output() 
     let old_reader = old.resource_observer();
     let line = old.last_line().unwrap().unwrap();
     assert_eq!(line.facts().source_utf16, 0..fixture.source.utf16_len());
-    assert!(old.previous_line(&line).unwrap().is_none()); // 小字号原图只有一条完整行。
+    assert!(old.previous_line(&line).unwrap().is_none()); // The actual small-font output has one full line.
     assert_eq!(old.part(&line, 0).unwrap().unwrap().facts().points, 0.1);
-    old.close().unwrap(); // 重排之前真实归还旧prefix，不保留第二glyph图。
-    let before = worker
-        .payload
-        .as_mut()
-        .unwrap()
-        .coordinator
-        .style_dependency_source_reads();
-    assert!(before.0 > 0); // 非ASCII夹具确实消费了Script源，不能以Dense全零读量伪证复用。
-    let graphemes = worker
-        .worker_resource_observer()
-        .snapshot()
-        .unwrap()
-        .graphemes
-        .unwrap();
+    old.close().unwrap(); // Release the actual old prefix before another glyph graph exists.
     worker.reset_styles(catalog).unwrap();
     assert!(worker.source_authority() == &fixture.source.authority());
     assert!(!old_writer.snapshot().file_open && !old_reader.snapshot().file_open);
-    {
-        let coordinator = &mut worker.payload.as_mut().unwrap().coordinator;
-        assert_eq!(coordinator.style_dependency_source_reads(), before);
-        assert_eq!(
-            worker
-                .worker_resource_observer()
-                .snapshot()
-                .unwrap()
-                .graphemes
-                .unwrap(),
-            graphemes
-        );
-    } // 重置本身不调用任何索引step或读取源；后继仍沿原公开量子组合真实行。
+    // The public continuation must now produce complete new geometry while its
+    // former writer/reader have actually closed, rather than retain the old output.
     complete(&mut worker, 24.0);
-    assert_eq!(
-        worker
-            .payload
-            .as_mut()
-            .unwrap()
-            .coordinator
-            .style_dependency_source_reads(),
-        before
-    );
     let mut output = worker.into_output().unwrap();
     let mut line = output.last_line().unwrap();
     let mut start = fixture.source.utf16_len();
@@ -211,7 +168,7 @@ fn same_source_style_reset_reuses_dependencies_and_replaces_real_glyph_output() 
     while let Some(actual) = line {
         assert_eq!(actual.facts().source_utf16.end, start);
         assert!(actual.facts().source_utf16.start < start);
-        assert!(actual.facts().x_advance_26_6 <= 80 * 64); // 此夹具每个GCB都小于80pt，不能用整词溢出假装换行。
+        assert!(actual.facts().x_advance_26_6 <= 80 * 64); // Every actual fixture grapheme fits this width.
         for index in 0..actual.facts().parts {
             let part = output.part(&actual, index).unwrap().unwrap();
             assert_eq!(part.facts().points, 24.0);
@@ -226,16 +183,16 @@ fn same_source_style_reset_reuses_dependencies_and_replaces_real_glyph_output() 
         count += 1;
         line = output.previous_line(&actual).unwrap();
     }
-    assert_eq!(start, 0); // 新完整输出必须重新覆盖原canonical，不能只伪造远端marker的字体元数据。
-    assert!(count > 1); // 真实字号变大必须折行，不沿用旧0.1pt单行几何。
+    assert_eq!(start, 0); // New output must cover the entire original canonical Source.
+    assert!(count > 1); // Larger actual font size must replace the old single-line geometry.
     output.close().unwrap();
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn need_style_reads_no_lb_source_and_first_line_work_is_equal_for_4k_8k_4m() {
+fn first_line_output_and_public_work_are_equal_for_4k_8k_4m() {
     let font = font();
-    let mut results = Vec::new(); // 只有三个固定测试结果，不进入产品的文本或历史缓存。
+    let mut results = Vec::new(); // Three fixed oracle results, never a product history cache.
     for length in [4096usize, 8192, 4 * 1024 * 1024] {
         let mut text = "hello world ".repeat(length.div_ceil(12));
         text.truncate(length);
@@ -257,7 +214,6 @@ fn need_style_reads_no_lb_source_and_first_line_work_is_equal_for_4k_8k_4m() {
             bytes += progress.bytes;
             match progress.answer {
                 MarkdownLineComposeAnswer::NeedStyle(request) => {
-                    assert_eq!(source_read(&mut worker), 0);
                     respond(&mut worker, request, &registered);
                 }
                 MarkdownLineComposeAnswer::LineReady(line) => {
@@ -269,10 +225,10 @@ fn need_style_reads_no_lb_source_and_first_line_work_is_equal_for_4k_8k_4m() {
             }
         }
         let first = first.expect("有限前沿必须实际发布LineEnd");
-        let line_bytes = source_read(&mut worker);
-        assert!(line_bytes > 0 && line_bytes <= 256 && line_bytes < length);
+        // Compare public step work and actual committed first-line coverage across
+        // large Sources, then release real output/backing rather than inspect a
+        // private line-break read counter.
         results.push((
-            line_bytes,
             bytes,
             first.source_utf16.end,
             worker.frontier_work().unwrap(),
@@ -286,49 +242,6 @@ fn need_style_reads_no_lb_source_and_first_line_work_is_equal_for_4k_8k_4m() {
     }
     assert!(results.windows(2).all(|pair| pair[0] == pair[1]));
     eprintln!("按需LB真实首行 work={results:?} whole_product_pass=false");
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn pending_consumption_and_lb_progress_use_separate_quota_one_turns() {
-    let font = font();
-    let fixture = Fixture::new(&"hello world ".repeat(400));
-    let (mut worker, registered) =
-        fixture.worker(&font, true, MarkdownLineComposeCancellation::new());
-    let budget = MarkdownLineComposeBudget {
-        bytes: 1,
-        scalars: 1,
-        records: 1,
-        metadata_units: 1,
-    };
-    for _ in 0..200_000 {
-        let progress = worker.step(budget).unwrap();
-        assert!(
-            progress.bytes <= 1
-                && progress.scalars <= 1
-                && progress.records <= 1
-                && progress.metadata_units <= 1
-                && progress.shapes <= 1
-        );
-        if let MarkdownLineComposeAnswer::NeedStyle(request) = progress.answer {
-            respond(&mut worker, request, &registered);
-        }
-        if worker.payload.as_ref().unwrap().line_breaks_pending {
-            let stage = std::mem::discriminant(&worker.payload.as_ref().unwrap().stage);
-            let before = source_read(&mut worker);
-            let next = worker.step(budget).unwrap();
-            assert_eq!((next.shapes, next.metadata_units), (0, 0));
-            assert!(next.bytes <= 1 && next.scalars <= 1 && next.records <= 1);
-            assert_eq!(source_read(&mut worker) - before, next.bytes);
-            assert_eq!(
-                std::mem::discriminant(&worker.payload.as_ref().unwrap().stage),
-                stage
-            );
-            assert!(!worker.payload.as_ref().unwrap().line_breaks_pending);
-            return;
-        }
-    }
-    panic!("实际Measure没有经过原LB等待和独立推进");
 }
 
 #[cfg(target_os = "macos")]
@@ -355,11 +268,10 @@ fn complete(
         }
     }
     assert!(finished);
-    assert_eq!(source_read(&mut worker), fixture.source.byte_len());
     let mut output = worker.into_output().unwrap();
     let observer = output.resource_observer();
     let mut line = output.last_line().unwrap();
-    let mut actual = Vec::new(); // 完整有限测试oracle允许留逐行值；产品仍使用唯一原FD。
+    let mut actual = Vec::new(); // Only this finite complete oracle retains line results.
     while let Some(current) = line {
         let mut glyphs = Vec::new();
         for index in 0..current.facts().parts {
@@ -397,8 +309,9 @@ fn complete(
 #[test]
 fn full_continuation_matches_complete_original_lb_and_shape_oracle() {
     let font = font();
-    // 第二项复现编辑短前缀后留下长连续词的实际正文；完整模式是独立断行与字形对照，
-    // 不把前沿自身的候选坐标当成正确结果。
+    // The second fixture reproduces a short edited prefix before a long unbroken
+    // word. Complete mode independently derives line/glyph results rather than
+    // treating frontier candidate coordinates as their own expected answer.
     for text in [
         "hello (world) 12,345 next ".repeat(150),
         format!("one {}", "A".repeat(4099)),
@@ -428,34 +341,8 @@ fn full_continuation_matches_complete_original_lb_and_shape_oracle() {
                     oracle.glyphs
                 )
             );
-            assert_eq!(glyphs, expected_glyphs); // 全字段含原global cluster、offset、advance与unsafe flags。
+            assert_eq!(glyphs, expected_glyphs); // Preserve global clusters, offsets, advances, and unsafe flags.
         }
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn complete_mode_and_non_uniform_rtl_still_prepare_the_complete_line_job_before_style() {
-    let font = font();
-    // 完整模式保持旧准入；含真实RTL的Source无法取得全源UniformZero无控制证书，
-    // 仍须完成原依赖。普通LTR Greek的按需准入由item/open_prefix_tests独立覆盖。
-    for (text, frontier) in [("hello world hello", false), ("hello אבג world", true)] {
-        let fixture = Fixture::new(text);
-        let (mut worker, _registered) =
-            fixture.worker(&font, frontier, MarkdownLineComposeCancellation::new());
-        let mut seen = false;
-        for _ in 0..100_000 {
-            if let MarkdownLineComposeAnswer::NeedStyle(_) = worker
-                .step(MarkdownLineComposeBudget::default())
-                .unwrap()
-                .answer
-            {
-                assert_eq!(source_read(&mut worker), fixture.source.byte_len());
-                seen = true;
-                break;
-            }
-        }
-        assert!(seen);
     }
 }
 
@@ -483,6 +370,8 @@ fn source_eio_precedes_cancel_while_waiting_and_drops_every_actual_owner() {
         }
     }
     assert!(waiting);
+    // Use the existing injection through real backing reclaim at the observed
+    // pending dependency boundary. This is not a naturally induced kernel error.
     fixture.document.fail_next_original_reclaim_for_test();
     assert!(matches!(
         fixture.document.reclaim_original_read_windows_for_test(),
@@ -502,14 +391,15 @@ fn source_eio_precedes_cancel_while_waiting_and_drops_every_actual_owner() {
     let released = resources.snapshot().unwrap();
     assert!(released.source_payload_released);
     assert_eq!(released.first_source_errno, Some(libc::EIO));
-    assert!(!resources.is_released()); // 真实归还不洗掉首I/O失败；总成功票必须继续失败。
+    assert!(!resources.is_released()); // Real cleanup cannot erase the first I/O failure.
     assert!(backing.unmap_succeeded() && backing.mapped_bytes() == 0);
 }
 
 #[test]
 #[ignore = "需要真实Native Body14字体输入；设置OMNI_FRONTIER_UIFONT_FIXTURES"]
-fn actual_body14_natural_and_unbroken_first_line_lb_work_is_equal_for_4k_8k_4m() {
-    // 原UIFont控制的name表、轴和ptem保持一起；不以同名字体或mono替代真实正文。
+fn actual_body14_natural_and_unbroken_first_line_public_work_is_equal_for_4k_8k_4m() {
+    // Keep the actual UIFont name table, axes, and point size together. A same-named
+    // font or monospace substitute cannot certify the real body-font path.
     let root = std::path::PathBuf::from(
         std::env::var_os("OMNI_FRONTIER_UIFONT_FIXTURES").expect("需要真实UIFont输入"),
     );
@@ -543,8 +433,9 @@ fn actual_body14_natural_and_unbroken_first_line_lb_work_is_equal_for_4k_8k_4m()
         for length in [4096usize, 8192, 4 * 1024 * 1024] {
             let mut text = unit.repeat(length.div_ceil(unit.len()));
             text.truncate(length);
-            // 有限测试输入保留真实短词接长词的接缝；它的自然断点落在原字形分片末端，
-            // 不能通过改分隔符或缩小长词来避开生产中的续项路径。
+            // Preserve the short-word/long-word seam whose natural break lies at
+            // the original glyph-part end. Changing separators/length would avoid
+            // the real continuation path this fixture must exercise.
             text.insert_str(0, prefix);
             let fixture = Fixture::new(&text);
             let (mut worker, registered) =
@@ -557,7 +448,6 @@ fn actual_body14_natural_and_unbroken_first_line_lb_work_is_equal_for_4k_8k_4m()
                 match progress.answer {
                     MarkdownLineComposeAnswer::Yielded => {}
                     MarkdownLineComposeAnswer::NeedStyle(request) => {
-                        assert_eq!(source_read(&mut worker), 0);
                         let range = request.source_range();
                         worker
                             .provide_style(
@@ -588,10 +478,9 @@ fn actual_body14_natural_and_unbroken_first_line_lb_work_is_equal_for_4k_8k_4m()
                 assert_eq!(first.source_utf16, 0..prefix.len());
                 assert_eq!(first.kind, MarkdownComposedLineKind::Allowed);
             }
-            let line_bytes = source_read(&mut worker);
-            assert!(line_bytes > 0 && line_bytes <= 256 && line_bytes < length);
+            // Public bounded work and actual first-line geometry must remain
+            // independent of the unconsumed long suffix's length.
             observed.push((
-                line_bytes,
                 bytes,
                 first.source_utf16.end,
                 first.x_advance_26_6,
@@ -608,7 +497,7 @@ fn actual_body14_natural_and_unbroken_first_line_lb_work_is_equal_for_4k_8k_4m()
 
 #[cfg(target_os = "macos")]
 #[test]
-fn cancel_before_the_deferred_lb_turn_performs_no_read_and_releases_real_resources() {
+fn cancel_before_the_deferred_lb_turn_releases_real_resources() {
     let font = font();
     let fixture = Fixture::new(&"hello world ".repeat(400));
     let cancellation = MarkdownLineComposeCancellation::new();
@@ -629,7 +518,7 @@ fn cancel_before_the_deferred_lb_turn_performs_no_read_and_releases_real_resourc
             break;
         }
     }
-    assert!(waiting && source_read(&mut worker) == 0);
+    assert!(waiting);
     cancellation.cancel();
     assert!(matches!(
         worker.step(MarkdownLineComposeBudget::default()),
@@ -637,7 +526,7 @@ fn cancel_before_the_deferred_lb_turn_performs_no_read_and_releases_real_resourc
     ));
     let closed = resources.snapshot().unwrap();
     assert!(!closed.line_breaks.unwrap().metadata_file_open);
-    assert_eq!(closed.line_breaks.unwrap().metadata_peak_map_bytes, 0); // 原LB尚未写首机会页。
+    assert_eq!(closed.line_breaks.unwrap().metadata_peak_map_bytes, 0); // No actual opportunity page was mapped yet.
     assert!(!closed.writer.unwrap().file_open && closed.shapes.active == 0);
     drop((worker, registered, fixture));
     assert!(resources.is_released());

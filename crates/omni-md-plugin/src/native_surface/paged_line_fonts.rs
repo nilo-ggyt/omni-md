@@ -1,4 +1,5 @@
-//! 一个真实Native字体的行注册值；会话palette持有它，输出目录只保弱注册。
+//! One actual Native font registration is held by the session palette; the output directory retains
+//! weak registration only.
 
 use objc2::rc::Retained;
 use objc2_app_kit::{NSFont, NSLayoutManager};
@@ -35,14 +36,16 @@ pub enum NativeMarkdownLineFontError {
 }
 type Result<T> = std::result::Result<T, NativeMarkdownLineFontError>;
 
-/// 同一真实 Font 的系统行槽与基线；只存两个 Copy 标量，不保 TextKit、正文或 Native manager。
+/// System line slot/baseline for the same actual font, stored as two Copy scalars without TextKit,
+/// text, or a Native manager.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::native_surface) struct NativeMarkdownPreviewFontMetrics {
     pub line_height: f64,
     pub baseline: f64,
 }
 
-/// 强边仅为一个实际Font、其真实度量和同payload注册；没有Source、视图或全局缓存。
+/// Strong ownership contains one actual font, its metrics, and same-payload registration, without
+/// Source, View, or global cache.
 pub struct NativeMarkdownLineFont {
     native: NativeMarkdownPagedFont,
     registered: MarkdownLineRegisteredFont,
@@ -52,10 +55,11 @@ pub struct NativeMarkdownLineFont {
 }
 
 impl NativeMarkdownLineFont {
-    /// 已捕获的Native字体只注册一次；读取度量前后始终核原调用票。
+    /// Register the captured Native font once, validating the original caller around metric reads.
     ///
     /// # Errors
-    /// 失权、实际度量失败或有限注册槽耗尽均拒绝，不用同名字体替换旧输出。
+    /// Reject revocation, actual metric failure, or exhausted registration slots without substituting a
+    /// same-name font for old output.
     pub fn register(
         native: NativeMarkdownPagedFont,
         catalog: &MarkdownLineFontCatalog,
@@ -65,28 +69,31 @@ impl NativeMarkdownLineFont {
             return Err(NativeMarkdownLineFontError::Revoked);
         }
         let metrics = capture_paged_font_metrics(&native, current)?;
-        // SAFETY: 原主线程CTFont由本候选强持有，公开getter仅返回有限trait位，不借正文或调用布局。
+        // SAFETY: This candidate strongly holds the main-thread CTFont; its getter returns finite trait
+        // bits without text borrowing or layout.
         let traits = unsafe { native.native_font().symbolic_traits() };
         if !current() {
             return Err(NativeMarkdownLineFontError::Revoked);
-        } // 实际face特征在原注册边捕获；绘制和验收不在Reader借用中再次进入Native。
+        } // Capture actual face traits at registration; drawing/verification need not reenter Native while a reader is borrowed.
         let registered = catalog.register(native.core_font())?;
         if !current() {
             return Err(NativeMarkdownLineFontError::Revoked);
-        } // 原票撤销时本候选的Font/注册值直接析构，不占据后继会话的字体槽。
+        } // Revocation drops this candidate's font/registration without occupying a successor session's font slot.
         Ok(Self {
             native,
             registered,
             metrics,
             traits,
-            preview: None, // Source 注册只捕原 CT 度量；预览装配另从同一 Font 捕系统行标量。
+            preview: None, // Source captures original Core Text metrics only; preview separately captures system-line scalars for that same font.
         })
     }
 
-    /// Preview 的有限字体槽只捕一次实际系统行度量；每次 Native 调用前后仍核原输入/Source 票。
+    /// The finite preview font slot captures actual system-line metrics once, validating original
+    /// Input/Source authority around every Native call.
     ///
     /// # Errors
-    /// 原票撤销或同一实际 Font 的系统度量无效时归还本候选，不保留 manager 或另找字体。
+    /// Revocation or invalid system metrics returns this candidate without retaining the manager or
+    /// finding another font.
     pub fn capture_preview_metrics(
         mut self,
         manager: &NSLayoutManager,
@@ -95,10 +102,12 @@ impl NativeMarkdownLineFont {
         if !current() {
             return Err(NativeMarkdownLineFontError::Revoked);
         }
-        // SAFETY: 本注册值强持同一 CTFont；Apple 定义 CTFont/NSFont toll-free bridge，+1只活于本次捕获。
+        // SAFETY: Registration holds this CTFont; the public CTFont/NSFont toll-free bridge lends a +1
+        // claim only for this capture.
         let retained = unsafe { CFRetained::retain(NonNull::from(self.native.native_font())) };
         let retained: Retained<CTFont> = retained.into();
-        // SAFETY: 只转换同一真实对象的 Rust 视图，不按名称或字号重新创建另一份 Font。
+        // SAFETY: Cast only the Rust view of the same actual object, without reconstructing a font by
+        // name or size.
         let font: Retained<NSFont> = unsafe { Retained::cast_unchecked(retained) };
         let line_height = manager.defaultLineHeightForFont(&font);
         if !current() {
@@ -110,7 +119,7 @@ impl NativeMarkdownLineFont {
         }
         if !line_height.is_finite() || line_height <= 0.0 || !baseline.is_finite() {
             return Err(NativeMarkdownPagedFontGeometryError::InvalidMetrics.into());
-        } // 原隐藏 0.1pt face 的系统 baseline 确实可为0；不以正数限制撑高隐藏围栏。
+        } // A hidden 0.1-point face may have an actual zero baseline; requiring positivity would incorrectly expand hidden fences.
         self.preview = Some(NativeMarkdownPreviewFontMetrics {
             line_height,
             baseline,
@@ -118,41 +127,47 @@ impl NativeMarkdownLineFont {
         Ok(self)
     }
 
-    /// 由原 Body 的不可变模式选择：Preview 必须已经捕同 Font 系统标量，Source 不借用此值。
+    /// The Body's actual mode selects usage: preview must already hold same-font system scalars, while
+    /// Source does not borrow them.
     pub(in crate::native_surface) fn preview_metrics(&self) -> NativeMarkdownPreviewFontMetrics {
         self.preview
             .expect("InlinePreview 的每个真实注册 Font 都持自己的系统行标量")
     }
 
     #[must_use]
+    /// Borrow the already-owned Native font without another capture.
     pub fn native(&self) -> &NativeMarkdownPagedFont {
         &self.native
     }
 
     #[must_use]
+    /// Borrow this same registration value; callers receive no additional catalog slot.
     pub fn registered(&self) -> &MarkdownLineRegisteredFont {
         &self.registered
     }
 
-    /// 返回同一个实际CTFont在注册时的字形特征，不把语义样式或slot编号冒充真实face。
+    /// Return traits captured from the actual CTFont at registration, never semantic style or a slot
+    /// number pretending to be a face.
     #[must_use]
     pub fn traits(&self) -> CTFontSymbolicTraits {
         self.traits
     }
 
-    /// 用实际注册弱票核同一个Core payload；slot整数或相同PSName均不够。
+    /// Validate the same Core payload with its actual weak registration; a slot integer or equal
+    /// PostScript name is insufficient.
     ///
     /// # Errors
-    /// 原catalog、槽代次或注册值已失效，或它属于另一个实际Font时拒绝。
+    /// Reject an expired catalog, slot generation, or registration, and any registration belonging to
+    /// another actual font.
     pub fn require(&self, registration: &MarkdownLineFontRegistration) -> Result<()> {
         let leased = registration.lease()?;
         if !self.native.core_font().permits(&leased.font().authority()) {
             return Err(NativeMarkdownLineFontError::FontMismatch);
-        } // lease只有本次栈强边；不把目录里的弱注册升级成常驻字体列表。
+        } // The lease holds a strong claim only on this stack; weak directory registrations never become a resident font inventory.
         Ok(())
     }
 
-    /// 行高合并使用原字号与轴位的真实ascent/descent/leading，不调用Native排版。
+    /// Combine actual ascent/descent/leading at the original size/axes without invoking Native layout.
     pub fn metrics(&self) -> Result<NativeMarkdownPagedFontMetricValues> {
         Ok(self.metrics.values_for(&self.native)?)
     }

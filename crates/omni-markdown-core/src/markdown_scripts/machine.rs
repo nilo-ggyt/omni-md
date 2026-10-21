@@ -1,4 +1,5 @@
-//! 只保存当前cluster/run和配对栈头；任意深度的栈记录在有限分页owner中。
+//! Keeps only the current cluster/run and bracket-stack heads in memory.
+//! Arbitrarily deep frames belong to the bounded paged storage owner.
 use super::{
     MarkdownScript as Script, MarkdownScriptBudget as Budget, MarkdownScriptError as Error,
     MarkdownScriptRun as Run, MarkdownScriptStep as Step, Result,
@@ -29,6 +30,8 @@ struct Cluster {
     bracket: Option<Bracket>,
 }
 impl Cluster {
+    /// Starts one grapheme cluster at actual source coordinates, with no script
+    /// guessed before its first contributing scalar establishes the candidate set.
     fn new(value: &Decoded) -> Self {
         Self {
             start_byte: value.start_byte,
@@ -42,25 +45,27 @@ impl Cluster {
             bracket: None,
         }
     }
+    /// Keeps an indivisible grapheme cluster under its first specific base's
+    /// SCX authority; marks cannot split a user-visible cluster into script runs.
     fn add(&mut self, value: Decoded) -> Result<()> {
         let p = value.properties;
         if !self.anchored {
             if !matches!(p.primary, unicode_data::COMMON | unicode_data::INHERITED) {
                 self.scripts = p.scripts;
                 self.primary = Some(p.primary);
-                self.anchored = true; // 包括Unknown；未知字符不伪装成Latin或任意通配脚本。
+                self.anchored = true; // Unknown is specific too; never reinterpret it as Latin or a wildcard.
             } else if let Some(next) = p.scripts {
                 self.scripts = match self.scripts {
                     Some(current) => Some(current.intersection(next).unwrap_or(current)),
                     None => Some(next),
-                }; // 没有specific base时合并受限SCX；冲突仍不能拆开完整cluster。
+                }; // Without a specific base, narrow SCX while preserving the complete cluster.
             }
-        } // 第一个specific base拥有完整SCX，后续mark/字素成员随base，不按其单字属性拆分。
+        } // The first specific base owns full SCX; later marks/cluster members follow it rather than split by scalar properties.
         if let Some(bracket) = p.bracket {
             if self.bracket.is_some() {
                 return Err(Error::CorruptMetadata);
             }
-            self.bracket = Some(bracket); // Unicode18的配对标点均非Mark且GCB=Other，同一cluster最多一个。
+            self.bracket = Some(bracket); // Unicode 18 paired punctuation is non-Mark/GCB Other: at most one per cluster.
         }
         self.paragraph |= p.paragraph;
         self.end_byte = value.end_byte;
@@ -73,13 +78,18 @@ struct CurrentRun {
     start_utf16: usize,
     scripts: Option<Set>,
     primary: Option<u8>,
-    // 只推进到完整cluster及其配对action都结束的位置，不以已解码/已借用byte代替。
+    // Advance only after complete clusters and their bracket actions settle,
+    // never merely because bytes have been decoded or borrowed.
     #[cfg(feature = "paged-shaping-frontier")]
     settled_end: (usize, usize),
 }
 impl CurrentRun {
+    /// Chooses only among surviving candidates: prefer a compatible preceding
+    /// script, then the base's primary script, then deterministic generated order.
     fn script(&self, preceding: Option<u8>) -> Result<u8> {
         let Some(set) = self.scripts else {
+            // A genuinely unconstrained run remains Common rather than borrowing
+            // an incompatible preceding script or inventing Latin coverage.
             return Ok(unicode_data::COMMON);
         };
         if let Some(script) = preceding.filter(|&script| set.contains(script)) {
@@ -88,7 +98,7 @@ impl CurrentRun {
         if let Some(script) = self.primary.filter(|&script| set.contains(script)) {
             return Ok(script);
         }
-        set.first().ok_or(Error::CorruptMetadata) // IDs按ISO tag排序；空集合是损坏，不伪装Unknown。
+        set.first().ok_or(Error::CorruptMetadata) // IDs follow ISO-tag order; an empty set is corruption, not Unknown.
     }
 }
 enum Phase {
@@ -124,6 +134,8 @@ pub(super) struct Machine {
     pub(super) ready: bool,
 }
 impl Default for Machine {
+    /// Initializes fixed decoder/cluster state and empty bracket heads only;
+    /// arbitrarily deep actual frames remain the separate paged store's responsibility.
     fn default() -> Self {
         Self {
             byte: 0,
@@ -146,7 +158,8 @@ impl Default for Machine {
     }
 }
 impl Machine {
-    /// 任何原行前 action/cluster 必须先沿原 pump 完成；不能用结构跳转吞掉已接受的正文义务。
+    /// Settles every pre-row action/cluster through the original pump. A structural
+    /// jump cannot discard obligations from body text already accepted.
     #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
     pub(super) fn settle_before_table(
         &mut self,
@@ -185,7 +198,8 @@ impl Machine {
         Ok(true)
     }
 
-    /// 只有表格内部的未完成 SCX 状态可舍弃；硬边界之前的配对栈已由原 B 段逻辑结清。
+    /// Discards only unfinished SCX state inside the table. Original paragraph
+    /// processing already settled bracket context before its hard boundary.
     #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
     pub(super) fn begin_table_tail(
         &mut self,
@@ -205,7 +219,8 @@ impl Machine {
         self.pending_utf8 = [0; 4];
     }
 
-    /// 末 CR/LF 只恢复同一原 GCB scalar 后缀；未终止 EOF 不伪造后继上下文或脚本值。
+    /// Restores only original grapheme-cursor context from actual trailing CR/LF.
+    /// An unterminated EOF invents neither later context nor script values.
     #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
     pub(super) fn finish_table(
         &mut self,
@@ -224,7 +239,8 @@ impl Machine {
         self.scalar_start = span.end.byte;
         Ok(())
     }
-    /// header 的真实 CR/LF 已完整解码，GB4/B 段事实足以结算当前 cluster，无需读取隐藏首字符。
+    /// Actual header CR/LF has fully decoded. Grapheme/paragraph hard-boundary
+    /// facts settle the current cluster without reading the first hidden character.
     #[cfg(feature = "paged-line-compose")]
     pub(super) fn settle_hard_boundary(
         &mut self,
@@ -261,7 +277,8 @@ impl Machine {
         Ok(true)
     }
 
-    /// 原 B 已结束 header 的配对与 preceding；实际尾终止符只恢复原 GCB 后缀，不授隐区 SCX。
+    /// Original paragraph processing ended header bracket/preceding context. Actual
+    /// tail terminators restore grapheme state only, granting no hidden-text SCX.
     #[cfg(feature = "paged-line-compose")]
     pub(super) fn resume_after_fold(
         &mut self,
@@ -283,7 +300,7 @@ impl Machine {
             for byte in tail {
                 self.cursor.push(char::from(*byte));
             }
-        } // 无尾分隔符只允许原 proof 的真实 EOF；后面没有可见 scalar 需要上下文。
+        } // No tail separator requires the original proof's actual EOF; no later visible scalar needs context.
         self.byte = span.end.byte;
         self.utf16 = span.end.utf16;
         self.scalar_start = span.end.byte;
@@ -300,8 +317,10 @@ impl Machine {
         self.action.is_some()
     }
 
-    /// 候选已收敛到唯一脚本时，未来兼容交集不能改变已结算前缀的脚本。
-    /// 尚有held/action时不借出开放证明，避免半次配对或元数据操作被当作已完成。
+    /// Once the candidate set narrows to one script, later compatible intersections
+    /// cannot change the script of this settled prefix.
+    /// Pending held scalars/actions forbid lending a proof, so partially completed
+    /// bracket or metadata operations cannot masquerade as settled work.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn stable_open_prefix(&self) -> Option<Run> {
         if self.held.is_some() || self.action.is_some() {
@@ -314,7 +333,7 @@ impl Machine {
             || run.settled_end.0 <= run.start_byte
             || run.settled_end.1 <= run.start_utf16
         {
-            return None; // Common/Inherited或多候选SCX继续等待原上下文，不能先选primary。
+            return None; // Common/Inherited or multiple SCX candidates must await actual context.
         }
         Some(Run {
             start_byte: run.start_byte,
@@ -325,7 +344,8 @@ impl Machine {
         })
     }
 
-    /// 仅沿原稳定SCX上下文续至真实正文末端；任何未结算动作、UTF8残余或实际括号栈均不得跳过。
+    /// Extends only original stable SCX context to the actual body endpoint. Pending
+    /// actions, incomplete UTF-8, and real bracket frames must not be skipped.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn latin_suffix(&self, position: usize, content_end: usize) -> Option<Run> {
         let run = self.stable_open_prefix()?;
@@ -339,7 +359,8 @@ impl Machine {
             .then_some(run)
     }
 
-    /// 同一当前run的ASCII后缀已证到真实B正文末端，只推进语义输入，不写闭run或封存Store。
+    /// A proven ASCII suffix advances this same run to the actual paragraph body
+    /// endpoint, without writing a closed run or sealing its store.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn advance_proven_ascii(&mut self, byte: usize, utf16: usize) {
         self.current
@@ -353,13 +374,18 @@ impl Machine {
         self.used = 0;
         self.needed = 0;
         self.cluster = None;
-        // 原held/action均已结算，最近实际scalar属于所证ASCII域。原GCB State::advance对
-        // Other/incb=None/ep=false会清RI、EP/ZWJ与Indic后缀，再次ASCII是同一状态；保原cursor。
-        // 后续B/CRLF仍由push_byte/pump读取并走Phase::Paragraph，不能把此端点签成闭SCX。
+        // Held scalars/actions already settled; the last actual scalar belongs to
+        // the proven ASCII domain. Original grapheme advancement for
+        // Other/incb=None/ep=false clears RI, EP/ZWJ, and Indic suffixes. Another
+        // ASCII scalar has that same state, so preserve the original cursor.
+        // Later paragraph controls/CRLF still enter push_byte/pump and Paragraph;
+        // this content endpoint cannot authorize a closed SCX run.
     }
 
-    /// 原完整聚合或原上下文后缀已取得EOF证明，且原Store真实封存后，结束同一Machine。
-    /// byte/utf16是语义完成坐标；真实读取量由外层独立累积，不能把聚合跳过伪报为I/O。
+    /// Completes the same machine only after complete-aggregate or contextual-suffix
+    /// EOF proof and actual original-store sealing.
+    /// Byte/UTF-16 endpoints describe semantic completion. Outer owners account for
+    /// actual reads separately; aggregate skipping is never reported as source I/O.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn finish_proven_eof(&mut self, byte: usize, utf16: usize) {
         self.byte = byte;
@@ -379,16 +405,20 @@ impl Machine {
         self.ready = true;
     }
 
+    /// Completion requires both an empty byte carry and the actual expected
+    /// UTF-16 endpoint, not merely the absence of another borrowed source page.
     pub(super) fn complete_utf8(&self, expected: usize) -> bool {
         self.used == 0 && self.utf16 == expected
     }
+    /// Accepts one actual byte only when prior scalar/actions have settled.
+    /// A complete scalar enters the same grapheme cursor once; partial UTF-8 stays fixed-size.
     pub(super) fn push_byte(&mut self, byte: u8, step: &mut Step) -> Result<()> {
         if self.held.is_some() || self.action.is_some() || self.ready {
             return Err(Error::CorruptMetadata);
         }
         let position = self.byte;
         self.byte = self.byte.checked_add(1).ok_or(Error::CoordinateOverflow)?;
-        step.bytes += 1; // 只有真正解引用的源byte计入；后续UTF8失败也不伪造零读取。
+        step.bytes += 1; // Charge actual source bytes even when subsequent UTF-8 validation fails.
         if self.used == 0 {
             self.scalar_start = position;
             self.needed = match byte {
@@ -402,6 +432,8 @@ impl Machine {
         self.pending_utf8[self.used] = byte;
         self.used += 1;
         if self.used != self.needed {
+            // A source chunk can end inside a scalar. Preserve its original bytes
+            // without advancing UTF-16 or applying grapheme/script properties early.
             return Ok(());
         }
         let scalar = std::str::from_utf8(&self.pending_utf8[..self.used])
@@ -426,7 +458,8 @@ impl Machine {
         Ok(())
     }
 
-    /// false只表示本次预算已用尽；held scalar与配对阶段保持原身份，下次不重读或重推GCB。
+    /// False means this quantum exhausted its budget only. Preserve held scalar
+    /// and bracket-phase identity, without rereading text or repushing grapheme state.
     pub(super) fn pump(
         &mut self,
         store: &mut Store,
@@ -436,6 +469,8 @@ impl Machine {
     ) -> Result<bool> {
         loop {
             if let Some(mut action) = self.action.take() {
+                // Resume this exact action before accepting the held next scalar.
+                // Quota exhaustion restores its phase rather than replaying I/O.
                 if !self.advance_action(&mut action, store, step, budget)? {
                     self.action = Some(action);
                     return Ok(false);
@@ -449,6 +484,8 @@ impl Machine {
                     .as_ref()
                     .is_some_and(|cluster| value.boundary && (cluster.paragraph || !mark));
                 if closes {
+                    // Settle the completed cluster first; the lookahead scalar stays
+                    // held so grapheme state and byte consumption are not repeated.
                     let cluster = self.cluster.take().ok_or(Error::CorruptMetadata)?;
                     self.action = Some(Action {
                         cluster,
@@ -462,6 +499,8 @@ impl Machine {
                 continue;
             }
             if !eof {
+                // No pending scalar/action remains, but an open cluster/run can
+                // still gain context from actual later source input.
                 return Ok(true);
             }
             if let Some(cluster) = self.cluster.take() {
@@ -478,7 +517,8 @@ impl Machine {
                 self.commit_run(self.byte, self.utf16, store, step)?;
                 continue;
             }
-            // 真EOF没有未定cluster或run后，分两次固定操作封存/归还两个实际owner。
+            // After actual EOF leaves no pending cluster/run, seal and release the
+            // two actual storage owners through separate bounded operations.
             if step.stack_ops == budget.stack_ops {
                 return Ok(false);
             }
@@ -500,6 +540,8 @@ impl Machine {
         }
     }
 
+    /// Commits only a settled nonempty run under its surviving candidate set.
+    /// Failed append preserves the current candidate for the original failure owner.
     fn commit_run(
         &mut self,
         end_byte: usize,
@@ -519,9 +561,11 @@ impl Machine {
         self.current = None;
         self.preceding = Some(script);
         step.records += 1;
-        Ok(()) // 只有append成功才丢弃待决候选和推进run ID，失败不会留下可发布的伪覆盖。
+        Ok(()) // Clear the candidate/advance its ID only after actual append succeeds.
     }
 
+    /// Settles one complete cluster through resumable pairing, run merge, and
+    /// paragraph phases. Every real frame read/write or emitted record charges its quota.
     fn advance_action(
         &mut self,
         action: &mut Action,
@@ -532,6 +576,8 @@ impl Machine {
         loop {
             match action.phase {
                 Phase::Locate => {
+                    // Same-kind heads locate a potential matching opener directly;
+                    // no scan over arbitrary historical frames or source text is needed.
                     if let Some(Bracket {
                         kind,
                         opening: false,
@@ -551,9 +597,11 @@ impl Machine {
                             continue;
                         }
                     }
-                    action.phase = Phase::Merge; // 未匹配closer不伪造pair，也不扫描整个历史栈。
+                    action.phase = Phase::Merge; // An unmatched closer creates no pair and scans no entire historical stack.
                 }
                 Phase::Resolve { target, run } => {
+                    // An opener in a committed run gives its closer that exact script.
+                    // An opener in the current unresolved run shares the eventual choice.
                     if run < store.run_count() {
                         if step.stack_ops == budget.stack_ops {
                             return Ok(false);
@@ -565,10 +613,13 @@ impl Machine {
                     } else if run > store.run_count() {
                         return Err(Error::CorruptMetadata);
                     }
-                    // 同一个未定run内的pair不增加约束；最终run脚本自然同时赋给两端。
+                    // A pair in the same pending run adds no constraint; both ends receive
+                    // its eventual actual script together.
                     action.phase = Phase::Pop { target };
                 }
                 Phase::Pop { target } => {
+                    // Pop actual frames through the matched opener, updating both the
+                    // nesting head and per-kind links only after each real read succeeds.
                     if step.stack_ops == budget.stack_ops {
                         return Ok(false);
                     }
@@ -583,9 +634,12 @@ impl Machine {
                     if index == target {
                         action.phase = Phase::Merge;
                     }
-                    // 每个被弹frame都消耗原预算；深/错误嵌套可以暂停，不丢弃底部32层之外的事实。
+                    // Every popped frame consumes budget. Deep/misnested input may pause,
+                    // but no arbitrary depth cutoff discards earlier pairing facts.
                 }
                 Phase::Merge => {
+                    // Intersect complete-cluster candidates with the open run. Only
+                    // actual incompatibility closes the earlier run at this cluster start.
                     let cluster = action.cluster;
                     let intersection = match (
                         self.current.as_ref().and_then(|run| run.scripts),
@@ -595,6 +649,8 @@ impl Machine {
                         _ => None,
                     };
                     if intersection == Some(None) {
+                        // Disjoint nonwildcard sets require a boundary; an exhausted
+                        // record quota cannot silently merge them or discard the cluster.
                         if step.records == budget.records {
                             return Ok(false);
                         }
@@ -607,6 +663,8 @@ impl Machine {
                                 run.primary = cluster.primary;
                             }
                         } else if run.scripts.is_none() {
+                            // Earlier wildcard text adopts the first actual constrained
+                            // cluster's candidates without copying any preceding bytes.
                             run.scripts = cluster.scripts;
                             run.primary = cluster.primary;
                         }
@@ -623,6 +681,8 @@ impl Machine {
                     action.phase = Phase::Open;
                 }
                 Phase::Open => {
+                    // Record a real opening bracket against the current run ID only
+                    // after merge settles its position in the contiguous coverage stream.
                     if let Some(Bracket {
                         kind,
                         opening: true,
@@ -645,6 +705,8 @@ impl Machine {
                     action.phase = Phase::Paragraph;
                 }
                 Phase::Paragraph => {
+                    // A real paragraph control closes the current run and ends both
+                    // preceding-script preference and pairing context for later text.
                     if action.cluster.paragraph {
                         if step.records == budget.records {
                             return Ok(false);
@@ -658,14 +720,16 @@ impl Machine {
                         self.top = store::NONE;
                         self.same_kind = [store::NONE; 65];
                         self.preceding = None;
-                    } // 真B终止上下文；只重置固定65个头，不读取/清空全部旧frame或任何正文。
+                    } // Real paragraph controls end context by resetting 65 heads, without rereading old frames/text.
                     action.phase = Phase::Done;
                 }
                 Phase::Done => {
                     #[cfg(feature = "paged-shaping-frontier")]
                     if let Some(run) = &mut self.current {
-                        // 先保留原完整run选择/写盘顺序，只有本cluster全部阶段成功才推进
-                        // 开放可借范围。后继scalar仍留在原cluster/held状态，不进入此范围。
+                        // Preserve original run-selection/write ordering. Advance the borrowable
+                        // open prefix only after every phase of this cluster succeeds;
+                        // later scalars remain in their original cluster/held state and cannot
+                        // enter this certified prefix.
                         run.settled_end = (action.cluster.end_byte, action.cluster.end_utf16);
                     }
                     return Ok(true);

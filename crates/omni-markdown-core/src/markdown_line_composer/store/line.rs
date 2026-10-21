@@ -1,4 +1,5 @@
-//! 实际安全切片的LineEnd签入；这里只接原job路径，跨item由同一封闭provider继续认证。
+//! Commit LineEnd from an actual safe slice. This entry accepts the original Job
+//! path; the same sealed provider authenticates cross-item composition separately.
 #[cfg(test)]
 use super::output;
 use super::output::OutputSeal;
@@ -7,7 +8,8 @@ use super::*;
 use crate::{MarkdownBidiParagraph, MarkdownSafeGlyphSlice, MarkdownShapingJob};
 
 impl GlyphStore {
-    /// 只消费原实际safe token，不允许调用方以source Range截字形；L1/L2变化须多part组装。
+    /// Consume only the original real safe token, never caller-selected glyphs via
+    /// a Source range. L1/L2 changes require actual multiple-part assembly.
     #[cfg(test)]
     pub(super) fn append_safe_line(
         &mut self,
@@ -30,6 +32,8 @@ impl GlyphStore {
             {
                 return Err(Error::SourceMismatch);
             }
+            // The original Job identity and token must still match before reading
+            // its selected facts. Same coordinates or a different Job cannot renew it.
             slice.require(job)?;
             if !slice
                 .cancellation()
@@ -68,8 +72,10 @@ impl GlyphStore {
             })?;
             if runs != 1 || !identical {
                 return Err(Error::NeedsBidiAssembly);
-            } // 不以一个原item冒充L1/L2后的完整视觉顺序。
-            self.grapheme_directory()?; // 发布行前必须有同Source已迁入的真实GCB目录，覆盖端点由publish_line复核。
+            } // One item cannot impersonate a complete reordered L1/L2 visual line.
+            // Require the actual same-Source migrated grapheme directory;
+            // publish_line will recheck its coverage of the complete line endpoint.
+            self.grapheme_directory()?;
             let header = self.index.as_ref().ok_or(Error::Poisoned)?.len();
             let end = header.checked_add(3).ok_or(Error::Overflow)?;
             let glyph_start = item
@@ -96,7 +102,8 @@ impl GlyphStore {
                 MarkdownComposedLineKind::TableRow => return Err(Error::InvalidRequest),
             };
             rows[0][58] = self.paragraph_base_level(bidi, selected.source_utf16.start)?;
-            // 同源原段base与单item的resolved level分开，完整Uniform证书不重扫正文。
+            // Original same-Source paragraph base differs from this item's resolved
+            // level. A complete Uniform certificate avoids rereading text for it.
             for (at, value) in [
                 (0, selected.source_utf16.start),
                 (8, selected.source_utf16.end),
@@ -105,7 +112,8 @@ impl GlyphStore {
             ] {
                 rows[1][at..at + 8].copy_from_slice(&number(value)?.to_le_bytes());
             }
-            // 单个真实visual run从本行原点开始；glyph自身26.6 offset完全沿原shaper记录。
+            // The one actual visual run starts at this line's origin; glyph 26.6
+            // offsets remain exactly those produced by the original shaper.
             rows[1][48..56].copy_from_slice(&item.origin.to_le_bytes());
             rows[1][56] = output::PART;
             rows[2][..8].copy_from_slice(&item.font.generation.to_le_bytes());
@@ -138,7 +146,8 @@ impl GlyphStore {
             for row in rows {
                 self.index.as_mut().ok_or(Error::Poisoned)?.append(row)?;
             }
-            // 四条元数据是固定小事务；实际写完后仍核原token/Source/Bidi，才发布LineEnd指针。
+            // Four fixed metadata records form the candidate. Recheck original
+            // token/Source/bidi after actual writes before publishing LineEnd.
             slice.require(job)?;
             bidi.require_layout_source(&self.authority)?;
             self.guard()?;
@@ -158,7 +167,8 @@ impl GlyphStore {
         self.finish(result)
     }
 
-    /// 只有至少一个真实LineEnd才交接不可变值；未覆盖的尾部不能被source_range冒充已布局。
+    /// Transfer immutable output only after at least one actual LineEnd. Its
+    /// source_range cannot describe an uncovered suffix as completed layout.
     pub(in crate::markdown_line_composer) fn into_output(
         mut self,
     ) -> Result<MarkdownComposedLines> {
@@ -166,6 +176,8 @@ impl GlyphStore {
         if self.lines == 0 || self.capture.is_some() || self.control_capture.is_some() {
             return Err(Error::InvalidRequest);
         }
+        // Transfer the sole real I/O owner with the grapheme facts captured at the
+        // latest complete LineEnd, not metadata prefetched beyond that publication.
         let graphemes = self.published_grapheme_directory()?;
         let reader = match self.index.take().ok_or(Error::Poisoned)? {
             Rows::Writing(index) => index.into_reader()?,

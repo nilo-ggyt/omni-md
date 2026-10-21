@@ -1,4 +1,4 @@
-//! 有限可见行的真实GCB几何；不按UTF16平均分配，不保留整行字素列表。
+//! Actual grapheme geometry in bounded visible lines, without uniform UTF-16 spacing or whole-line grapheme arrays.
 
 use super::*;
 use crate::native_surface::paged_line_geometry::{
@@ -9,24 +9,24 @@ use omni_markdown_core::{
     MarkdownPresentationStyles,
 };
 
-/// 一次命中最多查询固定数量的真实边界；超大零advance行由后继producer另行索引。
+/// Each hit queries a fixed maximum of actual boundaries; oversized zero-advance lines need later producer indexing.
 const HIT_BOUNDARIES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NativeMarkdownComposedViewportHit {
     pub source_utf16: usize,
-    /// 实际命中 part 的起/末侧；显示格删除语法后，相同局部 caret 两侧的 canonical 端点可以不同。
+    /// The actual hit part's start/end side; after Cell syntax removal, equal local carets may map to different canonical endpoints.
     pub source_affinity: omni_markdown_core::MarkdownComposedLineAffinity,
-    /// 第二候选保它自己的实际 part 侧，不能借主候选的亲和解释 BiDi 边界。
+    /// The second candidate retains its own part side, rather than borrow primary affinity to interpret a Bidi boundary.
     pub other_source_affinity: Option<omni_markdown_core::MarkdownComposedLineAffinity>,
-    /// 同一实际视觉x对应两个逻辑位置时保留另一候选，外层不能据此伪造主方向。
+    /// Retain another logical candidate for the same actual visual X; this does not authorize an outer layer to invent primary direction.
     pub other_source_utf16: Option<usize>,
     pub line_ordinal: usize,
 }
 
 impl NativeMarkdownComposedViewport {
-    /// 只线性枚举当前可见标签的真实推进包络，不查询目标或复制字形/正文。
-    /// 原同View坐标与viewport/cell clip在本层确定，AppKit光标区域的排序合并归安装者负责。
+    /// Enumerate actual advance envelopes of current visible labels without target lookup or glyph/text copies.
+    /// This layer establishes View coordinates/viewport-Cell clipping; the AppKit installer owns cursor-region sorting/merging.
     pub(in crate::native_surface) fn visit_link_cursor_rects(
         &self,
         current: &dyn Fn() -> bool,
@@ -40,21 +40,21 @@ impl NativeMarkdownComposedViewport {
                 };
                 let area = objc2_foundation::NSIntersectionRect(area, self.clip());
                 if area.size.width <= 0.0 || area.size.height <= 0.0 {
-                    continue; // 离屏与零advance不扩大成整行或相邻格的悬停范围。
+                    continue; // Offscreen/zero-advance labels cannot expand hover regions to a whole line or neighboring Cell.
                 }
                 if !rect(area) {
                     return Err(NativeMarkdownComposedViewportError::InvalidGeometry);
                 }
-                self.require(current)?; // 只交纯Copy几何；调用者收集完毕并归还Scene后才可进入Native。
+                self.require(current)?; // Deliver Copy geometry only; the caller returns Scene after collection before entering Native.
                 visit(area);
-                self.require(current)?; // Source首错仍来自原输出，临时集合不能给后继Scene补票。
+                self.require(current)?; // Source errors still come from original output; temporary collections cannot authorize a successor Scene.
             }
         }
         self.require(current)
     }
 
-    /// Find只借当前可见软行的真实part源域；Preview的Markdown语法没有高亮权限，
-    /// Source保留字面字符。折叠区和表格占位没有普通正文glyph，不能借行包络扫描其隐藏源。
+    /// Find uses actual part ranges from visible soft lines; Preview Markdown syntax has no highlight authority,
+    /// while Source keeps literal characters. Fold/table placeholders have no ordinary text glyphs, so line envelopes cannot authorize scanning their hidden Source.
     pub(in crate::native_surface) fn visible_find_ranges(
         &self,
         current: &dyn Fn() -> bool,
@@ -81,14 +81,14 @@ impl NativeMarkdownComposedViewport {
                 {
                     continue;
                 }
-                ranges.push(facts.source_utf16.clone()); // 仅封存metadata，不读取、复制或解析正文。
+                ranges.push(facts.source_utf16.clone()); // Copy sealed metadata only, without reading, copying, or parsing text.
             }
         }
         self.require(current)?;
         Ok(ranges)
     }
 
-    /// 只给实际链接墨迹区域开放后继目标查询；样式位不能自行构造URL或扩大到行尾空白。
+    /// Only an actual visible link-label advance envelope admits target lookup; style bits cannot construct URLs or expand to trailing line whitespace.
     pub fn link_part_at(
         &self,
         local: NSPoint,
@@ -116,7 +116,7 @@ impl NativeMarkdownComposedViewport {
         Ok(None)
     }
 
-    /// 正式IME/可见性与绘制消费同一选择槽的真实Bidi侧；非空范围仍定位首GCB。
+    /// IME/visibility/painting consume the same selection slot's actual Bidi side; nonempty ranges still locate their first grapheme.
     pub fn first_rect_with_caret_side(
         &self,
         range: NSRange,
@@ -126,7 +126,7 @@ impl NativeMarkdownComposedViewport {
     ) -> Result<NativeMarkdownPagedCharacterRect> {
         if range.length != 0 {
             return self.first_rect_with_affinity(range, affinity, current);
-        } // 真实字符框不由caret侧改写；只对同位置的两个插入点作明确选择。
+        } // Caret side does not alter character rectangles; it explicitly chooses between two carets at the same position.
         let caret = self.caret_geometry_with_side(range.location, affinity, side, current)?;
         if !self.visible(caret.line_frame) {
             return Err(NativeMarkdownComposedViewportError::Pending);
@@ -138,10 +138,10 @@ impl NativeMarkdownComposedViewport {
         })
     }
 
-    /// 首scalar所在GCB的实际typographic框；没有该首位置的可见行就保持Pending。
+    /// Return the actual typographic frame of the first scalar's grapheme; remain Pending without a visible line covering that first position.
     ///
     /// # Errors
-    /// 离屏、未知范围、原Source/Font/scene失权以及非GCB caret均拒绝，不取后继可见文字替代。
+    /// Reject offscreen/unknown ranges, revoked Source/font/Scene, and non-grapheme carets rather than substitute later visible text.
     pub fn first_rect(
         &self,
         range: NSRange,
@@ -154,11 +154,11 @@ impl NativeMarkdownComposedViewport {
         )
     }
 
-    /// IME/导航使用原选择槽的换行侧；不以同位置的后一行替换用户实际的上游光标。
-    /// 非空范围仍定位首scalar所属GCB；BiDi双位置必须由更外层原选择证据解决。
+    /// IME/navigation uses original selection wrap affinity, not the following line in place of the user's actual upstream caret.
+    /// Nonempty ranges locate the first scalar's grapheme; original outer selection evidence must resolve two Bidi positions.
     ///
     /// # Errors
-    /// 与first_rect相同；零范围有两个不同视觉位置时返回Pending，不猜测主插入点。
+    /// As with first_rect; an empty range with two visual positions remains Pending without guessing primary caret.
     pub fn first_rect_with_affinity(
         &self,
         range: NSRange,
@@ -175,7 +175,7 @@ impl NativeMarkdownComposedViewport {
             let caret = self.caret_geometry(range.location, affinity, current)?;
             if !self.visible(caret.line_frame) || caret.secondary.is_some() {
                 return Err(NativeMarkdownComposedViewportError::Pending);
-            } // 只读实际准备侧；换行侧不授予选择BiDi主/次位置的权限。
+            } // Use the prepared side only; wrap affinity grants no Bidi primary/secondary choice.
             self.require(current)?;
             return Ok(NativeMarkdownPagedCharacterRect {
                 rect: caret.primary,
@@ -186,7 +186,7 @@ impl NativeMarkdownComposedViewport {
         if !self.visible(line.frame) {
             return Err(NativeMarkdownComposedViewportError::Pending);
         }
-        // 非空请求扩到首scalar所属完整GCB；不把后继行或UTF16中点当作字形首位置。
+        // Expand nonempty requests to their first scalar's complete grapheme; neither later lines nor UTF-16 interiors are the first glyph position.
         let start = self.boundary(range.location, false)?;
         let next = self.next_boundary(start)?;
         if next > line.handle.facts().source_utf16.end || next <= start {
@@ -201,8 +201,8 @@ impl NativeMarkdownComposedViewport {
             if overlap.start >= overlap.end {
                 continue;
             }
-            // 同一 GCB 的字形可以属于数个真实 UBA/字体项；只聚合原有限行的实际包络。
-            // 内部 seam 仅作绘制截面，actual_range 始终保留原完整 GCB，不给 IME 半个字符框。
+            // One grapheme may span actual UBA/font items; union their actual envelopes within the bounded original line only.
+            // Internal seams are paint sections only; actual_range retains the complete grapheme instead of giving IME a partial character frame.
             let next = self.part_rect(line, part, overlap.clone(), current)?;
             covered = covered
                 .checked_add(overlap.len())
@@ -224,7 +224,7 @@ impl NativeMarkdownComposedViewport {
         }
         if covered != actual.len() {
             return Err(NativeMarkdownComposedViewportError::Pending);
-        } // 未准备完整原 GCB 时不能把一个已显示片段签为整个字符。
+        } // An already displayed fragment cannot certify a full grapheme that is not completely prepared.
         let rect = rect.ok_or(NativeMarkdownComposedViewportError::Pending)?;
         if !self.visible(rect) && rect.size.width != 0.0 {
             return Err(NativeMarkdownComposedViewportError::Pending);
@@ -236,8 +236,8 @@ impl NativeMarkdownComposedViewport {
         })
     }
 
-    /// 词组点击侧只由本次真实字形与相邻GCB的caret方向决定；Body和只读格共用此事实。
-    /// 返回命中而非词范围，真正中文、标点和双向文字分词仍交同Source的原UBA生产者。
+    /// Actual glyph/adjacent-grapheme caret direction decides word-hit bias, shared by Body and read-only Cells.
+    /// Return a hit rather than a word range; the same-Source UBA producer still classifies Chinese, punctuation, and Bidi word boundaries.
     pub(in crate::native_surface) fn word_hit(
         &self,
         local: NSPoint,
@@ -246,7 +246,7 @@ impl NativeMarkdownComposedViewport {
         let hit = self.hit(local, current)?;
         if hit.other_source_utf16.is_some() {
             return Err(NativeMarkdownComposedViewportError::Pending);
-        } // 同视觉位置仍有两个逻辑候选时，不能从UTF16大小或默认LTR猜词组侧。
+        } // Two logical candidates at one visual position cannot be resolved from UTF-16 ordering or assumed LTR.
         let line = self
             .lines
             .iter()
@@ -263,7 +263,7 @@ impl NativeMarkdownComposedViewport {
         }
         for next in [true, false] {
             let position = {
-                // 只读原封存GCB目录；Reader租约在Native几何或current回调前结束。
+                // Read the original sealed grapheme directory and end the reader borrow before Native geometry/current callbacks.
                 let mut output = self
                     .output
                     .try_borrow_mut()
@@ -284,7 +284,7 @@ impl NativeMarkdownComposedViewport {
             let Some(position) =
                 position.filter(|position| range.contains(position) || *position == range.end)
             else {
-                continue; // 窗口外、硬换行或尚无相邻边界均不授方向，仍可检查另一真实同run邻侧。
+                continue; // Offwindow/hard-break/missing neighbors grant no direction; the other actual same-run neighbor may still supply it.
             };
             let adjacent = self.caret_geometry(
                 position,
@@ -300,7 +300,7 @@ impl NativeMarkdownComposedViewport {
                 caret.primary.origin.x - adjacent.primary.origin.x
             };
             if forward_x == 0.0 {
-                continue; // 零advance没有可证明方向，不能把UTF16邻接当作真实视觉位置。
+                continue; // Zero advance proves no direction; UTF-16 adjacency cannot substitute for actual visual displacement.
             }
             let backward_bias = if forward_x > 0.0 {
                 local.x < caret.primary.origin.x
@@ -312,16 +312,16 @@ impl NativeMarkdownComposedViewport {
         }
         self.require(current)?;
         if range.is_empty() {
-            return Ok((hit, false)); // 真空行没有词组，原UBA将返回同一空范围，不借相邻行补内容。
+            return Ok((hit, false)); // An actual empty line has no word; UBA returns its empty range without borrowing neighboring text.
         }
         Err(NativeMarkdownComposedViewportError::Pending)
     }
 
-    /// 有界顺序比较原GCB的实际caret，保留BiDi同视觉位置的两个逻辑候选。
+    /// Project drag endpoints through bounded prepared-line geometry; text hit-testing below retains actual grapheme/Bidi candidates.
     ///
     /// # Errors
-    /// 点在窗口外、候选行尚未准备、边界预算不足或原权限失效时返回Pending/错误。
-    /// 拖选终点只投到本窗口真正可见的封存行；保留原物理点供滚动使用，不猜离屏文字位置。
+    /// Invalid coordinates/original authority fail; without a prepared eligible line return no projected point.
+    /// Project only onto genuinely visible sealed lines, retaining physical pointer position for scrolling rather than guessing offscreen text.
     pub(in crate::native_surface) fn project_drag_point(
         &self,
         local: NSPoint,
@@ -345,7 +345,7 @@ impl NativeMarkdownComposedViewport {
                     )
                 })
             {
-                continue; // 结构行交真实Grid；折叠隐区没有可用于拖选的可见墨迹或虚构行高。
+                continue; // Actual Grid owns structural lines; hidden folds supply neither visible drag targets nor invented line heights.
             }
             if self.key.presentation_mode == MarkdownPresentationMode::InlinePreview {
                 let mut hidden_text = false;
@@ -367,7 +367,7 @@ impl NativeMarkdownComposedViewport {
                     }
                 }
                 if hidden_text && !visible_text {
-                    continue; // 整行只有0.1pt隐藏语法时没有拖选目标；真实空行的ParagraphBreak仍保留。
+                    continue; // A line containing only tiny hidden syntax is not a drag target; actual empty-line ParagraphBreak remains eligible.
                 }
             }
             let bottom = line.frame.origin.y.max(clip.origin.y);
@@ -376,7 +376,7 @@ impl NativeMarkdownComposedViewport {
             if top <= bottom {
                 continue;
             }
-            // 严格小于右/上边，沿原hit的半开行框；next_down只选同一真实框内的最近可表示点。
+            // Use hit-testing's half-open right/top edges; next_down picks the nearest representable point inside the same actual frame.
             let projected = NSPoint::new(
                 local
                     .x
@@ -390,7 +390,7 @@ impl NativeMarkdownComposedViewport {
             }
         }
         self.require(current)?;
-        Ok(nearest) // 仅遍历当前已拥有的有限行metadata；不读Source、GCB或建立新目录。
+        Ok(nearest) // Visit existing bounded line metadata only, without Source/GCB reads or another directory.
     }
 
     pub fn hit(
@@ -413,12 +413,12 @@ impl NativeMarkdownComposedViewport {
         if line.handle.facts().kind == omni_markdown_core::MarkdownComposedLineKind::TableRow {
             return Err(NativeMarkdownComposedViewportError::Pending);
         }
-        // 先以原目录rank预检全行查询量；没有预算时不能用已比较的前缀冒称最近位置。
+        // Preflight complete line work using directory ranks; insufficient budget cannot publish the nearest position from a scanned prefix.
         let mut count = 0usize;
         {
             for part in &line.parts {
                 let Some(range) = self.part_grapheme_range(part)? else {
-                    continue; // 两个整形 seam 之间可以没有可编辑边界，不把零个 GCB 当成缺源错误。
+                    continue; // There may be no editable boundary between shaping seams; zero graphemes do not imply missing Source.
                 };
                 let mut reader = self
                     .output
@@ -444,11 +444,11 @@ impl NativeMarkdownComposedViewport {
         }
         let mut answer: Option<NativeMarkdownComposedViewportHit> = None;
         let mut distance = f64::INFINITY;
-        // 只在answer已由真实caret产生后参与比较；普通字符中点两侧同距不等于视觉位置重合。
-        // 这个坐标属于本次有限扫描，不保存Source、后继输入或跨调用几何缓存。
+        // Compare only after an actual caret produced answer; equal distances at a character midpoint are not coincident visual positions.
+        // This coordinate belongs to one bounded scan, without Source ownership, successor Input, or a cross-call geometry cache.
         let mut primary_caret_x = 0.0;
         let mut primary_inside_part = false;
-        // 有限GCB逐项比较真实caret；不假设连字内部GDEF单调，也不按源字节长度插值。
+        // Compare actual bounded grapheme carets without assuming monotone ligature GDEF or interpolating by Source byte length.
         for part in &line.parts {
             let Some(range) = self.part_grapheme_range(part)? else {
                 continue;
@@ -463,13 +463,13 @@ impl NativeMarkdownComposedViewport {
                     line.baseline,
                     &|| self.require(current).is_ok(),
                 );
-                self.require(current)?; // 原Source故障优先，不能被几何回调的bool撤权掩盖。
+                self.require(current)?; // Original Source failure takes priority over boolean revocation from geometry callbacks.
                 let caret = caret?;
                 let affinity = if position == part.handle.facts().source_utf16.end {
                     omni_markdown_core::MarkdownComposedLineAffinity::Upstream
                 } else {
                     omni_markdown_core::MarkdownComposedLineAffinity::Downstream
-                }; // 只消费原真实 part 边界，不按文字方向或平均 advance 猜测隐藏语法的来源侧。
+                }; // Use actual original part boundaries, not text direction/average advance to guess hidden-syntax Source affinity.
                 let facts = part.handle.facts();
                 let part_start = line.baseline.x + facts.origin_x_26_6 as f64 / 64.0;
                 let part_end = part_start + facts.x_advance_26_6 as f64 / 64.0;
@@ -477,7 +477,7 @@ impl NativeMarkdownComposedViewport {
                     local.x >= part_start.min(part_end) && local.x < part_start.max(part_end);
                 let delta = (caret.baseline.x - local.x).abs();
                 if delta < distance {
-                    // 更近的视觉位置整体替换旧候选，旧BiDi歧义不能污染新结果。
+                    // A closer visual position replaces the entire candidate so obsolete Bidi ambiguity cannot contaminate it.
                     distance = delta;
                     primary_caret_x = caret.baseline.x;
                     primary_inside_part = inside_part;
@@ -494,9 +494,9 @@ impl NativeMarkdownComposedViewport {
                     && inside_part
                     && !primary_inside_part
                 {
-                    // 同源caret有两侧时，取点击点实际落入的墨迹跨度一侧，并同步真实视觉位置。
-                    // 若主位置已从另一同距x换边，原other属于旧x，不能挂到新位置冒称BiDi重合；
-                    // 同x只换样式亲和则保留真实的另一逻辑候选，不丢隐藏语法边缘事实。
+                    // For two sides of one source caret, prefer the part advance span containing the actual hit and update visual position together.
+                    // If primary moves from another equally distant X, old secondary belongs to that old X and cannot imply coincidence at the new position.
+                    // An affinity change at the same X retains its actual other logical candidate, including hidden-syntax edge facts.
                     if primary_caret_x != caret.baseline.x {
                         answer.other_source_affinity = None;
                         answer.other_source_utf16 = None;
@@ -509,24 +509,24 @@ impl NativeMarkdownComposedViewport {
                     && let Some(answer) = &mut answer
                     && answer.source_utf16 != position
                 {
-                    // 只有同x的真实不同端点才构成逻辑歧义；异x普通平局沿原稳定主候选结束，
-                    // 不按字符宽度插值、不新增方向猜测，也不把合法的字符中点交给外层拒绝。
+                    // Only distinct actual endpoints sharing X create logical ambiguity; equal-distance different-X ties retain the stable primary,
+                    // without width interpolation, invented direction, or rejecting valid character midpoints in the outer layer.
                     if answer
                         .other_source_utf16
                         .is_some_and(|other| other != position)
                     {
                         return Err(NativeMarkdownComposedViewportError::Pending);
-                    } // 多个零advance/GCB重合时不丢中间逻辑候选，等待后继完整affinity生产者。
+                    } // Several coincident zero-advance graphemes must not lose intermediate candidates; wait for complete affinity production.
                     answer.other_source_affinity = Some(affinity);
-                    answer.other_source_utf16 = Some(position); // 不丢BiDi边界歧义，亦不声称这是选择anchor/head。
+                    answer.other_source_utf16 = Some(position); // Retain Bidi-boundary ambiguity without claiming a selection anchor/head.
                 }
                 if position == *range.end()
                     || part.handle.facts().kind == MarkdownComposedLinePartKind::ParagraphBreak
                     || part.handle.facts().kind == MarkdownComposedLinePartKind::FoldedSection
                 {
                     break;
-                } // 换段part的起点是本行末caret，末端属于下一视觉行；CRLF零advance不能凭空制造BiDi歧义。
-                // 其他part仍遍历原GCB端点，保留真实同x候选；不跨字体/方向目录猜位置。
+                } // ParagraphBreak starts at this line's final caret and ends on the next visual line; zero-advance CRLF cannot invent Bidi ambiguity.
+                // Other parts visit original grapheme endpoints and retain same-X candidates without guessing across font/direction directories.
                 let next = self.next_boundary(position)?;
                 if next <= position || next > *range.end() {
                     return Err(NativeMarkdownComposedViewportError::InvalidRange);
@@ -538,11 +538,11 @@ impl NativeMarkdownComposedViewport {
         answer.ok_or(NativeMarkdownComposedViewportError::Pending)
     }
 
-    /// 按原视觉part流式交付一个逻辑选区的可见框，不建立全部选区/GCB/正文Vec。
-    /// visitor可绘入未发布候选；任何Err都必须丢弃整个候选，不能发布成功前缀。
+    /// Stream visible rectangles for a logical selection through original visual parts, without a complete selection/grapheme/text Vec.
+    /// Visitors may draw into an unpublished candidate; any error discards that complete candidate, never publishes a successful prefix.
     ///
     /// # Errors
-    /// 范围越界、Source/Font/scene失效或visitor失败时整次拒绝；离屏部分明确不产生框。
+    /// Reject the operation for bounds, Source/font/Scene, or visitor failure; offscreen portions produce no rectangles.
     pub fn selection_rects(
         &self,
         selection: Range<usize>,
@@ -554,7 +554,7 @@ impl NativeMarkdownComposedViewport {
             return Err(NativeMarkdownComposedViewportError::InvalidRange);
         }
         let mut count = 0usize;
-        // 每个已准备part最多交付一个区间框；外层可对有限多选逐个调用并统一限制frame工作量。
+        // Each prepared part supplies at most one span; the outer caller bounds whole-frame work across finite multiple ranges.
         for line in &self.lines {
             if !self.visible(line.frame) {
                 continue;
@@ -566,14 +566,14 @@ impl NativeMarkdownComposedViewport {
                     MarkdownComposedLinePartKind::FoldedSection
                         | MarkdownComposedLinePartKind::TableRow
                 ) {
-                    continue; // 隐区没有可见字形或选区框，不能沿其原 UTF16 长度遍历内部 GCB。
+                    continue; // Hidden regions have no visible glyph/selection rectangle; their UTF-16 length cannot authorize scanning internal graphemes.
                 }
                 let start = selection.start.max(facts.source_utf16.start);
                 let end = selection.end.min(facts.source_utf16.end);
                 if start >= end {
                     continue;
-                } // 该视觉part没有选中字节，不能通过取整制造额外高亮。
-                // 先保原完整字素，再裁回真实绘制项；整形 seam 只影响包络，不拆用户的选择。
+                } // This visual part has no selected range; rounding cannot manufacture additional highlight.
+                // Preserve complete original graphemes, then intersect actual paint items; shaping seams affect envelopes without splitting selection.
                 let actual = self.boundary(start, false)?.max(facts.source_utf16.start)
                     ..self.boundary(end, true)?.min(facts.source_utf16.end);
                 let rect = self.part_rect(line, part, actual, current)?;
@@ -581,7 +581,7 @@ impl NativeMarkdownComposedViewport {
                     continue;
                 };
                 self.require(current)?;
-                visitor(rect)?; // Reader租约在上面的几何函数结束，不跨外层Native绘制/回调。
+                visitor(rect)?; // Geometry returned its reader borrow before the outer Native paint/callback.
                 self.require(current)?;
                 count += 1;
             }
@@ -604,7 +604,7 @@ impl NativeMarkdownComposedViewport {
                 }
             }
         }
-        Err(NativeMarkdownComposedViewportError::Pending) // 本分支只定位非空首scalar；caret由真实换行侧单独查询。
+        Err(NativeMarkdownComposedViewportError::Pending) // This path locates a nonempty first scalar only; caret lookup separately uses actual wrap affinity.
     }
 
     pub(super) fn boundary(&self, offset: usize, following: bool) -> Result<usize> {
@@ -614,7 +614,7 @@ impl NativeMarkdownComposedViewport {
             .map_err(|_| NativeMarkdownComposedViewportError::Busy)?;
         if reader.grapheme_ordinal(offset)?.is_some() {
             return Ok(offset);
-        } // 原边界保持原坐标，避免把已对齐的范围扩大到相邻字素。
+        } // Keep an existing original boundary rather than expand an already aligned range to a neighboring grapheme.
         let query = if following {
             MarkdownGraphemeQuery::Next
         } else {
@@ -622,7 +622,7 @@ impl NativeMarkdownComposedViewport {
         };
         match reader.grapheme_query(offset, query)? {
             MarkdownGraphemeAnswer::Known(Some(boundary)) => Ok(boundary.utf16),
-            _ => Err(NativeMarkdownComposedViewportError::InvalidRange), // 未知或不存在的GCB不能按相邻UTF16猜。
+            _ => Err(NativeMarkdownComposedViewportError::InvalidRange), // Unknown/missing grapheme boundaries cannot be guessed from adjacent UTF-16 positions.
         }
     }
     fn next_boundary(&self, offset: usize) -> Result<usize> {
@@ -632,11 +632,11 @@ impl NativeMarkdownComposedViewport {
             .map_err(|_| NativeMarkdownComposedViewportError::Busy)?;
         match reader.grapheme_query(offset, MarkdownGraphemeQuery::Next)? {
             MarkdownGraphemeAnswer::Known(Some(boundary)) => Ok(boundary.utf16),
-            _ => Err(NativeMarkdownComposedViewportError::InvalidRange), // 真EOF与缺失目录不制造下一字素。
+            _ => Err(NativeMarkdownComposedViewportError::InvalidRange), // Actual EOF or a missing directory cannot manufacture a next grapheme.
         }
     }
 
-    /// 只借原目录确定这个真实 part 内第一/最后的 GCB；不造新边界或缓存逐字素数组。
+    /// Use the original directory for first/last grapheme boundaries inside this part, without invented boundaries or a per-grapheme cache.
     fn part_grapheme_range(&self, part: &Part) -> Result<Option<std::ops::RangeInclusive<usize>>> {
         let range = &part.handle.facts().source_utf16;
         let first = self.boundary(range.start, true)?;
@@ -654,7 +654,7 @@ impl NativeMarkdownComposedViewport {
         if selection.start < actual.start || selection.end > actual.end {
             return Err(NativeMarkdownComposedViewportError::InvalidRange);
         }
-        let guarded = || self.require(current).is_ok(); // Native GDEF查询只拿bool，外层仍优先重报实际Source错误。
+        let guarded = || self.require(current).is_ok(); // Native GDEF receives a boolean guard; the outer layer still preserves actual Source error priority.
         let position = |at| {
             let edge = if at == actual.start {
                 Some(ComposedPartSourceEdge::Start)
@@ -673,7 +673,7 @@ impl NativeMarkdownComposedViewport {
                     &guarded,
                 )
             } else {
-                // 真正位于项内部的位置仍是公开 caret 合同，只允许原 GCB/GDEF，不能按 scalar 插值。
+                // Interior positions follow the public caret contract using original GCB/GDEF, without scalar interpolation.
                 composed_part_caret(
                     &self.output,
                     &part.handle,
@@ -691,7 +691,7 @@ impl NativeMarkdownComposedViewport {
         let end = position(selection.end);
         self.require(current)?;
         let end = end?;
-        // RTL端点按实际视觉x取min/max；高度沿同一行真实metrics，不能用UTF16长度推宽度。
+        // Use min/max actual visual X for RTL endpoints and measured line height, never width inferred from UTF-16 length.
         let rect = NSRect::new(
             NSPoint::new(start.x.min(end.x), line.baseline.y - line.descent),
             NSSize::new((end.x - start.x).abs(), line.ascent + line.descent),
@@ -707,8 +707,8 @@ impl NativeMarkdownComposedViewport {
     }
 }
 
-/// 点击和悬停共享同一实际LINK标签包络；显露语法与零advance不获得额外激活区域。
-/// 负advance只交换左右边，仍保原行的真实字体高，不按UTF16个数或字形平均宽度猜测。
+/// Click/hover share the actual LINK-label advance envelope; exposed syntax/zero advances gain no extra activation area.
+/// Negative advance swaps left/right only, retaining actual line font height without UTF-16 counts or average glyph widths.
 fn link_part_rect(line: &Line, part: &Part) -> Option<NSRect> {
     let facts = part.handle.facts();
     let styles = facts.presentation;

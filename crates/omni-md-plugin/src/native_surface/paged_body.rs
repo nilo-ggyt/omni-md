@@ -47,8 +47,6 @@ mod notifications;
 mod page_scroll;
 mod paint_observer;
 mod preparation;
-#[cfg(feature = "native-markdown-runtime-probe")]
-mod preparation_probe;
 mod presentation;
 mod producer;
 pub(super) mod scene;
@@ -57,10 +55,6 @@ mod target;
 mod word;
 pub use paint_observer::NativeMarkdownPagedBodyPaintObserver;
 use paint_observer::PaintObservation;
-#[cfg(feature = "native-markdown-runtime-probe")]
-pub use preparation_probe::{
-    NativeMarkdownPagedBodyPreparationProbe, NativeMarkdownPagedBodyPreparationResources,
-};
 use producer::{FontWorker, Producer};
 use scene::Scene;
 pub use target::NativeMarkdownPagedBodySourceTarget;
@@ -382,8 +376,6 @@ pub struct NativeMarkdownPagedBody {
     pending_word_delete: RefCell<Option<Rc<word::PendingWordDelete>>>,
     input_observers: RefCell<Vec<Weak<dyn NativeMarkdownPagedBodyInputObserver>>>,
     paint_observation: RefCell<Option<PaintObservation>>,
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    preparation_probe: RefCell<Option<Weak<dyn NativeMarkdownPagedBodyPreparationProbe>>>,
     revoked_preparations: Cell<usize>,
     // The current body session owns its mode; configuration supplies only the initial value, and
     // switching preserves Input, history, and folds.
@@ -614,8 +606,6 @@ impl NativeMarkdownPagedBody {
             pending_word_delete: RefCell::new(None),
             input_observers: RefCell::new(Vec::new()),
             paint_observation: RefCell::new(None),
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            preparation_probe: RefCell::new(None),
             revoked_preparations: Cell::new(0),
             presentation: Cell::new(configuration.presentation_mode),
             configuration,
@@ -1045,8 +1035,6 @@ impl NativeMarkdownPagedBody {
         let _ = self.cancel_word_delete(); // The first error is preserved; explicitly return input slots that a local reentrant Rc might still retain.
         self.revoke_source_target();
         drop(self.paint_observation.borrow_mut().take());
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        drop(self.preparation_probe.borrow_mut().take());
         let scene_result = self.clear_scene().map_err(Into::into);
         let producer = self.producer.borrow_mut().take();
         let producer_result = producer::merge_preparation_cleanup(
@@ -1437,8 +1425,6 @@ impl NativeMarkdownPagedBody {
         self.deferred.set(false);
         self.font_notices.borrow_mut().clear();
         drop(self.paint_observation.borrow_mut().take());
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        drop(self.preparation_probe.borrow_mut().take());
         self.remove_clip_observers();
         // First detach gutter Scene/fonts/pixels/client/ruler, then the body viewport; the same receipt
         // verifies actual Native and munmap facts.

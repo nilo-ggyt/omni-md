@@ -1,4 +1,5 @@
-//! 封闭后的原像素只由真实最后munmap归还；登记和最后析构共用同一小临界区。
+//! Closed pixels complete release only after actual final munmap; subscription and final destruction
+//! share one small critical section.
 
 use super::*;
 use crate::native_surface::deallocation::NativeMarkdownDeallocationClaim;
@@ -10,7 +11,8 @@ pub(super) struct ReleaseState {
 }
 
 impl NativeMarkdownViewportPixels {
-    /// 关闭装配登记原cohort义务；已同步归零也交同一真实事实，不丢先完成后订阅的事件。
+    /// Register the original close-cohort obligation; already-released pixels use the same actual fact,
+    /// preserving completion-before-subscription.
     pub(in crate::native_surface) fn observe_release(
         &self,
         claim: NativeMarkdownDeallocationClaim,
@@ -22,11 +24,12 @@ impl NativeMarkdownViewportPixels {
             self.take_released_claims(&mut release)
         };
         for claim in ready {
-            claim.release(); // 先结束资源锁，再交既有cohort排队；不执行Native或保活业务owner。
+            claim.release(); // Release the resource lock before queueing the existing cohort, without Native calls or retained business ownership.
         }
     }
 
-    /// 此方法只在实际munmap成功后调用；原三项归还和通知决定处于同一锁，最后更新不会漏唤醒。
+    /// Call only after actual munmap success; update the three release counters and notification
+    /// decision under one lock so the final update cannot lose its wake.
     pub(super) fn released_allocation(&self, length: usize, receipt: Option<&AtomicUsize>) {
         let ready = {
             let mut release = self.release.lock().expect("像素释放锁不跨外部调用");
@@ -34,15 +37,17 @@ impl NativeMarkdownViewportPixels {
             self.live_pixel_bytes.fetch_sub(length, Ordering::AcqRel);
             self.reserved_bytes.fetch_sub(length, Ordering::AcqRel);
             if let Some(receipt) = receipt {
-                receipt.store(1, Ordering::Release); // 真实munmap与原分配收据先完成，后授cohort归还权。
+                receipt.store(1, Ordering::Release); // Actual munmap and the original allocation receipt precede cohort-release authority.
             }
             self.take_released_claims(&mut release)
         };
         for claim in ready {
-            claim.release(); // 可以来自CoreGraphics后台释放栈；此处仍只有Send/Sync原子元数据。
+            claim.release(); // This may run on a Core Graphics release thread, carrying Send/Sync atomic metadata only.
         }
     }
 
+    /// Transfer subscribed claims only after every actual allocation counter reached zero without
+    /// failure.
     fn take_released_claims(
         &self,
         release: &mut ReleaseState,
@@ -55,7 +60,7 @@ impl NativeMarkdownViewportPixels {
         {
             std::mem::take(&mut release.claims)
         } else {
-            Vec::new() // 原分配仍活或归还失败时保持义务；没有轮询、超时或成功计数补写。
+            Vec::new() // Retain obligations while an allocation lives or release failed, without polling, timeouts, or invented success counters.
         }
     }
 }

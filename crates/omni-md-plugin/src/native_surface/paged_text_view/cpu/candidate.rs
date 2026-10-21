@@ -1,12 +1,15 @@
-//! 候选只保原弱输入权限和一个可续绘图会话；主队列闭包不延长它的生命期。
+//! A candidate owns its original weak input authority and resumable paint session; queued closures do
+//! not retain it.
 
 use super::*;
 use crate::native_surface::viewport_pixels::{
     CertifiedMaskPairs, PreparedTileEncodingPlan, WritableTile,
 };
 
-/// 与同步SceneUse相同的原事实，但不能把Input或delegate强边保存到后续主队列轮次。
-/// 克隆仍只有弱身份和固定元数据，供本次advance消费Candidate之后核原票的真实换代。
+/// Carry the original synchronous SceneUse facts without retaining Input or delegate across main-queue
+/// turns.
+/// Clones keep weak identities and finite metadata so advance can distinguish actual supersession after
+/// consuming the candidate.
 #[derive(Clone)]
 pub(in super::super) struct Ticket {
     input: Weak<NativeMarkdownPagedInput>,
@@ -16,7 +19,8 @@ pub(in super::super) struct Ticket {
     geometry_epoch: u64,
 }
 impl Ticket {
-    /// 同步获取和异步候选共享原事实；只保存弱身份，绝不保存后继 Scene 或延长正文资源寿命。
+    /// Synchronous acquisition and asynchronous candidates share original facts using weak identities,
+    /// without successor Scenes or extended document ownership.
     pub(in super::super) fn new(origin: &Origin) -> Self {
         Self {
             input: Rc::downgrade(&origin.input),
@@ -43,18 +47,21 @@ impl Ticket {
             state: self.state,
             epoch: self.epoch,
             geometry_epoch: self.geometry_epoch,
-            interpreted: false, // CPU候选只核绘图票，不能认领原IME解释回调的输入收据。
+            interpreted: false, // A CPU paint ticket cannot claim the input receipt belonging to an original IME interpretation callback.
         };
         origin.current(view) && origin.delegate.scene_current(key) && origin.current(view)
     }
 
-    /// 只有客户、完整输入或几何确已换代，旧CPU票的撤权才是正常退休。
-    /// current中的bool还可能来自借用失败、Viewport故障或当前图层关系错误，不能直接
-    /// 把!current当作成功；这里不领取后继Scene，也不让清理后的空serial代替身份事实。
+    /// Treat old CPU revocation as normal retirement only after actual client, complete Input, or
+    /// geometry supersession.
+    /// A false current result may also mean borrow failure, viewport failure, or a broken layer
+    /// relationship; do not equate
+    /// !current with success, acquire a successor Scene, or let a cleared serial replace actual
+    /// identity facts.
     pub(in super::super) fn superseded(&self, view: &NativeMarkdownPagedTextView) -> Result<bool> {
         let ivars = view.ivars();
         if ivars.geometry_failed.get() {
-            return Ok(false); // 几何计数失败不是一次合法布局换代，原Revoked必须继续交给失败边界。
+            return Ok(false); // Geometry-counter failure is not valid layout supersession; preserve Revoked for the owning failure boundary.
         }
         if ivars.closed.get() || ivars.epoch != self.epoch {
             return Ok(true);
@@ -72,13 +79,13 @@ impl Ticket {
             .as_ref()
             .is_some_and(|delegate| Weak::ptr_eq(&self.delegate, delegate));
         if !same_input || !same_delegate {
-            return Ok(true); // 只有原槽真的退出/换客户才退休；没有延长旧Input或delegate的强生命期。
+            return Ok(true); // Retire only when the original slot actually exits or changes client, without extending old Input/delegate ownership.
         }
         let input = self
             .input
             .upgrade()
             .ok_or(NativeMarkdownPagedTextViewError::Revoked)?;
-        let state = input.state()?; // Borrowed/StateChanged/Source等真实输入错误不能被bool撤权吞掉。
+        let state = input.state()?; // Boolean revocation must not swallow actual Borrowed, StateChanged, or Source errors.
         Ok(state != self.state || ivars.geometry_epoch.get() != self.geometry_epoch)
     }
 }
@@ -97,7 +104,7 @@ pub(super) struct Candidate {
     reusable: std::rc::Weak<TileFrame>,
 }
 
-/// 每个候选只有一个有限准备槽，不随正文、行或主队列让出次数扩容。
+/// Each candidate has one bounded staging slot, independent of text, line count, or main-queue yields.
 #[derive(Default)]
 struct Staging {
     prepared: Option<PreparedTileEncodingPlan>,
@@ -131,7 +138,7 @@ impl Complete {
         let current = || self.current(surface, view);
         self.scene.validate_ready(&current)?;
         let geometry = surface.geometry_for(view, &self.key, &current);
-        self.scene.validate_ready(&current)?; // Native几何拒绝也必须先检查原Source首错。
+        self.scene.validate_ready(&current)?; // Check the original Source error before reporting Native geometry rejection.
         if geometry? != self.geometry {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
@@ -151,8 +158,10 @@ impl Candidate {
                 Err(crate::native_surface::viewport_pixels::PixelError::BudgetExceeded)
                     if surface.clear_calibrations() =>
                 {
-                    // 此构造到预算拒绝为止没有Native、mmap或绘图副作用。先实际归还可选表页，
-                    // 再核同一个候选的原预检，不能因优化常驻页缩小用户原本可绘制的视口。
+                    // Budget rejection at this constructor has no Native, mmap, or paint effects.
+                    // Return optional calibration pages first,
+                    // then repeat this same candidate preflight so optional optimization pages cannot
+                    // reduce the drawable viewport.
                     if surface.pixels.observer().snapshot().release_failed {
                         return Err(NativeMarkdownPagedTextViewError::Raster(
                             "预算预检前校准纯颜色表未能实际归还".into(),
@@ -162,7 +171,7 @@ impl Candidate {
                 }
                 other => other?,
             };
-        surface.calibrations.borrow_mut().begin_frame(); // 纯Rust额度转移，不查询新Scene或续原权限。
+        surface.calibrations.borrow_mut().begin_frame(); // Transfer pure Rust frame quota without querying a new Scene or renewing authority.
         Ok(Self {
             serial,
             key: scene.key.clone(),
@@ -189,7 +198,7 @@ impl Candidate {
         view: &NativeMarkdownPagedTextView,
     ) -> Result<()> {
         let current = || self.current(surface, view);
-        self.scene.validate_ready(&current)?; // 原Source首错先于取消；从不领取当前较新Scene。
+        self.scene.validate_ready(&current)?; // The original Source error precedes cancellation; never acquire the current newer Scene.
         if !current() {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
@@ -200,6 +209,8 @@ impl Candidate {
         }
         Ok(())
     }
+    /// Resume the same tile/session with a bounded work allowance; pending work never exposes a partial
+    /// frame.
     pub(super) fn advance(
         mut self,
         surface: &CpuSurface,
@@ -208,7 +219,7 @@ impl Candidate {
         self.validate(surface, view)?;
         if let Some(prepared) = self.staging.prepared.take() {
             return self.finish_prepared(surface, view, prepared);
-        } // 有限原生校准独占下一次主队列轮次，不与最后glyph批次叠加同步工作。
+        } // Bounded Native calibration gets the next main-queue turn instead of adding synchronous work to the final glyph batch.
         if self.writable.is_none() {
             let tile = self
                 .bitmap
@@ -231,18 +242,18 @@ impl Candidate {
             self.writable = Some(writable);
             self.session = Some(session);
             self.work = NativeMarkdownPagedScenePaintWork::default();
-        } // 每轮至多创建一个tile；预算耗尽从原session cursor续，不从第一glyph重画。
+        } // Create at most one tile per turn; resume the original session cursor after budget exhaustion without repainting its first glyph.
         let session = self
             .session
             .take()
             .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
         let current = || self.current(surface, view);
         let step = session.step(NativeMarkdownPagedScenePaintBudget::default(), &current);
-        self.scene.validate_ready(&current)?; // 即使Native返回撤权，真实Source/Font首错仍优先。
+        self.scene.validate_ready(&current)?; // Actual Source/font failure takes priority even when Native reports revocation.
         let step = step?;
         if step.work.glyphs > 256 || step.work.metadata_records > 32 || step.work.batches > 256 {
             return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
-        } // producer违规不能以拆多个实际批次越过一次主队列的同步预算。
+        } // A producer cannot evade a main-queue turn budget by splitting work into additional actual batches.
         self.work = add(self.work, step.work)?;
         match step.outcome {
             NativeMarkdownPagedScenePaintOutcome::Pending(session) => {
@@ -260,19 +271,21 @@ impl Candidate {
                 {
                     return Err(NativeMarkdownPagedTextViewError::Revoked);
                 }
-                drop(completion); // 归还完成票显式claim；WritableTile的最后context待finish实际callback后才封存。
+                drop(completion); // Return the completion claim; seal WritableTile only after finish receives the actual final-context callback.
                 self.validate(surface, view)?;
                 let prepared = self
                     .bitmap
                     .prepare_tile(writable)
                     .and_then(|prepared| self.bitmap.plan_encoding(prepared));
-                self.validate(surface, view)?; // 最后context/纯扫描/只读转换错误不能覆盖原Source首错。
+                self.validate(surface, view)?; // Final-context, pure-scan, or read-only conversion errors cannot overwrite the original Source failure.
                 self.staging.prepared = Some(prepared?);
                 Ok(Advance::Pending(self))
             }
         }
     }
 
+    /// Certify one prepared region per turn, then seal exact original pixels before complete-frame
+    /// publication.
     fn finish_prepared(
         mut self,
         surface: &CpuSurface,
@@ -285,47 +298,51 @@ impl Candidate {
         }
         let index = self.staging.next_region;
         let pairs = if let Some(request) = prepared.mask_request(index)? {
-            // 把有限纯事实槽移到借用外，Native/current重入期间没有借用Candidate内部容器。
+            // Move finite calibration facts out of the RefCell before Native/current reentry, leaving
+            // no live container borrow.
             let mut calibrations = std::mem::take(&mut *surface.calibrations.borrow_mut());
             let pairs = calibrations.pairs(&request, Arc::clone(&surface.pixels), &|| {
                 self.validate(surface, view)
             });
             let current = self.validate(surface, view);
             if pairs.is_ok() && current.is_ok() {
-                // Native可关闭或撤销原候选；只有原serial/Source/几何全部仍成立才归还纯表。
-                // 取出期间Surface槽为空，重入取消不会借用冲突；失权局部值直接drop，不复活旧页。
+                // Native may close or revoke this candidate; restore pure tables only while original
+                // serial, Source, and geometry remain valid.
+                // The surface slot stays empty during reentry; cancellation can proceed without borrow
+                // conflicts, and revoked local tables drop without revival.
                 drop(surface.calibrations.replace(calibrations));
             } else {
                 drop(calibrations);
             }
-            current?; // 真实Source/Font首错仍高于校准拒绝或原生撤权。
+            current?; // Actual Source/font failure precedes calibration rejection or Native revocation.
             pairs?
         } else {
-            None // 固色、透明或原中性A8不必加载双色校准图，保持旧表示与功能。
+            None // Solid, transparent, and original neutral-A8 tiles need no two-color calibration graph; retain their existing representation.
         };
         self.staging.certificates[index] = pairs;
         self.staging.next_region += 1;
         if self.staging.next_region < count {
             self.staging.prepared = Some(prepared);
             self.validate(surface, view)?;
-            return Ok(Advance::Pending(self)); // 同一个原context只完成过一次；每轮至多处理一个子区Native请求。
+            return Ok(Advance::Pending(self)); // The original context completed once; process at most one subregion Native request in each turn.
         }
         let current = || self.current(surface, view);
-        // 这里只借原活帧的不可变图片作精确内容比较；宽度改变不继承其位置、Scene 或输入票。
+        // Borrow immutable images from the live frame for exact content comparison only; changed width
+        // inherits no position, Scene, or input ticket.
         let prior = surface.reusable_frame(view, &self.reusable, &current);
-        self.validate(surface, view)?; // 旧Native关系出错仍拒绝，不能被像素优化洗成cache miss。
+        self.validate(surface, view)?; // Reject broken old Native relationships instead of turning their failure into an optimization cache miss.
         let prior = prior?;
         let certificates = self.staging.certificates.each_ref().map(Option::as_ref);
         let sealed =
             self.bitmap
                 .finish_encoding(prepared, &certificates[..count], prior.as_deref());
-        drop(prior); // 两图的逐byte比较结束就归还旧帧，不跨主队列或发布事务。
+        drop(prior); // Release the prior frame immediately after byte comparison, before another main-queue turn or publication transaction.
         self.staging.certificates = Default::default();
         self.staging.next_region = 0;
         self.validate(surface, view)?;
         sealed?;
         if self.bitmap.next_tile().is_some() {
-            Ok(Advance::Pending(self)) // 所有tile完成前仍不展示部分候选。
+            Ok(Advance::Pending(self)) // Keep the candidate unpublished until every tile completes.
         } else {
             self.validate(surface, view)?;
             if surface.pixels.observer().snapshot().release_failed {
@@ -344,6 +361,7 @@ impl Candidate {
         }
     }
 }
+// Accumulate actual work with checked arithmetic so overflow cannot manufacture a completion receipt.
 fn add(
     a: NativeMarkdownPagedScenePaintWork,
     b: NativeMarkdownPagedScenePaintWork,

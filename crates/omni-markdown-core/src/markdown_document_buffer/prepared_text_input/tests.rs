@@ -618,7 +618,7 @@ fn pending_input_blocks_save_and_save_as_before_any_disk_or_saved_baseline_mutat
     // 保存回归使用独立vault；普通保存已有dirty草稿，保证未被“clean快速返回”掩盖。
     let directory = tempdir().unwrap();
     let root = directory.path().join("vault");
-    let workspace = crate::MarkdownWorkspace::new(root.clone(), directory.path().join("data"));
+    let workspace = crate::MarkdownWorkspace::new(root.clone());
     let access = workspace.open_session().unwrap();
     std::fs::write(root.join("Note.md"), "before").unwrap();
     std::fs::write(root.join("Draft.md"), "旧目标").unwrap();

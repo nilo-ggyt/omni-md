@@ -1,4 +1,4 @@
-//! 字符读取与scene身份共享同一Body/Cell目标；cell局部UTF16不能借原Doc弱引用进入正文消费者。
+//! Character reads and Scene identity share one Body/Cell target; cell-local UTF-16 cannot enter Body consumers through the canonical document identity.
 
 use super::cell::{CellPermit, NativeMarkdownPagedCellSession};
 use super::*;
@@ -25,12 +25,14 @@ enum Domain {
 }
 
 #[derive(Clone)]
-/// 只有Input能捕获的不透明目标域；相同Doc内不同cell/root不能通过全局坐标或相同版本互换。
+/// An opaque domain captured only by Input: cells/roots in one document are not interchangeable through equal coordinates or versions.
 pub struct NativeMarkdownPagedTargetDomain(Domain);
 
 impl NativeMarkdownPagedTargetDomain {
     #[must_use]
     pub fn same(&self, other: &Self) -> bool {
+        // Body identity is its original allocation. Cell additionally binds the
+        // draft Source and captured alignment, which equal local offsets omit.
         match (&self.0, &other.0) {
             (Domain::Body(a), Domain::Body(b)) => Weak::ptr_eq(a, b),
             (
@@ -45,7 +47,7 @@ impl NativeMarkdownPagedTargetDomain {
                     alignment: right,
                 },
             ) => Weak::ptr_eq(a, b) && x == y && left == right,
-            _ => false, // Body与Cell从不共享位置域，不能比较原Doc指针后继续解释局部range。
+            _ => false, // Body and Cell never share coordinates; equal document identity cannot authorize a local range.
         }
     }
 
@@ -54,7 +56,7 @@ impl NativeMarkdownPagedTargetDomain {
         matches!(&self.0, Domain::Body(original) if Weak::ptr_eq(original, document))
     }
 
-    /// 活动格的真实列方向属于已捕获 session/source；正文没有表列方向，不改变原段落设置。
+    /// The captured Cell session/Source owns its column alignment; Body has no column alignment and retains paragraph settings.
     #[must_use]
     pub fn cell_alignment(&self) -> Option<omni_markdown_core::MarkdownTableAlignment> {
         match &self.0 {
@@ -63,12 +65,14 @@ impl NativeMarkdownPagedTargetDomain {
         }
     }
 
-    /// 此门只核原capture类别与弱内容身份；Body的具体Doc/capture仍由原producer和SceneKey核对。
+    /// Check original capture kind and weak content identity here; the Body producer and SceneKey still verify the exact document/capture.
     ///
     /// # Errors
-    /// 源已失败或目标域不符时拒绝，不从公开range/Doc代次给新source补票。
+    /// Reject failed Source or a mismatched target domain; public ranges/generations cannot authorize a new Source.
     pub fn require_source(&self, source: &MarkdownLayoutTextSource) -> Result<()> {
-        source.byte_offset_for_utf16(0)?; // public有限端点门同样保原Source首错，不另借正文或造Source票。
+        source.byte_offset_for_utf16(0)?; // The bounded public endpoint check preserves the Source first error without borrowing another Body or creating authority.
+        // Read-only table-cell Source is a third domain, not a canonical Body or
+        // active draft; neither input target can borrow its local coordinates.
         let accepted = match &self.0 {
             Domain::Body(_) => source.domain() == MarkdownLayoutTextSourceDomain::Canonical,
             Domain::Cell {
@@ -93,7 +97,7 @@ impl InputTarget {
     pub(super) fn body_document(&self) -> Weak<RefCell<MarkdownDocumentBuffer>> {
         match self {
             Self::Body(document) => document.clone(),
-            Self::Cell { .. } => Weak::new(), // 旧Body专用Find/Source消费者明确失败，绝不拿局部range改canonical。
+            Self::Cell { .. } => Weak::new(), // Body-only Find/Source consumers fail explicitly rather than apply a local range to canonical text.
         }
     }
 
@@ -115,6 +119,8 @@ impl InputTarget {
         let domain = match self {
             Self::Body(document) => Domain::Body(document.clone()),
             Self::Cell { session, serial } => {
+                // Keep the original serial check: capturing a new Source after an
+                // external draft mutation cannot renew this Input's target domain.
                 let original = session
                     .upgrade()
                     .ok_or(NativeMarkdownPagedInputError::Closed)?;
@@ -134,10 +140,10 @@ impl InputTarget {
 }
 
 impl NativeMarkdownPagedInput {
-    /// 只捕获原输入票所属的布局源；Cell沿原草稿工厂，正文沿原Doc冻结，不复制文字或另建草稿。
+    /// Capture layout Source only for this input permit: use the original Cell factory or canonical document capture without copying text or creating a draft.
     ///
     /// # Errors
-    /// 原票、目标域、内容版本或Source失效时归还本次capture；原映射首错优先于前台撤权。
+    /// Release this capture if original permit/domain/content/Source is invalid; an original mapping failure precedes foreground revocation.
     pub fn capture_layout_source(
         &self,
         permit: &NativeMarkdownPagedInputPermit,
@@ -146,7 +152,7 @@ impl NativeMarkdownPagedInput {
         self.check_permit(permit, current)?;
         let domain = self.target.domain()?;
         let source = if let Some(cell) = &permit.cell {
-            cell.session()?.capture_source()? // 原token签发局部Source，不能从canonical范围补Cell身份。
+            cell.session()?.capture_source()? // The original token authorizes local Source; canonical coordinates cannot manufacture Cell identity.
         } else {
             let original = self
                 .document_identity()
@@ -159,7 +165,7 @@ impl NativeMarkdownPagedInput {
         };
         domain.require_source(&source)?;
         let checked = self.check_permit(permit, current);
-        domain.require_source(&source)?; // current可重入修改Cell；旧Source真实健康不得被一般Revoked遮住。
+        domain.require_source(&source)?; // current may reenter and change Cell; check the old Source health before returning generic revocation.
         checked?;
         if !self.target.domain()?.same(&domain) {
             return Err(NativeMarkdownPagedInputError::StateChanged);
@@ -171,10 +177,10 @@ impl NativeMarkdownPagedInput {
     pub fn is_cell(&self) -> bool {
         matches!(self.target, InputTarget::Cell { .. })
     }
-    /// 同一许可最多读取4096 UTF16单元，允许半代理项；Native字符串调用者另核标量端点。
+    /// Read at most 4096 UTF-16 code units under one permit, including partial surrogate pairs; Native string callers separately validate scalar endpoints.
     ///
     /// # Errors
-    /// Source、原目标或serial失效时丢弃整次候选；Cell不新增冻结root或布局reader。
+    /// Discard the candidate when original Source/target/serial is invalid; Cell acquires no extra frozen root or layout reader.
     pub fn copy_utf16_code_units(
         &self,
         permit: &NativeMarkdownPagedInputPermit,
@@ -200,13 +206,15 @@ impl NativeMarkdownPagedInput {
                 .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
             document.copy_utf16_code_units(offset, destination)?;
         }
+        // Returned units are a candidate until original authority survives the
+        // read. Callers discard the entire bounded destination on rejection.
         self.check_permit(permit, current)
     }
 
-    /// 原目标自己的局部/全局范围验证；不把Cell范围套到Doc字节树上。
+    /// Validate in the original target's local/global domain; never apply Cell coordinates to the canonical byte tree.
     ///
     /// # Errors
-    /// Source首错、原权限撤销、越界或切入代理项时拒绝，零范围和EOF也真实核健康。
+    /// Reject Source failure, revocation, bounds errors, or split scalars; even empty ranges and EOF check actual Source health.
     pub fn validate_utf16_range(
         &self,
         permit: &NativeMarkdownPagedInputPermit,

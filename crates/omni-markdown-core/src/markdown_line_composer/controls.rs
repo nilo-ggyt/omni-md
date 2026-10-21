@@ -1,11 +1,13 @@
-//! 非字形控制的真实样式响应；换段不改源字节，Tab不以固定空格数代替制表停靠。
+//! Bind actual style responses for nonglyph controls. Paragraph changes preserve
+//! source bytes, and tabs use real stops rather than a fixed number of spaces.
 use super::{MarkdownLineComposeError as Error, MarkdownLineRegisteredFont, item::Result};
 use crate::MarkdownLayoutTextAuthority;
 mod validated;
 use std::{ops::Range, sync::Arc};
 pub(super) use validated::ValidatedControl;
 
-/// 平台从原段落样式捕获的对齐；非Left需要实际后继宽度/terminator后才可完成。
+/// Alignment captured from the original platform paragraph style. Nonleft
+/// alignment needs actual following-content width/terminators before completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownLineTabAlignment {
     Left,
@@ -14,18 +16,22 @@ pub enum MarkdownLineTabAlignment {
     Decimal,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// One actual tab stop in signed 26.6 layout coordinates, with its captured alignment.
 pub struct MarkdownLineTabStop {
     pub location_26_6: i64,
     pub alignment: MarkdownLineTabAlignment,
 }
 
-/// 候选样式的有界元数据；None明确表示尚未取得系统默认间隔，不隐式猜28点或8空格。
+/// Bounded paragraph metadata. None explicitly means the system's default
+/// interval is not yet known, without guessing 28 points or eight spaces.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownLineParagraphStyle {
     pub tab_stops: Vec<MarkdownLineTabStop>,
     pub default_tab_interval_26_6: Option<i64>,
 }
 impl MarkdownLineParagraphStyle {
+    /// Admit only bounded, ordered nonnegative stop metadata; never truncate the
+    /// platform's actual stops or turn malformed style into a default layout.
     pub(super) fn require(&self) -> Result<()> {
         if self.tab_stops.len() > 64
             || self
@@ -37,14 +43,22 @@ impl MarkdownLineParagraphStyle {
                 .windows(2)
                 .any(|pair| pair[0].location_26_6 >= pair[1].location_26_6)
         {
+            // Reject invalid metadata before tab lookahead or arithmetic can
+            // turn it into a partially accepted line geometry.
             return Err(Error::InvalidRequest);
-        } // 超出候选元数据预算明确失败，不截断真实stop数组，也不冒称功能完备。
+        }
         Ok(())
     }
+    /// Resolve the next actual stop, or request the missing interval/lookahead
+    /// needed to preserve the paragraph's real alignment policy.
     pub(super) fn tab(&self, pen: i64) -> Result<MarkdownLineTabPlacement> {
         self.require()?;
         if let Some(stop) = self.tab_stops.iter().find(|stop| stop.location_26_6 > pen) {
+            // A declared stop strictly ahead of the current pen has priority
+            // over any implicit default grid.
             if stop.alignment != MarkdownLineTabAlignment::Left {
+                // Right/center/decimal geometry is incomplete until following
+                // content has been measured; this is an explicit pending result.
                 return Ok(MarkdownLineTabPlacement::NeedsLookahead {
                     pen_26_6: pen,
                     stop: *stop,
@@ -55,12 +69,16 @@ impl MarkdownLineParagraphStyle {
             });
         }
         let Some(interval) = self.default_tab_interval_26_6 else {
+            // Unknown platform defaults remain pending rather than guessed spacing.
             return Ok(MarkdownLineTabPlacement::NeedsDefaultInterval);
         };
         if interval == 0 {
+            // A known zero interval advances no further after explicit stops;
+            // it never moves a pen already beyond the last stop backward.
             return Ok(MarkdownLineTabPlacement::Left { advance_26_6: 0 });
         }
-        // 真实Cocoa对照：隐式网格以最后一个显式stop为原点，不是以全文x=0的倍数。
+        // Actual Cocoa comparison anchors the implicit grid at the last explicit
+        // stop, rather than at document x=0; retain signed checked 26.6 arithmetic.
         let anchor = self.tab_stops.last().map_or(0, |stop| stop.location_26_6);
         let distance = pen.checked_sub(anchor).ok_or(Error::Overflow)?;
         let target = distance
@@ -75,7 +93,8 @@ impl MarkdownLineParagraphStyle {
     }
 }
 
-/// 未得right/center/decimal真实后继前仍是待决；该值不代表源范围或绘制权限。
+/// Right/center/decimal alignment remains pending until real lookahead exists;
+/// this geometry result grants neither source-range nor drawing authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownLineTabPlacement {
     Left {
@@ -88,18 +107,22 @@ pub enum MarkdownLineTabPlacement {
     NeedsDefaultInterval,
 }
 
-/// 非字形part仍保留实际Source/Font/GCB；Native跳过画glyph不能跳过几何和选择。
+/// Nonglyph parts still retain actual Source/font/grapheme facts. Skipping ink
+/// does not permit native consumers to skip geometry or selection semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownComposedLinePartKind {
     Glyphs,
     Tab,
     ParagraphBreak,
-    /// 原折叠控制覆盖的 canonical 隐区；没有内部可见 glyph 或可命中的 caret。
+    /// The canonical hidden interval covered by an original fold control has
+    /// no internal visible glyphs or hittable caret positions.
     FoldedSection,
-    /// 已按最终列宽完成真实格排版的表格块行，不包含正文 glyph。
+    /// A table block row with actual cell layout at final column widths,
+    /// without body glyph output at this outer block level.
     TableRow,
 }
 impl MarkdownComposedLinePartKind {
+    /// Encode the declared part kind in the same private immutable output format.
     pub(super) fn code(self) -> u8 {
         match self {
             Self::Glyphs => 0,
@@ -109,6 +132,7 @@ impl MarkdownComposedLinePartKind {
             Self::TableRow => 4,
         }
     }
+    /// Reject unknown stored kinds instead of guessing glyph geometry for them.
     pub(super) fn decode(code: u8) -> Result<Self> {
         match code {
             0 => Ok(Self::Glyphs),
@@ -121,7 +145,8 @@ impl MarkdownComposedLinePartKind {
     }
 }
 
-/// 响应只持一个实际注册Font和有限段落样式；不捕获Native对象、文档、历史或第二正文。
+/// Retain one actually registered font and bounded paragraph style, never native
+/// objects, a document/history owner, or a second content representation.
 pub struct MarkdownLineControlResponse {
     pub(super) request: super::MarkdownLineInlineControl,
     pub(super) registered: MarkdownLineRegisteredFont,
@@ -131,13 +156,15 @@ pub struct MarkdownLineControlResponse {
     pub(super) paragraph_inset_26_6: i32,
 }
 impl MarkdownLineControlResponse {
-    /// 原控制范围也消费同一来源语义；换行不画墨迹，但其字体和段落不得把隐藏围栏重新撑高。
+    /// Apply the same source semantics to controls. A break paints no ink, but
+    /// its font/paragraph geometry must not restore height for a hidden fence marker.
     pub fn with_presentation(
         mut self,
         styles: crate::MarkdownPresentationStyles,
         inset_26_6: i32,
     ) -> Result<Self> {
         if inset_26_6 < 0 {
+            // Negative inset cannot become a valid later available-width calculation.
             return Err(Error::InvalidRequest);
         }
         self.presentation = styles;
@@ -146,7 +173,8 @@ impl MarkdownLineControlResponse {
     }
 }
 impl super::MarkdownLineInlineControl {
-    /// 原控制nonce和源票随响应一起归还；公开事实的改写不能替代实际仍待处理的请求。
+    /// Return the original control nonce and source ticket with the response;
+    /// editing public facts cannot substitute for the actual outstanding request.
     pub fn respond(
         self,
         registered: &MarkdownLineRegisteredFont,
@@ -155,6 +183,7 @@ impl super::MarkdownLineInlineControl {
     ) -> Result<MarkdownLineControlResponse> {
         paragraph.require()?;
         if !points.is_finite() || points <= 0.0 {
+            // Invalid point sizes cannot produce a usable control's font geometry.
             return Err(Error::InvalidRequest);
         }
         registered.registration().lease()?;
@@ -167,9 +196,11 @@ impl super::MarkdownLineInlineControl {
             paragraph_inset_26_6: 0,
         })
     }
+    /// Borrow the original weak Source authority, without recapturing current text.
     pub fn source(&self) -> &MarkdownLayoutTextAuthority {
         &self.source
     }
+    /// Bind one private request nonce to its actual source interval and control role.
     pub(super) fn new(
         source: MarkdownLayoutTextAuthority,
         range: Range<usize>,
@@ -182,6 +213,8 @@ impl super::MarkdownLineInlineControl {
             nonce: Arc::new(()),
         }
     }
+    /// Require the original nonce, source, range, and role together; identical
+    /// coordinates from a newer control cannot authorize this response.
     pub(super) fn accepts(&self, response: &MarkdownLineControlResponse) -> bool {
         Arc::ptr_eq(&self.nonce, &response.request.nonce)
             && self.source == response.request.source

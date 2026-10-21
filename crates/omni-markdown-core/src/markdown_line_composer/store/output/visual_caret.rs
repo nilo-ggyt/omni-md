@@ -39,7 +39,8 @@ pub enum MarkdownComposedVisualGraphemeAnswer {
     },
 }
 
-/// 外部 caret 必须是真 GCB；整行内部进入真实视觉 part 时，还可跳过其非 GCB 整形端点。
+/// External carets require an actual GCB. Entering an authenticated visual part
+/// from the whole-line query may also skip a shaping endpoint inside a GCB.
 #[derive(Clone, Copy)]
 enum GraphemeQueryStart {
     Caret,
@@ -104,8 +105,10 @@ impl MarkdownComposedLines {
                 part.facts.kind == crate::MarkdownComposedLinePartKind::FoldedSection;
             if folded_section && utf16 != range.start && utf16 != range.end {
                 return Err(Error::InvalidRequest);
-            } // 折叠控制只有两个可见端点；原 Source 的内部 GCB 不授予隐藏 caret。
+            } // Fold controls expose only two endpoints; hidden Source GCBs grant no caret authority.
             let logical_forward = match part.facts.direction {
+                // Convert the requested visual side using this actual part's
+                // original resolved direction, not a guessed paragraph direction.
                 MarkdownShapingDirection::LeftToRight => right,
                 MarkdownShapingDirection::RightToLeft => !right,
                 _ => return Err(Error::InconsistentCoverage),
@@ -183,8 +186,9 @@ impl MarkdownComposedLines {
                     if let GraphemeQueryStart::PartEntry { inclusive } = query.start
                         && (inclusive || exact.is_none())
                     {
-                        // lower_bound 给出真实后继 GCB；向左进入 RTL/LTR part 时按其逻辑方向取前驱。
-                        // 不把内部标量 seam 冒充起点，也不把后继边界搬进当前 part。
+                        // lower_bound supplies the real successor. Entering an
+                        // RTL/LTR part toward logical start selects its predecessor
+                        // instead; an internal scalar seam is never a caret.
                         let ordinal = if query.logical_forward || exact.is_some() {
                             ordinal
                         } else {
@@ -198,7 +202,7 @@ impl MarkdownComposedLines {
                     #[cfg(feature = "paged-shaping-frontier")]
                     {
                         query.origin = Some((ordinal, boundary));
-                    } // 只记录原目录实际交付的双坐标；最终 caret 在 Bidi 边界可能改到另一等价侧。
+                    } // Keep only the directory's actual byte/UTF-16 pair; Bidi may choose an equivalent caret side.
                     let edge = if query.logical_forward {
                         query.range.end
                     } else {
@@ -209,7 +213,9 @@ impl MarkdownComposedLines {
                         break;
                     }
                     if query.folded_section {
-                        // 仍查询同一输出的真实端点 GCB；不能把整个隐区当一个普通字符后取内部 ordinal。
+                        // Query this same output's real endpoint GCB. A whole
+                        // hidden range is not one ordinary character whose
+                        // internal ordinal would authorize another caret.
                         query.search = graphemes::BoundarySearch::offset(edge);
                     } else {
                         let ordinal = if query.logical_forward {
@@ -229,8 +235,9 @@ impl MarkdownComposedLines {
                     query.neighbor = Some((ordinal, boundary));
                 }
                 if next < query.range.start || next > query.range.end {
-                    // 真实 GCB 可以跨两个 UBA/字体 part；本 part 无权签跨域 caret，
-                    // 由原整行查询继续寻找邻接 part。内部 seam 绝不变成可编辑的位置。
+                    // A real GCB may span UBA/font parts. This part cannot issue
+                    // a cross-domain caret; the original whole-line query finds
+                    // its neighbor, preserving the noneditable internal seam.
                     query.answer = Some(MarkdownComposedVisualGraphemeAnswer::Edge);
                     break;
                 }
@@ -245,6 +252,8 @@ impl MarkdownComposedLines {
                         && ((query.logical_forward && next <= query.utf16)
                             || (!query.logical_forward && next >= query.utf16)))
                 {
+                    // Fold traversal must reach its exact opposite endpoint;
+                    // ordinary carets must advance strictly in logical direction.
                     return Err(Error::InconsistentCoverage);
                 }
                 query.answer = Some(MarkdownComposedVisualGraphemeAnswer::Found {
@@ -254,13 +263,19 @@ impl MarkdownComposedLines {
                         association: if matches!(query.start, GraphemeQueryStart::PartEntry { .. })
                             && next == query.range.start
                         {
+                            // Entering at logical start associates with this
+                            // part's following grapheme, regardless of bidi level.
                             MarkdownComposedCaretAssociation::After
                         } else if matches!(query.start, GraphemeQueryStart::PartEntry { .. })
                             && next == query.range.end
                             || query.logical_forward
                         {
+                            // Logical end/forward movement retains the side of
+                            // the preceding actual grapheme at the destination.
                             MarkdownComposedCaretAssociation::Before
                         } else {
+                            // Reverse movement retains the following grapheme's
+                            // side; the whole-line layer handles adjacent parts.
                             MarkdownComposedCaretAssociation::After
                         },
                     },

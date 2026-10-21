@@ -17,7 +17,7 @@ impl Fixture {
         let external = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("Note.md"), "note").unwrap();
         std::fs::write(external.path().join("asset.png"), "synthetic asset").unwrap();
-        let access = MarkdownWorkspace::with_root(root.path().to_owned())
+        let access = MarkdownWorkspace::new(root.path().to_owned())
             .open_session()
             .unwrap();
         Self {

@@ -1,4 +1,5 @@
-//! 把原NeedStyle的封闭字素票接入同一字体级联；不另建或接收GCB/Script索引。
+//! Bind the original NeedStyle's sealed grapheme ticket to the same font cascade,
+//! without constructing or accepting another grapheme/script index.
 
 use objc2_core_foundation::{CFRange, CFString};
 use omni_markdown_core::{
@@ -9,7 +10,7 @@ use omni_markdown_core::{
 
 use super::*;
 
-/// Native只给原样式和字体资源预算；方向、脚本、原范围及BOT/EOT全部由Core原票生成。
+/// Native supplies original style and font budgets only; Core's original ticket provides direction, script, source range and BOT/EOT.
 pub struct NativeMarkdownProbedFontFallbackRequest {
     pub style: MarkdownLineComposeStyle,
     pub languages: &'static [&'static str],
@@ -17,23 +18,25 @@ pub struct NativeMarkdownProbedFontFallbackRequest {
     pub maximum_font_bytes: u64,
 }
 
+/// Preserve original Source/Shaping categories while adapting only actual Composer-specific failures.
 pub(super) fn error(cause: MarkdownLineComposeError) -> NativeMarkdownFontFallbackError {
     match cause {
         MarkdownLineComposeError::Source(cause) => NativeMarkdownFontFallbackError::Source(cause),
-        // 原 probe 只转交同一个 Shaping Job；保留原取消与存储错误类型，
-        // 不能让新增的坐标认证入口把真实资源退休错误包成另一种普通 Compose 失败。
+        // The original probe delegates to the same Shaping Job. Preserve cancellation
+        // and storage types instead of disguising resource-retirement failure as ordinary Compose failure.
         MarkdownLineComposeError::Shaping(cause) => NativeMarkdownFontFallbackError::Shaping(cause),
         other => NativeMarkdownFontFallbackError::Compose(other),
     }
 }
 
 impl NativeMarkdownFontFallback {
-    /// 消费当前原请求签出的一个真实GCB；构造不会分配第二套文字依赖或读取整个段落。
+    /// Consume one actual grapheme issued by the current original request, without allocating
+    /// another text dependency graph or reading a complete paragraph during construction.
     ///
-    /// 此字体结果仍只授权原GCB，不能把首字的无缺字结论推广到后继文字或完整run。
+    /// Coverage still authorizes this grapheme only; the first one's success proves no following text or complete run.
     ///
     /// # Errors
-    /// 原scope、Source或样式无效时拒绝；所有Native字体来源继续经过原捕获/往返校验。
+    /// Reject invalid original scope, Source or style; every native font still uses original capture/round-trip verification.
     pub fn new_with_probe(
         probe: MarkdownLineFontProbe,
         base: &NativeMarkdownPagedFont,
@@ -49,8 +52,9 @@ impl NativeMarkdownFontFallback {
         if !base.accepts_shaping_size(options.points) {
             return Err(NativeMarkdownFontFallbackError::InvalidCluster);
         }
-        // 原 probe 已经核准同一个完整 GCB 的 UTF16 与字节端点；不能再经过普通 new 的远端坐标转换。
-        // 样式预算由上面的原 shaping_options 校验，原 backing 与取消仍由同一个 owner/guard 负责。
+        // The original probe already certified this complete grapheme's UTF-16 and byte
+        // endpoints. Do not repeat remote coordinate conversion through ordinary new;
+        // shaping_options owns style validation and the same owner/guard owns backing/cancellation.
         let owner = Self {
             authority: source.authority(),
             backing: source.original_backing_observer(),
@@ -80,7 +84,8 @@ impl NativeMarkdownFontFallback {
         Ok(owner)
     }
 
-    /// 原 Base 真缺字后才读取首 scalar；它仅选择候选，完整覆盖仍由同一 worker 实排原 GCB。
+    /// Read the first scalar only after actual Base coverage failure. It selects a candidate;
+    /// the same worker still shapes the original complete grapheme to prove coverage.
     pub(super) fn for_string_font(
         &mut self,
         base: &NativeMarkdownPagedFont,
@@ -98,12 +103,14 @@ impl NativeMarkdownFontFallback {
             .probe_source_bytes
             .checked_add(read)
             .ok_or(NativeMarkdownFontFallbackError::Overflow)?;
-        let scalar = scalar.map_err(error)?; // 即使原票在读取后撤销，已发生的字节量也留待 Producer 领取。
+        // Producer still consumes actual read accounting if the original ticket was revoked after the read.
+        let scalar = scalar.map_err(error)?;
         self.guard(base, authority, current)?;
         let mut bytes = [0_u8; 4];
         let string = CFString::from_str(scalar.encode_utf8(&mut bytes));
         self.guard(base, authority, current)?;
-        // SAFETY: string 只含一个完整原 scalar，公开范围至多两个 UTF16；原 base 与本次票贯穿调用。
+        // SAFETY: string contains one complete original scalar, at most two UTF-16
+        // units. The original base and ticket stay valid across this synchronous call.
         let native = unsafe {
             base.native_font()
                 .for_string(&string, CFRange::new(0, scalar.len_utf16() as _))
@@ -119,18 +126,20 @@ impl NativeMarkdownFontFallback {
             self.mtm,
             &valid,
         );
-        self.guard(base, authority, current)?; // 真实原 Source errno 优先于字体捕获或回调失权。
+        // Actual original Source errno takes precedence over capture failure or callback revocation.
+        self.guard(base, authority, current)?;
         drop(native);
         self.guard(base, authority, current)?;
         captured.map_err(NativeMarkdownFontFallbackError::ForStringCapture)
     }
 
-    /// 只领取这个原 owner 已发生的有限读取；调用方必须先记账，再消费成功、不可捕获或失败结果。
+    /// Take only this original owner's actual bounded reads; callers account for them before consuming success, unavailable capture or failure.
     pub(in crate::native_surface) fn take_probe_source_bytes(&mut self) -> usize {
         std::mem::take(&mut self.probe_source_bytes)
     }
 
-    /// 同一原票推进一个 Native 候选；palette 只供精确同候选复用，纯 Core 试次仍由原 worker 完成。
+    /// Advance one native candidate under the same original ticket. Palette reuse requires exact candidate identity;
+    /// the original worker still performs the pure Core trial.
     pub fn next_trial_probed(
         &mut self,
         base: &NativeMarkdownPagedFont,
@@ -142,7 +151,7 @@ impl NativeMarkdownFontFallback {
         self.finish_probed(result)
     }
 
-    /// 只消费已真实归还的本段结果；None 表示同候选仍须推进后继段，绝不是 Selected。
+    /// Consume only an actually released segment result; None means this candidate still has another segment, never Selected.
     pub fn complete_trial_probed(
         &mut self,
         base: &NativeMarkdownPagedFont,
@@ -154,8 +163,9 @@ impl NativeMarkdownFontFallback {
         self.finish_probed(result)
     }
 
-    /// 缺字候选的真实 Job 与捕获已归还后，才把原协调器恢复到同一个外 GCB 起点。
-    /// 下一字体必须重试此前成功的段，不能从失败段续接而漏掉候选的完整覆盖。
+    /// Restore the original Composer to the same outer-grapheme start only after the
+    /// missing-glyph candidate's Job/capture have returned. The next font retries earlier
+    /// successful segments too, rather than resuming at the failure and skipping full coverage.
     pub(in crate::native_surface) fn restart_probe(
         &mut self,
         composer: &mut MarkdownLineComposer,
@@ -176,8 +186,9 @@ impl NativeMarkdownFontFallback {
         self.finish_probed(result)
     }
 
-    /// 每次只推进原协调器的一个元数据量子；返回真实 Step 后再交成功/失败，后验撤权也不漏记工作。
-    /// 中间 Ready 只授权同候选的下一 Job；Complete 才允许消费此前全部段的真实无缺字事实。
+    /// Advance one original Composer metadata quantum and return its actual Step even
+    /// when later authority fails. Intermediate Ready authorizes the same candidate's next
+    /// Job; only Complete permits consuming all segments' actual coverage facts.
     pub(in crate::native_surface) fn step_probe_segment(
         &mut self,
         composer: &mut MarkdownLineComposer,
@@ -213,13 +224,16 @@ impl NativeMarkdownFontFallback {
                 .is_some_and(|active| active.phase == ProbeTrialPhase::NextSegment)
                 || !probe.shaping_segment_ready().map_err(error)?;
             if !advance {
-                return Ok(None); // 首个普通段或已经交付的下一段保原快路径，不重复构造 options 或探下一段。
+                // The initial ordinary or already-delivered next segment keeps its original
+                // fast path, without rebuilding options or probing another segment.
+                return Ok(None);
             }
             let actual = composer
                 .step_font_probe_segment(probe, budget)
                 .map_err(error)?;
             let answer = actual.answer;
-            step = Some(actual); // Native/current 的后验可能失败；已经发生的原工作仍交调用者计费。
+            // Later Native/current validation may fail; actual work already performed still belongs in caller accounting.
+            step = Some(actual);
             self.guard(base, authority, current)?;
             match answer {
                 MarkdownLineFontProbeSegmentAnswer::Pending => Ok(None),
@@ -250,7 +264,8 @@ impl NativeMarkdownFontFallback {
                 }
             }
         })();
-        // final Choice 会转走捕获；只有失败才核原 capture 的实际释放，不把中间成功误当退休。
+        // Final Choice transfers capture ownership. Check actual capture release only
+        // on failure, without misclassifying intermediate success as retirement.
         let result = self.finish_probed(result);
         let result = match (result, bytes) {
             (Err(cause), Some(bytes))
@@ -271,7 +286,7 @@ impl NativeMarkdownFontFallback {
         (step, result)
     }
 
-    /// 只读取原协调器的当前事实；Pending 不构造 packet，也不切换候选。
+    /// Read original Composer facts only; Pending constructs no packet and switches no candidate.
     pub(in crate::native_surface) fn probe_segment_ready(&self) -> Result<bool> {
         self.probe
             .as_ref()
@@ -280,7 +295,8 @@ impl NativeMarkdownFontFallback {
             .map_err(error)
     }
 
-    /// 同一候选的前一段已真实归还；这里只给下一段换唯一 packet 身份，不重捕字体或增加候选计数。
+    /// The same candidate's previous segment actually returned. Assign the next segment a
+    /// unique packet identity without recapturing its font or increasing candidate count.
     pub(super) fn continue_trial(
         &mut self,
         base: &NativeMarkdownPagedFont,
@@ -318,8 +334,9 @@ impl NativeMarkdownFontFallback {
         Ok(NativeMarkdownFontFallbackStep::Trial(Box::new(trial)))
     }
 
+    /// Retire this original candidate owner on failure while preserving its complete typed cause chain.
     fn finish_probed<T>(&mut self, result: Result<T>) -> Result<T> {
-        // 同一失败仍撤原试次/级联/Source，但已有Source与shaper双错链必须跨此wrapper保留。
+        // Ending trial/cascade/Source ownership cannot flatten an existing combined Source/shaper error.
         result.map_err(|cause| self.stop_preserving_error(cause))
     }
 }

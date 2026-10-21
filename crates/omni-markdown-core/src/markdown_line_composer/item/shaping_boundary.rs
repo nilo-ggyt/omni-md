@@ -1,10 +1,12 @@
-//! 原 UBA 标量级自然整形分界；它与编辑/断行 GCB 是两种不同事实。
+//! Preserve actual scalar-level bidi shaping seams separately from grapheme
+//! boundaries used by editing and line breaking.
 
 use super::*;
 use crate::markdown_bidi::MarkdownBidiShapingUnit;
 
-/// 只有同一原 Bidi owner 实际读到的相邻记录可构造；公开范围不能补成此票。
-/// 不保 Bidi、Source 或新目录强边，原 Source authority 与请求 nonce 继续负责后继准入。
+/// Construct only from adjacent records actually read by the same bidi owner,
+/// never public coordinate ranges. Retain no strong bidi/Source/directory edge;
+/// original Source authority and request nonce still govern later admission.
 #[derive(Clone)]
 pub(crate) struct ResolvedBidiShapingSeam {
     source: MarkdownLayoutTextAuthority,
@@ -15,7 +17,8 @@ pub(crate) struct ResolvedBidiShapingSeam {
 }
 
 impl ResolvedBidiShapingSeam {
-    /// 原扫描只能在确实相邻、不同 level 的真实标量头封口；低代理项永远没有此能力。
+    /// Seal only adjacent actual scalar heads with different resolved levels;
+    /// a low surrogate never has this independent shaping-seam authority.
     pub(super) fn from_adjacent_units(
         source: &MarkdownLayoutTextAuthority,
         left: &MarkdownBidiShapingUnit,
@@ -23,6 +26,8 @@ impl ResolvedBidiShapingSeam {
     ) -> Result<Self> {
         if !left.permits(source) || !right.permits(source) || !left.precedes_different_level(right)
         {
+            // Neither foreign records nor nonadjacent/equal-level units prove
+            // the original natural bidi shaping boundary.
             return Err(MarkdownLineComposeError::InconsistentCoverage);
         }
         Ok(Self {
@@ -34,22 +39,26 @@ impl ResolvedBidiShapingSeam {
         })
     }
 
-    /// 返回原 byte/UTF16 两套标量坐标；这仍不是字素边界，不能用它签 caret 或 LineEnd。
+    /// Return original byte/UTF-16 scalar coordinates. This is still not a
+    /// grapheme certificate and cannot authorize a caret or line-end boundary.
     pub(crate) fn boundary(&self, source: &MarkdownLayoutTextAuthority) -> Result<(usize, usize)> {
         if &self.source != source {
+            // Equal integer coordinates cannot transfer this seam to another source.
             return Err(MarkdownLineComposeError::SourceMismatch);
         }
         Ok((self.byte, self.utf16))
     }
 
-    /// 保留真实两侧 UBA level；消费方不得通过合并同奇偶方向来改写原视觉顺序。
+    /// Preserve both actual bidi levels; combining equal-parity directions must
+    /// not rewrite the original visual-order facts at this boundary.
     pub(crate) fn levels(&self) -> (u8, u8) {
         (self.left_level, self.right_level)
     }
 }
 
-/// 两种真实端点只共同授权本地 shaper 坐标，只有 Grapheme 分支还具有原编辑 GCB 事实。
-/// 保留额外 seam 是为了裁掉不同 level 的上下文，不能因它恰逢 GCB 就丢失 UBA 屏障。
+/// Both endpoint kinds authorize local shaping coordinates; only Grapheme also
+/// retains the original editing-boundary fact. An additional seam excludes
+/// different-level context even when it coincides with a grapheme boundary.
 #[cfg(feature = "paged-shaping-frontier")]
 pub(crate) enum CertifiedShapingEndpoint {
     Grapheme {
@@ -61,13 +70,16 @@ pub(crate) enum CertifiedShapingEndpoint {
 
 #[cfg(feature = "paged-shaping-frontier")]
 impl CertifiedShapingEndpoint {
-    /// 返回值只有坐标含义；必须继续携带原枚举，不能凭这个结构向 GCB 目录登记新记录。
+    /// Return coordinates only. Consumers must retain this original enum and
+    /// cannot register a new grapheme record from the returned coordinate structure.
     pub(crate) fn boundary(
         &self,
         source: &MarkdownLayoutTextAuthority,
     ) -> std::result::Result<crate::MarkdownGraphemeBoundary, MarkdownLayoutBreakError> {
         match self {
             Self::Grapheme { proof, seam } => {
+                // An attached bidi barrier must agree with the original grapheme
+                // endpoint in both coordinate spaces, not just its UTF-16 offset.
                 let point = proof.boundary(source)?;
                 if let Some(seam) = seam
                     && seam
@@ -80,6 +92,8 @@ impl CertifiedShapingEndpoint {
                 Ok(point)
             }
             Self::Bidi(seam) => {
+                // The shape API consumes this coordinate value without upgrading
+                // its bidi-only proof into a grapheme editing certificate.
                 let (byte, utf16) = seam
                     .boundary(source)
                     .map_err(|_| MarkdownLayoutBreakError::SourceMismatch)?;
@@ -88,8 +102,9 @@ impl CertifiedShapingEndpoint {
         }
     }
 
-    /// 每个端点必须真正属于原 Source；两端均由 GCB 签发时还须同一原 BreakJob scope。
-    /// Bidi seam 则由唯一 Style nonce/取消 scope 保有，不能要求它冒充另一个索引的 GCB 票。
+    /// Require both endpoints to belong to the original Source; two grapheme
+    /// proofs must also share their original break-job scope. Bidi seams remain
+    /// under the original style nonce/cancellation scope without impersonating a GCB ticket.
     pub(crate) fn require_pair(
         &self,
         other: &Self,
@@ -101,11 +116,14 @@ impl CertifiedShapingEndpoint {
             (self, other)
             && !left.same_scope(right)
         {
+            // Two independent grapheme jobs cannot combine equal coordinates
+            // into a certified pair belonging to either original job.
             return Err(MarkdownLayoutBreakError::SourceMismatch);
         }
         Ok(())
     }
 
+    /// Borrow the original bidi context barrier regardless of endpoint representation.
     pub(crate) fn seam(&self) -> Option<&ResolvedBidiShapingSeam> {
         match self {
             Self::Grapheme { seam, .. } => seam.as_ref(),
@@ -113,6 +131,7 @@ impl CertifiedShapingEndpoint {
         }
     }
 
+    /// Distinguish actual grapheme proof from bidi-only shaping coordinates.
     pub(crate) fn is_grapheme(&self) -> bool {
         matches!(self, Self::Grapheme { .. })
     }

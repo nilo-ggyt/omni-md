@@ -1129,17 +1129,6 @@ impl NativeMarkdownController {
         self.set_feedback_visible(true);
     }
 
-    /// 恢复的旧草稿缺少原保存基线，明确展示可用解决入口而不伪装成普通已保存笔记。
-    pub(super) fn present_pending_legacy_recovery(&self) {
-        self.present_error("恢复草稿待处理：请另存或重新载入");
-        if let Some(status_label) = self.ivars().status_label.get() {
-            // 固定提示解释原文件未覆盖；只有活动窗口持有这个界面说明。
-            status_label.setToolTip(Some(ns_string!(
-                "已恢复旧冲突草稿，原文件未被覆盖。请在“文档”菜单中选择“将草稿另存为新笔记”或“从磁盘重新载入”。"
-            )));
-        }
-    }
-
     /// Reflects actual cursor exhaustion without probing the filesystem from idle UI.
     pub(super) fn set_next_sidebar_page_available(&self, available: bool) {
         // The button is installed once and remains borrowed by its native target until close detaches it.

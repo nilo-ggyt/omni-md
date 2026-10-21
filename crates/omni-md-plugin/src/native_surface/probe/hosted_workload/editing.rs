@@ -450,7 +450,7 @@ impl HostedEditingProbe {
         let editor = surface.editor.as_ref().ok_or("恢复保存缺少原正文")?;
         let document = editor.document().borrow();
         if document.is_dirty()
-            || document.original_revision() != Some(self.original.revision)
+            || document.original_revision() != self.original.revision
             || document
                 .current_revision()
                 .map_err(|error| format!("无法读取原文档revision：{error}"))?

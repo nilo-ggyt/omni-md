@@ -1,23 +1,28 @@
-//! 固定短表的独立 Native 字形定位；先核原浮点排版，再逐字形转为公开 26.6 合同。
+//! Independent Native glyph positions for fixed short tables verify original floating layout before
+//! per-glyph conversion to public 26.6 coordinates.
 
 use super::*;
 use objc2_core_text::CTRunStatus;
 use objc2_foundation::{NSCharacterSet, NSNotFound, NSStringCompareOptions};
 use omni_markdown_core::MarkdownTableAlignment;
 
-/// 只保同一真实 run 的纯值；没有 Font、CTLine、Source 或候选字形的强引用。
+/// Retain pure facts from the same actual run, without font, CTLine, Source, or candidate-glyph
+/// ownership.
 pub(super) struct Glyph {
     cluster: usize,
     position: NSPoint,
-    // 同一次原 run 的 base advance 与相对 origin，不从画出的 glyph x 顺序反推。
+    // Use original run base advances and relative origins, without inferring them from painted glyph-X
+    // order.
     advance: NSSize,
     origin: NSPoint,
     run_origin: f64,
     run: usize,
 }
 
-/// 原 TextKit 行限定输入，CoreText 只交付同一属性来源的实际 glyph、位置与推进。
-/// 这些位置必须在下面重建原 TextKit GCB 框；另一条排版策略不能借量化获得通过。
+/// The actual TextKit line bounds input; Core Text supplies actual glyphs, positions, and advances from
+/// that same attributed Source.
+/// These positions must reconstruct original TextKit grapheme boxes below; quantization cannot excuse a
+/// different floating layout.
 pub(super) fn capture(
     line: &objc2_app_kit::NSTextLineFragment,
     element_start: usize,
@@ -35,12 +40,14 @@ pub(super) fn capture(
     if end > text.length() || local.length > 256 {
         return Err("短表字形参考超出原有限行范围".into());
     }
-    // SAFETY: 原属性串与行范围仍由活 TextKit 图持有；不读取候选字体或重新分配正文来源。
+    // SAFETY: The live TextKit graph retains original attributes/range; read no candidate font and
+    // allocate no document Source.
     let setter = unsafe { CTTypesetter::with_attributed_string_and_options(text.as_ref(), None) }
         .ok_or("短表原属性没有真实 typesetter")?;
-    // SAFETY: local 完整落在同一实际属性串内；CTLine 在本同步栈内归还。
+    // SAFETY: Local range fits the same actual attributed string; CTLine returns on this synchronous
+    // stack.
     let native = unsafe { setter.line(CFRange::new(local.location as _, local.length as _)) };
-    // SAFETY: 不可变 CTLine 保有下方全部 run，记录只以 Copy 值离开本函数。
+    // SAFETY: The immutable CTLine retains every run below; only Copy facts leave this function.
     let (range, count, runs) = unsafe {
         (
             native.string_range(),
@@ -60,10 +67,12 @@ pub(super) fn capture(
     let mut origins = [NSPoint::ZERO; 256];
     let mut covered = [false; 256];
     for ordinal in 0..runs.len() {
-        // SAFETY: ordinal 来自活 run 数组，Font 与 run 的所有借用均不离开这个循环。
+        // SAFETY: Ordinal belongs to the live run array; all font/run borrows end within this
+        // iteration.
         let raw = unsafe { runs.value_at_index(ordinal as _) };
         let run = NonNull::new(raw.cast_mut().cast::<CTRun>()).ok_or("短表实际 run 为空")?;
-        // SAFETY: 原 run 的公开元数据只读；非水平矩阵不能冒充当前短表的几何合同。
+        // SAFETY: Read original public run metadata only; a nonhorizontal matrix cannot satisfy this
+        // short-table geometry contract.
         let (used, matrix, status, attributes, run_range) = unsafe {
             (
                 run.as_ref().glyph_count(),
@@ -97,7 +106,8 @@ pub(super) fn capture(
             return Err("短表实际 run 重复覆盖原行来源".into());
         }
         covered.fill(true);
-        // SAFETY: 固定数组均覆盖 used 项；所有来源和坐标在数组交付后逐项核验。
+        // SAFETY: Every fixed array holds used entries; validate all Source coordinates and positions
+        // after delivery.
         unsafe {
             run.as_ref().glyphs(
                 CFRange::new(0, used as _),
@@ -117,14 +127,18 @@ pub(super) fn capture(
                 origins.as_mut_ptr(),
             );
         }
-        // 首 origin 也可能非零；相减才是实际 run 起点，随后逐 glyph 重建原 Native position。
-        // 此处的 base prefix 不含 mark 相对定位，不能拿 run 间 gap 当作 glyph offset。
+        // The first relative origin may be nonzero; subtract it for actual run start, then reconstruct
+        // each original Native glyph position.
+        // This base prefix excludes relative mark positioning; gaps between runs cannot masquerade as
+        // glyph offsets.
         let run_origin = NSPoint::new(positions[0].x - origins[0].x, positions[0].y - origins[0].y);
         let mut pen = NSSize::ZERO;
-        // SAFETY: kCTFontAttributeName 的公开值为原 run 实际 CTFont；包括系统真正选取的 fallback。
+        // SAFETY: The public font-key value is the original run actual CTFont, including any actual
+        // system fallback.
         let font = unsafe { attributes.value(std::ptr::from_ref(kCTFontAttributeName).cast()) };
         let font = NonNull::new(font.cast_mut().cast::<CTFont>()).ok_or("短表实际 run 缺 Font")?;
-        // SAFETY: run 保活 Font；只核真实 glyph 编号域，不按名字或候选字体推断。
+        // SAFETY: The run retains Font; check actual glyph-ID domain without inference from names or
+        // candidate fonts.
         let domain = usize::try_from(unsafe { font.as_ref().glyph_count() })
             .map_err(|_| "短表实际 Font 的 glyph 域无效")?;
         for index in 0..used {
@@ -156,9 +170,12 @@ pub(super) fn capture(
             {
                 return Err("短表实际 glyph、水平位置或来源无效".into());
             }
-            // 候选整簇试次之后，最终原 TextKit 行也必须保留同一实际 Font；不接受静默 cascade。
-            // 身份、轴和字号来自原属性与真实 run，绝不读取产品已经选出的字体来生成参考。
-            // SAFETY: 此字体仍由本轮原 run 字典持活；只借入同步属性核对，不跨原生资源释放边界。
+            // After the whole-grapheme trial, the final original TextKit line must still use that
+            // actual font without silent cascade.
+            // Identity, axes, and size come from original attributes/actual runs, never the product
+            // selected font as reference input.
+            // SAFETY: This original run dictionary retains the font; synchronous attribute comparison
+            // crosses no Native release boundary.
             let actual_font = unsafe { font.as_ref() };
             table_fonts::require_run_font(expected, element_start + source, actual_font)?;
             if index != 0 && !status.contains(CTRunStatus::NonMonotonic) {
@@ -185,11 +202,15 @@ pub(super) fn capture(
     if result.len() != count as usize || covered[..local.length].iter().any(|covered| !covered) {
         return Err("短表最终 Native run 未完整覆盖原行来源和字形域".into());
     }
-    // 只按实际 run 起点排序，run 内保持 Native 原 glyph 消费序；mark 的 ink x 可以越过 base。
-    // 同点保持原 run 顺序，不按 source 或画出的位置把 RTL/同 cluster 多 glyph 改成 LTR。
+    // Sort actual run starts only, preserving Native glyph order within each run because mark ink may
+    // extend before its base.
+    // Keep original order for tied starts; Source/ink sorting must not convert RTL or multiglyph
+    // clusters into LTR.
     result.sort_by(|left, right| left.run_origin.total_cmp(&right.run_origin));
-    // CTLine 的零点可位于视觉行内部：RTL 的逻辑尾空白真实排在负 x，不能强令首 run 为零。
-    // 仍逐 run 严格核连续；这个起点来自原 Native 事实，不吸收后继 run 的任何 gap。
+    // CTLine zero may lie inside the visual line: actual RTL trailing whitespace can have negative X,
+    // so the first run need not start at zero.
+    // Still verify actual per-run continuity; the original Native start cannot absorb gaps from later
+    // runs.
     let (mut run, mut pen) = (None, result.first().map_or(0.0, |glyph| glyph.run_origin));
     for glyph in &result {
         if run != Some(glyph.run) {
@@ -211,19 +232,24 @@ pub(super) fn capture(
     Ok(result)
 }
 
-/// 两个末端代表不同的真实合同：原 Native 字符尾策略只证明旧浮点图，完整 EGC 决定最终定位。
+/// Keep two distinct ends: Native character-tail policy verifies original floating layout, while whole
+/// graphemes determine final positioning.
 struct AlignmentEnds {
     native_alignment_utf16: usize,
     whole_egc_utf16: usize,
 }
 
-/// 原 Native 的非空白搜索不重新分组，固定 EGC 的整簇空白判断也不借待测 Core trim 结果。
-/// Prepend+首空格会在 Native 尾策略里排除该空格，在最终完整 EGC 中则必须共同保留。
+/// Native nonwhitespace search does not regroup text; whole-grapheme whitespace checks do not borrow
+/// the Core trim result under test.
+/// Native tail policy can exclude the space after Prepend, but the final complete grapheme must retain
+/// both together.
 fn alignment_ends(source: &str, line: &OriginalLine) -> AlignmentEnds {
     let native = NSString::from_str(source);
     let nonwhite = NSCharacterSet::whitespaceAndNewlineCharacterSet().invertedSet();
-    // 该公开 API 只查询原真实软行范围内最后一个非空白字符；范围已由原图证明属于短 source。
-    // 此来源仅用于核实际 Native baseline，绝不把这个标量端点签成产品可编辑 GCB 边界。
+    // The public API finds the final nonwhitespace character inside the actual soft-line range already
+    // certified by the original graph.
+    // Use this scalar endpoint for Native-baseline verification only, without certifying a
+    // product-editable grapheme boundary.
     let last_nonwhite = native.rangeOfCharacterFromSet_options_range(
         &nonwhite,
         NSStringCompareOptions::BackwardsSearch,
@@ -238,8 +264,9 @@ fn alignment_ends(source: &str, line: &OriginalLine) -> AlignmentEnds {
     for grapheme in line.graphemes.iter().rev() {
         let text =
             native.substringWithRange(NSRange::new(grapheme.source.start, grapheme.source.len()));
-        // NSRange.location 是 NSUInteger，而绑定的 NSNotFound 是正的 NSIntegerMax。
-        // macOS 二者位宽相同；这里只转换系统哨兵，不转换或截断实际来源下标。
+        // NSRange.location uses NSUInteger while the binding NSNotFound is positive NSIntegerMax.
+        // Their widths match on macOS; convert the system sentinel only, without converting/truncating
+        // actual Source indices.
         if text.rangeOfCharacterFromSet(&nonwhite).location != NSNotFound as usize {
             break;
         }
@@ -251,13 +278,16 @@ fn alignment_ends(source: &str, line: &OriginalLine) -> AlignmentEnds {
     }
 }
 
-/// 公开定位是逐 glyph 最近值/半值离零；不是给浮点累计坐标 round 一次，也不按字符数修偏。
+/// Public positioning rounds each glyph to nearest with ties away from zero, rather than rounding an
+/// accumulated coordinate or adjusting by character count.
 fn tick(value: f64) -> f64 {
     (value * 64.0).round() / 64.0
 }
 
-/// 仅由原 Native 实际 glyph 得出同一完整 GCB 的浮点与量化包络。
-/// 每次重走固定≤256项纯值，避免为这几个短串引入目录、第二排版器或可变缓存。
+/// Derive floating and quantized envelopes of one complete grapheme from original actual Native glyphs
+/// only.
+/// Revisit at most 256 fixed pure records rather than adding directories, another layout engine, or
+/// mutable caches for short fixtures.
 struct GlyphBounds {
     native_left: f64,
     native_right: f64,
@@ -275,13 +305,17 @@ fn bounds(glyphs: &[Glyph], source: &Range<usize>) -> Result<GlyphBounds, String
         f64::NEG_INFINITY,
     );
     for glyph in glyphs {
-        // 只认原 Native 确实存在的 basepen=0 字形边缘。RTL 尾空白位于它之前，须减去此前
-        // 各 glyph 已分别量化的 prefix；不能将整个负 run_origin round 一次或选择最近边缘。
+        // Require an actual original Native base-pen-zero glyph edge. RTL trailing whitespace lies
+        // before it, so subtract earlier
+        // individually quantized glyph prefixes instead of rounding the whole negative run origin or
+        // choosing a nearest edge.
         if glyph.position.x - glyph.origin.x == 0.0 && zero_prefix.is_none() {
             zero_prefix = Some(positioned);
         }
-        // 相对定位直接取原 origin；不再拿全线 pen 逆推而吞掉 run 间错位。
-        // base advance 与相对 origin 分别量化，随后继续同一个 Native glyph 消费序。
+        // Use original relative origin directly without reverse-deriving it from a whole-line pen that
+        // could hide inter-run misalignment.
+        // Quantize base advance and relative origin separately while retaining the same Native glyph
+        // consumption order.
         let advance = tick(glyph.advance.width);
         let origin = positioned + tick(glyph.origin.x);
         if source.contains(&glyph.cluster) {
@@ -307,7 +341,8 @@ fn bounds(glyphs: &[Glyph], source: &Range<usize>) -> Result<GlyphBounds, String
     })
 }
 
-/// 先证浮点原图与 alignment pivot，再输出独立26.6字形参考；原 raw frame 始终保留。
+/// Verify original floating geometry/alignment pivot before producing independent 26.6 reference
+/// positions, preserving raw frames.
 pub(super) fn position(
     source: &str,
     line: &mut OriginalLine,
@@ -319,7 +354,8 @@ pub(super) fn position(
     }
     let glyphs = std::mem::take(&mut line.table_glyphs);
     let ends = alignment_ends(source, line);
-    // 原 Native 对齐范围只为证明其浮点图；Prepend 的旧尾空白政策不能反过来切产品完整簇。
+    // The Native alignment extent verifies floating layout only; its Prepend tail policy cannot split
+    // product whole graphemes.
     let native_alignment_extent = if ends.native_alignment_utf16 == line.source.start {
         0.0..0.0
     } else {
@@ -364,12 +400,14 @@ pub(super) fn position(
         eprintln!(
             "native_table_original_alignment_policy source={:?} native_alignment_end={} native_alignment_extent={native_alignment_extent:?} native_origin={origin} whole_egc_end={} whole_egc_extent={whole_egc_extent:?} positioned_origin={qorigin}",
             line.source, ends.native_alignment_utf16, ends.whole_egc_utf16
-        ); // 明示两个合同的真实差别，不将旧 Native 尾策略伪称为最终完整 EGC 的逐位位置。
+        ); // Report the actual policy difference without treating old Native tail rules as final complete-grapheme positions.
     }
     for grapheme in &mut line.graphemes {
         let bounds = bounds(&glyphs, &grapheme.source)?;
-        // Standard 是同一真实 GCB 的 typographic 框，Selection 另有软行尾延展/容器裁切政策。
-        // 先核未改写的 Standard，不能拿已裁到 content.right 的 Selection 宽度当完整 advance。
+        // Standard supplies the same actual grapheme typographic box; Selection separately applies
+        // line-end extension/container clipping.
+        // Verify untouched Standard first; a Selection clipped to content.right cannot stand in for
+        // complete advance.
         let native_left = origin + bounds.native_left;
         let native_right = origin + bounds.native_right;
         if (native_left - grapheme.typographic_frame.origin.x).abs() > 1.0 / 64.0
@@ -384,13 +422,17 @@ pub(super) fn position(
                 native_right - native_left
             ));
         }
-        // 当前查询只含一个完整 GCB，并已证明落在单一原软行内；None 没有请求 head/tail
-        // 扩展，不能仅因 GCB.end 恰等于软行.end 就猜它的选择还继续到下一行。
-        // 原 Selection 可等于 Standard 的真实容器裁切；raw 仍保留，不用候选几何拟合。
+        // This query contains one complete grapheme certified within one actual soft line; no head/tail
+        // extension, so equal grapheme/soft-line end does not imply selection continues into another
+        // line.
+        // Actual Selection may equal Standard after container clipping; preserve raw observations
+        // without fitting to candidate geometry.
         let intersection = native_left.max(0.0)..native_right.min(width);
         let outside = intersection.end <= intersection.start;
-        // 完全离屏的 Native 空选择保留原 Standard 起点，只将宽度置零；它不是落在W的caret。
-        // 最终 q 字形仍保持完整范围，visibility 继续由它与产品 clip 的真实交集决定。
+        // An entirely offscreen Native empty selection keeps original Standard start with zero width,
+        // rather than a caret clamped at container width.
+        // Final quantized glyphs retain complete extents; actual intersection with the product clip
+        // still determines visibility.
         let selected = if outside {
             native_left..native_left
         } else {
@@ -409,7 +451,8 @@ pub(super) fn position(
                 grapheme.source, grapheme.frame, grapheme.typographic_frame
             ));
         }
-        // 只有前置原图证明完成才签量化框；Center 的半差保留浮点，不能把 baseline 再 round。
+        // Issue a quantized box after original-graph checks only; retain the floating half-difference
+        // for Center without rounding baseline again.
         grapheme.positioned_frame = Some(NSRect::new(
             NSPoint::new(qorigin + bounds.positioned_left, grapheme.frame.origin.y),
             NSSize::new(

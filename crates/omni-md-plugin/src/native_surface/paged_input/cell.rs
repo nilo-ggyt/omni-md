@@ -1,4 +1,4 @@
-//! 原单元格的唯一会话owner；输入与视图只借Weak，局部正文不成为第二个Doc或TextKit字符串。
+//! The sole Cell session owner; Input/View borrow weakly, and draft text becomes neither a second document nor TextKit storage.
 
 use super::*;
 use omni_markdown_core::markdown_document_buffer::{
@@ -10,20 +10,20 @@ use omni_markdown_core::{
     MarkdownCellDraftResourceObserver, MarkdownCellDraftSourceAuthority, MarkdownLayoutTextSource,
 };
 
-/// 控制器只持同源计划生成的唯一草稿token；退出先撤Scene，再显式close并检查原资源票。
+/// The controller owns one draft token from a verified same-Source plan; revoke Scene before explicit close and resource verification.
 pub struct NativeMarkdownPagedCellSession {
     document: Weak<RefCell<MarkdownDocumentBuffer>>,
     token: MarkdownCellDraft,
-    // 与开始草稿的原格票同时捕获；局部编辑改变文字，不改变所属表列的方向。
+    // Captured with the original cell authority: local text edits do not change its table-column alignment.
     alignment: omni_markdown_core::MarkdownTableAlignment,
     closed: Cell<bool>,
 }
 
 impl NativeMarkdownPagedCellSession {
-    /// 消费正式 Cell Display 或原 RequiredRow 的封闭格票开始局部会话，不读取完整格。
+    /// Begin a local session from verified Cell Display/RequiredRow authority without reading the entire cell.
     ///
     /// # Errors
-    /// 原 Doc、格来源或唯一草稿槽不再有效时拒绝，不改变 canonical 正文。
+    /// Reject invalid original document/cell Source or unavailable unique draft slot without changing canonical text.
     pub fn begin(
         document: Weak<RefCell<MarkdownDocumentBuffer>>,
         source: VerifiedMarkdownTableCellSource,
@@ -40,10 +40,10 @@ impl NativeMarkdownPagedCellSession {
         Self::begin_prepared(document, plan)
     }
 
-    /// 原短窗和4KiB长格请求只交同一种Core计划；不保正文、不把编辑权限当完整inline预览。
+    /// Short-window and 4 KiB long-cell requests supply the same Core plan; it retains no text and does not substitute editing authority for a complete inline preview.
     ///
     /// # Errors
-    /// 原Doc、Source、计划身份或唯一草稿槽失效时拒绝，原canonical和读取值均保留。
+    /// Reject invalid document/Source/plan identity or unavailable draft slot while retaining canonical text and existing reads.
     pub fn begin_prepared(
         document: Weak<RefCell<MarkdownDocumentBuffer>>,
         plan: MarkdownTableCellEditPlan,
@@ -60,7 +60,7 @@ impl NativeMarkdownPagedCellSession {
                 .map_err(NativeMarkdownPagedInputError::CellSource)?;
             (document.begin_prepared_cell_draft(plan)?, alignment)
         };
-        drop(original); // 长期只保原Doc弱引用，计划也不保正文或Native图。
+        drop(original); // Retain only a weak document identity; the plan owns neither text nor a Native graph.
         Ok(Rc::new(Self {
             document,
             token,
@@ -69,7 +69,7 @@ impl NativeMarkdownPagedCellSession {
         }))
     }
 
-    /// 只供同一已核实的 TargetDomain 捕获，不提供从裸列序号重建方向的入口。
+    /// Only the verified TargetDomain captures alignment; raw column indexes cannot reconstruct its authority.
     pub(super) fn alignment(&self) -> omni_markdown_core::MarkdownTableAlignment {
         self.alignment
     }
@@ -88,12 +88,12 @@ impl NativeMarkdownPagedCellSession {
         let facts = document.cell_draft_facts(&self.token)?;
         if self.closed.get() {
             return Err(NativeMarkdownPagedInputError::Closed);
-        } // Core先保真实Source首错，不能让Native关闭metadata把旧EIO改写成普通Closed。
+        } // Core checks Source first, so Native closed metadata cannot replace an existing EIO with Closed.
         Ok(facts)
     }
 
     pub(super) fn mark_committed(&self) {
-        self.closed.set(true); // 只在Core已成功发布并真实Drop原分支之后记录，不提前签资源释放。
+        self.closed.set(true); // Record only after Core publication and actual draft-branch Drop; do not certify release early.
     }
 
     fn history_facts(&self) -> Result<MarkdownCellDraftHistoryFacts> {
@@ -104,11 +104,13 @@ impl NativeMarkdownPagedCellSession {
         let facts = document.cell_draft_history_facts(&self.token)?;
         if self.closed.get() {
             return Err(NativeMarkdownPagedInputError::Closed);
-        } // 与原facts相同，先保Core Source首因；只读真实局部栈，不读取canonical历史作为回退。
+        } // Preserve Core Source priority as facts does; inspect the real local stack without falling back to canonical history.
         Ok(facts)
     }
 
     pub(super) fn capture(self: &Rc<Self>) -> Result<CellPermit> {
+        // Core captures an edit capsule under the original draft token. Native
+        // retains only a weak session and that bounded, consumable authority.
         let original = self.document()?;
         let document = original
             .try_borrow()
@@ -123,10 +125,10 @@ impl NativeMarkdownPagedCellSession {
         })
     }
 
-    /// 只有Core受控draft factory可生产布局Source；capture占原两个读取名额之一。
+    /// Only Core's controlled draft factory creates layout Source; capture consumes one of the original two reader slots.
     ///
     /// # Errors
-    /// Source/nonce失效、两个真实reader仍占用或已关闭时拒绝，不为canonical Source补草稿票。
+    /// Reject invalid Source/nonce, occupied reader slots, or closure; canonical Source cannot acquire draft authority here.
     pub fn capture_source(&self) -> Result<MarkdownLayoutTextSource> {
         self.facts()?;
         let original = self.document()?;
@@ -139,10 +141,10 @@ impl NativeMarkdownPagedCellSession {
         )?)
     }
 
-    /// 原固定原子收据不持Doc、草稿root、Scene或Native owner。
+    /// This fixed atomic observer retains no document, draft root, Scene, or Native owner.
     ///
     /// # Errors
-    /// 只允许在原会话仍有效时取得；关闭后仍可用已取得的observer核对真实Drop。
+    /// Acquire while the original session is valid; an already acquired observer can verify actual Drop after closure.
     pub fn resource_observer(&self) -> Result<MarkdownCellDraftResourceObserver> {
         let original = self.document()?;
         let document = original
@@ -151,15 +153,17 @@ impl NativeMarkdownPagedCellSession {
         Ok(document.cell_draft_resource_observer(&self.token)?)
     }
 
-    /// Esc只取消原候选，不提交canonical；尚活的真实reader由Core保留retired槽直到归还。
+    /// Esc cancels this candidate without canonical publication; Core retains its retired slot until actual readers return.
     ///
     /// # Errors
-    /// 原Doc正在借用时明确失败，不能把仍活分支签成已释放。重复close只再次排空原retired槽。
+    /// A document borrow conflict fails explicitly instead of certifying a live branch as released; repeated close only drains original retired work again.
     pub fn close(&self) -> Result<()> {
         let original = self.document()?;
         let mut document = original
             .try_borrow_mut()
             .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
+        // Cancellation revokes the draft immediately; drain releases only branches
+        // whose actual readers returned. The resource observer reports the rest.
         document.cancel_cell_draft(&self.token);
         document.drain_cancelled_cell_draft();
         self.closed.set(true);
@@ -169,7 +173,7 @@ impl NativeMarkdownPagedCellSession {
 
 impl Drop for NativeMarkdownPagedCellSession {
     fn drop(&mut self) {
-        // 析构不能造成功收据：借用失败时token随后只撤原scope，Doc仍保retired/active事实供close门拒绝。
+        // Drop cannot manufacture a successful receipt: if borrowing fails, token Drop revokes its scope while document active/retired facts still block closure.
         if let Some(original) = self.document.upgrade()
             && let Ok(mut document) = original.try_borrow_mut()
         {
@@ -180,11 +184,11 @@ impl Drop for NativeMarkdownPagedCellSession {
 }
 
 impl NativeMarkdownPagedInput {
-    /// 当前Cell的真实局部历史可用性；Body没有局部栈，返回None，不自动改查正文历史。
-    /// marked时原栈事实仍保留，菜单应结合原state.marked禁用，实际history入口同样拒绝组合中操作。
+    /// Inspect actual local Cell history; Body returns None instead of silently querying canonical history.
+    /// Marked input retains stack facts; menus combine them with state.marked, and history execution also rejects active composition.
     ///
     /// # Errors
-    /// 原Input状态、Doc、Source或会话不再有效时拒绝，不以空栈掩盖关闭或借用失败。
+    /// Reject invalid Input/document/Source/session rather than disguise closure or borrowing failure as an empty stack.
     pub fn cell_history_facts(&self) -> Result<Option<MarkdownCellDraftHistoryFacts>> {
         self.state()?;
         self.target
@@ -194,7 +198,7 @@ impl NativeMarkdownPagedInput {
     }
 }
 
-/// 一个Native许可只捕获这一个Core编辑胶囊；有限读取借它，真正修改才按值取走。
+/// One Native permit captures one Core edit capsule; bounded reads borrow it, and a mutation consumes it by value.
 pub(super) struct CellPermit {
     session: Weak<NativeMarkdownPagedCellSession>,
     edit: RefCell<Option<MarkdownCellDraftEditCapsule>>,
@@ -220,7 +224,7 @@ impl CellPermit {
         let edit = edit
             .as_ref()
             .ok_or(NativeMarkdownPagedInputError::Consumed)?;
-        apply(&document, edit) // 回调只做有限Core读取；禁止Native/current和任何能重入的外部调用。
+        apply(&document, edit) // This closure performs bounded Core reads only, with no Native/current or other reentrant external calls.
     }
 
     pub(super) fn facts(
@@ -237,6 +241,8 @@ impl CellPermit {
     }
 
     pub(super) fn take(&self) -> Result<MarkdownCellDraftEditCapsule> {
+        // Move the unique edit capsule into Core; no clone or successor capture
+        // can turn a consumed Native callback into another mutation attempt.
         self.edit
             .try_borrow_mut()
             .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?

@@ -1,4 +1,4 @@
-//! Cell局部事务只消费原胶囊；Core成功后仅交换有限metadata，不再执行可失败Native或Source读取。
+//! Cell transactions consume the original capsule; after Core succeeds only bounded metadata changes, with no fallible Native/Source read.
 
 use super::cell::{CellPermit, NativeMarkdownPagedCellSession};
 use super::target::InputTarget;
@@ -24,7 +24,7 @@ pub(super) struct CellInputIntents {
 impl CellInputIntents {
     pub(super) fn into_intent(self, empty_marked: bool) -> MarkdownCellDraftInputIntent {
         if empty_marked {
-            // 空setMarkedText结束marked；两个有限意图都在Native载荷getter前签发，不补签后继serial。
+            // Empty setMarkedText ends composition; both bounded intents were captured before the Native payload getter, not from a successor serial.
             self.empty_marked.unwrap_or(self.primary)
         } else {
             self.primary
@@ -33,10 +33,10 @@ impl CellInputIntents {
 }
 
 impl NativeMarkdownPagedInput {
-    /// 只接显式既有breakUndoCoalescing；不从粘贴、按键内容或时间间隔推断其他分组边界。
+    /// Honor the existing explicit breakUndoCoalescing action without inferring grouping boundaries from Paste, key text, or timing.
     ///
     /// # Errors
-    /// marked未结束、Source或原票撤销时保留草稿；Body没有新增合并策略，仍保原事务历史。
+    /// Keep the draft when marked input or Source/permit checks reject; Body retains its existing transaction history policy.
     pub fn break_undo_coalescing(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -58,10 +58,10 @@ impl NativeMarkdownPagedInput {
         ))
     }
 
-    /// 从唯一会话建立弱目标；独立局部版本/选区不读取canonical选择或创建第二正文owner。
+    /// Create a weak target from the sole session; local version/selection neither reads canonical selection nor creates another text owner.
     ///
     /// # Errors
-    /// 原会话失效、Doc借用冲突或Source首错时拒绝，不捕获布局reader。
+    /// Reject invalid session, document borrow conflict, or Source failure without acquiring a layout reader.
     pub fn new_cell(session: Weak<NativeMarkdownPagedCellSession>) -> Result<Rc<Self>> {
         let original = session
             .upgrade()
@@ -92,6 +92,8 @@ impl NativeMarkdownPagedInput {
         let InputTarget::Cell { session, serial } = &self.target else {
             return Ok(None);
         };
+        // Core facts check the original token/Source before local metadata. This
+        // Input may describe only that serial, never an externally advanced draft.
         let original = session
             .upgrade()
             .ok_or(NativeMarkdownPagedInputError::Closed)?;
@@ -127,6 +129,8 @@ impl NativeMarkdownPagedInput {
         permit: &NativeMarkdownPagedInputPermit,
         kind: MarkdownCellDraftInputKind,
     ) -> Result<Option<CellInputIntents>> {
+        // Capture both possible marked outcomes before reading Native payload:
+        // nonempty text continues composition, while empty marked input isolates it.
         permit
             .cell
             .as_ref()
@@ -154,7 +158,7 @@ impl NativeMarkdownPagedInput {
         replacement: CellReplacement<'_>,
         current: &(impl Fn(u64) -> bool + ?Sized),
     ) -> Result<NativeMarkdownPagedInputCommit> {
-        self.check_permit(permit, current)?; // 可重入门完成后再取原胶囊；不在后继serial重新捕获。
+        self.check_permit(permit, current)?; // Finish reentrant checks before consuming the original capsule; never recapture a successor serial.
         let cell = Self::original_cell(permit)?;
         let session = cell.session()?;
         let original = session.document()?;
@@ -171,7 +175,7 @@ impl NativeMarkdownPagedInput {
                 .marked
                 .map(|range| range.location..range.location + range.length),
         )?;
-        // Core的字符/选区/历史已经一起发布；以下不读Source、不调用current，不把后果失权报告成未提交。
+        // Core published text, selection, and history together; do not read Source/call current afterward or report later revocation as an uncommitted edit.
         let change =
             replacement.text.encode_utf16().count() as isize - replacement.range.len() as isize;
         Ok(self.publish_cell(permit, facts, Some((replacement.range, change)), None))
@@ -192,6 +196,8 @@ impl NativeMarkdownPagedInput {
             unreachable!("只有原cell事务能发布局部metadata");
         };
         serial.set(facts.serial);
+        // Core facts are the committed local state. Replace bounded selection and
+        // marked metadata without a fallible Source read or a callback after commit.
         let marked = facts
             .marked_range
             .map(|range| NSRange::new(range.start, range.len()));
@@ -227,7 +233,7 @@ impl NativeMarkdownPagedInput {
                 characters_changed: state.generation != permit.before.generation,
                 selection_changed: state.selection != permit.before.selection,
                 marked_changed: state.marked != permit.before.marked,
-                folds_changed: false, // 局部坐标从未进入Body折叠mapper，canonical折叠与历史都保持原样。
+                folds_changed: false, // Local coordinates never enter the Body fold mapper; canonical folds/history remain unchanged.
             },
         }
     }
@@ -264,6 +270,8 @@ impl NativeMarkdownPagedInput {
             NativeMarkdownPagedInputHistory::Redo => MarkdownCellDraftHistoryDirection::Redo,
         };
         let Some(edit) = document.restore_cell_draft_history(cell.take()?, direction)? else {
+            // No local entry is genuinely unchanged; canonical history is never
+            // a fallback for an exhausted Cell stack.
             return Ok(NativeMarkdownPagedInputOutcome::Unchanged(permit.before));
         };
         Ok(NativeMarkdownPagedInputOutcome::Committed(
@@ -293,6 +301,8 @@ impl NativeMarkdownPagedInput {
             goal.is_some_and(|goal| !goal.is_finite() || head.is_none())
                 || side.is_some_and(|side| side.level > 126 || head.is_none())
         }) {
+            // Check Source even for invalid geometry, using an empty real range.
+            // A backing failure must precede the later invalid-intent diagnosis.
             cell.with_edit(|document, edit| {
                 Ok(document.validate_cell_draft_utf16_range(edit, 0..0)?)
             })?;
@@ -303,6 +313,8 @@ impl NativeMarkdownPagedInput {
             .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
         let facts = document.set_cell_draft_selection(cell.take()?, selection)?;
         if geometry.is_none() && selection == permit.before.selection {
+            // A plain identical selection carries no new visual intent. Core
+            // validated the capsule/Source without advancing local metadata.
             return Ok(NativeMarkdownPagedInputOutcome::Unchanged(permit.before));
         }
         Ok(NativeMarkdownPagedInputOutcome::Committed(

@@ -1,7 +1,9 @@
-//! 真实LineEnd之后的只读交付；Line/Part只含原输出弱票，没有公开Range构造入口。
+//! Read-only delivery after an actual LineEnd. Line/Part values retain weak
+//! original-output tickets and expose no public constructor from a raw range.
 //!
-//! 这里的26.6坐标相对于本行baseline。真实字体ascent/descent/leading与全局行y由平台
-//! 使用同一个注册字体计算，本模块不制造固定行高、Native视口Ready或caret几何。
+//! Coordinates use 26.6 units relative to this line's baseline. The platform
+//! derives actual ascent/descent/leading and global Y from the same registered
+//! font; this reader grants no fixed line height or Native viewport readiness.
 
 use super::*;
 use crate::MarkdownLayoutTextSourceObserver;
@@ -45,7 +47,8 @@ pub enum MarkdownComposedLineKind {
     Mandatory,
     Emergency,
     Overflow,
-    /// 原 canonical 结构行；高度来自同一真实 Grid consumer 的最终排版。
+    /// An original canonical structural row; the actual Grid consumer determines
+    /// its final laid-out height under the same row authority.
     TableRow,
 }
 
@@ -63,9 +66,11 @@ pub struct MarkdownComposedLineFacts {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkdownComposedLinePartFacts {
-    /// 同一字体响应已经封存的左右缩进；不增加目录记录或重读活文档样式。
+    /// Left/right inset already sealed by the same font response; no extra
+    /// directory record or live-document style lookup is introduced.
     pub paragraph_inset_26_6: i32,
-    /// 来自本part原item封存记录，不能由平台按字符范围事后猜测。
+    /// Sealed by this part's original item, never inferred later by the platform
+    /// from an arbitrary character range.
     pub presentation: crate::MarkdownPresentationStyles,
     pub kind: super::super::MarkdownComposedLinePartKind,
     pub source_utf16: Range<usize>,
@@ -81,7 +86,8 @@ pub struct MarkdownComposedLinePartFacts {
     pub visual_glyphs: Range<usize>,
 }
 
-/// 只能由完整行目录读出，保留弱输出身份；事实副本不能签发另一输出的part。
+/// Obtain only from a complete authenticated line directory. Weak output
+/// identity prevents copied facts from issuing parts for another output.
 pub struct MarkdownComposedLine {
     output: Weak<()>,
     header: usize,
@@ -92,6 +98,7 @@ pub struct MarkdownComposedLine {
     facts: MarkdownComposedLineFacts,
 }
 impl MarkdownComposedLine {
+    /// Borrow established Copy/range facts without acquiring new reader authority.
     pub fn facts(&self) -> &MarkdownComposedLineFacts {
         &self.facts
     }
@@ -101,7 +108,8 @@ impl MarkdownComposedLine {
     }
 }
 
-/// 不保活Reader、Source或Font；平台必须仍持原Output及实际字体注册owner。
+/// Retain neither Reader, Source, nor Font. The platform must keep the original
+/// output and actual font-registration owner alive while using this part.
 pub struct MarkdownComposedLinePart {
     output: Weak<()>,
     source: MarkdownLayoutTextAuthority,
@@ -112,17 +120,22 @@ pub struct MarkdownComposedLinePart {
     facts: MarkdownComposedLinePartFacts,
 }
 impl MarkdownComposedLinePart {
+    /// Expose sealed metadata only; these facts alone cannot authorize drawing.
     pub fn facts(&self) -> &MarkdownComposedLinePartFacts {
         &self.facts
     }
+    /// Preserve the original Source ticket for checks at the actual use boundary.
     pub fn source_authority(&self) -> &MarkdownLayoutTextAuthority {
         &self.source
     }
+    /// Return the weak original registration rather than retaining a font graph.
     pub fn font_registration(&self) -> &MarkdownLineFontRegistration {
         &self.registration
     }
 }
 
+/// Own the single actual reader and the exact Source/font/fold/table claims
+/// needed to authenticate its sealed metadata. Revocation drops this group.
 struct Payload {
     reader: LayoutIndexReader<64>,
     source: MarkdownLayoutTextSource,
@@ -135,11 +148,13 @@ struct Payload {
     tables: Option<crate::markdown_layout_source::table_rows::TablePlan>,
 }
 
-/// 单一只读FD的真实owner；不持完整glyph、item、Line、Font或正文Vec。
+/// Own one read-only output FD without complete glyph/item/line/font or document
+/// vectors. Queries read bounded records through this same owner.
 pub struct MarkdownComposedLines {
     payload: Option<Payload>,
     identity: Arc<()>,
-    // 只认证同一 writer 的追加前缀，不让旧 Line/Part 身份跨快照生效。
+    // Lineage authenticates append-only prefixes from the same writer. Line/Part
+    // identities still cannot cross snapshots merely because lineage matches.
     #[cfg(feature = "paged-shaping-frontier")]
     lineage: Weak<()>,
     authority: MarkdownLayoutTextAuthority,
@@ -151,7 +166,8 @@ pub struct MarkdownComposedLines {
     observer: MarkdownComposedLineResourceObserver,
 }
 
-/// 观察真实文件/映射与同Source字段的归还，不能凭Line/Part弱票失效冒充底层释放。
+/// Observe actual file/mapping and same-Source release facts. Expired Line/Part
+/// tickets alone cannot establish that underlying resources really returned.
 #[derive(Clone)]
 pub struct MarkdownComposedLineResourceObserver {
     file: LayoutIndexObserver,
@@ -163,7 +179,8 @@ pub struct MarkdownComposedLineResources {
     pub file_open: bool,
     pub mapped_bytes: usize,
     pub peak_mapped_bytes: usize,
-    /// 唯一metadata写buffer；Reader归还该buffer后只保原File。
+    /// The sole metadata write buffer; the Reader retains only its original File
+    /// after this buffer has actually returned.
     pub buffer_bytes: usize,
     pub peak_buffer_bytes: usize,
     pub cleanup_failed: bool,
@@ -172,13 +189,17 @@ pub struct MarkdownComposedLineResources {
     pub first_source_errno: Option<i32>,
 }
 impl MarkdownComposedLineResourceObserver {
+    /// Capture the actual owners' fixed receipts, without retaining Source
+    /// payload or duplicating its file descriptor.
     pub(super) fn for_source(file: LayoutIndexObserver, source: &MarkdownLayoutTextSource) -> Self {
         Self {
             file,
             source: source.resource_observer(),
             backing: source.original_backing_observer(),
-        } // 只取实际owner的固定原子收据；不持source正文或复制任何File。
+        }
     }
+    /// Read resource facts independently of weak line/part revocation. These
+    /// observations describe this owner rather than whole-product RSS.
     pub fn snapshot(&self) -> MarkdownComposedLineResources {
         let file = self.file.snapshot();
         MarkdownComposedLineResources {
@@ -195,7 +216,8 @@ impl MarkdownComposedLineResourceObserver {
     }
 }
 
-/// 只有producer的真实LineEnd流程可以组装这个移交包；它不对外暴露File或目录坐标。
+/// Only the producer's actual LineEnd flow creates this handoff. Its File and
+/// directory coordinates are not exposed as caller-supplied output authority.
 pub(super) struct OutputSeal {
     pub source: MarkdownLayoutTextSource,
     pub authority: MarkdownLayoutTextAuthority,
@@ -203,7 +225,8 @@ pub(super) struct OutputSeal {
     pub cancellation: MarkdownLineComposeCancellation,
     pub reader: LayoutIndexReader<64>,
     pub identity: Arc<()>,
-    // 原 GlyphStore 在实际 LineEnd 移交时提供；Word 续算不为布局重置或外来 writer 续权。
+    // The original GlyphStore supplies lineage at actual LineEnd. A Word
+    // continuation cannot extend authority across reset or a foreign writer.
     #[cfg(feature = "paged-shaping-frontier")]
     pub lineage: Weak<()>,
     pub last: Option<usize>,
@@ -219,6 +242,8 @@ pub(super) struct OutputSeal {
 }
 
 impl MarkdownComposedLines {
+    /// Validate this actual sealed prefix before taking over its single reader.
+    /// Records prefetched after its last LineEnd remain outside its authority.
     pub(super) fn from_sealed(seal: OutputSeal) -> Result<Self> {
         seal.source.health()?;
         if !seal.source.permits(&seal.authority)
@@ -226,9 +251,12 @@ impl MarkdownComposedLines {
             || seal.range.end > seal.source.utf16_len()
             || (seal.count == 0) != seal.last.is_none()
         {
+            // Source identity, range coverage, and the actual last-line marker
+            // must agree before any read-only output can become public.
             return Err(Error::InconsistentCoverage);
         }
         if seal.cancellation.is_cancelled() {
+            // A cancelled producer cannot transfer an apparently ready output.
             return Err(Error::Cancelled);
         }
         seal.graphemes.validate(
@@ -240,7 +268,7 @@ impl MarkdownComposedLines {
             || seal.last.is_some_and(|last| seal.graphemes.last >= last)
         {
             return Err(Error::InconsistentCoverage);
-        } // 只使用实际最近LineEnd签入的目录；writer随后预取的记录不在本快照权限内。
+        } // Grapheme coverage and last record must belong to this exact LineEnd prefix.
         let observer = MarkdownComposedLineResourceObserver::for_source(
             seal.reader.resource_observer(),
             &seal.source,
@@ -268,20 +296,26 @@ impl MarkdownComposedLines {
             graphemes: seal.graphemes,
             observer,
         };
+        // Recheck source/cancellation/reader health on the assembled original
+        // owner before the candidate escapes this acquisition boundary.
         value.require(&value.authority)?;
         Ok(value)
     }
+    /// Return the original immutable ticket, never a recaptured current source.
     pub fn source_authority(&self) -> &MarkdownLayoutTextAuthority {
         &self.authority
     }
+    /// This finite sealed prefix need not cover the complete document.
     pub fn source_range(&self) -> Range<usize> {
         self.range.clone()
     }
+    /// Observing release does not keep this reader or document payload alive.
     pub fn resource_observer(&self) -> MarkdownComposedLineResourceObserver {
         self.observer.clone()
     }
 
-    /// 全为Core纯检查；Native调用方的current必须在外层RefCell借用前后分别执行。
+    /// Perform Core-only checks. Native callers must check their own original
+    /// current predicate before/after the outer RefCell borrow, never inside it.
     pub fn require(&self, authority: &MarkdownLayoutTextAuthority) -> Result<()> {
         if let Some(errno) = self
             .observer
@@ -289,6 +323,8 @@ impl MarkdownComposedLines {
             .as_ref()
             .and_then(|value| value.first_errno())
         {
+            // Preserve the original backing failure before a later poisoned or
+            // expired wrapper could replace its typed cause.
             return Err(
                 crate::MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into(),
             );
@@ -296,9 +332,11 @@ impl MarkdownComposedLines {
         let payload = self.payload.as_ref().ok_or(Error::Poisoned)?;
         payload.source.health()?;
         if authority != &self.authority || !payload.source.permits(authority) {
+            // Equal offsets or a newer ticket cannot authorize this old output.
             return Err(Error::SourceMismatch);
         }
         if self.cancellation.is_cancelled() {
+            // Cancellation remains terminal even if every file is still open.
             return Err(Error::Cancelled);
         }
         let file = self.observer.file.snapshot();
@@ -308,13 +346,18 @@ impl MarkdownComposedLines {
             || file.cleanup_failed
             || file.reader_failed
         {
+            // A settled reader owns no active map/write buffer. Closed files or
+            // recorded backend failures revoke it rather than manufacturing EOF.
             return Err(Error::Poisoned);
         }
         Ok(())
     }
+    /// Complete one query and revoke the actual payload on terminal failure.
+    /// Fold/table exclusions are recoverable only while original health holds.
     fn finish<T>(&mut self, result: Result<T>) -> Result<T> {
         if matches!(&result, Err(Error::FoldedRange(_) | Error::TableRange)) {
-            // 隐区缺少本记录域的内部 GCB 是可恢复显示状态；健康失败仍永久撤回实际 reader。
+            // This ordinal domain legitimately omits hidden/internal GCBs.
+            // Backend health failure still permanently returns the actual reader.
             if let Err(error) = self.require(&self.authority) {
                 drop(self.payload.take());
                 return Err(error);
@@ -327,7 +370,7 @@ impl MarkdownComposedLines {
         });
         if result.is_err() {
             drop(self.payload.take());
-        } // 失败交还唯一reader与Source claim，旧Line不能重签。
+        } // Terminal failure drops the sole reader/Source; old lines cannot regain authority.
         if let Some(errno) = self
             .observer
             .backing
@@ -340,6 +383,7 @@ impl MarkdownComposedLines {
         }
         result
     }
+    /// Read one fixed record only after the same output's actual health check.
     fn row(&mut self, record: usize) -> Result<[u8; 64]> {
         self.require(&self.authority)?;
         Ok(self
@@ -349,6 +393,8 @@ impl MarkdownComposedLines {
             .reader
             .read(record)?)
     }
+    /// Authenticate LineEnd shape and checked part extent before following its
+    /// header pointer. A malformed directory cannot redirect record reads.
     fn line_header(&self, end: usize, tail: &[u8; 64]) -> Result<usize> {
         if tail[56] != LINE_END || tail[57..].iter().any(|byte| *byte != 0) {
             return Err(Error::InconsistentCoverage);
@@ -366,13 +412,15 @@ impl MarkdownComposedLines {
         }
         Ok(header)
     }
+    /// Read the original tail/header pair and decode without another directory.
     fn line_at(&mut self, end: usize) -> Result<MarkdownComposedLine> {
         let tail = self.row(end)?;
         let header = self.line_header(end, &tail)?;
         let head = self.row(header)?;
         self.decode_line(end, tail, head)
     }
-    /// 同步旧入口与quota1游标共用纯解码；这里不再读取额外记录，避免把两次pread藏成1。
+    /// Synchronous lookup and the quota-one cursor share pure decoding. This
+    /// step performs no extra read that could hide two preads inside one quantum.
     fn decode_line(
         &self,
         end: usize,
@@ -385,6 +433,7 @@ impl MarkdownComposedLines {
             return Err(Error::InconsistentCoverage);
         }
         let kind = match head[57] {
+            // Accept only the actual writer's finite line-kind domain.
             0 => MarkdownComposedLineKind::Allowed,
             1 => MarkdownComposedLineKind::Mandatory,
             2 => MarkdownComposedLineKind::Emergency,
@@ -403,10 +452,13 @@ impl MarkdownComposedLines {
             kind,
         };
         let previous = match u64_at(&tail, 48) {
+            // Absence uses the canonical on-disk sentinel, not a guessed offset.
             NONE => None,
             _ => Some(usize_at(&tail, 48)?),
         };
         let skip = match (u64_at(&head, 40), u64_at(&head, 48)) {
+            // The first line has no predecessor. Later skips must point into
+            // the authenticated earlier prefix and agree with its ordinal rule.
             (NONE, NONE) if facts.ordinal == 0 => None,
             (record, ordinal) if record != NONE && ordinal != NONE && facts.ordinal != 0 => {
                 let record = usize_at(&head, 40)?;
@@ -448,6 +500,9 @@ impl MarkdownComposedLines {
             || usize_at(&tail, 40)? != facts.source_utf16.len()
             || previous.is_some_and(|record| record >= header)
         {
+            // Require ordered Source/paragraph ranges and consistent line
+            // history. An empty line is valid only for the actual terminal
+            // mandatory break, with exactly one glyph-free zero-advance part.
             return Err(Error::InconsistentCoverage);
         }
         Ok(MarkdownComposedLine {
@@ -460,6 +515,8 @@ impl MarkdownComposedLines {
             facts,
         })
     }
+    /// Reauthenticate the original weak output and actual records, not only a
+    /// caller's copied line facts or numerically equal generation.
     fn require_line(&mut self, line: &MarkdownComposedLine) -> Result<()> {
         if !Weak::ptr_eq(&line.output, &Arc::downgrade(&self.identity)) {
             return Err(Error::SourceMismatch);
@@ -475,6 +532,7 @@ impl MarkdownComposedLines {
         }
         Ok(())
     }
+    /// Query the last sealed line; an empty original output returns None.
     pub fn last_line(&mut self) -> Result<Option<MarkdownComposedLine>> {
         let result = (|| {
             self.require(&self.authority)?;
@@ -483,8 +541,9 @@ impl MarkdownComposedLines {
         self.finish(result)
     }
 
-    /// 同一真实Line头里的原段base，不从首part或最小resolved level反推段方向。
-    /// 原记录仍为64B，复用两条既有Line认证读取，不持新Bidi或Reader。
+    /// Read the paragraph base authenticated by this original line header.
+    /// Reuse the existing two-record check; neither a first-part/minimum level
+    /// guess nor another Bidi/Reader owner can supply the paragraph direction.
     pub fn paragraph_base_level(&mut self, line: &MarkdownComposedLine) -> Result<u8> {
         let result = (|| {
             self.require(&self.authority)?;
@@ -493,6 +552,8 @@ impl MarkdownComposedLines {
         })();
         self.finish(result)
     }
+    /// Follow an authenticated predecessor and require contiguous source/ordinal
+    /// coverage, retaining the same actual output across reverse traversal.
     pub fn previous_line(
         &mut self,
         line: &MarkdownComposedLine,
@@ -504,18 +565,23 @@ impl MarkdownComposedLines {
                 .map(|record| self.line_at(record))
                 .transpose()?;
             if let Some(previous) = &previous {
+                // A valid record pointer still needs the exact previous ordinal
+                // and adjoining Source boundary to establish line continuity.
                 if previous.facts.ordinal.checked_add(1) != Some(line.facts.ordinal)
                     || previous.facts.source_utf16.end != line.facts.source_utf16.start
                 {
                     return Err(Error::InconsistentCoverage);
                 }
             } else if line.facts.ordinal != 0 {
+                // Only the actual first line can legitimately lack a predecessor.
                 return Err(Error::InconsistentCoverage);
             }
             Ok(previous)
         })();
         self.finish(result)
     }
+    /// Read one authenticated line part through its exact metadata and item
+    /// records. The ordinal immediately after the last part is ordinary EOF.
     pub fn part(
         &mut self,
         line: &MarkdownComposedLine,
@@ -524,9 +590,11 @@ impl MarkdownComposedLines {
         let result = (|| {
             self.require_line(line)?;
             if ordinal > line.facts.parts {
+                // Beyond one-past-end is invalid input, not an absent part.
                 return Err(Error::InvalidRequest);
             }
             if ordinal == line.facts.parts {
+                // One-past-end reads no unrelated record or Source bytes.
                 return Ok(None);
             }
             let record = ordinal
@@ -535,7 +603,8 @@ impl MarkdownComposedLines {
                 .ok_or(Error::Overflow)?;
             self.require(&self.authority)?;
             let mut part_records = [[0; 64]; 2];
-            // 原Part头与meta本来都须完整读取后才能认证；合并同一128B范围，不预读其他part或增加缓存。
+            // Both original part records are required for authentication. Read
+            // that exact contiguous range without another part or extra cache.
             self.payload
                 .as_mut()
                 .ok_or(Error::Poisoned)?
@@ -549,7 +618,8 @@ impl MarkdownComposedLines {
             let item_record = usize_at(&meta, 40)?;
             self.require(&self.authority)?;
             let mut item_records = [[0; 64]; 3];
-            // 只有已认证的Part才能给出原Directory位置；仍读精确三条192B，再共同解码、核覆盖与弱Font。
+            // Only the authenticated part can supply the original item pointer.
+            // Read exactly three directory records, then check coverage/weak Font.
             self.payload
                 .as_mut()
                 .ok_or(Error::Poisoned)?
@@ -585,6 +655,8 @@ impl MarkdownComposedLines {
         meta: [u8; 64],
         item: Directory,
     ) -> Result<MarkdownComposedLinePart> {
+        // Decode finite metadata from already-read records; no Native call or
+        // live-document style lookup may reconstruct the original item facts.
         let font = FontKey {
             generation: u64_at(&meta, 0),
             slot: u16::from_le_bytes(meta[8..10].try_into().expect("固定2B字段")),
@@ -639,6 +711,8 @@ impl MarkdownComposedLines {
                 .is_none_or(|end| end > item.glyph_count)
             || item.glyph_start.checked_add(original_start) != Some(glyph_start)
         {
+            // Part kind, ranges, glyph extent, font, and Bidi parity must all
+            // agree with the original item before its registration is exposed.
             return Err(Error::InconsistentCoverage);
         }
         let registration = self
@@ -658,7 +732,8 @@ impl MarkdownComposedLines {
             facts,
         })
     }
-    /// 只读原glyph元数据；范围/字体/输出票错误均撤整候选，Err后的整个输出batch不可发布。
+    /// Read original glyph metadata only. Range/font/output-ticket failure
+    /// revokes the candidate; no output batch may be published after Err.
     pub fn read_batch(
         &mut self,
         part: &MarkdownComposedLinePart,
@@ -687,10 +762,13 @@ impl MarkdownComposedLines {
                 .checked_add(range.end)
                 .ok_or(Error::Overflow)?;
             if output.is_empty() {
-                // 空批仍是原绘图边界的实际权限核验，必须进入同一 Reader 检查健康、FD 与
-                // 精确空范围；这里只省去没有任何字形要解码的 16KiB 临时数组，不提前成功。
+                // Even an empty draw batch checks the same Reader's health, FD,
+                // and exact empty extent. Skip only the unused glyph scratch;
+                // an empty request cannot bypass authorization by returning early.
                 payload.reader.read_batch(start..end, &mut [])?;
             } else {
+                // A finite stack batch reads actual records, then admits each
+                // decoded cluster only inside this original part's Source range.
                 let mut rows = [[0; 64]; STEP];
                 payload
                     .reader
@@ -713,6 +791,8 @@ impl MarkdownComposedLines {
         self.finish(result)
     }
 
+    /// Search the original item cluster directory without scanning document text
+    /// or materializing every cluster in the paragraph.
     fn original_cluster(
         &mut self,
         part: &MarkdownComposedLinePart,
@@ -729,10 +809,14 @@ impl MarkdownComposedLines {
                 )?,
             )?;
             if offset < value.source_utf16.start {
+                // Continue only into the earlier half of this ordered directory.
                 high = middle;
             } else if offset >= value.source_utf16.end {
+                // A cluster ends before this offset; search the remaining suffix.
                 low = middle + 1;
             } else {
+                // The located cluster must also belong to this exact soft-line
+                // part, including its original visual-glyph interval.
                 if value.source_utf16.start < part.facts.source_utf16.start
                     || value.source_utf16.end > part.facts.source_utf16.end
                     || value.glyphs.start < part.facts.visual_glyphs.start
@@ -746,7 +830,8 @@ impl MarkdownComposedLines {
         Err(Error::InconsistentCoverage)
     }
 
-    /// 原source/flags/advance不变，glyph与逻辑prefix均减去本part的真实起点，未扫描正文。
+    /// Preserve original Source/flags/advances while rebasing glyph and logical
+    /// prefix coordinates to this actual part, without scanning document text.
     pub fn cluster(
         &mut self,
         part: &MarkdownComposedLinePart,
@@ -766,10 +851,13 @@ impl MarkdownComposedLines {
                 return Err(Error::InvalidRequest);
             }
             if offset == part.facts.source_utf16.end {
+                // The exact part endpoint is known absence, not a query against
+                // an adjacent item or an unprepared document suffix.
                 return Ok(MarkdownGlyphClusterAnswer::Known(None));
             }
             if part.facts.kind != super::super::MarkdownComposedLinePartKind::Glyphs {
-                // 同LineEnd原控制范围只携源和真实进距，不假造可画glyph或ligature内部边界。
+                // Original control ranges carry Source/actual advance only;
+                // they invent neither drawable glyphs nor internal ligature stops.
                 return Ok(MarkdownGlyphClusterAnswer::Known(Some(
                     MarkdownGlyphCluster {
                         source_utf16: part.facts.source_utf16.clone(),
@@ -785,7 +873,8 @@ impl MarkdownComposedLines {
             }
             let mut value = self.original_cluster(part, offset)?;
             let start = self.original_cluster(part, part.facts.source_utf16.start)?;
-            // 前缀原本从item逻辑起点累计；直接暴露会把后续软行的caret错误平移到前面行。
+            // Item prefixes accumulate from the logical item start. Rebase to
+            // this part so a later wrapped line's caret is not shifted by earlier lines.
             value.prefix_x_26_6 = value
                 .prefix_x_26_6
                 .checked_sub(start.prefix_x_26_6)
@@ -814,8 +903,13 @@ impl MarkdownComposedLines {
         self.finish(result)
     }
 
+    /// Return the actual reader and then inspect the same Source health. Source
+    /// failure keeps its typed priority; release observers retain file cleanup
+    /// facts even when both operations fail.
     pub fn close(mut self) -> Result<()> {
         let Some(payload) = self.payload.take() else {
+            // A prior terminal query already returned the reader; it cannot
+            // yield a successful close receipt for a now-absent payload.
             return Err(Error::Poisoned);
         };
         let result = payload.reader.close().map_err(Error::from);

@@ -1,4 +1,5 @@
-//! 同原Source的实际RootLeaf字体帧；原选择决定marker字号，不宣称完整Markdown装饰已完成。
+//! Observe actual RootLeaf font frames from the original Source. Original
+//! selection determines marker sizing; this alone does not prove all Markdown decoration.
 use std::io::Write;
 
 use super::*;
@@ -24,6 +25,8 @@ mod table;
 #[path = "root_leaf/word.rs"]
 mod word;
 
+/// Compare actual sealed font coverage and Native geometry with independent
+/// fixture coordinates, then navigate selection to reveal editable heading markers.
 fn run_case(rig: &mut Rig) -> Result<(), String> {
     let key = rig
         .view
@@ -33,7 +36,8 @@ fn run_case(rig: &mut Rig) -> Result<(), String> {
         .body
         .probe_root_leaf_parts()
         .map_err(|cause| cause.to_string())?;
-    // 期望位置来自固定源字面；不是由新Producer的结果反算heading/code范围。
+    // Expected positions come from fixed source literals, never inferred from the
+    // producer's heading/code ranges under test.
     for (source, points, role) in [
         (2..7, 28.0, "heading"),
         (17..31, 14.0, "code"),
@@ -83,8 +87,9 @@ fn run_case(rig: &mut Rig) -> Result<(), String> {
     if marker.points < 14.0 || marker.native_points != f64::from(marker.points) {
         return Err("原选择所在标题的marker没有按原语义保持可见字号".into());
     }
-    // 初始caret在第一标题；第二标题的实际语义才授予隐藏权。检查真正sealed part，
-    // 不能只查palette或期望styles来冒充实际shaping已经使用该小字体。
+    // Initial selection lies in the first heading. Only the second heading's
+    // actual semantics permit hiding; inspect sealed parts rather than palette
+    // declarations to prove shaping really used the small marker font.
     for offset in 37..40 {
         let hidden = parts
             .iter()
@@ -131,12 +136,14 @@ fn run_case(rig: &mut Rig) -> Result<(), String> {
     {
         return Err("真实标题/代码框或隐藏marker宽度没有保留Source坐标与实际字体几何".into());
     }
-    drop(scene); // 真实Find准备前归还旧Scene Reader，不占旧prefix快照槽。
+    drop(scene); // Return the previous Scene reader before Find preparation so no old prefix snapshot occupies its slot.
     rig.bar.query.setStringValue(ns_string!("Title"));
     let range = NSRange::new(2, 5);
     let frame = observe(&rig.body)?;
-    // Title已在当前viewport；原execute可同步提交选择，不应套远端样本必须Pending的前提。
-    // 若实际仍需异步准备，则保留同一请求并由原Body续体完成，不能只凭选择提交判可见。
+    // Title is already in the viewport, so execution may finish synchronously;
+    // a remote fixture's required-Pending premise does not apply. If preparation
+    // is asynchronous, retain that same request and wait for the original Body's
+    // endpoint rather than treating selection commit as visibility.
     let pending = match rig
         .action(MarkdownFindAction::Next)
         .map_err(|cause| cause.to_string())?
@@ -174,8 +181,9 @@ fn run_case(rig: &mut Rig) -> Result<(), String> {
     rig.view
         .verify_find_target_visible(&found, range)
         .map_err(|cause| cause.to_string())?;
-    // Find进入第二标题会改变原canonical选择；后继必须重新取得同一来源的语义，
-    // 使此前隐藏的相同源marker恢复标题字号，不能沿旧槽永久隐藏可编辑语法。
+    // Find changes canonical selection to the second heading. Its successor must
+    // derive semantics from the same source and restore heading-sized markers,
+    // rather than preserving a stale hidden slot over editable syntax.
     rig.bar.query.setStringValue(ns_string!("Next"));
     let frame = observe(&rig.body)?;
     match rig
@@ -215,7 +223,7 @@ fn run_case(rig: &mut Rig) -> Result<(), String> {
             return Err(format!(
                 "原选择变化后marker仍复用旧隐藏字体：offset={offset}, source={:?}, points={}, native_points={}, role={}",
                 marker.source, marker.points, marker.native_points, marker.role
-            )); // 保留实际封存part事实，失败不能只靠选择或已完成帧反推样式已更新。
+            )); // Keep actual sealed-part facts; selection/frame completion cannot establish updated styles.
         }
     }
     let progress = rig.body.progress().map_err(|cause| cause.to_string())?;
@@ -225,7 +233,7 @@ fn run_case(rig: &mut Rig) -> Result<(), String> {
     {
         return Err("RootLeaf没有真实收费或错误回到局部Parser/String路径".into());
     }
-    rig.remember_receipt()?; // 包含实际新增heading/code capture，close沿原strict资源门逐一核释放。
+    rig.remember_receipt()?; // Include actual added heading/code font captures for strict close-time release verification.
     println!(
         "native_body_root_leaf actual_frame=true heading_points=28,24 code_points=14 exact_source_ranges=true selection_bound_marker_points=0.1,24 canonical_markers_preserved=true original_find_source=true semantic_work={:?} formal=false whole_product=false",
         progress.semantic_work
@@ -233,7 +241,8 @@ fn run_case(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 原canonical标签、真实sealed字体与实际文字几何共用同一个完整帧，不用Parser期望反造parts。
+/// Verify canonical tags, sealed fonts, and actual text geometry in the same
+/// complete frame without manufacturing parts from parser expectations.
 fn verify_literal_code(rig: &mut Rig, source: &str) -> Result<(), String> {
     let literal = "<u>中文😀</u>";
     let start = source[..source.find(literal).expect("固定代码字面样本")]
@@ -301,7 +310,7 @@ fn verify_literal_code(rig: &mut Rig, source: &str) -> Result<(), String> {
         }
         if position < start + 3 {
             CGContext::fill_rect(Some(&mask.context), first.rect);
-        } // 遮罩只定位真实<u>三个字面字符，不借中文或emoji墨迹替隐藏标签过门。
+        } // Mask only the actual three <u> characters; Chinese/emoji ink cannot certify hidden literal tags.
         position += scalar.len_utf16();
     }
     CGContext::flush(Some(&actual.context));
@@ -313,7 +322,8 @@ fn verify_literal_code(rig: &mut Rig, source: &str) -> Result<(), String> {
         .iter()
         .zip(mask.pixels.as_chunks::<4>().0)
         .filter(|(pixel, marker)| {
-            // 只计Rig黑色字形墨迹；新代码底色最小通道约33，不能拿整块深底替字面标签过门。
+            // Count only actual black glyph ink. The code background's lowest
+            // channel is about 33, so a dark fill cannot certify literal-tag glyphs.
             **marker == [255, 0, 0, 255] && pixel[..3].iter().all(|channel| *channel < 24)
         })
         .count();
@@ -323,7 +333,7 @@ fn verify_literal_code(rig: &mut Rig, source: &str) -> Result<(), String> {
     if ink == 0 {
         return Err("代码中的原<u>标签没有真实像素墨迹".into());
     }
-    drop(scene); // 原Reader/Font/Source强边在收据与close前归还，位图和mask也不逃出本次固定控制。
+    drop(scene); // Return reader/font/Source claims before close; bitmap/mask remain local to this bounded control.
     rig.remember_receipt()?;
     println!(
         "native_body_root_leaf_code_literal actual_marker_ink={ink} bounded_paint_steps={steps} original_utf16=true actual_code_points=14 actual_tag_rects=true no_underline_or_hidden=true original_complete_frame=true formal=false whole_product=false"
@@ -331,7 +341,8 @@ fn verify_literal_code(rig: &mut Rig, source: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 每种真实代码块单独装配和关闭；上一份字体、Reader与像素全部归还后才构造下一种。
+/// Assemble and close each actual code-block variant separately. Return the prior
+/// fonts, readers, and pixels before constructing its successor.
 fn literal_code_case(mtm: MainThreadMarker, source: &str) -> Result<(), String> {
     let (retirement, publication, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
@@ -352,17 +363,18 @@ fn literal_code_case(mtm: MainThreadMarker, source: &str) -> Result<(), String> 
             .body
             .probe_root_leaf_publication()
             .map_err(|cause| cause.to_string());
-        let retirement = release::close(rig, false)?;
-        Ok((retirement, publication, result)) // 即使某个断言失败也先沿原严格拆图，不留下合成窗口或Font owner。
+        let retirement = release::close(rig)?;
+        Ok((retirement, publication, result)) // Failed assertions still dismantle the actual synthetic window/font owners first.
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     if publication?.upgrade().is_some() {
         return Err("代码字面关闭后原RootLeaf Ready仍被业务持有".into());
     }
     result
 }
 
-/// 用户刚键入后立即点击标题按钮，像素尚在重建也必须接纳同一真实选择的格式事务。
+/// Formatting immediately after actual typing must accept the same current
+/// selection transaction even while its pixels are still rebuilding.
 fn format_after_input(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
@@ -380,8 +392,10 @@ fn format_after_input(mtm: MainThreadMarker) -> Result<(), String> {
         let result = (|| {
             let frame = observe(&rig.body)?;
             let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**rig.view);
-            // 真实输入回调先发布中文；这里不运行消息循环，不等旧Scene重建后才补按格式按钮。
-            // SAFETY: 完整的短NSString与未指定替换范围沿原NSTextInputClient入口消费当前caret。
+            // Commit Chinese text through the actual input callback, then format
+            // without running the loop or waiting for a rebuilt Scene.
+            // SAFETY: The complete short NSString and unspecified replacement range
+            // use the original NSTextInputClient entry to consume its current caret.
             unsafe {
                 client.insertText_replacementRange(
                     &NSString::from_str("中"),
@@ -392,7 +406,8 @@ fn format_after_input(mtm: MainThreadMarker) -> Result<(), String> {
                 .apply_format(omni_markdown_core::MarkdownFormatAction::Heading1)
                 .map_err(|cause| cause.to_string())?;
             frame::wait_complete_frame("format_immediately_after_input", &rig.body, frame)?;
-            // 独立短文稿才允许完整oracle；生产的格式和保存仍直接消费原piece root。
+            // Only this independent short fixture permits a complete oracle;
+            // production formatting/save still consume the original piece root.
             let assert_text = |expected: &[u8]| -> Result<(), String> {
                 let document = rig.document.upgrade().ok_or("格式验证的原文稿已经释放")?;
                 let mut actual = Vec::new();
@@ -418,8 +433,9 @@ fn format_after_input(mtm: MainThreadMarker) -> Result<(), String> {
                 1,
                 1.0,
             ).ok_or("无法构造原窗口的右键菜单事件")?;
-            drop(window); // 真实事件只带窗口号，不能让验收局部 claim 延长原窗口的关闭寿命。
-            // 格式与字符键入是两个独立用户动作；原Undo逐笔恢复，不能合并或吞掉其中一步。
+            drop(window); // The event retains only the window number; a local claim must not extend window lifetime.
+            // Formatting and character insertion are separate user actions. Actual
+            // Undo restores each individually without merging or swallowing a step.
             for (index, expected) in ["中T\n", "T\n"].into_iter().enumerate() {
                 let frame = observe(&rig.body)?;
                 let menu = rig
@@ -433,8 +449,8 @@ fn format_after_input(mtm: MainThreadMarker) -> Result<(), String> {
                 {
                     return Err("右键撤销未绑定原历史，或擅自增加了快捷键".into());
                 }
-                menu.performActionForItemAtIndex(0); // 由真实NSMenu将原action交给本客户，不直接调用测试替代命令。
-                drop((undo, menu)); // 本次菜单的临时强引用必须先归还，owner仍只保当前唯一菜单。
+                menu.performActionForItemAtIndex(0); // Actual NSMenu delivers the original action to this client.
+                drop((undo, menu)); // Return temporary menu claims; the owner retains only its one current menu.
                 frame::wait_complete_frame(
                     if index == 0 {
                         "format_immediate_undo_format"
@@ -449,16 +465,17 @@ fn format_after_input(mtm: MainThreadMarker) -> Result<(), String> {
             if std::fs::read(rig._file.path()).map_err(|cause| cause.to_string())? != b"T\n" {
                 return Err("格式与撤销流程意外覆盖了原磁盘文件".into());
             }
-            // 保存和资源释放仍由实际owner负责，测试不私改selection、Scene或撤销栈。
+            // Actual owners retain save/release responsibility; this test does
+            // not mutate private selection, Scene, or undo-stack state.
             println!(
                 "native_root_format immediate_after_input=true actual_text_input_client=true native_context_menu_undo=true no_added_shortcuts=true two_real_undo=true disk_unchanged=true whole_product=false formal=false"
             );
             rig.remember_receipt()
         })();
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, result))
     })?;
-    retirement.verify(false)?; // 失败也在报告前归还真实Native、字体、Reader与原映射。
+    retirement.verify()?; // Even failure returns actual Native/font/reader/mapping resources before reporting.
     result
 }
 
@@ -482,19 +499,20 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
             .body
             .probe_root_leaf_publication()
             .map_err(|cause| cause.to_string())?;
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, publication, result))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     if publication.upgrade().is_some() {
         return Err("RootLeaf关闭后原有限Ready仍被业务强持有".into());
     }
     result?;
     literal_code_case(mtm, "outside\n\n```text\n<u>中文😀</u>\n```\n\n")?;
     literal_code_case(mtm, "outside\n\n    <u>中文😀</u>\n\n")?;
-    // 每个独立场景都在返回前核自己的完整关闭；这里顺序执行全部原流程，
-    // 把各自失败一并保留，便于一次真实运行发现编辑、字形和链接各自的生产缺陷。
-    // 不在失败后重放同一动作，不缩小样本，也不改变原期限、像素或资源断言。
+    // Each independent scenario verifies complete closure before returning. Run
+    // the original cases sequentially and retain their separate failures so one
+    // actual run can expose edit, glyph, and link defects. Never replay a failed
+    // action, shrink fixtures, or relax deadlines, pixel checks, or resource assertions.
     let mut failures = Vec::new();
     for (name, result) in [
         ("table", table::run(mtm)),

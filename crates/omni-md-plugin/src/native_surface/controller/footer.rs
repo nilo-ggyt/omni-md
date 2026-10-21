@@ -1,4 +1,4 @@
-//! 原footer只投影当前canonical聚合和已发生的保存结果；反馈显隐复用同一正文几何来源。
+//! Projects current canonical aggregates and actual save outcomes; feedback uses the original body geometry.
 
 use super::*;
 use omni_markdown_core::MarkdownWorkspaceError;
@@ -6,16 +6,14 @@ use omni_markdown_core::MarkdownWorkspaceError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native_surface) struct NativeMarkdownFooterDocument {
     dirty: bool,
-    recovery: bool,
     characters: usize,
     lines: usize,
 }
 impl NativeMarkdownFooterDocument {
-    /// 只读树根聚合；caller须在任何Native setter前结束这份Doc借用。
+    /// Reads root aggregates only; callers end the document borrow before any Native setter.
     pub(in crate::native_surface) fn capture(document: &MarkdownDocumentBuffer) -> Self {
         Self {
             dirty: document.is_dirty(),
-            recovery: document.has_pending_legacy_recovery(),
             characters: document.character_count(),
             lines: document.line_count(),
         }
@@ -30,30 +28,25 @@ pub(super) enum NativeMarkdownFooterSaveResult {
     #[default]
     Current,
     Conflict,
-    Recovery,
     Unconfirmed,
 }
 impl NativeMarkdownFooterSaveResult {
     fn after_save(self, error: Option<&MarkdownWorkspaceError>) -> Self {
         match error {
-            None => Self::Current, // 只有实际成功保存或新文稿安装才撤旧保存错误。
+            None => Self::Current, // Only an actual successful save or a newly installed document clears an old result.
             Some(MarkdownWorkspaceError::SaveConflict) => Self::Conflict,
-            Some(MarkdownWorkspaceError::PendingLegacyRecovery) => Self::Recovery,
-            // 重试的读取、输入busy或目录同步失败不能证明旧冲突已收敛；当前错误
-            // 仍由原临时反馈显示，持久footer保留必须另存/重载的既有业务事实。
-            Some(_) if matches!(self, Self::Conflict | Self::Recovery) => self,
-            Some(_) => Self::Unconfirmed, // rename后sync失败也到此；不谎报磁盘未写或已持久化。
+            // A failed read, busy input, or unconfirmed directory sync does not resolve an earlier
+            // conflict. Temporary feedback shows the new error; the footer keeps the actual conflict.
+            Some(_) if self == Self::Conflict => self,
+            Some(_) => Self::Unconfirmed, // Includes post-rename sync failure; do not claim no write or confirmed durability.
         }
     }
-    /// 冲突条只投影已观察到的保存事实；不把目录sync未确认说成磁盘尚未写入。
+    /// Projects observed save facts without presenting unconfirmed directory durability as an absent disk write.
     fn resolution_message(
         self,
         document: Option<NativeMarkdownFooterDocument>,
     ) -> Option<&'static str> {
-        let document = document?;
-        if document.recovery || self == Self::Recovery {
-            return Some("恢复草稿尚未解决。请另存为新笔记或重新加载磁盘版本。");
-        }
+        document?;
         (self == Self::Conflict).then_some("检测到磁盘版本变化，本地草稿已保留。请选择处理方式。")
     }
 
@@ -61,15 +54,11 @@ impl NativeMarkdownFooterSaveResult {
         let Some(document) = document else {
             return "未打开笔记";
         };
-        if document.recovery || self == Self::Recovery {
-            return "恢复草稿待处理 · 请另存或重新载入";
-        }
         match self {
-            Self::Conflict => "保存已暂停 · 等待处理冲突", // clean也能遇外部冲突，不能由dirty推断。
+            Self::Conflict => "保存已暂停 · 等待处理冲突", // A clean model may still conflict with an external disk revision.
             Self::Unconfirmed => "保存未确认 · 草稿已保留",
             Self::Current if document.dirty => "本地修改待保存",
             Self::Current => "已保存",
-            Self::Recovery => "恢复草稿待处理 · 请另存或重新载入",
         }
     }
 }
@@ -102,7 +91,8 @@ impl NativeMarkdownController {
         let Some(labels) = self.ivars().footer_labels.get() else {
             return; // 已关闭或尚未完整装配的控制器不能为了反馈重建控件。
         };
-        // 保存状态仍排在首位；复制既不证明保存成功，也不撤销冲突、恢复或未确认事实。
+        // Keep the real save result first. Copying neither certifies persistence nor clears an
+        // observed disk conflict or uncertain post-publication durability.
         let message = NSString::from_str(&format!("{} · 已复制全文", save.label(document)));
         labels[1].setStringValue(&message);
         if current() {
@@ -393,7 +383,7 @@ impl NativeMarkdownController {
 mod tests {
     use super::*;
     #[test]
-    /// 实际canonical的字符/CRLF行数和Undo保存基线由原树聚合提供，不读第二份字符串。
+    /// Actual file-backed edits and undo supply root aggregates and dirty state without another body string.
     fn canonical_edit_and_undo_supply_the_footer_counts_and_dirty_state() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("footer.md");
@@ -411,87 +401,5 @@ mod tests {
         );
         document.undo().unwrap();
         assert_eq!(NativeMarkdownFooterDocument::capture(&document), clean);
-    }
-
-    #[test]
-    /// 冲突是独立保存结果；undo到clean和一般失败均不能伪报已保存或磁盘未写。
-    fn save_labels_preserve_clean_conflict_recovery_and_uncertain_publication() {
-        let clean = NativeMarkdownFooterDocument {
-            dirty: false,
-            recovery: false,
-            characters: 3,
-            lines: 1,
-        };
-        let dirty = NativeMarkdownFooterDocument {
-            dirty: true,
-            ..clean
-        };
-        assert_eq!(
-            NativeMarkdownFooterSaveResult::Current.resolution_message(None),
-            None
-        );
-        assert_eq!(
-            NativeMarkdownFooterSaveResult::Current.resolution_message(Some(clean)),
-            None
-        );
-        assert_eq!(
-            NativeMarkdownFooterSaveResult::Unconfirmed.resolution_message(Some(dirty)),
-            None
-        );
-        assert_eq!(
-            NativeMarkdownFooterSaveResult::Current.resolution_message(Some(
-                NativeMarkdownFooterDocument {
-                    recovery: true,
-                    ..clean
-                }
-            )),
-            Some("恢复草稿尚未解决。请另存为新笔记或重新加载磁盘版本。")
-        );
-        assert_eq!(
-            NativeMarkdownFooterSaveResult::Current.label(None),
-            "未打开笔记"
-        );
-        assert_eq!(
-            NativeMarkdownFooterSaveResult::Current.label(Some(clean)),
-            "已保存"
-        );
-        assert_eq!(
-            NativeMarkdownFooterSaveResult::Current.label(Some(dirty)),
-            "本地修改待保存"
-        );
-        let conflict = NativeMarkdownFooterSaveResult::Current
-            .after_save(Some(&MarkdownWorkspaceError::SaveConflict));
-        assert_eq!(conflict.label(Some(clean)), "保存已暂停 · 等待处理冲突");
-        assert_eq!(conflict.label(Some(dirty)), "保存已暂停 · 等待处理冲突");
-        // 外部版本与继续编辑后的正文相同时，真实baseline采用仍可能在目录sync失败；
-        // StorageUnavailable没有完成采用权限，不能把此前的SaveConflict清掉。
-        let retry = conflict.after_save(Some(&MarkdownWorkspaceError::StorageUnavailable));
-        assert_eq!(retry, NativeMarkdownFooterSaveResult::Conflict);
-        // 旧冲突随后发生目录sync未确认时，直达操作仍在，但不能再保证“没有覆盖磁盘”。
-        assert_eq!(
-            retry.resolution_message(Some(clean)),
-            Some("检测到磁盘版本变化，本地草稿已保留。请选择处理方式。")
-        );
-        assert_eq!(retry.label(Some(clean)), "保存已暂停 · 等待处理冲突");
-        let recovery = retry.after_save(Some(&MarkdownWorkspaceError::PendingLegacyRecovery));
-        assert_eq!(
-            recovery.after_save(Some(&MarkdownWorkspaceError::StorageUnavailable)),
-            NativeMarkdownFooterSaveResult::Recovery
-        );
-        let uncertain = NativeMarkdownFooterSaveResult::Current
-            .after_save(Some(&MarkdownWorkspaceError::StorageUnavailable));
-        assert_eq!(uncertain.label(Some(dirty)), "保存未确认 · 草稿已保留");
-        assert_eq!(retry.after_save(None).label(Some(clean)), "已保存");
-        assert_eq!(
-            recovery.after_save(None),
-            NativeMarkdownFooterSaveResult::Current
-        );
-        assert_eq!(
-            NativeMarkdownFooterSaveResult::Current.label(Some(NativeMarkdownFooterDocument {
-                recovery: true,
-                ..clean
-            })),
-            "恢复草稿待处理 · 请另存或重新载入"
-        );
     }
 }

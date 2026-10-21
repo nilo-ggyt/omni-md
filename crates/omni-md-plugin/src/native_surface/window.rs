@@ -63,8 +63,6 @@ pub(super) struct PendingNativeMarkdownNoteSwitch {
     pub(super) relative_path: String,
     pub(super) previous_relative_path: Option<String>,
     pub(super) release_barrier: Option<NativeMarkdownEditorReleaseBarrier>,
-    /// 仅明确恢复决定携带一次性小票据；普通切换没有跳过旧草稿的权限。
-    pub(super) recovery_handoff: Option<omni_markdown_core::MarkdownRecoveryHandoff>,
     /// 仅该次链接切换携带已解码片段；旧图释放后移交目标Body，不保旧Doc或Scene。
     pub(super) fragment: Option<String>,
 }
@@ -571,12 +569,6 @@ impl NativeMarkdownWindowSurface {
             controller.present_error(&document_error);
         }
         if let Some(editor) = &editor {
-            // 只取纯状态后结束正文借用，再显示恢复提示；原生 setter 不跨越 RefCell 借用。
-            let pending_recovery = editor.document().borrow().has_pending_legacy_recovery();
-            if pending_recovery {
-                // 原记录没有磁盘基线，提示明确解决入口，不把自动恢复说成已经保存。
-                controller.present_pending_legacy_recovery();
-            }
             // 表格真实编辑只弱引用窗口 controller；正文不增加窗口的强所有权环。
             // Only a live editor can own the initial text responder.
             panel.setInitialFirstResponder(Some(editor.input_view()));
@@ -1082,11 +1074,6 @@ impl NativeMarkdownWindowSurface {
             // 上一个Native setter也可能重入；只清仍属于本次原反馈的状态。
             self.controller.clear_status();
         }
-        let pending_recovery = editor.document().borrow().has_pending_legacy_recovery();
-        if pending_recovery && feedback.permits(self) {
-            // 普通重开保留原恢复提示；旧文件操作不覆盖新查询已发布的反馈。
-            self.controller.present_pending_legacy_recovery();
-        }
         if feedback.permits(self)
             && !self.panel.makeFirstResponder(Some(editor.input_view()))
             && feedback.permits(self)
@@ -1419,41 +1406,46 @@ impl NativeMarkdownWindowSurface {
         (borrowed, released_field_editor)
     }
 
-    /// 正常结束输入后释放当前编辑器，并返回完整的弱释放屏障。
+    /// End the actual input client before accepting teardown and return its real release barrier.
     pub(super) fn destroy_current_editor(
         &mut self,
     ) -> Result<Option<NativeMarkdownEditorReleaseBarrier>, String> {
-        // 普通切换没有旧草稿恢复票据，仍共用相同的辞任与实际释放流程。
-        self.destroy_current_editor_with_recovery(None)
-    }
-
-    /// 在最后一次可失败的输入边界后重验恢复身份，再接受不可逆的编辑器交接。
-    pub(super) fn destroy_current_editor_with_recovery(
-        &mut self,
-        recovery_handoff: Option<&omni_markdown_core::MarkdownRecoveryHandoff>,
-    ) -> Result<Option<NativeMarkdownEditorReleaseBarrier>, String> {
-        // 弹窗局部owner尚在栈内时，不辞任/清理父输入，也不接受新资源交接。
+        // Capture the original model before the first reentrant preflight. A later Native getter,
+        // resignation, or final responder cleanup cannot silently discard newly committed input.
+        let original = self.editor.as_ref().map(|editor| {
+            (
+                Rc::downgrade(editor.document()),
+                editor.document().borrow().generation(),
+            )
+        });
+        // A live modal owner blocks resignation and accepted cleanup of its parent editor.
         self.preflight_modal_boundary()?;
         self.resign_editor_responder()?;
-        if let Some(handoff) = recovery_handoff {
-            // capture、辞任和末尾原生预检均可能重入；直到这些调用结束，才核对票据的
-            // 原路径、旧记录摘要与正文代次。失败时不冻结 provider、不清 Undo、不取走模型，
-            // 因而晚到输入继续留在当前草稿中，票据销毁也不会发布恢复决定。
-            let editor = self.editor.as_ref().ok_or("当前没有打开的笔记")?;
-            self.session
-                .validate_legacy_recovery_handoff(&editor.document().borrow(), handoff)
-                .map_err(|error| error.to_string())?;
+        let unchanged = match (&original, self.editor.as_ref()) {
+            (None, None) => true,
+            (Some((document, generation)), Some(editor)) => {
+                std::rc::Weak::ptr_eq(document, &Rc::downgrade(editor.document()))
+                    && editor.document().borrow().generation() == *generation
+            }
+            _ => false,
+        };
+        if !unchanged {
+            // No provider is frozen and no history/model is taken yet. Keep the actual new input
+            // in the original editor; the caller must save or explicitly resolve it again.
+            return Err("结束输入时正文发生变更，草稿将保持打开以供保存".to_owned());
         }
-        // 上述纯核验与 accepted 清理之间没有其他原生调用，旧 debounce 此后不能跨正文保存。
+        // No Native call separates the final scalar check from accepting teardown. Cancel the
+        // original autosave so its delayed work cannot cross into a successor document.
         self.controller.cancel_autosave();
         self.controller.set_workspace_input_enabled(false);
         let (borrowed, field_editor) = self.finish_borrowed_editing(false);
-        // 信息卡先撤原Doc弱票和全部动态文本，空控件不再挂接旧正文。
+        // Revoke the information panel's original weak document and dynamic values before detaching the graph.
         self.controller.hide_information_panel();
-        // accepted拆图前先撤纯Weak布局引用，后继反馈不能把尚未析构的旧scroll重新带回布局。
+        // Unbind weak layout references before accepted teardown; later feedback cannot remount the old scroll.
         self.controller.unbind_document_area();
         let Some(editor) = self.editor.take() else {
-            // 无正文仍可能有搜索字段的自有 editor；后继必须等它实际释放，不能漏掉该旧图。
+            // An empty body may still own a search field editor. Its actual release remains part
+            // of the barrier before the successor can acquire any document graph.
             self.note_path.setStringValue(ns_string!(""));
             self.note_path.setToolTip(None);
             self.current_note_relative_path = None;
@@ -1474,7 +1466,7 @@ impl NativeMarkdownWindowSurface {
         // Callers committed and saved composition before this irreversible ownership transition.
         let mut release_barrier = destroy_native_markdown_editor(editor);
         release_barrier.borrowed = Some(borrowed);
-        // 旧正文已结束；等待后继安装期间不继续公开已撤销的相对路径。
+        // The old body has ended; do not expose its revoked relative path while waiting for the successor.
         self.note_path.setStringValue(ns_string!(""));
         self.note_path.setToolTip(None);
         self.current_note_relative_path = None;
@@ -1540,7 +1532,6 @@ impl NativeMarkdownWindowSurface {
             relative_path: relative_path.to_owned(),
             previous_relative_path,
             release_barrier,
-            recovery_handoff: None,
             fragment,
         });
         Ok(true)
@@ -1576,61 +1567,26 @@ impl NativeMarkdownWindowSurface {
         let editor_frame =
             native_markdown_editor_frame(&content_view, self.controller.feedback_visible());
 
-        // 已验证旧图释放后才消费恢复票据；普通打开仍执行旧草稿检查，不共享忽略恢复的开关。
-        let opened = if let Some(handoff) = pending_switch.recovery_handoff {
-            self.session
-                .open_resolved_legacy_recovery(handoff)
-                .map_err(|error| error.to_string())
-                .and_then(|outcome| {
-                    // core 已核验唯一目标并尝试记录决定，只有此时才创建它的原生编辑图。
-                    native_markdown_editor_surface(
-                        outcome.document,
-                        editor_frame,
-                        self.presentation_mode,
-                        &self.owned_ledger,
-                        mtm,
-                    )
-                    .map(|editor| (editor, Some(outcome.recording)))
-                })
-        } else {
-            // 正常笔记不产生恢复存储或第二正文模型，继续使用 confined 打开入口。
-            self.open_note_editor(&pending_switch.relative_path, editor_frame, mtm)
-                .map(|editor| (editor, None))
-        };
+        // The actual old graph has released. Acquire the sole destination through the same
+        // confined UTF-8 Markdown opener; no alternate source or historical-record bypass exists.
+        let opened = self.open_note_editor(&pending_switch.relative_path, editor_frame, mtm);
         match opened {
             // A valid destination becomes the sole mounted editor after old release verification.
-            Ok((editor, recording)) => {
-                // 目标确实打开后才更新目录；下面失败恢复旧正文的分支不能覆盖用户原浏览位置。
+            Ok(editor) => {
+                // Update the sidebar only after the target really opens; failure compensation below
+                // must not overwrite the user's previous browse location.
                 self.sidebar_list
                     .select_directory(&native_markdown_note_parent(&pending_switch.relative_path));
                 self.install_editor(&content_view, editor, pending_switch.relative_path);
                 if let Some(fragment) = pending_switch.fragment.as_deref() {
-                    // 已安装目标才绑定其自己的完整Input；旧屏障和旧Source不能签标题位置。
+                    // Only the installed target's complete Input can authorize heading navigation;
+                    // the old source and release barrier grant no target location authority.
                     self.editor
                         .as_ref()
                         .expect("刚安装的唯一目标正文")
                         .body
                         .navigate_heading(fragment)
                         .map_err(|cause| cause.to_string())?;
-                }
-                if let Some(recording) = recording {
-                    // 已打开目标与恢复决定的持久化是两个事实，记录故障不能伪装成功。
-                    match recording {
-                        omni_markdown_core::MarkdownRecoveryRecording::Recorded => {
-                            // 完整决定已同步，install_editor 的正常状态已经准确。
-                        }
-                        omni_markdown_core::MarkdownRecoveryRecording::AlreadyResolved => {
-                            // 不覆盖同一旧记录的另一个合法决定，也不声称本次重新写入。
-                            self.controller
-                                .present_error("已打开笔记，既有恢复决定已保留");
-                        }
-                        omni_markdown_core::MarkdownRecoveryRecording::NotRecorded(error) => {
-                            // 明确保留旧草稿与目标文件；提示可用目标之外仍存在恢复记录故障。
-                            self.controller.present_error(&format!(
-                                "恢复决定未能完整记录，原草稿已保留，下次可能再次提示：{error}"
-                            ));
-                        }
-                    }
                 }
                 Ok(())
             }
@@ -1705,8 +1661,6 @@ impl NativeMarkdownWindowSurface {
                     .document()
                     .borrow()
                     .original_revision()
-                    // 已恢复的旧record没有可写base；即使前序保存已拒绝，类型边界也不能猜测revision。
-                    .ok_or_else(|| "旧冲突草稿尚未解决，不能修改原笔记路径".to_owned())?
                     .encode_hex(),
             )
         } else {

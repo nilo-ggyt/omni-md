@@ -35,7 +35,7 @@ pub(super) fn execute_native_markdown_file_mutation(
             .rename_directory(relative_path, name)
             .map(NativeMarkdownFileMutationResult::DirectoryRenamed)
             .map_err(|error| error.to_string()),
-        // Directory removal obeys the core empty/confinement rules after explicit user confirmation.
+        // Directory removal obeys Core confinement and reserved-directory rules after explicit user confirmation.
         NativeMarkdownFileMutation::DeleteDirectory { relative_path } => session
             .delete_directory(relative_path)
             .map(|()| NativeMarkdownFileMutationResult::DirectoryDeleted)
@@ -69,7 +69,7 @@ pub(super) fn execute_native_markdown_file_mutation(
     }
 }
 
-/// 模态前复制原行或真实浏览目录的有限上下文，不跨对话框借用surface或正文。
+/// Copy bounded original-row or selected-directory context before modal UI, without borrowing surface/body across the dialog.
 pub(super) fn native_markdown_sidebar_action_context(
     list: &NativeMarkdownSidebarTable,
     origin: &NativeMarkdownSidebarActionOrigin,
@@ -91,21 +91,23 @@ pub(super) fn native_markdown_sidebar_action_context(
             return Err("另一项 Markdown 操作仍在完成中".to_owned());
         }
         if !list.origin_matches_surface(surface, origin) {
+            // Original projection/directory authority is required before copying any modal context.
             return Err("侧栏或所选目录已经变化，请重试".to_owned());
         }
         let row = match origin {
             NativeMarkdownSidebarActionOrigin::Row { row_index, .. } => {
-                // 原菜单仍只消费自己的真实行，Note行不会凭头部按钮获得创建子项权限。
+                // Row menus consume their original row; note rows cannot acquire child-creation authority from header actions.
                 let row = native_markdown_sidebar_row_at(&surface.sidebar_rows, *row_index)
                     .cloned()
                     .ok_or_else(|| "所选侧栏条目已经不可用".to_owned())?;
                 if !native_markdown_sidebar_action_is_allowed(row.kind, action) {
+                    // A row-kind mismatch cannot authorize filesystem work from the same numeric action tag.
                     return Err("这个侧栏条目不支持所选操作".to_owned());
                 }
                 Some(row)
             }
             NativeMarkdownSidebarActionOrigin::SelectedDirectory { .. } => {
-                // 头部只恢复原有创建/导入，不伪造目录行或开放重命名、删除等行菜单操作。
+                // Headers permit existing create/import only, without fabricated directory rows or row-only rename/delete authority.
                 if !matches!(
                     action,
                     NativeMarkdownSidebarAction::CreateNote
@@ -173,7 +175,7 @@ pub(super) fn activate_native_markdown_sidebar_row(row_index: usize) -> Result<(
         // Directory selection toggles a subtree projection and restarts its bounded traversal.
         NativeMarkdownSidebarEntryKind::Directory => {
             with_active_native_markdown_surface(|surface| {
-                // 浏览目录与当前正文独立；折叠/刷新只能改变投影，不能抹掉这次明确选择。
+                // Browse directory is independent of the open note; projection refresh cannot erase explicit directory selection.
                 surface.sidebar_list.select_directory(&row.relative_path);
                 if !surface.collapsed_directories.remove(&row.relative_path) {
                     // First toggle hides descendants; a second removes the collapsed marker and expands them.
@@ -189,7 +191,7 @@ pub(super) fn activate_native_markdown_sidebar_row(row_index: usize) -> Result<(
         // The virtual root is the stable return-to-first-page navigation target.
         NativeMarkdownSidebarEntryKind::Root => {
             with_active_native_markdown_surface(|surface| {
-                // 只有明确点击根行才把目的地切回根，不把缺失的页内目录当成根。
+                // Only an explicit root click changes destination to root; a directory absent from this page cannot imply root selection.
                 surface.sidebar_list.select_directory("");
                 Ok::<(), String>(())
             })?;
@@ -244,7 +246,7 @@ pub(super) fn reveal_markdown_entry_in_finder(path: &Path) -> Result<(), String>
     Ok(())
 }
 
-/// 原行菜单与恢复的头部入口共用名称收集、原来源复核和唯一文件mutation流程。
+/// Row menus and header actions share name collection, original-origin checks, and the sole mutation workflow.
 pub(super) fn request_native_markdown_sidebar_action(
     list: &NativeMarkdownSidebarTable,
     origin: &NativeMarkdownSidebarActionOrigin,
@@ -252,11 +254,11 @@ pub(super) fn request_native_markdown_sidebar_action(
 ) -> Result<(), String> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| "Markdown 文件操作必须在 AppKit 主线程执行".to_owned())?;
-    // 先纯检查modal，不借出Active、不复制候选或触及父输入。
+    // Check modal admission before leasing Active, copying candidates, or touching parent input.
     preflight_native_markdown_modal()?;
     let context = native_markdown_sidebar_action_context(list, origin, action)?;
     if action == NativeMarkdownSidebarAction::ImportNote {
-        // 头部和文档菜单共用一个导入实现，目的地来自原目录票而非当前正文的父目录。
+        // Header/document menus share import; the original directory ticket chooses destination, not the open note's parent.
         return import_native_markdown_note_to_directory(list, origin);
     }
     if action == NativeMarkdownSidebarAction::RevealInFinder {
@@ -275,7 +277,7 @@ pub(super) fn request_native_markdown_sidebar_action(
             action,
             NativeMarkdownSidebarAction::CreateNote | NativeMarkdownSidebarAction::CreateDirectory
         ) {
-            // 同一中文创建面板接收真实来源提供的父目录，不能要求该目录仍在当前有限页。
+            // Creation uses the original parent directory, which need not remain in the current bounded page.
             let parent_directory = match origin {
                 NativeMarkdownSidebarActionOrigin::Row { .. } => {
                     &context
@@ -295,7 +297,7 @@ pub(super) fn request_native_markdown_sidebar_action(
                 mtm,
             );
         }
-        // 其余操作已由真实行kind/action检查接纳；头部来源不能进入这些分支。
+        // Remaining operations passed real row-kind/action admission; header origins cannot enter these branches.
         let row = context.row.as_ref().expect("非创建的文件动作具有真实行");
         match (row.kind, action) {
             (NativeMarkdownSidebarEntryKind::Directory, NativeMarkdownSidebarAction::Rename) => {
@@ -359,7 +361,7 @@ pub(super) fn request_native_markdown_sidebar_action(
                 }))
             }
             (NativeMarkdownSidebarEntryKind::Directory, NativeMarkdownSidebarAction::Delete) => {
-                // 显式确认授权受core confinement保护的递归目录删除，不扩大到vault root或保留目录。
+                // Confirmation authorizes Core-confined recursive deletion, never the vault root or reserved directories.
                 Ok(
                     run_native_markdown_delete_confirmation(&context.controller, row, mtm)
                         .map_err(|error| error.to_string())?
@@ -393,7 +395,7 @@ pub(super) fn request_native_markdown_sidebar_action(
     begin_native_markdown_file_mutation(list, origin, context.row.as_ref(), mutation)
 }
 
-/// 原右键创建与恢复的头部创建只收集名称；真实Core写入仍由唯一mutation流程负责。
+/// Context-menu/header creation collects names only; the sole mutation workflow owns actual Core publication.
 fn collect_native_markdown_sidebar_creation(
     controller: &NativeMarkdownController,
     parent_directory: &str,
@@ -401,7 +403,7 @@ fn collect_native_markdown_sidebar_creation(
     mtm: MainThreadMarker,
 ) -> Result<Option<NativeMarkdownFileMutation>, String> {
     match action {
-        // 父目录保留原相对身份，名称的冲突、保留目录和路径约束继续由Core执行。
+        // Preserve relative parent identity; Core retains name collision, reserved-directory, and confinement policy.
         NativeMarkdownSidebarAction::CreateNote => run_native_markdown_name_dialog(
             controller,
             "新建笔记",
@@ -418,7 +420,7 @@ fn collect_native_markdown_sidebar_creation(
                 title,
             })
         }),
-        // 目录创建沿同一对话框生命周期，不分配正文或提前更新浏览目录。
+        // Directory creation shares the dialog lifecycle, without allocating body text or prematurely changing browse selection.
         NativeMarkdownSidebarAction::CreateDirectory => run_native_markdown_name_dialog(
             controller,
             "新建目录",
@@ -439,7 +441,7 @@ fn collect_native_markdown_sidebar_creation(
     }
 }
 
-/// 文件接纳点保留原页/行或目录选择；保存与实际释放继续由原surface负责。
+/// Mutation admission preserves original page/row or directory selection; the original surface owns save and actual release.
 pub(super) fn begin_native_markdown_file_mutation(
     list: &NativeMarkdownSidebarTable,
     origin: &NativeMarkdownSidebarActionOrigin,
@@ -452,17 +454,18 @@ pub(super) fn begin_native_markdown_file_mutation(
         // Modal reentry may have accepted close; never stage a command into its retiring surface.
         return Err("原生 Markdown 窗口正在关闭".to_owned());
     }
-    // 在take Active owner或正文save/release之前拒绝仍在栈中的modal。
+    // Refuse an active modal stack before taking Active or starting body save/release.
     preflight_native_markdown_modal()?;
     let controller = autoreleasepool(|_| {
         with_active_native_markdown_surface(|surface| {
             if !list.origin_matches_surface(surface, origin) {
+                // A modal result cannot borrow a replacement projection or changed selected directory.
                 return Err("侧栏或所选目录已经变化，请重新选择".to_owned());
             }
             if let NativeMarkdownSidebarActionOrigin::Row { row_index, .. } = origin {
                 let current_row = native_markdown_sidebar_row_at(&surface.sidebar_rows, *row_index);
                 if current_row != expected_row {
-                    // 页与行内容都属于原菜单，modal返回不能借同号行操作后继文件。
+                    // Original page and row identity survive modal return; a reused row index cannot authorize another file.
                     return Err("侧栏已经变化，请重新选择条目".to_owned());
                 }
             }
@@ -477,7 +480,7 @@ pub(super) fn begin_native_markdown_file_mutation(
             .ok_or("当前没有等待执行的笔记文件操作")?;
         controller.enqueue_owned_after_release(pending.release_barrier.as_ref(), || {
             if let Err(error) = finish_native_markdown_file_mutation() {
-                // 失败可能已改变磁盘，保留原首因；不调度隐式重试或猜测新路径。
+                // Failure may follow disk mutation; preserve the first cause without implicit retry or a guessed path.
                 eprintln!("笔记文件操作失败：{error}");
             }
         });
@@ -495,8 +498,8 @@ pub(super) fn finish_native_markdown_file_mutation() -> Result<(), String> {
     }
     autoreleasepool(|_| {
         with_active_native_markdown_surface(|surface| {
-            // 原ticket来自begin且跨release异步保存；finish不能领取等待期间新B的current代次。
-            // 反馈只更新自己实际cancel推进的预期代次，不持任何业务payload。
+            // The begin ticket survives asynchronous release; finish cannot recapture input created while waiting.
+            // Feedback advances only through this action's actual cancellation successor and retains no business payload.
             let mut feedback_intent = surface
                 .pending_file_mutation
                 .as_ref()
@@ -506,7 +509,7 @@ pub(super) fn finish_native_markdown_file_mutation() -> Result<(), String> {
                 && feedback_intent
                     .is_some_and(|intent| surface.workspace_refresh_intent_is_current(intent))
             {
-                // 操作可能已发布或部分完成；不声称磁盘未变，旧意图也不能覆盖新输入/关闭。
+                // Publication may already be partial or complete; do not claim unchanged disk or overwrite newer input/close status.
                 surface.controller.present_error(error);
             }
             mutation_result

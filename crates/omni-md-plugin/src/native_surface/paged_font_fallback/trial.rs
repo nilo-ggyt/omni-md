@@ -1,4 +1,5 @@
-//! 一个原试次的持久worker状态；只有输入和逐字形检查可分量子，shape仍是原同步完整pass。
+//! Persist one original worker trial. Input ingestion and glyph inspection can advance in quanta;
+//! shaping itself remains the original complete synchronous pass.
 use omni_markdown_core::{
     MARKDOWN_LAYOUT_SOURCE_BYTES, MarkdownShapingBudget, MarkdownShapingJob,
     MarkdownShapingProfile, MarkdownShapingResourceObserver,
@@ -6,18 +7,19 @@ use omni_markdown_core::{
 
 use super::*;
 
-/// 每步最多检查256条真实输出；上限不改变完整GCB或最终缺字结论。
+/// Inspect at most 256 actual output records per step without changing the complete grapheme or missing-glyph conclusion.
 pub const NATIVE_MARKDOWN_FONT_TRIAL_GLYPHS: usize = 256;
 
-/// 三类工作独立计费；零预算只让对应阶段等待，仍检查原Source和取消位。
+/// Account for three work classes independently; zero budget pauses only that phase while still checking original source/cancellation.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeMarkdownFontTrialBudget {
     pub input: MarkdownShapingBudget,
     pub glyphs: usize,
-    /// 每步至多调用一次原同步shape；1不代表vendor pass能在一个时间量子内返回。
+    /// Permit at most one original synchronous shape call per step, without claiming that a vendor pass fits a time quantum.
     pub shape_calls: usize,
 }
 impl Default for NativeMarkdownFontTrialBudget {
+    /// Reuse Core's finite input budget and this worker's fixed glyph/shape ceilings.
     fn default() -> Self {
         Self {
             input: MarkdownShapingBudget::default(),
@@ -27,7 +29,7 @@ impl Default for NativeMarkdownFontTrialBudget {
     }
 }
 
-/// 只有Finished允许消费完整结果；输入结束或shape返回不能提前代表已检查全部glyph。
+/// Only Finished authorizes consuming a complete result; input completion or shape return does not prove every glyph was checked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeMarkdownFontTrialStatus {
     Ingesting,
@@ -36,7 +38,7 @@ pub enum NativeMarkdownFontTrialStatus {
     Finished,
 }
 
-/// Core失败时不返回该输入步已读计数；显式保留有限上界，不能把未知工作伪报成零。
+/// Core errors return no partial input counters; preserve the admitted finite upper bound instead of reporting unknown work as zero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeMarkdownFontTrialInputProgress {
     NotAttempted,
@@ -50,7 +52,7 @@ pub enum NativeMarkdownFontTrialInputProgress {
     },
 }
 
-/// 本步只推进一个阶段；glyphs计成功取得的原记录，shape_calls计实际原API调用。
+/// Advance one phase per step; glyphs counts successfully read original records and shape_calls counts actual original API calls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeMarkdownFontTrialStep {
     pub status: NativeMarkdownFontTrialStatus,
@@ -59,7 +61,7 @@ pub struct NativeMarkdownFontTrialStep {
     pub shape_calls: usize,
 }
 
-/// 只在原worker内部构造并保留原非Send Job；跨线程传送的仍只有Trial packet和最终结果。
+/// Construct and retain the non-Send Job inside its original worker; only the trial packet and final result cross threads.
 pub struct NativeMarkdownFontTrialWorker {
     #[cfg(feature = "native-paged-production")]
     probe: Option<omni_markdown_core::MarkdownLineFontProbe>,
@@ -77,8 +79,9 @@ pub struct NativeMarkdownFontTrialWorker {
 }
 
 impl NativeMarkdownFontTrial {
-    /// 消费原packet后才在当前线程构造Job；主线程或构造失败成为同nonce的终态错误。
-    /// 失败没有伪造的零资源收据，调用方仍通过into_result取得原错误。
+    /// Consume the original packet before constructing a Job on this thread. Main-thread use
+    /// or construction failure becomes that same nonce's terminal error, without a fabricated
+    /// zero-resource receipt; into_result still returns the original failure.
     #[must_use]
     pub fn into_worker(self) -> NativeMarkdownFontTrialWorker {
         let Self {
@@ -122,17 +125,21 @@ impl NativeMarkdownFontTrial {
                 if MainThreadMarker::new().is_some() {
                     return Err(NativeMarkdownFontFallbackError::MainThreadShape);
                 }
-                // 外 GCB 与当前 scalar shaping 段均来自同 Source 的封存票；Worker 只消费当前真段。
-                // 下一段只能在此 Job/glyph 存储真实归还后由原 Composer 推进，不重扫远端段首。
+                // Outer grapheme and current scalar shaping segment share one frozen source
+                // ticket. Consume this real segment only; the original Composer advances
+                // after this Job/glyph storage actually returns, without rescanning a remote prefix.
                 return probe
                     .shaping_job(font, &worker.font, options, worker.cancellation.clone())
                     .map_err(compose::error);
             }
-            // 未取得协调器原票的公开完整试次仍由原构造验证两端，不凭本地范围补签权限。
+            // The public complete-trial path lacking a Composer ticket still validates both
+            // endpoints through its original constructor, without renewing authority from local bounds.
             source.byte_offset_for_utf16(range.start)?;
             if MainThreadMarker::new().is_some() {
                 return Err(NativeMarkdownFontFallbackError::MainThreadShape);
-            } // 原 Source 真实错误优先于线程调度；不让长 GCB 进入主线程同步算法。
+            }
+            // Actual source failure takes precedence over thread scheduling; long graphemes
+            // cannot enter the main thread's synchronous shaping algorithm.
             Ok(MarkdownShapingJob::new_with_cancellation(
                 source,
                 &worker.source,
@@ -149,41 +156,44 @@ impl NativeMarkdownFontTrial {
                 worker.job = Some(job);
             }
             Err(error) => worker.finish(Err(error)),
-        } // 只有实际构造成功才发布原observer；失败的None保留“未取得收据”事实。
+        }
+        // Publish an observer only after actual construction. None on failure means no receipt was acquired.
         worker
     }
 
-    /// 同步兼容入口只驱动同一个状态机；调用方仍须在真实worker执行并join。
-    /// 此方法不承诺长GCB的shape可暂停，也没有第二套缺字或候选选择算法。
+    /// Drive this same worker to completion synchronously; the caller still executes and joins
+    /// a real worker. This convenience entry adds no second missing-glyph/candidate algorithm
+    /// and does not promise interruptible shaping of a long grapheme.
     pub fn run(self) -> NativeMarkdownFontTrialResult {
         let mut worker = self.into_worker();
         while worker.status() != NativeMarkdownFontTrialStatus::Finished {
             worker.step(NativeMarkdownFontTrialBudget::default());
-        } // 默认预算在各阶段都有实际进度；没有后台轮询或自动新建线程。
+        }
+        // Default budgets make real progress in every phase; this loop neither polls a background task nor starts a thread.
         worker.into_result()
     }
 }
 
 impl NativeMarkdownFontTrialWorker {
-    /// 只读阶段不升级权限；Finished仍须消费最终结果并由原fallback重核试次身份。
+    /// Observe the phase without upgrading authority; Finished still needs result consumption and original fallback identity checks.
     #[must_use]
     pub fn status(&self) -> NativeMarkdownFontTrialStatus {
         self.status
     }
 
-    /// 原取消位没有正文、字体或Job强边；请求停止不等于已交还资源。
+    /// The original cancellation flag holds no body, font or Job claim; requesting stop does not prove resource release.
     #[must_use]
     pub fn cancellation(&self) -> MarkdownShapingCancellation {
         self.cancellation.clone()
     }
 
-    /// 原Job的纯原子观察者；构造失败的None不是零资源已通过。
+    /// Lend the original Job's atomic observer; None after construction failure is not successful zero-resource evidence.
     #[must_use]
     pub fn resource_observer(&self) -> Option<MarkdownShapingResourceObserver> {
         self.resources.clone()
     }
 
-    /// 推进当前单一阶段；超额glyph或shape预算按固定上限消费，不扩大正文覆盖。
+    /// Advance the current phase only, clamping glyph/shape work to fixed ceilings without widening source coverage.
     pub fn step(&mut self, budget: NativeMarkdownFontTrialBudget) -> NativeMarkdownFontTrialStep {
         let mut step = NativeMarkdownFontTrialStep {
             status: self.status,
@@ -194,16 +204,19 @@ impl NativeMarkdownFontTrialWorker {
         if self.status == NativeMarkdownFontTrialStatus::Finished {
             self.refresh_terminal_error();
             return step;
-        } // 终态不重跑输入或shape；原共享Source后来失败仍不能交出旧成功facts。
+        }
+        // Terminal steps replay no ingestion or shaping; later shared-source failure still revokes old successful facts.
         match self.advance(budget, &mut step) {
             Ok(true) => self.finish(Ok(self.facts)),
-            Ok(false) => {} // 有效零预算或阶段转换保留同一Job，不签不完整缺字结论。
+            // Zero budget or a phase transition preserves this Job without certifying incomplete glyph facts.
+            Ok(false) => {}
             Err(error) => self.finish(Err(error)),
         }
         step.status = self.status;
         step
     }
 
+    /// Debit one real phase after original Source/Font/probe/cancellation validation, including zero-budget calls.
     fn advance(
         &mut self,
         budget: NativeMarkdownFontTrialBudget,
@@ -212,18 +225,21 @@ impl NativeMarkdownFontTrialWorker {
         #[cfg(feature = "native-paged-production")]
         if let Some(probe) = &self.probe {
             probe.validate().map_err(compose::error)?;
-        } // 零预算也核原Source及原Style scope；原响应已消费时不能继续旧字体试次。
+        }
+        // Even zero budget validates original source/style scope; a consumed response cannot continue an old font trial.
         let job = self
             .job
             .as_mut()
             .ok_or(NativeMarkdownFontFallbackError::InvalidState)?;
-        job.profile()?; // 每步包括零预算都走原Source/Font/分页/取消门，不以阶段缓存绕过健康。
+        // No cached phase bypasses the actual Source/Font/paging/cancellation health boundary.
+        job.profile()?;
         match self.status {
             NativeMarkdownFontTrialStatus::Ingesting => {
                 if budget.input.bytes == 0 || budget.input.scalars == 0 {
                     return Ok(false);
                 }
-                // 原Core输入失败不提供部分计数；先登记真实允许上界，成功才替换成准确计数。
+                // Core supplies no partial counters on failure. Record the actual admitted
+                // upper bounds first; replace them with exact counters only after success.
                 step.input = NativeMarkdownFontTrialInputProgress::Failed {
                     byte_limit: budget
                         .input
@@ -251,7 +267,8 @@ impl NativeMarkdownFontTrialWorker {
                     return Ok(false);
                 }
                 step.shape_calls = 1;
-                job.shape(&self.source, &self.font)?; // 原完整同步vendor pass，不声称时间量子有界。
+                // This is the original complete synchronous vendor pass, without a bounded-time claim.
+                job.shape(&self.source, &self.font)?;
                 let profile = job.profile()?;
                 self.facts = facts(profile);
                 self.status = NativeMarkdownFontTrialStatus::CheckingGlyphs;
@@ -277,15 +294,17 @@ impl NativeMarkdownFontTrialWorker {
                         && probe.source_range().end <= 8
                         && std::env::var_os("OMNI_NATIVE_PROBE_TRACE").is_some()
                     {
-                        // 原检查循环刚取得的实际glyph直接交诊断；不重读spool、不另shape，
-                        // 也不把试次候选当最终选择。主线程原Choice日志另确认最终注册Font。
+                        // Diagnose the actual glyph just read by this loop, without rereading
+                        // the spool, reshaping or treating a trial candidate as final selection.
+                        // The main-thread Choice event separately identifies the registered final font.
                         eprintln!(
                             "native_font_trial_glyph whole_gcb={:?} record_index={} actual_glyph={glyph:?}",
                             probe.source_range(),
                             self.checked,
                         );
                     }
-                    // 只成功读取原记录才增加计数；任何后续失败都整次撤权，不发布已有前缀。
+                    // Count only a successfully read original record. Later failure revokes
+                    // the entire trial, without publishing its already-inspected prefix.
                     step.glyphs += 1;
                     self.checked += 1;
                     self.facts.missing_glyphs = self
@@ -298,7 +317,8 @@ impl NativeMarkdownFontTrialWorker {
                 if self.checked == self.facts.glyph_count {
                     if job.glyph(&self.source, &self.font, self.checked)?.is_some() {
                         return Err(NativeMarkdownFontFallbackError::InvalidCluster);
-                    } // 原EOF getter完整认证实际条数；零glyph也不能用猜测跳过此门。
+                    }
+                    // The real EOF getter certifies actual record count, including an empty output.
                     return Ok(true);
                 }
                 Ok(false)
@@ -309,8 +329,10 @@ impl NativeMarkdownFontTrialWorker {
         }
     }
 
+    /// Return the actual Job before observing terminal resource facts; retain no glyph arrays in the result.
     fn finish(&mut self, outcome: Result<NativeMarkdownFontGlyphFacts>) {
-        drop(self.job.take()); // 真正交还分页数组和本Job的Source/Font强边后才读取终态收据。
+        // Return paged arrays and this Job's Source/Font claims before observing its terminal receipt.
+        drop(self.job.take());
         let resources = self
             .resources
             .as_ref()
@@ -322,7 +344,8 @@ impl NativeMarkdownFontTrialWorker {
                     MarkdownShapingError::Source(_)
                 ))
         ) {
-            outcome // 原Source错误先于分页和取消；最后Drop的新Backing失败还会在下方再核。
+            // Original source failure precedes paging/cancellation; the final backing Drop is checked again below.
+            outcome
         } else if let Some(error) = resources.and_then(|resources| resources.first_error) {
             Err(NativeMarkdownFontFallbackError::GlyphStoreIo(error))
         } else if resources.is_some_and(|resources| {
@@ -348,6 +371,7 @@ impl NativeMarkdownFontTrialWorker {
         self.refresh_terminal_error();
     }
 
+    /// Recheck shared original-source/probe health before allowing a terminal success to escape.
     fn refresh_terminal_error(&mut self) {
         #[cfg(feature = "native-paged-production")]
         let probe_error = self.probe.as_ref().and_then(|probe| probe.validate().err());
@@ -370,13 +394,17 @@ impl NativeMarkdownFontTrialWorker {
             ) || result.outcome.is_ok())
         {
             result.outcome = Err(compose::error(cause));
-        } // 草稿正文撤权同属原Source失败，必须优先于稍后的取消；弱scope失效不覆盖已有分页首错。
+        }
+        // Draft revocation is an original-source failure before later cancellation; an
+        // expired weak scope does not replace an existing paging failure.
         if result.outcome.is_ok() && self.cancellation.requested() {
             result.outcome = Err(MarkdownShapingError::Cancelled.into());
-        } // 终态先核Source/原票，再核取消；没有任何旧成功可以越过真实源健康门。
+        }
+        // Check source/original ticket before cancellation; old success cannot bypass actual source health.
     }
 
-    /// 消费完整终态；若调用者提前停止，先请求原取消并实际归还Job，不把前缀视为成功。
+    /// Consume a complete terminal result; early consumption requests original cancellation
+    /// and actually returns the Job instead of treating its prefix as success.
     pub fn into_result(mut self) -> NativeMarkdownFontTrialResult {
         if self.status != NativeMarkdownFontTrialStatus::Finished {
             self.cancellation.request();
@@ -395,14 +423,17 @@ impl NativeMarkdownFontTrialWorker {
 }
 
 impl Drop for NativeMarkdownFontTrialWorker {
+    /// Early return still requests stop and destroys the actual Job; independent observers retain no business resources.
     fn drop(&mut self) {
         if self.status != NativeMarkdownFontTrialStatus::Finished {
             self.cancellation.request();
         }
-        drop(self.job.take()); // 未消费结果的早退也真实释放；观察者独立存活但不保业务资源。
+        // Dropping an unconsumed result cannot defer returning this worker's actual Job.
+        drop(self.job.take());
     }
 }
 
+/// Copy only finite profile counters; missing-glyph facts are established by the later actual output traversal.
 fn facts(profile: MarkdownShapingProfile) -> NativeMarkdownFontGlyphFacts {
     NativeMarkdownFontGlyphFacts {
         glyph_count: profile.glyph_count,

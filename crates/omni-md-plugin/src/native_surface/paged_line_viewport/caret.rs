@@ -1,4 +1,4 @@
-//! 从封存行取真实插入点两侧；换行侧不能代替双向文字的第二视觉位置。
+//! Read actual caret sides from sealed lines; wrap affinity cannot substitute for a second Bidi visual position.
 
 use super::*;
 use crate::native_surface::{
@@ -6,7 +6,7 @@ use crate::native_surface::{
     paged_text_view::NativeMarkdownPagedHeadAffinity,
 };
 
-/// 只有有限标量，不保留Native、正文或新索引；两个框不同时，消费者必须明确解决歧义。
+/// Bounded scalar facts retain no Native object, text, or new index; different rectangles require explicit ambiguity resolution.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NativeMarkdownComposedCaretGeometry {
     pub source_utf16: usize,
@@ -18,15 +18,15 @@ pub struct NativeMarkdownComposedCaretGeometry {
 }
 
 impl NativeMarkdownComposedViewport {
-    /// 读取一个真实GCB的行框和视觉插入点；只访问已经准备的有限Line/Part。
+    /// Read the actual grapheme's line frame/visual caret through prepared bounded Line/Part metadata only.
     ///
-    /// Upstream取终止于该位置的原行，Downstream取从该位置开始的原行。真正BOF/EOF
-    /// 只有一个存在的文档侧；缓存窗口边缘没有这个特权。行内BiDi边界仍可有两个框，
-    /// 不因调用者给了换行侧就静默丢掉第二位置。准备好的overscan行也可返回，屏幕与
-    /// IME消费者还须按自身原viewport合同检查可见性。
+    /// Upstream chooses the line ending at this position; Downstream chooses the line starting there. Actual BOF/EOF
+    /// has only its existing document side; a cache-window edge has no such privilege. A Bidi boundary may still have two rectangles,
+    /// and wrap affinity cannot silently discard the second. Prepared overscan lines may also return; screen/IME consumers
+    /// must separately enforce their original viewport visibility contract.
     ///
     /// # Errors
-    /// 原Source/Font/scene失效、非GCB、请求侧未准备或多于两个不同位置均拒绝。
+    /// Reject invalid original Source/font/Scene, non-grapheme positions, an unprepared side, or more than two distinct caret positions.
     pub fn caret_geometry(
         &self,
         source_utf16: usize,
@@ -36,8 +36,8 @@ impl NativeMarkdownComposedViewport {
         self.caret_geometry_impl(source_utf16, affinity, None, current)
     }
 
-    /// 正式选择的Bidi侧决定实际主caret；没有旧侧时与视觉导航共用最低真实level规则。
-    /// 已失配的侧保持Pending，不能在同一次旧输入意图中改签另一个part。
+    /// The actual selection Bidi side chooses primary caret; absent a side, share visual navigation's lowest actual level rule.
+    /// A mismatched side remains Pending; the same old input intent cannot authorize a different part.
     pub fn caret_geometry_with_side(
         &self,
         source_utf16: usize,
@@ -48,8 +48,8 @@ impl NativeMarkdownComposedViewport {
         self.caret_geometry_impl(source_utf16, affinity, Some(side), current)
     }
 
-    /// 场景路由只消费原已准备行的真实kind与既有换行侧；不从源字符或范围长度猜结构块。
-    /// 用于识别只在正文overscan内、未产生可见Grid窗口的表格，不能为它合成font0文字几何。
+    /// Scene routing consumes prepared line kind/wrap affinity only, without inferring structural blocks from characters/range length.
+    /// Identify tables in Body overscan without a visible Grid window; do not synthesize font-zero text geometry for them.
     pub(in crate::native_surface) fn table_row_at(
         &self,
         position: usize,
@@ -73,24 +73,24 @@ impl NativeMarkdownComposedViewport {
     ) -> Result<NativeMarkdownComposedCaretGeometry> {
         self.require(current)?;
         let index = self.caret_line_index(source_utf16, affinity)?;
-        self.require(current)?; // 原Reader租约已结束，真实Source错误仍先于缺页或撤权。
+        self.require(current)?; // The reader borrow ended; actual Source failure still precedes missing-page/revocation results.
         let line = &self.lines[index];
         if line.handle.facts().kind == omni_markdown_core::MarkdownComposedLineKind::TableRow {
             return Err(NativeMarkdownComposedViewportError::Pending);
-        } // 结构块没有文字字号或caret；真正格位置由外层同源Grid提供，不放宽字体guard。
+        } // Structural blocks have no text point size/caret; outer same-Source Grid supplies Cell geometry without relaxing font guards.
         let selected = side
             .map(|side| self.caret_part_index(line, source_utf16, side))
             .transpose()?;
         let (mut primary, mut secondary) = (None, None);
-        // Part本身已有固定窗口上限；只查包含该GCB的实际字体/方向端点，不遍历正文。
+        // The window bounds part count; inspect actual font/direction endpoints containing this grapheme, not document text.
         for (index, part) in line.parts.iter().enumerate() {
             if selected.is_some_and(|selected| selected != index) {
-                continue; // 正式caret/IME消费同一次实际Bidi侧；旧公开查询仍保留双位置事实。
+                continue; // Caret/IME consumes its actual Bidi side; the unselected public query retains both positions.
             }
             let range = &part.handle.facts().source_utf16;
             if source_utf16 < range.start || source_utf16 > range.end {
                 continue;
-            } // 同行但没有这个源位置的视觉part不参与插入点选择。
+            } // A visual part on this line without the source position cannot participate in caret choice.
             let caret = composed_part_caret(
                 &self.output,
                 &part.handle,
@@ -99,7 +99,7 @@ impl NativeMarkdownComposedViewport {
                 line.baseline,
                 &|| self.require(current).is_ok(),
             );
-            self.require(current)?; // bool回调不抹掉原Source的实际首错。
+            self.require(current)?; // A boolean guard cannot erase the original Source first failure.
             let caret = caret?;
             let rect = NSRect::new(
                 NSPoint::new(caret.baseline.x, caret.baseline.y - line.descent),
@@ -107,14 +107,14 @@ impl NativeMarkdownComposedViewport {
             );
             if !point(rect.origin) || !rect.size.height.is_finite() || rect.size.height <= 0.0 {
                 return Err(NativeMarkdownComposedViewportError::InvalidGeometry);
-            } // 不能把无效坐标或空字体行补成一个固定高度的成功光标。
+            } // Invalid coordinates/empty font height cannot be replaced by a fixed-height successful caret.
             if primary.is_none() {
                 primary = Some(rect);
             } else if primary != Some(rect) && secondary.is_none() {
                 secondary = Some(rect);
             } else if primary != Some(rect) && secondary != Some(rect) {
                 return Err(NativeMarkdownComposedViewportError::Pending);
-            } // 保留真实BiDi歧义；同点字体边界只归并相同框，多候选不能任取前两项。
+            } // Retain Bidi ambiguity; merge identical font-boundary rectangles only, never arbitrarily keep two of several candidates.
         }
         self.require(current)?;
         Ok(NativeMarkdownComposedCaretGeometry {

@@ -1,4 +1,5 @@
-//! 表格硬边界只结清此前真实 LB token，再以原末控制恢复同一 DFA；表格内部没有断行权限。
+//! Table hard boundaries settle earlier actual line-break tokens, then restore
+//! the same DFA from its trailing control. Table interiors grant no break authority.
 
 use super::*;
 use crate::markdown_layout_source::table_rows::{TableCursor, TablePlan};
@@ -9,7 +10,8 @@ pub(super) struct State {
 }
 
 impl MarkdownLineBreakJob {
-    /// 同一个空动态目录在首次正文消费前共享，后续表格行只追加原结构事实。
+    /// Shares the same initially empty dynamic directory before consuming body text.
+    /// Later table rows append only their original structural facts.
     pub(crate) fn install_table_plan(&mut self, plan: TablePlan) -> Result<()> {
         plan.require(&self.source)?;
         self.tables = Some(State {
@@ -20,7 +22,8 @@ impl MarkdownLineBreakJob {
     }
 }
 
-/// 每步仍支付原 records/bytes/scalars；行体长度没有进入任何文本借用或常驻数组。
+/// Every step still charges records, bytes, and scalars. Row-body length never
+/// becomes a whole-row text lease or a retained array.
 pub(super) fn advance(
     job: &mut MarkdownLineBreakJob,
     budget: MarkdownLineBreakBudget,
@@ -34,13 +37,18 @@ pub(super) fn advance(
         return Ok(false);
     };
     if !state.jumped && job.machine.byte_offset() >= span.end.byte as u64 {
+        // The original decoder already passed this structural row. Consume its
+        // cursor once without replaying a jump or generating duplicate boundaries.
         state.cursor.finish();
         return Ok(true);
     }
     if job.machine.byte_offset() < span.start.byte as u64 {
+        // Earlier ordinary body text still needs the original line-breaking rules.
         return Ok(false);
     }
     if !state.jumped {
+        // Settle every earlier actual pending token before abandoning table-body
+        // context. Each rule transition remains charged even when it emits no break.
         while job.machine.has_before_table(span.start.byte) {
             if step.records == budget.records {
                 return Ok(true);
@@ -48,7 +56,7 @@ pub(super) fn advance(
             if let Some(event) = job.machine.drain_before_table(span.start.byte) {
                 job.index.push(event, job.machine.needs_dictionary())?;
             }
-            step.records += 1; // 真实待决规则结算即使没有断点也消费一个有限状态操作。
+            step.records += 1; // Settling a real pending rule costs one operation even when no break is emitted.
         }
         job.machine.begin_table_tail(span);
         state.jumped = true;
@@ -58,6 +66,8 @@ pub(super) fn advance(
         .end
         .byte
         .min(start.saturating_add((budget.bytes - step.bytes).min(budget.scalars - step.scalars)));
+    // The table proof grants only this real trailing-control extent. Feed it
+    // through the same DFA byte by byte, never parse or copy the row interior.
     let mut failure = None;
     job.source
         .visit_byte_range(start..end, |bytes| {
@@ -78,6 +88,8 @@ pub(super) fn advance(
             Ok(())
         })
         .or_else(|error| {
+            // This local sentinel only transports the actual machine failure out
+            // of the bounded visitor. Real source/lease errors retain precedence.
             if error == MarkdownDocumentBufferError::RangeOutsideDocument && failure.is_some() {
                 Ok(())
             } else {
@@ -88,13 +100,16 @@ pub(super) fn advance(
         return Err(error.into());
     }
     if job.machine.byte_offset() == span.end.byte as u64 {
+        // Only complete tail consumption retires this row; a short quota retains
+        // the same decoder/cursor state for the next admitted quantum.
         state.cursor.finish();
         state.jumped = false;
     }
     Ok(true)
 }
 
-/// 已收费的原行只裁界读取，不为解析预算取一个尚未发布的后继行。
+/// Uses already charged original rows to bound reads; parser budget cannot
+/// authorize obtaining an unpublished successor row.
 pub(super) fn read_end(job: &MarkdownLineBreakJob, end: usize) -> usize {
     job.tables
         .as_ref()

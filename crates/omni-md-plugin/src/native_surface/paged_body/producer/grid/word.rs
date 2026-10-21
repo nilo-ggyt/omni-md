@@ -1,4 +1,5 @@
-//! 格内选词复用原 Cell 的显示源和 Composer；离屏恢复只有一个实际 Cell，不建立几何占位。
+//! Cell word selection reuses the original display Source and Composer; offscreen recovery owns one
+//! actual cell without geometry placeholders.
 
 use super::*;
 use crate::native_surface::paged_text_view::NativeMarkdownPagedCellWordTarget;
@@ -6,7 +7,8 @@ use omni_markdown_core::{
     MarkdownLayoutTextAuthority, MarkdownWordGroupAction, MarkdownWordGroupAnswer,
 };
 
-/// 查询标量和实际恢复资源同属 Producer 当前一个词组槽；旧 Scene/Source 不进入续体。
+/// Query scalars and actual recovery resources belong to the Producer unique current word slot, without
+/// old Scene/Source continuations.
 pub(in crate::native_surface::paged_body::producer) struct CellWordQuery {
     pub target: NativeMarkdownPagedCellWordTarget,
     head: usize,
@@ -16,7 +18,8 @@ pub(in crate::native_surface::paged_body::producer) struct CellWordQuery {
     pub lookup: Option<omni_markdown_core::MarkdownComposedLineLookup>,
     recovered: Option<RecoveredCell>,
     pub cancelled: bool,
-    /// 原准备尚未交回时，最多保当前队首下一次 begin 的固定意图，绝不并行启动第二个词组。
+    /// While preparation is outstanding, retain at most the next begin intent for the current head
+    /// without starting another word query concurrently.
     pub restart: Option<(
         MarkdownWordGroupAction,
         usize,
@@ -25,7 +28,8 @@ pub(in crate::native_surface::paged_body::producer) struct CellWordQuery {
     work: Work,
 }
 
-/// 只为已退休格恢复读源；行票来自最新同请求，宽度来自原解算器或封存目录，没有假行框。
+/// Restore reading for a retired cell using the latest same-request row ticket and actual solved/sealed
+/// widths, without invented row geometry.
 struct RecoveredCell {
     row: omni_markdown_core::VerifiedMarkdownLayoutTableRow,
     cell: Cell,
@@ -55,7 +59,8 @@ impl CellWordQuery {
         self.recovered.is_some()
     }
 
-    /// 宽度已经由真正表行认证；这里只创建固定 Cell owner，不创建正文输入或另一解析器。
+    /// Actual row metadata certified the width; create a fixed cell owner only, without body Input or
+    /// another parser.
     pub fn restore(&mut self, width: f64) {
         self.recovered = Some(RecoveredCell {
             row: self.row.take().expect("恢复格已经取得真实行票"),
@@ -72,7 +77,8 @@ impl CellWordQuery {
     ) -> Result<MarkdownWordGroupAnswer> {
         let mut recovered = self.recovered.take().expect("真实恢复格仍由本查询持有");
         let mut work = std::mem::take(&mut self.work);
-        // 本步只有纯Core来源/GCB操作，没有Native回调；暂借字段后无论成功失败都归还实际资源。
+        // This step performs pure Core Source/grapheme work with no Native callback; restore
+        // temporarily moved resources on every result.
         let result = (|| {
             recovered.row.require_for(
                 &owner
@@ -92,7 +98,8 @@ impl CellWordQuery {
         result
     }
 
-    /// 删除业务查询不能撤掉已经借出的 CellInline。只有真实准备交回后才释放这个 Cell。
+    /// Cancelling the business query cannot remove a loaned CellInline; release its cell only after
+    /// actual preparation returns.
     pub fn cancel(&mut self) -> bool {
         self.cancelled = true;
         let Some(recovered) = &mut self.recovered else {
@@ -104,6 +111,8 @@ impl CellWordQuery {
         recovered.cell.preparation.is_none()
     }
 
+    /// Continue cancellation through the original semantics slot until its real writer is closed and
+    /// returned.
     pub fn drain(
         &mut self,
         owner: &Owner,
@@ -114,7 +123,7 @@ impl CellWordQuery {
             return Ok(true);
         };
         if recovered.cell.preparation.is_none() {
-            return Ok(true); // 未启动或已经交还的来源没有异步工作，不能为了取消再开一次准备。
+            return Ok(true); // Unstarted or already-returned preparation has no asynchronous work; cancellation must not start another preparation.
         }
         let document = owner
             .document
@@ -140,7 +149,7 @@ impl CellWordQuery {
         self.work
             .display_step(measured, before, semantics.current_work())?;
         if ready {
-            recovered.cell.preparation = None; // Core已经关闭真实writer并归槽，此处才丢原任务owner。
+            recovered.cell.preparation = None; // Core closed the actual writer and returned its slot; only then drop the original task owner.
         }
         Ok(ready)
     }
@@ -160,7 +169,8 @@ impl CellWordQuery {
 }
 
 impl Grid {
-    /// 当前真实行才可借其格；column 是原命中查询，不根据零长范围猜隐式缺格归属。
+    /// Only the actual current row can lend its cells; preserve the queried column instead of inferring
+    /// missing-cell ownership from an empty range.
     pub(in crate::native_surface::paged_body::producer) fn word_row(
         &self,
         target: NativeMarkdownPagedCellWordTarget,
@@ -180,14 +190,14 @@ impl Grid {
             return Err(ViewError::InvalidRange.into());
         }
         if self.natural.is_some() {
-            return Ok(None); // 真正最终宽度尚未发布，先完成原表头解算，不借临时测宽Composer签词组。
+            return Ok(None); // Finish original header solving before final widths exist; temporary width-measurement Composers cannot certify word groups.
         }
         if self
             .cells
             .iter()
             .any(|cell| cell.column != query.target.column && cell.preparation.is_some())
         {
-            return Ok(None); // 原唯一来源请求仍被其他列占用，外层先推进其准备归还。
+            return Ok(None); // Another column still occupies the unique original Source request; the outer owner must advance its return first.
         }
         let cell = &mut self.cells[query.target.column];
         cell.advance_word(owner, source, &self.row, query, semantics, &mut self.work)
@@ -213,7 +223,8 @@ impl Grid {
 }
 
 impl Cell {
-    /// 显示准备、GCB词组和实际映射串行复用同一 Cell；选词不要求整格字形或 LineReady。
+    /// Display preparation, grapheme word queries, and actual mapping serially reuse the same cell
+    /// without requiring all glyphs or LineReady.
     fn advance_word(
         &mut self,
         owner: &Owner,
@@ -242,7 +253,7 @@ impl Cell {
             {
                 return Err(ViewError::InvalidRange.into());
             }
-            return Ok(MarkdownWordGroupAnswer::Ready(range.clone())); // 双空证明授真实空组，未制造字形。
+            return Ok(MarkdownWordGroupAnswer::Ready(range.clone())); // The verified empty cell and empty range certify an actual empty word group without invented glyphs.
         }
         let display = self.display.as_ref().expect("非空格Composer持原显示源");
         display.require_for(&document)?;
@@ -254,7 +265,7 @@ impl Cell {
         let composer = self.composer.as_mut().expect("原格Composer已经准备");
         if let Some(original) = &query.binding {
             if *original != authority {
-                return Err(ViewError::Revoked.into()); // 已开始查询不能用后继显示Source补权。
+                return Err(ViewError::Revoked.into()); // A started query cannot renew authority from a successor display Source.
             }
         } else {
             let affinity = if query.target.affinity.is_upstream() {
@@ -269,6 +280,8 @@ impl Cell {
             composer.begin_word_group(query.action, head)?;
             query.binding = Some(authority);
         }
+        // Use the same bounded Composer cursor for this original display authority, never a copied cell
+        // string.
         let before = composer.frontier_work()?;
         let step = composer.step_word_group(MarkdownLineComposeBudget {
             bytes: 4096,
@@ -280,7 +293,8 @@ impl Cell {
         display.require_for(&document)?;
         let map = |range: Range<usize>| -> Result<Range<usize>> {
             if range.is_empty() {
-                // 真空显示上的组仍是一个原插入点；两侧隐藏标记不能把空组映成倒置范围。
+                // An empty display group remains one original insertion point; hidden markers on either
+                // side must not map it into a reversed range.
                 let affinity = if query.target.affinity.is_upstream() {
                     omni_markdown_core::MarkdownComposedLineAffinity::Upstream
                 } else {
@@ -317,7 +331,8 @@ impl Cell {
 }
 
 impl Work {
-    /// 词组步进与排版步进记同一真实计量；前沿只累计本步增量，不重复加父请求的语义读量。
+    /// Word and layout steps share actual work accounting; add frontier deltas only, without
+    /// duplicating parent semantic reads.
     fn word_step(
         &mut self,
         step: &omni_markdown_core::MarkdownWordGroupStep,

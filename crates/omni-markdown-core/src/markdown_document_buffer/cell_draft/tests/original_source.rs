@@ -86,10 +86,7 @@ fn existing_two_mib_cell_edits_and_saves_without_whole_cell_materialization() {
     let source = format!("| H | C |\n| --- | --- |\n| {payload} | other |\n");
     let (directory, original) = document(&source);
     drop(original);
-    let workspace = crate::MarkdownWorkspace::new(
-        directory.path().to_path_buf(),
-        directory.path().join("app-data"),
-    );
+    let workspace = crate::MarkdownWorkspace::new(directory.path().to_path_buf());
     let access = workspace.open_session().unwrap();
     let mut doc = access.open_document_buffer("cell-draft.md").unwrap();
     let prepared = plan(&doc, 1, 0);

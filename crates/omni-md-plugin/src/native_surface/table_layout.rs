@@ -1334,7 +1334,9 @@ impl PieceBackedMarkdownTextView {
         }
     }
 
-    /// 只移动同一次模式动作的真实 Native 源锚点，不扩大 ensure 范围或重新签发输入权限。
+    /// The explicit raster oracle moves the original Native source anchor only;
+    /// it never enlarges preparation or grants a replacement input authority.
+    #[cfg(feature = "native-raster-surface-probe")]
     fn relocate_mode_viewport(
         &self,
         context: &NativeMarkdownModeViewportContext,

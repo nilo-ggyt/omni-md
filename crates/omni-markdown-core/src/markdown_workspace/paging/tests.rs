@@ -1,8 +1,10 @@
-//! 合成目录验证跨页总序、Pending边界、折叠与撤权，不读取用户正文。
+//! Synthetic directories verify cross-page order, Pending, collapse intent,
+//! and revocation without reading any user vault or original document.
 
 use super::*;
 
-/// 真实公开分页器按有限步骤完成一页，测试不能把Pending当空页消费。
+/// Complete a real public pager in finite steps; Pending is never consumed as
+/// an empty successful page.
 fn finish_page(
     pager: &mut MarkdownWorkspacePager,
     limit: usize,
@@ -10,7 +12,8 @@ fn finish_page(
     collapsed: &HashSet<String>,
 ) -> MarkdownWorkspacePage {
     for _ in 0..10_000 {
-        // fixture有限；固定上限只防止实现不前进导致测试永久阻塞。
+        // The fixture is finite; this iteration ceiling prevents a nonprogressing
+        // implementation from blocking the regression indefinitely.
         let progress = pager
             .next_page_cancellable(limit, budget, collapsed, &AtomicBool::new(false))
             .expect("合成目录扫描成功");
@@ -18,15 +21,17 @@ fn finish_page(
         assert!(pager.candidates.capacity() <= limit + 1);
         match progress {
             MarkdownWorkspacePageProgress::Pending => {
-                // 候选不外露，继续有限扫描步骤。
+                // No candidates escaped; continue with another bounded real scan step.
             }
+            // Only a completed scan may return the public page to the caller.
             MarkdownWorkspacePageProgress::Ready(page) => return page,
         }
     }
     panic!("有限fixture必须完成目录扫描");
 }
 
-/// 快照分组仅是运输形式；消费者使用公开比较器恢复同一树总序。
+/// Snapshot grouping is transport only; reconstruct the mixed tree order with
+/// the same public comparator used by its native consumer.
 fn ordered_paths(page: &MarkdownWorkspacePage) -> Vec<String> {
     let mut entries: Vec<_> = page
         .snapshot
@@ -50,31 +55,33 @@ fn ordered_paths(page: &MarkdownWorkspacePage) -> Vec<String> {
 }
 
 #[test]
-/// 文件创建顺序与排序逆序，55项跨五页仍全局升序且唯一；正文故意不是UTF8。
+/// Reverse creation order and invalid UTF-8 bodies isolate metadata-only paging:
+/// all 55 entries must remain unique and globally ordered across five pages.
 fn fifty_five_notes_are_globally_sorted_across_five_bounded_pages() {
     let fixture = tempfile::tempdir().unwrap();
     for index in (0..55).rev() {
-        // 目录只需metadata；若误走正文解码，此fixture会失败。
+        // Browsing needs metadata only; accidental body decoding fails this fixture.
         fs::write(
             fixture.path().join(format!("note-{index:02}.md")),
             [0xff, 0xfe],
         )
         .unwrap();
     }
-    let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(fixture.path().to_owned());
     let session = workspace.open_session().unwrap();
     let mut pager = session.open_workspace_pager().unwrap();
     let mut all = Vec::new();
     let mut sizes = Vec::new();
     loop {
-        // 小步预算强制每页经过多个Pending，避免只覆盖单次read_dir的小目录路径。
+        // Small scan budgets force multiple Pending states per page rather than
+        // covering only directories that fit in one read_dir step.
         let page = finish_page(&mut pager, 12, 7, &HashSet::new());
         assert!(page.authority.is_current(&session, &HashSet::new()));
         let paths = ordered_paths(&page);
         sizes.push(paths.len());
         all.extend(paths);
         if !page.has_more {
-            // 真实K+1耗尽结束，不按预设页数提前停止。
+            // Stop on real K+1 exhaustion, not an assumed page count that could lose results.
             break;
         }
     }
@@ -90,7 +97,8 @@ fn fifty_five_notes_are_globally_sorted_across_five_bounded_pages() {
 }
 
 #[test]
-/// 树中每层目录优先，父先于子；大小写/中文/emoji按声明scalar序而非拼音。
+/// Keep directories first at every depth and parents before children, with case,
+/// CJK, and emoji names following the declared scalar order rather than pinyin.
 fn nested_tree_order_and_unicode_names_do_not_depend_on_readdir_order() {
     let fixture = tempfile::tempdir().unwrap();
     for directory in ["z/child", "a/中", "a/Z"] {
@@ -109,12 +117,13 @@ fn nested_tree_order_and_unicode_names_do_not_depend_on_readdir_order() {
     ] {
         fs::write(fixture.path().join(note), []).unwrap();
     }
-    let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(fixture.path().to_owned());
     let session = workspace.open_session().unwrap();
     let mut pager = session.open_workspace_pager().unwrap();
     let mut all = Vec::new();
     loop {
-        // 两行页宽把父、子和同名种类放到不同页，直接覆盖跨页比较。
+        // Two-entry pages separate ancestors, descendants, and entry kinds so
+        // the same comparator must remain correct across continuation boundaries.
         let page = finish_page(&mut pager, 2, 3, &HashSet::new());
         all.extend(ordered_paths(&page));
         if !page.has_more {
@@ -143,19 +152,20 @@ fn nested_tree_order_and_unicode_names_do_not_depend_on_readdir_order() {
 }
 
 #[test]
-/// 512是硬步骤上限；还没扫完整库时没有随机前页可安装。
+/// A 512-step bound cannot publish an arbitrary prefix before complete traversal.
 fn pending_does_not_publish_a_random_prefix_even_with_unbounded_requested_scan() {
     let fixture = tempfile::tempdir().unwrap();
     for index in 0..1_025 {
-        // 忽略文件也收费；大量无关条目不能使一步扫描越界。
+        // Ignored files still consume scan work; unrelated entries cannot bypass
+        // a step's enumeration limit.
         fs::write(fixture.path().join(format!("ignored-{index}.txt")), []).unwrap();
     }
     fs::write(fixture.path().join("first.md"), []).unwrap();
-    let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(fixture.path().to_owned());
     let session = workspace.open_session().unwrap();
     let mut pager = session.open_workspace_pager().unwrap();
     for _ in 0..2 {
-        // 即使外部传usize::MAX，前两步仍不足以消费1026项和EOF。
+        // Even usize::MAX cannot let two steps consume 1,026 entries plus EOF.
         assert!(matches!(
             pager
                 .next_page_cancellable(12, usize::MAX, &HashSet::new(), &AtomicBool::new(false))
@@ -169,7 +179,8 @@ fn pending_does_not_publish_a_random_prefix_even_with_unbounded_requested_scan()
 }
 
 #[test]
-/// 折叠、附件和链接过滤仍生效；中途改折叠不能沿旧末项继续。
+/// Preserve collapse, asset-tree, and symlink filtering; changed collapse intent
+/// cannot continue from a key bound to the previous visible tree.
 fn collapse_changes_require_refresh_and_do_not_traverse_reserved_or_linked_trees() {
     let fixture = tempfile::tempdir().unwrap();
     let external = tempfile::tempdir().unwrap();
@@ -179,7 +190,7 @@ fn collapse_changes_require_refresh_and_do_not_traverse_reserved_or_linked_trees
     fs::write(fixture.path().join("attachments/asset.md"), []).unwrap();
     fs::write(external.path().join("outside.md"), []).unwrap();
     std::os::unix::fs::symlink(external.path(), fixture.path().join("linked")).unwrap();
-    let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(fixture.path().to_owned());
     let session = workspace.open_session().unwrap();
     let mut pager = session.open_workspace_pager().unwrap();
     assert!(matches!(
@@ -189,6 +200,8 @@ fn collapse_changes_require_refresh_and_do_not_traverse_reserved_or_linked_trees
         MarkdownWorkspacePageProgress::Pending
     ));
     let collapsed = HashSet::from(["folder".to_owned()]);
+    // Change intent during a real Pending traversal, then prove a fresh pager
+    // includes the collapsed directory itself without descending into its children.
     assert!(matches!(
         pager.next_page_cancellable(12, 512, &collapsed, &AtomicBool::new(false)),
         Err(MarkdownWorkspaceError::InvalidWorkspaceCursor)
@@ -201,13 +214,14 @@ fn collapse_changes_require_refresh_and_do_not_traverse_reserved_or_linked_trees
 }
 
 #[test]
-/// 取消在步骤之间撤权并释放半页；复位flag不能复活被取消游标。
+/// Cancellation between steps releases the partial page and permanently revokes
+/// that cursor, even if the caller later resets its cancellation token.
 fn cancellation_releases_pending_payload_and_cannot_be_reset_into_late_delivery() {
     let fixture = tempfile::tempdir().unwrap();
     for index in 0..55 {
         fs::write(fixture.path().join(format!("{index}.md")), []).unwrap();
     }
-    let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(fixture.path().to_owned());
     let session = workspace.open_session().unwrap();
     let mut pager = session.open_workspace_pager().unwrap();
     let cancelled = AtomicBool::new(false);
@@ -232,11 +246,11 @@ fn cancellation_releases_pending_payload_and_cannot_be_reset_into_late_delivery(
 }
 
 #[test]
-/// 新目录刷新只撤旧目录，末页没有next也必须失去旧安装权限。
+/// A new traversal revokes the old terminal page even though it has no continuation.
 fn refresh_and_local_mutations_revoke_final_page_authority() {
     let fixture = tempfile::tempdir().unwrap();
     fs::write(fixture.path().join("a.md"), []).unwrap();
-    let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(fixture.path().to_owned());
     let session = workspace.open_session().unwrap();
     let mut old = session.open_workspace_pager().unwrap();
     let final_page = finish_page(&mut old, 12, 512, &HashSet::new());
@@ -244,6 +258,8 @@ fn refresh_and_local_mutations_revoke_final_page_authority() {
     let mut refreshed = session.open_workspace_pager().unwrap();
     assert!(!final_page.authority.is_current(&session, &HashSet::new()));
     let page = finish_page(&mut refreshed, 12, 512, &HashSet::new());
+    // Public creation and later session closure separately revoke completed
+    // page authority; a fresh traversal alone observes the new actual note.
     session.create_note("", "b").unwrap();
     assert!(!page.authority.is_current(&session, &HashSet::new()));
     assert!(matches!(
@@ -258,13 +274,14 @@ fn refresh_and_local_mutations_revoke_final_page_authority() {
 }
 
 #[test]
-/// 目录刷新不取消已展示搜索的cursor；搜索取消/本地发布仍阻断旧目录迟到交付。
+/// Browsing refresh preserves independent search continuation, while explicit
+/// search cancellation revokes old browse delivery under the shared cancel contract.
 fn directory_refresh_and_search_continuation_have_separate_authority() {
     let fixture = tempfile::tempdir().unwrap();
     for index in 0..15 {
         fs::write(fixture.path().join(format!("hit-{index:02}.md")), []).unwrap();
     }
-    let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(fixture.path().to_owned());
     let session = workspace.open_session().unwrap();
     let cancelled = AtomicBool::new(false);
     let search = session
@@ -285,13 +302,14 @@ fn directory_refresh_and_search_continuation_have_separate_authority() {
 }
 
 #[test]
-/// 同一路径重建根或换页宽不能把旧key套到新集合；旧close不得撤销较新pager。
+/// Recreated roots and changed widths reject old keys; closing an older pager
+/// must not revoke a newer traversal's generation.
 fn stale_root_page_width_and_late_close_are_rejected_without_revoking_new_pager() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("vault");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.md"), []).unwrap();
-    let workspace = MarkdownWorkspace::new(root.clone(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(root.clone());
     let session = workspace.open_session().unwrap();
     let mut old = session.open_workspace_pager().unwrap();
     let _ = finish_page(&mut old, 1, 512, &HashSet::new());
@@ -313,7 +331,8 @@ fn stale_root_page_width_and_late_close_are_rejected_without_revoking_new_pager(
 }
 
 #[test]
-/// 不依赖本机文件系统能否同时创建NFC/NFD或扩展大小写别名，纯核公开总序。
+/// Check the public total order independently of whether this filesystem permits
+/// simultaneous NFC/NFD names or case aliases.
 fn unicode_and_display_name_ties_remain_a_strict_total_order() {
     let note = MarkdownWorkspaceEntryKind::Note;
     let directory = MarkdownWorkspaceEntryKind::Directory;
@@ -329,7 +348,8 @@ fn unicode_and_display_name_ties_remain_a_strict_total_order() {
     ];
     for (left_index, left) in expected.iter().enumerate() {
         for (right_index, right) in expected.iter().enumerate() {
-            // 所有两两关系核对一个人工声明顺序，含同stem不同真实路径的平局。
+            // Compare all pairs with a hand-declared order, including equal display
+            // stems whose distinct real paths must still break ties.
             assert_eq!(
                 compare_markdown_workspace_entries(left.0, left.1, right.0, right.1),
                 left_index.cmp(&right_index)
@@ -347,7 +367,7 @@ fn content_saves_preserve_directory_continuation_but_revoke_search() {
         // Stable paths keep their tree position even when a later public buffer transaction changes the body.
         fs::write(fixture.path().join(format!("note-{index:02}.md")), "before").unwrap();
     }
-    let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(fixture.path().to_owned());
     let session = workspace.open_session().unwrap();
     let mut document = session.open_document_buffer("note-20.md").unwrap();
     let mut pager = session.open_workspace_pager().unwrap();
@@ -467,15 +487,16 @@ fn content_saves_preserve_directory_continuation_but_revoke_search() {
 
 #[cfg(feature = "native-markdown-candidate")]
 #[test]
-/// 结构操作仍同时撤销目录与搜索，不能把所有保存/文件操作宽泛归为content-only。
+/// Structural operations still revoke browsing and search together; not every
+/// save/file operation qualifies for same-path content-only invalidation.
 fn structural_publications_continue_to_revoke_both_directory_and_search() {
     for operation in ["create", "rename", "move", "delete", "save_as_new"] {
-        // 每个操作独立fixture和权限，避免先前撤权掩盖后面漏接的分支。
+        // Give each real operation independent resources and authority so an
+        // earlier revocation cannot conceal another operation's missing invalidation.
         let fixture = tempfile::tempdir().unwrap();
         fs::create_dir(fixture.path().join("sub")).unwrap();
         fs::write(fixture.path().join("a.md"), "before").unwrap();
-        let workspace =
-            MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
+        let workspace = MarkdownWorkspace::new(fixture.path().to_owned());
         let session = workspace.open_session().unwrap();
         let mut pager = session.open_workspace_pager().unwrap();
         let page = finish_page(&mut pager, 12, 512, &HashSet::new());
@@ -484,30 +505,32 @@ fn structural_publications_continue_to_revoke_both_directory_and_search() {
             .unwrap();
         match operation {
             "create" => {
-                // 新路径进入排序集合，旧目录和搜索都失效。
+                // A new path enters the sorted collection, revoking browse and search.
                 session.create_note("", "new").unwrap();
             }
             "rename" => {
-                // 文件stem和排序位置发生变化，不能继续沿旧末项交付。
+                // A changed stem/order position cannot continue delivery from an old key.
                 session.rename_note("a.md", "renamed", None).unwrap();
             }
             "move" => {
-                // 父路径改变影响树层级，仍使用结构发布撤权。
+                // A different parent changes tree order and requires structural revocation.
                 session.move_note("a.md", "sub", None).unwrap();
             }
             "delete" => {
-                // 条目退出集合，排队目录页和正文搜索都不得再安装。
+                // Removal ends membership; neither queued pages nor old body searches may install.
                 session.delete_note("a.md", None).unwrap();
             }
             "save_as_new" => {
-                // 另存新增真实路径，和保持路径的正文保存使用不同撤权合同。
+                // Save-as creates a real new path and uses structural authority,
+                // unlike content persistence under an unchanged path.
                 let document = session.open_document_buffer("a.md").unwrap();
                 session
                     .save_document_buffer_as_new(&document, "", "copy")
                     .unwrap();
             }
             _ => {
-                // 测试枚举由上面的固定表给定，未知项不能悄悄跳过断言。
+                // Reject an unknown case instead of silently skipping this fixed
+                // table's actual-operation assertions.
                 unreachable!("测试操作集合固定")
             }
         }

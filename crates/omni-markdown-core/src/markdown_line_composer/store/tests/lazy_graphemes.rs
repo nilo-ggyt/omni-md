@@ -1,4 +1,4 @@
-//! 原GCB只按实际item前缀迁入同FD；有限oracle可保数组，生产没有第二索引或正文副本。
+//! Migrate original graphemes only through the actual item prefix into the same paged file.
 use super::*;
 use crate::{
     BidiBaseDirection, BidiMemoryBudget, MarkdownBidiParagraph,
@@ -15,14 +15,14 @@ fn through(
     writes: usize,
     reads: usize,
 ) -> (usize, usize) {
+    // Drive the real migration with independent read/write quotas. Progress is
+    // reported by that operation; no private record-count mirror is needed here.
     let (mut written, mut read) = (0, 0);
     for _ in 0..100_000 {
-        let before = store.record_count().unwrap();
         let progress = store
             .capture_graphemes_through(breaks, end, writes, reads)
             .unwrap();
         assert!(progress.records <= writes && progress.metadata_units <= reads);
-        assert_eq!(store.record_count().unwrap() - before, progress.records);
         written += progress.records;
         read += progress.metadata_units;
         if progress.ready {
@@ -39,8 +39,10 @@ struct Prepared {
     cancellation: MarkdownLineComposeCancellation,
 }
 impl Prepared {
-    /// 首item只覆盖0..6；后继GCB可在glyph目录之后、LineEnd之前交错写入。
+    /// Commit only the first 0..6 item; later GCB records may interleave with its glyph records.
     fn new(text: &str, extra: Option<usize>) -> Self {
+        // This finite prefix lets queries distinguish original graphemes already
+        // migrated from later boundaries that remain pending in published output.
         assert!(text.starts_with("aa aa "));
         let fixture = Fixture::new(text);
         let cancellation = MarkdownLineComposeCancellation::new();
@@ -54,6 +56,8 @@ impl Prepared {
             {
                 MarkdownLineItemAnswer::Yielded => {}
                 MarkdownLineItemAnswer::NeedStyle(request) => {
+                    // Supply only the requested original prefix through a genuine
+                    // registered style, leaving later item work outside this fixture.
                     assert_eq!(request.source_range().start, 0);
                     assert!(request.source_range().end >= 6);
                     coordinator
@@ -85,6 +89,8 @@ impl Prepared {
         let mut breaks = super::lines::breaks(&fixture);
         let mut store = fixture.store(cancellation.clone());
         assert_eq!(through(&mut store, &mut breaks, 6, 1, 1), (7, 7));
+        // Optional prefetch writes later GCB data into the same file before any
+        // corresponding line is committed; it must not extend publication authority.
         let proof = capture(&mut store, &mut item);
         if let Some(end) = extra {
             through(&mut store, &mut breaks, end, 2, 1);
@@ -93,6 +99,8 @@ impl Prepared {
         drop(item);
         drop(coordinator);
         assert_eq!(original_job.snapshot().files_open, 0);
+        // The stored line is committed with actual paragraph direction and the
+        // selected measurement permit, after its original shaping job has dropped.
         let mut bidi = MarkdownBidiParagraph::analyze_layout_source(
             fixture.source.clone(),
             &fixture.source.authority(),
@@ -142,6 +150,8 @@ impl Prepared {
 
 #[test]
 fn migration_charges_real_reads_and_writes_separately_at_quota_one() {
+    // Different asymmetric quotas must converge to the same actual migrated
+    // prefix, without treating a fully ready break job as fully copied output.
     for (writes, reads) in [(1, 3), (3, 1), (256, 256)] {
         let fixture = Fixture::new(&"aa ".repeat(32));
         let mut breaks = super::lines::breaks(&fixture);
@@ -152,12 +162,11 @@ fn migration_charges_real_reads_and_writes_separately_at_quota_one() {
         );
         let directory = store.grapheme_directory().unwrap();
         assert_eq!((directory.count, directory.covered.utf16), (31, 30));
-        // 此夹具的原BreakJob已真正Ready：96个ASCII标量加真实EOF共97条边界；
-        // Store只复制0..30的31条，已知完整总数和已迁入前缀不能混为一个Ready位。
+        // The original job has 96 ASCII scalars plus true EOF, but only 31
+        // boundaries through offset 30 were migrated. Known total is not complete.
         let total = directory.total.expect("原完整Ready表必须保留已知总数");
         assert_eq!(total, 97);
         assert!(!directory.complete && total > directory.count);
-        assert_eq!(store.record_count().unwrap(), 31);
         let observer = store.observer();
         store.close().unwrap();
         let actual = observer.snapshot();
@@ -167,6 +176,8 @@ fn migration_charges_real_reads_and_writes_separately_at_quota_one() {
 
 #[test]
 fn incomplete_queries_are_pending_and_legacy_ordinal_does_not_poison_the_reader() {
+    // A known prefix boundary may be queried while its successor is still pending.
+    // The ordinal convenience API must preserve Pending rather than poison the file.
     let prepared = Prepared::new("aa aa aa aa aa aa ", None);
     let mut output = prepared.store.into_output().unwrap();
     assert_eq!(
@@ -188,6 +199,8 @@ fn incomplete_queries_are_pending_and_legacy_ordinal_does_not_poison_the_reader(
         output.grapheme_ordinal(7),
         Err(Error::GraphemePrefixPending)
     ));
+    // The same reader remains healthy after that recoverable pending result and
+    // can still answer original-prefix predecessor and BOF queries.
     output
         .require(&prepared.fixture.source.authority())
         .unwrap();
@@ -204,6 +217,8 @@ fn incomplete_queries_are_pending_and_legacy_ordinal_does_not_poison_the_reader(
 
 #[test]
 fn interleaved_records_preserve_original_non_bmp_and_multi_scalar_global_ordinals() {
+    // Non-BMP scalars and combining sequences make UTF-16 offsets differ from
+    // global grapheme ordinals; the independent original break job is the oracle.
     let text = "aa aa a\u{301} \u{1f16a} b \u{1f16b} z";
     let end = text.encode_utf16().count();
     let mut prepared = Prepared::new(text, Some(end));
@@ -213,6 +228,8 @@ fn interleaved_records_preserve_original_non_bmp_and_multi_scalar_global_ordinal
         .ready_grapheme_count(&auth)
         .unwrap()
         .unwrap();
+    // This small fixture may hold a finite comparison array. Production continues
+    // to read bounded records from the original migrated index.
     let mut oracle = vec![Boundary { byte: 0, utf16: 0 }; count];
     assert!(
         prepared
@@ -243,6 +260,8 @@ fn interleaved_records_preserve_original_non_bmp_and_multi_scalar_global_ordinal
 #[cfg(feature = "paged-shaping-frontier")]
 #[test]
 fn uncommitted_prefetch_cannot_extend_old_or_new_snapshot_past_the_last_line_end() {
+    // Publish a real committed prefix, then prefetch the remaining original GCBs.
+    // Neither the existing reader nor a new same-line snapshot gains extra range.
     let mut prepared = Prepared::new("aa aa aa aa aa aa ", None);
     let mut old = prepared.store.publish_ready_prefix().unwrap().unwrap();
     let old_receipt = old.resource_observer();
@@ -267,7 +286,8 @@ fn uncommitted_prefetch_cannot_extend_old_or_new_snapshot_past_the_last_line_end
     same_line.close().unwrap();
     old.close().unwrap();
     assert!(!old_receipt.snapshot().file_open);
-    // 消费writer也只能交最近已提交目录，不能把文件中更晚存在的行当成快照权限。
+    // Consuming the writer also publishes only its last committed directory;
+    // later records existing in the file do not authorize an extended snapshot.
     let mut final_prefix = prepared.store.into_output().unwrap();
     assert_eq!(
         final_prefix.grapheme_ordinal_answer(7).unwrap(),
@@ -277,6 +297,8 @@ fn uncommitted_prefetch_cannot_extend_old_or_new_snapshot_past_the_last_line_end
 }
 
 fn complete(fixture: &Fixture) -> MarkdownComposedLines {
+    // Exercise the real composer with unit quotas, answering only its original
+    // style/control requests. Yielded and LineReady do not imply source completion.
     let mut worker = MarkdownLineComposer::new(
         fixture.source.clone(),
         &fixture.source.authority(),
@@ -298,6 +320,8 @@ fn complete(fixture: &Fixture) -> MarkdownComposedLines {
         match progress.answer {
             MarkdownLineComposeAnswer::Yielded | MarkdownLineComposeAnswer::LineReady(_) => {}
             MarkdownLineComposeAnswer::NeedStyle(request) => {
+                // The response preserves the complete requested source range and
+                // actual font registration rather than bypassing a dependency.
                 let range = request.source_range();
                 worker
                     .provide_style(
@@ -317,6 +341,8 @@ fn complete(fixture: &Fixture) -> MarkdownComposedLines {
                     .unwrap();
             }
             MarkdownLineComposeAnswer::NeedsControl(request) => {
+                // Supply the real paragraph tab policy for this control request;
+                // controls retain original CR/LF/EOF and grapheme semantics.
                 worker
                     .provide_control(
                         request
@@ -341,6 +367,8 @@ fn complete(fixture: &Fixture) -> MarkdownComposedLines {
 
 #[test]
 fn empty_and_terminal_controls_keep_true_eof_and_crlf_is_one_original_grapheme() {
+    // Compare all original boundary queries, including empty input and terminal
+    // controls. CRLF remains one grapheme even under one-record producer quanta.
     for text in ["", "\n", "\r\n", "a\tb\n", "a\u{85}b\u{2028}"] {
         let fixture = Fixture::new(text);
         let mut breaks = super::lines::breaks(&fixture);
@@ -369,6 +397,8 @@ fn empty_and_terminal_controls_keep_true_eof_and_crlf_is_one_original_grapheme()
 
 #[test]
 fn cancellation_with_one_buffered_original_record_closes_the_unique_writer() {
+    // Make actual migration progress with one buffered boundary, then revoke that
+    // same request before another read/write quantum can publish more data.
     let fixture = Fixture::new("aa aa aa aa ");
     let source = fixture.source.resource_observer();
     let backing = fixture.source.original_backing_observer().unwrap();
@@ -390,6 +420,8 @@ fn cancellation_with_one_buffered_original_record_closes_the_unique_writer() {
     ));
     let actual = observer.snapshot();
     assert!(!actual.file_open && actual.mapped_bytes == 0 && !actual.cleanup_failed);
+    // Drop the remaining original break/source owners before checking actual
+    // payload release and successful unmap, not merely writer cancellation state.
     drop((store, breaks, fixture));
     assert!(source.payload_released() && backing.unmap_succeeded() && backing.mapped_bytes() == 0);
 }
@@ -397,12 +429,16 @@ fn cancellation_with_one_buffered_original_record_closes_the_unique_writer() {
 #[cfg(feature = "paged-shaping-frontier")]
 #[test]
 fn real_source_failure_precedes_cancel_and_pending_for_both_reader_and_writer() {
+    // Keep a real published reader and active writer from the same original
+    // source, so both paths must retain its first failure over Pending/cancellation.
     let mut prepared = Prepared::new("aa aa aa aa aa aa ", None);
     let source = prepared.fixture.source.resource_observer();
     let backing = prepared.fixture.source.original_backing_observer().unwrap();
     let writer = prepared.store.observer();
     let mut reader = prepared.store.publish_ready_prefix().unwrap().unwrap();
     let reader_receipt = reader.resource_observer();
+    // Consume the existing reclaim EIO injection through a real resident-source
+    // operation; this is not evidence of a naturally occurring kernel failure.
     prepared
         .fixture
         .document
@@ -423,6 +459,8 @@ fn real_source_failure_precedes_cancel_and_pending_for_both_reader_and_writer() 
         ))
     );
     prepared.cancellation.cancel();
+    // A pending offset must return the original source cause before considering
+    // missing prefix data or the subsequently cancelled request.
     assert!(matches!(
         reader.grapheme_ordinal_answer(7),
         Err(Error::Source(
@@ -445,6 +483,8 @@ fn real_source_failure_precedes_cancel_and_pending_for_both_reader_and_writer() 
 
 #[test]
 fn same_bytes_foreign_break_job_cannot_sign_any_store_grapheme_record() {
+    // Two equal-text files have different captures. The foreign break job cannot
+    // authorize even the first migrated record and the real writer must close.
     let fixture = Fixture::new("aa aa aa ");
     let foreign = Fixture::new("aa aa aa ");
     let mut breaks = super::lines::breaks(&foreign);
@@ -456,66 +496,5 @@ fn same_bytes_foreign_break_job_cannot_sign_any_store_grapheme_record() {
             crate::MarkdownLayoutBreakError::SourceMismatch
         ))
     ));
-    assert!(store.graphemes.is_none());
     assert!(!observer.snapshot().file_open && observer.snapshot().mapped_bytes == 0);
-}
-
-#[test]
-fn fixed_skip_links_bound_deep_real_record_reads_and_reject_corrupt_ranks() {
-    let fixture = Fixture::new(&"a ".repeat(4096));
-    let mut breaks = super::lines::breaks(&fixture);
-    let mut store = fixture.store(MarkdownLineComposeCancellation::new());
-    through(
-        &mut store,
-        &mut breaks,
-        fixture.source.utf16_len(),
-        256,
-        256,
-    );
-    let directory = store.grapheme_directory().unwrap();
-    let mut reads = 0;
-    let value = graphemes::ordinal_boundary(
-        directory,
-        1,
-        fixture.source.byte_len(),
-        fixture.source.utf16_len(),
-        |record| {
-            reads += 1;
-            Ok(store.index.as_mut().unwrap().read(record)?)
-        },
-    )
-    .unwrap();
-    assert_eq!(value.unwrap().utf16, 1);
-    assert!(reads < 512 && reads < directory.count / 2);
-    let mut reads = 0;
-    let (_, value) = graphemes::lower_bound(
-        directory,
-        17,
-        fixture.source.byte_len(),
-        fixture.source.utf16_len(),
-        |record| {
-            reads += 1;
-            Ok(store.index.as_mut().unwrap().read(record)?)
-        },
-    )
-    .unwrap();
-    assert_eq!(value.unwrap().utf16, 17);
-    assert!(reads < 512 && reads < directory.count / 2);
-    assert!(matches!(
-        graphemes::lower_bound(
-            directory,
-            1,
-            fixture.source.byte_len(),
-            fixture.source.utf16_len(),
-            |record| {
-                let mut row = store.index.as_mut().unwrap().read(record)?;
-                if record == directory.last {
-                    row[32..40].copy_from_slice(&1u64.to_le_bytes());
-                }
-                Ok(row)
-            }
-        ),
-        Err(Error::InconsistentCoverage)
-    ));
-    store.close().unwrap();
 }

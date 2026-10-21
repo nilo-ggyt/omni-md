@@ -1,4 +1,4 @@
-//! 同一真实 viewport 的标准 fragment 只向一份 RGBA8 位图绘制，随后直接交给 CALayer。
+//! Draws the original viewport's standard fragments into one RGBA8 bitmap and publishes it to CALayer.
 
 use super::authority::Authority;
 use super::*;
@@ -12,6 +12,8 @@ use objc2_core_graphics::CGContext;
 use objc2_foundation::NSComparisonResult;
 
 struct Fragment {
+    // One synchronous claim per actual fragment captures the source/element and geometry used to draw.
+    // Later checks must match all of them; a live framework object alone does not grant current authority.
     native: Retained<NSTextLayoutFragment>,
     frame: NSRect,
     rendering_bounds: NSRect,
@@ -23,6 +25,8 @@ struct Fragment {
 }
 
 struct Enumeration {
+    // The frontier tracks complete source coverage independently of visible ink. This temporary batch
+    // is moved out of its RefCell before Native calls, so reentry cannot borrow half-mutated state.
     frontier: Retained<ProtocolObject<dyn NSTextLocation>>,
     visited: usize,
     complete: bool,
@@ -32,7 +36,7 @@ struct Enumeration {
     previous_frame_end: Option<f64>,
 }
 
-/// 连续源流与需画ink分别拥有权限；首尾共享同批实际fragment，不再由ink过滤结果猜边界。
+/// Source continuity and visible ink have separate evidence; endpoints share the same actual batch claims.
 struct PrimaryFlow {
     first: Rc<Fragment>,
     last: Rc<Fragment>,
@@ -41,12 +45,12 @@ struct PrimaryFlow {
 impl PrimaryFlow {
     fn include(flow: &mut Option<Self>, fragment: &Rc<Fragment>) {
         match flow {
-            Some(flow) => flow.last = Rc::clone(fragment), // 纯Rc共享原claim，不再次retain Native。
+            Some(flow) => flow.last = Rc::clone(fragment), // Share the original Rust claim without another Native retain.
             None => {
                 *flow = Some(Self {
                     first: Rc::clone(fragment),
                     last: Rc::clone(fragment),
-                }); // 首个实际框即源流起点，即使其渲染范围为空也不能丢失。
+                }); // Even a first frame with no ink remains the source-flow boundary.
             }
         }
     }
@@ -62,12 +66,12 @@ impl CollectedBatch {
         Self {
             flow: None,
             visible: Vec::new(),
-        } // 只供已证明的终端；普通非空正文仍须独立完整源覆盖。
+        } // Only an authenticated terminal may use this; ordinary source still requires complete coverage.
     }
 }
 
-/// 单一文字容器沿Y向排段，项目段前/后间距均非负；ink可越界，布局框不能逆向覆盖。
-/// text_attributes与preview_blocks只添加非负段距，这里不把墨迹外溢误当作负段距。
+/// The single text container lays out paragraphs along Y with nonnegative project paragraph spacing.
+/// Ink can overhang, but layout frames cannot overlap backwards; overhang is not negative paragraph spacing.
 fn frame_follows_source(previous_end: Option<f64>, frame: NSRect) -> bool {
     let end = frame.origin.y + frame.size.height;
     geometry::finite(frame)
@@ -76,7 +80,7 @@ fn frame_follows_source(previous_end: Option<f64>, frame: NSRect) -> bool {
         && previous_end.is_none_or(|previous| frame.origin.y + 0.000_001 >= previous)
 }
 
-/// 流边界来自完整已认证枚举的首末框，与它们是否有ink、是否进入待画集合无关。
+/// Bounds use the authenticated source flow's first/last frames, including endpoints with no visible ink.
 fn complete_flow_bounds(first: NSRect, last: NSRect) -> Option<(f64, f64)> {
     if !frame_follows_source(None, first) || !frame_follows_source(None, last) {
         return None;
@@ -91,7 +95,7 @@ enum OutflowSourceSide {
     After,
 }
 
-/// 只认证布局框与实际primary流的源顺序；绘制仍用完整rendering bounds，不裁负ink。
+/// Checks layout-frame order against the actual primary flow; drawing keeps full, possibly negative ink bounds.
 fn outflow_frame_connects(
     side: OutflowSourceSide,
     frame: NSRect,
@@ -111,7 +115,7 @@ fn outflow_frame_connects(
     }
 }
 
-/// 无 Native 字段；即使下层校验提前失败，也会恢复同步重入标志。
+/// Restores the synchronous reentry flag on every exit without invoking Native from Drop.
 struct Painting<'a>(&'a Cell<bool>);
 impl Drop for Painting<'_> {
     fn drop(&mut self) {
@@ -120,14 +124,16 @@ impl Drop for Painting<'_> {
 }
 
 enum GraphicsRestore {
+    // drawRect has an existing graphics stack; updateLayer can begin with an actually empty context slot.
+    // Preserve those different restoration obligations instead of inventing a context for the layer route.
     Stack,
     Current(Option<Retained<NSGraphicsContext>>),
 }
 impl Drop for GraphicsRestore {
     fn drop(&mut self) {
         match self {
-            Self::Stack => NSGraphicsContext::restoreGraphicsState_class(), // drawRect还原原设备context栈。
-            Self::Current(previous) => NSGraphicsContext::setCurrentContext(previous.as_deref()), // layer还原原可空槽。
+            Self::Stack => NSGraphicsContext::restoreGraphicsState_class(), // Restore drawRect's original device stack.
+            Self::Current(previous) => NSGraphicsContext::setCurrentContext(previous.as_deref()), // Restore the actual optional slot.
         }
     }
 }
@@ -160,6 +166,7 @@ fn paint_entry(
     if owner.painting.replace(true) {
         return Err("光栅绘制发生同步重入".into());
     }
+    // Both guards unwind on every error. The pool bounds autoreleased Native claims created by this paint.
     let _painting = Painting(&owner.painting);
     let _operation = OperationGuard::new(Arc::clone(&owner.counters));
     autoreleasepool(|_| paint_visible(owner, view, permit, layer_entry))
@@ -174,8 +181,9 @@ fn paint_visible(
     let Some(auth) = Authority::capture(owner, view, permit)? else {
         return Ok(false);
     };
-    // updateLayer没有窗口绘图context；只用同一原Authority的实际视口/scale，并直接创建
-    // 下方唯一CPU画布。drawRect对照仍完整验证原设备context、clip与CTM，不拿假context过门。
+    // updateLayer has no window graphics context; use the same Authority's actual viewport/scale
+    // for the one CPU canvas below. drawRect still authenticates its real device context, clip,
+    // and CTM; a fabricated context cannot satisfy that entry's contract.
     let original = if layer_entry {
         None
     } else {
@@ -194,6 +202,8 @@ fn paint_visible(
                 return Err("原正文没有有效视口绘图 clip".into());
             }
             let transform = auth.step(|| CGContext::ctm(Some(&cg)))?;
+            // This mapping supports finite axis-aligned uniform scale with either Y direction.
+            // Rotation, skew, zero scale, or unequal axes cannot produce an exact viewport bitmap here.
             if ![
                 transform.a,
                 transform.b,
@@ -214,7 +224,7 @@ fn paint_visible(
             }
             Some(cg)
         }
-        None => None, // 真正layer入口不要求不存在的window clip，也不补造第二份位图。
+        None => None, // The real layer entry requires no nonexistent window clip and creates no extra bitmap.
     };
     let body_layer = if layer_entry {
         let lease = view
@@ -232,18 +242,18 @@ fn paint_visible(
         None
     };
     let mut collected = if auth.terminal_viewport {
-        collect_terminal(&auth)? // 已证实EOF可没有字形；仍尽可能取得实际末片作布局流边界。
+        collect_terminal(&auth)? // Authenticated EOF may have no glyphs; retain its actual final flow boundary if available.
     } else {
         collect(&auth)?
     };
     let outflow = collect_outflow(&auth, collected.flow.as_ref(), &mut collected.visible)?;
     let requires_table_paint = if collected.visible.is_empty() && !auth.terminal_viewport {
         let Some(required) = auth.table_overlay_requirement()? else {
-            return Ok(false); // 无当前占位结论时保留Pending，不把未知内容发布成空背景。
+            return Ok(false); // Unknown placeholder requirements stay pending instead of publishing empty content.
         };
         required
     } else {
-        false // 实际glyph或已认证终端已覆盖正文；表格仍在同一画布正常绘制。
+        false // Actual glyphs or an authenticated terminal cover source; tables still draw into this same canvas.
     };
     if requires_table_paint
         && !view
@@ -253,7 +263,9 @@ fn paint_visible(
             .as_ref()
             .is_some_and(|cache| !cache.tables.is_empty())
     {
-        return Ok(false); // 原流完整而占位尚无glyph/已发布表格，等原合并事件准备，不造空图或sticky。
+        // Source flow is complete, but the original table producer has not prepared its visible cache.
+        // Wait for that lifecycle event without publishing an empty image or creating a sticky failure.
+        return Ok(false);
     }
     let mut fragments = collected.visible;
     order_fragments(&auth, &mut fragments)?;
@@ -263,8 +275,8 @@ fn paint_visible(
     let bitmap =
         auth.step(|| pixels::Bitmap::new(width, height, Arc::clone(&owner.counters.pixels)))??;
     let context = bitmap.context();
-    // 标准 source 坐标为 Y-down；独立建立与图像上边一致的实际 backing-scale 变换。
-    // 原设备 context 可能是正 Y，不能照抄其符号，也不能仅放宽符号检查造成倒字。
+    // Standard source coordinates point down Y. Build the actual backing-scale transform relative
+    // to this image's top edge; copying a device context's Y sign could draw text upside down.
     auth.step(|| {
         CGContext::concat_ctm(
             Some(context),
@@ -278,8 +290,9 @@ fn paint_visible(
             },
         )
     })?;
-    // 每次 contents 替换的是整份视口图像；须重画该有界视口，不能把 dirty 外像素换成透明洞。
-    // 该 CPU clip 从不扩大到正文高度，原 Native dirty clip 和后续装饰绘制保持原值。
+    // Replacing contents replaces the whole viewport image, so redraw that bounded viewport rather
+    // than leaving transparent holes outside the dirty rect. This CPU clip never expands to body
+    // height; the original Native dirty clip and later decoration drawing retain their own values.
     auth.step(|| CGContext::clip_to_rect(Some(context), auth.visible))?;
     if let Some(original_cg) = original_cg.as_ref() {
         let text_matrix = auth.step(|| CGContext::text_matrix(Some(original_cg)))?;
@@ -290,8 +303,9 @@ fn paint_visible(
         })?;
         let interpolation = auth.step(|| CGContext::interpolation_quality(Some(original_cg)))?;
         auth.step(|| CGContext::set_interpolation_quality(Some(context), interpolation))?;
-    } // Layer入口使用新建真实RGBA8/sRGB画布自己的原始文字矩阵与插值属性，不借别处显示状态。
-    // 临时 AppKit context 必须在 finish 前真实归还其 CGContext claim；外层 pool 不足以证明这一点。
+    } // The layer route uses its new RGBA8/sRGB context's own defaults, without unrelated display state.
+    // Return the temporary AppKit context's actual CGContext claim before finish. An outer pool
+    // alone would not guarantee that this owner has ended before the bitmap is converted to an image.
     let content_painted = autoreleasepool(|_| -> Result<bool, String> {
         let raster =
             auth.step(|| NSGraphicsContext::graphicsContextWithCGContext_flipped(context, true))?;
@@ -311,7 +325,7 @@ fn paint_visible(
             return Err("标准字形绘制前原视口失效".into());
         }
         let _restore = if layer_entry {
-            // 无窗口context时直接保存原可空线程槽；退出时恢复None，不对空context发save消息。
+            // Save the actual optional thread slot; restore None rather than sending save to an absent context.
             GraphicsRestore::Current(auth.step(NSGraphicsContext::currentContext)?)
         } else {
             NSGraphicsContext::saveGraphicsState_class();
@@ -321,8 +335,9 @@ fn paint_visible(
             return Err("保存原 GraphicsContext 后原票失效".into());
         }
         auth.step(|| NSGraphicsContext::setCurrentContext(Some(&raster)))?;
-        // 同一有限画布先承接原生背景、选择与输入提示；原viewport proxy不建立窗口glyph子surface。
-        // 随后逐片画标准glyph，所有实际发布仍须同一原始权限，避免第二份窗口显示列表。
+        // Draw the original background, selection, and input hints into this bounded canvas first.
+        // The default proxy route does not configure window glyph surfaces. Draw each standard
+        // fragment under the same authority, without an additional window display list here.
         auth.step(|| view.draw_native_body_for_raster(auth.visible))?;
         for fragment in &fragments {
             if !fragment_current(&auth, fragment)? {
@@ -353,19 +368,22 @@ fn paint_visible(
                 return Err("原 fragment 在绘制后改变".into());
             }
         }
-        // 表格文字和 Source 提示仍使用原已准备缓存；与正文共用有限 CPU 画布，避免窗口
-        // 显示列表在后续提交时另外建立 glyph 资源。此处不解析、重排或创建第二份正文。
+        // Tables and Source hints use their already prepared caches on the same bounded canvas.
+        // Do not parse, reflow, or create another document here, or let a later window display list
+        // allocate a separate set of glyph resources for these decorations.
         let tables_painted = auth.step(|| view.draw_visible_markdown_tables(auth.visible))?;
         auth.step(|| view.draw_source_decorations(auth.visible))?;
         Ok(!requires_table_paint || tables_painted)
     })?;
     if !content_painted {
-        return Ok(false); // 真实表格producer未完成原cache绘制；释放本次CPU画布但绝不发布空背景。
+        return Ok(false); // The original table cache did not paint; drop this canvas without publishing blank contents.
     }
     if let Some(layer) = body_layer.as_ref() {
-        verify_body_layer(&auth, layer)?; // CPU同步原语不能把同一原正文layer悄换成后继backing。
+        verify_body_layer(&auth, layer)?; // Synchronous drawing cannot silently replace the original body backing.
     }
     let image = auth.step(|| bitmap.finish())??;
+    // finish transfers the bounded pixel owner to the CGImage's provider. CALayer then retains that
+    // same image; only the provider's actual final release can return the underlying mapping.
     if !auth.current() {
         return Err("光栅发布前原票失效".into());
     }
@@ -401,13 +419,14 @@ fn paint_visible(
                 .load(Ordering::Acquire),
         );
     }
-    Ok(true) // 真实同源字形或已证明终端的背景/选择已发布；不把无字形分支伪称字形绘制。
+    Ok(true) // Publishes original glyphs or authenticated terminal background/selection, not invented glyph coverage.
 }
 
 fn verify_body_layer(
     auth: &Authority<'_>,
     layer: &objc2_quartz_core::CALayer,
 ) -> Result<(), String> {
+    // updateLayer must still own the exact backing installed before attachment, including both public flags.
     if !auth.step(|| auth.view.wantsLayer())?
         || !auth.step(|| auth.view.wantsUpdateLayer())?
         || !auth
@@ -420,23 +439,23 @@ fn verify_body_layer(
     Ok(())
 }
 
-/// 真空文档或EOF独立取实际末片；没有已布局字形时只发布真实背景，不创建占位fragment。
+/// Uses the real final fragment for canonical emptiness/EOF, without creating a placeholder for absent glyphs.
 fn collect_terminal(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
     let end = auth.step(|| auth.range.endLocation())?;
     let Some(native) = auth.step(|| auth.manager.textLayoutFragmentForLocation(&end))? else {
-        return Ok(CollectedBatch::empty()); // 有界空背景仍需后续完整authority/publish；不宣称caret已实测。
+        return Ok(CollectedBatch::empty()); // Empty background still needs full authority/publication; this is no caret test.
     };
     if !auth
         .owner()
         .fragment_is_registered(&native, &|| auth.current())?
     {
         if auth.document_length == 0 {
-            return Ok(CollectedBatch::empty()); // canonical无字符可遗漏；不使用尚未配置的Native片段伪造glyph。
+            return Ok(CollectedBatch::empty()); // Canonical emptiness needs no unconfigured fragment to invent glyphs.
         }
         return Err("终端fragment未经原viewport实际配置".into());
     }
     if auth.step(|| native.state())? != NSTextLayoutFragmentState::LayoutAvailable {
-        return Ok(CollectedBatch::empty()); // 不读未就绪frame；有限registry扫描仍拒绝任何需显示但无完整布局的ink。
+        return Ok(CollectedBatch::empty()); // Do not read unready frames; bounded registry scanning still rejects unlaid-out visible ink.
     }
     if !auth
         .step(|| native.textLayoutManager())?
@@ -449,7 +468,7 @@ fn collect_terminal(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
     if auth.step(|| finish.compare(&end))? != NSComparisonResult::Same
         || !actual_fragment(auth, &native, &source)?
     {
-        return Ok(CollectedBatch::empty()); // 旧片或非EOF片不能冒充终端边界；实际外溢另由原有限扫描认证。
+        return Ok(CollectedBatch::empty()); // A stale/non-EOF fragment cannot become the terminal; outflow needs its own scan.
     }
     let (element, element_range) = capture_element(auth, &native, &source)?;
     let empty = auth.step(|| source.isEmpty())?;
@@ -464,7 +483,7 @@ fn collect_terminal(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
         if auth.step(|| value.length())? != 0 {
             return Err("空终端fragment仍持非空paragraph值".into());
         }
-        drop(value); // 实际空属性值临时claim归还后仍核原票，不把可变源强制清空。
+        drop(value); // Return the actual empty attributed value; never clear mutable source to satisfy this condition.
     }
     let frame = auth.step(|| native.layoutFragmentFrame())?;
     let rendering_bounds = auth.step(|| native.renderingSurfaceBounds())?;
@@ -491,7 +510,7 @@ fn collect_terminal(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
             geometry::ink(frame, rendering_bounds, auth.origin)?,
             auth.visible,
         ) {
-        vec![Rc::clone(&fragment)] // 只共享同一实际末片；EOF无墨迹时仍保留独立源流边界。
+        vec![Rc::clone(&fragment)] // Share this actual final fragment; no ink still leaves an independent flow boundary.
     } else {
         Vec::new()
     };
@@ -507,7 +526,7 @@ fn collect_terminal(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
 fn collect(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
     let start = auth.step(|| auth.range.location())?;
     let end = auth.step(|| auth.range.endLocation())?;
-    let fold_revision = auth.view.ivars().folds.revision(); // 原Authority已固定同一fold revision。
+    let fold_revision = auth.view.ivars().folds.revision(); // The Authority already fixed this fold revision.
     let state = RefCell::new(Some(Enumeration {
         frontier: start.clone(),
         visited: 0,
@@ -518,7 +537,8 @@ fn collect(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
         previous_frame_end: None,
     }));
     let block = block2::RcBlock::new(|raw: NonNull<NSTextLayoutFragment>| -> Bool {
-        // 先 take 整个临时批次，RefCell 借用结束后才调用 retain/getter/比较和析构。
+        // Move the whole batch out before retain/getter/comparison/destruction can reenter Native.
+        // A recursive callback cannot borrow partially updated source-frontier state.
         let Some(mut batch) = state.borrow_mut().take() else {
             return Bool::NO;
         };
@@ -530,7 +550,7 @@ fn collect(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
             if !auth.current() {
                 return Err("枚举期间原光栅视口改变".into());
             }
-            // SAFETY: 同步公开枚举回调提供存活 fragment；临时 retain 仅持续本次画图。
+            // SAFETY: Public synchronous enumeration supplies a live fragment; the retain lasts only this paint.
             let native = unsafe { Retained::retain(raw.as_ptr()) }.ok_or("原 fragment 无法保留")?;
             if !auth
                 .owner()
@@ -550,10 +570,12 @@ fn collect(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
             let location = auth.step(|| source.location())?;
             let finish = auth.step(|| source.endLocation())?;
             let start_order = auth.step(|| location.compare(&batch.frontier))?;
+            // Accept an omitted source interval only when the original canonical fold explicitly
+            // covers it. Otherwise every actual fragment must advance the continuous source frontier.
             let hidden_gap = start_order == NSComparisonResult::Descending
                 && hidden_source_interval(auth, &batch.frontier, &location, fold_revision)?;
             let finish_order = if start_order == NSComparisonResult::Descending && !hidden_gap {
-                None // 保留原短路次序；已发现空洞时不为了诊断追加原本不会发生的compare。
+                None // Preserve short-circuit order; diagnostics must not add a compare after an already known gap.
             } else {
                 Some(auth.step(|| finish.compare(&batch.frontier))?)
             };
@@ -584,7 +606,8 @@ fn collect(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
                 return Err("零高fragment没有当前显式折叠证明".into());
             }
             if !frame_follows_source(batch.previous_frame_end, frame) {
-                // 当前viewport自身也不能混用两次布局的坐标；失效整批，不遮掉冲突段落。
+                // A viewport cannot mix coordinates from different layouts. Reject the entire batch
+                // instead of hiding the paragraph whose frame conflicts with the current source flow.
                 return Err("原 viewport 的源顺序与实际布局框冲突".into());
             }
             batch.previous_frame_end = Some(frame.origin.y + frame.size.height);
@@ -608,7 +631,7 @@ fn collect(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
             });
             PrimaryFlow::include(&mut batch.flow, &fragment);
             if frame.size.height > 0.0 && geometry::intersects(body, auth.visible) {
-                batch.visible.push(fragment); // 需画集合只筛ink；完整源流首尾仍独立存在。
+                batch.visible.push(fragment); // Filter only visible ink; keep complete source-flow endpoints separately.
             }
             batch.complete =
                 auth.step(|| batch.frontier.compare(&end))? != NSComparisonResult::Ascending;
@@ -621,7 +644,7 @@ fn collect(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
             batch.error = Some(error);
         }
         let again = batch.error.is_none() && !batch.complete;
-        *state.borrow_mut() = Some(batch); // 只移动批次，不执行 Native 析构或 getter。
+        *state.borrow_mut() = Some(batch); // Moving the batch performs no Native getter or destruction in this borrow.
         Bool::from(again)
     });
     auth.step(|| {
@@ -632,13 +655,14 @@ fn collect(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
                 &block,
             )
     })?;
-    drop(block); // 公开枚举同步返回后结束闭包对批次槽的借用，再移出唯一临时 owner。
+    // Enumeration returned synchronously; drop its closure before extracting the unique temporary owner.
+    drop(block);
     let mut batch = state.into_inner().ok_or("光栅枚举回调未归还批次")?;
     if let Some(error) = batch.error {
         return Err(error);
     }
     if !batch.complete && hidden_source_interval(auth, &batch.frontier, &end, fold_revision)? {
-        batch.complete = true; // 仅真实尾部全被当前fold覆盖时允许Native省略这些片段。
+        batch.complete = true; // Native may omit the tail only when the original fold covers that entire source interval.
     }
     if !batch.complete || !auth.current() {
         return Err("光栅真实 viewport 未被当前可见 fragment 完整覆盖".into());
@@ -649,7 +673,7 @@ fn collect(auth: &Authority<'_>) -> Result<CollectedBatch, String> {
     })
 }
 
-/// 原provider精确往返端点后，只用canonical显式fold解释省略区间，不读字符或补做布局。
+/// Round-trips original provider endpoints, then checks canonical folds without reading text or adding layout.
 fn hidden_source_interval(
     auth: &Authority<'_>,
     from: &ProtocolObject<dyn NSTextLocation>,
@@ -689,6 +713,8 @@ fn hidden_source_interval(
 }
 
 fn fragment_current(auth: &Authority<'_>, fragment: &Fragment) -> Result<bool, String> {
+    // A cached framework fragment can stay alive after replacement. Revalidate its exact element,
+    // source, manager, state, and both geometries before and after drawing that captured fragment.
     let element = auth.step(|| fragment.native.textElement())?;
     let Some(element) = element else {
         return Ok(false);
@@ -717,6 +743,8 @@ fn capture_element(
     native: &NSTextLayoutFragment,
     source: &NSTextRange,
 ) -> Result<(Retained<NSTextElement>, Retained<NSTextRange>), String> {
+    // The source range must belong to an actual element in the same content manager. A matching
+    // fragment address alone cannot authorize a source range moved into another Native graph.
     let element = auth
         .step(|| native.textElement())?
         .ok_or("光栅 fragment 的原 element 缺失")?;
@@ -735,7 +763,7 @@ fn capture_element(
     Ok((element, element_range))
 }
 
-/// viewportRange连续性不能证明range外的负ink；补扫原viewport实际配置登记的标准片段。
+/// Viewport-range continuity cannot cover negative ink outside it; scan the original configured registry too.
 fn collect_outflow(
     auth: &Authority<'_>,
     flow: Option<&PrimaryFlow>,
@@ -755,7 +783,7 @@ fn collect_outflow(
             bottom,
         ))
     } else if auth.terminal_viewport {
-        None // 唯有已认证的终端可无字形；扫描仍须证明没有遗漏任何实际需显示的ink。
+        None // Only an authenticated terminal may have no glyphs; the scan must still exclude omitted visible ink.
     } else {
         return Err("外溢字形缺少实际primary流边界".into());
     };
@@ -768,7 +796,8 @@ fn collect_outflow(
         return Err("光栅 Weak 集合超过原身份预算".into());
     }
     for weak in entries.iter() {
-        // 集合唯一 owner 已移出 RefCell；临时 Native claim 只活到本次扫描/画图，不增加布局所有权。
+        // The unique registry payload is outside RefCell. Temporary Native claims last only through
+        // this scan/paint and do not become another persistent layout owner.
         let Some(own) = auth.step(|| weak.load())? else {
             continue;
         };
@@ -776,13 +805,13 @@ fn collect_outflow(
         let manager = auth.step(|| native.textLayoutManager())?;
         let Some(manager) = manager else {
             continue;
-        }; // 已脱离任何 manager 的旧缓存没有当前绘制权。
+        }; // An old cache detached from every manager has no current drawing authority.
         if !std::ptr::eq::<NSTextLayoutManager>(&*manager, &*auth.manager) {
             return Err("已登记 fragment 被转移到其他 manager".into());
         }
         let state = auth.step(|| native.state())?;
         if state <= NSTextLayoutFragmentState::EstimatedUsageBounds {
-            continue; // 尚无实际渲染度量的片段不能绘制；原 viewport 必需片仍由连续性门禁拒绝缺失。
+            continue; // Unmeasured fragments cannot draw; primary continuity still rejects any required missing fragment.
         }
         if auth.terminal_viewport && auth.document_length == 0 {
             let source = auth.step(|| native.rangeInElement())?;
@@ -792,7 +821,7 @@ fn collect_outflow(
                 && auth.step(|| end.compare(&viewport_end))? == NSComparisonResult::Same
                 && actual_fragment(auth, native, &source)?
             {
-                continue; // canonical与Native均证实无字符，不把空ink度量当成尚缺的字形。
+                continue; // Canonical and Native emptiness agree; empty ink metrics do not imply missing glyphs.
             }
         }
         let frame = auth.step(|| native.layoutFragmentFrame())?;
@@ -815,13 +844,13 @@ fn collect_outflow(
                 if auth.step(|| end.compare(&viewport_end))? == NSComparisonResult::Same
                     && actual_fragment(auth, native, &source)?
                 {
-                    continue; // 真实EOF空片无需glyph；其存在不能制造另一个字形或覆盖其它源。
+                    continue; // A real empty EOF fragment needs no glyph and cannot cover another source interval.
                 }
             }
             if !hidden_source_interval(auth, &start, &end, auth.view.ivars().folds.revision())? {
                 return Err("零高外溢缓存没有当前显式折叠证明".into());
             }
-            continue; // 真实隐藏片只保原Weak生命周期，不绘制其旧ink或额外扩大primary流。
+            continue; // Keep a hidden fragment's original weak lifecycle without drawing stale ink or expanding primary flow.
         }
         let ink = geometry::ink(frame, rendering_bounds, auth.origin)?;
         if !geometry::intersects(ink, auth.visible) {
@@ -839,7 +868,7 @@ fn collect_outflow(
         let source = auth.step(|| native.rangeInElement())?;
         if !actual_fragment(auth, native, &source)? {
             continue;
-        } // 存活旧缓存不能与实际当前片重复叠绘。
+        } // A live stale cache cannot draw over the actual current fragment.
         let start = auth.step(|| source.location())?;
         let end = auth.step(|| source.endLocation())?;
         let Some((primary_start, primary_end, primary_top, primary_bottom)) = primary.as_ref()
@@ -851,12 +880,14 @@ fn collect_outflow(
         } else if auth.step(|| start.compare(primary_end))? != NSComparisonResult::Ascending {
             OutflowSourceSide::After
         } else {
-            // primary源范围已连续覆盖，此处额外身份不能获得重复绘制权；Weak仍留在原登记中。
+            // Primary source is already continuously covered. Another identity inside that range
+            // receives no duplicate drawing rights; its weak entry remains in the original registry.
             continue;
         };
         if !outflow_frame_connects(side, frame, *primary_top, *primary_bottom) {
-            // TextKit可缓存旧state3框；与本批实际流矛盾的旧框没有当前绘制权，不能叠到新段上。
-            // 不失效Native、不删除Weak或业务值，也不裁掉合法框的负方向ink。
+            // TextKit can cache old LayoutAvailable frames. A frame inconsistent with this actual
+            // source flow cannot draw over relocated paragraphs. Do not invalidate Native, delete
+            // its weak/business observations, or clip valid negative ink to hide that inconsistency.
             continue;
         }
         let (element, element_range) = capture_element(auth, native, &source)?;
@@ -874,7 +905,8 @@ fn collect_outflow(
             return Err("补齐真实外溢片段时原状态改变".into());
         }
     }
-    drop(lease); // 先归还 Weak 元数据唯一 owner，析构/恢复后的原票仍须有效。
+    // Return the unique weak-metadata payload first; destruction/restoration must leave the permit current.
+    drop(lease);
     if !auth.current() {
         return Err("外溢片段扫描归还后原票失效".into());
     }
@@ -891,6 +923,7 @@ fn actual_fragment(
     native: &NSTextLayoutFragment,
     source: &NSTextRange,
 ) -> Result<bool, String> {
+    // Query the original manager at this source location; a registered but replaced identity is stale.
     let location = auth.step(|| source.location())?;
     let actual = auth.step(|| auth.manager.textLayoutFragmentForLocation(&location))?;
     Ok(actual.is_some_and(|actual| std::ptr::eq::<NSTextLayoutFragment>(&*actual, native)))
@@ -898,7 +931,8 @@ fn actual_fragment(
 
 fn order_fragments(auth: &Authority<'_>, fragments: &mut [Rc<Fragment>]) -> Result<(), String> {
     let failed = Cell::new(false);
-    // Weak 集合按真实创建顺序登记，外溢片未必晚于主视口片；按原 source 顺序恢复标准叠绘关系。
+    // Registry order is creation order, so outflow need not follow viewport fragments. Restore source
+    // order for standard compositing. Native comparison failure cancels the batch, not just that pair.
     fragments.sort_by(|left, right| {
         if failed.get() {
             return std::cmp::Ordering::Equal;
@@ -924,19 +958,19 @@ fn order_fragments(auth: &Authority<'_>, fragments: &mut [Rc<Fragment>]) -> Resu
     Ok(())
 }
 
-/// 只诊断深视口的原批次；固定预算外不查询Native，也不改变任何布局或绘制判据。
+/// Diagnoses only the original deep-viewport batch, within a fixed budget and without changing paint decisions.
 #[cfg(feature = "native-block-fragment-diagnostic")]
 fn trace_deep_fragment_geometry(auth: &Authority<'_>, fragments: &[Rc<Fragment>]) {
     native_markdown_trace! {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static DEEP_PAINTS: AtomicUsize = AtomicUsize::new(0);
         if auth.visible.origin.y <= 1_000.0 {
-            return; // 首屏不消耗深位置预算，便于保留真实Find后的首组几何。
+            return; // Preserve the deep-position budget for the first actual Find/reveal geometry.
         }
         let Ok(previous) = DEEP_PAINTS.try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < 8).then(|| count + 1)
         }) else {
-            return; // 计数停在8，不因后续绘制增长或回绕恢复观察权限。
+            return; // Stop at eight; later paints cannot wrap this counter into renewed observation rights.
         };
         let ordinal = previous + 1;
         let result = (|| -> Result<(), String> {
@@ -948,7 +982,7 @@ fn trace_deep_fragment_geometry(auth: &Authority<'_>, fragments: &[Rc<Fragment>]
                 let end = auth.step(|| range.endLocation())?;
                 let from = auth.step(|| auth.content.offsetFromLocation_toLocation(&document_start, &start))?;
                 let to = auth.step(|| auth.content.offsetFromLocation_toLocation(&document_start, &end))?;
-                Ok((from, to)) // 只翻译原Native位置，不读字符、创建正文或修正负坐标。
+                Ok((from, to)) // Translate Native positions only, without text materialization or coordinate correction.
             };
             let (viewport_start, viewport_end) = offsets(&auth.range)?;
             let epoch = auth.owner().counters.viewport_epoch.load(Ordering::Acquire);
@@ -962,20 +996,22 @@ fn trace_deep_fragment_geometry(auth: &Authority<'_>, fragments: &[Rc<Fragment>]
                 if !fragment_current(auth, fragment)? {
                     return Err("深视口诊断的原fragment几何已改变".into());
                 }
-                // 只输出同一source排序批次的已捕获几何；原票和实际frame仍由原函数逐原语复核。
+                // Log captured geometry from this same source-ordered batch. The original function
+                // still validates authority and actual frame identity around each Native primitive.
                 let source = if fragment.diagnostic_outflow { "outflow" } else { "primary" };
                 eprintln!("native_raster_fragment_geometry event=fragment ordinal={ordinal} index={index} source_start={source_start} source_end={source_end} membership={source} captured_frame={:?} captured_ink={ink:?} formal=false", fragment.frame);
             }
             Ok(())
         })();
         if let Err(error) = result {
-            // 诊断失败不签绘制成功，也不另设失败门；原paint继续按既有原票与几何谓词判定。
+            // Diagnostics certify no paint result and add no failure gate. The existing paint
+            // path still decides using its original permit and geometry predicates.
             eprintln!("native_raster_fragment_geometry event=unavailable ordinal={ordinal} reason={error:?} formal=false");
         }
     }
 }
 
-/// 首个覆盖失败只翻译五个原位置，不ensure、读字符或改写原错误；上限外不做Native查询。
+/// Translates five original positions at bounded coverage failures, without layout, text reads, or error replacement.
 #[cfg(feature = "native-block-fragment-diagnostic")]
 fn trace_fragment_frontier_failure(
     auth: &Authority<'_>,
@@ -994,7 +1030,7 @@ fn trace_fragment_frontier_failure(
         let Ok(ordinal) = FAILURES.try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < 16).then(|| count + 1)
         }) else {
-            return; // 固定一次性观察预算，不无限记录持续失败或补做查询。
+            return; // A fixed observation budget prevents unbounded repeated-failure logs and Native queries.
         };
         let offsets = (|| -> Result<[isize; 5], String> {
             let provider = ProtocolObject::<dyn NSTextElementProvider>::from_ref(&*auth.content);
@@ -1007,7 +1043,8 @@ fn trace_fragment_frontier_failure(
             Ok(result)
         })();
         let kind = if start_order == NSComparisonResult::Descending { "hole" } else { "no_progress" };
-        // state3已由原collector的准入查询证实；frame尚未读取必须明确None，不能猜造旧值。
+        // The collector already confirmed LayoutAvailable. This failure precedes frame lookup:
+        // report that absence explicitly rather than inventing geometry from an earlier fragment.
         eprintln!("native_raster_fragment_frontier_failure ordinal={} kind={kind} visited={visited} offsets_viewport_start_end_source_start_end_frontier={offsets:?} start_order={start_order:?} finish_order={finish_order:?} state_layout_available=true frame_queried=false previous_frame_end={previous_frame_end:?} visible={:?} origin={:?} formal=false", ordinal + 1, auth.visible, auth.origin);
     }
 }
@@ -1034,7 +1071,7 @@ mod flow_tests {
             geometry::ink(last, no_ink, NSPoint::ZERO).unwrap(),
             viewport,
         ));
-        // 即使两端均未进入ink集合，外溢准入仍必须使用100..214的实际连续流。
+        // Endpoints absent from the ink set still define the complete 100..214 source-flow bounds.
         let (top, bottom) = complete_flow_bounds(first, last).unwrap();
         assert_eq!((top, bottom), (100.0, 214.0));
         assert!(!outflow_frame_connects(
@@ -1057,7 +1094,7 @@ mod flow_tests {
         assert!(complete_flow_bounds(frame(f64::NAN, 38.0), frame(176.0, 38.0)).is_none());
         assert!(complete_flow_bounds(frame(100.0, -1.0), frame(176.0, 38.0)).is_none());
         assert!(complete_flow_bounds(frame(100.0, 38.0), frame(f64::MAX, f64::MAX)).is_none());
-        // 显式隐藏的零高框仍可作为流末端；是否隐藏继续由原canonical fold证明负责。
+        // A zero-height frame can terminate flow; the actual canonical fold separately proves it is hidden.
         assert_eq!(
             complete_flow_bounds(frame(100.0, 38.0), frame(138.0, 0.0)),
             Some((100.0, 138.0)),
@@ -1066,7 +1103,8 @@ mod flow_tests {
 
     #[test]
     fn cached_preceding_source_cannot_reenter_a_relocated_primary_flow() {
-        // 实测旧片段仍state3且同manager，源位置在11763之前，但布局框向后侵入新primary。
+        // These observed stale frames remained LayoutAvailable in the same manager, with earlier
+        // source positions, yet their geometry intruded into the relocated primary flow.
         for stale in [
             frame(6443.0, 17.0),
             frame(6460.0, 51.0),
@@ -1106,7 +1144,8 @@ mod flow_tests {
             100.0,
             150.0
         ));
-        // 前段向下和后段负方向墨迹都真实进入视口；准入不要求ink也服从布局框边界。
+        // Both the preceding frame's downward ink and the following frame's negative ink enter
+        // the viewport; valid admission must not force ink to stay inside the layout-frame bounds.
         let before_ink = NSRect::new(NSPoint::new(-3.0, 0.0), NSSize::new(790.0, 30.0));
         let after_ink = NSRect::new(NSPoint::new(-3.0, -10.0), NSSize::new(790.0, 30.0));
         assert!(geometry::intersects(

@@ -1,4 +1,4 @@
-//! 原文件粘贴与拖放沿现存输入链排队，文件归属仍由受限导入的provisional事务确认。
+//! Existing file Paste/drop uses the original input queue; confined import's provisional transaction still confirms file ownership.
 
 use objc2::{DefinedClass, runtime::ProtocolObject};
 use objc2_app_kit::{NSDragOperation, NSDraggingInfo, NSPasteboardTypeString};
@@ -11,7 +11,7 @@ use crate::native_surface::workspace_actions::{
 use crate::payload_use::PayloadUseGuard;
 
 impl NativeMarkdownPagedTextView {
-    /// 路径到达时固定的原输入事实必须仍成立；原Body只接纳这一份有限载荷，不复制或打开外部文件。
+    /// Original Input facts captured on path arrival must hold; Body admits this bounded payload without copying/opening external files yet.
     pub(in crate::native_surface) fn queue_attachment_paths(
         &self,
         paths: Vec<std::path::PathBuf>,
@@ -21,7 +21,7 @@ impl NativeMarkdownPagedTextView {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         let origin = self.origin()?;
         if origin.state != before {
-            return Err(Error::Revoked); // Native路径读取期间已发生后继输入，旧文件请求不得领取较新的选区。
+            return Err(Error::Revoked); // Native path reads delivered successor input; an old file request cannot acquire the newer selection.
         }
         if origin.input.is_cell() {
             return Err(Error::UnsupportedCommand);
@@ -34,7 +34,7 @@ impl NativeMarkdownPagedTextView {
         Ok(())
     }
 
-    /// 进入拖放只检查有限类型/路径，不复制文件、不改变选择，也不提前确认正在编辑的组合文字。
+    /// Drag entry checks bounded types/paths only, without file copy, selection changes, or early composition confirmation.
     pub(super) fn accepted_drag_operation(
         &self,
         sender: &ProtocolObject<dyn NSDraggingInfo>,
@@ -43,13 +43,13 @@ impl NativeMarkdownPagedTextView {
         let accepted = (|| {
             let origin = self.origin()?;
             if origin.input.is_cell() {
-                return Ok(false); // 单元格不能借正文附件语义产生未定义的表格转义或外部文件副作用。
+                return Ok(false); // Cell cannot borrow Body attachment semantics for undefined table escaping or external file effects.
             }
             if !origin
                 .step(self, || sender.draggingSourceOperationMask())?
                 .contains(NSDragOperation::Copy)
             {
-                return Ok(false); // 本目标只复制外部源；源未允许Copy时不宣称Move/Link也能导入。
+                return Ok(false); // This target copies external input only; a source without Copy permission cannot import through Move/Link.
             }
             let board = origin.step(self, || sender.draggingPasteboard())?;
             let paths = origin
@@ -58,7 +58,7 @@ impl NativeMarkdownPagedTextView {
             if !paths.is_empty() {
                 return Ok(true);
             }
-            // SAFETY: 系统公开字符串类型常量只用于实际拖板的类型查询，不读取或物化文本。
+            // SAFETY: The public string-type constant only queries this drag pasteboard's formats, without reading/materializing text.
             let types = objc2_foundation::NSArray::from_slice(&[unsafe { NSPasteboardTypeString }]);
             Ok(origin
                 .step(self, || board.availableTypeFromArray(&types))?
@@ -69,13 +69,13 @@ impl NativeMarkdownPagedTextView {
             Ok(false) => NSDragOperation::None,
             Err(cause) => {
                 self.report_attachment_rejection(&cause);
-                self.failure(cause); // 拒绝完整超限批次，并沿原错误通知反馈；不静默接收前缀。
+                self.failure(cause); // Reject the whole over-budget batch through existing feedback rather than silently accept a prefix.
                 NSDragOperation::None
             }
         }
     }
 
-    /// 实际放下只使用现成Scene的真实命中；未Ready时拒绝，不为接收文件读取全篇或猜测行高。
+    /// Actual drop uses the existing Scene's measured hit; missing Ready rejects without whole-document reads or guessed line heights.
     pub(super) fn accept_drop(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> Result<()> {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         self.cancel_link_intent();
@@ -87,8 +87,8 @@ impl NativeMarkdownPagedTextView {
                 .borrow()
                 .clone()
                 .ok_or(Error::ContextUnavailable)?;
-            // 放下接受已显示组合，再结束原转换；不能让旧IME缓冲在附件动作后再次提交。
-            // 同步回调仍核原客户，外部文件此时尚未复制，Scene命中仍在收尾后重新领取。
+            // Drop accepts displayed composition and ends original conversion before old IME buffers could submit again after attachments.
+            // Callbacks still validate the original client; no external file was copied, and Scene hits are acquired after composition completion.
             self.finish_composition_in_context(
                 &origin.input,
                 &origin.delegate,
@@ -104,7 +104,7 @@ impl NativeMarkdownPagedTextView {
             .step(self, || sender.draggingSourceOperationMask())?
             .contains(NSDragOperation::Copy)
         {
-            return Err(Error::UnsupportedCommand); // 放下时重核真实源操作许可，不能沿先前enter替后继mask补签。
+            return Err(Error::UnsupportedCommand); // Recheck actual source-operation permission at drop; earlier enter cannot authorize a successor mask.
         }
         let board = scene.step(self, || sender.draggingPasteboard())?;
         let point = scene.step(self, || sender.draggingLocation())?;
@@ -123,14 +123,14 @@ impl NativeMarkdownPagedTextView {
                 paths,
                 Some((scene.origin.state.generation, position)),
                 scene.origin.state,
-            ); // 只接纳原文件动作；文件归属、文本和Undo直到原队首才提交。
+            ); // Admit the original file action only; file ownership, text, and Undo commit at the actual queue head.
         }
         if scene.origin.delegate.has_native_input_barrier() {
-            return Err(Error::Busy); // 真实导航尚未结束时不以鼠标旧选择覆盖它，也不把拖板改读成general clipboard。
+            return Err(Error::Busy); // An unfinished navigation cannot be overwritten by old pointer selection, nor may the drag pasteboard become general clipboard.
         }
         let text = scene
             .step(self, || {
-                // SAFETY: 只读取当前这次实际拖板的公开纯文本类型；有限转换由唯一Input执行。
+                // SAFETY: Read this actual drag pasteboard's public plain-text type only; the sole Input performs bounded conversion.
                 board.stringForType(unsafe { NSPasteboardTypeString })
             })?
             .ok_or(Error::ClipboardUnavailable)?;
@@ -143,7 +143,7 @@ impl NativeMarkdownPagedTextView {
         self.finish_edit_commit(&scene.origin, commit)
     }
 
-    /// 唯一队首用前步真实收据接续；外部拖放只有canonical未变时能使用原物理命中。
+    /// The sole queue head continues the preceding actual receipt; external drop uses its original physical hit only if canonical generation is unchanged.
     pub(in crate::native_surface) fn perform_queued_attachments(
         &self,
         paths: &[std::path::PathBuf],
@@ -161,8 +161,8 @@ impl NativeMarkdownPagedTextView {
                     .borrow()
                     .clone()
                     .ok_or(Error::ContextUnavailable)?;
-                // 队首前面的真实输入可刚建立组合；仅接受该原客户显示文字并结束系统转换。
-                // 不重领解释权限；下方拖放generation与原physical命中仍须在收尾后严格核对。
+                // Earlier queued input may have started composition; accept only that client's displayed text and end system conversion.
+                // Do not renew interpretation authority; recheck original drop generation/physical hit strictly after completion.
                 self.finish_composition_in_context(
                     &origin.input,
                     &origin.delegate,
@@ -176,7 +176,7 @@ impl NativeMarkdownPagedTextView {
                 if origin.state.generation != generation {
                     return Err(Error::AttachmentImport(
                         "拖入前原文稿已改变，请重新拖入".into(),
-                    )); // 原命中已失效，拒绝文件动作但保留健康正文。
+                    )); // The original hit is invalid; reject the file action while retaining healthy document state.
                 }
                 let current = |epoch| epoch == origin.epoch && origin.current(self);
                 let permit = origin.input.capture(origin.epoch, &current)?;

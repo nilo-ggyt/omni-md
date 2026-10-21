@@ -1,4 +1,5 @@
-//! 只绘制同一Ready任务的一批真实字形；不创建文字、段落、软行或原生视图。
+//! Draw one finite batch of actual glyphs from the same Ready job, without
+//! constructing text, paragraphs, soft lines, or Native views.
 
 use std::{ops::Range, ptr::NonNull};
 
@@ -19,20 +20,23 @@ mod composed;
 #[cfg(feature = "native-paged-production")]
 pub use composed::paint_composed_glyphs;
 
-/// 一次同步调用的固定栈预算；较长可见结果须由调度者保存原票并明确分批。
+/// Fixed stack allowance for one synchronous draw. Longer visible output keeps
+/// its original authority at the scheduling owner and uses explicit batches.
 pub const NATIVE_MARKDOWN_PAGED_GLYPH_BATCH: usize = 256;
 const MAX_EXACT_26_6: i64 = (1i64 << 53) - 1;
 const MAX_POINT_MAGNITUDE: f64 = (1u64 << 46) as f64;
 
 #[derive(Clone, Copy, Debug)]
-/// baseline属于调用者当前CGContext的y-up用户坐标；pen沿shaper实际视觉顺序累加。
+/// Baseline uses the caller's current CGContext Y-up coordinates; pen advances
+/// follow the shaper's actual visual order, including RTL output.
 pub struct NativeMarkdownPagedGlyphOrigin {
     pub baseline: CGPoint,
     pub pen_x_26_6: i64,
     pub pen_y_26_6: i64,
 }
 
-/// 所有引用仅借本次调用；两个authority必须来自创建同一个job时的原owner。
+/// Borrow references only for this synchronous call. Both authorities must come
+/// from the original owners that created this same shaping job.
 pub struct NativeMarkdownPagedGlyphPaintRequest<'a> {
     pub source: &'a MarkdownLayoutTextAuthority,
     pub font_authority: &'a MarkdownLayoutFontAuthority,
@@ -76,14 +80,16 @@ pub enum NativeMarkdownPagedGlyphPaintCause {
 
 #[derive(Debug, Error)]
 #[error("{cause}；原生绘制已返回={native_draw_returned}")]
-/// draw返回以后失权仍是失败，但调用者必须丢弃候选像素，不能谎称目标context未改变。
+/// Revocation after draw remains failure. The caller must discard candidate
+/// pixels rather than claim that a returned Native draw left its context untouched.
 pub struct NativeMarkdownPagedGlyphPaintError {
     pub cause: NativeMarkdownPagedGlyphPaintCause,
     pub native_draw_returned: bool,
 }
 
 #[derive(Debug)]
-/// 只证明指定批次已实际调用绘制且末端同票；不证明墨迹、clip或软行布局Ready。
+/// Prove only that this batch actually drew and kept its original ticket through
+/// completion. Ink, clip, soft-line layout, and viewport readiness remain separate.
 pub struct NativeMarkdownPagedGlyphPaintReceipt {
     pub glyph_range: Range<usize>,
     pub source_utf16_range: Range<usize>,
@@ -104,6 +110,8 @@ struct Proof<'a, 'b> {
 }
 
 impl Proof<'_, '_> {
+    /// Recheck the original frontend and both actual font identities without
+    /// fetching glyph bytes; real EOF still executes the job's health boundary.
     fn current(
         &self,
         job: &mut MarkdownShapingJob,
@@ -112,7 +120,8 @@ impl Proof<'_, '_> {
         if !current() {
             return Err(NativeMarkdownPagedGlyphPaintCause::Revoked);
         }
-        // 查询真实EOF只执行原job的权限/健康门，不读取字形，也不借名字重建另一Font。
+        // Query exact EOF for the request font and actual Native font. Equal
+        // names cannot substitute a different face or bypass original health.
         if job
             .glyph(
                 self.request.source,
@@ -133,7 +142,8 @@ impl Proof<'_, '_> {
         if !current() {
             return Err(NativeMarkdownPagedGlyphPaintCause::Revoked);
         }
-        // 最后一次current可以同步发现源回收失败；再核同一原身份，绝不重捕后继票。
+        // The last current callback may discover a Source reclamation failure.
+        // Recheck this same original identity without recapturing successor input.
         if job
             .glyph(
                 self.request.source,
@@ -148,7 +158,8 @@ impl Proof<'_, '_> {
     }
 }
 
-/// 配对归还本调用保存的context状态；拒绝后也须撤自己的保存帧，不能留下栈污染。
+/// Return exactly this call's saved context frame on success or failure, leaving
+/// no extra graphics-state stack entry after rejection.
 struct ContextRestore<'a> {
     context: &'a CGContext,
     text_matrix: CGAffineTransform,
@@ -158,8 +169,9 @@ struct ContextRestore<'a> {
 impl Drop for ContextRestore<'_> {
     fn drop(&mut self) {
         CGContext::restore_g_state(Some(self.context));
-        // CoreText公开声明会改text matrix；它和text position另行原样恢复，不假定包含于GState。
-        // 这里只履行原保存帧的清理，不重画、不获取几何，也不把已撤权的候选发布出去。
+        // Core Text may change the text matrix. Restore it and text position
+        // explicitly instead of assuming GState includes them. Cleanup neither
+        // redraws nor acquires geometry or publishes a revoked candidate.
         CGContext::set_text_matrix(Some(self.context), self.text_matrix);
         CGContext::set_text_position(
             Some(self.context),
@@ -169,6 +181,8 @@ impl Drop for ContextRestore<'_> {
     }
 }
 
+/// Convert only exactly representable finite 26.6 coordinates into the caller's
+/// user space; excessive values must reject before any pixel drawing occurs.
 fn axis_position(baseline: f64, pen: i64, offset: i32) -> Result<f64> {
     let positioned = pen
         .checked_add(i64::from(offset))
@@ -184,13 +198,15 @@ fn axis_position(baseline: f64, pen: i64, offset: i32) -> Result<f64> {
     Ok(result)
 }
 
+/// Preserve exact checked fixed-point accumulation for subsequent glyphs.
 fn advance(pen: i64, amount: i32) -> Result<i64> {
     pen.checked_add(i64::from(amount))
         .filter(|value| value.unsigned_abs() <= MAX_EXACT_26_6 as u64)
         .ok_or(NativeMarkdownPagedGlyphPaintCause::InvalidCoordinate)
 }
 
-/// 两条来源只共用批次数学与同步绘制；身份校验仍由各自原owner逐次执行。
+/// Job/spool/composed sources share finite batch math and synchronous drawing
+/// only; each original owner still authenticates its own Source/font/output.
 struct PreparedBatch {
     glyphs: [u16; NATIVE_MARKDOWN_PAGED_GLYPH_BATCH],
     positions: [CGPoint; NATIVE_MARKDOWN_PAGED_GLYPH_BATCH],
@@ -205,6 +221,7 @@ struct PreparedBatch {
 }
 
 impl PreparedBatch {
+    /// Own fixed glyph/position arrays for this actual source range and pen.
     fn new(request: &NativeMarkdownPagedGlyphPaintRequest<'_>, source: Range<usize>) -> Self {
         Self {
             glyphs: [0; NATIVE_MARKDOWN_PAGED_GLYPH_BATCH],
@@ -220,12 +237,15 @@ impl PreparedBatch {
         }
     }
 
+    /// Validate one actual glyph and exact position before adding it to the
+    /// local candidate. No Native draw occurs while a batch is incomplete.
     fn push(
         &mut self,
         request: &NativeMarkdownPagedGlyphPaintRequest<'_>,
         glyph: MarkdownShapedGlyph,
     ) -> Result<()> {
-        // 即使来源已核范围，也必须把实际字形编号与同一NativeFont的真实face上限连接。
+        // An admitted source range still needs glyph IDs from this actual
+        // Native face; another font's same-numbered glyph is not interchangeable.
         if self.count == NATIVE_MARKDOWN_PAGED_GLYPH_BATCH
             || !self.source.contains(&glyph.source_utf16_cluster)
             || glyph.glyph_id >= request.native_font.core_font().metadata().glyph_count
@@ -242,12 +262,14 @@ impl PreparedBatch {
         self.pen_y = advance(self.pen_y, glyph.y_advance)?;
         self.first_cluster.get_or_insert(glyph.source_utf16_cluster);
         self.last_cluster = glyph.source_utf16_cluster;
-        self.flags_or |= glyph.flags; // 保留unsafe-break等原事实；绘制不签断行许可。
-        self.missing += usize::from(glyph.glyph_id == 0); // .notdef也实际绘制，不能静默抛字。
+        self.flags_or |= glyph.flags; // Preserve unsafe-break facts without issuing new line-break authority.
+        self.missing += usize::from(glyph.glyph_id == 0); // Draw .notdef too; never silently omit missing text.
         self.count += 1;
         Ok(())
     }
 
+    /// Save the caller's actual context state and perform one complete Native
+    /// draw, checking original authority around getters, drawing, and restoration.
     fn draw(
         mut self,
         request: &NativeMarkdownPagedGlyphPaintRequest<'_>,
@@ -268,8 +290,10 @@ impl PreparedBatch {
             text_position,
         };
         check()?;
-        // SAFETY: 两个固定数组的count项均已预检，count非零且不超过256；原CTFont/context
-        // 在同步调用内存活，原来源门在前后核验，没有Doc/RefCell租约或部分批次发布。
+        // SAFETY: Both arrays contain count validated elements, with nonzero
+        // count inside the fixed cap. The original CTFont/context outlive the
+        // synchronous call, original authority brackets it, and no document/
+        // RefCell borrow or partial batch crosses into Native drawing.
         unsafe {
             request.native_font.native_font().draw_glyphs(
                 NonNull::from(&mut self.glyphs[0]),
@@ -295,6 +319,7 @@ impl PreparedBatch {
     }
 }
 
+/// Reject the complete excessive/empty range instead of truncating visible text.
 fn batch_count(range: &Range<usize>) -> Result<usize> {
     range
         .end
@@ -303,6 +328,7 @@ fn batch_count(range: &Range<usize>) -> Result<usize> {
         .ok_or(NativeMarkdownPagedGlyphPaintCause::BatchLimit)
 }
 
+/// Reentrant Native operations retain their original check on both sides.
 fn native_checked<T>(
     check: &mut impl FnMut() -> Result<()>,
     operation: impl FnOnce() -> T,
@@ -313,11 +339,14 @@ fn native_checked<T>(
     Ok(value)
 }
 
+/// Accept only the actual untransformed font model used by the original shaper;
+/// unsupported transforms cannot be approximated through coordinate arithmetic.
 fn validate_native_font(
     request: &NativeMarkdownPagedGlyphPaintRequest<'_>,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
-    // SAFETY: 实际主线程NativeFont覆盖getter生命周期；这里只读原不可变CTFont的公开matrix。
+    // SAFETY: The actual main-thread NativeFont outlives this getter. Read only
+    // its immutable original CTFont's public transform matrix.
     let matrix = native_checked(check, || unsafe {
         request.native_font.native_font().matrix()
     })?;
@@ -336,14 +365,16 @@ fn validate_native_font(
     Ok(())
 }
 
-/// 将同一Ready任务的指定批次送入真实CoreText；调用者负责context、clip及原回调生命周期。
-///
-/// 原点沿当前context的y-up用户坐标解释，offset/advance原样按26.6除64；RTL也不得倒排。
-/// 调用者必须在进入本函数前结束Doc/RefCell借用，并在Err时丢弃候选像素。超量range整批拒绝，
-/// 不截断成256；本函数不申请图形surface、不执行layout、不提供任何软行/选择几何Ready权限。
+/// Send one original Ready-job batch to actual Core Text. The caller owns the
+/// context, clip, and callback lifetime. Interpret baseline in current Y-up user
+/// coordinates and divide original fixed-point offsets/advances by 64; never
+/// reverse already visual-order RTL glyphs. End document/RefCell borrows first
+/// and discard candidate pixels on Err. Excessive ranges reject as a whole;
+/// this call creates no surface/layout or selection/viewport readiness proof.
 ///
 /// # Errors
-/// 非Ready、原Source/Font/前台失权、范围/坐标无效或IO失败均拒绝；实际draw后失权显式带返回事实。
+/// Reject Pending, revoked Source/font/frontend, invalid range/coordinates, and
+/// IO failure. Revocation after actual draw preserves its returned-draw fact.
 pub fn paint_paged_glyphs(
     job: &mut MarkdownShapingJob,
     request: NativeMarkdownPagedGlyphPaintRequest<'_>,
@@ -357,6 +388,7 @@ pub fn paint_paged_glyphs(
             return Err(NativeMarkdownPagedGlyphPaintCause::Revoked);
         }
         if job.status() != MarkdownShapingStatus::Ready {
+            // Pending shaping cannot be converted into partial visible glyphs.
             return Err(NativeMarkdownPagedGlyphPaintCause::Pending);
         }
         let profile = job.profile()?;
@@ -364,6 +396,7 @@ pub fn paint_paged_glyphs(
             return Err(NativeMarkdownPagedGlyphPaintCause::InvalidRange);
         }
         if !request.native_font.accepts_shaping_size(job.points()) {
+            // Native size/optical geometry must match this exact original job.
             return Err(NativeMarkdownPagedGlyphPaintCause::FontSizeMismatch);
         }
         let proof = Proof {
@@ -376,7 +409,8 @@ pub fn paint_paged_glyphs(
         let source = job.source_range();
         let mut batch = PreparedBatch::new(&request, source);
         for index in request.glyph_range.clone() {
-            // 固定批次全部准备完才进行唯一draw；IO/任何坐标拒绝都不会留下半批绘图。
+            // Complete the entire finite candidate before the single draw;
+            // failed IO or coordinates cannot leave a partially drawn batch.
             proof.current(job, current)?;
             let glyph = job
                 .glyph(request.source, request.font_authority, index)?

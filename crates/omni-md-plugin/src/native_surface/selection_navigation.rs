@@ -1,4 +1,4 @@
-//! 从已证明的逻辑选择计算原生导航目标；这里只持有同步调用所需的临时 TextKit 对象。
+//! Derive native navigation targets from proven logical selections, retaining TextKit objects only for synchronous calculation.
 
 use super::*;
 use objc2_app_kit::{
@@ -7,7 +7,7 @@ use objc2_app_kit::{
     NSTextSelectionNavigationDirection, NSTextSelectionNavigationModifier,
 };
 
-/// 标准系统动作按方向和边界分派；键盘解释仍由 AppKit 完成，不维护第二份按键映射。
+/// Describe system-interpreted direction/boundary actions without a second physical-key map.
 #[derive(Clone, Copy)]
 pub(super) struct NativeMarkdownSelectionMotion {
     pub(super) direction: NSTextSelectionNavigationDirection,
@@ -15,7 +15,7 @@ pub(super) struct NativeMarkdownSelectionMotion {
     pub(super) extending: bool,
 }
 
-/// 导航只交还有限标量；系统 selection、fragment 和正文对象均在返回之前释放。
+/// Return finite navigation coordinates; temporary system selection, fragment and body claims end before returning.
 #[derive(Clone, Copy)]
 pub(super) struct NativeMarkdownSelectionTarget {
     pub(super) selection: MarkdownTextSelection,
@@ -23,14 +23,14 @@ pub(super) struct NativeMarkdownSelectionTarget {
     pub(super) line_offset: f64,
 }
 
-/// 第一次垂直动作的列由实际 caret 几何逆核；短行不能覆盖用户已经选定的目标列。
+/// Establish the first vertical goal by inverse-checking actual caret geometry; a short line cannot replace that target.
 #[derive(Clone, Copy)]
 pub(super) struct NativeMarkdownSelectionColumn {
     pub(super) line_offset: f64,
     pub(super) container_x: f64,
 }
 
-/// 一个真实鼠标事件的点、初始选择和粒度合并为有限值；不把上一帧结果误作新的锚点。
+/// Carry one actual mouse event's finite point, original selection and granularity, without adopting an old frame as a new anchor.
 #[derive(Clone, Copy)]
 pub(super) struct NativeMarkdownSelectionPointQuery {
     pub(super) point: NSPoint,
@@ -40,9 +40,9 @@ pub(super) struct NativeMarkdownSelectionPointQuery {
     pub(super) length: usize,
 }
 
-/// 临时图必须与此 view 登记的唯一图完全相同，不能通过兼容 layoutManager 建立第二套布局。
+/// Require the exact graph registered by this view; never create a second layout through a compatibility layoutManager getter.
 pub(super) struct NativeMarkdownSelectionGraph {
-    // 同步计算期间保活刚核对的唯一图；这些 claims 不进入请求、缓存或后继回调。
+    // Keep the just-verified graph alive during this synchronous call only, outside requests, caches and successors.
     _manager: Retained<NSTextLayoutManager>,
     content: Retained<NSTextContentManager>,
     _container: Retained<NSTextContainer>,
@@ -50,13 +50,14 @@ pub(super) struct NativeMarkdownSelectionGraph {
     navigation: Retained<NSTextSelectionNavigation>,
 }
 
-/// 每个 Native 调用都守调用者的原动作票；失败不读取当前状态重新签发权限。
+/// Guard every native operation with the caller's original action ticket; failure cannot renew it from current state.
 fn step<T>(current: &impl Fn() -> bool, work: impl FnOnce() -> T) -> Result<T, String> {
     native_markdown_table_intent_step(current, work)
         .map_err(|_| "选择动作对应的笔记、窗口或输入已经改变".to_owned())
 }
 
 impl NativeMarkdownSelectionGraph {
+    /// Match the view's registered and actual manager/container/content/storage identities before lending navigation.
     pub(super) fn load(
         view: &PieceBackedMarkdownTextView,
         current: &impl Fn() -> bool,
@@ -67,12 +68,13 @@ impl NativeMarkdownSelectionGraph {
         .ok_or("文本布局已断开")?;
         let actual_manager =
             step(current, || view.textLayoutManager())?.ok_or("文本视图已失去原布局")?;
+        // Equal contents do not substitute for the sole layout manager registered by this view.
         if !std::ptr::eq(&*manager, &*actual_manager) {
             return Err("选择不能使用其他文本布局".into());
         }
         let container = step(current, || manager.textContainer())?.ok_or("文本容器已断开")?;
         let actual_container = step(current, || {
-            // SAFETY: 主线程活 view 的公开 nullable getter；没有设置或创建兼容布局。
+            // SAFETY: Borrow this live main-thread view's public nullable getter without creating a compatibility layout.
             unsafe { view.textContainer() }
         })?
         .ok_or("文本视图已失去原容器")?;
@@ -83,23 +85,27 @@ impl NativeMarkdownSelectionGraph {
             step(current, || manager.textContentManager())?.ok_or("文本内容管理器已断开")?;
         let actual_content =
             step(current, || view.textContentStorage())?.ok_or("文本视图已失去原内容管理器")?;
+        // Content ownership must match too; a manager retained from a transferred graph is not sufficient.
         if !std::ptr::eq::<NSTextContentManager>(&*content, actual_content.as_super()) {
             return Err("选择不能使用其他文本内容".into());
         }
         let storage = step(current, || view.ivars().text_storage.load())?.ok_or("笔记已经关闭")?;
         let actual_storage =
             step(current, || actual_content.textStorage())?.ok_or("文本内容已失去原存储")?;
+        // Require the actual original piece storage before deriving any logical-source coordinates.
         if !std::ptr::eq::<NSTextStorage>(storage.as_super(), &*actual_storage) {
             return Err("选择不能使用其他笔记的存储".into());
         }
         if step(current, || content.hasEditingTransaction())? {
+            // Native editing has not committed its logical state; do not navigate an intermediate graph.
             return Err("文本输入尚未结束，暂时不能改变选择".into());
         }
         let provider = ProtocolObject::<dyn NSTextElementProvider>::from_ref(&*content);
         let document_range = step(current, || provider.documentRange())?;
         let origin = step(current, || document_range.location())?;
         let navigation = step(current, || manager.textSelectionNavigation())?;
-        // 额外 getter 的局部 claims 先析构，再纯核原票；不能让析构中出现的输入继承旧结果。
+        // Release incidental getter claims before the final pure authority check; input arising
+        // during destruction cannot inherit a result calculated for the previous action.
         drop(document_range);
         drop(actual_storage);
         drop(storage);
@@ -118,7 +124,7 @@ impl NativeMarkdownSelectionGraph {
         })
     }
 
-    /// 显式方向只来自调用方已持有的 Core 选择；系统 view 中失真的非空 affinity 不参与。
+    /// Derive explicit direction from the caller's Core selection, excluding unreliable nonempty affinity stored by the system view.
     fn selection(
         &self,
         selection: MarkdownTextSelection,
@@ -146,7 +152,7 @@ impl NativeMarkdownSelectionGraph {
             NSTextRange::initWithLocation_endLocation(allocated, &from, Some(&to))
         })?
         .ok_or("原生选择范围无效")?;
-        // 非空选择的 affinity 表示 head 所在逻辑端；caret 的 affinity 只表示换行侧。
+        // Nonempty affinity identifies the logical active endpoint; a caret's affinity instead selects its wrap side.
         let upstream = if start == end {
             head_upstream
         } else {
@@ -170,13 +176,13 @@ impl NativeMarkdownSelectionGraph {
             if !offset.is_finite() {
                 return Err("选择目标列无效".into());
             }
-            // 只安装同一布局中已经逆核的行片段相对 offset，不把屏幕 x 当作此属性。
+            // Install only a line-fragment-relative offset inverse-checked in this same layout, never a screen-space x.
             step(current, || native.setAnchorPositionOffset(offset))?;
         }
         Ok(native)
     }
 
-    /// 一个目标必须是实际单 caret；多范围、双向次位置或非空结果都不能悄悄取第一项。
+    /// Require one actual caret; multiple ranges, a secondary bidi position or nonempty output cannot silently become its first item.
     fn caret_target(
         &self,
         native: &NSTextSelection,
@@ -206,6 +212,7 @@ impl NativeMarkdownSelectionGraph {
             return Err("导航没有产生当前笔记中的唯一插入位置".into());
         }
         let affinity = step(current, || native.affinity())?;
+        // Accept only the two declared native affinities; unknown values cannot establish a wrap side.
         let head_upstream = if affinity == NSTextSelectionAffinity::Upstream {
             true
         } else if affinity == NSTextSelectionAffinity::Downstream {
@@ -220,6 +227,7 @@ impl NativeMarkdownSelectionGraph {
         Ok((offset, head_upstream, line_offset))
     }
 
+    /// Resolve standard motion through the original native graph, preserving the Core anchor for extension.
     pub(super) fn move_selection(
         &self,
         selection: MarkdownTextSelection,
@@ -230,10 +238,12 @@ impl NativeMarkdownSelectionGraph {
         current: &impl Fn() -> bool,
     ) -> Result<NativeMarkdownSelectionTarget, String> {
         let input = if motion.extending {
-            // Extend 从真实活动端移动，然后保留 Core 原 anchor；从不依赖 view 的私有持续扩选锚点。
+            // Extend moves from the actual active endpoint and keeps the Core anchor,
+            // without relying on the view's private persistent extension anchor.
             MarkdownTextSelection::caret(selection.head_utf16)
         } else {
-            // 普通方向键由完整原选择计算折叠语义，不能先取 head 再额外移动一个字符。
+            // Plain motion derives collapse semantics from the entire original selection,
+            // rather than collapsing to its head and moving one additional character.
             selection
         };
         let native = self.selection(
@@ -270,7 +280,7 @@ impl NativeMarkdownSelectionGraph {
         })
     }
 
-    /// 只查询一个已经存在的 caret，再以同一容器点逆核位置和换行侧，不从默认零列起步。
+    /// Query one existing caret and inverse-check its position/affinity through the same container point, without a default zero column.
     pub(super) fn column_for_head(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -317,7 +327,8 @@ impl NativeMarkdownSelectionGraph {
             if other != frame {
                 return Err("当前插入位置的换行侧无法相互验证".into());
             }
-            // 行内普通位置的两侧几何可以完全相同；只有实测同一矩形才允许忽略这个方向位。
+            // Interior positions can have identical geometry on both sides; ignore affinity
+            // disagreement only after observing the exact same rectangle for both.
         }
         let origin = step(current, || view.textContainerOrigin())?;
         Ok(NativeMarkdownSelectionColumn {
@@ -326,7 +337,7 @@ impl NativeMarkdownSelectionGraph {
         })
     }
 
-    /// 点导航使用当前真实容器坐标；在一个事件里只保存系统结果的有限坐标，不缓存其对象。
+    /// Navigate actual container coordinates, retaining only finite output for this event and no cached native selection objects.
     pub(super) fn selection_at_point(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -345,6 +356,7 @@ impl NativeMarkdownSelectionGraph {
         }
         let origin = step(current, || view.textContainerOrigin())?;
         let mut bounds = step(current, || view.visibleRect())?;
+        // Translate viewport bounds and the pointer into the same original text-container coordinates.
         bounds.origin.x -= origin.x;
         bounds.origin.y -= origin.y;
         let anchor = anchor
@@ -357,6 +369,7 @@ impl NativeMarkdownSelectionGraph {
             None => NSArray::new(),
         })?;
         let modifiers = if extending {
+            // Only an explicitly extending gesture supplies Extend; ordinary point selection uses no modifier.
             NSTextSelectionNavigationModifier::Extend
         } else {
             NSTextSelectionNavigationModifier::empty()
@@ -379,7 +392,7 @@ impl NativeMarkdownSelectionGraph {
         self.range_target(&native, length, current)
     }
 
-    /// 双击和三击只交由原 TextKit 图计算词或段边界，不扫描或复制整个段落来猜边界。
+    /// Double/triple clicks use the original TextKit graph's word/paragraph boundaries, without scanning or copying paragraph text.
     pub(super) fn selection_granularity_at_point(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -401,7 +414,7 @@ impl NativeMarkdownSelectionGraph {
         self.range_target(&native, length, current)
     }
 
-    /// 粒度展开保留调用方明确给出的两个端点；不借用 view 里无法证明方向的非空选择。
+    /// Preserve both explicitly supplied endpoints during granularity expansion; do not borrow an unproven system-view direction.
     pub(super) fn enclosing_selection(
         &self,
         selection: MarkdownTextSelection,
@@ -411,10 +424,12 @@ impl NativeMarkdownSelectionGraph {
         current: &impl Fn() -> bool,
     ) -> Result<NativeMarkdownSelectionTarget, String> {
         if selection.anchor_utf16 > length || selection.head_utf16 > length {
-            return Err("当前选择已经超出笔记".into()); // 任一旧端点越界都不能截断为新正文的 EOF。
+            // An old out-of-range endpoint cannot be clamped into the successor document's EOF.
+            return Err("当前选择已经超出笔记".into());
         }
         let target = (|| {
-            // 原完整方向交同一图展开；非空范围不能缩成 head 而遗漏另一端的词或段落。
+            // Expand the complete original direction on the same graph; reducing a nonempty
+            // range to its head would omit the word/paragraph at its other endpoint.
             let input = self.selection(
                 selection,
                 head_upstream,
@@ -429,16 +444,18 @@ impl NativeMarkdownSelectionGraph {
                         &input,
                     )
             })?;
-            // 唯一范围、双向次位置、原文边界及有限列值沿现有实际 Native 结果验证，不补造结果。
+            // Validate actual native output for one range, no secondary bidi position, original
+            // source bounds and finite column values, without manufacturing a replacement result.
             self.range_target(&expanded, length, current)
-        })(); // 输入选择、展开结果和内部范围 claims 全部结束后才允许返回有限坐标。
+        })();
+        // Input selection, expanded result and internal range claims end before coordinates may leave.
         if !current() {
             return Err("粒度展开完成前原选择权限已经失效".into());
         }
         target
     }
 
-    /// 选行明确使用有序低端的下游视觉行；不继承系统内部无法认证的持续拖选锚点。
+    /// Select the actual downstream visual line at the ordered lower endpoint, without inheriting an unproven internal drag anchor.
     pub(super) fn visual_line_at(
         &self,
         low: usize,
@@ -446,7 +463,8 @@ impl NativeMarkdownSelectionGraph {
         current: &impl Fn() -> bool,
     ) -> Result<NativeMarkdownSelectionTarget, String> {
         if low > length {
-            return Err("选行起点已经超出当前笔记".into()); // 越界旧位置不能被截断成合法 EOF。
+            // An obsolete out-of-range position cannot be truncated into a legitimate EOF.
+            return Err("选行起点已经超出当前笔记".into());
         }
         let offset = isize::try_from(low).map_err(|_| "选行起点超出原生坐标范围")?;
         let target = (|| {
@@ -462,7 +480,8 @@ impl NativeMarkdownSelectionGraph {
             if step(current, || fragment.state())?.0
                 < objc2_app_kit::NSTextLayoutFragmentState::LayoutAvailable.0
             {
-                return Err("选行起点的实际行布局尚未完成".into()); // 估计片段不能授权实际视觉行。
+                // Estimated fragments cannot establish an actual laid-out visual line.
+                return Err("选行起点的实际行布局尚未完成".into());
             }
             let manager =
                 step(current, || fragment.textLayoutManager())?.ok_or("选行布局片段已经断开")?;
@@ -474,10 +493,12 @@ impl NativeMarkdownSelectionGraph {
             let element_content =
                 step(current, || element.textContentManager())?.ok_or("选行文本元素已经断开")?;
             if !std::ptr::eq(&*element_content, &*self.content) {
-                return Err("选行文本元素不属于原内容管理器".into()); // 迁移后的元素不能沿旧 origin 解释。
+                // A transferred element cannot be interpreted relative to this graph's old origin.
+                return Err("选行文本元素不属于原内容管理器".into());
             }
 
-            // NSTextRange 使用文档坐标；逐个公开 location 转换，不能把对象地址或局部序号当偏移。
+            // Convert public NSTextRange locations into document offsets. Neither object
+            // addresses nor fragment-local indices are valid substitutes for source coordinates.
             let source_range = |range: &NSTextRange| -> Result<std::ops::Range<usize>, String> {
                 let from = step(current, || range.location())?;
                 let to = step(current, || range.endLocation())?;
@@ -507,7 +528,8 @@ impl NativeMarkdownSelectionGraph {
                 || low > fragment_source.end
                 || (low == fragment_source.end && low != length)
             {
-                return Err("选行片段没有覆盖原有序起点".into()); // 普通端点取下游，不能误用前一片段的末端。
+                // Ordinary endpoints choose downstream; the preceding fragment's trailing edge cannot substitute.
+                return Err("选行片段没有覆盖原有序起点".into());
             }
 
             let line = step(current, || {
@@ -516,13 +538,15 @@ impl NativeMarkdownSelectionGraph {
             .ok_or("选行起点没有实际下游视觉行")?;
             let local = step(current, || line.characterRange())?;
             if local.location == objc2_foundation::NSNotFound as usize {
-                return Err("实际视觉行缺少有效字符范围".into()); // 缺失范围不等于空行或 EOF。
+                // An absent character range proves neither an empty line nor EOF.
+                return Err("实际视觉行缺少有效字符范围".into());
             }
             let local_end = local
                 .location
                 .checked_add(local.length)
                 .ok_or("实际视觉行的局部范围溢出")?;
-            // characterRange 相对整个 textElement 的原文；分片后也不能改用 fragment 起点作基准。
+            // characterRange is relative to the entire text element's source, even after
+            // fragmentation; using the fragment start would translate the same units twice.
             let start = element_source
                 .start
                 .checked_add(local.location)
@@ -536,14 +560,17 @@ impl NativeMarkdownSelectionGraph {
             }
             if start == end {
                 if start != low || low != length {
-                    return Err("零长视觉行不是原文档的实际 EOF 空行".into()); // 仅真实已布局的终端空行可保持空选区。
+                    // Only an actually laid-out terminal empty line may produce this empty selection.
+                    return Err("零长视觉行不是原文档的实际 EOF 空行".into());
                 }
             } else if low < start || low > end || (low == end && low != length) {
-                // 无末尾换行的实际末行可在 EOF 结束；普通行末仍必须取下游，不能复用上一视觉行。
+                // The actual final line may end at EOF without a trailing newline; ordinary
+                // line boundaries still choose downstream rather than reusing the previous line.
                 return Err("实际下游视觉行没有包含选行起点".into());
             }
 
-            // getter 可重入布局；交还目标前再次核同源范围、同一行值与已完成状态，不拼接两帧结果。
+            // Getters can reenter layout. Recheck original source ranges, line values and
+            // completed state before returning, rather than combining facts from different frames.
             let final_element_range = step(current, || element.elementRange())?
                 .ok_or("选行完成前文本元素已失去源范围")?;
             let final_fragment_range = step(current, || fragment.rangeInElement())?;
@@ -561,16 +588,18 @@ impl NativeMarkdownSelectionGraph {
                     head_utf16: end,
                 },
                 head_upstream: false,
-                line_offset: 0.0, // 新 forward 范围不继承目标列；共享入口须清除 vertical goal。
+                // The new forward range inherits no target column; shared publication clears its vertical goal.
+                line_offset: 0.0,
             })
-        })(); // fragment、line、element、location 和范围 claims 只活在此同步局部栈。
+        })();
+        // Fragment, line, element, location and range claims remain confined to this synchronous stack.
         if !current() {
             return Err("选行完成前原笔记、窗口或输入已经改变".into());
         }
         target
     }
 
-    /// 这里只解释从本次明确输入直接得到的 navigation 结果，不能用来读取 view 的桥接状态。
+    /// Interpret navigation output derived directly from this explicit input, never bridged selection state read back from the view.
     fn range_target(
         &self,
         native: &NSTextSelection,
@@ -612,6 +641,8 @@ impl NativeMarkdownSelectionGraph {
         if !line_offset.is_finite() {
             return Err("鼠标导航返回了无效的目标列".into());
         }
+        // Native affinity supplies the output's logical direction; preserve ordered bounds while
+        // reconstructing the original anchor/head meaning rather than guessing from screen order.
         let selection = if head_upstream {
             MarkdownTextSelection {
                 anchor_utf16: to,

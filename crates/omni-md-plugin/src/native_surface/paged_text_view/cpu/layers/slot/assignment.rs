@@ -1,4 +1,5 @@
-//! 本次Native安装的独立补偿票；payload被重入清理取走后仍持原图和精确关系身份。
+//! An independent Native-installation compensation ticket retains original images and exact
+//! relationship identities even after reentrant cleanup takes payload.
 
 use super::*;
 
@@ -52,8 +53,10 @@ impl<'a> Assignment<'a> {
                 .as_ref()
                 .is_some_and(|weak| weak.upgrade().is_some())
         {
-            // payload即使已被重入clear取走，原guard仍独占此安装栈；禁止后继抢占同槽，
-            // 否则旧Native setter返回的效果可能覆盖新token已经发布的关系。
+            // Even after reentrant clear takes payload, the original guard exclusively owns this
+            // installation stack; reject successor slot admission,
+            // because a returning old Native setter could overwrite relationships already published by
+            // a new token.
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
         let image = image.clone();
@@ -66,7 +69,7 @@ impl<'a> Assignment<'a> {
             })
         } else {
             None
-        }; // CF claim全部在RefCell借用之外取得，失败/结束时也不在借用中释放。
+        }; // Acquire and release all CF claims outside RefCell borrows, including failure exits.
         let token = Rc::new(());
         slot.installing.replace(Some(Rc::downgrade(&token)));
         Ok(Self {
@@ -122,7 +125,7 @@ impl<'a> Assignment<'a> {
                 foreground: colors.foreground.clone(),
                 secondary_foreground: colors.secondary_foreground.clone(),
             });
-        } // 仅配对颜色覆盖初始空claim；中性原Palette身份保持，全部CFretain/release均无槽借用。
+        } // Paired colors replace the initial empty claim only; neutral palette identity remains original, with CF retain/release outside slot borrows.
     }
 
     pub(super) fn publish_payload(&self, colors: Option<PairedColors>) -> Result<()> {
@@ -139,10 +142,12 @@ impl<'a> Assignment<'a> {
             secondary_image: None,
             presentation: self.presentation,
             paired_colors: colors,
-        }); // 只移动预先持活的颜色和Rust token，没有Native调用或CFretain。
+        }); // Move already-retained colors and the Rust token only, without Native calls or CF retain.
         Ok(())
     }
 
+    /// Record the exact setter obligation before calling Native, then require the same token after
+    /// every reentrant boundary.
     pub(super) fn apply(
         &self,
         point: AssignmentPoint,
@@ -151,33 +156,37 @@ impl<'a> Assignment<'a> {
     ) -> Result<()> {
         self.require_payload()?;
         checked(current, || {
-            // current的前置回调也可能取走payload；先撤旧票，再记录紧邻真实setter的义务。
+            // The pre-call current callback may take payload; recheck the original ticket before
+            // recording the immediately following setter obligation.
             self.require_payload()?;
             self.effects.set(self.effects.get() | point.bit());
             native();
             #[cfg(feature = "native-markdown-runtime-probe")]
             if let Some(probe) = self.probe {
-                probe(point); // 精确位于Native效果之后、image/installedCells持久登记之前。
+                probe(point); // The diagnostic callback runs immediately after the Native effect, before persistent image/installed-field registration.
             }
             self.require_payload()
         })??;
-        // checked的后置current同样可重入清理；不能因它返回true就给已take的payload补登记。
+        // Post-call current may also reenter cleanup; true cannot authorize registration into an
+        // already-taken payload.
         self.require_payload()
     }
 
     pub(super) fn commit(mut self) -> Result<()> {
         self.require_payload()?;
         self.committed = true;
-        Ok(()) // 此后真实完整payload接管长期claim，局部票只归还本次安装准入。
+        Ok(()) // The actual complete payload takes long-term claims; the local ticket returns this installation admission only.
     }
 
     fn touched(&self, point: AssignmentPoint) -> bool {
         self.effects.get() & point.bit() != 0
     }
 
+    // The independent guard can compensate effects not yet entered in payload, but only for its
+    // original active token.
     fn rollback(&self) {
         if !self.active() {
-            return; // 后继token不属于本票，不能以旧guard清它已经接管的关系。
+            return; // A successor token does not belong to this ticket; an old guard cannot clear its transferred relationships.
         }
         let payload = {
             let mut payload = self.slot.payload.borrow_mut();
@@ -188,7 +197,7 @@ impl<'a> Assignment<'a> {
                 return;
             }
             payload.take()
-        }; // 空payload仍允许本票补偿已发生但尚未入账的效果；强claim由guard独立保留。
+        }; // An empty payload still permits compensation for effects not yet registered; the guard independently retains original strong claims.
         self.slot.background_installed.set(false);
         self.slot.foreground_color_installed.set(false);
         self.slot.second_color_installed.set(false);
@@ -236,7 +245,7 @@ impl<'a> Assignment<'a> {
                 clear_color(self.slot.secondary().0, &colors.secondary_foreground);
             }
         }
-        drop(payload); // CFRelease与原token归还发生在所有RefCell借用之外，也不持业务状态借用。
+        drop(payload); // Return CF claims and the original token outside all RefCell and business-state borrows.
     }
 }
 
@@ -247,21 +256,24 @@ impl Drop for Assignment<'_> {
         }
         if self.active() {
             self.slot.installing.borrow_mut().take();
-        } // 先完成所有原关系补偿，才释放本次准入；字段CF claim随后在无槽借用时析构。
+        } // Complete original-relationship compensation before returning admission; field CF claims then drop outside slot borrows.
     }
 }
 
 fn clear_image(layer: &CALayer, expected: &CGImage) {
-    // 回滚只需身份标量；局部池归还本次getter的临时claim，不将旧image留到外层事件池。
+    // Rollback needs scalar identity only; a local pool returns getter temporaries without retaining
+    // old images in an outer event pool.
     let same = objc2::rc::autoreleasepool(|_| {
-        // SAFETY: 只读opaque身份；原强claim仍持活，不把外方对象转换成CGImage解引用。
+        // SAFETY: Read opaque identity while the original strong claim lives, without converting or
+        // dereferencing an external object as CGImage.
         let actual = unsafe { layer.contents() };
         actual.as_deref().is_some_and(|value| {
             std::ptr::from_ref(value).cast::<()>() == std::ptr::from_ref(expected).cast::<()>()
         })
     });
     if same {
-        // SAFETY: 仅仍等于本次原image的Native关系可清理，外方替换原样保留。
+        // SAFETY: Clear the Native relationship only while it still matches this original image,
+        // preserving external replacements.
         unsafe { layer.setContents(None) };
     }
 }
@@ -273,7 +285,8 @@ fn clear_mask(foreground: &CALayer, mask: &CALayer) {
         .is_some_and(|value| std::ptr::eq(value, mask));
     drop(actual);
     if same {
-        // SAFETY: 原固定mask身份仍匹配；外方后设mask不归本安装票所有。
+        // SAFETY: The original fixed-mask identity still matches; an externally replaced mask does not
+        // belong to this installation ticket.
         unsafe { foreground.setMask(None) };
     }
 }
@@ -281,7 +294,7 @@ fn clear_mask(foreground: &CALayer, mask: &CALayer) {
 fn clear_parent(layer: &CALayer, parent: &CALayer) {
     if parent_is(layer, parent) {
         layer.removeFromSuperlayer();
-    } // 只解除本次容器里的原child；外方重挂的父关系绝不夺回。
+    } // Detach only the original child in this container, without reclaiming an externally reparented relationship.
 }
 
 fn clear_color(layer: &CALayer, expected: &CGColor) {
@@ -292,5 +305,5 @@ fn clear_color(layer: &CALayer, expected: &CGColor) {
     drop(actual);
     if same {
         layer.setBackgroundColor(None);
-    } // 原RGB相同但CGColor身份不同也属于外方，不能借等值颜色洗掉替换事实。
+    } // Equal RGB with another CGColor identity belongs elsewhere; equal values cannot erase actual replacement.
 }

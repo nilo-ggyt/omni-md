@@ -136,10 +136,10 @@ mod sidebar_geometry;
 pub(crate) mod string_read_diagnostic;
 mod window;
 #[cfg(all(
-    feature = "native-paged-find-probe",
+    feature = "native-paged-body-probe",
     feature = "native-markdown-runtime-probe"
 ))]
-pub use find_bar::run_native_paged_find_backend_control;
+pub use find_bar::run_native_paged_find_body_control;
 #[cfg(all(
     feature = "native-paged-body-probe",
     feature = "native-markdown-runtime-probe"

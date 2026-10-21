@@ -1,4 +1,4 @@
-//! 使用原Measure和安全切片创建多条真实LineEnd，不用测试伪造公开Range或字形目录。
+//! Commit real LineEnds through measurement and safe slices, without fabricated ranges or directories.
 use super::*;
 use crate::{
     BidiBaseDirection, BidiMemoryBudget, MarkdownBidiParagraph, MarkdownLayoutBreakJob,
@@ -8,6 +8,8 @@ use crate::{
 };
 
 pub(super) fn breaks(fixture: &Fixture) -> MarkdownLayoutBreakJob {
+    // Prepare the real original break job to its explicit Ready state. A yielded
+    // quantum cannot authorize grapheme export or substitute for an actual EOF.
     let mut breaks =
         MarkdownLayoutBreakJob::new(fixture.source.clone(), &fixture.source.authority()).unwrap();
     for _ in 0..10000 {
@@ -27,6 +29,8 @@ pub(super) fn breaks(fixture: &Fixture) -> MarkdownLayoutBreakJob {
 
 #[test]
 fn original_safe_lines_commit_real_line_end_and_preserve_glyphs_gcb_clusters_after_job_drop() {
+    // Keep independent original job, cluster and break results while committing
+    // several naturally wrapped lines into the real store.
     let fixture = Fixture::new("office office office office office office office office");
     let mut coordinator = fixture.coordinator();
     let mut item = fixture.next(&mut coordinator).unwrap();
@@ -38,6 +42,8 @@ fn original_safe_lines_commit_real_line_end_and_preserve_glyphs_gcb_clusters_aft
     let mut index =
         MarkdownGlyphClusterIndex::new(&mut item.job, &item.authority, &item.font).unwrap();
     while index.step(&mut item.job, 16).unwrap().status != MarkdownGlyphClusterStatus::Ready {}
+    // Resolve paragraph direction from the same captured source; selected line
+    // geometry must not borrow a bidi result from an equal-text capture.
     let mut bidi = MarkdownBidiParagraph::analyze_layout_source(
         fixture.source.clone(),
         &fixture.source.authority(),
@@ -48,6 +54,8 @@ fn original_safe_lines_commit_real_line_end_and_preserve_glyphs_gcb_clusters_aft
     .unwrap();
     let mut start = 0;
     let mut lines = 0;
+    // Each next measurement starts at the prior committed endpoint. Its chosen
+    // break and safe glyph slice remain tied to the original job and cancellation.
     while start < fixture.source.utf16_len() {
         let mut measure = MarkdownSoftLineMeasureJob::new(
             fixture.source.clone(),
@@ -78,6 +86,8 @@ fn original_safe_lines_commit_real_line_end_and_preserve_glyphs_gcb_clusters_aft
                 break;
             }
         }
+        // This finite fixture has natural opportunities. Emergency reshaping is
+        // not accepted as an interchangeable way to obtain the expected line.
         let selected = match chosen.unwrap() {
             MarkdownSoftLineMeasureChoice::MeasuredBreak(value) => value,
             other => panic!("有限自然软行必须真实MeasuredBreak: {other:?}"),
@@ -86,6 +96,8 @@ fn original_safe_lines_commit_real_line_end_and_preserve_glyphs_gcb_clusters_aft
             MarkdownSafeGlyphSlices::from_measure(&measure, &mut item.job, &mut breaks, &mut index)
                 .unwrap()
                 .into_parts();
+        // Preserve the actual break kind in the committed line rather than
+        // inferring it later from a coordinate or the remaining source length.
         let kind = if selected.boundary.kind == crate::MarkdownLineBreakKind::Mandatory {
             MarkdownComposedLineKind::Mandatory
         } else {
@@ -101,6 +113,8 @@ fn original_safe_lines_commit_real_line_end_and_preserve_glyphs_gcb_clusters_aft
         lines += 1;
     }
     assert!(lines >= 3);
+    // These bounded oracle vectors belong only to this short fixture. Drop all
+    // original producers before exercising output reads from the unique store.
     let mut expected = Vec::new();
     while let Some(glyph) = item.glyph(expected.len()).unwrap() {
         expected.push(glyph);
@@ -127,6 +141,8 @@ fn original_safe_lines_commit_real_line_end_and_preserve_glyphs_gcb_clusters_aft
     assert_eq!(output.source_range(), 0..fixture.source.utf16_len());
     assert!(output.source_authority() == &fixture.source.authority());
     output.require(&fixture.source.authority()).unwrap();
+    // Walk published lines backward to prove complete, nonoverlapping coverage.
+    // Each part retains its actual source and weak font registration authority.
     let mut expected_end = fixture.source.utf16_len();
     let mut actual = 0;
     let mut line = output.last_line().unwrap();
@@ -143,6 +159,8 @@ fn original_safe_lines_commit_real_line_end_and_preserve_glyphs_gcb_clusters_aft
                 .font()
                 .permits(&fixture.font.font().authority())
         );
+        // Read one real part into a fixed-size buffer and compare the corresponding
+        // original visual glyph range, then query clusters at every covered offset.
         let blank = MarkdownShapedGlyph {
             glyph_id: 0,
             source_utf16_cluster: 0,
@@ -180,6 +198,8 @@ fn original_safe_lines_commit_real_line_end_and_preserve_glyphs_gcb_clusters_aft
     }
     assert_eq!(expected_end, 0);
     assert_eq!(actual, lines);
+    // A grapheme ordinal advances only at an original boundary; UTF-16 scalar
+    // coordinates inside a cluster cannot be relabeled as consecutive ordinals.
     let mut ordinal = 0;
     for (offset, expected) in gcb.into_iter().enumerate() {
         assert_eq!(
@@ -196,6 +216,8 @@ fn original_safe_lines_commit_real_line_end_and_preserve_glyphs_gcb_clusters_aft
             assert_eq!(actual, None);
         }
     }
+    // Explicit close provides fallible file/mapping cleanup evidence after all
+    // original job/index/bidi owners have already been released.
     output.close().unwrap();
     let state = observer.snapshot();
     assert!(
@@ -208,6 +230,8 @@ fn original_safe_lines_commit_real_line_end_and_preserve_glyphs_gcb_clusters_aft
 
 #[test]
 fn ordinal_export_is_unknown_before_ready_and_never_accepts_large_or_foreign_batches() {
+    // Export before Ready must leave caller memory untouched and remain unknown,
+    // rather than converting an unfinished boundary table into an empty table.
     let fixture = Fixture::new("a\u{301}😀 z");
     let auth = fixture.source.authority();
     let mut pending = MarkdownLayoutBreakJob::new(fixture.source.clone(), &auth).unwrap();
@@ -223,6 +247,8 @@ fn ordinal_export_is_unknown_before_ready_and_never_accepts_large_or_foreign_bat
             .unwrap()
     );
     assert_eq!(untouched, [sentinel]);
+    // Once the genuine break job is ready, its exported endpoints and individual
+    // queries must agree on the same original byte and UTF-16 coordinates.
     let mut ready = breaks(&fixture);
     let count = ready.ready_grapheme_count(&auth).unwrap().unwrap();
     let mut all = [sentinel; 16];
@@ -247,6 +273,8 @@ fn ordinal_export_is_unknown_before_ready_and_never_accepts_large_or_foreign_bat
             matches!(ready.grapheme_query(&auth,value.utf16,crate::MarkdownGraphemeQuery::IsBoundary).unwrap(),crate::MarkdownGraphemeAnswer::Known(Some(actual)) if actual==*value)
         );
     }
+    // An excessive batch fails before mutating caller output and retires that job.
+    // A separate healthy job then proves that equal text has no source authority.
     let mut huge = [sentinel; 257];
     assert!(
         ready

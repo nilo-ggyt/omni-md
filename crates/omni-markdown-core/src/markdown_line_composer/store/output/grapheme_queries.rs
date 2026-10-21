@@ -1,7 +1,9 @@
-//! 只读快照的字素覆盖独立于glyph布局范围；未迁入的尾部保留Pending而非伪EOF。
+//! Grapheme coverage belongs to the read-only snapshot independently of glyph
+//! layout coverage. Untransferred suffix records remain Pending, never false EOF.
 use super::*;
 
-/// Known(None)只代表已覆盖记录域内不是 GCB；隐区 typed 拒绝，Pending 表示原记录尚未迁入。
+/// Known(None) means no GCB in the covered ordinal domain. Hidden ranges produce
+/// typed rejection; Pending means the original records have not transferred yet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownComposedGraphemeOrdinalAnswer {
     Pending,
@@ -9,16 +11,20 @@ pub enum MarkdownComposedGraphemeOrdinalAnswer {
 }
 
 impl MarkdownComposedLines {
-    /// 序号只属于本次明确的记录域；FoldedVisible 不含隐区内部边界，不能当全源字素计数。
+    /// Ordinals belong to this explicit record domain. FoldedVisible excludes
+    /// internal hidden boundaries and cannot supply a complete Source GCB count.
     pub fn grapheme_ordinal_domain(&self) -> Result<crate::MarkdownGraphemeOrdinalDomain> {
         self.require(&self.authority)?;
         Ok(self.graphemes.domain)
     }
 
+    /// Establish dimensions from the same healthy Source, rejecting domains
+    /// whose internal boundaries are intentionally absent from this directory.
     fn grapheme_dimensions(&self, offset: usize) -> Result<(usize, usize)> {
         self.require(&self.authority)?;
         let source = &self.payload.as_ref().ok_or(Error::Poisoned)?.source;
         if offset > source.utf16_len() {
+            // EOF is valid; a coordinate beyond actual Source is invalid input.
             return Err(Error::InvalidRequest);
         }
         if let Some(fold) = self
@@ -32,7 +38,7 @@ impl MarkdownComposedLines {
             })
         {
             return Err(Error::FoldedRange(fold.start.utf16..fold.end.utf16));
-        } // 这里只使用同 Source 的有限锚点，绝不为一次查询遍历或解析隐藏正文。
+        } // Same-Source finite anchors require no hidden-document traversal or parse.
         #[cfg(all(
             feature = "s2-table-window-prototype",
             feature = "paged-shaping-frontier"
@@ -40,12 +46,15 @@ impl MarkdownComposedLines {
         if let Some(tables) = &self.payload.as_ref().ok_or(Error::Poisoned)?.tables
             && tables.contains(offset, true)?
         {
+            // Table-visible records belong to their own actual domain; a raw
+            // body ordinal cannot authorize boundaries internal to a table.
             return Err(Error::TableRange);
         }
         Ok((source.byte_len(), source.utf16_len()))
     }
 
-    /// ordinal 属于显式 Source/FoldedVisible 域；非 BMP 与多 scalar GCB 沿原 BreakJob 记录。
+    /// Use the explicit ordinal domain and original BreakJob records for non-BMP
+    /// scalars and multi-scalar GCBs, without substituting UTF-16 unit counts.
     pub fn grapheme_ordinal_answer(
         &mut self,
         offset: usize,
@@ -53,6 +62,7 @@ impl MarkdownComposedLines {
         let result = (|| {
             let (bytes, units) = self.grapheme_dimensions(offset)?;
             if offset > self.graphemes.covered.utf16 {
+                // A sealed prefix cannot answer an untransferred suffix query.
                 return Ok(MarkdownComposedGraphemeOrdinalAnswer::Pending);
             }
             let (ordinal, value) =
@@ -66,8 +76,9 @@ impl MarkdownComposedLines {
         self.finish(result)
     }
 
-    /// 兼容已准备位置的旧入口。缺记录是可恢复背压，故此特定typed错误不经finish
-    /// 永久撤权；任何真实Source/FD/取消失败仍由新入口原门处理并归还reader。
+    /// Adapt the established prepared-position query to its typed Pending error.
+    /// Missing prefix records are recoverable and do not revoke the reader;
+    /// real Source/FD/cancellation failures still pass through the same finish gate.
     pub fn grapheme_ordinal(&mut self, offset: usize) -> Result<Option<usize>> {
         match self.grapheme_ordinal_answer(offset)? {
             MarkdownComposedGraphemeOrdinalAnswer::Known(value) => Ok(value),
@@ -75,6 +86,8 @@ impl MarkdownComposedLines {
         }
     }
 
+    /// Query an actual previous/next/exact boundary under this directory's
+    /// domain and prefix coverage, retaining explicit Pending at an unseen tail.
     pub fn grapheme_query(
         &mut self,
         offset: usize,
@@ -84,6 +97,7 @@ impl MarkdownComposedLines {
         let result = (|| {
             let (bytes, units) = self.grapheme_dimensions(offset)?;
             if offset > self.graphemes.covered.utf16 {
+                // Do not manufacture an end boundary from unavailable records.
                 return Ok(Answer::Pending);
             }
             let (ordinal, value) =
@@ -92,10 +106,13 @@ impl MarkdownComposedLines {
                 })?;
             let index = match query {
                 Query::IsBoundary => {
+                    // A lower-bound result is exact only at the requested UTF-16 coordinate.
                     return Ok(Answer::Known(value.filter(|value| value.utf16 == offset)));
                 }
                 Query::Previous => ordinal.checked_sub(1),
                 Query::Next => {
+                    // Advance past an exact boundary; between boundaries, the
+                    // lower-bound record is already the requested successor.
                     let next = if value.is_some_and(|value| value.utf16 == offset) {
                         ordinal.checked_add(1).ok_or(Error::Overflow)?
                     } else {
@@ -103,12 +120,12 @@ impl MarkdownComposedLines {
                     };
                     if next == self.graphemes.count && !self.graphemes.complete {
                         return Ok(Answer::Pending);
-                    } // 已覆盖末边界不是源EOF；不能把没有复制的后继答为Known(None)。
+                    } // The covered final boundary is not Source EOF while transfer is incomplete.
                     Some(next)
                 }
             };
             let value = match index {
-                None => None, // 真实SOT之前没有边界。
+                None => None, // There is no predecessor before actual start-of-text.
                 Some(index) => {
                     graphemes::ordinal_boundary(self.graphemes, index, bytes, units, |record| {
                         self.row(record)

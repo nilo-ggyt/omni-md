@@ -1,4 +1,5 @@
-//! 正式插表入口同一提交、预览首格焦点与源码字面行为；沿原 Rig 和原严格关闭核验。
+//! Verify the production insert-table entry's single commit, preview first-cell
+//! focus, and literal Source behavior through the original Rig and strict close sequence.
 
 use super::*;
 
@@ -11,7 +12,8 @@ const INSERTED: &str = concat!(
     "after\n",
 );
 
-/// 固定短例逐片读 canonical；原模板、邻文与历史由用户结果证明，不从待测模板函数生成期望。
+/// Read the fixed short canonical fixture in chunks. Expected template/surrounding
+/// text are independent literals, not output from the template function under test.
 fn document(rig: &Rig, expected: &str) -> Result<(), String> {
     let original = rig.document.upgrade().ok_or("插表原 Doc 已归还")?;
     let document = original.borrow();
@@ -34,14 +36,16 @@ fn document(rig: &Rig, expected: &str) -> Result<(), String> {
     }
     drop(document);
     drop(original);
-    // 未执行保存，真实模板事务和局部输入都只能改变文档分支；磁盘仍应是最初 after。
+    // No save occurred. Template transactions/local input affect document branches
+    // only; the actual file must retain its original short contents.
     if std::fs::read(rig._file.path()).map_err(|cause| cause.to_string())? != SOURCE.as_bytes() {
         return Err("插表或局部格输入自动改写了原磁盘".into());
     }
     Ok(())
 }
 
-/// 首格只靠原系统焦点和 Native 输入协议证明；测试不创建会话、不修改来源票或活动槽。
+/// Establish the first cell through actual system focus and Native input protocol,
+/// without creating a session or mutating source tickets/active slots from the test.
 fn preview_cell(rig: &mut Rig, started: Instant) -> Result<(), String> {
     let child = ui_active(rig, None, started, "table_insert_actual_first_cell")?;
     let view = child.view().map_err(|cause| cause.to_string())?;
@@ -53,8 +57,10 @@ fn preview_cell(rig: &mut Rig, started: Instant) -> Result<(), String> {
     document(rig, INSERTED)?;
     let frame = observe(&child)?;
     let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**view);
-    // SAFETY: 正式客户在当前全选范围键入固定中文；NSNotFound 沿真实选择替换，不能用显式
-    // 0..3 帮产品绕开错误的首格选区。这不是物理输入法候选验收，也不切换系统输入法。
+    // SAFETY: The actual client inserts fixed Chinese at its selected range.
+    // NSNotFound must consume actual selection; explicit 0..3 would conceal an
+    // incorrect first-cell selection. This verifies no physical IME candidate UI
+    // and changes no system input method.
     unsafe {
         client.insertText_replacementRange(
             &NSString::from_str("首格"),
@@ -63,7 +69,7 @@ fn preview_cell(rig: &mut Rig, started: Instant) -> Result<(), String> {
     }
     frame::wait_complete_frame("table_insert_first_cell_native_text", &child, frame)?;
     ui_local(&view, "首格")?;
-    document(rig, INSERTED)?; // 首格本地草稿不能提前变成第二笔正文历史。
+    document(rig, INSERTED)?; // The first cell's local draft cannot become a second document-history entry early.
     if rig
         .view
         .input_state()
@@ -80,7 +86,8 @@ fn preview_cell(rig: &mut Rig, started: Instant) -> Result<(), String> {
     ui_local(&view, "列 1")?;
     document(rig, INSERTED)?;
     let frame = observe(&rig.body)?;
-    // 原 Esc 取消唯一格草稿；不按应用退出、不手动拆图，也不制造一次空 canonical 提交。
+    // The existing Escape command cancels the sole draft without quitting the
+    // app, manually dismantling its graph, or inventing an empty canonical commit.
     view.command(sel!(cancelOperation:))
         .map_err(|cause| cause.to_string())?;
     frame::wait_complete_frame("table_insert_first_cell_original_escape", &rig.body, frame)?;
@@ -88,7 +95,7 @@ fn preview_cell(rig: &mut Rig, started: Instant) -> Result<(), String> {
         return Err("插表首格原取消动作没有归还唯一 owner".into());
     }
     drop(view);
-    drop(child); // 真实临时强引用在整产品关闭之前归还；原 Rig 已持子图弱资源观察。
+    drop(child); // Return temporary strong claims before product close; the Rig already retains weak child-resource observations.
     Ok(())
 }
 
@@ -122,8 +129,10 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
                 rig.view
                     .insert_default_table()
                     .map_err(|cause| cause.to_string())?;
-                // 同一插表按钮入口只发布一笔原事务。Preview 等实际首格/当前帧，Source 等原字面帧；
-                // 两者都从动作开始计原三秒，不能用首个父定位帧冒充预览编辑已经就绪。
+                // The same insert-button entry publishes one transaction. Preview
+                // waits for the actual first cell/current frame; Source waits for
+                // its literal frame. Both keep the original action-start deadline;
+                // a first parent-location frame cannot certify preview editing readiness.
                 if mode == MarkdownPresentationMode::InlinePreview {
                     preview_cell(&mut rig, started)?;
                 } else {
@@ -165,11 +174,12 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
                 drop(original);
                 rig.remember_receipt()
             })();
-            // 失败同样先归还实际资源；不让后一个模式、后一个窗口或进程结束替本例清理。
-            let retirement = release::close(rig, false)?;
+            // Failure still returns actual resources before another mode/window
+            // starts; process exit cannot substitute for this fixture's cleanup.
+            let retirement = release::close(rig)?;
             Ok((retirement, result))
         })?;
-        retirement.verify(false)?;
+        retirement.verify()?;
         result?;
     }
     println!(

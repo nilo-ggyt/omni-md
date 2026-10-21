@@ -1,4 +1,4 @@
-//! 新正文的纯事务边界：只弱借原文档，不创建TextKit图或负责可见几何。
+//! The paged input transaction boundary weakly borrows its original target; it owns neither TextKit storage nor visible geometry.
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
@@ -30,7 +30,7 @@ mod target;
 pub use cell::NativeMarkdownPagedCellSession;
 pub use cell_commit::{
     NativeMarkdownPagedCellCommit, NativeMarkdownPagedCellCommitError,
-    NativeMarkdownPagedCellCommitResult, NativeMarkdownPagedCellPreparedCommit,
+    NativeMarkdownPagedCellPreparedCommit,
 };
 use target::InputTarget;
 pub use target::NativeMarkdownPagedTargetDomain;
@@ -113,14 +113,14 @@ pub enum NativeMarkdownPagedInputError {
 type Result<T> = std::result::Result<T, NativeMarkdownPagedInputError>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// canonical历史选择与有限可见选择事实；多选时不能把历史anchor/head冒充当前主方向。
+/// Target history selection and bounded interactive facts; multiple ranges do not authorize a directed primary anchor/head.
 pub struct NativeMarkdownPagedInputState {
     pub generation: u64,
-    /// Core原有memento；只有selection_is_directed为true时也代表当前可交互anchor/head。
+    /// The Core memento also represents interactive anchor/head only when selection_is_directed is true.
     pub selection: MarkdownTextSelection,
     pub selection_is_directed: bool,
     pub selection_range_count: usize,
-    /// NSTextInputClient的有序主范围；单靠此范围不能恢复多选的未知anchor/head方向。
+    /// The ordered NSTextInputClient primary range cannot recover the unknown direction of a multiple selection.
     pub primary_range: NSRange,
     pub marked: Option<NSRange>,
     pub utf16_len: usize,
@@ -129,14 +129,14 @@ pub struct NativeMarkdownPagedInputState {
 }
 
 impl NativeMarkdownPagedInputState {
-    /// 多范围只知道真实范围集合与主范围，不为导航或查找伪造一个主head。
+    /// Multiple ranges retain their actual set and primary range without inventing a primary head for navigation or Find.
     #[must_use]
     pub fn directed_selection(self) -> Option<MarkdownTextSelection> {
         self.selection_is_directed.then_some(self.selection)
     }
 }
 
-/// 真实回调入口的一张原票；不可Clone，首次尝试后即消费，失败也不能换载荷重试。
+/// One original callback permit: it is not Clone, and the first attempt consumes it even if a different payload could succeed.
 pub struct NativeMarkdownPagedInputPermit {
     owner: Weak<NativeMarkdownPagedInput>,
     epoch: u64,
@@ -146,7 +146,7 @@ pub struct NativeMarkdownPagedInputPermit {
 }
 
 #[derive(Clone, Debug)]
-/// 仅说明已提交的源范围变化；实际可见区域由后续原票下的布局阶段另行计算。
+/// Describes committed source changes; subsequent layout computes visible damage under its own original authority.
 pub struct NativeMarkdownPagedInputInvalidation {
     pub replaced_utf16_range: Option<Range<usize>>,
     pub change_in_utf16_length: isize,
@@ -156,7 +156,7 @@ pub struct NativeMarkdownPagedInputInvalidation {
     pub folds_changed: bool,
 }
 
-/// 成功返回即表示Core已发布；后续权限失效只能停止显示后果，不能解释为未发生编辑。
+/// A successful return means Core has published; later revocation can stop presentation but cannot undo that fact.
 pub struct NativeMarkdownPagedInputCommit {
     owner: Weak<NativeMarkdownPagedInput>,
     epoch: u64,
@@ -165,10 +165,10 @@ pub struct NativeMarkdownPagedInputCommit {
 }
 
 impl NativeMarkdownPagedInputCommit {
-    /// 在View发出任何可重入坐标或显示通知之前验证本次提交后果，绝不重捕后继状态。
+    /// Validate this committed effect before a View emits reentrant geometry or display notifications; never recapture a successor.
     ///
     /// # Errors
-    /// 前台、原epoch、输入owner或完整已提交状态变化时拒绝；此错误不会回滚已提交正文。
+    /// Reject a changed foreground epoch, owner, or complete committed state; rejection does not roll back published text.
     pub fn check_current(&self, current: &(impl Fn(u64) -> bool + ?Sized)) -> Result<()> {
         let owner = self
             .owner
@@ -180,7 +180,7 @@ impl NativeMarkdownPagedInputCommit {
 
 pub enum NativeMarkdownPagedInputOutcome {
     Committed(NativeMarkdownPagedInputCommit),
-    /// 只用于真实无历史或原本没有marked；错误不能借此分支伪装成无变化。
+    /// Only genuine empty history or an already unmarked state is unchanged; errors must remain errors.
     Unchanged(NativeMarkdownPagedInputState),
 }
 
@@ -190,7 +190,7 @@ pub enum NativeMarkdownPagedInputHistory {
     Redo,
 }
 
-/// composition root持唯一Rc；内部只有原Doc弱引用与有限派生metadata，不保活任何源映射。
+/// The composition root owns the Rc; this owner holds only a weak document identity and bounded derived metadata, not mappings.
 pub struct NativeMarkdownPagedInput {
     target: InputTarget,
     selection: NativeMarkdownSelectionState,
@@ -200,7 +200,7 @@ pub struct NativeMarkdownPagedInput {
     fold_revision: Cell<u64>,
     closed: Cell<bool>,
     busy: Cell<bool>,
-    // 只在显式arm成功后分配原有限记录器；字段没有Doc、Native或异步反向所有权。
+    // Allocate the bounded recorder only after explicit arming; it owns no document, Native object, or asynchronous back-reference.
     #[cfg(feature = "native-input-trace")]
     input_trace: RefCell<Option<crate::native_input_trace::SharedNativeInputTrace>>,
 }
@@ -208,11 +208,13 @@ pub struct NativeMarkdownPagedInput {
 struct Mutation<'a>(&'a Cell<bool>);
 impl Drop for Mutation<'_> {
     fn drop(&mut self) {
-        self.0.set(false); // 同步栈没有后继owner可替换此槽；错误和展开都只归还本次占用。
+        self.0.set(false); // Only this synchronous stack owns the occupied slot; errors and unwinding release that same admission.
     }
 }
 
 struct PreparedFolds {
+    // The observer transfers bounded derived facts only; the candidate tree and
+    // original text/mappings remain with the Core transaction.
     folds: Vec<MarkdownFoldRegion>,
     length: usize,
     selection: MarkdownTextSelection,
@@ -230,8 +232,10 @@ impl MarkdownTextChangeObserver for FoldObserver<'_> {
 
     fn changed(&mut self, change: MarkdownTextChange) -> std::result::Result<(), Self::Error> {
         if !self.owner.metadata_matches(self.before) {
-            return Err(Self::Error::Revoked); // 这里只核纯metadata；Core可变借用内不调用current或Native。
+            return Err(Self::Error::Revoked); // Inspect pure metadata only: Core holds a mutable borrow, so current and Native must not run here.
         }
+        // Consume actual changes in old coordinates; an envelope would erase folds
+        // between disjoint replacements or the two markers of a surround format.
         self.mapper.push(MarkdownFoldChange {
             old_utf16_range: change.old_utf16_range,
             inserted_utf16_len: change.inserted_utf16_len,
@@ -252,7 +256,7 @@ impl MarkdownTextChangeObserver for FoldObserver<'_> {
             .finish(candidate.utf16_len(), Some(selection_after.head_utf16))?;
         let mut folds = Vec::with_capacity(ranges.len());
         for hidden in ranges {
-            // 原mapper最多256项；header来自真实候选树，旧行号不能进入新generation。
+            // The mapper has at most 256 anchors; derive headers from the actual candidate tree rather than reusing old-generation line numbers.
             folds.push(MarkdownFoldRegion {
                 header_line: candidate.line_for_utf16(hidden.start)?,
                 hidden_utf16_range: hidden,
@@ -267,10 +271,10 @@ impl MarkdownTextChangeObserver for FoldObserver<'_> {
 }
 
 impl NativeMarkdownPagedInput {
-    /// 借原模型初态建立唯一选择事实；调用方须在替换同Rc内的Doc前撤销原epoch及本owner。
+    /// Initialize the sole selection authority from the original model; revoke its epoch and this owner before replacing the document inside that Rc.
     ///
     /// # Errors
-    /// 文档不存在、正在借用或初始选择无效时拒绝；不创建Native图或第二canonical owner。
+    /// Reject a released or borrowed document or invalid initial selection; create neither a Native graph nor another canonical owner.
     pub fn new(document: Weak<RefCell<MarkdownDocumentBuffer>>) -> Result<Rc<Self>> {
         Self::with_folds(document, Vec::new())
     }
@@ -279,6 +283,8 @@ impl NativeMarkdownPagedInput {
         document: Weak<RefCell<MarkdownDocumentBuffer>>,
         folds: Vec<MarkdownFoldRegion>,
     ) -> Result<Rc<Self>> {
+        // Validate endpoints against the existing canonical tree without taking a
+        // text snapshot or creating an independent Source owner.
         let original = document
             .upgrade()
             .ok_or(NativeMarkdownPagedInputError::DocumentReleased)?;
@@ -292,7 +298,7 @@ impl NativeMarkdownPagedInput {
             MarkdownFoldAnchorMapping::new(original.utf16_len(), &folds, false)?;
             (original.generation(), selection)
         };
-        drop(original); // 初态读取的临时强claim在返回owner之前结束；长期字段只有Weak。
+        drop(original); // End the temporary strong claim before returning the input owner; the retained identity is weak.
         Ok(Rc::new(Self {
             target: InputTarget::Body(document),
             selection: NativeMarkdownSelectionState::new(generation, selection),
@@ -307,14 +313,16 @@ impl NativeMarkdownPagedInput {
         }))
     }
 
-    /// 返回真实canonical元数据；外部绕过本owner修改选择/代次后拒绝，不自动采新状态续权。
+    /// Return canonical metadata only while it agrees with this owner; out-of-band selection/generation changes revoke it rather than renew it.
     ///
     /// # Errors
-    /// 封闭、Doc释放、借用冲突或完整选择事实失配时拒绝。
+    /// Reject closure, document release, a conflicting borrow, or disagreement in complete selection facts.
     pub fn state(&self) -> Result<NativeMarkdownPagedInputState> {
         if self.closed.get() {
             return Err(NativeMarkdownPagedInputError::Closed);
         }
+        // Cell serials/UTF-16 offsets belong to its draft, never the canonical
+        // document. A local mismatch cannot be repaired from Body metadata.
         if let Some(state) = self.cell_state()? {
             return Ok(state);
         }
@@ -351,26 +359,28 @@ impl NativeMarkdownPagedInput {
         })
     }
 
-    /// 新视图只借同一输入owner的原Doc身份，不能另传同内容文档冒充原canonical。
+    /// Views borrow this input owner's original document identity; another document with equal bytes is not the canonical target.
     pub(super) fn document_identity(&self) -> Weak<RefCell<MarkdownDocumentBuffer>> {
         self.target.body_document()
     }
 
-    /// 固定原Body/Cell位置域；不导出Doc给局部范围补签，Scene另保原Source capture权限。
+    /// Capture the original Body/Cell coordinate domain; Scene still checks its original Source capture independently.
     pub fn target_domain(&self) -> Result<NativeMarkdownPagedTargetDomain> {
         self.state()?;
         self.target.domain()
     }
 
-    /// 首个Native输入读取前固定原epoch；current必须验证既有前台与该epoch，不能补签较新票。
+    /// Fix the original epoch before the first Native payload read; current must validate that foreground epoch, not authorize a newer one.
     ///
     /// # Errors
-    /// 已占用或原权限/完整状态不再成立时拒绝。current可能重入，所有调用均在借用之外。
+    /// Reject busy or invalid original authority/state. Every current call is outside borrows because it can reenter.
     pub fn capture(
         self: &Rc<Self>,
         epoch: u64,
         current: &(impl Fn(u64) -> bool + ?Sized),
     ) -> Result<NativeMarkdownPagedInputPermit> {
+        // current may reenter and complete an action. Check busy on both sides
+        // while retaining the same before-state and original Cell capsule.
         if self.busy.get() {
             return Err(NativeMarkdownPagedInputError::Busy);
         }
@@ -392,6 +402,8 @@ impl NativeMarkdownPagedInput {
         })
     }
 
+    // This runs inside Core's mutable document borrow: inspect bounded metadata
+    // only, with no Source read, Native operation, or external callback.
     fn metadata_matches(&self, state: NativeMarkdownPagedInputState) -> bool {
         !self.closed.get()
             && self.selection.serial() == state.selection_serial
@@ -419,7 +431,7 @@ impl NativeMarkdownPagedInput {
     ) -> Result<()> {
         let source_health = || -> Result<()> {
             if self.is_cell() {
-                self.cell_state()?; // 已提交receipt不再持编辑胶囊，仍沿同会话核真实Source首错。
+                self.cell_state()?; // A committed receipt no longer holds the edit capsule, but the same session still checks the original Source failure.
             } else {
                 let original = self
                     .document_identity()
@@ -429,7 +441,7 @@ impl NativeMarkdownPagedInput {
                     .try_borrow()
                     .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
                 for observer in document.backing_observers() {
-                    // 含已退休段的原票；publish后的真实Drop失败必须由原Commit报告为已提交后果。
+                    // Include retired backing observers: a real Drop failure after publication remains an effect of this original commit.
                     if let Some(errno) = observer.first_errno() {
                         return Err(
                             MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into(),
@@ -441,14 +453,14 @@ impl NativeMarkdownPagedInput {
         };
         source_health()?;
         let permitted = current(epoch);
-        source_health()?; // 可重入回调或最后旧Snapshot释放所发现的Source首错优先于撤权。
+        source_health()?; // A Source failure discovered by reentry or the last old snapshot release takes precedence over revocation.
         if !permitted {
             return Err(NativeMarkdownPagedInputError::Revoked);
         }
         if self.state()? != state {
             return Err(NativeMarkdownPagedInputError::StateChanged);
         }
-        // state()的Doc借用已结束；末次可重入检查后再纯核原完整状态，不能只核前一次结果。
+        // state() has released its document borrow. Recheck complete original facts after the last reentrant callback.
         let permitted = current(epoch);
         source_health()?;
         if !permitted {
@@ -460,7 +472,7 @@ impl NativeMarkdownPagedInput {
         Ok(())
     }
 
-    /// 原输入票跨过真实外部操作后仍须核同一owner与原状态，不重捕后继输入续权。
+    /// After an external operation, validate the same owner and original state without recapturing successor input.
     pub(super) fn check_permit(
         &self,
         permit: &NativeMarkdownPagedInputPermit,
@@ -470,7 +482,7 @@ impl NativeMarkdownPagedInput {
             return Err(NativeMarkdownPagedInputError::Revoked);
         }
         if let Some(cell) = &permit.cell {
-            cell.facts()?; // 同owner的原胶囊Source首错先于前台撤销，不读取外来permit的另一个Source。
+            cell.facts()?; // The original capsule's Source failure precedes foreground revocation; never inspect a foreign permit's Source.
         }
         self.check_original(permit.epoch, permit.before, current)
     }
@@ -480,6 +492,8 @@ impl NativeMarkdownPagedInput {
         permit: &NativeMarkdownPagedInputPermit,
         current: &(impl Fn(u64) -> bool + ?Sized),
     ) -> Result<Mutation<'a>> {
+        // Reject occupied/consumed admission before reentry, then recheck both:
+        // current itself may consume the same permit or start another action.
         if self.busy.get() {
             return Err(NativeMarkdownPagedInputError::Busy);
         }
@@ -491,9 +505,11 @@ impl NativeMarkdownPagedInput {
             return Err(NativeMarkdownPagedInputError::Busy);
         }
         if permit.consumed.replace(true) {
-            // current可能同步重入并先消费同票；这种拒绝不能伪装成另一在途事务。
+            // current may have reentered and consumed this permit; distinguish that from another busy transaction.
             return Err(NativeMarkdownPagedInputError::Consumed);
         }
+        // Preflight counter capacity before any Core publication. Metadata after
+        // a successful canonical edit must not fail partway through publication.
         self.selection
             .serial()
             .checked_add(1)
@@ -507,6 +523,8 @@ impl NativeMarkdownPagedInput {
     }
 
     fn observer(&self, before: NativeMarkdownPagedInputState) -> Result<FoldObserver<'_>> {
+        // Copy the bounded projection into its mapper; return the fold borrow
+        // before any subsequent reentrant current/Native call.
         let folds = self
             .folds
             .try_borrow()
@@ -519,10 +537,10 @@ impl NativeMarkdownPagedInput {
         })
     }
 
-    /// 直接处理同一次真实新增输入；范围为全局UTF16，NSNotFound优先替换原marked再取完整选择。
+    /// Apply this newly supplied text in target UTF-16 coordinates; NSNotFound prefers the original marked range over the full selection.
     ///
     /// # Errors
-    /// 所有Err均先于Core发布；成功后的原票失效由返回Commit的check_current独立报告。
+    /// All errors precede Core publication; the returned commit separately reports revocation of an already published effect.
     pub fn insert_text(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -535,7 +553,7 @@ impl NativeMarkdownPagedInput {
         self.replace(permit, text, replacement, None, intent, current)
     }
 
-    /// 已在真实Paste到达时转换的有限载荷，沿原Isolated事务执行，不重建NSString副本。
+    /// Use the bounded payload converted when Paste arrived and its isolated intent without allocating another NSString.
     pub(in crate::native_surface) fn insert_text_isolated(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -548,10 +566,10 @@ impl NativeMarkdownPagedInput {
         self.replace(permit, text, replacement, None, intent, current)
     }
 
-    /// selected相对本次候选，marked只在同一Core事务成功后发布；失败保留旧候选和历史。
+    /// selected is relative to this candidate; publish marked state only with its successful Core transaction, preserving the old candidate/history on failure.
     ///
     /// # Errors
-    /// 非完整scalar范围、相对选择越界、资源失败或原票撤销均拒绝，不裁短输入。
+    /// Reject scalar splits, out-of-range relative selection, resource failure, or revocation; never truncate input.
     pub fn set_marked_text(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -565,10 +583,10 @@ impl NativeMarkdownPagedInput {
         self.replace(permit, text, replacement, Some(selected), intent, current)
     }
 
-    /// 原Native对象只借本回调；复用既有输入转换上限，绝不读取原文或构造隐藏NSTextView。
+    /// Borrow the Native payload only for this callback and use the existing conversion limit; read no document text or hidden NSTextView.
     ///
     /// # Errors
-    /// 未支持的输入类型、转换期间撤权或后续Core预检失败均保留原状态。
+    /// Unsupported payload types, revocation during conversion, and Core preflight errors preserve the original state.
     pub fn insert_native(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -585,10 +603,10 @@ impl NativeMarkdownPagedInput {
         )
     }
 
-    /// 显式隔离的新增载荷；不声称尚未测量的paste分组等同旧field，Body仍走同一事务实现。
+    /// An explicitly isolated payload uses the same Body transaction; this does not claim unmeasured equivalence with the former field's Paste grouping.
     ///
     /// # Errors
-    /// 与insert_native相同，原输入票只消费一次，失败不发布任何字符。
+    /// As with insert_native, consume the original permit once and publish no characters on failure.
     pub fn insert_native_isolated(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -619,10 +637,10 @@ impl NativeMarkdownPagedInput {
         self.replace(permit, &text, replacement, None, intent, current)
     }
 
-    /// 与insert_native相同的原票覆盖完整Native候选读取和相对选择校验。
+    /// The same original permit covers the complete Native candidate read and relative-selection validation.
     ///
     /// # Errors
-    /// 不截断候选、不忽略无效属性字符串类型，也不把读取失败当成空marked。
+    /// Do not truncate a candidate, ignore an invalid attributed-string type, or reinterpret a failed read as empty marked text.
     pub fn set_marked_native(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -648,7 +666,7 @@ impl NativeMarkdownPagedInput {
         })
     }
 
-    /// 延后普通输入复用同一typed首错和Native转换；额度只限制本次新增副本，不读取正文。
+    /// Deferred ordinary input shares the typed first-error conversion; the limit bounds only this newly supplied copy, not document reads.
     pub(in crate::native_surface) fn copy_permit_text_with_limit(
         &self,
         permit: &NativeMarkdownPagedInputPermit,
@@ -663,7 +681,7 @@ impl NativeMarkdownPagedInput {
                 match self.check_permit(permit, current) {
                     Ok(()) => true,
                     Err(error) => {
-                        // 仅栈内固定首错槽；借用在返回bool之前结束，不跨后续Native载荷getter或current。
+                        // Keep one stack-local first-error slot; release its borrow before returning to a Native payload getter or current.
                         first.borrow_mut().get_or_insert(error);
                         false
                     }
@@ -672,7 +690,7 @@ impl NativeMarkdownPagedInput {
             reserve_bytes,
         );
         if let Some(error) = first.into_inner() {
-            return Err(error); // 真实Source/原票失败优先，不能由转换层的String错误覆盖typed因果。
+            return Err(error); // Preserve the typed Source/permit cause instead of replacing it with a conversion-layer String error.
         }
         converted.map_err(NativeMarkdownPagedInputError::NativeInput)
     }
@@ -683,6 +701,8 @@ impl NativeMarkdownPagedInput {
         token: &MarkdownPreparedTextInput,
         cause: NativeMarkdownPagedInputError,
     ) -> NativeMarkdownPagedInputError {
+        // Cancel only this original prepare token. Preserve the primary cause
+        // together with any inability to confirm cancellation.
         let cleanup = document
             .try_borrow_mut()
             .map_err(|_| NativeMarkdownPagedInputCancellationError::Borrowed)
@@ -692,7 +712,7 @@ impl NativeMarkdownPagedInput {
                     .map_err(NativeMarkdownPagedInputCancellationError::Document)
             });
         match cleanup {
-            Ok(()) => cause, // 清理成功不恢复原Source权限，原首错仍返回调用方。
+            Ok(()) => cause, // Successful cancellation does not restore Source authority; return the original cause.
             Err(cleanup) => NativeMarkdownPagedInputError::CancellationUnconfirmed {
                 cause: Box::new(cause),
                 cleanup,
@@ -709,6 +729,8 @@ impl NativeMarkdownPagedInput {
         intent: Option<cell_mutations::CellInputIntents>,
         current: &(impl Fn(u64) -> bool + ?Sized),
     ) -> Result<NativeMarkdownPagedInputCommit> {
+        // Bound only the newly supplied UTF-8 payload. Existing text stays in the
+        // canonical tree and is never materialized by this replacement adapter.
         if text.len() > NATIVE_MARKDOWN_INPUT_TRANSACTION_MAX_BYTES {
             return Err(NativeMarkdownPagedInputError::InputTooLarge);
         }
@@ -720,8 +742,10 @@ impl NativeMarkdownPagedInput {
             .checked_add(units)
             .ok_or(NativeMarkdownPagedInputError::InvalidRange)?;
         let after = match relative {
-            None => MarkdownTextSelection::caret(end), // 与原生产输入相同，显式替换也发布本次末端单caret。
+            None => MarkdownTextSelection::caret(end), // Explicit replacement also publishes a single caret at the inserted end, as the production input path does.
             Some(selected) => {
+                // Candidate-relative selection uses UTF-16. Verify complete scalar
+                // endpoints before translating it into the target coordinate domain.
                 let selected_end = selected
                     .location
                     .checked_add(selected.length)
@@ -746,6 +770,8 @@ impl NativeMarkdownPagedInput {
         };
         let marked = (relative.is_some() && units != 0).then_some(NSRange::new(range.start, units));
         if let Some(intent) = intent {
+            // Consume the captured Cell intent/capsule, including empty marked
+            // input; Body folds/history have no authority in this local domain.
             return self.replace_cell(
                 permit,
                 cell_mutations::CellReplacement {
@@ -770,7 +796,7 @@ impl NativeMarkdownPagedInput {
             if !self.matches_document(&document, permit.before) {
                 return Err(NativeMarkdownPagedInputError::StateChanged);
             }
-            // 只按原permit的真实marked翻译；新Input首个Start不继承同Doc旧client遗留的组标记。
+            // Translate only this permit's marked state; a new input owner's first Start cannot inherit another client's old group.
             let composition = match (relative.is_some(), permit.before.marked) {
                 (true, None) => Some(MarkdownTextInputComposition::Start),
                 (true, Some(marked)) => Some(MarkdownTextInputComposition::Update {
@@ -779,10 +805,10 @@ impl NativeMarkdownPagedInput {
                 (false, Some(marked)) => Some(MarkdownTextInputComposition::Commit {
                     marked_before: marked.location..marked.location + marked.length,
                 }),
-                (false, None) => None, // 普通输入不取得任何旧组合的合并权限。
+                (false, None) => None, // Ordinary input receives no authority to merge with an old composition.
             };
             if let Some(composition) = composition {
-                // marked更新与确认沿同一个Core组合组；显式子范围是否可合并由原组真实范围决定。
+                // Marked updates and confirmation use the same Core group; its actual range decides whether an explicit subrange can merge.
                 document.prepare_composition_text_input_observed(
                     range,
                     text,
@@ -801,7 +827,7 @@ impl NativeMarkdownPagedInput {
                 )?
             }
         };
-        // prepare的Doc/fold借用已结束，原前台检查可同步重入；失权只能取消同nonce。
+        // Preparation has released document/fold borrows. Foreground reentry may revoke this exact nonce, which must then be cancelled.
         if let Err(cause) = self.check_permit(permit, current) {
             return Err(self.cancel(&original, &token, cause));
         }
@@ -826,6 +852,8 @@ impl NativeMarkdownPagedInput {
                 ));
             }
         };
+        // Preparation did not publish. Metadata drift cancels this nonce while
+        // preserving the original canonical root and history.
         if !self.matches_document(&document, permit.before) || prepared.selection != after {
             drop(folds);
             drop(document);
@@ -843,7 +871,7 @@ impl NativeMarkdownPagedInput {
                 return Err(self.cancel(&original, &token, error.into()));
             }
         };
-        // 从publish到metadata完成没有Native、current或可失败IO；不允许提交后再用普通Err谎报未修改。
+        // From publication through metadata update there is no Native call, current, or fallible I/O; a committed edit cannot become an ordinary precommit error.
         let commit = self.publish(permit, &document, prepared, marked, Some(edit), &mut folds);
         drop(folds);
         drop(document);
@@ -874,9 +902,9 @@ impl NativeMarkdownPagedInput {
     ) -> NativeMarkdownPagedInputCommit {
         let generation = document.generation();
         let folds_changed = *folds != prepared.folds;
-        // 系统IME可在激活/辞任时提交空字符串。Core已经真实消费原prepare票并验证Source，
-        // 空替换的SelectionOnly结果不能凭空推进选择和fold版本，撤销刚签的首帧或模式票。
-        // 仍逐项比较实际发布结果：删除选区、清marked、折叠映射或多选收束都必须正常发布。
+        // The system IME may insert empty text during activation/resignation. Core has still consumed the prepare token and checked Source health.
+        // An empty SelectionOnly result must not advance selection/fold revisions and invalidate a just-captured first frame or mode ticket.
+        // Compare actual effects: selection deletion, unmarking, fold remapping, and collapsing multiple ranges must still publish.
         let unchanged = generation == permit.before.generation
             && prepared.length == permit.before.utf16_len
             && prepared.selection == permit.before.selection
@@ -885,12 +913,12 @@ impl NativeMarkdownPagedInput {
             && permit.before.selection_is_directed
             && permit.before.selection_range_count == 1;
         let state = if unchanged {
-            permit.before // 保原完整Input，包括真实导航侧、选择serial和fold revision，不重签旧票。
+            permit.before // Preserve complete original Input, including navigation side, selection serial, and fold revision; issue no replacement authority.
         } else {
-            *folds = prepared.folds; // 旧有限Vec在纯Rust发布内释放，不跨Native调用保留容量。
-            self.fold_revision.set(self.fold_revision.get() + 1); // begin已预检checked_add且busy禁止第二发布。
+            *folds = prepared.folds; // Release the previous bounded Vec inside pure Rust publication, without carrying its capacity across Native calls.
+            self.fold_revision.set(self.fold_revision.get() + 1); // begin preflighted checked_add, and busy excludes another publication.
             self.marked.set(marked);
-            // 生产输入和历史发布一个明确after，旧多范围在同一不可重入栈内释放。
+            // Input/history publish one definite after-selection; release the old multiple ranges on this nonreentrant stack.
             drop(self.selection_ranges.replace(Vec::new()));
             let serial = self
                 .selection
@@ -922,14 +950,14 @@ impl NativeMarkdownPagedInput {
             },
         };
         #[cfg(feature = "native-input-trace")]
-        self.record_input_trace_commit(&commit, document); // 纯标量观察不调用Native/current，失败后果不改变已发布事务。
+        self.record_input_trace_commit(&commit, document); // Observe scalar facts without Native/current; observation cannot change the published transaction.
         commit
     }
 
-    /// 解除标记只改变原owner的组合metadata；不创建候选、追加、日志或历史事务。
+    /// Unmarking changes this owner's composition metadata without creating a candidate, append, journal, or history transaction.
     ///
     /// # Errors
-    /// 原票或Core完整选择失配时保留marked；只有真实无marked才返回Unchanged。
+    /// Keep marked text when the permit or complete Core selection disagrees; only an already unmarked state is Unchanged.
     pub fn unmark(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -954,7 +982,7 @@ impl NativeMarkdownPagedInput {
             return Err(NativeMarkdownPagedInputError::StateChanged);
         }
         document.finish_text_input_composition()?;
-        // Core只结束同一组合的历史归属；bytes/root/g/history及资源均不变，再发布真实无marked状态。
+        // Core ends this composition's history grouping without changing bytes, root, generation, history entries, or resources; then publish unmarked facts.
         self.marked.set(None);
         let side = self
             .selection
@@ -988,13 +1016,13 @@ impl NativeMarkdownPagedInput {
             },
         };
         #[cfg(feature = "native-input-trace")]
-        self.record_input_trace_commit(&commit, &document); // 无字节变化的真实unmark也属于原组合的完成。
+        self.record_input_trace_commit(&commit, &document); // The real unmark completes the original composition even without byte changes.
         drop(document);
         drop(original);
         Ok(NativeMarkdownPagedInputOutcome::Committed(commit))
     }
 
-    /// 菜单只读当前客户真正拥有的历史；活动格不能借正文栈启用撤销，组合输入不执行历史动作。
+    /// Menus inspect the active client's actual history; Cell does not borrow Body undo availability, and composition blocks history actions.
     pub(in crate::native_surface) fn can_perform_history(
         &self,
         direction: NativeMarkdownPagedInputHistory,
@@ -1006,7 +1034,7 @@ impl NativeMarkdownPagedInput {
             return Ok(match direction {
                 NativeMarkdownPagedInputHistory::Undo => facts.can_undo,
                 NativeMarkdownPagedInputHistory::Redo => facts.can_redo,
-            }); // 局部草稿的历史在原 Cell token 下读取，不为菜单提交它或创建新的历史。
+            }); // Read draft history under the original Cell token without committing it or creating menu-only history.
         }
         let owner = self
             .document_identity()
@@ -1018,13 +1046,13 @@ impl NativeMarkdownPagedInput {
         Ok(match direction {
             NativeMarkdownPagedInputHistory::Undo => document.can_undo(),
             NativeMarkdownPagedInputHistory::Redo => document.can_redo(),
-        }) // 只读真实栈，既不读取正文，也不改变选择、历史分组或磁盘状态。
+        }) // Inspect actual stacks without reading text or changing selection, grouping, or disk state.
     }
 
-    /// 直接复用Core已预检的observed历史事务，不把Undo伪装为一次新replacement。
+    /// Reuse Core's preflighted observed history transaction; Undo is not a fresh replacement.
     ///
     /// # Errors
-    /// 有marked、原票撤销、真实日志/源IO或fold预检失败时保留当前正文、历史与组合状态。
+    /// Marked input, revocation, journal/Source I/O, or fold preflight failure preserves the current text, history, and composition.
     pub fn history(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -1058,6 +1086,8 @@ impl NativeMarkdownPagedInput {
             NativeMarkdownPagedInputHistory::Undo => document.undo_text_edit_observed(observer)?,
             NativeMarkdownPagedInputHistory::Redo => document.redo_text_edit_observed(observer)?,
         };
+        // Only an actually empty stack is Unchanged; Core errors above retain
+        // their cause instead of being disguised as missing history.
         let Some((edit, prepared)) = restored else {
             return Ok(NativeMarkdownPagedInputOutcome::Unchanged(permit.before));
         };
@@ -1068,10 +1098,10 @@ impl NativeMarkdownPagedInput {
         Ok(NativeMarkdownPagedInputOutcome::Committed(commit))
     }
 
-    /// 鼠标、导航和全选只发布同票选择，不通过另一次文字事务制造历史或代次。
+    /// Mouse, navigation, and Select All publish selection under this permit without manufacturing text history or a generation.
     ///
     /// # Errors
-    /// 组合仍在进行、原票撤销、选择切入scalar或Core正准备事务时保留完整原状态。
+    /// Active composition, revocation, a split scalar, or Core preparation preserves the complete original state.
     pub fn set_selection(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -1081,11 +1111,11 @@ impl NativeMarkdownPagedInput {
         self.publish_selection(permit, selection, None, current)
     }
 
-    /// 原导航的方向、换行侧和目标列与同一选择serial一起发布；相同数值范围仍是新意图。
-    /// 只改唯一选择槽，不改文字generation，也不创建Undo历史或第二套导航缓存。
+    /// Publish navigation direction, wrap affinity, and goal column with one selection serial; identical numeric ranges can still carry new intent.
+    /// Update the sole selection slot without changing text generation, adding Undo history, or creating a navigation cache.
     ///
     /// # Errors
-    /// 与普通set_selection相同；坏目标列在Core选择改变前拒绝，原事实保持完整。
+    /// As with set_selection, reject an invalid goal before changing Core selection and keep original facts intact.
     pub fn set_selection_intent(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -1102,10 +1132,10 @@ impl NativeMarkdownPagedInput {
         )
     }
 
-    /// 原视觉导航把真实Bidi侧与同一次选择serial发布；同offset换侧也撤销旧输入票。
+    /// Visual navigation publishes the actual Bidi side with selection serial; changing sides at the same offset revokes old permits.
     ///
     /// # Errors
-    /// 与普通选择意图相同；不改文字generation、Undo或另建一个选择缓存。
+    /// Use ordinary selection intent semantics without changing text generation/Undo or creating another selection cache.
     pub fn set_visual_selection_intent(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -1122,7 +1152,7 @@ impl NativeMarkdownPagedInput {
         )
     }
 
-    /// 只返回同原选择槽的视觉侧；current重入撤销几何后不能复活回调前的侧。
+    /// Return the original selection slot's visual side; current reentry must not resurrect geometry it revoked.
     pub fn navigation_bidi_side(
         &self,
         permit: &NativeMarkdownPagedInputPermit,
@@ -1143,10 +1173,10 @@ impl NativeMarkdownPagedInput {
         Ok(side)
     }
 
-    /// 只读原permit对应的同一选择槽；多选未知方向不能从canonical历史memento恢复主head。
+    /// Read this permit's selection slot; a canonical history memento cannot supply an unknown primary head for multiple ranges.
     ///
     /// # Errors
-    /// 原输入、完整状态或前台失权时拒绝；纯事实读取不延长Doc、Native对象或Source生命周期。
+    /// Reject lost original input/state/foreground authority; these facts do not retain a document, Native object, or Source.
     pub fn navigation_selection_facts(
         &self,
         permit: &NativeMarkdownPagedInputPermit,
@@ -1157,7 +1187,7 @@ impl NativeMarkdownPagedInput {
         self.check_permit(permit, current)?;
         if facts != self.navigation_facts_for(permit.before) {
             return Err(NativeMarkdownPagedInputError::StateChanged);
-        } // current可能同步清除了几何而未改canonical数值，旧事实也不能在返回时复活。
+        } // current may have cleared geometry without changing canonical offsets; the returned facts must not resurrect it.
         Ok(facts)
     }
 
@@ -1173,16 +1203,16 @@ impl NativeMarkdownPagedInput {
                     .known_vertical_goal(state.generation, state.selection),
             )
         } else {
-            (None, None) // 有序主范围不是有方向的选择，不能猜一个上游/下游事实。
+            (None, None) // An ordered primary range has no known direction, so do not guess upstream/downstream affinity.
         }
     }
 
-    /// 原Source/样式/排版坐标变化时撤除几何事实；逻辑anchor/head和历史保持原样。
+    /// Revoke geometry when Source/style/layout coordinates change while retaining logical anchor/head and history.
     pub fn clear_navigation_geometry(&self) {
         self.selection.clear_vertical_goal();
     }
 
-    /// 原 Source 未换代，只撤选择样式重排所淘汰的视觉几何；本次显式 head 亲和不重新捕获。
+    /// For the same Source, revoke geometry invalidated by selection-style layout while retaining explicit head affinity without recapture.
     pub(in crate::native_surface) fn clear_style_navigation_geometry(&self) {
         self.selection.clear_style_geometry();
     }
@@ -1221,7 +1251,7 @@ impl NativeMarkdownPagedInput {
                 || side.is_some_and(|side| side.level > 126 || head.is_none())
         });
         if invalid_geometry {
-            // 首错仍先归原Source；不能让坏目标列掩盖已经发生的Backing故障，也不改变选择。
+            // Check original Source first: an invalid goal cannot hide an existing backing failure or change selection.
             document.byte_offset_for_utf16(permit.before.selection.anchor_utf16)?;
             return Err(NativeMarkdownPagedInputError::InvalidRange);
         }
@@ -1236,7 +1266,7 @@ impl NativeMarkdownPagedInput {
             if !inside(selection.anchor_utf16) && !inside(selection.head_utf16) {
                 retained.push(fold.clone());
             }
-        } // 系统/程序选择的真实端点进入隐区时必须同收据展开；跨越隐区的外部端点不凭重叠展开。
+        } // Reveal folds entered by actual selection endpoints in the same receipt; endpoints outside a spanned fold do not imply reveal.
         let folds_changed = retained.len() != folds.len();
         let fold_revision = if folds_changed {
             permit
@@ -1255,7 +1285,7 @@ impl NativeMarkdownPagedInput {
         {
             return Ok(NativeMarkdownPagedInputOutcome::Unchanged(permit.before));
         }
-        // set_selection已核源健康、idle和两端scalar；后面只发布有限事实，没有Native/current/IO。
+        // set_selection checked Source health, idle state, and scalar endpoints; only bounded metadata follows, without Native/current/I/O.
         let (head_upstream, goal, side) = intent.unwrap_or((None, None, None));
         let serial = self.selection.publish_with_bidi_side(
             permit.before.generation,
@@ -1299,31 +1329,31 @@ impl NativeMarkdownPagedInput {
         ))
     }
 
-    /// 原close预检可读此值；事务占用中不能接受会释放同一文档的关闭。
+    /// Close preflight reads this admission: an active transaction cannot accept closure that releases its document.
     #[must_use]
     pub fn is_busy(&self) -> bool {
         self.busy.get()
     }
 
-    /// 封闭只释放有限metadata，原文与映射始终归composition root；旧Permit/Commit立即失权。
+    /// Closing releases bounded metadata only; text/mappings stay with the composition root, and old permits/commits lose authority immediately.
     ///
     /// # Errors
-    /// 当前同步输入尚未结束时拒绝，不清候选或把仍活输入伪装成已关闭。
+    /// Reject while synchronous input is active; do not clear its candidate or report that live input as closed.
     pub fn close(&self) -> Result<()> {
         if self.closed.get() {
             return Ok(());
-        } // 重复清理不推进serial、不重建容量，也不影响后继owner。
+        } // Repeated closure advances no serial, rebuilds no capacity, and affects no successor owner.
         if self.busy.get() {
             return Err(NativeMarkdownPagedInputError::Busy);
         }
         self.closed.set(true);
         #[cfg(feature = "native-input-trace")]
-        drop(self.input_trace.borrow_mut().take()); // 接受close即移走payload；迟到scope只剩固定标量记录。
+        drop(self.input_trace.borrow_mut().take()); // Accepted closure removes the payload; a late scope retains only fixed scalar records.
         self.marked.set(None);
         if self.selection.serial() != u64::MAX {
             self.selection.seal();
         }
-        // serial已耗尽时closed仍永久拒绝；不回绕计数或调用内部expect制造teardown panic。
+        // Even an exhausted serial remains permanently closed; neither wrap it nor panic through an internal expect during teardown.
         let previous = self.folds.replace(Vec::new());
         drop(previous);
         drop(self.selection_ranges.replace(Vec::new()));
@@ -1335,13 +1365,15 @@ fn replacement_range(
     state: NativeMarkdownPagedInputState,
     requested: NSRange,
 ) -> Result<Range<usize>> {
+    // Explicit AppKit replacement wins. Only NSNotFound can fall back to original
+    // marked text and then the unambiguous current primary selection.
     let range = if requested.location != NSNotFound as usize {
         requested
     } else if let Some(marked) = state.marked {
         marked
     } else {
         if !state.selection_is_directed {
-            // 原产品未指定输入不从实际Multiple猜主替换范围；保留全部选择和原文等待明确动作。
+            // Unspecified input cannot guess a replacement from multiple ranges; preserve all ranges/text until an explicit action.
             return Err(NativeMarkdownPagedInputError::MultipleSelectionInput);
         }
         state.primary_range
@@ -1357,6 +1389,8 @@ fn replacement_range(
 }
 
 fn ordered_selection_range(selection: MarkdownTextSelection) -> NSRange {
+    // Native asks for an ordered NSRange. Keep original anchor/head separately
+    // rather than infer their direction from this projection later.
     NSRange::new(
         selection.anchor_utf16.min(selection.head_utf16),
         selection.anchor_utf16.abs_diff(selection.head_utf16),
@@ -1364,6 +1398,8 @@ fn ordered_selection_range(selection: MarkdownTextSelection) -> NSRange {
 }
 
 fn text_boundary(text: &str, at: usize) -> bool {
+    // Walk only new input: UTF-8 scalars contribute one/two UTF-16 units, so a
+    // low-surrogate position cannot become a valid relative candidate endpoint.
     let mut units = 0;
     for scalar in text.chars() {
         if units == at {
@@ -1372,7 +1408,7 @@ fn text_boundary(text: &str, at: usize) -> bool {
         units += scalar.len_utf16();
         if units > at {
             return false;
-        } // 低代理位置不能变成另一个看似有效的候选选择。
+        } // A position inside a surrogate pair must not become a seemingly valid candidate selection.
     }
     units == at
 }

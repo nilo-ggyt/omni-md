@@ -1,4 +1,5 @@
-//! 原 composer 只持同 Source 折叠段落证明；各 Unicode job 共享端点，不保存第二正文。
+//! Retain folding proof for the same original Source. Unicode jobs share its
+//! real endpoints rather than building a second text representation.
 
 use std::ops::Range;
 
@@ -14,26 +15,32 @@ pub(super) struct Plan {
 }
 
 impl Plan {
-    /// 显式配置最多保原256个锚点；真实 Source 首尾 CRLF/EOF 证明由唯一共享计划准备。
+    /// Retain at most the existing 256 explicit anchors. One shared plan proves
+    /// actual Source paragraph boundaries, including CRLF and real EOF.
     pub(super) fn new(source: &MarkdownLayoutTextSource, ranges: &[Range<usize>]) -> Result<Self> {
         source.health()?;
         if ranges.len() > MAX_MARKDOWN_FOLD_ANCHORS {
+            // Reject excess intent before constructing a directory or copying ranges.
             return Err(Error::InvalidRequest);
         }
         let shared = if ranges.is_empty() {
+            // An unfolded document needs no additional fold-proof owner.
             None
         } else {
+            // Validate every supplied range against this exact original Source.
             Some(FoldPlan::new(source, ranges)?)
         };
         Ok(Self { shared })
     }
 
-    /// 原 Script/GCB/LB/Bidi 各保同一个弱 Source 证明与有限游标，不复制目录或另开 Source。
+    /// Script, grapheme, line-break, and bidi jobs share the same weak Source
+    /// proof and finite cursors without duplicating its directory or recapturing text.
     pub(super) fn shared(&self) -> Option<FoldPlan> {
         self.shared.clone()
     }
 
-    /// 只有原 Item 游标命中精确隐区起点才签控制，不从 viewport 边缘推测隐藏权限。
+    /// Issue a fold control only at an actual hidden-range start. A viewport
+    /// edge cannot be used to infer authority over a different hidden interval.
     pub(super) fn at(&self, position: usize) -> Option<Range<usize>> {
         let spans = self.shared.as_ref()?.spans();
         let index = spans

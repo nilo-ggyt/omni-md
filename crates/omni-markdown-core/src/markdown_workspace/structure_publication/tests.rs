@@ -1,11 +1,13 @@
-//! 实际合成文件变化后的失败反例：同时检查原权限和操作中途才建立的新权限。
+//! Fail after actual synthetic filesystem changes and check both prior authority
+//! and authority acquired while the same operation was still in progress.
 
 use super::super::*;
 use super::*;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
-/// 取得真实公开目录/正文搜索页，末页也有独立authority，不用伪造计数当作已发布。
+/// Acquire real public directory/body-search pages, including independently
+/// revocable terminal-page authority rather than a fabricated publication count.
 fn authorities(
     session: &MarkdownSessionAccess,
 ) -> (MarkdownWorkspacePageAuthority, MarkdownSearchAuthority) {
@@ -22,7 +24,8 @@ fn authorities(
     (page.authority, search.authority)
 }
 
-/// 两类权限必须一起失效，不能只检查search掩盖目录漏撤。
+/// Check both authority domains; search invalidation alone could conceal a
+/// missing directory-page revocation.
 fn assert_revoked(
     authority: &(MarkdownWorkspacePageAuthority, MarkdownSearchAuthority),
     session: &MarkdownSessionAccess,
@@ -33,7 +36,8 @@ fn assert_revoked(
 
 #[cfg(feature = "native-markdown-candidate")]
 #[test]
-/// 所有结构路径在真实effect后注入同步Err，旧页和中途新页都不能越过终态。
+/// Fail durability after each actual structural effect; neither an old page nor
+/// a page acquired mid-operation may survive the final outcome.
 fn structure_sync_failures_revoke_old_and_mid_operation_authorities() {
     for operation in [
         "create_note",
@@ -48,30 +52,33 @@ fn structure_sync_failures_revoke_old_and_mid_operation_authorities() {
         "delete_note",
         "save_as_new",
     ] {
-        // 各分支独立fixture，避免上次撤权或遗留文件掩盖当前路径的漏接。
+        // Independent real fixtures prevent earlier revocation or retained files
+        // from hiding a missing invalidation in the current operation.
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("vault");
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("sub/child.md"), "before").unwrap();
         let content = if operation == "move_rewritten" {
-            // 深度变化的附件链接强制进入创建重写目标再删除source的分支。
+            // A depth-changing attachment link selects real rewritten-destination
+            // creation followed by source removal rather than the plain rename path.
             "before [asset](attachments/pic.png)"
         } else {
-            // 其他move保持正文不变，实际走独占rename分支。
+            // The plain move keeps body bytes unchanged and uses exclusive rename.
             "before"
         };
         fs::write(root.join("a.md"), content).unwrap();
         fs::write(root.join("b.md"), "before").unwrap();
         let external = fixture.path().join("External.md");
         fs::write(&external, "before external").unwrap();
-        let workspace = MarkdownWorkspace::new(root.clone(), fixture.path().join("data"));
+        let workspace = MarkdownWorkspace::new(root.clone());
         let session = workspace.open_session().unwrap();
         let old = authorities(&session);
         let mut mid = None;
         let mut called = 0;
         let mut fail_sync = |_: &Path| {
             called += 1;
-            // 回调只位于真实发布之后；先核可见名字，再观察撤权，不假定operation成功返回。
+            // This boundary follows real publication. Check the actual visible
+            // names before authority; a successful operation return is not assumed.
             match operation {
                 "create_note" => assert!(root.join("New.md").is_file()),
                 "create_directory" => assert!(root.join("NewDir").is_dir()),
@@ -99,7 +106,8 @@ fn structure_sync_failures_revoke_old_and_mid_operation_authorities() {
                 _ => unreachable!("操作表固定"),
             }
             assert_revoked(&old, &session);
-            // 模拟worker在首次effect后才启动；终态不能放行它看到的临时/部分集合。
+            // Acquire actual public page authority after the first effect. Final
+            // cleanup must also reject this observed temporary/partial collection.
             mid = Some(authorities(&session));
             assert!(
                 mid.as_ref()
@@ -136,7 +144,8 @@ fn structure_sync_failures_revoke_old_and_mid_operation_authorities() {
                 .map(|_| ()),
             "delete_note" => session.delete_note_with_directory_sync("a.md", None, &mut fail_sync),
             "save_as_new" => {
-                // 另存的buffer仍关联原a.md，失败只能清理新目标，不能修改原正文/历史。
+                // The save-as buffer still belongs to a.md. Failure may clean
+                // only its new destination, never alter original characters/history.
                 let document = session.open_document_buffer("a.md").unwrap();
                 session
                     .save_document_buffer_as_new_with_directory_sync(
@@ -161,7 +170,8 @@ fn structure_sync_failures_revoke_old_and_mid_operation_authorities() {
             operation,
             "import" | "copy" | "move_rewritten" | "save_as_new"
         ) {
-            // 这些分支仍有原rollback责任；终态撤权必须发生在guard移除候选之后。
+            // These operations retain destination rollback. Final revocation
+            // must follow the guard's actual removal of its candidate.
             let destination = match operation {
                 "import" => "External.md",
                 "copy" => "a 副本.md",
@@ -175,11 +185,12 @@ fn structure_sync_failures_revoke_old_and_mid_operation_authorities() {
 }
 
 #[test]
-/// O_EXCL后partial写失败必须保留无法证明的字节，终态仍撤销操作中途的新页。
+/// A failed partial write after exclusive open retains bytes whose final identity
+/// cannot be proved and revokes authority acquired during that write.
 fn created_note_write_failure_and_rollback_revoke_both_generations() {
     let fixture = tempfile::tempdir().unwrap();
     fs::write(fixture.path().join("a.md"), "before").unwrap();
-    let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(fixture.path().to_owned());
     let session = workspace.open_session().unwrap();
     let old = authorities(&session);
     let publication = WorkspaceStructurePublication::new(&session);
@@ -191,7 +202,8 @@ fn created_note_write_failure_and_rollback_revoke_both_generations() {
         b"complete",
         None,
         |file, _| {
-            // create已经成功且通知撤权，实际写部分字节使故障发生在真实副作用之后。
+            // Exclusive creation already revoked old pages. Write an actual
+            // prefix before failing, so failure follows a real visible side effect.
             assert!(created.is_file());
             assert_revoked(&old, &session);
             file.write_all(b"partial before")?;
@@ -215,14 +227,15 @@ fn created_note_write_failure_and_rollback_revoke_both_generations() {
 }
 
 #[test]
-/// std递归的私有seam真实删掉一个子项后Err，目录仍存在且终态撤销中途页。
+/// The existing private removal boundary deletes a real child before failing;
+/// the surviving directory cannot keep authority acquired after that partial change.
 fn partial_recursive_delete_error_is_conservatively_revoked_without_reimplementing_std() {
     let fixture = tempfile::tempdir().unwrap();
     fs::create_dir(fixture.path().join("sub")).unwrap();
     fs::write(fixture.path().join("a.md"), "before").unwrap();
     fs::write(fixture.path().join("sub/removed.md"), "before").unwrap();
     fs::write(fixture.path().join("sub/kept.md"), "before").unwrap();
-    let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(fixture.path().to_owned());
     let session = workspace.open_session().unwrap();
     let old = authorities(&session);
     let mut mid = None;
@@ -230,7 +243,8 @@ fn partial_recursive_delete_error_is_conservatively_revoked_without_reimplementi
         "sub",
         |_| panic!("失败移除不能进入sync"),
         |path| {
-            // 删除尝试在进入opaque std之前保守撤权，这里再制造并观察真实partial变化。
+            // Revocation precedes opaque recursive removal; now perform and
+            // observe a real partial deletion before returning the failure.
             assert_revoked(&old, &session);
             fs::remove_file(path.join("removed.md"))?;
             assert!(!path.join("removed.md").exists());
@@ -246,7 +260,8 @@ fn partial_recursive_delete_error_is_conservatively_revoked_without_reimplementi
 }
 
 #[test]
-/// 源post-read重验失败会drop返回中的候选guard，真实rollback和末端都不能漏撤。
+/// Failed source revalidation drops the returned candidate guard; actual rollback
+/// and final publication must both revoke pages acquired along the way.
 fn source_revalidation_failure_releases_provisional_note_and_revokes_mid_page() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("vault");
@@ -254,7 +269,7 @@ fn source_revalidation_failure_releases_provisional_note_and_revokes_mid_page() 
     fs::write(root.join("a.md"), "before").unwrap();
     let source = fixture.path().join("source.md");
     fs::write(&source, "before source").unwrap();
-    let workspace = MarkdownWorkspace::new(root.clone(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(root.clone());
     let session = workspace.open_session().unwrap();
     let publication = WorkspaceStructurePublication::new(&session);
     let mut mid = None;
@@ -270,7 +285,8 @@ fn source_revalidation_failure_releases_provisional_note_and_revokes_mid_page() 
         )?;
         assert!(pending.path.is_file());
         mid = Some(authorities(&session));
-        // 修改真实源长度强制post-read identity失败，目标候选已真实创建而非虚构mutation。
+        // Change the real source extent to fail post-read identity validation
+        // after an actual provisional destination has already been created.
         fs::write(&source, "changed source with a different byte count").unwrap();
         Ok(pending)
     });
@@ -285,12 +301,13 @@ fn source_revalidation_failure_releases_provisional_note_and_revokes_mid_page() 
 }
 
 #[test]
-/// 未进入实际删除的根保护和真正no-op不激活终态guard，不无故取消有效页。
+/// Root protection before deletion and real no-ops leave publication inactive,
+/// preserving otherwise-current pages without unnecessary revocation.
 fn preflight_rejection_and_noop_leave_authority_current() {
     let fixture = tempfile::tempdir().unwrap();
     fs::create_dir(fixture.path().join("sub")).unwrap();
     fs::write(fixture.path().join("a.md"), "before").unwrap();
-    let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(fixture.path().to_owned());
     let session = workspace.open_session().unwrap();
     let old = authorities(&session);
     let result = session.delete_directory_with_removal(
@@ -308,21 +325,24 @@ fn preflight_rejection_and_noop_leave_authority_current() {
 
 #[cfg(feature = "native-markdown-candidate")]
 #[test]
-/// 完整候选被外部替换或同inode改写后，四条真实rollback路径都保留外部字节和原首因。
+/// After replacement or in-place mutation of complete candidates, all four
+/// rollback paths preserve external bytes and the original operation failure.
 fn provisional_note_rollback_preserves_replacements_and_same_inode_modifications() {
     for operation in ["import", "copy", "move_rewritten", "save_as_new"] {
         for replacement in [true, false] {
-            // 每个反例重新取得文件与权限，不能靠上一例留下的目录状态绕过清理。
+            // Reacquire real files and authority per case; state retained by an
+            // earlier failure cannot alter naming or bypass the next cleanup path.
             let fixture = tempfile::tempdir().unwrap();
             let root = fixture.path().join("vault");
             fs::create_dir_all(root.join("sub")).unwrap();
             fs::write(root.join("a.md"), "before [asset](attachments/p.png)").unwrap();
             let source = fixture.path().join("External.md");
             fs::write(&source, "before external").unwrap();
-            let workspace = MarkdownWorkspace::new(root.clone(), fixture.path().join("data"));
+            let workspace = MarkdownWorkspace::new(root.clone());
             let session = workspace.open_session().unwrap();
             let destination = root.join(match operation {
-                // 各公开操作实际取得不同命名规则，测试不直接构造guard冒充调用链。
+                // Use each operation's actual naming rule; do not construct a
+                // guard directly and pretend its production call chain ran.
                 "import" => "External.md",
                 "copy" => "a 副本.md",
                 "move_rewritten" => "sub/a.md",
@@ -334,13 +354,15 @@ fn provisional_note_rollback_preserves_replacements_and_same_inode_modifications
                 let mut fail_sync = |_: &Path| {
                     let acquired_inode = fs::metadata(&destination).unwrap().ino();
                     if replacement {
-                        // 真正新inode通过rename接管同名路径；原FD仍属于已经退出目录的旧文件。
+                        // A real new inode takes the name via rename while the
+                        // acquired descriptor still belongs to the removed original.
                         let external = root.join("external-replacement.tmp");
                         fs::write(&external, b"EXTERNAL replacement bytes").unwrap();
                         fs::rename(external, &destination).unwrap();
                         assert_ne!(fs::metadata(&destination).unwrap().ino(), acquired_inode);
                     } else {
-                        // 原inode直接写入不同长度正文，ctime/mtime/size至少一项改变。
+                        // Rewrite the original inode with a different extent;
+                        // its captured size/ctime/mtime identity must no longer match.
                         fs::write(
                             &destination,
                             b"EXTERNAL modified bytes with distinct length",
@@ -352,7 +374,8 @@ fn provisional_note_rollback_preserves_replacements_and_same_inode_modifications
                     Err(MarkdownWorkspaceError::StorageUnavailable)
                 };
                 match operation {
-                    // 错误发生在完整取得和封存之后，Drop必须拒绝清理失去身份的候选。
+                    // Failure follows complete acquisition/sealing. Drop must
+                    // refuse cleanup once that sealed identity has been lost.
                     "import" => session
                         .import_note_with_directory_sync(&source, "", &mut fail_sync)
                         .map(|_| ()),
@@ -381,10 +404,12 @@ fn provisional_note_rollback_preserves_replacements_and_same_inode_modifications
                 matches!(result, Err(MarkdownWorkspaceError::RollbackUnconfirmed { cause }) if *cause == MarkdownWorkspaceError::StorageUnavailable)
             );
             let expected: &[u8] = if replacement {
-                // 原来的完整bytes不再授权删除当前路径上的独立replacement。
+                // Owning the former complete bytes grants no right to delete
+                // the independent replacement under the same name.
                 b"EXTERNAL replacement bytes"
             } else {
-                // 同inode并非足够的清理依据，修改后的完整bytes同样保留。
+                // The same inode alone is insufficient cleanup authority;
+                // preserve its externally modified complete bytes too.
                 b"EXTERNAL modified bytes with distinct length"
             };
             assert_eq!(
@@ -398,27 +423,31 @@ fn provisional_note_rollback_preserves_replacements_and_same_inode_modifications
 }
 
 #[test]
-/// 增加硬链接或替换为symlink都撤销清理权限；不会跟随链接删除外部文件。
+/// Added hardlinks and symlink replacement revoke cleanup authority; rollback
+/// cannot follow a link and remove an unrelated external file.
 fn provisional_note_rollback_rejects_added_aliases_and_symlinks() {
     use std::os::unix::fs::symlink;
     for symbolic in [false, true] {
-        // 只测试本次取得的完整文件；外部目标使用独立路径和固定合成bytes。
+        // Acquire a complete file for this case and keep the external victim
+        // under an independent synthetic path with known exact bytes.
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("vault");
         fs::create_dir(&root).unwrap();
         fs::write(root.join("a.md"), "before").unwrap();
-        let workspace = MarkdownWorkspace::new(root.clone(), fixture.path().join("data"));
+        let workspace = MarkdownWorkspace::new(root.clone());
         let session = workspace.open_session().unwrap();
         let destination = root.join("a 副本.md");
         let external = fixture.path().join("external.md");
         let result = session.copy_note_with_directory_sync("a.md", None, |_| {
             if symbolic {
-                // 同名symlink从不授予原取得FD对目标的unlink权限。
+                // A same-name symlink grants the old acquired FD no authority
+                // to unlink either the substituted name or its target.
                 fs::write(&external, b"external target").unwrap();
                 fs::remove_file(&destination).unwrap();
                 symlink(&external, &destination).unwrap();
             } else {
-                // nlink变化说明已有额外观察者，不能删除原名字冒称完整回滚。
+                // A changed link count means the bytes are shared; removing the
+                // original name cannot be reported as an exclusively owned rollback.
                 fs::hard_link(&destination, &external).unwrap();
             }
             Err(MarkdownWorkspaceError::SaveConflict)
@@ -439,7 +468,8 @@ fn provisional_note_rollback_rejects_added_aliases_and_symlinks() {
 }
 
 #[test]
-/// 父目录已移到库外再symlink接回时，最终file身份相同也不授权库外清理。
+/// An unchanged file identity grants no out-of-vault cleanup authority when its
+/// parent moved outside the vault and was reconnected through a symlink.
 fn provisional_note_rollback_rejects_moved_parent_reconnected_by_symlink() {
     use std::os::unix::fs::symlink;
     let fixture = tempfile::tempdir().unwrap();
@@ -448,10 +478,11 @@ fn provisional_note_rollback_rejects_moved_parent_reconnected_by_symlink() {
     let moved_parent = fixture.path().join("outside");
     fs::create_dir_all(&original_parent).unwrap();
     fs::write(original_parent.join("a.md"), b"before original").unwrap();
-    let workspace = MarkdownWorkspace::new(root, fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(root);
     let session = workspace.open_session().unwrap();
     let result = session.copy_note_with_directory_sync("sub/a.md", None, |_| {
-        // 保留原file inode和bytes，只改变父目录的实际confinement。
+        // Preserve the original file inode/bytes while changing only its real
+        // parent confinement, so path containment must independently reject cleanup.
         fs::rename(&original_parent, &moved_parent).unwrap();
         symlink(&moved_parent, &original_parent).unwrap();
         Err(MarkdownWorkspaceError::StorageUnavailable)
@@ -470,13 +501,14 @@ fn provisional_note_rollback_rejects_moved_parent_reconnected_by_symlink() {
 }
 
 #[test]
-/// 写入中途samepath替换后返回Err也不能删除外部replacement；没有完整seal可供清理。
+/// A same-path replacement during a failed partial write remains external data;
+/// no complete seal exists that could authorize deleting it.
 fn partial_writer_failure_does_not_remove_external_replacement() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("vault");
     fs::create_dir(&root).unwrap();
     let destination = root.join("Partial.md");
-    let workspace = MarkdownWorkspace::new(root, fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(root);
     let session = workspace.open_session().unwrap();
     let publication = WorkspaceStructurePublication::new(&session);
     let result = create_new_markdown_file_with_writer(
@@ -485,7 +517,8 @@ fn partial_writer_failure_does_not_remove_external_replacement() {
         b"complete expected",
         None,
         |file, _| {
-            // 确实已有本次partial副作用；随后新inode接管路径，再注入真实写阶段失败。
+            // Write a real partial prefix, replace its name with another inode,
+            // then fail the original write stage after those observable effects.
             file.write_all(b"partial")?;
             let external = fixture.path().join("external.tmp");
             fs::write(&external, b"external replacement during failed write")?;
@@ -508,13 +541,14 @@ fn partial_writer_failure_does_not_remove_external_replacement() {
 }
 
 #[test]
-/// rewrite move的source unlink是第二个真实发布点；其后sync失败保留目标并再次撤销中途权限。
+/// Source unlink is a rewritten move's second publication point. Later sync
+/// failure preserves its destination while revoking newly acquired intermediate pages.
 fn rewritten_move_second_publication_revokes_intermediate_pages_even_when_final_sync_fails() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("vault");
     fs::create_dir_all(root.join("sub")).unwrap();
     fs::write(root.join("a.md"), "before [asset](attachments/p.png)").unwrap();
-    let workspace = MarkdownWorkspace::new(root.clone(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(root.clone());
     let session = workspace.open_session().unwrap();
     let mut first = None;
     let mut second = None;
@@ -522,13 +556,15 @@ fn rewritten_move_second_publication_revokes_intermediate_pages_even_when_final_
     let result = session.move_note_with_directory_sync("a.md", "sub", None, |_| {
         calls += 1;
         if calls == 1 {
-            // destination已完整创建，但source仍在；模拟第一轮可见集合的真实worker权限。
+            // The complete destination exists alongside its source. Acquire real
+            // page authority for this first intermediate filesystem collection.
             assert!(root.join("a.md").is_file());
             assert!(root.join("sub/a.md").is_file());
             first = Some(authorities(&session));
             Ok(())
         } else {
-            // source已实际unlink；其即时撤权应先于第二次目录sync。
+            // Source unlink already happened; immediate revocation must precede
+            // this second fallible directory-sync boundary.
             assert_eq!(calls, 2);
             assert!(!root.join("a.md").exists());
             assert_revoked(first.as_ref().unwrap(), &session);
@@ -547,19 +583,21 @@ fn rewritten_move_second_publication_revokes_intermediate_pages_even_when_final_
 }
 
 #[test]
-/// 即使调用者没有乐观版本，改写后的移动也不能删除同步期间外部更新的源文件。
+/// A rewritten move without a caller revision must still preserve source bytes
+/// that an external writer changed during destination durability.
 fn rewritten_move_rechecks_its_own_source_revision_without_caller_precondition() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("vault");
     fs::create_dir_all(root.join("sub")).unwrap();
     let source = root.join("a.md");
     fs::write(&source, b"before [asset](attachments/p.png)").unwrap();
-    let workspace = MarkdownWorkspace::new(root.clone(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(root.clone());
     let session = workspace.open_session().unwrap();
     let mut calls = 0;
     let result = session.move_note_with_directory_sync("a.md", "sub", None, |_| {
         calls += 1;
-        // 目标已完整封存；模拟外部程序在目录同步中途成功更新源，回调仍返回成功。
+        // The destination is fully sealed. Actually update the source during
+        // the sync boundary, which itself still returns success.
         assert_eq!(calls, 1);
         fs::write(&source, b"EXTERNAL new source bytes").unwrap();
         Ok(())
@@ -571,7 +609,8 @@ fn rewritten_move_rechecks_its_own_source_revision_without_caller_precondition()
 }
 
 #[test]
-/// 成功的目录同步回调不证明目标身份；外部改写和同名替换均保留源与外部目标。
+/// A successful directory sync proves no destination identity. In-place writes
+/// and same-name replacement must preserve both source and external destination.
 fn successful_sync_does_not_commit_a_modified_provisional_note() {
     for operation in [
         "import",
@@ -581,7 +620,8 @@ fn successful_sync_does_not_commit_a_modified_provisional_note() {
         "save_as_new",
     ] {
         for replacement in [false, true] {
-            // 独立的真实文件系统fixture，避免一次失败残留改变下一操作的命名或版本。
+            // Independent real fixtures keep one failure's retained files from
+            // changing another operation's collision names or revision checks.
             let fixture = tempfile::tempdir().unwrap();
             let root = fixture.path().join("vault");
             fs::create_dir_all(root.join("sub")).unwrap();
@@ -589,7 +629,7 @@ fn successful_sync_does_not_commit_a_modified_provisional_note() {
             fs::write(root.join("a.md"), original).unwrap();
             let external_source = fixture.path().join("External.md");
             fs::write(&external_source, original).unwrap();
-            let workspace = MarkdownWorkspace::new(root.clone(), fixture.path().join("data"));
+            let workspace = MarkdownWorkspace::new(root.clone());
             let session = workspace.open_session().unwrap();
             let destination = root.join(match operation {
                 "import" => "External.md",
@@ -603,12 +643,14 @@ fn successful_sync_does_not_commit_a_modified_provisional_note() {
                 calls += 1;
                 assert_eq!(calls, 1);
                 if replacement {
-                    // 独立inode替换路径，原取得FD仍持旧值，不能授权删除新对象。
+                    // Replace the name with an independent inode; the original
+                    // FD still owns the old value and cannot authorize deleting the new one.
                     let temporary = root.join("external.tmp");
                     fs::write(&temporary, b"EXTERNAL destination bytes").unwrap();
                     fs::rename(temporary, &destination).unwrap();
                 } else {
-                    // 同inode的正文变化同样撤销封存身份，不能因为路径未变就提交。
+                    // In-place body changes also revoke the seal. An unchanged
+                    // pathname alone cannot authorize committing externally written bytes.
                     fs::write(&destination, b"EXTERNAL destination bytes").unwrap();
                 }
                 Ok(())
@@ -623,7 +665,8 @@ fn successful_sync_does_not_commit_a_modified_provisional_note() {
                 }
                 #[cfg(feature = "native-markdown-candidate")]
                 "save_as_new" => {
-                    // 同一生产另存入口在成功同步之后也不能认领外部替换的目标。
+                    // The production save-as entry cannot adopt an externally
+                    // replaced destination merely because directory sync succeeded.
                     let document = session.open_document_buffer("a.md").unwrap();
                     session.save_document_buffer_as_new_with_directory_sync(
                         &document,
@@ -648,23 +691,26 @@ fn successful_sync_does_not_commit_a_modified_provisional_note() {
 }
 
 #[test]
-/// 目标在成功同步期间消失时，移动失败并保留源；缺失名字不会被当作可提交文件。
+/// If a destination disappears during otherwise successful sync, fail the move
+/// and preserve its source; absence cannot stand in for a committable file.
 fn rewritten_move_preserves_source_when_synchronized_destination_disappears() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("vault");
     fs::create_dir_all(root.join("sub")).unwrap();
     let original = b"before [asset](attachments/p.png)";
     fs::write(root.join("a.md"), original).unwrap();
-    let workspace = MarkdownWorkspace::new(root.clone(), fixture.path().join("data"));
+    let workspace = MarkdownWorkspace::new(root.clone());
     let session = workspace.open_session().unwrap();
     let result = session.move_note_with_directory_sync("a.md", "sub", None, |_| {
-        // 删除只是合成故障输入；没有额外重试、复活名字或应用内关闭动作。
+        // Remove only the synthetic destination as the fault input; no retry,
+        // name recreation, or application-lifecycle action changes the outcome.
         fs::remove_file(root.join("sub/a.md")).unwrap();
         Ok(())
     });
     assert_eq!(fs::read(root.join("a.md")).unwrap(), original);
     assert!(!root.join("sub/a.md").exists());
-    // unlink已改变原取得FD的链接身份，严格回滚拒绝重认领；保留不确定清理与原存储原因。
+    // Unlink changed the acquired FD's link identity. Strict rollback refuses
+    // to reacquire it and preserves cleanup uncertainty with the original storage cause.
     assert!(
         matches!(result, Err(MarkdownWorkspaceError::RollbackUnconfirmed { cause }) if *cause == MarkdownWorkspaceError::StorageUnavailable)
     );

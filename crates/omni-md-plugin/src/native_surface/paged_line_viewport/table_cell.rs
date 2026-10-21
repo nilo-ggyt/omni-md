@@ -1,4 +1,4 @@
-//! 只读格消费真正的 display Source；所有对外位置映回 canonical，编辑仍由原唯一 cell session 承担。
+//! Read-only Cells consume actual display Source and map public positions back to canonical; the sole original Cell session still owns editing.
 
 use super::*;
 use crate::native_surface::paged_text_view::NativeMarkdownPagedHeadAffinity;
@@ -6,14 +6,14 @@ use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::CGContext;
 use omni_markdown_core::MarkdownComposedLineAffinity;
 
-/// 内层窗口不暴露 display 局部输入口，也不保活 Doc、Body、编辑器或另一个字体目录。
+/// The inner window exposes no display-local input and retains no document, Body, editor, or additional font catalog.
 pub struct NativeMarkdownComposedTableCell {
     window: Rc<NativeMarkdownComposedViewport>,
 }
 
 impl NativeMarkdownComposedTableCell {
-    /// 悬停只消费显示窗口的真实几何，不需要canonical映射或链接目标副本。
-    /// window已用content_frame与外层viewport交集裁剪，不能把手形扩到格padding或邻格。
+    /// Hover consumes actual display-window geometry without canonical mapping or copied link targets.
+    /// window clips to content_frame/outer viewport intersection; hand cursors cannot extend into Cell padding/neighbors.
     pub(in crate::native_surface) fn visit_link_cursor_rects(
         &self,
         current: &dyn Fn() -> bool,
@@ -22,7 +22,7 @@ impl NativeMarkdownComposedTableCell {
         self.window.visit_link_cursor_rects(current, visit)
     }
 
-    /// 只读格拖选沿原实际显示行投影；canonical命中仍由下面同一display映射完成。
+    /// Read-only drag projects through actual display lines; the same display mapping below still produces canonical hits.
     pub(in crate::native_surface) fn project_drag_point(
         &self,
         local: NSPoint,
@@ -31,10 +31,10 @@ impl NativeMarkdownComposedTableCell {
         self.window.project_drag_point(local, current)
     }
 
-    /// 真实列宽已由原表格解算器确定；content_frame 属同一行，裁剪只取它与外层视口的交集。
+    /// The original table solver determines actual column width; same-row content_frame clips only to the outer viewport intersection.
     ///
     /// # Errors
-    /// 原 publication/场景、字体、Source 或实际行输出失效时拒绝，离屏格不创建占位窗口。
+    /// Reject invalid original publication/Scene, font, Source, or actual line output; offscreen Cells create no placeholder window.
     pub fn prepare(
         output: Rc<RefCell<MarkdownComposedLines>>,
         key: NativeMarkdownPagedSceneKey,
@@ -44,7 +44,7 @@ impl NativeMarkdownComposedTableCell {
         content_frame: NSRect,
         current: &dyn Fn() -> bool,
     ) -> Result<Self> {
-        // 显示格只嵌入真实正文 Preview；不能让 active draft 或 Source 模式借另一坐标域消费它。
+        // Display Cells belong only to actual Body Preview; active drafts/Source mode cannot borrow another coordinate domain to consume them.
         if !key.request.target.is_body(&key.request.document)
             || key.presentation_mode != MarkdownPresentationMode::InlinePreview
         {
@@ -62,9 +62,9 @@ impl NativeMarkdownComposedTableCell {
             .min(content_frame.origin.y + content_frame.size.height);
         if right <= left || top <= bottom {
             return Err(NativeMarkdownComposedViewportError::Pending);
-        } // 真正离屏的格留在原 spool，不能为它分配整格像素或签空 Ready。
+        } // An actually offscreen Cell stays in its original spool, without full-Cell pixels or an empty Ready claim.
         let alignment = {
-            // 同原 Doc/root 核方向后归还租约；后继 Native getter 不跨此借用，旧格不能续权。
+            // Check alignment against original document/root and return the borrow before Native getters; an old Cell cannot renew authority.
             let original = key
                 .request
                 .document
@@ -100,7 +100,7 @@ impl NativeMarkdownComposedTableCell {
         })
     }
 
-    /// 这里只借同一个封存显示 Source；不会从原文重新解析、创建第二份显示文本或补建字体。
+    /// Borrow the same sealed display Source without reparsing source text, creating another display copy, or reconstructing fonts.
     fn display(&self) -> &MarkdownTableCellDisplaySource {
         match &self.window.domain {
             LayoutDomain::TableCell { display, .. } => display,
@@ -110,7 +110,7 @@ impl NativeMarkdownComposedTableCell {
         }
     }
 
-    /// 命中返回 canonical 两个真实候选；Bidi 另一侧不会因映射而被静默抹掉。
+    /// Return both actual canonical hit candidates without silently discarding a Bidi side during mapping.
     pub fn hit(
         &self,
         point: NSPoint,
@@ -120,7 +120,7 @@ impl NativeMarkdownComposedTableCell {
         self.canonical_hit(hit, current)
     }
 
-    /// 词组侧沿同一个显示窗口的真实GCB几何，再映回原raw格；分词不读取或清洗整格。
+    /// Word bias follows actual display-window grapheme geometry then maps to original raw Cell, without reading/sanitizing the entire cell.
     pub(in crate::native_surface) fn word_hit(
         &self,
         point: NSPoint,
@@ -130,7 +130,7 @@ impl NativeMarkdownComposedTableCell {
         Ok((self.canonical_hit(hit, current)?, backward_bias))
     }
 
-    /// 普通命中和选词共享这一次真实display→canonical映射，主次候选各保其原part亲和。
+    /// Ordinary/word hits share this actual display-to-canonical map; primary/secondary candidates retain their own part affinities.
     fn canonical_hit(
         &self,
         hit: NativeMarkdownComposedViewportHit,
@@ -152,7 +152,7 @@ impl NativeMarkdownComposedTableCell {
         })
     }
 
-    /// 激活仍交原 publication 查询真实链接目标；显示样式只授予当前可见墨迹的 canonical 范围。
+    /// Original publication still resolves actual link targets; display style supplies only the canonical range of the visible label envelope.
     pub fn link_part_at(
         &self,
         point: NSPoint,
@@ -172,7 +172,7 @@ impl NativeMarkdownComposedTableCell {
         Ok(mapped)
     }
 
-    /// Find/IME 使用原 canonical 位置与显式换行亲和；隐藏标记映射沿同一个磁盘目录。
+    /// Find/IME uses original canonical positions/explicit wrap affinity, mapping hidden markers through the same on-disk directory.
     pub fn first_rect(
         &self,
         range: NSRange,
@@ -194,15 +194,15 @@ impl NativeMarkdownComposedTableCell {
             .window
             .first_rect_with_affinity(displayed_range, affinity, current)?;
         if range.length == 0 && value.actual_range == displayed_range {
-            // 隐藏强调/代码标记的两侧可映到同一个真实显示 caret。原 canonical 请求已经
-            // 精确映到该零范围、底层也只返回它时，保留原端点；再次反映会按亲和越过隐藏标记，
-            // 错把已完成选词的原端点改成闭标记之后，令后继可见性证明永久拒绝正确位置。
+            // Both sides of hidden emphasis/code markers may map to one actual display caret. The original canonical request already
+            // maps exactly to that empty range; if the lower layer returns precisely it, retain the original endpoint. Mapping back would cross hidden markers
+            // according to affinity, moving a completed word endpoint beyond closing syntax and incorrectly preventing visibility certification.
             self.window.require(current)?;
             return Ok(NativeMarkdownPagedCharacterRect {
                 rect: value.rect,
                 actual_range: range,
             });
-        } // 非空请求或底层交付不同范围仍走真实反映，不能借此把隐藏字符/邻字形冒充原请求。
+        } // Nonempty/different returned ranges still map back normally; hidden characters/adjacent glyphs cannot stand in for the original request.
         let start = self.map_to_canonical(
             value.actual_range.location,
             if value.actual_range.length == 0 && affinity.is_upstream() {
@@ -226,14 +226,14 @@ impl NativeMarkdownComposedTableCell {
         })
     }
 
-    /// 实际点击激活只借同一个原格票；行列、范围和 Root 由 Core 票管理，不复制另一套坐标。
+    /// Actual click activation borrows the same original Cell authority; Core owns row/column/range/root facts without another coordinate copy.
     pub(in crate::native_surface) fn canonical_cell_source(
         &self,
     ) -> &omni_markdown_core::markdown_document_buffer::VerifiedMarkdownTableCellSource {
         self.display().canonical_raw_cell()
     }
 
-    /// 模式切换只从真实可见字形取得原文锚点；不把隐藏表格分隔符或离屏行首当可见文字。
+    /// Mode changes take source anchors from actual visible glyph parts, not hidden table delimiters or offscreen line starts.
     pub(in crate::native_surface) fn first_visible_source(
         &self,
         current: &dyn Fn() -> bool,
@@ -259,7 +259,7 @@ impl NativeMarkdownComposedTableCell {
         Ok(canonical)
     }
 
-    /// 实时查找只读取已封存且实际相交的软行；巨格离屏前缀不能借raw全格范围重新扫描。
+    /// Live Find reads sealed intersecting soft lines only; a large Cell's offscreen prefix cannot be rescanned through its full raw range.
     pub(in crate::native_surface) fn visible_canonical_range(
         &self,
         current: &dyn Fn() -> bool,
@@ -278,8 +278,8 @@ impl NativeMarkdownComposedTableCell {
         Ok(mapped.filter(|range| !range.is_empty()))
     }
 
-    /// 查找消费真实显示目录的逐run片段，canonical包络仅作排序，不能把隐藏语法补回匹配域。
-    /// 最大输入直接使用整个视口的剩余额度；返回借用迭代器，不先收集巨格全部来源记录。
+    /// Find consumes actual display-directory run fragments; the canonical envelope orders them but cannot restore hidden syntax to matching.
+    /// Use the whole viewport's remaining input budget and return a borrowed iterator, not a collection of all large-Cell Source records.
     pub(in crate::native_surface) fn visible_find_ranges(
         &self,
         maximum_units: usize,
@@ -308,7 +308,7 @@ impl NativeMarkdownComposedTableCell {
         Ok(Some(ranges))
     }
 
-    /// 真实可见软行共享一个display连续域；这里仅借已封存的行metadata，不读原文字节。
+    /// Actual visible soft lines share a contiguous display domain; inspect sealed line metadata without reading source bytes.
     fn visible_display_range(&self) -> Option<Range<usize>> {
         let mut range: Option<Range<usize>> = None;
         for line in self
@@ -330,7 +330,7 @@ impl NativeMarkdownComposedTableCell {
         range
     }
 
-    /// 当前格的原 canonical 范围只从原 sealed 结构票取得；租约不跨 Native 或调用者回调。
+    /// Read original canonical Cell range only from its sealed structural authority, without holding borrows across Native/caller callbacks.
     pub(in crate::native_surface) fn canonical_range(
         &self,
         current: &dyn Fn() -> bool,
@@ -356,7 +356,7 @@ impl NativeMarkdownComposedTableCell {
         Ok(range)
     }
 
-    /// 正文的跨格选择先与真实 raw 格相交，再映入 display；不把全篇范围交给局部输入口。
+    /// Intersect Body selection with actual raw Cell before mapping into display, without passing whole-document ranges into local input.
     pub fn selection_rects(
         &self,
         selection: Range<usize>,
@@ -378,7 +378,7 @@ impl NativeMarkdownComposedTableCell {
         self.window.selection_rects(start..end, current, visitor)
     }
 
-    /// 先读取真正的派生目录健康，再判断外层撤权；另一格的取消不能掩盖当前格已经发生的 I/O。
+    /// Check actual derived-directory health before outer revocation; another Cell's cancellation cannot hide this Cell's I/O failure.
     pub(in crate::native_surface) fn source_health(&self) -> Result<()> {
         self.display()
             .source()
@@ -387,19 +387,19 @@ impl NativeMarkdownComposedTableCell {
             .map_err(|error| MarkdownLineComposeError::Source(error).into())
     }
 
-    /// 可复用像素仍重核原 output、有限字体与当前 publication；没有正文重排或额外资源捕获。
+    /// Pixel reuse still validates original output, bounded fonts, and publication without relayout or extra resource capture.
     pub fn validate_ready(&self, current: &dyn Fn() -> bool) -> Result<()> {
         self.window.validate_ready(current)
     }
 
-    /// 只建立单个实际格的代码底色游标；未调用 Native，不增加 context 或来源 owner。
+    /// Create one actual Cell's code-background cursor without Native calls or another context/Source owner.
     pub(in crate::native_surface) fn code_background_cursor(
         &self,
     ) -> NativeMarkdownComposedViewportDecorationCursor {
         NativeMarkdownComposedViewportDecorationCursor::backgrounds()
     }
 
-    /// 选区端点先从原格取得；跨量子只保整数与原 Scene 的范围引用，不复制选中文本。
+    /// Take endpoints from the original Cell; across quanta retain integers/original Scene range references, not selected text.
     pub(in crate::native_surface) fn selection_cursor(
         &self,
         selections: &[Range<usize>],
@@ -411,7 +411,7 @@ impl NativeMarkdownComposedTableCell {
         ))
     }
 
-    /// 代码背景与选区共用外层本轮真实 metadata 余量，不能按每格重领一次完整预算。
+    /// Background/selection consumes the outer step's remaining metadata, never a fresh full budget per Cell.
     pub(in crate::native_surface) fn advance_decorations(
         &self,
         cursor: &mut NativeMarkdownComposedViewportDecorationCursor,
@@ -434,7 +434,7 @@ impl NativeMarkdownComposedTableCell {
         )
     }
 
-    /// 同一原窗口负责代码底色；图形上下文仅画真实格内的可见范围。
+    /// The same original window paints code backgrounds only within the actual visible Cell clip.
     pub fn paint_code_backgrounds(
         &self,
         context: &CGContext,
@@ -443,7 +443,7 @@ impl NativeMarkdownComposedTableCell {
         self.window.paint_code_backgrounds(context, current)
     }
 
-    /// 显式同步对照沿原总字形上限；正式显示继续由可续CPU会话负责，不截断可见前缀。
+    /// Explicit synchronous comparison retains its total glyph bound; production uses resumable CPU sessions without truncating visible output.
     pub(in crate::native_surface) fn paint(
         &self,
         context: &CGContext,
@@ -455,7 +455,7 @@ impl NativeMarkdownComposedTableCell {
         self.window.paint(context, current)
     }
 
-    /// 仍沿原有界绘图游标；收据额外绑定这一个格窗口，不能冒充外层 Body 已绘完。
+    /// Use the original bounded paint cursor and additionally bind its receipt to this Cell window, not completed outer Body paint.
     pub fn begin_paint(
         &self,
         context: CFRetained<CGContext>,
@@ -467,7 +467,7 @@ impl NativeMarkdownComposedTableCell {
         self.window.clone().begin_paint(context, current)
     }
 
-    /// 同一 outer key/context 的其他格或 Body 收据都不能领取当前格的完成事实。
+    /// Another Cell/Body receipt sharing outer key/context cannot claim completion for this Cell.
     #[must_use]
     pub fn permits_completion(
         &self,
@@ -477,13 +477,13 @@ impl NativeMarkdownComposedTableCell {
         completion.permits_cell(&self.window, context)
     }
 
-    /// 行高来自原实际字体/换行结果，供唯一表格行解算器累计，不按字符数估算。
+    /// The sole row solver accumulates heights from actual font/wrapping results, not character-count estimates.
     #[must_use]
     pub fn line_frame(&self, ordinal: usize) -> Option<NSRect> {
         self.window.line_frame(ordinal)
     }
 
-    /// 真实目录读取错误保留为 Source 错误，不能变成普通离屏或撤权。
+    /// Preserve actual directory read failures as Source errors, not ordinary offscreen/revocation results.
     fn map_to_canonical(
         &self,
         position: usize,
@@ -494,7 +494,7 @@ impl NativeMarkdownComposedTableCell {
             .map_err(|error| MarkdownLineComposeError::Source(error).into())
     }
 
-    /// 范围外不是当前格；半代理和目录故障仍从同一原 display Source 明确返回。
+    /// Out-of-range positions do not belong to this Cell; surrogate splits/directory faults still return explicitly from original display Source.
     fn map_to_display(
         &self,
         position: usize,

@@ -435,6 +435,9 @@ impl MemoryFindObservation {
         self.frame.completed()
     }
 
+    // Only the explicit code-paint oracle verifies a Find terminal against an
+    // already borrowed surface. Other probes use the same actual active owner.
+    #[cfg(feature = "native-block-fragment-diagnostic")]
     fn completed_at(&self, surface: &NativeMarkdownWindowSurface) -> Result<(), String> {
         self.find_completed()?;
         self.frame.completed_at(surface)
@@ -512,9 +515,7 @@ impl NativeMarkdownMemoryWorkload {
                 input: paged.body.probe_find_input_weak(),
                 generation: document.generation(),
                 length: document.utf16_len(),
-                revision: document
-                    .original_revision()
-                    .ok_or("合成笔记没有已验证的初始磁盘版本")?,
+                revision: document.original_revision(),
                 disk: (
                     metadata.dev(),
                     metadata.ino(),
@@ -1559,7 +1560,7 @@ impl NativeMarkdownMemoryWorkload {
                     .current_revision()
                     .map_err(|error| format!("无法读取原文档revision：{error}"))?
                     != original.revision
-                || document.original_revision() != Some(original.revision)
+                || document.original_revision() != original.revision
                 || document.is_dirty()
                 || !document.original_file_identity_is_unchanged()
             {

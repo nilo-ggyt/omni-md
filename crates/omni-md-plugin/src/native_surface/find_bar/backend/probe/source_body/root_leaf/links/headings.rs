@@ -1,4 +1,5 @@
-//! 同一真实长Doc内的标题链接必须完成新CPU可见性；不以查找到标题或命令返回代替跳转。
+//! Heading links within the actual long document must publish new visible CPU
+//! pixels. Finding a heading or returning from its command does not prove navigation.
 
 use super::*;
 
@@ -10,7 +11,8 @@ const COLLISION: &str = "# Deep Title-1\n\n";
 const SETEXT: &str = "Deep **Title**\n===\n\n";
 const PADDING: usize = 512;
 
-/// 每个片段远小于4KiB；只逐片写合成文件，原mmap图不被一份全文期望String保活。
+/// Stream fragments much smaller than 4KiB into the synthetic file. No complete
+/// expected String duplicates or extends the lifetime of the original mmap graph.
 fn segments() -> impl Iterator<Item = &'static str> {
     std::iter::once(HEAD)
         .chain(std::iter::repeat_n(PAD, PADDING))
@@ -18,7 +20,8 @@ fn segments() -> impl Iterator<Item = &'static str> {
         .chain(std::iter::repeat_n(PAD, PADDING))
 }
 
-/// 字节期望来自原固定字面；选择可以合法导航，generation、Undo和磁盘必须完全不动。
+/// Expected bytes come from fixed independent literals. Selection may navigate;
+/// document generation, history, and original disk contents must remain untouched.
 fn unchanged(rig: &Rig) -> Result<(), String> {
     let owner = rig.document.upgrade().ok_or("标题原Doc已释放")?;
     let document = owner.borrow();
@@ -48,7 +51,7 @@ fn unchanged(rig: &Rig) -> Result<(), String> {
         return Err("标题导航截断了原canonical尾部".into());
     }
     drop(document);
-    drop(owner); // 独立磁盘验证不跨Doc借用，更不跨Native或runloop。
+    drop(owner); // Independent disk checks hold no document borrow, Native call, or run-loop scope.
     let mut file = std::fs::File::open(rig._file.path()).map_err(|cause| cause.to_string())?;
     let mut bytes = [0; 256];
     for segment in segments() {
@@ -68,8 +71,9 @@ fn unchanged(rig: &Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 三次均由真实Command Down/Up激活label，按独立原fixture位置检查最终caret与新CPU。
-/// 第二个目标同时涵盖Setext和已占用的-1 slug，不能把裸同名计数伪装成唯一消歧。
+/// Activate each label through actual Command mouse down/up and check its caret
+/// and new CPU frame against independent fixture positions. The second target
+/// combines Setext and an occupied -1 slug; duplicate counting alone is insufficient.
 fn verify(rig: &mut Rig) -> Result<(), String> {
     rig.panel.makeKeyWindow();
     if !rig.panel.makeFirstResponder(Some(&**rig.view)) || !rig.panel.isKeyWindow() {
@@ -111,7 +115,8 @@ fn verify(rig: &mut Rig) -> Result<(), String> {
         {
             return Err("标题链接没有按同源新选择交付准确后继帧，或旧Scene仍有权限".into());
         }
-        // 原可见证明检查实际viewport与caret，而不是只看heading查询或选择提交已返回。
+        // Verify actual viewport/caret geometry, not merely successful heading
+        // lookup or a returned selection-commit call.
         rig.view
             .verify_find_target_visible(&key, NSRange::new(expected, 0))
             .map_err(|cause| cause.to_string())?;
@@ -120,8 +125,10 @@ fn verify(rig: &mut Rig) -> Result<(), String> {
         let caret = scene
             .first_rect(NSRange::new(expected, 0))
             .map_err(|cause| cause.to_string())?;
-        // 零范围的公开几何是插入线：原caret_geometry保零宽与真实行高，只有绘制时才加1pt。
-        // 此处严格核原零宽，不把绘制厚度误作字符框；完整范围、可见性与同票CPU门仍分别保留。
+        // Public empty-range geometry is an insertion line: caret geometry keeps
+        // zero width and actual line height, adding paint thickness only during
+        // drawing. Verify zero width here separately from range, visibility, and
+        // same-ticket CPU-frame requirements.
         if caret.actual_range != NSRange::new(expected, 0)
             || !caret.rect.origin.x.is_finite()
             || !caret.rect.origin.y.is_finite()
@@ -144,7 +151,8 @@ fn verify(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 复用原Rig和同一严格Retirement；业务失败也先归还Native/Source/Font/worker/mmap与像素。
+/// Reuse the original Rig and strict Retirement sequence. Even a navigation
+/// failure must first release Native/Source/font/worker/mmap/pixel resources.
 pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
@@ -153,7 +161,7 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
         for segment in segments() {
             file.write_all(segment.as_bytes())
                 .map_err(|cause| cause.to_string())?;
-            units += segment.len(); // 本夹具全部ASCII，独立字面字节就是canonical UTF16。
+            units += segment.len(); // This all-ASCII fixture has equal independent literal byte and UTF-16 lengths.
             lines += segment.bytes().filter(|byte| *byte == b'\n').count();
         }
         file.flush().map_err(|cause| cause.to_string())?;
@@ -167,9 +175,9 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
             false,
         )?;
         let result = verify(&mut rig);
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, result))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     result
 }

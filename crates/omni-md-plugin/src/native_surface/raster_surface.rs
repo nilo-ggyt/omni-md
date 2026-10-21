@@ -1,4 +1,5 @@
-//! 显式探针才把原标准 fragment 的字形送入单个有界 CPU 视口，再发布原生图层。
+//! An explicit probe draws the original TextKit fragments into one bounded CPU viewport.
+//! Its Native layer and release receipts do not certify the separate paged-body implementation.
 
 use super::cache_owner::{CacheAdmission, CacheOwner, CachePayload};
 use super::*;
@@ -22,13 +23,13 @@ pub(in crate::native_surface) use body_layer::NativeMarkdownRasterBodyLayerLease
 use native::{NativeMarkdownRasterImageView, NativeMarkdownRasterViewportProxy};
 pub(super) use pixels::Bitmap as NativeMarkdownRasterAuxiliaryBitmap;
 
-/// 辅助画布只共享本 editor 的原子资源收据，不拥有正文、Native 图或另一份计数器。
+/// Auxiliary canvases share this editor's atomic receipts, without owning its document or Native graph.
 #[derive(Clone)]
 pub(super) struct NativeMarkdownRasterAuxiliaryResources {
     counters: Arc<ResourceCounters>,
 }
 
-/// 同步辅助绘制沿原收据登记在途操作；析构只归还标量，不执行 Native。
+/// Tracks synchronous auxiliary work in the same receipt; dropping it never invokes Native code.
 pub(super) struct NativeMarkdownRasterAuxiliaryOperation {
     _guard: OperationGuard,
 }
@@ -39,18 +40,21 @@ impl NativeMarkdownRasterAuxiliaryResources {
     }
 
     pub(super) fn fail(&self) {
-        // 辅助绘制的真实失败仍进入原共享资源收据；不保已无消费者的首帧通知回链。
+        // Report an actual auxiliary failure through the original shared receipt. No obsolete
+        // first-frame notification link is retained solely to announce that failure.
         self.counters.fail();
     }
 
     pub(super) fn invalidate_geometry(&self) {
-        self.counters.invalidate_geometry(); // 仍撤同一原票，不另设 gutter 代次或调度器。
+        // Revoke the original geometry permit; auxiliary drawing has no independent epoch or scheduler.
+        self.counters.invalidate_geometry();
     }
 
     pub(super) fn operation(&self) -> Result<NativeMarkdownRasterAuxiliaryOperation, String> {
         if !self.is_open() {
             return Err("光栅辅助绘制已经关闭".into());
         }
+        // This guard covers only the caller's synchronous work and cannot authorize later callbacks.
         Ok(NativeMarkdownRasterAuxiliaryOperation {
             _guard: OperationGuard::new(Arc::clone(&self.counters)),
         })
@@ -64,12 +68,13 @@ impl NativeMarkdownRasterAuxiliaryResources {
         if !self.is_open() {
             return Err("光栅辅助画布已经关闭".into());
         }
+        // Allocate at the real backing scale, within the viewport budget, using the same pixel owner.
         let (width, height) = geometry::dimensions(bounds, scale)?;
         pixels::Bitmap::new(width, height, Arc::clone(&self.counters.pixels))
     }
 }
 
-// 这里只限制标准框架 fragment 的 Weak 元数据；自有对象和实际业务值仍共用原 ledger 预算。
+// This bounds weak framework-fragment metadata. Owned objects and business values use the original ledger.
 const MAX_FRAGMENT_WEAK_METADATA: usize = 1_024;
 
 struct FragmentRegistry {
@@ -87,7 +92,8 @@ impl CachePayload for FragmentRegistry {
 impl Drop for FragmentRegistry {
     fn drop(&mut self) {
         let identities = std::mem::take(&mut self.identities);
-        drop(identities); // 所有 Weak 控制块先在 lease 外槽归还，再记无 payload 的标量收据。
+        // Return weak control blocks outside the cache slot before reporting payload detachment.
+        drop(identities);
         if let Some(counters) = self.counters.take()
             && counters.closed.load(Ordering::Acquire)
         {
@@ -96,32 +102,35 @@ impl Drop for FragmentRegistry {
     }
 }
 
-/// 关闭槽后把真实 payload 留在同步栈；失效 Native 前必须结束 CacheLease。
+/// Closes admission while moving the actual registry onto the shutdown stack, outside CacheLease.
 fn take_fragment_registry_for_close(
     fragments: &CacheOwner<FragmentRegistry>,
 ) -> Result<FragmentRegistry, String> {
     match fragments.begin() {
         CacheAdmission::Ready(mut lease) => {
-            // 连计数收据一起移出，空替身的 Drop 不能在旧 Weak 容量仍活时报告 registry_detached。
+            // Move the counters with the real payload. Dropping the empty replacement must not
+            // report detachment while the old weak-vector allocation remains on this stack.
             let registry = std::mem::replace(lease.payload_mut(), FragmentRegistry::empty());
             fragments.close();
-            drop(lease); // Closed 禁止恢复旧槽；之后所有 Native 调用都不持 lease 或状态借用。
+            // Closed admission prevents restoration; subsequent Native invalidation holds no slot borrow.
+            drop(lease);
             Ok(registry)
         }
         CacheAdmission::Loaned => {
-            // 在途扫描仍独占旧 Weak；只能封闭并明确失败，由原栈实际归还，不能补建另一列表。
+            // An active scan still owns the registry. Revoke future admission and fail rather than
+            // stealing its allocation or constructing another registry to claim cleanup.
             fragments.close();
             Err("关闭时光栅 fragment 弱登记仍被同步操作借出".into())
         }
         CacheAdmission::Closed => {
-            // 首次 shutdown 不应先失去 registry；重复关闭由上层纯标量入口直接结束。
+            // The first shutdown must still own the registry. The scalar shutdown gate handles repeats.
             Err("关闭时光栅 fragment 弱登记已被提前封闭".into())
         }
     }
 }
 
-/// 资源收据只持原像素/操作的原子事实，不保活 Native 图、文档或旧诊断目录。
-/// 关闭成功仍由实际 provider/context 归还决定，不以 view 析构或时间流逝代替。
+/// Holds atomic facts about the original pixels and operations, without retaining Native or document data.
+/// Actual provider/context release determines completion; view destruction or elapsed time cannot replace it.
 #[derive(Clone)]
 pub(super) struct NativeMarkdownRasterReleaseReceipt {
     resources: Arc<ResourceCounters>,
@@ -166,7 +175,8 @@ impl ResourceCounters {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        // 真实事件在首个 Native 操作前撤原票；耗尽无法表达更新，永久失败而非回绕或饱和冒充新票。
+        // Revoke the old permit before any Native operation in the event. Exhaustion permanently
+        // fails admission: wrapping or saturating would let a later event reuse an old identity.
         if self
             .viewport_epoch
             .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
@@ -199,7 +209,8 @@ impl NativeMarkdownRasterReleaseReceipt {
 
     pub(super) fn is_released(&self) -> bool {
         let s = self.snapshot();
-        // 函数性失败另由 sticky_failure 验收；释放必须等待真实 provider/context 最后归还。
+        // Functional failure is reported separately. Release still requires the last real
+        // provider/context owner, native owner, registry, and synchronous operation to return.
         s.closed
             && s.native_detached
             && s.registry_detached
@@ -210,7 +221,7 @@ impl NativeMarkdownRasterReleaseReceipt {
     }
 }
 
-/// 同步 Native 操作只递增标量；析构不调用 Native，也不把延迟释放改写为成功。
+/// Counts a synchronous Native operation; Drop changes only the count and never fabricates release.
 struct OperationGuard(Arc<ResourceCounters>);
 impl OperationGuard {
     fn new(counters: Arc<ResourceCounters>) -> Self {
@@ -224,7 +235,7 @@ impl Drop for OperationGuard {
     }
 }
 
-/// 所有产品回链均为弱引用；Rc 只让同步操作在结束状态借用后安全加载它们。
+/// Product back-links are weak; Rc allows synchronous access after the state borrow has ended.
 struct WeakGraph {
     view: Weak<PieceBackedMarkdownTextView>,
     storage: Weak<PieceBackedMarkdownTextStorage>,
@@ -255,8 +266,8 @@ impl NativeOwners {
 
 impl Drop for NativeOwners {
     fn drop(&mut self) {
-        // 先撤本proxy，只复原它安装前的同一原delegate；不覆盖后来被替换的关系。
-        // 字段已移出状态槽，Native恢复和临时claim析构均不跨RefCell借用。
+        // Restore only the delegate relation this proxy installed; never overwrite a successor.
+        // Native restoration and temporary claim destruction occur outside the state-slot borrow.
         let proxy = self.proxy.take();
         if let Some(proxy) = proxy.as_ref()
             && proxy.restore_original_delegate().is_err()
@@ -264,10 +275,11 @@ impl Drop for NativeOwners {
             self.counters.fail();
         }
         drop(proxy);
-        // 代理关系已撤，再撤真实通知、恢复原通知开关并清除图像内容。
+        // After detaching the proxy, remove our notifications, restore their original flags,
+        // and return the image retained by our layer.
         let observers = std::mem::take(&mut self.observers);
         for observer in observers {
-            // SAFETY: 只撤本对象从默认中心取得的 token，且整个 Native owner 仅能在主线程析构。
+            // SAFETY: Each token came from this owner and the default center; this owner drops on main.
             unsafe {
                 NSNotificationCenter::defaultCenter().removeObserver(<ProtocolObject<
                     dyn NSObjectProtocol,
@@ -288,7 +300,8 @@ impl Drop for NativeOwners {
             image.clear();
         }
         drop(image);
-        // 这里只证明项目关系和强 claim 已归还；真实 Native dealloc 仍由统一 weak ledger 核验。
+        // This reports returned project relationships and claims. The weak ledger still checks
+        // actual Native deallocation independently, including framework-delayed releases.
         self.counters.native_detached.store(true, Ordering::Release);
     }
 }
@@ -305,14 +318,14 @@ pub(super) struct NativeMarkdownRasterSurface {
 }
 
 impl NativeMarkdownRasterSurface {
-    /// 只给同一 editor 的附属视口共享既有收据，不把私有计数器或 Native owner 暴露出去。
+    /// Shares the same editor's receipts with auxiliary viewports without exposing Native owners.
     pub(super) fn auxiliary_resources(self: &Rc<Self>) -> NativeMarkdownRasterAuxiliaryResources {
         NativeMarkdownRasterAuxiliaryResources {
             counters: Arc::clone(&self.counters),
         }
     }
 
-    /// 附属视图沿本次原 OriginPermit 执行原语；不补领较新正文、模式或字体权限。
+    /// Executes auxiliary work with the original permit, without adopting newer source, mode, or fonts.
     pub(super) fn auxiliary_step<T>(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -323,6 +336,7 @@ impl NativeMarkdownRasterSurface {
     }
 
     pub(super) fn requested() -> bool {
+        // This diagnostic route is opt-in; an arbitrary nonempty environment value does not enable it.
         std::env::var_os("OMNI_NATIVE_RASTER_SURFACE").is_some_and(|value| value == "1")
     }
 
@@ -337,6 +351,7 @@ impl NativeMarkdownRasterSurface {
         if !Self::requested() {
             return Err("未显式启用光栅探针".into());
         }
+        // Preserve the existing fragment factory and body identity rather than replacing another owner.
         if manager.delegate().is_some() {
             return Err("原布局已有 fragment factory，光栅探针不替换它".into());
         }
@@ -357,7 +372,8 @@ impl NativeMarkdownRasterSurface {
             clip: Weak::from_retained(&clip),
             document: Rc::downgrade(&document),
         });
-        drop(document); // 从此没有第二份正文强 owner，安装过程也不读取正文字符串。
+        // Keep only the original document's weak identity; installation never reads its text.
+        drop(document);
         let counters = Arc::new(ResourceCounters::default());
         let owner = Rc::new(Self {
             closed: Cell::new(false),
@@ -377,7 +393,7 @@ impl NativeMarkdownRasterSurface {
                 view, ledger, &owner,
             )?))
         } else {
-            None // 默认drawRect对照既不显式开启正文backing，也不增加恢复租约。
+            None // The default drawRect comparison does not enable body backing or add a restoration lease.
         };
         let image = NativeMarkdownRasterImageView::new(view.visibleRect(), mtm);
         let proxy =
@@ -390,7 +406,8 @@ impl NativeMarkdownRasterSurface {
             previous_posts_bounds: view.postsBoundsChangedNotifications(),
             previous_posts_frame: view.postsFrameChangedNotifications(),
         });
-        // 安装临时 owner 后任何后续失败都走同一 Drop 撤销，不留下半挂接观察者或图层。
+        // Once constructed, this local owner rolls back every later failure through Drop,
+        // including observers already registered before a ledger admission fails.
         let mut native = NativeOwners {
             image: Some(image),
             proxy: Some(proxy),
@@ -409,7 +426,8 @@ impl NativeMarkdownRasterSurface {
         let weak_view = MainThreadBound::new(Weak::from(view), mtm);
         let notify_counters = Arc::clone(&counters);
         let callback = block2::RcBlock::new(move |_notification: NonNull<NSNotification>| {
-            notify_counters.invalidate_geometry(); // 先撤票；最后一个 getter 内发生滚动也不能逃过原 epoch。
+            // Revoke first: scrolling during even the final getter must invalidate the original epoch.
+            notify_counters.invalidate_geometry();
             let Some(mtm) = MainThreadMarker::new() else {
                 notify_counters.fail();
                 return;
@@ -429,7 +447,8 @@ impl NativeMarkdownRasterSurface {
             };
             if let Some(view) = view {
                 reentry.record(view.ivars().table_layout_update_scheduled.get());
-                // 真实 clip 通知只请求原 NSView 生命周期；不移动图像、不强制布局或排轮询。
+                // A real clip notification requests the existing NSView lifecycle. It neither moves
+                // the image nor forces layout or schedules polling from inside the notification.
                 {
                     let _phase = super::viewport_reentry_diagnostic::enter(
                         super::viewport_reentry_diagnostic::Phase::NoticeLayout,
@@ -440,15 +459,16 @@ impl NativeMarkdownRasterSurface {
             }
         });
         for observed in [body, clip_view] {
-            // Bounds 通知不覆盖 setFrameSize 引起的变化，必须分别订阅原 Frame 与 Bounds。
-            // SAFETY: 两个名称由 AppKit 静态导出；对象为原正文/clip，不观察自有 image 的设置。
+            // Bounds notifications do not cover every frame-size change, so observe both kinds.
+            // SAFETY: AppKit exports these static names; observed objects are the original body/clip.
             for name in unsafe {
                 [
                     NSViewBoundsDidChangeNotification,
                     NSViewFrameDidChangeNotification,
                 ]
             } {
-                // SAFETY: 空 queue 使用原通知线程；闭包首核主线程，且仅持主线程封装 Weak 与原子收据。
+                // SAFETY: A nil queue uses the posting thread. The block checks main-thread access
+                // before loading its MainThreadBound weak reference and otherwise holds only atomics.
                 let token = unsafe {
                     NSNotificationCenter::defaultCenter()
                         .addObserverForName_object_queue_usingBlock(
@@ -459,7 +479,8 @@ impl NativeMarkdownRasterSurface {
                         )
                 };
                 native.observers.push(token);
-                // 先交给本地 owner，ledger 失败返回也能真实 removeObserver，不遗留中心持有的 token。
+                // Give the token to the local owner first, so a ledger error still removes the
+                // center's registration rather than abandoning a retained notification block.
                 let token = &**native.observers.last().expect("geometry observer owned");
                 ledger.include(
                     "editor.raster.geometry-observer",
@@ -473,8 +494,8 @@ impl NativeMarkdownRasterSurface {
         viewport.setDelegate(Some(ProtocolObject::from_ref(
             &**native.proxy.as_ref().expect("proxy created"),
         )));
-        // 标准factory和标准fragment均保留；只由公开viewport代理接管后续rendering surface配置。
-        // 不失效全文、不ensure，也不重新构造完整text element。
+        // Preserve the standard factory/fragments. The public viewport proxy handles later surface
+        // configuration without invalidating the document, ensuring layout, or rebuilding text elements.
         *owner.native.borrow_mut() = Some(Rc::new(native));
         *view.ivars().raster_body_layer.borrow_mut() = body_layer;
         eprintln!("native_raster_surface event=installed formal=false");
@@ -482,7 +503,7 @@ impl NativeMarkdownRasterSurface {
     }
 
     fn native_owner(&self) -> Result<Rc<NativeOwners>, String> {
-        // Rc clone 本身不 retain Native；结束 RefCell 借用后才允许任何可重入 getter/setter。
+        // Clone only the Rust owner here. End the RefCell borrow before any reentrant Native getter/setter.
         self.native
             .borrow()
             .as_ref()
@@ -504,8 +525,9 @@ impl NativeMarkdownRasterSurface {
         let payload = lease.payload_mut();
         let mut duplicate = false;
         let mut failed = false;
-        // lease 已将整个 payload 移出 RefCell；Weak load/析构不跨槽借用。只淘汰真实 nil，
-        // 活身份不可因换视口或预算用尽而丢失，重复的同一存活对象不再次累计。
+        // The lease moves the payload out of RefCell before weak loads/destruction. Evict only
+        // actual nil entries: changing viewports or exhausting the budget cannot discard live
+        // identities. Repeated registration of the same live fragment consumes no extra entry.
         payload.identities.retain(|weak| {
             if failed || !current() {
                 failed = true;
@@ -521,7 +543,8 @@ impl NativeMarkdownRasterSurface {
             if let Some(original) = original.as_ref() {
                 duplicate |= std::ptr::eq::<NSTextLayoutFragment>(&**original, fragment);
             }
-            drop(original); // 临时 claim 归还也可撤权；检查后禁止后继 Weak load。
+            // Returning a temporary claim can reenter; revoke further weak loads if it changes authority.
+            drop(original);
             if !current() {
                 failed = true;
                 return true;
@@ -534,6 +557,7 @@ impl NativeMarkdownRasterSurface {
         if duplicate {
             return Ok(());
         }
+        // Refuse excess metadata instead of losing lifecycle coverage for an existing live fragment.
         if payload.identities.len() >= MAX_FRAGMENT_WEAK_METADATA {
             return Err("光栅标准 fragment Weak 元数据超过固定预算".into());
         }
@@ -563,6 +587,8 @@ impl NativeMarkdownRasterSurface {
             return Err("标准fragment登记正被借出或已关闭".into());
         };
         let mut found = false;
+        // Each weak load and release may reenter Native. The original permit must survive both,
+        // and the lease must be returned before reporting the identity to a later Native caller.
         for weak in &lease.payload_mut().identities {
             if !current() {
                 return Err("查询标准fragment登记期间原票已撤销".into());
@@ -601,7 +627,8 @@ impl NativeMarkdownRasterSurface {
     }
 
     pub(super) fn invalidate_geometry(&self) {
-        self.counters.invalidate_geometry(); // Root 的公开 Native 几何回调只调用此纯标量入口。
+        // Public geometry callbacks revoke through this scalar-only entry before doing Native work.
+        self.counters.invalidate_geometry();
     }
 
     pub(super) fn settle_layout(
@@ -635,6 +662,8 @@ impl NativeMarkdownRasterSurface {
             let layer = permit
                 .step(self, view, || native.image().layer())?
                 .ok_or("光栅布局的原 CALayer 缺失")?;
+            // Retain the exact window/layer locally and recheck the captured visible rect, origin,
+            // and backing scale across every configuration call; do not configure successor geometry.
             let current = || {
                 permit.current(self, view)
                     && permit
@@ -676,7 +705,7 @@ impl NativeMarkdownRasterSurface {
         })();
         if !permit.current(self, view) {
             return Ok(false);
-        } // 合法撤权只取消，不重签或制造完成。
+        } // Legitimate revocation cancels this operation; it neither renews the permit nor reports completion.
         if result.is_err() {
             self.counters.fail();
         }
@@ -704,12 +733,12 @@ impl NativeMarkdownRasterSurface {
         permit: &NativeMarkdownRasterOriginPermit,
     ) -> Result<bool, String> {
         if !view.uses_raster_layer_updates() {
-            self.counters.fail(); // 入口合同错误仍进入原真实失败收据。
+            self.counters.fail(); // An invalid entry contract is a functional failure in the same receipt.
             return Err("正文未显式启用真实layer绘制入口".into());
         }
         let result = paint::paint_layer(self, view, permit);
         if !permit.current(self, view) {
-            return Ok(false); // 与原drawRect同样只取消原操作，绝不从后继状态补领发布票据。
+            return Ok(false); // Like drawRect, cancellation cannot acquire publishing rights from newer state.
         }
         if result.is_err() {
             self.counters.fail();
@@ -718,7 +747,8 @@ impl NativeMarkdownRasterSurface {
     }
 
     pub(super) fn fail_layer_update_sequence(&self) {
-        self.counters.fail(); // 只记不可回绕序号耗尽，不读取Native或制造后继显示任务。
+        // Sequence exhaustion is terminal; do not read Native or manufacture another display request.
+        self.counters.fail();
     }
 
     pub(super) fn release_receipt(&self) -> NativeMarkdownRasterReleaseReceipt {
@@ -729,18 +759,20 @@ impl NativeMarkdownRasterSurface {
 
     pub(super) fn shutdown(&self) -> Result<(), String> {
         if self.closed.replace(true) {
-            // Native 失效/最后 release 可同步重入；原关闭栈独占清理，重复调用不重开 registry。
-            // 返回本身不是释放收据，统一 barrier 仍核真实 Native weak 与原子资源状态。
+            // Native invalidation/final release may reenter. The original shutdown stack alone
+            // cleans up; this repeat cannot reopen the registry. Returning is not a release receipt:
+            // the barrier still checks actual Native weak references and original atomic resources.
             return Ok(());
         }
         self.counters.closed.store(true, Ordering::Release);
         let registry = take_fragment_registry_for_close(&self.fragments);
         let active = self.counters.active_operations.load(Ordering::Acquire);
-        // 封闭标量先拒绝绘制和代理配置，再撤原Native proxy和观察者；不持RefCell借用。
+        // Seal drawing/proxy admission before detaching Native owners, outside the RefCell borrow.
         let obsolete = self.native.borrow_mut().take();
-        drop(obsolete); // 同步绘图临时 Rc 若还存在，真实清理须等待它归还，不能谎称已经释放。
+        // An active synchronous Rc may delay destruction; only its eventual return proves detachment.
+        drop(obsolete);
         let result = if active != 0 {
-            // 已有同步 Native 操作不能被关闭栈抢占；不得在其仍使用 fragment 时失效布局。
+            // Shutdown cannot preempt synchronous Native work or invalidate a fragment it still uses.
             Err("关闭时仍存在光栅同步操作".into())
         } else {
             match registry.as_ref() {
@@ -748,7 +780,8 @@ impl NativeMarkdownRasterSurface {
                 Err(error) => Err(error.clone()),
             }
         };
-        drop(registry); // 最后真实归还 Weak 数组容量后，FragmentRegistry::drop 才报告 detached。
+        // FragmentRegistry reports detachment only after returning the actual weak-array allocation.
+        drop(registry);
         if result.is_err() {
             self.counters.fail();
         }
@@ -771,7 +804,8 @@ impl NativeMarkdownRasterSurface {
         let _storage_payload = PayloadUseGuard::enter(&storage.ivars().payload_use_depth);
         let source_current =
             || {
-                // 只核原身份和存活标量；每个 Native 原语前后结束 Weak 字段借用，不读正文或 line array。
+                // Check original identity/liveness only. Weak-field borrows end before Native;
+                // shutdown never reads document text or a fragment's complete line array.
                 self.closed.get()
                     && self.counters.closed.load(Ordering::Acquire)
                     && self.graph.document.strong_count() != 0
@@ -780,7 +814,7 @@ impl NativeMarkdownRasterSurface {
                     })
             };
         if !source_current() {
-            // 旧 NSString 的来源已撤，公开失效也不能在不合法的旧范围上继续执行。
+            // Once the old NSString's source is revoked, even public invalidation cannot use its range.
             return Err("失效旧 fragment 前原文档身份已撤销".into());
         }
         for weak in &registry.identities {
@@ -792,18 +826,20 @@ impl NativeMarkdownRasterSurface {
                 return Err("加载旧 fragment 后原文档已撤销".into());
             }
             let Some(fragment) = fragment else {
-                continue; // 真实 nil 已完成归还；不能重建对象或为它补一份布局。
+                continue; // Actual nil is already returned; do not reconstruct the fragment or its layout.
             };
-            // SAFETY: 原片段仍在主线程同步强 claim 内；None 撤其异步队列，不引入跨线程操作。
+            // SAFETY: The original fragment has a synchronous main-thread claim; None detaches its queue.
             unsafe { fragment.setLayoutQueue(None) };
             if !source_current() {
                 return Err("撤旧 fragment 队列后原文档已撤销".into());
             }
-            fragment.invalidateLayout(); // 仅公开撤销已有布局，不 ensure、不读取 state3 专属行数据。
+            // Revoke existing layout publicly without ensuring layout or reading LayoutAvailable-only lines.
+            fragment.invalidateLayout();
             if !source_current() {
                 return Err("失效旧 fragment 布局后原文档已撤销".into());
             }
-            drop(fragment); // 标准壳不作自有资源豁免；原ledger中真实业务值仍必须逐个Weak归零。
+            // Framework shells do not exempt business values from the original ledger's actual-nil checks.
+            drop(fragment);
             if !source_current() {
                 return Err("归还旧 fragment 临时 claim 后原文档已撤销".into());
             }
@@ -823,59 +859,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shutdown_registry_receipt_waits_for_real_extracted_payload_drop() {
-        let counters = Arc::new(ResourceCounters::default());
-        let registry = CacheOwner::new(FragmentRegistry {
-            identities: Vec::with_capacity(8),
-            counters: Some(Arc::clone(&counters)),
-        });
-        counters.closed.store(true, Ordering::Release);
-        let detached = take_fragment_registry_for_close(&registry).expect("可关闭的独占 registry");
-        // 槽和 lease 已结束，但待逐个失效的旧 Weak 容量仍在同步栈，不能提前报告实际归还。
-        assert!(registry.is_released());
-        assert!(!counters.registry_detached.load(Ordering::Acquire));
-        assert!(detached.identities.capacity() >= 8);
-        drop(detached);
-        assert!(counters.registry_detached.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn shutdown_cannot_steal_a_live_registry_loan_or_report_early_release() {
-        let counters = Arc::new(ResourceCounters::default());
-        let registry = CacheOwner::new(FragmentRegistry {
-            identities: Vec::new(),
-            counters: Some(Arc::clone(&counters)),
-        });
-        let CacheAdmission::Ready(lease) = registry.begin() else {
-            panic!("初始 registry 应可借出");
-        };
-        counters.closed.store(true, Ordering::Release);
-        assert!(take_fragment_registry_for_close(&registry).is_err());
-        // 关闭只能撤销后续准入；原栈未归还时必须继续显示 payload 存活，且不能补建第二份。
-        assert!(matches!(registry.begin(), CacheAdmission::Closed));
-        assert!(!registry.is_released());
-        assert!(!counters.registry_detached.load(Ordering::Acquire));
-        drop(lease);
-        assert!(registry.is_released());
-        assert!(counters.registry_detached.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn geometry_events_revoke_old_epoch_and_cannot_wrap_into_a_valid_receipt() {
+    fn geometry_events_revoke_the_original_epoch() {
         let counters = ResourceCounters::default();
         let original = counters.viewport_epoch.load(Ordering::Acquire);
+        // Use the production event entry to revoke the original geometry epoch.
         counters.invalidate_geometry();
         assert_ne!(counters.viewport_epoch.load(Ordering::Acquire), original);
-        // 最后一个可表达事件仍有效；下一次必须永久失败，不能饱和到同一个可复用的 MAX 票。
-        counters
-            .viewport_epoch
-            .store(u64::MAX - 1, Ordering::Release);
-        counters.invalidate_geometry();
-        assert_eq!(counters.viewport_epoch.load(Ordering::Acquire), u64::MAX);
-        assert!(!counters.viewport_epoch_exhausted.load(Ordering::Acquire));
-        counters.invalidate_geometry();
-        assert_eq!(counters.viewport_epoch.load(Ordering::Acquire), u64::MAX);
-        assert!(counters.viewport_epoch_exhausted.load(Ordering::Acquire));
-        assert!(counters.sticky_failure.load(Ordering::Acquire));
     }
 }

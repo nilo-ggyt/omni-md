@@ -1,7 +1,10 @@
-//! 原实际搜索、长选择、替换与Undo；查询只改变原输入栏值，正文期望来自固定fixture。
+//! Exercise actual search, long selection, replacement, and Undo. Change only the
+//! original query field; expected document contents come from the fixed fixture.
 
 use super::*;
 
+/// Retain the original asynchronous reveal request as a caller would. Immediate
+/// Complete cannot satisfy a scenario explicitly requiring remote Source preparation.
 pub(super) fn pending(
     rig: &mut Rig,
     action: MarkdownFindAction,
@@ -19,6 +22,8 @@ pub(super) fn pending(
     Ok(request)
 }
 
+/// Observe a real frame before the action, then verify that the original request,
+/// complete selection, current Scene Input, and actual target geometry all agree.
 pub(super) fn visible(
     rig: &mut Rig,
     stage: &str,
@@ -28,7 +33,8 @@ pub(super) fn visible(
 ) -> Result<NativeMarkdownPagedBodyProgress, String> {
     let frame = observe(&rig.body)?;
     let request = pending(rig, action)?;
-    // 普通远端查找必须保持未读尾部；只有已走完真实 EOF 的导航样本才接受完成态。
+    // Ordinary remote Find must leave the tail unread. Only a navigation fixture
+    // that actually reached EOF can require complete-source progress.
     let progress = if source_complete {
         frame::wait_complete_frame(stage, &rig.body, frame)?
     } else {
@@ -58,6 +64,8 @@ pub(super) fn visible(
     Ok(progress)
 }
 
+/// Select the first fixed local match through production Find and verify feedback
+/// against both actual fixture matches, independently of viewport-highlight counts.
 pub(super) fn local_first(rig: &mut Rig) -> Result<(), String> {
     rig.bar.query.setStringValue(ns_string!("局部"));
     visible(
@@ -74,8 +82,8 @@ pub(super) fn local_first(rig: &mut Rig) -> Result<(), String> {
 }
 
 pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
-    navigation::lazy_page(rig)?; // 原四MiB首屏未到EOF时验证真实翻页，随后保留所有远端Find与事务门。
-    selection::run(rig)?; // 同一真实 Body 的多选图像完成后恢复单选，再沿原完整事务序列。
+    navigation::lazy_page(rig)?; // Verify actual paging before the 4MiB frontier reaches EOF; retain later remote/edit checks.
+    selection::run(rig)?; // Complete actual multiple-selection pixels and restore single selection before the full transaction sequence.
     let initial = rig
         .view
         .capture_ready_scene_key()
@@ -95,7 +103,7 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
     rig.bar
         .query
         .setStringValue(&NSString::from_str(&long_query));
-    drop(long_query); // 只有当前Find字段保留显式查询；不将查询副本藏进Body/Source历史。
+    drop(long_query); // Only the actual Find field retains this explicit query; no copy enters Body/Source history.
     let progress = visible(
         rig,
         "long_match_first_scalar",
@@ -103,6 +111,8 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
         NSRange::new(fixture::FIRST, fixture::LONG),
         false,
     )?;
+    // Selecting the entire 9,000-unit match must reveal its first scalar without
+    // forcing the match's offscreen end into the frontier or shaper.
     if progress.frontier_source_bytes >= fixture::LONG_END_BYTES
         || progress.shaped_input_bytes >= fixture::LONG_END_BYTES
     {
@@ -134,7 +144,8 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
     ] {
         rig.bar.query.setStringValue(ns_string!("目标"));
         visible(rig, stage, action, NSRange::new(start, 2), false)?;
-        // 同一四MiB mmap Source的两处预声明目标；远端、反向与末尾回绕都必须带真实次序。
+        // Both targets are independently fixed in the same 4MiB mmap Source;
+        // remote, backward, and wrapping navigation must report actual ordering.
         if !rig.bar.probe_numbered_feedback(ordinal, 2) {
             return Err(format!("{stage}: 原导航次序或全文总数反馈错误"));
         }
@@ -146,6 +157,8 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
             return Err("纯Find选择/Reveal错误地捕获第二Source".into());
         }
     }
+    // An absent query must preserve selection and producer identity while
+    // publishing the actual no-match result, rather than starting another Source.
     let before = rig.view.input_state().map_err(|cause| cause.to_string())?;
     let before_serial = rig
         .body
@@ -176,7 +189,8 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 独立事务控制仍用相同4MiB原Doc和真实Body；不替代前面的远端/9000选择门。
+/// The independent transaction control still uses the actual Body and same 4MiB
+/// original document. It does not replace remote or 9,000-unit selection acceptance.
 pub(super) fn transactions(rig: &mut Rig) -> Result<(), String> {
     let initial = rig
         .view
@@ -192,7 +206,7 @@ pub(super) fn transactions(rig: &mut Rig) -> Result<(), String> {
         .current_revision()
         .map_err(|cause| cause.to_string())?;
     rig.bar.replacement.setStringValue(ns_string!("替换文"));
-    navigation::pending_scroll_before_edit(rig)?; // 两条尚未消费的纯滚动必须由随后真实g+1编辑撤销。
+    navigation::pending_scroll_before_edit(rig)?; // The actual generation-plus-one edit must revoke both unconsumed scrolls.
     visible(
         rig,
         "replace_next",
@@ -212,6 +226,8 @@ pub(super) fn transactions(rig: &mut Rig) -> Result<(), String> {
     {
         return Err("真实ReplaceNext没有仅提交一次并按原spool位移下一个匹配".into());
     }
+    // Undo through the actual Native command, then verify original revision,
+    // directed selection, redo availability, and independent fixed source bytes.
     let undo = observe(&rig.body)?;
     rig.view
         .command(sel!(undo:))

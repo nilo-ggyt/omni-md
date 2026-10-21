@@ -1,8 +1,8 @@
-//! Find只消费已Ready的同票首位置；已选中和真正进入可见区是两个独立事实。
+//! Find consumes the first position under the same Ready authority; selection and actual viewport visibility are separate facts.
 
 use super::*;
 
-/// 只能由实际View认证构造；弱Key不保活scene、Source、文档或原生视图。
+/// Only the actual View constructs this certified proof; weak Key retains no Scene, Source, document, or Native View.
 pub struct NativeMarkdownPagedFindVisibleProof {
     key: NativeMarkdownPagedSceneKey,
     range: NSRange,
@@ -24,10 +24,10 @@ impl NativeMarkdownPagedFindVisibleProof {
 }
 
 impl NativeMarkdownPagedTextView {
-    /// 只取现成Ready scene的原key；不布局、不滚动，也不为旧请求挑选一个后继nonce。
+    /// Capture the existing Ready Scene key without layout, scrolling, or choosing a successor nonce for an old request.
     ///
     /// # Errors
-    /// 尚无Ready、原Source或输入/几何失权时直接返回对应错误。
+    /// Return the actual missing-Ready, original Source, or Input/geometry revocation error.
     pub fn capture_ready_scene_key(&self) -> Result<NativeMarkdownPagedSceneKey> {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         let scene = self.scene()?;
@@ -37,8 +37,8 @@ impl NativeMarkdownPagedTextView {
         Ok(scene.key.clone())
     }
 
-    /// 扫描visitor可持有Doc只读借用；这里严格不调用Native、delegate或可重入current。
-    /// None允许原Reveal有授权的离屏滚动，最终可见性仍必须用完整Key与私有proof确认。
+    /// The scan visitor may hold a document read borrow; call no Native, delegate, or reentrant current here.
+    /// None allows authorized offscreen Reveal; complete Key/private proof must still establish final visibility.
     #[must_use]
     pub fn find_input_is_current(
         &self,
@@ -62,17 +62,17 @@ impl NativeMarkdownPagedTextView {
         owns_input && input.state().is_ok_and(|actual| actual == *expected)
     }
 
-    /// 只返回当前纯几何代次，不读取frame/bounds或触发任何Native布局。
+    /// Return scalar geometry generation only, without frame/bounds reads or Native layout.
     #[must_use]
     pub fn find_geometry_epoch(&self) -> Option<u64> {
         (!self.ivars().closed.get() && !self.ivars().geometry_failed.get())
             .then(|| self.ivars().geometry_epoch.get())
     }
 
-    /// Core已经提交的Find操作沿原输入owner通知已有显示调度，不重签或重放文本事务。
+    /// A committed Core Find action notifies existing display scheduling through original Input without renewing/replaying text authority.
     ///
     /// # Errors
-    /// View关闭、owner/原状态不符或显示后果失权均保留CommittedEffect，不能解释为正文未修改。
+    /// Closure, mismatched original owner/state, and revoked display effects remain CommittedEffect, never a claim that text was unchanged.
     pub fn apply_find_commit(
         &self,
         input: &Rc<NativeMarkdownPagedInput>,
@@ -91,13 +91,13 @@ impl NativeMarkdownPagedTextView {
         self.finish_commit_ref(&origin, commit)
     }
 
-    /// 仅同一个实际Ready Key的首scalar或插入点进入真实clip，才产生Find可见证明。
+    /// Certify Find visibility only when the same actual Ready Key's first scalar/caret enters the real clip.
     ///
-    /// 本方法不排版、不发起Reveal、不滚动、不重试。离屏或尚无scene时保持Pending，
-    /// 原匹配后面的某一可见行不能替代原首位置；裁切只决定可见部分，不改用户源范围。
+    /// Perform no layout, Reveal, scroll, or retry. Remain Pending for offscreen/missing Scene;
+    /// a later visible match line cannot replace the first position. Clipping limits visibility without changing the user's source range.
     ///
     /// # Errors
-    /// 原票失效、范围无效或首位置尚未可见时拒绝，不把当前选择、非空缓存当作定位成功。
+    /// Reject revoked authority, invalid range, or hidden first position; current selection/nonempty cache is not successful positioning.
     pub fn verify_find_target_visible(
         &self,
         expected: &NativeMarkdownPagedSceneKey,
@@ -130,7 +130,7 @@ impl NativeMarkdownPagedTextView {
                     1
                 })
                 .ok_or(NativeMarkdownPagedTextViewError::InvalidRange)?
-        }; // 原目标只借一个真实UTF16单元；借用先结束，下面scene/Native方法才能安全重入。
+        }; // Read one actual UTF-16 unit only; return the borrow before subsequent Scene/Native methods can reenter.
         if !scene.current(self) {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
@@ -143,7 +143,7 @@ impl NativeMarkdownPagedTextView {
             .ok_or(NativeMarkdownPagedTextViewError::InvalidRange)?;
         if first.actual_range.location > range.location || actual_end < first_end {
             return Err(NativeMarkdownPagedTextViewError::Pending);
-        } // 不能用同一match内的后继可见行、表格后面的文字或虚拟EOF充当首glyph。
+        } // A later visible match line, text following a table, or virtual EOF cannot substitute for the first glyph.
         if !finite_rect(first.rect, false)
             || first.rect.size.height <= 0.0
             || !finite_endpoints(first.rect)
@@ -172,7 +172,7 @@ fn finite_endpoints(rect: NSRect) -> bool {
     (rect.origin.x + rect.size.width).is_finite() && (rect.origin.y + rect.size.height).is_finite()
 }
 
-/// 零宽caret仍是有效竖线；非空字形必须有正宽交集，边缘擦过不算真正可见。
+/// A zero-width caret is a valid vertical line; nonempty glyphs need positive-width intersection, not mere edge contact.
 fn visible_first_rect(first: NSRect, clip: NSRect) -> Option<NSRect> {
     if !finite_rect(clip, true) || !finite_endpoints(clip) {
         return None;
@@ -215,7 +215,7 @@ mod tests {
                 visible_first_rect(rect(x, 50.0, 0.0, 20.0), clip),
                 Some(rect(x, 50.0, 0.0, 20.0))
             );
-        } // 插入点允许贴住clip边界；没有宽度的caret不被误认成没有文本位置。
+        } // Carets may touch the clip boundary; zero width does not mean a missing text position.
         for x in [9.0, 111.0] {
             assert!(visible_first_rect(rect(x, 50.0, 0.0, 20.0), clip).is_none());
         }

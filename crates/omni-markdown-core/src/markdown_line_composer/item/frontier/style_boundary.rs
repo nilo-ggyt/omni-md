@@ -1,10 +1,13 @@
-//! 原RootLeaf相邻语义只开启一个右GCB试次；真Font变化才封闭左项，不消费右侧文字。
+//! Adjacent original RootLeaf semantics authorize one complete right-grapheme trial.
+//! Only a real font change closes the left item; right-side text stays unconsumed.
 
 use super::*;
 use crate::VerifiedMarkdownRootLeafStyleBoundary;
 use crate::markdown_document_buffer::MarkdownTableRequestError;
 
 pub(super) struct StyleBoundary {
+    // Retain the verified publication ticket, not caller-supplied adjacent ranges.
+    // A completed or declined trial is not retried under the same boundary owner.
     ticket: VerifiedMarkdownRootLeafStyleBoundary,
     probe: Option<PendingFontProbe>,
     declined: bool,
@@ -21,19 +24,24 @@ impl StyleBoundary {
 }
 
 fn source_error(error: MarkdownTableRequestError) -> MarkdownLineComposeError {
+    // Keep original Source failure typed; other publication-proof failures retain
+    // their own cause instead of becoming a font capability refusal.
     match error {
         MarkdownTableRequestError::Source(error) => MarkdownLineComposeError::Source(error),
         other => MarkdownLineComposeError::RootLeafBoundary(Box::new(other)),
     }
 }
 
-/// 只在完整左短项的逐GCB原Font审核确实到达末端后，才允许查看紧邻右语义。
-/// 巨项没有此入口；真实样式交界也不允许为了到右界而先读完巨段正文。
+/// Inspect the adjacent right semantic run only after the original per-grapheme
+/// font audit reached the complete short left item's end. A huge item cannot enter
+/// this path or read its complete body merely to reach a real style boundary.
 pub(super) fn begin(payload: &mut Payload) -> Result<bool> {
     let pending = payload.frontier.as_mut().expect("原前沿仍持唯一样式owner");
     let Some(boundary) = &mut pending.style_boundary else {
         return Ok(false);
     };
+    // Admission needs the original unconsumed, closed short item and no retained
+    // child/terminal trial. Do not combine independent font-transfer lifecycles.
     if boundary.declined
         || boundary.probe.is_some()
         || !pending.declined_font_head
@@ -45,6 +53,8 @@ pub(super) fn begin(payload: &mut Payload) -> Result<bool> {
     {
         return Ok(false);
     }
+    // Revalidate the actual publication against the same Source and accepted left
+    // style before deriving the right probe's start from that certified endpoint.
     boundary
         .ticket
         .require_source(&payload.source)
@@ -70,13 +80,15 @@ pub(in crate::markdown_line_composer::item) fn has_style_boundary_probe(payload:
         .is_some_and(|boundary| boundary.probe.is_some())
 }
 
-/// 原Next及两张端点票逐项收费；在拿齐之前，Native不能拿到半个代理项或半个组合字。
+/// Charge the original Next query and two endpoint proofs separately. Native font
+/// selection cannot receive half a surrogate pair or combining sequence.
 pub(super) fn prepare(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
     budget: MarkdownLineComposeBudget,
     step: MarkdownLineItemStep,
 ) -> Result<MarkdownLineItemStep> {
+    // Attribute only work actually performed by this continuation to the frontier.
     let before = step.metadata_units;
     let result = prepare_gcb(payload, authority, budget, step)?;
     payload.frontier_work.boundary_records = payload
@@ -101,6 +113,8 @@ fn prepare_gcb(
         .map_err(source_error)?;
     let probe = boundary.probe.as_mut().expect("只有已开启右GCB才推进");
     if probe.range.is_empty() {
+        // Establish one complete right grapheme inside both the verified semantic
+        // range and its original request, yielding on unresolved original metadata.
         if step.metadata_units == budget.metadata_units {
             return Ok(step);
         }
@@ -122,6 +136,8 @@ fn prepare_gcb(
         }
     }
     for (index, offset) in [probe.range.start, probe.range.end].into_iter().enumerate() {
+        // Reuse certified endpoints across quanta. Pending does not issue a partial
+        // request, and a non-grapheme semantic edge does not manufacture a proof.
         if probe.endpoints[index].is_some() {
             continue;
         }
@@ -141,6 +157,8 @@ fn prepare_gcb(
             _ => return Err(MarkdownLineComposeError::InconsistentCoverage),
         }
     }
+    // Bind exact original byte coordinates and paragraph facts to a fresh nonce.
+    // The right glyphs are not consumed here; they only witness a possible font edge.
     let request = MarkdownLineStyleRequest {
         nonce: Arc::new(()),
         source: authority.clone(),
@@ -172,8 +190,10 @@ fn prepare_gcb(
     Ok(step)
 }
 
-/// 接收真实右样式的完整GCB Font；不同样式但相同Font时严格退回原计划拒绝。
-/// 左项已经由原head试次证明完整同Font；右Font只作自然边界见证，不留第二glyph图。
+/// Accept a complete grapheme under the actual right style. A changed semantic
+/// style with the same payload returns to the original plan refusal. The head trial
+/// already proved the left item's font; the right payload only witnesses an edge,
+/// without retaining another glyph graph.
 pub(in crate::markdown_line_composer::item) fn provide_boundary_style(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
@@ -187,6 +207,8 @@ pub(in crate::markdown_line_composer::item) fn provide_boundary_style(
         .require_source(&payload.source)
         .map_err(source_error)?;
     let probe = boundary.probe.as_ref().expect("原右NeedStyle持完整GCB");
+    // The response must belong to this exact right-side trial/publication. If it
+    // names a registration, lease that actual payload before consuming the trial.
     if response.coverage != probe.range
         || response.style.presentation != boundary.ticket.right().styles
     {
@@ -204,6 +226,8 @@ pub(in crate::markdown_line_composer::item) fn provide_boundary_style(
     payload.request = None;
     payload.font_probe_scope = None;
     if changed {
+        // The real payload transition closes only the original left item. Its
+        // existing source/style/cancellation chain owns the pending reshape.
         payload.closed_fonts = Some(closed_item::FontRuns::style_boundary(
             authority.clone(),
             pending.original.clone(),
@@ -215,13 +239,16 @@ pub(in crate::markdown_line_composer::item) fn provide_boundary_style(
         ));
         payload.stage = Stage::ClosedFonts;
     } else {
-        payload.stage = Stage::Frontier; // Link颜色等语义变化不证明字形上下文可以在此截断。
+        // Link color or another semantic difference does not prove shaping context
+        // can be cut here when the actual selected font payload remains unchanged.
+        payload.stage = Stage::Frontier;
     }
     Ok(())
 }
 
 impl MarkdownLineItemCoordinator {
-    /// 仅当前唯一右NeedStyle能借原票；相同范围的旧nonce不能读取仍活的出版物续权。
+    /// Only the current right-side NeedStyle may borrow this original ticket. A
+    /// stale nonce at identical coordinates cannot renew publication authority.
     pub(in crate::markdown_line_composer) fn root_leaf_style_boundary_for(
         &self,
         request: &MarkdownLineStyleRequest,
@@ -235,6 +262,8 @@ impl MarkdownLineItemCoordinator {
             .request
             .as_ref()
             .ok_or(MarkdownLineComposeError::InvalidRequest)?;
+        // Check the one current request before exposing the borrowed publication;
+        // then recheck its original Source rather than recapturing current state.
         if !matches!(payload.stage, Stage::Style)
             || !Arc::ptr_eq(&current.nonce, &request.nonce)
             || request.source != self.authority

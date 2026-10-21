@@ -1,33 +1,43 @@
-//! 表格作为原正文流的真实块元素交接；只停在原 Style nonce，不创建第二 Unicode worker。
+//! Hand off tables as actual blocks in the original source flow, using the
+//! existing style nonce rather than another Unicode worker.
 use super::*;
 use crate::VerifiedMarkdownLayoutTableRow;
 use crate::markdown_layout_source::table_rows::{TablePlan, TablePlanWriter};
 
-/// 同源样式重排遇到已封存行首，先请求当前语义行票，再进入原表格目录流程。
-/// 这是原 Style 握手的结构作用域，不为 raw 表格补造 Script、UBA、字素或 Font 权限。
+/// At a sealed row start during same-source restyling, request the current
+/// semantic row ticket before resuming the original table directory. This is
+/// structural style scope, with no invented raw-text script/bidi/grapheme/font facts.
 pub(super) fn known_row_request(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
     step: &mut MarkdownLineItemStep,
 ) -> Result<bool> {
     let Some(tables) = payload.tables.as_ref() else {
+        // This source has no original table-plan owner to query.
         return Ok(false);
     };
     if payload.table_checked_at == Some(payload.cursor) {
+        // The same cursor's directory access was already charged; let its next
+        // original input phase proceed without repeating that metadata work.
         return Ok(false);
     }
     let (span, records) = tables.peek_published(&payload.source)?;
     payload.table_checked_at = Some(payload.cursor);
     step.records = records;
-    step.metadata_units = 1; // 空计划也实际访问了原出版槽，但没有 pread 时不能记一条记录。
+    // Even an empty plan examines its original publication slot, but no pread
+    // means no fictional record may be charged.
+    step.metadata_units = 1;
     let Some(span) = span else {
+        // Actual directory access ended this quantum without a published row.
         return Ok(true);
     };
     if span.start.utf16 < payload.cursor {
+        // A previously passed row cannot be replayed behind the canonical cursor.
         return Err(MarkdownLineComposeError::InconsistentCoverage);
     }
     if span.start.utf16 != payload.cursor {
-        // 文字游标尚未到下一行；此量子的目录访问已经收费，下个量子继续原正文准备。
+        // The text cursor has not reached that row. This directory access
+        // consumed its quantum; original body preparation resumes next step.
         return Ok(true);
     }
     let request = MarkdownLineStyleRequest {
@@ -46,7 +56,8 @@ pub(super) fn known_row_request(
 }
 
 impl MarkdownLineItemCoordinator {
-    /// 构造时分享空目录；逐视口发现行时原四个 Unicode owner 读取同一结构记录。
+    /// Share an initially empty directory at construction. As viewports discover
+    /// rows, original Unicode owners consume the same actual structural records.
     pub(in crate::markdown_line_composer) fn install_table_flow(
         &mut self,
         writer: TablePlanWriter,
@@ -57,6 +68,7 @@ impl MarkdownLineItemCoordinator {
             .as_mut()
             .ok_or(MarkdownLineComposeError::Poisoned)?;
         if !matches!(payload.stage, Stage::Bidi) || payload.cursor != 0 {
+            // A consumed source cannot retroactively acquire different table structure.
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
         let plan = writer.plan();
@@ -69,14 +81,16 @@ impl MarkdownLineItemCoordinator {
         Ok(())
     }
 
-    /// 样式重排保留原结构目录及语言 owner；新 writer 仍属于同一个 canonical Source。
+    /// Preserve the original structural directory and language owners during
+    /// restyling; the replacement glyph writer still belongs to this canonical Source.
     pub(in crate::markdown_line_composer) fn table_plan(&self) -> Option<TablePlan> {
         self.payload
             .as_ref()
             .and_then(|payload| payload.tables.as_ref().map(TablePlanWriter::plan))
     }
 
-    /// 只接当前尚未响应的原请求；旧 nonce、其他源和非物理行首不能变成块控制。
+    /// Accept only the current outstanding request. Old nonces, foreign sources,
+    /// and positions other than an actual physical row start cannot become table controls.
     pub(in crate::markdown_line_composer) fn begin_table_row(
         &mut self,
         request: &MarkdownLineStyleRequest,
@@ -103,16 +117,20 @@ impl MarkdownLineItemCoordinator {
             || payload.closed_fonts.is_some()
             || payload.frontier.is_some()
         {
+            // Row handoff cannot coexist with another active glyph/input/font
+            // owner or substitute coordinates for the actual original source ticket.
             return Err(MarkdownLineComposeError::SourceMismatch);
         }
         if let StyleScope::Table(span) = &pending.scope
             && *span != row.span()
         {
-            // 原目录只指示要重新索取哪一物理行；当前出版物必须交回完全相同的真实结构票。
+            // The original directory identifies which row needs reacquisition;
+            // the current semantic publication must return that exact structural span.
             return Err(MarkdownLineComposeError::SourceMismatch);
         }
-        // 这里只转交原 nonce；真实目录追加和后缀 flush 留给有预算的原 advance 量子。
-        // 请求尚未产生实际 ShapeJob；撤销它的 FontProbe scope 和扫描壳，不能撤销既有 glyph。
+        // Transfer only the original nonce now. Actual directory append/suffix
+        // flush belongs to later budgeted advance. This request created no shape
+        // job, so revoke only its probe/scan shell, not already committed glyphs.
         payload.font_probe_scope = None;
         payload.request = None;
         payload.scan = None;
@@ -122,7 +140,8 @@ impl MarkdownLineItemCoordinator {
         Ok(())
     }
 
-    /// 每次只推进一个原依赖，末 CR/LF 逐字节收费；表格内部不解析 SCX 或原正文 GCB。
+    /// Advance one original dependency per step, charging actual trailing CR/LF
+    /// bytes without parsing table interiors as body script or grapheme input.
     pub(in crate::markdown_line_composer) fn advance_table_row(
         &mut self,
         row: &VerifiedMarkdownLayoutTableRow,
@@ -136,6 +155,7 @@ impl MarkdownLineItemCoordinator {
         if !matches!(payload.stage, Stage::TableDirectory | Stage::TableRow)
             || !payload.source.permits(row.source_authority())
         {
+            // Only the same original row-source proof can drive this pending handoff.
             return Err(MarkdownLineComposeError::SourceMismatch);
         }
         let end = row.source_range().end;
@@ -149,6 +169,8 @@ impl MarkdownLineItemCoordinator {
             answer: MarkdownLineItemAnswer::Yielded,
         };
         if matches!(payload.stage, Stage::TableDirectory) {
+            // Finish real structural publication before letting another Unicode
+            // owner consume its announced span.
             let progress = payload
                 .tables
                 .as_mut()
@@ -160,10 +182,13 @@ impl MarkdownLineItemCoordinator {
                 payload.scripts.table_announced();
                 payload.stage = Stage::TableRow;
             }
-            // 本量子的记录访问或真实出版已经收费；不同时再推进另一个 Unicode owner。
+            // Directory access/publication already consumed this quantum; do
+            // not spend it again advancing another original Unicode owner.
             return Ok((result, false));
         }
         if !payload.scripts.table_passed(end) {
+            // Script consumes the original structural jump and any actual line
+            // suffix under its own byte/scalar/metadata allowance.
             let step = payload.scripts.step(
                 &self.authority,
                 MarkdownScriptBudget {
@@ -180,6 +205,8 @@ impl MarkdownLineItemCoordinator {
             return Ok((result, false));
         }
         if !payload.breaks.table_passed(&self.authority, end)? {
+            // Break indexes independently pass that same actual row span before
+            // table geometry can be published as complete composition.
             let step = payload.breaks.step(
                 &self.authority,
                 MarkdownLineBreakBudget {
@@ -196,7 +223,8 @@ impl MarkdownLineItemCoordinator {
         Ok((result, true))
     }
 
-    /// 真实 row writer 已提交 LineEnd 后才越过 canonical 范围；下一正文沿原 ItemStart 恢复。
+    /// Advance canonical coordinates only after the actual row writer committed
+    /// its LineEnd; resume subsequent body text through the original ItemStart path.
     pub(in crate::markdown_line_composer) fn finish_table_row(
         &mut self,
         row: &VerifiedMarkdownLayoutTableRow,
@@ -207,6 +235,7 @@ impl MarkdownLineItemCoordinator {
             .as_mut()
             .ok_or(MarkdownLineComposeError::Poisoned)?;
         if !matches!(payload.stage, Stage::TableRow) || payload.cursor != row.source_range().start {
+            // A row may finish only once at its original unconsumed starting position.
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
         payload.cursor = row.source_range().end;

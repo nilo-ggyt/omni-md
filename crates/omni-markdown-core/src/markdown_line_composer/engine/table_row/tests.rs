@@ -1,4 +1,6 @@
-//! 真实来源出版、原 Style nonce、原字体注册与原输出目录共同验证表格块交接。
+//! Actual Source publications, original Style nonces, live font registration, and
+//! output records verify table-block handoff. Finite geometry responses exercise
+//! the Core boundary; they do not establish native Grid rendering acceptance.
 use super::*;
 use crate::{
     MarkdownDocumentBuffer, MarkdownLayoutFont, MarkdownViewportSourceAuthority,
@@ -6,7 +8,8 @@ use crate::{
 };
 use std::sync::Arc;
 
-/// 只把同一个原 leaf request 的结构出版物交给生产 row factory，不手工制造 canonical 范围。
+/// Pass this same original leaf request's structural publication to the production
+/// row factory, without manufacturing canonical ranges or publication authority.
 fn header() -> (
     tempfile::NamedTempFile,
     MarkdownDocumentBuffer,
@@ -79,7 +82,8 @@ fn real_row_waits_for_grid_then_publishes_exact_block_geometry_and_only_two_visi
         }
     };
     let request = worker.begin_table_row(&style, row.clone()).unwrap();
-    // 未完成格布局只能保同 nonce 请求；原 canonical 游标与输出行数都不前移。
+    // Before a completed-geometry response, retain this original pending row.
+    // Its canonical cursor/output cannot advance merely because a request exists.
     for _ in 0..3 {
         assert!(matches!(
             worker
@@ -90,6 +94,8 @@ fn real_row_waits_for_grid_then_publishes_exact_block_geometry_and_only_two_visi
         ));
         assert!(worker.publish_ready_prefix().unwrap().is_none());
     }
+    // Supply finite geometry through the real response factory, then verify the
+    // exact same values only after actual item/LineEnd publication completes.
     worker
         .provide_table_row(
             request
@@ -198,7 +204,8 @@ fn real_table_between_text_and_blank_crlf_resumes_body_before_and_after_style_re
     let mut original_lines = Vec::new();
     for pass in 0..2 {
         if pass != 0 {
-            // 第一遍的 prefix 已在本轮末端归还；同 Source、原语言 owner 与原结构目录参与真实重排。
+            // The first prefix reader retired at that pass's end. Restyling shares
+            // the same actual Source, original language owners, and table directory.
             worker.reset_styles(catalog.clone()).unwrap();
         }
         let resources = worker.worker_resource_observer();
@@ -229,7 +236,9 @@ fn real_table_between_text_and_blank_crlf_resumes_body_before_and_after_style_re
                             .verified_table_layout_row_from_source(&document, row, authority)
                             .unwrap();
                         if pass != 0 {
-                            // 已知结构行只有原行握手权限；普通字体响应必须明确拒绝，不能补造脚本/级别。
+                            // A known structural row owns only its original row
+                            // handshake. An ordinary font response must fail rather
+                            // than manufacture Script/bidi-level authority.
                             assert!(matches!(
                                 request.clone().respond_registered(
                                     request.source_range(),
@@ -310,7 +319,8 @@ fn real_table_between_text_and_blank_crlf_resumes_body_before_and_after_style_re
         if pass == 0 {
             original_lines = lines;
         } else {
-            // 对比两次真实输出的来源覆盖、断行种类、字形和几何，不把静态快照或私态当验收。
+            // Compare the two actual outputs' Source coverage, line kinds, glyph
+            // counts, and geometry, not a private-state or constant snapshot.
             assert_eq!(lines, original_lines);
         }
         let mut output = worker.publish_ready_prefix().unwrap().unwrap();
@@ -338,7 +348,8 @@ fn real_table_between_text_and_blank_crlf_resumes_body_before_and_after_style_re
         }
         drop(worker);
         let retained = resources.snapshot().unwrap().table_directory.unwrap();
-        // 原 writer 已退出并归还唯一页；输出只持已 flush 的真实只读前缀 FD。
+        // The writer has retired and released its work page. Output retains only
+        // the actual flushed read-only prefix FD until that reader also drops.
         assert!(!retained.owner_released && retained.file_open);
         assert_eq!(retained.buffer_bytes, 0);
         drop(output);
@@ -351,13 +362,15 @@ fn real_table_between_text_and_blank_crlf_resumes_body_before_and_after_style_re
                 && !released.cleanup_failed
                 && !released.reader_failed
         );
-        break; // 原 worker 已真实释放，不能进入另一次布局。
+        break; // The actual worker retired; no further pass may use it.
     }
 }
 
 #[test]
 fn real_forward_publications_cross_structure_page_and_release_original_directory_fd() {
     use std::io::Write;
+    // Write enough real structural rows to cross a directory page, then continue
+    // the original request/worker forward rather than reconstruct another read graph.
     let mut file = tempfile::NamedTempFile::new().unwrap();
     file.write_all(b"| H | C |\r\n| --- | --- |\r\n").unwrap();
     for _ in 0..130 {
@@ -422,7 +435,8 @@ fn real_forward_publications_cross_structure_page_and_release_original_directory
                     .unwrap()
                     .contains(&position)
                 {
-                    // 真实后继行只续同一个原 SourceRequest/Global，不用复制旧出版物构造下一页权限。
+                    // Continue this same original SourceRequest/global owner for
+                    // later rows. Cloning an old publication cannot grant next-page access.
                     sources
                         .continue_forward(&document, &published, position..position + 1, authority)
                         .unwrap();
@@ -484,8 +498,9 @@ fn real_forward_publications_cross_structure_page_and_release_original_directory
     drop(worker);
     let retained = resources.snapshot().unwrap().table_directory.unwrap();
     assert!(!retained.owner_released && retained.file_open);
-    assert_eq!(retained.buffer_bytes, 0); // 跨页目录也只保原不可变文件，不保活 writer 的工作页。
-    // 内部位置由格显示源负责；输出读者活着时既拒绝 raw 内部 Unicode 权限，也保留原真实目录。
+    assert_eq!(retained.buffer_bytes, 0); // A cross-page reader retains no original writer work page.
+    // Cell display Sources own internal positions. This live output reader rejects
+    // raw table-interior Unicode authority while retaining its real directory FD.
     assert!(matches!(
         output.grapheme_ordinal(line.facts().source_utf16.start + 2),
         Err(MarkdownLineComposeError::TableRange)

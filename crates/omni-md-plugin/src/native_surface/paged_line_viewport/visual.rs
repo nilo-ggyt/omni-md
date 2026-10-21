@@ -1,4 +1,4 @@
-//! 现成L1/L2视觉part之间的一GCB导航；不建立第二UBA顺序或正文/字素数组。
+//! Navigate one grapheme through existing L1/L2 visual parts without a second UBA order or text/grapheme array.
 
 use super::*;
 use crate::native_surface::{
@@ -14,7 +14,7 @@ pub struct NativeMarkdownComposedVisualTarget {
 }
 
 impl NativeMarkdownComposedViewport {
-    /// 原头位置所属行的真实段base；与caret一样按soft-wrap侧和真实EOF选择原Line。
+    /// Read the head's actual paragraph base from the original Line chosen by soft-wrap side/actual EOF, as caret lookup does.
     pub fn paragraph_base_level_at(
         &self,
         utf16: usize,
@@ -32,7 +32,7 @@ impl NativeMarkdownComposedViewport {
         Ok(base)
     }
 
-    /// 真实EOF沿原last ordinal定位；其他位置严格消费soft-wrap侧而不夹到窗口边缘。
+    /// Actual EOF uses the original last ordinal; other positions follow wrap affinity without clamping to window edges.
     pub(super) fn caret_line_index(&self, utf16: usize, affinity: Affinity) -> Result<usize> {
         let length = self.utf16_len();
         if utf16 > length {
@@ -60,7 +60,7 @@ impl NativeMarkdownComposedViewport {
                 })
             {
                 return Err(NativeMarkdownComposedViewportError::Pending);
-            } // 真换行后尚无尾空行，不能用前一行替它签caret或导航位置。
+            } // Without the actual terminal empty line after a hard break, the preceding line cannot authorize its caret/navigation position.
             return Ok(index);
         }
         self.lines
@@ -78,7 +78,7 @@ impl NativeMarkdownComposedViewport {
             .ok_or(NativeMarkdownComposedViewportError::Pending)
     }
 
-    /// 显式侧必须覆盖原位置的相应逻辑字素；缺侧时使用实际最低level的规范主侧。
+    /// An explicit side must cover the position's actual logical grapheme; absent a side choose the canonical lowest actual level.
     pub(super) fn caret_part_index(
         &self,
         line: &Line,
@@ -86,7 +86,7 @@ impl NativeMarkdownComposedViewport {
         side: Option<NativeMarkdownBidiCaretSide>,
     ) -> Result<usize> {
         let mut selected: Option<usize> = None;
-        // part数已由原窗口预算限制；这里只读已发布元数据，不再读取File或正文。
+        // Window budgets bound part count; inspect published metadata only, without further file/text reads.
         for (index, part) in line.parts.iter().enumerate() {
             let facts = part.handle.facts();
             let range = &facts.source_utf16;

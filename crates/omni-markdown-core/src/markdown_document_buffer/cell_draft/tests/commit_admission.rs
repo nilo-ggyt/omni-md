@@ -647,10 +647,7 @@ fn source_failure_after_observer_finish_rolls_back_the_prepared_admission_publis
 fn long_sanitize_boundaries_save_and_history_preserve_exact_bytes() {
     let (directory, original) = document(SOURCE);
     drop(original);
-    let workspace = crate::MarkdownWorkspace::new(
-        directory.path().to_path_buf(),
-        directory.path().join("app-data"),
-    );
+    let workspace = crate::MarkdownWorkspace::new(directory.path().to_path_buf());
     let access = workspace.open_session().unwrap();
     // 保存必须由原vault规范路径打开；/var与/private别名不能替代同一关联的真实保存权限。
     let mut doc = access.open_document_buffer("cell-draft.md").unwrap();

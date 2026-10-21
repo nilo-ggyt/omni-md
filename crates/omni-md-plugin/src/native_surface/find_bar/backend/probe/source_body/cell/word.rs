@@ -1,28 +1,35 @@
-//! 同一Cell原生词组删除、局部历史和输入撤权；末尾恢复seed后继续原两MiB草稿验收。
+//! Exercise Native cell word deletion, local history, and input revocation. Restore
+//! the original seed afterward so the existing 2MiB draft workload remains intact.
 
 use super::*;
 use objc2::runtime::Sel;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
 
-/// 所有动作均由真实NSTextInputClient解释；不向Core传手工算出的删除范围。
+/// Let actual NSTextInputClient interpret each action instead of supplying Core
+/// with a deletion range calculated by the test.
 fn command(rig: &Rig, selector: Sel) {
-    // SAFETY: 固定Cocoa编辑selector及原活主线程client；失败仍由View原错误槽记录。
+    // SAFETY: Use a fixed Cocoa editing selector and the original live main-thread
+    // client; failures remain in the actual view's error channel.
     unsafe { client(rig).doCommandBySelector(selector) };
 }
 
-/// 有限新增样本只交原输入协议；不是重新打开短文档或物化现有Cell。
+/// Send bounded new sample text through the original input protocol, without
+/// reopening a shorter document or materializing the existing cell.
 fn insert(rig: &Rig, text: &str, range: NSRange) {
-    // SAFETY: 完整同步NSString和实际原Cell client；明确范围仍由原Input认证。
+    // SAFETY: The complete NSString and actual original cell client remain alive
+    // synchronously; original Input still authenticates explicit replacement ranges.
     unsafe { client(rig).insertText_replacementRange(&NSString::from_str(text), range) };
 }
 
-/// 每一步保留原三秒完整帧及原资源票，当前同一Cell Source的UTF8长度也须精确。
+/// Preserve the original three-second complete-frame gate and actual resource
+/// observations for each action on this same cell Source.
 fn finish(rig: &mut Rig, stage: &str, frame: Rc<frame::Frame>) -> Result<(), String> {
     frame::wait_complete_frame(stage, &rig.body, frame)?;
     rig.remember_receipt()
 }
 
-/// 短样本用固定32unit缓冲逐unit核验；canonical父文稿和邻格一直保持原值。
+/// Compare short samples unit for unit with fixed 32-unit scratch. Parent canonical
+/// text and neighboring cells must retain their original values throughout.
 fn check(rig: &Rig, expected: &str, selection: MarkdownTextSelection) -> Result<(), String> {
     let input = input(rig)?;
     let state = input.state().map_err(|cause| cause.to_string())?;
@@ -51,7 +58,8 @@ fn check(rig: &Rig, expected: &str, selection: MarkdownTextSelection) -> Result<
     unchanged(rig)
 }
 
-/// 相邻同向和反向命令都真实入队；只在原Cell逐笔提交后才可出现最终帧。
+/// Queue actual adjacent same/reverse-direction commands; the final frame must
+/// follow each original cell transaction, not a merged or reordered net edit.
 fn ordered_words(rig: &mut Rig) -> Result<(), String> {
     for (text, head, forward, first, first_head, final_text, final_head) in [
         ("one two three ", 14, false, "one two ", 8, "one ", 4),
@@ -134,12 +142,13 @@ fn ordered_words(rig: &mut Rig) -> Result<(), String> {
                 return Err("Cell连按的一次Undo/Redo没有只发布一步".into());
             }
             check(rig, content, selection)?;
-        } // 逐次恢复中间字符串和caret；父canonical/邻格及原资源门一直保持。
+        } // Verify each intermediate string/caret while preserving parent text, neighboring cells, and resource gates.
     }
     Ok(())
 }
 
-/// 两个Word之间的普通输入仍携NSNotFound；不能将它偷换成显式replacement取消负控。
+/// Ordinary typing between two word commands keeps NSNotFound. An explicit
+/// replacement would instead revoke the queue and would not test this ordering.
 fn ordered_typing(rig: &mut Rig) -> Result<(), String> {
     let setup = observe(&rig.body)?;
     select(rig, 0..4)?;
@@ -194,7 +203,7 @@ fn ordered_typing(rig: &mut Rig) -> Result<(), String> {
             return Err("Cell顺序输入的一次Undo/Redo跳过或重复了真实步骤".into());
         }
         check(rig, text, MarkdownTextSelection::caret(head))?;
-    } // 每个真实中间结果都检查原父文档与像素选择，不只比较三步的净差值。
+    } // Check actual intermediate parent state/selection pixels, not merely the three actions' final net change.
     let old = rig.view.input_state().map_err(|cause| cause.to_string())?;
     let restore = observe(&rig.body)?;
     command(rig, sel!(undo:));
@@ -211,7 +220,8 @@ fn ordered_typing(rig: &mut Rig) -> Result<(), String> {
     check(rig, "seed", original_selection)
 }
 
-/// 使用同一Cell可见GCB的真实本地框构造系统鼠标事件；旧Scene在事件交付前真实归还。
+/// Construct Native mouse events from actual visible cell grapheme geometry.
+/// Return the Scene before dispatching the event.
 fn pointer(
     rig: &Rig,
     source: usize,
@@ -250,7 +260,8 @@ fn pointer(
             NSEventModifierFlags::empty()
         };
         let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(kind, point, flags, 1.0, window.windowNumber(), None, 1, 2, 1.0).ok_or("无法构造原Cell鼠标事件")?;
-        // SAFETY: 原主线程view和完整同步事件；只允许三个既有公开NSResponder鼠标语义。
+        // SAFETY: The original main-thread view and complete event remain alive
+        // synchronously; only existing public responder mouse entries are admitted.
         unsafe {
             if kind == NSEventType::LeftMouseDown {
                 let _: () = objc2::msg_send![&**rig.view, mouseDown: &*event];
@@ -264,7 +275,8 @@ fn pointer(
     })
 }
 
-/// 原鼠标抬起仅结束同一手势，沿最后真实点交付；不为清指针槽重新申请已撤的Source/Scene。
+/// Mouse-up ends the same gesture at its last actual point. Clearing pointer state
+/// must not reacquire a Source/Scene already revoked by earlier input.
 fn pointer_up(rig: &Rig, point: NSPoint, shift: bool) -> Result<(), String> {
     autoreleasepool(|_| {
         let window = rig.view.window().ok_or("原Cell窗口已释放")?;
@@ -274,7 +286,8 @@ fn pointer_up(rig: &Rig, point: NSPoint, shift: bool) -> Result<(), String> {
             NSEventModifierFlags::empty()
         };
         let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(NSEventType::LeftMouseUp, point, flags, 1.001, window.windowNumber(), None, 2, 2, 0.0).ok_or("无法构造原Cell鼠标抬起事件")?;
-        // SAFETY: 原活主线程view及同一次手势的有限window点，公开mouseUp只同步清原指针槽。
+        // SAFETY: The original view lives on its main thread and the bounded point
+        // belongs to this same gesture; public mouseUp synchronously ends it.
         unsafe {
             let _: () = objc2::msg_send![&**rig.view, mouseUp: &*event];
         }
@@ -282,7 +295,8 @@ fn pointer_up(rig: &Rig, point: NSPoint, shift: bool) -> Result<(), String> {
     })
 }
 
-/// 局部选择只改真实Cell选区；中文/非BMP、双击及拖动不能污染父canonical或增加草稿历史。
+/// Local word selection changes only actual cell selection. Chinese/non-BMP hits,
+/// double-click, and drag must change neither parent text nor draft character history.
 fn selected_words(rig: &mut Rig) -> Result<(), String> {
     let text = "one two 中文😀! ";
     select(rig, 0..4)?;
@@ -343,7 +357,7 @@ fn selected_words(rig: &mut Rig) -> Result<(), String> {
         pointer_up(rig, point, false)?;
         finish(rig, stage, frame)?;
         check(rig, text, expected)?;
-    } // 右半emoji命中必须回到真实完整GCB，不能把UTF16低代理项用作Core查询位置。
+    } // The emoji's right half maps to its complete grapheme, never a low surrogate used as a Core query position.
 
     let down = observe(&rig.body)?;
     let mut point = pointer(rig, 1, 0.125, NSEventType::LeftMouseDown, false)?;
@@ -402,7 +416,7 @@ fn selected_words(rig: &mut Rig) -> Result<(), String> {
         point = pointer(rig, source, 0.125, NSEventType::LeftMouseDragged, false)?;
         finish(rig, stage, frame)?;
         check(rig, text, expected)?;
-    } // 同词小拖和回初点的活动端严格沿真实CM6.43.9 get输出，范围相同也核方向。
+    } // Same-word drags/return-to-origin follow actual CM6.43.9 results, checking direction even when ordered ranges match.
     pointer_up(rig, point, false)?;
 
     let down = observe(&rig.body)?;
@@ -467,7 +481,8 @@ fn selected_words(rig: &mut Rig) -> Result<(), String> {
             original_selection,
             "cell_word_selection_one_undo_setup",
         ),
-        // Cell原Typing memento固定输入确认时的caret，不把后来的纯选择作为输入的Redo终态。
+        // Original typing history fixes the commit-time caret; later pure
+        // selection cannot replace that input's redo endpoint.
         (
             sel!(redo:),
             text,
@@ -503,7 +518,8 @@ fn selected_words(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 原Cell同槽的选词、普通键入和删除必须消费各自真实前一步收据，不能从旧caret删除半个词。
+/// Cell word selection, typing, and deletion consume their actual predecessor
+/// receipts in order, rather than deleting part of a word from an old caret.
 fn ordered_selection_inputs(rig: &mut Rig) -> Result<(), String> {
     for typing in [false, true] {
         select(rig, 0..4)?;
@@ -600,7 +616,7 @@ fn ordered_selection_inputs(rig: &mut Rig) -> Result<(), String> {
                 return Err("Cell普通键入没有独立的一次Undo".into());
             }
             check(rig, "one two ", selected)?;
-        } // 撤销键入恢复原完整词组选区；查询自身不插入字符历史，父文稿仍由check核原值。
+        } // Undo typing restores the actual word selection; querying adds no character history and check preserves parent text.
         let old = rig
             .view
             .input_state()
@@ -623,7 +639,8 @@ fn ordered_selection_inputs(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 在同一实际帧事件中领取这一动作的错误，随后仍沿原Frame核完整票、三秒和原像素门。
+/// Consume this action's actual error at the same real frame event, retaining the
+/// original Frame's complete-key, three-second, and pixel requirements.
 struct WordMoveFrame {
     frame: Rc<frame::Frame>,
     view: Rc<Retained<NativeMarkdownPagedTextView>>,
@@ -633,12 +650,13 @@ struct WordMoveFrame {
 
 impl NativeMarkdownPagedBodyPaintObserver for WordMoveFrame {
     fn frame_published(&self, key: &NativeMarkdownPagedSceneKey, paints: usize) {
-        *self.error.borrow_mut() = self.view.take_failure(); // 真实错误只移交给本用例，不转成Pending或吞掉Source错误。
+        *self.error.borrow_mut() = self.view.take_failure(); // Transfer the actual error without converting it to Pending or suppressing Source failure.
         self.frame.frame_published(key, paints);
     }
 }
 
-/// 原Cell使用同一Body和草稿；移动无字符历史，Typing后新Source必须重新取得UBA事实。
+/// Reuse the original cell Body/draft. Word movement adds no character history;
+/// a Source created by later typing must obtain its own actual UBA facts.
 fn move_words(rig: &mut Rig) -> Result<(), String> {
     select(rig, 0..4)?;
     let original_selection = rig
@@ -718,7 +736,9 @@ fn move_words(rig: &mut Rig) -> Result<(), String> {
     finish(rig, "cell_word_move_restore_seed", restore)?;
     check(rig, "seed", original_selection)?;
 
-    // 同一真实队列核逻辑前后、RTL 屏幕左右、非空收拢及保锚扩选；后继 Typing 必须落在精确目标。
+    // Verify logical forward/backward, RTL screen-left/right, nonempty collapse,
+    // and anchored extension in the actual queue. Subsequent typing must consume
+    // the exact resulting selection, not just a plausible nearby caret.
     for (text, from, to, selector, moved, expected, final_head) in [
         (
             "one אבג ",
@@ -835,7 +855,7 @@ fn move_words(rig: &mut Rig) -> Result<(), String> {
                 "四向 Word 实际动作失败 selector={selector:?}: {cause}"
             ));
         }
-        drop((erased, observed)); // 本帧观察的 Native 强边在 Undo 或关闭前真实归还。
+        drop((erased, observed)); // Return this frame observer's actual Native claims before Undo or closure.
         if rig
             .view
             .input_state()
@@ -856,6 +876,8 @@ fn move_words(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
+/// Exercise actual endpoint no-ops, Unicode deletion, ordered input/history, and
+/// revocation, restoring seed before the subsequent independent large-draft workload.
 pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
     for (head, selector, stage) in [
         (0, sel!(deleteWordBackward:), "cell_word_bof_noop"),
@@ -870,7 +892,7 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
             return Err("Cell BOF/EOF词组空操作修改了原状态或历史".into());
         }
         check(rig, "seed", MarkdownTextSelection::caret(head))?;
-        command(rig, sel!(undo:)); // 初始空历史必须仍为空：实际Undo也不允许多出一次状态变化。
+        command(rig, sel!(undo:)); // Initially empty history must stay empty; actual Undo may introduce no state change.
         if rig.view.input_state().map_err(|cause| cause.to_string())? != before {
             return Err("Cell端点空删除产生了可撤销事务".into());
         }
@@ -906,7 +928,8 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
         insert(rig, text, unspecified());
         finish(rig, "cell_word_finite_input", setup)?;
         if selected {
-            // 已有非空原选择必须直接删除；两个Word方向都不得继续扩大或留下局部内容。
+            // An existing nonempty selection is deleted directly; neither word
+            // direction may expand it or leave an unmatched fragment behind.
             let selecting = observe(&rig.body)?;
             select(rig, 2..4)?;
             finish(rig, "cell_word_select_existing", selecting)?;

@@ -1,10 +1,12 @@
-//! 同一原词组动作只借当前真格或恢复一个真格；查询位置从不代替 Row、raw 或显示源权限。
+//! One original word action borrows the current actual cell or restores one cell; query coordinates
+//! never replace row/raw/display Source authority.
 
 use super::*;
 use omni_markdown_core::{MarkdownComposedLineAffinity, MarkdownWordGroupAnswer};
 
 impl Producer {
-    /// 接回当前唯一格查询。来源准备和词组各占一个回合，不在 Yielded 后偷做第二份读取。
+    /// Resume the unique cell query, giving Source preparation and word work separate turns without
+    /// another read after Yielded.
     pub(super) fn step_cell_word_group(
         &mut self,
         owner: &Owner,
@@ -21,13 +23,13 @@ impl Producer {
         let mut query = self.cell_word.take().expect("原词组仍持唯一格查询");
         let result = self.advance_cell_word_query(owner, &mut query);
         let work = query.take_work();
-        self.cell_word = Some(query); // Native布局回调前归还owner；失败也不能丢仍占原Request的准备。
+        self.cell_word = Some(query); // Restore query ownership before Native layout callbacks, preserving preparation occupying the original Request even on failure.
         self.record_grid_work(work)?;
         self.target_source_health()?;
         let answer = match result? {
             Some(answer) => answer,
             None => {
-                self.advance(owner, request)?; // 真实表头宽度/原其他Cell准备尚未交回，沿原布局槽推进。
+                self.advance(owner, request)?; // Actual header width or another original cell preparation still needs the existing layout slot to advance.
                 MarkdownWordGroupAnswer::Yielded
             }
         };
@@ -35,7 +37,8 @@ impl Producer {
         Ok(answer)
     }
 
-    /// None 仅表示本步尚未做来源工作，需要原Producer先结束真实字体/表头/其他格准备。
+    /// None means this turn did no Source work and the original Producer must first finish actual
+    /// font/header/other-cell preparation.
     fn advance_cell_word_query(
         &mut self,
         owner: &Owner,
@@ -74,8 +77,10 @@ impl Producer {
                 .as_ref()
                 .is_some_and(|restoring| restoring.grid.is_none())
         {
-            // 另一真实行或尚未取得Grid的恢复任务先归还原唯一Request，existing命中也不能绕过。
-            // 目标行自身必须放行：它可能正持本次要续的CellInline；同行其他列仍由Grid串行推进。
+            // Another actual row or restoration without a Grid must return the unique original Request
+            // first, even when an existing cell matches.
+            // Admit the target row itself because it may own this CellInline continuation; Grid still
+            // serializes its other columns.
             return Ok(None);
         }
         let existing = self
@@ -91,7 +96,7 @@ impl Producer {
         if let Some(grid) = existing {
             let result = grid.advance_word(owner, &self.source, query, semantics);
             let work = grid.take_work();
-            self.record_grid_work(work)?; // 成功或失败都接回这次真实来源/GCB费用。
+            self.record_grid_work(work)?; // Collect actual Source/grapheme work on both success and failure.
             return result;
         }
         if query.row.is_none() {
@@ -111,7 +116,7 @@ impl Producer {
                 }
                 query.row = Some(row);
             }
-            return Ok(Some(MarkdownWordGroupAnswer::Yielded)); // 真正根重放/发布亦独占本步原量子。
+            return Ok(Some(MarkdownWordGroupAnswer::Yielded)); // Actual root replay/publication also consumes this turn original quantum exclusively.
         }
         let row = query.row.as_ref().expect("原最新请求已交真实行");
         if let Some(widths) = self
@@ -127,7 +132,7 @@ impl Producer {
             return Ok(Some(MarkdownWordGroupAnswer::Yielded));
         }
         let Some(output) = self.output.as_ref() else {
-            return Ok(None); // 新canonical尚无该表宽度；继续原表头解算，不用平均宽或旧Source宽。
+            return Ok(None); // Without widths for the new canonical Source, continue original header solving instead of using average or old-Source widths.
         };
         if output.borrow().source_range().end <= query.target.row_start {
             return Ok(None);
@@ -157,13 +162,14 @@ impl Producer {
         match step.answer {
             MarkdownComposedLineLookupAnswer::Pending => {}
             MarkdownComposedLineLookupAnswer::PrefixNotCovered => {
-                query.lookup = None; // 实际prefix尚未到行；下回合再交原Producer，不能在本步另读第二份量子。
+                query.lookup = None; // The actual prefix has not reached this row; defer to the original Producer next turn without a second read quantum now.
             }
             MarkdownComposedLineLookupAnswer::Found(line) => {
                 if line.facts().source_utf16 != row.source_range() {
                     return Err(ViewError::Revoked.into());
                 }
-                // 与原旧行恢复相同，只读这条封存行的列目录；不读取正文或计算一个假top/height。
+                // As with old-row restoration, read this sealed line column directory only, without
+                // document text or invented top/height.
                 let mut widths = [0i64; 256];
                 let columns = output.borrow_mut().table_column_widths(
                     &self.source.authority(),
@@ -173,7 +179,8 @@ impl Producer {
                 if columns != row.columns() {
                     return Err(ViewError::Revoked.into());
                 }
-                // 原API实际读5条part、1条meta、3条directory、1条header和每7列1条width。
+                // The actual API reads five part, one metadata, three directory, one header, and one
+                // width record per seven columns.
                 let records = 10 + columns.div_ceil(7);
                 self.step_metadata = self
                     .step_metadata
@@ -186,7 +193,8 @@ impl Producer {
         Ok(Some(MarkdownWordGroupAnswer::Yielded))
     }
 
-    /// 取消继续原实际CellInline直到take归槽，随后才释放恢复Cell或开始已登记的当前队首。
+    /// Cancellation drains the actual original CellInline until its slot returns before releasing the
+    /// restored cell or starting the registered next head.
     pub(super) fn drain_cell_word(&mut self, owner: &Owner) -> Result<()> {
         let mut query = self.cell_word.take().expect("原格取消仍持实际owner");
         let result = query.drain(
@@ -200,7 +208,7 @@ impl Producer {
         match result {
             Ok(true) => {
                 let restart = query.restart.take();
-                drop(query); // 实际准备已交回，先释放旧Cell，再允许新begin借同一Request。
+                drop(query); // Actual preparation returned; drop the old cell before a new begin may borrow the same Request.
                 if let Some((action, head, cell)) = restart {
                     self.begin_word_group(action, head, cell)?;
                 }

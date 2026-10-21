@@ -1,4 +1,5 @@
-//! 单个worker内的真实分项协调；请求只携带弱源票和固定事实，不把文字或Native对象送入响应。
+//! Coordinate actual itemization inside one worker. Requests carry weak Source
+//! tickets and finite facts, never copied text or native objects in responses.
 
 use std::{ops::Range, sync::Arc};
 
@@ -122,7 +123,8 @@ pub enum MarkdownLineComposeError {
 }
 pub(super) type Result<T> = std::result::Result<T, MarkdownLineComposeError>;
 
-/// 非字形控制必须由后继真实段落/制表策略处理，不能作为缺字送入字体fallback。
+/// Nonglyph controls need actual paragraph/tab policy; they cannot be treated
+/// as missing glyphs and passed through font fallback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownLineInlineControlKind {
     Tab,
@@ -132,12 +134,16 @@ pub enum MarkdownLineInlineControlKind {
     LineSeparator,
     ParagraphSeparator,
     EmptyParagraph,
-    /// 原折叠隐区的整段控制；没有字形，端点仍属于原完整 Source。
+    /// A complete original hidden-range control has no glyphs; its endpoints
+    /// still belong to the same complete Source.
     FoldedSection,
-    /// 原结构行的独立块；内部正文只由真实格显示源布局。
+    /// An original structural-row block; only its actual cell display sources
+    /// own layout of the contained text.
     TableRow,
 }
 #[derive(Clone)]
+/// Return this original request nonce with its weak source authority; public
+/// range/kind facts cannot independently create an accepted response.
 pub struct MarkdownLineInlineControl {
     pub source_utf16: std::ops::Range<usize>,
     pub kind: MarkdownLineInlineControlKind,
@@ -145,7 +151,8 @@ pub struct MarkdownLineInlineControl {
     pub(super) nonce: Arc<()>,
 }
 
-/// 同一次组合的深层取消位；Clone只共享原位，不拥有正文、字体或调度线程。
+/// Share this composition's original deep-cancellation state. Cloning retains
+/// no text, font payload, or scheduling thread.
 #[derive(Clone, Default)]
 pub struct MarkdownLineComposeCancellation {
     bidi: MarkdownBidiCancellation,
@@ -154,27 +161,34 @@ pub struct MarkdownLineComposeCancellation {
     measure: crate::MarkdownSoftLineMeasureCancellation,
 }
 impl MarkdownLineComposeCancellation {
+    /// Create cancellation for the same bidi/script/shaping/measure pipeline.
     pub fn new() -> Self {
         Self::default()
     }
+    /// Revoke every actual dependency, including work inside a long shaping call.
     pub fn cancel(&self) {
         self.bidi.cancel();
         self.script.cancel();
-        self.shape.request(); // 实际长GSUB/GPOS也观察原位；不是只在外层step之间取消。
+        // Long GSUB/GPOS processing observes this same state, not only outer step boundaries.
+        self.shape.request();
         self.measure.cancel();
     }
+    /// Observe the shared cancellation request without claiming child completion.
     pub fn is_cancelled(&self) -> bool {
         self.bidi.is_cancelled()
     }
+    /// Lend the original shaping cancellation state to the actual child job.
     pub(super) fn shaping(&self) -> MarkdownShapingCancellation {
         self.shape.clone()
     }
+    /// Lend the original measurement cancellation state without a new task lifetime.
     pub(super) fn measure(&self) -> crate::MarkdownSoftLineMeasureCancellation {
         self.measure.clone()
     }
 }
 
-/// 单次只推进一个依赖或一份输入；同一个bytes配额不会给Script和断点各用一遍。
+/// Advance one dependency or input role per step; script and break work cannot
+/// each spend the same byte allowance independently.
 #[derive(Clone, Copy, Debug)]
 pub struct MarkdownLineComposeBudget {
     pub bytes: usize,
@@ -183,6 +197,7 @@ pub struct MarkdownLineComposeBudget {
     pub metadata_units: usize,
 }
 impl Default for MarkdownLineComposeBudget {
+    /// Keep the established finite source and metadata quanta independent of item length.
     fn default() -> Self {
         Self {
             bytes: 4096,
@@ -193,33 +208,39 @@ impl Default for MarkdownLineComposeBudget {
     }
 }
 
-/// 平台响应样式和实际Font；方向、脚本及BOT/EOT由Core原事实确定，不接受响应伪造。
+/// Platform-provided style accompanies an actual font. Core's original facts
+/// determine direction, script, and BOT/EOT rather than trusting response claims.
 #[derive(Clone, Debug)]
 pub struct MarkdownLineComposeStyle {
-    /// 原语义来源的绘制位随同一字体响应封存；不改写字形、源坐标或断行权限。
+    /// Seal original semantic drawing roles with the same font response without
+    /// changing glyphs, source coordinates, or line-break authority.
     pub presentation: crate::MarkdownPresentationStyles,
     pub points: f32,
     pub language: Option<String>,
     pub features: Vec<MarkdownShapingFeature>,
 }
 
-/// 私有nonce绑定本次仍待响应的真实交集；相同坐标的新请求不能复用旧响应。
+/// Bind this actual outstanding intersection through a private nonce. Another
+/// request with equal coordinates cannot reuse its older response.
 #[derive(Clone)]
 pub struct MarkdownLineStyleRequest {
     nonce: Arc<()>,
     source: MarkdownLayoutTextAuthority,
     range: Range<usize>,
     scope: StyleScope,
-    // 只有真实 UBA 自然分界可不为 GCB；不能从短 coverage 或源坐标自行构造。
+    // Only a real natural bidi seam may differ from a grapheme boundary; short
+    // coverage or public source coordinates cannot manufacture that authority.
     shaping_seams: [Option<ResolvedBidiShapingSeam>; 2],
     #[cfg(feature = "paged-shaping-frontier")]
     continuation_font: Option<MarkdownLayoutFontAuthority>,
-    // 字体交接已经持原 GCB 两端票；保其真实字节范围供有限首 scalar 读取，不能再次远端定位。
+    // Font handoff already owns original grapheme endpoint proof. Retain exact
+    // bytes for bounded first-scalar input without another distant coordinate lookup.
     #[cfg(feature = "paged-shaping-frontier")]
     continuation_bytes: Option<Range<usize>>,
 }
 
-/// 普通文字的真实 Unicode 事实与已认证结构行互斥；表格握手不持伪造脚本、级别或段落。
+/// Actual text Unicode facts and certified structural rows are mutually
+/// exclusive; a table handshake owns no invented script, level, or paragraph.
 #[derive(Clone)]
 enum StyleScope {
     Text(TextStyleScope),
@@ -237,58 +258,72 @@ struct TextStyleScope {
     level: u8,
 }
 impl MarkdownLineStyleRequest {
+    /// Borrow this original request's weak source identity without recapturing text.
     pub fn source(&self) -> &MarkdownLayoutTextAuthority {
         &self.source
     }
+    /// Return finite requested geometry without granting new source-reading authority.
     pub fn source_range(&self) -> Range<usize> {
         self.range.clone()
     }
-    /// 仅文字作用域持原 Unicode 段落；结构行必须先交回真实行票，误用按调用契约 panic。
+    /// Only text scope owns an original Unicode paragraph. Structural rows must
+    /// return their actual row ticket; misuse violates this accessor's contract.
     pub fn paragraph_range(&self) -> Range<usize> {
         self.text_scope()
             .expect("结构表格请求没有文字段落权限")
             .paragraph
             .clone()
     }
-    /// 只返回实际 Script 分析值；表格结构握手没有可借用的脚本，误用按调用契约 panic。
+    /// Return only actual script analysis. Structural table handshakes have no
+    /// text script value, so calling this accessor for them violates its contract.
     pub fn script(&self) -> [u8; 4] {
         self.text_scope().expect("结构表格请求没有脚本权限").script
     }
-    /// 只返回原 UBA 级别；结构行不经过文字 UBA，误用按调用契约 panic。
+    /// Return the original bidi level. Structural rows do not pass text bidi
+    /// analysis and cannot supply this accessor's required text fact.
     pub fn level(&self) -> u8 {
         self.text_scope()
             .expect("结构表格请求没有 UBA 级别权限")
             .level
     }
-    /// 字体/整形入口必须先取得真实 Text 作用域；结构请求只能交回原行票，不能降为文字。
+    /// Font/shaping entry requires actual text scope. A structural request can
+    /// return only its original row proof, never degrade into fabricated text.
     fn text_scope(&self) -> Result<&TextStyleScope> {
         match &self.scope {
+            // The original analyzed text scope owns all required Unicode facts.
             StyleScope::Text(text) => Ok(text),
             #[cfg(all(
                 feature = "s2-table-window-prototype",
                 feature = "paged-shaping-frontier"
             ))]
+            // A structural row grants no script/bidi/text-shaping authority.
             StyleScope::Table(_) => Err(MarkdownLineComposeError::TableRange),
         }
     }
-    /// 字体交接保留原item的Font上下文身份；普通样式请求没有续算身份。
-    /// 这不是平台字体优先策略：完整GCB仍按真实语义base选择，不能让旧fallback吞掉已可回base的字符。
+    /// Preserve the original item's font context during handoff; ordinary style
+    /// requests have no continuation identity. This is not platform preference:
+    /// each complete grapheme still tries its actual semantic base so an old
+    /// fallback cannot absorb characters that can return to that preferred font.
     #[cfg(feature = "paged-shaping-frontier")]
     pub fn continuation_font(&self) -> Option<&MarkdownLayoutFontAuthority> {
         self.continuation_font.as_ref()
     }
-    /// 响应只能覆盖请求起点开始的一个真实样式段；GCB与当前nonce仍由接收方再次核验。
+    /// Cover one actual style interval beginning at this request's start. Its
+    /// recipient must still revalidate grapheme proof and the original pending nonce.
     pub fn respond(
         self,
         coverage: Range<usize>,
         font: MarkdownLayoutFont,
         style: MarkdownLineComposeStyle,
     ) -> Result<MarkdownLineStyleResponse> {
-        self.text_scope()?; // 没有 Unicode/Font 权限的结构请求不得产生普通字体响应。
+        // A structural request has no Unicode/font authority to produce a text response.
+        self.text_scope()?;
         if coverage.start != self.range.start
             || coverage.end <= coverage.start
             || coverage.end > self.range.end
         {
+            // Neither a gap at the start nor an oversized/empty response grants
+            // authority over a different part of this original item request.
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
         Ok(MarkdownLineStyleResponse {
@@ -308,7 +343,8 @@ impl MarkdownLineStyleRequest {
         })
     }
 
-    /// 完整组合器使用实际palette仍持有的注册值；弱票不能在字体已归还后冒充可画字形。
+    /// Use the registration still owned by the actual palette. A weak ticket
+    /// cannot claim drawable glyph authority after that font has been released.
     pub fn respond_registered(
         self,
         coverage: Range<usize>,
@@ -321,7 +357,8 @@ impl MarkdownLineStyleRequest {
     }
 }
 
-/// 没有公开字段；外部只能消费实际request产生响应，不能凭source range构造新item。
+/// Private fields require consuming an actual request to respond; a caller
+/// cannot construct a new item solely from public source coordinates.
 pub struct MarkdownLineStyleResponse {
     request: MarkdownLineStyleRequest,
     coverage: Range<usize>,
@@ -339,11 +376,14 @@ pub struct MarkdownLineStyleResponse {
 }
 
 impl MarkdownLineStyleResponse {
-    /// 只附同一个真实请求签出的相邻语义票；短coverage本身没有闭项权。
-    /// 后继仍须按原预算取得右侧完整GCB，并实测另一Font，颜色变化不能强行断开连字。
+    /// Attach only adjacent semantic proof issued for this same actual request;
+    /// short coverage alone cannot close an item. Later work still obtains the
+    /// complete right grapheme within budget and probes its actual font. A color
+    /// change cannot arbitrarily split a ligature.
     ///
     /// # Errors
-    /// 异源或另一次请求即使坐标相同也拒绝；票的左样式和本响应必须精确一致。
+    /// Reject another source/request even at equal coordinates. The proof's
+    /// exact left style must agree with this response.
     #[cfg(all(
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
@@ -355,23 +395,30 @@ impl MarkdownLineStyleResponse {
         if !Arc::ptr_eq(&self.request.nonce, &boundary.request().nonce)
             || self.request.source != *boundary.source()
         {
+            // A new request cannot reuse an older adjacent-style publication's
+            // nonce or Source authority merely because the ranges coincide.
             return Err(MarkdownLineComposeError::SourceMismatch);
         }
         if self.coverage.end != boundary.left().utf16_range.end
             || self.coverage.start < boundary.left().utf16_range.start
             || self.style.presentation != boundary.left().styles
         {
+            // Preserve the actual left style interval and drawing roles, not
+            // just a numeric endpoint that could hide another semantic segment.
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
         self.root_leaf_boundary = Some(boundary);
         Ok(self)
     }
 
-    /// 原平台语义base随同本次nonce封存；这是字体选择的真实优先身份，不是范围或闭项许可。
-    /// 选中fallback后，后继完整GCB仍须重新实际试base，不能凭fallback也覆盖空格而吞掉优先字体。
+    /// Seal the platform's original semantic base font with this nonce. It is
+    /// real font preference, not range/closure authority. After selecting fallback,
+    /// each later whole grapheme still tries that base; fallback covering spaces
+    /// does not let it absorb content belonging to the preferred font.
     ///
     /// # Errors
-    /// 原注册已过期或绑定字号与本样式不一致时拒绝，不按同名字体重新注册替代权限。
+    /// Reject expired registration or a bound point size differing from this
+    /// style, without substituting a newly resolved equal-name font.
     #[cfg(feature = "paged-shaping-frontier")]
     pub fn with_preferred_registered_font(
         mut self,
@@ -384,23 +431,30 @@ impl MarkdownLineStyleResponse {
             .shaping_point_size()
             .is_some_and(|points| (points as f32).to_bits() != self.style.points.to_bits())
         {
+            // A font bound to another size cannot acquire this response's exact
+            // shaping authority through its otherwise valid registration.
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
         self.preferred_registration = Some(registration);
         Ok(self)
     }
 
-    /// 左右段落缩进随原 nonce 响应封存；字面调用不设置该值，保持原零缩进行为。
+    /// Seal paragraph inset with the original response nonce; literal callers
+    /// that omit it retain their existing zero-inset behavior.
     pub fn with_paragraph_inset(mut self, inset_26_6: i32) -> Result<Self> {
         if inset_26_6 < 0 {
+            // Reject negative available-width input before it can be clipped
+            // during drawing; the actual measure still validates final line width.
             return Err(MarkdownLineComposeError::InvalidRequest);
-        } // 负可用宽度不能等到绘图时裁掉；实际行宽在原测量入口继续核验。
+        }
         self.paragraph_inset_26_6 = inset_26_6;
         Ok(self)
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// Finite actual item facts; they do not independently certify a soft line,
+/// glyph coverage, caret boundary, or a still-current font/Source.
 pub struct MarkdownLineItemFacts {
     pub source_utf16: Range<usize>,
     pub paragraph_utf16: Range<usize>,
@@ -412,36 +466,43 @@ pub struct MarkdownLineItemFacts {
     pub end_of_text: bool,
 }
 
-/// worker局部唯一真实job。分项Ready没有承诺软行、Native几何或字体回退已经完成。
+/// Own one actual worker-local job. Item readiness promises neither completed
+/// soft-line geometry nor native presentation or whole-item font fallback.
 pub struct MarkdownLineItem {
     pub(super) job: super::worker_resources::ShapeResourceOwner,
     pub(super) source: MarkdownLayoutTextSource,
     pub(super) authority: MarkdownLayoutTextAuthority,
     pub(super) font: MarkdownLayoutFontAuthority,
     pub(super) registration: Option<MarkdownLineFontRegistration>,
-    // 只保上游已校验的小样式，不保正文；历史字形遇到真正unsafe边界时须用原选项重形。
+    // Retain only the validated finite style. Replaying a genuinely unsafe
+    // shaping boundary must use these original options without retaining text.
     pub(super) replay_style: MarkdownLineComposeStyle,
     facts: MarkdownLineItemFacts,
     shaping_seams: [Option<ResolvedBidiShapingSeam>; 2],
 }
 impl MarkdownLineItem {
-    /// Store 只借原分项签出的两张 scalar shaping seam；None 仍须核真实 GCB。
-    /// 这两端不授予 LineEnd/caret；下游不得将视觉 part 的边缘冒充编辑边界。
+    /// Lend only original item-issued scalar shaping seams to Store; absent
+    /// seams still require actual grapheme proof. These endpoints grant no
+    /// LineEnd/caret authority: a visual part edge is not automatically editable.
     pub(in crate::markdown_line_composer) fn shaping_seams(
         &self,
     ) -> &[Option<ResolvedBidiShapingSeam>; 2] {
         &self.shaping_seams
     }
+    /// Borrow original finite facts without cloning glyph data or the job owner.
     pub fn facts(&self) -> &MarkdownLineItemFacts {
         &self.facts
     }
+    /// Borrow the original weak font registration, if this item was registered.
     pub fn font_registration(&self) -> Option<&MarkdownLineFontRegistration> {
         self.registration.as_ref()
     }
-    /// 原job已经校验的小样式；后继unsafe重形须复用它，不重新查询较新的活文档样式。
+    /// Reuse the original job's validated style during unsafe-boundary reshaping,
+    /// rather than querying newer active-document presentation.
     pub fn shaping_style(&self) -> &MarkdownLineComposeStyle {
         &self.replay_style
     }
+    /// Query the actual original job only while Source and font authority remain valid.
     pub fn glyph(&mut self, ordinal: usize) -> Result<Option<MarkdownShapedGlyph>> {
         self.source.health()?;
         Ok(self.job.glyph(&self.authority, &self.font, ordinal)?)
@@ -461,7 +522,8 @@ pub enum MarkdownLineItemAnswer {
 #[derive(Clone)]
 pub struct MarkdownLineItemStep {
     pub bytes: usize,
-    /// 前沿child构造的原邻接上下文读取独立计数，不冒充中心输出或步进输入配额。
+    /// Report actual frontier-child adjacent-context input separately from its
+    /// central output and ordinary input quantum.
     #[cfg(feature = "paged-shaping-frontier")]
     pub context_bytes: usize,
     pub scalars: usize,
@@ -539,14 +601,17 @@ struct Payload {
     breaks_ready: bool,
     script_first: bool,
     cursor: usize,
-    // 上一原 item 真消费完的右 seam 才能授权下一分项的相同起点；不凭裸 cursor 复建。
+    // Only the actually consumed item's right seam authorizes the next matching
+    // start; a bare cursor cannot reconstruct its original proof.
     next_shaping_seam: Option<ResolvedBidiShapingSeam>,
     scan: Option<Scan>,
     request: Option<MarkdownLineStyleRequest>,
-    // 内部缩短coverage的响应只有一份；等待实际metadata量子时不持Native借用或新正文。
+    // Retain one shortened internal response while waiting for its actual
+    // metadata quantum, without a native borrow or another text value.
     #[cfg(feature = "paged-shaping-frontier")]
     pending_style: Option<MarkdownLineStyleResponse>,
-    // 只有仍等待原样式响应的协调器持强边；外部请求副本不能延长字体试次权限。
+    // Only the coordinator awaiting this original style response keeps the
+    // probe scope alive. Escaped request clones cannot extend font-trial authority.
     font_probe_scope: Option<Arc<()>>,
     item: Option<MarkdownLineItem>,
     #[cfg(feature = "paged-shaping-frontier")]
@@ -572,7 +637,8 @@ struct Payload {
     frontier_work: MarkdownLineFrontierWork,
 }
 
-/// 只保一份待处理item；不会为长文建立`Vec<Job>`、`Vec<run>`或完整正文副本。
+/// Retain one pending item rather than a long-document Vec of jobs/runs or a
+/// complete copied body.
 pub struct MarkdownLineItemCoordinator {
     payload: Option<Payload>,
     authority: MarkdownLayoutTextAuthority,
@@ -581,6 +647,8 @@ pub struct MarkdownLineItemCoordinator {
     resources: super::worker_resources::ComposerResourceScope,
 }
 impl MarkdownLineItemCoordinator {
+    /// Bind one original source/cancellation scope and construct its actual
+    /// script/break dependencies before publishing the worker-local coordinator.
     pub fn new(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
@@ -588,9 +656,11 @@ impl MarkdownLineItemCoordinator {
     ) -> Result<Self> {
         source.health()?;
         if !source.permits(authority) {
+            // Equal text or generation cannot replace the captured source allocation.
             return Err(MarkdownLineComposeError::SourceMismatch);
         }
         if cancellation.is_cancelled() {
+            // Do not construct dependencies for an already-cancelled composition.
             return Err(MarkdownLineComposeError::Cancelled);
         }
         let backing = source.original_backing_observer();
@@ -659,11 +729,13 @@ impl MarkdownLineItemCoordinator {
         })
     }
 
+    /// Share only this worker's original resource observation scope with actual child owners.
     pub(super) fn resource_scope(&self) -> super::worker_resources::ComposerResourceScope {
         self.resources.clone()
     }
 
-    /// 原词组/删除共享此有限 proof，不能把可见序列的相邻端点当作完整原 GCB 读取隐区。
+    /// Share finite original folding proof with word movement/deletion. Adjacent
+    /// visible endpoints cannot authorize reading hidden content as one original grapheme.
     pub(in crate::markdown_line_composer) fn fold_plan(
         &self,
     ) -> Option<crate::markdown_layout_source::folds::FoldPlan> {
@@ -672,7 +744,8 @@ impl MarkdownLineItemCoordinator {
             .and_then(|payload| payload.folds.shared())
     }
 
-    /// 折叠是构造期的显示意图；开始消费原 Source 后不能改写尚在用的控制范围。
+    /// Bind folding as construction-time display intent; once Source consumption
+    /// begins, do not rewrite the still-active original control intervals.
     pub(super) fn install_folded_ranges(&mut self, ranges: &[Range<usize>]) -> Result<()> {
         let result = (|| {
             self.guard()?;
@@ -681,6 +754,7 @@ impl MarkdownLineItemCoordinator {
                 .as_mut()
                 .ok_or(MarkdownLineComposeError::Poisoned)?;
             if !matches!(payload.stage, Stage::Bidi) || payload.cursor != 0 {
+                // A later cursor or phase already depends on the original visible sequence.
                 return Err(MarkdownLineComposeError::InvalidRequest);
             }
             let plan = super::folds::Plan::new(&payload.source, ranges)?;
@@ -694,8 +768,9 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
-    /// 同一冻结源的显隐选择变化只撤销样式项；保留已收费的UBA、Script和GCB/LB索引。
-    /// 旧Font试次须由Native先取消并归还，此处撤销nonce后不能再接受旧响应。
+    /// Changing marker visibility on the same frozen Source resets styled items
+    /// while retaining already-paid bidi/script/grapheme/line-break indexes.
+    /// Native code first cancels and returns old font trials; revoked nonces cannot accept them later.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn reset_styles(&mut self) -> Result<()> {
         let result = (|| {
@@ -704,7 +779,8 @@ impl MarkdownLineItemCoordinator {
                 .payload
                 .as_mut()
                 .ok_or(MarkdownLineComposeError::Poisoned)?;
-            // 原样式的实际整形owner先退出；Source及语言索引保持同一allocation，不重新扫描原mmap。
+            // Retire actual shaping owners for the old style first. Source and
+            // language indexes remain the same allocation without another mmap scan.
             payload.font_probe_scope = None;
             payload.request = None;
             payload.pending_style = None;
@@ -720,9 +796,13 @@ impl MarkdownLineItemCoordinator {
             payload.script_source_demand = false;
             payload.cursor = 0;
             payload.next_shaping_seam = None;
-            payload.stage = Stage::Bidi; // 已有Bidi直接复用；尚未完成的原准备续体沿原量子继续。
+            // Reuse an existing bidi value; unfinished preparation resumes the
+            // same original continuation under its next actual work quantum.
+            payload.stage = Stage::Bidi;
 
-            // 新glyph writer有独立释放收据；复用依赖的实际observer，不能把旧writer登记覆盖成“已释放”。
+            // A new glyph writer has independent release observations. Reuse
+            // actual dependency observers without overwriting the old writer's
+            // still-outstanding resource facts with apparent completion.
             let resources = super::worker_resources::ComposerResourceScope::new(&payload.source);
             resources.register_dependencies(
                 payload.scripts.resource_observer(),
@@ -738,7 +818,9 @@ impl MarkdownLineItemCoordinator {
                 resources.register_bidi(bidi.resource_observer());
             } else if let Some(preparation) = &payload.bidi_preparation {
                 resources.register_bidi(preparation.resource_observer());
-            } // 尚未创建UBA时不制造observer，真正创建仍由原bidi_preparation登记。
+            }
+            // If bidi was never created, invent no observation; its actual later
+            // preparation registers the original owner when construction begins.
             payload.resources = resources.clone();
             self.resources = resources;
             Ok(())
@@ -746,9 +828,11 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
-    /// 同一原源的已封存字形只有在整个仍活跃样式域均位于真实 plain 证明内才可保留。
-    /// 不改 cursor、nonce 或 scope；后继 NeedStyle 仍由新选择的正常语义发布授权。
-    /// 未交付输入和旧 RootLeaf 边界不在这个窄能力内，不能以默认样式或相同坐标猜测。
+    /// Retain sealed glyphs only when every still-active style scope is inside
+    /// actual plain-text proof for this original Source. Change no cursor/nonce/
+    /// scope; later NeedStyle still uses the new selection's real semantics.
+    /// Unpublished input and old RootLeaf boundaries lie outside this capability;
+    /// default styles or equal coordinates cannot establish that missing proof.
     #[cfg(all(
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
@@ -779,10 +863,13 @@ impl MarkdownLineItemCoordinator {
                     Stage::ItemStart | Stage::ClosedFonts | Stage::Frontier | Stage::End
                 )
             {
+                // Any active request/input/scan outside the proven retained
+                // prefix still depends on old selection semantics and must reset.
                 return Ok(false);
             }
-            // ClosedFonts 的 AwaitChild 会晚于 Store 的实际归还一步清槽；保留真实空 child
-            // 的续体，不为得到空槽而额外推进一个量子，也不把仍活的 child 当作已释放。
+            // ClosedFonts clears AwaitChild one step after Store actually returns
+            // its child. Keep that genuinely empty continuation without spending
+            // an extra quantum to clear a slot or treating a live child as returned.
             if let Some(fonts) = &payload.closed_fonts
                 && !fonts.retains_selection_styles(&self.authority, proven_end)?
             {
@@ -795,26 +882,22 @@ impl MarkdownLineItemCoordinator {
             }
             Ok(true)
         })();
-        self.guard()?; // Font 注册检查失败也先归还同一原 Source 健康首因。
+        // A failed font-registration query still yields the original Source
+        // health failure first if that same source became unavailable meanwhile.
+        self.guard()?;
         result
     }
 
-    #[cfg(all(test, feature = "paged-shaping-frontier"))]
-    /// 实际语言索引的累计源读取只用于重排回归；getter自身不推进任何Job。
-    pub(super) fn style_dependency_source_reads(&mut self) -> (usize, usize) {
-        let payload = self.payload.as_mut().expect("原索引仍由Coordinator持有");
-        (
-            payload.scripts.storage_profile().source_bytes_read,
-            payload.breaks.line_source_bytes_read_for_test(),
-        )
-    }
-
+    /// Keep original backing failure ahead of payload retirement, source
+    /// identity, and cancellation; metadata cannot revive an obsolete owner.
     fn guard(&self) -> Result<()> {
         if let Some(errno) = self
             .backing
             .as_ref()
             .and_then(|observer| observer.first_errno())
         {
+            // A previously recorded backing failure remains authoritative even
+            // after payload destruction or a later cancellation request.
             return Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
         }
         let payload = self
@@ -823,42 +906,54 @@ impl MarkdownLineItemCoordinator {
             .ok_or(MarkdownLineComposeError::Poisoned)?;
         payload.source.health()?;
         if !payload.source.permits(&self.authority) {
+            // A replacement Source cannot use this worker's original authority.
             return Err(MarkdownLineComposeError::SourceMismatch);
         }
         if self.cancellation.is_cancelled() {
+            // Cancellation revokes further work, not proof of actual resource completion.
             return Err(MarkdownLineComposeError::Cancelled);
         }
         Ok(())
     }
 
+    /// Revalidate the original owner after work, retire failed payloads, then
+    /// check cleanup-time Source failure before exposing a result.
     fn finish<T>(&mut self, answer: Result<T>) -> Result<T> {
         let answer = match self.guard() {
             Err(error) => {
-                drop(answer); // 后置撤权时先归还尚未交付的实际item，再核析构产生的首I/O事实。
+                // Return an unexposed actual item before checking I/O facts
+                // produced by its destruction after post-work revocation.
+                drop(answer);
                 Err(error)
             }
+            // Still-current work retains its actual result, including a dependency failure.
             Ok(()) => answer,
         };
         if answer.is_err() {
-            drop(self.payload.take()); // 源、三个索引和实际job先归还，外部请求壳不能重新启用此owner。
+            // Return Source, indexes, and actual jobs; an escaped request shell
+            // cannot restore this retired worker's authority.
+            drop(self.payload.take());
         }
         if let Some(errno) = self
             .backing
             .as_ref()
             .and_then(|observer| observer.first_errno())
         {
+            // A real source failure during teardown keeps its original priority.
             return Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
         }
         answer
     }
 
-    /// UBA整源元数据计算是可取消的worker阶段，不宣称一次调用具有限主线程耗时。
+    /// Whole-source bidi preparation is cancellable worker work, not a promise
+    /// that one call has bounded main-thread execution time.
     pub fn step(&mut self, budget: MarkdownLineComposeBudget) -> Result<MarkdownLineItemStep> {
         let result = self.advance(budget);
         self.finish(result)
     }
 
-    /// 词组移动只推进原 Bidi 准备；整源证书和逐可见段职责明确区分，不顺带推进 GCB。
+    /// Word movement advances only original bidi preparation. Whole-source and
+    /// visible-paragraph proof remain distinct, with no uncharged grapheme work.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn prepare_word_move(
         &mut self,
@@ -887,14 +982,19 @@ impl MarkdownLineItemCoordinator {
                     budget,
                     &mut step,
                 )?;
-            } // 已发布的原Paragraph直接借其事实，不为每个按键重复扫描或另建分析器。
+            }
+            // An already published original paragraph lends its existing facts;
+            // each key press does not rescan text or create another analyzer.
             let proved = self.word_move_scope()?;
             Ok((step, proved))
         })();
-        self.finish(result) // 能力结果不是样式或位置；只有真实 Source/取消/I/O 失败才沿原关闭边退休。
+        // This answer grants a capability, not style/position. Real Source,
+        // cancellation, or I/O failure follows the same original retirement path.
+        self.finish(result)
     }
 
-    /// 已准备表示决定后续真实消费者；Visible 只允许逐 GCB 求原完整 B 段的真实零级顺序。
+    /// The prepared representation selects its real later consumer. Visible
+    /// scope permits per-grapheme queries of an original complete zero-level bidi paragraph.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(in crate::markdown_line_composer) fn word_move_scope(
         &self,
@@ -905,19 +1005,24 @@ impl MarkdownLineItemCoordinator {
             .as_ref()
             .and_then(|payload| payload.bidi.as_ref())
         else {
+            // No completed original bidi representation grants word-order capability yet.
             return Ok(None);
         };
         let scope = if bidi.whole_source_uniform_zero(&self.authority)? {
+            // Complete source proof can authorize the whole uniform zero-level path.
             super::MarkdownWordMoveScope::WholeUniformZero
         } else if bidi.uses_visible_paragraph_scopes(&self.authority)? {
+            // Otherwise only prepared visible paragraphs carry the required local proof.
             super::MarkdownWordMoveScope::VisibleParagraphScopes
         } else {
+            // A different resolved representation does not imply supported word movement.
             super::MarkdownWordMoveScope::Unsupported
         };
         Ok(Some(scope))
     }
 
-    /// 同一 Item 的原在途 owner 准备实际 GCB 所属完整 B 段；任何工作都结束本回合，不再兼花分类量子。
+    /// Prepare the actual grapheme's complete bidi paragraph in this same Item
+    /// owner; source/metadata work ends this step before another classification role can run.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(in crate::markdown_line_composer) fn prepare_word_cluster(
         &mut self,
@@ -954,8 +1059,10 @@ impl MarkdownLineItemCoordinator {
                 answer: MarkdownLineItemAnswer::Yielded,
             };
             if !progress.ready || step.bytes != 0 || step.scalars != 0 || step.metadata_units != 0 {
+                // Newly completed preparation still consumed its original quantum;
+                // obtain its word-order proof only in a later step.
                 return Ok((step, None));
-            } // 刚完成的真实段在下一回合借证书；原 4KiB 量子不会被两种角色重复使用。
+            }
             let (proof, through) = bidi.prepare_word_order(
                 &self.authority,
                 range,
@@ -968,7 +1075,8 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
-    /// 原布局游标仍在暂停中的真实 Item 起点；Word 只保存该标量，不保额外 B 段或 Source。
+    /// Observe the paused original item cursor. Word work keeps only this finite
+    /// position, without another Source or bidi-paragraph owner.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(in crate::markdown_line_composer) fn word_layout_position(&self) -> Result<usize> {
         self.guard()?;
@@ -979,7 +1087,9 @@ impl MarkdownLineItemCoordinator {
             .cursor)
     }
 
-    /// Word 可能换走两槽中的旧 B 段；发布终点前在同一在途 owner 中恢复原布局段，避免 Style/Scan 借失效段。
+    /// Word work may replace a retained bidi slot. Restore the original layout
+    /// paragraph in the same owner before publishing its endpoint, so Style/Scan
+    /// cannot consume an evicted paragraph's stale facts.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(in crate::markdown_line_composer) fn restore_word_layout_context(
         &mut self,
@@ -1022,6 +1132,8 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
+    /// Advance one actual dependency/input stage. Each returned step exposes
+    /// only work and readiness justified by the original Source and its proofs.
     fn advance(&mut self, budget: MarkdownLineComposeBudget) -> Result<MarkdownLineItemStep> {
         self.guard()?;
         if budget.bytes == 0
@@ -1029,6 +1141,7 @@ impl MarkdownLineItemCoordinator {
             || budget.records == 0
             || budget.metadata_units == 0
         {
+            // A zero budget cannot make actual progress or authorize a partial stage transition.
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
         #[cfg(feature = "paged-shaping-frontier")]
@@ -1039,8 +1152,9 @@ impl MarkdownLineItemCoordinator {
             .breaks
             .take_line_source_demand(&self.authority)?
         {
-            // 直接使用Coordinator的调用方也只在下一量子推进；Engine会在上个回合
-            // 取走同一需求并调度，因此两种驱动方式不会把一次等待重复计费。
+            // Direct coordinator callers also advance only in the next quantum.
+            // Engine already consumes this same demand when scheduling, so the
+            // two driving paths cannot charge one pending request twice.
             return self.advance_pending_line_breaks(budget);
         }
         #[cfg(feature = "paged-shaping-frontier")]
@@ -1050,6 +1164,7 @@ impl MarkdownLineItemCoordinator {
             .ok_or(MarkdownLineComposeError::Poisoned)?
             .script_source_demand
         {
+            // Script demand resumes that same original script job exclusively.
             return self.advance_pending_scripts(budget);
         }
         #[cfg(feature = "paged-shaping-frontier")]
@@ -1060,6 +1175,7 @@ impl MarkdownLineItemCoordinator {
             .breaks
             .take_grapheme_source_demand(&self.authority)?
         {
+            // Grapheme demand does not implicitly advance line-break or item input work.
             return self.advance_pending_graphemes(budget);
         }
         let mut step = MarkdownLineItemStep {
@@ -1083,7 +1199,9 @@ impl MarkdownLineItemCoordinator {
         if matches!(payload.stage, Stage::Bidi | Stage::ItemStart)
             && table_row::known_row_request(payload, &self.authority, &mut step)?
         {
-            return Ok(step); // 真实目录访问独占此量子，表格行首先交语义来源，不能先进入 Body UBA。
+            // This actual table-directory access owns the quantum. Obtain its
+            // structural semantics before allowing the row to enter body bidi.
+            return Ok(step);
         }
         match payload.stage {
             #[cfg(all(
@@ -1091,16 +1209,20 @@ impl MarkdownLineItemCoordinator {
                 feature = "paged-shaping-frontier"
             ))]
             Stage::TableDirectory | Stage::TableRow => {
+                // Table handoff uses its explicit row API, not ordinary text stepping.
                 return Err(MarkdownLineComposeError::InvalidRequest);
             }
 
             Stage::Bidi => {
                 #[cfg(feature = "paged-shaping-frontier")]
                 if payload.bidi.is_some() {
+                    // Reuse the real prepared bidi owner and prepare its current
+                    // paragraph before script/grapheme dependencies may continue.
                     if paragraph::prepare(payload, &self.authority, budget, &mut step)? {
                         payload.stage = Stage::Dependencies;
                     }
-                    return Ok(step); // 真B段范围先独占原量子；后继Script/GCB不得再次消费同一预算。
+                    // Paragraph preparation alone consumes this quantum.
+                    return Ok(step);
                 }
                 bidi_preparation::advance(
                     payload,
@@ -1115,8 +1237,9 @@ impl MarkdownLineItemCoordinator {
                 }
             }
             Stage::Dependencies => {
-                // 原ASCII继续消费完整Dense/Script快路；普通LTR Unicode只在完整Uniform
-                // 无控制证明下开始查询原稳定SCX/GCB。没有证明仍轮换原两个完整依赖。
+                // ASCII uses its exact dense/script path. Ordinary LTR Unicode
+                // queries stable original prefixes only with complete uniform
+                // control-free proof; otherwise alternate the two full dependencies.
                 #[cfg(feature = "paged-shaping-frontier")]
                 let prefix = payload.frontier_enabled
                     && (payload.breaks.ascii_prefix_ready(&self.authority)?
@@ -1128,10 +1251,12 @@ impl MarkdownLineItemCoordinator {
                     .ok_or(MarkdownLineComposeError::InconsistentCoverage)?
                     .uses_prepared_paragraphs()
                 {
-                    // 原Source本身不超过一次既有借用域时保完整SCX批次；只有长源
-                    // 才按当前真B段开放准备。这个额度不签SCX、Font、shape或行边界。
+                    // Keep a complete script batch for sources fitting the
+                    // existing source-read domain. Only longer sources prepare
+                    // an open current paragraph; size grants no script/font/shape/line boundary.
                     payload.source.byte_len() > crate::MARKDOWN_SCRIPT_SOURCE_BYTES
                 } else {
+                    // Nonparagraph preparation uses only its existing original prefix proof.
                     prefix
                 };
                 #[cfg(feature = "paged-shaping-frontier")]
@@ -1140,13 +1265,16 @@ impl MarkdownLineItemCoordinator {
                     && !payload.breaks.ascii_prefix_ready(&self.authority)?
                 {
                     payload.stage = Stage::ItemStart;
-                    return Ok(step); // 原无B前缀手感照旧；长多段的真实控制仍先交initial_inline_control。
+                    // Later ItemStart still checks actual controls for a long
+                    // multi-paragraph source; prefix mode does not manufacture control-free text.
+                    return Ok(step);
                 }
                 #[cfg(not(feature = "paged-shaping-frontier"))]
                 let prefix = false;
                 let scripts = !payload.scripts_ready
                     && (prefix || payload.script_first || payload.breaks_ready);
                 if scripts {
+                    // Advance script alone, charging its actual source/scalar/record work.
                     let progress = payload.scripts.step(
                         &self.authority,
                         MarkdownScriptBudget {
@@ -1161,6 +1289,8 @@ impl MarkdownLineItemCoordinator {
                     step.scalars = progress.scalars;
                     step.records = progress.records;
                 } else if !payload.breaks_ready && !prefix {
+                    // The alternating break phase receives this quantum only
+                    // when the script phase did not consume it.
                     let progress = payload.breaks.step(
                         &self.authority,
                         MarkdownLineBreakBudget {
@@ -1176,6 +1306,8 @@ impl MarkdownLineItemCoordinator {
                 }
                 payload.script_first = !payload.script_first;
                 if payload.scripts_ready && (payload.breaks_ready || prefix) {
+                    // A prefix-capable break representation is distinct from
+                    // complete dependencies; later queries still expose genuine Pending.
                     payload.stage = Stage::ItemStart;
                 }
             }
@@ -1186,10 +1318,13 @@ impl MarkdownLineItemCoordinator {
                     || step.scalars != 0
                     || step.metadata_units != 0
                 {
-                    return Ok(step); // 跨段先结束真实叶/目录查询，Ready同样不在这一量子再推进分项。
+                    // Real cross-paragraph endpoint work must end this step;
+                    // newly Ready does not allow spending its quantum again on itemization.
+                    return Ok(step);
                 }
                 if let Some(range) = payload.folds.at(payload.cursor) {
-                    // 隐藏行只交原控制 nonce，不进入 Script/Font/HarfBuzz；原源索引仍分步推进。
+                    // A hidden interval returns its original control nonce,
+                    // never Script/font/shaping input. Original indexes still advance in real steps.
                     let control = MarkdownLineInlineControl::new(
                         self.authority.clone(),
                         range,
@@ -1199,7 +1334,8 @@ impl MarkdownLineItemCoordinator {
                     payload.stage = Stage::Control;
                     step.answer = MarkdownLineItemAnswer::NeedsControl(control);
                 } else if payload.cursor == payload.source.utf16_len() {
-                    // 这里只报告分项输入的真实EOF。末尾空视觉行仍由后继行组合器按实际分隔符处理。
+                    // Report only actual item-input EOF. The later composer
+                    // owns any empty final visual line caused by a real trailing separator.
                     payload.stage = Stage::End;
                     step.answer = MarkdownLineItemAnswer::EndOfSource;
                 } else if let Some(control) = initial_inline_control(
@@ -1208,12 +1344,14 @@ impl MarkdownLineItemCoordinator {
                     payload.bidi.as_ref(),
                     payload.cursor,
                 )? {
-                    // CRLF按真实两个源unit作为一项控制，绝不在其GCB内部签item或伪换段。
+                    // CRLF stays one actual two-unit control; do not split its
+                    // grapheme or introduce a synthetic paragraph boundary.
                     payload.control = Some(control.clone());
                     payload.stage = Stage::Control;
                     step.answer = MarkdownLineItemAnswer::NeedsControl(control);
                 } else {
-                    // 完成的Script run、真实UBA段和实际level必须来自同Source；查询不能补捕较新文档。
+                    // Script run, actual bidi paragraph, and level all belong
+                    // to this same Source. Queries cannot recapture a newer document to fill gaps.
                     #[cfg(feature = "paged-shaping-frontier")]
                     let script_answer = {
                         step.metadata_units = 1;
@@ -1254,12 +1392,14 @@ impl MarkdownLineItemCoordinator {
                         if let Some(span) =
                             bidi.uniform_control_free_span(&self.authority, payload.cursor..end)?
                         {
-                            // 原完整单段证明已绑定分析范围和level0；起点只消费这两个事实，
-                            // 不为checked_range的标量定位再次借正文，也不以此一unit当完整段。
-                            // 原Script交集和下方GCB准入仍独立决定可交付item范围。
+                            // Complete original proof already binds this range
+                            // and level zero. Consume those facts without another
+                            // scalar lookup or treating the one-unit probe as a paragraph.
+                            // Script intersection and later grapheme admission still bound the item.
                             (span.paragraph_range(), span.level())
                         } else {
-                            // 没有完整无控制证明时保持原段表/标量端点查询，不以level0猜范围。
+                            // Without complete control-free proof, keep actual
+                            // paragraph/scalar queries rather than guessing extent from level zero.
                             (
                                 bidi.paragraph_range_at_utf16(payload.cursor)?
                                     .ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
@@ -1296,13 +1436,16 @@ impl MarkdownLineItemCoordinator {
                         #[cfg(feature = "paged-shaping-frontier")]
                         endpoint_proofs: [None, None],
                     });
-                    step.metadata_units = 1; // 起点消费原段/level证明或原查询，均计一次真实元数据工作。
+                    // Starting from original paragraph/level proof or an actual
+                    // query both consume real metadata work.
+                    step.metadata_units = 1;
                     payload.stage = Stage::ItemScan;
                 }
             }
             Stage::ItemScan => {
-                // 逐UTF16元数据确定同level的实际末端；低代理项只读原重复level记录，
-                // 只有完整GCB端点才会在下面成为可交付范围，不能把配额边界当新run。
+                // Original UTF-16 records determine the actual same-level end.
+                // Low surrogates repeat their original level; later admission
+                // needs complete grapheme proof or an actual bidi seam, never a budget cutoff.
                 let scan = payload
                     .scan
                     .as_mut()
@@ -1317,9 +1460,10 @@ impl MarkdownLineItemCoordinator {
                     && let Some(span) =
                         bidi.uniform_control_free_span(&self.authority, scan.start..scan.limit)?
                 {
-                    // 原UBA已在完整扫描中证明此分析范围每单位level0且没有六种控制；
-                    // 消费同Source真实Script/paragraph交集，不再逐UTF16重借中文/emoji正文。
-                    // span只借原Paragraph且不证明端点；下方原GCB检查仍决定能否交付。
+                    // Complete bidi analysis already proved uniform level zero
+                    // and absence of the six controls. Reuse this same Source's
+                    // real script/paragraph intersection without per-unit CJK/emoji reads.
+                    // The span itself proves no endpoints; admission below still checks them.
                     if scan.level != span.level() || scan.limit > payload.source.utf16_len() {
                         return Err(MarkdownLineComposeError::InconsistentCoverage);
                     }
@@ -1333,24 +1477,32 @@ impl MarkdownLineItemCoordinator {
                         .source
                         .is_printable_ascii_range(0..payload.source.utf16_len())?
                 {
-                    // 保留原ASCII聚合路径；原冻结root在建叶/编辑时已验证全源U+0020..007E；
-                    // Auto 基方向下它们的已解 UBA level 全为0，且没有 inline control。
-                    // 直接消费原 Script/paragraph 的真实上界，避免为首屏重读整个超长项。
-                    // 该证明只在本次纯 Core 借用内使用；外层前后 guard 仍核同 Source 健康，
-                    // 不按字符抽样、generation 或已显示前缀推断未读尾部的性质。
+                    // Leaf creation/editing proved the entire frozen root is
+                    // U+0020..U+007E. Its resolved Auto bidi level is zero with no
+                    // inline controls, so consume the original script/paragraph
+                    // bound without rereading a long item for its first viewport.
+                    // This exact aggregate is used only within the current Core
+                    // borrow and outer health checks, never inferred from a sample,
+                    // generation, or the already displayed prefix.
                     if scan.level != 0 || scan.limit > payload.source.utf16_len() {
                         return Err(MarkdownLineComposeError::InconsistentCoverage);
                     }
                     scan.next = scan.limit;
                     complete = true;
-                    step.metadata_units = 1; // 固定聚合查询也收费；没有逐 UTF16 level/正文探测。
+                    // The constant-size aggregate query still consumes metadata
+                    // work, with no hidden per-unit level or text probe.
+                    step.metadata_units = 1;
                 }
                 for _ in 0..budget.metadata_units.min(METADATA_UNITS) {
+                    // Resume original records only within this step's remaining
+                    // metadata allowance; incomplete coverage keeps the same Scan.
                     if complete {
                         break;
                     }
                     if inline_control(&payload.source, scan.next)?.is_some() {
-                        complete = true; // 控制之前的真实GCB封闭字形项；控制本身留给原下一阶段。
+                        // The actual boundary before a control closes glyph
+                        // input; the control remains for the next original stage.
+                        complete = true;
                         break;
                     }
                     let unit = bidi.shaping_unit_at_utf16(&self.authority, scan.next)?;
@@ -1359,6 +1511,8 @@ impl MarkdownLineItemCoordinator {
                         None => bidi.level_at_utf16(scan.next)?,
                     };
                     if level != scan.level {
+                        // A real changed-level adjacent scalar pair, rather
+                        // than a direction parity guess, can issue a shaping seam.
                         let left = scan
                             .last_bidi_unit
                             .as_ref()
@@ -1371,7 +1525,9 @@ impl MarkdownLineItemCoordinator {
                             left,
                             right,
                         )?);
-                        step.metadata_units += 1; // 真正读到不同 level 的那条记录同样收费，不能藏在结束分支。
+                        // Charge the actual differing-level record too; ending
+                        // the item cannot conceal that metadata access.
+                        step.metadata_units += 1;
                         complete = true;
                         break;
                     }
@@ -1384,6 +1540,8 @@ impl MarkdownLineItemCoordinator {
                     complete = scan.next == scan.limit;
                 }
                 if complete {
+                    // Completion needs original endpoint proof before any
+                    // style request can expose this interval to the platform.
                     if scan.next <= scan.start {
                         return Err(MarkdownLineComposeError::InconsistentCoverage);
                     }
@@ -1398,14 +1556,18 @@ impl MarkdownLineItemCoordinator {
                             {
                                 return Err(MarkdownLineComposeError::InconsistentCoverage);
                             }
-                        } // 只借原扫描确实读到的不同 level；script/样式/预算上界不能补签。
+                        }
+                        // Only a changed-level seam actually read by this
+                        // scan is valid; script/style/budget bounds cannot create it.
                         #[cfg(feature = "paged-shaping-frontier")]
                         {
                             if payload.frontier_enabled {
                                 if ordinal < scan.verified_endpoints {
+                                    // Earlier steps already retained this exact endpoint proof.
                                     continue;
                                 }
                                 if step.metadata_units == budget.metadata_units {
+                                    // Do not query another endpoint after the quantum is spent.
                                     return Ok(step);
                                 }
                                 step.metadata_units += 1;
@@ -1427,6 +1589,8 @@ impl MarkdownLineItemCoordinator {
                             MarkdownGraphemeAnswer::Known(Some(boundary))
                                 if boundary.utf16 == endpoint =>
                             {
+                                // Keep the actual GCB certificate together with
+                                // any coincident original bidi context barrier.
                                 #[cfg(feature = "paged-shaping-frontier")]
                                 {
                                     scan.verified_endpoints += 1;
@@ -1440,6 +1604,8 @@ impl MarkdownLineItemCoordinator {
                                 }
                             }
                             MarkdownGraphemeAnswer::Known(None) if seam.is_some() => {
+                                // A proven bidi seam may bound shaping inside
+                                // a grapheme, without changing the editing index.
                                 #[cfg(feature = "paged-shaping-frontier")]
                                 {
                                     scan.verified_endpoints += 1;
@@ -1453,7 +1619,9 @@ impl MarkdownLineItemCoordinator {
                             MarkdownGraphemeAnswer::Pending => return Ok(step),
                             _ => return Err(MarkdownLineComposeError::InconsistentCoverage),
                         }
-                    } // 非 GCB 只用于本地 shaping 分项，GCB 目录、caret 和软行机会保持原事实。
+                    }
+                    // Nongrapheme seams authorize only local shaping partitions;
+                    // grapheme records, carets, and soft breaks keep their original facts.
                     payload.request = Some(MarkdownLineStyleRequest {
                         nonce: Arc::new(()),
                         source: self.authority.clone(),
@@ -1481,7 +1649,8 @@ impl MarkdownLineItemCoordinator {
                 }
             }
             Stage::Style => {
-                // 调度等待只返回原nonce的副本，不重复创建Font、文件、Source或另一份请求权限。
+                // Waiting returns only a clone of the original nonce; it creates
+                // no font/file/Source and no independent request authority.
                 step.answer = MarkdownLineItemAnswer::NeedStyle(
                     payload
                         .request
@@ -1498,13 +1667,18 @@ impl MarkdownLineItemCoordinator {
                     .ok_or(MarkdownLineComposeError::InconsistentCoverage)?
                     .coverage
                     .end;
-                step.metadata_units = 1; // 查询实际发生前收费；Pending不会借下一个量子再查一次。
+                // Charge before the actual query. Pending cannot retroactively
+                // attribute this work to a later quantum.
+                step.metadata_units = 1;
                 let (answer, endpoint) = payload
                     .breaks
                     .certified_grapheme_endpoint(&self.authority, end)?;
                 match answer {
-                    MarkdownGraphemeAnswer::Pending => {} // 原GCB demand由Engine下一独立量子消费。
+                    // Engine consumes the original GCB demand in a separate later quantum.
+                    MarkdownGraphemeAnswer::Pending => {}
                     MarkdownGraphemeAnswer::Known(Some(boundary)) if boundary.utf16 == end => {
+                        // Transfer this exact response only after obtaining its
+                        // real shortened endpoint; reuse the original request nonce.
                         let response = payload
                             .pending_style
                             .take()
@@ -1535,8 +1709,9 @@ impl MarkdownLineItemCoordinator {
             }
             #[cfg(feature = "paged-shaping-frontier")]
             Stage::ClosedInput => {
-                // queue_style只完成原票交接；邻接上下文在此按同一个bytes/scalars余额
-                // 真实读取。context_bytes是本回合bytes的子集，没有同时再读中心正文。
+                // Queuing transferred only original proof. Read actual adjacent
+                // context here under this quantum's byte/scalar allowance;
+                // context_bytes is a subset of bytes, with no simultaneous central input.
                 let progress = payload
                     .closed_input
                     .as_mut()
@@ -1550,6 +1725,8 @@ impl MarkdownLineItemCoordinator {
                 step.context_bytes = progress.bytes;
                 step.scalars = progress.scalars;
                 if let Some(job) = progress.job {
+                    // Context preparation yields one real job owner only when
+                    // complete; transfer its original facts and registered font together.
                     let pending = payload
                         .closed_input
                         .take()
@@ -1568,10 +1745,13 @@ impl MarkdownLineItemCoordinator {
                         shaping_seams: pending.shaping_seams,
                     });
                     payload.stage = Stage::Input;
-                } // 固定上下文全部准备好才装配唯一Job；下一回合才输入中心正文，预算不复用。
+                }
+                // Central source input begins only in a later quantum, after
+                // this actual fixed context preparation has finished.
             }
             Stage::Input => {
-                // 原job逐批读取同一冻结源；单次原始正文请求仍不超过4KiB，不按item长短扩窗。
+                // The original job consumes this same frozen Source in finite
+                // batches. Source requests stay at most 4 KiB regardless of item length.
                 let item = payload
                     .item
                     .as_mut()
@@ -1587,11 +1767,14 @@ impl MarkdownLineItemCoordinator {
                 step.bytes = progress.bytes;
                 step.scalars = progress.scalars;
                 if progress.status == MarkdownShapingStatus::AwaitingShape {
+                    // Input completion authorizes the actual later shape call,
+                    // not a precomputed glyph result or final visual line.
                     payload.stage = Stage::Shape;
                 }
             }
             Stage::Shape => {
-                // 一次真实整形可包含长run的算法工作，必须在worker执行；深层取消沿原位传播。
+                // Actual shaping may perform long-run algorithmic work and must
+                // run on the worker, with its original deep-cancellation state.
                 let item = payload
                     .item
                     .as_mut()
@@ -1600,7 +1783,8 @@ impl MarkdownLineItemCoordinator {
                 step.shapes = 1;
                 #[cfg(feature = "paged-shaping-frontier")]
                 if closed_item::inspect_shaped(payload)? {
-                    // 首字素试字成功不证明闭项余下内容无缺字；真正入Store前逐条检查原结果。
+                    // A successful first-grapheme font trial does not prove the
+                    // rest has no missing glyphs. Inspect actual output before Store admission.
                     payload.stage = Stage::ClosedFonts;
                     return Ok(step);
                 }
@@ -1615,7 +1799,8 @@ impl MarkdownLineItemCoordinator {
                 );
             }
             Stage::Ready => {
-                // 未被消费的唯一item只重复返回有限事实，不复制字形或让较新任务替代原job。
+                // The sole unconsumed item repeats only finite original facts,
+                // without copying glyphs or substituting a newer task's job.
                 step.answer = MarkdownLineItemAnswer::ItemReady(
                     payload
                         .item
@@ -1626,6 +1811,8 @@ impl MarkdownLineItemCoordinator {
                 );
             }
             Stage::Control => {
+                // A still-outstanding original control stays pending under
+                // the same nonce until its actual platform response is accepted.
                 step.answer = MarkdownLineItemAnswer::NeedsControl(
                     payload
                         .control
@@ -1635,13 +1822,15 @@ impl MarkdownLineItemCoordinator {
                 );
             }
             Stage::End => {
-                step.answer = MarkdownLineItemAnswer::EndOfSource; // EOF重复查询仍经过原源健康与取消门。
+                // Repeated EOF queries still pass original Source/cancellation guards.
+                step.answer = MarkdownLineItemAnswer::EndOfSource;
             }
         }
         Ok(step)
     }
 
-    /// 同步兼容入口保留原即时GCB验证；不把这里的查询虚记成后继step预算。
+    /// Preserve immediate GCB validation for the synchronous public entry;
+    /// its actual queries cannot be charged to a later step's budget.
     pub fn provide_style(&mut self, response: MarkdownLineStyleResponse) -> Result<()> {
         let result = (|| {
             self.guard()?;
@@ -1660,7 +1849,8 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
-    /// 只消费当前真实控制nonce；Font和段落样式来自平台原对象，不创建字符替身。
+    /// Consume only the current original control nonce. Actual platform font
+    /// and paragraph facts do not require a substitute text character.
     pub(super) fn consume_control(
         &mut self,
         response: super::MarkdownLineControlResponse,
@@ -1676,9 +1866,12 @@ impl MarkdownLineItemCoordinator {
                 .as_ref()
                 .ok_or(MarkdownLineComposeError::InvalidRequest)?;
             if !matches!(payload.stage, Stage::Control) || !request.accepts(&response) {
+                // A stale or foreign response cannot consume this pending control.
                 return Err(MarkdownLineComposeError::SourceMismatch);
             }
             for offset in [request.source_utf16.start, request.source_utf16.end] {
+                // Both actual control endpoints need original GCB facts; do not
+                // split CRLF or an independently larger grapheme for convenience.
                 if !matches!(payload.breaks.grapheme_query(&self.authority, offset, MarkdownGraphemeQuery::IsBoundary)?, MarkdownGraphemeAnswer::Known(Some(actual)) if actual.utf16 == offset)
                 {
                     return Err(MarkdownLineComposeError::InconsistentCoverage);
@@ -1709,6 +1902,8 @@ impl MarkdownLineItemCoordinator {
                 end_of_text: range.end == paragraph.end,
             };
             response.registered.registration().lease()?;
+            // Only after all fallible validation succeeds may the sole cursor
+            // advance and relinquish the original outstanding control.
             payload.cursor = range.end;
             payload.control = None;
             payload.stage = Stage::ItemStart;
@@ -1719,7 +1914,8 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
-    /// 组合worker只借原已认证依赖；开放模式仍由每个实际查询给出Known或真实Pending。
+    /// Lend only the composition's original certified dependencies. In open
+    /// mode, each actual query still returns Known or genuine Pending independently.
     pub(super) fn dependencies(
         &mut self,
     ) -> Result<(&mut MarkdownBidiParagraph, &mut MarkdownLayoutBreakJob)> {
@@ -1739,9 +1935,12 @@ impl MarkdownLineItemCoordinator {
         #[cfg(not(feature = "paged-shaping-frontier"))]
         let prefix = false;
         if (!payload.scripts_ready && !prefix) || (!payload.breaks_ready && !prefix) {
+            // Neither incomplete full dependencies nor absent prefix authority
+            // can authorize downstream composition queries.
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
-        // 真B段的控制起点同样可查询原LB/GCB的Pending；这里只借原依赖，不授无控制或SCX范围。
+        // Actual paragraph-control starts may also query Pending LB/GCB. This
+        // borrow grants no independent control-free or script-range proof.
         Ok((
             payload
                 .bidi
@@ -1751,7 +1950,8 @@ impl MarkdownLineItemCoordinator {
         ))
     }
 
-    /// 逻辑词组删除只借本worker原GCB依赖，不要求字体、脚本或视觉行已经完成。
+    /// Logical word deletion borrows this worker's original grapheme dependency
+    /// without requiring completed fonts, scripts, or visual lines.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(in crate::markdown_line_composer) fn word_breaks(
         &mut self,
@@ -1764,7 +1964,8 @@ impl MarkdownLineItemCoordinator {
             .breaks)
     }
 
-    /// 只取实际LB查询的等待；GCB/cluster未完成或候选配额用完不会请求源扫描。
+    /// Consume only demand from an actual line-break query. An unfinished
+    /// grapheme/cluster or spent candidate budget does not itself request a source scan.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn take_line_break_demand(&mut self) -> Result<bool> {
         let result = (|| {
@@ -1778,7 +1979,8 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
-    /// 消费方已结束本量子后，单独推进同一原LBjob；保留Item/Style/Measure的原身份与游标。
+    /// Advance the same original line-break job after the consumer's quantum
+    /// ends, preserving original Item/style/measure identity and cursors.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn advance_pending_line_breaks(
         &mut self,
@@ -1787,7 +1989,8 @@ impl MarkdownLineItemCoordinator {
         self.advance_pending_break_dependency(budget, false)
     }
 
-    /// 移出唯一Ready item供同worker后继行组合消费；不会把item末尾签成软行末尾。
+    /// Transfer the sole Ready item to later composition in this same worker;
+    /// an item's end does not certify a soft line end.
     pub fn take_item(&mut self) -> Result<MarkdownLineItem> {
         let result = (|| {
             self.guard()?;
@@ -1796,6 +1999,7 @@ impl MarkdownLineItemCoordinator {
                 .as_mut()
                 .ok_or(MarkdownLineComposeError::Poisoned)?;
             if !matches!(payload.stage, Stage::Ready) {
+                // No other stage owns an actual fully shaped item ready for transfer.
                 return Err(MarkdownLineComposeError::InvalidRequest);
             }
             let mut item = payload
@@ -1803,24 +2007,31 @@ impl MarkdownLineItemCoordinator {
                 .take()
                 .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
             let profile = item.job.profile()?;
+            // Query the original job's terminal ordinal to certify complete
+            // glyph coverage and health before handing over its actual owner.
             item.job
                 .glyph(&self.authority, &item.font, profile.glyph_count)?;
             if item.facts.source_utf16.start != payload.cursor {
+                // The item cannot skip or replay text relative to this original cursor.
                 return Err(MarkdownLineComposeError::InconsistentCoverage);
             }
             #[cfg(feature = "paged-shaping-frontier")]
             frontier::lend_font_item(payload, &self.authority, &mut item)?;
             #[cfg(feature = "paged-shaping-frontier")]
             closed_item::lend_font_item(payload, &item)?;
-            // 新Font段登记的是这一个真实Ready child；原Frontier在其实际归还前不能越过它。
+            // Register this one actual Ready child with font continuation.
+            // The original frontier cannot advance past it before actual return.
             payload.cursor = item.facts.source_utf16.end;
             payload.next_shaping_seam = item.shaping_seams[1].clone();
             #[cfg(feature = "paged-shaping-frontier")]
             if payload.closed_fonts.is_some() {
+                // Continue the original closed item's font coverage after this child returns.
                 payload.stage = Stage::ClosedFonts;
             } else if payload.frontier.is_some() {
+                // Otherwise resume its existing frontier rather than constructing another item.
                 payload.stage = Stage::Frontier;
             } else {
+                // A fully consumed standalone item can begin the next original input interval.
                 payload.stage = Stage::ItemStart;
             }
             #[cfg(not(feature = "paged-shaping-frontier"))]
@@ -1833,13 +2044,16 @@ impl MarkdownLineItemCoordinator {
     }
 }
 
-/// 只有内部已收费端点可以跳过同步查询；空值保持原公开入口的准确验证行为。
+/// Only an internally obtained, already-charged endpoint may avoid another
+/// synchronous query; absent proof retains public entry's exact validation.
 #[derive(Default)]
 struct StyleCoordinates {
     #[cfg(feature = "paged-shaping-frontier")]
     endpoint: Option<CertifiedShapingEndpoint>,
 }
 
+/// Validate one original style response before creating any real shaping owner.
+/// Preserve its actual endpoint certificates, context barriers, and resource scope.
 fn install_style(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
@@ -1860,13 +2074,18 @@ fn install_style(
         || response.coverage.end <= response.coverage.start
         || response.coverage.end > request.range.end
     {
-        // 相同字节、相同坐标、旧请求重放都不能替代实际仍待响应的唯一nonce。
+        // Equal bytes/coordinates or replayed requests cannot substitute for
+        // this actual still-outstanding unique nonce.
         return Err(MarkdownLineComposeError::SourceMismatch);
     }
-    let text = request.text_scope()?; // 真实样式安装只消费已分析文字，不能为结构行补造 Unicode 事实。
+    // Actual text-style installation requires analyzed text; structural rows
+    // cannot acquire manufactured Unicode facts through this entry.
+    let text = request.text_scope()?;
     let mut shaping_seams = request.shaping_seams.clone();
     if response.coverage.end != request.range.end {
-        shaping_seams[1] = None; // 真实缩短样式段不能继承尚未到达的右 UBA seam。
+        // A shortened interval has not reached the original right bidi seam
+        // and cannot inherit its context barrier or endpoint authority.
+        shaping_seams[1] = None;
     }
     #[cfg(feature = "paged-shaping-frontier")]
     if request.continuation_font.is_some() {
@@ -1874,7 +2093,8 @@ fn install_style(
         if frontier::has_style_boundary_probe(payload) {
             return frontier::provide_boundary_style(payload, authority, cancellation, response);
         }
-        // 两条路径都只发已取得原GCB端点的试次；不能让闭项响应误落到另一个Frontier owner。
+        // Both continuation paths already own their original grapheme endpoints.
+        // A closed-item response cannot be consumed by a different frontier owner.
         if payload.closed_fonts.is_some() {
             return closed_item::provide_font_style(payload, authority, response);
         }
@@ -1882,11 +2102,14 @@ fn install_style(
     }
     #[cfg(feature = "paged-shaping-frontier")]
     let end_proof = if let Some(endpoint) = coordinates.endpoint {
+        // Reuse only the actual endpoint previously charged for this exact response extent.
         if endpoint.boundary(authority)?.utf16 != response.coverage.end {
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
         endpoint
     } else {
+        // Synchronous callers still obtain the original endpoint now; this
+        // query is not retroactively assigned to another step's quantum.
         let (answer, endpoint) = payload
             .breaks
             .certified_grapheme_endpoint(authority, response.coverage.end)?;
@@ -1894,6 +2117,7 @@ fn install_style(
             MarkdownGraphemeAnswer::Known(Some(boundary))
                 if boundary.utf16 == response.coverage.end =>
             {
+                // The real GCB certificate keeps any coincident original bidi barrier.
                 CertifiedShapingEndpoint::Grapheme {
                     proof: endpoint.ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
                     seam: if response.coverage.end == request.range.end {
@@ -1904,6 +2128,8 @@ fn install_style(
                 }
             }
             MarkdownGraphemeAnswer::Known(None) if response.coverage.end == request.range.end => {
+                // Only this full original request may use its actual bidi seam
+                // as a nongrapheme shaping endpoint; short coverage has no such proof.
                 let seam = request.shaping_seams[1]
                     .clone()
                     .ok_or(MarkdownLineComposeError::InvalidRequest)?;
@@ -1943,16 +2169,20 @@ fn install_style(
         let registered = registration.lease()?;
         if !response.font.permits(&registered.font().authority()) {
             return Err(MarkdownLineComposeError::SourceMismatch);
-        } // 只有同一个实际Font payload才能使用该注册；数字slot、PSName均不能代替此门。
+        }
+        // Only the same actual font payload may use this registration. A numeric
+        // slot or equal PostScript name cannot replace its authority.
     }
     #[cfg(feature = "paged-shaping-frontier")]
     {
-        // 响应显式缩短coverage时，它沿原API确定一个真实样式项末端；不能再把
-        // 这个已确定末端当作SCX暂存的支持域而吞掉最后GCB。只有回应到开放请求
-        // 的临时上界，才必须保留后继见证并在原Script后续推进后重新请求。
+        // Explicit shortened coverage establishes a real style end; it cannot
+        // later be treated as temporary SCX support and lose its last grapheme.
+        // Only a response reaching the open request's provisional bound retains
+        // a following witness and requests more after the original script progresses.
         payload.open_script &= response.coverage.end == request.range.end;
     }
-    // 平台只提供实际Font与有限样式；段落、脚本、方向和BOT/EOT由原分析事实封闭决定。
+    // The platform supplies actual font and finite style only. Original
+    // paragraph/script/bidi facts determine direction and BOT/EOT boundaries.
     let facts = MarkdownLineItemFacts {
         source_utf16: response.coverage.clone(),
         paragraph_utf16: text.paragraph.clone(),
@@ -1964,7 +2194,8 @@ fn install_style(
         end_of_text: response.coverage.end == text.paragraph.end,
     };
     let font = response.font.authority();
-    // 先显式核固定小预算，才复制重形所需样式；非法大Vec不能为错误响应再分配一份。
+    // Check finite style budgets before cloning replay options; an invalid
+    // oversized feature vector cannot force another retained allocation.
     if response.style.features.len() > crate::MARKDOWN_SHAPING_MAX_FEATURES
         || response
             .style
@@ -1979,13 +2210,16 @@ fn install_style(
     let natural_tail = !payload.open_script && response.coverage == request.range;
     #[cfg(feature = "paged-shaping-frontier")]
     let admission = if payload.frontier_enabled {
-        // 只有完整原request能取得闭项票；缩短响应即使已经清除open_script，仍不会
-        // 借此把预算切片升级为自然项。两张端点票原样移交，不仅复制其坐标。
+        // Only the complete original request can obtain closed-item authority.
+        // Clearing open_script on shortened coverage cannot upgrade a budget
+        // fragment into natural closure. Transfer actual endpoint tickets, not just numbers.
         closed_item::ClosedItem::admit(payload, authority, &response, end_proof, cancellation)?
     } else {
-        closed_item::Admission::Frontier(end_proof) // 原非前沿入口保持既有完整项合同。
+        // Nonfrontier callers preserve their established complete-item contract.
+        closed_item::Admission::Frontier(end_proof)
     };
-    // 输入owner只在完整响应验证后创建；构造失败会真实归还候选，不发布半初始化item。
+    // Create an input owner only after complete response validation. Constructor
+    // failure returns real candidate resources without publishing a partial item.
     let options = MarkdownShapingOptions {
         direction,
         script: facts.script,
@@ -1998,8 +2232,10 @@ fn install_style(
     #[cfg(feature = "paged-shaping-frontier")]
     let end_proof = match admission {
         closed_item::Admission::Closed(closed_item) => {
-            // 原小项已自然封闭；这里只转移票和原有限样式，不能为装配Job同步读取
-            // 邻接上下文。后继ClosedInput才实际收费，完整shape仍不是可恢复时间量子。
+            // This small item closed naturally. Transfer only proof and finite
+            // original style; do not synchronously read context while assembling
+            // the job. ClosedInput later pays real input work, while a full shape
+            // call still is not a resumable wall-clock quantum.
             let fonts = closed_item::FontRuns::new(
                 &closed_item,
                 response.font.clone(),
@@ -2026,16 +2262,21 @@ fn install_style(
             });
             payload.closed_fonts = Some(fonts);
             payload.request.take();
-            payload.font_probe_scope.take(); // 响应消费即撤旧试次，不能把相同范围的旧probe重用。
+            // Consuming the response revokes its old font trial immediately;
+            // equal coordinates cannot make that escaped probe current again.
+            payload.font_probe_scope.take();
             payload.scan.take();
             payload.stage = Stage::ClosedInput;
-            return Ok(()); // 后继仍按调用方原bytes/scalars预算输入，再交真实完整ItemReady。
+            // Later steps consume original byte/scalar quanta before actual complete ItemReady.
+            return Ok(());
         }
+        // Retain the original endpoint for frontier work when natural closure was not admitted.
         closed_item::Admission::Frontier(endpoint) => endpoint,
-    }; // 未准入时归还原末端票，后继前沿仍消费原scope，不能另造公开坐标许可。
+    };
     #[cfg(feature = "paged-shaping-frontier")]
     if payload.frontier_enabled {
-        // 原完整响应先建能力owner，尚未认证的tail不创建glyph输入或伪造部分item。
+        // Establish the original frontier owner first. An uncertified tail
+        // creates neither glyph input nor a fabricated partial Ready item.
         let resource_registration = payload.resources.begin_frontier_audit();
         let scan = payload
             .scan
@@ -2045,6 +2286,8 @@ fn install_style(
             .as_ref()
             .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
         let mut owner = if payload.open_script {
+            // An open item keeps the actual script-prefix scope and its original
+            // endpoint witnesses rather than treating provisional coverage as closed.
             let prefix = match payload.scripts.stable_prefix_at(
                 authority,
                 MarkdownScriptUnit::Utf16,
@@ -2068,6 +2311,8 @@ fn install_style(
             )
             .map_err(frontier::map_error)?
         } else {
+            // Closed script coordinates still carry original endpoint proof;
+            // numeric ranges alone cannot construct certified shaping input.
             crate::markdown_shaping::frontier::MarkdownShapingFrontierJob::new_with_scope(
                         payload.source.clone(), authority, response.font.clone(), &font,
                         crate::markdown_shaping::frontier::MarkdownShapingFrontierScope::CertifiedCoordinates {
@@ -2088,13 +2333,16 @@ fn install_style(
             natural_tail,
         ));
         payload.request.take();
-        payload.font_probe_scope.take(); // 原响应已消费，所有在途字体试次立即失去原请求权限。
+        // The original response was consumed, so every outstanding font trial
+        // immediately loses that request's authority.
+        payload.font_probe_scope.take();
         payload.scan.take();
         payload.stage = Stage::Frontier;
         return Ok(());
     }
     let job = if shaping_seams.iter().any(Option::is_some) {
-        // 非前沿入口仍保持完整项合同；真正 UBA seam 只裁断邻接上下文，不签新的 GCB/BOT/EOT。
+        // Nonfrontier input retains its complete-item contract. An actual bidi
+        // seam narrows adjacent context only; it grants no new GCB/BOT/EOT fact.
         let start = match &shaping_seams[0] {
             Some(seam) => seam.boundary(authority)?.0,
             None => payload
@@ -2123,6 +2371,8 @@ fn install_style(
             cancellation.shape.clone(),
         )?
     } else {
+        // With no original bidi barriers, preserve the standard job's actual
+        // bounded input and adjacent-context construction.
         MarkdownShapingJob::new_with_cancellation(
             payload.source.clone(),
             authority,
@@ -2144,13 +2394,15 @@ fn install_style(
         shaping_seams,
     });
     payload.request.take();
-    payload.font_probe_scope.take(); // 不保活已完成样式阶段的字体探测或相同坐标旧票。
+    // Finished style work keeps neither font-trial authority nor old equal-coordinate tickets alive.
+    payload.font_probe_scope.take();
     payload.scan.take();
     payload.stage = Stage::Input;
     Ok(())
 }
 
-/// 只查看当前真实unit及CR后可能的LF；不通过完整NSString/段落String识别控制。
+/// Inspect only the current actual unit and a possible LF after CR, without
+/// constructing an NSString or paragraph String to classify controls.
 fn initial_inline_control(
     source: &MarkdownLayoutTextSource,
     authority: &MarkdownLayoutTextAuthority,
@@ -2167,21 +2419,27 @@ fn initial_inline_control(
             .uniform_control_free_span(authority, offset..end)?
             .is_some()
         {
-            return Ok(None); // 同原完整证明排除控制，起点也不为一次分类重新读取冻结窗口。
+            // The same complete original proof excludes controls; no extra
+            // frozen-window read is needed just to classify this starting unit.
+            return Ok(None);
         }
     }
     #[cfg(not(feature = "paged-shaping-frontier"))]
-    let _ = (authority, bidi); // 旧功能配置继续使用原控制getter，不引入未启用的证书API。
+    // Configurations without frontier proof retain their existing control-unit
+    // query and do not reference an unavailable certificate API.
+    let _ = (authority, bidi);
     inline_control(source, offset)
 }
 
-/// 无完整控制证明的原路径；其有限UTF16窗口读取尚未纳入ItemScan的bytes配额。
+/// Without complete control-free proof, use the original finite UTF-16 cache.
+/// This path's unit/cache work is not included in ItemScan's reported byte quantum.
 fn inline_control(
     source: &MarkdownLayoutTextSource,
     offset: usize,
 ) -> Result<Option<MarkdownLineInlineControl>> {
     source.health()?;
     if offset >= source.utf16_len() {
+        // Actual EOF contains no control unit and grants no out-of-range read.
         return Ok(None);
     }
     let snapshot = source.snapshot_for_bidi();
@@ -2193,12 +2451,16 @@ fn inline_control(
         0x85 => MarkdownLineInlineControlKind::NextLine,
         0x2028 => MarkdownLineInlineControlKind::LineSeparator,
         0x2029 => MarkdownLineInlineControlKind::ParagraphSeparator,
-        _ => return Ok(None), // 普通UTF16（含代理项）仍交原Script/UBA/GCB，不改变字符。
+        // Ordinary UTF-16, including surrogate units, remains original text for
+        // script/bidi/grapheme analysis without character substitution.
+        _ => return Ok(None),
     };
     let mut end = offset
         .checked_add(1)
         .ok_or(MarkdownLineComposeError::Overflow)?;
     if unit == 13 && end < source.utf16_len() && snapshot.utf16_code_unit_at(end)? == 10 {
+        // Preserve the actual CRLF pair as one control range, including its LF
+        // instead of manufacturing two independent paragraph transitions.
         end = end
             .checked_add(1)
             .ok_or(MarkdownLineComposeError::Overflow)?;
@@ -2212,6 +2474,8 @@ fn inline_control(
 }
 
 impl std::fmt::Debug for MarkdownLineInlineControl {
+    /// Format only finite public control geometry, without exposing Source internals
+    /// or retaining/copying content for diagnostics.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MarkdownLineInlineControl")
             .field("source_utf16", &self.source_utf16)

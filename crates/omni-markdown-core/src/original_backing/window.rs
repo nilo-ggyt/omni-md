@@ -93,6 +93,8 @@ impl WindowState {
     }
 
     pub(super) fn managed_bytes(&self, capacity: usize, page_size: usize) -> usize {
+        // Only admitted directory entries count toward this owner's budget.
+        // The kernel's file cache and unrelated process allocations live elsewhere.
         self.slots[..capacity]
             .iter()
             .filter(|slot| slot.page.is_some())

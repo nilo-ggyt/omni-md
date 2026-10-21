@@ -1,4 +1,5 @@
-//! 查找必须先读到真实单格提交，再完成同一正文的可见匹配；原磁盘与单笔历史独立核对。
+//! Find must consume the actual cell commit before revealing a match in the same
+//! document. Independently verify original disk contents and one-entry history.
 
 use super::*;
 
@@ -14,8 +15,9 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
     let child = cell.view().map_err(|cause| cause.to_string())?;
     let first = observe(&cell)?;
     let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**child);
-    // 真实client只替换固定短格；这里不写canonical，也不代替物理输入法确认候选。
-    // SAFETY: 当前主线程活client、有效字符串与原格四个真实UTF16单元。
+    // The actual client replaces only this fixed short draft, without writing
+    // canonical text or claiming physical IME candidate confirmation.
+    // SAFETY: The main-thread client/string are alive and the original cell has four UTF-16 units.
     unsafe {
         client.insertText_replacementRange(&NSString::from_str(UI_INSERTED), NSRange::new(0, 4));
     }
@@ -23,7 +25,8 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
     ui_local(&child, UI_INSERTED)?;
     ui_document(rig, UI_SOURCE)?;
 
-    // 格外父背景的右键菜单也必须保留原活动格历史，不能碰尚未提交的父文稿 Undo。
+    // The parent background's context menu must route history to the actual active
+    // cell rather than the parent document's still-uncommitted character history.
     let window = rig.view.window().ok_or("活动格右键菜单的窗口已释放")?;
     let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
         NSEventType::RightMouseDown,
@@ -52,14 +55,15 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
         if !item.isEnabled() {
             return Err("右键菜单误用了父文稿历史，禁用了真实草稿历史".into());
         }
-        menu.performActionForItemAtIndex(index); // 经父view实际返回的NSMenu交付，不直接调用child或改Doc。
+        menu.performActionForItemAtIndex(index); // Deliver through the parent view's actual NSMenu, not direct child/Doc mutation.
         drop((item, menu));
         frame::wait_complete_frame(stage, &cell, first)?;
         ui_local(&child, expected)?;
-        ui_document(rig, UI_SOURCE)?; // 两次菜单动作都只能影响原草稿，不可提前发布或撤销canonical。
+        ui_document(rig, UI_SOURCE)?; // Both menu actions affect only the original draft, without early canonical commit/undo.
     }
 
-    // Find沿生产Body入口结束真实草稿；只有查到新字且显示完整帧才算完成，不能直接提交格帮助测试。
+    // Production Body Find ends the actual draft. Require the new characters and
+    // a complete visible frame, without directly committing the cell to assist the test.
     rig.bar.query.setStringValue(&NSString::from_str("中文"));
     let first = observe(&rig.body)?;
     let pending = match rig
@@ -97,7 +101,8 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
         return Err("单格查找有画面但原匹配请求尚未成功结束".into());
     }
 
-    // 仅一笔canonical修改；查找选择不制造历史，Undo必须一次恢复原格和整份原始CRLF。
+    // Find selection adds no character history. One canonical Undo must restore
+    // the original cell and every original CRLF byte together.
     let first = observe(&rig.body)?;
     rig.view
         .command(sel!(undo:))
@@ -105,7 +110,7 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
     frame::wait_complete_frame("table_ui_find_single_undo", &rig.body, first)?;
     ui_document(rig, UI_SOURCE)?;
     rig.remember_receipt()?;
-    drop((child, cell)); // 关闭门核同一批旧子图；测试不以强claim延长其输入、字体或映射寿命。
+    drop((child, cell)); // Strict close observes these same retired child graphs without local claims extending Input/font/mmap lifetime.
     println!(
         "native_body_table_cell_ui find_reads_actual_cell_commit=true visible_canonical_match=true one_document_undo=true original_disk_unchanged=true physical_ime_tested=false whole_product=false formal=false"
     );

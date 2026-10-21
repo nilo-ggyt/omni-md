@@ -1,29 +1,38 @@
-//! 原正文或真实表格格的装饰续体；每个 line、part 与 selection 项支付同一 metadata 预算。
+//! Resumable decorations for the original body or table cell. Every visited line,
+//! part, and selection entry consumes the shared metadata allowance.
 //!
-//! 同步代码背景与选区入口保留作完整像素对照，异步正文与Grid共用这里的原窗口循环。
-//! 背景先于所有选区，选区先于所有字形；暂停不会改变这个像素覆盖顺序。
-//! 游标没有自己的context，唯一Scene Paint一直持有未发布候选；失败直接丢弃候选。
-//! 原Line/Part与display映射都已封存，跨量子只保存有限下标，不创建第二份排版结果。
-//! 字形、源文字和选中内容不会进入本文件的状态；metadata是实际遍历项而非整格折算。
+//! The synchronous background and selection entry points remain complete pixel
+//! comparisons; asynchronous Body and Grid use this same original-window traversal.
+//! All backgrounds precede selections, and all selections precede glyphs, including
+//! across suspension. The cursor owns no context: Scene Paint alone owns the
+//! unpublished candidate and discards it on failure. Original Line/Part records and
+//! display mappings are already sealed, so only bounded indexes survive a quantum.
+//! No glyphs, source text, selected content, or duplicate layout enters this state;
+//! metadata work counts actual visited records rather than estimating whole cells.
 
 use super::*;
 use omni_markdown_core::MarkdownComposedLineAffinity;
 
-/// 仅保原窗口的循环位置和一个已映射范围；没有正文、context claim 或第二套布局对象。
+/// Holds original-window traversal positions and one mapped range, without document
+/// text, a context claim, or a second layout graph.
 pub(in crate::native_surface) struct NativeMarkdownComposedViewportDecorationCursor {
     cursor: Decoration,
-    // 背景任务没有canonical选区；只有selection任务携带同原格范围求交所需的两个端点。
+    // Background work has no canonical selection. Selection work retains only the
+    // two endpoints needed to intersect the original window's canonical range.
     canonical: Option<Range<usize>>,
-    // 当前一个选区完成前保留其display端点，下一选区覆盖它，不收集全部映射结果。
+    // Keep this selection's display endpoints until it finishes, then overwrite
+    // them with the next selection instead of collecting all mapping results.
     selected: Option<Range<usize>>,
-    // marked 只改变本次显示：原 Input 范围、字形与行槽不变，确认组合后随旧 Scene 一起退役。
+    // Marked styling changes presentation only. Original Input ranges, glyphs, and
+    // line slots remain unchanged; the old Scene retires when composition commits.
     marked: bool,
     native_draw_returned: bool,
 }
 
 #[derive(Clone, Copy)]
-// 各项直接对应原双层line/part循环及外层selection循环，结束事实本身也支付一次遍历项。
-// 阶段切换不签发Glyph完成票，只有Scene的后续真实字形会话能完成整张候选。
+// States mirror the original line/part loops and outer selection loop. Observing
+// the end also costs one record. Stage transitions do not certify glyph completion;
+// the Scene's subsequent glyph session must finish the candidate itself.
 enum Decoration {
     BackgroundLine(usize),
     BackgroundPart {
@@ -49,7 +58,8 @@ pub(in crate::native_surface) struct NativeMarkdownComposedViewportDecorationSte
 }
 
 impl NativeMarkdownComposedViewportDecorationCursor {
-    /// 代码背景只消费原封存行/part，构造不进入 Native、不取得额外来源或字体。
+    /// Background work consumes sealed original lines/parts. Construction calls
+    /// no Native API and acquires no additional Source or font.
     pub(in crate::native_surface) fn backgrounds() -> Self {
         Self {
             cursor: Decoration::BackgroundLine(0),
@@ -60,13 +70,15 @@ impl NativeMarkdownComposedViewportDecorationCursor {
         }
     }
 
-    /// 已封存窗口范围只与 canonical 选区求交；正文不换坐标，格仍由同一 display Source 映射。
+    /// Intersects canonical selections with the sealed window. Body coordinates
+    /// stay unchanged; a cell still maps through its original display Source.
     pub(in crate::native_surface) fn selections(
         canonical: Range<usize>,
         selections: &[Range<usize>],
     ) -> Self {
-        // 原Input已经给出有序不相交范围；只跳过严格位于本格之前的metadata，不读取那些正文。
-        // 当前格之后的首范围会在SelectionEntry结束任务，不逐项扫全文Find结果。
+        // Input supplies ordered disjoint ranges. Skip metadata ending before this
+        // window without reading that text; the first range after the window ends
+        // SelectionEntry rather than scanning every document-wide Find result.
         let first = selections.partition_point(|selection| selection.end <= canonical.start);
         Self {
             cursor: Decoration::SelectionEntry(first),
@@ -77,8 +89,9 @@ impl NativeMarkdownComposedViewportDecorationCursor {
         }
     }
 
-    /// 组合文字沿原选区的真实坐标映射，只把填框改为各 part 原字体的下划线。
-    /// 不解释输入法属性、不建立另一份 marked 状态，也不改变候选范围或实际选择。
+    /// Uses the same actual selection mapping for composition, replacing filled
+    /// rectangles with each part's original font underline. It does not interpret
+    /// IME attributes, duplicate marked state, or change candidate/selection ranges.
     pub(in crate::native_surface) fn marked_text(mut self) -> Self {
         self.marked = true;
         self
@@ -86,7 +99,8 @@ impl NativeMarkdownComposedViewportDecorationCursor {
 }
 
 impl NativeMarkdownComposedViewport {
-    /// 只推进调用者剩余的 metadata 项；任何失败使外层丢弃整张未发布画布，不重放原 draw。
+    /// Consumes only the caller's remaining metadata allowance. Any failure makes
+    /// the outer owner discard the unpublished canvas without replaying draws.
     pub(in crate::native_surface) fn advance_decorations(
         &self,
         cursor: &mut NativeMarkdownComposedViewportDecorationCursor,
@@ -101,10 +115,12 @@ impl NativeMarkdownComposedViewport {
     > {
         let result = (|| -> std::result::Result<_, NativeMarkdownComposedViewportPaintCause> {
             self.require(current)?;
-            // 每次调用配平自己的颜色和背景clip，游标不会把图形状态留给另一个格。
-            // 背景由未裁剪的真实行/part框绘制，因此与同步背景入口一样领取窗口clip。
-            // 选区在下面已把矩形裁到同一clip；不能再把分数像素边缘的coverage乘一次。
-            // 外层边线阶段在背景任务完成后才建立路径，ClipToRect不会清掉待提交边线。
+            // Balance colors and background clipping within this call so another
+            // cell cannot inherit them. Backgrounds use unclipped actual line/part
+            // frames and therefore need the same window clip as synchronous paint.
+            // Selection rectangles are already clipped below; clipping again would
+            // multiply fractional-edge coverage. The outer border stage builds its
+            // path after backgrounds finish, so ClipToRect cannot clear pending borders.
             CGContext::save_g_state(Some(context));
             let restore = Restore(context);
             if cursor.canonical.is_none() {
@@ -113,11 +129,12 @@ impl NativeMarkdownComposedViewport {
             let mut records = 0;
             while records < budget && !matches!(cursor.cursor, Decoration::Done) {
                 self.require(current)?;
-                records += 1; // 下列每次只消费一个真实循环项；没有隐藏的全格遍历。
+                records += 1; // Each iteration visits one actual record, without a hidden whole-cell scan.
                 match cursor.cursor {
                     Decoration::BackgroundLine(line) => {
-                        // 行背景有固定数量的矩形，行内parts必须交下一阶段逐个消费。
-                        // overscan只保metadata；真正离屏的行不产生本候选像素，也不需要进入其parts。
+                        // A line background has a fixed rectangle count; its parts
+                        // are visited individually in the next stage. Offscreen
+                        // overscan retains metadata but produces no pixels or part work.
                         if let Some(actual) = self.lines.get(line) {
                             if self.visible(actual.frame) {
                                 self.line_background(
@@ -126,8 +143,9 @@ impl NativeMarkdownComposedViewport {
                                     &mut cursor.native_draw_returned,
                                     current,
                                 )?;
-                                // 原行收费及块背景已完成；封存事实证明全部 part 都无代码底色
-                                // 时直接前进。只跳过零绘制循环，不用行框猜测任何字形墨迹。
+                                // The line record and block background are complete.
+                                // Sealed facts can prove all parts lack code background,
+                                // skipping only a zero-draw loop, without estimating ink.
                                 cursor.cursor = if actual.has_inline_code_background {
                                     Decoration::BackgroundPart { line, part: 0 }
                                 } else {
@@ -141,8 +159,9 @@ impl NativeMarkdownComposedViewport {
                         }
                     }
                     Decoration::BackgroundPart { line, part } => {
-                        // 每次最多访问一个原part；不论它是否inline-code都支付相同的查阅费用。
-                        // 暂停位置只在一次完整矩形操作之后前移，不能重放已经返回的Native fill。
+                        // Inspect at most one original part, charging equally whether
+                        // or not it has inline code. Advance only after its rectangle
+                        // operation returns so suspension cannot replay a Native fill.
                         if let Some(actual) = self.lines[line].parts.get(part) {
                             self.part_background(
                                 &self.lines[line],
@@ -160,8 +179,10 @@ impl NativeMarkdownComposedViewport {
                         }
                     }
                     Decoration::SelectionEntry(selection) => {
-                        // canonical范围先和原窗口求交，正文保持原端点，格的隐藏语法沿同一目录映射。
-                        // 这一步不访问line或part；两端映射归还源读取租约后才进入后续Native绘制。
+                        // Intersect canonical ranges with the original window first.
+                        // Body endpoints stay unchanged; cell syntax maps through its
+                        // existing directory. No line/part is visited here, and endpoint
+                        // mapping releases Source leases before later Native drawing.
                         let canonical = cursor.canonical.as_ref().expect("选区续体持原格范围");
                         if let Some(actual) = selections
                             .get(selection)
@@ -175,8 +196,10 @@ impl NativeMarkdownComposedViewport {
                                 let (start, end) = match &self.domain {
                                     LayoutDomain::Body => (start, end),
                                     LayoutDomain::TableCell { display, .. } => {
-                                        // 同一真实格的起点取下游、终点取上游，隐藏URL没有选区面积。
-                                        // 两次实际读取失败都保留Source错误，不以未映射范围代替显示坐标。
+                                        // Map this cell's start downstream and end
+                                        // upstream, leaving hidden URLs no selection
+                                        // area. Preserve either Source read failure
+                                        // instead of using unmapped display endpoints.
                                         let start = display
                                             .canonical_to_display(
                                                 start,
@@ -206,9 +229,10 @@ impl NativeMarkdownComposedViewport {
                                     return Err(
                                         NativeMarkdownComposedViewportError::InvalidRange.into()
                                     );
-                                } // 与原selection_rects相同：倒序映射是实际坐标失败，不能静默丢失高亮。
+                                } // Like selection_rects, reversed mapping is a coordinate error, not absent highlighting.
                                 if start == end {
-                                    // 纯隐藏语法没有可见面积，不需要为了确认零矩形再扫描所有parts。
+                                    // Hidden syntax has no visible area; no part scan
+                                    // is needed merely to confirm an empty rectangle.
                                     cursor.cursor = Decoration::SelectionEntry(selection + 1);
                                 } else {
                                     cursor.selected = Some(start..end);
@@ -221,15 +245,18 @@ impl NativeMarkdownComposedViewport {
                         }
                     }
                     Decoration::SelectionLine { selection, line } => {
-                        // 一个selection可以跨多条已准备软行；每条真实行先单独付费，再查看其parts。
-                        // 行的可见性与原同步selection_rects完全一致，不用选区包络代替真实clip。
+                        // A selection can span several prepared soft lines. Charge
+                        // each line before its parts and use the synchronous
+                        // selection_rects visibility test, not a selection envelope.
                         if let Some(actual) = self.lines.get(line) {
                             let selected =
                                 cursor.selected.as_ref().expect("逐行绘制保同一已映射选区");
                             let source = &actual.handle.facts().source_utf16;
-                            // 原Reader已认证每个part的源范围包含于本行；整行与选区不相交时，
-                            // 后续每个part的求交都必为空。仍支付本行费用，只省零绘制的part循环。
-                            // 这里使用真实源端点，不按视觉次序或墨迹包络猜测，RTL与跨段GCB不变。
+                            // The original Reader verified every part is contained
+                            // in its line's Source range. A disjoint line therefore
+                            // proves every part intersection empty. Charge the line
+                            // but skip that zero-draw loop. Actual Source endpoints,
+                            // rather than visual/ink order, preserve RTL and GCB seams.
                             let intersects =
                                 selected.start < source.end && source.start < selected.end;
                             cursor.cursor = if intersects && self.visible(actual.frame) {
@@ -254,8 +281,10 @@ impl NativeMarkdownComposedViewport {
                         line,
                         part,
                     } => {
-                        // 一个真实part最多交一个相交矩形；同part中的全部GCB不会被复制成Vec。
-                        // 查实际GCB端点与原part几何后才fill，任何目录/字体错误撤回整个候选。
+                        // One actual part yields at most one intersecting rectangle,
+                        // without collecting all its GCBs. Fill only after resolving
+                        // real GCB endpoints and part geometry; a directory/font
+                        // failure invalidates the entire candidate.
                         if let Some(actual) = self.lines[line].parts.get(part) {
                             let facts = actual.handle.facts();
                             if !matches!(
@@ -270,17 +299,20 @@ impl NativeMarkdownComposedViewport {
                                 let start = selected.start.max(facts.source_utf16.start);
                                 let end = selected.end.min(facts.source_utf16.end);
                                 if start < end {
-                                    // 先保原完整GCB，再将包络裁回本真实整形part。
-                                    // 一个GCB可跨多个UBA/字体段；每段只负责自己的实际几何，
-                                    // 不能用相邻part端点重复覆盖或请求本part没有的caret。
+                                    // Expand to the original whole GCB, then intersect
+                                    // with this shaping part. A GCB may span UBA/font
+                                    // runs; each owns only its actual geometry and
+                                    // cannot reuse adjacent endpoints or foreign carets.
                                     let range =
                                         self.boundary(start, false)?.max(facts.source_utf16.start)
                                             ..self.boundary(end, true)?.min(facts.source_utf16.end);
                                     let mut frame =
                                         self.part_rect(&self.lines[line], actual, range, current)?;
                                     if cursor.marked {
-                                        // 部分范围、跨软行与 RTL 都沿同一个真实 part_rect 求横向两端。
-                                        // 垂直位置只取本 part 原字体度量，不按字符串长度或全行最高字体猜线。
+                                        // Partial, wrapped, and RTL ranges share the
+                                        // actual part_rect horizontal endpoints. The
+                                        // original part font alone supplies vertical
+                                        // metrics, not string length or line maxima.
                                         let metrics = self.palette[actual.font]
                                             .metrics()
                                             .map_err(NativeMarkdownComposedViewportError::Font)?;
@@ -296,8 +328,10 @@ impl NativeMarkdownComposedViewport {
                                     {
                                         let [r, g, b, a] = selection_color;
                                         self.fill_color(context, [r, g, b, a]);
-                                        // Reader和Font临时借用已结束，Native fill前后仍核同Source/current。
-                                        // 外层尚未发布画布，因此取消不会把这一个矩形当作成功帧。
+                                        // Reader and temporary font borrows have
+                                        // ended. Check the same Source/current before
+                                        // fill and again below; the unpublished canvas
+                                        // prevents cancellation from publishing this rectangle.
                                         self.require(current)?;
                                         CGContext::fill_rect(Some(context), frame);
                                         cursor.native_draw_returned = true;
@@ -320,7 +354,8 @@ impl NativeMarkdownComposedViewport {
                 }
                 self.require(current)?;
             }
-            // 先归还图形状态，再运行可重入current；不会让回调继承格局部clip或选区颜色。
+            // Restore graphics state before reentrant current so it cannot inherit
+            // a cell-local clip or selection color.
             drop(restore);
             self.require(current)?;
             Ok(NativeMarkdownComposedViewportDecorationStep {
@@ -328,7 +363,8 @@ impl NativeMarkdownComposedViewport {
                 complete: matches!(cursor.cursor, Decoration::Done),
             })
         })();
-        // 派生几何错误或撤销发生后仍核原 Source，避免把真实读失败改写为普通取消。
+        // Recheck the original Source even after geometry failure or revocation,
+        // preserving actual read failure rather than rewriting it as cancellation.
         let result = match self.require(current) {
             Ok(()) => result,
             Err(cause) => Err(cause.into()),
@@ -339,7 +375,8 @@ impl NativeMarkdownComposedViewport {
         })
     }
 
-    /// 单行块背景的几何取自已封存行；至多固定五个矩形，不枚举本行 parts。
+    /// Uses one sealed line's block geometry, drawing at most five rectangles
+    /// without enumerating its parts.
     fn line_background(
         &self,
         line: &Line,
@@ -347,21 +384,25 @@ impl NativeMarkdownComposedViewport {
         native_draw_returned: &mut bool,
         current: &dyn Fn() -> bool,
     ) -> std::result::Result<(), NativeMarkdownComposedViewportPaintCause> {
-        // 颜色来自原Native常量；此单行步骤不改变字号、baseline或段距。
-        // 同步oracle仍保原循环实现，此处直接消费同一已封存几何的一个实际行。
+        // Existing Native constants supply colors without changing font size,
+        // baseline, or paragraph spacing. The synchronous comparison retains its
+        // original loop; this step consumes one line of the same sealed geometry.
         let [red, green, blue, alpha] = NATIVE_MARKDOWN_CODE_BACKGROUND;
         self.fill_color(context, [red, green, blue, alpha]);
-        // 块背景只消费已经决定软换行、baseline 和滚动高度的同一行框；不能在这里扩张正文。
+        // Reuse the frame that already determines wrapping, baseline, and scroll
+        // height; painting cannot expand the body layout.
         use crate::native_surface::preview_paragraph::PreviewParagraphBackground as Background;
         match line.paragraph.background {
             Some(Background::Code) => {
-                // 块代码背景覆盖真实行槽，软换行和滚动高度不能在绘图阶段重新估算。
+                // Cover the actual code line slot without recalculating wrapping
+                // or scroll height during drawing.
                 CGContext::fill_rect(Some(context), line.frame);
                 *native_draw_returned = true;
             }
             Some(Background::Quote) => {
-                // 引用背景及左右边线来自原段落策略；只有真实首末软行拥有横向封口。
-                // 固定五个以内矩形不枚举格中的任何文字或相邻part。
+                // The original paragraph policy supplies quote fill and vertical
+                // borders. Only its actual first/last soft lines own horizontal
+                // caps; at most five rectangles require no text or neighboring parts.
                 self.fill_color(context, [0.10, 0.12, 0.16, 1.0]);
                 CGContext::fill_rect(Some(context), line.frame);
                 self.fill_color(context, [0.28, 0.34, 0.44, 1.0]);
@@ -379,7 +420,8 @@ impl NativeMarkdownComposedViewport {
                         NSSize::new(1.0, line.frame.size.height),
                     ),
                 );
-                // 软行之间没有重复横框；只有同一源段真正首末行才拥有对应边缘。
+                // Avoid horizontal borders between soft lines: only the original
+                // paragraph's actual first/last lines own the corresponding edge.
                 let facts = line.handle.facts();
                 if facts.source_utf16.start == facts.paragraph_utf16.start {
                     CGContext::fill_rect(
@@ -402,8 +444,9 @@ impl NativeMarkdownComposedViewport {
                 *native_draw_returned = true;
             }
             Some(Background::Rule) => {
-                // 分隔线仍消费原段落文字槽，不因当前viewport边缘或暂停位置移动。
-                // 固定细线只位于真实 12 点文字槽内；段距和 viewport 边缘不会移动其位置。
+                // Position the rule inside the original paragraph text slot,
+                // independent of viewport edges or suspension. Paragraph spacing
+                // does not shift the thin line out of its actual 12-point text slot.
                 let low = line.frame.origin.y + line.geometry.after;
                 let y = low + line.geometry.text_height / 2.0;
                 self.fill_color(context, [0.28, 0.34, 0.44, 1.0]);
@@ -423,7 +466,8 @@ impl NativeMarkdownComposedViewport {
         Ok(())
     }
 
-    /// 单个 inline-code part 只读其真实字体度量；不扫描相邻字形、行或来源。
+    /// Reads this inline-code part's actual font metrics without scanning adjacent
+    /// glyphs, lines, or Sources.
     fn part_background(
         &self,
         line: &Line,
@@ -434,15 +478,17 @@ impl NativeMarkdownComposedViewport {
     ) -> std::result::Result<(), NativeMarkdownComposedViewportPaintCause> {
         let [red, green, blue, alpha] = NATIVE_MARKDOWN_CODE_BACKGROUND;
         self.fill_color(context, [red, green, blue, alpha]);
-        // 原part已经绑定真实字体与来源，这里只判断这一项是否有代码底色面积。
-        // 零advance不造占位矩形；隐藏marker也不能借INLINE_CODE位着色。
+        // The original part already binds its font and Source. Determine only
+        // whether this item has code-background area; zero advance gets no
+        // placeholder rectangle, and hidden markers cannot gain color from INLINE_CODE.
         let facts = part.handle.facts();
         if !part.has_inline_code_background() {
-            return Ok(()); // 隐藏语法、硬分隔和零宽字符都没有可绘制的代码底色面积。
+            return Ok(()); // Hidden syntax, hard separators, and zero-width characters have no code-background area.
         }
         self.require(current)?;
-        // 使用该part原Native字体上下沿，绝不借邻格的字号或整个行的最大高度。
-        // 负advance仍按两端实际位置取矩形，保RTL代码段的覆盖范围。
+        // Use this part's original Native font ascent/descent, not another cell's
+        // size or the line's maximum height. Min/max of actual endpoints preserves
+        // RTL code coverage even when the advance is negative.
         let metrics = self.palette[part.font]
             .metrics()
             .map_err(NativeMarkdownComposedViewportError::Font)?;
@@ -455,9 +501,10 @@ impl NativeMarkdownComposedViewport {
                 NSPoint::new(start.min(end), baseline - metrics.descent),
                 NSSize::new((end - start).abs(), metrics.ascent + metrics.descent),
             ),
-        ); // 底色采用该part原字体真实上下沿，选区稍后覆盖，不能把已选文字涂回代码底色。
+        ); // Original font metrics bound the background; later selection paint must remain above it.
         *native_draw_returned = true;
-        // 本次实际fill已经发生；后核失败保留draw事实并让外层丢弃整张候选。
+        // The actual fill has returned. A failed recheck preserves that fact and
+        // makes the outer owner discard the entire candidate.
         self.require(current)?;
         Ok(())
     }

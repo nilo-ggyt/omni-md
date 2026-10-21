@@ -1,4 +1,4 @@
-//! 同窗口真实part按≤256glyph绘制；超同步预算不画前缀，失败由调用者丢弃整个候选。
+//! Paint actual parts from one window in batches of at most 256 glyphs; synchronous budget overflow paints no prefix and failure discards the candidate.
 
 use super::*;
 use crate::native_surface::paged_glyph_paint::{
@@ -63,15 +63,15 @@ impl Drop for Restore<'_> {
 }
 
 impl NativeMarkdownComposedViewport {
-    /// 有色墨迹与背景共享原窗口的一份 sRGB 输入空间；不会借目标 bitmap 猜源颜色。
-    /// 调用均处于原绘图 save/restore 内，普通文字没有专属着色时仍继承调用者原 fill。
+    /// Colored ink/backgrounds share the window's sRGB input space; do not infer source color from target bitmap space.
+    /// Calls occur inside paint save/restore; ordinary unstyled text retains the caller's fill.
     fn fill_color(&self, context: &CGContext, color: [f64; 4]) {
         CGContext::set_fill_color_space(Some(context), Some(&self.paint_space));
-        // SAFETY: 当前命名 sRGB 恰有 RGB 三分量；栈数组另含 alpha，原 API 返回后不保该指针。
+        // SAFETY: Named sRGB has three RGB components plus stack alpha; the API retains no pointer after return.
         unsafe { CGContext::set_fill_color(Some(context), color.as_ptr()) };
     }
 
-    /// 只改变当前part的墨迹状态；真实glyph/advance不变，颜色与原TextKit链接策略一致。
+    /// Change this part's ink state only, retaining glyphs/advances and the existing Native link-color policy.
     fn ink_style(&self, part: &Part, context: &CGContext) {
         let styles = part.handle.facts().presentation;
         if styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER) {
@@ -83,14 +83,14 @@ impl NativeMarkdownComposedViewport {
             let [red, green, blue, alpha] = NATIVE_MARKDOWN_LINK_COLOR;
             self.fill_color(context, [red, green, blue, alpha]);
         } else if styles.contains(MarkdownPresentationStyles::BLOCK_QUOTE) {
-            // 引用中的强调、等宽代码仍使用各自真实Font；只按原颜色合同降低正文墨迹亮度。
-            // 可见标记与链接已在上方领取自己的颜色，不能被容器样式覆盖。
+            // Quoted emphasis/monospace code retains actual fonts; only ink brightness follows the original quote-color contract.
+            // Visible markers/links already selected their colors above; container styles cannot override them.
             let [red, green, blue, alpha] = NATIVE_MARKDOWN_QUOTE_COLOR;
             self.fill_color(context, [red, green, blue, alpha]);
-        } // alpha同时覆盖彩色字形；显露语法不借LINK位着成可点击内容，也不替换真实Font。
+        } // Alpha also affects color glyphs; exposed syntax cannot borrow LINK styling as clickable content or replace the actual font.
     }
 
-    /// 已封存窗口的代码底色先于Scene选区绘制；只遍历原有限parts，不读正文或建立字形副本。
+    /// Paint sealed-window code backgrounds before Scene selection using bounded original parts, without Source reads or glyph copies.
     pub fn paint_code_backgrounds(
         &self,
         context: &CGContext,
@@ -108,7 +108,7 @@ impl NativeMarkdownComposedViewport {
                 if !self.visible(line.frame) {
                     continue;
                 }
-                // 块背景只消费已经决定软换行、baseline 和滚动高度的同一行框；不能在这里扩张正文。
+                // Block backgrounds use the same frame that established wrapping, baseline, and scroll height, without expanding document geometry here.
                 use crate::native_surface::preview_paragraph::PreviewParagraphBackground as Background;
                 match line.paragraph.background {
                     Some(Background::Code) => {
@@ -136,7 +136,7 @@ impl NativeMarkdownComposedViewport {
                                 NSSize::new(1.0, line.frame.size.height),
                             ),
                         );
-                        // 软行之间没有重复横框；只有同一源段真正首末行才拥有对应边缘。
+                        // No duplicate horizontal borders between soft lines; only actual paragraph first/last lines own those edges.
                         let facts = line.handle.facts();
                         if facts.source_utf16.start == facts.paragraph_utf16.start {
                             CGContext::fill_rect(
@@ -162,7 +162,7 @@ impl NativeMarkdownComposedViewport {
                         native_draw_returned = true;
                     }
                     Some(Background::Rule) => {
-                        // 固定细线只位于真实 12 点文字槽内；段距和 viewport 边缘不会移动其位置。
+                        // The fixed rule stays in its actual 12 pt text slot; paragraph spacing/viewport edges cannot move it.
                         let low = line.frame.origin.y + line.geometry.after;
                         let y = low + line.geometry.text_height / 2.0;
                         self.fill_color(context, [0.28, 0.34, 0.44, 1.0]);
@@ -185,7 +185,7 @@ impl NativeMarkdownComposedViewport {
                         || !styles.contains(MarkdownPresentationStyles::INLINE_CODE)
                         || facts.x_advance_26_6 == 0
                     {
-                        continue; // 隐藏语法、硬分隔和零宽字符都没有可绘制的代码底色面积。
+                        continue; // Hidden syntax, hard separators, and zero-width characters have no code-background area to paint.
                     }
                     self.require(current)?;
                     let metrics = self.palette[part.font]
@@ -201,7 +201,7 @@ impl NativeMarkdownComposedViewport {
                             NSPoint::new(start.min(end), baseline - metrics.descent),
                             NSSize::new((end - start).abs(), metrics.ascent + metrics.descent),
                         ),
-                    ); // 底色采用该part原字体真实上下沿，选区稍后覆盖，不能把已选文字涂回代码底色。
+                    ); // Use actual font ascent/descent for this part; selection paints afterward so code background cannot overwrite selected text.
                     native_draw_returned = true;
                 }
             }
@@ -215,7 +215,7 @@ impl NativeMarkdownComposedViewport {
         })
     }
 
-    /// 原字体度量和实际part视觉宽度决定装饰；不会创建CTLine、正文副本或另一个样式索引。
+    /// Original font metrics/actual part advance determine decoration, without CTLine, text copies, or another style index.
     fn paint_decorations(
         &self,
         line: &Line,
@@ -232,7 +232,7 @@ impl NativeMarkdownComposedViewport {
                 && !styles.contains(MarkdownPresentationStyles::LINK)
                 && !styles.contains(MarkdownPresentationStyles::STRIKETHROUGH))
         {
-            return Ok(()); // 真实隐藏权限也覆盖装饰；相邻可见文字保留自己的独立part和原前景。
+            return Ok(()); // Hidden presentation also suppresses decorations; adjacent visible text retains its own part/foreground.
         }
         let metrics = self.palette[part.font]
             .metrics()
@@ -242,13 +242,13 @@ impl NativeMarkdownComposedViewport {
         let baseline = self.part_baseline(line, part).y + facts.origin_y_26_6 as f64 / 64.0;
         let thickness = metrics.underline_thickness;
         if start == end || thickness == 0.0 {
-            return Ok(()); // 零宽或原字体无厚度时确实没有线墨迹，不捏造像素最小值。
+            return Ok(()); // Zero width/font thickness means no line ink; do not invent a minimum pixel size.
         }
         CGContext::save_g_state(Some(context));
         let restore = Restore(context);
         CGContext::clip_to_rect(Some(context), self.clip());
-        self.ink_style(part, context); // 链接线与其真实文字同色；本part退出即还原调用者前景。
-        // 同一个part可同时拥有两种装饰；只消费原位，不推断或解析Markdown语法。
+        self.ink_style(part, context); // Link underline shares actual text color; exiting this part restores caller foreground.
+        // A part may have both decorations; use original style bits without inferring/parsing Markdown syntax.
         for (style, position) in [
             (
                 MarkdownPresentationStyles::UNDERLINE,
@@ -270,8 +270,8 @@ impl NativeMarkdownComposedViewport {
                         NSPoint::new(start.min(end), baseline + position - thickness / 2.0),
                         NSSize::new((end - start).abs(), thickness),
                     ),
-                ); // 继承本Scene原前景色，选区背景已经由Scene先画；不覆盖背景或调整全局palette。
-                *native_draw_returned = true; // 后继撤权必须保留真实draw已返回的事实，不能用Err抹掉。
+                ); // Retain Scene foreground over its already painted selection background, without overwriting backgrounds or changing global palette.
+                *native_draw_returned = true; // Later revocation must preserve the actual returned draw fact instead of erasing it with an error.
             }
         }
         drop(restore);
@@ -279,10 +279,10 @@ impl NativeMarkdownComposedViewport {
         Ok(())
     }
 
-    /// 画本窗口真实glyph和原part装饰；选区背景、caret和段落外观仍由Scene组合。
+    /// Paint actual window glyphs/part decorations; Scene still composes selection backgrounds, carets, and paragraph appearance.
     ///
     /// # Errors
-    /// 超固定同步预算在首个Native draw前返回Pending；其余错误保留是否已有真实draw事实。
+    /// Excess synchronous work returns Pending before first Native draw; other failures retain whether actual drawing returned.
     pub fn paint(
         &self,
         context: &CGContext,
@@ -294,11 +294,11 @@ impl NativeMarkdownComposedViewport {
         let mut native_draw_returned = false;
         let result = (|| -> std::result::Result<_, NativeMarkdownComposedViewportPaintCause> {
             self.require(current)?;
-            // 同步预算先于首个draw检查；超大GCB/行不能画一个前缀后伪称完整frame。
+            // Check synchronous budget before first draw; large graphemes/lines cannot paint a prefix and claim a complete frame.
             if self.glyphs > NATIVE_MARKDOWN_COMPOSED_VIEWPORT_GLYPHS {
                 return Err(NativeMarkdownComposedViewportError::Pending.into());
             }
-            // 只改调用者尚未发布的候选context，clip固定为原Scene的真实有限viewport。
+            // Modify only the caller's unpublished candidate context, clipped to original Scene's actual bounded viewport.
             CGContext::save_g_state(Some(context));
             let restore = Restore(context);
             CGContext::clip_to_rect(Some(context), self.clip());
@@ -307,14 +307,14 @@ impl NativeMarkdownComposedViewport {
                 batches: 0,
                 missing_glyphs: 0,
             };
-            // 有限overscan行可以留在metadata窗口，只有与原clip相交的行实际送入Native。
+            // Bounded overscan lines may stay in metadata; send only lines intersecting original clip to Native.
             for line in &self.lines {
                 if !self.visible(line.frame) {
                     continue;
                 }
                 for part in &line.parts {
                     if part.handle.facts().kind != MarkdownComposedLinePartKind::Glyphs {
-                        continue; // 真Tab/分隔符只贡献布局；绝不向CTFont发送缺字占位。
+                        continue; // Actual Tabs/separators contribute layout only; never send missing-glyph placeholders to CTFont.
                     }
                     let facts = part.handle.facts();
                     CGContext::save_g_state(Some(context));
@@ -322,7 +322,7 @@ impl NativeMarkdownComposedViewport {
                     self.ink_style(part, context);
                     let (mut pen_x, mut pen_y) = (facts.origin_x_26_6, facts.origin_y_26_6);
                     let mut start = 0;
-                    // pen从原part视觉origin开始，后继批次沿真实receipt累计，不重置到行首。
+                    // Start pen at original part visual origin; subsequent batches use actual receipt advances rather than reset to line start.
                     while start < facts.glyphs {
                         self.require(current)?;
                         let end = start
@@ -347,11 +347,11 @@ impl NativeMarkdownComposedViewport {
                             context,
                             &|| self.require(current).is_ok(),
                         );
-                        // 每个真实draw后的失权都保留事实，不能解释为未修改候选context再重放。
+                        // Revocation after each actual draw preserves its effect, never implying an untouched candidate that may be replayed.
                         native_draw_returned |= painted
                             .as_ref()
                             .map_or_else(|error| error.native_draw_returned, |_| true);
-                        self.require(current)?; // 先保留实际draw事实，再优先暴露原Source故障。
+                        self.require(current)?; // Preserve returned draw first, then give original Source failure priority.
                         let painted =
                             painted.map_err(NativeMarkdownComposedViewportPaintCause::Glyph)?;
                         pen_x = painted.final_pen_x_26_6;
@@ -365,8 +365,8 @@ impl NativeMarkdownComposedViewport {
                         || facts.origin_y_26_6.checked_add(facts.y_advance_26_6) != Some(pen_y)
                     {
                         return Err(NativeMarkdownComposedViewportPaintCause::InconsistentAdvance);
-                    } // 未覆盖全部真实advance时整候选作废，不能跳字或用估计宽度补齐。
-                    drop(part_restore); // 隐藏alpha只属于这个part，不能污染后继可见正文或选区。
+                    } // Incomplete actual advance invalidates the whole candidate; do not skip glyphs or fill gaps with estimated width.
+                    drop(part_restore); // Hidden alpha belongs to this part only, without affecting later visible text/selection.
                     self.paint_decorations(
                         line,
                         part,
@@ -376,7 +376,7 @@ impl NativeMarkdownComposedViewport {
                     )?;
                 }
             }
-            drop(restore); // 配平本层Native状态后仍核原Source，返回receipt不等于发布候选像素。
+            drop(restore); // Restore this layer's Native state then check original Source; returning a receipt does not publish candidate pixels.
             self.require(current)?;
             Ok(receipt)
         })();

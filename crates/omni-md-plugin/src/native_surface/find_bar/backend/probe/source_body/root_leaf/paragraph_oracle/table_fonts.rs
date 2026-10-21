@@ -1,13 +1,16 @@
-//! 固定短表的整 EGC 选字：候选来自系统，覆盖事实来自真实 CTLine，不读取产品已选字体。
+//! Choose fonts for whole graphemes in fixed short table fixtures using system candidates and actual
+//! CTLine coverage, without product-selected fonts.
 
 use super::*;
 use objc2_core_foundation::CFString;
 use objc2_core_text::CTLine;
 use objc2_foundation::NSAttributedString;
 
-/// 同一候选须保持真实字体身份、字号、矩阵与轴；名称相同不代表同一次 Native 字体事实。
+/// Require the same actual font identity, size, matrix, and axes; an equal name cannot certify
+/// identical Native font facts.
 fn same_font(actual: &CTFont, expected: &CTFont) -> bool {
-    // SAFETY: 两个不可变字体均由当前原生栈持活，getter 不借用产品字体或候选缓存。
+    // SAFETY: This Native stack retains both immutable fonts; getters borrow neither product fonts nor
+    // candidate caches.
     unsafe {
         actual == expected
             && actual.size().to_bits() == expected.size().to_bits()
@@ -24,8 +27,10 @@ fn same_font(actual: &CTFont, expected: &CTFont) -> bool {
     }
 }
 
-/// 原 Native 可以在 CTLine 内自动 cascade；只有所有实际 run 都仍使用原候选，才算整簇通过。
-/// 本参考只接固定≤2KiB字面中的有限 EGC；数组上限沿原短行的256项字形参考，不扩展产品能力。
+/// CTLine may automatically cascade; whole-grapheme coverage passes only if every actual run still uses
+/// the original candidate.
+/// This reference accepts bounded graphemes in fixed literals of at most 2 KiB; its 256-glyph arrays do
+/// not enlarge product budgets.
 fn covers(cluster: &NSString, candidate: &NSFont) -> Result<bool, String> {
     let length = cluster.length();
     if length == 0 || length > 256 {
@@ -33,15 +38,18 @@ fn covers(cluster: &NSString, candidate: &NSFont) -> Result<bool, String> {
     }
     let attributed =
         NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), cluster);
-    // SAFETY: Font 类型与完整短串范围已确定；这里不把逐 scalar 的 fallback 混入同一个 EGC。
+    // SAFETY: Font type and complete short-string range are known; do not mix scalar-specific fallback
+    // within one grapheme.
     unsafe {
         attributed.addAttribute_value_range(NSFontAttributeName, candidate, NSRange::new(0, length))
     };
-    // 先沿真实 Foundation 继承关系借不可变属性串，再使用其公开 CFAttributedString 桥接。
+    // Borrow the immutable attributed string through actual Foundation inheritance before its public
+    // CFAttributedString bridge.
     let native: &NSAttributedString = &attributed;
-    // SAFETY: 此公开桥接只布局当前固定短簇；CTLine 和它保有的 run 均在函数返回前归还。
+    // SAFETY: This public bridge lays out the current fixed short grapheme only; CTLine and retained
+    // runs return before function exit.
     let line = unsafe { CTLine::with_attributed_string(native.as_ref()) };
-    // SAFETY: 不可变 CTLine 的来源与 run 数组均由 line 持活。
+    // SAFETY: The immutable CTLine retains its Source attributes and run array.
     let (range, count, runs) =
         unsafe { (line.string_range(), line.glyph_count(), line.glyph_runs()) };
     if range != CFRange::new(0, length as _) || !(1..=256).contains(&count) {
@@ -52,10 +60,12 @@ fn covers(cluster: &NSString, candidate: &NSFont) -> Result<bool, String> {
     let mut indices = [0_isize; 256];
     let mut total = 0;
     for index in 0..runs.len() {
-        // SAFETY: index 来自同一活 run 数组，不把 Font 或 run 保存到参考图之外。
+        // SAFETY: Index belongs to the same live run array; retain no font/run outside this reference
+        // graph.
         let raw = unsafe { runs.value_at_index(index as _) };
         let run = NonNull::new(raw.cast_mut().cast::<CTRun>()).ok_or("短表选字 run 为空")?;
-        // SAFETY: 所有读取均限定在这个公开不可变 run；来源交付后逐项核范围与覆盖。
+        // SAFETY: Read this public immutable run only, checking actual Source range and coverage after
+        // delivery.
         let (range, count, attributes) = unsafe {
             (
                 run.as_ref().string_range(),
@@ -70,15 +80,19 @@ fn covers(cluster: &NSString, candidate: &NSFont) -> Result<bool, String> {
         if extent == 0 || end > length || count == 0 || count > 256 {
             return Err("短表选字 run 未落在原完整簇范围内".into());
         }
-        // SAFETY: CoreText Font 键的实际值为 CTFont；字典持活它直到本轮身份检查结束。
+        // SAFETY: The Core Text font key holds CTFont, retained by its dictionary through this identity
+        // check.
         let actual = unsafe { attributes.value(std::ptr::from_ref(kCTFontAttributeName).cast()) };
         let actual = NonNull::new(actual.cast_mut().cast::<CTFont>()).ok_or("选字 run 缺 Font")?;
-        // 自动 cascade 或缺字是该候选未覆盖，不把系统暗中换字后的成功冒充候选自身成功。
-        // SAFETY: 原不可变 run 的字体字典仍持活实际 CTFont；借用不离开本次同步试字栈。
+        // Automatic cascade or missing glyphs reject candidate coverage; silent system substitution
+        // cannot count as candidate success.
+        // SAFETY: The immutable run font dictionary retains actual CTFont; its borrow stays on this
+        // synchronous trial stack.
         if !same_font(unsafe { actual.as_ref() }, candidate.as_ref()) {
             return Ok(false);
         }
-        // SAFETY: count 已核在固定数组内；glyph0 与真实 cluster 均由原生结果本身判断。
+        // SAFETY: Count fits the fixed arrays; actual Native results determine glyph-zero rejection and
+        // cluster validity.
         unsafe {
             run.as_ref().glyphs(
                 CFRange::new(0, count as _),
@@ -108,8 +122,10 @@ fn covers(cluster: &NSString, candidate: &NSFont) -> Result<bool, String> {
     Ok(true)
 }
 
-/// fixture 端点独立声明 UAX 分组；这里只核 scalar 合法与完整拼接，然后按整簇合同选字体。
-/// Base 先试，失败才用首 scalar 向系统求一个真实候选；候选必须再次证明完整覆盖，不能猜名字。
+/// Fixture endpoints independently declare Unicode graphemes; validate scalar-aligned complete coverage
+/// before selecting fonts for whole graphemes.
+/// Try Base first, then request one actual system candidate with the first scalar; verify complete
+/// coverage again without name guesses.
 pub(super) fn apply(
     source: &str,
     base: &Retained<NSFont>,
@@ -142,14 +158,18 @@ pub(super) fn apply(
             let mut utf8 = [0; 4];
             let scalar = CFString::from_str(first.encode_utf8(&mut utf8));
             let base: &CTFont = (**base).as_ref();
-            // SAFETY: 系统仅接同一个完整首 scalar；这与产品候选顺序一致，不读其已选 Font。
+            // SAFETY: The system receives the same complete first scalar; preserve candidate ordering
+            // without reading the product selected font.
             let fallback =
                 unsafe { base.for_string(&scalar, CFRange::new(0, first.len_utf16() as _)) };
             let fallback: Retained<CTFont> = fallback.into();
-            // SAFETY: Apple 的 CTFont/NSFont 公开 toll-free 桥接保持同一 +1 所有权。
+            // SAFETY: Apple public CTFont/NSFont toll-free bridge preserves the same retained ownership
+            // claim.
             let fallback: Retained<NSFont> = unsafe { Retained::cast_unchecked(fallback) };
-            // 系统候选只能换实际 face，不能悄悄改变固定短例原字号；不以名称或常量14代替来源。
-            // SAFETY: base 仍由外层原字体持活，size 只读同一 CTFont 的实际点数。
+            // The system candidate may change actual face but not original fixture size; names or a
+            // constant size cannot replace source facts.
+            // SAFETY: The outer original font retains Base; size reads actual points from that same
+            // CTFont.
             if fallback.pointSize().to_bits() != unsafe { base.size() }.to_bits() {
                 return Err("系统首 scalar 候选改变了原短表字号".into());
             }
@@ -160,19 +180,22 @@ pub(super) fn apply(
             }
             fallback
         };
-        // SAFETY: 整簇试次已证明实际 Font 身份与完整覆盖；只替换 Font，保原语义颜色和行属性。
+        // SAFETY: Whole-grapheme trials verified actual font identity and coverage; change Font only
+        // while preserving semantic colors/paragraph attributes.
         unsafe { attributed.addAttribute_value_range(NSFontAttributeName, &candidate, range) };
     }
     Ok(())
 }
 
-/// 最终 TextKit 行再核同一来源 Font；不能仅凭独立簇试次成功就忽略后继 Native cascade。
+/// Recheck original-source font in final TextKit lines; independent grapheme trial success cannot
+/// excuse later Native cascade.
 pub(super) fn require_run_font(
     text: &NSAttributedString,
     source: usize,
     actual: &CTFont,
 ) -> Result<(), String> {
-    // SAFETY: source 来自同一 CTLine 的实际 cluster，原属性串仍在这个同步栈内持活。
+    // SAFETY: Source is an actual cluster from the same CTLine; this synchronous stack retains the
+    // original attributed string.
     let expected = unsafe {
         text.attribute_atIndex_effectiveRange(NSFontAttributeName, source, std::ptr::null_mut())
     }

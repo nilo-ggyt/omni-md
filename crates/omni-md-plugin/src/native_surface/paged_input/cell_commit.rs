@@ -1,18 +1,18 @@
-//! 先有限准入，再由原控制器撤Scene并消费同票；不重新捕获后继草稿或执行第二次sanitize。
+//! Prepare bounded admission, then let the original controller revoke Scenes and consume that same ticket without recapture or repeat sanitization.
 
 use super::*;
 use omni_markdown_core::markdown_document_buffer::VerifiedMarkdownTableRowSource;
 use omni_markdown_core::{
-    MarkdownCellDraftCommit, MarkdownCellDraftCommitError, MarkdownCellDraftCommitReceipt,
-    MarkdownCellDraftPreparedCommit, MarkdownCellDraftWordAnchor, MarkdownViewportSourceAuthority,
+    MarkdownCellDraftCommitError, MarkdownCellDraftCommitReceipt, MarkdownCellDraftPreparedCommit,
+    MarkdownCellDraftWordAnchor, MarkdownViewportSourceAuthority,
 };
 
 #[cfg(test)]
 #[path = "cell_commit/body_tests.rs"]
 mod body_tests;
 
-/// 唯一结果仍归Core准入claim：小结果保有限堆字符串，长结果保封存匿名输出；
-/// 此封闭包只增加原Input/session弱身份和原epoch标量，不复制结果或保活原草稿。
+/// Core admission owns the sole result: bounded small strings stay on the heap, while long output is sealed anonymous storage.
+/// This capsule adds only weak original Input/session identities and epoch facts, without copying output or retaining the draft.
 pub struct NativeMarkdownPagedCellPreparedCommit {
     owner: Weak<NativeMarkdownPagedInput>,
     session: Weak<NativeMarkdownPagedCellSession>,
@@ -23,14 +23,14 @@ pub struct NativeMarkdownPagedCellPreparedCommit {
 
 impl NativeMarkdownPagedCellPreparedCommit {
     #[must_use]
-    /// 只供真正提交后重查新行格；准备票不提供caret、Source或提前激活权限。
+    /// Use only to query the next cell after actual commit; preparation authorizes neither caret/Source access nor early activation.
     pub fn next_cell(&self) -> Option<(usize, usize)> {
         self.prepared.next_cell()
     }
 }
 
-/// 原Body的真实提交结果与同趟草稿端点一并交付；只有原Body权限仍当前时才可消费坐标。
-/// 这份结果不修改Body选择，也不能替代下一格真实Source或后继输入准入。
+/// Deliver the original Body commit and same-transaction draft endpoints; consume coordinates only while original Body authority remains current.
+/// The receipt itself changes no Body selection and cannot replace next-cell Source or successor input admission.
 pub struct NativeMarkdownPagedCellCommit {
     pub outcome: NativeMarkdownPagedInputOutcome,
     pub receipt: MarkdownCellDraftCommitReceipt,
@@ -66,19 +66,13 @@ impl<E> From<NativeMarkdownPagedInputError> for NativeMarkdownPagedCellCommitErr
     }
 }
 
-/// canonical观察者仍消费原一次事务；局部Input不能把提交结果伪装为同一Cell的可继续状态。
-pub type NativeMarkdownPagedCellCommitResult<O> = std::result::Result<
-    MarkdownCellDraftCommit<<O as MarkdownTextChangeObserver>::Output>,
-    NativeMarkdownPagedCellCommitError<<O as MarkdownTextChangeObserver>::Error>,
->;
-
 impl NativeMarkdownPagedInput {
-    /// 消费同一次Cell准入，将唯一canonical事务交给已经存在的Body输入owner。
-    /// 两个Scene须先由原控制器撤销并归还；这里不重新prepare、不重建Body，也不补捕新票。
+    /// Consume the same Cell admission and publish the sole canonical transaction through the existing Body Input owner.
+    /// The original controller must revoke/return both Scenes first; do not prepare again, rebuild Body, or recapture authority here.
     ///
     /// # Errors
-    /// 外来Doc/Cell/Body票、marked、借用或原观察者失败都在Core发布前拒绝并保留草稿。
-    /// 成功后的前台变化由返回Body receipt单独报告，绝不把已提交正文解释为未提交。
+    /// Reject foreign document/Cell/Body authority, marked input, borrow conflicts, and observer failure before publication, retaining the draft.
+    /// The returned Body receipt reports later foreground changes separately; published text remains committed.
     pub fn commit_cell_to_body(
         self: &Rc<Self>,
         prepared: NativeMarkdownPagedCellPreparedCommit,
@@ -90,7 +84,7 @@ impl NativeMarkdownPagedInput {
         NativeMarkdownPagedCellCommit,
         NativeMarkdownPagedCellCommitError<NativeMarkdownPagedInputObserverError>,
     > {
-        // 不读取外来prepared的Doc；先核原Cell owner，再沿自己的session保Source首因。
+        // Reject a foreign prepared owner before reading its document; then preserve Source errors through this owner's own session.
         if !Weak::ptr_eq(&prepared.owner, &Rc::downgrade(self)) {
             return Err(NativeMarkdownPagedInputError::Revoked.into());
         }
@@ -109,7 +103,7 @@ impl NativeMarkdownPagedInput {
         let original = session.document()?;
         if !Weak::ptr_eq(&body.document_identity(), &Rc::downgrade(&original)) {
             return Err(NativeMarkdownPagedInputError::Revoked.into());
-        } // 相同正文、相同generation或同一局部range都不能代替原canonical Doc身份。
+        } // Equal bytes, generation, or local range cannot replace original canonical document identity.
 
         self.check_original(prepared.epoch, prepared.before, cell_current)?;
         if self.busy.replace(true) {
@@ -119,10 +113,10 @@ impl NativeMarkdownPagedInput {
         let _body_mutation = body.begin(body_permit, body_current)?;
         if body_permit.before.marked.is_some() {
             return Err(NativeMarkdownPagedInputError::CompositionActive.into());
-        } // Cell提交不能抢走Body自己的IME候选；Core准入已独立拒绝Cell marked。
+        } // Cell commit cannot take Body's IME candidate; Core admission independently rejects marked Cell input.
 
-        // 交叉current都可重入，但两个busy槽已封闭。结束全部回调后才持Doc/folds借用，
-        // 下方只有纯Core prepare/publish，观察者不得调用Native或较新的current。
+        // Cross-owner current calls can reenter, but both busy admissions are held. Finish callbacks before borrowing document/folds.
+        // Only pure Core preparation/publication follows; observers must not call Native or a newer current callback.
         session.facts()?;
         self.check_original(prepared.epoch, prepared.before, cell_current)?;
         body.check_permit(body_permit, body_current)?;
@@ -145,8 +139,8 @@ impl NativeMarkdownPagedInput {
             .map_err(NativeMarkdownPagedCellCommitError::Commit)?;
         let outcome = match result.edit {
             Some((edit, mapped)) => {
-                // canonical已经发布。publish只交换原FoldObserver的有限metadata与selection，
-                // 没有current、Native或可失败IO；receipt始终属于原Body而非局部Cell坐标域。
+                // Canonical text is published. publish exchanges only bounded metadata/selection from the original FoldObserver.
+                // No current, Native, or fallible I/O follows; the receipt belongs to original Body, never Cell-local coordinates.
                 NativeMarkdownPagedInputOutcome::Committed(body.publish(
                     body_permit,
                     &document,
@@ -157,8 +151,8 @@ impl NativeMarkdownPagedInput {
                 ))
             }
             None => {
-                // Core原未改内容路径不运行observer、不移动canonical选择、不制造空Undo。
-                // 因此不虚构PreparedFolds或强行推进Body serial，只结束原局部会话。
+                // Core's unchanged path runs no observer, moves no canonical selection, and creates no empty Undo entry.
+                // Do not invent PreparedFolds or advance Body serial; end only the original local session.
                 NativeMarkdownPagedInputOutcome::Unchanged(body_permit.before)
             }
         };
@@ -169,7 +163,7 @@ impl NativeMarkdownPagedInput {
         })
     }
 
-    /// 只在Core成功后封闭原局部metadata；不调用可失败close或后置Source读取。
+    /// Seal local metadata only after Core success, with no fallible close or subsequent Source read.
     fn seal_committed_cell(&self, session: &NativeMarkdownPagedCellSession) {
         self.closed.set(true);
         self.marked.set(None);
@@ -179,11 +173,11 @@ impl NativeMarkdownPagedInput {
         session.mark_committed();
     }
 
-    /// 两个Scene读取值仍活时准备唯一准入输出；小结果使用有限堆字符串，长结果沿匿名存储封存。
+    /// Prepare the sole admission output while both Scene readers remain live; bound small strings and seal long output in anonymous storage.
     ///
     /// # Errors
-    /// 原票/Source错误、marked、文档预算、候选存储失败或已有准入时拒绝；
-    /// 失败不清Scene、草稿、局部历史或canonical。
+    /// Reject invalid permit/Source, marked input, document budget failure, candidate storage failure, or existing admission.
+    /// Failure clears neither Scenes, draft/local history, nor canonical text.
     pub fn prepare_cell_commit(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -206,8 +200,8 @@ impl NativeMarkdownPagedInput {
             let document = original
                 .try_borrow()
                 .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
-            // 两种实际动作共用原输入准入和唯一候选槽；End只能来自同Source请求的封闭行票。
-            // 不先提交原格再追加第二次，也不以裸行列或范围给缺少End的草稿补权限。
+            // Both actions share original input admission and the sole candidate slot; End requires a verified terminal from the same Source request.
+            // Do not commit then append separately, or manufacture missing End authority from raw row/column/range values.
             let edit = cell.take()?;
             match append {
                 Some((terminal, authority)) => document.prepare_cell_draft_row_append(
@@ -219,7 +213,7 @@ impl NativeMarkdownPagedInput {
                 None => document.prepare_cell_draft_commit(edit, word_anchor)?,
             }
         };
-        session.facts()?; // Source首错先于可重入前台门；准入本身不改变原serial或原草稿。
+        session.facts()?; // Check Source before reentrant foreground authority; admission changes neither original serial nor draft.
         self.check_original(permit.epoch, permit.before, current)?;
         Ok(NativeMarkdownPagedCellPreparedCommit {
             owner: Rc::downgrade(self),
@@ -228,40 +222,5 @@ impl NativeMarkdownPagedInput {
             before: permit.before,
             prepared,
         })
-    }
-
-    /// 控制器真实撤掉两个Scene后，消费同张准入票执行一次canonical发布；不重prepare/重sanitize。
-    ///
-    /// # Errors
-    /// 原目标/serial失效、Reader仍活、Source或观察者失败时保留原草稿；准入输出按实际Drop归还。
-    pub fn commit_cell_observed<O: MarkdownTextChangeObserver>(
-        self: &Rc<Self>,
-        prepared: NativeMarkdownPagedCellPreparedCommit,
-        observer: O,
-        current: &(impl Fn(u64) -> bool + ?Sized),
-    ) -> NativeMarkdownPagedCellCommitResult<O> {
-        if !Weak::ptr_eq(&prepared.owner, &Rc::downgrade(self)) {
-            return Err(NativeMarkdownPagedInputError::Revoked.into());
-        }
-        let session = prepared
-            .session
-            .upgrade()
-            .ok_or(NativeMarkdownPagedInputError::Closed)?;
-        session.facts()?;
-        self.check_original(prepared.epoch, prepared.before, current)?;
-        if self.busy.replace(true) {
-            return Err(NativeMarkdownPagedInputError::Busy.into());
-        }
-        let _mutation = Mutation(&self.busy);
-        let original = session.document()?;
-        let mut document = original
-            .try_borrow_mut()
-            .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
-        let result = document
-            .commit_prepared_cell_draft_observed(prepared.prepared, observer)
-            .map_err(NativeMarkdownPagedCellCommitError::Commit)?;
-        // canonical已经提交或确认为原未改内容；此后仅封闭旧Cell metadata，绝不执行可失败的后置读取。
-        self.seal_committed_cell(&session);
-        Ok(result)
     }
 }

@@ -61,9 +61,6 @@ mod active_line;
 mod gutter;
 #[path = "paged_body_source/ime.rs"]
 mod ime;
-#[cfg(feature = "native-markdown-runtime-probe")]
-#[path = "paged_body_source/reentry.rs"]
-mod reentry;
 #[path = "paged_body_source/targets.rs"]
 mod targets;
 #[path = "paged_body_source/word.rs"]
@@ -1210,8 +1207,6 @@ fn main() {
     ime_result.unwrap_or_else(|cause| panic!("{cause}"));
     gutter::small(mtm);
     active_line::eof(mtm);
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    reentry::run(mtm);
     process_memory::sample("source_after_all_actual_releases").unwrap();
     if matches!(fixture, SourceFixture::Cjk) {
         // 原大图和后继短图的pool、Doc/Source/FD/worker/font/Native/mmap/pixel门均已结束。

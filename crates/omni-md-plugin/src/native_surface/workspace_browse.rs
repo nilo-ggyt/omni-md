@@ -1,4 +1,4 @@
-//! 目录完整排序只在一个前台worker执行；主队列通知只持weak邮箱、owner和标量权限。
+//! Sort the directory on one foreground-owned worker; main-queue delivery carries only weak mailbox identity and scalar authority.
 
 use super::workspace_browse_policy::{
     NativeMarkdownBrowseCompletionPolicy, NativeMarkdownBrowseTicket,
@@ -9,13 +9,13 @@ use omni_markdown_core::{
     MarkdownWorkspacePage, MarkdownWorkspacePageProgress, MarkdownWorkspacePager,
 };
 
-/// 只有邮箱/worker暂持有限页和pager，关闭可同步排空，不等待通知执行。
+/// Only mailbox/worker own the bounded page and pager; close can drain them synchronously before notification delivery.
 pub(super) type NativeMarkdownBrowseResult = Result<
     (MarkdownWorkspacePager, MarkdownWorkspacePage),
     omni_markdown_core::MarkdownWorkspaceError,
 >;
 
-/// 只有显式“返回目录/刷新目录”清查询；内部保存、恢复与折叠刷新保留各自原输入合同。
+/// Only explicit directory-return/refresh clears the query; save, recovery, and collapse preserve their original input contracts.
 pub(super) fn return_native_markdown_workspace_to_directory(
     owner_identity: usize,
     intent: u64,
@@ -24,7 +24,7 @@ pub(super) fn return_native_markdown_workspace_to_directory(
         if std::ptr::from_ref(&*surface.controller).addr() != owner_identity
             || !surface.workspace_refresh_intent_is_current(intent)
         {
-            // 排队期间的新输入或新窗口只撤旧动作，不能取消它的新查询期限。
+            // A new input/window revokes this queued action, without cancelling the replacement query's deadline.
             return Ok(());
         }
         let mut feedback = Some(intent);
@@ -32,7 +32,7 @@ pub(super) fn return_native_markdown_workspace_to_directory(
         if let Err(error) = result
             && feedback.is_some_and(|ticket| surface.workspace_refresh_intent_is_current(ticket))
         {
-            // 失败只报告给原意图（或本动作确切推进的代次），不能覆盖Native重入的新输入。
+            // Report only to the original intent or this action's exact successor generation, never input created by native reentry.
             surface.controller.present_error(&error);
         }
         Ok(())
@@ -40,7 +40,7 @@ pub(super) fn return_native_markdown_workspace_to_directory(
 }
 
 impl NativeMarkdownWindowSurface {
-    /// 正常结束已知查询客户端后清字段；拒绝组合/验证/未知历史时不改原输入。
+    /// End the known query client before clearing; marked text, validation refusal, or unknown history preserves original input.
     fn clear_workspace_query_and_refresh(
         &mut self,
         intent: u64,
@@ -57,9 +57,9 @@ impl NativeMarkdownWindowSurface {
         self.controller.ivars().undo.preflight()?;
         let borrowed = self.controller.ivars().borrowed.borrow().clone();
         if let Some(editor) = field.currentEditor() {
-            // 这里只查询已存在的实际field editor，不为清空动作新建editor或Undo manager。
+            // Query an existing field editor only, without creating an editor or undo manager for the clear action.
             if !self.workspace_refresh_intent_is_current(intent) {
-                return Ok(()); // getter重入B后，旧按钮不再拥有辞任或清字段权限。
+                return Ok(()); // Getter reentry revoked the old button's authority to resign or clear the replacement client.
             }
             let editor = editor
                 .downcast::<NSTextView>()
@@ -73,50 +73,51 @@ impl NativeMarkdownWindowSurface {
                     )
                 })
             {
-                // 未知输入源和历史完整保留，不清全局manager或借字段路径猜所有权。
+                // Preserve unknown input/history; neither global undo clearing nor field identity can infer session ownership.
                 return Err("搜索输入控件不属于当前笔记会话".into());
             }
             if editor.hasMarkedText() {
-                // 未提交中文组合不能被程序清空；用户完成或取消组合后可再次点击。
+                // Never clear provisional Chinese composition; this action can be retried after composition ends normally.
                 return Err("请先完成搜索框的输入，再返回目录".into());
             }
             if !self.workspace_refresh_intent_is_current(intent) {
-                return Ok(()); // composition getter后仍不能重领新输入代次。
+                return Ok(()); // A composition getter cannot authorize recapturing the new input generation.
             }
             let responder = self.panel.firstResponder();
             if !self.workspace_refresh_intent_is_current(intent) {
+                // The responder getter may reenter input; retain no authority over a replacement client.
                 return Ok(());
             }
             if !responder.as_ref().is_some_and(|value| {
                 std::ptr::from_ref(&**value).cast::<()>()
                     == std::ptr::from_ref(&*editor).cast::<()>()
             }) {
-                // 名义currentEditor与实际responder不一致时不强制夺走另一输入客户。
+                // A nominal currentEditor that differs from the actual responder cannot justify stealing another client's focus.
                 return Err("搜索输入焦点已经变化，请重试".into());
             }
             if !self.panel.makeFirstResponder(None) {
-                // 公开验证拒绝正常辞任时，不清值、不清历史，也不切换目录模式。
+                // Native validation refusal preserves the value, history, and existing query mode.
                 return Err("搜索输入尚未结束，请完成输入后重试".into());
             }
             if !self.workspace_refresh_intent_is_current(intent) {
-                return Ok(()); // 成功didEnd可能同步重入B；原动作不能清掉它。
+                return Ok(()); // Successful didEnd can synchronously publish new input, which this old action cannot clear.
             }
             if field.currentEditor().is_some() {
-                // 不以makeFirstResponder的返回值代替真实client结束事实。
+                // makeFirstResponder's return value cannot substitute for the actual client's end state.
                 return Err("搜索输入仍在编辑，请重试".into());
             }
         }
         if !self.workspace_refresh_intent_is_current(intent) {
-            return Ok(()); // 无editor分支的getter同样可能同步重入新输入。
+            return Ok(()); // Even the no-editor getter branch can synchronously reenter a new input intent.
         }
         self.controller.ivars().undo.preflight()?;
         if let Some(error) = borrowed.failure() {
-            // didEnd仅沿原owned-client合同结束历史；已记录的未知历史失败不能被清字段掩盖。
+            // didEnd ends only the owned client's history; clearing the field cannot erase a recorded unknown-history failure.
             return Err(error);
         }
         field.setStringValue(ns_string!(""));
         if !self.workspace_refresh_intent_is_current(intent) {
-            return Ok(()); // setter之后若B接管，只保留B的调度，不继续取消或刷新。
+            return Ok(()); // A replacement intent after the setter retains its own scheduling; stop cancelling or refreshing old work.
         }
         self.refresh_workspace_sidebar_with_policy(
             self.panel.mtm(),
@@ -126,7 +127,7 @@ impl NativeMarkdownWindowSurface {
         )
     }
 
-    /// 显式刷新进入目录模式；旧搜索的取消只来自用户刷新动作，不来自Core打开游标。
+    /// Explicit refresh enters directory mode; the user action, not opening a Core cursor, authorizes cancelling old search.
     pub(super) fn refresh_workspace_sidebar(
         &mut self,
         mtm: MainThreadMarker,
@@ -140,7 +141,7 @@ impl NativeMarkdownWindowSurface {
         )
     }
 
-    /// 失败后实际目录只供重选；policy保留在pager上，后续Next不会自动开第一篇。
+    /// After failure the directory permits reselection only; pager policy prevents later Next from automatically opening a note.
     pub(super) fn refresh_workspace_sidebar_for_reselection(
         &mut self,
         mtm: MainThreadMarker,
@@ -155,7 +156,7 @@ impl NativeMarkdownWindowSurface {
         )
     }
 
-    /// 首个Native取消之前固定意图；timer析构重入B不能被贴到旧刷新继续取消。
+    /// Fix the intent before native cancellation; timer-destruction reentry cannot relabel a new intent onto the old refresh.
     pub(super) fn refresh_workspace_sidebar_with_policy(
         &mut self,
         mtm: MainThreadMarker,
@@ -165,14 +166,16 @@ impl NativeMarkdownWindowSurface {
     ) -> Result<(), String> {
         *feedback_intent = None;
         if !self.workspace_refresh_intent_is_current(intent) {
+            // Revoked input grants neither cancellation nor feedback authority over the current query.
             return Ok(());
         }
         self.stop_search();
         let after_cancel = intent.wrapping_add(1);
         if !self.workspace_refresh_intent_is_current(after_cancel) {
+            // Only this action's exact cancellation successor may acquire a new directory pager.
             return Ok(());
         }
-        // 已观察到自己的取消，若纯打开pager失败，只允许这个确切代次报告错误。
+        // Observe this action's cancellation before opening the pager; only that exact successor may report open failure.
         *feedback_intent = Some(after_cancel);
         let pager = self
             .session
@@ -181,22 +184,22 @@ impl NativeMarkdownWindowSurface {
         self.sidebar_pager = Some(pager);
         self.sidebar_intent = Some(after_cancel);
         self.sidebar_completion_policy = policy;
-        // 先撤销旧metadata；已删除path不能当成剩余笔记，错误status保持原值。
+        // Revoke old metadata first; deleted paths cannot count as remaining notes, while error status remains intact.
         self.notes = Vec::new();
         self.sidebar_rows = Vec::new();
         self.sidebar_has_more = false;
-        // Next在进入Native取消前固定after_cancel+1；任何重入输入使最终反馈ticket失效。
+        // Next reserves after_cancel+1 before native cancellation; intervening input invalidates the feedback ticket.
         *feedback_intent = Some(after_cancel.wrapping_add(1));
         self.install_next_sidebar_page(mtm)
     }
 
-    /// 输入权限和必要空态补偿分开：B撤旧目录/错误权限，但不能让查询控件恢复一半。
+    /// Separate input authority from empty-state repair: new input revokes old delivery/error authority without leaving controls half-restored.
     pub(super) fn workspace_refresh_intent_is_current(&self, intent: u64) -> bool {
         self.workspace_surface_owner_is_current()
             && self.controller.workspace_query_intent() == intent
     }
 
-    /// 借用surface的当前栈仍有同owner；只读TLS标量/身份，不执行Weak/Native。
+    /// Require the current borrowed stack's original owner using TLS scalars/identity only, without native weak loads or messages.
     fn workspace_surface_owner_is_current(&self) -> bool {
         let identity = std::ptr::from_ref(&*self.controller).addr();
         let owner = BORROWED_NATIVE_MARKDOWN_OWNER
@@ -207,7 +210,7 @@ impl NativeMarkdownWindowSurface {
             && !self.controller.ivars().close_finalizer_scheduled.get()
     }
 
-    /// strict释放后必须恢复完整可用的无正文态；只要仍是同一空owner，B不阻止必要补偿。
+    /// Strict release must restore a usable empty-body state; changed input alone cannot prevent repair for the same empty owner.
     pub(super) fn empty_workspace_compensation_is_current(&self) -> bool {
         self.workspace_surface_owner_is_current()
             && self.editor.is_none()
@@ -216,26 +219,26 @@ impl NativeMarkdownWindowSurface {
             && self.pending_file_mutation.is_none()
     }
 
-    /// 首次挂载完成后继续唯一的未完成扫描；此调用不捕获surface或递归借Active槽。
+    /// Continue the sole unfinished scan after mounting, without capturing the surface or recursively borrowing Active.
     pub(super) fn continue_initial_sidebar_scan(
         &mut self,
         mtm: MainThreadMarker,
     ) -> Result<(), String> {
         if !self.sidebar_scan_pending || self.sidebar_pager.is_none() {
-            // 小库已经完整Ready；关闭/新query拿走pager后也没有重启权限。
+            // A small workspace is already Ready; close or a replacement query that took the pager grants no restart authority.
             return Ok(());
         }
         self.install_next_sidebar_page(mtm)
     }
 
-    /// Next只移交一个pager；512步循环留在worker，不在AppKit主线程重扫全库。
+    /// Next transfers one pager; bounded 512-entry steps execute on its worker, never by rescanning on AppKit's main thread.
     pub(super) fn install_next_sidebar_page(
         &mut self,
         _mtm: MainThreadMarker,
     ) -> Result<(), String> {
         let intent = self.controller.workspace_query_intent();
         if self.search_query.is_some() || self.sidebar_intent != Some(intent) {
-            // 新query/IME输入意图已撤销目录；不能把其新epoch贴到旧pager。
+            // A new query/IME intent revoked directory mode; its epoch cannot be attached to an old pager.
             return Ok(());
         }
         let mut pager = self
@@ -245,7 +248,7 @@ impl NativeMarkdownWindowSurface {
         self.controller.cancel_workspace_search();
         let accepted_intent = intent.wrapping_add(1);
         if self.controller.workspace_query_intent() != accepted_intent {
-            // timer释放可重入新输入；未发布pager局部释放，不取消新期限。
+            // Timer release can reenter input; drop the unpublished local pager without cancelling the replacement deadline.
             return Ok(());
         }
         self.stop_search_attempt();
@@ -256,15 +259,15 @@ impl NativeMarkdownWindowSurface {
         if self.controller.workspace_query_intent() != accepted_intent
             || self.search_query.is_some()
         {
-            // Native setter之后再纯核权限；已有恢复/保存反馈不被目录加载覆盖。
+            // Recheck pure authority after native setters, preserving existing recovery/save feedback.
             return Ok(());
         }
         self.search_cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancelled = std::sync::Arc::clone(&self.search_cancelled);
         let generation = self.search_generation;
         let collapsed = self.collapsed_directories.clone();
-        // worker绝不持原生Weak或MainThreadBound：主线程取消后同步join，原生包装在
-        // worker析构时同步派发会形成互等。非拥有地址须与下方精确邮箱身份共同核验。
+        // Workers hold no native Weak/MainThreadBound: main-thread cancellation joins them, so a worker destructor
+        // synchronously dispatching back would deadlock. The nonowning address must match the exact mailbox below.
         let owner_identity = std::ptr::from_ref(&*self.controller).addr();
         let mailbox = std::sync::Arc::new(crate::cancelable_mailbox::CancelableMailbox::new());
         self.sidebar_results = Some(std::sync::Arc::clone(&mailbox));
@@ -272,7 +275,7 @@ impl NativeMarkdownWindowSurface {
             .name("omni-md-directory".into())
             .spawn(move || {
                 let results = loop {
-                    // 每步≤512，Core逐项检查取消和会话权限；Pending不进入UI邮箱。
+                    // Each step scans at most 512 entries with Core cancellation/session checks; Pending never enters the UI mailbox.
                     match pager.next_page_cancellable(
                         MAX_VISIBLE_NATIVE_MARKDOWN_WORKSPACE_ENTRIES - 1,
                         MAX_SCANNED_NATIVE_MARKDOWN_WORKSPACE_ENTRIES,
@@ -280,14 +283,14 @@ impl NativeMarkdownWindowSurface {
                         &cancelled,
                     ) {
                         Ok(MarkdownWorkspacePageProgress::Pending) => {
-                            // 同一个worker继续下一有限步，不向主队列排每帧重试。
+                            // Continue on the same worker with another bounded step, without main-queue frame-by-frame retries.
                         }
-                        Ok(MarkdownWorkspacePageProgress::Ready(page)) => break Ok((pager, page)),
-                        Err(error) => break Err(error),
+                        Ok(MarkdownWorkspacePageProgress::Ready(page)) => break Ok((pager, page)), // Transfer one completed page and its cursor.
+                        Err(error) => break Err(error), // Preserve the original failure instead of publishing a partial page.
                     }
                 };
                 if !mailbox.publish(results) {
-                    // 关闭/换词已经封闭邮箱，结果和pager在worker栈内释放。
+                    // Close or a query change sealed the mailbox; release result and pager on the worker stack.
                     return;
                 }
                 let signal = WorkspaceReadySignal::Directory(WorkspaceDelivery {
@@ -297,12 +300,12 @@ impl NativeMarkdownWindowSurface {
                     mailbox: std::sync::Arc::downgrade(&mailbox),
                 });
                 dispatch2::DispatchQueue::main().exec_async(move || {
-                    // 只发纯弱信号；借出owner时等待真实恢复事件，不丢通知或重新扫描。
+                    // Deliver a weak-only signal; a borrowed owner waits for its actual restoration event without losing notice or rescanning.
                     deliver_native_markdown_workspace_signal(signal);
                 });
             })
             .map_err(|error| {
-                // spawn没有建立线程，先释放本次邮箱和等待标记，不遗留永久“正在读取”。
+                // Failed spawn acquired no thread; release this mailbox and pending flag instead of leaving permanent loading state.
                 if let Some(mailbox) = self.sidebar_results.take() {
                     mailbox.cancel();
                 }
@@ -313,7 +316,7 @@ impl NativeMarkdownWindowSurface {
         Ok(())
     }
 
-    /// 纯门禁不调用Native；所有跨Native阶段共用同一个固定输入和任务代次。
+    /// Pure admission performs no native call; all native phases retain the original input and worker generations.
     fn browse_delivery_is_current(&self, generation: u64, intent: u64) -> bool {
         NativeMarkdownBrowseTicket { generation, intent }.accepts(
             self.search_generation,
@@ -324,7 +327,7 @@ impl NativeMarkdownWindowSurface {
         )
     }
 
-    /// 完整页安装只构造固定≤13行；布局和控件调用后再次核验原权限。
+    /// Install at most 13 rows from a complete page, rechecking original authority after layout/control calls.
     fn install_workspace_page(
         &mut self,
         page: MarkdownWorkspacePage,
@@ -337,7 +340,7 @@ impl NativeMarkdownWindowSurface {
                 .authority
                 .is_current(&self.session, &self.collapsed_directories)
         {
-            // 错模式/旧query/本地发布后不拆除当前有效投影。
+            // Wrong mode, stale query, or local publication must not dismantle the current valid projection.
             return Ok(false);
         }
         let root = self
@@ -347,14 +350,14 @@ impl NativeMarkdownWindowSurface {
         let root_title = native_markdown_path_name(&root.to_string_lossy());
         let (notes, mut rows) = native_markdown_sidebar_rows(page.snapshot, &root_title);
         for row in &mut rows {
-            // 只触碰当前有界页；折叠集合是用户状态，不扫描整库来补父行。
+            // Touch only this bounded page; collapse is user state and does not authorize a whole-workspace parent scan.
             row.is_collapsed = self.collapsed_directories.contains(&row.relative_path);
         }
         self.notes = Vec::new();
         self.sidebar_rows = Vec::new();
         self.sidebar_list.clear()?;
         if !self.browse_delivery_is_current(generation, intent) {
-            // 移除过程中重入新输入，旧页不能继续构造控件。
+            // Input reentry during removal revokes the old page's authority to construct controls.
             return Ok(false);
         }
         self.sidebar_list
@@ -364,6 +367,7 @@ impl NativeMarkdownWindowSurface {
                 .authority
                 .is_current(&self.session, &self.collapsed_directories)
         {
+            // Revoke the just-built obsolete projection after native replacement reentry, without publishing its pager.
             self.sidebar_list.clear()?;
             return Ok(false);
         }
@@ -373,23 +377,23 @@ impl NativeMarkdownWindowSurface {
         self.controller
             .set_next_sidebar_page_available(page.has_more);
         if !self.browse_delivery_is_current(generation, intent) {
-            // 最后setEnabled仍可能重入，外层不得随后发布pager或自动选旧笔记。
+            // Even final setEnabled can reenter; callers must not then publish the old pager or auto-open an old note.
             return Ok(false);
         }
         if let Some(label) = &self.empty_label {
-            // 初始Pending结束但本页没有笔记时，不能永远保留“正在读取”的旧提示。
+            // Once initial Pending ends, a note-free page must replace the obsolete loading label with the policy's status.
             label.setStringValue(&NSString::from_str(
                 self.sidebar_completion_policy
                     .empty_message(self.sidebar_rows.len() == 1 && !page.has_more),
             ));
         }
         if !self.browse_delivery_is_current(generation, intent) {
-            // 标签setter同样是重入边界，不清新输入的状态。
+            // Label setters are reentry boundaries too; leave replacement input state untouched.
             return Ok(false);
         }
-        // 保留活动笔记的恢复/保存反馈；最后Native setter之后仍须核本地发布撤权。
+        // Preserve active-note recovery/save feedback, rechecking local publication authority after the final native setter.
         self.update_sidebar_mode_label(false, intent);
-        // 模式标题也为Native setter，仍须通过本次原有的最终权限检查。
+        // The mode title is another native setter and must pass the same original final authority check.
         Ok(self.browse_delivery_is_current(generation, intent)
             && page
                 .authority
@@ -397,7 +401,7 @@ impl NativeMarkdownWindowSurface {
     }
 }
 
-/// 只有主队列信号门禁允许进入；消费时仍逐项核原owner/代次及精确邮箱身份。
+/// Main-queue signal admission still requires original owner/generations and exact mailbox identity at consumption.
 pub(super) fn deliver_native_markdown_directory_result(
     delivery: WorkspaceDelivery<NativeMarkdownBrowseResult>,
 ) {
@@ -410,7 +414,7 @@ pub(super) fn deliver_native_markdown_directory_result(
 
     let mtm = MainThreadMarker::new().expect("目录结果在主队列交付");
     let Some(mailbox) = mailbox.upgrade() else {
-        // cancel已同步释放载荷，没有重试或重建权限。
+        // Cancellation already synchronously discarded the payload, granting no retry or reconstruction authority.
         return;
     };
     let mut first_note = None;
@@ -422,18 +426,18 @@ pub(super) fn deliver_native_markdown_directory_result(
                 .as_ref()
                 .is_some_and(|current| std::sync::Arc::ptr_eq(current, &mailbox))
         {
-            // 搜索模式、owner、输入/任务代次或精确邮箱任何一个变化均拒绝。
-            // 地址与标量复用不能让旧通知取消或消费新邮箱。
+            // Reject changed search mode, owner, input/worker generation, or exact mailbox identity.
+            // Reused addresses/scalars cannot let an old notice cancel or consume its replacement mailbox.
             mailbox.cancel();
             return Ok(());
         }
         let Some(results) = mailbox.take() else {
-            // 已取消/消费的邮箱不能重复安装。
+            // A cancelled or consumed mailbox cannot install its page twice.
             return Ok(());
         };
         match results {
             Ok((pager, page)) => {
-                // 末页也验证core authority，本地save可能已在排队期间撤权。
+                // Even a final page requires Core authority; local save may have revoked it while queued.
                 if !page
                     .authority
                     .is_current(&surface.session, &surface.collapsed_directories)
@@ -448,7 +452,7 @@ pub(super) fn deliver_native_markdown_directory_result(
                     || !surface.browse_delivery_is_current(generation, accepted_intent)
                     || !authority.is_current(&surface.session, &surface.collapsed_directories)
                 {
-                    // Native布局/setter重入后仅丢弃本次局部pager，不能拉回旧页。
+                    // After native layout/setter reentry, discard only this local pager without restoring the old page.
                     return Ok(());
                 }
                 surface.sidebar_pager = Some(pager);
@@ -460,7 +464,7 @@ pub(super) fn deliver_native_markdown_directory_result(
                     && surface.pending_file_mutation.is_none()
                     && surface.pending_note_switch.is_none()
                 {
-                    // 初始大库/删除后没有正文时，完成排序后才选真正第一条。
+                    // With no body after initial large-workspace loading or deletion, select the true first note only after sorting completes.
                     first_note = surface
                         .notes
                         .first()
@@ -468,7 +472,7 @@ pub(super) fn deliver_native_markdown_directory_result(
                 }
             }
             Err(error) => {
-                // 只由仍有效的同一任务显示错误，保留现有正文和用户字段。
+                // Only the same still-current task may report failure, preserving the existing body and user input.
                 surface.sidebar_scan_pending = false;
                 surface.sidebar_results.take();
                 return Err(error.to_string());
@@ -477,19 +481,19 @@ pub(super) fn deliver_native_markdown_directory_result(
         Ok(())
     });
     if let Err(error) = delivered {
-        // present_error是Native调用，先重新只读确认当前owner/意图，旧错误不覆盖新query。
+        // present_error calls native code; recheck owner/intent first so old failure cannot overwrite a replacement query.
         let _ = with_active_native_markdown_surface(|surface| {
             if std::ptr::from_ref(&*surface.controller).addr() == owner_identity
                 && surface.browse_delivery_is_current(generation, accepted_intent)
             {
-                // 租约已结束TLS借用；当前owner才可执行原生错误展示。
+                // The lease ended the TLS borrow; only this current owner may present the native error.
                 surface.controller.present_error(&error);
             }
             Ok(())
         });
     }
     if let Some((path, authority)) = first_note {
-        // 离开surface租约后走既有文档转换，不在Active槽借用中构造TextKit。
+        // Use the existing document handoff after leaving the surface lease, without constructing native editors under an Active borrow.
         let current = with_active_native_markdown_surface(|surface| {
             Ok(
                 std::ptr::from_ref(&*surface.controller).addr() == owner_identity
@@ -504,7 +508,7 @@ pub(super) fn deliver_native_markdown_directory_result(
         })
         .unwrap_or(false);
         if current {
-            // 既有switch在当前surface内报告首因；外层不重复显示可能已过期的错误。
+            // Existing switch reports its first failure to the current surface; do not repeat a possibly stale outer error.
             let _ = switch_native_markdown_note(&path, None);
         }
     }

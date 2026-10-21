@@ -1,4 +1,5 @@
-//! 每个候选只有一条实际主队列延续；闭包仅存原view/surface的Weak与标量serial。
+//! Each candidate has one main-queue continuation containing only weak View/surface identities and its
+//! original serial.
 
 use super::*;
 use dispatch2::MainThreadBound;
@@ -6,6 +7,7 @@ use dispatch2::MainThreadBound;
 pub(super) mod probe;
 
 impl CpuSurface {
+    /// Queue one turn for the original serial, retaining neither View nor surface while waiting.
     pub(super) fn schedule(
         self: &Rc<Self>,
         view: &NativeMarkdownPagedTextView,
@@ -32,7 +34,7 @@ impl CpuSurface {
             if surface.scheduled.get() != Some(serial)
                 || surface.active_serial.get() != Some(serial)
             {
-                return; // 旧排队事件没有清理后继scheduled槽或领取新scene的权利。
+                return; // A stale queued event may neither clear a successor scheduled slot nor acquire a new Scene.
             }
             surface.scheduled.set(None);
             let _use = PayloadUseGuard::enter(&view.ivars().depth);
@@ -40,7 +42,7 @@ impl CpuSurface {
                 Ok(painting) => painting,
                 Err(_) => {
                     surface.deferred.set(Some(serial));
-                    return; // 原同步绘图栈退出时唯一wake，不能在嵌套runloop里空转调度。
+                    return; // The original synchronous paint exit owns the wake; avoid rescheduling loops inside nested run loops.
                 }
             };
             let result = (|| {
@@ -60,10 +62,12 @@ impl CpuSurface {
                 Err(error) => Err(error),
                 Ok(()) => wake,
             };
-            view.record(result); // 每轮真实错误仅记录一次；没有定时器、嵌套runloop或失败重放。
+            view.record(result); // Record the actual error once per turn, without timers, nested run loops, or replaying failed work.
         });
         Ok(())
     }
+    /// Wake deferred original work and independently honor a newer repaint, preserving the earlier
+    /// error.
     pub(super) fn wake_deferred(self: &Rc<Self>, view: &NativeMarkdownPagedTextView) -> Result<()> {
         let continuation = if let Some(serial) = self.deferred.take()
             && self.active_serial.get() == Some(serial)
@@ -72,8 +76,10 @@ impl CpuSurface {
         } else {
             Ok(())
         };
-        // 原同步栈已经归还 PaintUse，才能让 AppKit 重新交付 updateLayer。
-        // 此处只标脏当前真实客户，不领取 Scene，也不把旧票重新签给已接受的新输入。
+        // The synchronous stack must release PaintUse before asking AppKit to deliver updateLayer
+        // again.
+        // Dirty only the actual current client, without acquiring a Scene or renewing old authority for
+        // accepted new input.
         let repaint = if self.repaint_requested.replace(false) && !view.ivars().closed.get() {
             (|| {
                 let origin = view.origin()?;
@@ -83,8 +89,10 @@ impl CpuSurface {
         } else {
             Ok(())
         };
-        // 两项都执行，保证原 serial 的调度错误不会丢掉较新 Scene 的重绘请求。
-        // 原 continuation 首错仍优先，调用者再保留原 paint/Source 的更早失败。
+        // Run both operations so an original-serial scheduling error cannot discard a newer Scene
+        // repaint request.
+        // Preserve the continuation error first; the caller still gives an earlier paint/Source failure
+        // priority.
         continuation.and(repaint)
     }
 }

@@ -220,6 +220,9 @@ fn native_glyphs(
             // 独立参考也必须保持原实际字体；系统静默换 face 不能成为原 Core glyph 的期望。
             // SAFETY: attributes 由仍活的 run 取得，公开 Font 键值的借用不离开此自动释放池。
             let attributes = unsafe { run.as_ref().attributes() };
+            // SAFETY: The retained real run owns this immutable attribute
+            // dictionary; the exported CTFont key has process lifetime and the
+            // borrowed value is consumed within this same autorelease pool.
             let actual =
                 unsafe { attributes.value(std::ptr::from_ref(kCTFontAttributeName).cast()) };
             let actual = NonNull::new(actual.cast_mut().cast::<CTFont>())

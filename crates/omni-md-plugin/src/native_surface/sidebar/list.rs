@@ -1,4 +1,4 @@
-//! 当前有限元数据页的原生列表；滚动与行复用不读取笔记正文，也不推进目录游标。
+//! Native list for the current bounded metadata page; scrolling and reuse neither read note bodies nor advance the directory cursor.
 
 use super::*;
 use objc2_app_kit::{
@@ -7,28 +7,29 @@ use objc2_app_kit::{
 };
 use objc2_foundation::NSIndexSet;
 
-/// 搜索副行只改变当前结果页的真实高度；普通目录和笔记沿原30pt行高。
+/// Search subtitles change only result-row height; ordinary directory/note rows retain the existing 30 pt height.
 const SEARCH_ROW_HEIGHT: f64 = 48.0;
 
+/// Own only two visible labels, while the table's current metadata page retains file identity.
 struct NativeMarkdownSidebarSearchRowIvars {
     title: Retained<NSTextField>,
     subtitle: Retained<NSTextField>,
 }
 
 define_class!(
-    /// 同一个复用行只持两项可见标签；文件身份仍只归原表的有限metadata页。
-    // SAFETY: 主线程NSView子类只有明确的两个控件强边，不接管事件或文本输入协议。
+    /// Each reused row owns two visible labels; file identity remains in the original table's bounded metadata page.
+    // SAFETY: This main-thread NSView owns two declared controls and implements no event or text-input protocol.
     #[unsafe(super = NSView)]
     #[thread_kind = MainThreadOnly]
     #[ivars = NativeMarkdownSidebarSearchRowIvars]
     struct NativeMarkdownSidebarSearchRow;
 
-    // SAFETY: NSObjectProtocol没有新增方法；视图构造和清理均在原AppKit主线程。
+    // SAFETY: NSObjectProtocol adds no methods; construction and cleanup remain on the original AppKit main thread.
     unsafe impl NSObjectProtocol for NativeMarkdownSidebarSearchRow {}
 );
 
 impl NativeMarkdownSidebarSearchRow {
-    /// 构造发生在实际可见行请求内；离屏行由同一NSTableView复用，不建立摘要缓存。
+    /// Construct only on an actual visible-row request; the same NSTableView reuses offscreen rows without a snippet cache.
     fn new(
         width: f64,
         ledger: &NativeMarkdownOwnedLedger,
@@ -46,7 +47,7 @@ impl NativeMarkdownSidebarSearchRow {
         );
         let allocated =
             Self::alloc(mtm).set_ivars(NativeMarkdownSidebarSearchRowIvars { title, subtitle });
-        // SAFETY: 两个自有标签已初始化；原NSView指定初始化器只接收有限实际列宽与固定行高。
+        // SAFETY: Both labels are initialized; NSView's designated initializer receives bounded column width and fixed row height.
         let row: Retained<Self> = unsafe {
             msg_send![super(allocated), initWithFrame: NSRect::new(NSPoint::ZERO, NSSize::new(width, SEARCH_ROW_HEIGHT))]
         };
@@ -55,14 +56,14 @@ impl NativeMarkdownSidebarSearchRow {
         row.setClipsToBounds(true);
         row.addSubview(&row.ivars().title);
         row.addSubview(&row.ivars().subtitle);
-        // 容器、两label和各自cell都沿原会话账本；登记失败时局部整行归还，不发布半行。
+        // Register container, labels, and cells in the session ledger; registration failure drops the whole unpublished row.
         ledger.include("sidebar.search-row", &row)?;
         ledger.include_control("sidebar.row", &row.ivars().title)?;
         ledger.include_control("sidebar.row", &row.ivars().subtitle)?;
         Ok(row)
     }
 
-    /// 两个独立单行cell分别截断，宽度变化不让长标题挤掉摘要或扩张行高。
+    /// Independent single-line cells truncate separately, preventing a long title from displacing the snippet or changing row height.
     fn label(size: f64, frame: NSRect, mtm: MainThreadMarker) -> Retained<NSTextField> {
         let label = NSTextField::labelWithString(ns_string!(""), mtm);
         label.setFrame(frame);
@@ -71,6 +72,7 @@ impl NativeMarkdownSidebarSearchRow {
         label.setSelectable(false);
         label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
         if let Some(cell) = label.cell() {
+            // Keep native single-line layout while allowing the actual column width to determine tail truncation.
             cell.setUsesSingleLineMode(true);
             cell.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
         }
@@ -78,29 +80,29 @@ impl NativeMarkdownSidebarSearchRow {
     }
 }
 
-/// 一个会话只构造一对列表和滚动容器；翻页只替换当前页的纯元数据。
+/// One session owns one table/scroll pair; paging replaces only the current metadata projection.
 pub(in crate::native_surface) struct NativeMarkdownSidebarList {
     pub(in crate::native_surface) table: Retained<NativeMarkdownSidebarTable>,
     scroll: Retained<NSScrollView>,
 }
 
-/// dataSource回调只访问这一份有限投影，不反借前台surface或目录扫描器。
+/// Data-source callbacks access only this bounded projection, without borrowing foreground surface or directory scanner.
 pub(in crate::native_surface) struct NativeMarkdownSidebarTableIvars {
     rows: RefCell<Vec<NativeMarkdownSidebarRow>>,
     active_path: RefCell<Option<String>>,
-    /// 真实浏览目录独立于打开的正文；翻页、折叠和搜索不将它重置为正文父目录。
+    /// Browse directory is independent of the open body; paging, collapse, and search cannot reset it to the note's parent.
     selected_directory: RefCell<String>,
     selection_revision: Cell<u64>,
     revision: Cell<u64>,
     closed: Cell<bool>,
     ledger: std::rc::Weak<NativeMarkdownOwnedLedger>,
-    /// 仅跟踪已创建行的弱身份，关闭时清空AppKit复用池中可能暂存的标签。
+    /// Track created labels weakly, allowing close to clear text still held temporarily by AppKit's reuse pool.
     labels: RefCell<Vec<Weak<NSTextField>>>,
 }
 
 define_class!(
-    /// AppKit负责可见行、滚动、方向键与类型选择；项目只提供当前页内容与既有动作。
-    // SAFETY: 主线程NSTableView子类使用公开dataSource/delegate及精确声明的selector签名。
+    /// AppKit owns visibility, scrolling, arrow navigation, and type selection; the project supplies current-page metadata/actions only.
+    // SAFETY: This main-thread NSTableView uses public data-source/delegate APIs and exact declared selector signatures.
     #[unsafe(super = NSTableView)]
     #[thread_kind = MainThreadOnly]
     #[ivars = NativeMarkdownSidebarTableIvars]
@@ -109,23 +111,26 @@ define_class!(
     impl NativeMarkdownSidebarTable {
         #[unsafe(method(createMarkdownNoteInSelectedDirectory:))]
         fn create_note_in_selected_directory(&self, _sender: &AnyObject) {
+            // Capture the selected directory before queuing the existing create-note workflow.
             self.enqueue_directory_action(NativeMarkdownSidebarAction::CreateNote);
         }
 
         #[unsafe(method(createMarkdownDirectoryInSelectedDirectory:))]
         fn create_directory_in_selected_directory(&self, _sender: &AnyObject) {
+            // Directory creation shares original selection authority and the same deferred mutation boundary.
             self.enqueue_directory_action(NativeMarkdownSidebarAction::CreateDirectory);
         }
 
         #[unsafe(method(importMarkdownNoteInSelectedDirectory:))]
         fn import_note_in_selected_directory(&self, _sender: &AnyObject) {
+            // Import keeps the selected-directory ticket rather than deriving destination from the open body.
             self.enqueue_directory_action(NativeMarkdownSidebarAction::ImportNote);
         }
 
         #[unsafe(method(activateMarkdownSidebarSelection:))]
         fn activate_selection(&self, _sender: Option<&AnyObject>) {
             if let Ok(row) = usize::try_from(self.selectedRow()) {
-                // 点击与原按钮相同，只排队一次原目录/笔记动作，不在native回调栈切换正文。
+                // Queue one existing directory/note action, matching the old button without switching body on the native callback stack.
                 self.enqueue_activation(row);
             }
         }
@@ -135,41 +140,43 @@ define_class!(
             if matches!(event.keyCode(), 36 | 76)
                 && event.modifierFlags().intersection(NSEventModifierFlags::DeviceIndependentFlagsMask).is_empty()
             {
-                // 列表获得焦点后，Return执行当前行；不是Host快捷键或新全局注册。
+                // Unmodified Return activates the focused list row; it neither registers nor handles a Host global shortcut.
                 if let Ok(row) = usize::try_from(self.selectedRow()) {
                     self.enqueue_activation(row);
                 }
             } else {
-                // 方向键、Tab和按名称选择由NSTableView保持原生行为，不重新解释文本编辑键。
-                // SAFETY: 原始NSEvent同步转给同一NSTableView superclass实现。
+                // Preserve NSTableView's arrows, Tab, and type selection without reinterpreting text-editing keys.
+                // SAFETY: Forward the original NSEvent synchronously to the same NSTableView superclass ABI.
                 unsafe { let _: () = msg_send![super(self), keyDown: event]; }
             }
         }
 
         #[unsafe(method_id(menuForEvent:))]
         fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
+            // Build only the actually hit row's temporary owned menu; stale/closed targets return none.
             self.context_menu(event)
         }
     }
 
-    // SAFETY: NSObjectProtocol没有额外方法；所有实例和消息都限制在AppKit主线程。
+    // SAFETY: NSObjectProtocol adds no methods; every instance and message stays on AppKit's main thread.
     unsafe impl NSObjectProtocol for NativeMarkdownSidebarTable {}
-    // SAFETY: NSTableViewDelegate的公开父协议要求此conformance；不实现额外文本编辑动作。
+    // SAFETY: NSTableViewDelegate requires this public parent conformance, without additional text-editing actions.
     unsafe impl NSControlTextEditingDelegate for NativeMarkdownSidebarTable {}
 
-    // SAFETY: dataSource同步返回当前有限页数量，不访问磁盘或借用外部UI所有者。
+    // SAFETY: The synchronous data source returns the bounded page count, without disk access or borrowing external UI owners.
     unsafe impl NSTableViewDataSource for NativeMarkdownSidebarTable {
         #[unsafe(method(numberOfRowsInTableView:))]
         fn number_of_rows(&self, _table: &NSTableView) -> isize {
+            // The admitted page is at most 13 entries, so its metadata length fits the native row-count ABI.
             self.ivars().rows.borrow().len() as isize
         }
     }
 
-    // SAFETY: viewFor回调的NSView返回所有权符合协议；Native调用前已归还metadata借用。
+    // SAFETY: viewFor returns NSView ownership required by the protocol; metadata borrows end before native calls.
     unsafe impl NSTableViewDelegate for NativeMarkdownSidebarTable {
         #[unsafe(method(tableView:heightOfRow:))]
         fn height_of_row(&self, _table: &NSTableView, row: isize) -> f64 {
-            // 原表逐行读取当前页metadata；不按可见高度改变Core页容量或目录滚动行为。
+            // Read per-row metadata without changing Core page capacity or directory scrolling according to viewport height.
             if usize::try_from(row).ok().and_then(|index| self.ivars().rows.borrow().get(index).map(|row| row.subtitle.is_some())).unwrap_or(false) {
                 SEARCH_ROW_HEIGHT
             } else {
@@ -179,20 +186,23 @@ define_class!(
 
         #[unsafe(method_id(tableView:viewForTableColumn:row:))]
         fn row_view(&self, table: &NSTableView, _column: Option<&NSTableColumn>, row: isize) -> Option<Retained<NSView>> {
+            // Delegate visible-row construction to the fallible helper after AppKit supplies its actual row index.
             self.make_row_view(table, row)
         }
 
         #[unsafe(method_id(tableView:typeSelectStringForTableColumn:row:))]
         fn type_select_title(&self, _table: &NSTableView, _column: Option<&NSTableColumn>, row: isize) -> Option<Retained<NSString>> {
+            // Native type selection compares original metadata title, excluding indentation and file-opening side effects.
             self.type_select_string(row)
         }
     }
 );
 
 impl NativeMarkdownSidebarTable {
-    /// 原生按名称选择只比较当前页的真实标题；不含显示缩进，也不触发文档打开。
+    /// Native type selection compares current-page original titles only, without indentation or document opening.
     fn type_select_string(&self, row: isize) -> Option<Retained<NSString>> {
         if self.ivars().closed.get() {
+            // A framework-cached table cannot restore access to metadata after close.
             return None;
         }
         let index = usize::try_from(row).ok()?;
@@ -200,17 +210,17 @@ impl NativeMarkdownSidebarTable {
         Some(NSString::from_str(&title))
     }
 
-    /// 菜单构造在普通Rust返回值中处理关闭、失页和登记失败。
+    /// Ordinary Rust return values handle closed lists, missing pages, and menu registration failure.
     fn context_menu(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
         if self.ivars().closed.get() {
-            return None; // 已关闭的复用视图不再生成文件动作。
+            return None; // Closed reused views grant no authority to generate file actions.
         }
         let point = self.convertPoint_fromView(event.locationInWindow(), None);
         let row = usize::try_from(self.rowAtPoint(point)).ok()?;
         let revision = self.ivars().revision.get();
         let kind = self.ivars().rows.borrow().get(row)?.kind;
         if !self.permits(revision, row) {
-            return None; // 只接受当前真实命中行，不用最后一个点击行代替空白区域。
+            return None; // Require the actually hit current row; blank space cannot reuse the last clicked row.
         }
         let ledger = self.ivars().ledger.upgrade()?;
         let target = NativeMarkdownSidebarMenuTarget::new(row, revision, self, self.mtm());
@@ -220,11 +230,11 @@ impl NativeMarkdownSidebarTable {
             .and_then(|()| ledger.include_menu("sidebar.context.menu", &menu))
         {
             present_native_markdown_error(&error);
-            return None; // 未登记的目标和菜单只归本栈，失败时不交给AppKit跟踪。
+            return None; // Unregistered target/menu stay local and cannot be transferred to AppKit tracking.
         }
         Some(menu)
     }
-    /// 仅当前可见行请求标签；普通Rust helper保留可失败的复用与资源登记。
+    /// Request labels for current visible rows only; the Rust helper preserves fallible reuse and ledger registration.
     fn make_row_view(&self, table: &NSTableView, row: isize) -> Option<Retained<NSView>> {
         let index = usize::try_from(row).ok()?;
         let metadata = self.ivars().rows.borrow().get(index).cloned()?;
@@ -232,15 +242,15 @@ impl NativeMarkdownSidebarTable {
             self.ivars().active_path.borrow().as_deref() == Some(metadata.relative_path.as_str());
         let revision = self.ivars().revision.get();
         if metadata.subtitle.is_some() {
-            // 搜索行独立复用两标签；目录行仍走下方原单label构造/呈现。
+            // Search reuses a separate two-label container; ordinary rows keep the single-label construction below.
             return self.make_search_row_view(table, metadata, active, revision);
         }
-        // SAFETY: 标识符仅属于本表注册的NSTextField；没有nib或需要额外owner的工厂。
+        // SAFETY: Only this table creates NSTextField under this identifier; there is no nib or factory with another owner.
         let reused = unsafe {
             table.makeViewWithIdentifier_owner(ns_string!("OmniMarkdownSidebarRow"), None)
         };
         let field = match reused {
-            Some(view) => view.downcast::<NSTextField>().ok()?,
+            Some(view) => view.downcast::<NSTextField>().ok()?, // Reject an incompatible reuse identity without rebuilding an unknown subtree.
             None => {
                 let field = NSTextField::labelWithString(ns_string!(""), self.mtm());
                 field.setIdentifier(Some(ns_string!("OmniMarkdownSidebarRow")));
@@ -249,13 +259,13 @@ impl NativeMarkdownSidebarTable {
                 field.setSelectable(false);
                 field.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
                 if let Some(cell) = field.cell() {
-                    // 列表宽度变化只影响尾部省略，文件相对路径和完整AX文本不被截短。
+                    // Width changes affect tail truncation only, preserving relative file identity and complete accessibility text.
                     cell.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
                 }
                 let ledger = self.ivars().ledger.upgrade()?;
                 if let Err(error) = ledger.include_control("sidebar.row", &field) {
                     present_native_markdown_error(&error);
-                    return None; // 未进入原资源账的行不能发布为可见内容。
+                    return None; // A row absent from the original resource ledger cannot become visible content.
                 }
                 let mut labels = self.ivars().labels.take();
                 labels.retain(|label| label.load().is_some());
@@ -265,7 +275,7 @@ impl NativeMarkdownSidebarTable {
             }
         };
         if self.ivars().closed.get() || self.ivars().revision.get() != revision {
-            return None; // 创建/复用期间若新页或关闭接管，不把旧文本写入后继行。
+            return None; // Creation/reuse reentry that changes page or closes the table cannot publish old text into a successor row.
         }
         field.setStringValue(&NSString::from_str(&native_markdown_sidebar_button_title(
             &metadata,
@@ -273,13 +283,13 @@ impl NativeMarkdownSidebarTable {
         field.setTextColor(Some(&native_markdown_note_color(
             active && metadata.kind == NativeMarkdownSidebarEntryKind::Note,
         )));
-        // 当前打开的笔记与原生表格选择是两件事；焦点转入正文后，字重仍标明实际文稿。
-        // 复用行每次都重设普通/当前字重，避免旧笔记的强调样式串到下一页或目录行。
+        // Open-note identity differs from native table selection; font weight still identifies the note after focus moves to the body.
+        // Reset weight on every reuse so an old note's emphasis cannot carry into another page or directory row.
         let weight = if active && metadata.kind == NativeMarkdownSidebarEntryKind::Note {
-            // SAFETY: 框架公开固定字重值进程内有效，样式不保留本行或业务对象。
+            // SAFETY: This public process-lifetime font-weight constant retains neither row nor business object.
             unsafe { NSFontWeightSemibold }
         } else {
-            // SAFETY: 与当前笔记分支同一公开常量合同，复用行必须恢复普通字重。
+            // SAFETY: The same public-constant contract applies; a reused inactive row restores regular weight.
             unsafe { NSFontWeightRegular }
         };
         field.setFont(Some(&NSFont::systemFontOfSize_weight(13.0, weight)));
@@ -308,7 +318,7 @@ impl NativeMarkdownSidebarTable {
         Some(field.into_super().into_super())
     }
 
-    /// 同一搜索结果的原title/路径/摘要分别呈现；原行身份、菜单与激活仍由table页票决定。
+    /// Present original title/path/snippet separately; the table's page ticket still owns row identity, menus, and activation.
     fn make_search_row_view(
         &self,
         table: &NSTableView,
@@ -316,12 +326,12 @@ impl NativeMarkdownSidebarTable {
         active: bool,
         revision: u64,
     ) -> Option<Retained<NSView>> {
-        // SAFETY: 只有本类用此identifier创建搜索容器，不读取系统未知复用视图的子树。
+        // SAFETY: Only this class creates search containers under this identifier; never inspect unknown system reuse subtrees.
         let reused = unsafe {
             table.makeViewWithIdentifier_owner(ns_string!("OmniMarkdownSearchRow"), None)
         };
         let row = match reused {
-            Some(view) => view.downcast::<NativeMarkdownSidebarSearchRow>().ok()?,
+            Some(view) => view.downcast::<NativeMarkdownSidebarSearchRow>().ok()?, // An incompatible reused container grants no label authority.
             None => {
                 let ledger = self.ivars().ledger.upgrade()?;
                 let width = table.bounds().size.width;
@@ -329,10 +339,10 @@ impl NativeMarkdownSidebarTable {
                     Ok(row) => row,
                     Err(error) => {
                         present_native_markdown_error(&error);
-                        return None; // 原ledger失败不发布未完整登记的行。
+                        return None; // Ledger failure prevents publication of a partially registered row.
                     }
                 };
-                // 与普通标签共用原弱清理列表；复用池即使暂存容器，也不能留下旧业务文本。
+                // Share the existing weak cleanup list; a framework-cached container must not retain old business text.
                 let mut labels = self.ivars().labels.take();
                 labels.retain(|label| label.load().is_some());
                 labels.push(Weak::from_retained(&row.ivars().title));
@@ -342,12 +352,12 @@ impl NativeMarkdownSidebarTable {
             }
         };
         if self.ivars().closed.get() || self.ivars().revision.get() != revision {
-            return None; // 构造/复用期间已换页时，不把旧搜索值写进后继显示。
+            return None; // A page change during construction/reuse prevents old search text entering successor presentation.
         }
         let title = &row.ivars().title;
         let subtitle = &row.ivars().subtitle;
         let current = || !self.ivars().closed.get() && self.ivars().revision.get() == revision;
-        // 每份Native临时值和setter前后均保原页票；重入换页后不再改后继复用字段。
+        // Guard every native temporary and setter with the original page ticket; reentry cannot mutate successor reused labels.
         let native_title =
             native_markdown_table_intent_step(&current, || NSString::from_str(&metadata.title))
                 .ok()?;
@@ -397,7 +407,7 @@ impl NativeMarkdownSidebarTable {
         Some(row.into_super())
     }
 
-    /// 只校验原列表/页/行身份，不将复用标签的地址当成业务文件身份。
+    /// Validate original list/page/row identity, never treating a reused label address as business file identity.
     pub(in crate::native_surface) fn permits(&self, revision: u64, row: usize) -> bool {
         self.permits_origin(&NativeMarkdownSidebarActionOrigin::Row {
             row_index: row,
@@ -405,7 +415,7 @@ impl NativeMarkdownSidebarTable {
         })
     }
 
-    /// 只读捕获真实目录选择；没有原生getter，也不要求目录仍出现在当前有限页中。
+    /// Capture actual directory selection without native getters or requiring that directory in the bounded current page.
     pub(in crate::native_surface) fn directory_origin(&self) -> NativeMarkdownSidebarActionOrigin {
         NativeMarkdownSidebarActionOrigin::SelectedDirectory {
             relative_path: self.ivars().selected_directory.borrow().clone(),
@@ -413,10 +423,10 @@ impl NativeMarkdownSidebarTable {
         }
     }
 
-    /// 一次明确目录选择或成功收据撤销旧按钮请求，即使路径随后又被选回也不能复活。
+    /// Explicit selection or successful receipt revokes old button requests, even if the same path is selected again later.
     fn select_directory(&self, path: &str) {
         if self.ivars().closed.get() {
-            return; // 已拆图的目录不能被迟到安装/收据重新填入。
+            return; // Late installation/receipts cannot repopulate directory metadata after teardown.
         }
         self.ivars().selection_revision.set(
             self.ivars()
@@ -428,7 +438,7 @@ impl NativeMarkdownSidebarTable {
         *self.ivars().selected_directory.borrow_mut() = path.to_owned();
     }
 
-    /// 普通回调检查唯一前台；真正take surface的文件边界使用同一纯来源判断。
+    /// Ordinary callbacks check the unique foreground; the actual surface lease uses the same pure origin validation.
     pub(in crate::native_surface) fn permits_origin(
         &self,
         origin: &NativeMarkdownSidebarActionOrigin,
@@ -440,17 +450,17 @@ impl NativeMarkdownSidebarTable {
         })
     }
 
-    /// 原页是元数据身份，目录选择代次是用户意图；不借用全局Active所以可用于原mutation收口。
+    /// Page revision identifies metadata and directory revision identifies user intent; no global Active borrow is needed at mutation admission.
     pub(in crate::native_surface) fn origin_matches_surface(
         &self,
         surface: &NativeMarkdownWindowSurface,
         origin: &NativeMarkdownSidebarActionOrigin,
     ) -> bool {
         if self.ivars().closed.get() || !std::ptr::eq(&*surface.sidebar_list.table, self) {
-            return false; // 同名目录和同号页不能跨会话继承权限。
+            return false; // Equal directory names or page numbers cannot transfer authority across sessions.
         }
         match origin {
-            // 原右键动作仍要求原页及实际行，不将目录浏览状态混入该行的权限。
+            // Row actions require the original page and actual row, without borrowing independent browse-directory authority.
             NativeMarkdownSidebarActionOrigin::Row {
                 row_index,
                 revision,
@@ -458,7 +468,7 @@ impl NativeMarkdownSidebarTable {
                 self.ivars().revision.get() == *revision
                     && *row_index < self.ivars().rows.borrow().len()
             }
-            // 独立目录选择不属于某页；合法保存刷新/翻页可以继续原意图，换目录仍按原代次撤权。
+            // Directory selection is page-independent; save refresh/paging preserves intent, while directory change revokes its generation.
             NativeMarkdownSidebarActionOrigin::SelectedDirectory {
                 relative_path,
                 selection_revision,
@@ -469,19 +479,20 @@ impl NativeMarkdownSidebarTable {
         }
     }
 
-    /// 三个固定按钮在第一个原生操作前固定当前目录，随后复用原菜单的排队和文件流程。
+    /// Three fixed buttons capture directory before the first native operation, then share context-menu queuing and file workflow.
     fn enqueue_directory_action(&self, action: NativeMarkdownSidebarAction) {
         let origin = self.directory_origin();
         if !self.permits_origin(&origin) {
-            return; // 已关闭或暂借的原列表不能为后继会话创建文件。
+            return; // A closed or currently leased original table cannot create files for a successor session.
         }
         enqueue_native_markdown_sidebar_action(Weak::from(self), origin, action, self.mtm());
     }
 
+    /// Queue the original row/page weakly so native selection returns before note switching or directory refresh.
     fn enqueue_activation(&self, row: usize) {
         let revision = self.ivars().revision.get();
         if !self.permits(revision, row) {
-            return; // 迟到事件不能打开已被新页替代的同号笔记。
+            return; // A late event cannot open the equal-index note from a replacement page.
         }
         let weak = MainThreadBound::new(Weak::from(self), self.mtm());
         enqueue_native_markdown_main_task(move || {
@@ -491,20 +502,22 @@ impl NativeMarkdownSidebarTable {
                 .load()
                 .is_some_and(|table| table.permits(revision, row))
             {
-                return; // 排队期间原页或前台已变化，不获取后继文件的动作权限。
+                return; // Changed page/foreground while queued revokes this action without acquiring successor file authority.
             }
             if let Err(error) = activate_native_markdown_sidebar_row(row) {
+                // Report actual activation failure without replaying a possibly completed save/switch operation.
                 present_native_markdown_error(&error);
                 eprintln!("Markdown sidebar activation failed: {error}");
             }
         });
     }
 
-    /// 标签的复用池可能暂存离屏行；先复制弱句柄，再逐个清空，避免借用跨Native消息。
+    /// Reuse pools may hold offscreen labels; copy weak handles before clearing them, keeping borrows outside native messages.
     fn clear_labels(&self) {
         let labels = self.ivars().labels.borrow().clone();
         for label in labels {
             if let Some(label) = label.load() {
+                // Erase business text and path/accessibility metadata even when AppKit still leases the empty label shell.
                 label.setStringValue(ns_string!(""));
                 label.setToolTip(None);
                 label.setAccessibilityLabel(None);
@@ -514,6 +527,7 @@ impl NativeMarkdownSidebarTable {
 }
 
 impl NativeMarkdownSidebarList {
+    /// Build the session's one table/scroll pair, register actual native roles, and publish only a complete bounded projection.
     pub(in crate::native_surface) fn new(
         rows: &[NativeMarkdownSidebarRow],
         selected_path: Option<&str>,
@@ -537,7 +551,7 @@ impl NativeMarkdownSidebarList {
                 ledger: Rc::downgrade(ledger),
                 labels: RefCell::new(Vec::new()),
             });
-        // SAFETY: 原table只初始化一次；所有dataSource调用发生在Rust ivars完整构造之后。
+        // SAFETY: Initialize this table once; every data-source callback sees fully initialized Rust ivars.
         let table: Retained<NativeMarkdownSidebarTable> = unsafe {
             msg_send![super(table), initWithFrame: NSRect::new(NSPoint::ZERO, frame.size)]
         };
@@ -564,13 +578,14 @@ impl NativeMarkdownSidebarList {
             0.06, 0.067, 0.086, 1.0,
         ));
         table.setAccessibilityLabel(Some(ns_string!("笔记列表")));
-        // SAFETY: table由唯一会话保活，dataSource/delegate/target均为weak且关闭时显式断开。
+        // SAFETY: The unique session retains table; weak data-source/delegate/target links are explicitly detached at close.
         unsafe {
             table.setDataSource(Some(ProtocolObject::from_ref(&*table)));
             table.setDelegate(Some(ProtocolObject::from_ref(&*table)));
             table.setTarget(Some(&*table));
             table.setAction(Some(sel!(activateMarkdownSidebarSelection:)));
         }
+        // Scrolling changes only the native viewport; it cannot advance a Core pager or read a document body.
         let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
         scroll.setHasVerticalScroller(true);
         scroll.setHasHorizontalScroller(false);
@@ -578,6 +593,7 @@ impl NativeMarkdownSidebarList {
         scroll.setDrawsBackground(false);
         scroll.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
         scroll.setDocumentView(Some(&table));
+        // Keep the real scroll/clip/table/column identities in the original ledger before publishing to content.
         ledger.include("sidebar.scroll", &scroll)?;
         ledger.include("sidebar.clip", &scroll.contentView())?;
         ledger.include("sidebar.table", &table)?;
@@ -588,16 +604,18 @@ impl NativeMarkdownSidebarList {
         Ok(list)
     }
 
-    /// 翻页只替换这13项投影；程序安装选择不会触发click action或另开文档。
+    /// Paging replaces only this 13-row projection; programmatic selection triggers no click action or document open.
     pub(in crate::native_surface) fn replace(
         &self,
         rows: &[NativeMarkdownSidebarRow],
         selected_path: Option<&str>,
     ) -> Result<(), String> {
         if self.table.ivars().closed.get() {
+            // Framework-retained closed tables cannot be repopulated by late page delivery.
             return Err("笔记列表已经关闭".into());
         }
         if rows.len() > sidebar_geometry::MINIMUM_PAGE_ROWS {
+            // Reject excess metadata rather than silently truncating a Core page or enlarging the UI resource budget.
             return Err("笔记列表超出当前页容量".into());
         }
         let revision = self
@@ -611,10 +629,12 @@ impl NativeMarkdownSidebarList {
         *self.table.ivars().rows.borrow_mut() = rows.to_vec();
         self.table.clear_labels();
         if self.table.ivars().closed.get() || self.table.ivars().revision.get() != revision {
+            // Clearing reused labels can call native code; reject a page or close that replaced this exact projection.
             return Err("笔记列表已经变化".into());
         }
         self.select_active(selected_path);
         if self.table.ivars().closed.get() || self.table.ivars().revision.get() != revision {
+            // Selection/reload reentry cannot scroll a successor page using this old installation intent.
             return Err("笔记列表已经变化".into());
         }
         self.scroll.contentView().scrollToPoint(NSPoint::ZERO);
@@ -623,10 +643,10 @@ impl NativeMarkdownSidebarList {
         Ok(())
     }
 
-    /// 当前笔记只更新正文色标；原生选中行仍对应独立浏览目录，不被刷新偷换成正文项。
+    /// Open-note identity changes visual emphasis only; native selected row still follows the independent browse directory.
     pub(in crate::native_surface) fn select_active(&self, path: Option<&str>) {
         if self.table.ivars().closed.get() {
-            return; // 文档安装回调迟到不能让已关闭列表重新加载旧标题。
+            return; // Late document installation cannot reload old titles into a closed table.
         }
         let revision = self.table.ivars().revision.get();
         let selection_revision = self.table.ivars().selection_revision.get();
@@ -642,7 +662,7 @@ impl NativeMarkdownSidebarList {
             || self.table.ivars().revision.get() != revision
             || self.table.ivars().selection_revision.get() != selection_revision
         {
-            return; // reloadData可重入换页/选择/关闭，旧位置不能选中后继页的同号条目。
+            return; // reloadData can reenter page/selection/close; an old position cannot select an equal-index successor row.
         }
         match selected {
             Some(index) => self.table.selectRowIndexes_byExtendingSelection(
@@ -650,7 +670,7 @@ impl NativeMarkdownSidebarList {
                 false,
             ),
             None => {
-                // SAFETY: nil sender只表示程序取消列表选择，不执行文件动作或编辑事务。
+                // SAFETY: A nil sender requests programmatic deselection only, without file actions or editing transactions.
                 unsafe {
                     self.table.deselectAll(None);
                 }
@@ -658,16 +678,17 @@ impl NativeMarkdownSidebarList {
         }
     }
 
+    /// Revoke the current row projection through the same bounded replacement/revision contract.
     pub(in crate::native_surface) fn clear(&self) -> Result<(), String> {
         self.replace(&[], None)
     }
 
-    /// 明确点击目录或成功安装正文才更新实际浏览目的地；此处不发送Native消息。
+    /// Only explicit directory selection or successful body installation changes browse destination; no native message is sent here.
     pub(in crate::native_surface) fn select_directory(&self, path: &str) {
         self.table.select_directory(path);
     }
 
-    /// 只消费同一原mutation的成功收据；失败、取消和无关操作都不移动浏览目录。
+    /// Consume the same original mutation's successful receipt; failure, cancellation, and unrelated work cannot move browse selection.
     pub(in crate::native_surface) fn apply_directory_mutation(
         &self,
         mutation: &NativeMarkdownFileMutation,
@@ -679,17 +700,17 @@ impl NativeMarkdownSidebarList {
         }
     }
 
-    /// 关闭先撤回调和metadata，再断实际容器关系；复用缓存不保文件名或菜单目标。
+    /// Revoke callbacks/metadata before detaching containers, leaving no filename or action target in a reuse cache.
     pub(in crate::native_surface) fn detach(&self) {
         if self.table.ivars().closed.replace(true) {
-            return; // 显式关闭和Rust Drop共享同一清理，不再向已拆图发送第二轮消息。
+            return; // Explicit close and Rust Drop share one cleanup, without sending a second message pass to a detached graph.
         }
-        // 关闭归还整份有限页及路径容量；只clear会让被框架暂存的table继续拥有旧Vec缓冲。
-        // take先结束槽借用再析构原值，后续Native拆图不跨任何metadata借用。
+        // Return the whole bounded page/path allocation; clear alone would leave old Vec capacity in a framework-cached table.
+        // take ends each slot borrow before destruction, so native detachment crosses no metadata borrow.
         drop(self.table.ivars().rows.take());
         drop(self.table.ivars().active_path.take());
         drop(self.table.ivars().selected_directory.take());
-        // SAFETY: 原唯一table所有者在主线程断开全部weak协议/动作入口。
+        // SAFETY: The original unique table owner detaches every weak protocol/action entry on the main thread.
         unsafe {
             self.table.setAction(None);
             self.table.setTarget(None);
@@ -697,11 +718,11 @@ impl NativeMarkdownSidebarList {
             self.table.setDataSource(None);
         }
         self.table.clear_labels();
-        // 所有真实标签先清空文字、路径提示和AX，再归还弱身份数组及其容量。
+        // Clear actual labels' text, path tooltips, and accessibility metadata before returning weak-array capacity.
         drop(self.table.ivars().labels.take());
         self.table.reloadData();
-        // table拥有其列，不能把列的归还推迟到table本体析构。复制本次真实列集合，
-        // 避免removeTableColumn修改原数组时仍遍历它；临时列强边只活到本轮移除结束。
+        // Table owns columns; do not delay their release until table destruction. Copy actual columns before mutation,
+        // avoiding iteration over the changing native array; temporary strong column claims end after removal.
         let columns = self.table.tableColumns().to_vec();
         for column in columns {
             self.table.removeTableColumn(&column);
@@ -713,20 +734,21 @@ impl NativeMarkdownSidebarList {
 }
 
 impl Drop for NativeMarkdownSidebarList {
+    /// Balance partial construction and explicit-close ownership through the same idempotent native teardown.
     fn drop(&mut self) {
-        self.detach(); // 构造或安装失败也归还同一真实图，不另建空列表替代。
+        self.detach(); // Failed construction/installation returns the same actual graph, without a replacement empty list.
     }
 }
 
 #[cfg(feature = "native-markdown-runtime-probe")]
-/// 原Full验收只复用当前NSApplication/主线程与原账本，核真实列表组件；不冒称工作区端到端或整产品验收。
+/// Full acceptance reuses the current app/main thread/ledger for this real component, without claiming workspace or product acceptance.
 pub(in crate::native_surface) fn verify_search_rows(
     parent: &NSView,
     ledger: &Rc<NativeMarkdownOwnedLedger>,
     mtm: MainThreadMarker,
 ) -> Result<(), String> {
     autoreleasepool(|_| {
-        // 固定有限页走与真实搜索结果相同的唯一metadata映射，不读文件、不构造正文或新窗口。
+        // Use the same bounded search metadata mapping, without reading files, constructing a body, or opening a new window.
         let rows: Vec<_> = (0..sidebar_geometry::MINIMUM_PAGE_ROWS)
             .map(|index| {
                 NativeMarkdownSidebarRow::from_search_result(
@@ -746,7 +768,7 @@ pub(in crate::native_surface) fn verify_search_rows(
             mtm,
         )?;
         for width in [224.0, 144.0, 224.0] {
-            // 真实滚动容器/列宽变化使AppKit重排同一复用行，不直接伪造两个label的最终frame。
+            // Real scroll/column resizing lets AppKit lay out reused rows; do not fabricate final label frames.
             let size = list.scroll.frame().size;
             list.scroll.setFrameSize(NSSize::new(width, size.height));
             list.scroll.tile();
@@ -772,7 +794,7 @@ pub(in crate::native_surface) fn verify_search_rows(
                         && rect.origin.x + rect.size.width <= frame.size.width
                         && rect.origin.y + rect.size.height <= frame.size.height
                 };
-                // SDK明确rectOfRow包含intercellSpacing，内容view不含；两者必须分别保持真实48pt与原间隔。
+                // SDK rectOfRow includes intercell spacing while content view does not; preserve actual 48 pt content and spacing separately.
                 if frame.size.height != SEARCH_ROW_HEIGHT
                     || list.table.rectOfRow(index as isize).size.height
                         != SEARCH_ROW_HEIGHT + list.table.intercellSpacing().height
@@ -783,6 +805,7 @@ pub(in crate::native_surface) fn verify_search_rows(
                     || title_frame.size.width != frame.size.width - 16.0
                     || subtitle_frame.size.width != frame.size.width - 16.0
                 {
+                    // A real out-of-bounds/overlapping native layout fails, with geometry-only diagnostics.
                     return Err(format!(
                         "搜索两行的真实行高、窄列宽或标签边界不一致：requested_width={width} row={index} scroll={:?} clip={:?} table={:?} row_rect={:?} bounds={frame:?} title={title_frame:?} subtitle={subtitle_frame:?}",
                         list.scroll.frame(),
@@ -799,6 +822,7 @@ pub(in crate::native_surface) fn verify_search_rows(
                             value.to_string() != rows[index].search_description()
                         })
                     {
+                        // Each real label independently retains single-line truncation and its complete original tooltip.
                         return Err("搜索两行没有各自尾截断或完整Tooltip".into());
                     }
                 }
@@ -812,11 +836,12 @@ pub(in crate::native_surface) fn verify_search_rows(
                         .accessibilityLabel()
                         .is_none_or(|value| !value.to_string().contains(&rows[index].relative_path))
                 {
+                    // Presentation must preserve title/path/snippet/accessibility identity rather than rewriting bounded source metadata.
                     return Err("搜索标题、原路径、完整摘要或无障碍身份被重写".into());
                 }
             }
         }
-        // 实际选中第二个重名项后仍对应第二条原路径；本组件不伪造Active会话或执行文件打开。
+        // Actual selection of the second equal-title row preserves its second path, without fabricating Active or opening a file.
         list.table
             .selectRowIndexes_byExtendingSelection(&NSIndexSet::indexSetWithIndex(1), false);
         let selected =
@@ -832,6 +857,7 @@ pub(in crate::native_surface) fn verify_search_rows(
         {
             return Err("重名搜索结果的真实选择丢失原相对路径".into());
         }
+        // Reach the last bounded row through the actual native scroller, without changing page capacity to fit the viewport.
         let last = (rows.len() - 1) as isize;
         list.table.scrollRowToVisible(last);
         if !NSIntersectsRect(
@@ -840,6 +866,7 @@ pub(in crate::native_surface) fn verify_search_rows(
         ) {
             return Err("搜索末行不能通过真实滚动到达".into());
         }
+        // Capture weak old labels before returning to an ordinary page, so reuse-cache payload cleanup remains observable.
         let previous_labels = list.table.ivars().labels.borrow().clone();
         let (_, ordinary) = native_markdown_sidebar_rows(
             MarkdownWorkspaceSnapshot {
@@ -860,6 +887,7 @@ pub(in crate::native_surface) fn verify_search_rows(
             return Err("返回目录后仍使用搜索行高度".into());
         }
         for weak in previous_labels {
+            // A surviving empty shell is allowed here, but no old title/path/accessibility payload may remain attached.
             if let Some(label) = weak.load()
                 && (label.stringValue().length() != 0
                     || label.toolTip().is_some()
@@ -869,7 +897,7 @@ pub(in crate::native_surface) fn verify_search_rows(
             }
         }
         list.detach();
-        // 原Full关闭阶段继续严格核本ledger中的容器/label/cell真实nil；这里不清账或豁免控件。
+        // Full close still strictly checks actual nil container/label/cell identities in this ledger, without erasing or exempting them here.
         eprintln!(
             "native_sidebar_search event=two_line_component_pass widths=224,144,224 rows=13 original_path_selection=true scroll_last=true ordinary_height_restored=true old_labels_empty=true formal=false whole_product=false"
         );

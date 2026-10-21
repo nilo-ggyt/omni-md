@@ -1,4 +1,5 @@
-//! 目录续页完整扫描后只发布K+1有界候选，绝不发布文件系统随机前缀。
+//! Publish a sorted directory page only after a complete scan, retaining at most
+//! K+1 candidates rather than exposing an arbitrary filesystem enumeration prefix.
 
 use super::*;
 use std::cmp::Ordering;
@@ -9,14 +10,16 @@ const MAX_SCAN_ENTRIES: usize = 512;
 const MAX_PAGE_ENTRIES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 每层目录排在笔记前；路径中间段必然是目录。
+/// At each tree depth, directories sort before notes; intermediate path segments
+/// necessarily represent directories regardless of the final entry kind.
 pub enum MarkdownWorkspaceEntryKind {
     Directory,
     Note,
 }
 
-/// 树顺序：父在子前，每层目录优先，同类名称按Unicode scalar序，完整路径打破同名平局。
-/// 中文按码点而非拼音，不归一化或修改文件名，也不等同旧JS的默认localeCompare。
+/// Order parents before descendants, then directories before notes at each depth.
+/// Compare same-kind display names by Unicode scalar order and break ties with
+/// the full path. This preserves original names without normalization or pinyin collation.
 pub fn compare_markdown_workspace_entries(
     left: &str,
     left_kind: MarkdownWorkspaceEntryKind,
@@ -26,7 +29,7 @@ pub fn compare_markdown_workspace_entries(
     let mut left_parts = left.split('/').peekable();
     let mut right_parts = right.split('/').peekable();
     loop {
-        // 比较只借用当前分段；不按路径深度分配排序键或名称副本。
+        // Borrow one segment at a time; path depth does not allocate sorting keys or name copies.
         match (left_parts.next(), right_parts.next()) {
             (Some(left_name), Some(right_name)) => {
                 let left_directory = left_parts.peek().is_some()
@@ -34,25 +37,27 @@ pub fn compare_markdown_workspace_entries(
                 let right_directory = right_parts.peek().is_some()
                     || right_kind == MarkdownWorkspaceEntryKind::Directory;
                 let order = right_directory.cmp(&left_directory).then_with(|| {
-                    // 原目录名中的点保留，末尾.md笔记按展示stem比较；UTF8序与scalar序一致。
+                    // Directory dots remain significant; a note's final .md suffix
+                    // is excluded from its display stem. UTF-8 order agrees with scalar order.
                     workspace_display_name(left_name, left_directory)
                         .cmp(workspace_display_name(right_name, right_directory))
                 });
                 if order != Ordering::Equal {
-                    // 首个层级差异决定整棵子树的先后。
+                    // The first differing depth decides the order of the entire subtree.
                     return order;
                 }
             }
             (None, Some(_)) => {
-                // 相同前缀的父目录先于后代。
+                // The shorter identical prefix is the ancestor and sorts first.
                 return Ordering::Less;
             }
             (Some(_), None) => {
-                // 后代不能排在其父目录前。
+                // A descendant cannot precede its own parent.
                 return Ordering::Greater;
             }
             (None, None) => {
-                // 相同展示标题也保留严格总序，不能让续页键遗漏不同真实文件。
+                // Equal display titles still need a strict total order so the
+                // continuation key cannot skip distinct real filesystem entries.
                 return left.cmp(right).then_with(|| {
                     (left_kind == MarkdownWorkspaceEntryKind::Note)
                         .cmp(&(right_kind == MarkdownWorkspaceEntryKind::Note))
@@ -62,27 +67,29 @@ pub fn compare_markdown_workspace_entries(
     }
 }
 
-/// 借用名称，不因排序建立另一份字符串。
+/// Borrow a display name without allocating another string for sorting.
 fn workspace_display_name(name: &str, directory: bool) -> &str {
     if directory {
-        // 目录点号是名称的一部分。
+        // A directory's dots are ordinary parts of its name.
         name
     } else {
-        // 已验证的.md条目以文件stem显示；隐藏名没有非空stem前缀时保留原名。
+        // A validated note displays its stem. Preserve a hidden name when removing
+        // its suffix would leave no nonempty stem.
         name.rsplit_once('.')
             .filter(|(stem, _)| !stem.is_empty())
             .map_or(name, |(stem, _)| stem)
     }
 }
 
-/// 只持深度优先路径栈中的目录句柄，不缓存整层目录。
+/// Own one iterator in the depth-first path stack, never a cached directory layer.
 struct DirectoryCursor {
     path: PathBuf,
     entries: fs::ReadDir,
 }
 
 #[derive(Clone)]
-/// 页权限绑定真实根、会话代次和用户折叠状态；没有正文或Native所有权。
+/// Bind page authority to the original root, session generation, and user collapse
+/// intent without owning note content or native objects.
 pub struct MarkdownWorkspacePageAuthority(Arc<WorkspacePageAuthority>);
 
 struct WorkspacePageAuthority {
@@ -94,7 +101,8 @@ struct WorkspacePageAuthority {
 }
 
 impl MarkdownWorkspacePageAuthority {
-    /// 安装前的纯权限检查；真实根inode另在每个扫描步骤开始和发布前核验。
+    /// Check installation authority without I/O. Each scan step and final publication
+    /// independently recheck the original root inode through the filesystem.
     pub fn is_current(&self, session: &MarkdownSessionAccess, collapsed: &HashSet<String>) -> bool {
         self.0.root == session.canonical_root
             && Arc::ptr_eq(&self.0.generation, &session.browse_generation)
@@ -103,31 +111,32 @@ impl MarkdownWorkspacePageAuthority {
     }
 }
 
-/// 私有候选最多K+1条，EOF之后才拆成公开快照。
+/// Retain at most K+1 private candidates; only full-scan EOF permits public output.
 enum WorkspaceCandidate {
     Directory(String),
     Note(MarkdownNoteSummary),
 }
 
 impl WorkspaceCandidate {
-    /// 比较借用既有路径，不读正文或复制标题。
+    /// Compare borrowed existing paths without opening content or copying titles.
     fn position(&self) -> (&str, MarkdownWorkspaceEntryKind) {
         match self {
-            // 目录只有相对身份。
+            // A directory candidate owns only its relative identifier.
             Self::Directory(path) => (path, MarkdownWorkspaceEntryKind::Directory),
-            // 笔记沿用同一个摘要里的相对身份。
+            // A note reuses the identifier already owned by its compact summary.
             Self::Note(note) => (&note.relative_path, MarkdownWorkspaceEntryKind::Note),
         }
     }
 }
 
-/// 旧页只留下一个排序末项，不保留旧页或全部目录。
+/// Keep only the previous page's final sorting key, not its entries or a full catalog.
 struct WorkspacePosition {
     path: String,
     kind: MarkdownWorkspaceEntryKind,
 }
 
-/// 活动pager只有K+1候选、当前深度栈和用户折叠集合；没有全库缓存。
+/// Own K+1 candidates, the current depth stack, and the user's collapsed set,
+/// rather than a vault-wide cache.
 pub struct MarkdownWorkspacePager {
     authority: MarkdownWorkspacePageAuthority,
     collapse_bound: bool,
@@ -138,24 +147,27 @@ pub struct MarkdownWorkspacePager {
     exhausted: bool,
 }
 
-/// 已完成整轮扫描的有限页；虚拟根不在结果内，适配层须为它预留一行。
+/// A finite page after complete traversal. The virtual root is absent; its
+/// presentation adapter must reserve a separate row if that root is displayed.
 pub struct MarkdownWorkspacePage {
     pub snapshot: MarkdownWorkspaceSnapshot,
     pub has_more: bool,
     pub authority: MarkdownWorkspacePageAuthority,
 }
 
-/// Pending没有可显示的半页；Ready也可表示空库的最终空页。
+/// Pending carries no displayable partial page; Ready may be the final empty page.
 pub enum MarkdownWorkspacePageProgress {
     Pending,
     Ready(MarkdownWorkspacePage),
 }
 
 impl MarkdownSessionAccess {
-    /// 新目录遍历只撤销旧目录，不取消正在显示的搜索。
+    /// Starting a directory traversal revokes older browsing without cancelling
+    /// the independently owned search that may still be displayed.
     ///
     /// # Errors
-    /// 固定根缺失、链接替换或metadata不可用时返回原存储错误，不发布游标。
+    /// A missing/replaced root or unavailable metadata returns its storage error
+    /// without publishing a cursor.
     pub fn open_workspace_pager(&self) -> Result<MarkdownWorkspacePager, MarkdownWorkspaceError> {
         let root = resolve_existing_directory(&self.canonical_root, "")?;
         let metadata =
@@ -183,14 +195,19 @@ impl MarkdownSessionAccess {
 }
 
 impl MarkdownWorkspacePager {
-    /// 推进最多512次枚举；整轮EOF之前只返回Pending，不发布随机前缀。
+    /// Advance at most 512 enumeration attempts. Before complete traversal EOF,
+    /// expose only Pending, never an arbitrarily ordered filesystem prefix.
     ///
-    /// 页宽首步绑定1..=64，折叠集合不可中途改；每页重扫只保留O(K+深度+用户折叠状态)。
-    /// 正文从不打开。外部变更遵循live续页，新增排序前缀在刷新后可见，不承诺全库快照。
+    /// Bind page width (1..=64) and collapse intent on the first step. Rescanning
+    /// each page retains O(K + depth + collapsed entries) metadata and opens no
+    /// note bodies. This is live continuation: new earlier-sorting entries require
+    /// refresh, rather than an immutable whole-vault snapshot guarantee.
     ///
     /// # Errors
-    /// 取消/结构发布/新目录遍历/关闭返回WorkspaceSuperseded；同路径正文保存保留权限。页宽/折叠变化返回
-    /// InvalidWorkspaceCursor。失败释放半页与目录句柄，不可复活该游标。
+    /// Cancellation, structural publication, new browsing, or closure supersedes
+    /// the request; same-path body saves preserve it. Changing width/collapse intent
+    /// invalidates the cursor. Failure releases partial candidates and iterators
+    /// permanently, so resetting a cancellation flag cannot revive old output.
     pub fn next_page_cancellable(
         &mut self,
         requested_limit: usize,
@@ -200,7 +217,8 @@ impl MarkdownWorkspacePager {
     ) -> Result<MarkdownWorkspacePageProgress, MarkdownWorkspaceError> {
         let result = self.scan_step(requested_limit, scanned_entry_limit, collapsed, cancelled);
         if result.is_err() {
-            // 错误的游标不能在flag复位后继续发布旧半页，容量也随之释放。
+            // Release capacity and close authority; a later flag reset cannot let
+            // this failed cursor continue publishing its old partial page.
             self.stack = Vec::new();
             self.candidates = Vec::new();
             self.exhausted = true;
@@ -209,26 +227,27 @@ impl MarkdownWorkspacePager {
         result
     }
 
-    /// 每步开始及发布前重新核验权限和根inode。
+    /// Recheck cancellation/generation and the original root inode before work
+    /// and again before publishing a complete page.
     fn validate(&self, cancelled: &AtomicBool) -> Result<(), MarkdownWorkspaceError> {
         if cancelled.load(AtomicOrdering::Acquire)
             || self.authority.0.generation.load(AtomicOrdering::Acquire)
                 != self.authority.0.expected_generation
         {
-            // 撤权先于IO，也不能替较新的会话发布旧页。
+            // Revocation precedes I/O; an older owner cannot publish for a newer session.
             return Err(MarkdownWorkspaceError::WorkspaceSuperseded);
         }
         let root = resolve_existing_directory(&self.authority.0.root, "")?;
         let metadata =
             fs::metadata(root).map_err(|_| MarkdownWorkspaceError::StorageUnavailable)?;
         if (metadata.dev(), metadata.ino()) != self.authority.0.root_identity {
-            // 同一路径重建的目录不是原来的根。
+            // A recreated directory under the same path is not the original root.
             return Err(MarkdownWorkspaceError::InvalidWorkspaceCursor);
         }
         Ok(())
     }
 
-    /// 内部步骤只取得metadata；所有未完成候选都留在pager私有状态。
+    /// Read metadata only and retain unfinished candidates privately inside the pager.
     fn scan_step(
         &mut self,
         requested_limit: usize,
@@ -243,11 +262,13 @@ impl MarkdownWorkspacePager {
             || self.page_limit.is_some_and(|previous| previous != limit)
             || (self.collapse_bound && self.authority.0.collapsed != *collapsed)
         {
-            // 旧排序末项不能用于新页宽或折叠意图；调用者须显式刷新。
+            // A previous final key cannot authorize a different width or collapse
+            // intent; the caller must explicitly start a refreshed traversal.
             return Err(MarkdownWorkspaceError::InvalidWorkspaceCursor);
         }
         if !self.collapse_bound {
-            // 首步尚未发布authority，独占写入用户折叠集合，后续严格比较。
+            // No authority has escaped on the first step. Bind collapse intent
+            // through the sole Arc owner and require exact equality thereafter.
             Arc::get_mut(&mut self.authority.0)
                 .expect("首步authority由pager独占")
                 .collapsed = collapsed.clone();
@@ -255,11 +276,12 @@ impl MarkdownWorkspacePager {
             self.page_limit = Some(limit);
         }
         if self.exhausted {
-            // 已经确认末页后不再打开目录。
+            // Once the terminal page is proved, later calls open no directories.
             return Ok(MarkdownWorkspacePageProgress::Ready(self.empty_page()));
         }
         if self.stack.is_empty() {
-            // 新逻辑页完整重扫，末项过滤发生在候选保留之前。
+            // Rescan the complete tree for each logical page, excluding the
+            // previous final key before retaining any candidate.
             self.candidates = Vec::with_capacity(limit + 1);
             let root = self.authority.0.root.clone();
             let entries =
@@ -270,21 +292,24 @@ impl MarkdownWorkspacePager {
             });
         }
         for _ in 0..scanned_entry_limit.min(MAX_SCAN_ENTRIES) {
-            // EOF同样收费，连续空目录也不能越过512次循环和取消点。
+            // Charge iterator EOF too, so chains of empty directories cannot
+            // bypass the 512-iteration work bound and cancellation checkpoints.
             if cancelled.load(AtomicOrdering::Acquire)
                 || self.authority.0.generation.load(AtomicOrdering::Acquire)
                     != self.authority.0.expected_generation
             {
+                // An operation that revoked browsing cannot deliver an unfinished
+                // page even when this step still has enumeration budget remaining.
                 return Err(MarkdownWorkspaceError::WorkspaceSuperseded);
             }
             let Some(cursor) = self.stack.last_mut() else {
-                // 整轮EOF之后才允许确认K+1和末页。
+                // Only complete traversal EOF proves the K+1 sentinel and terminal status.
                 break;
             };
             let relative = relative_workspace_path(&self.authority.0.root, &cursor.path)?;
             resolve_existing_directory(&self.authority.0.root, &relative)?;
             let Some(entry) = cursor.entries.next() else {
-                // 当前目录耗尽立即释放句柄，再返回父级。
+                // Release an exhausted iterator immediately before returning to its parent.
                 self.stack.pop();
                 continue;
             };
@@ -293,7 +318,7 @@ impl MarkdownWorkspacePager {
                 .file_type()
                 .map_err(|_| MarkdownWorkspaceError::StorageUnavailable)?;
             if kind.is_symlink() {
-                // 链接既不暴露为笔记，也不授权外部目录遍历。
+                // Links are neither visible notes nor authority to traverse an external tree.
                 continue;
             }
             if cursor.path == self.authority.0.root
@@ -302,14 +327,15 @@ impl MarkdownWorkspacePager {
                     .to_str()
                     .is_some_and(|name| name.eq_ignore_ascii_case(ATTACHMENTS_DIRECTORY_NAME))
             {
-                // 根附件树是资源，不参与笔记目录排序。
+                // The root attachment tree stores assets, not sortable note entries.
                 continue;
             }
             let path = entry.path();
             let (relative, entry_kind) = if kind.is_dir() {
                 let relative = relative_workspace_path(&self.authority.0.root, &path)?;
                 if !collapsed.contains(&relative) {
-                    // 折叠目录本身仍可见，只有未折叠时才取得后代目录句柄。
+                    // A collapsed directory itself remains visible; acquire a child
+                    // iterator only when its descendants are part of the user's intent.
                     let checked = resolve_existing_directory(&self.authority.0.root, &relative)?;
                     let entries = fs::read_dir(&checked)
                         .map_err(|_| MarkdownWorkspaceError::StorageUnavailable)?;
@@ -320,26 +346,30 @@ impl MarkdownWorkspacePager {
                 }
                 (relative, MarkdownWorkspaceEntryKind::Directory)
             } else if kind.is_file() && has_markdown_extension(&path) {
-                // 先取得当前条目的路径scratch；未入选时连stat和标题分配也不执行。
+                // Obtain only this entry's path scratch first. Entries that lose
+                // candidate admission need neither a metadata stat nor a title allocation.
                 (
                     relative_markdown_path(&self.authority.0.root, &path)?,
                     MarkdownWorkspaceEntryKind::Note,
                 )
             } else {
-                // 不支持的条目收费但不占可显示行。
+                // Unsupported entries consume scan work but no displayable result slot.
                 continue;
             };
             let Some(index) = self.admit_candidate(&relative, entry_kind, limit) else {
-                // 排序前缀、重复或更差条目只释放当前路径，不建立额外摘要记录。
+                // Earlier, duplicate, and worse entries release their current
+                // path without constructing another summary record.
                 continue;
             };
             let candidate = match entry_kind {
                 MarkdownWorkspaceEntryKind::Directory => {
-                    // 原路径直接移入唯一目录记录；需要时的旧worst已经释放。
+                    // Move the existing path into its sole directory record;
+                    // admission already released a former worst candidate if needed.
                     WorkspaceCandidate::Directory(relative)
                 }
                 MarkdownWorkspaceEntryKind::Note => {
-                    // 只有入选候选才stat普通.md，正文从不打开或映射。
+                    // Stat only admitted regular Markdown candidates; their body
+                    // is never opened or mapped for directory presentation.
                     let metadata = entry
                         .metadata()
                         .map_err(|_| MarkdownWorkspaceError::StorageUnavailable)?;
@@ -355,13 +385,14 @@ impl MarkdownWorkspacePager {
         }
         self.validate(cancelled)?;
         if !self.stack.is_empty() {
-            // 完整排序还未确定，只有Pending可以离开本步骤。
+            // The complete ordering is not yet known, so this step can expose only Pending.
             return Ok(MarkdownWorkspacePageProgress::Pending);
         }
         let has_more = self.candidates.len() > limit;
         self.candidates.truncate(limit);
         self.after = self.candidates.last().map(|candidate| {
-            // 末项来自实际返回的第K条，不能取被丢弃的sentinel。
+            // Derive continuation from the last actual returned entry, never
+            // from the discarded K+1 sentinel.
             let (path, kind) = candidate.position();
             WorkspacePosition {
                 path: path.to_owned(),
@@ -372,7 +403,8 @@ impl MarkdownWorkspacePager {
         let mut page = self.empty_page();
         page.has_more = has_more;
         for candidate in std::mem::take(&mut self.candidates) {
-            // 只移动有限metadata，Native按公开比较器恢复混合树顺序。
+            // Move finite metadata only; the native adapter uses the same public
+            // comparator to reconstruct mixed directory/note tree order.
             match candidate {
                 WorkspaceCandidate::Directory(path) => page.snapshot.directories.push(path),
                 WorkspaceCandidate::Note(note) => page.snapshot.notes.push(note),
@@ -381,8 +413,9 @@ impl MarkdownWorkspacePager {
         Ok(MarkdownWorkspacePageProgress::Ready(page))
     }
 
-    /// 先按纯路径预留候选槽，淘汰旧worst后才构造新摘要，记录总数保持K+1。
-    /// 枚举另有当前路径scratch，续页另有一个最小末项键，不冒称它们零占用。
+    /// Admit a path before building its summary and evict the old worst entry
+    /// before replacement, keeping at most K+1 candidate records. The current
+    /// enumeration path and one continuation key still own their separate finite storage.
     fn admit_candidate(
         &mut self,
         path: &str,
@@ -393,7 +426,8 @@ impl MarkdownWorkspacePager {
             compare_markdown_workspace_entries(path, kind, &after.path, after.kind)
                 != Ordering::Greater
         }) {
-            // live重扫不重复返回排序前缀；外部新建早项须刷新可见。
+            // Live rescans do not repeat the earlier sorted prefix; newly created
+            // entries before this key become visible after an explicit refresh.
             return None;
         }
         let index = match self.candidates.binary_search_by(|existing| {
@@ -401,23 +435,26 @@ impl MarkdownWorkspacePager {
             compare_markdown_workspace_entries(existing_path, existing_kind, path, kind)
         }) {
             Ok(_) => {
-                // 外部并发变更下read_dir也可能重复身份，同一页不重复保留相同路径。
+                // Concurrent filesystem changes can repeat an enumerated path;
+                // retain that identity at most once in this candidate page.
                 return None;
             }
+            // The failed lookup provides the exact insertion position in total order.
             Err(index) => index,
         };
         if index > limit {
-            // 更差条目不进入容器，避免瞬时扩到K+2。
+            // Do not insert a worse entry even transiently, avoiding K+2 candidates.
             return None;
         }
         if self.candidates.len() > limit {
-            // 插入前先释放旧sentinel，保持K+1对象硬边界。
+            // Release the old sentinel before insertion to maintain the K+1 object bound.
             self.candidates.pop();
         }
         Some(index)
     }
 
-    /// EOF返回的空页仍携带独立权限，迟到末页同样必须被拒绝。
+    /// Even an empty terminal page carries authority: a late terminal result
+    /// must be rejectable under the same installation checks as a populated page.
     fn empty_page(&self) -> MarkdownWorkspacePage {
         MarkdownWorkspacePage {
             snapshot: MarkdownWorkspaceSnapshot {
@@ -429,8 +466,9 @@ impl MarkdownWorkspacePager {
         }
     }
 
-    /// 显式关闭只撤销本代并释放扫描容量/末项，不影响较新遍历。
-    /// authority与用户折叠集合随最后page/pager持有者drop，不声称本方法清掉外持共享值。
+    /// Revoke only this generation and release its iterators, candidate capacity,
+    /// and continuation key without affecting newer browsing. Shared authority
+    /// and collapse intent remain alive until their final page/pager owner drops.
     pub fn close(&mut self) {
         let _ = self.authority.0.generation.compare_exchange(
             self.authority.0.expected_generation,

@@ -273,7 +273,7 @@ impl Permission<'_> {
             && document
                 .current_revision()
                 .is_ok_and(|actual| actual == self.revision)
-            && document.original_revision() == Some(self.revision)
+            && document.original_revision() == self.revision
             && !document.is_dirty()
             && !document.can_undo()
             && !document.can_redo()
@@ -298,7 +298,7 @@ impl Permission<'_> {
             document
                 .current_revision()
                 .is_ok_and(|actual| actual == self.revision),
-            document.original_revision() == Some(self.revision),
+            document.original_revision() == self.revision,
             !document.is_dirty(),
             !document.can_undo(),
             !document.can_redo(),

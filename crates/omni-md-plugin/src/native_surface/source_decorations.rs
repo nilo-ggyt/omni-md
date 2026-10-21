@@ -1,6 +1,8 @@
-//! 原可见窗口的Find高亮、括号与控制字符提示，共用settled TextKit准备和原装饰Vec。
+//! Find, bracket, and control-character cues share the settled reference
+//! TextKit viewport and its existing bounded decoration vector.
 //!
-//! 绘制只消费有限Copy矩形；不在paint中读取源码、构造另一份正文或强制离屏排版。
+//! Painting consumes prepared Copy rectangles only; it neither reads Source nor
+//! constructs another document or forces offscreen layout.
 
 use super::*;
 use objc2_app_kit::{
@@ -9,10 +11,12 @@ use objc2_app_kit::{
 };
 use omni_markdown_core::markdown_brackets::{MarkdownBracketQuery, markdown_bracket_match};
 
-// 独立参考图也沿正式可见 Find 的原配额，不在旧装饰模块重复定义数值。
+// The reference graph uses the same visible-Find limits, owned by FindBar;
+// duplicating numerical policies here would let the two paths drift.
 use super::find_bar::{MAX_DECORATION_VIEWPORT_UNITS, MAX_SPECIAL_CHARACTER_MARKERS};
 
-/// 原装饰Vec统一归还有限提示和Find矩形；批次仅保弱票，不持正文或Native布局对象。
+/// The original vector owns finite cue/Find geometry. Batches retain weak
+/// authority tickets rather than document text or Native layout objects.
 #[derive(Clone)]
 pub(super) enum NativeMarkdownDecorationGeometry {
     Source {
@@ -23,7 +27,8 @@ pub(super) enum NativeMarkdownDecorationGeometry {
     PreviewVisibility(Rc<NativeMarkdownPreviewVisibility>),
 }
 
-/// 原装饰批次只保实际可见范围的样式事实；不持解析快照、正文、Native 对象或 Find 查询。
+/// Visible style facts belong to this decoration batch alone. It retains no
+/// parser snapshot, document payload, Native object, or Find query.
 pub(super) struct NativeMarkdownPreviewVisibility {
     document: WeakMarkdownDocument,
     selection: MarkdownTextSelection,
@@ -37,7 +42,8 @@ pub(super) struct NativeMarkdownPreviewVisibility {
 }
 
 impl NativeMarkdownPreviewVisibility {
-    /// 纯语义不依赖 Find intent；正文、选择、模式、折叠或原输入变更仍立即撤销这份事实。
+    /// Semantic visibility is independent of Find intent. Source, selection,
+    /// mode, fold, font, and input changes still revoke this original proof.
     fn current(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -57,9 +63,13 @@ impl NativeMarkdownPreviewVisibility {
             || view.ivars().folds.revision() != self.folds
             || !WeakMarkdownDocument::ptr_eq(&self.document, &storage.ivars().document.borrow())
         {
-            return false; // 活着的旧范围不能借同数值代次授权后继正文或不同几何。
+            // Equal generation numbers cannot authorize another document or
+            // geometry; retain the original weak identity and every input epoch.
+            return false;
         }
         self.document.upgrade().is_some_and(|document| {
+            // This is a Rust-only authority check. Release the canonical borrow
+            // before callers resume any reentrant AppKit operation.
             let source_matches = view.ivars().folds.matches_document(&document);
             let document = document.borrow();
             source_matches
@@ -69,7 +79,8 @@ impl NativeMarkdownPreviewVisibility {
         })
     }
 
-    /// 发布前配对实际 clip、列宽和源窗口；这里只复核既有标量，不再进入 Native 几何。
+    /// Pair the actual clip, column width, and source window before publication;
+    /// checking existing scalar facts does not reenter Native geometry.
     fn covers(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -86,7 +97,8 @@ impl NativeMarkdownPreviewVisibility {
             && source.end <= self.key.native_viewport_end
     }
 
-    /// 只在已裁交、连续覆盖的真实 run 中查询；包络外没有默认 Plain 权限。
+    /// Query only admitted, clipped runs. A gap or a point outside the envelope
+    /// has no implicit Plain-style visibility authority.
     fn query(&self, index: usize) -> Option<omni_markdown_core::MarkdownPresentationQuery> {
         let ordinal = self
             .runs
@@ -98,7 +110,8 @@ impl NativeMarkdownPreviewVisibility {
     }
 }
 
-/// 裁交原完整解析的 metadata；最多沿现成目录访问128个 run，不复制源码或保留整个 snapshot。
+/// Clip metadata from the original complete parse within the shared run/window
+/// limits. Neither Source bytes nor the complete snapshot enter the result.
 fn clipped_preview_visibility_runs(
     snapshot: &omni_markdown_core::MarkdownViewportPresentationSnapshot,
     window: std::ops::Range<usize>,
@@ -108,24 +121,31 @@ fn clipped_preview_visibility_runs(
         || snapshot.utf16_window().start > window.start
         || window.end > snapshot.utf16_window().end
     {
-        return None; // 源窗口须来自原有限 viewport，不能把目录包络外或超预算正文当已知样式。
+        // A proof must cover an admitted finite viewport inside this snapshot;
+        // unknown or oversized text cannot be treated as established styles.
+        return None;
     }
     let mut cursor = window.start;
     let mut runs = Vec::new();
     while cursor < window.end {
         if runs.len() == MAX_SPECIAL_CHARACTER_MARKERS {
-            return None; // 不完整的前缀不签全窗证明；原 RootLeaf 续体仍可在后续真实发布覆盖它。
+            // A partial prefix cannot certify the whole requested window. The
+            // real RootLeaf continuation may establish it in a later publication.
+            return None;
         }
         let mut query = snapshot.query(cursor)?;
         query.utf16_range = cursor..query.utf16_range.end.min(window.end);
         cursor = query.utf16_range.end;
-        runs.push(query); // 只移入两个坐标和 styles，URL、正文及原解析大目录均不进入原装饰 Vec。
+        // Keep only range/style facts; URLs, document text, and the original
+        // parser directory remain with their existing owners.
+        runs.push(query);
     }
     Some(runs)
 }
 
 impl PartialEq for NativeMarkdownDecorationGeometry {
-    /// 实际几何或原Find权限变化才要求重绘；不同提示角色不能互相复用像素。
+    /// Redraw when actual geometry or original Find authority changes; separate
+    /// cue roles cannot reuse each other's pixels.
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -140,7 +160,9 @@ impl PartialEq for NativeMarkdownDecorationGeometry {
             ) => left == right && left_match == right_match,
             (Self::Find(left), Self::Find(right)) => left.same_geometry(right),
             (Self::PreviewVisibility(left), Self::PreviewVisibility(right)) => {
-                Rc::ptr_eq(left, right) // 同一可见事实在普通查询变化时复用，不因为复读metadata要求重绘。
+                // Ordinary query changes can reuse this same visible proof;
+                // rereading equivalent metadata alone does not require paint.
+                Rc::ptr_eq(left, right)
             }
             _ => false,
         }
@@ -153,7 +175,8 @@ fn is_visible_special_character(unit: u16) -> bool {
 }
 
 impl PieceBackedMarkdownTextView {
-    /// 只取原已准入源范围的真实TextKit segment；每个Native阶段前后都服从同一原票。
+    /// Read actual TextKit segments for the admitted original range. Every
+    /// reentrant Native step remains guarded by the same original ticket.
     fn source_decoration_frames(
         &self,
         source: std::ops::Range<usize>,
@@ -165,7 +188,9 @@ impl PieceBackedMarkdownTextView {
         let content =
             native_markdown_table_intent_step(current, || manager.textContentManager()).ok()??;
         if native_markdown_table_intent_step(current, || content.hasEditingTransaction()).ok()? {
-            return None; // 活TextKit事务不签发稳定glyph位置，也不为提示主动ensure。
+            // An active editing transaction supplies no settled glyph authority;
+            // decorations must not force layout to manufacture it.
+            return None;
         }
         let provider = ProtocolObject::<dyn NSTextElementProvider>::from_ref(&*content);
         let document_range =
@@ -198,7 +223,8 @@ impl PieceBackedMarkdownTextView {
                  _baseline: f64,
                  _container: NonNull<NSTextContainer>| {
                     if !current() || frames.borrow().len() >= maximum_frames {
-                        // 取消或有限矩形预算到达后立即停止，callback不保留任何Native对象。
+                        // Cancellation or the finite frame cap ends enumeration;
+                        // the synchronous callback retains no Native object.
                         return objc2::runtime::Bool::NO;
                     }
                     if [
@@ -212,7 +238,8 @@ impl PieceBackedMarkdownTextView {
                         && frame.size.width >= 0.0
                         && frame.size.height >= 0.0
                     {
-                        // Find保实际glyph矩形，不能用控制字符的最小提示宽度放大普通命中。
+                        // Find uses actual glyph rectangles. The minimum width
+                        // for control cues must not enlarge ordinary matches.
                         frames.borrow_mut().push(NSRect::new(
                             NSPoint::new(frame.origin.x + origin.x, frame.origin.y + origin.y),
                             frame.size,
@@ -230,11 +257,12 @@ impl PieceBackedMarkdownTextView {
                 );
             })
             .ok()?;
-        } // 同步StackBlock的词法作用域结束后才交付Copy矩形，不用drop延长非析构类型的借用。
+        } // End the synchronous block's lexical scope before returning Copy frames.
         Some(frames.into_inner())
     }
 
-    /// 首个正文 Native getter 前裁出当前可见样式；后续属性窗口换页不会逐出这份有限事实。
+    /// Capture current visible styles before the first document Native getter.
+    /// Later attribute-window eviction does not erase these finite facts.
     fn capture_preview_visibility(
         &self,
         storage: &PieceBackedMarkdownTextStorage,
@@ -248,7 +276,9 @@ impl PieceBackedMarkdownTextView {
         if key.presentation_mode != MarkdownPresentationMode::InlinePreview
             || !WeakMarkdownDocument::ptr_eq(&identity, &storage.ivars().document.borrow())
         {
-            return None; // 没有本原文稿已发布的实际 viewport 时，不用旧解析包络猜可见区。
+            // Only this document's published preview viewport can authorize the
+            // proof; an old parser envelope cannot stand in for a real viewport.
+            return None;
         }
         let previous =
             self.ivars()
@@ -261,10 +291,14 @@ impl PieceBackedMarkdownTextView {
                     {
                         Some(Rc::clone(proof))
                     }
-                    _ => None, // 括号/Find几何不授予语义；过期可见事实也不能拼成新证明。
+                    // Bracket/Find geometry and expired proofs grant no semantic
+                    // authority for a newly captured visible window.
+                    _ => None,
                 });
         if previous.is_some() {
-            return previous; // 同一真实 viewport 的查询变化只复用原有限 metadata，不反复分配。
+            // Reuse the same finite metadata for this actual viewport rather
+            // than allocating it again for an ordinary query change.
+            return previous;
         }
         let document = identity.upgrade()?;
         let selection = {
@@ -272,7 +306,9 @@ impl PieceBackedMarkdownTextView {
             if document.generation() != key.document_generation
                 || document.utf16_len() != key.document_length
             {
-                return None; // 原 cache 已经落后于 canonical，不能从后来解析补签旧 key。
+                // A stale cache cannot acquire authority for its old key from a
+                // newer canonical document or parser result.
+                return None;
             }
             document.selection()
         };
@@ -281,13 +317,15 @@ impl PieceBackedMarkdownTextView {
             let presentation = storage.ivars().presentation.borrow();
             let snapshot = presentation.semantic_snapshot()?;
             if snapshot.generation() != key.document_generation {
-                return None; // SourceFallback 没有 snapshot；不同代次的完整目录同样没有本次权限。
+                // SourceFallback has no complete snapshot; a complete directory
+                // from another generation is equally unauthorized here.
+                return None;
             }
             clipped_preview_visibility_runs(
                 &snapshot,
                 key.native_viewport_start..key.native_viewport_end,
             )?
-        }; // 临时 snapshot 在纯 Rust 裁交后即归还；不跨任何 Native getter 保留大目录。
+        }; // Return the parser snapshot after Rust-only clipping, before any Native getter.
         let proof = Rc::new(NativeMarkdownPreviewVisibility {
             document: identity,
             selection,
@@ -302,7 +340,8 @@ impl PieceBackedMarkdownTextView {
         proof.current(self, storage).then_some(proof)
     }
 
-    /// 仅在既有settled刷新消费同次匹配结果；查询、来源过滤与实际矩形均不进入paint栈。
+    /// Prepare matching/filtering/segment geometry in the existing settled
+    /// refresh. Painting later consumes this batch without repeating that work.
     fn prepare_find_highlight_geometry(
         &self,
         storage: &PieceBackedMarkdownTextStorage,
@@ -311,7 +350,9 @@ impl PieceBackedMarkdownTextView {
         source_range: std::ops::Range<usize>,
         preview_visibility: Option<&NativeMarkdownPreviewVisibility>,
     ) -> Option<NativeMarkdownFindHighlightBatch> {
-        let requested_source = source_range.clone(); // 两个坐标留给本批实际几何核验，不复制查询或正文。
+        // Preserve the requested range for geometry verification without copying
+        // either the query text or document payload.
+        let requested_source = source_range.clone();
         let controller =
             native_markdown_table_intent_step(current, || self.ivars().controller.get()?.load())
                 .ok()??;
@@ -330,31 +371,39 @@ impl PieceBackedMarkdownTextView {
         let preview_visibility = preview_visibility.filter(|proof| {
             proof.covers(self, storage, visible, &requested_source)
                 && proof.key.text_view_width == native_markdown_layout_metric(width)
-        }); // 每轮真实 Native getter之后仍核原几何，旧 metadata 不能为不同列宽补签坐标。
+        }); // Recheck original geometry after Native getters; old metadata cannot authorize a new width.
         let mut frames = Vec::new();
         for source in prepared.ranges {
             if !original() {
-                return None; // 上一个Native getter重入后旧范围全部丢弃，不发布半批高亮。
+                // Reentry revokes the whole old batch; publishing a partial set
+                // would mix coordinates from different inputs.
+                return None;
             }
             if frames.len() == MAX_SPECIAL_CHARACTER_MARKERS {
-                break; // 多行命中也服从实际矩形上限，不为一次超长查询缓存整个段落。
+                // Multiline hits share the actual frame cap; a long query must
+                // not create a whole-paragraph geometry cache.
+                break;
             }
             if !self.find_source_is_visible(storage, &source, preview_visibility) {
-                continue; // 自绘表格、隐藏标记或折叠源没有标准TextKit glyph权限，不能画占位矩形。
+                // Custom tables, concealed markers, and folds have no standard
+                // TextKit glyph authority; do not highlight their placeholders.
+                continue;
             }
             let Some(found) = self.source_decoration_frames(
                 source,
                 MAX_SPECIAL_CHARACTER_MARKERS - frames.len(),
                 &original,
             ) else {
-                return None; // 没有实际完整原生坐标时保持无高亮，不把来源坐标当屏幕位置。
+                // Missing actual Native geometry is not a screen coordinate;
+                // discard this batch rather than drawing from Source offsets.
+                return None;
             };
             for frame in found {
                 if frame.size.width > 0.0
                     && frame.size.height > 0.0
                     && NSIntersectsRect(frame, visible)
                 {
-                    frames.push(frame); // 同一有限Vec只拥有Copy矩形，不持TextKit segment对象。
+                    frames.push(frame); // The bounded vector owns Copy frames, not TextKit segments.
                 }
             }
         }
@@ -365,7 +414,8 @@ impl PieceBackedMarkdownTextView {
         Some(batch)
     }
 
-    /// Preview须逐语义run证明源仍显示；未知语义不触发解析，Source保持全部原文字面可见。
+    /// Preview requires visibility proof for every semantic run. Unknown styles
+    /// do not trigger parsing; literal Source mode keeps original text visible.
     fn find_source_is_visible(
         &self,
         storage: &PieceBackedMarkdownTextStorage,
@@ -375,7 +425,7 @@ impl PieceBackedMarkdownTextView {
         if self.ivars().folds.borrow().iter().any(|fold| {
             source.start < fold.hidden_utf16_range.end && source.end > fold.hidden_utf16_range.start
         }) {
-            return false; // 跨折叠的命中不能当成一个连续可见glyph范围。
+            return false; // A hit crossing a fold has no contiguous visible glyph range.
         }
         if storage.presentation_mode() == MarkdownPresentationMode::Source {
             return true;
@@ -396,9 +446,9 @@ impl PieceBackedMarkdownTextView {
                     (snapshot.generation() == generation)
                         .then(|| snapshot.query(cursor))
                         .flatten()
-                }); // 只有完整解析目录或真实 RootLeaf 授权；fallback 的空 styles 不是 Plain 证明。
+                }); // Only complete parse/RootLeaf facts authorize visibility; fallback empty styles do not.
             let Some(query) = query else {
-                return false; // 未发布的语义空洞不能被默认Plain冒认成可见源。
+                return false; // An unpublished semantic gap cannot default to visible Plain text.
             };
             if [
                 MarkdownPresentationStyles::MARKER,
@@ -409,18 +459,24 @@ impl PieceBackedMarkdownTextView {
             .into_iter()
             .any(|style| query.styles.contains(style))
             {
-                return false; // 表格由独立CTFrame绘制，marker被隐藏；后续需要其真实source map几何。
+                // Tables use their own CTFrame and markers are concealed. Their
+                // actual source-map geometry must authorize separate highlights.
+                return false;
             }
-            cursor = query.utf16_range.end.min(source.end); // Core query保证包含当前标量且非空，不重读源码。
+            // Core supplies a nonempty run containing this scalar; advance by
+            // that established range without rereading Source.
+            cursor = query.utf16_range.end.min(source.end);
         }
         true
     }
 
-    /// 原合并executor结束实际编辑事务后准备提示与Find几何；本次原票贯穿全部Native阶段。
+    /// The existing coalesced executor prepares cues after the real editing
+    /// transaction. One original ticket governs every Native stage in this refresh.
     pub(super) fn refresh_source_decorations(&self) -> bool {
         let _payload_use = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
         if self.ivars().textkit_graph_teardown.get() {
-            // 直接或迟到调用不取得 canonical Rc，也不重建关闭后释放的几何容量。
+            // Late calls must acquire neither the canonical owner nor new
+            // geometry capacity after teardown has released the graph.
             return false;
         }
         let Some(storage) = self.ivars().text_storage.load() else {
@@ -430,7 +486,7 @@ impl PieceBackedMarkdownTextView {
             return changed;
         };
         let Some(document) = storage.document() else {
-            return false; // 已失去原Doc的Native空壳不能重新构造提示或Find几何。
+            return false; // A detached Native shell cannot rebuild document cues or Find geometry.
         };
         let (generation, length) = {
             // End canonical borrows before viewport/segment calls can reenter native text callbacks.
@@ -463,7 +519,9 @@ impl PieceBackedMarkdownTextView {
             }
         }
         let Some((visible, paragraph_window)) = self.visible_utf16_window(length) else {
-            return false; // 没有layoutViewport后配对的实际clip/range，就不补签零范围或匹配反馈。
+            // Require a real clip/range pair established after viewport layout;
+            // a zero-range substitute grants no matching or paint authority.
+            return false;
         };
         let viewport = match (
             self.insertion_offset_at_view_point(NSPoint::new(visible.origin.x, visible.origin.y)),
@@ -480,7 +538,8 @@ impl PieceBackedMarkdownTextView {
             _ => paragraph_window,
         };
         if !self.projection_generation_is_current(generation) {
-            // viewport 定位可能重入编辑；不把旧范围交给后续 canonical 扫描或 Native segment 查询。
+            // Viewport positioning may reenter editing. Reject its old range
+            // before further canonical scans or Native segment queries.
             return false;
         }
         let mode = storage.presentation_mode();
@@ -555,7 +614,8 @@ impl PieceBackedMarkdownTextView {
             preview_visibility.filter(|proof| proof.covers(self, &storage, visible, &viewport));
         for (source, matched) in positions {
             if !current() {
-                // 前一个 segment 查询返回后代次可能改变，停止而不是查询下一个过期位置。
+                // A preceding segment query may change generation through
+                // reentry; stop before querying another expired position.
                 return false;
             }
             if geometry.len() >= maximum_geometry {
@@ -582,7 +642,8 @@ impl PieceBackedMarkdownTextView {
                 continue;
             };
             for frame in frames {
-                // 控制/括号提示保留原最小尺寸；零宽控制字符也必须先扩成可见点再参与clip判断。
+                // Preserve the original minimum cue size. Expand a zero-width
+                // control to its visible dot before testing the viewport clip.
                 let frame = NSRect::new(
                     frame.origin,
                     NSSize::new(frame.size.width.max(7.0), frame.size.height.max(14.0)),
@@ -594,14 +655,16 @@ impl PieceBackedMarkdownTextView {
             }
         }
         if !current() {
-            // TextKit 查询可同步重入；原生调用结束后的失效 geometry 仅在本地析构。
+            // TextKit may reenter synchronously; invalid geometry is dropped
+            // locally after the Native calls, never installed over newer state.
             return false;
         }
         if let Some(proof) = preview_visibility
             .as_ref()
             .filter(|proof| proof.covers(self, &storage, visible, &viewport))
         {
-            // Vec至多保一个可见事实；Native glyph/属性 getter可逐出共享解析窗，但不夺其原纯语义。
+            // Keep at most one visible proof. Native glyph/attribute getters may
+            // evict the parser window without revoking this original semantic fact.
             geometry.push(NativeMarkdownDecorationGeometry::PreviewVisibility(
                 Rc::clone(proof),
             ));
@@ -616,7 +679,9 @@ impl PieceBackedMarkdownTextView {
             geometry.push(NativeMarkdownDecorationGeometry::Find(Rc::new(find)));
         }
         if !current() {
-            return false; // Find的字段/segment getters也可能重入，旧整批提示不能随后覆盖新图。
+            // Find's field/segment getters may also reenter; the old complete
+            // batch must not replace decorations belonging to successor input.
+            return false;
         }
         let changed = *self.ivars().source_decorations.borrow() != geometry;
         *self.ivars().source_decorations.borrow_mut() = geometry;
@@ -625,11 +690,13 @@ impl PieceBackedMarkdownTextView {
         changed
     }
 
-    /// 消费已准备的括号、控制点与Find矩形；绘制不枚举元素，也不改用户选择和历史。
+    /// Paint prepared bracket/control/Find frames without enumerating document
+    /// elements or changing the user's selection and history.
     pub(super) fn draw_source_decorations(&self, dirty: NSRect) {
         let _payload_use = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
         if self.ivars().textkit_graph_teardown.get() {
-            // 独立 draw 调用也不能使用旧 cue snapshot 或 canonical owner。
+            // Standalone draw calls also lose access to old cues and the
+            // canonical owner once teardown begins.
             return;
         }
         if self.ivars().textkit_input_depth.get() != 0
@@ -660,7 +727,9 @@ impl PieceBackedMarkdownTextView {
                 {
                     self.draw_find_highlight_batch(&batch, storage, dirty);
                 }
-                continue; // Find与既有提示共用当前上下文，不创建新层或进入源码/布局调用。
+                // Find shares the current graphics context; no extra layer,
+                // Source acquisition, or layout work is introduced during paint.
+                continue;
             };
             // Copying the bounded cache ends state borrows before native drawing can reenter AppKit.
             if !NSIntersectsRect(frame, dirty) {
@@ -700,7 +769,8 @@ impl PieceBackedMarkdownTextView {
         NSGraphicsContext::restoreGraphicsState_class();
     }
 
-    /// 只画同票下已准备的有限矩形；clip、模式或原输入变化后旧batch不再留下新像素。
+    /// Draw finite frames under their original ticket. A changed clip, mode, or
+    /// input revokes this batch before it can add pixels to a successor frame.
     fn draw_find_highlight_batch(
         &self,
         batch: &NativeMarkdownFindHighlightBatch,
@@ -708,7 +778,7 @@ impl PieceBackedMarkdownTextView {
         dirty: NSRect,
     ) {
         let Some(controller) = self.ivars().controller.get().and_then(Weak::load) else {
-            return; // 原controller结束后，没有其他窗口可以替这批几何授予绘制权。
+            return; // Another window cannot grant paint authority after the original controller ends.
         };
         let authority = || batch.authority_current(self, storage, &controller);
         let Ok(visible) = native_markdown_table_intent_step(&authority, || self.visibleRect())
@@ -730,7 +800,9 @@ impl PieceBackedMarkdownTextView {
         }
         for frame in &batch.frames {
             if !current() {
-                return; // 上一个fill重入的后继输入只能撤旧绘制，不能改用户选区或重做查找。
+                // Reentry during fill revokes old drawing. It grants no right
+                // to change selection or rerun Find on the successor input.
+                return;
             }
             if NSIntersectsRect(*frame, dirty)
                 && native_markdown_table_intent_step(&current, || NSBezierPath::fillRect(*frame))
@@ -763,12 +835,12 @@ mod tests {
                 && run
                     .styles
                     .contains(MarkdownPresentationStyles::HIDDEN_MARKER)
-        })); // 裁到半个原marker也保留真实隐藏事实，不能把边缘空白变成 Plain。
+        })); // A clipped half-marker remains hidden rather than becoming Plain at the edge.
         assert!(clipped.iter().any(|run| {
             run.utf16_range.start <= 104
                 && 108 <= run.utf16_range.end
                 && run.styles.contains(MarkdownPresentationStyles::STRONG)
-        })); // 中文和emoji两单元仍沿原UTF16坐标，不改成字符数或重新推断 token。
+        })); // Chinese and the emoji surrogate pair retain original UTF-16 coordinates.
         assert!(
             clipped
                 .iter()
@@ -780,7 +852,7 @@ mod tests {
         assert!(clipped.iter().any(|run| {
             run.utf16_range.contains(&104)
                 && run.styles.contains(MarkdownPresentationStyles::STRONG)
-        })); // 共享属性窗口真正逐出原目录后，保留的可见metadata仍只解释原103..111。
+        })); // After real directory eviction, retained facts still describe only the original 103..111.
     }
 
     #[test]
@@ -790,7 +862,7 @@ mod tests {
             .record_source_fallback_window(7, 100..120)
             .unwrap();
         assert!(presentation.query(105).is_some());
-        assert!(presentation.semantic_snapshot().is_none()); // 空styles的fallback不能进入完整snapshot接面。
+        assert!(presentation.semantic_snapshot().is_none()); // Fallback empty styles cannot supply a complete snapshot.
         let text = "x".repeat(MAX_DECORATION_VIEWPORT_UNITS + 1);
         presentation
             .rebuild(7, 100..100 + text.len(), &text)
@@ -802,12 +874,13 @@ mod tests {
         assert!(
             clipped_preview_visibility_runs(&snapshot, 100..100 + MAX_DECORATION_VIEWPORT_UNITS,)
                 .is_some()
-        ); // 原可见单位上限允许完整范围，超出一单元不能签部分覆盖。
+        ); // Admit the complete window at the actual limit, never a partial oversized proof.
         let marked = "**x** ".repeat(MAX_SPECIAL_CHARACTER_MARKERS);
         presentation.rebuild(8, 0..marked.len(), &marked).unwrap();
         let snapshot = presentation.semantic_snapshot().unwrap();
         assert!(clipped_preview_visibility_runs(&snapshot, 0..marked.len()).is_none());
-        assert!(clipped_preview_visibility_runs(&snapshot, 0..6).is_some()); // 多run准入失败仍不损害真实有限子窗。
+        // A rejected high-run-count envelope does not invalidate an admitted finite subwindow.
+        assert!(clipped_preview_visibility_runs(&snapshot, 0..6).is_some());
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! 真实原依赖签发的字体票只覆盖一个GCB，外部副本不延长样式阶段的权限。
+//! Original real dependencies issue font trials for one complete grapheme only.
+//! External copies do not prolong the producing style phase's authority.
 
 use super::*;
 
@@ -42,7 +43,8 @@ fn font_probe_preserves_actual_cluster_script_direction_and_source_without_new_i
                 crate::MarkdownShapingDirection::RightToLeft
             }
         );
-        // 固定次数目录读取不创建新GCB/Script/Bidi资源；真实resource scope保持同一组依赖。
+        // Probe metadata queries must reuse actual original grapheme/Script/bidi
+        // resources. Compare real file/mapping observations without a replacement index.
         let after = coordinator
             .resource_scope()
             .observer()
@@ -67,6 +69,8 @@ fn font_probe_preserves_actual_cluster_script_direction_and_source_without_new_i
 
 #[test]
 fn font_probe_external_request_and_probe_clones_cannot_extend_consumed_style_scope() {
+    // Consume the real response while both external probe copies remain alive;
+    // neither equal coordinates nor cloned requests may renew that expired scope.
     let fixture = Fixture::new("office");
     let mut coordinator = fixture.coordinator(MarkdownLineComposeCancellation::new());
     let pending = request(&mut coordinator);
@@ -88,6 +92,8 @@ fn font_probe_external_request_and_probe_clones_cannot_extend_consumed_style_sco
 
 #[test]
 fn font_probe_rejects_equal_range_foreign_nonce_and_cancellation() {
+    // Two genuine coordinators on the same Source still issue distinct requests.
+    // Original shared cancellation must also invalidate the already issued probe.
     let fixture = Fixture::new("same");
     let cancellation = MarkdownLineComposeCancellation::new();
     let mut coordinator = fixture.coordinator(cancellation.clone());
@@ -115,8 +121,10 @@ fn font_probe_is_send_and_scope_drop_revokes_without_retaining_coordinator() {
     let backing = fixture.document.original_backing_observer().unwrap();
     drop(coordinator);
     drop(fixture);
-    assert!(!observer.payload_released()); // 在途原packet仍有同Source读claim；scope撤权不伪称已经unmap。
+    assert!(!observer.payload_released()); // The in-flight real packet still owns its Source read claim.
     std::thread::spawn(move || {
+        // The actual worker thread receives the stale packet, observes original
+        // scope revocation, then releases its final real Source claim before join.
         assert!(matches!(
             probe.validate(),
             Err(MarkdownLineComposeError::Poisoned)
@@ -146,6 +154,8 @@ fn font_probe_source_error_precedes_expired_scope_and_rejects_oversized_style_be
         .text_snapshot()
         .visit_byte_range(0..1, |_| Ok(()))
         .unwrap();
+    // Existing injection reports EIO through actual original backing reclaim, not
+    // a naturally induced kernel failure. It must win even after scope retirement.
     fixture.document.fail_next_original_reclaim_for_test();
     assert_eq!(
         fixture.document.reclaim_original_read_windows_for_test(),
@@ -165,7 +175,8 @@ fn font_probe_source_error_precedes_expired_scope_and_rejects_oversized_style_be
     feature = "s2-table-window-prototype"
 ))]
 fn prepend_font() -> MarkdownLayoutFont {
-    // 固定未改造 Amiri 1.002 与必要 OFL 已随测试输入保存；不靠 PUA 字体的缺字矩形验收。
+    // Use unchanged Amiri 1.002 with its required OFL fixture. A PUA font's missing
+    // glyph rectangle cannot prove real Arabic/Prepend coverage.
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fonts/amiri/Amiri-Regular.ttf"
@@ -198,11 +209,12 @@ fn trial_actual_segments(
         records: 1,
         metadata_units: 1,
     };
-    let mut spans: Vec<std::ops::Range<usize>> = Vec::new(); // 固定短夹具保存 oracle，产品只保当前一个段。
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new(); // Only the fixed short oracle retains prior segments.
     for _ in 0..1024 {
         if !probe.shaping_segment_ready().unwrap() {
-            // 元数据准备仍在原主线程 Composer，四项预算只记这次真实工作；没有另发源读量。
-            // Ready 才授权以下 Job，Pending 不构造缓冲、字形文件或候选成功结果。
+            // Metadata preparation stays in the original main-thread composer.
+            // Charge its actual work once; only Ready authorizes the following Job.
+            // Pending creates no input buffer, glyph file, or successful font result.
             let step = worker.step_font_probe_segment(probe, one).unwrap();
             assert!(
                 step.bytes <= 1
@@ -213,7 +225,8 @@ fn trial_actual_segments(
             match step.answer {
                 MarkdownLineFontProbeSegmentAnswer::Pending => continue,
                 MarkdownLineFontProbeSegmentAnswer::Complete => {
-                    // 完成的是同外层 GCB 的遍历。调用方仅在之前每个真实 Job 都无 glyph0 时接纳字体。
+                    // Complete traverses this same enclosing grapheme. Accept the
+                    // candidate only if every prior real Job had no glyph zero.
                     assert_eq!(spans.first().unwrap().start, probe.source_range().start);
                     assert_eq!(spans.last().unwrap().end, probe.source_range().end);
                     return (true, spans);
@@ -222,8 +235,9 @@ fn trial_actual_segments(
             }
         }
         let options = probe.shaping_options(&style()).unwrap();
-        // 每个候选始终是同一个实际 Font payload；段内只改变原 Bidi 给出的方向与源范围。
-        // 段结束后才归还 worker，不持有两张 glyph 图来拼装一个假完成票。
+        // Every segment trials the same actual candidate payload. Only original
+        // bidi direction/range varies; release each Job before advancing the worker
+        // rather than combine two retained glyph graphs into a false completion.
         let mut job = probe
             .shaping_job(
                 candidate.clone(),
@@ -234,7 +248,8 @@ fn trial_actual_segments(
             .unwrap();
         let range = job.source_range();
         assert!(range.start >= probe.source_range().start && range.end <= probe.source_range().end);
-        // 独立完整 UBA 的有限 oracle 保留每个实际 level；不能按同奇偶合并两个原整形段。
+        // An independent finite complete-UBA oracle preserves each actual level.
+        // Equal parity alone cannot merge two original shaping segments.
         let level = levels[range.start];
         assert!(levels[range.clone()].iter().all(|actual| *actual == level));
         assert_eq!(
@@ -246,7 +261,8 @@ fn trial_actual_segments(
             }
         );
         let resources = job.resource_observer();
-        // 一字节输入也会切开 U600/Arabic 的 UTF8 编码，原 Job 自己保留唯一 decoder 残余。
+        // One-byte input splits U+0600/Arabic UTF-8. The original Job retains its
+        // one decoder remainder across quanta, without replacing partial scalars.
         while job.status() == crate::MarkdownShapingStatus::Ingesting {
             let step = job
                 .step(
@@ -262,16 +278,18 @@ fn trial_actual_segments(
         }
         job.shape(&source, &font).unwrap();
         let mut missing = false;
-        // 逐实际输出取字形，既观察真实 .notdef，也让真实源/字体/EOF 校验参与失败路径。
+        // Inspect each actual glyph, including real .notdef, through original
+        // Source/font/EOF checks before deciding whether this candidate covers it.
         for ordinal in 0..job.profile().unwrap().glyph_count {
             let glyph = job.glyph(&source, &font, ordinal).unwrap().unwrap();
             assert!(range.contains(&glyph.source_utf16_cluster));
             missing |= glyph.glyph_id == 0;
         }
         spans.push(range);
-        drop(job); // 实际 glyph Job 先归还，才能让原主线程 owner 前进或重试下一候选。
+        drop(job); // Actual Job release precedes advancing or retrying another candidate.
         let released = resources.snapshot();
-        // 这里只核实际 Job 的 FD/映射生命周期；这张组件收据不冒充整产品物理内存验收。
+        // These actual Job FD/mapping observations prove component release only,
+        // not whole-product kernel RSS or platform glyph-cache acceptance.
         assert_eq!(
             (
                 released.files_open,
@@ -282,10 +300,11 @@ fn trial_actual_segments(
         );
         assert!(!released.cleanup_failed && released.first_error.is_none());
         if missing {
-            return (false, spans); // 真实 glyph0 是候选失败，不能先签 Complete 或拿名义 cmap 当成功。
+            return (false, spans); // Actual glyph zero rejects the candidate before Complete.
         }
         let next = loop {
-            // 所有段复用同一个候选和原请求。跨量子只推进当前元数据续体，不能跳过尚未试字的段。
+            // Reuse this candidate and original request for all segments. Yielding
+            // advances only current metadata, never skips unshaped segments.
             let step = worker.step_font_probe_segment(probe, one).unwrap();
             assert!(
                 step.bytes <= 1
@@ -318,7 +337,8 @@ fn actual_font_trial_checks_every_bidi_segment_before_accepting_one_complete_gra
         let catalog = MarkdownLineFontCatalog::new();
         let actual = prepend_font();
         let registered = catalog.register(&actual).unwrap();
-        // 正式分页原入口即使没有表格，也使用同原可见段 UBA owner，不能偷换完整预读路径。
+        // The production paged entry uses the same visible-paragraph UBA owner
+        // even without tables; do not replace it with a complete pre-read path.
         let mut worker = MarkdownLineComposer::new_with_table_flow(
             fixture.source.clone(),
             &fixture.source.authority(),
@@ -336,7 +356,8 @@ fn actual_font_trial_checks_every_bidi_segment_before_accepting_one_complete_gra
             }
         };
         let mut probe = worker.font_probe(&pending).unwrap();
-        // 两个真实 level 属于一个编辑 GCB；完整原范围一直保持 0..2，worker 仅借当前段。
+        // Two actual levels belong to one editing grapheme. Its complete original
+        // range remains 0..2 while a worker borrows only the current shaping segment.
         assert_eq!(probe.source_range(), 0..2);
         assert!(!probe.complete_single_segment().unwrap());
         assert!(matches!(
@@ -344,7 +365,8 @@ fn actual_font_trial_checks_every_bidi_segment_before_accepting_one_complete_gra
             Err(MarkdownLineComposeError::InvalidRequest)
         ));
         let units: Vec<_> = text.encode_utf16().collect();
-        // 仅有限合成字符串使用完整独立 UBA oracle；生产 owner 仍是上面正式分页入口的可见段索引。
+        // Only this finite synthetic string uses a complete independent UBA oracle.
+        // The actual production owner above remains its paged visible-paragraph index.
         let bidi = unicode_bidi::utf16::BidiInfo::new(&units, None);
         let (covered, _) = trial_actual_segments(&mut worker, &mut probe, &font(), &bidi.levels);
         assert!(
@@ -352,7 +374,8 @@ fn actual_font_trial_checks_every_bidi_segment_before_accepting_one_complete_gra
             "真实 Roboto 缺 U600，不能把前段或 .notdef 当成候选成功"
         );
         worker.restart_font_probe(&mut probe).unwrap();
-        // 缺字 Job 已真正归还，随后才从同一 GCB 起点试 Amiri，不替换 Source 或延长旧 scope。
+        // The missing-glyph Job has actually retired. Trial Amiri from the same
+        // grapheme start without replacing Source or renewing an expired scope.
         let (covered, spans) =
             trial_actual_segments(&mut worker, &mut probe, &actual, &bidi.levels);
         assert!(covered, "完整固定 Amiri 必须实际覆盖这个字素的全部形状");
@@ -370,7 +393,8 @@ fn actual_font_trial_checks_every_bidi_segment_before_accepting_one_complete_gra
                     .unwrap(),
             )
             .unwrap();
-        // 样式被原请求真正消费后旧试次立即撤销；文件仍是同一未经编辑的原始 mmap 输入。
+        // Actual response consumption revokes the old trial immediately. The file
+        // remains the same unedited original mmap input, independently verified below.
         assert!(matches!(
             probe.validate(),
             Err(MarkdownLineComposeError::Poisoned)

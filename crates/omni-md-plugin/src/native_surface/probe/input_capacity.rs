@@ -10,7 +10,7 @@ const NATIVE9_DOCUMENT_MAX_BYTES: usize = 2 * 1024 * 1024;
 struct CoreState {
     generation: u64,
     revision: omni_markdown_core::MarkdownDocumentRevision,
-    original_revision: Option<omni_markdown_core::MarkdownDocumentRevision>,
+    original_revision: omni_markdown_core::MarkdownDocumentRevision,
     bytes: usize,
     units: usize,
     dirty: bool,

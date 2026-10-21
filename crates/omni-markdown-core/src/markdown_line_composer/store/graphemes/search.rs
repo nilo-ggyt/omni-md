@@ -16,7 +16,8 @@ enum Next {
 }
 
 /// Retain one authenticated directory record and its next link, without a reader or a second GCB index.
-/// 本次行组合可复制已解码的右端，再各自向左查真实 part；副本不持资源，也不跨行保留。
+/// One line assembly may copy its decoded right endpoint for earlier real parts;
+/// the copies own no resources and are not retained across lines.
 #[derive(Clone)]
 pub(in crate::markdown_line_composer::store) struct BoundarySearch {
     target: Target,
@@ -49,9 +50,11 @@ impl BoundarySearch {
         }
     }
 
-    /// 同一次范围查询先查右端，再从已经解码的原记录查左端；不跨调用保留游标或来源。
-    /// 只接受已完成的 offset 查询及更早目标，原 current 必须仍在目标右侧；后续每条
-    /// previous/skip 仍由 step 核 ordinal、字节/UTF16 严格顺序，不从旧答案猜新边界。
+    /// After finding the right endpoint in one range query, search left from its
+    /// decoded original record without retaining a Source/cursor across calls.
+    /// Require a completed offset query and an earlier target still left of current.
+    /// Each later previous/skip read authenticates ordinal and strict byte/UTF-16
+    /// order; an old answer cannot infer another grapheme boundary.
     pub(in crate::markdown_line_composer::store) fn preceding_offset(
         &mut self,
         offset: usize,
@@ -186,7 +189,8 @@ impl BoundarySearch {
     }
 }
 
-/// Legacy synchronous consumers share this cursor; budgeted interaction calls step without an outer IO loop.
+/// Synchronous consumers share this cursor; budgeted interaction calls step without
+/// an enclosing I/O loop or a second search implementation.
 pub(in crate::markdown_line_composer::store) fn ordinal_boundary(
     directory: GraphemeDirectory,
     ordinal: usize,

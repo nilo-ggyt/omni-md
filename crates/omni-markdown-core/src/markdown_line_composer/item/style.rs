@@ -1,8 +1,10 @@
-//! Engine内部样式提交：完整范围复用已收费端点，缩短范围在下一metadata量子验证。
+//! Queue an internal engine style response: complete coverage reuses original
+//! charged endpoints, while shortened coverage validates in a later metadata quantum.
 use super::*;
 
 impl MarkdownLineItemCoordinator {
-    /// 只保留一份真实原响应。公开同步provide_style不改时序，此内部入口不提前查询索引。
+    /// Retain one original response without querying an endpoint prematurely.
+    /// Public synchronous provide_style retains its separate immediate-validation timing.
     pub(in crate::markdown_line_composer) fn queue_style(
         &mut self,
         response: MarkdownLineStyleResponse,
@@ -14,13 +16,15 @@ impl MarkdownLineItemCoordinator {
                 .as_mut()
                 .ok_or(MarkdownLineComposeError::Poisoned)?;
             if !payload.frontier_enabled {
+                // Without frontier mode, preserve the existing synchronous
+                // complete-item validation and construction contract.
                 return install_style(
                     payload,
                     &self.authority,
                     &self.cancellation,
                     response,
                     StyleCoordinates::default(),
-                ); // 未启用候选时保持原同步完整item合同。
+                );
             }
             let request = payload
                 .request
@@ -33,9 +37,12 @@ impl MarkdownLineItemCoordinator {
                 || response.coverage.end <= response.coverage.start
                 || response.coverage.end > request.range.end
             {
+                // Require this original outstanding nonce and its contiguous
+                // response extent before retaining any candidate style.
                 return Err(MarkdownLineComposeError::SourceMismatch);
             }
-            // 响应尚未开始装配；先拒绝过大样式，不能在等待配额时保留无界features/language。
+            // Reject oversized style before construction or pending storage;
+            // waiting for a quantum cannot retain unbounded features/language.
             if response.style.features.len() > crate::MARKDOWN_SHAPING_MAX_FEATURES
                 || response
                     .style
@@ -46,6 +53,8 @@ impl MarkdownLineItemCoordinator {
                 return Err(MarkdownLineComposeError::InvalidRequest);
             }
             if response.coverage.end == request.range.end {
+                // Full coverage already owns the real right endpoint charged
+                // by ItemScan. Transfer that exact proof rather than querying again.
                 let endpoint = payload
                     .scan
                     .as_mut()
@@ -63,13 +72,17 @@ impl MarkdownLineItemCoordinator {
                     },
                 )?;
             } else {
-                // 缩短coverage的端点尚未由原ItemScan收费。此处只保真实响应和原nonce，
-                // 下一step在查询前收费；不事后把同步IO虚记成下个量子的工作。
+                // ItemScan did not pay for this shortened endpoint. Retain only
+                // the actual response/nonce; the next step charges before querying,
+                // without relabeling synchronous I/O as later quantum work.
                 if payload.pending_style.is_some() {
+                    // One original request cannot accumulate multiple retained responses.
                     return Err(MarkdownLineComposeError::InconsistentCoverage);
                 }
                 payload.pending_style = Some(response);
-                payload.font_probe_scope.take(); // 已接受响应立刻撤旧试次，等待端点不恢复旧Style权限。
+                // Accepting the response revokes old font trials immediately;
+                // pending endpoint work cannot restore old style authority.
+                payload.font_probe_scope.take();
                 payload.stage = Stage::StyleEndpoint;
             }
             Ok(())

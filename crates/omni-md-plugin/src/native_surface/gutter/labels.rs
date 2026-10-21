@@ -1,4 +1,5 @@
-//! 有限行号只保存十个真实数字字形；不创建正文字符串、CTLine或字形缓存。
+//! Finite line numbers retain ten actual digit glyphs, without document strings,
+//! CTLine allocations, or a separate glyph cache.
 
 use std::ptr::NonNull;
 
@@ -10,7 +11,8 @@ use objc2_core_text::{CTFont, CTFontOrientation};
 
 use crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError as Error;
 
-/// SF Mono沿AppKit公开monospaced入口取得；系统共享字体不承担项目对象必须析构的义务。
+/// AppKit supplies its shared monospaced system font. Returning this retained
+/// reference does not require a system-cached font object to be destroyed.
 pub(super) struct LineNumberFont {
     font: Retained<NSFont>,
     glyphs: [u16; 10],
@@ -20,14 +22,16 @@ pub(super) struct LineNumberFont {
 }
 
 impl LineNumberFont {
-    /// 原CodeMirror样式是14pt等宽数字；实际字体映射/度量失败不能静默换另一套标签。
+    /// Preserve the established 14-point monospaced digits. Failed glyph coverage
+    /// or metrics reject the label source rather than silently switching fonts.
     pub(super) fn new() -> Result<Self, Error> {
-        // SAFETY: AppKit公开的regular权重为进程期不可变标量。
+        // SAFETY: AppKit's public regular weight is an immutable process-lifetime scalar.
         let font = NSFont::monospacedSystemFontOfSize_weight(14.0, unsafe { NSFontWeightRegular });
         let core: &CTFont = font.as_ref();
         let mut digits = (*b"0123456789").map(u16::from);
         let mut glyphs = [0u16; 10];
-        // SAFETY: 两个栈数组均恰有十项；输入是完整BMP数字，输出在同步调用内独占。
+        // SAFETY: Both stack arrays have exactly ten entries. The input contains
+        // complete BMP digits, and this synchronous call exclusively borrows output.
         let covered = unsafe {
             core.glyphs_for_characters(
                 NonNull::from(&mut digits[0]),
@@ -36,10 +40,12 @@ impl LineNumberFont {
             )
         };
         if !covered || glyphs.contains(&0) {
+            // A missing digit cannot be represented as a successful blank label.
             return Err(Error::Raster("行号字体缺少实际数字字形".into()));
         }
         let mut sizes = [CGSize::ZERO; 10];
-        // SAFETY: 字形输入与CGSize输出各覆盖十项，真实字体与输出缓冲在调用内保持存活。
+        // SAFETY: Glyph input and CGSize output each cover ten entries; the actual
+        // font and exclusive output buffer stay alive throughout the synchronous call.
         unsafe {
             core.advances_for_glyphs(
                 CTFontOrientation::Horizontal,
@@ -48,7 +54,8 @@ impl LineNumberFont {
                 10,
             );
         }
-        // SAFETY: 同步读取上方真实CTFont的不可变度量，没有正文或裸输出指针。
+        // SAFETY: Read immutable metrics from the same live CTFont, without source
+        // document access or an escaping output pointer.
         let (ascent, descent) = unsafe { (core.ascent(), core.descent()) };
         if sizes
             .iter()
@@ -58,6 +65,7 @@ impl LineNumberFont {
             || ascent <= 0.0
             || descent < 0.0
         {
+            // Nonfinite or invalid metrics cannot define a safe label bitmap.
             return Err(Error::InvalidGeometry);
         }
         Ok(Self {
@@ -69,19 +77,22 @@ impl LineNumberFont {
         })
     }
 
-    /// 宽度随canonical总行数的十进制位数变化；保留原左5/右3、最小20和1pt右边线。
+    /// Size the ruler from the canonical line-count digit width, preserving the
+    /// existing padding, minimum width, border, and gap to the document.
     pub(super) fn width(&self, lines: usize) -> f64 {
         let mut value = lines;
         let mut digits = 1usize;
         while value >= 10 {
-            value /= 10; // 只缩小原总行数标量，不遍历文档或可见行。
+            value /= 10; // Reduce one scalar only; never enumerate document or visible lines.
             digits += 1;
         }
-        // 原CM用同位数的连续9撑宽；border-box的最小20已经包含左右padding。
+        // The established layout reserves repeated nines of the required length.
+        // Its minimum border-box width already contains both horizontal paddings.
         (self.advances[9] * digits as f64 + 5.0 + 3.0).max(20.0) + 1.0 + 10.0
     }
 
-    /// 右对齐同一逻辑行的有限数字；usize最多二十位，全部字形和位置只占固定栈数组。
+    /// Right-align one logical line number. A 64-bit usize needs at most twenty
+    /// decimal digits, so glyphs and positions fit fixed stack arrays.
     pub(super) fn draw(&self, context: &CGContext, number: usize, right: f64, frame: CGRect) {
         let mut value = number;
         let mut ordinals = [0usize; 20];
@@ -91,7 +102,7 @@ impl LineNumberFont {
             ordinals[start] = value % 10;
             value /= 10;
             if value == 0 {
-                break; // 最低一位也真实绘制，零值不会变成空标签。
+                break; // Preserve the final digit, including a visible zero label.
             }
         }
         let width: f64 = ordinals[start..]
@@ -106,10 +117,11 @@ impl LineNumberFont {
         for (target, ordinal) in ordinals[start..].iter().enumerate() {
             glyphs[target] = self.glyphs[*ordinal];
             positions[target] = CGPoint::new(x, baseline);
-            x += self.advances[*ordinal]; // 只消费本标签实际数字的advance，不按均值猜宽度。
+            x += self.advances[*ordinal]; // Use each actual digit's advance, without averaging widths.
         }
         let core: &CTFont = self.font.as_ref();
-        // SAFETY: count不超过两个二十项栈数组，字形来自该真实字体；context由本同步位图独占。
+        // SAFETY: Count fits both twenty-entry stack arrays, and every glyph came
+        // from this actual font. The caller exclusively owns this bitmap context.
         unsafe {
             core.draw_glyphs(
                 NonNull::from(&mut glyphs[0]),

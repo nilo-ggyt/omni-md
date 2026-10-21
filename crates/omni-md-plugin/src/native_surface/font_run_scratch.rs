@@ -1,4 +1,4 @@
-//! 单个活动 storage 的有界 UTF-16 字体扫描内容；不拥有 canonical 文档。
+//! Bounded UTF-16 font-run scratch for one active storage, without ownership of the canonical document.
 
 use super::cache_owner::CachePayload;
 use super::{
@@ -6,7 +6,7 @@ use super::{
 };
 use std::ops::Range;
 
-/// Loaned 分支只读完整查询 scalar 到固定栈空间，不分配第二个主 buffer。
+/// When the main scratch is loaned, copy exactly one complete query scalar into two stack units.
 pub(super) fn copy_query_scalar(
     document: &SharedMarkdownDocument,
     range: &Range<usize>,
@@ -22,18 +22,21 @@ pub(super) fn copy_query_scalar(
             .copy_utf16_code_units(range.start, &mut output[..count])
             .is_err()
     {
-        // surrogate 半段、超限或 copy 失败不发布部分字符，更不能换成伪造 base font。
+        // Reject split surrogates, excess units, or failed copies without publishing partial text or a
+        // substitute base font.
         return None;
     }
     let mut decoded = char::decode_utf16(output[..count].iter().copied());
     if decoded.next()?.is_err() || decoded.next().is_some() {
-        // 两个 BMP 字符不是一个 scalar；只允许一个 BMP 或完整 supplementary pair。
+        // Two BMP characters are not one scalar; accept one BMP scalar or one complete supplementary
+        // pair only.
         return None;
     }
     Some(count)
 }
 
-/// 唯一活动 buffer；key 只证明正文内容，实际样式与字体策略每次 query 重新计算。
+/// One active buffer whose key certifies text only; each query still recomputes its actual style and
+/// font policy.
 pub(super) struct FontRunScratch {
     identity: WeakMarkdownDocument,
     generation: Option<u64>,
@@ -42,6 +45,7 @@ pub(super) struct FontRunScratch {
 }
 
 impl CachePayload for FontRunScratch {
+    // Closed/empty slots carry no text capacity or document identity.
     fn empty() -> Self {
         Self {
             identity: WeakMarkdownDocument::new(),
@@ -52,7 +56,8 @@ impl CachePayload for FontRunScratch {
     }
 
     fn invalidate(&mut self) {
-        // 正常编辑使 key 无效；活动会话仍只保留原有有限 buffer，不为下一 query 再分配。
+        // Editing revokes the key while the active session retains its bounded capacity for the next
+        // query.
         self.identity = WeakMarkdownDocument::new();
         self.generation = None;
         self.coverage = 0..0;
@@ -61,16 +66,18 @@ impl CachePayload for FontRunScratch {
 }
 
 impl FontRunScratch {
-    /// 显式活动 storage 只预留一个固定上限的 buffer，空闲插件没有该对象。
+    /// An explicitly active storage reserves one bounded buffer; an idle plugin owns no such scratch.
     pub(super) fn new() -> Self {
-        // 与旧实现相同：只在显式活动 storage 构造时保留一个固定 buffer。
+        // Reserve the fixed window only when this active storage is constructed, never for every font
+        // query.
         Self {
             units: Vec::with_capacity(NATIVE_MARKDOWN_ATTRIBUTE_WINDOW_UTF16_UNITS),
             ..Self::empty()
         }
     }
 
-    /// 命中需要完整 scalar coverage；返回当前 semantic/request 与缓存的交集。
+    /// A hit must cover the complete scalar; return the intersection of the current semantic/request
+    /// range and cached text.
     pub(super) fn prepare(
         &mut self,
         document: &SharedMarkdownDocument,
@@ -82,12 +89,15 @@ impl FontRunScratch {
             style_range,
             scalar_range,
             |document, start, units| {
-                // 真实 copy 边界只在 miss 执行；测试在此注入计数而不改变产品布局。
+                // Copy actual piece-tree contents only on a miss; existing tests observe this boundary
+                // without changing layout.
                 document.copy_utf16_code_units(start, units).is_ok()
             },
         )
     }
 
+    /// Validate scalar boundaries before changing the key; install new coverage only after the complete
+    /// bounded copy succeeds.
     fn prepare_with(
         &mut self,
         document: &SharedMarkdownDocument,
@@ -106,9 +116,11 @@ impl FontRunScratch {
             || source.byte_offset_for_utf16(scalar_range.start).is_err()
             || source.byte_offset_for_utf16(scalar_range.end).is_err()
         {
-            // 非法边界不触碰已有有效 buffer，更不能把半个 surrogate 当成命中。
+            // Invalid requests preserve the existing valid buffer and cannot treat half a surrogate as
+            // a hit.
             return None;
         }
+        // Generation alone is insufficient: distinct live documents may share the same generation.
         let identity = std::rc::Rc::downgrade(document);
         let generation = source.generation();
         let hit = std::rc::Weak::ptr_eq(&self.identity, &identity)
@@ -116,18 +128,21 @@ impl FontRunScratch {
             && self.coverage.start <= scalar_range.start
             && scalar_range.end <= self.coverage.end;
         if !hit {
-            // miss 不扩大预取：只复制旧策略本来会读取的当前 style_range。
+            // A miss copies the requested bounded style range only, without extending prefetch beyond
+            // that range.
             self.generation = None;
             self.coverage = 0..0;
             self.identity = WeakMarkdownDocument::new();
             if self.units.capacity() < NATIVE_MARKDOWN_ATTRIBUTE_WINDOW_UTF16_UNITS {
-                // 失效 loan 归还空槽后重新按固定上限取得容量，避免 Vec 的倍增超过 4096。
+                // After an invalid loan returns an empty slot, reserve the fixed limit exactly instead
+                // of doubling beyond 4096 units.
                 self.units
                     .reserve_exact(NATIVE_MARKDOWN_ATTRIBUTE_WINDOW_UTF16_UNITS - self.units.len());
             }
             self.units.resize(style_range.len(), 0);
             if !copy(&source, style_range.start, &mut self.units) {
-                // 部分写入没有 key/coverage，不能在后续 query 被误读为有效命中。
+                // A failed partial write retains no key or coverage, so a later query must refill
+                // instead of reading it as valid text.
                 self.units.clear();
                 return None;
             }
@@ -135,11 +150,13 @@ impl FontRunScratch {
             self.generation = Some(generation);
             self.coverage = style_range.clone();
         }
-        // 当前语义/请求可能比旧 buffer 更窄；只在交集内扫描，绝不返回旧样式范围。
+        // Current semantics may be narrower than the old buffer; scan only their intersection, never
+        // the previous style range.
         Some(style_range.start.max(self.coverage.start)..style_range.end.min(self.coverage.end))
     }
 
-    /// 只借用 prepare 返回的交集；调用方局部 loan 的寿命必须覆盖全部字体扫描。
+    /// Borrow only the intersection returned by prepare; the caller must retain its local loan
+    /// throughout font scanning.
     pub(super) fn slice(&self, range: &Range<usize>) -> &[u16] {
         &self.units[range.start - self.coverage.start..range.end - self.coverage.start]
     }
@@ -153,7 +170,7 @@ mod tests {
     use std::io::Write;
     use std::rc::Rc;
 
-    /// 使用真实私有 snapshot/piece tree，纯测试不构造 AppKit 对象。
+    /// Open a real private snapshot/piece tree; these tests construct no AppKit objects.
     fn fixture(text: &str) -> (tempfile::NamedTempFile, SharedMarkdownDocument) {
         let mut file = tempfile::NamedTempFile::new().expect("synthetic source");
         file.write_all(text.as_bytes()).expect("write source");
@@ -163,7 +180,8 @@ mod tests {
 
     #[test]
     fn old_copy_policy_counts_actual_piece_tree_reads() {
-        // 保存旧策略：每次 query 都 resize 并从真实 piece tree 拷贝同一个样式范围。
+        // Keep the previous policy as a baseline: each query resizes and copies the same range from the
+        // actual piece tree.
         let mut file = tempfile::NamedTempFile::new().expect("synthetic source");
         file.write_all(&vec![b'a'; 32 * 1024])
             .expect("write source");
@@ -172,7 +190,7 @@ mod tests {
         let mut copies = 0;
         let mut copied_units = 0;
         for _ in 0..1000 {
-            // 该计数位于真实 copy 调用边界；不把 resize 次数说成分配次数。
+            // Count actual copy operations here; resizing alone does not prove an allocation occurred.
             scratch.resize(4096, 0);
             document
                 .copy_utf16_code_units(6145, &mut scratch)
@@ -196,7 +214,8 @@ mod tests {
         let copies = Cell::new(0);
         let units = Cell::new(0);
         for _ in 0..1000 {
-            // 与旧基准完全相同的真实源、range 和 query；只在实际 copy 边界计数。
+            // Use the same real source, range, and queries as the baseline, counting at the actual copy
+            // boundary.
             let range = scratch
                 .prepare_with(
                     &document,
@@ -217,7 +236,8 @@ mod tests {
                     .all(|unit| *unit == u16::from(b'a'))
             );
         }
-        // centered request 右移不必复制同样的正文；允许返回合法的较短交集。
+        // A shifted centered request can reuse the same text and return the valid, narrower
+        // intersection.
         let range = scratch
             .prepare_with(&document, 6146..10242, 8193..8194, |_, _, _| {
                 panic!("coverage hit must not copy")
@@ -242,7 +262,7 @@ mod tests {
         let range = scratch
             .prepare_with(&document, 1..4, 1..3, |_, _, _| panic!("hit"))
             .expect("semantic clip");
-        // 使用与产品相同的纯 font-run 算法，从 emoji 的 low surrogate 发起查询。
+        // Run the production font-run algorithm with the query starting at the emoji low surrogate.
         let run = super::super::text_storage::native_markdown_font_run_range_by(
             scratch.slice(&range),
             range.start,
@@ -260,7 +280,8 @@ mod tests {
             |scalar| !scalar.is_ascii(),
         );
         assert_eq!(run, 1..3);
-        // 单独包含 low surrogate 的范围不合法，不能以 contains(index) 错判覆盖。
+        // A low-surrogate-only range is invalid; containing one queried index does not prove complete
+        // scalar coverage.
         assert!(scratch.prepare(&document, 2..3, 1..3).is_none());
     }
 
@@ -333,7 +354,8 @@ mod tests {
                 4096..5000,
                 4096..4097,
                 |source, start, output| {
-                    // 失败后的同 query 必须真实重读，不能复用部分写入。
+                    // The same query after failure must read the source again instead of reusing a
+                    // partial write.
                     calls.set(calls.get() + 1);
                     source.copy_utf16_code_units(start, output).is_ok()
                 },
@@ -365,7 +387,8 @@ mod tests {
         assert!(lease.payload_mut().generation.is_none());
         assert!(lease.payload_mut().units.is_empty());
         assert_eq!(lease.payload_mut().identity.strong_count(), 0);
-        // Loaned 的同一 buffer 不得在 close 后恢复；Weak 观察也不能保活正文。
+        // Closing must prevent the loaned buffer from returning to service; weak observations must not
+        // retain the document.
         owner.close();
         assert!(!owner.is_released());
         drop(lease);
@@ -384,7 +407,8 @@ mod tests {
         assert!(matches!(owner.begin(), CacheAdmission::Loaned));
         let mut output = [0_u16; 2];
         assert_eq!(copy_query_scalar(&document, &(1..3), &mut output), Some(2));
-        // low-surrogate query 的 local_index=1 仍解析为同一完整 emoji，而非 replacement。
+        // A low-surrogate query at local_index=1 still resolves the same complete emoji, without a
+        // replacement scalar.
         let scalar = super::super::text_storage::native_markdown_utf16_scalar_at(&output, 1)
             .expect("scalar");
         assert_eq!(scalar.value, '😀');
@@ -411,7 +435,8 @@ mod tests {
                 ))
                 .is_none()
         );
-        // 从失效后无容量槽模拟渐增样式范围，不能让普通 Vec 倍增到 6000 units。
+        // Grow requests from an empty slot without allowing ordinary Vec growth to double capacity to
+        // 6000 units.
         scratch
             .prepare(&document, 0..3000, 0..1)
             .expect("small fill");

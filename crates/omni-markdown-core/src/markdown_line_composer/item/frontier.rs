@@ -1,4 +1,5 @@
-//! 原协调器的显式前沿策略；只消费封闭证书，不以公开短Range创建glyph任务。
+//! Explicit frontier policy for the original coordinator. Only closed certificates
+//! authorize glyph work; a short public range cannot create a shaping task.
 use super::*;
 use crate::markdown_layout_breaks::MarkdownCertifiedGraphemeEndpoint;
 use crate::markdown_shaping::frontier::{
@@ -11,12 +12,15 @@ mod style_boundary;
 #[cfg(feature = "s2-table-window-prototype")]
 pub(super) use style_boundary::{has_style_boundary_probe, provide_boundary_style};
 
-/// 未认证能力保持真实待决；这些原因不表示缺字、整段Ready或默认排版降级。
+/// Uncertified capabilities remain pending. These reasons do not mean missing
+/// glyphs, a complete Ready paragraph, or permission to substitute default layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownLineFrontierReason {
-    /// 原字体真实计划的窄证书拒绝；保留下层类型，调用者才能区分定位、查表与缺字。
+    /// A narrow certificate rejected by the actual font plan. Keep the original
+    /// type so callers can distinguish positioning, lookup behavior, and coverage.
     Plan(harfrust::AsciiFrontierRejection),
-    /// 同一回退字体继续覆盖后继字素，尚未遇到真实字体边界且本次有界输入已用尽。
+    /// The same fallback still covers following graphemes; bounded input was
+    /// exhausted before a real font boundary was found.
     FontRunBeyondBudget,
     NonAscii,
     WordBeyondBudget,
@@ -27,7 +31,8 @@ pub enum MarkdownLineFrontierReason {
     NonSimpleGrapheme,
 }
 
-/// 只计原前沿的实际工作；全源UBA/Script/GCB元数据阶段仍由原step事实独立计量。
+/// Actual work performed by this frontier only. Original step facts independently
+/// account for the Source-wide UBA, Script, and grapheme metadata phases.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MarkdownLineFrontierWork {
     pub source_bytes: usize,
@@ -40,7 +45,8 @@ pub struct MarkdownLineFrontierWork {
     pub boundary_records: usize,
 }
 
-/// 仅一个未解析原item；续票和实际child弱身份不随已输出片数增长。
+/// One unresolved original item. Its continuation and real child's weak identity
+/// do not grow with the number of parts already delivered.
 pub(super) struct PendingFrontier {
     owner: MarkdownShapingFrontierJob,
     original: MarkdownLayoutFont,
@@ -57,13 +63,15 @@ pub(super) struct PendingFrontier {
     terminal: Option<PendingTerminal>,
     declined_same_font: bool,
     declined_font_head: bool,
-    // 原平台base只保弱注册；实际part完成后才对其有限GCB窗口审核字体选择，不预扫整个FontRun。
+    // Keep only a weak registration for the platform base. Audit each completed
+    // part's bounded grapheme window, never pre-scan the complete font run.
     preferred_registration: Option<MarkdownLineFontRegistration>,
     #[cfg(feature = "s2-table-window-prototype")]
     style_boundary: Option<style_boundary::StyleBoundary>,
 }
 
-/// 一个真实阻塞GCB开启的回退字体段；只存端点、已选Font及最多一个后继GCB，不存正文。
+/// A real blocking grapheme starts this fallback run. Store endpoint proofs, the
+/// chosen font, and at most one following grapheme response, without retaining text.
 struct PendingTerminal {
     proof: MarkdownShapingTerminalGrapheme,
     endpoints: [Option<MarkdownCertifiedGraphemeEndpoint>; 2],
@@ -76,13 +84,15 @@ struct PendingTerminal {
     beyond_limit: bool,
 }
 
-/// 只有原Next查询给出的一个完整相邻GCB；两张端点票分量子领取。
+/// One complete adjacent grapheme from the original Next query. Acquire its two
+/// endpoint proofs over separately charged metadata quanta.
 struct PendingFontProbe {
     range: Range<usize>,
     endpoints: [Option<MarkdownCertifiedGraphemeEndpoint>; 2],
 }
 
-/// 真实第三Font选择同时封闭前段和开启后段；等待前段原child归还后才消费。
+/// An actual third font closes one run and starts the next. Consume this response
+/// only after the preceding run's real child allocation has been released.
 struct SelectedFontGrapheme {
     response: MarkdownLineStyleResponse,
     endpoints: [MarkdownCertifiedGraphemeEndpoint; 2],
@@ -105,9 +115,11 @@ impl PendingTerminal {
     }
 }
 impl PendingFrontier {
-    /// 只保留已归还 child 的原前沿。facts 的完整范围与 owner.original 在原装配时
-    /// 相等，后继 part 也逐次核 original_range；不能拿中心片或已发布行冒充其支持域。
-    /// 语义边界及终端 Font 响应可能持旧出版物，首版一律交回冷路，不延长它们的寿命。
+    /// Retain the original frontier only after child release. Complete facts matched
+    /// owner.original at assembly and every part checks original_range; a center
+    /// slice or published line cannot stand in for that support range. Semantic-edge
+    /// and terminal-font responses may retain old publications, so restart them
+    /// through normal preparation rather than prolonging their lifetimes here.
     #[cfg(feature = "s2-table-window-prototype")]
     pub(super) fn retains_selection_styles(&self, proven_end: usize) -> Result<bool> {
         if self.facts.source_utf16.end > proven_end
@@ -131,11 +143,14 @@ impl PendingFrontier {
         Ok(true)
     }
 
-    /// 首 Font 探测未取得真实字体右界后，保留同一失败计划及原 SCX/词证明续体。
+    /// After a head-font trial finds no real right boundary, preserve the same
+    /// rejected plan and original Script_Extensions/word-proof continuation.
     pub(in crate::markdown_line_composer::item) fn decline_font_head(&mut self) {
         self.declined_font_head = true;
     }
 
+    /// Transfer the original frontier Job and its accepted response facts into one
+    /// owner; no child, continuation, or terminal trial exists before actual work.
     pub(super) fn new(
         owner: MarkdownShapingFrontierJob,
         response: MarkdownLineStyleResponse,
@@ -170,7 +185,8 @@ impl PendingFrontier {
     }
 }
 
-/// 真实端点分别收费，拿齐后才签一次NeedStyle；没有新GCB索引或第二Source。
+/// Charge each original endpoint independently, then issue one NeedStyle only when
+/// both are certified. No replacement grapheme index or second Source is created.
 fn prepare_terminal_style(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
@@ -181,6 +197,8 @@ fn prepare_terminal_style(
     let terminal = pending.terminal.as_mut().expect("原末GCB票仍在唯一槽内");
     let range = terminal.proof.source_range();
     for (index, offset) in [range.start, range.end].into_iter().enumerate() {
+        // Keep previously acquired proofs across yields. Pending never supplies a
+        // partial grapheme to a native font worker.
         if terminal.endpoints[index].is_some() {
             continue;
         }
@@ -204,7 +222,7 @@ fn prepare_terminal_style(
             }
             _ => return Err(MarkdownLineComposeError::InconsistentCoverage),
         }
-    } // 只有原两端票都已取得，Native字体worker才可能领取这个完整GCB。
+    }
     let request = MarkdownLineStyleRequest {
         nonce: Arc::new(()),
         source: authority.clone(),
@@ -236,7 +254,8 @@ fn prepare_terminal_style(
     Ok(step)
 }
 
-/// 字体响应只改变真实Font选择；同Font中部仍没有上下文闭合证明，保留原能力拒绝。
+/// A font response changes only the selected payload. Same-font success in the
+/// middle does not close shaping context, so retain the original capability refusal.
 pub(super) fn provide_terminal_style(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
@@ -248,6 +267,8 @@ pub(super) fn provide_terminal_style(
         || terminal.proof.source_range(),
         |probe| probe.range.clone(),
     );
+    // A font trial cannot alter style and thereby invalidate the already certified
+    // prefix's input. Validate the exact pending grapheme and live registration first.
     if response.coverage != expected
         || response.style.presentation != pending.replay_style.presentation
         || response.style.points.to_bits() != pending.replay_style.points.to_bits()
@@ -255,7 +276,7 @@ pub(super) fn provide_terminal_style(
         || response.style.features != pending.replay_style.features
     {
         return Err(MarkdownLineComposeError::InvalidRequest);
-    } // 字体试次不能顺带改样式，否则旧前缀不再属于同一个已认证输入。
+    }
     if let Some(registration) = &response.registration {
         let registered = registration.lease()?;
         if !response.font.permits(&registered.font().authority()) {
@@ -266,7 +287,8 @@ pub(super) fn provide_terminal_style(
     if let Some(probe) = terminal.probe.take() {
         if original_selected {
             terminal.boundary_ready = true;
-            // 原Font完整试次重新成功，当前回退段到此真实结束；后继原字素尚未消费。
+            // Actual original-font coverage closes the fallback run here. This
+            // following original-font grapheme has not yet been consumed.
         } else if response.font.permits(
             &terminal
                 .response
@@ -288,7 +310,8 @@ pub(super) fn provide_terminal_style(
             terminal.beyond_limit = last.utf16 - first.utf16 > closed_item::MAX_CLOSED_UTF16
                 || last.byte - first.byte > closed_item::MAX_CLOSED_BYTES;
             terminal.boundary_ready = last.utf16 == pending.facts.source_utf16.end;
-            // 相同回退Font必须合并，不能用固定预算制造字体边界；过大真实段保持未支持。
+            // Coalesce the same fallback payload. A fixed allowance cannot close
+            // the real run; an oversized continuous run remains explicitly unsupported.
         } else {
             terminal.next = Some(SelectedFontGrapheme {
                 response,
@@ -297,30 +320,33 @@ pub(super) fn provide_terminal_style(
                     .map(|value| value.expect("完整相邻GCB原端点")),
             });
             terminal.boundary_ready = true;
-            // 真正第三Font选择给出当前右边界；只暂存这一个已付费后继试次。
+            // A real third-font choice supplies the right edge. Retain only this
+            // already prepared successor trial until the current child retires.
         }
     } else if original_selected && expected.end != pending.facts.source_utf16.end {
         pending.terminal = None;
         pending.declined_same_font = true;
-        // 中部同Font成功不代表局部计划支持它；不造字体边界，也不无限重发同一试次。
+        // Same-font coverage in the middle does not certify the local shaping plan.
+        // Do not invent a boundary or endlessly reissue the same trial.
     } else {
         pending
             .owner
             .resume_terminal_grapheme(authority, &pending.font, &terminal.proof, original_selected)
             .map_err(map_error)?;
         if original_selected {
-            pending.terminal = None; // 原Font自然尾片沿已通过的原plan路径完成。
+            pending.terminal = None; // Finish the natural tail through its original plan.
         } else {
-            terminal.response = Some(response); // 先交付旧Font的实际残余，随后寻找真实右边界。
+            terminal.response = Some(response); // Deliver the old-font remainder first.
         }
     }
     payload.request.take();
-    payload.font_probe_scope.take(); // 响应接受即撤原试次，后继Font不续用旧nonce。
+    payload.font_probe_scope.take(); // Accepted responses expire the original trial scope.
     payload.stage = Stage::Frontier;
     Ok(())
 }
 
-/// 相邻GCB只在回退区逐个试次；原Font一旦重新成功，就恢复原来的批量排版。
+/// Trial adjacent graphemes only inside the fallback region. Actual original-font
+/// coverage resumes the original batched layout path.
 fn advance_font_run(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
@@ -332,13 +358,15 @@ fn advance_font_run(
     if terminal.beyond_limit {
         step.answer =
             MarkdownLineItemAnswer::NeedsFrontier(MarkdownLineFrontierReason::FontRunBeyondBudget);
-        return Ok(step); // 有限完整输入上限不是真Font边界，绝不能截断这个真实连续Font段。
+        return Ok(step); // An input allowance is not a font edge; never truncate the run.
     }
     if terminal.boundary_ready {
         install_terminal_font(payload, authority)?;
         return Ok(step);
     }
     if terminal.probe.is_none() {
+        // Ask the original grapheme index for one adjacent complete range, preserving
+        // the original item's end rather than guessing from Source length.
         let start = terminal.endpoints[1]
             .as_ref()
             .expect("已选段末端点")
@@ -392,7 +420,7 @@ fn advance_font_run(
             }
             _ => return Err(MarkdownLineComposeError::InconsistentCoverage),
         }
-    } // 两个原端点齐备后才发Native试次；没有正文读取、替代索引或推测行高。
+    } // Both original proofs are required; no text read or guessed line height occurs.
     let request = MarkdownLineStyleRequest {
         nonce: Arc::new(()),
         source: authority.clone(),
@@ -424,7 +452,8 @@ fn advance_font_run(
     Ok(step)
 }
 
-/// 左右都是真实Font边界或自然项端点，才装配这一完整Font段，保留原Frontier等待child归还。
+/// Assemble a complete font run only between real font boundaries/natural item
+/// ends. The original frontier remains alive until its child is actually released.
 fn install_terminal_font(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
@@ -440,12 +469,14 @@ fn install_terminal_font(
     let first = endpoints[0].boundary(authority)?;
     let last = endpoints[1].boundary(authority)?;
     let range = first.utf16..last.utf16;
+    // The already delivered prefix remains unchanged. This fallback run cannot
+    // escape the original Script_Extensions, style, or bidi item coverage.
     if payload.cursor != range.start
         || !terminal.boundary_ready
         || range.end > pending.facts.source_utf16.end
     {
         return Err(MarkdownLineComposeError::InconsistentCoverage);
-    } // 旧中文已经原样交付；完整回退段不得跨过原SCX、样式或UBA范围。
+    }
     let font = response.font.authority();
     let closed = closed_item::ClosedItem::from_terminal_font_change(
         &terminal.proof,
@@ -467,6 +498,8 @@ fn install_terminal_font(
         end_of_text: facts.end_of_text,
         features: style.features.clone(),
     };
+    // Transfer the same Source and selected payload to the original pending input
+    // preparation; this does not advance the frontier's private cursor yet.
     let shaping = crate::markdown_shaping::PendingClosedShaping::new(
         payload.source.clone(),
         authority,
@@ -485,10 +518,11 @@ fn install_terminal_font(
         shaping_seams: [None, None],
     });
     payload.stage = Stage::ClosedInput;
-    Ok(()) // 原owner继续持同一计划；新Font段真实归还后才允许移动其私有游标。
+    Ok(()) // Only actual run-child release later permits the original plan to advance.
 }
 
-/// take_item已核实际Ready/EOF，此处登记同一个新Font child，不能用坐标回执代替真实归还。
+/// After take_item checks actual Ready/EOF, register this same new-font child. A
+/// coordinate receipt cannot substitute for release of the real Job allocation.
 pub(super) fn lend_font_item(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
@@ -514,7 +548,8 @@ pub(super) fn lend_font_item(
     Ok(())
 }
 
-/// 前段真实child归还后，已付费第三Font试次才能成为下一段；普通原Font继续批量运行。
+/// After actual child release, the already prepared third-font trial may become
+/// the next run. Without such a successor, the original font resumes batched work.
 fn finish_font_run(payload: &mut Payload, authority: &MarkdownLayoutTextAuthority) -> Result<()> {
     let pending = payload.frontier.as_mut().expect("归还Font段仍属于原owner");
     let mut terminal = pending.terminal.take().expect("原Font交接唯一槽");
@@ -533,12 +568,13 @@ fn finish_font_run(payload: &mut Payload, authority: &MarkdownLayoutTextAuthorit
         following.response = Some(next.response);
         following.prefix_returned = true;
         pending.terminal = Some(following);
-    } // 没有后继回退Font时清空交接，原Font/plan/Script/Source全部继续沿原owner。
+    } // No successor: retain original font/plan/Script/Source on their existing owner.
     Ok(())
 }
 
 impl MarkdownLineItemCoordinator {
-    /// 显式候选才启用已认证前沿；原new继续作为完整item对照，不能混称惰性通过。
+    /// Explicitly enable certified frontier work. The original constructor retains
+    /// complete-item behavior and cannot itself establish lazy-layout acceptance.
     pub fn new_with_frontier(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
@@ -557,7 +593,9 @@ impl MarkdownLineItemCoordinator {
         if !matches!(payload.stage, Stage::Bidi) || payload.cursor != 0 {
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
-        payload.frontier_enabled = true; // 首个step前选择一次，不允许运行中把旧完整Job补签成前沿。
+        // Select before the first step; an in-flight complete Job cannot be
+        // retroactively certified as frontier work.
+        payload.frontier_enabled = true;
         Ok(())
     }
     pub fn frontier_work(&self) -> Result<MarkdownLineFrontierWork> {
@@ -571,6 +609,8 @@ impl MarkdownLineItemCoordinator {
 }
 
 pub(super) fn map_error(error: MarkdownShapingFrontierError) -> MarkdownLineComposeError {
+    // Preserve typed failures at their existing owning boundary. A continuation
+    // mismatch is authority failure; it must not turn into a retryable pending reason.
     match error {
         MarkdownShapingFrontierError::Shaping(error) => MarkdownLineComposeError::Shaping(error),
         MarkdownShapingFrontierError::Breaks(error) => MarkdownLineComposeError::Break(error),
@@ -584,6 +624,7 @@ pub(super) fn map_error(error: MarkdownShapingFrontierError) -> MarkdownLineComp
     }
 }
 fn reason(value: MarkdownShapingFrontierReason) -> MarkdownLineFrontierReason {
+    // Keep capability refusal distinct from fatal errors and from glyph coverage.
     match value {
         MarkdownShapingFrontierReason::Plan(reason) => MarkdownLineFrontierReason::Plan(reason),
         MarkdownShapingFrontierReason::NonAscii => MarkdownLineFrontierReason::NonAscii,
@@ -631,7 +672,7 @@ pub(super) fn advance(
             .is_some_and(|tail| tail.response.is_none() && !tail.installed)
     }) {
         return prepare_terminal_style(payload, authority, budget, step);
-    } // 查询端点占独立量子，不能在刚读完阻塞GCB的同一个已满预算里补做索引工作。
+    } // Endpoint work uses a later quantum, not an already exhausted Source budget.
     {
         let pending = payload
             .frontier
@@ -646,7 +687,9 @@ pub(super) fn advance(
                 step.answer = MarkdownLineItemAnswer::NeedsFrontier(
                     MarkdownLineFrontierReason::PendingConsumer,
                 );
-                return Ok(step); // consumer未真实归还child时不调用会永久失败的resume，更不新建第二Job。
+                // Resume requires actual child release; calling it early would
+                // poison the owner. Do not allocate a replacement Job while waiting.
+                return Ok(step);
             }
             pending
                 .owner
@@ -664,7 +707,7 @@ pub(super) fn advance(
                 finish_font_run(payload, authority)?;
             } else if let Some(run) = &mut pending.terminal {
                 run.prefix_returned = true;
-            } // 原Font残余和回退Font段都必须先归还实际child，不能只凭游标跳过Store。
+            } // Both old-font remainder and fallback run wait for actual Store release.
             let pending = payload.frontier.as_mut().expect("原Frontier不在归还中丢失");
             if pending.complete {
                 if (!pending.open_script && payload.cursor != pending.facts.source_utf16.end)
@@ -674,7 +717,9 @@ pub(super) fn advance(
                 }
                 drop(payload.frontier.take());
                 payload.stage = Stage::ItemStart;
-                return Ok(step); // 闭合item到真末端，开放scope只到中心末端；二者都先归还实际child。
+                // A closed item reaches its real end; an open scope reaches only
+                // its center end. Both transitions occur after actual child release.
+                return Ok(step);
             }
         }
     }
@@ -706,7 +751,7 @@ pub(super) fn advance(
         .source_bytes
         .checked_add(progress.input_bytes)
         .ok_or(MarkdownLineComposeError::Overflow)?;
-    step.scalars = progress.scalars; // 真UTF8解码与child输入逐scalar计费，不以中文字节数冒充标量数。
+    step.scalars = progress.scalars; // Charge actual decoded scalars, not UTF-8 byte count.
     step.shapes = progress.shapes;
     step.context_bytes = progress.context_bytes;
     step.metadata_units = progress
@@ -715,6 +760,8 @@ pub(super) fn advance(
         .and_then(|units| units.checked_add(progress.boundary_records))
         .filter(|units| *units <= budget.metadata_units)
         .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
+    // Accumulate the original owner's actual work without resetting it at each
+    // part or font trial. Overflow and exceeded metadata remain explicit failures.
     let work = &mut payload.frontier_work;
     work.source_bytes = work
         .source_bytes
@@ -747,6 +794,8 @@ pub(super) fn advance(
     match progress.answer {
         Answer::Pending => {}
         Answer::NeedsFrontier(value) => {
+            // A head-font trial is allowed only before consuming this original
+            // item, and only for refusals that could hide a real font transition.
             let at_unconsumed_head = payload.cursor == pending.facts.source_utf16.start
                 && pending.child.is_none()
                 && pending.terminal.is_none()
@@ -785,7 +834,7 @@ pub(super) fn advance(
                     }
                 } else {
                     false
-                }; // 无原同源B正文范围就保FontRuns，不能从Source长度猜分隔符位置。
+                }; // Without an original same-Source bidi span, do not guess separators.
                 if ascii_suffix {
                     match payload.scripts.run_at(
                         authority,
@@ -794,7 +843,9 @@ pub(super) fn advance(
                     )? {
                         MarkdownScriptAnswer::Pending => payload.script_source_demand = true,
                         MarkdownScriptAnswer::Known(Some(_)) => {
-                            // 原Script完整闭run真实存在后才撤原开放计划；同一Font/Style由原请求链重新装配。
+                            // Retire the open plan only after the original Script
+                            // index has a real closed run. Its request chain obtains
+                            // the same font/style through normal assembly again.
                             payload.closed_script_at = Some(payload.cursor);
                             drop(payload.frontier.take());
                             payload.open_script = false;
@@ -802,20 +853,20 @@ pub(super) fn advance(
                         }
                         _ => return Err(MarkdownLineComposeError::InconsistentCoverage),
                     }
-                    return Ok(step); // 实际后缀证明在下一原Script量子执行，不偷用本次整形剩余额度。
+                    return Ok(step); // Original Script work consumes its next own quantum.
                 }
-                // 后缀不是ASCII、上下文未结算或没有同源端点时仍用原FontRuns；emoji首Font不能沿用到巨项。
-                // ASCII 字体的局部资格也可能先被后面的中文拒绝：起始空格选中原 Font，
-                // 不代表同一样式交集中后继中文也使用它。NonAscii 同样只允许原完整 GCB
-                // 字体试次；必须找到真实 Font 变化才封闭前段，无变化仍保留原精确拒绝。
-                // Positioning 或跨输入 GSUB 拒绝都没有赋予任意切分权限。首 GCB 的实际 Font
-                // 不证明整个 SCX 均可用，只在相邻完整 GCB 确认另一真实 Font 后封闭首 Font 段。
-                // 同 Font 的组合字/连字不能因此被拆开；未找到变化只退役探测，继续原 SCX/词域证明。
-                // 原owner仍持Source/Font/取消及资源scope，直到这个短段child真正归还才结束。
-                // 原自然小项仍走已有闭项合同；只有尚未消费的非自然短样式项也可试真实Font边界。
-                // 例如“空格、中文、空格”首字素选中Mono，并不证明该Font覆盖中间中文；原计划可能
-                // 在缺字处理前就拒绝跨输入查表。这里只开放同GCB试次机会，不授予短样式末端闭合权：
-                // 只有后继确实选出另一原Font才交付，直到coverage末端仍相同则原样退役并保精确拒绝。
+                // Non-ASCII suffixes, unsettled context, or absent same-Source ends
+                // stay with original FontRuns. The first grapheme's font never
+                // proves coverage for a huge Script_Extensions item: an initial
+                // Mono space, for example, says nothing about following Chinese.
+                // Positioning/cross-input refusals grant no arbitrary split either.
+                // Only an adjacent complete grapheme selecting another real payload
+                // closes this head; same-font marks/ligatures remain intact. If no
+                // change is found, retire this probe and keep the precise refusal
+                // and original Script/word proof. The original owner retains Source,
+                // font, cancellation, and resource scope until its real child ends.
+                // This also covers an unconsumed short semantic run whose end is
+                // not natural; short style coverage alone never grants closure.
                 payload.closed_fonts = Some(closed_item::FontRuns::frontier_head(
                     authority.clone(),
                     pending.original.clone(),
@@ -830,14 +881,16 @@ pub(super) fn advance(
             }
             #[cfg(feature = "s2-table-window-prototype")]
             if style_boundary::begin(payload)? {
-                // 原head量子已经使用了本次计划预算；右侧GCB从下一step独立收费，
-                // 不把同一个metadata配额先交旧owner再偷偷交第二次目录查询。
+                // The head already spent this step's plan budget. Charge the right
+                // grapheme on the next step, without spending the metadata quota twice.
                 return Ok(step);
             }
             let pending = payload.frontier.as_mut().expect("原失败计划仍在同owner内");
             if pending.open_script {
-                // 开放SCX没有资格退到有限context的ASCII计划；保持原run算法直到真实闭合，
-                // 再请求对应完整交集的样式。旧响应和资源真实归还，不扩充其Font覆盖权限。
+                // An open Script_Extensions run cannot switch to a finite-context
+                // ASCII plan. Continue original dependency preparation until actual
+                // closure, then request the complete intersection's style. Release
+                // the old response/resources without extending its font authority.
                 payload.closed_script_at = Some(payload.cursor);
                 drop(payload.frontier.take());
                 payload.open_script = false;
@@ -853,9 +906,9 @@ pub(super) fn advance(
                     pending.terminal = Some(PendingTerminal::new(proof));
                 } else {
                     step.answer = MarkdownLineItemAnswer::NeedsFrontier(reason(value));
-                } // 只对原完整SCX中的实际阻塞GCB重试；缩短样式和已拒同Font中部仍不升权。
+                } // Retry only the blocking grapheme inside the original complete run.
             }
-        } // 未认证计划/正文保持待决，没有完整item fallback隐藏首行glyph工作。
+        } // Uncertified plans stay pending; no complete-item fallback hides glyph work.
         Answer::PartReady => {
             let part = pending
                 .owner
@@ -864,6 +917,8 @@ pub(super) fn advance(
             let range = part.certified_range();
             let item_complete = part.is_item_complete();
             let complete = part.is_scope_complete();
+            // Validate the actual original range and current cursor before moving
+            // the child. A safe open-scope end is not a complete natural item end.
             if part.original_range() != pending.facts.source_utf16
                 || range.start != payload.cursor
                 || range.is_empty()
@@ -903,7 +958,7 @@ pub(super) fn advance(
                 if at == endpoint {
                     shaping_seams[index] = Some(seam.clone());
                 }
-            } // 原 Source 错配必须返回 typed 错误，不能靠 .ok() 悄悄抹去内部 shaping 票。
+            } // A stale Source returns its typed error, never a silently missing seam.
             payload.item = Some(MarkdownLineItem {
                 job: crate::markdown_line_composer::worker_resources::ShapeResourceOwner::new(
                     job,
@@ -924,16 +979,18 @@ pub(super) fn advance(
             payload.stage = Stage::Ready;
             step.answer = MarkdownLineItemAnswer::ItemReady(facts);
             if let Some(audit) = audit {
-                // 只暂借刚封存的同一个原Job；没有第二字形图。未发现Font变化时原continuation
-                // 原封交回；真实变化后的旧parent必须等重形child归还才退役，不能resume到整part末端。
+                // Audit this same sealed Job without another glyph graph. Unchanged
+                // fonts return its original continuation intact. After a real font
+                // change, retire the parent only after the reshaped child releases;
+                // never resume it at the stale whole-part endpoint.
                 payload.closed_fonts = Some(audit);
                 payload.stage = Stage::ClosedFonts;
                 step.answer = MarkdownLineItemAnswer::Yielded;
             }
-        } // 只移交实际Ready子任务；Store完成后才能归还私有Continuation并推进下一前沿。
+        } // Store must release the real Ready child before returning its continuation.
         Answer::PendingConsumer | Answer::Complete => {
             return Err(MarkdownLineComposeError::InconsistentCoverage);
-        } // 这两个状态只能通过上面的原ticket交接完成，不能绕过独立child真实释放。
+        } // These transitions require the original ticket handoff and actual child release.
     }
     Ok(step)
 }

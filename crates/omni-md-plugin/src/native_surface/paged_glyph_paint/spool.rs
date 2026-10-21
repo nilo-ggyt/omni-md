@@ -1,4 +1,5 @@
-//! 主线程只读消费原worker封存的字形文件；不把可变Job或NativeFont跨线程移交。
+//! Consume the original worker's sealed glyph file read-only on the main thread,
+//! without transferring a mutable Job or NativeFont between threads.
 
 use objc2_core_graphics::CGContext;
 use omni_markdown_core::{MarkdownShapedGlyph, MarkdownShapedSpool, MarkdownShapedSpoolAuthority};
@@ -9,7 +10,8 @@ use super::{
     NativeMarkdownPagedGlyphPaintRequest, PreparedBatch, Result, batch_count, validate_native_font,
 };
 
-/// 封存文件的每次读取都绑定同一输出nonce；相同Source/Font的新任务不能替代原文件。
+/// Every file read binds the original output nonce. A newer task with the same
+/// Source/font cannot authorize a different sealed file in its place.
 struct SpoolProof<'a, 'b> {
     output: &'a MarkdownShapedSpoolAuthority,
     request: &'a NativeMarkdownPagedGlyphPaintRequest<'b>,
@@ -18,6 +20,8 @@ struct SpoolProof<'a, 'b> {
 }
 
 impl SpoolProof<'_, '_> {
+    /// Authenticate exact EOF under both original font identities before and
+    /// after reentrant frontend checks, without issuing a glyph pread.
     fn current(
         &self,
         spool: &mut MarkdownShapedSpool,
@@ -26,8 +30,9 @@ impl SpoolProof<'_, '_> {
         if !current() {
             return Err(NativeMarkdownPagedGlyphPaintCause::Revoked);
         }
-        // 真EOF空批次没有pread；仍核同一输出、Source健康、取消位与精确Font payload。
-        // 同时核请求Font和实际CTFont对应的CoreFont，不能借相同PSName冒充同一face权限。
+        // An empty actual-EOF batch still checks output, Source health,
+        // cancellation, and exact font payload. Request/Core-Native font checks
+        // prevent a matching PostScript name from substituting another face.
         for font in [self.request.font_authority, &self.native_font_authority] {
             spool.read_batch(
                 self.output,
@@ -40,7 +45,8 @@ impl SpoolProof<'_, '_> {
         if !current() {
             return Err(NativeMarkdownPagedGlyphPaintCause::Revoked);
         }
-        // 原current可以同步发现源回收失败；返回前再核原票，不领取较新的输出或Source。
+        // current may discover Source reclamation failure synchronously. Recheck
+        // original tickets before return, never a newly captured output/Source.
         spool.read_batch(
             self.output,
             self.request.source,
@@ -52,14 +58,16 @@ impl SpoolProof<'_, '_> {
     }
 }
 
-/// 将原worker已完整seal的指定字形批次画到调用者的真实context。
-///
-/// 每次最多256glyph，按原视觉顺序消费一次真实`read_batch`，全部预检后才唯一draw。
-/// `output`必须来自该spool的原任务nonce；调用者须结束所有Doc/RefCell借用、保留原前台票，
-/// 并在任何Err后丢弃本次候选像素。本函数不提供软行、clip、选择或视口Ready权限。
+/// Draw one complete original worker-sealed batch into the caller's actual
+/// context. One finite read_batch preserves visual order and all preflight
+/// checks finish before the single draw. Output must retain this spool's task
+/// nonce; callers end document/RefCell borrows, retain original frontend
+/// authority, and discard candidate pixels on Err. Soft-line/clip/selection/
+/// viewport readiness belongs to the existing enclosing owners.
 ///
 /// # Errors
-/// 超量、失权、原Source/Font/输出不符或文件IO均明确拒绝；draw后撤权保留实际绘制返回事实。
+/// Reject excessive ranges, revoked/mismatched authorities, and actual file IO
+/// failures; post-draw revocation retains the actual returned-draw fact.
 pub fn paint_paged_spool_glyphs(
     spool: &mut MarkdownShapedSpool,
     output: &MarkdownShapedSpoolAuthority,
@@ -69,7 +77,8 @@ pub fn paint_paged_spool_glyphs(
 ) -> std::result::Result<NativeMarkdownPagedGlyphPaintReceipt, NativeMarkdownPagedGlyphPaintError> {
     let mut native_draw_returned = false;
     let result = (|| -> Result<NativeMarkdownPagedGlyphPaintReceipt> {
-        // 大范围在读取任何glyph前整批拒绝，不以截断或内部循环画完整长run。
+        // Reject an oversized range before any glyph read; neither truncate it
+        // nor internally loop over an entire giant shaping run.
         let count = batch_count(&request.glyph_range)?;
         let proof = SpoolProof {
             output,
@@ -94,7 +103,8 @@ pub fn paint_paged_spool_glyphs(
             x_offset: 0,
             y_offset: 0,
         }; NATIVE_MARKDOWN_PAGED_GLYPH_BATCH];
-        // 整批是固定栈候选，read_batch错误时全部弃用，不向CoreText交付成功前缀。
+        // The entire fixed-stack candidate is discarded on read failure. Core
+        // Text receives no successful prefix from an incomplete batch.
         let read = spool.read_batch(
             output,
             request.source,
@@ -103,12 +113,14 @@ pub fn paint_paged_spool_glyphs(
             &mut records[..count],
         )?;
         if read != count {
+            // A short file result cannot stand in for the complete requested batch.
             return Err(NativeMarkdownPagedGlyphPaintCause::InvalidRange);
         }
         proof.current(spool, current)?;
         let mut batch = PreparedBatch::new(&request, spool.source_range());
         for glyph in records[..count].iter().copied() {
-            // 这里没有Native调用或正文读取；共用Job路径相同的编号/26.6/flags预检。
+            // Rust-only preflight shares the Job path's exact ID/coordinate/
+            // flags rules, with neither Native calls nor document text reads.
             batch.push(&request, glyph)?;
         }
         batch.draw(

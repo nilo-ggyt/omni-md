@@ -1,4 +1,4 @@
-//! 行首许可来自真实选中与LineEnd提交；同源坐标、普通GCB或未提交选择都不能替代。
+//! A next-line start requires a selected and committed LineEnd, not a coordinate or bare grapheme.
 use super::*;
 use crate::markdown_soft_line_measure::provider::SelectedLineStart;
 use crate::{
@@ -9,6 +9,8 @@ use crate::{
 };
 
 struct Prepared {
+    // This fixture retains the genuine source, writer, break/bidi jobs and original
+    // measure until each test explicitly transfers or retires their real owners.
     fixture: Fixture,
     cancellation: MarkdownLineComposeCancellation,
     store: GlyphStore,
@@ -21,11 +23,13 @@ struct Prepared {
 
 impl Prepared {
     fn new(emergency: bool) -> Self {
+        // Only synthetic finite source is materialized here. The long unbroken
+        // case uses the real frontier and a real system font to force an emergency.
         let text = if emergency {
             "a".repeat(4099)
         } else {
             "aa aa aa aa aa aa aa aa aa aa aa aa".to_owned()
-        }; // 只在这个有限测试夹具生成正文；产品Store不保全文String。
+        }; // The production store never retains this fixture's whole-text String.
         let mut fixture = Fixture::new(&text);
         if emergency {
             let bytes = crate::MarkdownLayoutFontBytes::capture_file(
@@ -36,7 +40,7 @@ impl Prepared {
             let font =
                 crate::MarkdownLayoutFont::resolve(bytes.blob(), ".SFNSMono-Regular", &[]).unwrap();
             fixture.font = fixture.catalog.register(&font).unwrap();
-        } // 这是实际系统字体正控，生产计划证书没有字体名称白名单。
+        } // This is an actual-font positive case; production permissions do not whitelist its name.
         let cancellation = MarkdownLineComposeCancellation::new();
         let mut coordinator = if emergency {
             MarkdownLineItemCoordinator::new_with_frontier(
@@ -59,6 +63,8 @@ impl Prepared {
                 },
             )
             .unwrap();
+        // Persist the item and grapheme records, then release its original job
+        // before measuring through the stored provider.
         let original = item.job.resource_observer();
         let mut store = fixture.store(cancellation.clone());
         let mut breaks = super::lines::breaks(&fixture);
@@ -68,6 +74,8 @@ impl Prepared {
         drop(coordinator);
         assert_eq!(original.snapshot().files_open, 0);
         assert_eq!(original.snapshot().mapped_bytes, 0);
+        // The committed line still needs the same original paragraph direction;
+        // stored glyph availability is not a substitute for bidi authority.
         let bidi = MarkdownBidiParagraph::analyze_layout_source(
             fixture.source.clone(),
             &fixture.source.authority(),
@@ -94,6 +102,8 @@ impl Prepared {
             )
             .unwrap()
         };
+        // Require the genuine selection variant for each fixture. The selected
+        // endpoint must remain strictly inside the original source, not at fake EOF.
         let choice = super::providers::selected(&mut measure, &mut store, &proof, &mut breaks);
         let end = match choice {
             MarkdownSoftLineMeasureChoice::MeasuredBreak(value) if !emergency => {
@@ -106,7 +116,7 @@ impl Prepared {
             }
             other => panic!("真实原选择未取得预期安全行尾: {other:?}"),
         };
-        assert!(end > 0 && end < store.source_end);
+        assert!(end > 0 && end < fixture.source.utf16_len());
         Self {
             fixture,
             cancellation,
@@ -120,6 +130,8 @@ impl Prepared {
     }
 
     fn commit(&mut self) {
+        // A selected permit gains next-start authority only through the actual
+        // LineEnd append; constructing a permit alone does not commit anything.
         let measure = self.measure.as_ref().unwrap();
         let permit = {
             let mut provider = self.store.borrow(&self.proof).unwrap();
@@ -133,6 +145,8 @@ impl Prepared {
     }
 
     fn issue(&mut self) -> std::result::Result<SelectedLineStart, MarkdownSoftLineMeasureError> {
+        // Borrow the original proof for this one-shot handoff. Ownership of the
+        // resulting ticket belongs to its consumer, not to the stored coordinate.
         let mut provider = self.store.borrow(&self.proof).unwrap();
         let permit = self
             .measure
@@ -148,6 +162,8 @@ impl Prepared {
         start: usize,
         cancellation: MarkdownSoftLineMeasureCancellation,
     ) -> std::result::Result<MarkdownSoftLineMeasureJob, MarkdownSoftLineMeasureError> {
+        // Consume the original ticket while preserving exact source, font, break
+        // and cancellation identities; an equal false cancel bit is not equivalent.
         let mut provider = self.store.borrow(&self.proof).unwrap();
         MarkdownSoftLineMeasureJob::after_selected_start(
             self.fixture.source.clone(),
@@ -167,6 +183,8 @@ impl Prepared {
 
 #[test]
 fn actual_emergency_commit_survives_old_measure_drop_but_raw_gcb_is_not_a_line_start() {
+    // An emergency GCB is not necessarily a natural line-break opportunity. The
+    // ordinary constructor must reject it before a committed ticket exists.
     let mut prepared = Prepared::new(true);
     let mut raw = {
         let mut provider = prepared.store.borrow(&prepared.proof).unwrap();
@@ -193,16 +211,18 @@ fn actual_emergency_commit_survives_old_measure_drop_but_raw_gcb_is_not_a_line_s
                 MarkdownSoftLineMeasureBudget::default(),
             ),
             Err(MarkdownSoftLineMeasureError::InvalidRequest)
-        )); // 普通new仍要求自然机会；不能通过放宽At(None)让这项负控通过。
-    } // 结束同Store借用后才提交真实下一行，不把无资源的借用适配器当作析构收据。
+        )); // Keep the ordinary constructor's natural-opportunity contract intact.
+    } // End the provider borrow before the actual LineEnd commit.
     drop(raw);
     prepared.commit();
     let ticket = prepared.issue().unwrap();
     assert!(matches!(
         prepared.issue(),
         Err(MarkdownSoftLineMeasureError::InvalidRequest)
-    )); // 同一原Measure不可签第二份票，丢票也不会隐式重新授权。
+    )); // The original measure cannot issue a second ticket, even if the first is discarded.
     drop(prepared.measure.take());
+    // A committed ticket survives the original measure's destruction and permits
+    // genuine progress from that exact next-line position.
     let mut next = prepared
         .restart(ticket, prepared.end, prepared.cancellation.measure())
         .unwrap();
@@ -220,11 +240,13 @@ fn actual_emergency_commit_survives_old_measure_drop_but_raw_gcb_is_not_a_line_s
 
 #[test]
 fn uncommitted_selection_and_inexact_requested_start_cannot_issue_or_consume_a_ticket() {
+    // Neither an uncommitted selected GCB nor a nearby coordinate grants the
+    // original single-use start; both must fail without broadening its coverage.
     let mut uncommitted = Prepared::new(true);
     assert!(matches!(
         uncommitted.issue(),
         Err(MarkdownSoftLineMeasureError::InvalidRequest)
-    )); // 实际选择尚未写LineEnd，未提交GCB本身不产生下一行许可。
+    )); // No actual LineEnd has been written for this selection.
     let mut committed = Prepared::new(false);
     committed.commit();
     let ticket = committed.issue().unwrap();
@@ -236,6 +258,8 @@ fn uncommitted_selection_and_inexact_requested_start_cannot_issue_or_consume_a_t
 
 #[test]
 fn same_source_foreign_store_is_not_the_original_committed_line_family() {
+    // Persist equal-source glyphs in another actual writer. Its provider is still
+    // outside the original committed line family and may not consume that ticket.
     let mut prepared = Prepared::new(false);
     prepared.commit();
     let ticket = prepared.issue().unwrap();
@@ -265,6 +289,8 @@ fn same_source_foreign_store_is_not_the_original_committed_line_family() {
 
 #[test]
 fn a_different_false_cancel_bit_and_actual_cancellation_both_revoke_the_start() {
+    // First reject a different request identity while both cancel states are false,
+    // then independently prove revocation by cancelling the real original request.
     let mut different = Prepared::new(false);
     different.commit();
     let ticket = different.issue().unwrap();
@@ -275,7 +301,7 @@ fn a_different_false_cancel_bit_and_actual_cancellation_both_revoke_the_start() 
             MarkdownSoftLineMeasureCancellation::new()
         ),
         Err(MarkdownSoftLineMeasureError::SourceMismatch)
-    )); // 两个位当前都是false也不是同一个撤权请求。
+    )); // Equal current booleans are not the same revocation authority.
     let mut cancelled = Prepared::new(false);
     cancelled.commit();
     let ticket = cancelled.issue().unwrap();
@@ -301,6 +327,8 @@ fn a_different_false_cancel_bit_and_actual_cancellation_both_revoke_the_start() 
 
 #[test]
 fn a_later_real_line_end_prevents_an_old_ticket_from_reopening_its_start() {
+    // Advance the actual committed line family before consuming the older ticket;
+    // a stale coordinate must not reopen a line behind that real publication.
     let mut prepared = Prepared::new(false);
     prepared.commit();
     let ticket = prepared.issue().unwrap();
@@ -319,7 +347,7 @@ fn a_later_real_line_end_prevents_an_old_ticket_from_reopening_its_start() {
             },
         )
         .unwrap()
-    }; // 自然机会允许独立旧API创建此对照；不复制或手造原单次票。
+    }; // A natural opportunity permits this separate ordinary measure without copying the ticket.
     assert!(matches!(
         super::providers::selected(
             &mut next,
@@ -329,6 +357,8 @@ fn a_later_real_line_end_prevents_an_old_ticket_from_reopening_its_start() {
         ),
         MarkdownSoftLineMeasureChoice::MeasuredBreak(_)
     ));
+    // Append the next genuinely selected line, then try the still-unconsumed old
+    // ticket against the store's now-later committed boundary.
     let permit = {
         let mut provider = prepared.store.borrow(&prepared.proof).unwrap();
         next.selected_permit(&mut provider).unwrap()
@@ -347,6 +377,8 @@ fn a_later_real_line_end_prevents_an_old_ticket_from_reopening_its_start() {
 
 #[test]
 fn original_source_io_failure_precedes_cancel_and_all_real_resources_are_returned() {
+    // Keep the committed ticket after retiring its original measure. Consume the
+    // existing failure injection via actual source reclaim before later cancellation.
     let mut prepared = Prepared::new(false);
     prepared.commit();
     let ticket = prepared.issue().unwrap();
@@ -368,7 +400,7 @@ fn original_source_io_failure_precedes_cancel_and_all_real_resources_are_returne
             Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(
                 libc::EIO
             ))
-        ); // 故障必须发生在真实驻留页归还操作，而不是只设置未消费的测试标志。
+        ); // The existing EIO injection was consumed by real reclaim; it is not a natural kernel fault.
         prepared.cancellation.cancel();
         assert!(matches!(
             MarkdownSoftLineMeasureJob::after_selected_start(
@@ -389,6 +421,8 @@ fn original_source_io_failure_precedes_cancel_and_all_real_resources_are_returne
             ))
         ));
     }
+    // Release the whole fixture owner graph before checking real writer, source
+    // payload and mapping receipts; a consumed ticket alone proves no cleanup.
     drop(prepared);
     let released = observer.snapshot();
     assert!(!released.file_open && released.mapped_bytes == 0 && !released.cleanup_failed);

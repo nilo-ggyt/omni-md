@@ -1,4 +1,5 @@
-//! 原 Body 的有限选区与 Emoji 像素控制；真实 Scene、可见 GCB 和最终 Native 图分别核对。
+//! Exercise bounded selection/emoji pixels on the original Body. Check its actual
+//! Scene, visible grapheme geometry, and final Native output separately.
 
 use super::*;
 use crate::native_surface::paged_input::NativeMarkdownPagedInputOutcome;
@@ -6,7 +7,7 @@ use crate::native_surface::paged_text_view::{
     NativeMarkdownPagedScenePaintBudget, NativeMarkdownPagedScenePaintOutcome,
     NativeMarkdownPagedTextScene,
 };
-use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+use objc2_app_kit::NSPasteboardTypeString;
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo,
     kCGColorSpaceSRGB,
@@ -15,18 +16,21 @@ use objc2_core_graphics::{
 const WIDTH: usize = 720;
 const HEIGHT: usize = 348;
 
-/// 仅供本固定 viewport 的实际 RGBA，context 先于像素 Vec 析构，不进入产品或保存正文。
+/// Actual RGBA belongs only to this fixed viewport. Declaration order releases
+/// CGContext before its backing Vec; neither canvas nor document text enters product state.
 pub(super) struct Canvas {
     pub(super) context: CFRetained<CGContext>,
     pub(super) pixels: Vec<u8>,
 }
 impl Canvas {
-    /// 原多选控制沿用一个点对应一个像素；Emoji 对照另取窗口实际 backing scale。
+    /// Multiple-selection controls keep one pixel per point; emoji comparison uses
+    /// the window's actual backing scale separately.
     fn new(viewport: NSRect) -> Result<Self, String> {
         Self::scaled(viewport, 1.0)
     }
 
-    /// 像素对照采用真实 backing scale；只接受本合成窗口至多两倍的有限 RGBA 画布。
+    /// Accept only the synthetic window's bounded RGBA extent at up to 2x actual
+    /// backing scale, rejecting nonfinite or oversized geometry before allocation.
     pub(super) fn scaled(viewport: NSRect, scale: f64) -> Result<Self, String> {
         if !viewport.origin.x.is_finite()
             || !viewport.origin.y.is_finite()
@@ -37,15 +41,17 @@ impl Canvas {
         {
             return Err("原像素视口或实际 backing scale 超出固定合成画布".into());
         }
-        // 活动格的真实行高可以落在像素内部；与产品 CPU surface 一样向外取整，
-        // 保留原 scale、原点及精确 clip。不能把合法的亚像素视口改成整数点或裁掉末行。
+        // Actual cell heights may be fractional. Round outward like production
+        // CPU surfaces while preserving scale, origin, and precise clip, rather
+        // than snapping valid point geometry or clipping the final pixel row.
         let width = (viewport.size.width * scale).ceil() as usize;
         let height = (viewport.size.height * scale).ceil() as usize;
         let mut pixels = vec![0; width * height * 4];
-        // SAFETY: 系统公开 sRGB 静态名在本进程有效。
+        // SAFETY: The system's public static sRGB name is valid for this process.
         let space =
             CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB })).ok_or("缺少 sRGB")?;
-        // SAFETY: Vec 覆盖固定 RGBA8 的 stride*height；不 resize，字段顺序先释放 context。
+        // SAFETY: The Vec covers stride*height RGBA8 bytes and is never resized;
+        // field drop order releases the context before its borrowed pixel allocation.
         let context = unsafe {
             CGBitmapContextCreate(
                 pixels.as_mut_ptr().cast(),
@@ -58,7 +64,8 @@ impl Canvas {
             )
         }
         .ok_or("无法创建有限像素画布")?;
-        // 原 Scene、最终图和位置遮罩共用 Y-up 坐标与实际 scale，不猜行号或手动翻转像素。
+        // Scene, final image, and position masks share actual scale and Y-up
+        // coordinates, with no guessed line indexes or manual pixel flipping.
         CGContext::scale_ctm(Some(&context), scale, scale);
         CGContext::translate_ctm(Some(&context), -viewport.origin.x, -viewport.origin.y);
         CGContext::clip_to_rect(Some(&context), viewport);
@@ -66,12 +73,14 @@ impl Canvas {
     }
 }
 
-/// 选择色由独立 CG 实绘量化，不能把 0.7*255 的猜测整数当作实际 sRGB 输出。
+/// Quantize selection color through independent actual Core Graphics painting,
+/// never a guessed integer conversion of floating-point sRGB components.
 pub(super) fn selection_pixel() -> Result<[u8; 4], String> {
     let mut pixel = [0_u8; 4];
-    // SAFETY: 同上，系统静态 sRGB 名不从被测 Scene 借色表。
+    // SAFETY: The same system-static sRGB name provides no color data from the Scene under test.
     let space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB })).ok_or("缺少 sRGB")?;
-    // SAFETY: 四字节栈内单像素在 context 释放前有效；不让 Native claim 逃出此函数。
+    // SAFETY: The four-byte stack pixel outlives the context; no Native claim
+    // referencing this stack allocation escapes the function.
     let context = unsafe {
         CGBitmapContextCreate(
             pixel.as_mut_ptr().cast(),
@@ -84,17 +93,18 @@ pub(super) fn selection_pixel() -> Result<[u8; 4], String> {
         )
     }
     .ok_or("无法创建选择色对照")?;
-    CGContext::set_rgb_fill_color(Some(&context), 0.7, 0.8, 1.0, 1.0); // 固定 Rig 独立声明的选择色。
+    CGContext::set_rgb_fill_color(Some(&context), 0.7, 0.8, 1.0, 1.0); // Independently fixed Rig selection color.
     CGContext::fill_rect(
         Some(&context),
         NSRect::new(NSPoint::ZERO, NSSize::new(1.0, 1.0)),
     );
     CGContext::flush(Some(&context));
-    drop(context); // 归还 Native 对原栈内像素的全部访问权后才能返回实际字节。
+    drop(context); // Return all Native access to the stack pixel before returning its actual bytes.
     Ok(pixel)
 }
 
-/// 两项控制都消费原 Scene 的同一个有界绘制协议；只在真实完成票返回后读取像素。
+/// Both controls consume the original Scene's bounded paint protocol. Read pixels
+/// only after its actual completion receipt returns.
 pub(super) fn paint_scene(
     scene: Rc<dyn NativeMarkdownPagedTextScene>,
     key: &NativeMarkdownPagedSceneKey,
@@ -108,7 +118,8 @@ pub(super) fn paint_scene(
         .map_err(|cause| cause.to_string())?;
     let mut steps = 0;
     loop {
-        // 首轮只给一条 metadata，实际领取窗口后必须可让出；后继仍沿同一绘图游标完成原帧。
+        // One metadata record in the first step must permit yielding after actual
+        // window acquisition; subsequent steps continue the same original paint cursor.
         let budget = if steps == 0 {
             NativeMarkdownPagedScenePaintBudget {
                 glyphs: 1,
@@ -117,7 +128,8 @@ pub(super) fn paint_scene(
         } else {
             NativeMarkdownPagedScenePaintBudget::default()
         };
-        // 真实生产 session 每步继续原游标；绝不以一次无预算 paint 绕开原 bounded 路径。
+        // Continue the actual production session cursor; an unbudgeted paint call
+        // cannot substitute for this bounded path.
         let step = session
             .step(budget, current)
             .map_err(|cause| cause.to_string())?;
@@ -138,15 +150,16 @@ pub(super) fn paint_scene(
                 if !completion.permits(key, &actual.context) || completion.work().glyphs == 0 {
                     return Err("有限像素缺少原 context/Scene 的真实非空完成票".into());
                 }
-                break; // 原消费者签完成后才能检查像素，Pending 不发布部分图像成功。
+                break; // Only actual completion permits pixel inspection; Pending cannot publish partial-image success.
             }
         }
     }
     Ok(steps)
 }
 
-/// 同一真实Scene的同步图与每步1/1预算异步图逐像素核对，完成票还须真实归还原context。
-/// 此处不读取Scene内部Grid、游标或publication；只消费产品Scene接口及真实像素资源操作。
+/// Compare actual synchronous/1-glyph-1-metadata stepped painting pixel for pixel,
+/// and require the completion receipt to return its actual context claim. Use
+/// product Scene interfaces and real pixel resources, not private Grid/cursor/publication state.
 pub(super) fn exact_scene_rgba(
     scene: Rc<dyn NativeMarkdownPagedTextScene>,
     key: &NativeMarkdownPagedSceneKey,
@@ -156,7 +169,9 @@ pub(super) fn exact_scene_rgba(
     use crate::native_surface::viewport_pixels::{NativeMarkdownViewportPixels, TiledBitmap};
     let expected = Canvas::scaled(key.request.viewport, scale)?;
     let actual = Canvas::scaled(key.request.viewport, scale)?;
-    // 同步路径保原背景/选区循环，不调用新装饰游标；相同系统CG颜色与scale就是独立像素oracle。
+    // The synchronous path keeps its original background/selection loops rather
+    // than the stepped decoration cursor; equal system CG colors/scale provide
+    // an independent pixel comparison for the new stepped path.
     scene
         .paint(&expected.context, current)
         .map_err(|cause| cause.to_string())?;
@@ -178,7 +193,8 @@ pub(super) fn exact_scene_rgba(
         scene
             .validate_ready(current)
             .map_err(|cause| cause.to_string())?;
-        // 预算对应真实主线程让出；不能只核最终图相同而允许一个格先同步处理所有parts。
+        // Budgets require actual bounded main-thread work, not merely a matching
+        // final image after one cell synchronously processes all its parts.
         if step.work.glyphs > budget.glyphs
             || step.work.metadata_records > budget.metadata_records
             || started.elapsed() > Duration::from_secs(3)
@@ -191,7 +207,7 @@ pub(super) fn exact_scene_rgba(
                 if !completion.permits(key, &actual.context) || completion.work().glyphs == 0 {
                     return Err("真实Grid分步完成票丢失原Scene/context或实际字符绘制".into());
                 }
-                drop(completion); // 像素读取前归还游标与完成票的实际context强边。
+                drop(completion); // Return actual cursor/completion context claims before reading pixels.
                 break;
             }
         }
@@ -215,12 +231,14 @@ pub(super) fn exact_scene_rgba(
         ));
     }
 
-    // 同一Scene另外使用产品的真实首tile验证context归还，不能把Canvas字段drop顺序当作释放成功。
-    // 原prepare_tile只有Native context release callback完成后才能seal实际mmap，外部claim未归还就失败。
+    // Use this same Scene with an actual product tile to verify context release.
+    // Canvas field drop order alone cannot prove it. prepare_tile seals the real
+    // mmap only after its Native context-release callback, rejecting surviving external claims.
     let resources = std::sync::Arc::new(NativeMarkdownViewportPixels::default());
     let observer = resources.observer();
     let bitmap = TiledBitmap::new(
-        // 同一亚像素视口必须覆盖同一组外取整像素；不能在 context 归还控制里少分配边缘一行。
+        // Cover the same outward-rounded pixels for fractional viewports;
+        // context-release verification must not omit the edge row.
         (key.request.viewport.size.width * scale).ceil() as usize,
         (key.request.viewport.size.height * scale).ceil() as usize,
         resources,
@@ -228,7 +246,8 @@ pub(super) fn exact_scene_rgba(
     .map_err(|cause| cause.to_string())?;
     let tile = bitmap.next_tile().ok_or("真实Grid像素候选没有首tile")?;
     let writable = bitmap.begin_tile(tile).map_err(|cause| cause.to_string())?;
-    // 采用产品tile同一Y-up位置与真实scale；这个context只属于本函数尚未发布的实际候选。
+    // Use the product tile's same Y-up coordinates/actual scale. This context
+    // belongs only to this function's actual unpublished candidate.
     CGContext::scale_ctm(Some(writable.context()), scale, scale);
     CGContext::translate_ctm(
         Some(writable.context()),
@@ -260,7 +279,7 @@ pub(super) fn exact_scene_rgba(
     let prepared = bitmap
         .prepare_tile(writable)
         .map_err(|cause| cause.to_string())?;
-    drop(prepared); // 本资源对照不发布image；真实封存后的原mmap由生产owner立即归还。
+    drop(prepared); // This resource control publishes no image; the production owner returns the actual sealed mmap.
     drop(bitmap);
     scene
         .validate_ready(current)
@@ -277,6 +296,8 @@ pub(super) fn exact_scene_rgba(
     Ok(())
 }
 
+/// Independently mark both selected graphemes and their unselected gap, then
+/// compare actual selection/background pixels under the original Scene authority.
 fn paint(rig: &Rig, key: &NativeMarkdownPagedSceneKey) -> Result<(), String> {
     let scene = NativeMarkdownPagedTextViewDelegate::ready_scene(&*rig.body, &key.request)
         .map_err(|cause| cause.to_string())?;
@@ -292,7 +313,8 @@ fn paint(rig: &Rig, key: &NativeMarkdownPagedSceneKey) -> Result<(), String> {
         (fixture::LOCAL_SECOND, [0.0, 1.0, 0.0]),
         (20, [0.0, 0.0, 1.0]),
     ] {
-        // 几何来自同一真实 Scene 的首 GCB；独立三色 Native 遮罩只标位置，不复用其装饰代码。
+        // The same actual Scene supplies first-grapheme geometry. Independent
+        // three-color Native masks mark positions without sharing decoration code.
         let range = NSRange::new(position, 1);
         let first = scene.first_rect(range).map_err(|cause| cause.to_string())?;
         if first.actual_range != range
@@ -317,7 +339,8 @@ fn paint(rig: &Rig, key: &NativeMarkdownPagedSceneKey) -> Result<(), String> {
         .iter()
         .zip(mask.pixels.as_chunks::<4>().0)
     {
-        // 只统计 Native 遮罩内部的纯色像素，边缘抗锯齿不被当作正文选择或额外位置。
+        // Count solid interior mask pixels only, excluding antialiased edges from
+        // selection/background and position counts.
         let location = match *marker {
             [255, 0, 0, 255] => 0,
             [0, 255, 0, 255] => 1,
@@ -347,7 +370,8 @@ fn paint(rig: &Rig, key: &NativeMarkdownPagedSceneKey) -> Result<(), String> {
     Ok(())
 }
 
-/// 同一原Source票复制真实两个命中；只写本函数的唯一私有板，不变更选择或借另一Source读正文。
+/// Copy both actual matches under original Source authority to this function's
+/// unique private pasteboard, preserving selection and never reading another Source.
 fn copy_selected_source(rig: &Rig, key: &NativeMarkdownPagedSceneKey) -> Result<(), String> {
     let input = rig
         .body
@@ -391,14 +415,17 @@ fn copy_selected_source(rig: &Rig, key: &NativeMarkdownPagedSceneKey) -> Result<
             document.can_undo(),
             document.can_redo(),
         ))
-    }; // 只投影有限标量；每次原Doc Rc和Ref都在进入Native之前归还，不创建全文hash或String。
+    }; // Project bounded scalars only; return each document Rc/Ref before Native calls, without a full-document hash/String.
     let canonical = document_state()?;
-    let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+    // The parent can recover this exact owned name if this process aborts; the
+    // normal result path below still releases it before selection restoration.
+    let pasteboard = private_pasteboard()?;
     let result = autoreleasepool(|_| {
         rig.body
             .copy_source_selection_to(&key.request, &pasteboard)
             .map_err(|cause| cause.to_string())?;
-        // SAFETY: 系统常量具有进程寿命，与实际生产发布使用完全相同的标准纯文本类型。
+        // SAFETY: The process-lifetime system constant is the same standard plain-
+        // text type used by production publication.
         let string_type = unsafe { NSPasteboardTypeString };
         let data = pasteboard
             .dataForType(string_type)
@@ -407,7 +434,8 @@ fn copy_selected_source(rig: &Rig, key: &NativeMarkdownPagedSceneKey) -> Result<
         if data.length() != expected.len() {
             return Err("原多选复制长度不符，可能误复制了范围包络或整篇正文".into());
         }
-        // SAFETY: 本同步栈Retained持有完整NSData，只读固定13字节；期间没有任何修改data的消息。
+        // SAFETY: This synchronous stack retains the complete NSData; inspect the
+        // fixed 13 bytes without sending any message that mutates that data.
         if unsafe { data.as_bytes_unchecked() } != expected.as_bytes() {
             return Err("原多选复制未精确保留两个局部命中和中间单个换行".into());
         }
@@ -438,16 +466,19 @@ fn copy_selected_source(rig: &Rig, key: &NativeMarkdownPagedSceneKey) -> Result<
         );
         Ok(())
     });
-    // 只有唯一自有命名板才允许归还全局名称；成功/普通错误均先归还，保持后续原选择恢复流程。
-    // SAFETY: 本板由本函数在当前主线程创建，releaseGlobally公开方法无参数且返回void。
+    // Release only this unique owned pasteboard name on success or ordinary
+    // failure, before continuing original selection restoration.
+    // SAFETY: This function created the board on the current main thread;
+    // public releaseGlobally takes no arguments and returns void.
     unsafe {
         let _: () = objc2::msg_send![&*pasteboard, releaseGlobally];
     }
     result
 }
 
-/// 完整帧后比较固定 Emoji 的原 Scene RGBA 与当前实际 CALayer 输出；不独立认证整形。
-/// range 只接受本导航夹具中的“😀😀”或“😀中”，避免用无 Emoji 的空白区域证明保色。
+/// Compare the fixed emoji's original Scene RGBA with actual published CALayer
+/// output after complete-frame delivery. This is no independent shaping oracle;
+/// only the fixture's two-emoji or emoji/Chinese ranges are admitted, never blank pixels.
 pub(super) fn emoji_pixels(rig: &Rig, stage: &str, range: NSRange) -> Result<(), String> {
     let key = rig
         .view
@@ -469,7 +500,7 @@ pub(super) fn emoji_pixels(rig: &Rig, stage: &str, range: NSRange) -> Result<(),
             return Err("混合 Emoji 对照的实际后继字符不是原夹具的中".into());
         }
         1
-    }; // 每次只读取原选择的至多四个 UTF-16 units，不取得长段落或新 Source。
+    }; // Read at most four original selected UTF-16 units, never a paragraph or new Source.
     let paints = rig
         .view
         .cpu_paints()
@@ -507,7 +538,8 @@ pub(super) fn emoji_pixels(rig: &Rig, stage: &str, range: NSRange) -> Result<(),
         {
             return Err("原 Emoji 缺少同一可见 GCB 的真实非空框".into());
         }
-        // 框来自真实 glyph 几何；只用红/绿位置标记，不复制绘制颜色或猜 baseline。
+        // Actual glyph geometry supplies the rectangle; red/green mark location
+        // independently of painted colors and any guessed baseline.
         CGContext::set_rgb_fill_color(
             Some(&mask.context),
             if index == 0 { 1.0 } else { 0.0 },
@@ -521,13 +553,15 @@ pub(super) fn emoji_pixels(rig: &Rig, stage: &str, range: NSRange) -> Result<(),
             .map_err(|cause| cause.to_string())?;
     }
 
-    // 读取当前实际发布树；原 backing 必须只有 CPU mount，不能另建 LayerPool 代替产品输出。
+    // Inspect the actual published backing tree, which must have one CPU mount.
+    // A separately constructed layer pool cannot stand in for product output.
     let bounds = rig.view.bounds();
     let backing = rig.view.layer().ok_or("原 Emoji 视图没有实际 backing")?;
     scene
         .validate_ready(&current)
         .map_err(|cause| cause.to_string())?;
-    // SAFETY: 当前 key 对应的活主线程 backing 被本同步栈持有，只读其实际标准 CALayer 子关系。
+    // SAFETY: This stack retains the current key's live main-thread backing;
+    // observe only its actual public CALayer child relationships.
     let children = unsafe { backing.sublayers() }.ok_or("原 Emoji 没有实际挂载图")?;
     if children.len() != 1 {
         return Err("原 Emoji 的实际 backing 不再包含唯一 CPU 挂载点".into());
@@ -537,7 +571,8 @@ pub(super) fn emoji_pixels(rig: &Rig, stage: &str, range: NSRange) -> Result<(),
     if mount.frame() != bounds || mount.bounds() != local || !current() {
         return Err("原 Emoji 的实际挂载图与原有限视口坐标不符".into());
     }
-    // mount 自身坐标从零开始；恢复真实 view bounds 原点后沿同一 backing scale 渲染。
+    // Mount coordinates begin at zero. Restore the actual view-bounds origin,
+    // then render with the same backing scale.
     CGContext::translate_ctm(Some(&rendered.context), bounds.origin.x, bounds.origin.y);
     mount.renderInContext(&rendered.context);
     scene
@@ -566,15 +601,16 @@ pub(super) fn emoji_pixels(rig: &Rig, stage: &str, range: NSRange) -> Result<(),
         let index = match *marker {
             [255, 0, 0, 255] => 0,
             [0, 255, 0, 255] => 1,
-            _ => continue, // 只比较真实可见 Emoji 框，离屏正文和其他控件不进入该有限控制。
+            _ => continue, // Compare actual visible emoji rectangles only, excluding offscreen text and other controls.
         };
         locations[index] += 1;
-        // 固定😀必须含实际暖色像素；白底、蓝色选区及其黑字抗锯齿均不能满足红绿大于蓝。
+        // The fixed emoji must have actual warm pixels. White, blue selection,
+        // and antialiased black text cannot satisfy both red/green exceeding blue.
         let warm = |pixel: &[u8; 4]| pixel[3] != 0 && pixel[0] > pixel[2] && pixel[1] > pixel[2];
         colored[index] += usize::from(warm(expected));
         rendered_colored[index] += usize::from(warm(output));
         if expected != output && mismatch.is_none() {
-            mismatch = Some((pixel_index, *expected, *output)); // 保留首差异，不对像素容差或颜色做近似。
+            mismatch = Some((pixel_index, *expected, *output)); // Retain the first exact mismatch without color/tolerance approximation.
         }
     }
     scene
@@ -592,7 +628,7 @@ pub(super) fn emoji_pixels(rig: &Rig, stage: &str, range: NSRange) -> Result<(),
     println!(
         "native_body_find stage={stage} actual_emoji_range={range:?} actual_backing_scale={scale} bounded_paint_steps={steps} actual_visible_emoji_pixels={locations:?} actual_scene_warm_pixels={colored:?} actual_layer_warm_pixels={rendered_colored:?} exact_visible_rgba=true original_scene_and_published_layers=true independent_shaping_oracle=false whole_product=false formal=false"
     );
-    Ok(()) // 所有 Canvas、临时 Native claim 与 Scene 到此同步归还，不保存跨帧副本。
+    Ok(()) // Return all canvases, Native claims, and Scene synchronously, retaining no cross-frame copy.
 }
 
 pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
@@ -610,7 +646,7 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
         ) {
             return Err("原局部查询的 SelectAll 未同步完成真实多选".into());
         }
-        wait_frame("select_all_frame", &rig.body, frame)?; // 原三秒动作到完整帧门保持不变。
+        wait_frame("select_all_frame", &rig.body, frame)?; // Preserve the original three-second action-to-complete-frame gate.
         let key = rig
             .view
             .capture_ready_scene_key()
@@ -619,12 +655,14 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
             return Err("SelectAll 未保存两个原范围或创建了第二 Source".into());
         }
         paint(rig, &key)?;
-        copy_selected_source(rig, &key)?; // 同一完整帧下只读复制原两范围，不扰动后面的原单选恢复。
+        copy_selected_source(rig, &key)?; // Read both original ranges under the same complete frame without disrupting later restoration.
         rig.remember_receipt()
     })();
     let restored = (|| {
-        // 多选保留 Core 原 memento；直接 Next 会从原 2..4 跳到第二项，不能假定它从全文开头搜索。
-        // 这里只用原 Input 的显式目标合同设置下一测试起点；不声称修复未定向多选的文首导航。
+        // Multi-selection preserves Core's original memento. Next from 2..4 would
+        // select the second match rather than start at document beginning. Use the
+        // actual Input's explicit-target contract only to establish the next case's
+        // start, without claiming this verifies undirected multi-selection navigation.
         let frame = observe(&rig.body)?;
         {
             let input = rig
@@ -659,7 +697,7 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
             rig.view
                 .apply_find_commit(&input, &commit)
                 .map_err(|cause| cause.to_string())?;
-        } // 原 Input 的临时 Rc、permit 和提交载荷均在等待 Native 帧前归还。
+        } // Return temporary Input Rc, permit, and commit payload before waiting for the actual Native frame.
         wait_frame("select_all_restore_caret", &rig.body, frame)?;
         let restored = rig
             .view
@@ -669,7 +707,7 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
             return Err("多选测试恢复错误地建立第二 Source".into());
         }
         cases::local_first(rig)
-    })(); // 检查完成或失败都先归回原单选，不改后继完整事务的起点。
+    })(); // Restore original single selection on success or failure before the following transaction cases.
     result?;
     restored
 }

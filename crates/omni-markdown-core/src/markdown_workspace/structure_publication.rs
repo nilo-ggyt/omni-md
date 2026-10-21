@@ -1,9 +1,11 @@
-//! 结构操作的代次边界：首个可见变化立即撤权，所有rollback之后再封闭中途启动的扫描。
+//! Revoke workspace traversal at its first visible structural change and again
+//! after rollback, closing scans that started while the operation was in progress.
 
 use super::{MarkdownSessionAccess, MarkdownWorkspaceError};
 use std::cell::Cell;
 
-/// 必须先于文件/rollback guard声明，因而最后drop；只持借用与标量，不执行IO或Native。
+/// Declare before file/rollback guards so this owner drops last. It retains only
+/// a borrowed session and scalar facts, with no I/O or native object of its own.
 pub(super) struct WorkspaceStructurePublication<'session> {
     session: &'session MarkdownSessionAccess,
     invalidate_on_finish: Cell<bool>,
@@ -11,7 +13,8 @@ pub(super) struct WorkspaceStructurePublication<'session> {
 }
 
 impl<'session> WorkspaceStructurePublication<'session> {
-    /// 预校验、碰撞和no-op都保持未激活；它们不声称文件系统已经变化。
+    /// Start inactive: preflight rejection, collisions, and no-ops do not prove
+    /// that the filesystem collection actually changed.
     pub(super) fn new(session: &'session MarkdownSessionAccess) -> Self {
         Self {
             session,
@@ -20,37 +23,43 @@ impl<'session> WorkspaceStructurePublication<'session> {
         }
     }
 
-    /// 仅供取得文件的同一根约束校验，返回借用不持新文件或目录资源。
+    /// Lend the same confinement root to acquired-file validation without
+    /// opening another directory or creating a second resource owner.
     pub(super) fn canonical_root(&self) -> &std::path::Path {
         &self.session.canonical_root
     }
 
-    /// 在真实mkdir/open(O_EXCL)/rename/unlink成功后立即调用，任何后续?都不能漏撤。
+    /// Revoke immediately after actual mkdir, exclusive open, rename, or unlink,
+    /// before a later fallible stage can return without invalidating old pages.
     pub(super) fn changed(&self) {
         self.invalidate_on_finish.set(true);
         self.session.cancel_active_search();
     }
 
-    /// std::remove_dir_all错误不报告进度；通过纯保护后接受删除尝试时保守撤权。
-    /// 不声称失败无副作用时发生了mutation，也不为精确计数改写std防链接race的递归实现。
+    /// Standard recursive removal can fail after partial deletion without reporting
+    /// progress. Revoke conservatively after pure protection checks and before the
+    /// attempt; do not rewrite its link-race handling merely to count exact mutations.
     pub(super) fn recursive_delete_attempt(&self) {
         self.invalidate_on_finish.set(true);
         self.session.cancel_active_search();
     }
 
-    /// 不能证明当前文件仍属于本次完整写入时保留它；只记录失败，不在Drop里丢首因。
+    /// Retain files whose complete-write ownership cannot be proved. Record that
+    /// fact without letting Drop replace the operation's earlier failure.
     pub(super) fn rollback_unconfirmed(&self) {
         self.rollback_unconfirmed.set(true);
         self.changed();
     }
 
-    /// 所有文件guard必须先在私有操作闭包中析构，才能把清理状态并入原始Result。
+    /// Combine cleanup uncertainty with the original result only after all file
+    /// guards have finished inside the operation's private scope.
     pub(super) fn finish<T>(
         &self,
         result: Result<T, MarkdownWorkspaceError>,
     ) -> Result<T, MarkdownWorkspaceError> {
         if self.rollback_unconfirmed.get() {
-            // 仅不确定清理的失败路径分配Box；已发生的主错误保留为可检索source。
+            // Allocate only for unconfirmed cleanup. Preserve an existing operation
+            // failure as the inspectable source; absent one, report storage failure.
             let cause = result
                 .err()
                 .unwrap_or(MarkdownWorkspaceError::StorageUnavailable);
@@ -58,17 +67,19 @@ impl<'session> WorkspaceStructurePublication<'session> {
                 cause: Box::new(cause),
             })
         } else {
-            // 正常成功和已确认的回滚不改变原有返回类别。
+            // Successful operations and confirmed rollback retain their original result.
             result
         }
     }
 }
 
 impl Drop for WorkspaceStructurePublication<'_> {
+    /// Close scans started during mutation after every inner rollback owner ended.
     fn drop(&mut self) {
         if self.invalidate_on_finish.get() {
-            // 操作中途启动的worker可能观察过部分文件或即将rollback的名字，终态再撤一次。
-            // 原文件guard已先drop，成功/失败清理都不能恢复旧authority。
+            // A mid-operation worker may have observed a partial file or a name
+            // later rolled back. File guards have already ended; neither successful
+            // nor failed cleanup can restore that worker's obsolete authority.
             self.session.cancel_active_search();
         }
     }

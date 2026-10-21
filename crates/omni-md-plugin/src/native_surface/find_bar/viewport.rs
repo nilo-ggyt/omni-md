@@ -1,7 +1,8 @@
-//! 输入变化撤旧反馈与像素；原settled刷新同次生成有限计数、源范围与真实字面高亮。
+//! Input changes revoke old feedback and pixels. The original settled refresh
+//! produces bounded counts, source ranges, and actual literal highlights together.
 
 use super::*;
-/// 即时可见反馈共享同一有限窗口与结果上限，不随文稿长度增加工作。
+/// Immediate visible feedback shares fixed source/result budgets, independent of document length.
 pub(in crate::native_surface) const MAX_DECORATION_VIEWPORT_UNITS: usize = 16_384;
 pub(in crate::native_surface) const MAX_SPECIAL_CHARACTER_MARKERS: usize = 128;
 use omni_markdown_core::MarkdownDocumentBufferError;
@@ -9,7 +10,8 @@ use omni_markdown_core::markdown_find::{
     MarkdownLiteralFindOptions, visit_markdown_literal_matches_cancellable,
 };
 
-/// 一次原Scene准备中的两种真实来源；格只借窗口，canonical包络用于排序而不授匹配权限。
+/// Two actual sources in one original Scene preparation. Cells borrow their visible
+/// windows; a canonical envelope orders them but does not authorize searching that envelope.
 #[cfg(feature = "native-paged-production")]
 pub(in crate::native_surface) enum NativeMarkdownFindVisibleSource<'a> {
     Body(std::ops::Range<usize>),
@@ -19,7 +21,8 @@ pub(in crate::native_surface) enum NativeMarkdownFindVisibleSource<'a> {
     },
 }
 
-/// 显示窗口与canonical源是两个真实失败边界；交原Body映射时保留Source首错和原几何错误。
+/// Display-window and canonical-source failures are distinct boundaries. Preserve
+/// the first Source error and the original geometry error for the owning Body to map.
 #[cfg(feature = "native-paged-production")]
 pub(in crate::native_surface) enum NativeMarkdownPagedFindHighlightError {
     Source(MarkdownDocumentBufferError),
@@ -33,7 +36,8 @@ impl From<MarkdownDocumentBufferError> for NativeMarkdownPagedFindHighlightError
     }
 }
 
-/// 排队只保原bar/Doc弱身份和输入时的纯代次；不保存查询值、正文或Native强引用。
+/// Queued feedback retains original weak bar/document identities and input-time
+/// revisions, never query text, document contents, or strong Native references.
 #[derive(Clone)]
 pub(in crate::native_surface) struct NativeMarkdownFindViewportFeedback {
     bar: std::rc::Weak<NativeMarkdownFindBar>,
@@ -47,7 +51,8 @@ pub(in crate::native_surface) struct NativeMarkdownFindViewportFeedback {
 }
 
 impl NativeMarkdownFindViewportFeedback {
-    /// 原Doc由栏创建时固定；首个Native getter前捕获代次，不能等队列执行再领取当前Doc。
+    /// The bar fixes its document at creation. Capture its generation before any
+    /// Native getter; delayed execution cannot acquire the then-current document.
     pub(in crate::native_surface) fn capture(
         bar: &Rc<NativeMarkdownFindBar>,
         controller: &NativeMarkdownController,
@@ -69,7 +74,8 @@ impl NativeMarkdownFindViewportFeedback {
         request.current(controller).then_some(request)
     }
 
-    /// 检查只读取原Rust权限；不会为比较身份升级Native weak或借用Active Surface。
+    /// Check only original Rust authority; identity comparison neither upgrades a
+    /// Native weak reference nor borrows the active surface.
     pub(in crate::native_surface) fn current(&self, controller: &NativeMarkdownController) -> bool {
         std::ptr::from_ref(controller).addr() == self.owner
             && native_markdown_controller_has_foreground_authority(controller)
@@ -87,7 +93,8 @@ impl NativeMarkdownFindViewportFeedback {
                 .is_some_and(|document| document.borrow().generation() == self.generation)
     }
 
-    /// 新输入立即撤旧“找到/无结果/已替换”文案；原bar的借用在setter前已经结束。
+    /// Clear old result/replacement status immediately for new input. No bar-state
+    /// borrow remains when the native setter can reenter.
     pub(in crate::native_surface) fn clear(&self, controller: &NativeMarkdownController) {
         if self.current(controller)
             && let Some(bar) = self.bar.upgrade()
@@ -96,7 +103,8 @@ impl NativeMarkdownFindViewportFeedback {
         }
     }
 
-    /// 输入结束便交给原合并 executor；反馈回调不再先等一轮主队列才有机会申请几何刷新。
+    /// Hand completed input to the existing coalescing executor immediately; the
+    /// feedback callback need not wait another main-queue turn to request geometry.
     pub(in crate::native_surface) fn schedule_highlights(
         &self,
         controller: &NativeMarkdownController,
@@ -113,7 +121,8 @@ impl NativeMarkdownFindViewportFeedback {
         }
     }
 
-    /// 可见匹配由原 Scene 发布完成；输入反馈只校验正则语法，不创建临时正文图。
+    /// The original Scene publishes visible matches. Input feedback validates regex
+    /// syntax without creating a temporary document graph.
     pub(in crate::native_surface) fn run(&self, controller: &NativeMarkdownController) {
         if !self.current(controller) {
             return;
@@ -142,7 +151,8 @@ impl NativeMarkdownFindViewportFeedback {
         }
     }
 
-    /// 独立 TextKit 机制夹具借其已存在的实际图观察字面高亮，正式入口不调用此路径。
+    /// The independent TextKit fixture observes literal highlights through its own
+    /// existing actual graph. The production entry never calls this reference path.
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(in crate::native_surface) fn prepare_highlights(
         &self,
@@ -160,12 +170,14 @@ impl NativeMarkdownFindViewportFeedback {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.consume_status(bar, &|| self.current(controller), &error);
-                None // 原读取或几何失败不发布部分batch，保留原文字与显式查找能力。
+                // Read/geometry failure publishes no partial batch; original text and explicit Find remain usable.
+                None
             }
         }
     }
 
-    /// 查询只活本次刷新；Source直接使用原文，Preview只允许后续证明可见的语义区间。
+    /// Query text lives only for this refresh. Source uses original text; Preview
+    /// permits only semantic ranges subsequently proved visible.
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     fn read_highlight_matches(
         &self,
@@ -180,7 +192,8 @@ impl NativeMarkdownFindViewportFeedback {
         if !view.ivars().folds.matches_document(&document)
             || !WeakMarkdownDocument::ptr_eq(&self.document, &storage.ivars().document.borrow())
         {
-            return Ok(None); // 原Doc不能通过同generation数值借到另一图的可见范围。
+            // Equal generation numbers cannot authorize another graph's visible ranges.
+            return Ok(None);
         }
         let selection = view
             .ivars()
@@ -201,15 +214,19 @@ impl NativeMarkdownFindViewportFeedback {
                 && storage.ivars().font_run_scratch.epoch() == font_epoch
         };
         let Some(query) = read_visible_query(bar, &current)? else {
-            return Ok(None); // marked查询不能产生临时高亮，也不能读取候选值。
+            // A marked query provides neither candidate text nor temporary highlights.
+            return Ok(None);
         };
         if query.search.is_empty() {
             self.consume_status(bar, &current, "");
-            return Ok(None); // 空查询只保持空状态，没有零长枚举或自动选择。
+            // Empty input keeps empty feedback; do not enumerate zero-length matches or select text.
+            return Ok(None);
         }
         if query.regex {
-            // 仅即时验证同一ICU语法；任意lookaround可能依赖视口外源，不能在截断串上伪造匹配。
-            return Ok(None); // 语法反馈在原输入队列完成；这里不反复编译或冒称已有自动正则高亮。
+            // Lookaround can depend on source outside the viewport. Syntax feedback
+            // belongs to the original input queue; a clipped string cannot supply
+            // full-document semantics or justify automatic regex highlights here.
+            return Ok(None);
         }
         let length = document.borrow().utf16_len();
         if length == 0 {
@@ -219,7 +236,8 @@ impl NativeMarkdownFindViewportFeedback {
         let width = native_markdown_table_intent_step(&current, || view.bounds().size.width)
             .map_err(|_| "原查找宽度已变化")?;
         if range.is_empty() {
-            return Ok(None); // 没有已证明的可见源行时不能把未知范围说成“没有匹配”。
+            // No proved visible source range means unknown coverage, not a zero-match result.
+            return Ok(None);
         }
         let outcome = visible_literal_matches(
             &document.borrow(),
@@ -234,7 +252,8 @@ impl NativeMarkdownFindViewportFeedback {
             current,
         )
         .map_err(|cause| {
-            // 保留真实源错误作诊断；产品状态使用固定中文，不把系统英文或笔记内容拼入界面。
+            // Diagnose the actual source failure; fixed Chinese product status must
+            // not incorporate system English or note contents.
             eprintln!("native_find_viewport event=source_read_failed cause={cause}");
             "当前可见区域查找失败，请重试".to_owned()
         })?;
@@ -242,7 +261,8 @@ impl NativeMarkdownFindViewportFeedback {
             self.consume_status(bar, &current, &outcome.status());
         }
         if !current() {
-            return Ok(None); // 反馈setter重入后，旧源范围也失去生成实际几何的权限。
+            // Status-setter reentry can revoke the old ranges' geometry authority too.
+            return Ok(None);
         }
         Ok(Some(NativeMarkdownFindHighlightPreparation {
             ranges: outcome.ranges,
@@ -259,8 +279,9 @@ impl NativeMarkdownFindViewportFeedback {
         }))
     }
 
-    /// 分页发布只借有序的真实可见源域；所有行和格共用16K单元/128匹配，不给每格重领预算。
-    /// 查询只活本次调用。原Source读取错误保类型返回，不能洗成零匹配或成功反馈。
+    /// Paged publication borrows ordered actual visible source domains. All rows and
+    /// cells share 16K UTF-16 units and 128 matches rather than renewing per-cell budgets.
+    /// Query text is call-local. Return typed Source failures instead of zero/success feedback.
     #[cfg(feature = "native-paged-production")]
     pub(in crate::native_surface) fn prepare_paged_highlights(
         &self,
@@ -274,7 +295,8 @@ impl NativeMarkdownFindViewportFeedback {
         }
         let query = match read_visible_query(bar, current) {
             Ok(Some(query)) => query,
-            Ok(None) => return Ok(Box::new([])), // 真实marked输入既不读候选，也不沿旧查询留像素。
+            // Composition neither exposes candidates nor keeps pixels from an earlier query.
+            Ok(None) => return Ok(Box::new([])),
             Err(message) => {
                 self.consume_status(bar, current, &message);
                 return Ok(Box::new([]));
@@ -285,7 +307,9 @@ impl NativeMarkdownFindViewportFeedback {
             return Ok(Box::new([]));
         }
         if query.regex || sources.is_empty() {
-            return Ok(Box::new([])); // 正则只在原输入队列核语法；不能对截断视口执行lookaround冒充全文语义。
+            // Regex syntax belongs to the original input queue. Viewport-clipped
+            // lookaround must not pretend to implement whole-document semantics.
+            return Ok(Box::new([]));
         }
         let search = unquote(&query.search);
         let options = MarkdownLiteralFindOptions {
@@ -302,8 +326,10 @@ impl NativeMarkdownFindViewportFeedback {
         let mut remaining = MAX_DECORATION_VIEWPORT_UNITS;
         for (ordinal, source) in sources.iter().enumerate() {
             let maximum_units = remaining;
-            // 每个原raw连续域只匹配一次。格迭代器按同一remaining夹display末端，
-            // 只逐原sealed记录前进；不会先收齐巨格的全部raw片段或给每格重领16K额度。
+            // Match each original contiguous raw domain once. The cell iterator
+            // clips its display end to this shared remaining budget and advances
+            // sealed records incrementally; it never collects an enormous cell's
+            // raw fragments or grants each cell a fresh 16K allowance.
             let limited = {
                 let mut consume =
                     |range: std::ops::Range<usize>| -> Result<bool, MarkdownDocumentBufferError> {
@@ -347,7 +373,8 @@ impl NativeMarkdownFindViewportFeedback {
                             }
                             limited
                         } else {
-                            false // 同票下确实没有与clip相交的文字，不制造空显示源。
+                            // This ticket proves no text intersects the clip; invent no empty source.
+                            false
                         }
                     }
                 }
@@ -361,7 +388,8 @@ impl NativeMarkdownFindViewportFeedback {
         if current() {
             self.consume_status(bar, current, &outcome.status());
         }
-        // 重叠搜索仍按实际命中数反馈；绘图只覆盖匹配域的并集，避免同一像素叠两次半透明黄色。
+        // Report actual overlapping hits, but draw their union so translucent
+        // highlight paint does not accumulate twice over the same pixel.
         let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(outcome.ranges.len());
         for range in outcome.ranges {
             if let Some(last) = merged.last_mut()
@@ -375,7 +403,8 @@ impl NativeMarkdownFindViewportFeedback {
         Ok(merged.into_boxed_slice())
     }
 
-    /// 只有该次真实输入仍待反馈才发布文案；scroll/显式动作不重新领取状态写入权。
+    /// Publish status only while this actual input awaits feedback. Scrolling and
+    /// explicit actions cannot reacquire status-publication authority.
     fn consume_status(
         &self,
         bar: &NativeMarkdownFindBar,
@@ -386,11 +415,12 @@ impl NativeMarkdownFindViewportFeedback {
         write_viewport_status(bar, &pending, message);
         if pending() {
             bar.viewport_feedback_intent.set(None);
-        } // setter重入已经登记后继intent时，不能清掉后继pending。
+        } // Setter reentry may register a successor intent; never clear that pending feedback.
     }
 }
 
-/// 原查询的组合状态只读；每个Native getter之后继续核同一票，不提交或取消IME。
+/// Observe the original query's composition without committing/cancelling its IME.
+/// Every Native getter must retain the same original authority.
 fn read_visible_query(
     bar: &NativeMarkdownFindBar,
     current: &impl Fn() -> bool,
@@ -404,20 +434,23 @@ fn read_visible_query(
         if native_markdown_table_intent_step(current, || editor.hasMarkedText())
             .map_err(|_| "原查询输入已变化")?
         {
-            return Ok(None); // marked期间只撤旧像素，不读取候选查询。
+            // During composition revoke old pixels without reading the candidate query.
+            return Ok(None);
         }
     }
     Query::read_viewport(bar, current).map(Some)
 }
 
-/// 源范围只活本次settled准备；几何发布后不继续保存匹配表或查询串。
+/// Source ranges live only during this settled preparation. Geometry publication
+/// must not retain a match table or query string afterward.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(in crate::native_surface) struct NativeMarkdownFindHighlightPreparation {
     pub(in crate::native_surface) ranges: Vec<std::ops::Range<usize>>,
     pub(in crate::native_surface) batch: NativeMarkdownFindHighlightBatch,
 }
 
-/// 同一原装饰Vec拥有有限矩形和弱票；不持Doc、TextKit、查询文字或第二份布局。
+/// The existing decoration vector owns bounded rectangles and a weak ticket, not
+/// the document, TextKit objects, query text, or a second layout.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(in crate::native_surface) struct NativeMarkdownFindHighlightBatch {
     feedback: NativeMarkdownFindViewportFeedback,
@@ -432,7 +465,8 @@ pub(in crate::native_surface) struct NativeMarkdownFindHighlightBatch {
 
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownFindHighlightBatch {
-    /// 已准备矩形必须仍属于原栏、原Doc与原模式/字体/折叠/可见几何；绘制不枚举正文。
+    /// Prepared rectangles still require the original bar/document, presentation,
+    /// font, folds, and visible geometry. Drawing never enumerates document contents.
     pub(in crate::native_surface) fn current(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -446,7 +480,8 @@ impl NativeMarkdownFindHighlightBatch {
             && self.visible == visible
     }
 
-    /// 读取实际clip/宽度之前先核原业务票，避免Native getter给关闭或模式后的旧batch续权。
+    /// Validate original authority before reading actual clip/width. A Native
+    /// getter cannot renew a batch revoked by closure or a presentation change.
     pub(in crate::native_surface) fn authority_current(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -472,7 +507,8 @@ impl NativeMarkdownFindHighlightBatch {
             )
     }
 
-    /// 缓存比较包含真实原票及矩形；相同像素也不能保留另一query/Doc的过期授权。
+    /// Cache equality includes original authority and rectangles; equal pixels do
+    /// not authorize a stale batch from another query or document.
     pub(in crate::native_surface) fn same_geometry(&self, other: &Self) -> bool {
         std::rc::Weak::ptr_eq(&self.feedback.bar, &other.feedback.bar)
             && WeakMarkdownDocument::ptr_eq(&self.feedback.document, &other.feedback.document)
@@ -489,7 +525,8 @@ impl NativeMarkdownFindHighlightBatch {
     }
 }
 
-/// 字符串构造和setter分别核同一原viewport票，Native重入后不能覆盖后继输入或位置。
+/// String construction and the setter separately check the original viewport
+/// ticket, preventing Native reentry from overwriting successor input or position.
 fn write_viewport_status(bar: &NativeMarkdownFindBar, current: &impl Fn() -> bool, message: &str) {
     if let Ok(message) = native_markdown_table_intent_step(current, || NSString::from_str(message))
     {
@@ -497,7 +534,8 @@ fn write_viewport_status(bar: &NativeMarkdownFindBar, current: &impl Fn() -> boo
     }
 }
 
-/// 同次visitor交付计数与有限源范围，几何消费后归还；达到预算必须说明“部分/至少”。
+/// One visitor supplies counts and bounded source ranges, released after geometry
+/// consumption. Exhausted budgets must be reported as partial or at-least counts.
 #[derive(Debug, Eq, PartialEq)]
 struct VisibleLiteralMatches {
     count: usize,
@@ -507,7 +545,8 @@ struct VisibleLiteralMatches {
 }
 
 impl VisibleLiteralMatches {
-    /// 文案只描述当前真实范围，不能把预算耗尽或局部零结果提升成全局结论。
+    /// Describe actual current coverage; exhausted budgets or local zero matches
+    /// cannot establish a document-wide result.
     fn status(&self) -> String {
         if self.count_limited {
             format!("当前可见区域至少 {} 处匹配（已达反馈上限）", self.count)
@@ -519,7 +558,8 @@ impl VisibleLiteralMatches {
     }
 }
 
-/// 传原Doc范围给既有visitor；whole-word读取原真实邻接，不把截断窗口当作词边界。
+/// Pass original document ranges to the existing visitor. Whole-word matching reads
+/// actual source neighbors instead of treating a clipped window as a word boundary.
 fn visible_literal_matches(
     document: &MarkdownDocumentBuffer,
     search: &str,
@@ -549,9 +589,11 @@ fn visible_literal_matches(
         keep_searching,
         |found| {
             result.count += 1;
-            result.ranges.push(found.range_utf16); // 同一次visitor交付计数和坐标，几何不能重新扫描。
+            // Deliver counts and coordinates from the same visit; geometry must not rescan.
+            result.ranges.push(found.range_utf16);
             result.count_limited = result.count == maximum_matches;
-            Ok(!result.count_limited) // 精确总数未知时停止原visitor，不继续为了文案扫描更多源。
+            // Stop the original visitor at its budget; status text cannot justify scanning more source.
+            Ok(!result.count_limited)
         },
     )?;
     Ok(result)
@@ -561,7 +603,8 @@ fn visible_literal_matches(
 mod tests {
     use super::*;
 
-    /// 仅创建合成原文件；测试只借同一canonical，不初始化AppKit或建立全文Native镜像。
+    /// Open only a synthetic original file. Tests borrow the same canonical source,
+    /// without AppKit initialization or a full-document Native mirror.
     fn document(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("visible-find.md");
@@ -579,7 +622,8 @@ mod tests {
             ..MarkdownLiteralFindOptions::default()
         };
         for (query, range, count) in [("bar", 3..6, 0), ("foo", 0..3, 0), ("foo", 7..10, 1)] {
-            // 窗口边缘不是词边界：左右真实邻接能拒绝截断单词，完整末词仍应命中。
+            // Actual neighbors reject clipped words on either viewport edge while
+            // the complete trailing word remains searchable.
             let found = visible_literal_matches(
                 &document,
                 query,
@@ -594,7 +638,7 @@ mod tests {
             assert!(!found.count_limited);
         }
         assert_eq!(document.selection(), before);
-        assert_eq!(document.generation(), 0); // 可见反馈不得推进选区、编辑或历史代次。
+        assert_eq!(document.generation(), 0); // Visible feedback changes no selection, edit, or history generation.
     }
 
     #[test]
@@ -615,7 +659,7 @@ mod tests {
         assert!(!found.count_limited);
         assert!(found.status().contains("已检查部分"));
         assert_eq!(document.utf16_len(), MAX_DECORATION_VIEWPORT_UNITS + 3);
-        assert_eq!(document.generation(), 0); // cap位于emoji中间时只缩小读域，不截断或修改原文。
+        assert_eq!(document.generation(), 0); // A cap inside an emoji narrows the read, never the original text.
     }
 
     #[test]
@@ -633,7 +677,7 @@ mod tests {
         assert_eq!(found.count, MAX_SPECIAL_CHARACTER_MARKERS);
         assert!(found.count_limited);
         assert!(!found.source_limited);
-        assert!(found.status().contains("至少")); // 已早停就不能把128写成精确总数或全文匹配数。
+        assert!(found.status().contains("至少")); // Early stopping cannot turn 128 into an exact/global total.
         assert_eq!(document.generation(), 0);
     }
 
@@ -652,7 +696,7 @@ mod tests {
             result,
             Err(MarkdownDocumentBufferError::FindInterrupted)
         ));
-        assert_eq!(document.generation(), 0); // 新输入撤票是取消，不能洗成一次完整的“没有匹配”。
+        assert_eq!(document.generation(), 0); // Revocation is cancellation, not a completed zero-match search.
     }
 
     #[test]
@@ -674,7 +718,8 @@ mod tests {
                 || true,
             )
             .unwrap();
-            assert_eq!(found.ranges.as_slice(), ranges); // 几何必须消费Core交付的原UTF16坐标，不能把emoji当一个unit。
+            // Geometry consumes Core's original UTF-16 coordinates; an emoji is not one unit.
+            assert_eq!(found.ranges.as_slice(), ranges);
             assert_eq!(found.count, ranges.len());
         }
         assert_eq!(document.selection(), before);

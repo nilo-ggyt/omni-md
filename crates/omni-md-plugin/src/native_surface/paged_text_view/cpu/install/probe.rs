@@ -1,4 +1,5 @@
-//! 实际未发布安装的撤权控制；只自建短合成文稿与无窗口DirectView，不给外部对象故障注入权。
+//! Exercise actual unpublished-install revocation with a short synthetic document and windowless
+//! DirectView, without modifying external objects.
 
 use super::*;
 use objc2::rc::{Weak as NativeWeak, autoreleasepool};
@@ -22,14 +23,15 @@ impl NativeMarkdownPagedTextViewDelegate for Owner {
             return false;
         }
         let Ok(_inspecting) = PaintUse::enter(&self.inspecting) else {
-            return self.active.get(); // Nativegetter重入只读原活动位，不递归抓层，也不伪造另一条前台票。
+            return self.active.get(); // Getter reentry observes original activity only, without recursive layer inspection or another foreground ticket.
         };
         let weak = self.watched.borrow().clone();
         if !self.fired.get()
             && let Some(view) = weak.and_then(|weak| weak.load())
             && let Some(backing) = view.layer()
         {
-            // SAFETY: 这是本控制新建的DirectView，唯一子层只能来自正在执行的真实CPU安装。
+            // SAFETY: This control constructed the DirectView; its sole child can only come from the
+            // actual in-progress CPU installation.
             let children = unsafe { backing.sublayers() };
             if let Some(children) = children
                 && children.len() == 1
@@ -39,9 +41,9 @@ impl NativeMarkdownPagedTextViewDelegate for Owner {
                 self.observed.borrow_mut().extend(receipts);
                 self.fired.set(true);
                 if self.reparent {
-                    self.successor.addSublayer(&mount); // 真实移到不同owner；回滚不得再移除或清它的关系。
+                    self.successor.addSublayer(&mount); // Actually transfer to another owner; rollback must preserve that new parent relationship.
                 }
-                self.active.set(false); // 唯一故障发生在addSublayer已经真实完成后的原current回调。
+                self.active.set(false); // Revoke in the original current callback only after addSublayer actually completed.
             }
         }
         self.active.get()
@@ -62,7 +64,8 @@ impl NativeMarkdownPagedTextViewDelegate for Owner {
         Err(NativeMarkdownPagedTextViewError::Pending)
     }
     fn reveal_committed_selection(&self, _: &NativeMarkdownPagedInputCommit) -> Result<()> {
-        // 本有限组件没有正文Producer/reveal续体，不能把选择提交伪装成实际可见。
+        // This bounded component has no body Producer/reveal continuation; selection commit cannot
+        // claim actual visibility.
         Err(NativeMarkdownPagedTextViewError::Pending)
     }
     fn copy_selection(&self, _: &NativeMarkdownPagedSceneRequest) -> Result<()> {
@@ -70,7 +73,8 @@ impl NativeMarkdownPagedTextViewDelegate for Owner {
     }
 }
 
-/// 只运行两个有限自有图；失败仍清理并先发布真实资源事实，不增菜单、按键或产品窗口。
+/// Run two bounded owned graphs, reporting actual cleanup even on failure, without menus, keys, or
+/// product windows.
 pub(in crate::native_surface::paged_text_view) fn run(mtm: MainThreadMarker) -> Result<()> {
     for reparent in [false, true] {
         let (passed, observed, document_weak, input_weak, mapping) = autoreleasepool(
@@ -119,14 +123,15 @@ pub(in crate::native_surface::paged_text_view) fn run(mtm: MainThreadMarker) -> 
                 let installed = CpuSurface::install(&view);
                 let rejected = matches!(installed, Err(NativeMarkdownPagedTextViewError::Revoked));
                 if let Ok(surface) = installed {
-                    view.ivars().cpu.replace(Some(surface)); // 非预期成功也交给真实close清理，不能遗留无owner的mount。
+                    view.ivars().cpu.replace(Some(surface)); // Hand unexpected installation success to actual close cleanup rather than leaving an ownerless mount.
                 }
                 let detached = !view.wantsLayer() && view.layer().is_none();
                 let captured = owner.observed.borrow().len() == 2;
                 observed.extend(owner.observed.borrow_mut().drain(..));
                 let expected_mount = observed.last().and_then(NativeWeak::load);
                 let untouched = if reparent {
-                    // SAFETY: successor只由本控制持有；仅该回调向它迁入原mount，核数量和精确对象身份。
+                    // SAFETY: This control exclusively retains successor; the callback transferred the
+                    // original mount, whose exact count/identity are inspected.
                     let children = unsafe { owner.successor.sublayers() };
                     children.as_ref().is_some_and(|children| {
                         children.len() == 1
@@ -138,16 +143,17 @@ pub(in crate::native_surface::paged_text_view) fn run(mtm: MainThreadMarker) -> 
                 } else {
                     owner.successor.superlayer().is_none()
                 };
-                drop(expected_mount); // 临时Native强claim不能跨关闭后的Weak验收。
+                drop(expected_mount); // Temporary Native strong claims must end before post-close weak observations.
                 let passed = rejected && detached && untouched && captured && owner.fired.get();
                 println!(
                     "paged_cpu_installation reparent={reparent} revoked_after_actual_mount={} returned_revoked={rejected} original_backing_detached={detached} successor_parent_preserved={untouched} observed_mount_backing={captured} formal=false",
                     owner.fired.get()
                 );
-                // SAFETY: 对照owner自行归还迁入的关系；这不是被测安装guard的回滚动作。
+                // SAFETY: The control owner returns its transferred relationship; this is not the
+                // installation guard rollback under test.
                 unsafe { owner.successor.setSublayers(None) };
                 let watched = owner.watched.borrow_mut().take();
-                drop(watched); // Weak原生注销也在RefCell借用外，不让清理回调重入活动槽。
+                drop(watched); // Native weak unregistration also occurs outside RefCell borrowing so cleanup may reenter the active slot.
                 let close = view.begin_close()?;
                 let arrived = Rc::new(Cell::new(false));
                 let release_observed = Rc::clone(&arrived);
@@ -155,9 +161,10 @@ pub(in crate::native_surface::paged_text_view) fn run(mtm: MainThreadMarker) -> 
                     .ok_or(NativeMarkdownPagedTextViewError::Revoked)?;
                 close.when_released(move || {
                     release_observed.set(true);
-                    run_loop.stop(); // 原资源事件只结束本次交付，不保任何安装图或文档强边。
+                    run_loop.stop(); // The original resource event ends this delivery only, retaining no installation graph or document.
                 });
-                // SAFETY: 仅原main default mode有限3秒；未收到真实事件明确失败，不循环重试。
+                // SAFETY: Run the original main default mode for at most three seconds; absent actual
+                // completion fails without retry loops.
                 unsafe {
                     objc2_core_foundation::CFRunLoop::run_in_mode(
                         objc2_core_foundation::kCFRunLoopDefaultMode,
@@ -174,7 +181,7 @@ pub(in crate::native_surface::paged_text_view) fn run(mtm: MainThreadMarker) -> 
                     .verify_released()
                     .map_err(NativeMarkdownPagedTextViewError::Raster)?;
                 drop((context, view, input, erased, owner, document, file));
-                CATransaction::flush(); // 自有合成图全部归还后提交清空；不轮询Weak，不借后继业务清理旧图。
+                CATransaction::flush(); // Flush after returning owned synthetic graphs, without weak polling or using successor business work to clean old graphs.
                 Ok((passed, observed, document_weak, input_weak, mapping))
             },
         )?;

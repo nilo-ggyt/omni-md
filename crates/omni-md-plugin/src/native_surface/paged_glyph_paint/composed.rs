@@ -1,4 +1,5 @@
-//! 唯一已封存行目录的有界绘制；任何Native调用与重入检查都在Reader借用之外。
+//! Draw bounded batches from the one sealed line directory. All Native calls
+//! and reentrant frontend checks occur outside the Reader borrow.
 
 use std::cell::RefCell;
 
@@ -14,7 +15,8 @@ use super::{
     NativeMarkdownPagedGlyphPaintRequest, PreparedBatch, Result, batch_count, validate_native_font,
 };
 
-/// 有界空批只检查原输出/part/Source/Font；借用归还以后才允许运行可重入的current。
+/// An empty bounded batch authenticates original output/part/Source/font. Return
+/// its borrow before the reentrant current predicate can run again.
 fn require(
     output: &RefCell<MarkdownComposedLines>,
     part: &MarkdownComposedLinePart,
@@ -27,21 +29,23 @@ fn require(
             .permits(&request.native_font.core_font().authority())
     {
         return Err(Cause::InvalidGlyph);
-    } // 同名或同字号的新capture没有原目录的Font身份，不能解释它的glyph编号。
+    } // Equal font names/sizes do not grant the original directory's glyph identity.
     let mut lines = output.try_borrow_mut().map_err(|_| Cause::OutputBusy)?;
     lines.require(request.source)?;
     lines.read_batch(part, 0..0, &mut [])?;
     Ok(())
 }
 
-/// 一个同步调用只画一个真实part的≤256个字形；不会跨part推断来源或临时排版。
-///
-/// `output`必须是原组合器完整封存的唯一Reader，`part`必须由它真实LineEnd产生。
-/// `origin`已包含该part之前的实际视觉pen；调用者负责同票clip、装饰和候选像素发布。
-/// 所有Err均丢弃本轮候选；draw已经返回时错误保留实际绘制事实，不许重放编辑。
+/// One synchronous call draws a finite batch from one actual part, without
+/// inferring cross-part source or laying text out. Output is the original
+/// composer's sole sealed Reader; part comes from its actual LineEnd. Origin
+/// includes the preceding actual visual pen. The caller owns same-ticket clip,
+/// decorations, and candidate publication. Err discards the candidate; an actual
+/// returned draw remains recorded and grants no right to replay an edit.
 ///
 /// # Errors
-/// 失权、重入借用、来源/Font/part不符、批次或坐标无效以及真实IO失败均整批拒绝。
+/// Reject revoked authority, reentrant borrowing, mismatched Source/font/part,
+/// invalid batch/coordinates, and actual IO failure as whole-batch failures.
 pub fn paint_composed_glyphs(
     output: &RefCell<MarkdownComposedLines>,
     part: &MarkdownComposedLinePart,
@@ -59,11 +63,11 @@ pub fn paint_composed_glyphs(
             if !current() {
                 return Err(Cause::Revoked);
             }
-            require(output, part, &request) // 后一次current也可能撤Source或Font；不能用较新的票补签。
+            require(output, part, &request) // A later current call may revoke Source/font; never replace the original ticket.
         };
         check()?;
         if part.facts().kind != MarkdownComposedLinePartKind::Glyphs {
-            return Err(Cause::NonGlyphPart); // Tab和段分隔符只贡献真实布局，不向CTFont提交.notdef。
+            return Err(Cause::NonGlyphPart); // Tabs/break controls supply layout, never a synthetic .notdef draw.
         }
         let count = batch_count(&request.glyph_range)?;
         if !request
@@ -83,16 +87,17 @@ pub fn paint_composed_glyphs(
             y_offset: 0,
         }; NATIVE_MARKDOWN_PAGED_GLYPH_BATCH];
         {
-            // 这里仅执行纯Core pread；不调用current、Native getter或delegate。
+            // Execute Core-only pread here. No current callback, Native getter,
+            // or delegate may reenter while this original Reader borrow is live.
             let mut lines = output.try_borrow_mut().map_err(|_| Cause::OutputBusy)?;
             lines.require(request.source)?;
             lines.read_batch(part, request.glyph_range.clone(), &mut records[..count])?;
         }
-        check()?; // 固定栈候选已完整读取；若重入撤权，不向Native发布任何成功前缀。
+        check()?; // The complete fixed-stack read still needs original authority before Native sees it.
         let mut batch = PreparedBatch::new(&request, part.facts().source_utf16.clone());
         for glyph in records[..count].iter().copied() {
             batch.push(&request, glyph)?;
-        } // 与旧Job/spool共用全部glyph编号、26.6、offset和advance验证。
+        } // Share Job/spool's actual glyph ID, fixed-point offset, and advance validation.
         batch.draw(&request, context, &mut check, &mut native_draw_returned)
     })();
     result.map_err(|cause| NativeMarkdownPagedGlyphPaintError {

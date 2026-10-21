@@ -1,4 +1,5 @@
-//! 正式worker的不可消费前缀交付；快照只读旧LineEnd，producer仍从原cursor继续。
+//! Publish a prefix without consuming the production worker. Its snapshot reads
+//! only the original sealed LineEnd while the producer continues the same cursor.
 
 use super::{engine::composer, *};
 use crate::MarkdownShapedGlyph;
@@ -17,6 +18,8 @@ fn next_line(
     worker: &mut MarkdownLineComposer,
     font: &MarkdownLineRegisteredFont,
 ) -> Option<MarkdownComposedLineFacts> {
+    // Advance the actual original composition/response chain until a committed line
+    // or real completion, without constructing a Store or a publication identity.
     for _ in 0..100_000 {
         match worker.step(budget()).unwrap().answer {
             MarkdownLineComposeAnswer::Yielded => {}
@@ -42,8 +45,9 @@ fn plain_selection_change_keeps_real_glyph_prefix_and_continues_fresh_publicatio
         MarkdownOrdinarySemanticState, MarkdownTextSelection, MarkdownViewportSourceAuthority,
     };
 
-    // 同一真实文档先完成语义，再产生可读字形。选择改变只在已经证明无 inline
-    // 特殊字符的范围内发生；仍沿正式工厂和真实源，不构造能力或直接修改组合器状态。
+    // Prepare actual semantics and readable glyphs from one real document first.
+    // Selection changes only inside a proven plain range. Original factories/Source
+    // issue all capabilities; no private composer state is manufactured.
     let text = "office abc office xyz ".repeat(20);
     let mut fixture = Fixture::new(&text);
     let backing = fixture.source.original_backing_observer().unwrap();
@@ -104,8 +108,10 @@ fn plain_selection_change_keeps_real_glyph_prefix_and_continues_fresh_publicatio
     };
     fixture.document.set_selection(changed).unwrap();
     {
-        // 原普通 item 已为测量预取后文；可见首行仍落在64字符内，也不能把这64字符
-        // 语义证明扩成整段。能力拒绝后原出版物必须还能沿真正的旧选择继续推进。
+        // The original item prefetched later text for Measure. A visible first
+        // line inside 64 characters does not extend that finite semantic proof to
+        // the paragraph. After refusal, restore the real original selection so its
+        // same publication can continue normal forward preparation.
         assert!(first.source_utf16.end <= 64);
         let capability = request
             .selection_style_invariant(&fixture.document, &previous, authority(&fixture.document))
@@ -149,7 +155,8 @@ fn plain_selection_change_keeps_real_glyph_prefix_and_continues_fresh_publicatio
             )
             .unwrap()
     );
-    // 退休的是旧出版物自身：即使选回旧 anchor/head，它也不能重新授权旧语义。
+    // Retire the old publication itself. Returning to equal anchor/head coordinates
+    // cannot revive its superseded semantic authority.
     fixture.document.set_selection(original).unwrap();
     assert!(matches!(
         previous.ordinary_semantics_for(&fixture.document, authority(&fixture.document)),
@@ -165,7 +172,8 @@ fn plain_selection_change_keeps_real_glyph_prefix_and_continues_fresh_publicatio
         .unwrap()
         .unwrap();
 
-    // 同 Store 重新发布独立 Reader；完整字形必须不变，而旧弱 Line 不能混入新输出。
+    // The same Store publishes an independent reader with identical actual glyphs.
+    // An old weak Line must not be accepted by that new output identity.
     let mut fresh = worker.publish_ready_prefix().unwrap().unwrap();
     let fresh_receipt = fresh.resource_observer();
     let line = fresh.last_line().unwrap().unwrap();
@@ -180,7 +188,8 @@ fn plain_selection_change_keeps_real_glyph_prefix_and_continues_fresh_publicatio
         fresh.part(&old_line, 0),
         Err(MarkdownLineComposeError::SourceMismatch)
     ));
-    // 外来弱 Line 的真实错误会退休该 Reader；不能再用已失败输出继续读取或伪报正常 close。
+    // This actual foreign-Line error retires that reader. Do not continue reading
+    // the failed output or report a normal explicit close for it.
     drop(fresh);
     assert!(!fresh_receipt.snapshot().file_open);
     let second = next_line(&mut worker, &font).unwrap();
@@ -214,8 +223,9 @@ fn root_code_selection_keeps_preceding_real_glyphs_with_fresh_output_authority()
     use crate::markdown_document_buffer::MarkdownTableRequestError;
     use crate::{MarkdownTextSelection, MarkdownViewportSourceAuthority};
 
-    // 真正有限语义窗只在后方Code正文。已发布字形和完整自然项却在前方普通段落，
-    // 这覆盖“保838行前缀”所需的跨owner证明，不能把能力收缩为Code body内的交集。
+    // The actual finite semantic window lies in later Code body while published
+    // glyphs/the complete natural item lie in preceding plain text. This proves
+    // cross-owner prefix retention rather than merely a Code-body intersection.
     let prefix = "office abc office xyz ".repeat(20);
     let text = format!("{prefix}\n\n```text\nliteral alpha omega\n```\n");
     let first = text.find("literal").unwrap();
@@ -269,8 +279,9 @@ fn root_code_selection_keeps_preceding_real_glyphs_with_fresh_output_authority()
         .unwrap();
     assert!(expected.iter().all(|glyph| glyph.glyph_id != 0));
 
-    // 选择移到同一Code正文另一词，真正SourceRequest负责核Root/scope/body和完整选择。
-    // Composer仍核其自己的静止阶段、Font和全部ahead支持；测试不修改Store或构造能力。
+    // Move selection to another real word in the same Code body. SourceRequest
+    // checks original root/scope/body/full selection; composer separately verifies
+    // its quiescent boundary, fonts, and all ahead support. No Store is mutated.
     let changed = MarkdownTextSelection {
         anchor_utf16: second + 3,
         head_utf16: second,
@@ -308,8 +319,9 @@ fn root_code_selection_keeps_preceding_real_glyphs_with_fresh_output_authority()
         .unwrap()
         .unwrap();
 
-    // 同一个writer重新发布的Reader必须读到逐glyph相同结果，但不能接受旧弱Line身份。
-    // 只比较真实公开输出，不靠保留次数、内部目录或旧Reader仍可读来冒充正确复用。
+    // A new reader from the same writer must return identical glyph records but
+    // reject old weak Line identity. Public output proves reuse; retention counts,
+    // private directories, or an old reader staying readable do not establish it.
     let mut fresh = worker.publish_ready_prefix().unwrap().unwrap();
     let fresh_receipt = fresh.resource_observer();
     let line = fresh.last_line().unwrap().unwrap();
@@ -370,9 +382,10 @@ fn committed_prefixes_survive_append_and_normal_writer_close_with_independent_fd
     assert_eq!(old.source_range(), first.source_utf16);
     assert_eq!(old_receipt.snapshot().mapped_bytes, 0);
     assert!(old_receipt.snapshot().file_open);
-    assert_eq!(writer_receipt.snapshot().mapped_bytes, 0); // 发布确实checkpoint原页，不是假Reader零映射。
+    assert_eq!(writer_receipt.snapshot().mapped_bytes, 0); // Actual publication checkpointed the writer page.
 
-    // 后继LineEnd真实追加到同文件；旧reader的last/count与逻辑EOF不能随inode长度变大。
+    // Actual later LineEnds append to the same file. Growing its inode cannot
+    // extend an old reader's sealed last/count or logical EOF.
     let second = next_line(&mut worker, &font).unwrap();
     assert_eq!(second.source_utf16.start, first.source_utf16.end);
     let mut candidate = worker.publish_ready_prefix().unwrap().unwrap();
@@ -397,7 +410,8 @@ fn committed_prefixes_survive_append_and_normal_writer_close_with_independent_fd
     let newer_receipt = newer.resource_observer();
     assert_eq!(newer.source_range().end, third.source_utf16.end);
 
-    // writer正常终结不撤已发布的不可变reader；真实源一直由这些值持有到最后close。
+    // Normal writer retirement preserves already published immutable readers.
+    // Their actual Source claims remain alive until the final explicit close.
     while next_line(&mut worker, &font).is_some() {}
     let final_output = worker.into_output().unwrap();
     let final_receipt = final_output.resource_observer();
@@ -437,7 +451,7 @@ fn each_prefix_has_fresh_output_authority_and_cancel_revokes_worker_and_old_read
         second.part(&line, 0),
         Err(MarkdownLineComposeError::SourceMismatch)
     ));
-    assert!(!receipt.snapshot().file_open); // 错用只归还该reader，健康writer及另一份输出仍有效。
+    assert!(!receipt.snapshot().file_open); // Retire only the misused reader; other real owners stay healthy.
     first.last_line().unwrap().unwrap();
     let replacement = worker.publish_ready_prefix().unwrap().unwrap();
     cancellation.cancel();
@@ -462,7 +476,9 @@ fn source_first_error_overrides_reader_backpressure_and_old_prefix_cache_hits() 
     let first_receipt = first.resource_observer();
     let second_receipt = second.resource_observer();
     first.last_line().unwrap().unwrap();
-    // 从同一个真实Backing装页后触发实际回收；不是仅把输出权限位改成失败。
+    // Make a real original backing page resident, then exercise reclaim with the
+    // existing EIO injection. No private output permission is flipped; this is not
+    // a naturally induced kernel failure.
     fixture.source.visit_byte_range(0..1, |_| Ok(())).unwrap();
     fixture.document.fail_next_original_reclaim_for_test();
     assert!(matches!(
@@ -474,7 +490,7 @@ fn source_first_error_overrides_reader_backpressure_and_old_prefix_cache_hits() 
         Err(MarkdownLineComposeError::Source(
             crate::MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
         ))
-    )); // 名额仍满时也不能用SnapshotBusy掩盖原Source首错。
+    )); // Full reader slots cannot disguise original Source failure as SnapshotBusy.
     assert!(matches!(
         first.last_line(),
         Err(MarkdownLineComposeError::Source(

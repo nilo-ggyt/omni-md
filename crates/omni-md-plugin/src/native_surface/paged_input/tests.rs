@@ -1,4 +1,4 @@
-//! 直接运行生产事务适配器和真实Core文档；没有NSApplication、隐藏输入图或伪几何。
+//! Exercise production transaction adapters with real Core documents, without NSApplication, hidden input storage, or synthetic geometry.
 
 use super::*;
 use std::io::Write;
@@ -12,6 +12,8 @@ mod replacements;
 mod selection_ranges;
 mod source_commands;
 
+// Own the private file and canonical allocation together. The caller keeps the
+// file alive while exercising production mmap/edit/history APIs against it.
 fn fixture(
     text: &str,
     maximum: u64,
@@ -24,7 +26,7 @@ fn fixture(
 
 fn text(document: &RefCell<MarkdownDocumentBuffer>) -> String {
     let document = document.borrow();
-    assert!(document.utf16_len() <= 256); // 仅此短控制允许完整oracle，生产API没有正文镜像入口。
+    assert!(document.utf16_len() <= 256); // Only this bounded short fixture materializes an oracle; production exposes no full-text mirror API.
     let mut units = [0; 256];
     let length = document.utf16_len();
     document
@@ -34,6 +36,8 @@ fn text(document: &RefCell<MarkdownDocumentBuffer>) -> String {
 }
 
 fn unspecified() -> NSRange {
+    // Use the actual AppKit sentinel so replacement precedence is exercised by
+    // production code instead of selecting a range in this fixture helper.
     NSRange::new(NSNotFound as usize, 0)
 }
 
@@ -79,6 +83,8 @@ fn selection_publication_preserves_generation_bytes_history_and_rejects_split_sc
 }
 
 fn committed(outcome: NativeMarkdownPagedInputOutcome) -> NativeMarkdownPagedInputCommit {
+    // These callers expect a user-visible change; an unchanged result is not a
+    // substitute for checking the actual commit receipt and canonical data.
     match outcome {
         NativeMarkdownPagedInputOutcome::Committed(commit) => commit,
         NativeMarkdownPagedInputOutcome::Unchanged(_) => panic!("真实变化没有返回提交收据"),
@@ -96,7 +102,7 @@ fn empty_ime_commit_keeps_original_complete_input_and_existing_folds() {
             let permit = owner.capture(1, &current).unwrap();
             committed(owner.toggle_fold(&permit, 0, &current).unwrap());
         }
-        // 模拟IME的空提交仍经过公开生产prepare/publish，不能靠跳过Core健康检查伪造无变化。
+        // Submit empty IME-style input through public preparation/publication so unchanged still requires Core health checks.
         let before = owner.state().unwrap();
         let permit = owner.capture(1, &current).unwrap();
         let folds = owner.folded_layout_ranges(&permit, &current).unwrap();
@@ -146,7 +152,7 @@ fn empty_text_deletes_actual_selection_or_marked_range() {
                     .unwrap(),
             );
         }
-        // 空载荷并不等于空操作；原选区和真实marked都必须被删除且保留真实历史。
+        // An empty payload is not necessarily a no-op: delete an actual selection/marked range and preserve its history.
         let before = owner.state().unwrap();
         let permit = owner.capture(1, &current).unwrap();
         let receipt = owner
@@ -173,13 +179,13 @@ fn empty_explicit_replacement_preserves_secondary_range_semantics() {
     );
     let before = owner.state().unwrap();
     let permit = owner.capture(1, &current).unwrap();
-    // 未指定范围仍拒绝多选歧义；显式次范围则真正删除，不能拿未变化的主caret吞掉它。
+    // An unspecified range remains ambiguous; explicit secondary deletion must not disappear behind an unchanged primary caret.
     assert!(matches!(
         owner.insert_text(&permit, "", unspecified(), &current),
         Err(NativeMarkdownPagedInputError::MultipleSelectionInput)
     ));
     assert_eq!(owner.state().unwrap(), before);
-    // 显式范围是下一次独立输入请求，不能重放已由歧义拒绝消费的一次性许可。
+    // The explicit range is a new input request, not reuse of the one-shot permit consumed by ambiguity rejection.
     let permit = owner.capture(1, &current).unwrap();
     let receipt = owner
         .insert_text(&permit, "", NSRange::new(2, 1), &current)
@@ -222,6 +228,8 @@ fn chinese_emoji_marked_replacement_and_history_use_real_core_transactions() {
     );
     first.check_current(&current).unwrap();
 
+    // A new foreground epoch does not change composition ownership. Update the
+    // original marked range, then confirm it through a new one-shot callback.
     epoch.set(2);
     let permit = owner.capture(2, &current).unwrap();
     let second = owner
@@ -251,6 +259,8 @@ fn chinese_emoji_marked_replacement_and_history_use_real_core_transactions() {
         Err(NativeMarkdownPagedInputError::Consumed)
     ));
 
+    // Undo the whole composition once, including its initial caret. Redo must
+    // restore actual final text/selection without reviving an IME session.
     epoch.set(4);
     let permit = owner.capture(4, &current).unwrap();
     let undo = committed(
@@ -260,14 +270,14 @@ fn chinese_emoji_marked_replacement_and_history_use_real_core_transactions() {
     );
     assert_eq!(text(&document), "首尾");
     assert_eq!(undo.state.selection, MarkdownTextSelection::caret(1));
-    assert_eq!(undo.state.marked, None); // 历史恢复正文和选择，不伪造重新开始的输入法会话。
+    assert_eq!(undo.state.marked, None); // History restores text/selection without inventing a restarted IME session.
     let permit = owner.capture(4, &current).unwrap();
     assert!(matches!(
         owner
             .history(&permit, NativeMarkdownPagedInputHistory::Undo, &current)
             .unwrap(),
         NativeMarkdownPagedInputOutcome::Unchanged(_)
-    )); // 同一实际组合的多次候选和确认只占一笔历史。
+    )); // Candidate updates and confirmation of one composition occupy one history entry.
     epoch.set(5);
     let permit = owner.capture(5, &current).unwrap();
     let redo = committed(
@@ -299,6 +309,8 @@ fn unmark_preserves_source_generation_lengths_history_and_actual_mapping() {
             &current,
         )
         .unwrap();
+    // Unmark is a metadata/group-completion action. Capture actual document and
+    // mapping facts before it, then ensure no additional text transaction appears.
     let before = owner.state().unwrap();
     let source = document.borrow().original_backing_observer().unwrap();
     let original_mapping = source.mapped_bytes();
@@ -343,7 +355,7 @@ fn unmark_preserves_source_generation_lengths_history_and_actual_mapping() {
             .history(&permit, NativeMarkdownPagedInputHistory::Undo, &current)
             .unwrap(),
     );
-    assert_eq!(text(&document), "首"); // unmark没有插入一条需要先Undo的假空历史。
+    assert_eq!(text(&document), "首"); // Unmark adds no empty history entry that would require a preliminary Undo.
     let permit = owner.capture(7, &current).unwrap();
     assert!(matches!(
         owner
@@ -360,6 +372,8 @@ fn rejected_unicode_capacity_and_stale_permissions_keep_original_state() {
     let epoch = Cell::new(1);
     let current = |expected| expected == epoch.get();
     let before = owner.state().unwrap();
+    // Relative marked selection must end on scalar boundaries, while replacement
+    // endpoints and live-byte capacity are independently enforced by Core.
     let permit = owner.capture(1, &current).unwrap();
     assert!(matches!(
         owner.set_marked_text(&permit, "🙂", NSRange::new(1, 0), unspecified(), &current),
@@ -414,7 +428,7 @@ fn rejected_marked_replacement_preserves_the_existing_composition_and_history() 
             )
             .is_err()
     );
-    // 真实容量错误发生在原候选发布之前；先前marked和方向选择不能被失败输入清掉。
+    // Capacity failure precedes candidate publication; failed input must retain the previous marked range and directed selection.
     assert_eq!(owner.state().unwrap(), before);
     assert_eq!(text(&document), "中🙂首");
     assert!(!document.borrow().has_prepared_text_input());
@@ -426,7 +440,7 @@ fn rejected_marked_replacement_preserves_the_existing_composition_and_history() 
             .history(&permit, NativeMarkdownPagedInputHistory::Undo, &current)
             .unwrap(),
     );
-    assert_eq!(text(&document), "首"); // 失败替换没有在原marked之前或之后插入另一条历史。
+    assert_eq!(text(&document), "首"); // Failed replacement adds no history entry before or after the original composition.
 }
 
 #[test]
@@ -437,7 +451,7 @@ fn reentrant_permission_after_prepare_cancels_only_its_original_nonce() {
     let checks_during_mutation = Cell::new(0);
     let current = |epoch| {
         assert_eq!(epoch, 11);
-        // 真实回调尝试取得所有内部借用，证明current从未在Doc或fold RefCell租约内调用。
+        // The actual callback attempts document/fold borrows, checking that current never runs while those leases are held.
         let original = document.try_borrow_mut().expect("current跨了Doc借用");
         let folds = owner.folds.try_borrow_mut().expect("current跨了fold借用");
         if owner.is_busy() {
@@ -483,7 +497,7 @@ fn submitted_receipt_revocation_is_separate_from_successful_edit() {
         commit.check_current(&current),
         Err(NativeMarkdownPagedInputError::Revoked)
     ));
-    assert_eq!(text(&document), "中🙂原文"); // 后果权限撤销不把已提交正文谎报成未写入或自动重放。
+    assert_eq!(text(&document), "中🙂原文"); // Revoked presentation authority cannot report committed text as unwritten or replay it.
     assert!(document.borrow().can_undo());
 }
 
@@ -500,6 +514,8 @@ fn fold_anchor_preflight_and_publish_follow_the_actual_candidate_root() {
     .unwrap();
     let current = |_| true;
     let permit = owner.capture(1, &current).unwrap();
+    // A supplementary scalar adds two UTF-16 units. Both fold movement and Undo
+    // must follow actual candidate coordinates rather than UTF-8 byte counts.
     let commit = owner
         .insert_text(&permit, "🙂", unspecified(), &current)
         .unwrap();
@@ -539,17 +555,19 @@ fn input_permits_and_commits_do_not_keep_document_or_source_mapping_alive() {
         .insert_text(&permit, "中", unspecified(), &current)
         .unwrap();
     assert_eq!(Rc::strong_count(&document), 1);
+    // Retain input/permit/receipt and one independent Core snapshot while dropping
+    // the actual document owner; only that real snapshot may postpone unmapping.
     drop(document);
     assert!(weak.upgrade().is_none());
     assert!(matches!(
         owner.state(),
         Err(NativeMarkdownPagedInputError::DocumentReleased)
     ));
-    assert!(!source.unmap_succeeded()); // 独立真实Snapshot仍合法持有同一原映射。
+    assert!(!source.unmap_succeeded()); // An independent actual snapshot still owns the original mapping.
     drop(alias);
     assert!(source.unmap_succeeded());
     assert_eq!(source.mapped_bytes(), 0);
-    assert!(!source.failed()); // 活input/permit/receipt均没有偷偷共享Source payload。
+    assert!(!source.failed()); // Live input/permit/receipt objects retain no hidden Source payload.
     owner.close().unwrap();
     owner.close().unwrap();
     assert!(commit.check_current(&current).is_err());

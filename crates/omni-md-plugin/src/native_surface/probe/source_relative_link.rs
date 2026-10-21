@@ -631,7 +631,7 @@ impl RelativeLink {
                     .target_path
                     .canonicalize()
                     .map_err(|cause| cause.to_string())?
-                || document.original_revision() != Some(self.target_revision)
+                || document.original_revision() != self.target_revision
                 || document.is_dirty()
                 || document.generation() != 0
                 || document.utf16_len()

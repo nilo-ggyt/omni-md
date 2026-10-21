@@ -220,6 +220,9 @@ struct FindReplacementQueuedButton {
 struct FindButtonDownIdentity {
     kind: objc2_app_kit::NSEventType,
     number: isize,
+    // Timestamp differences are diagnostic only; dispatch authority uses the
+    // actual event number, target window, position, type, and modifiers below.
+    #[cfg(feature = "native-close-stage-diagnostic")]
     timestamp: f64,
     window: isize,
     location: NSPoint,
@@ -242,6 +245,7 @@ impl FindButtonDownIdentity {
         Self {
             kind: event.r#type(),
             number: event.eventNumber(),
+            #[cfg(feature = "native-close-stage-diagnostic")]
             timestamp: event.timestamp(),
             window: event.windowNumber(),
             location: event.locationInWindow(),

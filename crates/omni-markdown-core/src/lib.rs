@@ -248,14 +248,6 @@ pub use markdown_workspace::{
     MarkdownWorkspacePager, MarkdownWorkspaceSnapshot, compare_markdown_workspace_entries,
 };
 
-// Native adapters name the same recovery contracts through the crate root;
-// re-exporting them does not create another protocol or implementation.
-#[cfg(feature = "native-markdown-candidate")]
-pub use markdown_workspace::{
-    MarkdownRecoveryHandoff, MarkdownRecoveryPreparation, MarkdownRecoveryRecording,
-    MarkdownRecoveryResolutionOutcome,
-};
-
 #[cfg(feature = "native-markdown-candidate")]
 pub use markdown_brackets::{
     MARKDOWN_BRACKET_SCAN_UTF16_UNITS, MarkdownBracketMatch, MarkdownBracketQuery,

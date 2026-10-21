@@ -35,8 +35,11 @@ pub(super) fn empty_ime_keeps_scrolled_frame(
     }
     assert_eq!(view.input_state().unwrap(), before);
     assert!(view.capture_ready_scene_key().unwrap().same(&key));
-    // 一次有限主循环机会允许原生通知交付；没有新帧应等待的理由，也不注册轮询器
-    // 或领取后继key。错误实现若把reveal排队，必须在下面暴露实际clip/原Scene变化。
+    // A finite main-loop opportunity delivers actual Native notifications; no
+    // new frame, polling source, or successor key is requested. A wrongly queued
+    // reveal must expose its clip/original-Scene change in the assertions below.
+    // SAFETY: This control owns the original AppKit main thread and uses the
+    // public default mode without a document/Scene borrow across source delivery.
     unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.05, false) };
     assert!(NativeMarkdownPagedTextViewDelegate::scene_current(
         body, &key

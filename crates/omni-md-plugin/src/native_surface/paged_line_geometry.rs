@@ -1,4 +1,5 @@
-//! 原封存part的字素插入点；只读原GCB/cluster目录，不构造字符串或触发Native排版。
+//! Grapheme carets in the original sealed part read only its grapheme/cluster directories, without
+//! strings or Native layout.
 
 use std::cell::RefCell;
 
@@ -42,7 +43,8 @@ pub enum NativeMarkdownLineGeometryError {
 }
 type Result<T> = std::result::Result<T, NativeMarkdownLineGeometryError>;
 
-/// 插入点与真实Font度量共享同一baseline；外层行布局仍负责混合字体的整体行框。
+/// Caret and actual font metrics share one baseline; outer line layout still owns the combined
+/// rectangle for mixed fonts.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeMarkdownComposedCaret {
     pub source_utf16: usize,
@@ -53,6 +55,8 @@ pub struct NativeMarkdownComposedCaret {
 const MAX_EXACT: u64 = (1_u64 << 53) - 1;
 const MAX_POINT: f64 = (1_u64 << 46) as f64;
 
+/// Combine bounded 26.6 and point coordinates without losing exact integer range or accepting nonfinite
+/// output.
 fn axis(origin: f64, fixed: i64, within: f64) -> Result<f64> {
     if !origin.is_finite()
         || fixed.unsigned_abs() > MAX_EXACT
@@ -68,7 +72,8 @@ fn axis(origin: f64, fixed: i64, within: f64) -> Result<f64> {
     Ok(value)
 }
 
-/// 原Font/输出健康与可重入current分开；调用者不得把活RefCell借用带进这个函数。
+/// Separate original font/output health from reentrant current checks; callers must end live RefCell
+/// borrows before entry.
 fn require(
     output: &RefCell<MarkdownComposedLines>,
     part: &MarkdownComposedLinePart,
@@ -80,7 +85,8 @@ fn require(
     }
     font.require(part.font_registration())?;
     if !font.native().accepts_shaping_size(part.facts().points) {
-        // 只在真实拒绝点记录原封存字号与绑定值；不读取正文或替不一致输出更换字体。
+        // Record sealed/bound sizes only at actual rejection, without reading text or replacing the
+        // font for inconsistent output.
         #[cfg(feature = "native-markdown-runtime-probe")]
         eprintln!(
             "native_line_font_size_mismatch phase=geometry part_points={} native_points={} core_points={:?} kind={:?}",
@@ -101,7 +107,8 @@ fn require(
     if !current() {
         return Err(NativeMarkdownLineGeometryError::Revoked);
     }
-    // current可能发现实际Source故障；最后再核原健康，不用同名字体或后继scene恢复权限。
+    // current may discover actual Source failure; recheck original health without a same-name font or
+    // successor Scene renewing authority.
     let lines = output
         .try_borrow()
         .map_err(|_| NativeMarkdownLineGeometryError::Busy)?;
@@ -109,15 +116,18 @@ fn require(
     Ok(())
 }
 
-/// 仅用于已经认证 part 的绘制包络；这个几何边缘不授予字素、选择或输入光标权限。
+/// Geometry edges belong to a certified part's paint envelope only, granting no grapheme, selection, or
+/// input-caret authority.
 #[derive(Clone, Copy)]
 pub(in crate::native_surface) enum ComposedPartSourceEdge {
     Start,
     End,
 }
 
-/// UBA 可在完整字素内部拆分整形项；绘制需要其真实边缘，公开 caret 仍必须经过原 GCB 目录。
-/// 返回纯坐标而不是带源位置的 Caret，避免内部 scalar seam 被输入消费者误用。
+/// Bidi may split shaping items inside a grapheme. Painting needs their actual edges; public carets
+/// still require the original grapheme directory.
+/// Return coordinates without a Source-bearing caret so input consumers cannot misuse an internal
+/// scalar seam.
 pub(in crate::native_surface) fn composed_part_extent_edge(
     output: &RefCell<MarkdownComposedLines>,
     part: &MarkdownComposedLinePart,
@@ -135,7 +145,8 @@ pub(in crate::native_surface) fn composed_part_extent_edge(
             return Err(NativeMarkdownLineGeometryError::UnsupportedDirection);
         }
     };
-    // 此端点只能从原 part 的实际起/终侧选择，调用方不能传裸 scalar 下标补签权限。
+    // Choose only the original part's actual start/end side; a bare scalar index cannot authorize an
+    // edge.
     let advance = matches!(edge, ComposedPartSourceEdge::End) != backward;
     let x = facts
         .origin_x_26_6
@@ -153,14 +164,18 @@ pub(in crate::native_surface) fn composed_part_extent_edge(
     Ok(baseline)
 }
 
-/// 只计算原part内一个已认证GCB边界的实际插入点，不同步扫描字素、读取段落或shape。
+/// Compute one certified grapheme-boundary caret within the original part without synchronous grapheme
+/// scans, paragraph reads, or shaping.
 ///
-/// 完整GDEF与真实内部GCB数量一致时使用字体给出的caret。没有可匹配GDEF时，按原
-/// cluster的真实总advance及GCB ordinal分配内部插入点；绝不按UTF16单元、bytes或窗口
-/// 端点拆开组合字。此策略不授予安全断行权，也不会重用不安全的字形切片。
+/// Use actual font carets when complete GDEF matches the interior grapheme count. Otherwise distribute
+/// interior carets by the original
+/// cluster's actual total advance and grapheme ordinal, never by UTF-16 units, bytes, or viewport
+/// edges splitting a combining sequence. This grants neither safe line-break authority nor unsafe
+/// glyph-slice reuse.
 ///
 /// # Errors
-/// 原权限、输出、字体、GCB或cluster不符以及坐标溢出均拒绝，不返回近似的别处光标。
+/// Reject authority/output/font/grapheme/cluster mismatch or coordinate overflow, without substituting
+/// an approximate caret elsewhere.
 pub fn composed_part_caret(
     output: &RefCell<MarkdownComposedLines>,
     part: &MarkdownComposedLinePart,
@@ -182,7 +197,8 @@ pub fn composed_part_caret(
         return Err(NativeMarkdownLineGeometryError::InvalidPosition);
     }
     let metrics = font.metrics()?;
-    // 端点与内部位置都要经过原GCB目录；一个低代理项或组合字内部位置不能借端点捷径通过。
+    // Endpoints and interior positions both pass the original grapheme directory; low surrogates or
+    // combining interiors cannot bypass it.
     let mut lines = output
         .try_borrow_mut()
         .map_err(|_| NativeMarkdownLineGeometryError::Busy)?;
@@ -197,11 +213,11 @@ pub fn composed_part_caret(
             } else {
                 (0, 0)
             };
-            (x, y, None, 0, 0) // 真part端点沿实际视觉方向解释；不查相邻part的cluster来猜换行侧。
+            (x, y, None, 0, 0) // Interpret actual part endpoints in their real visual direction, without guessing wrap side from neighboring clusters.
         } else {
             if facts.kind != MarkdownComposedLinePartKind::Glyphs {
                 return Err(NativeMarkdownLineGeometryError::InvalidPosition);
-            } // 控制part只允许真实GCB两端；不从不存在的glyph cluster推导段内光标。
+            } // Control parts permit actual grapheme endpoints only; nonexistent glyph clusters cannot provide interior carets.
             let cluster = match lines.cluster(part, source_utf16)? {
                 MarkdownGlyphClusterAnswer::Known(Some(value)) => value,
                 _ => return Err(NativeMarkdownLineGeometryError::InconsistentClusters),
@@ -263,8 +279,9 @@ pub fn composed_part_caret(
                 Some(glyphs[0])
             } else {
                 None
-            }; // 多glyph cluster没有单个GDEF坐标原点；不能任取首glyph伪称整个cluster的插入点。
-            // 到此均为原Reader的固定次数查询；不循环读取cluster内全部GCB或glyph。
+            }; // A multi-glyph cluster has no single GDEF origin; its first glyph cannot certify carets for the whole cluster.
+            // These are fixed-count original-reader queries, without iterating all graphemes or glyphs
+            // inside a cluster.
             let fraction = if backward {
                 (graphemes - rank) as f64 / graphemes as f64
             } else {
@@ -283,7 +300,7 @@ pub fn composed_part_caret(
                 graphemes,
             )
         };
-    drop(lines); // 任何Native字体查询、CFRelease或current都不能保留这个Reader租约。
+    drop(lines); // End this reader lease before Native font queries, CFRelease, or reentrant current checks.
     require(output, part, font, current)?;
     let (mut within_x, within_y) = if let Some((_, x, y, fraction)) = glyph {
         if x.unsigned_abs() > MAX_EXACT || y.unsigned_abs() > MAX_EXACT {
@@ -296,7 +313,7 @@ pub fn composed_part_caret(
     if let Some((Some(glyph), _, _, _)) = glyph {
         let font_current = || require(output, part, font, current).is_ok();
         let captured = capture_paged_ligature_carets(font.native(), glyph.glyph_id, &font_current);
-        require(output, part, font, current)?; // 先保留原Source/Font的真实失败，不能只报告bool回调失权。
+        require(output, part, font, current)?; // Preserve actual Source/font failure before a boolean callback's ordinary revocation.
         let carets = captured?;
         let positions = carets.positions_for(font.native(), glyph.glyph_id)?;
         if positions.len().checked_add(1) == Some(graphemes) && internal_rank != 0 {
@@ -306,7 +323,7 @@ pub fn composed_part_caret(
                 internal_rank - 1
             };
             within_x = positions[index] + f64::from(glyph.x_offset) / 64.0;
-        } // 不完整或无GDEF保留真实GCB ordinal插值，不按code unit平均，也不篡改原字形advance。
+        } // Absent/incomplete GDEF keeps actual grapheme-ordinal interpolation, without code-unit averaging or altered glyph advance.
     }
     let origin_x = facts
         .origin_x_26_6

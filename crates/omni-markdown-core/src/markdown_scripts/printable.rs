@@ -1,4 +1,5 @@
-//! 原完整ASCII摘要与Latn上下文后缀证明；真实B仍由原Machine消费，EOF才封存。
+//! Complete ASCII aggregates and Latin-context suffix proofs. The original
+//! machine still consumes actual paragraph separators; only real EOF permits sealing.
 
 use super::*;
 
@@ -25,19 +26,23 @@ pub(super) struct Preparation {
 }
 
 impl Preparation {
+    /// Captures only exact whole-source printable-ASCII facts already present
+    /// on this immutable root, avoiding a second scan or another text owner.
     pub(super) fn capture(source: &MarkdownLayoutTextSource) -> Result<Option<Self>> {
         let Some(has_letters) = source.printable_ascii_has_letters()? else {
-            return Ok(None); // Unicode或控制符没有此证书，必须交回原SCX/括号Machine。
+            return Ok(None); // Unicode/control characters require the original SCX/bracket machine.
         };
         if source.byte_len() != source.utf16_len() {
             return Err(MarkdownScriptError::CorruptMetadata);
-        } // 完整ASCII每scalar恰好一个byte和UTF16单位，长度矛盾不能降为可疑成功。
+        } // ASCII has one byte/UTF-16 unit per scalar; inconsistent lengths cannot pass.
         let run = if source.byte_len() == 0 {
-            None // 真空源只有两个owner的封存，没有空run或虚构source coverage。
+            None // Empty input seals its two actual owners without inventing a run or coverage.
         } else {
             let script = if has_letters {
-                // 原精确聚合已证明存在ASCII字母；其唯一specific脚本取自同一Unicode表，
-                // 其余Common均为通配。ASCII配对括号不引入第二个specific或段落边界。
+                // Exact aggregates prove an ASCII letter exists. Its only specific script
+                // comes from the same Unicode table;
+                // other Common characters are wildcards. ASCII paired brackets introduce
+                // neither another specific script nor a paragraph boundary.
                 MarkdownScript(properties::get('a').primary)
             } else {
                 MarkdownScript(unicode_data::COMMON)
@@ -50,7 +55,7 @@ impl Preparation {
                 script,
             })
         };
-        source.health()?; // 精确root事实仍属于原Source，晚到的原errno不能被无读取路径绕过。
+        source.health()?; // Even a no-read aggregate path preserves the original source's late I/O failure.
         Ok(Some(Self {
             proof: None,
             run,
@@ -59,14 +64,16 @@ impl Preparation {
         }))
     }
 
-    /// 原Machine已确定Latn且没有待配对上下文时，证明该run直到同源真实正文端点的后缀。
+    /// After the original machine establishes Latin with no pending bracket context,
+    /// proves this run's suffix through the same source's actual content endpoint.
     pub(super) fn suffix(
         source: &MarkdownLayoutTextSource,
         mut run: MarkdownScriptRun,
         content_end: usize,
     ) -> Result<Self> {
         let proof = source.begin_printable_ascii_suffix(run.start_utf16..content_end)?;
-        // ASCII正证明后两种坐标一一对应；候选尚未知时不把该byte坐标用于任何Source借用。
+        // Byte/UTF-16 coordinates coincide only after an ASCII proof. This candidate
+        // byte endpoint grants no source lease while the proof remains unknown.
         run.end_byte = run
             .start_byte
             .checked_add(content_end - run.start_utf16)
@@ -80,10 +87,14 @@ impl Preparation {
         })
     }
 
+    /// Exposes this candidate's coordinate envelope only; the range itself
+    /// grants neither a byte lease nor permission to publish an unfinished proof.
     pub(super) fn range(&self) -> Option<std::ops::Range<usize>> {
         self.run.map(|run| run.start_utf16..run.end_utf16)
     }
 
+    /// Shares the original quantum's remaining byte/scalar/metadata budgets.
+    /// Store phases advance only after the corresponding real operation succeeds.
     pub(super) fn advance(
         &mut self,
         source: &MarkdownLayoutTextSource,
@@ -107,6 +118,8 @@ impl Preparation {
                     *maximum_borrow = (*maximum_borrow).max(actual.maximum_borrow);
                     match actual.answer {
                         None => return Ok(Progress::Pending),
+                        // A real counterexample returns control to the untouched SCX
+                        // machine; it cannot publish a shortened or guessed ASCII run.
                         Some(false) => return Ok(Progress::Rejected),
                         Some(true) => {
                             self.proof = None;
@@ -114,15 +127,15 @@ impl Preparation {
                                 return Ok(Progress::Resume(
                                     self.run.expect("非EOF证明保原当前run"),
                                 ));
-                            } // 真B前正文只可推进原Machine，不能在这里直接append自然闭项。
+                            } // Before a real paragraph separator, resume the original machine rather than append a closed run.
                             self.phase = Phase::Append;
                         }
-                    } // 真反例不改原Machine或已完成run；只有整个后缀证明成功才取得封存资格。
+                    } // A counterexample changes no machine/run; only the complete proven suffix permits sealing.
                 }
                 Phase::Append => {
                     if let Some(run) = self.run {
                         if step.records == budget.records {
-                            return Ok(Progress::Pending); // 原单run尚未写入，保留候选与原phase等待下次量子。
+                            return Ok(Progress::Pending); // Keep this unwritten run and phase for a later admitted quantum.
                         }
                         store.append_run(run)?;
                         step.records += 1;
@@ -133,7 +146,7 @@ impl Preparation {
                     if step.stack_ops == budget.stack_ops {
                         return Ok(Progress::Pending);
                     }
-                    store.seal_frames()?; // 原空括号FD真实close，不以跳过栈扫描伪造已归还。
+                    store.seal_frames()?; // Actually close bracket storage; a skipped scan is no release receipt.
                     step.stack_ops += 1;
                     self.phase = Phase::SealRuns;
                 }
@@ -141,7 +154,7 @@ impl Preparation {
                     if step.stack_ops == budget.stack_ops {
                         return Ok(Progress::Pending);
                     }
-                    store.seal_runs()?; // 原64B记录真实封存/归还写映射后才可进入最终Ready。
+                    store.seal_runs()?; // Seal actual 64-byte records and return write storage before publishing Ready.
                     step.stack_ops += 1;
                     self.phase = Phase::Ready;
                 }

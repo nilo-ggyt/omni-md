@@ -1,4 +1,5 @@
-//! 已迁入GCB记录的固定跳链；正文/原GCB算法仍属于同一个BreakJob。
+//! Fixed skip links for migrated grapheme records. Text and the original grapheme
+//! algorithm remain under the same Break Job.
 
 use super::*;
 
@@ -9,8 +10,9 @@ impl Ancestors {
         Self([None; usize::BITS as usize])
     }
 
-    /// 和Line相同，清除最低1位的目标在本次发布前仍占其popcount槽。
-    /// 原GCB可与glyph/item交错，record不再由start+ordinal推导。
+    /// As with lines, the lowest-set-bit target still owns its popcount slot before
+    /// this publication. Grapheme records may interleave with glyphs/items, so a
+    /// record pointer cannot be derived from start plus ordinal.
     pub(super) fn encode(
         &self,
         value: MarkdownGraphemeBoundary,
@@ -32,6 +34,8 @@ impl Ancestors {
             }
             Some((record, actual))
         };
+        // Seal only existing predecessor/skip pointers into this fixed candidate.
+        // The ancestor table is updated separately, after the actual append succeeds.
         let mut row = [0; 64];
         for (at, value) in [(0, value.byte), (8, value.utf16), (40, ordinal)] {
             row[at..at + 8].copy_from_slice(&number(value)?.to_le_bytes());
@@ -61,7 +65,8 @@ impl Ancestors {
         Ok(row)
     }
 
-    /// 只在真实append成功后发布槽；失败不会把半记录注册为后继的祖先。
+    /// Update a slot only after successful append; a failed partial record cannot
+    /// become an authenticated ancestor for subsequent records.
     pub(super) fn publish(&mut self, ordinal: usize, record: usize) -> Result<()> {
         let slot = ordinal.count_ones() as usize;
         *self.0.get_mut(slot).ok_or(Error::Overflow)? = Some((record, ordinal));
@@ -77,7 +82,8 @@ pub(super) struct BoundaryRecord {
     pub skip: Option<(usize, usize)>,
 }
 
-/// 解码本次实际读取的64B，不读后继或正文；所有指针都必须严格指向更早记录。
+/// Decode this actual 64-byte read without following links or reading text. Every
+/// pointer must reference a strictly earlier original record.
 pub(super) fn decode(
     row: [u8; 64],
     record: usize,
@@ -102,6 +108,8 @@ pub(super) fn decode(
         NONE => None,
         _ => Some(usize_at(&row, 16)?),
     };
+    // Check both the exact lowest-set-bit rank and pointer order. An adjacent skip
+    // must be the same actual predecessor, not merely a plausible earlier number.
     let skip = match (u64_at(&row, 24), u64_at(&row, 32)) {
         (NONE, NONE) if ordinal == 0 => None,
         (pointer, rank) if pointer != NONE && rank != NONE && ordinal != 0 => {
@@ -118,6 +126,8 @@ pub(super) fn decode(
         }
         _ => return Err(Error::InconsistentCoverage),
     };
+    // The first actual record is Source start; later records advance both coordinate
+    // axes. Directory bounds cannot manufacture a missing start/predecessor proof.
     if ordinal >= count
         || value.byte > bytes
         || value.utf16 > utf16

@@ -1,4 +1,5 @@
-//! 同一实际Find字段驱动分页高亮；只读查询不改变canonical，旧Scene在新输入时立即撤权。
+//! Drive paged highlights through the actual Find field. Read-only query changes
+//! leave canonical text untouched and synchronously revoke the previous Scene.
 
 use super::*;
 use objc2::runtime::ProtocolObject;
@@ -13,10 +14,12 @@ const GRID_SOURCE: &str = concat!(
     "\nend\n",
 );
 
-/// 不直接改查询控件或发通知；原会话field editor通过NSTextInputClient提交一次真实短输入。
+/// Commit one actual short input through the original session field editor's
+/// NSTextInputClient, without rewriting the query control or fabricating notifications.
 fn query(rig: &Rig, value: &str) -> Result<(), String> {
     let intent = rig.controller.find_input_intent();
-    // SAFETY: 原栏与窗口仍在同一主线程，聚焦由原生字段正常执行，不替换delegate/IME。
+    // SAFETY: The original bar/window remain on their main thread. Let the actual
+    // field perform focus without replacing its delegate or input method.
     unsafe { rig.bar.query.selectText(None) };
     let editor = rig
         .bar
@@ -30,7 +33,8 @@ fn query(rig: &Rig, value: &str) -> Result<(), String> {
     }
     let range = NSRange::new(0, editor.string().length());
     let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&*editor);
-    // SAFETY: 只替换当前实际字段中的有限查询，不传入正文或更改文稿选择。
+    // SAFETY: Replace only the actual field's bounded query; supply no document
+    // text and change no document selection.
     unsafe { client.insertText_replacementRange(&NSString::from_str(value), range) };
     if rig.controller.find_input_intent() != intent.checked_add(1).ok_or("查找意图溢出")?
         || !rig
@@ -44,7 +48,8 @@ fn query(rig: &Rig, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 只画当前Scene的实际有界协议；黄色来自原Find色的真实白底混合，不从匹配表猜已经显示。
+/// Paint the current Scene's actual bounded protocol. Observe the real Find-color
+/// blend on a white background rather than inferring painted pixels from match records.
 fn rgba(rig: &Rig) -> Result<Vec<u8>, String> {
     let key = rig
         .view
@@ -64,18 +69,20 @@ fn rgba(rig: &Rig) -> Result<Vec<u8>, String> {
         .validate_ready(&current)
         .map_err(|cause| cause.to_string())?;
     let selection::Canvas { context, pixels } = canvas;
-    drop(context); // 原context先结束借用，实际RGBA才可独立作有限像素对照。
+    drop(context); // End the context's pixel borrow before independently comparing the actual bounded RGBA buffer.
     Ok(pixels)
 }
 
-/// 白底正文的独立Find黄色域；表格深色底改与同原空查询的完整RGBA逐字节比较。
+/// Recognize Find yellow independently for white document backgrounds. Dark table
+/// backgrounds instead compare complete bounded RGBA with the original empty query.
 fn pixels(rig: &Rig) -> Result<usize, String> {
     let count = rgba(rig)?
         .as_chunks::<4>()
         .0
         .iter()
         .filter(|pixel| {
-            // 白底、黑字、普通蓝选区都不满足该色域；透明黄色必须真正进入原正文画布。
+            // White, black text, and ordinary blue selection do not meet this
+            // range; actual translucent yellow must reach the original document canvas.
             pixel[0] > 240
                 && (175..250).contains(&pixel[1])
                 && (100..225).contains(&pixel[2])
@@ -85,7 +92,8 @@ fn pixels(rig: &Rig) -> Result<usize, String> {
     Ok(count)
 }
 
-/// 同一短源的真实字段与两个后端模式；模式是正式构造值，不是测试时改私态。
+/// Exercise actual fields in both presentation modes of the same short source.
+/// Each mode is a real construction value, never a test-time private-state mutation.
 fn exercise(rig: &mut Rig) -> Result<(), String> {
     rig.panel.makeKeyWindow();
     if !rig.panel.isKeyWindow() {
@@ -103,7 +111,7 @@ fn exercise(rig: &mut Rig) -> Result<(), String> {
     if !matches!(old_scene.validate_ready(&|| true), Err(ViewError::Revoked)) {
         return Err("实际查询输入未同步撤销旧Scene与CPU候选权限".into());
     }
-    drop(old_scene); // 撤权证明结束后归还Reader，再让同一Producer发布新窗口。
+    drop(old_scene); // Return the reader after proving revocation, before the same producer publishes a new window.
     frame::wait_complete_frame("root_leaf_find_live_matches", &rig.body, event)?;
     let found = rig
         .view
@@ -127,7 +135,8 @@ fn exercise(rig: &mut Rig) -> Result<(), String> {
     rig.remember_receipt()?;
     let event = observe(&rig.body)?;
     query(rig, "不存在")?;
-    // 后继真实输入不等旧队列/帧；只能发布最后已确认查询，不能在旧匹配的setter重入后复活。
+    // Successor input arrives without waiting for the old frame. Only the latest
+    // committed query may publish; an earlier match cannot revive after setter reentry.
     query(rig, "目标")?;
     query(rig, "仍不存在")?;
     frame::wait_complete_frame("root_leaf_find_live_successor", &rig.body, event)?;
@@ -140,7 +149,8 @@ fn exercise(rig: &mut Rig) -> Result<(), String> {
     if pixels(rig)? == 0 {
         return Err("同一原栏再次输入没有恢复真实高亮".into());
     }
-    // Preview只借真实可见part域；隐藏语法既不计数也不画0.1pt占位条，Source仍可字面查找。
+    // Preview uses only actual visible part domains. Hidden syntax contributes
+    // neither counts nor placeholder highlight bars; Source still searches literal syntax.
     let event = observe(&rig.body)?;
     query(rig, "**")?;
     frame::wait_complete_frame("root_leaf_find_live_markers", &rig.body, event)?;
@@ -171,7 +181,8 @@ fn exercise(rig: &mut Rig) -> Result<(), String> {
         return Err("可见粗体正文被隐藏语法过滤错误地一同移除了".into());
     }
     let event = observe(&rig.body)?;
-    // Hide属于原布局动作；执行backend只负责查找/替换并明确拒绝Hide，不能误把其拒绝当产品失败。
+    // Hide belongs to the original layout action. The matching backend explicitly
+    // rejects Hide; that rejection cannot be mistaken for a product hide failure.
     let intent = rig.controller.advance_find_input_intent();
     rig.bar.viewport_feedback_intent.set(None);
     rig.body
@@ -196,13 +207,16 @@ fn exercise(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 两个固定短夹具共用独立原文/磁盘逐片核验，Find没有取得任何正文写权限。
+/// Independently compare canonical/disk contents of either fixed short fixture in
+/// bounded chunks. Find acquired no authority to write document text.
 fn unchanged(rig: &Rig, source: &str) -> Result<(), String> {
     let document = rig.document.upgrade().ok_or("实时查找原Doc已释放")?;
     let document = document.borrow();
     if document.generation() != 0 || document.utf16_len() != source.encode_utf16().count() {
         return Err("实时查找改变canonical世代或长度".into());
     }
+    // Read fixed windows against the independent literal iterator, then release
+    // the canonical borrow before accessing its original on-disk file.
     let mut units = [0_u16; 32];
     let mut expected = source.encode_utf16();
     for start in (0..document.utf16_len()).step_by(units.len()) {
@@ -237,7 +251,8 @@ fn unchanged(rig: &Rig, source: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 原表格display目录的删符不能靠canonical包络补回；计数与实际RGBA必须同时排除隐藏语法。
+/// The canonical envelope cannot restore syntax removed by the actual table
+/// display projection. Both counts and actual RGBA must exclude hidden syntax.
 fn exercise_grid(rig: &mut Rig) -> Result<(), String> {
     rig.panel.makeKeyWindow();
     if !rig.panel.isKeyWindow() {
@@ -282,7 +297,8 @@ fn exercise_grid(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 各模式顺序创建并严格关闭；字段、Body、Font、Reader、像素与合成文件仍归原release流程。
+/// Construct modes sequentially and close each strictly. The original release
+/// sequence owns fields, Body, fonts, readers, pixels, and the synthetic file.
 pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
     for (mode, source, grid) in [
         (MarkdownPresentationMode::Source, SOURCE, false),
@@ -313,10 +329,10 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
                     exercise(&mut rig)
                 }
             })();
-            let retirement = release::close(rig, false)?;
+            let retirement = release::close(rig)?;
             Ok((retirement, result))
         })?;
-        retirement.verify(false)?;
+        retirement.verify()?;
         result?;
     }
     Ok(())

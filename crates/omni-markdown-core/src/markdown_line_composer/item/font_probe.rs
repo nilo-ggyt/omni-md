@@ -1,10 +1,12 @@
-//! 原协调器签发单个真实字素的字体试次权限；不建立第二份GCB、Script或UBA索引。
+//! The original coordinator issues font-trial authority for one actual complete
+//! grapheme without constructing another grapheme, script, or bidi index.
 
 use std::sync::Weak;
 
 use super::*;
 
-/// 同一个完整编辑字素中的真实整形段准备结果；Ready 不表示整个字素已经选定字体。
+/// Preparation of one actual shaping segment within a complete editing
+/// grapheme; Ready does not mean the whole grapheme has selected a font.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownLineFontProbeSegmentAnswer {
     Pending,
@@ -12,7 +14,8 @@ pub enum MarkdownLineFontProbeSegmentAnswer {
     Complete,
 }
 
-/// 只报告本次实际读取的原目录工作；字体 worker 的正文、glyph 费用仍由原试次归属。
+/// Report this step's original directory work only. Text and glyph work in the
+/// font worker remains attributable to that same actual trial.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MarkdownLineFontProbeSegmentStep {
     pub bytes: usize,
@@ -22,17 +25,20 @@ pub struct MarkdownLineFontProbeSegmentStep {
     pub answer: MarkdownLineFontProbeSegmentAnswer,
 }
 
-/// 任意时刻只有一个真实 level 段；不按完整 GCB 长度保存段表或复制正文。
+/// Retain one actual resolved-level segment at a time, without a full-grapheme
+/// segment directory or a text copy proportional to its length.
 #[derive(Clone)]
 struct ProbeSegment {
     utf16: Range<usize>,
     bytes: Range<usize>,
     level: u8,
-    // 只有混合 level 字素需要额外裁定邻接上下文，普通单段保持原热路径。
+    // Only mixed-level graphemes need additional context-barrier discovery;
+    // ordinary single-segment input retains its existing direct path.
     context: Option<Range<usize>>,
 }
 
-/// 流式扫描只借原 Bidi 的逐 UTF16 记录，下一段首记录留在这一固定槽，避免重复 I/O。
+/// Stream original bidi UTF-16 records and keep the next segment's first record
+/// in one fixed slot rather than rereading it from storage.
 #[derive(Clone)]
 struct SegmentScan {
     start: usize,
@@ -46,6 +52,7 @@ struct SegmentScan {
 }
 
 impl SegmentScan {
+    /// Resume from exact source coordinates and an optional already-paid original record.
     fn new(
         start: usize,
         byte: usize,
@@ -64,61 +71,74 @@ impl SegmentScan {
     }
 }
 
-/// 只共享原冻结Source，不复制文字；同一请求被响应、取消或归还后，弱scope立即失效。
-/// 一个完整GCB可以包含很多标量，凭此票不能宣称底层整形已具有固定时间上界。
+/// Share the original frozen Source without copying text. A consumed, cancelled,
+/// or returned request immediately invalidates this weak scope. One complete
+/// grapheme can contain many scalars, so this ticket promises no fixed shaping time.
 #[derive(Clone)]
 pub struct MarkdownLineFontProbe {
     source: MarkdownLayoutTextSource,
     request: MarkdownLineStyleRequest,
     range: Range<usize>,
-    // 两端来自同一原 GCB 目录或其已经持有的认证端点，不在 Native 入口重查 UTF16。
+    // Both coordinates come from the same original GCB directory or retained
+    // certificates, with no repeated UTF-16 lookup at the native entry point.
     bytes: Range<usize>,
     scope: Weak<()>,
     cancellation: MarkdownLineComposeCancellation,
     segment: Option<ProbeSegment>,
     scan: Option<SegmentScan>,
-    // 普通单段从签发时就有原 item 的完整 level 证明，绝不由“首段成功”推导此事实。
+    // Ordinary single-segment scope already has the item's complete level proof
+    // when issued; success on its first trial segment cannot infer that fact.
     single_segment: bool,
     complete: bool,
 }
 
 impl MarkdownLineFontProbe {
-    /// 优先核原Source首错，再核原请求和取消位；不查活文档或申请任何文本窗口。
+    /// Check original Source health before cancellation and request lifetime,
+    /// without querying the active document or acquiring a text window.
     ///
     /// # Errors
-    /// 原Source失败、取消或原样式阶段已结束时拒绝，旧探测不能由后继请求重新启用。
+    /// Reject source failure, cancellation, or an ended original style phase.
+    /// A later request cannot restore this older probe's authority.
     pub fn validate(&self) -> Result<()> {
         self.source.health()?;
         if self.cancellation.is_cancelled() {
+            // Cancellation revokes trial work even if the original request shell survives.
             return Err(MarkdownLineComposeError::Cancelled);
         }
         if self.scope.strong_count() == 0 {
+            // Only the still-waiting original coordinator owns this scope;
+            // cloned request/probe values cannot extend it.
             return Err(MarkdownLineComposeError::Poisoned);
         }
         Ok(())
     }
 
-    /// 只借同一个不可变来源供纯Core worker共享；不会再捕获Doc或额外构造索引。
+    /// Borrow the same immutable Source for a Core worker without recapturing
+    /// a document or constructing another language/index owner.
     pub fn source(&self) -> Result<&MarkdownLayoutTextSource> {
         self.validate()?;
         Ok(&self.source)
     }
 
     #[must_use]
+    /// Return finite geometry only; consuming text still requires validate/byte-range authority.
     pub fn source_range(&self) -> Range<usize> {
         self.range.clone()
     }
 
-    /// 借原两张GCB端点已经认证的UTF8坐标；不再从远端UTF16位置重扫冻结源。
+    /// Borrow UTF-8 coordinates already certified by the original two grapheme
+    /// endpoints, without another distant UTF-16-to-byte scan.
     ///
     /// # Errors
-    /// 原Source首错、取消或请求已消费时拒绝，数值端点自身不能延长试次权限。
+    /// Source failure, cancellation, or consumed request rejects the query;
+    /// numeric endpoints themselves cannot extend trial lifetime.
     pub fn byte_range(&self) -> Result<Range<usize>> {
         self.validate()?;
         Ok(self.bytes.clone())
     }
 
-    /// 只有已取到真实两端和上下文范围的当前段才能交 worker，Pending/Complete 不重放旧段。
+    /// Hand off only a current segment with actual endpoints and complete
+    /// context extent. Pending/Complete must not replay the prior ready segment.
     pub fn shaping_segment_ready(&self) -> Result<bool> {
         self.validate()?;
         Ok(!self.complete
@@ -129,12 +149,14 @@ impl MarkdownLineFontProbe {
                 .is_none_or(|scan| scan.context_phase == 3))
     }
 
-    /// 字体复用只能用于原分析已经证明的整个单段 GCB；混合字素永远不能缓存首段结论。
+    /// Reuse a font choice only for an entire single-segment grapheme proved
+    /// by original analysis; mixed graphemes cannot cache the first segment's result.
     pub fn complete_single_segment(&self) -> Result<bool> {
         self.validate()?;
         Ok(self.single_segment)
     }
 
+    /// Borrow only the original currently ready segment, never an older pending value.
     fn ready_segment(&self) -> Result<&ProbeSegment> {
         self.validate()?;
         if !self.shaping_segment_ready()? {
@@ -145,9 +167,13 @@ impl MarkdownLineFontProbe {
             .ok_or(MarkdownLineComposeError::InconsistentCoverage)
     }
 
-    /// 为已完成选择的有界复用读取精确输入；只借本GCB和原shaper两侧20B上下文包络。
-    /// 每次最多72B（32B小GCB加40B上下文），不扩大Source公开读取权限，也不解析第二套上下文。
-    /// 已交付piece之后失败仍返回真实read，调用方必须收费，不能把失败或命中当零工作。
+    /// Copy exact finite input for an already selected font choice, confined to
+    /// this grapheme plus the shaper's original 20-byte context on each side.
+    /// At most 72 bytes are delivered/copied (32-byte small grapheme plus context).
+    /// This is not a promise of a 72-byte mapping or kernel page pin: Source
+    /// still leases bounded logical pieces and manages actual system pages.
+    /// Return bytes already copied on failure so callers charge callback work;
+    /// cache hits/failure do not redefine that work as zero.
     pub fn copy_choice_bytes(&self, range: Range<usize>, target: &mut [u8]) -> (usize, Result<()>) {
         let mut read = 0;
         let result = (|| {
@@ -163,24 +189,32 @@ impl MarkdownLineFontProbe {
                 || range.len() != target.len()
                 || range.len() > 72
             {
+                // Public range values cannot widen this trial's exact input
+                // envelope or force a larger target buffer than the fixed choice limit.
                 return Err(MarkdownLineComposeError::InvalidRequest);
             }
             self.source.visit_byte_range(range, |piece| {
+                // Account actual callback-delivered bytes copied into the caller's
+                // finite buffer, not virtual extent or page-directory accounting.
                 target[read..read + piece.len()].copy_from_slice(piece);
                 read += piece.len();
                 Ok(())
             })?;
             self.validate()
         })();
-        // 原健康优先于操作中的较早错误；已读取的字节保留，不据成功与否推导资源事实。
+        // Original Source health takes precedence over an earlier operation
+        // error. Copied-byte accounting remains, without inferring resource release from success.
         (read, self.validate().and(result))
     }
 
-    /// 原试次唯一整形入口直接转移已认证的两套坐标，不重定位远端UTF16端点。
-    /// 正文仍由原Job按调用方预算流入；上下文、flags、资源与取消继续使用唯一assemble路径。
+    /// Transfer the trial's original certified byte/UTF-16 coordinates directly
+    /// into its shaping entry without distant endpoint relocation. The actual
+    /// job still consumes bounded source input through the existing context,
+    /// flags, resource, and cancellation construction path.
     ///
     /// # Errors
-    /// 同源试次、原Font、真实选项或取消失效时拒绝；构造后再次核原probe，失败真实丢弃候选Job。
+    /// Reject invalid original source/font/options/cancellation. Revalidate the
+    /// probe after construction and actually destroy a rejected candidate job.
     pub fn shaping_job(
         &self,
         font: MarkdownLayoutFont,
@@ -204,18 +238,24 @@ impl MarkdownLineFontProbe {
             cancellation,
         )
         .map_err(MarkdownLineComposeError::from);
-        self.validate()?; // 即使候选创建失败，原Source首因也不能被Font/选项或取消错误遮住。
+        // Even failed construction cannot hide original Source failure behind
+        // a font/options/cancellation error discovered during that attempt.
+        self.validate()?;
         result
     }
 
-    /// 只读取原 GCB 最前面的至多四个 UTF8 字节，首 scalar 仅用于系统候选选择，不证明完整 GCB 覆盖。
-    /// 返回实际已借字节数及原 typed 结果：读取后失权、解码或来源失败也必须由调用方收费。
-    /// 范围和原票在读取前后核验；部分 piece 已交付后发生 I/O 失败时，错误仍保留原 Source 首因。
+    /// Copy/decode at most the grapheme's first four UTF-8 bytes. The first scalar
+    /// guides system candidates but cannot prove complete grapheme coverage.
+    /// Report actual callback bytes copied even after revocation/decoding/source
+    /// failure. Bounded logical leases and system-page pins have separate extents;
+    /// a four-byte scalar query does not imply a four-byte mapped page or syscall.
+    /// Validate original tickets before/after access and preserve source failure priority.
     pub fn first_scalar(&self) -> (usize, Result<char>) {
         let mut read = 0;
         let result = (|| {
             self.validate()?;
             if self.bytes.is_empty() {
+                // A complete nonempty grapheme must have original input bytes.
                 return Err(MarkdownLineComposeError::InconsistentCoverage);
             }
             let mut bytes = [0_u8; 4];
@@ -226,7 +266,8 @@ impl MarkdownLineFontProbe {
                     read += piece.len();
                     Ok(())
                 })?;
-            self.validate()?; // 即使这里失权，已读取的原字节数仍通过外层 tuple 交还。
+            // Revocation here still returns already-copied byte accounting in the outer tuple.
+            self.validate()?;
             let width = match bytes[0] {
                 0x00..=0x7f => 1,
                 0xc2..=0xdf => 2,
@@ -235,9 +276,11 @@ impl MarkdownLineFontProbe {
                 _ => return Err(MarkdownLineComposeError::InconsistentCoverage),
             };
             if width > read {
+                // A partial first scalar cannot be used as a system font-candidate character.
                 return Err(MarkdownLineComposeError::InconsistentCoverage);
             }
-            // 有限窗口可以止于下一个 scalar 内部；只解码首个完整 scalar，不把其后不完整字节当正文错误。
+            // This finite prefix may end inside the next scalar. Decode only
+            // the complete first one, without classifying the unrelated partial suffix as bad text.
             let value = std::str::from_utf8(&bytes[..width])
                 .ok()
                 .and_then(|value| value.chars().next())
@@ -248,17 +291,20 @@ impl MarkdownLineFontProbe {
         (read, result)
     }
 
-    /// 字体选择只能服务签发时的原nonce；相同范围、同文本或同Source都不能代替它。
+    /// A font choice serves only its issuing nonce; equal range/text or even
+    /// the same Source cannot replace that original outstanding request.
     pub fn accepts_request(&self, request: &MarkdownLineStyleRequest) -> Result<bool> {
         self.validate()?;
         Ok(Arc::ptr_eq(&self.request.nonce, &request.nonce)
             && self.request.source == request.source)
     }
 
-    /// 方向、Script及BOT/EOT沿原UBA/段落事实；调用者仅提供原有限样式。
+    /// Derive direction, script, and BOT/EOT from original bidi/paragraph facts;
+    /// the caller supplies only its finite style.
     ///
     /// # Errors
-    /// 原权限失效或样式超出原Core固定预算时拒绝，不截断language/features或回退默认值。
+    /// Reject lost original authority or exceeded Core style limits without
+    /// truncating language/features or substituting defaults.
     pub fn shaping_options(
         &self,
         style: &MarkdownLineComposeStyle,
@@ -274,12 +320,16 @@ impl MarkdownLineFontProbe {
                 .as_ref()
                 .is_some_and(|value| value.len() > 64)
         {
+            // Invalid sizes and oversized metadata cannot reach shaping or
+            // allocate a second retained feature/language representation.
             return Err(MarkdownLineComposeError::InvalidRequest);
         }
         Ok(MarkdownShapingOptions {
             direction: if segment.level & 1 == 0 {
+                // Preserve the actual segment's resolved bidi parity.
                 MarkdownShapingDirection::LeftToRight
             } else {
+                // Odd resolved level requires the original right-to-left shaping direction.
                 MarkdownShapingDirection::RightToLeft
             },
             script: text.script,
@@ -293,7 +343,8 @@ impl MarkdownLineFontProbe {
 }
 
 impl MarkdownLineItemCoordinator {
-    /// 下一段只能继续当前原 Style nonce；另一个协调器、旧 scope 或已取消来源不能借整数复位。
+    /// Continue only the current original style nonce. Another coordinator,
+    /// old scope, or cancelled Source cannot restart a probe through numeric coordinates.
     fn require_font_probe(&mut self, probe: &MarkdownLineFontProbe) -> Result<()> {
         self.guard()?;
         probe.validate()?;
@@ -314,13 +365,16 @@ impl MarkdownLineItemCoordinator {
             || request.source != probe.request.source
             || !std::sync::Weak::ptr_eq(&probe.scope, &Arc::downgrade(scope))
         {
+            // Both original request and original probe-scope identity must
+            // still belong to this coordinator's actual style phase.
             return Err(MarkdownLineComposeError::SourceMismatch);
         }
         Ok(())
     }
 
-    /// 一个真实候选的 worker 已结束当前段后才调用；每次只保一个实际 level 段。
-    /// 原 Bidi/Script 目录仍在唯一协调器，worker 不带这些非 Send owner，也不建立新索引。
+    /// Advance after the real candidate worker consumed its current segment;
+    /// retain one actual level segment at a time. Bidi/script directories remain
+    /// in the sole coordinator; a worker receives no non-Send index owner or duplicate index.
     pub fn step_font_probe_segment(
         &mut self,
         probe: &mut MarkdownLineFontProbe,
@@ -329,6 +383,7 @@ impl MarkdownLineItemCoordinator {
         let result = (|| {
             self.require_font_probe(probe)?;
             if budget.metadata_units == 0 {
+                // A zero metadata quantum cannot query or certify another segment.
                 return Err(MarkdownLineComposeError::InvalidRequest);
             }
             let payload = self.payload.as_mut().expect("原试次已经核同唯一协调器");
@@ -344,12 +399,16 @@ impl MarkdownLineItemCoordinator {
                 answer: MarkdownLineFontProbeSegmentAnswer::Pending,
             };
             if probe.complete {
+                // Completed trials return only terminal status, never the prior segment again.
                 step.answer = MarkdownLineFontProbeSegmentAnswer::Complete;
                 return Ok(step);
             }
             if probe.shaping_segment_ready()? {
+                // Consume the previous actually ready segment before preparing
+                // its successor from an already-paid held original record.
                 let prior = probe.segment.take().expect("Ready 持唯一实际段");
                 if prior.utf16.end == probe.range.end {
+                    // Only reaching the actual whole-grapheme endpoint completes the trial.
                     probe.complete = true;
                     probe.scan = None;
                     step.answer = MarkdownLineFontProbeSegmentAnswer::Complete;
@@ -360,12 +419,18 @@ impl MarkdownLineItemCoordinator {
             }
             let limit = budget.metadata_units.min(METADATA_UNITS);
             while step.metadata_units < limit {
+                // Every new original bidi record consumes this finite metadata
+                // quantum; retained records do not trigger duplicate directory I/O.
                 let scan = probe
                     .scan
                     .as_mut()
                     .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
                 if scan.context_phase == 0 {
+                    // Find the next true resolved-level boundary within the
+                    // complete grapheme before discovering its shaping context.
                     if scan.next == probe.range.end {
+                        // Actual grapheme end closes the final level segment,
+                        // rather than treating a spent quantum as a segment edge.
                         let level = scan
                             .level
                             .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
@@ -380,18 +445,26 @@ impl MarkdownLineItemCoordinator {
                         continue;
                     }
                     let unit = if let Some(unit) = scan.held.take() {
-                        unit // 原上一步已收费的右首记录只移交一次，不重复借目录或重复计费。
+                        // Transfer the previous step's already-charged first
+                        // right record exactly once, without rereading or recharging it.
+                        unit
                     } else {
+                        // Only a fresh directory read consumes another metadata unit.
                         step.metadata_units += 1;
                         bidi.shaping_unit_at_utf16(&self.authority, scan.next)?
                             .ok_or(MarkdownLineComposeError::InconsistentCoverage)?
                     };
                     if unit.utf16 != scan.next || !unit.permits(&self.authority) {
+                        // Equal-looking coordinates from another source or an
+                        // unexpected record cannot fill this original contiguous scan.
                         return Err(MarkdownLineComposeError::InconsistentCoverage);
                     }
                     if let Some(level) = scan.level {
                         if unit.level != level {
+                            // Real changed-level scalar heads partition shaping
+                            // even when the complete editing grapheme spans both levels.
                             if unit.continuation {
+                                // A low surrogate cannot independently introduce a level seam.
                                 return Err(MarkdownLineComposeError::InconsistentCoverage);
                             }
                             probe.segment = Some(ProbeSegment {
@@ -406,6 +479,8 @@ impl MarkdownLineItemCoordinator {
                             continue;
                         }
                     } else {
+                        // The first actual scalar head determines this segment's
+                        // level and must match its original byte starting coordinate.
                         if unit.continuation || unit.byte != scan.byte {
                             return Err(MarkdownLineComposeError::InconsistentCoverage);
                         }
@@ -417,10 +492,13 @@ impl MarkdownLineItemCoordinator {
                 let segment = probe.segment.as_mut().expect("实际段已由原 level 记录封闭");
                 let paragraph = &probe.request.text_scope()?.paragraph;
                 if scan.context_phase == 1 {
-                    // 原 shaper 至多借前 20B；仅在这个固定包络内寻找实际 level 屏障。
-                    // 允许窗首落 UTF8 中部，仍交原 decode_context 舍弃不完整的首 scalar。
+                    // Search backward for actual level barriers only inside
+                    // the shaper's existing 20-byte context envelope. Its start
+                    // may split UTF-8; the original context decoder discards that partial scalar.
                     let floor = segment.bytes.start.saturating_sub(20);
                     if scan.context_cursor == paragraph.start || scan.context.start <= floor {
+                        // Actual paragraph start or the fixed context floor
+                        // ends backward lookahead before forward context begins.
                         scan.context_phase = 2;
                         scan.context_cursor = segment.utf16.end;
                         scan.context.end = segment.bytes.end;
@@ -431,22 +509,29 @@ impl MarkdownLineItemCoordinator {
                         .shaping_unit_at_utf16(&self.authority, scan.context_cursor - 1)?
                         .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
                     if unit.level != segment.level {
+                        // A real different-level record is the context barrier,
+                        // not permission to feed its text into this segment.
                         scan.context_phase = 2;
                         scan.context_cursor = segment.utf16.end;
                         scan.context.end = segment.bytes.end;
                     } else {
+                        // Extend only within the original same-level context envelope.
                         scan.context.start = unit.byte.max(floor);
                         scan.context_cursor -= 1;
                     }
                     continue;
                 }
                 if scan.context_phase == 2 {
+                    // Discover only the finite right context after the actual
+                    // segment, retaining original paragraph/level barriers.
                     let ceiling = segment
                         .bytes
                         .end
                         .saturating_add(20)
                         .min(probe.source.byte_len());
                     if scan.context.end >= ceiling || scan.context_cursor == paragraph.end {
+                        // Complete only at the actual paragraph endpoint or
+                        // existing finite context ceiling, after prior reads finished.
                         segment.context = Some(scan.context.clone());
                         scan.context_phase = 3;
                         step.answer = MarkdownLineFontProbeSegmentAnswer::Ready;
@@ -457,14 +542,17 @@ impl MarkdownLineItemCoordinator {
                         .shaping_unit_at_utf16(&self.authority, scan.context_cursor)?
                         .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
                     if unit.level != segment.level || unit.byte >= ceiling {
+                        // This real next-level/extent barrier ends context without
+                        // borrowing content from an unrelated shaping segment.
                         scan.context.end = unit.byte.min(ceiling);
                         segment.context = Some(scan.context.clone());
                         scan.context_phase = 3;
                         step.answer = MarkdownLineFontProbeSegmentAnswer::Ready;
                         return Ok(step);
                     }
-                    // 同一条记录给出完整 scalar 尾；到当前段末即可结束，不向尚未准备的后段借票。
-                    // 原上下文最多 20B，窗尾切在 UTF8 内仍由唯一 decode_context 合同处理。
+                    // This original record supplies the complete scalar tail.
+                    // Never obtain proof from an unprepared later paragraph;
+                    // the original decoder handles a 20-byte cap splitting the final scalar.
                     scan.context.end = unit.byte_end.min(ceiling);
                     scan.context_cursor += 1;
                     continue;
@@ -477,13 +565,15 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
-    /// 当前候选任一段缺字后，原唯一 owner 才能重试同 GCB 的下一真实字体。
-    /// 不替换 Source/nonce/取消位；已失败、取消或已消费请求绝不能复活。
+    /// After a candidate misses any segment, the same sole owner may try the
+    /// next actual font for this whole grapheme. Replace no Source, nonce, or
+    /// cancellation state, and never revive failed/cancelled/consumed authority.
     pub fn restart_font_probe(&mut self, probe: &mut MarkdownLineFontProbe) -> Result<()> {
         let result = (|| {
             self.require_font_probe(probe)?;
             probe.complete = false;
             if probe.single_segment {
+                // Original complete single-level proof can reset its one ready segment directly.
                 probe.segment = Some(ProbeSegment {
                     utf16: probe.range.clone(),
                     bytes: probe.bytes.clone(),
@@ -492,6 +582,8 @@ impl MarkdownLineItemCoordinator {
                 });
                 probe.scan = None;
             } else {
+                // A mixed-level grapheme must replay its actual segment scan;
+                // first-segment success cannot stand in for whole-grapheme font coverage.
                 probe.segment = None;
                 probe.scan = Some(SegmentScan::new(probe.range.start, probe.bytes.start, None));
             }
@@ -500,12 +592,15 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
-    /// 从当前唯一NeedStyle的原依赖领取首个完整GCB；固定次数目录查询不扫描字素正文。
+    /// Obtain the first complete grapheme from the sole current NeedStyle's
+    /// original dependencies through finite directory queries, without scanning its text.
     ///
-    /// 返回值只证明此一个GCB的Script、UBA和来源，不能将其字体选择扩展到整个item。
+    /// These facts prove only this grapheme's script, bidi, and Source; its font
+    /// choice cannot be extended to the remainder of the item.
     ///
     /// # Errors
-    /// 非当前nonce、阶段不符或原依赖不连续时撤销该协调器；失败不能另外创建索引补签。
+    /// Retire the coordinator on wrong nonce/phase or discontinuous original
+    /// dependencies; failure cannot be repaired by constructing another index.
     pub fn font_probe(
         &mut self,
         request: &MarkdownLineStyleRequest,
@@ -524,16 +619,20 @@ impl MarkdownLineItemCoordinator {
                 || !Arc::ptr_eq(&original.nonce, &request.nonce)
                 || original.source != request.source
             {
+                // Require the actual currently outstanding request before issuing
+                // a probe, regardless of equal text or source coordinates.
                 return Err(MarkdownLineComposeError::SourceMismatch);
             }
-            // 真实结构握手没有 Unicode/Font 权限；必须在 GCB、Script 查询之前明确拒绝。
+            // Structural handshakes have no Unicode/font authority. Reject them
+            // before issuing any grapheme or script query.
             let text = original.text_scope()?;
             #[cfg(feature = "paged-shaping-frontier")]
             if original.continuation_font.is_some()
                 && original.shaping_seams.iter().all(Option::is_none)
             {
-                // 原Frontier或自然闭项只在缺字/相邻GCB两张原端点票齐备后签发request；它本身
-                // 就是完整GCB，继续借同一个Style scope，不再同步重查原索引或正文。
+                // Frontier/closed-item continuation issues a request only with
+                // both original endpoints for the actual missing/adjacent grapheme.
+                // Reuse that complete scope without synchronously rereading indexes/text.
                 let scope = payload
                     .font_probe_scope
                     .as_ref()
@@ -562,8 +661,9 @@ impl MarkdownLineItemCoordinator {
                     complete: false,
                 });
             }
-            // 原 shaping seam 可以在真实 GCB 内部；只从同一个原 GCB 目录取外层完整字素。
-            // 它用于候选字体的全字素试次，不能把原样式响应范围扩大到这个外层范围。
+            // An original shaping seam may be inside a real grapheme. Obtain
+            // the enclosing complete grapheme from the same GCB directory for
+            // whole-grapheme font trials, without enlarging style-response authority.
             let start = request.range.start;
             let start_boundary = match payload.breaks.grapheme_query(
                 &self.authority,
@@ -598,7 +698,8 @@ impl MarkdownLineItemCoordinator {
             let end = end_boundary.utf16;
             let whole_start = start_boundary.utf16;
             let single_segment = whole_start == start && end <= request.range.end;
-            // Script来自原已完成的同一个Job，不能只看首scalar或新建局部run猜整个GCB。
+            // Script comes from the same original job's certified coverage;
+            // neither a first scalar nor another local run can classify the whole grapheme.
             #[cfg(feature = "paged-shaping-frontier")]
             let script = match payload.scripts.stable_prefix_at(
                 &self.authority,

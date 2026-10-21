@@ -1,7 +1,10 @@
-//! 系统有序字体候选的有限owner；不接收正文，不执行缺字裁决或整形。
+//! Bounded owner of ordered system font candidates, receiving no text and performing no missing-glyph
+//! decision or shaping.
 //!
-//! CoreText只保证descriptor的顺序和best-match构造。本层每个实际CTFont仍经过原
-//! PagedFont的文件、face、TTC与轴位核验；候选存在不等于某个字素已经可以正确显示。
+//! Core Text supplies descriptor order and best-match construction only. Every actual CTFont still
+//! passes the original
+//! PagedFont file, face, collection, and axis checks; candidate existence does not certify correct
+//! grapheme display.
 use std::{
     cell::Cell,
     rc::{Rc, Weak},
@@ -17,7 +20,7 @@ use super::paged_fonts::{
     NativeMarkdownFontCapture, NativeMarkdownPagedFont, NativeMarkdownPagedFontError,
 };
 
-/// 系统列表超过此硬上限时明确拒绝，不静默删掉列表尾部的回退字体。
+/// Reject a system list above this hard bound instead of silently dropping its final fallback fonts.
 pub const NATIVE_MARKDOWN_CASCADE_MAX_CANDIDATES: usize = 256;
 const MAX_LANGUAGES: usize = 8;
 const MAX_LANGUAGE_BYTES: usize = 64;
@@ -55,12 +58,15 @@ pub enum NativeMarkdownFontCascadeError {
 }
 type Result<T> = std::result::Result<T, NativeMarkdownFontCascadeError>;
 
-/// 只含弱Core身份与永久撤权标量；不保活base、字体字节、视图、文档或调用方闭包。
+/// Retain weak Core identity and sticky revocation only, without the base, font bytes, View, document,
+/// or caller closure.
 struct CascadePermit {
     original: MarkdownLayoutFontAuthority,
     revoked: Cell<bool>,
 }
 impl CascadePermit {
+    /// Check sticky revocation and the same actual base-payload identity before consulting caller
+    /// authority.
     fn check(
         &self,
         base: &NativeMarkdownPagedFont,
@@ -73,7 +79,7 @@ impl CascadePermit {
         if !base.core_font().permits(&self.original) || !base.core_font().permits(authority) {
             self.revoked.set(true);
             return Err(NativeMarkdownFontCascadeError::FontAuthorityMismatch);
-        } // 同名字、同CTFont或同轴的新capture仍没有原Core allocation权限。
+        } // A new same-name, same-CTFont, or same-axis capture still lacks the original Core allocation authority.
         if !current() {
             self.revoked.set(true);
             return Err(NativeMarkdownFontCascadeError::Revoked);
@@ -81,6 +87,7 @@ impl CascadePermit {
         Ok(())
     }
 
+    /// Guard each Native acquisition/release and return any acquired value on post-call revocation.
     fn native<T>(
         &self,
         base: &NativeMarkdownPagedFont,
@@ -91,17 +98,20 @@ impl CascadePermit {
         self.check(base, authority, current)?;
         let value = operation();
         if let Err(error) = self.check(base, authority, current) {
-            drop(value); // 原语已经返回的+1临时值在失权出口真实归还，不能发布给后继票。
+            drop(value); // Return the actual +1 temporary on revocation rather than publishing it under a successor ticket.
             return Err(error);
         }
         Ok(value)
     }
 }
 
-/// 会话局部的原有序CFArray；只保元数据，不创建或缓存每个候选的字体文件映射。
+/// Session-local ordered CFArray holds metadata only, without creating/caching font-file mappings for
+/// every candidate.
 ///
-/// MainThreadMarker保持与原PagedFont相同的Native线程边界；析构只归还本owner的CF引用，
-/// 不把框架共享descriptor/font实际销毁伪装为已证明。正文和缺字处理属于后续composer。
+/// MainThreadMarker preserves PagedFont's Native thread boundary. Destruction returns this owner's CF
+/// claims only,
+/// without claiming shared framework descriptors/fonts were destroyed. Later composition owns text and
+/// missing-glyph decisions.
 pub struct NativeMarkdownFontCascade {
     descriptors: CFRetained<CFArray>,
     permit: Rc<CascadePermit>,
@@ -111,10 +121,12 @@ pub struct NativeMarkdownFontCascade {
     mtm: MainThreadMarker,
 }
 impl NativeMarkdownFontCascade {
-    /// 捕获系统真实顺序；languages只来自固定配置，不能用笔记内容探测字体。
+    /// Capture actual system order using fixed configured languages, never probing fonts with note
+    /// contents.
     ///
     /// # Errors
-    /// 配额、语言、原payload权限、系统Copy失败或列表超预算均明确拒绝；不返回截断列表。
+    /// Reject invalid quota/languages/original-payload authority, failed system copy, or excess
+    /// candidates without a truncated list.
     pub fn capture(
         base: &NativeMarkdownPagedFont,
         authority: &MarkdownLayoutFontAuthority,
@@ -136,20 +148,21 @@ impl NativeMarkdownFontCascade {
             })
         {
             return Err(NativeMarkdownFontCascadeError::InvalidLanguages);
-        } // 仅校验有限语言tag形状，不把任意UTF8正文交给系统字体查询。
+        } // Validate bounded language-tag syntax only; arbitrary UTF-8 note text never enters the system font query.
         let permit = Rc::new(CascadePermit {
             original: authority.clone(),
             revoked: Cell::new(false),
         });
-        permit.check(base, authority, current)?; // 任何CF构造前先核同一个实际Core payload。
+        permit.check(base, authority, current)?; // Validate the actual same Core payload before any CF construction.
         let mut values = Vec::with_capacity(languages.len());
         for language in languages {
             values.push(permit.native(base, authority, current, || CFString::from_str(language))?);
-        } // Vec仅有最多8个固定语言值，不按文档或系统字体总量扩张。
+        } // This vector holds at most eight fixed languages, independently of document size or system font count.
         let language_array = permit.native(base, authority, current, || {
             CFArray::<CFString>::from_retained_objects(&values)
         })?;
-        // SAFETY: 原base与有限CFString数组贯穿公开Copy调用；返回列表自身拥有全部descriptor。
+        // SAFETY: The original base and bounded CFString array cover the Copy call; the returned array
+        // owns its descriptors.
         let descriptors = permit
             .native(base, authority, current, || unsafe {
                 base.native_font()
@@ -162,11 +175,11 @@ impl NativeMarkdownFontCascade {
                 actual: count,
                 maximum: budget.maximum_candidates,
             });
-        } // 原完整list在失败出口归还；没有用预算后的前缀冒充系统完整候选。
+        } // Return the complete list on failure; a bounded prefix cannot masquerade as the full system cascade.
         permit.native(base, authority, current, || drop(language_array))?;
         for value in values {
             permit.native(base, authority, current, || drop(value))?;
-        } // 临时语言claim归还后再次核票，列表才能进入外部可见owner。
+        } // Recheck authority after returning language temporaries before publishing the externally visible list owner.
         permit.check(base, authority, current)?;
         Ok(Self {
             descriptors,
@@ -178,16 +191,19 @@ impl NativeMarkdownFontCascade {
         })
     }
 
-    /// 返回实际系统列表总数，包含尚未构造字体的候选；不是已经支持的字素数。
+    /// Return the actual system-list count including unconstructed fonts, never a count of supported
+    /// graphemes.
     #[must_use]
     pub fn candidate_count(&self) -> usize {
         self.count
     }
 
-    /// 按原列表逐项交付；不排序、不按同名去重、不扫描字符，也不隐式重试失败字体。
+    /// Deliver original list entries in order, without sorting, name-based deduplication, character
+    /// scans, or implicit retries.
     ///
     /// # Errors
-    /// 任意失权永久撤销本游标；不合格CF类型明确失败，不能跳过后伪称完整候选遍历。
+    /// Revocation permanently ends this cursor; invalid CF types fail instead of being skipped in a
+    /// supposedly complete traversal.
     pub fn next(
         &mut self,
         base: &NativeMarkdownPagedFont,
@@ -196,10 +212,11 @@ impl NativeMarkdownFontCascade {
     ) -> Result<Option<NativeMarkdownFontCandidate>> {
         self.permit.check(base, authority, current)?;
         if self.next == self.count {
-            return Ok(None); // 仅在实际count全部交付后结束；空系统列表也不表示字体功能Ready。
+            return Ok(None); // End only after delivering the actual count; an empty system list does not mean font support is Ready.
         }
         let ordinal = self.next;
-        // SAFETY: 原不可变list保活，ordinal<count≤256；CoreText公开约定每个值是CFType descriptor。
+        // SAFETY: The immutable list stays alive and ordinal<count<=256; Core Text specifies CFType
+        // descriptor entries.
         let raw = self.permit.native(base, authority, current, || unsafe {
             self.descriptors.value_at_index(ordinal as _)
         })?;
@@ -207,7 +224,8 @@ impl NativeMarkdownFontCascade {
             self.permit.revoked.set(true);
             return Err(NativeMarkdownFontCascadeError::InvalidDescriptor);
         }
-        // SAFETY: 刚取得的非空CFType由原list保活；先动态核类型，再取得自己的+1 claim。
+        // SAFETY: The original list retains this nonnull CFType; verify its dynamic type before
+        // obtaining an independent +1 claim.
         let value = unsafe { &*raw.cast::<CFType>() };
         let descriptor = self.permit.native(base, authority, current, || {
             value.downcast_ref::<CTFontDescriptor>()
@@ -219,7 +237,7 @@ impl NativeMarkdownFontCascade {
         let descriptor = self
             .permit
             .native(base, authority, current, || descriptor.retain())?;
-        self.next += 1; // 只有原类型与retain都按同票完成，才消费这个固定系统ordinal。
+        self.next += 1; // Consume this system ordinal only after original-ticket type checking and retain both succeed.
         Ok(Some(NativeMarkdownFontCandidate {
             descriptor,
             permit: Rc::downgrade(&self.permit),
@@ -229,18 +247,19 @@ impl NativeMarkdownFontCascade {
         }))
     }
 
-    /// 停止签发候选并归还原CFArray；已有不可变描述符不被清空，旧候选不能再构造字体。
+    /// Stop issuing candidates and return the original CFArray; existing immutable descriptors stay
+    /// intact but cannot construct new fonts.
     pub fn close(self) {
         drop(self);
     }
 }
 impl Drop for NativeMarkdownFontCascade {
     fn drop(&mut self) {
-        self.permit.revoked.set(true); // 先撤所有Weak候选，再由字段顺序交还原list与唯一permit。
+        self.permit.revoked.set(true); // Revoke every weak candidate before fields return the original list and sole permit.
     }
 }
 
-/// 原列表一个真实descriptor及Weak签发身份；不保活列表或原base Font。
+/// One actual descriptor and weak issuer identity retain neither the cascade list nor base font.
 pub struct NativeMarkdownFontCandidate {
     descriptor: CFRetained<CTFontDescriptor>,
     permit: Weak<CascadePermit>,
@@ -249,22 +268,25 @@ pub struct NativeMarkdownFontCandidate {
     mtm: MainThreadMarker,
 }
 impl NativeMarkdownFontCandidate {
-    /// 原系统数组下标；不是字体名、glyph ID或脚本范围。
+    /// Original system-array ordinal, not a font name, glyph ID, or script range.
     #[must_use]
     pub fn ordinal(&self) -> usize {
         self.ordinal
     }
-    /// 只借出原不可变描述符供有限元数据观察；不授予新的capture、正文或绘制权限。
-    /// 级联关闭后该值仍保持不可变，不能为释放验收强制改成空对象。
+    /// Lend the immutable descriptor for finite metadata observation only, without new
+    /// capture/text/paint authority.
+    /// After cascade close it remains immutable; release verification must not force it into an empty
+    /// object.
     #[must_use]
     pub fn descriptor(&self) -> &CTFontDescriptor {
         &self.descriptor
     }
 
-    /// 按需构造一个实际best-match字体，再复用原精确Native/Core来源捕获。
+    /// Construct one actual best-match font on demand, then reuse exact Native/Core Source capture.
     ///
     /// # Errors
-    /// 级联结束、原Font失权、Native捕获失败均显式返回；本调用不猜缺字、不改字素边界。
+    /// Report ended cascade, revoked original font, or failed Native capture without guessing missing
+    /// glyphs or changing grapheme boundaries.
     pub fn capture(
         &self,
         base: &NativeMarkdownPagedFont,
@@ -278,9 +300,10 @@ impl NativeMarkdownFontCandidate {
             NativeMarkdownPagedFont::capture(&native, maximum_font_bytes, self.mtm, &valid);
         permit.native(base, authority, current, || drop(native))?;
         permit.check(base, authority, current)?;
-        captured.map_err(Into::into) // 候选失败不会自动拿后一个字体掩盖；下一步由composer显式决定。
+        captured.map_err(Into::into) // A candidate failure never silently substitutes the next font; the Composer explicitly owns the next decision.
     }
-    /// 活动 Body 只复用这个实际候选的既有 capture；级联 ordinal 与原单 GCB 试次顺序不变。
+    /// The active Body reuses this actual candidate's existing capture while preserving cascade ordinal
+    /// and original grapheme-trial order.
     pub(crate) fn capture_reusing(
         &self,
         base: &NativeMarkdownPagedFont,
@@ -303,7 +326,8 @@ impl NativeMarkdownFontCandidate {
         captured.map_err(Into::into)
     }
 
-    /// 独立捕获与活动 palette 复用共用实际 best-match 构造；仅原弱许可仍活时可以进入 Native。
+    /// Standalone capture and active-palette reuse share actual best-match construction; Native entry
+    /// requires the original live weak permit.
     fn construct(
         &self,
         base: &NativeMarkdownPagedFont,
@@ -315,8 +339,10 @@ impl NativeMarkdownFontCandidate {
             .upgrade()
             .ok_or(NativeMarkdownFontCascadeError::Revoked)?;
         permit.check(base, authority, current)?;
-        // SAFETY: 原descriptor强claim与有限正字号来自原base；None矩阵没有外部指针。
-        // 禁止自动激活/下载只是候选来源约束，实际best-match仍交原capture完整核验。
+        // SAFETY: The original strong descriptor and finite positive size come from the base; the null
+        // matrix references no external storage.
+        // Preventing autoactivation/download only constrains candidate acquisition; original capture
+        // still fully verifies actual best-match identity.
         let native = permit.native(base, authority, current, || unsafe {
             CTFont::with_font_descriptor_and_options(
                 &self.descriptor,

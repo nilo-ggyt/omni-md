@@ -760,15 +760,7 @@ fn revision_is_content_based_and_stable() {
         first.buffer.original_revision(),
         different.buffer.original_revision()
     );
-    assert_eq!(
-        first
-            .buffer
-            .original_revision()
-            .expect("normal disk baseline")
-            .encode_hex()
-            .len(),
-        64
-    );
+    assert_eq!(first.buffer.original_revision().encode_hex().len(), 64);
 }
 
 /// Materialize a test oracle through the public streaming API only.

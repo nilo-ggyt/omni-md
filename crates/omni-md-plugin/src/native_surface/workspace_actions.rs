@@ -823,7 +823,8 @@ impl NativeMarkdownCurrentNoteIntent {
             .with_borrow(|active| active.as_ref().is_some_and(|surface| self.matches(surface)))
     }
 
-    /// 原菜单与冲突条共用具体重载/另存流程；原票跨IME、确认、命名和磁盘副作用持续有效。
+    /// Shares the actual reload/save-as flow between the menu and conflict bar, preserving the
+    /// original note intent through IME commit, confirmation, naming, and disk side effects.
     pub(super) fn perform_resolution(&self, action: isize, revision: u64) -> Result<(), String> {
         if !self.current() {
             return Ok(());
@@ -842,7 +843,8 @@ impl NativeMarkdownCurrentNoteIntent {
             return Ok(());
         }
         with_active_native_markdown_surface(|surface| {
-            // 重载/另存提交实际模式的唯一客户端；Source不能因没有NSTextView而跳过中文组合。
+            // Commit the actual presentation mode's one input client. Source mode still owns
+            // Chinese composition even though it does not use an NSTextView.
             surface.commit_marked_text(false)
         })?;
         if !current() {
@@ -850,7 +852,8 @@ impl NativeMarkdownCurrentNoteIntent {
         }
         let mtm = MainThreadMarker::new().expect("冲突处理沿原AppKit主队列执行");
         match action {
-            // 只有明确确认才放弃原本地草稿；取消保留同一canonical与原外部文件。
+            // Discard the local draft only after explicit confirmation; cancellation keeps the
+            // same canonical model and the authoritative external file.
             4 => {
                 let path = self.relative_path.clone();
                 if !run_native_markdown_modal_confirmation(
@@ -863,41 +866,18 @@ impl NativeMarkdownCurrentNoteIntent {
                 )
                 .map_err(|error| error.to_string())?
                 {
-                    // 只有明确Reload授权丢弃；Cancel保留当前canonical草稿和外部文件。
+                    // Only explicit reload authorizes discard. Cancel preserves both live and disk versions.
                     return Ok(());
                 }
                 if !current() {
                     return Ok(());
                 }
-                let preparation = ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
-                    // 用户已明确确认重新载入；这里只核验磁盘并准备小票据，不发布决定或新模型。
-                    let surface = active.as_ref().ok_or("笔记窗口已关闭")?;
-                    if !self.matches(surface)
-                        || surface.controller.conflict_publication() != revision
-                    {
-                        return Err("原冲突笔记或保存结果已变更，本次操作已取消".to_owned());
-                    }
-                    let editor = surface.editor.as_ref().ok_or("当前没有打开的笔记")?;
-                    session
-                        .prepare_legacy_recovery_after_reload(&editor.document().borrow())
-                        .map_err(|error| error.to_string())
-                })?;
-                let handoff = match preparation {
-                    omni_markdown_core::MarkdownRecoveryPreparation::NotPending => {
-                        // 普通文档继续既有重新载入，不创建恢复权限。
-                        None
-                    }
-                    omni_markdown_core::MarkdownRecoveryPreparation::Prepared(handoff) => {
-                        // 仅当前旧冲突草稿的显式决定获得一次性目标能力。
-                        Some(handoff)
-                    }
-                };
-                if !current() {
-                    return Ok(());
-                }
-                replace_active_editor_from_disk(path, handoff, self, revision)
+                // Explicit discard keeps the established reload route and waits for the actual
+                // old editor release before acquiring the confined destination Markdown file.
+                replace_active_editor_from_disk(path, self, revision, None)
             }
-            // 本地草稿先以独占新文件真正保存，再沿原释放屏障更换编辑器。
+            // Save the live draft under an exclusive new filename before replacing the editor
+            // through its original actual-release barrier.
             5 => {
                 let path = self.relative_path.clone();
                 let title = format!(
@@ -918,87 +898,100 @@ impl NativeMarkdownCurrentNoteIntent {
                 )
                 .map_err(|error| error.to_string())?
                 else {
-                    // 命名取消保留原草稿和权威文件，不新建或删除任何笔记。
+                    // Cancelling naming preserves the live draft and disk file without creating or deleting a note.
                     return Ok(());
                 };
                 if !current() {
                     return Ok(());
                 }
-                let receipt = ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
-                    let surface = active.as_ref().ok_or("笔记窗口已关闭")?;
-                    if !self.matches(surface)
-                        || surface.controller.conflict_publication() != revision
-                    {
-                        return Err("原冲突笔记或保存结果已变更，本次操作已取消".to_owned());
-                    }
-                    let editor = surface.editor.as_ref().ok_or("当前没有打开的笔记")?;
-                    session
-                        .save_document_buffer_as_new(
-                            &editor.document().borrow(),
-                            &native_markdown_note_parent(&path),
-                            &title,
-                        )
-                        .map_err(|error| error.to_string())
-                })?;
-                if !current() {
+                let (receipt, saved_generation) =
+                    ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
+                        // Recheck the original note and conflict publication before the irreversible
+                        // save-as. Core streams its actual piece tree and returns a durable-copy receipt.
+                        let surface = active.as_ref().ok_or("笔记窗口已关闭")?;
+                        if !self.matches(surface)
+                            || surface.controller.conflict_publication() != revision
+                        {
+                            return Err("原冲突笔记或保存结果已变更，本次操作已取消".to_owned());
+                        }
+                        let editor = surface.editor.as_ref().ok_or("当前没有打开的笔记")?;
+                        let document = editor.document().borrow();
+                        // Fix the generation in the same original document borrow that owns the actual
+                        // save-as. Later Native sidebar work must not recapture a newer live generation.
+                        let generation = document.generation();
+                        let receipt = session
+                            .save_document_buffer_as_new(
+                                &document,
+                                &native_markdown_note_parent(&path),
+                                &title,
+                            )
+                            .map_err(|error| error.to_string())?;
+                        let actual = document.current_revision().map_err(|error| {
+                            format!(
+                                "草稿副本已保存到“{}”，但原正文校验未完成，原草稿已保留：{error}",
+                                receipt.relative_path
+                            )
+                        })?;
+                        if receipt.revision != actual.encode_hex() {
+                            // A published copy cannot justify discarding another live value. Keep both
+                            // files and the original editor; do not replay the already completed save-as.
+                            return Err(format!(
+                                "草稿副本已保存到“{}”，但与原正文版本不一致，原草稿已保留",
+                                receipt.relative_path
+                            ));
+                        }
+                        Ok((receipt, generation))
+                    })?;
+                let saved_input_current = || {
+                    ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
+                        active.as_ref().is_some_and(|surface| {
+                            self.matches(surface)
+                                && surface.controller.conflict_publication() == revision
+                                && surface.editor.as_ref().is_some_and(|editor| {
+                                    editor.document().borrow().generation() == saved_generation
+                                })
+                        })
+                    })
+                };
+                if !saved_input_current() {
                     return Err(format!(
-                        "草稿副本已保存到“{}”，但原笔记操作已撤销",
+                        "草稿副本已保存到“{}”，但原笔记已变更，原草稿已保留",
                         receipt.relative_path
                     ));
                 }
                 with_active_native_markdown_surface(|surface| {
+                    // Refresh only the still-original surface after the copy exists. A later failure
+                    // reports the saved path; it cannot roll back or hide that real published copy.
                     if !self.matches(surface)
                         || surface.controller.conflict_publication() != revision
+                        || surface.editor.as_ref().is_none_or(|editor| {
+                            editor.document().borrow().generation() != saved_generation
+                        })
                     {
-                        return Err("草稿副本已保存，但原笔记操作已撤销".to_owned());
+                        return Err("原笔记已变更，原草稿已保留".to_owned());
                     }
                     surface.refresh_workspace_sidebar(mtm)
                 })
                 .map_err(|error| {
                     format!(
-                        "草稿副本已保存到“{}”，但目录刷新未完成：{error}",
+                        "草稿副本已保存到“{}”，但目录刷新未完成，原草稿已保留：{error}",
                         receipt.relative_path
                     )
                 })?;
-                if !current() {
+                if !saved_input_current() {
                     return Err(format!(
-                        "草稿副本已保存到“{}”，但原笔记操作已撤销",
+                        "草稿副本已保存到“{}”，但原笔记已变更，原草稿已保留",
                         receipt.relative_path
                     ));
                 }
-                let preparation = ACTIVE_NATIVE_MARKDOWN_SURFACE.with_borrow(|active| {
-                    // 副本已经持久化，重新核验当前 live 草稿与该副本的 receipt；失败仍保留所有文件。
-                    let surface = active.as_ref().ok_or("笔记窗口已关闭")?;
-                    if !self.matches(surface)
-                        || surface.controller.conflict_publication() != revision
-                    {
-                        return Err("原冲突笔记或保存结果已变更，本次操作已取消".to_owned());
-                    }
-                    let editor = surface.editor.as_ref().ok_or("当前没有打开的笔记")?;
-                    session
-                        .prepare_legacy_recovery_after_save_as_new(
-                            &editor.document().borrow(),
-                            &receipt,
-                        )
-                        .map_err(|error| format!("副本已保存，但恢复交接尚未准备完成：{error}"))
-                })?;
-                let handoff = match preparation {
-                    omni_markdown_core::MarkdownRecoveryPreparation::NotPending => {
-                        // 普通另存副本不生成恢复记录或绕过权限。
-                        None
-                    }
-                    omni_markdown_core::MarkdownRecoveryPreparation::Prepared(handoff) => {
-                        // 只把已核验的小票据交给原释放屏障，旧模型与映射不进入 pending transition。
-                        Some(handoff)
-                    }
-                };
-                if !current() {
-                    return Err(format!(
-                        "草稿副本已保存到“{}”，但原笔记操作已撤销",
-                        receipt.relative_path
-                    ));
-                }
-                replace_active_editor_from_disk(receipt.relative_path, handoff, self, revision)
+                // The new copy already passed Core's durable save-as boundary. Transition through
+                // the same original editor teardown; failure preserves the copy and current draft.
+                replace_active_editor_from_disk(
+                    receipt.relative_path,
+                    self,
+                    revision,
+                    Some(saved_generation),
+                )
             }
             _ => unreachable!("冲突处理只接原重载和另存动作"),
         }
@@ -1364,41 +1357,58 @@ fn choose_import_file(
 /// Starts an explicit discard/reload after the caller obtained confirmation or saved a new draft.
 fn replace_active_editor_from_disk(
     relative_path: String,
-    recovery_handoff: Option<omni_markdown_core::MarkdownRecoveryHandoff>,
     original: &NativeMarkdownCurrentNoteIntent,
     revision: u64,
+    saved_generation: Option<u64>,
 ) -> Result<(), String> {
     let controller = with_active_native_markdown_surface(|surface| {
-        if !original.matches(surface) || surface.controller.conflict_publication() != revision {
-            return Err("原冲突笔记或保存结果已变更，本次操作已取消".to_owned());
+        // Reload explicitly discards the confirmed draft. Save-as instead carries the generation
+        // fixed by its real durable copy; neither a sidebar refresh nor search shutdown may renew it.
+        let current = |surface: &NativeMarkdownWindowSurface| {
+            original.matches(surface)
+                && surface.controller.conflict_publication() == revision
+                && saved_generation.is_none_or(|generation| {
+                    surface
+                        .editor
+                        .as_ref()
+                        .is_some_and(|editor| editor.document().borrow().generation() == generation)
+                })
+        };
+        let changed = || {
+            if saved_generation.is_some() {
+                format!("草稿副本已保存到“{relative_path}”，但原笔记已变更，原草稿已保留")
+            } else {
+                "原冲突笔记或保存结果已变更，本次操作已取消".to_owned()
+            }
+        };
+        if !current(surface) {
+            return Err(changed());
         }
         surface.stop_search();
-        if let Some(handoff) = &recovery_handoff {
-            // 票据只能打开它绑定的唯一目标，不能被另一菜单路径借用为通用绕过入口。
-            if handoff.target_relative_path() != relative_path {
-                return Err("恢复交接目标已变更，当前草稿已保留".to_owned());
-            }
-            let editor = surface.editor.as_ref().ok_or("当前没有打开的笔记")?;
-            surface
-                .session
-                .validate_legacy_recovery_handoff(&editor.document().borrow(), handoff)
-                .map_err(|error| error.to_string())?;
+        if !current(surface) {
+            return Err(changed());
         }
         let previous_relative_path = surface.current_note_relative_path.clone();
-        // 所有可重入的辞任/预检结束后，再在 accepted 清理前核验票据源身份；
-        // 晚到输入拒绝释放，票据 drop 不写任何 marker。
-        let release_barrier =
-            surface.destroy_current_editor_with_recovery(recovery_handoff.as_ref())?;
+        // The actual resign/preflight path rechecks this same document and generation before
+        // accepting cleanup. A late canonical edit keeps the original draft open for saving.
+        let release_barrier = surface.destroy_current_editor().map_err(|error| {
+            if saved_generation.is_some() {
+                format!(
+                    "草稿副本已保存到“{relative_path}”，但原编辑器未能结束，原草稿已保留：{error}"
+                )
+            } else {
+                error
+            }
+        })?;
         surface.pending_note_switch = Some(PendingNativeMarkdownNoteSwitch {
             relative_path,
             previous_relative_path,
             release_barrier,
-            recovery_handoff,
             fragment: None,
         });
         Ok::<_, String>(surface.controller.clone())
     })?;
-    // The confirmed reload waits for actual old-graph destruction before acquiring authoritative disk content.
+    // Both replacement routes wait for actual old-graph destruction before acquiring destination disk content.
     schedule_native_markdown_note_switch_completion(&controller)
 }
 

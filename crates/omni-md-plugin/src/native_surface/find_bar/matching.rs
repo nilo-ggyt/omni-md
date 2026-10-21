@@ -1,4 +1,5 @@
-//! 同步显式查找的匹配适配；Foundation 枚举与 canonical 可变事务严格分开。
+//! Adapt matching for explicit synchronous Find actions. Keep Foundation
+//! enumeration separate from canonical mutable transactions.
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -25,7 +26,8 @@ use template::*;
 #[path = "backend.rs"]
 pub(super) mod backend;
 
-/// 独立 TextKit 夹具显式提供自己的实际图；正式 Find 直接使用分页后端。
+/// The independent TextKit fixture explicitly supplies its actual graph;
+/// production Find uses the paged backend directly.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn execute_find_action(
     bar: &Rc<NativeMarkdownFindBar>,
@@ -46,7 +48,7 @@ pub(super) fn execute_find_action(
     .map(|_| ())
     .map_err(|error| error.to_string())
 }
-/// 查询和值只活在一次同步动作内，退出动作即释放所有容量。
+/// Query values live for one synchronous action; all capacity is released when it ends.
 pub(super) struct Query {
     pub(super) search: String,
     replacement: String,
@@ -56,14 +58,16 @@ pub(super) struct Query {
     compiled: std::cell::OnceCell<Result<Retained<NSRegularExpression>, String>>,
 }
 
-/// 导航只取主范围；只有替换模板需要 capture 坐标，避免每个导航命中都分配 Vec。
+/// Navigation needs only the main range. Capture coordinates are allocated only
+/// for replacement templates that consume them, avoiding per-navigation-match vectors.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CaptureRanges {
     Omit,
     Include,
 }
 
-/// 一个 match 只携带标量坐标；不跨 Foundation callback 保留 NSTextCheckingResult。
+/// A match carries scalar coordinates only, never an NSTextCheckingResult retained
+/// beyond its Foundation callback.
 #[derive(Clone, Debug)]
 struct Found {
     range: Range<usize>,
@@ -71,23 +75,26 @@ struct Found {
     captures: Vec<Option<Range<usize>>>,
 }
 
-/// 反转义只处理 baseline 声明的四种字符，未知 escape 保留给 regex 或字面搜索。
+/// Decode only the baseline query language's four escapes. Preserve unknown
+/// escapes for the regex engine or literal search.
 pub(super) fn unquote(text: &str) -> String {
     let mut result = String::new();
     let mut chars = text.chars().peekable();
     while let Some(character) = chars.next() {
-        // 只向前消费有界输入；已识别的二字符 escape 一次消费，未知序列保留原文。
+        // Consume bounded input forward once. Recognized two-scalar escapes are
+        // consumed together; unknown sequences retain their original characters.
         if character == '\\' {
-            // 只有明确的查询语言 escape 才改变值，末尾单独反斜线按字面保留。
+            // Only defined query-language escapes change value; a trailing lone
+            // backslash remains literal.
             let replacement = match chars.peek() {
-                Some('n') => Some('\n'),  // 显式换行。
-                Some('r') => Some('\r'),  // 显式 carriage return。
-                Some('t') => Some('\t'),  // 显式 tab。
-                Some('\\') => Some('\\'), // 显式反斜线。
-                _ => None, // 非集合 escape 留给下面的专门转换或原生校验。                // 未知 escape 不被悄悄删除。
+                Some('n') => Some('\n'),  // Explicit line feed.
+                Some('r') => Some('\r'),  // Explicit carriage return.
+                Some('t') => Some('\t'),  // Explicit tab.
+                Some('\\') => Some('\\'), // Explicit backslash.
+                _ => None,                // Unknown escapes must not silently lose their backslash.
             };
             if let Some(replacement) = replacement {
-                // 已确认替代字符，跳过 escape 的第二个 scalar，避免下轮重复输出。
+                // Consume the recognized escape's second scalar so it is not emitted twice.
                 chars.next();
                 result.push(replacement);
                 continue;
@@ -98,13 +105,14 @@ pub(super) fn unquote(text: &str) -> String {
     result
 }
 
-/// 仅转换已核对的 ECMAScript 字符类/转义；不是私有 parser，也不声称 ICU 支持全部 JS 语法。
+/// Translate only reviewed ECMAScript character classes/escapes. ICU's public
+/// compiler still owns syntax validation; this is no complete JavaScript parser.
 fn native_pattern(pattern: &str, case_sensitive: bool) -> String {
     let word = if case_sensitive {
-        // 区分大小写时 JS word 仅含 ASCII 字母、数字与下划线。
+        // Case-sensitive JavaScript word characters are ASCII letters, digits, and underscore.
         "A-Za-z0-9_"
     } else {
-        // Unicode ignore-case 额外允许与 ASCII word simple-fold 等价的两个字符。
+        // Unicode ignore-case adds the two scalars whose simple fold equals an ASCII word character.
         "A-Za-z0-9_ſK"
     };
     let space = r"\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
@@ -113,32 +121,34 @@ fn native_pattern(pattern: &str, case_sensitive: bool) -> String {
     let mut characters = pattern.chars().peekable();
     let mut in_class = false;
     while let Some(character) = characters.next() {
-        // 转换单个 token，不递归展开用户 pattern；最终语法仍由 ICU 公共 compiler 校验。
+        // Translate one token without recursively expanding user syntax; ICU
+        // remains responsible for compiling and rejecting the resulting pattern.
         if character == '\\' {
             let Some(escape) = characters.next() else {
-                // 不完整 escape 原样交给 compiler 报错，不补造合法查询。
+                // Preserve an incomplete escape for the compiler to reject; invent no valid query.
                 output.push('\\');
                 break;
             };
             let class = match escape {
-                'w' => Some((false, word)), // JS 的 word 类不等于 ICU 的 Unicode word 类。
-                'W' => Some((true, word)),  // word 的补集仍按 JS 字符集合定义。
-                'd' => Some((false, "0-9")), // JS \d 只包含 ASCII digit。
-                'D' => Some((true, "0-9")), // 非 ASCII digit 的字符不能被 ICU Unicode digit 吞掉。
-                's' => Some((false, space)), // 包含 BOM，不把 ICU 的 NEL 当 JS whitespace。
-                'S' => Some((true, space)), // 与同一 JS whitespace 集合取补集。
-                _ => None,                  // 非集合 escape 留给下面的专门转换或原生校验。
+                'w' => Some((false, word)), // JavaScript word differs from ICU Unicode word.
+                'W' => Some((true, word)),  // Complement that same JavaScript set.
+                'd' => Some((false, "0-9")), // JavaScript digits contain ASCII only.
+                'D' => Some((true, "0-9")), // ICU Unicode digits must not broaden the complemented set.
+                's' => Some((false, space)), // Include BOM; exclude ICU's NEL whitespace.
+                'S' => Some((true, space)), // Complement the same JavaScript whitespace set.
+                _ => None, // Other escapes follow the explicit translations or Native validation below.
             };
             if let Some((negative, class)) = class {
-                // ICU 的公开 UnicodeSet 支持嵌套补集；正向集合在现有括号内直接展开。
+                // Public ICU UnicodeSet supports nested complements; positive
+                // classes can expand directly inside an existing character class.
                 if in_class && !negative {
-                    // 复用外层字符类，避免把其中成员错误解释为额外的字面括号。
+                    // Reuse the outer character class rather than introducing literal brackets.
                     output.push_str(class);
                 } else {
-                    // 独立 atom 或补集需要自己的括号，维持集合而不是文本拼接语义。
+                    // Standalone atoms/complements need their own brackets to preserve set semantics.
                     output.push('[');
                     if negative {
-                        // 仅在此内层集合反转成员，不反转整个用户查询。
+                        // Complement this inner set only, not the user's whole pattern.
                         output.push('^');
                     }
                     output.push_str(class);
@@ -146,38 +156,38 @@ fn native_pattern(pattern: &str, case_sensitive: bool) -> String {
                 }
             } else if !in_class && matches!(escape, 'b' | 'B') {
                 if escape == 'b' {
-                    // 相邻两侧 word 类别不同；使用零宽断言，不消费正文。
+                    // A word boundary separates different word categories; zero-width assertions consume no text.
                     output.push_str(&format!(
                         "(?:(?<!{word_atom})(?={word_atom})|(?<={word_atom})(?!{word_atom}))"
                     ));
                 } else {
-                    // 相同类别是边界的补集，正文边缘也按非 word 处理。
+                    // Equal categories form the complement; document edges count as nonword.
                     output.push_str(&format!(
                         "(?:(?<={word_atom})(?={word_atom})|(?<!{word_atom})(?!{word_atom}))"
                     ));
                 }
             } else if escape == 'u' && characters.peek() == Some(&'{') {
-                // JS Unicode scalar escape 与 ICU 的公开 \x{...} 使用不同前缀。
+                // JavaScript scalar escapes use a different prefix from ICU's public \x{...} syntax.
                 output.push_str("\\x");
             } else {
                 output.push('\\');
-                output.push(escape); // 其余语法由 ICU 正常验证并返回明确错误。
+                output.push(escape); // ICU validates remaining syntax and returns an explicit error.
             }
         } else if character == '^' && !in_class {
-            // ECMAScript multiline 只承认四种行终止符；ICU 原生 m 还包含 VT/FF/NEL。
+            // ECMAScript multiline recognizes four terminators; ICU's native m also includes VT/FF/NEL.
             output.push_str(r"(?:\A|(?<=[\n\r\u2028\u2029]))");
         } else if character == '$' && !in_class {
-            // 使用绝对正文末尾，不把 ICU 的额外换行语义带进 baseline 查询。
+            // Use the absolute document end, excluding ICU's additional line-ending semantics.
             output.push_str(r"(?:\z|(?=[\n\r\u2028\u2029]))");
         } else if character == '.' && !in_class {
-            output.push_str(r"[^\n\r\u2028\u2029]"); // JS dot 不排除 NEL，保留其实际匹配行为。
+            output.push_str(r"[^\n\r\u2028\u2029]"); // JavaScript dot permits NEL; preserve that behavior.
         } else {
             if character == '[' {
-                // 字符类内部的点和锚点是字面成员，不能套用外部 token 转换。
+                // Dots/anchors inside a class are literal members, not outside-class tokens.
                 in_class = true;
             }
             if character == ']' {
-                // 结束当前类；无效或不配对的括号仍交给 ICU 拒绝。
+                // Close this class; ICU still rejects invalid/unpaired brackets.
                 in_class = false;
             }
             output.push(character);
@@ -186,27 +196,30 @@ fn native_pattern(pattern: &str, case_sensitive: bool) -> String {
     output
 }
 
-/// 原生字符串先检查有限长度再复制；不会为搜寻而截断或取消正在进行的 composition。
+/// Check Native length before bounded copying. Find must neither truncate user
+/// input nor commit/cancel an active composition to obtain a value.
 fn read_field(field: &NSTextField) -> Result<String, String> {
     if let Some(editor) = field.currentEditor() {
         let editor = editor
             .downcast_ref::<NSTextView>()
             .ok_or("查找字段的原输入上下文不可用")?;
-        // SAFETY: 实际字段编辑器已经核为NSTextView，公开NSTextInputClient只读该原生组合状态。
+        // SAFETY: The actual field editor was checked as NSTextView; the public
+        // NSTextInputClient method only observes its marked-text state.
         if unsafe { msg_send![editor, hasMarkedText] } {
             return Err("请先完成当前输入法组合，再执行查找或替换".into());
         }
-    } // 按钮/菜单与Return共用同一组合边界；不提交、取消或读取未完成的查询候选。
+    } // Buttons, menus, and Return share this composition boundary and never read unfinished candidates.
     let value = field.stringValue();
     if value.length() > 16_384 {
-        // 先拒绝超限 native 值，避免复制不可控输入或静默截断用户模板。
+        // Reject oversized Native values before copying, without silently truncating a user's template.
         return Err("查找与替换输入最多为 16,384 个 UTF-16 单元".into());
     }
     Ok(value.to_string())
 }
 
 impl Query {
-    /// 自动反馈只读原查询和三个选项，不读取替换候选；每个Native getter分别服从同一原输入票。
+    /// Automatic feedback reads the original query and three options, never the
+    /// replacement candidate. Each Native getter obeys the same original input ticket.
     pub(super) fn read_viewport(
         bar: &NativeMarkdownFindBar,
         current: &impl Fn() -> bool,
@@ -214,7 +227,7 @@ impl Query {
         Ok(Self {
             search: native_markdown_table_intent_step(current, || read_field(&bar.query))
                 .map_err(|_| "原查询输入已变化")??,
-            replacement: String::new(), // 反馈不会解析替换模板或自动提交替换。
+            replacement: String::new(), // Feedback neither parses replacement templates nor performs replacement.
             case_sensitive: native_markdown_table_intent_step(current, || bar.case.state() != 0)
                 .map_err(|_| "原查询选项已变化")?,
             regex: native_markdown_table_intent_step(current, || bar.regex.state() != 0)
@@ -225,18 +238,19 @@ impl Query {
         })
     }
 
-    /// 导航只读查询；真正替换才读取模板，替换字段的中文候选不能阻断无关导航。
+    /// Read a template only for replacement. Composition in the replacement field
+    /// must not block unrelated query navigation.
     fn read(bar: &NativeMarkdownFindBar, action: MarkdownFindAction) -> Result<Self, String> {
         Ok(Self {
             search: read_field(&bar.query)?,
             replacement: match action {
                 MarkdownFindAction::ReplaceNext | MarkdownFindAction::ReplaceAll => {
-                    unquote(&read_field(&bar.replacement)?) // 保留实际替换的组合输入拒绝、长度及 escape 合同。
+                    unquote(&read_field(&bar.replacement)?) // Preserve replacement composition, length, and escape contracts.
                 }
                 MarkdownFindAction::Next
                 | MarkdownFindAction::Previous
                 | MarkdownFindAction::SelectAll
-                | MarkdownFindAction::Hide => String::new(), // 导航和隐藏不取得替换候选，也不解析用户模板。
+                | MarkdownFindAction::Hide => String::new(), // Navigation/hide read no replacement candidate/template.
             },
             case_sensitive: bar.case.state() != 0,
             regex: bar.regex.state() != 0,
@@ -245,13 +259,15 @@ impl Query {
         })
     }
 
-    /// 每次动作或有限反馈最多编译一次；模板和枚举复用同一个只读原生对象。
+    /// Compile once per action or bounded feedback call. Template parsing and
+    /// enumeration share this one read-only Native regex object.
     pub(super) fn compiled_regex(&self) -> Result<&NSRegularExpression, String> {
         self.compiled
             .get_or_init(|| {
                 let mut options = NSRegularExpressionOptions::empty();
                 if !self.case_sensitive {
-                    // 仅此旗标引入 ICU full folding；已审差异不冒充 JS simple folding。
+                    // This flag introduces ICU full folding; reviewed differences
+                    // must not be described as JavaScript simple folding equivalence.
                     options |= NSRegularExpressionOptions::CaseInsensitive;
                 }
                 let pattern =
@@ -264,7 +280,8 @@ impl Query {
             .map_err(Clone::clone)
     }
 
-    /// 字面模式用流式 NFKD；正则使用公开 ICU API，语法差异在 oracle 中单独记账。
+    /// Literal matching streams NFKD; regex uses public ICU APIs. Independent
+    /// oracle data records syntax differences separately.
     fn visit(
         &self,
         document: &SharedMarkdownDocument,
@@ -283,8 +300,10 @@ impl Query {
         )
     }
 
-    /// 测试可注入更短预算；产品在进度/结果 callback 协作检查两秒，取消为完整错误。
-    /// 编译和两个公开 callback 之间没有硬实时中断保证，不能把此预算写成输入到返回的上界。
+    /// Tests may choose a shorter real elapsed-time budget. Product progress/result
+    /// callbacks cooperatively check two seconds and return cancellation as an error.
+    /// Compilation and gaps between callbacks have no hard real-time interruption;
+    /// the budget is not an input-to-return latency guarantee.
     fn visit_with_budget(
         &self,
         document: &SharedMarkdownDocument,
@@ -296,10 +315,11 @@ impl Query {
     ) -> Result<(), String> {
         let length = document.borrow().utf16_len();
         if self.search.is_empty() {
-            return Ok(()); // 空查询没有匹配，不执行无限零长查找。
+            return Ok(()); // Empty queries enumerate no matches, avoiding unbounded zero-length searching.
         }
         if !self.regex {
-            // 字面路径在纯 Rust 固定源窗口中 KMP 扫描，不创建完整正文的 normalized 镜像。
+            // Pure Rust KMP scans fixed source windows without constructing a
+            // normalized mirror of the complete document.
             let text = unquote(&self.search);
             let options = MarkdownLiteralFindOptions {
                 case_sensitive: self.case_sensitive,
@@ -318,28 +338,31 @@ impl Query {
                      range_utf16,
                      precise,
                  }| {
-                    // 回调只做标量/标准 I/O，不调用 Native 或可重入的 AppKit getter。
+                    // Visitors use scalars/standard I/O only, with no Native calls
+                    // or reentrant AppKit getters under the document borrow.
                     if started.elapsed() > budget {
-                        // 标准 I/O visitor 也计入扫描预算，取消后调用方不会提交已生成的记录。
+                        // Visitor I/O counts toward the budget; cancellation keeps
+                        // callers from committing records already generated.
                         callback_error.replace(Some("查找超过 2 秒执行时限".to_owned()));
                         return Ok(false);
                     }
                     match visit(Found {
-                        captures: Vec::new(), // 字面模板没有捕获引用，不为每个命中分配一个无用 Vec。
+                        captures: Vec::new(), // Literal templates need no per-hit capture allocation.
                         range: range_utf16,
                         precise,
                     }) {
-                        Ok(proceed) => Ok(proceed), // 调用方显式控制早停，不保留后续匹配。
+                        Ok(proceed) => Ok(proceed), // Callers own early stopping; retain no later matches.
                         Err(error) => {
                             callback_error.replace(Some(error));
                             Ok(false)
-                        } // 错误在释放只读借用后传播。
+                        } // Propagate the error after ending the read-only document borrow.
                     }
                 },
             );
             result.map_err(|error| error.to_string())?;
             if let Some(error) = callback_error.take() {
-                // 释放 canonical 只读借用后保留 visitor 的首个失败，匿名记录随上层动作丢弃。
+                // Preserve the visitor's failure after releasing the canonical
+                // borrow; the enclosing action drops its anonymous records.
                 return Err(error);
             }
             return Ok(());
@@ -352,7 +375,8 @@ impl Query {
         let stopped = Cell::new(false);
         let accepted_end = Cell::new(None);
         loop {
-            // 每批最多 1,024 个结果后退出并排空本地 pool，不积攒百万个 autoreleased match 对象。
+            // End each batch after at most 1,024 results and drain its local pool,
+            // preventing accumulation of unbounded autoreleased match objects.
             let count = Cell::new(0usize);
             let batch_full = Cell::new(false);
             autoreleasepool(|_| {
@@ -361,21 +385,22 @@ impl Query {
                      flags: NSMatchingFlags,
                      mut stop: NonNull<Bool>| {
                         if flags.contains(NSMatchingFlags::InternalError) {
-                            // 原生匹配器内部失败不能伪装成“没有匹配”或发布部分替换。
+                            // An engine failure is neither zero matches nor permission for partial replacement.
                             error.replace(Some("原生正则表达式引擎无法完成搜索".to_owned()));
-                            // SAFETY: Foundation 在本次同步 callback 内提供有效的 stop 输出。
+                            // SAFETY: Foundation supplies valid writable stop storage for this synchronous callback.
                             unsafe { *stop.as_mut() = Bool::YES };
                             return;
                         }
                         if started.elapsed() > budget {
                             error.replace(Some("正则表达式搜索超过 2 秒执行时限".to_owned()));
-                            // SAFETY: Foundation 只在本次同步 callback 期间提供可写 BOOL stop 指针。
+                            // SAFETY: Foundation's BOOL stop pointer is writable only for this callback's lifetime.
                             unsafe { *stop.as_mut() = Bool::YES };
                             return;
                         }
-                        // SAFETY: Foundation 的 result 要么 nil（进度）要么是在本次同步 callback 内有效的 match 对象。
+                        // SAFETY: Foundation supplies nil for progress or a valid
+                        // match object for this synchronous callback's lifetime.
                         let Some(result) = (unsafe { result.as_ref() }) else {
-                            // NSMatchingReportProgress 的 nil result 是进度，不是一个空匹配。
+                            // A nil ReportProgress result is progress, not an empty match.
                             return;
                         };
                         let native = result.range();
@@ -385,13 +410,14 @@ impl Query {
                             .filter(|end| *end <= length)
                         else {
                             error.replace(Some("正则表达式返回了无效的 UTF-16 范围".to_owned()));
-                            // SAFETY: 相同的同步 Foundation stop 输出，明确终止整个动作。
+                            // SAFETY: The same synchronous Foundation stop output explicitly ends this action.
                             unsafe { *stop.as_mut() = Bool::YES };
                             return;
                         };
                         let range = native.location..end;
                         let validated = {
-                            // Native result 已转成纯标量后才借 canonical；借用在 visitor/Native 返回前结束。
+                            // Borrow canonical source only after copying scalar
+                            // coordinates; end the borrow before the visitor/Native callback returns.
                             let document = document.borrow();
                             document
                                 .byte_offset_for_utf16(range.start)
@@ -405,17 +431,19 @@ impl Query {
                                 })
                         };
                         let admitted = match validated {
-                            Ok(admitted) => admitted, // 正文边界验证后才允许业务动作。
+                            Ok(admitted) => admitted, // Source-boundary validation precedes action admission.
                             Err(failure) => {
                                 error.replace(Some(failure.to_string()));
                                 false
-                            } // 非 scalar 坐标不能替换。
+                            } // Coordinates inside a scalar cannot authorize replacement.
                         };
                         let admitted = admitted
                             && (!range.is_empty()
                                 || accepted_end.get().is_none_or(|prior| range.start > prior));
                         if admitted {
-                            // baseline 略过最后已接受匹配末尾的相邻 zero；保持批量枚举，不逐匹配重开引擎。
+                            // The baseline skips an adjacent zero-length match at
+                            // the last accepted end. Keep batched enumeration
+                            // rather than restarting the engine for every match.
                             accepted_end.set(Some(range.end));
                             let range_count = if capture_ranges == CaptureRanges::Include {
                                 result.numberOfRanges()
@@ -424,7 +452,7 @@ impl Query {
                             };
                             let mut captures = Vec::with_capacity(range_count);
                             for index in 0..range_count {
-                                // 只拷贝范围，不持 native result 或复制捕获正文。
+                                // Copy coordinates only, retaining no Native result or captured source text.
                                 let capture = result.rangeAtIndex(index);
                                 captures.push(if capture.location == NSNotFound as usize {
                                     None
@@ -440,17 +468,18 @@ impl Query {
                                 precise: true,
                                 captures,
                             }) {
-                                Ok(true) => {} // 继续本批同步枚举。
+                                Ok(true) => {} // Continue this synchronous batch.
                                 Ok(false) => {
                                     stopped.set(true);
-                                } // 导航已得到需要的结果。
+                                } // The caller has the result it needs.
                                 Err(failure) => {
                                     error.replace(Some(failure));
-                                } // 不签发部分 ReplaceAll。
+                                } // Failure cannot authorize a partial Replace All.
                             }
                         }
                         let following = if range.is_empty() && end < length {
-                            // 零长匹配至少跨过一个完整 scalar，不在 surrogate 内重开搜索。
+                            // Advance an empty match by one complete scalar,
+                            // never restarting search inside a surrogate pair.
                             let document = document.borrow();
                             end + if document
                                 .utf16_code_unit_at(end)
@@ -471,12 +500,14 @@ impl Query {
                             batch_full.set(true);
                         }
                         if stopped.get() || error.borrow().is_some() || batch_full.get() {
-                            // SAFETY: 当前 Foundation callback 的 stop 指针有效；只结束本轮，不改变 source。
+                            // SAFETY: This callback's stop pointer remains valid;
+                            // ending the batch does not modify the source.
                             unsafe { *stop.as_mut() = Bool::YES };
                         }
                     },
                 );
-                // ReportProgress 允许在没有匹配的灾难性回溯中检查单调 deadline；没有 timer/重试线程。
+                // ReportProgress permits cooperative deadline checks during
+                // no-match backtracking, without a timer or retry thread.
                 regex.enumerateMatchesInString_options_range_usingBlock(
                     native_string,
                     NSMatchingOptions::ReportProgress
@@ -490,13 +521,14 @@ impl Query {
                 return Err(failure);
             }
             if stopped.get() || !batch_full.get() || next.get() > length {
-                return Ok(()); // 完成、明确早停或最终零长匹配，均不再次投递搜索。
+                return Ok(()); // Completion, explicit stop, or final empty match never resubmits search.
             }
         }
     }
 }
 
-/// 导航只保留五个候选；替换排除当前项，普通导航允许唯一非空匹配回绕。
+/// Navigation retains five candidates only. Replacement excludes the current
+/// match; ordinary navigation may wrap to a sole nonempty match.
 #[derive(Default)]
 struct NavigationMatches {
     first: Option<NumberedMatch>,
@@ -507,7 +539,8 @@ struct NavigationMatches {
     total: usize,
 }
 
-/// 序号只来自本次真实升序枚举；最多五个候选保留它，不保存全部命中或另一份正文。
+/// Ordinals come only from this actual ascending scan and remain on at most five
+/// candidates, never a complete hit list or another document copy.
 #[derive(Clone)]
 struct NumberedMatch {
     found: Found,
@@ -515,51 +548,56 @@ struct NumberedMatch {
 }
 
 impl NavigationMatches {
-    /// 与旧编辑器从 selection 边界开始再回绕的行为一致；零长当前位置仍必须前进。
+    /// Preserve the original selection-boundary navigation/wrap behavior. An empty
+    /// match at the current position must still advance.
     fn navigation_target(self, backwards: bool) -> Option<NumberedMatch> {
         let target = if backwards {
-            // 优先前一处，越过文件起点后选择最后一处非当前匹配。
+            // Prefer the preceding match; crossing document start wraps to the last noncurrent match.
             self.previous.or(self.last)
         } else {
-            // 优先后一处，越过文件终点后选择第一处非当前匹配。
+            // Prefer the following match; crossing document end wraps to the first noncurrent match.
             self.next.or(self.first)
         };
         target.or_else(|| {
-            // 唯一非空匹配仍是有效搜索结果；不能把“已选中”误报为“没有匹配”。
+            // A sole nonempty selected match remains a result; selected does not mean absent.
             self.current.filter(|found| !found.found.range.is_empty())
         })
     }
 
     fn observe(&mut self, found: Found, selection: &Range<usize>) -> Result<(), String> {
-        // 原导航本就完整遍历一次；在原命中入口计数，不能按字节位置或可见高亮反推序号。
+        // Navigation already scans completely. Count actual hits at their entry;
+        // byte positions or visible highlights cannot establish an ordinal.
         self.total = self.total.checked_add(1).ok_or("查找匹配数量超出范围")?;
         let found = NumberedMatch {
             found,
             ordinal: std::num::NonZeroUsize::new(self.total).expect("真实枚举计数在加一后必为正数"),
         };
         if found.found.range == *selection {
-            // 当前选择只为 ReplaceNext 提供替换候选；零长当前匹配也不能自我回绕。
+            // The current selection supplies ReplaceNext's candidate. An empty
+            // current match cannot wrap to itself.
             self.current = Some(found);
             return Ok(());
         }
         if self.first.is_none() {
-            // 全文第一个非当前匹配用于正向回绕。
+            // Keep the first noncurrent document match for forward wrap.
             self.first = Some(found.clone());
         }
         if found.found.range.end <= selection.start {
-            // 升序扫描中的最后一个前置匹配就是 Previous；不必反向解码或再次编译查询。
+            // The last preceding match in ascending order is Previous; no reverse
+            // decoding or second compilation is required.
             self.previous = Some(found.clone());
         }
         if self.next.is_none() && found.found.range.start >= selection.end {
-            // 只保留首次满足正向位置的候选，后续结果不覆盖它。
+            // Keep the first forward candidate without overwriting it with later results.
             self.next = Some(found.clone());
         }
-        self.last = Some(found); // 反向回绕只需要最后一个非当前匹配，内存与结果总数无关。
+        self.last = Some(found); // Reverse wrap needs only the final noncurrent match, independent of total hits.
         Ok(())
     }
 }
 
-/// 导航只保留首/末/当前候选；替换先封存匿名记录，再一次提交原子 canonical 事务。
+/// Navigation retains bounded candidates; replacement seals anonymous records
+/// before committing one atomic canonical transaction.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) fn execute_textkit_find_action(
     bar: &Rc<NativeMarkdownFindBar>,
@@ -568,17 +606,21 @@ pub(super) fn execute_textkit_find_action(
     intent: u64,
     action: MarkdownFindAction,
 ) -> Result<(), String> {
-    // 空尾槽先于所有 Native claim 声明；只有实际替换才放入原 guard，最终 string/storage/regex 析构后再清槽。
+    // Declare the empty tail slot before Native claims. Actual replacement alone
+    // installs its guard, which outlives string/storage/regex destruction.
     let pending_tail: RefCell<Option<NativeMarkdownPendingSelectionGuard>> = RefCell::new(None);
-    // 任何显式动作先撤掉前次延后目标；当前controller票据在所有查询Native getter之前固定。
+    // Explicit actions revoke previous deferred targets before any Native query
+    // getter; the controller ticket is already fixed at entry.
     view.cancel_pending_find_reveal();
-    // 在查询Native getter之前固定栏状态；隐藏仅允许原Next/Previous，不自动显示或领取新权限。
+    // Fix bar state before query getters. A hidden bar permits only original
+    // Next/Previous navigation without showing controls or acquiring new authority.
     let bar_revision = bar.layout_revision.get();
     let visibility =
         NativeMarkdownFindVisibility::capture(action, bar.visible.get(), bar.closed.get())
             .ok_or("查找请求已失效")?;
     let table_epoch = view.ivars().table_input_intent_epoch.get();
-    // 首个栏/正文Native getter之前固定原Core选择票；明确Find新目标不要求旧非空主head已知。
+    // Capture original Core selection before any bar/document Native getter. An
+    // explicit new Find target does not require a known prior nonempty primary head.
     let selection_capture = view
         .ivars()
         .folds
@@ -621,7 +663,8 @@ pub(super) fn execute_textkit_find_action(
             document.selection(),
         )
     };
-    // 完整anchor/head与查找使用的有序范围分别保存；后续Native getter不能把反向历史变成正向。
+    // Preserve directed anchor/head separately from Find's ordered range. Later
+    // Native getters must not turn backward selection history into forward history.
     let native_string = native_markdown_table_intent_step(&read_current, || storage.string())
         .map_err(|_| "读取查找正文时原权限已失效")?;
     let selected = native_markdown_table_intent_step(&read_current, || {
@@ -639,7 +682,8 @@ pub(super) fn execute_textkit_find_action(
             (Some(range), range.location..end)
         }
         NativeMarkdownOrderedSelection::Multiple => {
-            // 多选没有公开主head；扫描从仍持有的Core范围出发，明确新目标由Find命令授权。
+            // Multiple selections expose no primary head; scan from the retained
+            // Core extent, with the explicit Find command authorizing the new target.
             (
                 None,
                 canonical_before
@@ -653,7 +697,8 @@ pub(super) fn execute_textkit_find_action(
     };
     let mut navigation = NavigationMatches::default();
     let mut matches = Vec::new();
-    // 模板 owner 比 spool/reader/core 借用活得久，退出动作时一次释放所有 arena/token 容量。
+    // The template owner outlives spool/reader/Core borrows; action exit releases
+    // all literal-arena and token capacity together.
     let capture_count = if query.regex {
         query.compiled_regex()?.numberOfCaptureGroups() + 1
     } else {
@@ -683,7 +728,7 @@ pub(super) fn execute_textkit_find_action(
             return Err("查找期间原选择或输入权限已失效".into());
         }
         if action == MarkdownFindAction::SelectAll {
-            // 限额超出时整个动作失败，尚未向 AppKit 发布任何部分选择。
+            // Exceeding the limit fails the whole action before AppKit sees any partial selection.
             if matches.len() == 1_000 {
                 return Err("全部选中最多支持 1,000 处匹配".into());
             }
@@ -692,7 +737,8 @@ pub(super) fn execute_textkit_find_action(
         if let Some(spool) = &mut spool
             && found.precise
         {
-            // 只写坐标；模板 literal 与捕获 token 已在动作开头解析，逐命中不再复制。
+            // Write coordinates only. Template literals/capture tokens were parsed
+            // once at action entry and are not copied for every hit.
             spool.push(&found)?;
         }
         if matches!(
@@ -701,7 +747,7 @@ pub(super) fn execute_textkit_find_action(
                 | MarkdownFindAction::Previous
                 | MarkdownFindAction::ReplaceNext
         ) {
-            // SelectAll/ReplaceAll 不保留导航候选，也不复制其 capture 描述符。
+            // SelectAll/ReplaceAll retain no navigation candidates or copied capture descriptors.
             navigation.observe(found, &selection)?;
         }
         Ok(true)
@@ -716,32 +762,37 @@ pub(super) fn execute_textkit_find_action(
     if document.borrow().generation() != generation || !read_current() {
         return Err("查找期间文档已变更，请重试".into());
     }
-    let total = navigation.total; // 只有完整枚举和同源复核成功后，才允许把它交给延后成功反馈。
+    // Only complete enumeration and original-source verification authorize totals
+    // for subsequent successful reveal feedback.
+    let total = navigation.total;
     let target = match action {
         MarkdownFindAction::Previous => {
-            // 双向导航允许唯一非空匹配回绕，仍只消费本轮扫描的有限候选。
+            // Bidirectional navigation may wrap to a sole nonempty match using only this scan's bounded candidates.
             navigation.navigation_target(true)
         }
         MarkdownFindAction::Next => {
-            // 选择本身不是替换，回绕同一非空匹配不会再编辑正文或搜索新插入文字。
+            // Selection is not replacement; wrapping a nonempty match neither edits
+            // the document nor searches newly inserted text.
             navigation.navigation_target(false)
         }
         MarkdownFindAction::ReplaceNext => {
             let target = navigation.next.or(navigation.first);
             if let Some(found) = navigation.current.filter(|found| found.found.precise) {
-                let found = found.found; // 替换只消费原命中，不能把旧文稿的计数带到编辑后的正文。
-                // 下一候选来自旧 snapshot，先映射再提交；不搜索本次刚插入的 replacement 文本。
+                let found = found.found; // Replacement consumes the original hit, not a pre-edit total for new text.
+                // Map the next candidate from the original snapshot before commit;
+                // do not search the replacement text inserted by this action.
                 let mut replacement = ReplacementSpool::new(&template)?;
                 replacement.push(&found)?;
-                let before = canonical_before; // Undo恢复原方向；明确的新Find目标才采用start→end。
+                let before = canonical_before; // Undo restores direction; only the explicit new target uses start-to-end.
                 let after = if let Some(target) = &target {
-                    // 尚未改变 canonical，candidate 的两个端点仍以旧坐标计算。
+                    // Canonical text is unchanged; map both candidate endpoints from old coordinates.
                     replacement.map_selection(MarkdownTextSelection {
                         anchor_utf16: target.found.range.start,
                         head_utf16: target.found.range.end,
                     })?
                 } else {
-                    // 最后一个匹配被替换后保留新片段末尾 caret，不把 replacement 再次当成旧匹配。
+                    // After replacing the last match, leave the caret at the new
+                    // fragment's end rather than treating inserted text as an old match.
                     MarkdownTextSelection::caret(found.range.start + replacement.inserted_utf16())
                 };
                 let (edit, committed, pending) = storage.apply_find_replacements(
@@ -754,7 +805,7 @@ pub(super) fn execute_textkit_find_action(
                             Some(before) => captured
                                 .with_observed_native_before(before)
                                 .map_err(|error| error.to_string())?,
-                            None => captured, // 实际 Multi 不伪造旧主范围；完整目标仍只来自本次明确 Find 动作。
+                            None => captured, // Actual multi-selection invents no prior primary range; Find owns this target.
                         }
                     },
                     replacement.into_replacements()?,
@@ -763,18 +814,21 @@ pub(super) fn execute_textkit_find_action(
                     after,
                 )?;
                 drop(pending_tail.replace(pending));
-                // storage 返回纯发布时构造的同一 Rc；查找定位直接复用，不再另包一层收据身份。
+                // Storage returns the same Rc created during pure publication;
+                // reveal reuses it rather than wrapping another receipt identity.
                 if !current() || !committed.current() {
-                    return Ok(()); // 正文已提交；后继输入撤权时不再移动旧选择或覆盖新状态。
+                    return Ok(()); // Text is committed; successor input revokes only these old presentation effects.
                 }
-                // 原 pending guard 仍覆盖这里的同步 Native 后果；先用同一 Rc 精确安装 Core after，
-                // 再把它交给后续 reveal，不让等待可见区布局期间的旧 Native before 冒充已完成选择。
+                // The original pending guard covers synchronous Native effects.
+                // Install the exact Core after-selection through the same Rc before
+                // reveal; the old Native before-selection cannot impersonate completion.
                 if !view.apply_committed_selection_if(&committed, current) {
-                    return Ok(()); // 已提交正文保留；原显示票失权时不 fresh capture 或重放替换。
+                    return Ok(()); // Preserve committed text; do not recapture authority or replay replacement.
                 }
                 let start = after.anchor_utf16.min(after.head_utf16);
                 let end = after.anchor_utf16.max(after.head_utf16);
-                // 事务已提交；新代次目标仍沿原输入票据定位，不能以选区已发布冒充可见。
+                // The committed new-generation target still uses original input
+                // authority; published selection does not establish visibility.
                 let revealed = committed.native_step(|| {
                     view.begin_find_reveal(
                         bar,
@@ -782,7 +836,8 @@ pub(super) fn execute_textkit_find_action(
                         intent,
                         NativeMarkdownFindRevealTarget {
                             document: Rc::downgrade(&document),
-                            // core原子事务每次实际提交只推进一代；Native通知重入的新编辑不可冒领此收据。
+                            // Each actual Core transaction advances one generation;
+                            // an edit from Native notification reentry cannot claim this receipt.
                             generation: if edit.is_some() {
                                 generation.wrapping_add(1)
                             } else {
@@ -809,12 +864,12 @@ pub(super) fn execute_textkit_find_action(
                 revealed.map_err(|error| error.to_string())??;
                 return Ok(());
             }
-            target // 没有精确的当前匹配时只前进，NFKD 字符内部命中不会误删未匹配内容。
+            target // Without an exact current match, only navigate; never delete unmatched parts of an NFKD scalar.
         }
         MarkdownFindAction::ReplaceAll => {
             let mut spool = spool.expect("ReplaceAll creates one operation-local spool");
             let count = spool.count();
-            let before = canonical_before; // map_selection逐端映射，不经过有序NSRange丢失方向。
+            let before = canonical_before; // Map endpoints independently without losing direction through ordered NSRange.
             let after = spool.map_selection(before)?;
             let (_edit, committed, pending) = storage.apply_find_replacements(
                 &{
@@ -835,25 +890,27 @@ pub(super) fn execute_textkit_find_action(
                 after,
             )?;
             drop(pending_tail.replace(pending));
-            // 同一次 pending guard 保留到选择安装、反馈字符串和最后状态 setter 都结束，不能提前清槽。
-            // 原子提交成功才改变 native 选择，失败时字段、正文与选区全部保留。
+            // Retain the same pending guard through selection installation,
+            // feedback-string release, and the last status setter. Native selection
+            // changes only after atomic commit; failed edits preserve fields/text/selection.
             if !view.apply_committed_selection_if(&committed, current) {
                 return Ok(());
             }
             let Ok(status) =
                 committed.native_step(|| NSString::from_str(&format!("已替换 {count} 处匹配")))
             else {
-                return Ok(()); // 旧提交反馈失效不再生成错误覆盖后继查询。
+                return Ok(()); // Revoked commit feedback cannot overwrite a successor query with an error.
             };
             if current() {
                 let _ = committed.native_step(|| bar.status.setStringValue(&status));
             }
-            drop(status); // Native临时值析构结束后也不再从新epoch领取旧反馈权限。
+            drop(status); // Native temporary destruction cannot reacquire old feedback authority from a new epoch.
             return Ok(());
         }
         MarkdownFindAction::SelectAll => {
             if let [target] = matches.as_slice() {
-                // 唯一目标由本次明确命令授权，可发布完整方向；不让单caret通知意外撤掉原动作。
+                // The explicit command authorizes this sole directed target;
+                // a single-caret notification must not inadvertently revoke the action.
                 let mut captured = selection_capture
                     .clone()
                     .finish(
@@ -876,7 +933,7 @@ pub(super) fn execute_textkit_find_action(
                     return Err("全部选中的原选择权限已失效".into());
                 };
                 if !view.apply_committed_selection_if(&committed, current) {
-                    return Ok(()); // 新输入只撤旧选择后果，不能回滚已发布的明确单目标。
+                    return Ok(()); // New input revokes old visual effects, not the already published explicit target.
                 }
                 if current() {
                     let _ = committed
@@ -888,7 +945,8 @@ pub(super) fn execute_textkit_find_action(
                 .iter()
                 .map(|range| {
                     native_markdown_table_intent_step(&read_current, || {
-                        // SAFETY: 匹配范围已核对Core UTF-16边界，NSValue仅同步复制该有限值。
+                        // SAFETY: Matches were checked against Core UTF-16
+                        // boundaries; NSValue synchronously copies this bounded range.
                         unsafe {
                             objc2_foundation::NSValue::valueWithRange(NSRange::new(
                                 range.start,
@@ -917,12 +975,13 @@ pub(super) fn execute_textkit_find_action(
             drop(array);
             drop(ranges);
             if !matches.is_empty() && read_current() {
-                // 多范围保留Native显示，临时claims结束后纯撤完整方向；绝不从数组猜主head。
+                // Keep Native multi-range presentation. Once temporary claims end,
+                // revoke directed selection without guessing a primary head from the array.
                 view.ivars().folds.reset_selection();
             }
             return Ok(());
         }
-        MarkdownFindAction::Hide => return Ok(()), // 上层在读取查询前已经处理隐藏。
+        MarkdownFindAction::Hide => return Ok(()), // The owning layer handles hide before reading query text.
     };
     if let Some(target) = target {
         let feedback = if matches!(
@@ -935,9 +994,10 @@ pub(super) fn execute_textkit_find_action(
                     .expect("存在真实导航目标就必有完整正数总量"),
             })
         } else {
-            NativeMarkdownFindRevealFeedback::Found // 未编辑的ReplaceNext导航也保留原反馈语义。
+            NativeMarkdownFindRevealFeedback::Found // ReplaceNext without an edit preserves its original feedback semantics.
         };
-        // 一次粗定位后交由原有bounded executor完成真实segment可见性认证。
+        // After one coarse relocation, the existing bounded executor verifies
+        // actual segment visibility under the same original target.
         view.begin_find_reveal(
             bar,
             controller,

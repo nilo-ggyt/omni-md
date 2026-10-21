@@ -1,4 +1,4 @@
-//! 像素预算只由真实视口和实际 backing scale 推导，不降低清晰度或改变文字布局。
+//! Derives the pixel budget from the actual viewport/backing scale without reducing resolution or reflowing text.
 
 use super::*;
 
@@ -14,6 +14,7 @@ pub(super) fn finite(rect: NSRect) -> bool {
 }
 
 pub(super) fn dimensions(visible: NSRect, scale: f64) -> Result<(usize, usize), String> {
+    // Reject invalid external Native geometry before converting floats into allocation dimensions.
     if !finite(visible)
         || visible.size.width <= 0.0
         || visible.size.height <= 0.0
@@ -24,6 +25,8 @@ pub(super) fn dimensions(visible: NSRect, scale: f64) -> Result<(usize, usize), 
     }
     let width = (visible.size.width * scale).ceil();
     let height = (visible.size.height * scale).ceil();
+    // Round up fractional backing pixels so the viewport is covered at its real display scale.
+    // Bound both axes before integer conversion, then bound the product against overflow/allocation growth.
     if !width.is_finite() || !height.is_finite() || width > 4_000_000.0 || height > 4_000_000.0 {
         return Err("光栅视口尺寸超限".into());
     }
@@ -39,6 +42,7 @@ pub(super) fn dimensions(visible: NSRect, scale: f64) -> Result<(usize, usize), 
 }
 
 pub(super) fn intersects(a: NSRect, b: NSRect) -> bool {
+    // Edge contact has no ink area. This deliberately excludes zero-width or zero-height overlap.
     a.origin.x < b.origin.x + b.size.width
         && b.origin.x < a.origin.x + a.size.width
         && a.origin.y < b.origin.y + b.size.height
@@ -46,6 +50,8 @@ pub(super) fn intersects(a: NSRect, b: NSRect) -> bool {
 }
 
 pub(super) fn ink(frame: NSRect, bounds: NSRect, origin: NSPoint) -> Result<NSRect, String> {
+    // Rendering bounds are fragment-relative and may extend past its layout frame. Translate the
+    // full ink extent into body coordinates instead of clipping negative bearings or italic overhang.
     let rect = NSRect::new(
         NSPoint::new(
             frame.origin.x + origin.x + bounds.origin.x,
@@ -61,6 +67,7 @@ pub(super) fn ink(frame: NSRect, bounds: NSRect, origin: NSPoint) -> Result<NSRe
         .into_iter()
         .all(f64::is_finite)
     {
+        // Finite inputs can still overflow when added; invalid extents cannot enter viewport tests.
         return Err("真实字形 ink 坐标发生非有限溢出".into());
     }
     Ok(rect)
@@ -75,6 +82,7 @@ mod tests {
 
     #[test]
     fn backing_scale_preserves_all_pixels_and_rejects_unbounded_views() {
+        // Exercise real viewport dimensions, fractional rounding, and the bounded allocation edge.
         assert_eq!(
             dimensions(viewport(1120.0, 780.0), 2.0).unwrap(),
             (2240, 1560)
@@ -89,6 +97,7 @@ mod tests {
 
     #[test]
     fn ink_can_enter_viewport_while_layout_frame_is_outside() {
+        // Ink from an offscreen frame remains visible after its negative rendering offset is applied.
         let viewport = NSRect::new(NSPoint::new(0.0, 100.0), NSSize::new(200.0, 50.0));
         let frame = NSRect::new(NSPoint::new(0.0, 160.0), NSSize::new(100.0, 20.0));
         let bounds = NSRect::new(NSPoint::new(-3.0, -15.0), NSSize::new(110.0, 40.0));

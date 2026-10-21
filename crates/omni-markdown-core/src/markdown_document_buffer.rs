@@ -44,7 +44,8 @@ pub use heading_anchor::{
     MarkdownHeadingAnchorTarget, MarkdownHeadingAnchorWork,
 };
 mod replacements;
-// 原生运行启用有限表格权限；默认视口的迁移仍须分别完成语义、几何和功能门禁。
+// The native feature exposes bounded table authority. Semantic, geometric, and
+// functional completeness remain separate obligations of viewport consumers.
 #[cfg(feature = "s2-table-window-prototype")]
 mod table_cell_edit;
 #[cfg(feature = "s2-table-window-prototype")]
@@ -88,11 +89,13 @@ pub use replacements::{MarkdownReplacement, MarkdownReplacementPart};
 mod piece_tree;
 #[cfg(feature = "paged-shaping-frontier")]
 pub(crate) use piece_tree::ascii_word::{MarkdownAsciiWordRun, MarkdownAsciiWordStep};
-// 规范根只存通用Unicode属性事实；方向/布局快路的适用策略由各算法自行决定。
+// The canonical root stores general Unicode facts only. Each bidi/layout
+// algorithm owns the policy that permits its specialized paths.
 #[path = "markdown_document_buffer/unicode_properties.rs"]
 mod canonical_unicode_properties;
 pub(crate) use canonical_unicode_properties::MarkdownUnicodeProperties;
-// 冻结文本只分享不可变正文资源；不携带活动文档、历史或保存权限。
+// Frozen text shares immutable read resources without active-document, history,
+// or persistence authority.
 #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
 pub(crate) mod display_projection;
 mod frozen_text;
@@ -102,7 +105,7 @@ pub(crate) use frozen_text::{
     FrozenBidiParagraphCursor, FrozenPrintableAsciiSuffix, FrozenPrintableAsciiSuffixStep,
 };
 mod queries;
-// 单个派生UTF-16窗口只加速有限读取；它不取得正文或历史所有权。
+// One derived UTF-16 window accelerates finite reads without owning text or history.
 mod read_cache;
 mod revision_cache;
 
@@ -121,7 +124,7 @@ const MAX_VIEWPORT_OVERSCAN_UTF16_UNITS: usize = 8 * 1_024;
 #[cfg(any(test, feature = "native-markdown-candidate"))]
 const MARKDOWN_BLOCK_CHECKPOINT_STRIDE_UTF16_UNITS: usize = 64 * 1_024;
 
-/// A selection is stored in the same UTF-16 coordinate space used by TextKit.
+/// A selection uses the native editor's UTF-16 coordinate space.
 /// Both positions must be Unicode scalar boundaries before an edit is accepted.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MarkdownTextSelection {
@@ -131,7 +134,7 @@ pub struct MarkdownTextSelection {
 
 impl MarkdownTextSelection {
     #[must_use]
-    /// Construct a collapsed TextKit selection without accessing document storage.
+    /// Construct a collapsed native selection without accessing document storage.
     pub fn caret(utf16_offset: usize) -> Self {
         Self {
             anchor_utf16: utf16_offset,
@@ -207,7 +210,7 @@ pub struct MaterializedMarkdownViewport {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Compact replacement geometry sufficient to notify TextKit during history restoration.
+/// Compact replacement geometry sufficient for native history-restoration notifications.
 struct MarkdownReplacementMetrics {
     location: usize,
     removed_utf16_length: usize,
@@ -215,7 +218,7 @@ struct MarkdownReplacementMetrics {
     forward_change_in_utf16_length: isize,
 }
 
-/// Exact character-edit notification required when TextKit restores a Rust history entry.
+/// Exact character-edit geometry for a native adapter restoring Rust-owned history.
 ///
 /// The range addresses the document before restoration, so undo/redo notification
 /// does not flatten or diff the full document.
@@ -234,46 +237,48 @@ pub struct MarkdownHistoryTextEdit {
 /// bounded viewport and persistence streams leaves directly to a writer.
 pub struct MarkdownDocumentBuffer {
     path: PathBuf,
-    // 独立匿名inode可由已发布不可变值共享；活动文档释放不会撤销旧值的读取。
+    // Published immutable values may share this independently frozen anonymous
+    // inode; active-document destruction cannot revoke their existing read resources.
     original_snapshot: Option<Arc<OriginalBacking>>,
-    original_range: std::ops::Range<usize>,
-    save_authority: MarkdownSaveAuthority,
+    save_baseline: MarkdownDiskBaseline,
     maximum_document_bytes: usize,
     root: PieceTreeLink,
     initial_root: PieceTreeLink,
     edits: MarkdownEditSegments,
-    // 真实变化只保有限inline记录或文档自有匿名页；不与UTF8正文段混用。
+    // Real changes use finite inline records or document-owned anonymous pages,
+    // never the UTF-8 text segments themselves.
     change_journal: change_journal::ChangeJournal,
     selection: MarkdownTextSelection,
-    // 输入候选仍由同一文档独占；未发布期间所有写入口均拒绝，读取只见canonical。
+    // This document exclusively owns its input candidate. Until publication,
+    // other writes reject it and readers observe only the canonical root.
     prepared_text_input: Option<prepared_text_input::PendingTextInput>,
-    // 只描述当前Body组合的历史归属；正文仍只由原root、编辑段和Undo尾项拥有。
+    // Describe only the current input composition's history ownership. Its text
+    // remains owned by the original root, segments, and final undo entry.
     text_input_composition: Option<prepared_text_input::CompositionGroup>,
-    // 同一文档最多一个cell原始草稿；retired槽也须等真实读取根归还后才能再写canonical。
+    // Permit at most one cell draft per document. Even a retired slot must wait
+    // for its actual read roots to return before canonical writes can resume.
     #[cfg(feature = "s2-table-window-prototype")]
     cell_draft: Option<cell_draft::CellDraftSlot>,
     undo: VecDeque<MarkdownEditorMemento>,
     redo: VecDeque<MarkdownEditorMemento>,
     generation: u64,
-    // 活动文档与全部独立capture共用同一8KiB派生窗口；不按快照数量重复分配。
-    // 窗口只保原root的Weak键，不能经这个共享Arc反向保活文档、正文或历史。
+    // The active document and all independent captures share one derived 8 KiB
+    // window, rather than allocating per snapshot. Its root key is weak, so the
+    // shared cache Arc cannot keep a document, text allocation, or history alive.
     utf16_read_cache: Arc<Mutex<read_cache::Utf16ReadCache>>,
-    // 只缓存同一不可变root的32B摘要；身份Weak不保活旧正文或历史。
+    // Cache only this immutable root's 32-byte digest; weak identity does not
+    // extend an old text/history lifetime.
     revision_cache: Mutex<revision_cache::RevisionCache>,
     #[cfg(any(test, feature = "native-markdown-candidate"))]
     block_checkpoints: RefCell<MarkdownBlockCheckpointIndex>,
 }
 
 #[derive(Clone, Copy)]
-/// 磁盘基线与未知旧基线的恢复草稿不能互相冒充；恢复内容相同也不自动取得覆盖权限。
-enum MarkdownSaveAuthority {
-    /// 正常文件打开或完成保存后，identity与revision共同约束后续普通覆盖。
-    DiskBaseline {
-        identity: MarkdownFileIdentity,
-        revision: MarkdownDocumentRevision,
-    },
-    /// 旧record只证明恢复内容身份，没有发生冲突前的disk baseline。
-    PendingLegacyRecovery { record_digest: [u8; 32] },
+/// Every opened UTF-8 Markdown model binds the actual disk identity and revision together.
+/// Later saves revalidate both rather than inferring overwrite authority from equal live text.
+struct MarkdownDiskBaseline {
+    identity: MarkdownFileIdentity,
+    revision: MarkdownDocumentRevision,
 }
 
 impl MarkdownDocumentBuffer {
@@ -357,8 +362,7 @@ impl MarkdownDocumentBuffer {
         Ok(Self {
             path: path.to_path_buf(),
             original_snapshot: original_snapshot.map(Arc::new),
-            original_range: 0..byte_count,
-            save_authority: MarkdownSaveAuthority::DiskBaseline {
+            save_baseline: MarkdownDiskBaseline {
                 identity: original_identity,
                 revision: original_revision,
             },
@@ -385,55 +389,6 @@ impl MarkdownDocumentBuffer {
         })
     }
 
-    /// 采用已经固定的旧record正文区间；不复制正文，不把未知旧基线变为当前磁盘版本。
-    pub(crate) fn from_legacy_recovery(
-        path: &Path,
-        snapshot: OriginalBacking,
-        payload_range: std::ops::Range<usize>,
-        record_digest: [u8; 32],
-        maximum_document_bytes: u64,
-    ) -> Result<Self, MarkdownDocumentBufferError> {
-        let maximum_document_bytes = usize::try_from(maximum_document_bytes)
-            .map_err(|_| MarkdownDocumentBufferError::DocumentTooLarge)?;
-        if payload_range.start > payload_range.end || payload_range.end > snapshot.len() {
-            // record范围必须属于同一已冻结inode；不借全片来检查payload。
-            return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
-        }
-        if payload_range.len() > maximum_document_bytes {
-            return Err(MarkdownDocumentBufferError::DocumentTooLarge);
-        }
-        let build = build_original_backing_tree(Some(&snapshot), payload_range.clone())?;
-        let root = build.root;
-        #[cfg(any(test, feature = "native-markdown-candidate"))]
-        let block_checkpoints = build.checkpoints;
-        Ok(Self {
-            path: path.to_path_buf(),
-            original_snapshot: Some(Arc::new(snapshot)),
-            original_range: payload_range,
-            save_authority: MarkdownSaveAuthority::PendingLegacyRecovery { record_digest },
-            maximum_document_bytes,
-            initial_root: root.clone(),
-            revision_cache: Mutex::new(revision_cache::RevisionCache::seeded(
-                &root,
-                build.revision,
-            )),
-            root,
-            edits: MarkdownEditSegments::default(),
-            change_journal: change_journal::ChangeJournal::default(),
-            selection: MarkdownTextSelection::default(),
-            prepared_text_input: None,
-            text_input_composition: None,
-            #[cfg(feature = "s2-table-window-prototype")]
-            cell_draft: None,
-            undo: VecDeque::new(),
-            redo: VecDeque::new(),
-            generation: 0,
-            utf16_read_cache: Arc::new(Mutex::new(read_cache::Utf16ReadCache::default())),
-            #[cfg(any(test, feature = "native-markdown-candidate"))]
-            block_checkpoints: RefCell::new(block_checkpoints),
-        })
-    }
-
     #[must_use]
     /// Borrow the current authoritative path without transferring document ownership.
     pub fn path(&self) -> &Path {
@@ -441,33 +396,10 @@ impl MarkdownDocumentBuffer {
     }
 
     #[must_use]
-    /// 只返回真实已知的保存基线；旧恢复record没有base revision，None不能被当前磁盘hash替代。
-    pub fn original_revision(&self) -> Option<MarkdownDocumentRevision> {
-        match self.save_authority {
-            // 普通打开或成功保存的authority才可作为后续revision检查基线。
-            MarkdownSaveAuthority::DiskBaseline { revision, .. } => Some(revision),
-            // 即使恢复正文与磁盘相同或为空，也必须先经过显式解决。
-            MarkdownSaveAuthority::PendingLegacyRecovery { .. } => None,
-        }
-    }
-
-    #[must_use]
-    /// 只读显示待解决的旧恢复冲突；不能通过该状态推断某个磁盘版本已获覆盖授权。
-    pub fn has_pending_legacy_recovery(&self) -> bool {
-        matches!(
-            self.save_authority,
-            MarkdownSaveAuthority::PendingLegacyRecovery { .. }
-        )
-    }
-
-    /// 内容身份只用于绑定小resolution marker，不包含正文或可变文件句柄。
-    pub(crate) fn legacy_recovery_record_digest(&self) -> Option<[u8; 32]> {
-        match self.save_authority {
-            // 正常模型不产生marker，避免把一次普通打开写成隐式恢复决定。
-            MarkdownSaveAuthority::DiskBaseline { .. } => None,
-            // 摘要来自不可变record的完整bytes，文件换inode但内容相同仍是同一恢复身份。
-            MarkdownSaveAuthority::PendingLegacyRecovery { record_digest } => Some(record_digest),
-        }
+    /// Return the verified revision acquired by opening the file or completing a validated save.
+    /// Live edits do not change this disk baseline until persistence actually succeeds.
+    pub fn original_revision(&self) -> MarkdownDocumentRevision {
+        self.save_baseline.revision
     }
 
     /// Computes the current edited revision without materializing a flat
@@ -479,9 +411,11 @@ impl MarkdownDocumentBuffer {
     ) -> Result<MarkdownDocumentRevision, MarkdownDocumentBufferError> {
         self.original_backing_health()?;
         let mut cache = match self.revision_cache.lock() {
+            // A valid lock protects only this original root's derived digest.
             Ok(cache) => cache,
             Err(_) => {
-                // 同步错误不能恢复旧缓存；此时也优先保留共享原映射的真实首个失败。
+                // A synchronization failure cannot revive cached authority.
+                // Preserve any real shared-backing failure before reporting poison.
                 self.original_backing_health()?;
                 return Err(MarkdownDocumentBufferError::RevisionCacheUnavailable);
             }
@@ -492,10 +426,7 @@ impl MarkdownDocumentBuffer {
     #[must_use]
     /// Conservatively detect path replacement or metadata changes before attempting a save.
     pub fn original_file_identity_is_unchanged(&self) -> bool {
-        let MarkdownSaveAuthority::DiskBaseline { identity, .. } = self.save_authority else {
-            // 未知旧基线不能因当前路径仍存在就被升级为可写authority。
-            return false;
-        };
+        let identity = self.save_baseline.identity;
         let Ok(metadata) = std::fs::symlink_metadata(&self.path) else {
             // An unreadable or missing path cannot establish that the opened file is unchanged.
             return false;
@@ -518,10 +449,7 @@ impl MarkdownDocumentBuffer {
         destination: &Path,
     ) -> Result<(), MarkdownDocumentBufferError> {
         self.ensure_text_input_idle()?;
-        let MarkdownSaveAuthority::DiskBaseline { identity, .. } = self.save_authority else {
-            // 一个发布后的正常save mapping才有重新绑定权限，恢复模型不能通过该入口解除保护。
-            return Err(MarkdownDocumentBufferError::PendingLegacyRecovery);
-        };
+        let identity = self.save_baseline.identity;
         let metadata = std::fs::symlink_metadata(destination).map_err(|_| {
             // A failed destination identity inspection cannot establish ownership of the newly saved file.
             MarkdownDocumentBufferError::DocumentChangedDuringSave
@@ -548,14 +476,9 @@ impl MarkdownDocumentBuffer {
         saved: &Self,
     ) -> Result<(), MarkdownDocumentBufferError> {
         self.ensure_text_input_idle()?;
-        if self.has_pending_legacy_recovery() {
-            // 普通保存与相同bytes收敛都不能替用户解决未知基线的旧冲突。
-            return Err(MarkdownDocumentBufferError::PendingLegacyRecovery);
-        }
-        let Some(saved_revision) = saved.original_revision() else {
-            // 另一恢复草稿也不是新的磁盘保存基线。
-            return Err(MarkdownDocumentBufferError::PendingLegacyRecovery);
-        };
+        // This saved model was opened from a real file. Its mandatory baseline still requires exact
+        // path, unchanged file identity, and current piece-revision agreement before adoption.
+        let saved_revision = saved.original_revision();
         if self.path != saved.path
             || !saved.original_file_identity_is_unchanged()
             || self.current_revision()? != saved_revision
@@ -564,7 +487,7 @@ impl MarkdownDocumentBuffer {
             return Err(MarkdownDocumentBufferError::DocumentChangedDuringSave);
         }
         // Only validated metadata and one shared root become the new conflict/dirty baseline.
-        self.save_authority = saved.save_authority;
+        self.save_baseline = saved.save_baseline;
         self.initial_root = self.root.clone();
         Ok(())
     }
@@ -576,16 +499,18 @@ impl MarkdownDocumentBuffer {
     }
 
     #[must_use]
-    /// Read the TextKit coordinate length without materializing UTF-16 storage.
+    /// Read the native UTF-16 coordinate length without materializing UTF-16 storage.
     pub fn utf16_len(&self) -> usize {
         piece_tree_metrics(&self.root).utf16_len
     }
 
     #[must_use]
-    /// 冻结当前canonical正文；仅复制资源引用与索引，不复制正文或保活活动文档。
+    /// Freeze the current canonical text by copying only resource references and
+    /// sparse source metadata, never body bytes or active-document ownership.
     ///
-    /// 已准备但未发布的输入不在当前root中。后续编辑、Undo/Redo、路径变化及文档释放
-    /// 都不会改变此值；快照的最后一个所有者释放后才归还其仍引用的匿名映射与编辑段。
+    /// Prepared but unpublished input is absent from this root. Later edits,
+    /// undo/redo, path changes, and document destruction cannot change the value.
+    /// Its referenced anonymous backings/segments end with the final snapshot owner.
     pub fn text_snapshot(&self) -> MarkdownTextSnapshot {
         MarkdownTextSnapshot::capture(self)
     }
@@ -635,15 +560,16 @@ impl MarkdownDocumentBuffer {
         self.ensure_text_input_idle()?;
         self.validate_selection(selection)?;
         self.selection = selection;
-        self.text_input_composition = None; // 明确程序选区是组合断点，不把后来同位置的新输入吞进旧组。
+        // An explicit programmatic selection breaks composition. Later input at
+        // the same position must not be merged into that old history group.
+        self.text_input_composition = None;
         Ok(())
     }
 
     #[must_use]
-    /// 普通模型按共享root识别保存状态；旧恢复即使空值或Undo回初值也始终dirty，不在输入路径hash正文。
+    /// Compare live and saved roots without hashing on the input path; undo to the saved root is clean.
     pub fn is_dirty(&self) -> bool {
-        self.has_pending_legacy_recovery()
-            || !piece_tree_links_share_root(&self.root, &self.initial_root)
+        !piece_tree_links_share_root(&self.root, &self.initial_root)
     }
 
     #[must_use]
@@ -671,7 +597,8 @@ impl MarkdownDocumentBuffer {
         self.replace_utf16_range_with_selection(range, replacement, self.selection, selection_after)
     }
 
-    /// 既有入口也记录真实变化；不需要派生结果的caller使用纯Noop观察者。
+    /// Preserve real change recording for the convenience entry point; callers
+    /// needing no derived output use the existing no-op observer.
     pub fn replace_utf16_range_with_selection(
         &mut self,
         range: Range<usize>,
@@ -690,7 +617,8 @@ impl MarkdownDocumentBuffer {
         .map_err(changes::legacy_error)
     }
 
-    /// 在提交前流式观察真实旧坐标变化；观察者失败保留原root、选区、append预算及两侧历史。
+    /// Stream actual old-coordinate changes before commit. Observer failure
+    /// preserves the original root, selection, append budget, undo, and redo.
     pub fn replace_utf16_range_with_selection_observed<O: changes::MarkdownTextChangeObserver>(
         &mut self,
         range: Range<usize>,
@@ -699,7 +627,8 @@ impl MarkdownDocumentBuffer {
         selection_after: MarkdownTextSelection,
         observer: O,
     ) -> Result<O::Output, changes::MarkdownObservedEditError<O::Error>> {
-        // 单阶段兼容入口复用同一准备/发布切口；失败仍发生在canonical切换之前。
+        // The single-stage convenience entry reuses the same prepare/publish
+        // transaction; preparation failure still precedes any canonical switch.
         let (token, output) = self.prepare_text_input_observed(
             range,
             replacement,
@@ -741,7 +670,8 @@ impl MarkdownDocumentBuffer {
         })
     }
 
-    /// 兼容入口在日志损坏/I/O失败时不移动history；需要typed失败的caller使用observed入口。
+    /// The selection-only convenience API leaves history unchanged on journal
+    /// corruption/I/O failure; callers needing typed failure use the observed API.
     pub fn undo_text_edit(&mut self) -> Option<MarkdownHistoryTextEdit> {
         self.undo_text_edit_observed(changes::NoopObserver)
             .ok()
@@ -749,7 +679,8 @@ impl MarkdownDocumentBuffer {
             .map(|(edit, ())| edit)
     }
 
-    /// 先peek逆变化并完成派生状态，再原子移动原root和同一日志票据；失败不pop历史。
+    /// Peek inverse changes and complete derived state before moving the original
+    /// root and unique journal ticket; failures do not pop history.
     pub fn undo_text_edit_observed<O: changes::MarkdownTextChangeObserver>(
         &mut self,
         observer: O,
@@ -758,12 +689,14 @@ impl MarkdownDocumentBuffer {
     }
 
     #[cfg(any(test, feature = "native-markdown-candidate"))]
-    /// 便利入口只取恢复后的选区；读取日志失败仍保持原状态。
+    /// Return only the restored selection while preserving state on journal-read failure.
     pub fn redo(&mut self) -> Option<MarkdownTextSelection> {
+        // Exact change geometry and typed errors remain available at the observed boundary.
         self.redo_text_edit().map(|edit| edit.selection_after)
     }
 
-    /// 兼容入口不把读取失败当已完成Redo；原history和正文保持可重试。
+    /// The convenience API cannot report a failed read as completed redo;
+    /// preserve original history and text for a later explicit attempt.
     pub fn redo_text_edit(&mut self) -> Option<MarkdownHistoryTextEdit> {
         self.redo_text_edit_observed(changes::NoopObserver)
             .ok()
@@ -771,7 +704,8 @@ impl MarkdownDocumentBuffer {
             .map(|(edit, ())| edit)
     }
 
-    /// 正向变化流重放完成前不pop；每条变化仍使用该历史事务的旧坐标。
+    /// Complete forward-change replay before popping history. Every change
+    /// retains the original transaction's old-coordinate interpretation.
     pub fn redo_text_edit_observed<O: changes::MarkdownTextChangeObserver>(
         &mut self,
         observer: O,
@@ -779,6 +713,8 @@ impl MarkdownDocumentBuffer {
         self.restore_history_observed(false, observer)
     }
 
+    /// Prepare the observer's complete result from the original history entry,
+    /// then transfer that one entry and its journal ownership without copying pages.
     fn restore_history_observed<O: changes::MarkdownTextChangeObserver>(
         &mut self,
         inverse: bool,
@@ -787,21 +723,27 @@ impl MarkdownDocumentBuffer {
         self.ensure_text_input_idle()?;
         let source = if inverse { &self.undo } else { &self.redo };
         let Some(target) = source.back() else {
-            return Ok(None); // 无历史不调用观察者，也不产生虚构变化。
+            // No history means no observer callback or manufactured character change.
+            return Ok(None);
         };
         self.change_journal
             .visit(&target.changes, inverse, |record| {
+                // Journal records already carry this restoration direction's
+                // exact old extent and inserted length; do not infer a whole-text diff.
                 observer.changed(changes::MarkdownTextChange {
                     old_utf16_range: record.start..record.start + record.removed,
                     inserted_utf16_len: record.inserted,
                 })
             })
             .map_err(|error| match error {
-                // 任意读/校验失败都在peek阶段停止；观察者的部分候选随错误丢弃。
+                // Journal read/validation failure ends the peek phase before
+                // history movement; the observer's partial candidate is discarded.
                 change_journal::VisitError::Journal(error) => {
                     changes::MarkdownObservedEditError::Journal(error)
                 }
                 change_journal::VisitError::Observer(error) => {
+                    // Keep the observer's own typed error rather than relabeling
+                    // it as storage failure or committing a partial derived value.
                     changes::MarkdownObservedEditError::Observer(error)
                 }
             })?;
@@ -814,7 +756,8 @@ impl MarkdownDocumentBuffer {
                 target.selection,
             )
             .map_err(changes::MarkdownObservedEditError::Observer)?;
-        // 所有可失败步骤结束后才从源history取走唯一票据，向另一侧转移而不复制日志页。
+        // All fallible observer/journal work has ended. Transfer the unique
+        // ticket to the opposite history side without copying its anonymous pages.
         let target = if inverse {
             self.undo.pop_back()
         } else {
@@ -822,6 +765,8 @@ impl MarkdownDocumentBuffer {
         }
         .expect("the immutable peek validated one existing history entry");
         let opposite = MarkdownEditorMemento {
+            // Composition stores its actual counterpart selection; ordinary
+            // entries retain the established exchange with the current selection.
             root: self.root.clone(),
             selection: target.counterpart_selection.unwrap_or(self.selection),
             counterpart_selection: target.counterpart_selection.map(|_| target.selection),
@@ -834,11 +779,15 @@ impl MarkdownDocumentBuffer {
             push_bounded_snapshot(&mut self.undo, opposite)
         };
         if let Some(evicted) = evicted {
+            // Only the newly committed bounded-history eviction releases its
+            // journal ownership, after the replacement entry has been installed.
             self.change_journal.release(evicted.changes);
         }
         self.root = target.root;
         self.selection = target.selection;
-        self.text_input_composition = None; // 真正历史恢复结束旧组合分组，失败的peek阶段不会改此状态。
+        // Completed history restoration ends composition; a failed earlier peek
+        // leaves that original grouping untouched.
+        self.text_input_composition = None;
         self.generation = self.generation.wrapping_add(1);
         #[cfg(any(test, feature = "native-markdown-candidate"))]
         self.block_checkpoints
@@ -876,14 +825,17 @@ impl MarkdownDocumentBuffer {
         utf16_offset_for_byte_in_tree(self, self.root.as_deref(), byte_offset, 0)
     }
 
-    /// 读取NSString兼容单元；单个派生窗口最多4096单元，不建立整篇编码镜像。
+    /// Read an NSString-compatible unit through one at-most-4096-unit derived
+    /// window, without constructing a whole-document encoding mirror.
     pub fn utf16_code_unit_at(
         &self,
         utf16_offset: usize,
     ) -> Result<u16, MarkdownDocumentBufferError> {
-        // 健康失败优先于缓存命中；EOF没有单元，且不能因缓存中旧字节而成功。
+        // Source failure precedes cache hits. EOF has no readable unit, and old
+        // cached bytes cannot turn an unavailable source into a successful read.
         self.original_backing_health()?;
         if utf16_offset >= self.utf16_len() {
+            // Reject EOF or outside unit positions before requesting cache contents.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         let mut unit = [0];
@@ -891,10 +843,12 @@ impl MarkdownDocumentBuffer {
         Ok(unit[0])
     }
 
-    /// 完整填充调用方范围，允许从低代理项开始；内部一次只保留一个8KiB窗口。
+    /// Fill the caller's complete unit range, including a low-surrogate start,
+    /// while retaining only one internal 8 KiB cache window at a time.
     ///
-    /// 大请求仍按原真实范围逐窗完成，不截断、不改变NSString语义；原root与generation
-    /// 每次读取都参与命中验证，编辑、Undo或失败事务临时换root不能复用旧窗口。
+    /// Larger explicit requests proceed window by window over their exact range,
+    /// without truncating native unit semantics. Root and generation both bind
+    /// cache hits; edits, undo, and temporarily switched candidate roots cannot reuse an old key.
     pub fn copy_utf16_code_units(
         &self,
         utf16_offset: usize,
@@ -905,7 +859,8 @@ impl MarkdownDocumentBuffer {
             .utf16_read_cache
             .lock()
             .map_err(|_| MarkdownDocumentBufferError::Utf16ReadCacheUnavailable)?;
-        // 借用只覆盖纯Rust读取；没有Native调用或活动文档回链藏在cache中。
+        // Hold the lock only for Rust reads. This cache contains neither native
+        // calls nor a hidden strong link back to an active document.
         cache.copy(self, &self.root, self.generation, utf16_offset, destination)
     }
 
@@ -1106,11 +1061,13 @@ impl MarkdownDocumentBuffer {
             && scan_end < self.utf16_len()
             && desired_end > 0
         {
-            // 原扫描器只消费完整 CR/LF 物理行；唯一行被任一预算截断且未到 EOF 时，
-            // 首轮就会在 consume_line 之前停止，既没有完整 block，也不产生新 checkpoint。
-            // 直接走原 source fallback，省掉注定会被丢弃的最大扫描 String；不改变语法判定。
-            // desired_end=0 的原空请求仍保留下面的 Complete 空值路径，不能改签为 fallback。
-            self.byte_offset_for_utf16(scan_end)?; // UTF-16 上限可能切在 surrogate 中间；保留旧扫描切片的边界错误。
+            // The scanner consumes complete physical CR/LF lines. If a budget
+            // cuts the sole line before actual EOF, it stops before consume_line,
+            // yielding neither a complete block nor a new checkpoint. Use the
+            // existing explicit source status without allocating a doomed scan String.
+            // A desired_end=0 request keeps the complete-empty path below.
+            // Preserve the ordinary slice's split-surrogate error at its UTF-16 cap.
+            self.byte_offset_for_utf16(scan_end)?;
             return self
                 .materialize_markdown_source_fallback(requested_utf16_range, overscan_utf16_units);
         }
@@ -1195,11 +1152,14 @@ impl MarkdownDocumentBuffer {
         write_piece_tree(self, self.root.as_deref(), destination)
     }
 
-    /// 将真实UTF-16选区按原UTF-8字节流式写出，不创建正文String或选区镜像。
+    /// Stream an actual UTF-16 selection as original UTF-8 bytes without a body
+    /// String or separate selection-content mirror.
     ///
-    /// 两端必须是标量边界；全部范围预检完成前不调用writer。空范围和EOF同样核原源健康。
-    /// writer失败可能已经留下部分输出，但不改变canonical、选择或历史；原叶lease的真实
-    /// 回收错误优先于写入错误，调用方不得把不完整目标当作已经成功复制。
+    /// Both endpoints must be scalar boundaries before the writer is called.
+    /// Empty ranges/EOF also check original source health. Write failure may leave
+    /// partial caller-owned output without changing canonical text/selection/history.
+    /// Actual lease reclamation currently takes precedence over writer failure;
+    /// the destination owner must not treat incomplete output as successful copying.
     pub fn write_utf16_range_to(
         &self,
         range: Range<usize>,
@@ -1207,16 +1167,21 @@ impl MarkdownDocumentBuffer {
     ) -> Result<(), MarkdownDocumentBufferError> {
         self.original_backing_health()?;
         if range.start > range.end || range.end > self.utf16_len() {
+            // Reject reversed/outside coordinates rather than clamping them and
+            // writing a different interval than the caller selected.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
-        } // 拒绝逆序和越界，不能夹取范围后写入另一段正文。
+        }
         let start = self.byte_offset_for_utf16(range.start)?;
         let end = self.byte_offset_for_utf16(range.end)?;
-        // 两次转换先排除代理对内部端点；随后只借选区相交的有限叶，UTF8字节保持原值。
+        // Both conversions exclude surrogate interiors first. Then borrow only
+        // intersecting finite leaves and preserve their exact UTF-8 representation.
         visit_piece_tree_range(self, self.root.as_deref(), start..end, 0, &mut |bytes| {
+            // The caller owns partial-output rollback. This source lease must
+            // actually finish before its writer result can propagate.
             destination
                 .write_all(bytes)
                 .map_err(|_| MarkdownDocumentBufferError::WriteUnavailable)
-        }) // 原visitor先归还真实lease再传播writer结果，不能用写入失败洗掉Source首错。
+        })
     }
 
     #[must_use]
@@ -1321,6 +1286,8 @@ impl MarkdownDocumentBuffer {
         Ok(())
     }
 
+    /// Arm the existing reclaim-failure injection for this real original backing;
+    /// setting the flag alone does not prove any kernel resource operation failed.
     #[cfg(test)]
     pub(crate) fn fail_next_original_reclaim_for_test(&self) {
         if let Some(backing) = &self.original_snapshot {
@@ -1329,26 +1296,32 @@ impl MarkdownDocumentBuffer {
     }
 
     #[cfg(test)]
-    /// 测试显式触发真实无pin页驱逐；不能把注入标志本身当成已发生I/O错误。
+    /// Explicitly perform real unpinned-page eviction for regression tests;
+    /// an injected flag alone is not evidence of completed or failed I/O.
     pub(crate) fn reclaim_original_read_windows_for_test(
         &self,
     ) -> Result<(), MarkdownDocumentBufferError> {
         match self.original_snapshot.as_ref() {
+            // Use the actual original backing's reclamation boundary when one exists.
             Some(backing) => backing.reclaim_unpinned_for_test().map_err(Into::into),
-            None => Ok(()), // 纯编辑或空原文没有原始映射页需要驱逐。
+            // An empty original has no original mapping pages to evict.
+            None => Ok(()),
         }
     }
 
-    /// 原回收失败对所有后继读取和提交永久生效；metadata长度本身不授予新的正文权限。
+    /// A recorded reclamation failure permanently revokes later reads/commits;
+    /// a metadata length grants no independent authority to access content.
     pub(crate) fn original_backing_health(&self) -> Result<(), MarkdownDocumentBufferError> {
         if let Some(backing) = self.original_snapshot.as_deref() {
-            // 原始Source首错仍先于后继编辑文件；两者都不能被纯metadata查询绕过。
+            // Original-source failure precedes later edit-file failure; neither
+            // may be bypassed by a metadata-only query that needs source authority.
             backing.health()?;
         }
         self.edits.health()
     }
 
-    /// 观察原始映射的真实最终VM释放；固定标量observer不保活正文资源。
+    /// Observe actual final VM release through scalar facts without retaining
+    /// the original text allocation or backing resource.
     #[must_use]
     pub fn original_backing_observer(
         &self,
@@ -1358,10 +1331,13 @@ impl MarkdownDocumentBuffer {
             .map(|backing| backing.observer())
     }
 
-    /// 遍历文档实际持有的原始映射及已发布文件段；观察票不保活正文、文件或映射。
+    /// Observe the document's original backing and actually published file
+    /// segments without retaining their content, descriptors, or mappings.
     ///
-    /// 已发布段即使暂时只由Undo/Redo引用，也仍归该文档释放；未发布候选仍归原事务。
-    /// 调用者须在销毁文档前取得这些票，再于真实最后owner退场后检查VM释放结果。
+    /// History-only published segments still belong to this document's release
+    /// obligation; unpublished candidates belong to their original transaction.
+    /// Acquire observations before destruction and inspect VM facts only after
+    /// the real final resource owner has ended.
     pub fn backing_observers(
         &self,
     ) -> impl Iterator<Item = crate::original_backing::MarkdownOriginalBackingObserver> + '_ {
@@ -1372,11 +1348,14 @@ impl MarkdownDocumentBuffer {
                 self.edits.segments[..self.edits.published_segments]
                     .iter()
                     .filter_map(|segment| match segment.as_ref() {
-                        // 堆段不承担文件映射义务，不能合成一个已释放票冒充实际资源。
+                        // Heap segments have no mapping obligation; never invent
+                        // an already-released observation for a nonexistent file resource.
                         MarkdownEditSegment::Heap(_) => None,
-                        // 同一实际backing只借出票；不读取正文、不建立第二份存储库存。
+                        // Lend only this actual backing's observation without
+                        // reading text or building another resource inventory.
                         MarkdownEditSegment::Frozen(backing) => Some(backing.observer()),
-                        // 退休只结束Doc的payload强边；全部已发布映射的释放证据仍在同一个编号。
+                        // Retirement ends only the document's strong payload edge;
+                        // evidence for its published mapping remains under the same ID.
                         MarkdownEditSegment::RetiredFrozen(observer) => {
                             Some(observer.as_ref().clone())
                         }
@@ -1384,7 +1363,8 @@ impl MarkdownDocumentBuffer {
             )
     }
 
-    /// 每次借用只取得当前叶的有限权限；原始payload偏移不改变piece的逻辑坐标。
+    /// Borrow only the current bounded leaf. An original payload's nonzero
+    /// backing offset does not alter logical piece coordinates.
     fn piece_bytes(
         &self,
         piece: &MarkdownPiece,
@@ -1392,6 +1372,8 @@ impl MarkdownDocumentBuffer {
         self.piece_range_bytes(piece, 0..piece.byte_len)
     }
 
+    /// Lease an exact local extent from the original backing or stable edit
+    /// segment without changing the logical piece or its cached aggregate.
     fn piece_range_bytes(
         &self,
         piece: &MarkdownPiece,
@@ -1399,19 +1381,20 @@ impl MarkdownDocumentBuffer {
     ) -> Result<PieceBytes<'_>, MarkdownDocumentBufferError> {
         self.original_backing_health()?;
         if local.start > local.end || local.end > piece.byte_len {
+            // Reject invalid local extents before acquiring any backing resource.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         match piece.source {
             MarkdownPieceSource::Original => {
+                // Original piece coordinates belong to this same immutable Markdown snapshot.
+                // Keep health checks and lease only the actual local range, never the full backing.
                 let backing = self
                     .original_snapshot
                     .as_ref()
                     .ok_or(MarkdownDocumentBufferError::RangeOutsideDocument)?;
-                let start = self
-                    .original_range
-                    .start
-                    .checked_add(piece.byte_start)
-                    .and_then(|start| start.checked_add(local.start))
+                let start = piece
+                    .byte_start
+                    .checked_add(local.start)
                     .ok_or(MarkdownDocumentBufferError::RangeOutsideDocument)?;
                 backing
                     .lease(start..start + local.len())
@@ -1419,7 +1402,8 @@ impl MarkdownDocumentBuffer {
                     .map_err(Into::into)
             }
             MarkdownPieceSource::EditSegment(index) => {
-                // 同一编号的堆段和封存段共用piece坐标；映射分支只取得当前有限range的lease。
+                // Heap and frozen segments share the same stable piece coordinates;
+                // a file-backed segment leases only this actual finite range.
                 self.edits.read(
                     index,
                     piece.byte_start + local.start..piece.byte_start + local.end,
@@ -1430,9 +1414,11 @@ impl MarkdownDocumentBuffer {
 }
 
 impl PieceByteSource for MarkdownDocumentBuffer {
+    /// Forward health checks to the one active document's original and edited resources.
     fn source_health(&self) -> Result<(), MarkdownDocumentBufferError> {
         self.original_backing_health()
     }
+    /// Keep whole-piece trait reads on the same finite active-source implementation.
     fn piece_bytes(
         &self,
         piece: &MarkdownPiece,
@@ -1440,7 +1426,8 @@ impl PieceByteSource for MarkdownDocumentBuffer {
         MarkdownDocumentBuffer::piece_bytes(self, piece)
     }
 
-    /// 保留原叶与其真实摘要，只把本量子的局部字节范围交给原有限lease。
+    /// Retain the real leaf and aggregate while lending only this quantum's
+    /// requested local byte extent through the original finite lease.
     #[cfg(feature = "paged-shaping-frontier")]
     fn piece_range_bytes(
         &self,
@@ -1451,21 +1438,23 @@ impl PieceByteSource for MarkdownDocumentBuffer {
     }
 }
 
-/// 共享root、选区与唯一真实变化票据；页身份不可Clone，避免重复释放。
+/// Retain a shared root, selection, and unique real change ticket. The journal
+/// page identity cannot be cloned into duplicate release authority.
 ///
 /// Only tree roots, selection, and replacement metrics are retained; snapshots
 /// never copy the document body, so bounded history does not duplicate full text.
 struct MarkdownEditorMemento {
     root: PieceTreeLink,
     selection: MarkdownTextSelection,
-    // 仅组合组记录真实另一端选区；普通历史继续沿原当前选择交换合同。
+    // Only composition groups record the actual counterpart selection. Ordinary
+    // history preserves its established exchange with the current selection.
     counterpart_selection: Option<MarkdownTextSelection>,
     replacement: MarkdownReplacementMetrics,
     changes: change_journal::Entry,
 }
 
 impl MarkdownReplacementMetrics {
-    /// Record a checked signed TextKit length delta before accepting an editor replacement.
+    /// Record a checked signed native length delta before accepting an editor replacement.
     fn new(
         location: usize,
         removed_utf16_length: usize,
@@ -1532,10 +1521,13 @@ fn push_bounded_snapshot(
     history: &mut VecDeque<MarkdownEditorMemento>,
     snapshot: MarkdownEditorMemento,
 ) -> Option<MarkdownEditorMemento> {
-    // 先从容器取出旧票据，调用方仅在新提交成功后释放其日志页。
+    // Detach the old ticket first; the caller releases its journal pages only
+    // after the new bounded-history entry has committed successfully.
     let evicted = if history.len() == MAX_EDIT_HISTORY_ENTRIES {
+        // Evict exactly the oldest entry when the real retained-history bound is reached.
         history.pop_front()
     } else {
+        // Existing capacity does not create a fictitious journal-release obligation.
         None
     };
     history.push_back(snapshot);
@@ -1568,32 +1560,40 @@ impl From<&Metadata> for MarkdownFileIdentity {
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 /// Stable rejection categories for safe storage, Unicode boundaries, and bounded editing.
 pub enum MarkdownDocumentBufferError {
-    /// 只读显示来源的匿名坐标目录真实失败；None 表示索引撤权或同步状态损坏，不伪造 errno。
+    /// Actual anonymous display-coordinate storage failure; None denotes revoked
+    /// index authority or synchronization damage without inventing a system errno.
     #[error("显示坐标存储不可用（系统错误 {0:?}）")]
     DisplayStorageUnavailable(Option<i32>),
-    /// 本次匿名候选尚未发布时的真实创建、写入、封存或读取失败；不撤销未改原Source。
+    /// Failed creation, writing, sealing, or reading of this unpublished anonymous
+    /// candidate does not revoke an otherwise unchanged original Source.
     #[error("编辑候选存储不可用（系统错误 {0}）")]
     EditStorageUnavailable(i32),
-    /// 摘要缓存的同步状态损坏时明确拒绝，不以旧摘要宣称提交权限仍有效。
+    /// Damaged revision-cache synchronization explicitly rejects access; an old
+    /// digest cannot claim that commit authority remains valid.
     #[error("正文版本摘要暂不可用")]
     RevisionCacheUnavailable,
-    /// 派生读取窗口的同步状态不可用；不能清除poison后继续返回未经认证的缓存。
+    /// Unavailable derived-cache synchronization cannot be repaired by clearing
+    /// poison and returning an uncertified old window.
     #[error("正文读取窗口暂不可用")]
     Utf16ReadCacheUnavailable,
-    /// 原始匿名映射的真实获取、同步归还或释放失败；errno固定且不携带用户数据。
+    /// Actual original-backing acquisition, synchronous reclamation, or release
+    /// failure carries only its fixed errno, never user content.
     #[error("原始正文映射不可用（系统错误 {0}）")]
     OriginalBackingUnavailable(i32),
-    /// 限制同时存活的原始读取窗口，避免递归或并发借用突破驻留上界。
+    /// Bound simultaneously live original leases so recursive/concurrent reads
+    /// cannot exceed their retained-source resource limit.
     #[error("同时读取的原始正文窗口过多")]
     OriginalReadLeaseLimitExceeded,
 
-    /// 正在等待同一原生输入完成；不能让其他写操作破坏候选append与原始选区权限。
+    /// Await completion of this same native input. Other writes cannot disturb
+    /// the candidate append extent or its original selection authority.
     #[error("当前文本输入尚未完成，请稍后重试")]
     TextInputPrepared,
-    /// 票据不属于当前唯一候选、已取消或原始canonical权限已撤销。
+    /// A ticket no longer belongs to the unique current candidate, was cancelled,
+    /// or lost its original canonical authority.
     #[error("当前文本输入的提交权限已失效")]
     PreparedTextInputStale,
-    /// 进入原生输入前无法为唯一历史记录预留容量。
+    /// Reserving the sole history entry failed before native input began.
     #[error("无法为当前文本输入准备编辑历史")]
     EditHistoryUnavailable,
     #[error("当前文档的变化日志达到会话上限")]
@@ -1602,8 +1602,6 @@ pub enum MarkdownDocumentBufferError {
     ChangeJournalUnavailable,
     #[error("正文未提交，但变化日志失败后的物理清理未确认")]
     ChangeJournalCleanupUnconfirmed,
-    #[error("旧冲突草稿尚未解决，请另存为新笔记或明确重新载入磁盘版本")]
-    PendingLegacyRecovery,
     #[error("Markdown 文件无法安全打开")]
     OpenUnavailable,
     #[error("Markdown 路径不是普通文件")]
@@ -1627,27 +1625,35 @@ pub enum MarkdownDocumentBufferError {
     EditBufferLimitExceeded,
     #[error("Markdown 流式写入失败")]
     WriteUnavailable,
-    /// 匿名替换输入无法继续读取；不携带路径、正文或系统错误详情。
+    /// Anonymous replacement input cannot continue reading; expose neither its
+    /// path, content, nor internal system-error details.
     #[error("Markdown 替换输入无法完整读取")]
     ReplacementInputUnavailable,
-    /// 原文坐标必须升序且不重叠，同位置的连续空插入也不能制造不明确的次序。
+    /// Original coordinates must be ascending and nonoverlapping. Consecutive
+    /// empty insertions at one position cannot introduce ambiguous ordering.
     #[error("Markdown 替换范围未按原文顺序排列或发生重叠")]
     ReplacementRangesNotOrdered,
-    /// 有界查找的调用方已取消或撤销本次期限，不把部分枚举冒充完整结果。
+    /// The bounded find owner cancelled or revoked this request's deadline;
+    /// partial enumeration cannot be reported as a complete result.
     #[error("Markdown 查找已中止")]
     FindInterrupted,
 }
 
 impl From<crate::original_backing::OriginalBackingError> for MarkdownDocumentBufferError {
+    /// Preserve the concrete backing failure category at the document boundary
+    /// without inferring a missing source or successful empty read from I/O failure.
     fn from(error: crate::original_backing::OriginalBackingError) -> Self {
         match error {
             crate::original_backing::OriginalBackingError::RangeOutsideMapping => {
+                // An invalid backing extent remains a rejected document range.
                 Self::RangeOutsideDocument
             }
             crate::original_backing::OriginalBackingError::Unavailable(errno) => {
+                // Keep the original system cause rather than synthesizing another errno.
                 Self::OriginalBackingUnavailable(errno)
             }
             crate::original_backing::OriginalBackingError::LeaseLimitExceeded => {
+                // Resource contention is distinct from malformed coordinates or I/O failure.
                 Self::OriginalReadLeaseLimitExceeded
             }
         }

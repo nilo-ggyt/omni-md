@@ -1,4 +1,4 @@
-//! 真Cell准入消费原Body票；不创建NSApplication或用Noop observer替代折叠发布。
+//! Real Cell admission consumes original Body authority without NSApplication or a no-op replacement for fold publication.
 
 use super::*;
 use omni_markdown_core::markdown_document_buffer::{
@@ -25,7 +25,7 @@ impl Fixture {
         Self::with_stale_body_permit(false, 0).0
     }
 
-    /// stale负控必须在Cell准入之前制造；草稿存活期禁止canonical选区修改正是被测事务门。
+    /// Create stale authority before Cell admission; canonical selection mutation while a draft is live is itself forbidden by the tested boundary.
     fn with_stale_body_permit(
         stale: bool,
         column: usize,
@@ -47,8 +47,8 @@ impl Fixture {
         let body =
             NativeMarkdownPagedInput::with_folds(Rc::downgrade(&document), vec![fold.clone()])
                 .unwrap();
-        // 先捕获原Body票，再用另一真实Body票发布选区。此时尚未begin草稿，
-        // canonical允许这次操作；后续旧票会因真实serial变化失效，而非测试改私有字段。
+        // Capture original Body authority, then publish selection through another actual Body permit before beginning the draft.
+        // The allowed public operation advances actual serial and revokes the old permit without mutating private fields.
         let stale_permit = if stale {
             let old = body.capture(BODY_EPOCH, &|_| true).unwrap();
             let fresh = body.capture(BODY_EPOCH, &|_| true).unwrap();
@@ -125,7 +125,7 @@ impl Fixture {
     }
     fn text(&self) -> String {
         let original = self.document.borrow();
-        assert!(original.utf16_len() < 256); // 仅有限oracle，桥接生产不捕获canonical全文。
+        assert!(original.utf16_len() < 256); // Only a bounded oracle; the production bridge never captures full canonical text.
         let mut units = [0; 256];
         let length = original.utf16_len();
         original
@@ -135,7 +135,7 @@ impl Fixture {
     }
 }
 
-/// 只驱动同一生产请求的原4096工作量子；不另起Parser或用目标行号构造权限。
+/// Advance the same production request with its 4096-work quantum, without another parser or authority invented from a row number.
 fn finish_sources(
     request: &mut MarkdownViewportSourceRequest,
     document: &MarkdownDocumentBuffer,
@@ -150,7 +150,7 @@ fn finish_sources(
 }
 
 #[test]
-/// 原末格草稿和真实terminal沿同Input准入，两个显示读取归还后仅发布一次cell+append。
+/// Admit the last-cell draft and actual terminal under one Input; after both readers return, publish cell+append once.
 fn real_terminal_append_to_existing_body_preserves_directed_receipt_and_one_undo() {
     let fixture = Fixture::with_stale_body_permit(false, 1).0;
     let original_mapping = fixture
@@ -173,7 +173,7 @@ fn real_terminal_append_to_existing_body_preserves_directed_receipt_and_one_undo
             .table_row_at_for(&document, authority, 0)
             .unwrap()
             .unwrap();
-        // 从真实Header逐次向后走，唯有原请求返回的End才允许追加；离屏行不要求整表语义窗口。
+        // Walk from the verified header; only the original request's End authorizes append, without preparing the entire offscreen table.
         let terminal = loop {
             let query = sources
                 .required_row_query_for(
@@ -232,7 +232,7 @@ fn real_terminal_append_to_existing_body_preserves_directed_receipt_and_one_undo
         )
         .unwrap();
     assert_eq!(prepared.next_cell(), Some((2, 0)));
-    assert_eq!(fixture.text(), SOURCE); // 准备期保原显示与磁盘，不能先提交草稿再另起追加事务。
+    assert_eq!(fixture.text(), SOURCE); // Preparation retains display/disk text; do not commit the draft before a separate append transaction.
     drop((first, second));
     let body_permit = fixture.body_permit();
     let result = fixture
@@ -261,7 +261,7 @@ fn real_terminal_append_to_existing_body_preserves_directed_receipt_and_one_undo
             },
             origin_utf16: start + 3
         })
-    ); // 首组两端和组内首击点分别穿过trim与管道转义；提交后不再从裸位置重扩词。
+    ); // Map both word endpoints and the initial hit through trimming/pipe escaping; do not re-expand a word from bare postcommit positions.
     assert!(resources.is_released());
     let after = SOURCE.replacen("other |\n", "新\\|😀 |\n| | |\n", 1);
     assert_eq!(fixture.text(), after);
@@ -269,7 +269,7 @@ fn real_terminal_append_to_existing_body_preserves_directed_receipt_and_one_undo
         std::fs::read(fixture.document.borrow().path()).unwrap(),
         SOURCE.as_bytes()
     );
-    // canonical原历史只含同一次事务；旧输入票不能再贡献一次追加，Undo一次精确回到磁盘原文。
+    // One canonical history transaction covers the append; old input cannot append again, and one Undo restores exact disk text.
     let permit = fixture.body_permit();
     fixture
         .body
@@ -326,7 +326,7 @@ fn real_cell_commit_updates_existing_body_folds_global_selection_and_one_undo_re
     let NativeMarkdownPagedInputOutcome::Committed(commit) = outcome.outcome else {
         panic!("真实修改必须返回Body commit");
     };
-    // Body仍沿原caret(after)发布；单独的真实端点保留原草稿方向，供后续Shift在原许可下使用。
+    // Body publishes its original after-caret; separate actual endpoints retain draft direction for later Shift use under original authority.
     let start = SOURCE.find("base").unwrap();
     assert_eq!(
         outcome.receipt.selection,

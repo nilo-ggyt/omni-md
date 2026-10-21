@@ -1,15 +1,18 @@
-//! 同一已封口前缀的行查找。每个实际64B读取计一record，没有新正文或GCB索引。
+//! Locate lines inside the same sealed prefix. Each actual 64-byte read consumes
+//! one record of work; no document copy or second GCB index is constructed.
 
 use super::*;
 
-/// 只决定相邻行共享源端点属于哪侧；不授予caret、glyph或Native可见性权限。
+/// Choose the side of a Source endpoint shared by adjacent lines. This policy
+/// grants neither caret/glyph geometry nor Native visibility authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownComposedLineAffinity {
     Upstream,
     Downstream,
 }
 
-/// Source坐标可以位于scalar内部：这里只返回真实整行，不能据此签发该位置的编辑权限。
+/// A Source target may lie inside a scalar: lookup returns an actual complete
+/// line, without granting permission to edit at that raw coordinate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownComposedLineLookupTarget {
     Source {
@@ -22,7 +25,8 @@ pub enum MarkdownComposedLineLookupTarget {
 pub enum MarkdownComposedLineLookupAnswer {
     Pending,
     Found(MarkdownComposedLine),
-    /// 只说明原快照未覆盖目标，不表示全文EOF，也不从较新的Output补取行。
+    /// This original prefix does not cover the target. It proves neither whole-
+    /// document EOF nor permission to borrow a line from a newer output.
     PrefixNotCovered,
 }
 
@@ -38,7 +42,8 @@ enum Edge {
     Previous,
 }
 
-/// 固定状态跨quota边界保留已读tail；没有Reader、Source、Font或其他业务强边。
+/// Fixed cursor state carries an already-read tail across work quanta, without
+/// retaining a Reader, Source, Font, or another business owner.
 pub struct MarkdownComposedLineLookup {
     output: Weak<()>,
     source: MarkdownLayoutTextAuthority,
@@ -63,6 +68,8 @@ enum Relation {
 }
 
 impl MarkdownComposedLineLookup {
+    /// Compare the actual line with the original target, respecting association
+    /// at shared soft-line boundaries and the real Source endpoint.
     fn relation(&self, line: &MarkdownComposedLine, source_len: usize) -> Relation {
         match self.target {
             MarkdownComposedLineLookupTarget::Ordinal(target) => {
@@ -80,23 +87,25 @@ impl MarkdownComposedLineLookup {
                         && line.facts.ordinal != 0
                         && affinity == MarkdownComposedLineAffinity::Upstream)
                 {
-                    Relation::Before // 上游侧属于前一真实行，不能取后继行相同整数端点。
+                    Relation::Before // Upstream belongs to the actual preceding line, not an equal successor offset.
                 } else if utf16 < range.end
                     || (utf16 == range.end
                         && (affinity == MarkdownComposedLineAffinity::Upstream
                             || utf16 == source_len))
                 {
-                    Relation::Found // 真EOF无后继时可取最后实行；若有尾空行，已从它开始查。
+                    Relation::Found // Actual EOF can use the final line; a terminal empty line is searched first.
                 } else {
-                    Relation::After // 下游未布局端点不是完整EOF；不能把前缀尾行补签为下一行。
+                    Relation::After // An unprepared downstream endpoint cannot reuse the prefix's last line.
                 }
             }
         }
     }
 
+    /// Copy authenticated weak facts only. The caller still checks original
+    /// output health before returning even a repeated terminal answer.
     fn answer(&self) -> MarkdownComposedLineLookupAnswer {
         if let Some(line) = &self.found {
-            // 只复制已经认证过的弱身份和固定事实；重复终态查询仍先经过Output健康门。
+            // Copy neither reader/file ownership nor a newer Source ticket.
             MarkdownComposedLineLookupAnswer::Found(MarkdownComposedLine {
                 output: line.output.clone(),
                 header: line.header,
@@ -107,22 +116,27 @@ impl MarkdownComposedLineLookup {
                 facts: line.facts.clone(),
             })
         } else if self.done {
+            // Exhausted coverage is distinct from a cursor awaiting more work.
             MarkdownComposedLineLookupAnswer::PrefixNotCovered
         } else {
             MarkdownComposedLineLookupAnswer::Pending
         }
     }
 
+    /// Resume from the original current line's actual predecessor; a broken
+    /// chain is corruption, not legitimate uncovered-prefix backpressure.
     fn previous(&mut self) -> Result<()> {
         let line = self.current.as_ref().ok_or(Error::InconsistentCoverage)?;
         self.next = line.previous;
         self.edge = Edge::Previous;
         if self.next.is_none() {
             return Err(Error::InconsistentCoverage);
-        } // 合法目标不可能早于ordinal0；断链不能变成“前缀未覆盖”。
+        } // An admitted target cannot precede ordinal zero.
         Ok(())
     }
 
+    /// Authenticate each actual backward edge before moving the cursor. Skips
+    /// may bypass lines, but cannot reverse record/Source order or forge adjacency.
     fn accept(&mut self, line: MarkdownComposedLine, source_len: usize) -> Result<()> {
         if let Some(current) = &self.current {
             let ordinal = line.facts.ordinal;
@@ -131,9 +145,10 @@ impl MarkdownComposedLineLookup {
                 || line.facts.source_utf16.end > current.facts.source_utf16.start
             {
                 return Err(Error::InconsistentCoverage);
-            } // 即使跳过多行，原记录顺序和Source单调性也必须严格成立。
+            } // Multi-line skips still preserve original record and Source monotonicity.
             match self.edge {
                 Edge::Skip if current.skip != Some((line.end, ordinal)) => {
+                    // The actual skip must point to this exact earlier line.
                     return Err(Error::InconsistentCoverage);
                 }
                 Edge::Previous
@@ -141,13 +156,17 @@ impl MarkdownComposedLineLookup {
                         || ordinal.checked_add(1) != Some(current.facts.ordinal)
                         || line.facts.source_utf16.end != current.facts.source_utf16.start =>
                 {
+                    // A predecessor edge also proves adjacent ordinal and
+                    // continuous Source coverage, not just a smaller record.
                     return Err(Error::InconsistentCoverage);
                 }
-                _ => {} // 非相邻skip只核它实际声明的目标；相邻跳链仍须连续源覆盖。
+                _ => {} // Nonadjacent skips authenticate only their actual declared target.
             }
             if ordinal.checked_add(1) == Some(current.facts.ordinal)
                 && line.facts.source_utf16.end != current.facts.source_utf16.start
             {
+                // Even a skip that happens to be adjacent must preserve the
+                // actual joining Source endpoint.
                 return Err(Error::InconsistentCoverage);
             }
         } else if !matches!(self.edge, Edge::Last)
@@ -155,29 +174,38 @@ impl MarkdownComposedLineLookup {
             || Some(line.end) != self.last
             || line.facts.source_utf16.end != self.prefix.end
         {
+            // The initial record must be the original sealed prefix's last
+            // line, before any predecessor/skip search can begin.
             return Err(Error::InconsistentCoverage);
         }
         match self.relation(&line, source_len) {
             Relation::Found => {
+                // Retain only the authenticated found line and release cursor
+                // predecessor state; repeated answers still check output health.
                 self.found = Some(line);
                 self.done = true;
                 self.current = None;
                 self.next = None;
             }
             Relation::Before => {
+                // Search earlier lines from this authenticated current record.
                 let skip = line.skip.map(|value| value.0);
                 self.current = Some(line);
                 if let Some(skip) = skip {
+                    // Prefer the writer's actual skip edge when available.
                     self.next = Some(skip);
                     self.edge = Edge::Skip;
                 } else {
+                    // Without a skip, only the true predecessor can advance.
                     self.previous()?;
                 }
             }
             Relation::After if matches!(self.edge, Edge::Skip) => {
-                self.previous()?; // skip越过目标时只退原current的真实前驱，不从错误候选继续。
+                self.previous()?; // An overshooting skip resumes from the original current predecessor.
             }
             Relation::After if matches!(self.edge, Edge::Last) => {
+                // The target is beyond this actual prefix; do not acquire a
+                // successor writer or label it whole-document EOF.
                 self.done = true;
                 self.next = None;
             }
@@ -188,10 +216,12 @@ impl MarkdownComposedLineLookup {
 }
 
 impl MarkdownComposedLines {
-    /// 捕获原已封口前缀；不读行记录、不定位正文端点，也不借较新的writer重签范围。
+    /// Capture the original sealed prefix without reading line records or
+    /// document endpoints. A newer writer cannot extend this cursor's authority.
     ///
     /// # Errors
-    /// 原Source/取消/FD失败或Source目标越界时沿原输出错误门撤权。
+    /// Source/cancellation/FD failure or an invalid Source target passes through
+    /// the original output's terminal error/release boundary.
     pub fn line_lookup(
         &mut self,
         target: MarkdownComposedLineLookupTarget,
@@ -208,6 +238,8 @@ impl MarkdownComposedLines {
                 MarkdownComposedLineLookupTarget::Ordinal(ordinal) => ordinal >= self.count,
                 MarkdownComposedLineLookupTarget::Source { utf16, affinity } => {
                     if utf16 > len || utf16 < self.range.start {
+                        // Reject targets outside Source or before this sealed
+                        // prefix; a raw coordinate cannot manufacture coverage.
                         return Err(Error::InvalidRequest);
                     }
                     utf16 > self.range.end
@@ -235,19 +267,23 @@ impl MarkdownComposedLines {
         self.finish(result)
     }
 
-    /// 每次实际64B行记录读取计1；tail/head可跨两次quota1调用，不把空白调度算成读取。
-    /// 原prefix的行证明只定位行，不授予glyph、caret或Native可见性。
+    /// Charge each actual fixed-record read once. Tail/head may span two quota-
+    /// one calls; empty scheduling does not count as IO. Locating an original
+    /// prefix line grants no glyph, caret, or Native visibility authority.
     ///
     /// # Errors
-    /// 外来/过期游标、零或过大配额、损坏跳链、Source首错及取消均永久拒绝。
+    /// Reject foreign/expired cursors, invalid quotas, corrupt edges, original
+    /// Source failures, and cancellation without restarting from another output.
     pub fn step_line_lookup(
         &mut self,
         lookup: &mut MarkdownComposedLineLookup,
         record_budget: usize,
     ) -> Result<MarkdownComposedLineLookupStep> {
         let result = (|| {
-            self.require(&self.authority)?; // 元数据命中与终态重复查询也必须让原Source错误优先。
+            self.require(&self.authority)?; // Metadata hits/repeated terminal answers preserve original Source priority.
             if lookup.failed {
+                // An earlier failed cursor is terminal, even if its offsets
+                // still fit this output's numerical range.
                 return Err(Error::Poisoned);
             }
             if !Weak::ptr_eq(&lookup.output, &Arc::downgrade(&self.identity))
@@ -256,9 +292,12 @@ impl MarkdownComposedLines {
                 || lookup.count != self.count
                 || lookup.last != self.last
             {
+                // Preserve original allocation, Source, prefix, and last-line
+                // identity together; equal ranges alone cannot rebind a cursor.
                 return Err(Error::SourceMismatch);
             }
             if record_budget == 0 || record_budget > STEP {
+                // Caller work remains inside the existing fixed record quantum.
                 return Err(Error::InvalidRequest);
             }
             let source_len = self
@@ -271,17 +310,21 @@ impl MarkdownComposedLines {
             while records < record_budget && !lookup.done {
                 let end = lookup.next.ok_or(Error::InconsistentCoverage)?;
                 if let Some(tail) = lookup.tail.take() {
+                    // Consume the already-paid tail and charge only this real
+                    // header read before the shared pure decoder authenticates it.
                     let header = self.line_header(end, &tail)?;
                     records += 1;
                     let head = self.row(header)?;
                     let line = self.decode_line(end, tail, head)?;
                     lookup.accept(line, source_len)?;
                 } else {
+                    // Pay for the actual tail read now and retain it for the
+                    // next header quantum, without prefetching unrelated rows.
                     records += 1;
                     let tail = self.row(end)?;
                     self.line_header(end, &tail)?;
                     lookup.tail = Some(tail);
-                } // tail保留至下个真实head读取；任何await/Native均不在此Core同步入口内发生。
+                } // This synchronous Core boundary holds no borrow across await or Native delivery.
             }
             self.require(&self.authority)?;
             Ok(MarkdownComposedLineLookupStep {
@@ -291,6 +334,8 @@ impl MarkdownComposedLines {
         })();
         let result = self.finish(result);
         if result.is_err() {
+            // Failure permanently ends this cursor; a later call must not reset
+            // its allowance or publish partially authenticated line facts.
             lookup.failed = true;
         }
         result

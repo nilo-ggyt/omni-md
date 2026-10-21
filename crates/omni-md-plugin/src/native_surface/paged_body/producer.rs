@@ -1,4 +1,5 @@
-//! 原 Composer 的单一有限续体；前缀目录保存在原匿名文件，不缓存整篇行或字形。
+//! One bounded original Composer continuation keeps prefix directories in anonymous storage without
+//! caching whole-document lines or glyphs.
 
 use std::{
     cell::RefCell,
@@ -41,7 +42,8 @@ use crate::native_surface::{
 };
 
 const METADATA_PER_TURN: usize = 32;
-// 行尾Source/GCB查询与原part度量共享一次真实量子；跨行继续时不重新领取字节或记录额度。
+// Trailing Source/grapheme queries share one actual quantum with part metrics; crossing lines grants no
+// fresh byte/record allowance.
 const LINE_METRIC_BUDGET: MarkdownLineComposeBudget = MarkdownLineComposeBudget {
     bytes: 4096,
     scalars: 256,
@@ -49,7 +51,8 @@ const LINE_METRIC_BUDGET: MarkdownLineComposeBudget = MarkdownLineComposeBudget 
     metadata_units: METADATA_PER_TURN,
 };
 const MAX_WINDOW_LINES: usize = 256;
-// 远端目标只延后至多32条真实LineEnd的checkpoint；不改变原Core每步读取/标量/元数据配额。
+// Distant targets defer checkpointing for at most 32 actual LineEnds without changing Core per-step
+// read/scalar/metadata budgets.
 const MAX_TARGET_BATCH_LINES: usize = 32;
 
 #[path = "actual_y.rs"]
@@ -59,7 +62,8 @@ mod cell_word;
 mod grid;
 use grid::{Grid, TableWidths};
 
-/// 同一原语义账本的具体字段相加；已处理字节与实际workspace分别保持，不把容量当源读取。
+/// Add concrete fields in the same original semantic ledger, keeping processed bytes distinct from
+/// allocated workspace capacity.
 fn add_semantic_work(
     total: &mut omni_markdown_core::markdown_document_buffer::SemanticWork,
     work: omni_markdown_core::markdown_document_buffer::SemanticWork,
@@ -89,17 +93,20 @@ fn add_semantic_work(
     Ok(())
 }
 
-/// 同次准备失败与真实退休失败都保留；只有实际Source存储errno提升到错误链首位。
-/// 此处只处理本Body的具体typed原因，不从字符串或普通取消推断磁盘故障。
+/// Preserve both preparation and actual retirement failures; promote only actual Source storage errno
+/// to the primary error.
+/// Handle this Body concrete typed causes only, without inferring disk failure from text or ordinary
+/// cancellation.
 pub(super) fn merge_preparation_cleanup(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
     match (primary, cleanup) {
-        // 一侧成功就完整保留另一侧结果；没有实际双错时不构造复合失败。
+        // If one operation succeeds, retain the other complete result; construct a compound failure
+        // only for two actual errors.
         (Ok(()), result) | (result, Ok(())) => result,
         (Err(cause), Err(cleanup)) => {
             let (cause, cleanup) = if source_io(&cleanup) && !source_io(&cause) {
-                (cleanup, cause) // 清理末尾才发生的Source首errno优先，原操作错误仍作为同次次因保留。
+                (cleanup, cause) // A first Source errno observed during cleanup takes priority while preserving the original operation as the secondary cause.
             } else {
-                (cause, cleanup) // 两个普通失败或已有Source首因时保留原操作顺序。
+                (cause, cleanup) // Preserve operation order for ordinary failures or an existing primary Source cause.
             };
             Err(Error::PreparationCleanup {
                 cause: Box::new(cause),
@@ -109,12 +116,14 @@ pub(super) fn merge_preparation_cleanup(primary: Result<()>, cleanup: Result<()>
     }
 }
 
-/// 只识别本退休路径已存在的typed存储errno链；纯权限失效不能改变首错优先级。
+/// Recognize existing typed storage-errno chains on this retirement path only; authority revocation
+/// cannot change primary-error priority.
 fn source_io(error: &Error) -> bool {
     use omni_markdown_core::{
         MarkdownDocumentBufferError as Document, MarkdownLineComposeError as Compose,
     };
-    // 样式退休会把原Source首错包在复合错误中；包装不能降低它在后续清理合并中的优先级。
+    // Style retirement may wrap the original Source failure; wrapping cannot lower its priority in
+    // later cleanup merges.
     fn compose_source_io(error: &Compose) -> bool {
         match error {
             Compose::Source(
@@ -123,7 +132,7 @@ fn source_io(error: &Error) -> bool {
                 | Document::DisplayStorageUnavailable(Some(_)),
             ) => true,
             Compose::StyleResetCleanup { cause, .. } => compose_source_io(cause),
-            _ => false, // 字形文件自身归还失败仍是清理错误，不能冒充正文读取失败。
+            _ => false, // Glyph-file release failure remains a cleanup error, rather than pretending to be document Source read failure.
         }
     }
     match error {
@@ -138,17 +147,21 @@ fn source_io(error: &Error) -> bool {
             ),
         ) => true,
         Error::PreparationCleanup { cause, cleanup } => source_io(cause) || source_io(cleanup),
-        _ => false, // 弱scope、旧Cell标记及普通撤权不提升为真实Source I/O首错。
+        _ => false, // Weak-scope expiry, stale-cell markers, and ordinary revocation cannot become primary Source I/O failures.
     }
 }
 
-/// 准备退休与实际绘图共用这一个View错误分支；只有真实存储errno能压过普通撤销。
-/// 首因已经是Source时保留其顺序，不能把目录撤权或同步状态损坏伪装成磁盘失败。
+/// Preparation retirement and actual painting share this View error classification; actual storage
+/// errno alone outranks ordinary revocation.
+/// Keep existing Source-primary order, without treating directory revocation or synchronization
+/// corruption as disk failure.
 pub(super) fn view_source_io(error: &ViewError) -> bool {
     use crate::native_surface::paged_input::NativeMarkdownPagedInputError as Input;
     use omni_markdown_core::MarkdownDocumentBufferError as Document;
-    // 标题查询也读同一原Source；其匿名slug/mask存储不冒充正文I/O。
-    // 仅沿这个新错误的实际Cleanup包装识别原Source首因，不能因查询取消改变先后顺序。
+    // Heading queries read the same original Source; anonymous slug/mask storage is not document Source
+    // I/O.
+    // Inspect its actual Cleanup wrapper for original Source causes, without changing priority because
+    // the query was cancelled.
     fn heading_source_io(error: &omni_markdown_core::MarkdownHeadingAnchorError) -> bool {
         use omni_markdown_core::MarkdownHeadingAnchorError as Heading;
         use omni_markdown_core::markdown_document_buffer::MarkdownTableRequestError as Semantic;
@@ -192,8 +205,10 @@ pub(super) fn view_source_io(error: &ViewError) -> bool {
     )
 }
 
-/// 同一真实字体响应只构造一次；缓存命中与 worker 完整试次都重核当前原 Selection。
-/// 字体选择事实不能扩大来源、覆盖或相邻语义权，最终消费仍交回签发请求的 Core 组合器。
+/// Construct the actual font response once; both cache hits and complete worker trials revalidate the
+/// original current Selection.
+/// Font-choice facts expand no Source, coverage, or adjacent-semantic authority; return consumption to
+/// the request original Core Composer.
 fn selected_font_response(
     owner: &Owner,
     layout_source: &MarkdownLayoutTextSource,
@@ -202,8 +217,10 @@ fn selected_font_response(
     base: &crate::native_surface::paged_line_fonts::NativeMarkdownLineFont,
     font: &crate::native_surface::paged_line_fonts::NativeMarkdownLineFont,
 ) -> Result<omni_markdown_core::MarkdownLineStyleResponse> {
-    // 这个 style 只是原样式字体选择；首 GCB 试次不证明整个 request 无
-    // 缺字。后继原 Composer 对实际范围整形，真实 painter 缺字即拒绝候选。
+    // This style selects the original semantic font only; testing the first grapheme does not certify
+    // the entire request as free of
+    // missing glyphs. The original Composer shapes actual ranges and the real painter rejects
+    // missing-glyph candidates.
     selection.require(owner, layout_source, &request)?;
     let boundary = selection.style_boundary(owner, layout_source, &request)?;
     let inset =
@@ -211,13 +228,16 @@ fn selected_font_response(
             .map_or(0, |geometry| geometry.inset_26_6());
     let response = request
         .respond_registered(selection.coverage, font.registered(), selection.style)?
-        // 原语义基础字体随同一响应封存；Core 在已证明的有限字形段内
-        // 审核后继字素的真实字体选择，不能由一次回退成功吞掉后续空格。
+        // Seal the original semantic base font with this response; within the certified bounded shaping
+        // segment Core
+        // checks subsequent grapheme font choices so one fallback success cannot absorb later spaces.
         .with_preferred_registered_font(base.registered())?
         .with_paragraph_inset(inset)?;
     let response = if let Some(boundary) = boundary {
-        // 只装入同Doc、同来源及原nonce签出的真实相邻样式；它本身不授予闭项，
-        // Core仍须实际试完整右字素并确认Font变化，颜色变化不能制造整形边界。
+        // Attach the actual adjacent style certified by the same document, Source, and nonce; it does
+        // not itself close a shaping item,
+        // because Core must test the complete right grapheme and confirm a font change; color changes
+        // do not create shaping boundaries.
         response.with_root_leaf_style_boundary(boundary)?
     } else {
         response
@@ -229,37 +249,45 @@ struct FontTrial {
     target: FontTrialTarget,
     request: MarkdownLineStyleRequest,
     fallback: Option<NativeMarkdownFontFallback>,
-    // 多段外 GCB 的首个真实 shaping 段可能仍在原 UBA 元数据续体中；未 Ready 前不伪造 options。
+    // The first shaping segment of a multisegment grapheme may still await original Bidi metadata;
+    // invent no options before Ready.
     pending_probe: Option<MarkdownLineFontProbe>,
     selection: super::semantics::Selection,
     in_flight: bool,
     result: Option<NativeMarkdownFontTrialResult>,
-    // 每个完整字素都先试原语义的优先字体；上一字素的回退结果不取得后继空格或文字的优先权。
+    // Try the original semantic preferred font for every complete grapheme; previous fallback gains no
+    // priority over following spaces/text.
     base: Rc<crate::native_surface::paged_line_fonts::NativeMarkdownLineFont>,
-    // 只保当前完整字素的有限纯值键；只有真实 Selected 且原字形资源已归还才存入 Body 缓存。
+    // Keep one bounded complete-grapheme key and cache it only after actual Selected with original
+    // glyph resources returned.
     cache_key: Option<super::font_choice::FontChoiceKey>,
 }
 
-/// 原线程结果只回同一真实 Composer；Cell 的局部范围不能误投外层 canonical 正文。
+/// Return worker results to their original actual Composer; cell-local ranges cannot answer canonical
+/// body requests.
 #[derive(Clone, Copy)]
 enum FontTrialTarget {
     Body,
     Cell { row: usize, column: usize },
 }
 
-/// 只说明本次真实样式交付；缓存响应已被Core消费，等待则仍由原语义/字体续体拥有。
+/// Describe this actual style delivery only: Core consumed a cached response, or original semantic/font
+/// continuations still own Pending.
 enum StyleStart {
     Cached { source_bytes: usize },
     Pending,
 }
 
-/// 活动 Body 只有一个实际 worker；无 packet 时阻塞接收，不轮询、不定时唤醒。
+/// One active Body owns one actual worker, blocking on receive without polling or periodic wakes when
+/// no packet exists.
 pub(super) struct FontWorker {
     sender: Option<mpsc::SyncSender<(u64, NativeMarkdownFontTrial)>>,
     receiver: mpsc::Receiver<(u64, NativeMarkdownFontTrialResult)>,
     join: Option<JoinHandle<()>>,
-    // 保留主线程最后一份 claim 到 join 返回；MainThreadBound::Drop 在后台会同步投递
-    // 主线程，不能让它和主线程 join 形成互等。通知仍只持同一 Weak 的短期副本。
+    // Retain the final main-thread claim until join returns; dropping MainThreadBound on a background
+    // thread synchronously dispatches to
+    // main and must not deadlock with main-thread join. Notifications retain temporary copies of the
+    // same weak identity only.
     _callback_owner: Arc<MainThreadBound<std::rc::Weak<Owner>>>,
 }
 
@@ -278,8 +306,9 @@ impl FontWorker {
                         break;
                     }
                     let weak = weak.clone();
-                    // 完成通知只有原弱身份和 serial；结果固定事实留在原 channel，不能由
-                    // 回调保活 Source、Native 字体、ShapeJob 或第二份正文。
+                    // Completion notifications carry original weak identity and serial only; actual
+                    // results stay in the original channel rather than letting
+                    // callbacks retain Source, Native fonts, ShapeJobs, or another document copy.
                     crate::native_surface::enqueue_native_markdown_main_task(move || {
                         let mtm = MainThreadMarker::new().expect("字体完成只能在主队列交付");
                         let Some(owner) = weak.get(mtm).upgrade() else {
@@ -291,11 +320,13 @@ impl FontWorker {
                             .as_ref()
                             .is_some_and(|worker| Arc::ptr_eq(&worker._callback_owner, &weak))
                         {
-                            return; // 旧worker已真实join/归还；迟到通知不能从后继worker领取同serial结果。
+                            return; // The old worker actually joined/returned; late notifications cannot take equal-serial results from a successor worker.
                         }
                         if owner.preparing.get() {
-                            // 嵌套 Native runloop 只能记下真实完成事件；正在借出的 producer
-                            // 要先回到原槽。单 worker 加一个排队 packet 最多容纳两个通知。
+                            // Nested Native delivery records the actual completion event only; the
+                            // loaned Producer
+                            // must return to its original slot first. One worker plus one queued packet
+                            // permits at most two notifications.
                             let mut notices = owner.font_notices.borrow_mut();
                             if notices.len() == 2 {
                                 owner.font_notice_failed.set(true);
@@ -330,7 +361,8 @@ impl FontWorker {
             .map_err(|_| Error::WorkerFailed)
     }
 
-    /// 只有实际结果通知到达才消费一次队列；这不是探测线程完成的轮询。
+    /// Consume one queue item only after its actual result notification arrives, without polling for
+    /// thread completion.
     fn take_delivered(&self) -> Result<(u64, NativeMarkdownFontTrialResult)> {
         self.receiver.try_recv().map_err(|_| Error::WorkerFailed)
     }
@@ -341,8 +373,10 @@ impl FontWorker {
             .join
             .take()
             .map_or(Ok(()), |join| join.join().map_err(|_| Error::WorkerFailed));
-        // join后唯一results发送端已析构；这里只排空已经完成的真实结果，不轮询线程或等待新工作。
-        // join失败也继续消费已交付结果，不能把其资源首错留给receiver的无声Drop。
+        // After join the unique result sender ended; drain completed actual results only, without
+        // polling or waiting for new work.
+        // Even after join failure retire delivered results so receiver Drop cannot silently hide their
+        // primary resource failure.
         for (_, delivered) in self.receiver.try_iter() {
             result =
                 merge_preparation_cleanup(result, delivered.retire(false).map_err(Error::from));
@@ -367,7 +401,8 @@ pub(super) struct Producer {
     generation: u64,
     fold_revision: u64,
     width: i64,
-    /// 同一Source/排版宽epoch只记一个真实最大右端；离屏行退休后不留全表列索引。
+    /// Track one actual maximum right edge per Source/layout-width epoch, without retaining all-table
+    /// column indices after offscreen retirement.
     maximum_content_width: f64,
     serial: u64,
     padding: f64,
@@ -388,7 +423,8 @@ pub(super) struct Producer {
     semantics: Option<super::semantics::RootLeaf>,
     grid: Option<Grid>,
     grids: VecDeque<Grid>,
-    /// 只保一个原行目录恢复续体；完成后进入可见行集合，离屏后不保历史 Native 索引。
+    /// Keep one original row-directory restoration cursor, transferring it to visible rows on
+    /// completion without historical Native indices.
     restoring_grid: Option<GridRestoration>,
     table_widths: Option<TableWidths>,
     cell_display_work: omni_markdown_core::markdown_document_buffer::SemanticWork,
@@ -402,7 +438,8 @@ pub(super) struct Producer {
     vertical: Option<VerticalTarget>,
     visual: Option<VisualWork>,
     visual_word: Option<omni_markdown_core::MarkdownComposedVisualWordQuery>,
-    /// 原词组槽需要的唯一离屏格恢复；不保旧Scene，取消先归还同Request在途来源。
+    /// The original word slot owns one offscreen restored cell without an old Scene; cancellation first
+    /// returns its same-request Source work.
     cell_word: Option<grid::word::CellWordQuery>,
     last_target_anchor: Option<MeasuredLineAnchor>,
     target_lookup_records: usize,
@@ -425,20 +462,23 @@ pub(super) enum VisualAdvance {
     NeedsFoldExpansion(std::ops::Range<usize>),
 }
 
-/// A weak query bound to the original output; a later prefix replaces this ticket without another reader or Source.
+/// A weak query bound to the original output; a later prefix replaces this ticket without another
+/// reader or Source.
 struct VisualWork {
     query: Option<omni_markdown_core::MarkdownComposedVisualQuery>,
     collapse: Option<MarkdownComposedLineLookup>,
 }
 
-/// 只记原Composer连续LineReady的有限区间和末行事实，不保存全部行或字形。
+/// Record a bounded interval of consecutive original LineReady results and final-line facts, without
+/// all lines or glyphs.
 struct QueuedLines {
     first: usize,
     count: usize,
     last: MarkdownComposedLineFacts,
 }
 
-/// 单一真实prefix Reader中的至多32个弱行handle，顺序度量后立即归还小队列。
+/// At most 32 weak handles belong to one actual prefix Reader; return the small queue after ordered
+/// measurement.
 struct PendingBatch {
     output: Rc<RefCell<MarkdownComposedLines>>,
     first: usize,
@@ -448,8 +488,10 @@ struct PendingBatch {
     collecting: bool,
 }
 
-/// 只保首屏原末行号和真实高度；从最新唯一 Reader 的原索引定位，不额外保一份快照。
-/// 这两个标量仅在同一 Producer/Source/宽度生命周期有效，不能跨编辑或布局继承。
+/// Retain first-screen final ordinal/actual height and locate it through the latest unique Reader
+/// index, without another snapshot.
+/// Both scalars belong to the same Producer/Source/width lifetime and cannot survive edit/layout
+/// supersession.
 struct TopPrefix {
     last_ordinal: usize,
     height: f64,
@@ -466,7 +508,7 @@ struct PendingLine {
     target_batch: bool,
 }
 
-/// 已取得 LineEnd 仍不授权一次遍历任意多 part；每次恢复同一度量游标。
+/// A LineEnd grants no unbounded part traversal; resume the same metric cursor each turn.
 struct LineMetrics {
     handle: MarkdownComposedLine,
     part: usize,
@@ -489,20 +531,24 @@ struct Scan {
     folded_ends: VecDeque<Option<usize>>,
     simple_ltr: bool,
     metrics: Option<LineMetrics>,
-    /// 仅当前窗口的真实表格行顶，来自本次完整 LineMetrics，不估计历史行高。
+    /// Actual table-row tops come from complete LineMetrics in this current window only, without
+    /// historical height estimates.
     table_rows: VecDeque<(usize, f64)>,
 }
 
-/// 只随原有限扫描保留本次已完成的 Native 行高；不保存正文或历史行坐标。
-/// 经过原目标锚时，下方已收集格的位置须沿这些真实行高前向恢复，不能平移一个舍入差值。
+/// Retain completed Native line heights for this bounded scan only, without text or historical line
+/// positions.
+/// At an original target anchor, reconstruct lower collected row positions forward from actual heights
+/// rather than shifting a rounding difference.
 struct ScannedLine {
     handle: NativeMarkdownMeasuredLine,
     height: f64,
 }
 
 impl Scan {
-    /// 当前行的原 top/bottom 已由完整目标请求认证；下方窗口不能继续保留旧 prefix 逆减坐标。
-    /// 这里只重放原有限窗口的纯度量值，不再读 Source、目录或 Font，也不创建额外 Reader。
+    /// The complete target request certified original top/bottom; lower windows cannot retain stale
+    /// backward-subtracted prefix coordinates.
+    /// Replay finite pure window metrics only, without Source/directory/font reads or another Reader.
     fn reanchor_table_rows(&mut self, anchor: &MeasuredLineAnchor) -> Result<()> {
         let mut top = anchor.bottom;
         let mut rows = self.table_rows.iter_mut();
@@ -512,7 +558,7 @@ impl Scan {
             {
                 let (ordinal, row_top) = rows.next().ok_or(Error::Unsupported)?;
                 if *ordinal != measured.handle.facts().ordinal {
-                    return Err(Error::Unsupported); // 原行与格目录必须一一对应，不能以另一格填补缺项。
+                    return Err(Error::Unsupported); // Original lines and table entries must match one-to-one without another cell filling a missing entry.
                 }
                 *row_top = top;
             }
@@ -522,13 +568,14 @@ impl Scan {
             }
         }
         if rows.next().is_some() {
-            return Err(Error::Unsupported); // 不遗留没有原弱行及真实行高的表格位置。
+            return Err(Error::Unsupported); // Retain no table position lacking its original weak line and actual height.
         }
         Ok(())
     }
 }
 
-/// 原 Reader 的真实查询与恢复格同寿；没有另一个正文、Parser、Input 或全表坐标缓存。
+/// The actual original Reader query shares restored-cell lifetime, without another document, parser,
+/// Input, or whole-table position cache.
 struct GridRestoration {
     output: Rc<RefCell<MarkdownComposedLines>>,
     lookup: Option<MarkdownComposedLineLookup>,
@@ -554,6 +601,7 @@ impl Producer {
             .map_err(ViewError::Input)?;
         let width = width(request, padding)?;
         let cancellation = MarkdownLineComposeCancellation::new();
+        // Inline preview admits actual table-flow requests; Source keeps the literal frontier. Both own the same canonical Source.
         let mut composer = if mode == omni_markdown_core::MarkdownPresentationMode::InlinePreview {
             MarkdownLineComposer::new_with_table_flow(
                 source.clone(),
@@ -573,7 +621,7 @@ impl Producer {
         };
         if !folds.is_empty() {
             composer.install_folded_ranges(folds)?;
-        } // 只在原 Source composer 首次 step 前交有限物理行 proof，不建立另一正文或字形图。
+        } // Install bounded physical-line proofs before the original Source Composer first step, without another document or glyph graph.
         let semantics = (mode == omni_markdown_core::MarkdownPresentationMode::InlinePreview)
             .then(|| super::semantics::RootLeaf::new(&source, serial));
         Ok(Self {
@@ -631,6 +679,7 @@ impl Producer {
             target_batch_index_records: 0,
         })
     }
+    /// Check original content/domain/fold/width identity; same-Source selection changes have their explicit reprojection path below.
     pub(super) fn accepts(&self, request: &NativeMarkdownPagedSceneRequest) -> bool {
         self.domain.same(&request.target)
             && self.generation == request.input.generation
@@ -639,8 +688,10 @@ impl Producer {
             && width(request, self.padding).is_ok_and(|width| width == self.width)
     }
 
-    /// 选择变化只重排同源的样式图，不能复用旧隐藏字形，也不能重建原语言索引。
-    /// 返回false只表示原Font worker尚未实际交回；其完成事件负责唤醒，不在主线程轮询。
+    /// Selection changes reproject same-Source styles without reusing old hidden glyphs or rebuilding
+    /// original language indices.
+    /// False means the original font worker has not returned; its completion event owns wakeup without
+    /// main-thread polling.
     pub(super) fn refresh_semantic_selection(
         &mut self,
         owner: &Owner,
@@ -651,25 +702,27 @@ impl Producer {
             .as_ref()
             .is_some_and(|semantic| semantic.selection_changed(request.input.selection))
         {
-            return Ok(true); // Source模式或真实选择未变化，原prefix/Reader与字体图原样保留。
+            return Ok(true); // Source mode or unchanged actual selection preserves original prefix/Reader and fonts.
         }
         let ticket =
             PreparationTicket::new(request, &self.source, self.serial, self.width, self.padding);
         ticket.require_pure(owner, &self.source)?;
         if let Some(mut trial) = self.trial.take() {
             if let Some(fallback) = trial.fallback.take() {
-                fallback.close(); // 先取消旧Font试次，旧选择不能把完成包交给新语义。
+                fallback.close(); // Cancel the old font trial first; old selection cannot deliver its packet into new semantics.
             }
             if trial.in_flight {
                 self.trial = Some(trial);
-                return Ok(false); // 保留唯一结果槽，收到原worker包并退休后才允许重排。
+                return Ok(false); // Preserve the unique result slot; reproject only after receiving and retiring the original worker packet.
             }
             if let Some(result) = trial.result.take() {
                 result.retire(false)?;
-            } // 真实源/Font清理失败仍沿原失败出口，不能被新的空图覆盖。
+            } // Actual Source/font cleanup failure retains its original error path and cannot be overwritten by a new empty graph.
         }
-        // 只有所有已发布行都已完成原度量时，Native 累计 Y 才与同 Store 的最新
-        // LineEnd 一致。半批次仍走旧重排，不丢掉已封存但尚未计入高度的行。
+        // Native accumulated Y agrees with the same Store latest LineEnd only after every published
+        // line completes original measurement.
+        // Incomplete batches use full style reset so sealed lines not yet included in height are not
+        // lost.
         let retain_composer = self.output.is_some()
             && self.pending_line.is_none()
             && self.pending_batch.is_none()
@@ -707,13 +760,13 @@ impl Producer {
             self.grids.len(),
             self.restoring_grid.is_some(),
             self.cell_word.is_some(),
-        ); // 只在原选择换代边界报告真实拥有槽；区分原拒绝门，不为获得保留而清槽，也不记录正文。
+        ); // At selection supersession report actual owner slots only, without clearing them to force retention or logging text.
         self.pending_style = None;
         self.pending_control = None;
         self.grid = None;
         self.grids.clear();
         self.restoring_grid = None;
-        self.cell_word = None; // 选择已经换代；同次旧Request及其有限格读取图随后一同归还。
+        self.cell_word = None; // Selection superseded; retire the same old Request and its bounded cell-reading graph together.
         self.table_widths = None;
         self.scan = None;
         self.pending_line = None;
@@ -726,12 +779,15 @@ impl Producer {
         self.visual = None;
         self.visual_word = None;
         self.last_target_anchor = None;
-        drop(self.output.take()); // Body已先清旧Scene；即使字形不变，旧输出身份也不为新Input补票。
+        drop(self.output.take()); // Body cleared the old Scene first; equal glyphs cannot let old output identity certify new Input.
         ticket.require_pure(owner, &self.source)?;
         if retain_composer {
-            // 原 SourceRequest 已在上方同栈退休旧 publication；字形、原 Font 注册和
-            // 资源 scope 保持原 owner。重新 dup 同 writer 的已提交前缀，旧弱 Line/Part
-            // 仍然失效；后继 Scene/CPU 使用完整新 Input 和新输出身份，不复用旧帧。
+            // The same stack retired the original SourceRequest publication; glyphs, original font
+            // registration, and
+            // resource scope keep their original owner. Duplicate the same writer committed prefix
+            // while old weak Line/Part
+            // identities remain revoked; successor Scene/CPU use complete new Input and output identity
+            // without old-frame reuse.
             self.output = Some(self.checkpoint_prefix(false)?);
             owner.input.clear_style_navigation_geometry();
             ticket.require_pure(owner, &self.source)?;
@@ -749,20 +805,23 @@ impl Producer {
         self.height = 0.0;
         self.maximum_content_width = request.virtual_viewport.layout_width;
         self.complete = false;
-        // 同 Source 的选择显隐没有撤销刚提交的上下游意图；仅淘汰旧目标列与 BiDi part。
-        // 新 Source/宽度入口仍走完整 clear_navigation_geometry，不能把这条窄保留扩展到换代。
+        // Same-Source selection visibility preserves committed affinity intent while retiring old
+        // target columns/Bidi parts.
+        // New Source/width still performs full navigation-geometry clearing; this narrow retention
+        // cannot cross supersession.
         owner.input.clear_style_navigation_geometry();
         ticket.require_pure(owner, &self.source)?;
         Ok(true)
     }
-    /// Cell真实编辑使旧读取失效；只在同Input已发布后继内容版本时交回准备，原EIO仍直接失败。
+    /// Actual cell edits revoke old reads; retire preparation only after the same Input publishes
+    /// successor content, preserving actual EIO failure.
     pub(super) fn replaced_cell_source(
         &self,
         input: &crate::native_surface::paged_input::NativeMarkdownPagedInput,
         request: &NativeMarkdownPagedSceneRequest,
     ) -> Result<bool> {
         if !input.is_cell() {
-            return Ok(false); // 原正文冻结Source的既有读取与预算完全保持。
+            return Ok(false); // Keep original frozen body-Source reads and budgets unchanged.
         }
         match self.source.byte_offset_for_utf16(0) {
             Ok(_) => Ok(false),
@@ -772,7 +831,7 @@ impl Producer {
                         .state()
                         .is_ok_and(|actual| actual.generation != request.input.generation) =>
             {
-                Ok(true) // 构造时domain已核同原Cell；不是任意Source错误或取消会话的静默恢复。
+                Ok(true) // Construction verified the original cell domain; this is not silent recovery for arbitrary Source errors or cancelled sessions.
             }
             Err(cause) => Err(ViewError::Document(cause).into()),
         }
@@ -789,7 +848,7 @@ impl Producer {
         if self.serial != serial || !self.accepts(request) {
             return Err(ViewError::Revoked.into());
         }
-        Ok(self.source.authority()) // 只借已有冻结Source的原身份，不捕Source或领取prefix Reader。
+        Ok(self.source.authority()) // Borrow existing frozen Source identity without capture or another prefix Reader.
     }
     pub(super) fn target_source_health(&self) -> Result<()> {
         self.source
@@ -797,7 +856,8 @@ impl Producer {
             .map_err(ViewError::Document)?;
         Ok(())
     }
-    /// 原词组提交在Drop前取得同一Composer的弱释放票；不要求output或新增Source读取者。
+    /// Before Drop, word commit obtains a weak release observer from the same Composer without output
+    /// or another Source reader.
     pub(super) fn word_retirement_resources(
         &self,
     ) -> Result<omni_markdown_core::MarkdownLineComposerWorkerResourceObserver> {
@@ -807,7 +867,8 @@ impl Producer {
             .ok_or(Error::Closed)?
             .worker_resource_observer())
     }
-    /// 词组删除复用原Composer Payload及Source；开始只认证空caret，不构造行、Reader或字体试次。
+    /// Word deletion reuses original Composer payload/Source; begin certifies a caret without lines,
+    /// Readers, or font trials.
     pub(super) fn begin_word_delete(&mut self, forward: bool, head: usize) -> Result<()> {
         self.target_source_health()?;
         let direction = if forward {
@@ -822,7 +883,8 @@ impl Producer {
         self.target_source_health()
     }
 
-    /// 普通删除只借同一Composer的真实相邻GCB；无字体、行几何或额外全文读取者。
+    /// Ordinary deletion borrows actual adjacent graphemes from the same Composer without fonts, line
+    /// geometry, or another document reader.
     pub(super) fn begin_grapheme_delete(&mut self, forward: bool, head: usize) -> Result<()> {
         self.target_source_health()?;
         let direction = if forward {
@@ -837,7 +899,8 @@ impl Producer {
         self.target_source_health()
     }
 
-    /// 一个原主队列回合只推进一次共享4096B量子；巨型GCB跨步，不按scalar近似截断。
+    /// Advance one shared 4096-byte quantum per original main-queue turn; huge graphemes span steps
+    /// without scalar-based truncation.
     pub(super) fn step_word_delete(
         &mut self,
         owner: &Owner,
@@ -856,7 +919,8 @@ impl Producer {
                 records: 256,
                 metadata_units: 256,
             })?;
-        // 原量子的真实读取计入现有Composer进度；不增加用于冒充验收的另一套计数器。
+        // Account actual quantum reads in existing Composer progress, without another set of acceptance
+        // counters.
         self.step_bytes = self
             .step_bytes
             .checked_add(step.bytes)
@@ -872,18 +936,20 @@ impl Producer {
         self.maximum_step_bytes = self.maximum_step_bytes.max(step.bytes);
         self.maximum_step_scalars = self.maximum_step_scalars.max(step.scalars);
         self.maximum_step_metadata = self.maximum_step_metadata.max(step.metadata_units);
-        ticket.require(owner, &self.source)?; // 实际Native几何撤权后，旧Ready范围也没有提交权。
+        ticket.require(owner, &self.source)?; // An old Ready range loses commit authority after actual Native geometry revocation.
         Ok(step.answer)
     }
 
-    /// 取消只归还原Payload中的词组续体；既有布局、Source和Reader仍归这个Producer。
+    /// Cancel the original payload word continuation only; this Producer still owns existing layout,
+    /// Source, and Reader.
     pub(super) fn cancel_word_delete(&mut self) {
         if let Some(composer) = self.composer.as_mut() {
             composer.cancel_word_delete();
         }
     }
 
-    /// 选词只借原Composer/GCB与原Source；开始动作不捕第二份读取，也不要求当前LineReady。
+    /// Word selection borrows original Composer/graphemes and Source, without another read capture or a
+    /// current LineReady requirement.
     pub(super) fn begin_word_group(
         &mut self,
         action: omni_markdown_core::MarkdownWordGroupAction,
@@ -896,7 +962,7 @@ impl Producer {
                 return Err(ViewError::Busy.into());
             }
             original.restart = Some((action, head, cell));
-            return Ok(()); // 只登记已接纳的队首；原CellInline真正交回前不启动任何后继读取。
+            return Ok(()); // Record the accepted next head only; start no successor read until actual original CellInline return.
         }
         if let Some(cell) = cell {
             self.cell_word = Some(grid::word::CellWordQuery::new(cell, head, action));
@@ -909,7 +975,8 @@ impl Producer {
         self.target_source_health()
     }
 
-    /// 视觉移动只能由原 Composer 决定使用完整 Root 或逐可见段证书；原选择类逻辑组不借此扩权。
+    /// The original Composer selects full-Root or per-visible-segment certificates for visual movement;
+    /// logical selection groups gain no extra authority.
     pub(super) fn begin_visual_word_group(&mut self, forward: bool, head: usize) -> Result<()> {
         self.target_source_health()?;
         self.composer
@@ -926,7 +993,8 @@ impl Producer {
         self.target_source_health()
     }
 
-    /// 视觉Word仅在原全源UBA明确UniformZero时可借逻辑组；准备不与GCB共用两份量子。
+    /// Visual word movement may use logical groups only for original full-Source UniformZero Bidi;
+    /// preparation and grapheme work receive no duplicate quantum.
     pub(super) fn prepare_word_move(
         &mut self,
         owner: &Owner,
@@ -960,11 +1028,12 @@ impl Producer {
         self.maximum_step_bytes = self.maximum_step_bytes.max(step.bytes);
         self.maximum_step_scalars = self.maximum_step_scalars.max(step.scalars);
         self.maximum_step_metadata = self.maximum_step_metadata.max(step.metadata_units);
-        ticket.require(owner, &self.source)?; // 完成事实不能替代原Native几何/输入票的后置检查。
+        ticket.require(owner, &self.source)?; // Completion cannot replace post-call validation of original Native geometry/Input authority.
         Ok(step.scope)
     }
 
-    /// 同一主队列回合只消费一份原4KiB/256量子；记录继续计入原Producer真实工作统计。
+    /// One main-queue turn consumes one original 4 KiB/256 quantum, recorded in the same Producer
+    /// actual work totals.
     pub(super) fn step_word_group(
         &mut self,
         owner: &Owner,
@@ -1001,11 +1070,12 @@ impl Producer {
         self.maximum_step_bytes = self.maximum_step_bytes.max(step.bytes);
         self.maximum_step_scalars = self.maximum_step_scalars.max(step.scalars);
         self.maximum_step_metadata = self.maximum_step_metadata.max(step.metadata_units);
-        ticket.require(owner, &self.source)?; // geometry或输入撤权后，真实范围也没有原permit的提交权。
+        ticket.require(owner, &self.source)?; // Even an actual range lacks original-permit commit authority after geometry or Input revocation.
         Ok(step.answer)
     }
 
-    /// 只移除同槽的group续体；原字体、布局与Source仍由这个唯一Producer持有并真实关闭。
+    /// Remove this slot word continuation only; the unique Producer still owns and actually closes
+    /// original fonts, layout, and Source.
     pub(super) fn cancel_word_group(&mut self) {
         if let Some(mut query) = self.cell_word.take() {
             for grid in self.grid.iter_mut().chain(self.grids.iter_mut()).chain(
@@ -1017,7 +1087,7 @@ impl Producer {
             }
             query.restart = None;
             if !query.cancel() {
-                self.cell_word = Some(query); // 取消意图不等于SourceRequest单格任务已真实交回。
+                self.cell_word = Some(query); // Cancellation intent does not mean actual return of the SourceRequest cell task.
             }
         }
         if let Some(composer) = self.composer.as_mut() {
@@ -1032,11 +1102,14 @@ impl Producer {
         )
     }
 
-    /// 真实 EOF 才能终止补前缀；尚在途的表格格也以当前实际度量高度参与这份判断。
+    /// Actual EOF alone ends prefix production; in-flight table cells contribute their current actual
+    /// measured heights.
     pub(super) fn needs_document_prefix(&self, bottom: f64) -> bool {
         !self.complete && self.height() < bottom
     }
 
+    /// Observe actual existing task phases and work facts without advancing Source, creating Readers,
+    /// or claiming Ready.
     pub(super) fn progress(&self) -> Result<NativeMarkdownPagedBodyProgress> {
         let work = self
             .composer
@@ -1136,8 +1209,10 @@ impl Producer {
         self.trial.as_ref().is_some_and(|trial| trial.in_flight)
     }
 
-    /// 活动格导航只在原显示来源/Font 已交还后短借唯一 Request；
-    /// 同一在途导航继续自己的量子，不能被普通视口再次启动的 CellInline 抢走归属。
+    /// Active-cell navigation briefly borrows the unique Request after original display Source/font
+    /// work returns;
+    /// an in-flight navigation resumes its own quantum without another viewport CellInline taking
+    /// ownership.
     pub(super) fn navigate_cell(
         &mut self,
         owner: &Owner,
@@ -1172,7 +1247,8 @@ impl Producer {
         Ok(step)
     }
 
-    /// Esc 只归还原导航的实际来源作业；未启动的意图直接结束，不能撤整个 Request 重发预算。
+    /// Esc returns actual Source work for this original navigation only; an unstarted intent ends
+    /// without recreating the whole Request budget.
     pub(super) fn drain_cell_navigation(&mut self, owner: &Owner) -> Result<bool> {
         self.target_source_health()?;
         let document = owner
@@ -1186,7 +1262,7 @@ impl Producer {
             .as_mut()
             .expect("活动格只来自原预览来源请求")
             .drain_cell_navigation(&document.borrow(), &self.source);
-        self.target_source_health()?; // 同一原 Source 的首错高于正常取消或来源撤权。
+        self.target_source_health()?; // The same original Source failure precedes ordinary cancellation or authority revocation.
         result
     }
 
@@ -1249,7 +1325,8 @@ impl Producer {
         let mut line = output.last_line()?;
         let mut result = Vec::new();
         let mut count = 0;
-        // 原Reader单批最多256字形；固定栈只在本观察栈复用，不构造第二个排版或源读取图。
+        // The original Reader batch holds at most 256 glyphs; reuse fixed stack storage without another
+        // layout or Source-reading graph.
         let mut glyphs = [omni_markdown_core::MarkdownShapedGlyph {
             glyph_id: 0,
             source_utf16_cluster: 0,
@@ -1271,15 +1348,17 @@ impl Producer {
                 let part = output.part(&actual, ordinal)?.ok_or(Error::Unsupported)?;
                 if part.facts().glyphs == 0 {
                     continue;
-                } // 原Newline/空行不是假字形字体断言。
+                } // Actual newlines/empty lines do not create invented glyph-font assertions.
                 let authority = part.font_registration().authority()?;
                 let index = fonts
                     .iter()
                     .position(|font| font.native().core_font().permits(&authority))
                     .ok_or(Error::Unsupported)?;
                 fonts[index].require(part.font_registration())?;
-                // 只读取原LineEnd已经封存的glyph。大part保留原metadata观察能力，
-                // 但明确没有完整glyph结果；不能扩容或重形后把另一结果当原输出。
+                // Read glyphs sealed by the original LineEnd only. Large parts retain metadata
+                // observation,
+                // but expose no complete glyph result; neither enlarge storage nor reshape another
+                // result as original output.
                 let observed_glyphs = if part.facts().glyphs <= glyphs.len() {
                     let used = part.facts().glyphs;
                     output.read_batch(&part, 0..used, &mut glyphs[..used])?;
@@ -1308,7 +1387,8 @@ impl Producer {
         Ok(result)
     }
 
-    /// 链接查询只消费本Producer的原Source和真实Ready，不捕新文档或在鼠标栈推进Parser。
+    /// Link queries consume this Producer original Source and actual Ready without new document capture
+    /// or parser advancement on the mouse stack.
     pub(super) fn link_at(
         &self,
         owner: &Owner,
@@ -1324,14 +1404,15 @@ impl Producer {
                 .filter_map(|restoring| restoring.grid.as_ref()),
         ) {
             if let Some(link) = grid.link_at(owner, index).map_err(ViewError::LinkSource)? {
-                return Ok(link); // 只有真实格覆盖才能完成；没有覆盖仍交普通正文的原恢复路径。
+                return Ok(link); // Only actual cell coverage answers; otherwise use the original ordinary-body recovery path.
             }
         }
         let semantics = self.semantics.as_ref().ok_or(ViewError::Pending)?;
         semantics.link_at(owner, &self.source, index)
     }
 
-    /// 链接回查借原Composer/字体owner；在途试次只等原通知，已交付试次先沿原完成路径退休。
+    /// Link recovery borrows original Composer/font ownership, waiting for in-flight notifications and
+    /// retiring delivered trials through their original path.
     pub(super) fn advance_link(
         &mut self,
         owner: &Owner,
@@ -1351,15 +1432,17 @@ impl Producer {
         }
         if self.trial.is_some() {
             self.advance_trial(owner, &ticket)?;
-            return Ok(None); // 不并行推进语义或取消真实FontTrial，也不同步join正在后台使用的Source。
+            return Ok(None); // Do not advance semantics concurrently, cancel the actual FontTrial, or synchronously join a background Source user.
         }
         for grid in self.grids.iter().chain(self.grid.iter()).chain(
             self.restoring_grid
                 .iter()
                 .filter_map(|restoring| restoring.grid.as_ref()),
         ) {
-            // mouseUp 仍持原 Scene/Source/手势票；格目标只消费实际 Display 的原 Parser 发布。
-            // 范围相等、可见 LINK 位或目标字符串都不能替代这次真实来源查询。
+            // mouseUp retains original Scene/Source/gesture authority; cell targets consume the actual
+            // display original parser publication only.
+            // Equal ranges, visible LINK bits, or target strings cannot replace this actual source
+            // query.
             let result = grid.link_at(owner, index);
             self.source
                 .byte_offset_for_utf16(0)
@@ -1377,22 +1460,23 @@ impl Producer {
         result
     }
 
-    /// 显式退休先结束同次fallback取消权，再实际Drop本Producer；结果首错不能藏在Drop返回之外。
+    /// Explicit retirement ends original fallback authority before actual Producer Drop, preserving
+    /// result errors beyond destructor boundaries.
     pub(super) fn retire(mut self: Box<Self>) -> Result<()> {
         let backing = self.source.original_backing_observer();
         self.cancellation.cancel();
         let result = if let Some(trial) = self.trial.as_mut() {
             if let Some(fallback) = trial.fallback.take() {
-                fallback.close(); // 同原取消位先置位，精确旧Cell撤权才可作为正常退休。
+                fallback.close(); // Set original cancellation first so precisely stale-cell revocation may qualify as ordinary retirement.
             }
             trial
                 .result
                 .take()
                 .map_or(Ok(()), |result| result.retire(false).map_err(Error::from))
         } else {
-            Ok(()) // 尚未创建试次时没有结果可消费，不构造假零收据。
+            Ok(()) // Without a constructed trial there is no result to consume and no fabricated zero receipt.
         };
-        drop(self); // 所有原Source、Reader、语义、Composer和剩余试次真实退场后才核末Drop错误。
+        drop(self); // Check final destructor errors after actual retirement of original Source, Readers, semantics, Composer, and remaining trials.
         if let Some(errno) = backing.as_ref().and_then(|backing| backing.first_errno()) {
             if matches!(
                 &result,
@@ -1400,7 +1484,7 @@ impl Producer {
                     omni_markdown_core::MarkdownDocumentBufferError::OriginalBackingUnavailable(original),
                 ))) if *original == errno
             ) {
-                return result; // 同一observer回读的同一个errno不是第二笔清理失败，不构造假复合错误。
+                return result; // Reading the same errno from the same observer is not another cleanup failure and must not fabricate a compound error.
             }
             let source =
                 crate::native_surface::paged_font_fallback::NativeMarkdownFontFallbackError::Source(
@@ -1415,7 +1499,8 @@ impl Producer {
 
     pub(super) fn receipts(&self) -> Result<NativeMarkdownPagedBodyResourceReceipts> {
         let composer = self.composer.as_ref().ok_or(Error::Closed)?;
-        // 新prefix可已建立Reader但尚在有限度量中；观察原同一实例，不为收据publish/dup新Reader。
+        // A new prefix may already own a Reader during bounded measurement; observe that same instance
+        // without publishing/duplicating another for receipts.
         let reader = self
             .output
             .as_ref()
@@ -1432,7 +1517,8 @@ impl Producer {
         })
     }
 
-    /// 只聚合此刻实际持有的有限格观察者；不创建 Reader、保留旧格或补造历史释放事实。
+    /// Aggregate currently owned bounded cell observers only, without Readers, old-cell retention, or
+    /// invented historical release facts.
     pub(super) fn cell_resource_receipts(
         &self,
     ) -> Result<Vec<super::NativeMarkdownPagedCellResourceReceipts>> {
@@ -1452,10 +1538,13 @@ impl Producer {
         Ok(receipts)
     }
 
-    /// 只归还原弱目录游标；Source 和 Reader 仍由唯一 Producer 退休路径释放。
+    /// Return original weak directory cursors only; the unique Producer retirement path still releases
+    /// Source and Reader.
     pub(super) fn cancel_visual(&mut self) {
-        // 普通排版每回合也会走到这里；空槽没有要归还的游标，不搬出大型 Option。
-        // 真正取消仍先 take 清原槽，再 Drop 原值，保留原资源释放和重入可见顺序。
+        // Ordinary layout also reaches this method every turn; an empty slot has no cursor to return
+        // and needs no large Option move.
+        // Actual cancellation takes the original slot before dropping its value, preserving release
+        // order and reentrant visibility.
         if self.visual.is_some() {
             drop(self.visual.take());
         }
@@ -1464,7 +1553,8 @@ impl Producer {
         }
     }
 
-    /// Alternate visual queries with original font/line work; a directory-read turn cannot also run a Composer quantum.
+    /// Alternate visual queries with original font/line work; a directory-read turn cannot also run a
+    /// Composer quantum.
     fn advance_visual(
         &mut self,
         owner: &Owner,
@@ -1500,7 +1590,8 @@ impl Producer {
         }
     }
 
-    /// 原真实视觉词组查询复用同一 writer 的新增 prefix；分类进度不因视口还没准备好而从起点重扫。
+    /// An actual visual-word query reuses new prefixes from the same writer without restarting
+    /// classification while viewport preparation remains pending.
     fn step_visual_word_intent(
         &mut self,
         owner: &Owner,
@@ -1514,6 +1605,7 @@ impl Producer {
             return Ok(VisualAdvance::NeedPrefix);
         };
         let mut output = output.borrow_mut();
+        // Construct once from the original directed head, wrap affinity and Bidi side; later quanta reuse this exact weak query.
         if self.visual_word.is_none() {
             let affinity = if seed.upstream && seed.selection.head_utf16 != request.input.utf16_len
             {
@@ -1549,7 +1641,7 @@ impl Producer {
                 metadata_units: 256,
             },
         )?;
-        drop(output); // 原文件/字体查询借用结束后才核 Native 当前票或发布选择。
+        drop(output); // End original file/font query borrows before Native authority checks or selection publication.
         self.step_bytes = self
             .step_bytes
             .checked_add(step.bytes)
@@ -1571,6 +1663,7 @@ impl Producer {
                 Ok(VisualAdvance::Pending)
             }
             omni_markdown_core::MarkdownComposedVisualWordAnswer::PrefixNotCovered => {
+                // A turn that already read directory records yields first; only zero-work absence may request a Composer prefix now.
                 Ok(if step.records == 0 {
                     VisualAdvance::NeedPrefix
                 } else {
@@ -1586,6 +1679,7 @@ impl Producer {
                 line,
                 ..
             } => Ok(VisualAdvance::Ready(super::word::VisualSelection {
+                // Preserve the original anchor for extension and return the actual resolved Bidi side rather than inferring visual order.
                 selection: omni_markdown_core::MarkdownTextSelection {
                     anchor_utf16: if seed.extend {
                         seed.selection.anchor_utf16
@@ -1606,8 +1700,10 @@ impl Producer {
         }
     }
 
-    /// Reuse this same query for immediate Ready navigation and queued continuation, without Native calls or scheduling.
-    /// A Pending result leaves every already-read record in place, so entering the queue cannot restart its work.
+    /// Reuse this same query for immediate Ready navigation and queued continuation, without Native
+    /// calls or scheduling.
+    /// A Pending result leaves every already-read record in place, so entering the queue cannot restart
+    /// its work.
     pub(super) fn step_visual_intent(
         &mut self,
         request: &NativeMarkdownPagedSceneRequest,
@@ -1617,6 +1713,8 @@ impl Producer {
         let Some(output) = self.output.as_ref() else {
             return Ok(VisualAdvance::NeedPrefix);
         };
+        // A nonextended selection collapses by the actual line base direction; caret motion otherwise
+        // uses the weak visual query.
         let collapse = !seed.extend && seed.selection.anchor_utf16 != seed.selection.head_utf16;
         if self.visual.is_none() {
             let mut output = output.borrow_mut();
@@ -1665,6 +1763,7 @@ impl Producer {
                 let step = output.step_line_lookup(lookup, 256)?;
                 match step.answer {
                     MarkdownComposedLineLookupAnswer::Found(line) => {
+                        // Collapse toward the actual visual side under this line base direction, without moving beyond the original selection.
                         let forward = seed.right == (line.base_level() == 0);
                         let head = if forward {
                             seed.selection.anchor_utf16.max(seed.selection.head_utf16)
@@ -1699,6 +1798,7 @@ impl Producer {
                         line,
                         ..
                     } => {
+                        // A certified visual result supplies the new head and side; extending retains only the original anchor.
                         let selection = omni_markdown_core::MarkdownTextSelection {
                             anchor_utf16: if seed.extend {
                                 seed.selection.anchor_utf16
@@ -1748,7 +1848,8 @@ impl Producer {
             PreparationTicket::new(request, &self.source, self.serial, self.width, self.padding);
         ticket.require_pure(owner, &self.source)?;
         let result = self.advance_inner(owner, request, &ticket);
-        // Source首错优先于Native前台撤权：错误旧源不能被换新Source或取消动作吞掉。
+        // Source failure precedes Native foreground revocation; replacing or cancelling an old Source
+        // cannot hide its error.
         self.source
             .byte_offset_for_utf16(0)
             .map_err(ViewError::Document)?;
@@ -1759,7 +1860,7 @@ impl Producer {
                     .byte_offset_for_utf16(0)
                     .map_err(ViewError::Document)?;
                 if current {
-                    Err(cause) // 原前台仍有效时不能把真实Native拒绝归咎于后继事件。
+                    Err(cause) // With original foreground authority still valid, actual Native rejection cannot be blamed on a successor event.
                 } else {
                     Err(Error::PreparationRevoked)
                 }
@@ -1784,7 +1885,7 @@ impl Producer {
         if self.cell_word.as_ref().is_some_and(|query| query.cancelled) {
             self.drain_cell_word(owner)?;
             owner.schedule()?;
-            return Ok(()); // 原唯一来源槽交回前，普通布局也不得启动后继CellInline。
+            return Ok(()); // Ordinary layout also waits for the unique original Source slot before starting a successor CellInline.
         }
         if self.pending_line.is_some() {
             let mut parts = LINE_METRIC_BUDGET;
@@ -1804,13 +1905,16 @@ impl Producer {
                     .as_ref()
                     .is_none_or(|target| !target.request.pending()))
         {
-            // 原目标取消或被另一目标替代时也不丢已完成的LineEnd；先封口并完成真实度量，
-            // 再领取新目标或普通视口，避免后继旧前缀Ready把尚未度量的小批永远留在槽内。
+            // When a target cancels or is replaced, preserve completed LineEnds by checkpointing and
+            // actually measuring them first,
+            // before new targets or ordinary viewports can leave their unmeasured batch stranded behind
+            // an old Ready prefix.
             self.checkpoint_batch()?;
             owner.schedule()?;
             return Ok(());
         }
-        // 确有试次在途时不重复发起；唯一 worker 结束后会投递同一个弱 owner 的完成事件。
+        // Do not restart an in-flight trial; the unique worker delivers completion to the same weak
+        // owner.
         if self.trial.is_some() {
             if self.advance_trial(owner, ticket)? {
                 return Ok(());
@@ -1821,15 +1925,17 @@ impl Producer {
         if let Some(style) = self.pending_style.take() {
             let _ = self.start_style(owner, style, ticket)?;
             owner.schedule()?;
-            return Ok(()); // 同一回合只推进原语义量子或Font准备，不再偷做Composer下一步。
+            return Ok(()); // This turn advances original semantics or font preparation only, without an additional Composer step.
         }
         if let Some(control) = self.pending_control.take() {
             self.provide_control(owner, control, ticket)?;
             owner.schedule()?;
-            return Ok(()); // 控制语义与 Native 字体准备独占本次原量子，不在同轮继续测量。
+            return Ok(()); // Control semantics and Native font preparation own this quantum exclusively, without further measurement in this turn.
         }
-        // FontTrial 已实际交回后才退休完成行，迟到结果不能失去它所属的原格。
-        // 未提交行仍在独立 grid 槽，滚回旧视口也不能丢掉原 Core 请求的最终提交责任。
+        // Retire completed rows after actual FontTrial return so a late result cannot lose its original
+        // cell owner.
+        // The independent grid slot retains unsubmitted rows and their original Core final-response
+        // obligation even after backward scroll.
         self.grids.retain(|grid| {
             grid.visible(request)
                 || self
@@ -1854,7 +1960,8 @@ impl Producer {
                     .as_ref()
                     .is_none_or(|grid| !grid.has_preparation())
         }) {
-            // 视口已移走就归还这一个恢复作业；尚有 CellInline 时先交回原槽再退休。
+            // Return this restoration when the viewport moves away, draining actual CellInline to its
+            // original slot before retirement.
             self.restoring_grid = None;
         }
         if self.restoring_grid.is_some() {
@@ -1895,13 +2002,16 @@ impl Producer {
                 && owner.pending_vertical.borrow().is_none()
                 && owner.pending_word_delete.borrow().is_none()
             {
-                // 普通滚回不要求把后方在途行排完；明确的后向导航仍由原作业继续取得真实几何。
-                // 此刻没有原 CellInline/FontTrial 在途，恢复旧行可以安全短借同一来源请求。
+                // Ordinary backward scrolling need not finish a later in-flight row; explicit
+                // navigation still obtains actual geometry through original work.
+                // With no original CellInline/FontTrial outstanding, old-row restoration may briefly
+                // borrow the same Source request.
                 return self.publish(owner, request, ticket);
             }
             return self.advance_grid(owner, request, ticket);
         }
-        // Resolve queued visual work before ordinary viewport publication; missing lines use this same producer.
+        // Resolve queued visual work before ordinary viewport publication; missing lines use this same
+        // producer.
         let visual = self.advance_visual(owner, request)?;
         if matches!(visual, TargetAdvance::Handled) {
             return Ok(());
@@ -1931,7 +2041,7 @@ impl Producer {
                 } else {
                     0.0
                 }
-        }); // 向下只补当前与下一实际viewport，不猜系统距离/overlap；上方行已由当前prefix覆盖。
+        }); // Downward paging extends through current/next actual viewports only; existing prefix covers earlier rows without guessed system distance/overlap.
         if let Some(pending) = &page_scroll
             && scroll_needed.is_some_and(|needed| self.height >= needed || self.complete)
         {
@@ -1942,19 +2052,19 @@ impl Producer {
                     viewport.set_content_width(self.maximum_content_width)
                 })?;
                 owner.schedule()?;
-                return Ok(()); // 横向范围换票后结束本回合，不能沿旧票再改高度或分页。
+                return Ok(()); // End this turn after horizontal-extent supersession; old authority cannot also change height or page.
             }
             if viewport.geometry()?.content_height != self.height() {
                 owner.native_preparation_geometry(&ticket.request, &viewport, || {
                     viewport.set_content_height(self.height())
                 })?;
                 owner.schedule()?;
-                return Ok(()); // 真实前缀高度先安装，旧geometry到此结束，不能先让系统在短prefix底部clamp。
+                return Ok(()); // Install actual prefix height first and end old geometry authority, avoiding premature system clamp at a short-prefix bottom.
             }
             let result = owner.consume_page_scroll(pending);
-            self.target_source_health()?; // 真实Native/current重入后的Source首错优先，动作消费后不可重放。
+            self.target_source_health()?; // Source failure after Native/current reentry takes priority; a consumed action cannot be replayed.
             result?;
-            return Ok(()); // 每轮仅一个标准Native动作；方向段剩余次数交原主队列续体。
+            return Ok(()); // Perform one standard Native action per turn; the original main-queue continuation owns remaining directional actions.
         }
         if !matches!(visual, TargetAdvance::NeedPrefix)
             && !matches!(target, TargetAdvance::NeedPrefix)
@@ -1976,12 +2086,15 @@ impl Producer {
             metadata_units: 256,
         };
         let mut budget = quantum;
-        // 这一回合只持原四维额度；Core 明确签出的无源目录工作可以消费余额，不能重领配额。
-        // 源读取、context、shape 与外部任务仍交回原调度；Source 的缓存桥保持至多一次。
+        // This turn owns one four-dimensional allowance; Core-certified Source-free directory work may
+        // consume the remainder without renewal.
+        // Source reads, context, shaping, and external work yield to original scheduling; bridge a
+        // Source font-cache hit at most once.
         let mut cache_bridged = false;
         loop {
             ticket.require_pure(owner, &self.source)?;
-            // 原Composer可变借用只跨这一个Core调用；Native/Selection检查不能保着它重入。
+            // Hold mutable Composer access for this Core call only, ending it before Native/Selection
+            // reentry checks.
             let step = self.composer.as_mut().ok_or(Error::Closed)?.step(budget)?;
             self.step_bytes = self
                 .step_bytes
@@ -2011,7 +2124,8 @@ impl Producer {
                 .metadata_units
                 .checked_sub(step.metadata_units)
                 .ok_or(Error::CounterExhausted)?;
-            // 观察的是本回合各字段真实累计；只报最后一步会掩盖已经用掉的目录/标量额度。
+            // Observe actual cumulative work in this turn; the last step alone would hide
+            // directory/scalar allowance already spent.
             self.maximum_step_bytes = self.maximum_step_bytes.max(quantum.bytes - budget.bytes);
             self.maximum_step_scalars = self
                 .maximum_step_scalars
@@ -2029,8 +2143,10 @@ impl Producer {
                             .ok_or(Error::Closed)?
                             .pending_style_request()?
                     {
-                        // 本次实际目录工作可能已经生成原 nonce 请求；只接回这一发布事实，
-                        // 不再为了取得同一请求额外 step，也不在此读取语义或启动字体工作。
+                        // Actual directory work may already have issued the original nonce request;
+                        // accept that publication fact only,
+                        // without stepping again for the same request or starting semantic reads/font
+                        // work here.
                         self.pending_style = Some(style);
                     }
                     if self.pending_style.is_none()
@@ -2044,8 +2160,10 @@ impl Producer {
                         && budget.records != 0
                         && budget.metadata_units != 0
                     {
-                        // 只有已审的原目录/测量阶段可续，不能把零 bytes 当作没有隐含源读取的证明。
-                        // 每步仍核原 ticket/Source，至少一项有限余额严格下降；源字节额度始终未用。
+                        // Continue only Core-certified directory/measurement stages; zero bytes alone
+                        // cannot prove absence of hidden Source reads.
+                        // Every step rechecks original ticket/Source and strictly consumes at least one
+                        // finite remaining budget; Source-byte allowance stays unused.
                         continue;
                     }
                     owner.schedule()?;
@@ -2060,14 +2178,18 @@ impl Producer {
                         || budget.bytes < super::font_choice::MAXIMUM_CHOICE_SOURCE_BYTES
                     {
                         self.pending_style = Some(request);
-                        // Preview的Font决策仍可能推进原Parser/metadata；本桥接不把它算作免费样式。
-                        // Core若交付实际工作或本次已桥过，也保原请求给后继回合，不重领完整预算。
+                        // Preview font decisions may advance original parser/metadata; this bridge
+                        // never treats them as free styles.
+                        // If Core performed work or this turn already bridged, defer the original
+                        // request without renewing a full allowance.
                         owner.schedule()?;
                     } else if let StyleStart::Cached { source_bytes } =
                         self.start_style(owner, request, ticket)?
                     {
-                        // Key读取已原样进入trial_source_bytes；这里只扣共享额度，不重复累计工作。
-                        // 本次 Core 四项工作确为零才到这里；此前目录工作已扣除，其余余额不重领。
+                        // Key reads already entered trial_source_bytes; subtract shared allowance only
+                        // without counting them again.
+                        // Reach here only after zero work from this Core step; prior directory costs
+                        // stay deducted and no remainder is renewed.
                         budget.bytes = budget
                             .bytes
                             .checked_sub(source_bytes)
@@ -2075,14 +2197,18 @@ impl Producer {
                         self.maximum_step_bytes =
                             self.maximum_step_bytes.max(quantum.bytes - budget.bytes);
                         cache_bridged = true;
-                        // Key 已读源后只保留旧桥原来的一步；后继 Yielded 不再合并到本回合。
+                        // After key Source reads, allow the original bridge single next step only,
+                        // without merging a later Yielded into this turn.
                         continue;
                     } else if !self.has_in_flight() {
-                        // Pending没有在途worker时仍由原Body续体唤醒；不能依赖不会到达的线程通知。
-                        // 已在内部安排的同serial任务会原样去重，不另开轮询或第二个字体试次。
+                        // Without an in-flight worker, Pending needs the original Body continuation
+                        // rather than a notification that cannot arrive.
+                        // Existing same-serial scheduling coalesces as usual, without polling or a
+                        // second font trial.
                         owner.schedule()?;
                     }
-                    // Pending仍由原worker/续体负责后继唤醒，不在本回合再推进试次或轮询空转。
+                    // The original worker/continuation owns Pending wakeup; do not advance trials again
+                    // or spin-poll in this turn.
                 }
                 MarkdownLineComposeAnswer::LineReady(facts) => {
                     self.accept_line(owner, &facts)?;
@@ -2096,7 +2222,8 @@ impl Producer {
                     if self.semantics.is_some() {
                         self.pending_control = Some(request);
                     } else {
-                        // 正式 Source 和 Cell 保持原同步控制响应、原字体与原调度次数。
+                        // Source and Cell retain their original synchronous control response, font
+                        // choice, and scheduling cadence.
                         let fonts = owner.fonts.borrow().clone();
                         let font = fonts.first().ok_or(Error::Closed)?;
                         let response = request.respond(
@@ -2111,14 +2238,16 @@ impl Producer {
                     }
                     owner.schedule()?;
                 }
-                // 未实现的控制、词典解析、Tab 和无前沿证明不能变成永久 Pending，
-                // 更不能退回 TextKit 读取整段；候选明确失败，默认完整后端没有因此切换。
+                // Unsupported controls, dictionary resolution, Tab placement, or missing frontier proof
+                // cannot become permanent Pending,
+                // or fall back to whole-paragraph TextKit reads; fail this candidate explicitly without
+                // switching the production backend.
                 MarkdownLineComposeAnswer::NeedsResolution(_reason) => {
                     #[cfg(feature = "native-markdown-runtime-probe")]
                     eprintln!(
                         "native_body_unsupported phase=resolution serial={} reason={_reason:?}",
                         self.serial
-                    ); // 仅记录原Core范围/原因，不输出正文；真实缺字不能伪装成一般Pending。
+                    ); // Log original Core ranges/reasons only, without text; actual missing glyphs cannot become generic Pending.
                     return Err(Error::Unsupported);
                 }
                 MarkdownLineComposeAnswer::NeedsTabPlacement(_reason) => {
@@ -2144,7 +2273,8 @@ impl Producer {
         Ok(())
     }
 
-    /// 格作业与外层 Composer 串行：同回合最多一次原量子或一次真实 Font 准备。
+    /// Serialize cell work with the body Composer: one original quantum or actual font-preparation step
+    /// per turn.
     fn advance_grid(
         &mut self,
         owner: &Owner,
@@ -2168,13 +2298,15 @@ impl Producer {
                 .as_mut()
                 .expect("Grid只属于原Preview语义请求"),
         );
-        // 即便本轮真实资源操作失败，也先接回已发生的工作量，不能让错误路径漏记读量。
+        // Collect performed work before reporting resource-operation failure so error paths cannot omit
+        // actual reads.
         let measured_width = working.width();
         let work = working.take_work();
         self.record_grid_work(work)?;
         let step = advanced?;
         if measured_width > 0.0 {
-            // 列解算器已经固定并量化的前缀宽可授横向范围；这里不授行高或Complete权限。
+            // Solved quantized prefix widths may authorize horizontal extents, without row-height or
+            // Complete authority.
             self.maximum_content_width = self
                 .maximum_content_width
                 .max(measured_width + self.padding * 2.0);
@@ -2182,7 +2314,8 @@ impl Producer {
         match step {
             grid::Advance::Progress => owner.schedule()?,
             grid::Advance::Style { column, request } => {
-                // 格显示坐标只交给该格原 Composer，字体试次仍独占 Body 的同一个工作槽。
+                // Cell display coordinates answer that original cell Composer only; font trials still
+                // exclusively use the same Body slot.
                 let display = self.active_grid().display(column);
                 let row = self.active_grid().source_range().start;
                 let selection = super::semantics::Selection::cell(owner, display, &request)?;
@@ -2198,7 +2331,8 @@ impl Producer {
                 }
             }
             grid::Advance::Control { column, request } => {
-                // 原空白/换行控制也核同一显示票；不能把正文 control 的权限借给格内源。
+                // Whitespace/newline controls also validate the same display authority; body control
+                // authority cannot answer a cell Source.
                 let display = self.active_grid().display(column);
                 let mut selection =
                     super::semantics::Selection::cell_control(owner, display.clone(), &request)?;
@@ -2224,12 +2358,14 @@ impl Producer {
             }
             grid::Advance::Visible => self.publish(owner, request, ticket)?,
             grid::Advance::Complete if self.restoring_grid.is_some() => {
-                // 旧行早已封存；恢复格结束只交回当前可见集合，不能再次向 Core 提交同一行。
+                // The old row is already sealed; restored cells return to current visible rows without
+                // another Core submission.
                 self.finish_grid_restoration();
                 owner.schedule()?;
             }
             grid::Advance::Complete => {
-                // 所有格真实结束后才回应块行；submitted 只表示响应已交 Core，不表示 LineEnd 已封存。
+                // Answer the block row after all cells actually end; submitted means Core received the
+                // response, not that LineEnd sealed.
                 let response = self
                     .grid
                     .as_ref()
@@ -2252,17 +2388,18 @@ impl Producer {
                         viewport.set_content_width(self.maximum_content_width)
                     })?;
                     owner.schedule()?;
-                    return Ok(()); // 原列前缀先进入真实document范围，不能让Native把右列目标夹回首列。
+                    return Ok(()); // Install actual column-prefix document extents before Native can clamp a right-column target back to the first column.
                 }
                 if viewport.geometry()?.content_height != self.height() {
                     owner.native_preparation_geometry(request, &viewport, || {
                         viewport.set_content_height(self.height())
                     })?;
                     owner.schedule()?;
-                    return Ok(()); // 真实Cell前缀高度先进入文档，旧几何不能在短内容范围内夹掉目标。
+                    return Ok(()); // Install actual cell-prefix document height before old short-content geometry can clamp away the target.
                 }
                 ticket.require(owner, &self.source)?;
-                // 原 Find 请求的存活检查包围实际 Native reveal，失效目标不能改变当前文档视口。
+                // Guard actual Native reveal with original Find liveness so revoked targets cannot
+                // change the current document viewport.
                 let revealed = owner.native_preparation_geometry(request, &viewport, || {
                     viewport.reveal_document_rect(rect, &|| target.current_native(owner))
                 });
@@ -2276,14 +2413,15 @@ impl Producer {
         Ok(())
     }
 
-    /// 唯一活格作业来自当前行或当前恢复行，两者共用原 FontTrial 与串行语义槽。
+    /// The unique active cell work belongs to current/restoring rows, sharing the original FontTrial
+    /// and serial semantic slot.
     fn active_grid(&self) -> &Grid {
         match &self.restoring_grid {
             Some(restoring) => restoring.grid.as_ref().expect("恢复格已持实际来源"),
             None => self.grid.as_ref().expect("当前行作业仍在原槽"),
         }
     }
-    /// 控制响应必须回原在途格，不能借可见集合里的另一行替换接收者。
+    /// Return controls to their original in-flight cell rather than another visible-row receiver.
     fn active_grid_mut(&mut self) -> &mut Grid {
         match &mut self.restoring_grid {
             Some(restoring) => restoring.grid.as_mut().expect("恢复格已持实际来源"),
@@ -2291,14 +2429,16 @@ impl Producer {
         }
     }
 
-    /// 恢复作业只保当前可见格；移交后原查询 Reader/handle 随续体退场，不增加历史库存。
+    /// Restoration retains current visible cells only; its query Reader/handle retire on transfer
+    /// without historical inventory.
     fn finish_grid_restoration(&mut self) {
         let restoring = self.restoring_grid.take().expect("只有实际恢复作业能完成");
         self.grids
             .push_back(restoring.grid.expect("实际格前缀已经准备完成"));
     }
 
-    /// 一回合只查原目录、重放一个语义量子或推进一个格作业；不在字体线程外另起来源图。
+    /// Each turn performs original directory lookup, one semantic quantum, or one cell step without a
+    /// second Source graph.
     fn advance_grid_restoration(
         &mut self,
         owner: &Owner,
@@ -2316,7 +2456,8 @@ impl Producer {
         }
         let restoring = self.restoring_grid.as_mut().expect("实际恢复续体仍在原槽");
         if let Some(lookup) = restoring.lookup.as_mut() {
-            // 原 Reader 自己签发 handle；数字 ordinal 只是查询，不能替裸范围授表格来源权限。
+            // The original Reader issues handles; an ordinal is a query coordinate and cannot grant
+            // table Source authority to bare ranges.
             let step = restoring
                 .output
                 .borrow_mut()
@@ -2351,7 +2492,8 @@ impl Producer {
             owner.schedule()?;
             return Ok(());
         };
-        // 原 sealed handle 再次经真实 Reader 验证，列宽/高度不能来自另一个输出或普通文字行。
+        // Revalidate the sealed handle with its actual Reader; widths/heights cannot come from another
+        // output or ordinary text line.
         let mut widths = [0i64; 256];
         let columns = restoring.output.borrow_mut().table_column_widths(
             &self.source.authority(),
@@ -2376,7 +2518,8 @@ impl Producer {
         owner.schedule()
     }
 
-    /// 原Producer接管本轮格账本，所有Cell/自然宽作业退休之后进度仍保留真实已发生读量。
+    /// The original Producer takes this cell-work ledger, preserving actual performed reads after every
+    /// cell/natural-width task retires.
     fn record_grid_work(&mut self, work: grid::Work) -> Result<()> {
         add_semantic_work(&mut self.cell_display_work, work.display)?;
         for (total, value) in [
@@ -2389,7 +2532,8 @@ impl Producer {
             ),
             (&mut self.cell_shaped_input_bytes, work.shaped_input_bytes),
         ] {
-            // 累计读量必须保留已退休格的真实成本；溢出时失败，禁止饱和为看似合格的数值。
+            // Totals retain retired-cell actual costs; fail overflow instead of saturating into
+            // apparently compliant values.
             *total = total.checked_add(value).ok_or(Error::CounterExhausted)?;
         }
         self.maximum_step_bytes = self.maximum_step_bytes.max(work.maximum_bytes);
@@ -2398,7 +2542,8 @@ impl Producer {
         Ok(())
     }
 
-    /// 原 NeedStyle 仅可交普通字体或真实结构行；表格不走普通段落的 Font 响应。
+    /// Original NeedStyle receives ordinary font style or an actual structural row; tables do not use
+    /// ordinary paragraph font responses.
     fn start_style(
         &mut self,
         owner: &Owner,
@@ -2411,8 +2556,9 @@ impl Producer {
             .expect("正文样式请求持原Composer")
             .root_leaf_style_boundary_for(&request)?
         {
-            // 原左语义出版物只借一次紧邻右字素作字体见证；不推进当前语义窗口，
-            // 也不把右字素的样式、坐标或输入权交给左侧输出。
+            // The original left semantic publication borrows one adjacent right grapheme as font
+            // evidence without advancing its semantic window,
+            // or transferring right-side style, coordinates, or input authority into left-side output.
             let selection = super::semantics::Selection::root_leaf_boundary(
                 owner,
                 &self.source,
@@ -2427,15 +2573,19 @@ impl Producer {
                 Some(super::semantics::StyleDecision::Font(selection)) => selection,
                 Some(super::semantics::StyleDecision::Table(row)) => {
                     if self.queued_lines.is_some() {
-                        // 远端选择/reveal可把前几条真实LineEnd暂存于原小批；此时height尚未累计它们。
-                        // 格top必须来自已经完成原Native度量的前缀，不能以旧height开下一行，
-                        // 否则后续批次虽补齐总高度，这一行文字与点击框仍会永久重叠上一表格行。
+                        // Distant selection/reveal may stage actual LineEnds in a small batch before
+                        // height accounts for them.
+                        // Cell top must use the prefix with complete original Native metrics rather
+                        // than opening the next row at old height,
+                        // otherwise later total-height corrections leave this row text/click box
+                        // overlapping the previous table row.
                         self.pending_style = Some(request);
                         self.checkpoint_batch()?;
                         owner.schedule()?;
-                        return Ok(StyleStart::Pending); // 原NeedStyle/nonce尚未消费；先沿原pending_batch逐量子真实度量。
+                        return Ok(StyleStart::Pending); // The original NeedStyle/nonce remains unconsumed; measure its pending batch in actual quanta first.
                     }
-                    // Core 核真实当前 cursor、原请求 nonce 与行范围，仍在途的前段不能被此交接吞掉。
+                    // Core checks actual cursor, original nonce, and row range so this handoff cannot
+                    // discard an in-flight prefix.
                     let request = self
                         .composer
                         .as_mut()
@@ -2446,10 +2596,11 @@ impl Producer {
                         self.height + self.padding,
                         &self.table_widths,
                     ));
-                    return Ok(StyleStart::Pending); // 块交接没有Font响应或假LineReady，后续只推进真实格作业。
+                    return Ok(StyleStart::Pending); // Block handoff creates no font response or fabricated LineReady; later turns advance actual cells.
                 }
                 None => {
-                    // 同一原 Parser publication 尚未完成，保原 NeedStyle 续体，不构造默认语义。
+                    // While original parser publication is incomplete, retain its NeedStyle
+                    // continuation without default semantics.
                     self.pending_style = Some(request);
                     return Ok(StyleStart::Pending);
                 }
@@ -2461,7 +2612,8 @@ impl Producer {
         self.start_font_trial(owner, request, selection, FontTrialTarget::Body, ticket)
     }
 
-    /// 两种真实坐标域共用同一试次槽和线程；外层PreparationTicket始终核canonical Body。
+    /// Both actual coordinate domains share one trial slot/worker; outer PreparationTicket always
+    /// validates canonical Body authority.
     fn start_font_trial(
         &mut self,
         owner: &Owner,
@@ -2471,7 +2623,8 @@ impl Producer {
         ticket: &PreparationTicket,
     ) -> Result<StyleStart> {
         let layout_source = self.layout_source(target).clone();
-        // 内层布局票核显示坐标，外层 ticket 核 canonical 文档；二者各自持有真实权限。
+        // Inner layout authority validates display coordinates while the outer ticket validates the
+        // canonical document; both remain necessary.
         selection.require(owner, &layout_source, &request)?;
         let semantic_base = if self.semantics.is_some() {
             selection.base_index(owner, &self.source, ticket)?
@@ -2480,25 +2633,36 @@ impl Producer {
         };
         let probe = self.layout_composer(target).font_probe(&request)?;
         if probe.source_range().len() > 4096 {
-            // 回退字体探针仅允许原有限切片；过大请求不得退回整格字符串测量。
+            // Fallback probes accept original bounded slices only; oversized requests cannot fall back
+            // to whole-cell string measurement.
             return Err(Error::Unsupported);
         }
-        // 本次只使用一个真实 Base；取出该 Rc 就结束 palette 借用，不为每个样式请求
-        // 复制整份 Vec 或延长无关字体的强生命期。原 Base 仍贯穿后续校验和 Native 试次。
+        // Use one actual Base and end the palette borrow after cloning its Rc, without copying the
+        // entire vector per style request
+        // or retaining unrelated fonts. The original Base spans subsequent validation and Native
+        // trials.
         let base = Rc::clone(&owner.fonts.borrow()[semantic_base]);
-        // continuation 属于 Core 的当前整形段，不是语义字体偏好的替代品。
-        // 后继完整 GCB 按同一语义 Base、系统 for_string、系统级联顺序真实试字；
-        // Base 再次可用时返回它，才能保留中英混排中的空格宽度与原始换行位置。
+        // The continuation belongs to Core current shaping segment and cannot replace semantic font
+        // preference.
+        // Try every subsequent complete grapheme in original semantic Base, system for_string, then
+        // system-cascade order;
+        // return to Base when available again to preserve mixed Chinese/English space widths and
+        // original wrapping.
         selection.style.points = base.native().point_size() as f32;
-        // Key 捕获区间只读原 Core probe、认证字节包络与已捕获字体标量，没有 Native 调用。
-        // 因而沿原纯票核当前 Input/来源即可；不能为这三次纯检查重复读取整组 AppKit 几何。
-        // probe 的前后 Source/scope 校验仍在原 capture 内；命中后下方 ticket.require 会重新
-        // 完整核 Native 几何，未命中后的 fallback 也继续逐 Native 步守原票，不跨重入复用权限。
+        // Key capture reads the original Core probe, certified byte envelope, and captured font
+        // scalars, without Native calls.
+        // Original pure checks suffice for Input/Source here, without repeated full AppKit geometry
+        // reads for these pure validations.
+        // Original capture retains pre/post Source/scope checks; on a hit the following ticket.require
+        // again
+        // validates full Native geometry, while fallback still guards every Native step with original
+        // authority across reentry.
         let (read, key) =
             super::font_choice::FontChoiceKey::capture(&probe, &selection.style, &base, &|| {
                 ticket.pure_current(owner, &self.source)
             });
-        // 有限 key 的读取同样属于真实工作；Source、取消或 scope 后验失败也不能把已读量抹成零。
+        // Bounded key reads are actual work even if post-call Source/cancellation/scope checks reject
+        // the result.
         self.trial_source_bytes = self
             .trial_source_bytes
             .checked_add(read)
@@ -2508,16 +2672,20 @@ impl Producer {
             .as_ref()
             .and_then(|key| owner.font_choices.borrow().get(key));
         if let Some(font) = cached {
-            // 只复用同完整字素、上下文和原字体选项已验证过的选择；本次原票和语义必须仍有效。
-            // 命中不签造 TrialResult，也不把旧 GCB、publication 或字体目录当作本请求权限。
+            // Reuse choices for the same complete grapheme, context, and original font options only
+            // while current original authority/semantics remain valid.
+            // A hit creates no TrialResult and uses neither old grapheme, publication, nor font
+            // directory as this request authority.
             selection.require(owner, &layout_source, &request)?;
             ticket.require(owner, &self.source)?;
             probe.validate()?;
             let response =
                 selected_font_response(owner, &layout_source, request, selection, &base, &font)?;
             self.layout_composer(target).provide_style(response)?;
-            // 命中没有worker事件；调用方或在原剩余额度内续一次Core，或按原Grid/语义边界调度。
-            // 此返回只带本次实际读取，不持原probe/Selection/响应，更不能冒充后台试次结果。
+            // A cache hit has no worker event; the caller advances Core within remaining budget or
+            // schedules at the original Grid/semantic boundary.
+            // Return actual reads only, without retaining probe/Selection/response or claiming a
+            // background trial result.
             return Ok(StyleStart::Cached { source_bytes: read });
         }
         let (fallback, pending_probe) = if probe.shaping_segment_ready()? {
@@ -2535,7 +2703,7 @@ impl Producer {
             )?;
             (Some(fallback), None)
         } else {
-            (None, Some(probe)) // 原唯一 FontTrial 先等首段，不额外捕获字体或启动第二个 worker。
+            (None, Some(probe)) // The unique original FontTrial waits for its first segment without extra font capture or another worker.
         };
         self.trial = Some(FontTrial {
             target,
@@ -2552,14 +2720,16 @@ impl Producer {
         Ok(StyleStart::Pending)
     }
 
-    /// 仅路由到已存在的具体正文或当前格，不制造默认Source或后继装配。
+    /// Route to the existing concrete body/current cell only, without default Source or successor
+    /// assembly.
     fn layout_source(&self, target: FontTrialTarget) -> &MarkdownLayoutTextSource {
         match target {
             FontTrialTarget::Body => &self.source,
             FontTrialTarget::Cell { row, column } => self.grid_for_row(row).source(column),
         }
     }
-    /// 响应回到发起请求的原组合器；迟到格试次不得误交当前正文组合器。
+    /// Return responses to their original issuing Composer; late cell trials cannot answer the current
+    /// body Composer.
     fn layout_composer(&mut self, target: FontTrialTarget) -> &mut MarkdownLineComposer {
         match target {
             FontTrialTarget::Body => self.composer.as_mut().expect("Body试次持原Composer"),
@@ -2567,7 +2737,8 @@ impl Producer {
         }
     }
 
-    /// 按原物理行路由真实试次；可见旧行恢复也只借当前这一作业，不重新捕获 Source。
+    /// Route actual trials by original physical row; restored visible rows borrow this existing work
+    /// without Source recapture.
     fn grid_for_row(&self, row: usize) -> &Grid {
         self.grid
             .iter()
@@ -2580,7 +2751,8 @@ impl Producer {
             .find(|grid| grid.source_range().start == row)
             .expect("Cell试次始终持原Grid作业")
     }
-    /// 可变借用仍按原行起点路由，编程装配错误直接 panic，不以另一个格作为默认接收方。
+    /// Mutable routing also uses original row start; an assembly error panics rather than choosing
+    /// another default cell receiver.
     fn grid_for_row_mut(&mut self, row: usize) -> &mut Grid {
         self.grid
             .iter_mut()
@@ -2594,7 +2766,8 @@ impl Producer {
             .expect("Cell试次始终持原Grid作业")
     }
 
-    /// Source 保持原控制字体；预览控制先取得同一真实语义，避免 LF 把隐藏围栏撑成普通行。
+    /// Source retains original control fonts; preview controls acquire actual semantics first so LF
+    /// cannot expand hidden fences into normal lines.
     fn provide_control(
         &mut self,
         owner: &Owner,
@@ -2603,7 +2776,7 @@ impl Producer {
     ) -> Result<()> {
         let selection =
             if request.kind == omni_markdown_core::MarkdownLineInlineControlKind::EmptyParagraph {
-                None // 真 EOF 空行没有 Markdown 内容，其字体和字面路径相同。
+                None // An actual empty EOF paragraph has no Markdown content and uses the literal font path.
             } else if let Some(semantics) = self.semantics.as_mut() {
                 match semantics.select_control(owner, &self.source, &request, ticket)? {
                     Some(selection) => Some(selection),
@@ -2623,8 +2796,10 @@ impl Producer {
             0
         };
         ticket.require(owner, &self.source)?;
-        // 控制项同样只需原选定字体；Rc 独立保活到响应交回，RefCell 借用不跨后续调用。
-        // palette 的其余字体继续由原 Body 拥有，无需为这个控制项另建临时 Vec。
+        // Controls need the originally selected font only; an independent Rc retains it through
+        // response delivery without a live RefCell borrow.
+        // The original Body keeps other palette fonts, without another temporary vector for this
+        // control.
         let font = Rc::clone(&owner.fonts.borrow()[index]);
         let mut response = request.clone().respond(
             font.registered(),
@@ -2646,17 +2821,21 @@ impl Producer {
         Ok(())
     }
 
+    /// Resume one original trial, transferring work to the sole worker only after its exact shaping
+    /// segment is ready.
     fn advance_trial(&mut self, owner: &Owner, ticket: &PreparationTicket) -> Result<bool> {
         let mut trial = self.trial.take().ok_or(Error::Closed)?;
         if trial.selection.context_changed(owner)
             || (trial.fallback.is_none() && trial.pending_probe.is_none())
         {
-            // 原selection已经改变：先取消旧试次，不把新publication借给旧结果。
-            // 在途packet仍由同一个worker交回后析构，drain完成前不发送第二试次混淆serial。
+            // After original selection changes, cancel the old trial before a new publication can
+            // certify its old result.
+            // The same worker returns the in-flight packet for destruction; drain it before sending
+            // another trial with ambiguous serial ownership.
             if let Some(fallback) = trial.fallback.take() {
                 fallback.close();
             }
-            drop(trial.pending_probe.take()); // 只有原 scope 的首段等待票，不把它转交新的 selection。
+            drop(trial.pending_probe.take()); // The first-segment wait belongs to original scope only, without transfer to a new selection.
             if trial.in_flight {
                 self.trial = Some(trial);
                 return Ok(true);
@@ -2667,8 +2846,8 @@ impl Producer {
                 .map_or(Ok(()), |result| result.retire(false).map_err(Error::from));
             if let FontTrialTarget::Body = trial.target {
                 self.pending_style = Some(trial.request);
-            } // Cell旧选择由同一Body真实reset撤整张Grid；不能把局部旧请求投入正文槽。
-            retired?; // 原context已换，但真实旧试次清理失败不能被下一样式请求吞掉。
+            } // The same Body resets the old cell selection/Grid; never place a stale cell-local request into the body slot.
+            retired?; // Even with changed context, the next style request cannot swallow actual old-trial cleanup failure.
             return Ok(false);
         }
         let layout_source = self.layout_source(trial.target).clone();
@@ -2683,15 +2862,10 @@ impl Producer {
         let base = trial.base.clone();
         let authority = base.native().core_font().authority();
         let source = self.source.clone();
-        #[cfg(feature = "native-markdown-runtime-probe")]
-        let probe =
-            owner.take_preparation_probe(&ticket.request, &source, self.composer.as_ref())?;
         let current = || {
             if !ticket.current(owner, &source) {
                 return false;
             }
-            #[cfg(feature = "native-markdown-runtime-probe")]
-            super::preparation_probe::deliver(&probe);
             ticket.current(owner, &source)
         };
         if let Some(mut probe) = trial.pending_probe.take() {
@@ -2749,8 +2923,10 @@ impl Producer {
                 .complete_trial_probed(base.native(), &authority, result, &current)?
             {
                 Some(NativeMarkdownFontFallbackCompletion::Rejected { .. }) => {
-                    // 同一个 owner 在真实 Base 缺字后优先系统 for_string，再按原级联顺序继续。
-                    // palette 只在实际候选已确定后精确复用，不拿 hidden 或其他字号轮流试正文。
+                    // After actual Base missing-glyph rejection, this owner tries system for_string
+                    // before original cascade order.
+                    // Reuse exact palette captures only after selecting an actual candidate, without
+                    // trying hidden/other-size fonts over body text.
                     trial
                         .fallback
                         .as_mut()
@@ -2769,7 +2945,7 @@ impl Producer {
                     self.accept_font_choice(owner, trial, choice, ticket, &current)?;
                     return Ok(false);
                 }
-                None => {} // 当前真实段无缺字且已释放，仍须原协调器确认后继段或整簇 Complete。
+                None => {} // This actual segment passed and released, but the original coordinator still must confirm subsequent segments or whole-grapheme completion.
             }
         }
         let fallback = trial.fallback.as_mut().expect("活试次持原fallback");
@@ -2787,7 +2963,7 @@ impl Producer {
             &current,
         );
         if let Some(step) = &step {
-            self.record_font_probe_work(step)?; // 后验取消也保留真实元数据、读取与标量量子成本。
+            self.record_font_probe_work(step)?; // Post-call cancellation still retains actual metadata/read/scalar quantum costs.
         }
         match advanced? {
             Some(NativeMarkdownFontFallbackCompletion::Selected(choice)) => {
@@ -2802,10 +2978,11 @@ impl Producer {
         if !fallback.probe_segment_ready()? {
             self.trial = Some(trial);
             owner.schedule()?;
-            return Ok(false); // 同一个候选和原 probe 等待，不提交空 Job 或跳下一字体。
+            return Ok(false); // Wait on the same candidate/original probe without submitting an empty Job or skipping to another font.
         }
         let next = fallback.next_trial_probed(base.native(), &authority, &fonts, &current);
-        // 字节读取先于候选构造/原票后验，失败与不可捕获都已发生真实工作，不能只在 Trial 成功后计账。
+        // Reads precede candidate construction/post-call authority checks, so failure and unavailable
+        // captures still account performed work.
         self.trial_source_bytes = self
             .trial_source_bytes
             .checked_add(fallback.take_probe_source_bytes())
@@ -2832,13 +3009,15 @@ impl Producer {
                 Ok(false)
             }
             NativeMarkdownFontFallbackStep::PendingDependencies => {
-                // 原字体依赖尚未交付时不能冒充缺字或 Ready；诊断只记录阶段，不保留正文。
+                // Undelivered font dependencies certify neither missing glyphs nor Ready; diagnostics
+                // record phase only without text.
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 eprintln!("native_body_font_trial outcome=pending_dependencies");
                 Err(Error::Unsupported)
             }
             NativeMarkdownFontFallbackStep::Exhausted { tried } => {
-                // 真实有序候选全部试完仍失败才报告耗尽；不能用默认字体替换未知字形。
+                // Report exhaustion only after trying the actual ordered candidates, without
+                // substituting a default font for unknown glyphs.
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 eprintln!("native_body_font_trial outcome=exhausted actual_tried={tried}");
                 #[cfg(not(feature = "native-markdown-runtime-probe"))]
@@ -2848,7 +3027,8 @@ impl Producer {
         }
     }
 
-    /// 元数据续体与正文/格量子进入同一实际工作账；不把多段边界查找藏成免费字体选择。
+    /// Account metadata continuation in the same body/cell work ledger, without treating
+    /// multisegment-boundary lookup as free font choice.
     fn record_font_probe_work(&mut self, step: &MarkdownLineFontProbeSegmentStep) -> Result<()> {
         for (total, value) in [
             (&mut self.step_bytes, step.bytes),
@@ -2863,7 +3043,8 @@ impl Producer {
         Ok(())
     }
 
-    /// 整个外 GCB 的真实候选完成后沿原响应提交；单段与多段共用同一注册、源权限和缓存顺序。
+    /// Commit through the original response after actual whole-grapheme completion; single/multiple
+    /// segments share registration, Source, and cache ordering.
     fn accept_font_choice(
         &mut self,
         owner: &Owner,
@@ -2880,8 +3061,9 @@ impl Producer {
         let base = trial.base.clone();
         #[cfg(feature = "native-markdown-runtime-probe")]
         let actual_choice = (choice.source_range(), choice.origin(), choice.facts());
-        // 真实完整试字决定此 GCB 的字体；回到语义 Base 不要求上一回退字体先缺字。
-        // 同来源、同样式和已注册字体仍由原响应与 Core FontRuns 核验及合并。
+        // Actual complete trials select this grapheme font; returning to semantic Base does not require
+        // prior fallback failure.
+        // Original responses and Core FontRuns validate/merge same-Source, same-style registered fonts.
         let selected = choice.into_captured_font(base.native(), &layout_source, current)?;
         let font = if let Some(selected) = selected {
             if let Some(existing) = fonts.iter().find(|font| {
@@ -2889,9 +3071,12 @@ impl Producer {
                     .core_font()
                     .permits(&font.native().core_font().authority())
             }) {
-                // 系统实际候选已在文件快照前严格核为同一字体；这里只复用原 Core 注册身份。
-                // 原 GCB 仍由唯一 worker 完整试过，不能因旧字体支持过别的字就跳过试次。
-                // 归还本次借出的强边，Body 保留唯一原注册及行度量，不随逐格滚动重复 push。
+                // Before file snapshotting, the actual system candidate was verified as the same font;
+                // reuse original Core registration identity only here.
+                // The unique worker still tested the complete original grapheme; support for another
+                // character cannot skip this trial.
+                // Return this temporary strong claim while Body keeps unique original
+                // registration/metrics, without duplicate insertion during cell scrolling.
                 let reused = existing.clone();
                 drop(selected);
                 reused
@@ -2914,7 +3099,7 @@ impl Producer {
                         .clone();
                     selected.capture_preview_metrics(&metrics_owner, current)?
                 } else {
-                    selected // Source级联字体同样保原CT浮点；不读取或构造Preview行槽。
+                    selected // Source cascade fonts preserve actual Core Text floating metrics without reading/creating preview line slots.
                 };
                 let selected = Rc::new(selected);
                 owner.fonts.borrow_mut().push(selected.clone());
@@ -2940,8 +3125,10 @@ impl Producer {
             && actual_choice.2.glyph_count <= 8
             && std::env::var_os("OMNI_NATIVE_PROBE_TRACE").is_some()
         {
-            // 只诊断原短格开头的完整多单位字素；值来自刚成功交付的原Choice/Font注册。
-            // metadata/points均为捕获时已认证的纯值，不调Native getter、不读正文、不留新强边。
+            // Diagnose complete multiunit graphemes near a short cell start only, using the
+            // just-delivered original Choice/font registration.
+            // Metadata/points are capture-certified pure values, without Native getters, text reads, or
+            // new retained claims.
             eprintln!(
                 "native_cell_font_choice row={row} column={column} whole_gcb={:?} origin={:?} glyph_facts={:?} points={} base_metadata={:?} selected_metadata={:?}",
                 actual_choice.0,
@@ -2953,13 +3140,16 @@ impl Producer {
             );
         }
         if let Some(key) = trial.cache_key {
-            // complete_trial_probed 已逐 glyph 检查并真实归还原 Job/分页；
-            // 当前 Selection、Source 与响应也已接纳，缓存仅留下字体弱边和有限键。
+            // complete_trial_probed checked every glyph and returned the actual original Job/pages;
+            // current Selection, Source, and response also passed, leaving weak font identity and a
+            // finite key only in the cache.
             owner.font_choices.borrow_mut().remember(key, &font);
         }
         Ok(())
     }
 
+    /// Consume actual ordered LineReady facts, checkpointing bounded distant batches before committing
+    /// measured heights.
     fn accept_line(&mut self, owner: &Owner, facts: &MarkdownComposedLineFacts) -> Result<()> {
         if facts.kind == omni_markdown_core::MarkdownComposedLineKind::TableRow {
             let grid = self.grid.take().expect("真实TableRow来自当前已完成Grid");
@@ -2969,7 +3159,7 @@ impl Producer {
             {
                 return Err(Error::Unsupported);
             }
-            self.grids.push_back(grid); // 下一原回合按真实视口退休；旧行几何已封存在原输出目录中。
+            self.grids.push_back(grid); // Retire by actual viewport on the next original turn; old row geometry remains sealed in the original output directory.
         }
         self.scan = None;
         self.top_lookup = None;
@@ -2979,8 +3169,10 @@ impl Producer {
         if let Some(vertical) = self.vertical.as_mut() {
             vertical.reset_output();
         }
-        // 只有尚未到目标首scalar的真实新行才启用有限批次。普通首屏/滚动继续逐行发布，
-        // 最后一条目标行即使不足32条也立即封口，不能等匹配尾端或整个段落。
+        // Batch actual new lines only while still before the target first scalar; ordinary
+        // first-screen/scroll work publishes line by line,
+        // and checkpoint the target line immediately even below 32 lines, without waiting for match
+        // tail or whole paragraph.
         let distant = self.target.as_ref().is_some_and(|target| {
             target.request.pending()
                 && !target.has_anchor()
@@ -3011,10 +3203,12 @@ impl Producer {
             if batch.count == MAX_TARGET_BATCH_LINES || reached {
                 self.checkpoint_batch()?;
             }
-            return Ok(()); // 仍每次只执行原Core量子；有限batch只减少真实checkpoint频率。
+            return Ok(()); // Each turn still executes one original Core quantum; finite batching reduces actual checkpoint frequency only.
         }
-        // 本槽仅保上一条度量完成的候选。先实际归还，再领取同 writer 的下一前缀，
-        // 不让中间候选和旧业务 Scene 一起占用两个 Reader 后再请求第三个 FD。
+        // This slot keeps the last measured candidate only; return it before obtaining the same writer
+        // next prefix,
+        // rather than holding two Readers through intermediate candidate/old Scene and requesting a
+        // third descriptor.
         let output = self.checkpoint_prefix(owner.source_target_pending())?;
         let handle = output.borrow_mut().last_line()?.ok_or(Error::Unsupported)?;
         if handle.facts() != facts || facts.ordinal != self.lines {
@@ -3032,7 +3226,7 @@ impl Producer {
         &mut self,
         target_work: bool,
     ) -> Result<Rc<RefCell<MarkdownComposedLines>>> {
-        drop(self.output.take()); // 原业务Scene已由Owner撤掉；先归还旧Reader名额，再同步/dup新prefix。
+        drop(self.output.take()); // Owner revoked the old business Scene; return the old Reader slot before syncing/duplicating the new prefix.
         let next_attempt = target_work
             .then(|| {
                 self.target_checkpoint_attempts
@@ -3047,7 +3241,8 @@ impl Producer {
             .ok_or(Error::Closed)?
             .publish_ready_prefix();
         if let (Some(started), Some(attempts)) = (started, next_attempt) {
-            // 这里只计实际调用的整个checkpoint入口（包含guard/sync/dup），不是隔离fsync耗时。
+            // Measure the actual complete checkpoint entry including guards/sync/dup, without claiming
+            // isolated fsync latency.
             self.target_checkpoint_attempts = attempts;
             self.target_checkpoint_elapsed += started.elapsed();
         }
@@ -3059,8 +3254,10 @@ impl Producer {
         if batch.count == 0 || batch.count > MAX_TARGET_BATCH_LINES || batch.first != self.lines {
             return Err(Error::Unsupported);
         }
-        // 每条LineReady已令原Composer进入下一原阶段，publish不是继续step的许可。
-        // 到此仅将这些既有LineEnd签入唯一prefix Reader，绝不制造行或复用旧Output身份。
+        // Each LineReady already advanced original Composer state; publication does not authorize
+        // another step.
+        // Certify existing LineEnds into the unique prefix Reader only, without fabricated lines or old
+        // output identity reuse.
         let output = self.checkpoint_prefix(true)?;
         let last = output.borrow_mut().last_line()?.ok_or(Error::Unsupported)?;
         self.target_batch_index_records = self
@@ -3084,8 +3281,10 @@ impl Producer {
     fn advance_batch(&mut self, owner: &Owner) -> Result<()> {
         let mut batch = self.pending_batch.take().ok_or(Error::Closed)?;
         if batch.collecting {
-            // previous_line实际包含四条64B读取；至多31次前驱加原末行已在checkpoint读过，
-            // 本轮不会同时度量part，保持原Native元数据量子，不一次展开任意长前缀。
+            // previous_line performs four 64-byte reads; at most 31 predecessors follow the final line
+            // already read by checkpoint,
+            // with no part measurement in this turn, preserving bounded Native metadata work without
+            // expanding an arbitrary prefix.
             for _ in 0..MAX_TARGET_BATCH_LINES {
                 let handle = batch.cursor.take().ok_or(Error::Unsupported)?;
                 let expected = batch.first + batch.count - batch.handles.len() - 1;
@@ -3110,11 +3309,13 @@ impl Producer {
                 batch.cursor = previous;
             }
             self.pending_batch = Some(batch);
-            return Ok(()); // 弱handle收集与真实Font/part度量分到不同回合，避免叠加扩大工作配额。
+            return Ok(()); // Weak-handle collection and actual font/part measurement use separate turns without stacking their allowances.
         }
         let mut parts = LINE_METRIC_BUDGET;
-        // 原32-part配额属于整个度量回合，不能每个短行只消费一个part就废弃余量。
-        // 已收集目录至多32行；逐行消费原handle也限制了零part/控制行，既不预读新行也不另建Reader。
+        // The original 32-part quota belongs to the complete measurement turn; short lines can consume
+        // its remaining allowance.
+        // At most 32 collected line handles also bound zero-part/control lines, without prefetching new
+        // lines or another Reader.
         while let Some(handle) = batch.handles.pop_front() {
             if handle.facts().ordinal != self.lines {
                 return Err(Error::Unsupported);
@@ -3128,7 +3329,7 @@ impl Producer {
                 || parts.metadata_units == 0
                 || parts.records < 7
             {
-                break; // 本行尚未完成或共享配额已耗尽；原pending_line和剩余batch在后继量子继续。
+                break; // Resume the same pending line/remaining batch next quantum when this line is unfinished or shared allowance is spent.
             }
         }
         if !batch.handles.is_empty() {
@@ -3137,7 +3338,8 @@ impl Producer {
         Ok(())
     }
 
-    /// 单行续体和远端有限批次共用真实度量提交；调用者提供本回合唯一part余量，不逐行重领预算。
+    /// Single-line continuation and bounded distant batches share actual metric commit under the caller
+    /// unique turn part allowance.
     fn advance_line(
         &mut self,
         owner: &Owner,
@@ -3154,14 +3356,15 @@ impl Producer {
                 .target_batch_index_records
                 .checked_add((line.metrics.part - before) * 7)
                 .ok_or(Error::CounterExhausted)?;
-            // 原part读取包含Line认证2条、Part2条及真实Directory3条；32-part回合最多224条记录。
+            // Each actual part read includes two Line checks, two Part records, and three Directory
+            // records: at most 224 records per 32-part turn.
         }
         if !ready {
             self.pending_line = Some(line);
             return Ok(false);
         }
         if line.metrics.handle.facts().ordinal != self.lines {
-            return Err(Error::Unsupported); // 累计Y只接受原顺序的下一条真实行，拒绝遗漏或重复度量。
+            return Err(Error::Unsupported); // Accumulated Y accepts the next actual original-order line only, rejecting missing or repeated measurement.
         }
         let old_height = self.height;
         self.height += line.metrics.height()?;
@@ -3201,14 +3404,16 @@ impl Producer {
                 viewport.set_content_width(self.maximum_content_width)
             })?;
             owner.schedule()?;
-            return Ok(()); // 有限像素仍消费原viewport；本次只发布空document的真实横向范围。
+            return Ok(()); // Bounded pixels still consume the original viewport; this turn installs actual horizontal document extents only.
         }
         if viewport.geometry()?.content_height != content_height {
             owner.native_preparation_geometry(request, &viewport, || {
                 viewport.set_content_height(content_height)
             })?;
-            // 自有高度事务真实改变了几何。旧请求到此结束，只排同一续体；后继回合
-            // 再领取真实新请求，绝不在旧排版回调里捕后继Input/宽度为旧Source签Scene。
+            // The owned height transaction actually changes geometry. End this request and queue its
+            // same continuation; a later turn
+            // acquires the actual new request instead of capturing successor Input/width inside an old
+            // callback to certify old Source.
             owner.schedule()?;
             return Ok(());
         }
@@ -3217,8 +3422,10 @@ impl Producer {
             + self.padding;
         let output = self.output.as_ref().cloned().ok_or(Error::Unsupported)?;
         let top_prefix = self.top.as_ref().filter(|top| needed_bottom <= top.height);
-        // 已度量目标行的bottom覆盖真实viewport底边即可作为逆扫起点；不必从遥远EOF重走，
-        // 也不需要padding以外的行参与本次实际绘制。锚始终属于这个Source/字体/宽度Producer。
+        // A measured target line covering the actual viewport bottom can seed backward scanning without
+        // restarting at distant EOF,
+        // or including lines beyond required padding. The anchor remains bound to this
+        // Source/font/width Producer.
         let target_anchor = self.last_target_anchor.as_ref().filter(|anchor| {
             anchor.bottom
                 >= request.virtual_viewport.document_origin.y + request.viewport.size.height
@@ -3244,7 +3451,7 @@ impl Producer {
             .as_ref()
             .is_some_and(|lookup| !lookup.request.same(request))
         {
-            self.top_lookup = None; // 几何改变后的旧查找票不为后继视口补签；原 output 仍唯一。
+            self.top_lookup = None; // Old lookup authority cannot certify a successor viewport after geometry changes; the original output remains unique.
         }
         let cursor = if self.scan.is_none() {
             if let Some((last_ordinal, _)) = seed {
@@ -3263,7 +3470,7 @@ impl Producer {
                 match step.answer {
                     MarkdownComposedLineLookupAnswer::Pending => {
                         owner.schedule()?;
-                        return Ok(()); // 确有原查找 cursor 在途，下一轮继续原文件索引，不从末行重扫。
+                        return Ok(()); // Resume the actual original file-index cursor next turn rather than rescanning from the last line.
                     }
                     MarkdownComposedLineLookupAnswer::Found(line) => {
                         if line.facts().ordinal != last_ordinal {
@@ -3273,7 +3480,7 @@ impl Producer {
                         Some(line)
                     }
                     MarkdownComposedLineLookupAnswer::PrefixNotCovered => {
-                        return Err(Error::Unsupported); // 已实测首屏应在最新前缀内，缺失是失配而非空 Ready。
+                        return Err(Error::Unsupported); // The measured first screen must exist in the latest prefix; absence is a mismatch rather than empty Ready.
                     }
                 }
             } else {
@@ -3281,10 +3488,12 @@ impl Producer {
                 output.borrow_mut().last_line()?
             }
         } else {
-            None // 原 scan 已持当前候选的游标，不重复定位或从首屏末行重开。
+            None // The original scan already owns this candidate cursor; do not relocate or restart at the first-screen final line.
         };
-        // 本轮原窗口移到唯一局部 owner，释放 self.scan 字段借用后才记真实读取工作。
-        // 需要继续时完整放回；错误则由外层原失败/关闭流程释放，不漏记失败前已发生的读量。
+        // Move this original scan to one local owner and end field borrowing before recording actual
+        // read work.
+        // Restore it intact for continuation; outer failure/close releases errors while preserving
+        // reads already performed.
         let mut scan = match self.scan.take() {
             Some(scan) => scan,
             None => Scan {
@@ -3331,8 +3540,10 @@ impl Producer {
             let ltr = metrics.ltr;
             let folded_end = metrics.folded_end;
             let handle = metrics.into_measured()?;
-            // 同一可见行不能随视口下方 prefix 变长而从另一串逆减重新取得坐标。
-            // 只在仍有完整原请求的真实目标行上重接它的实测边界；裸历史锚不具备此权限。
+            // A growing prefix below the viewport cannot relocate the same visible line through a
+            // different backward-subtraction chain.
+            // Reanchor measured bounds only on the actual target line with complete original request
+            // authority, never a bare historical anchor.
             let anchor = self.target.as_ref().and_then(|target| {
                 target
                     .current_line_anchor(owner, request, self.source.authority())
@@ -3358,14 +3569,15 @@ impl Producer {
                 scan.paragraphs
                     .push_front(handle.facts().paragraph_utf16.clone());
                 if handle.facts().kind == omni_markdown_core::MarkdownComposedLineKind::TableRow {
-                    // 行顶是同一目录逆扫得到的真实值，只保当前有限窗口，不给所有历史行建 Native 索引。
+                    // Actual row tops come from the same directory scan and remain in this bounded
+                    // window, without historical Native row indices.
                     scan.table_rows
                         .push_front((handle.facts().ordinal, line_top));
                 }
                 scan.handles.push_front(ScannedLine { handle, height });
             }
             scan.bottom = line_top;
-            // 一旦已覆盖真实视口顶部，后续更早行没有进入本次有限窗口的资格。
+            // After covering the actual viewport top, earlier lines cannot enter this bounded window.
             if line_top <= top {
                 scan.cursor = None;
                 break;
@@ -3378,10 +3590,10 @@ impl Producer {
             return Ok(());
         }
         if scan.handles.is_empty() {
-            return self.publish_grid(owner, request, ticket); // 正文已在上方，当前表格前缀不制造假文本行。
+            return self.publish_grid(owner, request, ticket); // Body text lies above; the current table prefix fabricates no text line.
         }
         if self.begin_missing_grid_restoration(&output, &scan)? {
-            self.scan = Some(scan); // 保住本次原窗口，后续只恢复缺失格，不从正文末尾重扫。
+            self.scan = Some(scan); // Preserve this original window and restore missing cells only, without restarting at the body end.
             owner.schedule()?;
             return Ok(());
         }
@@ -3396,7 +3608,7 @@ impl Producer {
         let source = self.source.clone();
         let current = || ticket.current(owner, &source) && geometry.is_current();
         let Some(grids) = self.prepare_grids(owner, &key, &current)? else {
-            self.scan = Some(scan); // 已完成的正文窗口保原弱handles，后续只续格目录，不从正文末行重扫。
+            self.scan = Some(scan); // The complete body window keeps original weak handles while cell directories continue, without body-last-line rescanning.
             owner.schedule()?;
             return Ok(());
         };
@@ -3443,7 +3655,8 @@ impl Producer {
                 .input
                 .navigation_selection_facts(&permit, &current)
                 .map_err(ViewError::Input)?;
-            // 与光标方向共用同一原票；最多1000个整数范围，不读取被选正文或另捕Source。
+            // Use the same original caret-affinity ticket for at most 1000 integer ranges, without
+            // selected-text reads or Source recapture.
             let selections = owner
                 .input
                 .selected_ranges(&permit, &current)
@@ -3456,7 +3669,8 @@ impl Producer {
             {
                 match request.input.directed_selection() {
                     Some(selection) => {
-                        // 原票已固定Doc/generation/完整输入；纯Core借用不跨Native，不能用UBA段代替逻辑行。
+                        // The original ticket fixes document/generation/complete Input; pure Core
+                        // borrows cross no Native call, and Bidi segments cannot replace logical lines.
                         let document = owner
                             .document
                             .borrow()
@@ -3468,10 +3682,10 @@ impl Producer {
                                 .map_err(ViewError::Document)?;
                         Some(range)
                     }
-                    None => None, // 未证明方向的选择不从ordered范围猜head，也不消费旧memento。
+                    None => None, // Without certified direction, do not infer head from an ordered range or consume an old memento.
                 }
             } else {
-                None // Cell、Preview和多选没有本次Source单有向活动行权限。
+                None // Cell, Preview, and multiselection lack this Source single-directed-active-line authority.
             };
             (
                 upstream.map(crate::native_surface::paged_text_view::NativeMarkdownPagedHeadAffinity::from_upstream),
@@ -3505,7 +3719,7 @@ impl Producer {
                             && (range.start < logical.end
                                 || logical.is_empty() && range.start == logical.start) =>
                     {
-                        (*number, logical.clone()) // 同一长逻辑行的后续softwrap只复用本次局部标量，不重复查树。
+                        (*number, logical.clone()) // Later soft wraps of one long logical line reuse these local facts without another tree query.
                     }
                     _ => {
                         source_line_at_head(&document, range.start).map_err(ViewError::Document)?
@@ -3529,9 +3743,9 @@ impl Producer {
             }
             Some(rows.into_boxed_slice())
         } else {
-            None // Cell和Preview既不挂ruler，也不为行号读取canonical逻辑行。
+            None // Cell and Preview mount no ruler and read no canonical logical lines for line numbering.
         };
-        ticket.require(owner, &self.source)?; // 所有Doc/Rc借用已结束；发布前仍核原Source和同次Native权限。
+        ticket.require(owner, &self.source)?; // End all document/Rc slot borrows before rechecking original Source and same-attempt Native authority for publication.
         let ranges = scan
             .ranges
             .into_iter()
@@ -3543,7 +3757,7 @@ impl Producer {
             })?
         else {
             owner.schedule()?;
-            return Ok(()); // 查询getter重入已换意图；旧候选不能给后继查询发布空/旧匹配。
+            return Ok(()); // Query getter reentry changed intent; the old candidate cannot publish empty/old matches for a successor query.
         };
         let find_highlights = std::mem::take(&mut highlights.ranges);
         let scene = Rc::new(Scene::new(super::scene::Publication {
@@ -3577,7 +3791,7 @@ impl Producer {
             gutter,
         }));
         drop(owner.scene.replace(Some(scene.clone())));
-        drop(highlights); // 原栏/控制器的临时Native claim在安装后归还，重入的新查询可立即撤原Scene。
+        drop(highlights); // Return temporary bar/controller Native claims after installation so a reentrant new query can immediately revoke the original Scene.
         let gutter = owner.gutter.borrow().clone();
         if let Some(gutter) = gutter {
             gutter.publish(&scene)?;
@@ -3594,7 +3808,8 @@ impl Producer {
         Ok(())
     }
 
-    /// 当前窗口缺少旧格时，只恢复一条真实封存行；已有行不重测宽度，也不建立全表 Native 索引。
+    /// Restore one actual sealed row missing from the current window, without remeasuring existing
+    /// widths or whole-table Native indices.
     fn begin_missing_grid_restoration(
         &mut self,
         output: &Rc<RefCell<MarkdownComposedLines>>,
@@ -3613,7 +3828,7 @@ impl Producer {
                     + scan.request.viewport.size.height
                 || *top + height <= scan.request.virtual_viewport.document_origin.y
             {
-                continue; // 目录边界相接的行没有可见交集，不能反复恢复后又立即退休。
+                continue; // Rows touching only a directory boundary have no visible intersection; do not restore and immediately retire them repeatedly.
             }
             if self
                 .grids
@@ -3623,7 +3838,8 @@ impl Producer {
             {
                 continue;
             }
-            // 缺失的旧行只创建一个真实 lookup 续体；前一次完成后再接下一可见行，避免全表准备。
+            // A missing old row creates one actual lookup continuation; finish it before the next
+            // visible row instead of whole-table preparation.
             self.restoring_grid = Some(GridRestoration {
                 output: output.clone(),
                 lookup: Some(
@@ -3641,7 +3857,8 @@ impl Producer {
         Ok(false)
     }
 
-    /// 所有行共用一个真实扫描预算，完成后才一次装配当前可见格窗口。
+    /// Share one actual scan allowance across rows and assemble current visible-cell windows only after
+    /// all scans finish.
     fn prepare_grids(
         &mut self,
         owner: &Owner,
@@ -3664,7 +3881,8 @@ impl Producer {
         if !scanned? {
             return Ok(None);
         }
-        // 扫描尚未全部完成前不创建任何 Native 格窗口，防止前格反复分配而后格永远饥饿。
+        // Create no Native cell window before all scans finish, preventing repeated early-cell
+        // allocation from starving later cells.
         let mut rows = Vec::new();
         for grid in self.grids.iter_mut().chain(self.grid.iter_mut()) {
             if grid.visible(&key.request) {
@@ -3674,7 +3892,8 @@ impl Producer {
         Ok(Some(rows.into_boxed_slice()))
     }
 
-    /// 表格首行尚无Core LineReady时也只发布真实Cell前缀；没有伪造的空正文窗口或EOF。
+    /// Before first-row Core LineReady, publish actual cell prefixes only, without fabricated empty
+    /// body windows or EOF.
     fn publish_grid(
         &mut self,
         owner: &Owner,
@@ -3688,10 +3907,11 @@ impl Producer {
                 viewport.set_content_width(self.maximum_content_width)
             })?;
             owner.schedule()?;
-            return Ok(()); // 尚未封存整行也可交付已固定列宽，但旧Scene几何不能续签。
+            return Ok(()); // Solved column widths can publish before full-row sealing, without renewing old Scene geometry.
         }
         if viewport.geometry()?.content_height != self.height() {
-            // 先发布已测真实内容范围；这次改变几何后必须重取 Scene key，不能继续签旧像素坐标。
+            // Publish measured actual content extents first; geometry changes require a new Scene key
+            // rather than old pixel-coordinate certification.
             owner.native_preparation_geometry(request, &viewport, || {
                 viewport.set_content_height(self.height())
             })?;
@@ -3709,12 +3929,14 @@ impl Producer {
         let source = self.source.clone();
         let current = || ticket.current(owner, &source) && geometry.is_current();
         let Some(grids) = self.prepare_grids(owner, &key, &current)? else {
-            // 同一 Scene 请求仍待有限扫描续体，保持 Pending 并排下一回合。
+            // The same Scene request awaits its bounded scan continuation; remain Pending and queue the
+            // next turn.
             owner.schedule()?;
             return Ok(());
         };
         let input_current = |epoch| owner.current(epoch) && current();
-        // 选择来自原 Input 当前权限；Grid-only publication 也不能另建输入图或假设空选择。
+        // Selection uses original current Input authority; grid-only publication creates no new Input
+        // graph or assumed empty selection.
         let permit = owner
             .input
             .capture(owner.configuration.epoch, &input_current)
@@ -3729,7 +3951,8 @@ impl Producer {
             .map_err(ViewError::Input)?
             .into_boxed_slice();
         ticket.require(owner, &self.source)?;
-        // 无普通正文窗口就是实际 None；只有真实格前缀参与绘制，不伪造空 TextWindow。
+        // No ordinary body window means actual None; paint real cell prefixes without an invented empty
+        // TextWindow.
         let Some(mut highlights) = owner
             .prepare_find_highlights(&key, None, &grids, || ticket.require(owner, &self.source))?
         else {
@@ -3753,7 +3976,8 @@ impl Producer {
     }
 }
 
-/// 只用canonical行树定位原活动头的逻辑行；完整子树读聚合，命中叶至多4KiB，不扫描整段。
+/// Locate the original active head through canonical line-tree aggregates and at most a 4 KiB hit leaf,
+/// without paragraph scanning.
 pub(super) fn source_line_range_at_head(
     document: &omni_markdown_core::MarkdownDocumentBuffer,
     head: usize,
@@ -3761,7 +3985,8 @@ pub(super) fn source_line_range_at_head(
     source_line_at_head(document, head).map(|(_, range)| range)
 }
 
-/// 行号和活动底色共用同一CRLF/尾空行定义；只返回原行树数字与端点，不复制逻辑行文本。
+/// Line numbering and active background share CRLF/trailing-empty-line semantics, returning tree
+/// ordinals/endpoints without logical-line copies.
 fn source_line_at_head(
     document: &omni_markdown_core::MarkdownDocumentBuffer,
     head: usize,
@@ -3773,15 +3998,16 @@ fn source_line_at_head(
     let line = document.line_for_byte(byte)?;
     let start = document.byte_offset_for_line(line)?;
     let (line, start) = if start > byte {
-        // prefix已计CR，而真实下一行始于完整CRLF后；LF内部仍归前行，不另读正文或改变head。
+        // The prefix counted CR before actual next-line start after CRLF; LF interior still belongs to
+        // the previous line without new reads or head changes.
         (line - 1, document.byte_offset_for_line(line - 1)?)
     } else {
-        (line, start) // 普通标量边界沿原行树结果，不把UBA或soft line接缝加入逻辑行。
+        (line, start) // Ordinary scalar boundaries use actual line-tree results, without Bidi or soft-wrap seams becoming logical lines.
     };
     let end = if line + 1 < document.line_count() {
         document.byte_offset_for_line(line + 1)?
     } else {
-        document.byte_len() // 真EOF没有下一行；若原文件以换行结束，start==end签尾空行。
+        document.byte_len() // Actual EOF has no next line; an original trailing newline yields start==end for the final empty line.
     };
     Ok((
         line,
@@ -3790,6 +4016,8 @@ fn source_line_at_head(
 }
 
 impl Owner {
+    /// Consume the delivered original worker result once; stale or unaccepted results still retire
+    /// through fallible resource cleanup.
     pub(super) fn finish_font_trial(&self, delivered_serial: u64) -> Result<()> {
         let (serial, result) = self
             .worker
@@ -3804,7 +4032,7 @@ impl Owner {
             );
         }
         if !self.active.get() || self.serial.get() != serial {
-            return result.retire(false).map_err(Error::from); // 迟到只失去字体选择权，真实资源错误仍须交给原Body。
+            return result.retire(false).map_err(Error::from); // Late delivery loses font-choice authority only; actual resource failures still belong to the original Body.
         }
         let mut delivered = Some(result);
         let admission = (|| {
@@ -3821,7 +4049,8 @@ impl Owner {
             Ok(())
         })();
         if let Err(cause) = admission {
-            // 槽借用已经归还；未安装的结果只在此退场，不因状态拒绝而裸丢真实I/O失败。
+            // End the slot borrow before retiring unaccepted results here, preserving actual I/O
+            // failure despite state rejection.
             let cleanup = delivered
                 .expect("未接纳分支仍持本次唯一结果")
                 .retire(false)
@@ -3838,20 +4067,22 @@ impl Drop for Producer {
         if let Some(target) = self.target.take() {
             target.request.revoke();
         }
-        // 有限未度量批与真实Reader一并归还；取消不能只清目标标志而让批次挂在后继会话。
+        // Return bounded unmeasured batches with the actual Reader; cancellation cannot clear a target
+        // flag while leaving a batch in a successor session.
         self.queued_lines = None;
         drop(self.pending_line.take());
         drop(self.pending_batch.take());
         let trial = self.trial.take();
         if let Some(mut trial) = trial {
-            // fallback 的 Drop 请求同一在途 ShapeCancellation；实际 worker 属于 Body，
-            // 关闭时断 channel 并 join，不能以取消位代替 ShapeJob 资源归还。
+            // Fallback Drop requests the same in-flight ShapeCancellation; Body owns the actual worker
+            // and disconnects/joins at close, without mistaking cancellation for actual ShapeJob
+            // resource return.
             drop(trial.fallback);
             drop(trial.result.take());
         }
         self.pending_style = None;
         self.pending_control = None;
-        drop(self.semantics.take()); // 真正取消唯一来源请求并释放Ready，不靠旧Native任务回收。
+        drop(self.semantics.take()); // Actually cancel the unique Source request and return Ready without relying on stale Native work for cleanup.
         drop(self.composer.take());
         self.vertical = None;
         drop(self.output.take());
@@ -3917,7 +4148,7 @@ impl LineMetrics {
                 budget.metadata_units -= step.metadata_units;
                 work.alignment_step(&step)?;
                 if !alignment.source_ready() {
-                    return Ok(false); // 只保原尾游标；不把尚未读到的空白或正文判成已完成宽度。
+                    return Ok(false); // Retain the original trailing cursor without treating unread whitespace/text as completed width.
                 }
             }
         }
@@ -3931,21 +4162,23 @@ impl LineMetrics {
                 .part(&self.handle, self.part)?
                 .ok_or(Error::Unsupported)?;
             budget.metadata_units -= 1;
-            budget.records -= 7; // Line认证2条、Part2条和真实Directory3条，仍沿原part交易计费。
+            budget.records -= 7; // Charge the original part transaction: two Line checks, two Part records, and three actual Directory records.
             match part.facts().kind {
                 omni_markdown_core::MarkdownComposedLinePartKind::Glyphs
                 | omni_markdown_core::MarkdownComposedLinePartKind::Tab => {
                     self.visible_end = part.facts().source_utf16.end;
                 }
                 omni_markdown_core::MarkdownComposedLinePartKind::FoldedSection => {
-                    // 原可见 glyph/TAB 末端与真实 opaque 控制共同证明 header 行末；
-                    // fold 内包含的 CR/LF 和隐藏行不能变成 EndOfLine 或行内删除的目标。
+                    // Original visible glyph/Tab end plus actual opaque control certifies the header
+                    // line end;
+                    // CR/LF and hidden lines inside folds cannot become EndOfLine or in-line deletion
+                    // targets.
                     self.folded_end = Some(self.visible_end);
                 }
                 omni_markdown_core::MarkdownComposedLinePartKind::ParagraphBreak => {}
                 omni_markdown_core::MarkdownComposedLinePartKind::TableRow => {
                     self.part += 1;
-                    continue; // 表格块已持实际完整Cell高度，不借这个目录Font生成普通文本行槽。
+                    continue; // The table block owns actual complete-cell height; its directory font cannot create an ordinary text line slot.
                 }
             }
             let authority = part.font_registration().authority()?;
@@ -3981,6 +4214,7 @@ impl LineMetrics {
         Ok(self.part == self.handle.facts().parts)
     }
 
+    // Only complete original part/alignment measurement may issue a Native line handle for painting.
     fn into_measured(self) -> Result<NativeMarkdownMeasuredLine> {
         if self.part != self.handle.facts().parts {
             return Err(ViewError::InvalidGeometry.into());
@@ -4042,7 +4276,8 @@ pub(super) fn scene_error(
         ) => ViewError::Document(cause),
         Cause::Revoked => ViewError::Revoked,
         Cause::Busy => ViewError::Busy,
-        // 本窗口的离屏/缺乏几何不是自动重试许可；只有 owner 另行排队真实工作才可 Pending。
+        // Offscreen/missing geometry grants no automatic retry; Pending requires actual work separately
+        // queued by the owner.
         Cause::Pending => ViewError::InvalidRange,
         Cause::InvalidRange => ViewError::InvalidRange,
         other => ViewError::Raster(other.to_string()),
@@ -4058,7 +4293,8 @@ mod cleanup_tests {
     };
 
     #[test]
-    /// 复合样式错误中的正文首错不能被随后清理的另一个Source错误调换；两份errno都保留。
+    /// A later cleanup Source error cannot replace the original Source failure inside a style error;
+    /// preserve both errnos.
     fn style_reset_preserves_original_source_error_priority_during_cleanup() {
         let primary = Error::Compose(Compose::StyleResetCleanup {
             cause: Box::new(Compose::Source(Document::EditStorageUnavailable(libc::EIO))),
@@ -4073,7 +4309,8 @@ mod cleanup_tests {
         else {
             panic!("两次实际错误类型不能退化为单一通用失败");
         };
-        // 这里只检验已存在错误类型的传播合同，不冒称注入了内核EIO或munmap故障。
+        // Check existing typed-error propagation only, without claiming actual kernel EIO or munmap
+        // fault injection.
         let Error::Compose(Compose::StyleResetCleanup {
             cause,
             operation,
@@ -4105,7 +4342,8 @@ mod active_line_tests {
 
     use super::source_line_range_at_head;
 
-    /// 真文件保持到断言结束；活动行测试与生产路径共用canonical mmap行树。
+    /// Retain actual files through assertions; active-line tests use the production canonical mmap line
+    /// tree.
     fn document(content: &str) -> (tempfile::NamedTempFile, MarkdownDocumentBuffer) {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(content.as_bytes()).unwrap();
@@ -4114,15 +4352,17 @@ mod active_line_tests {
     }
 
     #[test]
-    /// 原Source逻辑分行不能随双向段边界、emoji宽度或视口soft wrap改变。
+    /// Original Source logical lines do not change with Bidi boundaries, emoji width, or viewport soft
+    /// wraps.
     fn logical_line_uses_crlf_not_uba_paragraph_or_soft_wrap_boundaries() {
-        // NEL、LS、PS会影响UBA段或字形换行，但不属于原Source的CR/LF逻辑分行。
+        // NEL, LS, and PS can affect Bidi or glyph wrapping without becoming original Source CR/LF
+        // logical breaks.
         let (_file, document) = document("甲😀\r\nab\rcd\nef\u{85}gh\u{2028}ij\u{2029}kl");
         for (head, expected) in [
             (0, 0..5),
             (1, 0..5),
             (3, 0..5),
-            (4, 0..5), // CRLF内部只改变观察归属，不改变真正的head或原换行字节。
+            (4, 0..5), // CRLF-interior observation changes line ownership only, without changing actual head or original line-ending bytes.
             (5, 5..8),
             (7, 5..8),
             (8, 8..11),
@@ -4138,10 +4378,12 @@ mod active_line_tests {
     }
 
     #[test]
-    /// 跨行反向选择、真实尾空行和Undo后的新发布都使用canonical活动head。
+    /// Reverse multiline selection, actual trailing empty lines, and post-undo publications all use the
+    /// canonical active head.
     fn active_head_keeps_nonempty_reverse_selection_and_true_eof_line() {
         let (_file, mut document) = document("first\nsecond\n");
-        // 反向跨行选择仍以真实head定位；不能取有序选择的末端或只高亮空选区。
+        // Locate reverse multiline selection by its actual head, without using ordered-range end or
+        // highlighting empty selections only.
         let reverse = MarkdownTextSelection {
             anchor_utf16: 11,
             head_utf16: 2,
@@ -4154,7 +4396,8 @@ mod active_line_tests {
         assert_eq!(document.selection(), reverse);
         assert_eq!(source_line_range_at_head(&document, 12), Ok(6..13));
         assert_eq!(source_line_range_at_head(&document, 13), Ok(13..13));
-        // 实际编辑后立即沿新root取行范围；Undo回原root后末尾空行不能被旧范围覆盖。
+        // After actual editing query the new root immediately; undo to the original root must preserve
+        // its trailing empty line.
         document
             .replace_utf16_range(
                 6..12,
@@ -4171,11 +4414,13 @@ mod active_line_tests {
     }
 
     #[test]
-    /// 巨型原单行仍返回完整逻辑范围；空源只授予原EOF空行，不物化正文。
+    /// Huge original single lines return their full logical range, while empty Source grants only its
+    /// actual EOF empty line without materialized text.
     fn giant_single_line_and_empty_document_need_no_materialized_text() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         let block = [b'a'; 4096];
-        // 两MiB真实源只有一个逻辑行；测试输入也逐块落盘，不构造整段测试String。
+        // The actual two-MiB source contains one logical line; write test input in chunks without a
+        // whole-paragraph test String.
         for _ in 0..512 {
             file.write_all(&block).unwrap();
         }

@@ -1,4 +1,4 @@
-//! 多选事实、输入和删除以同一个生产owner和真实Core校验，不拿第一范围冒充全集。
+//! Check multiple-selection facts/input/deletion through the same production owner and real Core, not a first-range substitute.
 
 use super::*;
 
@@ -19,7 +19,7 @@ fn multiple_ranges_keep_complete_set_and_do_not_invent_primary_direction() {
             .set_selected_ranges(&permit, &[0..2, 6..8], &current)
             .unwrap(),
     );
-    assert_eq!(commit.state.selection, memento); // 未知主方向不能改写原Core历史memento。
+    assert_eq!(commit.state.selection, memento); // Unknown primary direction cannot rewrite Core's original history memento.
     assert_eq!(commit.state.directed_selection(), None);
     assert_eq!(commit.state.selection_range_count, 2);
     assert_eq!(commit.state.primary_range, NSRange::new(0, 2));
@@ -35,7 +35,7 @@ fn multiple_ranges_keep_complete_set_and_do_not_invent_primary_direction() {
         owner.insert_text(&permit, "X", unspecified(), &current),
         Err(NativeMarkdownPagedInputError::MultipleSelectionInput)
     ));
-    assert_eq!(text(&document), "a1 b2 c3"); // 原生产Multiple输入没有唯一替换范围，不按平台首项静默修改。
+    assert_eq!(text(&document), "a1 b2 c3"); // Multiple input has no unique replacement range; do not silently edit the platform's first item.
     assert_eq!(owner.state().unwrap(), commit.state);
 }
 
@@ -51,13 +51,15 @@ fn invalid_or_excessive_ranges_keep_original_set_and_scalar_boundaries() {
             .unwrap(),
     );
     let before = owner.state().unwrap();
+    // Validate the caller's original order/set: do not sort away errors, merge
+    // overlaps, or accept a split scalar while silently losing existing ranges.
     for ranges in [
         vec![0..1, 2..3],
         vec![3..4, 0..1],
         vec![0..3, 1..4],
         vec![0..0, 0..0],
         vec![0..1, 3..5],
-        // 这是必须拒绝的倒置输入坐标，不是尝试反向迭代一个Rust Range。
+        // These reversed input coordinates must be rejected; they are not a reverse-iteration request.
         std::iter::once(Range { start: 3, end: 1 }).collect(),
         vec![0..0; NATIVE_MARKDOWN_PAGED_SELECTION_RANGE_LIMIT + 1],
     ] {
@@ -92,6 +94,8 @@ fn full_range_budget_and_middle_only_changes_revoke_old_ticket() {
     );
     assert_eq!(commit.state.selection_range_count, 1000);
     let stale = owner.capture(1, &current).unwrap();
+    // Keep count and primary range identical, changing only an interior item.
+    // Original permits must still lose authority through the actual serial.
     ranges[500] = 1000..1000;
     let permit = owner.capture(1, &current).unwrap();
     let next = committed(
@@ -130,6 +134,8 @@ fn multiple_delete_is_one_atomic_transaction_and_keeps_unselected_middle_text() 
     );
     let before = owner.state().unwrap();
     let permit = owner.capture(1, &current).unwrap();
+    // Delete each selected span rather than its envelope. The unselected gap and
+    // complete canonical history memento are independently observable afterward.
     let commit = committed(owner.delete_selected_ranges(&permit, &current).unwrap());
     assert_eq!(text(&document), " b2 ");
     assert_eq!(commit.state.selection, MarkdownTextSelection::caret(4));
@@ -144,7 +150,7 @@ fn multiple_delete_is_one_atomic_transaction_and_keeps_unselected_middle_text() 
     assert_eq!(text(&document), "a1 b2 c3");
     assert_eq!(undo.state.selection, memento);
     assert!(!document.borrow().can_undo());
-    assert!(undo.state.selection_is_directed); // Core历史仍是明确单memento，没有伪称恢复多选集合。
+    assert!(undo.state.selection_is_directed); // Core history restores its definite single memento without claiming to restore the entire range set.
 }
 
 #[test]
@@ -158,6 +164,8 @@ fn selected_bytes_delete_skips_empty_carets_and_all_empty_is_unchanged() {
             .set_selected_ranges(&permit, &[0..0, 6..8], &current)
             .unwrap(),
     );
+    // Empty carets contribute no selected bytes; the nonempty secondary range
+    // still deletes even though the primary range is empty.
     let permit = owner.capture(1, &current).unwrap();
     let commit = committed(owner.delete_selected_ranges(&permit, &current).unwrap());
     assert_eq!(text(&document), "a1 b2 ");
@@ -207,6 +215,8 @@ fn marked_single_selection_delete_retains_old_path_and_multi_replacement_is_reje
 
 #[test]
 fn explicit_replacement_always_publishes_single_caret_and_core_memento_history() {
+    // Explicit replacement may lie inside, outside, or across the visible ranges.
+    // It replaces exactly that target and collapses selection in the same commit.
     for (replacement, expected_text, caret) in [
         (NSRange::new(3, 2), "a1 Z c3", 4),
         (NSRange::new(2, 0), "a1Z b2 c3", 3),
@@ -271,6 +281,8 @@ fn unspecified_marked_input_preserves_multiple_and_explicit_candidate_releases_r
     assert_eq!(owner.state().unwrap(), before);
     assert_eq!(text(&document), "a1 b2 c3");
     let permit = owner.capture(1, &current).unwrap();
+    // A later explicit candidate is a separate request. Its actual publication
+    // collapses multiple ranges and drops their old bounded metadata allocation.
     let commit = owner
         .set_marked_text(
             &permit,

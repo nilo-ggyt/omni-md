@@ -1,4 +1,5 @@
-//! 只观察原Foundation业务值的实际Weak；不复制字符，也不把标准fragment壳当释放收据。
+//! Observes actual weak identities of original Foundation values without copying their characters.
+//! A standard fragment shell is not proof that its document-bearing values were released.
 
 use super::*;
 use objc2_app_kit::{
@@ -13,6 +14,8 @@ fn checked<T>(
     current: &(impl Fn() -> bool + ?Sized),
     work: impl FnOnce() -> T,
 ) -> Result<T, String> {
+    // Observation getters and ledger admission may reenter. Neither can advance to another value
+    // after the original paint's source/geometry authority has been revoked.
     if !current() {
         return Err("业务值观察前原光栅票已撤销".into());
     }
@@ -31,23 +34,26 @@ fn capture_attributed(
     current: &(impl Fn() -> bool + ?Sized),
 ) -> Result<(), String> {
     if units == 0 {
-        return Ok(()); // 真实空值不是业务正文；不能把共享空常量包装成非空数据释放证据。
+        return Ok(()); // A real empty value carries no body data; shared empty constants cannot prove its release.
     }
     let string = checked(current, || attributed.string())?;
     if checked(current, || string.length())? != units {
         return Err("实际attributedString与其原string长度不一致".into());
     }
-    // 原attributed对象仍完整进入同一owned预算与actual-dealloc门禁，不因其正文只有一个unit放宽。
+    // Record the original attributed value under the same owned budget and actual-deallocation gate,
+    // including one-unit values; small content size does not exempt a retained business value.
     checked(current, || ledger.include(roles.0, attributed))??;
     let borrowed_literal = checked(current, || {
         ledger.observe_preexisting_literal_string(roles.1, &string, units, current)
     })??;
     if !borrowed_literal {
-        // 只有文档打开前已归还强claim、且仍为同一原Weak身份的固定LF才是借用值。
-        // 不按类、tag位、文本相等或事后“缓存”解释放过任何其他String/Frozen/自建对象。
+        // Only the known LF literal, observed weakly before opening the document and after returning
+        // its strong claim, may be borrowed. Class, tagging, equal text, or a later cache explanation
+        // cannot exempt another NSString, frozen value, or project-created object from the ledger.
         checked(current, || ledger.include(roles.1, &string))??;
-    } // 借用已有明确来源与标量观察记录；不制造该预存原值的“已析构”收据。
-    drop(string); // 原 attributed/string 的 Weak 仍归唯一账本；这里只结束本次 getter 的强 claim。
+    } // A borrowed literal has explicit provenance, not a fabricated deallocation receipt.
+    // The unique ledger keeps only weak observations; return this getter's temporary strong claim.
+    drop(string);
     if !current() {
         return Err("归还原业务字符串临时值后光栅票已撤销".into());
     }
@@ -55,6 +61,8 @@ fn capture_attributed(
 }
 
 pub(super) struct ParagraphObservation {
+    // Hold only the framework's original attributed value during this synchronous observation.
+    // This reference route does not make paragraph getters evidence of strict paged-body laziness.
     units: usize,
     value: Retained<NSAttributedString>,
 }
@@ -64,6 +72,8 @@ pub(super) fn capture_paragraph(
     fragment: &NSTextLayoutFragment,
     current: &(impl Fn() -> bool + ?Sized),
 ) -> Result<ParagraphObservation, String> {
+    // Observe the actual fragment's paragraph rather than a reconstructed string or substituted value.
+    // A non-paragraph element cannot silently count as complete business-value coverage.
     let element = checked(current, || fragment.textElement())?
         .ok_or("标准fragment缺少原text element，业务覆盖不完整")?;
     let paragraph = checked(current, || element.downcast_ref::<NSTextParagraph>())?
@@ -90,7 +100,7 @@ pub(super) fn capture_paragraph(
     })
 }
 
-/// 仅借用同一次原Authority已有的图与element范围；没有第二个持久正文或布局owner。
+/// Borrows the same Authority's content/layout graph, without another persistent document or layout owner.
 pub(super) struct VisibleLineObservation<'a> {
     pub(super) content: &'a NSTextContentManager,
     pub(super) manager: &'a NSTextLayoutManager,
@@ -117,6 +127,7 @@ pub(super) fn capture_visible_lines(
         return Err("观察可见line时原视口坐标无效".into());
     }
     let source = checked(current, || fragment.rangeInElement())?;
+    // Relate the original paragraph length to its exact provider range before selecting visible lines.
     let source_start = checked(current, || source.location())?;
     let end_location = checked(current, || source.endLocation())?;
     let provider: &ProtocolObject<dyn NSTextElementProvider> = ProtocolObject::from_ref(content);
@@ -125,8 +136,8 @@ pub(super) fn capture_visible_lines(
     })?;
     let empty = checked(current, || source.isEmpty())?;
     if span == 0 && empty && paragraph_units == 0 {
-        // 只有真实canonical空范围、实际paragraph与它自己的string都确为空，才没有行业务值。
-        // 不能只看range空，也不能用某个共享空值替换原来的不可变业务值。
+        // Only an actual empty canonical range, paragraph, and that paragraph's own string prove
+        // absence of line data. An empty range alone or a substituted shared empty value does not.
         let actual_empty_string = checked(current, || paragraph.value.string())?;
         if checked(current, || actual_empty_string.length())? != 0 {
             return Err("原空paragraph的实际string仍含业务值".into());
@@ -146,14 +157,16 @@ pub(super) fn capture_visible_lines(
     if empty || span <= 0 || usize::try_from(span).ok() != Some(paragraph_units) {
         return Err("标准fragment范围与实际非空paragraph长度不一致".into());
     }
-    // endLocation是边界，不保证可作为字符位置；只读原已观察string尾部最多两个UTF16单元，
-    // 用实际surrogate关系选最后完整scalar的起点，不复制段落、不把low surrogate当独立字符。
+    // endLocation is a boundary, not necessarily a character position. Read at most two UTF-16
+    // units from the already observed original string to locate its last whole scalar; never
+    // copy the paragraph or treat a low surrogate as a standalone character.
     let string = checked(current, || paragraph.value.string())?;
     if checked(current, || string.length())? != paragraph_units {
         return Err("原paragraph string在末行定位时长度变化".into());
     }
     let final_unit = checked(current, || string.characterAtIndex(paragraph_units - 1))?;
     let scalar_units: isize = if (0xdc00..=0xdfff).contains(&final_unit) {
+        // A trailing low surrogate requires its actual preceding high surrogate from this same value.
         if paragraph_units < 2 {
             return Err("原paragraph末尾包含孤立low surrogate".into());
         }
@@ -182,6 +195,8 @@ pub(super) fn capture_visible_lines(
         provider.locationFromLocation_withOffset(&last_location, scalar_units)
     })?
     .ok_or("最后完整scalar不能roundtrip至原endLocation")?;
+    // Authenticate the inside position through signed offsets, ordering, and a round-trip to EOF.
+    // This avoids using an adjacent fragment's line merely because it shares an endpoint boundary.
     if before_end != scalar_units
         || from_start != span - scalar_units
         || from_start < 0
@@ -205,12 +220,14 @@ pub(super) fn capture_visible_lines(
     {
         return Err("末行inside位置不属于同一原manager和fragment".into());
     }
-    // inside位置使用downstream affinity，归属包含该实际scalar的line；不在end边界上请求上游。
+    // Downstream affinity at the inside position chooses the line containing that actual scalar,
+    // instead of requesting upstream affinity at the ambiguous end boundary.
     let last = checked(current, || {
         fragment.textLineFragmentForTextLocation_isUpstreamAffinity(&last_location, false)
     })?;
     if last.is_none() && LAST_LOOKUP_DIAGNOSTICS.fetch_add(1, Ordering::AcqRel) < 8 {
-        // 只在原失败点补已有对象的标量；不更换末行票、不读取行数组或正文。
+        // At this failure site, collect only existing object scalars. Do not replace the last-line
+        // permit, read the complete line array, or materialize document text to improve diagnostics.
         let provider: &ProtocolObject<dyn NSTextElementProvider> =
             ProtocolObject::from_ref(content);
         let document = checked(current, || provider.documentRange())?;
@@ -262,7 +279,8 @@ pub(super) fn capture_visible_lines(
     }
     let last = last.ok_or("标准fragment缺少可证明的末行身份")?;
     let mut cursor = top;
-    // 只用macOS14公开逐行查询；不取textLineFragments数组，巨段落的离屏line不产生镜像。
+    // Use macOS 14's public per-line lookup. Do not obtain textLineFragments or mirror the offscreen
+    // lines of a giant paragraph; the fixed observation budget bounds this synchronous scan.
     for _ in 0..MAX_VISIBLE_LINE_OBSERVATIONS {
         let line = checked(current, || {
             fragment.textLineFragmentForVerticalOffset_requiresExactMatch(cursor, false)
@@ -275,6 +293,7 @@ pub(super) fn capture_visible_lines(
         }
         let attributed = checked(current, || line.attributedString())?;
         let units = checked(current, || attributed.length())?;
+        // The framework's original line range must fit its actual attributed value before observation.
         range
             .location
             .checked_add(range.length)
@@ -288,8 +307,9 @@ pub(super) fn capture_visible_lines(
             current,
         )?;
         let next = bounds.origin.y + bounds.size.height;
-        // 只有实际末行同一身份才能证明尾部没有后继line；每行string可能是独立子串，长度不能代替身份。
-        // 其余情况必须在真实几何上严格前进，不能重复同一line伪造覆盖。
+        // Only the actual last-line identity proves no successor exists. A line string can be an
+        // independent substring, so its length cannot replace identity. Otherwise require strict
+        // progress through actual geometry instead of counting the same line as fresh coverage.
         let complete = std::ptr::eq::<objc2_app_kit::NSTextLineFragment>(&*line, &*last)
             || bounds.origin.y >= bottom
             || next >= bottom;
@@ -304,7 +324,8 @@ pub(super) fn capture_visible_lines(
         if !next.is_finite() || next <= cursor {
             return Err("实际可见line未严格前进，业务覆盖不完整".into());
         }
-        cursor = next.next_up(); // 跨到真实下一行边界，不重复领取同一行的边界坐标。
+        // Cross the real next-line boundary so a repeated boundary lookup cannot return the same line.
+        cursor = next.next_up();
     }
     Err("可见line业务值观察超过固定预算".into())
 }

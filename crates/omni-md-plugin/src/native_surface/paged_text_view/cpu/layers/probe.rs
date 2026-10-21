@@ -1,4 +1,5 @@
-//! 主线程显式slot负控：同帧遮罩与半透明彩色、真实renderer、后继关系及实际mmap释放。
+//! Main-thread gated slot controls cover same-frame masks/translucent colors, actual rendering,
+//! successor relationships, and real mapping release.
 
 use super::*;
 use crate::native_surface::viewport_pixels::PixelPresentation;
@@ -16,7 +17,7 @@ mod paired;
 mod regions;
 mod resize;
 
-/// 固定小型对照图，不保存文稿；context先于原像素Vec归还。
+/// A fixed small comparison bitmap owns no document; its context drops before its backing pixel vector.
 struct Canvas {
     context: CFRetained<CGContext>,
     pixels: Vec<u8>,
@@ -31,7 +32,7 @@ impl Canvas {
     fn sized(width: usize, height: usize) -> Result<Self> {
         if width == 0 || height == 0 || width > WIDTH || height > 512 {
             return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
-        } // 仅供本固定小型图像控制，拒绝将辅助Canvas变为任意尺寸整帧分配入口。
+        } // Keep this Canvas limited to small image controls rather than an arbitrary full-frame allocation API.
         let row_bytes = width
             .checked_mul(4)
             .and_then(|row| row.checked_add(15))
@@ -41,11 +42,14 @@ impl Canvas {
             .checked_mul(height)
             .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
         let mut pixels = vec![0; length];
-        // SAFETY: 静态sRGB常量由系统提供；本控制不更改gamma或默认颜色空间。
+        // SAFETY: The system supplies the static sRGB constant; this control changes neither gamma nor
+        // default color space.
         let space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))
             .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
-        // SAFETY: 固定Vec覆盖真实对齐row_bytes*height，context存活期不resize；
-        // 字段顺序保证先释放context。原1024宽度stride不变，513宽度另有显式padding。
+        // SAFETY: The fixed vector covers aligned row_bytes*height and never resizes while its context
+        // lives;
+        // field order releases context first. Width 1024 retains its stride, and width 513 has explicit
+        // padding.
         let context = unsafe {
             CGBitmapContextCreate(
                 pixels.as_mut_ptr().cast(),
@@ -90,7 +94,7 @@ fn fixture(source: &mut Canvas, counters: Arc<NativeMarkdownViewportPixels>) -> 
                 let gray = ((x + y) & 255) as u8;
                 pixel.copy_from_slice(&[gray, gray, gray, 255]);
             } else {
-                pixel.copy_from_slice(&[128, 0, 0, 128]); // 真半透明彩色，不能被局部白底遮罩资格覆盖。
+                pixel.copy_from_slice(&[128, 0, 0, 128]); // Actual translucent color cannot be covered by local white-background mask qualification.
             }
         }
     }
@@ -104,14 +108,15 @@ fn fixture(source: &mut Canvas, counters: Arc<NativeMarkdownViewportPixels>) -> 
             return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
         }
         for y in 0..tile.height {
-            // SAFETY: 唯一WritableTile实际context覆盖有限stride*height；只写公开width像素，不跨借用或Native回调。
+            // SAFETY: The unique WritableTile context covers bounded stride*height; write active width
+            // only, without borrowed data across Native calls.
             let target = unsafe {
                 std::slice::from_raw_parts_mut(data.cast::<u8>().add(y * row), tile.width * 4)
             };
             let offset = ((tile.y + y) * WIDTH + tile.x) * 4;
             target.copy_from_slice(&source.pixels[offset..offset + tile.width * 4]);
         }
-        bitmap.finish_tile(writable, None)?; // 真实最后context callback之后由生产封存器签发表示。
+        bitmap.finish_tile(writable, None)?; // The production sealer certifies presentation only after the actual final-context callback.
     }
     let frame = bitmap.finish()?;
     if frame.tiles.len() != 2
@@ -123,7 +128,8 @@ fn fixture(source: &mut Canvas, counters: Arc<NativeMarkdownViewportPixels>) -> 
     Ok(frame)
 }
 
-/// 所有异常都先实际detach并记录资源，再返回失败；不提前panic跳过清理。
+/// Actually detach and report resources before returning controlled failures, without an early panic
+/// bypassing cleanup.
 pub(in crate::native_surface::paged_text_view) fn run(_mtm: MainThreadMarker) -> Result<()> {
     resize::run()?;
     for mutation in [
@@ -163,7 +169,7 @@ pub(in crate::native_surface::paged_text_view) fn run(_mtm: MainThreadMarker) ->
             {
                 Ok(publication) => publication,
                 Err(error) => {
-                    pool.detach(&backing); // 发布失败也先归还已建候选，不能靠测试提前返回跳过真实清理。
+                    pool.detach(&backing); // Publication failure returns the constructed candidate before exiting the control, preserving actual cleanup.
                     return Err(error);
                 }
             };
@@ -178,12 +184,14 @@ pub(in crate::native_surface::paged_text_view) fn run(_mtm: MainThreadMarker) ->
                 match mutation {
                     Mutation::None => {}
                     Mutation::Mask => {
-                        // SAFETY: 独立外方owner真实替换mask，原清理不能清这条后继关系。
+                        // SAFETY: An independent control owner actually replaces the mask; original
+                        // cleanup must preserve that successor relationship.
                         unsafe { foreground.setMask(Some(&successor)) };
                     }
                     Mutation::Color => container.setBackgroundColor(Some(&foreign_color)),
                     Mutation::Contents => {
-                        // SAFETY: 独立已保活的真实RGBA参考图，后继contents不是原mask provider。
+                        // SAFETY: The retained actual RGBA reference is independent; replacement
+                        // contents are not the original mask provider.
                         unsafe {
                             mask.setContents(Some(
                                 &*std::ptr::from_ref(&*reference).cast::<AnyObject>(),
@@ -191,16 +199,17 @@ pub(in crate::native_surface::paged_text_view) fn run(_mtm: MainThreadMarker) ->
                         };
                     }
                     Mutation::Format => {
-                        // SAFETY: 公开静态常量把原单通道mask真实改回RGBA；必须据实际值撤权。
+                        // SAFETY: A public static constant actually changes the original single-channel
+                        // mask to RGBA; revoke based on that actual format.
                         unsafe {
                             mask.setContentsFormat(objc2_quartz_core::kCAContentsFormatRGBA8Uint)
                         };
                     }
                     Mutation::ReparentAttempt => {
-                        successor.addSublayer(pool.mount()); // 真实完整mount已经提交后才迁给外方。
+                        successor.addSublayer(pool.mount()); // Transfer the complete mount only after actual publication.
                         if !pool.revoke_attempt(&attempt, &backing) {
                             return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
-                        } // 原serial仍同actual attempt，必须清自身业务图片而保外方parent。
+                        } // The original serial still belongs to this actual attempt; return owned business images while preserving the external parent.
                     }
                 }
                 let rejected = if matches!(mutation, Mutation::None) {
@@ -228,7 +237,8 @@ pub(in crate::native_surface::paged_text_view) fn run(_mtm: MainThreadMarker) ->
                     .as_deref()
                     .is_some_and(|actual| std::ptr::eq::<CGColor>(actual, &*foreign_color)),
                 Mutation::Contents => {
-                    // SAFETY: 只比较opaque身份，不能因原owner清理成功就略过后继contents核验。
+                    // SAFETY: Compare opaque identity only; successful original cleanup cannot skip
+                    // successor-contents verification.
                     unsafe { mask.contents() }.as_deref().is_some_and(|actual| {
                         std::ptr::eq(
                             std::ptr::from_ref(actual).cast::<()>(),
@@ -251,15 +261,17 @@ pub(in crate::native_surface::paged_text_view) fn run(_mtm: MainThreadMarker) ->
             } else {
                 detached
             };
-            drop(frame); // 先归还测试自身的原frame强边；外方仍持mount，必须已不再保原业务像素。
+            drop(frame); // Return the control original frame claim first; the external owner retains mount but must retain no original business pixels.
             CATransaction::flush();
             let reparent_pixels =
                 !matches!(mutation, Mutation::ReparentAttempt) || observer.is_released();
             println!(
                 "paged_mask_slots mutation={mutation:?} foreign_parent_still_held={successor_preserved} original_pixels_released_before_foreign_owner_drop={reparent_pixels} formal=false"
             );
-            // 外方在核验后自行归还自己的内容；不是把这一步算入被测旧owner清理。
-            // SAFETY: 本控制外方正持活这三个真实角色，None仅归还它自己安装的后继mask/contents。
+            // After verification, the external owner returns its own contents; this is not cleanup
+            // performed by the old owner under test.
+            // SAFETY: The control retains these actual roles; None returns only the successor
+            // mask/contents it installed itself.
             unsafe {
                 foreground.setMask(None);
                 mask.setContents(None);

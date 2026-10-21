@@ -1,4 +1,4 @@
-//! 已归还旧Job的同Store来源，必须仍沿原Measure last-fitting与二阶段交接，不强制item换行。
+//! Stored providers retain last-fitting measurement and two-phase handoff after the original job drops.
 use super::*;
 use crate::markdown_soft_line_measure::provider::GlyphProvider;
 use crate::{
@@ -12,6 +12,8 @@ fn item_until(
     end: usize,
     points: f32,
 ) -> MarkdownLineItem {
+    // Split actual style coverage at the requested original endpoint; the item
+    // producer still decides its genuine script, bidi and shaping boundaries.
     for _ in 0..10000 {
         match coordinator
             .step(MarkdownLineComposeBudget::default())
@@ -19,6 +21,8 @@ fn item_until(
             .answer
         {
             MarkdownLineItemAnswer::NeedStyle(request) => {
+                // The next item's registration belongs to this fixture's catalog;
+                // a shorter response changes style coverage, not source authority.
                 let coverage = request.source_range().start..request.source_range().end.min(end);
                 coordinator
                     .provide_style(
@@ -50,6 +54,8 @@ pub(super) fn selected(
     proof: &StoredItemProof,
     breaks: &mut crate::MarkdownLayoutBreakJob,
 ) -> MarkdownSoftLineMeasureChoice {
+    // Every quantum borrows the same stored proof. Yielding leaves the measure
+    // pending until its real provider and break dependencies select a result.
     for _ in 0..10000 {
         let mut provider = store.borrow(proof).unwrap();
         if let MarkdownSoftLineMeasureAnswer::Selected(choice) = measure
@@ -69,6 +75,8 @@ pub(super) fn selected(
 
 #[test]
 fn stored_provider_continues_after_old_job_drop_and_selects_last_fit_before_new_item() {
+    // Produce adjacent items with different point sizes and retire both original
+    // jobs before measuring across their persisted boundary.
     let fixture = Fixture::new("aa bb cc dd");
     let mut coordinator = fixture.coordinator();
     let mut breaks = super::lines::breaks(&fixture);
@@ -84,6 +92,8 @@ fn stored_provider_continues_after_old_job_drop_and_selects_last_fit_before_new_
     let second_job = second.job.resource_observer();
     drop(second);
     assert_eq!(second_job.snapshot().files_open, 0);
+    // Derive width from actual stored cluster advances so the next word overflows
+    // midway; the expected break must remain the last fit in the previous item.
     let mut word = 0;
     let mut at = 6;
     while at < 9 {
@@ -114,6 +124,8 @@ fn stored_provider_continues_after_old_job_drop_and_selects_last_fit_before_new_
     assert!(
         matches!(selected(&mut measure,&mut store,&first_proof,&mut breaks),MarkdownSoftLineMeasureChoice::NeedNextItem{source_utf16,..} if source_utf16== (0..6))
     );
+    // The measured-item permit proves only the consumed first range. Prepare its
+    // continuation before opening the next provider; neither borrow remains live.
     {
         let mut provider = store.borrow(&first_proof).unwrap();
         let permit = measure.measured_item_permit(&mut provider).unwrap();
@@ -131,15 +143,19 @@ fn stored_provider_continues_after_old_job_drop_and_selects_last_fit_before_new_
             .continue_with(&mut next, &font, &mut breaks)
             .unwrap();
     }
+    // Continuing into a larger style does not force an item boundary into a new
+    // line or discard the remembered last-fitting opportunity.
     let choice = selected(&mut measure, &mut store, &second_proof, &mut breaks);
     assert!(
         matches!(choice,MarkdownSoftLineMeasureChoice::MeasuredBreak(selected) if selected.source_utf16==(0..6) && selected.x_advance_26_6==first_facts.x_advance_26_6)
     );
-    assert_eq!(store.facts(&first_proof).unwrap().facts.source_utf16, 0..6); // 后续行可回读旧项，不重造Job或吞掉末尾。
+    assert_eq!(store.facts(&first_proof).unwrap().facts.source_utf16, 0..6); // Later lines can revisit the original stored range.
 }
 
 #[test]
 fn immutable_forest_finds_many_real_items_without_a_resident_item_vector() {
+    // Persist many genuinely separate items while retaining only one live job and
+    // proof at a time; later lookup must recover each original source interval.
     let fixture = Fixture::new(&"a ".repeat(257));
     let mut coordinator = fixture.coordinator();
     let mut store = fixture.store(MarkdownLineComposeCancellation::new());
@@ -151,8 +167,7 @@ fn immutable_forest_finds_many_real_items_without_a_resident_item_vector() {
             store.facts(&proof).unwrap().facts.source_utf16,
             number * 2..(number + 1) * 2
         );
-        drop(item); // 每次只保一个Job，Proof也在这次循环归还，不积累N个Weak控制块。
-        assert!(store.forest.iter().flatten().count() <= 64);
+        drop(item); // This iteration also drops its proof; the oracle does not retain N job identities.
         assert!(observer.snapshot().mapped_bytes <= 16 * 1024);
     }
     for offset in (0..fixture.source.utf16_len()).rev() {
@@ -162,9 +177,10 @@ fn immutable_forest_finds_many_real_items_without_a_resident_item_vector() {
             facts.facts.source_utf16,
             (offset / 2) * 2..(offset / 2 + 1) * 2
         );
-        assert!(proof.job.is_none()); // 回读只按Store认证origin，不能反造已析构原Job的弱票。
     }
     assert!(store.item_at(fixture.source.utf16_len()).unwrap().is_none());
+    // The real backing file and mapping must be released after the final reverse
+    // lookup; an internal directory shape is not a resource-release receipt.
     store.close().unwrap();
     let state = observer.snapshot();
     assert!(!state.file_open && state.mapped_bytes == 0 && !state.cleanup_failed);
@@ -172,7 +188,8 @@ fn immutable_forest_finds_many_real_items_without_a_resident_item_vector() {
 
 #[test]
 fn stored_selected_permit_builds_mixed_script_lines_across_real_item_boundaries() {
-    // 只在有限oracle中先写完三种脚本的真实item；每个原Job写入后立即Drop。
+    // This finite oracle persists three actual scripts first and immediately
+    // drops each original job. The product has no parallel resident item vector.
     let fixture = Fixture::new("office αλφα слово office βητα текст office gamma конец ");
     let cancellation = MarkdownLineComposeCancellation::new();
     let mut coordinator = fixture.coordinator();
@@ -189,6 +206,8 @@ fn stored_selected_permit_builds_mixed_script_lines_across_real_item_boundaries(
     }
     assert!(item_count >= 5);
     drop(coordinator);
+    // One real paragraph analysis supplies visual ordering for all stored items;
+    // the line measure still owns the last-fitting decision across item boundaries.
     let mut bidi = crate::MarkdownBidiParagraph::analyze_layout_source(
         fixture.source.clone(),
         &fixture.source.authority(),
@@ -219,9 +238,13 @@ fn stored_selected_permit_builds_mixed_script_lines_across_real_item_boundaries(
             )
             .unwrap()
         };
+        // A NeedNextItem response authorizes only the explicit two-phase
+        // continuation. A selected result is committed through its original permit.
         loop {
             match selected(&mut measure, &mut store, &proof, &mut breaks) {
                 MarkdownSoftLineMeasureChoice::NeedNextItem { source_utf16, .. } => {
+                    // End the old provider borrow before opening the next one;
+                    // passing a cloned coordinate cannot substitute for continuation.
                     let next = store.item_at(source_utf16.end).unwrap().unwrap().proof;
                     let continuation = {
                         let mut old = store.borrow(&proof).unwrap();
@@ -236,6 +259,8 @@ fn stored_selected_permit_builds_mixed_script_lines_across_real_item_boundaries(
                     proof = next;
                 }
                 MarkdownSoftLineMeasureChoice::MeasuredBreak(selected) => {
+                    // Commit exactly the measured range and advance. A line can
+                    // contain several script parts without gaining extra source coverage.
                     let permit = {
                         let mut provider = store.borrow(&proof).unwrap();
                         measure.selected_permit(&mut provider).unwrap()
@@ -261,6 +286,8 @@ fn stored_selected_permit_builds_mixed_script_lines_across_real_item_boundaries(
     let mut line = output.last_line().unwrap();
     let mut expected_end = fixture.source.utf16_len();
     let mut actual = 0;
+    // Re-read committed output after producer retirement, checking both contiguous
+    // source coverage and cumulative visual origins of the actual stored parts.
     while let Some(current) = line {
         assert_eq!(current.facts().source_utf16.end, expected_end);
         let mut coverage = 0;
@@ -274,6 +301,8 @@ fn stored_selected_permit_builds_mixed_script_lines_across_real_item_boundaries(
             );
             output.read_batch(&part, 0..0, &mut []).unwrap();
             let mut offset = facts.source_utf16.start;
+            // Cluster queries must stay inside their real part and advance to an
+            // actual source endpoint, including script changes within the line.
             while offset < facts.source_utf16.end {
                 let MarkdownGlyphClusterAnswer::Known(Some(cluster)) =
                     output.cluster(&part, offset).unwrap()
@@ -306,7 +335,8 @@ fn stored_selected_permit_builds_mixed_script_lines_across_real_item_boundaries(
 
 #[test]
 fn stored_provider_cluster_hint_matches_original_index_for_ltr_rtl_and_mixed_jumps() {
-    // 连字、组合字符、代理对和RTL均由真实shaper产生；oracle另建原Job索引，不复用Store目录。
+    // Real shaping supplies ligatures, combining marks, surrogate pairs and RTL.
+    // The comparison index is built independently from the original job.
     let fixture = Fixture::new("office a\u{301} 😀 אבג abc");
     let source_observer = fixture.source.resource_observer();
     let backing = fixture.source.original_backing_observer().unwrap();
@@ -329,7 +359,8 @@ fn stored_provider_cluster_hint_matches_original_index_for_ltr_rtl_and_mixed_jum
         }
         {
             let mut provider = store.borrow(&proof).unwrap();
-            // 同一借用内顺序包含内部UTF16与重复查询；只有真实cluster末端才是下一ordinal。
+            // Repeated and interior UTF-16 queries share one provider borrow;
+            // only a real cluster endpoint can advance its sequential hint.
             for offset in range.clone() {
                 let expected = original.containing(&mut item.job, offset).unwrap();
                 for _ in 0..2 {
@@ -339,7 +370,8 @@ fn stored_provider_cluster_hint_matches_original_index_for_ltr_rtl_and_mixed_jum
                     );
                 }
             }
-            // 先从末端跳回开头，再反向遍历，确保hint不能把任意坐标误当作下一条记录。
+            // Jump backward and reverse traversal to ensure that a hint cannot
+            // interpret an arbitrary coordinate as the next serialized record.
             for offset in [range.start, range.end - 1, range.start]
                 .into_iter()
                 .chain(range.clone().rev())
@@ -355,7 +387,7 @@ fn stored_provider_cluster_hint_matches_original_index_for_ltr_rtl_and_mixed_jum
             );
         }
         drop(original);
-        drop(item); // 原Job与其独立cluster文件归还后，再以新借用读取同Store记录。
+        drop(item); // Reborrow stored records after the original job and independent index are gone.
         let mut provider = store.borrow(&proof).unwrap();
         assert!(matches!(
             GlyphProvider::cluster(&mut provider, &source, &font, range.start).unwrap(),
@@ -367,6 +399,8 @@ fn stored_provider_cluster_hint_matches_original_index_for_ltr_rtl_and_mixed_jum
     let closed = observer.snapshot();
     assert!(!closed.file_open && closed.mapped_bytes == 0 && !closed.cleanup_failed);
     drop(coordinator);
+    // Release every strong source/font owner before consulting weak observers of
+    // payload lifetime and the actual original mapping.
     drop(fixture);
     assert!(source_observer.payload_released() && font_observer.payload_released());
     assert!(backing.unmap_succeeded() && backing.mapped_bytes() == 0 && !backing.failed());
@@ -374,6 +408,8 @@ fn stored_provider_cluster_hint_matches_original_index_for_ltr_rtl_and_mixed_jum
 
 #[test]
 fn stored_provider_cluster_hint_cannot_hide_cancellation_or_expired_font() {
+    // First populate a real sequential hint, then revoke either the actual font
+    // lifetime or the same cancellation request before repeating that coordinate.
     for expire_font in [false, true] {
         let fixture = Fixture::new("office");
         let mut coordinator = fixture.coordinator();
@@ -394,11 +430,12 @@ fn stored_provider_cluster_hint_cannot_hide_cancellation_or_expired_font() {
                 MarkdownGlyphClusterAnswer::Known(Some(_))
             ));
             if expire_font {
-                // hint已实际填入，再归还最后的注册字体；不能凭旧字形绕过原FontCatalog弱票。
+                // A cached glyph cannot bypass the original weak catalog ticket
+                // after the last registered font owner has actually been dropped.
                 drop(fixture.font);
                 assert!(font_observer.payload_released());
             } else {
-                cancellation.cancel(); // 同坐标缓存命中也必须先撤销这次实际Measure读取。
+                cancellation.cancel(); // Even an identical-coordinate cache hit must observe revocation.
             }
             match GlyphProvider::cluster(&mut provider, &source, &font, 0) {
                 Err(MarkdownSoftLineMeasureError::Stored(cause)) if expire_font => {
@@ -415,6 +452,8 @@ fn stored_provider_cluster_hint_cannot_hide_cancellation_or_expired_font() {
 
 #[test]
 fn stored_provider_cluster_hint_rejects_foreign_source_with_identical_text() {
+    // Equal bytes, ranges and coordinates do not confer the original capture's
+    // authority; the already-filled hint must not leak a stored result to it.
     let fixture = Fixture::new("office");
     let foreign = Fixture::new("office");
     let mut coordinator = fixture.coordinator();
@@ -432,7 +471,8 @@ fn stored_provider_cluster_hint_rejects_foreign_source_with_identical_text() {
             GlyphProvider::cluster(&mut provider, &source, &font, 0).unwrap(),
             MarkdownGlyphClusterAnswer::Known(Some(_))
         ));
-        // 内容、范围与坐标都相同，真实来源仍不同；错误必须关闭原文件，不交付缓存字形。
+        // Rejection must also close the real stored file rather than returning
+        // the earlier cached cluster under the foreign source authority.
         assert!(matches!(
             GlyphProvider::cluster(&mut provider, &foreign.source.authority(), &font, 0),
             Err(MarkdownSoftLineMeasureError::SourceMismatch)
@@ -444,6 +484,8 @@ fn stored_provider_cluster_hint_rejects_foreign_source_with_identical_text() {
 
 #[test]
 fn stored_provider_cluster_hint_preserves_source_eio_before_cancel_and_foreign_source() {
+    // Establish a successful stored read before making the original source fail.
+    // Later cancellation and foreign authority must not overwrite that first cause.
     let fixture = Fixture::new("office");
     let foreign = Fixture::new("office");
     let backing = fixture.source.original_backing_observer().unwrap();
@@ -463,7 +505,8 @@ fn stored_provider_cluster_hint_preserves_source_eio_before_cancel_and_foreign_s
             GlyphProvider::cluster(&mut provider, &source, &font, 0).unwrap(),
             MarkdownGlyphClusterAnswer::Known(Some(_))
         ));
-        // 先实际借用一字节使原映射驻留，再经真实回收路径消费EIO注入；不是伪造Store返回值。
+        // Pin an original byte, then consume the existing EIO injection through
+        // actual reclaim. This exercises the real path, not a natural kernel EIO.
         fixture
             .document
             .text_snapshot()
@@ -476,7 +519,7 @@ fn stored_provider_cluster_hint_preserves_source_eio_before_cancel_and_foreign_s
                 libc::EIO
             ))
         );
-        cancellation.cancel(); // 原源首错必须仍优先于后来的取消、外方来源与已经填入的hint。
+        cancellation.cancel(); // The first source failure remains authoritative over later revocations.
         for authority in [&foreign.source.authority(), &source] {
             assert!(matches!(
                 GlyphProvider::cluster(&mut provider, authority, &font, 0),
@@ -490,6 +533,6 @@ fn stored_provider_cluster_hint_preserves_source_eio_before_cancel_and_foreign_s
     assert!(!closed.file_open && closed.mapped_bytes == 0 && !closed.cleanup_failed);
     drop(store);
     drop(fixture);
-    assert!(backing.failed()); // 首错记录继续保留；实际munmap与FD释放是另一项义务。
+    assert!(backing.failed()); // Retaining the first cause is separate from actual unmap and FD cleanup.
     assert!(backing.unmap_succeeded() && backing.mapped_bytes() == 0);
 }

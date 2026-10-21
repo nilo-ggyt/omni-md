@@ -1,20 +1,21 @@
-//! 与view/fold同生灭的有限选择事实；不持正文、Native对象或异步执行权限。
+//! Finite selection facts share the view/fold lifetime, owning no body text, native objects or asynchronous execution authority.
 
 use super::MarkdownTextSelection;
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use super::NSRange;
 use std::cell::Cell;
 
-/// 原L1/L2光标所属的真实level与逻辑字素侧；不表示soft-wrap换行侧或屏幕左右。
+/// Bind the original L1/L2 caret to its real bidi level and logical grapheme side,
+/// independently of soft-wrap affinity and visual screen direction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg(feature = "native-paged-production")]
 pub struct NativeMarkdownBidiCaretSide {
     pub level: u8,
-    /// true绑定位置后的字素，false绑定位置前的字素。
+    /// True binds the following logical grapheme; false binds the preceding one.
     pub logical_after: bool,
 }
 
-/// 连续垂直移动的目标列；两个横坐标分别属于行片段和container，不能互换。
+/// Preserve a target column across vertical moves; line-fragment and container coordinates are not interchangeable.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NativeMarkdownVerticalGoal {
     pub(super) line_offset: f64,
@@ -24,8 +25,8 @@ pub struct NativeMarkdownVerticalGoal {
 }
 
 impl NativeMarkdownVerticalGoal {
-    /// 只接收原布局实际caret给出的有限坐标；调用方另外核同Source、宽度和布局代次。
-    /// geometry_epoch属于原排版坐标系，不能用随滚动改变的View事件代次冒充。
+    /// Accept finite coordinates from the original layout's actual caret. The caller separately
+    /// matches source, width and layout generation; a scrolling view-event epoch is not a layout epoch.
     #[must_use]
     pub fn new(
         line_offset: f64,
@@ -34,7 +35,7 @@ impl NativeMarkdownVerticalGoal {
         geometry_epoch: u64,
     ) -> Option<Self> {
         if !line_offset.is_finite() || !container_x.is_finite() {
-            // 非有限目标不能进入后继Native导航；保留原选择而非代入默认列。
+            // Nonfinite coordinates cannot authorize native navigation; preserve selection instead of inventing a default column.
             return None;
         }
         Some(Self {
@@ -45,32 +46,33 @@ impl NativeMarkdownVerticalGoal {
         })
     }
 
+    /// Revalidate both coordinate spaces before publishing a borrowed vertical goal.
     pub(super) fn is_finite(self) -> bool {
         self.line_offset.is_finite() && self.container_x.is_finite()
     }
 
-    /// 原行片段内的真实偏移；它与container_x属于不同坐标，不可互换。
+    /// Return the original line-fragment offset, independently of the container-space horizontal position.
     #[cfg(feature = "native-paged-production")]
     #[must_use]
     pub fn line_offset(self) -> f64 {
         self.line_offset
     }
 
-    /// 原文本容器的实际横坐标；短行返回的目标位置不能覆盖这个连续垂直目标。
+    /// Preserve the original container-space target even when a shorter line returns a nearer caret.
     #[cfg(feature = "native-paged-production")]
     #[must_use]
     pub fn container_x(self) -> f64 {
         self.container_x
     }
 
-    /// 原文本容器实际行宽的键，不等于带边距的窗口或滚动视口宽度。
+    /// Identify actual text-container line width, excluding window and viewport margins.
     #[cfg(feature = "native-paged-production")]
     #[must_use]
     pub fn width_key(self) -> i64 {
         self.width_key
     }
 
-    /// 原producer的排版坐标代次，随Source、样式或布局宽度变化失效。
+    /// Identify the original producer's layout coordinates, invalidated by source, style or width changes.
     #[cfg(feature = "native-paged-production")]
     #[must_use]
     pub fn layout_epoch(self) -> u64 {
@@ -78,7 +80,7 @@ impl NativeMarkdownVerticalGoal {
     }
 }
 
-/// 只有原收据声明的两个范围属于本次安装；其他通知必须交回真实输入路径。
+/// Only the original receipt's two declared ranges belong to installation; other notifications return to real input handling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(super) enum NativeMarkdownSelectionInstallObservation {
@@ -87,6 +89,7 @@ pub(super) enum NativeMarkdownSelectionInstallObservation {
 }
 
 #[derive(Clone, Copy)]
+/// Keep direction and geometry metadata for one exact logical selection, without retaining its source graph.
 struct KnownSelection {
     selection: MarkdownTextSelection,
     head_is_upstream: Option<bool>,
@@ -97,6 +100,7 @@ struct KnownSelection {
 
 #[derive(Clone, Copy)]
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+/// Identify one stack-scoped TextKit installation, including its declared before/after ranges.
 struct NativeInstall {
     id: u64,
     generation: u64,
@@ -106,8 +110,8 @@ struct NativeInstall {
     selection: MarkdownTextSelection,
 }
 
-/// 两种客户共用选择事实；只有独立 TextKit 客户需要原生选区通知的栈内安装租约。
-/// 正式 Paged 输入直接发布同一 Core 事实，不创建 TextKit before/after 安装槽。
+/// Both clients share selection facts; only the independent TextKit client needs a stack-scoped
+/// installation lease. Production paged input publishes Core facts without a TextKit before/after slot.
 pub(super) struct NativeMarkdownSelectionState {
     generation: Cell<u64>,
     serial: Cell<u64>,
@@ -120,6 +124,7 @@ pub(super) struct NativeMarkdownSelectionState {
 }
 
 impl NativeMarkdownSelectionState {
+    /// Begin with known logical endpoints but no evidence of wrap affinity, vertical goal or bidi side.
     pub(super) fn new(generation: u64, selection: MarkdownTextSelection) -> Self {
         Self {
             generation: Cell::new(generation),
@@ -139,11 +144,12 @@ impl NativeMarkdownSelectionState {
         }
     }
 
+    /// Lend the current action-revocation serial without acquiring any native or document owner.
     pub(super) fn serial(&self) -> u64 {
         self.serial.get()
     }
 
-    /// generation与当前Core选择都相同才返回事实；未被adapter观察的修改不会借旧方向续权。
+    /// Require both generation and current Core selection; unseen edits cannot inherit old directional authority.
     pub(super) fn known_selection(
         &self,
         generation: u64,
@@ -153,6 +159,7 @@ impl NativeMarkdownSelectionState {
             .map(|known| known.selection)
     }
 
+    /// Expose wrap affinity only while the original complete logical selection still matches.
     pub(super) fn known_head_is_upstream(
         &self,
         generation: u64,
@@ -162,6 +169,7 @@ impl NativeMarkdownSelectionState {
             .and_then(|known| known.head_is_upstream)
     }
 
+    /// Reuse the captured vertical target only for the same current logical selection and generation.
     pub(super) fn known_vertical_goal(
         &self,
         generation: u64,
@@ -172,6 +180,7 @@ impl NativeMarkdownSelectionState {
     }
 
     #[cfg(feature = "native-paged-production")]
+    /// Reuse the original bidi caret side only while its exact selection facts remain known.
     pub(super) fn known_bidi_side(
         &self,
         generation: u64,
@@ -181,13 +190,14 @@ impl NativeMarkdownSelectionState {
             .and_then(|known| known.bidi_side)
     }
 
+    /// Match complete logical identity before lending any optional direction or geometry metadata.
     fn known_metadata(
         &self,
         generation: u64,
         selection: MarkdownTextSelection,
     ) -> Option<KnownSelection> {
         if self.sealed.get() || self.generation.get() != generation {
-            // 换代和seal后没有可继承的Native方向或目标列。
+            // A changed generation or sealed view has no inheritable native direction or target column.
             return None;
         }
         self.known
@@ -195,7 +205,8 @@ impl NativeMarkdownSelectionState {
             .filter(|known| known.selection == selection)
     }
 
-    /// 仅在同一纯Core发布栈调用；每次发布都撤销旧capture，包括范围不变的方向/意图转换。
+    /// Publish only on the same nonreentrant Core stack. Every publication revokes old captures,
+    /// including direction or intent changes whose numerical range remains unchanged.
     pub(super) fn publish(
         &self,
         generation: u64,
@@ -213,14 +224,15 @@ impl NativeMarkdownSelectionState {
                 head_is_upstream,
                 vertical_goal: vertical_goal.filter(|goal| goal.is_finite()),
                 #[cfg(feature = "native-paged-production")]
-                bidi_side: None, // 普通输入/历史没有原视觉侧的继承权。
+                // Ordinary input/history cannot inherit the original visual caret side.
+                bidi_side: None,
             },
         );
         self.known.set(known);
         self.advance_serial()
     }
 
-    /// 同一次纯Core选择提交签入真实视觉侧；没有额外serial、回调或后置修补窗口。
+    /// Bind the real visual side in the same Core selection commit, without another serial, callback or repair window.
     #[cfg(feature = "native-paged-production")]
     pub(super) fn publish_with_bidi_side(
         &self,
@@ -241,11 +253,12 @@ impl NativeMarkdownSelectionState {
         if let Some(mut known) = self.known.get() {
             known.bidi_side = bidi_side;
             self.known.set(Some(known));
-        } // 仍在原无可重入操作的发布栈内；唯一serial只由上方原publish递增一次。
+        }
+        // This is still the original nonreentrant publication stack; publish advanced the sole serial exactly once.
         serial
     }
 
-    /// 实际新输入只撤销旧安装/动作权限；当前Core方向事实仍可供新动作捕获。
+    /// New actual input revokes old installation/action authority; current Core direction may still be captured by a new action.
     pub(super) fn revoke_install(&self) {
         #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
         self.discard_install();
@@ -253,25 +266,28 @@ impl NativeMarkdownSelectionState {
     }
 
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+    /// Revoke only the optional TextKit installation slot, leaving current logical Core facts intact.
     pub(super) fn discard_install(&self) {
         self.install.set(None);
     }
 
+    /// Invalidate old layout coordinates without changing the logical selection endpoints.
     pub(super) fn clear_vertical_goal(&self) {
         if let Some(mut known) = self.known.get() {
-            // 布局变化不改逻辑anchor/head，但旧行内偏移不能应用到新几何。
+            // A layout change preserves anchor/head but cannot apply old line offsets to new geometry.
             known.vertical_goal = None;
             known.head_is_upstream = None;
             #[cfg(feature = "native-paged-production")]
             {
                 known.bidi_side = None;
-            } // 原Source/宽度/样式的part侧不能用于下一套实际视觉行。
+            }
+            // The original source/width/style's bidi side cannot authorize a successor set of visual lines.
             self.known.set(Some(known));
         }
     }
 
-    /// 同一来源仅因选择显隐重排样式时，原 head 的显式上下游仍是这次逻辑选择的事实。
-    /// 旧目标列与 BiDi part 则依赖已退休的字形图，必须撤销，不能延续到新样式的视觉行。
+    /// Selection-visibility restyling of the same source preserves explicit logical wrap affinity.
+    /// Vertical targets and bidi sides depend on retired glyph geometry and cannot survive into the new style's lines.
     #[cfg(feature = "native-paged-production")]
     pub(super) fn clear_style_geometry(&self) {
         if let Some(mut known) = self.known.get() {
@@ -281,19 +297,20 @@ impl NativeMarkdownSelectionState {
         }
     }
 
-    /// 未知选择或外部换代失去方向证据；不从有序范围伪造一个新head。
+    /// Unknown selection or external revision loses directional evidence; do not invent an active endpoint from an ordered range.
     pub(super) fn reset(&self, generation: u64) {
         self.generation.set(generation);
         self.known.set(None);
         self.revoke_install();
     }
 
+    /// Permanently revoke this view's future selection authority before clearing its current facts.
     pub(super) fn seal(&self) {
         self.sealed.set(true);
         self.reset(self.generation.get());
     }
 
-    /// 收据已经认证后才建立唯一栈内lease；覆盖前一个id使旧guard的Drop不能清掉后继。
+    /// Acquire one stack-scoped lease only after receipt validation; replacing its ID prevents an old guard from clearing a successor.
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
     pub(super) fn begin_install(
         &self,
@@ -311,7 +328,7 @@ impl NativeMarkdownSelectionState {
             || !valid_declared_range(before)
             || !valid_declared_range(after)
         {
-            // 过期收据和溢出范围都不能安装；不读取当前值给旧收据补票。
+            // Neither stale authority nor overflowing ranges permit installation. Current values cannot refresh an old receipt.
             return None;
         }
         let id = self.next_install_id.get().checked_add(1)?;
@@ -328,6 +345,7 @@ impl NativeMarkdownSelectionState {
     }
 
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+    /// Match generation, action serial and installation ID as independent facts of the same lease.
     pub(super) fn install_matches(&self, generation: u64, serial: u64, id: u64) -> bool {
         !self.sealed.get()
             && self.generation.get() == generation
@@ -338,6 +356,7 @@ impl NativeMarkdownSelectionState {
     }
 
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+    /// Classify a real native notification without accepting an undeclared intermediate range.
     pub(super) fn observe_install(
         &self,
         range: NSRange,
@@ -354,6 +373,7 @@ impl NativeMarkdownSelectionState {
     }
 
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+    /// Require installation identity and complete Core endpoints before the observer consumes its receipt.
     pub(super) fn install_core_is_current(
         &self,
         generation: u64,
@@ -366,17 +386,19 @@ impl NativeMarkdownSelectionState {
     }
 
     #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
+    /// Release this guard's lease only if no reentrant successor has replaced its exact ID and serial.
     pub(super) fn finish_install(&self, serial: u64, id: u64) {
         if self
             .install
             .get()
             .is_some_and(|install| install.serial == serial && install.id == id)
         {
-            // 只清自己仍占有的slot；旧guard不能擦除重入后建立的新lease。
+            // An old guard cannot erase a new installation acquired during native reentry.
             self.install.set(None);
         }
     }
 
+    /// Revoke previous captures with a checked monotonic serial; exhaustion is a programming/lifetime error.
     fn advance_serial(&self) -> u64 {
         let serial = self
             .serial
@@ -388,7 +410,7 @@ impl NativeMarkdownSelectionState {
     }
 }
 
-/// 这里只验证有限声明，不把旧Native before范围误当当前正文的可读授权。
+/// Validate finite declarations only; an old native before-range never grants current body-read authority.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn valid_declared_range(range: NSRange) -> bool {
     range.location != objc2_foundation::NSNotFound as usize

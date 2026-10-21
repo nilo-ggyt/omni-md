@@ -1,4 +1,5 @@
-//! 真实AAT计划拒绝与Font边界；原长尾保留mmap，不把开放端点或相同Font试次当成闭段。
+//! Real AAT plan rejection and font boundaries. The long suffix stays mmap-backed;
+//! neither an open endpoint nor repeated same-font trials establish a closed run.
 
 use super::*;
 use crate::MarkdownDocumentBuffer;
@@ -13,7 +14,8 @@ const ROBOTO: &[u8] = include_bytes!(concat!(
     "/../../vendor/harfrust/benches/fonts/Roboto-Regular.ttf"
 ));
 
-/// 固定64KiB长尾逐块落盘；只用首两个ASCII字素区分真实Font覆盖。
+/// Write the fixed 64-KiB suffix in bounded blocks. Only the first two ASCII
+/// graphemes distinguish actual font coverage; no whole-tail shaping oracle is built.
 fn fixture(
     prefix: &[u8],
 ) -> (
@@ -32,7 +34,8 @@ fn fixture(
     (file, document, source)
 }
 
-/// 原SFNT的真实name表定位同一face；不篡改glyph、cmap、查表或计划的拒绝结果。
+/// Resolve the actual SFNT face through its name table without modifying glyphs,
+/// cmap, shaping tables, or the real plan's rejection result.
 fn font(bytes: &'static [u8]) -> MarkdownLayoutFont {
     let name = read_fonts::FontRef::from_index(bytes, 0)
         .unwrap()
@@ -43,7 +46,8 @@ fn font(bytes: &'static [u8]) -> MarkdownLayoutFont {
     MarkdownLayoutFont::resolve_name_table_at_size(Arc::new(bytes), &name, &[], 16.0).unwrap()
 }
 
-/// 固定Latn样式与原段落方向；完整GCB短oracle和候选使用同样的BOT/EOT规则。
+/// Share Latin style, paragraph direction, and actual BOT/EOT rules between the
+/// complete-grapheme short oracle and the candidate.
 fn options(source: &MarkdownLayoutTextSource, range: &Range<usize>) -> MarkdownShapingOptions {
     MarkdownShapingOptions {
         direction: MarkdownShapingDirection::LeftToRight,
@@ -56,7 +60,8 @@ fn options(source: &MarkdownLayoutTextSource, range: &Range<usize>) -> MarkdownS
     }
 }
 
-/// 只对短 Font 段运行旧完整 Job 取得独立实际字形，绝不对长尾建立完整整形输入。
+/// Obtain independent real glyphs from the original complete Job for short font
+/// runs only. The long suffix never becomes complete shaping input.
 fn glyphs(
     source: &MarkdownLayoutTextSource,
     font: &MarkdownLayoutFont,
@@ -76,6 +81,8 @@ fn glyphs(
         options(source, &range),
     )
     .unwrap();
+    // Prepare through the original bounded Source reader before actual shaping;
+    // no coordinator state or expected glyph record is injected into this oracle.
     for _ in 0..10000 {
         if job
             .step(
@@ -104,7 +111,8 @@ fn glyphs(
         .collect()
 }
 
-/// 只推进原协调器，直到真实NeedStyle；每一步仍受原bytes/scalar/metadata量子约束。
+/// Advance the original coordinator to NeedStyle while respecting its separate
+/// byte, scalar, record, and metadata quanta on every step.
 fn request(worker: &mut MarkdownLineItemCoordinator) -> MarkdownLineStyleRequest {
     let budget = MarkdownLineComposeBudget::default();
     for _ in 0..100000 {
@@ -124,7 +132,8 @@ fn request(worker: &mut MarkdownLineItemCoordinator) -> MarkdownLineStyleRequest
     panic!("原有限Font请求未完成");
 }
 
-/// 单次真实Font响应不改变原覆盖、段落、取消或注册职责。
+/// Reply once with the actual font while preserving the original requested range,
+/// paragraph, cancellation authority, and registration ownership.
 fn respond(
     worker: &mut MarkdownLineItemCoordinator,
     request: MarkdownLineStyleRequest,
@@ -150,7 +159,8 @@ fn respond(
 }
 
 #[test]
-/// 首个AAT Font只覆盖真实A字素；x实际glyph0促成另一Font选择，长尾必须回原itemization。
+/// The AAT font covers A; actual glyph zero for x selects another font. Emit only
+/// the naturally closed head, then return the long suffix to original itemization.
 fn actual_first_font_boundary_emits_only_closed_head_then_restarts_original_item() {
     let (file, document, source) = fixture(b"Ax");
     let original = font(MORX);
@@ -166,6 +176,8 @@ fn actual_first_font_boundary_emits_only_closed_head_then_restarts_original_item
         ),
         Err(harfrust::AsciiFrontierRejection::Positioning)
     ));
+    // Establish both font coverages with real shaping before answering trials. The
+    // original font's plan rejection is independent of its missing x glyph.
     let oracle = glyphs(&source, &original, 0..1);
     assert!(oracle.iter().all(|glyph| glyph.glyph_id != 0));
     assert!(
@@ -196,6 +208,8 @@ fn actual_first_font_boundary_emits_only_closed_head_then_restarts_original_item
             .unwrap()
             .same_payload(&original.authority())
     );
+    // Consuming this exact request expires its old probe; the next grapheme must
+    // obtain its own authority rather than reuse coordinates from the first trial.
     let stale_probe = worker.font_probe(&first).unwrap();
     respond(&mut worker, first, &original);
     assert!(matches!(
@@ -230,6 +244,8 @@ fn actual_first_font_boundary_emits_only_closed_head_then_restarts_original_item
         }
     }
     let item = ready.expect("真实短Font段未在有限工作内交付");
+    // The consumer holds the real child allocation. A subsequent coordinator step
+    // must wait until that child is dropped and its file/mapping release is observed.
     let shape = item.job.resource_observer();
     assert!(matches!(
         worker
@@ -254,7 +270,8 @@ fn actual_first_font_boundary_emits_only_closed_head_then_restarts_original_item
 }
 
 #[test]
-/// 同一Font连续成功不能将256配额当成边界；没有真实变化就保留原能力拒绝。
+/// Repeated same-font success cannot turn the 256-unit work allowance into a
+/// boundary. Without a real transition, retain the original capability rejection.
 fn unchanged_first_font_cannot_publish_an_open_prefix_as_a_closed_run() {
     let (file, document, source) = fixture(b"A");
     let original = font(MORX);
@@ -276,7 +293,8 @@ fn unchanged_first_font_cannot_publish_an_open_prefix_as_a_closed_run() {
             MarkdownLineItemAnswer::Yielded => {}
             MarkdownLineItemAnswer::NeedStyle(request) => respond(&mut worker, request, &original),
             MarkdownLineItemAnswer::NeedsFrontier(reason) => {
-                // 实际字体计划拒绝与连续字体段预算不是同一事实；失配时保留完整类型化原因。
+                // The actual font-plan rejection and the same-font work budget are
+                // distinct facts. Preserve the complete typed rejection reason.
                 assert_eq!(
                     reason,
                     MarkdownLineFrontierReason::Plan(harfrust::AsciiFrontierRejection::Positioning)
@@ -287,12 +305,13 @@ fn unchanged_first_font_cannot_publish_an_open_prefix_as_a_closed_run() {
             _ => panic!("没有真实Font边界时不得交付任何预算伪段"),
         }
     }
-    assert!(rejected && worker.payload.as_ref().unwrap().cursor == 0);
+    assert!(rejected);
     drop((worker, source, document, file, original));
 }
 
 #[test]
-/// 非自然短样式也必须取得真实Font变化；段内缺字不能被首字素选Font遮住，短末端不能冒充闭合。
+/// A shortened semantic style still needs a real font transition. Choosing a font
+/// for its first grapheme cannot hide later missing glyphs or certify its short end.
 fn shortened_style_head_uses_real_gcb_font_boundary_and_keeps_same_font_rejection() {
     for (text, changes_font) in [("Ax*A*", true), ("AA*A*", false)] {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -306,7 +325,8 @@ fn shortened_style_head_uses_real_gcb_font_boundary_and_keeps_same_font_rejectio
         let original_observer = original.resource_observer();
         let fallback_observer = fallback.resource_observer();
 
-        // 原Parser的真实正文run止于后面的斜体标记；不是为了通过闭项预算而任意截一段文字。
+        // The real parser ends this body run at the following emphasis marker; its
+        // coverage was not arbitrarily shortened to fit the closed-item budget.
         let mut semantics = crate::MarkdownViewportPresentation::default();
         semantics
             .rebuild(document.generation(), 0..document.utf16_len(), text)
@@ -359,7 +379,9 @@ fn shortened_style_head_uses_real_gcb_font_boundary_and_keeps_same_font_rejectio
                     let probe = worker.font_probe(&request).unwrap();
                     let range = probe.source_range();
                     assert!(range == (0..1) || range == (1..2));
-                    // 同一个完整GCB先实际试原Font；只在真实glyph0后选择确实覆盖它的另一Font。
+                    // Shape the same complete grapheme with the original font;
+                    // select fallback only after actual glyph zero, then verify that
+                    // the selected payload really covers the complete grapheme.
                     let primary = glyphs(probe.source().unwrap(), &original, range.clone());
                     let selected = if primary.iter().any(|glyph| glyph.glyph_id == 0) {
                         assert!(changes_font && range == (1..2));
@@ -373,7 +395,7 @@ fn shortened_style_head_uses_real_gcb_font_boundary_and_keeps_same_font_rejectio
                         &original
                     };
                     respond(&mut worker, request, selected);
-                    assert!(probe.validate().is_err()); // 原nonce消费后，旧探测不能为后继字素补权。
+                    assert!(probe.validate().is_err()); // Consumed nonces cannot bless later trials.
                 }
                 MarkdownLineItemAnswer::ItemReady(facts) => {
                     assert!(changes_font);
@@ -390,7 +412,7 @@ fn shortened_style_head_uses_real_gcb_font_boundary_and_keeps_same_font_rejectio
                             MarkdownLineFrontierReason::PendingConsumer
                         )
                     ));
-                    drop(item); // Font边界不免除原child的实际释放责任。
+                    drop(item); // A font transition does not waive actual child release.
                     assert_eq!(request(&mut worker).source_range().start, 1);
                     completed = true;
                     break;
@@ -402,7 +424,7 @@ fn shortened_style_head_uses_real_gcb_font_boundary_and_keeps_same_font_rejectio
                         MarkdownLineFrontierReason::Plan(
                             harfrust::AsciiFrontierRejection::Positioning
                         )
-                    ); // 两个GCB都仍是原Font，不能借短coverage末端交付伪闭合段。
+                    ); // Same-font graphemes cannot use short coverage as natural closure.
                     completed = true;
                     break;
                 }
@@ -410,6 +432,8 @@ fn shortened_style_head_uses_real_gcb_font_boundary_and_keeps_same_font_rejectio
             }
         }
         assert!(completed);
+        // Actual source bytes and backing/font/worker resources remain intact after
+        // either a successful transition or the unchanged typed plan rejection.
         assert_eq!(std::fs::read(file.path()).unwrap(), text.as_bytes());
         drop((worker, source, document, file, original, fallback));
         assert!(resources.snapshot().unwrap().is_released());

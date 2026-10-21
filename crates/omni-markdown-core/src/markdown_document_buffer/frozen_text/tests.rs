@@ -1,4 +1,5 @@
-//! 仅用独占合成文件验证冻结值的Unicode、COW、事务和真实资源所有权，不接触用户笔记。
+//! Isolated synthetic files verify Unicode, copy-on-write, transactions, and
+//! actual frozen-resource ownership without accessing user notes.
 
 use std::io::Write;
 use std::rc::Rc;
@@ -7,8 +8,10 @@ use tempfile::{TempDir, tempdir};
 
 use super::*;
 
+/// Open the production buffer over a real file owned by the returned temporary directory.
 fn fixture(source: &str) -> (TempDir, MarkdownDocumentBuffer) {
-    // 文件只用于建立真实独立匿名映射；快照不依赖此目录或原路径继续存在。
+    // The file establishes an independent anonymous backing. A snapshot need
+    // not retain this directory or require the original path to remain present.
     let directory = tempdir().unwrap();
     let path = directory.path().join("frozen-text.md");
     std::fs::write(&path, source).unwrap();
@@ -16,8 +19,10 @@ fn fixture(source: &str) -> (TempDir, MarkdownDocumentBuffer) {
     (directory, document)
 }
 
+/// Compare finite oracle bytes and UTF-16 units through the real snapshot read APIs.
 fn assert_text(snapshot: &MarkdownTextSnapshot, expected: &str) {
-    // 完整oracle仅属于有限合成测试；生产快照没有wholeString或自有UTF-16数组。
+    // Contiguous output belongs only to this finite synthetic oracle. Production
+    // snapshots provide neither a whole-string accessor nor a private UTF-16 body array.
     let expected_units: Vec<u16> = expected.encode_utf16().collect();
     let mut actual = vec![0; expected_units.len()];
     snapshot.copy_utf16_code_units(0, &mut actual).unwrap();
@@ -27,7 +32,8 @@ fn assert_text(snapshot: &MarkdownTextSnapshot, expected: &str) {
     let mut bytes = Vec::new();
     snapshot
         .visit_byte_range(0..snapshot.byte_len(), |piece| {
-            // 原始叶与编辑叶都最多4KiB；大请求仍只按借用逐叶交付。
+            // Original and edited logical leaves are at most 4 KiB. A larger
+            // explicit request still delivers individual borrowed pieces.
             assert!(piece.len() <= ORIGINAL_PIECE_BYTES);
             bytes.extend_from_slice(piece);
             Ok(())
@@ -38,6 +44,8 @@ fn assert_text(snapshot: &MarkdownTextSnapshot, expected: &str) {
 
 #[test]
 fn empty_snapshot_has_only_empty_boundaries_and_no_retained_payload() {
+    // Actual empty text permits zero boundaries but no readable unit or source
+    // resource. It must not behave as a missing backing for nonempty content.
     let (_directory, document) = fixture("");
     let snapshot = document.text_snapshot();
     assert_text(&snapshot, "");
@@ -63,10 +71,13 @@ fn empty_snapshot_has_only_empty_boundaries_and_no_retained_payload() {
 
 #[test]
 fn scalar_coordinates_and_surrogate_unit_reads_keep_distinct_contracts() {
+    // Scalar-coordinate conversion and native UTF-16 unit observation are
+    // separate contracts, especially inside this actual supplementary scalar.
     let (_directory, document) = fixture("a中😀e\u{301}z");
     let snapshot = document.text_snapshot();
     for (byte, utf16) in [(0, 0), (1, 1), (4, 2), (8, 4), (9, 5), (11, 6), (12, 7)] {
-        // 所有真实标量边界双向往返；编码内部位置仅允许以原始单元方式读取。
+        // Round-trip every actual scalar boundary; encoding-interior positions
+        // remain usable only through the raw-unit observation contract.
         assert_eq!(snapshot.byte_offset_for_utf16(utf16), Ok(byte));
         assert_eq!(snapshot.utf16_offset_for_byte(byte), Ok(utf16));
     }
@@ -86,7 +97,8 @@ fn scalar_coordinates_and_surrogate_unit_reads_keep_distinct_contracts() {
         Err(MarkdownDocumentBufferError::NotUnicodeBoundary)
     );
 
-    // 溢出、越界与EOF读取在第一次写入前失败，不静默截断调用方的请求。
+    // Overflow, outside extents, and EOF reads fail before mutating output,
+    // rather than silently truncating the caller's requested range.
     let mut unchanged = [0xbeef; 2];
     assert_eq!(
         snapshot.copy_utf16_code_units(usize::MAX, &mut unchanged),
@@ -105,12 +117,15 @@ fn scalar_coordinates_and_surrogate_unit_reads_keep_distinct_contracts() {
 
 #[test]
 fn zero_utf16_boundary_keeps_far_original_pages_and_reports_sticky_reclaim_failure() {
+    // Zero-coordinate metadata queries must not acquire the first original page
+    // and evict a genuinely resident far-source window.
     let directory = tempdir().unwrap();
     let path = directory.path().join("zero-boundary.md");
     let mut file = std::fs::File::create(&path).unwrap();
     let block = [b'a'; 4096];
     for _ in 0..64 {
-        file.write_all(&block).unwrap(); // 真实256KiB源只按固定块生成，不物化整文。
+        // Generate the real 256 KiB source through fixed blocks, without a whole-body fixture copy.
+        file.write_all(&block).unwrap();
     }
     drop(file);
     let mut document = MarkdownDocumentBuffer::open(&path, 1024 * 1024).unwrap();
@@ -128,10 +143,12 @@ fn zero_utf16_boundary_keeps_far_original_pages_and_reports_sticky_reclaim_failu
         Err(MarkdownDocumentBufferError::NotUnicodeBoundary)
     );
     assert_eq!(edited.byte_offset_for_utf16(2), Ok(4));
-    assert_eq!(edited.byte_offset_for_utf16(3), Ok(5)); // 非零代理项和原片偏移仍沿原解码路径。
+    // Nonzero surrogate and original-piece offsets still use the real scalar decoder.
+    assert_eq!(edited.byte_offset_for_utf16(3), Ok(5));
 
-    // 填满真实远端64KiB页目录；旧0查询会请求首系统页并驱逐最旧远端页。
-    // 使用4KiB步长同时覆盖4KiB与本机16KiB页，不依赖目录命中次数的模拟值。
+    // Fill the actual far 64 KiB managed-page set; the old zero-boundary read
+    // would acquire the first system page and evict its oldest far page. A 4 KiB
+    // stride covers both 4 KiB and this machine's 16 KiB pages without simulated hits.
     let far = 128 * 1024;
     for offset in (far..far + 64 * 1024).step_by(4096) {
         original
@@ -162,7 +179,8 @@ fn zero_utf16_boundary_keeps_far_original_pages_and_reports_sticky_reclaim_failu
         before
     );
 
-    // 原远端页确实存在，只有真实msync成功后的一次注入才令全共享源永久失败。
+    // This existing test injects failure after a real successful msync over
+    // actual resident pages; it does not establish an operating-system msync failure.
     document.fail_next_original_reclaim_for_test();
     let failure = MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO);
     assert_eq!(
@@ -177,11 +195,14 @@ fn zero_utf16_boundary_keeps_far_original_pages_and_reports_sticky_reclaim_failu
     assert_eq!(document.byte_offset_for_utf16(0), Err(failure));
     drop((document, original, edited, undone));
     assert!(backing.unmap_succeeded() && backing.mapped_bytes() == 0);
-    assert!(backing.failed()); // 实际unmap成功不能擦掉先前的真实源回收错误记录。
+    // Successful actual unmap cannot erase the earlier injected source-failure fact.
+    assert!(backing.failed());
 }
 
 #[test]
 fn capture_and_clone_share_exact_tree_mapping_and_edit_allocations() {
+    // Capture a mixed original/edited value, then compare real allocation
+    // identities rather than inferring zero copying from equal characters alone.
     let source = "中文😀原文\r\n".repeat(32_000);
     let (_directory, mut document) = fixture(&source);
     document
@@ -191,7 +212,8 @@ fn capture_and_clone_share_exact_tree_mapping_and_edit_allocations() {
     let snapshot = document.text_snapshot();
     let cloned = snapshot.clone();
 
-    // 以真实资源身份验证共享；内存布局没有第二份正文，不能只比较字符结果推断零复制。
+    // Validate sharing through the tree, backing, and edit-segment identities;
+    // snapshot acquisition must not append bytes or allocate another body.
     assert!(Arc::ptr_eq(&snapshot.text, &cloned.text));
     assert!(Arc::ptr_eq(
         document.root.as_ref().unwrap(),
@@ -212,6 +234,8 @@ fn capture_and_clone_share_exact_tree_mapping_and_edit_allocations() {
 
 #[test]
 fn appending_after_freeze_copies_only_shared_tail_and_keeps_segment_capacity() {
+    // Keep the existing heap-tail COW path active using separate finite inputs,
+    // while a snapshot continues owning the original segment allocations.
     let (_directory, mut document) = fixture("原");
     let first_edit = "x".repeat(EDIT_SEGMENT_BYTES + 20);
     document
@@ -221,7 +245,8 @@ fn appending_after_freeze_copies_only_shared_tail_and_keeps_segment_capacity() {
             MarkdownTextSelection::caret(1),
         )
         .unwrap();
-    // 两次真实小输入继续覆盖原heap尾段COW；一次超段长输入现在属于独立封存映射职责。
+    // Two actual small inputs exercise heap-tail COW. One input exceeding the
+    // segment size now belongs to the independently frozen-file path instead.
     document
         .replace_utf16_range(
             1 + EDIT_SEGMENT_BYTES..1 + EDIT_SEGMENT_BYTES,
@@ -237,7 +262,8 @@ fn appending_after_freeze_copies_only_shared_tail_and_keeps_segment_capacity() {
         .replace_utf16_range(end..end, "后😀", MarkdownTextSelection::caret(end))
         .unwrap();
 
-    // 完整前段始终共享；仅实际写入的尾段换allocation，原编号与累计字节预算保持原值。
+    // Completed earlier segments remain shared. Only the actually modified
+    // tail changes allocation, preserving stable IDs and cumulative byte accounting.
     assert!(Arc::ptr_eq(&first_segment, &document.edits.segments[0]));
     assert!(!Arc::ptr_eq(&original_tail, &document.edits.segments[1]));
     assert!(Arc::ptr_eq(&original_tail, &frozen.text.edits[&1]));
@@ -250,6 +276,8 @@ fn appending_after_freeze_copies_only_shared_tail_and_keeps_segment_capacity() {
 
 #[test]
 fn old_values_survive_cross_piece_edits_undo_redo_and_document_drop() {
+    // Put mixed-width text across an original piece boundary and retain values
+    // on both sides of a real edit before exercising undo/redo and later input.
     let source = format!(
         "{}中😀尾\r\n{}",
         "a".repeat(ORIGINAL_PIECE_BYTES - 3),
@@ -274,7 +302,8 @@ fn old_values_survive_cross_piece_edits_undo_redo_and_document_drop() {
         .replace_utf16_range(start..start + 3, "新", MarkdownTextSelection::caret(start))
         .unwrap();
 
-    // 保存的两个值不随当前generation、历史root或用户路径存活；目录也可以先释放。
+    // The two retained values depend on neither current generation/history nor
+    // a live path. Release the active document and fixture directory first.
     drop(document);
     drop(directory);
     assert_text(&original, &source);
@@ -283,6 +312,8 @@ fn old_values_survive_cross_piece_edits_undo_redo_and_document_drop() {
 
 #[test]
 fn snapshot_outlives_live_document_without_retaining_document_or_path() {
+    // The immutable value is cross-thread capable, while the actual active
+    // document remains a separately observed owner that must be destroyed.
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<MarkdownTextSnapshot>();
     let (directory, document) = fixture("真实独立😀正文");
@@ -296,7 +327,8 @@ fn snapshot_outlives_live_document_without_retaining_document_or_path() {
     drop(document);
     drop(directory);
 
-    // 原文档已经真实销毁；匿名mmap与原root由值而非路径或文档保活。
+    // The original document is actually gone. Snapshot values, not its path or
+    // active owner, retain the backing/root until their final clone is released.
     assert!(weak_document.upgrade().is_none());
     assert!(original_mapping.upgrade().is_some());
     assert!(original_root.upgrade().is_some());
@@ -309,38 +341,9 @@ fn snapshot_outlives_live_document_without_retaining_document_or_path() {
 }
 
 #[test]
-fn recovery_snapshot_keeps_original_payload_offset_without_record_bytes() {
-    let directory = tempdir().unwrap();
-    let path = directory.path().join("synthetic-record");
-    let prefix = b"record-header:";
-    let payload = "恢复😀正文";
-    let record = [prefix.as_slice(), payload.as_bytes(), b":record-tail"].concat();
-    std::fs::write(&path, &record).unwrap();
-    let file = std::fs::File::open(&path).unwrap();
-    let mapping = snapshot_canonical(&file, record.len() as u64, || true)
-        .unwrap()
-        .unwrap();
-    let document = MarkdownDocumentBuffer::from_legacy_recovery(
-        &path,
-        mapping,
-        prefix.len()..prefix.len() + payload.len(),
-        [0; 32],
-        1024,
-    )
-    .unwrap();
-    let snapshot = document.text_snapshot();
-    drop(document);
-    drop(file);
-    drop(directory);
-
-    // 旧record的header/path/tail不是正文坐标；所有查询仍只见真实payload0..EOF。
-    assert_text(&snapshot, payload);
-    assert_eq!(snapshot.byte_offset_for_utf16(2), Ok("恢复".len()));
-    assert_eq!(snapshot.utf16_code_unit_at(3), Ok(0xde00));
-}
-
-#[test]
 fn snapshot_retains_only_sources_in_current_root_and_releases_last_edit_arc() {
+    // Fully replacing the original removes that backing from the current value,
+    // even while the active document's history still owns its old roots.
     let (_directory, mut document) = fixture("原文");
     let original_mapping = Arc::downgrade(document.original_snapshot.as_ref().unwrap());
     document
@@ -351,13 +354,16 @@ fn snapshot_retains_only_sources_in_current_root_and_releases_last_edit_arc() {
     assert!(edited.text.original_snapshot.is_none());
     drop(document);
 
-    // 完全被替换的原始映射仅供旧history使用，不应跟随当前值存活。
+    // The fully replaced original belongs only to old history, so destroying
+    // that history must release it independently of the current edited snapshot.
     assert!(original_mapping.upgrade().is_none());
     assert!(edit_segment.upgrade().is_some());
     assert_text(&edited, "只有编辑😀");
     drop(edited);
     assert!(edit_segment.upgrade().is_none());
 
+    // The converse case abandons every large edit while retaining original text;
+    // a fresh current value must not capture those history-only segment resources.
     let (_directory, mut document) = fixture("保留原文");
     let large_edit = "x".repeat(EDIT_SEGMENT_BYTES * 2 + 1);
     document
@@ -371,7 +377,8 @@ fn snapshot_retains_only_sources_in_current_root_and_releases_last_edit_arc() {
     assert!(current.text.edits.is_empty());
     drop(document);
     for segment in abandoned {
-        // 被删掉的历史段逐一实际释放，不能仅通过快照的空字段声称已释放。
+        // Observe actual destruction of each removed historical segment rather
+        // than claiming release merely because the snapshot map is empty.
         assert!(segment.upgrade().is_none());
     }
     assert_text(&current, "保留原文");
@@ -379,6 +386,8 @@ fn snapshot_retains_only_sources_in_current_root_and_releases_last_edit_arc() {
 
 #[test]
 fn prepared_input_freeze_and_cancellation_preserve_all_published_values() {
+    // Capture both before and during an unpublished native-input candidate;
+    // neither immutable value may observe that candidate as committed text.
     let (_directory, mut document) = fixture("原");
     document
         .replace_utf16_range(1..1, "已提交", MarkdownTextSelection::caret(1))
@@ -401,7 +410,9 @@ fn prepared_input_freeze_and_cancellation_preserve_all_published_values() {
     assert_text(&during, "原已提交");
     document.cancel_prepared_text_input(&token).unwrap();
 
-    // 取消时新快照可能共享包含未发布后缀的段；只COW恢复活动段，不改任何冻结值。
+    // A newly captured value may share the segment containing an unpublished
+    // suffix. Cancellation COW-restores only the live segment, never mutating
+    // either frozen value or publishing the candidate root/history.
     assert!(!Arc::ptr_eq(
         &shared_candidate_tail,
         document.edits.segments.last().unwrap()
@@ -415,7 +426,8 @@ fn prepared_input_freeze_and_cancellation_preserve_all_published_values() {
 }
 
 #[test]
-/// 长输入沿原编号封存，后继小输入、历史和独立snapshot都不把文件重新物化为堆字节。
+/// Keep a long input frozen under its stable segment ID across small input,
+/// history, and snapshot ownership without rematerializing file bytes on the heap.
 fn long_edit_keeps_frozen_segment_through_small_input_history_and_final_snapshot_drop() {
     let (_directory, mut document) = fixture("原");
     let input = "中😀a\r\n".repeat(32_000);
@@ -423,12 +435,16 @@ fn long_edit_keeps_frozen_segment_through_small_input_history_and_final_snapshot
         .replace_utf16_range(1..1, &input, MarkdownTextSelection::caret(1))
         .unwrap();
     let MarkdownEditSegment::Frozen(backing) = document.edits.segments[0].as_ref() else {
+        // This real long edit must use the file-backed production path, not a
+        // heap segment that happens to return the same characters.
         panic!("长输入应由真实匿名映射保管");
     };
     let observer = backing.observer();
     assert_eq!(observer.mapped_bytes(), input.len());
     assert_eq!(document.edits.allocated_bytes(), 0);
     let frozen = document.text_snapshot();
+    // A later finite input may use a heap tail while the original long segment
+    // remains the same shared frozen resource through undo and redo.
     let end = document.utf16_len();
     document
         .replace_utf16_range(end..end, "尾", MarkdownTextSelection::caret(end + 1))
@@ -450,7 +466,9 @@ fn long_edit_keeps_frozen_segment_through_small_input_history_and_final_snapshot
     assert_text(&document.text_snapshot(), &format!("原{input}"));
     assert!(observer.peak_managed_resident_bytes() <= 64 * 1024);
     drop(document);
-    assert_eq!(observer.mapped_bytes(), input.len()); // 最后实际snapshot仍拥有该段，不能提前签释放。
+    // The last actual snapshot still owns the segment; document destruction
+    // cannot truthfully claim its mapping already released.
+    assert_eq!(observer.mapped_bytes(), input.len());
     assert_text(&frozen, &format!("原{input}"));
     drop(frozen);
     assert_eq!(observer.mapped_bytes(), 0);
@@ -458,7 +476,8 @@ fn long_edit_keeps_frozen_segment_through_small_input_history_and_final_snapshot
 }
 
 #[test]
-/// 未发布封存段在原cancel中先随候选root退场，再回退同一个段表，旧正文与历史均保留。
+/// Cancellation first drops the unpublished candidate root, then rolls back
+/// its original segment table while preserving current text and editing history.
 fn cancelling_prepared_long_edit_unmaps_only_the_unpublished_segment() {
     let (_directory, mut document) = fixture("原文");
     let before = document.storage_profile();
@@ -478,6 +497,8 @@ fn cancelling_prepared_long_edit_unmaps_only_the_unpublished_segment() {
     };
     let observer = backing.observer();
     assert!(observer.mapped_bytes() > EDIT_SEGMENT_BYTES);
+    // Actual candidate bytes exist, but the current public snapshot remains
+    // unchanged. Cancel must reclaim only that unpublished anonymous mapping.
     assert_text(&document.text_snapshot(), "原文");
     document.cancel_prepared_text_input(&token).unwrap();
     assert_eq!(document.storage_profile(), before);
@@ -488,7 +509,8 @@ fn cancelling_prepared_long_edit_unmaps_only_the_unpublished_segment() {
 }
 
 #[test]
-/// 封存编辑段的真实页回收错误永久撤销缓存读取和后继准备，不能被原始映射健康遮住。
+/// A recorded frozen-edit reclamation failure revokes cached observations and
+/// later input preparation, even when the original document backing remains healthy.
 fn frozen_edit_reclaim_failure_reaches_metadata_snapshots_and_next_input() {
     let (_directory, mut document) = fixture("原");
     document
@@ -503,6 +525,8 @@ fn frozen_edit_reclaim_failure_reaches_metadata_snapshots_and_next_input() {
         panic!("应取得原封存编辑文件");
     };
     let observer = backing.observer();
+    // This existing fault hook records EIO after a real page-reclamation call.
+    // It exercises sticky propagation, not a naturally failing kernel operation.
     backing.fail_next_reclaim_for_test();
     assert_eq!(
         backing.reclaim_unpinned_for_test(),
@@ -518,6 +542,8 @@ fn frozen_edit_reclaim_failure_reaches_metadata_snapshots_and_next_input() {
         matches!(document.prepare_text_input_observed(0..0, "后", document.selection(), MarkdownTextSelection::caret(0), changes::NoopObserver), Err(changes::MarkdownObservedEditError::Document(found)) if found == error)
     );
     assert!(observer.failed());
+    // Releasing the active owner alone is insufficient while a frozen value
+    // still retains the same actual segment mapping.
     drop(document);
     assert!(observer.mapped_bytes() > 0);
     drop(frozen);
@@ -526,6 +552,8 @@ fn frozen_edit_reclaim_failure_reaches_metadata_snapshots_and_next_input() {
 
 #[test]
 fn bounded_visitor_borrows_actual_piece_bytes_and_stops_on_first_failure() {
+    // A byte-range observation may split scalars but must still borrow the
+    // actual mapped offsets and stop before later leaves after consumer failure.
     let source = format!(
         "{}😀中{}",
         "x".repeat(ORIGINAL_PIECE_BYTES - 1),
@@ -539,7 +567,8 @@ fn bounded_visitor_borrows_actual_piece_bytes_and_stops_on_first_failure() {
     let mut offset = start;
     snapshot
         .visit_byte_range(start..end, |piece| {
-            // 指针来自原mmap的真实偏移；即使范围位于UTF-8标量内部也不复制或改字符。
+            // Compare the actual mmap offset. Even partial UTF-8 scalar bytes
+            // are neither copied nor interpreted as replacement characters.
             mapping
                 .with_bytes(offset..offset + piece.len(), |same| {
                     assert_eq!(piece.as_ptr(), same.as_ptr());
@@ -552,6 +581,8 @@ fn bounded_visitor_borrows_actual_piece_bytes_and_stops_on_first_failure() {
         .unwrap();
     assert_eq!(offset, end);
 
+    // Consumer failure stops the real traversal; a separately invalid request
+    // fails before invoking that consumer at all.
     let mut calls = 0;
     assert_eq!(
         snapshot.visit_byte_range(0..source.len(), |_| {
@@ -573,11 +604,14 @@ fn bounded_visitor_borrows_actual_piece_bytes_and_stops_on_first_failure() {
 
 #[test]
 fn frozen_cache_lock_poison_is_not_recovered_as_a_valid_immutable_read() {
+    // Populate the shared cache before the existing intentional lock-poison
+    // scenario; an old valid entry cannot conceal its later unavailable owner.
     let (_directory, document) = fixture("冻结原值😀");
     let snapshot = document.text_snapshot();
     assert_eq!(snapshot.utf16_code_unit_at(0), Ok(0x51bb));
     let worker = snapshot.clone();
-    // 只有合成测试主动在持锁时panic；后台异常不得将半写入窗口重新声明为有效。
+    // Only this synthetic test deliberately panics while holding the actual
+    // lock. Poison must not redefine a possibly partial window as valid text.
     assert!(
         std::thread::spawn(move || {
             let _guard = worker.text.utf16_read_cache.lock().unwrap();
@@ -596,7 +630,8 @@ fn frozen_cache_lock_poison_is_not_recovered_as_a_valid_immutable_read() {
         Err(MarkdownDocumentBufferError::Utf16ReadCacheUnavailable)
     );
     assert_eq!(output, [0xbeef]);
-    // 同一Doc和后续独立capture也共享原poison，不能重建一个干净cache绕过失败。
+    // The same document and later independent captures share the actual poisoned
+    // cache; rebuilding a clean cache would incorrectly bypass that failure.
     assert_eq!(
         document.utf16_code_unit_at(0),
         Err(MarkdownDocumentBufferError::Utf16ReadCacheUnavailable)
@@ -609,6 +644,8 @@ fn frozen_cache_lock_poison_is_not_recovered_as_a_valid_immutable_read() {
 
 #[test]
 fn hundreds_of_distinct_captures_share_the_document_single_actual_8k_window() {
+    // Allocate one real read window, then repeatedly capture distinct frozen
+    // values to detect per-capture cache allocation or unintended active-owner retention.
     let (directory, document) = fixture(&"原😀文".repeat(4096));
     let mapping = document.original_backing_observer().unwrap();
     let cache = Arc::downgrade(&document.utf16_read_cache);
@@ -630,7 +667,8 @@ fn hundreds_of_distinct_captures_share_the_document_single_actual_8k_window() {
     assert_eq!(original_window.1, 8192);
     let mut snapshots = Vec::new();
     for capture in 0..512 {
-        // 每次调用都产生独立FrozenText payload，不是用snapshot.clone掩盖capture重复分配。
+        // Every call creates a distinct FrozenText payload; using clone alone
+        // could conceal an allocation mistakenly repeated only during capture.
         let snapshot = document.text_snapshot();
         assert!(Arc::ptr_eq(
             &document.utf16_read_cache,
@@ -654,6 +692,8 @@ fn hundreds_of_distinct_captures_share_the_document_single_actual_8k_window() {
         snapshots.push(snapshot);
     }
     assert_eq!(Arc::strong_count(&document.utf16_read_cache), 513);
+    // Retained values own the same actual cache/backing after active teardown;
+    // only releasing their final collection ends those resource lifetimes.
     drop(document);
     drop(directory);
     assert!(!mapping.unmap_succeeded());
@@ -670,6 +710,8 @@ fn hundreds_of_distinct_captures_share_the_document_single_actual_8k_window() {
 
 #[test]
 fn interleaved_old_and_new_generations_reuse_one_box_without_changing_frozen_values() {
+    // Alternate reads of old, edited, and undone values against a single cache
+    // allocation; its key must retain each value's captured root and generation.
     let (_directory, mut document) = fixture("旧😀文");
     let original = document.text_snapshot();
     original.utf16_code_unit_at(0).unwrap();
@@ -688,12 +730,15 @@ fn interleaved_old_and_new_generations_reuse_one_box_without_changing_frozen_val
     document.undo_text_edit().unwrap();
     let restored = document.text_snapshot();
     assert_ne!(original.text.generation, restored.text.generation);
-    // Undo可恢复相同root；原捕获代次仍不同，不能用活动代次替代冻结键。
+    // Undo can restore the exact same root allocation while its capture
+    // generation differs; the active generation cannot substitute for a frozen key.
     assert!(Arc::ptr_eq(
         original.text.root.as_ref().unwrap(),
         restored.text.root.as_ref().unwrap()
     ));
     for _ in 0..128 {
+        // Every read may replace only derived cache contents, never characters
+        // or generation authority of the other immutable values.
         assert_eq!(original.utf16_code_unit_at(0), Ok(0x65e7));
         assert_eq!(changed.utf16_code_unit_at(0), Ok(0x65b0));
         assert_eq!(restored.utf16_code_unit_at(0), Ok(0x65e7));
@@ -708,6 +753,7 @@ fn interleaved_old_and_new_generations_reuse_one_box_without_changing_frozen_val
         );
     }
     document.redo_text_edit().unwrap();
+    // Final active mutation and teardown likewise leave all saved values intact.
     assert_eq!(document.utf16_code_unit_at(0), Ok(0x65b0));
     drop(document);
     assert_text(&original, "旧😀文");

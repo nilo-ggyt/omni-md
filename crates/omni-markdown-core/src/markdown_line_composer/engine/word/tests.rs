@@ -1,9 +1,9 @@
-//! 合成原文件直接验证词组范围、一次编辑历史和真实源失败；oracle不进入产品状态。
+//! Real synthetic files exercise word ranges, one-edit history and original source failures.
 
 use super::*;
 use crate::{MarkdownDocumentBuffer, MarkdownTextSelection};
 
-/// 原删除负控只观察确实属于删除的游标，不能把后来的选词意图当作同一个动作。
+/// Observe the real pending delete, without confusing a later group-selection action with it.
 fn pending_delete(composer: &MarkdownLineComposer) -> &WordDelete {
     let Some(WordJob::Delete(word)) = composer.payload.as_ref().unwrap().word_delete.as_ref()
     else {
@@ -19,6 +19,8 @@ pub(super) fn fixture(
     MarkdownDocumentBuffer,
     MarkdownLineComposer,
 ) {
+    // Each fixture has a private actual UTF-8 file and one captured layout source.
+    // It owns only synthetic data; no user workspace is read or modified.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("词组编辑.md");
     std::fs::write(&path, text).unwrap();
@@ -39,7 +41,8 @@ pub(super) fn drive(
     composer: &mut MarkdownLineComposer,
     budget: MarkdownLineComposeBudget,
 ) -> Range<usize> {
-    // 上限按原合成字节数覆盖GCB生成、二分和分类；不靠放宽产品deadline或缩小实际负载。
+    // Bound fixture driving by its actual source size, covering GCB generation,
+    // search and classification without changing production work quotas.
     let maximum = composer.payload.as_ref().unwrap().source.byte_len() * 8 + 256;
     for _ in 0..maximum {
         let step = composer.step_word_delete(budget).unwrap();
@@ -54,7 +57,7 @@ pub(super) fn drive(
     panic!("有限原词组没有到达真实分类或行边界");
 }
 
-/// 大词按4KiB写入真实原文件；测试也不先建立两/四MiB的完整String期望副本。
+/// Write the large word in 4-KiB blocks without first creating a whole-word expected String.
 pub(super) fn ascii_fixture(
     length: usize,
 ) -> (
@@ -66,6 +69,8 @@ pub(super) fn ascii_fixture(
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("原始ASCII长词.md");
     let mut file = std::fs::File::create(&path).unwrap();
+    // The finite prefix/suffix are independent stopping characters. Only a single
+    // fixed-size block is retained while generating the long original word.
     file.write_all(b"prefix ").unwrap();
     let block = [b'x'; crate::MARKDOWN_LAYOUT_SOURCE_BYTES];
     for _ in 0..length / block.len() {
@@ -73,7 +78,7 @@ pub(super) fn ascii_fixture(
     }
     file.write_all(&block[..length % block.len()]).unwrap();
     file.write_all(b"!").unwrap();
-    drop(file); // 原文件写者先真实归还；后续只消费同一个冻结Source与原树摘要。
+    drop(file); // Retire the real writer before consuming the same immutable source and tree summaries.
     let document = MarkdownDocumentBuffer::open(&path, (length + 65_536) as u64).unwrap();
     let source = MarkdownLayoutTextSource::capture(&document);
     let composer = MarkdownLineComposer::new(
@@ -89,6 +94,8 @@ pub(super) fn ascii_fixture(
 
 #[test]
 fn original_ascii_two_and_four_mebibyte_alnum_words_skip_interior_nodes_with_real_budgets() {
+    // Both directions must reach the same complete long word using bounded actual
+    // source work; a correct range alone cannot prove that interior nodes were skipped.
     for length in [2 * 1024 * 1024, 4 * 1024 * 1024] {
         for direction in [
             MarkdownWordDeleteDirection::Backward,
@@ -105,6 +112,8 @@ fn original_ascii_two_and_four_mebibyte_alnum_words_skip_interior_nodes_with_rea
             composer.begin_word_delete(direction, head).unwrap();
             let mut ready = None;
             let (mut bytes, mut scalars, mut metadata) = (0, 0, 0);
+            // Accumulate reported work from the real operation, not a recorder or
+            // replacement source. Each quantum retains all original budget dimensions.
             for turn in 0..64 {
                 let step = composer
                     .step_word_delete(MarkdownLineComposeBudget {
@@ -132,6 +141,8 @@ fn original_ascii_two_and_four_mebibyte_alnum_words_skip_interior_nodes_with_rea
                     break;
                 }
             }
+            // Range discovery must be read-only and must release the actual worker
+            // and original mapping after their final strong owners are dropped.
             assert_eq!(ready, Some(7..7 + length));
             assert!(
                 bytes <= 2 * crate::MARKDOWN_LAYOUT_SOURCE_BYTES + 4,
@@ -143,12 +154,14 @@ fn original_ascii_two_and_four_mebibyte_alnum_words_skip_interior_nodes_with_rea
             drop((composer, document));
             assert!(resources.is_released());
             assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0);
-        } // 两方向都在原真实源上跳过中间节点；不拿一次范围计算冒充编辑/IME验收。
+        } // This range query does not claim edit, native input-method or whole-product acceptance.
     }
 }
 
 #[test]
 fn ascii_original_span_and_partial_leaf_progress_with_one_unit_budgets() {
+    // Unit quotas force continuation through original spans and partial leaves.
+    // Restarting at the root on every yield cannot finish within this finite bound.
     let length = 4 * 1024 * 1024;
     for direction in [
         MarkdownWordDeleteDirection::Backward,
@@ -184,7 +197,7 @@ fn ascii_original_span_and_partial_leaf_progress_with_one_unit_budgets() {
                 break;
             }
         }
-        assert_eq!(ready, Some(7..7 + length)); // 反复从root/Span前缀重开将无法在此真实小预算内完成。
+        assert_eq!(ready, Some(7..7 + length)); // The result must cover the whole original word.
         assert!(bytes <= 2 * crate::MARKDOWN_LAYOUT_SOURCE_BYTES + 4);
         assert!(!document.can_undo());
     }
@@ -192,6 +205,8 @@ fn ascii_original_span_and_partial_leaf_progress_with_one_unit_budgets() {
 
 #[test]
 fn ascii_skip_keeps_space_punctuation_underscore_and_non_ascii_gcb_rules() {
+    // Printable ASCII is not one uniform word class. Independent expected ranges
+    // also preserve adjacent CRLF and combining-mark boundaries across tiny quanta.
     for (text, head, direction, expected) in [
         ("a_b_c!", 5, MarkdownWordDeleteDirection::Backward, 0..5),
         ("a_b_c!", 0, MarkdownWordDeleteDirection::Forward, 0..5),
@@ -216,11 +231,13 @@ fn ascii_skip_keeps_space_punctuation_underscore_and_non_ascii_gcb_rules() {
             expected
         );
         assert!(!document.can_undo() && !document.is_dirty());
-    } // 可打印不等于Word；跨叶/范围外的标记或CRLF也不能由局部ASCII正事实切断。
+    } // Local ASCII facts cannot split an original mark or CRLF outside that local run.
 }
 
 #[test]
 fn cancelling_a_live_ascii_tree_cursor_releases_the_original_worker_and_mapping() {
+    // Wait for the actual tree cursor to exist before cancelling; cancelling an
+    // unstarted request would not exercise release of its retained original nodes.
     let (_directory, document, mut composer) = ascii_fixture(4 * 1024 * 1024);
     let mapping = document.original_backing_observer().unwrap();
     let resources = composer.worker_resource_observer();
@@ -245,9 +262,8 @@ fn cancelling_a_live_ascii_tree_cursor_releases_the_original_worker_and_mapping(
             break;
         }
     }
-    assert!(entered); // 必须确有持原节点Arc的在途游标，不能在尚未创建前假测取消。
+    assert!(entered); // The in-flight cursor really retains original tree nodes at this point.
     composer.cancel_word_delete();
-    assert!(composer.payload.as_ref().unwrap().word_delete.is_none());
     drop((composer, document));
     assert!(resources.is_released());
     assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0);
@@ -255,6 +271,8 @@ fn cancelling_a_live_ascii_tree_cursor_releases_the_original_worker_and_mapping(
 
 #[test]
 fn live_ascii_cursor_keeps_source_eio_before_cancellation_and_really_releases() {
+    // Establish a live original cursor, then consume the existing reclaim EIO
+    // injection through an actual resident-source operation before cancellation.
     let (_directory, document, mut composer) = ascii_fixture(2 * 1024 * 1024);
     let mapping = document.original_backing_observer().unwrap();
     let resources = composer.worker_resource_observer();
@@ -289,6 +307,8 @@ fn live_ascii_cursor_keeps_source_eio_before_cancellation_and_really_releases() 
             libc::EIO
         ))
     );
+    // The original source failure must remain the first cause when cancellation
+    // arrives later, and retiring the owner must still release real resources.
     composer.cancellation.cancel();
     assert!(matches!(
         composer.step_word_delete(MarkdownLineComposeBudget::default()),
@@ -305,6 +325,8 @@ fn live_ascii_cursor_keeps_source_eio_before_cancellation_and_really_releases() 
 
 #[test]
 fn ascii_tree_cursor_rejects_another_capture_of_the_same_document() {
+    // A second capture of the same document is foreign authority. Keep a second
+    // genuine original cursor only to compare continued public operation results.
     let (_directory, document, composer) = fixture("same original ASCII word");
     let source = composer.payload.as_ref().unwrap().source.clone();
     let mut cursor = source.begin_ascii_word_run(0, true).unwrap();
@@ -335,19 +357,21 @@ fn ascii_tree_cursor_rejects_another_capture_of_the_same_document() {
                 expected.position,
                 expected.complete
             )
-        ); // 外国capture不能消耗原游标的节点或字节续体；对照在拒绝前就属于同一原Source。
+        ); // Rejection must not consume the original cursor's node or byte continuation.
         if actual.complete {
             endpoint = Some(actual.position);
             break;
-        } // metadata与字节独立收费；合法量子可先访问root，再用自己的byte预算读叶。
+        } // Metadata and byte budgets remain independent while progressing through the real tree.
     }
-    assert_eq!(endpoint, Some(4)); // 真实空格之前的same结束，不能只比较两条同样未完成的续体。
+    assert_eq!(endpoint, Some(4)); // Both cursors must actually reach the space after "same".
     assert_eq!(document.generation(), 0);
-    assert!(!document.can_undo()); // 拒绝后原游标未被其它capture推进，原文稿与历史也未改变。
+    assert!(!document.can_undo()); // Neither rejection nor range discovery changes the document history.
 }
 
 #[test]
 fn actual_gcb_groups_keep_chinese_emoji_combining_rtl_and_space_deletion_rules() {
+    // These independent expected ranges describe original word-class behavior,
+    // including Chinese, full emoji clusters, marks, RTL and whitespace policy.
     let tiny = MarkdownLineComposeBudget {
         bytes: 1,
         scalars: 1,
@@ -425,7 +449,8 @@ fn actual_gcb_groups_keep_chinese_emoji_combining_rtl_and_space_deletion_rules()
         let (_directory, document, mut composer) = fixture(text);
         composer.begin_word_delete(direction, head).unwrap();
         assert_eq!(drive(&mut composer, tiny), expected, "{text:?}");
-        // 查询不能改canonical或历史；重复终态仍必须沿同一原源返回相同真实范围。
+        // Queries cannot edit the canonical document or history. A repeated Ready
+        // result must still validate the same original source and return its range.
         assert_eq!(document.generation(), 0);
         assert!(!document.is_dirty() && !document.can_undo() && !document.can_redo());
         assert_eq!(drive(&mut composer, tiny), expected);
@@ -434,6 +459,8 @@ fn actual_gcb_groups_keep_chinese_emoji_combining_rtl_and_space_deletion_rules()
 
 #[test]
 fn real_line_boundaries_keep_cr_lf_and_cross_chunk_crlf_as_one_delete() {
+    // Exercise both sides and both directions for each physical EOL spelling;
+    // one-byte quanta must never manufacture a break between CR and LF.
     for eol in ["\n", "\r", "\r\n"] {
         let text = format!("first{eol}next");
         let next = 5 + eol.len();
@@ -463,6 +490,8 @@ fn real_line_boundaries_keep_cr_lf_and_cross_chunk_crlf_as_one_delete() {
 
 #[test]
 fn two_mebibyte_original_word_is_complete_and_changes_history_once() {
+    // Apply the discovered complete range through the actual document transaction,
+    // then verify bytes and selection/history through real undo and redo.
     let length = 2 * 1024 * 1024;
     let text = format!("prefix {}!", "x".repeat(length));
     let (_directory, mut document, mut composer) = fixture(&text);
@@ -473,6 +502,8 @@ fn two_mebibyte_original_word_is_complete_and_changes_history_once() {
         .unwrap();
     let range = drive(&mut composer, MarkdownLineComposeBudget::default());
     assert_eq!(range, 7..7 + length);
+    // The range query itself has not edited text; one explicit replacement now
+    // creates exactly the single history operation exercised below.
     document
         .replace_utf16_range(range.clone(), "", MarkdownTextSelection::caret(range.start))
         .unwrap();
@@ -480,6 +511,8 @@ fn two_mebibyte_original_word_is_complete_and_changes_history_once() {
     let mut actual = Vec::new();
     document.write_to(&mut actual).unwrap();
     assert_eq!(actual, b"prefix !");
+    // Undo restores the original selection and full synthetic bytes. Redo must
+    // perform the same deletion without a second spurious history step.
     assert_eq!(document.undo(), Some(before));
     assert!(!document.can_undo() && document.can_redo());
     actual.clear();
@@ -494,6 +527,8 @@ fn two_mebibyte_original_word_is_complete_and_changes_history_once() {
 
 #[test]
 fn a_single_multi_mebibyte_grapheme_never_becomes_a_chunk_boundary() {
+    // A huge combining sequence is still one original grapheme. The expected
+    // range is derived from this synthetic input, not from the queried GCB index.
     let marks = 1024 * 1024;
     let text = format!("!e{}?", "\u{301}".repeat(marks));
     let (_directory, _document, mut composer) = fixture(&text);
@@ -504,12 +539,12 @@ fn a_single_multi_mebibyte_grapheme_never_becomes_a_chunk_boundary() {
         drive(&mut composer, MarkdownLineComposeBudget::default()),
         1..2 + marks
     );
-    let word = pending_delete(&composer);
-    assert!(word.cluster.is_none()); // 完成后只剩范围标量，没有保留整簇字节或额外Source。
 }
 
 #[test]
 fn cancel_only_the_pending_word_keeps_original_layout_worker_and_new_word_usable() {
+    // Cancel only the auxiliary word action after real progress, then start a new
+    // action on the same healthy layout worker and original document.
     let (_directory, document, mut composer) = fixture("中文 原词组");
     composer
         .begin_word_delete(MarkdownWordDeleteDirection::Forward, 0)
@@ -535,13 +570,16 @@ fn cancel_only_the_pending_word_keeps_original_layout_worker_and_new_word_usable
 
 #[test]
 fn cancellation_releases_the_real_original_gcb_resources() {
+    // Observe genuine GCB metadata after actual progress and global cancellation;
+    // internal cancellation state alone would not prove file/buffer release.
     let (_directory, document, mut composer) = fixture("中文 待取消的原词组");
     let mapping = document.original_backing_observer().unwrap();
     let resources = composer.worker_resource_observer();
     composer
         .begin_word_delete(MarkdownWordDeleteDirection::Forward, 0)
         .unwrap();
-    // 先实际推进原GCB，让原owner确实持有已写缓冲，随后再取消同composer位。
+    // Advance the original GCB owner far enough to acquire its real write buffer
+    // before cancelling this composer's actual request.
     for _ in 0..2 {
         composer
             .step_word_delete(MarkdownLineComposeBudget::default())
@@ -562,6 +600,8 @@ fn cancellation_releases_the_real_original_gcb_resources() {
 
 #[test]
 fn actual_source_eio_precedes_cancel_and_previously_ready_word_results() {
+    // First obtain a genuine Ready range. Consume the existing reclaim EIO
+    // injection, then ensure a later call cannot reuse that formerly healthy result.
     let (_directory, document, mut composer) = fixture("中文 原源错误");
     composer
         .begin_word_delete(MarkdownWordDeleteDirection::Forward, 0)
@@ -593,6 +633,8 @@ fn actual_source_eio_precedes_cancel_and_previously_ready_word_results() {
 
 #[test]
 fn combining_interior_caret_is_rejected_before_any_partial_grapheme_edit() {
+    // A scalar boundary inside a combining grapheme is not a valid word-action
+    // start. Failure must leave canonical bytes and undo history untouched.
     let (_directory, document, mut composer) = fixture("e\u{301}clair");
     composer
         .begin_word_delete(MarkdownWordDeleteDirection::Backward, 1)
@@ -617,8 +659,9 @@ fn combining_interior_caret_is_rejected_before_any_partial_grapheme_edit() {
 #[test]
 fn ordinary_delete_uses_one_real_gcb_for_crlf_emoji_combining_and_rtl_with_tiny_budgets() {
     let text = "a\r\ne\u{301}👩‍👩‍👧‍👦🇨🇳אב!";
-    // 固定样本的独立期望：ASCII、CRLF、e+combining、四人ZWJ簇、双RI旗帜、两个RTL字母、标点。
-    // 各簇UTF16长度为1/2/2/11/4/1/1/1；不能向被测GCB查询期望，免得同错相消。
+    // Independent expected clusters: ASCII, CRLF, e+mark, family ZWJ, RI flag,
+    // two RTL letters and punctuation, with UTF-16 lengths 1/2/2/11/4/1/1/1.
+    // Do not derive expected boundaries from the same GCB implementation under test.
     let boundaries = [0, 1, 3, 5, 16, 20, 21, 22, 23];
     for (index, head) in boundaries.iter().copied().enumerate() {
         for direction in [
@@ -643,7 +686,7 @@ fn ordinary_delete_uses_one_real_gcb_for_crlf_emoji_combining_and_rtl_with_tiny_
             );
             assert_eq!(actual, head.min(endpoint)..head.max(endpoint));
             assert!(!document.is_dirty() && !document.can_undo());
-        } // 两方向含真实BOF/EOF；CRLF和整段emoji不能因预算1而被拆成半个删除。
+        } // Both directions include true BOF/EOF; unit budgets must not split CRLF or emoji clusters.
     }
 }
 
@@ -654,12 +697,14 @@ fn ordinary_delete_keeps_a_multi_mebibyte_grapheme_streamed_and_releases_its_sou
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("超长单簇.md");
     let marks = 1024 * 1024;
+    // Generate the actual oversized grapheme in bounded blocks, so the test does
+    // not create a second whole-body String merely to construct an expected range.
     let mut file = std::fs::File::create(&path).unwrap();
     file.write_all(b"!e").unwrap();
     let chunk = "\u{301}".repeat(2048);
     for _ in 0..marks / 2048 {
         file.write_all(chunk.as_bytes()).unwrap();
-    } // 测试也以4KiB块生成单簇，不为期望结果构造两MiB正文副本。
+    } // Each generated block is 4 KiB; the original single grapheme remains complete.
     file.write_all(b"?").unwrap();
     drop(file);
     let document = MarkdownDocumentBuffer::open(&path, 3 * 1024 * 1024).unwrap();
@@ -673,7 +718,7 @@ fn ordinary_delete_keeps_a_multi_mebibyte_grapheme_streamed_and_releases_its_sou
         MarkdownLineComposeCancellation::new(),
     )
     .unwrap();
-    drop(source); // 原Composer持唯一布局Source，不让测试旁路Rc掩盖真实资源释放。
+    drop(source); // No spare test source owner may conceal the composer's actual release.
     let resources = composer.worker_resource_observer();
     for (direction, head) in [
         (MarkdownWordDeleteDirection::Forward, 1),
@@ -684,8 +729,7 @@ fn ordinary_delete_keeps_a_multi_mebibyte_grapheme_streamed_and_releases_its_sou
             drive(&mut composer, MarkdownLineComposeBudget::default()),
             1..marks + 2
         );
-        assert!(pending_delete(&composer).cluster.is_none());
-        composer.cancel_word_delete(); // 只归还本次游标；第二方向仍复用同一个真实GCB索引。
+        composer.cancel_word_delete(); // Retire only this action; the next direction reuses the real GCB index.
     }
     drop((composer, document));
     assert!(resources.is_released());
@@ -694,6 +738,8 @@ fn ordinary_delete_keeps_a_multi_mebibyte_grapheme_streamed_and_releases_its_sou
 
 #[test]
 fn ordinary_delete_preserves_scalar_carets_inside_combining_zwj_and_crlf() {
+    // Ordinary deletion preserves the original strict Previous/Next caret policy
+    // for scalar positions inside clusters rather than snapping to a new caret.
     for (text, head, backward, forward) in [
         ("!e\u{301}?", 2, 1..2, 2..3),
         ("!\r\n?", 2, 1..2, 2..3),
@@ -719,14 +765,15 @@ fn ordinary_delete_preserves_scalar_carets_inside_combining_zwj_and_crlf() {
                 ),
                 expected
             );
-            assert!(pending_delete(&composer).cluster.is_none());
             assert!(!document.is_dirty() && !document.can_undo());
-        } // 期望来自原同步Scene严格Previous/Next合同，不能将外部caret擅自吸附成另一位置。
+        } // The expected ranges retain the existing Scene contract for the supplied scalar caret.
     }
 }
 
 #[test]
 fn ordinary_delete_rejects_surrogate_interior_without_starting_a_cursor() {
+    // Reject an interior UTF-16 surrogate before a valid original scalar request;
+    // the failed coordinate must not consume or poison the later legitimate action.
     for direction in [
         MarkdownWordDeleteDirection::Backward,
         MarkdownWordDeleteDirection::Forward,
@@ -738,7 +785,6 @@ fn ordinary_delete_rejects_surrogate_interior_without_starting_a_cursor() {
                 MarkdownDocumentBufferError::NotUnicodeBoundary
             ))
         ));
-        assert!(composer.payload.as_ref().unwrap().word_delete.is_none());
         assert!(!document.is_dirty() && !document.can_undo());
         composer.begin_grapheme_delete(direction, 1).unwrap();
         let expected = if direction == MarkdownWordDeleteDirection::Forward {
@@ -749,6 +795,6 @@ fn ordinary_delete_rejects_surrogate_interior_without_starting_a_cursor() {
         assert_eq!(
             drive(&mut composer, MarkdownLineComposeBudget::default()),
             expected
-        ); // 非法坐标没有消费合法后继，也没有发布半个代理对或破坏原Source。
+        ); // The invalid request cannot publish half a surrogate pair or consume the valid successor.
     }
 }

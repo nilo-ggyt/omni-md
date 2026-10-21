@@ -1,16 +1,19 @@
-//! 原 Style 请求在真实结构行首交给同一 Grid；最终几何归还后才向原行目录提交块元素。
+//! Hand the original Style request at a real structural row start to the same Grid.
+//! Commit the block to the original line directory only after final geometry returns.
 use super::*;
 use crate::VerifiedMarkdownLayoutTableRow;
 use crate::markdown_layout_source::table_rows::TablePlanWriter;
 
-/// 请求只持真实结构出版物与弱 Source；复制不会创建正文、格编辑会话或第二 worker。
+/// Retains the real structural publication and weak Source authority. Cloning
+/// creates no text copy, cell-editing session, or second worker.
 #[derive(Clone)]
 pub struct MarkdownLineTableRowRequest {
     nonce: std::sync::Arc<()>,
     row: VerifiedMarkdownLayoutTableRow,
     source: MarkdownLayoutTextAuthority,
 }
-/// 只有已完成所有真实格的 Grid 才归还此几何；列宽按完整 cell frame 的 26.6 数值封存。
+/// Geometry returned after the Grid completes all real cells. Column widths are
+/// sealed 26.6 values for complete cell frames.
 pub struct MarkdownLineTableRowResponse {
     request: MarkdownLineTableRowRequest,
     registered: MarkdownLineRegisteredFont,
@@ -26,11 +29,13 @@ pub(super) struct PendingRow {
     response: Option<MarkdownLineTableRowResponse>,
 }
 impl MarkdownLineTableRowRequest {
-    /// 原 sealed 行票负责 cell factory 和 canonical 来源，调用方不能改写坐标制造相邻行。
+    /// The original sealed row owns cell factories and canonical Source provenance.
+    /// Caller coordinates cannot manufacture another adjacent row.
     pub fn row(&self) -> &VerifiedMarkdownLayoutTableRow {
         &self.row
     }
-    /// 字体仅保同一 palette 的真实活性，块不使用文字 points；宽高来自实际 Grid 完成结果。
+    /// The font preserves actual same-palette liveness; a block has no text point
+    /// size. Width/height come from the completed Grid, not a guessed row height.
     pub fn respond_registered(
         self,
         registered: &MarkdownLineRegisteredFont,
@@ -38,6 +43,8 @@ impl MarkdownLineTableRowRequest {
         width_26_6: i64,
         column_widths_26_6: &[i64],
     ) -> Result<MarkdownLineTableRowResponse> {
+        // Require positive complete frames and the actual structural column count.
+        // Their checked sum must equal the reported Grid width before transfer.
         if height_26_6 <= 0
             || width_26_6 <= 0
             || column_widths_26_6.len() != self.row.columns()
@@ -63,7 +70,8 @@ impl MarkdownLineTableRowRequest {
     }
 }
 impl MarkdownLineComposer {
-    /// 正文保原 frontier，另分享空结构目录；Source/活动格的原构造不取得表格流权限。
+    /// Keep original frontier text composition and share its initially empty table
+    /// plan. Plain Source/active-cell construction does not gain table-flow authority.
     pub fn new_with_table_flow(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
@@ -83,7 +91,8 @@ impl MarkdownLineComposer {
         Ok(result)
     }
 
-    /// 原文字行必须已完成；只在当前 Style nonce 将实际物理行交给 Grid，不丢在途 Measure。
+    /// Begin only after the original text line completes. The current Style nonce
+    /// transfers this actual physical row to Grid without discarding an active Measure.
     pub fn begin_table_row(
         &mut self,
         request: &MarkdownLineStyleRequest,
@@ -95,6 +104,8 @@ impl MarkdownLineComposer {
                 .payload
                 .as_mut()
                 .ok_or(MarkdownLineComposeError::Poisoned)?;
+            // A structural block starts only at the composer's current committed
+            // endpoint, with no in-flight text, resolver, or previous table owner.
             if !matches!(payload.stage, Stage::Style)
                 || payload.start != row.source_range().start
                 || payload.measure.is_some()
@@ -114,7 +125,7 @@ impl MarkdownLineComposer {
                 source: self.authority.clone(),
             };
             payload.request = None;
-            payload.next_start = None; // 原 text LineEnd 的一次性起点不能跨越真实独立块。
+            payload.next_start = None; // A text LineEnd start ticket cannot cross this block.
             payload.table = Some(PendingRow {
                 request: request.clone(),
                 response: None,
@@ -125,7 +136,8 @@ impl MarkdownLineComposer {
         self.finish(result)
     }
 
-    /// 同坐标的旧 Row 响应也不能回到新请求；实际注册及 Source 由原 Store 再核。
+    /// An old row response cannot answer a new nonce at equal coordinates. The
+    /// original Store also rechecks actual registration and Source during capture.
     pub fn provide_table_row(&mut self, response: MarkdownLineTableRowResponse) -> Result<()> {
         let result = (|| {
             self.guard()?;
@@ -137,6 +149,8 @@ impl MarkdownLineComposer {
                 .table
                 .as_mut()
                 .ok_or(MarkdownLineComposeError::InvalidRequest)?;
+            // Accept one response for this original pending row, then verify the
+            // live registration before retaining its completed geometry.
             if !matches!(payload.stage, Stage::TableRow)
                 || pending.response.is_some()
                 || !std::sync::Arc::ptr_eq(&pending.request.nonce, &response.request.nonce)
@@ -152,7 +166,8 @@ impl MarkdownLineComposer {
     }
 }
 
-/// 每次只推进原依赖、GCB、item 或四条块记录中的一种，未完成 Grid 不会前移正文游标。
+/// Advance only one of original dependencies, graphemes, item capture, or four
+/// block-line records per turn. An unfinished Grid never advances the text cursor.
 pub(super) fn advance(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
@@ -166,6 +181,7 @@ pub(super) fn advance(
     match payload.stage {
         Stage::TableRow => {
             if pending.response.is_none() {
+                // Waiting on real Grid completion grants no text/GCB progress.
                 step.answer = MarkdownLineComposeAnswer::NeedsTableRow(pending.request.clone());
                 return Ok(());
             }
@@ -182,6 +198,8 @@ pub(super) fn advance(
             }
         }
         Stage::TableGraphemes => {
+            // Preserve the same canonical row span while migrating only its visible
+            // structural endpoints into the original grapheme record domain.
             let progress = payload.store.capture_graphemes_through(
                 payload.coordinator.word_breaks()?,
                 pending.request.row.source_range().end,
@@ -203,7 +221,8 @@ pub(super) fn advance(
                         MarkdownLineInlineControlKind::TableRow,
                     ),
                     registered: response.registered,
-                    // 独立块的范围就是它的真实布局域，不把多物理行结构伪装成 UBA 段落。
+                    // This independent block's range is its actual layout domain;
+                    // multiple physical lines must not masquerade as a UBA paragraph.
                     facts: MarkdownLineItemFacts {
                         source_utf16: range.clone(),
                         paragraph_utf16: range,
@@ -227,6 +246,8 @@ pub(super) fn advance(
             }
         }
         Stage::TableCapture => {
+            // Capture the real control item first, then derive the block's sealed
+            // line records from that same opaque item proof.
             let before = payload.store.record_count()?;
             if let Some(proof) = payload.store.step_control(budget.records.min(256))? {
                 payload.store.begin_table_line(&proof)?;
@@ -239,6 +260,8 @@ pub(super) fn advance(
                 .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
         }
         Stage::TablePublish => {
+            // Only actual LineEnd completion permits the original coordinator to
+            // finish the row and move the public composition cursor.
             let before = payload.store.record_count()?;
             if let Some(line) = payload.store.step_table_line(budget.records.min(256))? {
                 payload.coordinator.finish_table_row(&pending.request.row)?;

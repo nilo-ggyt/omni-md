@@ -1,4 +1,5 @@
-//! 已完成run与配对栈分别排序/寻址；各有一真实16KiB写buffer，固定总上限32KiB。
+//! Completed runs and bracket frames use separate ordered/addressed indexes.
+//! Each owns one real 16-KiB write buffer, for a fixed combined 32-KiB ceiling.
 use super::{
     MarkdownScript as Script, MarkdownScriptCancellation as Cancellation,
     MarkdownScriptError as Error, MarkdownScriptRun as Run, Result,
@@ -29,6 +30,8 @@ impl From<LayoutIndexError> for Error {
         }
     }
 }
+/// Encodes checked machine coordinates in the fixed on-disk record format,
+/// without truncating an addressable value to fit a smaller integer.
 fn put(record: &mut [u8], field: usize, value: usize) -> Result<()> {
     record[field..field + 8].copy_from_slice(
         &u64::try_from(value)
@@ -37,12 +40,15 @@ fn put(record: &mut [u8], field: usize, value: usize) -> Result<()> {
     );
     Ok(())
 }
+/// Decodes the same fixed-width field and refuses values this process cannot
+/// address instead of treating wrapped offsets as valid source coordinates.
 fn get(record: &[u8], field: usize) -> Result<usize> {
     let bytes: [u8; 8] = record[field..field + 8].try_into().expect("固定八字节字段");
     usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| Error::CoordinateOverflow)
 }
 impl Store {
-    /// 表格本体没有 SCX run；此覆盖游标仅承认原物理硬边界，不能给被跳正文补 Common。
+    /// Table bodies have no SCX runs. This coverage cursor accepts original physical
+    /// hard boundaries without filling skipped source text with Common runs.
     #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
     pub(super) fn skip_table(
         &mut self,
@@ -56,7 +62,8 @@ impl Store {
         self.end_utf16 = span.end.utf16;
         Ok(())
     }
-    /// 同一折叠 proof 只转移覆盖游标；隐藏 body 没有 Script 值，也不制造 Unknown/空 run 填洞。
+    /// The same fold proof moves coverage only. Hidden text has no script value;
+    /// Unknown or empty runs must not be manufactured to fill that hole.
     #[cfg(feature = "paged-line-compose")]
     pub(super) fn skip_fold(
         &mut self,
@@ -71,10 +78,12 @@ impl Store {
         Ok(())
     }
 
+    /// Acquires separate anonymous run/frame indexes under one cancellation
+    /// authority. Partial construction releases already acquired local owners.
     pub(super) fn new(cancellation: &Cancellation) -> Result<Self> {
         cancellation.check()?;
         let runs = PagedLayoutIndex::new()?;
-        cancellation.check()?; // 第一份索引装配期间也可撤权，局部owner在返回前真实析构。
+        cancellation.check()?; // Cancellation during first-index acquisition drops that actual local owner.
         let frames = PagedLayoutIndex::new()?;
         cancellation.check()?;
         Ok(Self {
@@ -85,6 +94,8 @@ impl Store {
             cancellation: cancellation.clone(),
         })
     }
+    /// Uses a real caller-owned descriptor for storage-permission regression;
+    /// production encoding, buffering, page I/O, and cancellation remain unchanged.
     #[cfg(test)]
     pub(super) fn with_runs_file(file: std::fs::File, cancellation: &Cancellation) -> Result<Self> {
         Ok(Self {
@@ -93,28 +104,34 @@ impl Store {
             end_byte: 0,
             end_utf16: 0,
             cancellation: cancellation.clone(),
-        }) // 只替换真实FD权限，后续仍执行原追加buffer/换页实际写入路径，不代算任何脚本结果。
+        }) // Only actual descriptor permissions differ; original buffered/page writes still compute results.
     }
+    /// Returns committed record count without reading source text or file pages.
     pub(super) fn run_count(&self) -> usize {
         self.runs.len()
     }
-    /// 只借原唯一追加页已初始化的记录范围；不复制页、不读旧文件，也不创建后继缓存。
-    /// 调用方仍须用 run 完整解码选中的实际记录，取消及已知索引首错不能被范围查询绕过。
+    /// Borrows initialized record bounds from the sole append page, without copying
+    /// it, reading older file pages, or creating a successor cache.
+    /// Callers still decode selected real records with `run`. Range inspection
+    /// cannot bypass cancellation or the index's known first failure.
     pub(super) fn run_append_page(&mut self) -> Result<Option<std::ops::Range<usize>>> {
         self.cancellation.check()?;
         self.runs.append_page_records().map_err(Into::into)
     }
+    /// Returns actual allocated frame IDs, not the current bracket-stack depth.
     pub(super) fn frame_count(&self) -> usize {
         self.frames.len()
     }
+    /// Publishes one nonempty contiguous run. Coverage endpoints advance only
+    /// after its real fixed record enters the owned append index successfully.
     pub(super) fn append_run(&mut self, run: Run) -> Result<()> {
-        self.cancellation.check()?; // 固定每次metadata操作核同handle，深栈循环不等整step完成才取消。
+        self.cancellation.check()?; // Check this same cancellation handle on every metadata operation, including deep stacks.
         if run.start_byte != self.end_byte
             || run.start_utf16 != self.end_utf16
             || run.start_byte >= run.end_byte
             || run.start_utf16 >= run.end_utf16
         {
-            return Err(Error::CorruptMetadata); // 只发布真实连续非空覆盖，不用空run填补尚未解析的前缀。
+            return Err(Error::CorruptMetadata); // Publish actual contiguous nonempty coverage; empty runs cannot fill unparsed prefixes.
         }
         let mut record = [0; 64];
         for (field, value) in [
@@ -131,6 +148,8 @@ impl Store {
         self.end_utf16 = run.end_utf16;
         Ok(())
     }
+    /// Reads and validates one actual run record; malformed coordinates or a
+    /// script outside the pinned table revoke this metadata result.
     pub(super) fn run(&mut self, index: usize) -> Result<Run> {
         self.cancellation.check()?;
         let record = self.runs.read(index)?;
@@ -149,6 +168,8 @@ impl Store {
         }
         Ok(run)
     }
+    /// Appends one bracket frame with backward-only links. A frame may refer
+    /// to the currently open run ID, but never a future run or forward frame.
     pub(super) fn append_frame(&mut self, frame: Frame) -> Result<usize> {
         self.cancellation.check()?;
         let index = self.frames.len();
@@ -168,6 +189,8 @@ impl Store {
         self.frames.append(record)?;
         Ok(index)
     }
+    /// Revalidates persisted pairing links before they can change stack heads
+    /// or constrain a closing bracket's script.
     pub(super) fn frame(&mut self, index: usize) -> Result<Frame> {
         self.cancellation.check()?;
         let record = self.frames.read(index)?;
@@ -187,31 +210,43 @@ impl Store {
         }
         Ok(frame)
     }
+    /// Once actual pairing work ends, close its no-longer-needed index rather
+    /// than retaining an idle descriptor/write buffer throughout layout.
     pub(super) fn seal_frames(&mut self) -> Result<()> {
         self.cancellation.check()?;
         self.frames.close().map_err(Into::into)
     }
+    /// Seals completed run storage for later bounded reads; retained run data
+    /// and physically returned append resources remain distinct facts.
     pub(super) fn seal_runs(&mut self) -> Result<()> {
         self.cancellation.check()?;
         self.runs.seal().map_err(Into::into)
     }
+    /// Attempts both owned closes before propagating failure. Cancellation must
+    /// not prevent cleanup of resources this operation already acquired.
     pub(super) fn close(&mut self) -> Result<()> {
         let frames = self.frames.close();
         let runs = self.runs.close();
         frames?;
         runs?;
-        Ok(()) // 即使第一份失败仍尝试归还另一份，不能用失败短路留下额外映射。
+        Ok(()) // Attempt both actual closes before returning the first failure; never leave another mapping by short-circuiting.
     }
+    /// Revokes both derived indexes together; later metadata hits cannot revive
+    /// a partially failed source/layout construction.
     pub(super) fn poison(&mut self) {
         self.frames.poison();
         self.runs.poison();
     }
+    /// Returns the two original fixed-fact observers without retaining either
+    /// file, mapping, or document text as another diagnostic owner.
     pub(super) fn observers(&self) -> (LayoutIndexObserver, LayoutIndexObserver) {
         (
             self.runs.resource_observer(),
             self.frames.resource_observer(),
         )
     }
+    /// Reports actual separate index-page loads for profiling, never inferred
+    /// source reads or a kernel-RSS reclamation receipt.
     pub(super) fn loads(&self) -> (u64, u64) {
         (self.runs.page_loads(), self.frames.page_loads())
     }

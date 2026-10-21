@@ -73,19 +73,21 @@ impl MarkdownSessionAccess {
         let result_limit = requested_limit.clamp(1, MAX_SEARCH_RESULTS);
         let scanned = self.scan_ranked_search(query, result_limit, None, &is_current);
         if !is_current() {
-            // 保留旧Vec接口既有取消语义；新分页接口另以显式失败拒绝失效凭据。
+            // Preserve this complete-vector API's empty-result cancellation
+            // contract; the paged API separately rejects superseded credentials.
             return Ok(Vec::new());
         }
         Ok(scanned?
             .into_iter()
             .map(|item| {
-                // 旧接口只转移最多K条元数据，不暴露内部排序键。
+                // Transfer at most K metadata records without exposing internal rank keys.
                 item.result
             })
             .collect())
     }
 
-    /// 共享单候选映射与有界排名；调用者决定旧Vec或新分页的取消返回语义。
+    /// Share one-candidate source acquisition and bounded ranking. The caller
+    /// owns the complete-vector or paged API's distinct cancellation outcome.
     fn scan_ranked_search(
         &self,
         query: &str,
@@ -95,46 +97,55 @@ impl MarkdownSessionAccess {
     ) -> Result<Vec<RankedSearchResult>, MarkdownWorkspaceError> {
         let pattern = SearchPattern::new(query.as_bytes());
         let mut ranked = Vec::<RankedSearchResult>::with_capacity(result_limit + 1);
-        // 单次扫描可复用空的私有scratch目录；每个候选映射与目录owner都在本次调用结束前释放。
+        // Reuse only an empty private scratch directory during this scan. Each
+        // candidate's backing and the directory owner end before this call returns.
         let mut snapshot_directory = None;
         let walk_result = walk_markdown_workspace(&self.canonical_root, |entry| {
-            // 目录条目同样检查取消，纯目录树也不能绕过结束权限继续遍历。
+            // Check cancellation for directory entries too; a directory-only tree
+            // cannot continue traversal after its request authority ends.
             if !is_current() {
-                // 停止遍历同时释放已打开目录句柄，不保留后台游标。
+                // Stop traversal and release open directory iterators without
+                // retaining a background cursor.
                 return Ok(WalkControl::Stop);
             }
             let MarkdownFilesystemEntry::Note(path) = entry else {
-                // 目录只用于导航，不能当成正文候选或搜索结果。
+                // Directories guide traversal but are neither body candidates nor note results.
                 return Ok(WalkControl::Continue);
             };
-            // 先匹配标题；标题命中优先且完全跳过该笔记正文映射。
+            // Match the title first: title hits rank higher and need no body mapping.
             let title = markdown_title(path)?;
             let title_match = pattern.find(title.as_bytes(), is_current)?;
-            // 在正文读取前按既有排序过滤已翻过的身份；不为旧页重复映射正文或生成摘要。
+            // Exclude the already-returned rank prefix before body acquisition;
+            // earlier pages need neither repeated body mappings nor new snippets.
             let score = if title_match.is_some() {
-                // 标题命中已经确定最高排名，不需要读取正文。
+                // A title match already proves the highest rank without reading content.
                 2
             } else {
-                // 只有正文可能命中；先核对排名前缀，排除旧页后才映射该候选。
+                // Only the body can match; check its possible rank before deciding
+                // whether this page may acquire that candidate's source.
                 1
             };
             let relative_path = relative_markdown_path(&self.canonical_root, path)?;
             if after.is_some_and(|last| {
-                // keyset 必须严格在末项之后；同分用原相对路径字节序，不受目录枚举顺序影响。
+                // Keyset continuation must be strictly after the previous final
+                // result; relative-path bytes break ties independently of read_dir order.
                 compare_search_position(score, &relative_path, last) != Ordering::Greater
             }) {
-                // 已展示的排名前缀不再进入当前页，正文仍保持未打开状态。
+                // An already-returned prefix cannot enter this page; leave its body unopened.
                 return Ok(WalkControl::Continue);
             }
             let (score, snippet) = if title_match.is_some() {
-                // 标题命中不生成正文摘要，也不获取文件映射。
+                // A title hit produces no body snippet and acquires no content mapping.
                 (2_u8, None)
             } else {
-                // 仅临时映射当前正文候选；借用文本不能离开本回调。
+                // Acquire only the current candidate transiently; no borrowed
+                // source text may escape this inspection callback.
                 if snapshot_directory.is_none() {
-                    // 第一次正文扫描才取得私有scratch；纯标题查询不执行快照IO。
+                    // Acquire private scratch only at the first body candidate;
+                    // a title-only search performs no snapshot I/O.
                     snapshot_directory = Some(SnapshotDirectory::new().map_err(|_| {
-                        // 无法建立私有快照边界则返回存储失败，不能回退为用户文件的可变映射。
+                        // Failure to establish private snapshot ownership is a
+                        // storage error, never permission to map the mutable user file.
                         MarkdownWorkspaceError::StorageUnavailable
                     })?);
                 }
@@ -143,7 +154,8 @@ impl MarkdownSessionAccess {
                     MAX_SEARCH_FILE_BYTES,
                     is_current,
                     |text| {
-                        // 首次命中后仍验证候选全部UTF8；合法EOF后才派生有限摘要。
+                        // Validate all candidate UTF-8 after the first hit too.
+                        // Derive the bounded snippet only after valid real EOF.
                         let start = pattern.find_bounded(text, is_current)?;
                         start
                             .map(|start| {
@@ -160,12 +172,14 @@ impl MarkdownSessionAccess {
                 )?
                 .value;
                 let Some(snippet) = body_match else {
-                    // 未命中候选不占结果名额，临时映射随检查返回释放。
+                    // A nonmatch occupies no result slot; inspection has already
+                    // reclaimed its transient source before this branch continues.
                     return Ok(WalkControl::Continue);
                 };
                 (1_u8, Some(snippet))
             };
-            // 只保留当前有界最佳候选；同分按路径排序，淘汰项立即释放。
+            // Retain only the current best bounded results. Path order resolves
+            // equal scores and truncation immediately releases an evicted record.
             ranked.push(RankedSearchResult {
                 score,
                 result: MarkdownSearchResult {
@@ -179,7 +193,8 @@ impl MarkdownSessionAccess {
             Ok(WalkControl::Continue)
         });
 
-        // 扫描失败保留原类别；取消也由外层在结果发布前再次核验，不发布半页。
+        // Preserve actual traversal failures. The caller separately rechecks
+        // cancellation before publication, never presenting a partial search page.
         walk_result?;
         Ok(ranked)
     }
@@ -196,16 +211,19 @@ impl MarkdownSessionAccess {
         self.search_generation.load(AtomicOrdering::Acquire) == generation
     }
 
-    /// 同路径正文已原子发布，只撤销可能依赖旧正文的搜索，不撤销目录排序末项。
-    /// 路径/kind/stem/root/collapse未变；note inode原子替换不属于目录cursor身份。
+    /// After same-path content publication, revoke only searches that may depend
+    /// on the old bytes. Path, kind, stem, root, and collapse intent are unchanged;
+    /// a note inode replacement is not part of the directory cursor's identity.
     pub(super) fn invalidate_content_search(&self) {
         self.search_generation.fetch_add(1, AtomicOrdering::AcqRel);
     }
 
-    /// 新建、路径变动、显式取消或关闭同时撤销搜索和目录；不用于同路径正文保存。
+    /// Creation, path changes, explicit cancellation, and closure revoke both
+    /// search and browsing. Same-path content saves use the narrower operation above.
     pub(super) fn cancel_active_search(&self) {
         self.invalidate_content_search();
-        // 文件集合/排序身份已改变，旧目录after或排队页不能继续交付。
+        // Collection/order authority has ended; neither an old continuation key
+        // nor an already queued directory page may continue delivery.
         self.browse_generation.fetch_add(1, AtomicOrdering::AcqRel);
     }
 }
@@ -255,7 +273,8 @@ impl SearchPattern {
         self.bytes.len()
     }
 
-    /// 单个KMP前缀跨真实4KiB窗口延续；命中位置只记录一次，尾部UTF8仍必须有效。
+    /// Carry one KMP prefix across real 4 KiB leases. Record only the first hit,
+    /// while still requiring the remaining candidate bytes to form valid UTF-8.
     fn find_bounded(
         &self,
         text: &BoundedMarkdownText,
@@ -265,23 +284,29 @@ impl SearchPattern {
         let mut found = self.bytes.is_empty().then_some(0);
         text.visit_validated_bytes(is_current, |start, bytes| {
             if found.is_some() {
-                // 无需继续KMP，但visit仍读取并校验真实尾部，非法文件不能发布局部命中。
+                // Matching can stop, but validation continues through the actual
+                // tail; an invalid file cannot publish an otherwise useful prefix hit.
                 return Ok(());
             }
             for (index, source_byte) in bytes.iter().copied().enumerate() {
                 let byte = if self.ascii_case_insensitive {
+                    // ASCII case folding preserves the original source byte offsets.
                     source_byte.to_ascii_lowercase()
                 } else {
+                    // Non-ASCII queries retain literal bytes and scalar alignment.
                     source_byte
                 };
                 while matched > 0 && byte != self.bytes[matched] {
+                    // Reuse a shorter proven query border without rereading source bytes.
                     matched = self.prefix_lengths[matched - 1];
                 }
                 if byte == self.bytes[matched] {
+                    // Advance the same cross-window query prefix until its first full match.
                     matched += 1;
                     if matched == self.bytes.len() {
                         found = Some(start + index + 1 - matched);
-                        break; // 只停止此窗口KMP，不终止外层完整UTF8扫描。
+                        // Stop only this window's KMP work, not the enclosing UTF-8 scan.
+                        break;
                     }
                 }
             }
@@ -338,17 +363,18 @@ struct RankedSearchResult {
     result: MarkdownSearchResult,
 }
 
-/// 已展示末项的纯排序键；不持正文、摘要、映射或目录迭代器。
+/// Keep only the last returned sorting key, without content, snippets, mappings,
+/// or a live directory iterator.
 #[derive(Debug)]
 struct SearchPosition {
     score: u8,
     relative_path: String,
 }
 
-/// 比较当前候选与旧页末项；Greater才有资格进入后续页。
+/// Admit a continuation candidate only when it sorts strictly after the last result.
 fn compare_search_position(score: u8, path: &str, last: &SearchPosition) -> Ordering {
     last.score.cmp(&score).then_with(|| {
-        // 与首次查询同一字节序，避免并列项跨页重复或遗漏。
+        // Use the first page's same byte order so ties neither repeat nor disappear.
         path.cmp(&last.relative_path)
     })
 }
@@ -365,7 +391,8 @@ fn compare_ranked_search_results(
     })
 }
 
-/// 已完成全文件UTF8验证后，只借用命中周围足以覆盖原scalar规则的小窗口。
+/// After complete UTF-8 validation, borrow only the small interval surrounding
+/// the hit that can satisfy the established scalar-count snippet context.
 fn bounded_file_search_snippet(
     text: &BoundedMarkdownText,
     match_start: usize,
@@ -376,25 +403,30 @@ fn bounded_file_search_snippet(
         .checked_add(match_bytes)
         .filter(|end| *end <= text.len())
         .ok_or(MarkdownWorkspaceError::StorageUnavailable)?;
-    // 原前缀rev().nth(N)实际需要N+1个前驱，后缀nth(N)最多需要N+1个边界。
-    // 每scalar至多4byte，查询上限128scalar，整个借用始终小于4KiB。
+    // Reverse nth(N) needs up to N+1 preceding scalars; the suffix needs at most
+    // N+1 boundaries. At four bytes per scalar plus a 128-scalar query, the whole
+    // requested interval stays below the source's 4 KiB lease limit.
     let context = (SNIPPET_CONTEXT_CHARACTERS + 1) * 4;
     let begin = match_start.saturating_sub(context);
     let end = match_end.saturating_add(context).min(text.len());
     text.with_bytes(begin..end, is_current, |bytes| {
         let mut skip = 0;
         while skip < bytes.len() && bytes[skip] & 0xc0 == 0x80 {
-            // 任意字节起点最多切入一个已证明有效的scalar，跳过其continuation尾。
+            // An arbitrary start can split only one already-validated scalar;
+            // skip its continuation tail before decoding the finite context.
             skip += 1;
         }
         let bytes = &bytes[skip..];
         let valid = match std::str::from_utf8(bytes) {
+            // A scalar-aligned complete interval needs no trimming.
             Ok(value) => value,
             Err(error) if error.error_len().is_none() => {
-                // 有限窗口尾可以切入下一scalar，只去掉该残余；已验证EOF本身不能残缺。
+                // The bounded interval may end within the next scalar. Trim only
+                // that residual; the already-validated real EOF cannot be incomplete.
                 std::str::from_utf8(&bytes[..error.valid_up_to()])
                     .map_err(|_| MarkdownWorkspaceError::InvalidUtf8Document)?
             }
+            // A definite invalid sequence is not an interval-boundary artifact.
             Err(_) => return Err(MarkdownWorkspaceError::InvalidUtf8Document),
         };
         let local = match_start
@@ -461,7 +493,7 @@ mod tests {
         // A synthetic vault exposes query results without accessing any personal file content.
         let directory = tempfile::tempdir().expect("temporary vault");
         let root = directory.path().join("vault");
-        let workspace = MarkdownWorkspace::new(root.clone(), directory.path().join("data"));
+        let workspace = MarkdownWorkspace::new(root.clone());
         let access = workspace.open_session().expect("open synthetic session");
         fs::write(root.join("Note.md"), "needle").expect("seed searchable note");
         let generation = access.search_generation.load(AtomicOrdering::Acquire);

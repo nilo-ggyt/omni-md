@@ -1,4 +1,6 @@
-//! 同源GCB按实际排版前缀迁入唯一输出FD；显式可见ordinal域不冒充未解析隐区的原全源序号。
+//! Migrate same-Source graphemes into the unique output FD for the actual layout
+//! prefix. Explicit visible ordinal domains do not impersonate raw whole-Source
+//! ranks inside unparsed hidden ranges.
 use super::*;
 use crate::{MarkdownGraphemeBoundary, MarkdownLayoutBreakJob};
 
@@ -10,7 +12,9 @@ pub(super) use search::{lower_bound, ordinal_boundary};
 
 pub(super) const GRAPHEME: u8 = 12;
 
-/// 不连续record的固定目录；count是原全局ordinal前缀，covered不是glyph布局范围。
+/// Fixed directory for noncontiguous records. Count belongs to its explicit domain;
+/// filtered TableVisible/FoldedVisible ranks are not raw whole-Source ordinals.
+/// Covered tracks migrated grapheme metadata, not glyph-layout coverage.
 #[derive(Clone, Copy)]
 pub(super) struct GraphemeDirectory {
     pub domain: crate::MarkdownGraphemeOrdinalDomain,
@@ -22,6 +26,8 @@ pub(super) struct GraphemeDirectory {
 }
 impl GraphemeDirectory {
     pub(super) fn validate(&self, bytes: usize, utf16: usize, records: usize) -> Result<()> {
+        // A complete directory needs both its exact domain count and actual
+        // byte/UTF-16 EOF. Neither known Source length nor a count alone grants EOF.
         let eof = self.covered == (MarkdownGraphemeBoundary { byte: bytes, utf16 });
         if self.count == 0
             || self.total.is_some_and(|total| self.count > total)
@@ -54,7 +60,8 @@ pub(super) struct GraphemeCapture {
 }
 
 impl GraphemeCapture {
-    /// 未来 GCB 可由一个真实 UBA seam 隔开；只有本 item 应先写入的边界仍阻止 glyph 捕获。
+    /// A real UBA seam may precede the next grapheme. Only a buffered boundary
+    /// required by this item still prevents glyph capture.
     pub(super) fn has_buffered_through(&self, through: usize) -> bool {
         self.pending
             .is_some_and(|boundary| boundary.utf16 <= through)
@@ -73,14 +80,16 @@ impl GraphemeCapture {
     }
 }
 
-/// records只计真实64B写入，metadata_units计原GCB读取；两份配额不互相借用。
+/// Records count actual 64-byte writes; metadata_units count original grapheme
+/// reads. Neither allowance borrows from the other.
 pub(in crate::markdown_line_composer) struct GraphemeCaptureStep {
     pub records: usize,
     pub metadata_units: usize,
     pub ready: bool,
 }
 
-/// 普通控制仍只请求真实 GCB；内部整形端点必须借原 ItemScan 签发的同 Source 票。
+/// Ordinary controls still require actual grapheme endpoints. An internal shaping
+/// endpoint needs the original ItemScan's same-Source seam proof.
 #[derive(Clone, Copy)]
 enum CaptureEnd<'a> {
     Grapheme(usize),
@@ -97,7 +106,8 @@ impl CaptureEnd<'_> {
 }
 
 impl GlyphStore {
-    /// 只迁入截至原实际item/control端点的边界；不读正文、不把配额边界当GCB或EOF。
+    /// Migrate boundaries only through the actual original item/control endpoint.
+    /// Read no text; budget edges are neither grapheme boundaries nor EOF.
     pub(in crate::markdown_line_composer) fn capture_graphemes_through(
         &mut self,
         breaks: &mut MarkdownLayoutBreakJob,
@@ -113,7 +123,8 @@ impl GlyphStore {
         )
     }
 
-    /// 字形 item 的内部 UBA seam 不进入 GCB 目录；保留真实后继边界供下一 item 完成后迁入。
+    /// An item's internal UBA seam is not a grapheme record. Keep the real next
+    /// boundary buffered for migration after its following item is ready.
     pub(in crate::markdown_line_composer) fn capture_item_graphemes(
         &mut self,
         breaks: &mut MarkdownLayoutBreakJob,
@@ -155,6 +166,8 @@ impl GlyphStore {
                 metadata_units: 0,
                 ready: false,
             };
+            // Preserve the original Break Job's explicit ordinal domain and stable
+            // committed prefix. Frontier mode may still have an unknown total.
             let domain = breaks.grapheme_ordinal_domain(&self.authority)?;
             #[cfg(feature = "paged-shaping-frontier")]
             let (known, total) = {
@@ -169,7 +182,8 @@ impl GlyphStore {
                 (total, Some(total))
             };
             if known == 0 {
-                // 原GCB尚无首条记录；通过有限读留下实际需求，不能把空前缀解释为EOF。
+                // No original first record exists yet. A bounded query leaves real
+                // dependency demand; an empty prepared prefix cannot mean EOF.
                 #[cfg(feature = "paged-shaping-frontier")]
                 {
                     step.metadata_units = 1;
@@ -200,6 +214,8 @@ impl GlyphStore {
                 pending: None,
                 ancestors: Ancestors::new(),
             });
+            // Once known, the original raw total/domain cannot change beneath this
+            // capture. Table filtering derives its own final visible total later.
             if capture.domain != domain
                 || capture.source_total.is_some() && total != capture.source_total
             {
@@ -209,7 +225,8 @@ impl GlyphStore {
             if domain != crate::MarkdownGraphemeOrdinalDomain::TableVisible {
                 capture.total = total;
             }
-            // 可见域的总数只在真实 EOF record 经过筛选并写入后封存，原 raw count 不等于可见 count。
+            // Seal a visible-domain total only after filtering/writing actual EOF;
+            // the original raw boundary count is not the visible count.
             let file = self.index.as_mut().ok_or(Error::Poisoned)?;
             loop {
                 if let Some((_, covered)) = capture.last
@@ -217,7 +234,8 @@ impl GlyphStore {
                 {
                     if covered.utf16 != through_utf16 && step.records != 0 {
                         return Err(Error::InconsistentCoverage);
-                    } // 新目标必须是真实item GCB；已捕获更长前缀则可供较短行继续消费。
+                    } // New writes must land on a real item grapheme; an already
+                    // migrated longer prefix may serve an earlier shorter line.
                     step.ready = true;
                     break;
                 }
@@ -226,6 +244,9 @@ impl GlyphStore {
                     feature = "paged-shaping-frontier"
                 ))]
                 if let Some((mut low, mut high)) = capture.skip_search {
+                    // A table span may overlap raw metadata already prepared by the
+                    // original Job. Find its real end inside that known prefix
+                    // under the same metadata quota, without copying its interior.
                     if low < high {
                         if step.metadata_units == metadata_units {
                             break;
@@ -276,14 +297,15 @@ impl GlyphStore {
                     )?;
                     if !read {
                         break;
-                    } // 原ordinal尚未提交，保留同capture并让下一量子推进原GCB。
+                    } // Retain this capture while a later quantum advances the same GCB Job.
                     capture.read_ordinal = end;
-                    capture.pending = Some(value[0]); // 写预算用尽时只保一条实际已读记录，不重读计费。
+                    capture.pending = Some(value[0]); // Retain one read record across write-budget yields.
                 }
                 let value = capture.pending.ok_or(Error::InconsistentCoverage)?;
                 if value.utf16 > through_utf16 && matches!(target, CaptureEnd::BidiSeam(_)) {
-                    // 原 BreakJob 已交付真实下一 GCB，但它在本 item 的 UBA 端点之后。
-                    // 本轮不写一个伪边界、不丢已读记录；唯一后继 item 会继续消费同 pending。
+                    // The original Break Job returned the real next grapheme after
+                    // this item's UBA seam. Write no fabricated boundary and keep
+                    // that actual record for the one following item to consume.
                     step.ready = true;
                     break;
                 }
@@ -294,7 +316,8 @@ impl GlyphStore {
                 if self.table_skip.is_some_and(|span| {
                     span.start.utf16 < value.utf16 && value.utf16 < span.end.utf16
                 }) {
-                    // 旧短行可能已被原 job 看过；只二分它的真实已知前缀，不迁入内部 raw GCB。
+                    // The original Job may have seen old short rows. Search only
+                    // its actual known prefix; do not migrate internal raw boundaries.
                     capture.pending = None;
                     capture.skip_search = Some((capture.read_ordinal, known));
                     continue;
@@ -312,6 +335,8 @@ impl GlyphStore {
                 {
                     return Err(Error::InconsistentCoverage);
                 }
+                // Append and publish this same actual boundary in strict Source
+                // order. Update skip ancestors only after the file append succeeds.
                 let record = file.len();
                 let row = capture.ancestors.encode(
                     value,
@@ -332,7 +357,7 @@ impl GlyphStore {
                         })
                 {
                     return Err(Error::InconsistentCoverage);
-                } // 只有原全局 count 与真实 byte/UTF16 尾都一致，才有完整 EOF。
+                } // Actual raw count and byte/UTF-16 end must agree before claiming EOF.
                 if total == Some(capture.read_ordinal) {
                     capture.total = Some(capture.written);
                 }
@@ -343,7 +368,8 @@ impl GlyphStore {
         self.finish(result)
     }
 
-    /// 旧有限测试仍可迁完整表作为oracle；生产入口只传实际item/control端点。
+    /// Finite tests may migrate the complete real table as an oracle. Production
+    /// entries pass only actual item/control endpoints.
     #[cfg(test)]
     pub(in crate::markdown_line_composer) fn capture_graphemes(
         &mut self,
@@ -361,6 +387,8 @@ impl GlyphStore {
     }
 
     pub(super) fn grapheme_directory(&self) -> Result<GraphemeDirectory> {
+        // Validate this original writer's current metadata facts against actual
+        // Source dimensions and appended record bounds before any query uses them.
         self.guard()?;
         let directory = self
             .graphemes
@@ -386,6 +414,7 @@ impl GlyphStore {
             return Err(Error::InvalidRequest);
         }
         if offset > directory.covered.utf16 {
+            // Missing migrated records remain Pending, never known non-boundaries.
             return Err(Error::GraphemePrefixPending);
         }
         let bytes = self.source.byte_len();
@@ -398,8 +427,10 @@ impl GlyphStore {
         Ok(value.is_some_and(|value| value.utf16 == offset))
     }
 
-    /// 精确核原范围两端，并交回本次已解码的右端游标；非 GCB 返回 None，不签新边界。
-    /// 整行从原目录起查；内部 part 只借同次行尾副本继续向左，不向 Store 增加状态或预取。
+    /// Check both exact endpoints and return this query's decoded right cursor.
+    /// A non-grapheme returns None, never a replacement proof. Whole lines start
+    /// from the original directory; internal parts borrow a line-local right-cursor
+    /// copy to search left without Store state or prefetch.
     pub(super) fn grapheme_range_end(
         &mut self,
         range: &Range<usize>,
@@ -409,7 +440,8 @@ impl GlyphStore {
         if range.start > range.end || range.end > self.source.utf16_len() {
             return Err(Error::InvalidRequest);
         }
-        // 输出前缀只到实际已提交的 GCB；更远的位置应等待原推进，不能误判成簇内部。
+        // Output covers actual committed graphemes only. A farther endpoint waits
+        // for original progress instead of being classified as a grapheme interior.
         if range.end > directory.covered.utf16 {
             return Err(Error::GraphemePrefixPending);
         }
@@ -417,15 +449,17 @@ impl GlyphStore {
         let units = self.source.utf16_len();
         let mut query = match preceding {
             Some(right) => {
-                // 原行右端已经实际读取并解码；这里只复制固定查询事实，所有后继记录仍走
-                // 原 step 的 ordinal、skip、previous 和字节顺序校验，不能从坐标猜 GCB。
+                // This line's actual right endpoint was decoded already. Copy only
+                // fixed query facts; subsequent step reads retain ordinal, skip,
+                // predecessor, and Source-order authentication.
                 let mut query = right.clone();
                 query.preceding_offset(range.end)?;
                 query
             }
             None => BoundarySearch::offset(range.end),
         };
-        // 先定位右端，让左端沿同一反链复用已认证路径；两个源长度仍来自当前冻结来源。
+        // Locate right first, then search left through the same authenticated reverse
+        // links. Both dimensions still come from the original frozen Source.
         let right = query
             .step(directory, bytes, units, usize::MAX, |record| {
                 self.guard()?;
@@ -434,9 +468,9 @@ impl GlyphStore {
             .answer
             .ok_or(Error::InconsistentCoverage)?
             .1;
-        self.guard()?; // 第一次真实 IO 后仍核原 Source；没有用共享路径跳过取消或首错。
-        // 后续左端会移动原游标；保留右端只供本次行组合内的其他 part 使用。
-        // 即使目标恰是已解码 current、没有 pread，前后的 guard 也仍必须执行。
+        self.guard()?; // Recheck original Source/cancellation after actual I/O.
+        // The left query moves its cursor; retain right only for other parts in this
+        // same line assembly. Even a decoded-current hit retains both health gates.
         let right_query = query.clone();
         query.preceding_offset(range.start)?;
         let left = query
@@ -448,7 +482,8 @@ impl GlyphStore {
             .ok_or(Error::InconsistentCoverage)?
             .1;
         self.guard()?;
-        // 查找可返回目标右侧的真实边界；必须分别精确命中，才能签出完整范围。
+        // Lower-bound search may return a real boundary to the target's right.
+        // Both endpoints must match exactly before this complete range is accepted.
         Ok((left.is_some_and(|value| value.utf16 == range.start)
             && right.is_some_and(|value| value.utf16 == range.end))
         .then_some(right_query))

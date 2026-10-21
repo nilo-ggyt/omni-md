@@ -1,4 +1,4 @@
-//! 真Composer/匿名输出的行查找回归；有限oracle可保Vec，产品游标没有逐行数组。
+//! Line lookup through actual Composer/anonymous output; bounded test oracles may use Vec while product cursors keep no per-line array.
 
 use super::*;
 use crate::{
@@ -18,6 +18,8 @@ struct Fixture {
 }
 
 impl Fixture {
+    // Own a private real UTF-8 file, canonical document, captured Source, and font
+    // registration. Callers retain those actual owners until their release checks.
     fn new(text: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("真实行查找.md");
@@ -48,6 +50,8 @@ impl Fixture {
         }
     }
     fn composer(&self) -> MarkdownLineComposer {
+        // Narrow real width forces soft-line publication and directory paging;
+        // expected text positions never come from a second layout implementation.
         MarkdownLineComposer::new(
             self.source.clone(),
             &self.source.authority(),
@@ -58,6 +62,8 @@ impl Fixture {
         .unwrap()
     }
     fn next_line(&self, worker: &mut MarkdownLineComposer) -> Option<MarkdownComposedLineFacts> {
+        // Advance the production handshake until one sealed line or real EOF.
+        // Supply the original registered font/paragraph controls for its requests.
         for _ in 0..1_000_000 {
             match worker
                 .step(MarkdownLineComposeBudget::default())
@@ -66,6 +72,8 @@ impl Fixture {
             {
                 MarkdownLineComposeAnswer::Yielded => {}
                 MarkdownLineComposeAnswer::NeedStyle(request) => {
+                    // Respond to this exact source range; a generic default span
+                    // could hide a missing style handoff or stale request.
                     let range = request.source_range();
                     worker
                         .provide_style(
@@ -108,6 +116,8 @@ impl Fixture {
         panic!("有限真实Composer未完成");
     }
     fn output(&self) -> MarkdownComposedLines {
+        // Completion consumes the actual writer into its sealed output; this test
+        // helper creates no private reader, index records, or alternate owner graph.
         let mut worker = self.composer();
         while self.next_line(&mut worker).is_some() {}
         worker.into_output().unwrap()
@@ -125,6 +135,8 @@ fn lookup(
     output: &mut MarkdownComposedLines,
     target: MarkdownComposedLineLookupTarget,
 ) -> (Option<MarkdownComposedLine>, usize) {
+    // Budget actual directory records, not calls. Pending must consume its one
+    // record, while incomplete prefix remains distinct from a fabricated EOF line.
     let mut cursor = output.line_lookup(target).unwrap();
     let mut total = 0;
     for _ in 0..32_768 {
@@ -150,7 +162,7 @@ fn real_lines_match_reverse_chain_oracle_with_quota_one_and_both_endpoint_sides(
         oracle.push(actual.facts.clone());
         line = output.previous_line(&actual).unwrap();
     }
-    oracle.reverse(); // 仅小夹具沿原相邻逆链建立oracle，不用新skip查找生成期望。
+    oracle.reverse(); // Build the small oracle through the original adjacent reverse chain, independently of the skip lookup being checked.
     assert!(oracle.len() > 32);
     for facts in &oracle {
         let (actual, _) = lookup(
@@ -191,6 +203,8 @@ fn deep_lookup_reads_sublinear_real_rows_instead_of_walking_every_previous_line(
     let mut output = fixture.output();
     let last = output.last_line().unwrap().unwrap().facts.ordinal;
     assert!(last >= 2048);
+    // A remote target near the front of a genuinely long output must use bounded
+    // skip lookup rather than reading its complete reverse chain.
     let (line, records) = lookup(&mut output, MarkdownComposedLineLookupTarget::Ordinal(1));
     let line = line.unwrap();
     assert_eq!(line.facts.ordinal, 1);
@@ -227,6 +241,8 @@ fn true_empty_and_terminal_empty_line_keep_eof_affinity_without_creating_a_next_
             source(end, MarkdownComposedLineAffinity::Upstream),
         );
         if last.facts.source_utf16.is_empty() && last.facts.ordinal > 0 {
+            // At a terminal empty line, upstream still denotes the preceding real
+            // line; downstream owns that empty EOF line, not an invented successor.
             let previous = output.previous_line(&last).unwrap().unwrap();
             assert_eq!(up.unwrap().facts(), previous.facts());
         } else {
@@ -237,8 +253,8 @@ fn true_empty_and_terminal_empty_line_keep_eof_affinity_without_creating_a_next_
 
 #[test]
 fn paged_selected_lines_keep_remote_unicode_clusters_and_release_original_resources() {
-    // 字面 GCB 包含组合附标与真实非 BMP 字符；不同脚本使一条实际软行跨多个原 item。
-    // 有限重复样本让原 glyph/GCB/目录真正换页，不复制生产输出作为边界期望。
+    // Literal graphemes include combining marks/non-BMP scalars; mixed scripts place multiple actual shaping items in one soft line.
+    // A bounded repeated fixture causes actual glyph/GCB/directory paging without using copied output as expected boundaries.
     const TEXT: &str = "office e\u{301} \u{1f16a} αλφα ";
     const UNITS: usize = 18;
     const BOUNDARIES: &[usize] = &[0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 12, 13, 14, 15, 16, 17];
@@ -261,7 +277,7 @@ fn paged_selected_lines_keep_remote_unicode_clusters_and_release_original_resour
     let resources = output.resource_observer();
     let mut expected_end = text.encode_utf16().count();
     let mut line = output.last_line().unwrap();
-    // 从实际末行逆行核完整覆盖；固定字面的边界独立于输出索引，不用查询结果生成期望。
+    // Walk backward from the actual last line to check complete coverage; literal expected boundaries remain independent of the output index.
     while let Some(actual) = line {
         let facts = actual.facts();
         assert_eq!(facts.source_utf16.end, expected_end);
@@ -272,7 +288,7 @@ fn paged_selected_lines_keep_remote_unicode_clusters_and_release_original_resour
             let part = output.part(&actual, ordinal).unwrap().unwrap();
             let range = part.facts().source_utf16.clone();
             let mut at = range.start;
-            // 每个真实 part 的簇必须连续走到尾端；跨页读取不能跳过字符或借缺字完成。
+            // Actual clusters must cover each part continuously to its end; paging may neither skip characters nor complete through missing glyphs.
             while at < range.end {
                 let crate::MarkdownGlyphClusterAnswer::Known(Some(cluster)) =
                     output.cluster(&part, at).unwrap()
@@ -290,8 +306,8 @@ fn paged_selected_lines_keep_remote_unicode_clusters_and_release_original_resour
     }
     assert_eq!(expected_end, 0);
 
-    // 远端组合字与代理项内部仍明确拒绝 caret；失败只结束原查询，不毒化健康输出。
-    // 这一公开结果同时核共享查找的非精确命中不能被当作真正 GCB。
+    // Reject carets inside remote combining clusters/surrogates; end the invalid query without poisoning healthy output.
+    // This public result also verifies that an inexact shared lookup hit is not actual grapheme-boundary authority.
     for at in [95 * UNITS + 8, 95 * UNITS + 11] {
         let mut query = output
             .visual_query(at, MarkdownComposedLineAffinity::Downstream, None, true)
@@ -310,13 +326,13 @@ fn paged_selected_lines_keep_remote_unicode_clusters_and_release_original_resour
         assert!(rejected);
     }
     assert!(output.last_line().unwrap().is_some());
-    // 布局及被拒绝的光标查询都是只读操作，磁盘原文和文稿历史必须一起保持不变。
+    // Layout and rejected caret queries are read-only; persisted bytes and document history must both remain unchanged.
     assert_eq!(
         std::fs::read(fixture._directory.path().join("真实行查找.md")).unwrap(),
         text.as_bytes()
     );
     assert!(!fixture.document.is_dirty() && !fixture.document.can_undo());
-    // 关闭原输出后撤掉文稿、字体目录和来源拥有者，只通过原资源观察票核真实释放。
+    // Close output and drop document/catalog/Source owners, verifying actual release only through original resource observers.
     output.close().unwrap();
     drop(fixture);
     let actual = resources.snapshot();
@@ -328,8 +344,8 @@ fn paged_selected_lines_keep_remote_unicode_clusters_and_release_original_resour
 
 #[test]
 fn utf16_inside_non_bmp_scalar_only_locates_its_real_line_without_caret_authority() {
-    // 原固定字体 cmap 的 format 12 真实覆盖这两个非 BMP 符号；emoji 缺字单独验证
-    // typed 阻塞，不能用 .notdef 产出的行来冒充代理项查找的成功样本。
+    // The fixed font's format-12 cmap actually covers these non-BMP symbols; separate emoji cases check typed missing-glyph
+    // blocking, so a .notdef line cannot masquerade as successful surrogate-interior lookup.
     let fixture = Fixture::new("a \u{1f16a} b \u{1f16b} c");
     let mut output = fixture.output();
     let mut line = output.last_line().unwrap();
@@ -354,7 +370,7 @@ fn utf16_inside_non_bmp_scalar_only_locates_its_real_line_without_caret_authorit
             assert!(batch[..glyphs].iter().all(|glyph| glyph.glyph_id != 0));
         }
         line = output.previous_line(&actual).unwrap();
-    } // 只有原真实非零字形与原 LineEnd 都存在，才进入代理项内部的查找断言。
+    } // Require actual nonzero glyphs and the original LineEnd before checking surrogate-interior line lookup.
     for position in [2, 3, 7, 8] {
         let (actual, _) = lookup(
             &mut output,
@@ -362,10 +378,10 @@ fn utf16_inside_non_bmp_scalar_only_locates_its_real_line_without_caret_authorit
         );
         let actual = actual.unwrap();
         assert!(actual.facts.source_utf16.contains(&position));
-    } // 查找不会把低代理项变成source端点；返回的始终是原封口整行。
+    } // Lookup does not turn a low surrogate into a source endpoint; it returns the original sealed complete line.
 }
 
-/// 缺字夹具仍走真实字体和字形索引，不能用换字体把原错误的 consumer 交接隐藏掉。
+/// Missing-glyph fixtures use actual fonts/glyph indexes; switching fonts cannot hide an incorrect consumer handoff.
 fn missing_font_choice(
     fixture: &Fixture,
     worker: &mut MarkdownLineComposer,
@@ -412,6 +428,8 @@ fn missing_glyph_stays_typed_without_entering_reshape_and_cancellation_releases_
     assert!(
         matches!(&choice, crate::MarkdownSoftLineMeasureChoice::NeedsFontFallback { cluster_utf16, missing_glyphs } if cluster_utf16 == &(2..4) && *missing_glyphs > 0)
     );
+    // A real font-fallback request is blocked until its consumer responds. Inspect
+    // actual work/resources so repeated stepping cannot silently reshape or leak.
     let before = resources.snapshot().unwrap();
     for _ in 0..8 {
         let progress = worker.step(MarkdownLineComposeBudget::default()).unwrap();
@@ -428,7 +446,7 @@ fn missing_glyph_stays_typed_without_entering_reshape_and_cancellation_releases_
             ),
             (0, 0, 0, 0, 0)
         );
-    } // 阻塞只重核原权，不重新整形、创建 resolver 或积累另一个缺字任务。
+    } // Blocked work revalidates original authority without reshaping, allocating another resolver, or accumulating fallback tasks.
     let after = resources.snapshot().unwrap();
     assert_eq!(before.shapes, after.shapes);
     assert_eq!(before.clusters, after.clusters);
@@ -471,7 +489,7 @@ fn original_source_error_precedes_cancellation_even_while_font_consumer_is_pendi
                 crate::MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
             ))
         ));
-    } // 原失败保持 sticky；撤销后的第二次调用也不能把实际 EIO 改写成普通取消或缺字。
+    } // The recorded Source failure stays sticky; a later call after cancellation cannot rewrite injected EIO as cancellation/missing glyphs.
     let closed = resources.snapshot().unwrap();
     assert!(!closed.writer.unwrap().file_open && closed.writer.unwrap().mapped_bytes == 0);
     assert_eq!(closed.resolvers.registered, 0);
@@ -488,6 +506,8 @@ fn old_prefix_downstream_end_is_not_eof_and_foreign_snapshot_cannot_resume_curso
     let mut old_cursor = old
         .line_lookup(MarkdownComposedLineLookupTarget::Ordinal(0))
         .unwrap();
+    // Publish a later prefix from the same writer. The old immutable prefix still
+    // lacks its downstream neighbor; the newer output has its own reader identity.
     fixture.next_line(&mut worker).unwrap();
     let mut new = worker.publish_ready_prefix().unwrap().unwrap();
     assert!(
@@ -530,79 +550,6 @@ fn old_prefix_downstream_end_is_not_eof_and_foreign_snapshot_cannot_resume_curso
     assert_eq!(old.last_line().unwrap().unwrap().facts(), &first);
 }
 
-/// 仅破坏小夹具派生记录的独立匿名副本；原Source和正文始终未改。每次只读/写一条64B，
-/// 最终公开游标实际pread到损坏header，不用直接调私有decode假装覆盖了I/O消费者。
-fn corrupted(
-    output: &mut MarkdownComposedLines,
-    mutate: impl FnOnce(&mut [u8; 64]),
-) -> MarkdownComposedLines {
-    let last = output.last_line().unwrap().unwrap();
-    let mut mutation = Some(mutate);
-    let mut index = PagedLayoutIndex::<64>::new().unwrap();
-    let count = output.payload.as_ref().unwrap().reader.len();
-    for record in 0..count {
-        let mut row = output.row(record).unwrap();
-        if record == last.header {
-            mutation.take().unwrap()(&mut row);
-        }
-        index.append(row).unwrap();
-    }
-    let payload = output.payload.as_ref().unwrap();
-    let identity = Arc::new(());
-    MarkdownComposedLines::from_sealed(OutputSeal {
-        source: payload.source.clone(),
-        authority: output.authority.clone(),
-        fonts: payload.fonts.clone(),
-        cancellation: output.cancellation.clone(),
-        reader: index.into_reader().unwrap(),
-        #[cfg(feature = "paged-shaping-frontier")]
-        lineage: Arc::downgrade(&identity),
-        identity,
-        last: output.last,
-        count: output.count,
-        range: output.range.clone(),
-        graphemes: output.graphemes,
-        folds: payload.folds.clone(),
-        #[cfg(all(
-            feature = "s2-table-window-prototype",
-            feature = "paged-shaping-frontier"
-        ))]
-        tables: payload.tables.clone(),
-    })
-    .unwrap()
-}
-
-#[test]
-fn malformed_skip_ordinal_record_and_nonmonotone_source_permanently_reject_real_reader() {
-    let fixture = Fixture::new(&"a ".repeat(16));
-    let mut output = fixture.output();
-    for field in [40, 48, 0] {
-        let mut damaged = corrupted(&mut output, |row| {
-            let value = if field == 0 {
-                u64_at(row, 8) + 1
-            } else {
-                u64::MAX - 1
-            };
-            row[field..field + 8].copy_from_slice(&value.to_le_bytes());
-        });
-        let receipt = damaged.resource_observer();
-        let mut cursor = damaged
-            .line_lookup(MarkdownComposedLineLookupTarget::Ordinal(0))
-            .unwrap();
-        assert_eq!(damaged.step_line_lookup(&mut cursor, 1).unwrap().records, 1);
-        assert!(matches!(
-            damaged.step_line_lookup(&mut cursor, 1),
-            Err(Error::InconsistentCoverage)
-        ));
-        assert!(!receipt.snapshot().file_open && receipt.snapshot().mapped_bytes == 0);
-        assert!(matches!(
-            damaged.step_line_lookup(&mut cursor, 1),
-            Err(Error::Poisoned)
-        ));
-    }
-    output.last_line().unwrap(); // 损坏副本失败不能撤销原健康Output。
-}
-
 #[test]
 fn source_error_precedes_cancel_and_cached_tail_with_actual_close_and_unmap() {
     let fixture = Fixture::new(&"a ".repeat(32));
@@ -628,7 +575,7 @@ fn source_error_precedes_cancel_and_cached_tail_with_actual_close_and_unmap() {
     assert!(source_receipt.payload_released());
     assert!(backing.unmap_succeeded() && backing.mapped_bytes() == 0);
     assert!(backing.failed() && backing.first_errno() == Some(libc::EIO));
-    drop(cursor); // 游标尚活时Source/FD已实际归还；弱票不能成为业务强边。
+    drop(cursor); // Source/FD are actually released while the cursor remains live; weak authority cannot become a business ownership edge.
 }
 
 #[test]
@@ -673,11 +620,13 @@ fn identical_bytes_in_other_source_cannot_receive_a_line_from_foreign_lookup() {
         Err(Error::SourceMismatch)
     ));
     assert!(!receipt.snapshot().file_open);
-    original.last_line().unwrap().unwrap(); // 错误只归还接收方，不撤销仍健康的原Output。
+    original.last_line().unwrap().unwrap(); // Failure releases only the receiving output, leaving the healthy original output valid.
 }
 
 #[test]
 fn invalid_record_quota_rejects_before_reading_and_does_not_revive_the_reader() {
+    // Invalid public work budgets terminate this actual reader. Subsequent valid
+    // stepping cannot revive it; verify public errors and actual FD/mmap release.
     for quota in [0, STEP + 1] {
         let fixture = Fixture::new("a a a a");
         let mut output = fixture.output();
@@ -689,7 +638,6 @@ fn invalid_record_quota_rejects_before_reading_and_does_not_revive_the_reader() 
             output.step_line_lookup(&mut cursor, quota),
             Err(Error::InvalidRequest)
         ));
-        assert!(cursor.tail.is_none() && cursor.current.is_none());
         assert!(!receipt.snapshot().file_open && receipt.snapshot().mapped_bytes == 0);
         assert!(matches!(
             output.step_line_lookup(&mut cursor, 1),

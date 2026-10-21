@@ -1,4 +1,5 @@
-//! 原LineEnd的固定祖先槽；只写同一文件的两字段，不建立逐行内存索引。
+//! Fixed ancestor slots for original LineEnds. Two fields in the same file encode
+//! skip links without an in-memory entry per line.
 
 use super::*;
 
@@ -9,8 +10,9 @@ pub(super) struct LineAncestor {
 }
 
 impl GlyphStore {
-    /// 清除ordinal最低有效位就是本行的skip目标。目标与本行之间的ordinal有更多1位，
-    /// 因此按popcount分槽时不会覆盖这个目标；发布计数先checked，最多使用usize::BITS槽。
+    /// Clearing the ordinal's lowest set bit selects this line's skip target.
+    /// Intermediate ordinals have more set bits, so popcount slots preserve that
+    /// target. Check the next publication count before using at most usize::BITS slots.
     pub(super) fn write_line_skip(&self, row: &mut [u8; 64]) -> Result<()> {
         self.lines.checked_add(1).ok_or(Error::Overflow)?;
         let previous = if self.lines == 0 {
@@ -44,11 +46,13 @@ impl GlyphStore {
         Ok(())
     }
 
-    /// 只有真实末记录和原许可全部完成后调用。槽更新与原LineEnd发布同一步，不从
-    /// 半写入行或失败重试中保留跳链；旧只读前缀仍只见自身已封口的记录。
+    /// Publish only after the actual tail record and original permit checks finish.
+    /// Update slots with LineEnd publication; no partial line or failed retry leaves
+    /// a live skip link. Old readers still see only their own sealed prefix.
     pub(super) fn publish_line(&mut self, end: usize, source_end: usize) -> Result<()> {
-        // 目录必须已经落在本次真实LineEnd之前，且覆盖本行端点。这里只复制固定
-        // 事实，不把后继writer当前目录借给旧reader，也不以行前缀末尾声称源EOF。
+        // Grapheme metadata must precede this actual LineEnd and cover its endpoint.
+        // Copy fixed facts only: a newer writer directory cannot extend an old
+        // reader, and a line-prefix endpoint cannot claim whole-Source EOF.
         let graphemes = self.grapheme_directory()?;
         if graphemes.last >= end || graphemes.covered.utf16 < source_end {
             return Err(Error::InconsistentCoverage);

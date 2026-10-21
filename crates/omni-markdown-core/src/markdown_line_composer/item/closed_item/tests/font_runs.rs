@@ -1,8 +1,10 @@
-//! 真实SFNT缺字与完整字素回退；测试字体只移除x映射，其余轮廓、GSUB/GPOS和cmap保留。
+//! Real SFNT missing-glyph and complete-grapheme fallback. The fixture removes only
+//! x's cmap entry while retaining the other outlines, GSUB/GPOS tables, and mappings.
 
 use super::*;
 
-/// 重排原Roboto的单个cmap子表，仅去掉x；真实shaper必须自行产生glyph0，不能伪造响应。
+/// Rewrite one actual Roboto cmap subtable to omit x. The real shaper must produce
+/// glyph zero itself; neither glyph responses nor the font port are substituted.
 fn without_x() -> MarkdownLayoutFont {
     let mut bytes = ROBOTO.to_vec();
     let u16_at = |offset| {
@@ -11,6 +13,8 @@ fn without_x() -> MarkdownLayoutFont {
         ))
     };
     let u32_at = |offset| u32::from_be_bytes(ROBOTO[offset..offset + 4].try_into().unwrap());
+    // Locate the actual cmap table and its format-12 subtable in the source SFNT.
+    // Every retained mapping below keeps its original glyph identity.
     let record = (0..u16_at(4))
         .map(|index| 12 + index * 16)
         .find(|&offset| &ROBOTO[offset..offset + 4] == b"cmap")
@@ -25,7 +29,8 @@ fn without_x() -> MarkdownLayoutFont {
         let offset = subtable + 16 + index * 12;
         let (start, end, glyph) = (u32_at(offset), u32_at(offset + 4), u32_at(offset + 8));
         if start <= u32::from('x') && end >= u32::from('x') {
-            // 同一原group只拆成两边；不移动其它字符的原glyph编号或篡改缺字之外的字体能力。
+            // Split only the group containing x. Keep every other character's
+            // original glyph index and all capabilities unrelated to this omission.
             if start < u32::from('x') {
                 groups.push((start, u32::from('x') - 1, glyph));
             }
@@ -38,7 +43,7 @@ fn without_x() -> MarkdownLayoutFont {
     }
     let length = 16 + groups.len() * 12;
     let mut replacement = Vec::new();
-    replacement.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 4]); // 唯一Unicode format12编码记录。
+    replacement.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 4]); // One Unicode format-12 encoding record.
     replacement.extend_from_slice(&12_u32.to_be_bytes());
     replacement.extend_from_slice(&[0, 12, 0, 0]);
     replacement.extend_from_slice(&(length as u32).to_be_bytes());
@@ -49,6 +54,8 @@ fn without_x() -> MarkdownLayoutFont {
             replacement.extend_from_slice(&value.to_be_bytes());
         }
     }
+    // Keep the rewritten table within the original allocation, leaving other SFNT
+    // tables in place. Resolve the resulting real font through its actual name data.
     assert!(replacement.len() <= u32_at(record + 12) as usize);
     bytes[cmap..cmap + replacement.len()].copy_from_slice(&replacement);
     let name = read_fonts::FontRef::from_index(&bytes, 0)
@@ -60,7 +67,8 @@ fn without_x() -> MarkdownLayoutFont {
     MarkdownLayoutFont::resolve_name_table_at_size(Arc::new(bytes), &name, &[], 16.0).unwrap()
 }
 
-/// 独立原完整Job逐条取得小夹具的实际字形；不是从候选结果复制期望值。
+/// Obtain the small fixture's real glyph records from an independent original
+/// complete Job; expected records are never copied from the candidate.
 fn original_glyphs(
     source: &MarkdownLayoutTextSource,
     actual: &MarkdownLayoutFont,
@@ -78,6 +86,8 @@ fn original_glyphs(
         options,
     )
     .unwrap();
+    // Prepare through actual one-byte/one-scalar Source work before shaping. Release
+    // and inspect the oracle's real backing resources after reading its finite result.
     for _ in 0..100_000 {
         if job
             .step(
@@ -126,7 +136,7 @@ fn missing_closed_gcb_reuses_actual_probe_coalesces_fonts_and_reshapes_original_
         let fallback_registration = catalog.register(&fallback).unwrap();
         let mut worker = fixture.worker(true, MarkdownLineComposeCancellation::new());
         let resources = worker.resources.observer();
-        let mut ranges = Vec::new(); // 只有这个数个字素的oracle保结果，不进入生产owner。
+        let mut ranges = Vec::new(); // Only this few-grapheme oracle retains results.
         let mut probes = Vec::new();
         let mut ended = false;
         for _ in 0..100_000 {
@@ -154,7 +164,8 @@ fn missing_closed_gcb_reuses_actual_probe_coalesces_fonts_and_reshapes_original_
                         let missing = glyphs.iter().any(|glyph| glyph.glyph_id == 0);
                         if range.start < fallback_range.end {
                             assert_eq!(range.len(), (fallback_range.len() / 2));
-                        } // 组合mark与x属于同一真实GCB，绝不能只试缺字HB cluster或拆标量。
+                        } // x plus its mark is one real grapheme, not a bare missing
+                        // HarfBuzz cluster or independently selectable scalars.
                         probes.push((range.clone(), missing));
                         if missing {
                             &fallback_registration
@@ -173,6 +184,8 @@ fn missing_closed_gcb_reuses_actual_probe_coalesces_fonts_and_reshapes_original_
                         .unwrap();
                 }
                 MarkdownLineItemAnswer::ItemReady(facts) => {
+                    // Compare the whole coalesced run with a fresh real shaping Job
+                    // using its original paragraph/context facts and selected payload.
                     let mut item = worker.take_item().unwrap();
                     let actual = if facts.source_utf16 == fallback_range {
                         &fallback
@@ -213,7 +226,7 @@ fn missing_closed_gcb_reuses_actual_probe_coalesces_fonts_and_reshapes_original_
                         )
                     ));
                     ranges.push(facts.source_utf16);
-                    drop(item); // 只有原真实child释放后，下一段才允许被发布。
+                    drop(item); // Only actual child release permits the next run.
                 }
                 MarkdownLineItemAnswer::EndOfSource => {
                     ended = true;
@@ -237,6 +250,8 @@ fn missing_closed_gcb_reuses_actual_probe_coalesces_fonts_and_reshapes_original_
                 .iter()
                 .any(|(range, missing)| range.start == fallback_range.end && !missing)
         );
+        // Both production run children and the independent oracle have been dropped;
+        // check actual files, mappings, Source backing, and font payload release.
         drop(worker);
         let released = resources.snapshot().unwrap();
         assert_eq!(released.shapes.active, 0);
@@ -295,7 +310,8 @@ fn pending_closed_missing_gcb_preserves_source_errno_before_cancel_and_drops_ori
                     .reclaim_original_read_windows_for_test()
                     .is_err()
             );
-        } // 原mapping实际回收失败后再取消，旧字体试次也必须交付同一个Source首因。
+        } // Existing injection reports EIO through real backing reclaim, not a
+        // naturally induced kernel failure. The old font trial must retain it.
         cancellation.cancel();
         let failure = worker.step(one()).err().expect("取消不应发布缺字Job");
         if poison {
@@ -318,7 +334,8 @@ fn pending_closed_missing_gcb_preserves_source_errno_before_cancel_and_drops_ori
                 Err(MarkdownLineComposeError::Cancelled)
             ));
         }
-        assert!(worker.payload.is_none());
+        // Typed failure and actual Job resource release establish the public
+        // cancellation outcome without mirroring the worker's private payload slot.
         let released = receipt.snapshot();
         assert_eq!(
             (

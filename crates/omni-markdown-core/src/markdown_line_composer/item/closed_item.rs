@@ -1,4 +1,5 @@
-//! 自然闭合小项的单次坐标票；不把开放前缀或预算切片提升为完整排版范围。
+//! Single-use proofs for a naturally closed, bounded shaping item. An open prefix or
+//! a budget-sized slice cannot establish a complete layout range.
 
 use super::*;
 use crate::markdown_layout_breaks::MarkdownCertifiedGraphemeEndpoint;
@@ -8,11 +9,13 @@ pub(super) use fonts::{
     FontRuns, advance_fonts, inspect_shaped, lend_font_item, provide_font_style,
 };
 
-// UTF16上限同时界定标量上限；byte上限来自原GCB票，不为准入再读取文字或定位端点。
+// The UTF-16 bound also bounds the scalar count. Byte coordinates come from the
+// original grapheme proofs; admission neither rereads text nor relocates endpoints.
 pub(super) const MAX_CLOSED_UTF16: usize = 256;
 pub(super) const MAX_CLOSED_BYTES: usize = 1024;
 
-/// 只有当前真实Style阶段能构造；不可Clone且保原端点弱scope，公开Range不能重放。
+/// Issued only by the original Style phase. This non-Clone ticket retains weak
+/// endpoint scopes, so public coordinates alone cannot replay its authority.
 pub(crate) struct ClosedItem {
     source: MarkdownLayoutTextAuthority,
     font: MarkdownLayoutFontAuthority,
@@ -21,8 +24,10 @@ pub(crate) struct ClosedItem {
     cancellation: MarkdownShapingCancellation,
 }
 
-/// 原闭项票消费后的唯一整形输入值；三种范围具名区分，不把上下文包络当正文或 GCB。
-/// 没有 Source/Font 强边；真实资源仍由紧接着创建的原 PendingClosedShaping 独占。
+/// The sole shaping input obtained by consuming a closed-item ticket. Named ranges
+/// distinguish item UTF-16, item bytes, and context; context is not a grapheme proof.
+/// This value owns no Source or font payload. The immediately created original
+/// PendingClosedShaping remains responsible for those real resources.
 pub(crate) struct ClosedShapingInput {
     pub(crate) source_utf16: Range<usize>,
     pub(crate) source_bytes: Range<usize>,
@@ -35,7 +40,8 @@ pub(super) enum Admission {
     Frontier(CertifiedShapingEndpoint),
 }
 
-/// 原唯一item槽先保存有限准备续体；Font/样式/段落事实直到原Job装配后原样移交。
+/// The existing item slot retains bounded preparation until the original Job is
+/// assembled, then transfers the same font, style, paragraph facts, and seam proofs.
 pub(super) struct PendingItem {
     pub(super) shaping: crate::markdown_shaping::PendingClosedShaping,
     pub(super) font: MarkdownLayoutFontAuthority,
@@ -46,7 +52,8 @@ pub(super) struct PendingItem {
 }
 
 impl ClosedItem {
-    /// 原Font确实变化，右端由实际字体选择或自然项端点封闭；普通短响应没有此入口。
+    /// Accept a real font transition whose right edge is certified by font choice
+    /// or the natural item endpoint. An arbitrary shorter response has no such proof.
     pub(super) fn from_terminal_font_change(
         terminal: &crate::markdown_shaping::frontier::MarkdownShapingTerminalGrapheme,
         endpoints: [MarkdownCertifiedGraphemeEndpoint; 2],
@@ -57,6 +64,8 @@ impl ClosedItem {
         let bytes = terminal.byte_range();
         let first = endpoints[0].boundary(authority)?;
         let last = endpoints[1].boundary(authority)?;
+        // The terminal's complete blocking grapheme must remain inside the two
+        // original endpoints. Neither a byte budget nor a foreign scope can close it.
         if terminal.source_authority() != authority
             || terminal.original_font().same_payload(font)
             || !endpoints[0].same_scope(&endpoints[1])
@@ -69,8 +78,9 @@ impl ClosedItem {
             || last.byte - first.byte > MAX_CLOSED_BYTES
         {
             return Err(MarkdownLineComposeError::SourceMismatch);
-        } // 原阻塞GCB必须完整包含；连续回退字素只按真实右边界合并，不按预算截断。
+        }
         let scope = terminal.owner_scope();
+        // A terminal outliving its producing owner cannot authorize another Job.
         if scope.strong_count() == 0 {
             return Err(MarkdownLineComposeError::Poisoned);
         }
@@ -91,13 +101,17 @@ impl ClosedItem {
         end: CertifiedShapingEndpoint,
         cancellation: &MarkdownLineComposeCancellation,
     ) -> Result<Admission> {
+        // Check the original Source before inspecting coordinates or moving proofs;
+        // a stale backing must fail rather than become an ordinary pending frontier.
         payload.source.health()?;
         let request = payload
             .request
             .as_ref()
             .ok_or(MarkdownLineComposeError::InvalidRequest)?;
         if payload.open_script || response.coverage != request.range {
-            return Ok(Admission::Frontier(end)); // 临时SCX上界和缩短响应都不证明自然项结束。
+            // An open Script_Extensions prefix or shortened response still needs
+            // the original frontier to establish the natural item end.
+            return Ok(Admission::Frontier(end));
         }
         let scan = payload
             .scan
@@ -109,6 +123,8 @@ impl ClosedItem {
         let first = start.boundary(authority)?;
         let last = end.boundary(authority)?;
         start.require_pair(&end, authority)?;
+        // The actual Style request, scanner, Source, and paired endpoint proofs
+        // must describe one complete item. A mismatch is never downgraded to Pending.
         if !matches!(payload.stage, Stage::Style)
             || !Arc::ptr_eq(&request.nonce, &response.request.nonce)
             || request.source != *authority
@@ -121,9 +137,11 @@ impl ClosedItem {
             || last.byte > payload.source.byte_len()
         {
             return Err(MarkdownLineComposeError::SourceMismatch);
-        } // 两张真实GCB端点票和原扫描必须指向同一来源；失配不能降格成普通前沿待决。
+        }
         if request.range.len() > MAX_CLOSED_UTF16 || last.byte - first.byte > MAX_CLOSED_BYTES {
-            return Ok(Admission::Frontier(end)); // 真实大项继续原Frontier，不缩短样式或段落。
+            // A genuinely large item continues through the same frontier; retain
+            // its complete style and paragraph instead of manufacturing a short item.
+            return Ok(Admission::Frontier(end));
         }
         let scope = Arc::downgrade(
             payload
@@ -131,6 +149,8 @@ impl ClosedItem {
                 .as_ref()
                 .ok_or(MarkdownLineComposeError::InconsistentCoverage)?,
         );
+        // Recheck before consuming the original left proof. Failed admission leaves
+        // that proof in the scanner; success moves it without another reader/index.
         payload.source.health()?;
         let start = payload
             .scan
@@ -145,10 +165,11 @@ impl ClosedItem {
             scope,
             endpoints: [start, end],
             cancellation: cancellation.shape.clone(),
-        })) // 成功才移动原票；没有第二Source、Font强边、Reader或索引。
+        }))
     }
 
-    /// 消费原票、样式scope和原取消位；裸坐标不能进入这个封闭转换。
+    /// Consume the original ticket, style scope, and cancellation authority. Bare
+    /// coordinates cannot enter this conversion or renew an expired producing scope.
     pub(crate) fn into_input(
         self,
         source: &MarkdownLayoutTextAuthority,
@@ -157,13 +178,13 @@ impl ClosedItem {
     ) -> std::result::Result<ClosedShapingInput, MarkdownShapingError> {
         if &self.source != source {
             return Err(MarkdownShapingError::SourceMismatch);
-        } // 相同文字、相同坐标的新Source不能继承原Style阶段的闭项权限。
+        } // Equal text and coordinates in another Source do not inherit this proof.
         if !self.font.same_payload(font) {
             return Err(MarkdownShapingError::FontMismatch);
-        } // 同名Font不能替代原响应实际选定的payload。
+        } // A same-named font cannot replace the payload selected by the response.
         if self.scope.strong_count() == 0 {
             return Err(MarkdownShapingError::Poisoned);
-        } // 原Style阶段结束后，即使外部仍持坐标也不得装配Job。
+        } // Retained coordinates cannot authorize a Job after the Style owner ends.
         let [start, end] = self.endpoints;
         let first = start
             .boundary(source)
@@ -171,10 +192,13 @@ impl ClosedItem {
         let last = end
             .boundary(source)
             .map_err(|_| MarkdownShapingError::SourceMismatch)?;
-        // 端点getter只检查来源和弱scope，不执行I/O；原Source健康门由装配入口先核。
+        // Endpoint access checks identity and weak scopes without I/O; the assembly
+        // entry is responsible for checking the actual Source's health first.
         start
             .require_pair(&end, source)
             .map_err(|_| MarkdownShapingError::SourceMismatch)?;
+        // A certified bidi seam stops shaping context at that endpoint. Without
+        // such a seam, keep the original Source extent available to bounded readers.
         let context = (if start.seam().is_some() {
             first.byte
         } else {

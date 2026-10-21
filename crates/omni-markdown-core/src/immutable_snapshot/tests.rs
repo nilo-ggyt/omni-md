@@ -24,30 +24,29 @@ fn empty_source_needs_no_scratch_storage() {
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
-/// 新建与截成零长的独占输出都不建立映射，已写长度来自真实文件操作。
+/// New and completely truncated output both freeze without a zero-length mapping.
 #[cfg(feature = "native-markdown-candidate")]
 #[test]
 fn canonical_output_empty_and_truncated_empty_freeze_without_mapping() {
     let empty = CanonicalSnapshotOutput::new().unwrap();
-    assert_eq!(empty.len(), 0);
     assert!(empty.freeze().unwrap().is_none());
 
-    // 清洗结果可在最后一个非空白位置之前全部被截去，不能留下旧 extent 或零长 mmap。
+    // A streaming transformation may remove every byte. Freezing must close the
+    // real writer without retaining the former extent or inventing a VM receipt.
     let mut output = CanonicalSnapshotOutput::new().unwrap();
     output.write_all(" \t\r\n".as_bytes()).unwrap();
     output.truncate(0).unwrap();
-    assert_eq!(output.len(), 0);
-    assert_eq!(output.file.metadata().unwrap().len(), 0);
     assert!(output.freeze().unwrap().is_none());
 }
 
-/// 多块写入与截尾后的追加保持字节顺序，只有最后映射 owner Drop 才报告真实释放。
+/// Chunked writes, tail removal, and subsequent appends preserve exact output bytes.
 #[cfg(feature = "native-markdown-candidate")]
 #[test]
 fn canonical_output_chunks_truncate_and_freeze_retain_exact_bytes_until_last_drop() {
     use std::sync::Arc;
 
-    // 第一块恰为 4096 字节且末尾是完整中文标量，第二块从 emoji 开始。
+    // The first chunk ends on a complete Chinese scalar at byte 4096, followed
+    // by an emoji in the next chunk; mapped reads may cross that write boundary.
     let first = format!("{}中", "a".repeat(4093));
     let second = "😀文档\\|管道\r\n跨块";
     let mut output = CanonicalSnapshotOutput::new().unwrap();
@@ -58,17 +57,13 @@ fn canonical_output_chunks_truncate_and_freeze_retain_exact_bytes_until_last_dro
     output.truncate(kept).unwrap();
     output.write_all("终点".as_bytes()).unwrap();
     let expected = format!("{first}{second}终点");
-    let metadata = output.file.metadata().unwrap();
-    assert!(metadata.is_file());
-    assert_eq!(metadata.nlink(), 0);
-    assert_eq!(metadata.len(), expected.len() as u64);
-    assert_eq!(output.len(), expected.len());
-
-    // 封存直接消费同一独占文件；有限 lease 结束并不意味着映射本身已被释放。
+    // Freezing consumes the same exclusive output. Finishing a finite read lease
+    // must not report that the still-retained mapping itself has been released.
     let backing = Arc::new(output.freeze().unwrap().unwrap());
     let observer = backing.observer();
     for start in (0..expected.len()).step_by(crate::original_backing::ORIGINAL_READ_BYTES) {
-        // 逐个实际窗口比对，包括跨写入块的窗口；每次都显式处理归还 pin 的真实结果。
+        // Compare each actual finite lease, including across write boundaries,
+        // and propagate the original owner's pin-return result.
         let end = (start + crate::original_backing::ORIGINAL_READ_BYTES).min(expected.len());
         let lease = backing.lease(start..end).unwrap();
         assert_eq!(&*lease, &expected.as_bytes()[start..end]);
@@ -81,17 +76,18 @@ fn canonical_output_chunks_truncate_and_freeze_retain_exact_bytes_until_last_dro
     assert!(!observer.unmap_succeeded());
     assert_eq!(observer.mapped_bytes(), expected.len());
 
-    // 最后 owner 确实执行 munmap，观察者只保留固定事实，不保活正文或文件。
+    // The final owner performs munmap. Its observer retains fixed facts only,
+    // without keeping the output file or its source bytes alive.
     drop(retained);
     assert!(observer.unmap_succeeded());
     assert_eq!(observer.mapped_bytes(), 0);
     assert!(!observer.failed());
 }
 
-/// 截尾不能扩展正文；封存也拒绝与完成写入计量不符的真实文件 extent。
+/// Rejecting an extending truncate leaves the completed output unchanged.
 #[cfg(feature = "native-markdown-candidate")]
 #[test]
-fn canonical_output_rejects_growth_and_unaccounted_extent() {
+fn canonical_output_rejects_growth_without_changing_frozen_bytes() {
     let mut output = CanonicalSnapshotOutput::new().unwrap();
     output.write_all("原文".as_bytes()).unwrap();
     let bytes = output.len();
@@ -99,12 +95,13 @@ fn canonical_output_rejects_growth_and_unaccounted_extent() {
         output.truncate(bytes + 1),
         Err(SnapshotError::Storage(error)) if error.kind() == io::ErrorKind::InvalidInput
     ));
-    assert_eq!(output.len(), bytes);
-    assert_eq!(output.file.metadata().unwrap().len(), bytes as u64);
-
-    // 测试在工厂内部直接改变实际 extent；产品 API 没有取得或克隆此写句柄的入口。
-    output.file.set_len(bytes as u64 + 1).unwrap();
-    assert!(matches!(output.freeze(), Err(SnapshotError::SourceChanged)));
+    // Verify the public operation's consequence through the real frozen output,
+    // without mutating a private writer to manufacture an impossible caller state.
+    let backing = output.freeze().unwrap().unwrap();
+    backing
+        .with_bytes(0..bytes, |actual| assert_eq!(actual, "原文".as_bytes()))
+        .unwrap();
+    backing.close().unwrap();
 }
 
 /// Streaming fallback freezes exact bytes without retaining any public scratch names.

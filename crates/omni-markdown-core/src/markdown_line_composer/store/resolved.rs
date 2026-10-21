@@ -1,4 +1,5 @@
-//! 原selector签包的唯一Store转换；临时child真正归还后才发布同一File中的LineEnd。
+//! Transfer the original selector's signed prefix into the sole Store. Publish its
+//! same-file LineEnd only after the temporary child is actually released.
 use super::*;
 use crate::markdown_soft_line_measure::provider::{
     GlyphProviderOrigin, MeasuredLineScope, ResolutionMeasurePermit,
@@ -17,8 +18,9 @@ enum Stage {
     Line,
 }
 
-/// 与Store分开持有临时child，避免在原provider独占借用期间再次可变借用同一File。
-/// 每批只取原签包的Copy记录，再归还provider借用，最后写入唯一输出页。
+/// Own the temporary child outside Store to avoid borrowing the same file mutably
+/// while the original provider has its exclusive borrow. Each batch obtains Copy
+/// records, ends the provider borrow, then writes the unique output page.
 pub(in crate::markdown_line_composer) struct ResolvedCapture {
     prefix: Option<MarkdownStoredResolvedPrefix>,
     clusters: Option<super::super::worker_resources::ClusterResourceOwner>,
@@ -49,6 +51,9 @@ impl ResolvedCapture {
         }
         let item = store.directory(original)?;
         let resources = store.resources.clone();
+        // Acquire actual signed-prefix facts and its real cluster index under the
+        // original permit/provider. A failed unobserved constructor leaves resource
+        // coverage incomplete instead of being erased by later successful work.
         let (facts, clusters) = {
             let mut provider = store.borrow_at(original, pen)?;
             let facts = prefix.facts(permit, &mut provider)?;
@@ -72,6 +77,8 @@ impl ResolvedCapture {
             return Err(Error::SourceMismatch);
         };
         let range = facts.boundary.source_utf16.clone();
+        // Check the same opaque Store origin, Source/font, cancellation, and complete
+        // selected range before this child may contribute derived output records.
         if !Weak::ptr_eq(&owner, &Arc::downgrade(&store.identity))
             || origin != original.key.origin
             || facts.source != store.authority
@@ -88,8 +95,9 @@ impl ResolvedCapture {
         {
             return Err(Error::SourceMismatch);
         }
-        // 本入口只转换当前真实单item前缀。若L1/L2形成多个run，须继续真实跨run组合，
-        // 不能把child方向或glyph数组反转成一条假视觉行。
+        // This entry transfers one actual item's prefix only. Multiple L1/L2 runs
+        // still need real cross-run assembly; reversing child glyphs/direction cannot
+        // substitute for that complete visual line.
         bidi.require_layout_source(&store.authority)?;
         if bidi.source_range() != (0..store.source.utf16_len()) {
             return Err(Error::SourceMismatch);
@@ -109,17 +117,18 @@ impl ResolvedCapture {
         if !store.is_grapheme(range.start)? || !store.is_grapheme(range.end)? {
             return Err(Error::InconsistentCoverage);
         }
-        // 输出另有真实child origin，但不插入原item检索树，不覆盖原item来源或余文。
+        // Give the actual child its own output origin without inserting it into the
+        // original item forest or overwriting the parent item's Source/suffix facts.
         let start = store.index.as_ref().ok_or(Error::Poisoned)?.len();
         let mut item_facts = item.facts;
         item_facts.source_utf16 = range.clone();
         item_facts.beginning_of_text = range.start == item_facts.paragraph_utf16.start;
         item_facts.end_of_text = range.end == item_facts.paragraph_utf16.end;
         let directory = Directory {
-            shaping_seams: [None; 2], // 重排范围两端来自原行选择的 GCB，不能沿普通 item 扩大分段权限。
+            shaping_seams: [None; 2], // Original selected GCB endpoints grant no extra bidi seams.
             paragraph_inset_26_6: item.paragraph_inset_26_6,
             facts: item_facts,
-            presentation: item.presentation, // child沿原样式整形，折行不能丢失隐藏或装饰身份。
+            presentation: item.presentation, // Preserve original hidden/decorated style through wrapping.
             font: item.font,
             glyph_start: start,
             glyph_count: facts.boundary.glyphs,
@@ -162,6 +171,8 @@ impl ResolvedCapture {
         permit: &ResolutionMeasurePermit<'_>,
         pen: i64,
     ) -> Result<()> {
+        // The original item key and measured-line scope must remain live throughout
+        // every transfer quantum, including publication after the child is released.
         store.guard()?;
         if original.key != self.original
             || Some(self.directory.origin) != store.origins.checked_add(1)
@@ -183,11 +194,13 @@ impl ResolvedCapture {
         }
         if let Some(prefix) = self.prefix.as_mut() {
             prefix.require(permit, &mut provider)?;
-        } // child归还后的提交阶段只用本私有转换保留的同scope，不重建已释放child身份。
+        } // Post-release publication uses this retained original scope, never a
+        // reconstructed identity for the already released child.
         Ok(())
     }
 
-    /// 每回合最多消费256条索引/字形/目录记录，Ready只在实际LineEnd最终复核后返回。
+    /// Consume at most 256 index/glyph/directory records per turn. Return Ready only
+    /// after actual LineEnd completion and final original-authority checks.
     pub(in crate::markdown_line_composer) fn step(
         &mut self,
         store: &mut GlyphStore,
@@ -214,7 +227,8 @@ impl ResolvedCapture {
         let limit = records.min(STEP);
         match self.stage {
             Stage::Index => {
-                // 先让实际child完成有界cluster索引；Building不是可消费的行范围。
+                // Complete the actual child's bounded cluster index first;
+                // Building is not a consumable line range.
                 let mut provider = store.borrow_at(original, pen)?;
                 let progress = self.prefix.as_mut().ok_or(Error::Poisoned)?.step_clusters(
                     permit,
@@ -227,7 +241,8 @@ impl ResolvedCapture {
                 }
             }
             Stage::Glyphs => {
-                // 每次只取一个原签包glyph；provider借用结束后才写Store，避免别名和跨IO借用。
+                // Obtain one actual signed glyph, end the provider borrow, then
+                // write Store. No alias or exclusive borrow spans both file roles.
                 for _ in 0..limit {
                     let value = {
                         let mut provider = store.borrow_at(original, pen)?;
@@ -255,7 +270,8 @@ impl ResolvedCapture {
                 }
             }
             Stage::Clusters => {
-                // 原逻辑cluster连续覆盖整个真实前缀，字形范围仍保child原视觉顺序。
+                // Logical clusters must continuously cover the actual prefix while
+                // glyph ranges retain the original child's visual order.
                 for _ in 0..limit {
                     let value = {
                         let mut provider = store.borrow_at(original, pen)?;
@@ -315,7 +331,8 @@ impl ResolvedCapture {
                 }
             }
             Stage::Directory => {
-                // 目录只是私有候选，写完三条也尚未取得可发布的LineEnd。
+                // Three complete directory records are still a private candidate,
+                // without an authenticated LineEnd available for publication.
                 for row in encode_directory(&self.directory)?
                     .into_iter()
                     .skip(self.consumed)
@@ -329,8 +346,9 @@ impl ResolvedCapture {
                 }
             }
             Stage::Release => {
-                // 这里先完成真实child和临时cluster FD归还；即使元数据已写入，负面收据也
-                // 不允许签LineEnd。索引Drop后只读固定observer，不保活已释放资源。
+                // Release the actual child and temporary cluster FD before signing
+                // LineEnd. Existing metadata cannot override failed cleanup. After
+                // index Drop, its fixed observer cannot retain released resources.
                 let index = self.clusters.take().ok_or(Error::Poisoned)?;
                 let observer = index.resource_observer();
                 drop(index);
@@ -345,7 +363,8 @@ impl ResolvedCapture {
                 self.stage = Stage::Line;
             }
             Stage::Line => {
-                // child已真实归还后，以原scope继续签四条固定行记录；最后一次复核才移动公开末端。
+                // After real child release, sign four fixed line records under the
+                // same scope. Only final validation moves the public endpoint.
                 let rows = self.line_rows(store)?;
                 for row in rows.into_iter().skip(self.consumed).take(limit) {
                     store.index.as_mut().ok_or(Error::Poisoned)?.append(row)?;
@@ -379,8 +398,9 @@ impl ResolvedCapture {
                 MarkdownSoftLineResolvedKind::Natural
                     if self.boundary.source_utf16.end == source_length =>
                 {
-                    // 真正文档末端仍是原UAX14强制机会；紧急续行的最后有限余量不能
-                    // 因经过重排便降为普通可选断点，字形分片末端也不具有这个资格。
+                    // Actual document EOF remains the original UAX14 mandatory
+                    // opportunity. Reshaping the final bounded remainder cannot
+                    // downgrade it to Allowed; a glyph-part end alone grants no EOF.
                     MarkdownComposedLineKind::Mandatory
                 }
                 MarkdownSoftLineResolvedKind::Natural => MarkdownComposedLineKind::Allowed,
@@ -412,7 +432,7 @@ impl ResolvedCapture {
             MarkdownComposedLineKind::Overflow => 3,
             MarkdownComposedLineKind::TableRow => return Err(Error::InvalidRequest),
         };
-        rows[0][58] = self.base_level; // 原同源准备阶段捕获，不能由child方向重签原段base。
+        rows[0][58] = self.base_level; // Original Source preparation certified this paragraph base.
         for (at, value) in [
             (0, facts.source_utf16.start),
             (8, facts.source_utf16.end),

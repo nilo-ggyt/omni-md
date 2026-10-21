@@ -1,4 +1,5 @@
-//! 已完成 Grid 的独立块记录仍写入原 GlyphStore；固定四记录逐预算提交，不进入文字 Measure。
+//! Write the completed Grid block through the original GlyphStore. Its four fixed
+//! line records commit under the record budget without entering text Measure.
 use super::super::MarkdownComposedLinePartKind;
 use super::*;
 
@@ -10,13 +11,16 @@ pub(super) struct TableLineCapture {
     facts: MarkdownComposedLineFacts,
 }
 impl GlyphStore {
-    /// 只接原 item producer 的真实 TableRow proof；源覆盖、字体和两个硬端点已经封闭。
+    /// Accept only the original item producer's actual TableRow proof, whose Source
+    /// coverage, font, and two hard endpoints have already been certified.
     pub(in crate::markdown_line_composer) fn begin_table_line(
         &mut self,
         proof: &StoredItemProof,
     ) -> Result<()> {
         self.guard()?;
         let item = self.directory(proof)?;
+        // The block must cover exactly the pending canonical row, with no text
+        // glyphs/clusters and positive geometry from the completed original Grid.
         if self.table_line.is_some()
             || item.kind != MarkdownComposedLinePartKind::TableRow
             || item.facts.source_utf16.start != self.line_source_end
@@ -42,7 +46,7 @@ impl GlyphStore {
         }
         self.write_line_skip(&mut rows[0])?;
         rows[0][56] = output::LINE;
-        rows[0][57] = 4; // 真实 TableRow 类型，不借 Mandatory/空文字行冒充块。
+        rows[0][57] = 4; // Preserve TableRow kind, never a mandatory/empty text substitute.
         rows[1][..8].copy_from_slice(&number(item.facts.source_utf16.start)?.to_le_bytes());
         rows[1][8..16].copy_from_slice(&number(item.facts.source_utf16.end)?.to_le_bytes());
         rows[1][16..24].copy_from_slice(&number(item.glyph_start)?.to_le_bytes());
@@ -71,6 +75,8 @@ impl GlyphStore {
                 .to_le_bytes(),
         );
         rows[3][56] = output::LINE_END;
+        // Retain the four bounded candidate records and same opaque item key until
+        // actual writes complete; no public LineReady exists while they are partial.
         self.table_line = Some(TableLineCapture {
             rows,
             written: 0,
@@ -90,7 +96,8 @@ impl GlyphStore {
         Ok(())
     }
 
-    /// 部分四记录仍属于当前 writer，只有真实末记录和原 Font 活性均完成才对外发 LineReady。
+    /// Partial records remain owned by the current writer. Only the actual tail
+    /// write and original live-font check permit external LineReady publication.
     pub(in crate::markdown_line_composer) fn step_table_line(
         &mut self,
         records: usize,
@@ -112,6 +119,8 @@ impl GlyphStore {
             if capture.written != 4 {
                 return Ok(None);
             }
+            // Reauthenticate this original item after all writes, then atomically
+            // publish the same line endpoint and its captured geometry facts.
             let capture = self.table_line.take().ok_or(Error::InconsistentCoverage)?;
             let proof = StoredItemProof {
                 store: Arc::downgrade(&self.identity),

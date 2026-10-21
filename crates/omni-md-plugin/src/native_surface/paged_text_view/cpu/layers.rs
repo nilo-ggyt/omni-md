@@ -1,4 +1,5 @@
-//! 双组只为实际瓦片建立图层；挂载点原子切换完整候选，旧组立即归还全部角色。
+//! Two groups create layers for actual tiles only; the mount switches complete candidates and
+//! immediately returns all old roles.
 
 use super::*;
 use crate::native_surface::viewport_pixels::MAX_TILE_SLOTS;
@@ -20,7 +21,8 @@ pub(super) struct LayerPool {
     serial: Cell<usize>,
 }
 
-/// 只记录本池实际发布的有限身份，不保CGImage、正文、Source或Scene强边。
+/// Record this pool actual finite publication identities without strong CGImage, text, Source, or Scene
+/// ownership.
 #[derive(Clone)]
 pub(super) struct Publication {
     index: usize,
@@ -32,14 +34,17 @@ pub(super) struct Publication {
 struct LayerGroup {
     layer: Retained<CALayer>,
     slots: RefCell<Vec<Rc<slot::Slot>>>,
-    // 部分更新只暂存本次新建的变化槽；原完整slots在真实替换前保持不变。
-    // Native构造/安装可重入，关闭和Weak收据必须同样看见这份有限、唯一的资源拥有者。
+    // Partial updates stage newly created changed slots only; the original complete slots remain intact
+    // until actual replacement.
+    // Native construction/installation may reenter; close and weak receipts must observe the same
+    // bounded unique resource owner.
     pending: RefCell<Vec<Rc<slot::Slot>>>,
     retired: RefCell<Vec<Weak<AnyObject>>>,
     palette: slot::Palette,
 }
 
-/// 仅同pool、原前序和后继serial可以归属一次真实发布；不保Source或image。
+/// One actual publication belongs to the same pool and original before/after serials, without Source or
+/// image ownership.
 pub(super) struct Attempt {
     pool: *const LayerPool,
     before: usize,
@@ -47,20 +52,22 @@ pub(super) struct Attempt {
     index: usize,
 }
 
-/// 失败时只清理已经分离的候选；若setter已经挂载，仍保留完整图组供真实后果核对。
+/// On failure clear detached candidates only; after a mounting setter, retain the complete group for
+/// actual-effect validation.
 struct Candidate<'a>(&'a LayerGroup);
 impl Drop for Candidate<'_> {
     fn drop(&mut self) {
         if self.0.layer.superlayer().is_none() {
             self.0.clear();
-        } // 此处不重新领取Scene；清理只操作本owner已经分离的空池。
+        } // Cleanup touches this owner detached pool only, without acquiring another Scene.
     }
 }
 
 impl LayerPool {
     pub(super) fn new(current: &impl Fn() -> bool) -> Result<Self> {
         let mount = checked(current, CALayer::new)?;
-        // 最后一个设备像素可能跨出分数point边界；只在原正文实际bounds裁边，绝不压缩整图。
+        // A final device pixel may cross a fractional point edge; clip at actual document bounds
+        // without compressing the image.
         checked(current, || mount.setMasksToBounds(true))?;
         let first = LayerGroup::new(current)?;
         let second = LayerGroup::new(current)?;
@@ -79,7 +86,8 @@ impl LayerPool {
         Retained::clone(&self.mount)
     }
 
-    /// 只登记当前真实图中的角色；记录不保活图层，也不为未用瓦片建立空对象。
+    /// Observe roles in the actual current graph without retaining layers or constructing empty objects
+    /// for unused tiles.
     pub(super) fn weaks(&self) -> Vec<Weak<AnyObject>> {
         let mut values = vec![layer_weak(&self.mount)];
         for group in &self.groups {
@@ -94,6 +102,8 @@ impl LayerPool {
         values
     }
 
+    /// Reserve the next original serial without Native effects; publication alone advances the actual
+    /// serial.
     pub(super) fn attempt(&self) -> Result<Attempt> {
         let before = self.serial.get();
         Ok(Attempt {
@@ -105,14 +115,17 @@ impl LayerPool {
             index: self.active.get().map_or(0, |old| 1 - old),
         })
     }
-    /// 只撤销本次已经实际挂载、仍是原mount/group的图片；不能回滚成“从未提交”。
+    /// Revoke images from this actual mounted attempt only while mount/group remain original; do not
+    /// claim the commit never occurred.
     pub(super) fn revoke_attempt(&self, attempt: &Attempt, backing: &CALayer) -> bool {
         if !std::ptr::eq(attempt.pool, self) || self.serial.get() != attempt.serial {
             return false;
         }
         if self.active.get().is_none() {
-            // 同一真实后继serial已经由事务内补偿撤图；外层仍须退休旧Published元数据。
-            // serial只有Native提交后才推进，不能将未提交的候选或另一个后继误认成此事实。
+            // Compensation already detached the actual successor serial inside its transaction; the
+            // outer owner must still retire old Published metadata.
+            // Serial advances only after Native commit, distinguishing this fact from an unpublished
+            // candidate or different successor.
             return true;
         }
         if self.active.get() != Some(attempt.index) {
@@ -120,7 +133,8 @@ impl LayerPool {
         }
         let group = &self.groups[attempt.index];
         let parent = self.mount.superlayer();
-        // SAFETY: 只读原标准CALayer数组，比较原保活对象身份，不发送正文回调。
+        // SAFETY: Read the standard CALayer array and compare original retained object identities
+        // without document callbacks.
         let children = unsafe { self.mount.sublayers() };
         let same = parent
             .as_deref()
@@ -141,17 +155,22 @@ impl LayerPool {
             self.active.set(None);
             drop(transaction);
         } else {
-            // 外方只夺走parent关系，原serial仍归本attempt；不能先丢claim再把业务图片藏在外国图中。
-            // clear逐项只清仍等于原claim的图片/颜色/own child，保留外方parent和后继替换内容。
+            // External reparenting does not change this attempt serial; do not drop claims while
+            // business images remain in the external graph.
+            // Clear original image/color/child identities individually, preserving external parent and
+            // successor replacement contents.
             group.clear();
             self.active.set(None);
         }
-        true // private serial证明本次提交发生过；调用者必须废除旧weakMetadata。
+        true // The private serial proves this attempt committed; the caller must retire its old weak metadata.
     }
 
-    /// 新候选已经完成真实绘图；只有全部瓦片仍是当前原图，才沿用现存 Native 图。
-    /// 收据最多复制64项身份标量，不新增图层、图像或历史帧；任一表示/位置/主次图不同
-    /// 都交回正常发布。像素相等由上游封存器逐字节证明，这里只消费其真实复用身份。
+    /// The new candidate already finished actual painting; reuse the Native graph only if every tile
+    /// remains the current original image.
+    /// Copy at most 64 scalar identity receipts without new layers, images, or historical frames; any
+    /// presentation, position, or primary/secondary difference
+    /// returns to normal publication. The upstream sealer proves byte equality; consume actual reused
+    /// identities only here.
     pub(super) fn reuse_publication(
         &self,
         backing: &CALayer,
@@ -182,12 +201,16 @@ impl LayerPool {
         {
             return Ok(None);
         }
-        // 相同 CGImage 不代表它仍装在原槽中。完整核原 mount、serial、各层关系、
-        // 颜色和主次图片；外方修改或 Native/current 重入失权必须失败，不能降成 miss。
+        // An equal CGImage identity does not prove original installation; fully check mount, serial,
+        // layer relationships,
+        // colors, and primary/secondary images. External mutation or Native/current revocation is
+        // failure rather than a cache miss.
         self.validate(backing, previous, current)?;
         Ok(Some(previous.clone()))
     }
 
+    /// Install a detached complete group, record the actual mount setter, and validate before returning
+    /// publication identity.
     pub(super) fn publish(
         &self,
         backing: &CALayer,
@@ -212,12 +235,13 @@ impl LayerPool {
         let index = attempt.index;
         let group = &self.groups[index];
         if checked(current, || group.layer.superlayer())?.is_some() {
-            return Err(NativeMarkdownPagedTextViewError::Revoked); // 仍挂载的旧组绝不能当可写候选复用。
+            return Err(NativeMarkdownPagedTextViewError::Revoked); // A still-mounted old group cannot be reused as a writable candidate.
         }
         if !group.clear() {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
-        // 已分离槽只归还本owner旧image；外方改过槽则拒绝复用，不覆盖后继内容。
+        // Detached slots return this owner old images only; external slot mutation rejects reuse
+        // without overwriting successor contents.
         let _candidate = Candidate(group);
         checked(current, CATransaction::begin)?;
         let transaction = Transaction;
@@ -225,7 +249,8 @@ impl LayerPool {
         let local = NSRect::new(NSPoint::new(0.0, 0.0), bounds.size);
         checked(current, || group.layer.setFrame(local))?;
         checked(current, || group.layer.setBounds(local))?;
-        // 每次候选只建立本帧所需角色；先交本组接管，重入撤权能看见并清理已建的原关系。
+        // Build only this frame actual roles and give them to the group before reentry can revoke and
+        // clean constructed relationships.
         let slots = frame
             .tiles
             .iter()
@@ -234,7 +259,8 @@ impl LayerPool {
         group.slots.replace(slots.clone());
         for (slot, image) in slots.iter().zip(&frame.tiles) {
             let tile = image.tile;
-            // tile的frame仍是精确像素数/scale，contents与mask保持1:1；尾部余像素由mount裁掉。
+            // tile frames remain exact pixel dimensions divided by scale, keeping contents/masks 1:1
+            // while mount clips tail pixels.
             let rect = NSRect::new(
                 NSPoint::new(tile.x as f64 / scale, tile.bottom as f64 / scale),
                 NSSize::new(tile.width as f64 / scale, tile.height as f64 / scale),
@@ -256,8 +282,9 @@ impl LayerPool {
             .map(|slot| &**slot.container())
             .collect::<Vec<_>>();
         let tiles = checked(current, || NSArray::from_slice(&containers))?;
-        drop(containers); // 固定最多64个借用身份，原Native数组已持各container；不延长业务资源。
-        // SAFETY: 数组只包含本组独占的有限CALayer；组尚未挂载，因此这些setter不显示部分候选。
+        drop(containers); // At most 64 borrowed identities are covered by the Native array retaining each container, without extra business ownership.
+        // SAFETY: The bounded array contains this group exclusive CALayers; the detached group cannot
+        // expose a partial candidate.
         checked(current, || unsafe {
             group.layer.setSublayers(Some(&tiles))
         })?;
@@ -271,13 +298,16 @@ impl LayerPool {
         if !current() {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
-        // SAFETY: mount只属于本owner，数组只有完整候选group；一个setter是唯一可见帧提交点。
+        // SAFETY: This owner exclusive mount receives the complete candidate group; this setter is the
+        // sole visible frame commit point.
         unsafe { self.mount.setSublayers(Some(&next)) };
-        self.active.set(Some(index)); // Native提交已发生即记录事实；后置撤权不得把它误称从未提交。
+        self.active.set(Some(index)); // Record actual Native commit immediately; post-call revocation cannot claim it never happened.
         self.serial.set(serial);
         drop(next);
-        // 同一显式事务里断开并清空旧组，避免另一次隐式事务把上帧像素额外保留到下一帧。
-        // 非活跃组即使后置Source票失效也能安全清理：先核真实detached，绝不清当前已挂载帧。
+        // Detach and empty the old group in this explicit transaction so another implicit transaction
+        // cannot retain old pixels into a later frame.
+        // Cleanup remains safe after Source revocation only for an actually detached inactive group,
+        // never the current mounted frame.
         let old = &self.groups[1 - index];
         let old_intact = if old.layer.superlayer().is_none() {
             old.clear()
@@ -310,7 +340,8 @@ impl LayerPool {
         Ok(publication)
     }
 
-    /// 原组、slot顺序、精确几何和image身份都必须仍相同；不能以active布尔值替代实际Native图。
+    /// Require original group, slot order, exact geometry, and image identities; an active flag cannot
+    /// substitute for the actual Native graph.
     pub(super) fn validate(
         &self,
         backing: &CALayer,
@@ -334,7 +365,8 @@ impl LayerPool {
         if !geometries {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
-        // SAFETY: mount只由本owner设置为一个类型正确的CALayer组，读取只比较实际身份。
+        // SAFETY: This owner sets a type-correct CALayer group on mount; reading compares actual
+        // identities only.
         let actual = checked(current, || unsafe { self.mount.sublayers() })?;
         let matches = actual.as_ref().is_some_and(|layers| {
             layers.len() == 1 && std::ptr::eq::<CALayer>(&*layers.objectAtIndex(0), &*group.layer)
@@ -343,7 +375,8 @@ impl LayerPool {
         if !matches || !current() {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
-        // SAFETY: 原组的有限数组只包含本池slots；完整有序关系同样属于原发布事实。
+        // SAFETY: The original bounded group array contains this pool slots; their complete order
+        // belongs to the original publication facts.
         let actual_tiles = checked(current, || unsafe { group.layer.sublayers() })?;
         let Some(actual_tiles) = actual_tiles else {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
@@ -351,7 +384,8 @@ impl LayerPool {
         if actual_tiles.len() != publication.tiles.len() {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
-        // 快照只保本次有限槽；Native/current 调用前归还 RefCell 借用，允许真实关闭重入。
+        // Snapshot bounded slots only and end the RefCell borrow before Native/current so real close
+        // reentry remains possible.
         let slots = group.slots.borrow().clone();
         if slots.len() != publication.tiles.len() {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
@@ -413,8 +447,10 @@ impl LayerPool {
         if parent_is(&self.mount, backing) {
             self.mount.removeFromSuperlayer();
         }
-        // 外方重挂的mount保留那条parent关系；内部业务图片和本owner子关系仍必须归还。
-        // mount的外方显示属性也必须保留并报告撤权；移除挂载关系不能洗掉整图隐藏或变透明。
+        // Preserve an externally reparented mount while returning internal business images and this
+        // owner child relationships.
+        // Preserve external display properties and report revocation; detaching cannot hide external
+        // whole-graph hiding or transparency.
         let mut intact = !foreign
             && !self.mount.isHidden()
             && self.mount.opacity() == 1.0
@@ -443,7 +479,8 @@ impl LayerPool {
 impl LayerGroup {
     fn new(current: &impl Fn() -> bool) -> Result<Self> {
         let layer = checked(current, CALayer::new)?;
-        // 空组只有一个结构层；未激活的第二组不预占 64 个瓦片和 320 个辅助角色。
+        // An empty group owns one structural layer; the inactive second group does not preallocate 64
+        // tiles and 320 auxiliary roles.
         Ok(Self {
             layer,
             slots: RefCell::new(Vec::new()),
@@ -453,15 +490,19 @@ impl LayerGroup {
         })
     }
     fn clear(&self) -> bool {
-        // 先移出有限槽，再发 Native 清理；关闭重入不会再次清同一槽或保留历史空层。
+        // Move bounded slots out before Native cleanup so close reentry neither clears them twice nor
+        // retains historical empty layers.
         let mut slots = std::mem::take(&mut *self.slots.borrow_mut());
         let pending = std::mem::take(&mut *self.pending.borrow_mut());
         slots.extend(pending);
         let mut intact = self.retire_slots(slots);
-        // 本组从不安装背景、mask、contents或delegate；外方后来设置的内容保持原样并拒绝复用。
-        // SAFETY: own slot已逐一移除；剩余children只能归属外方，不能清空整个数组夺走它们。
+        // This group installs no background, mask, contents, or delegate; preserve external additions
+        // and reject reuse.
+        // SAFETY: Owned slots were individually detached; remaining children belong elsewhere and
+        // cannot be cleared as a whole array.
         let contents = unsafe { self.layer.contents() };
-        // SAFETY: 同上，只读原标准图层的数组，不遍历外方对象或取得其资源权限。
+        // SAFETY: Read the standard layer array only, without traversing external objects or acquiring
+        // their resources.
         let children = unsafe { self.layer.sublayers() };
         intact &= contents.is_none()
             && children.as_ref().is_none_or(|children| children.is_empty())
@@ -471,10 +512,11 @@ impl LayerGroup {
             && self.layer.backgroundColor().is_none()
             && self.layer.mask().is_none()
             && self.layer.delegate().is_none();
-        intact // 没有本项目设置的layer delegate；外方后设delegate不属于本owner，不能擅自清理。
+        intact // This project installs no group delegate; a later external delegate does not belong to this cleanup owner.
     }
 
-    /// 失败前只归还尚未接管的变化槽；原完整画面和原published serial保持原样。
+    /// Return changed slots not yet transferred on failure, preserving the original complete picture
+    /// and published serial.
     fn clear_pending(&self) -> bool {
         let pending = std::mem::take(&mut *self.pending.borrow_mut());
         if pending.is_empty() {
@@ -483,36 +525,42 @@ impl LayerGroup {
         self.retire_slots(pending)
     }
 
-    /// 完整退场和部分替换共用真实槽归还；先登记Weak，再清各自图片/颜色/父关系。
-    /// 传入值是已从本组拥有槽移出的唯一有限列表，不增加历史强引用或闲置角色池。
+    /// Full retirement and partial replacement share actual slot cleanup; register weak identities
+    /// before clearing images, colors, and parents.
+    /// The input is the unique bounded list removed from group ownership, without historical strong
+    /// claims or an idle role pool.
     fn retire_slots(&self, slots: Vec<Rc<slot::Slot>>) -> bool {
         let mut intact = true;
         let mut retired = std::mem::take(&mut *self.retired.borrow_mut());
-        // 历史身份只保 Weak；框架或外方仍持空角色时，关闭收据仍须观察它的真实生命周期。
+        // Historical identities remain weak; close receipts still observe actual lifetimes when
+        // frameworks or external owners retain empty roles.
         objc2::rc::autoreleasepool(|_| retired.retain(|weak| weak.load().is_some()));
         if retired.is_empty() {
-            // 所有旧角色都已真实销毁，连 Weak 列表的历史容量也归还；活 Weak 一项不丢。
+            // Once every old role actually dies, return the weak-list capacity too; never discard a
+            // live weak observation.
             retired = Vec::new();
         }
         for slot in &slots {
             slot.add_weaks(&mut retired);
         }
-        self.retired.replace(retired); // 归还槽借用后才逐项发 Native 清理，允许同一关闭边界重入。
+        self.retired.replace(retired); // End the slot borrow before Native cleanup so the same close boundary can reenter.
         for slot in &slots {
             intact &= slot.clear(&self.layer, &self.palette);
         }
-        drop(slots); // 旧帧及缩窗淘汰的角色在本事务结束前归还，不成为闲置图层缓存。
+        drop(slots); // Return old-frame and resized-away roles before this transaction ends, without an idle layer cache.
         intact
     }
 }
 
 fn empty_container(layer: &CALayer, current: &impl Fn() -> bool) -> Result<()> {
-    // SAFETY: mount/group不安装业务contents；只核空值，不能把未知外方对象当作原图片。
+    // SAFETY: Mount/group install no business contents; test emptiness without treating unknown
+    // external objects as original images.
     let contents = checked(current, || unsafe { layer.contents() })?;
     let background = checked(current, || layer.backgroundColor())?;
     let mask = checked(current, || layer.mask())?;
     let delegate = checked(current, || layer.delegate())?;
-    // 原mount/group从不隐藏、变透明或改Z顺序；只验空载荷不足以证明实际输出仍相同。
+    // Mount/group never hide, fade, or change Z order; empty payload alone cannot certify unchanged
+    // actual output.
     let unchanged = checked(current, || {
         !layer.isHidden() && layer.opacity() == 1.0 && layer.zPosition() == 0.0
     })?;
@@ -528,7 +576,8 @@ fn empty_container(layer: &CALayer, current: &impl Fn() -> bool) -> Result<()> {
     }
 }
 
-/// 原CALayer继承链直接借作AnyObject，弱登记不新增主线程强owner。
+/// Borrow the actual CALayer superclass as AnyObject; weak registration creates no additional
+/// main-thread strong owner.
 fn layer_weak(layer: &CALayer) -> Weak<AnyObject> {
     let object: &AnyObject = layer;
     Weak::from(object)

@@ -1,4 +1,6 @@
-//! 同原短表实际列方向、软行、尾空白和活动格几何；标准 TextKit 图在产品图关闭后才创建。
+//! Observe actual column alignment, soft lines, trailing spaces, and active-cell
+//! geometry in the same short table. Construct independent TextKit references
+//! only after the product graph has strictly closed.
 
 use super::*;
 use crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError as ViewError;
@@ -31,18 +33,21 @@ const CELLS: [(&str, MarkdownTableAlignment); 6] = [
     ("R  ", MarkdownTableAlignment::Right),
 ];
 
-// 此固定例特意使用 Latin LTR：每个 byte 就是一个独立 UTF16 单元，不把测试索引算法扩为
-// 产品 Unicode 解码器。三种方向都含真实软换行，另一行的代码保留两个可见 trailing space。
-// 内容总量不足一页；这里有限采样的许可绝不传到产品长文或整格 materialization 路径。
+// This fixed Latin LTR fixture has one byte per UTF-16 unit; its indexing is no
+// product Unicode decoder. Every alignment includes actual wrapped lines, while
+// code cells retain two trailing spaces. Less than one page of fixture observations
+// grants no permission for product long-document or whole-cell materialization.
 
-/// 关闭后仅留下已显示的有限字符框；方向取固定 Markdown 字面，绝不从候选 styles 推期望。
+/// Retain only bounded displayed character rectangles after close. Fixed Markdown
+/// literals determine alignment independently of candidate presentation styles.
 struct ObservedCell {
     text: &'static str,
     alignment: MarkdownTableAlignment,
     content: NSRect,
     clip: NSRect,
-    // None 只记录真实 Pending；是否合理必须等产品严格关闭后由独立 Native 字形框判断。
-    // 每个固定字符仍保原顺序，没有提前按空白、行末或候选失败过滤观察。
+    // None records actual Pending only. An independent Native glyph rectangle
+    // decides whether it was justified after product closure. Keep every fixed
+    // character in order, without filtering whitespace, line ends, or failed candidates.
     characters: Vec<Option<NSRect>>,
     active: bool,
 }
@@ -53,14 +58,16 @@ fn canonical(text: &str) -> usize {
         .count()
 }
 
-/// 三列自然宽可超过真实 clip；右对齐末软行必须先经原目标定位进入横向视口。
-/// 只请求固定 ASCII 字面的真实首/末 GCB，不改选区、尺寸、点击点或产品滚动策略。
+/// Natural column widths may exceed the clip. Reveal the right-aligned last soft
+/// line through its original target before observing it. Request only fixed ASCII
+/// first/last graphemes, changing no selection, size, hit point, or scrolling policy.
 fn reveal_sample(rig: &Rig, text: &str) -> Result<(), String> {
     let start = canonical(text);
     let before = rig.view.input_state().map_err(|cause| cause.to_string())?;
-    // 固定 R␠␠ 样本的两个尾空白保留在对齐宽度之外，不能要求 SourceTarget 给离屏字形签可见。
-    // 这里仍揭示原首 R；所有空白的框、Pending 与两端 caret 都在 capture/独立 Native 中逐项核。
-    // 其它短例，特别是长软行末字母，继续保原首末两次真实目标定位。
+    // The fixed R-plus-two-spaces sample keeps trailing spaces outside alignment
+    // width; SourceTarget cannot certify offscreen glyphs as visible. Reveal R,
+    // then compare every space's rectangle/Pending/caret endpoints independently.
+    // Other samples retain both actual first/last targets, including the wrapped tail letter.
     let tail = (text != "R  ").then_some(start + text.len() - 1);
     for position in std::iter::once(start).chain(tail) {
         let range = NSRange::new(position, 1);
@@ -69,14 +76,15 @@ fn reveal_sample(rig: &Rig, text: &str) -> Result<(), String> {
             .capture_ready_scene_key()
             .map_err(|cause| cause.to_string())?;
         match rig.view.verify_find_target_visible(&key, range) {
-            Ok(_) => continue, // 已真实可见就沿同一帧读取，不为了测试制造一次多余滚动或发布。
+            Ok(_) => continue, // Existing actual visibility needs no extra test-induced scrolling/publication.
             Err(
                 crate::native_surface::paged_text_view::NativeMarkdownPagedTextViewError::Pending,
             ) => {}
             Err(cause) => return Err(cause.to_string()),
         }
-        // 原 visible proof 明确未覆盖才驱动真实 SourceTarget。新 key 由产品自身滚动、布局和
-        // 完整 CPU 发布取得；原三秒帧门照常生效，不能把离屏 Pending 夹成首屏假字形。
+        // Only failed actual visibility coverage authorizes SourceTarget. Product
+        // scrolling/layout/complete CPU publication create the new key within the
+        // original three seconds; never clamp offscreen Pending into a fake first-page glyph.
         let frame = observe(&rig.body)?;
         let target = rig
             .body
@@ -113,7 +121,8 @@ fn reveal_sample(rig: &Rig, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 每个实际字符框都须保原 canonical 范围；非空白字的墨迹左侧还必须反向命中原位置。
+/// Each actual character rectangle preserves its canonical range. The left side
+/// of nonspace glyphs must also hit the same original source position.
 fn capture(
     body: &NativeMarkdownPagedBody,
     view: &NativeMarkdownPagedTextView,
@@ -127,8 +136,9 @@ fn capture(
     let scene = NativeMarkdownPagedTextViewDelegate::ready_scene(body, &key.request)
         .map_err(|cause| cause.to_string())?;
     let start = if active { 0 } else { canonical(text) };
-    // 活动 Source 的位置从局部零点开始，只读预览则保原 Markdown 的 canonical 端点。
-    // 这两种域都只能消费当前 key；不能用父原文下标解释 child 的 raw 草稿。
+    // Active Source coordinates start at local zero; read-only preview keeps
+    // original Markdown canonical endpoints. Both require the current key; parent
+    // source offsets cannot interpret a child's raw draft.
     let first = scene.first_rect(NSRange::new(start, 1)).map_err(|cause| {
         format!("对齐 sample 首字：text={text:?} canonical={start} active={active}: {cause}")
     })?;
@@ -137,7 +147,8 @@ fn capture(
         first.rect.origin.y + first.rect.size.height * 0.5,
     );
     let content = if active {
-        // 实际 child 的 layout lane 与局部坐标来自原 Native 转换，不借父 clip 宽猜活动格大小。
+        // Obtain the actual child's layout lane/local coordinates through its
+        // Native transform, not the parent clip width as a guessed cell size.
         NSRect::new(
             NSPoint::new(
                 key.request.virtual_viewport.layout_origin_x
@@ -150,8 +161,9 @@ fn capture(
             ),
         )
     } else {
-        // 内容框只提供用户实际得到的排版 lane，方向和文字期望仍由上方固定字面决定。
-        // 若已对齐的字形无法命中这张真实格票，直接失败，不去邻列寻找可通过的框。
+        // Content geometry supplies only the actual layout lane; fixed literals
+        // still own text/alignment expectations. If the aligned glyph cannot hit
+        // its actual cell, fail rather than searching a neighboring column for a passing frame.
         let hit = scene
             .cell_hit(point, false)
             .map_err(|cause| cause.to_string())?
@@ -166,15 +178,18 @@ fn capture(
     };
     let clip = NSIntersectionRect(content, key.request.viewport);
     let mut characters = Vec::with_capacity(text.len());
-    // 一次只记录这六个固定短串的纯值；不保 Scene/Reader/字体，也不形成生产整段目录。
-    // 每个字符的 canonical 证明同时防止隐藏 backtick 把代码尾空白映到闭标记之外。
+    // Record scalar geometry for six fixed short strings, retaining no Scene,
+    // reader, font, or product paragraph directory. Per-character canonical
+    // identity also prevents hidden backticks from mapping code-tail spaces beyond the closing marker.
     for (local, byte) in text.bytes().enumerate() {
         let at = start + local;
         let value = match scene.first_rect(NSRange::new(at, 1)) {
             Ok(value) => value,
             Err(ViewError::Pending) => {
-                // 只封存这次公开结果；关闭后若原 Native 框与 clip 相交，仍然是产品失败。
-                // 零范围查询继续核两个原端点，不能因字符离屏把范围改到邻字或拆开 GCB。
+                // Record the public result only. After close, an independently
+                // visible Native rectangle still makes this a product failure.
+                // Check both original caret endpoints without shifting an offscreen
+                // character into a neighbor or splitting its grapheme.
                 for boundary in [at, at + 1] {
                     let caret = scene
                         .first_rect(NSRange::new(boundary, 0))
@@ -206,7 +221,8 @@ fn capture(
             ));
         }
         if byte != b' ' {
-            // 空白端点可能同时属于相邻软行；此处保非空字形的独立点击侧，不能靠改点迁就命中。
+            // Space endpoints can belong to adjacent soft lines. Keep a fixed
+            // side for nonspace glyphs rather than moving points to obtain a passing hit.
             let point = NSPoint::new(
                 value.rect.origin.x + value.rect.size.width * 0.125,
                 value.rect.origin.y + value.rect.size.height * 0.5,
@@ -228,8 +244,9 @@ fn capture(
         view.capture_ready_scene_key()
             .is_ok_and(|actual| actual.same(&key))
     };
-    // 同一个实际 key 的同步帧和逐项预算帧必须零 RGBA 差；baseline 只动 paint 的修补过不了
-    // 上面的字符框/命中往返，也不能把一次像素完成当成后继 Scene 的绘图权限。
+    // Synchronous and item-budgeted frames of this actual key must match exactly.
+    // A paint-only baseline patch cannot satisfy the geometry/hit round trips
+    // above, nor can one completed frame authorize a successor Scene's painting.
     selection::exact_scene_rgba(
         scene,
         &key,
@@ -246,7 +263,8 @@ fn capture(
     })
 }
 
-/// 只读预览、激活与取消均不得写入 canonical、历史或磁盘；完整核验也仅限固定小夹具。
+/// Read-only preview, activation, and cancellation preserve canonical text,
+/// history, and disk. Complete integrity checks are limited to this fixed short fixture.
 fn unchanged(rig: &Rig) -> Result<(), String> {
     let original = rig.document.upgrade().ok_or("对齐原 Doc 已归还")?;
     let document = original.borrow();
@@ -258,7 +276,8 @@ fn unchanged(rig: &Rig) -> Result<(), String> {
         return Err("对齐显示/活动格取消产生了正文或历史".into());
     }
     let mut actual = [0_u16; 128];
-    // 固定小片读取只用于核这个合成例。产品用户笔记从不经过本函数，不拼接完整字符串。
+    // Fixed small chunks inspect this synthetic fixture only. User notes never
+    // pass through this helper, which assembles no complete string.
     let mut expected = SOURCE.encode_utf16();
     for start in (0..document.utf16_len()).step_by(actual.len()) {
         let used = actual.len().min(document.utf16_len() - start);
@@ -277,14 +296,16 @@ fn unchanged(rig: &Rig) -> Result<(), String> {
     }
     drop(document);
     drop(original);
-    // 所有文档租约先归还，再通过独立文件句柄核原磁盘；未保存的活动格不能偷偷落盘。
+    // End every document lease before independent disk verification. An unsaved
+    // active cell must not silently persist its draft.
     if std::fs::read(rig._file.path()).map_err(|cause| cause.to_string())? != SOURCE.as_bytes() {
         return Err("对齐流程写入了原磁盘".into());
     }
     Ok(())
 }
 
-/// 标准短表采用向下的容器坐标；原内容框提供共同物理原点，不从候选字宽或行高拟合参考。
+/// Standard short-table references use downward container coordinates. Actual
+/// content frames provide the shared origin, without fitting reference glyph widths/heights.
 fn original_frame(frame: NSRect, content: NSRect) -> NSRect {
     NSRect::new(
         NSPoint::new(
@@ -295,13 +316,15 @@ fn original_frame(frame: NSRect, content: NSRect) -> NSRect {
     )
 }
 
-/// 产品图关闭后才排独立 Native 短串，实际 NSParagraphStyle 决定对齐和尾空白语义。
+/// Lay out independent Native short strings only after product closure. Actual
+/// NSParagraphStyle determines reference alignment and trailing-space behavior.
 fn original(observed: &[ObservedCell]) -> Result<(), String> {
     let font = crate::native_surface::text_attributes::native_markdown_document_fixed_font(14.0)
         .map_err(|cause| cause.to_string())?;
     for cell in observed {
-        // 这六个固定字面只有 ASCII 字母/空格；每个 byte 是一个 scalar 和完整 GCB。
-        // 端点仅从原 fixture 字面生成，不读取产品字符框、选区或 Core GCB 输出。
+        // Six fixed ASCII letter/space strings have one byte/scalar/grapheme each.
+        // Derive endpoints from those literals alone, never product geometry,
+        // selection state, or Core grapheme output.
         if !cell.text.is_ascii() {
             return Err("固定 ASCII 对齐参考出现了非 ASCII 字面".into());
         }
@@ -316,8 +339,9 @@ fn original(observed: &[ObservedCell]) -> Result<(), String> {
         if cell.text.len() > 10 && lines.len() < 2 {
             return Err("独立原对齐夹具没有真实软换行".into());
         }
-        // 首行和后继每条软行都消费原 Native 的真实源范围；尾空白不从参考属性串删除。
-        // Right 对齐会让保留的尾空白超出 content.right，只有独立框确在 clip 外才允许 Pending。
+        // Every soft line uses actual Native source ranges, retaining trailing
+        // spaces in reference text. Right alignment may place spaces beyond the
+        // content edge; only an independently offscreen rectangle justifies Pending.
         let original_characters = lines.iter().map(|line| line.graphemes.len()).sum::<usize>();
         if original_characters != cell.characters.len() {
             return Err("ASCII 对齐原 Native GCB 没有覆盖全部固定字符".into());
@@ -336,7 +360,8 @@ fn original(observed: &[ObservedCell]) -> Result<(), String> {
                     .flatten()
                     .any(|character| character.origin.y != first.origin.y)
             {
-                // 来源落在同一原 Native 软行的字符必须同一候选 y；只对齐第一行而后续仍左贴不能通过。
+                // Characters in the same actual Native soft line need one
+                // candidate y; aligning only the first line cannot satisfy later rows.
                 return Err(format!(
                     "对齐格与原 Native 真实软行端点不同：alignment={:?} active={} source={:?}",
                     cell.alignment, cell.active, line.source
@@ -356,7 +381,7 @@ fn original(observed: &[ObservedCell]) -> Result<(), String> {
                 let expected = original_frame(positioned, cell.content);
                 let visible = NSIntersectsRect(expected, cell.clip);
                 match (visible, actual) {
-                    (false, None) => {} // 这是原 Native 框证明的真实离屏，不按空白类别豁免。
+                    (false, None) => {} // The actual Native rectangle proves offscreen placement; whitespace gets no blanket exemption.
                     (true, Some(actual))
                         if (actual.origin.x - expected.origin.x).abs() <= 1.0 / 64.0
                             && (actual.size.width - expected.size.width).abs() <= 1.0 / 64.0 => {}
@@ -402,8 +427,10 @@ fn run_ascii(mtm: MainThreadMarker) -> Result<(), String> {
                 observed.push(capture(&rig.body, &rig.view, text, alignment, false)?);
             }
             rig.panel.makeKeyAndOrderFront(None);
-            // 继续用真实父 mouseDown/up 挂载唯一 child，不直接创建 CellSession 或改活动槽。
-            // Ready 前已发 Up；原三秒焦点/完整像素门仍由现 ui_active 负责，不能把 owner 存在当完成。
+            // Mount the sole child through actual parent down/up, never directly
+            // creating CellSession or changing its active slot. Up precedes Ready;
+            // ui_active still requires actual focus/full pixels within three seconds,
+            // rather than treating owner existence as completion.
             for (text, alignment) in &CELLS[1..3] {
                 reveal_sample(&rig, text)?;
                 let point = links::point(&rig, canonical(text))?;
@@ -414,7 +441,8 @@ fn run_ascii(mtm: MainThreadMarker) -> Result<(), String> {
                 let view = child.view().map_err(|cause| cause.to_string())?;
                 ui_local(&view, text)?;
                 observed.push(capture(&child, &view, text, *alignment, true)?);
-                // Esc 是原格的取消动作，仅关闭这次草稿；不使用应用退出或另加快捷键帮助收尾。
+                // Existing Escape cancels only this draft. No app quit command or
+                // added shortcut assists teardown.
                 let frame = observe(&rig.body)?;
                 view.command(sel!(cancelOperation:))
                     .map_err(|cause| cause.to_string())?;
@@ -424,19 +452,21 @@ fn run_ascii(mtm: MainThreadMarker) -> Result<(), String> {
                 }
                 drop(view);
                 drop(child);
-                // 短期强引用在下一格开始前归还；最终严格关闭仍核原 Native/FD/mmap/字体/worker。
+                // Return temporary claims before the next cell. Final strict
+                // closure still checks actual Native/FD/mmap/font/worker resources.
                 unchanged(&rig)?;
             }
             rig.remember_receipt()?;
             unchanged(&rig)?;
             Ok(observed)
         })();
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, result))
     })?;
-    retirement.verify(false)?;
-    // 即使业务动作失败也先走上方真实关闭；只有整个产品图退场后才分配标准参考图。
-    // 两图永不同存，记录仅是可见字符框与方向纯值，不能掩盖产品资源延迟释放。
+    retirement.verify()?;
+    // Even interaction failure first completes actual closure above. Allocate
+    // the standard reference only afterward; scalar rectangles/alignment remain,
+    // but simultaneous graphs cannot conceal delayed product-resource release.
     original(&result?)?;
     println!(
         "native_body_table_alignment actual_left_center_right=true actual_soft_lines_and_trailing_spaces=true active_cell_geometry=true canonical_hit_and_zero_rgba=true strict_original_release=true whole_product=false formal=false"
@@ -453,8 +483,9 @@ const UNICODE_SOURCE: &str = concat!(
     "\r\nafter\r\n",
 );
 
-/// 固定 Hebrew 与 Prepend 字面直接给出真实 GCB 端点；不是复制产品 Unicode 解码或分词算法。
-/// U+0600 与其后第一个空格为整簇，后一个独立空格仍可退出对齐宽度；任何命中都不能切簇。
+/// Fixed Hebrew/Prepend literals independently specify grapheme endpoints without
+/// copying product Unicode decoding/segmentation. U+0600 joins its first following
+/// space; the next separate space may lie outside alignment width. Hits cannot split either cluster.
 const UNICODE_CELLS: [(&str, MarkdownTableAlignment, &[usize]); 4] = [
     ("אבג  ", MarkdownTableAlignment::Center, &[0, 1, 2, 3, 4, 5]),
     ("דהו  ", MarkdownTableAlignment::Right, &[0, 1, 2, 3, 4, 5]),
@@ -470,10 +501,11 @@ struct UnicodeCell {
     graphemes: Vec<(std::ops::Range<usize>, Option<NSRect>)>,
 }
 
-/// 查找首标量仍沿正式 SourceTarget；内部 UBA seam 不能让原完整 GCB 的可见证明失败。
+/// Reveal the first scalar through production SourceTarget. An internal UBA seam
+/// must not break the original complete grapheme's actual visibility proof.
 fn reveal_unicode_grapheme(rig: &Rig, text: &str) -> Result<(), String> {
     let Some(within) = text.find('\u{0600}') else {
-        return Ok(()); // 普通 Hebrew 样本继续只验证其原几何，没有额外目标动作。
+        return Ok(()); // Ordinary Hebrew cases verify existing geometry without an extra target action.
     };
     let canonical = UNICODE_SOURCE[..UNICODE_SOURCE.find(text).expect("固定 Unicode 格存在")]
         .encode_utf16()
@@ -516,7 +548,8 @@ fn reveal_unicode_grapheme(rig: &Rig, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 只通过原 Scene 的公开字符框、光标、命中和有向选择消费同一真实格；不读内部布局字段。
+/// Observe the same actual cell through public Scene character/caret geometry,
+/// hit testing, and directed selection, without reading internal layout fields.
 fn unicode_cell(
     rig: &Rig,
     text: &'static str,
@@ -532,7 +565,8 @@ fn unicode_cell(
         .map_err(|cause| cause.to_string())?;
     let scene = NativeMarkdownPagedTextViewDelegate::ready_scene(&*rig.body, &key.request)
         .map_err(|cause| cause.to_string())?;
-    // 首 GCB 仍须实际可见并命中当前格，才取得真实内容框；不从列号或候选字宽猜 clip。
+    // The first grapheme must actually be visible and hit this cell before its
+    // content frame is authorized; column numbers/glyph widths cannot guess the clip.
     let first = scene
         .first_rect(NSRange::new(canonical, boundaries[1]))
         .map_err(|cause| cause.to_string())?;
@@ -553,8 +587,10 @@ fn unicode_cell(
         let value = match scene.first_rect(NSRange::new(from, to - from)) {
             Ok(value) => value,
             Err(ViewError::Pending) => {
-                // 离屏不授字形框，但两个公开插入点仍须保原完整 GCB 的 canonical 端点。
-                // None 会在严格关闭后与真实 Native 框逐项核对，可见却 Pending 不能通过。
+                // Offscreen status supplies no glyph rectangle, but both caret
+                // queries must preserve original complete-grapheme endpoints.
+                // Compare None with actual Native geometry after strict closure;
+                // a visible yet Pending grapheme cannot pass.
                 for boundary in [from, to] {
                     let caret = scene
                         .first_rect(NSRange::new(boundary, 0))
@@ -609,8 +645,10 @@ fn unicode_cell(
                 value.rect.origin.y + value.rect.size.height * 0.5,
             );
             if !NSPointInRect(point, clip) {
-                // 部分可见 GCB 的原固定点击点可能在邻格；保留原点，不移动到可通过的位置。
-                // 关闭后的独立框仍须与实际框精确对应，只有真实 clip 内的点才属于本格交互。
+                // A partially visible grapheme's fixed hit point may lie in a
+                // neighboring cell. Keep the point rather than moving it to pass;
+                // independent geometry still must match, and only actual clipped
+                // points belong to this cell's interaction domain.
                 continue;
             }
             let hit = scene.hit(point).map_err(|cause| {
@@ -653,7 +691,8 @@ fn unicode_cell(
     })
 }
 
-/// 短例只在原 mmap 文档图中读取/选择；参考 TextKit 图必须等严格关闭完成后才创建。
+/// Read/select these short fixtures only in their original mmap graph. Independent
+/// TextKit reference construction waits until strict product closure completes.
 fn run_unicode(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
@@ -710,15 +749,16 @@ fn run_unicode(mtm: MainThreadMarker) -> Result<(), String> {
             rig.remember_receipt()?;
             Ok(observed)
         })();
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, result))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     let font = crate::native_surface::text_attributes::native_markdown_document_fixed_font(14.0)
         .map_err(|cause| cause.to_string())?;
     for cell in result? {
-        // 原 UNICODE_CELLS 已独立声明 UAX GCB：Prepend+首空格为1..3，尾空格仍为3..4。
-        // 这里只按固定字面/方向找回该声明，不能从待测 cell.graphemes 反推 Native 查询范围。
+        // Independent UNICODE_CELLS declares Prepend/first-space as 1..3 and the
+        // final space as 3..4. Retrieve those fixed literal/alignment facts rather
+        // than deriving Native query ranges from candidate grapheme observations.
         let boundaries = UNICODE_CELLS
             .iter()
             .find_map(|(text, alignment, boundaries)| {
@@ -742,8 +782,10 @@ fn run_unicode(mtm: MainThreadMarker) -> Result<(), String> {
             ));
         }
         for ((source, actual), original) in cell.graphemes.iter().zip(original) {
-            // 两种引擎都来自同一短字面、真实同列宽和原 NSParagraphStyle；RTL 逐 GCB 比真实
-            // 视觉左右，不能把逻辑首字直接贴 baseline，也不在参考侧 trim 掉 Prepend 整簇。
+            // Both engines use the same fixed text, actual column width, and
+            // paragraph style. Compare actual RTL visual positions per grapheme;
+            // do not pin the logical first character to the baseline or trim the
+            // complete Prepend cluster from the reference.
             if *source != original.source {
                 return Err("Unicode 对齐观察与独立 Native 的原 GCB 端点不同".into());
             }
@@ -753,7 +795,7 @@ fn run_unicode(mtm: MainThreadMarker) -> Result<(), String> {
             let expected = original_frame(positioned, cell.content);
             let visible = NSIntersectsRect(expected, cell.clip);
             match (visible, actual) {
-                (false, None) => {} // 原字形确在 clip 外；保留该 GCB，不把末空白从结果删除。
+                (false, None) => {} // Actual reference geometry is offscreen; retain the grapheme instead of deleting trailing spaces.
                 (true, Some(actual))
                     if (actual.origin.x - expected.origin.x).abs() <= 1.0 / 64.0
                         && (actual.size.width - expected.size.width).abs() <= 1.0 / 64.0 => {}
@@ -778,7 +820,8 @@ fn run_unicode(mtm: MainThreadMarker) -> Result<(), String> {
 }
 
 pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
-    // 两个独立真实图都完整执行并关闭；ASCII 首次失败不能遮住 RTL/Prepend 的资源或功能结果。
+    // Complete and close both independent actual graphs. An ASCII failure must
+    // not conceal RTL/Prepend behavior or resource-release outcomes.
     let ascii = run_ascii(mtm);
     let unicode = run_unicode(mtm);
     match (ascii, unicode) {

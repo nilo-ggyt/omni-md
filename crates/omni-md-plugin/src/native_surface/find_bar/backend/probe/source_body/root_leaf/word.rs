@@ -1,11 +1,13 @@
-//! 普通 Source 的真实双击首组、快拖、反向与离屏续选；只复用原 Rig 和公开 Native 入口。
+//! Exercise actual Source word double-click, fast drag, reversed direction, and
+//! offscreen continuation using the original Rig and public Native responder entries.
 
 use super::*;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
 use std::io::Read;
 
-// 中文词范围取自 Core 已有实际 CM6.11/6.43.9 oracle：中文分组=0..4、测试=5..7。
-// 本夹具不按 ASCII 空格拆中文；四 MiB 尾部只逐个固定片段写入和核验。
+// Chinese group ranges come from Core's actual CM6.11/6.43.9 oracle: 0..4 and
+// 5..7, rather than ASCII whitespace splitting. Write/verify the 4MiB tail one
+// fixed fragment at a time, without assembling the complete expected document.
 const LINE: &str = "中文分组 测试\r\n\r\n";
 const FILLER: &str = "bounded paragraph keeps original selection stable.\r\n\r\n";
 const ROWS: usize = 80;
@@ -16,7 +18,8 @@ fn far() -> usize {
     LINE.encode_utf16().count() + ROWS * FILLER.len()
 }
 
-/// fixture 只拥有本轮临时文件；没有整篇 String、预解析目录或第二个应用实例。
+/// Own only this case's temporary file, with no whole-document String, pre-parsed
+/// directory, or second application instance.
 fn fixture() -> Result<tempfile::NamedTempFile, String> {
     let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
     file.write_all(LINE.as_bytes())
@@ -35,7 +38,8 @@ fn fixture() -> Result<tempfile::NamedTempFile, String> {
     Ok(file)
 }
 
-/// 原字符框映射为窗口点；Scene 在真实事件交付前归还，不以强引用阻止 Source 退休。
+/// Map actual character geometry to window coordinates and return the Scene before
+/// event delivery, so a strong reader claim cannot prevent Source retirement.
 fn point(rig: &Rig, index: usize) -> Result<NSPoint, String> {
     let key = rig
         .view
@@ -60,13 +64,15 @@ fn point(rig: &Rig, index: usize) -> Result<NSPoint, String> {
     Ok(rig.view.convertPoint_toView(local, None))
 }
 
-/// 每个同步活事件只交原 responder 一次；clickCount 保留真实双击角色，不调用业务选择方法。
+/// Deliver each synchronous live event once to the original responder. clickCount
+/// expresses double-click semantics without calling business selection methods directly.
 fn mouse(rig: &Rig, point: NSPoint, kind: NSEventType, clicks: isize) -> Result<(), String> {
     let window = rig.view.window().ok_or("Source Word 原窗口已归还")?;
     let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
         kind, point, NSEventModifierFlags::empty(), 1.0, window.windowNumber(), None, 1, clicks, 1.0,
     ).ok_or("无法构造 Source Word 原 Native 鼠标事件")?;
-    // SAFETY: 主线程实际窗口与活 view；只有已有 NSResponder Down/Drag/Up 三个语义入口。
+    // SAFETY: The actual window/view live on the main thread. Use only existing
+    // NSResponder mouse-down/drag/up entries.
     unsafe {
         if kind == NSEventType::LeftMouseDown {
             let _: () = objc2::msg_send![&**rig.view, mouseDown: &*event];
@@ -81,7 +87,8 @@ fn mouse(rig: &Rig, point: NSPoint, kind: NSEventType, clicks: isize) -> Result<
     Ok(())
 }
 
-/// 只核用户可见有向选区和原文历史；没有查询/突变私有 pending、游标或词缓存。
+/// Check user-visible directed selection and original text history, without
+/// reading/mutating private pending state, cursors, or word caches.
 fn selected(rig: &Rig, expected: MarkdownTextSelection) -> Result<(), String> {
     let actual = rig.view.input_state().map_err(|cause| cause.to_string())?;
     let original = rig.document.upgrade().ok_or("Source Word 原 Doc 已归还")?;
@@ -101,7 +108,8 @@ fn selected(rig: &Rig, expected: MarkdownTextSelection) -> Result<(), String> {
     Ok(())
 }
 
-/// 不运行主循环便交 Drag/Up；原 Input 未发布首组时就必须接纳最新点，随后仍只有原三秒帧期限。
+/// Deliver drag/up without running the loop. Before Input publishes its first word
+/// group, it must accept the latest point and finish within the original three-second frame limit.
 fn fast_groups(rig: &mut Rig) -> Result<(), String> {
     for (origin, target, expected, stage) in [
         (
@@ -140,8 +148,9 @@ fn fast_groups(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 同组方向沿原 CM range.extend 事实：回原首击 head 正向，同组另一 head 反向。
-/// 此处先得到真实首组，再拖动，既核 Group 重用也不让快拖用例掩盖已 Ready 的方向回归。
+/// Preserve actual CodeMirror range.extend direction: returning to the initial hit
+/// is forward; another point within the group is backward. Obtain the actual first
+/// group before dragging so fast-drag scenarios cannot conceal ready-group direction defects.
 fn same_group(rig: &mut Rig) -> Result<(), String> {
     let origin = point(rig, 1)?;
     let frame = observe(&rig.body)?;
@@ -179,7 +188,8 @@ fn same_group(rig: &mut Rig) -> Result<(), String> {
         selected(rig, expected)?;
         rig.remember_receipt()?;
     }
-    // Down 保持真实活性，接下来只用原 SourceTarget 滚动，首组随后真正离开可见窗口。
+    // Keep the actual mouse-down active. Scroll only through original SourceTarget
+    // until the initial word group actually leaves the viewport.
     let before = rig.view.input_state().map_err(|cause| cause.to_string())?;
     let frame = observe(&rig.body)?;
     let target = rig
@@ -213,7 +223,7 @@ fn same_group(rig: &mut Rig) -> Result<(), String> {
         }
         Err(ViewError::Pending | ViewError::InvalidRange) => {}
         Err(cause) => return Err(cause.to_string()),
-    } // 离屏允许没有几何；实际 Source/Native 错误不能借此降为“不可见”。
+    } // Offscreen geometry may be unavailable; actual Source/Native errors cannot be downgraded to invisibility.
     drop((scene, key));
     let end = point(rig, far() + 6)?;
     let frame = observe(&rig.body)?;
@@ -230,7 +240,8 @@ fn same_group(rig: &mut Rig) -> Result<(), String> {
     rig.remember_receipt()
 }
 
-/// 原 Up 后立即新 Down，旧首组在途完成不能覆盖新 caret；迟到 Drag 也没有新的 Down 权限。
+/// A new down immediately after up revokes the old pending word group. Its late
+/// completion cannot overwrite the new caret, and late drag has no new down authority.
 fn cancelled_group(rig: &mut Rig) -> Result<(), String> {
     let frame = observe(&rig.body)?;
     let target = rig
@@ -262,7 +273,8 @@ fn cancelled_group(rig: &mut Rig) -> Result<(), String> {
     if rig.view.input_state().map_err(|cause| cause.to_string())? != after {
         return Err("Source Word Up 后迟到 Drag 复活了旧首组".into());
     }
-    // 同点Up仍须为未Ready首组保留可撤归属；后继新Down若恰在原caret，InputState不变也必须撤旧查询。
+    // Same-point up keeps the unready group's revocable identity. A successor down
+    // at the existing caret must revoke it even when InputState values do not change.
     let started = Instant::now();
     mouse(rig, down, NSEventType::LeftMouseDown, 2)?;
     mouse(rig, down, NSEventType::LeftMouseUp, 2)?;
@@ -271,7 +283,8 @@ fn cancelled_group(rig: &mut Rig) -> Result<(), String> {
     }
     mouse(rig, successor, NSEventType::LeftMouseDown, 1)?;
     mouse(rig, successor, NSEventType::LeftMouseUp, 1)?;
-    // SAFETY: 原查询为短词但仍经真实异步生产者；只推进原loop，未用私态或假返回替代取消。
+    // SAFETY: The short query still uses its actual asynchronous producer. Service
+    // the original loop without private-state mutation or fabricated cancellation results.
     unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.2, false) };
     selected(rig, MarkdownTextSelection::caret(3))?;
     let key = rig
@@ -291,7 +304,8 @@ fn cancelled_group(rig: &mut Rig) -> Result<(), String> {
     rig.remember_receipt()
 }
 
-/// 单次真实Drag停在视口外；不再补发事件，必须由原期限连续滚动并扩展同一个Down选区。
+/// One actual drag remains outside the viewport. Without additional events, its
+/// existing timer must keep scrolling and extending the same mouse-down selection.
 fn autoscroll(rig: &mut Rig) -> Result<NativeWeak<objc2::runtime::AnyObject>, String> {
     let down = point(rig, 2)?;
     let event = observe(&rig.body)?;
@@ -341,12 +355,13 @@ fn autoscroll(rig: &mut Rig) -> Result<NativeWeak<objc2::runtime::AnyObject>, St
                 .map_err(|cause| cause.to_string())?
                 .validate_ready(&|| true)
                 .map_err(|cause| cause.to_string())?;
-            break; // 两轮实际滚动及其完整帧都完成；没有调用滚动/选区业务方法替代用户动作。
+            break; // Two actual scroll/frame completions occurred without direct business scrolling/selection calls.
         }
         let remaining = Duration::from_secs(3)
             .checked_sub(started.elapsed())
             .ok_or("同一个真实Drag三秒内没有连续滚动与最终有向选区")?;
-        // SAFETY: 主线程仅推进原事件loop，时间片包含在同一个绝对三秒动作期限内。
+        // SAFETY: Service only the original main-thread event loop, with each slice
+        // contained in the same absolute three-second action deadline.
         unsafe {
             CFRunLoop::run_in_mode(
                 kCFRunLoopDefaultMode,
@@ -356,7 +371,8 @@ fn autoscroll(rig: &mut Rig) -> Result<NativeWeak<objc2::runtime::AnyObject>, St
         };
     }
     mouse(rig, outside, NSEventType::LeftMouseUp, 1)?;
-    // Up可以在真实重排边界到达；先等其已接纳终点完成，不能把中间帧当作停止后的最终选择。
+    // Mouse-up may arrive during actual reflow. Wait for its accepted endpoint;
+    // an intermediate frame cannot stand in for the stopped final selection.
     let stopped = loop {
         if let Ok(key) = rig.view.capture_ready_scene_key()
             && rig.view.cpu_paint_pending() == Some(false)
@@ -366,7 +382,8 @@ fn autoscroll(rig: &mut Rig) -> Result<NativeWeak<objc2::runtime::AnyObject>, St
         let remaining = Duration::from_secs(3)
             .checked_sub(started.elapsed())
             .ok_or("原拖选Up没有在同一次三秒期限内完成")?;
-        // SAFETY: 只等待原Up与实际CPU帧，不重放Down或延长总deadline。
+        // SAFETY: Wait only for original up/CPU-frame delivery, with no replayed
+        // mouse-down or extension of the total deadline.
         unsafe {
             CFRunLoop::run_in_mode(
                 kCFRunLoopDefaultMode,
@@ -375,7 +392,8 @@ fn autoscroll(rig: &mut Rig) -> Result<NativeWeak<objc2::runtime::AnyObject>, St
             )
         };
     };
-    // SAFETY: 推进超过三轮旧timer期限，证明真实Up已停止滚动；不制造额外事件或改输入法。
+    // SAFETY: Service more than three old timer intervals to verify mouse-up
+    // stopped scrolling, without posting another event or changing input methods.
     unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.2, false) };
     let after = rig
         .view
@@ -390,10 +408,11 @@ fn autoscroll(rig: &mut Rig) -> Result<NativeWeak<objc2::runtime::AnyObject>, St
         return Err("原Up后旧期限仍改变视口、选择或保留timer owner".into());
     }
     rig.remember_receipt()?;
-    Ok(timer) // 外层池结束后独立核原timer真实销毁，弱票不占Native或业务资源。
+    Ok(timer) // After outer-pool drainage, verify actual timer destruction using this nonowning weak identity.
 }
 
-/// 固定生成规则独立核 canonical 和磁盘；只保栈片，不通过产品结果反推期望文稿。
+/// Compare canonical/disk contents against independent fixed generation rules,
+/// using stack chunks rather than deriving expected text from product output.
 fn unchanged(rig: &Rig) -> Result<(), String> {
     let original = rig.document.upgrade().ok_or("Source Word 原 Doc 已归还")?;
     let document = original.borrow();
@@ -458,6 +477,8 @@ fn unchanged(rig: &Rig) -> Result<(), String> {
     Ok(())
 }
 
+/// Complete actual word/drag scenarios, verify the unread layout tail, then close
+/// the original graph and inspect the retained weak timer only after release.
 pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, result, timer) = autoreleasepool(|_| -> Result<_, String> {
         let file = fixture()?;
@@ -493,10 +514,10 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
             unchanged(&rig)?;
             Ok(())
         })();
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, result, timer))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     if timer.is_some_and(|timer| timer.load().is_some()) {
         return Err("原拖选期限在关闭与原池归还后仍未真实销毁".into());
     }

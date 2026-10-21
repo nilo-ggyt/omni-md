@@ -1,13 +1,13 @@
-//! 源码写作直接消费Core键盘命令；标记续写、缩进和历史不在Native层重写。
+//! Source editing consumes Core keyboard commands; Native does not duplicate marker continuation, indentation, or history.
 
 use super::*;
 use omni_markdown_core::{MarkdownEditingCommand, MarkdownEditingOutcome};
 
 impl NativeMarkdownPagedInput {
-    /// 源码插表复用原中文模板，一次正文事务同时发布首格caret；不复制被替换的正文。
+    /// Insert the existing Chinese table template and first-cell caret in one Body transaction without copying replaced text.
     ///
     /// # Errors
-    /// 组合、多选或Cell客户不具备块插入权限；原票、源IO、准备或发布失败保留旧正文和历史。
+    /// Composition, multiple selection, and Cell cannot insert Body blocks; permit/Source/preparation/publication failures preserve text/history.
     pub fn insert_default_table(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -16,10 +16,10 @@ impl NativeMarkdownPagedInput {
         let _mutation = self.begin(permit, current)?;
         if self.is_cell() {
             return Err(NativeMarkdownPagedInputError::BodyTargetRequired);
-        } // 单元格草稿不能通过插表按钮把局部偏移当作canonical块位置。
+        } // A draft cannot turn local offsets into canonical block coordinates through Insert Table.
         if permit.before.marked.is_some() {
             return Err(NativeMarkdownPagedInputError::CompositionActive);
-        } // 候选仍归系统输入法；按钮不得强制确认或取消后再领取另一份选择。
+        } // The system IME owns its candidate; the button cannot force confirmation/cancellation and recapture another selection.
         if !permit.before.selection_is_directed {
             return Err(NativeMarkdownPagedInputError::MultipleSelectionInput);
         }
@@ -37,7 +37,7 @@ impl NativeMarkdownPagedInput {
             let mut document = original
                 .try_borrow_mut()
                 .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
-            // 只读取原选择两端相邻的UTF16单位；真实IO错误必须传播，不能当成普通非换行。
+            // Read only adjacent UTF-16 units at selection endpoints; propagate actual I/O failure rather than treat it as a non-newline.
             let needs_prefix = range.location > 0
                 && !matches!(document.utf16_code_unit_at(range.location - 1)?, 10 | 13);
             let needs_suffix =
@@ -56,7 +56,7 @@ impl NativeMarkdownPagedInput {
                 observer,
             )?
         };
-        // 准备不发布正文；归还Doc借用后才调用可重入的前台门，失权只取消本nonce。
+        // Preparation publishes no text. Release the document borrow before foreground reentry; revoke only this nonce on failure.
         if let Err(cause) = self.check_permit(permit, current) {
             return Err(self.cancel(&original, &token, cause));
         }
@@ -89,7 +89,7 @@ impl NativeMarkdownPagedInput {
                 return Err(self.cancel(&original, &token, cause.into()));
             }
         };
-        // Core发布后只交换已准备好的选择/折叠metadata，无Native调用或第二次caret事务。
+        // After Core publication exchange prepared selection/fold metadata only, with no Native call or second caret transaction.
         let commit = self.publish(permit, &document, prepared, None, Some(edit), &mut folds);
         drop(folds);
         drop(document);
@@ -98,13 +98,13 @@ impl NativeMarkdownPagedInput {
         Ok(commit)
     }
 
-    /// 用原票提交一次源码命令；普通Backspace只消费调用方同Scene认证的真实GCB范围。
+    /// Submit one Source command under the original permit; ordinary Backspace consumes only its caller's same-Scene verified grapheme range.
     ///
-    /// 返回None仅表示Core没有适用标记规则、且本次没有可用GCB计划；调用方须保留原
-    /// Pending/错误，不能把它当作已删除。整个动作只消费一张permit，不重新捕获或重放。
+    /// None means Core has no applicable marker rule and no grapheme plan was supplied; the caller must retain its actual
+    /// Pending/error rather than report deletion. Consume one permit without recapture or replay.
     ///
     /// # Errors
-    /// marked、多选未知方向、Cell局部坐标、旧票、资源或Core预检失败时保留原文和历史。
+    /// Marked input, unknown multi-range direction, Cell coordinates, stale permit, or resource/Core preflight failure preserves text/history.
     pub fn apply_source_editing_command(
         self: &Rc<Self>,
         permit: &NativeMarkdownPagedInputPermit,
@@ -115,13 +115,13 @@ impl NativeMarkdownPagedInput {
         let _mutation = self.begin(permit, current)?;
         if self.is_cell() {
             return Err(NativeMarkdownPagedInputError::BodyTargetRequired);
-        } // 表格Tab/Return归原客户控制器，不把局部草稿位置用于canonical块命令。
+        } // The Cell controller owns table Tab/Return; local draft positions cannot drive canonical block commands.
         if permit.before.marked.is_some() {
             return Err(NativeMarkdownPagedInputError::CompositionActive);
-        } // 输入法仍拥有候选；块算法不能删标记或结束组合。
+        } // The IME still owns the candidate; block algorithms cannot remove its markers or end composition.
         if !permit.before.selection_is_directed {
             return Err(NativeMarkdownPagedInputError::MultipleSelectionInput);
-        } // 旧命令只支持一个真实方向，不能只改主范围并悄悄丢弃其他选择。
+        } // These commands require one directed selection; do not edit only a primary range and silently discard others.
 
         let original = self
             .document_identity()
@@ -129,7 +129,7 @@ impl NativeMarkdownPagedInput {
             .ok_or(NativeMarkdownPagedInputError::DocumentReleased)?;
         let observer = self.observer(permit.before)?;
         {
-            // current已在借用外完成；Core和FoldObserver只运行纯Rust预检及一次原子发布。
+            // current finished outside borrows; Core/FoldObserver now perform pure Rust preflight and one atomic publication.
             let mut document = original
                 .try_borrow_mut()
                 .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
@@ -147,29 +147,29 @@ impl NativeMarkdownPagedInput {
             )?;
             match outcome {
                 MarkdownEditingOutcome::Changed(edit) => {
-                    // Core已经成功；此后只交换原fold/选择metadata，不调用Native或后置可失败IO。
+                    // Core succeeded; exchange original fold/selection metadata without Native calls or fallible postcommit I/O.
                     return Ok(Some(NativeMarkdownPagedInputOutcome::Committed(
                         self.publish(permit, &document, prepared, None, Some(edit), &mut folds),
                     )));
                 }
                 MarkdownEditingOutcome::Unchanged => {
-                    // 已无缩进的BackTab仍消费动作，不移动焦点、不推进serial或破坏Redo。
+                    // BackTab on unindented text consumes the action without moving focus, advancing serial, or invalidating Redo.
                     return Ok(Some(NativeMarkdownPagedInputOutcome::Unchanged(
                         permit.before,
                     )));
                 }
                 MarkdownEditingOutcome::NotHandled => {
-                    // 无标记规则不发布临时派生metadata；归还全部借用后才检查原GCB的current。
+                    // No marker rule publishes no temporary metadata; release every borrow before checking the original grapheme current.
                 }
             }
         }
         if let Some(range) = ordinary_backward {
-            // 复用原replace及FoldObserver；begin已消费同票并保持busy，绝不另取permit重试。
+            // Reuse replace/FoldObserver with the permit already consumed by begin and busy still held; do not acquire another permit.
             return self
                 .replace(permit, "", range, None, None, current)
                 .map(NativeMarkdownPagedInputOutcome::Committed)
                 .map(Some);
         }
-        Ok(None) // 没有真实GCB便没有普通删除；原View必须返回其实际Pending/失败。
+        Ok(None) // Without a verified grapheme range there is no ordinary deletion; View must preserve actual Pending/failure.
     }
 }

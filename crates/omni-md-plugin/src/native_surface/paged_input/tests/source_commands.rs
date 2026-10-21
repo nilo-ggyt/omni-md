@@ -1,4 +1,4 @@
-//! 真实Core写作事务覆盖续写、缩进、普通字素回落、原票取消和共享mmap。
+//! Exercise real Core continuation/indentation/grapheme fallback transactions, original-permit cancellation, and shared mmap backing.
 
 use super::*;
 use omni_markdown_core::MarkdownEditingCommand;
@@ -23,11 +23,11 @@ fn source_table_insertion_places_first_cell_and_restores_reverse_selection_in_on
             "\n\n乙",
         ),
     ] {
-        // 真实选区含代理对及反向范围；一次Undo须同时恢复原字符、方向与mmap，不只比较净长度。
+        // Use surrogate pairs and reversed selection; one Undo restores actual text/direction/mmap, not just net length.
         let (_file, document) = fixture(input, 4096);
         document.borrow_mut().set_selection(before).unwrap();
         let mapping = document.borrow().original_backing_observer();
-        // 空文件没有可映射区；非空原文必须保留真实映射，而不是为验收制造一个空映射。
+        // Empty files have no mapping; nonempty text must retain its actual mapping rather than invent an empty acceptance mapping.
         assert_eq!(mapping.is_some(), !input.is_empty());
         let mapped = mapping.as_ref().map(|mapping| mapping.mapped_bytes());
         let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
@@ -72,7 +72,7 @@ fn source_table_preparation_revocation_and_capacity_failure_preserve_original_hi
         let before = owner.state().unwrap();
         let permit = owner.capture(1, &|_| true).unwrap();
         let prepared = Cell::new(false);
-        // 只在Core已经持有真实候选时撤前台权限；不依赖调用次数来假设准备已经发生。
+        // Revoke foreground authority only when Core actually owns a candidate, not after an assumed callback count.
         let current = |_| {
             let pending = document.borrow().has_prepared_text_input();
             prepared.set(prepared.get() || pending);
@@ -83,7 +83,7 @@ fn source_table_preparation_revocation_and_capacity_failure_preserve_original_hi
         assert_eq!(owner.state().unwrap(), before);
         assert!(!document.borrow().can_undo() && !document.borrow().can_redo());
         assert!(!document.borrow().has_prepared_text_input());
-        // 撤销准备后原pending槽应可再次使用；不是仅让失败返回却遗留一张占用事务。
+        // After cancellation the actual pending slot must accept another operation, not merely return failure while retaining its transaction.
         if maximum == 4096 {
             assert!(prepared.get());
             let permit = owner.capture(1, &|_| true).unwrap();
@@ -201,7 +201,7 @@ fn source_indent_and_backtab_keep_reverse_selection_and_exclude_trailing_line() 
             .unwrap(),
     );
     assert_eq!(text(&document), "甲🙂\n乙\n末");
-    assert!(!document.borrow().can_undo()); // 两次真实撤销分别归还取消缩进和缩进，没有额外空事务。
+    assert!(!document.borrow().can_undo()); // Two actual Undo operations restore unindent/indent without an extra empty transaction.
     let stable = owner.state().unwrap();
     let permit = owner.capture(1, &current).unwrap();
     assert!(matches!(
@@ -212,7 +212,7 @@ fn source_indent_and_backtab_keep_reverse_selection_and_exclude_trailing_line() 
     ));
     assert_eq!(owner.state().unwrap(), stable);
     assert_eq!(text(&document), "甲🙂\n乙\n末");
-    assert!(document.borrow().can_redo()); // 已无缩进的BackTab不插假历史，也不破坏既有Redo。
+    assert!(document.borrow().can_redo()); // BackTab on unindented text creates no empty history and preserves existing Redo.
 }
 
 #[test]
@@ -255,7 +255,7 @@ fn source_markup_backspace_and_real_grapheme_fallback_consume_the_same_permit() 
         );
         assert_eq!(text(&document), input);
         assert_eq!(undo.state.selection, MarkdownTextSelection::caret(head));
-        assert!(!document.borrow().can_undo()); // 普通GCB回落不另建一次标记删除历史。
+        assert!(!document.borrow().can_undo()); // Ordinary grapheme fallback creates no separate marker-deletion history.
     }
 
     let (_file, document) = fixture("甲🙂", 4096);
@@ -279,7 +279,7 @@ fn source_markup_backspace_and_real_grapheme_fallback_consume_the_same_permit() 
     );
     assert_eq!(owner.state().unwrap(), before);
     assert_eq!(text(&document), "甲🙂");
-    assert!(!document.borrow().can_undo()); // None是尚缺真实GCB，绝不是已成功删除或空历史。
+    assert!(!document.borrow().can_undo()); // None means the actual grapheme plan is missing, not successful deletion or empty history.
 }
 
 #[test]
@@ -346,7 +346,7 @@ fn source_commands_preserve_marked_text_and_all_multiple_ranges_on_rejection() {
             .unwrap(),
     );
     assert_eq!(text(&document), "甲🙂\n乙");
-    assert!(!document.borrow().can_undo()); // 拒绝的源码命令未插在原marked输入之前或之后。
+    assert!(!document.borrow().can_undo()); // Rejected Source commands add no history around original marked input.
 }
 
 #[test]
@@ -364,7 +364,7 @@ fn source_ordinary_backspace_cancels_prepared_bytes_when_the_original_scene_lose
         assert!(owner.folds.try_borrow_mut().is_ok());
         if document.has_prepared_text_input() {
             prepared_seen.set(true);
-        } // 真正的普通GCB替换候选已建立后撤票；不能只测尚未开始的false。
+        } // Revoke only after the actual grapheme replacement candidate exists, not before the operation starts.
         !prepared_seen.get()
     };
     let permit = owner.capture(1, &current).unwrap();
@@ -452,7 +452,7 @@ fn source_command_capacity_and_current_rejections_keep_document_history_and_fold
         active.get()
     };
     let permit = owner.capture(1, &current).unwrap();
-    // 捕获后真实前台权限被撤销；begin须拒绝原票，不依赖内部busy翻转制造第二次相同检查。
+    // Revoke real foreground authority after capture; begin rejects the original permit without changing private busy state.
     active.set(false);
     assert!(matches!(
         owner.apply_source_editing_command(
@@ -475,7 +475,7 @@ fn source_indent_of_a_giant_single_paragraph_preserves_saved_bytes_and_releases_
     let mut file = tempfile::NamedTempFile::new().unwrap();
     let block = [b'a'; 4096];
     for _ in 0..256 {
-        file.write_all(&block).unwrap(); // 真实1MiB单段落按固定块生成，不创建全文String。
+        file.write_all(&block).unwrap(); // Create the actual 1 MiB paragraph from fixed blocks without a full-text String.
     }
     let mut document = MarkdownDocumentBuffer::open(file.path(), 2 * 1024 * 1024).unwrap();
     document
@@ -510,7 +510,7 @@ fn source_indent_of_a_giant_single_paragraph_preserves_saved_bytes_and_releases_
     );
     assert_eq!(document.borrow().byte_len(), 1024 * 1024 + 2);
     assert_eq!(mapping.mapped_bytes(), 1024 * 1024);
-    // 直接使用生产保存入口核完整字节：两个空格后仍是全部原文，每次只保留一个4KiB块。
+    // Verify complete output through production save: two spaces then all original bytes, with only one 4 KiB block retained.
     let mut saved = tempfile::tempfile().unwrap();
     document.borrow().write_to(&mut saved).unwrap();
     saved.seek(SeekFrom::Start(0)).unwrap();
@@ -541,5 +541,5 @@ fn source_indent_of_a_giant_single_paragraph_preserves_saved_bytes_and_releases_
     assert!(weak.upgrade().is_none());
     assert!(mapping.unmap_succeeded() && !mapping.failed());
     assert_eq!(mapping.mapped_bytes(), 0);
-    assert!(commit.check_current(&|_| true).is_err()); // 收据和已消费permit均不保活Doc或原映射。
+    assert!(commit.check_current(&|_| true).is_err()); // Receipts and consumed permits retain neither document nor original mapping.
 }

@@ -1,4 +1,4 @@
-//! 原Job已归还后，真实Store目录只经原Measure许可触发有限unsafe前缀，不重造旧Job身份。
+//! Resolve bounded unsafe prefixes from the real stored directory after the original job is gone.
 use super::*;
 use crate::markdown_soft_line_resolve::stored::MarkdownStoredPrefixResolveJob;
 use crate::{
@@ -8,6 +8,8 @@ use crate::{
 
 #[test]
 fn stored_prefix_after_actual_job_drop_matches_direct_font_fields_and_requires_real_child_return() {
+    // Ligatures force a genuine unsafe boundary. Persist the original item and
+    // drop its shaping job before asking the measure permit for a prefix resolver.
     let text = "ffi".repeat(16);
     let fixture = Fixture::new(&text);
     let mut coordinator = fixture.coordinator();
@@ -43,6 +45,8 @@ fn stored_prefix_after_actual_job_drop_matches_direct_font_fields_and_requires_r
         MarkdownSoftLineMeasureChoice::NeedsEmergencyBreak(_)
             | MarkdownSoftLineMeasureChoice::NeedsReshape { .. }
     ));
+    // Only the selected measurement can issue this resolution permission. Every
+    // later borrow uses the same stored proof rather than inventing an old job ID.
     let permit = {
         let mut provider = store.borrow(&proof).unwrap();
         measure.resolution_permit(&mut provider).unwrap()
@@ -53,6 +57,8 @@ fn stored_prefix_after_actual_job_drop_matches_direct_font_fields_and_requires_r
     };
     let resources = resolver.resource_observer();
     let mut total = 0;
+    // Yielded dependencies remain pending. A prefix becomes usable only when the
+    // resolver hands out its real child, which must be returned before continuing.
     for _ in 0..10000 {
         let step = {
             let mut provider = store.borrow(&proof).unwrap();
@@ -81,13 +87,16 @@ fn stored_prefix_after_actual_job_drop_matches_direct_font_fields_and_requires_r
                 let range = actual.source_utf16.clone();
                 assert_eq!(range.start, total);
                 assert!(range.end > range.start && range.len() < text.len());
-                // 有限直接字体API仅作字段对照，不称为独立上游算法或整产品内存验收。
+                // This finite direct-font comparison checks actual glyph fields;
+                // it is neither an independent algorithm nor whole-product RSS evidence.
                 let mut oracle = harfrust::Buffer::new();
                 oracle.set_direction(harfrust::Direction::LeftToRight);
                 oracle.set_script(Some(harfrust::Script::LATIN));
                 oracle.set_language("en-GB".parse().ok());
                 oracle.set_cluster_level(harfrust::ClusterLevel::MonotoneGraphemes);
                 let mut flags = harfrust::BufferFlags::PRODUCE_UNSAFE_TO_CONCAT;
+                // Original BOF/EOF and surrounding text are shaping context, not
+                // properties inferred from where this bounded child was requested.
                 if range.start == 0 {
                     flags |= harfrust::BufferFlags::BEGINNING_OF_TEXT;
                 }
@@ -97,6 +106,8 @@ fn stored_prefix_after_actual_job_drop_matches_direct_font_fields_and_requires_r
                 oracle.set_flags(flags);
                 oracle.set_pre_context(&text[..range.start]);
                 oracle.set_post_context(&text[range.end..]);
+                // This fixture is ASCII, so enumerated scalar offsets are its
+                // original UTF-16 cluster coordinates; no general UTF-8 shortcut is implied.
                 for (at, scalar) in text[range.clone()].chars().enumerate() {
                     oracle.push(u32::from(scalar), u32::try_from(range.start + at).unwrap());
                 }
@@ -110,6 +121,8 @@ fn stored_prefix_after_actual_job_drop_matches_direct_font_fields_and_requires_r
                 )
                 .unwrap();
                 assert_eq!(oracle.len(), actual.glyphs);
+                // Compare IDs, source clusters, safety flags and all positioning
+                // fields through the child API, not through resolver internals.
                 for at in 0..oracle.len() {
                     let expected = oracle.paged_glyph_record(at).unwrap();
                     let glyph = {
@@ -144,6 +157,8 @@ fn stored_prefix_after_actual_job_drop_matches_direct_font_fields_and_requires_r
                         .unwrap()
                         .is_none()
                 });
+                // Keeping the child live must block the next prefix and consume
+                // no new input. Actual close releases its shaping resource owner.
                 let pending = {
                     let mut provider = store.borrow(&proof).unwrap();
                     resolver
@@ -171,6 +186,8 @@ fn stored_prefix_after_actual_job_drop_matches_direct_font_fields_and_requires_r
         }
     }
     assert!(total >= 6);
+    // Finish with the actual resolver close receipt; dropping a permit alone
+    // would not establish that its child job and paged file were released.
     let closed = resolver.close().unwrap();
     assert_eq!(closed.active_jobs, 0);
     assert!(!closed.cleanup_failed);

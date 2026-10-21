@@ -1,8 +1,8 @@
-//! 生产Input直接消费真实Core组合组；这里只验事务和同步状态，不冒充Native键盘或候选窗验收。
+//! Production Input consumes real Core composition groups; this checks synchronous transactions, not Native keyboard/candidate-window acceptance.
 
 use super::*;
 
-/// 直接消费生产Input的原历史收据，不用新replacement模拟Undo/Redo。
+/// Consume production Input history receipts instead of simulating Undo/Redo with new replacements.
 fn history(
     owner: &Rc<NativeMarkdownPagedInput>,
     direction: NativeMarkdownPagedInputHistory,
@@ -12,7 +12,7 @@ fn history(
 }
 
 #[test]
-/// 合法显式UTF16子范围保留两侧旧候选，非法代理项切口不能断组或污染选择。
+/// A valid UTF-16 subrange retains candidate text on both sides; split surrogates must not break grouping or alter selection.
 fn explicit_non_bmp_subrange_updates_merge_the_whole_composition_history() {
     let (_file, document) = fixture("甲乙", 4096);
     document
@@ -86,7 +86,7 @@ fn explicit_non_bmp_subrange_updates_merge_the_whole_composition_history() {
 }
 
 #[test]
-/// 跨出当前marked即独立成项，逐次Undo/Redo必须恢复被替换的外部正文。
+/// Replacing beyond current marked text creates independent history; sequential Undo/Redo restores replaced external text.
 fn explicit_replacement_outside_or_across_marked_starts_an_independent_history() {
     for (replacement, expected) in [
         (NSRange::new(4, 1), "甲中🙂新丙"),
@@ -122,11 +122,11 @@ fn explicit_replacement_outside_or_across_marked_starts_an_independent_history()
         history(&owner, NativeMarkdownPagedInputHistory::Redo);
         history(&owner, NativeMarkdownPagedInputHistory::Redo);
         assert_eq!(text(&document), expected);
-    } // 当前marked以外的正文有自己的真实Undo，不能被前一组合的净日志吞并。
+    } // Text outside current marked input owns its Undo entry; the prior composition's net journal cannot absorb it.
 }
 
 #[test]
-/// unmark无假字符历史；后来的选择移动不能改写原组合的Redo目标或原选择方向。
+/// Unmark creates no character history; later selection movement cannot rewrite the original group's Redo target/direction.
 fn unmark_keeps_one_group_and_redo_restores_the_actual_final_selection_after_a_later_move() {
     let (_file, document) = fixture("甲🙂乙", 4096);
     let before = MarkdownTextSelection {
@@ -168,7 +168,7 @@ fn unmark_keeps_one_group_and_redo_restores_the_actual_final_selection_after_a_l
 }
 
 #[test]
-/// 组合不能吞掉相邻普通输入；三笔真实用户事务按原顺序独立恢复。
+/// Composition must not absorb adjacent typing; restore the three actual user transactions separately in order.
 fn ordinary_typing_before_and_after_the_composition_keeps_three_separate_undo_steps() {
     let (_file, document) = fixture("甲", 4096);
     let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
@@ -208,7 +208,7 @@ fn ordinary_typing_before_and_after_the_composition_keeps_three_separate_undo_st
 }
 
 #[test]
-/// 容量拒绝保留原marked和分组，后续成功更新及确认仍只撤销一次。
+/// Capacity rejection retains marked text/grouping, so later successful updates and confirmation still need one Undo.
 fn failed_marked_candidate_keeps_the_group_available_for_a_later_real_confirmation() {
     let (_file, document) = fixture("首", 16);
     let owner = NativeMarkdownPagedInput::new(Rc::downgrade(&document)).unwrap();
@@ -257,7 +257,7 @@ fn failed_marked_candidate_keeps_the_group_available_for_a_later_real_confirmati
 }
 
 #[test]
-/// 关闭只封本地输入；后继client的首个marked必须Start，不能借同Doc旧范围合并上个组合。
+/// Close seals local Input only; a successor client starts its own composition rather than merge through an old range in the same document.
 fn closing_input_keeps_the_document_but_a_new_client_starts_an_independent_composition() {
     let (_file, document) = fixture("甲乙", 4096);
     document
@@ -316,7 +316,7 @@ fn closing_input_keeps_the_document_but_a_new_client_starts_an_independent_compo
 
 #[cfg(feature = "native-source-reclaim-probe")]
 #[test]
-/// 已提交组合的旧文件最终回收失败由原Commit保留；不能取消已发布候选或把它说成未修改。
+/// The original commit preserves old-backing retirement failure after publication; it cannot cancel or deny the committed candidate.
 fn frozen_candidate_retirement_failure_is_reported_by_the_actual_committed_input_receipt() {
     let (_file, document) = fixture("首尾", 1024 * 1024);
     document
@@ -340,7 +340,7 @@ fn frozen_candidate_retirement_failure_is_reported_by_the_actual_committed_input
     let attempts = observer.reclaim_attempts();
     let injected = Cell::new(false);
     let current = |_| {
-        // 只在真实唯一候选已经准备后武装旧backing；标记本身不制造错误、不改变队列或正文。
+        // Arm original backing only after the actual unique candidate exists; arming alone changes neither queue/text nor the error result.
         if !injected.get() && document.borrow().has_prepared_text_input() {
             observer.fail_next_reclaim_for_test();
             injected.set(true);
@@ -366,13 +366,13 @@ fn frozen_candidate_retirement_failure_is_reported_by_the_actual_committed_input
         Err(NativeMarkdownPagedInputError::Document(
             MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
         ))
-    )); // View原finish_commit_ref会把此真实后果包成既有CommittedEffect，禁止重放。
+    )); // View's finish_commit_ref wraps this actual postcommit effect as CommittedEffect, forbidding replay.
     assert!(matches!(
         commit.check_current(&|_| false),
         Err(NativeMarkdownPagedInputError::Document(
             MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
         ))
-    )); // 同一已提交票的Source首因仍优先于前台撤销，不为断言补领新票。
+    )); // The same committed authority keeps Source error priority over foreground revocation, without acquiring new authority for the assertion.
     let mut units = [0_u16; 4];
     document
         .borrow()
@@ -381,7 +381,7 @@ fn frozen_candidate_retirement_failure_is_reported_by_the_actual_committed_input
         .unwrap();
     assert_eq!(String::from_utf16(&units).unwrap(), "确认🙂");
     let backings: Vec<_> = document.borrow().backing_observers().collect();
-    owner.close().unwrap(); // close不新增可失败Doc健康门；失败源也必须能够拆图和释放。
+    owner.close().unwrap(); // close adds no fallible document-health gate; a failed Source must still allow teardown/release.
     drop((commit, permit, owner, document));
     assert!(
         backings
@@ -393,7 +393,7 @@ fn frozen_candidate_retirement_failure_is_reported_by_the_actual_committed_input
 
 #[cfg(feature = "native-paged-frontier-probe")]
 #[test]
-/// 先完成真实Core词组查询和提交，再验证Word与中文组合各有自己的一笔Undo；不是异步IME用例。
+/// Complete a real Core word query/edit before checking separate word/composition Undo entries; this is not an asynchronous IME case.
 fn completed_real_word_delete_precedes_the_single_composition_undo_group() {
     use omni_markdown_core::{
         MarkdownLineComposeBudget, MarkdownLineComposeCancellation, MarkdownLineComposer,
@@ -432,7 +432,7 @@ fn completed_real_word_delete_precedes_the_single_composition_undo_group() {
     }
     assert_eq!(ready, Some(4..7));
     drop((composer, source));
-    assert!(resources.is_released()); // 真正归还原Word读取后，才允许Input提交原exact范围。
+    assert!(resources.is_released()); // Return actual word readers before Input commits the exact original range.
     let range = ready.unwrap();
     owner
         .insert_text(&permit, "", NSRange::new(range.start, range.len()), &|_| {

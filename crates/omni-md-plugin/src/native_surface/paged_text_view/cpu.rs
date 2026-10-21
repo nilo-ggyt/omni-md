@@ -1,4 +1,5 @@
-//! 同一Ready scene只画入有限RGBA8像素；原窗口上下文不承接字形显示列表。
+//! Paint the same Ready Scene into bounded RGBA8 pixels; the window context receives no retained glyph
+//! display list.
 
 use super::*;
 use crate::native_surface::viewport_pixels::{
@@ -21,20 +22,24 @@ pub(super) use layers::probe::run as probe_mask_slots;
 pub(super) use scheduler::probe::nested_delivery as probe_nested_delivery;
 use std::sync::Arc;
 
-/// 只拥有本新视图经AppKit创建的真实backing和固定像素收据，没有正文、scene或view强回指。
+/// Own this new View actual AppKit backing and pixel ledger, without a strong document, Scene, or View
+/// back-reference.
 pub(super) struct CpuSurface {
     layer: Retained<CALayer>,
     layers: layers::LayerPool,
     pixels: Arc<NativeMarkdownViewportPixels>,
     paints: Cell<usize>,
     painting: Cell<bool>,
-    // 同步 Native 重入只合并一次重绘请求；不把较新 Scene/Input 或像素留在旧绘图栈中。
+    // Synchronous Native reentry coalesces one repaint request without retaining newer Scene/Input or
+    // pixels on the old stack.
     repaint_requested: Cell<bool>,
     published: RefCell<Option<Rc<Published>>>,
     reuses: Cell<usize>,
     candidate: RefCell<Option<candidate::Candidate>>,
-    // 只跨本Surface帧保有限原生合成纯表；没有Scene、Input、provider或CALayer强边。
-    // Native校准前整槽移出，关闭重入与表的实际munmap均不穿过RefCell借用。
+    // Retain bounded pure composition tables across this surface frames only, without Scene, Input,
+    // provider, or CALayer ownership.
+    // Move the entire slot out before Native calibration so close reentry and actual table unmapping
+    // cross no RefCell borrow.
     calibrations: RefCell<calibration::Calibrations>,
     active_serial: Cell<Option<u64>>,
     next_serial: Cell<u64>,
@@ -43,7 +48,8 @@ pub(super) struct CpuSurface {
     steps: Cell<usize>,
 }
 
-/// 单个已显示帧的弱身份和有限Native证明；不保Scene、Input、文件或正文载荷。
+/// One displayed frame weak identity and finite Native publication facts, without Scene, Input, file,
+/// or document payload.
 struct Published {
     key: NativeMarkdownPagedSceneKey,
     geometry: Geometry,
@@ -59,7 +65,8 @@ struct Geometry {
     height: usize,
 }
 
-/// Native可重入，但同一surface只接受一个原始绘图栈；嵌套不能领取后继计数或覆盖候选。
+/// Admit one original paint stack per surface despite Native reentry; nested stacks cannot consume
+/// counters or overwrite candidates.
 struct PaintUse<'a>(&'a Cell<bool>);
 impl<'a> PaintUse<'a> {
     fn enter(slot: &'a Cell<bool>) -> Result<Self> {
@@ -72,11 +79,11 @@ impl<'a> PaintUse<'a> {
 }
 impl Drop for PaintUse<'_> {
     fn drop(&mut self) {
-        self.0.set(false); // 只归还本同步栈的准入，不排事件、不重采scene或重试较新状态。
+        self.0.set(false); // Return this synchronous stack admission only, without queueing events, recapturing Scenes, or retrying newer state.
     }
 }
 
-/// 失败出口也结束当前原事务；不因撤权继续发布contents。
+/// End the original transaction on failure too, without publishing further contents after revocation.
 struct Transaction;
 impl Drop for Transaction {
     fn drop(&mut self) {
@@ -84,7 +91,8 @@ impl Drop for Transaction {
     }
 }
 
-/// 唯一mount setter之后的失败不能假称未提交；只撤原attempt数据，并保持调用者原首错。
+/// Failure after the mount setter cannot claim no commit occurred; revoke only the original attempt and
+/// preserve the caller error.
 struct PublicationUse<'a> {
     surface: &'a CpuSurface,
     attempt: layers::Attempt,
@@ -111,7 +119,7 @@ impl Drop for PublicationUse<'_> {
                 .revoke_attempt(&self.attempt, &self.surface.layer)
         {
             let metadata = self.surface.published.borrow_mut().take();
-            drop(metadata); // 已失权原画面不能继续签Ready；不清其他serial的后继关系。
+            drop(metadata); // A revoked original picture cannot certify Ready; do not clear successor relationships from another serial.
         }
     }
 }
@@ -121,10 +129,11 @@ impl CpuSurface {
         let origin = view.origin()?;
         if origin.step(view, || view.wantsLayer())? || origin.step(view, || view.layer())?.is_some()
         {
-            return Err(NativeMarkdownPagedTextViewError::InvalidGeometry); // 新视图必须保持原nil关系，不能夺取外部层。
+            return Err(NativeMarkdownPagedTextViewError::InvalidGeometry); // The new View must retain its original nil relationship rather than take an external layer.
         }
-        // 先仅启用标准layer-backed路径，由AppKit建立和管理updateLayer的公开调度关系。
-        // 先setLayer再wantsLayer会成为layer-hosting，不能靠直接调用updateLayer伪造实际绘图。
+        // Enable the standard layer-backed path first so AppKit owns actual updateLayer scheduling.
+        // Setting a layer before wantsLayer creates layer-hosting; direct updateLayer calls cannot
+        // substitute for real scheduling.
         let mut installation = install::Installation::new(view);
         let layer = installation.enable(&origin)?;
         let layers = layers::LayerPool::new(&|| origin.current(view))?;
@@ -153,7 +162,7 @@ impl CpuSurface {
             )
         })?;
         owner.layer_current(view, &|| origin.current(view))?;
-        installation.commit(); // 之后到唯一cpu槽发布之间没有Native回调；成功owner接管全部清理责任。
+        installation.commit(); // No Native callback occurs before publication to the unique CPU slot; the successful owner takes all cleanup responsibility.
         Ok(owner)
     }
 
@@ -161,7 +170,7 @@ impl CpuSurface {
         self.pixels.observer()
     }
     pub(super) fn track_close(&self, receipt: &NativeMarkdownPagedCloseReceipt) {
-        receipt.track_pixels(&self.pixels); // 封闭原分配；异步provider仍归这份实际像素收据，不保surface。
+        receipt.track_pixels(&self.pixels); // Close original allocation admission; asynchronous providers remain covered by this actual pixel receipt without retaining the surface.
     }
     pub(super) fn layer_weaks(&self) -> Vec<objc2::rc::Weak<AnyObject>> {
         self.layers.weaks()
@@ -170,8 +179,10 @@ impl CpuSurface {
         self.paints.get()
     }
 
-    /// 悬停只认这份实际已提交的完整图，不把Ready或候选等同于已经显示。
-    /// 临时Rc在本栈归还；Native关系复核后再核同一发布身份，不保旧Scene或像素历史。
+    /// Hover uses the actual complete published frame, without equating Ready or a candidate with
+    /// displayed pixels.
+    /// Return temporary Rc claims on this stack and recheck publication identity after Native
+    /// validation, retaining no Scene or pixel history.
     pub(super) fn cursor_publication_current(
         &self,
         view: &NativeMarkdownPagedTextView,
@@ -197,7 +208,8 @@ impl CpuSurface {
         Ok(true)
     }
 
-    /// 正式Source验收只借实际已发布key和原paint计数；不克隆像素、层或候选帧。
+    /// The production Source probe borrows the actual published key and paint count without cloning
+    /// pixels, layers, or candidate frames.
     #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn published_frame(&self) -> Option<(NativeMarkdownPagedSceneKey, usize)> {
         self.published
@@ -231,37 +243,41 @@ impl CpuSurface {
         let matches = actual
             .as_deref()
             .is_some_and(|actual| std::ptr::eq::<CALayer>(actual, &*self.layer));
-        drop(actual); // Native临时claim的析构也在后置纯票核之前完成。
+        drop(actual); // Release the temporary Native claim before the final pure-authority check.
         if !matches || !current() {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
         Ok(())
     }
 
-    /// AppKit 显示回调获取的是此刻画面；获取期间旧输入或几何已换代时，只放弃该次请求。
-    /// 未接受关闭的客户捕获失败、真正资源错误以及 Ready 后的 CPU/图层检查仍原样处理。
+    /// AppKit display callbacks acquire the current picture; abandon only that request if original
+    /// Input or geometry changes during acquisition.
+    /// Preserve acquisition failure before accepted close, real resource errors, and CPU/layer checks
+    /// after Ready.
     pub(super) fn paint_current(self: &Rc<Self>, view: &NativeMarkdownPagedTextView) -> Result<()> {
         let result = (|| {
             let Some(origin) = view.display_origin()? else {
-                // 原Body已接受关闭、先撤活动票而View尚在Native拆图；不领取新Scene或发布像素。
-                // 这里只结束Origin获取，后继资源与Native失败仍走下方原严格边界。
+                // The Body accepted close and revoked active authority while Native still detaches the
+                // View; acquire no new Scene or pixels.
+                // End Origin acquisition only; later resource and Native failures retain their existing
+                // strict boundary.
                 return Ok(());
             };
             let ticket = candidate::Ticket::new(&origin);
             let scene = match view.scene_for_origin(origin) {
                 Ok(scene) => scene,
                 Err(NativeMarkdownPagedTextViewError::Pending) => {
-                    return Ok(()); // 唯一布局任务已排队；不发布像素，也不把旧图冒充新 Ready。
+                    return Ok(()); // The unique layout task is queued; publish no pixels and do not present an old image as newly Ready.
                 }
                 Err(NativeMarkdownPagedTextViewError::Revoked) if ticket.superseded(view)? => {
-                    return Ok(()); // 只认原客户、完整 Input 或几何的真实换代，不凭 !scene_current 放行。
+                    return Ok(()); // Require actual original-client, complete-Input, or geometry supersession rather than trusting !scene_current.
                 }
                 Err(cause) => return Err(cause),
             };
-            self.paint(view, &scene) // Ready 后不再借获取期票据吞掉 Source、字体或 Native 所有权错误。
+            self.paint(view, &scene) // After Ready, acquisition tickets cannot swallow Source, font, or Native ownership errors.
         })();
         if result.is_err() {
-            self.clear_calibrations(); // 获取、重入健康检查或显示真实失败均归还优化页，原typed首错不变。
+            self.clear_calibrations(); // Return optimization pages after real acquisition, reentry-health, or display failure while preserving the typed primary error.
         }
         result
     }
@@ -270,8 +286,10 @@ impl CpuSurface {
         let painting = match PaintUse::enter(&self.painting) {
             Ok(painting) => painting,
             Err(NativeMarkdownPagedTextViewError::Pending) => {
-                // updateLayer 可在 CoreText/AppKit 的同步回调里重入。这里只拒绝第二个写入者，
-                // 原候选仍由外层独占；健康的显示请求不应成为永久输入失败。
+                // updateLayer may reenter during synchronous Core Text/AppKit callbacks. Reject a
+                // second writer only;
+                // the outer stack retains exclusive candidate ownership, and a healthy display request
+                // must not become permanent input failure.
                 let current = || scene.current(view);
                 if !Self::scene_ready_for_display(view, scene)? {
                     return Ok(());
@@ -281,7 +299,7 @@ impl CpuSurface {
                 }
                 if !Self::scene_ready_for_display(view, scene)? {
                     return Ok(());
-                } // 真实 Source、字体和 Native 所有权错误仍原样失败，不能被合并请求掩盖。
+                } // Actual Source, font, and Native ownership failures remain errors and cannot hide behind a coalesced request.
                 self.repaint_requested.set(true);
                 return Ok(());
             }
@@ -289,11 +307,11 @@ impl CpuSurface {
         };
         let result = self.paint_inner(view, scene);
         drop(painting);
-        let wake = self.wake_deferred(view); // 若真实嵌套主队列让出了延续，只在原绘图栈退出后重排同serial。
+        let wake = self.wake_deferred(view); // If nested main-queue delivery deferred this continuation, reschedule the same serial only after its original paint stack exits.
         match result {
             Err(error) => Err(error),
             Ok(()) => wake,
-        } // 原绘图/Source首错不能被后继调度拒绝替换。
+        } // A later scheduling rejection cannot replace the original paint/Source error.
     }
     fn paint_inner(
         self: &Rc<Self>,
@@ -302,7 +320,7 @@ impl CpuSurface {
     ) -> Result<()> {
         let current = || scene.current(view);
         if !Self::scene_ready_for_display(view, scene)? {
-            return Ok(()); // 原Source/Font/输出健康先于退休判定；相同nonce不能掩盖EIO。
+            return Ok(()); // Original Source/font/output health precedes retirement classification; an equal nonce cannot hide EIO.
         }
         let geometry = match self.geometry(view, scene) {
             Ok(geometry) => geometry,
@@ -311,7 +329,7 @@ impl CpuSurface {
         if !Self::scene_ready_for_display(view, scene)? {
             return Ok(());
         }
-        let prior = self.published.borrow().clone(); // Rc只借固定metadata，结束槽借用后才进入Native/current。
+        let prior = self.published.borrow().clone(); // Borrow finite metadata through Rc and end the slot borrow before Native/current calls.
         if let Some(prior) = prior
             && prior.key.same(&scene.key)
             && prior.geometry == geometry
@@ -345,8 +363,10 @@ impl CpuSurface {
                 return Err(NativeMarkdownPagedTextViewError::Revoked);
             }
             if !current() {
-                // 实际 Native 几何和图组已经通过；这里只分类最后一次原票检查的撤权。
-                // 相同票的 Scene 异常仍失败，不能借另一次 current 返回覆盖已观察的拒绝。
+                // Actual Native geometry and layers already passed; classify only the final
+                // original-ticket revocation here.
+                // Same-ticket Scene failure remains an error; another current result cannot erase the
+                // observed rejection.
                 if !Self::scene_ready_for_display(view, scene)? {
                     return Ok(());
                 }
@@ -357,12 +377,12 @@ impl CpuSurface {
                 .get()
                 .checked_add(1)
                 .ok_or(NativeMarkdownPagedTextViewError::CounterExhausted)?;
-            self.cancel_candidate(); // 即使producer返回旧已显示nonce，也先消费任何不相干的未发布候选。
+            self.cancel_candidate(); // Even for an already displayed nonce, consume any unrelated unpublished candidate first.
             if !Self::scene_ready_for_display(view, scene)? {
                 return Ok(());
             }
             self.reuses.set(count);
-            return Ok(()); // 已发布的同一完整帧仍健康，不再分配第三帧，也不重复向CTFont提交glyph。
+            return Ok(()); // Reuse the same healthy complete frame without allocating a third frame or resubmitting glyphs to CTFont.
         }
         let existing = self
             .candidate
@@ -370,7 +390,7 @@ impl CpuSurface {
             .as_ref()
             .map(|candidate| candidate.key.same(&scene.key) && candidate.geometry == geometry);
         if existing == Some(true) {
-            return Ok(()); // 原候选已有唯一coalesced回调，重复updateLayer不能从首tile重新分配。
+            return Ok(()); // The candidate already has one coalesced callback; duplicate updateLayer must not allocate again from its first tile.
         }
         self.cancel_candidate();
         let serial = self
@@ -396,9 +416,12 @@ impl CpuSurface {
         }
     }
 
-    /// 只有这一项原 Scene 健康校验失败、且没有待处理的 Native 错误，才可能正常退休。
-    /// Source/Font/目录的真实错误由 validate_ready 原样交付；原客户或完整输入/几何
-    /// 确实换代才放弃旧显示，不以 scene_current 的普通 false 或空候选 serial 作证明。
+    /// Normal retirement is possible only after this original Scene health check fails with no pending
+    /// Native error.
+    /// validate_ready preserves actual Source/font/directory errors; abandon old display only after the
+    /// original client or complete Input/geometry
+    /// actually changes, without treating a plain false scene_current or empty candidate serial as
+    /// proof.
     fn scene_ready_for_display(
         view: &NativeMarkdownPagedTextView,
         scene: &SceneUse,
@@ -411,8 +434,10 @@ impl CpuSurface {
         }
     }
 
-    /// 几何或实际图层检查自身已经失败，后置普通撤权不得把该 Native 错误吞成退休。
-    /// 仍沿同一 Scene 再核 Source/Font 首错；只有明确资源错误可以优先于原 Native 失败。
+    /// After geometry or layer validation fails, later ordinary revocation cannot turn that Native
+    /// failure into retirement.
+    /// Recheck Source/font on the same Scene; only a specific resource failure can precede the original
+    /// Native error.
     fn native_failure(
         view: &NativeMarkdownPagedTextView,
         scene: &SceneUse,
@@ -424,33 +449,36 @@ impl CpuSurface {
         }
     }
 
-    /// 任何新原票或关闭只取消本surface候选；排队闭包仅含Weak，不保这些资源。
+    /// New original authority or close cancels this surface candidate only; weak queued closures retain
+    /// none of its resources.
     pub(super) fn cancel_candidate(&self) {
         let active = self.active_serial.replace(None).is_some();
         self.scheduled.set(None);
         self.deferred.set(None);
         let candidate = self.candidate.borrow_mut().take();
-        drop(candidate); // 借用先归还，再真实drop会话/context和已封存的有限tiles。
+        drop(candidate); // End the slot borrow before actually dropping sessions, contexts, and bounded sealed tiles.
         if active {
-            self.clear_calibrations(); // 真取消未完帧立即归还表；没有候选的普通Scene退休保有限纯事实。
+            self.clear_calibrations(); // Actual unfinished-frame cancellation returns tables immediately; ordinary Scene retirement without a candidate may retain bounded pure facts.
         }
     }
 
-    /// 实际归还全部纯表；返回是否确有优化状态可淘汰，不把预算拒绝变成通用重试。
+    /// Return all actual pure tables and report whether optional page state was evicted, without a
+    /// generic budget retry policy.
     fn clear_calibrations(&self) -> bool {
         let calibrations = std::mem::take(&mut *self.calibrations.borrow_mut());
         let occupied = calibrations.has_pages();
-        drop(calibrations); // 最后Arc的munmap在槽借用结束后执行，失败仍留在原像素释放收据。
+        drop(calibrations); // Final-Arc unmapping occurs after the slot borrow ends; failures remain in the original pixel-release receipt.
         occupied
     }
 
-    /// 单格准入后归还真实绘图读取；同步paint仍在栈上时拒绝，不以取消标志冒充其析构。
+    /// Release actual paint readers for cell admission, rejecting a live synchronous paint stack
+    /// instead of mistaking cancellation for destruction.
     pub(super) fn release_source_readers(&self) -> Result<()> {
         if self.painting.get() {
             return Err(NativeMarkdownPagedTextViewError::Busy);
         }
         self.cancel_candidate();
-        Ok(()) // Published只持弱key和像素，可保留原帧，不保活草稿Source。
+        Ok(()) // Published retains weak key facts and pixels only, so keeping the old frame does not retain draft Source.
     }
     pub(super) fn cancel_if_not_key(&self, key: &NativeMarkdownPagedSceneKey) {
         let obsolete = self
@@ -469,9 +497,12 @@ impl CpuSurface {
         self.steps.get()
     }
 
-    /// 只短借当前活帧的不可变图片；不借旧 Scene、输入权限或瓦片位置。
-    /// 行号变宽或缩窗会改变完整几何，但仍可逐字节证明部分同尺寸图片未变；
-    /// 旧图的实际挂载关系继续完整核验，新位置和 Ready 仍只由当前候选发布。
+    /// Briefly borrow immutable images from the current live frame without old Scene, input authority,
+    /// or tile positions.
+    /// Wider line numbers or resized windows change full geometry while equal-size image regions may
+    /// remain byte-identical;
+    /// fully validate old mounting relationships and publish new positions and Ready through the
+    /// current candidate only.
     fn reusable_frame(
         &self,
         view: &NativeMarkdownPagedTextView,
@@ -479,7 +510,7 @@ impl CpuSurface {
         current: &impl Fn() -> bool,
     ) -> Result<Option<Rc<TileFrame>>> {
         let Some(frame) = expected.upgrade() else {
-            return Ok(None); // 旧帧已经按原生命周期归还，不能升级历史缓存或重建旧图像。
+            return Ok(None); // The old frame already released through its original lifecycle; do not recover historical caches or reconstruct old images.
         };
         let published = self.published.borrow().clone();
         let Some(published) = published else {
@@ -491,7 +522,7 @@ impl CpuSurface {
             .as_ref()
             .is_some_and(|actual| Rc::ptr_eq(actual, &frame));
         if !same_frame {
-            return Ok(None); // 只能借本次预期的当前活帧，不能恢复历史图片或另一发布的像素。
+            return Ok(None); // Borrow only the expected current live frame, never historical images or another publication pixels.
         }
         self.layer_current(view, current)?;
         self.layers
@@ -508,7 +539,7 @@ impl CpuSurface {
                 .is_some_and(|actual| Rc::ptr_eq(actual, &frame));
         if !same || !current() {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
-        } // Native/current重入后只能消费同一个原活帧，不给另一个publication补签。
+        } // After Native/current reentry, consume only the same original live frame without certifying another publication.
         Ok(Some(frame))
     }
 
@@ -521,15 +552,17 @@ impl CpuSurface {
         let ticket = candidate.ticket.clone();
         let key = candidate.key.clone();
         let scene = Rc::clone(&candidate.scene);
-        // Candidate会移入Pending/Complete或在错误时真正析构；本同步栈仅保原弱票与同一Scene，
-        // 不另持Input/Doc，也不把较新Scene补签给旧绘图。错误分类必须发生在serial清理之前。
+        // Candidate moves into Pending/Complete or actually drops on failure; this synchronous stack
+        // keeps only the original weak ticket and same Scene,
+        // without extra Input/document ownership or a newer Scene certifying old paint. Classify
+        // failure before clearing the serial.
         let result = (|| {
             let step = self
                 .steps
                 .get()
                 .checked_add(1)
                 .ok_or(NativeMarkdownPagedTextViewError::CounterExhausted)?;
-            self.steps.set(step); // 溢出也经过下方同一终态cleanup，不能剩active但已无candidate。
+            self.steps.set(step); // Overflow follows the same terminal cleanup, preventing active state without a candidate.
             match candidate.advance(self, view)? {
                 candidate::Advance::Pending(candidate) => {
                     if self.active_serial.get() != Some(serial) {
@@ -538,7 +571,7 @@ impl CpuSurface {
                     let replaced = self.candidate.replace(Some(candidate));
                     drop(replaced);
                     self.schedule(view, serial)?;
-                    Ok(()) // 尚未完整frame保持旧像素；不把Pending计为真实publish。
+                    Ok(()) // Keep old pixels until the full frame completes; Pending is not an actual publication.
                 }
                 candidate::Advance::Complete(completed) => {
                     completed.validate(self, view)?;
@@ -559,7 +592,7 @@ impl CpuSurface {
                     } else {
                         Ok(None)
                     };
-                    completed.validate(self, view)?; // 原 Source/Font 首错仍优先于 Native 图验证失败。
+                    completed.validate(self, view)?; // Original Source/font failure still precedes Native graph validation failure.
                     let reused = reused?;
                     if reused.is_some()
                         && !self.published.borrow().as_ref().is_some_and(|actual| {
@@ -569,16 +602,16 @@ impl CpuSurface {
                         })
                     {
                         return Err(NativeMarkdownPagedTextViewError::Revoked);
-                    } // Native getter 后仍须是同一个当前发布，不能拿旧图收据给后继 owner 补签。
+                    } // After Native getters, require the same current publication; old graph receipts cannot certify a successor owner.
                     let mut publication_use = if reused.is_none() {
                         Some(PublicationUse::new(self)?)
                     } else {
-                        None // 复用没有 Native setter 效果，失败不撤掉仍属旧帧的原图。
+                        None // Reuse performs no Native setter, so failure must not revoke the graph still owned by the previous frame.
                     };
                     let retired = prior
                         .as_ref()
                         .and_then(|published| published.frame.borrow_mut().take());
-                    drop(retired); // 原slot仍保旧可见图片；仅先归还frame cache，旧metadata/Ready到原提交点才换。
+                    drop(retired); // Original slots retain visible images; return the frame cache first and replace old metadata/Ready at the actual commit point only.
                     let publication = match reused {
                         Some(publication) => Ok(publication),
                         None => (|| {
@@ -586,8 +619,10 @@ impl CpuSurface {
                                 .as_mut()
                                 .expect("新图发布持有原补偿票")
                                 .attempt;
-                            // 部分变化同样是真实Native提交，必须先有原PublicationUse补偿票。
-                            // 旧帧像素槽已归还；只借当前发布的身份元数据，不持历史Scene或provider。
+                            // Partial changes also commit Native effects and require the original
+                            // PublicationUse compensation ticket first.
+                            // The old frame pixel slot was returned; borrow current publication
+                            // identity only, without historical Scene/provider claims.
                             if let Some(prior) = &prior
                                 && prior.geometry == completed.geometry
                                 && let Some(publication) = self.layers.publish_partial(
@@ -610,8 +645,8 @@ impl CpuSurface {
                             )
                         })(),
                     };
-                    drop(prior); // 真实Native结果先暂存；Source/Font首错仍由下方同一次validate裁决。
-                    completed.validate(self, view)?; // Source首错先于Native撤权；不可给较新scene补签。
+                    drop(prior); // Keep the actual Native result local until the same following validation decides Source/font priority.
+                    completed.validate(self, view)?; // Source failure precedes Native revocation, without certifying a newer Scene.
                     let publication = publication?;
                     self.layer_current(view, &current)?;
                     completed.validate(self, view)?;
@@ -632,11 +667,14 @@ impl CpuSurface {
                     self.active_serial.set(None);
                     if let Some(publication_use) = &mut publication_use {
                         publication_use.commit();
-                    } // 已核完所有Source/几何事实；此后只交付提交观察，不再产生可回滚失败。
-                    // 两条路径都只在原 Candidate 完成整帧真实绘制后提交新 key，并沿原尾部
-                    // 增长一次 paint、通知一次。图层复用本身不冒充额外绘制或补发旧 Scene。
-                    completed.scene.cpu_frame_published(count); // 只通知真实整帧提交事实；此后不新增可回滚Result或重领新scene。
-                    // 原绘图栈仍持Scene；只投原弱票，归还全部Reader后才让AppKit重建光标区。
+                    } // All Source/geometry checks passed; subsequent commit observation introduces no rollback-capable failure.
+                    // Both paths publish a new key only after the original Candidate actually finishes
+                    // the full frame,
+                    // incrementing paint and notifying once at the existing tail; layer reuse claims no
+                    // extra paint or old Scene replay.
+                    completed.scene.cpu_frame_published(count); // Notify actual full-frame commit only; add no later rollback Result or new Scene acquisition.
+                    // The paint stack still holds Scene; queue original weak facts so AppKit rebuilds
+                    // cursor regions after all readers return.
                     view.queue_link_cursor_refresh(&completed.key);
                     Ok(())
                 }
@@ -650,17 +688,17 @@ impl CpuSurface {
                 match scene.validate_ready(&current) {
                     Ok(()) | Err(NativeMarkdownPagedTextViewError::Revoked) => {}
                     Err(cause) => return Err(cause),
-                } // 沿原validate_ready保Source首错和实际字体/资源错误；不越过current给旧字体补权。
+                } // Preserve Source/font/resource errors through original validate_ready without bypassing current to renew old font authority.
                 if ticket.superseded(view)? {
-                    Ok(()) // 已接纳的新客户/输入/几何只退休旧候选，不能污染新客户的永久输入失败槽。
+                    Ok(()) // Accepted new client/Input/geometry retires the old candidate without poisoning the new client permanent input-failure slot.
                 } else {
                     Err(NativeMarkdownPagedTextViewError::Revoked)
-                } // 同原完整票的图层/Scene错误仍严格失败；不泛吞scene_current的bool拒绝。
+                } // Layer/Scene failures under the same complete ticket remain errors; do not swallow every false scene_current.
             })(),
             other => other,
         };
         if failed && self.active_serial.get() == Some(serial) {
-            self.cancel_candidate(); // 首错终态，不能下一轮从同失败session继续或重放。
+            self.cancel_candidate(); // Failure is terminal; the next turn cannot resume or replay the failed session.
         }
         result
     }
@@ -668,6 +706,8 @@ impl CpuSurface {
     fn geometry(&self, view: &NativeMarkdownPagedTextView, scene: &SceneUse) -> Result<Geometry> {
         self.geometry_for(view, &scene.key, &|| scene.current(view))
     }
+    // Match the current View, backing, Scene width and viewport before deriving actual device
+    // allocation dimensions.
     fn geometry_for(
         &self,
         view: &NativeMarkdownPagedTextView,
@@ -703,9 +743,9 @@ impl CpuSurface {
     }
 
     pub(super) fn detach(&self, view: &NativeMarkdownPagedTextView) -> Result<()> {
-        self.repaint_requested.set(false); // 关闭不复活较早的显示请求；标量本身没有异步业务强边。
-        self.cancel_candidate(); // 先归还所有Pending session/context，不让真实业务数据躲在主队列任务里。
-        self.clear_calibrations(); // idle也可能持纯表；原Surface关闭不能靠稍后Rust owner析构归还。
+        self.repaint_requested.set(false); // Close cannot revive old display requests; this scalar retains no asynchronous business owner.
+        self.cancel_candidate(); // Return every Pending session/context first so actual business data cannot hide in queued tasks.
+        self.clear_calibrations(); // An idle surface may retain pure tables; close returns them now rather than waiting for later Rust owner destruction.
         let published = self.published.borrow_mut().take();
         drop(published);
         let actual = view.layer();
@@ -716,7 +756,7 @@ impl CpuSurface {
         CATransaction::begin();
         let transaction = Transaction;
         CATransaction::setDisableActions(true);
-        let intact = self.layers.detach(&self.layer); // backing已被替换也必须先清自身图片；外方parent保持原样。
+        let intact = self.layers.detach(&self.layer); // Clear owned images even if backing changed, preserving the external parent relationship.
         let delegate = self.layer.delegate();
         let our_delegate = delegate.as_deref().is_some_and(|delegate| {
             std::ptr::from_ref(delegate).cast::<()>() == std::ptr::from_ref(view).cast::<()>()
@@ -724,7 +764,7 @@ impl CpuSurface {
         drop(delegate);
         if our_delegate {
             self.layer.setDelegate(None);
-        } // 只断原AppKit→本view的关系，不清后来外方delegate。
+        } // Detach only the original AppKit-to-View delegate relationship, leaving a later external delegate intact.
         let actual = view.layer();
         let still_owned = actual
             .as_deref()
@@ -739,7 +779,7 @@ impl CpuSurface {
             drop(actual);
             if may_clear {
                 view.setLayer(None);
-            } // 原setter可能已清nil；后继backing出现时不能再清它。
+            } // The setter may already have cleared the layer; a successor backing must remain untouched.
         }
         drop(transaction);
         let actual = view.layer();
@@ -747,12 +787,14 @@ impl CpuSurface {
         drop(actual);
         let final_wants_layer = view.wantsLayer();
         if !owned || !intact || final_layer || final_wants_layer {
-            return Err(NativeMarkdownPagedTextViewError::Revoked); // 仍完成原业务清理；不把外方活Weak谎称nil。
+            return Err(NativeMarkdownPagedTextViewError::Revoked); // Complete owned business cleanup without claiming an external live weak object is nil.
         }
         Ok(())
     }
 }
 
+// Retain original caller authority across each reentrant Native operation; local results drop on
+// rejection.
 fn checked<T>(current: &impl Fn() -> bool, call: impl FnOnce() -> T) -> Result<T> {
     if !current() {
         return Err(NativeMarkdownPagedTextViewError::Revoked);
@@ -765,8 +807,10 @@ fn checked<T>(current: &impl Fn() -> bool, call: impl FnOnce() -> T) -> Result<T
 }
 fn dimension(points: f64, scale: f64) -> Result<usize> {
     let pixels = points * scale;
-    // ruler等真实Native布局可产生分数point；覆盖它需要向外取完整设备像素，不能拒绝或缩放正文。
-    // 分配仍按原TiledBitmap的实际ceil尺寸收费；usize上界用严格小于，避免f64将MAX舍入成2^64。
+    // Actual Native ruler layout may produce fractional points; round outward to cover device pixels
+    // without rejecting or scaling text.
+    // TiledBitmap accounts actual ceiling dimensions; use a strict usize bound because f64 may round
+    // MAX to 2^64.
     if !points.is_finite()
         || points <= 0.0
         || !scale.is_finite()
@@ -798,7 +842,8 @@ fn tile_transform(bounds: NSRect, scale: f64, tile: PixelTile) -> Result<CGAffin
     if !tx.is_finite() || !ty.is_finite() {
         return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
     }
-    // 本视图坐标是Y-up；tile.y为provider顶行，真实bottom把同一source点映射回对应子context。
+    // View coordinates are Y-up and tile.y is the provider top row; actual bottom maps the same Source
+    // point into its tile context.
     Ok(CGAffineTransform {
         a: scale,
         b: 0.0,
@@ -849,7 +894,8 @@ mod tests {
             dimension(f64::MAX, 2.0),
             Err(NativeMarkdownPagedTextViewError::InvalidGeometry)
         ));
-        // 原分数point不能被判无效，也不能通过饱和转换掩盖真正无法分配的设备尺寸。
+        // Accept original fractional points without saturating away actually unallocatable device
+        // dimensions.
         assert_eq!(dimension(613.69140625, 2.0).unwrap(), 1228);
         for (points, scale) in [(usize::MAX as f64, 1.0), (-1.0, -1.0), (1.0, 0.0)] {
             assert!(matches!(
@@ -857,7 +903,8 @@ mod tests {
                 Err(NativeMarkdownPagedTextViewError::InvalidGeometry)
             ));
         }
-        // 同一正常source在部分尾tile中保留确切Y-up设备原点，不借截断或反向图来通过。
+        // Preserve the same Source exact Y-up device origin in a partial tail tile, without truncation
+        // or reversed images.
         let valid = NSRect::new(NSPoint::new(12.0, 7.0), NSSize::new(640.0, 320.0));
         let transform = tile_transform(
             valid,
@@ -875,7 +922,8 @@ mod tests {
             (transform.a, transform.d, transform.tx, transform.ty),
             (2.0, 2.0, -536.0, -14.0)
         );
-        // 真实9→10行号后的最后设备列仍取原2倍像素比例；不得把1228列压成1227.3828125列。
+        // After actual line-number growth from 9 to 10, preserve 2x device scale instead of compressing
+        // 1228 columns into 1227.3828125.
         let fractional = NSRect::new(NSPoint::ZERO, NSSize::new(613.69140625, 240.0));
         let tail = tile_transform(
             fractional,

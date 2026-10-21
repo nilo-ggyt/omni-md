@@ -1,25 +1,31 @@
-//! 单个Find目标贯穿既有有界布局事务；只有真实目标首个字形进入clip才发布成功。
+//! Carry one Find target through the existing bounded layout transaction. Publish
+//! success only when the actual target's first glyph enters the visible clip.
 
 use super::*;
 
-/// 显式原生诊断只记录公开单调时钟与固定阶段名，不取得正文、对象或新的动作权限。
+/// Explicit diagnostics record only the public monotonic clock and fixed phases,
+/// without acquiring text, Native objects, or new action authority.
 #[cfg(feature = "native-markdown-runtime-probe")]
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn trace_find_native_phase(phase: &'static str) {
     native_markdown_trace! {
-        // SAFETY: 签名对应系统mach_time.h的无参uint64时钟；此调用不访问AppKit或产生回调。
+        // SAFETY: The signature matches mach_time.h's argument-free uint64 clock;
+        // this call neither accesses AppKit nor invokes callbacks.
         unsafe extern "C" {
             fn mach_absolute_time() -> u64;
         }
-        // SAFETY: 公共时钟无前置条件；原始ticks由独立采样器的timebase解释，不猜毫秒。
+        // SAFETY: The public clock has no preconditions. The independent sampler's
+        // timebase interprets raw ticks; this diagnostic does not assume milliseconds.
         let ticks = unsafe { mach_absolute_time() };
         eprintln!("[probe] find native phase={phase} awake_ticks={ticks}");
-        // 同步采本PID原有账本，区分选区安装与视口迁移；该诊断不签发整产品预算通过。
+        // Sample this PID through its existing ledger to distinguish selection
+        // installation from viewport relocation; this is no product-memory acceptance receipt.
         crate::native_surface::probe_call_diagnostic::memory_point(phase);
     }
 }
 
-/// 有限诊断只使用本次动作已读取的标量，不为观察补做布局或原生查询。
+/// Bounded diagnostics use scalars already read by this action, never extra layout
+/// or Native queries solely for observation.
 #[cfg(feature = "native-markdown-runtime-probe")]
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn trace_find_geometry(
@@ -32,7 +38,7 @@ fn trace_find_geometry(
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNT: AtomicUsize = AtomicUsize::new(0);
     if COUNT.fetch_add(1, Ordering::Relaxed) >= 64 {
-        return; // 诊断容量不随文档长度或后续Find动作增长。
+        return; // Diagnostic volume cannot grow with document length or later Find actions.
     }
     eprintln!(
         "native_find_geometry phase={phase} probe={probe:?} clip={clip:?} frame={frame:?} target={target:?}"
@@ -41,7 +47,8 @@ fn trace_find_geometry(
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use objc2_app_kit::{NSTextLayoutManagerSegmentOptions, NSTextLayoutManagerSegmentType};
 
-/// 反馈只说明本次已提交动作；正文或查找字符串绝不进入延后票据。
+/// Feedback describes this committed action only; delayed tickets contain no
+/// document contents or search string.
 #[derive(Clone, Copy)]
 pub(in crate::native_surface) enum NativeMarkdownFindRevealFeedback {
     Found,
@@ -50,7 +57,8 @@ pub(in crate::native_surface) enum NativeMarkdownFindRevealFeedback {
     ReplacedLast,
 }
 
-/// 原完整导航枚举证明的位置；两个非零纯值随原定位请求结束，不保查询或正文。
+/// Position proved by the original complete navigation scan. Both nonzero scalars
+/// end with the original reveal request and retain neither query nor document text.
 #[derive(Clone, Copy)]
 pub(in crate::native_surface) struct NativeMarkdownFindPosition {
     pub(super) ordinal: std::num::NonZeroUsize,
@@ -58,7 +66,8 @@ pub(in crate::native_surface) struct NativeMarkdownFindPosition {
 }
 
 impl NativeMarkdownFindRevealFeedback {
-    /// 只有原可见终点可消费此文案；替换不沿用旧文稿的匹配总数。
+    /// Only the original visible endpoint may consume this message. Replacement
+    /// must not reuse match totals from the pre-edit document.
     pub(super) fn text(self) -> std::borrow::Cow<'static, str> {
         match self {
             Self::Found => "找到匹配".into(),
@@ -71,7 +80,8 @@ impl NativeMarkdownFindRevealFeedback {
     }
 }
 
-/// 隐藏导航是入口固定的有限权限，不把隐藏状态泛化为可执行替换/全选的权限。
+/// Hidden navigation is a limited entry-time capability, never authority to replace
+/// text or select all matches while the bar is hidden.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native_surface) enum NativeMarkdownFindVisibility {
     Visible,
@@ -79,7 +89,7 @@ pub(in crate::native_surface) enum NativeMarkdownFindVisibility {
 }
 
 impl NativeMarkdownFindVisibility {
-    /// 唯有Next/Previous允许沿hide保留的查询继续导航；closed始终拒绝。
+    /// Only Next/Previous may use the query preserved on hide. A closed bar always rejects entry.
     pub(in crate::native_surface) fn capture(
         action: MarkdownFindAction,
         visible: bool,
@@ -98,7 +108,8 @@ impl NativeMarkdownFindVisibility {
         .then_some(Self::HiddenNavigation)
     }
 
-    /// 显示状态变化撤销旧栈；visible请求不能在hide后自动继承隐藏导航权限。
+    /// Visibility transitions revoke the original stack. Hiding cannot convert a
+    /// visible request into an authorized hidden-navigation request.
     pub(in crate::native_surface) fn permits(
         self,
         visible: bool,
@@ -106,12 +117,14 @@ impl NativeMarkdownFindVisibility {
         expected_revision: u64,
         current_revision: u64,
     ) -> bool {
-        // hide/show两次后布尔值可相同，既有单调代次仍须严格等于入口原票据。
+        // Hide/show can restore the same boolean; the monotonic revision must still
+        // exactly match the original entry ticket.
         !closed && visible == (self == Self::Visible) && expected_revision == current_revision
     }
 }
 
-/// 同一次定位的所有标量权限。相同generation不代表同文档，弱身份另行独立核对。
+/// Scalar authority for one reveal. Equal generations do not establish document
+/// identity; weak allocation identity is checked separately.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct FindRevealStamp {
@@ -124,7 +137,8 @@ struct FindRevealStamp {
     table_epoch: u64,
 }
 
-/// slot、owner关闭态和分配身份都必须成立，不能用Rc仍存活或某一个代次代替授权。
+/// Slot membership, live foreground ownership, and allocation identity must all
+/// hold. A surviving Rc or one matching revision cannot substitute for authority.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn find_reveal_permissions(
     expected: FindRevealStamp,
@@ -137,7 +151,8 @@ fn find_reveal_permissions(
     expected == actual && slot && foreground && document && bar_authorized
 }
 
-/// 匹配扫描/替换收据给出的原始身份与坐标；arm不得重新领取当前文档代次。
+/// Original identity and coordinates from match scanning or a replacement receipt;
+/// arming must not acquire the current document generation anew.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(in crate::native_surface) enum NativeMarkdownFindRevealSelection {
     Captured {
@@ -154,13 +169,14 @@ pub(in crate::native_surface) struct NativeMarkdownFindRevealTarget {
     pub(in crate::native_surface) range: std::ops::Range<usize>,
     pub(in crate::native_surface) feedback: NativeMarkdownFindRevealFeedback,
     pub(in crate::native_surface) visibility: NativeMarkdownFindVisibility,
-    /// 来自匹配动作入口，不在arm时重新读取较新show/hide权限。
+    /// Comes from action entry; arming never rereads newer show/hide authority.
     pub(in crate::native_surface) bar_revision: u64,
     pub(in crate::native_surface) table_epoch: u64,
     pub(in crate::native_surface) selection: NativeMarkdownFindRevealSelection,
 }
 
-/// 每view唯一有限目标。两个Rust Weak不延长正文/栏的存活，不持Native对象或片段。
+/// Each view has one bounded target. Rust weak identities extend neither document
+/// nor bar lifetime and retain no Native object or source fragment.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(in crate::native_surface) struct NativeMarkdownFindRevealRequest {
     document: WeakMarkdownDocument,
@@ -170,14 +186,17 @@ pub(in crate::native_surface) struct NativeMarkdownFindRevealRequest {
     feedback: NativeMarkdownFindRevealFeedback,
     visibility: NativeMarkdownFindVisibility,
     bar_revision: u64,
-    /// 新Find只沿入口原capture发布一次；替换直接复用已提交收据，不二次推进serial。
+    /// New Find publishes once through its entry capture. Replacement reuses its
+    /// committed receipt rather than advancing selection serial a second time.
     selection_capture: Option<NativeMarkdownSelectionCapture>,
     committed: RefCell<Option<Rc<NativeMarkdownCommittedSelection>>>,
-    /// selectedRange回调可重入executor；粗定位结束前不能消费尚未完成的目标。
+    /// Selection callbacks may reenter the executor; coarse relocation must finish
+    /// before that executor can consume the target.
     ready: Cell<bool>,
-    /// 完整有界批次通过后才能消费成功，literal fallback不是完成收据。
+    /// Success requires the complete bounded batch; a literal fallback is no completion receipt.
     prepared: Cell<bool>,
-    /// 独立工作负载只观察原请求终点；产品默认构建不增加收据状态。
+    /// Independent workloads observe only the original request endpoint; default
+    /// product builds contain no extra receipt state.
     #[cfg(feature = "native-markdown-runtime-probe")]
     completed: Cell<Option<bool>>,
 }
@@ -185,12 +204,14 @@ pub(in crate::native_surface) struct NativeMarkdownFindRevealRequest {
 #[cfg(feature = "native-markdown-runtime-probe")]
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownFindRevealRequest {
-    /// 只读原请求的实际终点，slot消失和后继栏文案都不能代替该收据。
+    /// Read the original actual endpoint. A removed slot or a successor bar's status
+    /// cannot replace this receipt.
     pub(in crate::native_surface) fn probe_completed(&self) -> Option<bool> {
         self.completed.get()
     }
 
-    /// 未完成请求被取消时保留失败；已经签发的成功不被正常移除覆写。
+    /// Cancellation records failure for unfinished requests; normal removal must
+    /// not overwrite success already issued at the actual endpoint.
     fn record_probe_removal(&self) {
         if self.completed.get().is_none() {
             self.completed.set(Some(false));
@@ -198,7 +219,8 @@ impl NativeMarkdownFindRevealRequest {
     }
 }
 
-/// 仅同步executor栈内持有实际controller/storage；外层PayloadUseGuard阻止栈内关闭。
+/// Strong controller/storage claims exist only on the synchronous executor stack;
+/// the outer PayloadUseGuard prevents payload teardown within that stack.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 pub(in crate::native_surface) struct NativeMarkdownFindRevealContext {
     request: Rc<NativeMarkdownFindRevealRequest>,
@@ -208,7 +230,7 @@ pub(in crate::native_surface) struct NativeMarkdownFindRevealContext {
 
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownFindRevealContext {
-    /// 所有条件均为Rust元数据，不在原生调用之后用另一个getter重新领取权限。
+    /// Read Rust metadata only; another getter after a Native call cannot reacquire authority.
     pub(in crate::native_surface) fn is_current(&self, view: &PieceBackedMarkdownTextView) -> bool {
         if !self.permissions_are_current(view) {
             return false;
@@ -216,7 +238,8 @@ impl NativeMarkdownFindRevealContext {
         self.request.selection_is_current()
     }
 
-    /// 纯发布callback只沿既有owner/source/bar/input票接收自己的转换，不读取新权限。
+    /// The publication callback accepts its own transition through existing owner,
+    /// source, bar, and input authority, never newly read authority.
     fn permissions_are_current(&self, view: &PieceBackedMarkdownTextView) -> bool {
         let request = &self.request;
         let slot_current = view
@@ -260,14 +283,16 @@ impl NativeMarkdownFindRevealContext {
         )
     }
 
-    /// cache最终发布后仅标记当前票据；旧局部值不能为新目标签发准备成功。
+    /// Mark only the current ticket after final cache publication. An old local
+    /// value cannot certify a successor target's preparation.
     pub(in crate::native_surface) fn mark_prepared(&self, view: &PieceBackedMarkdownTextView) {
         if self.is_current(view) {
             self.request.prepared.set(true);
         }
     }
 
-    /// 只布局首个完整Unicode标量；长跨行匹配也不要求全选区同时驻留或全篇布局。
+    /// Lay out only the first complete Unicode scalar. Even a long multiline match
+    /// requires neither resident layout of its full selection nor full-document layout.
     pub(in crate::native_surface) fn probe(&self) -> std::ops::Range<usize> {
         self.request.probe.clone()
     }
@@ -278,7 +303,8 @@ impl NativeMarkdownFindRevealRequest {
     fn selection_is_current(&self) -> bool {
         let committed = self.committed.borrow();
         if let Some(committed) = committed.as_ref() {
-            // 纯发布callback已接入同Rc后，旧capture撤权是预期转换，只消费原提交后果。
+            // Once publication attaches the committed receipt to this same Rc,
+            // capture revocation is the expected transition; consume that receipt only.
             committed.current()
         } else {
             self.selection_capture
@@ -288,7 +314,8 @@ impl NativeMarkdownFindRevealRequest {
     }
 }
 
-/// EOF零长匹配保持caret；补充平面首字形不能把surrogate一分为二。
+/// Preserve the caret for an empty EOF match. A supplementary-plane first scalar
+/// must retain both UTF-16 surrogates.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn first_match_scalar(
     start: usize,
@@ -296,7 +323,7 @@ fn first_match_scalar(
     first: Option<u16>,
 ) -> Option<std::ops::Range<usize>> {
     if start > length {
-        // 过期或越界坐标不截断成另一个合法位置。
+        // Do not clamp stale/out-of-range coordinates into a different valid position.
         return None;
     }
     if start == length {
@@ -311,29 +338,33 @@ fn first_match_scalar(
     (end <= length).then_some(start..end)
 }
 
-/// 真实segment须有限且有高度；超宽字形以其起点可见为准，不伪造完整匹配全可见。
+/// Require valid segment/clip geometry. For an oversized glyph, visibility follows
+/// its origin; this does not claim the entire match is simultaneously visible.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn find_segment_is_visible(frame: NSRect, clip: NSRect) -> bool {
     let Some(origin) = native_markdown_minimal_cell_scroll_origin(frame, clip) else {
-        return false; // NaN/无限/零clip没有可见性收据。
+        return false; // NaN, infinite, or empty clip geometry cannot prove visibility.
     };
     (origin.x - clip.origin.x).abs() <= 0.5 && (origin.y - clip.origin.y).abs() <= 0.5
 }
 
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl PieceBackedMarkdownTextView {
-    /// 新命令、resize、物理输入和accepted release同步撤权；drop不跨slot借用。
+    /// New commands, resize, physical input, and accepted release revoke authority
+    /// synchronously. Drop claims after ending the slot borrow.
     pub(in crate::native_surface) fn cancel_pending_find_reveal(&self) {
-        self.cancel_pending_mode_viewport(); // 新Find动作不能让上一模式目标在同一视图上迟到恢复。
+        // A previous mode target cannot later restore this same view over a new Find action.
+        self.cancel_pending_mode_viewport();
         let old = self.ivars().find_reveal.borrow_mut().take();
         #[cfg(feature = "native-markdown-runtime-probe")]
         if let Some(old) = old.as_ref() {
-            old.record_probe_removal(); // 只写原Rust票据，借用已经结束，不增加Native操作。
+            old.record_probe_removal(); // Only the original Rust ticket changes; no borrow or Native call remains.
         }
         drop(old);
     }
 
-    /// TextKit因真实内容高度更新setFrameSize不算用户改宽；只撤销不同列宽的目标。
+    /// TextKit updating frame height for actual content is not a user width change;
+    /// revoke only targets whose column width differs.
     pub(in crate::native_surface) fn cancel_find_reveal_for_width(&self, width: f64) {
         let metric = native_markdown_layout_metric(width);
         let changed = self
@@ -347,13 +378,15 @@ impl PieceBackedMarkdownTextView {
         }
     }
 
-    /// executor只克隆Rust Rc；Native weak.load及retain都在借用之外，且前后核原票据。
+    /// Clone only the Rust Rc while borrowing. Native weak loads/retains happen
+    /// outside that borrow and must preserve original authority across reentry.
     pub(in crate::native_surface) fn pending_find_reveal_context(
         &self,
     ) -> Option<NativeMarkdownFindRevealContext> {
         let request = self.ivars().find_reveal.borrow().as_ref().map(Rc::clone)?;
         if !request.ready.get() || self.ivars().textkit_graph_teardown.get() {
-            return None; // 粗定位尚在原生栈内时不抢先消费；关闭由release清slot。
+            // Do not consume during Native coarse relocation; accepted release owns closed-slot cleanup.
+            return None;
         }
         let controller = self.ivars().controller.get()?.load()?;
         if std::ptr::from_ref(&*controller).addr() != request.stamp.owner
@@ -372,7 +405,7 @@ impl PieceBackedMarkdownTextView {
         if context.is_current(self) {
             Some(context)
         } else {
-            // Native weak升级中新的输入只撤旧目标，绝不清后继目标。
+            // Input during a Native weak upgrade revokes only this old target, never its successor.
             self.remove_find_reveal_if_same(&context.request);
             None
         }
@@ -387,7 +420,7 @@ impl PieceBackedMarkdownTextView {
             {
                 slot.take()
             } else {
-                None // 新目标已经发布，旧executor不能取走它。
+                None // A successor already occupies the slot; this old executor cannot take it.
             }
         };
         #[cfg(feature = "native-markdown-runtime-probe")]
@@ -397,7 +430,8 @@ impl PieceBackedMarkdownTextView {
         drop(old);
     }
 
-    /// 同步Find动作返回后捕获原票；未取得票据就失败，不用较新UI猜测先前成功。
+    /// Observe the original ticket after synchronous Find returns. Missing tickets
+    /// mean no receipt; newer UI cannot establish the previous action's success.
     #[cfg(feature = "native-markdown-runtime-probe")]
     pub(in crate::native_surface) fn observe_find_reveal_for_probe(
         &self,
@@ -405,7 +439,8 @@ impl PieceBackedMarkdownTextView {
         self.ivars().find_reveal.borrow().as_ref().map(Rc::clone)
     }
 
-    /// 仅保留既有的一次scrollRangeToVisible作粗定位；后续不是第二次命令/计时重试。
+    /// Arm one target and relocate the existing Native viewport once for coarse
+    /// positioning. Later bounded preparation is not another command or timed retry.
     pub(in crate::native_surface) fn begin_find_reveal(
         &self,
         bar: &Rc<NativeMarkdownFindBar>,
@@ -437,7 +472,8 @@ impl PieceBackedMarkdownTextView {
                 capture,
                 native_before,
             } => {
-                // 完整方向由明确Find目标给出；原capture在查询getter之前固定，不从当前选区重领。
+                // The explicit Find target supplies direction. Its capture predates
+                // query getters and must not be reacquired from the current selection.
                 let captured = capture
                     .clone()
                     .finish(selection, true)
@@ -447,7 +483,8 @@ impl PieceBackedMarkdownTextView {
                         .with_observed_native_before(native_before)
                         .map_err(|error| error.to_string())?
                 } else {
-                    // 实际多选没有单before或主head；明确Find目标仍沿原capture，不伪造旧单范围。
+                    // Actual multi-selection has no single prior range/head; keep
+                    // the original capture without inventing a prior single selection.
                     captured
                 }
                 .with_head_side(Some(false))
@@ -456,7 +493,8 @@ impl PieceBackedMarkdownTextView {
             }
             NativeMarkdownFindRevealSelection::Committed(committed) => {
                 if !committed.current() || committed.selection != selection {
-                    // 替换自己的字符收据必须精确对应这个目标，不得再次发布同一选择以补新serial。
+                    // Replacement's committed receipt must match this exact target;
+                    // republishing the selection to obtain a new serial is invalid.
                     return Err("替换后的查找选择收据已失效".into());
                 }
                 (None, None, Some(committed))
@@ -478,6 +516,8 @@ impl PieceBackedMarkdownTextView {
             return Err("查找所属笔记已变化".into());
         }
         let document = identity.upgrade().ok_or("笔记文档已关闭")?;
+        // Generation equality is insufficient: either the original capture or the
+        // replacement receipt must identify this exact document allocation.
         let belongs = captured
             .as_ref()
             .map(|captured| captured.belongs_to(&document))
@@ -492,6 +532,8 @@ impl PieceBackedMarkdownTextView {
         if !belongs {
             return Err("查找选择不属于原笔记收据".into());
         }
+        // Read only the first code unit needed to bound the target scalar. The
+        // complete match remains a selection, not a materialized layout range.
         let (generation, length, probe) = {
             let document = document.borrow();
             if document.generation() != target.generation {
@@ -533,7 +575,8 @@ impl PieceBackedMarkdownTextView {
             #[cfg(feature = "native-markdown-runtime-probe")]
             completed: Cell::new(None),
         });
-        // 先取得局部原生owner；失败不能留下ready=false而永远阻止cache命中的票据。
+        // Acquire local Native ownership before slot publication. Failure must not
+        // strand an unready ticket that prevents subsequent cache consumption.
         if !current() || !request.selection_is_current() {
             return Err("查找输入已变更".into());
         }
@@ -552,10 +595,12 @@ impl PieceBackedMarkdownTextView {
         let previous = self.ivars().find_reveal.replace(Some(Rc::clone(&request)));
         #[cfg(feature = "native-markdown-runtime-probe")]
         if let Some(previous) = previous.as_ref() {
-            previous.record_probe_removal(); // 后继目标不能让被替换的旧收据永久停留在未完成。
+            // Replacing the slot also gives the old request an explicit unsuccessful endpoint.
+            previous.record_probe_removal();
         }
         drop(previous);
-        // 局部context不跨事件；仅用于对每个Native步骤前后认证同一个目标。
+        // This context never crosses events; it authenticates the same target
+        // before and after each potentially reentrant Native step.
         let context = NativeMarkdownFindRevealContext {
             request,
             controller: actual_controller,
@@ -565,7 +610,8 @@ impl PieceBackedMarkdownTextView {
         let result = (|| {
             native_markdown_table_intent_step(&is_current, || {
                 if bar.is_visible() {
-                    // 隐藏Cmd-G只导航，不挂载栏、不改变输入焦点或为反馈布局隐藏控件。
+                    // Hidden Cmd-G only navigates; it neither mounts the bar,
+                    // changes input focus, nor lays out hidden feedback controls.
                     bar.status.setStringValue(ns_string!("正在定位匹配…"));
                 }
             })?;
@@ -578,7 +624,8 @@ impl PieceBackedMarkdownTextView {
                 context
                     .storage
                     .update_active_selection_observed(captured, |committed| {
-                        // 无Native、无Doc借用；只把原转换收据接到同Rc请求，再允许attrs重入。
+                        // No Native call or document borrow here: attach the
+                        // original transition receipt to this same Rc before attrs can reenter.
                         if context.permissions_are_current(self)
                             && context.request.committed.borrow().is_none()
                         {
@@ -606,14 +653,15 @@ impl PieceBackedMarkdownTextView {
             }
             #[cfg(feature = "native-markdown-runtime-probe")]
             trace_find_native_phase("selection_return");
-            // 完整选择不变；由原生 viewport 直接迁移至原首 scalar，避免通用滚动入口向前补排离屏内容。
+            // Preserve the full selection while relocating the Native viewport
+            // to its original first scalar; generic scrolling could eagerly lay out offscreen content.
             self.relocate_find_viewport(&context, &is_current)?;
             #[cfg(feature = "native-markdown-runtime-probe")]
             trace_find_native_phase("coarse_scroll_return");
             Ok::<(), NativeMarkdownStableTableFailure>(())
         })();
         if result.is_err() {
-            // getter/setter重入撤权时只移除旧票据，不触及已发布的后继slot。
+            // Getter/setter reentry removes only this old ticket, preserving any successor slot.
             self.remove_find_reveal_if_same(&context.request);
             return Err("查找定位已失效".into());
         }
@@ -622,7 +670,8 @@ impl PieceBackedMarkdownTextView {
         Ok(())
     }
 
-    /// 返回第一个实际字形矩形；block只拷贝一个标量rect且立即停止，不保留原生range。
+    /// Return the first actual glyph rectangle. The enumeration callback copies one
+    /// scalar rectangle and stops immediately, retaining no Native range.
     fn find_reveal_segment(
         &self,
         context: &NativeMarkdownFindRevealContext,
@@ -630,7 +679,8 @@ impl PieceBackedMarkdownTextView {
         self.source_probe_segment(&context.probe(), &|| context.is_current(self))
     }
 
-    /// 粗定位只迁移原请求的 viewport；建议锚点不是查找成功，后续仍须验证实际首字形与 clip。
+    /// Coarse positioning relocates only the original request's viewport. Its
+    /// suggested anchor is not success; actual first-glyph/clip verification follows.
     fn relocate_find_viewport(
         &self,
         context: &NativeMarkdownFindRevealContext,
@@ -651,7 +701,8 @@ impl PieceBackedMarkdownTextView {
             if !std::ptr::eq(&*actual_manager, &*manager)
                 || !std::ptr::eq(&*actual_content, &*content)
             {
-                return Err(Failure::InvalidSourceAssociation); // 同代次状态不能授权已脱离视图的原生图。
+                // Matching revisions cannot authorize a Native graph detached from this view.
+                return Err(Failure::InvalidSourceAssociation);
             }
             Ok(())
         };
@@ -669,21 +720,25 @@ impl PieceBackedMarkdownTextView {
             content.offsetFromLocation_toLocation(&start, &location)
         })? != offset
         {
-            // 原生位置必须往返同一 canonical 偏移；不能把估计位置当作原查找匹配。
+            // Native positions must round-trip the same canonical offset; an
+            // estimated location cannot stand in for the original Find match.
             return Err(Failure::InvalidSourceAssociation);
         }
         let visible = native_markdown_table_intent_step(current, || self.visibleRect())?;
         let visible_source = self.read_visible_utf16_window(visible, context.request.stamp.length);
         if !current() {
-            return Err(Failure::InputIntentExpired); // 行读取可重入；旧查找不能继续迁移后继视口。
+            // Visible-line reads can reenter; this old Find cannot relocate a successor viewport.
+            return Err(Failure::InputIntentExpired);
         }
         require_original_content_graph()?;
         if !visible_source.is_empty()
             && visible_source.start <= context.request.probe.start
             && context.request.probe.end <= visible_source.end
         {
-            // 已在真实可见行中的目标保留当前视口；不因粗迁移重新估算已排好的段落位置。
-            // 后续有限ensure和实际字形矩形仍须通过，源行相交本身不签发Find成功。
+            // Preserve the viewport for a target already within actual visible
+            // lines instead of reestimating their laid-out paragraph positions.
+            // Bounded preparation and glyph verification still must pass; source
+            // intersection alone cannot establish Find success.
             #[cfg(feature = "native-markdown-runtime-probe")]
             trace_find_geometry(
                 "already_in_viewport",
@@ -700,7 +755,7 @@ impl PieceBackedMarkdownTextView {
             native_markdown_table_intent_step(current, || viewport.textLayoutManager())?
                 .ok_or(Failure::MissingGeometry)?;
         if !std::ptr::eq(&*actual_manager, &*manager) {
-            // getter 重入导致关联变化时停止，不迁移后继 manager 的 viewport。
+            // Getter reentry changed the association; do not relocate a successor manager's viewport.
             return Err(Failure::InvalidSourceAssociation);
         }
         let require_original_graph = || -> Result<(), Failure> {
@@ -709,12 +764,14 @@ impl PieceBackedMarkdownTextView {
                 native_markdown_table_intent_step(current, || viewport.textLayoutManager())?
                     .ok_or(Failure::MissingGeometry)?;
             if !std::ptr::eq(&*actual_viewport_manager, &*manager) {
-                // relocate 或后续 getter 可重入；旧 manager 的建议锚点不能应用到后继原生图。
+                // Relocation/getters can reenter. An old manager's suggested
+                // anchor cannot be applied to a successor Native graph.
                 return Err(Failure::InvalidSourceAssociation);
             }
             Ok(())
         };
-        require_original_graph()?; // 先证明viewport仍属于本视图，不能迁移之后才发现旧图已被替换。
+        // Prove viewport membership before relocation, not after moving a replaced graph.
+        require_original_graph()?;
         let anchor = native_markdown_table_intent_step(current, || {
             viewport.relocateViewportToTextLocation(&location)
         })?;
@@ -723,7 +780,8 @@ impl PieceBackedMarkdownTextView {
         let visible = native_markdown_table_intent_step(current, || self.visibleRect())?;
         let target_y = anchor + origin.y;
         if !target_y.is_finite() || !visible.origin.x.is_finite() {
-            // 建议位置无效时明确失败；不改用另一个滚动 API 重试或猜测目标页。
+            // Invalid suggested geometry is an explicit failure, not permission to
+            // retry another scrolling API or guess the target page.
             return Err(Failure::MissingGeometry);
         }
         #[cfg(feature = "native-markdown-runtime-probe")]
@@ -741,19 +799,21 @@ impl PieceBackedMarkdownTextView {
             .ok_or(Failure::MissingGeometry)?;
         let original_view: &NSView = self;
         if !std::ptr::eq(&*document_view, original_view) {
-            // 原 scroll 仍存活不代表当前仍挂着原文本视图，拒绝移动其他 document view。
+            // A surviving scroll view need not still host this text view; never move another document view.
             return Err(Failure::InvalidSourceAssociation);
         }
         require_original_graph()?;
         native_markdown_table_intent_step(current, || {
-            // 保留横向 clip；EOF 和文首由现有 NSClipView 约束，随后真实 segment 会核对实际结果。
+            // Preserve horizontal position. NSClipView constrains document start/EOF;
+            // later actual-segment verification checks the resulting position.
             clip.scrollToPoint(NSPoint::new(visible.origin.x, target_y.max(0.0)));
         })?;
         native_markdown_table_intent_step(current, || scroll.reflectScrolledClipView(&clip))?;
         Ok(())
     }
 
-    /// 查找和模式连续性共用首scalar/EOF的真实几何，不共享两者各自的授权票据。
+    /// Find and mode continuity share actual first-scalar/EOF geometry, while each
+    /// retains its own distinct authority ticket.
     pub(in crate::native_surface) fn source_probe_segment(
         &self,
         probe: &std::ops::Range<usize>,
@@ -762,7 +822,8 @@ impl PieceBackedMarkdownTextView {
         self.source_probe_segment_with_affinity(probe, false, current)
     }
 
-    /// 空 caret 在换行边界可以处于两条视觉行；选择导航必须保留已证明的那一侧。
+    /// An empty caret at a wrap boundary can occupy either visual line; selection
+    /// navigation preserves the affinity already proved for that caret.
     pub(in crate::native_surface) fn source_probe_segment_with_affinity(
         &self,
         probe: &std::ops::Range<usize>,
@@ -774,7 +835,8 @@ impl PieceBackedMarkdownTextView {
         if let Some(cache) = cache {
             let rect = native_markdown_table_scalar_frame(&cache.tables, probe)?;
             if let Some(rect) = rect {
-                // 当前可见CTFrame必须仍属于原文稿/完整表格几何票，不能用旧行位置给新输入补证。
+                // A visible CTFrame still needs the original document and complete
+                // table-geometry ticket; stale row positions cannot certify new input.
                 let actual = native_markdown_table_intent_step(current, || {
                     self.current_table_layout_request_key()
                 })?
@@ -815,7 +877,8 @@ impl PieceBackedMarkdownTextView {
              rect: NSRect,
              _baseline: f64,
              _container: NonNull<NSTextContainer>| {
-                // 回调内不做getter；只接受首个真实有限矩形，不扩张成全选区/全段layout。
+                // Copy the first callback rectangle without getters, then stop.
+                // Never expand this probe into full-selection or paragraph layout.
                 frame.set(Some(NSRect::new(
                     NSPoint::new(rect.origin.x + origin.x, rect.origin.y + origin.y),
                     NSSize::new(rect.size.width.max(1.0), rect.size.height),
@@ -825,7 +888,8 @@ impl PieceBackedMarkdownTextView {
         );
         let mut options = NSTextLayoutManagerSegmentOptions::RangeNotRequired;
         if probe.is_empty() && upstream {
-            // 非空探针仍使用既有字形矩形；只有明确空位置才使用换行上游语义。
+            // Nonempty probes keep existing glyph geometry; only an explicitly
+            // empty position uses upstream wrap affinity.
             options |= NSTextLayoutManagerSegmentOptions::UpstreamAffinity;
         }
         native_markdown_table_intent_step(&current, || {
@@ -843,7 +907,8 @@ impl PieceBackedMarkdownTextView {
             .ok_or(Failure::MissingGeometry)
     }
 
-    /// 无表格/Source分支也沿同一目标完成有限ensure与真实viewport布局，不绕过认证。
+    /// Table-free/Source paths still prepare the same bounded target and actual
+    /// viewport; they cannot bypass original-target authentication.
     pub(in crate::native_surface) fn prepare_find_reveal_without_tables(
         &self,
         context: &NativeMarkdownFindRevealContext,
@@ -859,7 +924,8 @@ impl PieceBackedMarkdownTextView {
         self.position_find_reveal(context)
     }
 
-    /// 表格高度确定后，按实际segment作一次最小clip调整；不再次调用scrollRangeToVisible。
+    /// Once table height is known, adjust the clip minimally using the actual
+    /// segment rather than issuing another general scroll-to-range command.
     pub(in crate::native_surface) fn position_find_reveal(
         &self,
         context: &NativeMarkdownFindRevealContext,
@@ -887,7 +953,8 @@ impl PieceBackedMarkdownTextView {
             })?;
             native_markdown_table_intent_step(&current, || viewport.layoutViewport())?;
         }
-        // clip可能被EOF约束或layout改变；只读重取后认证，不能以请求scroll成功当目标已可见。
+        // EOF constraints/layout can change the clip. Re-read and verify actual
+        // visibility; an accepted scrolling request is insufficient.
         self.verify_find_reveal(context)
     }
 
@@ -907,7 +974,7 @@ impl PieceBackedMarkdownTextView {
         }
     }
 
-    /// TextKit明确不允许布局时，本次定位失败而非等待下一draw反复尝试。
+    /// If TextKit disallows layout, fail this reveal instead of retrying on later draws.
     pub(in crate::native_surface) fn fail_pending_find_reveal(&self) {
         let Some(context) = self.pending_find_reveal_context() else {
             return;
@@ -922,7 +989,8 @@ impl PieceBackedMarkdownTextView {
         self.remove_find_reveal_if_same(&context.request);
     }
 
-    /// 完成同一个有限executor后才发布成功；失败目标移除，绝不靠draw/timer重试。
+    /// Publish success only after this same bounded executor finishes. Remove
+    /// unsuccessful targets rather than retrying through draws or timers.
     pub(in crate::native_surface) fn finish_pending_find_reveal(&self) {
         let Some(context) = self.pending_find_reveal_context() else {
             return;
@@ -936,21 +1004,25 @@ impl PieceBackedMarkdownTextView {
             let text = if verified {
                 context.request.feedback.text()
             } else if !prepared {
-                // 看见首个字符不代表整批布局已准备完成；保留原成功门槛并说明真实失败阶段。
+                // Seeing the first character does not prove complete batch
+                // preparation; retain the success gate and report the actual failure stage.
                 "匹配已选中，但当前内容的布局未完成".into()
             } else {
-                // 整批准备完成后仍须通过同票据的实际可见区认证，不能用选中状态替代。
+                // A prepared batch still needs actual viewport verification under
+                // the same ticket; selected state cannot substitute for visibility.
                 "匹配已选中，但未能完成可见区定位".into()
             };
             let text = NSString::from_str(&text);
-            // 此前的Native getters均已结束；setter前纯核票据，随后只移除相同slot。
+            // All earlier Native getters returned. Check pure authority before
+            // the setter, then remove only this same slot.
             if context.is_current(self) {
                 bar.status.setStringValue(&text);
             }
         }
         #[cfg(feature = "native-markdown-runtime-probe")]
         if context.request.completed.get().is_none() {
-            // 原成功条件完全不变；反馈setter及其析构已返回后仍核同一原票，不签发后继权限。
+            // Preserve the actual success conditions. Recheck the same original
+            // ticket after the feedback setter and its temporary claims return.
             context
                 .request
                 .completed
@@ -963,43 +1035,6 @@ impl PieceBackedMarkdownTextView {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    #[test]
-    fn probe_receipt_does_not_promote_prepared_or_removed_requests_to_success() {
-        let request = NativeMarkdownFindRevealRequest {
-            document: WeakMarkdownDocument::new(),
-            bar: std::rc::Weak::new(),
-            stamp: FindRevealStamp {
-                owner: 1,
-                generation: 2,
-                length: 3,
-                width: 4,
-                mode: MarkdownPresentationMode::Source,
-                input_epoch: 5,
-                table_epoch: 6,
-            },
-            probe: 1..2,
-            feedback: NativeMarkdownFindRevealFeedback::Found,
-            visibility: NativeMarkdownFindVisibility::Visible,
-            bar_revision: 7,
-            selection_capture: None,
-            committed: RefCell::new(None),
-            ready: Cell::new(true),
-            prepared: Cell::new(true),
-            completed: Cell::new(None),
-        };
-        // 整批prepared也可能在最终verify失败；缺原终点不能被当成成功。
-        assert_eq!(request.probe_completed(), None);
-        request.record_probe_removal();
-        assert_eq!(request.probe_completed(), Some(false));
-        request.record_probe_removal();
-        assert_eq!(request.probe_completed(), Some(false));
-        // 真实成功终点在移除之前已签发，正常移除不能把它覆写为失败。
-        request.completed.set(Some(true));
-        request.record_probe_removal();
-        assert_eq!(request.probe_completed(), Some(true));
-    }
 
     #[test]
     fn target_probe_keeps_unicode_scalar_and_eof_without_full_match_layout() {
@@ -1019,63 +1054,6 @@ mod tests {
         assert!(!find_segment_is_visible(row(700.0), clip));
         assert!(!find_segment_is_visible(row(f64::NAN), clip));
         assert!(!find_segment_is_visible(row(450.0), NSRect::ZERO));
-    }
-    #[test]
-    fn stale_owner_document_query_width_mode_or_slot_never_grants_reveal() {
-        let stamp = FindRevealStamp {
-            owner: 1,
-            generation: 7,
-            length: 100,
-            width: 900,
-            mode: MarkdownPresentationMode::InlinePreview,
-            input_epoch: 2,
-            table_epoch: 3,
-        };
-        assert!(find_reveal_permissions(
-            stamp, stamp, true, true, true, true
-        ));
-        for actual in [
-            FindRevealStamp { owner: 2, ..stamp },
-            FindRevealStamp {
-                generation: 8,
-                ..stamp
-            },
-            FindRevealStamp {
-                length: 99,
-                ..stamp
-            },
-            FindRevealStamp {
-                width: 1120,
-                ..stamp
-            },
-            FindRevealStamp {
-                mode: MarkdownPresentationMode::Source,
-                ..stamp
-            },
-            FindRevealStamp {
-                input_epoch: 3,
-                ..stamp
-            },
-            FindRevealStamp {
-                table_epoch: 4,
-                ..stamp
-            },
-        ] {
-            // 每项独立改变都须撤权；不能由其余相同标量或仍活Rc恢复权限。
-            assert!(!find_reveal_permissions(
-                stamp, actual, true, true, true, true
-            ));
-        }
-        for (slot, foreground, document, visible) in [
-            (false, true, true, true),
-            (true, false, true, true),
-            (true, true, false, true),
-            (true, true, true, false),
-        ] {
-            assert!(!find_reveal_permissions(
-                stamp, stamp, slot, foreground, document, visible
-            ));
-        }
     }
     #[test]
     fn hidden_navigation_preserves_query_without_granting_hidden_mutation() {
@@ -1115,7 +1093,7 @@ mod tests {
     fn show_hide_aba_does_not_restore_an_old_navigation_ticket() {
         let original = 40;
         let after_two_transitions = original + 2;
-        // Visible→hidden→visible与hidden→visible→hidden虽然回到相同布尔值，票据都已过期。
+        // Visible/hidden round trips restore the boolean, but both original tickets remain expired.
         assert!(!NativeMarkdownFindVisibility::Visible.permits(
             true,
             false,

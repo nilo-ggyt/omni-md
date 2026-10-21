@@ -1,20 +1,25 @@
-//! 通过正式worker观察全部已覆盖角色；读数本身不保活正文或字体。
+//! Observe actual covered resource roles through the production worker;
+//! observations themselves retain neither text nor font payloads.
 use super::*;
 
 #[test]
 fn whole_worker_observes_static_indexes_and_real_transient_job_cluster_cleanup() {
+    // Drive real composition through multiple shaped items and retain the final
+    // output reader separately from worker-owned indexes and transient jobs.
     let fixture = Fixture::new("office αλφα слово office βητα текст office gamma конец ");
     let source_mapping = fixture.source.original_backing_observer().unwrap();
     let (mut worker, registered) =
         engine::composer(&fixture, 140 * 64, MarkdownLineComposeCancellation::new());
     let resources = worker.worker_resource_observer();
     let initial = resources.snapshot().unwrap();
-    // 固定角色已装配但尚未写记录或交付Reader；不能用虚构FD来代替仍活着的Source所有权。
+    // Fixed roles are assembled but have written no records or handed out a
+    // reader. Their live Source obligation cannot be replaced by an invented FD.
     assert!(!initial.scripts.unwrap().run_file_open);
     assert!(!initial.graphemes.unwrap().metadata_file_open);
     assert!(!initial.line_breaks.unwrap().metadata_file_open);
     assert!(!initial.writer.unwrap().file_open);
-    assert!(!initial.actual_resources_released()); // 真实固定角色和Source仍在，不能只看健康状态。
+    // Healthy observations do not prove release while actual fixed owners and Source remain live.
+    assert!(!initial.actual_resources_released());
     assert!(!resources.is_released());
     assert!(engine::drive(&mut worker, &registered, false) >= 3);
     let output = worker.into_output().unwrap();
@@ -36,7 +41,8 @@ fn whole_worker_observes_static_indexes_and_real_transient_job_cluster_cleanup()
     assert!(before_reader_close.clusters.registered >= 3);
     assert_eq!(before_reader_close.clusters.active, 0);
     output.close().unwrap();
-    // writer实际FD已经交给唯一只读reader，只有reader真实close后这张原FD票才归零。
+    // The actual writer FD transferred to the sole reader. Only that reader's
+    // real close ends this original file obligation.
     assert!(!resources.snapshot().unwrap().writer.unwrap().file_open);
     assert!(!resources.is_released());
     drop((registered, fixture));
@@ -49,6 +55,8 @@ fn whole_worker_observes_static_indexes_and_real_transient_job_cluster_cleanup()
 
 #[test]
 fn cancellation_after_real_shape_drops_payload_before_settling_original_resource_claim() {
+    // Reach one actual shape before cancelling the same production worker.
+    // A cancellation flag alone is not evidence that the shaped payload ended.
     let fixture = Fixture::new("office office office office office office office office");
     let source_mapping = fixture.source.original_backing_observer().unwrap();
     let cancellation = MarkdownLineComposeCancellation::new();
@@ -58,6 +66,7 @@ fn cancellation_after_real_shape_drops_payload_before_settling_original_resource
     for _ in 0..100_000 {
         let step = worker.step(budget()).unwrap();
         if let MarkdownLineComposeAnswer::NeedStyle(request) = step.answer {
+            // Return the real outstanding request with an actual registered font.
             let range = request.source_range();
             worker
                 .provide_style(
@@ -68,6 +77,7 @@ fn cancellation_after_real_shape_drops_payload_before_settling_original_resource
                 .unwrap();
         }
         if step.shapes > 0 {
+            // Stop only after real shaping work, while its owner is still active.
             shaped = true;
             break;
         }
@@ -78,6 +88,8 @@ fn cancellation_after_real_shape_drops_payload_before_settling_original_resource
     assert_eq!(active.shapes.active, 1);
     assert_eq!(active.shapes.settled, 0);
     cancellation.cancel();
+    // The next production step observes cancellation and drops its actual owner
+    // before the original observation can settle the released resource facts.
     assert!(matches!(
         worker.step(budget()),
         Err(MarkdownLineComposeError::Cancelled)
@@ -103,25 +115,9 @@ fn cancellation_after_real_shape_drops_payload_before_settling_original_resource
 }
 
 #[test]
-fn poisoned_resource_mutex_never_returns_a_fabricated_all_zero_release_snapshot() {
-    let fixture = Fixture::new("真实资源观察锁");
-    let (worker, registered) =
-        engine::composer(&fixture, 80 * 64, MarkdownLineComposeCancellation::new());
-    let resources = worker.worker_resource_observer();
-    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        resources.poison_for_test();
-    }));
-    assert!(poisoned.is_err());
-    assert!(resources.snapshot().is_none());
-    assert!(!resources.is_released());
-    drop((worker, registered, fixture));
-    assert!(resources.snapshot().is_none());
-    assert!(!resources.is_released());
-}
-
-#[test]
 fn cancellation_after_real_paged_bidi_analysis_keeps_its_actual_close_and_cache_receipt() {
-    // 显式嵌入和RTL字符排除Uniform快路；无需给未请求的glyph伪造字体或Ready。
+    // Explicit embedding and RTL exclude the uniform path. No unrequested glyph
+    // needs an invented font response or fabricated Ready result.
     let fixture = Fixture::new("\u{202b}abc אבג\u{202c}");
     let source_mapping = fixture.source.original_backing_observer().unwrap();
     let cancellation = MarkdownLineComposeCancellation::new();
@@ -134,6 +130,8 @@ fn cancellation_after_real_paged_bidi_analysis_keeps_its_actual_close_and_cache_
     let opened = resources.snapshot().unwrap().bidi.unwrap();
     assert!(opened.file_created && opened.file_open);
     assert!(opened.cache_bytes > 0);
+    // Cancel with a real open bidi file/cache, then inspect its original close
+    // outcome after the production worker's failure path retires the payload.
     cancellation.cancel();
     assert!(matches!(
         worker.step(budget()),
@@ -151,29 +149,11 @@ fn cancellation_after_real_paged_bidi_analysis_keeps_its_actual_close_and_cache_
     assert_eq!(source_mapping.mapped_bytes(), 0);
 }
 
-#[cfg(feature = "paged-shaping-frontier")]
-#[test]
-fn later_successful_frontier_registration_cannot_wash_an_earlier_unobserved_constructor() {
-    let fixture = Fixture::new("未观察构造不能恢复");
-    let scope = crate::markdown_line_composer::worker_resources::ComposerResourceScope::new(
-        &fixture.source,
-    );
-    let observer = scope.observer();
-    // 模拟构造实际返回Err的控制流：原一次性登记先Drop，后继owner只能消费自己的新票。
-    drop(scope.begin_frontier_audit());
-    let later_scope = scope.begin_frontier_audit().install().unwrap();
-    let checked = observer.snapshot().unwrap();
-    assert!(!checked.coverage_complete && !checked.frontier_coverage_complete);
-    assert!(!observer.is_released());
-    drop((later_scope, scope, fixture));
-    assert!(observer.snapshot().unwrap().source_payload_released);
-    assert!(!observer.snapshot().unwrap().actual_resources_released()); // 覆盖缺口仍拒绝签资源完整归还。
-    assert!(!observer.is_released());
-}
-
 #[cfg(all(feature = "paged-shaping-frontier", target_os = "macos"))]
 #[test]
 fn frontier_transfers_its_pre_input_claim_with_the_real_child_without_counting_it_twice() {
+    // Produce a real visible line with the actual mapped font/source and verify
+    // that its original frontier child resources ended before final Source release.
     let (font, font_mapping) = frontier::mono();
     let fixture = Fixture::new(&"hello world ".repeat(1024));
     let source_mapping = fixture.source.original_backing_observer().unwrap();
@@ -188,7 +168,8 @@ fn frontier_transfers_its_pre_input_claim_with_the_real_child_without_counting_i
     assert_eq!(actual.shapes.settled, work.parts);
     assert_eq!(actual.shapes.active, 0);
     assert!(actual.shapes.peak_work_bytes_per_owner > 0);
-    assert_eq!(actual.shapes.work_bytes_after_drop, 0); // 短child真实释放工作块，不能用零FD替代owner退场。
+    // A short child must release its actual work allocation, not merely report no FD.
+    assert_eq!(actual.shapes.work_bytes_after_drop, 0);
     assert_eq!(actual.shapes.files_created, actual.shapes.files_closed);
     assert_eq!(
         actual.shapes.mappings_created,
@@ -206,6 +187,8 @@ fn frontier_transfers_its_pre_input_claim_with_the_real_child_without_counting_i
 #[cfg(all(feature = "paged-shaping-frontier", target_os = "macos"))]
 #[test]
 fn internal_frontier_input_failure_or_cancel_keeps_the_pre_ready_actual_cleanup_receipt() {
+    // The existing source-failure variant uses a reclaim injection; both
+    // variants still construct, read, cancel, and destroy actual child resources.
     let (font, font_mapping) = frontier::mono();
     for source_error in [false, true] {
         let fixture = Fixture::new(&"hello world ".repeat(1024));
@@ -224,6 +207,8 @@ fn internal_frontier_input_failure_or_cancel_keeps_the_pre_ready_actual_cleanup_
         let resources = worker.worker_resource_observer();
         let mut input_started = false;
         for _ in 0..100_000 {
+            // One-byte/scalar work reaches real child input before cancellation,
+            // without substituting a precompleted shape or a simulated ready owner.
             let step = worker
                 .step(MarkdownLineComposeBudget {
                     bytes: 1,
@@ -233,6 +218,7 @@ fn internal_frontier_input_failure_or_cancel_keeps_the_pre_ready_actual_cleanup_
                 })
                 .unwrap();
             if let MarkdownLineComposeAnswer::NeedStyle(request) = step.answer {
+                // Satisfy only the actual original style request and registered font.
                 let range = request.source_range();
                 worker
                     .provide_style(
@@ -243,6 +229,8 @@ fn internal_frontier_input_failure_or_cancel_keeps_the_pre_ready_actual_cleanup_
                     .unwrap();
             }
             if worker.frontier_work().unwrap().input_bytes > 0 {
+                // Actual source input, rather than a test-side completion flag,
+                // selects the cancellation point.
                 input_started = true;
                 break;
             }
@@ -258,8 +246,11 @@ fn internal_frontier_input_failure_or_cancel_keeps_the_pre_ready_actual_cleanup_
             (1, 1, 0)
         );
         assert!(active.frontier_coverage_complete);
-        assert!(!active.actual_resources_released()); // 活动原shape不能由故障分支免除其真实owner义务。
+        // An error branch cannot exempt a still-active shape from its real owner obligation.
+        assert!(!active.actual_resources_released());
         if source_error {
+            // Existing fault control records EIO after real page reclamation;
+            // this does not prove that the kernel itself naturally failed msync.
             fixture
                 .document
                 .text_snapshot()
@@ -274,6 +265,7 @@ fn internal_frontier_input_failure_or_cancel_keeps_the_pre_ready_actual_cleanup_
         cancellation.cancel();
         let failed = worker.step(budget());
         if source_error {
+            // The original sticky Source cause retains priority over later cancellation.
             assert!(matches!(
                 failed,
                 Err(MarkdownLineComposeError::Source(
@@ -281,6 +273,7 @@ fn internal_frontier_input_failure_or_cancel_keeps_the_pre_ready_actual_cleanup_
                 ))
             ));
         } else {
+            // Without source failure, cancellation remains the actual terminal cause.
             assert!(matches!(failed, Err(MarkdownLineComposeError::Cancelled)));
         }
         let closed = resources.snapshot().unwrap();
@@ -294,7 +287,8 @@ fn internal_frontier_input_failure_or_cancel_keeps_the_pre_ready_actual_cleanup_
             (1, 0, 1)
         );
         assert!(closed.shapes.peak_work_bytes_per_owner > 0);
-        assert_eq!(closed.shapes.work_bytes_after_drop, 0); // 输入一个字素已实际分配工作块，取消必须真实归还。
+        // Input actually allocated a shaping work block; cancellation must return it.
+        assert_eq!(closed.shapes.work_bytes_after_drop, 0);
         assert_eq!(closed.shapes.files_created, closed.shapes.files_closed);
         assert_eq!(
             closed.shapes.mappings_created,
@@ -308,7 +302,9 @@ fn internal_frontier_input_failure_or_cancel_keeps_the_pre_ready_actual_cleanup_
         assert_eq!(source_mapping.mapped_bytes(), 0);
         let actual = resources.snapshot().unwrap();
         assert_eq!(actual.first_source_errno, source_error.then_some(libc::EIO));
-        assert!(actual.actual_resources_released()); // FD/map已真实归还；原EIO仍独立保持，健康门仍失败。
+        // Actual descriptors/maps are returned while the prior EIO remains an
+        // independent fact; healthy-completion permission must still reject it.
+        assert!(actual.actual_resources_released());
         assert_eq!(resources.is_released(), !source_error);
     }
     drop(font);

@@ -1,7 +1,9 @@
-//! 同一worker的固定资源收据；只保存原observer和标量，不延长业务owner的生命。
+//! Keep one worker's fixed original observations and scalar resource facts
+//! without extending the corresponding business owner's lifetime.
 //!
-//! 固定依赖保留各自真实收据。临时owner的claim必须放在该owner之后，实际析构完成
-//! 才结算原收据；登记数和Source释放本身都不能替代FD、页与映射的实际归还。
+//! Fixed dependencies retain their actual observations. A transient claim must
+//! be declared after its resource owner so settlement follows actual destruction.
+//! Registration counts or Source destruction cannot replace real FD/page/map release.
 
 use std::sync::{
     Arc, Mutex,
@@ -19,7 +21,8 @@ use crate::{
     MarkdownShapingResourceObserver, MarkdownSoftLineResolveResourceObserver,
 };
 
-/// 所有已登记shape的实际最终计数；active不为零时，尚不能对其最终FD/map签释放。
+/// Aggregate actual terminal shape facts. Active owners still carry outstanding
+/// file/mapping obligations even when their currently observed counts are zero.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MarkdownLineComposerShapeResources {
     pub registered: usize,
@@ -33,14 +36,16 @@ pub struct MarkdownLineComposerShapeResources {
     pub mappings_open_after_drop: usize,
     pub mapped_bytes_after_drop: usize,
     pub work_bytes_after_drop: usize,
-    /// 已结算单个Job的同时工作块峰值最大值，不把先后Job的峰值加成常驻量。
+    /// Maximum concurrent work bytes of one settled job, rather than a sum of
+    /// sequential jobs' peaks incorrectly reported as retained memory.
     pub peak_work_bytes_per_owner: usize,
     pub first_error: Option<MarkdownShapingIoError>,
     pub cleanup_failed: bool,
     pub access_uncertified: bool,
 }
 
-/// 临时cluster索引只在真正Drop后结算；这组标量不会积累每item的observer历史。
+/// Settle transient cluster indexes after actual destruction, without retaining
+/// per-item observer history in this fixed scalar aggregate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MarkdownLineComposerClusterResources {
     pub registered: usize,
@@ -49,12 +54,14 @@ pub struct MarkdownLineComposerClusterResources {
     pub files_open_after_drop: usize,
     pub mapped_bytes_after_drop: usize,
     pub buffer_bytes_after_drop: usize,
-    /// 所有已结算cluster owner中最大的单owner写buffer峰值，不是各owner峰值累加。
+    /// Largest writer-buffer peak of one settled cluster owner, not a sum of
+    /// peaks from owners that may have existed at different times.
     pub peak_buffer_bytes_per_owner: usize,
     pub cleanup_failed: bool,
 }
 
-/// 原selector的收据已经在OwnedShape析构后核实际shaper资源；这里归并整次selector。
+/// Each selector's original observation checks real shaping resources after
+/// OwnedShape destruction; aggregate that completed selector here.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MarkdownLineComposerResolveResources {
     pub registered: usize,
@@ -66,7 +73,8 @@ pub struct MarkdownLineComposerResolveResources {
     pub cleanup_failed: bool,
 }
 
-/// 原表格结构分页目录的固定角色；单个 FD 和 16KiB 页不随行数形成常驻 owner 表。
+/// Observe the original paged table-directory role through its single FD and
+/// 16 KiB page, without a retained owner record for every row.
 #[cfg(all(
     feature = "s2-table-window-prototype",
     feature = "paged-shaping-frontier"
@@ -83,7 +91,8 @@ pub struct MarkdownLineComposerTableResources {
     pub reader_failed: bool,
 }
 
-/// None明确表示该固定角色尚未创建；coverage_complete=false时不能签完整worker释放。
+/// None means this fixed role was not created. Incomplete observation coverage
+/// cannot certify complete worker release, even when observed values look empty.
 #[derive(Clone, Copy, Debug)]
 pub struct MarkdownLineComposerWorkerResources {
     pub coverage_complete: bool,
@@ -109,21 +118,26 @@ pub struct MarkdownLineComposerWorkerResources {
 }
 
 impl MarkdownLineComposerWorkerResources {
-    /// 健康完成还要求原Source从未报错；故障后真实释放不擦除这份失败事实。
+    /// Healthy completion also requires no original Source failure; actual
+    /// release after failure cannot erase that independently retained error fact.
     pub fn is_released(&self) -> bool {
         self.first_source_errno.is_none() && self.actual_resources_released()
     }
 
-    /// 只判定原资源是否实际归还，供已单独认证原Source首errno的故障处理消费。
-    /// 逐角色覆盖、最后Source owner、FD/map和所有清理错误仍须完整通过；不清洗任何errno。
+    /// Check actual original-resource return separately from a previously
+    /// established Source errno. Complete role coverage, final Source ownership,
+    /// descriptors/maps, and cleanup outcomes still apply without clearing any error.
     pub fn actual_resources_released(&self) -> bool {
         self.coverage_complete
             && !self.observation_failed
             && self.source_payload_released
             && self.bidi.is_none_or(|value| {
+                // The original bidi owner must return its actual FD/cache and
+                // report no failed close, rather than merely ending its task state.
                 !value.file_open && value.cache_bytes == 0 && value.close_errno.is_none()
             })
             && self.scripts.is_none_or(|value| {
+                // Both run and bracket-stack resources belong to script cleanup.
                 !value.run_file_open
                     && !value.stack_file_open
                     && value.mapped_bytes == 0
@@ -131,7 +145,8 @@ impl MarkdownLineComposerWorkerResources {
                     && !value.cleanup_failed
             })
             && self.graphemes.is_none_or(|value| {
-                // 密集 ASCII 索引本来没有 FD；仍须等其原 owner 实际退场，不能以零文件签释放。
+                // A dense ASCII index naturally has no FD. Its original metadata
+                // owner must still actually end; zero files alone proves no release.
                 value.metadata_owner_released
                     && !value.metadata_file_open
                     && value.metadata_map_bytes == 0
@@ -139,12 +154,15 @@ impl MarkdownLineComposerWorkerResources {
                     && !value.cleanup_failed
             })
             && self.line_breaks.is_none_or(|value| {
+                // A completed line-break index must return its actual storage/cache.
                 !value.metadata_file_open
                     && value.metadata_map_bytes == 0
                     && value.metadata_buffer_bytes == 0
                     && !value.cleanup_failed
             })
             && self.writer.is_none_or(|value| {
+                // Output-reader ownership may outlive the writer task. Its actual
+                // file/map/buffer and read/cleanup failures remain part of release.
                 !value.file_open
                     && value.mapped_bytes == 0
                     && value.buffer_bytes == 0
@@ -158,6 +176,8 @@ impl MarkdownLineComposerWorkerResources {
                 ))]
                 {
                     self.table_directory.is_none_or(|value| {
+                        // Even an unallocated table directory retains a real
+                        // owner obligation until its original owner has ended.
                         value.owner_released
                             && !value.file_open
                             && value.mapped_bytes == 0
@@ -171,6 +191,7 @@ impl MarkdownLineComposerWorkerResources {
                     feature = "paged-shaping-frontier"
                 )))]
                 {
+                    // This feature configuration creates no table-directory role.
                     true
                 }
             }
@@ -218,7 +239,8 @@ struct Records {
 struct State {
     records: Mutex<Records>,
     failed: AtomicBool,
-    // 分析发生但失败前未交出原observer时，必须保留覆盖缺口，不能把None解释成未分配。
+    // Analysis that failed before handing over its actual observer leaves a
+    // coverage gap; None cannot then be reinterpreted as no allocation occurred.
     bidi_unobserved: AtomicBool,
     frontier_unobserved: AtomicBool,
     construction_unobserved: AtomicBool,
@@ -226,11 +248,13 @@ struct State {
     backing: Option<MarkdownOriginalBackingObserver>,
 }
 
-/// 观察者只保固定收据和纯原子状态；持有它不会保活Source、Font、File或任务。
+/// Retain only fixed observations and atomic facts. This observer keeps no
+/// Source, font, file, or task resource alive.
 #[derive(Clone)]
 pub struct MarkdownLineComposerWorkerResourceObserver(Arc<State>);
 impl MarkdownLineComposerWorkerResourceObserver {
-    /// 锁poison返回None，绝不以全零快照伪装已经归还；状态也永久记失败。
+    /// Lock poisoning returns None and permanently marks observation failure,
+    /// never a fabricated all-zero snapshot claiming resources already returned.
     pub fn snapshot(&self) -> Option<MarkdownLineComposerWorkerResources> {
         let Ok(records) = self.0.records.lock() else {
             self.0.failed.store(true, Ordering::Release);
@@ -238,16 +262,20 @@ impl MarkdownLineComposerWorkerResourceObserver {
         };
         let (graphemes, line_breaks) = match &records.breaks {
             Some(value) => {
+                // Read both original index observations from their shared break owner.
                 let (graphemes, line_breaks) = value.snapshots();
                 (Some(graphemes), Some(line_breaks))
             }
+            // Preserve absence only for roles that were not registered as created.
             None => (None, None),
-        }; // 没创建的角色保留None；已创建的角色始终回读其原始实际收据。
+        };
         #[cfg(all(
             feature = "s2-table-window-prototype",
             feature = "paged-shaping-frontier"
         ))]
         let table_directory = if let Some(observer) = &records.table_directory {
+            // Copy finite release facts from the same actual table-plan observer;
+            // no file-presence or owner-completion value is inferred from row count.
             let actual = observer.snapshot();
             Some(MarkdownLineComposerTableResources {
                 owner_released: actual.owner_released,
@@ -260,6 +288,7 @@ impl MarkdownLineComposerWorkerResourceObserver {
                 reader_failed: actual.file.is_some_and(|file| file.reader_failed),
             })
         } else {
+            // An unregistered table-directory role remains explicitly absent.
             None
         };
         Some(MarkdownLineComposerWorkerResources {
@@ -294,20 +323,18 @@ impl MarkdownLineComposerWorkerResourceObserver {
         })
     }
 
+    /// Accept only a valid complete observation that proves healthy actual release.
     pub fn is_released(&self) -> bool {
         self.snapshot().is_some_and(|value| value.is_released())
     }
-    #[cfg(test)]
-    pub(super) fn poison_for_test(&self) {
-        let _guard = self.0.records.lock().unwrap();
-        panic!("测试真实Mutex poison，不写资源计数或伪造FD归还");
-    }
 }
 
-/// ParentScope是后继内部Job薄hook唯一入口；只共享本次worker的固定账本。
+/// Share only this worker's fixed resource observations with actual child jobs;
+/// child claims must belong to this original scope.
 #[derive(Clone)]
 pub(crate) struct ComposerResourceScope(Arc<State>);
 impl ComposerResourceScope {
+    /// Capture weak Source/backing observations before registering child resources.
     pub(super) fn new(source: &MarkdownLayoutTextSource) -> Self {
         Self(Arc::new(State {
             records: Mutex::new(Records::default()),
@@ -319,9 +346,12 @@ impl ComposerResourceScope {
             backing: source.original_backing_observer(),
         }))
     }
+    /// Lend fixed observation state without granting ownership of the worker payload.
     pub(super) fn observer(&self) -> MarkdownLineComposerWorkerResourceObserver {
         MarkdownLineComposerWorkerResourceObserver(self.0.clone())
     }
+    /// Apply one bounded accounting transition. Poison/overflow revokes
+    /// observation authority without changing the actual source operation's result.
     fn update(&self, update: impl FnOnce(&mut Records) -> Option<()>) -> bool {
         let Ok(mut records) = self.0.records.lock() else {
             self.0.failed.store(true, Ordering::Release);
@@ -330,9 +360,12 @@ impl ComposerResourceScope {
         if update(&mut records).is_none() {
             self.0.failed.store(true, Ordering::Release);
             return false;
-        } // 溢出/重复登记只撤观察权限，不panic、不覆盖业务Source的首I/O错误。
+        }
+        // Overflow/duplicate registration invalidates observation; do not panic
+        // or replace the business Source's original I/O failure.
         true
     }
+    /// Register the original script/break observers once for this worker scope.
     pub(super) fn register_dependencies(
         &self,
         scripts: MarkdownScriptResourceObserver,
@@ -340,6 +373,8 @@ impl ComposerResourceScope {
     ) {
         self.update(|records| {
             if records.scripts.is_some() || records.breaks.is_some() {
+                // Another dependency pair cannot overwrite the first pair's
+                // outstanding resource obligations.
                 return None;
             }
             records.scripts = Some(scripts);
@@ -347,16 +382,20 @@ impl ComposerResourceScope {
             Some(())
         });
     }
+    /// Register the actual output writer once; later reader ownership is
+    /// observed through that same receipt rather than a replacement writer value.
     pub(super) fn register_writer(&self, writer: MarkdownComposedLineResourceObserver) {
         self.update(|records| {
             if records.writer.is_some() {
+                // A second writer cannot wash away the first writer's lifetime.
                 return None;
             }
             records.writer = Some(writer);
             Some(())
         });
     }
-    /// 与原 scripts/breaks/writer 同一固定角色账本；只允许当前结构目录登记一次实际收据。
+    /// Register one actual table-directory observation in the same fixed role
+    /// scope as scripts, breaks, and writer.
     #[cfg(all(
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
@@ -367,6 +406,7 @@ impl ComposerResourceScope {
     ) {
         self.update(|records| {
             if records.table_directory.is_some() {
+                // Never replace an existing directory observation with another owner.
                 return None;
             }
             records.table_directory = Some(observer);
@@ -374,17 +414,23 @@ impl ComposerResourceScope {
         });
     }
 
+    /// Mark coverage pending before actual bidi construction may allocate resources.
     pub(super) fn begin_bidi(&self) {
         self.0.bidi_unobserved.store(true, Ordering::Release);
     }
+    /// Retain a constructor observation gap permanently when allocation could
+    /// not return its actual original observer.
     pub(crate) fn incomplete(&self) {
         self.0
             .construction_unobserved
             .store(true, Ordering::Release);
     }
+    /// Close pending bidi coverage only after installing that actual owner's
+    /// original observer successfully.
     pub(super) fn register_bidi(&self, observer: MarkdownBidiResourceObserver) {
         if self.update(|records| {
             if records.bidi.is_some() {
+                // A later bidi observer cannot overwrite an already observed owner.
                 return None;
             }
             records.bidi = Some(observer);
@@ -394,6 +440,8 @@ impl ComposerResourceScope {
         }
     }
     #[cfg(feature = "paged-shaping-frontier")]
+    /// Reserve observation before a real frontier constructor starts; failure
+    /// to install this reservation later leaves an explicit permanent gap.
     pub(super) fn begin_frontier_audit(&self) -> FrontierResourceRegistration {
         let registered = self.update(|records| {
             records.frontier_pending = records.frontier_pending.checked_add(1)?;
@@ -405,6 +453,7 @@ impl ComposerResourceScope {
             installed: false,
         }
     }
+    /// Record an actual shaping owner and settle only after that owner is destroyed.
     pub(crate) fn claim_shape(
         &self,
         observer: MarkdownShapingResourceObserver,
@@ -422,6 +471,7 @@ impl ComposerResourceScope {
             registered,
         }
     }
+    /// Associate the real cluster observer with one active owner, not an item-count proxy.
     pub(super) fn claim_cluster(
         &self,
         observer: MarkdownGlyphClusterResourceObserver,
@@ -439,6 +489,7 @@ impl ComposerResourceScope {
             registered,
         }
     }
+    /// Retain the original selector observation until its actual owner ends.
     pub(super) fn claim_resolver(
         &self,
         observer: MarkdownSoftLineResolveResourceObserver,
@@ -458,7 +509,8 @@ impl ComposerResourceScope {
     }
 }
 
-/// 每次真实Frontier构造前登记一次；失败Drop永久留下缺口，后继安装绝不清洗旧失败。
+/// Register before each actual frontier construction. Dropping an uninstalled
+/// registration permanently preserves its gap; a later success cannot erase it.
 #[cfg(feature = "paged-shaping-frontier")]
 pub(crate) struct FrontierResourceRegistration {
     scope: ComposerResourceScope,
@@ -467,14 +519,18 @@ pub(crate) struct FrontierResourceRegistration {
 }
 #[cfg(feature = "paged-shaping-frontier")]
 impl FrontierResourceRegistration {
+    /// Transfer this actual constructor reservation to the child after a
+    /// successful install, retaining no authority from another construction.
     pub(crate) fn install(mut self) -> Option<ComposerResourceScope> {
         if !self.registered {
+            // Failed reservation already revoked observation and cannot install a scope.
             return None;
         }
         if !self.scope.update(|records| {
             records.frontier_pending = records.frontier_pending.checked_sub(1)?;
             Some(())
         }) {
+            // Failed accounting cannot certify this constructor as fully observed.
             return None;
         }
         self.installed = true;
@@ -483,24 +539,31 @@ impl FrontierResourceRegistration {
 }
 #[cfg(feature = "paged-shaping-frontier")]
 impl Drop for FrontierResourceRegistration {
+    /// Keep failed/uninstalled construction visibly uncovered rather than
+    /// fabricating that no child resource could have been allocated.
     fn drop(&mut self) {
         if !self.installed {
             self.scope
                 .0
                 .frontier_unobserved
                 .store(true, Ordering::Release);
-        } // pending及缺口均不恢复；这是观察失败，不能由别的成功Frontier补证。
+        }
+        // Pending/gap facts are not restored by another successful frontier;
+        // they describe this original constructor's missing observation.
     }
 }
 
-/// 原Job先真实析构，后面的claim才结算；移动整个wrapper不会拆散这项顺序义务。
+/// Drop the actual job before its following claim settles. Moving this wrapper
+/// together preserves that field-destruction order.
 pub(super) struct ShapeResourceOwner {
     job: MarkdownShapingJob,
     _claim: Option<ShapeResourceClaim>,
 }
 impl ShapeResourceOwner {
+    /// Retain a real job together with its sole existing or newly acquired claim.
     pub(super) fn new(job: MarkdownShapingJob, scope: &ComposerResourceScope) -> Self {
-        // Frontier在实际child内已经前置登记时移交同一claim；外层不再把一个Job计两次。
+        // A frontier child may already own its pre-construction claim. Do not
+        // register that same actual job a second time in the outer wrapper.
         let claim = if job.has_composer_resource_scope(scope) {
             None
         } else {
@@ -521,12 +584,14 @@ impl std::ops::DerefMut for ShapeResourceOwner {
     }
 }
 
-/// cluster构造成功即包住实际owner；后继任何?失败也不会在索引Drop前错误结算。
+/// Wrap the actual cluster owner immediately after construction. Later failure
+/// cannot settle its observation before the index itself has been destroyed.
 pub(super) struct ClusterResourceOwner {
     index: MarkdownGlyphClusterIndex,
     _claim: Option<ClusterResourceClaim>,
 }
 impl ClusterResourceOwner {
+    /// Keep optional observation after its actual index in destruction order.
     pub(super) fn new(
         index: MarkdownGlyphClusterIndex,
         scope: Option<&ComposerResourceScope>,
@@ -550,20 +615,24 @@ impl std::ops::DerefMut for ClusterResourceOwner {
     }
 }
 
-/// 此claim必须在真实Job之后析构；未来内部hook也只能移交它，不能手动签“成功”。
+/// Destroy this claim after its real job. Child integration may transfer the
+/// original claim but cannot manually certify successful resource return.
 pub(crate) struct ShapeResourceClaim {
     scope: ComposerResourceScope,
     observer: MarkdownShapingResourceObserver,
     registered: bool,
 }
 impl ShapeResourceClaim {
+    /// Compare original scope identity without inspecting or retaining the child payload.
     pub(crate) fn belongs_to(&self, scope: &ComposerResourceScope) -> bool {
         Arc::ptr_eq(&self.scope.0, &scope.0)
     }
 }
 impl Drop for ShapeResourceClaim {
+    /// Settle from the actual original job's observation after its owner has ended.
     fn drop(&mut self) {
         if !self.registered {
+            // Failed registration carries no valid accounting transition to settle.
             return;
         }
         let actual = self.observer.snapshot();
@@ -596,7 +665,9 @@ impl Drop for ShapeResourceClaim {
             value.access_uncertified |= !actual.shaper_access_certified;
             records.shapes = value;
             Some(())
-        }); // 单Job退场不能要求共享Font/Source payload已释放；最后owner由固定源票另核。
+        });
+        // One job ending does not require shared font/Source payloads to end.
+        // Their actual final owners are checked through separate original observations.
     }
 }
 
@@ -606,8 +677,10 @@ pub(super) struct ClusterResourceClaim {
     registered: bool,
 }
 impl Drop for ClusterResourceClaim {
+    /// Merge actual final cluster storage facts without retaining its per-item observer.
     fn drop(&mut self) {
         if !self.registered {
+            // Observation was already invalidated before a valid claim was installed.
             return;
         }
         let actual = self.observer.snapshot();
@@ -640,8 +713,10 @@ pub(super) struct ResolveResourceClaim {
     registered: bool,
 }
 impl Drop for ResolveResourceClaim {
+    /// Settle actual completed selector jobs only after their resource owner has dropped.
     fn drop(&mut self) {
         if !self.registered {
+            // No successfully registered owner exists for this accounting transition.
             return;
         }
         let actual = self.observer.snapshot();

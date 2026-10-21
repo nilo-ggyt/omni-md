@@ -1,6 +1,6 @@
-//! 目录交付的纯权限门禁；Native阶段前后使用同一固定任务和输入票据。
+//! Pure directory-delivery admission preserves the original task and input ticket across native phases.
 
-/// policy属于整个pager续页链；错误重选不能在后续Next偷偷恢复自动打开。
+/// One policy spans the whole pager chain; later Next actions cannot restore auto-open after an error requires reselection.
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 pub(super) enum NativeMarkdownBrowseCompletionPolicy {
     #[default]
@@ -9,14 +9,15 @@ pub(super) enum NativeMarkdownBrowseCompletionPolicy {
 }
 
 impl NativeMarkdownBrowseCompletionPolicy {
-    /// 无正文不是自动选择的充分条件，失败后必须保留用户确认当前文件的机会。
+    /// An empty editor alone does not permit auto-selection; failure must leave the user able to confirm the current file.
     pub(super) fn permits_auto_open(self) -> bool {
         matches!(self, Self::OpenFirstIfEmpty)
     }
 
-    /// 每一页都沿用同一提示；空结果也不把未核验文件误称“库为空”。
+    /// Preserve the same status on every page; an empty result cannot label unverified files as an empty vault.
     pub(super) fn empty_message(self, actually_empty: bool) -> &'static str {
         match self {
+            // Reselection owns its error context regardless of whether this particular page has rows.
             Self::RequireReselection => "请从目录重新选择笔记，并核对当前文件状态",
             Self::OpenFirstIfEmpty if actually_empty => "这里还没有 Markdown 笔记",
             Self::OpenFirstIfEmpty => "请选择笔记，或继续查看更多笔记",
@@ -24,6 +25,7 @@ impl NativeMarkdownBrowseCompletionPolicy {
     }
 }
 
+/// Copied generation and intent identify the original browse request without retaining its page payload or native owner.
 #[derive(Clone, Copy)]
 pub(super) struct NativeMarkdownBrowseTicket {
     pub(super) generation: u64,
@@ -31,7 +33,7 @@ pub(super) struct NativeMarkdownBrowseTicket {
 }
 
 impl NativeMarkdownBrowseTicket {
-    /// 搜索模式、输入变化、关闭或另一任务任一成立，旧目录只能丢弃自己的载荷。
+    /// Search mode, changed input, close, or a replacement task revokes the old page's publication authority.
     pub(super) fn accepts(
         self,
         generation: u64,
@@ -57,7 +59,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    /// 代次各自相同仍不足以通过其他维度；也覆盖getter/setter重入后的B意图。
+    /// Matching one generation is insufficient; getter/setter reentry that creates a new intent must also revoke old delivery.
     #[test]
     fn old_directory_ticket_cannot_cross_search_refresh_input_or_close_boundaries() {
         let ticket = NativeMarkdownBrowseTicket {
@@ -73,20 +75,21 @@ mod tests {
             (7, 11, None, false, false),
             (7, 11, Some(11), false, true),
         ] {
-            // 模式或意图变化不能用新的scalar重新贴到旧payload上继续安装。
+            // A changed mode or intent cannot be relabeled onto an old payload to continue installation.
             assert!(!ticket.accepts(state.0, state.1, state.2, state.3, state.4));
         }
     }
 
+    /// Synthetic Drop accounting observes mailbox ownership only, without representing a native resource graph.
     struct Payload(Arc<AtomicUsize>);
     impl Drop for Payload {
         fn drop(&mut self) {
-            // 纯计数证明取消在通知执行前已经销毁旧载荷，不涉及Native对象。
+            // Count the synthetic payload's destruction before notification, without claiming native-object release.
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
-    /// 正在显示的B邮箱不会被旧A结果/错误取消；close同步排空且迟到worker不能再publish。
+    /// Cancelling an old mailbox cannot affect its replacement; late publication must discard only its own payload.
     #[test]
     fn directory_to_search_cancellation_releases_old_payload_without_touching_new_mailbox() {
         let dropped = Arc::new(AtomicUsize::new(0));
@@ -108,9 +111,10 @@ mod completion_policy_tests {
     use super::NativeMarkdownBrowseCompletionPolicy as Policy;
 
     #[test]
-    /// 错误重选policy跨所有续页保持，空页/有笔记页都不能自动开文档或抹去错误提示。
+    /// Reselection persists across pages; neither empty nor populated results may auto-open or erase failure status.
     fn failure_reselection_is_explicit_on_all_pages_including_empty_result() {
         for actually_empty in [false, true] {
+            // Actual emptiness cannot override the original operation's reselection requirement.
             let policy = Policy::RequireReselection;
             assert!(!policy.permits_auto_open());
             assert_eq!(

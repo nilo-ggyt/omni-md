@@ -1,4 +1,5 @@
-//! 四 MiB 合成文稿中的同一代码段跨视口编辑；整篇只按固定栈片核对，不构造全文字符串。
+//! Edit the same code paragraph across viewports in a four-MiB synthetic document; verify it in fixed
+//! stack chunks without a full-document string.
 
 use super::*;
 use objc2::runtime::ProtocolObject;
@@ -16,7 +17,8 @@ const TAIL_REPEATS: usize = (4 * 1024 * 1024) / TAIL.len();
 const INSERTED: &str = "跨视口修复 alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
 const TARGET: usize = HEADER.len() + UNIT.len() * REPEATS;
 
-/// 只逐个固定片段写入本轮自有临时文件；原文与尾部都不会聚合成内存中的完整文稿。
+/// Write fixed segments to this owned temporary file without aggregating either body or tail into a
+/// complete in-memory document.
 fn fixture() -> Result<tempfile::NamedTempFile, String> {
     let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
     file.write_all(HEADER.as_bytes())
@@ -41,7 +43,8 @@ fn fixture() -> Result<tempfile::NamedTempFile, String> {
     Ok(file)
 }
 
-/// 独立预期来自上方固定生成规则；逐个 UTF16 对照不会从编辑结果反算期望字符。
+/// Independent UTF-16 expectations follow the fixed construction above, without deriving expected
+/// characters from edited output.
 fn expected(index: usize, replacement: &[u16]) -> u16 {
     if index < HEADER.len() {
         return u16::from(HEADER.as_bytes()[index]);
@@ -64,9 +67,10 @@ fn expected(index: usize, replacement: &[u16]) -> u16 {
     u16::from(TAIL.as_bytes()[(index - CLOSE.len()) % TAIL.len()])
 }
 
-/// 实际 canonical 的每个 UTF16 unit 都核对；长度同时保证没漏掉尾部和原 UTF8 编码。
+/// Check every canonical UTF-16 unit; independent byte/unit lengths also detect omitted tails or
+/// changed UTF-8 encoding.
 fn check(rig: &Rig, replacement: &str) -> Result<(), String> {
-    let replacement_units: Vec<_> = replacement.encode_utf16().collect(); // 只保这一次有限新增输入。
+    let replacement_units: Vec<_> = replacement.encode_utf16().collect(); // Retain this bounded replacement input only.
     let utf16 = TARGET
         + replacement_units.len()
         + UNIT.len() * REPEATS
@@ -97,7 +101,8 @@ fn check(rig: &Rig, replacement: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 独立核原磁盘文件仍是合成输入；编辑、撤销与重做不能无指令写回或者破坏未保存源。
+/// Independently verify the synthetic disk source remains unchanged through editing, undo, and redo
+/// without an explicit save.
 fn disk_unchanged(rig: &Rig) -> Result<(), String> {
     let mut file = std::fs::File::open(rig._file.path()).map_err(|cause| cause.to_string())?;
     let mut scratch = [0; 64];
@@ -128,7 +133,8 @@ fn disk_unchanged(rig: &Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 真正远端 Find 必须交付实际 CPU 帧和目标可见收据；不拿 canonical 选择代替视口成功。
+/// Distant Find must deliver an actual CPU frame and target-visibility receipt; canonical selection
+/// alone proves no viewport success.
 fn find(rig: &mut Rig) -> Result<(), String> {
     rig.bar.query.setStringValue(&NSString::from_str(LABEL));
     let frame = observe(&rig.body)?;
@@ -166,7 +172,8 @@ fn find(rig: &mut Rig) -> Result<(), String> {
     rig.remember_receipt()
 }
 
-/// 同一个原生输入入口修改跨视口段落，再沿真实命令撤销重做；不直接改文稿或伪造编辑完成。
+/// Edit the cross-viewport paragraph through the actual Native input API, then undo/redo through real
+/// commands without direct document mutation.
 fn exercise(rig: &mut Rig) -> Result<(), String> {
     let initial = rig
         .view
@@ -193,7 +200,8 @@ fn exercise(rig: &mut Rig) -> Result<(), String> {
     let before = rig.view.input_state().map_err(|cause| cause.to_string())?;
     let frame = observe(&rig.body)?;
     let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**rig.view);
-    // SAFETY: 同一主线程实际 client、有限新增字符串与明确的当前目标范围，仍由原 Input 核票并提交。
+    // SAFETY: Use the actual main-thread client, bounded replacement, and current target range;
+    // original Input still validates and commits.
     unsafe {
         client.insertText_replacementRange(&NSString::from_str(INSERTED), NSRange::new(TARGET, 4))
     };
@@ -209,6 +217,8 @@ fn exercise(rig: &mut Rig) -> Result<(), String> {
     }
     check(rig, INSERTED)?;
     rig.remember_receipt()?;
+    // Every history transition must produce its own actual frame and independently match the complete
+    // canonical stream.
     for (selector, replacement, stage) in [
         (sel!(undo:), LABEL, "root_leaf_code_cross_viewport_undo"),
         (sel!(redo:), INSERTED, "root_leaf_code_cross_viewport_redo"),
@@ -236,7 +246,8 @@ fn exercise(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 自有长文只在本轮 Rig 存活；全部字体、文件、映射与像素仍归原严格关闭收据核验。
+/// The owned long document lives with this Rig only; original close receipts still verify actual
+/// font/file/mapping/pixel release.
 pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, publication, result) = autoreleasepool(|_| -> Result<_, String> {
         let file = fixture()?;
@@ -255,10 +266,10 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
             .body
             .probe_root_leaf_publication()
             .map_err(|cause| cause.to_string());
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, publication, result))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     if publication?.upgrade().is_some() {
         return Err("跨视口长文退出后原有限语义仍被强持有".into());
     }

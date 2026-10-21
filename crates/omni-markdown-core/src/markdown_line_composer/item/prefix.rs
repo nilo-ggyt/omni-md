@@ -1,13 +1,16 @@
-//! 原Script/GCB稳定前缀的按需衔接；开放范围不替代真实paragraph或完整依赖状态。
+//! Join original stable script/grapheme prefixes on demand. An open interval
+//! cannot substitute for real paragraph authority or completed dependencies.
 use super::*;
 use crate::markdown_scripts::{MarkdownScriptPrefixAnswer, MarkdownScriptPrefixKind};
 
-/// 仅完整Uniform无控制证明允许本轮开放Script；GCB和字体仍分别核验。
+/// Permit an open script query only through complete uniform control-free proof;
+/// grapheme and font authority still require their own independent checks.
 pub(super) fn unicode_prefix_allowed(
     payload: &Payload,
     authority: &MarkdownLayoutTextAuthority,
 ) -> Result<bool> {
     if !payload.frontier_enabled {
+        // Nonfrontier composition retains its existing complete dependency contract.
         return Ok(false);
     }
     let bidi = payload
@@ -23,10 +26,12 @@ pub(super) fn unicode_prefix_allowed(
         .is_some())
 }
 
-/// 一个起点最多保一份固定坐标探针；各元数据查询独占一量子，quota1也不偷做后继查询。
+/// Retain one finite coordinate probe per start. Each metadata query occupies
+/// its own quantum, including when a one-unit budget cannot pay for a later query.
 pub(super) struct OpenPrefixProbe {
     run: crate::MarkdownScriptRun,
-    // 新多段的开放准备至少累计到原闭项额度或真实B端点，不能以最早两个GCB反复试Font。
+    // For prepared multi-paragraph input, accumulate through the original closed
+    // item allowance or real bidi endpoint before repeatedly probing fonts on tiny prefixes.
     through: usize,
     paragraph_end: Option<usize>,
     end: Option<crate::MarkdownGraphemeBoundary>,
@@ -34,7 +39,8 @@ pub(super) struct OpenPrefixProbe {
     phase: u8,
 }
 
-/// 返回原Script事实与是否开放；未知只请求原子任务下一量子，不扫描临时子串。
+/// Return original script facts while retaining open/closed scope separately.
+/// Unknown coverage requests the original dependency's next step, not a substring scan.
 pub(super) fn script_at(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
@@ -51,8 +57,9 @@ pub(super) fn script_at(
                 payload.cursor..payload.cursor.saturating_add(1),
             )?;
         if let Some(span) = span {
-            // 原整形计划已要求真实闭项；同Script只证明原Latn上下文到同源B正文末端。
-            // 非EOF仍真实消费B/CRLF自然闭合，绝不以当前256准备终点封闭SCX。
+            // The shaping plan requested actual closure. Reuse the original Latin
+            // suffix proof through this Source's bidi content end; non-EOF B/CRLF
+            // still closes naturally rather than treating a 256-unit preparation cap as SCX end.
             payload.scripts.prepare_ascii_suffix(
                 authority,
                 payload.cursor,
@@ -62,22 +69,29 @@ pub(super) fn script_at(
         }
     }
     if !allowed || payload.closed_script_at == Some(payload.cursor) {
+        // Without open-prefix authority, consume only the actual complete run;
+        // pending data requests source work without advancing item coordinates.
         return match payload
             .scripts
             .run_at(authority, MarkdownScriptUnit::Utf16, payload.cursor)?
         {
             MarkdownScriptAnswer::Known(Some(run)) => {
+                // A genuinely completed run consumes the one pending close request.
                 payload.closed_script_at = None;
                 Ok(Some(run))
             }
             MarkdownScriptAnswer::Pending => {
+                // Keep the cursor unchanged and let a separately charged script step progress.
                 payload.script_source_demand = true;
                 Ok(None)
             }
+            // A missing run at a nonterminal item position is inconsistent coverage.
             _ => Err(MarkdownLineComposeError::InconsistentCoverage),
         };
     }
     if payload.open_probe.is_none() {
+        // Obtain only one original stable-prefix fact before any grapheme query;
+        // the following phases retain that exact run rather than recapturing current state.
         let (run, open) = match payload.scripts.stable_prefix_at(
             authority,
             MarkdownScriptUnit::Utf16,
@@ -88,14 +102,17 @@ pub(super) fn script_at(
                 prefix.kind()? == MarkdownScriptPrefixKind::StableOpenPrefix,
             ),
             MarkdownScriptPrefixAnswer::Pending => {
+                // No stable original coverage exists yet; request the real script dependency.
                 payload.script_source_demand = true;
                 return Ok(None);
             }
             MarkdownScriptPrefixAnswer::Known(None) => {
+                // The current nonterminal cursor requires a real script run.
                 return Err(MarkdownLineComposeError::InconsistentCoverage);
             }
         };
         if !open {
+            // Naturally closed script coverage needs no additional open-prefix probe.
             return Ok(Some(run));
         }
         let paragraph_end = if payload
@@ -120,8 +137,10 @@ pub(super) fn script_at(
             .map(|end| end.min(payload.cursor.saturating_add(closed_item::MAX_CLOSED_UTF16)))
             .unwrap_or(payload.cursor);
         if run.end_utf16 < through {
+            // The preparation target may need several original source quanta;
+            // it grants neither a script boundary nor permission to probe fonts yet.
             payload.script_source_demand = true;
-            return Ok(None); // 原Script续体仍按调用方量子推进；准备目标不是SCX或Font边界。
+            return Ok(None);
         }
         payload.open_probe = Some(OpenPrefixProbe {
             run,
@@ -131,7 +150,9 @@ pub(super) fn script_at(
             first: None,
             phase: 0,
         });
-        return Ok(None); // 本量子只读原Script目录；下一量子再读取GCB覆盖事实。
+        // This quantum consumed only the original script directory. Grapheme
+        // coverage must be queried in a subsequent independently charged step.
+        return Ok(None);
     }
     let probe = payload
         .open_probe
@@ -139,12 +160,15 @@ pub(super) fn script_at(
         .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
     match probe.phase {
         0 => {
+            // Read committed original grapheme coverage and cap it by the exact
+            // stable script run; neither directory may enlarge the other's proof.
             let facts = payload.breaks.grapheme_prefix_facts(authority)?;
             let Some(boundary) = facts
                 .last_committed_boundary
                 .filter(|value| value.utf16 > payload.cursor && value.utf16 >= probe.through)
             else {
-                // 用真实Next留下GCB需求的工作留给下一量子，不能从GB2坐标推记录。
+                // Leave actual Next-demand generation to another quantum;
+                // GB2 coordinates alone cannot manufacture a committed record.
                 probe.phase = 1;
                 return Ok(None);
             };
@@ -159,6 +183,8 @@ pub(super) fn script_at(
             probe.phase = 1;
         }
         1 => {
+            // Obtain a real following grapheme, or demand enough original
+            // grapheme coverage to reach the existing preparation target.
             if probe.end.is_none() && probe.through > payload.cursor {
                 match payload.breaks.grapheme_query(
                     authority,
@@ -168,7 +194,9 @@ pub(super) fn script_at(
                     MarkdownGraphemeAnswer::Known(_) => probe.phase = 0,
                     MarkdownGraphemeAnswer::Pending => {}
                 }
-                return Ok(None); // 真实Next可跨长GCB/CRLF；未知末端只推进原GCB，不伪签准备目标。
+                // Real Next may cross a long cluster or CRLF. Pending advances
+                // only the original grapheme job, never certifies the target offset.
+                return Ok(None);
             }
             match payload.breaks.grapheme_query(
                 authority,
@@ -184,6 +212,8 @@ pub(super) fn script_at(
             }
         }
         2 => {
+            // The original first and next grapheme establish a complete support
+            // interval before publishing any shortened stable script prefix.
             let first = probe
                 .first
                 .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
@@ -200,7 +230,8 @@ pub(super) fn script_at(
                 .end
                 .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
             if second.utf16 > end.utf16 {
-                // SCX范围短于完整支持域；推进原Script后重新取得证明，不擅自扩大旧范围。
+                // Script coverage is shorter than the complete support interval.
+                // Advance its original job and reacquire proof without enlarging this run.
                 payload.open_probe = None;
                 payload.script_source_demand = true;
                 return Ok(None);
@@ -212,17 +243,21 @@ pub(super) fn script_at(
                 .paragraph_end
                 .is_none_or(|paragraph_end| bounded.end_utf16 < paragraph_end);
             payload.open_probe = None;
-            // 稳定SCX已覆盖真实B端点时，原ItemScan可由该段/内联控制自然封闭；
-            // 仅达到准备额度仍是开放范围，不能进入ClosedItem或制造字体边界。
+            // Stable SCX through the real bidi endpoint allows later natural
+            // paragraph/control closure. Merely reaching the preparation allowance
+            // stays open and grants no ClosedItem or font-boundary authority.
             payload.open_script = open;
             return Ok(Some(bounded));
         }
+        // Only the three actual probe phases can interpret the retained original facts.
         _ => return Err(MarkdownLineComposeError::InconsistentCoverage),
     }
     Ok(None)
 }
 
 impl MarkdownLineItemCoordinator {
+    /// Consume only the original break job's actual grapheme demand after this
+    /// caller's preceding quantum has ended.
     pub(in crate::markdown_line_composer) fn take_grapheme_demand(&mut self) -> Result<bool> {
         let result = (|| {
             self.guard()?;
@@ -237,7 +272,8 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
-    /// GCB查询阻塞后只推进原GCB。原LB、Script、消费者游标均保留，预算不重复使用。
+    /// After grapheme demand, advance only the original grapheme dependency;
+    /// preserve line-break/script/caller cursors without spending the same budget twice.
     pub(in crate::markdown_line_composer) fn advance_pending_graphemes(
         &mut self,
         budget: MarkdownLineComposeBudget,
@@ -245,6 +281,8 @@ impl MarkdownLineItemCoordinator {
         self.advance_pending_break_dependency(budget, true)
     }
 
+    /// Advance the selected original break dependency under the existing
+    /// frontier/paragraph authority and one actual source-work quantum.
     pub(super) fn advance_pending_break_dependency(
         &mut self,
         budget: MarkdownLineComposeBudget,
@@ -264,9 +302,12 @@ impl MarkdownLineItemCoordinator {
                         .is_some_and(MarkdownBidiParagraph::uses_prepared_paragraphs)
                     && !unicode_prefix_allowed(payload, &self.authority)?)
             {
+                // Pending alone cannot grant prefix mode to a coordinator whose
+                // original full-dependency or paragraph prerequisites are absent.
                 return Err(MarkdownLineComposeError::InvalidRequest);
             }
-            // 原B控制符与尾空段也可推进真实等待的依赖；各查询仍独立保Pending和原Source票。
+            // Real bidi controls and trailing empty paragraphs may also demand
+            // work; each query keeps its own Pending state and original Source ticket.
             let progress = payload.breaks.step_dependency(
                 &self.authority,
                 grapheme,
@@ -290,6 +331,8 @@ impl MarkdownLineItemCoordinator {
         self.finish(result)
     }
 
+    /// Consume the current script demand through the same original script job;
+    /// report its actual work without moving any item's source cursor.
     pub(super) fn advance_pending_scripts(
         &mut self,
         budget: MarkdownLineComposeBudget,

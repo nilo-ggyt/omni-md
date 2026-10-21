@@ -1,4 +1,5 @@
-//! 活帧内的封存像素比较；哈希只预筛，最终身份替换必须逐格式、色表及有效字节相等。
+//! Compare sealed pixels within the live frame; reuse requires matching format, palette, and active
+//! bytes after hash prefiltering.
 
 use super::super::*;
 use super::{Plan, PreparedImage, project_row};
@@ -6,10 +7,13 @@ use super::{Plan, PreparedImage, project_row};
 const FINGERPRINT_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FINGERPRINT_PRIME: u64 = 0x100_0000_01b3;
 
-/// 新RGBA已实际只读，按原编码核每个有效byte；只保一行，不申请压缩映射。
-/// miss多一次有限行投影，但不增加任何Source读取、glyph或Native调用配额。
+/// Project actual read-only RGBA into its planned encoding, keeping one stack row instead of allocating
+/// an encoded mapping.
+/// A miss adds one bounded row projection, without additional Source reads, glyph work, or Native call
+/// quota.
 pub(super) fn projection_fingerprint(prepared: &PreparedImage) -> Result<Option<u64>, PixelError> {
-    // 投影只借固定瓦片行空间；越界不切片，由原编码路径负责原有结果与错误。
+    // Use the fixed tile-row capacity only; unsupported geometry stays with the existing encoding path
+    // and its errors.
     if prepared.width > 512
         || prepared.height > 512
         || !matches!(
@@ -30,7 +34,8 @@ pub(super) fn projection_fingerprint(prepared: &PreparedImage) -> Result<Option<
     Ok(Some(fingerprint))
 }
 
-/// 构造参数与原CGImage对应；配对mask还记录Native解释模式，禁止同bytes跨合成语义复用。
+/// Record the original CGImage encoding; paired masks include Native blend interpretation so equal
+/// bytes cannot cross blend semantics.
 #[derive(Clone, Eq, PartialEq)]
 pub(in crate::native_surface::viewport_pixels) enum Format {
     Rgba,
@@ -40,7 +45,8 @@ pub(in crate::native_surface::viewport_pixels) enum Format {
     PairedMask(MaskPairBlend),
 }
 
-/// 仅保原provider已持的同一只读映射；不复制像素、解码图像、保Scene或建立跨会话缓存。
+/// Retain the original read-only mapping used by the provider, without pixel copies, decoded images,
+/// Scenes, or a cross-session cache.
 #[derive(Clone)]
 pub(in crate::native_surface::viewport_pixels) struct SealedPixels {
     allocation: Arc<PixelAllocation>,
@@ -52,8 +58,10 @@ pub(in crate::native_surface::viewport_pixels) struct SealedPixels {
 }
 
 impl SealedPixels {
-    /// 只接受已结束context的实际编码页；先真实改为只读，再记录本次编码的格式和有效字节。
-    /// 此事实尚不代表CGImage已创建，也不授予Source/Scene权限；允许在建provider前比较原活帧。
+    /// Accept actual encoded pages only after all contexts end, make them read-only, and record their
+    /// format and active bytes.
+    /// This certifies neither CGImage creation nor Source/Scene authority; comparison may precede
+    /// provider construction.
     pub(super) fn new(
         allocation: Arc<PixelAllocation>,
         width: usize,
@@ -73,7 +81,7 @@ impl SealedPixels {
             Format::NeutralMask | Format::PairedMask(_) => 1,
         };
         if allocation.active_contexts.load(Ordering::Acquire) != 0 {
-            return Err(PixelError::ContextRetained); // 不能以未完成绘图的可写页签发可比较只读视图。
+            return Err(PixelError::ContextRetained); // An unfinished drawing context cannot issue a comparable read-only view of its writable pages.
         }
         if width == 0
             || height == 0
@@ -97,7 +105,8 @@ impl SealedPixels {
             format,
             fingerprint: 0,
         };
-        // 只对同一真实封存映射有效像素作一次有限哈希；padding不参与内容判断，仍完整计入实际页账。
+        // Hash active bytes of this sealed mapping once; exclude row padding from content identity
+        // while retaining its full allocation accounting.
         let mut fingerprint = FINGERPRINT_OFFSET;
         result.visit(|bytes| {
             for byte in bytes {
@@ -108,8 +117,10 @@ impl SealedPixels {
         Ok(result)
     }
 
-    /// 旧页只来自SealedPixels::new的真实只读映射，Arc保活整个逐行比较。
-    /// 哈希只跳过不可能的候选；命中还必须同stride/格式/完整色表及每个有效byte相等。
+    /// The old pages came from the actual read-only seal in new; their Arc remains alive throughout row
+    /// comparison.
+    /// The hash eliminates impossible matches only; reuse still requires equal stride, format, full
+    /// palette, and every active byte.
     pub(in crate::native_surface::viewport_pixels) fn matches_projection(
         &self,
         prepared: &PreparedImage,
@@ -151,8 +162,10 @@ impl SealedPixels {
         let mut line = [0; 512 * 3];
         for y in 0..prepared.height {
             let active = project_row(prepared, y, &mut line)?;
-            // SAFETY: 本SealedPixels构造时已核width/height/stride完整覆盖，且未再开放写入。
-            // 只比较本行有效编码字节，padding不伪装像素，页账仍保全部实际舍入长度。
+            // SAFETY: Construction verified full width/height/stride coverage, and this mapping has not
+            // been reopened for writing.
+            // Compare active encoded bytes only; padding is not pixel content but remains part of the
+            // actual rounded page accounting.
             let previous = unsafe {
                 std::slice::from_raw_parts(
                     self.allocation
@@ -170,7 +183,8 @@ impl SealedPixels {
         Ok(true)
     }
 
-    /// 返回true只表示两个不可变编码相等；不能签当前Source、Scene、几何、Native关系或Ready。
+    /// True certifies equal immutable encodings only, without current Source, Scene, geometry, Native
+    /// relationship, or Ready authority.
     pub(in crate::native_surface::viewport_pixels) fn identical(&self, other: &Self) -> bool {
         if self.width != other.width
             || self.height != other.height
@@ -178,12 +192,14 @@ impl SealedPixels {
             || self.format != other.format
             || self.fingerprint != other.fingerprint
         {
-            return false; // 哈希相同仍没有通过，任何尺寸、stride、色表、alpha或decode表示差异先拒绝。
+            return false; // Matching hashes cannot override differences in dimensions, stride, palette, alpha, or decode interpretation.
         }
         let active = self.width * self.bytes_per_pixel();
         for y in 0..self.height {
-            // SAFETY: 两个SealedPixels都来自真实seal，Arc保同一只读映射；new已核每行覆盖，
-            // 纯循环内无Native/current回调，也没有可写或逃逸slice。
+            // SAFETY: Both values came from actual seals; each Arc retains its read-only mapping with
+            // row coverage checked by new.
+            // This comparison performs no Native/current callbacks and exposes no writable or escaping
+            // slices.
             let (left, right) = unsafe {
                 (
                     std::slice::from_raw_parts(
@@ -206,12 +222,13 @@ impl SealedPixels {
                 )
             };
             if left != right {
-                return false; // 哈希碰撞不能授权复用；任一真实有效byte不同都保新图像。
+                return false; // A hash collision cannot authorize reuse; retain the new image whenever any actual active byte differs.
             }
         }
         true
     }
 
+    /// Match the original allocation ledger by Arc identity, independently of encoded content equality.
     pub(in crate::native_surface::viewport_pixels) fn belongs_to(
         &self,
         counters: &Arc<NativeMarkdownViewportPixels>,
@@ -219,11 +236,14 @@ impl SealedPixels {
         Arc::ptr_eq(&self.allocation.counters, counters)
     }
 
-    /// 仅核同一实际页账；旧帧全部plane都须属于本候选，不能靠相等字节借外会话provider。
+    /// Require the same actual allocation ledger for every old plane; equal bytes cannot borrow another
+    /// session provider.
     pub(in crate::native_surface::viewport_pixels) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.allocation.counters, &other.allocation.counters)
     }
 
+    /// Preserve the actual ledger's sticky unmapping failure even when this particular tile compares
+    /// equal.
     pub(in crate::native_surface::viewport_pixels) fn release_failed(&self) -> bool {
         self.allocation
             .counters
@@ -231,6 +251,7 @@ impl SealedPixels {
             .load(Ordering::Acquire)
     }
 
+    // The sealed format determines active row width; row padding is never interpreted as another pixel.
     fn bytes_per_pixel(&self) -> usize {
         match self.format {
             Format::Rgba => 4,
@@ -239,10 +260,12 @@ impl SealedPixels {
         }
     }
 
+    // Lend one active row at a time from the original mapping, with no whole-image allocation.
     fn visit(&self, mut visitor: impl FnMut(&[u8])) {
         let active = self.width * self.bytes_per_pixel();
         for y in 0..self.height {
-            // SAFETY: 同上，映射已封存且被本Arc保活；一次只交付本行有效字节，visitor不获所有权。
+            // SAFETY: This Arc retains the sealed mapping; lend only the current active row, without
+            // transferring ownership to the visitor.
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     self.allocation
@@ -268,7 +291,8 @@ mod tests {
         first_byte: u8,
     ) -> (CFRetained<CGImage>, SealedPixels) {
         let allocation = allocate(32 * 32, Arc::clone(resources), None).unwrap();
-        // SAFETY: 新独占映射覆盖32²A8，尚无context/provider；直接生成有限非恒定mask源。
+        // SAFETY: The new exclusive mapping covers 32x32 A8 with no context/provider; write a bounded,
+        // nonconstant mask source.
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(allocation.address.as_ptr().cast::<u8>(), 32 * 32)
         };
@@ -278,7 +302,7 @@ mod tests {
         bytes[0] = first_byte;
         let image = seal_neutral_mask(&allocation, 32, 32, 32).unwrap();
         let storage = SealedPixels::new(allocation, 32, 32, 32, Format::PairedMask(blend)).unwrap();
-        (image, storage) // 只构造真实CGImage存储比较对象，不伪造校准票、SealedTile或Ready。
+        (image, storage) // Construct actual CGImage storage comparison values, without calibration tickets, SealedTiles, or Ready authority.
     }
 
     #[test]
@@ -301,7 +325,7 @@ mod tests {
                 assert_eq!(left.fingerprint, right.fingerprint);
                 assert_eq!(left.identical(&right), left_blend == right_blend);
                 drop((left_image, right_image));
-                assert_eq!(observer.snapshot().live_pixel_buffers, 2); // 存储还实际持原映射，不能因provider归还就记零。
+                assert_eq!(observer.snapshot().live_pixel_buffers, 2); // Storage still retains the mappings after provider release; actual live allocations cannot yet be zero.
                 drop((left, right));
                 assert!(observer.is_released());
             }
@@ -318,7 +342,7 @@ mod tests {
             let observer = resources.observer();
             let (left_image, left) = sealed_mask(&resources, blend, 0);
             let (right_image, mut right) = sealed_mask(&resources, blend, 1);
-            right.fingerprint = left.fingerprint; // 只在测试制造hash碰撞，两个真实只读映射仍有一个有效byte不同。
+            right.fingerprint = left.fingerprint; // This existing test forces a hash collision while the actual read-only mappings still differ in one active byte.
             assert!(!left.identical(&right));
             drop((left_image, right_image, left, right));
             assert!(observer.is_released());
@@ -333,7 +357,8 @@ mod tests {
         let row = 32 * 4;
         let allocation = allocate(row * 32, Arc::clone(resources), None).unwrap();
         for y in 0..32 {
-            // SAFETY: 测试刚取得唯一私有可写分配，未创建任何context或provider；写完后走真实encoding seal。
+            // SAFETY: The test exclusively owns this writable allocation with no context/provider;
+            // subsequent encoding performs the real seal.
             let pixels = unsafe {
                 std::slice::from_raw_parts_mut(
                     allocation.address.as_ptr().cast::<u8>().add(y * row),
@@ -365,7 +390,7 @@ mod tests {
         let mut right = encoded(&resources, false, 1);
         assert!(matches!(left.storage.format, Format::Rgba));
         assert!(matches!(right.storage.format, Format::Rgba));
-        right.storage.fingerprint = left.storage.fingerprint; // 仅私有测试制造碰撞，真实只读像素仍保持不同。
+        right.storage.fingerprint = left.storage.fingerprint; // This existing test forces a collision while retaining different actual read-only pixels.
         assert!(!left.storage.identical(&right.storage));
         drop((left, right));
         assert!(observer.is_released());
@@ -391,14 +416,15 @@ mod tests {
     ) -> super::super::EncodedImage {
         let row = 32 * 4;
         let allocation = allocate(row * 32, Arc::clone(resources), None).unwrap();
-        // SAFETY: 新独占测试映射覆盖32²RGBA，尚无context或provider；逐像素写入超过256个opaque颜色。
+        // SAFETY: This exclusive 32x32 RGBA test mapping has no context/provider; write more than 256
+        // opaque colors.
         let pixels = unsafe {
             std::slice::from_raw_parts_mut(allocation.address.as_ptr().cast::<u8>(), row * 32)
         };
         for (index, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             *pixel = [(index % 32) as u8, (index / 32) as u8, 0, 255];
         }
-        pixels[row * 32 - 2] = delta; // 最后一个有效蓝色byte变化，必须进入RGB24的实际行比较。
+        pixels[row * 32 - 2] = delta; // The final active blue byte changes and must participate in actual RGB24 row comparison.
         super::super::finish(allocation, 32, 32, row).unwrap()
     }
 
@@ -411,7 +437,7 @@ mod tests {
         assert!(matches!(left.storage.format, Format::Rgb24));
         assert!(matches!(right.storage.format, Format::Rgb24));
         assert_eq!(CGImage::bits_per_pixel(Some(&left.image)), 24);
-        right.storage.fingerprint = left.storage.fingerprint; // 私有测试仅强制哈希碰撞，不修改原只读存储。
+        right.storage.fingerprint = left.storage.fingerprint; // This existing test forces only the hash collision, without changing read-only storage.
         assert!(!left.storage.identical(&right.storage));
         drop((left, right));
         assert!(observer.is_released());

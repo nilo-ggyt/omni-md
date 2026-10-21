@@ -1,8 +1,8 @@
-//! 原 Source 菜单和行号动作沿唯一输入链改变有限 fold 锚点，不创建文字或 Undo 事务。
+//! Existing Source menu/gutter actions change bounded fold anchors through the sole input chain without text/Undo transactions.
 
 use super::*;
 
-/// 菜单到队首才取当前行；行号只持同一 Scene 的弱权限值，不保活正文、Reader 或 Native 图。
+/// Resolve menu current-line at queue head; gutter intent holds weak same-Scene authority, retaining no text, reader, or Native graph.
 #[derive(Clone)]
 pub enum NativeMarkdownPagedSourceFoldAction {
     ToggleCurrent,
@@ -14,12 +14,12 @@ pub enum NativeMarkdownPagedSourceFoldAction {
 }
 
 impl NativeMarkdownPagedTextView {
-    /// 原“折叠/展开当前段落”菜单只提交显示意图，菜单到达次序仍由现存输入屏障保留。
+    /// The existing fold/unfold-current menu submits display intent in arrival order through the existing input barrier.
     pub(in crate::native_surface) fn toggle_current_source_fold(&self) -> Result<()> {
         self.perform_source_fold(NativeMarkdownPagedSourceFoldAction::ToggleCurrent)
     }
 
-    /// 行号按已发布 Scene 的实际 canonical 行触发；排队后也不能跨输入或布局发布补签。
+    /// Gutter actions use actual canonical lines from published Scene; queuing cannot renew authority across Input/layout publication.
     pub(in crate::native_surface) fn toggle_source_fold_line(
         &self,
         key: NativeMarkdownPagedSceneKey,
@@ -31,12 +31,12 @@ impl NativeMarkdownPagedTextView {
         })
     }
 
-    /// 原“展开全部”撤有限显示锚点，正文、保存位置和历史游标保持原值。
+    /// Existing Expand All removes bounded display anchors while retaining text, save location, and history cursor.
     pub(in crate::native_surface) fn expand_source_folds(&self) -> Result<()> {
         self.perform_source_fold(NativeMarkdownPagedSourceFoldAction::ExpandAll)
     }
 
-    /// 公开入口先结束真实系统组合，再捕唯一当前输入票；没有另一个折叠焦点或文本客户。
+    /// Public entry completes actual system composition before capturing current Input, without another folding focus/text client.
     fn perform_source_fold(&self, action: NativeMarkdownPagedSourceFoldAction) -> Result<()> {
         self.commit_composition_before_release()?;
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
@@ -45,7 +45,7 @@ impl NativeMarkdownPagedTextView {
         self.source_fold_at(&origin, action)
     }
 
-    /// 原 Native 菜单槽只执行一次；interpret 标记仅属于这个受控队首调用，不借全局 depth。
+    /// Execute the Native menu slot once; interpreted ownership belongs to this controlled queue-head call, not shared depth.
     pub(in crate::native_surface) fn perform_queued_source_fold(
         &self,
         action: NativeMarkdownPagedSourceFoldAction,
@@ -62,8 +62,8 @@ impl NativeMarkdownPagedTextView {
                     .borrow()
                     .clone()
                     .ok_or(NativeMarkdownPagedTextViewError::ContextUnavailable)?;
-                // 已排在前面的key可刚建立组合；接受已显示文字后结束原系统转换，再捕折叠before。
-                // 不让旧IME会话跨fold重发缓冲，原行号key仍须通过下方同Scene权限检查。
+                // An earlier queued key may just have started composition; accept displayed text/end system conversion before capturing fold before-state.
+                // Old IME buffers must not replay across folding; the gutter key still requires the same-Scene authority check below.
                 self.finish_composition_in_context(
                     &origin.input,
                     &origin.delegate,
@@ -77,7 +77,7 @@ impl NativeMarkdownPagedTextView {
         })
     }
 
-    /// 先保到达顺序，再从本步原 Doc/选择求真实行；折叠收据经原 committed 通知使旧图失效。
+    /// Preserve arrival order, then derive the actual line from this document/selection; the fold receipt retires old display through committed.
     fn source_fold_at(
         &self,
         origin: &Origin,
@@ -100,7 +100,7 @@ impl NativeMarkdownPagedTextView {
             NativeMarkdownPagedSourceFoldAction::ToggleLine { key, line } => {
                 if !origin.delegate.scene_current(&key) {
                     return Err(NativeMarkdownPagedTextViewError::FoldAction("正文布局已改变，请重新点击行号".into()));
-                } // 旧行号不随文字编辑猜新的目标；原用户意图已经失去这张 canonical 权限。
+                } // Do not guess a new target after edits; the old gutter intent has lost this canonical authority.
                 origin.input.toggle_fold(&permit, line, &current)
             }
             NativeMarkdownPagedSourceFoldAction::ToggleCurrent => {
@@ -112,8 +112,8 @@ impl NativeMarkdownPagedTextView {
                 let document = original
                     .try_borrow()
                     .map_err(|_| NativeMarkdownPagedInputError::Borrowed)?;
-                // 旧菜单按 NSTextView.selectedRange 的有序起点定位当前行；反向选择、全选也沿此契约，
-                // 不能用有方向 head 把菜单动作移到选择末端或把单个未知方向范围误判为多选。
+                // The original menu locates current line from NSTextView.selectedRange's ordered start, including reversed selection/Select All.
+                // A directed head cannot move the action to selection end, nor can unknown direction alone imply multiple ranges.
                 let start = origin.state.primary_range.location;
                 let line = document.line_for_byte(document.byte_offset_for_utf16(start)?)?;
                 drop(document);
@@ -132,7 +132,7 @@ impl NativeMarkdownPagedTextView {
         self.finish_outcome(origin, outcome)
     }
 
-    /// 原链全部结算后才显示普通业务拒绝；它不会撤销健康正文或已提交后继字符。
+    /// Report ordinary use-case rejection only after the original chain settles, without revoking healthy text or committed successor input.
     pub(in crate::native_surface) fn reject_source_fold(
         &self,
         cause: NativeMarkdownPagedTextViewError,

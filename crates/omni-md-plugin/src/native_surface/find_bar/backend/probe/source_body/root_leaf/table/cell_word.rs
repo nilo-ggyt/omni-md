@@ -1,4 +1,5 @@
-//! 真实父/子格 Word 手势与显示映射；未 Ready 快跨仍以原三秒门暴露，不能把 Pending 当完成。
+//! Exercise actual parent/child-cell word gestures and display mapping. Fast
+//! crossings before Ready retain the original three-second gate; Pending is not completion.
 
 use super::*;
 
@@ -18,14 +19,16 @@ const EDITED: &str = concat!(
 );
 const DRAFT: &str = "前缀 中文分组 测试";
 
-/// 坐标只从固定原字面换算；中文组范围复用已执行 CM oracle 的中文分组=0..4、测试=5..7。
+/// Derive coordinates from fixed original literals. Chinese groups retain the
+/// actual CodeMirror oracle ranges 0..4 and 5..7, independent of product hit results.
 fn offset(text: &str) -> usize {
     SOURCE[..SOURCE.find(text).expect("固定 Word 格字面唯一存在")]
         .encode_utf16()
         .count()
 }
 
-/// 同一实际 Scene 的字符框须映回独立 canonical 字符；隐藏标记不能被拿来冒充显示文字。
+/// Actual Scene rectangles must map back to independent canonical characters.
+/// Hidden markers cannot stand in for displayed text.
 fn point(
     body: &NativeMarkdownPagedBody,
     view: &NativeMarkdownPagedTextView,
@@ -56,8 +59,10 @@ fn point(
         )
     })?;
     if actual != index {
-        // 只在真实拒绝点借同Scene的公开空间结果；不读取选择/指针私态，也不改变固定点击侧来迁就候选。
-        // 普通命中与Word命中的亲和、行列意图及两端caret可区分隐藏映射、跨part重合和视觉方向问题。
+        // Diagnose the actual rejected point through the same Scene's public
+        // geometry, with no private pointer/selection inspection or adjusted hit
+        // point. Cell/word affinity, row identity, and both carets distinguish
+        // hidden-source mapping, overlapping parts, and visual-direction failures.
         let cell = scene.cell_hit(local, false).map(|hit| {
             hit.map(|hit| {
                 (
@@ -83,7 +88,8 @@ fn point(
     Ok(view.convertPoint_toView(local, None))
 }
 
-/// 事件继续交原 Down 接收者；child 已 detach 后仍借同一 Rig 活窗口，不重挂 View 或重播父 mouse。
+/// Keep delivering to the original mouse-down receiver. A detached child uses the
+/// same Rig's live window; do not remount a view or replay a parent mouse event.
 fn mouse(
     rig: &Rig,
     view: &NativeMarkdownPagedTextView,
@@ -95,7 +101,8 @@ fn mouse(
     let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
         kind, point, NSEventModifierFlags::empty(), 1.0, window.windowNumber(), None, 1, clicks, 1.0,
     ).ok_or("无法构造格 Word 实际鼠标事件")?;
-    // SAFETY: 原主线程实际接收者、同窗口有限点；每个同步活事件只交一次既有 responder 语义。
+    // SAFETY: The actual main-thread receiver and bounded same-window point are
+    // valid; deliver each live event once through its existing responder entry.
     unsafe {
         if kind == NSEventType::LeftMouseDown {
             let _: () = objc2::msg_send![view, mouseDown: &*event];
@@ -110,8 +117,9 @@ fn mouse(
     Ok(())
 }
 
-/// 相同三秒从实际 Down 开始，只有真实有向首组和同 Input 的 CPU 完整帧都就绪才继续跨格。
-/// 不检查 Word pending/cache/游标，也不以初始 child 可见帧替代首次选词完成。
+/// Keep three seconds from the actual down. Cross cells only after the actual
+/// directed first group and its same-Input complete CPU frame arrive. Inspect no
+/// private word cache/pending/cursor, and do not substitute the initial child mount frame.
 fn group_ready(
     rig: &mut Rig,
     child: &NativeMarkdownPagedBody,
@@ -153,12 +161,14 @@ fn group_ready(
         let remaining = Duration::from_secs(3)
             .checked_sub(started.elapsed())
             .ok_or_else(|| format!("{stage}: 三秒内没有真实首词组和当前完整帧"))?;
-        // SAFETY: 只等待原动作剩余期限；原 Source/字体/CPU 完成通知唤醒后核公开选择与帧。
+        // SAFETY: Wait only within the original action's remaining deadline;
+        // actual Source/font/CPU events permit checking public selection/frame state.
         unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), true) };
     }
 }
 
-/// 固定短文逐片核 canonical 和原文件；真实草稿提交前后均无权自动保存到磁盘。
+/// Compare the fixed short canonical text and original file in chunks. Draft
+/// submission grants no authority to save automatically before or after commit.
 fn document(rig: &Rig, expected: &str) -> Result<(), String> {
     let original = rig.document.upgrade().ok_or("格 Word 原 Doc 已归还")?;
     let document = original.borrow();
@@ -200,7 +210,8 @@ fn document(rig: &Rig, expected: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 选择只保当前公开方向；字符变化与历史是否存在由真实 Doc 事实决定，不读指针或格缓存私态。
+/// Check public directed selection only. Actual document facts establish text/
+/// history changes, without private pointer or cell-cache inspection.
 fn selected(rig: &Rig, expected: MarkdownTextSelection) -> Result<(), String> {
     let actual = rig.view.input_state().map_err(|cause| cause.to_string())?;
     if actual.selection != expected || rig.body.active_cell_body().is_some() {
@@ -212,8 +223,9 @@ fn selected(rig: &Rig, expected: MarkdownTextSelection) -> Result<(), String> {
     Ok(())
 }
 
-/// Reopen 的父定位帧只供下一步真实挂载，不能把它当整次首组/末端交付已经完成。
-/// 同一次 Down 的绝对三秒不重置；只等用户可观察的精确有向选择、格退出和其当前完整 CPU 帧。
+/// Reopen's parent-location frame supports later actual mounting; it cannot prove
+/// first-group/final-endpoint completion. Preserve the same down's absolute three
+/// seconds while waiting for exact public directed selection, cell exit, and current complete CPU pixels.
 fn wait_selected(
     rig: &Rig,
     expected: MarkdownTextSelection,
@@ -240,7 +252,8 @@ fn wait_selected(
         {
             let scene = NativeMarkdownPagedTextViewDelegate::ready_scene(&*rig.body, &key.request)
                 .map_err(|cause| cause.to_string())?;
-            // 当前帧的原权限必须还活着；旧 mount 帧、只有 selection 变更或还在绘图都不算完成。
+            // Current-frame authority must remain live. An old mount frame,
+            // selection-only change, or in-progress paint is insufficient.
             scene
                 .validate_ready(&|| {
                     rig.view
@@ -253,12 +266,14 @@ fn wait_selected(
         let remaining = Duration::from_secs(3).checked_sub(started.elapsed()).ok_or_else(|| {
             format!("{stage}: 原 Down 三秒内未完成最终有向选择与当前帧：actual={:?}, expected={expected:?}, active_cell={}", state.selection, rig.body.active_cell_body().is_some())
         })?;
-        // SAFETY: 仍消费原手势剩余期限；不另发事件、不重置截止时间，也不检查内部 pending/游标。
+        // SAFETY: Use the original gesture's remaining deadline with no additional
+        // events, renewed deadline, or private pending/cursor inspection.
         unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), true) };
     }
 }
 
-/// 首个真实父 Down 进入 child Source 选词；随后仍把 Drag/Up 交原父接收者，目标依次经过强调/代码/管道投影。
+/// Original parent down enters child-Source word selection. Keep drag/up on that
+/// same parent receiver while targets cross bold, code, and escaped-pipe projections.
 fn parent_drag(rig: &mut Rig) -> Result<(), String> {
     let start = offset("中文分组 测试");
     for (target, end, stage) in [
@@ -321,9 +336,10 @@ fn parent_drag(rig: &mut Rig) -> Result<(), String> {
                 "{stage}: 真实Word终点在隐藏标记处丢失canonical位置：actual={:?}, expected={canonical_caret:?}",
                 actual.actual_range
             ));
-        } // 原端点来自独立字面，空间只借真实格caret，不从映回后的范围反推期望。
-        // 真实跨格选择会触发canonical目标reveal；后继数据格必须仍在原表头下方，
-        // 不能让批量LineEnd补齐总高度后，旧Grid.top把同源正确字符框画回上一物理行。
+        } // Independent literals define endpoints; actual cell caret geometry supplies no expected source range.
+        // Cross-cell selection reveals its canonical target. Data must stay below
+        // the header after accumulated LineEnd heights update; a stale Grid top
+        // cannot paint otherwise correct source geometry onto the preceding physical row.
         let header = scene
             .first_rect(NSRange::new(offset("首列") + 1, 1))
             .map_err(|cause| cause.to_string())?;
@@ -357,7 +373,8 @@ fn parent_drag(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 原父窗口的真实三击只选当前格的完整原段；格式标记仍属可编辑 raw，不能吞掉或扩到邻格。
+/// Actual parent triple-click selects this cell's complete raw paragraph only.
+/// Editable formatting markers remain intact and selection excludes neighboring cells.
 fn paragraph_click(rig: &mut Rig) -> Result<(), String> {
     for (target, raw, stage) in [
         (
@@ -391,7 +408,8 @@ fn paragraph_click(rig: &mut Rig) -> Result<(), String> {
         ui_local(&view, raw)?;
         document(rig, SOURCE)?;
 
-        // 沿既有格取消动作结束这次只读选择；不造正文编辑，也不为测试添加退出快捷键。
+        // End read-only selection through the existing cell cancellation command,
+        // without a document edit or test-specific quit shortcut.
         let frame = observe(&rig.body)?;
         view.command(sel!(cancelOperation:))
             .map_err(|cause| cause.to_string())?;
@@ -416,7 +434,8 @@ fn paragraph_click(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 实际 child 新 Down 在已编辑 Source 内确定首组；跨到父 Grid 后用真实三点清洗 receipt 提交一次。
+/// A new actual child down identifies its first group in edited Source. Crossing
+/// to the parent Grid consumes the real three-point sanitization receipt in one commit.
 fn edited_child(rig: &mut Rig) -> Result<(), String> {
     let start = offset("中文分组 测试");
     let down = point(&rig.body, &rig.view, start + 1)?;
@@ -428,7 +447,8 @@ fn edited_child(rig: &mut Rig) -> Result<(), String> {
     let view = child.view().map_err(|cause| cause.to_string())?;
     let frame = observe(&child)?;
     let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**view);
-    // SAFETY: 原实际 child client 只替换固定七单元 raw；父 canonical 此时仍必须保持完整原文。
+    // SAFETY: The original child client replaces its fixed seven-unit raw draft;
+    // parent canonical text must still retain the complete original document.
     unsafe {
         client.insertText_replacementRange(&NSString::from_str(DRAFT), NSRange::new(0, 7));
     }
@@ -485,8 +505,10 @@ fn edited_child(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 此动作故意不等首组/child Ready；原三秒门必须证明接纳Up后仍完成同一次首组与目标。
-/// 不以预期 Pending 分支返回成功，也不在发第二点之前驱动 runloop 帮产品规避快拖。
+/// Deliver without waiting for the first group/child Ready. The original three
+/// seconds must prove that accepted mouse-up still completes this same group and
+/// target. Pending cannot return success, and pre-delivering the loop before the
+/// second point would evade the actual fast-drag scenario.
 fn pending_first_group(rig: &mut Rig) -> Result<(), String> {
     let start = offset("中文分组 测试");
     let down = point(&rig.body, &rig.view, start + 1)?;
@@ -511,7 +533,8 @@ fn pending_first_group(rig: &mut Rig) -> Result<(), String> {
     rig.remember_receipt()
 }
 
-/// 已编辑child自己的首Down未Ready即跨到父Grid并Up；原局部三点只能经一次真实清洗提交。
+/// Cross from an edited child's own unready first down to the parent Grid and up.
+/// Its original three local points must pass one actual sanitizing commit only.
 fn child_pending_group(rig: &mut Rig) -> Result<(), String> {
     let start = offset("中文分组 测试");
     let mount = point(&rig.body, &rig.view, start + 1)?;
@@ -523,7 +546,8 @@ fn child_pending_group(rig: &mut Rig) -> Result<(), String> {
     let view = child.view().map_err(|cause| cause.to_string())?;
     let frame = observe(&child)?;
     let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**view);
-    // SAFETY: 原实际child的固定七单元raw；正文在真正跨界发布前不得改变。
+    // SAFETY: Replace the original actual child's fixed seven-unit raw draft;
+    // parent text must not change before the actual cross-boundary publication.
     unsafe {
         client.insertText_replacementRange(&NSString::from_str(DRAFT), NSRange::new(0, 7));
     }
@@ -572,7 +596,8 @@ fn child_pending_group(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 旧Up已接纳而未Ready时，child新Down明确撤旧终点；迟到Drag不能重新发布或改写原磁盘。
+/// A new child down revokes an accepted but unready old mouse-up endpoint. Late
+/// drag cannot republish it or change original disk contents.
 fn cancelled_child_group(rig: &mut Rig) -> Result<(), String> {
     let start = offset("中文分组 测试");
     let mount = point(&rig.body, &rig.view, start + 1)?;
@@ -629,8 +654,10 @@ fn cancelled_child_group(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 真实换raw必经Reopen：旧格未编辑，避免几何随正文变更，使独立终点仍对应同一物理字符。
-/// 第二次在旧来源归槽前真实新Down，必须撤旧终点并保新Down，而不是以Pending丢掉用户动作。
+/// Changing actual raw cells requires Reopen. Keep the old cell unedited so
+/// independent endpoint coordinates still identify the same physical characters.
+/// A successor down before the old Source returns to its slot must revoke the old
+/// endpoint and preserve the new action, never discard user input as Pending.
 fn reopen_groups(rig: &mut Rig) -> Result<(), String> {
     let first = offset("中文分组 测试");
     let bold = offset("**中文分组**");
@@ -715,6 +742,8 @@ fn reopen_groups(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
+/// Run actual cross-cell gestures on the original preview graph, then complete
+/// strict resource closure before reporting interaction results.
 pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
     let (retirement, result) = autoreleasepool(|_| -> Result<_, String> {
         let mut file = tempfile::NamedTempFile::new().map_err(|cause| cause.to_string())?;
@@ -743,10 +772,10 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
             cancelled_child_group(&mut rig)?;
             reopen_groups(&mut rig)
         })();
-        let retirement = release::close(rig, false)?;
+        let retirement = release::close(rig)?;
         Ok((retirement, result))
     })?;
-    retirement.verify(false)?;
+    retirement.verify()?;
     result?;
     println!(
         "native_body_grid_word actual_parent_down_child_group=true actual_bold_code_pipe_targets=true actual_edited_child_down=true same_commit_group_origin_receipt=true one_document_undo=true actual_pending_first_group_cross=true original_disk_unchanged=true strict_original_release=true triple_click_tested=true physical_ime_tested=false formal=false whole_product=false"

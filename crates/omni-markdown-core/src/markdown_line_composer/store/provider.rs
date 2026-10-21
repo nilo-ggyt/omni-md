@@ -1,32 +1,38 @@
-//! 当前item的有限独占读取借用；目录只核一次，每次glyph/cluster仍核同源、字体和取消。
+//! Bounded exclusive reads of the current item. Authenticate its directory once;
+//! each glyph/cluster read still checks original Source, font, and cancellation.
 //!
-//! 借用没有原job或Font强owner，也不缓存正文。它只在一次受限Measure调用期间存在，
-//! 借用结束后上层重新从同Store与同opaque Proof取得资格，不能把metadata当永久权限。
+//! This borrow owns no Job/font payload or text cache. It lives for one bounded
+//! Measure call; later calls reacquire authority from the same Store and opaque
+//! proof instead of treating immutable metadata as permanent permission.
 
 use super::*;
 use crate::MarkdownLayoutFontAuthority;
 use crate::MarkdownSoftLineMeasureError;
 use crate::markdown_soft_line_measure::provider::{self, GlyphProvider};
 
-/// 只能由原Store验证私有Proof后构造；外部crate没有实现provider或伪造origin的入口。
+/// Constructed only after the original Store verifies its private proof. External
+/// crates cannot implement this sealed provider or manufacture its origin.
 pub(in crate::markdown_line_composer) struct StoredGlyphBorrow<'a> {
     store: &'a mut GlyphStore,
     directory: Directory,
     pen: i64,
-    // 仅本次Measure借用保留一条已认证的64B记录和实际ordinal；不跨借用保存源或字体权限。
+    // Retain one authenticated 64-byte cluster and its real ordinal for this
+    // Measure borrow only, without carrying Source/font authority across calls.
     cluster_hint: Option<(usize, [u8; 64])>,
 }
 
 impl provider::sealed::Sealed for StoredGlyphBorrow<'_> {}
 
 impl GlyphProvider for StoredGlyphBorrow<'_> {
-    /// 本次原目录已由 borrow/require 核对；只回读独占 kind，不产生新的源或范围权限。
+    /// The original directory was authenticated by borrow/require. Read its kind
+    /// only, without deriving new Source or range authority.
     fn folded_section(&self) -> Option<Range<usize>> {
         (self.directory.kind == super::super::MarkdownComposedLinePartKind::FoldedSection)
             .then(|| self.directory.facts.source_utf16.clone())
     }
 
-    /// 仅原 ValidatedControl 写成的真实零字形换段可终止前行；TableRow 与普通 glyph 不获此能力。
+    /// Only an actual zero-glyph paragraph break from ValidatedControl can end a
+    /// preceding text line. Tables and ordinary glyphs do not gain that capability.
     fn ends_paragraph_control(&self) -> bool {
         self.directory.kind == super::super::MarkdownComposedLinePartKind::ParagraphBreak
             && self.directory.glyph_count == 0
@@ -55,8 +61,9 @@ impl GlyphProvider for StoredGlyphBorrow<'_> {
             {
                 return Err(Error::SourceMismatch);
             }
-            // 目录已在本借用建立时核过覆盖；这里只核本次真实来源和字体权限。
-            // 返回前由原finish统一复核健康，实际cluster读取仍各自检查范围和完整记录。
+            // Coverage was authenticated when this borrow began. Check the same
+            // actual Source/font now; finish rechecks health before return and
+            // individual cluster reads still validate their full records/ranges.
             let (store, origin) = self.origin();
             Ok(provider::GlyphProviderFacts {
                 origin: provider::GlyphProviderOrigin::Stored { store, origin },
@@ -88,10 +95,11 @@ impl GlyphProvider for StoredGlyphBorrow<'_> {
                 return Err(MarkdownSoftLineMeasureError::InvalidRequest);
             };
             value.x_advance_26_6 = advance_26_6;
-            GlyphProvider::require(self, source, font)?; // Tab另读原style/placement，须在这次额外IO后核原权限。
+            GlyphProvider::require(self, source, font)?; // Recheck after actual tab-style I/O.
         }
-        // 普通cluster已由内层require_current及finish核过真实Font、取消和Source首错；
-        // 此后仅移动本次结果，没有Native、回调或另一借用，不重复完整catalog/来源扫描。
+        // Ordinary clusters already passed require_current/finish for actual font,
+        // cancellation, and Source first failure. Moving this result involves no
+        // Native call, callback, or other borrow requiring another full scan.
         Ok(MarkdownGlyphClusterAnswer::Known(answer))
     }
     #[cfg(feature = "paged-shaping-frontier")]
@@ -103,7 +111,7 @@ impl GlyphProvider for StoredGlyphBorrow<'_> {
         GlyphProvider::require(self, source, font)?;
         let end = self.directory.frontier_word_end;
         GlyphProvider::require(self, source, font)?;
-        Ok(end) // 只回读原producer写入同origin的事实，不重建已Drop Job或扩大当前source_range。
+        Ok(end) // Same-origin producer fact only; no retired Job or expanded range.
     }
     #[cfg(feature = "paged-shaping-frontier")]
     fn bidi_shaping_end(
@@ -114,7 +122,7 @@ impl GlyphProvider for StoredGlyphBorrow<'_> {
         GlyphProvider::require(self, source, font)?;
         let end = self.directory.shaping_seams[1].map(|_| self.directory.facts.source_utf16.end);
         GlyphProvider::require(self, source, font)?;
-        Ok(end) // 私有目录只由原 Item 的 sealed seam 写入；公开整数不能补签该事实。
+        Ok(end) // Only the original item's sealed seam populated this directory fact.
     }
     fn committed_line_start(
         &mut self,
@@ -134,7 +142,7 @@ impl GlyphProvider for StoredGlyphBorrow<'_> {
                 .map_err(measure_error);
         }
         GlyphProvider::require(self, source, font)?;
-        Ok(committed) // 只有原latest LineEnd实际写完，且宽度/选中事实仍相同，才签本次行首。
+        Ok(committed) // The latest actual LineEnd must retain its selection and width facts.
     }
     fn require_committed_line_start(
         &mut self,
@@ -157,7 +165,8 @@ impl GlyphProvider for StoredGlyphBorrow<'_> {
                 .store
                 .finish(Err(Error::InvalidRequest))
                 .map_err(measure_error);
-        } // 旧line票不能在更晚LineEnd之后重开原行；同源/同坐标也不接受另一个Store。
+        } // An old line ticket cannot reopen the line after a later LineEnd, and
+        // identical Source/coordinates in a different Store grant no authority.
         GlyphProvider::require(self, source, font)?;
         Ok(())
     }
@@ -175,7 +184,8 @@ fn measure_error(error: Error) -> MarkdownSoftLineMeasureError {
         Error::Shaping(error) => MarkdownSoftLineMeasureError::Shaping(error),
         Error::Cluster(error) => MarkdownSoftLineMeasureError::Cluster(error),
         Error::Break(error) => MarkdownSoftLineMeasureError::Break(error),
-        // 字体过期、实际文件IO与catalog失败保留完整首因，不压成假空cluster或普通Pending。
+        // Preserve font expiry, actual file I/O, and catalog causes instead of
+        // returning fabricated empty clusters or ordinary Pending.
         other => MarkdownSoftLineMeasureError::Stored(Box::new(other)),
     }
 }
@@ -225,7 +235,7 @@ impl StoredGlyphBorrow<'_> {
         kind: &provider::SelectedMeasureKind,
     ) -> Result<provider::CommittedLineStart> {
         let result = self.committed_line_inner(kind);
-        self.store.finish(result) // 新票校验失败也永久撤半候选；析构中的原Source首错仍先行。
+        self.store.finish(result) // A failed ticket also revokes the partial candidate.
     }
     fn committed_line_inner(
         &mut self,
@@ -239,6 +249,8 @@ impl StoredGlyphBorrow<'_> {
             .checked_sub(1)
             .ok_or(Error::InvalidRequest)?;
         let file = self.store.index.as_mut().ok_or(Error::Poisoned)?;
+        // Read the actual latest LineEnd and its exact head; a retained numeric
+        // line range cannot independently certify complete committed output.
         let tail = file.read(record)?;
         let header = usize_at(&tail, 0)?;
         let parts = usize_at(&tail, 8)?;
@@ -301,10 +313,11 @@ impl StoredGlyphBorrow<'_> {
     pub(super) fn require_current(&self) -> Result<()> {
         self.store.guard()?;
         self.store.fonts.resolve(self.directory.font)?;
-        Ok(()) // 字体解析只借固定弱槽；每次实际记录读取前后及最终finish仍核原Source。
+        Ok(()) // Font lookup borrows a fixed weak slot; actual reads/finish still check Source.
     }
 
-    /// 该origin只供封闭provider比较；数字单独不能恢复Store、Source、Font或Ready资格。
+    /// Only the sealed provider compares this origin. Its number alone cannot
+    /// recover Store, Source, font, or Ready authority.
     pub(super) fn origin(&self) -> (Weak<()>, u64) {
         (Arc::downgrade(&self.store.identity), self.directory.origin)
     }
@@ -339,14 +352,16 @@ impl StoredGlyphBorrow<'_> {
             if let Some((ordinal, row)) = self.cluster_hint {
                 let value = decode_cluster(row)?;
                 if value.source_utf16.contains(&offset) {
-                    // 内部UTF16或断点flags探针重查同一原cluster时只复用完整记录，不截取或重算glyph。
+                    // A same-cluster UTF-16/flags query reuses the whole original
+                    // record, without slicing it or recomputing glyphs.
                     self.require_current()?;
                     return Ok(Some(value));
                 }
                 if offset == value.source_utf16.end {
                     let next = ordinal.checked_add(1).ok_or(Error::Overflow)?;
                     if next < self.directory.cluster_count {
-                        // Store按逻辑源顺序写入真实目录；只允许已知末端领下一ordinal，RTL不推视觉序。
+                        // Store records follow logical Source order. Only the
+                        // known endpoint admits next ordinal; RTL is not inferred.
                         self.require_current()?;
                         let (row, following) = self.cluster_record(next)?;
                         if following.source_utf16.start != value.source_utf16.end
@@ -362,7 +377,7 @@ impl StoredGlyphBorrow<'_> {
             }
             let (mut low, mut high) = (0, self.directory.cluster_count);
             while low < high {
-                self.require_current()?; // 最多usize::BITS次，每次实际record读取前核同票，不整项线性扫描。
+                self.require_current()?; // Bounded binary search; every read keeps original authority.
                 let middle = low + (high - low) / 2;
                 let (row, value) = self.cluster_record(middle)?;
                 if offset < value.source_utf16.start {
@@ -380,7 +395,8 @@ impl StoredGlyphBorrow<'_> {
         self.store.finish(result)
     }
 
-    /// 读取同一已认证目录中的实际记录；调用者只传二分中点或已知相邻ordinal。
+    /// Read an actual record in this same authenticated directory. Callers supply
+    /// only a binary-search midpoint or a known adjacent ordinal.
     fn cluster_record(&mut self, ordinal: usize) -> Result<([u8; 64], MarkdownGlyphCluster)> {
         let record = self
             .directory
@@ -398,7 +414,7 @@ impl StoredGlyphBorrow<'_> {
             || value.source_utf16.end > self.directory.facts.source_utf16.end
             || value.glyphs.end > self.directory.glyph_count
         {
-            return Err(Error::InconsistentCoverage); // IO/格式/覆盖失败交原finish撤文件，不能保留半条hint。
+            return Err(Error::InconsistentCoverage); // Invalid coverage cannot leave a usable hint.
         }
         Ok((row, value))
     }
@@ -419,13 +435,14 @@ impl provider::ResolutionProvider for StoredGlyphBorrow<'_> {
             let Some(located) = self.store.item_at(end)? else {
                 return Ok(None);
             };
-            // 定位已经用同 Store 原票核过完整目录；只在本次 provider 借用内复用。
+            // Lookup authenticated the full directory through the same Store's
+            // original proof. Reuse it only within this one provider borrow.
             let next = located.directory;
             if next.kind != super::super::MarkdownComposedLinePartKind::Glyphs
                 || next.facts.source_utf16.start != end
                 || next.cluster_count == 0
             {
-                return Ok(None); // 未完成、控制或缺口没有后继glyph见证，仍交原NextItem能力出口。
+                return Ok(None); // Incomplete/control coverage grants no successor glyph proof.
             }
             let row = self
                 .store
@@ -439,7 +456,7 @@ impl provider::ResolutionProvider for StoredGlyphBorrow<'_> {
                 || cluster.glyphs.end > next.glyph_count
             {
                 return Err(Error::InconsistentCoverage);
-            } // 错目录/记录不得被当作“安全后继”；只消费同一真实首cluster，不扫描整项。
+            } // Validate this one real first cluster; corruption is not safe continuation.
             Ok((cluster.missing_glyphs == 0).then_some(cluster.flags))
         })();
         let value = self.store.finish(result).map_err(measure_error)?;
@@ -453,7 +470,8 @@ impl provider::ResolutionProvider for StoredGlyphBorrow<'_> {
         range: Range<usize>,
     ) -> std::result::Result<crate::MarkdownShapingJob, crate::MarkdownSoftLineResolveError> {
         use crate::{MarkdownShapingJob, MarkdownShapingOptions, MarkdownSoftLineResolveError};
-        // 该sealed方法只由原Resolver的真实候选调用；先核同源/字体/完整目录，再派生实际子任务。
+        // Only the original resolver's real candidate reaches this sealed method.
+        // Check same-Source/font/complete-directory authority before creating its Job.
         GlyphProvider::require(self, source, font)?;
         if self.directory.kind != super::super::MarkdownComposedLinePartKind::Glyphs
             || range.is_empty()
@@ -486,7 +504,8 @@ impl provider::ResolutionProvider for StoredGlyphBorrow<'_> {
             script: self.directory.facts.script,
             language: style.language,
             points: self.directory.facts.points,
-            // 沿原真实段落旗标相与；软换行不伪造新的BOT/EOT，仍安装同Source邻接上下文。
+            // Intersect original paragraph flags with this actual range. Soft wraps
+            // cannot invent BOT/EOT; original adjacent Source context is still used.
             beginning_of_text: self.directory.facts.beginning_of_text
                 && range.start == self.directory.facts.source_utf16.start,
             end_of_text: self.directory.facts.end_of_text
@@ -502,7 +521,9 @@ impl provider::ResolutionProvider for StoredGlyphBorrow<'_> {
             options,
             self.store.cancellation.shaping(),
         )?;
-        GlyphProvider::require(self, source, font)?; // 创建期间失权就归还真实候选，不能以新Job补签原请求。
+        // If authority expired during construction, release the real candidate;
+        // creating a new Job cannot renew the original request.
+        GlyphProvider::require(self, source, font)?;
         Ok(job)
     }
 }

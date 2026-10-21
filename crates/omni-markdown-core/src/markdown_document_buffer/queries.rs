@@ -1,6 +1,7 @@
 //! Read-only aggregate metrics and bounded-memory literal search over document pieces.
 
 use super::*;
+use std::ops::ControlFlow;
 
 impl MarkdownDocumentBuffer {
     /// Read raw HTML-introducer risk in O(1), without a per-caret prefix scan or a separate syntax index.
@@ -90,42 +91,48 @@ impl MarkdownDocumentBuffer {
         };
         let mut matched = 0;
         let mut found = None;
-        visit_piece_tree_range(self, self.root.as_deref(), range, 0, &mut |bytes| {
-            // Carry query-sized KMP state across immutable piece leaves without flattening the document.
-            if found.is_some() && !backwards {
-                // A forward result is final; remaining leaves require no decoding or text scan.
-                return Ok(());
-            }
-            // Every leaf/range boundary is scalar-aligned by the document's edit invariant.
-            let text = std::str::from_utf8(bytes).map_err(|_| {
-                // Invalid source encoding must remain an explicit failure rather than silently replacing bytes.
-                MarkdownDocumentBufferError::InvalidUtf8Document
-            })?;
-            for unit in text.encode_utf16() {
-                // Prefix state spans leaves, so a match may cross original/edit segment joins.
-                let unit = fold(unit);
-                // Reuse the longest remaining query border after a mismatch, keeping total scan work linear.
-                while matched > 0 && unit != pattern[matched] {
-                    matched = prefix_lengths[matched - 1];
-                }
-                if unit == pattern[matched] {
-                    // Advance only a matching prefix; valid query UTF-16 cannot end mid-scalar.
-                    matched += 1;
-                }
-                position += 1;
-                if matched == pattern.len() {
-                    // Keep either the first suffix match or the latest prefix match, as requested.
-                    found = Some(position - pattern.len()..position);
-                    if !backwards {
-                        // The forward result requires no further work within the current leaf.
-                        break;
+        let _ = visit_piece_tree_range_until_break(
+            self,
+            self.root.as_deref(),
+            range,
+            0,
+            &mut |bytes| {
+                // Carry query-sized KMP state across immutable piece leaves without flattening the document.
+                // Every leaf/range boundary is scalar-aligned by the document's edit invariant.
+                let text = std::str::from_utf8(bytes).map_err(|_| {
+                    // Invalid source encoding must remain an explicit failure rather than silently replacing bytes.
+                    MarkdownDocumentBufferError::InvalidUtf8Document
+                })?;
+                for unit in text.encode_utf16() {
+                    // Prefix state spans leaves, so a match may cross original/edit segment joins.
+                    let unit = fold(unit);
+                    // Reuse the longest remaining query border after a mismatch, keeping total scan work linear.
+                    while matched > 0 && unit != pattern[matched] {
+                        matched = prefix_lengths[matched - 1];
                     }
-                    // Backward search still accepts overlaps while retaining only one range.
-                    matched = prefix_lengths[matched - 1];
+                    if unit == pattern[matched] {
+                        // Advance only a matching prefix; valid query UTF-16 cannot end mid-scalar.
+                        matched += 1;
+                    }
+                    position += 1;
+                    if matched == pattern.len() {
+                        // Keep either the first suffix match or the latest prefix match, as requested.
+                        found = Some(position - pattern.len()..position);
+                        if !backwards {
+                            // Stop at the first forward match. The original traversal
+                            // must finish this actual lease before propagating Break,
+                            // then it acquires no remaining tail leaf or span record.
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        // Backward search still accepts overlaps while retaining only one range.
+                        matched = prefix_lengths[matched - 1];
+                    }
                 }
-            }
-            Ok(())
-        })?;
+                // Backward lookup still scans the entire bounded prefix so its
+                // retained result is the last complete match, including overlaps.
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
         Ok(found)
     }
 }

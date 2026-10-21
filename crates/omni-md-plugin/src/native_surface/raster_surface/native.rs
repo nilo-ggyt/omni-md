@@ -1,4 +1,4 @@
-//! 自有透明视图和公开viewport代理；标准factory/fragment及原输入图保持原身份。
+//! Owns the transparent image view and public viewport proxy while preserving the original factory/input graph.
 
 use super::*;
 use objc2_app_kit::{
@@ -7,7 +7,7 @@ use objc2_app_kit::{
 use objc2_core_graphics::CGImage;
 use objc2_quartz_core::{CALayer, CATransaction, kCAContentsFormatRGBA8Uint, kCAGravityResize};
 
-/// 事务撤权后仍须配平 begin/commit；此析构只恢复 Native 栈，不再发布像素或修改图层。
+/// Balances begin/commit even after revocation; Drop unwinds Native transaction state without another write.
 struct LayerTransaction(bool);
 impl Drop for LayerTransaction {
     fn drop(&mut self) {
@@ -21,6 +21,7 @@ fn checked<T>(
     current: &(impl Fn() -> bool + ?Sized),
     work: impl FnOnce() -> T,
 ) -> Result<T, String> {
+    // Every Native call can reenter; only the same original permit may authorize its result and successor.
     if !current() {
         return Err("光栅原票在 Native 调用前撤权".into());
     }
@@ -32,7 +33,7 @@ fn checked<T>(
 }
 
 define_class!(
-    // SAFETY: 自有 NSView 只经公开 layer API 发布不可变 CGImage；不持业务载荷或输入回调。
+    // SAFETY: This NSView publishes immutable CGImage contents through public layer APIs and owns no input state.
     #[unsafe(super = NSView)]
     #[thread_kind = MainThreadOnly]
     pub(super) struct NativeMarkdownRasterImageView;
@@ -42,11 +43,12 @@ define_class!(
         fn wants_update_layer(&self) -> bool { true }
         #[unsafe(method(updateLayer))]
         fn update_layer(&self) {
-            // contents 已由同票发布；AppKit 更新时不重新读正文或生成 CGContext 显示列表。
+            // Contents were published under the original permit; AppKit updates do not read source
+            // again or construct a CGContext display list from the body.
         }
         #[unsafe(method_id(hitTest:))]
         fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> {
-            None // 透明图像不能截获点击、拖选、表格字段或输入法的原生交互。
+            None // Preserve body clicks, drag selection, table fields, and the original input-method client.
         }
         #[unsafe(method(acceptsFirstResponder))]
         fn accepts_first_responder(&self) -> bool { false }
@@ -54,25 +56,27 @@ define_class!(
         fn is_accessibility_element(&self) -> bool { false }
         #[unsafe(method_id(accessibilityChildren))]
         fn accessibility_children(&self) -> Retained<NSArray<AnyObject>> {
-            NSArray::new() // 原 NSTextView 继续独占可访问文本与选择，图像不制造第二份 AX 内容。
+            NSArray::new() // The original NSTextView owns accessible text/selection; publish no duplicate AX tree.
         }
     }
-    // SAFETY: NSObject 身份和主线程约束由 NSView 继承，类不改变对象 ABI。
+    // SAFETY: NSView supplies NSObject identity and main-thread constraints; this class preserves its ABI.
     unsafe impl NSObjectProtocol for NativeMarkdownRasterImageView {}
 );
 
 impl NativeMarkdownRasterImageView {
     pub(super) fn new(frame: NSRect, mtm: MainThreadMarker) -> Retained<Self> {
         let view = Self::alloc(mtm).set_ivars(());
-        // SAFETY: 空 ivars 已初始化，仅在主线程调用公开 NSView designated initializer。
+        // SAFETY: Empty ivars are initialized before the public NSView designated initializer on main.
         unsafe { msg_send![super(view), initWithFrame: frame] }
     }
 
     pub(super) fn configure(&self, scale: f64) -> Result<(), String> {
+        // Initial installation precedes callback publication. Later configuration uses the guarded
+        // variant below so it cannot silently switch to a layer created by reentrant work.
         self.setWantsLayer(true);
         let layer = self.layer().ok_or("光栅图层尚未创建")?;
         layer.setContentsScale(scale);
-        // SAFETY: QuartzCore 导出常量具有静态生命周期；只配置本项目创建的唯一视口层。
+        // SAFETY: QuartzCore exports static constants; configure only this project's viewport layer.
         unsafe {
             layer.setContentsFormat(kCAContentsFormatRGBA8Uint);
             layer.setContentsGravity(kCAGravityResize);
@@ -92,11 +96,11 @@ impl NativeMarkdownRasterImageView {
             return Err("光栅配置时 CALayer 身份改变".into());
         }
         checked(current, || layer.setContentsScale(scale))?;
-        // SAFETY: QuartzCore 常量静态存活，且每一个 setter 都受同一原始操作票约束。
+        // SAFETY: QuartzCore constants live statically; each setter consumes the same original permit.
         checked(current, || unsafe {
             layer.setContentsFormat(kCAContentsFormatRGBA8Uint)
         })?;
-        // SAFETY: 同上，常量仅用于本项目的固定 CALayer，不创建较新图层或重新领取权限。
+        // SAFETY: The static gravity constant applies only to the captured CALayer, without new authority.
         checked(current, || unsafe {
             layer.setContentsGravity(kCAGravityResize)
         })?;
@@ -118,13 +122,15 @@ impl NativeMarkdownRasterImageView {
             return Err("光栅事务开始前原票已撤权".into());
         }
         CATransaction::begin();
+        // Commit must balance begin even when a setter revokes authority and returns early.
         let mut transaction = LayerTransaction(true);
         if !current() {
             return Err("光栅事务开始后原票已撤权".into());
         }
         checked(current, || CATransaction::setDisableActions(true))?;
-        // SAFETY: CALayer.contents 公开接受 CGImage；本同步调用持有有效 image，layer 自行
-        // 保留其 CF 所有权。桥接只用于该 setter，不发送其他 NSObject 消息或建立像素副本。
+        // SAFETY: CALayer.contents publicly accepts CGImage. This stack owns a valid image and
+        // the layer retains its CF ownership. Bridge only for this setter, without arbitrary
+        // NSObject messages or a separately allocated pixel copy.
         checked(current, || unsafe {
             let object = &*std::ptr::from_ref(image).cast::<AnyObject>();
             layer.setContents(Some(object));
@@ -142,8 +148,8 @@ impl NativeMarkdownRasterImageView {
         {
             return Err("光栅事务返回后的 CALayer 身份改变".into());
         }
-        // SAFETY: 此项目图层只接收公开允许的 CGImage/None；只比较 getter 返回对象的身份，
-        // 不向 CF 图像发送任意 NSObject 消息或把另一个图像冒认为本次发布值。
+        // SAFETY: This layer receives only supported CGImage/None values. Compare getter identity;
+        // do not send arbitrary NSObject messages to CF images or accept a successor image as ours.
         let contents = checked(current, || unsafe { layer.contents() })?;
         let matches = contents.as_deref().is_some_and(|actual| {
             std::ptr::eq(
@@ -151,7 +157,8 @@ impl NativeMarkdownRasterImageView {
                 std::ptr::from_ref(image).cast::<AnyObject>(),
             )
         });
-        drop(contents); // 临时 Native claim 也可能重入；归还之后再核同一原票。
+        // Returning the temporary Native claim may reenter; recheck the original permit afterwards.
+        drop(contents);
         if !matches || !current() {
             return Err("实际图层内容不是本次同票 CGImage".into());
         }
@@ -162,15 +169,18 @@ impl NativeMarkdownRasterImageView {
         if let Some(layer) = self.layer() {
             CATransaction::begin();
             CATransaction::setDisableActions(true);
-            // SAFETY: 只清除本层 contents；None 归还层持有的 CGImage，不触碰原正文或选择层。
+            // SAFETY: None returns this layer's retained CGImage only, without touching source/selection layers.
             unsafe { layer.setContents(None) };
             CATransaction::commit();
         }
-        self.removeFromSuperview(); // 原 table field 等较晚挂载的兄弟不重排、不移除。
+        // Remove only this view; later table fields and other siblings keep their existing ordering.
+        self.removeFromSuperview();
     }
 }
 
 pub(super) struct ViewportProxyIvars {
+    // Weak back-links avoid retaining the editor graph through the delegate. Scalar counters can
+    // outlive teardown to report failures, but cannot grant late callbacks fresh business authority.
     owner: std::rc::Weak<NativeMarkdownRasterSurface>,
     counters: Arc<ResourceCounters>,
     viewport: Weak<NSTextViewportLayoutController>,
@@ -181,17 +191,18 @@ pub(super) struct ViewportProxyIvars {
 }
 
 define_class!(
-    // SAFETY: 保留macOS12已有的四项viewport协议；27新增公开通知另有availability和原responds检查。
+    // SAFETY: Keep the four existing viewport methods; the newer notification has runtime availability/responds checks.
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
     #[ivars = ViewportProxyIvars]
     pub(super) struct NativeMarkdownRasterViewportProxy;
-    // SAFETY: 类保留NSObject身份，ivars仅Weak回链和独立原子收据，Native访问固定在主线程。
+    // SAFETY: NSObject identity is preserved; ivars hold weak links/atomics and Native access stays on main.
     unsafe impl NSObjectProtocol for NativeMarkdownRasterViewportProxy {}
     impl NativeMarkdownRasterViewportProxy {
         #[unsafe(method(textViewportLayoutControllerReceivedSetNeedsLayout:))]
         fn received_set_needs_layout(&self, viewport: &NSTextViewportLayoutController) {
-            // 只消费系统交付的实际回调，不自行发事件、重排或定时查询；计数耗尽永久失败而不回绕。
+            // Consume actual system callbacks only, without creating events, reflow, or polling.
+            // Sequence exhaustion fails permanently instead of wrapping to an earlier diagnostic identity.
             let Some(sequence) = self.ivars().received_layout_calls.get().checked_add(1) else {
                 self.ivars().counters.fail(); return;
             };
@@ -208,8 +219,9 @@ define_class!(
                     if responds {
                         checked(current, || {
                             issued = true;
-                            // SAFETY: 当前macOS27公开header声明void+一个viewport参数；runtime availability、
-                            // 原delegate responds和同一OriginPermit均已核实，只调用实际响应对象一次。
+                            // SAFETY: The macOS 27 header declares void plus one viewport argument.
+                            // Availability, the original delegate's selector response, and the same
+                            // OriginPermit are checked before this single call to that actual object.
                             unsafe { let _: () = msg_send![original, textViewportLayoutControllerReceivedSetNeedsLayout: viewport]; }
                             returned = true;
                         })?;
@@ -217,15 +229,15 @@ define_class!(
                     Ok(())
                 }).is_some()
             } else {
-                false // macOS14不调用尚未公开的原selector；既有四项协议路径保持原样。
+                false // Earlier systems do not call the unavailable selector; existing protocol methods still apply.
             };
             if sequence <= 8 {
                 eprintln!("native_raster_surface event=received_set_needs_layout sequence={sequence} available={available} responds_checked={responds_checked} original_responds={responds} issued={issued} returned={returned} completed={completed} formal=false");
             }
         }
     }
-    // SAFETY: 每个参数/返回值匹配绑定的公开协议；默认配置只登记原fragment，显式因果对照
-    // 才向原delegate转交同一实际配置，其他入口始终同票转原delegate。
+    // SAFETY: Signatures match the public protocol. Default configuration registers original fragments;
+    // only the explicit comparison forwards that same configure call. Other methods forward under one permit.
     unsafe impl NSTextViewportLayoutControllerDelegate for NativeMarkdownRasterViewportProxy {
         #[unsafe(method(viewportBoundsForTextViewportLayoutController:))]
         fn viewport_bounds(&self, viewport: &NSTextViewportLayoutController) -> NSRect {
@@ -252,14 +264,15 @@ define_class!(
             fragment: &NSTextLayoutFragment,
         ) {
             let sequence = if self.ivars().forward_configure {
-                // 仅对真实交付回调计数；固定日志预算之外仍核耗尽，不回绕生成伪序号。
+                // Count only delivered callbacks. Check exhaustion even beyond the fixed log budget;
+                // wrapping cannot manufacture another valid sequence.
                 let Some(sequence) = self.ivars().forward_configure_calls.get().checked_add(1) else {
                     self.ivars().counters.fail(); return;
                 };
                 self.ivars().forward_configure_calls.set(sequence);
                 Some(sequence)
             } else {
-                None // 构造时未显式启用对照，既有诊断路径不取得原生glyph surface。
+                None // Without the construction-time switch, this diagnostic does not request a Native glyph surface.
             };
             let mut issued = false;
             let mut returned = false;
@@ -276,12 +289,14 @@ define_class!(
                     {
                         return Err("viewport配置fragment不属于同一原manager".into());
                     }
-                    // 标准fragment不进自有对象账本；实际业务值进入同一原ledger，仍必须真实nil。
+                    // Framework fragments use the weak registry; their actual business values enter
+                    // the original owned ledger and must still reach actual nil during resource acceptance.
                     owner.register_fragment(fragment, current)?;
                     value_observation::capture_paragraph(&owner.ledger, fragment, current)?;
                     if self.ivars().forward_configure {
-                        // 原NSTextView的配置副作用可能同步调整几何；只调用公开协议required方法
-                        // 一次，前后仍消费原OriginPermit，撤权后不补票或重新配置。
+                        // The original NSTextView may synchronously change geometry during configuration.
+                        // Call the public required method once under the same permit; revocation cannot
+                        // renew it or repeat configuration against a successor state.
                         checked(current, || {
                             issued = true;
                             original.textViewportLayoutController_configureRenderingSurfaceForTextLayoutFragment(viewport, fragment);
@@ -305,8 +320,9 @@ define_class!(
 
         #[unsafe(method(textViewportLayoutControllerWillLayout:))]
         fn will_layout(&self, viewport: &NSTextViewportLayoutController) {
-            // 真正viewport布局可只改fragment坐标而不触发view frame通知；先撤旧几何票，
-            // 再由invoke取得本回调自己的原permit，不能让回调把自己新领的票立即作废。
+            // Viewport layout can change fragment coordinates without a frame notification.
+            // Revoke older geometry before invoke captures this callback's permit, so this event
+            // does not immediately invalidate the authority it has just acquired.
             if let Some(owner) = self.ivars().owner.upgrade() {
                 owner.invalidate_geometry();
             }
@@ -328,7 +344,8 @@ define_class!(
 
         #[unsafe(method(textViewportLayoutControllerDidLayout:))]
         fn did_layout(&self, viewport: &NSTextViewportLayoutController) {
-            // 原生布局已完成也是真实几何边界；废止布局中领取的旧票后，才转交原did回调。
+            // Completed Native layout is another actual geometry boundary: revoke permits captured
+            // during layout before forwarding the original did-layout callback.
             if let Some(owner) = self.ivars().owner.upgrade() {
                 owner.invalidate_geometry();
             }
@@ -357,7 +374,8 @@ impl NativeMarkdownRasterViewportProxy {
         original: &ProtocolObject<dyn NSTextViewportLayoutControllerDelegate>,
         mtm: MainThreadMarker,
     ) -> Retained<Self> {
-        // 只在该session代理构造时读取一次精确开关；不会随帧或环境后续变化切换渲染路径。
+        // Read the exact comparison switch once for this proxy. Later frames/environment changes
+        // cannot switch rendering paths inside an existing session.
         let forward_configure = std::env::var_os("OMNI_NATIVE_RASTER_FORWARD_CONFIGURE")
             .is_some_and(|value| value == "1");
         let proxy = Self::alloc(mtm).set_ivars(ViewportProxyIvars {
@@ -369,7 +387,7 @@ impl NativeMarkdownRasterViewportProxy {
             forward_configure,
             forward_configure_calls: Cell::new(0),
         });
-        // SAFETY: 所有Weak/原子ivars已初始化，主线程调用NSObject公开初始化器。
+        // SAFETY: All weak/atomic ivars are initialized before NSObject's public initializer on main.
         unsafe { msg_send![super(proxy), init] }
     }
 
@@ -384,6 +402,8 @@ impl NativeMarkdownRasterViewportProxy {
             return false;
         }
         let result = (|| -> Result<bool, String> {
+            // Certify the callback's exact viewport, original manager, and still-installed proxy.
+            // Equal dimensions or matching document scalars do not prove this delegate relationship.
             let actual = permit.step(owner, view, || self.ivars().viewport.load())?;
             if !actual.as_deref().is_some_and(|actual| {
                 std::ptr::eq::<NSTextViewportLayoutController>(actual, viewport)
@@ -410,7 +430,7 @@ impl NativeMarkdownRasterViewportProxy {
                     )
             }))
         })();
-        // 临时Native claim归还也可能撤票，整个检查结束后必须仍为原请求。
+        // Temporary Native claim destruction can revoke the permit; recheck after the whole local scope.
         result.unwrap_or(false) && permit.current(owner, view)
     }
 
@@ -427,10 +447,11 @@ impl NativeMarkdownRasterViewportProxy {
         ) -> Result<T, String>,
     ) -> Option<T> {
         if self.ivars().counters.closed.load(Ordering::Acquire) {
-            return None; // 原关闭已封业务权；迟到viewport回调不重启原delegate或旧布局。
+            return None; // Close sealed authority; a late callback cannot restart the old delegate/layout.
         }
         let Some(owner) = self.ivars().owner.upgrade() else {
-            // 活动代理失去原owner属于结构失败，不能转入另一个图或原GPU配置路径。
+            // Losing the owner while the proxy is active is structural failure. Do not switch
+            // graphs or fall back to the original GPU configuration path.
             self.ivars().counters.fail();
             return None;
         };
@@ -445,11 +466,13 @@ impl NativeMarkdownRasterViewportProxy {
             return None;
         };
         let _storage_payload = PayloadUseGuard::enter(&storage.ivars().payload_use_depth);
+        // Keep original payloads live through this synchronous callback. The permit is captured
+        // only after these original graph upgrades, and no borrow crosses the forwarded Native call.
         let permit = match NativeMarkdownRasterOriginPermit::begin(&owner, &view) {
             Ok(Some(permit)) => permit,
             Ok(None) => {
                 self.trace_failure(kind, "original_permit_unavailable");
-                return None; // 构造未就绪或原票合法撤销，只取消，不领取后继业务票。
+                return None; // Unready construction or legitimate revocation cancels without a successor permit.
             }
             Err(error) => {
                 self.trace_failure(kind, &error);
@@ -472,7 +495,7 @@ impl NativeMarkdownRasterViewportProxy {
             Ok(result)
         })();
         if !permit.current(&owner, &view) {
-            return None; // 正常同步撤权不被重签；后继真实Native事件自行发起新的独立操作。
+            return None; // Legitimate revocation is not renewed; a later real Native event owns its own operation.
         }
         match result {
             Ok(value) => Some(value),
@@ -485,7 +508,8 @@ impl NativeMarkdownRasterViewportProxy {
     }
 
     fn trace_failure(&self, kind: &'static str, reason: &str) {
-        // 总共最多八条固定回调/无正文原因；这不是完成收据，也不安排后继事件或重试。
+        // Emit at most eight callback/reason diagnostics without document contents. Logging neither
+        // certifies completion nor arranges another event or retry.
         if self
             .ivars()
             .counters
@@ -505,7 +529,8 @@ impl NativeMarkdownRasterViewportProxy {
             .viewport
             .load()
             .ok_or("撤proxy时原viewport已释放")?;
-        // 先取得要恢复的原claim，随后最后一次核仍挂本proxy；不能在这个核验后再Weak升级别的对象。
+        // Load the delegate to restore before the final installed-proxy check; do not upgrade another
+        // weak object after that check and accidentally overwrite a relation changed by reentry.
         let original = self.ivars().original.load();
         let actual = viewport.delegate();
         let matches = actual.as_deref().is_some_and(|delegate| {
@@ -521,6 +546,7 @@ impl NativeMarkdownRasterViewportProxy {
             return Err("撤proxy时原delegate关系已被替换".into());
         }
         viewport.setDelegate(original.as_deref());
+        // Setter return alone does not prove restoration; require the exact original live delegate.
         let restored = viewport.delegate();
         if !restored
             .as_deref()

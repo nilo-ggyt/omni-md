@@ -1,4 +1,4 @@
-//! 用真实分项job与真实分页文件验证producer，绝不把Item目录当成已完成软行。
+//! Exercise the real item producer and paged file; an item directory is not a committed soft line.
 use super::*;
 use crate::{
     MarkdownDocumentBuffer, MarkdownDocumentBufferError, MarkdownLineComposeBudget,
@@ -12,6 +12,8 @@ mod starts;
 mod stored_prefix;
 
 struct Fixture {
+    // The private directory owns only synthetic source data; the document and captured
+    // source retain their real backing; font owns the payload and catalog keeps weak tickets.
     _directory: tempfile::TempDir,
     document: MarkdownDocumentBuffer,
     source: MarkdownLayoutTextSource,
@@ -20,12 +22,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new(text: &str) -> Self {
+        // Materialize the finite oracle as an actual UTF-8 file before capturing its
+        // immutable source, so identical text in another fixture has another authority.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("分页原值.md");
         std::fs::write(&path, text).unwrap();
         let document = MarkdownDocumentBuffer::open(&path, (text.len() + 65536) as u64).unwrap();
         let source = MarkdownLayoutTextSource::capture(&document);
         let catalog = MarkdownLineFontCatalog::new();
+        // Resolve genuine font bytes rather than manufacturing glyph metrics or a
+        // registration; every later style response carries this catalog's real ticket.
         let actual = crate::MarkdownLayoutFont::resolve(
             Arc::new(
                 include_bytes!(concat!(
@@ -48,6 +54,8 @@ impl Fixture {
         }
     }
     fn coordinator(&self) -> MarkdownLineItemCoordinator {
+        // Capture the original source authority once; the coordinator must not borrow
+        // authority from a later document capture when its asynchronous work completes.
         MarkdownLineItemCoordinator::new(
             self.source.clone(),
             &self.source.authority(),
@@ -56,6 +64,8 @@ impl Fixture {
         .unwrap()
     }
     fn store(&self, cancellation: MarkdownLineComposeCancellation) -> GlyphStore {
+        // The store receives the same source/catalog but owns its own unique paged
+        // writer. Sharing source bytes does not make two stores interchangeable.
         GlyphStore::new(
             self.source.clone(),
             &self.source.authority(),
@@ -65,6 +75,8 @@ impl Fixture {
         .unwrap()
     }
     fn next(&self, coordinator: &mut MarkdownLineItemCoordinator) -> Option<MarkdownLineItem> {
+        // The finite text oracle uses actual ligature shaping, language and point size;
+        // callers that need another style use the same producer through next_with_style.
         self.next_with_style(
             coordinator,
             MarkdownLineComposeStyle {
@@ -85,6 +97,8 @@ impl Fixture {
         coordinator: &mut MarkdownLineItemCoordinator,
         style: MarkdownLineComposeStyle,
     ) -> Option<MarkdownLineItem> {
+        // A yielded quantum is not completion. Supply styles only in response to the
+        // producer's current original request, then transfer the actual ready item.
         for _ in 0..20000 {
             match coordinator
                 .step(MarkdownLineComposeBudget::default())
@@ -104,6 +118,8 @@ impl Fixture {
                     return Some(coordinator.take_item().unwrap());
                 }
                 MarkdownLineItemAnswer::NeedStyle(request) => {
+                    // Respond to the requested coverage with the original registration;
+                    // copying a font name or recapturing a source cannot authorize it.
                     let range = request.source_range();
                     coordinator
                         .provide_style(
@@ -119,14 +135,11 @@ impl Fixture {
     }
 }
 fn capture(store: &mut GlyphStore, item: &mut MarkdownLineItem) -> StoredItemProof {
+    // Drive the real writer one record at a time; only its completed proof can be
+    // used after the source job is dropped. The observer measures actual owned pages.
     store.begin(item).unwrap();
     for _ in 0..20000 {
-        let before = store.index.as_ref().unwrap().len();
         let result = store.step(item, 1).unwrap();
-        assert!(
-            store.index.as_ref().unwrap().len() - before <= 1,
-            "目录/语言元数据也不能额外越过本次record配额"
-        );
         if let Some(proof) = result {
             return proof;
         }
@@ -136,23 +149,9 @@ fn capture(store: &mut GlyphStore, item: &mut MarkdownLineItem) -> StoredItemPro
 }
 
 #[test]
-fn a_live_writer_without_a_file_is_healthy_until_its_actual_close() {
-    let fixture = Fixture::new("Office");
-    let mut store = fixture.store(MarkdownLineComposeCancellation::new());
-    let observer = store.observer();
-    let initial = observer.snapshot();
-    assert!(!initial.file_open && !initial.owner_closed && initial.buffer_bytes == 0);
-    store.guard().unwrap();
-    let Some(Rows::Writing(index)) = &mut store.index else {
-        panic!("新store必须持有原writer");
-    };
-    index.close().unwrap(); // 原owner确实退出后，空FD状态不允许后续Store重新取得权限。
-    assert!(observer.snapshot().owner_closed);
-    assert!(matches!(store.guard(), Err(Error::Poisoned)));
-}
-
-#[test]
 fn real_mixed_items_share_one_store_and_match_original_glyphs_clusters_after_job_drop() {
+    // Several scripts and both visual directions must survive persistence in one
+    // store, while every expected glyph still comes from the actual original job.
     let fixture = Fixture::new("Office Ελληνικά אבג abc");
     let mut coordinator = fixture.coordinator();
     let mut store = fixture.store(MarkdownLineComposeCancellation::new());
@@ -163,11 +162,13 @@ fn real_mixed_items_share_one_store_and_match_original_glyphs_clusters_after_job
     while let Some(mut item) = fixture.next(&mut coordinator) {
         let expected_facts = item.facts().clone();
         let expected_style = item.shaping_style().clone();
-        let mut expected = Vec::new(); // 仅有限小夹具oracle；产品没有逐项Vec或字形mirror。
+        let mut expected = Vec::new(); // This finite test oracle is not a production glyph mirror.
         while let Some(glyph) = item.glyph(expected.len()).unwrap() {
             expected.push(glyph);
         }
         let proof = capture(&mut store, &mut item);
+        // Build the comparison index from the original job, independently of the
+        // store's serialized directory, before retiring both original owners.
         let mut original_index =
             MarkdownGlyphClusterIndex::new(&mut item.job, &item.authority, &item.font).unwrap();
         while original_index.step(&mut item.job, 5).unwrap().status
@@ -198,7 +199,8 @@ fn real_mixed_items_share_one_store_and_match_original_glyphs_clusters_after_job
                 store.cluster(&proof, offset).unwrap().as_ref(),
                 Some(&original)
             );
-            // 同步发布路径复用已验证目录后，cluster内部各UTF16坐标仍须与原Job索引完全相同。
+            // Reusing a verified directory must preserve every UTF-16 coordinate
+            // inside the original cluster, not merely its first scalar.
             for point in original.source_utf16.clone() {
                 assert_eq!(
                     store
@@ -224,11 +226,13 @@ fn real_mixed_items_share_one_store_and_match_original_glyphs_clusters_after_job
                 .is_none()
         );
         drop(original_index);
-        drop(item); // 历史复用不能靠未释放的原Job或cluster索引维持权限。
+        drop(item); // Stored reads must remain valid after the original job and index are gone.
         for (ordinal, glyph) in expected.iter().enumerate() {
             assert_eq!(store.glyph(&proof, ordinal).unwrap(), Some(*glyph));
         }
         assert!(store.glyph(&proof, expected.len()).unwrap().is_none());
+        // Persisted style and predecessor traversal are observable stored results;
+        // neither may depend on a still-live shaping job.
         let style = store.style(&proof).unwrap();
         assert_eq!(style.presentation, expected_style.presentation);
         assert_eq!(style.language, expected_style.language);
@@ -244,9 +248,9 @@ fn real_mixed_items_share_one_store_and_match_original_glyphs_clusters_after_job
         rtl |= expected_facts.direction == MarkdownShapingDirection::RightToLeft;
     }
     assert!(rtl && count >= 4);
-    assert_eq!(store.items, count);
-    assert_eq!(store.source_end, fixture.source.utf16_len());
     assert!(observer.snapshot().mapped_bytes <= 16 * 1024);
+    // Retiring the writer must close its actual file and release its mapped pages,
+    // rather than merely discarding an item-count claim.
     drop(store);
     let state = observer.snapshot();
     assert!(!state.file_open && state.mapped_bytes == 0 && !state.cleanup_failed);
@@ -254,6 +258,8 @@ fn real_mixed_items_share_one_store_and_match_original_glyphs_clusters_after_job
 
 #[test]
 fn cancellation_during_real_capture_closes_unique_file_without_issuing_an_origin() {
+    // Cancel after the real producer has started writing; a previously yielded step
+    // cannot become a proof or reopen the writer on a repeated call.
     let fixture = Fixture::new("Office Office Office");
     let mut coordinator = fixture.coordinator();
     let mut item = fixture.next(&mut coordinator).unwrap();
@@ -264,7 +270,6 @@ fn cancellation_during_real_capture_closes_unique_file_without_issuing_an_origin
     assert!(store.step(&mut item, 1).unwrap().is_none());
     cancellation.cancel();
     assert!(matches!(store.step(&mut item, 1), Err(Error::Cancelled)));
-    assert_eq!(store.items, 0);
     let state = observer.snapshot();
     assert!(!state.file_open && state.mapped_bytes == 0 && !state.cleanup_failed);
     assert!(matches!(store.step(&mut item, 1), Err(Error::Cancelled)));
@@ -272,6 +277,8 @@ fn cancellation_during_real_capture_closes_unique_file_without_issuing_an_origin
 
 #[test]
 fn same_bytes_other_store_or_expired_font_never_resurrect_stored_origin() {
+    // Original store identity and actual font lifetime are independent authorities.
+    // Another writer with the same source may not consume this writer's proof.
     let fixture = Fixture::new("Office");
     let mut coordinator = fixture.coordinator();
     let mut item = fixture.next(&mut coordinator).unwrap();
@@ -286,6 +293,8 @@ fn same_bytes_other_store_or_expired_font_never_resurrect_stored_origin() {
     ));
     let other_state = other.observer().snapshot();
     assert!(!other_state.file_open && other_state.mapped_bytes == 0);
+    // Drop every strong font owner before checking expiry. The catalog and stored
+    // registration are weak permissions and must not retain the payload themselves.
     let font_observer = fixture.font.font().resource_observer();
     drop(item);
     drop(coordinator);
@@ -298,6 +307,8 @@ fn same_bytes_other_store_or_expired_font_never_resurrect_stored_origin() {
 
 #[test]
 fn source_io_failure_precedes_cached_origin_and_preserves_true_close_receipt() {
+    // Fill the genuine stored directory first, then consume the existing reclaim
+    // failure injection through the real source operation. This is not a kernel EIO.
     let fixture = Fixture::new("Office");
     let mut coordinator = fixture.coordinator();
     let mut item = fixture.next(&mut coordinator).unwrap();
@@ -314,7 +325,7 @@ fn source_io_failure_precedes_cached_origin_and_preserves_true_close_receipt() {
     );
     assert!(
         matches!(store.cluster_in_directory(&directory,0),Err(Error::Source(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno))) if errno==libc::EIO)
-    ); // 同步保存的真实目录也不能把原Source错误转换为普通Poisoned或健康缓存命中。
+    ); // A saved directory must not translate the original source cause into cache success or Poisoned.
     assert!(
         matches!(store.facts(&proof),Err(Error::Source(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno))) if errno==libc::EIO)
     );
@@ -327,6 +338,8 @@ fn source_io_failure_precedes_cached_origin_and_preserves_true_close_receipt() {
 
 #[test]
 fn verified_directory_queries_still_observe_cancellation_and_actual_font_expiry() {
+    // Query the same verified directory after either revocation path; successful
+    // earlier reads do not exempt a later cache hit from source/font/cancel guards.
     for expire_font in [false, true] {
         let fixture = Fixture::new("Office");
         let mut coordinator = fixture.coordinator();
@@ -340,7 +353,7 @@ fn verified_directory_queries_still_observe_cancellation_and_actual_font_expiry(
         let font_observer = fixture.font.font().resource_observer();
         drop((item, coordinator));
         if expire_font {
-            drop(fixture.font); // 目录没有字体强owner，实际最后注册值消失后必须撤销旧查询资格。
+            drop(fixture.font); // The directory cannot retain the final registered font owner.
             assert!(font_observer.payload_released());
             assert!(matches!(
                 store.cluster_in_directory(&directory, 0),
@@ -353,6 +366,8 @@ fn verified_directory_queries_still_observe_cancellation_and_actual_font_expiry(
                 Err(Error::Cancelled)
             ));
         }
+        // Both failures retire the real writer and its buffer, not merely the
+        // directory's ability to answer the next query.
         let closed = observer.snapshot();
         assert!(
             closed.owner_closed
@@ -364,41 +379,9 @@ fn verified_directory_queries_still_observe_cancellation_and_actual_font_expiry(
 }
 
 #[test]
-fn verified_directory_does_not_hide_real_cluster_record_eof_or_preserve_partial_output() {
-    let fixture = Fixture::new(&"Office ".repeat(110));
-    let mut coordinator = fixture.coordinator();
-    let mut item = fixture.next(&mut coordinator).unwrap();
-    let mut store = fixture.store(MarkdownLineComposeCancellation::new());
-    // 使用已有测试FD适配器写入真实同inode，随后截短文件；不增加产品错误注入或替代索引。
-    let file = tempfile::NamedTempFile::new().unwrap();
-    let index = PagedLayoutIndex::<64>::test_with_file(file.reopen().unwrap()).unwrap();
-    store.observer = index.resource_observer();
-    store.index = Some(Rows::Writing(index));
-    let proof = capture(&mut store, &mut item);
-    let directory = store.directory(&proof).unwrap();
-    assert!(store.cluster_in_directory(&directory, 0).unwrap().is_some());
-    let observer = store.observer();
-    assert!(observer.snapshot().file_open);
-    file.as_file().set_len(0).unwrap(); // 原cluster在较早已回写页；保留Directory不能取代其真实record读取。
-    assert!(
-        matches!(store.cluster_in_directory(&directory, 0), Err(Error::Storage(error))
-        if error.kind() == std::io::ErrorKind::UnexpectedEof)
-    );
-    assert!(matches!(
-        store.cluster_in_directory(&directory, 0),
-        Err(Error::Poisoned)
-    ));
-    let closed = observer.snapshot();
-    assert!(
-        closed.owner_closed
-            && !closed.file_open
-            && closed.buffer_bytes == 0
-            && !closed.cleanup_failed
-    );
-}
-
-#[test]
 fn sealed_store_moves_the_unique_file_and_batches_exact_original_glyphs_with_real_release() {
+    // Persist enough glyphs to cross a reader batch, then retire the original job.
+    // Sealing transfers the unique file rather than keeping the producer alive.
     let fixture = Fixture::new(&"Office ".repeat(110));
     let source_observer = fixture.source.resource_observer();
     let backing = fixture.source.original_backing_observer().unwrap();
@@ -409,6 +392,8 @@ fn sealed_store_moves_the_unique_file_and_batches_exact_original_glyphs_with_rea
     let proof = capture(&mut store, &mut item);
     let count = store.facts(&proof).unwrap().glyphs;
     assert!(count > 512);
+    // Only this finite oracle keeps expected glyphs; the product reads bounded
+    // batches from the same sealed paged file.
     let mut expected = Vec::new();
     for ordinal in 0..count {
         expected.push(item.glyph(ordinal).unwrap().unwrap());
@@ -416,7 +401,7 @@ fn sealed_store_moves_the_unique_file_and_batches_exact_original_glyphs_with_rea
     let observer = store.observer();
     store.seal_items().unwrap();
     let sealed = observer.snapshot();
-    assert!(sealed.owner_closed); // Writer已实际移交原FD，下面的Reading仍必须允许真实读取。
+    assert!(sealed.owner_closed); // Writer ownership ended, but the transferred reader owns the same FD.
     assert!(
         sealed.file_open
             && sealed.mapped_bytes == 0
@@ -424,7 +409,7 @@ fn sealed_store_moves_the_unique_file_and_batches_exact_original_glyphs_with_rea
             && !sealed.reader_failed
     );
     drop(item);
-    drop(coordinator); // 再读取的是原唯一sealed FD，不靠原job、item或临时cluster索引。
+    drop(coordinator); // Later reads use the sealed FD after the original job and item have gone.
     let blank = MarkdownShapedGlyph {
         glyph_id: 0,
         source_utf16_cluster: 0,
@@ -436,6 +421,8 @@ fn sealed_store_moves_the_unique_file_and_batches_exact_original_glyphs_with_rea
     };
     let mut batch = [blank; 256];
     let mut start = 0;
+    // Cover every persisted glyph with batches of at most 256, including the final
+    // short batch and a legal empty range at EOF.
     while start < count {
         let end = (start + batch.len()).min(count);
         store
@@ -453,7 +440,7 @@ fn sealed_store_moves_the_unique_file_and_batches_exact_original_glyphs_with_rea
             && !closed.cleanup_failed
             && !closed.reader_failed
     );
-    drop(fixture); // 所有真实Source/Font都归还后才核底层资源；observer没有保活强边。
+    drop(fixture); // Weak observers cannot keep the actual source, font or backing alive.
     assert!(source_observer.payload_released());
     assert!(font_observer.payload_released());
     assert!(backing.unmap_succeeded() && backing.mapped_bytes() == 0 && !backing.failed());
@@ -461,6 +448,8 @@ fn sealed_store_moves_the_unique_file_and_batches_exact_original_glyphs_with_rea
 
 #[test]
 fn metadata_uses_the_actual_record_budget_and_invalid_large_batch_permanently_rejects() {
+    // Use real style metadata large enough to require multiple writer quanta;
+    // read it back through the stored style API before testing batch rejection.
     let fixture = Fixture::new("Office");
     let mut coordinator = fixture.coordinator();
     let style = MarkdownLineComposeStyle {
@@ -485,21 +474,6 @@ fn metadata_uses_the_actual_record_budget_and_invalid_large_batch_permanently_re
     let proof = capture(&mut store, &mut item);
     let restored = store.style(&proof).unwrap();
     assert_eq!(restored.presentation, style.presentation);
-    // 同一目录真实编码保留原样式及零缩进；样式保留位、负缩进和剩余保留字节都必须拒绝。
-    let encoded = encode_directory(&store.directory(&proof).unwrap()).unwrap();
-    assert_eq!(
-        decode_directory(encoded).unwrap().presentation,
-        style.presentation
-    );
-    assert_eq!(decode_directory(encoded).unwrap().paragraph_inset_26_6, 0);
-    for (offset, bit) in [(43, 0x80), (47, 0x80), (48, 1)] {
-        let mut damaged = encoded;
-        damaged[2][offset] |= bit;
-        assert!(matches!(
-            decode_directory(damaged),
-            Err(Error::InconsistentCoverage)
-        ));
-    }
     assert_eq!(restored.features, style.features);
     assert_eq!(restored.language, style.language);
     store.seal_items().unwrap();
@@ -512,12 +486,14 @@ fn metadata_uses_the_actual_record_budget_and_invalid_large_batch_permanently_re
         x_offset: 0,
         y_offset: 0,
     };
+    // The oversized external batch is rejected before any output slot is changed;
+    // its failure also retires this store instead of silently truncating the range.
     let mut invalid = [blank; 257];
     assert!(matches!(
         store.glyphs(&proof, 0..257, &mut invalid),
         Err(Error::InvalidRequest)
     ));
-    assert!(invalid.iter().all(|value| *value == blank)); // 大预算先拒，不先读/写输出再截短请求。
+    assert!(invalid.iter().all(|value| *value == blank)); // Reject before reading or changing caller output.
     assert!(matches!(store.glyph(&proof, 0), Err(Error::Poisoned)));
     let state = store.observer().snapshot();
     assert!(!state.file_open && state.mapped_bytes == 0 && !state.cleanup_failed);

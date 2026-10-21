@@ -1,4 +1,6 @@
-//! 独立65,523B输入的真实文档头尾及中部字体回退；原四MiB Find、三秒门与关闭收据保留。
+//! Exercise actual document endpoints and mid-document font fallback in an
+//! independent 65,523-byte fixture, preserving the original 4MiB Find, three-second
+//! deadline, and strict close-receipt scenarios.
 
 use super::*;
 use objc2::runtime::Sel;
@@ -10,7 +12,8 @@ const BYTES: usize = 65_523;
 const EMOJI_PAIR: usize = 8_192;
 const LATER_EMOJI: usize = 16_000;
 
-/// 中部连续/后续emoji后恢复中文，末四units仍是😀e+U+0301；全部按固定小片生成。
+/// Stream fixed fragments with Chinese following both adjacent/later emoji runs.
+/// The final four UTF-16 units remain an emoji plus e/combining-acute grapheme.
 fn write(file: &mut tempfile::NamedTempFile) -> Result<(), String> {
     fixture::fill(file, fixture::LOCAL_FIRST)?;
     file.write_all("局部".as_bytes())
@@ -24,11 +27,13 @@ fn write(file: &mut tempfile::NamedTempFile) -> Result<(), String> {
     fixture::fill(file, EMOJI_PAIR - 132)?;
     file.write_all("😀😀".as_bytes())
         .map_err(|cause| cause.to_string())?;
-    // 两个emoji占四个UTF16单位；后续中文要求真实回到原字体，不能把回退字体延用到段尾。
+    // Two emoji occupy four UTF-16 units. Following Chinese requires the original
+    // font again rather than extending the fallback font to paragraph end.
     fixture::fill(file, LATER_EMOJI - EMOJI_PAIR - 4)?;
     file.write_all("😀".as_bytes())
         .map_err(|cause| cause.to_string())?;
-    // 第二个独立回退段随后仍有中文，检验同一Source/plan可以再次暂停并接续。
+    // Chinese after the second fallback run verifies repeated suspension and
+    // resumption of this same Source/plan.
     fixture::fill(file, UTF16 - LATER_EMOJI - 2 - 4)?;
     file.write_all("😀e\u{301}".as_bytes())
         .map_err(|cause| cause.to_string())?;
@@ -45,13 +50,17 @@ fn write(file: &mut tempfile::NamedTempFile) -> Result<(), String> {
     Ok(())
 }
 
-/// 从实际NSTextInputClient selector进入，与系统文本动作相同，不调用私有选择setter。
+/// Use the actual NSTextInputClient selector route shared with system text actions,
+/// without setting private selection state.
 fn selector(rig: &Rig, selector: Sel) {
     let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**rig.view);
-    // SAFETY: client来自仍由本Rig保活的真实View；selector只取下面固定Cocoa文本动作。
+    // SAFETY: The Rig keeps this actual view alive; selectors are only the fixed
+    // Cocoa text actions used by the cases below.
     unsafe { client.doCommandBySelector(selector) };
 }
 
+/// Require the actual selector to commit a directed endpoint on the original
+/// Source, then prove its caret visible in the corresponding completed CPU frame.
 fn endpoint(
     rig: &mut Rig,
     stage: &str,
@@ -100,7 +109,8 @@ fn endpoint(
     Ok(())
 }
 
-/// 未到EOF时四个垂直selector仍须交付真实完整帧；纯选择不改文字，Shift始终保留原anchor。
+/// Vertical selectors before EOF still require actual complete frames. Selection
+/// changes preserve text, and Shift retains the original anchor.
 fn vertical(
     rig: &mut Rig,
     stage: &str,
@@ -116,7 +126,7 @@ fn vertical(
         .map_err(|cause| cause.to_string())?;
     let event = observe(&rig.body)?;
     selector(rig, action);
-    wait_frame(stage, &rig.body, event)?; // 完整像素帧不等于全文complete；这些动作只准备真实目标附近的前缀。
+    wait_frame(stage, &rig.body, event)?; // Complete pixels do not mean document EOF; prepare only the actual target's prefix.
     let key = rig
         .view
         .capture_ready_scene_key()
@@ -162,7 +172,8 @@ fn vertical(
     ))
 }
 
-/// 原Pending页面在真实宽度变化后必须撤销；恢复尺寸只正常重排，不恢复旧导航意图。
+/// Actual width changes revoke the pending page. Restoring width performs normal
+/// reflow and cannot restore the original cancelled navigation intent.
 fn vertical_width_cancel(rig: &mut Rig) -> Result<(), String> {
     let before = rig.view.input_state().map_err(|cause| cause.to_string())?;
     let mut previous = rig
@@ -171,14 +182,15 @@ fn vertical_width_cancel(rig: &mut Rig) -> Result<(), String> {
         .map_err(|cause| cause.to_string())?;
     for action in [sel!(pageDown:), sel!(scrollPageDown:)] {
         selector(rig, action);
-        selector(rig, action); // 原宽度负控同时撤销尚未消费的整段，不能只取消最后一条。
+        selector(rig, action); // Width changes must revoke the entire unconsumed sequence, not just its final action.
         if rig.view.input_state().map_err(|cause| cause.to_string())? != before {
             return Err("在途Page动作提前改变了原输入".into());
         }
         for width in [680.0, 720.0] {
             let event = observe(&rig.body)?;
             rig.panel.setContentSize(NSSize::new(width, 348.0));
-            wait_frame("vertical_width_cancels_original_page", &rig.body, event)?; // 宽度改变只重排当前首屏，不得为测试强制全文EOF。
+            // Resize reflows the current first viewport without forcing document EOF for this case.
+            wait_frame("vertical_width_cancels_original_page", &rig.body, event)?;
             let key = rig
                 .view
                 .capture_ready_scene_key()
@@ -191,13 +203,14 @@ fn vertical_width_cancel(rig: &mut Rig) -> Result<(), String> {
                 return Err("旧PageDown跨宽度重排补签了后来选择或滚动".into());
             }
             rig.remember_receipt()?;
-            previous = key; // 每次真实宽度对应新排版Source；恢复旧尺寸不能复活先前Pending票。
+            previous = key; // Each actual width has a new layout Source; restored size cannot revive an earlier Pending ticket.
         }
     }
     Ok(())
 }
 
-/// 真实Page往返与24次邻行往返跨越两个视口边界；保存的只有有限源位置，不缓存文字或行索引。
+/// Actual page travel and 24 neighboring-line round trips cross two viewport
+/// boundaries. Retain bounded positions only, without cached text or line indexes.
 fn vertical_cases(rig: &mut Rig, source: &MarkdownLayoutTextAuthority) -> Result<(), String> {
     let end_frame = observe(&rig.body)?;
     selector(rig, sel!(moveToEndOfLine:));
@@ -214,6 +227,8 @@ fn vertical_cases(rig: &mut Rig, source: &MarkdownLayoutTextAuthority) -> Result
         .first_rect()
         .origin
         .x;
+    // A short CRLF line temporarily clamps x, but later long lines must recover
+    // the original horizontal goal and reverse through the same visual-line heads.
     let mut line_heads = [end_head; 4];
     let mut line_x = [end_x; 3];
     for index in 0..3 {
@@ -314,8 +329,8 @@ fn vertical_cases(rig: &mut Rig, source: &MarkdownLayoutTextAuthority) -> Result
         return Err("原目标列的Page往返未回到文首实际caret".into());
     }
     let event = observe(&rig.body)?;
-    selector(rig, sel!(pageDown:)); // 仍未准备的页面只在途，不得跨后续明确DocStart复活。
-    selector(rig, sel!(pageDown:)); // 连续已接受动作也必须整体归还，不能留下第二次旧导航。
+    selector(rig, sel!(pageDown:)); // An unprepared page stays pending and cannot outlive the following explicit DocStart.
+    selector(rig, sel!(pageDown:)); // Revoke every accepted action, leaving no second stale navigation request.
     selector(rig, sel!(moveToBeginningOfDocument:));
     wait_frame("new_document_start_cancels_pending_page", &rig.body, event)?;
     let key = rig
@@ -332,7 +347,8 @@ fn vertical_cases(rig: &mut Rig, source: &MarkdownLayoutTextAuthority) -> Result
     Ok(())
 }
 
-/// 另用20pt正文视口强制相邻行离屏；真实逐帧落点作为连发oracle，原240pt回归保持不变。
+/// A separate 20pt document viewport forces neighboring lines offscreen. Actual
+/// serial frame endpoints provide burst expectations without changing the existing 240pt case.
 fn pending_vertical_sequence(
     rig: &mut Rig,
     source: &MarkdownLayoutTextAuthority,
@@ -372,7 +388,7 @@ fn pending_vertical_sequence(
     let original = rig.view.input_state().map_err(|cause| cause.to_string())?;
     let original_progress = rig.body.progress().map_err(|cause| cause.to_string())?;
     let resized = observe(&rig.body)?;
-    rig.panel.setContentSize(NSSize::new(720.0, 128.0)); // 原Find栏108pt保持原样，只把真实正文收为20pt。
+    rig.panel.setContentSize(NSSize::new(720.0, 128.0)); // Keep the existing 108pt Find bar and reduce only the actual body to 20pt.
     wait_frame("burst_twenty_point_viewport", &rig.body, resized)?;
     let small = rig
         .view
@@ -384,7 +400,8 @@ fn pending_vertical_sequence(
     {
         return Err("连发控制没有取得同源20pt真实小视口或缩放改变了输入".into());
     }
-    // 每个场景都在首条实际尚未提交时发送第二条；反向及Shift分别消费，不能用净delta替代。
+    // Send the second action while the first remains actually uncommitted.
+    // Reverse/Shift actions must each consume their own semantics, not a net delta.
     for (stage, actions, expected) in [
         (
             "pending_down_twice",
@@ -445,7 +462,7 @@ fn pending_vertical_sequence(
                 "{stage}: 首个动作已经提交，未覆盖真实Pending连续输入"
             ));
         }
-        selector(rig, actions[1]); // 同一runloop不执行中间队列，第二条必须追加到原未提交输入。
+        selector(rig, actions[1]); // With no intervening queue delivery, append to the original uncommitted input sequence.
         if rig.view.input_state().map_err(|cause| cause.to_string())? != before {
             return Err(format!("{stage}: 连续请求提前发布了中间选择"));
         }
@@ -502,7 +519,8 @@ fn pending_vertical_sequence(
     Ok(())
 }
 
-/// 原四MiB单段落尚未准备到远端时真正翻页往返；不能先走DocEnd再把已有行当懒加载。
+/// Page through the actual 4MiB paragraph before remote content is prepared. Going
+/// to document end first would invalidate this lazy-loading scenario.
 pub(super) fn lazy_page(rig: &mut Rig) -> Result<(), String> {
     let original = rig
         .view
@@ -522,7 +540,8 @@ pub(super) fn lazy_page(rig: &mut Rig) -> Result<(), String> {
     ] {
         let (head, y, _) = vertical(rig, stage, action, backwards, None, &original.source)?;
         let progress = rig.body.progress().map_err(|cause| cause.to_string())?;
-        // 原首个远端Find位于70001；只翻一页不应让该处进入frontier/shaper，更不能排到全文EOF。
+        // The first remote Find is at unit 70,001. One page must not reach it in
+        // frontier/shaping work, much less prepare the entire document to EOF.
         if progress.complete
             || progress.producer_serial != initial.producer_serial
             || progress.frontier_source_bytes >= fixture::FIRST * 3
@@ -546,14 +565,16 @@ pub(super) fn lazy_page(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 同一未完成4MiB正文连续两次纯Page，不改caret/原目标列；动作不能被覆盖成最后一次。
+/// Two pure-page commands on the same incomplete 4MiB body preserve caret and
+/// horizontal goal. Neither accepted action may be overwritten by the last one.
 fn pure_page_scroll(rig: &mut Rig) -> Result<(), String> {
     let source = rig
         .view
         .capture_ready_scene_key()
         .map_err(|cause| cause.to_string())?
         .source;
-    // 先用真实邻行往返建立非空垂直目标列；纯滚动不能把它清掉或换成当前可见行的列。
+    // Establish a real horizontal goal through neighboring-line navigation.
+    // Pure scrolling must neither clear it nor replace it with the visible row's column.
     vertical(
         rig,
         "pure_page_seed_vertical_goal",
@@ -580,7 +601,7 @@ fn pure_page_scroll(rig: &mut Rig) -> Result<(), String> {
         .probe_find_input_weak()
         .upgrade()
         .ok_or("原Input已释放")?;
-    let body = rig.body.clone(); // 原权限闭包只保活当前Body到本控制返回，不借住整个Rig妨碍归还真实收据。
+    let body = rig.body.clone(); // This control's authority closure retains only Body, not the whole Rig or its receipt borrows.
     let current = |epoch| {
         epoch == EPOCH
             && NativeMarkdownPagedTextViewDelegate::current(&*body, epoch)
@@ -603,7 +624,7 @@ fn pure_page_scroll(rig: &mut Rig) -> Result<(), String> {
     ] {
         let event = observe(&rig.body)?;
         selector(rig, action);
-        selector(rig, action); // 不运行中间队列，两次真实已接受动作必须逐次交标准Native滚动。
+        selector(rig, action); // With no queue delivery between them, both accepted actions must reach ordinary Native scrolling.
         if rig.view.input_state().map_err(|cause| cause.to_string())? != original.request.input {
             return Err("裸Page在排版等待前改变了原Input".into());
         }
@@ -641,7 +662,8 @@ fn pure_page_scroll(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 实际编辑前留下未消费的原纯滚动；后继Replace必须撤它，而非在新Source重放。
+/// Leave original pure scrolling unconsumed before editing. The following actual
+/// replacement must revoke it, never replay it against the new Source.
 pub(super) fn pending_scroll_before_edit(rig: &Rig) -> Result<(), String> {
     let before = rig.view.input_state().map_err(|cause| cause.to_string())?;
     selector(rig, sel!(scrollPageDown:));
@@ -652,7 +674,8 @@ pub(super) fn pending_scroll_before_edit(rig: &Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 只有原Composer已经到真实EOF才允许系统底部clamp；期望取实际空滚动文档frame，不估计全文行高。
+/// Bottom clamping requires the original composer to reach actual EOF. Derive the
+/// limit from the real scroll document frame rather than estimated document line heights.
 fn pure_page_eof_clamp(rig: &mut Rig) -> Result<(), String> {
     let before = rig
         .view
@@ -690,7 +713,8 @@ fn pure_page_eof_clamp(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
-/// 原全CJK/emoji源已取得全源UniformZero；标准Word现在必须真实移动，不能保留旧Unsupported负控。
+/// This CJK/emoji source has actual source-wide UniformZero direction authority.
+/// Standard word navigation must move rather than preserve an obsolete Unsupported expectation.
 fn known_word_move(rig: &mut Rig) -> Result<(), String> {
     let before = rig
         .view
@@ -762,6 +786,8 @@ fn known_word_move(rig: &mut Rig) -> Result<(), String> {
     Ok(())
 }
 
+/// Combine actual word/page/document actions with independent fixture-byte checks,
+/// then verify Native insertion and subsequent Find against the new original Source.
 fn cases(rig: &mut Rig) -> Result<(), String> {
     known_word_move(rig)?;
     vertical_width_cancel(rig)?;
@@ -814,8 +840,9 @@ fn cases(rig: &mut Rig) -> Result<(), String> {
         },
         &original.source,
         true,
-    )?; // 非零anchor必须原样保留；真正EOF只能由complete后的末行签发。
-    // 前缀计算到EOF不能替代中部真实绘制；通过原Find把两个回退段分别带进实际视口。
+    )?; // Preserve the nonzero anchor; only the actual completed final line can certify EOF.
+    // Prefix preparation reaching EOF is no proof of middle-document drawing.
+    // Use actual Find to bring both fallback runs into the viewport independently.
     rig.bar.query.setStringValue(ns_string!("😀😀"));
     cases::visible(
         rig,
@@ -862,7 +889,7 @@ fn cases(rig: &mut Rig) -> Result<(), String> {
     {
         return Err("原生selectAll没有提交真实有向全文选择".into());
     }
-    selector(rig, sel!(moveToBeginningOfDocument:)); // 不运行队列、不等Ready，立即消费下一原生动作。
+    selector(rig, sel!(moveToBeginningOfDocument:)); // Consume the next Native action immediately, without queue delivery or waiting for Ready.
     let top = rig.view.input_state().map_err(|cause| cause.to_string())?;
     frame::wait_complete_frame("select_all_immediate_document_start", &rig.body, immediate)?;
     let key = rig
@@ -886,12 +913,14 @@ fn cases(rig: &mut Rig) -> Result<(), String> {
     drop(document);
     rig.remember_receipt()?;
 
-    // 返回顶部后走真实NSTextInputClient输入，不能只证明一个逻辑head或用Core直接改字。
+    // After returning to the top, insert through actual NSTextInputClient rather
+    // than proving only a logical head or editing directly through Core.
     let edited = observe(&rig.body)?;
-    selector(rig, sel!(pageDown:)); // 原页面仍在途时实际输入必须撤它，不能在新Source里补签旧离屏目标。
-    selector(rig, sel!(pageDown:)); // 整串原输入一起撤权，后继Source不能接手第二次动作。
+    selector(rig, sel!(pageDown:)); // Actual insertion revokes a pending page; a new Source cannot authorize the old target.
+    selector(rig, sel!(pageDown:)); // Revoke the full original sequence so the successor Source inherits no second action.
     let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**rig.view);
-    // SAFETY: 原client仍保活；NSNotFound要求它消费当前真实caret，载荷只有单个合成ASCII。
+    // SAFETY: The original client remains alive. NSNotFound uses its actual
+    // current caret, with only one synthetic ASCII character as input.
     unsafe {
         client.insertText_replacementRange(
             &NSString::from_str("N"),
@@ -938,10 +967,10 @@ pub(super) fn run(mtm: MainThreadMarker) -> Result<(), String> {
         write(&mut file)?;
         let mut rig = Rig::attach_fixture(mtm, file, UTF16, 2)?;
         let result = cases(&mut rig);
-        let pending = release::hold_target_fixture_pending(&mut rig); // 本导航源真实含“目标”，保留原跨close未绑定票负控。
-        let retirement = release::close(rig, false)?; // 任一动作失败也先走原完整关闭/最后资源事件。
+        let pending = release::hold_target_fixture_pending(&mut rig); // This source actually contains the target; retain an unbound ticket across close.
+        let retirement = release::close(rig)?; // Every action failure still performs full close and final-resource observation first.
         Ok((retirement, pending.and(result)))
     })?;
-    retirement.verify(false)?; // 与四MiB相同的Native/Source/Font/worker/像素门，没有新豁免。
+    retirement.verify()?; // Preserve the same Native/Source/font/worker/pixel requirements as the 4MiB fixture.
     result
 }

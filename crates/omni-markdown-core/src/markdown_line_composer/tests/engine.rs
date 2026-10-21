@@ -1,4 +1,5 @@
-//! 正式worker经真实样式响应产出多行；测试不直接访问或伪造Store目录。
+//! The production worker emits multiple lines through real style responses.
+//! These tests neither access nor manufacture Store directories.
 use super::*;
 
 pub(super) fn composer(
@@ -6,6 +7,8 @@ pub(super) fn composer(
     width: i64,
     cancel: MarkdownLineComposeCancellation,
 ) -> (MarkdownLineComposer, MarkdownLineRegisteredFont) {
+    // The actual palette owns the font; the original production constructor creates
+    // its sole coordinator/writer over this fixture's captured Source.
     let catalog = MarkdownLineFontCatalog::new();
     let actual = catalog.register(&font()).unwrap();
     let worker = MarkdownLineComposer::new(
@@ -23,6 +26,8 @@ pub(super) fn drive(
     registered: &MarkdownLineRegisteredFont,
     stop_after_first: bool,
 ) -> usize {
+    // Consume only public bounded answers and real response factories. Complete
+    // lines must cover a continuous Source prefix before this driver may return.
     let mut next = 0;
     let mut lines = 0;
     for _ in 0..100_000 {
@@ -82,8 +87,9 @@ pub(super) fn drive(
 }
 #[test]
 fn production_worker_composes_mixed_items_into_real_lines_and_unique_readonly_output() {
-    // 同一真实字体覆盖三种脚本。保留原窄行，再以较宽行完整消费多次脚本切换；
-    // 只证明连续源、完整实际字形和资源收尾，不读取内部 forest 或断言定位调用次数。
+    // One actual font covers three scripts. Both narrow and wider lines cross real
+    // script changes; verify continuous Source, complete glyphs, and actual release
+    // without inspecting the forest or asserting lookup call counts.
     let text = "office αλφα слово office βητα текст office gamma конец ".repeat(17);
     for width in [140, 800] {
         let fixture = Fixture::new(&text);
@@ -115,8 +121,9 @@ fn production_worker_composes_mixed_items_into_real_lines_and_unique_readonly_ou
                         .font()
                         .permits(&registered.font().authority())
                 );
-                // 原只读输出分小批读回全部字形；不能用零长读取或 .notdef 冒称完整渲染。
-                // 三种脚本均为 LTR，视觉 part 的源顺序必须同时完整覆盖原行。
+                // Read all real output glyphs in small batches; empty reads or
+                // .notdef cannot prove rendering. All three scripts are LTR, so
+                // visual parts must also continuously cover their original line.
                 let mut glyphs = [crate::MarkdownShapedGlyph {
                     glyph_id: 0,
                     source_utf16_cluster: 0,
@@ -165,7 +172,8 @@ fn production_worker_composes_mixed_items_into_real_lines_and_unique_readonly_ou
                 && !closed.cleanup_failed
                 && !closed.reader_failed
         );
-        // 原输出关闭不等于原 Source 已释放；归还真实注册和文档后再核全部 worker 与映射。
+        // Closing output does not release every Source owner. Drop the actual
+        // registration/document before checking all workers and backing mappings.
         drop((registered, fixture));
         assert!(resources.is_released());
         assert!(source_mapping.unmap_succeeded());
@@ -175,6 +183,8 @@ fn production_worker_composes_mixed_items_into_real_lines_and_unique_readonly_ou
 }
 #[test]
 fn production_worker_can_seal_only_its_real_line_prefix_without_claiming_the_tail() {
+    // Stop after one actual LineReady, then consume the worker's sealed output.
+    // Its real reader must expose only that prefix, not the unprepared suffix.
     let fixture = Fixture::new("office office office office office office office office");
     let (mut worker, registered) =
         composer(&fixture, 80 * 64, MarkdownLineComposeCancellation::new());
@@ -189,6 +199,8 @@ fn production_worker_can_seal_only_its_real_line_prefix_without_claiming_the_tai
 }
 #[test]
 fn control_characters_are_explicit_pending_work_and_never_published_as_missing_glyphs() {
+    // Exercise public control requests and exact CRLF/Unicode separator spans.
+    // With no response supplied, neither text glyphs nor completed output may appear.
     for (text, offset, kind) in [
         ("a\tb", 1, MarkdownLineInlineControlKind::Tab),
         ("a\r\nb", 1, MarkdownLineInlineControlKind::CarriageReturn),
@@ -250,6 +262,8 @@ fn control_characters_are_explicit_pending_work_and_never_published_as_missing_g
 }
 #[test]
 fn worker_cancel_and_zero_budget_revoke_the_whole_candidate_without_source_mutation() {
+    // Cancel the actual worker and separately reject an invalid budget. Repeated
+    // calls observe terminal revocation, while the original document stays unchanged.
     let fixture = Fixture::new("office office");
     let cancellation = MarkdownLineComposeCancellation::new();
     let (mut worker, _registered) = composer(&fixture, 80 * 64, cancellation.clone());
@@ -278,6 +292,9 @@ fn worker_cancel_and_zero_budget_revoke_the_whole_candidate_without_source_mutat
 
 #[test]
 fn production_worker_commits_signed_unsafe_prefixes_without_full_tail_reshaping() {
+    // Actual ffi ligatures and a narrow width force original unsafe-prefix
+    // selection/reshape/Store publication. Complete output, not a private phase,
+    // must cover every canonical position and retire each real selector child.
     let fixture = Fixture::new(&"ffi".repeat(16));
     let (mut worker, registered) =
         composer(&fixture, 8 * 64, MarkdownLineComposeCancellation::new());
@@ -307,7 +324,8 @@ fn production_worker_commits_signed_unsafe_prefixes_without_full_tail_reshaping(
                 assert_eq!(facts.source_utf16.start, cursor);
                 assert!(facts.source_utf16.end > cursor && facts.glyphs > 0);
                 if facts.kind == MarkdownComposedLineKind::Mandatory {
-                    // 最后的真实EOF余量保持强制机会；任何中间分片都不能借它伪装文档结束。
+                    // Only actual final EOF retains Mandatory. An intermediate
+                    // glyph part cannot borrow that fact to claim document completion.
                     assert_eq!(facts.source_utf16.end, fixture.source.utf16_len());
                 } else {
                     assert!(matches!(
@@ -326,7 +344,8 @@ fn production_worker_commits_signed_unsafe_prefixes_without_full_tail_reshaping(
     }
     assert_eq!(cursor, fixture.source.utf16_len());
     assert!(count > 16 && reshapes > 16);
-    // 此计数含原item一次输入和协调元数据读取；只限制有限夹具不发生全tail重复输入。
+    // Public work includes original item input and coordination metadata reads.
+    // Bound repeated whole-suffix work only for this finite regression fixture.
     assert!(reshaped_bytes < 16 * fixture.source.byte_len());
     let mut output = worker.into_output().unwrap();
     let observer = output.resource_observer();
@@ -373,7 +392,8 @@ fn production_worker_commits_signed_unsafe_prefixes_without_full_tail_reshaping(
             && !closed.cleanup_failed
             && !closed.reader_failed
     );
-    // 同一真实selector生产管线必须结算所有前缀child和临时cluster，不留按行票据集合。
+    // The actual selector pipeline must release all real prefix children and
+    // temporary cluster resources, without retaining a receipt owner per line.
     let checked = all_resources.snapshot().unwrap();
     assert!(checked.resolvers.registered > 0);
     assert!(checked.resolvers.jobs_created > 16);
@@ -401,6 +421,8 @@ fn drive_controls(
     worker: &mut MarkdownLineComposer,
     font: &MarkdownLineRegisteredFont,
 ) -> Vec<MarkdownComposedLineFacts> {
+    // Finite control fixtures use their real response factories, including actual
+    // paragraph tab style; only public committed LineReady facts are retained here.
     let mut lines = Vec::new();
     for _ in 0..100_000 {
         match worker
@@ -443,6 +465,9 @@ fn drive_controls(
 }
 #[test]
 fn physical_breaks_empty_lines_and_trailing_line_have_real_non_glyph_parts() {
+    // These independent expected physical-line counts include real empty EOF
+    // paragraphs. Inspect their actual zero-glyph parts rather than infer them from
+    // text length or add a drawable space for a separator.
     for (text, count) in [
         ("", 1),
         ("\n", 2),
@@ -506,6 +531,8 @@ fn physical_breaks_empty_lines_and_trailing_line_have_real_non_glyph_parts() {
 }
 #[test]
 fn left_tabs_recompute_from_each_actual_line_pen_and_never_draw_space_glyphs() {
+    // The original explicit stop/default interval determines each tab's actual
+    // advance from this line's pen. Wrapped lines cannot retain a previous line's pen.
     let fixture = Fixture::new("aa aa\tbb cc dd\tend");
     let (mut worker, font) = composer(&fixture, 55 * 64, MarkdownLineComposeCancellation::new());
     let facts = drive_controls(&mut worker, &font);
@@ -546,6 +573,8 @@ fn left_tabs_recompute_from_each_actual_line_pen_and_never_draw_space_glyphs() {
 }
 #[test]
 fn right_tab_stays_typed_pending_until_actual_lookahead_and_default_interval_are_known() {
+    // Submit a real right-aligned stop without lookahead. The unresolved typed
+    // placement must remain visible instead of substituting left alignment or space.
     let fixture = Fixture::new("a\tb");
     let (mut worker, font) = composer(&fixture, 800 * 64, MarkdownLineComposeCancellation::new());
     let mut seen = false;
@@ -620,6 +649,8 @@ fn next_control(
 }
 #[test]
 fn equal_source_control_nonce_is_not_transferable_and_replay_never_commits_data() {
+    // Separate real workers on one Source issue distinct control nonces. Neither a
+    // foreign response nor a consumed replay can publish control or mutate the file.
     let fixture = Fixture::new("a\tb");
     let (mut first, font) = composer(&fixture, 800 * 64, MarkdownLineComposeCancellation::new());
     let (mut second, other_font) =
@@ -656,6 +687,8 @@ fn source_failure_precedes_control_response_and_cannot_be_hidden_by_cached_nonce
         .text_snapshot()
         .visit_byte_range(0..1, |_| Ok(()))
         .unwrap();
+    // Existing EIO injection goes through actual mapped backing reclaim. It is not
+    // a naturally induced kernel error; cached nonce/font data must still retain it.
     fixture.document.fail_next_original_reclaim_for_test();
     assert_eq!(
         fixture.document.reclaim_original_read_windows_for_test(),
@@ -683,5 +716,5 @@ fn source_failure_precedes_control_response_and_cannot_be_hidden_by_cached_nonce
     assert_eq!(closed.clusters.active, 0);
     drop((worker, font, fixture));
     assert!(resources.snapshot().unwrap().source_payload_released);
-    assert!(!resources.is_released()); // 实际FD归还不擦除Source的首EIO，不能伪签健康完成。
+    assert!(!resources.is_released()); // Real FD release cannot erase the original EIO.
 }

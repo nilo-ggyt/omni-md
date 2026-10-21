@@ -1,7 +1,10 @@
-//! 原Item起点只准备正在消费的真实B段；依赖与段端点查询共用原量子，不复制正文或段目录。
+//! Prepare only the actual bidi paragraph at this original item position.
+//! Dependency and endpoint work share one quantum without copied text or directories.
 
 use super::*;
 
+/// Resume the original paragraph preparation and return readiness separately
+/// from the source/scalar/metadata work already consumed during this step.
 pub(super) fn prepare(
     payload: &mut Payload,
     authority: &MarkdownLayoutTextAuthority,
@@ -13,14 +16,17 @@ pub(super) fn prepare(
         .as_mut()
         .ok_or(MarkdownLineComposeError::InconsistentCoverage)?;
     if !bidi.uses_prepared_paragraphs() {
-        return Ok(true); // 原单段/Paged路径没有端点查询工作；沿外层原Source/取消guard继续，不重复授权。
+        // Existing single-paragraph/paged representations need no endpoint
+        // preparation; outer Source/cancellation guards remain authoritative.
+        return Ok(true);
     }
     let budget = MarkdownBidiPrepareBudget {
         bytes: budget.bytes.min(4096),
         scalars: budget.scalars.min(256),
         metadata_ops: budget.metadata_units.min(256),
     };
-    // 同一原入口按真实已封存表示派发；!Send 在途 owner 仅留 Item，root 证书仍复用原 Uniform。
+    // Dispatch through the same sealed representation. The non-Send pending
+    // owner stays local to Item while root-level proof reuses its original uniform fact.
     let progress = bidi.prepare_layout_paragraph_range(
         authority,
         payload.cursor,

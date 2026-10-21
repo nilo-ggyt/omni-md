@@ -5,8 +5,6 @@ use std::ffi::CString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-#[cfg(feature = "native-markdown-candidate")]
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -20,14 +18,7 @@ use thiserror::Error;
 mod attachments;
 pub use attachments::MarkdownPendingAttachmentImport;
 #[cfg(feature = "native-markdown-candidate")]
-mod legacy_recovery;
-#[cfg(feature = "native-markdown-candidate")]
 mod native_save;
-#[cfg(feature = "native-markdown-candidate")]
-pub use legacy_recovery::{
-    MarkdownRecoveryHandoff, MarkdownRecoveryPreparation, MarkdownRecoveryRecording,
-    MarkdownRecoveryResolutionOutcome,
-};
 mod paging;
 mod paths;
 pub use paging::{
@@ -50,14 +41,6 @@ use super::markdown_document_buffer::{MarkdownDocumentBuffer, MarkdownDocumentBu
 pub const MARKDOWN_ROOT_DIRECTORY_NAME: &str = "OMNI";
 
 const ATTACHMENTS_DIRECTORY_NAME: &str = "attachments";
-#[cfg(feature = "native-markdown-candidate")]
-const CONFLICT_RECOVERY_DIRECTORY_NAME: &str = "markdown-conflict-recovery";
-#[cfg(feature = "native-markdown-candidate")]
-const CONFLICT_DRAFT_MAGIC: &[u8; 8] = b"OMNIMD1\0";
-#[cfg(feature = "native-markdown-candidate")]
-const CONFLICT_DRAFT_HEADER_BYTES: usize = 20;
-#[cfg(feature = "native-markdown-candidate")]
-const MAX_RECOVERY_RELATIVE_PATH_BYTES: usize = 4_096;
 const MAX_DOCUMENT_BYTES: u64 = 32 * 1_024 * 1_024;
 const MAX_ATTACHMENT_BYTES: u64 = 256 * 1_024 * 1_024;
 const MAX_SEARCH_FILE_BYTES: u64 = 128 * 1_024 * 1_024;
@@ -130,12 +113,10 @@ pub struct MarkdownSearchResult {
 /// Configured session authority; paths and atomic counters own no idle filesystem or worker resources.
 pub struct MarkdownWorkspace {
     configured_root: PathBuf,
-    /// Only the native editor owns historical recovery acquisition and resolution.
-    #[cfg(feature = "native-markdown-candidate")]
-    conflict_recovery_directory: PathBuf,
     active_root: Mutex<Option<PathBuf>>,
     search_generation: Arc<AtomicU64>,
-    /// 目录刷新独立于搜索；文件集合/排序身份变化与会话结束撤销目录权限，同路径正文保存保留。
+    /// Browsing has separate cancellation authority: collection/order changes and
+    /// session closure revoke it, while saving content under the same path preserves it.
     browse_generation: Arc<AtomicU64>,
     /// Native persistence shares one exclusive temporary-name sequence across access clones.
     #[cfg(feature = "native-markdown-candidate")]
@@ -146,11 +127,8 @@ pub struct MarkdownWorkspace {
 /// Lightweight active-session access; its owner must cancel and join any caller-created workers.
 pub struct MarkdownSessionAccess {
     canonical_root: PathBuf,
-    /// Only the native editor owns historical recovery acquisition and resolution.
-    #[cfg(feature = "native-markdown-candidate")]
-    conflict_recovery_directory: PathBuf,
     search_generation: Arc<AtomicU64>,
-    /// 克隆会话只共享撤权计数，不持目录句柄或目录索引。
+    /// Access clones share revocation counters, never directory handles or an eager index.
     browse_generation: Arc<AtomicU64>,
     /// Native persistence shares one exclusive temporary-name sequence across access clones.
     #[cfg(feature = "native-markdown-candidate")]
@@ -159,38 +137,12 @@ pub struct MarkdownSessionAccess {
 
 impl MarkdownWorkspace {
     #[must_use]
-    /// Configure vault and recovery paths without creating directories or activating the plugin.
-    pub fn new(configured_root: PathBuf, _app_data_directory: PathBuf) -> Self {
-        // Portable workspace operations need only the vault; recovery configuration belongs
-        // to the native editor feature and allocates no otherwise-unused path or sequence.
-        Self::with_storage_locations(
-            configured_root,
-            #[cfg(feature = "native-markdown-candidate")]
-            _app_data_directory.join(CONFLICT_RECOVERY_DIRECTORY_NAME),
-        )
-    }
-
-    #[cfg(test)]
-    /// Create isolated recovery storage beneath a test vault without touching application data.
-    fn with_root(configured_root: PathBuf) -> Self {
-        #[cfg(feature = "native-markdown-candidate")]
-        let recovery_directory = configured_root.join(".omni-md-test-conflict-recovery");
-        Self::with_storage_locations(
-            configured_root,
-            #[cfg(feature = "native-markdown-candidate")]
-            recovery_directory,
-        )
-    }
-
-    /// Initialize path and generation ownership without opening files or starting background work.
-    fn with_storage_locations(
-        configured_root: PathBuf,
-        #[cfg(feature = "native-markdown-candidate")] conflict_recovery_directory: PathBuf,
-    ) -> Self {
+    /// Configure the single vault path without opening files, creating storage, or starting work.
+    pub fn new(configured_root: PathBuf) -> Self {
+        // The native model acquires only confined UTF-8 Markdown files. Session configuration
+        // therefore owns no alternate source directory or application-data acquisition path.
         Self {
             configured_root,
-            #[cfg(feature = "native-markdown-candidate")]
-            conflict_recovery_directory,
             active_root: Mutex::new(None),
             search_generation: Arc::new(AtomicU64::new(0)),
             browse_generation: Arc::new(AtomicU64::new(0)),
@@ -258,8 +210,6 @@ impl MarkdownWorkspace {
     fn session_access(&self, canonical_root: PathBuf) -> MarkdownSessionAccess {
         MarkdownSessionAccess {
             canonical_root,
-            #[cfg(feature = "native-markdown-candidate")]
-            conflict_recovery_directory: self.conflict_recovery_directory.clone(),
             search_generation: Arc::clone(&self.search_generation),
             browse_generation: Arc::clone(&self.browse_generation),
             #[cfg(feature = "native-markdown-candidate")]
@@ -280,11 +230,8 @@ impl MarkdownSessionAccess {
         relative_path: &str,
     ) -> Result<MarkdownDocumentBuffer, MarkdownWorkspaceError> {
         let path = resolve_existing_markdown(&self.canonical_root, relative_path)?;
-        let relative_path = relative_markdown_path(&self.canonical_root, &path)?;
-        if let Some(document) = self.open_pending_legacy_recovery(&path, &relative_path)? {
-            // 旧record正文直接由独立snapshot提供；其未知base保持pending，不能自动覆盖当前磁盘。
-            return Ok(document);
-        }
+        // This one confined file supplies both immutable source bytes and the real disk baseline.
+        // Unrelated application-data files are neither inspected nor admitted as substitute text.
         MarkdownDocumentBuffer::open(&path, MAX_DOCUMENT_BYTES)
             .map_err(markdown_document_buffer_open_error)
     }
@@ -381,23 +328,6 @@ impl MarkdownSessionAccess {
         Ok(MarkdownWorkspaceSnapshot { directories, notes })
     }
 
-    /// Seed the historical on-disk format only for isolated recovery regression fixtures.
-    #[cfg(all(test, feature = "native-markdown-candidate"))]
-    fn write_conflict_fixture(
-        &self,
-        relative_path: &str,
-        content: &str,
-    ) -> Result<(), MarkdownWorkspaceError> {
-        // Keep the one real format writer for test acquisition; production only reads
-        // existing records through the bounded recovery protocol and never rewrites them.
-        write_conflict_draft(
-            &self.conflict_recovery_directory,
-            relative_path,
-            content,
-            &self.save_sequence,
-        )
-    }
-
     /// Create a heading note with bounded collision retries and exclusive file creation.
     pub fn create_note(
         &self,
@@ -416,7 +346,8 @@ impl MarkdownSessionAccess {
         requested_title: &str,
         mut synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
     ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
-        // 先声明撤权边界，所有后建文件/rollback guard先drop；纯预校验不激活。
+        // Declare publication before file/rollback owners so their cleanup finishes
+        // first; validation alone does not mark the workspace collection as changed.
         let publication = WorkspaceStructurePublication::new(self);
         let result = (|| {
             let directory = resolve_existing_directory(&self.canonical_root, relative_directory)?;
@@ -450,7 +381,8 @@ impl MarkdownSessionAccess {
                 }
             }
             let path = created_path.ok_or(MarkdownWorkspaceError::NameCollisionLimitExceeded)?;
-            // 新笔记已真实发布；后续sync/open失败也不能让旧搜索末项继续代表原目录。
+            // The new name is already visible. Later sync/inspection failure cannot
+            // allow an older search's final result to represent this changed collection.
             publication.changed();
             synchronize_directory(&directory)?;
             // Creation publishes only a compact receipt. Validate the actual file through
@@ -458,7 +390,8 @@ impl MarkdownSessionAccess {
             let created = inspect_bounded_markdown(&path, MAX_DOCUMENT_BYTES, |_| Ok(()))?;
             mutation_receipt(&self.canonical_root, &path, created.revision)
         })();
-        // 闭包内的pending/inspect guard此时已全部析构，不能提前取未确认标量。
+        // All inner inspection/rollback guards have finished before the publication
+        // owner combines the operation result with any unconfirmed cleanup.
         publication.finish(result)
     }
 
@@ -468,18 +401,21 @@ impl MarkdownSessionAccess {
         relative_parent: &str,
         requested_name: &str,
     ) -> Result<String, MarkdownWorkspaceError> {
-        // 公开入口始终使用真实目录sync；故障注入仅由同模块私有测试调用。
+        // Production always performs real directory sync; only the private in-module
+        // regression entry can select a failing filesystem boundary.
         self.create_directory_with_directory_sync(relative_parent, requested_name, sync_directory)
     }
 
-    /// 同一次结构操作的私有目录持久化边界，不新增公开flag或运行时重试。
+    /// Keep directory durability inside this one creation operation, with no public
+    /// failure switch or automatic replay of a possibly completed mutation.
     fn create_directory_with_directory_sync(
         &self,
         relative_parent: &str,
         requested_name: &str,
         mut synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
     ) -> Result<String, MarkdownWorkspaceError> {
-        // 先声明撤权边界，所有后建文件/rollback guard先drop；纯预校验不激活。
+        // The publication owner outlives all acquired files and rollback guards;
+        // rejecting a name or parent alone must not invalidate directory pages.
         let publication = WorkspaceStructurePublication::new(self);
         let result = (|| {
             let parent = resolve_existing_directory(&self.canonical_root, relative_parent)?;
@@ -504,7 +440,8 @@ impl MarkdownSessionAccess {
                     _ => MarkdownWorkspaceError::StorageUnavailable,
                 }
             })?;
-            // 真实目录已创建，撤销旧查询遍历；失败的目录sync不会恢复旧搜索权限。
+            // Creation changed the actual collection. Revoke old traversal authority
+            // even if the following directory sync reports uncertain durability.
             publication.changed();
             synchronize_directory(&parent)?;
             let canonical_directory = directory.canonicalize().map_err(|_| {
@@ -514,7 +451,8 @@ impl MarkdownSessionAccess {
             ensure_within_root(&self.canonical_root, &canonical_directory)?;
             relative_workspace_path(&self.canonical_root, &canonical_directory)
         })();
-        // 闭包内的pending/inspect guard此时已全部析构，不能提前取未确认标量。
+        // Observe cleanup only after inner guards have finished, rather than
+        // publishing a preliminary result while rollback can still change the tree.
         publication.finish(result)
     }
 
@@ -524,18 +462,21 @@ impl MarkdownSessionAccess {
         relative_path: &str,
         requested_name: &str,
     ) -> Result<String, MarkdownWorkspaceError> {
-        // 公开入口始终使用真实目录sync；故障注入仅由同模块私有测试调用。
+        // The public rename uses real directory durability; a private regression can
+        // exercise failure after the actual rename has already become visible.
         self.rename_directory_with_directory_sync(relative_path, requested_name, sync_directory)
     }
 
-    /// 同一次结构操作的私有目录持久化边界，不新增公开flag或运行时重试。
+    /// Own one rename and its parent-directory durability without replaying a
+    /// completed rename when the later sync fails.
     fn rename_directory_with_directory_sync(
         &self,
         relative_path: &str,
         requested_name: &str,
         mut synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
     ) -> Result<String, MarkdownWorkspaceError> {
-        // 先声明撤权边界，所有后建文件/rollback guard先drop；纯预校验不激活。
+        // Keep revocation alive through all inner resource cleanup. Preflight errors
+        // and an unchanged destination leave existing directory authority intact.
         let publication = WorkspaceStructurePublication::new(self);
         let result = (|| {
             let source = resolve_existing_directory(&self.canonical_root, relative_path)?;
@@ -573,41 +514,48 @@ impl MarkdownSessionAccess {
                     _ => MarkdownWorkspaceError::StorageUnavailable,
                 }
             })?;
-            // 名称已经真实移动，先撤权再执行可能失败的目录持久化。
+            // The entry has actually moved; revoke old pages before attempting
+            // fallible parent-directory durability.
             publication.changed();
             synchronize_directory(parent)?;
             publication.changed();
             relative_workspace_path(&self.canonical_root, &destination)
         })();
-        // 闭包内的pending/inspect guard此时已全部析构，不能提前取未确认标量。
+        // Only after inner resources finish can publication report the final
+        // operation result and any cleanup uncertainty.
         publication.finish(result)
     }
 
     /// Delete an explicitly selected user subtree while protecting the vault root.
     pub fn delete_directory(&self, relative_path: &str) -> Result<(), MarkdownWorkspaceError> {
-        // 公开入口始终使用真实目录sync；故障注入仅由同模块私有测试调用。
+        // The public delete retains the real directory sync; no runtime failure
+        // injection or alternative filesystem implementation is selected here.
         self.delete_directory_with_directory_sync(relative_path, sync_directory)
     }
 
-    /// 同一次结构操作的私有目录持久化边界，不新增公开flag或运行时重试。
+    /// Retain standard recursive deletion and the durability boundary of this
+    /// same operation, including partial-removal failures.
     fn delete_directory_with_directory_sync(
         &self,
         relative_path: &str,
         synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
     ) -> Result<(), MarkdownWorkspaceError> {
         self.delete_directory_with_removal(relative_path, synchronize_directory, |path| {
+            // Use the standard library's actual recursive removal in production.
             fs::remove_dir_all(path)
         })
     }
 
-    /// 保留std安全递归，私有移除参数仅供真实部分删除后的失败反例。
+    /// The private removal boundary lets the existing regression fail after real
+    /// partial deletion; production still uses the standard recursive operation.
     fn delete_directory_with_removal(
         &self,
         relative_path: &str,
         mut synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
         remove_directory: impl FnOnce(&Path) -> std::io::Result<()>,
     ) -> Result<(), MarkdownWorkspaceError> {
-        // 先声明撤权边界，所有后建文件/rollback guard先drop；纯预校验不激活。
+        // Keep publication ownership outside the deletion scope so root protection
+        // remains a pure preflight failure and cleanup completes before reporting.
         let publication = WorkspaceStructurePublication::new(self);
         let result = (|| {
             let directory = resolve_existing_directory(&self.canonical_root, relative_path)?;
@@ -619,7 +567,9 @@ impl MarkdownSessionAccess {
                 .parent()
                 .ok_or(MarkdownWorkspaceError::InvalidRelativePath)?;
             ensure_within_root(&self.canonical_root, parent)?;
-            // opaque std递归可能部分成功后Err，纯root保护之后保守封闭旧扫描。
+            // Recursive removal may delete children before returning an error.
+            // After root protection succeeds, conservatively revoke the old scan
+            // before invoking that operation rather than assuming failure means no change.
             publication.recursive_delete_attempt();
             remove_directory(&directory).map_err(|_| {
                 // Translate a failed filesystem stage into the stable vault-storage error category.
@@ -629,7 +579,7 @@ impl MarkdownSessionAccess {
             publication.changed();
             Ok(())
         })();
-        // 闭包内的pending/inspect guard此时已全部析构，不能提前取未确认标量。
+        // Inner cleanup is complete before final revocation/error publication.
         publication.finish(result)
     }
 
@@ -647,18 +597,21 @@ impl MarkdownSessionAccess {
         source_path: &Path,
         destination_directory: &str,
     ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
-        // 公开入口始终使用真实目录sync；故障注入仅由同模块私有测试调用。
+        // The public import always syncs the real destination directory; only the
+        // private regression entry can fail that boundary after destination creation.
         self.import_note_with_directory_sync(source_path, destination_directory, sync_directory)
     }
 
-    /// 同一次结构操作的私有目录持久化边界，不新增公开flag或运行时重试。
+    /// Keep source validation, destination rollback, and directory durability in
+    /// one import attempt without replaying external mutations.
     fn import_note_with_directory_sync(
         &self,
         source_path: &Path,
         destination_directory: &str,
         mut synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
     ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
-        // 先声明撤权边界，所有后建文件/rollback guard先drop；纯预校验不激活。
+        // Publication outlives the imported-file guard so failed source validation
+        // cannot report completion before destination rollback has actually run.
         let publication = WorkspaceStructurePublication::new(self);
         let result = (|| {
             validate_external_import_source(source_path)?;
@@ -675,8 +628,10 @@ impl MarkdownSessionAccess {
             let destination_parent =
                 resolve_existing_directory(&self.canonical_root, destination_directory)?;
             let inspected = inspect_bounded_markdown(source_path, MAX_DOCUMENT_BYTES, |content| {
-                // 只从同一个已验证冻结源分块写入；关闭/路径复核失败时完整目标仍由guard回滚。
-                // 目标写入结果保留在内层；外层只把源读取失败转换为导入源错误。
+                // Stream only this validated frozen source. A later close or path
+                // recheck failure leaves the complete destination under rollback.
+                // Nest the destination result so the outer mapping classifies
+                // source-read failures without relabeling destination-write failures.
                 Ok(create_collision_safe_imported_note_with_writer(
                     &publication,
                     &destination_parent,
@@ -695,7 +650,8 @@ impl MarkdownSessionAccess {
             publication.changed();
             Ok(receipt)
         })();
-        // 闭包内的pending/inspect guard此时已全部析构，不能提前取未确认标量。
+        // Source and destination guards have now finished; only this final owner
+        // can report the operation together with any retained-file uncertainty.
         publication.finish(result)
     }
 
@@ -814,7 +770,8 @@ impl MarkdownSessionAccess {
         requested_title: &str,
         expected_revision: Option<&str>,
     ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
-        // 公开入口始终使用真实目录sync；故障注入仅由同模块私有测试调用。
+        // Use real parent-directory durability for the public operation; only
+        // the private regression can fail sync after the actual rename.
         self.rename_note_with_directory_sync(
             relative_path,
             requested_title,
@@ -823,7 +780,8 @@ impl MarkdownSessionAccess {
         )
     }
 
-    /// 同一次结构操作的私有目录持久化边界，不新增公开flag或运行时重试。
+    /// Keep revision validation, exclusive rename, and directory sync within one
+    /// attempt; a sync error does not justify blindly replaying the rename.
     fn rename_note_with_directory_sync(
         &self,
         relative_path: &str,
@@ -831,7 +789,8 @@ impl MarkdownSessionAccess {
         expected_revision: Option<&str>,
         mut synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
     ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
-        // 先声明撤权边界，所有后建文件/rollback guard先drop；纯预校验不激活。
+        // The publication owner survives all inner resources. Pure name/revision
+        // rejection must not claim that the filesystem collection changed.
         let publication = WorkspaceStructurePublication::new(self);
         let result = (|| {
             let source = resolve_existing_markdown(&self.canonical_root, relative_path)?;
@@ -843,7 +802,8 @@ impl MarkdownSessionAccess {
             let destination = parent.join(format!("{title}.md"));
 
             let current = inspect_bounded_markdown(&source, MAX_DOCUMENT_BYTES, |_| {
-                // 摘要同样通过有限UTF8/SHA扫描，不能因callback不读正文就先整幅触页。
+                // The revision still requires finite UTF-8/SHA leases; a callback
+                // that needs no text does not authorize touching a whole mapping.
                 Ok(())
             })?;
             ensure_expected_revision(&current.revision, expected_revision)?;
@@ -861,13 +821,14 @@ impl MarkdownSessionAccess {
                     _ => MarkdownWorkspaceError::StorageUnavailable,
                 }
             })?;
-            // 名称已经真实移动，先撤权再执行可能失败的目录持久化。
+            // The name has moved before sync can fail, so revoke pages that still
+            // describe the old collection immediately.
             publication.changed();
             synchronize_directory(parent)?;
             publication.changed();
             mutation_receipt(&self.canonical_root, &destination, current.revision)
         })();
-        // 闭包内的pending/inspect guard此时已全部析构，不能提前取未确认标量。
+        // Complete inner cleanup before combining mutation and publication outcomes.
         publication.finish(result)
     }
 
@@ -878,7 +839,8 @@ impl MarkdownSessionAccess {
         destination_directory: &str,
         expected_revision: Option<&str>,
     ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
-        // 公开入口始终使用真实目录sync；故障注入仅由同模块私有测试调用。
+        // Production syncs the real source and destination parents; the existing
+        // private regression can expose failure between those actual filesystem stages.
         self.move_note_with_directory_sync(
             relative_path,
             destination_directory,
@@ -887,7 +849,8 @@ impl MarkdownSessionAccess {
         )
     }
 
-    /// 同一次结构操作的私有目录持久化边界，不新增公开flag或运行时重试。
+    /// Preserve one move's source revision, destination ownership, and durability
+    /// boundaries without a second implementation or automatic mutation replay.
     fn move_note_with_directory_sync(
         &self,
         relative_path: &str,
@@ -895,7 +858,8 @@ impl MarkdownSessionAccess {
         expected_revision: Option<&str>,
         mut synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
     ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
-        // 先声明撤权边界，所有后建文件/rollback guard先drop；纯预校验不激活。
+        // Retain publication until every inner source/spool/destination guard has
+        // ended; preflight alone cannot invalidate an otherwise unchanged collection.
         let publication = WorkspaceStructurePublication::new(self);
         let result = (|| {
             let source = resolve_existing_markdown(&self.canonical_root, relative_path)?;
@@ -913,7 +877,8 @@ impl MarkdownSessionAccess {
             let destination_relative_path =
                 relative_markdown_path(&self.canonical_root, &destination)?;
             let current = inspect_bounded_markdown(&source, MAX_DOCUMENT_BYTES, |content| {
-                // 只把真实需要替换的附件前缀流式写入匿名spool；超长行/URL不进入整篇String。
+                // Stream only the attachment-prefix rewrite into an anonymous spool.
+                // Neither an overlong line nor a URL becomes a whole-document String.
                 rewrite_moved_note_attachment_links_streamed(
                     content,
                     &source_relative_path,
@@ -939,7 +904,8 @@ impl MarkdownSessionAccess {
                         _ => MarkdownWorkspaceError::StorageUnavailable,
                     }
                 })?;
-                // plain rename已改变路径，所有后续持久化之前先双撤。
+                // The direct rename already changed paths. Revoke both search and
+                // directory authority before either parent's fallible sync.
                 publication.changed();
                 synchronize_directory(source_parent)?;
                 if destination_parent != source_parent {
@@ -964,9 +930,13 @@ impl MarkdownSessionAccess {
                 rewritten.byte_len,
                 Some(source_permissions),
                 |file| {
-                    // spool由本次原冻结源独占且已定位0；通过流式/内核复制转移，不向应用返回整篇正文。
+                    // This attempt exclusively owns the frozen-source spool at offset
+                    // zero. Stream/kernel-copy it into the destination without exposing
+                    // a whole-body allocation to the application.
                     let copied = std::io::copy(&mut rewritten.file, file)?;
                     if copied != rewritten.byte_len {
+                        // A short transfer cannot seal a complete destination or permit
+                        // later deletion of the revision-checked original.
                         return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
                     }
                     Ok(())
@@ -988,19 +958,23 @@ impl MarkdownSessionAccess {
 
             // Recheck the original before removal; destination rollback remains armed until removal succeeds.
             let rechecked = inspect_bounded_markdown(&source, MAX_DOCUMENT_BYTES, |_| {
-                // 删除原文件前仍核同一完整摘要；实际读取和页面归还均有界。
+                // Recompute the complete original revision before removal through
+                // finite leases with actual page reclamation.
                 Ok(())
             })?;
             ensure_expected_revision(&rechecked.revision, expected_revision)?;
-            // 调用者未提供版本也必须比较本次改写的原始版本，避免删除同步期间新写入的内容。
+            // Even without a caller precondition, compare with this rewrite's captured
+            // revision so bytes written during destination sync are never deleted.
             ensure_expected_revision(&rechecked.revision, Some(&current.revision))?;
-            // 目标在目录同步期间可能被外部修改或替换；只有原封存文件仍在才允许移除源。
+            // Directory sync can interleave with external writes/replacement. Only
+            // the same sealed destination permits removal of the original source.
             pending_destination.verify_for_commit()?;
             fs::remove_file(&source).map_err(|_| {
                 // Translate a failed filesystem stage into the stable vault-storage error category.
                 MarkdownWorkspaceError::StorageUnavailable
             })?;
-            // source实际unlink是第二个可见集合变化，必须再撤掉中途启动的扫描。
+            // Source unlink is a second visible collection change; revoke scans
+            // that could have started after destination creation but before removal.
             publication.changed();
             pending_destination.disarm();
             synchronize_directory(source_parent)?;
@@ -1011,7 +985,7 @@ impl MarkdownSessionAccess {
             publication.changed();
             Ok(receipt)
         })();
-        // 闭包内的pending/inspect guard此时已全部析构，不能提前取未确认标量。
+        // Observe rollback uncertainty after all inner guards have actually ended.
         publication.finish(result)
     }
 
@@ -1021,18 +995,21 @@ impl MarkdownSessionAccess {
         relative_path: &str,
         expected_revision: Option<&str>,
     ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
-        // 公开入口始终使用真实目录sync；故障注入仅由同模块私有测试调用。
+        // The public copy always syncs its real parent; only the private regression
+        // entry can fail durability after creating an actual guarded destination.
         self.copy_note_with_directory_sync(relative_path, expected_revision, sync_directory)
     }
 
-    /// 同一次结构操作的私有目录持久化边界，不新增公开flag或运行时重试。
+    /// Keep one copy's frozen source, revision check, guarded destination, and
+    /// directory durability within the same operation owner.
     fn copy_note_with_directory_sync(
         &self,
         relative_path: &str,
         expected_revision: Option<&str>,
         mut synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
     ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
-        // 先声明撤权边界，所有后建文件/rollback guard先drop；纯预校验不激活。
+        // Publication outlives the copy guard so destination rollback finishes
+        // before any final operation or cleanup result is exposed.
         let publication = WorkspaceStructurePublication::new(self);
         let result = (|| {
             let source = resolve_existing_markdown(&self.canonical_root, relative_path)?;
@@ -1041,7 +1018,8 @@ impl MarkdownSessionAccess {
                 .ok_or(MarkdownWorkspaceError::InvalidRelativePath)?;
             let source_title = markdown_title(&source)?;
             let inspected = inspect_bounded_markdown(&source, MAX_DOCUMENT_BYTES, |content| {
-                // 同一次冻结值的摘要与流式字节共同约束目标；不创建整篇slice或String副本。
+                // The digest and copied windows belong to the same frozen value;
+                // no whole-source slice or String becomes a second authority.
                 create_collision_safe_note_copy(&publication, parent, &source_title, content)
             })?;
             ensure_expected_revision(&inspected.revision, expected_revision)?;
@@ -1054,7 +1032,7 @@ impl MarkdownSessionAccess {
             publication.changed();
             Ok(receipt)
         })();
-        // 闭包内的pending/inspect guard此时已全部析构，不能提前取未确认标量。
+        // All source and destination cleanup has completed before final publication.
         publication.finish(result)
     }
 
@@ -1064,23 +1042,27 @@ impl MarkdownSessionAccess {
         relative_path: &str,
         expected_revision: Option<&str>,
     ) -> Result<(), MarkdownWorkspaceError> {
-        // 公开入口始终使用真实目录sync；故障注入仅由同模块私有测试调用。
+        // Production retains real parent-directory sync; a private regression can
+        // fail only after the actual note removal to exercise truthful invalidation.
         self.delete_note_with_directory_sync(relative_path, expected_revision, sync_directory)
     }
 
-    /// 同一次结构操作的私有目录持久化边界，不新增公开flag或运行时重试。
+    /// Bind deletion to its inspected revision and real directory durability;
+    /// failing sync cannot turn an already completed unlink into an unchanged tree.
     fn delete_note_with_directory_sync(
         &self,
         relative_path: &str,
         expected_revision: Option<&str>,
         mut synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
     ) -> Result<(), MarkdownWorkspaceError> {
-        // 先声明撤权边界，所有后建文件/rollback guard先drop；纯预校验不激活。
+        // Own revocation outside the deletion scope. A failed precondition is pure;
+        // after unlink, stale pages remain revoked even if later durability fails.
         let publication = WorkspaceStructurePublication::new(self);
         let result = (|| {
             let path = resolve_existing_markdown(&self.canonical_root, relative_path)?;
             let current = inspect_bounded_markdown(&path, MAX_DOCUMENT_BYTES, |_| {
-                // 无正文返回值也必须在有限源窗口中完成校验和真实页面回收。
+                // A body-free result still owes complete validation and actual
+                // reclamation through finite source windows before deletion.
                 Ok(())
             })?;
             ensure_expected_revision(&current.revision, expected_revision)?;
@@ -1091,13 +1073,14 @@ impl MarkdownSessionAccess {
                 // Translate a failed filesystem stage into the stable vault-storage error category.
                 MarkdownWorkspaceError::StorageUnavailable
             })?;
-            // unlink已经成功，后续sync返回Err也不能继续交付旧页。
+            // Unlink already succeeded; a later sync error cannot authorize
+            // continued delivery of pages describing the deleted note.
             publication.changed();
             synchronize_directory(parent)?;
             publication.changed();
             Ok(())
         })();
-        // 闭包内的pending/inspect guard此时已全部析构，不能提前取未确认标量。
+        // Finish inner cleanup before publishing the final invalidation outcome.
         publication.finish(result)
     }
 
@@ -1116,7 +1099,8 @@ fn inspect_markdown_save_baseline(
     path: &Path,
 ) -> Result<InspectedMarkdown<()>, MarkdownWorkspaceError> {
     inspect_bounded_markdown(path, MAX_DOCUMENT_BYTES, |_| {
-        // 原生保存基线无全文镜像，只有完整有界校验和真实归还后才授予覆盖权限。
+        // A native save baseline owns no text mirror. Only complete finite-window
+        // validation and real reclamation can authorize replacement of disk bytes.
         Ok(())
     })
     .map_err(|_| {
@@ -1134,11 +1118,7 @@ fn adopt_matching_document_buffer_baseline(
 ) -> Result<MarkdownSaveReceipt, MarkdownWorkspaceError> {
     let replacement = MarkdownDocumentBuffer::open(path, MAX_DOCUMENT_BYTES)
         .map_err(markdown_document_buffer_save_error)?;
-    let revision = replacement
-        .original_revision()
-        // 普通保存的校验模型必须有disk基线，旧恢复模型不具备收敛权限。
-        .ok_or(MarkdownWorkspaceError::PendingLegacyRecovery)?
-        .encode_hex();
+    let revision = replacement.original_revision().encode_hex();
     if revision != expected_revision || !replacement.original_file_identity_is_unchanged() {
         // A revision or identity mismatch means another writer changed the proposed reload baseline.
         return Err(MarkdownWorkspaceError::SaveConflict);
@@ -1156,11 +1136,10 @@ fn adopt_matching_document_buffer_baseline(
         byte_count: replacement.byte_len() as u64,
         modified_at_ms: modified_at_ms(&metadata),
     };
-    if Some(
-        document
-            .current_revision()
-            .map_err(markdown_document_buffer_save_error)?,
-    ) != replacement.original_revision()
+    if document
+        .current_revision()
+        .map_err(markdown_document_buffer_save_error)?
+        != replacement.original_revision()
     {
         // A raced different file cannot change live characters through a persistence-only operation.
         return Err(MarkdownWorkspaceError::SaveConflict);
@@ -1183,13 +1162,10 @@ fn markdown_document_buffer_open_error(
     error: MarkdownDocumentBufferError,
 ) -> MarkdownWorkspaceError {
     match error {
-        // 未知旧base必须保留具名冲突，不能被一般I/O分类掩盖。
-        MarkdownDocumentBufferError::PendingLegacyRecovery => {
-            MarkdownWorkspaceError::PendingLegacyRecovery
-        }
         // Preserve the public document size limit failure.
         MarkdownDocumentBufferError::DocumentTooLarge
-        // 匿名编辑元数据有独立硬预算；直接编辑API保留typed cause，此稳定边界沿现有容量分类。
+        // Anonymous edit metadata has its own hard budget. Direct editing keeps
+        // the specific typed cause; this public opening boundary uses its size category.
         | MarkdownDocumentBufferError::ChangeJournalLimitExceeded => MarkdownWorkspaceError::DocumentTooLarge,
         // Preserve invalid-encoding diagnostics instead of silently replacing bytes.
         MarkdownDocumentBufferError::InvalidUtf8Document => {
@@ -1206,7 +1182,8 @@ fn markdown_document_buffer_open_error(
         // An unavailable or nonregular note cannot be safely opened through the note API.
         MarkdownDocumentBufferError::OpenUnavailable
         | MarkdownDocumentBufferError::NotRegularFile => MarkdownWorkspaceError::NoteNotFound,
-        // 坐标、追加或替换输入失败均不能提供可用文档；此打开边界不暴露内部流式命令细节。
+        // Coordinate, append, and replacement-input failures cannot yield an opened
+        // document; this boundary does not expose internal streaming-command details.
         MarkdownDocumentBufferError::RangeOutsideDocument
         | MarkdownDocumentBufferError::NotUnicodeBoundary
         | MarkdownDocumentBufferError::EditBufferLimitExceeded
@@ -1214,19 +1191,22 @@ fn markdown_document_buffer_open_error(
         | MarkdownDocumentBufferError::ReplacementInputUnavailable
         | MarkdownDocumentBufferError::ReplacementRangesNotOrdered
         | MarkdownDocumentBufferError::FindInterrupted
-        // 输入独占与历史预留失败不授予打开/保存权限，也不应被解释为保存成功。
+        // Exclusive input and history reservation failures grant neither opening
+        // nor persistence authority and must not be interpreted as a successful save.
         | MarkdownDocumentBufferError::TextInputPrepared
         | MarkdownDocumentBufferError::PreparedTextInputStale
         | MarkdownDocumentBufferError::EditHistoryUnavailable => {
             MarkdownWorkspaceError::StorageUnavailable
         }
-        // 这里只是未提交的匿名编辑元数据失败，不代表用户笔记发生文件回滚。
+        // Failed uncommitted anonymous metadata does not mean a user note was rolled back.
         MarkdownDocumentBufferError::ChangeJournalUnavailable
         | MarkdownDocumentBufferError::ChangeJournalCleanupUnconfirmed
-        // 原映射读取/归还失败或同时租约耗尽不能交付可用文档；保留存储失败语义。
+        // A source read/reclamation failure or exhausted concurrent lease budget
+        // cannot yield a usable document; keep the public storage-failure category.
         | MarkdownDocumentBufferError::OriginalBackingUnavailable(_)
         | MarkdownDocumentBufferError::EditStorageUnavailable(_)
-        // 显示来源目录的真实读取/锁失败仍是存储错误，不能让打开或保存领取成功收据。
+        // Actual display-source read/lock failures remain storage errors and
+        // cannot provide either an opened document or a successful save receipt.
         | MarkdownDocumentBufferError::DisplayStorageUnavailable(_)
         | MarkdownDocumentBufferError::OriginalReadLeaseLimitExceeded
         | MarkdownDocumentBufferError::Utf16ReadCacheUnavailable
@@ -1244,13 +1224,10 @@ fn markdown_document_buffer_save_error(
     error: MarkdownDocumentBufferError,
 ) -> MarkdownWorkspaceError {
     match error {
-        // 恢复内容不因相同bytes或一次普通保存调用就获得覆盖当前磁盘的权限。
-        MarkdownDocumentBufferError::PendingLegacyRecovery => {
-            MarkdownWorkspaceError::PendingLegacyRecovery
-        }
         // Preserve size-limit failures for the caller.
         MarkdownDocumentBufferError::DocumentTooLarge
-        // 保存边界沿现有容量分类；日志详细原因仍由直接编辑API提供。
+        // Preserve the public capacity category; direct editing retains the
+        // specific anonymous journal-budget cause for its own caller.
         | MarkdownDocumentBufferError::ChangeJournalLimitExceeded => MarkdownWorkspaceError::DocumentTooLarge,
         // Preserve invalid UTF-8 diagnostics during saved-snapshot validation.
         MarkdownDocumentBufferError::InvalidUtf8Document => {
@@ -1261,12 +1238,15 @@ fn markdown_document_buffer_save_error(
         | MarkdownDocumentBufferError::DocumentChangedDuringSave => {
             MarkdownWorkspaceError::SaveConflict
         }
-        // 其他存储、坐标或替换输入错误不能形成成功保存收据，保留同一稳定边界分类。
+        // Storage, coordinate, and replacement-input failures cannot establish
+        // a successful save receipt; retain the same stable boundary category.
         MarkdownDocumentBufferError::OpenUnavailable
-        // 分块映射失败或并发租约耗尽不能形成保存收据，不能降级为空内容。
+        // Mapping failure or concurrent lease exhaustion cannot produce a save
+        // receipt and must never degrade into an apparently empty document.
         | MarkdownDocumentBufferError::OriginalBackingUnavailable(_)
         | MarkdownDocumentBufferError::EditStorageUnavailable(_)
-        // 显示来源目录的真实读取/锁失败仍是存储错误，不能让打开或保存领取成功收据。
+        // Display-source I/O and lock failures remain real storage failures,
+        // never successful persistence of an incomplete display projection.
         | MarkdownDocumentBufferError::DisplayStorageUnavailable(_)
         | MarkdownDocumentBufferError::OriginalReadLeaseLimitExceeded
         | MarkdownDocumentBufferError::Utf16ReadCacheUnavailable
@@ -1279,13 +1259,15 @@ fn markdown_document_buffer_save_error(
         | MarkdownDocumentBufferError::ReplacementInputUnavailable
         | MarkdownDocumentBufferError::ReplacementRangesNotOrdered
         | MarkdownDocumentBufferError::FindInterrupted
-        // 输入独占与历史预留失败不授予打开/保存权限，也不应被解释为保存成功。
+        // Exclusive input and history reservation failures grant no persistence
+        // authority even if an earlier stage completed successfully.
         | MarkdownDocumentBufferError::TextInputPrepared
         | MarkdownDocumentBufferError::PreparedTextInputStale
         | MarkdownDocumentBufferError::EditHistoryUnavailable => {
             MarkdownWorkspaceError::StorageUnavailable
         }
-        // 不把匿名日志清理不确定误当用户文件回滚或成功保存。
+        // Unconfirmed anonymous journal cleanup is neither user-file rollback
+        // nor evidence of a completed save.
         MarkdownDocumentBufferError::ChangeJournalUnavailable
         | MarkdownDocumentBufferError::ChangeJournalCleanupUnconfirmed => MarkdownWorkspaceError::StorageUnavailable,
         // Presentation materialization cannot supply a successful save result.
@@ -1389,7 +1371,8 @@ fn markdown_import_read_error(error: MarkdownWorkspaceError) -> MarkdownWorkspac
     }
 }
 
-/// 完整写入并同步的取得者：保留原O_EXCL描述符，后续清理不得从路径重新认领身份。
+/// Own a completely written, synced file through its original exclusive descriptor.
+/// A later pathname lookup cannot replace that descriptor's cleanup authority.
 struct AcquiredMarkdownFile {
     file: File,
     identity: FileIdentity,
@@ -1398,7 +1381,8 @@ struct AcquiredMarkdownFile {
 }
 
 impl AcquiredMarkdownFile {
-    /// 只在完整write+sync后封身份；rename可改ctime，另存必须在发布后从原FD封存。
+    /// Seal identity only after complete write and sync. Rename may change ctime,
+    /// so a save-as owner must seal its post-publication identity from the original FD.
     fn seal(
         file: File,
         acquired: FileIdentity,
@@ -1414,10 +1398,12 @@ impl AcquiredMarkdownFile {
             || metadata.dev() != acquired.device
             || metadata.ino() != acquired.inode
         {
-            // 当前FD不再代表取得的单链接完整载荷，不生成可删除权限。
+            // The descriptor no longer proves the acquired single-link complete
+            // payload; do not issue authority that could later delete unrelated bytes.
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
         }
-        // 复用附件已有父目录身份/当前canonical confinement校验，不扩展新的FD系统。
+        // Reuse the attachment boundary's real parent-descriptor and current
+        // canonical-containment checks rather than creating another FD owner graph.
         verify_attachment_parent(canonical_root, &parent_path, &parent)
             .map_err(std::io::Error::other)?;
         Ok(Self {
@@ -1429,7 +1415,8 @@ impl AcquiredMarkdownFile {
     }
 }
 
-/// 以独占方式创建完整笔记；失败partial无可信终态身份，保留文件并报告待核。
+/// Exclusively create a complete note. A failed partial write has no sealed
+/// terminal identity, so retain the file and report unconfirmed rollback.
 fn create_new_markdown_file(
     publication: &WorkspaceStructurePublication<'_>,
     path: &Path,
@@ -1438,20 +1425,24 @@ fn create_new_markdown_file(
     create_new_markdown_file_with_permissions(publication, path, content, None)
 }
 
-/// 可选权限、完整写入和同步成功后才转交持FD的清理权限。
+/// Transfer descriptor-backed cleanup authority only after permissions, complete
+/// content writing, and file durability have succeeded.
 fn create_new_markdown_file_with_permissions(
     publication: &WorkspaceStructurePublication<'_>,
     path: &Path,
     content: &[u8],
     permissions: Option<fs::Permissions>,
 ) -> std::io::Result<AcquiredMarkdownFile> {
-    // 生产固定write_all；私有测试只在真实创建后注入写入故障，不新增公开开关。
+    // Production writes the complete finite input. The existing private regression
+    // can fail after real creation without adding a public failure switch.
     create_new_markdown_file_with_writer(publication, path, content, permissions, |file, bytes| {
+        // A successful callback must account for every declared byte before sealing.
         file.write_all(bytes)
     })
 }
 
-/// 失败时不猜测partial内容的作者；身份无法封存也必须保留路径和首因。
+/// Do not infer ownership of partial bytes after failure. If sealing is impossible,
+/// retain the path and original cause rather than guessing that unlink is safe.
 fn create_new_markdown_file_with_writer(
     publication: &WorkspaceStructurePublication<'_>,
     path: &Path,
@@ -1459,7 +1450,8 @@ fn create_new_markdown_file_with_writer(
     permissions: Option<fs::Permissions>,
     write_content: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
 ) -> std::io::Result<AcquiredMarkdownFile> {
-    // 旧有限新建/故障测试入口与流式源共用同一O_EXCL/封存实现，不复制第二套回滚政策。
+    // Finite creation and streaming input share this one exclusive-create/seal
+    // implementation and the same policy for unconfirmed partial files.
     create_new_markdown_file_from_stream(
         publication,
         path,
@@ -1469,7 +1461,8 @@ fn create_new_markdown_file_with_writer(
     )
 }
 
-/// 接收已声明的完整字节数与一次writer，既有完整写入封存、目录身份和失败保留规则不变。
+/// Accept one declared extent and writer while preserving complete-write sealing,
+/// parent identity, and retention of files whose cleanup cannot be authorized.
 fn create_new_markdown_file_from_stream(
     publication: &WorkspaceStructurePublication<'_>,
     path: &Path,
@@ -1481,6 +1474,8 @@ fn create_new_markdown_file_from_stream(
         .parent()
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?
         .to_owned();
+    // Retain the original nonlinked directory descriptor as well as its confined
+    // pathname before acquiring the new visible file.
     let parent = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -1493,12 +1488,14 @@ fn create_new_markdown_file_from_stream(
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    // 从open开始名字已可见；任何后续错误都要撤掉中途扫描看到的部分记录。
+    // The name is visible as soon as open succeeds. Any later error must revoke
+    // scans that could have observed its partial metadata.
     publication.changed();
     let complete = (|| {
         let acquired = FileIdentity::from(&file.metadata()?);
         if let Some(permissions) = permissions {
-            // 权限在写入之前设置，失败仍留下未被授权清理的实际取得文件。
+            // Set requested permissions before writing. Failure still leaves an
+            // actual acquired file without sealed authority for automatic deletion.
             file.set_permissions(permissions)?;
         }
         write_content(&mut file)?;
@@ -1513,7 +1510,8 @@ fn create_new_markdown_file_from_stream(
         )
     })();
     if complete.is_err() {
-        // 失败partial即使仍同inode也不能证明没有外部修改；不reseal、不unlink。
+        // A matching inode cannot prove that partial bytes stayed unmodified by
+        // another writer; neither reseal nor unlink after this failure.
         publication.rollback_unconfirmed();
     }
     complete
@@ -1560,7 +1558,8 @@ fn rename_without_replacement(source: &Path, destination: &Path) -> std::io::Res
     }
 }
 
-/// 新公开笔记的有限回滚权限；只清理取得者未变的完整文件，不按路径盲删。
+/// Retain finite rollback authority for a newly visible note: only the acquired,
+/// unchanged complete file may be removed, never an arbitrary current pathname.
 struct PendingVaultFile<'publication, 'session> {
     publication: &'publication WorkspaceStructurePublication<'session>,
     acquired: AcquiredMarkdownFile,
@@ -1569,7 +1568,8 @@ struct PendingVaultFile<'publication, 'session> {
 }
 
 impl<'publication, 'session> PendingVaultFile<'publication, 'session> {
-    /// 同时转移原取得FD与封存身份，路径本身不能授予清理权限。
+    /// Transfer both the original descriptor and sealed identity; the path alone
+    /// cannot authorize cleanup of a subsequently replaced entry.
     fn new(
         path: PathBuf,
         acquired: AcquiredMarkdownFile,
@@ -1583,14 +1583,17 @@ impl<'publication, 'session> PendingVaultFile<'publication, 'session> {
         }
     }
 
-    /// 成功提交之后只关闭FD，不再撤销用户可见的文件。
+    /// After successful commit, release descriptors normally without removing
+    /// the now-authoritative user-visible file.
     fn disarm(&mut self) {
         self.armed = false;
     }
 
-    /// 原取得FD、父目录与当前路径必须仍指向同一封存值；缺失只对回滚表示无需删除。
+    /// Require the acquired FD, original parent, and current name to represent
+    /// the same sealed value. Absence means only that rollback has nothing to unlink.
     fn verify_current(&self) -> std::io::Result<bool> {
-        // 即使file仍同inode，父目录被移出库或以symlink接回也不得在库外清理。
+        // Even the same file inode cannot authorize cleanup after its parent
+        // moved outside the vault or was replaced by a symlink back into it.
         verify_attachment_parent(
             self.publication.canonical_root(),
             &self.acquired.parent_path,
@@ -1602,7 +1605,8 @@ impl<'publication, 'session> PendingVaultFile<'publication, 'session> {
             || original.nlink() != 1
             || FileIdentity::from(&original) != self.acquired.identity
         {
-            // 同inode写入、权限/链接改变或原文件被替换都使原清理权限失效。
+            // In-place writes, permission/link changes, and replacement all revoke
+            // the original sealed cleanup authority.
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
         }
         let current = match OpenOptions::new()
@@ -1610,10 +1614,11 @@ impl<'publication, 'session> PendingVaultFile<'publication, 'session> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&self.path)
         {
-            // 已不存在的名字不需要删除，且不尝试追踪到其他路径。
+            // A missing name needs no deletion; never search other paths for the inode.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            // symlink/特殊对象/无法核验都保留并交由上层报告。
+            // Preserve unsafe or unverifiable names and let the operation owner report them.
             Err(error) => return Err(error),
+            // Only a successfully opened, nonfollowed path can be compared with the seal.
             Ok(current) => current,
         };
         let observed = current.metadata()?;
@@ -1621,40 +1626,49 @@ impl<'publication, 'session> PendingVaultFile<'publication, 'session> {
             || observed.nlink() != 1
             || FileIdentity::from(&observed) != self.acquired.identity
         {
-            // 同名replacement不能被原FD的所有权代替，外部字节保持原样。
+            // Owning the old FD grants no authority over a replacement under the
+            // same name; leave that external value untouched.
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
         }
         Ok(true)
     }
 
-    /// 提交不能把缺失、改写或替换的目标作为成功结果；原回滚权限保持武装。
+    /// Do not commit a missing, changed, or replaced destination. Keep rollback
+    /// armed until the original acquired file and path are both verified.
     fn verify_for_commit(&self) -> Result<(), MarkdownWorkspaceError> {
         match self.verify_current() {
-            // 同一取得文件与路径身份完整，后续提交才可以撤销本次回滚权限。
+            // Only the intact acquired file/path pair permits later disarming.
             Ok(true) => Ok(()),
-            // 目标缺失不会授权删除源；外部对象仍由回滚核验保护。
+            // A missing destination cannot authorize source removal; rollback's
+            // identity check continues protecting any external replacement.
             Ok(false) | Err(_) => Err(MarkdownWorkspaceError::StorageUnavailable),
         }
     }
 
-    /// 对原FD和当前不跟随链接的路径FD验证同一封存值；不在这里重新seal。
+    /// Recheck the original FD and a nonfollowing path FD against the existing
+    /// seal; this cleanup path cannot manufacture a new seal for changed bytes.
     fn rollback(&self) -> std::io::Result<()> {
         if !self.verify_current()? {
-            // 已不存在的目标无需删除；不在其他路径寻找原取得文件。
+            // Already-absent output needs no unlink; do not seek the acquired inode elsewhere.
             return Ok(());
         }
-        // 与附件回滚相同，检查至unlink是cooperating-writer边界；不声称跨syscall原子隔离。
+        // As in attachment rollback, check-to-unlink assumes cooperating writers;
+        // separate syscalls do not provide atomic isolation from a hostile replacement.
         fs::remove_file(&self.path)?;
         self.publication.changed();
-        // 实际移除之后持久化原父目录；失败表示清理未完整确认，不复活旧页或重试unlink。
+        // Sync the retained original parent after actual removal. Failure leaves
+        // cleanup unconfirmed; it cannot revive old pages or justify replaying unlink.
         self.acquired.parent.sync_all()
     }
 }
 
 impl Drop for PendingVaultFile<'_, '_> {
+    /// Attempt only still-owned rollback; report uncertainty through publication
+    /// without panicking or replacing an operation's earlier failure.
     fn drop(&mut self) {
         if self.armed && self.rollback().is_err() {
-            // Drop不panic、不覆写主错误；外层在所有guard析构后包装原cause和保留说明。
+            // The outer owner combines the original cause with retained-file
+            // uncertainty only after every inner guard has finished.
             self.publication.rollback_unconfirmed();
         }
     }
@@ -1695,7 +1709,8 @@ fn create_collision_safe_note_copy<'publication, 'session>(
     Err(MarkdownWorkspaceError::NameCollisionLimitExceeded)
 }
 
-/// 导入的命名与碰撞策略只有这一处；每次成功取得目标FD后才调用同一个冻结源writer。
+/// Own the import naming/collision policy in one place. Invoke the same frozen
+/// source writer only after exclusively acquiring that attempt's destination FD.
 fn create_collision_safe_imported_note_with_writer<'publication, 'session>(
     publication: &'publication WorkspaceStructurePublication<'session>,
     parent: &Path,
@@ -1732,22 +1747,25 @@ fn create_collision_safe_imported_note_with_writer<'publication, 'session>(
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
-/// 稳定的存储与并发失败类别；不确定回滚用Box保留原首因，所以错误可Clone但不再Copy。
+/// Stable storage and concurrency outcomes. Boxed compound failures preserve
+/// their original cause and additional cleanup facts, so errors are Clone, not Copy.
 pub enum MarkdownWorkspaceError {
-    /// 文件未被证明仍属于本次完整写入，保留当前路径；cause保留操作首因而非只报清理错误。
+    /// A frozen-source inspection and its explicit reclamation both failed.
+    /// Retain cleanup as a separate typed fact while the source chain starts at
+    /// the original consumer/UTF-8-validation failure, never the later close error.
+    #[error("{cause}；冻结文档资源归还失败：{cleanup}")]
+    InspectionCleanupFailed {
+        #[source]
+        cause: Box<MarkdownWorkspaceError>,
+        cleanup: Box<MarkdownWorkspaceError>,
+    },
+    /// Retain an entry whose complete-write ownership cannot be re-established.
+    /// Preserve the operation's original cause rather than replacing it with cleanup failure.
     #[error("{cause}；新建文件的回滚未完整确认，请核对目录中保留或变更的文件")]
     RollbackUnconfirmed {
         #[source]
         cause: Box<MarkdownWorkspaceError>,
     },
-    #[error("旧冲突草稿尚未解决，请另存为新笔记或明确重新载入磁盘版本")]
-    PendingLegacyRecovery,
-    #[error("恢复决定记录无效，旧冲突草稿已保留")]
-    RecoveryResolutionCorrupted,
-    #[error("无法核验恢复决定，当前草稿与磁盘文件已保留")]
-    RecoveryResolutionUnverified,
-    #[error("恢复决定已发布，但目录持久化未确认；全部文件已保留")]
-    RecoveryResolutionDurabilityUncertain,
     #[error("Markdown 固定目录不可用")]
     RootUnavailable,
     #[error("Omni MD 会话不可用")]
@@ -1780,10 +1798,6 @@ pub enum MarkdownWorkspaceError {
     DocumentChangedDuringRead,
     #[error("磁盘文件已被修改，未覆盖外部版本")]
     SaveConflict,
-    #[error("冲突草稿无法安全持久化，请勿关闭 Omni MD")]
-    ConflictRecoveryUnavailable,
-    #[error("冲突恢复草稿已损坏，未自动加载")]
-    ConflictDraftCorrupted,
     #[error("Markdown 存储暂时不可用")]
     StorageUnavailable,
     #[error("笔记标题无效")]
