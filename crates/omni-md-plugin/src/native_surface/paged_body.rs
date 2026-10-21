@@ -754,68 +754,118 @@ impl NativeMarkdownPagedBody {
                 .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Coalesce this body's next real preparation request without waking main during its own work.
     fn schedule(&self) -> Result<()> {
         if !self.current_body() {
+            // A released or failed owner cannot acquire another dispatch callback.
             return Err(NativeMarkdownPagedBodyError::Closed);
         }
         let serial = self.serial.get();
         if self.scheduled.get() == Some(serial) {
+            // The existing callback already owns this exact epoch's continuation.
+            return Ok(());
+        }
+        if self.preparing.get() {
+            // Preparation still owns the synchronous stack. Record actual requested work;
+            // its exit either consumes another bounded turn or enqueues one successor.
+            self.deferred.set(true);
             return Ok(());
         }
         self.scheduled.set(Some(serial));
         let weak = MainThreadBound::new(self.weak.clone(), self.mtm);
         super::enqueue_native_markdown_main_task(move || {
-            let mtm = MainThreadMarker::new().expect("正文延续只在 AppKit 主队列执行");
+            let mtm = MainThreadMarker::new().expect("body continuations execute on AppKit main");
             let Some(owner) = weak.get(mtm).upgrade() else {
+                // Queued work lends no lifetime to a body that has already closed.
                 return;
             };
-            // 旧请求不能清理后继 scheduled 槽，也不能领取后继文档重新执行旧工作。
             if owner.serial.get() != serial
                 || owner.scheduled.get() != Some(serial)
                 || !owner.active.get()
             {
+                // A stale callback cannot consume or execute a newer epoch's scheduled request.
                 return;
             }
             owner.scheduled.set(None);
-            if owner.word_input_is_copying() {
-                return; // 这次真实载荷getter尚未归还；完成出口会恢复同一调度，不能排空转任务。
-            }
-            if owner.preparing.replace(true) {
-                owner.deferred.set(true);
+            owner.run_preparation_turn(serial);
+        });
+        Ok(())
+    }
+
+    /// Spend a short main-thread slice on already-requested work, preserving every original step boundary.
+    fn run_preparation_turn(&self, serial: u64) {
+        const MAX_TURNS: usize = 8;
+        const TIME_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
+        let started = std::time::Instant::now();
+        for turn in 0..MAX_TURNS {
+            if self.word_input_is_copying() {
+                // A real payload getter owns completion; do not poll it or drain empty callbacks.
                 return;
             }
-            let result = owner.advance();
-            owner.preparing.set(false);
+            if self.preparing.replace(true) {
+                // Native reentry leaves the original stack in charge of releasing this busy claim.
+                self.deferred.set(true);
+                return;
+            }
+            // Each iteration still captures its real Native geometry and retains the original
+            // Core/source budgets. Batching removes queue hops, never validation or bounded reads.
+            let result = self.advance();
+            self.preparing.set(false);
             if let Err(cause) = result {
-                owner.fail(cause);
+                // Preserve the first actual preparation failure and stop this slice immediately.
+                self.fail(cause);
                 return;
             }
-            if let Err(cause) = owner.finish_cell_work() {
-                owner.fail(cause);
-                return;
-            } // 父子同步prepare已退出，才消费真正Ready的格动作与唯一canonical提交。
-            if owner.font_notice_failed.replace(false) {
-                owner.fail(NativeMarkdownPagedBodyError::WorkerFailed);
+            if let Err(cause) = self.finish_cell_work() {
+                // Canonical cell actions run only after preparation and its slot borrows have ended.
+                self.fail(cause);
                 return;
             }
-            // 只交付实际已经到达的有限完成事件，不轮询 receiver 或等待 Weak 变空。
-            let notices = std::mem::take(&mut *owner.font_notices.borrow_mut());
-            for serial in notices {
-                if let Err(cause) = owner.finish_font_trial(serial) {
-                    owner.fail(cause);
+            if self.font_notice_failed.replace(false) {
+                // An observed worker delivery failure cannot be replaced with guessed progress.
+                self.fail(NativeMarkdownPagedBodyError::WorkerFailed);
+                return;
+            }
+            // Consume only delivered results, between the same original preparation boundaries.
+            // No receiver polling or native-resource wait is introduced by this short slice.
+            let notices = std::mem::take(&mut *self.font_notices.borrow_mut());
+            for notice in notices {
+                if let Err(cause) = self.finish_font_trial(notice) {
+                    self.fail(cause);
                     return;
                 }
             }
-            if owner.deferred.replace(false)
-                && !owner.word_input_is_copying()
-                && let Err(cause) = owner.schedule()
-            {
-                owner.fail(cause);
+            let requested = self.deferred.replace(false);
+            if !requested {
+                // No actual continuation request means there is nothing to batch or enqueue.
+                break;
             }
-            // Producer真实发布只登记原key；这里所有同步准备与槽借用均已归还，才交模式动作一次。
-            owner.deliver_pending_mode_action();
-        });
-        Ok(())
+            let copying = self.word_input_is_copying();
+            let can_continue = turn + 1 < MAX_TURNS
+                && started.elapsed() < TIME_SLICE
+                && self.current_body()
+                && self.serial.get() == serial
+                && self.scheduled.get().is_none()
+                && self.scene.borrow().is_none()
+                && !copying;
+            if can_continue {
+                // Only this unchanged owner with no ready Scene or queued successor may spend
+                // the remaining slice. A new epoch and Native painting always regain the queue.
+                continue;
+            }
+            if !copying && self.current_body() {
+                // Yield after the time/work cap, scene publication, or epoch handoff. An already
+                // queued successor coalesces here; a real payload getter resumes itself instead.
+                if let Err(cause) = self.schedule() {
+                    self.fail(cause);
+                    return;
+                }
+            }
+            break;
+        }
+        // Mode delivery remains outside preparation and all state borrows, once per callback.
+        // Only an actually published original Scene can authorize its pending Native action.
+        self.deliver_pending_mode_action();
     }
 
     fn fail(&self, cause: NativeMarkdownPagedBodyError) {
