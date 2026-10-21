@@ -409,6 +409,12 @@ impl NativeMarkdownPagedBodyPaintObserver for MemoryFrameObservation {
 
 impl MemoryFindObservation {
     fn find_completed(&self) -> Result<(), String> {
+        // 请求失败由终态回调消费一次并交给原帧观察保存；后续阶段核验须先保留这份
+        // 首因，不能再次 take_failure 后把已消费的真实错误改写为泛化取消消息。
+        // 没有已存失败时仍完整核验同一请求，成功之后也仍须通过原完整 CPU 帧门。
+        if let Some(cause) = self.frame.failure.borrow().as_ref() {
+            return Err(cause.clone());
+        }
         // Complete 是本次生产调用同步成功，Pending 则必须消费其原终态；二者都不能
         // 由栏文案或 Body.pending_find 已清空代替。失败沿原请求保留已提交后果。
         match &self.execution {
