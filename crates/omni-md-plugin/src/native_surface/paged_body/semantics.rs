@@ -1,4 +1,4 @@
-//! 同一Body输入的RootLeaf字体接入；只消费原有限publication，显隐不改canonical语法或坐标。
+//! RootLeaf font integration for the same Body Input. Consume bounded original publications without changing canonical syntax or coordinates for visibility.
 
 use std::{ops::Range, ptr::NonNull, rc::Rc};
 
@@ -29,7 +29,7 @@ use crate::native_surface::{
 const WINDOW_UTF16: usize = 16_384;
 const QUANTUM: usize = 4096;
 
-/// 基础角色沿原TextKit选字优先级；字重、斜体与下标另进入固定字体槽，不按正文长度增长。
+/// Base roles preserve the existing TextKit font-selection priority; weight, italic, and subscript use fixed slots independent of text length.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Role {
     Body,
@@ -40,7 +40,7 @@ pub(super) enum Role {
 }
 impl Role {
     fn from_styles(styles: MarkdownPresentationStyles) -> Self {
-        // 显隐权限来自原选择绑定的真实语义；必须先于标题/代码，否则同一marker会借用大字体。
+        // Visibility comes from actual selection-bound semantics and must precede heading/code roles so markers cannot borrow their larger fonts.
         if styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER) {
             return Self::Hidden;
         }
@@ -70,13 +70,13 @@ impl Role {
         {
             Self::Code
         } else {
-            Self::Body // 已认证的Rule等仍按原普通字体显示字面，不冒充已完成背景/隐藏预览。
+            Self::Body // Certified rules and other ordinary roles retain literal base-font behavior, without claiming background or hidden-preview completion.
         }
     }
-    /// 只合并实际字形相同的组合；标题本来已粗体，代码沿原等宽face，不能借正文槽吞掉斜体。
+    /// Merge only combinations with identical actual font roles. Headings are already bold and code uses its mono face; Body slots must not erase italics.
     fn slot(self, styles: MarkdownPresentationStyles) -> Option<usize> {
         if self == Self::Hidden {
-            return Some(40); // 隐藏字体不继承任何粗体、斜体或下标字号，保留原0.1pt身份。
+            return Some(40); // Hidden fonts inherit no bold, italic, or subscript size, retaining their actual 0.1-point identity.
         }
         let italic = usize::from(styles.contains(MarkdownPresentationStyles::EMPHASIS));
         let base = match self {
@@ -91,26 +91,26 @@ impl Role {
         let subscript = styles.contains(MarkdownPresentationStyles::SUBSCRIPT)
             && !styles.contains(MarkdownPresentationStyles::MARKER);
         let slot = base + usize::from(subscript) * 20;
-        (slot != 0).then_some(slot) // 普通正文继续复用原注册0号face，其余至多40个真实字体。
+        (slot != 0).then_some(slot) // Ordinary Body reuses registered face zero; other roles occupy at most forty fixed slots.
     }
 }
 
-/// 原属性策略直接选择真实NSFont；Native/Core捕获仍由既有精确face/axes入口完成。
+/// The existing attribute policy selects actual NSFonts; established exact-face/axis capture still owns Native/Core registration.
 pub(super) struct Typography {
     palette: MarkdownTextAttributePalette,
     slots: [Option<usize>; 41],
-    /// 只借公开 default-line API；没有 storage、container、字符串或另一正文图。
+    /// Uses only public default-line metrics, without storage, container, strings, or another document graph.
     pub(super) metrics_owner: Rc<Retained<NSLayoutManager>>,
 }
 impl Typography {
     pub(super) fn new(font: &CTFont) -> Result<Self> {
-        // SAFETY: 活CTFont在本调用有效，retain取得独立+1；Apple定义NSFont/CTFont toll-free bridge。
+        // SAFETY: The live CTFont remains valid here; retain acquires an independent +1, and Apple defines the NSFont/CTFont toll-free bridge.
         let retained = unsafe { CFRetained::retain(NonNull::from(font)) };
         let retained: Retained<CTFont> = retained.into();
-        // SAFETY: 上述真实CTFont与NSFont同一对象，只转换Rust视图并保留原+1所有权。
+        // SAFETY: The actual CTFont and NSFont are the same object; change only the Rust view while preserving the original +1 claim.
         let normal: Retained<NSFont> = unsafe { Retained::cast_unchecked(retained) };
         Ok(Self {
-            // 文稿角色创建失败即终止本次装配；不能发布缺少标题/代码字体的半个 palette。
+            // Role creation failure aborts assembly; do not publish a partial palette missing heading/code fonts.
             palette: MarkdownTextAttributePalette::new(normal)?,
             slots: [None; 41],
             metrics_owner: Rc::new(NSLayoutManager::new()),
@@ -118,19 +118,19 @@ impl Typography {
     }
 }
 
-/// 在途试次固定原样式、coverage与publication；原selection变更不能给旧结果补票。
+/// An in-flight trial retains original style, coverage, and publication. A changed selection cannot renew its old result.
 pub(super) struct Selection {
     pub(super) coverage: Range<usize>,
     pub(super) style: MarkdownLineComposeStyle,
     role: Role,
     styles: MarkdownPresentationStyles,
-    /// closing-EOL 只持原物理 separator 票；不能把这份控制权限用于 inline 或隐藏语法。
+    /// Closing EOL owns only the original physical separator ticket, never inline or hidden-syntax authority.
     fence_separator: bool,
     scope: SelectionScope,
     source: MarkdownLayoutTextAuthority,
 }
 
-/// 三种真实来源互斥：源码字面、正文语义、格显示目录不能凭相同数值范围互相续权。
+/// Literal Source, Body semantics, and cell display directories are distinct authorities; equal numeric ranges cannot renew another domain.
 enum SelectionScope {
     Literal,
     Body(
@@ -140,19 +140,19 @@ enum SelectionScope {
     Cell(Rc<MarkdownTableCellDisplaySource>, MarkdownTextSelection),
 }
 
-/// 独立表格行由同一次真实 publication 交接；它不是可套普通 Font 的根段落。
+/// A structural table row transfers through the actual publication, rather than becoming an ordinary font-styled root paragraph.
 pub(super) enum StyleDecision {
     Font(Selection),
     Table(VerifiedMarkdownLayoutTableRow),
 }
 impl Selection {
-    /// 只交已经绑定原 publication 的样式值；几何不能借它扩大来源或重新解释 Markdown。
+    /// Expose styles already bound to the original publication; geometry cannot expand Source coverage or reinterpret Markdown.
     pub(super) fn styles(&self) -> MarkdownPresentationStyles {
         self.styles
     }
 
-    /// 左字体响应只借当前Selection原出版物签语义交界；不重新查询最新窗口或另建Parser。
-    /// 票只允许后继原Composer试右GCB，真实Font是否变化仍由同一个完整试次决定。
+    /// The left-font response uses this Selection's original publication to certify a semantic seam, without a newer window or another Parser.
+    /// The ticket permits the original Composer to try the right GCB; that same complete trial still determines actual font change.
     pub(super) fn style_boundary(
         &self,
         owner: &Owner,
@@ -161,7 +161,7 @@ impl Selection {
     ) -> Result<Option<VerifiedMarkdownRootLeafStyleBoundary>> {
         self.require(owner, source, request)?;
         let SelectionScope::Body(publication, authority) = &self.scope else {
-            return Ok(None); // 字面或格显示不持RootLeaf权，不能用同值坐标签正文样式边界。
+            return Ok(None); // Literal/cell display owns no RootLeaf authority; equal coordinates cannot certify a Body style boundary.
         };
         let document = owner
             .document
@@ -177,8 +177,8 @@ impl Selection {
         )?)
     }
 
-    /// 右邻字体试次只消费Core原slot借出的票；元数据回到原ScopeBody，保持现有逐Native调用复核。
-    /// 本入口不推进SourceRequest、不改变左coverage，也不把右字素送进正文输出。
+    /// The right-font trial consumes Core's original slot ticket and returns metadata to its original Body scope with per-Native-call checks intact.
+    /// This entry neither advances SourceRequest, changes left coverage, nor appends the right grapheme to Body output.
     pub(super) fn root_leaf_boundary(
         owner: &Owner,
         source: &MarkdownLayoutTextSource,
@@ -200,7 +200,7 @@ impl Selection {
             coverage: request.source_range(),
             style: MarkdownLineComposeStyle {
                 presentation: styles,
-                points: 0.0, // 原base_index会读取真实语义Font字号，不继承左侧Emoji或隐藏字体的尺寸。
+                points: 0.0, // base_index supplies the actual semantic font size, not the preceding emoji or hidden font's size.
                 language: None,
                 features: Vec::new(),
             },
@@ -218,7 +218,7 @@ impl Selection {
     ) -> Self {
         Self::literal_range(source, request.source_range(), points)
     }
-    /// 真实空白控制只有布局，没有可隐藏语法；沿同一冻结 Source 保留普通字体。
+    /// Actual blank controls have layout but no hideable syntax; keep their ordinary font under the same frozen Source.
     fn literal_range(
         source: &MarkdownLayoutTextSource,
         coverage: Range<usize>,
@@ -235,7 +235,7 @@ impl Selection {
             role: Role::Body,
             styles: MarkdownPresentationStyles::default(),
             fence_separator: false,
-            scope: SelectionScope::Literal, // Source模式没有语义权限，不构造占位authority。
+            scope: SelectionScope::Literal, // Source mode owns no semantic authority and constructs no placeholder capability.
             source: source.authority(),
         }
     }
@@ -255,7 +255,7 @@ impl Selection {
             != selection
     }
 
-    /// 只消费当前格真实显示目录与原样式请求的交集，不重读 raw Markdown 或借用正文范围。
+    /// Consume the intersection of this actual cell display directory and style request, without rereading raw Markdown or borrowing Body ranges.
     pub(super) fn cell(
         owner: &Owner,
         display: Rc<MarkdownTableCellDisplaySource>,
@@ -264,7 +264,7 @@ impl Selection {
         Self::cell_range(owner, display, request.source(), request.source_range())
     }
 
-    /// 格内原换行/空尾行保同一显示 Source；控制没有权限读取邻格或假定普通正文样式。
+    /// Cell line breaks and empty trailing lines keep their display Source; controls cannot read adjacent cells or assume ordinary Body styling.
     pub(super) fn cell_control(
         owner: &Owner,
         display: Rc<MarkdownTableCellDisplaySource>,
@@ -278,7 +278,7 @@ impl Selection {
         )
     }
 
-    /// 样式和控制共用实际显示目录，空 EOF 只授原空范围，不能扩展成默认样式覆盖未知正文。
+    /// Styles/controls share the actual display directory. Empty EOF authorizes its original empty range, never default styling of unknown content.
     fn cell_range(
         owner: &Owner,
         display: Rc<MarkdownTableCellDisplaySource>,
@@ -294,14 +294,14 @@ impl Selection {
         let document = document.borrow();
         display.require_for(&document)?;
         if authority != &display.authority() {
-            // 相同偏移不能续另一显示源的权，旧格回调必须在这里退场。
+            // Equal offsets cannot renew another display Source; the old cell callback must stop here.
             return Err(super::ViewError::Revoked.into());
         }
         let (end, styles) = if range.is_empty() && range.start == display.source().utf16_len() {
-            // 真正空尾控制不消费文字，默认样式权限只到这个空范围。
+            // An actual empty trailing control consumes no text; default style applies only to that empty range.
             (range.end, MarkdownPresentationStyles::default())
         } else {
-            // 样式只授真实原目录覆盖交集，后续样式变化继续发下一次原 NeedStyle。
+            // Style authority ends at actual directory coverage; later style changes require the next original NeedStyle.
             let query = display
                 .styles_at(range.start)
                 .map_err(super::ViewError::Document)?;
@@ -317,7 +317,7 @@ impl Selection {
             };
             let end = range.end.min(query.utf16_range.end);
             if end <= range.start {
-                // 未覆盖非空文字意味着语义尚不可用，禁止用默认 Body 字体静默继续。
+                // Uncovered nonempty text has unavailable semantics; a default Body font cannot silently substitute.
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 eprintln!(
                     "native_cell_unsupported phase=style_empty range_start={} range_end={} covered_end={}",
@@ -350,7 +350,7 @@ impl Selection {
     ) -> Result<()> {
         self.require_source(owner, source, request.source())
     }
-    /// 原控制和原字体请求共享来源核验；控制没有权限凭相邻 part 继承新的样式。
+    /// Original controls and font requests share Source validation; neighboring parts cannot grant controls another style.
     pub(super) fn require_control(
         &self,
         owner: &Owner,
@@ -380,7 +380,7 @@ impl Selection {
                 .clone();
             display.require_for(&document.borrow())?;
             if !self.coverage.is_empty() {
-                // Native 字体准备可能跨事件循环，响应前再次核原目录覆盖与样式未撤销。
+                // Native font preparation may span event-loop turns; recheck original directory coverage/style before responding.
                 let query = display
                     .styles_at(self.coverage.start)
                     .map_err(super::ViewError::Document)?
@@ -389,7 +389,7 @@ impl Selection {
                     return Err(super::ViewError::Revoked.into());
                 }
             } else if self.coverage.start != source.utf16_len() {
-                // 空控制只能来自同源真实 EOF，不能替未知区间填一个空样式票。
+                // An empty control must be this Source's actual EOF, not an empty style ticket for unknown content.
                 return Err(super::ViewError::Revoked.into());
             }
         }
@@ -407,7 +407,7 @@ impl Selection {
                 {
                     return Err(super::ViewError::Revoked.into());
                 }
-                return Ok(()); // 原字体回调前后都重新借同一 publication；不改普通叶的覆盖或语义状态。
+                return Ok(()); // Revalidate the same publication around font callbacks without changing ordinary-leaf coverage or semantic state.
             }
             let MarkdownOrdinarySemanticState::RootLeafReady(leaf) =
                 publication.ordinary_semantics_for(&document, *authority)?
@@ -424,7 +424,7 @@ impl Selection {
                 return Err(super::ViewError::Revoked.into());
             }
         }
-        Ok(()) // 原输入/width/选择票由PreparationTicket在Native前后另核，不从pub数值重建Source。
+        Ok(()) // PreparationTicket separately checks Input/width/selection around Native; numeric publication facts cannot reconstruct Source authority.
     }
     pub(super) fn base_index(
         &mut self,
@@ -433,6 +433,8 @@ impl Selection {
         ticket: &PreparationTicket,
     ) -> Result<usize> {
         let Some(slot) = self.role.slot(self.styles) else {
+            // Ordinary Body already owns palette zero; no role-specific font
+            // construction or additional registration is needed for this run.
             return Ok(0);
         };
         let cached = owner
@@ -442,10 +444,12 @@ impl Selection {
             .expect("InlinePreview持活动字体角色策略")
             .slots[slot];
         if let Some(index) = cached {
+            // This slot names an actually registered font in this Body's current
+            // palette. Copy its real size into the response, not a guessed role size.
             self.style.points = owner.fonts.borrow()[index].native().point_size() as f32;
             return Ok(index);
         }
-        // 取出策略再进入Native，不能让RefCell借用跨NSFont/current回调；关闭由原preparing门串行化。
+        // Take the policy out before Native entry so no RefCell borrow spans NSFont/current callbacks; original preparation admission serializes close.
         let mut typography = owner
             .typography
             .borrow_mut()
@@ -453,17 +457,17 @@ impl Selection {
             .expect("活动策略只有本次装配能借出");
         let result = (|| {
             ticket.require(owner, source)?;
-            // 同一语义run完整交给既有字体策略；隐藏标记使用原palette的真实小字号，
-            // 不删源字符、不把marker混入标题槽，也不以默认字号覆盖Source授权的显隐。
-            // 同一原样式位也随Composer封存part交给CPU画墨迹/装饰；字体只负责真实形状与宽度。
+            // Pass the complete semantic run to the existing policy; hidden markers use the original palette's actual small size,
+            // without deleting Source characters, mixing markers into heading slots, or overriding certified visibility with a default size.
+            // The same style bits travel in Composer-sealed parts for CPU ink/decorations; fonts own actual shape and width only.
             let native = native_markdown_base_font(self.styles, &typography.palette);
-            // Native 样式转换可能交付重入；先核原 Source/票的真实首错，再接纳字体结果。
-            // 不能让字体失败覆盖同时发生的原映射异常，也不能把失权候选注册到后继输入。
+            // Native style conversion may reenter; preserve original Source/ticket failure before accepting its font result.
+            // Font failure cannot hide simultaneous original mapping failure, and a revoked candidate cannot register under successor Input.
             ticket.require(owner, source)?;
             let native = native?;
             let current = || ticket.current(owner, source);
-            // 只借同一 Body 已注册的有限字体；先结束槽借用，再进入可能交付重入的 Native。
-            // 角色槽描述语义，实际字体可相同；不能为每个新角色重建同一文件快照与 Core payload。
+            // Borrow the same Body's bounded registered palette, ending slot borrows before reentrant Native entry.
+            // Slots describe semantic roles, which may share one actual font; a new role must not recreate identical file snapshots/Core payloads.
             let palette = owner.fonts.borrow().clone();
             let captured = NativeMarkdownPagedFont::capture_reusing(
                 native.as_ref(),
@@ -475,8 +479,8 @@ impl Selection {
             ticket.require(owner, source)?;
             let (existing_index, registered) = match captured? {
                 NativeMarkdownFontCapture::Reused(captured) => {
-                    // Reused 只可能来自上述原 palette 的同 Core 身份，不按名称、字号或槽号猜匹配。
-                    // 原 Rc 已捕同模式的实际行度量；复用它同时保留原 catalog 注册和资源释放归属。
+                    // Reused comes only from the original palette's same Core identity, never a name, size, or slot-number guess.
+                    // The original Rc already captured this mode's metrics; reuse preserves catalog registration and resource-release ownership.
                     let authority = captured.core_font().authority();
                     let index = palette
                         .iter()
@@ -486,7 +490,7 @@ impl Selection {
                 }
                 NativeMarkdownFontCapture::Fresh(captured)
                 | NativeMarkdownFontCapture::SharedBytes(captured) => {
-                    // 共享冻结字节不等于共享实例：新字号或轴位仍注册自己的 Core 并捕真实 Preview 行槽。
+                    // Shared frozen bytes do not imply the same instance: another size/axis registers its own Core and captures actual Preview line metrics.
                     let registered =
                         NativeMarkdownLineFont::register(captured, &owner.catalog, &current);
                     ticket.require(owner, source)?;
@@ -496,8 +500,8 @@ impl Selection {
                     (None, Rc::new(registered?))
                 }
             };
-            ticket.require(owner, source)?; // 候选临时强边归还后仍核原票，关闭或原 Source 首错不发布角色槽。
-            // 原策略可在系统无法构造斜体时交回基础face；分页不能把该失败缓存成已实现的强调。
+            ticket.require(owner, source)?; // Recheck original authority before slot publication; close or original Source failure cannot publish the role.
+            // If the platform cannot construct italics, the policy may return a base face; pagination must not cache that as completed emphasis.
             let mut required = objc2_core_text::CTFontSymbolicTraits::empty();
             if self.role != Role::Hidden {
                 if self.styles.contains(MarkdownPresentationStyles::EMPHASIS) {
@@ -515,10 +519,10 @@ impl Selection {
             }
             if !registered.traits().contains(required) {
                 return Err(crate::native_surface::paged_line_fonts::NativeMarkdownLineFontError::StyleUnavailable.into());
-            } // 真face不能满足样式时归还候选，不发布普通字体冒充的strong/emphasis/code。
+            } // Return a face unable to satisfy required traits; ordinary fonts cannot masquerade as strong, emphasis, or code.
             self.style.points = registered.native().point_size() as f32;
             let index = if let Some(index) = existing_index {
-                index // 同实例只接纳新角色槽，不重复占据字体数组或 catalog 注册。
+                index // The same instance needs only a new role slot, not another palette entry or catalog registration.
             } else {
                 let mut fonts = owner.fonts.borrow_mut();
                 let index = fonts.len();
@@ -530,12 +534,12 @@ impl Selection {
         })();
         if owner.active.get() {
             *owner.typography.borrow_mut() = Some(typography);
-        } // 真关闭不把取出的Native字体策略重新放回业务槽。
+        } // Actual close prevents returning the extracted Native font policy to the business slot.
         result
     }
 }
 
-/// 单一来源续体只沿原Global向前；选区实际换代先撤旧，再建同Doc唯一后继。
+/// One Source continuation advances its original Global; selection replacement revokes old authority before its sole same-Doc successor.
 enum CellNavigation {
     Required {
         column: usize,
@@ -547,14 +551,14 @@ enum CellNavigation {
     },
 }
 
-/// 目标只含这次真实 Row/CellInline 的来源，未完成的视觉位置仍须由父 Body 原目标流程取得。
+/// A destination carries this actual Row/CellInline Source only; the parent Body's original target path still resolves visual position.
 pub(super) struct CellDestination {
     pub row: VerifiedMarkdownLayoutTableRow,
     pub source: omni_markdown_core::markdown_document_buffer::VerifiedMarkdownTableCellSource,
 }
 
 pub(super) enum CellNavigationStep {
-    /// 原字形/CellInline 尚有归属任务，调用方先继续它，不能并发借同一个请求。
+    /// Original glyph/CellInline work still owns the request; continue it before another consumer can borrow that same request.
     Occupied,
     Pending,
     Ready(CellDestination),
@@ -572,26 +576,26 @@ pub(super) struct RootLeaf {
     request: Option<MarkdownViewportSourceRequest>,
     ready: Option<Rc<VerifiedMarkdownViewportSources>>,
     window: Range<usize>,
-    // 正常来源准备时 ready=None；选择换代后 pending+ready 只暂存原最后发布，
-    // 等首次真实样式范围到来再交给 Core 重投影，绝不把它当作新选择的 Ready。
+    // Ordinary Source preparation has ready=None. After selection changes, pending+ready temporarily holds only the final old publication,
+    // awaiting the first actual style range for Core reprojection; it is never Ready authority for the new selection.
     pending: bool,
-    /// 只记本次click真正回退的起点；同一次完整重放后仍未知必须保原错误，不能自动无限重试。
+    /// Track this click's actual reposition start only; missing coverage after its completed replay retains the error, without infinite retries.
     link_repositioned: Option<usize>,
-    /// 当前格来源恢复只允许一次真实根重放；范围只是查询目标，不能替代原结构行票。
+    /// Current cell recovery permits one actual root replay; its range is query intent, not the structural row ticket.
     row_repositioned: Option<usize>,
-    /// 活动格换行与只读格共用原 Request；此槽只保本次真正查询的结构票，不另建 Global。
+    /// Active-cell navigation and read-only cells share the original Request; retain only the actual queried structure ticket, not another Global.
     cell_navigation: Option<CellNavigation>,
     pub(super) work: SemanticWork,
 }
 impl RootLeaf {
-    /// 当前原请求已把 CellInline 工作记入同一总账；不能读上次普通叶快照后再重复叠加。
+    /// The actual request already accounts CellInline in the same total; a previous ordinary-leaf snapshot must not be added again.
     pub(super) fn current_work(&self) -> SemanticWork {
         self.request
             .as_ref()
             .map_or(self.work, MarkdownViewportSourceRequest::total_work)
     }
 
-    /// 结构格只借原请求内唯一 Global；不能从 raw 格票创建第二份 Parser 或默认语义。
+    /// Structural cells borrow the original request's sole Global; raw tickets cannot create another Parser or default semantics.
     pub(super) fn advance_cell(
         &mut self,
         preparation: &mut omni_markdown_core::MarkdownTableCellDisplayPreparation,
@@ -615,7 +619,7 @@ impl RootLeaf {
         })
     }
 
-    /// 取消由原准备阶段判断归属；只推进已经借出的Inline，Display目录在Core实际关闭。
+    /// Original preparation determines cancellation ownership; advance only its already-borrowed Inline, with actual Display directory close in Core.
     pub(super) fn cancel_cell(
         &mut self,
         preparation: &mut omni_markdown_core::MarkdownTableCellDisplayPreparation,
@@ -646,13 +650,13 @@ impl RootLeaf {
         }
     }
 
-    /// 已发布字体依赖完整canonical选择；相同正文generation不能给旧隐藏标记续权。
+    /// Published fonts depend on complete canonical selection; unchanged text generation cannot renew old hidden-marker authority.
     pub(super) fn selection_changed(&self, selection: MarkdownTextSelection) -> bool {
         self.selection.is_some_and(|old| old != selection)
     }
 
-    /// 旧视口与暂停中的当前行共用此入口；只在原请求最新 publication 上取得真正行票。
-    /// 同一 Global 的根重放仍逐量子推进，不是就近 checkpoint 恢复，也不重新发放扫描预算。
+    /// Old viewports and paused current rows share this entry, obtaining actual row tickets from the original request's latest publication.
+    /// The same Global replays from root in bounded quanta, without nearest-checkpoint restoration or renewed scan budgets.
     fn row_source(
         &mut self,
         document: &omni_markdown_core::MarkdownDocumentBuffer,
@@ -672,13 +676,13 @@ impl RootLeaf {
             cancelled: false,
         };
         if self.pending && self.ready.is_some() {
-            return Ok(None); // 原样式范围尚未到来，不能用新选择推进旧请求或借旧行票。
+            return Ok(None); // The original style range has not arrived; new selection cannot advance the old request or borrow its row ticket.
         }
         let parser = self.request.as_mut().expect("真实表格沿原唯一来源请求恢复");
         if self.pending {
-            // 原在途来源量子先结束，不能为另一个可见行并存第二份 Global 或 publication。
+            // Finish original in-flight Source work before another visible row can use it; no second Global/publication runs alongside it.
             let step = parser.advance(document, authority, QUANTUM).inspect_err(|_cause| {
-                // 验收日志只保真实请求阶段、窗口和总账，不输出正文、路径或链接目标。
+                // Acceptance diagnostics retain actual request stage, window, and totals only, without text, paths, or link destinations.
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 eprintln!(
                     "native_root_source_failure stage=row_source window={:?} selection={:?} total={:?} cause={_cause:?}",
@@ -706,19 +710,19 @@ impl RootLeaf {
             return Ok(Some(row));
         }
         if self.row_repositioned == Some(position) {
-            // 同一原查询已经完整重放仍没有实际行，不把裸坐标升级成来源权限或反复重试。
+            // The same query already finished replay without an actual row; bare coordinates cannot gain Source authority or trigger endless retry.
             return Err(Error::Unsupported);
         }
-        // 恢复一行只需要行首完整scalar的查询窗；原Scanner仍负责认证整条物理行及H/D来源。
-        // 额外带上后方16K会把无关普通尾段塞进256条来源页，并让每格反复重扫同一大表前缀。
+        // Row recovery needs only its first complete scalar's query window; original Scanner still certifies the full physical row and header/delimiter Source.
+        // Including another 16K tail would fill the 256-record Source page with unrelated blocks and repeatedly rescan a large table prefix per cell.
         let Some(desired) =
             parser.table_row_source_viewport(document, authority, position, QUANTUM)?
         else {
             self.work = parser.total_work();
-            return Ok(None); // 原PositionLocator仍在同一个请求/总账内，不借Doc的8KiB UTF16缓存。
+            return Ok(None); // PositionLocator remains in the same request/total, without borrowing Doc's 8-KiB UTF-16 cache.
         };
         if desired.start >= self.window.start && desired.end >= self.window.end {
-            // 前向行沿最新publication续原Global与真实checkpoint；Core仍核其完整前向覆盖契约。
+            // Forward rows continue original Global/checkpoints from the latest publication; Core still validates complete forward coverage.
             parser.continue_forward(document, ready, desired.clone(), authority).inspect_err(|_cause| {
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 eprintln!(
@@ -736,7 +740,7 @@ impl RootLeaf {
                     parser.total_work(),
                 );
             })?;
-        } // 只有实际逆向/收窄需求才根重放，不把后方行也送回表头重新申请扫描fuel。
+        } // Only actual backward/narrower requests replay root; forward rows do not restart at the header or renew scan fuel.
         self.ready = None;
         self.window = desired;
         self.pending = true;
@@ -744,7 +748,7 @@ impl RootLeaf {
         Ok(None)
     }
 
-    /// 布局与活动格都先经过上方同一最新出版物，只有真正结构行能转成原 flow 行。
+    /// Layout and active cells both use the same latest publication; only an actual structural row converts into the original flow row.
     pub(super) fn table_row(
         &mut self,
         document: &omni_markdown_core::MarkdownDocumentBuffer,
@@ -780,8 +784,8 @@ impl RootLeaf {
         self.request.is_some() && !(self.pending && self.ready.is_some())
     }
 
-    /// 每回合只推进原请求一个实际阶段。同行换列也要取得最新结构来源，不能把旧 Layout 票
-    /// 的数值坐标当作 publication 权限；跨行继续原 RequiredRow，真正 End 才返回追加资格。
+    /// Advance one actual request stage per turn. Even same-row column navigation obtains latest structure Source; old Layout ticket
+    /// coordinates cannot act as publication authority. Cross-row movement continues original RequiredRow; only actual End authorizes append.
     pub(super) fn navigate_cell(
         &mut self,
         document: &omni_markdown_core::MarkdownDocumentBuffer,
@@ -803,7 +807,7 @@ impl RootLeaf {
             if (header, ordinal) != original.coordinate() || columns != original.columns() {
                 return Err(super::ViewError::Revoked.into());
             }
-            // 同一真实列空间内才移动；缺格仍由原 Scanner 生成 implicit-empty 来源。
+            // Move only inside the actual column domain; original Scanner still supplies implicit-empty Sources for missing cells.
             let local = match action {
                 Action::Next if column + 1 < columns => Some(column + 1),
                 Action::Previous if column > 0 => Some(column - 1),
@@ -827,7 +831,7 @@ impl RootLeaf {
             let ready = self.ready.as_ref().expect("最新行来自当前出版物");
             let Some(query) = ready.required_row_query_for(document, authority, &row, direction)?
             else {
-                return Ok(CellNavigationStep::Boundary); // 真正表头前界，原草稿与选择均不动。
+                return Ok(CellNavigationStep::Boundary); // The actual header-start boundary leaves draft and selection unchanged.
             };
             self.request
                 .as_mut()
@@ -854,7 +858,7 @@ impl RootLeaf {
         self.advance_cell_navigation(document, source)
     }
 
-    /// 提交后的旧位置只作查询；实际新行仍由当前请求重新认证，不能沿旧 raw 票开新草稿。
+    /// After commit the old position is query intent only; the actual new row must be recertified, never reopening a draft under old raw authority.
     pub(super) fn activate_cell(
         &mut self,
         document: &omni_markdown_core::MarkdownDocumentBuffer,
@@ -893,7 +897,7 @@ impl RootLeaf {
                 self.pending = true;
                 self.cell_navigation = Some(CellNavigation::Required { column });
                 return Ok(CellNavigationStep::Pending);
-            } // 仅真实append receipt触发；新行仍由原RequiredRow重新认证，不按新增字数猜行首。
+            } // Only actual append receipts trigger this; original RequiredRow certifies the new row without inferring its start from inserted length.
             self.cell_navigation = Some(CellNavigation::Inline {
                 row,
                 column,
@@ -916,9 +920,11 @@ impl RootLeaf {
         let navigation = self.cell_navigation.take().expect("原导航仍在同一请求");
         match navigation {
             CellNavigation::Required { column } => {
+                // Continue the already-admitted row search once. Consuming its
+                // publication and Row/End result ends this stage before Inline starts.
                 let parser = self.request.as_mut().expect("原 RequiredRow 仍有 owner");
                 let step = parser.advance(document, authority, QUANTUM).inspect_err(|_cause| {
-                // 验收日志只保真实请求阶段、窗口和总账，不输出正文、路径或链接目标。
+                // Acceptance diagnostics retain actual request stage, window, and totals only, without text, paths, or link destinations.
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 eprintln!(
                     "native_root_source_failure stage=cell_required window={:?} selection={:?} total={:?} cause={_cause:?}",
@@ -964,6 +970,8 @@ impl RootLeaf {
                 column,
                 started,
             } => {
+                // Starting Inline and advancing it occupy separate turns; the
+                // same Parser retains its actual row ticket and total work budget.
                 let parser = self.request.as_mut().expect("格语义短借原唯一请求");
                 if !started {
                     parser.prepare_cell_inline(document, row.clone(), authority, column)?;
@@ -975,7 +983,7 @@ impl RootLeaf {
                     return Ok(CellNavigationStep::Pending);
                 }
                 let step = parser.advance_cell_inline(document, authority, QUANTUM).inspect_err(|_cause| {
-                // 验收日志只保真实请求阶段、窗口和总账，不输出正文、路径或链接目标。
+                // Acceptance diagnostics retain actual request stage, window, and totals only, without text, paths, or link destinations.
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 eprintln!(
                     "native_root_source_failure stage=cell_inline window={:?} selection={:?} total={:?} cause={_cause:?}",
@@ -1006,8 +1014,8 @@ impl RootLeaf {
         }
     }
 
-    /// 取消只停止接纳后继格，原唯一请求已经启动的工作仍须真正交回。
-    /// RequiredRow 取得真实 Row/End 后立即停止；不为了清理再启动一次 CellInline。
+    /// Cancellation stops successor-cell admission, but the sole request must actually return all work it already started.
+    /// Stop RequiredRow after its actual Row/End result; cleanup must not start another CellInline.
     pub(super) fn drain_cell_navigation(
         &mut self,
         document: &omni_markdown_core::MarkdownDocumentBuffer,
@@ -1019,20 +1027,20 @@ impl RootLeaf {
             .byte_offset_for_utf16(0)
             .map_err(super::ViewError::Document)?;
         if self.cell_navigation.is_none() && !self.pending {
-            return Ok(true); // 尚未借来源的业务意图没有外部任务可撤，不创建请求来证明空闲。
+            return Ok(true); // Intent that never borrowed Source has no external task to cancel; do not create a request to demonstrate idleness.
         }
         if source.authority() != self.source || self.selection != Some(document.selection()) {
             return Err(super::ViewError::Revoked.into());
         }
         if self.pending && self.ready.is_some() && self.cell_navigation.is_none() {
-            // 同源健康和新完整选择均已核；pending+ready 只等首次新样式范围，没有格作业可排空。
-            // 取消导航不应把新选择交给仍待重投影的旧请求，更不能撤掉原 Composer 的准备。
+            // Source health and complete new selection were checked; pending+ready awaits its first new style range and has no cell job to drain.
+            // Navigation cancellation cannot pass new selection to the unreprojected old request or cancel original Composer preparation.
             return Ok(true);
         }
         let authority = self.authority(document);
         let navigation = self.cell_navigation.take();
         match navigation {
-            Some(CellNavigation::Inline { started: false, .. }) => Ok(true), // 这里只持已认证行票，原 parser 尚未启动格任务，直接归还票即可。
+            Some(CellNavigation::Inline { started: false, .. }) => Ok(true), // Only a certified row ticket exists; Parser has not started cell work, so returning that ticket is sufficient.
             Some(CellNavigation::Inline {
                 row,
                 column,
@@ -1040,7 +1048,7 @@ impl RootLeaf {
             }) => {
                 let parser = self.request.as_mut().expect("原 CellInline 仍有唯一 owner");
                 let step = parser.advance_cell_inline(document, authority, QUANTUM).inspect_err(|_cause| {
-                // 验收日志只保真实请求阶段、窗口和总账，不输出正文、路径或链接目标。
+                // Acceptance diagnostics retain actual request stage, window, and totals only, without text, paths, or link destinations.
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 eprintln!(
                     "native_root_source_failure stage=cell_drain_inline window={:?} selection={:?} total={:?} cause={_cause:?}",
@@ -1058,7 +1066,7 @@ impl RootLeaf {
                     });
                     return Ok(false);
                 }
-                // take 才真正释放请求的单格占用；丢弃结果，不转换 Display 或开启可写草稿。
+                // Taking the result actually returns the request's cell occupancy; discard it without Display conversion or writable-draft creation.
                 drop(
                     parser
                         .take_cell_inline_ready_for(document, authority)?
@@ -1067,11 +1075,11 @@ impl RootLeaf {
                 Ok(true)
             }
             navigation => {
-                // 这里包括原 RequiredRow，以及导航取得原行前尚在途的普通来源根重放。
-                // 两者都消费同一批真实出版物；仅 RequiredRow 额外消费它实际的 Row/End 结果。
+                // This includes original RequiredRow and ordinary Source root replay still in flight before navigation obtains its row.
+                // Both consume the same actual publication; only RequiredRow additionally consumes its actual Row/End result.
                 let parser = self.request.as_mut().expect("原来源量子仍有唯一 owner");
                 let step = parser.advance(document, authority, QUANTUM).inspect_err(|_cause| {
-                // 验收日志只保真实请求阶段、窗口和总账，不输出正文、路径或链接目标。
+                // Acceptance diagnostics retain actual request stage, window, and totals only, without text, paths, or link destinations.
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 eprintln!(
                     "native_root_source_failure stage=cell_drain_source window={:?} selection={:?} total={:?} cause={_cause:?}",
@@ -1102,7 +1110,7 @@ impl RootLeaf {
         }
     }
 
-    /// 原行票核身份，最新发布再授格准备；旧行恢复改变游标后，暂停行不能借旧发布启动 CellInline。
+    /// Original row tickets validate identity; latest publication authorizes preparation. Repositioned rows cannot start CellInline using old publication.
     pub(super) fn prepare_cell(
         &mut self,
         document: &omni_markdown_core::MarkdownDocumentBuffer,
@@ -1118,14 +1126,14 @@ impl RootLeaf {
             || row.coordinate() != expected.coordinate()
             || row.columns() != expected.columns()
         {
-            // 只有同源同物理行可续当前格，查询命中另一结构不能作为旧行的替代来源。
+            // Only the same Source/physical row continues this cell; another queried structure cannot substitute for the original row.
             return Err(super::ViewError::Revoked.into());
         }
         Ok(Some(row.prepare_cell(document, source, column)?))
     }
 
-    /// 原 Plain 前缀或真实 Root Code 能力覆盖整个 Composer 库存时，才保留同源字形。
-    /// 能力借用、Composer 只读核验与旧发布退休都在同一纯 Core 栈中完成，没有 Native 回调。
+    /// Retain same-Source glyphs only when actual Plain-prefix or Root Code capability covers all Composer inventory.
+    /// Capability borrowing, read-only Composer validation, and old-publication retirement share one pure Core stack, without Native callbacks.
     pub(super) fn reproject_selection_preserving_styles(
         &mut self,
         owner: &Owner,
@@ -1139,7 +1147,7 @@ impl RootLeaf {
             return Err(super::ViewError::Revoked.into());
         }
         if self.pending || self.cell_navigation.is_some() {
-            return Ok(false); // 原请求/格作业尚在途，仍由原重排路径取消并等待真实归还。
+            return Ok(false); // Original request/cell work is still in flight; the existing relayout path cancels it and waits for actual return.
         }
         let (Some(parser), Some(previous)) = (self.request.as_mut(), self.ready.as_ref()) else {
             return Ok(false);
@@ -1157,11 +1165,11 @@ impl RootLeaf {
             cancelled: false,
         };
         {
-            // cap 不是裸 Range，也不保旧 publication 的强副本；它借原请求/Doc/最新发布，
-            // 认证 Plain 已读前缀或同一 Root Code 正文内的选择移动。后者不重用旧
-            // marked/选区像素：旧 Scene/Reader 仍退休，后继帧须匹配完整新 Input。
-            // Composer 自己核 Stage/Store/活跃支持范围，
-            // 不能由 Native 的 SceneReady 或已显示行数猜测其尚未捕获的整形输入。
+            // cap is neither a bare Range nor a strong old-publication copy; it borrows original request/Doc/latest publication,
+            // certifying a read Plain prefix or selection movement within the same Root Code body. Neither reuses old
+            // marked/selection pixels: old Scene/Reader still retire and the successor frame must match complete new Input.
+            // Composer checks its own Stage, Store, and active supported range;
+            // Native SceneReady or displayed-line counts cannot infer shaping input that Composer has not captured.
             let Some(capability) =
                 parser.selection_style_invariant(&document, previous, authority)?
             else {
@@ -1170,43 +1178,43 @@ impl RootLeaf {
             if !composer.can_retain_selection_styles(&capability)? {
                 return Ok(false);
             }
-        } // 借用先结束，才允许原唯一请求改变选择、退休 publication；没有跨 Native 或挂起保存 cap。
+        } // End the borrow before the sole request changes selection/retires publication; cap never survives Native entry or suspension.
         ticket.require_pure(owner, source)?;
         if !parser.reproject_selection(&document, previous, self.window.clone(), authority)? {
-            return Ok(false); // Core 资格不满足保证原 owner/发布不变，交原 reset_styles 冷路径。
+            return Ok(false); // Core rejection preserves the original owner/publication and leaves recovery to the established reset_styles path.
         }
         self.work = parser.total_work();
-        self.ready = None; // 旧发布此刻已永久退休，不等下一 NeedStyle，目标可能已经落在保留前缀内。
+        self.ready = None; // The old publication permanently retires now, not at another NeedStyle; the target may already lie inside the retained prefix.
         self.pending = true;
         self.selection = Some(selection);
         self.link_repositioned = None;
         self.row_repositioned = None;
-        // 后继样式必须由新选择正常 advance 生成的新发布提供，不能借旧 Boundary 给新 Input 补票。
+        // Successor styles require a new publication from normal advance under new selection; an old Boundary cannot renew new Input authority.
         ticket.require_pure(owner, source)?;
         Ok(true)
     }
 
-    /// 旧字形图已真实结束后接纳新选择；只有已移交输出的原请求可尝试保同源结构。
-    /// 实际新窗口由后继首次 StyleRequest 决定，不能猜一个可能截断 GCB 的范围。
+    /// Accept new selection after the old glyph graph ended; only the original request that transferred output may attempt same-Source structural reuse.
+    /// The successor's first actual StyleRequest determines its window, avoiding guessed ranges that could split a GCB.
     pub(super) fn reset_selection(&mut self, selection: MarkdownTextSelection) {
         if !self.pending
             && self.request.is_some()
             && self.ready.is_some()
             && self.cell_navigation.is_none()
         {
-            // pending+ready 是同一原槽的待重投影意图；旧发布仍按旧完整选择核权，
-            // 所有查询先受 pending 阻断。Core 接受或拒绝后才退还这枚最后 publication。
+            // pending+ready records reprojection intent in the same slot; the old publication remains authorized by its old complete selection,
+            // with all queries blocked by pending. Return the final old publication only after Core accepts or rejects reprojection.
             self.pending = true;
             self.link_repositioned = None;
             self.row_repositioned = None;
             self.cell_navigation = None;
         } else {
-            self.clear(); // 活动来源/格作业或再次换选择仍走原取消、释放与冷准备。
+            self.clear(); // Active Source/cell work or another selection change follows original cancellation, release, and cold preparation.
         }
         self.selection = Some(selection);
     }
 
-    /// 目标只借当前原Source/publication的解析事实；窗口外明确未准备，不能据LINK位猜URL。
+    /// Targets borrow actual parsing facts from original Source/publication; unknown off-window coverage stays Pending, never a URL inferred from LINK bits.
     pub(super) fn link_at(
         &self,
         owner: &Owner,
@@ -1235,7 +1243,7 @@ impl RootLeaf {
             if self.selection != Some(authority.selection) {
                 return Err(super::ViewError::Revoked);
             }
-            return Err(super::ViewError::Pending); // 原最后发布不能因 Native 已接纳新选择而获得新权限。
+            return Err(super::ViewError::Pending); // The final original publication gains no new authority merely because Native accepted another selection.
         }
         let ready = self.ready.as_ref().ok_or(super::ViewError::Pending)?;
         let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = ready
@@ -1244,20 +1252,20 @@ impl RootLeaf {
         else {
             return Err(super::ViewError::Pending);
         };
-        // 原有限闭合块的 Parser 已经逐项准入完整 label 与解码目标；正链接事实
-        // 可以覆盖当前样式交集以外的同块文字，但不能据此扩张字体、绘图或“无链接”权限。
+        // The bounded closed block's Parser already admitted complete labels and decoded targets. Positive link facts
+        // can cover same-block text outside the style intersection, without expanding font, paint, or negative no-link authority.
         match leaf.link_at_for(&document, authority, index) {
             Ok(link) => Ok(link.cloned()),
             Err(MarkdownTableRequestError::Window(MarkdownTableWindowError::ContextPending))
                 if !self.window.contains(&index) =>
             {
                 Err(super::ViewError::Pending)
-            } // 没有正证据的窗外查询仍明确未准备，后继真实 click 必须推进唯一原来源。
+            } // Off-window queries lacking positive evidence remain Pending; the actual click must advance the sole original Source request.
             Err(cause) => Err(super::ViewError::LinkSource(cause)),
         }
     }
 
-    /// 旧sealed Scene回查只重定位原唯一请求；推进与安装分别占后继回合，不复制Source或保全源URL表。
+    /// Queries from old sealed Scenes reposition only the sole original request; later turns advance/install separately without Source copies or a document-wide URL table.
     pub(super) fn advance_link(
         &mut self,
         owner: &Owner,
@@ -1265,7 +1273,7 @@ impl RootLeaf {
         index: usize,
         ticket: &PreparationTicket,
     ) -> Result<Option<Option<omni_markdown_core::MarkdownSourceLink>>> {
-        self.row_repositioned = None; // 链接接管唯一来源游标，之前取消的旧行意图到此结束。
+        self.row_repositioned = None; // Link intent takes the sole Source cursor; the previously cancelled row intent ends here.
         ticket.require_pure(owner, source)?;
         if source.authority() != self.source || index >= source.utf16_len() {
             return Err(super::ViewError::Revoked.into());
@@ -1283,15 +1291,15 @@ impl RootLeaf {
             cancelled: false,
         };
         if self.selection != Some(authority.selection) {
-            return Err(super::ViewError::Revoked.into()); // 不能借click对选择变化后的旧语义图重新授权。
+            return Err(super::ViewError::Revoked.into()); // A click cannot reauthorize the old semantic graph after selection changes.
         }
         if self.pending && self.ready.is_some() {
-            return Ok(None); // 等待原 Composer 给出新样式范围，不把旧完整选择的请求推进成失败。
+            return Ok(None); // Await the original Composer's new style range without advancing an old-selection request into failure.
         }
         if self.pending {
             let parser = self.request.as_mut().expect("pending持唯一来源请求");
             let step = parser.advance(&document, authority, QUANTUM).inspect_err(|_cause| {
-                // 验收日志只保真实请求阶段、窗口和总账，不输出正文、路径或链接目标。
+                // Acceptance diagnostics retain actual request stage, window, and totals only, without text, paths, or link destinations.
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 eprintln!(
                     "native_root_source_failure stage=link_source window={:?} selection={:?} total={:?} cause={_cause:?}",
@@ -1309,42 +1317,42 @@ impl RootLeaf {
                 ));
                 self.pending = false;
             }
-            return Ok(None); // 一个量子只推进原Parser；不同时创建下一份publication或进行Native副作用。
+            return Ok(None); // One quantum advances only the original Parser, without simultaneously installing another publication or issuing Native effects.
         }
-        // 先消费同一真实 publication 已持有的正目标；窗口边界只约束未知/负证明，
-        // 不能丢弃原 Parser 已验证且已付费的另一个 label，也不为它重放整个来源。
+        // First use positive targets already owned by this publication. Window limits constrain unknown/negative evidence,
+        // not another label already validated and accounted by Parser; do not discard it or replay its whole Source.
         match self.link_at(owner, source, index) {
             Ok(link) => {
                 self.link_repositioned = None;
                 return Ok(Some(link));
             }
-            Err(super::ViewError::Pending) if !self.window.contains(&index) => {} // 未知窗外仍沿原一单位恢复；窗内缺事实保原失败，不能无限重放。
+            Err(super::ViewError::Pending) if !self.window.contains(&index) => {} // Unknown off-window targets use the original one-unit recovery; missing in-window facts retain failure instead of replaying endlessly.
             Err(
                 cause @ super::ViewError::LinkSource(MarkdownTableRequestError::Window(
                     MarkdownTableWindowError::ContextPending,
                 )),
             ) => {
                 if self.link_repositioned == Some(index) {
-                    return Err(cause.into()); // 同一真实起点已完成重放仍无覆盖；保typed Pending，不造空target或重复重扫。
+                    return Err(cause.into()); // The same start finished replay without coverage; preserve typed Pending rather than inventing an empty target or rescanning again.
                 }
             }
-            Err(cause) => return Err(cause.into()), // I/O、撤权和原解析首因均不具备回退重试权限。
+            Err(cause) => return Err(cause.into()), // I/O, revocation, and original parse failure authorize no fallback replay.
         }
         let ready = self.ready.as_ref().ok_or(super::ViewError::Pending)?;
-        // 链接是原命中点的查询，不需要把后方16KiB表格和其它块一起请求成语义窗口。
-        // 这里的一单位只限定查询覆盖；原Core仍从同Global的真实闭合block取得完整Parser、
-        // references和HTML上下文，返回完整label/destination，不截断Markdown链接或另建来源。
-        // 命中票的index为真实GCB起点；若是emoji，原端点定位器仍按既有规则认证完整scalar。
+        // A link queries the original hit, without requesting another 16-KiB tail of tables/blocks into its semantic window.
+        // The one-unit range limits query coverage only. Core still uses the same Global's actual closed block for complete Parser,
+        // reference, and HTML context, returning complete label/destination without truncating Markdown or creating another Source.
+        // The hit index is an actual GCB start; for emoji, the original endpoint locator still certifies the complete scalar.
         let desired = index..source.utf16_len().min(index + 1);
         self.request
             .as_mut()
             .expect("已发布RootLeaf仍持同一来源续体")
             .reposition(&document, ready, desired.clone(), authority)?;
-        self.ready = None; // 请求已经接管重定位，先退旧Ready再让后继量子装配新有限语义工作区。
+        self.ready = None; // The request owns repositioning; retire old Ready before a later quantum assembles its bounded semantic workspace.
         self.window = desired;
         self.pending = true;
         self.link_repositioned = Some(index);
-        Ok(None) // 原数值window内的coverage空洞也必须沿同一请求恢复真实起点，不能签成无链接。
+        Ok(None) // Coverage holes inside the numeric window also recover their actual start through this request, never certifying no link.
     }
     pub(super) fn select(
         &mut self,
@@ -1363,7 +1371,7 @@ impl RootLeaf {
         )
     }
 
-    /// 原 LF/CRLF/Tab 也从唯一 publication 查询；空逻辑行只在真实行树证明后保留字面默认值。
+    /// Original LF/CRLF/Tab query the sole publication; only actual line-tree proof permits literal defaults for empty logical lines.
     pub(super) fn select_control(
         &mut self,
         owner: &Owner,
@@ -1395,8 +1403,8 @@ impl RootLeaf {
         ticket: &PreparationTicket,
     ) -> Result<Option<StyleDecision>> {
         ticket.require_pure(owner, source)?;
-        self.link_repositioned = None; // 原Composer重新接管语义，后继click属于另一次实际查询，不继承旧手势的恢复记录。
-        self.row_repositioned = None; // 同样结束先前旧行恢复的单次重放记录，后继滚回仍是新的真实需求。
+        self.link_repositioned = None; // Original Composer resumes semantic ownership; a later click is another query and inherits no old gesture recovery record.
+        self.row_repositioned = None; // Likewise end the preceding row recovery's single-replay record; later backward scrolling is a new actual request.
         if source.authority() != self.source || authority != &self.source {
             return Err(super::ViewError::Revoked.into());
         }
@@ -1407,9 +1415,9 @@ impl RootLeaf {
             .expect("InlinePreview装配只接受Body原Doc")
             .clone();
         let document = document.borrow();
-        // 只有下方真正缺少语义覆盖的控制才需要证明整条逻辑行为空。
-        // 普通已覆盖控制、首工厂和在途量子不消费这个事实，不能每轮重复解码行树的 Unicode 计量。
-        // 延迟查询仍沿原 CRLF/尾空行定义，不另写行解析器或保存跨请求缓存。
+        // Only a control actually lacking semantic coverage below needs proof that its entire logical line is empty.
+        // Covered controls, initial construction, and in-flight quanta do not need this fact; avoid repeatedly decoding line-tree Unicode measurements.
+        // The deferred query keeps existing CRLF/trailing-empty-line rules, without another line parser or cross-request cache.
         let is_blank_control = || -> Result<bool> {
             Ok(control.is_some()
                 && super::producer::source_line_range_at_head(&document, range.start)
@@ -1422,10 +1430,10 @@ impl RootLeaf {
                 omni_markdown_core::MarkdownLineInlineControlKind::CarriageReturn
                     | omni_markdown_core::MarkdownLineInlineControlKind::LineFeed
             )
-        ); // 控制种类来自原 Composer nonce；只对真实 CR/LF 查询同源 fence separator。
+        ); // Control kind comes from original Composer nonce; only actual CR/LF queries this Source's fence separator.
         let selection = document.selection();
         if self.selection.is_some_and(|old| old != selection) {
-            self.clear(); // 旧选择的publication无法续权；不捕第二Source或并存两个解析前沿。
+            self.clear(); // Old-selection publication cannot renew authority; acquire no second Source or concurrent parse frontier.
         }
         let authority = MarkdownViewportSourceAuthority {
             context_revision: self.context,
@@ -1434,20 +1442,20 @@ impl RootLeaf {
         };
         let desired = range.start..range.end.min(range.start.saturating_add(WINDOW_UTF16));
         if self.pending && self.ready.is_some() {
-            // 这里只移交原已消费输出的请求和它最后一枚发布；新范围来自真实 Style/Control，
-            // 新完整选择来自当前 Doc。Core 自己核同源、闭合记录和 prefix 能力，不据默认样式猜资格。
+            // Transfer only the original request whose output was consumed and its final publication. Actual Style/Control supplies the new range,
+            // and current Doc supplies complete selection. Core validates Source, closed records, and prefix capability without default-style guesses.
             let parser = self.request.as_mut().expect("待重投影仍持原唯一来源请求");
             let previous = self.ready.as_ref().expect("待重投影只借原最后发布");
             let reprojected =
                 parser.reproject_selection(&document, previous, desired.clone(), authority)?;
-            self.work = parser.total_work(); // 固定控制准备与真正析构费用仍计入原请求累计账。
+            self.work = parser.total_work(); // Fixed control preparation and actual destruction remain charged to the original cumulative request.
             if reprojected {
-                self.ready = None; // Core 已撤旧 publication；不保旧 Ready/Reader 或给旧 Font 响应补票。
+                self.ready = None; // Core revoked the old publication; retain no old Ready/Reader or renewed old-font authority.
                 self.window = desired;
-                return Ok(None); // 重投影控制与后继来源 advance 分回合，不重新领取或隐藏原步骤额度。
+                return Ok(None); // Reprojection control and Source advance occupy separate turns, without renewed or hidden step allowances.
             }
-            // false 只表示原有限记录/已证前缀不足；Core 保证未改 owner。
-            // I/O、取消、旧发布或完整选择失权均由上面的 Err 原样退出，不能降为冷准备成功。
+            // False means only bounded records/proven prefix are insufficient; Core guarantees unchanged ownership.
+            // I/O, cancellation, old publication, or complete-selection revocation exits through Err unchanged, never as successful cold preparation.
             self.clear();
             self.selection = Some(selection);
         }
@@ -1458,7 +1466,7 @@ impl RootLeaf {
                     "native_root_source_window stage=style_create requested={range:?} desired={desired:?} selection={selection:?} source_units={}",
                     source.utf16_len(),
                 );
-            } // 只记录真正开窗，不在每个Font/GCB请求中重复输出。
+            } // Record actual window creation only, not each Font/GCB request.
             self.request = Some(document.viewport_leaf_source_request(
                 desired.clone(),
                 self.context,
@@ -1467,8 +1475,8 @@ impl RootLeaf {
             self.selection = Some(selection);
             self.window = desired;
             self.pending = true;
-            // 工厂只绑定原 root、准入固定库存，不读取正文；下面仍只执行一次原来源步。
-            // 固定控制准备另有真实费用，不把本回合全部 metadata 宣称为至多4096。
+            // Construction binds original root and fixed inventory without text reads; below still executes just one actual Source step.
+            // Fixed control preparation has its own actual cost; do not claim all turn metadata is bounded by the 4096 scan allowance.
         } else if let Some(parser) = self.request.as_mut()
             && !self.pending
             && !self.window.contains(&range.start)
@@ -1505,20 +1513,20 @@ impl RootLeaf {
                         );
                     })?;
             }
-            self.ready = None; // click可把唯一语义游标移向旧视口；后继Composer仍按真实来源重新准备其需要的窗口。
+            self.ready = None; // A click may move the sole semantic cursor to an old viewport; successor Composer still prepares its needed actual Source window.
             self.window = desired;
             self.pending = true;
             if backward {
-                // 逆向先真实重置 Global 与旧 owner；保原独立控制回合，不能再挤入新 Leaf 构造。
+                // Backward movement first resets actual Global/old ownership; retain the separate control turn without also constructing a new Leaf.
                 return Ok(None);
             }
-            // 前向仅迁移原 publication 的有限目录与最新 quota；累计 fuel 从未重置，
-            // 接着推进同一请求一次，避免每个短样式窗口为纯准备多走一次 Native 调度。
+            // Forward movement transfers only the original publication's bounded directory/latest quota; cumulative fuel never resets,
+            // then advances that same request once, avoiding an extra Native scheduling turn for each short style window's control preparation.
         }
         if self.pending {
             let parser = self.request.as_mut().expect("pending持原来源请求");
             let step = parser.advance(&document, authority, QUANTUM).inspect_err(|_cause| {
-                // 验收日志只保真实请求阶段、窗口和总账，不输出正文、路径或链接目标。
+                // Acceptance diagnostics retain actual request stage, window, and totals only, without text, paths, or link destinations.
                 #[cfg(feature = "native-markdown-runtime-probe")]
                 eprintln!(
                     "native_root_source_failure stage=style_source window={:?} selection={:?} total={:?} cause={_cause:?}",
@@ -1527,7 +1535,7 @@ impl RootLeaf {
                     parser.total_work(),
                 );
             })?;
-            self.work = parser.total_work(); // 含源读取/复制/Parser输入的原真实累计账，不混成Composer字节0。
+            self.work = parser.total_work(); // Actual cumulative Source reads/copies/Parser input stay separate from Composer byte accounting.
             if matches!(step, MarkdownViewportSourceStep::SourcesAvailable { .. }) {
                 self.ready = Some(Rc::new(
                     parser
@@ -1536,7 +1544,7 @@ impl RootLeaf {
                 ));
                 self.pending = false;
             }
-            return Ok(None); // 每次只 advance 一次；即使已 Ready，也不合并样式查询、Font 或 Composer。
+            return Ok(None); // Advance once only; even Ready does not combine style lookup, font work, or Composer advancement into this turn.
         }
         let ready = self.ready.as_ref().expect("完成来源持同一publication");
         if line_break
@@ -1545,7 +1553,7 @@ impl RootLeaf {
             let mut selection = Selection::literal_range(source, separator, 0.0);
             selection.fence_separator = true;
             selection.scope = SelectionScope::Body(ready.clone(), authority);
-            return Ok(Some(StyleDecision::Font(selection))); // 完整 Parser 没给 closing separator 代码样式；原 Root 票单独证明它。
+            return Ok(Some(StyleDecision::Font(selection))); // The complete Parser supplies no code style for the closing separator; its original Root ticket certifies that control separately.
         }
         if control.is_none()
             && let Some(row) = ready.table_row_at_for(&document, authority, range.start)?
@@ -1553,9 +1561,9 @@ impl RootLeaf {
             let row = source.verified_table_layout_row_from_source(&document, row, authority)?;
             if row.source_range().start != range.start {
                 return Err(Error::Unsupported);
-            } // 原 NeedStyle 必须正处于真实块起点，不能在已消费的半行里事后跳过正文。
+            } // Original NeedStyle must be at the actual block start; already-consumed midline text cannot be skipped retroactively.
             return Ok(Some(StyleDecision::Table(row)));
-        } // TABLE 样式位、同值范围及离屏 header context 均不能补造可绘制行。
+        } // TABLE bits, equal ranges, and offscreen header context cannot manufacture a paintable row.
         let state = ready.ordinary_semantics_for(&document, authority)?;
         let MarkdownOrdinarySemanticState::RootLeafReady(leaf) = state else {
             let blank = is_blank_control()?;
@@ -1563,7 +1571,7 @@ impl RootLeaf {
                 return Ok(Some(StyleDecision::Font(Selection::literal_range(
                     source, range, 0.0,
                 ))));
-            } // 只为真实空逻辑行保留控制高度；普通字形的未知区间仍明确拒绝。
+            } // Preserve control height only for actual empty logical lines; unknown ordinary glyph ranges remain rejected.
             #[cfg(feature = "native-markdown-runtime-probe")]
             eprintln!(
                 "native_root_leaf_missing_semantics range={range:?} window={:?} blank={blank} line_break={line_break} state={}",
@@ -1578,12 +1586,12 @@ impl RootLeaf {
                     MarkdownOrdinarySemanticState::RootLeafReady(_) => unreachable!(),
                 }
             );
-            return Err(Error::Unsupported); // SourcesOnly/未知inline不签默认Body样式。
+            return Err(Error::Unsupported); // SourcesOnly or unknown inline coverage cannot certify default Body styling.
         };
         let query = match leaf.query_for(&document, authority, range.start)? {
             Some(query) => query,
             None => {
-                // 未覆盖才核原完整控制行；真正可见的字形仍不得借默认样式绕过原 Parser。
+                // Check the complete control line only when uncovered; visible glyphs cannot bypass original Parser with default styling.
                 let blank = is_blank_control()?;
                 if blank {
                     return Ok(Some(StyleDecision::Font(Selection::literal_range(
@@ -1619,16 +1627,22 @@ impl RootLeaf {
             source: self.source.clone(),
         })))
     }
-    #[cfg(feature = "native-markdown-runtime-probe")]
+    #[cfg(all(
+        feature = "native-paged-body-probe",
+        feature = "native-markdown-runtime-probe"
+    ))]
     pub(super) fn publication(&self) -> Option<std::rc::Weak<VerifiedMarkdownViewportSources>> {
         if self.pending {
-            None // 待重投影的旧 publication 仍属旧选择，不发布为当前图的观察票。
+            None // An old publication awaiting reprojection belongs to old selection and cannot observe the current graph.
         } else {
             self.ready.as_ref().map(Rc::downgrade)
         }
     }
 
     fn clear(&mut self) {
+        // Cancel the original request before releasing its last publication and
+        // navigation facts. Drop follows this same ownership path; no callback
+        // may later install a result into the retired RootLeaf.
         if let Some(request) = self.request.as_mut() {
             request.cancel();
         }
@@ -1644,19 +1658,22 @@ impl RootLeaf {
 impl Drop for RootLeaf {
     fn drop(&mut self) {
         self.clear();
-    } // 关闭真正释放语义续体/Ready；不等迟到Native或worker回调清槽。
+    } // Close returns actual semantic continuation/Ready without waiting for a late Native or worker callback to clear slots.
 }
 
-#[cfg(feature = "native-markdown-runtime-probe")]
-/// 实际sealed part的有限诊断事实；不返回Source/Font/Reader强边或另造行身份。
+#[cfg(all(
+    feature = "native-paged-body-probe",
+    feature = "native-markdown-runtime-probe"
+))]
+/// Bounded diagnostics from actual sealed parts, without strong Source/font/Reader claims or fabricated line identity.
 pub(in crate::native_surface) struct RootLeafPart {
     pub source: Range<usize>,
-    /// 原封存glyph的总推进；与CTFont自身的原生advance不同，实际Core整形也必须独立核对。
+    /// Total sealed-glyph advance, distinct from CTFont's Native advance; actual Core shaping still requires independent comparison.
     pub advance_26_6: i64,
     pub script: [u8; 4],
     pub direction: omni_markdown_core::MarkdownShapingDirection,
-    /// 仅完整采集至多256字形的真实part；超出时明确未采，不截前缀冒充完整字形域。
-    /// 这些Copy值不保活Reader/Source/Font，也不改变原观察入口可支持的part范围。
+    /// Capture complete actual parts of at most 256 glyphs; larger parts are explicitly unobserved rather than truncated into a complete domain.
+    /// These Copy values retain no Reader/Source/font ownership and do not expand the original observation entry's supported part range.
     pub glyphs: Option<Vec<omni_markdown_core::MarkdownShapedGlyph>>,
     pub presentation: MarkdownPresentationStyles,
     pub points: f32,
@@ -1667,16 +1684,19 @@ pub(in crate::native_surface) struct RootLeafPart {
     pub font_owner: std::rc::Weak<NativeMarkdownLineFont>,
 }
 
-#[cfg(feature = "native-markdown-runtime-probe")]
+#[cfg(all(
+    feature = "native-paged-body-probe",
+    feature = "native-markdown-runtime-probe"
+))]
 impl Typography {
     pub(super) fn role_at(
         &self,
         index: usize,
         presentation: MarkdownPresentationStyles,
     ) -> &'static str {
-        // 一个实际 Font 可被正文、表头或代码角色共用，索引自身没有唯一语义。
-        // 只用原 sealed part 的样式选槽，再核该槽确实发布了当前实际注册 Font；
-        // 不能扫描首个同索引槽，也不能只按样式把另一回退 Font 诊断成原角色字体。
+        // Body, table header, or code roles may share one actual font; its index has no unique semantic meaning.
+        // Select a slot using the original sealed part's style, then verify it actually published this registered font;
+        // neither the first equal-index slot nor style alone can misclassify another fallback font as the original role font.
         let role = Role::from_styles(presentation);
         let Some(slot) = role.slot(presentation) else {
             return "body-or-fallback";
@@ -1694,17 +1714,20 @@ impl Typography {
     }
 }
 
-#[cfg(feature = "native-markdown-runtime-probe")]
+#[cfg(all(
+    feature = "native-paged-body-probe",
+    feature = "native-markdown-runtime-probe"
+))]
 impl Owner {
-    /// 实际可见窗口的行观测只复制有限标量；不借 Producer 样式期望反造几何 oracle。
+    /// Visible-window line observation copies bounded scalar facts, without deriving a geometry oracle from Producer style expectations.
     pub(in crate::native_surface) fn probe_root_leaf_lines(
         &self,
     ) -> Result<Vec<crate::native_surface::preview_paragraph::PreviewLineObservation>> {
         let scene = self.scene.borrow().clone().ok_or(Error::Busy)?;
         scene.probe_line_geometry().map_err(Error::from)
     }
-    /// 固定最多32行/256part，读取原Reader和实际注册Font；不从语义期望反造诊断结果。
-    /// 只保metadata弱票，实测Body关闭确实释放Ready；不为测试延长任何Source或Native生命。
+    /// Observe the actual publication through a weak ticket, without deriving diagnostic output from semantic expectations.
+    /// The metadata-only weak ticket permits actual Ready-release observation without extending any Source or Native lifetime.
     pub(in crate::native_surface) fn probe_root_leaf_publication(
         &self,
     ) -> Result<std::rc::Weak<VerifiedMarkdownViewportSources>> {

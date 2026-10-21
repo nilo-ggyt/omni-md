@@ -1,4 +1,4 @@
-//! 原keyDown先等真实导航收据，再由唯一NSTextInputContext同步解释；不保存虚构marked状态。
+//! Original keyDown waits for actual navigation receipts, then the sole NSTextInputContext interprets it synchronously without duplicate marked state.
 
 use super::*;
 use crate::native_surface::paged_input::NativeMarkdownPagedInputState;
@@ -15,7 +15,7 @@ pub(in crate::native_surface::paged_body) enum NativeInput {
     Paste(String),
     Attachments {
         paths: Vec<std::path::PathBuf>,
-        /// 只保原可见命中的canonical代次/位置；正文变化后绝不把旧drop改插到新文稿。
+        /// Retain only the visible hit's canonical generation/position; text changes cannot redirect an old drop into a successor document.
         drop: Option<(u64, usize)>,
     },
     Format(omni_markdown_core::MarkdownFormatAction),
@@ -23,7 +23,7 @@ pub(in crate::native_surface::paged_body) enum NativeInput {
     Fold(super::super::super::paged_text_view::NativeMarkdownPagedSourceFoldAction),
 }
 impl NativeInput {
-    /// 事件数量另受原32段限制；字符payload与普通新增文本共用原输入字节额度。
+    /// Event count also obeys the existing 32-run bound; character payload shares the original byte allowance with ordinary insertion.
     pub(in crate::native_surface::paged_body) fn bytes(&self) -> usize {
         match self {
             Self::Key { bytes, .. } => *bytes,
@@ -37,7 +37,7 @@ impl NativeInput {
 }
 
 impl NativeMarkdownPagedBody {
-    /// 格式/插表只保原领域动作；实际选择必须等队首执行时从前步真实Commit取得。
+    /// Formatting/table insertion retains domain intent only; actual selection comes from the preceding Commit when this action reaches queue head.
     pub(in crate::native_surface::paged_body) fn accept_native_edit(
         &self,
         action: NativeInput,
@@ -49,12 +49,12 @@ impl NativeMarkdownPagedBody {
         }
         if let NativeInput::Attachments { paths, .. } = &action {
             crate::native_surface::workspace_actions::admit_attachment_paths(0, paths)
-                .map_err(ViewError::AttachmentImport)?; // 无效外部批次在建立任何输入屏障前整体拒绝。
+                .map_err(ViewError::AttachmentImport)?; // Reject an invalid external batch as a whole before creating any input barrier.
         }
         let Some(pending) = self.native_input_chain(files)? else {
             return Ok(false);
         };
-        // 正在解释前步时到达的外部菜单仍排在原队尾；本队首自有动作由View明确跳过defer。
+        // External menus arriving during interpretation stay at the original queue tail; View explicitly bypasses defer for this head action itself.
         let slot = Rc::new(RefCell::new(None));
         {
             let mut steps = pending.steps.borrow_mut();
@@ -62,7 +62,7 @@ impl NativeMarkdownPagedBody {
                 return Err(ViewError::Busy.into());
             }
             if let NativeInput::Attachments { paths, .. } = &action {
-                // 与原文件入口相同：最多四个待处理批次，不截断用户已经接纳的路径前缀。
+                // Match the existing file entry's four-pending-batch bound without truncating an already-admitted path prefix.
                 let queued = steps.iter().filter(|step| matches!(step,
                     WordInput::Native(slot) if matches!(&*slot.borrow(), Some(NativeInput::Attachments { .. }))
                 )).count();
@@ -70,6 +70,8 @@ impl NativeMarkdownPagedBody {
                     .map_err(ViewError::AttachmentImport)?;
             }
             let bytes = action.bytes();
+            // Reserve bounded payload ownership before publishing the action into
+            // its slot; a failed original permit check returns exactly this charge.
             if bytes
                 > crate::native_surface::text_storage::NATIVE_MARKDOWN_INPUT_TRANSACTION_MAX_BYTES
                     .saturating_sub(pending.queued_bytes.get())
@@ -96,18 +98,18 @@ impl NativeMarkdownPagedBody {
                 && pending.steps.borrow().is_empty()
                 && pending.waiting_vertical.borrow().is_none()
             {
-                self.cancel_original_word_delete(&pending)?; // 只归还本请求留下的原空链；不让失败批次永久占有输入屏障。
+                self.cancel_original_word_delete(&pending)?; // Return only this request's empty chain; a rejected batch cannot leave a permanent input barrier.
             } else if pending.current_at(self, serial) {
-                self.schedule()?; // getter重入可能已消费原唤醒；只恢复原链，不重放被拒绝动作。
+                self.schedule()?; // Getter reentry may have consumed the wake; resume only the original chain, without replaying the rejected action.
             }
             return Err(cause.into());
         }
-        *slot.borrow_mut() = Some(action); // 原检查的Native getter已经返回，未完成的占槽不再阻挡前步。
+        *slot.borrow_mut() = Some(action); // Original Native validation returned; filling this reserved slot removes its incomplete-payload barrier.
         self.schedule()?;
         Ok(true)
     }
 
-    /// 普通键盘只接现存Word/垂直屏障；文件I/O需让出Native回调，仍由同一原链延后执行。
+    /// Ordinary keys defer only behind existing Word/vertical barriers. File I/O yields the Native callback and runs later in this same chain.
     fn native_input_chain(&self, for_files: bool) -> Result<Option<Rc<PendingWordDelete>>> {
         if let Some(pending) = self.pending_word_delete.borrow().clone() {
             return Ok(Some(pending));
@@ -139,6 +141,8 @@ impl NativeMarkdownPagedBody {
             .capture(self.configuration.epoch, &current)
             .map_err(ViewError::from)?;
         let pending = Rc::new(PendingWordDelete {
+            // This is the same production input chain, initially waiting on the
+            // actual vertical owner or yielding file work out of its Native callback.
             request: RefCell::new(request),
             steps: RefCell::new(VecDeque::new()),
             queued_bytes: Cell::new(0),
@@ -162,7 +166,7 @@ impl NativeMarkdownPagedBody {
         Ok(Some(pending))
     }
 
-    /// getter之前先占原到达位置；Native重入只能排其后，转换失败只撤自己的空槽。
+    /// Reserve arrival order before getters so reentrant input stays later; conversion failure removes only its own empty slot.
     pub(in crate::native_surface::paged_body) fn accept_native_key(
         &self,
         event: &NSEvent,
@@ -172,7 +176,7 @@ impl NativeMarkdownPagedBody {
             return Ok(false);
         };
         if let Some(producer) = self.producer.borrow().as_ref() {
-            producer.target_source_health()?; // 额度或后继事件不能盖掉原Source已经发生的真实首错。
+            producer.target_source_health()?; // Quota rejection or successor events cannot hide the original Source's actual first failure.
         }
         let slot = Rc::new(RefCell::new(None));
         {
@@ -215,12 +219,12 @@ impl NativeMarkdownPagedBody {
                 return Err(ViewError::Busy.into());
             }
             pending.queued_bytes.set(pending.queued_bytes.get() + bytes);
-            charged.set(bytes); // retain和临时NSString释放均可重入，后继必须先看到本event已占用的额度。
-            // SAFETY: 原主线程同步参数仍活，retain仅保同一实际event，绝不重造时间戳/键盘载荷。
+            charged.set(bytes); // Retain and temporary NSString release may reenter; successor input must already see this event's charged allowance.
+            // SAFETY: The original synchronous main-thread argument is live; retain keeps that same event without recreating timestamps or key payload.
             let retained = unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
                 .ok_or(ViewError::Revoked)?;
             drop(characters);
-            drop(plain); // 临时NSString归还可重入；最终原票检查后才安装event和额度。
+            drop(plain); // Temporary NSString release may reenter; install the event only after final original-ticket validation.
             self.input
                 .check_permit(permit, &current)
                 .map_err(ViewError::from)?;
@@ -243,14 +247,14 @@ impl NativeMarkdownPagedBody {
                     |step| !matches!(step, WordInput::Native(actual) if Rc::ptr_eq(actual, &slot)),
                 );
                 if pending.current_at(self, serial) {
-                    self.schedule()?; // 载荷转换已结束，原None槽造成的暂停必须由同一链恢复。
+                    self.schedule()?; // Payload conversion ended; this same chain must resume work suspended by its original None slot.
                 }
                 Err(cause)
             }
         }
     }
 
-    /// 菜单先占原到达位置；Paste在本回调用累计额度转换，不未来重读clipboard或越额复制。
+    /// Menus reserve their original order. Paste converts under cumulative allowance now, without later clipboard rereads or over-budget copies.
     pub(in crate::native_surface::paged_body) fn accept_native_command(
         &self,
         selector: Sel,
@@ -260,7 +264,7 @@ impl NativeMarkdownPagedBody {
             return Ok(false);
         };
         if let Some(producer) = self.producer.borrow().as_ref() {
-            producer.target_source_health()?; // 额度或后继事件不能盖掉原Source已经发生的真实首错。
+            producer.target_source_health()?; // Quota rejection or successor events cannot hide the original Source's actual first failure.
         }
         let slot = Rc::new(RefCell::new(None));
         {
@@ -285,7 +289,7 @@ impl NativeMarkdownPagedBody {
                 .check_permit(permit, &current)
                 .map_err(ViewError::from)?;
             if selector == objc2::sel!(paste:) {
-                // 文件先于文本表示；路径在原菜单到达时捕获，队首不再读取后来变化的clipboard。
+                // Files precede text representation. Capture paths at original menu arrival; queue-head execution does not reread a changed clipboard.
                 let paths = crate::native_surface::workspace_actions::native_markdown_pasteboard_file_paths(&board)
                     .map_err(ViewError::AttachmentImport)?;
                 self.input
@@ -309,13 +313,15 @@ impl NativeMarkdownPagedBody {
                     return Ok(input);
                 }
             }
-            // SAFETY: 原公开字符串类型常量只用于这次真实菜单到达的clipboard读取。
+            // SAFETY: The public string-type constant is used only for this actual menu arrival's clipboard read.
             let text = board.stringForType(unsafe { objc2_app_kit::NSPasteboardTypeString });
             self.input
                 .check_permit(permit, &current)
                 .map_err(ViewError::from)?;
             let text = text.ok_or(ViewError::ClipboardUnavailable)?;
             let copied = self.input.copy_permit_text_with_limit(permit, &text, &current, &|bytes| {
+                // Charge before the real string copy, while preserving any quota
+                // already reserved by earlier or reentrant admitted input.
                 let remaining = crate::native_surface::text_storage::NATIVE_MARKDOWN_INPUT_TRANSACTION_MAX_BYTES.saturating_sub(pending.queued_bytes.get());
                 if bytes > remaining { return false; }
                 pending.queued_bytes.set(pending.queued_bytes.get() + bytes);
@@ -344,14 +350,14 @@ impl NativeMarkdownPagedBody {
                     |step| !matches!(step, WordInput::Native(actual) if Rc::ptr_eq(actual, &slot)),
                 );
                 if pending.current_at(self, serial) {
-                    self.schedule()?; // 载荷转换已结束，原None槽造成的暂停必须由同一链恢复。
+                    self.schedule()?; // Payload conversion ended; this same chain must resume work suspended by its original None slot.
                 }
                 Err(cause)
             }
         }
     }
 
-    /// 只有实际解释栈内的同步输入回调能交接这张Commit；外部点击/Find没有此入口。
+    /// Only synchronous input callbacks on the actual interpretation stack may hand off this Commit; external clicks/Find have no such authority.
     pub(in crate::native_surface::paged_body) fn begin_native_commit(
         &self,
         before: NativeMarkdownPagedInputState,
@@ -383,7 +389,7 @@ impl NativeMarkdownPagedBody {
         Ok(true)
     }
 
-    /// 同一Commit授权自有gutter变化与下一permit；不从后继Input补签旧event或外部resize。
+    /// The same Commit authorizes owned gutter changes and the next permit; successor Input cannot renew an old event or external resize.
     pub(in crate::native_surface::paged_body) fn finish_native_commit(
         &self,
         commit: &NativeMarkdownPagedInputCommit,
@@ -409,7 +415,7 @@ impl NativeMarkdownPagedBody {
         self.arm_word_successor(&pending, Some(commit))
     }
 
-    /// 每回合只解释一次原event；marked的所有状态在同步回调内由原Input发布。
+    /// Interpret one original event per turn; original Input publishes all marked state within synchronous callbacks.
     pub(in crate::native_surface::paged_body) fn advance_native_input(
         &self,
         pending: &Rc<PendingWordDelete>,
@@ -436,7 +442,7 @@ impl NativeMarkdownPagedBody {
                 producer.cancel_word_delete();
                 producer.cancel_word_group();
                 producer.cancel_visual();
-            } // 上一查询已经完成，Native回调不得继续领取其旧bound/Ready。
+            } // The preceding query finished; Native callbacks cannot reuse its old bound/Ready facts.
             pending.bound.borrow_mut().take();
             pending.ready.borrow_mut().take();
             pending.visual_seed.set(None);
@@ -445,6 +451,9 @@ impl NativeMarkdownPagedBody {
             let view = self.view()?;
             pending.interpreting_native.set(true);
             let result = match &input {
+                // Only the queue head enters these original View APIs. They retain
+                // production interpretation, command semantics, and synchronous
+                // Input publication instead of reconstructing events or IME state.
                 NativeInput::Key { event, .. } => view.interpret_queued_key(event),
                 NativeInput::Command(selector) => {
                     view.perform_queued_command(*selector).map(|()| true)
@@ -453,14 +462,14 @@ impl NativeMarkdownPagedBody {
                 NativeInput::Attachments { paths, drop } => {
                     match view.perform_queued_attachments(paths, *drop) {
                         Err(cause @ ViewError::AttachmentImport(_)) => {
-                            // 外部文件拒绝只结束此动作；原canonical和Body仍可编辑，后继已接纳输入照常接续。
+                            // External-file rejection ends this action only; canonical/Body remain editable and already-admitted successors continue normally.
                             let mut failure = pending.attachment_failure.borrow_mut();
                             if failure.is_none() {
                                 *failure = Some(cause);
-                            } // 原链只保一次业务首错，实际Source/资源错误仍沿Err归Body。
+                            } // Retain the chain's first business rejection only; actual Source/resource failures still propagate through Err to Body.
                             Ok(true)
                         }
-                        other => other.map(|()| true), // Core首错或已提交显示后果必须原样失败，不能伪装成普通导入拒绝。
+                        other => other.map(|()| true), // Core failure or committed display effects remain failures, never ordinary import rejection.
                     }
                 }
                 NativeInput::Format(action) => view.perform_queued_format(*action).map(|()| true),
@@ -472,7 +481,7 @@ impl NativeMarkdownPagedBody {
                             if failure.is_none() {
                                 *failure = Some(cause);
                             }
-                            Ok(true) // 普通业务拒绝只消费本菜单，后续已接纳文字仍沿同一链结算。
+                            Ok(true) // Ordinary business rejection consumes this menu only; later admitted text still settles through the same chain.
                         }
                         other => other.map(|()| true),
                     }
@@ -482,10 +491,10 @@ impl NativeMarkdownPagedBody {
         })();
         pending.interpreting_native.set(false);
         pending.native_insert_at.set(0);
-        drop(input); // 真实event/新增payload退出后才归还额度；取消的局部Rc不能拖住Native对象。
+        drop(input); // Return byte allowance after actual event/payload release; a cancelled local Rc must not retain Native objects.
         pending.queued_bytes.set(pending.queued_bytes.get() - bytes);
         if matches!(result, Ok(false)) {
-            self.cancel_original_word_delete(pending)?; // 焦点已实际移交，正文只归还旧事件，不假报已解释。
+            self.cancel_original_word_delete(pending)?; // Focus actually transferred; return the old event without claiming it was interpreted.
             self.schedule()?;
             return Ok(true);
         }
@@ -494,7 +503,7 @@ impl NativeMarkdownPagedBody {
         Ok(true)
     }
 
-    /// 未解释的原event等真实caret Scene；其自有viewport操作只交接这次API的真实geometry。
+    /// An uninterpreted event awaits actual caret Scene. Owned viewport operations transfer only this API call's actual geometry.
     pub(in crate::native_surface::paged_body) fn native_preparation_geometry<T>(
         &self,
         before: &NativeMarkdownPagedSceneRequest,
@@ -514,7 +523,7 @@ impl NativeMarkdownPagedBody {
                 && !pending.interpreting_native.get()
                 && pending.waiting_vertical.borrow().is_none()
         }) else {
-            return operation(); // 普通绘制与原垂直续体没有额外输入图或Native getter。
+            return operation(); // Ordinary paint and original vertical continuation require no additional input graph or Native getters.
         };
         let serial = self.serial.get();
         if !pending.current_native_at(self, serial) || !pending.request().same(before) {
@@ -534,7 +543,7 @@ impl NativeMarkdownPagedBody {
         if !pending.current_native_at(self, serial) {
             return Err(GeometryError::Revoked);
         }
-        let value = operation()?; // 原API已核实际目标Y、Native挂载、有限frame及同Input；失败不能补签。
+        let value = operation()?; // The original API checked actual target Y, Native mount, bounded frame, and same Input; failure cannot acquire renewed permission.
         let geometry = viewport.geometry()?;
         if !pending.current_at(self, serial) || !geometry.is_current() {
             return Err(GeometryError::Revoked);
@@ -549,7 +558,7 @@ impl NativeMarkdownPagedBody {
             || after_frame != frame
             || after_bounds != bounds
         {
-            return Err(GeometryError::Revoked); // 外层resize或移动不是这次自有内容高度/reveal的授权。
+            return Err(GeometryError::Revoked); // Outer resize/movement is outside this owned content-height/reveal operation's authority.
         }
         let actual = view.capture_scene_request()?;
         if !pending.current_at(self, serial)
@@ -565,11 +574,11 @@ impl NativeMarkdownPagedBody {
         {
             return Err(GeometryError::Revoked);
         }
-        *pending.request.borrow_mut() = actual; // 只有这个原API成功且原nonce仍当前，才交回同票剩余event。
+        *pending.request.borrow_mut() = actual; // Only this original API's success with current original identity may hand back remaining events under the same ticket.
         Ok(value)
     }
 
-    /// 当前原event产生的垂直命令接在它后面；其真实最终收据之前不能解释下一个key。
+    /// A vertical command from the original event follows that event; the next key waits for its actual final receipt.
     pub(in crate::native_surface::paged_body) fn attach_native_vertical(
         &self,
         vertical: &Rc<super::super::navigation::PendingVertical>,
@@ -585,7 +594,7 @@ impl NativeMarkdownPagedBody {
         Ok(())
     }
 
-    /// 原垂直续体的最终提交才释放事件屏障；同before/同pending不能由外部选择冒充。
+    /// Only the original vertical continuation's final result releases its event barrier; external selection cannot impersonate its before-state or pending identity.
     pub(in crate::native_surface::paged_body) fn bind_vertical_native_receipt(
         &self,
         vertical: &Rc<super::super::navigation::PendingVertical>,
@@ -628,7 +637,7 @@ impl NativeMarkdownPagedBody {
         Ok(true)
     }
 
-    /// 接到同一垂直收据的原键盘链继续认证下一permit；没有等待者不触碰普通垂直交互。
+    /// The keyboard chain receiving this same vertical receipt certifies its next permit; ordinary vertical interaction without a waiter stays unchanged.
     pub(in crate::native_surface::paged_body) fn finish_vertical_native_receipt(
         &self,
         commit: Option<&NativeMarkdownPagedInputCommit>,
@@ -641,7 +650,7 @@ impl NativeMarkdownPagedBody {
         self.arm_word_successor(&pending, commit)
     }
 
-    /// 仅判断是否存在输入屏障，不捕新Source或创建默认队列。
+    /// Inspect actual input-barrier presence only, without acquiring Source or creating a default queue.
     pub(in crate::native_surface::paged_body) fn native_input_pending(&self) -> bool {
         self.pending_word_delete.borrow().is_some() || self.pending_vertical.borrow().is_some()
     }
@@ -660,11 +669,11 @@ impl NativeMarkdownPagedBody {
 }
 
 impl PendingWordDelete {
-    /// 只核队首，不能让后面的event使当前未完成Word失去原Composer续体。
+    /// Inspect queue head only; later events cannot take original Composer continuation from unfinished Word work.
     pub(super) fn native_front(&self) -> bool {
         matches!(self.steps.borrow().front(), Some(WordInput::Native(_)))
     }
-    /// Core已提交但Native通知尚未发出，仅比较原before与同一个现存owner/epoch。
+    /// After Core commit but before Native notification, compare original before-state and the same existing owner/epoch only.
     fn current_at_before_commit(
         &self,
         owner: &NativeMarkdownPagedBody,

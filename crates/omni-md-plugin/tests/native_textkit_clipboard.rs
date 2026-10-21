@@ -1,4 +1,6 @@
-//! 显式复制的独立Native输出回归；只写自有命名板，不接触用户通用剪贴板或笔记。
+//! Verify explicit Native copy in an independent reader process. Only the
+//! regression's named board and synthetic files are owned here; General and
+//! the user's existing notes are outside this executable's authority.
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -9,12 +11,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mtm = objc2_foundation::MainThreadMarker::new().ok_or("剪贴板回归必须位于真实主线程")?;
     let mut arguments = std::env::args().skip(1);
     match arguments.next().as_deref() {
-        None => run_native_markdown_clipboard_control(mtm)?, // writer创建真实Doc并启动本二进制的reader。
+        // The writer uses actual documents and starts this same executable as
+        // the independent reader; it does not substitute a second publisher.
+        None => run_native_markdown_clipboard_control(mtm)?,
         Some("--reader") => {
             let name = arguments.next().ok_or("独立读取缺少私有剪贴板名称")?;
             let case = arguments.next().ok_or("独立读取缺少原场景身份")?;
             if arguments.next().is_some() {
-                return Err("独立读取不接受额外参数".into()); // 不把harness选项静默变成不同测试载荷。
+                return Err("独立读取不接受额外参数".into()); // Unknown harness arguments cannot silently select another payload.
             }
             read_native_markdown_clipboard_control(&name, &case, mtm)?;
         }

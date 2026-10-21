@@ -1,4 +1,5 @@
-//! 页眉只保存已有控件的弱身份；同步布局不拥有文档、计时器或后继窗口权限。
+//! Weak references to the existing header controls. Synchronous layout owns no
+//! document, timer, or authority over a successor window.
 
 use super::*;
 
@@ -6,12 +7,14 @@ mod geometry;
 pub(super) use geometry::editor_area_frames;
 use geometry::header_frames;
 
-/// 只弱观察既有两行页眉、临时反馈和三列footer；实际关闭仍由原构造账本和controller负责。
+/// Observe the two header rows, feedback, and three footer columns weakly.
+/// The original construction ledger and controller retain teardown responsibility.
 pub(super) struct NativeMarkdownHeaderControls {
     controls: [Weak<NSView>; 14],
 }
 
-/// 构造完成前尚无全局Active owner；运行期必须额外验证现有前台所有权。
+/// Construction precedes publication of Active. Runtime layout additionally
+/// requires the existing foreground owner; construction does not bypass close checks.
 #[derive(Clone, Copy)]
 pub(super) enum NativeMarkdownHeaderAuthority {
     Construction,
@@ -19,26 +22,30 @@ pub(super) enum NativeMarkdownHeaderAuthority {
 }
 
 impl NativeMarkdownHeaderControls {
-    /// 两个原按钮保持位置与动作；只写入原路由计算的历史可用性，不拥有历史或字段。
+    /// Apply the original route's undo/redo availability without owning history
+    /// or an input field, preserving both actions and their established positions.
     pub(super) fn set_history_available(&self, available: [bool; 2], current: &dyn Fn() -> bool) {
         for (control, available) in self.controls[4..6].iter().zip(available) {
             if !current() {
-                return; // 旧文稿或输入已撤权时，不升级仍存活的旧控件。
+                return; // Revoked document/input authority cannot upgrade an old live control.
             }
             let Some(control) = control
                 .load()
                 .and_then(|control| control.downcast::<NSControl>().ok())
             else {
-                return; // 实际按钮已经离开，不分配替身或重建工具栏。
+                return; // A departed button is never replaced or reconstructed by layout.
             };
             if !current() {
+                // Weak upgrade can enter Native. Revalidate before changing the
+                // retained control rather than granting authority from liveness alone.
                 return;
             }
             control.setEnabled(available);
         }
     }
 
-    /// 页眉只观察格式栏实际scroll根，内部各格式按钮由原controls和视图树持有。
+    /// Observe only the format strip's actual scroll root; its original controls
+    /// collection and view tree retain the individual buttons.
     pub(super) fn new(controls: [&NSView; 8], toolbar: [Weak<NSView>; 6]) -> Self {
         let [
             title,
@@ -71,7 +78,8 @@ impl NativeMarkdownHeaderControls {
         }
     }
 
-    /// 同一同步调用只发布同一内容尺寸；重入resize或关闭立即撤销余下setter权限。
+    /// Publish one content size per synchronous call. Reentrant resize or close
+    /// immediately revokes permission for every remaining setter.
     pub(super) fn layout(
         &self,
         controller: &NativeMarkdownController,
@@ -83,10 +91,12 @@ impl NativeMarkdownHeaderControls {
             || (matches!(authority, NativeMarkdownHeaderAuthority::Foreground)
                 && !native_markdown_controller_has_foreground_authority(controller))
         {
-            // 第一项Native getter之前就拒绝accepted/Closing；Construction仅免除尚未发布Active这一条件。
+            // Reject accepted/Closing ownership before the first Native getter.
+            // Construction skips only the not-yet-published Active requirement.
             return false;
         }
-        // 代次只保护当前栈内同步发布；耗尽则保持现状，不回绕成旧布局权限。
+        // This revision protects one stack-local publication. Exhaustion leaves
+        // the current layout intact instead of wrapping into an old authority.
         let Some(revision) = controller
             .ivars()
             .header_layout_revision
@@ -97,16 +107,18 @@ impl NativeMarkdownHeaderControls {
         };
         controller.ivars().header_layout_revision.set(revision);
         let Some(content) = window.contentView() else {
-            // 关闭后没有内容根，不恢复已拆卸控件。
+            // A closed window has no content root; do not remount detached controls.
             return false;
         };
         let size = content.frame().size;
         let Some(frames) = header_frames(size.width, size.height) else {
-            // 非法尺寸不产生部分几何；窗口最小尺寸仍由既有900x600合同限定。
+            // Invalid sizes publish no partial geometry. The existing window
+            // contract still owns the 900-by-600 minimum content size.
             return false;
         };
         let is_current = || {
-            // 先核对纯标量；任何重入后的旧栈都不能继续修改同一批控件。
+            // Check scalar authority first: an old reentrant stack cannot keep
+            // modifying the controls published by a later layout or close.
             if controller.ivars().close_finalizer_scheduled.get()
                 || VERIFYING_NATIVE_MARKDOWN_CLOSE.with(Cell::get).is_some()
                 || controller.ivars().header_layout_revision.get() != revision
@@ -116,12 +128,12 @@ impl NativeMarkdownHeaderControls {
                 return false;
             }
             let Some(panel) = controller.ivars().editing_window.load() else {
-                // weak窗口已结束，局部控件存活也不构成布局权限。
+                // Retained local controls cannot substitute for the departed weak window.
                 return false;
             };
             let owned_window: &objc2_app_kit::NSWindow = &panel;
             if !std::ptr::eq(owned_window, window) {
-                // 外来窗口通知不得修改本controller的页眉。
+                // A foreign window notification has no authority over this controller's header.
                 return false;
             }
             if matches!(authority, NativeMarkdownHeaderAuthority::Foreground)
@@ -129,18 +141,21 @@ impl NativeMarkdownHeaderControls {
                     controller, window,
                 )
             {
-                // 只有构造中的同步调用可尚未发布Active；实际resize必须属于现有owner。
+                // Only synchronous construction may precede Active publication;
+                // an actual resize must belong to the original editing-window owner.
                 return false;
             }
             let Some(current_content) = window.contentView() else {
-                // getter重入关闭后内容根消失，旧矩形不能重新挂回。
+                // Reentrant close may remove the content root; old frames cannot remount it.
                 return false;
             };
             if !std::ptr::eq(&*content, &*current_content) || current_content.frame().size != size {
-                // 真实内容根或尺寸变化使整组旧结果失效；由新的resize正常同步接管。
+                // A changed content identity or size invalidates the complete old
+                // result. The new resize owns its normal synchronous publication.
                 return false;
             }
-            // 上方getter也可能重入；最后再检查代次与关闭事实，不保留任何TLS借用。
+            // The getters above may also reenter. Recheck revision and close
+            // facts without retaining a TLS borrow across any Native operation.
             !controller.ivars().close_finalizer_scheduled.get()
                 && VERIFYING_NATIVE_MARKDOWN_CLOSE.with(Cell::get).is_none()
                 && controller.ivars().header_layout_revision.get() == revision
@@ -150,16 +165,19 @@ impl NativeMarkdownHeaderControls {
 
         for (control, frame) in self.controls.iter().zip(frames.0) {
             if !is_current() {
-                // accepted teardown里即使Weak尚活，也不先升级旧控件而干扰严格释放。
+                // Accepted teardown forbids upgrading even a still-live weak
+                // control, so this path cannot extend the old release barrier.
                 return false;
             }
-            // weak临时升级只覆盖一个setter；不让整组临时强引用跨关闭或布局回调保活。
+            // Retain at most the control needed for one setter, avoiding a whole
+            // toolbar of temporary strong references across layout/close callbacks.
             let Some(control) = control.load() else {
-                // 构造合同中缺少任一控件时停止，不能创建替身掩盖关闭状态。
+                // A missing constructed control stops publication; no substitute
+                // may hide the original owner's close or invalidated graph.
                 return false;
             };
             if !is_current() {
-                // 不排队重试；较新的resize或关闭已经取得唯一后续权限。
+                // Do not queue a retry: the newer resize or close owns the successor work.
                 return false;
             }
             control.setFrame(NSRect::new(
@@ -167,7 +185,8 @@ impl NativeMarkdownHeaderControls {
                 NSSize::new(frame.width, frame.height),
             ));
             if !is_current() {
-                // setter内重入后，剩余旧控件不得覆盖较新一次完整布局。
+                // Setter reentry revokes the remaining old batch before it can
+                // overwrite controls belonging to a newer complete layout.
                 return false;
             }
         }

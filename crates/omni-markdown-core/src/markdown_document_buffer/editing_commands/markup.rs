@@ -18,7 +18,8 @@ use source::{SourceCursor, SourceLine, SourceLines, range_is_whitespace};
 use transaction::{Payload, Plan};
 
 #[cfg(test)]
-// 既有语法golden继续走原签名；内部仍经同一个记录真实变化的Noop观察事务。
+// Existing grammar goldens retain their finite result signature while using the
+// same actual change journal and observed transaction with NoopObserver.
 fn apply_markup_command(
     document: &mut MarkdownDocumentBuffer,
     command: MarkdownEditingCommand,
@@ -122,7 +123,7 @@ pub(super) fn apply_markup_command_observed<O: MarkdownTextChangeObserver>(
     while let Some(lines) = source_lines.as_mut() {
         let Some(source) = lines.next(document)? else {
             break;
-        }; // 真EOF才结束未来项扫描，lease错误直接撤销命令。
+        }; // Only actual EOF ends future-item scanning; a lease failure rejects the command.
         // Forward context scanning stores no suffix text or item list; it updates only current ancestors.
         scanner.consume(document, source)?;
         for context in &mut contexts {
@@ -375,7 +376,7 @@ fn newline_separator(
         // Byte membership can skip LF-only giant bodies without scalar decoding or retained text.
         if source::scan_piece(document, &piece, |bytes| {
             if previous_cr && bytes.first() == Some(&b'\n') {
-                return Ok(true); // CRLF可跨原piece或4KiB scratch边界，仍须真实回收后才返回。
+                return Ok(true); // CRLF may cross a piece/scratch boundary; the actual lease must finish before this fact escapes.
             }
             if bytes.contains(&b'\r') {
                 carriage = true;

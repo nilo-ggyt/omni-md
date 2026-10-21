@@ -158,7 +158,7 @@ pub(super) fn marker_at(
             column + 1,
             literal_padding,
             following_padding,
-        )?; // 缩进窗口的真实读取/回收失败必须中止原命令，不能发布未认证的标记边界。
+        )?; // Actual indentation read/reclaim failure rejects the command instead of publishing an unverified marker boundary.
         return Ok(Some(Marker {
             context,
             punctuation,
@@ -220,7 +220,7 @@ pub(super) fn marker_at(
             column + digits + 1,
             literal_padding,
             following_padding,
-        )?; // 有序列表同样透传原源错误，不把失败误认为可用的空白宽度。
+        )?; // Ordered lists also preserve Source failure instead of treating it as usable padding width.
         return Ok(Some(Marker {
             context,
             punctuation,
@@ -234,7 +234,8 @@ pub(super) fn marker_at(
     Ok(None)
 }
 
-/// 独立解析实际内容缩进；所有窗口读取与回收失败均透传，不能使用部分边界提交命令。
+/// Resolve actual content indentation independently. Propagate every window read
+/// and reclaim failure; partial boundaries cannot authorize command publication.
 fn list_boundary(
     document: &MarkdownDocumentBuffer,
     line: SourceLine,

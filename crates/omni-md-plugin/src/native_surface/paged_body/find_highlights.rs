@@ -1,4 +1,5 @@
-//! 实时查询只借原栏和当前已排窗口；匹配坐标随 Scene 交付，不保查询文字或第二份正文。
+//! Live queries borrow the original bar and currently laid-out windows. Match coordinates
+//! travel with the Scene, without retaining query text or another document copy.
 
 use super::*;
 use crate::native_surface::{
@@ -17,8 +18,9 @@ pub(super) struct Binding {
     controller: Rc<NativeWeak<NativeMarkdownController>>,
 }
 
-/// 匹配交付与原栏的临时claim共同活到Scene安装；归还Native claim若重入，
-/// 此时原输入回调已能撤销新Scene，不会在撤图之后再安装一幅旧查询的画面。
+/// Match output and temporary claims on the original bar survive through Scene installation.
+/// If releasing a Native claim reenters input, that input can already revoke the installed
+/// Scene rather than having an old query's frame installed after its revocation.
 pub(super) struct Prepared {
     pub ranges: Box<[Range<usize>]>,
     _binding: Option<(
@@ -28,7 +30,8 @@ pub(super) struct Prepared {
 }
 
 impl NativeMarkdownPagedBody {
-    /// composition root 绑定同一笔记的实际栏；两边均不新增 Doc、Source 或 Native 强边。
+    /// The composition root binds this note's actual bar using weak references,
+    /// without adding document, Source, or Native strong ownership.
     pub(in crate::native_surface) fn bind_find_highlights(
         &self,
         bar: Weak<NativeMarkdownFindBar>,
@@ -42,7 +45,8 @@ impl NativeMarkdownPagedBody {
         self.refresh_bound_find_highlights();
     }
 
-    /// 原栏移交模式时只能解绑它自己；迟到的旧栏不得撤销后来绑定的新栏。
+    /// During mode handoff a bar may unbind only itself. A late old bar cannot
+    /// remove the successor bar's binding.
     pub(in crate::native_surface) fn unbind_find_highlights(
         &self,
         bar: &Weak<NativeMarkdownFindBar>,
@@ -57,16 +61,18 @@ impl NativeMarkdownPagedBody {
         }
     }
 
-    /// accepted close 不保弱控制块或旧匹配；若正文仍在运行，原队列负责擦掉其旧高亮画面。
+    /// Accepted close retains neither weak control blocks nor old matches. While
+    /// Body remains active, its original queue replaces the old highlight image.
     pub(in crate::native_surface) fn clear_find_highlights_binding(&self) {
         let binding = self.find_highlights.borrow_mut().take();
-        drop(binding); // NativeWeak的最后控制块可进入平台；此处已经没有Body RefMut。
+        drop(binding); // The final NativeWeak control block may enter the platform; no Body RefMut survives here.
         self.refresh_bound_find_highlights();
     }
 
     fn refresh_bound_find_highlights(&self) {
         if self.current_body() {
-            // 立即撤CPU候选；标题查询的显式取消关闭失败也由同一Body首错边界处理。
+            // Revoke the CPU candidate immediately. Explicit heading-query close
+            // failure also reaches the same Body first-failure boundary.
             if let Err(cause) = self
                 .clear_scene()
                 .map_err(Into::into)
@@ -77,7 +83,8 @@ impl NativeMarkdownPagedBody {
         }
     }
 
-    /// 输入回调持原 Feedback；这里只撤图并合并原队列，不读查询、不改选择、不申请新 Source。
+    /// Input owns the original Feedback. Revoke the frame and coalesce the same
+    /// queue without reading the query, changing selection, or acquiring a Source.
     pub(in crate::native_surface) fn refresh_find_highlights(
         &self,
         bar: &Rc<NativeMarkdownFindBar>,
@@ -95,8 +102,9 @@ impl NativeMarkdownPagedBody {
         }
     }
 
-    /// 发布真实窗口时才读取同一栏的已确认查询。visitor 的取消门只读 Rust 标量，
-    /// 不在每个字符上调用 Scene.current、viewport.geometry 或任何 Native getter。
+    /// Read this bar's committed query only when publishing actual windows. The
+    /// visitor's cancellation check uses Rust facts and the already-held controller,
+    /// without per-character Scene.current, viewport.geometry, or Native getters.
     pub(super) fn prepare_find_highlights(
         &self,
         key: &NativeMarkdownPagedSceneKey,
@@ -126,7 +134,8 @@ impl NativeMarkdownPagedBody {
             before_publish()?;
             return Ok(bound().then(empty));
         };
-        // Weak.load 及其临时 Native claim 不跨 Body 的 RefCell；热循环只借本栈实际controller。
+        // Load the Native weak reference outside Body RefCell borrows. The hot
+        // loop borrows this stack's actual controller rather than repeatedly loading it.
         let Some(controller) = binding.controller.load() else {
             before_publish()?;
             return Ok(bound().then(empty));
@@ -141,7 +150,7 @@ impl NativeMarkdownPagedBody {
             return Ok(bound().then(|| Prepared {
                 ranges: Box::new([]),
                 _binding: Some((bar, controller)),
-            })); // 原窗口已失前台资格，没有其他controller可替代它。
+            })); // The original window lost foreground authority; another controller cannot substitute for it.
         };
         let serial = self.serial.get();
         let layout_epoch = self.layout_epoch.get();
@@ -163,7 +172,8 @@ impl NativeMarkdownPagedBody {
             || self.input.is_cell()
             || self.active_cell_body().is_some()
         {
-            // 未确认正文或局部草稿不借canonical显示旧匹配；最终Native权限检查也可能换查询。
+            // Uncommitted composition or a local draft cannot display stale canonical
+            // matches. The final Native authority check may also change the query.
             before_publish()?;
             return Ok(current().then(|| Prepared {
                 ranges: Box::new([]),
@@ -193,7 +203,8 @@ impl NativeMarkdownPagedBody {
                 }
             }
         }
-        // 同一物理行可被正文/格边缘重复覆盖；排序后原地合并，既不重复读源也不重复加深半透明像素。
+        // Body/cell edges can overlap the same physical range. Sort and merge the
+        // bounded ranges so neither Source reads nor translucent highlight coverage repeat.
         visible.sort_unstable_by_key(|range| range.start);
         let mut merged: Vec<Range<usize>> = Vec::with_capacity(visible.len());
         for range in visible {
@@ -213,7 +224,7 @@ impl NativeMarkdownPagedBody {
         sources.sort_unstable_by_key(|source| match source {
             NativeMarkdownFindVisibleSource::Body(range) => range.start,
             NativeMarkdownFindVisibleSource::Cell { canonical, .. } => canonical.start,
-        }); // 只排序有限已排窗口域；Grid的真正raw片段在匹配时才沿原目录惰性推进。
+        }); // Sort only laid-out windows; matching lazily advances each Grid cell's actual raw fragments through its original directory.
         let document = self
             .document
             .borrow()
@@ -237,8 +248,9 @@ impl NativeMarkdownPagedBody {
                 )));
             }
         };
-        // 原ticket的最后Source/Native几何核验在此发生；其getter若重入新查询，
-        // 下面只读Rust票便拒绝旧匹配，Producer安装Scene前不再经过另一个Native检查。
+        // Perform the original ticket's final Source/Native geometry check here.
+        // If its getter admits a new query, the Rust checks below reject old matches;
+        // no additional Native check separates this output from Producer Scene installation.
         before_publish()?;
         if current() {
             Ok(Some(Prepared {

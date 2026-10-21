@@ -1,9 +1,9 @@
-//! 原词组动作遇 opaque fold 时先结束读取、展开同一锚点，再保留队首次数重算真实原字素。
+//! When word input encounters an opaque fold, retire reads, expand that same anchor, and recompute actual graphemes without consuming the queued action.
 
 use super::*;
 
 impl NativeMarkdownPagedBody {
-    /// 文字事务和折叠重试共用真实读图退休边界；失败先归还所有 owner，再保留源与清理首因。
+    /// Text transactions and fold continuation share actual read-graph retirement; return all owners on failure while retaining Source and cleanup causes.
     pub(super) fn retire_word_reading(
         &self,
         pending: &Rc<PendingWordDelete>,
@@ -31,14 +31,14 @@ impl NativeMarkdownPagedBody {
             .transpose()?;
         if requires_query && resources.is_none() {
             return Err(ViewError::Revoked.into());
-        } // 真实范围查询必须来自原 Producer；普通已接纳新增文本可以尚未建立读图。
+        } // Actual range queries require the original Producer; ordinary admitted insertion may not have created a read graph yet.
         self.serial.set(released_serial);
         pending.retired_serial.set(Some(released_serial));
         self.scheduled.set(None);
         self.deferred.set(false);
         let scene = self.scene.borrow_mut().take();
         let producer = self.producer.borrow_mut().take();
-        drop(scene); // 所有槽借用先结束，再归还原 Reader/像素；释放同步回调不能重入一个借用中的槽。
+        drop(scene); // End slot borrows before returning original Reader/pixel claims, allowing synchronous release callbacks without a borrowed slot.
         let producer_result = producer.map_or(Ok(()), Producer::retire);
         let worker = self.worker.borrow_mut().take();
         let worker_result = worker.map_or(Ok(()), FontWorker::close);
@@ -56,7 +56,7 @@ impl NativeMarkdownPagedBody {
                 Err(source.into()),
                 retirement,
             );
-        } // 原 backing 在最后 Drop 才暴露的失败仍先于普通取消，另一真实清理失败同时保留。
+        } // Backing failure discovered at final Drop still precedes ordinary cancellation, while a second actual cleanup failure is retained.
         retirement?;
         if resources.is_some() && released.is_none_or(|state| !state.is_released()) {
             return Err(NativeMarkdownPagedBodyError::ResourceReleaseFailed);
@@ -69,7 +69,7 @@ impl NativeMarkdownPagedBody {
         Ok(())
     }
 
-    /// 只消费 fold 的显示收据；原 Delete/Move/Select 队首仍在，下一原量子重新取得完整 GCB。
+    /// Consume the fold presentation receipt only. Original Delete/Move/Select remains queued, and the next quantum resolves the complete GCB again.
     pub(super) fn commit_fold_expansion(
         &self,
         pending: &Rc<PendingWordDelete>,
@@ -93,7 +93,7 @@ impl NativeMarkdownPagedBody {
             outcome
         else {
             return Err(ViewError::Revoked.into());
-        }; // 原同票 opaque proof 必须对应仍存在的 fold；没有实际展开不能声称动作已经重试。
+        }; // The original opaque proof must match a still-existing fold; without actual expansion the action has not resumed successfully.
         let commit = Rc::new(commit);
         *pending.receipt.borrow_mut() = Some(Rc::clone(&commit));
         let synchronized = self

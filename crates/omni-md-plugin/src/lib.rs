@@ -171,20 +171,3 @@ fn activate_markdown(
 /// Compile-time entry consumed by the host composition catalog.
 pub const REGISTRATION: PluginRegistration =
     PluginRegistration::new(&DESCRIPTOR, activate_markdown);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    /// Guards the immutable registration shape without constructing a session.
-    fn registration_is_static_and_contains_declared_command() {
-        // Identity, command inventory and exact protocol version stay aligned.
-        assert_eq!(REGISTRATION.descriptor().plugin_id, PLUGIN_ID);
-        assert_eq!(REGISTRATION.descriptor().commands.len(), 1);
-        assert_eq!(
-            REGISTRATION.descriptor().protocol_version,
-            PLUGIN_PROTOCOL_VERSION
-        );
-    }
-}

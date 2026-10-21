@@ -1,4 +1,5 @@
-//! 原正文顶部的冲突处理条；只拥有固定控件和已显示笔记的弱票，保存规则仍归原Core。
+//! The existing conflict strip owns fixed controls and a weak intent for the
+//! displayed note. Core retains all save and disk-conflict rules.
 
 use super::*;
 use objc2_app_kit::NSAttributedStringNSStringDrawing;
@@ -8,7 +9,8 @@ const PADDING: f64 = 12.0;
 const GAP: f64 = 8.0;
 const BUTTON_HEIGHT: f64 = 28.0;
 
-/// controller是唯一强owner；原票只含Doc Weak、路径与窗口身份，发布代次只撤销旧显示动作。
+/// The controller is the sole strong owner. The original intent contains a weak
+/// document, path, and window identity; publication revokes stale display actions.
 pub(super) struct NativeMarkdownConflictBar {
     root: Retained<NSBox>,
     message: Retained<NSTextField>,
@@ -23,16 +25,20 @@ impl NativeMarkdownConflictBar {
         feature = "native-markdown-runtime-probe",
         feature = "native-table-row-append"
     ))]
-    /// 原生验收只借已装配控件；不建立另一份条、保存状态或点击入口。
+    /// Native acceptance borrows the actual assembled controls without a second
+    /// strip, save state, or substitute action entry point.
     pub(super) fn probe_controls(&self) -> (&NSBox, &NSTextField, &[Retained<NSButton>; 2]) {
         (&self.root, &self.message, &self.buttons)
     }
 
-    /// composition root一次装配真实控件；构造失败不发布部分条，也不建立替代初始化图。
+    /// Assemble actual controls once at the existing composition root. Failure
+    /// leaves no published partial strip or alternative initialization graph.
     pub(super) fn new(controller: &NativeMarkdownController) -> Result<Self, String> {
         let mtm = controller.mtm();
         let ledger = &controller.ivars().owned;
         let root = NSBox::initWithFrame(NSBox::alloc(mtm), NSRect::ZERO);
+        // Construct hidden until an actual save conflict supplies a message.
+        // The original owned ledger observes every control's Native release.
         root.setBoxType(NSBoxType::Custom);
         root.setTitlePosition(NSTitlePosition::NoTitle);
         root.setBorderWidth(1.0);
@@ -60,7 +66,8 @@ impl NativeMarkdownConflictBar {
         let mut buttons = Vec::with_capacity(2);
         for (title, tag) in [("重新加载磁盘版本", 4), ("将本地草稿另存为新笔记", 5)]
         {
-            // SAFETY: 原主线程controller实现固定action；会话结束先清target/action再归还owner。
+            // SAFETY: The original main-thread controller implements this action.
+            // Session teardown disconnects target/action before returning the owner.
             let button = unsafe {
                 NSButton::buttonWithTitle_target_action(
                     &NSString::from_str(title),
@@ -89,12 +96,14 @@ impl NativeMarkdownConflictBar {
         })
     }
 
-    /// 只在实际安装/清理笔记时换弱票；同名A→B→A也因新Doc弱身份和发布代次失效。
+    /// Change the weak intent only on actual note installation/cleanup. Returning
+    /// to the same filename cannot revive a different document's old action.
     fn bind(&self, original: Option<NativeMarkdownCurrentNoteIntent>) {
         self.advance_publication();
         *self.original.borrow_mut() = original;
     }
-    /// 单一显示代次不回绕；重复相同保存失败不构成新的显示决定，也不会阻断原确认框。
+    /// Never wrap publication authority. Repeated identical save failures do not
+    /// create another display decision or invalidate the original confirmation.
     fn advance_publication(&self) {
         self.publication.set(
             self.publication
@@ -104,12 +113,15 @@ impl NativeMarkdownConflictBar {
         );
     }
 
-    /// 消息来源仅为原footer结果；这里不猜测磁盘版本，也不添加一份保存状态机。
+    /// Project the original footer result without guessing disk versions or
+    /// introducing another save state machine.
     pub(super) fn publish(&self, message: Option<&'static str>, current: &impl Fn() -> bool) {
         if self.published_message.replace(message) != message {
             self.advance_publication();
         }
         let revision = self.publication.get();
+        // Every Native setter may reenter. Continue only for this exact message
+        // publication and the caller's original document authority.
         let current = || current() && self.publication.get() == revision;
         if !current() {
             return;
@@ -133,7 +145,8 @@ impl NativeMarkdownConflictBar {
         }
     }
 
-    /// 真实按钮字体测宽后给原弹性文本留剩余宽；长提示提高行高，不能挤掉原两个全称。
+    /// Measure actual button titles first, then give the message the remaining
+    /// width. A long message grows vertically without hiding either full action name.
     fn dimensions(
         &self,
         width: f64,
@@ -149,12 +162,13 @@ impl NativeMarkdownConflictBar {
                 return Err("冲突处理显示已经变化".into());
             }
             widths[index] = (title.size().width + 16.0).ceil();
-            drop(title); // 固定标题的临时Native claim不跨后续控件布局或状态借用。
+            drop(title); // The finite Native title claim does not cross later layout or state borrows.
         }
         if !current() {
             return Err("冲突处理显示已经变化".into());
         }
         let text_width = (width - 2.0 * PADDING - 2.0 * GAP - widths.iter().sum::<f64>()).max(1.0);
+        // AppKit measures wrapping for this fixed message, never for document text.
         let text_height = self
             .message
             .sizeThatFits(NSSize::new(text_width, f64::MAX))
@@ -166,9 +180,11 @@ impl NativeMarkdownConflictBar {
         Ok(((text_height + 12.0).max(MIN_HEIGHT), widths, text_width))
     }
 
-    /// 所有Find显隐与普通resize都从这一真实高度扣正文，不在旧frame上相对叠减。
+    /// Find visibility and resize reserve the same measured height, without
+    /// subtracting repeatedly from a previously modified body frame.
     pub(super) fn reserve_area(&self, mut base: NSRect) -> Result<NSRect, String> {
         if self.published_message.get().is_none() {
+            // An absent conflict consumes no space and performs no Native measurement.
             return Ok(base);
         }
         let revision = self.publication.get();
@@ -182,7 +198,7 @@ impl NativeMarkdownConflictBar {
         Ok(base)
     }
 
-    /// 原错误行在最上方；冲突条随后、Find与正文再后，保持原页面垂直顺序。
+    /// Preserve feedback, conflict strip, Find, and body order on the original page.
     pub(super) fn position(
         &self,
         parent: &NSView,
@@ -203,7 +219,8 @@ impl NativeMarkdownConflictBar {
         if !current() {
             return;
         }
-        // content_top直接来自同一editor_area_frames的Find或正文顶部；不复制错误行高度常量。
+        // The shared editor_area_frames result supplies this exact Find/body top;
+        // no duplicated feedback height can shift the strip into another region.
         self.root.setFrame(NSRect::new(
             NSPoint::new(full.origin.x, content_top),
             NSSize::new(full.size.width, height),
@@ -217,6 +234,8 @@ impl NativeMarkdownConflictBar {
         ));
         let mut x = PADDING + text_width + GAP;
         for (button, width) in self.buttons.iter().zip(widths) {
+            // Publish only the original batch. A setter reentering into a new note
+            // must stop the remaining old controls before they can overwrite it.
             if !current() {
                 return;
             }
@@ -229,15 +248,19 @@ impl NativeMarkdownConflictBar {
         if !current() {
             return;
         }
-        // SAFETY: 只在原主线程核本控件父关系；不递归探查系统视图树或延长另一owner。
+        // SAFETY: Query only this control's parent on the original main thread,
+        // without recursively inspecting system views or retaining another owner.
         if unsafe { self.root.superview() }.is_none() && current() {
             parent.addSubview(&self.root);
         }
     }
 
-    /// 清理不依赖原票current，必须撤掉旧显示数据；会话结束另外对称断开两个target。
+    /// Clear stale display data even after its original intent expires. Session
+    /// teardown separately disconnects both targets before releasing controls.
     pub(super) fn clear(&self) {
         self.bind(None);
+        // Revoke authority before Native cleanup. A newer reentrant publication
+        // stops the remaining old setters without restoring the retired intent.
         self.published_message.set(None);
         let revision = self.publication.get();
         self.root.setHidden(true);
@@ -258,7 +281,8 @@ impl NativeMarkdownConflictBar {
     }
 }
 
-/// 首个sender getter之前固定当前显示的原票；隐藏条或后继笔记不能借旧按钮领取新权限。
+/// Fix the displayed note's original intent before the first sender getter.
+/// Hidden strips and successor notes cannot acquire authority from an old button.
 pub(super) fn enqueue_action(controller: &NativeMarkdownController, sender: &AnyObject) {
     let bar = controller
         .ivars()
@@ -281,6 +305,8 @@ pub(super) fn enqueue_action(controller: &NativeMarkdownController, sender: &Any
         .iter()
         .position(|owned| std::ptr::eq(&**owned, button))
     else {
+        // Matching an action tag alone is insufficient: only these actual two
+        // assembled buttons may resolve this strip's original note.
         return;
     };
     let tag = button.tag();
@@ -292,21 +318,25 @@ pub(super) fn enqueue_action(controller: &NativeMarkdownController, sender: &Any
         return;
     }
     let original = MainThreadBound::new(original, controller.mtm());
+    // Queue only the original weak intent. The actual modal/save flow revalidates
+    // it again before a disk side effect or accepted editor replacement.
     controller.enqueue_owned(move || {
         let mtm = MainThreadMarker::new().expect("冲突处理沿原主队列执行");
         if let Err(error) = original.get(mtm).perform_resolution(tag, revision) {
             if original.get(mtm).current() {
                 present_native_markdown_error(&error);
             } else {
-                // 外部副作用的原错误仍返回到此，但旧A的提示不能覆盖后来B的状态或另开窗口。
-                eprintln!("原笔记的冲突处理未完成，所属窗口或文稿已经变化");
+                // Preserve the failure at its final boundary without displaying
+                // the retired note's feedback over a successor or opening a window.
+                eprintln!("markdown_conflict operation=resolve outcome=failed reason=original_owner_changed");
             }
         }
     });
 }
 
 impl NativeMarkdownController {
-    /// 实际Window装配一次固定条并纳入原资源账本；后续只更换弱票和显示文字。
+    /// Install one actual strip into the original window ledger; later updates
+    /// replace only its weak intent and projected text.
     pub(super) fn install_conflict_bar(&self) -> Result<(), String> {
         let bar = NativeMarkdownConflictBar::new(self)?;
         assert!(
@@ -315,7 +345,8 @@ impl NativeMarkdownController {
         );
         Ok(())
     }
-    /// 原文稿安装点绑定显示身份，不从较晚的Active或侧栏路径补领权限。
+    /// Bind display identity at actual note installation, without recapturing a
+    /// later Active document or sidebar path as the original authority.
     pub(super) fn bind_conflict_note(&self, original: NativeMarkdownCurrentNoteIntent) {
         self.ivars()
             .conflict_bar
@@ -323,7 +354,8 @@ impl NativeMarkdownController {
             .expect("原窗口已装配冲突条")
             .bind(Some(original));
     }
-    /// 菜单与原两个按钮共享同一个实际显示代次，不新增另一套文件动作初始化图。
+    /// The menu and both existing buttons share the same actual display revision
+    /// and original file-action construction path.
     pub(super) fn conflict_publication(&self) -> u64 {
         self.ivars()
             .conflict_bar
@@ -332,18 +364,21 @@ impl NativeMarkdownController {
             .publication
             .get()
     }
-    /// 构造失败没有发布控件时只清原状态；正常拆图须真实清空本条并撤弱票。
+    /// Clear actual text and weak intents on teardown. A failed construction
+    /// with no installed strip cannot allocate a substitute during cleanup.
     pub(super) fn clear_conflict_bar(&self) {
         if let Some(bar) = self.ivars().conflict_bar.get() {
             bar.clear();
         }
     }
-    /// 会话结束清借用target/action，不添加关闭功能或替代原返回生命周期。
+    /// Return borrowed targets/actions at session end through the existing
+    /// return lifecycle, without adding another close interaction.
     pub(super) fn detach_conflict_bar(&self) {
         if let Some(bar) = self.ivars().conflict_bar.get() {
             bar.clear();
             for button in &bar.buttons {
-                // SAFETY: 原主线程controller仍活，归还控件owner前先解除标准action借用。
+                // SAFETY: The original main-thread controller is alive while
+                // detaching standard actions before returning the control owners.
                 unsafe {
                     button.setTarget(None);
                     button.setAction(None);

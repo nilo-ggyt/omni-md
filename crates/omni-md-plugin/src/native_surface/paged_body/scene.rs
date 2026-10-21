@@ -1,4 +1,4 @@
-//! 原已封存窗口的输入和绘图消费；任何方法都不创建新 Source 或推进排版。
+//! Consumes input geometry and paint from sealed original windows; no method acquires another Source or advances layout.
 
 use std::{
     cell::{OnceCell, RefCell},
@@ -63,20 +63,20 @@ pub(in crate::native_surface) struct Scene {
     colors: NativeMarkdownPagedBodyColors,
     head_affinity: Option<Affinity>,
     first_ordinal: usize,
-    /// 仅保存发布时同一输入票的有限范围；高亮不能用主范围冒充全部选中。
+    /// Bounded ranges from the publication's same Input ticket; the primary range cannot stand in for every selection.
     selections: Box<[Range<usize>]>,
-    /// 当前查询在真实可见源域中的有限匹配；不保栏、查询或Native强引用。
+    /// Bounded current-query matches in actual visible Source domains, without bar, query, or Native strong ownership.
     find_highlights: Box<[Range<usize>]>,
-    /// 仅原Source单有向选择的canonical逻辑行；UBA段和soft line均不授予此范围。
+    /// Canonical logical line for the original Source single directed selection; neither UBA runs nor soft lines authorize it.
     active_line: Option<Range<usize>>,
-    /// Source同次发布的有限行号；真实软行几何与canonical逻辑行只在Producer相交一次。
+    /// Bounded line numbers from the same Source publication; Producer alone intersects actual soft-line geometry with canonical logical lines.
     gutter: Option<Box<[GutterRow]>>,
-    // Scene 发布不创建 Native 资源；首个实际绘图入口捕获一次命名空间，随本 Scene 释放。
-    // None 是该次真实创建失败，不能改成 DeviceRGB 默认空间继续画出另一种颜色。
+    // Scene publication creates no Native resource. The first paint captures one named color space, owned until this Scene drops.
+    // None records actual creation failure; substituting DeviceRGB would silently paint another color.
     paint_space: OnceCell<Option<CFRetained<CGColorSpace>>>,
 }
 
-/// 一次准备结束的有限字段集合；构造范围仅限 Body，外界不能凭范围制造 Ready。
+/// Bounded facts from one completed preparation. Only Body constructs this; bare ranges cannot manufacture Ready.
 pub(super) struct Publication {
     pub key: NativeMarkdownPagedSceneKey,
     pub nonce: NativeMarkdownPagedSceneNonce,
@@ -101,8 +101,11 @@ pub(super) struct Publication {
 }
 
 impl Scene {
-    #[cfg(feature = "native-markdown-runtime-probe")]
-    /// 原帧的弱身份仍有效才交付有限几何；短 oracle 不取得这个 Scene 的长期强引用。
+    #[cfg(all(
+        feature = "native-paged-body-probe",
+        feature = "native-markdown-runtime-probe"
+    ))]
+    /// Expose bounded geometry only under the original frame's live weak identity; the short oracle gains no lasting Scene ownership.
     pub(super) fn probe_line_geometry(
         &self,
     ) -> Result<Vec<crate::native_surface::preview_paragraph::PreviewLineObservation>> {
@@ -164,11 +167,11 @@ impl Scene {
         }
     }
 
-    /// Source 与 Ready 核验包住实际色空间捕获；创建失败沿绘图错误返回，不能冒充几何失败。
+    /// Validate Source/Ready around actual color-space capture; creation failure remains a paint failure rather than a geometry error.
     fn prepare_paint_space(&self, current: &dyn Fn() -> bool) -> Result<()> {
         self.validate_ready(current)?;
         let space = self.paint_space.get_or_init(|| {
-            // SAFETY: 公开 sRGB 名称静态有效；同一个 Scene 不为每次颜色或 glyph 重新分配对象。
+            // SAFETY: The public sRGB name is statically valid; this Scene reuses one space rather than allocating for each color or glyph.
             CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))
         });
         self.validate_ready(current)?;
@@ -180,7 +183,7 @@ impl Scene {
         Ok(())
     }
 
-    /// 调色板声明的是源 sRGB 分量，须显式设置输入空间；位图的目标空间不能替代此事实。
+    /// Palette values are source sRGB components, requiring an explicit input space independently of the bitmap destination space.
     fn color(&self, context: &CGContext, color: [f64; 4]) {
         let space = self
             .paint_space
@@ -188,11 +191,11 @@ impl Scene {
             .and_then(Option::as_deref)
             .expect("Scene 实际绘图先取得命名 sRGB 空间");
         CGContext::set_fill_color_space(Some(context), Some(space));
-        // SAFETY: 命名 sRGB 有三个颜色分量，本同步栈的数组另含一个 alpha，恰好满足公开 API。
+        // SAFETY: Named sRGB has three color components; this synchronous stack array adds one alpha as required by the public API.
         unsafe { CGContext::set_fill_color(Some(context), color.as_ptr()) };
     }
 
-    /// 边线使用同一份源色空间；不调用会把输入重新切回 DeviceRGB 的 convenience setter。
+    /// Borders use the same source color space, avoiding convenience setters that switch input back to DeviceRGB.
     fn stroke_color(&self, context: &CGContext, color: [f64; 4]) {
         let space = self
             .paint_space
@@ -200,11 +203,11 @@ impl Scene {
             .and_then(Option::as_deref)
             .expect("Scene 实际绘图先取得命名 sRGB 空间");
         CGContext::set_stroke_color_space(Some(context), Some(space));
-        // SAFETY: 当前 stroke 空间同为三分量 sRGB，四个栈分量完整有效到原调用返回。
+        // SAFETY: The stroke space is three-component sRGB; all four stack components remain valid until this call returns.
         unsafe { CGContext::set_stroke_color(Some(context), color.as_ptr()) };
     }
 
-    /// 模式捕获只检查已封存窗口中的有限候选，离屏caret不能替代真实可见字形。
+    /// Mode capture examines bounded sealed-window candidates only; an offscreen caret cannot substitute for a visible glyph.
     pub(super) fn mode_source_candidates(&self) -> impl Iterator<Item = Result<usize>> + '_ {
         let head = self.key.request.input.primary_range.location;
         let visible = self.window.as_ref().is_some_and(|window| {
@@ -234,13 +237,13 @@ impl Scene {
             )
     }
 
-    /// 行号借用原Scene的全部Source/输入/字体/几何权限，不创建新的Ready或读取正文。
+    /// Gutter rows borrow this Scene's complete Source/Input/font/geometry authority, without new Ready state or text reads.
     pub(in crate::native_surface) fn gutter_rows(&self) -> Result<&[GutterRow]> {
         self.require()?;
         self.gutter.as_deref().ok_or(Error::Revoked)
     }
 
-    /// 捕获原caret的真实行/目标列；坐标只从当前有限窗口的实际Native字体度量转换。
+    /// Capture the actual caret line and target column using Native font geometry from this bounded window alone.
     pub(super) fn vertical_seed(
         &self,
         head: usize,
@@ -282,7 +285,7 @@ impl Scene {
             })
         } else {
             None
-        }; // Page仍沿原行为使用当前列；不把它变为连续Up/Down目标。
+        }; // Page retains its existing current-column behavior instead of establishing a continuous Up/Down goal.
         self.require()?;
         Ok(super::navigation::VerticalSeed {
             ordinal: caret.line_ordinal,
@@ -297,7 +300,7 @@ impl Scene {
         })
     }
 
-    /// 只命中Producer已度量并真正滚入当前窗口的那一行；越窗不夹到边缘行。
+    /// Hit only the Producer-measured line actually scrolled into this window; never clamp a missing target to a window edge.
     pub(super) fn vertical_line_target(
         &self,
         ordinal: usize,
@@ -356,7 +359,7 @@ impl Scene {
             head_affinity: Some(affinity),
             vertical_goal: goal,
             bidi_side: None,
-        }) // 混合Shift从同一原票的working anchor接续，不暗取尚未提交的canonical初始anchor。
+        }) // Mixed Shift motions continue the same ticket's working anchor, not the uncommitted initial canonical anchor.
     }
 
     fn current(&self) -> bool {
@@ -367,7 +370,7 @@ impl Scene {
                 .is_some_and(|owner| owner.scene_current(&self.key))
     }
 
-    /// Scene只借原Input唯一选择槽；同key/serial和原scope前后都必须仍有效。
+    /// Borrow the original Input's sole selection slot; the same key/serial and scope must survive both sides of the operation.
     fn bidi_side(&self) -> Result<Option<NativeMarkdownBidiCaretSide>> {
         self.require()?;
         let owner = self.owner.upgrade().ok_or(Error::Revoked)?;
@@ -381,7 +384,7 @@ impl Scene {
         Ok(side)
     }
 
-    /// Grid-only 前缀没有文字行；文字专用几何保持真实 Pending，不能造空文字窗口补票。
+    /// A Grid-only prefix has no text lines; text geometry stays Pending rather than inventing an empty text window.
     fn text_window(&self) -> Result<&Rc<NativeMarkdownComposedViewport>> {
         self.window.as_ref().ok_or(Error::Pending)
     }
@@ -391,6 +394,8 @@ impl Scene {
     }
 
     fn selection(&self) -> Result<MarkdownTextSelection> {
+        // A primary range alone does not define a directed multi-selection. Keep
+        // the original Input's explicit direction requirement at this consumer.
         self.key
             .request
             .input
@@ -399,6 +404,8 @@ impl Scene {
     }
 
     fn line(&self, position: usize, affinity: Affinity) -> Result<usize> {
+        // Soft-wrap seams belong to the requested side. Actual document EOF may
+        // use the final range end, but a cached prefix end cannot gain EOF authority.
         self.ranges
             .iter()
             .position(|range| {
@@ -413,13 +420,15 @@ impl Scene {
             .ok_or(Error::InvalidRange)
     }
 
-    /// canonical 行覆盖仍含整个 opaque 区；只有行内动作使用同次 glyph/control 证明的可见末端。
+    /// Canonical line coverage includes the full opaque range; within-line actions alone use its certified glyph/control visible end.
     fn visible_line_range(&self, line: usize) -> Range<usize> {
         let range = &self.ranges[line];
         range.start..self.folded_ends[line].unwrap_or(range.end)
     }
 
     fn boundary(&self, position: usize, next: bool) -> Result<usize> {
+        // Query the original GCB directory under a short Core borrow. Release it
+        // before require enters reentrant Native geometry validation again.
         self.require()?;
         let answer = {
             let mut output = self
@@ -448,12 +457,14 @@ impl Scene {
             {
                 Ok(position)
             }
-            // 缓存 EOF 没有全文 EOF 的语义。只有主动排版在途才可 Pending，否则明确范围不可用。
+            // Cache EOF is not document EOF. Return Pending only while actual preparation runs; otherwise the range is unavailable.
             _ => Err(self.missing_geometry()),
         }
     }
 
     fn missing_geometry(&self) -> Error {
+        // Pending promises only existing in-flight preparation, not a synthetic
+        // line endpoint or an unconditional retry when no producer can supply it.
         if self
             .owner
             .upgrade()
@@ -486,7 +497,7 @@ impl Scene {
         })
     }
 
-    /// 同步对照保原顺序：整背景、Grid底色边线、正文装饰、Grid选区，最后才绘制字形。
+    /// The synchronous comparison preserves canvas, Grid backgrounds/borders, text decorations, Grid selection, then glyph order.
     fn decorations(&self, context: &CGContext, current: &dyn Fn() -> bool) -> Result<()> {
         self.fill_canvas(context, current)?;
         self.grid_decorations(context, &|| current() && self.current())?;
@@ -496,7 +507,7 @@ impl Scene {
         self.validate_ready(current)
     }
 
-    /// 候选画布只填一次固定视口；Grid的逐项工作留给原Paint续体，不在构造栈扫描各格。
+    /// Fill the fixed viewport once; the original Paint continuation visits Grid work rather than scanning cells during construction.
     fn fill_canvas(&self, context: &CGContext, current: &dyn Fn() -> bool) -> Result<()> {
         self.validate_ready(current)?;
         self.color(context, self.colors.background);
@@ -504,14 +515,14 @@ impl Scene {
         self.validate_ready(current)
     }
 
-    /// 正文保既有单窗口装饰路径和像素顺序；Source没有Grid时原入口行为不变。
+    /// Preserve the existing single-window decoration path and pixel order, including the original Source behavior without Grid.
     fn text_decorations(&self, context: &CGContext, current: &dyn Fn() -> bool) -> Result<()> {
         self.validate_ready(current)?;
         if let Some(window) = &self.window {
             window
                 .paint_code_backgrounds(context, &|| current() && self.current())
                 .map_err(paint_error)?;
-        } // 原代码底色先落，再画活动行和真实选区；同步与CPU候选共用此顺序。
+        } // Code backgrounds precede the active line and selections in both synchronous and CPU candidate paths.
         if let Some(active) = &self.active_line {
             self.color(context, self.colors.active_line);
             for (index, range) in self.ranges.iter().enumerate() {
@@ -521,7 +532,7 @@ impl Scene {
                     range.start < active.end && active.start < range.end
                 };
                 if !selected {
-                    continue; // 不同逻辑行或真实EOF尾空行不能借前一wrapped行的范围着色。
+                    continue; // Another logical line or actual trailing EOF line cannot borrow the preceding wrapped line's range for highlighting.
                 }
                 let frame = self
                     .text_window()?
@@ -532,9 +543,9 @@ impl Scene {
                 let top = (frame.origin.y + frame.size.height)
                     .min(viewport.origin.y + viewport.size.height);
                 if top <= bottom {
-                    continue; // 实际已度量但在overscan之外的行没有本次像素后果。
+                    continue; // Measured lines outside the visible intersection have no pixels in this candidate.
                 }
-                // 行框已由原window覆盖viewport全宽；只裁真实垂直交集，不按平均行高猜矩形。
+                // The original window already spans viewport width; clip only the actual vertical intersection without estimating line height.
                 CGContext::fill_rect(
                     Some(context),
                     NSRect::new(
@@ -544,26 +555,26 @@ impl Scene {
                 );
             }
             self.validate_ready(current)?;
-        } // 活动行先于选区和文字绘制；不遮掉原选中反馈，也不读取或重排离屏正文。
-        // 查找背景与分步路径一样位于代码/活动行之后、用户选区之前。
-        // 同步入口保独立的真实窗口循环，不能漏掉查找反馈后再拿缺色图当像素期望。
+        } // The active line precedes selections/text, preserving feedback without reading or recomputing offscreen layout.
+        // Find backgrounds follow code/active-line paint and precede user selection, matching the stepped path.
+        // Keep the synchronous window traversal independent and complete; omitted Find feedback cannot define expected pixels.
         self.find_decorations(context, current)?;
         if let Some(window) = &self.window {
             let prepared = window.source_range();
-            // 输入所有者已经认证范围有序且不重叠；二分跳过视口前的范围，不扫描其正文。
-            // 这里只借发布时的整数元数据，离屏匹配不会推进排版或使匹配包络进入内存。
+            // Input certified ordered disjoint ranges; binary search skips ranges before the viewport without reading their text.
+            // Borrow publication's integer metadata only; offscreen matches neither advance layout nor materialize their text envelope.
             let first = self
                 .selections
                 .partition_point(|selection| selection.end <= prepared.start);
             self.color(context, self.colors.selection);
             for selection in &self.selections[first..] {
                 if selection.start >= prepared.end {
-                    break; // 后续范围同样位于本次准备窗口之后，没有本帧绘图后果。
+                    break; // Subsequent ranges also lie beyond this prepared window and have no pixels in this frame.
                 }
                 if selection.is_empty() {
-                    continue; // 空范围是光标位置，不能制造额外的选中背景。
+                    continue; // Empty ranges are caret positions, not additional selection backgrounds.
                 }
-                // 所有范围共用同一封存窗口和候选画布；任一真实几何或权限错误使整帧失败。
+                // All ranges share the sealed window and candidate canvas; any actual geometry or authority error fails the whole frame.
                 window
                     .selection_rects(selection.clone(), current, |rect| {
                         CGContext::fill_rect(Some(context), rect);
@@ -576,12 +587,12 @@ impl Scene {
         self.validate_ready(current)
     }
 
-    /// 只画本次已封存可见匹配；每个框由原窗口映射并裁剪，不创建第二份Find或排版结果。
-    /// 正文与格分别消费各自Source，透明色只覆盖一次真实矩形，不能叠加同一边缘clip。
+    /// Paint sealed visible matches only, mapping/clipping each rectangle through the original window without another Find/layout result.
+    /// Body/cells consume their own Sources; translucent paint covers each actual rectangle once without duplicate edge clipping.
     fn find_decorations(&self, context: &CGContext, current: &dyn Fn() -> bool) -> Result<()> {
         self.validate_ready(current)?;
         if self.find_highlights.is_empty() {
-            return Ok(()); // 没有实际匹配就没有绘图副作用，也不枚举当前Grid。
+            return Ok(()); // Without actual matches there is no drawing effect or Grid traversal.
         }
         self.color(context, [1.0, 0.75, 0.12, 0.25]);
         if let Some(window) = &self.window {
@@ -601,8 +612,8 @@ impl Scene {
                     .map_err(scene_error)?;
             }
         }
-        // 真实格映射只裁本格交集，隐藏Markdown语法不产生面积；离屏匹配不推进任何来源。
-        // 与异步阶段保持正文Find→Grid Find→正文选区→Grid选区的相同覆盖顺序。
+        // Actual cell mapping clips its own intersection; hidden Markdown has no area and offscreen matches advance no Source.
+        // Match asynchronous Body Find, Grid Find, Body selection, then Grid selection coverage order.
         for row in &self.grids {
             let source = row.row.source_range();
             let first = self
@@ -630,6 +641,8 @@ impl Scene {
     fn caret(&self, context: &CGContext, current: &dyn Fn() -> bool) -> Result<()> {
         self.validate_ready(current)?;
         let input = self.key.request.input;
+        // A visible caret belongs to one actual empty selection. Nonempty or
+        // multiple ranges keep their selection rendering without an invented caret.
         if input.selection_range_count != 1 || input.primary_range.length != 0 {
             return Ok(());
         }
@@ -645,14 +658,14 @@ impl Scene {
             }
             GridCharacterGeometry::Unavailable => return self.validate_ready(current),
             GridCharacterGeometry::Outside => {}
-        } // 隐藏语法仍属于表格；没有可见格时不退到零字号TableRow结构part。
+        } // Hidden syntax still belongs to Grid; absent visible cells never fall back to zero-size TableRow structure parts.
 
         let Some(window) = &self.window else {
             return self.validate_ready(current);
         };
         let prepared = window.source_range();
         if selection.head_utf16 < prepared.start || selection.head_utf16 > prepared.end {
-            return Ok(()); // 离屏 caret 没有本次绘图后果，不为它重排或读取其他段落。
+            return Ok(()); // An offscreen caret has no pixels here and triggers no other paragraph reads or layout.
         }
         if window
             .table_row_at(selection.head_utf16, affinity, &|| {
@@ -660,7 +673,7 @@ impl Scene {
             })
             .map_err(scene_error)?
         {
-            return self.validate_ready(current); // 原正文overscan中的离屏结构行也没有普通文字caret。
+            return self.validate_ready(current); // Offscreen structural rows in Body overscan also have no ordinary text caret.
         }
         let geometry = self
             .text_window()?
@@ -686,8 +699,8 @@ impl NativeMarkdownPagedTextScene for Scene {
     fn key(&self) -> &NativeMarkdownPagedSceneKey {
         &self.key
     }
-    /// 正文与只读格仍借同一张Scene；只交当前sealed标签的矩形，不登记URL或持久几何表。
-    /// visit只收集Copy矩形；调用者须归还这张Scene后才可进入Native，返回前仍读原Source首错。
+    /// Body and read-only cells share this Scene; expose current sealed label rectangles without a URL registry or persistent geometry table.
+    /// The visitor collects Copy rectangles only. Callers release the Scene before Native entry; original Source failure is still checked before return.
     fn visit_link_cursor_rects(&self, visit: &mut dyn FnMut(NSRect)) -> Result<()> {
         self.require()?;
         if let Some(window) = &self.window {
@@ -698,7 +711,7 @@ impl NativeMarkdownPagedTextScene for Scene {
         self.visit_grid_link_cursor_rects(visit)?;
         self.require()
     }
-    /// 原sealed LINK part与真实GCB侧只授命中事实，不同步推进语义或把marker当作label。
+    /// The sealed LINK part and actual GCB side authorize the hit only, without synchronous semantic work or marker-as-label substitution.
     fn link_hit(&self, local: NSPoint) -> Result<Option<(Range<usize>, usize)>> {
         self.require()?;
         if self.grid_cell_at(local).is_some() {
@@ -712,7 +725,7 @@ impl NativeMarkdownPagedTextScene for Scene {
             .link_part_at(local, &|| self.current())
             .map_err(scene_error)?
         else {
-            return Ok(None); // 普通文本不触发额外来源查询，行尾空白和显露marker也不截获原点击。
+            return Ok(None); // Ordinary text needs no extra Source query; trailing whitespace and exposed markers do not intercept the click.
         };
         let (head, backward, _) = self.word_hit(local)?;
         let index = if backward {
@@ -721,25 +734,25 @@ impl NativeMarkdownPagedTextScene for Scene {
             head
         };
         if !part.contains(&index) {
-            return Ok(None); // 最近caret可位于链接边缘之外；只有实际命中part中的原GCB才拥有激活权限。
+            return Ok(None); // The nearest caret can lie outside the label; activation requires the original GCB inside the actually hit part.
         }
         self.require()?;
         Ok(Some((part, index)))
     }
-    /// 原mouseup意图移交唯一Body；Scene不持后继闭包，也不在指针栈排版或打开外部应用。
+    /// Transfer original mouse-up intent to the sole Body; Scene retains no successor closure or pointer-stack layout/external opening.
     fn follow_link(&self, index: usize, intent: Weak<()>) -> Result<()> {
         self.require()?;
         let owner = self.owner.upgrade().ok_or(Error::Revoked)?;
         owner.follow_link(&self.key, index, intent)
     }
-    /// 原Scene先核Source/Font/输出健康，再把fragment交回同一弱Body；
-    /// 不经Workspace全局槽寻找另一个正文，也不在鼠标回调同步扫描整个文稿。
+    /// Check this Scene's Source/font/output health before returning the fragment to its same weak Body.
+    /// Do not look up another body in Workspace globals or synchronously scan the document during the mouse callback.
     fn follow_heading(&self, fragment: &str, intent: Weak<()>) -> Result<()> {
         self.require()?;
         let owner = self.owner.upgrade().ok_or(Error::Revoked)?;
         owner.follow_heading(&self.key, intent, fragment)
     }
-    /// 先证原可见链接part和真实GCB侧，再从同一Source/选择/publication取得有限目标副本。
+    /// Certify the visible link part and actual GCB side before obtaining a bounded target from the same Source/selection/publication.
     fn link_target(&self, local: NSPoint) -> Result<Option<String>> {
         let Some((_, index)) = self.link_hit(local)? else {
             return Ok(None);
@@ -751,20 +764,20 @@ impl NativeMarkdownPagedTextScene for Scene {
                 .as_ref()
                 .ok_or(Error::Pending)?
                 .link_at(&owner, &self.key, index)?
-        }; // 原Doc/Producer借用已结束，后继Native URL初始化不跨Core资源借用。
+        }; // Doc/Producer borrows end before subsequent Native URL construction; no Core resource borrow crosses it.
         self.require()?;
-        // 此处是原指针URL查询出口，已退还Doc/Producer借用并核同一key；有限目标的连续
-        // 表示只交给后继Native URL调用，不缓存为第二份CPU语义或借旧Source补权。
+        // This pointer URL-query boundary has returned Doc/Producer borrows and verified the same key. The bounded target's contiguous
+        // representation goes only to the later Native URL call, never another CPU semantic cache or renewed old-Source authority.
         Ok(link.map(|link| link.destination.into_string()))
     }
     fn cpu_frame_published(&self, paints: usize) {
-        // CPU owner 已真正提交完整帧；这里只排同一个原 key 的弱通知，不在绘图栈调用外方。
+        // CPU ownership already published a complete frame; queue only this original key's weak notification, without external callbacks on the paint stack.
         if let Some(owner) = self.owner.upgrade() {
             owner.queue_cpu_publication(&self.key, paints);
         }
     }
     fn validate_ready(&self, current: &dyn Fn() -> bool) -> Result<()> {
-        // 先核所有真实派生源；正文普通撤权不能把另一个格的目录首错覆盖为取消。
+        // Check every actual derived Source first; ordinary Body revocation cannot replace another cell directory's first failure with cancellation.
         for row in &self.grids {
             for cell in &row.cells {
                 if let GridCellContent::Composed(window) = &cell.content {
@@ -784,7 +797,7 @@ impl NativeMarkdownPagedTextScene for Scene {
         Ok(())
     }
     fn first_rect(&self, range: NSRange) -> Result<NativeMarkdownPagedCharacterRect> {
-        self.require()?; // 包括Grid域内无可见格的结果；Source首错不能被空间Pending掩盖。
+        self.require()?; // This includes Grid with no visible cell; geometric Pending cannot hide the original Source error.
         let affinity =
             if range.length == 0 && range.location == self.key.request.input.selection.head_utf16 {
                 self.head_affinity.unwrap_or(Affinity::Downstream)
@@ -794,7 +807,7 @@ impl NativeMarkdownPagedTextScene for Scene {
         match self.grid_first_rect(range, affinity)? {
             GridCharacterGeometry::Ready(rect) => return Ok(rect),
             GridCharacterGeometry::Unavailable => {
-                self.require()?; // 空间不可用也先保原Source首错，不把异步读取失败改写成Pending。
+                self.require()?; // Preserve Source failure even when geometry is unavailable; an asynchronous read failure is not Pending.
                 return Err(Error::Pending);
             }
             GridCharacterGeometry::Outside => {}
@@ -802,14 +815,14 @@ impl NativeMarkdownPagedTextScene for Scene {
         let geometry_error = |cause| match cause {
             ViewportError::Pending => Error::Pending,
             other => scene_error(other),
-        }; // 行域查询与实际字符查询同属此公开边界，屏外/尚未准备都保原Pending语义。
+        }; // Line-domain and character queries share this public boundary; offscreen or unprepared geometry retains Pending semantics.
         let window = self.text_window()?;
         if range.length == 0
             && window
                 .table_row_at(range.location, affinity, &|| self.current())
                 .map_err(geometry_error)?
         {
-            return Err(Error::Pending); // 可见Grid之外的结构行不借目录中的font0合成文字矩形。
+            return Err(Error::Pending); // Structural rows outside visible Grid cannot use directory font zero to synthesize character rectangles.
         }
         window
             .first_rect_with_caret_side(range, affinity, self.bidi_side()?, &|| self.current())
@@ -857,7 +870,7 @@ impl NativeMarkdownPagedTextScene for Scene {
                         consider(point);
                     }
                 } else {
-                    // 空格、文字前/后padding只有原格框能授予真实端点；不用整行等分推测列位置。
+                    // Empty cells and before/after-text padding use their actual cell frames for endpoints, never equal-width guesses from the row.
                     let clip = self.key.request.viewport;
                     let left = cell.frame.origin.x.max(clip.origin.x);
                     let right = (cell.frame.origin.x + cell.frame.size.width)
@@ -949,7 +962,7 @@ impl NativeMarkdownPagedTextScene for Scene {
                         == omni_markdown_core::MarkdownComposedLineAffinity::Upstream,
                 ),
             )
-        }; // 实际命中侧与选择一并交付；跨格提交不能用固定Downstream覆盖软换行上游。
+        }; // Deliver the actual hit side with selection; cross-cell commits cannot replace soft-wrap upstream with fixed Downstream.
         let before = self.selection()?;
         let selection = match clicks {
             0 | 1 => MarkdownTextSelection {
@@ -961,7 +974,7 @@ impl NativeMarkdownPagedTextScene for Scene {
                 head_utf16: position,
             },
             3 => self.paragraph_selection(position, affinity)?,
-            // 双击分词需要真实 word producer；不按 ASCII 空格猜中文和标点的选择范围。
+            // Double-click selection requires the actual word producer; ASCII-space guessing cannot define Chinese or punctuation groups.
             _ => return Err(Error::UnsupportedCommand),
         };
         self.require()?;
@@ -1007,7 +1020,7 @@ impl NativeMarkdownPagedTextScene for Scene {
                     Ok(visual) => visual,
                     Err(crate::native_surface::paged_line_viewport::NativeMarkdownComposedViewportError::Pending) => return Err(Error::Pending),
                     Err(cause) => return Err(scene_error(cause)),
-                }; // 缺真实邻行仍是原Producer的待准备范围，不当作BOF/EOF或猜一个整数邻居。
+                }; // A missing actual neighbor remains original Producer work, never BOF/EOF or an invented neighboring offset.
                 Ok(NativeMarkdownPagedNavigationTarget {
                     selection: MarkdownTextSelection {
                         anchor_utf16: if extend {
@@ -1025,8 +1038,8 @@ impl NativeMarkdownPagedTextScene for Scene {
             Nav::Backward | Nav::Forward | Nav::Left | Nav::Right => {
                 let backward = match action {
                     Nav::Left | Nav::Right => {
-                        // 原CM非空选择只collapse一次；左右的from/to由真实段base决定，
-                        // 不能用首part/最小level或mixed标记猜RTL段方向。
+                        // The existing CodeMirror nonempty selection collapses once; actual paragraph base decides the visual left/right endpoint,
+                        // rather than the first part, minimum level, or a mixed-direction flag guessing RTL paragraph direction.
                         let base = match self.text_window()?.paragraph_base_level_at(head, affinity, &|| self.current()) {
                             Ok(base) => base,
                             Err(crate::native_surface::paged_line_viewport::NativeMarkdownComposedViewportError::Pending) => return Err(Error::Pending),
@@ -1034,7 +1047,7 @@ impl NativeMarkdownPagedTextScene for Scene {
                         };
                         (action == Nav::Left) == (base == 0)
                     }
-                    _ => action == Nav::Backward, // 保留原标准逻辑Backward/Forward的既有语义。
+                    _ => action == Nav::Backward, // Preserve existing standard logical Backward/Forward semantics.
                 };
                 let target = if !extend && !ordered.is_empty() {
                     collapse(backward)
@@ -1053,6 +1066,8 @@ impl NativeMarkdownPagedTextScene for Scene {
                 )
             }
             Nav::LineStart | Nav::LineEnd | Nav::LineLeft | Nav::LineRight => {
+                // Logical line endpoints use original Source coverage. Visual
+                // left/right endpoints require the already-certified simple LTR case.
                 if matches!(action, Nav::LineLeft | Nav::LineRight) && !self.simple_ltr {
                     return Err(Error::UnsupportedCommand);
                 }
@@ -1071,6 +1086,8 @@ impl NativeMarkdownPagedTextScene for Scene {
                 )
             }
             Nav::ParagraphStart | Nav::ParagraphEnd | Nav::SelectParagraph | Nav::SelectLine => {
+                // Paragraph selection keeps canonical paragraph coverage; selecting
+                // a visible line uses its certified folded endpoint instead.
                 let line = self.line(head, affinity)?;
                 let range = if action == Nav::SelectLine {
                     self.visible_line_range(line)
@@ -1120,6 +1137,9 @@ impl NativeMarkdownPagedTextScene for Scene {
                 None,
             ),
             Nav::Up | Nav::Down | Nav::PageUp | Nav::PageDown => {
+                // Derive vertical targets from the original caret and actual line
+                // frames. A missing neighbor remains preparation work, not an
+                // estimated offset or a clamp to the prepared-window boundary.
                 let caret = self
                     .text_window()?
                     .caret_geometry(head, affinity, &|| self.current())
@@ -1212,6 +1232,8 @@ impl NativeMarkdownPagedTextScene for Scene {
             return Err(Error::InvalidRange);
         }
         let mut replacement = range;
+        // Plans describe one actual Input operation. Source/GCB ranges remain
+        // canonical; the few inserted control bytes never copy existing text.
         let inserted = match action {
             Edit::InsertNewline => "\n".to_owned(),
             Edit::InsertTab => "\t".to_owned(),
@@ -1235,7 +1257,7 @@ impl NativeMarkdownPagedTextScene for Scene {
                 replacement = NSRange::new(start, end.max(target) - start);
                 String::new()
             }
-            // 单词删除依真实 word producer，反向 Tab 依原缩进命令，不能假造为普通字节删除。
+            // Word deletion requires its actual producer, and Backtab its indentation command; neither becomes ordinary byte deletion.
             Edit::DeleteWordBackward | Edit::DeleteWordForward | Edit::InsertBacktab => {
                 return Err(Error::UnsupportedCommand);
             }
@@ -1251,8 +1273,8 @@ impl NativeMarkdownPagedTextScene for Scene {
         context: CFRetained<CGContext>,
         current: &dyn Fn() -> bool,
     ) -> Result<Box<dyn NativeMarkdownPagedScenePaintSession>> {
-        // 正文与Grid都只在构造时填固定画布；全部装饰沿同一量子预算继续，不能同步扫完整窗口。
-        // 原同步paint保独立完整像素对照，不参与异步候选的背景、选区或字形推进。
+        // Construction fills only the fixed canvas for Body/Grid; all decorations resume under the shared quantum instead of scanning the whole window.
+        // Synchronous paint remains an independent complete pixel comparison, not part of asynchronous candidate advancement.
         self.prepare_paint_space(current)?;
         self.fill_canvas(&context, &|| current() && self.current())?;
         Ok(Box::new(Paint::new(self, context)))
@@ -1280,8 +1302,8 @@ impl NativeMarkdownPagedTextScene for Scene {
                 }
             }
         }
-        // 独立同步 paint 也消费原完整 Input 的组合外观；不另画字形或取得后继 marked 票。
-        // 与正式 CPU 会话共用同一个逐 part 装饰实现，所有范围映射、字体度量及撤权规则一致。
+        // Independent synchronous paint uses composition appearance from the same complete Input, without extra glyphs or successor marked authority.
+        // It shares production CPU's per-part decoration implementation and the same range mapping, font metrics, and revocation rules.
         if let Some(marked) = self.key.request.input.marked {
             use crate::native_surface::paged_line_viewport::NativeMarkdownComposedViewportDecorationCursor;
             let marked = marked.location..marked.location + marked.length;
@@ -1306,8 +1328,8 @@ impl NativeMarkdownPagedTextScene for Scene {
                     .complete
                 {}
             }
-            // 格窗口仍先取其真实 canonical 域；不能把原 Body 的端点直接当 display 端点。
-            // 同步入口原本逐个消费有限窗口，此处不进入未准备行或启动任何额外排版。
+            // Cell windows first resolve their actual canonical domain; Body endpoints are not display endpoints.
+            // The synchronous entry visits bounded prepared windows, without entering unprepared lines or starting additional layout.
             for row in &self.grids {
                 for cell in &row.cells {
                     if let GridCellContent::Composed(window) = &cell.content {

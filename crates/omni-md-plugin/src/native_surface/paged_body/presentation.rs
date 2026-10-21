@@ -1,11 +1,13 @@
-//! 展示模式只替换当前正文的排版续体；文稿、输入客户、历史及 Native 根始终属于同一会话。
+//! Presentation changes replace only this body's layout continuation. The document,
+//! input client, history, and Native root remain in the same session.
 
 use super::NativeMarkdownPagedBodyError as Error;
 use super::*;
 use crate::native_surface::editor::viewport::ModeSourceAnchor;
 use omni_markdown_core::MarkdownPresentationMode;
 
-/// 与普通 prepare 共用同一个同步准入；Native 重入只登记 deferred，不并行领取第二个 Producer。
+/// Shares ordinary preparation's synchronous admission. Native reentry records deferred
+/// work instead of acquiring a second concurrent Producer.
 pub(super) struct PresentationUse<'a>(pub(super) &'a Cell<bool>);
 
 impl Drop for PresentationUse<'_> {
@@ -15,13 +17,14 @@ impl Drop for PresentationUse<'_> {
 }
 
 impl NativeMarkdownPagedBody {
-    /// 下一次模式动作必须先证明上一份派生排版已真实归还；共享的当前文稿和基础字体不在退休集合中。
+    /// A later mode action must first verify actual return of the preceding derived layout.
+    /// The shared current document and base fonts are outside that retirement set.
     pub(in crate::native_surface) fn verify_mode_retirement(
         &self,
     ) -> std::result::Result<(), String> {
         let slot = self.mode_retirement.borrow();
         let Some(receipt) = slot.as_ref() else {
-            return Ok(()); // 首次打开尚未退休任何 Producer，不制造一个虚假的已关闭对象。
+            return Ok(()); // Initial attachment retired no Producer; do not invent an already-closed resource.
         };
         if !receipt.source.payload_released() {
             return Err("上一模式的排版 Source 仍未归还".into());
@@ -51,10 +54,11 @@ impl NativeMarkdownPagedBody {
             return Err(format!("上一模式的整形 worker 仍未归还：{worker:?}"));
         }
         for cell in &receipt.cells {
-            cell.verify_released()?; // 格显示 Source、映射和实际目录仍沿各自原收据核验。
+            cell.verify_released()?; // Each cell's original receipt verifies its display Source, mappings, and actual directories.
         }
-        // 字号或模式可以更换 Core payload，却仍合法共享同一冻结映射。
-        // 只认当前实际字体持有的原映射身份；关闭已先清空 fonts，届时全部映射仍须真实归还。
+        // A new size or mode can own another Core payload while sharing the same frozen
+        // mapping. Recognize only the mapping identity held by actual current fonts.
+        // Close empties fonts first, so final verification still requires every mapping back.
         let current_mappings = self
             .fonts
             .borrow()
@@ -75,7 +79,8 @@ impl NativeMarkdownPagedBody {
         Ok(())
     }
 
-    /// 只有原可见字形和完整输入票仍有效时才接纳切换；准备失败不先销毁可用的旧排版。
+    /// Admit a switch only while the original visible glyph and complete Input ticket
+    /// remain valid. Font preparation failure leaves the usable old layout intact.
     pub(in crate::native_surface) fn change_presentation_mode(
         &self,
         mode: MarkdownPresentationMode,
@@ -91,7 +96,7 @@ impl NativeMarkdownPagedBody {
             || self.pending_cell.borrow().is_some()
             || self.has_pending_input()
         {
-            return Err(Error::Busy); // 已接纳的文字和单格事务必须由原 owner 完成，不能用换模式取消。
+            return Err(Error::Busy); // Admitted text and cell transactions remain their original owner's obligation; switching cannot cancel them.
         }
         let previous = self.presentation_mode();
         if previous == mode {
@@ -109,7 +114,8 @@ impl NativeMarkdownPagedBody {
         if !original() {
             return Err(ViewError::Revoked.into());
         }
-        // 后面的 AppKit getter 可以交付原通知；先锁住同一同步准备准入，再保留实际旧输入。
+        // Subsequent AppKit getters may deliver notifications. Acquire the same
+        // synchronous preparation admission before retaining original input authority.
         self.preparing.set(true);
         let preparation = PresentationUse(&self.preparing);
         let result = (|| {
@@ -122,14 +128,16 @@ impl NativeMarkdownPagedBody {
                 return Err(ViewError::Revoked.into());
             }
             drop(current_scroll);
-            // 只在接纳前的字体准备栈保原 Scene，用于保留 Native 回调中的 Source 首错。
-            // 进入退休前明确归还，不能因认证字体而把旧 Reader 跨模式保活。
+            // Keep the original Scene only during pre-admission font preparation to
+            // preserve Source failure across Native callbacks. Release it before
+            // retirement so font validation cannot keep the old Reader across modes.
             let scene = self.scene.borrow().clone().ok_or(ViewError::Pending)?;
             if !scene.key().same(key) {
                 return Err(ViewError::Revoked.into());
             }
-            // 产品两种用途明确选择目标 Native base；通用 Body 仍沿原传入字体。
-            // 捕获只借本 Body 的有限活字体，仍逐实例核真实来源/轴/字号/平台推进。
+            // Product roles select their actual Native base; generic Body keeps its
+            // supplied font. Capture borrows this body's bounded live palette and
+            // still verifies each instance's origin, axes, size, and platform advances.
             let captured = self.capture_base_font(mode, &original);
             scene.validate_ready(&original)?;
             let base = captured?;
@@ -141,7 +149,8 @@ impl NativeMarkdownPagedBody {
             if !original() {
                 return Err(ViewError::Revoked.into());
             }
-            // 目标 wrapper 记录对应模式的真实行度量；共享 payload 和映射只来自上方实际捕获收据。
+            // The target wrapper captures its mode's actual line metrics. Shared
+            // payload or mapping ownership comes only from the actual capture above.
             let registered = NativeMarkdownLineFont::register(base, &self.catalog, &original);
             scene.validate_ready(&original)?;
             let registered = registered?;
@@ -168,8 +177,9 @@ impl NativeMarkdownPagedBody {
                 .checked_add(1)
                 .ok_or(Error::CounterExhausted)?;
             let mut retired = self.resource_receipts()?;
-            // 零号也可能因用途变化而退休，不能再跳过首项。只有与目标实际同 Core
-            // payload 的旧字体继续存活；其它 payload 必须释放，共享映射另按当前 owner 核验。
+            // Font zero can retire when its role changes. Retain only old fonts
+            // sharing the target's actual Core payload; all other payloads must return.
+            // Shared mapping verification separately recognizes current ownership.
             let target_authority = registered.native().core_font().authority();
             retired.fonts = self
                 .fonts
@@ -183,8 +193,10 @@ impl NativeMarkdownPagedBody {
                     )
                 })
                 .collect();
-            // 从这里接纳本次切换：先撤旧导航和绘图 Reader，保原 Input 的多范围、亲和及折叠事实。
-            // 模式动作已经结束真实 marked/单格事务；它不是一次文本替换，也不写文稿或 Undo。
+            // Admission begins here: revoke old navigation and drawing readers while
+            // preserving Input's multiple ranges, affinities, and folds. The mode
+            // action already ended actual composition/cell work; it does not replace
+            // text, write the document, or append Undo history.
             self.cancel_pending_find()?;
             self.cancel_word_delete()?;
             self.cancel_mode_viewport();
@@ -203,7 +215,8 @@ impl NativeMarkdownPagedBody {
             );
             *self.mode_retirement.borrow_mut() = Some(retired);
             if let Err(cause) = cleanup {
-                // 实际资源归还失败后不建立新排版掩盖首错；正文仍可沿统一关闭边归还剩余资源。
+                // Do not hide actual retirement failure by creating new layout.
+                // The normal close boundary still returns this body's remaining resources.
                 self.failed.set(true);
                 return Err(cause);
             }
@@ -219,10 +232,11 @@ impl NativeMarkdownPagedBody {
             self.font_choices.borrow_mut().clear();
             let old_fonts = self.fonts.replace(vec![Rc::new(registered)]);
             let old_typography = self.typography.replace(typography);
-            self.presentation.set(mode); // 原 Producer 已实际退场，不能让它误接相同 Input/宽度的新模式。
+            self.presentation.set(mode); // The original Producer has retired and cannot accept another mode with coincident Input/width.
             drop((old_fonts, old_typography));
-            // 模式的结构义务与旧输入的位置恢复分开：真实新输入可以取消旧锚点，
-            // 却不能让已经接纳的 Preview 留源码 ruler，或让 Source 缺失同一行号附件。
+            // Mode structure and old-input position restoration have separate duties.
+            // New input may revoke the old anchor, but accepted Preview must still hide
+            // the Source ruler, and Source must still mount its line-number attachment.
             let mode_current = || self.current_body() && self.presentation_mode() == mode;
             let input_current = || {
                 mode_current()
@@ -237,7 +251,8 @@ impl NativeMarkdownPagedBody {
             }
             let gutter = self.gutter.borrow().clone();
             if let Some(gutter) = gutter {
-                // 标准 ruler 是同一正文会话的有限附件；预览清旧像素并隐藏，最终统一关闭才封闭共享页账。
+                // The standard ruler is a bounded attachment to this session.
+                // Preview clears/hides its pixels; final close settles the shared page ownership.
                 gutter
                     .set_mode_visibility(mode == MarkdownPresentationMode::Source, &mode_current)?;
             } else if mode == MarkdownPresentationMode::Source {
@@ -259,7 +274,7 @@ impl NativeMarkdownPagedBody {
                     return Err(ViewError::Revoked.into());
                 }
                 *self.gutter.borrow_mut() = Some(gutter.clone());
-                gutter.mount()?; // owner 先归原槽，同步 clip 通知才能看见唯一的行号归属。
+                gutter.mount()?; // Install ownership before mounting so synchronous clip notifications see the sole gutter owner.
             }
             if !mode_current() {
                 return Err(ViewError::Revoked.into());
@@ -274,18 +289,22 @@ impl NativeMarkdownPagedBody {
                 return Err(ViewError::Revoked.into());
             }
             if !input_current() {
-                // 新输入已经拥有自己的选择/滚动位置；只继续同模式真实排版，不能恢复旧 anchor。
+                // New input owns its selection and scroll position. Continue this
+                // mode's actual layout without restoring the revoked old anchor.
                 return self.schedule();
             }
-            // 同一个 Source 锚点在原 scroll 的新真实 lane 上恢复；绑定 controller 前不发布文首过渡帧。
-            // 原同步守卫仍借同一个锚点；这里只移交它的有限弱文稿和坐标值，不复制 Scene 或正文。
+            // Restore the same Source anchor in the original scroll's actual new
+            // lane, without a document-start frame before controller binding.
+            // Transfer only its bounded weak document identity and coordinates;
+            // the synchronous guard keeps this anchor without copying Scene or text.
             self.restore_mode_viewport(anchor.clone())
         })();
         drop(preparation);
         let deferred = self.deferred.replace(false);
         if (deferred || result.is_err()) && self.current_body() {
-            // 接纳前失败可能已经撤掉旧 Scene；接纳后 Native 新输入也可能撤旧位置恢复。
-            // 两者都只恢复当前同一 owner 的实际排版，不重放模式动作、文字输入或文稿编辑。
+            // Pre-admission failure may already have revoked the old Scene, and
+            // post-admission Native input may revoke position restoration. Both
+            // resume this owner's actual layout without replaying mode or text actions.
             self.schedule()?;
         }
         result

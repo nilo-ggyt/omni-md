@@ -1,4 +1,5 @@
-//! 流式多范围替换；旧 canonical root 只读，所有候选输出一次发布或完整回滚。
+//! Stream multiple replacements against the immutable old canonical root. The
+//! owning transaction publishes the entire candidate once or rolls it all back.
 
 use super::changes::{MarkdownObservedEditError, MarkdownTextChangeObserver};
 use super::command_transaction::{PreparedCommand, commit_prepared_command_observed};
@@ -7,27 +8,33 @@ use super::*;
 use std::borrow::Cow;
 
 #[derive(Debug)]
-/// 一项原文 UTF-16 替换；parts 完整消费后才读取下一项，不保存全量匹配列表。
+/// One replacement in original UTF-16 coordinates. Consume all its parts before
+/// requesting the next replacement, without retaining a full match list.
 pub struct MarkdownReplacement<P> {
     pub range_utf16: Range<usize>,
     pub parts: P,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-/// 字面块或旧 canonical root 的引用区间；Cow 可借动作外层模板，core 不保留该借用。
-/// 大区间共享原 piece，短片段复制合并进正常 canonical chunk；Owned String 调用方可用 `.into()`。
+/// A literal or a range of the old canonical root. Cow may borrow the caller's
+/// template for this call; Core retains no such borrow. Large source spans share
+/// pieces, while short spans coalesce into normal canonical chunks. Owned strings
+/// can be passed with `.into()`.
 pub enum MarkdownReplacementPart<'a> {
     Literal(Cow<'a, str>),
     SourceRange(Range<usize>),
 }
 
 impl MarkdownDocumentBuffer {
-    /// 将有序、不重叠的原文范围替换为一个原子 history entry。
+    /// Replace ordered, non-overlapping original ranges in one atomic history entry.
     ///
-    /// 两级 iterator 均只读普通数据，不得回调 native 或重入同一 document。调用方须在取得
-    /// mutable document 前检查匹配时的 generation。任意输入、边界、大小、预算或最终选区
-    /// 错误保留原文、redo、选区与 generation；空输入验证选区后返回 None，不改变状态。
-    /// 巨型 SourceRange 共享旧 subtree，小片段通过 4 KiB scratch 合并，避免密集匹配各占 leaf。
+    /// Both iterator levels must read plain data without native callbacks or
+    /// reentering this document. The caller checks the matched generation before
+    /// obtaining its mutable borrow. Input, boundary, budget, and final-selection
+    /// failures preserve text, redo, selection, and generation. An empty iterator
+    /// validates the requested selection and returns None without adopting it.
+    /// Large SourceRanges share old subtrees; a 4 KiB scratch coalesces small
+    /// fragments so dense matches do not each allocate a separate leaf.
     pub fn apply_replacements<'a, I, P>(
         &mut self,
         replacements: I,
@@ -43,7 +50,8 @@ impl MarkdownDocumentBuffer {
             .map_err(changes::legacy_error)
     }
 
-    /// 原子替换的可失败观察入口；每项parts消费完成后立即发出真实变化，不驻留匹配列表。
+    /// Observe each actual change after consuming that replacement's parts. The
+    /// observer may fail, but its candidate output is published only with the text.
     pub fn apply_replacements_observed<'a, I, P, O>(
         &mut self,
         replacements: I,
@@ -60,7 +68,9 @@ impl MarkdownDocumentBuffer {
         self.validate_selection(before)?;
         let mut replacements = replacements.into_iter();
         let Some(first) = replacements.next() else {
-            // 空输入不采用after/清redo；仍允许观察者根据显式head准备派生状态，失败不发布。
+            // Empty input neither adopts `after` nor clears redo. The observer
+            // may derive output from the actual unchanged head; failure publishes
+            // no derived result and does not manufacture an empty text command.
             self.validate_selection(after)?;
             let output = observer
                 .finish(
@@ -87,7 +97,8 @@ impl MarkdownDocumentBuffer {
     }
 }
 
-/// 一次消费原文坐标；顺序边界不反复从同一 leaf 开头解码，密集匹配只扫描标量一次。
+/// Consume original coordinates monotonically. Keep each leaf's decoded position
+/// so dense match boundaries do not repeatedly scan from the start of that leaf.
 struct OrderedBoundaries {
     cursor: SourcePieceCursor,
     piece: Option<MarkdownPiece>,
@@ -115,12 +126,14 @@ impl OrderedBoundaries {
         target: usize,
     ) -> Result<usize, MarkdownDocumentBufferError> {
         if target < self.utf16 {
-            // 外层本应先检查原文次序；游标也拒绝倒退，不能将新坐标误解为相对偏移。
+            // The outer loop checks ordering too. Reject retreat here rather
+            // than misinterpret an earlier absolute coordinate as a local offset.
             return Err(MarkdownDocumentBufferError::ReplacementRangesNotOrdered);
         }
         while self.utf16 < target {
             if self.piece.is_none() {
-                // 完整 leaf 只保留描述符，没有字节借用跨越后续 append。
+                // Retain only the leaf descriptor. No byte lease can survive
+                // across a later append that may change edit-segment storage.
                 let source = self
                     .cursor
                     .next_piece()
@@ -131,7 +144,8 @@ impl OrderedBoundaries {
             }
             let piece = self.piece.as_ref().expect("the cursor installed one leaf");
             if target - self.utf16 >= self.remaining_units {
-                // 使用聚合跳过完整尾部，不读取没有边界落入的原文页。
+                // Skip the complete remaining leaf by its metrics. Original
+                // pages with no requested endpoint need not be read at all.
                 self.utf16 += self.remaining_units;
                 self.byte += piece.byte_len - self.local_byte;
                 self.piece = None;
@@ -143,7 +157,8 @@ impl OrderedBoundaries {
                 for scalar in text.chars() {
                     let units = scalar.len_utf16();
                     if self.utf16 + units > target {
-                        // surrogate 内部不能被解释为可替换边界，整个事务随后回滚。
+                        // A position inside a surrogate pair is not a replacement
+                        // boundary; the owning transaction rolls back the candidate.
                         return Err(MarkdownDocumentBufferError::NotUnicodeBoundary);
                     }
                     self.utf16 += units;
@@ -151,7 +166,8 @@ impl OrderedBoundaries {
                     self.local_byte += scalar.len_utf8();
                     self.remaining_units -= units;
                     if self.utf16 == target {
-                        // 下一边界从已消费位置继续，避免每个字符匹配都扫描整个 4 KiB leaf。
+                        // Resume the next boundary here instead of scanning the
+                        // same 4 KiB leaf again for every single-character match.
                         break;
                     }
                 }
@@ -162,7 +178,9 @@ impl OrderedBoundaries {
     }
 }
 
-/// 只有一个输出 scratch；长原文共享 metadata，短原文复制前另用一个固定 scratch 结束借用。
+/// One output scratch coalesces literals and short source spans. Large spans share
+/// metadata; short copies use a separate fixed temporary to end the source borrow
+/// before appending to edit storage.
 struct ReplacementOutput {
     root: PieceTreeLink,
     scratch: [u8; ORIGINAL_PIECE_BYTES],
@@ -185,6 +203,8 @@ impl ReplacementOutput {
         additional: usize,
         maximum: usize,
     ) -> Result<(), MarkdownDocumentBufferError> {
+        // Account for the complete emitted prefix before copying or sharing it.
+        // Later replacements cannot shrink a prefix already emitted to this root.
         self.byte_len = self
             .byte_len
             .checked_add(additional)
@@ -198,16 +218,19 @@ impl ReplacementOutput {
         document: &mut MarkdownDocumentBuffer,
         mut text: &str,
     ) -> Result<(), MarkdownDocumentBufferError> {
-        // 输出只会增长，后续删除不会移除已发出的前缀；超限可在分配/复制前拒绝。
+        // Output grows monotonically, so reject an oversized literal before any
+        // allocation or copy, even if later original ranges will be deleted.
         self.grow(text.len(), document.maximum_document_bytes)?;
         while !text.is_empty() {
             let mut end = text.len().min(self.scratch.len() - self.length);
             while !text.is_char_boundary(end) {
-                // 最多退让一个 scalar 的 UTF-8 尾部，不把 surrogate/字节碎片写进 leaf。
+                // Retreat at most the UTF-8 tail of one scalar. Every appended
+                // canonical leaf must end on a complete encoded character.
                 end -= 1;
             }
             if end == 0 {
-                // 剩余空间容不下下个 scalar，先 flush；空 scratch 至少能容纳四字节 scalar。
+                // Flush when the next scalar does not fit. An empty scratch can
+                // hold even a four-byte scalar, so this cannot stall indefinitely.
                 self.flush(document)?;
                 continue;
             }
@@ -215,7 +238,8 @@ impl ReplacementOutput {
             self.length += end;
             text = &text[end..];
             if self.length == self.scratch.len() {
-                // 按块追加 canonical 字节，密集小替换不会各分配一个 leaf。
+                // Append canonical chunks rather than allocating one leaf per
+                // tiny replacement in a dense set of matches.
                 self.flush(document)?;
             }
         }
@@ -229,13 +253,15 @@ impl ReplacementOutput {
         range: Range<usize>,
     ) -> Result<(), MarkdownDocumentBufferError> {
         if range.is_empty() {
-            // 空 source span 不生成 leaf 或 append，也不会消费 scratch 容量。
+            // Empty source spans require neither a leaf nor an append and consume
+            // none of the output scratch capacity.
             return Ok(());
         }
         if range.len() >= ORIGINAL_PIECE_BYTES {
             self.grow(range.len(), document.maximum_document_bytes)?;
             self.flush(document)?;
-            // 两次 path-copy 只切边界；中间旧 subtree 和 backing 字节均继续共享。
+            // Path-copy only the two boundaries. The selected middle subtree and
+            // all underlying original/edit bytes remain shared with the old root.
             let (_, suffix) = split_piece_tree(document, original.clone(), range.start)?;
             let (selected, _) = split_piece_tree(document, suffix, range.len())?;
             self.root = join_piece_trees(self.root.take(), selected);
@@ -244,7 +270,8 @@ impl ReplacementOutput {
         let mut scratch = [0_u8; ORIGINAL_PIECE_BYTES];
         let mut copied = 0;
         visit_piece_tree_range(document, original.as_deref(), range, 0, &mut |bytes| {
-            // 先结束只读 source 借用，再允许 literal flush 扩展 edit segment Vec。
+            // Complete the read-only source borrow before literal's flush may
+            // grow the edit-segment Vec; the temporary has a fixed 4 KiB bound.
             scratch[copied..copied + bytes.len()].copy_from_slice(bytes);
             copied += bytes.len();
             Ok(())
@@ -259,7 +286,8 @@ impl ReplacementOutput {
         document: &mut MarkdownDocumentBuffer,
     ) -> Result<(), MarkdownDocumentBufferError> {
         if self.length == 0 {
-            // 纯 SourceRange 命令不创建任何新字节，包含完整文档 capture 的重复使用。
+            // SourceRange-only commands create no new text bytes, including when
+            // a replacement reuses a capture covering the entire original document.
             return Ok(());
         }
         let text = std::str::from_utf8(&self.scratch[..self.length])
@@ -273,6 +301,9 @@ impl ReplacementOutput {
     }
 }
 
+/// Build one candidate root from original coordinates. The shared command owner
+/// holds the append checkpoint and journal transaction, so every early error here
+/// discards candidate structure before reclaiming its newly appended storage.
 fn prepare_replacements<'a, I, P, O: MarkdownTextChangeObserver>(
     document: &mut MarkdownDocumentBuffer,
     original: PieceTreeLink,
@@ -294,7 +325,8 @@ where
     for replacement in replacements {
         let MarkdownReplacement { range_utf16, parts } = replacement?;
         if range_utf16.start > range_utf16.end || range_utf16.end > original_units {
-            // 先查完整范围，不允许无符号 len 计算掩盖倒置或越界。
+            // Validate the full range before computing lengths; unsigned
+            // arithmetic must not hide reversed or out-of-document coordinates.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument.into());
         }
         if let Some(previous) = &previous {
@@ -303,11 +335,13 @@ where
                     && range_utf16.is_empty()
                     && previous.start == range_utf16.start)
             {
-                // touching 允许，同位置的连续空插入及倒退/重叠都明确拒绝。
+                // Touching ranges are valid. Reject overlaps, retreat, and two
+                // empty insertions at one position, whose order is ambiguous here.
                 return Err(MarkdownDocumentBufferError::ReplacementRangesNotOrdered.into());
             }
         } else {
-            // 非空外层 iterator 才进入本函数，第一项建立唯一 native 通知包络。
+            // This function receives a nonempty outer iterator. Its first item
+            // anchors the single native notification envelope for the whole command.
             first_start = range_utf16.start;
         }
         let start = boundaries.byte_for_utf16(document, range_utf16.start)?;
@@ -317,7 +351,8 @@ where
         for part in parts {
             match part? {
                 MarkdownReplacementPart::Literal(text) => {
-                    // 借用模板只在此次调用内可达，Owned 值消费后立即 drop；二者均不存入 history/root。
+                    // Borrowed templates live only during this call; owned parts
+                    // drop after consumption. Neither is retained by history/root.
                     inserted = inserted
                         .checked_add(text.encode_utf16().count())
                         .ok_or(MarkdownDocumentBufferError::DocumentTooLarge)?;
@@ -325,7 +360,8 @@ where
                 }
                 MarkdownReplacementPart::SourceRange(range) => {
                     if range.start > range.end || range.end > original_units {
-                        // capture/prefix/suffix 也必须在旧 snapshot 内，不能逃到本次输出。
+                        // Captures, prefixes, and suffixes all address the old
+                        // snapshot; none can refer to the candidate being emitted.
                         return Err(MarkdownDocumentBufferError::RangeOutsideDocument.into());
                     }
                     inserted = inserted
@@ -337,7 +373,8 @@ where
                 }
             }
         }
-        // 一项完整parts的实际长度确定后立即记录；输入/observer失败由共享事务回滚全部append。
+        // Emit as soon as one replacement's actual length is known. Input or
+        // observer failure rolls back every append through the same transaction.
         changes::emit(document, observer, range_utf16.clone(), inserted)?;
         consumed_bytes = end;
         previous = Some(range_utf16);
@@ -345,6 +382,9 @@ where
     let last = previous.expect("the public entry passes at least one replacement");
     output.source(document, &original, consumed_bytes..original_bytes)?;
     output.flush(document)?;
+    // Preserve the untouched prefix/suffix when deriving the one replacement
+    // envelope. The final selection is validated against this complete candidate
+    // by the owning command before history or canonical text can be published.
     let result_units = piece_tree_metrics(&output.root).utf16_len;
     let outside_units = first_start
         .checked_add(original_units - last.end)

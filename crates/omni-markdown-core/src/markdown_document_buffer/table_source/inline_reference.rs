@@ -1,4 +1,4 @@
-//! 一个原引用请求的有限identifier解码；不是段落正文，也不建立第二份定义表。
+//! Decode one original bounded reference identifier without copying paragraph text or duplicating definitions.
 
 use super::*;
 use crate::markdown_document_buffer::table_window_request::{
@@ -13,17 +13,21 @@ use pulldown_cmark::global_frontier::{
 };
 
 pub(in crate::markdown_document_buffer) struct ReferenceLabel {
-    // 请求来自原同一cursor，含真实record、owner与label；不允许拿裸range补一个查询。
+    // The original cursor supplied this verified record, owner and label;
+    // a bare range cannot manufacture an equivalent reference request.
     pub request: VerifiedInlineReferenceRequest,
     decoder: InlineReferenceDecoder,
     chunks: Vec<Vec<u8>>,
     len: usize,
     decoded: bool,
-    // 完整key只在原有限normalizer边界存在，之后交原UniCase；这里没有第二份定义库存。
+    // A contiguous key exists only at the bounded normalizer boundary, then uses
+    // the original UniCase inventory. This owner has no second definition map.
     label: Option<String>,
 }
 impl ReferenceLabel {
     pub fn new(request: VerifiedInlineReferenceRequest) -> Self {
+        // Construct the decoder from the same verified request, retaining only
+        // current identifier progress until its genuine closing bracket is decoded.
         Self {
             decoder: request.reference_decoder(),
             request,
@@ -37,9 +41,9 @@ impl ReferenceLabel {
         self.label.as_deref()
     }
 
-    /// 借原Source小片逐步运行共享label语法；只有原closing bracket能结束，短frame不是EOF。
-    /// complete后只在既有有限identifier规范化边界建立连续key，真实copy/容量完整单列，
-    /// 不声称这个原Normalizer/UniCase边界逐token服从4096，也不把它扩展到段落正文。
+    /// Run shared label grammar over original pieces; only the genuine closing bracket completes it.
+    /// The bounded identifier may become contiguous at normalization, with copy/capacity reported separately.
+    /// This existing normalizer/UniCase boundary is not a per-token 4-KiB guarantee or paragraph-copy permission.
     pub fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -50,16 +54,20 @@ impl ReferenceLabel {
         if self.request.source_revision() != document.generation()
             || self.request.source_end() != document.byte_len()
         {
+            // An edited original source cannot resume the old decoder's label;
+            // the parent transaction retains its stronger root/scope authority.
             return Err(Error::SourceSuperseded);
         }
         if self.label.is_some() {
             return Ok(SemanticWork::default());
         }
         if self.decoded {
-            // 原key上限先于连续分配。新旧小片在本步短暂共存，quota按真实新容量累计，
-            // 归还旧chunks不从累计燃料反扣，也不伪称现在只保一份便没有分配峰值。
+            // Admit the complete bounded key before allocating it. Old chunks and
+            // the new buffer briefly coexist; cumulative allocation fuel does not
+            // erase that peak when chunks are returned.
             quota.admit_metadata(self.len).map_err(Error::Window)?;
-            // decoder每次输出完整UTF8；页可切scalar，故这里只拼原字节后检查整份有限identifier。
+            // Decoder output is valid UTF-8 while chunk storage may split scalars;
+            // join original bytes once and validate the complete bounded identifier.
             let mut bytes = Vec::with_capacity(self.len);
             for chunk in std::mem::take(&mut self.chunks) {
                 bytes.extend_from_slice(&chunk);
@@ -88,6 +96,8 @@ impl ReferenceLabel {
             .map_or(0, |root| usize::from(root.height()))
             + 1;
         let child = budget.saturating_sub(tree + 128 + 1024 + 512);
+        // Reserve actual tree descent, control and fixed output work before the
+        // shared decoder quantum; an insufficient quantum fails without borrowing input.
         if child < 2048 {
             return Err(Error::WorkLimit);
         }
@@ -100,7 +110,8 @@ impl ReferenceLabel {
             .ok_or(Error::InvalidRequest)?
             .min(1024);
         let frame = if maximum == 0 {
-            // 到真实closing bracket后允许原decoder排出carry；空输出不是Source EOF证明。
+            // After the real closing bracket, the same decoder may flush carry;
+            // empty output is not evidence of the document's EOF.
             None
         } else {
             Some(
@@ -129,14 +140,16 @@ impl ReferenceLabel {
             child,
         );
         let tree = if let Some(frame) = frame {
-            // 回收先于展开语法错误。真实Source EIO不能被坏label/输出错误抢成次因。
+            // Finish the actual lease before inspecting grammar output/errors.
+            // A source reclaim failure must remain ahead of a malformed label.
             frame.finish().map_err(Error::Source)?;
             tree
         } else {
             0
         };
         let step = step.map_err(Error::Global)?;
-        // 只有同一真实scope续行实际取得的新页才收费；浅Arc共享并不复制或再次物化正文。
+        // Charge only newly acquired workspace for the same actual scope
+        // continuation. Sharing an Arc does not copy or rematerialize source text.
         let prefix_allocated = self.decoder.allocated_workspace_bytes() - allocated_before;
         quota
             .admit_metadata(prefix_allocated)
@@ -146,6 +159,8 @@ impl ReferenceLabel {
         }
         let bytes = output.get(..step.written).ok_or(Error::InvalidRequest)?;
         std::str::from_utf8(bytes).map_err(|_| Error::InvalidRequest)?;
+        // Reuse remaining capacity in the current identifier page, then allocate
+        // at most the next finite page. Never reserve/reallocate all retained text.
         let free = self
             .chunks
             .last()
@@ -166,8 +181,9 @@ impl ReferenceLabel {
         quota
             .admit_metadata(capacity + directory)
             .map_err(Error::Window)?;
-        // 不reserve/realloc已持有的identifier字节。目录只移动小句柄，并按真的新目录
-        // 容量及移动长度计账；这与URL输出的有限页拥有责任一致，绝不藏一次大复制。
+        // Grow only the directory of small page handles. Report its actual new
+        // capacity and moved handle bytes separately; no large identifier-text
+        // copy is hidden inside directory replacement.
         let mut directory_moved = 0;
         let mut directory_allocated = 0;
         if directory != 0 {
@@ -189,15 +205,17 @@ impl ReferenceLabel {
             self.chunks.push(chunk);
         }
         if allocated + directory_allocated > capacity + directory {
-            // allocator若给出更大真实capacity，额外容量也必须准入，不能只记请求值。
+            // Admit allocator-provided excess capacity too; the requested page
+            // size alone is not the actual retained allocation fact.
             quota
                 .admit_metadata(allocated + directory_allocated - capacity - directory)
                 .map_err(Error::Window)?;
         }
         self.len += bytes.len();
         self.decoded = step.complete;
-        // 实际借片、共享scanner消费、输出复制和UTF8验证各报自己的事实；scanner可能
-        // 只用到frame前缀，故source_bytes不能退化为work.byte_reads来漏掉真实尾部I/O。
+        // Report borrowed bytes, scanner consumption, copied output and UTF-8
+        // validation independently. The scanner may consume only a frame prefix,
+        // so its byte_reads cannot stand in for the entire actual leased slice.
         Ok(SemanticWork {
             source_bytes,
             source_tree_steps: tree,

@@ -1,4 +1,5 @@
-//! 原格式栏的真实原生装配；只保留固定动作控件，不读取正文或管理第二份编辑状态。
+//! Assemble the existing format strip from actual Native controls. Fixed actions
+//! neither read document text nor own another editing state.
 
 use super::*;
 use objc2_app_kit::{
@@ -13,7 +14,8 @@ const HORIZONTAL_PADDING: f64 = 8.0;
 const SIDE_PADDING: f64 = 12.0;
 const GAP: f64 = 2.0;
 
-/// 原横滚格式栏保留日常编辑动作和顺序；既有 tag 不重编号，也不为已删除动作保留别名。
+/// Preserve everyday actions and their established horizontal order. Existing
+/// action tags stay stable, without aliases for actions that have been removed.
 const BUTTONS: &[(isize, &str, &str, Option<&str>)] = &[
     (3, "附件", "导入附件并在原光标处插入链接", Some("paperclip")),
     (100, "标题一", "一级标题", None),
@@ -39,8 +41,9 @@ const BUTTONS: &[(isize, &str, &str, Option<&str>)] = &[
     (115, "分隔线", "插入分隔线", Some("minus")),
 ];
 
-/// 构造唯一横向格式区，将按钮交回原controls所有者；返回根控件只供已有页眉布局观察。
-/// content视图树持有scroll/content，原controls保活实际按钮直到统一detach，均不持Doc或闭包。
+/// Install the sole horizontal strip and return its root to the existing header
+/// layout. The content tree owns scroll/content and the original controls owner
+/// retains buttons until unified detach; none retain a document or callback closure.
 pub(super) fn install(
     controller: &NativeMarkdownController,
     content_root: &NSView,
@@ -49,7 +52,8 @@ pub(super) fn install(
     has_document: bool,
     mtm: MainThreadMarker,
 ) -> Retained<NSScrollView> {
-    // 施工中的窄根只触发原生横滚装配；页眉在发布窗口前写入唯一真实frame，不靠弹簧再布局。
+    // Construction's narrow root initializes Native horizontal scrolling. The
+    // original header supplies the actual frame before the window is published.
     let scroll = NSScrollView::initWithFrame(
         NSScrollView::alloc(mtm),
         NSRect::new(NSPoint::ZERO, NSSize::new(1.0, HEIGHT)),
@@ -65,15 +69,18 @@ pub(super) fn install(
         NSRect::new(NSPoint::ZERO, NSSize::new(1.0, HEIGHT)),
     );
 
-    // SAFETY: AppKit固定字体权重常量在进程内始终有效，只用于这些静态短标签的标准字体。
+    // SAFETY: AppKit's immutable font-weight constant is valid for the process
+    // lifetime and is used only for these finite static labels.
     let weight = unsafe { NSFontWeightSemibold };
     let font = NSFont::systemFontOfSize_weight(11.0, weight);
-    // 系统符号仅表达原动作，中文标题、说明与无障碍名称始终保留；不会新增格式状态或快捷键。
+    // System symbols represent existing actions while Chinese titles, tooltips,
+    // and accessibility names remain available. No shortcut or format state is added.
     let symbols = NSImageSymbolConfiguration::configurationWithPointSize_weight(13.0, weight);
     let tint = NSColor::colorWithSRGBRed_green_blue_alpha(0.61, 0.65, 0.72, 1.0);
     let mut x = SIDE_PADDING;
     for (index, &(tag, title, explanation, symbol)) in BUTTONS.iter().enumerate() {
-        // SAFETY: 原主线程controller实现固定NSControl action ABI；统一detach先断开这条借用边。
+        // SAFETY: The original main-thread controller implements this fixed
+        // NSControl action ABI; unified detach disconnects the target before release.
         let button = unsafe {
             NSButton::buttonWithTitle_target_action(
                 &NSString::from_str(title),
@@ -90,7 +97,8 @@ pub(super) fn install(
         button.setToolTip(Some(&NSString::from_str(explanation)));
         button.setAccessibilityLabel(Some(&NSString::from_str(explanation)));
         button.setContentTintColor(Some(&tint));
-        // 标题层级继续直接显示中文；常见格式用同一套原生符号，避免窄窗把末端动作藏在屏外。
+        // Heading levels retain Chinese labels. Compact system symbols keep the
+        // everyday format actions usable through the original horizontal viewport.
         button.setFont(Some(&font));
         let image = symbol.and_then(|name| {
             NSImage::imageWithSystemSymbolName_accessibilityDescription(
@@ -102,12 +110,14 @@ pub(super) fn install(
         if let Some(image) = &image {
             button.setImage(Some(image));
             button.setImagePosition(NSCellImagePosition::ImageOnly);
-        } // 系统图像不可取得时，原中文标题仍完整可用；不发布没有名称的空白动作。
+        } // A missing system symbol leaves the original Chinese title usable, never a blank action.
         if index != 0 {
-            // 附件仍保原常驻边框，其他动作只在悬停时显示边框；输入焦点仍属于正文。
+            // Attachments retain their existing permanent border. Other actions
+            // show a hover border while the text client keeps keyboard focus.
             button.setShowsBorderOnlyWhileMouseInside(true);
         }
-        // 只测实际按钮的固定短标题；真实字体宽加原左右8pt，不以字符数估计或读取正文。
+        // Measure only the actual finite button title, using its font and original
+        // horizontal padding. Width never depends on document reads or character counts.
         let width = if image.is_some() {
             MINIMUM_BUTTON_WIDTH
         } else {
@@ -123,13 +133,16 @@ pub(super) fn install(
             .include_control("format.button", &button)
             .expect("固定格式按钮和cell纳入原账本");
         content.addSubview(&button);
+        // Transfer the real button to the existing control owner; it will detach
+        // targets and release the same object with the rest of the editor graph.
         controls.push(button.into_super());
         x += width + GAP;
         if matches!(index, 0 | 3 | 9 | 13) {
-            x += 6.0; // 只用留白区分附件、标题、行内格式、列表和块；原动作顺序与视图所有权不变。
+            x += 6.0; // Separate the established action groups with space, preserving order and owners.
         }
     }
-    // 内容宽由全部真实按钮决定，窄窗只裁切滚动视口；动作不会压缩、折行或被折叠菜单替换。
+    // Actual button widths determine content size. A narrow window clips only
+    // the scroll viewport without squeezing, wrapping, or replacing actions with a menu.
     content.setFrameSize(NSSize::new(x - GAP + SIDE_PADDING, HEIGHT));
     scroll.setDocumentView(Some(&content));
     let clip = scroll.contentView();
@@ -142,6 +155,8 @@ pub(super) fn install(
         ("format.scroller", &*scroller as &AnyObject),
         ("format.content", &*content as &AnyObject),
     ] {
+        // Register actual Native owners with the existing release ledger before
+        // mounting; reaching Rust Drop alone is not a Native deallocation receipt.
         ledger
             .include(role, object)
             .expect("固定格式视图纳入原账本");

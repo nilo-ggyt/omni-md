@@ -1,4 +1,5 @@
-//! 裸Page只逐次执行原NSScrollView动作；等待的仅是同Source真实布局高度，不移动文本选择。
+//! Plain Page actions execute the original NSScrollView operation one at a time.
+//! They wait for actual layout height from the same Source without moving text selection.
 
 use super::*;
 use omni_markdown_core::MarkdownLayoutTextAuthority;
@@ -10,7 +11,8 @@ struct DirectionSegment {
     remaining: usize,
 }
 
-/// 只保原弱输入票、实际滚动来源和有限方向段；不保存事件、正文、Source强引用或Native对象。
+/// Retains the original weak input ticket, scroll authority, and bounded direction runs,
+/// without events, document text, a strong Source claim, or Native objects.
 pub(super) struct PendingPageScroll {
     request: NativeMarkdownPagedSceneRequest,
     pub source: MarkdownLayoutTextAuthority,
@@ -22,6 +24,7 @@ pub(super) struct PendingPageScroll {
 }
 
 impl PendingPageScroll {
+    /// The original owner, epochs, complete Input, and slot identity must all survive.
     fn current(&self, owner: &NativeMarkdownPagedBody) -> bool {
         owner.current_body()
             && owner.serial.get() == self.serial
@@ -38,6 +41,7 @@ impl PendingPageScroll {
                 .is_some_and(|pending| std::ptr::eq(&**pending, self))
     }
 
+    /// This operation may change its own origin, but not the original wrapping domain or height.
     fn same_input_geometry(&self, actual: &NativeMarkdownPagedSceneRequest) -> bool {
         actual.target.is_body(&actual.document)
             && Weak::ptr_eq(&actual.document, &self.request.document)
@@ -48,6 +52,7 @@ impl PendingPageScroll {
             && actual.viewport.size.height == self.request.viewport.size.height
     }
 
+    /// Between operations, an external origin change retires this exact scroll sequence.
     pub(super) fn matches(
         &self,
         owner: &NativeMarkdownPagedBody,
@@ -59,7 +64,8 @@ impl PendingPageScroll {
     }
 
     fn current_native(&self, owner: &NativeMarkdownPagedBody) -> bool {
-        // 原Native动作主动改变origin；Source/Input/宽高仍守原票，外部滚动在下一轮matches撤销。
+        // This Native operation changes origin itself. Preserve original Source/Input/size
+        // authority here; the next matches check detects an external scroll takeover.
         self.current(owner)
             && owner.view().is_ok_and(|view| {
                 view.capture_scene_request()
@@ -70,7 +76,7 @@ impl PendingPageScroll {
 
     fn append(&self, down: bool) -> std::result::Result<(), ViewError> {
         if self.executing.get() {
-            return Err(ViewError::Busy); // 原Native效果尚在栈内，不接受无法确定先后origin的新动作。
+            return Err(ViewError::Busy); // An on-stack Native effect has not established the origin needed to order a new action.
         }
         let mut segments = self.segments.borrow_mut();
         if let Some(last) = segments.back_mut().filter(|last| last.down == down) {
@@ -78,16 +84,17 @@ impl PendingPageScroll {
                 .remaining
                 .checked_add(1)
                 .ok_or(ViewError::CounterExhausted)?;
-            last.remaining = remaining; // 溢出先拒绝，原已接受次数保持不变；长按同方向不占新段。
+            last.remaining = remaining; // Reject overflow before mutation; repeated direction uses no additional run slot.
         } else {
             if segments.len() == MAX_DIRECTION_SEGMENTS {
-                return Err(ViewError::Busy); // 方向段满明确拒绝，不接受后丢掉反向或重排次序。
+                return Err(ViewError::Busy); // Reject a full run queue without dropping admitted reverse actions or reordering them.
             }
             segments.push_back(DirectionSegment { down, remaining: 1 });
         }
         Ok(())
     }
 
+    /// Only the next admitted direction determines whether more lower layout is required.
     pub(super) fn needs_next_page(&self) -> bool {
         self.segments
             .borrow()
@@ -97,12 +104,13 @@ impl PendingPageScroll {
 }
 
 impl NativeMarkdownPagedBody {
+    /// Admit against the existing Producer and original Native request, without another Source.
     pub(super) fn accept_page_scroll(
         &self,
         actual: &NativeMarkdownPagedSceneRequest,
         down: bool,
     ) -> Result<()> {
-        self.find_source_health()?; // 普通前台撤权不能掩盖原Source已经存在的I/O首错。
+        self.find_source_health()?; // Ordinary foreground revocation cannot hide the original Source's first I/O failure.
         let previous = self.pending_page_scroll.borrow().clone();
         if let Some(previous) = previous.as_ref() {
             if previous.executing.get() {
@@ -120,7 +128,7 @@ impl NativeMarkdownPagedBody {
             slot.as_ref()
                 .ok_or(ViewError::Pending)?
                 .target_source_authority(actual, serial)?
-        }; // 只借已存在Producer；没有原Source时明确Pending，不捕第二正文补票。
+        }; // Borrow the existing Producer only; absent Source remains Pending instead of acquiring another document.
         if !self.current_body()
             || !actual.target.is_body(&actual.document)
             || !Weak::ptr_eq(&actual.document, &self.input.document_identity())
@@ -136,7 +144,7 @@ impl NativeMarkdownPagedBody {
         }
         drop(self.pending_vertical.borrow_mut().take());
         drop(self.selection_reveal.borrow_mut().take());
-        self.revoke_source_target(); // 纯滚动是新的视口意图，旧Find/选择reveal不能把它拉回原caret。
+        self.revoke_source_target(); // New scroll intent supersedes old Find/selection reveal so it cannot pull the viewport back.
         self.pending_page_scroll
             .replace(Some(Rc::new(PendingPageScroll {
                 request: actual.clone(),
@@ -148,21 +156,23 @@ impl NativeMarkdownPagedBody {
                 executing: Cell::new(false),
             })));
         let old_scene = self.scene.borrow_mut().take();
-        drop(old_scene); // 原业务Scene立即撤销，未完成旧像素不能充当滚动最终帧；Native旧完整图仍可显示。
+        drop(old_scene); // Revoke the business Scene; an old unfinished candidate cannot finish this scroll, while the prior complete image may remain visible.
         self.schedule()
     }
 
+    /// Actual editing, wrapping changes, or external scrolling revoke the old sequence.
     pub(super) fn refresh_page_scroll(&self, actual: &NativeMarkdownPagedSceneRequest) {
         let pending = self.pending_page_scroll.borrow().clone();
         if pending
             .as_ref()
             .is_some_and(|pending| !pending.matches(self, actual))
         {
-            drop(self.pending_page_scroll.borrow_mut().take()); // 编辑、宽度、外部scroll或新owner接管后不重签旧队列。
+            drop(self.pending_page_scroll.borrow_mut().take()); // Never renew the old queue after input, width, scroll, or owner takeover.
         }
     }
 
-    /// 每轮最多一个已经接受的方向；次数在Native前消费，失败也绝不重放潜在已发生的滚动。
+    /// Execute at most one admitted direction per turn. Consume its count before Native
+    /// entry so failure cannot replay a scroll whose external effect may already have occurred.
     pub(super) fn consume_page_scroll(&self, pending: &Rc<PendingPageScroll>) -> Result<()> {
         let actual = self.view()?.capture_scene_request()?;
         if !pending.matches(self, &actual) {
@@ -181,7 +191,7 @@ impl NativeMarkdownPagedBody {
         let viewport = self.viewport.borrow().clone().ok_or(ViewError::Closed)?;
         pending.executing.set(true);
         let result = viewport.scroll_page(down, &|| pending.current_native(self));
-        pending.executing.set(false); // 所有RefCell借用已结束才进Native，返回先结束执行期再处理原错误。
+        pending.executing.set(false); // All RefCell borrows ended before Native; end execution ownership before handling its result.
         pending.origin.set(result?);
         if pending.segments.borrow().is_empty() {
             let mut slot = self.pending_page_scroll.borrow_mut();
@@ -189,9 +199,9 @@ impl NativeMarkdownPagedBody {
                 .as_ref()
                 .is_some_and(|actual| Rc::ptr_eq(actual, pending))
             {
-                slot.take(); // 只归还自己的队列，旧回调不能取走后继请求。
+                slot.take(); // Remove only this queue; an old callback cannot take a successor request.
             }
         }
-        self.schedule() // 即使真实EOF空操作也一轮一次；后继动作不能在单回调中成千次阻塞主线程。
+        self.schedule() // Even a real EOF no-op yields; repeated successors cannot monopolize one main-thread callback.
     }
 }

@@ -188,13 +188,19 @@ impl NativeMarkdownPagedFindRevealRequest {
     }
 
     #[must_use]
-    #[cfg(feature = "native-markdown-runtime-probe")]
+    #[cfg(all(
+        feature = "native-paged-body-probe",
+        feature = "native-markdown-runtime-probe"
+    ))]
     pub(in crate::native_surface) fn pending(&self) -> bool {
         self.terminal.get() == Terminal::Pending
     }
 
     #[must_use]
-    #[cfg(feature = "native-markdown-runtime-probe")]
+    #[cfg(all(
+        feature = "native-paged-body-probe",
+        feature = "native-markdown-runtime-probe"
+    ))]
     pub(in crate::native_surface) fn cancelled(&self) -> bool {
         self.terminal.get() == Terminal::Cancelled
     }
@@ -216,7 +222,10 @@ impl NativeMarkdownPagedFindRevealRequest {
         self.document.clone()
     }
     #[must_use]
-    #[cfg(feature = "native-markdown-runtime-probe")]
+    #[cfg(all(
+        feature = "native-paged-body-probe",
+        feature = "native-markdown-runtime-probe"
+    ))]
     pub(in crate::native_surface) fn completed_visible(&self) -> bool {
         self.terminal.get() == Terminal::Visible
     }

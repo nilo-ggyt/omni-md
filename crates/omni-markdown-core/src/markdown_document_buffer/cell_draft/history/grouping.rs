@@ -1,16 +1,19 @@
-//! 连续输入只合并原输入serial下的实际替换；旧入口、选区移动和显式断点不能补回先前分组。
+//! Coalesce only actual replacements under the original input serial. Ungrouped
+//! input, selection moves and explicit breaks cannot renew an earlier group.
 
 use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 由适配器在读取Native载荷之前固定；Isolated不推断粘贴或其他尚未差分的合并边界。
+/// Fixed by the adapter before reading native payload. Isolated does not infer
+/// coalescing boundaries for paste or other input not represented as proven typing.
 pub enum MarkdownCellDraftInputKind {
     Typing,
     Marked,
     Isolated,
 }
 
-/// 原nonce/serial的一次输入意图；不可Clone，原编辑胶囊仍须独立按值消费。
+/// One input intent bound to the original nonce/serial. It cannot be cloned; the
+/// original edit capsule must still be consumed independently by value.
 pub struct MarkdownCellDraftInputIntent {
     scope: Weak<Scope>,
     serial: u64,
@@ -32,7 +35,8 @@ impl MarkdownCellDraftInputIntent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 原局部栈的真实可用性；不查询或创建Native UndoManager，不签发正文编辑许可。
+/// Actual local-stack availability, without querying/creating a native UndoManager
+/// or granting canonical text-edit permission.
 pub struct MarkdownCellDraftHistoryFacts {
     pub can_undo: bool,
     pub can_redo: bool,
@@ -88,7 +92,7 @@ pub(in crate::markdown_document_buffer::cell_draft) fn validate_input_kind(
         MarkdownCellDraftInputKind::Typing if marked_after.is_some() => {
             Err(MarkdownCellDraftError::InvalidInputIntent)
         }
-        _ => Ok(()), // Isolated保留旧合法范围规则，不从字符串内容猜用户的输入来源。
+        _ => Ok(()), // Isolated keeps the entry's valid-range rule; text content does not reveal the user's input origin.
     }
 }
 
@@ -114,6 +118,8 @@ impl LocalHistory {
         let old = self.group.as_ref().filter(|group| {
             group.serial == change.serial && self.redo.is_empty() && !self.undo.is_empty()
         });
+        // Typing extends only an adjacent insertion whose before/after carets
+        // agree with the actual edit. A moved selection or redo branch breaks it.
         let merge_typing = matches!(change.kind, Some(MarkdownCellDraftInputKind::Typing))
             && change.marked_before.is_none()
             && change.marked_after.is_none()
@@ -128,6 +134,8 @@ impl LocalHistory {
             change.kind,
             Some(MarkdownCellDraftInputKind::Marked | MarkdownCellDraftInputKind::Typing)
         ) && old.is_some_and(|group| {
+            // Marked input merges only when it replaces the same complete active
+            // composition span, including the final ordinary-typing commit.
             matches!(group.kind, GroupKind::Marked)
                 && change.marked_before.as_ref() == Some(&group.span)
                 && metrics.location == group.span.start
@@ -141,7 +149,7 @@ impl LocalHistory {
                     .checked_add(metrics.inserted_utf16_length)
                     .ok_or(MarkdownDocumentBufferError::DocumentTooLarge)?
             } else {
-                metrics.inserted_utf16_length // marked始终替换原完整组合范围，不能累计旧候选长度。
+                metrics.inserted_utf16_length // Marked input replaces the full span; old candidate lengths must not accumulate.
             };
             MarkdownReplacementMetrics::new(
                 previous.location,
@@ -170,7 +178,7 @@ impl LocalHistory {
                     span: replacement.location..end,
                 })
             }
-            _ => None, // 完成组合后不猜后续IME/粘贴的合并策略；原四组事务已经完整保留。
+            _ => None, // After composition ends, do not guess a later IME/paste policy or reopen an earlier transaction.
         };
         Ok(GroupPlan {
             merge: merge_typing || merge_marked,
@@ -185,7 +193,7 @@ impl LocalHistory {
         plan: &GroupPlan,
     ) -> Result<(), MarkdownDocumentBufferError> {
         if !plan.merge {
-            self.reserve_edit()?; // 合并只改已有末项；新组仍先预留原128项预算内的历史槽。
+            self.reserve_edit()?; // A merge updates the existing tail; a new group first reserves within the 128-entry history limit.
         }
         Ok(())
     }
@@ -199,9 +207,10 @@ impl LocalHistory {
         if plan.merge {
             let previous = self.undo.back_mut().expect("已预检原组末项");
             previous.replacement = plan.replacement;
-            // 连续输入的root前态不变，后态选区必须随真实最后一次输入更新，不能取后来移动的选区。
+            // Preserve the group's first root, but update its opposite selection
+            // from actual final input, never from a later unrelated caret move.
             previous.counterpart_selection = plan.counterpart_selection;
-            drop(root); // 中间候选不进入历史；仍有Frozen owner的共享叶由其实际生命周期保留。
+            drop(root); // Intermediate roots stay out of history; actual Frozen owners still retain their shared leaves as needed.
         } else {
             self.record(root, selection, plan.replacement);
             self.undo
@@ -214,7 +223,8 @@ impl LocalHistory {
 }
 
 impl MarkdownDocumentBuffer {
-    /// 与原编辑胶囊绑定一次输入类别；不同nonce或后继serial不能替旧Native载荷补签。
+    /// Bind one input kind to the original edit capsule. Another nonce or successor
+    /// serial cannot renew authority for an old native payload.
     pub fn capture_cell_draft_input_intent(
         &self,
         edit: &edit::MarkdownCellDraftEditCapsule,
@@ -228,7 +238,8 @@ impl MarkdownDocumentBuffer {
         })
     }
 
-    /// 只读本草稿历史；有marked时保留原栈事实，实际Undo仍须先沿原context完成unmark。
+    /// Read this draft's history only. Marked input does not hide stack facts, but
+    /// actual Undo still requires unmark through the original input context first.
     pub fn cell_draft_history_facts(
         &self,
         token: &MarkdownCellDraft,

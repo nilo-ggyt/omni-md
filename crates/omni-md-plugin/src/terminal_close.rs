@@ -29,9 +29,7 @@ impl TerminalWindowFacts {
     pub(crate) fn verify(self) -> Result<FrameworkWindowLeaseReceipt, &'static str> {
         if !self.close_notified || self.project_owner_present {
             // Visibility alone cannot prove the real close callback occurred or the unique owner ended.
-            return Err(
-                "The Markdown terminal close callback or project-owner release is incomplete",
-            );
+            return Err("笔记关闭回调或项目资源释放尚未完成");
         }
         if self.visible
             || self.key
@@ -42,7 +40,7 @@ impl TerminalWindowFacts {
             || self.sheet_attached
         {
             // Any native payload, routing edge or visible/key state exceeds the sole permitted empty-shell lease.
-            return Err("The Markdown terminal panel is not closed and detached");
+            return Err("笔记窗口尚未关闭或仍有关联资源");
         }
         Ok(FrameworkWindowLeaseReceipt {
             framework_panel_pending: self.panel_present,

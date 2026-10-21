@@ -64,7 +64,8 @@ fn text(document: &MarkdownDocumentBuffer) -> String {
 /// Every command matches the original editor's text and UTF-16 selection over diverse primary ranges.
 #[test]
 fn matches_original_editor_differential_corpus() {
-    // 保留动作的预期仍取自原编辑器真实输出；已删除的公式与上标动作不再属于产品契约。
+    // Retained commands use the original editor's actual recorded output.
+    // Removed formula/superscript commands are outside the current product contract.
     let corpus: ReferenceCorpus =
         serde_json::from_str(include_str!("reference_cases.json")).unwrap();
     assert_eq!(

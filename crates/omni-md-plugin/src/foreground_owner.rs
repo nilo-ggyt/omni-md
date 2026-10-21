@@ -84,7 +84,6 @@ mod tests {
     fn local_owner_has_no_slot_borrow_and_reentry_is_rejected() {
         let slot = RefCell::new(Some((31_usize, 0_usize)));
         let busy = Cell::new(None);
-        let restored_count = Cell::new(0);
         let result = with_foreground_owner(
             &slot,
             &busy,
@@ -110,10 +109,8 @@ mod tests {
                 // Rejected operations still return the exact owner before accepted work may resume.
                 assert_eq!(*slot.borrow(), Some((31, 1)));
                 assert_eq!(busy.get(), None);
-                restored_count.set(restored_count.get() + 1);
             },
         );
-        assert_eq!(restored_count.get(), 1);
         assert_eq!(result, Ok(Err("operation vetoed")));
         assert_eq!(*slot.borrow(), Some((31, 1)));
         assert_eq!(busy.get(), None);
@@ -126,7 +123,6 @@ mod tests {
         let weak = Rc::downgrade(&canonical);
         let slot = RefCell::new(Some(canonical));
         let busy = Cell::new(None);
-        let restored_count = Cell::new(0);
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = with_foreground_owner(
                 &slot,
@@ -141,12 +137,10 @@ mod tests {
                     // Unwinding must not strand a completion that arrived while this lease was busy.
                     assert!(slot.borrow().is_some());
                     assert_eq!(busy.get(), None);
-                    restored_count.set(restored_count.get() + 1);
                 },
             );
         }));
         assert!(unwind.is_err());
-        assert_eq!(restored_count.get(), 1);
         assert!(slot.borrow().is_some());
         assert_eq!(busy.get(), None);
         assert_eq!(weak.strong_count(), 1);

@@ -10,7 +10,7 @@ use streaming::{prepare_dense_line_prefix, scan_heading_whitespace};
 /// Shared-marker insertion is finite; dense selections use a chunked canonical replacement instead.
 const MAX_SPARSE_PREFIX_LINES: usize = 4096;
 
-/// 日常编辑动作只提供具有完整正文与预览语义的格式；不生成缺少排版实现的公式或上标模板。
+/// Offer everyday formats with implemented source/preview semantics, without unsupported formula or superscript templates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownFormatAction {
     Bold,
@@ -33,16 +33,16 @@ pub enum MarkdownFormatAction {
 
 impl MarkdownFormatAction {
     #[must_use]
-    /// 正文与已验证单格共用行内源标记和空选区占位文字；块命令不具有格内包裹语义。
+    /// Share inline markers/placeholders between Body and verified Cell; block commands have no cell-wrapping semantics.
     pub fn inline_markers(self) -> Option<(&'static str, &'static str, &'static str)> {
         match self {
-            Self::Bold => Some(("**", "**", "加粗文字")), // 保留既有加粗分隔符与占位文字。
-            Self::Italic => Some(("*", "*", "斜体文字")), // 不额外解释或切换已有标记。
-            Self::Underline => Some(("<u>", "</u>", "下划线文字")), // 下划线继续使用 canonical HTML。
-            Self::Strikethrough => Some(("~~", "~~", "删除线文字")), // GFM 成对波浪线。
-            Self::InlineCode => Some(("`", "`", "code")),           // 空 caret 保留原 code 占位。
-            Self::Link => Some(("[", "](https://)", "链接文字")),   // URL 模板不进入标签选区。
-            _ => None, // 标题、列表与模板保持各自正文块计划，不伪造表格行内表达。
+            Self::Bold => Some(("**", "**", "加粗文字")), // Preserve the original delimiter and placeholder.
+            Self::Italic => Some(("*", "*", "斜体文字")), // Do not reinterpret or toggle existing source markers.
+            Self::Underline => Some(("<u>", "</u>", "下划线文字")), // Underline keeps canonical HTML markers.
+            Self::Strikethrough => Some(("~~", "~~", "删除线文字")), // GFM uses paired tilde runs.
+            Self::InlineCode => Some(("`", "`", "code")), // An empty caret keeps the original code placeholder.
+            Self::Link => Some(("[", "](https://)", "链接文字")), // Exclude the URL template from label selection.
+            _ => None, // Headings/lists/templates retain their Body block plans, not a fabricated cell-inline form.
         }
     }
 }
@@ -95,13 +95,16 @@ impl MarkdownDocumentBuffer {
             .map_err(changes::legacy_error)
     }
 
-    /// 格式化保留真实插入/替换边界，不能把两侧Surround误当覆盖中间正文的一项替换。
+    /// Preserve actual insert/replace boundaries; two Surround insertions do not replace the selected middle text.
     pub fn apply_format_observed<O: MarkdownTextChangeObserver>(
         &mut self,
         action: MarkdownFormatAction,
         selection: MarkdownTextSelection,
         observer: O,
     ) -> Result<(MarkdownHistoryTextEdit, O::Output), MarkdownObservedEditError<O::Error>> {
+        // Validate the original directed scalar selection before preparing any
+        // marker storage. The shared transaction owns journal, observer, rollback
+        // and one history publication; no later capture may replace this selection.
         self.ensure_text_input_idle()?;
         self.validate_selection(selection)?;
         let plan = self.plan_format(action, selection)?;
@@ -131,7 +134,8 @@ impl MarkdownDocumentBuffer {
         };
         match action {
             Bold | Italic | Underline | Strikethrough | InlineCode | Link => {
-                // 正文与单格消费同一组日常行内标记，不为菜单另存模板或生成不可预览的语法。
+                // Body and Cell consume the same original inline marker contract;
+                // the menu owns no parallel template table or unsupported syntax.
                 let (opening, closing, placeholder) = action
                     .inline_markers()
                     .expect("行内格式分支必须具有领域标记");
@@ -348,13 +352,15 @@ impl FormatPlan {
                 placeholder,
             } => {
                 if let Some(placeholder) = placeholder {
-                    // 空选区模板是一项真实插入；不构造三项重叠的伪替换。
+                    // An empty-selection template is one actual insertion, not
+                    // three overlapping fictional replacement notifications.
                     let inserted = opening.encode_utf16().count()
                         + placeholder.encode_utf16().count()
                         + closing.encode_utf16().count();
                     changes::emit(document, observer, range.clone(), inserted)?;
                 } else {
-                    // 非空选区仅两端插入，中间原文与其中fold保持独立。
+                    // A nonempty selection inserts only at its two original
+                    // endpoints, preserving middle text and any independent folds.
                     changes::emit(
                         document,
                         observer,
@@ -406,7 +412,9 @@ impl FormatPlan {
                     let root = prepare_dense_line_prefix(document, first, last, prefix, observer)?;
                     return Ok((root, selection_after));
                 }
-                // 稀疏行数已有4096上限；先升序发真实插入，随后仍沿旧算法倒序组树。
+                // The sparse branch already has a 4096-line bound. Emit actual
+                // insertions in ascending order, then build its tree in reverse
+                // so every structural insertion still uses original coordinates.
                 for line in first..=last {
                     let at =
                         document.utf16_offset_for_byte(document.byte_offset_for_line(line)?)?;

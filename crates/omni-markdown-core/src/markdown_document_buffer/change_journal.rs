@@ -1,7 +1,10 @@
-//! 文档自有的真实变化日志；常见两项以内无I/O，多项仅用32KiB页缓冲和有限页身份表。
+//! The document owns its change journal. Up to two records stay inline; larger
+//! commands use one 32 KiB page buffer and a fixed table of page owners.
 //!
-//! 文件只存旧坐标及删除/插入长度，不含正文。所有页在提交前均属于本次候选；失败可释放，
-//! 成功后历史仅保小型页票据。原root/正文仍由现有piece tree和session source拥有。
+//! Disk records contain old coordinates and removed/inserted lengths, never text.
+//! Candidate pages can be reclaimed on failure; committed history retains only
+//! their small, non-cloneable receipt. The existing piece tree and session Source
+//! continue to own the original root and actual document bytes.
 
 use std::fs::File;
 use std::io;
@@ -19,7 +22,8 @@ const NO_PAGE: u32 = u32::MAX;
 const MAGIC: &[u8; 8] = b"OMNICHG1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 只保留有限系统分类与数值码；不保存系统英文、路径、正文或分配式io::Error。
+/// Preserve the finite I/O classification and errno without retaining an error
+/// allocation, system message, path, or document content.
 pub struct MarkdownChangeJournalIoFailure {
     pub kind: io::ErrorKind,
     pub raw_os_error: Option<i32>,
@@ -35,7 +39,8 @@ impl From<io::Error> for MarkdownChangeJournalIoFailure {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-/// 匿名日志错误不携带正文、路径或系统英文；调用方不得把I/O失败解释成成功提交。
+/// Anonymous journal failures carry no content or paths. A caller must propagate
+/// them through the command transaction rather than publish partial history.
 pub enum MarkdownChangeJournalError {
     #[error("变化日志状态无效")]
     InvalidState,
@@ -64,7 +69,8 @@ pub(super) struct Record {
     pub(super) inserted: usize,
 }
 
-/// 票据只在本document内部移动；不能Clone后让同一页被两个history重复释放。
+/// Move this receipt only inside its document. Keeping it non-Clone prevents two
+/// history entries from independently releasing the same journal pages.
 pub(super) struct Entry {
     old_length: usize,
     new_length: usize,
@@ -72,7 +78,8 @@ pub(super) struct Entry {
 }
 
 impl Entry {
-    /// 同一组合的净替换只有一条实际变化；直接保inline记录，不为合并重新借正文或建立日志FD。
+    /// A composition group's net replacement needs one inline record. Merging it
+    /// neither borrows document bytes again nor opens a journal file.
     pub(super) fn single_replacement(
         old_length: usize,
         record: Record,
@@ -133,11 +140,13 @@ pub(super) enum Fault {
     Truncate,
 }
 
-/// 唯一FD只属于文档；固定64KiB页身份表与匹配数量无关，首次第三项变化才取得它们。
+/// The document owns the only FD and fixed 64 KiB owner table. Both are acquired
+/// only when a command reaches its third record; neither grows with match count.
 pub(super) struct ChangeJournal {
     file: Option<File>,
     owners: Option<Box<[u64; PAGE_COUNT]>>,
-    // 写入尝试可触及的extent上界；普通inline事务不为checkpoint执行stat或其他I/O。
+    // Track the extent a write attempt may have touched. Inline checkpoints need
+    // no stat or other I/O, and a failed partial write still has a cleanup bound.
     possible_extent: u64,
     next_id: u64,
     pending: Option<Pending>,
@@ -164,9 +173,11 @@ impl Default for ChangeJournal {
 impl ChangeJournal {
     #[cfg(test)]
     pub(super) fn fail_next(&self, fault: Fault) {
-        self.fault.set(Some(fault)); // 测试只注入一次，生产没有此入口或额外分支。
+        self.fault.set(Some(fault)); // This existing one-shot injection is absent from production builds.
     }
 
+    /// Start the sole candidate without changing any live history page. The saved
+    /// extent belongs to abort, so later writes cannot lose their truncation point.
     pub(super) fn begin(&mut self, old_length: usize) -> Result<(), MarkdownChangeJournalError> {
         if self.pending.is_some() {
             return Err(MarkdownChangeJournalError::InvalidState);
@@ -193,7 +204,7 @@ impl ChangeJournal {
 
     pub(super) fn push(&mut self, record: Record) -> Result<(), MarkdownChangeJournalError> {
         if let Some(error) = self.pending.as_ref().and_then(|pending| pending.failure) {
-            return Err(error); // 错误后的输入不能修补成另一个可提交journal。
+            return Err(error); // Later records cannot repair a failed candidate into a different journal.
         }
         let result = self.push_inner(record);
         if let Err(error) = result
@@ -219,10 +230,11 @@ impl ChangeJournal {
                 Self::buffer_record(pending, record)?;
                 true
             } else {
-                false // 只有升级或页满需要取得journal文件/页目录的独占访问。
+                false // Only promotion or a full page needs exclusive access to the file and page directory.
             };
             if buffered {
-                // 高频记录只改当前字段，不逐match搬移Sha256状态、整份Pending或任何正文。
+                // Common records update the current fields in place. They do not
+                // move the hash, whole Pending value, or document bytes per match.
                 pending.records = pending
                     .records
                     .checked_add(1)
@@ -232,7 +244,8 @@ impl ChangeJournal {
                 return Ok(());
             }
         }
-        // 暂取候选结束字段借用，再操作唯一文件；任何失败仍把候选放回供统一abort释放。
+        // End the field borrow before touching the unique file. Restore Pending
+        // even on failure so the owning transaction can abort all candidate pages.
         let mut pending = self
             .pending
             .take()
@@ -257,7 +270,8 @@ impl ChangeJournal {
             pending.inline[pending.records] = record;
         } else {
             if pending.id.is_none() {
-                // 升级发生在第三项之前；普通键入/两侧Surround不创建FD或64KiB页目录。
+                // Promote immediately before the third record. Ordinary typing
+                // and two-sided Surround edits need neither the FD nor owner table.
                 self.ensure_file()?;
                 let id = self.next_id;
                 self.next_id = id
@@ -302,7 +316,8 @@ impl ChangeJournal {
         {
             return Err(MarkdownChangeJournalError::AnonymousIdentityRejected);
         }
-        // 私有匿名身份核准后才分配页目录；失败局部File自然close，没有可留下的命名文件。
+        // Allocate the directory only after verifying the actual anonymous 0600
+        // file. A rejected local File drops without leaving a named artifact.
         self.owners = Some(Box::new([0; PAGE_COUNT]));
         self.file = Some(file);
         Ok(())
@@ -310,7 +325,7 @@ impl ChangeJournal {
 
     fn allocate_page(&mut self, id: u64) -> Result<u32, MarkdownChangeJournalError> {
         if self.page_limit > PAGE_COUNT {
-            return Err(MarkdownChangeJournalError::BudgetExceeded); // 私有测试缩小容量不能扩大真实硬边界。
+            return Err(MarkdownChangeJournalError::BudgetExceeded); // A reduced test capacity cannot enlarge the real hard limit.
         }
         let owners = self
             .owners
@@ -320,7 +335,8 @@ impl ChangeJournal {
             .iter()
             .position(|owner| *owner == 0)
             .ok_or(MarkdownChangeJournalError::BudgetExceeded)?;
-        // 分配前已检查固定页上限；候选绝不覆盖当前undo/redo仍拥有的页。
+        // Only an unowned slot can be assigned. A candidate cannot overwrite any
+        // page still owned by the current undo or redo history.
         owners[page] = id;
         Ok(page as u32)
     }
@@ -331,6 +347,8 @@ impl ChangeJournal {
         record: Record,
     ) -> Result<(), MarkdownChangeJournalError> {
         if pending.page_records == RECORDS_PER_PAGE {
+            // Reserve the successor before linking the full page. If flushing
+            // fails, its owner ID still lets abort reclaim both reservations.
             let next =
                 self.allocate_page(pending.id.ok_or(MarkdownChangeJournalError::InvalidState)?)?;
             self.flush_page(pending, next)?;
@@ -345,6 +363,8 @@ impl ChangeJournal {
         pending: &mut Pending,
         record: Record,
     ) -> Result<(), MarkdownChangeJournalError> {
+        // The caller has reserved one slot in this page. Fixed-width integers
+        // encode coordinates only; no root, pointer, or text enters the file.
         let at = HEADER_BYTES + pending.page_records * RECORD_BYTES;
         let scratch = pending
             .scratch
@@ -385,16 +405,19 @@ impl ChangeJournal {
         #[cfg(test)]
         self.check_fault(Fault::Write)
             .map_err(|error| MarkdownChangeJournalError::WriteUnavailable(error.into()))?;
-        // 页号只能来自固定owner目录；整个pwrite范围先于I/O验证，文件物理extent不会越过硬预算。
+        // Page numbers come only from the fixed owner table. Validate the entire
+        // pwrite extent before I/O so disk growth stays within the session limit.
         let offset = u64::from(pending.current) * PAGE_BYTES as u64;
         if offset + PAGE_BYTES as u64 > MAX_JOURNAL_BYTES as u64 {
             return Err(MarkdownChangeJournalError::BudgetExceeded);
         }
-        // 即便write_all_at部分写入后失败，abort也知道必须截回哪个上界；不把失败当成零写入。
+        // Record possible growth before writing: write_all_at may fail after
+        // touching part of the page, and abort must not assume zero bytes changed.
         self.possible_extent = self.possible_extent.max(offset + PAGE_BYTES as u64);
         #[cfg(test)]
         if self.fault.get() == Some(Fault::PartialWrite) {
-            // 真实pwrite部分页后报错，检验abort并非假定失败等于零字节写入；仅测试可达。
+            // This existing test-only path writes a real partial page before
+            // reporting failure, exercising cleanup of an actually touched file.
             self.fault.set(None);
             self.file
                 .as_ref()
@@ -410,12 +433,16 @@ impl ChangeJournal {
             .ok_or(MarkdownChangeJournalError::InvalidState)?
             .write_all_at(scratch.as_slice(), offset)
             .map_err(|error| MarkdownChangeJournalError::WriteUnavailable(error.into()))?;
+        // Hash only occupied record bytes after the complete page write succeeds.
+        // The final receipt verifies logical history independently of page slack.
         pending
             .hash
             .update(&scratch[HEADER_BYTES..HEADER_BYTES + pending.page_records * RECORD_BYTES]);
         Ok(())
     }
 
+    /// Seal exactly the command's resulting length. A failed final write keeps
+    /// Pending available for the original checkpoint's abort; no receipt escapes.
     pub(super) fn finish(
         &mut self,
         new_length: usize,
@@ -426,7 +453,7 @@ impl ChangeJournal {
             .ok_or(MarkdownChangeJournalError::InvalidState)?;
         let result = (|| {
             if let Some(error) = pending.failure {
-                return Err(error); // 即便调用方误忽略push错误，最终完成也绝不发布部分记录。
+                return Err(error); // Ignoring an earlier push failure cannot publish a partial journal.
             }
             let expected = pending
                 .new_cursor
@@ -457,11 +484,13 @@ impl ChangeJournal {
             })
         })();
         if result.is_err() {
-            self.pending = Some(pending); // 最后一页失败仍必须由原checkpoint统一回收。
+            self.pending = Some(pending); // The original checkpoint still owns cleanup after a final-page failure.
         }
         result
     }
 
+    /// Revoke only this candidate's pages. Older history remains live; truncate
+    /// only newly touched file extent when those older owners keep the FD open.
     pub(super) fn abort(&mut self) -> Result<(), MarkdownChangeJournalError> {
         let Some(pending) = self.pending.take() else {
             return Ok(());
@@ -470,7 +499,7 @@ impl ChangeJournal {
             self.free_id(id);
         }
         if self.close_if_empty() {
-            return Ok(()); // 最后一个paged owner已消失，直接close匿名FD，无需可能失败的truncate。
+            return Ok(()); // With no remaining page owner, drop the anonymous FD instead of truncating it.
         }
         if let Some(file) = &self.file
             && self.possible_extent > pending.file_length_before
@@ -490,11 +519,14 @@ impl ChangeJournal {
             self.free_id(id);
             self.close_if_empty();
         }
-        // 提交后回收只改有限纯metadata或close最后FD，不执行可失败的I/O。
-        // 尚有活页时空页留在匿名文件内重用，物理大小始终不超过256MiB。
+        // Committed-history release updates fixed metadata and drops the final
+        // FD without a fallible write/truncate step. While owners remain, freed
+        // pages are reused in the anonymous file, whose extent stays within 256 MiB.
     }
 
     fn free_id(&mut self, id: u64) {
+        // Ownership, not page-chain contents, controls reclamation. Even a failed
+        // flush or unreadable candidate cannot strand its reserved successor.
         if let Some(owners) = &mut self.owners {
             for owner in owners.iter_mut() {
                 if *owner == id {
@@ -510,6 +542,8 @@ impl ChangeJournal {
             .as_ref()
             .is_some_and(|owners| owners.iter().all(|owner| *owner == 0))
         {
+            // No history or pending receipt can still refer to this file. Drop
+            // its sole FD and owner allocation together before resetting extent.
             self.file = None;
             self.owners = None;
             self.possible_extent = 0;
@@ -518,6 +552,9 @@ impl ChangeJournal {
         false
     }
 
+    /// Replay ordered changes, optionally in their resulting-coordinate inverse.
+    /// The observer must keep its output tentative until the whole visit succeeds:
+    /// page-chain, digest, and final-length checks may fail after earlier records.
     pub(super) fn visit<E>(
         &self,
         entry: &Entry,
@@ -530,6 +567,8 @@ impl ChangeJournal {
                 advance_coordinates(entry.old_length, old_cursor, new_cursor, record)
                     .map_err(VisitError::Journal)?;
             let actual = if inverse {
+                // Gaps survive unchanged; the insertion's start in new text is
+                // derived from the same cursors rather than the old raw offset.
                 Record {
                     start: new_end - record.inserted,
                     removed: record.inserted,
@@ -556,6 +595,8 @@ impl ChangeJournal {
                 records,
                 digest,
             } => {
+                // The non-Clone receipt and live owner table must agree before
+                // reading any page. One fixed stack buffer serves the full visit.
                 let owners = self
                     .owners
                     .as_ref()
@@ -589,6 +630,8 @@ impl ChangeJournal {
                         })?;
                     let next = u32_at(&buffer, 16);
                     let count = u32_at(&buffer, 20) as usize;
+                    // Reject a wrong owner/order, partial middle page, or broken
+                    // terminal link before interpreting that page's coordinates.
                     if &buffer[..8] != MAGIC
                         || u64_at(&buffer, 8) != *id
                         || u32_at(&buffer, 24) as usize != index
@@ -613,11 +656,15 @@ impl ChangeJournal {
                     page = next;
                 }
                 let actual: [u8; 32] = hash.finalize().into();
+                // The digest covers all occupied records in order, including a
+                // short final page; matching headers alone cannot seal history.
                 if read_records != *records || actual != *digest {
                     return Err(VisitError::Journal(MarkdownChangeJournalError::Corrupt));
                 }
             }
         }
+        // Unchanged trailing text participates in the command's final length.
+        // A valid record prefix cannot stand in for the sealed full transformation.
         if new_cursor.checked_add(entry.old_length - old_cursor) != Some(entry.new_length) {
             return Err(VisitError::Journal(MarkdownChangeJournalError::Corrupt));
         }
@@ -639,6 +686,8 @@ pub(super) enum VisitError<E> {
     Observer(E),
 }
 
+/// Validate monotonic, non-overlapping old coordinates and derive the matching
+/// new cursor with checked arithmetic before any record is buffered or emitted.
 fn advance_coordinates(
     old_length: usize,
     old: usize,

@@ -1,4 +1,5 @@
-//! 固定草稿作用域只观察真实分支与读取payload退场，不保活文档、树、段或映射。
+//! A fixed draft scope observes actual branch/reader-payload release without
+//! keeping the document, text tree, segments, or mappings alive.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -18,7 +19,8 @@ pub(in crate::markdown_document_buffer) struct Scope {
     delta_bytes: AtomicUsize,
     peak_delta_bytes: AtomicUsize,
     first_source_errno: AtomicI32,
-    // 仅本raw分支新建的实际映射票；空堆编辑不分配Vec库存，继承canonical映射不登记。
+    // Observe only actual mappings created by this raw branch. Empty heap edits
+    // allocate no Vec inventory, and inherited canonical mappings are not registered twice.
     raw_backings: Mutex<Vec<MarkdownOriginalBackingObserver>>,
     first_raw_cleanup_errno: AtomicI32,
     first_candidate_cleanup_errno: AtomicI32,
@@ -52,7 +54,8 @@ impl Scope {
 
     pub(super) fn record_source(&self, error: MarkdownDocumentBufferError) {
         if let MarkdownDocumentBufferError::OriginalBackingUnavailable(errno) = error {
-            // 保存真实首errno；取消、过期或后继成功不能把原I/O失败洗成健康票。
+            // Retain the actual first errno. Cancellation, staleness, or a later
+            // successful operation cannot renew a Source that already failed I/O.
             let _ = self.first_source_errno.compare_exchange(
                 0,
                 errno,
@@ -68,7 +71,8 @@ impl Scope {
             return Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
         }
         if self.cancelled.load(Ordering::Acquire) {
-            // 取消后的不可变字节仍可由旧owner持有，但不再提供输入或布局权限。
+            // An old owner may still hold immutable bytes after cancellation,
+            // but those bytes grant no continued input or layout authority.
             return Err(MarkdownCellDraftError::Stale);
         }
         Ok(())
@@ -85,7 +89,8 @@ impl Scope {
     pub(super) fn require_content(&self, serial: u64) -> Result<(), MarkdownCellDraftError> {
         self.require_live()?;
         if self.content_serial.load(Ordering::Acquire) != serial {
-            // 只撤销旧正文；选区或unmark不会给同一root制造新的布局域。
+            // Revoke only old text. Selection or unmark does not create another
+            // layout domain for the same unchanged root.
             return Err(MarkdownCellDraftError::Stale);
         }
         Ok(())
@@ -95,7 +100,8 @@ impl Scope {
         let mut count = self.read_roots.load(Ordering::Acquire);
         loop {
             if count >= MAX_READ_ROOTS {
-                // 两个实际payload是硬上限；不以追加Vec、丢旧owner或提前释放计数腾位。
+                // Two actual payloads are the hard limit. Do not grow a Vec, drop
+                // another owner, or clear its count early to manufacture a free slot.
                 return Err(MarkdownCellDraftError::ReadersBusy);
             }
             match self.read_roots.compare_exchange_weak(
@@ -105,6 +111,8 @@ impl Scope {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    // The claim, not an external completion flag, returns this
+                    // reserved slot when the final frozen payload actually drops.
                     self.peak_read_roots.fetch_max(count + 1, Ordering::AcqRel);
                     return Ok(ReadClaim(Arc::clone(self)));
                 }
@@ -118,6 +126,8 @@ impl Scope {
     }
 
     pub(super) fn has_retired_owners(&self) -> bool {
+        // A cancelled branch cannot admit canonical writes while any actual
+        // reader, prepared payload, or unconfirmed mapping cleanup remains.
         self.has_readers()
             || self.prepared_commit_live.load(Ordering::Acquire)
             || self.candidate_cleanup_failed.load(Ordering::Acquire)
@@ -131,7 +141,8 @@ impl Scope {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            // 先占唯一名额再创建有限String或匿名输出；不能反复捕获相同serial制造N份准入副本。
+            // Reserve the unique slot before a bounded String or anonymous output
+            // is created. Repeated capture of one serial cannot create N commit copies.
             return Err(MarkdownCellDraftError::CommitBusy);
         }
         Ok(CommitClaim {
@@ -140,18 +151,21 @@ impl Scope {
         })
     }
 
-    /// 文件首次交给raw段表前登记真实票；不持有映射强边，也不把继承的canonical段重复记账。
+    /// Register the actual observer before a file first enters raw segments. Keep
+    /// no strong mapping edge and do not count inherited canonical segments again.
     pub(super) fn observe_raw_backing(&self, backing: MarkdownOriginalBackingObserver) {
         let mut backings = self.raw_backings.lock().unwrap();
         backings.retain(|previous| {
-            // 已回退且真实unmap完成的旧候选可退出清单；实际错误仍永久留在原Scope首因中。
+            // A rolled-back candidate can leave the list only after actual unmap.
+            // Its real failure, if any, remains sticky in the original scope.
             self.record_raw_cleanup(previous);
             !previous.unmap_succeeded() || previous.mapped_bytes() != 0
         });
         backings.push(backing);
     }
 
-    /// 只观察真实系统操作事实；raw候选清理错误独立于未改变的原Source权限。
+    /// Observe actual system-operation facts. Raw candidate cleanup failure stays
+    /// distinct from the unchanged original Source's text authority.
     fn record_raw_cleanup(&self, backing: &MarkdownOriginalBackingObserver) {
         if let Some(errno) = backing.first_errno() {
             let _ = self.first_raw_cleanup_errno.compare_exchange(
@@ -163,12 +177,14 @@ impl Scope {
         }
     }
 
-    /// 仅资源退场查询遍历实际票；正文健康/布局读取不锁清单，也不扫描任何映射。
+    /// Only release queries traverse these real observers. Text health and layout
+    /// reads neither lock this list nor scan mapping state.
     fn raw_backings_released(&self) -> bool {
         let backings = self.raw_backings.lock().unwrap();
         let mut released = true;
         for backing in backings.iter() {
-            // 即使前项失败也读完其余实际票，不能用短路掩盖另一个文件的真实首errno。
+            // Observe every remaining ticket even after one failure, so short
+            // circuiting cannot hide another actual file's first errno.
             self.record_raw_cleanup(backing);
             released &=
                 backing.unmap_succeeded() && backing.mapped_bytes() == 0 && !backing.failed();
@@ -176,7 +192,8 @@ impl Scope {
         released && self.first_raw_cleanup_errno.load(Ordering::Acquire) == 0
     }
 
-    /// 分支与最后Reader都已结束后才核raw映射；不能在仍有合法owner时伪报泄漏errno。
+    /// Check raw mappings only after branch and final reader owners end. A still
+    /// legitimate owner must not be reported as a cleanup failure.
     fn finish_raw_backings(&self) {
         if !self.branch_live.load(Ordering::Acquire) && !self.has_readers() {
             self.raw_backings_released();
@@ -184,6 +201,8 @@ impl Scope {
     }
 
     pub(super) fn publish_delta(&self, bytes: usize) {
+        // This is actual draft-delta accounting, not RSS or inherited original
+        // bytes. Updating its peak retains no text or retired branch payload.
         self.delta_bytes.store(bytes, Ordering::Release);
         self.peak_delta_bytes.fetch_max(bytes, Ordering::AcqRel);
     }
@@ -192,7 +211,8 @@ impl Scope {
 pub(super) struct BranchClaim(pub(super) Arc<Scope>);
 impl Drop for BranchClaim {
     fn drop(&mut self) {
-        // 此字段必须排在candidate root与独立段表之后；它们真实Drop后才撤分支事实。
+        // This field must follow the candidate root and independent segment table.
+        // Only their actual Drop permits revoking the branch-live fact.
         self.0.delta_bytes.store(0, Ordering::Release);
         self.0.branch_live.store(false, Ordering::Release);
         self.0.cancelled.store(true, Ordering::Release);
@@ -203,7 +223,8 @@ impl Drop for BranchClaim {
 pub(in crate::markdown_document_buffer) struct ReadClaim(Arc<Scope>);
 impl Drop for ReadClaim {
     fn drop(&mut self) {
-        // FrozenText中它排在树、段与健康backing之后；内部snapshot clone也必须真实退场后才归还。
+        // FrozenText places this after its tree, segments, and health backing.
+        // Internal snapshot clones must really finish before the slot is returned.
         self.0.read_roots.fetch_sub(1, Ordering::AcqRel);
         self.0.finish_raw_backings();
     }
@@ -216,7 +237,8 @@ pub(super) struct CommitClaim {
 
 impl CommitClaim {
     pub(super) fn allocated(&self, bytes: usize) {
-        // 只记录准入实际保留的堆正文capacity；文件extent与原树共享字节不是堆分配。
+        // Count only heap text capacity actually held by prepared admission.
+        // File extent and bytes shared with the original tree are not heap capacity.
         self.scope
             .prepared_commit_bytes
             .store(bytes, Ordering::Release);
@@ -225,12 +247,14 @@ impl CommitClaim {
             .fetch_max(bytes, Ordering::AcqRel);
     }
 
-    /// seal得到实际映射后立即绑定；候选读取/缩回Inline失败也不能绕过最终释放核验。
+    /// Bind the actual mapped backing immediately after seal. Failed candidate
+    /// reads or Inline conversion cannot bypass its final release verification.
     pub(super) fn observe_backing(&mut self, backing: MarkdownOriginalBackingObserver) {
         self.backing = Some(backing);
     }
 
-    /// 仅供同一映射已被canonical成功publish接管，或临时Inline映射已实证释放后移出票。
+    /// Remove the observer only after canonical publication takes over this same
+    /// mapping or actual release of the temporary Inline mapping has been confirmed.
     pub(super) fn release_backing_ticket(&mut self) {
         self.backing = None;
     }
@@ -238,7 +262,8 @@ impl CommitClaim {
 
 impl Drop for CommitClaim {
     fn drop(&mut self) {
-        // PreparedCommit中本字段排在实际候选存储之后；String或映射owner退场后才归还唯一名额。
+        // PreparedCommit places this field after actual candidate storage. Return
+        // the unique slot only after its String or mapping owner has dropped.
         if let Some(backing) = &self.backing {
             if let Some(errno) = backing.first_errno() {
                 let _ = self.scope.first_candidate_cleanup_errno.compare_exchange(
@@ -249,7 +274,8 @@ impl Drop for CommitClaim {
                 );
             }
             if !backing.unmap_succeeded() || backing.mapped_bytes() != 0 || backing.failed() {
-                // replacement字段已先Drop；保留实际负面事实，不能把归还准入名额当作munmap成功。
+                // Replacement already dropped. Preserve the actual failed-release
+                // fact; returning an admission slot does not prove munmap succeeded.
                 self.scope
                     .candidate_cleanup_failed
                     .store(true, Ordering::Release);
@@ -263,13 +289,15 @@ impl Drop for CommitClaim {
 }
 
 #[derive(Clone)]
-/// 实际owner与映射清理收据；不保活草稿、原文、文档或文件，计数不是系统内存采样。
+/// Observe actual owner/mapping cleanup without retaining draft text, document,
+/// or files. These ownership counts are not a system-memory sample.
 pub struct MarkdownCellDraftResourceObserver {
     pub(super) scope: Arc<Scope>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 分支delta、实际读取payload和唯一准入String容量；clone共享payload，不增加read_roots。
+/// Snapshot branch delta, actual reader payloads and unique prepared String
+/// capacity. Capsule clones share a payload without increasing read_roots.
 pub struct MarkdownCellDraftResourceSnapshot {
     pub branch_live: bool,
     pub read_roots: usize,
@@ -287,7 +315,8 @@ pub struct MarkdownCellDraftResourceSnapshot {
 
 impl MarkdownCellDraftResourceObserver {
     #[must_use]
-    /// 各项是原子观察值；释放结论要求真实分支和全部读取payload都已归还。
+    /// Individual fields are atomic observations. Release requires the actual
+    /// branch and all reader payloads to have returned, not merely a cancelled flag.
     pub fn snapshot(&self) -> MarkdownCellDraftResourceSnapshot {
         let errno = self.scope.first_source_errno.load(Ordering::Acquire);
         let raw_errno = self.scope.first_raw_cleanup_errno.load(Ordering::Acquire);
@@ -315,8 +344,10 @@ impl MarkdownCellDraftResourceObserver {
     }
 
     #[must_use]
-    /// 树、Reader及准入owner退场后，还要求raw新文件与未转归候选真实清理成功。
-    /// 继承的canonical Source及成功发布的Frozen由Doc实际backing票承担最终munmap义务。
+    /// After tree, reader and prepared owners end, actual raw-file and untransferred
+    /// candidate cleanup must also succeed. The document's real backing observers
+    /// retain final munmap responsibility for inherited canonical Source and
+    /// successfully transferred Frozen storage.
     pub fn is_released(&self) -> bool {
         let state = self.snapshot();
         !state.branch_live
@@ -328,7 +359,8 @@ impl MarkdownCellDraftResourceObserver {
     }
 }
 
-/// 弱nonce不保候选分支；丢弃编辑票只标取消，Doc仍须显式排空唯一slot。
+/// A weak nonce retains no candidate branch. Dropping it marks cancellation only;
+/// the document must still explicitly drain its unique slot.
 pub struct MarkdownCellDraft {
     pub(super) scope: Weak<Scope>,
 }

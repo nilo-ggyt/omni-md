@@ -512,7 +512,10 @@ impl NativeMarkdownComposedViewport {
         self.lines.get(ordinal_in_window).map(|line| line.frame)
     }
 
-    #[cfg(feature = "native-markdown-runtime-probe")]
+    #[cfg(all(
+        feature = "native-paged-body-probe",
+        feature = "native-markdown-runtime-probe"
+    ))]
     /// Observe at most 256 installed original lines without advancing layout, reading text, or recomputing Native layout.
     pub(in crate::native_surface) fn probe_line_geometry(
         &self,

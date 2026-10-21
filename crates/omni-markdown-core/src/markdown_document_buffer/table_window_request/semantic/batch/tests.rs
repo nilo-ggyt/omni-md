@@ -1,7 +1,11 @@
+//! Real multi-table publication, overlap, replay, joint-quota and canonical-append behavior.
+
 use super::*;
 use crate::markdown_viewport_presentation::MarkdownViewportPresentation;
 
 fn document(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+    // Keep all actual source I/O inside the private synthetic directory returned
+    // with this document; no existing note library participates in these tests.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("多表窗口.md");
     std::fs::write(&path, source).unwrap();
@@ -12,6 +16,8 @@ fn finish(
     request: &mut MarkdownTableViewportRequest,
     doc: &MarkdownDocumentBuffer,
 ) -> Result<(), MarkdownTableRequestError> {
+    // Drive this same request under its real quantum. Pending work is not Ready,
+    // and typed failure must propagate instead of becoming partial output.
     for _ in 0..doc.byte_len().saturating_mul(64).saturating_add(10000) {
         match request.advance(doc, false, 4096)? {
             MarkdownTableViewportStep::Ready { .. } => return Ok(()),
@@ -23,11 +29,15 @@ fn finish(
     panic!("有限真实夹具未完成");
 }
 fn units(source: &str, bytes: usize) -> usize {
+    // Only this finite test oracle translates known scalar-aligned byte prefixes;
+    // production keeps byte/UTF-16 coordinates from its actual source traversal.
     source[..bytes].encode_utf16().count()
 }
 
 #[test]
 fn multi_table_batch_preserves_source_partition_and_shared_first_wins_semantics() {
+    // A real source contains two tables, ordinary gaps and competing definitions.
+    // The batch must publish a continuous partition while resolving first-wins once.
     let source = "[a]: /first\r\n\r\n普通段落\r\n\r\n> | H | C |\r\n> | - | - |\r\n> | [a] | **一** |\r\n\r\n中间 **正文**\r\n\r\n| X |\r\n| - |\r\n| [b] |\r\n\r\n[b]: /later\r\n[a]: /wrong\r\n";
     let (_directory, doc) = document(source);
     let owners = Arc::strong_count(doc.root.as_ref().unwrap());
@@ -52,6 +62,8 @@ fn multi_table_batch_preserves_source_partition_and_shared_first_wins_semantics(
     }
     assert_eq!(next, doc.utf16_len());
     let mut original = MarkdownViewportPresentation::default();
+    // Compare bounded table style coverage with the finite original full parser;
+    // no gap is silently promoted into table or ordinary-inline style authority.
     original.set_active_selection(0..0);
     original
         .rebuild(doc.generation(), viewport, source)
@@ -78,6 +90,8 @@ fn multi_table_batch_preserves_source_partition_and_shared_first_wins_semantics(
 
 #[test]
 fn forward_resume_keeps_same_global_math_and_real_absolute_ordinals() {
+    // Resume through actual rows with multiline literal-dollar content, then
+    // continue through a gap into another table without restarting the source frontier.
     let source = "| H |\n| - |\n| ${x |\n| y}$ |\n| tail |\n\n普通段\n\n| N |\n| - |\n| z |\n";
     let (_directory, doc) = document(source);
     let first = source.find("| ${x").unwrap();
@@ -131,6 +145,8 @@ fn forward_resume_keeps_same_global_math_and_real_absolute_ordinals() {
         style(&window.presentation_for(&doc).unwrap().runs),
         style(original.runs())
     );
+    // The next independent forward batch starts at the real completed physical
+    // boundary, carrying original absolute row ordinals into subsequent output.
     let floor = request.forward_resume_floor();
     request
         .resume_forward(&doc, floor..doc.utf16_len(), 9, 0..0)
@@ -163,6 +179,8 @@ fn forward_resume_keeps_same_global_math_and_real_absolute_ordinals() {
 
 #[test]
 fn gap_watermark_stops_before_unrelated_far_table_without_false_eof_or_origin_restart() {
+    // A tiny prefix can prove no table before a huge unrelated following line;
+    // it must not read that line merely to discover a distant table.
     let prefix = "普通\n\n";
     let source = format!(
         "{prefix}{}\n\n| H |\n| - |\n| z |\n",
@@ -176,7 +194,8 @@ fn gap_watermark_stops_before_unrelated_far_table_without_false_eof_or_origin_re
     assert_eq!(ready.gaps_for(&doc).unwrap().len(), 1);
     assert!(request.total_work().source_bytes < 10000);
     assert!(request.structure.as_ref().unwrap().global.is_some());
-    // 已分类到真实物理边界之前的请求不能偷偷from0重建；它是显式接口拒绝。
+    // Returning before the real classified boundary requires a checkpoint;
+    // explicit forward resume must reject rather than secretly rebuild Global from zero.
     assert_eq!(
         request.resume_forward(&doc, 0..3, 2, 0..0),
         Err(MarkdownTableRequestError::InvalidRequest)
@@ -192,6 +211,8 @@ fn gap_watermark_stops_before_unrelated_far_table_without_false_eof_or_origin_re
 
 #[test]
 fn total_rows_across_two_tables_rejects_without_partial_ready_and_stays_failed() {
+    // Two individually ordinary tables exhaust the one actual joint row stock.
+    // Failure must remain sticky and expose no partially successful batch.
     let mut source = String::new();
     for _ in 0..2 {
         source.push_str("| H |\n| - |\n");
@@ -216,6 +237,8 @@ fn total_rows_across_two_tables_rejects_without_partial_ready_and_stays_failed()
 
 #[test]
 fn batch_queries_are_sealed_before_single_scan_and_limit_is_shared() {
+    // Both tables contribute genuine labels before definition resolution begins.
+    // Their shared inventory must enforce one reference limit, not one per table.
     let mut source = String::from("[early]: /right\n\n");
     for table in 0..2 {
         source.push_str("| H |\n| - |\n| [early] ");
@@ -239,6 +262,8 @@ fn batch_queries_are_sealed_before_single_scan_and_limit_is_shared() {
 
 #[test]
 fn cancel_root_swap_and_edit_undo_do_not_reuse_batch_or_gap_authority() {
+    // Equal-text notes and undo to earlier bytes do not share source authority.
+    // A separate real cancellation remains the terminal cause on repeated calls.
     let source = "普通\n\n| H |\n| - |\n| v |\n";
     let (_directory, mut doc) = document(source);
     let mut request = doc
@@ -269,6 +294,8 @@ fn cancel_root_swap_and_edit_undo_do_not_reuse_batch_or_gap_authority() {
 
 #[test]
 fn overlap_shares_physical_tail_then_continues_same_math_global_gap_and_new_reference_query() {
+    // Start with a clipped visible request but retain its actual verified physical
+    // tail, then overlap through later rows and a second table under one frontier.
     let source = "[late]: /first\r\n\r\n| H |\r\n| - |\r\n| ${中 |\r\n| 尾}$ [late] |\r\n| end |\r\n\r\n普通 **段**\r\n\r\n| N |\r\n| - |\r\n| z |\r\n\r\n[other]: /later\r\n";
     let (_directory, doc) = document(source);
     let owners = Arc::strong_count(doc.root.as_ref().unwrap());
@@ -291,7 +318,8 @@ fn overlap_shares_physical_tail_then_continues_same_math_global_gap_and_new_refe
             .unwrap()
             .is_none()
     );
-    // 原 requested 在物理行中间截止，完整已验证行尾仍可共享，不能为它重读 source。
+    // The requested endpoint is inside a physical line, but that line's actual
+    // verified tail can be shared without rereading original source bytes.
     request
         .extend_from_ready(&doc, &old, first..second)
         .unwrap();
@@ -333,7 +361,8 @@ fn overlap_shares_physical_tail_then_continues_same_math_global_gap_and_new_refe
         vec![2, 3]
     );
     assert!(middle.table_end_for(&doc).unwrap().is_some());
-    // 后来的真实 End 只属于新票，不能就地升级原 immutable 窗口的未知末尾。
+    // A later genuine End belongs to the new ticket. It cannot mutate an older
+    // immutable window's still-unknown terminal boundary.
     assert!(
         old.window_at_for(&doc, 0)
             .unwrap()
@@ -352,7 +381,8 @@ fn overlap_shares_physical_tail_then_continues_same_math_global_gap_and_new_refe
         gap.utf16
             .contains(&units(source, source.find("普通").unwrap()))
     }));
-    // 新后缀才出现 [late]，其定义位于原 viewport 前。只能重新做完整 first-wins 查询，不能从 floor 查。
+    // The new suffix first uses [late], whose definition precedes the original
+    // viewport. Resolve in full source order; starting at resume floor loses first-wins.
     let mut original = MarkdownViewportPresentation::default();
     original.set_active_selection(0..0);
     original
@@ -384,6 +414,8 @@ fn overlap_shares_physical_tail_then_continues_same_math_global_gap_and_new_refe
 
 #[test]
 fn overlap_rejects_foreign_publication_old_publication_and_unknown_left_hole_before_mutation() {
+    // Keep a real previous Ready while trying another request's publication and
+    // an uncovered left hole. Rejection must preserve its payload and original fuel.
     let source = "普通\r\n\r\n| H |\r\n| - |\r\n| 一 |\r\n| 二 |\r\n| 三 |\r\n";
     let (_directory, mut doc) = document(source);
     let second = units(source, source.find("| 二").unwrap());
@@ -419,7 +451,8 @@ fn overlap_rejects_foreign_publication_old_publication_and_unknown_left_hole_bef
             .row_ordinal,
         2
     );
-    // 内部洞不能由 H context 到 body 的包络冒充；测试直接复用原真实 coverage 目录作证。
+    // The header-context/body convex hull cannot certify its internal hole;
+    // use the actual original coverage directory rather than fabricated ranges.
     assert!(!old.proves(&(0..third)));
     request
         .extend_from_ready(&doc, &old, second..third)
@@ -449,6 +482,8 @@ fn overlap_rejects_foreign_publication_old_publication_and_unknown_left_hole_bef
 
 #[test]
 fn overlap_full_old_row_budget_cannot_be_refunded_by_clipping_or_new_suffix_quota() {
+    // Previous Native payload keeps all its rows alive even if the new viewport
+    // clips to one row. Joint admission cannot refund that still-live stock.
     let mut source = String::from("| H |\n| - |\n");
     for _ in 0..255 {
         source.push_str("| v |\n");
@@ -460,7 +495,8 @@ fn overlap_full_old_row_budget_cannot_be_refunded_by_clipping_or_new_suffix_quot
     let old = request.take_ready_for(&doc).unwrap().unwrap();
     assert_eq!(old.budget().row_slots, TABLE_WINDOW_MAX_ROWS);
     assert_eq!(request.forward_resume_floor(), end);
-    // 即使新请求只与旧最后一行相交，旧 Native Ready 仍持有所有行，额度不能只按可见裁剪退款。
+    // The old Ready still owns every row; clipping the visible request does not
+    // reclaim their actual coexisting payload before suffix admission.
     request
         .extend_from_ready(&doc, &old, end - 1..doc.utf16_len())
         .unwrap();
@@ -476,6 +512,8 @@ fn overlap_full_old_row_budget_cannot_be_refunded_by_clipping_or_new_suffix_quot
 
 #[test]
 fn overlap_precharges_real_old_cells_before_individually_valid_suffix() {
+    // Establish both actual independent halves first, proving each fits alone;
+    // their joint cell count must still reject overlap despite spare row slots.
     let row = format!("|{}\n", " v |".repeat(256));
     let header = format!("|{}\n", " H |".repeat(256));
     let delimiter = format!("|{}\n", " - |".repeat(256));
@@ -500,8 +538,9 @@ fn overlap_precharges_real_old_cells_before_individually_valid_suffix() {
         .extend_from_ready(&doc, &old, 0..doc.utf16_len())
         .unwrap();
     let error = finish(&mut request, &doc).unwrap_err();
-    // 原结构层把 cells 剩余额度转换成 body_limit；零可接纳 body 的既有 typed 出口是 RowLimit。
-    // 此处真正耗尽的是 cells：行槽仍远低于 256，不能为测试改错误分类或重置 old 额度。
+    // Existing table-only structure converts remaining cells into a body limit;
+    // its zero-body typed outcome is RowLimit even though cells are the limiting
+    // resource here. Do not change that contract or reset previous allowance for this test.
     assert_eq!(error, MarkdownTableRequestError::Window(Error::RowLimit));
     assert_eq!(request.advance(&doc, false, 4096), Err(error));
     assert!(
@@ -511,8 +550,9 @@ fn overlap_precharges_real_old_cells_before_individually_valid_suffix() {
 
 #[test]
 fn overlap_precharges_real_old_runs_before_individually_valid_semantic_suffix() {
-    // 真实配对的 underline 交替产生隐藏、正文和普通 runs，两侧输入都须独立完成。
-    // 负例检查最终同活载荷合计，不能用伪造 record 或调小测试专用上限替代原预算。
+    // Actual underline pairing produces hidden/content/plain runs. Complete each
+    // side independently before testing their real combined payload; no fabricated
+    // record or reduced test-only limit can stand in for the original budget.
     let row = format!("| {} |\n", "<u>x</u> ".repeat(1100));
     let source = format!("| H |\n| - |\n{row}{row}");
     let (_directory, doc) = document(&source);
@@ -547,7 +587,8 @@ fn overlap_precharges_real_old_runs_before_individually_valid_semantic_suffix() 
         error,
         MarkdownTableRequestError::Window(Error::SemanticLimit)
     );
-    // 实际输出已经用尽联合 run 余额，证明本反例没有被更早的 metadata 拒绝冒充。
+    // Actual output consumed the joint run balance; an earlier metadata failure
+    // must not impersonate this specific run-stock rejection.
     assert_eq!(request.quota.remaining_runs(), 0);
     assert_eq!(request.advance(&doc, false, 65536), Err(error));
     assert!(old.coverage_for(&doc).is_ok());
@@ -556,6 +597,8 @@ fn overlap_precharges_real_old_runs_before_individually_valid_semantic_suffix() 
 
 #[test]
 fn overlap_prunes_departed_publication_records_then_cancel_releases_pending_handles() {
+    // Each real successor shares only current record handles, then prunes the
+    // departed record without retaining a parent-publication chain.
     let source = "| H |\n| - |\n| first |\n| next |\n| third |\n| fourth |\n";
     let (_directory, doc) = document(source);
     let next = source.find("| next").unwrap();
@@ -583,10 +626,10 @@ fn overlap_prunes_departed_publication_records_then_cancel_releases_pending_hand
         2
     );
     assert_eq!(second.retained.row_slots, 3);
-    assert_eq!(second.budget().row_slots, 6); // 本次 Pending 仍计旧新两窗，发布后才释放离开范围的记录。
+    assert_eq!(second.budget().row_slots, 6); // Pending admits old/new payload together; publication prunes departed records afterward.
     assert_eq!(Rc::strong_count(&old.windows[0]), 1);
     drop(old);
-    assert!(departed.upgrade().is_none()); // 新 publication 没有通过父批次链保旧记录。
+    assert!(departed.upgrade().is_none()); // No parent-publication backedge retains the departed record.
     request
         .extend_from_ready(&doc, &second, third..fourth)
         .unwrap();
@@ -604,6 +647,8 @@ fn overlap_prunes_departed_publication_records_then_cancel_releases_pending_hand
             .row_ordinal,
         3
     );
+    // Cancel the next real overlap while previous remains readable. Only the
+    // pending request's extra handle must be returned by that cancellation.
     drop(second);
     request
         .extend_from_ready(&doc, &old, third..doc.utf16_len())
@@ -633,7 +678,8 @@ fn required_window_oracle(
     header: usize,
     row: usize,
 ) -> VerifiedMarkdownTableWindow {
-    // 原独立producer只作为测试oracle；生产required路径不能用它拼接publication。
+    // This actual independent producer is a test oracle only. Production required
+    // navigation may not splice its separately built window into another publication.
     let mut request = doc
         .table_window_request(
             MarkdownTableWindowTarget::RequiredRow {
@@ -659,6 +705,8 @@ fn required_window_oracle(
 
 #[test]
 fn required_previous_replays_same_table_math_and_offsets_without_restarting_main_global() {
+    // Request a real preceding row under the current publication and compare its
+    // Unicode/CRLF/container semantics with the independent actual row oracle.
     let source = "[a]: /first\r\n\r\n> - | H | C |\r\n>   | - | - |\r\n>   | ${中 | 甲 |\r\n>   | 😀 | 乙 |\r\n>   | y}$ [a] | **三** |\r\n>   | 四 | 尾 |\r\n\r\n[a]: /wrong\r\n";
     let (_directory, doc) = document(source);
     let fourth = units(source, source.find(">   | 四").unwrap());
@@ -697,6 +745,8 @@ fn required_previous_replays_same_table_math_and_offsets_without_restarting_main
         }
         _ => panic!("Previous不能被表尾结果冒充"),
     };
+    // Required replay uses the retained table checkpoint while the main Global
+    // position stays unchanged; no new source owner can replace the original capture.
     let actual = ready.window_at_for(&doc, index).unwrap().unwrap();
     let oracle = required_window_oracle(&doc, header, 3);
     assert_eq!(
@@ -746,6 +796,8 @@ fn required_previous_replays_same_table_math_and_offsets_without_restarting_main
 
 #[test]
 fn required_far_previous_and_header_use_retained_real_base_not_a_row_history() {
+    // A distant earlier row requires real replay from the retained base, not a
+    // resident history of every row. Then navigate to actual visible row zero.
     let mut source = "| H |\n| - |\n".to_owned();
     for row in 1..=300 {
         source.push_str(&format!("| 行{row}😀 |\n"));
@@ -800,7 +852,8 @@ fn required_far_previous_and_header_use_retained_real_base_not_a_row_history() {
     assert_eq!(h.coverage_for(&doc).unwrap()[0].start, 0);
     assert!(std::mem::size_of::<ReplayAnchors>() <= 4096);
     assert!(header.windows_for(&doc).unwrap().len() <= 3);
-    // Header目标发布的是实际row0；随后Next仍核同publication，不把header_context当body。
+    // A header target publishes actual row zero. Its next-row query still needs
+    // this publication; syntax-only header context cannot impersonate a body member.
     let query = header.required_row_query_for(&doc, index, 0, 1).unwrap();
     request
         .extend_from_ready_with_required_row(&doc, &header, at..at + 4, query)
@@ -815,6 +868,8 @@ fn required_far_previous_and_header_use_retained_real_base_not_a_row_history() {
 
 #[test]
 fn required_real_end_same_publication_appends_draft_in_one_undo() {
+    // Navigating past the real last row must yield its actual EOF/EOL facts under
+    // this same publication before a combined draft+row append can be planned.
     let source = "> - | H | C |\r\n>   | - | - |\r\n>   | 中 | 原 |";
     let (_directory, mut doc) = document(source);
     let at = units(source, source.find(">   | 中").unwrap());
@@ -851,6 +906,8 @@ fn required_real_end_same_publication_appends_draft_in_one_undo() {
         _ => panic!("不存在行必须返回真实End，不是空Ready"),
     };
     assert!(Rc::ptr_eq(&old.windows[0], &ready.windows[index]));
+    // Apply the real append plan once through the canonical transaction, then
+    // undo exact CRLF bytes. The earlier plan/publication cannot revive after editing.
     let plan = doc
         .plan_verified_table_viewport_row_append(&ready, index, 1, 1, "草稿😀")
         .unwrap();
@@ -876,6 +933,8 @@ fn required_real_end_same_publication_appends_draft_in_one_undo() {
 
 #[test]
 fn required_union_cells_rejects_without_revoking_previous_and_query_cannot_cross_publication() {
+    // A query issued by another actual publication cannot be paired with old.
+    // The legitimate query then consumes joint cell stock while preserving old's readable payload.
     let mut source = format!("|{}\n|{}\n", " H |".repeat(64), " - |".repeat(64));
     let first = source.len();
     for _ in 0..14 {
@@ -925,6 +984,8 @@ fn required_union_cells_rejects_without_revoking_previous_and_query_cannot_cross
 
 #[test]
 fn true_table_checkpoint_one_byte_frames_match_original_global_and_require_real_eof() {
+    // Capture a genuine checkpoint from actual Global output, then replay with
+    // one-byte source frames so split UTF-8/CRLF and true EOF remain observable.
     use pulldown_cmark::block_frontier::{TableContinuationState, TableStep};
     let source = "> - | H | C |\r\n>   | - | - |\r\n>   | 中😀 | x |\r\n>   | 尾 | y |";
     let (_directory, doc) = document(source);
@@ -966,6 +1027,8 @@ fn true_table_checkpoint_one_byte_frames_match_original_global_and_require_real_
         }
     }
     assert!(global_complete);
+    // The same genuine checkpoint supplies table continuation. An empty frame
+    // with false EOF must stay NeedInput instead of manufacturing an End ticket.
     let mut table = TableContinuationState::resume(checkpoint.unwrap());
     let mut actual = Vec::new();
     let mut denied_false_eof = false;
@@ -1028,6 +1091,8 @@ fn true_table_checkpoint_one_byte_frames_match_original_global_and_require_real_
 
 #[test]
 fn required_partial_replay_cancel_and_stale_source_keep_old_ready_and_no_source_owner() {
+    // Start actual replay of a large Unicode row, then cancel while its original
+    // Ready still exists. New replay scratch must retire without revoking old payload.
     let source = format!("| H |\n| - |\n| {} |\n| final |\n", "中😀".repeat(3000));
     let (_directory, mut doc) = document(&source);
     let at = units(&source, source.find("| final").unwrap());
@@ -1076,6 +1141,8 @@ fn required_partial_replay_cancel_and_stale_source_keep_old_ready_and_no_source_
 
 #[test]
 fn required_far_beyond_end_publishes_actual_terminal_row_and_implicit_columns() {
+    // A far nonexistent ordinal must publish true End and the actual short final
+    // row, preserving implicit cells and the exact last-cell append restriction.
     let source = "| H | C |\n| - | - |\n| first | here |\n| last |\n";
     let (_directory, doc) = document(source);
     let at = source.find("| first").unwrap();
@@ -1133,7 +1200,8 @@ fn assert_required_source_partition(
     let requested = ready.requested_for(doc).unwrap();
     let mut next = requested.start;
     for coverage in ready.coverage_for(doc).unwrap() {
-        // 同一源位置只能发布一次；重复target ticket不能以重叠区间通过连续覆盖认证。
+        // Publish each actual source position once. Duplicate target tickets
+        // cannot pass continuous coverage certification using overlapping intervals.
         assert_eq!(coverage.utf16_range().start, next);
         next = coverage.utf16_range().end;
     }
@@ -1142,6 +1210,8 @@ fn assert_required_source_partition(
 
 #[test]
 fn required_suffix_target_reuses_sweep_ticket_without_duplicate_row_or_coverage() {
+    // Sweep already obtains the requested suffix row. Required navigation must
+    // reuse that real member instead of admitting/replaying a duplicate target.
     let source = "| H |\n| - |\n| 一 |\n| 二 |\n";
     let (_directory, doc) = document(source);
     let first = units(source, source.find("| 一").unwrap());
@@ -1197,6 +1267,8 @@ fn required_suffix_target_reuses_sweep_ticket_without_duplicate_row_or_coverage(
 
 #[test]
 fn required_suffix_terminal_reuses_sweep_ticket_and_retains_true_end_association() {
+    // When Sweep already holds the terminal member, associate true End with that
+    // same actual row without duplicating its coverage or increasing joint stock.
     let source = "| H |\n| - |\n| 一 |\n| 二 |\n";
     let (_directory, doc) = document(source);
     let first = units(source, source.find("| 一").unwrap());
@@ -1243,6 +1315,8 @@ fn required_suffix_terminal_reuses_sweep_ticket_and_retains_true_end_association
 
 #[test]
 fn required_repeated_replay_exhausts_original_total_fuel_and_preserves_previous_and_draft_plan() {
+    // Keep a genuine uncommitted draft plan while cycling real required targets.
+    // Each replay spends the original cumulative fuel; no navigation resets it.
     let source = "| H |\n| - |\n| one |\n| two |\n| three |\n| four |\n";
     let (_directory, doc) = document(source);
     let fourth = source.find("| four").unwrap();
@@ -1276,7 +1350,8 @@ fn required_repeated_replay_exhausts_original_total_fuel_and_preserves_previous_
             .unwrap();
         match finish(&mut request, &doc) {
             Ok(()) => {
-                // 三个目标循环会越过只保当前origin/target的目录，确实重复回放而非只读已有窗。
+                // Cycling three targets leaves the retained origin/target pair,
+                // forcing actual replay instead of merely querying existing windows.
                 let ready = request.take_ready_for(&doc).unwrap().unwrap();
                 origin_index = match ready.required_row_result_for(&doc).unwrap().unwrap() {
                     MarkdownTableViewportRequiredRowResult::Row {
@@ -1326,6 +1401,8 @@ fn required_repeated_replay_exhausts_original_total_fuel_and_preserves_previous_
 
 #[test]
 fn required_header_delimiter_only_end_has_real_row_zero_and_single_append_undo() {
+    // A header/delimiter-only table has true terminal row zero and no invented
+    // first body row. Its append still uses one original canonical undo transaction.
     let source = "| H | C |\r\n| - | - |";
     let (_directory, mut doc) = document(source);
     let mut request = doc.table_viewport_request(0..4, 29, 0..0).unwrap();

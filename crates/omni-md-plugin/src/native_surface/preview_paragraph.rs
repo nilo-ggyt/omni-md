@@ -1,4 +1,5 @@
-//! 分页预览的共同排版值；宽度、行高和绘图消费同一合同，不持正文、字体或布局图。
+//! Shared scalar geometry for paged preview. Width, line height, and painting
+//! consume this same contract without owning text, fonts, or a layout graph.
 
 use super::paged_font_geometry::NativeMarkdownPagedFontMetricValues;
 use super::paged_line_fonts::NativeMarkdownPreviewFontMetrics;
@@ -8,7 +9,8 @@ use omni_markdown_core::{
     MarkdownPresentationMode,
 };
 
-/// Producer 的分步读与 Viewport 的有限准备共用同一个字体/段落累计器，不另建行高目录。
+/// Producer steps and bounded viewport preparation share this font/paragraph
+/// accumulator; neither creates a separate document-wide line-height catalog.
 pub(in crate::native_surface) struct PreviewLineMetrics {
     pub ascent: f64,
     pub descent: f64,
@@ -23,7 +25,8 @@ pub(in crate::native_surface) struct PreviewLineMetrics {
 }
 
 impl PreviewLineMetrics {
-    /// 模式来自原Body/Scene几何身份；普通正文空样式不具有选择另一种行槽的权限。
+    /// Mode comes from the original Body/Scene geometry identity. An empty body
+    /// style cannot select a different mode's system line slot.
     pub fn new(mode: MarkdownPresentationMode) -> Self {
         Self {
             ascent: 0.0,
@@ -39,7 +42,8 @@ impl PreviewLineMetrics {
         }
     }
 
-    /// 只有封存的 glyph/tab 可决定段落角色；默认换行控制不借邻接文字补造样式。
+    /// Accumulate actual sealed part metrics. Glyphs/tabs establish text slots;
+    /// default newline controls cannot borrow adjacent text to invent styling.
     pub fn add(
         &mut self,
         part: &MarkdownComposedLinePartFacts,
@@ -55,7 +59,9 @@ impl PreviewLineMetrics {
             let offset =
                 super::text_attributes::native_markdown_baseline_offset(part.presentation, false)
                     .unwrap_or(0.0);
-            // 实测TextKit上移内容抬高行基线，下移内容保字体原基线并扩下沿；EOL仍不撑高非空行。
+            // The measured TextKit contract raises the baseline for superscript
+            // and extends the lower edge for subscript. EOL controls still do
+            // not increase the height of a line containing actual text.
             let above = preview.baseline + offset.max(0.0);
             let below = (preview.line_height - preview.baseline - offset).max(0.0);
             if matches!(
@@ -68,17 +74,17 @@ impl PreviewLineMetrics {
             } else {
                 self.control_above = self.control_above.max(above);
                 self.control_below = self.control_below.max(below);
-            } // 真实非空行不把EOL字体混进可见内容槽；只有空行/EOF才由自身控制Font确定高度。
-        } // 混合字体分别保真实baseline上/下界，同一结果仍由Producer和Viewport共同消费。
+            } // Only genuinely empty/EOL lines use their own control-font slot.
+        } // Mixed fonts retain separate measured bounds above and below the baseline.
         if part.kind != MarkdownComposedLinePartKind::FoldedSection {
             let paragraph = PreviewParagraph::from_styles(part.presentation)
                 .unwrap_or(PreviewParagraph::LITERAL);
             if paragraph.inset_26_6() != part.paragraph_inset_26_6 {
-                return None; // 软换行所用的封存宽度必须与最终行框一致，不能靠绘图偏移修正旧输出。
+                return None; // Sealed wrap width must match the final frame; a paint offset cannot repair old output.
             }
             if paragraph != PreviewParagraph::LITERAL {
                 if self.paragraph != PreviewParagraph::LITERAL && self.paragraph != paragraph {
-                    return None; // 同一源段不能拼进互相冲突的块行高；保留原失败而非任取第一种样式。
+                    return None; // Conflicting paragraph roles cannot share one source line; retain failure rather than choosing one.
                 }
                 self.paragraph = paragraph;
             }
@@ -86,7 +92,8 @@ impl PreviewLineMetrics {
         Some(())
     }
 
-    /// 首末软行只比较同一封存源段落端点；视口边缘没有首末段距权限。
+    /// Apply outer spacing only at the same sealed source paragraph's actual
+    /// endpoints. A viewport edge is not a paragraph boundary.
     pub fn geometry(&self, line: &MarkdownComposedLineFacts) -> Option<PreviewLineGeometry> {
         if self.mode == MarkdownPresentationMode::InlinePreview {
             let (above, below) = if self.has_text {
@@ -100,7 +107,7 @@ impl PreviewLineMetrics {
                 line.source_utf16.start == line.paragraph_utf16.start
                     && line.paragraph_utf16.start != 0,
                 line.source_utf16.end == line.paragraph_utf16.end,
-            ); // 首段没有前一段，原paragraphSpacingBefore不在正文起点另造8pt空白。
+            ); // No preceding paragraph exists at document start; paragraphSpacingBefore adds no extra initial gap.
         }
         self.paragraph.measure(
             self.ascent,
@@ -112,7 +119,8 @@ impl PreviewLineMetrics {
     }
 }
 
-/// 段落背景只是已排好行框的视觉角色，不承担行高、缩进或源坐标转换。
+/// A background paints an already measured frame; it owns no height, inset, or
+/// source-coordinate conversion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native_surface) enum PreviewParagraphBackground {
     Code,
@@ -120,7 +128,8 @@ pub(in crate::native_surface) enum PreviewParagraphBackground {
     Rule,
 }
 
-/// 只含原 AppKit 段落合同的有限标量；表格行高仍由表格自己的真实排版负责。
+/// Finite values from the original AppKit paragraph contract. Actual table
+/// layout remains the sole authority for table-row heights.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::native_surface) struct PreviewParagraph {
     pub before: f64,
@@ -132,7 +141,8 @@ pub(in crate::native_surface) struct PreviewParagraph {
     pub background: Option<PreviewParagraphBackground>,
 }
 
-/// 同一份实际字体度量只计算一次纵向分配；行框、baseline 与滚动高度不得分别猜值。
+/// One vertical allocation from actual font metrics, shared by line frames,
+/// baselines, and scroll height rather than independently estimated for each.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::native_surface) struct PreviewLineGeometry {
     pub advance: f64,
@@ -142,8 +152,12 @@ pub(in crate::native_surface) struct PreviewLineGeometry {
     pub after: f64,
 }
 
-#[cfg(feature = "native-markdown-runtime-probe")]
-/// 原有限窗口真实行的纯值观察；没有 Source、Reader、Font 或 Native 对象强边。
+#[cfg(all(
+    feature = "native-paged-body-probe",
+    feature = "native-markdown-runtime-probe"
+))]
+/// Plain facts from actual bounded-window lines. Only the Body/Find probe pair
+/// consumes these observations; they retain no Source, Reader, font, or Native claim.
 pub(in crate::native_surface) struct PreviewLineObservation {
     pub source: std::ops::Range<usize>,
     pub paragraph: std::ops::Range<usize>,
@@ -165,16 +179,17 @@ impl PreviewParagraph {
         background: None,
     };
 
-    /// 只解释原语义发布已经给出的样式；此函数不授予隐藏权，也不把未知容器变成普通段落。
+    /// Interpret already published semantic styles. This function grants no
+    /// marker-hiding authority and never treats an unknown container as ready body text.
     pub fn from_styles(styles: Styles) -> Option<Self> {
         let hidden = styles.contains(Styles::HIDDEN_MARKER);
         if hidden && styles.contains(Styles::FENCED_CODE) {
-            return None; // 收起的围栏沿原合同没有代码块的 padding、背景或最小行高。
+            return None; // Hidden fence controls receive no code padding, background, or minimum line height.
         }
         if styles.contains(Styles::TABLE_ROW_PLACEHOLDER)
             || (hidden && styles.contains(Styles::TABLE_DELIMITER))
         {
-            return None; // 表格自己的行槽与分隔带不能再叠加正文段落几何。
+            return None; // Table-owned slots and delimiters cannot receive body paragraph geometry again.
         }
 
         let mut paragraph = Self::LITERAL;
@@ -192,7 +207,7 @@ impl PreviewParagraph {
             paragraph.before = 8.0;
             paragraph.after = 6.0;
             paragraph.line_height_multiple = 1.08;
-        } // 标题内的粗体、链接等只改变字形；段落间距仍由同一标题拥有。
+        } // Inline emphasis and links change glyphs while the original heading owns paragraph spacing.
 
         if hidden && styles.contains(Styles::HORIZONTAL_RULE) {
             paragraph.minimum_line_height = 12.0;
@@ -200,7 +215,7 @@ impl PreviewParagraph {
             paragraph.before = 6.0;
             paragraph.after = 6.0;
             paragraph.background = Some(PreviewParagraphBackground::Rule);
-            return Some(paragraph); // 活动 rule 保持字面编辑；只有原隐藏语义才能领取细线槽。
+            return Some(paragraph); // Active rules remain literal; only original hidden semantics authorize the thin rule slot.
         }
         if styles.contains(Styles::FENCED_CODE) {
             paragraph.minimum_line_height = 22.0;
@@ -209,7 +224,7 @@ impl PreviewParagraph {
             paragraph.before += paragraph.inset;
             paragraph.after += paragraph.inset;
             paragraph.background = Some(PreviewParagraphBackground::Code);
-            return Some(paragraph); // 左右缩进先进入可用宽度，四边空隙再随真实段首末行分配。
+            return Some(paragraph); // Insets first reduce available width; actual first/last lines receive outer padding.
         }
         if styles.contains(Styles::BLOCK_QUOTE) {
             paragraph.line_height_multiple = 1.2;
@@ -218,17 +233,20 @@ impl PreviewParagraph {
             paragraph.before += paragraph.inset;
             paragraph.after += paragraph.inset;
             paragraph.background = Some(PreviewParagraphBackground::Quote);
-            return Some(paragraph); // 保留原 6 点 padding 与 1 点边框；容器权限仍归原解析来源。
+            return Some(paragraph); // Preserve 6-point padding plus the 1-point border, under the original parser's container authority.
         }
         heading.then_some(paragraph)
     }
 
-    /// 原有段落值都是精确的整数点；封存到同 Item 的 26.6 字段后仍无需浮点推断可用宽度。
+    /// Existing insets are exact integer points. Seal the same value in the
+    /// Item's 26.6 field without floating-point inference of available width.
     pub fn inset_26_6(self) -> i32 {
         (self.inset * 64.0) as i32
     }
 
-    /// 系统自然行槽先乘原paragraph倍数，再受min/max约束；额外高度按真实TextKit基线合同置于文字之前。
+    /// Scale the system's natural slot by the original paragraph multiple, then
+    /// apply its min/max bounds. Extra height precedes text according to the
+    /// independently measured TextKit baseline contract.
     fn measure_preview(
         self,
         above: f64,
@@ -260,7 +278,7 @@ impl PreviewParagraph {
             || !text_height.is_finite()
             || text_height <= 0.0
         {
-            return None; // 真正无效的系统Font/段落结果不能借min-height或夹值制造成功。
+            return None; // Minimum height or clamping cannot certify an invalid system-font or paragraph result.
         }
         Some(PreviewLineGeometry {
             advance,
@@ -271,7 +289,8 @@ impl PreviewParagraph {
         })
     }
 
-    /// 字体来自同封存 part 的实际注册；只有源段落的真正首末软行领取外段距。
+    /// Use the sealed part's actual registered font. Only the source paragraph's
+    /// genuine first and last soft lines receive outer spacing.
     pub fn measure(
         self,
         ascent: f64,
@@ -282,7 +301,7 @@ impl PreviewParagraph {
     ) -> Option<PreviewLineGeometry> {
         let natural = ascent + descent + leading;
         if !natural.is_finite() || natural <= 0.0 {
-            return None; // 无效的实际字体不能借段落最小高度变成貌似成功的布局。
+            return None; // Paragraph minimum height cannot turn invalid font metrics into apparently valid layout.
         }
         let mut text_height = if self.line_height_multiple == 0.0 {
             natural
@@ -297,7 +316,8 @@ impl PreviewParagraph {
         }
         let before = if first { self.before } else { 0.0 };
         let after = if last { self.after } else { 0.0 };
-        // 字面模式保持原来的加法及 baseline 次序；新增几何不改变既有 Source 的浮点结果。
+        // Preserve literal mode's original arithmetic and baseline order, so
+        // shared preview geometry does not change existing Source float results.
         let extra = if text_height == natural {
             leading
         } else {
@@ -311,7 +331,7 @@ impl PreviewParagraph {
             || !text_height.is_finite()
             || text_height <= 0.0
         {
-            return None; // 真正的算术或几何失败返回原调用者，不截断高度或画出一部分候选。
+            return None; // Return actual geometry failure without clipping height or painting a partial candidate.
         }
         Some(PreviewLineGeometry {
             advance,

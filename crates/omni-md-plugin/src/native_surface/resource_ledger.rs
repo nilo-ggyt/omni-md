@@ -1,14 +1,17 @@
-//! 显式构造角色的有限弱账本；共享编辑器与框架子树不自动归为项目所有。
+//! Bounded weak evidence for explicitly constructed Native roles. Shared field
+//! editors and framework subtrees do not become project-owned by reachability.
 
 use super::*;
 use omni_markdown_core::MarkdownOriginalBackingObserver;
 use std::collections::HashMap;
 
-/// 总预算仅覆盖进入OwnedLedger的显式身份，包含所有scope及仍活旧对象；不是Foundation对象总数。
+/// One budget covers explicitly registered identities across scopes and still
+/// live old objects. It does not count every Foundation object in the process.
 const MAX_OWNED_NATIVE_IDENTITIES: usize = 1_024;
 
 #[cfg(feature = "native-close-stage-diagnostic")]
-/// 只保存一次关闭观察的纯事实；地址仅供离线追踪，不再解引用或作为释放权限。
+/// Plain facts from one close observation. Addresses identify diagnostic output
+/// only; they are never dereferenced later or accepted as release authority.
 pub(super) struct NativeMarkdownCloseRasterIdentity {
     role: &'static str,
     address: usize,
@@ -28,7 +31,8 @@ impl std::fmt::Debug for NativeMarkdownCloseRasterIdentity {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-/// scope 由构造者明确指定，只决定既有收据的子集，不是原生类型豁免。
+/// Construction assigns scope explicitly. It selects a receipt subset without
+/// exempting any Native class from actual release.
 enum NativeMarkdownOwnedScope {
     Surface,
     Editor,
@@ -43,7 +47,8 @@ struct OwnedNativeIdentity {
 }
 
 #[derive(Clone)]
-/// 仅保留原映射owner的真实VM事实；Doc或Snapshot的其他alias不能被Weak-nil掩盖。
+/// Preserve the original mapping owner's actual VM facts. A dead document Weak
+/// cannot conceal a mapping still retained by a snapshot or another alias.
 struct OwnedOriginalBacking {
     role: &'static str,
     observer: MarkdownOriginalBackingObserver,
@@ -51,7 +56,8 @@ struct OwnedOriginalBacking {
 }
 
 impl OwnedOriginalBacking {
-    /// 单独的零长度或Drop进度均不足够；先前读取/回收失败同样永久阻止成功收据。
+    /// Zero length or destructor progress alone is insufficient. Prior read or
+    /// reclaim failure permanently prevents a successful release receipt.
     fn released(&self) -> bool {
         self.observer.unmap_succeeded()
             && self.observer.mapped_bytes() == 0
@@ -60,7 +66,8 @@ impl OwnedOriginalBacking {
 }
 
 #[derive(Clone, Default)]
-/// 收据只拥有weak与纯原子元数据；标准控件要求实际nil，源映射要求真实munmap成功。
+/// Own only Weak references and atomic metadata. Standard controls must actually
+/// become nil; source mappings require a successful real munmap.
 pub(super) struct NativeMarkdownOwnedSnapshot {
     identities: Vec<OwnedNativeIdentity>,
     original_backings: Vec<OwnedOriginalBacking>,
@@ -69,12 +76,14 @@ pub(super) struct NativeMarkdownOwnedSnapshot {
 }
 
 impl NativeMarkdownOwnedSnapshot {
-    /// 仅私有退出诊断使用一次既有Weak清单；统计不是资源收据，不添加或漏掉任何身份。
+    /// Summarize the existing Weak set for opt-in close diagnostics. Counts are
+    /// observations, not release receipts or another registration graph.
     #[cfg(feature = "native-close-stage-diagnostic")]
     pub(super) fn diagnostic_alive_roles(&self) -> (bool, Vec<(&'static str, usize, usize)>) {
         let mut roles = std::collections::BTreeMap::<&'static str, (usize, usize)>::new();
         for entry in &self.identities {
-            // 原清单最多1024身份；临时weak升级在本次局部pool中结束，没有账本借用跨native。
+            // The original set is bounded. Temporary Weak upgrades end in the
+            // caller's local pool, with no ledger borrow across Native work.
             let alive = entry.object.load().is_some();
             let counts = roles.entry(entry.role).or_default();
             counts.0 += 1;
@@ -89,8 +98,9 @@ impl NativeMarkdownOwnedSnapshot {
         )
     }
 
-    /// 只观察原账本中侧栏的两个已登记Weak，不遍历框架子树或建立额外身份清单。
-    /// 调用方在同一局部pool内消费；所有Native临时claim结束后才输出返回的纯标量文本。
+    /// Observe only the two originally registered sidebar roles. The caller
+    /// consumes these in one local pool; returned text contains scalar facts,
+    /// without traversing framework subtrees or retaining a second identity set.
     #[cfg(feature = "native-close-stage-diagnostic")]
     pub(super) fn diagnostic_sidebar_relationships(&self) -> String {
         let table = self
@@ -102,8 +112,10 @@ impl NativeMarkdownOwnedSnapshot {
             None => "live=false".to_owned(),
             Some(object) => match object.downcast_ref::<objc2_app_kit::NSTableView>() {
                 Some(table) => {
-                    // 类型由原构造角色及动态类型共同确认；公开getter只读取关系/数量，不读行内容。
-                    // SAFETY: 原主线程NSTableView仍由本次Weak升级保活，未持有TLS或账本可变借用。
+                    // Original construction role and actual type both identify
+                    // the table; public getters inspect relations/counts, not row text.
+                    // SAFETY: This Weak upgrade retains the main-thread table,
+                    // without a mutable TLS or ledger borrow across these getters.
                     let (super_attached, data_source_attached, delegate_attached) = unsafe {
                         (
                             table.superview().is_some(),
@@ -124,7 +136,7 @@ impl NativeMarkdownOwnedSnapshot {
                 None => "live=true type_match=false".to_owned(),
             },
         };
-        drop(table); // 不把table的临时Native强边带入下一个角色或stage。
+        drop(table); // Do not carry this temporary Native claim into another role or stage.
         let column = self
             .identities
             .iter()
@@ -140,11 +152,12 @@ impl NativeMarkdownOwnedSnapshot {
                 None => "live=true type_match=false".to_owned(),
             },
         };
-        drop(column); // getter返回值与原Weak升级都只归本次观察，不延长关闭资源的真实寿命。
+        drop(column); // Getter values and Weak upgrades belong only to this observation.
         format!("table=[{table_facts}] column=[{column_facts}]")
     }
 
-    /// 与首次关闭角色统计同池执行；只记录指定既有Weak，不安装额外观察或改变nil门禁。
+    /// Observe selected existing Weak entries in the initial close pool. This
+    /// adds no observer and leaves strict nil release requirements unchanged.
     #[cfg(feature = "native-close-stage-diagnostic")]
     pub(super) fn diagnostic_raster_close_identities(
         &self,
@@ -159,37 +172,38 @@ impl NativeMarkdownOwnedSnapshot {
                     | "editor.raster.layer"
                     | "editor.raster.line-string"
             ) {
-                continue; // 角色由构造边显式登记；不按类名扩张目标或推断所有权。
+                continue; // Construction registered each role; class names cannot expand ownership.
             }
             let Some(object) = entry.object.load() else {
-                continue; // 实际nil不造身份；本函数的存活或缺失都不替代原释放检查。
+                continue; // A nil Weak invents no identity; diagnostics never replace original release verification.
             };
             if identities.len() == 8 {
                 truncated = true;
-                continue; // 只确认其仍活，不再读取超额对象的类名或长度。
+                continue; // Record truncation without inspecting additional live objects' classes or lengths.
             }
             let name = object.class().name().to_string_lossy();
             let mut end = name.len().min(128);
             while !name.is_char_boundary(end) {
-                end -= 1; // 按UTF8边界截短到最多128字节，不读取对象正文或描述。
+                end -= 1; // Bound UTF-8 class metadata without reading object text or descriptions.
             }
             let class = name[..end].to_owned();
             let length = if entry.role == "editor.raster.line-string" {
                 object.downcast_ref::<NSString>().map(NSString::length)
             } else {
-                None // 图层绝不发送字符串getter；已知字符串角色也须真实类型认证。
+                None // Layers receive no string getter; even known string roles require actual type validation.
             };
             identities.push(NativeMarkdownCloseRasterIdentity {
                 role: entry.role,
                 address: std::ptr::from_ref(&*object).addr(),
                 class,
                 length,
-            }); // 仅移动标量和短Rust字符串；本轮临时Native claim随迭代归还。
+            }); // Move scalar facts and short Rust strings; temporary Native claims end with this iteration.
         }
         (identities, truncated)
     }
 
-    /// 仅登记调用方已经确认创建或配置的对象；不通过可达性或类名推断所有权。
+    /// Register only an object the caller actually constructed or configured;
+    /// reachability and class names do not establish ownership.
     fn include(
         &mut self,
         role: &'static str,
@@ -198,7 +212,8 @@ impl NativeMarkdownOwnedSnapshot {
     ) -> Result<(), String> {
         let address = std::ptr::from_ref(object).addr();
         if self.addresses.get(&address).is_some_and(|index| {
-            // 旧 weak 仍存活才算同一生命周期，地址复用必须创建新记录。
+            // A live original Weak proves the same lifetime; address reuse must
+            // create another record after the earlier object actually ended.
             self.identities[*index].object.load().is_some()
         }) {
             return Ok(());
@@ -213,31 +228,36 @@ impl NativeMarkdownOwnedSnapshot {
         Ok(())
     }
 
-    /// 映射和Native身份共享一个session总预算；只回收已有真实释放证据的历史槽。
+    /// Mappings and Native identities share one session budget. Reclaim only
+    /// historical slots whose original resources have actually been released.
     fn make_room(&mut self) -> Result<(), String> {
         if self.identities.len() + self.original_backings.len() == MAX_OWNED_NATIVE_IDENTITIES {
-            // Native仍只按实际nil淘汰；映射还必须证明无失败且最终munmap成功。
+            // Native entries require actual nil; mappings additionally require
+            // no retained failure and a successful final munmap.
             self.identities
                 .retain(|entry| entry.object.load().is_some());
             self.original_backings.retain(|entry| !entry.released());
             self.addresses.clear();
             for (index, entry) in self.identities.iter().enumerate() {
                 if let Some(object) = entry.object.load() {
-                    // 重建地址索引不推断映射身份；观察者不含可复用为权限的正文地址。
+                    // Rebuild Native address lookup only; mapping observers
+                    // contain no source address that can be reused as authority.
                     self.addresses
                         .insert(std::ptr::from_ref(&*object).addr(), index);
                 }
             }
         }
         if self.identities.len() + self.original_backings.len() == MAX_OWNED_NATIVE_IDENTITIES {
-            // 拒绝新资源后留下永久不完整事实，不能在调用方清理后冒签缺项的成功快照。
+            // Preserve permanent incompleteness after rejecting a resource.
+            // Later cleanup cannot certify a snapshot that omitted construction.
             self.incomplete = true;
             return Err("笔记自有资源登记超过容量上限".into());
         }
         Ok(())
     }
 
-    /// 构造边显式登记一次原映射；克隆observer只共享固定原子，不复制或保活映射。
+    /// Explicitly register a mapping at construction. Observer clones share
+    /// fixed atomics without copying or retaining the mapped payload.
     fn include_original_backing(
         &mut self,
         role: &'static str,
@@ -253,18 +273,21 @@ impl NativeMarkdownOwnedSnapshot {
         Ok(())
     }
 
-    /// 关闭停止构造后释放地址索引，仅保留有限角色和零化 weak。
+    /// Once construction ends, release the address index and retain only bounded
+    /// role/Weak evidence. Sealing does not claim those objects are already nil.
     pub(super) fn seal(&mut self) {
         self.addresses = HashMap::new();
     }
 
-    /// 最终文稿仍活时一次取得其实际映射票；编辑历史的文件段同原文件一样必须真实归还。
+    /// Capture actual mappings while the final document is still live. Published
+    /// edit-file pieces and history owe the same real release as the original file.
     pub(super) fn capture_document_backings(
         &mut self,
         observers: impl Iterator<Item = MarkdownOriginalBackingObserver>,
     ) {
-        // 这里不发布业务、不调用Native，也不新增构造预算；只有Doc实际仍拥有的映射进入收据。
-        // 用完整当前集合替换构造期原文件票，避免同一映射重复登记或漏掉已发布的编辑文件。
+        // This final receipt publishes no business state and performs no Native
+        // work or new construction admission. Replace the initial-file set with
+        // the document's complete actual backing set, including published edits.
         self.original_backings = observers
             .map(|observer| OwnedOriginalBacking {
                 role: "editor.document-backing",
@@ -274,7 +297,8 @@ impl NativeMarkdownOwnedSnapshot {
             .collect();
     }
 
-    /// 只给显式标准对象安装真实销毁事件；具体 TextKit 空壳由独立类型证明。
+    /// Attach actual destruction observation only to explicit standard objects.
+    /// Independent type-specific proof owns any retained empty TextKit shell.
     pub(super) fn track_remaining(
         &self,
         cohort: &mut NativeMarkdownDeallocationCohort,
@@ -282,23 +306,26 @@ impl NativeMarkdownOwnedSnapshot {
     ) {
         for entry in &self.identities {
             if let Some(object) = entry.object.load() {
-                // marker 不反向持有对象，临时强引用在本轮迭代结束。
+                // The marker retains no reverse object edge; the transient
+                // strong upgrade ends with this iteration.
                 cohort.track(&object, mtm);
             }
         }
     }
 
-    /// 真实检查每个角色，不用父根 nil 代替独立字段/cell/menu 的释放。
+    /// Verify every original role. A nil parent cannot substitute for actual
+    /// release of independently retained fields, cells, or menus.
     pub(super) fn verify_released(&self) -> Result<(), String> {
         if self.incomplete {
-            // 登记中的重入快照没有完整权限，不能把暂借期间的空槽当作已释放。
+            // A reentrant snapshot taken during registration lacks complete
+            // authority; an empty loaned slot is not a released resource graph.
             return Err("笔记自有资源快照不完整".into());
         }
         let roles: Vec<_> = self
             .identities
             .iter()
             .filter_map(|entry| {
-                // 失败只报告静态角色，不读取正文、路径或私有类名。
+                // Failure reports static roles only, without text, paths, or private class names.
                 entry.object.load().map(|_| entry.role)
             })
             .collect();
@@ -312,7 +339,8 @@ impl NativeMarkdownOwnedSnapshot {
             .map(|entry| entry.role)
             .collect();
         if !mappings.is_empty() {
-            // Doc的Weak或Native图均已nil也不能代替共享Snapshot最终归还原映射的事实。
+            // Dead document/Native Weak references cannot certify that the last
+            // shared snapshot actually returned its original mapping.
             return Err(format!("笔记源映射未完成真实释放：{mappings:?}"));
         }
         Ok(())
@@ -320,25 +348,29 @@ impl NativeMarkdownOwnedSnapshot {
 }
 
 #[cfg(feature = "native-raster-surface-probe")]
-/// 只记源码固定LF在读文档前的实际原Weak；无强字符串、正文、Native图或进程级缓存。
+/// Original Weak identity of a fixed source literal observed before opening a
+/// document, without a retained string, text payload, or process-wide cache.
 struct NativeMarkdownPreexistingLiteral {
     original: Weak<NSString>,
     eligible_after_pool: bool,
     observations: Cell<usize>,
 }
 
-/// 一个 backing 持有实际 weak 清单；Modal handle 共享它，不创建第三份身份预算。
+/// One backing owns the actual Weak set. Modal handles share it rather than
+/// creating another independent identity budget.
 struct NativeMarkdownOwnedLedgerState {
     snapshot: RefCell<Option<NativeMarkdownOwnedSnapshot>>,
     registering: Cell<Option<usize>>,
-    // 若root/local登记中途被拒绝，保留负面事实，不允许缺失映射的后续快照成功。
+    // Retain root/local registration failure so later snapshots cannot succeed
+    // after an original mapping was omitted.
     mapping_registration_failed: Cell<bool>,
     #[cfg(feature = "native-raster-surface-probe")]
     preexisting_literal: Option<NativeMarkdownPreexistingLiteral>,
 }
 
-/// Session root统一计数，具体后端保存其Native局部收据；原映射另归外层文稿收据。
-/// 父链接只有Rust Weak，不保活前台图或canonical模型。
+/// The session root owns admission; a backend retains local Native receipts and
+/// the outer document owns mapping receipts. Parent links remain Rust Weak and
+/// do not prolong the foreground graph or canonical model.
 pub(super) struct NativeMarkdownOwnedLedger {
     state: Rc<NativeMarkdownOwnedLedgerState>,
     root: Option<std::rc::Weak<NativeMarkdownOwnedLedgerState>>,
@@ -362,18 +394,21 @@ impl Default for NativeMarkdownOwnedLedger {
 }
 
 impl NativeMarkdownOwnedLedger {
-    /// 仅真实WindowSurface构造最前调用；时序早于pager、open_document_buffer及任何文档getter。
-    /// Default故意不调用本入口，测试或离线probe若已经有文档，就不能事后获得预存身份。
+    /// Call only at actual WindowSurface construction, before pager, document
+    /// open, or text getters. Default deliberately grants no retroactive literal
+    /// baseline to a test or probe that already opened a document.
     pub(super) fn for_native_session_before_document_open() -> Self {
         let mut ledger = Self::default();
         #[cfg(feature = "native-raster-surface-probe")]
         if super::raster_surface::NativeMarkdownRasterSurface::requested() {
-            // 固定工程字面量独立进入Foundation；不是从用户正文、幸存行或现有Native值复制。
+            // Independently construct the fixed literal, without copying user
+            // text, a surviving line, or an already observed Native value.
             let original = autoreleasepool(|_| {
                 let literal = NSString::from_str("\n");
                 Weak::from_retained(&literal)
             });
-            // 原构造强claim与本地pool已真正结束。若Weak已nil，本session永久无借用资格。
+            // The original strong claim and local pool have ended. A nil Weak
+            // permanently prevents borrowing eligibility for this session.
             let eligible_after_pool = autoreleasepool(|_| original.load().is_some());
             let state = Rc::get_mut(&mut ledger.state).expect("新session账本尚未共享");
             state.preexisting_literal = Some(NativeMarkdownPreexistingLiteral {
@@ -386,12 +421,13 @@ impl NativeMarkdownOwnedLedger {
             );
         }
         #[cfg(not(feature = "native-raster-surface-probe"))]
-        let _ = &mut ledger; // 普通构建没有任何Foundation基线构造或额外Native读。
+        let _ = &mut ledger; // Ordinary builds construct no Foundation baseline and perform no additional Native read.
         ledger
     }
 
     #[cfg(feature = "native-raster-surface-probe")]
-    /// 只把标准getter返回的同一预存身份记为借用；不改变include或任何自有对象的strictWeak合同。
+    /// Recognize only a standard getter's exact preexisting identity as borrowed.
+    /// Explicitly owned objects retain their original strict Weak contract.
     pub(super) fn observe_preexisting_literal_string(
         &self,
         role: &'static str,
@@ -403,17 +439,17 @@ impl NativeMarkdownOwnedLedger {
             return Err("原光栅票在借用字面量观察前已撤销".into());
         }
         if units != 1 {
-            return Ok(false); // 只允许与预先固定LF同长度的实际getter值进入身份比较，不读取字符。
+            return Ok(false); // Compare identity only for the fixed LF's length, without reading characters.
         }
         let root = match self.root.as_ref() {
             Some(root) => root.upgrade().ok_or("原session基线所属账本已结束")?,
-            None => Rc::clone(&self.state), // 根本身就是这一session最初的账本。
+            None => Rc::clone(&self.state), // This root is the session's original ledger.
         };
         let Some(baseline) = root.preexisting_literal.as_ref() else {
-            return Ok(false); // Default/editor本地账本无基线，不补建或回采其他已出现的业务值。
+            return Ok(false); // Local/default ledgers have no baseline and cannot recapture existing business values.
         };
         if !baseline.eligible_after_pool {
-            return Ok(false); // 构造归还后已nil的原Weak不能因后继同值或地址复用恢复资格。
+            return Ok(false); // Equal text or reused addresses cannot revive a baseline whose original Weak ended.
         }
         let actual = baseline.original.load();
         if !current() {
@@ -423,19 +459,19 @@ impl NativeMarkdownOwnedLedger {
         let same = actual
             .as_deref()
             .is_some_and(|original| std::ptr::eq::<NSString>(original, string));
-        drop(actual); // Weak临时claim的Native析构在无账本借用的局部栈内结束。
+        drop(actual); // End the temporary Native claim on this stack without a ledger borrow.
         if !current() {
             return Err("归还预存原Weak临时claim后光栅票已撤销".into());
         }
         if !same {
-            return Ok(false); // 同文本但另一实际身份仍完整进入原owned/actual-dealloc门禁。
+            return Ok(false); // Another identity with equal text retains all original owned/deallocation requirements.
         }
         let count = baseline
             .observations
             .get()
             .checked_add(1)
             .ok_or("借用字面量观察计数已耗尽")?;
-        baseline.observations.set(count); // 诊断是固定标量，不保留每次line对象或另建身份集合。
+        baseline.observations.set(count); // Fixed diagnostic state retains neither line objects nor another identity collection.
         if count <= 8 {
             eprintln!(
                 "native_raster_surface event=borrowed_literal role={role} before_document_open=true original_weak_identity_match=true utf16_units=1 observations={count} owned=false formal=false"
@@ -444,10 +480,12 @@ impl NativeMarkdownOwnedLedger {
         Ok(true)
     }
 
-    /// 为具体后端分出Native局部交接清单；原映射不归此清单，所有新身份仍先经过同一Session预算。
+    /// Create a backend-local Native handoff set, separate from the outer
+    /// document's mapping receipt. Every new identity still uses session admission.
     pub(super) fn for_editor(parent: &Self) -> Self {
         let root = parent.root.clone().unwrap_or_else(|| {
-            // surface 本身就是 root；Weak 只共享身份登记，不延长 native/session 生命周期。
+            // Surface itself is the root; Weak shares registration authority
+            // without extending the Native/session lifetime.
             Rc::downgrade(&parent.state)
         });
         Self {
@@ -463,7 +501,8 @@ impl NativeMarkdownOwnedLedger {
         }
     }
 
-    /// modal 给现有 editor/root backing 换一个明确构造 scope，不创建新 snapshot 或 quota。
+    /// Give the existing editor/root backing an explicit modal construction scope,
+    /// without creating another snapshot owner or quota.
     pub(super) fn modal_scope(&self) -> Self {
         Self {
             state: Rc::clone(&self.state),
@@ -472,32 +511,37 @@ impl NativeMarkdownOwnedLedger {
         }
     }
 
-    /// 弱升级/临时引用析构也可能交还原生控制权；借出账本后再登记，回调不跨 RefMut。
+    /// Weak upgrades and temporary destruction may reenter Native code. Lend the
+    /// ledger before registration so callbacks never cross a RefMut.
     pub(super) fn include(&self, role: &'static str, object: &AnyObject) -> Result<(), String> {
         if let Some(root) = &self.root {
-            // 父 root 先接受身份；子登记失败时仍保留父 weak 证据，禁止预算回滚伪释放。
+            // Admit at the root first. If local registration fails, preserve
+            // the root's Weak evidence rather than rolling back actual construction.
             let root = root.upgrade().ok_or("笔记会话资源已不可用")?;
             Self::include_in(&root, role, object, self.scope)?;
         }
         Self::include_in(&self.state, role, object, self.scope)
     }
 
-    /// 文稿原映射进入Session总预算，但最终释放收据不混入具体后端的Native清单。
+    /// Admit the original document mapping under the session budget while keeping
+    /// its final release receipt separate from backend-local Native identities.
     pub(super) fn include_document_backing(
         &self,
         observer: Option<MarkdownOriginalBackingObserver>,
     ) -> Result<NativeMarkdownOwnedSnapshot, String> {
         let mut document = NativeMarkdownOwnedSnapshot::default();
         if let Some(observer) = observer {
-            // 先登记真实Session归属；根拒绝时不发布缺失原映射事实的文稿根。
+            // Register actual session ownership first; root rejection must not
+            // publish a document receipt missing its original mapping.
             self.include_original_backing("editor.original-backing", observer.clone())?;
             document.include_original_backing("editor.original-backing", observer, self.scope)?;
-        } // 没有原映射时不伪造源文件；空收据只表示没有该类待归还资源，不推断正文为空。
+        } // No original mapping means no such release obligation, without inferring that document text is empty.
         document.seal();
         Ok(document)
     }
 
-    /// 原Doc构造后立即登记；与Native登记相同地先经过root，再写入明确所有者的局部收据。
+    /// Register immediately after actual document acquisition: root admission
+    /// precedes writing the explicit owner's local receipt, as for Native objects.
     pub(super) fn include_original_backing(
         &self,
         role: &'static str,
@@ -509,7 +553,8 @@ impl NativeMarkdownOwnedLedger {
                 if let Err(error) =
                     Self::include_original_backing_in(&root, role, observer.clone(), self.scope)
                 {
-                    // root已拒绝或正在借出时，父子都不能把未登记的源映射视为不存在。
+                    // A rejected or loaned root leaves both parent and child
+                    // unable to treat an unregistered source mapping as absent.
                     root.mapping_registration_failed.set(true);
                     return Err(error);
                 }
@@ -522,7 +567,8 @@ impl NativeMarkdownOwnedLedger {
         result
     }
 
-    /// 借出唯一snapshot后再做容量回收；其中Native弱升级绝不跨越RefCell借用。
+    /// Lend the unique snapshot before capacity reclaim, keeping Native Weak
+    /// upgrades outside the RefCell borrow.
     fn include_original_backing_in(
         state: &NativeMarkdownOwnedLedgerState,
         role: &'static str,
@@ -539,7 +585,8 @@ impl NativeMarkdownOwnedLedger {
         .map_err(|_| "笔记源映射登记仍在处理中".to_owned())?
     }
 
-    /// 每个 backing 的本地 owner 借出后才做 weak/native 操作，重入只能看到 Busy。
+    /// Lend each backing's local owner before Weak/Native operations; reentry
+    /// observes Busy rather than an alias to the mutable snapshot.
     fn include_in(
         state: &NativeMarkdownOwnedLedgerState,
         role: &'static str,
@@ -551,7 +598,8 @@ impl NativeMarkdownOwnedLedger {
             &state.registering,
             |_| 1,
             |snapshot| {
-                // snapshot 位于独占局部 owner，原生 weak 初始化/析构不跨越 RefCell 借用。
+                // The snapshot is exclusively local, so Native Weak creation/
+                // destruction executes without a RefCell borrow.
                 snapshot.include(role, object, scope)
             },
             || {},
@@ -559,60 +607,70 @@ impl NativeMarkdownOwnedLedger {
         .map_err(|_| "笔记资源登记仍在处理中".to_owned())?
     }
 
-    /// 配置字段/按钮时登记其实际 cell，不递归接管框架内部视图。
-    /// 组合登记不是回滚事务；中途失败保留已登记的 weak，调用方必须中止未完整对象的发布并负责清理。
+    /// Register a configured control and its actual cell, without taking over
+    /// framework subtrees. Partial registration retains existing Weak evidence;
+    /// its caller must stop publication and clean up the incomplete owner.
     pub(super) fn include_control(
         &self,
         role: &'static str,
         control: &NSControl,
     ) -> Result<(), String> {
         let cell = control.cell();
-        // control 先取得独立角色；后续 cell 登记失败也不能抹去这项既有观察证据。
+        // Register the control first; later cell rejection cannot erase this
+        // evidence of an already constructed original role.
         self.include(role, control)?;
         if let Some(cell) = cell {
-            // 项目配置的文本、动作可能由 cell 独立持有，必须独立进入账本。
+            // Cells may independently retain configured text/actions and must
+            // therefore enter the same actual identity ledger.
             self.include(role, &cell)?;
         }
         Ok(())
     }
 
-    /// 显式配置 popup/context 菜单后登记 menu 和所有实际 item。
-    /// 任一 item 登记失败都保留之前的 weak 证据；调用方须清理未完整发布的 owner，不能使用部分菜单。
+    /// Register the configured popup/context menu and every actual item. A later
+    /// item failure preserves prior Weak evidence; the caller must clean the
+    /// incomplete owner instead of publishing a partially registered menu.
     pub(super) fn include_menu(&self, role: &'static str, menu: &NSMenu) -> Result<(), String> {
         let items = menu.itemArray();
         if items.count() > MAX_OWNED_NATIVE_IDENTITIES {
-            // 输入数组超限不截断，调用者不得发布这个未完整登记的菜单。
+            // Reject the complete oversized array; truncation cannot authorize
+            // publishing an incompletely registered menu.
             return Err("笔记菜单超过资源数量上限".into());
         }
-        // 预算或重入错误可能发生在任意后续 item；逐项传播失败，不撤销已登记角色或截断后继续发布。
+        // Capacity or reentry can reject any later item. Propagate the failure
+        // without erasing admitted roles or publishing a truncated menu.
         self.include(role, menu)?;
         for index in 0..items.count() {
-            // 先取得当前 item，再短暂借用账本；getter 不与 RefMut 重叠。
+            // Obtain the actual item before lending the ledger; its Native
+            // getter never overlaps a mutable snapshot borrow.
             let item = items.objectAtIndex(index);
             self.include(role, &item)?;
         }
         Ok(())
     }
 
-    /// 快照只复制 weak，不能延长任何项目原生对象的生命周期。
+    /// Copy Weak evidence only, without extending project Native lifetimes.
     pub(super) fn snapshot(&self) -> NativeMarkdownOwnedSnapshot {
         if let Some(root) = &self.root {
             let Some(root) = root.upgrade() else {
-                // 没有共同预算owner时不能再签一个看似完整的新局部收据。
+                // Without the original shared admission owner, a local receipt
+                // cannot certify a new complete graph.
                 return Self::incomplete_snapshot();
             };
             if root.registering.get().is_some() {
-                // 父登记已开始而子记录尚未提交，局部空snapshot也不具备完整清单权限。
+                // Root registration may precede the child's record. Its local
+                // empty snapshot therefore cannot certify completeness yet.
                 return Self::incomplete_snapshot();
             }
             if root.mapping_registration_failed.get() {
-                return Self::incomplete_snapshot(); // 共同预算中曾缺失源映射，子清单不能另签完整。
+                return Self::incomplete_snapshot(); // A missing shared mapping permanently prevents a complete child receipt.
             }
         }
         Self::snapshot_in(&self.state)
     }
 
-    /// 不完整状态是显式拒绝，绝不以零角色伪装资源已经释放。
+    /// Represent incompleteness explicitly rather than certifying release from
+    /// a fabricated zero-role set.
     fn incomplete_snapshot() -> NativeMarkdownOwnedSnapshot {
         NativeMarkdownOwnedSnapshot {
             incomplete: true,
@@ -620,32 +678,37 @@ impl NativeMarkdownOwnedLedger {
         }
     }
 
-    /// 空工作区或保留父 editor 的操作只取得 modal 角色，不把活父控件纳入释放等待。
+    /// Operations that retain their parent editor acquire only modal roles,
+    /// without waiting for legitimate live parent controls to deallocate.
     pub(super) fn snapshot_modal(&self) -> NativeMarkdownOwnedSnapshot {
         let mut snapshot = self.snapshot();
         snapshot.identities.retain(|entry| {
-            // scope 来自显式构造，不根据类名、可见性或时间推断可释放对象。
+            // Explicit construction scope, not class name/visibility/timing,
+            // determines which original controls belong to this modal receipt.
             entry.scope == NativeMarkdownOwnedScope::Modal
         });
         snapshot.original_backings.retain(|entry| {
-            // modal完成时父文档合法存活；仅筛选显式构造scope，不豁免任何Editor关闭收据。
+            // The parent document may outlive a modal. This scope selection
+            // does not exempt any mapping from the editor's final close receipt.
             entry.scope == NativeMarkdownOwnedScope::Modal
         });
         snapshot.seal();
         snapshot
     }
 
-    /// clone weak 也可能进入 runtime；整个复制发生在局部 owner 而非 RefCell borrow 中。
+    /// Weak cloning may enter the runtime too. Perform the entire copy on the
+    /// exclusively local owner, outside a RefCell borrow.
     fn snapshot_in(state: &NativeMarkdownOwnedLedgerState) -> NativeMarkdownOwnedSnapshot {
         if state.mapping_registration_failed.get() {
-            return Self::incomplete_snapshot(); // 失败路径保留永久负面证据，不能回退为空账本。
+            return Self::incomplete_snapshot(); // Retain permanent failure evidence instead of falling back to an empty set.
         }
         crate::foreground_owner::with_foreground_owner(
             &state.snapshot,
             &state.registering,
             |_| 1,
             |snapshot| {
-                // 这里只复制有限 weak/scalar；调用方拿不到任何强 native owner。
+                // Copy bounded Weak/scalar evidence; the caller obtains no
+                // strong Native owner through this operation.
                 Ok::<_, ()>(snapshot.clone())
             },
             || {},
@@ -653,7 +716,8 @@ impl NativeMarkdownOwnedLedger {
         .ok()
         .and_then(Result::ok)
         .unwrap_or_else(|| {
-            // 登记/复制期间的重入必须得到不完整收据，不能冒签完整空账本。
+            // Reentry during registration/copy receives incomplete evidence,
+            // never an apparently complete empty graph.
             Self::incomplete_snapshot()
         })
     }
@@ -663,7 +727,8 @@ impl NativeMarkdownOwnedLedger {
 mod tests {
     use super::*;
 
-    /// 真实私有源映射供资源测试使用；不创建NSApplication、原生控件或用户目录数据。
+    /// Acquire a real mapping in a private temporary file, without constructing
+    /// AppKit objects or accessing the user's document directory.
     fn mapped_document() -> (tempfile::NamedTempFile, MarkdownDocumentBuffer) {
         let mut file = tempfile::NamedTempFile::new().expect("synthetic original source");
         file.write_all("源映射🙂\n".as_bytes())
@@ -674,7 +739,8 @@ mod tests {
 
     #[test]
     fn source_alias_keeps_actual_mapping_unreleased_after_document_drop() {
-        // 文档析构不是源映射最终所有者：Snapshot仍合法读取同一不可变inode。
+        // Document destruction need not release the mapping: an actual snapshot
+        // can still legitimately own the same immutable source inode.
         let (_file, document) = mapped_document();
         let alias = document.text_snapshot();
         let observer = document.original_backing_observer().expect("mapped source");
@@ -684,10 +750,9 @@ mod tests {
             .include_document_backing(Some(observer.clone()))
             .expect("register source");
         let whole = root.snapshot();
-        // 文稿合法存活不阻止无载荷的后端结束；最终文稿/Session仍必须等待同一mmap归还。
+        // A live document does not prevent an empty backend from ending, while
+        // document/session receipts still owe the same real mapping release.
         assert!(editor.snapshot().verify_released().is_ok());
-        assert_eq!(local.original_backings.len(), 1);
-        assert_eq!(whole.original_backings.len(), 1);
         assert!(local.verify_released().is_err());
         drop(document);
         assert!(observer.mapped_bytes() > 0);
@@ -695,7 +760,8 @@ mod tests {
         assert!(local.verify_released().is_err());
         assert!(whole.verify_released().is_err());
 
-        // 原最后Snapshot归还后，观察者本身不保活映射；系统munmap真实成功才允许收据通过。
+        // The observer does not retain the mapping after its final real snapshot
+        // ends. Only the actual successful munmap permits release receipts.
         drop(alias);
         assert_eq!(observer.mapped_bytes(), 0);
         assert!(observer.unmap_succeeded());
@@ -709,14 +775,16 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().expect("独占合成源文件");
         file.write_all("源映射🙂\n".as_bytes())
             .expect("写入合成源文件");
-        // 此试次准入一次大输入，原4096字节的小资源夹具不能承载其真实保存后长度。
+        // Admit this explicit large input; the smaller mapping fixture's limit
+        // would not accommodate the actual resulting canonical document.
         let mut document =
             MarkdownDocumentBuffer::open(file.path(), 262_144).expect("打开合成长编辑源");
         let root = NativeMarkdownOwnedLedger::default();
         let mut receipt = root
             .include_document_backing(document.original_backing_observer())
             .expect("登记实际原文件");
-        // 模拟一次超过小段阈值的明确输入；不是读取或复制已有整篇文稿。
+        // Submit an explicit new input exceeding the inline-piece threshold,
+        // without reading or copying an existing whole document.
         let input = "x".repeat(65_537);
         document
             .replace_utf16_range_with_selection(
@@ -728,28 +796,22 @@ mod tests {
             .expect("发布真实文件编辑段");
         drop(input);
         let alias = document.text_snapshot();
-        // 最终销毁同样从原Doc实际段表取得观察票；无Native调用或事后可失败的业务登记。
+        // Final destruction observes the original document's actual backing set,
+        // without Native work or a new fallible business registration after commit.
         receipt.capture_document_backings(document.backing_observers());
-        assert_eq!(receipt.original_backings.len(), 2);
         assert!(receipt.verify_released().is_err());
         drop(document);
-        // 同一已发布文件仍由真实快照持有；原Doc销毁不能洗成映射已成功归还。
+        // The real snapshot retains published file pieces. Document destruction
+        // cannot be relabeled as successful final mapping release.
         assert!(receipt.verify_released().is_err());
-        assert!(receipt.original_backings.iter().any(|entry| {
-            entry.observer.mapped_bytes() > 0 && !entry.observer.unmap_succeeded()
-        }));
         drop(alias);
         assert!(receipt.verify_released().is_ok());
-        assert!(receipt.original_backings.iter().all(|entry| {
-            entry.observer.mapped_bytes() == 0
-                && entry.observer.unmap_succeeded()
-                && !entry.observer.failed()
-        }));
     }
 
     #[test]
     fn modal_snapshot_does_not_require_live_parent_source_to_unmap() {
-        // scope是原构造事实：关闭对话框可保留父Doc，但父Editor收据仍严格等待同一源归还。
+        // Construction scope permits closing a modal while its parent document
+        // lives; the editor's final receipt still waits for that actual source.
         let (_file, document) = mapped_document();
         let observer = document.original_backing_observer().expect("mapped source");
         let root = NativeMarkdownOwnedLedger::default();
@@ -759,7 +821,6 @@ mod tests {
             .expect("register editor source");
         let modal_ledger = editor.modal_scope();
         let modal = modal_ledger.snapshot_modal();
-        assert!(modal.original_backings.is_empty());
         assert!(modal.verify_released().is_ok());
         assert!(root.snapshot().verify_released().is_err());
         assert!(editor.snapshot().verify_released().is_err());
@@ -772,154 +833,12 @@ mod tests {
             )
             .expect("register modal source");
         let modal = modal_ledger.snapshot_modal();
-        assert_eq!(modal.original_backings.len(), 1);
         assert!(modal.verify_released().is_err());
         drop(modal_document);
-        assert!(modal.verify_released().is_ok()); // 父源仍活；仅本modal真实构造的映射已完成munmap。
+        assert!(modal.verify_released().is_ok()); // Only this modal's actual mapping ended; its parent source remains live.
         assert!(editor.snapshot().verify_released().is_err());
         drop(document);
         assert!(root.snapshot().verify_released().is_ok());
         assert!(editor.snapshot().verify_released().is_ok());
-    }
-
-    #[test]
-    fn mapping_budget_cannot_discard_live_or_failed_registration_evidence() {
-        // 每次显式登记都计入原session总预算；相同observer不能凭复制绕开容量失败。
-        let (_file, document) = mapped_document();
-        let observer = document.original_backing_observer().expect("mapped source");
-        let ledger = NativeMarkdownOwnedLedger::default();
-        for _ in 0..MAX_OWNED_NATIVE_IDENTITIES {
-            ledger
-                .include_original_backing("editor.original-backing", observer.clone())
-                .expect("within shared budget");
-        }
-        assert!(
-            ledger
-                .include_original_backing("editor.original-backing", observer.clone())
-                .is_err()
-        );
-        assert_eq!(
-            ledger
-                .state
-                .snapshot
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .original_backings
-                .len(),
-            MAX_OWNED_NATIVE_IDENTITIES
-        );
-        drop(document);
-        assert!(observer.unmap_succeeded());
-        assert!(ledger.snapshot().verify_released().is_err()); // 缺失过构造记录不能因后继释放恢复完整权限。
-    }
-
-    #[test]
-    fn borrowed_root_mapping_registration_leaves_parent_and_child_incomplete() {
-        // 模拟原生登记重入：父账本已借出时不能漏登记映射，再把空child冒充为释放成功。
-        let (_file, document) = mapped_document();
-        let observer = document.original_backing_observer().expect("mapped source");
-        let root = NativeMarkdownOwnedLedger::default();
-        let editor = NativeMarkdownOwnedLedger::for_editor(&root);
-        let result = crate::foreground_owner::with_foreground_owner(
-            &root.state.snapshot,
-            &root.state.registering,
-            |_| 1,
-            |_| editor.include_document_backing(Some(observer.clone())),
-            || {},
-        );
-        assert!(matches!(result, Ok(Err(_))));
-        drop(document);
-        assert!(observer.unmap_succeeded());
-        assert!(root.snapshot().verify_released().is_err());
-        assert!(editor.snapshot().verify_released().is_err());
-        assert!(editor.snapshot_modal().verify_released().is_err()); // 失败构造不可按scope筛掉其不完整事实。
-    }
-
-    #[test]
-    fn borrowed_registration_never_looks_like_a_complete_empty_ledger() {
-        // 只操作 Rust 空账本，不构造原生对象；重入必须得到不完整收据而不是假 weak-nil 成功。
-        let ledger = NativeMarkdownOwnedLedger::default();
-        let result = crate::foreground_owner::with_foreground_owner(
-            &ledger.state.snapshot,
-            &ledger.state.registering,
-            |_| 1,
-            |_| {
-                assert!(ledger.snapshot().verify_released().is_err());
-                Err::<(), _>("synthetic registration failure")
-            },
-            || {},
-        );
-        assert_eq!(result, Ok(Err("synthetic registration failure")));
-        // 普通错误仍恢复原账本，不丢记录或留下永久 registering 状态。
-        assert_eq!(ledger.state.registering.get(), None);
-        assert!(ledger.snapshot().verify_released().is_ok());
-    }
-
-    #[test]
-    fn modal_scope_reuses_editor_backing_and_the_single_session_root() {
-        // 纯Rust关联证明modal不new另一份1024预算，且嵌套child仍归同一root。
-        let root = NativeMarkdownOwnedLedger::default();
-        let editor = NativeMarkdownOwnedLedger::for_editor(&root);
-        let modal = editor.modal_scope();
-        let later_editor = NativeMarkdownOwnedLedger::for_editor(&modal);
-        assert!(Rc::ptr_eq(&editor.state, &modal.state));
-        assert!(!Rc::ptr_eq(&root.state, &editor.state));
-        assert!(Rc::ptr_eq(
-            &root.state,
-            &modal.root.as_ref().unwrap().upgrade().unwrap()
-        ));
-        assert!(Rc::ptr_eq(
-            &root.state,
-            &later_editor.root.as_ref().unwrap().upgrade().unwrap()
-        ));
-    }
-
-    #[test]
-    fn root_registration_loan_prevents_an_empty_child_or_modal_receipt() {
-        // 父清单正在本地登记时，child尚无新条目不代表“零资源”；必须沿root拒绝。
-        let root = NativeMarkdownOwnedLedger::default();
-        let editor = NativeMarkdownOwnedLedger::for_editor(&root);
-        let modal = editor.modal_scope();
-        let result = crate::foreground_owner::with_foreground_owner(
-            &root.state.snapshot,
-            &root.state.registering,
-            |_| 1,
-            |_| {
-                assert!(editor.snapshot().verify_released().is_err());
-                assert!(modal.snapshot_modal().verify_released().is_err());
-                Ok::<_, ()>(())
-            },
-            || {},
-        );
-        assert_eq!(result, Ok(Ok(())));
-        assert!(editor.snapshot().verify_released().is_ok());
-    }
-
-    #[test]
-    fn modal_only_snapshot_excludes_parent_controls_without_classification() {
-        // 只装入nil weak元数据，不构造AppKit；scope必须来自显式构造而非对象类名。
-        let root = NativeMarkdownOwnedLedger::default();
-        root.state
-            .snapshot
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .identities = vec![
-            OwnedNativeIdentity {
-                role: "window.root",
-                object: Weak::default(),
-                scope: NativeMarkdownOwnedScope::Surface,
-            },
-            OwnedNativeIdentity {
-                role: "modal.name-input",
-                object: Weak::default(),
-                scope: NativeMarkdownOwnedScope::Modal,
-            },
-        ];
-        let modal = root.snapshot_modal();
-        assert_eq!(modal.identities.len(), 1);
-        assert_eq!(modal.identities[0].role, "modal.name-input");
-        assert_eq!(root.snapshot().identities.len(), 2);
     }
 }

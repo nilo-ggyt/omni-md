@@ -1,4 +1,5 @@
-//! 真实piece源上的有限table结构请求；当前只签发内部结构票据，不冒充完整语义Ready。
+//! A bounded table-structure request over actual source pieces. Its internal
+//! structural receipt does not stand in for the later complete semantic Ready.
 
 use super::table_source::MarkdownTableSourceIdentity;
 use super::*;
@@ -34,10 +35,12 @@ use pulldown_cmark::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// viewport查询使用真实UTF16；导航查询使用H物理身份与绝对row ordinal。
+/// Viewport lookup uses actual UTF-16 positions; row navigation uses physical
+/// header identity and an absolute row ordinal.
 pub enum MarkdownTableWindowTarget {
     AtUtf16(usize),
-    /// 寻找首个与viewport相交的真实表；顶部普通段落不能否定视口下方的表格。
+    /// Find the first actual table intersecting the viewport. Ordinary text at
+    /// its top does not prove that no table exists farther down the same viewport.
     FirstTableInViewport,
     RequiredRow {
         header_byte_start: usize,
@@ -47,15 +50,19 @@ pub enum MarkdownTableWindowTarget {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownTableRequestError {
-    /// 原源读取/归还真实失败；取消和结构坐标错误不得遮住它。
+    /// Actual original Source read/reclaim failure, preserved by its owning public
+    /// boundary rather than reclassified as cancellation or structural coordinates.
     Source(MarkdownDocumentBufferError),
-    /// 同一Root行内任务的匿名匹配栈真实IO首错；不返回半份样式或把短读改为空目录。
+    /// Actual first I/O failure of this Root inline job's anonymous matching stack.
+    /// Do not return partial styles or reinterpret a short read as an empty index.
     InlineStorageUnavailable(i32),
     InvalidRequest,
     SourceSuperseded,
-    /// 续体只接受本请求最后一次发布的 opaque 权限，不能借同代次的另一批或旧发布续读。
+    /// Continuation requires this request's last opaque publication, not another
+    /// same-generation batch or an earlier publication.
     PublicationSuperseded,
-    /// 所需左侧或内部区间尚无真实覆盖；调用方需要可信 checkpoint，不能暗中从源起点重扫。
+    /// Required left/interior coverage lacks an actual checkpoint. The caller
+    /// cannot silently restart from source zero and pretend it continued existing coverage.
     CoverageRequiresCheckpoint,
     Cancelled,
     WorkLimit,
@@ -64,7 +71,8 @@ pub enum MarkdownTableRequestError {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-/// 真实重放读取和状态转换均累计；不把source推进距离当作实际CPU读取量。
+/// Accumulate actual replay reads and state transitions. Source cursor distance
+/// is not a substitute for the work already performed.
 pub(crate) struct MarkdownTableRequestWork {
     pub byte_reads: usize,
     pub transitions: usize,
@@ -80,8 +88,10 @@ pub(crate) enum MarkdownTableStructureStep {
 }
 
 #[derive(Debug)]
-/// 只有本模块消费真实GlobalFact的路径能构造；不公开可伪造的字段或From转换。
-/// 它仅证明成员与坐标，尚未证明引用、下划线和继承样式，不可直接交Native隐藏正文。
+/// Only the actual GlobalFact consumer can construct this receipt; fields and
+/// conversion constructors remain private. It proves membership/coordinates only,
+/// not references, underline or inherited styles, and cannot authorize Native to
+/// hide source text directly.
 pub(crate) struct MarkdownTableStructuralWindow {
     source: MarkdownTableSourceIdentity,
     header: GlobalTableFact,
@@ -97,7 +107,8 @@ pub(crate) struct MarkdownTableStructuralWindow {
 }
 
 impl MarkdownTableStructuralWindow {
-    /// 内部结构票据进入语义阶段时仍核原root/代次，不能由相同整数坐标替代其源权限。
+    /// Semantic admission still checks the original root/generation. Equal
+    /// integer coordinates cannot replace the structural receipt's Source identity.
     fn is_current(&self, document: &MarkdownDocumentBuffer) -> bool {
         self.source.is_current(document)
     }
@@ -129,7 +140,8 @@ struct ActiveTable {
     found: bool,
     include_header: bool,
     first_overflow: Option<usize>,
-    // 只保真实D边界、当前接受点与前驱；不为所有历史行建立checkpoint目录。
+    // Retain the actual delimiter boundary, current accepted boundary and its
+    // predecessor, without building a checkpoint directory for every past row.
     base_boundary: Option<Boundary>,
     boundary: Option<Boundary>,
     halo_boundary: Option<Boundary>,
@@ -137,8 +149,9 @@ struct ActiveTable {
     chunk_halo: Option<Boundary>,
 }
 
-/// 请求不持document、mapping或正文String；每次advance由当前owner借一片真实源。
-/// Pending/结构完成/未发现分别记录，失败sticky，不在失败后继续扫到假Complete。
+/// The request retains no document, mapping or text String. Each advance borrows
+/// one actual source frame from its current owner. Pending, structural completion
+/// and absence are distinct; sticky failure cannot resume toward a false Complete.
 pub(crate) struct MarkdownTableWindowStructureRequest {
     source: MarkdownTableSourceIdentity,
     target: MarkdownTableWindowTarget,
@@ -147,7 +160,8 @@ pub(crate) struct MarkdownTableWindowStructureRequest {
     viewport: Range<usize>,
     global: Option<GlobalFrontier>,
     pending: Option<GlobalFact>,
-    // 仅 source-aware 包装入口启用；旧 table-only 调用仍直接忽略普通块事实。
+    // Enabled only by the source-aware wrapper. Table-only consumers deliberately
+    // ignore ordinary-block facts rather than create an unrelated source inventory.
     capture_ordinary: bool,
     ordinary_pending: Option<CapturedOrdinary>,
     coordinates: Option<HeaderCoordinates>,
@@ -162,7 +176,8 @@ pub(crate) struct MarkdownTableWindowStructureRequest {
 }
 
 impl MarkdownDocumentBuffer {
-    /// 每个请求绑定当前非空piece root；target/viewport都是已知真实坐标，不探测个人文件。
+    /// Bind this request to the current nonempty piece root. Target/viewport are
+    /// supplied actual coordinates, without probing other personal files.
     pub(crate) fn table_window_structure_request(
         &self,
         target: MarkdownTableWindowTarget,
@@ -178,7 +193,8 @@ impl MarkdownDocumentBuffer {
             || matches!(target, MarkdownTableWindowTarget::FirstTableInViewport)
                 && viewport.is_empty()
         {
-            // 不允许窗口上限被无界请求扩大，也不让EOF caret越界被误认作源成员。
+            // A caller cannot widen the bounded viewport or turn an out-of-range
+            // EOF caret into evidence of membership in an actual source table.
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
         let max_byte_work = self
@@ -238,8 +254,10 @@ impl MarkdownTableWindowStructureRequest {
         self.total
     }
 
-    /// 每步总byte与转换均≤调用预算；真实结构Fact在下一step消费，避免原scanner用满预算后
-    /// 又同步做坐标查询/分配。所有源借用都随本纯函数返回结束，不允许越过Native回调。
+    /// Keep per-step byte/transition work within the caller's allowance. Consume
+    /// actual structure facts on the next step so a Scanner that used all its
+    /// fuel is not followed by hidden coordinate work or allocation. Source leases
+    /// end within this Rust call and never cross a native callback.
     pub(crate) fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -280,7 +298,8 @@ impl MarkdownTableWindowStructureRequest {
                 if self.total.byte_reads > self.max_byte_work
                     || self.total.transitions > self.max_transitions
                 {
-                    // 元数据与spine共享请求总fuel，不因切换结构子阶段重置累计量。
+                    // Metadata and spine work share this request's lifetime fuel;
+                    // entering another structural phase does not reset its totals.
                     self.fail(MarkdownTableRequestError::WorkLimit);
                     return Err(MarkdownTableRequestError::WorkLimit);
                 }
@@ -294,8 +313,9 @@ impl MarkdownTableWindowStructureRequest {
     }
 
     fn fail(&mut self, error: MarkdownTableRequestError) {
-        // 首错撤权同时释放派生metadata/共享spine与全部容量；source只保Weak身份，
-        // 不触用户canonical正文/history，也不让过期Ready继续通过getter。
+        // Revoke on the first failure and drop derived metadata/shared spine and
+        // their capacities. Source retains only weak identity; canonical text and
+        // history stay untouched, and stale Ready cannot escape through getters.
         self.failed = Some(error);
         self.global = None;
         self.pending = None;
@@ -338,7 +358,8 @@ impl MarkdownTableWindowStructureRequest {
             });
         }
         if self.ordinary_pending.is_some() {
-            // 原票据尚未移交时暂停同一 Global，不覆盖 pending 或暗中扫描下一个普通块。
+            // Pause this same Global until its original receipt is transferred.
+            // Do not overwrite pending or silently scan another ordinary block.
             return Ok(MarkdownTableStructureStep::Progress {
                 work: MarkdownTableRequestWork::default(),
             });
@@ -347,7 +368,8 @@ impl MarkdownTableWindowStructureRequest {
             return self.advance_coordinates(document, budget);
         }
         if let Some(fact) = self.pending.take() {
-            // 一个Fact只包含有限metadata；消费它不重复读取已经完成结构扫描的原行。
+            // One fact carries bounded metadata. Consuming it does not reread a
+            // source row whose structural scan has already finished.
             return self.consume_fact(document, fact, budget);
         }
         let source_tree_steps = tree_height(document);
@@ -374,7 +396,8 @@ impl MarkdownTableWindowStructureRequest {
                 child_budget,
             )
             .map_err(MarkdownTableRequestError::Global);
-        // 回收成功后才消费step，不能让原parser提前终止遮住真实映射错误。
+        // Consume the Parser result only after the actual frame returns. Early
+        // Parser completion cannot turn a reclaim failure into structural success.
         frame
             .finish()
             .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
@@ -414,8 +437,9 @@ impl MarkdownTableWindowStructureRequest {
         };
         match fact {
             GlobalFact::Table(header) => {
-                // 坐标前缀只定位一个真实leaf；H/D正文的UTF16计量在后继有界step完成。
-                // 不调用旧utf16_offset_for_byte重复解码最多64KiB编辑leaf。
+                // Locate one actual boundary leaf now; measure header/delimiter
+                // UTF-16 in later bounded steps. Avoid the general offset lookup
+                // repeatedly decoding a potentially 64 KiB edited leaf prefix.
                 let coordinates = HeaderCoordinates::new(document, header, budget)?;
                 let source_tree_steps = tree_height(document);
                 self.coordinates = Some(coordinates);
@@ -474,7 +498,8 @@ impl MarkdownTableWindowStructureRequest {
                     return Ok(MarkdownTableStructureStep::StructureReady { work });
                 }
                 if current.found && !selected {
-                    // 已越过所需窗口：不读取额外row正文，也不把本地最后row标作整表末尾。
+                    // Coverage has passed this window: read no extra row body,
+                    // and do not promote its local last row into the table's End.
                     if self.continuous {
                         self.pending = Some(GlobalFact::Row(row));
                     }
@@ -492,7 +517,9 @@ impl MarkdownTableWindowStructureRequest {
                         ));
                     }
                     if current.body.len() == maximum_body {
-                        // target可能在viewport中间：首批先满仍须继续证明target属同表，不能漏前部可见row。
+                        // Target may lie inside the viewport. Even when the first
+                        // chunk fills earlier, prove same-table target membership
+                        // without dropping the already-visible preceding rows.
                         current.first_overflow.get_or_insert(row.row_ordinal);
                         if current.found {
                             if self.continuous {
@@ -504,12 +531,14 @@ impl MarkdownTableWindowStructureRequest {
                     }
                     if current.first_overflow.is_none() {
                         if current.body.is_empty() {
-                            // 当前Row的前一真实边界用于后续定位回放，不按窗口位置重造checkpoint。
+                            // Save this row's actual predecessor for later replay;
+                            // viewport positions cannot manufacture a checkpoint.
                             current.chunk_boundary = current.boundary.clone();
                             current.chunk_halo = current.halo_boundary.clone();
                         }
                         current.body.push(row);
-                        // 与刚发布 Row 同一 accepted checkpoint 捕原行，不以窗口范围重造 TableCell 来源。
+                        // Capture the original row from the same accepted checkpoint
+                        // as its Row fact, not from a window-derived TableCell range.
                         current.inline_rows.push(
                             self.global
                                 .as_ref()
@@ -519,7 +548,8 @@ impl MarkdownTableWindowStructureRequest {
                         );
                     }
                 }
-                // 同一Global已经接受完整行与checkpoint；不为不存在的公式渲染再读一次源。
+                // This same Global has accepted the complete row/checkpoint.
+                // No disabled display extension justifies another source read.
                 let checkpoint = self
                     .global
                     .as_ref()
@@ -536,26 +566,30 @@ impl MarkdownTableWindowStructureRequest {
                 if matches!(self.target, MarkdownTableWindowTarget::RequiredRow { header_byte_start, .. }
                     if header_byte_start == end.header_byte_start())
                 {
-                    // 缺少后继row与“不属于table”不同；保留真实Ended签发的opaque证明，
-                    // 上层还须核当前格确为该末行/末列，不能仅凭请求坐标授权append。
+                    // A missing successor row is distinct from not being a table.
+                    // Retain the actual Ended proof; upper layers still verify
+                    // final row/column before append, rather than trusting request coordinates.
                     self.required_row_end = Some(end);
                     self.current = None;
                     self.global = None;
                     return Ok(MarkdownTableStructureStep::TableEndReached { work });
                 }
-                // 目标不属于此table；drop旧checkpoint/metadata后继续真实全局frontier，不保历史表目录。
+                // The target is outside this table. Drop its checkpoint/metadata
+                // and continue the same Global, without retaining a table-history index.
                 self.current = None;
             }
-            GlobalFact::Reference(_) | GlobalFact::Footnote(_) => {} // 结构查找不存全文ref目录；有限查询库存形成后另从真实源顺序解析。
+            GlobalFact::Reference(_) | GlobalFact::Footnote(_) => {} // Structure lookup retains no document-wide reference index; bounded queries later resolve actual source order.
             GlobalFact::InlineBlock(block) => {
                 if self.capture_ordinary {
-                    // 保留同一真实前沿的 opaque capture；后继只能消费它，不能从 gap 重建 paragraph。
+                    // Retain this same actual frontier's opaque capture. A later
+                    // consumer cannot reconstruct a paragraph from a gap range.
                     self.ordinary_pending = Some(CapturedOrdinary::Inline(block));
                 }
             }
             GlobalFact::LeafBlock(block) => {
                 if self.capture_ordinary {
-                    // Leaf 尚无逐行 prefix 权限；移交原票据只证明真实闭合来源，不制造 ordinary Ready。
+                    // Leaf has no per-line prefix permission yet. Transferring its
+                    // original closed-source receipt does not create ordinary Ready.
                     self.ordinary_pending = Some(CapturedOrdinary::Leaf(block));
                 }
             }
@@ -596,7 +630,8 @@ impl MarkdownTableWindowStructureRequest {
         if found {
             validate_columns(header.columns)?;
         }
-        // H/D的坐标与原Global checkpoint已完成，直接建立首条body的真实回放入口。
+        // Header/delimiter coordinates and original Global checkpoint are complete;
+        // establish the actual replay entrance for the first body row directly.
         let boundary = Boundary::after_delimiter(checkpoint.clone(), &header, delimiter_utf16.end);
         self.current = Some(ActiveTable {
             header,
@@ -631,13 +666,15 @@ impl MarkdownTableWindowStructureRequest {
             && coordinate.boundary_index > 0
             && coordinate.values[0] >= self.viewport.end
         {
-            // 首个已验证H已在窗口之后，真实源顺序排除了此前gap内的任何表。
-            // 不为窗口外巨header继续解码H/D整行或创建下一个checkpoint。
+            // The first verified header is beyond the viewport. Actual source
+            // order excludes a table in the preceding gap; do not decode the rest
+            // of an offscreen giant header/delimiter or create another checkpoint.
             if !self.continuous {
                 self.coordinates = None;
                 self.global = None;
             }
-            // 连续批保留已验证下表H及其尚未完成的坐标游标，后继viewport不重建源起点。
+            // A continuous batch keeps that verified next header and unfinished
+            // coordinate cursor, so later viewports do not restart from source zero.
             self.current = None;
             self.no_table = true;
             return Ok(MarkdownTableStructureStep::NotTable { work });
@@ -664,8 +701,10 @@ impl MarkdownTableWindowStructureRequest {
         if !current.found {
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
-        // 连续消费者仅移交本窗metadata；同一frontier与已接受行边界继续归活动表所有。
-        // first未消费Row已由调用者保留pending，下一窗先消费它，不能从越过该行的checkpoint跳过。
+        // Continuous consumption transfers only this window's metadata. The active
+        // table retains the same frontier and accepted boundary. The caller saved
+        // the first unconsumed Row in pending; the next window must consume it,
+        // not resume from a checkpoint already beyond it.
         self.ready = Some(MarkdownTableStructuralWindow {
             source: self.source.clone(),
             header: current.header,
@@ -694,14 +733,17 @@ impl MarkdownTableWindowStructureRequest {
             }),
         });
         if !self.continuous {
-            // standalone仍须同源代码分类；语义事务结束时再释放原Global，不能另建第二个producer。
+            // Standalone semantics still need same-source code classification.
+            // Release the original Global when that transaction ends, not by
+            // substituting a second producer for this structural result.
             self.current = None;
         } else if self
             .ready
             .as_ref()
             .is_some_and(|ticket| ticket.table_end.is_some())
         {
-            // Global真实Ended已经回到原外层spine；保留Global继续下一块，不保不存在的活动表。
+            // Actual Global Ended restored the outer spine. Keep Global for the
+            // next block without retaining a table that is no longer active.
             self.current = None;
         } else {
             let current = self.current.as_mut().unwrap();
@@ -728,7 +770,8 @@ impl MarkdownTableWindowStructureRequest {
         Ok(self.required_row_end.as_ref())
     }
 
-    /// 只有相同source root/代次可借票据；返回值仍是结构阶段，尚非允许隐藏正文的语义window。
+    /// Borrow only under the same Source root/generation. The returned receipt is
+    /// still structural, not a semantic window authorized to hide source text.
     #[cfg(test)]
     pub(crate) fn structural_window_for(
         &self,
@@ -754,6 +797,8 @@ fn validate_columns(columns: usize) -> Result<(), MarkdownTableRequestError> {
     }
 }
 fn global_work(work: GlobalWork, source_tree_steps: usize) -> MarkdownTableRequestWork {
+    // Directory descent and fixed control belong to this same step. These are
+    // logical work units, not a measurement of OS page residency or elapsed CPU time.
     MarkdownTableRequestWork {
         byte_reads: work.byte_reads,
         transitions: work.transitions + source_tree_steps + 64,
@@ -761,10 +806,12 @@ fn global_work(work: GlobalWork, source_tree_steps: usize) -> MarkdownTableReque
     }
 }
 
-// 原AVL路径上界加有限共享目录工作上界；实际正文借用仍只落在一个4KiB逻辑片。
+// Reserve the original AVL path plus bounded shared-directory work. Actual text
+// borrowing remains within one logical 4 KiB piece, independently of OS page size.
 fn tree_height(document: &MarkdownDocumentBuffer) -> usize {
     document.root.as_ref().map_or(0, |root| {
-        // 单个普通Leaf没有共享目录，保持原步进切点；其余路径预留一个有限目录的最坏成本。
+        // A single ordinary Leaf has no compact directory. Other paths reserve
+        // that bounded directory's worst-case work in addition to tree descent.
         let directory = if matches!(root.as_ref(), MarkdownPieceTreeNode::Leaf(_)) {
             0
         } else {
@@ -774,6 +821,8 @@ fn tree_height(document: &MarkdownDocumentBuffer) -> usize {
     })
 }
 fn child_budget(budget: usize, tree: usize) -> Result<usize, MarkdownTableRequestError> {
+    // Admit indivisible control/tree work before handing the remaining fuel to
+    // the original Scanner, whose real minimum cannot be borrowed for outer work.
     let child = budget
         .checked_sub(tree + 64)
         .ok_or(MarkdownTableRequestError::InvalidRequest)?;
@@ -798,7 +847,8 @@ impl HeaderCoordinates {
         budget: usize,
     ) -> Result<Self, MarkdownTableRequestError> {
         if tree_height(document).saturating_add(64) > budget {
-            // 定位路径本身也必须先准入，不能借低byte消耗隐形走过任意高树。
+            // Admit directory traversal itself; few byte reads cannot conceal
+            // an arbitrarily deep tree walk in this step's work accounting.
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
         let mut node = document
@@ -807,20 +857,24 @@ impl HeaderCoordinates {
             .ok_or(MarkdownTableRequestError::InvalidRequest)?;
         let mut local = header.header_byte_start;
         let mut before_utf16 = 0;
-        // 缓存AVL高度给出有限路径准入；只加完整左子树metrics，不解码整个leaf。
+        // Cached AVL height bounds this path. Add complete left-subtree metrics,
+        // without decoding an entire leaf just to locate the starting prefix.
         while let MarkdownPieceTreeNode::Branch { left, right, .. } = node {
             if local < left.metrics().byte_len {
-                // 查询点位于左子树，右侧完整metrics不进入前缀。
+                // The position lies in the left subtree; right metrics contribute
+                // nothing to the prefix before the requested source boundary.
                 node = left;
             } else {
-                // 完整左子树直接复用缓存计量，只把剩余byte位置带入右侧。
+                // Reuse the complete left aggregate and carry only the remaining
+                // byte offset into the right subtree.
                 local -= left.metrics().byte_len;
                 before_utf16 += left.metrics().utf16_len;
                 node = right;
             }
         }
         if let MarkdownPieceTreeNode::OriginalSpan(span) = node {
-            // 合组叶只压缩元数据；从命中4KiB小片起计量，不能把整个64KiB叶前缀借入正文。
+            // The compact span compresses metadata only. Measure from the hit
+            // 4 KiB piece instead of borrowing a whole 64 KiB span prefix as text.
             let hit = span
                 .locate_byte(local, true)
                 .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
@@ -858,7 +912,8 @@ impl HeaderCoordinates {
             source_tree_steps,
         };
         loop {
-            // 相邻H.end/D.start只记录同一真实边界两次；固定4项，不按源长扩大元数据。
+            // Adjacent header-end/delimiter-start records may name one boundary
+            // twice. Four fixed slots suffice regardless of the source length.
             while self.boundary_index < 4 && self.boundaries[self.boundary_index] == self.next {
                 self.values[self.boundary_index] = self.utf16;
                 self.boundary_index += 1;
@@ -881,8 +936,10 @@ impl HeaderCoordinates {
                     .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
                 return Ok((work, false));
             };
-            // piece root的构造/编辑已经验证UTF8，真实H/D范围在scalar边界；continuation byte
-            // 不重复计量，4-byte scalar贡献两个UTF16 unit，即使frame切在scalar内部也保持一致。
+            // Piece construction/editing already validated UTF-8, and actual
+            // header/delimiter endpoints are scalar boundaries. Count leading
+            // bytes only: a four-byte scalar contributes two UTF-16 units even
+            // when a frame boundary cuts its continuation bytes.
             self.utf16 += if *byte < 0x80 || *byte >= 0xc0 {
                 if *byte >= 0xf0 { 2 } else { 1 }
             } else {

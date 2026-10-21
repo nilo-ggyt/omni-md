@@ -1,8 +1,10 @@
-//! 同一冻结树的可打印ASCII后缀证明；只保树路径和一个UTF8残余，不捕获第二份正文。
+//! Prove printable ASCII on one frozen range using a tree path and one UTF-8 remainder, not copied text.
 
 use super::*;
 
 enum Pending {
+    // Nodes and compact span records retain immutable metrics and physical piece
+    // coordinates only. Leaf progress carries at most one incomplete scalar.
     Node(Arc<MarkdownPieceTreeNode>, usize),
     Span {
         span: OriginalSpan,
@@ -21,10 +23,11 @@ enum Pending {
     },
 }
 
-/// 起点到调用方真实端点的原树事实；Weak只认证原Frozen，路径不会增加正文或Reader所有权。
+/// Original facts through the requested endpoint; a weak Frozen identity authorizes the retained path.
 pub(crate) struct FrozenPrintableAsciiSuffix {
     origin: std::sync::Weak<FrozenText>,
-    // 显示正文的删符与样式目录独立于原树；不会把其空 root 认证为全 ASCII。
+    // A display source has its own deleted-marker/style directory; its absent
+    // canonical root cannot be treated as an empty all-ASCII document.
     #[cfg(feature = "s2-table-window-prototype")]
     projection: Option<Box<display_projection::algorithms::ProjectionPrintableAsciiSuffix>>,
     pending: Vec<Pending>,
@@ -41,15 +44,20 @@ pub(crate) struct FrozenPrintableAsciiSuffixStep {
     pub(crate) metadata: usize,
     pub(crate) maximum_borrow: usize,
     pub(crate) answer: Option<bool>,
-    // 只有answer=true才授完整范围的保守包络；部分正节点可贡献更宽域，不能据此反推精确字符集合。
+    // Only a true answer authorizes an envelope for the complete range. Positive
+    // partial nodes may widen it conservatively; this is not an exact character set.
     pub(crate) minimum: u8,
     pub(crate) maximum: u8,
 }
 
 impl FrozenPrintableAsciiSuffix {
     pub(in super::super) fn new(snapshot: &MarkdownTextSnapshot, range: Range<usize>) -> Self {
+        // Construction retains the original identity and metadata path, without
+        // borrowing a boundary leaf or allocating a second source/text owner.
         #[cfg(feature = "s2-table-window-prototype")]
         if let Some(projection) = snapshot.display_projection() {
+            // Keep projection traversal on the same original display source; a
+            // missing canonical tree does not authorize the ordinary empty path.
             return Self {
                 origin: Arc::downgrade(&snapshot.text),
                 projection: Some(Box::new(
@@ -92,10 +100,11 @@ impl FrozenPrintableAsciiSuffix {
                 self.minimum.min(minimum)
             };
             self.maximum = self.maximum.max(maximum);
-        } // 空节点没有字符；不能把空集合哨兵当作范围内真实NUL。
+        } // Empty nodes contribute no character; zero is not evidence of a selected NUL.
     }
 
-    /// 所有目录收费后才展开；部分混合叶可按一字节量子续接，实际lease在本步返回前结束。
+    /// Charge every directory expansion and resume mixed leaves across one-byte quanta.
+    /// Actual leases end within this step; the snapshot entry point checks source health around it.
     pub(in super::super) fn advance(
         &mut self,
         snapshot: &MarkdownTextSnapshot,
@@ -105,7 +114,7 @@ impl FrozenPrintableAsciiSuffix {
     ) -> Result<FrozenPrintableAsciiSuffixStep, MarkdownDocumentBufferError> {
         if !std::sync::Weak::ptr_eq(&self.origin, &Arc::downgrade(&snapshot.text)) {
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
-        } // 同文本的另一Frozen不能替换实际来源及其资源健康。
+        } // Equal text from another Frozen value cannot replace the original resource authority.
         #[cfg(feature = "s2-table-window-prototype")]
         if let Some(cursor) = &mut self.projection {
             return cursor.advance(
@@ -118,6 +127,8 @@ impl FrozenPrintableAsciiSuffix {
             );
         }
         let mut step = FrozenPrintableAsciiSuffixStep {
+            // Report only this quantum's actual work while retaining the original
+            // cumulative candidate and envelope on the cursor itself.
             bytes: 0,
             scalars: 0,
             metadata: 0,
@@ -129,10 +140,12 @@ impl FrozenPrintableAsciiSuffix {
         while self.answer.is_none() {
             let Some(next) = self.pending.last() else {
                 self.answer = Some(!self.rejected);
-                break; // 原相交路径真正耗尽才取得完整范围事实，配额耗尽绝不产生正证明。
+                break; // Only exhaustion of the actual intersecting path completes the range proof.
             };
             if matches!(next, Pending::Leaf { .. }) {
                 if step.bytes == maximum_bytes || step.scalars == maximum_scalars {
+                    // A quota boundary leaves the original continuation pending;
+                    // it cannot manufacture EOF or a positive answer.
                     break;
                 }
                 let Some(Pending::Leaf {
@@ -148,8 +161,10 @@ impl FrozenPrintableAsciiSuffix {
                 };
                 if utf16 == self.range.end {
                     self.answer = Some(!self.rejected);
-                    break; // 两端均已由真实scalar或原节点边界验证，不再借范围外后继。
+                    break; // Both endpoints are original scalar/node boundaries; do not borrow a successor.
                 }
+                // Bound the requested slice by remaining byte/scalar work, the
+                // logical 4-KiB lease limit, the actual piece and requested endpoint.
                 let count = (maximum_bytes - step.bytes)
                     .min(maximum_scalars - step.scalars)
                     .min(crate::MARKDOWN_LAYOUT_SOURCE_BYTES)
@@ -162,6 +177,8 @@ impl FrozenPrintableAsciiSuffix {
                 step.maximum_borrow = step.maximum_borrow.max(bytes.len());
                 let mut failure = None;
                 for &value in &*bytes {
+                    // Keep at most one UTF-8 scalar across quanta. Invalid leading
+                    // bytes and invalid completed encodings remain typed source errors.
                     if used == 0 {
                         needed = match value {
                             0..=0x7f => 1,
@@ -194,14 +211,14 @@ impl FrozenPrintableAsciiSuffix {
                     {
                         failure = Some(MarkdownDocumentBufferError::NotUnicodeBoundary);
                         break;
-                    } // 任一端点切入代理项都不能被已有反例或正聚合掩盖。
+                    } // A surrogate-interior endpoint is invalid even after an earlier counterexample.
                     if utf16 >= self.range.start {
                         if (' '..='~').contains(&scalar) {
                             self.include(scalar as u8, scalar as u8);
                         } else {
                             self.rejected = true;
                         }
-                    } // 负事实不能短路末端标量校验；完整中间节点仍可只消费已有聚合。
+                    } // A negative fact cannot skip final endpoint validation; complete nodes still use aggregates.
 
                     utf16 = end;
                     used = 0;
@@ -210,12 +227,16 @@ impl FrozenPrintableAsciiSuffix {
                         break;
                     }
                 }
+                // Return the actual lease before publishing a scalar/error or
+                // preserving continuation; reclaim/source failure outranks the candidate.
                 bytes.finish()?;
-                snapshot.text.source_health()?; // 真实归还失败优先于刚算出的候选答案。
+                snapshot.text.source_health()?;
                 if let Some(error) = failure {
                     return Err(error);
                 }
                 if self.answer.is_none() && byte != piece.byte_len {
+                    // Resume this same piece and scalar remainder after yielding;
+                    // never restart at its prefix or retain borrowed body bytes.
                     self.pending.push(Pending::Leaf {
                         piece,
                         utf16,
@@ -228,6 +249,8 @@ impl FrozenPrintableAsciiSuffix {
                 continue;
             }
             if step.metadata == maximum_metadata {
+                // Directory work has its own budget; unvisited nodes remain in
+                // original order instead of being implicitly certified by the quota.
                 break;
             }
             step.metadata += 1;
@@ -236,21 +259,23 @@ impl FrozenPrintableAsciiSuffix {
                     let metrics = node.metrics();
                     let end = base + metrics.utf16_len;
                     if end <= self.range.start || base >= self.range.end {
-                        continue; // 原节点边界是标量边界；完全不相交不借正文。
+                        continue; // Original node bounds are scalar-aligned; unrelated nodes require no text lease.
                     }
                     if metrics.all_printable_ascii.is_printable() {
                         self.include(
                             metrics.unicode_properties.printable_ascii_min,
                             metrics.unicode_properties.printable_ascii_max,
                         );
-                        continue; // 完整节点包络覆盖本交集，允许保守扩大，绝不能漏未读尾部字符。
+                        continue; // A conservative envelope may widen this intersection, but never omit unread characters.
                     }
                     if self.range.start <= base && end <= self.range.end {
                         self.rejected = true;
-                        continue; // 完整混合节点已有真实反例，仍沿树验证尚未到达的部分末叶。
+                        continue; // A complete mixed node proves false; pending partial endpoints still need validation.
                     }
                     match node.as_ref() {
                         MarkdownPieceTreeNode::Branch { left, right, .. } => {
+                            // Push right before left so the stack visits original
+                            // source order without creating a flat piece list.
                             self.pending.push(Pending::Node(
                                 Arc::clone(right),
                                 base + left.metrics().utf16_len,
@@ -258,6 +283,8 @@ impl FrozenPrintableAsciiSuffix {
                             self.pending.push(Pending::Node(Arc::clone(left), base));
                         }
                         MarkdownPieceTreeNode::OriginalSpan(span) => {
+                            // The physical compact directory may start before its
+                            // selected logical records; charge that prefix explicitly.
                             let ordinal = span.record_range().start;
                             self.pending.push(Pending::Span {
                                 span: span.clone(),
@@ -293,10 +320,12 @@ impl FrozenPrintableAsciiSuffix {
                             byte_edge: byte_edge + metrics.byte_len,
                             prefix: (prefix + 1 < ordinal).then_some(prefix + 1),
                         });
-                        continue; // 真实目录物理前缀逐条收费，不能以一次元数据额度暗读十六项。
+                        continue; // Each physical-prefix record consumes metadata; one unit cannot hide 16 reads.
                     }
                     let metrics = span.word_record_metrics(ordinal)?;
                     if ordinal + 1 < span.record_range().end {
+                        // Preserve the exact next record coordinates before
+                        // classifying this intersection; no byte lease survives here.
                         self.pending.push(Pending::Span {
                             span,
                             ordinal: ordinal + 1,
@@ -313,13 +342,15 @@ impl FrozenPrintableAsciiSuffix {
                             metrics.unicode_properties.printable_ascii_min,
                             metrics.unicode_properties.printable_ascii_max,
                         );
-                        continue; // 真实compact还原的整片域覆盖相交部分，不再借正文。
+                        continue; // The original compact envelope covers this intersection without a text read.
                     }
                     if self.range.start <= base && base + metrics.utf16_len <= self.range.end {
                         self.rejected = true;
                         continue;
                     }
                     self.pending.push(Pending::Leaf {
+                        // Only a partial mixed record needs scalar decoding. Its
+                        // physical piece coordinates still refer to the original source.
                         piece: MarkdownPiece {
                             source: MarkdownPieceSource::Original,
                             byte_start: byte_edge,
@@ -338,7 +369,7 @@ impl FrozenPrintableAsciiSuffix {
         }
         if self.answer.is_some() {
             self.pending.clear();
-        } // 候选完成即交还路径Arc，不把树保留为额外缓存。
+        } // A completed answer releases the exhausted path instead of keeping an extra tree cache.
         step.answer = self.answer;
         step.minimum = self.minimum;
         step.maximum = self.maximum;

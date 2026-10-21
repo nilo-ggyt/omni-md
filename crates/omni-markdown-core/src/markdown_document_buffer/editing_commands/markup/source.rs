@@ -2,7 +2,9 @@
 
 use super::*;
 
-/// 按最多4KiB读取一个原piece区间；true仅表示调用方已找到终止事实，仍须先真实回收成功。
+/// Read an original piece interval through logical windows of at most 4 KiB.
+/// A callback's true means it found a stopping fact; actual lease completion must
+/// still succeed before that fact can be returned to the syntax owner.
 pub(super) fn scan_piece(
     document: &MarkdownDocumentBuffer,
     source: &super::super::super::formatting::streaming::SourcePieceRange,
@@ -20,9 +22,9 @@ pub(super) fn scan_piece(
             .byte_start
             .checked_add(offset)
             .ok_or(MarkdownDocumentBufferError::RangeOutsideDocument)?;
-        window.byte_len = length; // 只作byte lease描述，不把旧metrics作为新树叶发布。
+        window.byte_len = length; // Describe a byte lease only; stale whole-piece metrics never publish as a new tree leaf.
         if document.with_piece_bytes(&window, &mut visit)? {
-            return Ok(true); // callback的终止事实只有finish成功后才可交给语法调用方。
+            return Ok(true); // with_piece_bytes returns only after finish, so the syntax caller cannot consume an unreclaimed candidate.
         }
         offset += length;
     }
@@ -64,11 +66,11 @@ impl SourceCursor {
         document: &MarkdownDocumentBuffer,
     ) -> Result<Option<(char, usize, usize)>, MarkdownDocumentBufferError> {
         if let Some(error) = self.failed {
-            return Err(error); // 原lease失败永久撤销此cursor，不能在后来一次peek中伪装成EOF。
+            return Err(error); // The first lease failure revokes this cursor; a later peek cannot disguise it as EOF.
         }
         if let Err(error) = document.original_backing_health() {
             self.failed = Some(error);
-            return Err(error); // 其他原读取已撤权时，也不能凭本cursor的旧scratch继续发布字符。
+            return Err(error); // Failure observed by another original read also forbids publishing characters from old scratch.
         }
         if let Some(value) = self.pending.take() {
             // Lookahead already advanced the physical cursor and transfers its saved scalar exactly once.
@@ -102,7 +104,7 @@ impl SourceCursor {
             *target = self
                 .byte(document)?
                 .ok_or(MarkdownDocumentBufferError::InvalidUtf8Document)?;
-        } // 4KiB边界可以切入scalar，但只保至多4字节残余，不跨lease借用原内存。
+        } // A scratch boundary may split a scalar; retain at most four bytes, never an original-memory borrow across leases.
         let scalar = std::str::from_utf8(&scalar[..width])
             .map_err(|_| MarkdownDocumentBufferError::InvalidUtf8Document)?
             .chars()
@@ -127,7 +129,7 @@ impl SourceCursor {
                     .byte
                     .checked_add(1)
                     .ok_or(MarkdownDocumentBufferError::RangeOutsideDocument)?;
-                return Ok(Some(byte)); // 一个已回收成功的4KiB窗口供多个scalar复用，不逐scalar msync。
+                return Ok(Some(byte)); // Reuse the successfully returned 4 KiB window for multiple scalars, without per-scalar reclaim operations.
             }
             if let Some(piece) = &mut self.piece
                 && piece.local.start < piece.local.end
@@ -145,7 +147,7 @@ impl SourceCursor {
                     }
                     self.scratch[..length].copy_from_slice(bytes);
                     Ok(())
-                })?; // 只有真实finish成功才发布scratch长度；失败不能消费复制出的前缀。
+                })?; // Publish scratch length only after actual finish succeeds; failure cannot consume a copied prefix.
                 piece.local.start += length;
                 self.scratch_at = 0;
                 self.scratch_len = length;
@@ -154,7 +156,7 @@ impl SourceCursor {
             self.piece = self.pieces.next_piece();
             if self.piece.is_none() {
                 return Ok(None);
-            } // 只有真实元数据遍历终点才是EOF。
+            } // Only exhaustion of actual piece metadata establishes EOF.
         }
     }
 
@@ -168,7 +170,7 @@ impl SourceCursor {
         }
         if let Err(error) = document.original_backing_health() {
             self.failed = Some(error);
-            return Err(error); // 缓存的lookahead也服从同一原backing首错，不重签已知前缀。
+            return Err(error); // Cached lookahead obeys the same original-backing failure and cannot renew a known prefix.
         }
         if self.pending.is_none() {
             // Decode once; the next consumer takes the same saved scalar and original coordinates.
@@ -312,7 +314,7 @@ impl SourceLines {
         &mut self,
         document: &MarkdownDocumentBuffer,
     ) -> Result<Option<SourceLine>, MarkdownDocumentBufferError> {
-        document.original_backing_health()?; // 已观察的原回收失败不能被空行/EOF短路吞掉。
+        document.original_backing_health()?; // Empty lines/EOF cannot short-circuit an already-observed original reclaim failure.
         if self.remaining == 0 {
             // A final empty source line is represented by the aggregate count, never a synthetic sentinel.
             return Ok(None);
@@ -349,7 +351,7 @@ impl SourceLines {
             units: (start_unit, end_unit),
         };
         self.number += 1;
-        self.remaining -= 1; // 失败的行不消费remaining；后续调用继续返回同一cursor首错。
+        self.remaining -= 1; // Failed lines do not consume remaining; subsequent calls retain the same cursor's first error.
         Ok(Some(line))
     }
 }
@@ -404,13 +406,14 @@ mod cursor_tests {
                 },
             )
             .unwrap();
-        // 插入段的真实叶可超过4KiB；emoji首字节恰在4095，确实跨本cursor的scratch边界。
+        // Actual inserted leaves may exceed 4 KiB. The emoji starts at byte 4095,
+        // so decoding really crosses this cursor's bounded scratch boundary.
         let mut cursor = SourceCursor::new(&document, 0..text.len(), 0);
         let mut unit = 0;
         for (byte, scalar) in text.char_indices() {
             let expected = Some((scalar, byte, unit));
             assert_eq!(cursor.peek(&document).unwrap(), expected);
-            assert_eq!(cursor.peek(&document).unwrap(), expected); // 相同lookahead不重复消费原坐标。
+            assert_eq!(cursor.peek(&document).unwrap(), expected); // Repeated lookahead cannot consume original coordinates twice.
             assert_eq!(cursor.next(&document).unwrap(), expected);
             unit += scalar.len_utf16();
         }
@@ -484,7 +487,7 @@ mod cursor_tests {
             document.root.as_ref().unwrap()
         ));
         drop(leases);
-        assert_eq!(cursor.next(&document).unwrap_err(), failure); // 后来可用也不能复活已失败cursor。
+        assert_eq!(cursor.next(&document).unwrap_err(), failure); // Later lease availability cannot revive an already-failed cursor.
         assert!(document.undo.is_empty() && document.redo.is_empty());
     }
 }

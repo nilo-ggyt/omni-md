@@ -19,6 +19,8 @@ impl NativeMarkdownFooterDocument {
         }
     }
     pub(super) fn is_dirty(self) -> bool {
+        // This projected scalar grants no disk/save authority and performs no
+        // document read while a Native caller is holding the footer snapshot.
         self.dirty
     }
 }
@@ -32,6 +34,8 @@ pub(super) enum NativeMarkdownFooterSaveResult {
 }
 impl NativeMarkdownFooterSaveResult {
     fn after_save(self, error: Option<&MarkdownWorkspaceError>) -> Self {
+        // Preserve the outcome of the actual save boundary. A later unrelated
+        // failure cannot silently resolve an already observed external conflict.
         match error {
             None => Self::Current, // Only an actual successful save or a newly installed document clears an old result.
             Some(MarkdownWorkspaceError::SaveConflict) => Self::Conflict,
@@ -52,6 +56,7 @@ impl NativeMarkdownFooterSaveResult {
 
     fn label(self, document: Option<NativeMarkdownFooterDocument>) -> &'static str {
         let Some(document) = document else {
+            // Empty presentation cannot reuse the previous note's save claim.
             return "未打开笔记";
         };
         match self {
@@ -63,7 +68,8 @@ impl NativeMarkdownFooterSaveResult {
     }
 }
 
-/// 只弱观察本笔记已经装配的scroll与Find；没有第二个布局/正文owner。
+/// Weak references to this note's actual scroll and Find controls, without
+/// another body or layout owner.
 #[derive(Clone)]
 pub(super) struct NativeMarkdownDocumentAreaBinding {
     scroll: Weak<NSScrollView>,
@@ -71,8 +77,9 @@ pub(super) struct NativeMarkdownDocumentAreaBinding {
 }
 
 impl NativeMarkdownController {
-    /// 复制完成只借原保存列确认，不改变正文高度、选择或已有错误提示。
-    /// 后续真实编辑、模式或保存通知会重新投影原保存事实，自然撤掉这次短反馈；不另起timer。
+    /// Confirm copy through the existing save column without changing body height,
+    /// selection, or error feedback. Actual edit/mode/save notifications replace
+    /// this temporary projection naturally; no timer owns a second outcome.
     pub(super) fn present_copy_confirmation(&self) {
         let document = self.ivars().footer_document.get();
         let save = self.ivars().footer_save_result.get();
@@ -89,7 +96,7 @@ impl NativeMarkdownController {
             return;
         }
         let Some(labels) = self.ivars().footer_labels.get() else {
-            return; // 已关闭或尚未完整装配的控制器不能为了反馈重建控件。
+            return; // Closed or incomplete construction cannot rebuild controls for feedback.
         };
         // Keep the real save result first. Copying neither certifies persistence nor clears an
         // observed disk conflict or uncertain post-publication durability.
@@ -97,10 +104,11 @@ impl NativeMarkdownController {
         labels[1].setStringValue(&message);
         if current() {
             labels[1].setToolTip(Some(&message));
-        } // Native setter若重入换笔记，旧确认不能覆盖后继tooltip。
+        } // Setter reentry into another note revokes the old tooltip publication.
     }
 
-    /// 新文稿或空态清除上一个笔记的保存结果；只缓存四个显示标量，不授予文件操作权限。
+    /// A new document or empty state retires the previous note's save result.
+    /// Cached display scalars never grant file-operation authority.
     pub(in crate::native_surface) fn install_footer_document(
         &self,
         document: Option<NativeMarkdownFooterDocument>,
@@ -114,7 +122,8 @@ impl NativeMarkdownController {
         self.refresh_footer_document(document);
     }
 
-    /// 编辑/Undo/Redo由原完成通知刷新；冲突不会被undo到clean、复制或clear_status洗掉。
+    /// Actual edit/undo/redo completion refreshes aggregates. Undoing to clean,
+    /// copying, or clearing feedback cannot erase an unresolved disk conflict.
     pub(in crate::native_surface) fn refresh_footer_document(
         &self,
         document: Option<NativeMarkdownFooterDocument>,
@@ -123,7 +132,8 @@ impl NativeMarkdownController {
         self.render_footer();
     }
 
-    /// 在原Workspace错误转String之前记录结果，保留“未确认”和“未写入”的实际区别。
+    /// Capture the typed Workspace result before presentation converts it to text,
+    /// retaining the distinction between uncertain durability and no disk write.
     pub(in crate::native_surface) fn finish_footer_save(
         &self,
         document: NativeMarkdownFooterDocument,
@@ -138,12 +148,15 @@ impl NativeMarkdownController {
 
     pub(super) fn render_footer(&self) {
         if self.ivars().close_finalizer_scheduled.get() {
+            // Accepted teardown must not republish values into controls awaiting release.
             return;
         }
         let mode = self.ivars().published_presentation_mode.get();
         let document = self.ivars().footer_document.get();
         let save = self.ivars().footer_save_result.get();
         let current = || {
+            // Every Native setter below may reenter. Only these exact original
+            // mode/document/save scalars authorize the remaining projection.
             !self.ivars().close_finalizer_scheduled.get()
                 && self.ivars().published_presentation_mode.get() == mode
                 && self.ivars().footer_document.get() == document
@@ -157,7 +170,7 @@ impl NativeMarkdownController {
             .map(|value| format!("{} 字符 · {} 行", value.characters, value.lines))
             .unwrap_or_default();
         let Some(labels) = self.ivars().footer_labels.get() else {
-            return; // 仅构造尚未装配控件时无投影；真实文稿发布前会完整安装并刷新。
+            return; // Construction installs the complete footer before publishing a document.
         };
         for (label, text) in labels
             .iter()
@@ -165,7 +178,7 @@ impl NativeMarkdownController {
         {
             if !current() {
                 return;
-            } // Native setter重入换文稿后不继续发布上一份显示标量。
+            } // A reentrant document change stops all remaining old display values.
             let text = NSString::from_str(text);
             label.setStringValue(&text);
             if !current() {
@@ -177,6 +190,8 @@ impl NativeMarkdownController {
             return;
         }
         if let Some(bar) = self.ivars().conflict_bar.get() {
+            // The conflict strip consumes the same actual save result; it cannot
+            // infer another version or independently certify disk persistence.
             bar.publish(save.resolution_message(document), &current);
         }
         if current() {
@@ -184,7 +199,8 @@ impl NativeMarkdownController {
         }
     }
 
-    /// 拆图同时清除三列业务值，不让仍活着的控制器空壳保留旧笔记状态。
+    /// Clear all three business values during teardown so an empty retained
+    /// controller cannot keep the old note's projected state.
     pub(super) fn clear_footer(&self) {
         self.clear_conflict_bar();
         self.ivars().footer_document.set(None);
@@ -196,11 +212,12 @@ impl NativeMarkdownController {
                 label.setStringValue(ns_string!(""));
                 label.setToolTip(None);
             }
-        } // 构造失败尚无footer时仍必须撤销布局Weak，不能阻止其余真实资源清理。
+        } // Failed construction still revokes layout references even without installed labels.
         self.unbind_document_area();
     }
 
-    /// 显隐只改变实际消息行占用；无消息时不永久留下空白，原footer不受影响。
+    /// Feedback visibility consumes only its actual message row; hiding it returns
+    /// the space without shifting or retaining a blank area above the footer.
     pub(super) fn set_feedback_visible(&self, visible: bool) {
         if visible && self.ivars().close_finalizer_scheduled.get() {
             return;
@@ -209,14 +226,17 @@ impl NativeMarkdownController {
         if let Some(label) = self.ivars().status_label.get() {
             label.setHidden(!visible);
         }
-        // 构造失败未装反馈控件时只有纯标量清理；不创建替身或绕过原布局owner。
+        // Construction failure with no feedback control still clears scalar
+        // state, without allocating a substitute or bypassing the original layout owner.
         self.layout_document_area(NativeMarkdownHeaderAuthority::Foreground);
     }
     pub(in crate::native_surface) fn feedback_visible(&self) -> bool {
+        // A scalar request alone cannot reserve a row if no actual label was installed.
         self.ivars().feedback_visible.get() && self.ivars().status_label.get().is_some()
     }
 
-    /// 绑定发生在真实scroll安装后；替换笔记同步撤旧Weak，不能由查找或反馈重建正文。
+    /// Bind only after mounting the actual scroll. Note replacement synchronously
+    /// retires old weak references; Find/feedback cannot reconstruct the body.
     pub(in crate::native_surface) fn bind_document_area(&self, scroll: &NSScrollView) {
         *self.ivars().document_area.borrow_mut() = Some(NativeMarkdownDocumentAreaBinding {
             scroll: Weak::from(scroll),
@@ -225,6 +245,7 @@ impl NativeMarkdownController {
         let _ = self.next_document_area_revision();
     }
     pub(in crate::native_surface) fn unbind_document_area(&self) {
+        // Revoke synchronous layout authority before the old graph is detached.
         self.ivars().document_area.borrow_mut().take();
         let _ = self.next_document_area_revision();
     }
@@ -234,13 +255,14 @@ impl NativeMarkdownController {
         find: &Rc<NativeMarkdownFindBar>,
     ) -> Result<(), String> {
         let Some(binding) = self.ivars().document_area.borrow().clone() else {
-            return Ok(()); // 独立Find embedding没有Window布局owner；其实际parent区域由show/hide直接消费。
+            return Ok(()); // Independent embedding owns its supplied parent geometry directly.
         };
         let actual = binding.scroll.load().ok_or("笔记正文已经关闭")?;
         if !std::ptr::eq(&*actual, scroll) {
             return Err("查找栏不属于当前笔记正文".into());
         }
-        // Weak升级与身份检查均已结束，修改绑定时不执行任何AppKit调用。
+        // End the Native weak upgrade and identity check before changing the
+        // binding. No AppKit call crosses this state publication.
         drop(actual);
         *self.ivars().document_area.borrow_mut() = Some(NativeMarkdownDocumentAreaBinding {
             scroll: binding.scroll,
@@ -249,8 +271,9 @@ impl NativeMarkdownController {
         let _ = self.next_document_area_revision();
         Ok(())
     }
-    /// 正式Window已有原scroll绑定，扣真实chrome；独立Find消费者只有其调用方原parent。
-    /// 两种装配都显式传同一绝对分配算法，不能因拿不到必需依赖而重建或猜一个窗口。
+    /// The actual window reserves its existing chrome; independent Find embedding
+    /// uses exactly the supplied parent. Both use the same absolute allocation
+    /// algorithm without guessing or rebuilding a missing required owner.
     pub(in crate::native_surface) fn document_area_base(
         &self,
         scroll: &NSScrollView,
@@ -270,21 +293,26 @@ impl NativeMarkdownController {
                     .expect("Window正文布局已装配原冲突条")
                     .reserve_area(base)
             }
-            None => Ok(parent), // 原独立embedding没有正式Window chrome；完整parent就是已给定正文区域。
+            None => Ok(parent), // Independent embedding has no window chrome to subtract.
         }
     }
 
     pub(in crate::native_surface) fn document_area_layout_revision(&self) -> u64 {
+        // A finite revision invalidates synchronous geometry, without retaining
+        // Native controls or granting any source/document authority.
         self.ivars().document_area_revision.get()
     }
 
     fn next_document_area_revision(&self) -> Option<u64> {
+        // Exhaustion refuses new layout authority rather than wrapping into an
+        // old publication that a reentrant stack may still hold.
         let revision = self.ivars().document_area_revision.get().checked_add(1)?;
         self.ivars().document_area_revision.set(revision);
         Some(revision)
     }
 
-    /// resize/消息显隐共用同一绝对几何，不在scroll现有高度上重复加减Find或反馈。
+    /// Resize and feedback share one absolute layout; never repeatedly subtract
+    /// Find or message heights from the scroll's previous frame.
     pub(in crate::native_surface) fn layout_document_area(
         &self,
         authority: NativeMarkdownHeaderAuthority,
@@ -301,7 +329,7 @@ impl NativeMarkdownController {
         };
         let Some(binding) = self.ivars().document_area.borrow().clone() else {
             return true;
-        }; // 空文稿没有scroll需要重排。
+        }; // An empty document owns no scroll requiring layout.
         let Some(scroll) = binding.scroll.load() else {
             return false;
         };
@@ -314,7 +342,8 @@ impl NativeMarkdownController {
         if !current() {
             return false;
         }
-        // SAFETY: 只读取原scroll的父视图；局部强引用不发布到controller或后继笔记。
+        // SAFETY: Read only the original scroll's parent. The local retained
+        // reference is never published to a controller or successor note.
         let Some(parent) = (unsafe { scroll.superview() }) else {
             return false;
         };
@@ -327,6 +356,8 @@ impl NativeMarkdownController {
             return false;
         }
         let find = binding.find.upgrade();
+        // Measure the original Find's occupied height, then derive all frames
+        // from this one parent size and the same current conflict reservation.
         let height = find.as_ref().map_or(0.0, |find| find.occupied_height());
         let full = super::super::window::native_markdown_editor_base_frame(size);
         let Ok(base) = self.document_area_base(&scroll, bounds) else {
@@ -362,6 +393,8 @@ impl NativeMarkdownController {
             return false;
         }
         if let Some(bar) = self.ivars().conflict_bar.get() {
+            // Position the conflict strip at the same computed content boundary,
+            // preserving Find/body/feedback order without another height formula.
             let content_top = frames
                 .find
                 .as_ref()
@@ -373,7 +406,8 @@ impl NativeMarkdownController {
         if !current() {
             return false;
         }
-        // 信息卡覆盖当前正文区域，沿同一resize/Find/反馈几何定位，不压缩正文或另建窗口。
+        // The information card overlays this actual body region using the same
+        // geometry; it neither squeezes document text nor creates another window.
         self.position_information_panel(&parent, scroll.frame(), &current);
         current()
     }

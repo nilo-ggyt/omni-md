@@ -1,4 +1,4 @@
-//! 一个有限窗口的真实源配对事务；结构前探临时使用原Global，完成前恢复原来源位置。
+//! Pair underline on one bounded source window, temporarily replaying and restoring the same structural Global.
 
 use super::inline_code::{InlinePermission, ReferenceInput};
 use super::inline_stack::StackFile;
@@ -19,11 +19,11 @@ use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MarkdownTableUnderlineRequestStep {
-    /// 原配对与UTF16游标的实际读取；单独保留可验证每pair没有重扫长前缀。
+    /// Actual pairing/UTF-16 cursor work, separate from structural replay and repeated prefix decoding.
     pub source_bytes: usize,
     pub utf8_validation_bytes: usize,
     pub source_tree_steps: usize,
-    /// 同一个Global为代码权限实际重放的工作；父请求必须一并计入累计fuel。
+    /// Actual same-Global replay for code permission; the parent also charges it to cumulative fuel.
     pub global_source_bytes: usize,
     pub global_source_tree_steps: usize,
     pub structural_transitions: usize,
@@ -55,7 +55,7 @@ enum Phase {
 }
 
 #[derive(Clone, Copy, Debug)]
-/// 构造入口决定原 scanner 的实际后继拥有者；普通窗口的 UTF16 发布完成就结束其扫描用途。
+/// Construction fixes the scanner's real next owner; an ordinary window finishes scanning on UTF-16 publication.
 enum UnderlineContextUse {
     Window,
     StreamedSource,
@@ -63,6 +63,8 @@ enum UnderlineContextUse {
 
 #[derive(Debug)]
 pub(crate) struct MarkdownTableUnderlineRequest {
+    // This transaction owns one scanner, one current inline/reference operation
+    // and one external stack file. Its source identity is weak; body bytes remain document-owned.
     source: MarkdownTableSourceIdentity,
     pub(in crate::markdown_document_buffer) stack: StackFile,
     quota: MarkdownTableWindowQuota,
@@ -75,7 +77,7 @@ pub(crate) struct MarkdownTableUnderlineRequest {
 }
 
 #[derive(Debug)]
-/// 仅需要真实引用时分配；普通/巨段的原固定 owner 不嵌入整个引用解析器工作区。
+/// Allocate only when actual references require it, rather than embedding this workspace in every plain/huge block.
 struct ReferenceResolution {
     queries: Rc<MarkdownTableReferenceQueries>,
     fact: Option<VerifiedGlobalReference>,
@@ -83,7 +85,7 @@ struct ReferenceResolution {
 }
 
 impl MarkdownDocumentBuffer {
-    /// 只保有限coverage、原Source弱身份与一份scanner，不保存源正文或历史代码范围。
+    /// Retain bounded coverage, original weak source identity and one scanner, never body text or historical code ranges.
     pub(crate) fn table_underline_request(
         &self,
         byte_coverage: &[Range<usize>],
@@ -94,7 +96,7 @@ impl MarkdownDocumentBuffer {
         self.table_underline_from_context(context, quota, UnderlineContextUse::Window)
     }
 
-    /// 单格来自同一个真实 scanner 的 sealed 来源；巨格只增加扫描回合，不分配其正文 String。
+    /// Use a cell sealed by the same actual scanner; a huge cell adds scan rounds, not a whole-cell String.
     pub(crate) fn table_cell_underline_request(
         &self,
         cell: &super::super::VerifiedMarkdownTableCellSource,
@@ -107,7 +109,7 @@ impl MarkdownDocumentBuffer {
             .map_err(super::super::MarkdownTableRequestError::Window)
     }
 
-    /// 原 SourceRequest 串行交接一个当前范围；保原 scanner/UTF16 前沿，不保窗口历史或正文。
+    /// Hand off one current SourceRequest range serially, preserving its scanner/UTF-16 frontier without window history.
     pub(crate) fn table_source_underline_request(
         &self,
         byte_coverage: Range<usize>,
@@ -121,7 +123,7 @@ impl MarkdownDocumentBuffer {
         self.table_underline_from_context(context, quota, UnderlineContextUse::StreamedSource)
     }
 
-    /// 同一实际 scanner 的唯一 owner 图；上下文已经按对应业务入口取得真实范围。
+    /// Build the sole owner graph for a context whose actual range was established by its corresponding entry point.
     fn table_underline_from_context(
         &self,
         context: MarkdownTableUnderlineContext,
@@ -145,8 +147,8 @@ impl MarkdownDocumentBuffer {
 }
 
 impl MarkdownTableUnderlineRequest {
-    /// 原事务的最后inline消费者已经完成才关闭唯一文件；Ready本身不意味着外层CodeJob已结束。
-    /// 父job在发布前显式调用，close错误进入原首因；跨窗保留scanner时只留下空的文件owner。
+    /// Close the sole file only after the last actual inline consumer; Ready alone does not finish an outer CodeJob.
+    /// The parent closes explicitly before publication, preserving close failure; retained scanners keep an empty file owner.
     pub(in crate::markdown_document_buffer) fn close_inline_stack(&mut self) -> Result<(), Error> {
         if self.inline.is_some() {
             return Err(Error::InvalidRequest);
@@ -154,8 +156,8 @@ impl MarkdownTableUnderlineRequest {
         self.stack.close()
     }
 
-    /// 原单格完成后沿同一 Source 接下一个格；这里只变更实际覆盖和 quota，不重置扫描位置或标签状态。
-    /// 新覆盖向后时明确归还 false，调用方会释放这一旧 owner 并重新从原文首取得真实上下文。
+    /// Continue another cell on the same source, changing actual coverage/quota without resetting scanner/tag state.
+    /// Backward coverage returns false so the caller retires this owner and obtains an ordinary cold context.
     pub(crate) fn continue_cell(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -174,8 +176,8 @@ impl MarkdownTableUnderlineRequest {
         )
     }
 
-    /// 当前 RootLeaf 或格已真实认证这份范围；这里只串行推进原同源配对 owner。
-    /// 反向/重叠范围不复用旧前沿，调用者须释放后走原冷扫描，不能把未知标签当作不存在。
+    /// Advance the same pairing owner serially over a range certified by the actual root leaf/cell.
+    /// Reverse/overlapping ranges need a cold owner; unknown earlier tags cannot be treated as absent.
     pub(crate) fn continue_source(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -196,10 +198,11 @@ impl MarkdownTableUnderlineRequest {
         if !context.continue_source(bytes, utf16, &mut self.pairs) {
             return Ok(false);
         }
-        // 后继 Source 批次可有新的联合 quota；真实保留的 scanner/pair 容量仍占原有限工作区。
+        // A later source batch may supply a new joint quota, but actual retained
+        // scanner/pair capacity still occupies the original bounded workspace.
         quota.reserve_underline_workspace().map_err(Error::Window)?;
         self.quota = quota;
-        self.references = None; // 上一格已决 label 不是新格查询；其有限字符串随原唯一 owner 归还。
+        self.references = None; // Previous-cell labels are not new-cell queries; return their bounded strings with the owner.
         self.phase = if context.needs_classified_continuation() {
             Phase::Retain
         } else {
@@ -208,7 +211,7 @@ impl MarkdownTableUnderlineRequest {
         Ok(true)
     }
 
-    /// 闭合小块的有限 label 查询借同一个 Global 前探；已配对的 underline 不重建、不丢失。
+    /// Resolve bounded labels by looking ahead with the same Global, preserving already-paired underline results.
     pub(crate) fn resolve_references(
         &mut self,
         queries: MarkdownTableReferenceQueries,
@@ -219,7 +222,7 @@ impl MarkdownTableUnderlineRequest {
         let ready = queries.is_ready();
         let allocated = std::mem::size_of::<ReferenceResolution>()
             + std::mem::size_of::<MarkdownTableReferenceQueries>()
-            + 2 * std::mem::size_of::<usize>(); // Rc的两个计数和唯一Map owner都计入本次真实分配。
+            + 2 * std::mem::size_of::<usize>(); // Include the Rc counters and sole inventory owner in actual allocation.
         self.quota
             .admit_metadata(allocated)
             .map_err(Error::Window)?;
@@ -234,32 +237,33 @@ impl MarkdownTableUnderlineRequest {
             }
             if matches!(self.phase, Phase::Ready) {
                 self.phase = Phase::Retain;
-            } // 无 '<' 快路先完成真实源扫描，之后再为引用保留/回退同一个 Global。
+            } // The no-HTML path finishes real source scanning before retaining/rewinding this Global for references.
         }
         Ok(allocated)
     }
 
-    /// 原边界已恢复之后才移交查询值；未解析引用不能因局部 Parser 找不到定义而变成 Missing。
+    /// Transfer queries only after restoring the original boundary; unresolved definitions cannot become local Missing.
     pub(crate) fn take_resolved_references(
         &mut self,
     ) -> Result<Option<MarkdownTableReferenceQueries>, Error> {
         if !matches!(self.phase, Phase::Ready) || self.references_pending() {
             return Err(Error::InvalidRequest);
         }
-        // 原inline owner已在Restore阶段归还；这里只有同一查询库存的最后一个实际claim。
+        // Restore has returned the original inline owner. This is now the last
+        // actual claim on the same query inventory, not a cloned definition map.
         Ok(self.references.take().map(|state| {
             Rc::try_unwrap(state.queries).expect("原code解析器必须先于引用库存移交结束")
         }))
     }
 
-    /// 只有真实未解析 label 令前探继续；不存在引用事务与已闭合 Missing 都不能被当作 Pending。
+    /// Look ahead only for genuinely unresolved labels; no transaction and a closed Missing answer are not Pending.
     fn references_pending(&self) -> bool {
         self.references
             .as_ref()
             .is_some_and(|state| !state.queries.is_ready())
     }
 
-    /// 每步最多一个真实源借用或一个Global控制操作；归还成功之后才改变可发布阶段。
+    /// Perform one source borrow or Global control operation per step, returning leases before publication state advances.
     pub(crate) fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -270,6 +274,8 @@ impl MarkdownTableUnderlineRequest {
             return Err(Error::SourceSuperseded);
         }
         if !(2048..=MAX_TABLE_SOURCE_FRAME_BYTES).contains(&budget) {
+            // This internal entry admits a bounded control quantum. Actual parent
+            // call sites additionally reserve their own control work before delegating.
             return Err(Error::InvalidRequest);
         }
         let mut work = MarkdownTableUnderlineRequestStep {
@@ -288,7 +294,8 @@ impl MarkdownTableUnderlineRequest {
                 });
             }
             Phase::Retain => {
-                // 原来源必须已在真实闭合块或已提交表行；非法边界不丢Fact前行，也不以零进展忙等。
+                // Retain only an actual closed block or committed table-row
+                // boundary. An illegal boundary cannot discard facts or spin as zero progress.
                 let measured = global
                     .retain_semantic_boundary(authority, budget - 64)
                     .map_err(Error::Global)?
@@ -297,7 +304,8 @@ impl MarkdownTableUnderlineRequest {
                 self.phase = Phase::Rewind;
             }
             Phase::Rewind => {
-                // 同一个Global回到其真实Root入口，保留原预算/累计work及一次性恢复点。
+                // Rewind this same Global to its real root while preserving
+                // cumulative work, original limits and the one-shot restore point.
                 let measured = global
                     .rewind_semantic_source_to_start(authority, budget - 64)
                     .map_err(Error::Global)?;
@@ -310,11 +318,13 @@ impl MarkdownTableUnderlineRequest {
             }
             Phase::Restore => {
                 if self.inline.take().is_some() {
-                    // 先在独立量子归还固定小块 Parser/正文与 code cursor，再恢复原 Global。
+                    // Return the bounded Parser/input and current code cursor in
+                    // their own step before restoring the original Global position.
                     work.structural_transitions += 2048;
                     return Ok(work);
                 }
-                // 所有前探frame已在先前量子归还；恢复完成前配对结果始终不可读取。
+                // Every lookahead frame has already been returned. Paired output
+                // stays unreadable until the original boundary is actually restored.
                 let measured = global
                     .restore_semantic_boundary(authority, budget - 64)
                     .map_err(Error::Global)?;
@@ -322,19 +332,22 @@ impl MarkdownTableUnderlineRequest {
                 self.phase = Phase::Publish;
             }
             Phase::Publish => {
-                // scanner 同步计量的 UTF16 配对只移交一次，公开样式只读发布 Vec。
+                // Transfer the scanner's actual UTF-16 pairs once; style consumers
+                // read only the published vector, never intermediate byte candidates.
                 if let Some(context) = self.context.as_mut() {
                     self.pairs = context
                         .take_ready_utf16_pairs()
                         .ok_or(Error::Window(MarkdownTableWindowError::ContextPending))?;
-                } // 已发布配对只为引用重放时继续保留原有限 pairs。
+                } // Reference-only replay retains the same already-published bounded pairs.
                 if matches!(self.context_use, UnderlineContextUse::Window) {
-                    // 普通窗口后继只消费已发布配对或引用；它没有串行 Cell 前沿消费者。
-                    // 立即归还 scanner 与仅测试构建存在的 byte 配对目录，保留原完成即释放合同。
+                    // Ordinary windows have no serial-cell frontier consumer.
+                    // Return the completed scanner and test-only byte directory
+                    // immediately, preserving their completion-time release contract.
                     self.context = None;
                 }
-                // 只有原串行 Source 构造入口保真实 scanner/UTF16 前沿，供同 SourceRequest
-                // 下一窗口/格接管。UTF16 Vec 已移出，不保正文、第二个 Global 或全源标签索引。
+                // Only the serial-source entry retains the actual scanner/UTF-16
+                // frontier for its next window/cell. Its result vector moved out;
+                // no body text, second Global or document-wide tag index remains.
                 self.phase = Phase::Ready;
                 work.ready = true;
             }
@@ -352,8 +365,9 @@ impl MarkdownTableUnderlineRequest {
             }
             Phase::ReferenceSource => {
                 if !self.references_pending() {
-                    // 定义先按原Global的真实顺序闭合，再重放同一前沿解释code/HTML优先级。
-                    // 否则引用先于code事件时会等待引用，而引用又被这个code事件阻止向前解析。
+                    // Close definitions in original Global order before replaying
+                    // code/HTML precedence. Otherwise a code event awaiting its
+                    // reference could also block the definition needed to resolve it.
                     self.phase = Phase::Rewind;
                     return Ok(work);
                 }
@@ -368,7 +382,7 @@ impl MarkdownTableUnderlineRequest {
         Ok(work)
     }
 
-    /// 一步只驱动原Global并取得一个有界权限；未来Fact不进入主来源或历史目录。
+    /// Drive the original Global for one current permission; future facts do not enter the main source/history index.
     fn advance_global(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -381,7 +395,8 @@ impl MarkdownTableUnderlineRequest {
             .root
             .as_ref()
             .map_or(0, |root| usize::from(root.height()));
-        // Global内部byte额度至多转换额度的1/4；4/5分配同时覆盖读取、控制与AVL路径的联合上限。
+        // Global's internal byte work is at most one quarter of its transition
+        // allowance; this share also reserves actual source and AVL/control work.
         let child = budget.saturating_sub(tree + 64) * 4 / 5;
         if child < 2048 {
             return Err(Error::WorkLimit);
@@ -401,7 +416,7 @@ impl MarkdownTableUnderlineRequest {
                 child,
             )
             .map_err(Error::Global);
-        frame.finish().map_err(Error::Source)?; // 真实回收失败优先，不能恢复旧边界后伪作读取成功。
+        frame.finish().map_err(Error::Source)?; // Real reclaim failure outranks a candidate fact or restored-boundary claim.
         let mut metadata = 0;
         let (measured, permission) = match step? {
             GlobalStep::Progress { work, .. } | GlobalStep::NeedInput { work, .. } => (work, None),
@@ -416,13 +431,15 @@ impl MarkdownTableUnderlineRequest {
                 (work, Some((document.byte_len(), None, true)))
             }
             GlobalStep::Fact { fact, work } => {
-                // Fact逐个使用后释放；前探不碰主结构的pending、表格math或普通来源游标。
+                // Consume and return one fact at a time. Lookahead does not
+                // overwrite the main structure's pending table/ordinary-source state.
                 let (end, literal) = match fact {
-                    GlobalFact::Table(header) => (header.separator_byte_end, None), // 完整H/D已由原Global提交。
-                    GlobalFact::Row(row) => (row.byte_end, None), // 只包含真实成员行，不吞后继候选。
-                    GlobalFact::TableEnd(end) => (end.byte_end(), None), // 失败候选留待后继块重新分类。
+                    GlobalFact::Table(header) => (header.separator_byte_end, None), // Global committed the actual header/delimiter.
+                    GlobalFact::Row(row) => (row.byte_end, None), // Only actual member rows belong to this fact.
+                    GlobalFact::TableEnd(end) => (end.byte_end(), None), // Reclassify a failed candidate in the following block.
                     GlobalFact::Footnote(_) => {
-                        // 定义存在性不是可解释正文水位；保原phase，只交还这一步真实Global工作。
+                        // Definition existence is not body-classification coverage.
+                        // Keep the phase and return only this actual Global work.
                         return Ok(MarkdownTableUnderlineRequestStep {
                             global_source_bytes: work.byte_reads,
                             global_source_tree_steps: tree,
@@ -437,9 +454,10 @@ impl MarkdownTableUnderlineRequest {
                             state.fact = Some(reference);
                             self.phase = Phase::Reference;
                         }
-                        (end, None) // 不采用 title 前瞻的 backup 尾部；真实 Fact 只移交一次。
+                        (end, None) // Do not adopt a title lookahead backup tail; transfer the actual fact once.
                     }
-                    // 闭合InlineBlock不证明inline-code优先级，本次只解决真实块级代码的HTML抑制。
+                    // A closed inline block grants source/scope, not inline-code
+                    // precedence. Its actual code cursor must still classify that source.
                     GlobalFact::InlineBlock(block) => {
                         let end = block.physical_range().end;
                         if !references_only
@@ -454,7 +472,7 @@ impl MarkdownTableUnderlineRequest {
                             self.inline = Some(Box::new(InlinePermission::new(block)?));
                             self.phase = Phase::Inline;
                         }
-                        (end, None) // InlineBlock 只授予来源；code/HTML 优先级仍由该事实下的真实 cursor 证明。
+                        (end, None) // The actual child cursor still proves code/HTML precedence under this same fact.
                     }
                     GlobalFact::LeafBlock(block) => {
                         let end = block.consumed_end();
@@ -476,7 +494,7 @@ impl MarkdownTableUnderlineRequest {
                                 structural_transitions: work.transitions + tree + 64,
                                 metadata_bytes: metadata,
                                 ..Default::default()
-                            }); // 真 Leaf 下逐个 Code 事件先交唯一 scanner，不能让标题代码中的假 HTML 改外部配对。
+                            }); // Feed real leaf code events first so literal heading HTML cannot alter outer pairing.
                         }
                         let literal = matches!(
                             block.kind(),
@@ -493,7 +511,8 @@ impl MarkdownTableUnderlineRequest {
             && !matches!(self.phase, Phase::Reference | Phase::Inline)
         {
             if references_only {
-                // 首遍只消费定义事实；唯一underline scanner的UTF16游标与未决标签保持原位。
+                // The first pass consumes definition facts only; leave the sole
+                // underline scanner's UTF-16 cursor and pending tags at their original position.
                 self.phase = Phase::ReferenceSource;
             } else if self
                 .context
@@ -518,7 +537,7 @@ impl MarkdownTableUnderlineRequest {
         })
     }
 
-    /// 同一 code 权限 owner 逐条交接 literal；前后普通内容始终沿唯一 underline scanner 顺序消费。
+    /// Hand off literals from the same code owner, with surrounding plain text consumed by the sole scanner in order.
     fn advance_inline(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -526,7 +545,8 @@ impl MarkdownTableUnderlineRequest {
     ) -> Result<MarkdownTableUnderlineRequestStep, Error> {
         if self.inline.as_ref().unwrap().reference_input()?.is_some() {
             if self.references.is_none() {
-                // 普通目标没有自己的引用投影；只在此真实含tick的小块需要Parser时建立唯一库存。
+                // Plain targets have no reference projection. Create the sole
+                // inventory only when this actual backtick-bearing block needs Parser.
                 let mut queries =
                     MarkdownTableReferenceQueries::for_batch(Some(self.quota.clone()));
                 queries.seal_batch();
@@ -535,7 +555,7 @@ impl MarkdownTableUnderlineRequest {
                     metadata_bytes: allocated,
                     structural_transitions: 64,
                     ..Default::default()
-                }); // owner分配与后继有限Parser收集分开，保持原单量子工作上限。
+                }); // Separate owner allocation from subsequent bounded Parser collection work.
             }
             let inline = self.inline.as_mut().unwrap();
             let input = inline.reference_input()?.unwrap();
@@ -549,6 +569,8 @@ impl MarkdownTableUnderlineRequest {
             };
             let streamed = match input {
                 ReferenceInput::Bounded { source, options } => {
+                    // This original bounded block supplies its actual options;
+                    // classification queries share the one inventory, not a second parser of definitions.
                     work.parser_input_bytes = source.len();
                     queries
                         .collect_for_classification(source, options)
@@ -556,6 +578,8 @@ impl MarkdownTableUnderlineRequest {
                     None
                 }
                 ReferenceInput::Streamed(label) => {
+                    // Only a verified complete label can enter the finite
+                    // normalizer. Missing requires the real closed inventory result.
                     work.normalizer_input_bytes = label.len();
                     queries
                         .collect_verified_label(label)
@@ -592,8 +616,9 @@ impl MarkdownTableUnderlineRequest {
                     inline.accept_references(Rc::clone(&state.queries));
                 }
             } else {
-                // 原分类子cursor尚无外带结果；归还它后沿同Global重新走到该块，原Map的
-                // 新查询和已决值始终唯一。外层CodeJob自己的暂停cursor/records不受影响。
+                // No child classification result has escaped. Return that owner
+                // and replay the same Global to this block after definitions resolve;
+                // the original inventory and the outer CodeJob's paused records remain unique.
                 self.inline = None;
                 self.phase = Phase::Rewind;
                 work.structural_transitions += 2048;
@@ -629,7 +654,7 @@ impl MarkdownTableUnderlineRequest {
         })
     }
 
-    /// 一个实际定义沿既有 scope/normalizer/Parser 事务解析，失败保原首因，绝不采用后继同名值。
+    /// Parse one actual definition through its existing scope/normalizer transaction, never substituting a later namesake.
     fn advance_reference(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -637,6 +662,8 @@ impl MarkdownTableUnderlineRequest {
     ) -> Result<MarkdownTableUnderlineRequestStep, Error> {
         let state = self.references.as_mut().ok_or(Error::InvalidRequest)?;
         if let Some(fact) = state.fact.take() {
+            // Consume this verified fact once into its actual definition request,
+            // retaining neither an alternate seed nor a copied definition inventory.
             state.request =
                 table_reference_request::Request::new(self.source.clone(), fact, &state.queries)
                     .map_err(Error::Window)?;
@@ -668,7 +695,8 @@ impl MarkdownTableUnderlineRequest {
                 ..Default::default()
             });
         }
-        // 定义事务只在首遍运行；不把定义结束位置授予尚未走code优先级的scanner。
+        // Definition work belongs only to the first pass. Its endpoint does not
+        // authorize the underline scanner before actual code precedence is established.
         self.phase = Phase::ReferenceSource;
         Ok(MarkdownTableUnderlineRequestStep {
             structural_transitions: 64,
@@ -676,7 +704,7 @@ impl MarkdownTableUnderlineRequest {
         })
     }
 
-    /// 已证明的字节才解释标签；无HTML快路在首个候选前停住并保留原UTF16进度。
+    /// Interpret tags only in proven bytes; the no-HTML fast path stops before its first candidate with UTF-16 progress intact.
     fn advance_context(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -684,7 +712,8 @@ impl MarkdownTableUnderlineRequest {
     ) -> Result<MarkdownTableUnderlineRequestStep, Error> {
         let context = self.context.as_mut().unwrap();
         if context.is_ready() {
-            // 空coverage同样只移交一次；非空扫描的完成阶段已决定是否先恢复Global。
+            // Empty coverage also transfers once. For nonempty scans, the phase
+            // records whether original Global restoration must precede publication.
             self.phase = if self.references_pending() {
                 if matches!(self.phase, Phase::BeforeHtml) {
                     Phase::Retain
@@ -713,7 +742,8 @@ impl MarkdownTableUnderlineRequest {
                 real_eof,
             } => {
                 if next >= *end && !real_eof {
-                    // 前缀已由无token快路计量，或相邻事实没有新增字节；仍交回原Global继续证明。
+                    // A fast-path prefix or adjacent fact may add no bytes. Return
+                    // to the actual Global/code owner for further permission, not synthetic EOF.
                     self.phase = if self.inline.as_ref().is_some_and(|inline| !inline.done()) {
                         Phase::Inline
                     } else {
@@ -739,6 +769,8 @@ impl MarkdownTableUnderlineRequest {
             .map_err(Error::Source)?;
         let count = frame.bytes.len().min(end.saturating_sub(next));
         let count = if matches!(self.phase, Phase::BeforeHtml) {
+            // Leave the first actual '<' outside the scanner until structural
+            // classification can prove whether code/literal context suppresses it.
             frame.bytes[..count]
                 .iter()
                 .position(|byte| *byte == b'<')
@@ -751,6 +783,8 @@ impl MarkdownTableUnderlineRequest {
             && count == frame.bytes.len()
             && (matches!(self.phase, Phase::BeforeHtml) || proven_eof);
         let input = MarkdownTableContextFrame {
+            // Source EOF and classification-proven EOF must agree. A shorter
+            // permitted range or physical piece alone cannot close pending tags.
             generation: frame.generation,
             byte_start: frame.byte_start,
             bytes: &frame.bytes[..count],
@@ -761,6 +795,8 @@ impl MarkdownTableUnderlineRequest {
         } else {
             context.advance(input, maximum)
         };
+        // Return the real source lease before interpreting candidate pairing work;
+        // source reclaim failure must not become a successful published style.
         frame.finish().map_err(Error::Source)?;
         let step = step.map_err(Error::Window)?;
         if step.ready {
@@ -776,7 +812,8 @@ impl MarkdownTableUnderlineRequest {
                 Phase::Restore
             };
         } else if html {
-            // 首个可能的HTML字节尚未进入scanner，原UTF16位置保留，再取得真实结构权限。
+            // The first potential HTML byte remains unconsumed. Retain its actual
+            // UTF-16 position while acquiring original structural permission.
             self.phase = Phase::Retain;
         }
         Ok(MarkdownTableUnderlineRequestStep {
@@ -788,7 +825,7 @@ impl MarkdownTableUnderlineRequest {
         })
     }
 
-    /// 只有完成源回收和原Global恢复后才公开结果，旧代次不能复用已发布配对。
+    /// Expose pairs only after lease return and original Global restoration; stale generations cannot reuse published results.
     pub(crate) fn ready_pairs_for(
         &self,
         document: &MarkdownDocumentBuffer,

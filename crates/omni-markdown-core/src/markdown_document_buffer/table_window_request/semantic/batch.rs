@@ -1,4 +1,4 @@
-//! 同一真实结构前沿上的多表批次；gap仅有无表权限，不能被当作普通inline语义Ready。
+//! Batch tables on one real structural frontier; a gap proves no table, not completed ordinary inline semantics.
 
 use super::*;
 use crate::markdown_viewport_presentation::table_window::{
@@ -14,20 +14,20 @@ pub(in crate::markdown_document_buffer::table_window_request) use required::{
 };
 
 const MAX_COLUMN_SLOTS: usize = 1024;
-// 本层先保留最坏收尾额度，未使用的额度不能再伪记为已消耗转换。
+// Reserve worst-case finishing work before delegation; unused reservation is not consumed transitions.
 const SWEEP_CONTROL_RESERVE: usize = 1024;
-// 支付固定目标/结束事实检查、gap边界判断、至多一次票据/作业移交和phase更新。
-// 这是具名状态机fuel，不是CPU指令或allocator内部搬移字节的测量。
+// Pay fixed target/end checks, gap decisions, one ticket/job handoff and phase updates.
+// This named control fuel is not a measurement of CPU instructions or allocator byte moves.
 const SWEEP_CONTROL_BASE: usize = 128;
-// 每个真实body成员支付bytes与UTF16两次fold，以及一次行metadata移交准入。
+// Each actual body member pays byte/UTF-16 folds plus row-metadata handoff admission.
 const SWEEP_ROW_ADMISSION_COST: usize = 3;
-// 最后一个窗口句柄且持有 End 时，释放至多原 4MiB spine 页库存；不把此费用加到普通 Rc 减计数。
+// A last End-owning window may release its bounded spine pages; ordinary shared Rc drops do not pay that cost.
 const PRUNE_LAST_SPINE_COST: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-/// 本次构建包含旧 publication 同活载荷的联合准入量；不等于 allocator 容量或整产品峰值。
-/// Ready 内部另存修剪后真实保留量，供下一次扩展预扣，不能以修剪退款绕过本次峰值上限。
-/// 配额只涵盖传入 previous 与本次新记录，不涵盖调用方任意保留的全部历史 Ready。
+/// Joint admission includes previous publication's coexisting payload, not allocator capacity or whole-product peak.
+/// Ready separately stores retained logical payload for later precharge; pruning cannot refund this construction's peak allowance.
+/// The quota covers the supplied previous plus new records, not every historical Ready arbitrarily retained by callers.
 pub struct MarkdownTableViewportBudget {
     pub row_slots: usize,
     pub cells: usize,
@@ -39,7 +39,7 @@ pub struct MarkdownTableViewportBudget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// 每个区间都来自真实Table成员或分类水位；不能用单一凸包掩盖未证明的空洞。
+/// Every interval comes from actual table members or classification, never a convex hull hiding unproven holes.
 pub enum MarkdownTableViewportCoverage {
     Table {
         window_index: usize,
@@ -49,7 +49,7 @@ pub enum MarkdownTableViewportCoverage {
         gap_index: usize,
         utf16_range: Range<usize>,
     },
-    /// 只证明真实物理行与 H/D 上下文；单格 inline 必须沿同请求另行完成。
+    /// Prove actual physical rows/header context only; each cell's inline semantics still require the same request's work.
     Structure {
         table_index: usize,
         utf16_range: Range<usize>,
@@ -65,21 +65,21 @@ impl MarkdownTableViewportCoverage {
     }
 }
 
-/// 仅由源序producer构造。此票证明range无真实table，不证明可从该处重置paragraph/容器。
+/// Construct only from source-order production; no-table proof does not authorize resetting paragraph/container state here.
 pub struct VerifiedMarkdownTableGap {
     source: MarkdownTableSourceIdentity,
     bytes: Range<usize>,
     utf16: Range<usize>,
 }
 
-// 每份记录只保不可变 metadata；后继发布仅 clone Rc，不复制 row/cell/run 或保父批次链。
-// source 额度保留原结构票实际复制的 H/D/物理行开销，不能用已 trim 的投影范围低估它。
+// Records retain immutable metadata. Successors clone Rc handles, not row/cell/run payloads or parent-batch chains.
+// Source allowance preserves actual copied physical/header input, not a smaller trimmed projection extent.
 struct WindowRecord {
     window: VerifiedMarkdownTableWindow,
     retained: MarkdownTableViewportBudget,
 }
 
-// 此类型没有公开构造路径。地址身份只证明发布来自同一请求，源与上下文仍须分别核验。
+// Private construction binds publication to this request; source and context still require their own checks.
 struct Publication {
     source: MarkdownTableSourceIdentity,
     context_revision: u64,
@@ -104,8 +104,8 @@ impl VerifiedMarkdownTableGap {
     }
 }
 
-/// 窗口已经完成其真实inline上下文；gap仍是有独立权限的无表区间，不能因此隐藏普通正文。
-/// 整批一次move给Native Rc后，cell只需批次handle+窗口下标，无需clone完整表或拆分权限。
+/// Windows have completed actual inline context; independent no-table gaps do not authorize hiding ordinary text.
+/// Native receives the batch once; cells retain its handle/index without copying whole tables or splitting authority.
 pub struct VerifiedMarkdownTableViewport {
     source: MarkdownTableSourceIdentity,
     requested: Range<usize>,
@@ -115,12 +115,13 @@ pub struct VerifiedMarkdownTableViewport {
     coverage: Vec<MarkdownTableViewportCoverage>,
     budget: MarkdownTableViewportBudget,
     publication: Rc<Publication>,
-    // 只保最终 payload 与本发布自身目录/句柄，不把已释放的 Parser/ref/underline scratch 带到续批。
+    // Retain final payload and this publication's own handles/directories, never
+    // already-released Parser/reference/underline scratch from a previous batch.
     retained: MarkdownTableViewportBudget,
     required: Option<RequiredPublication>,
 }
 impl VerifiedMarkdownTableViewport {
-    /// 结构出口只借原票；没有投影 String、Parser 图或默认 inline 样式。
+    /// Lend original structural tickets only, without projected Strings, Parser graphs or default inline styles.
     pub(in crate::markdown_document_buffer::table_window_request) fn structural_tables(
         &self,
     ) -> &[Rc<MarkdownTableStructuralWindow>] {
@@ -202,8 +203,10 @@ impl VerifiedMarkdownTableViewport {
             .peekable();
         let mut gaps = self.gaps.iter().map(|gap| gap.utf16.clone()).peekable();
         let mut covered = required.start;
-        // 三个原目录按真实物理范围归并；结构票同样可证明覆盖，但省略 H context 或行间洞仍不能补齐。
-        // 这里只复制固定 Range 标量，不分配目录、不读取正文，也不把 clipped requested 当整行来源。
+        // Merge three original directories by actual physical extent. Structural
+        // tickets also prove coverage, but omitted header context/inter-row holes do not.
+        // Move only Range scalars without allocating a directory, reading text,
+        // or promoting a clipped request into complete-row source permission.
         while let Some((_, kind)) = [
             tables.peek().map(|range| (range.start, 0)),
             structures.peek().map(|range| (range.start, 1)),
@@ -254,10 +257,10 @@ enum BatchPhase {
     Consumed,
 }
 
-/// 只有一个活结构Global；语义库存收齐本批query后才另做一次真实源序refs pass。
-/// 后者仍可能到EOF，本请求不宣称零全源扫描，也不把有限Parser输入当逐token工作证明。
-/// 两个Global各自最多4MiB活spine页，总预留上界8MiB；这不是一个共享4MiB库存。
-/// 额外1MiB逻辑metadata准入包含有限工作区预留，不是allocator或整产品峰值测量。
+/// Keep one structural Global and, after sealing all batch queries, one real source-order reference pass.
+/// Reference resolution may reach EOF; bounded Parser input is neither zero full-source traversal nor per-token work proof.
+/// Each Global independently permits 4 MiB of live spine pages: the combined bound is 8 MiB, not one shared 4-MiB stock.
+/// Additional logical metadata admission includes bounded workspace reservations, not allocator or product-peak measurement.
 pub struct MarkdownTableViewportRequest {
     source: MarkdownTableSourceIdentity,
     structure: Option<MarkdownTableWindowStructureRequest>,
@@ -284,7 +287,8 @@ pub struct MarkdownTableViewportRequest {
     prune_keep: usize,
     between_start: (usize, usize),
     active_header: Option<usize>,
-    // 同一前沿的真实物理行/分类边界；byte 与 UTF16 同源保存，绝不从 UTF16 猜 byte。
+    // Preserve actual physical/classified boundaries from the same frontier in
+    // both byte and UTF-16 coordinates; never infer one from the other's numeric value.
     resume_boundary: (usize, usize),
     budget: MarkdownTableViewportBudget,
     records: MarkdownTableViewportBudget,
@@ -294,7 +298,8 @@ pub struct MarkdownTableViewportRequest {
     required: Option<RequiredState>,
     pending_record: Option<Rc<WindowRecord>>,
     last_publication: Option<Weak<Publication>>,
-    // 只有 source-aware owner 更新；结构 classified 水位不能替代实际 ordinary 来源消费。
+    // Only the source-aware owner advances this floor. Structural classification
+    // cannot stand in for actual ordinary-source consumption.
     source_origin_floor: usize,
     failed: Option<MarkdownTableRequestError>,
 }
@@ -382,7 +387,8 @@ impl MarkdownTableViewportRequest {
             self.advance_quantum(document, budget)
         };
         if let Err(error) = result {
-            // 首因sticky，取消/失败同时撤销所有窗口、scratch及两个Global；不能继续发布部分overlay。
+            // First failure is sticky. Return this request's windows, scratch and
+            // both Globals on failure/cancellation instead of publishing partial overlays.
             self.failed = Some(error);
             self.structure = None;
             self.jobs = Vec::new();
@@ -407,7 +413,8 @@ impl MarkdownTableViewportRequest {
     ) -> Result<MarkdownTableViewportStep, MarkdownTableRequestError> {
         let mut work = SemanticWork::default();
         loop {
-            // 单次quantum可以推进多个零source控制阶段；每阶段仍收费，不把async队列当公平性证明。
+            // One quantum may advance several zero-source control phases, each
+            // still charged. An asynchronous queue alone is not fairness evidence.
             if matches!(self.phase, BatchPhase::Ready) {
                 return Ok(MarkdownTableViewportStep::Ready { work });
             }
@@ -419,7 +426,8 @@ impl MarkdownTableViewportRequest {
                 .as_ref()
                 .is_some_and(|structure| structure.ordinary_pending.is_some())
             {
-                // opt-in owner 必须先接收原普通块；本 quantum 不循环读取同一 pending 或推进 Global。
+                // The opt-in owner must consume the original ordinary block first;
+                // do not loop over the same pending fact or advance Global past it.
                 return Ok(MarkdownTableViewportStep::Progress { work });
             }
             let used = work
@@ -428,9 +436,10 @@ impl MarkdownTableViewportRequest {
                 .max(work.copied_source_bytes)
                 .max(work.utf8_validation_bytes);
             let remaining = budget.saturating_sub(used);
-            // Gap 仅持 Range 与原 root Weak；一次裁剪/归还只付原固定64控制费，没有源借用、
-            // spine 析构或外部回调。只让它消费本量子的真实余额，不为每个 Gap 重领 budget。
-            // 进入 Coverage 或其它阶段立即恢复4096准入；Native原4096量子不会顺带推进它们。
+            // A gap owns only ranges and weak root identity, so pruning it needs
+            // fixed control without source reads, spine destruction or callbacks.
+            // Consume this quantum's actual remainder rather than reissuing budget
+            // per gap; Coverage/other phases restore their ordinary minimum admission.
             let minimum = if matches!(self.phase, BatchPhase::PruneGaps) {
                 64
             } else {
@@ -474,11 +483,12 @@ impl MarkdownTableViewportRequest {
                     if self.queries.as_ref().unwrap().is_ready() {
                         self.phase = BatchPhase::Project;
                     } else {
-                        // 所有有限query已封口；唯一refs Global从真实0起点按first-wins扫描，不能后来加标签。
+                        // Seal every finite query before the sole reference
+                        // Global scans from actual source zero under first-wins rules.
                         let job = self.jobs[0].as_mut().unwrap();
                         job.queries = self.queries.take();
-                        // 原resolver的唯一活动raw/prefix/Unicode-normalizer工作区预先保留上界。
-                        // 这是可复用的一份工作区，不按每个query/每张表累乘，也不等于heap精确容量。
+                        // Reserve one reusable raw/prefix/Unicode-normalizer
+                        // workspace bound, not one per query/table and not an exact heap measurement.
                         self.quota
                             .admit_metadata(
                                 16 * 1024 * (2 * std::mem::size_of::<usize>() + 2)
@@ -492,7 +502,8 @@ impl MarkdownTableViewportRequest {
                 } else {
                     let job = self.jobs[self.index].as_mut().unwrap();
                     if matches!(job.phase, Phase::Queries) {
-                        // 直接在同一库存分配前准入；不能先建第二张Map再合并拒绝。
+                        // Admit directly into the same inventory before its
+                        // allocation; do not build a second map and reject only after merging.
                         let queries = self.queries.as_mut().unwrap();
                         work.parser_input_bytes = job.with_input(document, false, |input| {
                             collect_table_window_reference_queries(input, queries)
@@ -550,7 +561,8 @@ impl MarkdownTableViewportRequest {
                         if self.budget.runs > MAX_RUNS {
                             return Err(MarkdownTableRequestError::Window(Error::SemanticLimit));
                         }
-                        // 原输入额度来自 admit_ticket；最终保留量只计不可变数组，不携带已释放 scratch。
+                        // admit_ticket owns original-input admission. Final
+                        // retained cost counts immutable arrays, not released scratch.
                         let retained = retained_window_budget(&window, self.job_costs[self.index])?;
                         self.records = add_budget(self.records, retained)?;
                         self.pending_record = Some(Rc::new(WindowRecord { window, retained }));
@@ -560,8 +572,9 @@ impl MarkdownTableViewportRequest {
                 }
             }
             BatchPhase::Insert => {
-                // 回放可能产生旧窗口之前的行。只移动有界Rc目录，绝不复制行/cell/run载荷。
-                // 移交独立于Parser调用，避免在子阶段耗尽fuel后追加未计量的目录移动。
+                // Replay may return a row before existing windows. Move only
+                // bounded Rc handles, never row/cell/run payload. A separate handoff
+                // step avoids uncharged directory movement after Parser exhausts its fuel.
                 let record = self
                     .pending_record
                     .take()
@@ -586,7 +599,8 @@ impl MarkdownTableViewportRequest {
             BatchPhase::PruneWindows => {
                 if self.prune_index < self.windows.len() {
                     let record = &self.windows[self.prune_index];
-                    // 单窗 coverage 只有 H/D 和真实 body 两段，不能按包含离屏 gap 的凸包保留。
+                    // A window has separate header/delimiter and actual body
+                    // coverage; an offscreen gap cannot enter their convex hull.
                     if record
                         .window
                         .coverage
@@ -603,8 +617,9 @@ impl MarkdownTableViewportRequest {
                     }
                     self.prune_index += 1;
                 } else if self.windows.len() > self.prune_keep {
-                    // 每步只释放一份未被本 publication 使用的记录；原 previous 句柄仍可继续读。
-                    // 只有实际销毁带 End 的最后一个记录才支付有限 spine 清理费用；普通共享句柄只走固定控制费。
+                    // Return one departed record per step while previous remains
+                    // readable. Charge bounded spine cleanup only when destroying
+                    // the final End-owning record; a shared-handle decrement is ordinary control.
                     let last = self.windows.last().unwrap();
                     if Rc::strong_count(last) == 1 && last.window.table_end.is_some() {
                         work.structural_transitions = PRUNE_LAST_SPINE_COST;
@@ -660,7 +675,8 @@ impl MarkdownTableViewportRequest {
                 }
             }
             BatchPhase::Coverage => {
-                // required结果只扫描当前有限句柄目录；把索引解析的上界单列进本层控制fuel。
+                // Required-result lookup scans only current bounded handles;
+                // account its directory bound separately in this control fuel.
                 work.structural_transitions += (self.windows.len() + self.structures.len()) * 2;
                 self.advance_coverage(document)?;
             }
@@ -694,8 +710,9 @@ impl MarkdownTableViewportRequest {
         if let Some(boundary) = classified.filter(|boundary| {
             boundary.1 >= self.viewport.end && self.source_origin_floor >= self.viewport.end
         }) {
-            // 来源 owner 已消费本视口所需 ordinary 行后，结构分类水位可以独立封 gap。
-            // 该水位不代表 origin cursor 已到段尾；未完游标仍由 opt-in owner 独占保留。
+            // Classification may close a gap after the source owner consumed
+            // required ordinary rows. It does not imply the origin cursor reached
+            // paragraph end; the opt-in owner still exclusively retains that continuation.
             self.push_gap(document, boundary)?;
             self.resume_boundary = boundary;
             self.phase = if self.required.is_some() {
@@ -710,7 +727,8 @@ impl MarkdownTableViewportRequest {
             });
         }
         let structure = self.structure.as_mut().unwrap();
-        // 已封窗口仍占全批预算，下一窗不能重新获得256行/1024格的额度。
+        // Completed windows still occupy joint batch allowance; another window
+        // cannot reacquire a fresh row/cell stock.
         let available_rows = TABLE_WINDOW_MAX_ROWS.saturating_sub(self.budget.row_slots + 2);
         let available_cells_as_rows = structure.current.as_ref().map_or(usize::MAX, |table| {
             TABLE_WINDOW_MAX_CELLS
@@ -726,8 +744,9 @@ impl MarkdownTableViewportRequest {
             && matches!(structure.pending.as_ref(), Some(GlobalFact::Row(row))
                 if row.utf16_start < self.viewport.end && self.viewport.start < row.utf16_end)
         {
-            // source-aware 联合库存确实是 cells 耗尽，而不是 rows 槽耗尽；
-            // 在原子层把 cell 派生的零上限统一标成 RowLimit 之前给出准确首因，原 table-only 行为不变。
+            // Source-aware joint stock exhausted cells, not row slots. Preserve
+            // that cause before the structural layer maps a zero body limit to
+            // RowLimit; existing table-only error semantics remain unchanged.
             return Err(MarkdownTableRequestError::Window(Error::CellLimit));
         }
         let ending = match structure.pending.as_ref() {
@@ -736,8 +755,9 @@ impl MarkdownTableViewportRequest {
             }
             _ => None,
         };
-        // 固定预留覆盖最坏收尾；真正消费量在下方按实际执行的控制和body成员计算。
-        // 不能把每次NeedInput或零source步骤都当作已经耗尽这份预留。
+        // Reserve worst-case finishing work, then charge actual control/member
+        // work below. NeedInput or zero-source progress does not consume the
+        // whole reservation merely because it was held aside.
         let step = structure.advance(document, false, budget - SWEEP_CONTROL_RESERVE)?;
         let mut control_work = SWEEP_CONTROL_BASE;
         let measured = match step {
@@ -747,7 +767,8 @@ impl MarkdownTableViewportRequest {
             | MarkdownTableStructureStep::TableEndReached { work } => work,
         };
         if structure.ordinary_pending.is_some() {
-            // 原 Fact 先移交 source-aware owner；不能在同一尾部用分类水位跳过其实际来源处理。
+            // Transfer the original fact to the source-aware owner first;
+            // a classified position cannot skip that actual source processing.
             return Ok(SemanticWork {
                 source_bytes: measured.byte_reads,
                 structural_transitions: measured.transitions + control_work,
@@ -773,7 +794,8 @@ impl MarkdownTableViewportRequest {
             self.active_header = Some(byte);
         }
         let structure = self.structure.as_mut().unwrap();
-        // 目标已经完整落在已证实成员中即可封窗；不为寻找一个无关的下条巨行先扫描整行。
+        // Close once actual verified members fully cover the target, without
+        // scanning an unrelated following huge row merely to discover its existence.
         let reached = structure.ready.is_none()
             && structure.current.as_ref().is_some_and(|table| {
                 table.found
@@ -790,8 +812,9 @@ impl MarkdownTableViewportRequest {
         let mut done = reached;
         if let Some(ticket) = ticket {
             control_work += ticket.body.len() * SWEEP_ROW_ADMISSION_COST;
-            // 原单窗至多255个body，128+3*255=893≤1024；真实batch还把D计入总行槽。
-            // 在两次输入相关fold及移交之前验证，不能超支后靠缩小报数继续。
+            // Actual member count bounds finishing control within the reservation;
+            // the batch also charges delimiter row slots. Check before folds and
+            // handoff, never perform excess work and shrink its reported count afterward.
             if control_work > SWEEP_CONTROL_RESERVE {
                 return Err(MarkdownTableRequestError::WorkLimit);
             }
@@ -799,7 +822,8 @@ impl MarkdownTableViewportRequest {
                 (ticket.header.separator_byte_end, ticket.delimiter_utf16.end),
                 |row| (row.byte_end, row.utf16_end),
             );
-            // 未消费行必须先由同一前沿继续；仅在本窗真覆盖目标末端时才能停止整个sweep。
+            // Unconsumed rows remain with the same frontier. Stop the sweep only
+            // when this actual window covers the requested end.
             if matches!(structure.pending.as_ref(), Some(GlobalFact::Row(row)) if row.utf16_start >= self.viewport.end)
             {
                 done = true;
@@ -807,7 +831,7 @@ impl MarkdownTableViewportRequest {
             let cost = self.admit_ticket(&ticket)?;
             if self.source_structures {
                 self.structures.reserve_exact(1);
-                self.structures.push(Rc::new(ticket)); // 原行票直接移交，巨行不进入 LineCopy 或完整 table Parser。
+                self.structures.push(Rc::new(ticket)); // Transfer original row tickets without LineCopy or whole-table Parser input.
             } else {
                 self.job_costs.push(cost);
                 self.jobs.push(Some(self.semantic_job(ticket)));
@@ -948,7 +972,8 @@ impl MarkdownTableViewportRequest {
         {
             return Err(MarkdownTableRequestError::Window(Error::SourceLimit));
         }
-        // 逻辑结构与最终cell/row/origin的保留容量先准入；source Strings随后由LineCopy逐行创建。
+        // Admit logical structure and final cell/row/origin payload first;
+        // LineCopy creates actual bounded source Strings one line at a time later.
         let metadata = if self.source_structures {
             structural_budget(ticket).metadata_bytes
                 + std::mem::size_of::<Rc<MarkdownTableStructuralWindow>>()
@@ -1010,7 +1035,8 @@ impl MarkdownTableViewportRequest {
         &mut self,
         document: &MarkdownDocumentBuffer,
     ) -> Result<(), MarkdownTableRequestError> {
-        // 两个已按源序建立的有限流逐项归并，不排序/凸包化，也不在一个低fuel step遍历整批。
+        // Merge the bounded original source-order streams incrementally, without
+        // sorting, convex-hull coverage or traversing the entire batch in one low-fuel step.
         while self.coverage_window < self.windows.len()
             && self.coverage_range == self.windows[self.coverage_window].window.coverage.len()
         {
@@ -1081,8 +1107,9 @@ impl MarkdownTableViewportRequest {
                 return Err(MarkdownTableRequestError::Window(Error::ContextPending));
             }
             self.budget.metadata_bytes = self.quota.metadata_used();
-            // 先计算同一不可变发布真实保留的逻辑量，再 mint 不可伪造的本次 publication。
-            // 不保父发布 Rc；旧 Native 句柄可继续读，后继只有平坦记录 Rc 与自己的覆盖目录。
+            // Compute this immutable publication's retained logical payload before
+            // issuing its private identity. Keep no parent-publication Rc: old
+            // Native handles remain readable, while successors own flat record handles and coverage.
             let retained = add_budget(
                 self.records,
                 MarkdownTableViewportBudget {
@@ -1185,8 +1212,8 @@ impl MarkdownTableViewportRequest {
         self.total
     }
 
-    /// 新选择只重投影原来已经闭合的无表区间；不倒退唯一 Global，也不恢复历史 Fact。
-    /// 调用者先核同一 SourceRequest 的完整选择及最新发布；这里继续核本批自己的发布身份。
+    /// Reproject a new selection only over an already-closed gap, without rewinding Global or reviving historical facts.
+    /// The caller checks original complete Input/latest publication; this batch also checks its own publication identity.
     pub(in crate::markdown_document_buffer::table_window_request) fn reproject_source_selection(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -1209,8 +1236,9 @@ impl MarkdownTableViewportRequest {
         {
             return Err(MarkdownTableRequestError::PublicationSuperseded);
         }
-        // 这里只重用无表结构权限。旧 table window 中的 marker/inline 选择投影必须另做，
-        // 不能把整个 classified 凸包当作可重放库存，也不为旧表开第二个语义 Global。
+        // Reuse no-table structure only. Table marker/inline selection needs its
+        // own projection; a classified convex hull is not replay inventory and
+        // cannot justify another semantic Global for old table payload.
         if !previous.windows.is_empty() || !previous.structures.is_empty() {
             return Ok(false);
         }
@@ -1227,10 +1255,11 @@ impl MarkdownTableViewportRequest {
             .and_then(|structure| structure.global.as_ref())
             .is_none_or(GlobalFrontier::semantic_boundary_retained)
         {
-            return Ok(false); // 未归还语义前探义务不能因选择变化而丢掉。
+            return Ok(false); // Selection change cannot discard an outstanding semantic-restore obligation.
         }
-        // 先联合准入仍活的旧发布和本次新目录，再改变唯一 owner。共享 Gap 只复制 Rc，
-        // 其 Source/byte/UTF16 事实保持原值；新选择不能扩张它的真实无表覆盖。
+        // Jointly admit live previous payload and new directories before mutation.
+        // Sharing a gap clones only Rc; its original source/byte/UTF-16 facts
+        // remain fixed and a new selection cannot enlarge its proven no-table extent.
         let quota = super::prefixes::BatchQuota::new(MAX_RUNS, MAX_METADATA_BYTES);
         quota
             .admit_retained(previous.retained.runs, previous.retained.metadata_bytes)
@@ -1263,8 +1292,9 @@ impl MarkdownTableViewportRequest {
         self.quota = quota;
         self.required = None;
         self.last_publication = None;
-        // 结构与 refs 不需要重新扫描：本次只含原无表 Gap。Coverage 仍逐步裁剪，
-        // 只有它正常完成后才能生成本批新 publication；原累计 fuel 与 Global 前沿不变。
+        // This original gap needs no new structural/reference scan. Coverage still
+        // clips incrementally and only normal completion issues a new publication;
+        // original cumulative fuel and Global frontier remain in force.
         self.phase = BatchPhase::Coverage;
         self.account_source_work(SemanticWork {
             structural_transitions: SWEEP_CONTROL_BASE + index + 1,
@@ -1273,7 +1303,7 @@ impl MarkdownTableViewportRequest {
         Ok(true)
     }
 
-    /// 原来源发布被新目标接管后重放唯一Global；旧窗口只预扣同活库存，不复制内容或重发扫描fuel。
+    /// Reposition the sole Global for a new source target, precharging coexisting old payload without text copies or new scan fuel.
     pub(in crate::markdown_document_buffer::table_window_request) fn reposition_source(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -1295,7 +1325,8 @@ impl MarkdownTableViewportRequest {
             .and_then(|()| quota.admit_metadata(publication_metadata()))
             .map_err(MarkdownTableRequestError::Window)?;
         let structure = self.structure.as_mut().expect("来源发布保留唯一结构续体");
-        // 未作任何新源借用，仍先保真实mmap首错；相同revision不能替代原DocRoot健康。
+        // Even before another source borrow, preserve the original mapping cause;
+        // equal revisions cannot replace this actual document root's health.
         document
             .byte_offset_for_utf16(0)
             .map_err(MarkdownTableRequestError::Source)?;
@@ -1316,7 +1347,8 @@ impl MarkdownTableViewportRequest {
             .transitions
             .checked_add(work.transitions)
             .ok_or(MarkdownTableRequestError::WorkLimit)?;
-        // 这些未发布派生值只属于旧目标；根重放会重新给出真实表头与ordinary Fact。
+        // These unpublished derived values belong to the old target only. Root
+        // replay will produce actual table/ordinary facts for the new target.
         structure.viewport = viewport.clone();
         structure.target = MarkdownTableWindowTarget::FirstTableInViewport;
         structure.continuous_body_limit = None;
@@ -1367,14 +1399,14 @@ impl MarkdownTableViewportRequest {
         })
     }
 
-    /// 只有同模块的 opt-in 包装入口开启截留；原 table-only factory 与 advance 语义不变。
+    /// Enable capture only through the module's opt-in wrapper, preserving the table-only factory/advance contract.
     pub(in crate::markdown_document_buffer::table_window_request) fn enable_source_capture(
         &mut self,
     ) {
         self.structure.as_mut().unwrap().capture_ordinary = true;
     }
 
-    /// 原生分页只需要结构行；单格语义另沿同 Global 完成，不复制整行后才交出第一帧来源。
+    /// Native paging needs structural rows first; finish cell semantics on the same Global without copying a whole row upfront.
     pub(in crate::markdown_document_buffer::table_window_request) fn enable_structural_tables(
         &mut self,
     ) {
@@ -1415,7 +1447,7 @@ impl MarkdownTableViewportRequest {
         )
     }
 
-    /// 只短借原结构Global；语义前探在返回Ready前恢复它，不产生另一个源或初始化图。
+    /// Briefly lend the original structural Global; semantic lookahead restores it before Ready, without another source graph.
     pub(in crate::markdown_document_buffer::table_window_request) fn source_global_mut(
         &mut self,
     ) -> Result<&mut GlobalFrontier, MarkdownTableRequestError> {
@@ -1425,15 +1457,16 @@ impl MarkdownTableViewportRequest {
             .ok_or(MarkdownTableRequestError::InvalidRequest)
     }
 
-    /// 来源内的串行语义 job 取得原批次同一份额度；不重建 quota、不退款或重发库存。
+    /// Serial source-semantic jobs share the original batch quota, without rebuilding, refunding or reissuing stock.
     pub(in crate::markdown_document_buffer::table_window_request) fn source_semantic_quota(
         &self,
     ) -> Result<MarkdownTableWindowQuota, MarkdownTableRequestError> {
         if let Some(error) = self.failed {
-            // 失败后的测试同样保留真实首因，不能复制额度后绕过原 owner 的撤权。
+            // Failure remains the original first cause for every caller; cloning
+            // quota cannot bypass this owner's revoked authority.
             return Err(error);
         }
-        self.source_limits()?; // 原结构续体必须仍在；失去它的请求不能借测试入口重建库存。
+        self.source_limits()?; // The actual structural continuation must still exist; no caller may recreate its stock.
         Ok(self.quota.clone())
     }
 
@@ -1462,7 +1495,8 @@ impl MarkdownTableViewportRequest {
         &mut self,
         runs: usize,
     ) -> Result<(), MarkdownTableRequestError> {
-        // Plain与table使用同一实际run库存；固定Plain scratch已由source工作区预扣，不能重发run额度。
+        // Plain and table semantics share actual run stock. Source workspace
+        // already reserved fixed plain scratch; do not issue another run allowance.
         self.quota
             .admit_retained(runs, 0)
             .map_err(MarkdownTableRequestError::Window)
@@ -1471,7 +1505,8 @@ impl MarkdownTableViewportRequest {
     pub(in crate::markdown_document_buffer::table_window_request) fn reserve_source_underline_workspace(
         &mut self,
     ) -> Result<(), MarkdownTableRequestError> {
-        // 复用原唯一underline容量预留；table工作区已经释放后Plain只串行接管这一份库存。
+        // Reuse the one underline reservation. After table scratch is returned,
+        // plain semantics can take over the same capacity serially.
         self.quota
             .reserve_underline_workspace()
             .map_err(MarkdownTableRequestError::Window)?;
@@ -1479,7 +1514,7 @@ impl MarkdownTableViewportRequest {
         Ok(())
     }
 
-    /// ordinary 重读与坐标转换进入同一个 batch 总账；子 cursor 自己的限额不能重发 owner fuel。
+    /// Charge ordinary rereads and coordinate conversion to the same batch total; child limits cannot reissue owner fuel.
     pub(in crate::markdown_document_buffer::table_window_request) fn account_source_work(
         &mut self,
         work: SemanticWork,
@@ -1496,7 +1531,8 @@ impl MarkdownTableViewportRequest {
         &mut self,
         error: MarkdownTableRequestError,
     ) {
-        // 只释放本请求新派生容量；外带不可变 publication 记录仍可按原源身份读取。
+        // Return only this request's derived capacity. Exported immutable
+        // publication records remain readable under their original source identity.
         self.failed = Some(error);
         self.structure = None;
         self.jobs = Vec::new();
@@ -1512,8 +1548,8 @@ impl MarkdownTableViewportRequest {
         self.last_publication = None;
     }
 
-    /// source-aware 跳向结构水位之后时仍与真实 previous 同活联合准入；
-    /// 原 table-only resume_forward 的独立批次语义保持不变。
+    /// Precharge actual previous payload when source-aware navigation resumes after the structural frontier.
+    /// Table-only resume_forward retains its separate independent-batch contract.
     pub(in crate::markdown_document_buffer::table_window_request) fn resume_source_from_ready(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -1555,7 +1591,8 @@ impl MarkdownTableViewportRequest {
                     + previous.gaps.len() * std::mem::size_of::<Rc<VerifiedMarkdownTableGap>>(),
             )
             .map_err(MarkdownTableRequestError::Window)?;
-        // 同一真实 Global 继续；只有完成上述来源/发布和库存 preflight 后才改变原请求。
+        // Continue the same actual Global only after source/publication and joint
+        // stock preflight; rejected admission must not mutate the original request.
         self.resume_forward(
             document,
             viewport,
@@ -1578,13 +1615,15 @@ impl MarkdownTableViewportRequest {
     }
 
     fn begin_prune(&mut self) {
-        // 不退本次 quota/budget；仅重算即将发布的保留目录。下次扩展才使用这份真实 retained 额度。
+        // Do not refund current quota/budget. Recompute only the upcoming retained
+        // directory, which a later extension can precharge as its actual retained payload.
         self.records = MarkdownTableViewportBudget::default();
         self.prune_index = 0;
         self.prune_keep = 0;
-        // 空目录没有句柄、spine 或行载荷可归还；按这次真实库存选择第一个有工作的阶段，
-        // 避免普通 Gap 小窗为两个空表目录各自交还一次量子。非空目录仍逐项裁剪、计费，
-        // Gap 及 Coverage 始终走原流程，不从目录为空推导任何正文样式或新的无表覆盖。
+        // Empty directories have no handles/spine/row payload to return. Begin
+        // at actual work rather than spending separate quanta on empty table lists.
+        // Nonempty lists still prune and charge per item; original gap/coverage
+        // processing does not infer body styles or new no-table authority from emptiness.
         self.phase = if !self.windows.is_empty() {
             BatchPhase::PruneWindows
         } else if !self.structures.is_empty() {
@@ -1594,12 +1633,12 @@ impl MarkdownTableViewportRequest {
         };
     }
 
-    /// 在本请求最后一份 Ready 上共享已验证窗口，只从仍活的原 Global/Math 续体读取右侧后缀。
-    /// 前置权限、覆盖或额度拒绝均不改变旧发布或请求；开始推进之后失败/取消仍为 sticky。
-    /// 旧发布可以继续读取，但不能用其凸包补未知洞，也不能更新 selection/context 后复用旧样式。
-    /// 调用方须保持唯一发布槽，旧同步 Rc 借用结束后再推进后继批；外部历史句柄不归此配额追踪。
-    /// selection/context 是本请求的原始身份，不会由 SourceIdentity 自动感知同代次的外部选择改变。
-    /// Native 仍须守原完整选择、输入与 context 票，不能只凭 source 仍 current 就发布旧样式。
+    /// Share verified windows from this request's latest Ready, reading only the right suffix from its live Global continuation.
+    /// Authority/coverage/quota preflight rejects without mutation; failure/cancellation after progress remains sticky.
+    /// Old publication stays readable but cannot fill unknown holes or authorize old styles after selection/context changes.
+    /// The caller owns one publication slot and ends old synchronous Rc borrows before progressing; arbitrary history handles are not tracked.
+    /// Selection/context are original request identity: SourceIdentity alone cannot detect a same-generation external selection change.
+    /// Native must retain complete original selection/Input/context authority instead of treating a current source as sufficient style permission.
     pub fn extend_from_ready(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -1610,8 +1649,9 @@ impl MarkdownTableViewportRequest {
             return Err(error);
         }
         self.check_extension(document, previous, &viewport)?;
-        // 元数据只按仍同活的不可变载荷预扣，不恢复已经释放的旧 refs/underline 工作区。
-        // 后缀收齐自身新 query 后仍需从源 0 做 first-wins 扫描；这里没有全局 refs 索引。
+        // Precharge only coexisting immutable payload, without reviving released
+        // reference/underline scratch. New suffix queries still need source-zero
+        // first-wins resolution; this owner has no document-wide reference index.
         let mut records = previous.windows.iter().try_fold(
             MarkdownTableViewportBudget {
                 metadata_bytes: previous.gaps.len() * gap_metadata(),
@@ -1635,7 +1675,8 @@ impl MarkdownTableViewportRequest {
                     + previous.gaps.len() * std::mem::size_of::<Rc<VerifiedMarkdownTableGap>>(),
             )
             .map_err(MarkdownTableRequestError::Window)?;
-        // 所有同步 preflight 完成后才复制有限 Rc 句柄。没有窗口内容 clone，也不保父 publication。
+        // Copy finite Rc handles only after synchronous preflight succeeds.
+        // Clone neither window payload nor a parent-publication chain.
         let windows = previous.windows.clone();
         let gaps = previous.gaps.clone();
         let suffix = viewport.end > self.resume_boundary.1;
@@ -1644,12 +1685,14 @@ impl MarkdownTableViewportRequest {
             structure.viewport = self.resume_boundary.1..viewport.end;
             structure.no_table = false;
             if let Some(table) = structure.current.as_mut() {
-                // 当前 H/math/pending Row 均仍属同一真实表，只把新 body 范围交给后续语义作业。
+                // Current header and pending row state still belong to this
+                // actual table. Transfer only new body coverage to subsequent semantic jobs.
                 table.found = false;
                 table.include_header = false;
             }
             if self.active_header.is_none() {
-                // 普通 gap 旧票已经证明至该 byte/UTF16 同源边界；新票不能重复覆盖旧 gap。
+                // The old gap already proves this same-source byte/UTF-16
+                // boundary; the new ticket must not cover that original gap twice.
                 self.between_start = self.resume_boundary;
             }
         }
@@ -1711,8 +1754,9 @@ impl MarkdownTableViewportRequest {
         if self.structure.is_none() {
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
-        // 只复用完整物理覆盖，不把旧 requested 的截断端点误当唯一可信边界。
-        // 后缀必须紧接真实续读点；其左侧每个字节对应的 UTF16 区间都必须已有独立票据。
+        // Reuse complete physical coverage, not a clipped requested endpoint.
+        // A suffix must meet the actual resume point and every interval to its
+        // left must already have independent original coverage proof.
         let required = viewport.start..viewport.end.min(self.resume_boundary.1);
         if viewport.start > self.resume_boundary.1 || !previous.proves(&required) {
             return Err(MarkdownTableRequestError::CoverageRequiresCheckpoint);
@@ -1741,7 +1785,7 @@ impl MarkdownTableViewportRequest {
             || selection.start > selection.end
             || selection.end > document.utf16_len()
         {
-            return Err(MarkdownTableRequestError::InvalidRequest); // 逆向必须另取可信checkpoint，绝不暗中重建Global。
+            return Err(MarkdownTableRequestError::InvalidRequest); // Reverse navigation requires an actual checkpoint, never implicit Global recreation.
         }
         let structure = self
             .structure
@@ -1777,14 +1821,16 @@ impl MarkdownTableViewportRequest {
         self.queries = Some(MarkdownTableReferenceQueries::for_batch(Some(
             self.quota.clone(),
         )));
-        // 显式不重叠 resume 仍是独立批次；旧发布只能读，不能再借给这份续体作 overlap 扩展。
+        // Explicit nonoverlapping resume starts an independent batch. Old
+        // publication stays read-only and cannot be lent back as overlap authority.
         self.last_publication = None;
         Ok(())
     }
 }
 
 fn publication_metadata() -> usize {
-    // Rc 控制头按两个 usize 计逻辑开销；不声称覆盖 allocator 对齐或实际峰值。
+    // Two usize fields account for logical Rc control overhead, not allocator
+    // alignment, bookkeeping or actual whole-product peak memory.
     std::mem::size_of::<VerifiedMarkdownTableViewport>()
         + std::mem::size_of::<Publication>()
         + 2 * std::mem::size_of::<usize>()
@@ -1798,7 +1844,7 @@ fn gap_metadata() -> usize {
     std::mem::size_of::<VerifiedMarkdownTableGap>() + 2 * std::mem::size_of::<usize>()
 }
 
-/// 结构票至多 H/D 与连续真实 body 两段；省略的 header context 不能贡献可见 flow 权限。
+/// Structural tickets have header/delimiter and actual contiguous body extents; omitted header context grants no visible flow.
 fn structure_range(ticket: &MarkdownTableStructuralWindow, index: usize) -> Option<Range<usize>> {
     if ticket.include_header && index == 0 {
         return Some(ticket.header_utf16.start..ticket.delimiter_utf16.end);
@@ -1809,7 +1855,7 @@ fn structure_range(ticket: &MarkdownTableStructuralWindow, index: usize) -> Opti
     Some(ticket.body.first()?.utf16_start..ticket.body.last()?.utf16_end)
 }
 
-/// 只计真正保留的原行与scope句柄；没有复制源，因此不挪用完整Parser的源输入额度。
+/// Count actual retained row/scope handles only; no copied text means no whole-Parser source-input charge.
 fn structural_budget(ticket: &MarkdownTableStructuralWindow) -> MarkdownTableViewportBudget {
     MarkdownTableViewportBudget {
         row_slots: ticket.body.len() + 2,
@@ -1832,8 +1878,9 @@ fn retained_window_budget(
     };
     let presentation = &window.presentation;
     source.runs = presentation.runs.len() + presentation.header_context.runs.len();
-    // 结构票的原物理输入额度继续保留；metadata 只记录最终发布的数组与固定对象。
-    // 临时 scope/prefix/ref/underline 目录已释放，不能把旧工作区重复当作 retained payload。
+    // Retain the structural ticket's actual physical input allowance. Metadata
+    // counts final arrays/objects only; returned scope/prefix/reference/underline
+    // scratch cannot be counted again as retained payload for the successor.
     let arrays = [
         (
             presentation.rows.len(),

@@ -172,7 +172,7 @@ pub(super) fn html_indentation(
     while let Some(piece) = pieces.next_piece() {
         if source::scan_piece(document, &piece, |bytes| Ok(bytes.contains(&b'<')))? {
             has_angle = true;
-            break; // 只有完成真实lease回收的已知角括号才授权HTML分支，IO错误不变成普通文本。
+            break; // Enter HTML handling only after the actual lease returns; an I/O error cannot become ordinary prose.
         }
     }
     if !has_angle {

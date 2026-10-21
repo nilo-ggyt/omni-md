@@ -1,4 +1,7 @@
-//! 真实表格认证→同Doc草稿→旧事务的回归；小样本允许物化oracle，产品读取仍有限。
+//! Actual table verification, same-document draft and canonical prepared-commit
+//! regressions. Owned synthetic fixtures may materialize their oracle; product
+//! reads retain their bounded Source contract. Existing reclaim-failure injection
+//! is explicit below and is not evidence of an independently occurring OS failure.
 
 use super::*;
 use changes::{MarkdownPreparedText, MarkdownTextChange, MarkdownTextChangeObserver, NoopObserver};
@@ -13,6 +16,8 @@ mod state_history;
 const SOURCE: &str = "| H | C |\n| --- | --- |\n| a | b |\n";
 
 fn document(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+    // The temporary directory owns the real file used by production mmap/pieces;
+    // each case keeps it alive until its document resources have finished.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("cell-draft.md");
     std::fs::write(&path, source).unwrap();
@@ -21,6 +26,8 @@ fn document(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
 }
 
 fn window(doc: &MarkdownDocumentBuffer) -> VerifiedMarkdownTableWindow {
+    // Drive the actual request over finite fixture input. No fabricated window or
+    // direct struct construction grants table/cell authority to the tests.
     let mut request = doc
         .table_window_request(
             MarkdownTableWindowTarget::AtUtf16(0),
@@ -47,12 +54,16 @@ fn begin(doc: &mut MarkdownDocumentBuffer) -> MarkdownCellDraft {
 }
 
 fn canonical(doc: &MarkdownDocumentBuffer) -> String {
+    // Whole output is a fixture oracle only. The operation under test still uses
+    // the actual production document and its regular streaming writer.
     let mut bytes = Vec::new();
     doc.write_to(&mut bytes).unwrap();
     String::from_utf8(bytes).unwrap()
 }
 
 fn read(capsule: &MarkdownCellDraftReadCapsule) -> String {
+    // Materialize only this test-owned expected result through the capsule's
+    // bounded public visitor; never extract an unrestricted draft snapshot.
     let authority = capsule.authority();
     let facts = capsule.facts(&authority).unwrap();
     let mut bytes = Vec::new();
@@ -113,7 +124,8 @@ fn cell_inline_formats_match_original_plan_and_keep_one_local_undo_with_exact_se
             },
             MarkdownTextSelection::caret(2),
         ] {
-            // 小样本直接由原正文格式计划作oracle；格内不另存一套日常格式标记或包裹算法。
+            // Use the original document-format plan as the finite oracle. Cell
+            // formatting must not introduce another set of markers/wrapping rules.
             let (_oracle_dir, mut oracle) = document(raw);
             let expected_edit = oracle.apply_format(action, selection).unwrap();
             let expected = canonical(&oracle);
@@ -139,7 +151,7 @@ fn cell_inline_formats_match_original_plan_and_keep_one_local_undo_with_exact_se
             assert_eq!(
                 original_read.facts(&original_authority),
                 Err(MarkdownCellDraftError::Stale)
-            ); // 旧读取payload仍由原owner持有，但不能把格式前的root当成当前内容。
+            ); // The original owner still holds its payload, but pre-format text cannot become current content.
             drop(original_read);
             assert_eq!(
                 doc.format_cell_draft(stale, action),
@@ -156,7 +168,8 @@ fn cell_inline_formats_match_original_plan_and_keep_one_local_undo_with_exact_se
                 undo.change_in_utf16_length,
                 -actual_edit.change_in_utf16_length
             );
-            // Undo后移动caret也不能改写格式组的Redo目标，仍恢复原计划的完整inner选择。
+            // A caret move after Undo cannot rewrite the format group's Redo
+            // target; restore the original plan's complete inner selection.
             let edit = doc.capture_cell_draft_edit(&token).unwrap();
             doc.set_cell_draft_selection(edit, MarkdownTextSelection::caret(0))
                 .unwrap();
@@ -201,7 +214,7 @@ fn cell_block_formats_and_active_composition_preserve_the_original_draft() {
             Err(MarkdownCellDraftError::FormatRequiresDocument)
         );
         assert_eq!(doc.cell_draft_facts(&token).unwrap(), before);
-    } // 块动作仍须由Native先完成单格生命周期，再分派正文；不能在格内造块语法。
+    } // Native must finish the cell lifecycle before dispatching a document block action; no cell-local block syntax is invented.
     edit(
         &mut doc,
         &token,
@@ -250,7 +263,8 @@ fn cell_format_second_marker_budget_failure_rolls_back_real_candidate_and_delta(
         .allocated_bytes();
     let delta = observer.snapshot().delta_bytes;
     assert_eq!(delta, MARKDOWN_CELL_DRAFT_MAX_DELTA_BYTES - 2);
-    // 关闭标记的真实append可用完剩余两字节，随后opening才实际触及累计预算错误。
+    // Closing markers consume the actual final two append bytes; only the later
+    // opening markers hit the cumulative allowance, exercising partial preparation rollback.
     let edit = doc.capture_cell_draft_edit(&token).unwrap();
     assert_eq!(
         doc.format_cell_draft(edit, MarkdownFormatAction::Bold),
@@ -268,9 +282,9 @@ fn cell_format_second_marker_budget_failure_rolls_back_real_candidate_and_delta(
     source
         .copy_utf16_code_units(&source.authority(), before.utf16_len - 4, &mut tail)
         .unwrap();
-    assert_eq!(tail, [u16::from(b'x'); 4]); // 原读取票、尾段字节及选区方向均未被私有半包裹撤销。
+    assert_eq!(tail, [u16::from(b'x'); 4]); // Failed one-sided wrapping preserves original read authority, tail bytes and directed selection.
     drop(source);
-    drop(root); // 指针同一性的临时观察也不跨后续历史和取消持有旧树metadata。
+    drop(root); // The temporary root-identity observation must not retain old tree metadata across later history/cancellation.
     let edit = doc.capture_cell_draft_edit(&token).unwrap();
     let undo = doc
         .restore_cell_draft_history(edit, MarkdownCellDraftHistoryDirection::Undo)
@@ -322,7 +336,8 @@ fn cell_format_large_selection_shares_body_and_preserves_commit_admission() {
     assert_eq!(change.replaced_utf16_range, 0..length);
     assert_eq!(change.change_in_utf16_length, 4);
     assert_eq!(observer.snapshot().delta_bytes, delta + 4);
-    // 用原有限读取逐字节核整段共享结果，不在测试里另建2MiB expected String。
+    // Verify the complete shared result through original bounded reads, without
+    // constructing another 2 MiB expected String in this case.
     let source = doc.capture_cell_draft(&token).unwrap();
     let authority = source.authority();
     let mut at = 0;
@@ -350,7 +365,7 @@ fn cell_format_large_selection_shares_body_and_preserves_commit_admission() {
     let edit = doc.capture_cell_draft_edit(&token).unwrap();
     let prepared = doc.prepare_cell_draft_commit(edit, None).unwrap();
     assert!(prepared.replacement_backing_observer().is_some());
-    drop(prepared); // 本测试继续核raw局部Undo；放弃真实已封存准入，不提前发布canonical。
+    drop(prepared); // Continue checking raw local Undo after discarding actual sealed admission, without canonical publication.
     assert_eq!(doc.cell_draft_facts(&token).unwrap(), formatted);
     let edit = doc.capture_cell_draft_edit(&token).unwrap();
     let undo = doc
@@ -384,7 +399,7 @@ fn cell_format_revokes_old_prepared_commit_and_source_failure_still_precedes_for
     ));
     assert_eq!(doc.cell_draft_facts(&token).unwrap(), formatted);
     let edit = doc.capture_cell_draft_edit(&token).unwrap();
-    drop(doc.prepare_cell_draft_commit(edit, None).unwrap()); // 旧失败票已真Drop，唯一准入槽允许下一次原serial准备。
+    drop(doc.prepare_cell_draft_commit(edit, None).unwrap()); // The failed old ticket actually dropped, reopening this serial's unique admission slot.
     let edit = doc.capture_cell_draft_edit(&token).unwrap();
     doc.original_snapshot
         .as_ref()
@@ -401,7 +416,7 @@ fn cell_format_revokes_old_prepared_commit_and_source_failure_still_precedes_for
         Err(MarkdownCellDraftError::Document(
             MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
         ))
-    ); // 真实Source错误先于正文位置拒绝，不把已失败的原源降成普通格式错误。
+    ); // The injected Source failure traversed actual reclaim first and must outrank a document-position format rejection.
     let pending = match &doc.cell_draft {
         Some(CellDraftSlot::Active(pending)) => pending,
         _ => panic!("源错误后原草稿仍须保留"),
@@ -414,6 +429,8 @@ fn cell_format_revokes_old_prepared_commit_and_source_failure_still_precedes_for
 
 #[test]
 fn only_real_current_window_can_begin_and_canonical_writes_remain_blocked() {
+    // Equal-byte foreign documents cannot exchange verified windows. While this
+    // unique draft owns the baseline, canonical writes/selection changes are blocked.
     let (_dir, mut doc) = document(SOURCE);
     let (_other_dir, mut other) = document(SOURCE);
     let verified = window(&doc);
@@ -483,7 +500,7 @@ fn large_draft_is_accepted_and_can_shrink_without_polluting_canonical_append() {
         .prepare_cell_draft_commit(doc.capture_cell_draft_edit(&token).unwrap(), None)
         .unwrap();
     let candidate = prepared.replacement_backing_observer().unwrap();
-    drop(prepared); // 长准入已经可用；用户继续缩短raw时不把已放弃的大候选移入canonical库存。
+    drop(prepared); // Long admission succeeded; discarding it before shrinking raw input must not transfer its storage into canonical inventory.
     assert!(candidate.unmap_succeeded());
     let capsule = doc.capture_cell_draft(&token).unwrap();
     let authority = capsule.authority();
@@ -494,8 +511,10 @@ fn large_draft_is_accepted_and_can_shrink_without_polluting_canonical_append() {
     assert_eq!(tail, [u16::from(b'x'); 4]);
     drop(capsule);
     replace(&mut doc, &token, "small");
+    let input = doc.capture_cell_draft_edit(&token).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(input, None).unwrap();
     assert!(
-        doc.commit_cell_draft_observed(&token, NoopObserver)
+        doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
             .unwrap()
             .edit
             .is_some()
@@ -538,7 +557,8 @@ fn scalar_failures_roll_back_delta_serial_selection_and_marked() {
             MarkdownDocumentBufferError::NotUnicodeBoundary
         ))
     );
-    // 新字节已暂时追加后，post-selection落在新surrogate内部仍必须真实回退本分支。
+    // Even after actual candidate append, a post-selection inside the new surrogate
+    // pair must roll back this branch's storage and preserve its original serial.
     assert_eq!(
         edit(
             &mut doc,
@@ -560,6 +580,8 @@ fn scalar_failures_roll_back_delta_serial_selection_and_marked() {
 
 #[test]
 fn read_authority_is_capture_and_serial_specific_with_fixed_two_payloads() {
+    // Capsule clones share one actual payload. Two independent captures exhaust
+    // the real slots, and editing revokes reads without prematurely freeing owners.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(&mut doc, &token, "中😀");
@@ -600,6 +622,8 @@ fn read_authority_is_capture_and_serial_specific_with_fixed_two_payloads() {
 
 #[test]
 fn cancellation_keeps_retired_slot_until_last_actual_read_payload_drop() {
+    // Cancelling drops the branch but not a live frozen payload. That real owner
+    // keeps canonical mutation blocked until it drops and the retired slot drains.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(&mut doc, &token, "uncommitted");
@@ -628,6 +652,8 @@ fn cancellation_keeps_retired_slot_until_last_actual_read_payload_drop() {
 
 #[test]
 fn token_drop_drains_and_unchanged_commit_does_not_add_history() {
+    // A dropped weak token requests cancellation only. After explicit draining,
+    // an unchanged prepared commit closes without a canonical edit or empty Undo.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     let baseline = doc.storage_profile();
@@ -635,8 +661,10 @@ fn token_drop_drains_and_unchanged_commit_does_not_add_history() {
     assert!(doc.has_cell_draft());
     assert!(doc.drain_cancelled_cell_draft());
     let token = begin(&mut doc);
+    let input = doc.capture_cell_draft_edit(&token).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(input, None).unwrap();
     assert!(
-        doc.commit_cell_draft_observed(&token, NoopObserver)
+        doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
             .unwrap()
             .edit
             .is_none()
@@ -647,6 +675,8 @@ fn token_drop_drains_and_unchanged_commit_does_not_add_history() {
 
 #[test]
 fn actual_edited_segments_are_shared_and_draft_cow_never_writes_old_snapshot() {
+    // Begin from actual canonical edit storage, then retain a real snapshot while
+    // editing the draft. Original bytes must survive without canonical growth.
     let (_dir, mut doc) = document(SOURCE);
     let cell = SOURCE.find("| a |").unwrap() + 2;
     doc.replace_utf16_range(
@@ -678,6 +708,8 @@ fn actual_edited_segments_are_shared_and_draft_cow_never_writes_old_snapshot() {
 
 #[test]
 fn held_reader_blocks_commit_and_observer_rejection_preserves_exact_draft() {
+    // This existing pure observer rejects the actual prepared transaction's final
+    // derived-output boundary. It is not an alternative text/Source implementation.
     struct Reject;
     impl MarkdownTextChangeObserver for Reject {
         type Output = ();
@@ -699,15 +731,21 @@ fn held_reader_blocks_commit_and_observer_rejection_preserves_exact_draft() {
     let facts = doc.cell_draft_facts(&token).unwrap();
     let baseline = doc.storage_profile();
     let capsule = doc.capture_cell_draft(&token).unwrap();
+    // Match Native's real ordering: preparation may coexist with the old Scene
+    // reader, but canonical publication must wait for that actual payload to drop.
+    let input = doc.capture_cell_draft_edit(&token).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(input, None).unwrap();
     assert!(matches!(
-        doc.commit_cell_draft_observed(&token, NoopObserver),
+        doc.commit_prepared_cell_draft_observed(prepared, NoopObserver),
         Err(MarkdownCellDraftCommitError::Draft(
             MarkdownCellDraftError::ReadersBusy
         ))
     ));
     drop(capsule);
+    let input = doc.capture_cell_draft_edit(&token).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(input, None).unwrap();
     assert!(matches!(
-        doc.commit_cell_draft_observed(&token, Reject),
+        doc.commit_prepared_cell_draft_observed(prepared, Reject),
         Err(MarkdownCellDraftCommitError::Edit(
             changes::MarkdownObservedEditError::Observer("reject candidate")
         ))
@@ -716,8 +754,12 @@ fn held_reader_blocks_commit_and_observer_rejection_preserves_exact_draft() {
     assert_eq!(doc.storage_profile(), baseline);
     assert!(!doc.has_prepared_text_input());
     assert_eq!(canonical(&doc), SOURCE);
+    // Retry only after the failed candidate has actually left the unique slot;
+    // this new preparation is explicit, using the same public path as Native.
+    let input = doc.capture_cell_draft_edit(&token).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(input, None).unwrap();
     assert!(
-        doc.commit_cell_draft_observed(&token, NoopObserver)
+        doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
             .unwrap()
             .edit
             .is_some()
@@ -726,6 +768,8 @@ fn held_reader_blocks_commit_and_observer_rejection_preserves_exact_draft() {
 
 #[test]
 fn sanitizer_and_implicit_cell_prefix_follow_original_table_rules() {
+    // Finite Unicode/escaping fixtures exercise the original sanitizer. A missing
+    // cell then compares its actual verified insertion plan with prepared commit.
     for (raw, escaped) in [
         (" a|b\r\nc\\|d ", "a\\|b c\\|d"),
         ("a\\\\|b", "a\\\\\\|b"),
@@ -734,7 +778,9 @@ fn sanitizer_and_implicit_cell_prefix_follow_original_table_rules() {
         let (_dir, mut doc) = document(SOURCE);
         let token = begin(&mut doc);
         replace(&mut doc, &token, raw);
-        doc.commit_cell_draft_observed(&token, NoopObserver)
+        let input = doc.capture_cell_draft_edit(&token).unwrap();
+        let prepared = doc.prepare_cell_draft_commit(input, None).unwrap();
+        doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
             .unwrap();
         assert_eq!(
             canonical(&doc),
@@ -753,18 +799,24 @@ fn sanitizer_and_implicit_cell_prefix_follow_original_table_rules() {
     let token = doc.begin_cell_draft(&verified, 1, 1).unwrap();
     assert_eq!(doc.cell_draft_facts(&token).unwrap().utf16_len, 0);
     replace(&mut doc, &token, "tail");
-    doc.commit_cell_draft_observed(&token, NoopObserver)
+    let input = doc.capture_cell_draft_edit(&token).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(input, None).unwrap();
+    doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap();
     assert_eq!(canonical(&doc), oracle);
 }
 
 #[test]
 fn sanitizer_escape_parity_survives_actual_four_kib_piece_boundary() {
+    // Place the backslash at the real logical piece boundary. Sanitization state
+    // must survive that split instead of escaping a literal pipe a second time.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     let raw = format!("{}\\|z\r\nq", "x".repeat(4095));
     replace(&mut doc, &token, &raw);
-    doc.commit_cell_draft_observed(&token, NoopObserver)
+    let input = doc.capture_cell_draft_edit(&token).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(input, None).unwrap();
+    doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap();
     assert_eq!(
         canonical(&doc),
@@ -774,6 +826,8 @@ fn sanitizer_escape_parity_survives_actual_four_kib_piece_boundary() {
 
 #[test]
 fn draft_doc_drop_does_not_keep_document_and_final_capsule_really_unmaps_source() {
+    // The frozen reader legitimately retains actual mapping ownership after the
+    // document drops. Only releasing its final capsule can complete munmap.
     let (_dir, mut doc) = document(SOURCE);
     let backing = doc.original_backing_observer().unwrap();
     let token = begin(&mut doc);
@@ -796,6 +850,9 @@ fn draft_doc_drop_does_not_keep_document_and_final_capsule_really_unmaps_source(
 
 #[test]
 fn true_source_errno_precedes_stale_cache_and_cancel_but_does_not_block_cleanup() {
+    // Populate a real read first, then use the existing one-shot reclaim failure
+    // seam and actually invoke reclaim. The resulting sticky Source failure must
+    // outrank cache/stale/cancel outcomes without blocking final resource release.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     let capsule = doc.capture_cell_draft(&token).unwrap();
@@ -833,6 +890,8 @@ fn true_source_errno_precedes_stale_cache_and_cancel_but_does_not_block_cleanup(
 
 #[test]
 fn utf16_string_threshold_keeps_supplementary_boundary_and_commits_the_larger_frozen_draft() {
+    // One extra unit crosses the bounded String threshold after complete emoji
+    // pairs. The same prepared path must publish frozen storage and preserve Undo.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     let boundary = "😀".repeat(MARKDOWN_CELL_DRAFT_COMMIT_UTF16_UNITS / 2);
@@ -847,7 +906,9 @@ fn utf16_string_threshold_keeps_supplementary_boundary_and_commits_the_larger_fr
     )
     .unwrap();
     assert_eq!(doc.cell_draft_facts(&token).unwrap().utf16_len, 65537);
-    doc.commit_cell_draft_observed(&token, NoopObserver)
+    let input = doc.capture_cell_draft_edit(&token).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(input, None).unwrap();
+    doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap();
     assert_eq!(
         doc.storage_profile().appended_edit_bytes,
@@ -880,7 +941,8 @@ fn source_failure_after_observer_finish_cancels_real_prepared_candidate_and_keep
             _: MarkdownTextSelection,
         ) -> Result<(), Self::Error> {
             let doc = candidate.document;
-            // 原真实页仍有已装入的无pin槽；注入后显式触发驱逐，不能把注入旗标当I/O已失败。
+            // Actual pages have loaded unpinned slots. Trigger eviction after the
+            // existing injection; the flag alone is not an observed I/O failure.
             doc.original_snapshot
                 .as_ref()
                 .unwrap()
@@ -901,8 +963,10 @@ fn source_failure_after_observer_finish_cancels_real_prepared_candidate_and_keep
     let observer = doc.cell_draft_resource_observer(&token).unwrap();
     let root = doc.root.clone();
     let before = doc.storage_profile();
+    let input = doc.capture_cell_draft_edit(&token).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(input, None).unwrap();
     assert!(matches!(
-        doc.commit_cell_draft_observed(&token, FailSource),
+        doc.commit_prepared_cell_draft_observed(prepared, FailSource),
         Err(MarkdownCellDraftCommitError::Draft(
             MarkdownCellDraftError::Document(
                 MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
@@ -923,6 +987,8 @@ fn source_failure_after_observer_finish_cancels_real_prepared_candidate_and_keep
 
 #[test]
 fn edit_capsule_is_consumed_and_old_serial_or_foreign_nonce_cannot_reauthorize_coordinates() {
+    // Actual input advances serial under the same nonce. Old local or equal-sized
+    // foreign capsules cannot authorize edits against the current marked draft.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     let stale = doc.capture_cell_draft_edit(&token).unwrap();

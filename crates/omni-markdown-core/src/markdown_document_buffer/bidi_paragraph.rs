@@ -1,4 +1,4 @@
-//! 同一冻结树的真实B类段端点；没有B的子树只消费元数据，命中叶按原量子逐scalar读取。
+//! Locate actual B-class paragraph endpoints in one frozen tree with bounded scalar and metadata work.
 
 use super::*;
 use crate::unicode_bidi_data::UnicodeBidiData;
@@ -13,6 +13,8 @@ enum Seek {
 }
 
 enum Pending {
+    // Immutable nodes and compact records retain only original metrics/path
+    // coordinates. Actual body bytes are borrowed only while advancing a leaf.
     Node(Arc<MarkdownPieceTreeNode>, usize, usize),
     Span {
         span: OriginalSpan,
@@ -26,6 +28,8 @@ enum Pending {
 }
 
 struct Leaf {
+    // One original physical piece and at most one UTF-8 scalar remainder survive
+    // a yield. No source lease or paragraph-sized buffer is retained here.
     piece: MarkdownPiece,
     utf16: usize,
     end: usize,
@@ -37,20 +41,22 @@ struct Leaf {
     previous: Option<(usize, usize)>,
 }
 
-/// 仅来自已完成的真实 scalar 解码；不保 lease、正文或尚未认证的 UTF8 残余。
+/// A completed original scalar boundary, never a lease, copied text, or unvalidated UTF-8 remainder.
 struct ScalarPoint {
     piece: MarkdownPiece,
     utf16: usize,
-    // 同一次命中叶的全局末端；不能按 UTF8 byte 差推测剩余 UTF16 范围。
+    // The same hit leaf's global UTF-16 end; byte differences cannot supply this
+    // remaining UTF-16 extent when scalar widths differ.
     end: usize,
     byte: usize,
     source_byte: usize,
 }
 
-/// 只保原冻结树的路径与一个scalar残余；Weak标记原Frozen身份，不增加正文或Reader owner。
+/// Retain the original tree path and one scalar remainder under a weak Frozen identity, not a reader owner.
 pub(crate) struct FrozenBidiParagraphCursor {
     origin: std::sync::Weak<FrozenText>,
-    // 显示源必须走自己的输出目录；其 root=None 不能落入原树空值分支。
+    // A display source must traverse its actual output directory. Its absent
+    // canonical root cannot be mistaken for an empty original source.
     #[cfg(feature = "s2-table-window-prototype")]
     projection: Option<Box<display_projection::algorithms::ProjectionBidiParagraphCursor>>,
     root: PieceTreeLink,
@@ -62,7 +68,8 @@ pub(crate) struct FrozenBidiParagraphCursor {
     end_byte: usize,
     content_end: usize,
     seek: Seek,
-    // 原 B 段已就绪后，只认证新的前进端点；段范围和这个点均出自本游标的同次查询。
+    // Once the actual B paragraph is ready, a forward query validates only its
+    // new scalar point; both range and point still belong to this original cursor.
     boundary_only: bool,
     forward: Option<ScalarPoint>,
 }
@@ -72,7 +79,8 @@ pub(crate) struct FrozenBidiParagraphStep {
     pub(crate) scalars: usize,
     pub(crate) metadata: usize,
     pub(crate) range: Option<Range<usize>>,
-    // 同一次真实 B 段定位同时保留 canonical byte 端点，后继 UBA 不必另读边叶转换。
+    // The same paragraph search retains canonical byte endpoints, so later UBA
+    // work need not borrow the boundary leaves again just to translate coordinates.
     pub(crate) byte_range: Option<Range<usize>>,
     pub(crate) content_end: usize,
     pub(crate) maximum_borrow: usize,
@@ -80,8 +88,12 @@ pub(crate) struct FrozenBidiParagraphStep {
 
 impl FrozenBidiParagraphCursor {
     pub(super) fn new(snapshot: &MarkdownTextSnapshot, position: usize) -> Self {
+        // Establish original identity and metadata only. The snapshot entry point
+        // has confined the request; mixed scalar validation is charged on advance.
         #[cfg(feature = "s2-table-window-prototype")]
         if let Some(projection) = snapshot.display_projection() {
+            // Projection coordinates use their own true visible directory and
+            // cannot borrow a canonical source's empty-root completion path.
             let metrics = projection.metrics();
             return Self {
                 origin: Arc::downgrade(&snapshot.text),
@@ -120,7 +132,8 @@ impl FrozenBidiParagraphCursor {
             boundary_only: false,
             forward: None,
         };
-        // 每字符都只占一个UTF16单位时任意整数端点均合法；否则沿同树验证命中scalar。
+        // One-unit scalars make every integer endpoint valid. Otherwise validate
+        // the actual hit scalar before searching the surrounding B-class boundaries.
         if position == 0
             || position == metrics.utf16_len
             || metrics.character_count == metrics.utf16_len
@@ -136,7 +149,7 @@ impl FrozenBidiParagraphCursor {
         self.position
     }
 
-    /// 仅在本游标真实交付 Ready 后由拥有者移交；投影没有 canonical 前进点证明，原路释放。
+    /// The owner transfers this only after actual Ready; projections have no canonical forward-point proof.
     pub(crate) fn into_forward_range(self) -> Option<Self> {
         #[cfg(feature = "s2-table-window-prototype")]
         if self.projection.is_some() {
@@ -145,8 +158,8 @@ impl FrozenBidiParagraphCursor {
         Some(self)
     }
 
-    /// 同 Frozen、同 B 段的向前请求只续算标量边界；范围覆盖本身不能授权代理项内部。
-    /// 后退、在途、另一段与显示投影不借用这个点，仍由调用方创建原冷游标。
+    /// Resume scalar validation only for a forward request inside this same Frozen paragraph.
+    /// Backward, in-flight, other-paragraph and projection requests require the caller's ordinary cold cursor.
     pub(crate) fn advance_position(
         &mut self,
         snapshot: &MarkdownTextSnapshot,
@@ -158,22 +171,26 @@ impl FrozenBidiParagraphCursor {
         }
         #[cfg(feature = "s2-table-window-prototype")]
         if self.projection.is_some() {
-            return Ok(false); // 投影的输出目录与 canonical piece 不共享此端点证明。
+            return Ok(false); // Projection output and canonical pieces cannot share this endpoint permission.
         }
         if self.seek != Seek::Complete
             || position <= self.position
             || !(self.start..self.end).contains(&position)
         {
+            // An unready or unrelated position cannot inherit the completed
+            // paragraph's original point. False asks the owner to use its cold path.
             return Ok(false);
         }
-        // 已封闭的同段范围保持不变；这里只更换尚未交付的新位置，未验证前没有 Ready。
+        // Preserve the already-closed paragraph and replace only the requested
+        // point. It remains pending until actual scalar validation completes.
         self.position = position;
         self.boundary_only = true;
         if let Some(point) = &self.forward
             && point.utf16 < position
             && position <= point.end
         {
-            // 只从原已认证点顺读同叶剩余字节；跨叶仍支付原树路径与命中叶的 Boundary 量子。
+            // Resume only from the original validated point in this leaf. Crossing
+            // leaves still pays for the real tree path and hit-leaf Boundary work.
             self.pending.clear();
             self.seek = Seek::Boundary;
             self.pending.push(Pending::Leaf(Leaf {
@@ -197,16 +214,20 @@ impl FrozenBidiParagraphCursor {
     fn finish_boundary(&mut self, point: ScalarPoint) {
         self.forward = Some(point);
         if self.boundary_only {
-            // 新点与旧 B 两端属于同一不可变 Frozen；无需再次 Previous/Next 扫描端点叶。
+            // The new point and closed B endpoints share the same immutable
+            // Frozen value; do not rescan previous/next boundary leaves.
             self.pending.clear();
             self.seek = Seek::Complete;
         } else {
-            // 冷查询只认证了这个 scalar，仍须完成原 B 范围定位才可对外交付。
+            // A cold query has validated only one scalar so far; locate the
+            // original B paragraph before handing any completed range outward.
             self.restart(Seek::Previous);
         }
     }
 
     fn restart(&mut self, seek: Seek) {
+        // Return the exhausted path and seed another traversal of the same
+        // original root. No current document capture can replace this authority.
         self.pending.clear();
         self.seek = seek;
         if let Some(root) = &self.root {
@@ -215,6 +236,8 @@ impl FrozenBidiParagraphCursor {
     }
 
     fn relevant(&self, metrics: MarkdownDocumentMetrics, base: usize) -> bool {
+        // Scalar validation follows only the containing subtree. Paragraph search
+        // follows only actual B-containing subtrees on the requested side.
         let end = base + metrics.utf16_len;
         if self.seek == Seek::Boundary {
             return base <= self.position && self.position < end;
@@ -230,7 +253,8 @@ impl FrozenBidiParagraphCursor {
             }
     }
 
-    /// 实际Node/目录各收费一次；叶的UTF8残余可跨1byte量子，原lease在返回前真实结束。
+    /// Charge each actual node/directory visit; continue scalar remainders across one-byte quanta.
+    /// Each real lease ends inside this step; the snapshot entry point owns surrounding health checks.
     pub(super) fn advance(
         &mut self,
         snapshot: &MarkdownTextSnapshot,
@@ -249,7 +273,7 @@ impl FrozenBidiParagraphCursor {
         };
         if !std::sync::Weak::ptr_eq(&self.origin, &Arc::downgrade(&snapshot.text)) {
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
-        } // 内部游标也不能借同文本的另一Frozen替换实际读取资源。
+        } // Equal text in another Frozen value cannot replace the actual resource owner.
         #[cfg(feature = "s2-table-window-prototype")]
         if let Some(cursor) = &mut self.projection {
             return cursor.advance(
@@ -269,10 +293,12 @@ impl FrozenBidiParagraphCursor {
                     Seek::Next => self.seek = Seek::Complete,
                     Seek::Complete => unreachable!(),
                 }
-                continue; // 只有原有序路径耗尽才取得BOF/EOF，不把一次配额当作段边界。
+                continue; // Only exhaustion of the original ordered path establishes BOF/EOF, never a quota limit.
             };
             if matches!(next, Pending::Leaf(_)) {
                 if step.bytes == maximum_bytes || step.scalars == maximum_scalars {
+                    // Leave the original leaf continuation pending; a budget
+                    // boundary cannot be published as a paragraph endpoint.
                     break;
                 }
                 let Some(Pending::Leaf(mut leaf)) = self.pending.pop() else {
@@ -289,15 +315,16 @@ impl FrozenBidiParagraphCursor {
                         byte: leaf.byte,
                         source_byte: leaf.source_byte,
                     });
-                    continue; // 叶首原本就是scalar边界，无需借正文重新证明。
+                    continue; // An original leaf start is already scalar-aligned and needs no text read.
                 }
                 let mut count = (maximum_bytes - step.bytes)
                     .min(maximum_scalars - step.scalars)
                     .min(crate::MARKDOWN_LAYOUT_SOURCE_BYTES)
                     .min(leaf.piece.byte_len - leaf.byte);
                 if self.seek == Seek::Boundary && self.boundary_only {
-                    // 每 UTF16 单位最多三个 UTF8 字节。只借到目标附近，避免每个小 GCB
-                    // 虽少解码却反复借满整个量子；低代理项仍必须读完真实 scalar 才能拒绝。
+                    // Each UTF-16 unit needs at most three UTF-8 bytes. Limit the
+                    // requested slice near this point instead of repeatedly borrowing
+                    // a full quantum for small GCBs; a surrogate interior still needs full scalar validation.
                     count = count.min(
                         (self.position - leaf.utf16).min(crate::MARKDOWN_LAYOUT_SOURCE_BYTES) * 3,
                     );
@@ -305,9 +332,11 @@ impl FrozenBidiParagraphCursor {
                 let bytes = snapshot
                     .text
                     .piece_range_bytes(&leaf.piece, leaf.byte..leaf.byte + count)?;
-                step.bytes += bytes.len(); // 计实际lease，而非只计遇到B之前的少量解引用。
+                step.bytes += bytes.len(); // Charge the requested leased slice, including any bytes beyond the first B hit.
                 step.maximum_borrow = step.maximum_borrow.max(bytes.len());
                 for &byte in &*bytes {
+                    // Decode at most one retained scalar across quanta. Malformed
+                    // starts/completions remain source errors, not artificial boundaries.
                     if leaf.used == 0 {
                         leaf.needed = match byte {
                             0..=0x7f => 1,
@@ -339,8 +368,9 @@ impl FrozenBidiParagraphCursor {
                         if self.position <= end {
                             complete = true;
                             let valid = self.position == leaf.utf16 || self.position == end;
-                            // lease 可以预读到目标之后，保存点仍严格对应目标的已认证 byte，
-                            // 不能把预读量或刚解码出的 scalar 末端移交给另一个 UTF16 位置。
+                            // A lease can include bytes beyond the target. Save
+                            // only that target's validated byte endpoint, never
+                            // relabel prefetch length or another scalar's end as this UTF-16 position.
                             let byte = if self.position == leaf.utf16 {
                                 leaf.byte - leaf.used
                             } else {
@@ -349,6 +379,8 @@ impl FrozenBidiParagraphCursor {
                             found = Some((valid, byte));
                         }
                     } else if UnicodeBidiData.bidi_class(scalar) == BidiClass::B {
+                        // Previous remembers the last original separator before
+                        // the request; Next closes at the first separator at/after it.
                         if self.seek == Seek::Previous && leaf.utf16 < self.position {
                             leaf.previous = Some((end, leaf.source_byte + leaf.byte));
                         } else if self.seek == Seek::Next && leaf.utf16 >= self.position {
@@ -367,7 +399,9 @@ impl FrozenBidiParagraphCursor {
                         break;
                     }
                 }
-                bytes.finish()?; // 原pin/驱逐失败优先于已经计算出的候选端点，不跨量子保留lease。
+                // End the real pin before publishing endpoints or decode errors.
+                // Reclaim/source failure takes precedence over the computed candidate.
+                bytes.finish()?;
                 snapshot.text.source_health()?;
                 if let Some(error) = failure {
                     return Err(error);
@@ -376,7 +410,8 @@ impl FrozenBidiParagraphCursor {
                     if !valid {
                         return Err(MarkdownDocumentBufferError::NotUnicodeBoundary);
                     }
-                    // lease.finish 与原 Source 健康核验已经完成，才保留这个实际解码端点。
+                    // Only after actual lease return and original-source health
+                    // checks may this decoded point become a retained continuation.
                     self.finish_boundary(ScalarPoint {
                         piece: leaf.piece,
                         utf16: self.position,
@@ -403,11 +438,13 @@ impl FrozenBidiParagraphCursor {
                         self.restart(Seek::Next);
                     }
                 } else {
-                    self.pending.push(Pending::Leaf(leaf)); // 原部分叶续算，不回到叶头，也不保存正文缓冲。
+                    self.pending.push(Pending::Leaf(leaf)); // Resume the same original leaf without copied body bytes.
                 }
                 continue;
             }
             if step.metadata == maximum_metadata {
+                // Directory work yields independently of byte/scalar work. The
+                // untouched path is not an implicit completed paragraph.
                 break;
             }
             step.metadata += 1;
@@ -418,6 +455,8 @@ impl FrozenBidiParagraphCursor {
                     }
                     match node.as_ref() {
                         MarkdownPieceTreeNode::Branch { left, right, .. } => {
+                            // Stack order follows the actual search direction;
+                            // byte and UTF-16 bases advance with their own metrics.
                             let right_base = base + left.metrics().utf16_len;
                             let right_byte = source_byte + left.metrics().byte_len;
                             if self.seek == Seek::Previous {
@@ -445,6 +484,8 @@ impl FrozenBidiParagraphCursor {
                             }
                         }
                         MarkdownPieceTreeNode::OriginalSpan(span) => {
+                            // Begin at the correct selected compact record and
+                            // explicitly charge any physical-directory prefix needed to locate it.
                             let reverse = self.seek == Seek::Previous;
                             let ordinal = if reverse {
                                 span.record_range().end - 1
@@ -507,9 +548,11 @@ impl FrozenBidiParagraphCursor {
                             source_byte,
                             prefix: (prefix + 1 < target).then_some(prefix + 1),
                         });
-                        continue; // 实际小目录的物理前缀同样逐条计费，budget1不会暗中展开十六项。
+                        continue; // Every physical-prefix record is charged; one metadata unit cannot hide 16 visits.
                     }
                     let metrics = span.word_record_metrics(ordinal)?;
+                    // Reverse traversal starts from this record's end; forward
+                    // traversal starts from its beginning. Keep physical/source byte bases distinct.
                     let reverse = self.seek == Seek::Previous;
                     let start = if reverse {
                         base - metrics.utf16_len
@@ -534,6 +577,8 @@ impl FrozenBidiParagraphCursor {
                         (ordinal + 1 < span.record_range().end).then_some(ordinal + 1)
                     };
                     if let Some(next) = next {
+                        // Retain only the next original compact-record cursor,
+                        // without expanding the directory into another piece list.
                         self.pending.push(Pending::Span {
                             span,
                             ordinal: next,
@@ -556,6 +601,8 @@ impl FrozenBidiParagraphCursor {
                         });
                     }
                     if self.relevant(metrics, start) {
+                        // Decode only a genuinely relevant original record. The
+                        // constructed leaf retains coordinates, not a live byte reader.
                         self.pending.push(Pending::Leaf(Leaf {
                             piece: MarkdownPiece {
                                 source: MarkdownPieceSource::Original,
@@ -578,7 +625,7 @@ impl FrozenBidiParagraphCursor {
             }
         }
         if self.seek == Seek::Complete {
-            self.pending.clear(); // 就绪后仅保原 root、单点与单段事实，不保已经用完的遍历路径。
+            self.pending.clear(); // Ready retains the original root/point/paragraph facts, not the exhausted traversal path.
             step.range = Some(self.start..self.end);
             step.byte_range = Some(self.start_byte..self.end_byte);
             step.content_end = self.content_end;

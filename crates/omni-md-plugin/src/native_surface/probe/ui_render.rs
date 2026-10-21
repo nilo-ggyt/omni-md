@@ -1,9 +1,11 @@
-//! 只导出当前合成窗口的有限自有NSView渲染；不领取正文、Scene或WindowServer截图权限。
-//! 调用者保原Source/Font/完整Input与CPU终点；本模块唯一拥有目录选择及bitmap/PNG文件I/O。
+//! Export the current synthetic window's bounded, owned NSView rendering.
+//! The caller retains original Source/font/Input authority and a complete CPU
+//! endpoint; this module owns only opt-in bitmap encoding and PNG file I/O.
 
 use super::*;
 
-/// 只有显式目录才启用输出；普通验收不查询Native、不分配bitmap，也不创建任何默认目录。
+/// Require an explicit existing output directory. Ordinary acceptance allocates
+/// no bitmap, creates no directory, and performs no Native work through this hook.
 pub(super) fn directory() -> Result<Option<std::path::PathBuf>, String> {
     let Some(path) = std::env::var_os("OMNI_NATIVE_UI_CAPTURE_DIRECTORY") else {
         return Ok(None);
@@ -15,8 +17,9 @@ pub(super) fn directory() -> Result<Option<std::path::PathBuf>, String> {
     Ok(Some(directory))
 }
 
-/// 真实内容根必须由调用者原窗口取得；只写同View当前有限bounds，不遍历逻辑全文或其它窗口。
-/// 静态label与实际窗口号/paint/像素尺寸组成文件名；重复输出真实失败，绝不覆盖之前证据。
+/// Render only the original content root's current finite bounds. A static label
+/// and actual window/paint/pixel facts identify each file; create_new preserves
+/// previous output instead of silently overwriting it on a repeated observation.
 pub(super) fn write(
     directory: &Path,
     view: &NSView,
@@ -27,7 +30,7 @@ pub(super) fn write(
     autoreleasepool(|_| {
         let window = step(current, || view.window())?.ok_or("UI图内容根已脱离原窗口")?;
         let number = step(current, || window.windowNumber())?;
-        drop(window); // 原Native claim只活本次getter，不进入PNG或跨下一步骤。
+        drop(window); // The temporary Native claim does not cross encoding or subsequent observations.
         let bounds = step(current, || view.bounds())?;
         if ![
             bounds.origin.x,
@@ -42,8 +45,10 @@ pub(super) fn write(
         {
             return Err("UI内部渲染内容根没有有限非空bounds".into());
         }
-        // 原View的真实backing决定像素数，不缩放图片来掩盖布局，也不扩大到滚动文档高度。
-        // cacheDisplay读取原已安装内容；调用者不能以新Scene.paint绘制一张替代通过图。
+        // Actual view backing determines pixel dimensions, without scaling away
+        // layout defects or extending capture to the logical document height.
+        // Cache the installed content rather than painting an alternative Scene
+        // that could disagree with the user's current view.
         let backing = step(current, || view.convertRectToBacking(bounds))?;
         let bitmap = step(current, || {
             view.bitmapImageRepForCachingDisplayInRect(bounds)
@@ -60,8 +65,10 @@ pub(super) fn write(
         {
             return Err("UI图实际bitmap没有覆盖同窗口backing尺寸".into());
         }
-        // 空属性只选择标准PNG编码；保原bitmap的实际颜色信息，不重染、拉伸或回填屏幕像素。
-        // SAFETY: properties为空，无不匹配的属性值；原bitmap在本同步主线程池内保活。
+        // Standard PNG encoding preserves the original bitmap's actual colors;
+        // no recoloring, resizing, or screen pixels fill missing content.
+        // SAFETY: Empty properties contain no mismatched values, and the original
+        // bitmap remains retained throughout this synchronous main-thread pool.
         let data = step(current, || unsafe {
             bitmap.representationUsingType_properties(
                 objc2_app_kit::NSBitmapImageFileType::PNG,
@@ -77,8 +84,10 @@ pub(super) fn write(
             .create_new(true)
             .open(path)
             .map_err(|cause| cause.to_string())?;
-        // SAFETY: data是本次独占编码得到的不可变NSData，未暴露可变别名；借用期间仅同步写盘，
-        // 不调用Native、不进runloop，也不复制第二份整窗PNG。FD/bitmap/NSData均在本调用归还。
+        // SAFETY: This encoding produced immutable NSData with no mutable alias.
+        // Its bytes remain borrowed only during synchronous file output, without
+        // Native calls, run-loop reentry, or another whole-window PNG copy. The
+        // file, bitmap, and NSData owners all end within this invocation.
         let bytes = unsafe { data.as_bytes_unchecked() };
         output.write_all(bytes).map_err(|cause| cause.to_string())?;
         if !current() {

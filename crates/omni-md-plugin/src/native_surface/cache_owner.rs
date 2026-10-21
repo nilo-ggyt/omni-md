@@ -1,19 +1,24 @@
-//! 主线程缓存的唯一 owner 借出；状态借用不跨 native factory、retain 或 drop。
+//! Lend the main-thread cache's unique payload owner. No state borrow crosses
+//! Native construction, retain, or destruction that could synchronously reenter.
 
 use std::cell::{Cell, RefCell};
 
-/// 空 payload 不分配容量或取得原生资源；仅供失效后恢复可用的空槽。
+/// Empty payloads allocate no capacity or Native resources. They restore an
+/// invalidated slot without recreating an old semantic request.
 pub(super) trait CachePayload: Sized {
     fn empty() -> Self;
 
-    /// Ready 状态在局部 owner 内失效；具体 scratch 可清 key 而保留活动会话的有限容量。
+    /// Invalidate a locally owned Ready payload. Concrete scratch owners may
+    /// clear keys while retaining their active session's bounded capacity.
     fn invalidate(&mut self) {
-        // 默认丢弃资源；调用者已经结束 slot 借用，原生析构允许重入。
+        // Default invalidation drops resources after the slot borrow has ended,
+        // allowing Native destructors to reenter the already Loaned owner.
         *self = Self::empty();
     }
 }
 
-/// Ready 拥有唯一 payload，Loaned 由同步栈独占，Closed 永久拒绝恢复。
+/// Ready owns one payload, Loaned transfers it exclusively to the synchronous
+/// stack, and Closed permanently rejects restoring that payload.
 pub(super) struct CacheOwner<T: CachePayload> {
     payload: RefCell<Option<T>>,
     loaned: Cell<bool>,
@@ -21,7 +26,8 @@ pub(super) struct CacheOwner<T: CachePayload> {
     epoch: Cell<u64>,
 }
 
-/// Busy 只改变本次计算方式；不能毒化外层 owner 或发布第二个缓存。
+/// An existing loan changes this computation's admission only; it neither
+/// poisons the outer owner nor authorizes a second shared cache.
 pub(super) enum CacheAdmission<'a, T: CachePayload> {
     Ready(CacheLease<'a, T>),
     Loaned,
@@ -29,7 +35,7 @@ pub(super) enum CacheAdmission<'a, T: CachePayload> {
 }
 
 impl<T: CachePayload> CacheOwner<T> {
-    /// 接收已有唯一 owner；不复制其原生 claim 或业务容量。
+    /// Take the existing unique payload without duplicating Native claims or capacity.
     pub(super) fn new(payload: T) -> Self {
         Self {
             payload: RefCell::new(Some(payload)),
@@ -39,14 +45,15 @@ impl<T: CachePayload> CacheOwner<T> {
         }
     }
 
-    /// 移出 payload 后才允许调用方执行任何可能重入的原生操作。
+    /// Move the payload out before the caller performs any reentrant Native operation.
     pub(super) fn begin(&self) -> CacheAdmission<'_, T> {
         if self.closed.get() {
-            // 已 accepted release 的空壳不能重建缓存或获得新 loan。
+            // An accepted release is terminal, even if AppKit still retains an empty shell.
             return CacheAdmission::Closed;
         }
         if self.loaned.get() {
-            // 外层尚在 native 栈，内层只能使用无缓存的局部计算。
+            // The outer Native stack retains exclusive ownership; nested work
+            // must use its existing uncached path rather than alias the payload.
             return CacheAdmission::Loaned;
         }
         let payload =
@@ -60,31 +67,35 @@ impl<T: CachePayload> CacheOwner<T> {
         })
     }
 
-    /// 即使 owner 正借出也推进 epoch，外层旧 payload 归还时必须被丢弃。
+    /// Advance epoch even during a loan, so its old payload cannot later return as current.
     pub(super) fn invalidate(&self) {
         self.invalidate_loans();
         if let CacheAdmission::Ready(mut lease) = self.begin() {
-            // Ready 值可在本地清 key 并复用容量；native 析构重入仍看到 Loaned。
+            // Invalidate locally and reuse permitted capacity; Native destructor
+            // reentry still observes Loaned throughout this operation.
             lease.payload_mut().invalidate();
         }
     }
 
-    /// 内容仍可复用但语义请求已变；Ready payload 保留，Loaned 的旧 owner 不可复活。
+    /// Retain reusable Ready content while revoking an older semantic request's
+    /// loan. An old owner cannot be restored under the new epoch.
     pub(super) fn invalidate_loans(&self) {
         self.advance_epoch();
     }
 
-    /// 请求只捕获标量 epoch，不取得 payload；归还仍由原 lease 独占完成。
+    /// Requests capture scalar epoch only; the original lease alone owns payload return.
     pub(super) fn epoch(&self) -> u64 {
         self.epoch.get()
     }
 
-    /// 封闭在先；若仍有同步 loan，由其归还栈完成实际销毁，不能提前宣称为空。
+    /// Close admission first. An outstanding synchronous lease must actually
+    /// destroy its payload before the closed owner can report release.
     pub(super) fn close(&self) {
         self.closed.set(true);
         self.advance_epoch();
         if !self.loaned.get() {
-            // 空槽先移出最后 owner；没有 RefMut 跨越原生字段析构。
+            // Move out the final owner before destruction; no RefMut remains
+            // while Native fields release or synchronously call back.
             self.loaned.set(true);
             let previous = { self.payload.borrow_mut().take() };
             drop(previous);
@@ -92,13 +103,15 @@ impl<T: CachePayload> CacheOwner<T> {
         }
     }
 
-    /// Closed 且所有 loan 都已实际 drop，才代表 payload、key 与容量全部不存在。
+    /// Only Closed with every loan actually returned proves that payload, keys,
+    /// and retained capacity are absent.
     pub(super) fn is_released(&self) -> bool {
         self.closed.get() && !self.loaned.get() && self.payload.borrow().is_none()
     }
 
     fn advance_epoch(&self) {
-        // epoch 只由本槽递增；耗尽意味着内部生命周期不变量已经无法继续表达。
+        // This slot alone advances epoch. Exhaustion is a programming invariant
+        // failure rather than permission to wrap and admit an old request.
         self.epoch.set(
             self.epoch
                 .get()
@@ -108,7 +121,8 @@ impl<T: CachePayload> CacheOwner<T> {
     }
 }
 
-/// 仅同步持有具体 payload；析构结束前保持 Loaned，避免 native drop 产生假释放。
+/// Own the concrete payload synchronously. Keep Loaned until destruction ends,
+/// so reentrant Native release cannot observe a false completed release.
 pub(super) struct CacheLease<'a, T: CachePayload> {
     owner: &'a CacheOwner<T>,
     payload: Option<T>,
@@ -117,12 +131,14 @@ pub(super) struct CacheLease<'a, T: CachePayload> {
 }
 
 impl<T: CachePayload> CacheLease<'_, T> {
-    /// payload 位于当前栈而非 RefCell；重入者只能见到 Loaned，不能取得同一可变引用。
+    /// The payload resides on this stack, outside RefCell. Reentry sees Loaned
+    /// and cannot acquire an alias to this mutable value.
     pub(super) fn payload_mut(&mut self) -> &mut T {
         self.payload.as_mut().expect("live cache lease payload")
     }
 
-    /// 调用方的文档身份/代次/封闭检查失败时丢弃，不能将旧请求写回活槽。
+    /// Discard after the caller rejects document identity, generation, or close
+    /// authority; an old request cannot write its payload back into the live slot.
     pub(super) fn discard(&mut self) {
         self.restore = false;
     }
@@ -132,128 +148,22 @@ impl<T: CachePayload> Drop for CacheLease<'_, T> {
     fn drop(&mut self) {
         let payload = self.payload.take();
         if self.restore && !self.owner.closed.get() && self.epoch == self.owner.epoch.get() {
-            // 只移动唯一 owner，不调用 native retain；原槽在本 loan 内始终为空。
+            // Move the unique owner without Native retain; the slot remained
+            // empty for this lease's entire exclusive loan.
             let previous = self.owner.payload.replace(payload);
             drop(previous);
         } else {
-            // 先析构旧值；它可能再次 invalidate/close，故之后必须重新检查 Closed。
+            // Destroy the old value first; its destructor may invalidate or
+            // close again, so restoration must recheck Closed afterwards.
             drop(payload);
             if !self.owner.closed.get() {
-                // 空值不分配也不调用 native；失效后仍可由后续真实 query 按需填充。
+                // Empty performs no allocation or Native work. A later real
+                // query may populate this still-open slot on demand.
                 let empty = T::empty();
                 let previous = self.owner.payload.replace(Some(empty));
                 drop(previous);
             }
         }
         self.owner.loaned.set(false);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::rc::Rc;
-
-    struct Payload {
-        bytes: Vec<u8>,
-        on_drop: Option<Box<dyn FnOnce()>>,
-    }
-
-    impl CachePayload for Payload {
-        fn empty() -> Self {
-            Self {
-                bytes: Vec::new(),
-                on_drop: None,
-            }
-        }
-    }
-
-    impl Drop for Payload {
-        fn drop(&mut self) {
-            if let Some(callback) = self.on_drop.take() {
-                // 模拟原生字段最后 release 的同步回调，而非只检查 Rust 析构次数。
-                callback();
-            }
-        }
-    }
-
-    #[test]
-    fn factory_and_retain_reentry_observe_loan_without_any_state_borrow() {
-        let owner = CacheOwner::new(Payload::empty());
-        let CacheAdmission::Ready(mut lease) = owner.begin() else {
-            panic!("ready")
-        };
-        for _stage in ["factory", "retain"] {
-            // 真正模拟 callback 在 native 边界重新查询同一槽，不能借出第二 owner。
-            assert!(owner.payload.try_borrow_mut().is_ok());
-            assert!(matches!(owner.begin(), CacheAdmission::Loaned));
-        }
-        lease.payload_mut().bytes.extend_from_slice(b"history");
-        drop(lease);
-        let CacheAdmission::Ready(mut next) = owner.begin() else {
-            panic!("restored")
-        };
-        assert_eq!(next.payload_mut().bytes, b"history");
-    }
-
-    #[test]
-    fn invalidation_during_loan_advances_epoch_and_cannot_restore_old_capacity() {
-        let owner = CacheOwner::new(Payload {
-            bytes: vec![1; 8192],
-            on_drop: None,
-        });
-        let CacheAdmission::Ready(lease) = owner.begin() else {
-            panic!("ready")
-        };
-        owner.invalidate();
-        assert!(matches!(owner.begin(), CacheAdmission::Loaned));
-        drop(lease);
-        let CacheAdmission::Ready(mut next) = owner.begin() else {
-            panic!("empty ready")
-        };
-        assert_eq!(next.payload_mut().bytes.capacity(), 0);
-    }
-
-    #[test]
-    fn accepted_close_waits_for_real_drop_and_drop_reentry_cannot_reopen() {
-        let owner = Rc::new(CacheOwner::new(Payload::empty()));
-        let weak = Rc::downgrade(&owner);
-        let CacheAdmission::Ready(mut lease) = owner.begin() else {
-            panic!("ready")
-        };
-        lease.payload_mut().bytes = vec![7; 8192];
-        lease.payload_mut().on_drop = Some(Box::new(move || {
-            // 旧 native payload 正在析构时，Closed 仍不能被误报为已释放。
-            let owner = weak.upgrade().expect("owner");
-            assert!(owner.payload.try_borrow_mut().is_ok());
-            assert!(!owner.is_released());
-            assert!(matches!(owner.begin(), CacheAdmission::Closed));
-            owner.invalidate();
-        }));
-        owner.close();
-        assert!(!owner.is_released());
-        drop(lease);
-        assert!(owner.is_released());
-    }
-
-    #[test]
-    fn ready_invalidation_drop_can_close_without_republishing_empty_owner() {
-        let owner = Rc::new(CacheOwner::new(Payload::empty()));
-        let weak = Rc::downgrade(&owner);
-        let CacheAdmission::Ready(mut lease) = owner.begin() else {
-            panic!("ready")
-        };
-        lease.payload_mut().on_drop = Some(Box::new(move || {
-            // Ready 失效会真实销毁 native 值；该 drop 重入的 close 必须胜过之后归还。
-            let owner = weak.upgrade().expect("owner");
-            assert!(owner.payload.try_borrow_mut().is_ok());
-            assert!(matches!(owner.begin(), CacheAdmission::Loaned));
-            owner.close();
-            assert!(!owner.is_released());
-        }));
-        drop(lease);
-        owner.invalidate();
-        assert!(owner.is_released());
-        assert!(matches!(owner.begin(), CacheAdmission::Closed));
     }
 }

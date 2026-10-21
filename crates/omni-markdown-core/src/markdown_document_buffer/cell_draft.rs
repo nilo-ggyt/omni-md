@@ -1,4 +1,5 @@
-//! 同Doc的唯一单元格草稿分支；局部坐标、独立nonce和新增段不冒充canonical正文。
+//! The document's unique cell-draft branch. Local coordinates, a separate nonce,
+//! and delta segments never impersonate the canonical document text.
 
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
@@ -35,13 +36,16 @@ pub use resources::{
     MarkdownCellDraft, MarkdownCellDraftResourceObserver, MarkdownCellDraftResourceSnapshot,
 };
 
-/// 未提交输入的累计新增UTF-8预算；不占用canonical的会话append库存。
+/// Cumulative UTF-8 delta allowance for uncommitted input, separate from the
+/// canonical session's append inventory.
 pub const MARKDOWN_CELL_DRAFT_MAX_DELTA_BYTES: usize = 32 * 1024 * 1024;
-/// 原有限String清洗快路的UTF16阈值；更大的草稿通过同规则写入封存文件，不是功能上限。
+/// UTF-16 threshold of the bounded String sanitization path. Larger drafts use
+/// the same rules with sealed file output; this is not a supported-content limit.
 pub const MARKDOWN_CELL_DRAFT_COMMIT_UTF16_UNITS: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-/// 失败不发布canonical；Source错误仍保真实typed首因。
+/// Failure does not publish canonical text. Source errors keep their actual
+/// typed first cause rather than becoming ordinary draft staleness.
 pub enum MarkdownCellDraftError {
     #[error(transparent)]
     Document(#[from] MarkdownDocumentBufferError),
@@ -66,11 +70,14 @@ pub enum MarkdownCellDraftError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// 位置都属于cell局部原始草稿；canonical_range仅供原owner定位，不授予另一Source权限。
+/// All positions address the cell-local raw draft. canonical_range lets the
+/// original owner locate it, without granting authority over another Source.
 pub struct MarkdownCellDraftFacts {
-    /// 任一实际输入状态改变都会推进；旧编辑胶囊不得重新补签坐标。
+    /// Advances for every actual input-state change; old edit capsules cannot
+    /// renew their coordinate authority from an equal-looking successor state.
     pub serial: u64,
-    /// 只有正文或历史root改变才推进；选区与unmark不撤销同正文的布局来源。
+    /// Advances only when text/history root changes. Selection and unmark changes
+    /// do not revoke the layout Source for the same text.
     pub content_serial: u64,
     pub byte_len: usize,
     pub utf16_len: usize,
@@ -80,9 +87,11 @@ pub struct MarkdownCellDraftFacts {
 }
 
 pub(super) enum CellDraftSlot {
-    // 活动分支只有一个实际owner；Box避免retired空槽也携带整份历史metadata体积。
+    // One actual owner holds the active branch. Boxing avoids making an otherwise
+    // empty retired slot retain the size of all local history metadata.
     Active(Box<PendingCellDraft>),
-    // 已取消分支已真Drop；只等两个以内原读取payload归还，不持候选树或段表。
+    // The cancelled branch has actually dropped. Await at most two original
+    // reader payloads without retaining a candidate root or segment table here.
     Retired(Arc<Scope>),
 }
 
@@ -98,16 +107,21 @@ pub(super) struct PendingCellDraft {
     base_descriptors: usize,
     scope: Arc<Scope>,
     history: history::LocalHistory,
-    // 按字段Drop顺序，只有上面的真实树、段与plan结束后才签branch_live=false。
+    // Field drop order is part of ownership: only after the actual root, segments,
+    // plan and history above are gone may this claim mark branch_live false.
     _claim: BranchClaim,
 }
 
 impl PendingCellDraft {
     fn matches(&self, token: &MarkdownCellDraft) -> bool {
+        // Only the original scope's weak nonce matches; equal serials or text in
+        // another document cannot authorize cancellation of this branch.
         Weak::ptr_eq(&token.scope, &Arc::downgrade(&self.scope))
     }
 
     fn require(&self, doc: &MarkdownDocumentBuffer) -> Result<(), MarkdownCellDraftError> {
+        // Actual original and delta storage failures precede scope revocation or
+        // stale plan identity, including when the current root has no original leaf.
         doc.original_backing_health()
             .inspect_err(|&error| self.scope.record_source(error))?;
         self.edits
@@ -133,7 +147,8 @@ impl PendingCellDraft {
 }
 
 impl MarkdownDocumentBuffer {
-    /// 从原表格认证窗口取得唯一草稿；原cell树直接切出共享，不读取整格或构造String。
+    /// Begin the unique draft from an original verified table window. Slice/share
+    /// the actual cell tree without reading its whole content or building a String.
     pub fn begin_cell_draft(
         &mut self,
         window: &VerifiedMarkdownTableWindow,
@@ -144,8 +159,9 @@ impl MarkdownDocumentBuffer {
         self.begin_prepared_cell_draft(plan)
     }
 
-    /// 短窗口与原有长格请求共用原plan和唯一草稿槽；计划只能由同源producer生成。
-    /// 不把这个编辑权限解释为inline预览Ready，也不读取完整cell。
+    /// Short windows and long-cell requests use the same plan and unique draft
+    /// slot. Only the same-source producer may issue that plan; this edit authority
+    /// neither implies inline-preview Ready nor requires a complete-cell read.
     pub fn begin_prepared_cell_draft(
         &mut self,
         plan: MarkdownTableCellEditPlan,
@@ -154,7 +170,8 @@ impl MarkdownDocumentBuffer {
         self.ensure_text_input_idle()?;
         let (range, replacement) = plan.replacement_for(self)?;
         if replacement.len() != plan.separator_prefix_bytes {
-            // 原公开plan也可承载一次显式替换；激活只接受空正文，不能把用户替换文本当补格前缀。
+            // Public plans can also carry explicit replacement text. Activation
+            // accepts only empty payload, never disguising user text as missing-cell prefix.
             return Err(MarkdownTableWindowError::InvalidSource.into());
         }
         let range = range.clone();
@@ -166,7 +183,9 @@ impl MarkdownDocumentBuffer {
         let token = MarkdownCellDraft {
             scope: Arc::downgrade(&scope),
         };
-        // 只复制原预算内descriptor；原字节共享Arc。used_bytes专计新delta，编号保持原树可读。
+        // Clone only existing bounded descriptors, sharing actual bytes through
+        // Arc. used_bytes counts new draft delta; segment numbering keeps the
+        // sliced original tree readable without copying its text.
         let edits = MarkdownEditSegments {
             segments: self.edits.segments.clone(),
             used_bytes: 0,
@@ -201,12 +220,13 @@ impl MarkdownDocumentBuffer {
         &self,
         scope: &Weak<Scope>,
     ) -> Result<&PendingCellDraft, MarkdownCellDraftError> {
-        // 即使外来token也先保原Source错误；不能让Stale遮住实际mmap失败。
+        // Preserve original Source failure even for a foreign token; Stale must
+        // not conceal an actual mmap failure from this document's backing.
         self.original_backing_health().inspect_err(|&error| {
             match &self.cell_draft {
                 Some(CellDraftSlot::Active(pending)) => pending.scope.record_source(error),
                 Some(CellDraftSlot::Retired(scope)) => scope.record_source(error),
-                None => {} // 没有原草稿scope可记录；真实Doc首错仍沿返回值保留。
+                None => {} // No draft scope can record it; the actual document failure still remains in the result.
             }
         })?;
         let Some(CellDraftSlot::Active(pending)) = &self.cell_draft else {
@@ -219,7 +239,8 @@ impl MarkdownDocumentBuffer {
         Ok(pending)
     }
 
-    /// 只读原nonce当前局部事实，不借入正文或改变canonical选区。
+    /// Read the original nonce's current local facts without borrowing text or
+    /// changing the canonical selection.
     pub fn cell_draft_facts(
         &self,
         token: &MarkdownCellDraft,
@@ -227,7 +248,8 @@ impl MarkdownDocumentBuffer {
         Ok(self.active_cell_draft(token)?.facts())
     }
 
-    /// 返回固定无owner资源票；取得它本身仍须属于当前草稿。
+    /// Return a fixed resource observer with no text owner. Acquiring it still
+    /// requires this currently active draft's authority.
     pub fn cell_draft_resource_observer(
         &self,
         token: &MarkdownCellDraft,
@@ -237,7 +259,8 @@ impl MarkdownDocumentBuffer {
         })
     }
 
-    /// 显式取消只撤草稿；不发布正文、不记录Undo，也不因Source已失败而阻止释放。
+    /// Explicit cancellation revokes only the draft, without publishing text or
+    /// recording Undo. An already-failed Source cannot prevent branch cleanup.
     pub fn cancel_cell_draft(&mut self, token: &MarkdownCellDraft) -> bool {
         let Some(CellDraftSlot::Active(pending)) = &self.cell_draft else {
             return false;
@@ -250,7 +273,8 @@ impl MarkdownDocumentBuffer {
         true
     }
 
-    /// 排空被token Drop或Esc撤销的分支；读取payload或准入String未真Drop时保持唯一retired槽。
+    /// Drain a branch cancelled by token Drop or Escape. Keep the unique retired
+    /// slot while actual reader payloads or prepared-commit storage remain owned.
     pub fn drain_cancelled_cell_draft(&mut self) -> bool {
         let releasable = match &self.cell_draft {
             Some(CellDraftSlot::Active(pending)) => pending.scope.cancelled.load(Ordering::Acquire),
@@ -264,7 +288,8 @@ impl MarkdownDocumentBuffer {
         match slot {
             CellDraftSlot::Active(pending) => {
                 let scope = Arc::clone(&pending.scope);
-                // 真正丢弃root与分支段表后才决定是否保留retired账目；不是先把计数清零。
+                // Drop the actual root and branch segments before deciding which
+                // retired claims remain. Do not clear counters in place of releasing owners.
                 drop(pending);
                 if scope.has_retired_owners() {
                     self.cell_draft = Some(CellDraftSlot::Retired(scope));
@@ -276,7 +301,8 @@ impl MarkdownDocumentBuffer {
     }
 
     #[must_use]
-    /// 包含等待真实读取payload或提交准入归还的retired槽；它仍禁止并行canonical写入。
+    /// Include the retired slot awaiting actual readers/prepared commit. That slot
+    /// still excludes concurrent canonical writes until its owners are released.
     pub fn has_cell_draft(&self) -> bool {
         self.cell_draft.is_some()
     }

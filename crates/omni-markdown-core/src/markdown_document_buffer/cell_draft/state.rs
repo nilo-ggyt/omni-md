@@ -1,4 +1,5 @@
-//! 选区/marked只改变输入意图版本，不撤销相同正文的布局Source或追加历史。
+//! Selection/marked state changes advance input-intent identity without revoking
+//! the unchanged text's layout Source or appending history.
 
 use super::edit::{DraftSource, MarkdownCellDraftEditCapsule, validate_positions};
 use super::*;
@@ -19,6 +20,8 @@ impl PendingCellDraft {
         };
         validate_positions(&source, &self.root, selection, &marked)?;
         if self.selection == selection && self.marked_range == marked {
+            // A true no-op keeps existing input capsules valid. Positions were
+            // still checked against actual Source before returning those facts.
             return Ok(self.facts());
         }
         let serial = self
@@ -29,21 +32,23 @@ impl PendingCellDraft {
         self.selection = selection;
         self.marked_range = marked;
         self.serial = serial;
-        // 输入旧票失效，正文root与content_serial保持原样；已有GCB/UBA/glyph输出仍绑定相同内容。
+        // Revoke old input receipts while retaining root/content_serial. Existing
+        // GCB/UBA/glyph output remains bound to precisely the same text content.
         self.scope.serial.store(serial, Ordering::Release);
         Ok(self.facts())
     }
 }
 
 impl MarkdownDocumentBuffer {
-    /// 原breakUndoCoalescing的局部意图；只撤旧输入serial和固定group，不修改正文或制造历史。
+    /// Apply the local breakUndoCoalescing intent: revoke old input serial/group
+    /// only, without editing text or manufacturing a history entry.
     pub fn break_cell_draft_undo_coalescing(
         &mut self,
         edit: MarkdownCellDraftEditCapsule,
     ) -> Result<MarkdownCellDraftFacts, MarkdownCellDraftError> {
         let pending = self.require_cell_draft_edit(&edit)?;
         if pending.marked_range.is_some() {
-            return Err(MarkdownCellDraftError::CompositionActive); // 未测的IME中断不能被当作普通typing断点。
+            return Err(MarkdownCellDraftError::CompositionActive); // An active IME composition is not an ordinary typing break.
         }
         let serial = pending
             .serial
@@ -58,7 +63,8 @@ impl MarkdownDocumentBuffer {
         Ok(pending.facts())
     }
 
-    /// 发布cell局部有向选区；输入法仍拥有marked时，先由原context完成明确unmark。
+    /// Publish a cell-local directed selection. While IME owns marked text, the
+    /// original input context must explicitly unmark it first.
     pub fn set_cell_draft_selection(
         &mut self,
         edit: MarkdownCellDraftEditCapsule,
@@ -71,12 +77,15 @@ impl MarkdownDocumentBuffer {
         let Some(CellDraftSlot::Active(mut pending)) = self.cell_draft.take() else {
             unreachable!("已核活动草稿");
         };
+        // Temporarily take the unique branch for this synchronous Rust operation.
+        // Restore the same owner on both success and failure; no native callback runs.
         let result = pending.set_state(self, selection, None);
         self.cell_draft = Some(CellDraftSlot::Active(pending));
         result
     }
 
-    /// 只结束原marked事实；不改raw字符、不造Undo，也不让相同内容的Source重新扫描。
+    /// End only the original marked-state fact, without changing raw characters,
+    /// creating Undo, or forcing the unchanged text Source to scan again.
     pub fn unmark_cell_draft(
         &mut self,
         edit: MarkdownCellDraftEditCapsule,

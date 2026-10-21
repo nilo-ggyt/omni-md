@@ -120,7 +120,7 @@ impl MarkdownBlockScannerState {
         self.consume_line_facts(line.utf16_range, line.byte_range, &facts, completed_blocks);
     }
 
-    /// 固定行事实与完整line使用同一状态转移，初开不需要保留或合成巨物理行。
+    /// Consume the same fixed line facts for slice and initial scans, without retaining a huge physical line.
     fn consume_line_facts(
         &mut self,
         utf16_range: Range<usize>,
@@ -411,6 +411,9 @@ pub(super) fn scan_markdown_block_slice(
     reaches_document_end: bool,
     collect_completed_blocks: bool,
 ) -> MarkdownBlockSliceScan {
+    // The caller owns source identity, immutable-byte acquisition and cancellation.
+    // This synchronous bounded slice contains only complete lines plus an optional
+    // incomplete tail, and only the explicit true-EOF flag may close that tail.
     let mut state = initial_state;
     let mut completed_blocks = MarkdownCompletedBlockCollection::new(collect_completed_blocks);
     let mut checkpoints = Vec::new();

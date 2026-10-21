@@ -1,9 +1,13 @@
+//! Exercise actual bounded table semantics against the original finite full-parser oracle.
+
 use super::*;
 use crate::markdown_viewport_presentation::{
     MarkdownPresentationStyles, MarkdownViewportPresentation,
 };
 
 fn document(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+    // Own an isolated actual source file; no user note or product workspace is
+    // accessed by the original-parser comparison.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("S2-semantic-fixture.md");
     std::fs::write(&path, source).unwrap();
@@ -14,6 +18,8 @@ fn finish(
     request: &mut MarkdownTableWindowRequest,
     document: &MarkdownDocumentBuffer,
 ) -> MarkdownTableWindowStep {
+    // Yielded work remains pending. Drive the same original request under its
+    // real 4096-unit quantum until an actual terminal response is delivered.
     for _ in 0..document.byte_len().saturating_mul(64).saturating_add(10000) {
         let step = request.advance(document, false, 4096).unwrap();
         if !matches!(step, MarkdownTableWindowStep::Progress { .. }) {
@@ -28,6 +34,8 @@ fn assert_matches_original(
     viewport: Range<usize>,
     selection: Range<usize>,
 ) {
+    // Preserve the original directed selection/context and source while preparing
+    // a real window; the finite independent parser is only a test output oracle.
     let (_directory, doc) = document(source);
     let owners = Arc::strong_count(doc.root.as_ref().unwrap());
     let mut request = doc
@@ -57,6 +65,8 @@ fn assert_matches_original(
     let presentation = window.presentation_for(&doc).unwrap();
     assert_eq!(presentation.context_revision, 93);
     let mut original = MarkdownViewportPresentation::default();
+    // Compare actual physical coverage one UTF-16 unit at a time. A retained
+    // header context cannot grant styles to an omitted interval outside that coverage.
     original.set_active_selection(selection);
     original
         .rebuild(doc.generation(), 0..doc.utf16_len(), source)
@@ -79,7 +89,8 @@ fn assert_matches_original(
 
 #[test]
 fn complete_request_preserves_full_physical_container_prefix_and_unicode_styles() {
-    // 整个物理源coverage逐UTF16对照，包含以前cell-only测试漏掉的H/D/body前缀与EOL。
+    // Compare whole physical coverage, including actual header/delimiter/body
+    // container prefixes and original EOL units, not cell interiors alone.
     for source in [
         "| H | C |\n| - | - |\n| **一** | $x$ |\n| [r] | ~~删~~ |\n\n[r]: /first \"title\"\n[r]: /later\n",
         "> > | H | C |\r\n> > | - | - |\r\n> > | **一** | $x$ |\r\n> > | [r] | ~~删~~ |\r\n\r\n[r]: /r\r\n",
@@ -95,7 +106,8 @@ fn complete_request_preserves_full_physical_container_prefix_and_unicode_styles(
             0..source.encode_utf16().count(),
             usize::MAX..usize::MAX,
         );
-        // 省略H时仍保body真实容器属性；中段窗不能凭H虚拟拼接给省略gap任何覆盖权限。
+        // Omitting the header preserves actual body-container attributes without
+        // granting source/style coverage to a virtually joined intervening gap.
         let body_start = source[..probe_byte].rfind('\n').map_or(0, |at| at + 1);
         let start = source[..body_start].encode_utf16().count();
         assert_matches_original(
@@ -109,6 +121,8 @@ fn complete_request_preserves_full_physical_container_prefix_and_unicode_styles(
 
 #[test]
 fn global_reference_and_underline_remain_required_around_literal_dollars() {
+    // Literal dollar text cannot waive real source-order reference and underline
+    // context extending before/after this small requested physical row.
     let hidden = format!("$x${}", "{}".repeat(255));
     let source = format!(
         "<u>opening\n\n| H | C |\n| - | - |\n| {hidden} | skipped |\n| $}}x{{y$ [r] | 中文😀 |\n\n</u>\n\n[r]: /real \"title\"\n"
@@ -132,7 +146,8 @@ fn standalone_table_underline_uses_literal_code_facts_before_and_after_its_viewp
         let probe = source[..probe_byte].encode_utf16().count();
         let start = source[..probe_byte].rfind('\n').unwrap() + 1;
         let end = probe_byte + source[probe_byte..].find('\n').unwrap() + 1;
-        // standalone的原结构Global要存活到配对恢复完成；不能丢它后再创建另一个分类器。
+        // Keep the standalone original structural Global alive until pairing
+        // restores it; another classifier is not an equivalent continuation.
         assert_matches_original(
             source,
             probe,
@@ -144,6 +159,8 @@ fn standalone_table_underline_uses_literal_code_facts_before_and_after_its_viewp
 
 #[test]
 fn verified_window_cannot_authorize_other_note_or_stale_edit_and_releases_scratch() {
+    // A real published window authorizes only its original note/root/generation.
+    // One actual cell edit, even after undo, revokes the old window and request.
     let source = "| H | C |\n| - | - |\n| first | second |\n";
     let (_directory, mut doc) = document(source);
     let (_other_directory, other) = document(source);
@@ -181,7 +198,8 @@ fn verified_window_cannot_authorize_other_note_or_stale_edit_and_releases_scratc
 
 #[test]
 fn consumed_request_cannot_republish_an_empty_ready_slot() {
-    // 同代次也只能取走一次；空请求不能继续回报Ready并让Native误认为已有完整窗口。
+    // Even in one generation, transfer Ready once. A consumed empty request
+    // cannot signal that Native has another completed window to publish.
     let (_directory, doc) = document("| H |\n| - |\n| value |\n");
     let mut request = doc
         .table_window_request(
@@ -202,7 +220,8 @@ fn consumed_request_cannot_republish_an_empty_ready_slot() {
 
 #[test]
 fn offscreen_header_retains_cell_styles_without_becoming_a_visible_row_or_gap() {
-    // 中段窗口仍用H测列宽，但H到body的省略区间没有属性/geometry覆盖权限。
+    // A middle window needs header cells for column measurement, but the omitted
+    // interval between header and body has no style/geometry coverage authority.
     let source = "<u>before\n\n> | **中文** [r] | $x$ 😀 |\n> | - | - |\n> | skipped | old |\n> | visible | cell |\n\n</u>\n\n[r]: /real\n";
     let (_directory, doc) = document(source);
     let start = source.find("> | visible").unwrap();
@@ -229,7 +248,8 @@ fn offscreen_header_retains_cell_styles_without_becoming_a_visible_row_or_gap() 
     original
         .rebuild(doc.generation(), 0..doc.utf16_len(), source)
         .unwrap();
-    // 仅对H格真实源范围逐unit比较；H容器marker无需进入当前绘制矩阵。
+    // Compare original header-cell ranges unit by unit; offscreen header-container
+    // markers need not enter this window's actual drawing matrix.
     for cell in actual.header_cells() {
         if let crate::markdown_viewport_presentation::table_window::MarkdownTableWindowCellSource::Present(range) = &cell.source {
             for at in range.clone() {
@@ -248,6 +268,8 @@ fn offscreen_header_retains_cell_styles_without_becoming_a_visible_row_or_gap() 
 
 #[test]
 fn measured_validation_includes_revisited_prefix_and_scope_metadata_payload() {
+    // Split a genuine Unicode scalar at a frame boundary to expose repeated
+    // UTF-8 validation input; distinct source bytes alone undercount this work.
     let source = format!("| {}中 |\n| - |\n| value |\n", "a".repeat(996));
     let (_directory, doc) = document(&source);
     let mut request = doc
@@ -266,7 +288,8 @@ fn measured_validation_includes_revisited_prefix_and_scope_metadata_payload() {
         if copying && let MarkdownTableWindowStep::Progress { work } = step {
             reads += work.source_bytes;
             validation += work.utf8_validation_bytes;
-            // 只对真正逐byte的复制阶段求和；有限Parser/marker helper输入另列，不能混称逐tokenfuel。
+            // Sum only the actual byte-copy phase. Whole-slice Parser/marker
+            // inputs are reported separately and do not prove per-token fuel bounds.
             assert!(
                 work.source_bytes
                     + work.copied_source_bytes
@@ -285,6 +308,8 @@ fn measured_validation_includes_revisited_prefix_and_scope_metadata_payload() {
         "frame尾scalar使valid prefix实际被再次校验，必须如实计量"
     );
 
+    // Actual quote scope requires visible-header marker metadata only when that
+    // header is published; offscreen syntax context retains no fictional output payload.
     let prefix = "> ".repeat(16);
     let source = format!("{prefix}| H |\n{prefix}| - |\n{prefix}| value |\n");
     let (_directory, doc) = document(&source);
@@ -314,13 +339,16 @@ fn measured_validation_includes_revisited_prefix_and_scope_metadata_payload() {
                 break;
             }
         }
-        // 只有H可见才准入其真实marker输出；离屏H只保固定kind状态，不能虚计Vec payload。
+        // Visible headers admit actual marker output. Offscreen headers keep
+        // fixed kind facts rather than inventing Vec payload that was never produced.
         assert_eq!(metadata > 0, expected_output);
     }
 }
 
 #[test]
 fn viewport_target_finds_real_tables_below_plain_text_and_continues_after_true_end() {
+    // Actual source classification rejects a fenced fake table and locates two
+    // later tables in order, preserving the first table's genuine end boundary.
     let source = "intro\n\n```text\n| fake |\n| - |\n```\n\n| first |\n| - |\n| body |\n\nordinary\n\n| second |\n| - |\n| tail |\n";
     let (_directory, doc) = document(source);
     let mut first = doc
@@ -363,7 +391,8 @@ fn viewport_target_finds_real_tables_below_plain_text_and_continues_after_true_e
             .start,
         source.find("| second").unwrap()
     );
-    // 有限前缀没有表的证明与整个文档无表不同；未来真实表不进入本批投影。
+    // A no-table proof for this finite prefix does not deny later document
+    // tables or authorize bringing them into the current projection.
     let mut prefix = doc
         .table_window_request(
             MarkdownTableWindowTarget::FirstTableInViewport,
@@ -379,7 +408,7 @@ fn viewport_target_finds_real_tables_below_plain_text_and_continues_after_true_e
 }
 
 #[test]
-/// S2逐层quote使用真实H锚点与原物理行端点，不把footnote label里的`>`当引用前缀。
+/// Quote layers use original header anchors/physical endpoints, never a literal '>' inside footnote labels.
 fn quote_prefix_owners_match_full_parser_for_endpoint_lines_and_footnote_labels() {
     for source in [
         "> > | H | C |\r\n> > | - | - |\r\n> > | 中文😀 | x |\r\n> > | 尾部 | y |",
@@ -396,7 +425,8 @@ fn quote_prefix_owners_match_full_parser_for_endpoint_lines_and_footnote_labels(
             line_start..line_start,
             length..probe,
         ] {
-            // 保留隐藏位和每个全局UTF16位置的精确oracle；中段gap仍不授予不存在的H覆盖。
+            // Compare hidden bits and global UTF-16 positions exactly. A middle
+            // gap still grants no nonexistent header coverage.
             assert_matches_original(source, probe, 0..length, selection.clone());
             assert_matches_original(source, probe, line_start..length, selection);
         }

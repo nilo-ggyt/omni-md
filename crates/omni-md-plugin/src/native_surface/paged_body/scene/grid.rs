@@ -1,4 +1,4 @@
-//! 正式场景只持当前可见表格格窗口；原结构票、显示映射与CPU绘图不建立第二份编辑图。
+//! Production Scenes retain currently visible cell windows only; structure tickets, display mappings, and CPU paint create no second editing graph.
 
 use super::*;
 use crate::native_surface::{
@@ -12,25 +12,25 @@ use omni_markdown_core::{
     VerifiedMarkdownLayoutTableRow, markdown_document_buffer::VerifiedMarkdownTableCellSource,
 };
 
-/// 真空显示不需要 Composer 或目录 FD；未知非空格不能借 Empty 当作已准备。
+/// Truly empty display needs neither Composer nor directory FD; unknown nonempty cells cannot become prepared through Empty.
 pub(in crate::native_surface::paged_body) enum GridCellContent {
     Empty(VerifiedMarkdownTableCellSource),
-    /// 视口只碰真实行顶内边距，文字区尚在下方；保原格起点，不授 EOF 或已排完权限。
+    /// The viewport intersects actual top padding while text lies below; retain the original cell start without certifying EOF or completion.
     BeforeText(VerifiedMarkdownTableCellSource),
-    /// 原短格已完整排完，当前可见区域位于其文字下方；不能把未准备正文放入此状态。
+    /// The actual short cell finished layout and visible space lies below its text; unprepared content cannot enter this state.
     OutsideText(VerifiedMarkdownTableCellSource),
     Composed(NativeMarkdownComposedTableCell),
 }
 
-/// 每个格只持实际窗口或空格来源票；frame 包含原表格 padding，文字窗口另持其实际 clip。
+/// Each cell owns an actual window or empty-cell Source ticket; frame includes table padding while text retains its own actual clip.
 pub(in crate::native_surface::paged_body) struct GridCellPublication {
     pub frame: NSRect,
-    /// 同次实测格扣原padding，保整段真实已测前缀，不扣文字窗口scan.first_top。
+    /// Measured cell frame minus original padding, retaining the actual measured prefix without subtracting text scan.first_top.
     pub content_frame: NSRect,
     pub content: GridCellContent,
 }
 
-/// 尚未封存的长行只发布真实已测高度；complete 之前不画假的行尾，也不排列后续正文。
+/// An unfinished tall row publishes measured height only; no final bottom border or later body layout appears before complete.
 pub(in crate::native_surface::paged_body) struct GridRowPublication {
     pub row: VerifiedMarkdownLayoutTableRow,
     pub frame: NSRect,
@@ -38,8 +38,8 @@ pub(in crate::native_surface::paged_body) struct GridRowPublication {
     pub cells: Box<[GridCellPublication]>,
 }
 
-/// 结构行里的隐藏语法/离屏格属于Grid域；无可见矩形不能被当成普通文字继续查字号。
-/// Ready只来自真实格窗口，Outside才允许调用方进入原正文几何，没有占位字形或伪高度。
+/// Hidden syntax and offscreen cells remain in Grid; missing visible rectangles cannot fall through to ordinary font lookup.
+/// Only actual cell windows yield Ready; only Outside permits Body geometry. Neither placeholder glyphs nor invented heights exist.
 pub(super) enum GridCharacterGeometry {
     Outside,
     Unavailable,
@@ -47,8 +47,8 @@ pub(super) enum GridCharacterGeometry {
 }
 
 impl Scene {
-    /// 只遍历当前有限可见格；空格、未到文字区和已离开文字区都没有链接光标权限。
-    /// 每个Composed窗口内部沿原真实cell clip裁剪，不为悬停准备离屏内容或读取目标字符串。
+    /// Visit bounded visible cells only; empty, before-text, and after-text cells authorize no link cursor.
+    /// Each Composed window uses its actual cell clip; hovering prepares no offscreen text and reads no destination string.
     pub(super) fn visit_grid_link_cursor_rects(&self, visit: &mut dyn FnMut(NSRect)) -> Result<()> {
         self.validate_grids(&|| self.current())?;
         for row in &self.grids {
@@ -63,7 +63,7 @@ impl Scene {
         self.validate_grids(&|| self.current())
     }
 
-    /// 返回真实命中格；不按列均分宽度或用可见数组下标推导原表格列坐标。
+    /// Return the actual hit cell, never inferring columns from equal widths or visible-array indexes.
     pub(super) fn grid_cell_at(&self, local: NSPoint) -> Option<&GridCellPublication> {
         self.grids
             .iter()
@@ -72,7 +72,7 @@ impl Scene {
             .find(|cell| inside(local, cell.frame))
     }
 
-    /// 无文字窗口的格仍核原 Doc/raw 票；已删除的行不能靠旧 frame 继续交付点击位置。
+    /// Cells without text windows still validate original Doc/raw tickets; old frames cannot authorize hits after row deletion.
     fn raw_cell_range(&self, cell: &VerifiedMarkdownTableCellSource) -> Result<Range<usize>> {
         let owner = self.key.request.document.upgrade().ok_or(Error::Revoked)?;
         let document = owner.try_borrow().map_err(|_| Error::Busy)?;
@@ -81,7 +81,7 @@ impl Scene {
             .map_err(|cause| scene_error(ViewportError::Table(cause)))
     }
 
-    /// 所有显示窗口先保真实 Source 首错；current 的撤销只能在实际资源检查后返回。
+    /// Preserve actual Source failure for every display window before returning current revocation.
     pub(super) fn validate_grids(&self, current: &dyn Fn() -> bool) -> Result<()> {
         for row in &self.grids {
             for cell in &row.cells {
@@ -103,7 +103,7 @@ impl Scene {
         Ok(())
     }
 
-    /// 可见格交原映射返回 canonical caret；另一真实 BiDi 位置仍明确拒绝由本层猜主侧。
+    /// Actual cell mapping returns canonical carets; another real BiDi position requires explicit handling, not a guessed primary side.
     pub(super) fn grid_hit(&self, local: NSPoint) -> Result<Option<usize>> {
         let Some(cell) = self.grid_cell_at(local) else {
             return Ok(None);
@@ -123,8 +123,8 @@ impl Scene {
         }
     }
 
-    /// 激活交付真实行票、raw票和同次完整内容框；未进入文字的格只交真实端点等待原reveal。
-    /// 普通格按实测列框命中，双击侧从显示窗口的真实GCB几何取得，不猜等宽列或LTR。
+    /// Activation transfers actual row/raw tickets and the same measured content frame; before-text cells supply endpoints pending original reveal.
+    /// Hit measured column frames; double-click bias comes from actual display GCB geometry, not equal-width or LTR guesses.
     pub(super) fn grid_pointer_hit(
         &self,
         local: NSPoint,
@@ -134,7 +134,7 @@ impl Scene {
             return Ok(None);
         };
         let Some(cell) = row.cells.iter().find(|cell| inside(local, cell.frame)) else {
-            return Ok(None); // 当前横向窗口没有该列真实发布，不能由整行范围反推一个格。
+            return Ok(None); // This horizontal window has no actual publication for that column; the row range cannot reconstruct a cell.
         };
         let (source, head_utf16, head_affinity, backward_bias) = match &cell.content {
             GridCellContent::Composed(window) => {
@@ -149,7 +149,7 @@ impl Scene {
                     )
                 };
                 if hit.other_source_utf16.is_some() {
-                    return Err(Error::Pending); // 同点两个逻辑位置必须等真实侧，不能静默取一个作为编辑起点。
+                    return Err(Error::Pending); // Two logical positions at one point require the actual side, not an arbitrary editing start.
                 }
                 (
                     window.canonical_cell_source().clone(),
@@ -162,7 +162,7 @@ impl Scene {
                 )
             }
             GridCellContent::Empty(source) | GridCellContent::BeforeText(source) => {
-                // BeforeText还没有字形侧；这里只保raw起点，childReady后由自己的Source选词/段落。
+                // BeforeText has no glyph side; retain its raw start and let the child's own Source resolve word/paragraph selection after Ready.
                 (
                     source.clone(),
                     self.raw_cell_range(source)?.start,
@@ -177,8 +177,8 @@ impl Scene {
                 false,
             ),
         };
-        // 词命中与当前真实 raw 列坐标在同一个 Scene 健康门内读取；行起点来自实际发布行。
-        // 这只是后继查询意图，不能代替 Producer 对最新 Source/Row/raw 的权限核验。
+        // Read word hits and actual raw column coordinates under the same Scene health guard; row start comes from actual publication.
+        // This is later-query intent only, not a substitute for Producer validation of latest Source/Row/raw authority.
         let word_target = if word {
             let original = self.key.request.document.upgrade().ok_or(Error::Revoked)?;
             let document = original.try_borrow().map_err(|_| Error::Busy)?;
@@ -208,8 +208,8 @@ impl Scene {
         ))
     }
 
-    /// Tab/Enter等真实目标来源只消费当前已发布格；另一publication的最新raw票须同Doc逐项核实。
-    /// 这里只归还实际内容框和可见端点，不重签Row权限、不读正文，也不把离屏格补成Ready。
+    /// Tab/Enter targets consume published cells only; raw tickets from another publication must match each actual fact in the same Doc.
+    /// Return actual content frames and visible endpoints without renewing Row authority, reading text, or upgrading offscreen cells to Ready.
     pub(in crate::native_surface::paged_body) fn cell_source_hit(
         &self,
         source: &VerifiedMarkdownTableCellSource,
@@ -239,7 +239,7 @@ impl Scene {
                     GridCellContent::Composed(window) => window.canonical_cell_source(),
                 };
                 let matches = {
-                    // 比较来源事实时只借同一个真实Doc；空范围还要区分Present与隐式缺格，不能只认整数。
+                    // Compare Source facts under the same actual Doc; empty integer ranges alone cannot distinguish Present from implicit missing cells.
                     let owner = self.key.request.document.upgrade().ok_or(Error::Revoked)?;
                     let document = owner.try_borrow().map_err(|_| Error::Busy)?;
                     let coordinate = raw
@@ -286,20 +286,20 @@ impl Scene {
                                 value.actual_range.location
                             }
                             Ok(_) | Err(ViewportError::Pending) => {
-                                self.require()?; // 真实资源首错仍先于离屏/尚未准备，不吞成等待。
+                                self.require()?; // Original resource failure precedes offscreen/unprepared geometry and cannot become ordinary waiting.
                                 return Ok(None);
                             }
                             Err(cause) => return Err(scene_error(cause)),
                         }
                     }
                     GridCellContent::Empty(_) if range.is_empty() => {
-                        // 真空格没有显示字形，原raw空范围已证明唯一BOF；这里只交真实格框，未制造caret。
-                        // 子Source仍须真实准备自己的字体行，正式输入与IME不能把本框当字符几何。
+                        // An empty cell has no display glyph; its raw empty range proves the sole BOF. Return only the actual frame, not an invented caret.
+                        // Child Source still prepares its actual font line; production input and IME cannot treat this frame as character geometry.
                         range.start
                     }
                     _ => {
                         self.require()?;
-                        return Ok(None); // Before/Outside的端点尚不在内容窗口，原SourceTarget继续reveal。
+                        return Ok(None); // Before/Outside endpoints are not in the content window; original SourceTarget continues reveal.
                     }
                 };
                 self.require()?;
@@ -313,21 +313,21 @@ impl Scene {
                         backward_bias: false,
                         word_target: None,
                     },
-                )); // 非指针导航只借真实端点；没有选择词组的点击侧，不作word handoff。
+                )); // Non-pointer navigation borrows actual endpoints only; without word-click bias it performs no word handoff.
             }
         }
         self.require()?;
         Ok(None)
     }
 
-    /// Find/IME先确认真实行域，再消费实际格坐标；只有空caret可投影隐藏管道等语法边界。
-    /// 非空语法没有显示字符，离屏/未准备格也不取邻格冒充；三态保证它们不会降到TableRow文字part。
+    /// Find/IME first resolve the actual row domain, then cell coordinates. Only empty carets may project hidden pipe/syntax boundaries.
+    /// Nonempty syntax has no display character; offscreen/unprepared cells cannot borrow neighbors. Three states prevent TableRow text fallback.
     pub(super) fn grid_first_rect(
         &self,
         range: NSRange,
         affinity: Affinity,
     ) -> Result<GridCharacterGeometry> {
-        // 两个调用边界已核本Scene健康；这里逐格核原raw票和实际窗口，不额外深扫整图。
+        // Both entry boundaries already checked Scene health; validate actual raw tickets/windows here without another full-graph scan.
         for row in &self.grids {
             let physical = row.row.source_range();
             let owns = if range.length == 0 && range.location != 0 && affinity.is_upstream() {
@@ -336,7 +336,7 @@ impl Scene {
                 physical.contains(&range.location)
             };
             if !owns {
-                continue; // 行尾上下游沿真实physical端点归属，不把下行起点重复认成上一表格行。
+                continue; // Actual physical endpoints decide upstream/downstream ownership; the next row start cannot also belong to the previous table row.
             }
             let mut previous: Option<(&GridCellPublication, Range<usize>, usize)> = None;
             let mut boundary = None;
@@ -348,7 +348,7 @@ impl Scene {
                     GridCellContent::Composed(window) => window.canonical_cell_source(),
                 };
                 let (canonical, column) = {
-                    // 同一结构票只在纯Core读取期借Doc；Native caret/current回调之前归还租约。
+                    // Borrow Doc for pure Core reads of this structure ticket, returning the lease before Native caret/current callbacks.
                     let owner = self.key.request.document.upgrade().ok_or(Error::Revoked)?;
                     let document = owner.try_borrow().map_err(|_| Error::Busy)?;
                     let canonical = raw
@@ -360,7 +360,7 @@ impl Scene {
                         .map_err(|cause| scene_error(ViewportError::Table(cause)))?;
                     (canonical, column)
                 };
-                // raw末端只给零范围caret，不把紧随其后的空白/管道非空请求截成一个假字符框。
+                // Raw end permits an empty caret only; following whitespace/pipe requests cannot be truncated into a fabricated character rectangle.
                 if canonical.contains(&range.location)
                     || range.length == 0 && range.location == canonical.end
                 {
@@ -376,10 +376,10 @@ impl Scene {
                     );
                 }
                 if range.length != 0 {
-                    continue; // 原管道/分隔线不是一个可见字符，不能用首格字符覆盖原非空请求。
+                    continue; // Original pipes/delimiters are not visible characters; a first-cell character cannot replace that nonempty request.
                 }
                 if column == 0 && range.location < canonical.start {
-                    // 只有原票证明的首列能接住本行前导语法；可见数组的第一个格可能实际是第十列。
+                    // Only a certified first column owns leading syntax; the first visible-array cell might actually be column ten.
                     boundary = Some((cell, canonical.start, Affinity::Downstream));
                     break;
                 }
@@ -388,7 +388,7 @@ impl Scene {
                     && previous_range.end < range.location
                     && range.location < canonical.start
                 {
-                    // 两个真实相邻列才证明中间隐藏管道的两侧；水平方向离屏缺列不能跳过后补票。
+                    // Only actual adjacent columns certify both sides of a hidden pipe; missing horizontal offscreen columns cannot be skipped to fabricate authority.
                     boundary = Some(if affinity.is_upstream() {
                         (*before, previous_range.end, Affinity::Upstream)
                     } else {
@@ -397,18 +397,18 @@ impl Scene {
                     break;
                 }
                 if column + 1 == row.row.columns() && range.location > canonical.end {
-                    // 表头physical范围包含真实delimiter；其尾部语法沿本行真实末格的末caret投影。
+                    // Header physical range includes the actual delimiter; trailing syntax projects through this row's actual final-cell end caret.
                     boundary = Some((cell, canonical.end, Affinity::Upstream));
                     break;
                 }
                 previous = Some((cell, canonical, column));
             }
             let Some((cell, position, side)) = boundary else {
-                return Ok(GridCharacterGeometry::Unavailable); // 同属此行但当前无真实可见格，不改写原请求。
+                return Ok(GridCharacterGeometry::Unavailable); // The position belongs to this row but lacks an actual visible cell; preserve the original request.
             };
             return match self.grid_cell_rect(cell, NSRange::new(position, 0), side)? {
                 GridCharacterGeometry::Ready(mut value) => {
-                    // 这里只投影空间：canonical语义仍是原隐藏位置，不能把输入/Find范围移到格中文字。
+                    // Project geometry only: canonical meaning remains the original hidden position, without moving Input/Find into cell text.
                     value.actual_range = range;
                     Ok(GridCharacterGeometry::Ready(value))
                 }
@@ -418,8 +418,8 @@ impl Scene {
         Ok(GridCharacterGeometry::Outside)
     }
 
-    /// 无文字的Before/Outside/Empty格没有可借用的字体行槽；真实窗口也可明确尚无此可见caret。
-    /// 只把几何Pending归为Unavailable，Source/字体/原映射错误完整保留，不能吞成“不画光标”。
+    /// Before/Outside/Empty cells have no font line to borrow; an actual window may also lack this visible caret.
+    /// Only geometric Pending becomes Unavailable; preserve Source/font/mapping errors instead of swallowing them as an absent caret.
     fn grid_cell_rect(
         &self,
         cell: &GridCellPublication,
@@ -436,7 +436,7 @@ impl Scene {
         }
     }
 
-    /// 链接激活仍走原 mouseUp 与目标查询；此处只交真实可见标签的原文范围。
+    /// Activation still follows original mouseUp and target resolution; expose only the actual visible label's canonical range here.
     pub(super) fn grid_link_hit(&self, local: NSPoint) -> Result<Option<(Range<usize>, usize)>> {
         let Some(cell) = self.grid_cell_at(local) else {
             return Ok(None);
@@ -450,12 +450,12 @@ impl Scene {
         else {
             return Ok(None);
         };
-        // 同一个真实LINK part内的目标一致，直接查询其已认证起点；不把末端caret当作链接外字符。
+        // A real LINK part has one destination; query its certified start without treating its end caret as a character outside the link.
         let position = range.start;
         Ok(Some((range, position)))
     }
 
-    /// 与原表格相同的底色和1pt边线；裁剪来自外层真实视口，不分配整行或整表 backing。
+    /// Preserve table colors and one-point borders using the actual outer viewport clip, without whole-row/table backing allocation.
     pub(super) fn grid_decorations(
         &self,
         context: &CGContext,
@@ -490,7 +490,7 @@ impl Scene {
             let right = left + row.frame.size.width;
             CGContext::move_to_point(Some(context), left, top);
             CGContext::add_line_to_point(Some(context), right, top);
-            // 未完成长行只有当前真实可见前缀，不能把前缀底部画成已封存整行的结尾。
+            // An unfinished tall row has only its actual visible prefix; its temporary bottom is not the sealed row end.
             if row.complete {
                 CGContext::move_to_point(Some(context), left, row.frame.origin.y);
                 CGContext::add_line_to_point(Some(context), right, row.frame.origin.y);
@@ -510,14 +510,14 @@ impl Scene {
         self.validate_grids(current)
     }
 
-    /// 一个真实行背景只有一次固定矩形绘制，裁剪仍是同一外层视口。
+    /// One actual row background performs one rectangle fill under the same outer viewport clip.
     pub(super) fn paint_grid_row_background(
         &self,
         row: usize,
         context: &CGContext,
         current: &dyn Fn() -> bool,
     ) -> Result<()> {
-        // 固定行框没有正文I/O；量子入口/出口核全图，这里只守原取消票，不能每格重扫全部字体。
+        // Fixed frames read no text; full checks belong to quantum entry/exit. Guard original cancellation here without rescanning every font per cell.
         if !current() {
             return Err(Error::Revoked);
         }
@@ -541,7 +541,7 @@ impl Scene {
         Ok(())
     }
 
-    /// 一行路径只在代码底色完成后建立；跨量子仅追加真实边线，最终仍一次stroke以保接缝像素。
+    /// Open the row path after code backgrounds finish; append actual borders across quanta, then stroke once to preserve seam pixels.
     pub(super) fn begin_grid_border(
         &self,
         row: usize,
@@ -555,8 +555,8 @@ impl Scene {
         let left = row.frame.origin.x;
         let right = left + row.frame.size.width;
         let top = row.frame.origin.y + row.frame.size.height;
-        // SDK明确ClipToRect会清空current path，必须先裁剪再建立跨量子的原行路径。
-        // 这份save由唯一Paint续体持有，完成或取消时都由该owner归还。
+        // The SDK states ClipToRect clears current path; clip before creating this cross-quantum row path.
+        // The sole Paint continuation owns this saved state and restores it on completion or cancellation.
         CGContext::save_g_state(Some(context));
         CGContext::clip_to_rect(Some(context), self.key.request.viewport);
         CGContext::begin_path(Some(context));
@@ -566,10 +566,10 @@ impl Scene {
             CGContext::move_to_point(Some(context), left, row.frame.origin.y);
             CGContext::add_line_to_point(Some(context), right, row.frame.origin.y);
         }
-        Ok(()) // Paint在登记本栈图形状态归属后统一执行Source/current后核。
+        Ok(()) // Paint records graphics-state ownership before performing the original Source/current post-check.
     }
 
-    /// 每个可见格只追加一条原列边线，不按总列数在同一metadata项内循环。
+    /// Each visible cell appends one original column border, without looping over all columns in one metadata record.
     pub(super) fn append_grid_border(
         &self,
         row: usize,
@@ -577,7 +577,7 @@ impl Scene {
         context: &CGContext,
         current: &dyn Fn() -> bool,
     ) -> Result<()> {
-        // 路径只消费原封存行框的一个x坐标，无来源读取；真实Source失败仍由step出口提升。
+        // The path uses one x coordinate from the sealed row frame, with no Source read; step exit still prioritizes actual Source failure.
         if !current() {
             return Err(Error::Revoked);
         }
@@ -591,7 +591,7 @@ impl Scene {
         Ok(())
     }
 
-    /// 原整行同一路径最终只stroke一次，不能因分步拆线造成抗锯齿接缝重复叠色。
+    /// Stroke the original complete-row path once; splitting steps must not duplicate antialiased seam coverage.
     pub(super) fn finish_grid_border(
         &self,
         row: usize,
@@ -614,7 +614,7 @@ impl Scene {
         Ok(())
     }
 
-    /// 跨格选区逐窗口映入其真实 display，不复制任何被选择的原文。
+    /// Map cross-cell selection through each window's actual display without copying selected source text.
     pub(super) fn grid_selection(
         &self,
         context: &CGContext,
@@ -646,7 +646,7 @@ impl Scene {
     }
 }
 
-/// 图形状态归还属于同步本栈，失败/取消均不能污染后继同CPU候选的状态。
+/// This synchronous stack restores graphics state on failure/cancellation, protecting later work on the same CPU candidate.
 struct Restore<'a>(&'a CGContext);
 impl Drop for Restore<'_> {
     fn drop(&mut self) {
@@ -654,7 +654,7 @@ impl Drop for Restore<'_> {
     }
 }
 
-/// 与原文字命中相同的半开框约定；边界共享时只由真实右/上邻格消费。
+/// Use text hit-testing's half-open frames; only the actual right/upper neighbor consumes a shared boundary.
 fn inside(point: NSPoint, frame: NSRect) -> bool {
     point.x >= frame.origin.x
         && point.x < frame.origin.x + frame.size.width

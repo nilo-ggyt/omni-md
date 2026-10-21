@@ -1,4 +1,5 @@
-//! 原Find请求只绑定一次正常Producer的Source；不以选择提交或旧Ready替代真正可见性。
+//! A Find request binds the normal Producer's original Source once. Selection commit
+//! and an old Ready frame cannot substitute for actual target visibility.
 
 use super::*;
 use crate::native_surface::paged_input::NativeMarkdownPagedInputOutcome;
@@ -14,6 +15,8 @@ use crate::native_surface::{
 };
 use target::SourceTargetRequest;
 
+/// Keep the original reveal request and one eventual Source target. Admission records
+/// wrapping geometry without acquiring a reader or a second input owner.
 pub(super) struct PendingFind {
     request: Rc<NativeMarkdownPagedFindRevealRequest>,
     layout_width: f64,
@@ -25,10 +28,12 @@ pub(super) struct PendingFind {
 impl NativeMarkdownPagedFindRevealPort for NativeMarkdownPagedBody {
     fn cancel_pending(&self) {
         if let Err(cause) = self.cancel_pending_find() {
-            self.fail(cause); // 原Source已失败时先交原失败；普通取消不能吞掉已存在的errno。
+            self.fail(cause); // Preserve the original Source failure; ordinary cancellation cannot swallow its existing errno.
         }
     }
 
+    /// Admit the complete original document/Input request before the normal Producer
+    /// chooses its Source. The result remains Pending until actual visibility is certified.
     fn begin(
         &self,
         request: Rc<NativeMarkdownPagedFindRevealRequest>,
@@ -68,9 +73,10 @@ impl NativeMarkdownPagedFindRevealPort for NativeMarkdownPagedBody {
             bound: Cell::new(false),
             target: RefCell::new(None),
         });
-        // begin在apply_find_commit清Scene后被调用。这里只存原票与真实宽度，不要求旧Ready，
-        // 也不捕Source/领取Reader；正常advance选择原Producer后才允许一次绑定。
-        drop(self.pending_page_scroll.borrow_mut().take()); // 后来的Find显示意图接管视口，不让旧纯滚动跨其reveal复活。
+        // apply_find_commit already cleared the Scene. Store only this ticket and
+        // actual width, requiring neither old Ready nor a Source/Reader acquisition.
+        // Normal advance selects the original Producer before the one permitted binding.
+        drop(self.pending_page_scroll.borrow_mut().take()); // Later Find reveal owns the viewport; an old scroll-only sequence cannot resume across it.
         *self.pending_find.borrow_mut() = Some(pending.clone());
         if let Err(cause) = self.schedule() {
             self.retire_find(&pending, Some(cause.to_string()));
@@ -81,17 +87,18 @@ impl NativeMarkdownPagedFindRevealPort for NativeMarkdownPagedBody {
 }
 
 impl NativeMarkdownPagedBody {
-    /// 查找读取正文前结束当前真实单格；同次提交后的输入票仍须有效，不能借后继选区继续旧动作。
+    /// Finish the actual active cell before Find reads canonical text. Its post-commit
+    /// ticket must remain valid; a successor selection cannot renew the old action.
     pub(in crate::native_surface) fn finish_cell_before_find(
         &self,
         controller: &NativeMarkdownController,
         intent: u64,
     ) -> Result<()> {
         if self.active_cell_body().is_none() {
-            return Ok(()); // 普通正文查找不承担单格提交义务，不因正在绘图而额外拒绝原查找入口。
+            return Ok(()); // Ordinary Body Find has no cell-commit obligation; unrelated drawing does not add an admission barrier.
         }
         let Some(committed) = self.commit_active_cell()? else {
-            return Err(ViewError::Revoked.into()); // 原草稿只能完成或失权，不能在提交边界消失后捕获后继输入。
+            return Err(ViewError::Revoked.into()); // The original draft must finish or lose authority; a vanished commit boundary cannot acquire successor input.
         };
         let current = |epoch| {
             self.current(epoch)
@@ -101,7 +108,8 @@ impl NativeMarkdownPagedBody {
                     controller,
                 )
         };
-        // detach会调用原生焦点入口；这些入口重入后必须继续核原after，不能重新捕获当前选择补权。
+        // Detachment enters Native focus APIs. After reentry validate the original
+        // after-state instead of recapturing current selection to renew permission.
         let result = match committed.outcome {
             NativeMarkdownPagedInputOutcome::Committed(after) => {
                 after.check_current(&current).map_err(ViewError::Input)
@@ -116,12 +124,14 @@ impl NativeMarkdownPagedBody {
                 }
             }
         };
-        // 草稿已经封闭；后续失权不得被调用方当成未提交而重试同一编辑。
+        // The draft is already sealed. Later revocation is a committed effect,
+        // not permission for the caller to repeat the original edit.
         result.map_err(|cause| ViewError::CommittedEffect(Box::new(cause)).into())
     }
 
-    /// 实际composition root可借原Body的唯一Input执行既有后端；不暴露第二Input owner，
-    /// 也不改变旧默认Find入口、中文按钮或命令。参数只在本同步动作中借用。
+    /// The composition root lends this body's sole Input to the existing backend.
+    /// No second Input owner, alternative Find entry, or changed button/command is
+    /// introduced; arguments are borrowed for this synchronous action alone.
     pub(in crate::native_surface) fn execute_paged_find_action(
         &self,
         bar: &Rc<NativeMarkdownFindBar>,
@@ -129,7 +139,8 @@ impl NativeMarkdownPagedBody {
         intent: u64,
         action: MarkdownFindAction,
     ) -> std::result::Result<NativeMarkdownFindExecution, NativeMarkdownFindExecutionError> {
-        // 既有查找栏可在编辑单格后继续使用；所有匹配/替换入口都读取本次真实提交后的正文。
+        // The existing bar continues after cell editing; every match/replace entry
+        // reads canonical text after this actual draft commit.
         self.finish_cell_before_find(controller, intent)
             .map_err(|cause| NativeMarkdownFindExecutionError::Rejected(cause.to_string()))?;
         let view = self
@@ -153,10 +164,13 @@ impl NativeMarkdownPagedBody {
     pub(in crate::native_surface) fn probe_find_input_weak(
         &self,
     ) -> Weak<NativeMarkdownPagedInput> {
-        Rc::downgrade(&self.input) // 只观察唯一原Input释放，不向测试交第二份Input强owner。
+        Rc::downgrade(&self.input) // Observe release of the sole Input without handing probes another strong owner.
     }
 
-    #[cfg(feature = "native-markdown-runtime-probe")]
+    #[cfg(all(
+        feature = "native-paged-body-probe",
+        feature = "native-markdown-runtime-probe"
+    ))]
     pub(in crate::native_surface) fn probe_bound_find_source(
         &self,
     ) -> Option<(
@@ -171,6 +185,7 @@ impl NativeMarkdownPagedBody {
         Some((Rc::downgrade(&pending.request), target.source.clone()))
     }
 
+    /// Exact Rc identity prevents an old callback from consuming a successor Find slot.
     fn find_slot_is(&self, pending: &Rc<PendingFind>) -> bool {
         self.pending_find
             .borrow()
@@ -179,13 +194,16 @@ impl NativeMarkdownPagedBody {
     }
 
     fn find_scope_current(&self, pending: &Rc<PendingFind>) -> bool {
-        // 先结束槽借用再进原request的Controller/View门；Native重入不能抢到任何RefCell借用。
+        // End slot borrows before the original request enters Controller/View gates;
+        // Native reentry must not encounter a live RefCell borrow here.
         self.current_body()
             && self.find_slot_is(pending)
             && pending.request.is_current()
             && self.find_slot_is(pending)
     }
 
+    /// Check only existing Producer/Source and canonical endpoint health, without
+    /// reading document-wide text or acquiring replacement layout authority.
     pub(super) fn find_source_health(&self) -> Result<()> {
         if let Some(producer) = self.producer.borrow().as_ref() {
             producer.target_source_health()?;
@@ -200,15 +218,17 @@ impl NativeMarkdownPagedBody {
             .map_err(|_| ViewError::Busy)?
             .byte_offset_for_utf16(0)
             .map_err(ViewError::Document)?;
-        Ok(()) // 只有原canonical零端点/原Source健康检查，无正文加载或Native调用。
+        Ok(()) // Original canonical endpoint and Source health only; no text materialization or Native calls.
     }
 
     #[cfg_attr(feature = "native-close-stage-diagnostic", track_caller)]
+    /// Settle this request's terminal state and revoke only its exact target identity.
     fn retire_find(&self, pending: &Rc<PendingFind>, failure: Option<String>) {
         #[cfg(feature = "native-close-stage-diagnostic")]
         if failure.is_none() {
-            // 正常取消没有错误载荷；保留实际发起退场的静态位置，避免终态观察只能看见
-            // 泛化取消而失去原分支。此处不重读Source、Native或请求权限，也不改变退场。
+            // Ordinary cancellation has no error payload. Record its actual static
+            // caller so terminal observation retains the originating branch without
+            // rereading Source, Native state, or permission, or changing retirement.
             let caller = std::panic::Location::caller();
             eprintln!(
                 "native_find_cancel_requested file={} line={}",
@@ -224,7 +244,7 @@ impl NativeMarkdownPagedBody {
             {
                 slot.take()
             } else {
-                None // 旧回调可以撤自己的票，绝不能清已经安装的后继Find槽。
+                None // An old callback may revoke its own request, never the installed successor Find slot.
             }
         };
         drop(removed);
@@ -247,10 +267,12 @@ impl NativeMarkdownPagedBody {
                 }
             };
             drop(removed);
-            target.revoke(); // 只清原Find的精确goal；不因相同range而夺走后继目标。
+            target.revoke(); // Revoke this exact Find goal; equal numeric ranges cannot identify a successor target.
         }
     }
 
+    /// Original Source failure takes precedence over ordinary cancellation; an
+    /// already-cancelled request cannot be revived by a later error.
     pub(super) fn cancel_pending_find(&self) -> Result<()> {
         let pending = self.pending_find.borrow().clone();
         if let Some(pending) = pending {
@@ -261,7 +283,7 @@ impl NativeMarkdownPagedBody {
             }
             self.retire_find(&pending, None);
         }
-        Ok(()) // 先发生的正常取消是终态；后来的错误不复活旧请求。
+        Ok(()) // Earlier ordinary cancellation is terminal; a later failure cannot revive the old request.
     }
 
     pub(super) fn fail_pending_find(&self, cause: &NativeMarkdownPagedBodyError) {
@@ -275,6 +297,8 @@ impl NativeMarkdownPagedBody {
         self.pending_find.borrow().is_some()
     }
 
+    /// Revoke changed Input, wrapping geometry, owner identity, or an already-bound
+    /// goal while preserving Source errors on both sides of foreground validation.
     pub(super) fn refresh_pending_find(
         &self,
         actual: &NativeMarkdownPagedSceneRequest,
@@ -302,6 +326,8 @@ impl NativeMarkdownPagedBody {
         Ok(())
     }
 
+    /// Bind the selected Producer's original Source exactly once, outside any
+    /// Native request recapture that could accidentally authorize successor input.
     pub(super) fn bind_pending_find(
         &self,
         producer: &Producer,
@@ -313,7 +339,7 @@ impl NativeMarkdownPagedBody {
         };
         producer.target_source_health()?;
         if pending.bound.get() {
-            return Ok(()); // 已绑定目标绝不领取后继Source，即使旧票后来失效也只走撤权。
+            return Ok(()); // A bound goal never acquires a successor Source; losing its original ticket permits revocation only.
         }
         let original_serial = self.serial.get();
         let source = producer.target_source_authority(actual, original_serial)?;
@@ -330,7 +356,7 @@ impl NativeMarkdownPagedBody {
                 && self.find_scope_current(&pending)
         };
         let result = self.admit_source_target(actual, source, pending.request.range(), &scope);
-        producer.target_source_health()?; // 原Producer在栈中；Native回调后的首错不能被查询取消吞掉。
+        producer.target_source_health()?; // This Producer is on-stack; query cancellation cannot swallow Source failure observed after Native reentry.
         let current = scope();
         producer.target_source_health()?;
         let target = match result {
@@ -342,7 +368,7 @@ impl NativeMarkdownPagedBody {
             }
             Err(cause) if cause.is_foreground_revocation() => {
                 self.retire_find(&pending, None);
-                return Ok(()); // 真编辑/resize仍由原PreparationTicket决定后继Source，不能重绑旧Find。
+                return Ok(()); // Original PreparationTicket handles edits/resize; the old Find cannot bind another Source.
             }
             Err(cause) => return Err(cause),
         };
@@ -356,7 +382,8 @@ impl NativeMarkdownPagedBody {
         Ok(())
     }
 
-    /// SourceTarget的纯current不能进入Native；只有稳定目标的Native检查才核原Find意图。
+    /// Pure SourceTarget.current never enters Native. Its separate stable-target
+    /// Native check validates the original Find intent here.
     pub(super) fn find_source_target_current(&self, target: &SourceTargetRequest) -> bool {
         let pending = self.pending_find.borrow().clone();
         let Some(pending) = pending else {
@@ -370,6 +397,8 @@ impl NativeMarkdownPagedBody {
         !owns || self.find_scope_current(&pending)
     }
 
+    /// Cancel only a goal actually owned by a stale original Find scope; unrelated
+    /// targets retain their own admission and cancellation authority.
     pub(super) fn cancel_stale_find_target(&self, target: &SourceTargetRequest) -> Result<bool> {
         let pending = self.pending_find.borrow().clone();
         let Some(pending) = pending else {
@@ -385,9 +414,11 @@ impl NativeMarkdownPagedBody {
         }
         self.find_source_health()?;
         self.retire_find(&pending, None);
-        Ok(true) // 只表示原Find意图取消；调用方仍须独立认证PreparationTicket和原Source。
+        Ok(true) // Only the original Find intent ended; callers must still verify PreparationTicket and original Source independently.
     }
 
+    /// Consume the original target's one-shot visibility proof, then settle the
+    /// request without treating selection commit or an empty proof slot as completion.
     pub(super) fn finish_pending_find(&self) -> Result<()> {
         let pending = self.pending_find.borrow().clone();
         let Some(pending) = pending else {
@@ -395,9 +426,10 @@ impl NativeMarkdownPagedBody {
         };
         let target = pending.target.borrow().clone();
         if target.as_ref().is_some_and(|target| target.pending()) {
-            // 唯一调用点advance已依次执行同回合refresh_pending_find、producer.advance和
-            // finish_source_target；原Source错误已沿Result进入fail_pending_find，仍在途时
-            // 没有新proof可消费。取消/输入/宽度仍由前述原票门撤权，不借后继Source续票。
+            // The sole advance caller already ran refresh_pending_find, Producer
+            // advance, and finish_source_target in this turn. Source failures reach
+            // fail_pending_find through Result; in-flight work has no new proof.
+            // Original cancellation/Input/width gates still revoke it without renewal.
             return Ok(());
         }
         self.find_source_health()?;
@@ -414,7 +446,7 @@ impl NativeMarkdownPagedBody {
         self.find_source_health()?;
         let proof = match proof {
             Ok(Some(proof)) => proof,
-            Ok(None) => return Err(ViewError::InvalidRange.into()), // 完成票的proof已消费不是重试许可。
+            Ok(None) => return Err(ViewError::InvalidRange.into()), // A completed target's consumed proof never authorizes retry.
             Err(cause) if cause.is_foreground_revocation() => {
                 self.retire_find(&pending, None);
                 return Ok(());
@@ -433,7 +465,8 @@ impl NativeMarkdownPagedBody {
             }
             return Ok(());
         }
-        // 完成终态不再满足request.is_current；只移除精确原槽，保原完成收据供调用方读取。
+        // Completion makes request.is_current false. Remove only the original slot,
+        // preserving its actual completed receipt for the caller.
         let mut slot = self.pending_find.borrow_mut();
         if slot
             .as_ref()

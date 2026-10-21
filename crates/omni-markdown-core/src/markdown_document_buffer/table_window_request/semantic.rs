@@ -1,4 +1,4 @@
-//! source绑定的完整窗口语义事务：结构→有限源行→真实scope/ref/underline→纯metadata发布。
+//! Complete a source-bound window through verified structure, bounded lines, scope/references/underline, then metadata publication.
 
 use super::super::{table_reference_request, table_source::MarkdownTableUnderlineRequest};
 use super::*;
@@ -17,16 +17,17 @@ use prefixes::{PrefixRuns, ScopeProjection};
 use source_lines::{LineCopy, OwnedLine};
 
 type Error = MarkdownTableWindowError;
-// 单窗口与同批窗口沿用同一有限投影上限；独立入口也明确持有自己的真实预算owner。
+// Standalone and batched windows use the same finite projection limits. The
+// standalone entry also owns an actual quota rather than borrowing ambient capacity.
 const MAX_RUNS: usize = 8192;
 const MAX_METADATA_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-/// 已知增量工作与有限whole-slice Parser输入分列；不把input cap误称AST/总内存或逐token证明。
+/// Separate incremental work from bounded whole-slice Parser input; input limits prove neither AST size nor total RSS.
 pub struct SemanticWork {
     pub source_bytes: usize,
     pub copied_source_bytes: usize,
-    /// 本step实际处理的metadata逻辑payload；不等于Vec capacity、allocator峰值或全部CPU。
+    /// Logical metadata payload handled this step, not Vec capacity, allocator peak, or all CPU work.
     pub metadata_bytes: usize,
     pub utf8_validation_bytes: usize,
     pub source_tree_steps: usize,
@@ -44,8 +45,8 @@ pub enum MarkdownTableWindowStep {
     TableEndReached { work: SemanticWork },
 }
 
-/// 唯一构造路径是本请求全部语义阶段成功；外部不能用同代次假window伪造另一note权限。
-/// ready对象没有源正文、Parser树、scope游标或Native对象，只有当前窗口纯metadata+Weak身份。
+/// Construct only after every semantic stage succeeds; equal generations cannot authorize another note's window.
+/// Ready retains current-window metadata and weak identity, without source text, Parser trees, scope cursors or Native objects.
 pub struct VerifiedMarkdownTableWindow {
     source: MarkdownTableSourceIdentity,
     presentation: MarkdownProjectedTableWindow,
@@ -59,6 +60,8 @@ impl VerifiedMarkdownTableWindow {
         &self,
         document: &MarkdownDocumentBuffer,
     ) -> Result<&MarkdownProjectedTableWindow, MarkdownTableRequestError> {
+        // Recheck the captured weak root/generation before exposing metadata;
+        // holding a completed window does not retain its document's source authority.
         if !self.source.is_current(document) {
             return Err(MarkdownTableRequestError::SourceSuperseded);
         }
@@ -100,7 +103,7 @@ enum Phase {
     End,
 }
 
-/// 一个请求只保当前批scratch和有限definition库存；每step结束纯源借用，无timer/worker/Native。
+/// Own current-batch scratch and bounded definitions only; source borrows end per step, without timers/workers/Native state.
 pub struct MarkdownTableWindowRequest {
     source: MarkdownTableSourceIdentity,
     batch: bool,
@@ -134,6 +137,8 @@ impl MarkdownDocumentBuffer {
         context_revision: u64,
         active_selection: Range<usize>,
     ) -> Result<MarkdownTableWindowRequest, MarkdownTableRequestError> {
+        // The original structure request establishes source/viewport authority.
+        // This owner adds its own finite semantic quota and no body copy up front.
         let structure = self.table_window_structure_request(target, viewport)?;
         let quota = MarkdownTableWindowQuota::new(MAX_RUNS, MAX_METADATA_BYTES);
         Ok(MarkdownTableWindowRequest {
@@ -162,7 +167,7 @@ impl MarkdownDocumentBuffer {
         })
     }
 
-    /// 只有不可伪造且属当前root的window才进入原单事务cell计划；未verified候选不得用于Native提交。
+    /// Plan a cell edit only from a verified current-root window, never an unverified candidate for Native publication.
     pub fn plan_verified_table_cell_edit(
         &self,
         window: &VerifiedMarkdownTableWindow,
@@ -216,7 +221,8 @@ impl MarkdownTableWindowRequest {
             self.advance_inner(document, budget, references, global)
         };
         if let Err(error) = result {
-            // 任一子阶段失败都丢弃整批和全部容量；不继续用后继definition/旧Ready修补错误。
+            // Any failed stage permanently retires this request's batch and
+            // capacities; later definitions or old Ready values cannot repair it.
             self.failed = Some(error);
             self.clear_scratch();
             self.ready = None;
@@ -252,7 +258,8 @@ impl MarkdownTableWindowRequest {
                 match step {
                     MarkdownTableStructureStep::StructureReady { .. } => {
                         self.ticket = structure.ready.take();
-                        // 有限语义仍借用同一个结构Global；原票据已移交，Ready时统一释放它。
+                        // Semantic work still borrows this same structural Global.
+                        // The transferred ticket is released with scratch before Ready.
                         self.phase = Phase::Scope;
                     }
                     MarkdownTableStructureStep::NotTable { .. } => {
@@ -275,12 +282,13 @@ impl MarkdownTableWindowRequest {
                     .as_ref()
                     .ok_or(MarkdownTableRequestError::InvalidRequest)?;
                 if !ticket.is_current(document) {
-                    // 请求与结构票据分别保有原源权限；前一阶段移交不能让失效票据进入scope派生。
+                    // Request and structural ticket each retain original-source
+                    // authority; transferring it cannot make a stale ticket valid for scope work.
                     return Err(MarkdownTableRequestError::SourceSuperseded);
                 }
                 if self.scope_cursor.is_none() {
                     self.scope_cursor = Some(ticket.checkpoint.scope_cursor());
-                    work.structural_transitions = 1024; // 固定4KiB级游标初始化单独计费，不隐藏deep traversal。
+                    work.structural_transitions = 1024; // Charge this bounded cursor initialization separately from traversal.
                     return Ok(MarkdownTableWindowStep::Progress { work });
                 }
                 match self
@@ -321,6 +329,8 @@ impl MarkdownTableWindowRequest {
                 }
             }
             Phase::Copy => {
+                // Copy only actual header/delimiter/selected member lines already
+                // admitted by the ticket; omitted table intervals are not input.
                 let (measured, complete) = self
                     .copier
                     .as_mut()
@@ -335,6 +345,8 @@ impl MarkdownTableWindowRequest {
                 }
             }
             Phase::Prefix => {
+                // Restore container properties from the original scope and true
+                // physical marker coordinates, not a compressed projection's apparent nesting.
                 let (measured, complete) = self
                     .prefixes
                     .as_mut()
@@ -365,7 +377,8 @@ impl MarkdownTableWindowRequest {
                     .map(|line| line.text.len() - line.spec.prefix)
                     .sum();
                 if self.batch {
-                    // 同批所有窗口的label先并入唯一库存，再开始源序解析；后加query会漏早先first-wins。
+                    // Seal every window's labels into the batch's sole inventory
+                    // before source-order resolution, preserving earlier first-wins definitions.
                     self.phase = Phase::AwaitReferences;
                 } else if self.queries.as_ref().unwrap().is_ready() {
                     self.phase = Phase::Underline;
@@ -393,7 +406,7 @@ impl MarkdownTableWindowRequest {
                     return Ok(MarkdownTableWindowStep::Progress { work });
                 }
                 let global = match global {
-                    Some(global) => global, // batch把原结构Global的唯一可变借用交到当前串行job。
+                    Some(global) => global, // The batch lends its original Global exclusively to this serial job.
                     None => self
                         .structure
                         .as_mut()
@@ -419,6 +432,8 @@ impl MarkdownTableWindowRequest {
                 }
             }
             Phase::Project => {
+                // Close the real shared inline-stack FD before building the final
+                // metadata projection; a computed style is not proof of resource release.
                 if let Some(underline) = self.underline.as_mut() {
                     underline.close_inline_stack()?;
                 }
@@ -439,16 +454,19 @@ impl MarkdownTableWindowRequest {
                     next_required_row: ticket.next_required_row,
                     replay: ticket.replay,
                 });
-                // Ready发布前释放所有正文/Parser引用库存/游标capacity，只保纯派生metadata。
+                // Return source strings, Parser/reference inventory and cursor
+                // capacities before Ready, retaining only derived metadata.
                 self.clear_scratch();
                 self.phase = Phase::Ready;
                 return Ok(MarkdownTableWindowStep::Ready { work });
             }
             Phase::Ready => return Ok(MarkdownTableWindowStep::Ready { work }),
-            // Ready所有权只移交一次；调用者消费后必须丢弃请求，不能拿空slot冒充另一个成功批次。
+            // Transfer Ready once. An empty consumed slot cannot represent
+            // another successful batch or authorize another Native publication.
             Phase::Consumed => return Err(MarkdownTableRequestError::InvalidRequest),
             Phase::AwaitReferences => {
-                // 仅batch内部能建立此阶段；未提供完整联合引用库存不能伪造语义Ready。
+                // Only the batch enters this phase; without its complete joint
+                // reference inventory, the window remains semantically pending.
                 return Err(MarkdownTableRequestError::Window(Error::ContextPending));
             }
             Phase::NotTable => return Ok(MarkdownTableWindowStep::NotTable { work }),
@@ -468,8 +486,9 @@ impl MarkdownTableWindowRequest {
             .ok_or(MarkdownTableRequestError::InvalidRequest)?;
         let mut work = SemanticWork::default();
         if let Some(fact) = self.reference_fact.take() {
-            // global本step的fuel已耗用，不在同一步再准入label buffer与normalize前置metadata。
-            // 下一step只接一个真实fact；构造失败由父请求sticky失败，不能跳过首定义。
+            // Global already spent its quantum. Admit one real definition fact
+            // on the next step, before label/normalizer allocation. Construction
+            // failure is sticky; skipping the first definition would change first-wins semantics.
             self.pending_reference =
                 table_reference_request::Request::new(self.source.clone(), fact, queries)
                     .map_err(MarkdownTableRequestError::Window)?;
@@ -489,7 +508,8 @@ impl MarkdownTableWindowRequest {
                 self.pending_reference = None;
             }
         } else if queries.is_ready() {
-            // 所有本批标签已取得first-wins值，无需为全源definition目录继续扫到EOF。
+            // Every current label has its actual first-wins result. Stop here
+            // rather than building an unnecessary document-wide definition index.
             self.references = None;
             self.phase = Phase::Underline;
         } else {
@@ -502,6 +522,8 @@ impl MarkdownTableWindowRequest {
             let frame = document
                 .table_source_frame(global.next_byte(), child)
                 .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
+            // This existing boundary maps source acquisition/reclaim failure to
+            // InvalidRequest; it does not return the underlying errno as Source.
             let step = global
                 .advance(
                     SourceFrame {
@@ -533,11 +555,14 @@ impl MarkdownTableWindowRequest {
                     work.source_bytes = measured.byte_reads;
                     work.structural_transitions = measured.transitions + tree + 64;
                     if let GlobalFact::Reference(fact) = fact {
-                        // 实际global输出与本请求Weak身份从构造起封闭，不接受外部伪配的同代次fact。
+                        // Facts come from this original Global under the captured
+                        // weak identity, never an externally paired equal-generation fact.
                         self.reference_fact = Some(fact);
                     }
                 }
                 GlobalStep::Complete { work: measured } => {
+                    // Only verified real source EOF closes unresolved definitions
+                    // as missing; a short frame or exhausted quantum cannot do so.
                     work.source_bytes = measured.byte_reads;
                     work.structural_transitions = measured.transitions + tree + 64;
                     queries.finish_verified_eof();
@@ -559,6 +584,8 @@ impl MarkdownTableWindowRequest {
         ready: bool,
         operation: impl FnOnce(&MarkdownTableWindowInput<'_>) -> Result<T, Error>,
     ) -> Result<T, MarkdownTableRequestError> {
+        // Metadata and source strings must still belong to this captured root;
+        // recapturing current document state cannot bless a stale semantic ticket.
         self.with_input_references(document, ready, None, operation)
     }
 
@@ -591,6 +618,8 @@ impl MarkdownTableWindowRequest {
             .map(OwnedLine::borrowed)
             .collect::<Vec<_>>();
         let global = if ready {
+            // Final projection needs actual completed underline and reference
+            // results. Earlier query collection sees Pending, not invented absence.
             let underline = self
                 .underline
                 .as_ref()
@@ -623,6 +652,8 @@ impl MarkdownTableWindowRequest {
     }
 
     fn clear_scratch(&mut self) {
+        // Return only resources owned by this request. Verified output keeps its
+        // own immutable metadata and weak source identity, with no scratch backedge.
         self.structure = None;
         self.ticket = None;
         self.scope_cursor = None;
@@ -656,7 +687,8 @@ impl MarkdownTableWindowRequest {
         self.ready_for(document)?;
         let ready = self.ready.take();
         if ready.is_some() {
-            // 值的根身份留在VerifiedWindow内继续核验，请求自身没有重复发布权限。
+            // The transferred window retains its original root identity;
+            // the request loses permission to publish the same slot again.
             self.phase = Phase::Consumed;
         }
         Ok(ready)
@@ -678,6 +710,9 @@ impl MarkdownTableWindowRequest {
 fn new_global(
     document: &MarkdownDocumentBuffer,
 ) -> Result<GlobalFrontier, MarkdownTableRequestError> {
+    // Reserve source-size-derived cumulative limits for a real source-order
+    // traversal. This can reach EOF; it is not whole-text materialization or a
+    // claim that local fuel is an allocator/whole-product memory measurement.
     let bytes = document
         .byte_len()
         .checked_mul(256)
@@ -706,6 +741,8 @@ fn new_global(
     .map_err(MarkdownTableRequestError::Global)
 }
 fn byte_coverage(ticket: &MarkdownTableStructuralWindow) -> Vec<Range<usize>> {
+    // Preserve separate original header/delimiter and actual body intervals;
+    // never fill an omitted gap with the convex hull of their coordinates.
     let mut result = Vec::with_capacity(2);
     result.push(ticket.header.header_byte_start..ticket.header.separator_byte_end);
     if let (Some(first), Some(last)) = (ticket.body.first(), ticket.body.last()) {
@@ -714,6 +751,8 @@ fn byte_coverage(ticket: &MarkdownTableStructuralWindow) -> Vec<Range<usize>> {
     result
 }
 fn utf16_coverage(ticket: &MarkdownTableStructuralWindow) -> Vec<Range<usize>> {
+    // Header context may be needed for syntax without being visible coverage.
+    // Publish it only when the original structural ticket included that header.
     let mut result = Vec::with_capacity(2);
     if ticket.include_header {
         result.push(ticket.header_utf16.start..ticket.delimiter_utf16.end);

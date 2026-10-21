@@ -272,7 +272,7 @@ fn named(
             .next(document)?
             .is_some_and(|value| value.0.eq_ignore_ascii_case(&expected))
         {
-            return Ok(false); // 已知不相等才能拒绝；不能把原读取错误当名称不匹配继续语法fallback。
+            return Ok(false); // Only actual inequality rejects; a Source read error cannot become a name miss and syntax fallback.
         }
     }
     Ok(true)

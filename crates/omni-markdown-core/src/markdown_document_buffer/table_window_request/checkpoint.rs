@@ -1,11 +1,13 @@
-//! 真实行边界上的单表回放；只保结构checkpoint，不重建全局前沿或保存源正文。
+//! Replay one table from actual accepted row boundaries. Retain structural
+//! checkpoints only, without rebuilding a Global frontier or storing source text.
 
 use super::*;
 use pulldown_cmark::block_frontier::{TableContinuationState, TableStep};
 
 #[derive(Clone, Debug)]
-/// checkpoint 来自同一已接受行边界；物理行号仅由 opaque checkpoint 保存并恢复。
-/// Core 只另记真实 fact 的后继 ordinal/byte/UTF16，不从窗口局部下标或 EOF 行尾推算坐标。
+/// The checkpoint comes from the same accepted row boundary and owns its opaque
+/// physical line number. Core adds only the actual fact's next ordinal/byte/UTF-16
+/// coordinates; window-local indices and EOF tails cannot derive new boundaries.
 pub(super) struct Boundary {
     pub(super) checkpoint: TableCheckpoint,
     pub(super) next_row_ordinal: usize,
@@ -14,7 +16,8 @@ pub(super) struct Boundary {
 }
 
 impl Boundary {
-    /// H/D由真实Global接受后保存首条body入口，不再为公式状态重复扫描header。
+    /// After actual Global acceptance of header/delimiter, save the first body
+    /// entrance without rereading the header for a disabled display extension.
     pub(super) fn after_delimiter(
         checkpoint: TableCheckpoint,
         header: &GlobalTableFact,
@@ -28,7 +31,8 @@ impl Boundary {
         }
     }
 
-    /// Row fact和checkpoint来自同一次结构接受；后继坐标不依赖额外正文重放。
+    /// Row fact and checkpoint come from the same structural acceptance. Derive
+    /// their next coordinates without another replay of the row's text.
     pub(super) fn after_row(checkpoint: TableCheckpoint, row: TableRowFact) -> Self {
         Self {
             checkpoint,
@@ -40,7 +44,8 @@ impl Boundary {
 }
 
 #[derive(Clone, Debug)]
-/// 三个有限锚点共享原 spine 页和 fuel；不保存文档 root、Native 对象、正文或逐行目录。
+/// Three bounded anchors share original spine pages and fuel. They retain no
+/// document root, native object, source text, or directory of all past rows.
 pub(super) struct ReplayAnchors {
     pub(super) header: GlobalTableFact,
     pub(super) header_utf16: Range<usize>,
@@ -52,7 +57,8 @@ pub(super) struct ReplayAnchors {
 
 #[derive(Debug)]
 pub(super) enum ReplayOutcome {
-    // 父批次已预扣 RequiredState 与固定 4096 字节工作区；此分配只移交一个有限 ticket，不复制完整表。
+    // The parent batch already admitted RequiredState and its fixed 4096-byte
+    // workspace. This allocation transfers one bounded receipt, not a full table copy.
     Window(Box<MarkdownTableStructuralWindow>),
     End {
         end: VerifiedTableEnd,
@@ -60,7 +66,8 @@ pub(super) enum ReplayOutcome {
     },
 }
 
-/// 临时续体只回放一张已验证表；结束后不接管或删除批次仍持有的主 Global。
+/// This temporary continuation replays one verified table, without taking over or
+/// removing the parent batch's still-owned primary Global when replay finishes.
 pub(super) struct ReplayRequest {
     source: MarkdownTableSourceIdentity,
     anchors: ReplayAnchors,
@@ -68,7 +75,8 @@ pub(super) struct ReplayRequest {
     boundary: Boundary,
     previous: Option<Boundary>,
     table: Option<TableContinuationState>,
-    // 只保最后完成行与它的真实前驱边界，供不存在目标时签真实terminal窗口。
+    // Retain only the last complete row and its actual predecessor boundary, so
+    // a missing target can produce an actual terminal window rather than an empty row.
     last_completed: Option<(TableRowFact, Boundary, Option<Boundary>)>,
     consumed: bool,
     failed: Option<MarkdownTableRequestError>,
@@ -92,7 +100,8 @@ impl ReplayRequest {
             || anchors.base.next_byte != anchors.header.separator_byte_end
             || anchors.base.next_utf16 != anchors.delimiter_utf16.end
         {
-            // 这些字段只由真实结构路径构造；不一致时撤销整次回放，不修补出一个猜测种子。
+            // Only the actual structural path constructs these fields. Any
+            // disagreement rejects replay rather than repairing a guessed seed.
             return Err(MarkdownTableRequestError::InvalidRequest);
         }
         let mut selected = None;
@@ -105,7 +114,8 @@ impl ReplayRequest {
                 || candidate.next_byte < anchors.base.next_byte
                 || candidate.next_utf16 < anchors.base.next_utf16
             {
-                // 固定三个锚点均须属同表已接受前缀；目标未命中的锚点也不能悄悄携带倒退坐标。
+                // All three anchors belong to this table's accepted prefix. An
+                // unselected anchor cannot quietly carry backward coordinates either.
                 return Err(MarkdownTableRequestError::InvalidRequest);
             }
             if candidate.next_row_ordinal <= target
@@ -113,12 +123,14 @@ impl ReplayRequest {
                     previous.next_row_ordinal < candidate.next_row_ordinal
                 })
             {
-                // 只选目标之前最近的真实入口；没有按 ordinal 构造新的 parser seed。
+                // Select the nearest actual entrance before the target. Its
+                // ordinal selects an existing checkpoint, never creates a Parser seed.
                 selected = Some(candidate);
             }
         }
         let boundary = if target == 0 {
-            // H/D已有独立真实结构事实；H-only不需要让续体读取第一条body。
+            // Header/delimiter already have independent structural evidence.
+            // Header-only lookup does not need to read the first body row.
             anchors.base.clone()
         } else {
             selected
@@ -147,14 +159,16 @@ impl ReplayRequest {
         })
     }
 
-    /// 批次在外层处理取消并累计原总 fuel；本层每次仍核当前 root，并只执行一个有界子阶段。
+    /// The outer batch owns cancellation and cumulative lifetime fuel. Every
+    /// entry here still checks the original root and runs one bounded child stage.
     pub(super) fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
         budget: usize,
     ) -> Result<(semantic::SemanticWork, Option<ReplayOutcome>), MarkdownTableRequestError> {
         if let Some(error) = self.failed {
-            // 首错保持撤权，不能凭同一旧 checkpoint 在下一回调自动重试并补签结果。
+            // First failure remains revoked. Another callback cannot retry the
+            // same old checkpoint and manufacture renewed result authority.
             return Err(error);
         }
         let result = if !self.source.is_current(document) {
@@ -165,7 +179,8 @@ impl ReplayRequest {
             self.advance_inner(document, budget)
         };
         if let Err(error) = result {
-            // 失败时释放续体与末行metadata；主Global由调用方持有，不从源起点重建。
+            // Drop this continuation and last-row metadata on failure. The caller
+            // still owns primary Global; do not reconstruct it at source zero.
             self.failed = Some(error);
             self.last_completed = None;
             self.table = None;
@@ -179,7 +194,8 @@ impl ReplayRequest {
         budget: usize,
     ) -> Result<(semantic::SemanticWork, Option<ReplayOutcome>), MarkdownTableRequestError> {
         if self.target == 0 {
-            // H-only 只移交既有真实 metadata；不运行 body 分类，也不把 context-only H 混入 body。
+            // Header-only transfers existing actual metadata without classifying
+            // body rows or mixing the context-only header into the body list.
             self.consumed = true;
             let ticket = self.window(None);
             return Ok((
@@ -213,7 +229,8 @@ impl ReplayRequest {
             .map_err(|error| {
                 MarkdownTableRequestError::Global(GlobalFrontierError::Frontier(error))
             });
-        // 回收成功后才消费step，不能让原parser提前终止遮住真实映射错误。
+        // Return the actual frame before consuming the Parser result. Its early
+        // completion cannot conceal a mapping/reclaim failure.
         frame
             .finish()
             .map_err(|_| MarkdownTableRequestError::InvalidRequest)?;
@@ -232,13 +249,15 @@ impl ReplayRequest {
                     || fact.byte_start != self.boundary.next_byte
                     || fact.utf16_start != self.boundary.next_utf16
                 {
-                    // 不接受另一个表或非连续回放的 Row；这些坐标不能由相同 ordinal 替代。
+                    // Reject another table or a noncontiguous replayed Row. Equal
+                    // ordinal alone cannot replace this accepted coordinate identity.
                     return Err(MarkdownTableRequestError::InvalidRequest);
                 }
                 let checkpoint = table
                     .checkpoint()
                     .ok_or(MarkdownTableRequestError::InvalidRequest)?;
-                // 原TableContinuation已完成本行与容器词法；直接消费同一checkpoint，不重读正文。
+                // Original TableContinuation finished this row/container grammar.
+                // Consume its same checkpoint directly, without rereading the text.
                 if fact.row_ordinal == self.target {
                     self.anchors.chunk = self.boundary.clone();
                     self.anchors.halo = self.previous.take();
@@ -250,7 +269,8 @@ impl ReplayRequest {
                         Some(ReplayOutcome::Window(Box::new(self.window(Some(fact))))),
                     ));
                 }
-                // 非目标行只替换固定metadata，真实前行/前驱边界仍可供末行窗口复用。
+                // A nontarget row replaces fixed metadata only. Actual last-row
+                // and predecessor facts remain available for a terminal window.
                 self.last_completed = Some((fact, self.boundary.clone(), self.previous.clone()));
                 self.previous = Some(std::mem::replace(
                     &mut self.boundary,
@@ -267,16 +287,19 @@ impl ReplayRequest {
                     || end.byte_end() != self.boundary.next_byte
                     || end.utf16_end() != self.boundary.next_utf16
                 {
-                    // 只交付此续体的真实表尾；未命中目标不生成空窗口，也不推断目标已激活。
+                    // Deliver only this continuation's actual End. A missed
+                    // target creates no empty window or assumed target activation.
                     return Err(MarkdownTableRequestError::InvalidRequest);
                 }
-                // 超界目标本身不能授权append。额外保留真实末行票，随后仍走同批语义/配额。
+                // An out-of-table ordinal cannot authorize append. Keep the actual
+                // final-row receipt for the same batch's semantics and shared quota.
                 let mut terminal = if let Some((row, before, halo)) = self.last_completed.take() {
                     self.anchors.chunk = before;
                     self.anchors.halo = halo;
                     self.window(Some(row))
                 } else if end.last_body_row_ordinal().is_none() {
-                    // H/D-only仍保留真实H事实，不把空body投影冒充虚构row1。
+                    // Header/delimiter-only still retains the actual header fact;
+                    // an empty body projection cannot impersonate a synthetic row 1.
                     let mut window = self.window(None);
                     window.include_header = true;
                     window
@@ -295,7 +318,8 @@ impl ReplayRequest {
                 ))
             }
             TableStep::Progress { .. } | TableStep::NeedInput { .. } => {
-                // 短 frame 与未完成分类均只保续体；不能在这里重授 checkpoint 或结束权限。
+                // Short frames and incomplete classification keep continuation
+                // only; neither renews a checkpoint nor grants End authority.
                 Ok((work, None))
             }
         }
@@ -304,7 +328,8 @@ impl ReplayRequest {
     fn window(&self, row: Option<TableRowFact>) -> MarkdownTableStructuralWindow {
         let mut body = Vec::with_capacity(usize::from(row.is_some()));
         if let Some(row) = row {
-            // 只物化目标这一条真实 body；H/D 作为独立语法上下文，绝不补齐中间省略行。
+            // Materialize metadata for this one actual target row only. Header and
+            // delimiter remain separate syntax context; omitted middle rows stay omitted.
             body.push(row);
         }
         MarkdownTableStructuralWindow {

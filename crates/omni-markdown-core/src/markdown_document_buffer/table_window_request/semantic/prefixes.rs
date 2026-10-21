@@ -1,4 +1,4 @@
-//! 真实scope的容器属性与源marker恢复；不从压缩投影猜测祖先类型。
+//! Restore container styles and source markers from actual scope, never inferred projection ancestry.
 
 use super::*;
 use crate::markdown_viewport_presentation::{
@@ -11,6 +11,8 @@ pub(super) use crate::markdown_viewport_presentation::table_window::MarkdownTabl
 
 #[derive(Default)]
 pub(super) struct ScopeProjection {
+    // Retain only actual ancestor starts and bounded visible-header marker facts.
+    // The same batch quota owns their logical metadata and eventual prefix runs.
     first: [Option<usize>; 3],
     header_markers: Vec<(TableScopeKind, usize)>,
     before_header: [bool; 3],
@@ -31,12 +33,15 @@ impl ScopeProjection {
         kind: TableScopeKind,
         start: usize,
     ) -> Result<usize, Error> {
+        // Scope kinds outside quote/list semantics contribute no prefix styles;
+        // each accepted kind still needs its original start before table content.
         let Some(index) = kind_index(kind) else {
             return Ok(0);
         };
         let header = ticket.header;
         if start > header.header_byte_start + header.header_prefix_bytes {
-            // 真实祖先必须在table content前已开启，不能让未来容器得到当前行的属性权限。
+            // An ancestor must already be open before table content; a future
+            // container cannot acquire styling authority over this earlier row.
             return Err(Error::InvalidSource);
         }
         self.first[index] = Some(self.first[index].map_or(start, |old| old.min(start)));
@@ -46,10 +51,12 @@ impl ScopeProjection {
             }
             self.quote_count += 1;
             if !ticket.include_header {
-                // 离屏H不需要其opening目录：续行只有原container prefix，固定层数足够逐层消费。
+                // Offscreen headers need no opening directory. Continuation
+                // prefixes require only the actual fixed quote depth.
                 return Ok(0);
             }
-            // H可见时每层真实quote都保留原起点，不能按kind合并或猜footnote label里的`>`。
+            // Visible headers retain every real quote start; merging by kind
+            // or scanning literal '>' inside footnote labels would lose ownership.
             if self.quote_starts.len() + self.header_markers.len() == MAX_RUNS {
                 return Err(Error::SemanticLimit);
             }
@@ -65,14 +72,15 @@ impl ScopeProjection {
         let anchor = if start < header.header_byte_start {
             if self.before_header[index] {
                 return Ok(0);
-            } // 同kind旧祖先在H行都从同一物理起点识别marker。
+            } // Older ancestors of one kind share the header's actual physical marker start.
             self.before_header[index] = true;
             header.header_byte_start
         } else {
             start
         };
         if self.header_markers.len() + self.quote_starts.len() == MAX_RUNS {
-            // metadata先准入再push；深spine不在失败前生成无界header marker目录。
+            // Admit metadata before push. A deep spine cannot create an
+            // unbounded header-marker directory before reporting its limit.
             return Err(Error::SemanticLimit);
         }
         if let Some(quota) = &self.quota {
@@ -82,6 +90,8 @@ impl ScopeProjection {
         Ok(std::mem::size_of::<(TableScopeKind, usize)>())
     }
     pub fn into_builder(self) -> PrefixRuns {
+        // Transfer these same original scope facts to one serial run builder;
+        // no second ancestor directory or copied source body is introduced.
         PrefixRuns {
             scope: self,
             runs: Vec::new(),
@@ -115,7 +125,7 @@ pub(super) struct PrefixRuns {
     stage: Stage,
 }
 impl PrefixRuns {
-    /// 每次只做一个有限style/marker映射；marker识别仍交既有helper，输入量单独报告。
+    /// Map one bounded style/marker per step, reporting the existing marker recognizer's input separately.
     pub fn advance(
         &mut self,
         lines: &[OwnedLine],
@@ -129,6 +139,8 @@ impl PrefixRuns {
         };
         match self.stage {
             Stage::Containers => {
+                // Container extent starts at its actual ancestor or the first
+                // retained line. Convert only the bounded real prefix to UTF-16.
                 if self.first_index == 3 {
                     self.stage = Stage::TablePrefix;
                     return Ok((work, false));
@@ -159,7 +171,7 @@ impl PrefixRuns {
                     || line.spec.prefix == 0
                     || line.spec.delimiter && !ticket.include_header
                 {
-                    return Ok((work, false)); // H prefix在原TagTable.start之前，不能误补TABLE。
+                    return Ok((work, false)); // A header prefix precedes the actual table start and must not gain TABLE.
                 }
                 let prefix = line
                     .text
@@ -168,7 +180,8 @@ impl PrefixRuns {
                 work.normalizer_input_bytes = prefix.len();
                 let mut styles = Styles::TABLE;
                 if line.spec.delimiter {
-                    // 原delimiter字节范围含真实container prefix且不含EOL，压缩投影必须补回同样隐藏属性。
+                    // The original delimiter extent includes its container
+                    // prefix and excludes EOL; restore those exact hidden properties.
                     styles = styles
                         .union(Styles::TABLE_DELIMITER)
                         .union(Styles::HIDDEN_MARKER);
@@ -180,7 +193,8 @@ impl PrefixRuns {
             }
             Stage::Quotes => {
                 if self.row_index == lines.len() {
-                    // quote阶段结束后复用原列表marker阶段；每次advance仍最多输出一个marker。
+                    // Continue into the original list-marker stage after quotes;
+                    // a step still emits at most one actual marker.
                     self.row_index = 0;
                     self.stage = Stage::Markers;
                     return Ok((work, false));
@@ -203,10 +217,12 @@ impl PrefixRuns {
                 let start = if self.row_index == 0
                     && source_start.is_some_and(|start| start >= line.spec.bytes.start)
                 {
-                    // H上新quote的真实anchor跳过已验证Item/Footnote opening，不能搜label里的字面`>`。
+                    // A new header quote starts at its verified anchor, past the
+                    // actual item/footnote opening, not a literal '>' in its label.
                     source_start.ok_or(Error::InvalidSource)? - line.spec.bytes.start
                 } else {
-                    // ActiveTable续行只有原container continuation；按scope次序从上个quote末端前进。
+                    // Table continuation contains only the original container
+                    // prefix; follow scope order from the preceding quote's end.
                     self.quote_cursor
                 };
                 if start < self.quote_cursor || start > prefix.len() {
@@ -236,7 +252,8 @@ impl PrefixRuns {
                 let styles = if active {
                     Styles::MARKER
                 } else {
-                    // 同一真实物理行端点规则；压缩projection/gap不能给旧quote重新授予可见权限。
+                    // Use the actual physical-line endpoint rule; a compressed
+                    // projection or gap cannot make an inactive quote marker visible.
                     Styles::MARKER.union(Styles::HIDDEN_MARKER)
                 };
                 self.push(marker_start..marker_end, styles)?;
@@ -250,7 +267,7 @@ impl PrefixRuns {
                 if self.row_index <= 1 && !ticket.include_header {
                     self.row_index += 1;
                     self.marker_index = 0;
-                    return Ok((work, false)); // 离屏H/D仅语法context，不发布marker。
+                    return Ok((work, false)); // Offscreen header/delimiter are syntax context, not published markers.
                 }
                 let marker = if self.row_index == 0 {
                     self.scope.header_markers.get(self.marker_index).copied()
@@ -273,7 +290,7 @@ impl PrefixRuns {
                 self.marker_index += 1;
                 if let Some((role, start)) = marker {
                     if role == TableScopeKind::BlockQuote {
-                        return Ok((work, false)); // quote各层已经单独签发，不再按kind首祖先重复输出。
+                        return Ok((work, false)); // Each quote layer was already emitted from its own original authority.
                     }
                     let local_start = start.max(line.spec.bytes.start) - line.spec.bytes.start;
                     let prefix = line
@@ -283,7 +300,8 @@ impl PrefixRuns {
                     if local_start > prefix.len() {
                         return Err(Error::InvalidSource);
                     }
-                    // 此helper只检查已知container prefix；不会为了marker读取/解析整个巨cell正文。
+                    // Recognize only the known bounded container prefix. Marker
+                    // recovery cannot authorize reading/parsing an entire huge cell.
                     work.normalizer_input_bytes = prefix.len();
                     if let Some(range) =
                         crate::markdown_viewport_presentation::parser::table_line_prefix_marker(
@@ -305,6 +323,8 @@ impl PrefixRuns {
         Ok((work, false))
     }
     fn push(&mut self, range: Range<usize>, styles: Styles) -> Result<(), Error> {
+        // Empty ranges retain no run. Admit the actual new prefix before it
+        // joins the bounded output, sharing the same quota as final projection.
         if range.start >= range.end {
             return Ok(());
         }

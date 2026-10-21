@@ -8,7 +8,7 @@ pub(crate) struct SourcePieceRange {
     pub(crate) local: Range<usize>,
 }
 
-/// 深度优先游标只保不可变root、AVL高度栈和一个有限Span续体，不收集全部小片。
+/// Retain one immutable root path, an AVL-height stack and a finite Span continuation, not a list of all pieces.
 pub(crate) struct SourcePieceCursor {
     stack: Vec<(Arc<MarkdownPieceTreeNode>, usize)>,
     range: Range<usize>,
@@ -38,22 +38,25 @@ impl SourcePieceCursor {
     pub(crate) fn next_piece(&mut self) -> Option<SourcePieceRange> {
         loop {
             if let Some((span, ordinal, start)) = self.span.take() {
-                // 一次只展开一个已验证目录条目；续体不保正文借用，调用者仍沿原piece API读取。
+                // Expand one validated compact record at a time. Continuation
+                // retains no borrowed bytes; callers still read through the original piece API.
                 let piece = span.piece(ordinal).expect("原不可变Span小目录已完整验证");
                 let end = start + piece.byte_len;
                 if ordinal + 1 < span.record_range().end {
-                    // 后继只保存共享目录与下一个逻辑byte起点，目录末端则自然释放当前Arc。
+                    // Retain only the shared directory and next logical byte
+                    // start; reaching its end returns this directory Arc naturally.
                     self.span = Some((span, ordinal + 1, end));
                 }
                 if self.range.end > start && self.range.start < end {
-                    // 只发布真实相交部分；被剪掉的小片不借Source，也不改变有序输出。
+                    // Yield only an actual intersection. Pruned pieces neither
+                    // borrow the source nor change the original output ordering.
                     return Some(SourcePieceRange {
                         local: self.range.start.saturating_sub(start)
                             ..(self.range.end - start).min(piece.byte_len),
                         piece,
                     });
                 }
-                continue; // 仅推进有限小目录；返回给所有旧消费者的仍是≤4KiB普通piece。
+                continue; // Advance only the finite directory; consumers still receive ordinary pieces up to 4 KiB.
             }
             let (node, start) = self.stack.pop()?;
             // Every iteration consumes a stack node; only intersecting branches add finite children.
@@ -72,7 +75,8 @@ impl SourcePieceCursor {
                     });
                 }
                 MarkdownPieceTreeNode::OriginalSpan(span) => {
-                    // 目录作为一个真实树叶进入固定续体，不能为一次遍历分配16个Arc树叶。
+                    // One actual directory leaf becomes one continuation; do
+                    // not allocate 16 Arc-backed leaves just to traverse its records.
                     self.span = Some((span.clone(), span.record_range().start, start));
                 }
                 MarkdownPieceTreeNode::Branch { left, right, .. } => {
@@ -243,12 +247,14 @@ pub(super) fn prepare_dense_line_prefix<O: changes::MarkdownTextChangeObserver>(
                     pending_carriage_return = false;
                     continue;
                 }
-                // 独立CR已计入旧坐标；在下一scalar前发出该行的真实插入。
+                // The standalone CR already advanced original coordinates. Emit
+                // this line's actual insertion before consuming its next scalar.
                 changes::emit(document, observer, source_units..source_units, prefix_units)?;
                 output.push(document, prefix.as_bytes())?;
                 pending_carriage_return = false;
             }
-            // UTF16计量与已有源扫描同程，不另建全行索引或再次解码选中正文。
+            // Measure UTF-16 during the same actual source traversal, without
+            // another line index or a second decode of the selected body.
             source_units += scalar.len_utf16();
             match scalar {
                 '\r' => {
@@ -257,7 +263,8 @@ pub(super) fn prepare_dense_line_prefix<O: changes::MarkdownTextChangeObserver>(
                     pending_carriage_return = true;
                 }
                 '\n' => {
-                    // 独立LF完成一行；即使尾端空行也有一项原坐标插入。
+                    // A standalone LF completes one original line. Its trailing
+                    // empty line still has its own actual insertion coordinate.
                     output.push(document, b"\n")?;
                     changes::emit(document, observer, source_units..source_units, prefix_units)?;
                     output.push(document, prefix.as_bytes())?;
@@ -271,7 +278,8 @@ pub(super) fn prepare_dense_line_prefix<O: changes::MarkdownTextChangeObserver>(
         }
     }
     if pending_carriage_return {
-        // 选中区间末尾独立CR后的空行仍拥有自己的插入锚点。
+        // The empty line after a selected interval's final standalone CR still
+        // owns an insertion anchored in the original source coordinates.
         changes::emit(document, observer, source_units..source_units, prefix_units)?;
         output.push(document, prefix.as_bytes())?;
     }

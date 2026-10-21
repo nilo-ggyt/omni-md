@@ -19,34 +19,34 @@ pub(super) struct NativeMarkdownWindowSurface {
     pub(super) sidebar_has_more: bool,
     pub(super) sidebar_scan_pending: bool,
     pub(super) sidebar_intent: Option<u64>,
-    /// 与当前pager同寿命；失败后各页只供重选，绝不以autoopen覆盖原始错误。
+    /// Lives with the current pager; after failure, pages permit explicit reselection without auto-opening over the original error.
     pub(super) sidebar_completion_policy:
         super::workspace_browse_policy::NativeMarkdownBrowseCompletionPolicy,
     pub(super) sidebar_results: Option<
         std::sync::Arc<crate::cancelable_mailbox::CancelableMailbox<NativeMarkdownBrowseResult>>,
     >,
-    /// 复用已登记的分区标题控件，模式提示不需要新label或查询缓存。
+    /// Reuses the recorded section-title control for mode feedback without another label or query cache.
     pub(super) sidebar_title: Retained<NSTextField>,
     pub(super) sidebar_rows: Vec<NativeMarkdownSidebarRow>,
     pub(super) sidebar_list: NativeMarkdownSidebarList,
     pub(super) note_title: Retained<NSTextField>,
-    /// 只显示当前已安装文档的真实相对路径；不保存第二份浏览选择或正文owner。
+    /// Displays only the installed document's actual relative path, without duplicating browser selection or document ownership.
     pub(super) note_path: Retained<NSTextField>,
     pub(super) current_note_relative_path: Option<String>,
     pub(super) editor: Option<NativeMarkdownEditorSurface>,
     pub(super) empty_label: Option<Retained<NSTextField>>,
     pub(super) pending_note_switch: Option<PendingNativeMarkdownNoteSwitch>,
-    /// 查询文本和opaque续页只保留有限纯元数据；stop_search/关闭时统一take释放。
+    /// Query text and opaque continuation retain bounded metadata only; stop_search and closure take and release them together.
     pub(super) search_query: Option<String>,
-    /// 查询被接纳时的输入意图；保存不得把新输入B的当前代次冒记为旧查询A的权限。
+    /// Keeps the input intent accepted with the query; save cannot assign a newer input epoch to an old query.
     pub(super) search_intent: Option<u64>,
     pub(super) search_cursor: Option<omni_markdown_core::MarkdownSearchCursor>,
-    /// 已展示页的独立查询权限，末页没有cursor也必须能被保存撤销。
+    /// Displayed pages retain independent query authority, so save can revoke even a final page without a cursor.
     pub(super) search_authority: Option<omni_markdown_core::MarkdownSearchAuthority>,
     pub(super) search_generation: u64,
     pub(super) search_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(super) search_worker: Option<std::thread::JoinHandle<()>>,
-    // 查询与结果由前台所有者持有；排队通知只保存邮箱弱引用。
+    // The foreground owner retains query/results; dispatch carries only a weak mailbox reference.
     pub(super) pending_search_query:
         Option<std::sync::Arc<crate::cancelable_mailbox::CancelableMailbox<String>>>,
     pub(super) search_results: Option<
@@ -54,7 +54,7 @@ pub(super) struct NativeMarkdownWindowSurface {
     >,
     pub(super) pending_file_mutation: Option<PendingNativeMarkdownFileMutation>,
     pub(super) borrowed_close: Option<NativeMarkdownBorrowedEditorSnapshot>,
-    /// modal公开清理失败的首因；不能通过再次打开dialog丢弃不完整资源事实。
+    /// Retains the first public modal-cleanup failure; opening another dialog cannot discard incomplete release facts.
     pub(super) modal_failure: Option<String>,
 }
 
@@ -63,23 +63,23 @@ pub(super) struct PendingNativeMarkdownNoteSwitch {
     pub(super) relative_path: String,
     pub(super) previous_relative_path: Option<String>,
     pub(super) release_barrier: Option<NativeMarkdownEditorReleaseBarrier>,
-    /// 仅该次链接切换携带已解码片段；旧图释放后移交目标Body，不保旧Doc或Scene。
+    /// Only this link switch carries the decoded fragment; transfers it to destination Body after old-graph release without retaining old document/Scene.
     pub(super) fragment: Option<String>,
 }
 
-/// A mutation waits for editor release while retaining the saved authority revision and recovery identity.
+/// A mutation waits for actual editor release while retaining its original path, saved disk revision, and feedback intent.
 pub(super) struct PendingNativeMarkdownFileMutation {
     pub(super) mutation: NativeMarkdownFileMutation,
     pub(super) active_relative_path_before: Option<String>,
     pub(super) expected_revision: Option<String>,
     pub(super) release_barrier: Option<NativeMarkdownEditorReleaseBarrier>,
-    /// modal-only barrier不代表正文已释放；失败恢复必须依据真实editor转换。
+    /// A modal-only barrier does not prove document release; failure compensation follows the actual editor transition.
     pub(super) editor_was_released: bool,
-    /// begin首个Native前固定的输入意图；release异步等待不能在finish领新查询权限。
+    /// Captures input intent before begin's first native call; asynchronous release cannot acquire newer query authority at finish.
     pub(super) feedback_intent: u64,
 }
 
-/// 仅文件操作把原反馈ticket贯穿安装；普通caller保持原合同，挂载不能领取新的输入权限。
+/// Only file operations carry their original feedback intent through installation; ordinary callers retain their contract, and mounting cannot renew input authority.
 #[derive(Clone, Copy)]
 enum NativeMarkdownEditorFeedback {
     ExistingCaller,
@@ -87,12 +87,12 @@ enum NativeMarkdownEditorFeedback {
 }
 
 impl NativeMarkdownEditorFeedback {
-    /// 正文恢复是必要补偿；状态/聚焦是业务反馈，必须另核原ticket以免抢新查询的输入。
+    /// Document restoration is necessary compensation; status/focus separately require the original intent to avoid taking newer query input.
     fn permits(self, surface: &NativeMarkdownWindowSurface) -> bool {
         match self {
-            // 其余既有文档切换仍走原调用方的交接权限，不在此引入新代次行为。
+            // Other document switches retain their caller's handoff authority without a new epoch policy here.
             Self::ExistingCaller => true,
-            // None明确表示旧权限已撤销，不能改用安装完成后的新epoch。
+            // None explicitly denotes revoked authority; installation cannot replace it with a newer epoch.
             Self::FileMutation(intent) => {
                 intent.is_some_and(|intent| surface.workspace_refresh_intent_is_current(intent))
             }
@@ -101,11 +101,11 @@ impl NativeMarkdownEditorFeedback {
 }
 
 impl NativeMarkdownWindowSurface {
-    /// 纯Rust门槛必须早于composition/save/resign/take，失败保留同一可编辑父草稿。
+    /// Pure Rust admission precedes composition, save, resignation, or owner removal; failure preserves the same editable parent draft.
     pub(super) fn preflight_modal_boundary(&self) -> Result<(), String> {
         preflight_native_markdown_modal()?;
         if let Some(error) = &self.modal_failure {
-            // 已观察到的清理失败不能因相关window后来不可见而被遗忘。
+            // An observed cleanup failure remains authoritative even if its window later becomes invisible.
             return Err(error.clone());
         }
         Ok(())
@@ -148,14 +148,14 @@ impl NativeMarkdownWindowSurface {
                 &std::sync::atomic::AtomicBool::new(false),
             )
             .map_err(|error| error.to_string())?;
-        // 首次只做一个有界步骤；未完成不能用随机前缀决定自动打开的笔记。
+        // Performs one bounded initial step; an incomplete arbitrary prefix cannot select an automatically opened note.
         let (snapshot, sidebar_has_more, sidebar_scan_pending) = match progress {
             omni_markdown_core::MarkdownWorkspacePageProgress::Ready(page) => {
-                // 小库完整扫描已结束，只有这一确定页可以决定首次打开的笔记。
+                // A fully scanned small vault has a deterministic page that may choose the initial note.
                 (page.snapshot, page.has_more, false)
             }
             omni_markdown_core::MarkdownWorkspacePageProgress::Pending => {
-                // 大库没有可发布前缀；根行与加载提示先挂载，之后由后台继续。
+                // An incomplete large vault has no publishable prefix; mounts root/loading UI while background scanning continues.
                 (
                     omni_markdown_core::MarkdownWorkspaceSnapshot {
                         directories: Vec::new(),
@@ -166,7 +166,7 @@ impl NativeMarkdownWindowSurface {
                 )
             }
         };
-        // 显示与所有文件操作相同的已验证根；失败直接保留错误，不另建空库。
+        // Displays the same validated root used by file operations; failure remains an error instead of creating another empty vault.
         let workspace_root = session
             .resolve_directory_for_system_action("")
             .map_err(|error| error.to_string())?;
@@ -182,8 +182,8 @@ impl NativeMarkdownWindowSurface {
 
         // Establish the invisible panel/delegate owner before installing any native action targets.
         let panel = NativeMarkdownPanel::new(mtm);
-        // 窗口背景固定深色，标准 popup/button/字段也必须使用同一原生 appearance。
-        // SAFETY: AppKit 导出的名称具有进程静态生命周期，仅在主线程查询框架共享样式。
+        // The fixed dark window background requires the same native appearance for standard popups, buttons, and fields.
+        // SAFETY: AppKit appearance names have process-static lifetime; shared framework appearance is queried only on the main thread.
         let appearance_name = unsafe { objc2_app_kit::NSAppearanceNameDarkAqua };
         let appearance = objc2_app_kit::NSAppearance::appearanceNamed(appearance_name)
             .ok_or("原生深色外观不可用")?;
@@ -197,7 +197,7 @@ impl NativeMarkdownWindowSurface {
         panel.setBecomesKeyOnlyIfNeeded(false);
         panel.setWorksWhenModal(true);
         panel.setHidesOnDeactivate(false);
-        // 恢复无边框窗口原有的背景拖动；文本与控件仍先处理各自的输入事件。
+        // Preserves original borderless background dragging while text and controls handle their own input first.
         panel.setMovableByWindowBackground(true);
         panel.setHasShadow(true);
         panel.setOpaque(true);
@@ -207,7 +207,7 @@ impl NativeMarkdownWindowSurface {
             NSWindowCollectionBehavior::CanJoinAllSpaces
                 | NSWindowCollectionBehavior::FullScreenAuxiliary,
         );
-        // 最小尺寸约束实际内容区；无系统标题栏时不再预留额外标题栏高度。
+        // Minimum size constrains actual content; a borderless window reserves no extra title-bar height.
         panel.setContentMinSize(NSSize::new(
             sidebar_geometry::MINIMUM_CONTENT_WIDTH,
             sidebar_geometry::MINIMUM_CONTENT_HEIGHT,
@@ -218,7 +218,7 @@ impl NativeMarkdownWindowSurface {
 
         let controller = NativeMarkdownController::new(&owned_ledger, &panel, mtm);
         panel.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
-        // 面板构造已建立唯一内容根；缺失属于装配错误，不能另造视图树掩盖它。
+        // Panel construction establishes the sole content root; absence is an assembly bug, not permission to create a replacement tree.
         let content_view = panel
             .contentView()
             .expect("原生 Markdown 面板必须提供内容视图");
@@ -287,7 +287,7 @@ impl NativeMarkdownWindowSurface {
         sidebar.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
         content_view.addSubview(&sidebar);
 
-        // 无系统标题栏仍保留原产品名；品牌不随功能中文化改写，也不增加关闭入口。
+        // Keeps the original product name without a system title bar; functional localization neither renames the brand nor adds a close control.
         let plugin_title = NSTextField::labelWithString(ns_string!("Omni MD"), mtm);
         plugin_title.setFrame(NSRect::new(
             NSPoint::new(18.0, NATIVE_MARKDOWN_HEIGHT - 38.0),
@@ -315,7 +315,7 @@ impl NativeMarkdownWindowSurface {
             NSPoint::new(166.0, NATIVE_MARKDOWN_HEIGHT - 42.0),
             NSSize::new(64.0, 28.0),
         ));
-        // 简短按钮保留完整辅助访问与悬停说明，关闭仍沿原保存与资源屏障执行。
+        // The compact button retains full accessibility/tooltip text; exit still follows original save and release barriers.
         exit_button.setAccessibilityLabel(Some(ns_string!("返回启动器")));
         exit_button.setToolTip(Some(ns_string!("关闭笔记并返回启动器")));
         exit_button.setBordered(false);
@@ -348,20 +348,20 @@ impl NativeMarkdownWindowSurface {
             ),
             NSSize::new(248.0, 20.0),
         ));
-        // SAFETY: AppKit公开的固定字重常量在本主线程构造期间有效，不借用文稿或字体缓冲。
+        // SAFETY: Public AppKit weight constants remain valid during main-thread construction without borrowing document or font buffers.
         let title_weight = unsafe { NSFontWeightSemibold };
         note_title.setFont(Some(&NSFont::systemFontOfSize_weight(17.0, title_weight)));
         note_title.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
             0.90, 0.92, 0.96, 1.0,
         )));
-        // 页眉所有横向位置由同一几何发布，避免独立弹簧在缩放后互相覆盖。
+        // One geometry publication owns all header horizontal positions, preventing independent springs from overlapping on resize.
         note_title.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
         configure_native_markdown_header_text(&note_title);
         note_title.setAccessibilityLabel(Some(ns_string!("当前笔记")));
         note_title.setToolTip(Some(&NSString::from_str(&current_title)));
         content_view.addSubview(&note_title);
 
-        // 路径来自同一次成功打开的身份；只读标准label保留完整AX值，截断不改用户字符串。
+        // The path comes from the same successful open identity; a read-only label preserves full AX text while visual truncation leaves the string intact.
         let initial_path = NSString::from_str(initial_note_relative_path.as_deref().unwrap_or(""));
         let note_path = NSTextField::labelWithString(&initial_path, mtm);
         note_path.setFrame(NSRect::new(
@@ -380,11 +380,11 @@ impl NativeMarkdownWindowSurface {
         note_path.setAccessibilityLabel(Some(ns_string!("当前笔记相对路径")));
         if initial_note_relative_path.is_some() {
             note_path.setToolTip(Some(&initial_path));
-        } // 空工作区不显示虚构路径，也不保留上一篇文档的提示。
+        } // Empty state shows no invented path or tooltip from the previous document.
         content_view.addSubview(&note_path);
 
-        // 原顶部“源码”是同一实际模式事务的双态按钮；不会替换canonical或新增编辑器。
-        // SAFETY: 原主线程controller实现固定action，窗口拆图先解除按钮target/action。
+        // The original Source toggle uses the same actual mode transaction without replacing canonical storage or creating an editor.
+        // SAFETY: The original main-thread controller implements the fixed action; teardown clears button target/action first.
         let presentation_mode_button = unsafe {
             NSButton::buttonWithTitle_target_action(
                 ns_string!("源码"),
@@ -420,7 +420,7 @@ impl NativeMarkdownWindowSurface {
         status_label.setAccessibilityLabel(Some(ns_string!("操作状态")));
         content_view.addSubview(&status_label);
 
-        // 原三列持久footer独立于临时反馈；每列都是同窗口实际登记的固定控件。
+        // The three persistent footer columns are separate from transient feedback; each is a fixed recorded control of this window.
         let footer_labels = ["显示模式", "保存状态", "字符和行数"].map(|accessibility| {
             let label = NSTextField::labelWithString(ns_string!(""), mtm);
             configure_native_markdown_header_text(&label);
@@ -450,8 +450,8 @@ impl NativeMarkdownWindowSurface {
         sidebar_title.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
         content_view.addSubview(&sidebar_title);
 
-        // 笔记库身份使用实际目录末级名称；完整保存位置仍由同一标准标签的提示和AX值提供。
-        // 这里只改善长路径的显示，不改会话根、书签、文件身份或打开保存目标。
+        // Vault display uses the actual final directory name; the same label exposes its full location through tooltip and AX value.
+        // Changes long-path presentation only, preserving session root, bookmarks, file identity, and open/save targets.
         let workspace_path = NSString::from_str(&workspace_root.to_string_lossy());
         let workspace_name = workspace_root
             .file_name()
@@ -464,19 +464,19 @@ impl NativeMarkdownWindowSurface {
             NSSize::new(212.0, 18.0),
         ));
         workspace_location.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-        // 窗口使用固定深色背景；系统浅色 appearance 的 secondaryLabelColor 会变成黑字。
+        // The fixed dark background needs an explicit compatible label color; the light appearance's secondaryLabelColor becomes black.
         workspace_location.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
             0.58, 0.63, 0.72, 1.0,
         )));
         workspace_location.setToolTip(Some(&workspace_path));
         workspace_location.setAccessibilityLabel(Some(ns_string!("笔记保存位置")));
-        // SAFETY: 该静态标签的无障碍值明确为只读 NSString；AppKit 同步保留这份实际目录文案。
+        // SAFETY: This static label exposes a read-only NSString accessibility value; AppKit synchronously retains the actual directory text.
         unsafe {
             workspace_location.setAccessibilityValue(Some(&workspace_path));
         }
         content_view.addSubview(&workspace_location);
 
-        // 原生滚动列表只接收当前有限元数据页，搜索和底栏仍固定在容器外。
+        // The native scrolling list receives only the current bounded metadata page; search and footer stay outside its container.
         let sidebar_list = NativeMarkdownSidebarList::new(
             &sidebar_rows,
             initial_note_relative_path.as_deref(),
@@ -485,7 +485,7 @@ impl NativeMarkdownWindowSurface {
             mtm,
         )?;
 
-        // Construct at most one TextKit graph; an open failure remains a visible empty-state error.
+        // Constructs at most one paginated document graph; an open failure remains a visible empty-state error.
         let editor_frame =
             native_markdown_editor_frame(&content_view, controller.feedback_visible());
         let (editor, current_note_relative_path, document_error) = match document_result {
@@ -513,7 +513,7 @@ impl NativeMarkdownWindowSurface {
         } else {
             // Preserve an interactive navigation surface even when no document could be opened.
             let empty_message = if sidebar_scan_pending {
-                // 完整排序还在后台继续，不能把空的暂态误称为用户没有笔记。
+                // Full sorting continues in the background; a temporarily empty page must not claim the user has no notes.
                 "正在读取笔记目录…"
             } else if notes.is_empty() {
                 // No metadata means the user can create their first note from the workspace controls.
@@ -527,8 +527,8 @@ impl NativeMarkdownWindowSurface {
             empty_label = Some(empty_state_label);
         }
 
-        // 菜单构造须读实际初始模式；此时没有前台更新权限，只设置既有模式真值。
-        // 控件安装后仍由原调用再次同步按钮，不把构造阶段伪装成活会话。
+        // Menu construction reads the actual initial mode; before foreground publication it sets only the established mode value.
+        // The original caller resynchronizes buttons after installation; construction does not impersonate a live session.
         controller.select_presentation_mode(presentation_mode);
         // Install remaining actions before the surface becomes visible or receives responder callbacks.
         let toolbar_controls = install_native_markdown_workspace_controls(
@@ -549,7 +549,7 @@ impl NativeMarkdownWindowSurface {
         );
         controller.install_conflict_bar()?;
         if let Some(editor) = &editor {
-            // 构造时直接绑定实际Doc，不等较晚Active getter重领路径；弱票不保活正文。
+            // Construction binds the actual document directly, without acquiring a path from a later Active getter; its weak intent keeps no text alive.
             controller.bind_conflict_note(NativeMarkdownCurrentNoteIntent::for_document(
                 &controller,
                 &panel,
@@ -569,12 +569,12 @@ impl NativeMarkdownWindowSurface {
             controller.present_error(&document_error);
         }
         if let Some(editor) = &editor {
-            // 表格真实编辑只弱引用窗口 controller；正文不增加窗口的强所有权环。
+            // Actual table editing weakly references the window controller, avoiding a strong document/window cycle.
             // Only a live editor can own the initial text responder.
             panel.setInitialFirstResponder(Some(editor.input_view()));
         }
 
-        // 仅登记本构造路径显式创建/配置的原生角色，不把 AppKit 内部子树升级为项目所有。
+        // Records only native roles explicitly created/configured here, without claiming ownership of AppKit's internal subtree.
         for (role, object) in [
             ("window.controller", &*controller as &AnyObject),
             ("window.content", &*content_view as &AnyObject),
@@ -582,7 +582,7 @@ impl NativeMarkdownWindowSurface {
             ("window.header", &*header as &AnyObject),
             ("window.sidebar", &*sidebar as &AnyObject),
         ] {
-            // 本构造数量固定且远小于 ledger 预算，失败属于内部构造不变量被破坏。
+            // This fixed construction is far below the ledger budget; failure indicates a broken construction invariant.
             owned_ledger
                 .include(role, object)
                 .expect("fixed Markdown chrome fits owned ledger");
@@ -622,19 +622,19 @@ impl NativeMarkdownWindowSurface {
             ("sidebar.title", sidebar_title.as_super()),
             ("sidebar.location", workspace_location.as_super()),
         ] {
-            // 控件及实际 cell 都有独立 weak 证明，不能只依赖 content/controller nil。
+            // Controls and actual cells each require independent weak release proof; nil content/controller alone is insufficient.
             owned_ledger
                 .include_control(role, control)
                 .expect("fixed Markdown controls fit owned ledger");
         }
         if let Some(label) = &empty_label {
-            // 空工作区路径同样登记 placeholder，不能只覆盖正文成功构造。
+            // Empty-workspace construction records its placeholder too, rather than covering only successful document construction.
             owned_ledger
                 .include_control("window.empty", label)
                 .expect("fixed empty label fits owned ledger");
         }
 
-        // 所有原生控件和菜单已登记；页眉只观察实际两行Weak，唯一strong仍归原controls所有者。
+        // All native controls/menus are recorded; the header observes the actual two rows weakly, leaving strong ownership with the original controls.
         let header_controls = NativeMarkdownHeaderControls::new(
             [
                 note_title.as_super().as_super(),
@@ -666,13 +666,13 @@ impl NativeMarkdownWindowSurface {
             ],
             toolbar_controls,
         );
-        // 构造还未发布全局owner；局部panel/controller身份与尺寸仍须逐setter复核。
+        // Before global owner publication, each setter still rechecks local panel/controller identity and dimensions.
         if !header_controls.layout(
             &controller,
             &panel,
             NativeMarkdownHeaderAuthority::Construction,
         ) {
-            // 构造期间尺寸/窗口已被重入取代，不能发布只改了一半的工具栏。
+            // Reentry replaced the window or dimensions during construction; a partially updated toolbar cannot be published.
             return Err("笔记工具栏布局未能完成，请重新打开笔记窗口".to_owned());
         }
         assert!(
@@ -690,7 +690,7 @@ impl NativeMarkdownWindowSurface {
             }
         }
 
-        // 构造中的Native getter也可能产生输入通知；首个目录任务绑定实际当前意图而非假设0。
+        // Construction getters may emit input notifications; the first directory task binds the actual current intent instead of assuming zero.
         let sidebar_intent = Some(controller.workspace_query_intent());
         // Transfer the completed native graph and scalar transition state into the unique surface owner.
         Ok(Self {
@@ -735,7 +735,7 @@ impl NativeMarkdownWindowSurface {
 
     /// Expose the already-owned native graph and request keyboard focus without creating another session.
     pub(super) fn show(&self) {
-        // 仅显式探针对照在首次绘制前隐藏既有组件；默认产品与正式功能门禁不变。
+        // Only an explicit diagnostic control hides existing components before first paint; default product and formal feature gates remain unchanged.
         #[cfg(feature = "native-markdown-runtime-probe")]
         self.apply_memory_component_control();
         // Activate only after the root has retained this fully configured foreground surface.
@@ -754,19 +754,19 @@ impl NativeMarkdownWindowSurface {
         }
     }
 
-    /// 只隔离真实窗口的既有组件，不另建正文、布局或持久原生所有者。
+    /// Isolates existing components of the actual window without creating document, layout, or persistent native owners.
     #[cfg(feature = "native-markdown-runtime-probe")]
     fn apply_memory_component_control(&self) {
         let Some(control) = std::env::var_os("OMNI_NATIVE_MEMORY_COMPONENT_CONTROL") else {
-            // 没有显式环境值时不查询原生图，也不改变任何组件的可见性。
+            // Without an explicit environment value, queries no native graph and changes no component visibility.
             return;
         };
         let (label, hide_gutter) = match control.to_str() {
-            // 两个固定对照都保留原 scroll_view；只有第二种额外隐藏原行号尺。
+            // Both fixed controls preserve the original scroll_view; only the second additionally hides its existing line-number ruler.
             Some("body_only") => ("body_only", false),
             Some("body_only_no_gutter") => ("body_only_no_gutter", true),
             _ => {
-                // 未知值不回退为其他对照，也不把原环境内容写入诊断。
+                // An unknown value selects no alternative control and is never copied into diagnostics.
                 eprintln!(
                     "native_memory_component_control control=invalid formal=false hidden_components=0 invalid=true"
                 );
@@ -777,32 +777,32 @@ impl NativeMarkdownWindowSurface {
         let mut hidden_components = 0_usize;
         let current = || native_markdown_controller_has_foreground_authority(&self.controller);
         let result = (|| -> Result<(), ()> {
-            // 与既有原生角色账本相同的 1024 上限约束整个快照，超限不截断后继续。
+            // The existing ledger's 1024-role bound limits the entire snapshot; over-budget input is rejected without truncation.
             const MAX_COMPONENT_SUBVIEWS: usize = 1_024;
             if MainThreadMarker::new().is_none() || !current() {
-                // 关闭或非主线程不具备隐藏原生视图的权限。
+                // Closing or a non-main thread has no authority to hide native views.
                 return Err(());
             }
             let editor = self.editor.as_ref().ok_or(())?;
             let content = self.panel.contentView().ok_or(())?;
             if !current() {
-                // getter 可能重入；不能把先前权限沿用到后续视图查询。
+                // Getters may reenter; prior authority does not automatically authorize later view queries.
                 return Err(());
             }
             let subviews = content.subviews();
             if !current() {
-                // NSArray 只在本次 show 内临时持有原子视图，失权立即归还快照。
+                // NSArray temporarily retains original subviews only during this show; revoked authority releases the snapshot immediately.
                 return Err(());
             }
             let count = subviews.count();
             if count > MAX_COMPONENT_SUBVIEWS {
-                // 输入数量超出账本预算时不隐藏任何部分组件。
+                // A snapshot exceeding the ledger budget hides no partial subset.
                 return Err(());
             }
             let body: &NSView = editor.scroll_view().as_super();
             let mut body_matches = 0_usize;
             for index in 0..count {
-                // 完整预检原 scroll_view 身份；不递归接管 AppKit 内部子树。
+                // Preflights the complete snapshot for the original scroll_view identity without recursively taking over AppKit internals.
                 if !current() {
                     return Err(());
                 }
@@ -811,16 +811,16 @@ impl NativeMarkdownWindowSurface {
                     return Err(());
                 }
                 if std::ptr::eq(&*child, body) {
-                    // 只认可实际已挂载正文；缺失或重复身份不能成为有效对照。
+                    // Only the actually mounted document is valid; a missing or duplicate identity invalidates the control.
                     body_matches += 1;
                 }
             }
             if body_matches != 1 {
-                // 没有唯一正文时保留原组件状态，不臆造替代视图。
+                // Without a unique document, preserves component state instead of inventing a replacement view.
                 return Err(());
             }
             for index in 0..count {
-                // 只隐藏原快照中的同级组件，保留 frame、层级与原正文所有权。
+                // Hides only peer components in the original snapshot, preserving frames, hierarchy, and document ownership.
                 if !current() {
                     return Err(());
                 }
@@ -829,18 +829,18 @@ impl NativeMarkdownWindowSurface {
                     return Err(());
                 }
                 if std::ptr::eq(&*child, body) {
-                    // 原 scroll_view 的 hidden 状态也不主动改写。
+                    // Does not change even the original scroll_view's hidden state.
                     continue;
                 }
                 child.setHidden(true);
                 if !current() || !child.isHidden() || !current() {
-                    // setter/getter 任一重入失权都使本次对照无效，不重试或补签。
+                    // Revocation during any setter/getter invalidates this control without retry or renewed authority.
                     return Err(());
                 }
                 hidden_components += 1;
             }
             if hide_gutter {
-                // 仅改变已有 ruler 视图的 hidden，不修改 rulersVisible 或正文布局。
+                // Changes only the existing ruler view's hidden flag, preserving rulersVisible and document layout.
                 if !current() {
                     return Err(());
                 }
@@ -853,14 +853,14 @@ impl NativeMarkdownWindowSurface {
             }
             Ok(())
         })();
-        // 原生快照和逐项临时 claim 已全部归还；对照不能升级为正式功能或内存通过证据。
+        // All native snapshots and temporary claims are released; this control is neither formal functionality nor memory-acceptance evidence.
         let invalid = result.is_err() || !current();
         eprintln!(
             "native_memory_component_control control={label} formal=false hidden_components={hidden_components} invalid={invalid}"
         );
     }
 
-    /// 已安装文档的真实身份只更新列表反馈，不触发另一次文档选择。
+    /// The installed document's actual identity updates list feedback only, without triggering another note selection.
     pub(super) fn update_selected_note(&self, selected_relative_path: Option<&str>) {
         self.sidebar_list.select_active(selected_relative_path);
     }
@@ -879,7 +879,7 @@ impl NativeMarkdownWindowSurface {
             // First empty transition installs one owned placeholder in the still-live content view.
             let label = native_markdown_empty_label(message, mtm);
             if let Err(error) = self.owned_ledger.include_control("window.empty", &label) {
-                // 未完整登记的控件不发布到层级；现有原生 surface 保持可关闭。
+                // An incompletely recorded control is not mounted; the existing native surface remains closable.
                 self.controller.present_error(&error);
                 return;
             }
@@ -887,7 +887,7 @@ impl NativeMarkdownWindowSurface {
             self.empty_label = Some(label);
         }
         if self.pending_note_switch.is_none() && self.pending_file_mutation.is_none() {
-            // 无待验证旧图的正常空工作区仍允许标题/正文搜索与后续恢复。
+            // An ordinary empty workspace without a pending old graph still permits title/body search and later user opening.
             let borrowed = self.controller.ivars().borrowed.borrow().clone();
             self.controller
                 .ivars()
@@ -898,7 +898,7 @@ impl NativeMarkdownWindowSurface {
         // Remove every action/focus affordance that would imply an active document still exists.
         self.panel.setInitialFirstResponder(None);
         self.note_title.setStringValue(ns_string!("笔记"));
-        // 空工作区不得继续通过悬停暴露上篇笔记的标题。
+        // Empty state must not expose the previous note's title through a tooltip.
         self.note_title.setToolTip(Some(ns_string!("笔记")));
         self.note_path.setStringValue(ns_string!(""));
         self.note_path.setToolTip(None);
@@ -910,7 +910,7 @@ impl NativeMarkdownWindowSurface {
         self.update_selected_note(None);
     }
 
-    /// 仅失败且旧正文已释放时使用；每个Native阶段后核同一空owner；B只撤业务发布，不能阻止必要补偿。
+    /// Used only after failure and actual old-document release; rechecks the same empty owner after each native phase, while newer input revokes feedback but not necessary compensation.
     fn prepare_failed_mutation_reselection(
         &mut self,
         mtm: MainThreadMarker,
@@ -927,18 +927,18 @@ impl NativeMarkdownWindowSurface {
         }
         let message = "请从目录重新选择笔记，并核对当前文件状态";
         if let Some(label) = &self.empty_label {
-            // 复用已有placeholder，不创建错误恢复窗口或另一个原生资源图。
+            // Reuses the existing placeholder without creating a recovery window or another native graph.
             label.setStringValue(&NSString::from_str(message));
         } else {
             let label = native_markdown_empty_label(message, mtm);
             if !self.empty_workspace_compensation_is_current() {
-                // 未发布candidate局部drop；关闭/新owner不能被旧错误补建控件。
+                // Drops an unpublished candidate locally; closure or a new owner cannot receive controls recreated by an old error.
                 return Ok(false);
             }
             self.owned_ledger.include_control("window.empty", &label)?;
             content.addSubview(&label);
             if !self.empty_workspace_compensation_is_current() {
-                // 自己尚未发布的candidate只移除自身，不动后继控件。
+                // An unpublished candidate removes only itself, leaving successor controls untouched.
                 label.removeFromSuperview();
                 return Ok(false);
             }
@@ -959,7 +959,7 @@ impl NativeMarkdownWindowSurface {
         if !self.empty_workspace_compensation_is_current() {
             return Ok(false);
         }
-        // 失败补偿只清同一空owner的旧身份，每次Native调用后仍服从原重入撤权。
+        // Failure compensation clears only this empty owner's old identity, honoring revocation after each native call.
         self.note_path.setStringValue(ns_string!(""));
         if !self.empty_workspace_compensation_is_current() {
             return Ok(false);
@@ -979,7 +979,7 @@ impl NativeMarkdownWindowSurface {
         if !self.empty_workspace_compensation_is_current() {
             return Ok(false);
         }
-        // pending已消费、旧图已严格释放；只恢复原查询provider，不复活旧field editor。
+        // Pending work is consumed and the old graph strictly released; resumes the original query provider without reviving an old field editor.
         let borrowed = self.controller.ivars().borrowed.borrow().clone();
         self.controller
             .ivars()
@@ -1006,7 +1006,7 @@ impl NativeMarkdownWindowSurface {
         );
     }
 
-    /// 文档/控件补偿总会完成；仅可见反馈和焦点沿文件操作原ticket门禁。
+    /// Document/control compensation still completes; visible feedback and focus alone require the original file-operation intent.
     fn install_editor_with_feedback(
         &mut self,
         content_view: &NSView,
@@ -1020,20 +1020,20 @@ impl NativeMarkdownWindowSurface {
         }
         // Mount after release verification, then publish the authoritative title/identity together.
         content_view.addSubview(editor.scroll_view());
-        // Core已成功打开并验证此笔记路径；标题沿同一file_stem规则，不依赖尚在异步刷新的目录页。
-        // 目录名仍保留完整文件名规则，碰撞生成的数字后缀及标题内部的点也保持原值。
+        // Core opened and validated this note; title uses the same file_stem rule independently of asynchronously refreshed directory pages.
+        // The directory name retains full filename semantics, including collision suffixes and interior dots.
         let title = std::path::Path::new(&relative_path)
             .file_stem()
             .and_then(|stem| stem.to_str())
             .expect("Core已验证所安装笔记的UTF-8文件名");
         let native_title = NSString::from_str(title);
         self.note_title.setStringValue(&native_title);
-        // 视觉截断只作用于cell，实际字符串、辅助访问值和悬停仍使用完整标题。
+        // Truncation is cell presentation only; the actual string, accessibility value, and tooltip preserve the full title.
         self.note_title.setToolTip(Some(&native_title));
         let native_path = NSString::from_str(&relative_path);
         self.note_path.setStringValue(&native_path);
         self.note_path.setToolTip(Some(&native_path));
-        // 普通切换、重命名和移动均从实际安装收据取得身份，不查侧栏页或替换目录名。
+        // Switch, rename, and move derive identity from the actual installation receipt rather than sidebar pages or substituted directory names.
         self.current_note_relative_path = Some(relative_path.clone());
         self.controller.set_copy_document_available(true);
         self.controller.set_table_insertion_available(true);
@@ -1057,7 +1057,7 @@ impl NativeMarkdownWindowSurface {
             .ivars()
             .field_editor_provider
             .resume(&borrowed);
-        // 旧图收据已消费，新 canonical owner 发布后才恢复查询客户端。
+        // Resumes query clients only after consuming old-graph receipts and publishing the new canonical owner.
         self.controller.set_workspace_input_enabled(true);
 
         // The installed owner now supports focus and user actions without an outstanding old editor.
@@ -1066,19 +1066,19 @@ impl NativeMarkdownWindowSurface {
             .as_ref()
             .expect("native Markdown editor was installed immediately above");
         if feedback.permits(self) {
-            // 文件操作期间已发生新B时不抢查询焦点，正文仍已作为可用补偿发布。
+            // New query input during the file operation keeps its focus; document compensation still publishes a usable editor.
             self.panel
                 .setInitialFirstResponder(Some(editor.input_view()));
         }
         if feedback.permits(self) {
-            // 上一个Native setter也可能重入；只清仍属于本次原反馈的状态。
+            // The preceding setter may also reenter; clears only status still owned by this original feedback intent.
             self.controller.clear_status();
         }
         if feedback.permits(self)
             && !self.panel.makeFirstResponder(Some(editor.input_view()))
             && feedback.permits(self)
         {
-            // 焦点失败也属于原操作反馈，不能在getter重入B后显示旧错误。
+            // Focus failure also belongs to original feedback and cannot be shown after getters reenter newer input.
             self.controller
                 .present_error("编辑器暂时无法获得键盘焦点，请点按正文后继续");
         }
@@ -1105,7 +1105,7 @@ impl NativeMarkdownWindowSurface {
         )
     }
 
-    /// 同一正文只更换排版策略；窗口模式、按钮和后续打开默认值都以实际接纳结果为准。
+    /// Changes layout policy on the same document; window mode, buttons, and future-open defaults follow the actual accepted result.
     pub(super) fn set_presentation_mode(
         &mut self,
         mode: MarkdownPresentationMode,
@@ -1115,13 +1115,13 @@ impl NativeMarkdownWindowSurface {
             self.controller.select_presentation_mode(mode);
             return Ok(());
         }
-        // 查找字段也可能正处于中文组合；先走原窗口辞任预检，不把候选迁到另一输入客户。
+        // Find fields may hold Chinese composition too; normal window resignation preflight preserves candidates in their original input client.
         let previous = self.panel.firstResponder();
         let find_focus = self.capture_mode_find_focus();
         #[cfg(feature = "native-markdown-runtime-probe")]
         {
-            // 只记录原捕获的有限选区与真实客户关系，不读取字段值或以诊断结果授权恢复。
-            // 由 capture/restore/verify 三个既有出口区分捕获前变化、当场恢复失败及后继失焦。
+            // Records only the originally captured bounded selection and actual client relationship, without reading field values or granting authority from diagnostics.
+            // Existing capture/restore/verify exits distinguish pre-capture changes, immediate restoration failure, and later focus loss.
             let actual = find_focus.as_ref().and_then(|(field, _)| {
                 field
                     .currentEditor()
@@ -1149,8 +1149,8 @@ impl NativeMarkdownWindowSurface {
         if let Some(editor) = &mut self.editor
             && let Err(error) = editor.set_presentation_mode(mode, &self.controller)
         {
-            // 接纳前的拒绝保留旧模式；接纳后的 Native 重入可能撤销位置恢复，
-            // 但已退休的 Producer 不能回滚。始终读取真实正文模式，避免按钮与正文失配。
+            // Pre-admission rejection preserves the old mode; native reentry after acceptance may revoke position restoration,
+            // but a retired Producer cannot be rolled back. Reads the actual document mode to keep buttons and content consistent.
             if let Some(editor) = &self.editor {
                 self.presentation_mode = editor.presentation_mode();
             }
@@ -1160,7 +1160,7 @@ impl NativeMarkdownWindowSurface {
                 && let Some(editor) = &self.editor
                 && let Err(mount) = editor.finish_mode_viewport_mount(&self.controller)
             {
-                // 模式可能已接纳后被 Native 输入撤位；仍结束原未绑定票，不留下永远等待的空正文。
+                // Native input may revoke positioning after mode acceptance; still finalizes the original unbound intent rather than leaving an indefinitely pending document.
                 return Err(format!("{error}；{mount}"));
             }
             if let Some((field, range)) = find_focus {
@@ -1173,7 +1173,7 @@ impl NativeMarkdownWindowSurface {
             }
             return Err(error);
         }
-        // 未打开文稿时只改变下一次打开默认值；当前文稿则必须已经真实接纳目标模式。
+        // Without a document, changes only the next-open default; an existing document must have actually accepted the target mode.
         self.presentation_mode = self
             .editor
             .as_ref()
@@ -1181,8 +1181,8 @@ impl NativeMarkdownWindowSurface {
         self.controller
             .select_presentation_mode(self.presentation_mode);
         if let Some(editor) = &self.editor {
-            // 正文、scroll、Find 栏和字段客户都是原实例；只重算 ruler 显隐后的实际区域。
-            // 重复 addSubview 或重绑 Find 会额外改变层级和字段焦点，不属于模式动作。
+            // Document, scroll, Find bar, and field clients remain the same instances; recomputes only geometry affected by ruler visibility.
+            // Repeated addSubview or Find rebinding would alter hierarchy and focus beyond this mode action.
             self.controller
                 .layout_document_area(NativeMarkdownHeaderAuthority::Foreground);
             self.panel
@@ -1194,8 +1194,8 @@ impl NativeMarkdownWindowSurface {
             } else {
                 Err("展示模式已切换，但正文暂时无法获得键盘焦点".into())
             };
-            // 焦点失败也必须交还本次挂载义务；否则已提交模式会永远停在 controller=None。
-            // 位置只使用原锚点；绑定失败在 Body 内撤同一票并恢复当前模式的普通排版。
+            // Focus failure must still discharge mounting, otherwise an accepted mode would remain at controller=None indefinitely.
+            // Position uses only the original anchor; Body revokes that same intent on binding failure and resumes ordinary layout for the current mode.
             let mounted = editor.finish_mode_viewport_mount(&self.controller);
             match (focus, mounted) {
                 (Err(focus), Err(mount)) => return Err(format!("{focus}；{mount}")),
@@ -1206,7 +1206,7 @@ impl NativeMarkdownWindowSurface {
         Ok(())
     }
 
-    /// 模式动作只保原实际Find客户和有限NSRange；不把共享field editor地址当作查询/替换身份。
+    /// Mode actions retain only the original actual Find client and bounded NSRange; a shared field-editor address cannot identify query versus replacement.
     fn capture_mode_find_focus(&self) -> Option<(Retained<NSTextField>, Option<NSRange>)> {
         let bar = self
             .editor
@@ -1222,7 +1222,7 @@ impl NativeMarkdownWindowSurface {
                 std::ptr::eq::<objc2_app_kit::NSText>(&**actual, responder.as_super())
             }) {
                 let input = ProtocolObject::<dyn NSTextInputClient>::from_ref(&*responder);
-                // 组合候选由下面真实辞任完成；它的内部选择不能作为普通已提交查询选区强行恢复。
+                // Actual resignation below completes composition; its internal selection cannot be restored as an ordinary committed query selection.
                 let selected = (!input.hasMarkedText()).then(|| responder.selectedRange());
                 return Some((
                     field,
@@ -1233,13 +1233,13 @@ impl NativeMarkdownWindowSurface {
         None
     }
 
-    /// 同一原字段重新获得真实Native客户后恢复其选择，不重建控件或复制查询文字/Undo。
+    /// Restores selection after the same field reacquires its actual native client, without reconstructing controls or copying query text/Undo.
     fn restore_mode_find_focus(
         &self,
         field: &NSTextField,
         selected: Option<NSRange>,
     ) -> Result<(), String> {
-        // SAFETY: 模式交接仍持唯一窗口owner，field来自该笔记原Find栏，并未清理或换目标。
+        // SAFETY: Mode handoff retains the sole window owner; field belongs to this note's original Find bar and was neither cleaned nor replaced.
         unsafe {
             field.selectText(None);
         }
@@ -1248,7 +1248,7 @@ impl NativeMarkdownWindowSurface {
             .and_then(|editor| editor.downcast::<NSTextView>().ok())
             .ok_or("展示模式已切换，但原查找字段未恢复输入")?;
         if let Some(selected) = selected {
-            let length = editor.string().length(); // 只借Native字段长度，不物化第二份查询或正文。
+            let length = editor.string().length(); // Reads native field length only, without materializing another query or document copy.
             if selected
                 .location
                 .checked_add(selected.length)
@@ -1260,7 +1260,7 @@ impl NativeMarkdownWindowSurface {
         }
         #[cfg(feature = "native-markdown-runtime-probe")]
         {
-            // 公开 setter 的返回不是焦点或选区收据；这里只观察恢复当场的标量，不补设焦点或重试。
+            // A public setter return is not a focus/selection receipt; observes immediate restoration scalars without forcing focus or retrying.
             let responder_same = self.panel.firstResponder().is_some_and(|responder| {
                 std::ptr::from_ref(&*responder).addr() == std::ptr::from_ref(&*editor).addr()
             });
@@ -1288,13 +1288,13 @@ impl NativeMarkdownWindowSurface {
         Ok(())
     }
 
-    /// 正常辞任所有实际客户端；没有正文的工作区也可能正在搜索字段中组合输入。
+    /// Normally resigns all actual clients; even a workspace without a document may have composition in its search field.
     pub(super) fn resign_editor_responder(&self) -> Result<(), String> {
         self.controller.ivars().undo.preflight()?;
         let borrowed = self.controller.ivars().borrowed.borrow().clone();
         borrowed.capture(&self.panel)?;
         if let Some(editor) = &self.editor {
-            // Find/表格旧身份先登记，不能依赖辞任后仍能从窗口查到同一客户端。
+            // Records original Find/table clients first rather than assuming the window can still identify them after resignation.
             editor.capture_find_resources()?;
         }
         let generation_before = self
@@ -1303,7 +1303,7 @@ impl NativeMarkdownWindowSurface {
             .map(|editor| editor.document().borrow().generation());
         let previous = self.panel.firstResponder();
         if !self.panel.makeFirstResponder(None) {
-            // 原生验证拒绝时不进行 accepted 清理，原始字段、草稿与焦点继续有效。
+            // Native validation refusal performs no accepted cleanup, preserving original fields, drafts, and focus.
             return Err("笔记输入尚未结束，请完成输入后重试".into());
         }
         let result = (|| {
@@ -1316,7 +1316,7 @@ impl NativeMarkdownWindowSurface {
                         std::ptr::from_ref(&*self.panel).cast::<()>(),
                     )
             }) {
-                // 名义成功仍不能留下原字段或正文作为实际输入 target。
+                // Nominal success must still leave neither the original field nor document as the actual input target.
                 return Err("上一笔记的输入仍未结束".to_owned());
             }
             if self
@@ -1325,12 +1325,12 @@ impl NativeMarkdownWindowSurface {
                 .map(|editor| editor.document().borrow().generation())
                 != generation_before
             {
-                // 辞任期间出现新的 canonical 修改，必须保留该草稿再显式保存。
+                // A canonical edit during resignation must remain as a draft for explicit saving.
                 return Err("结束输入时正文发生变更，草稿将保持打开以供保存".to_owned());
             }
             borrowed.capture(&self.panel)?;
             borrowed.preflight_unmarked()?;
-            // 辞任可触发原生 Undo 提供栈；仍未接受关闭时以 Busy 拒绝而不冻结/清历史。
+            // Resignation may reenter native Undo provision; before close acceptance, Busy rejects without freezing or clearing history.
             self.controller.ivars().undo.preflight()?;
             if let Some(editor) = &self.editor {
                 editor.capture_find_resources()?;
@@ -1341,7 +1341,7 @@ impl NativeMarkdownWindowSurface {
             if let Some(previous) = previous
                 && !self.panel.makeFirstResponder(Some(&previous))
             {
-                // 失败恢复也如实返回，不把失焦当成成功关闭或清空权限。
+                // Reports restoration failure honestly; focus loss is neither successful closure nor permission to clear input.
                 return Err(format!("{error}；无法恢复原输入焦点"));
             }
             return Err(error);
@@ -1350,7 +1350,7 @@ impl NativeMarkdownWindowSurface {
         Ok(())
     }
 
-    /// 通过预检并接受交接后，结束共享编辑器；不在此提交新正文或重新保存。
+    /// Finishes shared editing after preflight and handoff acceptance, without committing new document text or saving again.
     fn finish_borrowed_editing(
         &mut self,
         close_window: bool,
@@ -1364,7 +1364,7 @@ impl NativeMarkdownWindowSurface {
             .borrowed
             .replace(NativeMarkdownBorrowedEditorSnapshot::default());
         let mut fields: Vec<Retained<NSTextField>> = if close_window {
-            // 窗口结束才清除查询字段；跨笔记保留窗口级查询值。
+            // Clears query fields only on window closure; note switches preserve window-level query values.
             self.controller
                 .ivars()
                 .workspace_controls
@@ -1377,12 +1377,12 @@ impl NativeMarkdownWindowSurface {
             Vec::new()
         };
         if let Some(editor) = &self.editor {
-            // 单元格和 Find 属于即将结束的编辑客户端，不把它们留在下一笔记的共享缓存内。
+            // Cell and Find fields are retiring clients and must not leave business data in the next note's shared cache.
             let find = editor.find_resources().borrow().clone();
             fields.extend(find.fields());
         }
         let field_refs: Vec<_> = fields.iter().map(|field| &**field).collect();
-        // 正式结束客户端前先封闭 provider，清理重入不能分配新的 field editor。
+        // Freezes the provider before accepted client completion so cleanup reentry cannot allocate another field editor.
         self.controller.ivars().field_editor_provider.freeze();
         let released_field_editor = borrowed.finish_accepted(
             &self.panel,
@@ -1396,7 +1396,7 @@ impl NativeMarkdownWindowSurface {
             let mut find = editor
                 .find_resources()
                 .replace(NativeMarkdownFindResources::default());
-            // 原生清空可能重入，不能持 editor RefMut；完成后恢复仅弱元数据收据。
+            // Native clearing may reenter, so no editor RefMut spans it; restores only weak metadata receipts afterward.
             find.finish_accepted();
             *editor.find_resources().borrow_mut() = find;
             let container =
@@ -1482,7 +1482,7 @@ impl NativeMarkdownWindowSurface {
         relative_path: &str,
         fragment: Option<String>,
     ) -> Result<bool, String> {
-        // 即便选择相同笔记也不能抢走当前modal的responder。
+        // Even selecting the same note cannot take the active modal's responder.
         self.preflight_modal_boundary()?;
         // Sidebar pages are bounded discovery views, not an authorization registry. Imported/new
         // notes may be outside the current page; open_note_editor revalidates their confined path
@@ -1624,9 +1624,9 @@ impl NativeMarkdownWindowSurface {
         &mut self,
         mutation: NativeMarkdownFileMutation,
     ) -> Result<(), String> {
-        // 先于modal/IME/save/release任何Native阶段固定，只作反馈权限，不阻止必要操作补偿。
+        // Fixes feedback authority before native modal/IME/save/release work; revocation does not block necessary operation compensation.
         let feedback_intent = self.controller.workspace_query_intent();
-        // modal的确认/候选/局部资源未结束前，拒绝任何文件语义或正文效果。
+        // Rejects file and document effects while modal response, candidate, or local resources remain unfinished.
         self.preflight_modal_boundary()?;
         if native_markdown_operation_is_busy(
             self.pending_note_switch.is_some(),
@@ -1671,14 +1671,14 @@ impl NativeMarkdownWindowSurface {
             // The old mapping must be gone before path mutation can invalidate its authority.
             self.destroy_current_editor()?
         } else {
-            // 父正文继续使用同一owner，但已结束modal的默认nil角色仍须经过实际事件。
+            // The parent document keeps the same owner, but the finished modal's default nil role still requires actual event completion.
             Some(NativeMarkdownEditorReleaseBarrier::for_modal_roles(
                 self.owned_ledger.snapshot_modal(),
                 self.panel.mtm(),
             ))
         };
         if self.workspace_refresh_intent_is_current(feedback_intent) {
-            // 真实didChange或内部save合法推进代次时都保守不清，不能末尾领取current覆盖新反馈。
+            // Actual didChange or internal save may legitimately advance the epoch; conservatively preserves feedback instead of recapturing current at the end.
             self.controller.clear_status();
         }
         self.pending_file_mutation = Some(PendingNativeMarkdownFileMutation {
@@ -1692,7 +1692,7 @@ impl NativeMarkdownWindowSurface {
         Ok(())
     }
 
-    /// 完成严格释放后执行一次操作；失败可能已发布，恢复只使用旧authority而不推断磁盘未变。
+    /// Executes once after strict release; failure may follow publication, so compensation uses original authority without assuming unchanged disk.
     pub(super) fn finish_file_mutation(
         &mut self,
         mtm: MainThreadMarker,
@@ -1706,14 +1706,14 @@ impl NativeMarkdownWindowSurface {
             && let Err(error) = release_barrier.verify_released()
         {
             if pending_mutation.editor_was_released && self.editor.is_none() {
-                // 只有旧正文确实释放才展示空状态；modal-only失败保留同一正文、path/title与选择。
+                // Shows empty state only after actual old-document release; modal-only failure preserves the document, path/title, and selection.
                 let content_view = self
                     .panel
                     .contentView()
                     .ok_or_else(|| "原生 Markdown 窗口没有内容视图".to_owned())?;
                 self.show_empty_state(&content_view, "文件操作暂时不可用", mtm);
             }
-            // 保留同一pending与首个失败，caller只展示错误；不重试、不清仍活正文或触碰文件authority。
+            // Retains the same pending operation and primary failure for feedback, without retry, clearing a live document, or touching file authority.
             return Err(error);
         }
 
@@ -1722,7 +1722,7 @@ impl NativeMarkdownWindowSurface {
             .pending_file_mutation
             .take()
             .expect("native Markdown file mutation was checked immediately above");
-        // modal-only barrier存在也不授权重建/恢复仍然活着的正文。
+        // A modal-only barrier grants no authority to reconstruct or restore a document that is still alive.
         let editor_was_released = pending_mutation.editor_was_released;
         let mutation_result = execute_native_markdown_file_mutation(
             &self.session,
@@ -1737,7 +1737,7 @@ impl NativeMarkdownWindowSurface {
                 if editor_was_released
                     && let Some(previous_path) = pending_mutation.active_relative_path_before
                 {
-                    // 仅尝试原path并重新核磁盘；没有body镜像，也不假定失败操作未发生变化。
+                    // Attempts only the original path with fresh disk validation, without a document mirror or an assumption that failure changed nothing.
                     return match self.install_note_from_authority_with_feedback(
                         &previous_path,
                         mtm,
@@ -1745,7 +1745,7 @@ impl NativeMarkdownWindowSurface {
                     ) {
                         // Recovery succeeded, so report the mutation error with the original note usable.
                         Ok(()) => Err(mutation_error),
-                        // Err可能发生在真实发布/部分变化之后；旧path不能恢复时让用户检查实际目录。
+                        // Err may follow actual publication or partial changes; if the old path cannot reopen, directs the user to the actual directory.
                         Err(recovery_error) => {
                             let expected_intent = *feedback_intent;
                             *feedback_intent = None;
@@ -1753,8 +1753,8 @@ impl NativeMarkdownWindowSurface {
                                 "{mutation_error}；文件操作可能已更改磁盘，持久化状态未确认；原笔记恢复未确认：{recovery_error}；请从目录重新选择笔记并核对当前文件状态"
                             );
                             if let Some(intent) = expected_intent {
-                                // 任何Native重入的新输入/关闭都撤销本次旧错误对界面和刷新权限。
-                                // 先固定仍可报告的原代次；准备失败也必须携带原mutation首因。
+                                // Any native reentry delivering new input or closure revokes this old error's UI and refresh authority.
+                                // Fixes the still-reportable original epoch first; preparation failure also retains the primary mutation error.
                                 *feedback_intent = Some(intent);
                                 let prepared = match self.prepare_failed_mutation_reselection(mtm) {
                                     Ok(prepared) => prepared,
@@ -1771,7 +1771,7 @@ impl NativeMarkdownWindowSurface {
                                         feedback_intent,
                                     );
                                     if let Err(refresh_error) = refresh {
-                                        // 不重放文件操作；目录重读失败只作为第二事实附在原首因之后。
+                                        // Never replays the file operation; directory reread failure is a secondary fact attached to the primary error.
                                         return Err(format!(
                                             "{error}；目录重新读取失败：{refresh_error}"
                                         ));
@@ -1787,28 +1787,28 @@ impl NativeMarkdownWindowSurface {
             }
         };
 
-        // 磁盘操作已真正成功；先消费同一目录收据，再刷新有限投影，失败绝不预选或回滚猜测。
+        // After actual disk success, consumes the same directory receipt before refreshing bounded projections; failure never guesses selection or rollback.
         self.sidebar_list
             .apply_directory_mutation(&pending_mutation.mutation, &mutation_result);
         let mut fresh_sidebar = false;
         let refresh_result = if let Some(intent) = *feedback_intent
             && self.workspace_refresh_intent_is_current(intent)
         {
-            // 创建已经由 Core 收据确认，且仍属于原目录动作；只展开新项真实祖先，
-            // 让折叠目录中的新笔记可见，不改动无关目录或重领后来查询的反馈权限。
+            // Core confirms creation under the original directory action; expands only the new item's actual ancestors,
+            // making it visible in collapsed directories without changing unrelated folders or acquiring newer query-feedback authority.
             match &mutation_result {
                 NativeMarkdownFileMutationResult::NoteCreated(path)
                 | NativeMarkdownFileMutationResult::DirectoryCreated(path) => {
                     for parent in Path::new(path).ancestors().skip(1) {
-                        // Core 已验证路径为 UTF-8；根的空路径没有折叠标记，删除自然为空操作。
+                        // Core validated UTF-8 paths; the empty root path has no collapsed marker, so removing it is naturally a no-op.
                         self.collapsed_directories
                             .remove(parent.to_str().expect("Core 创建收据的目录必须是 UTF-8"));
                     }
                 }
-                // 重命名、移动和删除保持用户现有折叠状态；不把所有文件操作都当成新建。
+                // Rename, move, and delete preserve existing collapsed state rather than treating every operation as creation.
                 _ => {}
             }
-            // 只能延续begin保存的原ticket；Weak/barrier重入B后不可领取B再cancel它。
+            // Continues only begin's original intent; Weak/barrier reentry into newer input cannot authorize cancelling that input.
             let result = self.refresh_workspace_sidebar_with_policy(
                 mtm,
                 intent,
@@ -1820,7 +1820,7 @@ impl NativeMarkdownWindowSurface {
                     .is_some_and(|intent| self.workspace_refresh_intent_is_current(intent));
             result
         } else {
-            // 旧业务刷新被撤销，但真实receipt/editor补偿仍必须完成；旧notes不是新目录证据。
+            // Revoked business refresh does not cancel actual receipt/editor compensation; old notes do not prove the new directory state.
             *feedback_intent = None;
             Ok(())
         };
@@ -1857,7 +1857,7 @@ impl NativeMarkdownWindowSurface {
                     pending_mutation.mutation,
                     NativeMarkdownFileMutation::RenameDirectory { .. }
                 ) {
-                    // 成功的笔记身份变化采用新父目录；目录重命名已经按真实收据保留选中后代。
+                    // Successful note identity changes use the new parent; directory rename already preserved selected descendants from its actual receipt.
                     self.sidebar_list
                         .select_directory(&native_markdown_note_parent(&relative_path));
                 }
@@ -1873,13 +1873,13 @@ impl NativeMarkdownWindowSurface {
                     .contentView()
                     .ok_or_else(|| "原生 Markdown 窗口没有内容视图".to_owned())?;
                 let message = if fresh_sidebar && self.sidebar_scan_pending {
-                    // 新目录仍在有界worker扫描，不能把尚未完成的页误称空库。
+                    // The new directory is still scanning in a bounded worker; an incomplete page cannot be called an empty vault.
                     "操作已完成，正在读取笔记目录…"
                 } else if fresh_sidebar {
-                    // 完整页没有可打开笔记时，仍沿正常目录状态等待后续用户选择。
+                    // A complete page without an openable note remains in normal directory state awaiting explicit user selection.
                     "请选择笔记，或继续查看更多笔记"
                 } else {
-                    // 跳过旧刷新不能宣称库为空，保留新查询/用户重选的正常入口。
+                    // Skipping an old refresh cannot imply an empty vault; preserves normal new-query and reselection entry points.
                     "操作已完成，请重新选择笔记"
                 };
                 self.show_empty_state(&content_view, message, mtm);
@@ -1894,13 +1894,13 @@ impl NativeMarkdownWindowSurface {
             return Err(format!("文件操作已完成，但侧栏刷新失败：{refresh_error}"));
         }
         if feedback_intent.is_some_and(|intent| self.workspace_refresh_intent_is_current(intent)) {
-            // 必要正文补偿不授予旧操作清理新B反馈的权限。
+            // Necessary document compensation does not authorize the old operation to clear newer input feedback.
             self.controller.clear_status();
         }
         Ok(())
     }
 
-    /// 文件操作从最早入口透传反馈ticket，构造/挂载过程不更新它。
+    /// File operations carry the original feedback intent from the earliest entry without renewing it during construction or mounting.
     fn install_note_from_authority_with_feedback(
         &mut self,
         relative_path: &str,
@@ -1932,18 +1932,18 @@ impl NativeMarkdownWindowSurface {
             // An empty surface has no unsaved canonical document or selection to persist.
             return Ok(());
         };
-        // settled选择已由真实Native selection回调同步；保存不能把反向head再次展平为升序NSRange。
+        // Actual native selection callbacks already settled selection; save must not flatten a reversed head into an ascending NSRange.
         let mut document = editor.document().borrow_mut();
-        // 先完成真实保存并结束document可变借用；查询控件清理/重提绝不能跨正文借用。
+        // Completes actual save and releases the mutable document borrow before query-control cleanup or resubmission.
         let was_dirty = document.is_dirty();
         let saved = self.session.save_document_buffer(&mut document).map(|_| ());
         let footer = NativeMarkdownFooterDocument::capture(&document);
         drop(document);
-        // 保存实际结果先按typed原因投影；Native setter不跨canonical可变借用。
+        // Projects the actual typed save result with no canonical mutable borrow spanning native setters.
         self.controller
             .finish_footer_save(footer, saved.as_ref().err());
         if saved.is_ok() {
-            // 真正保存成功后才重读磁盘修改时间；不以失败写入或未确认sync冒充新元数据。
+            // Rereads disk modification time only after actual save success; failed writes or unconfirmed sync do not establish new metadata.
             self.controller.refresh_saved_information(editor.document());
         }
         let saved = saved.map_err(|error| error.to_string());
@@ -1953,18 +1953,18 @@ impl NativeMarkdownWindowSurface {
             .zip(self.search_authority.as_ref())
             .is_some_and(|(query, authority)| !authority.is_current(&self.session, query));
         if self.search_query.is_some() && ((saved.is_ok() && was_dirty) || revoked_page) {
-            // 真正发布后的旧页和queued结果失效；no-op保存不重复查询，失败仍保留原保存首因。
+            // Actual publication revokes old pages and queued results; no-op saves do not repeat search, and failure preserves the primary save error.
             if let Err(error) = self.refresh_search_after_save(saved.is_ok())
                 && saved.is_ok()
             {
-                // 搜索重提失败不谎报正文保存失败；原保存失败仍由调用者显示其首因。
+                // Search resubmission failure does not relabel a successful save; callers still report the primary error for actual save failure.
                 self.controller.present_error(&error);
             }
         }
         saved
     }
 
-    /// 同一原组合提交边界区分关闭与保存/模式交接；只有关闭可撤尚未发布的纯显示动作。
+    /// The same original composition boundary distinguishes close from save/mode handoff; only close revokes unpublished presentation work.
     pub(super) fn commit_marked_text(&self, closing: bool) -> Result<(), String> {
         self.controller.ivars().undo.preflight()?;
         let borrowed = self.controller.ivars().borrowed.borrow().clone();
@@ -1978,7 +1978,7 @@ impl NativeMarkdownWindowSurface {
         Ok(())
     }
 
-    /// 显式复制先有界准备独立输出，结束canonical借用后再交付可能重入的系统剪贴板。
+    /// Explicit copy prepares bounded independent output first, releases the canonical borrow, then delivers to the reentrant system pasteboard.
     pub(super) fn copy_current_document_to_pasteboard(
         &self,
         pasteboard: &NSPasteboard,
@@ -1999,14 +1999,14 @@ impl NativeMarkdownWindowSurface {
             .as_ref()
             .ok_or_else(|| "当前没有可复制的 Markdown 笔记".to_owned())?;
         let output = {
-            // 此阶段只有原Core读取和文件操作；固定scratch不生成全文String或NSString。
+            // This phase performs original Core reads/file operations only; fixed scratch never creates a whole-document String or NSString.
             let document = editor
                 .document()
                 .try_borrow()
                 .map_err(|_| "Markdown 正文仍在完成本次编辑".to_owned())?;
             MarkdownPasteboardOutput::prepare(&document).map_err(|error| error.to_string())?
         };
-        // Ref已归还且输出不含Doc/Core/FD；Native持有输出不会延长插件或原映射的生命。
+        // The borrow is released and output holds no document/Core/FD; native output ownership does not extend plugin or original mapping lifetime.
         output
             .publish(pasteboard)
             .map_err(|error| error.to_string())
@@ -2016,7 +2016,7 @@ impl NativeMarkdownWindowSurface {
     pub(super) fn prepare_to_close(&mut self) {
         self.controller.set_workspace_input_enabled(false);
         let (borrowed, _) = self.finish_borrowed_editing(true);
-        // 自有 field editor 已登记窗口账本；即使无正文，最终窗口收据也要求其实际 nil。
+        // The owned field editor is recorded in the window ledger; even without a document, final window receipts require its actual nil state.
         self.borrowed_close = Some(borrowed);
         // Cancel scanning and join the foreground worker before releasing its session.
         self.stop_search();
@@ -2035,7 +2035,7 @@ impl NativeMarkdownWindowSurface {
 
     /// Break the remaining delegate/content edges after the native close callback has completed.
     pub(super) fn release_native_ownership(&self) {
-        // 标签没有回调或Doc；先清真实路径值/悬停，再由原content拆图与surface释放唯一strong。
+        // Labels hold no callback or document; clears actual paths/tooltips before content teardown and surface release drop sole strong ownership.
         self.note_path.setStringValue(ns_string!(""));
         self.note_path.setToolTip(None);
         // This follows windowWillClose, so removing the delegate can no longer lose its close signal.
@@ -2046,7 +2046,7 @@ impl NativeMarkdownWindowSurface {
 
 /// Computes the current editor area after reserving header and sidebar layout space.
 pub(super) fn native_markdown_editor_base_frame(size: NSSize) -> NSRect {
-    // 正式Window真实拥有这三块chrome；独立Find embedding不调用本函数。
+    // The production window owns these three chrome elements; standalone Find embedding does not call this function.
     NSRect::new(
         NSPoint::new(
             NATIVE_MARKDOWN_SIDEBAR_WIDTH + 1.0,
@@ -2095,7 +2095,7 @@ pub(super) fn native_markdown_empty_label(
     label
 }
 
-/// 打开选中笔记并建立唯一分页正文；参考 TextKit 图只由独立夹具显式构造。
+/// Opens the selected note into the sole paginated document; only isolated fixtures explicitly construct reference TextKit graphs.
 pub(super) fn native_markdown_editor_surface(
     document: MarkdownDocumentBuffer,
     frame: NSRect,
@@ -2119,10 +2119,10 @@ pub(super) fn native_markdown_editor_surface(
     Ok(editor)
 }
 
-/// 只改变单行显示方式；不截断NSString值，也不重写恢复提示的tooltip。
+/// Changes single-line presentation only; does not truncate NSString values or rewrite restoration-feedback tooltips.
 fn configure_native_markdown_header_text(field: &NSTextField) {
     if let Some(cell) = field.cell() {
-        // 标题和状态为已有标准cell；换行关闭后长文字用省略号适配实际frame。
+        // Existing standard title/status cells disable wrapping and use ellipsis to fit their actual frames.
         cell.setUsesSingleLineMode(true);
         cell.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
     }

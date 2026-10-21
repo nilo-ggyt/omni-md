@@ -1,8 +1,12 @@
-//! 一个真实全局定义的有限解析事务；不持文档/root强引用，不创建全文引用目录。
+//! A bounded parsing transaction for one actual global definition. Retain no
+//! strong document/root owner and build no document-wide reference directory.
 //!
-//! 调用者只可将同一source identity驱动的global producer事实交到这里，并按源顺序处理。
-//! 本模块再次核弱root/代次，但opaque事实没有跨文档root品牌，不能自行证明错误配对的事实。
-//! 任何Err都须令外层全局请求失败；不得跳过它去采用后继同名定义或把未知声明为Missing。
+//! The caller must supply facts from the global producer driven by this same
+//! Source identity, in source order. This module rechecks weak root/generation,
+//! but the opaque fact has no cross-document root brand and cannot itself prove
+//! that a caller paired it with the correct document. Every Err must fail the
+//! outer global request: never skip it to use a later same-name definition or
+//! declare an unresolved value Missing.
 
 use super::{MarkdownDocumentBuffer, table_source::MarkdownTableSourceIdentity};
 use crate::markdown_viewport_presentation::table_window::{
@@ -18,14 +22,16 @@ use pulldown_cmark::{
 };
 use std::ops::Range;
 
-// 同一来源 owner 为控制/释放保留少量额度；真实 scanner 仍在下面核足 2048 的可用工作。
+// Reserve control/cleanup work for the same Source owner. The actual Scanner
+// still requires at least 2048 available work units after those reservations.
 const MIN_STEP: usize = 3 * 1_024;
 const MAX_STEP: usize = 64 * 1_024;
 const STATE_WORK: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-/// source/copy/结构工作分别报告。normalizer与Parser是有限whole-slice oracle，输入单独计量；
-/// 不把它们内部的AST/Unicode转换伪称为这里已经逐token计数的转换fuel。
+/// Report source, copy and structural work separately. The normalizer and Parser
+/// are bounded whole-slice oracles whose input sizes are accounted independently;
+/// their internal AST/Unicode work is not claimed as token-counted fuel here.
 pub(super) struct ReferenceWork {
     pub source_bytes: usize,
     pub copied_bytes: usize,
@@ -44,6 +50,9 @@ pub(super) struct ReferenceStep {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
+    // Label matching finishes before the definition payload is admitted. Each
+    // phase is resumed by the original request instead of synchronously scanning
+    // a deep continuation scope or copying an unrelated URL/title in one step.
     CopyLabel,
     ScanLabel,
     ProbeLabel,
@@ -57,7 +66,8 @@ enum Phase {
 }
 
 #[derive(Clone, Copy, Debug)]
-/// 只保一个真实续行位置及已验证skip；不保行正文或flatten的深容器角色。
+/// Retain one actual continuation-line position and verified prefix skip, without
+/// keeping line text or flattening the deep container scope into another role list.
 struct PrefixRecord {
     at: usize,
     bytes: usize,
@@ -77,7 +87,8 @@ impl Buffer {
             .checked_sub(range.start)
             .ok_or(Error::InvalidSource)?;
         if len == 0 || len > maximum {
-            // 先核完整范围再预留；截断标签/URL不能获得原规范化器的虚拟EOF权限。
+            // Admit the full range before reserving. A truncated label or URL
+            // cannot receive the original normalizer's complete-input EOF semantics.
             return Err(Error::ReferenceLimit);
         }
         Ok(Self {
@@ -105,7 +116,8 @@ pub(super) struct Request {
 
 impl std::fmt::Debug for Request {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 默认诊断只有状态/有限容量，不打印标签、URL、title或个人源字节。
+        // Default diagnostics expose state and bounded capacities only, never a
+        // label, URL, title, or personal source bytes.
         formatter
             .debug_struct("ReferenceRequest")
             .field("source", &self.source)
@@ -127,7 +139,8 @@ impl std::fmt::Debug for Request {
 }
 
 impl Request {
-    /// ASCII计数不可能命中时零正文复制。possible-match范围超限是未完成错误，不能当作miss。
+    /// Copy no text when ASCII counts rule out a match. A possible-match range
+    /// exceeding its allowance is unresolved failure, not a confirmed miss.
     pub(super) fn new(
         source: MarkdownTableSourceIdentity,
         fact: VerifiedGlobalReference,
@@ -144,11 +157,12 @@ impl Request {
             || label_end > candidate.span_end
             || candidate.span_end > source.byte_len()
         {
-            // 事实必须来自当前source驱动；即使无关标签，也不接受倒序或另一代次的范围。
+            // The current Source must have driven the fact. Even unrelated labels
+            // cannot admit reversed ranges or facts from another generation.
             return Err(Error::InvalidSource);
         }
         if !queries.may_match_ascii_count(candidate.label_ordinary_ascii) {
-            return Ok(None); // 无关巨URL/title不读取、不分配，也不消耗有限值库存。
+            return Ok(None); // An unrelated giant URL/title needs no read, allocation, or finite value-inventory slot.
         }
         let buffer = Buffer::new(
             candidate.label_start..label_end,
@@ -169,8 +183,9 @@ impl Request {
         }))
     }
 
-    /// 每step只做一个阶段；预算预留源树真实缓存height和固定状态/共享scope收尾成本。
-    /// 取消由外层请求在调用前检查；这里在每次入口（包括Complete）继续核实际root/代次。
+    /// Execute one phase per step, reserving the source tree's cached height and
+    /// fixed state/shared-scope completion cost. The outer request checks cancel
+    /// before calling; every entry here, including Complete, rechecks root/generation.
     pub(super) fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -178,11 +193,12 @@ impl Request {
         budget: usize,
     ) -> Result<ReferenceStep, Error> {
         if let Some(error) = self.failure {
-            return Err(error); // 首错不能被后继短定义或重新交付frame修复。
+            return Err(error); // A later short definition or another frame delivery cannot repair the first failure.
         }
         let result = self.advance_inner(document, queries, budget);
         if let Err(error) = result {
-            // 原库存也撤权，防外层误忽略Err后调用EOF或另一个Request发布部分结果。
+            // Revoke the original query inventory too. Ignoring Err must not let
+            // EOF or another Request publish a partial resolution afterward.
             queries.fail_verified_resolution();
             self.failure = Some(error);
             self.release_payload();
@@ -211,7 +227,7 @@ impl Request {
             .checked_sub(STATE_WORK + tree_work)
             .ok_or(Error::SourceLimit)?;
         if available < 2_048 {
-            return Err(Error::SourceLimit); // 深源树不能挤占prefix scanner的真实最小fuel。
+            return Err(Error::SourceLimit); // A deep source tree cannot consume the prefix Scanner's actual minimum fuel.
         }
         let mut work = ReferenceWork {
             structural_transitions: STATE_WORK,
@@ -230,18 +246,21 @@ impl Request {
             Phase::DecodeDefinition => {
                 let label = self.normalized.as_deref().ok_or(Error::InvalidSource)?;
                 let value = self.stripped.as_deref().ok_or(Error::InvalidSource)?;
-                // 原Parser只接已匹配的≤16KiB完整定义，继续负责entity/escape/title/首定义解码。
-                // parser_input_bytes是独立oracle输入上限，不声称其内部工作逐token服从available。
+                // The original Parser receives only a matched complete definition
+                // of at most 16 KiB, retaining entity/escape/title/first-definition
+                // semantics. parser_input_bytes bounds this independent oracle's
+                // input, not a claim that its internal tokens obey `available`.
                 work.parser_input_bytes = value.len();
                 if queries.admit_verified_definition(label, value)? {
-                    // 原whole-definition oracle的目标分配仍单列其有限输入；本轮新增的是
-                    // 实际Arc<String>固定拥有头，独立报告而不假称整个Parser已经逐token计费。
+                    // Oracle input remains separately bounded. Account for the
+                    // actual Arc<String> ownership header added to the destination
+                    // without pretending the whole Parser is token-metered here.
                     work.metadata_bytes += crate::MarkdownLinkDestination::whole_metadata();
                 }
                 self.release_payload();
                 self.phase = Phase::Complete;
             }
-            Phase::Complete => (), // Ready不恢复旧source或分配已释放载荷。
+            Phase::Complete => (), // Completion does not renew an old Source or recreate released payload.
         }
         debug_assert!(work.source_bytes <= budget);
         debug_assert!(work.structural_transitions + work.source_tree_steps <= budget);
@@ -268,7 +287,9 @@ impl Request {
             };
             return Ok(());
         }
-        // 一次树下降加最多两次UTF8验证/一次复制；frame可切scalar但本buffer始终在scalar边界结束。
+        // Reserve one tree descent, up to two UTF-8 validations and one copy.
+        // Frames may split scalars, but the retained buffer always ends on a
+        // scalar boundary and the next step resumes at that exact source byte.
         let limit = (available / 3).min(buffer.range.end - next);
         let frame = document
             .table_source_frame(next, limit)
@@ -278,14 +299,15 @@ impl Request {
         let text = match std::str::from_utf8(&frame.bytes) {
             Ok(text) => text,
             Err(error) if error.error_len().is_none() && error.valid_up_to() > 0 => {
-                // 仅丢回frame尾≤3byte未完成scalar，下step从同源精确位置重借；不替换或丢源字节。
+                // Defer only the incomplete scalar's at-most-three trailing bytes.
+                // Reborrow at the exact position next step; never replace/drop bytes.
                 std::str::from_utf8(&frame.bytes[..error.valid_up_to()])
                     .map_err(|_| Error::InvalidSource)?
             }
             Err(_) => return Err(Error::InvalidSource),
         };
         if text.is_empty() {
-            return Err(Error::InvalidSource); // 非空范围没有进展不能忙循环。
+            return Err(Error::InvalidSource); // A nonempty range without progress must not enter a busy loop.
         }
         work.structural_transitions += frame.bytes.len() * 3;
         work.copied_bytes = text.len();
@@ -310,7 +332,8 @@ impl Request {
             used += 2;
             work.metadata_bytes += width;
             if matches!(byte, b'\r' | b'\n') && buffer.scan_at < bytes.len() {
-                // 这里只识别真实行锚点；容器/空白规则仍交给opaque事实携带的原prefix scanner。
+                // Identify only the actual next-line anchor. The original prefix
+                // Scanner carried by the opaque fact owns container/whitespace rules.
                 self.pending_line = Some(buffer.range.start + buffer.scan_at);
                 self.phase = if self.phase == Phase::ScanLabel {
                     Phase::ProbeLabel
@@ -353,7 +376,7 @@ impl Request {
                     .prefix_scanner(line, purpose)
                     .map_err(|_| Error::ParserMismatch)?,
             );
-            return Ok(()); // 固定游标建立与实际源读取分step，不能隐藏deep scope展开。
+            return Ok(()); // Separate cursor creation from source reads; deep-scope expansion cannot hide inside that setup.
         }
         let probe = self.probe.as_mut().ok_or(Error::InvalidSource)?;
         let workspace_before = probe.allocated_workspace_bytes();
@@ -376,7 +399,8 @@ impl Request {
                 available,
             )
             .map_err(|_| Error::ParserMismatch);
-        // 回收成功后才消费step，不能让原parser提前终止遮住真实映射错误。
+        // Consume the result only after returning the actual frame. Early Parser
+        // completion must not conceal a mapping/reclaim failure.
         frame.finish().map_err(|_| Error::InvalidSource)?;
         let step = step?;
         let allocated = probe.allocated_workspace_bytes() - workspace_before;
@@ -402,7 +426,8 @@ impl Request {
                 return Err(Error::ParserMismatch);
             }
             if buffer.prefixes.len() == buffer.prefixes.capacity() {
-                // 每条真实续行只增加一个记录槽；不为一个换行预分配整段raw字节数个记录。
+                // Grow by one record per actual continuation line, not one slot
+                // per raw byte merely because a line break was encountered.
                 let before = buffer.prefixes.capacity();
                 buffer.prefixes.reserve_exact(1);
                 let allocated =
@@ -433,7 +458,9 @@ impl Request {
             .as_ref()
             .ok_or(Error::InvalidSource)?
             .normalized_label(&buffer.text, |after_eol| {
-                // 原normalizer传入同一raw的suffix，只查已完成map；绝不在这里同步遍历深scope×全部续行。
+                // The normalizer supplies a suffix of this same raw buffer. Query
+                // only the completed prefix map instead of synchronously traversing
+                // deep scope again for every continuation line.
                 let relative = buffer.text.len().checked_sub(after_eol.len())?;
                 let at = buffer.range.start.checked_add(relative)?;
                 let index = buffer
@@ -446,11 +473,12 @@ impl Request {
         if !queries.needs_definition(&normalized)? {
             self.release_payload();
             self.phase = Phase::Complete;
-            return Ok(()); // 无关/已解析定义到此停止，不读URL或title。
+            return Ok(()); // An unrelated/already-resolved label stops here without reading its URL or title.
         }
         let normalized = normalized.into_string();
         let candidate = *self.fact.as_ref().ok_or(Error::InvalidSource)?.candidate();
-        // 命中后才核并分配完整候选；过大的第一定义不可跳过后改采用短定义。
+        // Admit/allocate the complete definition only after a label match. An
+        // oversized first definition cannot be skipped in favor of a later short one.
         let value_len = candidate
             .span_end
             .checked_sub(candidate.span_start)
@@ -458,7 +486,7 @@ impl Request {
         if value_len > TABLE_WINDOW_MAX_REFERENCE_BYTES {
             return Err(Error::ReferenceLimit);
         }
-        self.buffer = None; // 先drop旧label/raw/prefix容量，阶段切换不叠两个完整source buffer。
+        self.buffer = None; // Drop label/raw/prefix capacity before allocating the next complete source buffer.
         self.buffer = Some(Buffer::new(
             candidate.span_start..candidate.span_end,
             TABLE_WINDOW_MAX_REFERENCE_BYTES,
@@ -478,7 +506,8 @@ impl Request {
             if let Some(record) = buffer.prefixes.get(self.strip_record)
                 && record.at == buffer.range.start + self.strip_at
             {
-                // 只删除实际ContainerOnly证明的前缀，额外indent留给原Parser处理label/title语义。
+                // Remove only prefixes proved by ContainerOnly. Leave additional
+                // indentation to the original Parser's label/title semantics.
                 self.strip_at += record.bytes;
                 self.strip_record += 1;
                 used += 1;
@@ -490,11 +519,11 @@ impl Request {
                 .map_or(buffer.text.len(), |record| record.at - buffer.range.start);
             let mut end = (self.strip_at + (available - used) / 2).min(next_prefix);
             while !buffer.text.is_char_boundary(end) {
-                end -= 1; // 有限UTF8尾最多退3byte；完整源字符保留到后继step，不截断String。
+                end -= 1; // Retreat at most three UTF-8 tail bytes, retaining the complete scalar for a later step.
                 used += 1;
             }
             if end <= self.strip_at {
-                return Err(Error::InvalidSource); // 记录顺序/范围错误不能造成零进展复制循环。
+                return Err(Error::InvalidSource); // Invalid record order/ranges must not cause a zero-progress copy loop.
             }
             value.push_str(&buffer.text[self.strip_at..end]);
             work.copied_bytes += end - self.strip_at;
@@ -503,14 +532,15 @@ impl Request {
         }
         work.structural_transitions += used;
         if self.strip_at == buffer.text.len() {
-            self.buffer = None; // Parser解码前释放原始candidate及prefix表，只保已去前缀的有限值。
+            self.buffer = None; // Before Parser decode, release raw candidate/prefix storage and keep only the bounded stripped value.
             self.phase = Phase::DecodeDefinition;
         }
         Ok(())
     }
 
     fn release_payload(&mut self) {
-        // 不持任何RefCell/源借用；关闭/错误/完成均同步释放所有正文与scope中间值。
+        // No RefCell or Source borrow crosses this cleanup. Failure/completion
+        // synchronously drops all intermediate text and retained scope values.
         self.probe = None;
         self.buffer = None;
         self.normalized = None;
@@ -535,6 +565,8 @@ mod tests {
     };
 
     fn fixture(text: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+        // Every case owns its actual isolated input file and production document;
+        // no alternate Source implementation supplies the parser's facts.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("有限引用.md");
         std::fs::write(&path, text).unwrap();
@@ -543,6 +575,9 @@ mod tests {
     }
 
     fn facts(document: &MarkdownDocumentBuffer) -> Vec<VerifiedGlobalReference> {
+        // Collect facts only for these finite fixtures from the actual global
+        // producer. Its Source frames and opaque scopes remain production-owned;
+        // a test-built candidate cannot substitute for verified global evidence.
         let mut global = GlobalFrontier::new(
             document.generation(),
             document.byte_len(),
@@ -596,6 +631,8 @@ mod tests {
         document: &MarkdownDocumentBuffer,
         queries: &mut Queries,
     ) -> Result<ReferenceWork, Error> {
+        // Drive the actual phases with finite fuel. Public work/input accounting
+        // checks the contract without claiming to profile the Parser's internals.
         let mut total = ReferenceWork::default();
         for _ in 0..10000 {
             let step = request.advance(document, queries, 4096)?;
@@ -618,6 +655,8 @@ mod tests {
 
     #[test]
     fn actual_global_scopes_and_multiline_unicode_labels_match_original_value_parser() {
+        // Real quote/list continuation, Unicode case folding, escapes and title
+        // decoding must agree with the pinned Parser over each complete short input.
         for (source, label) in [
             (
                 "[Straße]: <https://example.test/a\\>b?x=&amp;> '标题 &amp; \\'q\\''\n",
@@ -660,6 +699,8 @@ mod tests {
 
     #[test]
     fn giant_unrelated_payload_is_never_copied_and_normalized_miss_does_not_read_value() {
+        // Actual megabyte URL payloads are present in the original mapping.
+        // Count rejection or normalized mismatch must finish before value copying.
         let source = format!(
             "[unrelated-label]: /{}\n[r]: /{}\n",
             "x".repeat(1024 * 1024),
@@ -693,6 +734,8 @@ mod tests {
 
     #[test]
     fn earliest_matching_oversize_definition_is_sticky_even_with_later_short_definition() {
+        // Source order matters: a real oversized first match permanently fails
+        // this query inventory even if a later definition would fit its allowance.
         let source = format!(
             "[r]: /{}\n[r]: /later\n",
             "x".repeat(TABLE_WINDOW_MAX_REFERENCE_BYTES + 1)
@@ -732,6 +775,8 @@ mod tests {
 
     #[test]
     fn source_identity_rejects_other_document_edit_and_undo_without_keeping_root_alive() {
+        // Exercise actual equal-byte documents and canonical edit/Undo, then drop
+        // the final document to prove the request's identity does not retain its root.
         let (_directory, mut document) = fixture("[r]: /target\n");
         let mut found = facts(&document);
         let mut queries = Queries::from_projection("[r]", true).unwrap();

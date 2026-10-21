@@ -1,4 +1,5 @@
-//! 真实表尾的末格提交与追加行共用一次canonical替换，不以可见窗口末端猜测整表结束。
+//! Commit the actual final cell and append its next row in one canonical
+//! replacement. A visible window's end cannot stand in for the whole table's End.
 
 use std::ops::Range;
 
@@ -15,7 +16,8 @@ use crate::markdown_viewport_presentation::table_window::{
 
 const MAX_APPEND_SOURCE_BYTES: usize = 64 * 1024;
 
-/// 只持有限替换正文、下一格绝对坐标和Weak源身份；不保窗口、表格AST或原文强引用。
+/// Retain bounded replacement text, absolute next-cell coordinates, and weak
+/// Source identity; no window, table AST, or strong original-text owner is kept.
 pub struct MarkdownTableRowAppendPlan {
     source: MarkdownTableSourceIdentity,
     range: Range<usize>,
@@ -25,7 +27,8 @@ pub struct MarkdownTableRowAppendPlan {
 
 impl std::fmt::Debug for MarkdownTableRowAppendPlan {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 诊断只给身份与有限计量，不能因调试计划把用户尚未提交的cell草稿写入日志。
+        // Diagnostics expose identity and bounded sizes only. Formatting a plan
+        // must not put a user's uncommitted cell draft into logs.
         formatter
             .debug_struct("MarkdownTableRowAppendPlan")
             .field("source", &self.source)
@@ -37,28 +40,33 @@ impl std::fmt::Debug for MarkdownTableRowAppendPlan {
 }
 
 impl MarkdownTableRowAppendPlan {
-    /// 提交前重新验证同root与generation；原生层还须核验自己的当前编辑意图。
+    /// Revalidate the same root and generation before commit. The native caller
+    /// must also admit its own current editing intent.
     ///
     /// # Errors
-    /// 源已编辑、Undo、换note或释放时拒绝旧计划，不返回可写的陈旧坐标。
+    /// Editing, Undo, note changes or source release reject the old plan instead
+    /// of returning stale writable coordinates.
     pub fn replacement_for(
         &self,
         document: &MarkdownDocumentBuffer,
     ) -> Result<(&Range<usize>, &str), MarkdownTableWindowError> {
         if !self.source.is_current(document) {
-            // generation即使回到相同root也不复活，避免一次Tab被第二次投递重复追加。
+            // Generation does not revive when the same root returns, preventing
+            // a second delivery of one Tab intent from appending the row twice.
             return Err(MarkdownTableWindowError::InvalidSource);
         }
         Ok((&self.range, &self.replacement))
     }
 
-    /// 下一位置只是重新查询真实窗口的坐标，不是已发布的新cell或新window权限。
+    /// The next position is a coordinate for another actual-window query, not an
+    /// already-published cell or authority to activate a new window.
     pub fn next_cell(&self) -> (usize, usize) {
         (self.next_row_ordinal, 0)
     }
 }
 
-/// 同一真实End认证出的表尾续写；只持Weak源与原范围，不保Doc、尾部String或新提交权限。
+/// Tail output derived from the same verified End. Weak identity and original
+/// ranges retain no document, materialized tail string, or new commit authority.
 pub(super) struct VerifiedCellRowAppendTail {
     source: MarkdownTableSourceIdentity,
     range: Range<usize>,
@@ -73,28 +81,33 @@ pub(super) struct VerifiedCellRowAppendTail {
 }
 
 impl VerifiedCellRowAppendTail {
-    /// 原End决定范围与下一格，坐标本身不能给另一文档签发追加权。
+    /// The original End determines range and next cell. Coordinates alone cannot
+    /// authorize appending to a different document.
     pub(super) fn replacement_range_for(
         &self,
         document: &MarkdownDocumentBuffer,
     ) -> Result<&Range<usize>, MarkdownTableWindowError> {
         if !self.source.is_current(document) {
-            // 原Doc/root/g任一改变都撤销真实End，不能把旧范围拼到后继内容。
+            // Any document/root/generation change revokes End. The old range
+            // cannot be spliced onto successor content.
             return Err(MarkdownTableWindowError::InvalidSource);
         }
         Ok(&self.range)
     }
 
-    /// 只给成功后重新查询的逻辑行列；这份坐标不保活window或提供激活权。
+    /// Supply only logical row/column for a post-success query. These coordinates
+    /// neither retain a window nor grant its activation authority.
     pub(super) fn next_cell(&self) -> (usize, usize) {
         (self.next_row_ordinal, 0)
     }
-    /// 已由真实范围与固定新行计算的后缀extent，供写入前的原文档预算准入。
+    /// The original ranges and fixed new-row structure determine this suffix
+    /// extent, allowing document-budget admission before bytes are written.
     pub(super) fn byte_len(&self) -> usize {
         self.byte_len
     }
 
-    /// 原源范围逐4KiB交付给同一次输出；巨型padding和容器前缀不再复制为大String。
+    /// Deliver original ranges through 4 KiB logical pieces to the same output.
+    /// Giant padding and container prefixes never become one large String here.
     pub(super) fn write_to(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -113,7 +126,7 @@ impl VerifiedCellRowAppendTail {
         )?;
         if self.extra_eol {
             write(self.eol.as_bytes())?;
-        } // 原EOF末行无终止符时，先分开新行。
+        } // At original EOF without a terminator, separate the new row first.
         visit_piece_tree_range(
             document,
             document.root.as_deref(),
@@ -122,12 +135,12 @@ impl VerifiedCellRowAppendTail {
             write,
         )?;
         for _ in 0..self.columns {
-            write(b"| ")?; // 每格真实保留一空格，单列也不能生成Parser拒绝的裸pipe行。
+            write(b"| ")?; // Keep one actual space per cell; even a one-column row cannot be a rejected bare pipe.
         }
         write(b"|")?;
         if self.final_eol {
             write(self.eol.as_bytes())?;
-        } // 原文件已终止时新行也保持同一实际EOL。
+        } // An originally terminated file keeps the same actual EOL after its new row.
         document.original_backing_health()?;
         if !self.source.is_current(document) {
             return Err(MarkdownDocumentBufferError::PreparedTextInputStale);
@@ -137,12 +150,16 @@ impl VerifiedCellRowAppendTail {
 }
 
 impl MarkdownDocumentBuffer {
-    /// 只在同表真实End证明末行、末列后合并当前格草稿与新空行；本方法不修改文档。
-    /// escaped_cell_source沿既有cell输入规则事先转义pipe并归一化换行，不能传未提交的多行值。
+    /// Combine the current cell draft with a new empty row only after this table's
+    /// actual End proves the final row/column. This method does not mutate text.
+    /// escaped_cell_source has already escaped pipes and normalized line breaks
+    /// under the cell-input rule; an uncommitted multiline value is not accepted.
     ///
     /// # Errors
-    /// 尚无真实End时返回ContextPending，保留原草稿等后继结构请求。身份、坐标或预算无效时
-    /// 整体拒绝，不补写一半cell、不构造全文/整表String，也不把局部窗口末行升级为表尾。
+    /// Without actual End, return ContextPending so the original draft can await
+    /// further structure work. Invalid identity, coordinates or budget reject the
+    /// whole plan, without half a cell write, a whole-document/table String, or
+    /// promoting a partial window's last row into the table's final row.
     pub fn plan_verified_table_row_append(
         &self,
         window: &VerifiedMarkdownTableWindow,
@@ -163,7 +180,8 @@ impl MarkdownDocumentBuffer {
         )
     }
 
-    /// 同一批次的末行和真实End共用原单次替换计划；不把另一请求的窗口拼接为本发布权限。
+    /// The same batch's final row and actual End share the single replacement
+    /// plan. A different request's window cannot be combined into this authority.
     pub fn plan_verified_table_viewport_row_append(
         &self,
         batch: &VerifiedMarkdownTableViewport,
@@ -197,7 +215,8 @@ impl MarkdownDocumentBuffer {
         column_index: usize,
         escaped_cell_source: &str,
     ) -> Result<MarkdownTableRowAppendPlan, MarkdownTableWindowError> {
-        // 旧公开入口继续由原cell计划补齐缺格；最终候选仍是原有限的一次源替换。
+        // The bounded public entry uses the original cell plan to fill missing
+        // separators. Its candidate is still one bounded source replacement.
         let cell = self.plan_verified_table_cell_edit(
             window,
             row_ordinal,
@@ -213,7 +232,8 @@ impl MarkdownDocumentBuffer {
         )
     }
 
-    /// 原plan已认证行列与补格前缀；长格和短窗口只借同一真实End派生尾部。
+    /// The original plan already verified row, column, and missing-cell prefix.
+    /// Long cells and short windows derive their tail from the same actual End.
     pub(super) fn verified_cell_row_append_tail_for_plan(
         &self,
         plan: &MarkdownTableCellEditPlan,
@@ -228,7 +248,8 @@ impl MarkdownDocumentBuffer {
         self.table_row_append_tail_with_end(&plan.cell.context, end, range.clone())
     }
 
-    /// 旧公开有限String计划保原复制预算；规则与长Cell文件续写共用同一个真实表尾证明。
+    /// The bounded public String plan keeps its copy allowance. It and long-cell
+    /// file output share the same actual table-end proof and structural rules.
     fn finish_table_row_append_with_end(
         &self,
         context: &TableCellEditContext,
@@ -239,7 +260,7 @@ impl MarkdownDocumentBuffer {
         let tail = self.table_row_append_tail_with_end(context, end, cell_range)?;
         if tail.tail.len() > MAX_APPEND_SOURCE_BYTES || tail.prefix.len() > MAX_APPEND_SOURCE_BYTES
         {
-            return Err(MarkdownTableWindowError::SourceLimit); // 旧显式String入口仍不复制巨型尾部。
+            return Err(MarkdownTableWindowError::SourceLimit); // The explicit String entry cannot copy a giant tail.
         }
         let total = replacement
             .len()
@@ -262,7 +283,8 @@ impl MarkdownDocumentBuffer {
         })
     }
 
-    /// 统一认证行列、End、容器与EOL；返回的只是这份原Source的有限描述符，不读取整尾字节。
+    /// Verify row/column, End, container and EOL together. Return only bounded
+    /// descriptors of this original Source without reading the whole tail.
     fn table_row_append_tail_with_end(
         &self,
         context: &TableCellEditContext,
@@ -278,11 +300,13 @@ impl MarkdownDocumentBuffer {
             || row_ordinal != last_row
             || column_index.checked_add(1) != Some(end.columns())
         {
-            // 真实H身份、整表列数与最后body ordinal必须同时一致；H/D-only仅允许header末格。
+            // Header identity, full column count and final body ordinal must all
+            // agree. A Header/Delimiter-only table permits only its last header cell.
             return Err(MarkdownTableWindowError::InvalidSource);
         }
         let last_content_end = if row_ordinal == 0 {
-            // 只有H/D时，追加位置在D后；当前H格的原尾与完整D必须一起原样保留。
+            // With Header/Delimiter only, insertion follows the delimiter. Keep
+            // the header cell's original tail and full delimiter unchanged together.
             context.delimiter.end
         } else {
             context.row_bytes.end
@@ -296,7 +320,8 @@ impl MarkdownDocumentBuffer {
             || self.byte_offset_for_utf16(end.utf16_end()).ok() != Some(end.byte_end())
             || (!end.ended_with_eol() && !end.ended_at_source_eof())
         {
-            // End只能紧接最后真实行的EOL；下一块或省略行不能被这一连续替换吞入。
+            // End must immediately follow the final actual row's EOL. This
+            // contiguous replacement cannot swallow another block or omitted row.
             return Err(MarkdownTableWindowError::InvalidSource);
         }
         let prefix_range = end.continuation_prefix_byte_range();
@@ -304,13 +329,16 @@ impl MarkdownDocumentBuffer {
             || prefix_range.start > prefix_range.end
             || prefix_range.end > context.delimiter.end
         {
-            // 延续前缀只能借真实D行，不能重用H的列表/脚注opening marker新建另一个容器。
+            // Borrow continuation prefix only from the actual delimiter line.
+            // Repeating a header's list/footnote opener would create another container.
             return Err(MarkdownTableWindowError::InvalidSource);
         }
 
-        // cell_range来自原封闭cell计划；原CellDraft还在准入时认证同一行列和implicit前缀。
+        // cell_range comes from the original sealed cell plan. CellDraft admission
+        // also verified this same row/column and implicit-cell prefix.
         if cell_range.start > cell_range.end || cell_range.end > end.utf16_end() {
-            // 下层计划仍须落在当前表尾之前，避免错误范围扩成跨块删除。
+            // The underlying plan still must end before this table's End, so an
+            // invalid range cannot expand into deletion across another block.
             return Err(MarkdownTableWindowError::InvalidSource);
         }
         let tail_start = self
@@ -330,20 +358,24 @@ impl MarkdownDocumentBuffer {
                 "\r\n" => "\r\n",
                 "\r" => "\r",
                 _ => {
-                    // typed End的终止标量必须与当前真实源相符，不能默默改写非法尾部。
+                    // The typed End's terminating scalar must match actual Source
+                    // bytes; do not silently rewrite a mismatched tail.
                     return Err(MarkdownTableWindowError::InvalidSource);
                 }
             }
         } else {
             if !terminal.is_empty() {
-                // 无EOF EOL时保留零终止形式，不能丢掉被误计为EOL的用户字符。
+                // Preserve the unterminated EOF form. An incorrectly counted user
+                // character cannot be discarded as though it were an EOL.
                 return Err(MarkdownTableWindowError::InvalidSource);
             }
-            // EOF末行无EOL：沿用D实际EOL；D本身就是末行时，H仍有真实分行EOL可取。
+            // For an unterminated final row, reuse the delimiter's actual EOL.
+            // If the delimiter is itself final, the header still has a separating EOL.
             match self.table_append_eol_after(context.delimiter.end)? {
                 Some(eol) => eol,
                 None => {
-                    // D确实没有EOL才借H的分行形式，不额外读取另一个无关源位置。
+                    // Borrow the header's separator only when the delimiter truly
+                    // has no EOL; do not inspect another unrelated source position.
                     self.table_append_eol_after(context.header.end)?
                         .ok_or(MarkdownTableWindowError::InvalidSource)?
                 }
@@ -359,6 +391,8 @@ impl MarkdownDocumentBuffer {
             .ok_or(MarkdownTableWindowError::SourceLimit)?;
         let extra_eol = if end.ended_with_eol() { 0 } else { eol.len() };
         let final_eol = if end.ended_with_eol() { eol.len() } else { 0 };
+        // Admit the full output extent, including original padding/container
+        // bytes and both possible EOL placements, before any output allocation.
         let total_bytes = tail_bytes
             .checked_add(extra_eol)
             .and_then(|count| count.checked_add(prefix_bytes))
@@ -381,13 +415,15 @@ impl MarkdownDocumentBuffer {
         })
     }
 
-    /// 最多借两byte识别真实EOL；返回static选择值，不缓存原行或搜索全篇换行风格。
+    /// Read at most two bytes to recognize the actual EOL. Return a static choice
+    /// without caching a line or scanning the document's preferred newline style.
     fn table_append_eol_after(
         &self,
         byte_end: usize,
     ) -> Result<Option<&'static str>, MarkdownTableWindowError> {
         if byte_end > self.byte_len() {
-            // 无效坐标先拒绝，不能用饱和clamp把它变成“没有EOL”。
+            // Reject an invalid coordinate instead of saturating/clamping it into
+            // a false claim that this location has no EOL.
             return Err(MarkdownTableWindowError::InvalidSource);
         }
         let first = self
@@ -400,7 +436,8 @@ impl MarkdownDocumentBuffer {
         match first_byte {
             Some(b'\n') => Ok(Some("\n")),
             Some(b'\r') => {
-                // 跨piece只再读取一个真实单元；两个窗口都须实际回收后才发布EOL事实。
+                // Across pieces, read only one additional actual byte. Both frames
+                // must finish before the EOL fact can be returned.
                 let next = self
                     .table_source_frame(byte_end + 1, 1)
                     .map_err(|_| MarkdownTableWindowError::InvalidSource)?;
@@ -423,7 +460,8 @@ mod tests {
     use std::sync::Arc;
 
     fn fixture(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
-        // 只在独占临时测试文件中取得真实snapshot/piece root，不用手造window或End证明。
+        // Obtain the actual snapshot/piece root from a privately owned test file.
+        // Do not fabricate a window or End proof for the operation under test.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("S2-last-cell-append.md");
         std::fs::write(&path, source).unwrap();
@@ -448,7 +486,8 @@ mod tests {
             .saturating_mul(64)
             .saturating_add(10_000)
         {
-            // driver保留有限燃料；每次沿真实piece源推进，不用投影结果倒推整表成员。
+            // The driver has finite fuel and advances the actual piece Source.
+            // A projection result is not used to infer whole-table membership.
             match request.advance(document, false, 4096).unwrap() {
                 MarkdownTableWindowStep::Progress { .. } => {}
                 MarkdownTableWindowStep::Ready { .. } => {
@@ -482,7 +521,8 @@ mod tests {
                 .unwrap(),
             expected,
         );
-        // 当前格和新增行只有一条canonical事务；一次Undo即回到原始字节且不复活旧计划。
+        // Cell commit plus row append is one canonical transaction. One Undo
+        // restores exact original bytes without reviving the old generation's plan.
         assert!(document.undo().is_some());
         assert_eq!(
             document
@@ -499,7 +539,8 @@ mod tests {
                 .unwrap(),
             expected,
         );
-        // 空新行必须再次被真实producer/固定Parser认可，不能只以期望字符串相等代替成员证明。
+        // The actual producer and pinned Parser must recognize the new empty row.
+        // Expected-string equality alone does not prove its table membership.
         let new_window = window(&document, row + 1);
         let presentation = new_window.presentation_for(&document).unwrap();
         assert_eq!(presentation.column_count, columns);
@@ -526,7 +567,8 @@ mod tests {
                 "| H1 | H2 |\r\n| - | - |\r\n| a | 新\\|😀 |\r\n| | |\r\n\r\n后继段落😀\r\n",
             ),
         ] {
-            // 同一真实编辑路径覆盖LF/CRLF、escaped pipe、代理对和不属于table的后继正文。
+            // The same actual edit covers LF/CRLF, escaped pipes, surrogate pairs,
+            // and following document text that does not belong to the table.
             assert_history(source, 1, "新\\|😀", expected);
         }
     }
@@ -539,7 +581,7 @@ mod tests {
             "新😀",
             "| H1 | H2 | H3 | H4 |\n| - | - | - | - |\n|a| |  | 新😀\n| | | | |\n",
         );
-        // 一个空格cell的单列表尾必须是`| |`；裸pipe没有真实body row权限。
+        // A one-column empty row must be `| |`; a bare pipe has no actual body-row authority.
         assert_history("| H |\n| - |\n| a |", 1, "中", "| H |\n| - |\n| 中 |\n| |");
     }
 
@@ -562,13 +604,16 @@ mod tests {
                 "| H1 | 新😀 |\n| - | - |\n| | |\n",
             ),
         ] {
-            // D的continuation字节继续原quote/list，绝不复制H的opening marker建立另一个块。
+            // Delimiter continuation bytes preserve the original quote/list;
+            // copying the header opener would incorrectly start another block.
             assert_history(source, row, "新😀", expected);
         }
     }
 
     #[test]
     fn partial_window_or_nonfinal_coordinate_preserves_source_and_draft() {
+        // A partial actual window lacks End. Even a final window cannot append
+        // from a nonfinal column; both rejections preserve real source and history.
         let source = "| H1 | H2 |\n| - | - |\n| one | x |\n| two | y |\n";
         let (_directory, document) = fixture(source);
         let partial = window(&document, 1);
@@ -615,12 +660,15 @@ mod tests {
         );
         drop(verified);
         drop(document);
-        // plan、旧window都只有Weak。Root恢复相同内容或drop后不能留下snapshot/history强持有。
+        // The plan and old window have only weak identity. Restoring equal content
+        // or dropping the document must not leave snapshot/history strong owners.
         assert_eq!(weak.strong_count(), 0);
     }
 
     #[test]
     fn five_thousand_rows_only_copy_last_cell_tail_and_reject_oversized_draft_before_mutation() {
+        // Generate finite fixture data, then ask the actual producer for only the
+        // final row. Planning must not copy preceding rows or mutate on a budget error.
         let mut source = String::from("| H1 | H2 |\n| - | - |\n");
         for row in 1..=5000 {
             source.push_str(&format!("| ROW{row} | 中😀 |\n"));

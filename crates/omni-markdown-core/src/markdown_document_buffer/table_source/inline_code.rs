@@ -1,4 +1,4 @@
-//! 同一 Global 闭合 InlineBlock 的代码权限；每次只保当前事实、一个游标和一个 span。
+//! Derive code permission from the same Global's closed inline block, retaining one current fact/cursor/span.
 
 use super::inline_reference::ReferenceLabel;
 use super::inline_stack::StackFile;
@@ -19,7 +19,7 @@ use std::{cell::Cell, ops::Range, rc::Rc};
 
 type Callback = Box<dyn FnMut(BrokenLink<'static>) -> Option<(CowStr<'static>, CowStr<'static>)>>;
 
-/// Parser 永远先于其固定输入销毁；私有类型不暴露文本替换或跨 owner 借用。
+/// Drop Parser before its fixed input; this private owner exposes no text replacement or escaping borrow.
 struct SmallParser {
     events: OffsetIter<'static, Callback>,
     _text: Box<str>,
@@ -27,7 +27,7 @@ struct SmallParser {
     failure: Rc<Cell<Option<MarkdownTableWindowError>>>,
 }
 impl SmallParser {
-    /// 原 Parser 需要连续借用；固定<=2048字节输入拥有稳定独占分配，移动 owner 不移动这块堆内存。
+    /// Give Parser a stable, exclusive allocation for its bounded input, at most 2 KiB.
     fn new(
         bytes: Vec<u8>,
         options: Options,
@@ -36,27 +36,34 @@ impl SmallParser {
         let text = String::from_utf8(bytes)
             .map_err(|_| Error::InvalidRequest)?
             .into_boxed_str();
-        // SAFETY: text 的唯一 Box 随本私有 owner 保存，之后既不改写也不取出；events 字段先 Drop。
-        // 该借用从不外带，源代次/真实回收仍由父事务逐步核验；错误或取消会整体 Drop 本 owner。
+        // SAFETY: The unique text Box remains immutable inside this private owner;
+        // moving Self cannot move its heap allocation and events drops before text.
+        // No borrow escapes. The parent checks original source/reclaim authority,
+        // and error/cancellation drops this entire owner.
         let source: &'static str = unsafe { &*(text.as_ref() as *const str) };
         let failure = Rc::new(Cell::new(None));
         let observed = Rc::clone(&failure);
         let callback_references = Rc::clone(&references);
         let callback: Callback = Box::new(move |link| {
-            // 同一Global已解析的唯一库存只读共享；没有查询权限时保首错，不猜缺失或复制整个Map。
+            // Read the same Global's resolved inventory. Missing query authority
+            // records its first error instead of guessing Missing or copying the map.
             let result = callback_references.resolve_for_classification(&link.reference);
             match result {
                 Ok(value) => value.map(|(destination, title)| {
-                    // SAFETY: sealed Queries的entries没有内部可变；Parser活期有原Rc持有同一Map，
-                    // 因而原Arc<String>/title分配既不替换也不reopen。events（含callback）字段
-                    // 先于_text/_references销毁，任何Event/Cow只在本私有owner的方法栈消费，
-                    // 不外带或存入更长寿命对象。与上方稳定Box正文的私有自借用责任相同。
+                    // SAFETY: Sealed query entries are immutable and the original
+                    // Rc keeps their destination/title allocations alive throughout
+                    // Parser use. events (including this callback) drops before
+                    // _references. Event/Cow borrows are consumed only on this
+                    // private owner's method stack and never stored or returned outward.
                     let destination: &'static str = unsafe { &*(destination as *const str) };
-                    // SAFETY: 同上；title也由同一不可变Queries及原Rc保活，无独立临时String。
+                    // SAFETY: The same immutable queries and original Rc retain
+                    // title; this reference does not point into a temporary String.
                     let title: &'static str = unsafe { &*(title as *const str) };
                     (CowStr::from(destination), CowStr::from(title))
                 }),
                 Err(error) => {
+                    // A callback cannot return the typed query failure directly.
+                    // Preserve its first cause for the next event-consumer boundary.
                     if observed.get().is_none() {
                         observed.set(Some(error));
                     }
@@ -94,7 +101,8 @@ pub(super) struct InlinePermission {
     phase: Phase,
     bytes: Vec<u8>,
     parser: Option<SmallParser>,
-    // 原Fact只在真实cursor构造前暂存，下一步消费后即归还；不是第二seed/解析缓存。
+    // Hold the original fact only until constructing its actual cursor; consume
+    // it on that step rather than retaining another seed or parsed-result cache.
     block: Option<VerifiedGlobalInlineBlock>,
     cursor: Option<Box<InlineCodeCursor>>,
     pending_storage: Option<InlineLinkStorageRequest>,
@@ -113,8 +121,8 @@ pub(super) struct PermissionStep {
     pub done: bool,
 }
 
-/// AST内部开销仍作为固定小块Parser输入单独报告；这里只预留本owner与原2KiB源容量。
-/// 可选大cursor在真实构造的独立量子另行准入/报分配，不能把同一载荷重复算在固定预留中。
+/// Reserve this owner and the bounded 2-KiB input, reporting Parser input separately from AST internals.
+/// Admit an optional large cursor on its actual construction quantum, without charging its payload twice.
 pub(super) fn workspace_bytes() -> usize {
     2048 + std::mem::size_of::<InlinePermission>()
 }
@@ -130,9 +138,11 @@ impl std::fmt::Debug for InlinePermission {
 }
 
 impl InlinePermission {
-    /// 真 ATX Leaf 先检查无 tick 快路；只有真实 Root 小标题才借有限原 Parser 证明 code，其他范围不猜语法。
+    /// Inspect a real ATX leaf for backticks first; only an actual bounded root heading may use Parser proof.
     pub(super) fn from_atx(block: VerifiedGlobalLeafBlock) -> Result<Self, Error> {
         if !matches!(block.kind(), LeafBlockKind::AtxHeading(_)) {
+            // A leaf from another grammar class cannot borrow the ATX-specific
+            // shortcut merely because its source bytes resemble a heading.
             return Err(Error::InvalidRequest);
         }
         let range = block.physical_start()..block.source_range().end;
@@ -152,7 +162,7 @@ impl InlinePermission {
         })
     }
 
-    /// 实际 Fact 决定 Root/scope/options/范围；不接受调用方布尔、裸 Range 或 lookahead 作为权限。
+    /// Derive root/scope/options/range from the actual fact, never caller booleans, bare ranges or lookahead.
     pub(super) fn new(block: VerifiedGlobalInlineBlock) -> Result<Self, Error> {
         let range = block.physical_range();
         let root = block.scope_depth() == 1;
@@ -180,7 +190,7 @@ impl InlinePermission {
         matches!(self.phase, Phase::Done)
     }
 
-    /// 只有实际含tick且完整复制的有限Root块才收引用；Parser尚未产生任何code/HTML效果。
+    /// Collect references only for a genuinely copied bounded root block before Parser publishes code/HTML effects.
     pub(super) fn reference_input(&self) -> Result<Option<ReferenceInput<'_>>, Error> {
         if let Some(reference) = self.reference.as_ref() {
             return Ok(reference.label().map(ReferenceInput::Streamed));
@@ -195,7 +205,7 @@ impl InlinePermission {
         }))
     }
 
-    /// 原引用请求仍停在同一个cursor；只有唯一Map真实结果才能恢复它，绝不以局部未见当Missing。
+    /// Resume the same pending reference only with the sole inventory's result; local absence is not Missing.
     pub(super) fn accept_reference(
         &mut self,
         resolution: InlineReferenceResolution,
@@ -216,13 +226,13 @@ impl InlinePermission {
         Ok(work)
     }
 
-    /// 唯一库存完成当前块实际查询后才借给Parser；这里不复制Map或创建新的定义解析器。
+    /// Lend the sole completed query inventory to Parser without copying its map or parsing definitions again.
     pub(super) fn accept_references(&mut self, references: Rc<MarkdownTableReferenceQueries>) {
         self.references = Some(references);
         self.phase = Phase::Parse;
     }
 
-    /// 原 scanner 只有收到一个最终 code span 后才跳过其 literal；所有 frame 先真实 finish。
+    /// The original scanner skips a literal only after final code-span proof; finish every actual frame first.
     pub(super) fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -232,12 +242,15 @@ impl InlinePermission {
     ) -> Result<PermissionStep, Error> {
         document.original_backing_health().map_err(Error::Source)?;
         if self.block.is_some() {
+            // The enclosing request supplies its admitted quantum. Construct and
+            // charge the actual optional cursor separately from this small owner.
             let metadata = std::mem::size_of::<InlineCodeCursor>();
             if metadata > budget - 64 {
                 return Err(Error::WorkLimit);
             }
-            // 初始小owner与原大cursor分别真实分配、分别交回；没有把同一次大Box摊账。
-            // 原Fact在into_code_cursor中消费，成功只留下这一份独占cursor，不保存历史事实。
+            // Consume the verified fact into one exclusive cursor. Small owner
+            // and large cursor have separate real allocations/lifetimes; retain
+            // no historical fact after this ownership transfer.
             let block = self.block.take().unwrap();
             let end = if self.range.len() > 2048 {
                 self.range.end
@@ -276,6 +289,8 @@ impl InlinePermission {
             });
         }
         if let Some(request) = self.pending_storage.as_ref() {
+            // Complete the same vendor cursor's external record operation before
+            // advancing its source again; only Ready clears the storage request.
             let result = stack.storage(request, quota, budget - 64);
             document.original_backing_health().map_err(Error::Source)?;
             let (step, metadata) = result?;
@@ -308,6 +323,8 @@ impl InlinePermission {
             });
         }
         if let Some(reference) = self.reference.as_mut() {
+            // The original cursor remains suspended while its one bounded label
+            // decodes; an unresolved reference cannot be silently classified away.
             return reference
                 .advance(document, quota, budget)
                 .map(|work| PermissionStep {
@@ -331,6 +348,8 @@ impl InlinePermission {
                 });
             }
             Phase::Parse => {
+                // Move the bounded input into the stable private parser owner.
+                // The reference inventory was completed by the parent transaction.
                 work.parser_input_bytes = self.bytes.len();
                 self.parser = Some(SmallParser::new(
                     std::mem::take(&mut self.bytes),
@@ -343,13 +362,16 @@ impl InlinePermission {
             }
             Phase::Events => {
                 let parser = self.parser.as_mut().unwrap();
-                // 一步只取一个真实事件；原 Parser 输入已由上个量子固定准入，不积攒全块范围目录。
+                // Consume one actual event per step. The prior quantum admitted
+                // fixed input; do not accumulate an entire block's event-range directory.
                 let event = parser.events.next();
                 if let Some(error) = parser.failure.get() {
                     return Err(Error::Window(error));
                 }
                 match event {
                     Some((Event::Code(_), range)) => {
+                        // Translate only the actual Parser code event into the
+                        // original source range used by the unique underline scanner.
                         return Ok(PermissionStep {
                             work,
                             literal: Some(
@@ -360,12 +382,16 @@ impl InlinePermission {
                     }
                     Some(_) => {}
                     None => {
+                        // No events remain. Release Parser and its stable input
+                        // before declaring this permission owner finished.
                         self.parser = None;
                         self.phase = Phase::Done;
                     }
                 }
             }
             Phase::Cursor | Phase::VerifyRoot => {
+                // A verified cursor proves root/code semantics over original
+                // pieces, reserving tree/control work before its child quantum.
                 let verifying = matches!(self.phase, Phase::VerifyRoot);
                 let tree = document
                     .root
@@ -396,6 +422,8 @@ impl InlinePermission {
                         child,
                     )
                     .map_err(Error::Global);
+                // Reclaim the actual input lease before inspecting cursor facts;
+                // a source failure must outrank a candidate code span.
                 frame.finish().map_err(Error::Source)?;
                 let step = step?;
                 let allocated = cursor.allocated_workspace_bytes() - workspace_before;
@@ -414,13 +442,16 @@ impl InlinePermission {
                     | InlineCodeStep::Proven { work, .. }
                     | InlineCodeStep::NeedsGeneralInline { work } => *work,
                 };
-                // 游标可先交Storage/Reference而未吃完整帧；源账仍收本次实际借片长度。
+                // Storage/reference may suspend before consuming the whole frame;
+                // source accounting still records the actual requested leased slice.
                 work.source_bytes = source_bytes;
                 work.structural_transitions += measured.transitions + tree;
                 work.source_tree_steps = tree;
                 match step {
                     InlineCodeStep::Storage { request, .. } => self.pending_storage = Some(request),
                     InlineCodeStep::Reference { request, .. } => {
+                        // Allocate only this verified label owner; its decoder
+                        // and returned inventory result belong to the same paused cursor.
                         let metadata = std::mem::size_of::<ReferenceLabel>();
                         quota.admit_metadata(metadata).map_err(Error::Window)?;
                         work.metadata_bytes += metadata;
@@ -434,6 +465,8 @@ impl InlinePermission {
                         });
                     }
                     InlineCodeStep::Proven { .. } => {
+                        // Return the finished cursor. Root verification resumes
+                        // inspection; a fully streamed proof finishes this owner.
                         self.cursor = None;
                         self.phase = if verifying {
                             Phase::Inspect
@@ -444,12 +477,14 @@ impl InlinePermission {
                     InlineCodeStep::NeedsGeneralInline { .. } => {
                         self.cursor = None;
                         self.next = self.range.start;
-                        self.phase = Phase::Inspect; // 若全块根本无 tick，可继续证明无代码；遇真实 tick 则保持未知。
+                        self.phase = Phase::Inspect; // A no-backtick block can still be proved; an actual tick stays unknown.
                     }
                     _ => {}
                 }
             }
             Phase::Inspect | Phase::Copy => {
+                // Inspect first without retaining body text. Only an actual tick
+                // in an eligible bounded root block permits the explicit bounded copy.
                 if self.next == self.range.end {
                     self.phase = if matches!(self.phase, Phase::Inspect) {
                         Phase::Done
@@ -483,6 +518,8 @@ impl InlinePermission {
                 work.source_tree_steps = tree;
                 work.structural_transitions += count + tree;
                 if tick {
+                    // Larger or scoped blocks require real general-inline
+                    // permission; never flatten them to obtain a speculative result.
                     if !self.root || self.range.len() > 2048 {
                         return Err(Error::Window(MarkdownTableWindowError::ContextPending));
                     }

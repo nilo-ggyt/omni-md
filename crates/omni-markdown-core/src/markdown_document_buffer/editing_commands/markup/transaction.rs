@@ -375,7 +375,8 @@ fn each_edit<E: From<MarkdownDocumentBufferError>>(
 }
 
 #[cfg(test)]
-// 保留已有失败golden的直接规划入口；不绕开新journal与append回滚。
+// Existing failure goldens can submit their plan directly, while retaining the
+// same actual journal and append rollback as the observed production transaction.
 pub(super) fn commit(
     document: &mut MarkdownDocumentBuffer,
     before: MarkdownTextSelection,

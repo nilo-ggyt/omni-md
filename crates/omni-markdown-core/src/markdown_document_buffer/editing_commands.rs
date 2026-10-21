@@ -62,7 +62,9 @@ impl MarkdownDocumentBuffer {
             .map_err(changes::legacy_error)
     }
 
-    /// 键盘命令的真实变化流与正文共用一次可拒绝提交；NotHandled不产生伪变化。
+    /// Actual keyboard changes and canonical text share one fallible observed
+    /// commit. NotHandled emits no fabricated change; the adapter retains its
+    /// original grapheme/selection authority for ordinary native input.
     pub fn apply_editing_command_observed<O: MarkdownTextChangeObserver>(
         &mut self,
         command: MarkdownEditingCommand,
@@ -158,7 +160,9 @@ impl MarkdownDocumentBuffer {
     }
 }
 
-/// 不改变正文时仍允许显式head纯校验；派生结果由caller按实际是否消费命令采用。
+/// Unchanged text still permits pure derivation against the explicit selection.
+/// The caller adopts that output according to whether the action was consumed;
+/// this boundary publishes no canonical selection, history, or fake text change.
 fn complete_unchanged<O: MarkdownTextChangeObserver>(
     document: &MarkdownDocumentBuffer,
     selection: MarkdownTextSelection,
@@ -306,7 +310,9 @@ fn prepare_indentation<O: MarkdownTextChangeObserver>(
         let mut removed_bytes = 0_usize;
         let mut inserted_bytes = 0_usize;
         for line in first..=last {
-            // 原坐标升序发变化；仅split位置应用此前字节delta，源查询仍读旧root。
+            // Emit changes in ascending original coordinates. Only candidate
+            // split positions apply previous byte deltas; Source queries keep
+            // reading the unchanged original root throughout preparation.
             let edit = indentation_replacement(document, line, command)?;
             if edit.bytes.is_empty() && edit.spaces == 0 {
                 // Unchanged prefixes need neither canonical bytes nor additional tree structure.
@@ -339,7 +345,8 @@ fn prepare_indentation<O: MarkdownTextChangeObserver>(
         // Only original prefix descriptors are rescanned; unpublished output never changes source indexes.
         let edit = indentation_replacement(document, line, command)?;
         if !edit.utf16.is_empty() || edit.spaces != 0 {
-            // 无变化行不虚构delete段；真实prefix替换仍按旧坐标流式进入journal。
+            // An unchanged line has no synthetic deletion. Actual prefix changes
+            // stream into the journal using their original source coordinates.
             changes::emit(document, observer, edit.utf16.clone(), edit.spaces)?;
         }
         copy_source(document, &mut output, consumed..edit.bytes.start)?;

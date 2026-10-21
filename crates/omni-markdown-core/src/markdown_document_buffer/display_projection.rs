@@ -1,4 +1,5 @@
-//! 显示坐标的只读来源：原 piece 字节继续共享，省略与样式只进入同一匿名分页目录。
+//! A read-only Source in display coordinates. Original piece bytes stay shared;
+//! omissions and styles are represented only in the same anonymous paged index.
 
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -17,14 +18,16 @@ const RECORD_BYTES: usize = 256;
 const UNKNOWN_FAILURE: i32 = i32::MIN;
 
 #[derive(Clone, Copy)]
-/// 实际 BMP 终止标量的显示起点和真实 UTF8 尾；省略字符不进入这些摘要。
+/// The display start and actual UTF-8 end of a visible BMP terminator. Omitted
+/// characters never contribute paragraph boundaries to these summaries.
 pub(crate) struct DisplayProjectionTerminator {
     pub(crate) utf16: usize,
     pub(crate) byte_end: usize,
 }
 
 #[derive(Clone)]
-/// 一条目录只描述同样式、两种编码各连续的真实原源区间，不保存正文。
+/// One same-style run contiguous in both encodings and both coordinate spaces.
+/// A record describes an actual original span; it stores no document text.
 pub(crate) struct DisplayProjectionRun {
     pub(crate) display_bytes: Range<usize>,
     pub(crate) display_utf16: Range<usize>,
@@ -40,7 +43,8 @@ pub(crate) struct DisplayProjectionRun {
 }
 
 impl DisplayProjectionRun {
-    /// 编码固定 record；没有指针、Native 值、正文或可变外部结构进入匿名目录。
+    /// Encode a fixed record containing only coordinates and summaries. Pointers,
+    /// native values, document bytes, and mutable external objects never enter it.
     fn encode(&self) -> [u8; RECORD_BYTES] {
         let mut record = [0; RECORD_BYTES];
         let mut put = |slot: usize, value: usize| {
@@ -74,14 +78,15 @@ impl DisplayProjectionRun {
         .enumerate()
         {
             if let Some(value) = value {
-                put(11 + index * 2, value.utf16 + 1); // 零只表示不存在，不与真实显示起点混淆。
+                put(11 + index * 2, value.utf16 + 1); // Zero means absent, distinct from a terminator at display offset zero.
                 put(12 + index * 2, value.byte_end);
             }
         }
         record
     }
 
-    /// 文件实际短读由原 Reader 拒绝；坐标和样式恢复错误不能静默变成默认显示内容。
+    /// The original Reader rejects short reads. Invalid coordinate conversion or
+    /// style bits remain storage failures instead of becoming default content.
     fn decode(record: [u8; RECORD_BYTES]) -> Result<Self, MarkdownDocumentBufferError> {
         let get = |slot: usize| -> Result<usize, MarkdownDocumentBufferError> {
             usize::try_from(u64::from_le_bytes(
@@ -124,7 +129,8 @@ impl DisplayProjectionRun {
     }
 }
 
-/// 只保一个待合并 run 和原 16 KiB 追加页；目录长度不会变为常驻 Vec 或 AVL 节点。
+/// Retain one coalescing run and the index's original 16 KiB append buffer. Index
+/// length does not become a resident Vec of runs or a second tree of text nodes.
 pub(crate) struct DisplayProjectionBuilder {
     raw: MarkdownTextSnapshot,
     index: PagedLayoutIndex<RECORD_BYTES>,
@@ -134,16 +140,19 @@ pub(crate) struct DisplayProjectionBuilder {
 }
 
 impl DisplayProjectionBuilder {
-    /// 观察这个尚未封存的真实writer；观察者不保活raw快照、目录FD或追加页。
+    /// Observe this actual unsealed writer without keeping its raw snapshot, FD,
+    /// or append buffer alive.
     pub(crate) fn resource_observer(&self) -> LayoutIndexObserver {
         self.index.resource_observer()
     }
 
-    /// 只记录真正追加的固定 metadata 量，供原 caller 汇总本步逻辑工作，不是内存峰值。
+    /// Report metadata actually appended for the caller's logical-work accounting.
+    /// This is not a measure of resident memory or peak process usage.
     pub(crate) fn record_bytes(&self) -> usize {
         self.index.len() * RECORD_BYTES
     }
-    /// raw 已由原格工厂封闭；构建器不接活动 Doc、裸范围或第二份文本。
+    /// The original cell factory has already sealed raw. The builder receives no
+    /// active document, unverified range, or second copy of the text.
     pub(crate) fn new(raw: MarkdownTextSnapshot) -> Result<Self, MarkdownDocumentBufferError> {
         raw.original_backing_health()?;
         Ok(Self {
@@ -155,7 +164,8 @@ impl DisplayProjectionBuilder {
         })
     }
 
-    /// 每个已转换标量只更新原显示摘要和一个来源 run；没有正文追加文件或整格输出字符串。
+    /// Each converted scalar updates display metrics and one source run. Neither
+    /// an appended text file nor a materialized whole-cell string is created.
     pub(crate) fn append(
         &mut self,
         scalar: MarkdownTableCellDisplayScalar,
@@ -176,6 +186,8 @@ impl DisplayProjectionBuilder {
             && run.raw_utf16.end == scalar.raw_utf16.start
             && run.styles == scalar.styles
         {
+            // Coalesce only when both raw and display coordinates continue and
+            // style is unchanged. A removed marker must leave a real raw gap.
             run.display_bytes.end = scalar.display_bytes.end;
             run.display_utf16.end = scalar.display_utf16.end;
             run.raw_bytes.end = scalar.raw_bytes.end;
@@ -186,6 +198,8 @@ impl DisplayProjectionBuilder {
             run.first_text_terminator = run.first_text_terminator.or(checking);
             run.last_text_terminator = checking.or(run.last_text_terminator);
         } else {
+            // Seal the previous run before retaining its successor. This keeps
+            // only one pending record regardless of the cell's source length.
             self.flush()?;
             self.pending = Some(DisplayProjectionRun {
                 display_bytes: scalar.display_bytes,
@@ -210,7 +224,8 @@ impl DisplayProjectionBuilder {
         Ok(())
     }
 
-    /// 只有来源或样式断点才追加一个固定 record，先前同 inode 字节永不改写。
+    /// Append a fixed record only at a source/style break. Previously appended
+    /// bytes in this inode are never rewritten during projection construction.
     fn flush(&mut self) -> Result<(), MarkdownDocumentBufferError> {
         if let Some(run) = self.pending.take() {
             self.index.append(run.encode()).map_err(index_error)?;
@@ -218,7 +233,8 @@ impl DisplayProjectionBuilder {
         Ok(())
     }
 
-    /// 全部原输入和语义已完成后才封存；空显示不为不存在的目录读取创建 FD。
+    /// Seal only after the complete original input and semantics are known. Empty
+    /// display output closes the writer rather than creating a nonexistent reader.
     pub(crate) fn finish(mut self) -> Result<Arc<DisplayProjection>, MarkdownDocumentBufferError> {
         self.raw.original_backing_health()?;
         self.flush()?;
@@ -242,7 +258,8 @@ impl DisplayProjectionBuilder {
     }
 }
 
-/// 原 raw 冻结 pieces 和同一封存目录是唯一强资源；显示字节只在有限 visitor 回调里借用。
+/// The frozen raw pieces and this sealed index are the only strong resources.
+/// Display text is borrowed through bounded visitor callbacks, never retained here.
 pub(crate) struct DisplayProjection {
     raw: MarkdownTextSnapshot,
     reader: Mutex<Option<LayoutIndexReader<RECORD_BYTES>>>,
@@ -252,8 +269,9 @@ pub(crate) struct DisplayProjection {
     first_failure: AtomicI32,
 }
 
-/// 只借同一封存目录，保一个待交记录；显示端已夹到本次真实UTF16额度，
-/// 不会为了合并相邻样式先遍历巨格全部run，也不新增FD、正文或坐标索引。
+/// Borrow the same sealed index and retain one pending record. The display range
+/// is already clamped to this call's UTF-16 allowance, so coalescing styles cannot
+/// scan all runs in a giant cell or create another FD, text buffer, or index.
 pub(crate) struct DisplayProjectionVisibleRawRanges<'a> {
     projection: &'a DisplayProjection,
     display: Range<usize>,
@@ -302,8 +320,9 @@ impl Iterator for DisplayProjectionVisibleRawRanges<'_> {
             }
             let mut raw = run.raw_utf16.start + start - run.display_utf16.start
                 ..run.raw_utf16.start + end - run.display_utf16.start;
-            // 样式断点不妨碍完整字面查询跨字体；真实raw gap才结束一个可见连续域。
-            // 每条record至少含一UTF16单元，所以本循环也受构造时的同一输入额度约束。
+            // A style break does not stop a literal query across fonts; an actual
+            // raw gap ends this visible contiguous span. Every record contains at
+            // least one UTF-16 unit, bounding this loop by the admitted input range.
             while run.display_utf16.end < self.display.end && self.next < self.projection.count {
                 let next = self.projection.run(self.next)?;
                 self.next += 1;
@@ -322,7 +341,7 @@ impl Iterator for DisplayProjectionVisibleRawRanges<'_> {
         match result {
             Ok(value) => value.map(Ok),
             Err(cause) => {
-                self.done = true; // 首错只交一次；不能在错误后沿另一个正确record继续给部分成功。
+                self.done = true; // Emit the first error once; a later intact record cannot restore partial success.
                 Some(Err(cause))
             }
         }
@@ -330,8 +349,9 @@ impl Iterator for DisplayProjectionVisibleRawRanges<'_> {
 }
 
 impl DisplayProjection {
-    /// 原可见display端点先核真实标量，再用调用方剩余UTF16额度夹取末端。
-    /// 首run只二分一次，后续由同一借用游标逐记录推进；隐藏raw gap始终不被包络补齐。
+    /// Validate both requested display scalar boundaries before clamping the end
+    /// to the caller's remaining UTF-16 allowance. Locate the first run once, then
+    /// advance this borrowing cursor; an omitted raw gap is never filled by an envelope.
     pub(crate) fn visible_raw_ranges(
         &self,
         display: Range<usize>,
@@ -347,7 +367,7 @@ impl DisplayProjection {
         match self.byte_offset_for_utf16(end) {
             Ok(_) => {}
             Err(MarkdownDocumentBufferError::NotUnicodeBoundary) if end > display.start => {
-                end -= 1; // UTF16上限只可能切一对代理；只退这一个单元，不吞任何真实Source错误。
+                end -= 1; // Only a split surrogate pair needs one-unit retreat; actual Source errors remain errors.
                 self.byte_offset_for_utf16(end)?;
             }
             Err(cause) => return Err(cause),
@@ -367,28 +387,32 @@ impl DisplayProjection {
         })
     }
 
-    /// 原算法只沿该冻结 raw 根读取，每次借用仍归原 4 KiB 资源边界。
+    /// Raw algorithms read only this frozen root, retaining the original 4 KiB
+    /// logical lease boundary for each actual borrow.
     pub(crate) fn raw(&self) -> &MarkdownTextSnapshot {
         &self.raw
     }
-    /// 转换时逐个可见 scalar 累计，不能用 raw 树摘要替代显示语义。
+    /// Metrics were accumulated from visible scalars during conversion. Raw-tree
+    /// aggregates cannot substitute for these independent display facts.
     pub(super) fn metrics(&self) -> MarkdownDocumentMetrics {
         self.metrics
     }
-    /// 目录记录数量仅用于有限二分和逐条预算，不让正文长度变成常驻分配。
+    /// The record count bounds binary search and per-record work without turning
+    /// document length into a resident allocation.
     pub(crate) fn run_count(&self) -> usize {
         self.count
     }
-    /// 汇总封存时实际追加的记录量；最后 pending run 也在其中。
+    /// Report the actual sealed metadata extent, including the final pending run.
     pub(crate) fn record_bytes(&self) -> usize {
         self.count * RECORD_BYTES
     }
-    /// 原子观察者不会保活目录 Reader 或原字节映射。
+    /// The atomic observer keeps neither the index Reader nor raw mapping alive.
     pub(crate) fn resource_observer(&self) -> LayoutIndexObserver {
         self.observer.clone()
     }
 
-    /// 原字节错误始终先于派生目录失败；后者一旦撤销便不能从其他正确 record 恢复成功。
+    /// Original-byte failure takes precedence over a derived-index failure. Once
+    /// this index is revoked, another intact record cannot make it healthy again.
     pub(crate) fn health(&self) -> Result<(), MarkdownDocumentBufferError> {
         self.raw.original_backing_health()?;
         let failure = self.first_failure.load(Ordering::Acquire);
@@ -408,7 +432,8 @@ impl DisplayProjection {
         Ok(())
     }
 
-    /// 保存本来源的实际派生首错；不把普通范围错误升级为 I/O，也不覆盖原 raw errno。
+    /// Retain the first actual derived-storage failure without promoting ordinary
+    /// range errors to I/O or hiding the original raw Source's errno.
     fn fail(&self, error: MarkdownDocumentBufferError) -> MarkdownDocumentBufferError {
         if let MarkdownDocumentBufferError::DisplayStorageUnavailable(errno) = error {
             let _ = self.first_failure.compare_exchange(
@@ -421,7 +446,8 @@ impl DisplayProjection {
         self.raw.original_backing_health().err().unwrap_or(error)
     }
 
-    /// 一次只读一个原 256-byte record；没有页预读或另一个源、正文与索引缓存。
+    /// Read one original 256-byte record at a time, without prefetch or another
+    /// Source, text cache, or in-memory run index.
     pub(crate) fn run(
         &self,
         ordinal: usize,
@@ -431,6 +457,8 @@ impl DisplayProjection {
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         let result = (|| {
+            // Serialize only this reader's fixed-record I/O. Raw-source health is
+            // checked after the lock has left scope, before interpreting success.
             let mut reader = self
                 .reader
                 .lock()
@@ -446,7 +474,8 @@ impl DisplayProjection {
         result.map_err(|error| self.fail(error))
     }
 
-    /// 返回第一个尾端严格大于位置的 run；真实 EOF 是 count，不拿相邻格补位置。
+    /// Find the first run whose end is strictly after the position. Actual EOF is
+    /// count; a neighboring cell never supplies a missing coordinate.
     fn locate(&self, position: usize, axis: u8) -> Result<usize, MarkdownDocumentBufferError> {
         let mut low = 0;
         let mut high = self.count;
@@ -467,7 +496,8 @@ impl DisplayProjection {
         Ok(low)
     }
 
-    /// 显示 UTF16 必须是实际标量边界；raw run 内的线性关系不会把低代理项补成合法 caret。
+    /// Display UTF-16 must identify an actual scalar boundary. Linear translation
+    /// inside a raw run cannot turn a surrogate interior into a valid caret.
     pub(crate) fn byte_offset_for_utf16(
         &self,
         position: usize,
@@ -476,8 +506,9 @@ impl DisplayProjection {
         if position > self.metrics.utf16_len {
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
-        // 封存显示源的零点属于显示字节域；即使原文前面删过语法，它也恒为字节零。
-        // 健康检查仍先完成，不能为每次 Native 回调前后核源而重复读取首条磁盘目录。
+        // The sealed display origin is always display byte zero, even when raw
+        // syntax before it was omitted. Health was checked first; repeated native
+        // boundary observations need not reread the first disk record for zero.
         if position == 0 {
             return Ok(0);
         }
@@ -491,7 +522,8 @@ impl DisplayProjection {
         Ok(run.display_bytes.start + raw - run.raw_bytes.start)
     }
 
-    /// 字节边界仍由同一原 raw Snapshot 解码确认；隐藏 gap 只能改变目录偏移，不能吞掉标量。
+    /// The same raw snapshot validates byte/scalar boundaries. Hidden gaps change
+    /// coordinate offsets but do not permit dropping part of a visible scalar.
     pub(crate) fn utf16_offset_for_byte(
         &self,
         position: usize,
@@ -510,7 +542,8 @@ impl DisplayProjection {
         Ok(run.display_utf16.start + raw - run.raw_utf16.start)
     }
 
-    /// 多个显示片段直接借原 pieces；调用者可在自己的至多 4 KiB 形状缓冲里按需拼接。
+    /// Borrow each display fragment directly from original pieces. A shaping
+    /// caller may concatenate them into its own buffer of at most 4 KiB as needed.
     pub(crate) fn visit_byte_range(
         &self,
         range: Range<usize>,
@@ -531,7 +564,8 @@ impl DisplayProjection {
             let start = run.raw_bytes.start + position - run.display_bytes.start;
             let result = self
                 .raw
-                // 动态借用在 raw/显示派发边界收敛类型，不把递归转发实例化成不断增长的 &mut 层。
+                // Dynamic dispatch closes the raw/display forwarding type here;
+                // recursive forwarding must not instantiate ever deeper &mut types.
                 .visit_byte_range(start..start + end - position, &mut *visit);
             self.health()?;
             result?;
@@ -541,7 +575,8 @@ impl DisplayProjection {
         Ok(())
     }
 
-    /// NSString 读取保留半代理单元合同，遍历原实际 run，既不构造完整 UTF16 也不保另一份 cache。
+    /// Preserve NSString's code-unit reads, including surrogate halves. Traverse
+    /// actual runs without constructing whole UTF-16 text or another cache.
     pub(crate) fn copy_utf16_code_units(
         &self,
         offset: usize,
@@ -571,7 +606,8 @@ impl DisplayProjection {
         self.health()
     }
 
-    /// 前缀累计排除完整中间 run；仅两端部分 run 解码原有限叶，两个标量端点均验证。
+    /// Prefix counts cover complete middle runs. Decode bounded raw leaves only
+    /// for the two partial ends, validating both scalar endpoints even on a miss.
     pub(crate) fn is_printable_ascii_range(
         &self,
         range: Range<usize>,
@@ -604,7 +640,8 @@ impl DisplayProjection {
         Ok(beginning && ending && first.non_printable_after == last.non_printable_before)
     }
 
-    /// 文本检查允许半代理单位；只定位两端实际可见终止符，不让 raw 隐藏分隔符切断显示段落。
+    /// Text checking accepts surrogate-interior code-unit positions. Locate actual
+    /// visible terminators so a hidden raw separator cannot split a display paragraph.
     pub(crate) fn text_checking_paragraph_range(
         &self,
         request: Range<usize>,
@@ -634,13 +671,14 @@ impl DisplayProjection {
             self.copy_utf16_code_units(end, &mut unit)?;
             if unit[0] == 10 {
                 end += 1;
-            } // 合并的是实际显示 CRLF，不能沿 raw 坐标越过删除区。
+            } // Merge the actual display CRLF; raw adjacency cannot bridge an omitted span.
         }
         self.health()?;
         Ok(start..end)
     }
 
-    /// 完整中间 run 只看其真实尾摘要，命中端点 run 才沿原同长 raw 区间找最后终止符。
+    /// Complete middle runs use their actual last-terminator summary. Only the
+    /// endpoint run needs the original equal-length raw range searched internally.
     fn previous_text_terminator(
         &self,
         before: usize,
@@ -675,7 +713,8 @@ impl DisplayProjection {
         }
     }
 
-    /// raw 段落 API 可合并 CRLF；只接受当前 run 中真实首终止符，省略外的结果继续查下一显示 run。
+    /// Raw paragraph lookup may merge CRLF. Accept only a terminator inside this
+    /// run; a result beyond its visible extent requires searching the next run.
     fn next_text_terminator(
         &self,
         at: usize,
@@ -716,7 +755,8 @@ impl DisplayProjection {
         Ok(None)
     }
 
-    /// 显示边界两侧可跨隐藏语法；范围末端取上游可见尾，不能吞掉其后 URL 或闭合标记。
+    /// Affinity chooses the side of hidden syntax at a display boundary. A range
+    /// end uses the upstream visible tail so a following URL/closer is not consumed.
     pub(crate) fn display_to_raw(
         &self,
         position: usize,
@@ -729,7 +769,8 @@ impl DisplayProjection {
         if position == self.metrics.utf16_len {
             return Ok(self.run(self.count - 1)?.raw_utf16.end);
         }
-        // 先核 position 的真实 scalar 边界；position-1 只选择目录 run，不把代理中点当可读端点。
+        // Validate position itself first. position - 1 selects a directory run;
+        // it is not exposed as a scalar boundary or used for a byte borrow.
         let lookup = if !downstream && position != 0 {
             position - 1
         } else {
@@ -739,7 +780,8 @@ impl DisplayProjection {
         Ok(run.raw_utf16.start + position - run.display_utf16.start)
     }
 
-    /// 原源隐藏 gap 的亲和由真实调用者明确给出，不能将有向选择猜成 display range 的尾端。
+    /// The actual caller chooses affinity inside a hidden raw gap. A directed
+    /// selection is not guessed to be the trailing edge of a display range.
     pub(crate) fn raw_to_display(
         &self,
         position: usize,
@@ -765,7 +807,8 @@ impl DisplayProjection {
         }
     }
 
-    /// 样式查询只返回同一封存目录实际输出的 run；EOF 和空格没有可读取字符样式。
+    /// Return styles only from this sealed index's actual output run. EOF and an
+    /// empty cell have no character whose style could be queried.
     pub(crate) fn styles_at(
         &self,
         position: usize,
@@ -782,7 +825,8 @@ impl DisplayProjection {
     }
 }
 
-/// 派生目录的真实系统错误保留 errno；锁损坏和已撤销索引保持 None，不伪造系统原因。
+/// Preserve errno for actual index I/O. Poisoned locks or revoked indices carry
+/// None rather than inventing a system-level cause.
 fn index_error(error: LayoutIndexError) -> MarkdownDocumentBufferError {
     MarkdownDocumentBufferError::DisplayStorageUnavailable(match error {
         LayoutIndexError::Io(error) => error.raw_os_error(),

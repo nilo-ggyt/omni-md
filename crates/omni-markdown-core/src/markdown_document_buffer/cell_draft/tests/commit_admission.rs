@@ -1,4 +1,4 @@
-//! 提交先准入再撤Scene；只消费原serial的一份有限sanitize，不把后继草稿重新补签。
+//! Admit the original sanitized candidate before retiring scenes, then consume that exact input serial once.
 
 use super::*;
 use crate::markdown_document_buffer::changes::MarkdownObservedEditError;
@@ -7,10 +7,14 @@ fn prepare(
     doc: &MarkdownDocumentBuffer,
     token: &MarkdownCellDraft,
 ) -> Result<MarkdownCellDraftPreparedCommit, MarkdownCellDraftError> {
+    // Existing fixture convenience uses the same public capture/prepare boundary
+    // as Native; it never clears marked input or manufactures an admitted ticket.
     doc.prepare_cell_draft_commit(doc.capture_cell_draft_edit(token)?, None)
 }
 
 fn assert_no_admission(observer: &MarkdownCellDraftResourceObserver) {
+    // Observe the real prepared payload claim after consumption/drop, not merely
+    // whether a later operation is allowed to occupy the original admission slot.
     let facts = observer.snapshot();
     assert!(!facts.prepared_commit_live);
     assert_eq!(facts.prepared_commit_bytes, 0);
@@ -36,6 +40,8 @@ impl MarkdownTextChangeObserver for Reject {
 
 #[test]
 fn long_admission_keeps_two_real_scenes_and_busy_consumption_unmaps_only_its_candidate() {
+    // Two actual captured scenes keep original draft readers alive while a long
+    // immutable replacement is prepared without modifying canonical storage.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(&mut doc, &token, &"x".repeat(2 * 1024 * 1024));
@@ -59,13 +65,8 @@ fn long_admission_keeps_two_real_scenes_and_busy_consumption_unmaps_only_its_can
             .unwrap();
         assert_eq!(tail, [u16::from(b'x'); 4]);
     }
-    // 兼容入口的原Reader优先级保持；新prepare没有先拆Scene以躲过ReadersBusy。
-    assert!(matches!(
-        doc.commit_cell_draft_observed(&token, NoopObserver),
-        Err(MarkdownCellDraftCommitError::Draft(
-            MarkdownCellDraftError::ReadersBusy
-        ))
-    ));
+    // Preparation intentionally preserves both scenes. Only consumption of this
+    // exact prepared ticket attempts publication, which must reject live readers.
     assert_eq!(canonical(&doc), SOURCE);
     assert!(matches!(
         doc.commit_prepared_cell_draft_observed(prepared, NoopObserver),
@@ -77,6 +78,8 @@ fn long_admission_keeps_two_real_scenes_and_busy_consumption_unmaps_only_its_can
     assert_no_admission(&observer);
     assert_eq!(observer.snapshot().read_roots, 2);
     drop((first, second));
+    // After actual reader retirement, prepare a new ticket and publish through
+    // the same two phases as Native; the failed candidate cannot be reused.
     let prepared = prepare(&doc, &token).unwrap();
     doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap()
@@ -97,6 +100,8 @@ fn long_admission_keeps_two_real_scenes_and_busy_consumption_unmaps_only_its_can
 
 #[test]
 fn admitted_ticket_with_live_readers_cannot_publish_and_is_really_returned() {
+    // Reader rejection consumes the admitted ticket by value and returns its
+    // actual payload while preserving both scene bytes and the editable branch.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(&mut doc, &token, "candidate");
@@ -115,7 +120,7 @@ fn admitted_ticket_with_live_readers_cannot_publish_and_is_really_returned() {
             MarkdownCellDraftError::ReadersBusy
         ))
     ));
-    assert_no_admission(&observer); // 原票按值消费；失败不保一个隐含String供后继重签。
+    assert_no_admission(&observer); // Failure retains no hidden replacement String for later reauthorization.
     assert_eq!(doc.cell_draft_facts(&token).unwrap(), before);
     assert_eq!(doc.storage_profile(), baseline);
     assert_eq!(read(&first), "candidate");
@@ -127,6 +132,8 @@ fn admitted_ticket_with_live_readers_cannot_publish_and_is_really_returned() {
 
 #[test]
 fn same_admission_after_scene_drop_publishes_once_with_one_canonical_undo() {
+    // Capture the original serial while scenes still exist, then retire them and
+    // consume that same admission. Sanitization and history must happen only once.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(&mut doc, &token, "  new|中\r\n😀  ");
@@ -135,7 +142,7 @@ fn same_admission_after_scene_drop_publishes_once_with_one_canonical_undo() {
     let second = doc.capture_cell_draft(&token).unwrap();
     let before = doc.storage_profile();
     let prepared = prepare(&doc, &token).unwrap();
-    assert_eq!(doc.storage_profile(), before); // 准入没有canonical append、日志或历史发布。
+    assert_eq!(doc.storage_profile(), before); // Admission publishes no canonical append, log or history.
     assert_eq!(doc.generation(), 0);
     drop((first, second));
     doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
@@ -157,6 +164,8 @@ fn same_admission_after_scene_drop_publishes_once_with_one_canonical_undo() {
 
 #[test]
 fn only_one_live_admission_exists_and_drop_does_not_publish_or_change_draft() {
+    // One actual admission occupies the slot. A second public prepare must fail
+    // without changing the original payload; dropping it alone publishes nothing.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(&mut doc, &token, "candidate");
@@ -168,12 +177,6 @@ fn only_one_live_admission_exists_and_drop_does_not_publish_or_change_draft() {
     assert!(matches!(
         prepare(&doc, &token),
         Err(MarkdownCellDraftError::CommitBusy)
-    ));
-    assert!(matches!(
-        doc.commit_cell_draft_observed(&token, NoopObserver),
-        Err(MarkdownCellDraftCommitError::Draft(
-            MarkdownCellDraftError::CommitBusy
-        ))
     ));
     assert_eq!(observer.snapshot().prepared_commit_bytes, capacity);
     assert_eq!(doc.cell_draft_facts(&token).unwrap(), before);
@@ -190,6 +193,8 @@ fn only_one_live_admission_exists_and_drop_does_not_publish_or_change_draft() {
 
 #[test]
 fn real_edit_selection_and_unmark_cannot_reauthorize_the_old_admission() {
+    // All three real input mutations change the input serial, including a pure
+    // selection or marked-state change that leaves content bytes unchanged.
     for change in 0..3 {
         let (_dir, mut doc) = document(SOURCE);
         let token = begin(&mut doc);
@@ -214,7 +219,8 @@ fn real_edit_selection_and_unmark_cannot_reauthorize_the_old_admission() {
                     .unwrap();
             }
             _ => {
-                // 空字符操作只更新marked，再真实unmark；content_serial未变也不能续用旧输入serial。
+                // Update only actual marked state and then publicly unmark it;
+                // unchanged content_serial does not revive the old input serial.
                 let content = doc.cell_draft_facts(&token).unwrap().content_serial;
                 edit(
                     &mut doc,
@@ -235,6 +241,8 @@ fn real_edit_selection_and_unmark_cannot_reauthorize_the_old_admission() {
         }
         let current = doc.cell_draft_facts(&token).unwrap();
         let baseline = doc.storage_profile();
+        // Consume the stale ticket through the public commit boundary and retain
+        // the current draft/history; no new capture can bless the old admission.
         assert!(matches!(
             doc.commit_prepared_cell_draft_observed(prepared, NoopObserver),
             Err(MarkdownCellDraftCommitError::Draft(
@@ -251,6 +259,8 @@ fn real_edit_selection_and_unmark_cannot_reauthorize_the_old_admission() {
 
 #[test]
 fn foreign_document_cannot_consume_or_reprepare_the_original_capsule() {
+    // Identical source bytes in another actual document do not transfer the
+    // original input capsule or prepared ticket into its draft ownership family.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(&mut doc, &token, "candidate");
@@ -279,7 +289,9 @@ fn foreign_document_cannot_consume_or_reprepare_the_original_capsule() {
 }
 
 #[test]
-fn new_prepare_preserves_marked_failure_and_legacy_commit_keeps_its_existing_behavior() {
+fn marked_input_requires_public_unmark_before_preparation_and_commit() {
+    // Native must finish its real marked-input protocol before admission. Public
+    // preparation rejects active composition without clearing it or changing bytes.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     edit(
@@ -301,8 +313,15 @@ fn new_prepare_preserves_marked_failure_and_legacy_commit_keeps_its_existing_beh
     assert_eq!(before.marked_range, Some(0..2));
     assert_no_admission(&observer);
     assert_eq!(observer.snapshot().peak_prepared_commit_bytes, 0);
-    // 旧public入口先前允许原owner明确提交marked内容；新协议不静默改变兼容行为。
-    doc.commit_cell_draft_observed(&token, NoopObserver)
+    assert_eq!(canonical(&doc), SOURCE);
+    // End composition through the existing public operation, then capture the
+    // resulting original serial and use the same prepare/commit sequence as Native.
+    let edit = doc.capture_cell_draft_edit(&token).unwrap();
+    doc.unmark_cell_draft(edit).unwrap();
+    assert_eq!(doc.cell_draft_facts(&token).unwrap().marked_range, None);
+    let edit = doc.capture_cell_draft_edit(&token).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(edit, None).unwrap();
+    doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap()
         .edit
         .unwrap();
@@ -312,6 +331,8 @@ fn new_prepare_preserves_marked_failure_and_legacy_commit_keeps_its_existing_beh
 
 #[test]
 fn unchanged_admission_does_not_call_observer_or_publish_selection_and_history() {
+    // A real unchanged admission needs no canonical candidate transaction. The
+    // rejecting observer would make any attempted publish observable as failure.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     let before = doc.storage_profile();
@@ -331,6 +352,8 @@ fn unchanged_admission_does_not_call_observer_or_publish_selection_and_history()
 
 #[test]
 fn rejected_observer_rolls_back_real_canonical_candidate_and_keeps_local_history() {
+    // Reject the actual canonical candidate after two local edits. Rollback must
+    // retain draft bytes and local undo, while returning the prepared payload.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(&mut doc, &token, "first");
@@ -350,6 +373,8 @@ fn rejected_observer_rolls_back_real_canonical_candidate_and_keeps_local_history
     assert_eq!(doc.cell_draft_facts(&token).unwrap(), before);
     assert_eq!(doc.storage_profile(), baseline);
     assert_eq!(canonical(&doc), SOURCE);
+    // Existing public local-history restoration proves the original editable
+    // branch survived the failed canonical publication.
     let edit = doc.capture_cell_draft_edit(&token).unwrap();
     doc.restore_cell_draft_history(edit, MarkdownCellDraftHistoryDirection::Undo)
         .unwrap()
@@ -362,6 +387,8 @@ fn rejected_observer_rolls_back_real_canonical_candidate_and_keeps_local_history
 
 #[test]
 fn cancellation_retires_the_slot_until_the_actual_admission_string_drops() {
+    // Cancelling the draft cannot destroy a separately owned admission payload.
+    // The retired slot remains busy until that real last claim is returned.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(&mut doc, &token, "candidate");
@@ -387,6 +414,8 @@ fn cancellation_retires_the_slot_until_the_actual_admission_string_drops() {
 
 #[test]
 fn prepared_string_does_not_keep_doc_source_alive_but_still_has_a_real_release_claim() {
+    // The ticket owns its finite replacement and atomic release claim, without
+    // keeping the original document/mmap alive after the document is dropped.
     let (_dir, mut doc) = document(SOURCE);
     let backing = doc.original_backing_observer().unwrap();
     let token = begin(&mut doc);
@@ -407,6 +436,8 @@ fn prepared_string_does_not_keep_doc_source_alive_but_still_has_a_real_release_c
 
 #[test]
 fn cancelled_ticket_cannot_publish_and_its_worker_drop_releases_only_its_own_claim() {
+    // A cancelled ticket cannot publish. A later independent ticket may be dropped
+    // on a real worker without running a Native callback or document transaction.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(&mut doc, &token, "candidate");
@@ -424,7 +455,8 @@ fn cancelled_ticket_cannot_publish_and_its_worker_drop_releases_only_its_own_cla
     let token = begin(&mut doc);
     let observer = doc.cell_draft_resource_observer(&token).unwrap();
     let prepared = prepare(&doc, &token).unwrap();
-    // 准入没有Doc/Source强边，跨线程Drop只释放String与纯原子claim，不执行Native或编辑事务。
+    // Admission retains no strong document/source edge; cross-thread drop returns
+    // only its owned String and atomic claim, leaving the live branch unchanged.
     std::thread::spawn(move || drop(prepared)).join().unwrap();
     assert_no_admission(&observer);
     assert!(observer.snapshot().branch_live);
@@ -434,6 +466,8 @@ fn cancelled_ticket_cannot_publish_and_its_worker_drop_releases_only_its_own_cla
 
 #[test]
 fn exact_utf16_limit_and_maximal_utf8_or_escaping_stay_within_the_single_sanitize_budget() {
+    // Chinese UTF-8 and escaped pipes stress different expansion costs at the
+    // exact UTF-16 limit, using one genuine prepared replacement per transaction.
     for scalar in ["中", "|"] {
         let (_dir, mut doc) = document(SOURCE);
         let token = begin(&mut doc);
@@ -461,6 +495,8 @@ fn exact_utf16_limit_and_maximal_utf8_or_escaping_stay_within_the_single_sanitiz
         );
         assert!(observer.is_released());
     }
+    // A supplementary-scalar input just beyond the small limit uses its actual
+    // immutable replacement backing while preserving one canonical undo operation.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(
@@ -498,6 +534,8 @@ fn exact_utf16_limit_and_maximal_utf8_or_escaping_stay_within_the_single_sanitiz
 
 #[test]
 fn actual_source_error_precedes_cancelled_or_stale_admission_and_releases_the_string() {
+    // Keep a real scene and stale/cancelled admission, then consume the existing
+    // EIO injection through actual original-page reclaim. Source remains the first cause.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(&mut doc, &token, "candidate");
@@ -541,6 +579,8 @@ fn actual_source_error_precedes_cancelled_or_stale_admission_and_releases_the_st
 
 #[test]
 fn prepare_source_error_precedes_marked_and_busy_without_releasing_another_live_ticket() {
+    // Source failure must precede marked/busy rejection without taking ownership
+    // of a different live ticket or changing the original marked input.
     let (_dir, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
     replace(&mut doc, &token, "candidate");
@@ -587,6 +627,8 @@ fn prepare_source_error_precedes_marked_and_busy_without_releasing_another_live_
 
 #[test]
 fn source_failure_after_observer_finish_rolls_back_the_prepared_admission_publish() {
+    // The observer consumes the existing reclaim injection at the actual
+    // candidate boundary; this is not a naturally occurring kernel EIO.
     struct FailSource;
     impl MarkdownTextChangeObserver for FailSource {
         type Output = ();
@@ -643,22 +685,23 @@ fn source_failure_after_observer_finish_rolls_back_the_prepared_admission_publis
 }
 
 #[test]
-/// 清洗状态跨实际4KiB叶，Unicode空白只全局trim；保存流式发布后仍保留一次Undo/Redo。
+/// Preserve sanitization across actual 4-KiB leaves, global Unicode trim and one save/undo/redo history.
 fn long_sanitize_boundaries_save_and_history_preserve_exact_bytes() {
     let (directory, original) = document(SOURCE);
     drop(original);
     let workspace = crate::MarkdownWorkspace::new(directory.path().to_path_buf());
     let access = workspace.open_session().unwrap();
-    // 保存必须由原vault规范路径打开；/var与/private别名不能替代同一关联的真实保存权限。
+    // Save through this private workspace's canonical associated path; /var and
+    // /private aliases cannot substitute another path for the actual save authority.
     let mut doc = access.open_document_buffer("cell-draft.md").unwrap();
     let token = begin(&mut doc);
     let prefix = "\u{a0}\u{2003}";
     let mut raw = format!("{prefix}{}", "a".repeat(4095 - prefix.len()));
-    raw.push_str("\\|中 "); // 反斜线位于原byte4095，pipe在下一真实叶，保持已转义形式。
+    raw.push_str("\\|中 "); // The slash at byte 4095 escapes a pipe in the next actual leaf.
     raw.push_str(&"b".repeat(8190 - raw.len()));
-    raw.push_str("\\\\|"); // 偶数反斜线之后的pipe仍须再补一条转义反斜线。
+    raw.push_str("\\\\|"); // An even backslash run still requires another slash to escape the following pipe.
     raw.push_str(&"c".repeat(12_287 - raw.len()));
-    raw.push_str("\r\n"); // CR位于叶末，下一叶LF不能多产生空格。
+    raw.push_str("\r\n"); // A leaf-final CR and next-leaf LF must sanitize to only one space.
     raw.push_str(&"正文😀".repeat(20_000));
     raw.push_str(&"\u{2003}\t\r\n".repeat(4096));
     replace(&mut doc, &token, &raw);
@@ -694,7 +737,7 @@ fn long_sanitize_boundaries_save_and_history_preserve_exact_bytes() {
 }
 
 #[test]
-/// 未发布候选的真实EIO拒绝本次事务，但不能把它误记成原raw Source故障。
+/// A reclaim failure in the real unpublished candidate rejects it without poisoning the original raw source.
 fn candidate_reclaim_failure_rolls_back_without_poisoning_the_original_draft() {
     struct FailCandidate;
     impl MarkdownTextChangeObserver for FailCandidate {
@@ -756,16 +799,20 @@ fn candidate_reclaim_failure_rolls_back_without_poisoning_the_original_draft() {
     assert_eq!(tail, [0x4e2d, 0xd83d, 0xde00]);
     drop(read);
     replace(&mut doc, &token, "继续编辑");
-    doc.commit_cell_draft_observed(&token, NoopObserver)
+    // Continue with real public editing after rollback, then prepare the new
+    // input serial and consume exactly that ticket through Native's commit boundary.
+    let edit = doc.capture_cell_draft_edit(&token).unwrap();
+    let prepared = doc.prepare_cell_draft_commit(edit, None).unwrap();
+    doc.commit_prepared_cell_draft_observed(prepared, NoopObserver)
         .unwrap()
         .edit
         .unwrap();
     assert_eq!(canonical(&doc), SOURCE.replacen("| a |", "| 继续编辑 |", 1));
-    assert!(!resources.is_released()); // 后继成功不能把先前真实候选I/O失败洗成健康释放。
+    assert!(!resources.is_released()); // Later success cannot erase an earlier actual candidate-cleanup failure.
 }
 
 #[test]
-/// 取消和Doc退场不销毁仍由准入票拥有的独立候选；最后票Drop才真正munmap。
+/// Cancellation/document retirement leave the ticket's independent candidate alive until its final actual drop.
 fn cancelled_long_ticket_retains_only_its_candidate_until_actual_drop() {
     let (_directory, mut doc) = document(SOURCE);
     let original = doc.original_backing_observer().unwrap();
@@ -783,7 +830,7 @@ fn cancelled_long_ticket_retains_only_its_candidate_until_actual_drop() {
 }
 
 #[test]
-/// 全部输入被trim时不建立零长映射；普通关闭无空Undo，追加行仍由原独立测试覆盖。
+/// All-trimmed input creates no zero-length mapping; ordinary completion keeps the existing empty-cell semantics.
 fn long_whitespace_sanitizes_to_the_existing_empty_cell_semantics() {
     let (_directory, mut doc) = document(SOURCE);
     let token = begin(&mut doc);
@@ -800,7 +847,7 @@ fn long_whitespace_sanitizes_to_the_existing_empty_cell_semantics() {
 }
 
 #[test]
-/// 只在独立测试进程改变临时目录或文件大小限制；真实ENOENT/EFBIG都保原草稿可见可改。
+/// Change directory/size limits only in a private child; real ENOENT/EFBIG must preserve the editable draft.
 fn anonymous_output_io_failures_preserve_the_original_draft() {
     const CHILD: &str = "OMNI_CELL_OUTPUT_IO_CHILD";
     if let Some(kind) = std::env::var_os(CHILD) {
@@ -815,8 +862,9 @@ fn anonymous_output_io_failures_preserve_the_original_draft() {
         let second = doc.capture_cell_draft(&token).unwrap();
         let before = doc.cell_draft_facts(&token).unwrap();
         let baseline = doc.storage_profile();
-        // 本 --exact 子进程没有其他测试竞争FD；原Doc、草稿和两个reader在前后均保持存活。
-        // 每次目录迭代器只活在同一局部查询内，贡献对称，返回前已关闭；枚举失败不能算作释放。
+        // This --exact child has no competing tests; the real document, draft and
+        // two readers stay alive across the operation. Each /dev/fd iterator ends
+        // inside its query, and enumeration failure cannot count as release.
         let open_descriptors = || {
             let mut count = 0;
             for descriptor in std::fs::read_dir("/dev/fd").unwrap() {
@@ -827,30 +875,33 @@ fn anonymous_output_io_failures_preserve_the_original_draft() {
         };
         let descriptors_before = open_descriptors();
         let result = if kind == "create" {
-            std::fs::remove_dir(&scratch).unwrap(); // 原快照与raw文件均已匿名，删除空scratch不影响原字节。
+            std::fs::remove_dir(&scratch).unwrap(); // Original snapshot/raw files are anonymous; removing empty scratch changes no bytes.
             prepare(&doc, &token)
         } else {
-            // SAFETY: rlimit只有整数值；独立子进程暂改自身文件大小上限，不触及并行测试或用户进程。
+            // SAFETY: rlimit contains integer fields; this isolated child changes
+            // only its own file-size limit, never another test or user process.
             let mut old: libc::rlimit = unsafe { std::mem::zeroed() };
-            // SAFETY: old指向完整rlimit，getrlimit只写该值，不取得指针所有权。
+            // SAFETY: old is a complete rlimit value; getrlimit writes it without retaining ownership.
             assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut old) }, 0);
             let limited = libc::rlimit {
                 rlim_cur: 4096,
                 rlim_max: old.rlim_max,
             };
-            // SAFETY: SIG_IGN是标准handler常量；只在本子进程让真实write返回EFBIG，结束后恢复。
+            // SAFETY: SIG_IGN is the standard handler constant. Only this child
+            // temporarily requests real write failure as EFBIG, restoring the handler below.
             let signal = unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
-            // SAFETY: limited是完整只读rlimit，调用只修改本子进程资源上限。
+            // SAFETY: limited is a complete read-only rlimit; setrlimit changes only this process.
             assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limited) }, 0);
             let result = prepare(&doc, &token);
-            // SAFETY: old为本进程先前读得的值，恢复软上限不提升原硬上限。
+            // SAFETY: old came from this process; restoring its soft limit does not raise the original hard limit.
             assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &old) }, 0);
-            // SAFETY: 恢复刚才返回的同一有效handler，不安装新回调或跨进程信号状态。
+            // SAFETY: Restore the same valid returned handler, without introducing another callback or process state.
             unsafe { libc::signal(libc::SIGXFSZ, signal) };
             result
         };
-        // 真实创建/写入失败已返回且rlimit已恢复；候选输出必须归还其FD，不能只撤prepared标志。
-        // 不再查询已关闭FD的旧整数，避免将整数重用后的别的文件误判为原候选仍存活。
+        // Real create/write failure returned and rlimit was restored. Candidate
+        // output must close its actual FD, not just clear a prepared flag. Do not
+        // inspect a stale numeric descriptor that could now identify another file.
         assert_eq!(open_descriptors(), descriptors_before);
         let expected = if kind == "create" {
             libc::ENOENT

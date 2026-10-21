@@ -1,4 +1,5 @@
-//! 有限表格cell的单次源替换计划；补格时保留真实pipe、容器、EOL与原canonical Undo入口。
+//! A bounded cell's single source-replacement plan. Filling missing cells keeps
+//! actual pipes, containers and EOLs, using the original canonical Undo entry.
 
 use super::{table_source::MarkdownTableSourceIdentity, *};
 use crate::markdown_viewport_presentation::{
@@ -10,16 +11,19 @@ use crate::markdown_viewport_presentation::{
 };
 
 #[derive(Debug)]
-/// 计划只保一次有限replacement和root Weak。原生层须在自己的意图token仍有效时提交。
+/// Retain one bounded replacement and weak root identity. The native caller must
+/// still admit its own current editing-intent token before committing this plan.
 pub struct MarkdownTableCellEditPlan {
     pub(super) cell: VerifiedMarkdownTableCellSource,
     replacement: String,
-    /// 实际缺格分隔符和显式替换正文分开计量；后者不能冒充草稿激活前缀。
+    /// Measure actual missing-cell separators separately from explicit payload.
+    /// Replacement text cannot impersonate the prefix used to activate a draft.
     pub(super) separator_prefix_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
-/// 原成员行与Header/End的编辑上下文；不包含inline样式Ready或正文副本。
+/// Editing context for the original member row and Header/End. This contains
+/// neither inline-style Ready authority nor a copy of the row text.
 pub(super) struct TableCellEditContext {
     pub header: Range<usize>,
     pub delimiter: Range<usize>,
@@ -31,7 +35,8 @@ pub(super) struct TableCellEditContext {
     pub end: Option<pulldown_cmark::block_frontier::VerifiedTableEnd>,
 }
 
-/// 原实际格后只有连续缺格；真实尾pipe已充当第一条分隔符，不能再次补写。
+/// Only consecutive missing cells follow the last actual cell. A structural
+/// trailing pipe already supplies the first separator and must not be added twice.
 pub(super) fn missing_cell_separators(
     column: usize,
     first_missing: usize,
@@ -44,10 +49,12 @@ pub(super) fn missing_cell_separators(
 }
 
 impl MarkdownTableCellEditPlan {
-    /// 草稿会话在消费计划前捕获原列方向；不从 raw 文字或当前光标重新查另一张表。
+    /// Capture original column alignment before consuming the draft plan, without
+    /// looking up another table from raw text or the current cursor.
     ///
     /// # Errors
-    /// 原来源失败或计划所属根失效时拒绝，不消费计划或创建草稿。
+    /// Reject Source failure or revoked root identity without consuming the plan
+    /// or creating a draft.
     pub fn alignment_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -55,13 +62,15 @@ impl MarkdownTableCellEditPlan {
         self.cell.alignment_for(document)
     }
 
-    /// 返回前重核真实root及代次；NSString构造等可重入操作之后仍须在提交边界再次检查。
+    /// Recheck the actual root and generation before returning. After reentrant
+    /// work such as NSString construction, the commit boundary must check again.
     pub fn replacement_for(
         &self,
         document: &MarkdownDocumentBuffer,
     ) -> Result<(&Range<usize>, &str), MarkdownTableWindowError> {
         if !self.cell.source.is_current(document) {
-            // 编辑、Undo、换note都不能复用旧整数坐标，即使新长度恰好相同。
+            // Editing, Undo and note changes revoke old integer coordinates even
+            // when the successor happens to have exactly the same text length.
             return Err(MarkdownTableWindowError::InvalidSource);
         }
         Ok((&self.cell.range, &self.replacement))
@@ -69,8 +78,10 @@ impl MarkdownTableCellEditPlan {
 }
 
 impl MarkdownDocumentBuffer {
-    /// 仅供Core内部组合已验证票据；外部不能用伪造投影与相同代次坐标创建编辑计划。
-    /// escaped_cell_source沿既有单元格输入规则事先转义pipe并归一化用户换行，此处不改用户字节。
+    /// Compose already-verified receipts inside Core. External callers cannot
+    /// manufacture an edit plan from a fabricated projection with equal generation.
+    /// escaped_cell_source has already escaped pipes and normalized user line
+    /// breaks under the cell-input rule; this layer does not rewrite those bytes.
     pub(crate) fn plan_projected_table_cell_edit(
         &self,
         source: &MarkdownTableSourceIdentity,
@@ -80,14 +91,16 @@ impl MarkdownDocumentBuffer {
         escaped_cell_source: &str,
     ) -> Result<MarkdownTableCellEditPlan, MarkdownTableWindowError> {
         if !source.is_current(self) || window.generation != self.generation() {
-            // 先拒绝其他root，不能读取外来投影的行尾或由它推导补格前缀。
+            // Reject another root before reading its projected row end or deriving
+            // any prefix for missing cells from that unrelated projection.
             return Err(MarkdownTableWindowError::InvalidSource);
         }
         let cell = self.projected_table_cell_source(window, row_ordinal, column_index)?;
         self.plan_table_cell_source_replacement(cell, escaped_cell_source)
     }
 
-    /// 认证窗口和原编辑计划共用同一份端点规则；返回纯结构来源，不构造 replacement 或 inline Ready。
+    /// Verified windows and edit plans share these endpoint rules. Return a
+    /// structural Source only, without constructing replacement text or inline Ready.
     pub(super) fn projected_table_cell_source(
         &self,
         window: &MarkdownProjectedTableWindow,
@@ -103,7 +116,8 @@ impl MarkdownDocumentBuffer {
         if self.utf16_offset_for_byte(row.byte_range.start).ok() != Some(row.utf16_range.start)
             || self.utf16_offset_for_byte(row.byte_range.end).ok() != Some(row.utf16_range.end)
         {
-            // row的byte/UTF16坐标必须同时落在当前piece源，不能拿投影坐标替换原文。
+            // Both byte and UTF-16 row coordinates must agree with the current
+            // piece Source. Display coordinates cannot be used to replace raw text.
             return Err(MarkdownTableWindowError::InvalidSource);
         }
         let range = match &cell.source {
@@ -114,7 +128,8 @@ impl MarkdownDocumentBuffer {
                     || self.byte_offset_for_utf16(range.start).is_err()
                     || self.byte_offset_for_utf16(range.end).is_err()
                 {
-                    // 显式空格 trim 后也可以是零长 Present；只证明真实范围，不补新列。
+                    // Trimming a present empty cell may leave an empty Present
+                    // range. It remains an actual cell, not permission to add a column.
                     return Err(MarkdownTableWindowError::InvalidSource);
                 }
                 range.clone()
@@ -123,7 +138,8 @@ impl MarkdownDocumentBuffer {
                 insertion_anchor_utf16,
             } => {
                 if *insertion_anchor_utf16 != row.utf16_range.end {
-                    // 缺格只有原行内容末端锚点，不产生可读取字符，也不能跨 EOL 借邻行正文。
+                    // A missing cell has only the original row-content-end anchor,
+                    // no readable characters or permission to cross into the next EOL/row.
                     return Err(MarkdownTableWindowError::InvalidSource);
                 }
                 *insertion_anchor_utf16..*insertion_anchor_utf16
@@ -136,8 +152,10 @@ impl MarkdownDocumentBuffer {
             cell.source,
             MarkdownTableWindowCellSource::ImplicitEmpty { .. }
         );
-        // 有限窗口与流式 Scanner 在签发格票时各自证实同一种补列事实，消费计划时不再解释范围。
-        // 此路径只读取原有限投影的尾部 padding；正式巨格直接携带原 Scanner 的结果，不重读整格。
+        // The bounded window and streaming Scanner each prove the same separator
+        // fact when issuing a receipt. Consuming that plan need not reinterpret its
+        // range. This bounded path reads only projected trailing padding; giant
+        // cells already carry the Scanner's fact and are not reread in full.
         let separators = if implicit_empty {
             let insertion_anchor_utf16 = range.start;
             let cells = window
@@ -162,19 +180,22 @@ impl MarkdownDocumentBuffer {
                     MarkdownTableWindowCellSource::Present(_) => true,
                 })
             {
-                // 原 Parser 只在同一行尾补连续缺格；中间再有真实格不能按空列插入。
+                // The Parser appends only consecutive missing cells at one row
+                // end. A later present cell cannot be treated as an empty insertion.
                 return Err(MarkdownTableWindowError::ParserMismatch);
             }
             let tail_start = if let Some(index) = first_missing.checked_sub(1) {
                 match &cells[index].source {
-                    // 最后一个真实格末尾之后才可能有结构尾 pipe 或行内 padding。
+                    // Only after the last present cell may this tail contain the
+                    // structural closing pipe or within-row padding.
                     MarkdownTableWindowCellSource::Present(range) => range.end,
                     MarkdownTableWindowCellSource::ImplicitEmpty { .. } => {
                         return Err(MarkdownTableWindowError::ParserMismatch);
                     }
                 }
             } else {
-                // 没有真实前驱的极小行仍受原有限窗口的独立 64KiB 读取上限约束。
+                // A small row without a present predecessor still obeys this
+                // bounded-window path's independent 64 KiB read limit.
                 row.utf16_range.start
             };
             if tail_start < row.utf16_range.start || tail_start > insertion_anchor_utf16 {
@@ -188,7 +209,8 @@ impl MarkdownDocumentBuffer {
                 .map_err(|_| MarkdownTableWindowError::SourceLimit)?;
             let trimmed = tail.trim_end_matches([' ', '\t']);
             let trailing_pipe = trimmed.ends_with('|') && {
-                // 字符之外必须有原 Parser 的 TABLE_BOUNDARY 证据；escaped pipe 不能算闭列。
+                // The character also needs the Parser's TABLE_BOUNDARY evidence.
+                // An escaped literal pipe cannot close a structural column.
                 let at = tail_start + trimmed.encode_utf16().count() - 1;
                 let index = window.runs.partition_point(|run| run.utf16_range.end <= at);
                 window.runs.get(index).is_some_and(|run| {
@@ -200,7 +222,7 @@ impl MarkdownDocumentBuffer {
             };
             missing_cell_separators(column_index, first_missing, trailing_pipe)?
         } else {
-            0 // 显式空格的零长原范围是现成格，不能因显示为空额外插入分隔符。
+            0 // A present empty range is already a cell; empty display alone never adds a separator.
         };
         Ok(VerifiedMarkdownTableCellSource {
             source,
@@ -212,17 +234,18 @@ impl MarkdownDocumentBuffer {
                 row_ordinal,
                 column: column_index,
                 columns: window.column_count,
-                end: None, // 原 verified owner 在边界附加 End；metadata 本身不能推断表尾。
+                end: None, // The verified owner attaches End at its boundary; metadata alone cannot prove table end.
             },
             range,
             implicit_empty,
             separators,
             alignment: cell.alignment,
-            inline_seed: None, // 普通格已由 verified window 的完整语义授权；此编辑端点工厂不另签 inline。
+            inline_seed: None, // The verified window owns complete ordinary-cell semantics; this factory issues no new inline authority.
         })
     }
 
-    /// 短窗口与流式原格扫描共用唯一计划构造；上游各自交出真实GFM端点，不另定义补格协议。
+    /// Short windows and streamed original cells use one plan constructor. Each
+    /// upstream producer supplies actual GFM endpoints, without a second filling protocol.
     pub(super) fn plan_table_cell_source_replacement(
         &self,
         cell: VerifiedMarkdownTableCellSource,
@@ -236,7 +259,8 @@ impl MarkdownDocumentBuffer {
             || range.start > range.end
             || range.end > context.row_utf16.end
         {
-            // 上游已经认证行与格的标量端点；这里只核原root及相同行范围，不重复回读整格找坐标。
+            // Upstream already verified row/cell scalar boundaries. Check root
+            // identity and row containment without rereading a whole cell for coordinates.
             return Err(MarkdownTableWindowError::InvalidSource);
         }
         if context.columns == 0
@@ -249,19 +273,22 @@ impl MarkdownDocumentBuffer {
         if escaped_cell_source.len() > TABLE_WINDOW_MAX_BYTES
             || escaped_cell_source.contains(['\r', '\n'])
         {
-            // 这仍是原有限显式替换入口；长草稿沿同一plan进入流式sanitize，而非扩大String准入。
+            // This explicit-replacement entry remains bounded. Long drafts use
+            // the same plan with streamed sanitization, not a larger String allowance.
             return Err(MarkdownTableWindowError::SourceLimit);
         }
         let total = escaped_cell_source
             .len()
             .saturating_add(separators.saturating_mul(3));
         if total > TABLE_WINDOW_MAX_BYTES {
-            // 补格分隔符同样计入单批源预算，不能在payload准入后额外无界增长。
+            // Missing-cell separators count against the same source budget;
+            // admitting payload cannot permit unbounded extra prefix growth.
             return Err(MarkdownTableWindowError::SourceLimit);
         }
         let mut replacement = String::with_capacity(total);
         for _ in 0..separators {
-            // 一次源替换同时补齐目标之前的空列；最多column_count条，保留一次Undo动作。
+            // Fill the target's preceding empty columns in this one replacement,
+            // using at most column_count separators and retaining a single Undo.
             replacement.push_str(" | ");
         }
         replacement.push_str(escaped_cell_source);
@@ -282,6 +309,8 @@ mod tests {
     };
 
     fn fixture(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+        // Each case owns an isolated real file and its production document. The
+        // source text below is finite fixture input, not a second storage adapter.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("S2-owned-cell-edit.md");
         std::fs::write(&path, source).unwrap();
@@ -294,7 +323,8 @@ mod tests {
         generation: u64,
         prefix: usize,
     ) -> Result<MarkdownProjectedTableWindow, MarkdownTableWindowError> {
-        // 纯fixture可遍历自身短源建立已知行，不把此函数放入真实global producer。
+        // This finite fixture can enumerate its known short lines. Production
+        // global producers do not use this helper or materialize a whole line list.
         let mut byte_start = 0;
         let mut utf16_start = 0;
         let mut lines = Vec::new();
@@ -367,7 +397,8 @@ mod tests {
         };
         let actual = document.materialize_viewport(range.clone(), 0).unwrap();
         assert_eq!(actual.text, "新😀");
-        // 计划交给原canonical单次替换；一次Undo完整还原source/容器/EOL，旧plan永不复活。
+        // One canonical replacement restores exact source/container/EOL bytes on
+        // Undo. Returning to those bytes cannot revive the consumed generation's plan.
         assert!(document.undo().is_some());
         assert_eq!(
             document
@@ -397,14 +428,16 @@ mod tests {
             ("a\\\\|", 1, "a\\\\| | 新😀"),
             ("`a|b`", 3, "`a|b` |  | 新😀"),
         ] {
-            // 每个case由真实固定Parser给出缺格/marker，期望不按pipe奇偶或code span自行猜测。
+            // The actual pinned Parser proves missing cells and markers. Expected
+            // edits do not guess membership from pipe parity or code-span heuristics.
             apply_and_check(row, target, expected, "", "\n");
         }
     }
 
     #[test]
     fn explicit_empty_and_crlf_quote_container_do_not_gain_a_spurious_column() {
-        // 单独一条pipe不是固定Parser认可的body row，不能以补格计划把非成员“修成”同一张表。
+        // A bare pipe is not a body row under the pinned Parser. A filling plan
+        // cannot turn a nonmember line into another row of this table.
         let non_member = "| H1 | H2 | H3 | H4 |\n| - | - | - | - |\n|\n";
         assert_eq!(
             try_projected(non_member, 0, 0),
@@ -416,6 +449,8 @@ mod tests {
 
     #[test]
     fn invalid_intent_source_or_non_normalized_input_preserves_bytes_and_history() {
+        // Reject actual invalid input/coordinates before history mutation, then
+        // invalidate a previously valid plan through an ordinary production edit.
         let source = "| H1 | H2 |\n| - | - |\n| a |\n";
         let (_directory, mut document) = fixture(source);
         let window = projected(source, document.generation(), 0);

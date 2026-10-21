@@ -1,8 +1,10 @@
-//! 局部输入只修改独立descriptor分支；全部可失败校验完成后才替换草稿root与serial。
+//! Local input changes an independent descriptor branch. Replace the draft root
+//! and serial only after every fallible preparation and validation succeeds.
 
 use super::*;
 
-/// 某次局部编辑的固定nonce与serial；只能由原会话捕获，不能Clone或从裸坐标构造。
+/// Fixed nonce and serial for one local edit. Only the original session may
+/// capture it; it cannot be cloned or constructed from bare coordinates.
 pub struct MarkdownCellDraftEditCapsule {
     scope: Weak<Scope>,
     serial: u64,
@@ -17,6 +19,8 @@ pub(super) struct DraftSource<'a> {
 
 impl PieceByteSource for DraftSource<'_> {
     fn source_health(&self) -> Result<(), MarkdownDocumentBufferError> {
+        // Original storage and draft deltas retain their own actual health before
+        // serial revocation is considered. A delta-only tree cannot hide original I/O.
         self.document
             .original_backing_health()
             .inspect_err(|&error| self.scope.record_source(error))?;
@@ -27,7 +31,8 @@ impl PieceByteSource for DraftSource<'_> {
             .require(self.serial)
             .map_err(|error| match error {
                 MarkdownCellDraftError::Document(error) => error,
-                // 树内部只返回Core错误；外层原token门仍以独立Stale区分草稿权限。
+                // Tree internals return Core errors. The original outer token
+                // boundary still distinguishes draft authority with its own Stale.
                 _ => MarkdownDocumentBufferError::PreparedTextInputStale,
             })
     }
@@ -49,7 +54,8 @@ impl PieceByteSource for DraftSource<'_> {
         }
     }
 
-    /// 原草稿仍用相同scope与段表，仅将本次原叶内字节范围交给真实存储。
+    /// Keep this same draft scope/segment table and pass only this call's original
+    /// leaf-local byte range to actual storage.
     #[cfg(feature = "paged-shaping-frontier")]
     fn piece_range_bytes(
         &self,
@@ -77,10 +83,13 @@ pub(super) fn validate_positions(
     marked: &Option<Range<usize>>,
 ) -> Result<(), MarkdownDocumentBufferError> {
     for at in [selection.anchor_utf16, selection.head_utf16] {
-        // 选区不能落在surrogate内部；超尾也沿同一真实树查询拒绝。
+        // Selection cannot lie inside a surrogate pair. The same actual tree
+        // lookup rejects endpoints beyond its real extent.
         byte_offset_for_utf16_in_tree(source, root.as_deref(), at, 0)?;
     }
     if let Some(range) = marked {
+        // Marked ranges have independent directed bounds: validate both scalar
+        // endpoints, rather than accepting a length measured against another root.
         if range.start > range.end {
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
@@ -117,7 +126,8 @@ impl PendingCellDraft {
             if let Some(kind) = kind {
                 history::grouping::validate_input_kind(kind, range.start, 0, &marked)?;
             }
-            // 没有字符变化只走输入状态门；不能因选区/unmark造历史root或撤销相同正文来源。
+            // No character change goes through the state-only boundary. Selection
+            // or unmark cannot create history roots or revoke an unchanged text Source.
             return self.set_state(document, selection, marked);
         }
         let next_serial = self
@@ -141,7 +151,8 @@ impl PendingCellDraft {
             replacement,
         })?;
         self.history.reserve_group(&group)?;
-        // 先切原候选再追加，失败不产生垃圾delta；原Source错误先于提交新输入。
+        // Split the old candidate before appending, so an endpoint/source failure
+        // creates no unused delta. Original Source failure precedes new input commit.
         let (prefix, tail) = split_piece_tree(&source, self.root.clone(), start)?;
         let (_, suffix) = split_piece_tree(&source, tail, end - start)?;
         let checkpoint = command_transaction::AppendCheckpoint::capture_segments(&self.edits);
@@ -150,17 +161,21 @@ impl PendingCellDraft {
                 let backing = self
                     .edits
                     .freeze_input(text, MARKDOWN_CELL_DRAFT_MAX_DELTA_BYTES)?;
-                // 只登记本次新建的raw文件；先取得实际票，覆盖后续叶读取失败及事务回退。
-                // 激活时继承的canonical段不经过这里，仍由Doc承担最终释放义务。
+                // Observe only the newly created raw file, before later leaf reads
+                // or transaction rollback can fail. Inherited canonical segments
+                // do not enter here; their final release still belongs to the document.
                 self.scope.observe_raw_backing(backing.observer());
                 self.edits
                     .append_frozen(backing, MARKDOWN_CELL_DRAFT_MAX_DELTA_BYTES)?
             } else {
-                // 原有限堆尾没有映射义务，不分配观察清单或制造虚构文件票。
+                // A bounded heap tail has no mapping obligation. Do not allocate
+                // an observer list or invent a file receipt for that path.
                 self.edits
                     .append(text, MARKDOWN_CELL_DRAFT_MAX_DELTA_BYTES)?
             };
-            // 每段最多损失三个UTF-8尾字节；descriptor也有独立预算，不能靠大量标量留下无限小尾段。
+            // Each segment loses at most three UTF-8 tail bytes. A separate
+            // descriptor bound prevents many scalar-sized appends from accumulating
+            // an unbounded collection of tiny tail segments.
             let maximum_descriptors = self
                 .base_descriptors
                 .saturating_add(
@@ -182,13 +197,15 @@ impl PendingCellDraft {
             };
             validate_positions(&source, &root, selection, &marked)?;
             source.source_health()?;
-            self.edits.pending_health()?; // 新文件只在此准备成功后移交raw Source，失败保原分支可编辑。
+            self.edits.pending_health()?; // Transfer new files to raw Source only after successful preparation; failure retains the old branch.
             Ok(root)
         })();
         let root = match result {
             Ok(root) => root,
             Err(error) => {
-                // closure的失败候选root先实际Drop；随后只回退本分支，canonical与旧读取段均不写穿。
+                // The closure's failed candidate root has already dropped. Roll
+                // back this branch only; canonical text and old reader segments
+                // cannot be modified through the candidate's storage checkpoint.
                 checkpoint.rollback_segments(&mut self.edits);
                 self.scope.record_source(error);
                 return Err(error.into());
@@ -196,7 +213,7 @@ impl PendingCellDraft {
         };
         self.history
             .record_group(group, self.root.take(), self.selection);
-        self.edits.publish(); // 所有验证已成功；此刻起新匿名段才属于原raw Source。
+        self.edits.publish(); // All validation succeeded; new anonymous segments now belong to the original raw Source.
         self.root = root;
         self.selection = selection;
         self.marked_range = marked;
@@ -218,13 +235,15 @@ impl MarkdownDocumentBuffer {
     ) -> Result<&PendingCellDraft, MarkdownCellDraftError> {
         let pending = self.active_cell_draft_scope(&edit.scope)?;
         if pending.serial != edit.serial {
-            // 会话仍活也不能把旧UI范围补签为当前serial；失败后调用方须重新捕获一次权限。
+            // A live session cannot renew old UI ranges with the current serial.
+            // After rejection the caller must capture new authority explicitly.
             return Err(MarkdownCellDraftError::Stale);
         }
         Ok(pending)
     }
 
-    /// 在调用Native/读取UI之前捕获本次输入权限；后来任一成功输入都会撤销这张旧票。
+    /// Capture this input authority before native calls/UI reads. A later
+    /// successful input-state change revokes the old receipt.
     pub fn capture_cell_draft_edit(
         &self,
         token: &MarkdownCellDraft,
@@ -236,8 +255,9 @@ impl MarkdownDocumentBuffer {
         })
     }
 
-    /// 按cell局部坐标替换原始输入；大草稿准入不提前使用64Ki提交限制。
-    /// 所有失败保留原草稿、serial、局部选区/marked与canonical的一步Undo基线。
+    /// Replace raw input in cell-local coordinates. Large draft admission does
+    /// not prematurely impose the 64 Ki-unit inline commit threshold. Failure
+    /// preserves the draft, serial, local selection/marked state and canonical Undo baseline.
     pub fn replace_cell_draft(
         &mut self,
         edit: MarkdownCellDraftEditCapsule,
@@ -250,14 +270,17 @@ impl MarkdownDocumentBuffer {
         let Some(CellDraftSlot::Active(mut pending)) = self.cell_draft.take() else {
             unreachable!("已核唯一活动草稿");
         };
-        // 同步纯Rust编辑期间暂借出slot，以便候选source只借Doc；不运行任何外部或Native回调。
+        // Temporarily take the slot so the candidate Source can borrow the document
+        // during synchronous pure Rust editing. No external/native callback runs.
         let result = pending.replace(self, range, text, selection_after, marked_after, None);
         self.cell_draft = Some(CellDraftSlot::Active(pending));
         result
     }
 
-    /// 消费同一原输入的两张封闭票；只合并已证明相邻的typing或同一完整marked替换。
-    /// 权限、语义载荷或真实追加失败不改变原root、分组、delta、选区与canonical。
+    /// Consume the same original input's two sealed receipts. Merge only proven
+    /// adjacent typing or replacement of that same complete marked range.
+    /// Authority, semantic-input or actual append failure leaves the original
+    /// root, grouping, delta, selection and canonical document unchanged.
     pub fn replace_cell_draft_grouped(
         &mut self,
         edit: MarkdownCellDraftEditCapsule,

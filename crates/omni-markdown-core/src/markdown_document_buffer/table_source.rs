@@ -1,4 +1,4 @@
-//! S2结构producer的真实piece-tree字节借用；不构造全文/整表String或强持第二份源图。
+//! Lend actual piece-tree bytes to the structural producer without copying a document/table or owning another source graph.
 
 use std::sync::Weak;
 
@@ -28,7 +28,7 @@ pub(crate) struct BorrowedMarkdownTableSourceFrame<'a> {
 }
 
 impl BorrowedMarkdownTableSourceFrame<'_> {
-    /// 消费者必须在发布任何成功step或Ready之前完成真实窗口回收；失败不得继续旧票。
+    /// Finish the real lease before publishing a successful step or Ready; failure cannot authorize stale continuation.
     pub(crate) fn finish(self) -> Result<(), MarkdownDocumentBufferError> {
         self.bytes.finish()
     }
@@ -36,7 +36,8 @@ impl BorrowedMarkdownTableSourceFrame<'_> {
 
 impl std::fmt::Debug for BorrowedMarkdownTableSourceFrame<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 只输出结构坐标，避免把借用的个人正文写入默认日志。
+        // Debug output contains bounded structural coordinates, never borrowed
+        // document text or a user's content embedded in a default log message.
         formatter
             .debug_struct("BorrowedMarkdownTableSourceFrame")
             .field("generation", &self.generation)
@@ -49,6 +50,8 @@ impl std::fmt::Debug for BorrowedMarkdownTableSourceFrame<'_> {
 
 #[derive(Clone)]
 pub(crate) struct MarkdownTableSourceIdentity {
+    // The weak control block preserves original root identity without retaining
+    // its document, mapping or edit payload; generation separately revokes undo reuse.
     generation: u64,
     byte_len: usize,
     root: Weak<MarkdownPieceTreeNode>,
@@ -72,7 +75,7 @@ impl MarkdownTableSourceIdentity {
         self.byte_len
     }
 
-    /// root Weak保持allocation身份，generation拒绝Undo回到相同root时擅自复活旧状态。
+    /// Require original allocation identity and generation; undo to the same root cannot revive old state.
     pub(crate) fn is_current(&self, document: &MarkdownDocumentBuffer) -> bool {
         document.original_backing_health().is_ok()
             && self.generation == document.generation
@@ -85,12 +88,12 @@ impl MarkdownTableSourceIdentity {
 }
 
 impl MarkdownDocumentBuffer {
-    /// 单一 code 权限 owner 与固定小块输入的真实直接库存；巨段不申请段落正文缓冲。
+    /// Account for one code-permission owner and bounded input, never a paragraph-sized text buffer.
     pub(crate) fn underline_code_workspace_bytes() -> usize {
         inline_code::workspace_bytes()
     }
-    /// 先凭真实scanner的ASCII计数排除无关definition，再复制并规范化有限完整label。
-    /// candidate的真实block/scope身份仍由global producer负责，不能用本结果倒推成员权限。
+    /// Exclude irrelevant definitions by actual scanner counts before copying a bounded complete label.
+    /// The global producer still owns block/scope membership; a normalized match cannot establish it.
     #[cfg(test)]
     pub(crate) fn table_reference_candidate_label(
         &self,
@@ -100,11 +103,13 @@ impl MarkdownDocumentBuffer {
         continuation_prefix: impl Fn(&[u8]) -> Option<usize>,
     ) -> Result<Option<String>, MarkdownTableWindowError> {
         if !source.is_current(self) || candidate.source_revision != self.generation() {
-            // 同generation的不同note也必须由捕获root Weak拒绝，不能只比对u64。
+            // Equal generations in different notes do not share the captured
+            // root's authority; compare the actual weak identity as well.
             return Err(MarkdownTableWindowError::InvalidSource);
         }
         if !queries.may_match_ascii_count(candidate.label_ordinary_ascii) {
-            // 巨大普通ASCII标签在此零正文复制返回；不读取它的URL/title或构造全局label表。
+            // A huge excluded ASCII label needs no body copy, destination/title
+            // read or second document-wide label inventory.
             return Ok(None);
         }
         let end = candidate
@@ -121,36 +126,41 @@ impl MarkdownDocumentBuffer {
             .normalized_label(&raw, continuation_prefix)
             .map_err(|_| MarkdownTableWindowError::ParserMismatch)?;
         if !queries.needs_definition(&normalized)? {
-            // cheap排除只是必要条件；最后仍使用原label规范化及固定UniCase比较。
+            // The count filter is only necessary, not sufficient. The original
+            // normalization and pinned UniCase comparison decide the actual match.
             return Ok(None);
         }
         Ok(Some(normalized.into_string()))
     }
 
-    /// 只复制已经选中的有限完整源range。Vec直接移交String，不再复制第二次正文。
+    /// Copy only an explicitly selected bounded source range, transferring its Vec allocation into String.
     pub(crate) fn copy_table_source_range(
         &self,
         byte_range: Range<usize>,
         maximum_bytes: usize,
     ) -> Result<String, MarkdownDocumentBufferError> {
         let Some(length) = byte_range.end.checked_sub(byte_range.start) else {
-            // 倒序range不能利用饱和减法变成空请求，再交给后续定义解析获得错误权限。
+            // A reversed range cannot become an empty request through saturating
+            // subtraction and later acquire false definition-parser authority.
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         };
         if maximum_bytes > MAX_TABLE_SOURCE_FRAME_BYTES
             || length > maximum_bytes
             || byte_range.end > self.byte_len()
         {
-            // 分配前限制的是本批实际正文，不以总源长度或此前扫描过的字节数授权超量复制。
+            // Admit this operation's actual text before allocation. Total source
+            // size or past scan work cannot authorize an oversized current copy.
             return Err(MarkdownDocumentBufferError::MaterializationLimitExceeded);
         }
         let mut bytes = Vec::with_capacity(length);
         let mut next = byte_range.start;
         while next < byte_range.end {
-            // 一个range最多64KiB，所有片段复制量之和恰为length；不循环扫描无关piece或源尾。
+            // This explicit range is at most 64 KiB. Piece copies total exactly
+            // its length and never scan unrelated pieces or the remaining source tail.
             let frame = self.table_source_frame(next, byte_range.end - next)?;
             if frame.bytes.is_empty() {
-                // 非空range没有取得真实字节表示源/坐标不一致，不忙重试或返回部分字符串。
+                // Missing bytes inside a nonempty range indicate inconsistent
+                // source/coordinates; do not spin, retry or return a partial string.
                 return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
             }
             bytes.extend_from_slice(&frame.bytes);
@@ -160,7 +170,7 @@ impl MarkdownDocumentBuffer {
         String::from_utf8(bytes).map_err(|_| MarkdownDocumentBufferError::RangeOutsideDocument)
     }
 
-    /// 空源没有表，无需创建可外带的cursor。非空请求仅持root Weak，不延长映射/编辑段生命。
+    /// Empty sources need no table identity; nonempty identities retain only a weak root, not payload lifetime.
     pub(crate) fn table_source_identity(&self) -> Option<MarkdownTableSourceIdentity> {
         self.root.as_ref().map(|root| MarkdownTableSourceIdentity {
             generation: self.generation,
@@ -169,8 +179,8 @@ impl MarkdownDocumentBuffer {
         })
     }
 
-    /// 借出包含指定byte的真实4KiB逻辑片；允许frame切在UTF8内部，由结构scanner续接。
-    /// 返回借用不能越过document寿命，调用者须在任何可重入native操作前结束该借用。
+    /// Borrow the actual logical piece, at most 4 KiB, allowing the structural scanner to resume split UTF-8.
+    /// The borrow cannot outlive the document and must end before any reentrant native operation.
     pub(crate) fn table_source_frame(
         &self,
         byte_start: usize,
@@ -185,6 +195,8 @@ impl MarkdownDocumentBuffer {
             return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
         }
         if byte_start == source_end {
+            // Only the original actual source end supplies an empty EOF frame;
+            // a short physical piece or a caller quota does not establish EOF.
             return Ok(BorrowedMarkdownTableSourceFrame {
                 generation: self.generation,
                 byte_start,
@@ -200,6 +212,8 @@ impl MarkdownDocumentBuffer {
         loop {
             match node {
                 MarkdownPieceTreeNode::Branch { left, right, .. } => {
+                    // Descend by original byte metrics without producing a flat
+                    // piece directory or converting byte coordinates through UTF-16.
                     let left_len = left.metrics().byte_len;
                     if local < left_len {
                         node = left.as_ref();
@@ -209,6 +223,8 @@ impl MarkdownDocumentBuffer {
                     }
                 }
                 MarkdownPieceTreeNode::OriginalSpan(span) => {
+                    // The compact directory locates one original logical piece.
+                    // Its requested subrange remains bounded by that physical piece.
                     let hit = span.locate_byte(local, false)?;
                     let end = hit
                         .local
@@ -226,7 +242,8 @@ impl MarkdownDocumentBuffer {
                 MarkdownPieceTreeNode::Leaf(piece) => {
                     let end = local.saturating_add(maximum_bytes).min(piece.byte_len);
                     let bytes = self.piece_range_bytes(piece, local..end)?;
-                    // 先从仍活lease读取有限长度事实，再移交唯一owner；不Clone或提前Drop来绕过借用。
+                    // Obtain finite length facts while the real lease is live,
+                    // then transfer its unique owner without cloning or early-drop tricks.
                     let real_eof = byte_start + bytes.len() == source_end;
                     return Ok(BorrowedMarkdownTableSourceFrame {
                         generation: self.generation,
@@ -249,6 +266,8 @@ mod tests {
     };
 
     fn fixture(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+        // All actual file I/O is confined to this private synthetic fixture;
+        // the returned directory owns only the source created by this test.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("S2-owned-source.md");
         std::fs::write(&path, source).unwrap();
@@ -256,7 +275,7 @@ mod tests {
         (directory, document)
     }
 
-    /// 配对事务临时重放同一真实Global；独立夹具的初始Root本身就是合法可恢复边界。
+    /// Replay one genuine Global; the fixture's initial root is itself a legal recoverable boundary.
     fn underline_global(
         document: &MarkdownDocumentBuffer,
     ) -> pulldown_cmark::global_frontier::GlobalFrontier {
@@ -282,6 +301,8 @@ mod tests {
     }
 
     fn reference(document: &MarkdownDocumentBuffer, maximum: usize) -> ReferenceCandidate {
+        // Feed actual original pieces to the shared scanner. Finish every lease
+        // before inspecting the scanner's candidate or requesting another frame.
         let identity = document.table_source_identity().unwrap();
         let mut scanner =
             ReferenceDefinitionScanner::new(document.generation(), document.byte_len(), 0).unwrap();
@@ -314,6 +335,8 @@ mod tests {
 
     #[test]
     fn source_frames_borrow_exact_original_and_edited_piece_bytes_at_every_byte() {
+        // Compare finite frame bytes at every original/edited offset, including
+        // UTF-8 interiors; byte framing must not invent scalar alignment or EOF.
         let original = "中😀e\u{301}\r\nsource".repeat(1000);
         let (_directory, mut document) = fixture(&original);
         document
@@ -334,6 +357,8 @@ mod tests {
 
     #[test]
     fn reference_source_adapter_uses_real_piece_leaves_and_preserves_edit_undo_redo_bytes() {
+        // Vary actual frame length across a real definition, then exercise edits
+        // and undo/redo to prove that old generation authority cannot revive.
         let source = "[r]: <https://example.test/😀> \"Title中\"\r\nrest\n";
         let (_directory, mut document) = fixture(source);
         for maximum in 1..=source.len() {
@@ -362,6 +387,8 @@ mod tests {
 
     #[test]
     fn finite_reference_label_copy_uses_piece_source_and_rejects_stale_root() {
+        // Real normalization accepts the finite Unicode label. Equal generation
+        // in another note and later edits must both revoke the original identity.
         let (_directory, mut document) = fixture("[Maße]: <https://x.test/中> '标题'\n");
         let identity = document.table_source_identity().unwrap();
         let candidate = reference(&document, 1);
@@ -388,6 +415,8 @@ mod tests {
 
     #[test]
     fn source_range_copy_is_bounded_and_rejects_partial_utf8() {
+        // Explicit copy retains complete validated UTF-8 and rejects oversized,
+        // reversed, beyond-EOF and partial-scalar ranges without truncating output.
         let (_directory, document) = fixture("中😀tail");
         assert_eq!(document.copy_table_source_range(0..7, 7).unwrap(), "中😀");
         assert!(document.copy_table_source_range(0..7, 6).is_err());
@@ -399,6 +428,8 @@ mod tests {
 
     #[test]
     fn same_generation_different_document_and_accepted_drop_cannot_reuse_source_identity() {
+        // Keep only the weak identity while retiring its actual source owner;
+        // another equal-text document must remain outside that original permission.
         let (_first_dir, first) = fixture("same bytes");
         let (_second_dir, second) = fixture("same bytes");
         let identity = first.table_source_identity().unwrap();
@@ -417,6 +448,8 @@ mod tests {
 
     #[test]
     fn real_source_context_maps_byte_pairs_to_utf16_without_reading_huge_content_as_string() {
+        // Use a huge real source with a small viewport coverage. Incremental
+        // pairing must derive original UTF-16 values and reject a later source edit.
         let mut source = String::from("😀<u>");
         source.extend(std::iter::repeat_n('中', 400_000));
         source.push_str("</u>tail");
@@ -468,7 +501,8 @@ mod tests {
     #[test]
     fn dense_tags_in_large_edit_leaf_do_not_trigger_per_pair_prefix_decoding() {
         let (_directory, mut document) = fixture("seed");
-        // 单次大编辑产生真实edit leaf；旧实现每64pair会重复解码这个leaf的长前缀。
+        // One actual edit creates a large edit leaf. Repeated 64-pair batches
+        // must not decode that leaf's long prefix again for every batch.
         let source = format!("{}{}", "中".repeat(18_000), "<u>😀</u>".repeat(128));
         document
             .replace_utf16_range(0..4, &source, MarkdownTextSelection::caret(0))
@@ -495,7 +529,8 @@ mod tests {
                 break;
             }
         }
-        // 所有byte只扫一次；UTF8校验至多常数次，不随着pair数重复扫描leaf前缀。
+        // Reported source traversal stays linear; UTF-8 validation remains a
+        // constant multiple rather than restarting the prefix for every pair.
         assert_eq!(reads, source.len());
         assert!(validations <= source.len() * 4);
         assert!(
@@ -511,6 +546,8 @@ mod tests {
 
     #[test]
     fn no_html_viewport_keeps_the_original_global_untouched_and_reads_only_its_prefix() {
+        // A viewport with no candidate HTML needs only its actual prefix, without
+        // replaying Global classification over the huge remaining plain source.
         let (_directory, document) = fixture(&"中😀普通正文\n".repeat(40_000));
         let mut global = underline_global(&document);
         let initial = global.total_work();
@@ -529,7 +566,8 @@ mod tests {
             assert_eq!(step.global_source_tree_steps, 0);
             assert!(step.source_bytes + step.structural_transitions <= 4096);
         }
-        // UTF8端点向真实scalar尾计量；快路既不结构重放巨段，也不把整个source解码为String。
+        // Account through the real scalar end near the requested endpoint. This
+        // fast path neither replays the huge block nor decodes a whole-source String.
         assert!(reads >= coverage.end && reads <= coverage.end + 3);
         assert_eq!(global.total_work(), initial);
         assert_eq!(global.next_byte(), 0);

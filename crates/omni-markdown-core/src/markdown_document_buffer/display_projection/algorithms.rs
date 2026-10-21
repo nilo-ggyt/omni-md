@@ -1,4 +1,5 @@
-//! 显示源的真实目录与原字节读取；游标只存数字、单条记录和原算法的有限续算状态。
+//! Query the display Source through its real index and original bytes. Cursors
+//! retain coordinates, one record, and bounded continuation state, never display text.
 
 use std::ops::Range;
 
@@ -12,7 +13,8 @@ use crate::markdown_document_buffer::frozen_text::{
 use crate::markdown_document_buffer::{MarkdownAsciiWordRun, MarkdownAsciiWordStep};
 use unicode_bidi::BidiClass;
 
-/// 每一步只读一条原索引；候选记录本身保留在游标内，不把二分搜索藏成一次 metadata。
+/// Each search step reads one actual index record. Retain the candidate in this
+/// cursor rather than charging an entire binary search as one metadata operation.
 struct RunSeek {
     lower: usize,
     upper: usize,
@@ -30,7 +32,8 @@ impl RunSeek {
         }
     }
 
-    /// EOF 使用最后一个非空 run，空显示源由外层直接完成而不制造原索引记录。
+    /// EOF uses the final nonempty run. The outer query handles an empty display
+    /// directly without inventing an index record for it.
     fn advance(
         &mut self,
         projection: &DisplayProjection,
@@ -56,7 +59,8 @@ impl RunSeek {
     }
 }
 
-/// 单个原 raw B 段游标负责标量边界；只有仍落在本 run 内的真实 B 才映回显示源。
+/// One original raw B-paragraph cursor validates scalar boundaries. Only an actual
+/// B terminator still inside the visible run may be translated back to display.
 pub(crate) struct ProjectionBidiParagraphCursor {
     position: usize,
     seek: Option<RunSeek>,
@@ -95,7 +99,8 @@ impl ProjectionBidiParagraphCursor {
         }
     }
 
-    /// 目录、原树与真实 lease 共用调用方的三个额度；隐藏字符不能贡献显示段端点。
+    /// Index records, original-tree work, and actual reads share the caller's three
+    /// allowances. Hidden characters cannot supply display paragraph endpoints.
     pub(crate) fn advance(
         &mut self,
         projection: &DisplayProjection,
@@ -118,6 +123,8 @@ impl ProjectionBidiParagraphCursor {
                 return Ok(step);
             }
             let (ordinal, run) = seek.take();
+            // Resolve the requested scalar in the original root once. Neighboring
+            // runs are consulted only if raw paragraph endpoints fall outside it.
             let raw_position = run.raw_utf16.start + self.position - run.display_utf16.start;
             self.raw = Some(projection.raw().begin_bidi_paragraph(raw_position)?);
             self.previous = ordinal.checked_sub(1);
@@ -153,7 +160,8 @@ impl ProjectionBidiParagraphCursor {
                         run.display_utf16.start + observed.content_end - run.raw_utf16.start;
                     self.next_ready = true;
                 }
-                // 仅真实显示全源的 B 集合为空，才可跳过相邻 run；raw 的集合不能替它签字。
+                // Only the visible Source's own empty B-class set can skip
+                // neighboring runs. Raw aggregates may include omitted separators.
                 if projection.metrics().unicode_properties.bidi_classes()
                     & MarkdownUnicodeProperties::class_mask(BidiClass::B)
                     == 0
@@ -181,6 +189,8 @@ impl ProjectionBidiParagraphCursor {
                 step.metadata += 1;
                 self.previous = ordinal.checked_sub(1);
                 if let Some(terminator) = run.last_bidi {
+                    // The terminator is a visible BMP scalar. Its successor is
+                    // the actual paragraph start in both coordinate systems.
                     self.start = terminator.utf16 + 1;
                     self.start_byte = terminator.byte_end;
                     self.previous_ready = true;
@@ -199,6 +209,8 @@ impl ProjectionBidiParagraphCursor {
                 step.metadata += 1;
                 self.next += 1;
                 if let Some(terminator) = run.first_bidi {
+                    // Include B in the paragraph range but keep its start as the
+                    // content end, matching the original raw paragraph contract.
                     self.end = terminator.utf16 + 1;
                     self.end_byte = terminator.byte_end;
                     self.content_end = terminator.utf16;
@@ -208,7 +220,8 @@ impl ProjectionBidiParagraphCursor {
             }
             self.complete = true;
         }
-        // 源与索引必须在所有实际借用结束后仍健康，才可发布 BOF/EOF 或真实 B 端点。
+        // Check Source and index after actual borrows finish, before publishing
+        // either BOF/EOF or visible B endpoints as a completed paragraph.
         projection.health()?;
         if self.complete {
             step.range = Some(self.start..self.end);
@@ -219,7 +232,8 @@ impl ProjectionBidiParagraphCursor {
     }
 }
 
-/// 两端各一条原 run；中间非 ASCII 计数来自输出标量的累计值，不顺扫巨型显示范围。
+/// Retain one record for each endpoint. Visible-scalar prefix counts cover the
+/// middle, avoiding a sequential scan of a giant display range.
 pub(crate) struct ProjectionPrintableAsciiSuffix {
     range: Range<usize>,
     start_seek: Option<RunSeek>,
@@ -253,7 +267,8 @@ impl ProjectionPrintableAsciiSuffix {
         }
     }
 
-    /// 原范围两端即使已有非 ASCII 反例也完整验证，不能用 false 掩盖低代理项端点。
+    /// Validate both range endpoints even after finding a non-ASCII counterexample.
+    /// Returning false must not conceal a position inside a surrogate pair.
     pub(crate) fn advance(
         &mut self,
         projection: &DisplayProjection,
@@ -292,6 +307,8 @@ impl ProjectionPrintableAsciiSuffix {
             let first = if start_ordinal == end_ordinal {
                 raw_start..raw_end
             } else {
+                // Complete middle runs are decided from display counts. Both
+                // partial raw ends still run the original scalar-boundary query.
                 self.rejected = end.non_printable_before != start.non_printable_after;
                 self.trailing = Some(end.raw_utf16.start..raw_end);
                 raw_start..start.raw_utf16.end
@@ -316,6 +333,8 @@ impl ProjectionPrintableAsciiSuffix {
             };
             self.rejected |= !answer;
             if let Some(trailing) = self.trailing.take() {
+                // Reuse only the remaining allowances for the second endpoint.
+                // A negative first result cannot short-circuit its validation.
                 self.raw = Some(projection.raw().begin_printable_ascii_suffix(trailing)?);
             } else {
                 self.raw = None;
@@ -328,7 +347,8 @@ impl ProjectionPrintableAsciiSuffix {
     }
 }
 
-/// 原 ASCII Word 规则跨删符 run 续算；每次只保留当前 raw 原树游标，不缓存显示正文。
+/// Continue the original ASCII-word rule across runs separated by removed syntax.
+/// Retain only the current raw-tree cursor, without caching the display text.
 pub(crate) struct ProjectionAsciiWordRun {
     position: usize,
     forward: bool,
@@ -352,7 +372,8 @@ impl ProjectionAsciiWordRun {
         }
     }
 
-    /// run 之间的隐藏字符不属于显示输入，原 alnum 终止规则只解释已夹取的真实 raw 区间。
+    /// Hidden characters between runs are not display input. The original alnum
+    /// stopping rule operates only within the current admitted raw range.
     pub(crate) fn advance(
         &mut self,
         projection: &DisplayProjection,
@@ -370,6 +391,8 @@ impl ProjectionAsciiWordRun {
             complete: self.complete,
         };
         if !self.initialized {
+            // Exact display BOF/EOF completes without locating a nonexistent run.
+            // Reverse lookup uses the preceding unit only to choose a record.
             self.initialized = true;
             self.complete = if self.forward {
                 self.position == projection.metrics().utf16_len
@@ -424,7 +447,7 @@ impl ProjectionAsciiWordRun {
             };
             if !reached_edge {
                 self.complete = true;
-                break; // 当前实际显示字符已终止 alnum，不让后继 run 绕过它。
+                break; // An actual visible character ended alnum; a later run cannot bypass it.
             }
             let next = if self.forward {
                 (*ordinal + 1 < projection.run_count()).then_some(*ordinal + 1)
@@ -437,7 +460,8 @@ impl ProjectionAsciiWordRun {
             };
             self.raw = None;
             if step.metadata == maximum_metadata {
-                // 保留单个原目录待取位置；下步不重做二分，也不提前读取下一条。
+                // Keep the exact next record position. The next step need not
+                // repeat binary search, and this step does not read past its fuel.
                 self.run = None;
                 self.seek = Some(RunSeek {
                     lower: next,
@@ -472,7 +496,8 @@ mod tests {
     };
     use std::sync::Arc;
 
-    /// 只用有限合成样本装配真实原 mapping 与真实匿名索引，省略标量不进入显示聚合。
+    /// Finite synthetic text drives an actual original mapping and anonymous
+    /// projection index. Omitted scalars never enter the display aggregates.
     fn projection(
         text: &str,
         keep: impl Fn(char) -> bool,
@@ -489,7 +514,8 @@ mod tests {
         let mut display_utf16 = 0;
         for (raw_byte, scalar) in text.char_indices() {
             if keep(scalar) {
-                // 交错样式强制产生多个真实 run，验证删符断点不是 raw 的连续字符范围。
+                // Alternating styles creates actual separate records. Removed
+                // markers must not be mistaken for a continuous raw character span.
                 let styles = if display_utf16 % 2 == 0 {
                     MarkdownPresentationStyles::STRONG
                 } else {
@@ -512,13 +538,16 @@ mod tests {
             raw_utf16 += scalar.len_utf16();
         }
         let projection = builder.finish().unwrap();
+        // Retain only the actual projection plus weak layout authority. It must
+        // keep its own original snapshot/index valid after the document is gone.
         drop(document);
         drop(source);
         drop(directory);
         (projection, authority)
     }
 
-    /// 每个量子只有一字节、一标量、一条目录；真实源错误和代理项不能被部分答案盖掉。
+    /// Drive public one-byte/one-scalar/one-metadata quanta to completion. Actual
+    /// Source failure and invalid scalar endpoints cannot become partial answers.
     fn bidi(
         projection: &Arc<DisplayProjection>,
         position: usize,
@@ -550,6 +579,8 @@ mod tests {
             bidi(&projection, 6),
             Err(MarkdownDocumentBufferError::NotUnicodeBoundary)
         );
+        // The observer carries no FD claim. Dropping the final projection must
+        // release its real anonymous index file and append buffer.
         let observer = projection.resource_observer();
         assert!(observer.snapshot().file_open);
         drop(projection);
@@ -563,6 +594,8 @@ mod tests {
             scalar.is_ascii() && scalar != '*'
         });
         let snapshot = MarkdownTextSnapshot::from_display_projection(Arc::clone(&projection), 0);
+        // Raw non-ASCII prefixes and removed syntax do not change visible word
+        // positions; the actual displayed space still stops movement both ways.
         for (position, forward, expected) in
             [(0, true, 3), (3, false, 0), (4, true, 5), (5, false, 4)]
         {
@@ -588,6 +621,8 @@ mod tests {
     fn display_ascii_suffix_validates_both_unicode_endpoints_after_real_negative_fact() {
         let (projection, _) = projection("a**😀**b中c", |scalar| scalar != '*');
         let snapshot = MarkdownTextSnapshot::from_display_projection(Arc::clone(&projection), 0);
+        // A known emoji/CJK miss cannot hide either invalid surrogate endpoint,
+        // including an empty request whose two endpoints coincide inside the pair.
         for (range, expected) in [
             (0..1, Ok(true)),
             (1..3, Ok(false)),

@@ -1302,7 +1302,10 @@ impl Producer {
         Ok(step)
     }
 
-    #[cfg(feature = "native-markdown-runtime-probe")]
+    #[cfg(all(
+        feature = "native-paged-body-probe",
+        feature = "native-markdown-runtime-probe"
+    ))]
     pub(super) fn root_leaf_publication(
         &self,
     ) -> Option<std::rc::Weak<omni_markdown_core::VerifiedMarkdownViewportSources>> {
@@ -1311,7 +1314,10 @@ impl Producer {
             .and_then(super::semantics::RootLeaf::publication)
     }
 
-    #[cfg(feature = "native-markdown-runtime-probe")]
+    #[cfg(all(
+        feature = "native-paged-body-probe",
+        feature = "native-markdown-runtime-probe"
+    ))]
     pub(super) fn root_leaf_parts(
         &self,
         owner: &Owner,

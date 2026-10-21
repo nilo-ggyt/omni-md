@@ -1,4 +1,5 @@
-//! 原表格生产者签发的单格原始来源；结构票经原文档准入才可变成草稿计划，不授予 inline Ready。
+//! One original cell Source issued by the actual table producer. Document
+//! admission may turn its structural receipt into a draft plan, never inline Ready.
 
 use super::table_cell_edit::TableCellEditContext;
 use super::table_source::MarkdownTableSourceIdentity;
@@ -6,22 +7,26 @@ use super::*;
 use crate::markdown_viewport_presentation::table_window::MarkdownTableWindowCellSource;
 
 #[derive(Clone, Debug)]
-/// 源根弱身份、真实行列与原始端点共用一张票；没有正文、活动文档或 Native 强引用。
+/// One receipt binds weak source-root identity, actual row/column and original
+/// endpoints. It retains no text, active document, or strong native reference.
 pub struct VerifiedMarkdownTableCellSource {
     pub(super) source: MarkdownTableSourceIdentity,
     pub(super) context: TableCellEditContext,
     pub(super) range: Range<usize>,
     pub(super) implicit_empty: bool,
-    /// 原 Scanner 或有限窗口已经证实的补列数量；零长范围本身无法区分显式空格与缺格。
+    /// The actual Scanner or bounded window proved this missing-separator count.
+    /// A zero-length range alone cannot distinguish a present empty cell from a missing cell.
     pub(super) separators: usize,
-    /// 同一真实 separator 扫描或原有限 Parser 投影封存的列方向；空格也保此事实。
+    /// Column alignment sealed by the same separator scan or bounded Parser
+    /// projection. Empty cells retain the same original alignment fact.
     pub(super) alignment: crate::MarkdownTableAlignment,
     pub(super) inline_seed:
         Option<std::sync::Arc<pulldown_cmark::global_frontier::VerifiedInlineSemanticSeed>>,
 }
 
 impl VerifiedMarkdownTableCellSource {
-    /// 空格也先保真实源错误；相同长度、另一个文档或 Undo 回来的旧根均不能续签这张票。
+    /// Preserve actual Source failure even for empty cells. Equal length, another
+    /// document, or an old root restored by Undo cannot renew this receipt.
     pub(super) fn require(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -35,7 +40,8 @@ impl VerifiedMarkdownTableCellSource {
         Ok(())
     }
 
-    /// 只返回原真实格的 canonical 范围；缺格的零长插入位置不因此获得源字符或补管道权限。
+    /// Return only the original cell's canonical range. A missing cell's empty
+    /// insertion anchor does not by itself authorize text reads or adding pipes.
     pub fn canonical_range_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -44,7 +50,8 @@ impl VerifiedMarkdownTableCellSource {
         Ok(&self.range)
     }
 
-    /// 显式空格与隐式缺格保持原 Parser 区别；不能从显示均为空推断相同写入行为。
+    /// Preserve the Parser's distinction between present empty and implicit
+    /// missing cells; identical empty display does not imply identical writes.
     pub fn source_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -59,7 +66,8 @@ impl VerifiedMarkdownTableCellSource {
         })
     }
 
-    /// 头部位置和绝对行列来自同一结构生产者，离屏窗口的 Vec 位置不参与身份。
+    /// Header position and absolute row/column come from the same structural
+    /// producer. A cell's Vec position in an offscreen window supplies no identity.
     pub fn coordinate_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -72,10 +80,12 @@ impl VerifiedMarkdownTableCellSource {
         ))
     }
 
-    /// 列方向与原 root/格票同寿；另一个同字节文档、Undo 旧根或失败来源都不能续用。
+    /// Alignment lives with this original root/cell receipt. Another same-byte
+    /// document, an Undo-restored old root, or a failed Source cannot reuse it.
     ///
     /// # Errors
-    /// 返回原 Source 首错或已撤销的 root 身份；不从调用者列号补造方向。
+    /// Return the original Source failure or revoked root identity. A caller's
+    /// column number cannot manufacture alignment evidence.
     pub fn alignment_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -84,7 +94,8 @@ impl VerifiedMarkdownTableCellSource {
         Ok(self.alignment)
     }
 
-    /// raw 格的同源语义起点仍不是样式 Ready；普通已发布窗口继续沿其原完整 runs 查询。
+    /// A same-source raw-cell semantic seed is not style Ready. An ordinary
+    /// published window keeps querying its original complete semantic runs.
     pub fn inline_seed_for(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -98,18 +109,22 @@ impl VerifiedMarkdownTableCellSource {
 }
 
 impl MarkdownDocumentBuffer {
-    /// 消费原生产者的完整格票开始草稿计划；不接受裸范围，也不重新读取原格或另建结构请求。
+    /// Consume the producer's complete cell receipt to start a draft plan. Accept
+    /// no bare range, reread no whole original cell, and start no second structure request.
     ///
-    /// 显式空格直接替换自己的零长原范围，隐式缺格只补原 Scanner 已证实的分隔符。
-    /// 计划仍仅弱认原 root，真正的 mmap/piece 共享和唯一草稿槽由 begin_prepared_cell_draft 负责。
+    /// A present empty cell replaces its existing empty range; an implicit cell
+    /// adds only separators proved by the Scanner. The plan retains weak root
+    /// identity. begin_prepared_cell_draft owns actual mmap/piece sharing and the
+    /// unique active draft slot.
     ///
     /// # Errors
-    /// 原存储失败、另一个文档或旧源票均拒绝；补列预算错误保留原 typed 原因，不创建草稿。
+    /// Reject original storage failure, another document, or stale source receipts.
+    /// Preserve typed separator-budget failure without creating a draft.
     pub fn plan_verified_table_cell_draft(
         &self,
         cell: VerifiedMarkdownTableCellSource,
     ) -> Result<MarkdownTableCellEditPlan, MarkdownTableRequestError> {
-        cell.require(self)?; // 源错误先于旧票；相同长度、另一个 Doc 或 Undo 回来的 root 均不能续权。
+        cell.require(self)?; // Source failure precedes staleness; equal length or Undo cannot renew original authority.
         let plan = self
             .plan_table_cell_source_replacement(cell, "")
             .map_err(MarkdownTableRequestError::Window)?;
@@ -117,7 +132,8 @@ impl MarkdownDocumentBuffer {
         Ok(plan)
     }
 
-    /// 只有现有 verified 窗口可提供普通格来源；不接受裸范围，也不创建唯一活动草稿。
+    /// Only an existing verified window supplies an ordinary cell Source. This
+    /// accepts no bare range and does not create the unique active draft.
     pub fn verified_table_cell_source(
         &self,
         window: &VerifiedMarkdownTableWindow,
@@ -136,7 +152,8 @@ impl MarkdownDocumentBuffer {
         Ok(cell)
     }
 
-    /// 原 piece 路径只切出这一个 raw 格；实际字节继续共享原映射与编辑片，读取仍受布局量子约束。
+    /// Split original piece paths around this raw cell only. Bytes stay shared
+    /// with original mappings/edit segments, and reads retain the layout quantum.
     #[cfg(any(
         feature = "paged-graphemes",
         feature = "paged-line-breaks",
@@ -158,7 +175,7 @@ impl MarkdownDocumentBuffer {
         let (root, _) = split_piece_tree(self, tail, byte_end - byte_start)
             .map_err(MarkdownTableRequestError::Source)?;
         let snapshot = MarkdownTextSnapshot::capture_table_cell_root(self, &root);
-        cell.require(self)?; // 真实端点 lease 归还失败不能被冻结成功掩盖。
+        cell.require(self)?; // Successful freezing cannot conceal failure while returning an actual endpoint lease.
         Ok(snapshot)
     }
 }

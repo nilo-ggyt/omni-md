@@ -1,28 +1,33 @@
-//! 草稿只暴露封闭的局部读取胶囊；没有转成canonical Source或取出普通snapshot的接口。
+//! Expose only a sealed local-read capsule. There is no public conversion into a
+//! canonical Source or escape hatch returning an unrestricted ordinary snapshot.
 
 use super::*;
 
 struct ReadPayload {
-    // 实际读取名额在Frozen末字段；内部snapshot clone不能因这个外层payload退场而提前归还。
+    // The real read claim is Frozen's final field. Internal snapshot clones must
+    // not return that claim merely because this outer payload has dropped.
     snapshot: MarkdownTextSnapshot,
     facts: MarkdownCellDraftFacts,
     scope: Arc<Scope>,
 }
 
 #[derive(Clone)]
-/// clone共享同一个实际读取payload；原编辑或取消撤权不改变已持字节，但拒绝继续读取。
+/// Clones share one actual reader payload. Editing/cancellation revokes further
+/// reads without mutating immutable bytes already held by their original owner.
 pub struct MarkdownCellDraftReadCapsule {
     payload: Arc<ReadPayload>,
 }
 
 #[derive(Clone)]
-/// 仅当前capture的弱身份；坐标、相同长度或普通Source票都不能构造它。
+/// Weak identity of this exact capture. Coordinates, equal length, or an ordinary
+/// Source receipt cannot manufacture the same authority.
 pub struct MarkdownCellDraftReadAuthority {
     payload: Weak<ReadPayload>,
 }
 
 impl MarkdownDocumentBuffer {
-    /// 为原草稿当前content_serial固定只读根；状态修改不撤正文，真实编辑会撤销旧读取。
+    /// Freeze a read root for this draft's current content_serial. State-only
+    /// changes keep its text valid; actual edits revoke the old read authority.
     pub fn capture_cell_draft(
         &self,
         token: &MarkdownCellDraft,
@@ -42,7 +47,8 @@ impl MarkdownDocumentBuffer {
             guard,
             claim,
         );
-        // 即使candidate已不引用Original，原Source的sticky I/O仍必须先于cache hit或Stale。
+        // Even a candidate without Original leaves preserves original Source's
+        // sticky I/O failure ahead of a cache hit or ordinary staleness.
         let payload = Arc::new(ReadPayload {
             snapshot,
             facts: pending.facts(),
@@ -55,7 +61,8 @@ impl MarkdownDocumentBuffer {
 
 impl MarkdownCellDraftReadCapsule {
     #[must_use]
-    /// 票据不保活胶囊；不同capture即使同serial也不能互换。
+    /// The receipt does not keep its capsule alive. Separate captures cannot
+    /// exchange receipts even when their numeric serials are equal.
     pub fn authority(&self) -> MarkdownCellDraftReadAuthority {
         MarkdownCellDraftReadAuthority {
             payload: Arc::downgrade(&self.payload),
@@ -66,6 +73,8 @@ impl MarkdownCellDraftReadCapsule {
         &self,
         authority: &MarkdownCellDraftReadAuthority,
     ) -> Result<(), MarkdownCellDraftError> {
+        // Check actual frozen storage and original content revocation before weak
+        // capture identity, so a foreign receipt cannot hide this Source's failure.
         self.payload
             .snapshot
             .original_backing_health()
@@ -93,12 +102,14 @@ impl MarkdownCellDraftReadCapsule {
         if let Err(error) = &result {
             self.payload.scope.record_source(*error);
         }
-        // 先保原I/O错误；回调期间的撤权仍阻止部分候选返回成功。
+        // Preserve original I/O failure first. Revocation during a callback still
+        // prevents any previously observed partial candidate from escaping as success.
         self.require(authority)?;
         result.map_err(Into::into)
     }
 
-    /// 只返回捕获时的局部事实；selection可能早于当前输入状态，不授予canonical或编辑权限。
+    /// Return captured local facts only. Selection may predate current input state;
+    /// these facts grant neither canonical-coordinate nor edit authority.
     pub fn facts(
         &self,
         authority: &MarkdownCellDraftReadAuthority,
@@ -107,7 +118,8 @@ impl MarkdownCellDraftReadCapsule {
         Ok(self.payload.facts.clone())
     }
 
-    /// 原cell局部正文身份；相同长度、普通Source或裸范围都不能创建这张弱票。
+    /// Return original cell-local text identity. Equal length, an ordinary Source,
+    /// or a bare range cannot construct this weak receipt.
     pub fn source_authority(
         &self,
         authority: &MarkdownCellDraftReadAuthority,
@@ -119,7 +131,8 @@ impl MarkdownCellDraftReadCapsule {
             .ok_or(MarkdownCellDraftError::Stale)
     }
 
-    /// 只给布局Source受控factory共享同一Frozen；真实ReadClaim仍在最后snapshot归还时结算。
+    /// Only the controlled layout-Source factory may share this Frozen. The actual
+    /// ReadClaim is returned only when the final snapshot owner has dropped.
     #[cfg(any(
         feature = "paged-graphemes",
         feature = "paged-line-breaks",
@@ -133,8 +146,8 @@ impl MarkdownCellDraftReadCapsule {
         Ok(self.payload.snapshot.clone())
     }
 
-    /// 单次最多4096UTF16单元；代理对内的半个单元范围仍是合法NSString读取。
-    /// 出错时destination可能已有前缀，调用方必须丢弃整次候选。
+    /// Read at most 4096 UTF-16 units; surrogate-half ranges remain valid NSString
+    /// reads. On error destination may contain a prefix, so discard the whole candidate.
     pub fn copy_utf16_code_units(
         &self,
         authority: &MarkdownCellDraftReadAuthority,
@@ -153,7 +166,8 @@ impl MarkdownCellDraftReadCapsule {
         )
     }
 
-    /// 单次最多4KiB，回调仍按原小片执行；Err禁止调用方提交已观察的部分字节。
+    /// Read at most 4 KiB per call through original finite pieces. Err forbids
+    /// publishing any prefix already observed by the visitor.
     pub fn visit_byte_range(
         &self,
         authority: &MarkdownCellDraftReadAuthority,
@@ -170,7 +184,8 @@ impl MarkdownCellDraftReadCapsule {
         )
     }
 
-    /// 标量坐标映射仅查实际有限叶，拒绝surrogate或UTF-8标量内部边界。
+    /// Resolve scalar coordinates through actual bounded leaves, rejecting
+    /// positions inside surrogate pairs or UTF-8 encodings.
     pub fn byte_offset_for_utf16(
         &self,
         authority: &MarkdownCellDraftReadAuthority,
@@ -183,7 +198,8 @@ impl MarkdownCellDraftReadCapsule {
         )
     }
 
-    /// 从真实字节边界映射局部UTF16；不补签任何文档或表格全局范围。
+    /// Translate an actual byte boundary into local UTF-16 without granting
+    /// authority over any global document or table range.
     pub fn utf16_offset_for_byte(
         &self,
         authority: &MarkdownCellDraftReadAuthority,

@@ -24,7 +24,7 @@ pub(crate) fn admit_close(
     };
     if accepted.intent != requested.intent {
         // Promotion cannot redirect the original ordinary close destination, even when its successor is suppressed.
-        return Err("An opposing Markdown close is still completing");
+        return Err("另一笔记关闭操作仍在完成中");
     }
     match (accepted.scope, requested.scope) {
         // Identical requests share the accepted native close and its one completion authority.
@@ -38,7 +38,7 @@ pub(crate) fn admit_close(
         }
         // A terminal transaction can never reopen the ordinary successor path.
         (PluginCloseScope::ApplicationTermination, PluginCloseScope::ForegroundTransition) => {
-            Err("A terminal Markdown close cannot downgrade to a foreground transition")
+            Err("应用退出期间不能改为切换前台笔记")
         }
     }
 }

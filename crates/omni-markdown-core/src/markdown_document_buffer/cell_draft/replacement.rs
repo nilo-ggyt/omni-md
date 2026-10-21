@@ -1,18 +1,21 @@
-//! 同一次Cell清洗的有限堆快路与独占匿名输出；长结果不保留整格堆字节。
+//! Bounded heap and uniquely owned anonymous output for the same cell sanitization.
+//! Long results retain no whole-cell heap copy.
 
 use super::*;
 use crate::immutable_snapshot::CanonicalSnapshotOutput;
 use crate::markdown_viewport_presentation::table_window::TABLE_WINDOW_MAX_BYTES;
 
-/// 准入完成后只持最终字节资源，不保raw root、Doc或第三个Scene读取名额。
+/// After admission, retain only final byte storage, not the raw root, document or
+/// a third Scene-reader slot.
 pub(super) enum CellReplacement {
     Inline(String),
     Frozen(Arc<OriginalBacking>),
 }
 
 impl CellReplacement {
-    /// 原canonical预算使用真实输出字节数，文件映射extent不当作堆分配计量。
-    /// 仅观察已接受输出extent，文件缓冲尚未flush时也不触发正文复制。
+    /// Canonical admission uses actual output byte length; mapped file extent is
+    /// not heap allocation. Observe only accepted extent without copying text,
+    /// including while the output still has an unflushed buffer.
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Inline(text) => text.len(),
@@ -20,7 +23,8 @@ impl CellReplacement {
         }
     }
 
-    /// 唯一准入claim只记录实际保留的堆正文容量；封存资源由真实backing owner负责。
+    /// The unique commit claim records only actual heap-text capacity. The real
+    /// backing owner remains responsible for sealed file resources.
     pub(super) fn capacity(&self) -> usize {
         match self {
             Self::Inline(text) => text.capacity(),
@@ -28,7 +32,8 @@ impl CellReplacement {
         }
     }
 
-    /// 候选文件还未成为canonical Source，失败不能poison尚未改变的raw草稿。
+    /// The candidate file is not yet canonical Source; its failure cannot poison
+    /// the unchanged raw draft's text authority.
     pub(super) fn health(&self) -> Result<(), MarkdownDocumentBufferError> {
         match self {
             Self::Inline(_) => Ok(()),
@@ -38,7 +43,8 @@ impl CellReplacement {
         }
     }
 
-    /// 比较原canonical的一个真实小片；不因发现差异而跳过调用方后继Source读取。
+    /// Compare one actual finite fragment of canonical text. A mismatch must not
+    /// make the caller skip later Source reads and their possible real failures.
     pub(super) fn matches_bytes(
         &self,
         offset: usize,
@@ -61,7 +67,8 @@ impl CellReplacement {
         }
     }
 
-    /// 同一封存结果进入原PreparedTextInput；没有第二种公开提交票或重新清洗阶段。
+    /// Feed this same sealed result into the original PreparedTextInput. Introduce
+    /// no second public commit receipt or repeated sanitization stage.
     pub(super) fn input(&self, utf16: usize) -> prepared_text_input::TextInputReplacement<'_> {
         match self {
             Self::Inline(text) => prepared_text_input::TextInputReplacement::Text(text),
@@ -73,7 +80,8 @@ impl CellReplacement {
     }
 
     #[cfg(test)]
-    /// 直接业务测试观察这个实际候选的最后munmap，不从claim数字推断文件已经释放。
+    /// Actual business tests observe this candidate's final munmap rather than
+    /// infer file release from a returned numeric admission claim.
     pub(super) fn backing_observer(&self) -> Option<crate::MarkdownOriginalBackingObserver> {
         match self {
             Self::Inline(_) => None,
@@ -87,7 +95,8 @@ enum OutputStorage {
     File(CanonicalSnapshotOutput),
 }
 
-/// 清洗和真实表尾续写共享一个输出；只有这一个4KiB缓冲，完成后才封存唯一写者。
+/// Sanitization and actual table-tail output share one writer and one 4 KiB
+/// scratch. Seal the unique writer only when all output is complete.
 pub(super) struct CellReplacementOutput {
     storage: OutputStorage,
     bytes: usize,
@@ -97,7 +106,8 @@ pub(super) struct CellReplacementOutput {
 }
 
 impl CellReplacementOutput {
-    /// 64Ki UTF16仅选择原有限String快路；更大的输入直接写匿名文件而非功能拒绝。
+    /// The 64 Ki-unit threshold selects bounded String output only. Larger input
+    /// writes directly to an anonymous file instead of becoming a feature refusal.
     pub(super) fn new(
         metrics: MarkdownDocumentMetrics,
         prefix: &str,
@@ -119,27 +129,30 @@ impl CellReplacementOutput {
             scratch: [0; ORIGINAL_PIECE_BYTES],
             scratch_len: 0,
         };
-        output.push_text(prefix)?; // 已认证的implicit分隔符先进入输出，但不参与正文的全局trim状态。
+        output.push_text(prefix)?; // Write verified implicit separators first, outside the text's global trim state.
         Ok(output)
     }
 
     pub(super) fn len(&self) -> usize {
         self.bytes
     }
-    /// 同次标量写入累计的UTF16长度，用于原候选选区和变化日志。
+    /// UTF-16 length accumulated during these same scalar writes, used for the
+    /// candidate's selection and original change journal.
     pub(super) fn utf16_len(&self) -> usize {
         self.utf16
     }
 
-    /// 大尾部padding或容器前缀不能把小Cell扩成无界String；在增长前改由同一匿名工厂承接。
+    /// Large trailing padding or container prefixes cannot expand a small cell
+    /// into an unbounded String. Promote through the same anonymous factory first.
     fn require_file(&mut self, next_bytes: usize) -> Result<(), MarkdownDocumentBufferError> {
         if next_bytes <= TABLE_WINDOW_MAX_BYTES {
-            return Ok(()); // 原有限快路仍满足既有堆预算，不为小提交增加文件操作。
+            return Ok(()); // The bounded heap path still fits; small commits need no extra file operation.
         }
         self.promote()
     }
 
-    /// 已认证的超量源尾部只允许流式落盘；它不能通过多次小push累积成另一份大String。
+    /// An oversized verified source tail must stream to disk; many small pushes
+    /// cannot accumulate that tail into another large String.
     pub(super) fn prepare_suffix(
         &mut self,
         bytes: usize,
@@ -154,7 +167,8 @@ impl CellReplacementOutput {
         )
     }
 
-    /// 原有限快路字节完整转入一个匿名文件后才释放String，失败整体放弃候选。
+    /// Transfer the complete bounded heap output to one anonymous file before
+    /// releasing its String. Failure discards the entire candidate.
     fn promote(&mut self) -> Result<(), MarkdownDocumentBufferError> {
         if let OutputStorage::Inline(text) = &self.storage {
             let mut file = CanonicalSnapshotOutput::new().map_err(edit_snapshot_error)?;
@@ -163,17 +177,19 @@ impl CellReplacementOutput {
                 let mut end = (offset + ORIGINAL_PIECE_BYTES).min(text.len());
                 while !text.is_char_boundary(end) {
                     end -= 1;
-                } // 仅在完整标量之间转移有限堆快路字节。
+                } // Transfer bounded heap bytes only between complete encoded scalars.
                 file.write_all(&text.as_bytes()[offset..end])
                     .map_err(edit_snapshot_error)?;
                 offset = end;
             }
-            self.storage = OutputStorage::File(file); // 所有旧有限字节成功写入后才Drop原String。
+            self.storage = OutputStorage::File(file); // Drop the String only after all its original bounded bytes were written successfully.
         }
         Ok(())
     }
 
-    /// 接受一个完整UTF-8片段，逐4KiB写入；调用方仍负责最终文档/会话容量的原事务准入。
+    /// Accept a complete UTF-8 fragment and write through 4 KiB chunks. The owning
+    /// transaction still admits the final document/session capacity. Any write
+    /// failure requires discarding this candidate, not reusing partial output.
     pub(super) fn push_text(&mut self, text: &str) -> Result<(), MarkdownDocumentBufferError> {
         let next = self
             .bytes
@@ -191,14 +207,14 @@ impl CellReplacementOutput {
                 while offset < text.len() {
                     if self.scratch_len == self.scratch.len() {
                         self.flush()?;
-                    } // 满块先真实写出，不保第二份输出buffer。
+                    } // Actually write a full block first, without retaining a second output buffer.
                     let available = self.scratch.len() - self.scratch_len;
                     let mut end = (offset + available).min(text.len());
                     while !text.is_char_boundary(end) {
                         end -= 1;
                     }
                     if end == offset {
-                        self.flush()?; // 剩余尾隙不足下个完整标量；下一轮从空缓冲继续。
+                        self.flush()?; // The next whole scalar does not fit the tail; resume with an empty scratch.
                         continue;
                     }
                     let chunk = &text.as_bytes()[offset..end];
@@ -214,14 +230,16 @@ impl CellReplacementOutput {
         Ok(())
     }
 
-    /// Source回调只交当前真实小片；UTF-8验证失败仍由原lease归还后再传播。
+    /// A Source callback supplies only the current actual fragment. Its owner
+    /// still returns the original lease before propagating UTF-8 failure.
     pub(super) fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), MarkdownDocumentBufferError> {
         let text = std::str::from_utf8(bytes)
             .map_err(|_| MarkdownDocumentBufferError::InvalidUtf8Document)?;
         self.push_text(text)
     }
 
-    /// 全局trim只回退已写尾部；即使尾空白很长也不缓存，后续表尾从新EOF继续写入。
+    /// Global trim retracts only the already-written tail. Long trailing whitespace
+    /// stays uncached, and subsequent table-tail output resumes at the new EOF.
     pub(super) fn truncate(
         &mut self,
         bytes: usize,
@@ -243,7 +261,8 @@ impl CellReplacementOutput {
         Ok(())
     }
 
-    /// 尾缓冲不跨seal；冻结后唯一File写权被消费，映射通过原owner真正关闭descriptor。
+    /// Flush before seal and consume the unique File writer. The original backing
+    /// owner performs actual descriptor closure for the resulting mapping.
     pub(super) fn seal(
         mut self,
         claim: &mut super::resources::CommitClaim,
@@ -253,10 +272,11 @@ impl CellReplacementOutput {
             OutputStorage::Inline(text) => CellReplacement::Inline(text),
             OutputStorage::File(file) => match file.freeze().map_err(edit_snapshot_error)? {
                 Some(backing) if backing.len() <= EDIT_SEGMENT_BYTES => {
-                    // 原raw可以很长而trim后的有效结果很小；只保这份有界结果，
-                    // 先真正归还匿名映射，再把有限堆字节交给原提交票。
+                    // A long raw draft may trim to a small result. Retain only
+                    // this bounded result, actually returning its temporary mapping
+                    // before handing heap bytes to the original commit receipt.
                     let observer = backing.observer();
-                    claim.observe_backing(observer.clone()); // 必须先绑定，覆盖读取或最终释放的真实失败。
+                    claim.observe_backing(observer.clone()); // Bind first so actual read/final-release failure remains observed.
                     let copied = (|| {
                         let mut bytes = Vec::with_capacity(backing.len());
                         while bytes.len() < backing.len() {
@@ -273,30 +293,32 @@ impl CellReplacementOutput {
                             .map_err(|_| MarkdownDocumentBufferError::InvalidUtf8Document)
                     })();
                     drop(backing);
-                    let text = copied?; // 真实读取首错不被随后清理结果覆盖，也不污染raw Source。
+                    let text = copied?; // Preserve actual read failure over later cleanup, without poisoning raw Source.
                     if let Some(errno) = observer.first_errno() {
                         return Err(MarkdownDocumentBufferError::EditStorageUnavailable(errno));
                     }
                     if !observer.unmap_succeeded() {
-                        // 只有最终munmap成功才能交付Inline；未归还的实际映射不能冒充小结果完成。
+                        // Deliver Inline only after actual final munmap succeeds.
+                        // An unreleased mapping cannot masquerade as a finished small result.
                         return Err(MarkdownDocumentBufferError::EditStorageUnavailable(
                             libc::EIO,
                         ));
                     }
-                    claim.release_backing_ticket(); // 临时映射已实际释放；Inline成功不向Doc转移文件义务。
+                    claim.release_backing_ticket(); // Temporary mapping is actually released; Inline transfers no file obligation to the document.
                     CellReplacement::Inline(text)
                 }
                 Some(backing) => {
-                    claim.observe_backing(backing.observer()); // 大候选仍独占此映射，直到失败退场或原publish接管。
+                    claim.observe_backing(backing.observer()); // The large candidate owns this mapping until failed release or canonical publication takes over.
                     CellReplacement::Frozen(Arc::new(backing))
                 }
-                None => CellReplacement::Inline(String::new()), // 全局trim为空时没有映射，不制造零长文件叶。
+                None => CellReplacement::Inline(String::new()), // Empty global-trim output has no mapping or zero-length file leaf.
             },
         };
         Ok((replacement, self.utf16))
     }
 
-    /// 只有真实File分支拥有缓冲字节；失败后整个候选退场，不继续复用部分写入输出。
+    /// Only the actual File branch owns buffered bytes. Failure discards the
+    /// complete candidate rather than resuming a partially written output.
     fn flush(&mut self) -> Result<(), MarkdownDocumentBufferError> {
         if self.scratch_len == 0 {
             return Ok(());

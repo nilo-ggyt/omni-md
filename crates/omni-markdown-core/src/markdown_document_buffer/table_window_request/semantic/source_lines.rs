@@ -1,4 +1,4 @@
-//! 当前窗口的有限真实行复制；允许frame切在UTF8内部，绝不复制省略区间或整表。
+//! Copy bounded actual window lines across split UTF-8 frames, never omitted intervals or the whole table.
 
 use super::*;
 use crate::markdown_viewport_presentation::table_window::{
@@ -33,6 +33,8 @@ impl OwnedLine {
 }
 
 pub(super) struct LineCopy {
+    // One current line and at most three incomplete UTF-8 bytes survive a step.
+    // The complete admitted batch remains finite and contains only ticket members.
     lines: Vec<OwnedLine>,
     index: usize,
     copied_current: usize,
@@ -41,6 +43,8 @@ pub(super) struct LineCopy {
 }
 impl LineCopy {
     pub fn new(ticket: &MarkdownTableStructuralWindow) -> Result<Self, Error> {
+        // Header/delimiter context and body facts carry their own actual byte,
+        // UTF-16, physical-line and ordinal coordinates; none are inferred from window position.
         let h = ticket.header;
         let mut specs = Vec::with_capacity(ticket.body.len() + 2);
         specs.push(LineSpec {
@@ -60,7 +64,8 @@ impl LineCopy {
             delimiter: true,
         });
         for row in &ticket.body {
-            // 已签发成员坐标，含真实EOL/prefix；没有任何window位置+base的ordinal推算。
+            // Preserve verified member coordinates including original EOL/prefix,
+            // rather than deriving an ordinal from a window-local base.
             specs.push(LineSpec {
                 bytes: row.byte_start..row.byte_end,
                 utf16: row.utf16_start..row.utf16_end,
@@ -93,7 +98,8 @@ impl LineCopy {
                 || units > TABLE_WINDOW_MAX_UTF16
                 || spec.prefix > spec.bytes.len()
             {
-                // 当前批全部真实源容量先准入，再创建任何正文String；H context也收费。
+                // Admit the entire batch's actual text before any body String
+                // allocation; offscreen header context consumes the same source cap.
                 return Err(Error::SourceLimit);
             }
         }
@@ -121,8 +127,9 @@ impl LineCopy {
             return Ok((SemanticWork::default(), true));
         }
         let tree = tree_height(document);
-        // from_utf8遇到frame尾未完成scalar时会再次检查valid prefix；carry还可能重验至多4B。
-        // 分配四份byte额度并保96固定余量，覆盖真实读/写/每次UTF8校验输入，不仅是distinct源byte。
+        // from_utf8 can recheck a valid prefix before a split final scalar, and
+        // carry can revalidate up to four bytes. Reserve read/copy/validation work
+        // plus fixed control, rather than charging distinct source bytes alone.
         let available = budget.checked_sub(tree + 96).ok_or(Error::SourceLimit)? / 4;
         if available == 0 {
             return Err(Error::SourceLimit);
@@ -136,13 +143,16 @@ impl LineCopy {
             ..SemanticWork::default()
         };
         if line.text.capacity() == 0 {
-            // 分配总payload已在new按整批核准；此处仅为当前真实行预留，不给所有表行预留。
+            // Construction admitted the total batch payload. Reserve only this
+            // actual current line now, not every row of the original table.
             line.text.reserve_exact(line.spec.bytes.len());
             work.allocated_source_capacity = line.text.capacity();
         }
         let frame = document
             .table_source_frame(next, wanted.max(1))
             .map_err(|_| Error::InvalidSource)?;
+        // This boundary maps source acquisition/reclaim errors to InvalidSource;
+        // it does not expose the original OS errno as a separate source result.
         let bytes = &frame.bytes[..frame.bytes.len().min(wanted)];
         if wanted > 0 && bytes.is_empty() {
             return Err(Error::InvalidSource);
@@ -151,7 +161,8 @@ impl LineCopy {
         let before = line.text.len();
         let mut at = 0;
         while self.pending_len > 0 && at < bytes.len() {
-            // carry最多3个未完成字节；补成一个scalar后立即写入，不保存任意长行尾。
+            // Carry holds at most three incomplete bytes. Append immediately
+            // after completing one real scalar, without retaining an arbitrary text tail.
             self.pending[self.pending_len] = bytes[at];
             self.pending_len += 1;
             at += 1;
@@ -170,7 +181,8 @@ impl LineCopy {
             match std::str::from_utf8(&bytes[at..]) {
                 Ok(text) => line.text.push_str(text),
                 Err(error) if error.error_len().is_none() => {
-                    // 仅frame尾的合法未完成scalar可续接；真实非法UTF8不能当作输入不足。
+                    // Only a valid incomplete scalar at the frame end may resume;
+                    // malformed UTF-8 is an error, not a request for more input.
                     let prefix_end = at + error.valid_up_to();
                     work.utf8_validation_bytes += prefix_end - at;
                     line.text.push_str(
@@ -193,10 +205,13 @@ impl LineCopy {
             if self.pending_len != 0 || line.text.len() != line.spec.bytes.len() {
                 return Err(Error::InvalidSource);
             }
-            // 真实完整行复制完才转下一行；不把frame结束当成EOL或构造人工newline。
+            // Advance only after the actual complete line is copied. Frame end
+            // is neither EOL nor permission to insert a synthetic newline.
             self.index += 1;
             self.copied_current = 0;
         }
+        // Finish the actual lease before exposing this successful step. The
+        // parent drops all partially copied strings if any source/validation stage fails.
         frame.finish().map_err(|_| Error::InvalidSource)?;
         Ok((work, self.index == self.lines.len()))
     }

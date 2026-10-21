@@ -1,4 +1,5 @@
-//! 原始草稿自己的有限root历史；不触碰canonical历史，也不把大输入保存为另一个String。
+//! The raw draft's bounded root history. Canonical history stays separate, and
+//! large input is not retained as another materialized String.
 
 use super::edit::DraftSource;
 use super::*;
@@ -9,14 +10,16 @@ pub use grouping::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 恢复草稿局部历史；不能用此动作调用正文Doc的Undo/Redo。
+/// Restore draft-local history only; this action cannot invoke the canonical
+/// document's Undo/Redo.
 pub enum MarkdownCellDraftHistoryDirection {
     Undo,
     Redo,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// 变化范围属于本次恢复前的cell局部UTF16域，canonical选区/代次与历史保持不变。
+/// Change geometry belongs to the cell-local UTF-16 domain before this restore.
+/// Canonical selection, generation and history remain unchanged.
 pub struct MarkdownCellDraftHistoryEdit {
     pub replaced_utf16_range: Range<usize>,
     pub change_in_utf16_length: isize,
@@ -26,8 +29,9 @@ pub struct MarkdownCellDraftHistoryEdit {
 struct Memento {
     root: PieceTreeLink,
     selection: MarkdownTextSelection,
-    // grouped项同时记原事务另一端的选区；移动选区后Undo不能把临时caret写成原组Redo目标。
-    // legacy项保持None，仍按原入口的当前选区交换合同恢复，不改变已有调用者行为。
+    // Grouped entries retain the transaction's opposite selection too: moving the
+    // caret later must not replace the original group's Redo target. Ungrouped
+    // entries keep None and use their public entry's current-selection swap rule.
     counterpart_selection: Option<MarkdownTextSelection>,
     replacement: MarkdownReplacementMetrics,
 }
@@ -41,12 +45,13 @@ pub(super) struct LocalHistory {
 
 impl LocalHistory {
     pub(super) fn break_group(&mut self) {
-        self.group = None; // 只有固定metadata，不清原Undo/Redo，也不释放仍有owner的共享正文。
+        self.group = None; // Fixed metadata only; keep Undo/Redo and text still held by actual shared owners.
     }
 
     pub(super) fn reserve_edit(&mut self) -> Result<(), MarkdownDocumentBufferError> {
         if self.undo.len() < MAX_EDIT_HISTORY_ENTRIES {
-            // 先预留一个固定上限内的metadata槽；追加正文后不再有可失败的历史分配。
+            // Reserve one metadata slot within the fixed history limit before
+            // appending text, leaving no fallible history allocation after preparation.
             self.undo
                 .try_reserve(1)
                 .map_err(|_| MarkdownDocumentBufferError::EditHistoryUnavailable)?;
@@ -61,7 +66,7 @@ impl LocalHistory {
         replacement: MarkdownReplacementMetrics,
     ) {
         if self.undo.len() == MAX_EDIT_HISTORY_ENTRIES {
-            self.undo.pop_front(); // 丢最旧共享树metadata，累计delta预算不因此获得新额度。
+            self.undo.pop_front(); // Drop the oldest shared root; this does not renew cumulative delta allowance.
         }
         self.undo.push_back(Memento {
             root,
@@ -69,8 +74,8 @@ impl LocalHistory {
             counterpart_selection: None,
             replacement,
         });
-        self.redo.clear(); // 分叉后的旧redo不能重现新输入前的草稿。
-        self.group = None; // legacy或新独立组不能继续较早一次输入的合并权限。
+        self.redo.clear(); // After branching, old Redo cannot resurrect the pre-input successor draft.
+        self.group = None; // An ungrouped edit/new independent group cannot inherit an earlier input's merge authority.
     }
 
     fn stacks(
@@ -92,7 +97,8 @@ impl PendingCellDraft {
     ) -> Result<Option<MarkdownCellDraftHistoryEdit>, MarkdownCellDraftError> {
         self.require(document)?;
         if self.marked_range.is_some() {
-            // 不能在Core内猜输入法已经结束；适配器须先沿原context完成unmark，再捕获恢复票。
+            // Core cannot guess that IME has ended. The adapter must unmark
+            // through the original input context before capturing restore authority.
             return Err(MarkdownCellDraftError::CompositionActive);
         }
         let source = DraftSource {
@@ -109,7 +115,8 @@ impl PendingCellDraft {
             previous.selection.anchor_utf16,
             previous.selection.head_utf16,
         ] {
-            // 栈项仍须在原段表上通过真实有限端点验证，不能只根据旧长度恢复选区。
+            // Validate the stored selection's actual bounded endpoints against
+            // its original segment table; an old length alone is not sufficient.
             byte_offset_for_utf16_in_tree(&source, previous.root.as_deref(), at, 0)?;
         }
         let serial = self
@@ -121,6 +128,8 @@ impl PendingCellDraft {
             .checked_add(1)
             .ok_or(MarkdownCellDraftError::Stale)?;
         if to.len() < MAX_EDIT_HISTORY_ENTRIES {
+            // All storage/coordinate checks and possible destination allocation
+            // precede removing a source memento or publishing the restored root.
             to.try_reserve(1)
                 .map_err(|_| MarkdownDocumentBufferError::EditHistoryUnavailable)?;
         }
@@ -135,12 +144,13 @@ impl PendingCellDraft {
             counterpart_selection: previous.counterpart_selection.map(|_| previous.selection),
             replacement: previous.replacement,
         });
-        self.history.group = None; // 成功历史恢复是输入断点；不能把redo后的新输入并回旧root。
+        self.history.group = None; // Successful history restoration breaks input coalescing; new input cannot merge into the old root.
         self.root = previous.root;
         self.selection = previous.selection;
         self.serial = serial;
         self.content_serial = content_serial;
-        // 原marked会话绝不随历史复活；恢复正文只保原scalar选区。
+        // History never resurrects a marked-input session. Restored text retains
+        // only its original validated scalar selection.
         self.marked_range = None;
         self.scope
             .content_serial
@@ -163,7 +173,8 @@ impl PendingCellDraft {
 }
 
 impl MarkdownDocumentBuffer {
-    /// 消费原serial编辑胶囊恢复局部历史；空栈明确None，不发布正文或改变会话delta库存。
+    /// Consume the original-serial edit capsule to restore local history. Empty
+    /// history returns None, without publishing canonical text or renewing delta budget.
     pub fn restore_cell_draft_history(
         &mut self,
         edit: edit::MarkdownCellDraftEditCapsule,
