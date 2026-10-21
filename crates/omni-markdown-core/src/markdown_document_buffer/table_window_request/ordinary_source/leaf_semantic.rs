@@ -25,16 +25,25 @@ type RunPage = [Option<MarkdownPresentationRun>; PAGE_RUNS];
 const LEAF_PAGE_ENTRIES: usize = 16;
 const LEAF_PAGE_COUNT: usize = MAX_SOURCE_RECORDS.div_ceil(LEAF_PAGE_ENTRIES);
 
-/// 候选来源和成功覆盖共用小页容器；只在原quota准入后逐页分配，避免一次初始化整组来源。
+type LeafPage<T> = [Option<T>; LEAF_PAGE_ENTRIES];
+type LeafDirectory<T> = [Option<Box<LeafPage<T>>>; LEAF_PAGE_COUNT];
+
+/// 单块小窗口不需要页；多块目录放进 Box，避免 enum 的最大分支仍撑大每份 publication。
+enum LeafStorage<T> {
+    Inline(Option<T>),
+    Paged(Box<LeafDirectory<T>>),
+}
+
+/// 候选来源和成功覆盖共用同一有限容量；第二项才按原 quota 建真实目录和首页。
 struct LeafPages<T> {
-    pages: [Option<Box<[Option<T>; LEAF_PAGE_ENTRIES]>>; LEAF_PAGE_COUNT],
+    storage: LeafStorage<T>,
     len: usize,
 }
 
 impl<T> LeafPages<T> {
     fn new() -> Self {
         Self {
-            pages: std::array::from_fn(|_| None),
+            storage: LeafStorage::Inline(None),
             len: 0,
         }
     }
@@ -42,19 +51,40 @@ impl<T> LeafPages<T> {
         self.len.div_ceil(LEAF_PAGE_ENTRIES)
     }
     fn retained_metadata(&self) -> usize {
-        self.page_count() * std::mem::size_of::<[Option<T>; LEAF_PAGE_ENTRIES]>()
+        match &self.storage {
+            LeafStorage::Inline(_) => 0, // 内联值已经包含在拥有者 sizeof 中，不虚报一个堆页。
+            LeafStorage::Paged(_) => {
+                std::mem::size_of::<LeafDirectory<T>>()
+                    + self.page_count() * std::mem::size_of::<LeafPage<T>>()
+            }
+        }
     }
     fn get(&self, index: usize) -> Option<&T> {
         if index >= self.len {
             return None; // 未发布的页槽不能冒充已完成的来源或覆盖。
         }
-        self.pages[index / LEAF_PAGE_ENTRIES].as_ref()?[index % LEAF_PAGE_ENTRIES].as_ref()
+        match &self.storage {
+            LeafStorage::Inline(value) => value.as_ref(),
+            LeafStorage::Paged(pages) => {
+                pages[index / LEAF_PAGE_ENTRIES].as_ref()?[index % LEAF_PAGE_ENTRIES].as_ref()
+            }
+        }
     }
     fn iter(&self) -> impl Iterator<Item = &T> {
-        self.pages[..self.page_count()]
-            .iter()
-            .flatten()
-            .flat_map(|page| page.iter().flatten())
+        let (single, pages) = match &self.storage {
+            LeafStorage::Inline(value) => (value.as_ref(), None),
+            LeafStorage::Paged(pages) => (None, Some(pages)),
+        };
+        let count = self.page_count();
+        // 两条遍历只借同一容器；内联和分页互斥，不复制 Rc，也不合并不同块的交集。
+        single
+            .into_iter()
+            .chain(pages.into_iter().flat_map(move |pages| {
+                pages[..count]
+                    .iter()
+                    .flatten()
+                    .flat_map(|page| page.iter().flatten())
+            }))
     }
     fn append(
         &mut self,
@@ -68,11 +98,19 @@ impl<T> LeafPages<T> {
             )); // 与原来源目录同一上限，不能靠另一容器扩大发布库存。
         }
         let page_index = self.len / LEAF_PAGE_ENTRIES;
-        let needs_page = self.pages[page_index].is_none();
-        let bytes = usize::from(needs_page) * std::mem::size_of::<[Option<T>; LEAF_PAGE_ENTRIES]>();
+        let promoting = matches!(&self.storage, LeafStorage::Inline(Some(_)));
+        let needs_page = match &self.storage {
+            LeafStorage::Inline(_) => promoting,
+            LeafStorage::Paged(pages) => pages[page_index].is_none(),
+        };
+        let bytes = usize::from(promoting) * std::mem::size_of::<LeafDirectory<T>>()
+            + usize::from(needs_page) * std::mem::size_of::<LeafPage<T>>();
         let work = SemanticWork {
-            structural_transitions: usize::from(needs_page) * LEAF_PAGE_ENTRIES + 1,
-            metadata_bytes: bytes + std::mem::size_of::<T>(),
+            // 提升真正初始化原有限目录和一页，再搬迁唯一旧值；不能把它藏在第二项的便宜写入里。
+            structural_transitions: usize::from(promoting) * (LEAF_PAGE_COUNT + 1)
+                + usize::from(needs_page) * LEAF_PAGE_ENTRIES
+                + 1,
+            metadata_bytes: bytes + (1 + usize::from(promoting)) * std::mem::size_of::<T>(),
             ..SemanticWork::default()
         };
         if work.structural_transitions > budget || work.metadata_bytes > budget {
@@ -81,10 +119,30 @@ impl<T> LeafPages<T> {
         quota
             .admit_metadata(bytes)
             .map_err(MarkdownTableRequestError::Window)?;
-        if needs_page {
-            self.pages[page_index] = Some(Box::new(std::array::from_fn(|_| None)));
-        } // 已收费的小页只初始化一次，其余槽仍不授予读取权限。
-        self.pages[page_index].as_mut().unwrap()[self.len % LEAF_PAGE_ENTRIES] = Some(value);
+        if promoting {
+            // 所有预算与真实容量准入已经成功才移出旧值；失败前原单项仍完整可读。
+            let LeafStorage::Inline(previous) =
+                std::mem::replace(&mut self.storage, LeafStorage::Inline(None))
+            else {
+                unreachable!("提升只来自原单项容器");
+            };
+            let mut page = Box::new(std::array::from_fn(|_| None));
+            page[0] = previous;
+            page[1] = Some(value);
+            let mut pages: Box<LeafDirectory<T>> = Box::new(std::array::from_fn(|_| None));
+            pages[0] = Some(page);
+            self.storage = LeafStorage::Paged(pages);
+        } else {
+            match &mut self.storage {
+                LeafStorage::Inline(single) => *single = Some(value),
+                LeafStorage::Paged(pages) => {
+                    if needs_page {
+                        pages[page_index] = Some(Box::new(std::array::from_fn(|_| None)));
+                    } // 原页边界、最大项数和未初始化槽权限都不改变。
+                    pages[page_index].as_mut().unwrap()[self.len % LEAF_PAGE_ENTRIES] = Some(value);
+                }
+            }
+        }
         self.len += 1;
         Ok(work)
     }
@@ -109,16 +167,24 @@ pub(super) enum RootLeafSemanticPublication {
     Ready(Box<VerifiedMarkdownRootLeafViewport>),
 }
 
-/// 每页只在原quota准入后分配；目录固定128槽，8192 run上限与现有presentation合同相同。
+type RunDirectory = [Option<Box<RunPage>>; PAGE_COUNT];
+
+/// 常见单样式窗口直接保一条真实 run；复杂窗口才拥有原有限页目录，绝不增加最大 run 数。
+enum RunStorage {
+    Inline(Option<MarkdownPresentationRun>),
+    Paged(Box<RunDirectory>),
+}
+
+/// 同样式相邻项原位合并；第二条独立 run 才分配目录与首页，不为每个短窗预建 64 个空槽。
 struct RunPages {
-    pages: [Option<Box<RunPage>>; PAGE_COUNT],
+    storage: RunStorage,
     len: usize,
 }
 
 impl RunPages {
     fn new() -> Self {
         Self {
-            pages: std::array::from_fn(|_| None),
+            storage: RunStorage::Inline(None),
             len: 0,
         }
     }
@@ -126,14 +192,23 @@ impl RunPages {
         self.len.div_ceil(PAGE_RUNS)
     }
     fn retained_metadata(&self) -> usize {
-        self.page_count() * std::mem::size_of::<RunPage>()
+        match &self.storage {
+            RunStorage::Inline(_) => 0, // 真实 run 已属于拥有者值，不另保页或目录的堆容量。
+            RunStorage::Paged(_) => {
+                std::mem::size_of::<RunDirectory>()
+                    + self.page_count() * std::mem::size_of::<RunPage>()
+            }
+        }
     }
     fn last_mut(&mut self) -> Option<&mut MarkdownPresentationRun> {
         let index = self.len.checked_sub(1)?;
-        self.pages[index / PAGE_RUNS]
-            .as_mut()?
-            .get_mut(index % PAGE_RUNS)?
-            .as_mut()
+        match &mut self.storage {
+            RunStorage::Inline(run) => run.as_mut(),
+            RunStorage::Paged(pages) => pages[index / PAGE_RUNS]
+                .as_mut()?
+                .get_mut(index % PAGE_RUNS)?
+                .as_mut(),
+        }
     }
     fn append(
         &mut self,
@@ -158,31 +233,71 @@ impl RunPages {
             ));
         }
         let page_index = self.len / PAGE_RUNS;
-        let needs_page = self.pages[page_index].is_none();
-        let page_bytes = usize::from(needs_page) * std::mem::size_of::<RunPage>();
-        let metadata = page_bytes + std::mem::size_of::<MarkdownPresentationRun>();
-        if metadata > budget || CONTROL + PAGE_RUNS > budget {
-            // 单页初始化必须容纳在当前量子；不足不分配、不消耗原quota、不发布半段。
+        let promoting = matches!(&self.storage, RunStorage::Inline(Some(_)));
+        let needs_page = match &self.storage {
+            RunStorage::Inline(_) => promoting,
+            RunStorage::Paged(pages) => pages[page_index].is_none(),
+        };
+        let allocated = usize::from(promoting) * std::mem::size_of::<RunDirectory>()
+            + usize::from(needs_page) * std::mem::size_of::<RunPage>();
+        let metadata = allocated
+            + (1 + usize::from(promoting)) * std::mem::size_of::<MarkdownPresentationRun>();
+        let transitions =
+            usize::from(promoting) * (PAGE_COUNT + 1) + usize::from(needs_page) * PAGE_RUNS;
+        if metadata > budget || CONTROL + PAGE_RUNS.max(transitions) > budget {
+            // 原最小页工作余量仍保留；提升还必须容纳真实目录/首页初始化与旧值搬迁。
+            // 容量准入之前核本量子，不能为多样式临时扩配额或丢弃原单 run 来换取空间。
             return Err(MarkdownTableRequestError::WorkLimit);
         }
         quota
-            .admit_retained(1, page_bytes)
+            .admit_retained(1, allocated)
             .map_err(MarkdownTableRequestError::Window)?;
-        if needs_page {
-            // 联合run/页容量准入已经成功；只初始化这一页，不一次性建立8192条大数组。
-            self.pages[page_index] = Some(Box::new(std::array::from_fn(|_| None)));
+        if promoting {
+            let RunStorage::Inline(previous) =
+                std::mem::replace(&mut self.storage, RunStorage::Inline(None))
+            else {
+                unreachable!("提升只来自原单 run 容器");
+            };
+            let mut page = Box::new(std::array::from_fn(|_| None));
+            page[0] = previous;
+            page[1] = Some(run);
+            let mut pages: Box<RunDirectory> = Box::new(std::array::from_fn(|_| None));
+            pages[0] = Some(page);
+            self.storage = RunStorage::Paged(pages);
+        } else {
+            match &mut self.storage {
+                RunStorage::Inline(single) => *single = Some(run),
+                RunStorage::Paged(pages) => {
+                    if needs_page {
+                        pages[page_index] = Some(Box::new(std::array::from_fn(|_| None)));
+                    } // 第65条等真实页边界仍沿原索引、页容量和 quota 分配。
+                    pages[page_index].as_mut().unwrap()[self.len % PAGE_RUNS] = Some(run);
+                }
+            }
         }
-        self.pages[page_index].as_mut().unwrap()[self.len % PAGE_RUNS] = Some(run);
         self.len += 1;
         Ok(SemanticWork {
-            structural_transitions: usize::from(needs_page) * PAGE_RUNS,
+            structural_transitions: transitions,
             metadata_bytes: metadata,
             ..SemanticWork::default()
         })
     }
     fn query(&self, index: usize) -> Option<MarkdownPresentationQuery> {
+        if let RunStorage::Inline(run) = &self.storage {
+            let run = run.as_ref()?;
+            return run
+                .utf16_range
+                .contains(&index)
+                .then(|| MarkdownPresentationQuery {
+                    utf16_range: run.utf16_range.clone(),
+                    styles: run.styles,
+                });
+        } // 原单项仍按精确半开范围查询；没有覆盖的位置不返回默认样式。
         let count = self.page_count();
-        let pages = &self.pages[..count];
+        let RunStorage::Paged(pages) = &self.storage else {
+            unreachable!("内联查询已在前面结束");
+        };
+        let pages = &pages[..count];
         let page_index = pages.partition_point(|page| {
             let page = page.as_ref().unwrap();
             let last = page.iter().rev().find_map(Option::as_ref).unwrap();
@@ -201,10 +316,19 @@ impl RunPages {
             })
     }
     fn iter(&self) -> impl Iterator<Item = &MarkdownPresentationRun> {
-        self.pages[..self.page_count()]
-            .iter()
-            .flatten()
-            .flat_map(|page| page.iter().flatten())
+        let (single, pages) = match &self.storage {
+            RunStorage::Inline(run) => (run.as_ref(), None),
+            RunStorage::Paged(pages) => (None, Some(pages)),
+        };
+        let count = self.page_count();
+        single
+            .into_iter()
+            .chain(pages.into_iter().flat_map(move |pages| {
+                pages[..count]
+                    .iter()
+                    .flatten()
+                    .flat_map(|page| page.iter().flatten())
+            }))
     }
 }
 
@@ -472,12 +596,14 @@ pub(super) struct RootLeafSemanticJob {
 impl RootLeafSemanticJob {
     /// 逆向重定位等真正释放固定续体时归账；Ready与Pending移交均不虚报一次Drop。
     pub(super) fn completed_owner_drop_control() -> usize {
-        // publish已计量清候选并移走输出；这里只遍历空run目录和两组小页目录，不再虚付256个候选。
+        // publish 已归还候选并移走输出；沿原固定目录清理上界预留控制额度。
+        // 内联空槽不宣称实际分配或遍历这些页，也不因容量优化给原请求补发更多控制 fuel。
         CONTROL + PAGE_COUNT + 2 * LEAF_PAGE_COUNT
     }
 
     pub(super) fn construction_work() -> SemanticWork {
         SemanticWork {
+            // 保留原有限目录装配的保守控制预留；metadata 只登记当前真实小容量 owner。
             structural_transitions: CONTROL + PAGE_COUNT + 2 * LEAF_PAGE_COUNT,
             metadata_bytes: std::mem::size_of::<Self>(),
             ..SemanticWork::default()
@@ -1720,7 +1846,7 @@ impl RootLeafSemanticJob {
         Ok(work)
     }
 
-    /// 父 owner 在任何结果移交前取得确切清理与发布费用；这里只读有限元数据。
+    /// 父 owner 在结果移交前预扣固定清理上界和真实发布载荷；这里只读有限元数据。
     pub(super) fn publication_work(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -1736,6 +1862,7 @@ impl RootLeafSemanticJob {
                 .map_err(MarkdownTableRequestError::Window)?;
         }
         Ok(SemanticWork {
+            // 小窗口不再建空页，但保守的原控制预留保持；实际堆目录/页由 append 单独准入、收费。
             structural_transitions: CONTROL
                 + 2 * PAGE_COUNT
                 + 2 * LEAF_PAGE_COUNT

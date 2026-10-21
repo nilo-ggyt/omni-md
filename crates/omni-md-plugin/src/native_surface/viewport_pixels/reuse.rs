@@ -1,6 +1,34 @@
 //! 活帧内的封存像素比较；哈希只预筛，最终身份替换必须逐格式、色表及有效字节相等。
 
 use super::super::*;
+use super::{Plan, PreparedImage, project_row};
+
+const FINGERPRINT_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FINGERPRINT_PRIME: u64 = 0x100_0000_01b3;
+
+/// 新RGBA已实际只读，按原编码核每个有效byte；只保一行，不申请压缩映射。
+/// miss多一次有限行投影，但不增加任何Source读取、glyph或Native调用配额。
+pub(super) fn projection_fingerprint(prepared: &PreparedImage) -> Result<Option<u64>, PixelError> {
+    // 投影只借固定瓦片行空间；越界不切片，由原编码路径负责原有结果与错误。
+    if prepared.width > 512
+        || prepared.height > 512
+        || !matches!(
+            &prepared.plan,
+            Plan::Neutral | Plan::Indexed(_) | Plan::Rgb24
+        )
+    {
+        return Ok(None);
+    }
+    let mut line = [0; 512 * 3];
+    let mut fingerprint = FINGERPRINT_OFFSET;
+    for y in 0..prepared.height {
+        let active = project_row(prepared, y, &mut line)?;
+        for &byte in &line[..active] {
+            fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(FINGERPRINT_PRIME);
+        }
+    }
+    Ok(Some(fingerprint))
+}
 
 /// 构造参数与原CGImage对应；配对mask还记录Native解释模式，禁止同bytes跨合成语义复用。
 #[derive(Clone, Eq, PartialEq)]
@@ -70,14 +98,76 @@ impl SealedPixels {
             fingerprint: 0,
         };
         // 只对同一真实封存映射有效像素作一次有限哈希；padding不参与内容判断，仍完整计入实际页账。
-        let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+        let mut fingerprint = FINGERPRINT_OFFSET;
         result.visit(|bytes| {
             for byte in bytes {
-                fingerprint = (fingerprint ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
+                fingerprint = (fingerprint ^ u64::from(*byte)).wrapping_mul(FINGERPRINT_PRIME);
             }
         });
         result.fingerprint = fingerprint;
         Ok(result)
+    }
+
+    /// 旧页只来自SealedPixels::new的真实只读映射，Arc保活整个逐行比较。
+    /// 哈希只跳过不可能的候选；命中还必须同stride/格式/完整色表及每个有效byte相等。
+    pub(in crate::native_surface::viewport_pixels) fn matches_projection(
+        &self,
+        prepared: &PreparedImage,
+        presentation: PixelPresentation,
+        fingerprint: u64,
+    ) -> Result<bool, PixelError> {
+        let (row_bytes, same_format) = match (&self.format, &prepared.plan) {
+            (Format::NeutralMask, Plan::Neutral) => (
+                (prepared.width + 15) & !15,
+                presentation == PixelPresentation::OpaqueNeutralMask,
+            ),
+            (Format::Indexed(table), Plan::Indexed(palette)) => (
+                (prepared.width + 15) & !15,
+                presentation == PixelPresentation::Image
+                    && table.len() == palette.count * 3
+                    && table
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .zip(&palette.colors[..palette.count])
+                        .all(|(bytes, color)| {
+                            *bytes == [(color >> 16) as u8, (color >> 8) as u8, *color as u8]
+                        }),
+            ),
+            (Format::Rgb24, Plan::Rgb24) => (
+                (prepared.width * 3 + 15) & !15,
+                presentation == PixelPresentation::Image,
+            ),
+            _ => return Ok(false),
+        };
+        if !same_format
+            || self.width != prepared.width
+            || self.height != prepared.height
+            || self.row_bytes != row_bytes
+            || self.fingerprint != fingerprint
+        {
+            return Ok(false);
+        }
+        let mut line = [0; 512 * 3];
+        for y in 0..prepared.height {
+            let active = project_row(prepared, y, &mut line)?;
+            // SAFETY: 本SealedPixels构造时已核width/height/stride完整覆盖，且未再开放写入。
+            // 只比较本行有效编码字节，padding不伪装像素，页账仍保全部实际舍入长度。
+            let previous = unsafe {
+                std::slice::from_raw_parts(
+                    self.allocation
+                        .address
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(y * self.row_bytes),
+                    active,
+                )
+            };
+            if &line[..active] != previous {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// 返回true只表示两个不可变编码相等；不能签当前Source、Scene、几何、Native关系或Ready。

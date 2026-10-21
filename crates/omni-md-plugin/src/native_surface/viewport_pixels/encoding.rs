@@ -311,8 +311,8 @@ fn scan_regions(original: &PreparedImage, count: usize) -> [Option<RegionScan>; 
 /// 原context已真实归还、RGBA页已只读；允许Candidate在不借用像素slice时进行有限Native校准。
 pub(super) struct PreparedImage {
     original: Arc<PixelAllocation>,
-    width: usize,
-    height: usize,
+    pub(super) width: usize,
+    pub(super) height: usize,
     row_bytes: usize,
     first_row: usize,
     plan: Plan,
@@ -321,6 +321,16 @@ pub(super) struct PreparedImage {
     observed_pixels: usize,
 }
 impl PreparedImage {
+    /// 投影只读已经归还context、实际mprotect后的原RGBA，不新增输出页或Native对象。
+    /// 指纹只供有限旧tile预筛；真正复用仍须核格式、完整色表和逐个有效输出byte。
+    pub(super) fn projection_fingerprint(&self) -> Result<Option<u64>, PixelError> {
+        reuse::projection_fingerprint(self)
+    }
+
+    pub(super) fn projection_owner(&self) -> &Arc<NativeMarkdownViewportPixels> {
+        &self.original.counters
+    }
+
     pub(super) fn mask_request(&self) -> Option<MaskPaletteRequest> {
         match &self.plan {
             Plan::Indexed(palette) => MaskPaletteRequest::new(&palette.colors[..palette.count]),
@@ -342,6 +352,68 @@ fn row(allocation: &PixelAllocation, y: usize, width: usize, row_bytes: usize) -
             allocation.address.as_ptr().cast::<u8>().add(y * row_bytes),
             width * 4,
         )
+    }
+}
+
+/// 原编码与分配前比较共用同一个字节投影，不另写近似解码或放松alpha/色表资格。
+/// source只含本行有效RGBA；调用者已由prepare证明大小，目标是同宽A8/索引有效行。
+fn project_byte_row(
+    source: &[u8],
+    target: &mut [u8],
+    palette: Option<&Palette>,
+) -> Result<(), PixelError> {
+    for (to, pixel) in target.iter_mut().zip(source.as_chunks::<4>().0) {
+        *to = if let Some(palette) = palette {
+            palette
+                .locate(rgb(pixel))
+                .map_err(|_| PixelError::Backend("原像素不属于已验证色表"))? as u8
+        } else {
+            255 - pixel[0] // 只有原完整opaque-neutral分类可调用无palette分支。
+        };
+    }
+    Ok(())
+}
+
+/// RGB24仅省去原分类已证明恒为255的alpha，逐分量保留原sRGB字节。
+fn project_rgb_row(source: &[u8], target: &mut [u8]) {
+    for (to, pixel) in target
+        .as_chunks_mut::<3>()
+        .0
+        .iter_mut()
+        .zip(source.as_chunks::<4>().0)
+    {
+        to.copy_from_slice(&pixel[..3]);
+    }
+}
+
+/// 单区域最多512列，一份1536byte栈行足够三种原编码；不建立完整压缩副本。
+/// prepared仍保真实原RGBA与first_row，比较期间无Native、Source读取或可逃逸slice。
+fn project_row(
+    prepared: &PreparedImage,
+    y: usize,
+    target: &mut [u8; 512 * 3],
+) -> Result<usize, PixelError> {
+    let source = row(
+        &prepared.original,
+        prepared.first_row + y,
+        prepared.width,
+        prepared.row_bytes,
+    );
+    match &prepared.plan {
+        Plan::Neutral => {
+            project_byte_row(source, &mut target[..prepared.width], None)?;
+            Ok(prepared.width)
+        }
+        Plan::Indexed(palette) => {
+            project_byte_row(source, &mut target[..prepared.width], Some(palette))?;
+            Ok(prepared.width)
+        }
+        Plan::Rgb24 => {
+            let active = prepared.width * 3;
+            project_rgb_row(source, &mut target[..active]);
+            Ok(active)
+        }
+        _ => Err(PixelError::InvalidGeometry), // RGBA/固色/双mask仍走各自原路径。
     }
 }
 
@@ -507,6 +579,21 @@ fn finish_prepared_inner(
     if pairs.is_some() && !matches!(&prepared.plan, Plan::Indexed(_)) {
         return Err(PixelError::InvalidGeometry); // 透明、固色或中性原表示不能领用其他调色板的颜色票。
     }
+    if allocations.is_none()
+        && pairs.is_none()
+        && let Some(reused) = prior
+            .map(|prior| prior.reuse_projected_image(&prepared))
+            .transpose()?
+            .flatten()
+    {
+        // 原glyph和分类已经完整完成；这里只省去随后会立即销毁的压缩输出页。
+        // 分区的全页预扣和双mask原Native证书/回退顺序完全保留，不在这里消费它们。
+        drop(prepared);
+        if reused.storage.release_failed() {
+            return Err(PixelError::Backend("投影复用后的原RGBA页未能真实归还"));
+        }
+        return Ok(reused);
+    }
     if let (Some(pairs), Plan::Indexed(palette)) = (pairs, &prepared.plan) {
         let request = MaskPaletteRequest::new(&palette.colors[..palette.count])
             .ok_or(PixelError::InvalidGeometry)?;
@@ -597,16 +684,11 @@ fn finish_prepared_inner(
                     width,
                 )
             };
-            for (to, pixel) in target.iter_mut().zip(
-                row(&original, first_row + y, width, row_bytes)
-                    .as_chunks::<4>()
-                    .0,
-            ) {
-                *to = palette
-                    .locate(rgb(pixel))
-                    .map_err(|_| PixelError::Backend("原像素不属于已验证色表"))?
-                    as u8;
-            }
+            project_byte_row(
+                row(&original, first_row + y, width, row_bytes),
+                target,
+                Some(palette),
+            )?;
         }
     } else {
         // 只有Neutral分支没有palette/solid；逐byte反相原灰值，不量化、不改gamma或清晰度。
@@ -622,13 +704,11 @@ fn finish_prepared_inner(
                     width,
                 )
             };
-            for (to, pixel) in target.iter_mut().zip(
-                row(&original, first_row + y, width, row_bytes)
-                    .as_chunks::<4>()
-                    .0,
-            ) {
-                *to = 255 - pixel[0];
-            }
+            project_byte_row(
+                row(&original, first_row + y, width, row_bytes),
+                target,
+                None,
+            )?;
         }
     }
     // 本区的目标字节已经完整写入独立映射，后续颜色空间/provider/image只消费新页。
@@ -793,13 +873,7 @@ fn rgb24(
                 width * 3,
             )
         };
-        for (to, pixel) in target.as_chunks_mut::<3>().0.iter_mut().zip(
-            row(&original, first_row + y, width, row_bytes)
-                .as_chunks::<4>()
-                .0,
-        ) {
-            to.copy_from_slice(&pixel[..3]); // 唯一省略的是已完整证明恒为255的alpha，不改变任一RGB bit。
-        }
+        project_rgb_row(row(&original, first_row + y, width, row_bytes), target);
     }
     // RGB三通道已逐byte复制完成，颜色空间和CGImage不再访问原RGBA。
     // 仅提前释放这一个有限工作格的原Arc；原32MiB预算及真实munmap收据仍由分配owner维护。

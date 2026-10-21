@@ -53,6 +53,24 @@ pub(in crate::native_surface) struct SealedTile {
     row_bytes: usize,
 }
 
+impl SealedTile {
+    /// 两个复用入口交付同一种真实收据；只clone原图/provider页，不带旧位置或Scene权限。
+    fn reused_image(&self) -> encoding::EncodedImage {
+        encoding::EncodedImage {
+            image: self.image.clone(),
+            secondary_image: self.secondary_image.clone(),
+            presentation: self.presentation,
+            storage: self.storage.clone(),
+            secondary_storage: self.secondary_storage.clone(),
+            reused_image: true,
+            #[cfg(test)]
+            allocation: Arc::clone(&self.allocation),
+            #[cfg(test)]
+            row_bytes: self.row_bytes,
+        }
+    }
+}
+
 /// 只有全部瓦片成功才存在的候选；元数据上界固定，不保存正文或Scene。
 pub(in crate::native_surface) struct TileFrame {
     pub width: usize,
@@ -62,6 +80,52 @@ pub(in crate::native_surface) struct TileFrame {
 }
 
 impl TileFrame {
+    /// 只对当前活帧做分配前比较；同真实页账、原只读存储、单plane格式都必须吻合。
+    /// 指纹避免把一次512²投影放大成64个旧tile全扫，最后仍逐有效byte核实，不能补旧票。
+    pub(super) fn reuse_projected_image(
+        &self,
+        prepared: &encoding::PreparedImage,
+    ) -> Result<Option<encoding::EncodedImage>, PixelError> {
+        if self.tiles.len() > MAX_TILE_SLOTS
+            || self.tiles.iter().any(|tile| {
+                !tile.storage.belongs_to(prepared.projection_owner())
+                    || tile
+                        .secondary_storage
+                        .as_ref()
+                        .is_some_and(|storage| !storage.belongs_to(prepared.projection_owner()))
+            })
+        {
+            return Ok(None); // 外owner仍由原seal_region在原位置拒绝，不以优化改变首错顺序。
+        }
+        // 没有相同实际尺寸的单plane时不扫描新RGBA；旧帧不存在可用候选仍走原编码。
+        if !self.tiles.iter().any(|original| {
+            original.tile.width == prepared.width
+                && original.tile.height == prepared.height
+                && original.secondary_image.is_none()
+                && original.secondary_storage.is_none()
+        }) {
+            return Ok(None);
+        }
+        let Some(fingerprint) = prepared.projection_fingerprint()? else {
+            return Ok(None);
+        };
+        for original in &self.tiles {
+            if original.tile.width == prepared.width
+                && original.tile.height == prepared.height
+                && original.secondary_image.is_none()
+                && original.secondary_storage.is_none()
+                && original.storage.matches_projection(
+                    prepared,
+                    original.presentation,
+                    fingerprint,
+                )?
+            {
+                return Ok(Some(original.reused_image()));
+            }
+        }
+        Ok(None)
+    }
+
     /// 只在本次已认证活帧里借图；新绘制和编码已完成，两个plane均已真实只读。
     /// 先前在seal_region中才判等，会先创建随后立刻扔掉的provider/CGImage及索引色空间。
     /// 这里仍逐格式、尺寸、stride、端点解释和有效byte核对，不凭hash或主题猜相同画面。
@@ -98,18 +162,7 @@ impl TileFrame {
         })?;
         // 只克隆原实际图和同一provider页；新编码页仍由调用者局部Arc归还，既不保新旧副本，
         // 也不继承旧坐标、Ready或完整Input。父CPU发布仍按新Scene核原Native图和原子提交。
-        Some(encoding::EncodedImage {
-            image: original.image.clone(),
-            secondary_image: original.secondary_image.clone(),
-            presentation,
-            storage: original.storage.clone(),
-            secondary_storage: original.secondary_storage.clone(),
-            reused_image: true,
-            #[cfg(test)]
-            allocation: Arc::clone(&original.allocation),
-            #[cfg(test)]
-            row_bytes: original.row_bytes,
-        })
+        Some(original.reused_image())
     }
 }
 
@@ -1225,11 +1278,11 @@ mod tests {
     fn equal_rgb24_reuses_the_real_image_but_one_rgb_byte_change_does_not() {
         let resources = Arc::new(NativeMarkdownViewportPixels::default());
         let observer = resources.observer();
-        let original = frame_with_prior(32, 32, &resources, dense_opaque_rgba, None);
-        let same = frame_with_prior(32, 32, &resources, dense_opaque_rgba, Some(&original));
+        let original = frame_with_prior(509, 31, &resources, dense_opaque_rgba, None);
+        let same = frame_with_prior(509, 31, &resources, dense_opaque_rgba, Some(&original));
         let changed = frame_with_prior(
-            32,
-            32,
+            509,
+            31,
             &resources,
             |context| {
                 dense_opaque_rgba(context);
@@ -1249,8 +1302,49 @@ mod tests {
             &*original.tiles[0].image,
             &*changed.tiles[0].image
         ));
+        // 非紧密RGB行同时覆盖末像素和padding；独立RGBA绘图核原图、复用图与单byte差分。
+        // 不能仅靠CGImage身份或reuse标记把错误投影当成用户可见的等值图像。
+        for (frame, change) in [(&original, false), (&same, false), (&changed, true)] {
+            let expected = Bitmap::new(509, 31, Arc::default()).unwrap();
+            dense_opaque_rgba(expected.context());
+            if change {
+                change_first_red(expected.context());
+            }
+            let rendered = Bitmap::new(509, 31, Arc::default()).unwrap();
+            CGContext::draw_image(
+                Some(rendered.context()),
+                CGRect::new(
+                    objc2_core_foundation::CGPoint::new(0.0, 0.0),
+                    objc2_core_foundation::CGSize::new(509.0, 31.0),
+                ),
+                Some(&frame.tiles[0].image),
+            );
+            CGContext::flush(Some(expected.context()));
+            CGContext::flush(Some(rendered.context()));
+            // SAFETY: 两个真实RGBA context与紧密映射同步持活，flush后只比较有限完整像素。
+            let (actual, expected_bytes) = unsafe {
+                (
+                    std::slice::from_raw_parts(
+                        rendered.allocation.address.as_ptr().cast::<u8>(),
+                        509 * 31 * 4,
+                    ),
+                    std::slice::from_raw_parts(
+                        expected.allocation.address.as_ptr().cast::<u8>(),
+                        509 * 31 * 4,
+                    ),
+                )
+            };
+            assert_eq!(actual, expected_bytes);
+        }
         assert_eq!(observer.snapshot().live_pixel_buffers, 2);
+        let allocation = Arc::clone(&same.tiles[0].allocation);
+        let last_image = same.tiles[0].image.clone();
         drop((original, same, changed));
+        // 原frame与复用frame都归还后，唯一真实CGImage claim仍须保原provider，不能提前munmap。
+        assert!(!allocation.provider_returned.load(Ordering::Acquire));
+        drop(last_image);
+        assert!(allocation.provider_returned.load(Ordering::Acquire));
+        drop(allocation);
         assert!(observer.is_released());
     }
 
