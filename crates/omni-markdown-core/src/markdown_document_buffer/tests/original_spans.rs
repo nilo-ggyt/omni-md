@@ -1,11 +1,13 @@
-//! 共享原始小目录的实际存储、跨层坐标和持久历史回归；完整oracle仅属于有限合成夹具。
+//! Actual storage, cross-directory coordinates, and persistent history for shared original-piece
+//! directories. Complete oracle buffers belong only to finite synthetic test fixtures.
 
 use super::*;
 use std::ops::Range;
 
 #[test]
 fn actual_original_span_does_not_inflate_the_persistent_node() {
-    // 比较真实生产类型，不用布局镜像代替编译器实际布局；普通编辑叶仍决定最大variant。
+    // Compare actual production types rather than a mirrored layout. Ordinary edited leaves still
+    // determine the node enum's largest variant.
     let node = std::mem::size_of::<MarkdownPieceTreeNode>();
     let piece = std::mem::size_of::<super::super::MarkdownPiece>();
     let span = std::mem::size_of::<super::super::OriginalSpan>();
@@ -16,18 +18,22 @@ fn actual_original_span_does_not_inflate_the_persistent_node() {
 
 #[test]
 fn original_spans_preserve_real_four_kib_borrows_and_all_scalar_coordinates() {
-    // 夹具跨多个64KiB物理叶，并在4KiB与64KiB两种目录边界放置跨片CRLF。
+    // Cross several 64-KiB physical leaves and place split CRLF at both 4-KiB logical-piece and
+    // 64-KiB directory boundaries.
     let mut source = "x".repeat(192 * 1024);
     for boundary in [4096, 65536, 131072] {
         source.replace_range(boundary - 1..boundary + 1, "\r\n");
     }
     for byte in [128, 65536 + 128, 131072 + 128] {
-        // 等长替换保留上面已知物理边界，同时加入代理项、组合字符和段落终止符。
+        // Equal-byte-length substitutions preserve those known boundaries while adding non-BMP
+        // scalars, combining characters, and paragraph terminators.
         source.replace_range(byte..byte + 13, "中😀e\u{301}\u{2029}");
     }
     let fixture = MarkdownBufferFixture::new(&source);
     let snapshot = fixture.buffer.text_snapshot();
     let mut actual = Vec::new();
+    // The caller-owned finite oracle may collect fixture output; every production callback must
+    // still borrow one actual logical piece instead of the span's entire directory extent.
     snapshot
         .visit_byte_range(0..snapshot.byte_len(), |bytes| {
             assert!(bytes.len() <= ORIGINAL_PIECE_BYTES);
@@ -39,7 +45,8 @@ fn original_spans_preserve_real_four_kib_borrows_and_all_scalar_coordinates() {
     assert_tree_is_avl(&fixture.buffer.root);
     let mut utf16 = 0;
     for (ordinal, (byte, scalar)) in source.char_indices().enumerate() {
-        // 抽查全部标量流中的固定频率点与两层边界邻域；低代理项仍按NSString单元读取。
+        // Check fixed-frequency scalar positions and both boundary neighborhoods. An interior
+        // UTF-16 surrogate remains invalid for editing but valid for an NSString code-unit read.
         if ordinal % 127 == 0
             || [4096, 65536, 131072]
                 .iter()
@@ -62,7 +69,8 @@ fn original_spans_preserve_real_four_kib_borrows_and_all_scalar_coordinates() {
     }
     assert_eq!(snapshot.byte_offset_for_utf16(utf16), Ok(source.len()));
 
-    // 独立逐byte物理行oracle核对CRLF合并；段落检查仍按原始CR/LF/PS分别定位。
+    // An independent bytewise physical-line oracle verifies CRLF joining. Text-checking paragraph
+    // boundaries below still use original CR/LF/PS terminators rather than physical-line counts.
     let mut line_starts = vec![0];
     let mut cursor = 0;
     while cursor < source.len() {
@@ -95,7 +103,8 @@ fn original_spans_preserve_real_four_kib_borrows_and_all_scalar_coordinates() {
 }
 
 fn checking_oracle(units: &[u16], request: Range<usize>) -> Range<usize> {
-    // 此独立有限数组只用于测试；严格before、空caret和CRLF端点与原平台合同一致。
+    // This independent finite array exists only in tests. Keep the platform's strict-before start,
+    // empty-caret anchor, and complete CRLF endpoint rules.
     let terminator = |unit: u16| matches!(unit, 0x000d | 0x000a | 0x2029);
     let start = units[..request.start]
         .iter()
@@ -126,7 +135,8 @@ fn shared_original_directories_keep_all_history_entries_and_frozen_resource_rele
     let mut expected = original.clone();
     let mut history = Vec::new();
     for ordinal in 0..MAX_EDIT_HISTORY_ENTRIES {
-        // 每次在不同原始目录附近落入一个真实标量边界；历史保存原root，不能展开全部小片。
+        // Edit actual scalar boundaries near different original directories. History preserves
+        // persistent roots instead of expanding every original logical piece.
         let at = (ordinal * 1597) % expected.len();
         let at = (at..=expected.len())
             .find(|at| expected.is_char_boundary(*at))
@@ -145,13 +155,16 @@ fn shared_original_directories_keep_all_history_entries_and_frozen_resource_rele
         MAX_EDIT_HISTORY_ENTRIES
     );
     for before in history.iter().rev() {
-        // 128次真实Undo逐步恢复原事务字节与目录共享，不能只核最终摘要碰巧相同。
+        // Verify each of 128 actual undo states and AVL invariants, not merely a coincidentally
+        // matching final digest.
         fixture.buffer.undo_text_edit().unwrap();
         assert_eq!(streamed_text(&fixture.buffer), *before);
         assert_tree_is_avl(&fixture.buffer.root);
     }
     assert!(!fixture.buffer.can_undo());
     assert_eq!(streamed_text(&fixture.buffer), original);
+    // The frozen reader legitimately retains original bytes after the document/history owner ends.
+    // Directory sharing alone neither extends read authority nor proves the mapping was released.
     drop(fixture);
     assert!(!observer.unmap_succeeded());
     let mut restored = Vec::new();
@@ -163,6 +176,8 @@ fn shared_original_directories_keep_all_history_entries_and_frozen_resource_rele
         })
         .unwrap();
     assert_eq!(restored, original.as_bytes());
+    // End the actual last reader before checking successful munmap and the retained failure receipt;
+    // dropping an internal payload by itself would not prove this OS operation succeeded.
     drop(frozen);
     assert!(observer.unmap_succeeded());
     assert_eq!(observer.mapped_bytes(), 0);

@@ -1,4 +1,4 @@
-//! 同一全ASCII冻结树的邻接字母数字段；游标只保原节点栈，所有实际访问消费原量子。
+//! Traverse adjacent alphanumeric text in the same proved ASCII source, retaining an original-node stack and charging actual step work.
 
 use super::*;
 
@@ -12,7 +12,7 @@ enum PendingNode {
         prefix: Option<u8>,
     },
     Leaf(MarkdownPiece, usize),
-    // 显示 ASCII 区间前方的 raw 前缀仍可能含 Unicode；仅保一个 scalar 残余定位真实字节。
+    // A raw prefix before a displayed ASCII interval may contain Unicode; retain one partial scalar to locate actual bytes.
     ScopedLeaf {
         piece: MarkdownPiece,
         utf16: usize,
@@ -24,10 +24,10 @@ enum PendingNode {
     },
 }
 
-/// 只在原Source已认证Dense GCB时消费；不保Source、正文映射或派生Reader。
+/// Consume only through the original Source's proved ASCII/GCB gateway; retain no Source, text mapping, or derived reader.
 pub(crate) struct MarkdownAsciiWordRun {
     authority: crate::MarkdownLayoutTextAuthority,
-    // raw run 仅能读取已密封显示 run 的原区间；其外隐藏标点不能终止显示词组。
+    // A raw run reads only the original range of a sealed display run; hidden punctuation outside it cannot stop a visible word.
     scope: Option<Range<usize>>,
     #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
     projection: Option<Box<display_projection::algorithms::ProjectionAsciiWordRun>>,
@@ -37,7 +37,7 @@ pub(crate) struct MarkdownAsciiWordRun {
     complete: bool,
 }
 
-/// bytes计实际请求的局部lease，scalars计真正检查的字符；metadata计原节点与Span目录访问。
+/// Count requested logical lease bytes, actually inspected scalars, and original node/span-directory visits separately.
 pub(crate) struct MarkdownAsciiWordStep {
     pub(crate) bytes: usize,
     pub(crate) scalars: usize,
@@ -46,7 +46,7 @@ pub(crate) struct MarkdownAsciiWordStep {
     pub(crate) complete: bool,
 }
 
-/// 原L/N统计在可打印ASCII域中精确等于alnum；单run且两端在run内证明整个节点同类。
+/// Original letter/number summaries equal alnum in the printable ASCII domain; one run touching both endpoints proves the entire node belongs to it.
 fn all_alnum(metrics: MarkdownDocumentMetrics) -> bool {
     metrics.all_printable_ascii.is_printable()
         && metrics.word_count == 1
@@ -76,7 +76,7 @@ impl MarkdownAsciiWordRun {
         }
     }
 
-    /// 仅原 Frozen gateway 用真实显示 run 的 raw 区间装配；不重新扫描已密封的 ASCII 事实。
+    /// Only the original Frozen gateway supplies a real display run's raw range, without rescanning its already sealed ASCII fact.
     #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
     pub(in crate::markdown_document_buffer) fn new_range(
         root: &PieceTreeLink,
@@ -90,7 +90,7 @@ impl MarkdownAsciiWordRun {
         run
     }
 
-    /// 显示坐标始终留在原目录游标内，不拿空 raw root 伪造 BOF/EOF。
+    /// Keep display coordinates in the original projection cursor, never using an empty raw root to manufacture BOF/EOF.
     #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
     pub(in crate::markdown_document_buffer) fn new_display(
         position: usize,
@@ -110,7 +110,7 @@ impl MarkdownAsciiWordRun {
         }
     }
 
-    /// 目录和原树续算共用同一额度；Source gateway 在前后核对原身份及真实资源健康。
+    /// Projection and original-tree continuation share one budget; the Source gateway checks original identity and actual health around each step.
     #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
     pub(in crate::markdown_document_buffer) fn advance_display(
         &mut self,
@@ -135,7 +135,7 @@ impl MarkdownAsciiWordRun {
         &self.authority
     }
 
-    /// 整节点与Span记录各收费一次；借出的叶描述跨量子保留，不从root反复重走路径。
+    /// Charge whole nodes and individual span records once each; retain leaf descriptions across yields rather than restarting at root.
     pub(in crate::markdown_document_buffer) fn advance(
         &mut self,
         source: &impl PieceByteSource,
@@ -160,10 +160,10 @@ impl MarkdownAsciiWordRun {
             }) {
                 self.complete = true;
                 break;
-            } // 已到密封 run 的真实边界，不能再访问隐藏原字符或后继 raw sibling。
+            } // At the sealed run's actual edge, do not inspect hidden original characters or a later raw sibling.
             let Some(next) = self.pending.last() else {
                 self.complete = true;
-                break; // 实际有序栈已经耗尽，才是本方向的原树端点。
+                break; // Only exhausting the actual ordered stack proves this direction's original tree endpoint.
             };
             if matches!(next, PendingNode::ScopedLeaf { .. }) {
                 if step.bytes == maximum_bytes || step.scalars == maximum_scalars {
@@ -183,6 +183,7 @@ impl MarkdownAsciiWordRun {
                 };
                 located |= utf16 == self.position && used == 0;
                 if !located {
+                    // Decode only the mixed raw prefix needed to reach the admitted ASCII run; partial scalars survive a byte-limited yield.
                     let count = (maximum_bytes - step.bytes)
                         .min(maximum_scalars - step.scalars)
                         .min(crate::MARKDOWN_LAYOUT_SOURCE_BYTES)
@@ -232,9 +233,11 @@ impl MarkdownAsciiWordRun {
                     bytes.finish()?;
                     source.source_health()?;
                     if let Some(error) = failure {
+                        // Preserve actual lease-return/source failure before reporting a decoded scalar or boundary mismatch.
                         return Err(error);
                     }
                 } else {
+                    // The sealed equal-length ASCII range permits byte addressing only inside its actual scope, in either direction.
                     let scope = self.scope.as_ref().expect("受控显示原区间已装配");
                     let available = if self.forward {
                         (piece.byte_len - byte).min(scope.end - self.position)
@@ -276,7 +279,7 @@ impl MarkdownAsciiWordRun {
                         source.source_health()?;
                     }
                 }
-                // 未定位前保原 UTF8 续算；定位后只保实际仍未耗尽的方向内区间。
+                // Before location, retain UTF-8 continuation; afterward retain only an actual unexhausted interval in this direction.
                 if !self.complete
                     && (!located
                         || if self.forward {
@@ -319,7 +322,7 @@ impl MarkdownAsciiWordRun {
                     .min(crate::MARKDOWN_LAYOUT_SOURCE_BYTES)
                     .min(available);
                 if count == 0 {
-                    continue; // 原叶已到本方向端点，不为下一兄弟节点申请一个空lease。
+                    continue; // At this leaf's directional endpoint, do not request an empty lease merely to reach its sibling.
                 }
                 let range = if self.forward {
                     local..local + count
@@ -327,8 +330,8 @@ impl MarkdownAsciiWordRun {
                     local - count..local
                 };
                 let bytes = source.piece_range_bytes(&piece, range)?;
-                // bytes计真实逻辑lease请求，不只计提前遇终止字符前解引用的那几个字节。
-                // 底层可按系统页pin；页对齐驻留量是另一项资源事实，不能混作逻辑读取预算。
+                // Charge the actual logical lease request, not just bytes dereferenced before finding a stopping character.
+                // Backing may pin system pages; page-aligned residency is a separate resource fact rather than logical read fuel.
                 step.bytes += bytes.len();
                 let mut stopped = false;
                 for offset in 0..bytes.len() {
@@ -340,7 +343,7 @@ impl MarkdownAsciiWordRun {
                     step.scalars += 1;
                     if !bytes[index].is_ascii_alphanumeric() {
                         stopped = true;
-                        break; // 这个真实字符只用于终止alnum跳过，仍留给原GCB规则解释。
+                        break; // This actual character stops alnum skipping and remains for the original GCB rule to interpret.
                     }
                     if self.forward {
                         self.position += 1;
@@ -348,14 +351,14 @@ impl MarkdownAsciiWordRun {
                         self.position -= 1;
                     }
                 }
-                bytes.finish()?; // 原lease先真实归还；回收I/O失败不能被已算出的extent掩盖。
-                source.source_health()?; // 包括原Cell权限；最后一叶归还期间的撤权也不能交出extent。
+                bytes.finish()?; // Return the actual lease first; computed extent cannot mask reclaim I/O failure.
+                source.source_health()?; // Include original cell authority; revocation during the last leaf's return must withhold the extent too.
                 if stopped {
                     self.complete = true;
                 } else if (self.forward && self.position < base + piece.metrics.utf16_len)
                     || (!self.forward && self.position > base)
                 {
-                    self.pending.push(PendingNode::Leaf(piece, base)); // 同一个部分叶继续，不复制其正文。
+                    self.pending.push(PendingNode::Leaf(piece, base)); // Continue the same partial leaf without copying its text.
                 }
                 continue;
             }
@@ -369,7 +372,7 @@ impl MarkdownAsciiWordRun {
                     if (self.forward && self.position >= end)
                         || (!self.forward && self.position <= base)
                     {
-                        continue; // 原caret另一侧的子树只剪枝，不读其正文。
+                        continue; // Prune the subtree on the other side of the original caret without reading its text.
                     }
                     if self.position < base || self.position > end {
                         return Err(MarkdownDocumentBufferError::RangeOutsideDocument);
@@ -382,7 +385,7 @@ impl MarkdownAsciiWordRun {
                                 .as_ref()
                                 .map_or(base, |range| base.max(range.start))
                         };
-                        continue; // 只消费原建叶/joined的严格正事实，不把可打印直接当Word。
+                        continue; // Consume the strict positive fact from original leaf/join construction, not printability alone as a word proof.
                     }
                     match node.as_ref() {
                         MarkdownPieceTreeNode::Branch { left, right, .. } => {
@@ -395,7 +398,7 @@ impl MarkdownAsciiWordRun {
                                 self.pending.push(PendingNode::Node(Arc::clone(left), base));
                                 self.pending
                                     .push(PendingNode::Node(Arc::clone(right), right_base));
-                            } // 有序DFS只留O(height)兄弟节点，节点Arc始终属于原冻结树。
+                            } // Ordered DFS keeps O(height) sibling nodes, whose Arc identities remain in the original frozen tree.
                         }
                         MarkdownPieceTreeNode::OriginalSpan(span) => {
                             let ordinal = if self.forward {
@@ -433,7 +436,7 @@ impl MarkdownAsciiWordRun {
                             byte_edge: byte_edge + metrics.byte_len,
                             prefix: (prefix + 1 < target).then_some(prefix + 1),
                         });
-                        continue; // 物理block前缀也一条一收费，budget1可在原目录中真实推进。
+                        continue; // Charge physical-block prefix records individually, allowing budget-one progress through the original directory.
                     }
                     let metrics = span.word_record_metrics(ordinal)?;
                     let byte_start = if self.forward {
@@ -496,7 +499,7 @@ impl MarkdownAsciiWordRun {
                         };
                     } else {
                         self.push_leaf(piece, base);
-                    } // 目录每次只取一条真实compact记录，不把16条展开藏成一次metadata。
+                    } // Consume one actual compact record at a time rather than hiding sixteen expansions in one metadata unit.
                 }
                 PendingNode::Leaf(..) | PendingNode::ScopedLeaf { .. } => {
                     unreachable!("叶字节由上方独立预算分支消费")
@@ -508,7 +511,7 @@ impl MarkdownAsciiWordRun {
         Ok(step)
     }
 
-    /// 原全 ASCII 叶继续直接寻址；只有显示范围所在混合 raw 叶需要真实前缀解码。
+    /// Address original all-ASCII leaves directly; only a mixed raw leaf containing a displayed range needs actual prefix decoding.
     fn push_leaf(&mut self, piece: MarkdownPiece, base: usize) {
         if self.scope.is_some() && !piece.metrics.all_printable_ascii.is_printable() {
             self.pending.push(PendingNode::ScopedLeaf {

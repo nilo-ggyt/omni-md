@@ -1,4 +1,4 @@
-//! 使用真实字体与独立有限HarfRust整形核对；测试Vec只容纳合成oracle，产品不复制正文。
+//! Compare real font output with an independent finite HarfRust oracle; test Vecs hold synthetic expectations rather than product text copies.
 use super::*;
 use crate::{
     MarkdownDocumentBuffer, MarkdownLayoutFont, MarkdownLayoutFontAuthority,
@@ -37,6 +37,7 @@ impl Fixture {
         font: MarkdownLayoutFont,
         script: [u8; 4],
     ) -> Self {
+        // Use a private actual file and one captured Source/Font identity for shaping, cluster indexing, and original break analysis.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("实际软行子范围.md");
         std::fs::write(&path, text).unwrap();
@@ -69,6 +70,7 @@ impl Fixture {
         )
         .unwrap();
         fill(&mut shape, &authority, &font_authority);
+        // Complete actual dependencies before measuring; no substitute cluster or break implementation supplies readiness.
         let mut clusters =
             MarkdownGlyphClusterIndex::new(&mut shape, &authority, &font_authority).unwrap();
         while clusters.status() != MarkdownGlyphClusterStatus::Ready {
@@ -94,6 +96,7 @@ impl Fixture {
         }
     }
     fn measure(&mut self, start: usize, width: i64) -> MarkdownSoftLineMeasureJob {
+        // Drive the original measurement job with its actual ready dependencies, retaining its real cancellation/authority ticket.
         let mut job = MarkdownSoftLineMeasureJob::new(
             self.source.clone(),
             &self.authority,
@@ -131,6 +134,7 @@ fn fill(
     source: &MarkdownLayoutTextAuthority,
     font: &MarkdownLayoutFontAuthority,
 ) {
+    // Tiny independent byte/scalar limits force incremental ingestion before shaping the original finite fixture once.
     while shape.status() == MarkdownShapingStatus::Ingesting {
         shape
             .step(
@@ -146,6 +150,7 @@ fn fill(
     shape.shape(source, font).unwrap();
 }
 fn byte_offset(text: &str, utf16: usize) -> usize {
+    // Derive oracle byte coordinates directly from the fixture's scalar stream, independently of Core's source conversion.
     let mut units = 0;
     for (byte, scalar) in text.char_indices() {
         if units == utf16 {
@@ -157,7 +162,7 @@ fn byte_offset(text: &str, utf16: usize) -> usize {
     text.len()
 }
 
-/// 独立完整有限子串oracle：直接公开HarfRust输入与原全局context/feature，不调用Core派生helper。
+/// Shape a complete finite substring directly through public HarfRust with original global context/features, without Core's derived helpers.
 fn oracle(fixture: &Fixture, text: &str, range: Range<usize>) -> Vec<MarkdownShapedGlyph> {
     let mut buffer = harfrust::Buffer::new();
     let direction = match fixture.options.direction {
@@ -175,6 +180,7 @@ fn oracle(fixture: &Fixture, text: &str, range: Range<usize>) -> Vec<MarkdownSha
     buffer.set_cluster_level(harfrust::ClusterLevel::MonotoneGraphemes);
     let mut flags = harfrust::BufferFlags::PRODUCE_UNSAFE_TO_CONCAT;
     let item = fixture.shape.source_range();
+    // Preserve actual item-edge flags; a soft-line boundary alone is not beginning/end of the full shaping item.
     if fixture.options.beginning_of_text && range.start == item.start {
         flags |= harfrust::BufferFlags::BEGINNING_OF_TEXT;
     }
@@ -183,6 +189,7 @@ fn oracle(fixture: &Fixture, text: &str, range: Range<usize>) -> Vec<MarkdownSha
     }
     buffer.set_flags(flags);
     let bytes = byte_offset(text, range.start)..byte_offset(text, range.end);
+    // The finite oracle uses full original pre/post context and absolute UTF-16 clusters, including nonzero item starts.
     buffer.set_pre_context(&text[..bytes.start]);
     buffer.set_post_context(&text[bytes.end..]);
     let mut units = range.start;
@@ -222,10 +229,11 @@ fn oracle(fixture: &Fixture, text: &str, range: Range<usize>) -> Vec<MarkdownSha
                 y_offset: position.y_offset,
             }
         })
-        .collect() // 仅有限测试完整glyph oracle；产品没有Vec输出或全文借用接口。
+        .collect() // Only the finite test oracle collects all glyphs; this adds no product Vec output or whole-text borrowing interface.
 }
 
 fn pair(fixture: &mut Fixture, measure: &MarkdownSoftLineMeasureJob) -> MarkdownSafeGlyphSlices {
+    // Acquire actual safe slices from the same measured shaping/cluster/break owners rather than reconstructing ranges from coordinates.
     MarkdownSafeGlyphSlices::from_measure(
         measure,
         &mut fixture.shape,
@@ -235,6 +243,7 @@ fn pair(fixture: &mut Fixture, measure: &MarkdownSoftLineMeasureJob) -> Markdown
     .unwrap()
 }
 fn spool(fixture: &mut Fixture, slice: MarkdownSafeGlyphSlice) -> MarkdownShapedSpool {
+    // Copy the admitted actual slice in bounded glyph batches, then use its real seal boundary before read-only queries.
     let mut builder =
         MarkdownShapedSpoolBuilder::from_safe_slice(&mut fixture.shape, slice).unwrap();
     while builder.step(&mut fixture.shape, 7).unwrap().status
@@ -243,6 +252,7 @@ fn spool(fixture: &mut Fixture, slice: MarkdownSafeGlyphSlice) -> MarkdownShaped
     builder.seal(&mut fixture.shape).unwrap()
 }
 fn compare(fixture: &Fixture, mut spool: MarkdownShapedSpool, expected: &[MarkdownShapedGlyph]) {
+    // Compare every original glyph field under all three authorities, then explicitly close this output's actual resource owner.
     let observer = spool.resource_observer();
     let authority = spool.authority();
     assert_eq!(spool.glyph_count(), expected.len());
@@ -276,6 +286,7 @@ fn compare(fixture: &Fixture, mut spool: MarkdownShapedSpool, expected: &[Markdo
 }
 
 #[test]
+// Nonzero LTR/RTL item coordinates must produce the same line and remainder glyphs as the independent complete-context oracle.
 fn actual_ltr_and_rtl_nonzero_line_and_remainder_match_full_oracle() {
     let text = "前\n01234 56789 01234 56789 01234 56789";
     let end = text.encode_utf16().count();
@@ -323,8 +334,8 @@ fn same_independent_line_geometry(
     for (old, new) in original.iter().zip(reshaped) {
         let mut old = *old;
         let mut new = *new;
-        // 安全断点保证字形/位置可复用；UNSAFE_TO_CONCAT描述原片段外上下文，独立shape的
-        // 首cluster可改变该位。交付spool仍逐字段保留完整原oracle（包括此位），绝不归零。
+        // Safe breaks permit glyph/position reuse, while UNSAFE_TO_CONCAT describes external context and may change at an independently shaped first cluster.
+        // Only this geometry comparison masks that bit; delivered spools retain every original oracle field, including its actual flags.
         old.flags &= !concat;
         new.flags &= !concat;
         assert_eq!(old, new);
@@ -332,6 +343,7 @@ fn same_independent_line_geometry(
 }
 
 fn continuous(fixture: &mut Fixture, text: &str, width: i64) {
+    // Reuse one actual Ready shaping job across every selected line; only each line's admitted glyph interval enters a new spool.
     let range = fixture.shape.source_range();
     let all = oracle(fixture, text, range.clone());
     let before = fixture.shape.profile().unwrap();
@@ -357,7 +369,7 @@ fn continuous(fixture: &mut Fixture, text: &str, width: i64) {
         compare(fixture, sealed, expected);
         copied += facts.visual_glyphs.len();
         start = facts.source_utf16.end;
-        drop(tail); // 原余项只是一张固定元数据票；不把每行剩余glyph重写进新spool。
+        drop(tail); // The remainder is a fixed metadata ticket, not a reason to rewrite all remaining glyphs into another spool per line.
         lines += 1;
     }
     assert_eq!(copied, all.len());
@@ -367,10 +379,11 @@ fn continuous(fixture: &mut Fixture, text: &str, width: i64) {
     assert_eq!(before.source_bytes_read, after.source_bytes_read);
     assert_eq!(before.glyph_count, after.glyph_count);
     assert!(after.source_borrow_max_bytes <= 4096);
-    // 全过程仅原job；每条原glyph恰好写入一次。source_bytes_read是原shaper摄取统计，
-    // 不冒称包含Source端点校验或索引IO，更不以此替代整产品峰值/CPU验收。
+    // The same job serves the whole sequence and every original glyph is written once. source_bytes_read measures shaping ingestion,
+    // excluding source endpoint validation/index I/O; it is no substitute for whole-product peak RSS or CPU verification.
 }
 #[test]
+// Many ordinary lines share the original output; line count must not multiply full-shape or remainder copying.
 fn many_ascii_lines_reuse_one_ready_job_and_copy_each_original_glyph_once() {
     let text = "01234 56789 ".repeat(128);
     let mut fixture = Fixture::new(&text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
@@ -378,6 +391,7 @@ fn many_ascii_lines_reuse_one_ready_job_and_copy_each_original_glyph_once() {
 }
 #[test]
 #[cfg(target_os = "macos")]
+// Capture the actual system CJK font into its independent immutable snapshot, then release every byte owner before checking real munmap/FD receipts.
 fn real_cjk_font_many_lines_reuse_original_output_and_release_font_snapshot() {
     let bytes = crate::MarkdownLayoutFontBytes::capture_file(
         std::path::Path::new("/System/Library/Fonts/Hiragino Sans GB.ttc"),
@@ -409,6 +423,7 @@ fn real_cjk_font_many_lines_reuse_original_output_and_release_font_snapshot() {
 }
 
 #[test]
+// Unsafe concat boundaries and inside-cluster candidates need actual resolution; selected width alone cannot certify reusable slices.
 fn unsafe_and_inside_cluster_still_require_real_resolution() {
     for (text, width) in [("A\u{ad}V", 900), ("f\u{200b}fi", 650)] {
         let mut fixture = Fixture::new(
@@ -429,6 +444,7 @@ fn unsafe_and_inside_cluster_still_require_real_resolution() {
     }
 }
 #[test]
+// Actual unfinished cluster ownership and a low-surrogate endpoint cannot sign a safe range, even when measurement already selected a line.
 fn unready_original_index_and_low_surrogate_cannot_sign_safe_range() {
     let text = "01234 56789 😀";
     let mut fixture = Fixture::new(
@@ -466,6 +482,7 @@ fn unready_original_index_and_low_surrogate_cannot_sign_safe_range() {
     ));
 }
 #[test]
+// Another actual shape job on equal input, and another source with equal bytes, both remain foreign owners for an original safe slice.
 fn same_bytes_different_job_and_different_source_never_replace_original_owner() {
     let text = "01234 56789 01234";
     let mut fixture = Fixture::new(text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
@@ -492,6 +509,7 @@ fn same_bytes_different_job_and_different_source_never_replace_original_owner() 
     assert!(MarkdownShapedSpoolBuilder::from_safe_slice(&mut foreign.shape, line).is_err());
 }
 #[test]
+// A Ready cluster owner can legitimately live only in its actual buffer; FD absence does not imply closed ownership or permanent slice authority.
 fn an_unspilled_cluster_owner_authorizes_the_slice_until_its_real_close() {
     let text = "01234 56789 01234";
     let mut fixture = Fixture::new(text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
@@ -500,17 +518,18 @@ fn an_unspilled_cluster_owner_authorizes_the_slice_until_its_real_close() {
     let observer = fixture.clusters.resource_observer();
     let ready = observer.snapshot();
     assert!(!ready.file_open && !ready.owner_closed && ready.buffer_bytes == 16 * 1024);
-    line.require(&mut fixture.shape).unwrap(); // 同Ready索引仅有原buffer，不需要创建FD来保住切片资格。
+    line.require(&mut fixture.shape).unwrap(); // The Ready index's original buffer is sufficient; no FD is required merely to preserve slice eligibility.
     fixture.clusters.cancel();
     let closed = observer.snapshot();
     assert!(closed.owner_closed && !closed.file_open && closed.buffer_bytes == 0);
     assert!(matches!(
         line.require(&mut fixture.shape),
         Err(MarkdownSafeGlyphSliceError::Poisoned)
-    )); // 原owner实际退出后，仍活的measure/job不能让旧切片重新通过。
+    )); // A still-live measure/job cannot revive the old slice after its actual index owner exits.
 }
 
 #[test]
+// Unsealed slices still depend on their original measure/index, whereas successfully sealed output owns its independent readable data.
 fn measure_drop_or_index_cancel_revoke_unsealed_slice_but_not_sealed_data() {
     let text = "01234 56789 01234";
     let mut fixture = Fixture::new(text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
@@ -543,6 +562,7 @@ fn measure_drop_or_index_cancel_revoke_unsealed_slice_but_not_sealed_data() {
     ));
 }
 #[test]
+// Original operation cancellation reaches both future builders and already sealed output; sealing cannot detach input cancellation authority.
 fn original_cancel_reaches_builder_and_already_sealed_spool() {
     let text = "01234 56789 01234";
     let mut fixture = Fixture::new(text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
@@ -564,6 +584,7 @@ fn original_cancel_reaches_builder_and_already_sealed_spool() {
     ));
 }
 #[test]
+// A real source reclaim failure remains prior to later cancellation, and dropping all actual payload owners still releases the mapping.
 fn real_source_error_precedes_cancel_and_all_payloads_really_release() {
     let text = "01234 56789 01234";
     let mut fixture = Fixture::new(text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
@@ -583,7 +604,7 @@ fn real_source_error_precedes_cancel_and_all_payloads_really_release() {
             libc::EIO
         ))
     );
-    cancellation.cancel(); // 实际IO已失败之后再取消；原首errno仍必须胜过干净取消。
+    cancellation.cancel(); // Cancel after actual I/O failure; preserve the original first errno rather than reporting clean cancellation.
     assert!(matches!(
         MarkdownShapedSpoolBuilder::from_safe_slice(&mut fixture.shape, line),
         Err(MarkdownShapedSpoolError::SafeSlice(
@@ -599,6 +620,7 @@ fn real_source_error_precedes_cancel_and_all_payloads_really_release() {
 }
 
 #[test]
+// Failure of a still-live original measure revokes its issued builder and closes partial output, not merely the measure's local status.
 fn failure_of_still_live_measure_revokes_issued_builder_and_really_closes_output() {
     let text = "01234 56789 01234";
     let mut fixture = Fixture::new(text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
@@ -632,6 +654,7 @@ fn failure_of_still_live_measure_revokes_issued_builder_and_really_closes_output
 }
 
 #[test]
+// Cancel the actual shaping owner after writing part of the spool; no later batch may be signed and the output FD must close.
 fn real_shape_cancel_revokes_partial_builder_before_any_new_batch_is_signed() {
     let text = "01234 56789 01234";
     let mut fixture = Fixture::new(text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
@@ -648,6 +671,7 @@ fn real_shape_cancel_revokes_partial_builder_before_any_new_batch_is_signed() {
 }
 
 #[test]
+// Preserve the existing corrupt-metadata rejection while separately proving sealed output owns Source/Font until its actual close.
 fn corrupt_metadata_cannot_exceed_actual_glyph_array_and_sealed_owner_releases_source() {
     let text = "01234 56789 01234";
     let mut fixture = Fixture::new(text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
@@ -660,7 +684,7 @@ fn corrupt_metadata_cannot_exceed_actual_glyph_array_and_sealed_owner_releases_s
         MarkdownSafeGlyphSlice::make(&seed, &mut fixture.shape, &fixture.clusters, corrupt),
         Err(MarkdownSafeGlyphSliceError::InconsistentCoverage)
     ));
-    drop(seed); // 工厂的瞬时同Source借用不参与下面最后真实owner释放判定。
+    drop(seed); // Exclude the factory's temporary same-Source borrow from the final real-owner release check below.
     let source = fixture.source.resource_observer();
     let backing = fixture.source.original_backing_observer().unwrap();
     let font = fixture.font.resource_observer();
@@ -669,7 +693,7 @@ fn corrupt_metadata_cannot_exceed_actual_glyph_array_and_sealed_owner_releases_s
     let mut sealed = spool(&mut fixture, line);
     drop(measure);
     drop(fixture);
-    assert!(!source.payload_released()); // 真实readonly仍需要冻结源/字体；不提前签归还。
+    assert!(!source.payload_released()); // Actual read-only output still needs frozen Source/Font; do not report release before that owner ends.
     let authority = sealed.authority();
     assert!(
         sealed
@@ -682,5 +706,5 @@ fn corrupt_metadata_cannot_exceed_actual_glyph_array_and_sealed_owner_releases_s
     assert!(backing.unmap_succeeded() && backing.mapped_bytes() == 0 && !backing.failed());
 }
 
-// 历史收据控制复用上方真实fixture；include保持同一测试命名空间，不复制fixture。
+// Spool receipt cases reuse the actual fixture above through the same test namespace, without copying its construction graph.
 include!("spool_tests.rs");

@@ -1,15 +1,17 @@
-//! 原匿名索引异页读取的实际buffer身份、有限IO与撤权回归，不建立替代元数据缓存。
+//! Exercise cross-page reads of the original anonymous index, bounded I/O, and revocation.
+//! Existing buffer-identity assertions inspect this implementation; they do not establish UI behavior.
 
 use super::*;
 
 fn record<const N: usize>(row: usize) -> [u8; N] {
+    // Encode both ordinal and a trailing witness so reads must preserve the complete fixed-width record.
     let mut bytes = [0; N];
     bytes[..8].copy_from_slice(&(row as u64).to_le_bytes());
     bytes[N - 1] = (row % 251) as u8;
     bytes
 }
 
-// 只比较实际Box的地址，确认异页pread及seal没有把原追加buffer换成另一份缓存。
+// Inspect only the actual Box address: cross-page pread and sealing must not replace this append buffer.
 fn buffer_identity<const N: usize>(index: &PagedLayoutIndex<N>) -> *const u8 {
     index
         .page
@@ -22,6 +24,8 @@ fn buffer_identity<const N: usize>(index: &PagedLayoutIndex<N>) -> *const u8 {
 }
 
 fn binary_search<const N: usize>(index: &mut PagedLayoutIndex<N>, target: usize) {
+    // Query old and current pages through the real reader, checking each returned row before
+    // using its stored ordinal to choose the next interval. No alternate metadata cache is built.
     let mut low = 0;
     let mut high = index.len();
     while low < high {
@@ -35,6 +39,7 @@ fn binary_search<const N: usize>(index: &mut PagedLayoutIndex<N>, target: usize)
             high = middle;
         }
     }
+    // The declared target exists, so exact lower-bound position and full target bytes must agree.
     assert_eq!(low, target);
     assert_eq!(index.read(low).unwrap(), record::<N>(target));
 }
@@ -42,6 +47,8 @@ fn binary_search<const N: usize>(index: &mut PagedLayoutIndex<N>, target: usize)
 #[cfg(feature = "paged-line-compose")]
 #[test]
 fn explicit_record_batches_match_original_rows_across_file_and_unpublished_append_buffer() {
+    // An empty query must not acquire a file. Subsequent appends produce three flushed pages
+    // and a dirty tail in the one original buffer, giving each batch a different real boundary.
     let per_page = PAGE / 64;
     let mut index = PagedLayoutIndex::<64>::new().unwrap();
     let mut empty: [[u8; 64]; 0] = [];
@@ -61,7 +68,9 @@ fn explicit_record_batches_match_original_rows_across_file_and_unpublished_appen
             index.file.as_ref().unwrap().metadata().unwrap().len(),
             file_length
         );
-    } // 旧页跨界、FD与尚未落盘尾部跨界、纯buffer都读同一真实记录，不为查询先写脏页。
+    } // Old-page, file-to-dirty-tail, and buffer-only batches preserve rows without flushing for a query.
+    // Private sealing removes append authority; batches still combine real file records and
+    // the retained tail. Explicit close must revoke the same reader rather than reopen storage.
     index.seal().unwrap();
     let mut rows = [[0; 64]; 3];
     index
@@ -81,12 +90,14 @@ fn explicit_record_batches_match_original_rows_across_file_and_unpublished_appen
 #[cfg(feature = "paged-line-compose")]
 #[test]
 fn explicit_batch_real_file_eof_rejects_its_partial_prefix_and_revokes_the_original_writer() {
+    // Spill the first page, then shorten the real inode so this old-page batch reaches actual EOF.
     let mut index = PagedLayoutIndex::<64>::new().unwrap();
     for ordinal in 0..PAGE / 64 + 1 {
         index.append(record::<64>(ordinal)).unwrap();
     }
     let observer = index.resource_observer();
-    // 同一真实inode截到一条；请求的三条均在旧页，不能用当前追加buffer掩盖磁盘短读。
+    // All three requested records belong to the old page; the current append buffer cannot
+    // hide this disk short read or convert its available prefix into successful delivery.
     index.file.as_ref().unwrap().set_len(64).unwrap();
     let mut rows = [[0; 64]; 3];
     assert!(
@@ -94,6 +105,7 @@ fn explicit_batch_real_file_eof_rejects_its_partial_prefix_and_revokes_the_origi
         if error.kind() == io::ErrorKind::UnexpectedEof)
     );
     assert!(matches!(index.read(0), Err(Error::Poisoned)));
+    // A data-read failure revokes subsequent use but does not manufacture a kernel close error.
     index.close().unwrap();
     let released = observer.snapshot();
     assert!(!released.file_open && released.buffer_bytes == 0 && !released.cleanup_failed);
@@ -102,6 +114,8 @@ fn explicit_batch_real_file_eof_rejects_its_partial_prefix_and_revokes_the_origi
 #[cfg(feature = "paged-line-compose")]
 #[test]
 fn explicit_batch_cannot_truncate_invalid_input_to_a_valid_record_prefix() {
+    // Mismatched output length, beyond-EOF coverage, and reversed coordinates reject the whole
+    // request. Each case owns a fresh index so one failure cannot contaminate another result.
     for (start, end) in [(0, 2), (1, 4), (3, 2)] {
         let mut index = PagedLayoutIndex::<64>::new().unwrap();
         for ordinal in 0..3 {
@@ -114,12 +128,14 @@ fn explicit_batch_cannot_truncate_invalid_input_to_a_valid_record_prefix() {
         ));
         assert!(matches!(index.read(0), Err(Error::Poisoned)));
         index.close().unwrap();
-    } // 长度不符、越EOF和反向范围均拒绝，不能交付其中看似正确的子范围。
+    } // No apparently valid subrange may replace the invalid original request.
 }
 
 #[test]
 fn a_private_page_can_fill_seal_read_and_close_without_creating_a_file() {
     fn check<const N: usize>() {
+        // Fill exactly one private page and read each appended record while observing the actual
+        // resource owner. A full page alone does not yet require a successor or disk descriptor.
         let mut index = PagedLayoutIndex::<N>::new().unwrap();
         let observer = index.resource_observer();
         assert!(!observer.snapshot().file_open);
@@ -131,7 +147,8 @@ fn a_private_page_can_fill_seal_read_and_close_without_creating_a_file() {
             assert_eq!(index.read(row).unwrap(), record::<N>(row));
             assert!(!observer.snapshot().file_open);
         }
-        // 恰好装满并不需要后继页；私有seal仍只读原唯一buffer，不提前写出或分配FD。
+        // Sealing this full private page keeps the original buffer readable without eagerly
+        // writing it or allocating a file that no reader handoff has requested.
         let identity = buffer_identity(&index);
         index.seal().unwrap();
         assert_eq!(index.read(0).unwrap(), record::<N>(0));
@@ -139,7 +156,8 @@ fn a_private_page_can_fill_seal_read_and_close_without_creating_a_file() {
         assert_eq!(buffer_identity(&index), identity);
         assert!(!observer.snapshot().file_open);
         index.close().unwrap();
-        // close后的None不再代表未分配：同一个poison门必须阻止旧buffer和新File被重新创建。
+        // After close, an absent buffer no longer means lazily unallocated. The same poison
+        // gate must prevent old-record reads, appends, or sealing from recreating any resource.
         assert!(matches!(index.read(0), Err(Error::Poisoned)));
         assert!(matches!(index.append(record::<N>(0)), Err(Error::Poisoned)));
         assert!(matches!(index.seal(), Err(Error::Poisoned)));
@@ -149,6 +167,7 @@ fn a_private_page_can_fill_seal_read_and_close_without_creating_a_file() {
         assert!(released.owner_closed);
         assert_eq!(released.peak_buffer_bytes, PAGE);
     }
+    // Record widths exercise distinct page capacities through the same production owner.
     check::<16>();
     check::<32>();
     check::<64>();
@@ -158,6 +177,7 @@ fn a_private_page_can_fill_seal_read_and_close_without_creating_a_file() {
 fn first_rollover_allocates_one_file_and_reuses_the_existing_buffer_and_fd() {
     use std::os::fd::AsRawFd;
 
+    // Only the first record beyond the private page forces a real file and flushes that page.
     let mut index = PagedLayoutIndex::<64>::new().unwrap();
     let observer = index.resource_observer();
     for row in 0..PAGE / 64 {
@@ -173,6 +193,8 @@ fn first_rollover_allocates_one_file_and_reuses_the_existing_buffer_and_fd() {
         PAGE as u64
     );
     assert_eq!(index.read(0).unwrap(), record::<64>(0));
+    // Later rollovers keep the original descriptor and buffer while preserving old-page reads;
+    // resource observations below remain implementation-specific, separate from returned bytes.
     for row in PAGE / 64 + 1..PAGE / 64 * 3 + 1 {
         index.append(record::<64>(row)).unwrap();
         assert_eq!(index.file.as_ref().unwrap().as_raw_fd(), descriptor);
@@ -187,16 +209,20 @@ fn first_rollover_allocates_one_file_and_reuses_the_existing_buffer_and_fd() {
 fn actual_file_creation_failure_is_deferred_to_the_first_required_io_and_never_retried() {
     const CHILD: &str = "OMNI_LAYOUT_INDEX_CREATE_FAILURE_CHILD";
     if let Some(mode) = std::env::var_os(CHILD) {
-        // 独立测试进程的TMPDIR指向不存在的目录，制造真实tempfile ENOENT；不修改并行测试的环境。
+        // Only this child receives a nonexistent TMPDIR, causing actual tempfile ENOENT without
+        // changing the environment of tests running concurrently in the parent process.
         let mut index = PagedLayoutIndex::<64>::new().unwrap();
         let observer = index.resource_observer();
         index.append(record::<64>(0)).unwrap();
         index.seal().unwrap();
         assert_eq!(index.read(0).unwrap(), record::<64>(0));
         assert!(!observer.snapshot().file_open);
-        // 上方真实私有seal不应尝试创建File；以下各模式用原业务入口单独触发首次IO。
+        // The private seal above must not create a file. Each mode below independently exercises
+        // its production entry's first required I/O under this real filesystem failure.
         match mode.to_str().unwrap() {
             "rollover" => {
+                // Fill a private page, then reject its first actual spill. Poison remains sticky
+                // rather than retrying file creation through a later read or append.
                 let mut index = PagedLayoutIndex::<64>::new().unwrap();
                 let observer = index.resource_observer();
                 for row in 0..PAGE / 64 {
@@ -219,6 +245,8 @@ fn actual_file_creation_failure_is_deferred_to_the_first_required_io_and_never_r
             }
             #[cfg(feature = "paged-line-compose")]
             "reader" => {
+                // Final handoff needs an actual file even for private records; failed creation
+                // returns the consumed writer's resources without delivering another owner.
                 assert!(matches!(index.into_reader(), Err(Error::Io(error))
                     if error.kind() == io::ErrorKind::NotFound));
                 let released = observer.snapshot();
@@ -228,7 +256,8 @@ fn actual_file_creation_failure_is_deferred_to_the_first_required_io_and_never_r
             }
             #[cfg(feature = "paged-shaping-frontier")]
             "snapshot" => {
-                // 新writer保留追加权，真实发布失败须先归还预留名额并撤掉后续全部权限。
+                // Prefix publication starts with append authority. Actual creation failure must
+                // return the reserved reader slot and revoke all later writer/publication access.
                 let mut writer = PagedLayoutIndex::<64>::new().unwrap();
                 writer.append(record::<64>(0)).unwrap();
                 assert!(matches!(writer.snapshot_reader(1),
@@ -253,6 +282,8 @@ fn actual_file_creation_failure_is_deferred_to_the_first_required_io_and_never_r
     }
     let directory = tempfile::tempdir().unwrap();
     let missing = directory.path().join("missing-parent");
+    // Reinvoke only this exact test in a joined child per entry. The parent's private temporary
+    // directory owns the absent path; no shared environment or unrelated files are changed.
     let test = format!(
         "{}::actual_file_creation_failure_is_deferred_to_the_first_required_io_and_never_retried",
         module_path!().split_once("::").unwrap().1
@@ -283,6 +314,8 @@ fn actual_file_creation_failure_is_deferred_to_the_first_required_io_and_never_r
 #[test]
 fn repeated_old_and_new_binary_searches_preserve_the_single_dirty_append_buffer() {
     fn check<const N: usize>() {
+        // Keep the current page dirty while binary search visits both flushed and newly appended
+        // records. The pre-existing private counters below inspect buffer reuse, not product RSS.
         let per_page = PAGE / N;
         let initial = per_page * 2 + 17;
         let mut index = PagedLayoutIndex::<N>::new().unwrap();
@@ -312,7 +345,8 @@ fn repeated_old_and_new_binary_searches_preserve_the_single_dirty_append_buffer(
             assert_eq!(observer.snapshot().buffer_bytes, PAGE);
         }
 
-        // 私有seal只撤追加权限；原buffer继续服务本页，旧页仍按exactrecord读取。
+        // Private sealing revokes append authority only. The original buffer serves this page;
+        // old-page lookups still read exact records from the existing file.
         index.seal().unwrap();
         assert_eq!(buffer_identity(&index), identity);
         for target in [0, per_page, initial - 1, initial + 31] {
@@ -335,13 +369,15 @@ fn repeated_old_and_new_binary_searches_preserve_the_single_dirty_append_buffer(
 
 #[test]
 fn private_seal_and_close_do_not_write_an_unpublished_tail() {
+    // A real read-only file detects any attempted write. Since there is no file consumer,
+    // private seal/close must discard the unpublished buffer without altering existing bytes.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("unpublished-index");
     std::fs::write(&path, b"unchanged").unwrap();
     let mut index = PagedLayoutIndex::<32>::with_file(File::open(&path).unwrap()).unwrap();
     let observer = index.resource_observer();
     index.append(record::<32>(0)).unwrap();
-    index.seal().unwrap(); // 该owner没有File消费者，不应触发只读FD上的写入。
+    index.seal().unwrap(); // No file consumer exists, so sealing must not write through the read-only descriptor.
     assert_eq!(index.read(0).unwrap(), record::<32>(0));
     assert_eq!(observer.snapshot().buffer_bytes, PAGE);
     index.close().unwrap();
@@ -352,11 +388,13 @@ fn private_seal_and_close_do_not_write_an_unpublished_tail() {
 
 #[test]
 fn actual_short_read_preserves_partial_bytes_and_poisons_the_writer_without_mapping() {
+    // Force an old-page pread to return a real prefix followed by EOF. The helper's raw output
+    // may contain that prefix, but the error must keep the complete record unavailable.
     let mut index = PagedLayoutIndex::<32>::new().unwrap();
     for row in 0..PAGE / 32 + 1 {
         index.append(record::<32>(row)).unwrap();
     }
-    index.seal().unwrap(); // 第一页已实际write；末页仍在buffer，截短只针对旧页pread。
+    index.seal().unwrap(); // The first page was actually written; only old-page pread sees the truncation, not the buffered tail.
     let observer = index.resource_observer();
     let file = index.file.as_ref().unwrap();
     file.set_len(48).unwrap();
@@ -368,12 +406,14 @@ fn actual_short_read_preserves_partial_bytes_and_poisons_the_writer_without_mapp
     assert!(matches!(error, Error::Io(cause) if cause.kind() == io::ErrorKind::UnexpectedEof));
     assert_eq!(&output[..16], &record::<32>(1)[..16]);
     assert_eq!(&output[16..], &[0xab; 16]);
+    // The same failure through the owner poisons future reads while retaining its buffer until
+    // explicit close; successful descriptor release is independent of the failed data operation.
     assert!(
         matches!(index.read(1), Err(Error::Io(cause)) if cause.kind() == io::ErrorKind::UnexpectedEof)
     );
     assert!(matches!(index.read(0), Err(Error::Poisoned)));
     assert_eq!(observer.snapshot().buffer_bytes, PAGE);
-    index.close().unwrap(); // 数据失败不伪造成内核close失败；真实资源收据仍须全部归还。
+    index.close().unwrap(); // Data failure does not fabricate a kernel close error; all actual resources must still return.
     let closed = observer.snapshot();
     assert!(
         !closed.file_open
@@ -385,11 +425,13 @@ fn actual_short_read_preserves_partial_bytes_and_poisons_the_writer_without_mapp
 
 #[test]
 fn actual_directory_read_errno_poisons_before_any_mapping_and_preserves_close_receipt() {
+    // The existing test-only file constructor receives a real directory descriptor. The count
+    // mutation below admits the attempted read; EISDIR itself comes from the actual filesystem.
     let directory = tempfile::tempdir().unwrap();
     let file = File::open(directory.path()).unwrap();
     let mut index = PagedLayoutIndex::<16>::with_file(file).unwrap();
     let observer = index.resource_observer();
-    index.count = 1; // 仅测试构造不可读取的原FD范围；生产构造器只接受自己的匿名文件。
+    index.count = 1; // Test-only range admission for this unreadable descriptor; production creates its own anonymous file.
     let error = index.read(0).unwrap_err();
     assert!(matches!(error, Error::Io(cause) if cause.raw_os_error() == Some(libc::EISDIR)));
     assert!(matches!(index.read(0), Err(Error::Poisoned)));
@@ -406,6 +448,8 @@ fn actual_directory_read_errno_poisons_before_any_mapping_and_preserves_close_re
 
 #[test]
 fn finite_pread_retries_eintr_and_short_reads_only_at_the_original_remaining_coordinates() {
+    // This existing injected syscall sequence checks the production exact-read helper's offset
+    // arithmetic. It does not claim that the operating system actually delivered EINTR here.
     let mut output = [0xab; 8];
     let mut positions = [0; 4];
     let mut lengths = [0; 4];
@@ -417,10 +461,12 @@ fn finite_pread_retries_eintr_and_short_reads_only_at_the_original_remaining_coo
         match calls {
             1 | 3 => Err(io::Error::from_raw_os_error(libc::EINTR)),
             2 => {
+                // Three returned bytes advance the next original offset; an interrupt consumes none.
                 remaining[..3].copy_from_slice(&[10, 11, 12]);
                 Ok(3)
             }
             4 => {
+                // Complete only the five remaining bytes, without replaying the already written prefix.
                 remaining.copy_from_slice(&[13, 14, 15, 16, 17]);
                 Ok(5)
             }
@@ -436,6 +482,8 @@ fn finite_pread_retries_eintr_and_short_reads_only_at_the_original_remaining_coo
 
 #[test]
 fn finite_pread_returns_the_first_eio_after_partial_output_without_replay() {
+    // The retained injected partial-read/EIO sequence separates unchanged prefix bytes from the
+    // failed remainder. No retry may turn this first hard error into a successful complete record.
     let mut output = [0xab; 8];
     let mut calls = 0;
     let error = read_exact_at(&mut output, 11, |remaining, position| {
@@ -457,13 +505,15 @@ fn finite_pread_returns_the_first_eio_after_partial_output_without_replay() {
 
 #[test]
 fn cancellation_range_and_offset_overflow_keep_the_original_poison_gate() {
+    // This direct failure-gate mutation inspects the existing owner's implementation contract;
+    // it is not an observation of a real cancellation callback arriving from another subsystem.
     let mut index = PagedLayoutIndex::<16>::new().unwrap();
     for row in 0..PAGE / 16 + 1 {
         index.append(record::<16>(row)).unwrap();
     }
     let observer = index.resource_observer();
     let identity = buffer_identity(&index);
-    index.mark_failed(); // 原取消/失败门先于同页或异页IO，不给旧record恢复读权。
+    index.mark_failed(); // The original failure gate precedes same-page and cross-page I/O; old records gain no renewed read authority.
     assert!(matches!(index.read(0), Err(Error::Poisoned)));
     assert!(matches!(index.read(PAGE / 16), Err(Error::Poisoned)));
     assert_eq!(buffer_identity(&index), identity);
@@ -471,15 +521,18 @@ fn cancellation_range_and_offset_overflow_keep_the_original_poison_gate() {
     assert_eq!(observer.snapshot().buffer_bytes, 0);
     assert!(!observer.snapshot().file_open && observer.snapshot().mapped_bytes == 0);
 
+    // Reject a nonexistent record before allocating storage, then keep that same owner poisoned.
     let mut range = PagedLayoutIndex::<16>::new().unwrap();
     assert!(matches!(range.read(0), Err(Error::InvalidRecord)));
     assert!(matches!(range.read(0), Err(Error::Poisoned)));
     assert_eq!(range.resource_observer().snapshot().peak_buffer_bytes, 0);
     range.close().unwrap();
 
+    // The existing corrupted-count fixture exposes checked byte-offset overflow before I/O;
+    // no actual file offset or descriptor is manufactured to mimic successful access.
     let mut overflow = PagedLayoutIndex::<16>::new().unwrap();
     let record = usize::MAX / 16 + 1;
-    overflow.count = record + 1; // 只构造损坏计数，验证旧checked乘法仍先于任何系统调用。
+    overflow.count = record + 1; // Test-only corrupted count; checked multiplication must still precede every system call.
     assert!(matches!(overflow.read(record), Err(Error::Overflow)));
     assert!(matches!(overflow.read(0), Err(Error::Poisoned)));
     assert_eq!(overflow.resource_observer().snapshot().peak_buffer_bytes, 0);
@@ -488,6 +541,8 @@ fn cancellation_range_and_offset_overflow_keep_the_original_poison_gate() {
 
 #[test]
 fn finite_pread_rejects_oversized_or_overflowing_intervals_before_io() {
+    // Panic closures are the existing no-I/O witnesses for invalid helper arguments. These pure
+    // interval checks neither perform real filesystem calls nor establish external cleanup behavior.
     let mut oversized = [0; PAGE + 1];
     assert!(matches!(
         read_exact_at(&mut oversized, 0, |_, _| panic!("超预算不得进入IO")),
@@ -503,6 +558,8 @@ fn finite_pread_rejects_oversized_or_overflowing_intervals_before_io() {
 #[cfg(feature = "paged-shaping-frontier")]
 #[test]
 fn half_page_publication_writes_only_each_new_suffix_and_keeps_one_buffer() {
+    // Publish a prefix, then retain both readers while adding records to the same writer page.
+    // Independent file length and byte witnesses distinguish suffix writes from full-page rewrites.
     let mut index = PagedLayoutIndex::<32>::new().unwrap();
     for row in 0..4 {
         index.append(record::<32>(row)).unwrap();
@@ -513,8 +570,8 @@ fn half_page_publication_writes_only_each_new_suffix_and_keeps_one_buffer() {
     assert_eq!(index.file.as_ref().unwrap().metadata().unwrap().len(), 64);
     assert_eq!(index.page.as_ref().unwrap().flushed, 64);
     assert_eq!(prefix.read(1).unwrap(), record::<32>(1));
-    // 测试直接在已发布区留下外部见证；第二次发布只写64..160，不得重写旧字节。
-    // 这不是产品允许修改File的入口；用于精确区分dirty suffix与全页回写协议。
+    // This test writes a witness directly into the published region. The next publication must
+    // write only 64..160 and leave it intact; this is not a product entry permitting file mutation.
     index
         .file
         .as_ref()
@@ -537,6 +594,8 @@ fn half_page_publication_writes_only_each_new_suffix_and_keeps_one_buffer() {
     assert_eq!(buffer_identity(&index), identity);
     assert_eq!(observer.snapshot().buffer_bytes, PAGE);
     assert_eq!(observer.snapshot().mapped_bytes, 0);
+    // The old reader's logical EOF remains fixed despite new bytes in the same inode. Its invalid
+    // request revokes itself; the independent successor reader and writer still close normally.
     assert!(matches!(prefix.read(2), Err(Error::InvalidRecord)));
     assert!(matches!(prefix.close(), Err(Error::Poisoned)));
     second.close().unwrap();

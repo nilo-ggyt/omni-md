@@ -1,7 +1,9 @@
-//! 同一真实字形任务的逻辑cluster与26.6前缀索引，只保存一页派生元数据。
+//! Logical clusters and 26.6 advance prefixes for one actual shaping job, retaining only one page
+//! of derived metadata in memory.
 //!
-//! cluster可能合并多个字素；这个索引不把cluster内位置伪装成可复用字形的断点。
-//! 它也不决定软行、重排、词典、字体切换或caret，消费者须完成各自的真实阶段。
+//! A cluster may combine multiple graphemes; positions inside it do not become safe boundaries for
+//! glyph reuse. This index decides neither soft lines, reshaping, dictionaries, font switching, nor
+//! carets; consumers must complete their own actual stages.
 
 use std::{ops::Range, sync::Weak};
 
@@ -13,7 +15,8 @@ use crate::{
     markdown_layout_index::{LayoutIndexError, LayoutIndexObserver, PagedLayoutIndex},
 };
 
-/// 单次调用至多消费这些真实glyph；一个任意长cluster也要保留同一待决状态并让出。
+/// Maximum actual glyphs consumed per call. Even an arbitrarily long cluster retains the same
+/// pending state across yields instead of being scanned to completion in one call.
 pub const MARKDOWN_GLYPH_CLUSTER_STEP: usize = 256;
 
 #[derive(Debug, Error)]
@@ -55,7 +58,8 @@ pub enum MarkdownGlyphClusterStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// 原全局UTF16范围与原视觉glyph半开范围；前缀advance按逻辑源顺序累计。
+/// Original global UTF-16 bounds and half-open visual glyph bounds. Prefix advances accumulate in
+/// logical source order without renumbering the original visual array.
 pub struct MarkdownGlyphCluster {
     pub source_utf16: Range<usize>,
     pub glyphs: Range<usize>,
@@ -63,7 +67,7 @@ pub struct MarkdownGlyphCluster {
     pub prefix_y_26_6: i64,
     pub x_advance_26_6: i64,
     pub y_advance_26_6: i64,
-    /// 保留原flags并集，绝不把unsafe-to-break/concat解释成安全边界。
+    /// Preserve the original flags' union; unsafe-to-break/concat never grants a safe boundary.
     pub flags: u32,
     pub missing_glyphs: usize,
 }
@@ -82,17 +86,19 @@ pub struct MarkdownGlyphClusterStep {
 }
 
 #[derive(Clone)]
-/// 只有真实FD/map/写buffer归还事实，不保活索引、job、字体或原文。
+/// Observe actual descriptor/mapping/write-buffer facts without retaining the index, job, font,
+/// or original text. These owned-resource receipts are not kernel RSS measurements.
 pub struct MarkdownGlyphClusterResourceObserver(LayoutIndexObserver);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MarkdownGlyphClusterResources {
-    /// 原索引writer已实际close；私有单页没有File时，仍不能把活owner误报为退出。
+    /// The original index writer actually closed. A private single page may have no File, but a
+    /// live owner must not be reported as completed solely because its descriptor is absent.
     pub owner_closed: bool,
     pub file_open: bool,
     pub mapped_bytes: usize,
     pub peak_mapped_bytes: usize,
-    /// 唯一metadata写buffer；Reader归还该buffer后只保原File。
+    /// Unique metadata write buffer; after the reader returns this buffer, only its original File remains.
     pub buffer_bytes: usize,
     pub peak_buffer_bytes: usize,
     pub cleanup_failed: bool,
@@ -118,7 +124,8 @@ struct Payload {
     pending: Option<MarkdownGlyphCluster>,
 }
 
-/// 不持有原job的强边；每次推进、读取、EOF均须借用创建索引的同一个Ready任务。
+/// Retain no strong edge to the original job. Every advance/read/EOF query must borrow the same
+/// Ready shaping task that created this index.
 pub struct MarkdownGlyphClusterIndex {
     payload: Option<Payload>,
     identity: Weak<()>,
@@ -141,13 +148,16 @@ impl MarkdownGlyphClusterIndex {
         source: &MarkdownLayoutTextAuthority,
         font: &MarkdownLayoutFontAuthority,
     ) -> Result<Self> {
-        // profile核真实原job，EOF读再验证调用方的原Source/Font；未Ready不创建匿名文件。
+        // Profile checks the actual job, then an EOF glyph read validates the caller's original
+        // Source/font authorities. A job that is not Ready cannot create this derived index.
         let profile = job.profile()?;
         job.glyph(source, font, profile.glyph_count)?;
         let backwards = matches!(
             job.direction(),
             MarkdownShapingDirection::RightToLeft | MarkdownShapingDirection::BottomToTop
         );
+        // The fixed index owner retains only derived records and one pending cluster; the job
+        // continues to own all actual glyph storage and Source/font lifetimes.
         let index = PagedLayoutIndex::new()?;
         let resources = MarkdownGlyphClusterResourceObserver(index.resource_observer());
         let source_range = job.source_range();
@@ -175,7 +185,8 @@ impl MarkdownGlyphClusterIndex {
         if !Weak::ptr_eq(&self.identity, &job.index_identity()) {
             return Err(MarkdownGlyphClusterError::JobMismatch);
         }
-        // 源/字体真实失败优先于本派生索引的状态；不能以旧metadata掩盖共享源已失败。
+        // After same-job identity, actual Source/font failure takes precedence over local index
+        // status; old metadata cannot conceal a failed shared source, even for EOF queries.
         if job
             .glyph(&self.source, &self.font, self.glyph_count)?
             .is_some()
@@ -190,11 +201,12 @@ impl MarkdownGlyphClusterIndex {
 
     fn fail<T>(&mut self, error: MarkdownGlyphClusterError) -> Result<T> {
         self.status = MarkdownGlyphClusterStatus::Poisoned;
-        drop(self.payload.take()); // 返回失败前真实交还本索引的FD/map，不保留部分可发布结果。
+        drop(self.payload.take()); // Return this index's actual storage before reporting the cause; retain no partial publishable result.
         Err(error)
     }
 
-    /// 读取完整原glyph，按真实方向归并同一cluster；step边界不提交待决cluster。
+    /// Read complete original glyph records and group their actual clusters in logical order.
+    /// A step boundary never commits an unfinished cluster.
     pub fn step(
         &mut self,
         job: &mut MarkdownShapingJob,
@@ -219,7 +231,8 @@ impl MarkdownGlyphClusterIndex {
         let before = self.count();
         let mut read = 0;
         while self.consumed < self.glyph_count && read < budget.min(MARKDOWN_GLYPH_CLUSTER_STEP) {
-            // RTL/BTT只反向读取原视觉数组；不反转glyph内容、不分配排序Vec。
+            // RTL/BTT only traverse the original visual array backward; do not reverse glyph
+            // contents or allocate a sorting vector.
             let at = if self.backwards {
                 self.glyph_count - self.consumed - 1
             } else {
@@ -233,14 +246,15 @@ impl MarkdownGlyphClusterIndex {
             read += 1;
         }
         if self.consumed == self.glyph_count && self.status != MarkdownGlyphClusterStatus::Ready {
-            // 真实数组EOF才结算最后cluster和被shaper移除的零glyph源范围。
+            // Only the actual glyph-array EOF finalizes the last cluster and any source interval
+            // whose default-ignorable characters the shaper removed.
             self.commit(self.source_range.end)?;
             let payload = self
                 .payload
                 .as_mut()
                 .ok_or(MarkdownGlyphClusterError::Poisoned)?;
             payload.index.seal()?;
-            self.guard(job)?; // seal的真实IO归还后再核原job，不凭本地计数签Ready。
+            self.guard(job)?; // Recheck the original job after seal's actual I/O, rather than inferring Ready from counts alone.
             self.status = MarkdownGlyphClusterStatus::Ready;
         }
         Ok(MarkdownGlyphClusterStep {
@@ -261,13 +275,14 @@ impl MarkdownGlyphClusterIndex {
             .map(|cluster| cluster.source_utf16.start);
         if let Some(previous) = previous {
             if glyph.source_utf16_cluster < previous {
-                return Err(MarkdownGlyphClusterError::InconsistentGlyphs); // MonotoneGraphemes的方向合同被破坏。
+                return Err(MarkdownGlyphClusterError::InconsistentGlyphs); // The original MonotoneGraphemes direction contract was violated.
             }
             if glyph.source_utf16_cluster > previous {
                 self.commit(glyph.source_utf16_cluster)?;
             }
         } else if self.committed_end < glyph.source_utf16_cluster {
-            // 开头被移除的默认忽略字符仍有真实源坐标；它没有可画glyph，不能凭空补一个。
+            // Removed leading default-ignorables retain actual source coordinates but no drawable
+            // glyph; record that interval without fabricating output.
             self.commit(glyph.source_utf16_cluster)?;
         }
         let pending = self
@@ -285,7 +300,8 @@ impl MarkdownGlyphClusterIndex {
                 flags: 0,
                 missing_glyphs: 0,
             });
-        // 一个cluster的glyph在原数组连续；RTL只改变读取方向，不改变此半开范围。
+        // A cluster's glyphs remain contiguous in the original array; reverse traversal does not
+        // change their actual half-open visual range.
         pending.glyphs.start = pending.glyphs.start.min(at);
         pending.glyphs.end = pending.glyphs.end.max(at + 1);
         pending.x_advance_26_6 = pending
@@ -302,6 +318,8 @@ impl MarkdownGlyphClusterIndex {
     }
 
     fn commit(&mut self, end: usize) -> Result<()> {
+        // A real next-cluster boundary or final EOF closes this pending source interval. With no
+        // pending glyphs, preserve its actual zero-glyph extent and unchanged signed prefix.
         let payload = self
             .payload
             .as_mut()
@@ -321,7 +339,7 @@ impl MarkdownGlyphClusterIndex {
             missing_glyphs: 0,
         });
         if end == value.source_utf16.start && self.source_range.is_empty() {
-            return Ok(()); // 空run没有cluster，真实EOF由Ready单独表达。
+            return Ok(()); // An empty run has no cluster; Ready separately expresses actual EOF.
         }
         if value.source_utf16.start != self.committed_end
             || end <= self.committed_end
@@ -330,7 +348,8 @@ impl MarkdownGlyphClusterIndex {
             return Err(MarkdownGlyphClusterError::InconsistentGlyphs);
         }
         value.source_utf16.end = end;
-        // 累计保留有符号advance；负kerning不能被夹成零或当成单调宽度证明。
+        // Preserve signed advances. Negative kerning cannot be clamped to zero or treated as a
+        // proof of monotonic widths; overflow rejects this candidate.
         let next_x = self
             .prefix_x
             .checked_add(value.x_advance_26_6)
@@ -346,7 +365,8 @@ impl MarkdownGlyphClusterIndex {
         Ok(())
     }
 
-    /// 完整索引按原逻辑源顺序逐条交付；调用方不必把已知ordinal重新二分成同一条记录。
+    /// Deliver sealed records in original logical source order without making a caller binary-search
+    /// the same record again when its actual ordinal is already known.
     #[cfg(any(feature = "paged-line-compose", test))]
     pub(crate) fn at_ordinal(
         &mut self,
@@ -354,33 +374,35 @@ impl MarkdownGlyphClusterIndex {
         ordinal: usize,
     ) -> Result<Option<MarkdownGlyphCluster>> {
         let result = (|| {
-            self.guard(job)?; // 同一原job的源/字体失败先于本地Ready或ordinal判断。
+            self.guard(job)?; // The same original job's Source/font failure precedes local Ready/ordinal decisions.
             if self.status != MarkdownGlyphClusterStatus::Ready {
                 return Err(MarkdownGlyphClusterError::InvalidRequest);
-            } // 未封存的待决cluster不能因已经有一段前缀而取得完整顺序读取权限。
+            } // A committed prefix cannot grant complete ordinal access to an unsealed pending tail.
             let payload = self
                 .payload
                 .as_mut()
                 .ok_or(MarkdownGlyphClusterError::Poisoned)?;
             if ordinal > payload.index.len() {
                 return Err(MarkdownGlyphClusterError::InvalidRequest);
-            } // 只允许恰好位于真实记录末端的EOF，越界不能冒充空结果。
+            } // Only the exact record endpoint is EOF; positions beyond it cannot masquerade as absence.
             let value = if ordinal == payload.index.len() {
                 None
             } else {
-                // 只读原索引的一条固定record；RTL和零glyph范围仍沿原commit顺序，不推算cluster。
+                // Read one original fixed record. RTL and zero-glyph intervals keep actual commit
+                // order instead of inferred cluster numbering.
                 Some(decode(payload.index.read(ordinal)?)?)
             };
-            self.guard(job)?; // 页IO及回收完成后再核原权限，EOF也不能绕过真实源失效。
+            self.guard(job)?; // Revalidate after page I/O/return; even EOF cannot bypass real Source revocation.
             Ok(value)
         })();
         match result {
             Ok(value) => Ok(value),
-            Err(error) => self.fail(error), // 保留真实首因并立即交还这个索引的FD/map。
+            Err(error) => self.fail(error), // Return the actual cause and dispose this index's storage immediately.
         }
     }
 
-    /// 查询一个原全局UTF16单元所在的真实shaping cluster；未完成尾部始终Pending。
+    /// Find the actual shaping cluster containing one original global UTF-16 unit. The unfinished
+    /// tail remains Pending, even when an earlier prefix is already committed.
     pub fn containing(
         &mut self,
         job: &mut MarkdownShapingJob,
@@ -403,7 +425,8 @@ impl MarkdownGlyphClusterIndex {
             return Err(MarkdownGlyphClusterError::InvalidRequest);
         }
         if offset >= self.committed_end {
-            // 完整EOF确定无记录；同一位置在未封存时不能被解释为空文档。
+            // Completed EOF proves no record. Before seal, the same coordinate cannot establish
+            // an empty document or a completed tail.
             return Ok(if self.status == MarkdownGlyphClusterStatus::Ready {
                 MarkdownGlyphClusterAnswer::Known(None)
             } else {
@@ -417,7 +440,8 @@ impl MarkdownGlyphClusterIndex {
         let mut low = 0;
         let mut high = payload.index.len();
         while low < high {
-            // 已提交源范围严格递增，二分至多usize::BITS步；不按glyph数量分配目录。
+            // Committed source ranges strictly increase, bounding binary search by usize::BITS
+            // without a glyph-count-sized in-memory directory.
             let middle = low + (high - low) / 2;
             let value = decode(payload.index.read(middle)?)?;
             if offset < value.source_utf16.start {
@@ -425,7 +449,7 @@ impl MarkdownGlyphClusterIndex {
             } else if offset >= value.source_utf16.end {
                 low = middle + 1;
             } else {
-                self.guard(job)?; // 真实页读取与回收之后核原job，不能发布失权缓存。
+                self.guard(job)?; // Check the original job after actual page access, never returning revoked cached metadata.
                 return Ok(MarkdownGlyphClusterAnswer::Known(Some(value)));
             }
         }
@@ -448,12 +472,14 @@ impl MarkdownGlyphClusterIndex {
     pub fn cancel(&mut self) {
         if self.payload.is_some() {
             self.status = MarkdownGlyphClusterStatus::Cancelled;
-            drop(self.payload.take()); // 元数据及时归还，原job仍由其真实owner独立决定生命周期。
+            drop(self.payload.take()); // Return derived metadata now; the actual job owner independently controls its lifetime.
         }
     }
 }
 
 fn encode(value: &MarkdownGlyphCluster) -> Result<[u8; 64]> {
+    // Encode fixed scalar fields without storing addresses or text. Check narrowing to u32 before
+    // a record can enter storage; signed 26.6 advances retain their full i64 representation.
     let mut bytes = [0; 64];
     for (slot, value) in [
         value.source_utf16.start,
@@ -480,10 +506,12 @@ fn encode(value: &MarkdownGlyphCluster) -> Result<[u8; 64]> {
     {
         bytes[24 + slot * 8..32 + slot * 8].copy_from_slice(&value.to_le_bytes());
     }
-    Ok(bytes) // 尾部8B固定保留为零，不存地址、正文或不稳定枚举布局。
+    Ok(bytes) // Reserve the final eight bytes as zero, without pointers, body text, or unstable enum layout.
 }
 
 fn decode(bytes: [u8; 64]) -> Result<MarkdownGlyphCluster> {
+    // Decode the same fixed layout and reject inconsistent ranges/counts or nonzero reserved bytes;
+    // malformed storage cannot become an authorized semantic cluster.
     let small = |slot: usize| {
         usize::try_from(u32::from_le_bytes(
             bytes[slot * 4..slot * 4 + 4]

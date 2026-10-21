@@ -103,7 +103,8 @@ fn admitted_contexts_and_every_caret_match_the_frozen_real_editor() {
 fn literal_carets_do_not_split_ordinary_bracket_contexts_or_change_unicode_source() {
     let source = "(^中文😀)^ ²₃";
     let (directory, buffer) = document(source);
-    // ^只是普通UTF8文字；跨越其位置的正文括号仍处于同一真实Paragraph上下文。
+    // A literal caret remains ordinary UTF-8 text, so surrounding brackets keep
+    // their actual shared Paragraph context across its source position.
     let closing_byte = source.find(')').unwrap();
     let closing_utf16 = source[..closing_byte].encode_utf16().count();
     assert_eq!(
@@ -114,7 +115,8 @@ fn literal_carets_do_not_split_ordinary_bracket_contexts_or_change_unicode_sourc
             matched: true,
         })
     );
-    // 线索查询只观察映射源，不能删除^或将Unicode上下标标量转成HTML标记。
+    // A read-only cue query preserves the mapped source bytes, including the
+    // literal caret and Unicode superscript/subscript characters.
     assert_eq!(
         fs::read(directory.path().join("note.md")).unwrap(),
         source.as_bytes()

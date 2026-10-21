@@ -1,4 +1,5 @@
-//! 以原Ready job逐glyph作为独立有限聚合oracle；不把这个索引测试当作已完成软行。
+//! Independently aggregate glyphs from the original Ready job for finite fixtures. Cluster-index
+//! verification does not establish completed soft-line layout.
 use super::*;
 use crate::{
     MarkdownDocumentBuffer, MarkdownLayoutFont, MarkdownLayoutTextSource, MarkdownShapingBudget,
@@ -19,6 +20,8 @@ fn ready(
     MarkdownLayoutTextAuthority,
     MarkdownLayoutFontAuthority,
 ) {
+    // Open a real isolated document; the returned shaping job owns its actual captured Source, not
+    // a replacement test reader or a synthetic glyph provider.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("有限cluster.md");
     std::fs::write(&path, text).unwrap();
@@ -35,6 +38,8 @@ fn ready_from(
     MarkdownLayoutTextAuthority,
     MarkdownLayoutFontAuthority,
 ) {
+    // Ingest the same captured source in bounded steps and shape with an actual Font. Original
+    // Source/font authorities accompany the job through every later index query.
     let source = MarkdownLayoutTextSource::capture(document);
     let authority = source.authority();
     let font = MarkdownLayoutFont::resolve(Arc::new(ROBOTO), "Roboto-Regular", &[]).unwrap();
@@ -68,11 +73,14 @@ fn ready_from(
         .unwrap();
     }
     job.shape(&authority, &font_authority).unwrap();
-    // 返回值仅持原job与Weak权限；不会增设活动文档或路径owner。
+    // Return only the original job and weak authority tickets, without retaining another live
+    // document or source-path owner.
     (job, authority, font_authority)
 }
 
 fn finish(index: &mut MarkdownGlyphClusterIndex, job: &mut MarkdownShapingJob, budget: usize) {
+    // Resume the actual index per quantum; even an unlimited caller request retains the production
+    // maximum glyph step instead of completing a giant pending cluster in one operation.
     while index.status() != MarkdownGlyphClusterStatus::Ready {
         let step = index.step(job, budget).unwrap();
         assert!(step.glyphs <= budget.min(MARKDOWN_GLYPH_CLUSTER_STEP));
@@ -87,7 +95,8 @@ fn exact_ltr_and_rtl_clusters_keep_every_original_glyph_field() {
     ] {
         let (mut job, source, font) = ready("office a\u{301} 🙂 fi", direction);
         let count = job.profile().unwrap().glyph_count;
-        // 这个有限oracle显式保存小样本；生产索引仍逐条读原job且只用一页文件。
+        // Only the finite test oracle collects the small glyph sample. The production index reads
+        // original glyphs individually and retains one metadata page, not a complete glyph mirror.
         let glyphs = (0..count)
             .map(|at| job.glyph(&source, &font, at).unwrap().unwrap())
             .collect::<Vec<_>>();
@@ -107,7 +116,8 @@ fn exact_ltr_and_rtl_clusters_keep_every_original_glyph_field() {
             else {
                 panic!("真实完整cluster缺失")
             };
-            // 顺序入口与旧位置查询都必须保留原ligature/组合/非BMP及RTL的完整真实记录。
+            // Ordinal and position queries must agree on actual ligature, combining, non-BMP, and
+            // RTL records, including their original signed prefixes and visual ranges.
             assert_eq!(
                 index.at_ordinal(&mut job, ordinal).unwrap(),
                 Some(cluster.clone())
@@ -143,6 +153,8 @@ fn exact_ltr_and_rtl_clusters_keep_every_original_glyph_field() {
                 original.iter().filter(|glyph| glyph.glyph_id == 0).count()
             );
             for unit in cluster.source_utf16.clone() {
+                // Every source unit inside a shaping cluster returns that same complete record;
+                // this does not authorize splitting glyph reuse at interior grapheme positions.
                 assert_eq!(
                     index.containing(&mut job, unit).unwrap(),
                     MarkdownGlyphClusterAnswer::Known(Some(cluster.clone()))
@@ -175,11 +187,11 @@ fn ordinal_reads_reject_unsealed_or_past_eof_metadata_and_release_the_index() {
         let resources = index.resource_observer();
         let ordinal = if complete {
             finish(&mut index, &mut job, 1);
-            index.count() + 1 // 完整EOF的下一位不是另一个合法空结果。
+            index.count() + 1 // The position after exact record EOF is not another valid empty result.
         } else {
             index.step(&mut job, 1).unwrap();
             assert_eq!(index.status(), MarkdownGlyphClusterStatus::Building);
-            0 // 真实推进过的前缀也不能取得完整索引的顺序读取权限。
+            0 // A genuinely advanced prefix still grants no sealed-index ordinal access.
         };
         assert!(matches!(
             index.at_ordinal(&mut job, ordinal),
@@ -193,7 +205,8 @@ fn ordinal_reads_reject_unsealed_or_past_eof_metadata_and_release_the_index() {
                 && facts.buffer_bytes == 0
                 && !facts.cleanup_failed
         );
-        // 错误只撤掉这个派生索引；原Ready job及其Source/Font仍由原owner使用。
+        // Failure revokes only this derived index; its original owner still uses the Ready job and
+        // its actual Source/font resources.
         assert!(job.glyph(&source, &font, 0).unwrap().is_some());
     }
 }
@@ -235,7 +248,8 @@ fn another_identical_job_cannot_publish_original_metadata() {
     };
     let mut original = make();
     let mut foreign = make();
-    // 两次job刻意共享同一个Source/Font/范围/选项；拒绝确实来自原job身份，而非外来源。
+    // Both jobs deliberately share Source/font/range/options. Rejection must come from original-job
+    // identity rather than a different input source.
     assert!(foreign.glyph(&source, &font, 0).unwrap().is_some());
     let mut index = MarkdownGlyphClusterIndex::new(&mut original, &source, &font).unwrap();
     let resources = index.resource_observer();
@@ -249,7 +263,8 @@ fn another_identical_job_cannot_publish_original_metadata() {
     assert_eq!(resources.snapshot().buffer_bytes, 0);
     assert!(!resources.snapshot().cleanup_failed);
 
-    // 原job仍可建立自己的完整索引；相同Source/Font的另一job也不能借ordinal读它。
+    // The original job can still build its own sealed index; another job with identical Source/font
+    // cannot borrow its records through the ordinal path either.
     let mut ordinal_index = MarkdownGlyphClusterIndex::new(&mut original, &source, &font).unwrap();
     finish(&mut ordinal_index, &mut original, 1);
     let ordinal_resources = ordinal_index.resource_observer();
@@ -274,9 +289,11 @@ fn index_weak_keys_do_not_retain_source_font_or_original_job() {
     finish(&mut index, &mut job, 3);
     let index_resources = index.resource_observer();
     drop(job);
-    // 派生index仍活着时，原Source/font payload和shaper的实际FD/map均已交还。
+    // The derived index remains alive while original Source/font payloads and shaper descriptors/
+    // mappings finish their actual lifetime; index keys must not retain that original owner graph.
     assert!(original_resources.resources_released());
-    // 这个短索引仍实际持有唯一metadata buffer；私有seal无需为保活派生数据创建FD。
+    // This short index still owns its unique metadata buffer. Private seal need not create a file
+    // merely to retain derived data; only dropping the index returns that remaining buffer.
     assert!(!index_resources.snapshot().file_open);
     assert_eq!(index_resources.snapshot().buffer_bytes, 16 * 1024);
     drop(index);
@@ -288,6 +305,8 @@ fn index_weak_keys_do_not_retain_source_font_or_original_job() {
 
 #[test]
 fn one_long_cluster_yields_without_sealing_a_fake_chunk_boundary() {
+    // Combining glyphs share one actual cluster. Several small steps must retain Pending for its
+    // entire source interval instead of committing a boundary at each glyph-budget limit.
     let text = format!("a{}b", "\u{301}".repeat(2048));
     let (mut job, source, font) = ready(&text, MarkdownShapingDirection::LeftToRight);
     let mut index = MarkdownGlyphClusterIndex::new(&mut job, &source, &font).unwrap();
@@ -317,6 +336,8 @@ fn one_long_cluster_yields_without_sealing_a_fake_chunk_boundary() {
 
 #[test]
 fn multi_page_index_is_bounded_and_cancel_drops_only_its_own_resources() {
+    // Force actual multipage index storage and read records across pages before cancellation;
+    // observed file/buffer release is separate from kernel RSS or the source job's ownership.
     let (mut job, source, font) = ready(
         &"abcdef ".repeat(400),
         MarkdownShapingDirection::LeftToRight,
@@ -340,12 +361,14 @@ fn multi_page_index_is_bounded_and_cancel_drops_only_its_own_resources() {
     assert_eq!(observer.snapshot().mapped_bytes, 0);
     assert_eq!(observer.snapshot().buffer_bytes, 0);
     assert!(!observer.snapshot().cleanup_failed);
-    // 取消派生索引不取消原job；原owner仍能观察完整真实glyph。
+    // Cancelling the derived index does not cancel the original job; its owner still reads actual glyphs.
     assert!(job.glyph(&source, &font, 0).unwrap().is_some());
 }
 
 #[test]
 fn cancelled_job_revokes_an_already_ready_cluster_index() {
+    // Sealed metadata remains subordinate to the actual source job's cancellation, including
+    // queries that would otherwise be satisfied entirely from derived records.
     let (mut job, source, font) = ready("office", MarkdownShapingDirection::LeftToRight);
     let mut index = MarkdownGlyphClusterIndex::new(&mut job, &source, &font).unwrap();
     let resources = index.resource_observer();
@@ -364,6 +387,8 @@ fn cancelled_job_revokes_an_already_ready_cluster_index() {
 
 #[test]
 fn empty_run_and_invalid_budget_are_explicit_without_phantom_clusters() {
+    // An empty run transitions from Pending to a real sealed EOF with zero records. A later invalid
+    // step budget must still fail explicitly rather than manufacturing a cluster or silent success.
     let (mut empty, source, font) = ready("", MarkdownShapingDirection::LeftToRight);
     let mut index = MarkdownGlyphClusterIndex::new(&mut empty, &source, &font).unwrap();
     assert_eq!(
@@ -386,6 +411,8 @@ fn empty_run_and_invalid_budget_are_explicit_without_phantom_clusters() {
 
 #[test]
 fn record_codec_preserves_signed_advances_and_rejects_corruption() {
+    // Keep the existing fixed-record regression: signed extremes survive encoding, while changed
+    // reserved bytes must reject the record instead of becoming an accepted derived cluster.
     let value = MarkdownGlyphCluster {
         source_utf16: 100..105,
         glyphs: 8..11,
@@ -407,6 +434,8 @@ fn record_codec_preserves_signed_advances_and_rejects_corruption() {
 
 #[test]
 fn vertical_directions_preserve_nonzero_global_source_coordinates_and_advances() {
+    // Shape an actual nonzero global range in both vertical directions. Compare complete original
+    // glyph records rather than renumbering source positions or reducing results to horizontal width.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("垂直有界范围.md");
     let prefix = "前🙂";
@@ -436,7 +465,8 @@ fn vertical_directions_preserve_nonzero_global_source_coordinates_and_advances()
             else {
                 panic!("垂直cluster缺失")
             };
-            // ordinal只索引原record，不把非零全局源坐标或BTT视觉范围重编号。
+            // Ordinal locates the original record without renumbering global source coordinates or
+            // bottom-to-top visual glyph ranges.
             assert_eq!(
                 index.at_ordinal(&mut job, ordinal).unwrap(),
                 Some(value.clone())
@@ -480,6 +510,8 @@ fn vertical_directions_preserve_nonzero_global_source_coordinates_and_advances()
 
 #[test]
 fn real_source_reclaim_error_revokes_ready_metadata_even_at_eof() {
+    // Complete the index first, then fail actual original-window reclaim. Both EOF access paths
+    // must consult original authority before returning an apparently clean empty result.
     for ordinal_read in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("已封存源错误.md");
@@ -497,7 +529,7 @@ fn real_source_reclaim_error_revokes_ready_metadata_even_at_eof() {
             document.reclaim_original_read_windows_for_test(),
             Err(crate::MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO))
         );
-        // 旧位置查询与新顺序EOF均须先暴露同一真实Source EIO，不能签出干净None。
+        // Position and ordinal EOF queries expose the same actual Source EIO before any clean None.
         let error = if ordinal_read {
             index.at_ordinal(&mut job, ordinal).unwrap_err()
         } else {

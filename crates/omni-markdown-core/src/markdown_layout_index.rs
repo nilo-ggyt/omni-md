@@ -1,4 +1,5 @@
-//! 固定record的匿名分页IO；只持一份16KiB写buffer，不理解字素、断行或正文语义。
+//! Anonymous paged I/O for fixed-width records uses one 16 KiB append buffer.
+//! Grapheme, line-break, and document semantics remain with their algorithms.
 use std::{
     fs::File,
     os::fd::IntoRawFd,
@@ -9,7 +10,8 @@ use std::{
     },
 };
 
-/// 每个独立算法索引仅有一个16KiB工作区；不创建全局缓存或跨算法共享文件。
+/// Each independent algorithm index owns one 16 KiB workspace and its own
+/// backing file when needed, with no global or cross-algorithm cache.
 pub const MARKDOWN_LAYOUT_INDEX_BYTES: usize = 16 * 1024;
 const PAGE: usize = MARKDOWN_LAYOUT_INDEX_BYTES;
 use std::io;
@@ -48,13 +50,15 @@ struct ResourceState {
     peak_buffer: AtomicUsize,
     #[cfg(any(feature = "paged-graphemes", feature = "paged-shaping"))]
     owner_closed: AtomicBool,
-    // 真实写入或FD归还失败都不能被后来close洗掉；它不声称内核close必然失败。
+    // Actual write/descriptor-return failure stays visible after later close;
+    // this sticky result does not imply that every kernel close failed.
     cleanup_failed: AtomicBool,
     #[cfg(feature = "paged-line-compose")]
     reader_failed: AtomicBool,
 }
 
-/// 原追加页只在RAM保留一份；flushed之前的字节已写入同inode且永不回写。
+/// One append page remains in RAM. Bytes below flushed already belong to the
+/// same inode and are never overwritten after reader publication.
 struct Page<const N: usize> {
     bytes: Option<Box<[u8; PAGE]>>,
     used: usize,
@@ -62,6 +66,7 @@ struct Page<const N: usize> {
     resources: Arc<ResourceState>,
 }
 impl<const N: usize> Page<N> {
+    /// Allocate the sole page and publish its actual owned capacity receipt.
     fn new(resources: Arc<ResourceState>) -> Self {
         let bytes = Box::new([0; PAGE]);
         resources.buffer.store(PAGE, Ordering::Release);
@@ -74,6 +79,7 @@ impl<const N: usize> Page<N> {
         }
     }
 
+    /// Return exactly one initialized record from the original append page.
     fn read(&self, offset: usize) -> Result<[u8; N]> {
         let end = offset
             .checked_add(N)
@@ -84,12 +90,15 @@ impl<const N: usize> Page<N> {
         Ok(record)
     }
 
+    /// Append one complete record at the current initialized boundary only.
     fn write(&mut self, offset: usize, record: [u8; N]) -> Result<()> {
         let end = offset
             .checked_add(N)
             .filter(|&end| end <= PAGE)
             .ok_or(Error::InvalidRecord)?;
         if offset != self.used {
+            // Previously published bytes remain immutable, and gaps cannot
+            // become apparently initialized records.
             return Err(Error::InvalidRecord);
         }
         self.bytes.as_mut().ok_or(Error::Poisoned)?[offset..end].copy_from_slice(&record);
@@ -97,10 +106,12 @@ impl<const N: usize> Page<N> {
         Ok(())
     }
 
-    /// 只写新增脏后缀；即使半页已发布，后继也不回写旧Reader可读的任何字节。
+    /// Write only the new dirty suffix. A published half-page prefix stays
+    /// byte-for-byte immutable for every already-issued reader.
     fn flush_through(&mut self, file: &File, page_start: usize, through: usize) -> Result<()> {
         let through = through.min(self.used);
         if through <= self.flushed {
+            // The requested prefix already exists on the original inode.
             return Ok(());
         }
         let offset = page_start
@@ -108,7 +119,8 @@ impl<const N: usize> Page<N> {
             .ok_or(Error::Overflow)?;
         let offset = u64::try_from(offset).map_err(|_| Error::Overflow)?;
         let bytes = self.bytes.as_ref().ok_or(Error::Poisoned)?;
-        // write_all_at沿原有限区间处理短写/EINTR；部分成功后错误仍撤整个候选，不能补签prefix。
+        // write_all_at handles short writes/EINTR within this finite suffix.
+        // A later failure invalidates the candidate despite any written prefix.
         if let Err(error) = file.write_all_at(&bytes[self.flushed..through], offset) {
             self.resources.cleanup_failed.store(true, Ordering::Release);
             return Err(error.into());
@@ -117,7 +129,8 @@ impl<const N: usize> Page<N> {
         Ok(())
     }
 
-    /// 换页只在旧页完整flush后复用原分配；旧内容不进入新的有效区间。
+    /// Reuse the same allocation after full old-page flush. Previous bytes do
+    /// not authorize initialized records in the new logical page.
     fn reset(&mut self) {
         self.used = 0;
         self.flushed = 0;
@@ -125,13 +138,15 @@ impl<const N: usize> Page<N> {
 }
 impl<const N: usize> Drop for Page<N> {
     fn drop(&mut self) {
-        // 未发布尾部没有消费者，直接归还；先真实drop唯一buffer再发布资源归零。
+        // Unpublished tail bytes have no consumer. Drop the actual unique
+        // allocation before publishing a zero-capacity receipt.
         drop(self.bytes.take());
         self.resources.buffer.store(0, Ordering::Release);
     }
 }
 
-/// 读同一固定区间；构建器与只读Reader共用短读/EINTR协议，不额外建立映射或文件游标。
+/// Read one fixed extent with the same short-read/EINTR protocol for builders
+/// and readers, without adding a mapping or shared file cursor.
 fn read_exact_at(
     output: &mut [u8],
     offset: u64,
@@ -139,7 +154,8 @@ fn read_exact_at(
 ) -> Result<()> {
     if output.len() > PAGE {
         return Err(Error::InvalidRecord);
-    } // 辅助入口也保留真实16KiB上界，不能由后续调用者扩大为整索引读取。
+    } // This shared entry keeps the actual 16 KiB bound; callers cannot turn
+    // it into a complete-index materialization path.
     offset
         .checked_add(u64::try_from(output.len()).map_err(|_| Error::Overflow)?)
         .ok_or(Error::Overflow)?;
@@ -150,7 +166,8 @@ fn read_exact_at(
             .ok_or(Error::Overflow)?;
         match read(&mut output[complete..], position) {
             Ok(0) => {
-                // 已写入的栈前缀不代表完整record；真实EOF必须保留为本次失败。
+                // A filled stack prefix is incomplete. Preserve the real EOF
+                // failure instead of publishing a partial record.
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "layout index ended before the requested records",
@@ -158,31 +175,39 @@ fn read_exact_at(
                 .into());
             }
             Ok(bytes) => {
+                // Advance only over successfully read bytes of this same extent.
                 complete = complete.checked_add(bytes).ok_or(Error::Overflow)?;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                // EINTR未完成这一有限剩余区间，只重试原坐标，不重建候选、页或权限。
+                // EINTR retries the original unfinished extent without
+                // rebuilding the candidate, page, or reading authority.
             }
-            Err(error) => return Err(error.into()), // 首个真实errno原样交给owner永久撤权。
+            Err(error) => return Err(error.into()), // The actual first errno
+                                                    // reaches the owner's sticky rejection.
         }
     }
     Ok(())
 }
 
-/// 原唯一FD的close义务共用同一出口，不为只读移交复制File或猜测重试时机。
+/// Settle the unique descriptor once through the same close boundary, without
+/// duplicating File ownership for read-only handoff or guessing a retry.
 fn close_file(file: File, resources: &ResourceState) -> Result<()> {
     let raw = file.into_raw_fd();
-    // SAFETY: into_raw_fd转移唯一close义务；无第二File会重复关闭或复用此descriptor。
+    // SAFETY: into_raw_fd transfers the sole close responsibility; no second
+    // File owns this descriptor and can close a reused number later.
     if unsafe { libc::close(raw) } == 0 {
         resources.file_open.store(false, Ordering::Release);
         Ok(())
     } else {
-        // close失败时不假设内核已归还，也不重试可能已被系统复用的descriptor。
+        // A failed close grants no successful-return receipt and must not be
+        // retried against a descriptor number the system may have reused.
         resources.cleanup_failed.store(true, Ordering::Release);
         Err(io::Error::last_os_error().into())
     }
 }
 
+/// Append-only algorithm metadata owns one active page and, only when required,
+/// one anonymous file. Sealing and resource release remain separate operations.
 pub(crate) struct PagedLayoutIndex<const N: usize> {
     page: Option<Page<N>>,
     file: Option<File>,
@@ -195,14 +220,16 @@ pub(crate) struct PagedLayoutIndex<const N: usize> {
 }
 impl<const N: usize> PagedLayoutIndex<N> {
     pub(crate) fn new() -> Result<Self> {
-        // record不跨固定工作区边界；这里已无系统映射页对齐或磁盘预分配要求。
+        // Records fit wholly within the fixed workspace; this backend requires
+        // neither VM-page alignment nor eager disk allocation.
         if N == 0 || N > PAGE || !PAGE.is_multiple_of(N) {
             return Err(Error::InvalidRecord);
         }
         let resources = Arc::new(ResourceState::default());
         Ok(Self {
             page: None,
-            file: None, // 私有单页始终由唯一buffer保存；没有实际File消费者就不创建匿名FD。
+            file: None, // A private single page uses its unique buffer. Create
+            // no anonymous FD until an actual file consumer exists.
             number: 0,
             count: 0,
             loads: 0,
@@ -212,18 +239,21 @@ impl<const N: usize> PagedLayoutIndex<N> {
         })
     }
     #[cfg(all(test, any(feature = "paged-graphemes", feature = "paged-line-breaks")))]
+    /// Resource-boundary tests supply a real descriptor to the same index owner.
     pub(crate) fn test_with_file(file: File) -> Result<Self> {
         Self::with_file(file)
     }
     #[cfg(test)]
     fn with_file(file: File) -> Result<Self> {
         let mut index = Self::new()?;
-        // 真实只读、目录或可截短FD仍走同一实现；测试不替代后续写入、读取和close。
+        // Actual read-only, directory, or truncatable descriptors still use
+        // production write/read/close operations after this resource setup.
         index.file = Some(file);
         index.resources.file_open.store(true, Ordering::Release);
         Ok(index)
     }
 
+    /// Local rejection and original write/close failure permanently end access.
     fn healthy(&self) -> Result<()> {
         if self.poisoned
             || self.resources.cleanup_failed.load(Ordering::Acquire)
@@ -235,10 +265,12 @@ impl<const N: usize> PagedLayoutIndex<N> {
         }
     }
 
-    /// 只有换页回写或交付Reader才需要File；调用方的原失败出口负责永久撤权。
+    /// Allocate a real file only for page eviction or reader handoff. The
+    /// calling operation permanently rejects the original owner on failure.
     fn ensure_file(&mut self) -> Result<()> {
         if self.file.is_none() {
-            // 创建错误在首次真实IO边界原样返回；未取得FD不能伪造清理失败或重新建库兜底。
+            // Return creation failure at its actual I/O boundary. Failure to
+            // obtain a descriptor does not fabricate a close failure or retry.
             let file = tempfile::tempfile()?;
             self.file = Some(file);
             self.resources.file_open.store(true, Ordering::Release);
@@ -246,6 +278,8 @@ impl<const N: usize> PagedLayoutIndex<N> {
         Ok(())
     }
 
+    /// Prefix readers observe the same producer failure when that feature owns
+    /// published prefixes; other builds have no such upstream resource.
     fn producer_has_failed(&self) -> bool {
         #[cfg(feature = "paged-shaping-frontier")]
         {
@@ -257,6 +291,7 @@ impl<const N: usize> PagedLayoutIndex<N> {
         }
     }
 
+    /// Revoke the original writer and every feature-enabled prefix observer.
     fn mark_failed(&mut self) {
         self.poisoned = true;
         #[cfg(feature = "paged-shaping-frontier")]
@@ -265,18 +300,23 @@ impl<const N: usize> PagedLayoutIndex<N> {
             .store(true, Ordering::Release);
     }
 
+    /// Locate the next append record, flushing an old page completely before
+    /// reusing its sole allocation for another logical page.
     fn page(&mut self, record: usize) -> Result<usize> {
         self.healthy()?;
         let result = (|| {
             let offset = record.checked_mul(N).ok_or(Error::Overflow)?;
             let number = offset / PAGE;
             if self.page.is_none() {
+                // First use creates the fixed buffer, with no speculative file.
                 self.page = Some(Page::new(Arc::clone(&self.resources)));
                 self.number = number;
                 self.loads = self.loads.checked_add(1).ok_or(Error::Overflow)?;
             } else if self.number != number {
+                // The old page is leaving RAM. Complete its real file write
+                // before resetting initialized coverage in the reused buffer.
                 let start = self.number.checked_mul(PAGE).ok_or(Error::Overflow)?;
-                self.ensure_file()?; // 原页即将离开唯一buffer，先取得其实际落盘owner。
+                self.ensure_file()?;
                 let file = self.file.as_ref().ok_or(Error::Poisoned)?;
                 let page = self.page.as_mut().ok_or(Error::Poisoned)?;
                 page.flush_through(file, start, PAGE)?;
@@ -292,7 +332,8 @@ impl<const N: usize> PagedLayoutIndex<N> {
         result
     }
 
-    /// 只有交付File读取权限或换页才flush；私有seal仍可读原已付费buffer。
+    /// Flush only for file-backed reading authority or eviction; a private seal
+    /// continues to read the same already-owned append buffer.
     #[cfg(feature = "paged-line-compose")]
     fn flush_through(&mut self, records: usize) -> Result<()> {
         self.healthy()?;
@@ -301,7 +342,8 @@ impl<const N: usize> PagedLayoutIndex<N> {
             if records > self.count {
                 return Err(Error::InvalidRecord);
             }
-            // 包括空into_reader：交付真实File前只创建一次，不能移交未分配的FD或第二buffer。
+            // Even empty into_reader hands off one actual file, never a missing
+            // descriptor or another buffer pretending to be a reader.
             self.ensure_file()?;
             if let Some(page) = self.page.as_mut() {
                 let start = self.number.checked_mul(PAGE).ok_or(Error::Overflow)?;
@@ -321,9 +363,12 @@ impl<const N: usize> PagedLayoutIndex<N> {
         result
     }
 
+    /// Publish count only after one complete record is appended successfully.
     pub(crate) fn append(&mut self, record: [u8; N]) -> Result<()> {
         self.healthy()?;
         if self.sealed {
+            // Sealing ends append authority permanently, including later reads
+            // through an owner that attempted to violate that boundary.
             self.mark_failed();
             return Err(Error::Poisoned);
         }
@@ -341,9 +386,11 @@ impl<const N: usize> PagedLayoutIndex<N> {
         }
         result
     }
+    /// Read a complete existing record through the sole buffer or original FD.
     pub(crate) fn read(&mut self, record: usize) -> Result<[u8; N]> {
         self.healthy()?;
         if record >= self.count {
+            // Capacity or file extent cannot stand in for initialized count.
             self.mark_failed();
             return Err(Error::InvalidRecord);
         }
@@ -352,13 +399,15 @@ impl<const N: usize> PagedLayoutIndex<N> {
             if let Some(page) = self.page.as_ref()
                 && self.number == offset / PAGE
             {
-                // 命中原写页时直接读唯一buffer；seal不迫使已付费的记录落盘再读回。
+                // An append-page hit reads the existing allocation directly;
+                // sealing does not force a write followed by a redundant read.
                 return page.read(offset % PAGE);
             }
             let file = self.file.as_ref().ok_or(Error::Poisoned)?;
             let offset = u64::try_from(offset).map_err(|_| Error::Overflow)?;
             let mut bytes = [0; N];
-            // 异页只读取原FD上的固定栈record；旧页已在换页时flush，不预读或驱逐追加buffer。
+            // Old pages were flushed during eviction. Read one stack record
+            // from the original FD without prefetching or evicting the buffer.
             read_exact_at(&mut bytes, offset, |output, position| {
                 file.read_at(output, position)
             })?;
@@ -370,7 +419,8 @@ impl<const N: usize> PagedLayoutIndex<N> {
         result
     }
 
-    /// 消费调用方已明确请求的一小批相邻record；不预读范围外字节，也不增加第二个页缓存。
+    /// Deliver one explicitly requested small contiguous batch, without reading
+    /// beyond its extent or allocating a second page cache.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn read_batch(
         &mut self,
@@ -387,9 +437,11 @@ impl<const N: usize> PagedLayoutIndex<N> {
             let length = records.checked_mul(N).ok_or(Error::Overflow)?;
             if range.end > self.count || length > PAGE {
                 return Err(Error::InvalidRecord);
-            } // 范围及真实输出预算不匹配时整批拒绝，不能缩短后签发部分结果。
+            } // Reject a mismatched range/output budget as a whole; shortening
+            // it cannot authorize a partial successful batch.
             if records == 0 {
-                return Ok(()); // 空范围无需创建File或借用尚未分配的追加页。
+                return Ok(()); // Empty output requires neither a file nor an
+                // append page that has not been allocated.
             }
             let start = range.start.checked_mul(N).ok_or(Error::Overflow)?;
             let end = range.end.checked_mul(N).ok_or(Error::Overflow)?;
@@ -398,7 +450,8 @@ impl<const N: usize> PagedLayoutIndex<N> {
             let file_end = end.min(append_start);
             let file_length = file_end.saturating_sub(start);
             if file_length != 0 {
-                // 旧页已在换页时写出；把本次确定的相邻记录一次读回原输出，不读整页。
+                // Previously flushed records go directly into this bounded
+                // output interval; the rest of their page is never read.
                 let file = self.file.as_ref().ok_or(Error::Poisoned)?;
                 let offset = u64::try_from(start).map_err(|_| Error::Overflow)?;
                 read_exact_at(&mut output[..file_length], offset, |bytes, position| {
@@ -406,11 +459,13 @@ impl<const N: usize> PagedLayoutIndex<N> {
                 })?;
             }
             if file_length < length {
-                // 跨界的尾部仍来自唯一追加buffer；其中尚未发布的记录不能从旧FD读成零。
+                // The crossing suffix remains in the unique append buffer.
+                // Its unflushed records cannot be read as zeros from the FD.
                 let page = self.page.as_ref().ok_or(Error::Poisoned)?;
                 let local_start = start.max(append_start) - append_start;
                 let local_end = end.checked_sub(append_start).ok_or(Error::InvalidRecord)?;
                 if local_end > page.used {
+                    // Only fully initialized append bytes can fill the suffix.
                     return Err(Error::InvalidRecord);
                 }
                 let bytes = page.bytes.as_ref().ok_or(Error::Poisoned)?;
@@ -419,7 +474,8 @@ impl<const N: usize> PagedLayoutIndex<N> {
             Ok(())
         })();
         if result.is_err() {
-            self.mark_failed(); // 半批IO或无效范围都撤销原owner，不发布已读前缀。
+            self.mark_failed(); // Partial I/O and invalid ranges both revoke
+            // the owner; no already-read prefix is published.
         }
         result
     }
@@ -428,34 +484,41 @@ impl<const N: usize> PagedLayoutIndex<N> {
         self.count
     }
 
-    /// 只描述原唯一追加buffer已初始化的record；不加载旧页，也不创建另一份读取缓存。
+    /// Describe initialized records of the unique append buffer without loading
+    /// an old page or creating another read cache.
     #[cfg(any(feature = "paged-graphemes", feature = "paged-line-breaks"))]
     pub(crate) fn append_page_records(&mut self) -> Result<Option<std::ops::Range<usize>>> {
         self.healthy()?;
         let result = (|| {
             let Some(page) = &self.page else {
-                return Ok(None); // 尚无真实追加页，不能把未分配的零字节当作可读record。
+                return Ok(None); // An absent page grants no initialized zero
+                // records or permission to read capacity.
             };
             let start = self.number.checked_mul(PAGE / N).ok_or(Error::Overflow)?;
             let end = start.checked_add(page.used / N).ok_or(Error::Overflow)?;
-            // page.used只在完整record写入后增长；seal保留同一buffer及其真实有效范围。
-            // 不把整页容量或已flush长度当作初始化长度，最后半页仍只授权实际写过的记录。
+            // page.used advances only after a complete record write; seal keeps
+            // that initialized extent in the same buffer. Neither capacity nor
+            // flushed byte count certifies unwritten records in a partial page.
             Ok(Some(start..end))
         })();
         if result.is_err() {
-            self.mark_failed(); // 坐标错误仍沿原owner撤权，不由查询优化改签成功或重新建页。
+            self.mark_failed(); // Coordinate failure still rejects the original
+            // owner; a query optimization cannot recreate it.
         }
         result
     }
 
     #[cfg(any(feature = "paged-graphemes", feature = "paged-line-breaks"))]
+    /// Observe actual workspace-page activations without loading a page.
     pub(crate) fn page_loads(&self) -> u64 {
         self.loads
     }
     #[cfg(any(feature = "paged-graphemes", feature = "paged-line-breaks"))]
+    /// The owning algorithm uses this terminal path after its real failure.
     pub(crate) fn poison(&mut self) {
         self.mark_failed();
     }
+    /// Share resource facts without retaining the page or descriptor itself.
     pub(crate) fn resource_observer(&self) -> LayoutIndexObserver {
         LayoutIndexObserver {
             own: Arc::clone(&self.resources),
@@ -465,14 +528,16 @@ impl<const N: usize> PagedLayoutIndex<N> {
     }
     pub(crate) fn seal(&mut self) -> Result<()> {
         self.healthy()?;
-        // 这里只封闭私有追加权限；同owner查询继续使用原buffer，不为无File消费者强制写盘。
+        // Seal private append permission only. Same-owner reads retain the
+        // buffer without a forced write for a nonexistent file consumer.
         self.sealed = true;
         Ok(())
     }
 
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn into_reader(mut self) -> Result<LayoutIndexReader<N>> {
-        // 真正交File前必须把完整逻辑记录写出；失败由原owner归还buffer/FD，绝不发布部分Reader。
+        // Handoff requires every logical record on the actual file. On failure
+        // the original owner returns its buffer/FD without a partial reader.
         self.seal()?;
         self.flush_through(self.count)?;
         drop(self.page.take());
@@ -481,12 +546,14 @@ impl<const N: usize> PagedLayoutIndex<N> {
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(Error::Overflow)?;
         if self.resources.buffer.load(Ordering::Acquire) != 0 {
-            // Reader只保原File与收据，不能把尚活的写buffer交给后台只读消费者。
+            // A reader owns the original file and receipts only; a surviving
+            // writer allocation cannot be handed to a background reader.
             self.mark_failed();
             return Err(Error::Poisoned);
         }
         let file = self.file.take().ok_or(Error::Poisoned)?;
-        // take只移交原唯一File；自身Drop已无FD/buffer可关，观察者仍描述同一个资源身份。
+        // Move the unique original file. This value's Drop has no buffer/FD
+        // left to close; observers still refer to the same resource identity.
         Ok(LayoutIndexReader::from_sealed(
             file,
             self.count,
@@ -496,7 +563,8 @@ impl<const N: usize> PagedLayoutIndex<N> {
 
     pub(crate) fn close(&mut self) -> Result<()> {
         let mut first = None;
-        // close不再交付新Reader；未发布的dirty尾部可丢弃，不为无消费者临时数据额外写盘。
+        // Close issues no reader. Discard unpublished dirty tail bytes without
+        // writing temporary data that has no consumer.
         drop(self.page.take());
         if let Some(file) = self.file.take()
             && let Err(error) = close_file(file, &self.resources)
@@ -504,9 +572,11 @@ impl<const N: usize> PagedLayoutIndex<N> {
         {
             first = Some(error);
         }
-        self.poisoned = true; // 尚未分配FD与正常关闭都可能file=None；只有此终态撤销后续读写权。
+        self.poisoned = true; // file=None can mean never allocated or already
+        // returned; this terminal state ends future access.
         #[cfg(any(feature = "paged-graphemes", feature = "paged-shaping"))]
-        self.resources.owner_closed.store(true, Ordering::Release); // 实际归还或移交之后才结束writer生命周期；Reader仍单独持其FD。
+        self.resources.owner_closed.store(true, Ordering::Release); // Mark the
+        // writer ended after return/handoff; an issued reader owns its FD alone.
         if let Some(error) = first {
             #[cfg(feature = "paged-shaping-frontier")]
             self.resources
@@ -514,7 +584,8 @@ impl<const N: usize> PagedLayoutIndex<N> {
                 .store(true, Ordering::Release);
             Err(error)
         } else if self.resources.cleanup_failed.load(Ordering::Acquire) {
-            // 本次已把可归还资源真实排空，但原先的写入/归还失败不能被后来的close重签成功。
+            // Returning all presently owned resources cannot erase an earlier
+            // write/return failure or reclassify that operation as successful.
             Err(Error::Poisoned)
         } else {
             Ok(())
@@ -529,7 +600,8 @@ impl<const N: usize> Drop for PagedLayoutIndex<N> {
     }
 }
 
-/// 观察者只有原子资源事实，不保留FD、mmap、源、算法或任何Native对象。
+/// Atomic resource facts retain no FD, mapping, Source, algorithm, or Native
+/// object and make no claim about current kernel RSS.
 #[derive(Clone)]
 pub(crate) struct LayoutIndexObserver {
     own: Arc<ResourceState>,
@@ -539,19 +611,22 @@ pub(crate) struct LayoutIndexObserver {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LayoutIndexResources {
     pub(crate) file_open: bool,
-    /// 原 writer 已交付而尚未真实 close 的前缀 FD 数，包含 close 结果未知的未归还名额。
+    /// Issued prefix FDs without successful close, including unknown outcomes.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) prefix_readers: usize,
-    /// 原 inode 的真实写入、前缀读取或归还失败，后继前缀继续观察同一撤权事实。
+    /// Actual write/prefix-read/return failure of the original inode, shared by
+    /// every subsequent prefix observer.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) producer_failed: bool,
-    /// Writer已实际close或完成File移交；不声称接收该File的Reader也已关闭。
+    /// The writer closed or handed off its File; an issued reader may still own it.
     #[cfg(any(feature = "paged-graphemes", feature = "paged-shaping"))]
     pub(crate) owner_closed: bool,
-    /// 此metadata后端从不映射；保留真实零值，与Source和shaper的映射收据分开。
+    /// This metadata backend never maps; its actual zero remains distinct from
+    /// Source/shaper mapping receipts.
     pub(crate) mapped_bytes: usize,
     pub(crate) peak_mapped_bytes: usize,
-    /// 原唯一Box当前/历史实际分配；Reader不持工作buffer，prefix也不复制它。
+    /// Actual current/peak allocation of the unique Box, with no reader buffer
+    /// or copied prefix buffer included.
     pub(crate) buffer_bytes: usize,
     pub(crate) peak_buffer_bytes: usize,
     pub(crate) cleanup_failed: bool,
@@ -559,6 +634,8 @@ pub(crate) struct LayoutIndexResources {
     pub(crate) reader_failed: bool,
 }
 impl LayoutIndexObserver {
+    /// Report each original resource outcome independently; zero metadata
+    /// mappings do not prove that other Source/font mappings or RSS are zero.
     pub(crate) fn snapshot(&self) -> LayoutIndexResources {
         LayoutIndexResources {
             file_open: self.own.file_open.load(Ordering::Acquire),
@@ -607,6 +684,8 @@ mod tests {
         fn check<const N: usize>() {
             let mut index = PagedLayoutIndex::<N>::new().unwrap();
             let observer = index.resource_observer();
+            // Each actual record encodes independent head/tail values across
+            // several pages, exposing incorrect page reuse or positioned reads.
             for row in 0usize..2049 {
                 let mut bytes = [0; N];
                 bytes[..8].copy_from_slice(&(row as u64).to_le_bytes());
@@ -616,6 +695,8 @@ mod tests {
                 assert_eq!(observer.snapshot().buffer_bytes, PAGE);
             }
             index.seal().unwrap();
+            // Nonsequential queries cross both active and evicted pages after
+            // seal; expected bytes come from the original row coordinates.
             for row in [2048usize, 0, 513, 1024, 511, 2047] {
                 let bytes = index.read(row).unwrap();
                 assert_eq!(
@@ -627,6 +708,8 @@ mod tests {
                 assert_eq!(observer.snapshot().buffer_bytes, PAGE);
             }
             index.close().unwrap();
+            // Actual close/drop facts remain independent of the content checks
+            // and of any kernel memory measurement.
             let state = observer.snapshot();
             assert!(
                 !state.file_open
@@ -649,7 +732,8 @@ mod tests {
         std::fs::write(&path, b"unchanged").unwrap();
         let mut index = PagedLayoutIndex::<16>::with_file(File::open(&path).unwrap()).unwrap();
         let observer = index.resource_observer();
-        // 小页尚未交付File消费者，先在唯一buffer追加；跨页才发生真正write_all_at。
+        // The private first page appends to its unique buffer. Crossing the
+        // page boundary is the first actual write_all_at on this read-only FD.
         for _ in 0..PAGE / 16 {
             index.append([3; 16]).unwrap();
         }
@@ -674,6 +758,8 @@ mod tests {
     }
     #[test]
     fn invalid_width_and_post_seal_write_never_revive_cached_records() {
+        // Record widths must divide the actual fixed workspace, including the
+        // zero and oversized cases that cannot describe a complete record.
         assert!(matches!(
             PagedLayoutIndex::<0>::new(),
             Err(LayoutIndexError::InvalidRecord)
@@ -691,6 +777,8 @@ mod tests {
         index.append([7; 32]).unwrap();
         index.seal().unwrap();
         assert_eq!(index.read(0).unwrap(), [7; 32]);
+        // A prohibited post-seal append permanently ends this writer's access;
+        // previously cached bytes cannot revive it as a fresh valid owner.
         assert!(matches!(
             index.append([9; 32]),
             Err(LayoutIndexError::Poisoned)

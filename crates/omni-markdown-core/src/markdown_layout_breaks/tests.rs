@@ -1,7 +1,8 @@
-//! 原默认断行可能切入实际字素；交集查询必须保留Pending、有限让出与同一查询身份。
+//! Default line opportunities may lie inside actual graphemes; intersection queries preserve Pending, finite yields, and original cursor identity.
 use super::*;
 
 fn source(text: &str) -> (tempfile::TempDir, MarkdownLayoutTextSource) {
+    // Capture one actual immutable Source from a private synthetic file; returning it retains its legitimate backing owner after the document drops.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("layout-breaks.md");
     std::fs::write(&path, text).unwrap();
@@ -11,7 +12,7 @@ fn source(text: &str) -> (tempfile::TempDir, MarkdownLayoutTextSource) {
 }
 
 fn finish(job: &mut MarkdownLayoutBreakJob, authority: &MarkdownLayoutTextAuthority) {
-    // 两个算法合计每回合只有1 byte/1 scalar/1 record；跨UTF8与真实EOF均需保持推进。
+    // Both algorithms together receive only one byte/scalar/record per turn, including progress across UTF-8 fragments and actual EOF.
     for _ in 0..100_000 {
         let step = job
             .step(
@@ -32,6 +33,7 @@ fn finish(job: &mut MarkdownLayoutBreakJob, authority: &MarkdownLayoutTextAuthor
 }
 
 #[test]
+// Hundreds of actual raw line opportunities inside extended graphemes must yield rather than become a single unbounded intersection query.
 fn raw_default_break_inside_extended_grapheme_is_rejected_without_an_unbounded_query() {
     let text = " \u{301}".repeat(257);
     let (_directory, source) = source(&text);
@@ -77,15 +79,16 @@ fn raw_default_break_inside_extended_grapheme_is_rejected_without_an_unbounded_q
             other => panic!("完整源的后继查询返回了错误状态 {other:?}"),
         }
     }
-    assert!(yielded >= 256); // 大量raw机会均在字素内部，不能在一个回合偷偷扫描完。
+    assert!(yielded >= 256); // Numerous raw opportunities lie inside graphemes and cannot all be skipped secretly within one turn.
 }
 
 #[test]
+// A known line candidate with unfinished GCB coverage remains the same candidate when the original algorithms later make real progress.
 fn pending_grapheme_prefix_retries_the_same_line_candidate_after_real_progress() {
     let (_directory, source) = source("a b🙂c");
     let authority = source.authority();
     let mut job = MarkdownLayoutBreakJob::new(source, &authority).unwrap();
-    // 故意仅完成默认断行阶段，使已知机会对应的字素前缀仍未知。
+    // Complete only the actual line algorithm here, deliberately leaving the known opportunity's grapheme prefix unknown.
     while !job.payload.as_ref().unwrap().line.is_ready() {
         job.payload
             .as_mut()
@@ -114,6 +117,7 @@ fn pending_grapheme_prefix_retries_the_same_line_candidate_after_real_progress()
 }
 
 #[test]
+// Equal Source identity does not transfer cursor ownership between jobs; cancellation releases each real index without inventing shared-source release.
 fn cursors_do_not_transfer_between_equal_sources_and_cancellation_releases_both_indexes() {
     let (_directory, source) = source("a🙂 b\r\n中文");
     let authority = source.authority();
@@ -141,7 +145,7 @@ fn cursors_do_not_transfer_between_equal_sources_and_cancellation_releases_both_
             && !grapheme.cleanup_failed
     );
     assert!(!line.metadata_file_open && line.metadata_map_bytes == 0 && !line.cleanup_failed);
-    assert!(!grapheme.source_payload_released); // second/调用方仍合法保留同一源，不能假造已释放。
+    assert!(!grapheme.source_payload_released); // The second job/caller still legitimately owns this Source; release cannot be reported early.
     assert!(matches!(
         first.query(&mut cursor, 8),
         Err(MarkdownLayoutBreakError::Poisoned)
@@ -153,6 +157,7 @@ fn cursors_do_not_transfer_between_equal_sources_and_cancellation_releases_both_
 }
 
 #[test]
+// Empty EOF is an actual known boundary, while foreign capture authority poisons the original job rather than returning unknown/default content.
 fn wrong_authority_poisoning_and_empty_eof_are_not_reported_as_unknown_or_plain_text() {
     let (_directory, source) = source("");
     let authority = source.authority();

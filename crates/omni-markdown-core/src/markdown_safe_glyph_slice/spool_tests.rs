@@ -1,4 +1,7 @@
-// 此文件在同一合成测试模块内include，复用真实Source/字体/oracle，不重复生产算法。
+// Included in the existing synthetic test module, sharing its actual Source/font/oracle rather
+// than duplicating the production shaping or spool algorithms.
+// Retain two actual spool files from one shaping job to distinguish output authority from the
+// identity of the particular file captured by a historical-item proof.
 struct Historical {
     fixture: Fixture,
     measure: MarkdownSoftLineMeasureJob,
@@ -9,16 +12,19 @@ struct Historical {
 }
 impl Historical {
     fn new(text: &str, split: usize, width: i64, direction: MarkdownShapingDirection) -> Self {
+        // Capture the first measured item's actual file while its original shaping job is alive.
+        // The independent oracle owns complete finite fixture output only in this test.
         let mut fixture = Fixture::new(text, 0..split, direction);
         let expected = oracle(&fixture, text, 0..split);
         let mut measure = fixture.measure(0, width);
         let old = whole_spool(&mut fixture);
-        let other = whole_spool(&mut fixture); // 同Job第二个真正文件，故原Job输出票相同但实例必须不同。
+        let other = whole_spool(&mut fixture); // Same job/output authority, but a distinct actual file instance.
         let mut old = old;
         let proof = MarkdownMeasuredItemSpoolProof::capture(&measure, &mut fixture.shape, &mut old)
             .unwrap();
         let old_resources = fixture.shape.resource_observer();
-        // 实际后项使用独立Font payload；同名字也不能拿新Font重签历史item。
+        // Give the actual next item a separate Font payload. Equal font names cannot authorize
+        // replacing the captured historical item's original font receipt.
         let next_font =
             MarkdownLayoutFont::resolve(Arc::new(ROBOTO), "Roboto-Regular", &[]).unwrap();
         let next_authority = next_font.authority();
@@ -36,6 +42,8 @@ impl Historical {
         )
         .unwrap();
         fill(&mut next, &fixture.authority, &next_authority);
+        // Continue the same measure across the actual item boundary, then discard its original
+        // shaping job. The historical proof must remain usable without retaining that old job.
         measure
             .continue_item(
                 &mut fixture.shape,
@@ -44,7 +52,7 @@ impl Historical {
                 &mut fixture.breaks,
             )
             .unwrap();
-        fixture.shape = next; // 旧Job实际析构，收据不允许把它藏在历史Vec中继续保活。
+        fixture.shape = next; // Actually drop the old job rather than hiding it in a retained history vector.
         let released = old_resources.snapshot();
         assert_eq!(released.files_open, 0);
         assert_eq!(released.mappings_open, 0);
@@ -61,6 +69,8 @@ impl Historical {
         while fixture.clusters.status() != MarkdownGlyphClusterStatus::Ready {
             fixture.clusters.step(&mut fixture.shape, 13).unwrap();
         }
+        // Select the actual soft-line result using the continued job's dependencies. Pending
+        // dependencies cannot substitute for a successfully selected line.
         loop {
             let answer = measure
                 .step(
@@ -89,6 +99,8 @@ impl Historical {
         }
     }
     fn job(&mut self) -> MarkdownSafeSpoolSliceJob {
+        // Consume the captured proof once against its original file; a second actual spool with
+        // equal output authority is deliberately kept separate for rejection cases below.
         MarkdownSafeSpoolSliceJob::new(
             &self.measure,
             &mut self.fixture.shape,
@@ -102,6 +114,8 @@ impl Historical {
         mut job: MarkdownSafeSpoolSliceJob,
         budget: usize,
     ) -> MarkdownSafeSpoolSlice {
+        // Return each bounded glyph step to the test caller and seal only after actual readiness.
+        // The finite iteration bound reports failure; it never turns a timeout into Ready.
         for _ in 0..200_000 {
             let step = job
                 .step(
@@ -124,6 +138,8 @@ impl Historical {
     }
 }
 fn whole_spool(fixture: &mut Fixture) -> MarkdownShapedSpool {
+    // Build/seal a real file through the production spool builder, retaining its source/font/job
+    // authority instead of constructing a replacement reader or injecting expected glyphs.
     let mut builder = MarkdownShapedSpoolBuilder::new(
         &mut fixture.shape,
         &fixture.authority,
@@ -149,6 +165,8 @@ fn empty() -> MarkdownShapedGlyph {
 
 #[test]
 fn history_actual_old_font_and_job_receipt_survives_continue_and_views_exact_ltr_rtl_prefix() {
+    // Both directions must preserve the original item's selected prefix, visual glyph order, and
+    // measured total even after continuation switches to another actual Font/job payload.
     for direction in [
         MarkdownShapingDirection::LeftToRight,
         MarkdownShapingDirection::RightToLeft,
@@ -175,7 +193,7 @@ fn history_actual_old_font_and_job_receipt_survives_continue_and_views_exact_ltr
             for (index, expected) in expected.iter().enumerate() {
                 let mut actual = [empty()];
                 assert_eq!(view.read_batch(index..index + 1, &mut actual).unwrap(), 1);
-                assert_eq!(actual[0], *expected); // 全部七字段，包括原UNSAFE_TO_CONCAT原样保留。
+                assert_eq!(actual[0], *expected); // Preserve all seven fields, including the original UNSAFE_TO_CONCAT flag.
             }
             assert_eq!(
                 view.read_batch(expected.len()..expected.len(), &mut [])
@@ -184,7 +202,7 @@ fn history_actual_old_font_and_job_receipt_survives_continue_and_views_exact_ltr
             );
         }
         history.old.require_instance(&original_instance).unwrap();
-        assert!(observer.snapshot().file_open); // View Drop归还借用，不能谎报原文件已经close。
+        assert!(observer.snapshot().file_open); // Dropping a view returns its borrow, not the spool owner's file.
         history.old.close().unwrap();
         assert!(observer.snapshot().close_succeeded);
     }
@@ -192,6 +210,8 @@ fn history_actual_old_font_and_job_receipt_survives_continue_and_views_exact_ltr
 
 #[test]
 fn history_same_job_other_spool_instance_cannot_replace_captured_file() {
+    // Equal job output is insufficient: the consumed proof names the first actual spool instance,
+    // so supplying the second file must fail before any historical view is produced.
     let mut history = Historical::new(
         "01234 56789 01234",
         9,
@@ -214,6 +234,8 @@ fn history_same_job_other_spool_instance_cannot_replace_captured_file() {
 
 #[test]
 fn history_completed_slice_cannot_be_borrowed_from_same_job_second_file() {
+    // Completing a slice does not weaken its captured file identity. Reject a later attempt to
+    // borrow that slice from the same job's other file.
     let mut history = Historical::new(
         "01234 56789 01234",
         9,
@@ -232,6 +254,8 @@ fn history_completed_slice_cannot_be_borrowed_from_same_job_second_file() {
 
 #[test]
 fn history_cannot_capture_another_job_or_already_final_measure_as_old_item() {
+    // A distinct real job may shape identical source/font/range bytes but cannot supply this
+    // measure's historical output receipt.
     let text = "01234 56789 01234";
     let mut fixture = Fixture::new(text, 0..9, MarkdownShapingDirection::LeftToRight);
     let measure = fixture.measure(0, 5000);
@@ -256,6 +280,8 @@ fn history_cannot_capture_another_job_or_already_final_measure_as_old_item() {
             MarkdownShapedSpoolError::OutputMismatch
         ))
     ));
+    // A final measure has no unresolved cross-item continuation to capture as an old item; keep
+    // that semantic rejection separate from the preceding foreign-job identity failure.
     let mut fixture = Fixture::new(text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
     let final_measure = fixture.measure(0, 5000);
     let mut whole = whole_spool(&mut fixture);
@@ -267,6 +293,8 @@ fn history_cannot_capture_another_job_or_already_final_measure_as_old_item() {
 
 #[test]
 fn history_huge_single_cluster_flags_and_advances_are_finitely_read_without_extra_file() {
+    // One source cluster contains thousands of combining glyphs. A one-glyph step must not hide
+    // a complete-cluster scan, and the final view must preserve every original glyph field.
     let text = format!("a{} 01234", "\u{301}".repeat(4096));
     let mut history = Historical::new(
         &text,
@@ -295,7 +323,7 @@ fn history_huge_single_cluster_flags_and_advances_are_finitely_read_without_extr
         }
         assert!(steps < 100_000);
     }
-    assert!(reads >= 4096 && steps >= 4096); // 真实长cluster不在单次调用内悄悄扫完。
+    assert!(reads >= 4096 && steps >= 4096); // The actual long cluster cannot silently complete within one call.
     let slice = job
         .seal(
             &history.measure,
@@ -308,6 +336,8 @@ fn history_huge_single_cluster_flags_and_advances_are_finitely_read_without_extr
     let mut view = slice.view(&mut history.old).unwrap();
     let mut actual = [empty(); 17];
     let mut read = 0;
+    // Compare finite caller-owned batches with the independent oracle; a view borrows the original
+    // spool instead of copying the complete historical output into a new file.
     while read < facts.visual_glyphs.len() {
         let next = (read + 17).min(facts.visual_glyphs.len());
         view.read_batch(read..next, &mut actual[..next - read])
@@ -319,6 +349,8 @@ fn history_huge_single_cluster_flags_and_advances_are_finitely_read_without_extr
 
 #[test]
 fn history_measure_cancel_and_drop_revoke_pending_job_or_completed_view() {
+    // Cancellation must reach a view already borrowed from a completed slice, rather than only
+    // preventing construction of a future view.
     let mut history = Historical::new(
         "01234 56789 01234",
         9,
@@ -339,6 +371,8 @@ fn history_measure_cancel_and_drop_revoke_pending_job_or_completed_view() {
         Err(MarkdownSafeSpoolSliceError::Cancelled)
     ));
     drop(view);
+    // End a separate actual measure owner after slice completion. Its surviving receipt cannot
+    // authorize a new view when the operation that issued it no longer exists.
     let mut history = Historical::new(
         "01234 56789 01234",
         9,
@@ -356,6 +390,8 @@ fn history_measure_cancel_and_drop_revoke_pending_job_or_completed_view() {
 
 #[test]
 fn history_zero_budget_failure_is_permanent_and_source_error_precedes_cancel() {
+    // A rejected zero-budget operation ends this job. A later valid-sized step cannot resume it
+    // or publish a result from partially retained state.
     let mut history = Historical::new(
         "01234 56789 01234",
         9,
@@ -383,6 +419,8 @@ fn history_zero_budget_failure_is_permanent_and_source_error_precedes_cancel() {
         ),
         Err(MarkdownSafeSpoolSliceError::Poisoned)
     ));
+    // Use a distinct successful slice to test error precedence: reclaim the actual original read
+    // window with EIO, then cancel, without fabricating a spool-level error or modifying its file.
     let mut history = Historical::new(
         "01234 56789 01234",
         9,
@@ -401,6 +439,8 @@ fn history_zero_budget_failure_is_permanent_and_source_error_precedes_cancel() {
         .source
         .visit_byte_range(0..1, |_| Ok(()))
         .unwrap();
+    // Prime a real source read before injection; the explicit reclaim call must actually observe
+    // the failing resource operation before cancellation is issued.
     history
         .fixture
         .document

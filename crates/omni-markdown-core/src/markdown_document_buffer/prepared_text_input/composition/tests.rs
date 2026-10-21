@@ -1,4 +1,4 @@
-//! 用真实候选、日志与历史验证组合分组；短合成oracle不进入产品存储。
+//! Verify composition grouping through actual candidates, journals, and history; finite synthetic oracles do not enter product storage.
 
 use super::*;
 use MarkdownTextInputComposition::{Commit, Start, Update};
@@ -6,7 +6,7 @@ use MarkdownTextInputComposition::{Commit, Start, Update};
 mod heap_retirement;
 mod retirement;
 
-/// 每项只打开独占合成文件，正文和历史均走正式Core实现。
+/// Open one private synthetic file per case and use production Core for both text and history.
 fn fixture(text: &str, maximum: u64) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("组合历史.md");
@@ -15,9 +15,9 @@ fn fixture(text: &str, maximum: u64) -> (tempfile::TempDir, MarkdownDocumentBuff
     (directory, document)
 }
 
-/// 只读取短样本的独立期望，不参与产品选择或日志计算。
+/// Read only short fixture output for independent expectations, without computing product selections or journals.
 fn body(document: &MarkdownDocumentBuffer) -> Vec<u8> {
-    assert!(document.byte_len() <= 128); // 只对短合成正文建立oracle，不让产品出现整篇读取路径。
+    assert!(document.byte_len() <= 128); // Full output is a short synthetic oracle, not another whole-document product read path.
     let mut output = Vec::new();
     document.write_to(&mut output).unwrap();
     output
@@ -33,7 +33,7 @@ impl MarkdownTextChangeObserver for Observe {
     type Error = &'static str;
     type Output = Vec<changes::MarkdownTextChange>;
 
-    // 记录真实观察者回调，用于区分本次输入包络与历史净包络。
+    // Retain actual observer notifications to distinguish this input's local envelope from the net history envelope.
     fn changed(&mut self, change: changes::MarkdownTextChange) -> Result<(), Self::Error> {
         self.changes.push(change);
         Ok(())
@@ -45,13 +45,13 @@ impl MarkdownTextChangeObserver for Observe {
         _: MarkdownTextSelection,
     ) -> Result<Self::Output, Self::Error> {
         if self.reject {
-            return Err("原候选观察者拒绝"); // 必须在真实候选append之后拒绝，覆盖分组的准备回退。
+            return Err("原候选观察者拒绝"); // Reject after actual candidate append to exercise grouping preparation rollback.
         }
         Ok(self.changes)
     }
 }
 
-/// 准备和发布真实同步输入；检查局部通知但不重写生产历史规则。
+/// Prepare and publish actual synchronous input, checking local notifications without reimplementing production history rules.
 fn replace(
     document: &mut MarkdownDocumentBuffer,
     range: Range<usize>,
@@ -76,12 +76,12 @@ fn replace(
             old_utf16_range: range,
             inserted_utf16_len: text.encode_utf16().count(),
         }]
-    ); // 每次观察者看到真实局部输入，累计净日志只属于组合Undo/Redo。
+    ); // Every observer sees actual local input; only composition Undo/Redo owns the accumulated net journal.
     document.publish_text_input(&token).unwrap()
 }
 
 #[test]
-/// 子范围替换保留原候选两侧正文，最终净Undo仍准确覆盖整个组合与两个真实方向选区。
+/// Subrange replacement preserves candidate prefix/suffix; final net Undo still covers the full composition and both directed selections.
 fn partial_non_bmp_marked_updates_keep_one_real_net_journal_and_directed_history() {
     let (_directory, mut document) = fixture("甲原🙂尾", 4096);
     let before = MarkdownTextSelection {
@@ -157,11 +157,11 @@ fn partial_non_bmp_marked_updates_keep_one_real_net_journal_and_directed_history
         }]
     );
     assert_eq!(body(&document), "甲中好🙂文尾".as_bytes());
-    assert_eq!(document.selection(), after); // Redo恢复真实组合末端方向，不采用Undo前临时caret。
+    assert_eq!(document.selection(), after); // Redo restores the actual final directed selection, not the temporary pre-Undo caret.
 }
 
 #[test]
-/// 可失败观察与显式取消都不能提前改组；随后确认仍能一次撤销到首个组合前态。
+/// Fallible observation and explicit cancellation must not regroup early; later commit still undoes once to the first precomposition state.
 fn observer_rejection_and_explicit_cancel_preserve_the_original_composition_group() {
     let (_directory, mut document) = fixture("首尾", 4096);
     document
@@ -229,11 +229,11 @@ fn observer_rejection_and_explicit_cancel_preserve_the_original_composition_grou
     );
     document.undo_text_edit().unwrap();
     assert_eq!(body(&document), "首尾".as_bytes());
-    assert!(document.undo_text_edit().is_none()); // 两次失败都没有断开原组或制造中间Undo。
+    assert!(document.undo_text_edit().is_none()); // Neither failed preparation split the original group or created an intermediate Undo entry.
 }
 
 #[test]
-/// 原映射真实回收失败优先返回EIO，不改已发布root或组合metadata，也保实际最终unmap。
+/// An actual reclaim failure returns original EIO before later composition work, preserving published root/group state and final unmap facts.
 fn source_eio_before_composition_update_keeps_the_complete_previously_published_state() {
     let (_directory, mut document) = fixture("原尾", 4096);
     document

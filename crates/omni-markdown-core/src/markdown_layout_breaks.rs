@@ -1,7 +1,7 @@
-//! 同一冻结源的字素与默认断行交集；查询让出配额，不用无界循环寻找下一机会。
+//! Intersect grapheme and default line boundaries on the same frozen source, yielding at quota rather than searching without a bound.
 //!
-//! 这一步只认证断点。宽度选行、混合字体、unsafe-to-break重排、词典与Native几何
-//! 仍由各自阶段完成，不能把默认Unicode机会当成已排好的可见软行。
+//! This stage certifies boundaries only. Width selection, mixed fonts, unsafe-break reshaping, dictionary support, and Native geometry
+//! retain their own owners; a default Unicode opportunity is not an already laid-out visible soft line.
 
 use std::rc::{Rc, Weak};
 
@@ -37,7 +37,7 @@ pub enum MarkdownLayoutBreakError {
 }
 type Result<T> = std::result::Result<T, MarkdownLayoutBreakError>;
 
-/// 一个查询回合至多核验64个候选；更大的调用方预算不能把本API变成整文扫描循环。
+/// Check at most 64 candidates per query; a larger caller quota cannot turn this API into an unbounded document scan.
 pub const MARKDOWN_LAYOUT_BREAK_CANDIDATES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,7 +52,7 @@ pub enum MarkdownLayoutBreakQuery {
     Next,
 }
 
-/// 可克隆的有限查询状态只保弱owner与坐标；不能保活源、索引、字体或Native控件。
+/// Clone finite query state with weak owner identity and coordinates only, without retaining Source, indexes, fonts, or Native controls.
 #[derive(Clone)]
 pub struct MarkdownLayoutBreakCursor {
     owner: Weak<()>,
@@ -65,9 +65,9 @@ pub struct MarkdownLayoutBreakCursor {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownLayoutBreakAnswer {
-    /// 需要实际推进同一源的算法前缀；未知区域不能解释为空。
+    /// The original algorithm prefix needs actual progress; unknown coverage does not mean an empty result.
     PendingSource,
-    /// 本次候选数已用完；同一cursor保留精确下一步，不重采新的源或查询意图。
+    /// Candidate quota is exhausted; the same cursor retains the exact continuation without recapturing source or query intent.
     Yielded,
     Known(Option<MarkdownLineBreakBoundary>),
 }
@@ -102,12 +102,12 @@ struct Payload {
     source: MarkdownLayoutTextSource,
     grapheme: MarkdownGraphemeJob,
     line: MarkdownLineBreakJob,
-    // 端点票只保弱scope；任意子索引失败、cancel或Drop同时撤销已借出的坐标票。
+    // Endpoint tickets retain weak scope only; retiring this payload on failure, cancellation, or Drop revokes issued coordinates.
     #[cfg(feature = "paged-shaping-frontier")]
     endpoint_scope: Rc<()>,
 }
 
-/// 两个算法各自拥有一页匿名索引；只有同一个冻结source capsule可以同时授权它们。
+/// Own two independent paged anonymous indexes; only the same frozen source capsule can authorize both algorithms.
 pub struct MarkdownLayoutBreakJob {
     owner: Rc<()>,
     payload: Option<Payload>,
@@ -115,7 +115,7 @@ pub struct MarkdownLayoutBreakJob {
     maximum: [usize; 2],
     grapheme_first: bool,
     resources: MarkdownLayoutBreakResourceObserver,
-    // 仅实际raw LB查询的未知源留下调度需求；GCB待决和候选配额让出不能冒充正文需求。
+    // Only an actual raw-LB pending query requests line-source progress; GCB waits and candidate yields cannot masquerade as that demand.
     #[cfg(feature = "paged-shaping-frontier")]
     line_source_demand: bool,
     #[cfg(feature = "paged-shaping-frontier")]
@@ -123,7 +123,7 @@ pub struct MarkdownLayoutBreakJob {
 }
 
 impl MarkdownLayoutBreakJob {
-    /// 原两个算法共享同 Source 的真实段落 proof，各自原游标只跳过明确隐藏 body。
+    /// Share this Source's actual paragraph proof between original algorithms, whose cursors skip only explicitly hidden bodies.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn install_fold_plan(
         &mut self,
@@ -146,7 +146,7 @@ impl MarkdownLayoutBreakJob {
         }
     }
 
-    /// 表格流只分享原结构行目录；两个 Unicode 游标仍保各自真实状态和原配额。
+    /// Share only the original structural-row directory for table flow; both Unicode cursors retain their actual state and original quotas.
     #[cfg(all(
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
@@ -166,7 +166,7 @@ impl MarkdownLayoutBreakJob {
         Ok(())
     }
 
-    /// 只观察两个原 machine 的真实 canonical 进度，不以需求位置伪造已消费。
+    /// Observe both original machines' actual canonical progress; a requested position cannot manufacture consumed coverage.
     #[cfg(all(
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
@@ -184,7 +184,7 @@ impl MarkdownLayoutBreakJob {
         Ok(payload.grapheme.table_passed(end) && payload.line.table_passed(end))
     }
 
-    /// 迁移者必须明确区分原全源 ordinal 与本次显式可见序列；两者不互相补签。
+    /// Consumers distinguish original whole-source ordinals from this explicit visible sequence; neither domain authorizes the other.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn grapheme_ordinal_domain(
         &mut self,
@@ -203,6 +203,7 @@ impl MarkdownLayoutBreakJob {
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
     ) -> Result<Self> {
+        // One captured Source identity creates both real algorithms; partial construction failure drops its already created child.
         if !source.permits(authority) {
             return Err(MarkdownLayoutBreakError::SourceMismatch);
         }
@@ -234,11 +235,11 @@ impl MarkdownLayoutBreakJob {
         })
     }
 
-    /// 消费原Source权限前先核真实健康；同正文或代次的另一次capture不能冒充本任务。
+    /// Check actual health before consuming original Source authority; another capture of equal text/generation cannot impersonate this job.
     ///
     /// # Errors
-    /// 真实源错误优先于身份不符；任何失败均沿原poison路径释放两个索引和Source强边，
-    /// 不重新capture、不恢复旧前缀，也不授予Native布局或输入权限。
+    /// Actual source failure precedes identity mismatch; failure through this boundary drops both indexes and the Source strong edge.
+    /// Do not recapture, restore old prefixes, or grant Native layout/input authority.
     pub fn require_source(&mut self, authority: &MarkdownLayoutTextAuthority) -> Result<()> {
         let result = (|| {
             let payload = self
@@ -253,11 +254,11 @@ impl MarkdownLayoutBreakJob {
         })();
         match result {
             Ok(()) => Ok(()),
-            Err(error) => self.poison(error), // 与step/query共享真正的失败关闭边界。
+            Err(error) => self.poison(error), // Share the same actual failure-close boundary as step/query.
         }
     }
 
-    /// 软行紧急候选复用本任务的原GCB索引；不另建字素job或把未知后继当EOF。
+    /// Emergency soft-line candidates reuse this job's original GCB index, without another grapheme job or treating an unknown successor as EOF.
     #[cfg(feature = "paged-soft-line-resolve")]
     pub(crate) fn grapheme_query(
         &mut self,
@@ -272,7 +273,7 @@ impl MarkdownLayoutBreakJob {
             .ok_or(MarkdownLayoutBreakError::Poisoned)?
             .grapheme
             .query(authority, MarkdownGraphemeUnit::Utf16, offset, query);
-        self.require_source(authority)?; // 子索引IO完成后的同源健康门保留真实错误优先级。
+        self.require_source(authority)?; // Recheck same-source health after child-index I/O to preserve actual source-error precedence.
         match result {
             Ok(answer) => {
                 #[cfg(feature = "paged-shaping-frontier")]
@@ -285,7 +286,7 @@ impl MarkdownLayoutBreakJob {
         }
     }
 
-    /// 同一Ready GCB表的有限record数，不把当前前缀或另一Source的表交给行输出。
+    /// Read the same Ready GCB table's record count, without handing line output an incomplete prefix or another Source's table.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn ready_grapheme_count(
         &mut self,
@@ -305,7 +306,7 @@ impl MarkdownLayoutBreakJob {
         }
     }
 
-    /// 一次迁移≤256条实际byte/UTF16坐标；false保持未知，Err丢弃完整batch并撤原owner。
+    /// Transfer at most 256 actual byte/UTF-16 records; false remains unknown, while error invalidates the batch and retires its original owner.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn read_ready_graphemes(
         &mut self,
@@ -334,12 +335,12 @@ impl MarkdownLayoutBreakJob {
                 | MarkdownLayoutBreakError::Line(crate::MarkdownLineBreakError::FoldedRange)
         ) {
             return Err(error);
-        } // 明确隐藏是权限域差异，不是索引损坏；保留仍健康的可见 worker。
-        drop(self.payload.take()); // 原索引和source强边真实Drop，外部cursor/observer不保活资源。
+        } // Explicitly folded coverage is a domain mismatch, not index corruption; retain the healthy visible worker.
+        drop(self.payload.take()); // Drop actual indexes/Source ownership; external cursors and observers keep no resource claims alive.
         Err(error)
     }
 
-    /// 两个算法共用本次总配额，轮换先行方；不能把每个算法各用一份预算说成总预算。
+    /// Both algorithms share this call's total quota and alternate first turn, rather than each receiving a full copy of the budget.
     pub fn step(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,
@@ -357,7 +358,7 @@ impl MarkdownLayoutBreakJob {
         authority: &MarkdownLayoutTextAuthority,
         budget: MarkdownLineBreakBudget,
     ) -> Result<MarkdownLayoutBreakStep> {
-        // 子job仍分别核真实原source Weak身份；此处不得重捕文档来替换它们的authority。
+        // Children each check their actual original Source identity; never recapture the document to replace their authority.
         if budget.bytes == 0 || budget.scalars == 0 || budget.records == 0 {
             return Err(MarkdownLayoutBreakError::InvalidRequest);
         }
@@ -365,7 +366,7 @@ impl MarkdownLayoutBreakJob {
             .payload
             .as_mut()
             .ok_or(MarkdownLayoutBreakError::Poisoned)?;
-        payload.source.health()?; // 双阶段零工作量或缓存命中同样不能绕过共享源的永久撤权。
+        payload.source.health()?; // Even zero-work/cache-hit stages cannot bypass permanent revocation of the shared Source.
         let mut total = MarkdownLayoutBreakStep {
             bytes: 0,
             scalars: 0,
@@ -378,7 +379,7 @@ impl MarkdownLayoutBreakJob {
                 || total.scalars == budget.scalars
                 || total.records == budget.records
             {
-                break; // 次算法没有余额就等下一次真实step，不能零配额私自结算EOF。
+                break; // With no remaining quota, the second algorithm waits for the next step instead of flushing EOF for free.
             }
             let bytes = budget.bytes - total.bytes;
             let scalars = budget.scalars - total.scalars;
@@ -415,7 +416,7 @@ impl MarkdownLayoutBreakJob {
         Ok(total)
     }
 
-    /// 创建一个原任务的只读意图；越界不会被夹到EOF变成另一个有效查询。
+    /// Create a read-only intent for this original job; out-of-range positions are rejected rather than clamped into valid EOF queries.
     pub fn cursor(
         &self,
         unit: MarkdownLayoutBreakUnit,
@@ -447,21 +448,21 @@ impl MarkdownLayoutBreakJob {
         })
     }
 
-    /// 最多检查给定数量的真实机会；不分配交集Vec，也不复制原索引。
+    /// Check a bounded number of actual opportunities without allocating an intersection Vec or copying original indexes.
     pub fn query(
         &mut self,
         cursor: &mut MarkdownLayoutBreakCursor,
         candidate_budget: usize,
     ) -> Result<MarkdownLayoutBreakAnswer> {
         if !Weak::ptr_eq(&cursor.owner, &Rc::downgrade(&self.owner)) || cursor.completed {
-            return Err(MarkdownLayoutBreakError::CursorMismatch); // 旧/外来意图不能消费当前任务。
+            return Err(MarkdownLayoutBreakError::CursorMismatch); // Completed/foreign intent cannot consume this job.
         }
         if candidate_budget == 0 {
             return Err(MarkdownLayoutBreakError::InvalidRequest);
         }
         #[cfg(feature = "paged-shaping-frontier")]
         {
-            // 每次原查询独立给出阻塞原因；上一查询的等待不能污染后来的GCB或Known结果。
+            // Each original query reports its own blocking reason; a previous line wait cannot contaminate a later GCB or Known result.
             self.line_source_demand = false;
         }
         let result = self.query_inner(
@@ -483,7 +484,7 @@ impl MarkdownLayoutBreakJob {
             .payload
             .as_mut()
             .ok_or(MarkdownLayoutBreakError::Poisoned)?;
-        payload.source.health()?; // raw Line的Known(None)也必须先检查，不能靠之后GCB分支补验证。
+        payload.source.health()?; // Raw Line Known(None) must check health too; a later GCB branch cannot supply the missing check.
         let (line_unit, grapheme_unit) = match cursor.unit {
             MarkdownLayoutBreakUnit::Byte => {
                 (MarkdownLineBreakUnit::Byte, MarkdownGraphemeUnit::Byte)
@@ -494,7 +495,7 @@ impl MarkdownLayoutBreakJob {
         };
         for _ in 0..candidate_budget {
             let candidate = if let Some(candidate) = cursor.candidate {
-                candidate // 字素前缀待决后重试同一个真实机会，不跳过它去找后继。
+                candidate // Retry the same actual opportunity after a pending grapheme prefix, without skipping to its successor.
             } else {
                 let query = match cursor.query {
                     MarkdownLayoutBreakQuery::At => MarkdownLineBreakQuery::IsBoundary,
@@ -549,7 +550,7 @@ impl MarkdownLayoutBreakJob {
                         cursor.completed = true;
                         return Ok(MarkdownLayoutBreakAnswer::Known(None));
                     }
-                    // 原机会切入实际字素，继续严格前驱/后继；有限预算用完保存同一全局位置。
+                    // This original opportunity lies inside a grapheme; continue strict Previous/Next while preserving the same position at yield.
                     cursor.candidate = None;
                     cursor.at = position;
                 }
@@ -563,7 +564,7 @@ impl MarkdownLayoutBreakJob {
         self.resources.clone()
     }
     pub fn cancel(&mut self) {
-        drop(self.payload.take()); // 取消不改外部共享不可变源，只交还本job的两个索引owner。
+        drop(self.payload.take()); // Return this job's two index owners without mutating the externally shared immutable Source.
     }
 }
 

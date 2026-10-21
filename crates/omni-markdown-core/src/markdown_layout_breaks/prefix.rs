@@ -1,8 +1,8 @@
-//! 显式ASCII前沿的依赖调度；不改变原LB稳定前缀、机会查询或完整EOF的含义。
+//! Schedule actual ASCII-frontier dependencies without changing original LB stable-prefix, opportunity-query, or complete-EOF semantics.
 use super::*;
 
-/// 只能由原GCB成功的IsBoundary或同Source的真实GB2末端事实产生；整数不能重造权限。
-/// 原scope和Source都是弱身份，票不延长正文、FD、索引页或BreakJob的生命。
+/// Issue only from original GCB IsBoundary success or the same Source's actual GB2 endpoint, never from an integer alone.
+/// Weak Source/scope identities retain no text, descriptor, index page, or BreakJob lifetime.
 pub(crate) struct MarkdownCertifiedGraphemeEndpoint {
     source: MarkdownLayoutTextAuthority,
     scope: Weak<()>,
@@ -10,6 +10,7 @@ pub(crate) struct MarkdownCertifiedGraphemeEndpoint {
 }
 impl MarkdownCertifiedGraphemeEndpoint {
     pub(crate) fn same_scope(&self, other: &Self) -> bool {
+        // Equality compares original scope identity only; consuming the endpoint separately checks authority and scope liveness.
         self.source == other.source && Weak::ptr_eq(&self.scope, &other.scope)
     }
 
@@ -28,16 +29,16 @@ impl MarkdownCertifiedGraphemeEndpoint {
 }
 
 impl MarkdownLayoutBreakJob {
-    /// 非末端复用实际GCB查询；真实EOF只取原机器的GB2坐标，不重扫尚未索引的正文。
-    /// GB2不授予末ordinal、Previous或完整Ready；旧Pending需求保持，Known(None)不签票。
+    /// Use actual GCB queries inside the source; actual EOF borrows the original machine's GB2 coordinates without rescanning unindexed text.
+    /// GB2 grants no final ordinal, Previous result, or full readiness; retain existing Pending demand and issue no ticket for Known(None).
     pub(crate) fn certified_grapheme_endpoint(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,
         offset: usize,
     ) -> Result<(GraphemeAnswer, Option<MarkdownCertifiedGraphemeEndpoint>)> {
         let answer = if offset == self.maximum[1] {
-            // 长文即使含CRLF而不能使用Dense，GB2仍只依赖同一不可变Source的真实末端。
-            // 先后核原健康和身份；稳定前缀借用在检查前结束，不新增读者或推进原扫描。
+            // Even a long CRLF source ineligible for Dense has a GB2 endpoint from this same immutable Source's actual extent.
+            // Check original health/identity around the stable-prefix borrow, ending it before recheck without another reader or scan progress.
             self.require_source(authority)?;
             let result = self
                 .payload
@@ -48,13 +49,13 @@ impl MarkdownLayoutBreakJob {
                 .and_then(|mut prefix| prefix.source_end_boundary());
             self.require_source(authority)?;
             match result {
-                // 只把原GB2坐标交给下方同scope签票，原索引的完成状态保持不动。
+                // Pass original GB2 coordinates into the same-scope ticket factory without changing index completion state.
                 Ok(boundary) => GraphemeAnswer::Known(Some(boundary)),
-                // 子任务取消等失败同样撤销原scope；不能把已知长度当成可复活的末端票。
+                // Child cancellation/failure retires original scope too; known length cannot revive endpoint authority.
                 Err(error) => return self.poison(error.into()),
             }
         } else {
-            // 内部UTF16位置仍须真实字素分类，不能从EOF事实推断低代理项或CRLF内部。
+            // Internal UTF-16 positions still need actual grapheme classification; EOF cannot classify low surrogates or CRLF interiors.
             self.grapheme_query(authority, offset, MarkdownGraphemeQuery::IsBoundary)?
         };
         self.require_source(authority)?;
@@ -80,7 +81,7 @@ impl MarkdownLayoutBreakJob {
         Ok((answer, endpoint))
     }
 
-    /// 只借原GCB已经提交的记录事实；已知GB2坐标不补出末ordinal或完整Ready。
+    /// Borrow only records actually committed by original GCB; known GB2 coordinates supply neither final ordinals nor full readiness.
     pub(crate) fn grapheme_prefix_facts(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,
@@ -104,7 +105,7 @@ impl MarkdownLayoutBreakJob {
         }
     }
 
-    /// 每次至多256条真实原记录；未知ordinal留下GCB需求，不能被当作空表或EOF。
+    /// Read at most 256 actual original records; unknown ordinals request GCB progress instead of implying an empty table or EOF.
     pub(crate) fn read_grapheme_prefix(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,
@@ -120,7 +121,7 @@ impl MarkdownLayoutBreakJob {
             .is_ready()
         {
             return self.read_ready_graphemes(authority, range, output);
-        } // 真完整表沿原有限读取入口；未完成表才消费稳定前缀票，二者不互换EOF含义。
+        } // Complete tables use the original bounded read entry; unfinished ones use a stable-prefix ticket without exchanging EOF meanings.
         let result = self
             .payload
             .as_mut()
@@ -147,7 +148,7 @@ impl MarkdownLayoutBreakJob {
         Ok(std::mem::take(&mut self.grapheme_source_demand))
     }
 
-    /// 下一量子只推进真实阻塞的子算法；不会给LB和GCB各花一份调用方预算。
+    /// Advance only the actually blocked child next step, without separately spending a full caller budget on both LB and GCB.
     pub(crate) fn step_dependency(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,
@@ -199,8 +200,8 @@ impl MarkdownLayoutBreakJob {
         }
     }
 
-    /// 只有原全源精确Printable证书生成的Dense GCB完成，才允许LB保持未完成前缀。
-    /// 此处复用原GCB表示的来源证明，不重新读正文、不以长度或代次猜测字符域。
+    /// Only completed Dense GCB from the original exact whole-source Printable proof allows LB to remain an unfinished prefix.
+    /// Reuse GCB's actual source proof without rereading text or guessing the character domain from length/generation.
     pub(crate) fn ascii_prefix_ready(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,
@@ -216,8 +217,8 @@ impl MarkdownLayoutBreakJob {
         Ok(ready)
     }
 
-    /// 取走最近原查询的实际LB源等待。该标量不授予边界、range或EOF权限。
-    /// 消费方先结束自己的借用，下一量子才推进同job；错误沿原poison路径关闭索引。
+    /// Take actual line-source demand from the latest original query; this scalar grants no boundary, range, or EOF authority.
+    /// Consumers end their current borrow before advancing the same job next step; failures close indexes through original poison handling.
     pub(crate) fn take_line_source_demand(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,

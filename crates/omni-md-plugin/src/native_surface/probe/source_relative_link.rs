@@ -1,4 +1,5 @@
-//! 隔离笔记库内的真实链接交接：未保存编辑、原鼠标激活、旧图释放与目标完整帧分别核验。
+//! Exercise real link handoff inside the Host's exclusive synthetic vault. Unsaved bytes, original
+//! mouse delivery, old-graph release, and the target's complete CPU frame are independent facts.
 
 use super::*;
 use objc2::rc::{Retained, Weak as NativeWeak};
@@ -18,7 +19,8 @@ const PREFIX: &str =
 const LABEL: &str = "打开目标";
 const HTTP_LABEL: &str = "打开外部验收页";
 
-/// 精确目标由固定原文及有限HTTP后缀组成；比较接收流，不把canonical目标拼成第二份正文。
+/// Compare the canonical stream with fixed target bytes and the optional finite HTTP suffix,
+/// without assembling another copy of the target document.
 struct TargetComparison<'a> {
     expected: io::Chain<io::Cursor<&'static [u8]>, io::Cursor<&'a [u8]>>,
     length: usize,
@@ -27,6 +29,7 @@ struct TargetComparison<'a> {
 
 impl<'a> TargetComparison<'a> {
     fn new(suffix: Option<&'a str>) -> Self {
+        // These independent fixture bytes define the expected file before its production open.
         let suffix = suffix.unwrap_or("").as_bytes();
         Self {
             expected: io::Cursor::new(TARGET_TEXT.as_bytes()).chain(io::Cursor::new(suffix)),
@@ -36,6 +39,7 @@ impl<'a> TargetComparison<'a> {
     }
 
     fn finish(self) -> Result<(), String> {
+        // Matching every received chunk is insufficient if the canonical writer stopped early.
         if self.written != self.length {
             return Err("相对链接目标缺少预声明字节".into());
         }
@@ -46,6 +50,8 @@ impl<'a> TargetComparison<'a> {
 impl Write for TargetComparison<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let mut expected = [0_u8; 512];
+        // Debit the same expected stream across arbitrary writer chunk boundaries; extra output
+        // fails read_exact rather than becoming an accepted tail or a second text allocation.
         for part in bytes.chunks(expected.len()) {
             self.expected.read_exact(&mut expected[..part.len()])?;
             if part != &expected[..part.len()] {
@@ -59,11 +65,13 @@ impl Write for TargetComparison<'_> {
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
+        // This comparison sink owns no buffered output or descriptor; exact length is settled by finish.
         Ok(())
     }
 }
 
-/// 两个文件各有自己的磁盘身份；保存只能替换源文件，目标不能因打开或关闭被重写。
+/// Track each file's actual disk identity independently. Saving may replace the source inode;
+/// opening or closing the target must leave its original identity unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DiskIdentity {
     device: u64,
@@ -74,6 +82,8 @@ struct DiskIdentity {
 }
 
 fn disk_identity(path: &Path) -> Result<DiskIdentity, String> {
+    // Snapshot the real file's identity and timestamp, without reading its contents or adopting
+    // those observations as the canonical document's Source authority.
     let metadata = std::fs::metadata(path).map_err(|cause| cause.to_string())?;
     Ok(DiskIdentity {
         device: metadata.dev(),
@@ -84,7 +94,8 @@ fn disk_identity(path: &Path) -> Result<DiskIdentity, String> {
     })
 }
 
-/// 只保真实资源的观察值；不能把旧Doc消失当作Font、Reader和映射均已归还。
+/// Retain observation receipts only. An expired document Weak does not establish release of
+/// its fonts, reader, backing mappings, worker, or native objects.
 struct Graph {
     document: WeakMarkdownDocument,
     body: std::rc::Weak<NativeMarkdownPagedBody>,
@@ -96,7 +107,8 @@ struct Graph {
 }
 
 impl Graph {
-    /// 必须在原完整CPU帧已经通过后捕获；不创建新Reader或为了凑角色而重排正文。
+    /// Capture after the original complete CPU frame passes, using its existing resources rather
+    /// than creating a reader or reshaping text merely to populate an observation role.
     fn capture(surface: &NativeMarkdownWindowSurface) -> Result<Self, String> {
         let editor = surface.editor.as_ref().ok_or("链接释放观察缺少原正文")?;
         let paged = editor;
@@ -123,8 +135,11 @@ impl Graph {
         })
     }
 
-    /// 交接与最终关闭均只读原收据；没有循环、阈值或等待Weak自行变空的第二释放协议。
+    /// Inspect the same original receipts at handoff and final close. This creates no polling,
+    /// threshold-based success, or second release protocol waiting for Weak values to expire.
     fn verify_released(&self) -> Result<(), String> {
+        // Canonical ownership and both backing measures must end, with real cleanup failure
+        // preserved even if all the Rust weak identities have already expired.
         if self.document.upgrade().is_some()
             || self.body.upgrade().is_some()
             || self.input.upgrade().is_some()
@@ -135,11 +150,13 @@ impl Graph {
             return Err("相对链接的原Doc/Input/Body或mmap尚未真实释放".into());
         }
         for (role, weak) in &self.native {
+            // Each observed native role belongs to this captured graph, not a later same-named view.
             if weak.load().is_some() {
                 return Err(format!("相对链接的原Native角色尚未释放：{role}"));
             }
         }
         self.ledger.verify_released()?;
+        // A complete frame must have produced an actual reader receipt; absence is not zero usage.
         if !self.receipts.source.payload_released() || self.receipts.reader.is_none() {
             return Err("链接完整帧Source未释放或缺少真实Reader收据".into());
         }
@@ -149,6 +166,8 @@ impl Graph {
             .iter()
             .chain(std::iter::once(&self.receipts.writer))
         {
+            // Reader and writer receipts independently settle descriptors, mappings, scratch,
+            // Source payload, and the original error; one released role cannot excuse another.
             let actual = observer.snapshot();
             if actual.file_open
                 || actual.mapped_bytes != 0
@@ -170,6 +189,8 @@ impl Graph {
             return Err(format!("链接原worker未归还：{worker:?}"));
         }
         for (bytes, font) in &self.receipts.fonts {
+            // Font payload release and the corresponding byte mapping's successful unmap are
+            // separate obligations; neither proves system-wide font-cache destruction.
             if !font.payload_released()
                 || !bytes.unmap_succeeded()
                 || bytes.mapped_bytes() != 0
@@ -179,22 +200,27 @@ impl Graph {
             }
         }
         for cell in &self.receipts.cells {
+            // Actual mounted cell graphs retain their own resource receipts after the parent ends.
             cell.verify_released()?;
         }
         Ok(())
     }
 }
 
-/// 已安装目标只保弱身份和当时完整Input；路径相同的后来另一个Doc不能替本次交接通过。
+/// Keep only the installed target's weak identities and complete opening Input. A later document
+/// at the same path cannot complete this original handoff.
 struct Target {
     document: WeakMarkdownDocument,
     body: std::rc::Weak<NativeMarkdownPagedBody>,
     input: NativeMarkdownPagedInputState,
-    /// 安装票与真正导航完成票分开；只在独立标题位置、原Doc和CPU都通过时绑定一次后态。
+    /// Bind the navigated state once, separately from installation, after the independent heading
+    /// position, original document, and complete CPU publication jointly pass.
     navigated_input: Cell<Option<NativeMarkdownPagedInputState>>,
 }
 
-/// 这个场景只有一个原鼠标动作和一个目标；实际释放通知只绑定预声明文件，不发现任意后继文稿。
+/// Own the original relative-note action and declared target. The optional HTTP stage admits its
+/// own single click only after that navigation passes. Release notifications bind only the declared
+/// target, never discover or adopt an arbitrary successor document.
 pub(in super::super) struct RelativeLink {
     weak: std::rc::Weak<Self>,
     original: MemoryWorkloadFacts,
@@ -224,7 +250,8 @@ pub(in super::super) struct RelativeLink {
 }
 
 impl RelativeLink {
-    /// 原401已确认首屏；只有显式相对链接流程可在Host独占合成库建立自己的create_new文件。
+    /// The original opening step already verified its first frame. Only the explicit relative-link
+    /// flows may create an exclusive target file inside the Host-owned synthetic vault.
     fn begin(
         workload: &NativeMarkdownMemoryWorkload,
         http_url: Option<&str>,
@@ -242,6 +269,8 @@ impl RelativeLink {
         }
         workload.verify_open()?;
         let original = workload.facts()?;
+        // create_dir/create_new reject pre-existing fixtures instead of overwriting another
+        // owner's data. The Host retains ownership of this exact synthetic directory on failure.
         let vault = workload.path.parent().ok_or("合成原笔记没有库目录")?;
         std::fs::create_dir(vault.join(DIRECTORY)).map_err(|cause| cause.to_string())?;
         let target_path = vault.join(TARGET_NOTE);
@@ -258,12 +287,13 @@ impl RelativeLink {
             created
                 .write_all(suffix.as_bytes())
                 .map_err(|cause| cause.to_string())?;
-        } // 初次创建即封存完整目标；后续HTTP点击不编辑已通过原revision和磁盘身份门的笔记。
+        } // Seal the complete target now; the later HTTP click must not edit this admitted file.
         created.sync_all().map_err(|cause| cause.to_string())?;
         drop(created);
         let target_disk = disk_identity(&target_path)?;
-        // 这个固定短文件的独立Core读取只求磁盘revision，不建Native图；在真实点击之前立即归还。
-        // 生产目标随后仍从正式session打开，没有把这里的模型或源权限交给它。
+        // This independent Core open obtains only the fixed short file's disk revision. It creates
+        // no native graph and returns its mapping before the actual click. Production opens the
+        // target through its own session, without borrowing this model or its Source authority.
         let baseline = MarkdownDocumentBuffer::open(&target_path, 64 * 1024)
             .map_err(|cause| cause.to_string())?;
         let baseline_backing = baseline
@@ -280,6 +310,8 @@ impl RelativeLink {
             return Err("目标独立短基线没有在正式打开前归还".into());
         }
         let source_path = workload.path.clone();
+        // Independent read-only descriptors preserve both original inodes for later byte checks,
+        // even when production saving atomically replaces the source path.
         let original_file = std::fs::File::open(&source_path).map_err(|cause| cause.to_string())?;
         let target_file = std::fs::File::open(&target_path).map_err(|cause| cause.to_string())?;
         let (window, controller) = with_active_native_markdown_surface(|surface| {
@@ -313,8 +345,9 @@ impl RelativeLink {
                 body: RefCell::new(std::rc::Weak::new()),
                 generation: Cell::new(0),
                 mode: Cell::new(MarkdownPresentationMode::InlinePreview),
-                // 安装后的真实fragment选择会推进fold发布代次；这里只筛原g0/模式，
-                // 终点由下方准确标题位置与同一完整Input/Scene/CPU联合认证，不能假定fold0。
+                // Real fragment selection advances fold publication after installation. Filter
+                // only original generation zero and mode here; completion below certifies the
+                // exact heading with the same Input/Scene/CPU instead of assuming fold revision zero.
                 fold_revision: Cell::new(None),
                 failure: RefCell::new(None),
                 key: RefCell::new(None),
@@ -333,7 +366,8 @@ impl RelativeLink {
         Ok(case)
     }
 
-    /// 只插入固定小前缀；显式0..0避免偷用后来选区，期望长度和g+1在Native前已知。
+    /// Insert only the fixed small prefix at explicit 0..0, without adopting a later selection.
+    /// The expected length and generation increment are fixed before any native input call.
     fn insert(&self, workload: &NativeMarkdownMemoryWorkload) -> Result<(), String> {
         let (view, before) = with_active_native_markdown_surface(|surface| {
             if !workload.current(surface, &self.original)
@@ -351,7 +385,8 @@ impl RelativeLink {
             ))
         })?;
         let client = ProtocolObject::<dyn NSTextInputClient>::from_ref(&**view);
-        // SAFETY: 这个客户属于已核的合成原Doc，只有有限NSString与一次显式插入，非IME验收。
+        // SAFETY: This client belongs to the verified original synthetic document. One bounded
+        // NSString and explicit replacement exercise real insertion, without claiming IME delivery.
         unsafe {
             client.insertText_replacementRange(&NSString::from_str(PREFIX), NSRange::new(0, 0));
         }
@@ -366,6 +401,8 @@ impl RelativeLink {
                 .text_view
                 .input_state()
                 .map_err(|cause| cause.to_string())?;
+            // Compare the exact declared edit result before capturing its actual CPU endpoint;
+            // a successor generation, marked composition, or different caret cannot substitute.
             if actual.generation != before.generation.checked_add(1).ok_or("原generation耗尽")?
                 || actual.utf16_len != before.utf16_len + PREFIX.encode_utf16().count()
                 || actual.primary_range != NSRange::new(PREFIX.encode_utf16().count(), 0)
@@ -385,7 +422,8 @@ impl RelativeLink {
         Ok(())
     }
 
-    /// 已显示编辑必须与独立原FD逐片一致；这一实际正文revision才是后继保存的唯一允许结果。
+    /// Compare the displayed edit against the independent original descriptor in bounded pieces.
+    /// This actual canonical revision is the sole allowed result of the subsequent save.
     fn verify_edit(&self) -> Result<(), String> {
         self.edited_frame
             .borrow()
@@ -410,6 +448,8 @@ impl RelativeLink {
                 return Err("链接编辑帧的完整Input已被替换".into());
             }
             let document = editor.document().borrow();
+            // The fixture must still have a real unsaved edit and undo history before navigation;
+            // a clean reopened document cannot stand in for saving this operation's dirty source.
             if !document.is_dirty() || !document.can_undo() || document.can_redo() {
                 return Err("链接点击之前没有真实未保存编辑及原历史".into());
             }
@@ -429,7 +469,8 @@ impl RelativeLink {
                     return Err("链接编辑改变了预声明范围之外的字节长度".into());
                 }
             }
-            // 原独立FD借用在任何Native弱观察和资源捕获之前归还。
+            // The independent descriptor borrow ended before any native weak observation or
+            // resource capture; retain the measured canonical revision, not another text copy.
             self.edited_revision.set(Some(
                 document
                     .current_revision()
@@ -441,7 +482,8 @@ impl RelativeLink {
         })
     }
 
-    /// 同真实Scene取得标签墨迹点；点击前保存实际原窗口身份，不能直接调用切笔记实现。
+    /// Derive an ink point from the original ready Scene and keep its actual window identity.
+    /// Deliver mouse events through AppKit rather than invoking note-switch implementation directly.
     fn click(&self) -> Result<(), String> {
         let window = self.window.load().ok_or("链接原窗口已释放")?;
         window.makeKeyWindow();
@@ -482,8 +524,9 @@ impl RelativeLink {
         {
             return Err("原链接鼠标点转换期间Scene已失效".into());
         }
-        // 先观察这一个原View的真实析构。关联marker只持原子观察元数据，不保活View；
-        // 它只负责在异步链接确实拆图后找到原pending switch，绝不单独认证完整图已释放。
+        // Observe this original view's actual deallocation before clicking. Its associated marker
+        // holds atomic observation metadata only, not the view. That event locates the original
+        // pending switch after teardown; it cannot independently certify release of the whole graph.
         if self.original_view_release.borrow().is_some() {
             return Err("相对链接原View释放观察重复登记".into());
         }
@@ -503,8 +546,9 @@ impl RelativeLink {
             let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
                 kind, point, NSEventModifierFlags::Command, 1.0, window.windowNumber(), None, 1, 1, 1.0,
             ).ok_or("无法建立本次有限真实鼠标语义")?;
-            // Command 单击沿原窗口号和真实命中坐标各入队一次；由NSApplication→原NSWindow→原View派发。
-            // 不直接调用View selector或切笔记实现；这里不手动pump、重播或补点击。
+            // Queue each half of this Command-click once with the actual window number and ink
+            // point. NSApplication dispatches through the original NSWindow to its view; no direct
+            // view selector, note switch, manual event pump, replay, or replacement click is used.
             application.postEvent_atStart(&event, false);
         }
         if let Some(cause) = view.take_failure() {
@@ -513,14 +557,15 @@ impl RelativeLink {
         Ok(())
     }
 
-    /// 原View真正析构后，只观察同一pending switch的完整释放端点；不以队列先后推测安装完成。
+    /// After actual original-view deallocation, observe the same pending switch's complete release
+    /// endpoint. Main-queue order does not establish that the target has been installed.
     fn original_view_released(&self) {
         if self.signal.borrow().is_none() {
-            return; // Return/关闭已经撤销本次终点；迟到释放只结束观察，不能重新绑定后继文稿。
+            return; // Return/close revoked this endpoint; late release cannot bind a successor document.
         }
         let result = (|| {
             if self.accept_installed()? {
-                return Ok(()); // 若生产切换已经完成，消费它的实际安装与现成CPU帧，不要求另一次发布。
+                return Ok(()); // Consume an already completed installation and CPU frame without requesting another publication.
             }
             let window = self.window.load().ok_or("相对链接原窗口已释放")?;
             with_active_native_markdown_surface(|surface| {
@@ -547,13 +592,15 @@ impl RelativeLink {
                 barrier.probe_when_released(move || {
                     let mtm = MainThreadMarker::new().expect("原释放端点位于主线程");
                     let next = dispatch2::MainThreadBound::new(weak, mtm);
-                    // 原relay先让生产finish消费同一屏障。此一次退栈仅移交已发生的事件，
-                    // 不反复入队、不运行executor，也不把释放本身签成目标安装或完整CPU帧。
+                    // The original relay lets production finish consume this same barrier first.
+                    // This one continuation transfers an event that already occurred; it neither
+                    // repeatedly enqueues work nor treats release as installation or a complete frame.
                     let Some(controller) = controller.get(mtm).load() else {
                         return;
                     };
-                    // 同一生产handler可能因同步Native重入仍在等待原SurfaceLease恢复；
-                    // 复用原accepted continuation接该实际恢复事件，不按main queue轮次猜安装先后。
+                    // Synchronous native reentry may still leave production awaiting restoration of
+                    // its original SurfaceLease. Use that owner's accepted continuation for the
+                    // actual restoration event, without guessing from main-queue turns.
                     controller.enqueue_owned_after_release(None, move || {
                         let mtm = MainThreadMarker::new().expect("原切换完成后仍在主线程");
                         let Some(case) = next.get(mtm).upgrade() else {
@@ -579,6 +626,7 @@ impl RelativeLink {
     }
 
     fn fail(&self, cause: String) {
+        // Preserve the first functional failure; later observations may only deliver its endpoint.
         if self.failure.borrow().is_none() {
             *self.failure.borrow_mut() = Some(cause);
         }
@@ -586,14 +634,16 @@ impl RelativeLink {
     }
 
     fn deliver(&self) {
+        // Remove the one-shot signal before invocation so reentry cannot deliver it twice.
         let signal = self.signal.borrow_mut().take();
         if let Some(signal) = signal {
             signal();
         }
     }
 
-    /// 新Doc只能在预声明路径/revision和原窗口的真实安装结果处绑定一次；未安装返回false。
-    /// 调用方只在已有结果或真实释放端点继续，不能把false当成重新排队的许可。
+    /// Bind the new document once at actual installation in the original window, with its declared
+    /// path and revision. False means not installed; callers may continue only from an existing
+    /// result or real release endpoint, never enqueue another speculative observation.
     fn accept_installed(&self) -> Result<bool, String> {
         if self.signal.borrow().is_none() || self.target.borrow().is_some() {
             return Ok(true);
@@ -613,7 +663,7 @@ impl RelativeLink {
                 &Rc::downgrade(editor.document()),
                 &self.original.document,
             ) {
-                return Ok(None); // 原保存/拆图尚在进行；后继只接原View及原屏障的真实释放事件。
+                return Ok(None); // Original save/teardown continues; only the original view/barrier release events may resume observation.
             }
             if surface.current_note_relative_path.as_deref() != Some(TARGET_NOTE)
                 || surface.pending_note_switch.is_some()
@@ -623,6 +673,8 @@ impl RelativeLink {
             }
             let paged = editor;
             let document = editor.document().borrow();
+            // Actual confinement/opening must yield the declared clean target revision with no
+            // fabricated edit history. Path equality alone cannot certify this canonical allocation.
             if document
                 .path()
                 .canonicalize()
@@ -679,6 +731,8 @@ impl RelativeLink {
         *self.target.borrow_mut() = Some(target);
         self.arm_target_frame();
         let view = body.view().map_err(|cause| cause.to_string())?;
+        // Registration may follow an already completed CPU publication. Consume that exact ready
+        // Scene/frame when present; otherwise subscribe to the existing body's next actual frame.
         if let Some((key, paints)) = view.probe_cpu_published_frame()
             && paints != 0
             && view.cpu_paint_pending() == Some(false)
@@ -695,8 +749,9 @@ impl RelativeLink {
         Ok(true)
     }
 
-    /// 仍使用原SourceFrame观察者；首屏可能在fragment接管前发布，只有明确标题后态才能交终点。
-    /// 注册与后继帧共用实际mouseup时钟，没有重发点击、重开Doc或补做导航。
+    /// Reuse the original SourceFrame observer. An initial BOF frame may precede fragment handoff;
+    /// only the exact navigated heading state completes this operation. All observations share the
+    /// actual mouse-up clock, without replaying clicks, reopening documents, or adding navigation.
     fn arm_target_frame(&self) {
         let weak = self.weak.clone();
         *self.frame.signal.borrow_mut() = Some(Box::new(move || {
@@ -724,7 +779,7 @@ impl RelativeLink {
             let target = self.target.borrow();
             let target = target.as_ref().ok_or("相对锚点没有原安装票")?;
             (target.document.clone(), target.body.clone(), target.input)
-        }; // 这里只复制弱身份与标量，后续Native getter不持任何probe RefCell借用。
+        }; // Copy only weak identities and scalars; no probe RefCell borrow crosses later native getters.
         let ready = with_active_native_markdown_surface(|surface| {
             let editor = surface.editor.as_ref().ok_or("相对锚点原目标已关闭")?;
             if !WeakMarkdownDocument::ptr_eq(&document_identity, &Rc::downgrade(editor.document()))
@@ -762,6 +817,8 @@ impl RelativeLink {
                 Err(ViewError::Pending) => None,
                 Err(cause) => return Err(cause.to_string()),
             };
+            // The independent heading position, original complete Input, ready Scene, and finished
+            // CPU publication must agree. A rendered intermediate BOF frame grants no completion.
             let complete = key.request.input == actual
                 && actual.primary_range == expected
                 && ready_key.is_some_and(|ready| ready.same(&key))
@@ -784,7 +841,8 @@ impl RelativeLink {
             *self.frame.key.borrow_mut() = Some(key);
             self.deliver();
         } else {
-            // 只等原目标的下一次真实CPU发布；中间文首帧不是标题成功，也不替新输入续权。
+            // Wait only for the original target's next actual CPU publication; an intermediate BOF
+            // frame is neither heading success nor permission to continue under another Input.
             self.arm_target_frame();
             let body = self
                 .frame
@@ -799,7 +857,8 @@ impl RelativeLink {
         Ok(())
     }
 
-    /// 场景终点只订阅一次；注册时已经到达的同一个真实安装/CPU结果可以立即消费。
+    /// Register one endpoint; an already completed installation/CPU result for this same operation
+    /// may be consumed immediately when the observer arrives.
     fn observe_target(&self, observer: impl FnOnce() + 'static) -> Result<(), String> {
         if self.signal.borrow().is_some() || self.target.borrow().is_some() {
             return Err("相对链接目标终点重复注册".into());
@@ -822,20 +881,22 @@ impl RelativeLink {
             let Some(controller) = controller.get(mtm).load() else {
                 return;
             };
-            // 首次真实析构也可能从嵌套Native loop到达；原owner仍借出时只等其真正恢复，
-            // 不让with_active的暂时Busy变成链接失败，不轮询或重新捕获后继controller。
+            // Initial deallocation may arrive inside a nested native loop. Await actual restoration
+            // if the original surface is still leased, rather than treating temporary Busy as a link
+            // failure, polling, or recapturing another controller.
             controller.enqueue_owned_after_release(None, move || {
                 let mtm = MainThreadMarker::new().expect("原释放观察沿同一主线程恢复");
                 if let Some(case) = next.get(mtm).upgrade() {
                     case.original_view_released();
                 }
             });
-        }); // 注册晚于真实释放也消费同一已完成事实；没有下一窗口更新或时间猜测。
+        }); // Late registration consumes the same completed release, without waiting for another window update or guessing by time.
         Ok(())
     }
 
-    /// 原三秒期限已经失败才读取现成安装与绘制事实；不补绑定、不消费错误槽，也不推动后继工作。
-    /// 这里区分“旧图已拆”与“目标已安装/已观察/已绘制”，不能用旧Body消失掩盖后面任一缺口。
+    /// Read existing installation/paint facts only after the original three-second deadline fails,
+    /// without binding missing targets, consuming error slots, or advancing later work. Old-graph
+    /// release and target installation/observation/painting are distinct facts, even if Body expired.
     pub(in super::super) fn diagnose_deadline(&self) {
         let target = self
             .target
@@ -883,7 +944,8 @@ impl RelativeLink {
             );
             Ok(Some((Rc::clone(&paged.body), Rc::clone(&paged.text_view))))
         });
-        // Active租约与所有槽借用均已归还；Native几何查询即使重入也只读取当前诊断事实。
+        // The active-surface lease and all slot borrows ended. Native geometry getters may reenter,
+        // but this path only reads existing diagnostics and grants no production authority.
         let Ok(Some((body, view))) = current else {
             if current.is_err() {
                 eprintln!("native_relative_link_deadline current_surface=false");
@@ -916,6 +978,8 @@ impl RelativeLink {
     }
 
     fn verify_target(&self) -> Result<(), String> {
+        // A later frame or successful cleanup cannot erase the operation's original failure or
+        // exceed the one mouse action's deadline and still count as successful navigation.
         if let Some(cause) = self.failure.borrow().as_ref() {
             return Err(cause.clone());
         }
@@ -947,6 +1011,8 @@ impl RelativeLink {
         with_active_native_markdown_surface(|surface| {
             let editor = surface.editor.as_ref().ok_or("相对链接目标已关闭")?;
             let paged = editor;
+            // Require the exact installed document/body and the independently bound navigated
+            // Input; another document or newer geometry cannot donate its CPU completion.
             if !WeakMarkdownDocument::ptr_eq(&document_identity, &Rc::downgrade(editor.document()))
                 || !std::rc::Weak::ptr_eq(&body_identity, &Rc::downgrade(&paged.body))
                 || key.request.input != navigated
@@ -976,6 +1042,8 @@ impl RelativeLink {
                 )
                 .map_err(|cause| cause.to_string())?;
             let document = editor.document().borrow();
+            // Verify canonical target bytes independently of pixel/frame success, then drop the
+            // document borrow before capturing native weak observations and original resources.
             let mut comparison = TargetComparison::new(self.http_suffix.as_deref());
             document
                 .write_to(&mut comparison)
@@ -992,7 +1060,8 @@ impl RelativeLink {
         Ok(())
     }
 
-    /// 导航成功后的保存事实独立结算；原只读facts不改写，失败清理更不能借新基线冲销点击失败。
+    /// Settle saved-file facts independently after navigation. Original read-only facts stay fixed;
+    /// failure cleanup cannot adopt a new baseline and thereby excuse a failed click.
     fn verify_saved(&self) -> Result<(), String> {
         self.old_graph
             .borrow()
@@ -1010,8 +1079,9 @@ impl RelativeLink {
         Ok(())
     }
 
-    /// 只接受本次已验证编辑的字节：固定前缀之后逐片对照仍打开的原inode，另核编辑前已封存的revision。
-    /// 本函数既用于导航成功后的574，也用于失败后实际Return已保存的423；不会生成新的功能成功票。
+    /// Accept only the verified edit: compare the fixed prefix and stream the remainder against
+    /// the still-open original inode, then check the canonical revision captured before navigation.
+    /// Both successful navigation and failure cleanup use this check; it creates no new click-success receipt.
     fn verify_source_file(&self, original: &mut std::fs::File) -> Result<DiskIdentity, String> {
         original
             .seek(SeekFrom::Start(0))
@@ -1026,6 +1096,8 @@ impl RelativeLink {
             return Err("相对链接没有保存原未保存前缀".into());
         }
         let (mut expected, mut actual) = ([0_u8; 64 * 1024], [0_u8; 64 * 1024]);
+        // Compare bounded chunks of the original remainder without loading the long document.
+        // The independent old descriptor still names the pre-save inode after atomic replacement.
         loop {
             let count = original
                 .read(&mut expected)
@@ -1052,8 +1124,9 @@ impl RelativeLink {
             .edited_revision
             .get()
             .ok_or("链接缺少已验证编辑revision")?;
-        // open 的第二参数是文件编辑上限，而非驻留内存额度。原文件长度与唯一插入前缀
-        // 在动作前已经确定；只允许这个精确的新长度，不借任意放大限额容纳未知尾部。
+        // Core open's second argument is the editable file-size limit, not a resident-memory
+        // budget. Original file length plus the sole declared prefix determines this exact limit;
+        // do not enlarge it to accommodate an unknown tail.
         let expected_bytes = self
             .original
             .disk
@@ -1063,7 +1136,8 @@ impl RelativeLink {
         if disk.length != expected_bytes {
             return Err("链接保存长度不同于原文件加唯一固定前缀".into());
         }
-        // 已保存的文件再走Core公开读取；此独立mmap不进入产品图，核完立即归还实际映射。
+        // Reopen the saved file through Core's public reader. This independent mmap never joins
+        // the product graph and must actually unmap immediately after its revision is checked.
         let document = MarkdownDocumentBuffer::open(&self.source_path, expected_bytes)
             .map_err(|cause| cause.to_string())?;
         let backing = document
@@ -1084,6 +1158,8 @@ impl RelativeLink {
     }
 
     fn verify_target_file(&self) -> Result<(), String> {
+        // Use the original target descriptor for exact bytes and the current path for immutable
+        // disk identity; replacing the path with equal bytes still fails the identity check.
         let mut file = self.target_file.borrow_mut();
         let file = file.as_mut().ok_or("目标独立FD已归还")?;
         file.seek(SeekFrom::Start(0))
@@ -1097,7 +1173,8 @@ impl RelativeLink {
         Ok(())
     }
 
-    /// 清理只关闭同一原窗口中的源Doc或已绑定目标；合法字符代次变化不改变这些弱身份。
+    /// Cleanup may close only the original source or the bound target inside the same original
+    /// window. Legitimate character-generation changes do not replace those weak identities.
     pub(in super::super) fn require_return_current(
         &self,
         surface: &NativeMarkdownWindowSurface,
@@ -1128,7 +1205,8 @@ impl RelativeLink {
         Ok(())
     }
 
-    /// HTTP只借已经通过相对导航的目标图；外部页面不能成为替换Doc、修改历史或重签Source的理由。
+    /// HTTP borrows only the target graph that passed relative navigation. An external page cannot
+    /// authorize document replacement, history changes, or recapture of Source authority.
     fn http_target_view(
         &self,
     ) -> Result<
@@ -1147,7 +1225,7 @@ impl RelativeLink {
                     target.body.clone(),
                     target.navigated_input.get(),
                 )
-            }; // 结束本地观察槽借用，再调用任何View/Scene原生入口。
+            }; // End the local observation-slot borrow before any native View/Scene entry.
             let editor = surface.editor.as_ref().ok_or("HTTP原目标已关闭")?;
             let input = editor
                 .text_view
@@ -1161,6 +1239,8 @@ impl RelativeLink {
                 return Err("HTTP改变了原目标Doc/Body或完整Input".into());
             }
             let document = editor.document().borrow();
+            // Browser focus changes are allowed; canonical content, clean history, and the exact
+            // original target revision must remain unchanged throughout the external handoff.
             if document
                 .current_revision()
                 .map_err(|cause| cause.to_string())?
@@ -1171,7 +1251,7 @@ impl RelativeLink {
             {
                 return Err("HTTP外链改变了原目标内容或历史".into());
             }
-            drop(document); // Source健康和revision先核完，任何后继Native取得都不跨Doc借用。
+            drop(document); // Finish Source/revision checks before any native getter; no document borrow crosses that boundary.
             self.require_return_current(surface)?;
             let key = editor
                 .text_view
@@ -1186,7 +1266,7 @@ impl RelativeLink {
                     .is_none_or(|original| original.source != key.source)
             {
                 return Err("HTTP目标不再使用原Source及完整Input".into());
-            } // 浏览器激活可以改变焦点表现，不因此接受另一份文稿或Source。
+            } // Browser activation may change focus presentation, never the admitted document or Source.
             Ok(Rc::clone(&editor.text_view))
         })?;
         if disk_identity(&self.source_path)? != self.saved_disk.get().ok_or("HTTP原保存身份缺失")?
@@ -1197,7 +1277,8 @@ impl RelativeLink {
         Ok(view)
     }
 
-    /// 一次已命名的Command鼠标动作；服务器观察由Host在调用前登记，不能以入队当作HTTP成功。
+    /// Admit one declared Command-click after Host arms its server observation. Posting the native
+    /// events is an action only, not evidence that HTTP or browser work completed.
     fn click_http(&self) -> Result<(), String> {
         if self.http_input.get().is_some() {
             return Err("本轮HTTP链接不得重复点击".into());
@@ -1212,7 +1293,8 @@ impl RelativeLink {
             .capture_ready_scene_key()
             .map_err(|cause| cause.to_string())?;
         let before = view.input_state().map_err(|cause| cause.to_string())?;
-        // 后缀只有换行和左括号位于标签前；偏移来自独立生成内容，不从点击结果反推。
+        // Only the suffix's newline and opening bracket precede its label. Derive the offset from
+        // independently declared fixture bytes, without inferring a hit position from the result.
         let start = TARGET_TEXT.encode_utf16().count() + 2;
         let rect = view
             .screen_rect(NSRange::new(start, 1))
@@ -1239,7 +1321,7 @@ impl RelativeLink {
         {
             return Err("HTTP鼠标构造期间原Scene/Input失效".into());
         }
-        self.http_input.set(Some(before)); // 唯一动作先消费资格，任何错误均不重新投递外部导航。
+        self.http_input.set(Some(before)); // Consume the sole action before posting; no failure authorizes external navigation replay.
         let application = NSApplication::sharedApplication(window.mtm());
         application.postEvent_atStart(&down, false);
         application.postEvent_atStart(&up, false);
@@ -1265,18 +1347,20 @@ impl RelativeLink {
         Ok(())
     }
 
-    /// 错误/正常返回都先撤本地通知和目标FD；原独立inode留到Host收讫后核真实保存。
+    /// Revoke local notifications and close the target descriptor on success and failure alike.
+    /// Keep the independent original inode until Host close completes and the actual save is verified.
     pub(in super::super) fn prepare_return(&self) {
         drop(self.signal.borrow_mut().take());
         drop(self.frame.signal.borrow_mut().take());
         let release = self.original_view_release.borrow_mut().take();
-        drop(release); // 先撤终点再归还关联marker/观察；即使析构重入也不能重新接纳目标。
+        drop(release); // Revoke endpoints before releasing markers/observation; destructor reentry cannot readmit a target.
         self.switch_release_waiting.set(false);
         drop(self.edited_frame.borrow_mut().take());
         drop(self.target_file.borrow_mut().take());
     }
 
-    /// 产品严格关闭后核真实保存与已观察的资源；没有到达目标完整帧也不能把清理伪装成导航通过。
+    /// After strict product close, check the actual save and captured resources. Successful cleanup
+    /// cannot count as successful navigation if the target never reached a complete frame.
     pub(in super::super) fn verify_closed(&self) -> Result<(), String> {
         let mut original = self
             .original_file
@@ -1293,7 +1377,8 @@ impl RelativeLink {
             if let Some(graph) = target_graph.as_ref() {
                 graph.verify_released()?;
             }
-            // 目标安装后即使完整帧失败，也必须结束这两个真实weak；没有安装则不能虚构目标资源观察。
+            // Once installed, both actual target identities must end even if frame verification
+            // failed. Without installation, do not fabricate observations of nonexistent resources.
             if self.target.borrow().as_ref().is_some_and(|target| {
                 target.document.upgrade().is_some() || target.body.upgrade().is_some()
             }) || self.target_file.borrow().is_some()
@@ -1314,7 +1399,7 @@ impl RelativeLink {
             comparison.finish()?;
             Ok(target_graph.is_some())
         })();
-        drop(original); // 成功与错误都先归还原独立FD，不能靠后继idle或进程退出替本轮清理。
+        drop(original); // Close the independent descriptor before success/error propagation; later idle or process exit is not this cleanup.
         let target_frame_verified = result?;
         println!(
             "native_relative_note_link strict_close=true original_graph_released=true target_frame_verified={target_frame_verified} source_expected_edit_saved=true both_files_verified=true whole_product=false formal=false"
@@ -1325,13 +1410,16 @@ impl RelativeLink {
 
 impl Drop for RelativeLink {
     fn drop(&mut self) {
-        // 注册失败和真实功能失败也移除本轮通知；没有删除用户文件或发送任何键盘/输入源动作。
+        // Failed registration and failed functionality revoke this operation's notifications too.
+        // This destructor neither deletes user files nor sends keyboard/input-source actions.
         self.prepare_return();
-        drop(self.original_file.get_mut().take()); // 423没有执行的错误出口仍由本唯一owner关闭测试FD。
+        drop(self.original_file.get_mut().take()); // This owner closes the fixture descriptor even when the verified-close stage never ran.
     }
 }
 
 impl NativeMarkdownMemoryWorkload {
+    /// Dispatch only the owning workload's declared stages. The original case retains action,
+    /// Source, target, and cleanup identities across steps instead of recreating them per call.
     pub(crate) fn exercise_relative_link(
         &self,
         stage: i16,
@@ -1342,6 +1430,8 @@ impl NativeMarkdownMemoryWorkload {
             *self.relative_link.borrow_mut() = Some(case);
             return Ok(());
         }
+        // Later stages must borrow the already admitted case; missing ownership is an error,
+        // never permission to create a new target or replay an earlier mouse action.
         let case = self
             .relative_link
             .borrow()
@@ -1359,6 +1449,8 @@ impl NativeMarkdownMemoryWorkload {
         }
     }
 
+    /// Subscribe only to the actual edited-frame or installed-target endpoint owned by this case;
+    /// synchronous step dispatch and cleanup are not replacement terminal events.
     pub(crate) fn observe_relative_link_terminal(
         &self,
         stage: i16,

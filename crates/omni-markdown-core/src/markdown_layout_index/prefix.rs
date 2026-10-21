@@ -1,10 +1,12 @@
-//! 原匿名索引的不可变提交前缀；每份快照独占一个FD，不复制record或保留可写映射。
+//! An immutable committed prefix owns one descriptor on the original anonymous
+//! index, with no copied records or writable mapping.
 
 use super::*;
 
 const MAX_PREFIX_READERS: usize = 2;
 
-/// 背压只属于前缀发布；普通GCB/断行索引不会产生此状态，不能污染它们的IO错误协议。
+/// Prefix publication alone owns backpressure. Ordinary GCB/line-break indexes
+/// retain their existing I/O error contract without this publication state.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LayoutIndexSnapshotError {
     #[error("原索引的两份在用前缀快照尚未归还")]
@@ -14,18 +16,22 @@ pub(crate) enum LayoutIndexSnapshotError {
 }
 type SnapshotResult<T> = std::result::Result<T, LayoutIndexSnapshotError>;
 
-/// 先预留真实FD名额；失败仍归还计数，只有移交给实际Reader后才由其close收据结算。
+/// Reserve a real descriptor slot before publication. Failed construction
+/// returns it synchronously; a constructed reader settles it by actual close.
 struct Reservation {
     resources: Arc<ResourceState>,
     transferred: bool,
 }
 impl Reservation {
+    /// Admit at most the existing current/candidate prefixes without waiting for
+    /// Native release or manufacturing another reader descriptor.
     fn new(resources: &Arc<ResourceState>) -> SnapshotResult<Self> {
         let mut count = resources.prefix_readers.load(Ordering::Acquire);
         loop {
             if count >= MAX_PREFIX_READERS {
                 return Err(LayoutIndexSnapshotError::ReadersBusy);
-            } // 有界Current与candidate尚未归还时停止发布，不能制造第三份FD或丢弃旧帧。
+            } // Retain the current frame and stop publication while both
+            // original prefix slots remain owned.
             match resources.prefix_readers.compare_exchange_weak(
                 count,
                 count + 1,
@@ -33,7 +39,8 @@ impl Reservation {
                 Ordering::Acquire,
             ) {
                 Ok(_) => break,
-                Err(actual) => count = actual, // 只重试原名额的原子竞争，不轮询Native释放或重做排版。
+                Err(actual) => count = actual, // Retry only atomic contention
+                                               // for this slot, with no layout/native polling.
             }
         }
         Ok(Self {
@@ -41,6 +48,7 @@ impl Reservation {
             transferred: false,
         })
     }
+    /// Move slot settlement to the reader that now owns its real descriptor.
     fn transfer(mut self) -> Arc<ResourceState> {
         self.transferred = true;
         Arc::clone(&self.resources)
@@ -50,12 +58,13 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         if !self.transferred {
             self.resources.prefix_readers.fetch_sub(1, Ordering::AcqRel);
-        } // 未构造Reader的失败没有真实FD待关，名额必须同步归还。
+        } // Construction failure issued no reader FD; return its slot now.
     }
 }
 
 impl<const N: usize> PagedLayoutIndex<N> {
-    /// 只有上层已提交的LineEnd上界可移交；索引层不签发任何正文或行语义。
+    /// Publish only the upper layer's committed LineEnd extent. This generic
+    /// index grants no document-text or line-semantic authority of its own.
     pub(crate) fn snapshot_reader(
         &mut self,
         committed_records: usize,
@@ -63,18 +72,21 @@ impl<const N: usize> PagedLayoutIndex<N> {
         self.healthy()?;
         if committed_records == 0 || committed_records > self.count || self.sealed {
             return Err(Error::InvalidRecord.into());
-        } // 非法范围不调用任何IO，也不会把已封存索引重新变成可写状态。
+        } // Invalid coordinates perform no I/O and cannot restore append
+        // permission to an already sealed index.
         committed_records
             .checked_mul(N)
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(Error::Overflow)?;
         let reservation = Reservation::new(&self.resources)?;
         let result: Result<LayoutIndexReader<N>> = (|| {
-            // 仅写到本次已提交上界；后继继续用同一buffer追加，绝不重写旧prefix字节。
+            // Write through this committed endpoint only. Later appends reuse
+            // the same buffer without rewriting any published prefix byte.
             self.flush_through(committed_records)?;
             let file = self.file.as_ref().ok_or(Error::Poisoned)?;
             let prefix_file = file.try_clone()?;
-            // Reader只用pread且有自己的逻辑EOF；共享文件游标与后继文件增长不改变快照边界。
+            // The reader uses positioned reads and a fixed logical EOF. Shared
+            // file cursor or later file growth cannot extend that boundary.
             Ok(LayoutIndexReader::from_prefix(
                 prefix_file,
                 committed_records,
@@ -83,7 +95,8 @@ impl<const N: usize> PagedLayoutIndex<N> {
         })();
         if result.is_err() {
             self.mark_failed();
-        } // 真实写入/复制失败永久撤原producer；quota不足在进入本块前已经单独返回。
+        } // Actual write/descriptor-clone failure permanently rejects the
+        // producer; slot exhaustion returned separately before this block.
         result.map_err(Into::into)
     }
 }

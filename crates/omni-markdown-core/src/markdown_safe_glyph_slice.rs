@@ -1,7 +1,9 @@
-//! 原已测安全断点的字形切片；只交付原Ready数组的真实子范围，不重整形剩余文本。
+//! Glyph slices at original measured safe breaks borrow real subranges of the
+//! original Ready output, preserving the remaining shaped text.
 //!
-//! 切片不是任意Range许可。工厂只能读取同一个Measure内部已选机会，并重新核原GCB、
-//! 原cluster端点与UNSAFE_TO_BREAK。复杂边界仍交回真实resolver，不伪造软行或NativeReady。
+//! Factories consume the same measure's selected opportunity and recheck its
+//! grapheme/cluster endpoints and UNSAFE_TO_BREAK flags. Complex boundaries stay
+//! with the actual resolver; slice metadata alone grants no Native readiness.
 use crate::{
     MarkdownDocumentBufferError, MarkdownGlyphCluster, MarkdownGlyphClusterAnswer,
     MarkdownGlyphClusterError, MarkdownGlyphClusterIndex, MarkdownGlyphClusterResourceObserver,
@@ -58,7 +60,8 @@ pub enum MarkdownSafeGlyphSliceError {
 }
 type Result<T> = std::result::Result<T, MarkdownSafeGlyphSliceError>;
 
-/// 只报告原输出中的事实；不代表Native坐标、字体回退、整行BiDi重排或屏幕可绘制权限。
+/// Facts describe original shaping output. Native geometry, fallback selection,
+/// whole-line bidi ordering, and permission to draw require their own owners.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownSafeGlyphSliceFacts {
     pub source_utf16: Range<usize>,
@@ -67,7 +70,8 @@ pub struct MarkdownSafeGlyphSliceFacts {
     pub y_advance_26_6: i64,
 }
 
-/// 不可Clone且字段私有；仅持弱权限与固定元数据，不延长Doc、Source、Font或索引FD寿命。
+/// Private, non-Clone ownership carries weak authorities and fixed metadata;
+/// it keeps no document, Source, font, or cluster-index descriptor alive.
 pub struct MarkdownSafeGlyphSlice {
     facts: MarkdownSafeGlyphSliceFacts,
     shape: Weak<()>,
@@ -84,18 +88,24 @@ pub struct MarkdownSafeGlyphSlice {
 }
 impl MarkdownSafeGlyphSlice {
     #[must_use]
+    /// Copy finite output coordinates without extending any shaping authority.
     pub fn facts(&self) -> MarkdownSafeGlyphSliceFacts {
         self.facts.clone()
     }
 
-    /// 每批和封口重借原job；原IO先于取消/弱票核验，失败不能用另一任务重新授权。
+    /// Reborrow the original job for every batch and final publication. Source
+    /// and job I/O failures take precedence over cancellation or expired tickets.
     pub(crate) fn require(&mut self, job: &mut MarkdownShapingJob) -> Result<()> {
         let result = (|| {
+            // An already observed backing failure remains the actual error even
+            // if a later task cancellation would also reject this slice.
             if let Some(errno) = self.backing.as_ref().and_then(|value| value.first_errno()) {
                 return Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
             }
             let profile = job.profile()?;
             job.glyph(&self.source, &self.font, self.count)?;
+            // Equal array sizes cannot substitute for the original shaping
+            // allocation and generation from which these coordinates were made.
             if !Weak::ptr_eq(&self.shape, &job.index_identity())
                 || profile.glyph_count != self.count
                 || profile.source_generation != self.generation
@@ -103,27 +113,33 @@ impl MarkdownSafeGlyphSlice {
                 return Err(MarkdownSafeGlyphSliceError::OwnerMismatch);
             }
             if self.cancellation.is_cancelled() {
+                // Cancellation belongs to the original measure and ends every
+                // slice derived from that operation.
                 return Err(MarkdownSafeGlyphSliceError::Cancelled);
             }
             if self.poisoned
                 || self.revoked.load(Ordering::Acquire)
                 || self.measure.upgrade().is_none()
             {
+                // A failed check is permanent; a surviving shaping job cannot
+                // revive a retired measure or its revoked publication ticket.
                 return Err(MarkdownSafeGlyphSliceError::Poisoned);
             }
             let index = self.index.snapshot();
             if index.owner_closed || index.cleanup_failed {
                 return Err(MarkdownSafeGlyphSliceError::Poisoned);
-            } // 原索引失效会真实close原owner；单页可始终无FD，observer也不能保活其buffer或重新打开。
+            } // Index retirement closes its real owner. Single-page indexes may
+            // have no FD; this observer cannot retain or reopen their buffer.
             Ok(())
         })();
         if result.is_err() {
             self.poisoned = true;
-        } // 曾失权的切片不会因外部状态碰巧恢复而复活。
+        } // Later coincidental external recovery never restores this slice.
         result
     }
 
-    /// 只消费原紧急selector私有proof；原Measure内部起点不变，续行起点由该selector封闭推进。
+    /// Consume only the original emergency selector's private proof. That
+    /// selector advances continuation start while the measure retains its start.
     pub(crate) fn from_emergency_selection(
         choice: &crate::markdown_soft_line_resolve::MarkdownEmergencyResolvedChoice<'_>,
         measure: &MarkdownSoftLineMeasureJob,
@@ -135,22 +151,30 @@ impl MarkdownSafeGlyphSlice {
         seed.source.health()?;
         measure.require_resolve(&seed.owner, job)?;
         if index.status() != MarkdownGlyphClusterStatus::Ready {
+            // Incomplete cluster coverage cannot certify either slice endpoint.
             return Err(MarkdownSafeGlyphSliceError::PendingDependencies);
         }
         let facts = facts(seed, job, breaks, index, choice.range())?;
         if facts.x_advance_26_6 != choice.width() {
+            // The selector and actual cluster prefix difference must describe
+            // the same width before any candidate can be published.
             return Err(MarkdownSafeGlyphSliceError::InconsistentCoverage);
         }
         let value = Self::make(seed, job, index, facts)?;
+        // Metadata reads can fail or retire authority; check the original
+        // Source and measure again before returning the constructed candidate.
         seed.source.health()?;
         measure.require_resolve(&seed.owner, job)?;
         Ok(value)
     }
 
+    /// Share the same operation's cancellation signal without owning its job.
     pub(crate) fn cancellation(&self) -> MarkdownSoftLineMeasureCancellation {
         self.cancellation.clone()
     }
 
+    /// Bind validated coordinates to original weak owners, then perform the
+    /// same live-job check required by later consumers.
     fn make(
         seed: &MarkdownSoftLineResolveSeed,
         job: &mut MarkdownShapingJob,
@@ -166,7 +190,8 @@ impl MarkdownSafeGlyphSlice {
             || facts.source_utf16.end > source.end
         {
             return Err(MarkdownSafeGlyphSliceError::InconsistentCoverage);
-        } // 即使分页record发生损坏，原数组范围也必须先闭合，不能让后续索引加法越界或溢出。
+        } // A corrupt page record must fail before its range can authorize
+        // out-of-bounds array access or overflowing index arithmetic.
         let mut value = Self {
             facts,
             shape: job.index_identity(),
@@ -186,12 +211,15 @@ impl MarkdownSafeGlyphSlice {
     }
 }
 
-/// 原已选前缀及其同一输出余项；两者不创建新shaper，也不复制全部字形或正文。
+/// The selected prefix and remainder refer to the same original shaping output;
+/// neither creates a new shaper or copies complete glyph/text arrays.
 pub struct MarkdownSafeGlyphSlices {
     line: MarkdownSafeGlyphSlice,
     remainder: Option<MarkdownSafeGlyphSlice>,
 }
 impl MarkdownSafeGlyphSlices {
+    /// Derive both portions from the measure's private selected-break seed,
+    /// preserving original Source/font authority throughout metadata acquisition.
     pub fn from_measure(
         measure: &MarkdownSoftLineMeasureJob,
         job: &mut MarkdownShapingJob,
@@ -201,10 +229,13 @@ impl MarkdownSafeGlyphSlices {
         let seed = measure.resolve_seed(job)?;
         let MarkdownSoftLineMeasureChoice::MeasuredBreak(selected) = &seed.choice else {
             return Err(MarkdownSafeGlyphSliceError::NeedsResolution);
-        }; // 不能让调用方用公开Choice字段把紧急断点、缺字或词典待决冒充安全机会。
+        }; // Public Choice fields cannot turn emergency, missing-glyph, or
+        // dictionary-pending outcomes into a measured safe opportunity.
         if job.status() != MarkdownShapingStatus::Ready
             || index.status() != MarkdownGlyphClusterStatus::Ready
         {
+            // Both the glyph array and cluster index must be complete before
+            // selected coordinates may reference either output.
             return Err(MarkdownSafeGlyphSliceError::PendingDependencies);
         }
         let range = selected.source_utf16.clone();
@@ -214,15 +245,21 @@ impl MarkdownSafeGlyphSlices {
             || range.is_empty()
             || selected.boundary_flags & UNSAFE != 0
         {
+            // Only this item's original nonempty prefix, with no unsafe break
+            // flag, is eligible for a slice without additional resolution.
             return Err(MarkdownSafeGlyphSliceError::NeedsResolution);
         }
         let line_facts = facts(&seed, job, breaks, index, range.clone())?;
         if line_facts.x_advance_26_6 != selected.x_advance_26_6 {
             return Err(MarkdownSafeGlyphSliceError::InconsistentCoverage);
-        } // 原测量累计值必须等于真实cluster前缀差；跨item累计不能被误签为单item切片。
+        } // Actual cluster prefix differences must equal measured width;
+        // accumulated widths across items cannot certify a single-item slice.
         let remainder_facts = if range.end < seed.item.end {
+            // A remainder uses the same item output and independently verified
+            // endpoints, keeping continuation text out of a second shaper.
             Some(facts(&seed, job, breaks, index, range.end..seed.item.end)?)
         } else {
+            // A fully consumed item owns no empty remainder ticket.
             None
         };
         measure.require_resolve(&seed.owner, job)?;
@@ -230,15 +267,19 @@ impl MarkdownSafeGlyphSlices {
         let remainder = remainder_facts
             .map(|facts| MarkdownSafeGlyphSlice::make(&seed, job, index, facts))
             .transpose()?;
-        seed.source.health()?; // 元数据IO后最后核真实Source，不能把共享映射错误藏在已构造候选内。
+        seed.source.health()?; // Final source health preserves any actual mapped
+        // backing failure after the metadata I/O above.
         Ok(Self { line, remainder })
     }
     #[must_use]
+    /// Move each single-use slice to its eventual consumer without cloning it.
     pub fn into_parts(self) -> (MarkdownSafeGlyphSlice, Option<MarkdownSafeGlyphSlice>) {
         (self.line, self.remainder)
     }
 }
 
+/// Resolve one source position through the original cluster index, retaining
+/// Pending and absent coverage as distinct failures.
 fn cluster(
     index: &mut MarkdownGlyphClusterIndex,
     job: &mut MarkdownShapingJob,
@@ -254,6 +295,8 @@ fn cluster(
         }
     }
 }
+/// Certify original grapheme/cluster endpoints and exact prefix advances before
+/// exposing a contiguous visual interval of the already shaped array.
 fn facts(
     seed: &MarkdownSoftLineResolveSeed,
     job: &mut MarkdownShapingJob,
@@ -268,7 +311,9 @@ fn facts(
                 return Err(MarkdownSafeGlyphSliceError::PendingDependencies);
             }
             _ => return Err(MarkdownSafeGlyphSliceError::NeedsResolution),
-        } // 原GCB索引确认两端；低代理项、组合簇内部和未知尾部都不能由range长度绕过。
+        } // Original GCB proof covers both endpoints. Range length cannot
+        // legitimize surrogate interiors, combining-cluster interiors, or an
+        // unknown suffix.
     }
     let first = cluster(index, job, range.start)?;
     let last = cluster(index, job, range.end - 1)?;
@@ -276,14 +321,17 @@ fn facts(
         || last.source_utf16.end != range.end
         || (range.start != seed.item.start && first.flags & UNSAFE != 0)
     {
+        // Both source endpoints must coincide with real cluster endpoints; an
+        // interior start also requires permission to break before that cluster.
         return Err(MarkdownSafeGlyphSliceError::NeedsResolution);
     }
     if range.end < seed.item.end {
         let next = cluster(index, job, range.end)?;
         if next.source_utf16.start != range.end || next.flags & UNSAFE != 0 {
+            // The following cluster owns UNSAFE_TO_BREAK at this boundary.
             return Err(MarkdownSafeGlyphSliceError::NeedsResolution);
         }
-    } // UNSAFE_TO_BREAK属于断点后继cluster；不能只检查前缀自身flags并集。
+    } // Prefix-only flag aggregation cannot establish a safe following edge.
     let x = last
         .prefix_x_26_6
         .checked_add(last.x_advance_26_6)
@@ -294,7 +342,8 @@ fn facts(
         .checked_add(last.y_advance_26_6)
         .and_then(|end| end.checked_sub(first.prefix_y_26_6))
         .ok_or(MarkdownSafeGlyphSliceError::Overflow)?;
-    // RTL逻辑首尾的视觉数组区间顺序相反；只取原连续cluster的外包端点，不反转字形。
+    // RTL logical endpoints appear in reverse visual order. Take the outer
+    // endpoints of the original continuous clusters without reversing glyphs.
     let visual = first.glyphs.start.min(last.glyphs.start)..first.glyphs.end.max(last.glyphs.end);
     Ok(MarkdownSafeGlyphSliceFacts {
         source_utf16: range,

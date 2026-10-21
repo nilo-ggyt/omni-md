@@ -1,4 +1,5 @@
-//! 历史item必须先由仍活的原测量/原Job签收据；最终仅借原sealed文件，不复制整个spool。
+//! Capture historical items while the original measure/job is still live, then
+//! borrow the original sealed output file in bounded batches.
 use super::*;
 use crate::{
     MarkdownShapedGlyph, MarkdownShapedSpool, MarkdownShapedSpoolError,
@@ -6,6 +7,7 @@ use crate::{
     markdown_shaping::MarkdownSpoolSliceOrigin,
 };
 
+/// Maximum real glyph records read by one step or delivered in one batch.
 pub const MARKDOWN_SAFE_SPOOL_SLICE_GLYPHS: usize = 256;
 #[derive(Debug, Error)]
 pub enum MarkdownSafeSpoolSliceError {
@@ -34,31 +36,38 @@ pub enum MarkdownSafeSpoolSliceError {
 }
 type Result<T> = std::result::Result<T, MarkdownSafeSpoolSliceError>;
 
-/// 只保整行弱票与取消/撤权标量；合法continue不撤此票，失败或Drop立刻撤销。
+/// Weak line authority and shared cancellation/revocation facts survive valid
+/// continuation, while failed or dropped original owners revoke that authority.
 struct LineProof {
     measure: Weak<()>,
     alive: Arc<AtomicBool>,
     cancellation: MarkdownSoftLineMeasureCancellation,
 }
 impl LineProof {
+    /// Require the original line's live operation without retaining its measure.
     fn require(&self) -> Result<()> {
         if self.cancellation.is_cancelled() {
+            // Cancellation ends all historical item permissions for this line.
             return Err(MarkdownSafeSpoolSliceError::Cancelled);
         }
         if !self.alive.load(Ordering::Acquire) || self.measure.upgrade().is_none() {
+            // A retained receipt cannot revive a retired or failed line owner.
             return Err(MarkdownSafeSpoolSliceError::Poisoned);
         }
         Ok(())
     }
 }
 
-/// 不可Clone的历史收据；必须在NeedNextItem、原Job尚活时取得，不能事后回采同源字体。
+/// A non-Clone historical receipt is captured at NeedNextItem while its original
+/// job is live. A later same-named font cannot issue that original permission.
 pub struct MarkdownMeasuredItemSpoolProof {
     origin: MarkdownSpoolSliceOrigin,
     line: LineProof,
     measured: Range<usize>,
 }
 impl MarkdownMeasuredItemSpoolProof {
+    /// Authenticate one measured item's real job and exact sealed spool before
+    /// continuation retires that job and its font payload.
     pub fn capture(
         measure: &MarkdownSoftLineMeasureJob,
         job: &mut MarkdownShapingJob,
@@ -69,10 +78,12 @@ impl MarkdownMeasuredItemSpoolProof {
             .measured_item_permit(&mut JobGlyphProvider::new(job, None))
             .map_err(|error| match error {
                 MarkdownSoftLineMeasureError::InvalidRequest => {
+                    // Preserve the public phase error for a measure that has
+                    // not reached its real NeedNextItem boundary.
                     MarkdownSafeSpoolSliceError::NeedsResolution
                 }
                 other => MarkdownSafeSpoolSliceError::Measure(other),
-            })?; // 维持公开旧API对“真实尚非NeedNextItem”的阶段错误，不改变原调用方恢复语义。
+            })?;
         let facts = permit.require(&mut JobGlyphProvider::new(job, None))?;
         let origin = spool.safe_slice_origin(&facts.source)?;
         spool.require_safe_slice_job(&origin, job)?;
@@ -85,9 +96,13 @@ impl MarkdownMeasuredItemSpoolProof {
                     job.index_identity(),
                 )
         {
+            // Source extent, glyph count, generation, direction, and original
+            // job identity must all describe this same captured output.
             return Err(MarkdownSafeSpoolSliceError::InconsistentCoverage);
         }
         job.glyph(&facts.source, &facts.font, facts.glyphs)?;
+        // Recheck the same permit after actual output/source access; no later
+        // job can supply a fresh authority to bless this historical item.
         permit.require(&mut JobGlyphProvider::new(job, None))?;
         Ok(Self {
             origin,
@@ -97,7 +112,8 @@ impl MarkdownMeasuredItemSpoolProof {
                 alive: facts.line.alive,
                 cancellation: facts.line.cancellation,
             },
-        }) // 与Store共用真实NeedNextItem门；不再为了签固定事实临时clone整份Source。
+        }) // Share Store's real NeedNextItem boundary while retaining only the
+        // finite proof, rather than cloning a complete Source for capture.
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,7 +140,8 @@ enum Progress {
     Pending,
 }
 
-/// 每次至多读256个真实record；二分、flags和advance都在原文件上有限推进，不建索引镜像。
+/// Each turn reads at most 256 real records. Binary search, flag checks, and
+/// advance accumulation operate incrementally on the original sealed file.
 pub struct MarkdownSafeSpoolSliceJob {
     proof: Option<MarkdownMeasuredItemSpoolProof>,
     phase: Phase,
@@ -137,6 +154,8 @@ pub struct MarkdownSafeSpoolSliceJob {
     shape_cancellation: MarkdownShapingCancellation,
 }
 impl MarkdownSafeSpoolSliceJob {
+    /// Intersect the selected line with an already captured historical item,
+    /// keeping the original line/Source and spool instance identities.
     pub fn new(
         measure: &MarkdownSoftLineMeasureJob,
         current: &mut MarkdownShapingJob,
@@ -148,17 +167,22 @@ impl MarkdownSafeSpoolSliceJob {
         proof.line.require()?;
         if !Weak::ptr_eq(&seed.owner, &proof.line.measure) || seed.authority != proof.origin.source
         {
+            // Equal text or a different live measure cannot replace the
+            // original line owner that issued this historical receipt.
             return Err(MarkdownSafeSpoolSliceError::Poisoned);
         }
         let MarkdownSoftLineMeasureChoice::MeasuredBreak(selected) = &seed.choice else {
+            // Emergency and unresolved outcomes still require the resolver.
             return Err(MarkdownSafeSpoolSliceError::NeedsResolution);
         };
         let range = selected.source_utf16.start.max(proof.origin.range.start)
             ..selected.source_utf16.end.min(proof.origin.range.end);
         if range.is_empty() {
+            // This item contributes no glyphs to the selected source line.
             return Err(MarkdownSafeSpoolSliceError::OutsideSelectedLine);
         }
         if range.start < proof.measured.start || range.end > proof.measured.end {
+            // An item's unconsumed suffix has no measured historical proof.
             return Err(MarkdownSafeSpoolSliceError::InconsistentCoverage);
         }
         seed.source.health()?;
@@ -174,11 +198,14 @@ impl MarkdownSafeSpoolSliceJob {
             shape_cancellation: current.cancellation(),
         })
     }
+    /// Borrow the single proof until seal consumes it; absence is irreversible.
     fn proof(&self) -> Result<&MarkdownMeasuredItemSpoolProof> {
         self.proof
             .as_ref()
             .ok_or(MarkdownSafeSpoolSliceError::Poisoned)
     }
+    /// Check original Source/I/O before cancellation and metadata revocation at
+    /// both ends of a bounded step.
     fn guard(
         &self,
         measure: &MarkdownSoftLineMeasureJob,
@@ -186,14 +213,16 @@ impl MarkdownSafeSpoolSliceJob {
         spool: &mut MarkdownShapedSpool,
     ) -> Result<()> {
         let proof = self.proof()?;
-        spool.require_safe_slice_origin(&proof.origin)?; // 原Source/IO优先于元数据撤权与取消。
+        spool.require_safe_slice_origin(&proof.origin)?;
         measure.require_resolve(&proof.line.measure, current)?;
         proof.line.require()?;
         if self.poisoned {
+            // A previous failed step cannot resume after external recovery.
             return Err(MarkdownSafeSpoolSliceError::Poisoned);
         }
         Ok(())
     }
+    /// Read one real record by logical rank using its original file authority.
     fn glyph(&self, spool: &mut MarkdownShapedSpool, rank: usize) -> Result<MarkdownShapedGlyph> {
         let origin = &self.proof()?.origin;
         let index = visual_index(origin, rank)?;
@@ -201,7 +230,8 @@ impl MarkdownSafeSpoolSliceJob {
             .glyph(&origin.authority, &origin.source, &origin.font, index)?
             .ok_or(MarkdownSafeSpoolSliceError::InconsistentCoverage)
     }
-    /// 逻辑rank按源递增；RTL只反向选原视觉下标，不反转glyph或改变源cluster。
+    /// Advance logical rank in source order. RTL selects reverse visual indices
+    /// without reversing glyph records or changing their source clusters.
     fn advance_one(
         &mut self,
         spool: &mut MarkdownShapedSpool,
@@ -210,6 +240,8 @@ impl MarkdownSafeSpoolSliceJob {
         let origin = self.proof()?.origin.clone();
         match self.phase {
             Phase::StartGcb | Phase::EndGcb => {
+                // Both source endpoints require completed GCB proof before any
+                // glyph rank can authorize a slice boundary.
                 let start = matches!(self.phase, Phase::StartGcb);
                 let at = if start {
                     self.range.start
@@ -236,6 +268,8 @@ impl MarkdownSafeSpoolSliceJob {
                 Ok(Progress::Metadata)
             }
             Phase::SeekStart { low, high } | Phase::SeekEnd { low, high } => {
+                // Search lower bounds in original logical-cluster order; each
+                // actual record read consumes one unit of this turn's budget.
                 let start = matches!(self.phase, Phase::SeekStart { .. });
                 let target = if start {
                     self.range.start
@@ -243,6 +277,8 @@ impl MarkdownSafeSpoolSliceJob {
                     self.range.end
                 };
                 if low == high {
+                    // Finished searches publish only numeric ranks. Separate
+                    // endpoint checks still establish exact cluster coverage.
                     if start {
                         self.first = low;
                         self.phase = Phase::SeekEnd {
@@ -271,10 +307,13 @@ impl MarkdownSafeSpoolSliceJob {
             }
             Phase::CheckStart => {
                 if self.first > self.last || self.last > origin.count {
+                    // Reject inconsistent ranks before subtraction/indexing.
                     return Err(MarkdownSafeSpoolSliceError::InconsistentCoverage);
                 }
                 self.phase = Phase::CheckEnd;
                 if self.range.start != origin.range.start {
+                    // An interior start must equal a real cluster start; the
+                    // complete item start already has its original authority.
                     if self.first == origin.count
                         || self.glyph(spool, self.first)?.source_utf16_cluster != self.range.start
                     {
@@ -288,6 +327,8 @@ impl MarkdownSafeSpoolSliceJob {
             Phase::CheckEnd => {
                 self.phase = Phase::Accumulate { rank: self.first };
                 if self.range.end != origin.range.end {
+                    // An interior end must coincide with the following cluster
+                    // start; an arbitrary cut inside a cluster needs resolution.
                     if self.last == origin.count
                         || self.glyph(spool, self.last)?.source_utf16_cluster != self.range.end
                     {
@@ -300,11 +341,15 @@ impl MarkdownSafeSpoolSliceJob {
             }
             Phase::Accumulate { rank } => {
                 if rank == self.last {
+                    // End-of-slice accumulation still leaves the following
+                    // cluster's unsafe-break flags to check before readiness.
                     self.phase = Phase::CheckAfter { rank: self.last };
                     return Ok(Progress::Metadata);
                 }
                 let glyph = self.glyph(spool, rank)?;
                 if !self.range.contains(&glyph.source_utf16_cluster) || glyph.glyph_id == 0 {
+                    // Missing glyphs and records outside certified source
+                    // coverage cannot become a drawable measured prefix.
                     return Err(MarkdownSafeSpoolSliceError::NeedsResolution);
                 }
                 if self.range.start != origin.range.start
@@ -312,7 +357,8 @@ impl MarkdownSafeSpoolSliceJob {
                     && glyph.flags & UNSAFE != 0
                 {
                     return Err(MarkdownSafeSpoolSliceError::NeedsResolution);
-                } // 起点整个cluster的flags均须检查，不能把首glyph的0当作其他glyph的证明。
+                } // Check every glyph flag in the starting cluster; a clear
+                // first-glyph flag cannot certify the remaining records.
                 self.x = self
                     .x
                     .checked_add(i64::from(glyph.x_advance))
@@ -325,6 +371,8 @@ impl MarkdownSafeSpoolSliceJob {
                 Ok(Progress::Read)
             }
             Phase::CheckAfter { rank } => {
+                // UNSAFE_TO_BREAK belongs to the following complete cluster.
+                // Its records may span several bounded turns.
                 if self.range.end == origin.range.end || rank == origin.count {
                     self.phase = Phase::Ready;
                     return Ok(Progress::Metadata);
@@ -337,12 +385,15 @@ impl MarkdownSafeSpoolSliceJob {
                         return Err(MarkdownSafeSpoolSliceError::NeedsResolution);
                     }
                     self.phase = Phase::CheckAfter { rank: rank + 1 };
-                } // 末端属于后继cluster；该cluster很长时持续真实Pending工作，不截取首glyph冒Ready。
+                } // A long following cluster remains unfinished across turns;
+                // inspecting only its first record cannot establish Ready.
                 Ok(Progress::Read)
             }
             Phase::Ready => Ok(Progress::Metadata),
         }
     }
+    /// Spend one finite record budget, yielding on incomplete grapheme data and
+    /// checking original authority again before publishing progress.
     pub fn step(
         &mut self,
         measure: &MarkdownSoftLineMeasureJob,
@@ -354,6 +405,7 @@ impl MarkdownSafeSpoolSliceJob {
         let result = (|| {
             self.guard(measure, current, spool)?;
             if budget == 0 || budget > MARKDOWN_SAFE_SPOOL_SLICE_GLYPHS {
+                // Callers cannot enlarge this job's independent read allowance.
                 return Err(MarkdownSafeSpoolSliceError::InconsistentCoverage);
             }
             let mut glyphs = 0;
@@ -363,10 +415,13 @@ impl MarkdownSafeSpoolSliceJob {
                     Progress::Read => glyphs += 1,
                     Progress::Metadata => {}
                     Progress::Pending => {
+                        // The dependency owner must advance; this job does not
+                        // spin or fabricate a boundary from unknown coverage.
                         pending_dependencies = true;
                         break;
                     }
-                } // 无字形操作的状态转移总数固定；只有真实record读取消耗glyph配额。
+                } // Metadata-only transitions are finite; actual glyph records
+                // consume this turn's read quota.
             }
             self.guard(measure, current, spool)?;
             Ok(MarkdownSafeSpoolSliceStep {
@@ -377,10 +432,12 @@ impl MarkdownSafeSpoolSliceJob {
         })();
         if result.is_err() {
             self.poisoned = true;
+            // A partially accumulated candidate remains unusable permanently.
         }
         result
     }
-    /// 完整核验后消费候选；输出只是借原spool的读票，不新建FD或复制原glyph文件。
+    /// Consume a fully verified candidate into a read ticket for its original
+    /// spool, without opening another descriptor or copying the output file.
     pub fn seal(
         mut self,
         measure: &MarkdownSoftLineMeasureJob,
@@ -389,6 +446,7 @@ impl MarkdownSafeSpoolSliceJob {
     ) -> Result<MarkdownSafeSpoolSlice> {
         self.guard(measure, current, spool)?;
         if !matches!(self.phase, Phase::Ready) {
+            // Numeric ranks alone cannot bypass pending boundary/flag checks.
             return Err(MarkdownSafeSpoolSliceError::NeedsResolution);
         }
         let proof = self
@@ -397,8 +455,10 @@ impl MarkdownSafeSpoolSliceJob {
             .ok_or(MarkdownSafeSpoolSliceError::Poisoned)?;
         let backwards = backwards(&proof.origin);
         let visual = if backwards {
+            // Original RTL logical ranks map to the reverse visual interval.
             proof.origin.count - self.last..proof.origin.count - self.first
         } else {
+            // LTR keeps the same half-open ranks in the original output array.
             self.first..self.last
         };
         Ok(MarkdownSafeSpoolSlice {
@@ -414,11 +474,14 @@ impl MarkdownSafeSpoolSliceJob {
         })
     }
 }
+/// Direction belongs to the captured original spool, not a current font/job.
 fn backwards(origin: &MarkdownSpoolSliceOrigin) -> bool {
     matches!(origin.direction, MarkdownShapingDirection::RightToLeft)
 }
+/// Convert one in-range logical rank without reversing or copying file data.
 fn visual_index(origin: &MarkdownSpoolSliceOrigin, rank: usize) -> Result<usize> {
     if rank >= origin.count {
+        // Reject before RTL subtraction can underflow at or beyond EOF.
         return Err(MarkdownSafeSpoolSliceError::InconsistentCoverage);
     }
     Ok(if backwards(origin) {
@@ -428,7 +491,8 @@ fn visual_index(origin: &MarkdownSpoolSliceOrigin, rank: usize) -> Result<usize>
     })
 }
 
-/// 必须由上面完整job签发；公开Facts不能构造或替换这张具体spool读票。
+/// Only the completed job issues this specific spool ticket. Public coordinate
+/// facts do not construct or replace its original file/line authority.
 pub struct MarkdownSafeSpoolSlice {
     proof: MarkdownMeasuredItemSpoolProof,
     cancellation: MarkdownShapingCancellation,
@@ -437,26 +501,32 @@ pub struct MarkdownSafeSpoolSlice {
 }
 impl MarkdownSafeSpoolSlice {
     #[must_use]
+    /// Copy fixed coordinates while keeping the single-use ticket private.
     pub fn facts(&self) -> MarkdownSafeGlyphSliceFacts {
         self.facts.clone()
     }
+    /// Recheck original file health before cancellation and permanent rejection.
     fn require(&mut self, spool: &mut MarkdownShapedSpool) -> Result<()> {
         let result = (|| {
             spool.require_safe_slice_origin(&self.proof.origin)?;
             self.proof.line.require()?;
             if self.cancellation.requested() {
+                // Original shaping cancellation ends delivery of this output.
                 return Err(MarkdownSafeSpoolSliceError::Cancelled);
             }
             if self.poisoned {
+                // A previously failed read cannot resume through another view.
                 return Err(MarkdownSafeSpoolSliceError::Poisoned);
             }
             Ok(())
         })();
         if result.is_err() {
             self.poisoned = true;
+            // Preserve rejection even if a later call has otherwise live facts.
         }
         result
     }
+    /// Consume the ticket into an exclusive borrow of its actual sealed spool.
     pub fn view(
         mut self,
         spool: &mut MarkdownShapedSpool,
@@ -465,16 +535,20 @@ impl MarkdownSafeSpoolSlice {
         Ok(MarkdownSafeSpoolSliceView { slice: self, spool })
     }
 }
-/// Rust独占借用阻止读取期间close/换掉原文件；没有第二reader owner、映射或FD。
+/// Rust's exclusive borrow prevents closing/replacing the original file during
+/// reads, without creating another reader owner, mapping, or descriptor.
 pub struct MarkdownSafeSpoolSliceView<'a> {
     slice: MarkdownSafeSpoolSlice,
     spool: &'a mut MarkdownShapedSpool,
 }
 impl MarkdownSafeSpoolSliceView<'_> {
     #[must_use]
+    /// Observe the same finite facts while retaining the exclusive spool borrow.
     pub fn facts(&self) -> MarkdownSafeGlyphSliceFacts {
         self.slice.facts()
     }
+    /// Read one complete bounded visual interval. A failure invalidates the
+    /// entire caller buffer and permanently rejects the consumed slice ticket.
     pub fn read_batch(
         &mut self,
         range: Range<usize>,
@@ -488,6 +562,8 @@ impl MarkdownSafeSpoolSliceView<'_> {
                 || range.len() != output.len()
                 || range.len() > MARKDOWN_SAFE_SPOOL_SLICE_GLYPHS
             {
+                // The caller supplies exactly one relative interval and output
+                // span within both certified coverage and the fixed read quota.
                 return Err(MarkdownSafeSpoolSliceError::InconsistentCoverage);
             }
             let origin = &self.slice.proof.origin;
@@ -504,6 +580,8 @@ impl MarkdownSafeSpoolSliceView<'_> {
                 .iter()
                 .any(|glyph| !facts.source_utf16.contains(&glyph.source_utf16_cluster))
             {
+                // The sealed file must still associate every returned glyph
+                // with this same certified source interval.
                 return Err(MarkdownSafeSpoolSliceError::InconsistentCoverage);
             }
             self.slice.require(self.spool)?;
@@ -512,6 +590,6 @@ impl MarkdownSafeSpoolSliceView<'_> {
         if result.is_err() {
             self.slice.poisoned = true;
         }
-        result // Err时output候选全部作废；读取过一部分不构成可交付前缀。
+        result // A partially filled buffer grants no deliverable prefix on Err.
     }
 }

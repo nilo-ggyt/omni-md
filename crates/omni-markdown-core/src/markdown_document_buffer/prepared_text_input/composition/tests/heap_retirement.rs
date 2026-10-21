@@ -1,8 +1,8 @@
-//! 原Heap追加、有限COW与真实历史共用同一Doc；快照各自保原Arc，失败仍走原checkpoint。
+//! Exercise heap append, bounded COW, and real history in one document; snapshots retain original Arcs and failures use the original checkpoint.
 
 use super::*;
 
-/// 长合成文档只读取一个有限片段，期望字符串只描述当前核对位置。
+/// Read one finite fragment of a long synthetic document; the expected string describes only that checked position.
 fn assert_span(document: &MarkdownDocumentBuffer, position: usize, expected: &str) {
     let units: Vec<_> = expected.encode_utf16().collect();
     assert!(units.len() <= 16);
@@ -13,7 +13,7 @@ fn assert_span(document: &MarkdownDocumentBuffer, position: usize, expected: &st
     assert_eq!(&actual[..units.len()], units);
 }
 
-/// 独立旧值也只核有限片段；不能借快照验证给生产增加整篇读取。
+/// Check old snapshots through finite fragments too, without introducing a whole-document product read for validation.
 fn assert_snapshot_span(snapshot: &MarkdownTextSnapshot, position: usize, expected: &str) {
     let units: Vec<_> = expected.encode_utf16().collect();
     assert!(units.len() <= 16);
@@ -25,7 +25,7 @@ fn assert_snapshot_span(snapshot: &MarkdownTextSnapshot, position: usize, expect
 }
 
 #[test]
-/// 连续完整更新的实际Heap与descriptor均不随按键累积；前置普通输入仍有独立Undo。
+/// Repeated full updates keep actual heap storage/descriptors bounded while earlier ordinary input retains its independent Undo.
 fn repeated_full_updates_reuse_two_heap_slots_and_keep_the_pre_composition_prefix_and_history() {
     let (_directory, mut document) = fixture("首尾", 4 * 1024 * 1024);
     document
@@ -58,7 +58,7 @@ fn repeated_full_updates_reuse_two_heap_slots_and_keep_the_pre_composition_prefi
         assert_span(&document, 4, &character.to_string());
         assert_span(&document, 3 + length, &format!("{character}尾"));
         previous = length;
-    } // 输入累计已远超64KiB，真实当前段容量和编号仍只有原前缀加一个候选的至多两段。
+    } // Cumulative input far exceeds 64 KiB, but current capacity/indices still cover only the original prefix and one candidate in at most two segments.
     replace(
         &mut document,
         4..4 + previous,
@@ -83,7 +83,7 @@ fn repeated_full_updates_reuse_two_heap_slots_and_keep_the_pre_composition_prefi
 }
 
 #[test]
-/// 原尾只剩两字节时不能切开emoji；COW保基线前缀，两段旧快照在所有Undo/Redo后仍读旧值。
+/// A two-byte tail cannot split emoji; COW preserves baseline prefix and old two-segment snapshots through Undo/Redo.
 fn scalar_aligned_two_segment_cow_keeps_the_original_prefix_and_existing_snapshot_bytes() {
     let (_directory, mut document) = fixture("首尾", 2 * 1024 * 1024);
     let prefix = EDIT_SEGMENT_BYTES - 2;
@@ -147,7 +147,7 @@ impl MarkdownTextChangeObserver for CandidateLine {
     type Output = usize;
 
     fn changed(&mut self, _: changes::MarkdownTextChange) -> Result<(), Self::Error> {
-        Ok(()) // 真实变化日志仍由原事务记录，本观察者只准备fold使用的实际候选行号。
+        Ok(()) // The original transaction records real changes; this observer prepares only the actual candidate line needed by folding.
     }
 
     fn finish(
@@ -157,14 +157,14 @@ impl MarkdownTextChangeObserver for CandidateLine {
     ) -> Result<usize, Self::Error> {
         let line = candidate.line_for_utf16(after.head_utf16).unwrap();
         if self.reject {
-            return Err("真实候选观察者拒绝"); // 已完成候选实际坐标读取，拒绝仍不能安装COW。
+            return Err("真实候选观察者拒绝"); // Rejection after actual candidate-coordinate reads still must not install COW bytes.
         }
         Ok(line)
     }
 }
 
 #[test]
-/// 观察者读到原追加候选；拒绝、显式取消和丢票排空均恢复原段，成功才安装等价重定位字节。
+/// Observers read original appended candidates; rejection, explicit cancellation, and dropped-ticket draining restore segments before successful COW publication.
 fn heap_cow_observer_rejection_and_both_cancellation_paths_restore_the_original_append_checkpoint()
 {
     let (_directory, mut document) = fixture("首尾", 2 * 1024 * 1024);
@@ -231,7 +231,7 @@ fn heap_cow_observer_rejection_and_both_cancellation_paths_restore_the_original_
 }
 
 #[test]
-/// full→partial→full只重排最新append，旧候选仍被两侧正文使用，不能退掉它们或改旧快照。
+/// Full/partial/full updates rebase only the latest append; retained candidate sides and old snapshots cannot be retired or rewritten.
 fn partial_then_full_update_keeps_the_older_candidate_fragments_and_one_net_history() {
     let (_directory, mut document) = fixture("首尾", 1024 * 1024);
     replace(
@@ -271,7 +271,7 @@ fn partial_then_full_update_keeps_the_older_candidate_fragments_and_one_net_hist
 }
 
 #[test]
-/// Heap与Frozen交接分别消费原物理存储；长候选不复制回Heap，旧快照继续拥有旧有限堆段。
+/// Heap/Frozen transitions retire each actual storage payload; long candidates stay file-backed while old snapshots own their original finite heap segments.
 fn heap_to_frozen_to_heap_retires_each_actual_payload_without_truncating_the_new_frozen_slot() {
     let (_directory, mut document) = fixture("首尾", 2 * 1024 * 1024);
     let small = 8 * 1024;
@@ -319,7 +319,7 @@ fn heap_to_frozen_to_heap_retires_each_actual_payload_without_truncating_the_new
 }
 
 #[test]
-/// 物理候选被替换或删除都不退款原累计append额度，预算失败仍保旧root与实际Heap。
+/// Replacing/deleting physical candidates does not refund cumulative session append bytes; budget failure preserves the original root and heap.
 fn reclaiming_heap_candidates_does_not_refund_the_cumulative_session_edit_budget() {
     let length = 32 * 1024;
     let (_directory, mut document) = fixture("首尾", (length * 3) as u64);
@@ -387,7 +387,7 @@ fn reclaiming_heap_candidates_does_not_refund_the_cumulative_session_edit_budget
 }
 
 #[test]
-/// 原Source在COW准备后真实驱逐失败，publish不安装字节；显式取消仍回退原append并保EIO。
+/// Source reclaim failure after COW preparation prevents byte installation; explicit cancellation rolls back original append while retaining EIO.
 fn original_source_failure_before_publish_does_not_install_the_prepared_heap_cow() {
     let (_directory, mut document) = fixture("首尾", 1024 * 1024);
     let length = 8 * 1024;
@@ -426,7 +426,7 @@ fn original_source_failure_before_publish_does_not_install_the_prepared_heap_cow
     assert!(piece_tree_links_share_root(&document.root, &root));
     assert_eq!(document.storage_profile(), profile);
     assert_eq!(document.selection(), before);
-    assert_eq!(&document.edits.segments[0].as_slice()[..4], b"aaaa"); // 只核此真实Heap首片，不能借失败Doc继续读取Source。
+    assert_eq!(&document.edits.segments[0].as_slice()[..4], b"aaaa"); // Inspect only this actual heap prefix; do not read Source through the failed document.
     assert_eq!(observer.first_errno(), Some(libc::EIO));
     drop(document);
     assert!(observer.unmap_succeeded());

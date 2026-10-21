@@ -1,10 +1,12 @@
-//! 封存后移交原唯一文件的只读入口；不持映射、页面缓存或正文副本。
+//! Read-only access receives the original sealed file without owning a mapping,
+//! a page cache, or a document-text copy.
 
 use std::{fs::File, ops::Range, os::unix::fs::FileExt, sync::Arc};
 
 use super::{Error, LayoutIndexObserver, PAGE, ResourceState, Result, close_file, read_exact_at};
 
-/// 可自然跨线程移交的只读索引；它保留原文件与固定原子收据，不借用构建器。
+/// A transferable reader owns its file and fixed atomic receipts independently
+/// of the builder that issued it.
 pub(crate) struct LayoutIndexReader<const N: usize> {
     file: Option<File>,
     count: usize,
@@ -17,7 +19,8 @@ pub(crate) struct LayoutIndexReader<const N: usize> {
 
 impl<const N: usize> LayoutIndexReader<N> {
     pub(super) fn from_sealed(file: File, count: usize, resources: Arc<ResourceState>) -> Self {
-        // 最终移交的原FD也观察同scope首错；此前发布的prefix仍可能报告实际底层IO故障。
+        // Final file handoff observes this same scope's first failure; an older
+        // prefix can still report an actual underlying I/O failure.
         #[cfg(feature = "paged-shaping-frontier")]
         let upstream = Some(Arc::clone(&resources));
         Self {
@@ -32,6 +35,8 @@ impl<const N: usize> LayoutIndexReader<N> {
     }
 
     #[cfg(feature = "paged-shaping-frontier")]
+    /// Own one real cloned descriptor with a fixed logical prefix EOF and a
+    /// separate close receipt, while observing its original producer's health.
     pub(super) fn from_prefix(file: File, count: usize, upstream: Arc<ResourceState>) -> Self {
         let resources = Arc::new(ResourceState::default());
         resources.file_open.store(true, super::Ordering::Release);
@@ -56,13 +61,15 @@ impl<const N: usize> LayoutIndexReader<N> {
         }
     }
 
+    /// Missing ownership or any prior local/upstream failure ends reading.
     pub(crate) fn healthy(&self) -> Result<()> {
         if self.file.is_none()
             || self.resources.reader_failed.load(super::Ordering::Acquire)
             || self.resources.cleanup_failed.load(super::Ordering::Acquire)
             || self.upstream_has_failed()
         {
-            // 首个失败已经撤销整份输出；后继读取不能把剩余正确记录重新签成完整结果。
+            // First failure revoked the complete output. Remaining correct
+            // records cannot reclassify a later read as a complete publication.
             Err(Error::Poisoned)
         } else {
             Ok(())
@@ -83,13 +90,15 @@ impl<const N: usize> LayoutIndexReader<N> {
         }
     }
 
-    /// 固定 EOF 和 File 均不可变；失败使用原 reader_failed 原子撤权，读者可在锁外共享。
+    /// Fixed EOF and File ownership stay immutable. Atomic rejection allows
+    /// shared reads without holding a lock across I/O.
     pub(crate) fn read(&self, record: usize) -> Result<[u8; N]> {
         self.healthy()?;
         let end = match record.checked_add(1) {
             Some(end) => end,
             None => {
-                // 单记录入口同样不能让坐标溢出绕过永久撤权与资源观察。
+                // A single-record overflow still permanently rejects this
+                // reader and remains visible to its resource observer.
                 self.fail();
                 return Err(Error::Overflow);
             }
@@ -99,9 +108,10 @@ impl<const N: usize> LayoutIndexReader<N> {
         Ok(output)
     }
 
-    /// 一次最多读取256条且不超过16KiB，调用方必须提供恰好覆盖原范围的输出。
+    /// Read at most 256 records and 16 KiB into exactly matching output space.
     ///
-    /// IO错误可能已写入输出前缀；调用方必须丢弃本次完整候选，不能发布部分结果。
+    /// An I/O error may fill a prefix; the caller must discard the whole
+    /// candidate instead of publishing that incomplete output.
     pub(crate) fn read_batch(&self, range: Range<usize>, output: &mut [[u8; N]]) -> Result<()> {
         self.healthy()?;
         let result = self.read_batch_inner(range, output);
@@ -112,14 +122,17 @@ impl<const N: usize> LayoutIndexReader<N> {
             upstream
                 .producer_failed
                 .store(true, super::Ordering::Release);
-        } // 真实底层文件失败影响同inode的所有前缀；调用者无效范围只撤销其自己的Reader。
+        } // Actual file I/O failure affects every prefix on the same inode.
+        // Invalid caller coordinates revoke only their own reader.
         if result.is_err() {
-            // 校验失败与真实IO失败都撤销原只读输出权限；原cause仍由本次Result返回。
+            // Both invalid input and I/O failure end this reader's authority;
+            // the current Result still carries its original cause.
             self.fail();
         }
         result
     }
 
+    /// Validate the complete fixed interval before the first positioned read.
     fn read_batch_inner(&self, range: Range<usize>, output: &mut [[u8; N]]) -> Result<()> {
         let records = range
             .end
@@ -128,7 +141,8 @@ impl<const N: usize> LayoutIndexReader<N> {
             .ok_or(Error::InvalidRecord)?;
         let bytes = records.checked_mul(N).ok_or(Error::Overflow)?;
         if range.end > self.count || bytes > PAGE {
-            // 上限约束是本次真实读取预算；不能截短范围后伪称整个调用已经完成。
+            // This limit is the actual read budget; shortening the request
+            // cannot count as completing the original call.
             return Err(Error::InvalidRecord);
         }
         let start = range.start.checked_mul(N).ok_or(Error::Overflow)?;
@@ -137,31 +151,39 @@ impl<const N: usize> LayoutIndexReader<N> {
             .checked_add(u64::try_from(bytes).map_err(|_| Error::Overflow)?)
             .ok_or(Error::Overflow)?;
         let file = self.file.as_ref().ok_or(Error::Poisoned)?;
-        // 同构建器固定record读取共用完整区间协议；失败仍由外层撤销整份Reader并保首因。
+        // Reuse the builder's exact-extent protocol. The outer boundary rejects
+        // this whole reader on failure while returning the actual first cause.
         read_exact_at(output.as_flattened_mut(), offset, |output, position| {
             file.read_at(output, position)
         })
     }
 
+    /// Revoke this reader without modifying or closing another reader's FD.
     fn fail(&self) {
         self.resources
             .reader_failed
             .store(true, super::Ordering::Release);
     }
 
+    /// Return the owned descriptor once, settling a prefix reservation only
+    /// after an actual successful close.
     fn close_resources(&mut self) -> Result<()> {
         if let Some(file) = self.file.take() {
-            // close_file执行原唯一FD的真实close；不创建第二File，也不在失败后猜测FD可重试。
+            // close_file performs the actual unique close; it creates no second
+            // File and never retries a possibly reused descriptor number.
             let closed = close_file(file, &self.resources);
             #[cfg(feature = "paged-shaping-frontier")]
             if let Some(upstream) = &self.upstream {
                 if closed.is_ok() && self.prefix_claim {
+                    // Only this prefix's proven successful close returns its
+                    // publication slot to the original producer.
                     upstream
                         .prefix_readers
                         .fetch_sub(1, super::Ordering::AcqRel);
                     self.prefix_claim = false;
                 } else if closed.is_err() {
-                    // 旧前缀退出后仍由原索引收据保留真实 close 失败，后继出版物不能洗掉它。
+                    // Keep an old prefix's real close failure in original
+                    // receipts so subsequent publication cannot erase it.
                     upstream
                         .cleanup_failed
                         .store(true, super::Ordering::Release);
@@ -169,7 +191,8 @@ impl<const N: usize> LayoutIndexReader<N> {
                         .producer_failed
                         .store(true, super::Ordering::Release);
                 }
-            } // 只有真实close成功才归还名额；失败保留负面计数，不能据此再开新FD。
+            } // Unknown close outcomes retain their negative reservation and
+            // cannot authorize opening another prefix descriptor.
             closed?;
         }
         if self.resources.cleanup_failed.load(super::Ordering::Acquire) {
@@ -179,11 +202,14 @@ impl<const N: usize> LayoutIndexReader<N> {
         }
     }
 
+    /// Consume the reader and return its resources while retaining any earlier
+    /// read/upstream failure as a separate negative operation outcome.
     pub(crate) fn close(mut self) -> Result<()> {
         self.close_resources()?;
         if self.resources.reader_failed.load(super::Ordering::Acquire) || self.upstream_has_failed()
         {
-            // 资源已真实归还仍不能洗掉先前的读取失败；观察者可分别核对IO与清理事实。
+            // Real resource return cannot erase a previous read failure;
+            // observers distinguish the I/O result from cleanup facts.
             Err(Error::Poisoned)
         } else {
             Ok(())
@@ -193,7 +219,8 @@ impl<const N: usize> LayoutIndexReader<N> {
 
 impl<const N: usize> Drop for LayoutIndexReader<N> {
     fn drop(&mut self) {
-        // 只补偿尚未归还的唯一FD；读取撤权本身不冒充内核close失败。
+        // Settle only an as-yet-owned FD. Read rejection alone does not claim
+        // that its actual kernel close failed.
         if self.close_resources().is_err() {
             self.resources
                 .cleanup_failed
