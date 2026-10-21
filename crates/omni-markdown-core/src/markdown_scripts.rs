@@ -1,8 +1,12 @@
-//! Unicode18脚本run的有限扫描；正文窗口不构成段落、字素或脚本边界。
+//! Bounded Unicode 18 script itemization; a source window is not a paragraph,
+//! grapheme, or script boundary.
 //!
-//! 策略明确采用cluster首个specific脚本的完整SCX、Common/Inherited上下文、实际配对
-//! 括号的外层脚本。候选仍有多个时依次取兼容前run、primary、稳定ISO tag序；它不是
-//! Unicode规定的唯一itemization。字体、UBA level与宽度另在下游相交，不在此猜测。
+//! This policy takes the full SCX of a cluster's first specific base, resolves
+//! Common/Inherited through context, and gives actual paired brackets the outer
+//! script. Remaining candidates prefer a compatible preceding run, then the
+//! primary script, then stable ISO tag order. Unicode does not mandate this one
+//! itemization policy. Downstream composition intersects fonts, UBA levels, and
+//! width; this stage does not infer those boundaries.
 use crate::{
     MarkdownDocumentBufferError, MarkdownLayoutTextAuthority, MarkdownLayoutTextSource,
     MarkdownLayoutTextSourceObserver, markdown_layout_index::LayoutIndexObserver,
@@ -39,7 +43,8 @@ pub const MARKDOWN_SCRIPT_INDEX_BYTES: usize =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MarkdownScript(u8);
 impl MarkdownScript {
-    /// 返回规范ISO15924 tag；调用shaper时可用其公开tag构造器，不暴露vendor内部序号。
+    /// Exposes the ISO 15924 tag for a shaper's public tag constructor without
+    /// making the generated table's internal ordinal part of that API.
     pub fn iso15924_tag(self) -> [u8; 4] {
         unicode_data::TAGS[usize::from(self.0)]
     }
@@ -118,7 +123,9 @@ pub enum MarkdownScriptError {
 }
 type Result<T> = std::result::Result<T, MarkdownScriptError>;
 
-/// record写入和固定metadata操作分别计费；深括号栈可以跨step继续，不能截断为32层。
+/// Source bytes, decoded scalars, record writes, and fixed metadata operations
+/// have separate quotas. Deep bracket stacks resume across steps instead of
+/// silently truncating nesting at an arbitrary depth.
 #[derive(Clone, Copy, Debug)]
 pub struct MarkdownScriptBudget {
     pub bytes: usize,
@@ -151,7 +158,8 @@ pub struct MarkdownScriptStorageProfile {
     pub source_utf16: usize,
     pub source_bytes_read: usize,
     pub source_borrow_max_bytes: usize,
-    /// 只表示消费原整源精确摘要；不把跳过的扫描计入source_bytes_read。
+    /// Identifies the exact original-source summary path. Skipped source bytes
+    /// are not reported as reads in `source_bytes_read`.
     pub printable_summary_used: bool,
     pub completed_runs: usize,
     pub bracket_records: usize,
@@ -172,7 +180,8 @@ pub struct MarkdownScriptResourceSnapshot {
     pub mapped_bytes: usize,
     pub run_peak_mapped_bytes: usize,
     pub stack_peak_mapped_bytes: usize,
-    /// 两个独立索引的实际工作buffer合计；各自峰值不冒充同一时刻的进程峰值。
+    /// Current working buffers of the two independent indexes. Their individual
+    /// peaks do not establish a simultaneous peak or a process RSS measurement.
     pub buffer_bytes: usize,
     pub run_peak_buffer_bytes: usize,
     pub stack_peak_buffer_bytes: usize,
@@ -198,6 +207,9 @@ impl MarkdownScriptResourceObserver {
     }
 }
 
+/// Owns the frozen source and both metadata indexes. The retained authority
+/// identifies this capture; every public operation rechecks its permission and
+/// the source's sticky health before publishing cached or newly computed facts.
 pub struct MarkdownScriptJob {
     store: store::Store,
     machine: machine::Machine,
@@ -218,7 +230,8 @@ pub struct MarkdownScriptJob {
     printable: Option<printable::Preparation>,
 }
 impl MarkdownScriptJob {
-    /// 仅绑定原Source与Weak权限并创建有限metadata owner，不在构造时扫描正文。
+    /// Binds the original source and weak authority and creates bounded metadata
+    /// owners. Construction does not scan the body.
     pub fn new(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
@@ -227,7 +240,8 @@ impl MarkdownScriptJob {
         Self::create(source, authority, cancellation, true)
     }
 
-    /// 测试差分和故障注入始终可执行原Machine，不能让新快路替换其语义oracle。
+    /// Keeps the original scalar machine available for differential and failure
+    /// tests; the optimized path must not replace its own semantic oracle.
     #[cfg(test)]
     fn new_streaming(
         source: MarkdownLayoutTextSource,
@@ -247,22 +261,23 @@ impl MarkdownScriptJob {
         if !source.permits(authority) {
             return Err(MarkdownScriptError::SourceMismatch);
         }
-        cancellation.check()?; // 取消/外来身份在任何匿名FD创建前拒绝。
+        cancellation.check()?; // Reject cancellation or foreign identity before creating anonymous FDs.
         #[cfg(feature = "paged-shaping-frontier")]
         let printable = if use_summary {
-            // 原Source完整root的精确事实不借正文；没有证明则完整保留原Machine。
+            // Exact facts of the original full root need no body lease. Without
+            // that proof the complete original machine remains responsible.
             printable::Preparation::capture(&source)?
         } else {
-            None // 仅测试构造会关闭摘要，产品入口统一使用同一可验证选择。
+            None // Only the test constructor disables the production summary choice.
         };
         #[cfg(not(feature = "paged-shaping-frontier"))]
-        let _ = use_summary; // 未启用新布局功能时两入口均保持原逐scalar流程。
+        let _ = use_summary; // Without the frontier feature, both constructors use scalar scanning.
         source.health()?;
         cancellation.check()?;
         let store = store::Store::new(&cancellation);
         source.health()?;
         let store = store?;
-        cancellation.check()?; // 构造期间的真实源错误优先，已取消候选不会作为活job返回。
+        cancellation.check()?; // Source failure wins during construction; cancelled candidates are not returned live.
         Ok(Self {
             store,
             machine: machine::Machine::default(),
@@ -284,7 +299,7 @@ impl MarkdownScriptJob {
         })
     }
     fn guard(&self, authority: &MarkdownLayoutTextAuthority) -> Result<()> {
-        self.source.health()?; // 源的真实errno优先于旧metadata或取消，命中不能绕过sticky状态。
+        self.source.health()?; // The source's real errno precedes metadata or cancellation, even on a cache hit.
         if self.cancelled {
             return Err(MarkdownScriptError::Cancelled);
         }
@@ -297,6 +312,8 @@ impl MarkdownScriptJob {
         self.cancellation.check()
     }
     fn fail(&mut self, error: &MarkdownScriptError) {
+        // A table query needs its cell's display source; that local range refusal
+        // does not invalidate already authorized runs outside the table.
         if matches!(error, MarkdownScriptError::TableRange) {
             return;
         }
@@ -315,7 +332,8 @@ impl MarkdownScriptJob {
         }
         if budget.bytes == 0 || budget.scalars == 0 || budget.records == 0 || budget.stack_ops == 0
         {
-            // 零配额是调用错误；不能造一个永远没有工作量的Pending要求重试。
+            // A zero quota is a caller error, not a Pending result that can ask
+            // the caller to retry forever without making progress.
             self.fail(&MarkdownScriptError::InvalidBudget);
             return Err(MarkdownScriptError::InvalidBudget);
         }
@@ -326,7 +344,7 @@ impl MarkdownScriptJob {
                 self.guard(authority)?;
                 Ok(step)
             }),
-        }; // metadata失败/取消出口也核真实源，不能由短路掩盖同时已确认的底层errno。
+        }; // Recheck source health even on metadata failure or cancellation; preserve its first known errno.
         if let Err(error) = &result {
             self.fail(error);
         }
@@ -356,8 +374,10 @@ impl MarkdownScriptJob {
         }
         #[cfg(feature = "paged-shaping-frontier")]
         if let Some(preparation) = &mut self.printable {
-            // 原Preparation同时负责完整摘要与上下文后缀。后者的边叶和目录也付本量子配额，
-            // 不把聚合跳过的正文计入实际读取，Store未真实封存绝不能发布Ready。
+            // The same preparation owns a whole-root summary or a contextual
+            // suffix proof. Boundary-leaf reads and directory work consume this
+            // quantum's quotas. Aggregate skips are not reads, and Ready requires
+            // the actual store to finish sealing.
             let result = preparation.advance(
                 &self.source,
                 &mut self.source_borrow_max,
@@ -381,12 +401,13 @@ impl MarkdownScriptJob {
                         .advance_proven_ascii(run.end_byte, run.end_utf16);
                     self.completed_ascii_suffix = Some((run.start_utf16..run.end_utf16, true));
                     self.printable = None;
-                } // 仍为Pending；下一原量子必须实际消费B/CRLF，不能把范围证明冒充已闭run。
+                } // Remain Pending: the original machine must still consume B/CRLF and close the run.
                 printable::Progress::Pending => {}
             }
             return Ok(step);
         }
-        // 先完成上次暂停的配对/记录阶段；不为了推进metadata而多读正文。
+        // Finish suspended pairing or record work before borrowing more source;
+        // metadata progress must not cause additional body reads.
         if !self
             .machine
             .pump(&mut self.store, &mut step, budget, false)?
@@ -437,7 +458,7 @@ impl MarkdownScriptJob {
             Ok(())
         });
         self.source_bytes_read += step.bytes;
-        self.source.health()?; // 回调哨兵不能吞掉真实lease归还失败或其他reader撤权。
+        self.source.health()?; // The callback sentinel must not hide lease-return failure or another reader's revocation.
         match result {
             Ok(()) => {}
             Err(MarkdownDocumentBufferError::RangeOutsideDocument)
@@ -449,6 +470,8 @@ impl MarkdownScriptJob {
         }
         self.cancellation.check()?;
         if self.machine.byte == self.source.byte_len() {
+            // Only the original source endpoint permits EOF finalization. A
+            // window edge cannot close an incomplete UTF-8 scalar or script run.
             if !self.machine.complete_utf8(self.source.utf16_len()) {
                 return Err(MarkdownScriptError::InvalidUtf8);
             }
@@ -460,7 +483,8 @@ impl MarkdownScriptJob {
         }
         Ok(step)
     }
-    /// 只消费同源真实B正文末端或EOF；有限准备额度不构成Script边界。
+    /// Requests proof only up to an original-source B content endpoint or EOF.
+    /// A bounded preparation quantum does not establish a script boundary.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn prepare_ascii_suffix(
         &mut self,
@@ -473,18 +497,18 @@ impl MarkdownScriptJob {
             self.guard(authority)?;
             if content_end > paragraph_end || paragraph_end > self.source.utf16_len() {
                 return Err(MarkdownScriptError::InvalidRange);
-            } // 真实同源范围不能倒置或超出原Source；错误不夹取为可用证明。
+            } // Reject inverted or out-of-source endpoints instead of clamping them into usable proof.
             if let Some(preparation) = &self.printable {
                 return Ok(preparation
                     .range()
                     .is_some_and(|range| range.end == content_end && range.contains(&position)));
-            } // 原Preparation尚在证明或封存；只能继续它实际覆盖的原范围。
+            } // An in-flight proof or seal can serve only its actual original range.
             if let Some((range, positive)) = &self.completed_ascii_suffix
                 && range.end == content_end
                 && range.contains(&position)
             {
                 return Ok(*positive);
-            } // 真反例不重试；正结果仍等待原B消费，不能反复证明而饿死自然闭合步骤。
+            } // Reuse a real counterexample or positive proof; repeated proof must not starve B consumption.
             if self.machine.ready {
                 return Ok(false);
             }
@@ -495,7 +519,7 @@ impl MarkdownScriptJob {
                 && self.source.byte_len() - run.start_byte != content_end - run.start_utf16
             {
                 self.completed_ascii_suffix = Some((run.start_utf16..content_end, false));
-                return Ok(false); // 只有真EOF有完整byte长度；非EOF不能同步转换端点或读取整段。
+                return Ok(false); // Only EOF supplies this byte extent; non-EOF proof must not synchronously read the paragraph.
             }
             self.printable = Some(printable::Preparation::suffix(
                 &self.source,
@@ -528,7 +552,7 @@ impl MarkdownScriptJob {
         #[cfg(feature = "paged-line-compose")]
         if folds::hidden(self, unit, offset) {
             return Err(MarkdownScriptError::FoldedRange);
-        } // 真实 Source 首错已核；隐藏查询不代表任务损坏，不撤销仍有效的可见 run。
+        } // Source health was checked first; hidden-range refusal leaves valid visible runs authorized.
         let result = self.find_run(unit, offset);
         let result = match self.source.health() {
             Err(error) => Err(error.into()),
@@ -554,7 +578,7 @@ impl MarkdownScriptJob {
         #[cfg(feature = "paged-line-compose")]
         if folds::hidden(self, unit, offset) {
             return Err(MarkdownScriptError::FoldedRange);
-        } // 稳定前缀也不能绕过 run_at 的隐藏权限，把后继脚本误授给未分析正文。
+        } // Stable-prefix queries must also respect hidden ranges, rather than assign following script to unanalyzed text.
         let end = match unit {
             MarkdownScriptUnit::Byte => self.source.byte_len(),
             MarkdownScriptUnit::Utf16 => self.source.utf16_len(),
@@ -562,7 +586,8 @@ impl MarkdownScriptJob {
         if offset > end {
             return Err(MarkdownScriptError::InvalidRange);
         }
-        // 只对连续已完成run做二分；当前候选即使已有primary仍不是已发布完整run。
+        // Search only contiguous completed runs. A current candidate with a
+        // primary script is still not a published complete run.
         let position = |run: MarkdownScriptRun| match unit {
             MarkdownScriptUnit::Byte => run.end_byte,
             MarkdownScriptUnit::Utf16 => run.end_utf16,
@@ -574,15 +599,17 @@ impl MarkdownScriptJob {
         if let Some(page) = self.store.run_append_page()?
             && !page.is_empty()
         {
-            // 原追加页的首条完整run已经实际写入。根据它的真实末端，可把前向查询
-            // 限在这个已初始化范围；旧区域仍走原FD，不能用当前候选或页容量补覆盖。
+            // The append page's first complete run is already written. Its real
+            // endpoint can narrow forward queries to initialized records. Older
+            // records still use the original FD; neither capacity nor a pending
+            // candidate supplies additional coverage.
             let first = self.store.run(page.start)?;
             if position(first) <= offset {
                 low = page.start + 1;
                 high = page.end;
             } else {
                 high = page.start;
-                following = Some(first); // 旧区全部在offset左侧时，页首本身仍可能是目标run。
+                following = Some(first); // If all older runs end before the query, this first run remains the answer.
             }
         }
         while low < high {
@@ -596,12 +623,15 @@ impl MarkdownScriptJob {
             }
         }
         if low < count {
-            // 本次upper_bound已经完整解码了最终run；只保本栈Copy结果，不再读取同一
-            // 记录，也不跨query存续。相等末端仍属于后一run，原byte/UTF16语义不变。
+            // This upper-bound search already decoded the answer. Reuse only
+            // that stack-local Copy value, without rereading or retaining it
+            // across queries. An equal endpoint still belongs to the next run
+            // in both byte and UTF-16 coordinates.
             let run = following.ok_or(MarkdownScriptError::CorruptMetadata)?;
             return Ok(MarkdownScriptAnswer::Known(Some(run)));
         }
-        // 未读后继和未闭合run不能通过空结果冒充已知不存在；只有真EOF授予Known(None)。
+        // Unread successors and open runs remain Pending. Only actual EOF grants
+        // Known(None); an empty published prefix is not proof of absence.
         Ok(if self.machine.ready {
             MarkdownScriptAnswer::Known(None)
         } else {
@@ -637,7 +667,8 @@ impl MarkdownScriptJob {
         }
     }
     pub fn close(mut self) -> Result<()> {
-        // 不因取消跳过清理；两个真实owner都尝试close，之后字段析构交还原Source。
+        // Cancellation does not skip cleanup. Both real index owners attempt
+        // close; field destruction then relinquishes the original source.
         self.store.close()
     }
 }
@@ -648,11 +679,13 @@ impl MarkdownScriptJob {
     feature = "paged-shaping-frontier"
 ))]
 impl MarkdownScriptJob {
-    /// 原 SCX 游标真正越过行尾才可恢复后继正文，已读取字节总量不代表这个事实。
+    /// Resumes following text only after the actual SCX cursor reaches the row
+    /// endpoint; cumulative bytes read do not establish that position.
     pub(crate) fn table_passed(&self, end: usize) -> bool {
         self.machine.utf16 >= end
     }
-    /// 新行结构撤销可能跨该行的原 suffix 试次，后继 job 仍沿原预算和同一 Source 前进。
+    /// A newly announced row invalidates a suffix attempt that might cross it.
+    /// Subsequent work retains the same source and original step quotas.
     pub(crate) fn table_announced(&mut self) {
         self.printable = None;
         self.completed_ascii_suffix = None;

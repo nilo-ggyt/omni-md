@@ -1,4 +1,5 @@
-//! 稳定记录和独立GB2事实分开验证；非BMP/组合字不由UTF16差值推算ordinal。
+//! Verify stable records separately from the independent GB2 endpoint; UTF-16 differences do
+//! not determine ordinals for non-BMP scalars or combining sequences.
 use super::*;
 
 const ONE: MarkdownGraphemeBudget = MarkdownGraphemeBudget {
@@ -18,6 +19,7 @@ fn fixture(
     crate::MarkdownDocumentBuffer,
     MarkdownLayoutTextSource,
 ) {
+    // Own an isolated actual file and document, then capture their immutable layout source.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("真实字素前缀.md");
     std::fs::write(&path, text).unwrap();
@@ -28,6 +30,8 @@ fn fixture(
 
 #[test]
 fn gb2_exists_before_scanning_but_never_creates_a_record_ordinal_or_next_cluster() {
+    // Immutable source extent proves its GB2 coordinate before any paged records exist.
+    // That fact must leave unknown records and strict neighbors pending and output unchanged.
     let (_directory, _document, source) = fixture("中文𠮷");
     let authority = source.authority();
     let mut job = MarkdownGraphemeJob::new_paged(source.clone()).unwrap();
@@ -80,9 +84,9 @@ fn gb2_exists_before_scanning_but_never_creates_a_record_ordinal_or_next_cluster
 
 #[test]
 fn paged_mixed_unicode_queries_keep_strict_neighbors_and_pending_prefix() {
-    // 固定字面明确声明÷中÷𠮷÷A×COMBINING ACUTE÷；每组10B、5个UTF16单元。
-    // 两份短样本分别保留半页尾部、恰好整页尾部；写入中和封存后均查真实页间邻居。
-    // 期望始终来自字面字素规则，不读取待测索引，也不按其record布局生成结果。
+    // The literal declares breaks around the CJK scalar, non-BMP scalar, and A plus acute:
+    // each group has 10 bytes and 5 UTF-16 units. Two finite lengths leave partial/full
+    // final pages. Expectations come from those explicit rules, not the index under test.
     for groups in [400, 1365] {
         let text = "中𠮷A\u{301}".repeat(groups);
         let (directory, document, source) = fixture(&text);
@@ -105,12 +109,12 @@ fn paged_mixed_unicode_queries_keep_strict_neighbors_and_pending_prefix() {
             )
             .unwrap(),
             MarkdownGraphemeAnswer::Pending,
-        ); // 尚未开始读取，不能从空追加区间伪造首个完整字素。
+        ); // An empty append range before scanning cannot certify the first complete grapheme.
         for _ in 0..14 {
             job.step(&authority, quantum).unwrap();
         }
         assert!(!job.is_ready());
-        assert!(resources.snapshot().metadata_file_open); // 已实际换页取得FD，尚有未分类尾部。
+        assert!(resources.snapshot().metadata_file_open); // A real page transition acquired the FD while the tail remains unknown.
         for (unit, offset) in [
             (MarkdownGraphemeUnit::Byte, text.len()),
             (MarkdownGraphemeUnit::Utf16, groups * 5),
@@ -122,7 +126,7 @@ fn paged_mixed_unicode_queries_keep_strict_neighbors_and_pending_prefix() {
                 assert_eq!(
                     job.query(&authority, unit, offset, query).unwrap(),
                     MarkdownGraphemeAnswer::Pending,
-                ); // EOF长度事实不能替未知尾部签IsBoundary或严格Previous。
+                ); // Known source length cannot classify the unscanned tail or its strict predecessor.
             }
         }
         let mut expected = Vec::with_capacity(groups * 3 + 1);
@@ -159,8 +163,9 @@ fn paged_mixed_unicode_queries_keep_strict_neighbors_and_pending_prefix() {
                     MarkdownGraphemeUnit::Byte => boundary.byte,
                     MarkdownGraphemeUnit::Utf16 => boundary.utf16,
                 };
-                // 已分类前缀在3500B之前；封存后另查后段与EOF。两阶段都包含页首、页首
-                // 前一记录及其内部坐标，严格Previous/Next不能被当前页首替代或漏掉。
+                // The classified prefix ends before 3500 bytes; after sealing also inspect the
+                // far tail and EOF. Both phases query page starts, preceding records, and
+                // interior coordinates so strict neighbors cannot be replaced by the page head.
                 for block in [0, 170, 341, 349, 1023, 1024, groups - 1]
                     .into_iter()
                     .filter(|&block| block < groups && (complete || block <= 349))
@@ -196,12 +201,15 @@ fn paged_mixed_unicode_queries_keep_strict_neighbors_and_pending_prefix() {
                 }
             }
         }
-        // 只读查询既不修改原Doc，也不写用户内容；磁盘对照仅针对上方有界固定fixture。
+        // Queries leave the original document and file unchanged. This disk comparison
+        // concerns only the explicitly bounded, isolated fixture created above.
         assert_eq!(document.generation(), 0);
         assert_eq!(
             std::fs::read(directory.path().join("真实字素前缀.md")).unwrap(),
             text.as_bytes()
         );
+        // Close the real index first, then release the remaining source/document owners
+        // before checking actual original-backing unmap completion.
         job.close().unwrap();
         let closed = resources.snapshot();
         assert!(
@@ -226,9 +234,11 @@ fn every_quota_one_prefix_matches_explicit_non_bmp_combining_oracle_and_real_eof
         MarkdownGraphemeBoundary { byte: 3, utf16: 1 },
         MarkdownGraphemeBoundary { byte: 7, utf16: 3 },
         MarkdownGraphemeBoundary { byte: 10, utf16: 5 },
-    ]; // 明确÷中÷𠮷÷A×COMBINING ACUTE÷，不把同一个DFA作为唯一oracle。
+    ]; // Explicit CJK/non-BMP/A-plus-acute boundaries are independent of the DFA under test.
     let mut job = MarkdownGraphemeJob::new_paged(source.clone()).unwrap();
     let mut completed = false;
+    // Every one-unit quantum may leave UTF-8 or rule state incomplete, but the stable
+    // prefix must contain only the already committed leading portion of this oracle.
     for _ in 0..32 {
         let step = job.step(&authority, ONE).unwrap();
         assert!(step.bytes <= 1 && step.scalars <= 1 && step.records <= 1);
@@ -276,6 +286,8 @@ fn every_quota_one_prefix_matches_explicit_non_bmp_combining_oracle_and_real_eof
 
 #[test]
 fn giant_cluster_retains_only_the_start_record_and_pending_next_despite_known_gb2() {
+    // The source endpoint is known independently, yet this long combining cluster has
+    // no committed successor until the original machine reaches its actual end.
     let text = format!("A{}", "\u{301}".repeat(4096));
     let (_directory, _document, source) = fixture(&text);
     let authority = source.authority();
@@ -311,6 +323,8 @@ fn giant_cluster_retains_only_the_start_record_and_pending_next_despite_known_gb
 
 #[test]
 fn prefix_batches_are_real_records_and_empty_source_has_one_final_boundary() {
+    // A prefix read consumes actual original records without scanning more text. The
+    // public 256-record cap rejects a larger batch and permanently revokes this job.
     let (_directory, _document, source) = fixture(&"中".repeat(400));
     let authority = source.authority();
     let mut job = MarkdownGraphemeJob::new_paged(source.clone()).unwrap();
@@ -345,6 +359,8 @@ fn prefix_batches_are_real_records_and_empty_source_has_one_final_boundary() {
         Err(MarkdownGraphemeError::Poisoned)
     ));
 
+    // Empty Paged input initially has GB2 coordinates but no record; only an actual
+    // finish publishes its one shared BOF/EOF boundary and complete total.
     let (_empty_directory, _empty_document, empty) = fixture("");
     let authority = empty.authority();
     let mut job = MarkdownGraphemeJob::new_paged(empty).unwrap();
@@ -372,6 +388,8 @@ fn prefix_batches_are_real_records_and_empty_source_has_one_final_boundary() {
 
 #[test]
 fn borrowed_prefix_still_observes_real_source_failure_and_releases_original_fd_and_map() {
+    // A live prefix borrow retains the original authority checks. Reclaim failure is
+    // visible through both cached facts and GB2, and takes precedence over cancellation.
     let (_directory, document, source) = fixture("中文𠮷");
     let authority = source.authority();
     let backing = source.original_backing_observer().unwrap();
@@ -410,6 +428,8 @@ fn borrowed_prefix_still_observes_real_source_failure_and_releases_original_fd_a
             MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
         ))
     ));
+    // Releasing the prefix and job returns metadata independently of the external source
+    // owners; only dropping those last owners completes the original source unmap.
     drop(job);
     let closed = resources.snapshot();
     assert!(
@@ -425,6 +445,8 @@ fn borrowed_prefix_still_observes_real_source_failure_and_releases_original_fd_a
 
 #[test]
 fn foreign_authority_and_cancel_never_reborrow_a_known_prefix() {
+    // Equal text in another capture cannot authorize this prefix, and valid original
+    // authority cannot revive a job already revoked by mismatch or cancellation.
     let (_directory, _document, source) = fixture("中文");
     let (_foreign_directory, _foreign_document, foreign) = fixture("中文");
     let mut job = MarkdownGraphemeJob::new_paged(source.clone()).unwrap();

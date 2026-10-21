@@ -1,4 +1,4 @@
-// Unicode18官方数据生成；来源与精确SHA由tools/generate-line-break-data.py固定，许可见LICENSE-UNICODE。
+// Generated from Unicode 18 official data pinned by tools/generate-line-break-data.py; see LICENSE-UNICODE.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Class {
     Ai,
@@ -4070,6 +4070,7 @@ pub(crate) static RANGES: &[(u32, u32, Class, u8)] = &[
     (0x100000, 0x10FFFD, Xx, 0),
     (0x10FFFE, 0x10FFFF, Xx, 8),
 ];
+// Inclusive, disjoint ranges cover every scalar; lookup needs no runtime UCD or document cache.
 pub(crate) fn properties(value: char) -> (Class, u8) {
     let value = u32::from(value);
     let index = RANGES.partition_point(|(_, end, _, _)| *end < value);

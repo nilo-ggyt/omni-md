@@ -1,11 +1,11 @@
-//! 完整字符串只属于有限合成oracle；大样本按固定块写文件，不建立产品全文数组。
+//! Complete strings belong only to finite synthetic oracles; large fixtures are written in fixed chunks without constructing a product whole-text array.
 
 use super::*;
 use crate::MarkdownDocumentBuffer;
 use unicode_bidi::utf16::BidiInfo;
 
 #[cfg(feature = "paged-layout-breaks")]
-/// 先真实借入一页，再在公开测试驱逐点制造I/O失败；归还pin本身不代表msync发生。
+/// Read an actual page before using the existing test reclaim failure seam; returning a pin alone does not prove msync occurred.
 fn poison_original_read_windows(document: &MarkdownDocumentBuffer) {
     document
         .text_snapshot()
@@ -17,10 +17,11 @@ fn poison_original_read_windows(document: &MarkdownDocumentBuffer) {
         Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(
             libc::EIO
         ))
-    ); // 只有真实无pin页回收已失败，后继算法才应观察同一个永久源错误。
+    ); // Only after actual unpinned-page reclamation fails should later algorithms observe this same permanent Source error.
 }
 
 fn fixture(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+    // Only this private synthetic file enters the actual document/mmap implementation; the TempDir owns its fixture path.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("bidi.md");
     std::fs::write(&path, source).unwrap();
@@ -30,6 +31,7 @@ fn fixture(source: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
 
 #[test]
 fn production_resource_observer_distinguishes_uniform_from_paged_and_keeps_neither_alive() {
+    // Compare actual resource paths: Uniform owns no metadata file, while the original analysis still holds Source until its last owner drops.
     for (text, paged) in [("ASCII A123", false), ("אב😀 A123", true)] {
         let (_directory, document) = fixture(text);
         let mapping = document.original_backing_observer().unwrap();
@@ -44,10 +46,10 @@ fn production_resource_observer_distinguishes_uniform_from_paged_and_keeps_neith
         let before = observer.snapshot();
         assert_eq!(before.file_created, paged);
         assert_eq!(before.file_open, paged);
-        assert!(!before.close_succeeded); // Uniform无FD，不伪造close成功；Paged活着也不能提前签归还。
+        assert!(!before.close_succeeded); // Uniform has no FD to close; a live Paged owner cannot report premature release either.
         assert_eq!(before.cache_bytes, if paged { 65536 } else { 0 });
         drop(document);
-        assert!(mapping.mapped_bytes() > 0); // 分析对象仍拥有原冻结Source，原子观察者不替它解除所有权。
+        assert!(mapping.mapped_bytes() > 0); // Analysis still owns the original frozen Source; an atomic observer does not release that ownership.
         drop(analyzed);
         let after = observer.snapshot();
         assert!(!after.file_open && after.close_succeeded == paged);
@@ -60,6 +62,7 @@ fn production_resource_observer_distinguishes_uniform_from_paged_and_keeps_neith
 #[cfg(feature = "paged-line-compose")]
 #[test]
 fn observed_analysis_returns_the_actual_constructor_cleanup_receipt_after_cancellation() {
+    // Keep the existing first-page barrier on the real worker, then cancel/resume and join before checking actual constructor cleanup.
     let (_directory, document) = fixture("אב😀 A123");
     let source = crate::MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -78,7 +81,7 @@ fn observed_analysis_returns_the_actual_constructor_cleanup_receipt_after_cancel
             &worker_cancel,
         )
     });
-    gate.entered.wait(); // 只有真实FD与第一份16KiB页都已存在才继续，不按延时猜构造进度。
+    gate.entered.wait(); // Continue only after the actual FD and first 16-KiB page exist, without a delay-based progress guess.
     let original = gate.file.lock().unwrap().as_ref().unwrap().clone();
     let live = original.snapshot();
     assert!(live.file_created && live.file_open && !live.close_succeeded);
@@ -99,6 +102,7 @@ fn observed_analysis_returns_the_actual_constructor_cleanup_receipt_after_cancel
 #[cfg(feature = "paged-line-compose")]
 #[test]
 fn observed_uniform_and_failed_source_never_claim_a_file_was_created_or_closed() {
+    // A complete Uniform result and rejection before allocation both have no metadata FD, but only the former owns a healthy result Source.
     let (_directory, document) = fixture("ASCII A123");
     let source = crate::MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -113,7 +117,7 @@ fn observed_uniform_and_failed_source_never_claim_a_file_was_created_or_closed()
     let value = result.unwrap();
     assert!(matches!(value.resolution, Resolution::UniformZero(_)));
     assert!(!uniform.snapshot().file_created && !uniform.snapshot().close_succeeded);
-    assert!(uniform.is_released()); // 这里只签文件和页为空，分析值仍持原Source，二者不得混为一谈。
+    assert!(uniform.is_released()); // Only metadata files/pages are absent; the analysis still owns Source, which is a distinct lifetime.
     drop(value);
     let foreign = crate::MarkdownLayoutTextSource::capture(&document).authority();
     poison_original_read_windows(&document);
@@ -132,7 +136,7 @@ fn observed_uniform_and_failed_source_never_claim_a_file_was_created_or_closed()
         Err(BidiError::Source(
             MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
         ))
-    )); // 真实共享EIO仍先于外来票或取消；资源观察不能改写原失败原因。
+    )); // Actual shared EIO precedes a foreign ticket or cancellation; resource observations cannot rewrite the original failure cause.
     let actual = failed.snapshot();
     assert!(!actual.file_created && !actual.file_open && !actual.close_succeeded);
     assert_eq!(
@@ -148,6 +152,7 @@ fn observed_uniform_and_failed_source_never_claim_a_file_was_created_or_closed()
 
 #[test]
 fn paragraph_lookup_uses_original_table_and_matches_finite_uba_oracle_at_scalar_boundaries() {
+    // Check actual UBA paragraph ranges against a finite independent oracle, preserving CR/LF and supplementary-scalar coordinate semantics.
     for text in [
         "",
         "纯LTR中文😀123",
@@ -182,7 +187,7 @@ fn paragraph_lookup_uses_original_table_and_matches_finite_uba_oracle_at_scalar_
                     actual.paragraph_range_at_utf16(offset + 1),
                     Err(BidiError::InvalidScalarBoundary)
                 ));
-            } // 低代理项可供level查询，但不能作为新item的段端或几何请求位置。
+            } // A low surrogate may have a level record, but cannot become a new item's paragraph or geometry boundary.
             offset += scalar.len_utf16();
         }
         assert_eq!(actual.paragraph_range_at_utf16(units.len()).unwrap(), None);
@@ -191,7 +196,7 @@ fn paragraph_lookup_uses_original_table_and_matches_finite_uba_oracle_at_scalar_
             Err(BidiError::InvalidRange)
         ));
     }
-    // 非零分析范围的返回值仍保持原文绝对UTF16坐标；不把范围内的0补签为原文段首。
+    // Nonzero analysis ranges still return absolute original UTF16 coordinates; range-relative zero cannot become a newly certified document paragraph start.
     let (_directory, document) = fixture("前😀甲\nאב\n尾");
     let start = "前😀".encode_utf16().count();
     let end = document.utf16_len() - 1;
@@ -220,6 +225,7 @@ fn paragraph_lookup_uses_original_table_and_matches_finite_uba_oracle_at_scalar_
 #[cfg(feature = "paged-layout-breaks")]
 #[test]
 fn paragraph_lookup_preserves_cancellation_and_original_failure_priority_even_at_eof() {
+    // EOF and cached paragraph lookups must recheck actual Source/cancellation for both representations, rather than bypassing their authority.
     for text in ["纯LTR中文😀123", "aא\nb"] {
         let (_directory, document) = fixture(text);
         let source = crate::MarkdownLayoutTextSource::capture(&document);
@@ -250,10 +256,11 @@ fn paragraph_lookup_preserves_cancellation_and_original_failure_priority_even_at
                 MarkdownDocumentBufferError::OriginalBackingUnavailable(libc::EIO)
             ))
         ));
-    } // Uniform与真实分页两种表示都不能靠EOF或先前命中吞掉已知源错误。
+    } // Neither Uniform nor actual paging may hide known Source failure through EOF or a previous successful lookup.
 }
 
 fn compare(source: &str, base: BidiBaseDirection, all_lines: bool) {
+    // Limit the independent full-array oracle explicitly, then compare actual paragraph levels and all requested scalar-aligned soft-line splits.
     assert!(
         source.chars().count() <= 4096,
         "完整oracle只能处理明确有限的测试数据"
@@ -289,6 +296,7 @@ fn compare(source: &str, base: BidiBaseDirection, all_lines: bool) {
     }
     scalar_offsets.push(offset);
     for paragraph in &reference.paragraphs {
+        // L1/L2 expectations belong to each actual line range; paragraph-level pre-L1 levels alone cannot prove visual order.
         let start = scalar_offsets.partition_point(|&offset| offset < paragraph.range.start);
         let end = scalar_offsets.partition_point(|&offset| offset < paragraph.range.end);
         let split_points: Vec<usize> = if all_lines {
@@ -334,7 +342,7 @@ fn compare(source: &str, base: BidiBaseDirection, all_lines: bool) {
     }
     let profile = actual.storage_profile();
     match &actual.resolution {
-        // oracle逐项结果已经独立比较；这里再核不同表示的真实资源配置，不签发虚构缓存。
+        // Output already matched the independent oracle; now distinguish actual resource configurations without inventing a Uniform cache.
         Resolution::UniformZero(_) => {
             assert_eq!(profile.cache_bytes, 0);
             assert_eq!(profile.page_loads, 0);
@@ -344,7 +352,7 @@ fn compare(source: &str, base: BidiBaseDirection, all_lines: bool) {
         Resolution::VisibleParagraphs(_) => panic!("原完整分析 oracle 不构造显式折叠结果"),
     }
     assert!(profile.source_borrow_max_bytes <= 4096);
-    assert_eq!(profile.unicode_version, (18, 0, 0)); // 实际property provider版本，不沿用算法crate自带的数据版本。
+    assert_eq!(profile.unicode_version, (18, 0, 0)); // This is the actual property provider's version, not the algorithm crate's bundled data version.
 }
 
 struct BidiVisualOracle {
@@ -352,6 +360,7 @@ struct BidiVisualOracle {
 }
 impl BidiVisualOracle {
     fn new(_offsets: &[usize], levels: &[unicode_bidi::Level], ordinals: Range<usize>) -> Self {
+        // Build only the finite oracle's expected scalar order, independently of the production streamed run visitor.
         Self {
             order: BidiInfo::reorder_visual(&levels[ordinals.clone()])
                 .into_iter()
@@ -363,6 +372,7 @@ impl BidiVisualOracle {
 
 #[test]
 fn fixed_contexts_and_every_scalar_line_boundary_match_utf16_oracle() {
+    // Exercise complete real contexts across scripts, isolates, controls, combining scalars, and brackets at every scalar-aligned line split.
     for source in [
         "",
         "abc 中文123",
@@ -382,10 +392,10 @@ fn fixed_contexts_and_every_scalar_line_boundary_match_utf16_oracle() {
         "a ב 123  \t  x\u{2028}ג  \n",
         "a ב\r\n العربية\u{2029}123\u{0085}x",
         "אב\u{2066}12\u{2069}($+\u{2060}--123)\u{2066}z\u{2069}גד",
-        // 新括号必须消费原物理段落的N0上下文，isolate内部不能把强类型泄漏到外部。
+        // New bracket data still uses original physical-paragraph N0 context; strong text inside an isolate must not leak outside it.
         "a ב\u{2e62}ג\u{2e63}",
         "a \u{2067}ב\u{2e62}12\u{2e63}ג\u{2069} z",
-        // 默认AL与BN差异也进入完整规则oracle，不能只校验属性查表值。
+        // Default AL/BN differences must pass the complete rule oracle too, not only a property-table lookup check.
         "a\u{086b}123\u{2065}ב\u{fdd0}z\u{10ffff}",
         "a\u{05c8}ב\u{1b3a}123\u{1acf}z",
     ] {
@@ -401,6 +411,7 @@ fn fixed_contexts_and_every_scalar_line_boundary_match_utf16_oracle() {
 
 #[test]
 fn deterministic_property_sequences_match_complete_context_without_text_mirror() {
+    // Reproducible finite combinations use the same independent oracle without installing a second text model into the production analysis.
     let symbols = [
         'a', 'א', 'ع', '1', '\u{0661}', '+', '$', ',', ' ', '\u{0300}', '\u{2060}', '(', ')', '[',
         ']', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{202a}', '\u{202b}', '\u{202c}',
@@ -425,6 +436,7 @@ fn deterministic_property_sequences_match_complete_context_without_text_mirror()
 
 #[test]
 fn isolate_and_embedding_overflow_use_paged_initial_stack_and_exact_standard_levels() {
+    // Beyond the legal explicit-level depth, preserve actual overflow/isolate behavior rather than truncating source or the initial paged stack.
     for source in [
         format!("a{}ב{}z", "\u{2067}".repeat(140), "\u{2069}".repeat(141)),
         format!("a{}12ב{}z", "\u{202b}".repeat(140), "\u{202c}".repeat(141)),
@@ -437,6 +449,7 @@ fn isolate_and_embedding_overflow_use_paged_initial_stack_and_exact_standard_lev
 
 #[test]
 fn immutable_analysis_survives_edit_and_document_drop_and_preserves_surrogate_contracts() {
+    // Editing/dropping the active document cannot change the original analysis; low-surrogate level reads remain distinct from valid range endpoints.
     let (_directory, mut document) = fixture("x🙂אב12中z");
     let mut value = MarkdownBidiParagraph::analyze(
         document.text_snapshot(),
@@ -467,6 +480,7 @@ fn immutable_analysis_survives_edit_and_document_drop_and_preserves_surrogate_co
 
 #[test]
 fn empty_eof_invalid_ranges_and_budget_never_publish_incomplete_analysis() {
+    // Actual empty analysis emits no run, while unsupported budgets and scalar/range violations cannot publish a partially valid result.
     let (_directory, document) = fixture("");
     let mut empty = MarkdownBidiParagraph::analyze(
         document.text_snapshot(),
@@ -504,7 +518,7 @@ fn empty_eof_invalid_ranges_and_budget_never_publish_incomplete_analysis() {
 
 #[cfg(feature = "paged-layout-breaks")]
 #[test]
-/// 相同正文与代次的另一次capture没有发布权限；真正原capsule跨编辑保持冻结值与真实映射。
+/// Another capture of equal text/generation has no original publication authority; the actual capsule preserves frozen values and mapping lifetime across edits.
 fn shared_layout_source_authority_and_snapshot_alias_keep_the_original_bidi_value() {
     let (_directory, mut document) = fixture("x🙂אב12中z");
     let source = crate::MarkdownLayoutTextSource::capture(&document);
@@ -560,7 +574,7 @@ fn shared_layout_source_authority_and_snapshot_alias_keep_the_original_bidi_valu
 
 #[cfg(feature = "paged-layout-breaks")]
 #[test]
-/// 初始端点或已完成分析遇到真实读窗口回收失败均保留原errno，不返回伪边界错或缓存结果。
+/// Initial endpoint conversion and completed analysis retain actual reclaim errno, instead of returning a misleading boundary error or cached level.
 fn bidi_source_reclaim_failure_is_not_hidden_by_scalar_validation_or_cached_levels() {
     let (_directory, document) = fixture("abאב中🙂");
     poison_original_read_windows(&document);
@@ -612,6 +626,7 @@ fn bidi_source_reclaim_failure_is_not_hidden_by_scalar_validation_or_cached_leve
 
 #[test]
 fn giant_generated_paragraph_keeps_source_borrow_and_total_page_cache_bounded() {
+    // Write a large private fixture in fixed chunks and analyze through production; the bounded component page cache is not a whole-product RSS claim.
     use std::io::Write;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("giant.md");
@@ -642,7 +657,7 @@ fn giant_generated_paragraph_keeps_source_borrow_and_total_page_cache_bounded() 
 fn anonymous_metadata_descriptor_is_released_after_last_value() {
     const CHILD: &str = "OMNI_BIDI_RELEASE_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        // 独立测试子进程避免其他并发测试复用刚关闭的fd，不能把数字再次可用误判成泄漏。
+        // Wait for an isolated test child to avoid concurrent FD-number reuse being misclassified as a leak.
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -663,13 +678,13 @@ fn anonymous_metadata_descriptor_is_released_after_last_value() {
         BidiMemoryBudget::default(),
     )
     .unwrap();
-    assert!(matches!(value.resolution, Resolution::Paged(_))); // 真实R/AL上下文必须创建原匿名FD，不能以Uniform零资源绕过释放验证。
+    assert!(matches!(value.resolution, Resolution::Paged(_))); // Actual R/AL context must acquire the original anonymous FD; a zero-resource Uniform result cannot bypass this release scenario.
     let fd = value.resolution.paged_mut().raw_fd();
     drop(document);
-    // SAFETY: F_GETFD只观察测试独占的真实描述符，不读取内容、不移交或改变所有权。
+    // SAFETY: F_GETFD observes the test's actual exclusive descriptor without reading contents or transferring/changing ownership.
     assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
     drop(value);
-    // SAFETY: 同进程尚未创建新fd，F_GETFD对已关闭数字安全返回EBADF，不访问释放的Rust对象。
+    // SAFETY: This process has created no replacement FD; F_GETFD safely reports EBADF for a closed number without accessing a freed Rust object.
     assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
     assert_eq!(
         std::io::Error::last_os_error().raw_os_error(),
@@ -679,6 +694,7 @@ fn anonymous_metadata_descriptor_is_released_after_last_value() {
 
 #[test]
 fn visitor_reports_partial_candidates_but_failed_batch_and_every_later_query_are_revoked() {
+    // Retain the existing partial-read failure seam: callbacks may have produced candidates, but only overall Ok can authorize the complete batch.
     let source = "aא".repeat(2048);
     let (_directory, document) = fixture(&source);
     let mut value = MarkdownBidiParagraph::analyze(
@@ -688,14 +704,14 @@ fn visitor_reports_partial_candidates_but_failed_batch_and_every_later_query_are
         BidiMemoryBudget::new(4 * store::PAGE_BYTES).unwrap(),
     )
     .unwrap();
-    value.level_at_utf16(0).unwrap(); // 原页真实在缓存中，至少首批run能先于下一页IO错误被观察。
+    value.level_at_utf16(0).unwrap(); // Warm the actual original page so initial runs can be observed before the next page's I/O failure.
     value.resolution.paged_mut().fail_next_read_after_prefix(8);
     let mut candidates = 0;
     let result = value.visit_logical_runs(0..document.utf16_len(), |_| candidates += 1);
     assert!(candidates > 0);
     assert!(matches!(&result, Err(BidiError::Storage(_))));
     let committed = if result.is_ok() { candidates } else { 0 };
-    assert_eq!(committed, 0); // 候选回调不等于完整Ready，caller必须等原方法整体Ok才能发布。
+    assert_eq!(committed, 0); // A candidate callback is not complete Ready; the caller must wait for the entire method's Ok before publication.
     assert!(matches!(
         value.level_at_utf16(0),
         Err(BidiError::PoisonedMetadata)
@@ -709,6 +725,7 @@ fn visitor_reports_partial_candidates_but_failed_batch_and_every_later_query_are
 #[test]
 #[ignore = "需显式提供OMNI_BIDI_CHARACTER_TEST官方语料；语料与当前属性版本分别记录"]
 fn official_bidi_character_test_levels_and_order_are_exact() {
+    // This explicitly ignored oracle requires a supplied official corpus and records its own version separately from current property data.
     use std::io::BufRead;
     let path = std::env::var_os("OMNI_BIDI_CHARACTER_TEST").expect("必须显式指定官方数据路径");
     let file = std::fs::File::open(path).unwrap();
@@ -766,6 +783,7 @@ fn official_bidi_character_test_levels_and_order_are_exact() {
             line_number + 1
         );
         let expected_levels: Vec<_> = fields[3].split_whitespace().collect();
+        // Only one explicitly bounded official case builds scalar/UTF16 expectations; product analysis continues through the actual Source API.
         let mut offsets = Vec::new();
         let mut offset = 0;
         for scalar in source.chars() {
@@ -774,7 +792,7 @@ fn official_bidi_character_test_levels_and_order_are_exact() {
         }
         offsets.push(offset);
         assert_eq!(offsets.len() - 1, expected_levels.len());
-        // 官方样本把整个输入当一条行，levels包含L1；不能与analyze的段级pre-L1结果混比。
+        // Official cases treat the whole input as one line and include L1 levels; do not compare them with analyze's paragraph-level pre-L1 result.
         let mut actual_levels = vec![None; expected_levels.len()];
         let mut actual_order = Vec::new();
         value
@@ -833,6 +851,7 @@ fn official_bidi_character_test_levels_and_order_are_exact() {
 #[cfg(feature = "paged-layout-breaks")]
 #[test]
 fn cancellation_before_allocation_and_empty_source_never_returns_ready() {
+    // A pre-cancelled request fails before metadata allocation even for an empty Source, then releases its original snapshot/backing claim.
     for text in ["", "中文😀 אב12"] {
         let (_directory, document) = fixture(text);
         let source = crate::MarkdownLayoutTextSource::capture(&document);
@@ -867,6 +886,7 @@ fn cancellation_before_allocation_and_empty_source_never_returns_ready() {
 #[cfg(feature = "paged-layout-breaks")]
 #[test]
 fn cancel_at_actual_first_allocation_joins_and_releases_same_source_and_real_fd() {
+    // The existing barrier synchronizes the actual first allocation, not elapsed time; join the same worker before checking Source and FD release.
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<crate::MarkdownLayoutTextSource>();
     assert_send_sync::<crate::MarkdownLayoutTextAuthority>();
@@ -890,7 +910,7 @@ fn cancel_at_actual_first_allocation_joins_and_releases_same_source_and_real_fd(
             &worker_cancellation,
         )
     });
-    pause.entered.wait(); // 真实第一份固定页与匿名FD已经分配，分析尚未获准继续。
+    pause.entered.wait(); // The actual first fixed page and anonymous FD exist; analysis is not yet permitted to continue.
     let fd = pause.file.lock().unwrap().as_ref().unwrap().clone();
     assert!(!fd.closed());
     assert!(!observer.payload_released());
@@ -898,7 +918,7 @@ fn cancel_at_actual_first_allocation_joins_and_releases_same_source_and_real_fd(
     cancellation.cancel();
     pause.resume.wait();
     assert!(matches!(worker.join().unwrap(), Err(BidiError::Cancelled)));
-    assert!(fd.closed()); // 由真实libc close返回0记录，不用FD编号、sleep或线程结束猜测。
+    assert!(fd.closed()); // Actual libc close returned zero; this is not inferred from an FD number, delay, or thread completion alone.
     assert!(observer.payload_released());
     assert!(mapping.unmap_succeeded());
     assert_eq!(mapping.mapped_bytes(), 0);
@@ -908,6 +928,7 @@ fn cancel_at_actual_first_allocation_joins_and_releases_same_source_and_real_fd(
 #[cfg(feature = "paged-layout-breaks")]
 #[test]
 fn ready_cancellation_revokes_cached_empty_and_final_callback_queries() {
+    // Cached, empty-range, and final-callback paths all retain cancellation checks; a callback's cancellation prevents overall successful publication.
     let (_directory, document) = fixture("prefix\nאב🙂 123中文");
     let source = crate::MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -923,7 +944,7 @@ fn ready_cancellation_revokes_cached_empty_and_final_callback_queries() {
     )
     .unwrap();
     value.require_layout_source(&authority).unwrap();
-    value.level_at_utf16(7).unwrap(); // 预热真实页，取消后不能把hit作为另一条成功路径。
+    value.level_at_utf16(7).unwrap(); // Warm the actual page; a cached hit after cancellation cannot provide an alternative success path.
     let fd = value.resolution.paged_mut().io_observer_for_test();
     cancellation.cancel();
     assert!(matches!(value.level_at_utf16(7), Err(BidiError::Cancelled)));
@@ -939,7 +960,7 @@ fn ready_cancellation_revokes_cached_empty_and_final_callback_queries() {
         value.visit_visual_runs(7..7, |_| panic!("不应交付候选")),
         Err(BidiError::Cancelled)
     ));
-    assert!(!fd.closed()); // 取消只撤权，不篡改immutable值或提前释放仍被持有的Store。
+    assert!(!fd.closed()); // Cancellation revokes authority without mutating immutable values or prematurely releasing the still-owned Store.
     drop(value);
     assert!(fd.closed());
 
@@ -956,12 +977,13 @@ fn ready_cancellation_revokes_cached_empty_and_final_callback_queries() {
     )
     .unwrap();
     let result = value.visit_logical_runs(7..8, |_| cancellation.cancel());
-    assert!(matches!(result, Err(BidiError::Cancelled))); // 最后一条callback内撤权也不能返回完整覆盖Ok。
+    assert!(matches!(result, Err(BidiError::Cancelled))); // Revocation inside the final callback still prevents a complete-coverage Ok.
 }
 
 #[cfg(feature = "paged-layout-breaks")]
 #[test]
 fn cancellation_preserves_already_failed_original_source_cause() {
+    // Establish actual reclaim EIO first; subsequent cancellation cannot replace that original typed Source failure.
     let (_directory, document) = fixture("真实源错误🙂");
     let source = crate::MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -987,6 +1009,7 @@ fn cancellation_preserves_already_failed_original_source_cause() {
 
 #[test]
 fn uniform_zero_certificate_matches_oracle_and_reports_no_metadata_resources() {
+    // Compare finite eligible contexts with actual UBA output first; no metadata allocation is a separate observation, not the proof of correctness.
     for text in [
         "",
         "中文abc123🙂",
@@ -1001,7 +1024,7 @@ fn uniform_zero_certificate_matches_oracle_and_reports_no_metadata_resources() {
         "中文123\u{001c}",
     ] {
         for base in [BidiBaseDirection::Auto, BidiBaseDirection::LeftToRight] {
-            compare(text, base, true); // 先对照独立发布算法，含所有标量切分的L1/L2结果。
+            compare(text, base, true); // First compare the independent published algorithm, including L1/L2 at every scalar split.
             let (_directory, document) = fixture(text);
             let value = MarkdownBidiParagraph::analyze(
                 document.text_snapshot(),
@@ -1020,6 +1043,7 @@ fn uniform_zero_certificate_matches_oracle_and_reports_no_metadata_resources() {
 
 #[test]
 fn internal_multiple_b_and_complex_classes_preserve_exact_uba_and_cross_paragraph_rejection() {
+    // Multiple actual B paragraphs may share a zero-level certificate but cannot become one soft line; complex classes still require complete paged UBA.
     for text in [
         "a\nb",
         "a\r\n",
@@ -1060,10 +1084,10 @@ fn internal_multiple_b_and_complex_classes_preserve_exact_uba_and_cross_paragrap
                 assert!(matches!(
                     value.visit_visual_runs(0..document.utf16_len(), |_| {}),
                     Err(BidiError::InvalidRange)
-                )); // 全0不能让跨B查询被重签成一条合法软行；CR/LF和NEL都沿原规则分段。
+                )); // All-zero levels do not authorize a line crossing B; CR/LF and NEL retain their original paragraph semantics.
             } else {
                 assert!(matches!(value.resolution, Resolution::Paged(_)));
-                // 真RTL/AN/显式控制/隔离仍执行完整UBA；上方compare继续逐level和视觉顺序对照。
+                // Actual RTL/AN/explicit controls/isolates still run full UBA; compare above checks every level and actual visual order.
             }
         }
     }
@@ -1081,6 +1105,7 @@ fn internal_multiple_b_and_complex_classes_preserve_exact_uba_and_cross_paragrap
 #[cfg(feature = "paged-layout-breaks")]
 #[test]
 fn uniform_zero_keeps_original_source_global_utf16_and_surrogate_boundary_contract() {
+    // A Uniform certificate retains the same original snapshot and absolute coordinates, while range operations still reject surrogate interiors.
     let (_directory, document) = fixture("leadא\nA😀e\u{0301}12\nNEXT");
     let source = crate::MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -1100,7 +1125,7 @@ fn uniform_zero_keeps_original_source_global_utf16_and_surrogate_boundary_contra
     drop(document);
     assert_eq!(value.source_range(), range);
     assert_eq!(value.level_at_utf16(7).unwrap(), 0);
-    assert_eq!(value.level_at_utf16(8).unwrap(), 0); // 高、低UTF16项都保留实际零层级事实。
+    assert_eq!(value.level_at_utf16(8).unwrap(), 0); // Both UTF16 head/low records retain their actual zero-level fact.
     for query in [8..9, 7..8, 8..8] {
         assert!(matches!(
             value.visit_logical_runs(query.clone(), |_| {}),
@@ -1136,7 +1161,7 @@ fn uniform_zero_keeps_original_source_global_utf16_and_surrogate_boundary_contra
         value.require_layout_source(&foreign),
         Err(BidiError::SourceMismatch)
     ));
-    assert!(!mapping.unmap_succeeded()); // Uniform也真实持有同一snapshot，不能提前声称源已释放。
+    assert!(!mapping.unmap_succeeded()); // Uniform still owns the same actual snapshot; do not claim Source release before its last owner returns.
     drop(value);
     assert!(!observer.payload_released());
     drop(source);
@@ -1149,6 +1174,7 @@ fn uniform_zero_keeps_original_source_global_utf16_and_surrogate_boundary_contra
 #[cfg(feature = "paged-layout-breaks")]
 #[test]
 fn uniform_zero_ready_and_last_callback_cancellation_remain_permanent() {
+    // Uniform's single real run still obeys final-callback revocation for both logical and visual access; zero metadata does not bypass authority.
     let (_directory, document) = fixture("中文😀123");
     let source = crate::MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -1195,6 +1221,7 @@ fn uniform_zero_ready_and_last_callback_cancellation_remain_permanent() {
 #[cfg(feature = "paged-layout-breaks")]
 #[test]
 fn uniform_zero_negative_certificate_and_cached_queries_never_hide_source_poison() {
+    // A negative eligibility result cannot restart Paged analysis over poisoned Source, and positive cached Uniform levels keep the same Source-first gate.
     for text in ["纯LTR中文😀123", "aא", "a\nb"] {
         let (_directory, document) = fixture(text);
         poison_original_read_windows(&document);
@@ -1209,7 +1236,7 @@ fn uniform_zero_negative_certificate_and_cached_queries_never_hide_source_poison
             Err(BidiError::Source(
                 MarkdownDocumentBufferError::OriginalBackingUnavailable(_)
             ))
-        )); // 包括本来会早停的负证；共享源已真实失败时不能重走Paged包装成Ready。
+        )); // Even an otherwise early negative certificate cannot rerun Paged work over actual failed Source and repackage it as Ready.
     }
     let (_directory, document) = fixture("纯LTR中文😀123");
     let source = crate::MarkdownLayoutTextSource::capture(&document);
@@ -1234,7 +1261,7 @@ fn uniform_zero_negative_certificate_and_cached_queries_never_hide_source_poison
         Err(BidiError::Source(
             MarkdownDocumentBufferError::OriginalBackingUnavailable(_)
         ))
-    )); // 已知源错误优先于取消与Uniform零层级命中，保留实际errno类型。
+    )); // Known Source failure precedes cancellation and a cached Uniform zero level, retaining the actual errno type.
     assert!(value.visit_logical_runs(0..0, |_| {}).is_err());
     assert!(value.require_layout_source(&authority).is_err());
 }
@@ -1242,6 +1269,7 @@ fn uniform_zero_negative_certificate_and_cached_queries_never_hide_source_poison
 #[test]
 #[ignore = "需显式指定OMNI_BIDI_CHARACTER_TEST；只跑官方中前256个合格纯LTR正例"]
 fn official_uniform_zero_filtered_prefix_matches_declared_levels_and_order() {
+    // This ignored entry explicitly selects at most the first 256 eligible official positives; it does not execute or certify the whole corpus.
     use std::io::BufRead;
     let path = std::env::var_os("OMNI_BIDI_CHARACTER_TEST").expect("必须显式指定官方数据路径");
     let file = std::fs::File::open(path).unwrap();
@@ -1266,7 +1294,7 @@ fn official_uniform_zero_filtered_prefix_matches_declared_levels_and_order() {
             "2" => BidiBaseDirection::Auto,
             _ => continue,
         };
-        // 完整文本只属于明确有限的官方oracle；产品证书从不经过此String路径。
+        // Complete text belongs only to the explicitly finite official oracle; the product certificate does not use this String path.
         let source: String = fields[0]
             .split_whitespace()
             .map(|word| char::from_u32(u32::from_str_radix(word, 16).unwrap()).unwrap())
@@ -1316,7 +1344,7 @@ fn official_uniform_zero_filtered_prefix_matches_declared_levels_and_order() {
                     }
                 }
             })
-            .unwrap(); // 顺序必须来自真实visual查询回调，不能直接用输入顺序冒充API的实际结果。
+            .unwrap(); // Order must come from actual visual-query callbacks, not input order substituted for the API result.
         let expected_order: Vec<usize> = fields[4]
             .split_whitespace()
             .map(|word| word.parse().unwrap())
@@ -1324,7 +1352,7 @@ fn official_uniform_zero_filtered_prefix_matches_declared_levels_and_order() {
         assert_eq!(actual_order, expected_order, "官方行{}", line_number + 1);
         selected += 1;
         if selected == 256 {
-            break; // 明确有限筛选正例；不能把此入口声称为完整官方全语料通过。
+            break; // This is an explicitly finite filtered prefix, not a passing result for the entire official corpus.
         }
     }
     assert_eq!(selected, 256);
@@ -1334,6 +1362,7 @@ fn official_uniform_zero_filtered_prefix_matches_declared_levels_and_order() {
 
 #[test]
 fn uniform_zero_requires_real_end_of_large_unicode_source_before_committing() {
+    // Write a large fixture incrementally and place a single complex scalar at its real tail; no eligible prefix may certify the unread successor.
     use std::io::Write;
     for complex_tail in [false, true] {
         let directory = tempfile::tempdir().unwrap();
@@ -1364,12 +1393,13 @@ fn uniform_zero_requires_real_end_of_large_unicode_source_before_committing() {
             assert!(matches!(value.resolution, Resolution::UniformZero(_)));
             assert_eq!(value.storage_profile().cache_bytes, 0);
             assert_eq!(value.level_at_utf16(document.utf16_len() - 1).unwrap(), 0);
-        } // 唯一复杂字符在真实EOF前；不能把已消费的许多4KiB前缀误签成完整证书。
+        } // The sole complex character lies before actual EOF; many consumed 4-KiB prefixes do not establish a complete certificate.
     }
 }
 
 #[test]
 fn paragraph_base_preserves_rtl_ls_context_and_is_not_the_first_glyph_level() {
+    // Paragraph base comes from actual P2/P3 context and differs from a glyph's resolved level; compare scalar endpoints and real EOF with the finite oracle.
     for text in ["abc\u{2028}", "אב\u{2028}", "123 אב\u{2028}", "אב\r\n", ""] {
         let (_directory, document) = fixture(text);
         let units: Vec<u16> = text.encode_utf16().collect();

@@ -1,18 +1,19 @@
-//! 原GCB的真实稳定记录前缀；GB2位置事实不冒充末ordinal、末cluster或完整扫描。
+//! Actual stable records from the original GCB job. A GB2 endpoint does not establish a final
+//! ordinal, the last complete cluster, or completion of the source scan.
 use super::*;
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MarkdownGraphemePrefixFacts {
-    /// Source 域保留原全源序号；FoldedVisible 序号只覆盖可见边界与显式折叠两端。
+    /// Source uses whole-source ordinals; visible domains cover only visible boundaries and structural endpoints.
     pub ordinal_domain: MarkdownGraphemeOrdinalDomain,
-    /// 本记录域中已经连续提交的边界数；Dense为逻辑记录，物理IO另由原profile计量。
+    /// Continuously committed boundaries in this domain; Dense counts logical records, with physical I/O separate.
     pub known_boundary_count: usize,
-    /// 这个位置之前的可查询位置已经分类；折叠隐藏内部始终是 FoldedRange。
+    /// Queryable positions through this frontier have been classified; hidden interiors remain outside the domain.
     pub confirmed_through: Option<MarkdownGraphemeBoundary>,
     pub last_committed_boundary: Option<MarkdownGraphemeBoundary>,
     pub complete: bool,
-    /// 仅原全算法及索引封存完成后才给出最终总数。
+    /// Final count is available only after the original algorithm and index sealing complete.
     pub total_count: Option<usize>,
 }
 
@@ -22,7 +23,8 @@ pub enum MarkdownGraphemePrefixRead {
     Read,
 }
 
-/// 独占借用原job，不能Clone或在持有期间推进machine；内部不创建FD、正文副本或新索引。
+/// Exclusively borrow the original job without cloning it or advancing its machine while borrowed.
+/// This view creates no file descriptor, text copy, or replacement index.
 pub struct MarkdownGraphemePrefix<'a> {
     job: &'a mut MarkdownGraphemeJob,
     authority: MarkdownLayoutTextAuthority,
@@ -30,7 +32,8 @@ pub struct MarkdownGraphemePrefix<'a> {
 }
 
 impl MarkdownGraphemeJob {
-    /// 借出当前真实记录覆盖；没有已读字节就没有稳定前缀，原完整Ready含义保持不变。
+    /// Borrow currently proven record coverage without changing Ready semantics. Unscanned Paged
+    /// input has no stable records; exact Dense whole-source proof already supplies its complete domain.
     pub fn stable_prefix(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,
@@ -69,8 +72,8 @@ impl MarkdownGraphemePrefix<'_> {
         Ok(self.facts)
     }
 
-    /// GB2只认证真实不可变Source末位置；不读取未知尾部，也不推算最终边界序号。
-    /// 即使返回此位置，Next、Previous及末cluster范围仍必须消费原机器实际记录。
+    /// GB2 certifies only the actual immutable Source endpoint, without scanning its unknown tail
+    /// or guessing a final ordinal. Next, Previous, and the last cluster still require actual records.
     pub fn source_end_boundary(&mut self) -> Result<MarkdownGraphemeBoundary> {
         self.job.guard(&self.authority)?;
         let end = MarkdownGraphemeBoundary {
@@ -81,8 +84,8 @@ impl MarkdownGraphemePrefix<'_> {
         Ok(end)
     }
 
-    /// 一次只读取≤256条当前显式域的已提交记录；未知记录保持Pending且不改输出。
-    /// FoldedVisible 的相邻序号不能推导隐藏内部的原 GCB 数目或完整 cluster。
+    /// Read at most 256 committed records in the current domain; unknown records stay Pending
+    /// without changing output. Adjacent visible ordinals do not establish hidden GCB counts or clusters.
     pub fn read_boundaries(
         &mut self,
         range: Range<usize>,
@@ -112,7 +115,8 @@ impl MarkdownGraphemePrefix<'_> {
             self.job.index.read_batch(range, output)?;
             Ok(MarkdownGraphemePrefixRead::Read)
         })();
-        // 首源错误优先于参数/metadata结果；失败后的整个batch均不可发布。
+        // Original Source failure precedes parameter/metadata results. A failed batch cannot
+        // publish any prefix that may already have been written to the caller's buffer.
         let result = match self.job.source.health() {
             Err(error) => Err(error.into()),
             Ok(()) => result.and_then(|answer| {

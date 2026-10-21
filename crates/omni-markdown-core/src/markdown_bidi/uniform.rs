@@ -1,4 +1,5 @@
-//! 单个LTR段的完整证书；细byte/scalar预算暂停不被解释成真实EOF。
+//! Certify uniform LTR resolution for the original prepared scope. Byte/scalar quantum
+//! suspension never substitutes for actual completion of that scope.
 use super::*;
 use prepare::{cooperate::Gate, source::Reader};
 use std::rc::Rc;
@@ -25,13 +26,15 @@ pub(super) async fn certify_prepared(
     }
     #[cfg(feature = "paged-shaping-frontier")]
     if let Some(certificate) = root::certify(snapshot, source, &bytes, base)? {
-        // 折叠和普通 Prepare 共用同一原 root 白名单；原 Source/Gate 前后门仍覆盖这个零正文快路。
+        // Folded and ordinary preparation share the exact original-root whitelist.
+        // Source/Gate checks still surround this path even though it reads no text bytes.
         snapshot.original_backing_health()?;
         gate.health()?;
         return Ok(Some(certificate));
     }
-    // 未证明的Unicode类、含B正文和部分范围保持原预算Reader。尤其不对混合叶的局部范围
-    // 新发ASCII查询，否则该查询本身可能读取边叶而绕过本轮byte/scalar配额。
+    // Unproven classes and partial scopes retain the original budgeted Reader. Do not
+    // issue a new ASCII query on a mixed leaf's partial range: that query could itself
+    // read edge text outside this quantum's byte/scalar accounting.
     certify_scanned(snapshot, source, bytes, gate).await
 }
 
@@ -41,7 +44,8 @@ async fn certify_scanned(
     bytes: Range<usize>,
     gate: &Rc<Gate>,
 ) -> Result<Option<UniformCertificate>, BidiError> {
-    // 原扫描器作为未证明路径与独立差分基线保留；它不借整root摘要跳过任何正文。
+    // The original scanner remains both the unproven path and an independent differential
+    // baseline; it skips no text through a whole-root aggregate.
     snapshot.original_backing_health()?;
     gate.health()?;
     let mut reader = Reader::new(snapshot, bytes.clone());
@@ -53,10 +57,10 @@ async fn certify_scanned(
         if terminal_b || !eligible_class(class) {
             snapshot.original_backing_health()?;
             gate.health()?;
-            return Ok(None); // 仅撤快速证书，原全UBA仍在同一Future/Source继续处理合法正文。
+            return Ok(None); // Decline only this certificate; full UBA still handles valid text in the same Future/Source.
         }
         u32::try_from(byte).map_err(|_| BidiError::CoordinateOverflow)?;
-        certificate.observe(scalar, class); // 共用本次真实解码和类别，不另借正文或再查Unicode表。
+        certificate.observe(scalar, class); // Reuse the actual decoded scalar/class without another borrow or property lookup.
         terminal_b = class == BidiClass::B;
         units += scalar.len_utf16();
     }
@@ -65,7 +69,8 @@ async fn certify_scanned(
     if units != source.len() || reader.position() != bytes.end {
         return Err(BidiError::CorruptMetadata);
     }
-    // 只有真实完整范围与原白名单规则才得到UniformZero；不发布尚未确定的段落方向。
+    // Grant UniformZero only after the actual complete range and original whitelist
+    // agree; an unfinished paragraph cannot publish a guessed base direction.
     Ok(Some(certificate))
 }
 

@@ -1,4 +1,4 @@
-//! 一个固定4KiB源窗口与单scalar残余；真实lease已结束后才能到达任何await。
+//! One fixed 4-KiB source window and one scalar carry; every actual source lease ends before any await can be reached.
 use super::*;
 use cooperate::Gate;
 use std::rc::Rc;
@@ -20,6 +20,7 @@ impl<'a> Reader<'a> {
         snapshot: &'a MarkdownTextSnapshot,
         range: Range<usize>,
     ) -> Self {
+        // Borrow the original immutable snapshot and requested byte range, retaining neither another source capture nor a whole paragraph copy.
         Self {
             snapshot,
             position: range.start,
@@ -47,9 +48,10 @@ impl<'a> Reader<'a> {
                     if self.used != 0 {
                         return Err(BidiError::CorruptMetadata);
                     }
-                    return Ok(None); // 只有原真实byte端点才能结束，不把一次预算或缓冲尾部当EOF。
+                    return Ok(None); // Only the original actual byte endpoint ends input; a quota or buffer tail is not EOF.
                 }
                 let count = gate.source(self.end - self.position).await?;
+                // Copy only the admitted bounded window, then return all actual piece leases before suspending on further source/scalar work.
                 let mut copied = 0;
                 let result =
                     self.snapshot
@@ -61,7 +63,7 @@ impl<'a> Reader<'a> {
                             Ok(())
                         });
                 self.snapshot.original_backing_health()?;
-                result?; // 源lease归还失败先于取消；这时不发布新窗口，也不保留其引用。
+                result?; // A failed source-lease return precedes cancellation; publish no new window and retain no borrowed reference on error.
                 gate.health()?;
                 if copied != count || copied == 0 {
                     return Err(BidiError::CorruptMetadata);
@@ -71,6 +73,7 @@ impl<'a> Reader<'a> {
             }
             let byte = self.buffer[self.from];
             if self.used == 0 {
+                // Carry incomplete UTF8 bytes between windows; a new window never resets a partially consumed scalar.
                 self.scalar_start = self.position;
                 self.needed = match byte {
                     0..=0x7f => 1,
@@ -89,7 +92,7 @@ impl<'a> Reader<'a> {
                     .ok()
                     .and_then(|value| value.chars().next())
                     .ok_or(BidiError::CorruptMetadata)?;
-                // Future保留这个实际scalar和decoder位置；暂停后不是从窗口头再次解码。
+                // The future retains this actual scalar and decoder position; resumption does not decode the window again from its beginning.
                 gate.scalar().await?;
                 gate.decoded_scalar();
                 self.used = 0;

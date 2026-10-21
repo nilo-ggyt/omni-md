@@ -1,4 +1,4 @@
-//! 同一Store的异步预算桥；await只保存Rust局部状态，不改变真实页或record格式。
+//! The asynchronous budget bridge for the same Store; await preserves Rust locals without changing actual page or record formats.
 use super::*;
 use cooperate::{Gate, Operation};
 use std::rc::Rc;
@@ -19,7 +19,7 @@ impl CooperativeStore {
         gate.operation(Operation::Resource).await?;
         let mut raw = Store::new_prepared_empty(capacity, budget, cancellation, resources)?;
         for _ in 0..budget.pages {
-            // 原固定页预算逐页真实分配；暂停时FD已归原Store所有，不创建第二个IO owner。
+            // Allocate actual pages one at a time under the original fixed budget; at suspension the FD already belongs to this Store, not a second I/O owner.
             gate.operation(Operation::Resource).await?;
             raw.allocate_prepared_page()?;
         }
@@ -28,6 +28,7 @@ impl CooperativeStore {
         Ok(Self { raw, gate })
     }
     pub(in crate::markdown_bidi) fn healthy(&self) -> Result<(), BidiError> {
+        // Original Source failure precedes Store cancellation/storage checks, including operations that only touch metadata.
         self.gate.source_health()?;
         self.raw.healthy()
     }
@@ -38,13 +39,13 @@ impl CooperativeStore {
                 self.gate.operation(Operation::Resource).await?;
                 #[cfg(all(test, feature = "paged-layout-breaks"))]
                 if self.gate.take_flush_failure() {
-                    // 先执行真实前缀pwrite再报错；不以单纯置poison代替实际IO失败路径。
+                    // Preserve the existing failure case: perform actual prefix pwrite before returning error, rather than only setting poison.
                     self.raw.fail_next_write_after_prefix(7);
                 }
                 self.raw.flush_prepared_page(index)?;
             }
         }
-        self.healthy() // 全部原写操作成功后才允许prepare的最终Ready校验。
+        self.healthy() // Final preparation may verify Ready only after all original writes actually succeeded.
     }
     pub(in crate::markdown_bidi) fn into_inner(self) -> Store {
         self.raw
@@ -64,7 +65,7 @@ impl CooperativeStore {
     ) -> Result<Option<(u32, u32)>, BidiError> {
         self.healthy()?;
         if stack.len() == 0 {
-            return Ok(None); // 空栈没有真实record，不能消耗或伪报一次读。
+            return Ok(None); // An empty stack has no actual record, so do not charge or report an invented read.
         }
         self.gate.operation(Operation::Read).await?;
         stack.top(&mut self.raw)
@@ -78,12 +79,12 @@ impl CooperativeStore {
             return Ok(None);
         }
         self.gate.operation(Operation::Read).await?;
-        stack.pop(&mut self.raw) // 原pop只读top一次，成功后才更新原depth。
+        stack.pop(&mut self.raw) // The original pop reads its top once, then changes depth only after success.
     }
 }
 
-// 原编解码器仍是唯一32B格式权威；只是把预算等待放在调用之前。编译器保存暂存record，
-// 所有嵌套lookahead/backfill用同一桥，不以错误展开后重跑已改写的processing类别。
+// The original codec remains the sole 32-byte format authority; budget suspension occurs before each actual operation.
+// Compiler-owned future locals retain temporary records, so nested lookahead/backfill resumes without unwinding and replaying modified processing classes.
 macro_rules! prepared_record {
     ($record:ty) => {
         impl $record {

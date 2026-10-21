@@ -1,4 +1,4 @@
-//! UBA匿名文件和固定页的实际归还收据；观察者只持原子事实，不持正文、文件或缓存。
+//! Actual return facts for UBA anonymous files and fixed pages; observers retain atomic facts, without owning text, files, or caches.
 
 use std::sync::{
     Arc,
@@ -7,9 +7,9 @@ use std::sync::{
 
 pub(super) struct ResourceState {
     file_created: AtomicBool,
-    // 可见段最多保留前一段和当前段；每个真实 File acquire/close 都计入同一 scope。
+    // Visible analysis retains at most the previous/current part; every actual File acquisition/close belongs to this same scope.
     open_files: AtomicUsize,
-    // 0为原FD仍未报告close；1只来自真实close成功；负值保留真实失败errno。
+    // Zero means no reported close, one comes only from actual success, and a negative value preserves the actual failed-close errno.
     close_status: AtomicI32,
     cache_bytes: AtomicUsize,
     peak_cache_bytes: AtomicUsize,
@@ -40,11 +40,12 @@ impl ResourceState {
     pub(super) fn close_returned(&self, status: i32) {
         if status == 1 {
             self.open_files.fetch_sub(1, Ordering::AcqRel);
-            // 后一文件的成功 close 不能覆盖前一文件的真实失败 errno。
+            // A later file's successful close cannot overwrite a previous file's actual failure errno.
             let _ = self
                 .close_status
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
         } else {
+            // Failed close is not evidence that an open-file claim was returned; preserve the first negative fact across the shared scope.
             let _ = self
                 .close_status
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
@@ -62,19 +63,19 @@ impl ResourceState {
         self.cache_bytes.fetch_sub(bytes, Ordering::AcqRel);
     }
 
-    /// 每次成功的真实页读立即累计，Pending 子段或随后取消都不能把这次 IO 洗掉。
+    /// Charge every successful actual page read immediately; a pending part or later cancellation cannot erase this I/O.
     pub(super) fn page_loaded(&self) {
         self.page_loads.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// 同一 scope 的两个共活子段与已经退役子段共享累计实际页读数。
+    /// Both live parts and retired parts in this scope share accumulated actual page reads.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn page_loads(&self) -> u64 {
         self.page_loads.load(Ordering::Acquire)
     }
 }
 
-/// Uniform证书没有创建文件或页；Paged收据与原真实File和Box归还事件共享固定原子状态。
+/// Uniform certificates create no file/page; Paged observations share fixed atomic state with actual original File and Box return events.
 #[derive(Clone)]
 pub struct MarkdownBidiResourceObserver(Option<Arc<ResourceState>>);
 
@@ -104,7 +105,7 @@ impl MarkdownBidiResourceObserver {
                 cache_bytes: 0,
                 peak_cache_bytes: 0,
             };
-        }; // 从未分配不冒称一次close成功，调用者可明确区分两种资源路径。
+        }; // Never allocated is distinct from an actual successful close, so callers can distinguish these resource paths.
         let created = state.file_created.load(Ordering::Acquire);
         let status = state.close_status.load(Ordering::Acquire);
         let open_files = state.open_files.load(Ordering::Acquire);
@@ -120,6 +121,7 @@ impl MarkdownBidiResourceObserver {
 
     #[must_use]
     pub fn is_released(&self) -> bool {
+        // Release requires no remaining owned file/cache and no failed-close fact; it is not a claim about OS RSS or Source backing lifetime.
         let actual = self.snapshot();
         !actual.file_open && actual.cache_bytes == 0 && actual.close_errno.is_none()
     }

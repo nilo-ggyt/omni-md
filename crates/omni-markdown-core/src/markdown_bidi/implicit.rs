@@ -1,6 +1,6 @@
 // Copyright 2015 The Servo Project Developers.
 // Algorithm adapted from unicode-bidi 0.3.18 implicit.rs. SPDX-License-Identifier: MIT OR Apache-2.0
-//! W/N/I规则沿真实IRS游标执行；待定ET/BN/NI只保留端点，括号结果写回opening位置。
+//! Apply W/N/I rules through actual IRS cursors; pending ET/BN/NI runs retain endpoints only, and bracket matches are written at their opening records.
 
 use super::prepare::io::CooperativeStore;
 use super::*;
@@ -10,6 +10,7 @@ pub(super) async fn resolve(
     store: &mut CooperativeStore,
     sequence: Sequence,
 ) -> Result<(), BidiError> {
+    // Preserve rule order and the same Store across suspension: weak resolution precedes bracket pairing and neutral resolution.
     weak(store, sequence).await?;
     brackets(store, sequence).await?;
     neutral(store, sequence).await
@@ -19,6 +20,7 @@ async fn after_scalar(
     store: &mut CooperativeStore,
     position: Position,
 ) -> Result<Option<Position>, BidiError> {
+    // Advance by the original scalar's UTF16 length along the IRS, keeping a low surrogate from becoming an independent lookahead character.
     let mut at = Some(position);
     for _ in 0..Text::read_prepared(store, position.index)
         .await?
@@ -44,6 +46,7 @@ async fn write_processing(
 
 async fn weak(store: &mut CooperativeStore, sequence: Sequence) -> Result<(), BidiError> {
     use BidiClass::*;
+    // Keep only the distinct pre-rule classes and unresolved endpoint ranges needed by W1-W6, without a character-length state vector.
     let mut prev_before_w4 = sequence.sos;
     let mut prev_before_w5 = sequence.sos;
     let mut prev_before_w1 = sequence.sos;
@@ -58,7 +61,7 @@ async fn weak(store: &mut CooperativeStore, sequence: Sequence) -> Result<(), Bi
         if text.processing == BN {
             bn_start.get_or_insert(position);
             at = following;
-            continue; // BN本身跳过弱类型状态；仅在之后真正并入ET时回填。
+            continue; // BN does not advance weak-class context; backfill it only when actual subsequent resolution incorporates it into an ET run.
         }
         let mut before_w2 = text.processing;
         if text.processing == NSM {
@@ -72,7 +75,7 @@ async fn weak(store: &mut CooperativeStore, sequence: Sequence) -> Result<(), Bi
         match text.processing {
             EN if last_strong_al => text.processing = AN,
             AL => text.processing = R,
-            _ => {} // W2/W3以外的类型必须保留，不能按方向提前合并。
+            _ => {} // Preserve classes outside W2/W3 rather than prematurely merging them by direction.
         }
         match before_w2 {
             L | R => last_strong_al = false,
@@ -90,10 +93,12 @@ async fn weak(store: &mut CooperativeStore, sequence: Sequence) -> Result<(), Bi
             }
             ES | CS => {
                 if text.continuation() {
+                    // Reuse the scalar head's resolution for its low-surrogate record instead of running numeric-separator lookahead twice.
                     text.processing = Text::read_prepared(store, position.index - 1)
                         .await?
                         .processing;
                 } else {
+                    // Inspect the actual next nonremoved class, with eos only at the real IRS end; each read remains cooperatively budgeted.
                     let mut look = after_scalar(store, position).await?;
                     let mut next_class = sequence.eos;
                     while let Some(candidate) = look {
@@ -115,6 +120,7 @@ async fn weak(store: &mut CooperativeStore, sequence: Sequence) -> Result<(), Bi
                         _ => ON,
                     };
                     if text.processing == ON {
+                        // Apply the same resolved neutral class to adjacent removed BN records by walking the original chain, not a source envelope.
                         let mut look = previous(store, position).await?;
                         while let Some(candidate) = look {
                             if Text::read_prepared(store, candidate.index)
@@ -149,7 +155,7 @@ async fn weak(store: &mut CooperativeStore, sequence: Sequence) -> Result<(), Bi
                     if et_start.is_none() {
                         et_start = bn_start.or(Some(position));
                     }
-                    et_end = following; // 尾随BN还没有并入ET；不能把其余待定字符误包含在回填范围。
+                    et_end = following; // Trailing BN has not yet joined ET; do not include unrelated pending characters in the backfill interval.
                 }
             }
             _ => {}
@@ -170,7 +176,7 @@ async fn weak(store: &mut CooperativeStore, sequence: Sequence) -> Result<(), Bi
     if et_start.is_some() {
         set_processing(store, et_start, et_end, ON).await?;
     }
-    // W7以已经完成W1–W6的真实类别为输入，不重新读取原字符或保留另一份processing表。
+    // W7 consumes actual completed W1-W6 classes, without rereading source characters or retaining another processing table.
     let mut last_l = sequence.sos == L;
     let mut at = Some(first(store, sequence).await?);
     while let Some(position) = at {
@@ -204,7 +210,7 @@ async fn brackets(store: &mut CooperativeStore, sequence: Sequence) -> Result<()
     let mut stack = [dummy; 63];
     let mut depth = 0;
     let mut at = Some(first(store, sequence).await?);
-    // BD16的63项是Unicode规则，不是项目任意容量截断；溢出后本IRS不再识别新配对。
+    // BD16's 63 entries are the Unicode rule, not an arbitrary implementation cap; overflow ends new pair identification for this IRS.
     while let Some(position) = at {
         let text = Text::read_prepared(store, position.index).await?;
         if !text.continuation() && text.processing == ON && text.bracket != 0 {
@@ -222,6 +228,7 @@ async fn brackets(store: &mut CooperativeStore, sequence: Sequence) -> Result<()
                     .rev()
                     .find(|&index| stack[index].identity == text.bracket)
             {
+                // Persist the matching closer/run coordinates at the actual opening record before discarding nested unmatched openings.
                 let opening = stack[index].position;
                 let mut record = Text::read_prepared(store, opening.index).await?;
                 record.pair_end = position.index;
@@ -237,7 +244,7 @@ async fn brackets(store: &mut CooperativeStore, sequence: Sequence) -> Result<()
     let e = direction(Text::read_prepared(store, beginning.index).await?.level);
     let not_e = if e == L { R } else { L };
     let mut at = Some(first(store, sequence).await?);
-    // 按opening的source顺序读取匹配表，等价上游pair.sort_by(start)，不用O(N)pair数组或排序buffer。
+    // Visit stored matches in opening-source order, matching the upstream ordering without an O(N) pair array or sorting buffer.
     while let Some(position) = at {
         let text = Text::read_prepared(store, position.index).await?;
         if text.pair_end != NONE {
@@ -248,6 +255,7 @@ async fn brackets(store: &mut CooperativeStore, sequence: Sequence) -> Result<()
             let mut look = after_scalar(store, position).await?;
             let mut found_e = false;
             let mut found_not_e = false;
+            // N0 first searches actual content inside this pair for the embedding direction, treating numbers as prescribed strong context.
             while let Some(candidate) = look {
                 if candidate.index >= closing.index {
                     break;
@@ -274,6 +282,7 @@ async fn brackets(store: &mut CooperativeStore, sequence: Sequence) -> Result<()
             let replacement = if found_e {
                 Some(e)
             } else if found_not_e {
+                // Only when opposite-direction content exists is preceding actual strong context needed; sos remains the genuine IRS fallback.
                 let mut before = previous(store, position).await?;
                 let mut strong = sequence.sos;
                 while let Some(candidate) = before {
@@ -291,6 +300,7 @@ async fn brackets(store: &mut CooperativeStore, sequence: Sequence) -> Result<()
                 None
             };
             if let Some(class) = replacement {
+                // Rewrite both complete bracket scalars and their required adjacent NSM/BN records through the same budgeted Store.
                 let after_opening = after_scalar(store, position).await?;
                 let after_closing = after_scalar(store, closing).await?;
                 set_processing(store, Some(position), after_opening, class).await?;
@@ -339,6 +349,7 @@ async fn neutral(store: &mut CooperativeStore, sequence: Sequence) -> Result<(),
     while let Some(position) = at {
         let class = Text::read_prepared(store, position.index).await?.processing;
         if ni(class) || class == BN {
+            // Locate the actual end of one neutral/removed run, then resolve its endpoints under N1/N2 without buffering its characters.
             let mut following = next(store, position).await?;
             let mut after = sequence.eos;
             while let Some(candidate) = following {
@@ -378,6 +389,7 @@ pub(super) async fn finish_levels(
     paragraph: Paragraph,
 ) -> Result<(), BidiError> {
     use BidiClass::*;
+    // I1/I2 adjust the original explicit level using the already resolved class; invalid overflow is not clamped into a plausible level.
     for index in paragraph.start..paragraph.end {
         let mut text = Text::read_prepared(store, index).await?;
         let increase = match (text.level & 1 != 0, text.processing) {
@@ -393,6 +405,7 @@ pub(super) async fn finish_levels(
         text.write_prepared(store, index).await?;
     }
     let mut previous = paragraph.base;
+    // Restore levels for X9-removed coordinates from their preceding actual level, preserving a complete UTF16 result for later L1/L2.
     for index in paragraph.start..paragraph.end {
         let mut text = Text::read_prepared(store, index).await?;
         if removed(text.original) {

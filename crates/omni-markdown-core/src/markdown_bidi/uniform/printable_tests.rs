@@ -1,4 +1,5 @@
-//! 精确整源ASCII证书的语义、读取预算与原资源收据；有限UBA oracle不进入产品路径。
+//! Exact whole-source ASCII certificate semantics, read budgets, and original resource receipts.
+//! Finite complete UBA oracles stay outside the production path.
 
 use super::*;
 use crate::{
@@ -25,6 +26,8 @@ struct Fixture {
 
 impl Fixture {
     fn new(text: &str) -> Self {
+        // The fixture owns its actual isolated file and document; captures below retain
+        // only their original immutable payload, not the active document or its history.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("printable.md");
         std::fs::write(&path, text).unwrap();
@@ -48,7 +51,8 @@ fn job(
     MarkdownBidiPrepareJob,
     MarkdownBidiResourceObserver,
 ) {
-    // authority先从原payload取得，再把唯一Source移入Future；不另capture同文本补权限。
+    // Obtain authority from the original payload before moving Source into the Future;
+    // another capture of equal text cannot supply replacement authority.
     let authority = source.authority();
     let (result, receipt) = MarkdownBidiPrepareJob::new_layout_source_observed(
         source,
@@ -61,6 +65,8 @@ fn job(
 }
 
 fn assert_quantum(step: MarkdownBidiPrepareStep) {
+    // Public work dimensions are independently capped, and each metadata operation
+    // accounts for actual record or resource work rather than elapsed time or RSS.
     assert!(step.bytes <= ONE.bytes);
     assert!(step.scalars <= ONE.scalars);
     assert!(step.metadata_ops <= ONE.metadata_ops);
@@ -77,7 +83,8 @@ fn fast_ready(
 ) -> MarkdownBidiParagraph {
     let step = job.step(authority, ONE).unwrap();
     assert_eq!(step.status, MarkdownBidiPrepareStatus::Ready);
-    // 真实Gate记录正文借用和每项实际操作；整源证书应在首个量子完成且无Reader/Store工作。
+    // The real Gate records borrows and actual operations. Exact whole-source proof
+    // finishes in the first quantum with no Reader/Store work.
     assert_eq!(
         (
             step.bytes,
@@ -103,12 +110,13 @@ fn assert_unallocated(receipt: &MarkdownBidiResourceObserver) {
     assert!(!actual.file_created && !actual.file_open && !actual.close_succeeded);
     assert_eq!(actual.close_errno, None);
     assert_eq!((actual.cache_bytes, actual.peak_cache_bytes), (0, 0));
-    assert!(receipt.is_released()); // 从未分配须与真实close成功区别，不能制造关闭事件。
+    assert!(receipt.is_released()); // Never allocated is distinct from a successful real close; invent no close event.
 }
 
 fn assert_ascii_oracle(text: &str, base: BidiBaseDirection, actual: &mut MarkdownBidiParagraph) {
     assert!(text.is_ascii() && text.len() <= 4096);
-    // 只有此有限oracle建立完整数组；产品算法与4MiB夹具不建立全文副本。
+    // Only this finite oracle builds a complete array; production and the four-MiB
+    // fixture do not create complete document copies.
     let units: Vec<u16> = text.encode_utf16().collect();
     let oracle = BidiInfo::new_with_data_source(
         &UnicodeBidiData,
@@ -141,7 +149,7 @@ fn assert_ascii_oracle(text: &str, base: BidiBaseDirection, actual: &mut Markdow
         let mut observed = Vec::new();
         actual
             .visit_visual_runs(paragraph.range.clone(), |run| {
-                // ASCII一个单位就是一个scalar；真实L1/L2逆序仍按run level应用。
+                // ASCII units equal scalars; apply actual L1/L2 reversal according to each run's level.
                 let range = run.source_utf16_start..run.source_utf16_end;
                 if run.level & 1 == 0 {
                     observed.extend(range);
@@ -157,6 +165,8 @@ fn assert_ascii_oracle(text: &str, base: BidiBaseDirection, actual: &mut Markdow
 
 #[test]
 fn exact_full_ascii_is_zero_read_and_matches_complete_uba_oracle() {
+    // Cover the complete printable domain and mixed numeric/punctuation contexts in
+    // both accepted bases, comparing actual levels, paragraph ranges, and visual runs.
     let all_printable: String = (b' '..=b'~').map(char::from).collect();
     for text in [
         "",
@@ -186,7 +196,8 @@ fn four_mebibyte_single_paragraph_needs_no_uba_source_scan_or_metadata_file() {
     let path = directory.path().join("large-printable.md");
     let mut file = std::fs::File::create(&path).unwrap();
     for _ in 0..1024 {
-        // 固定4KiB写入实际4MiB文件，不用repeat String/全文Vec代替懒加载工作负载。
+        // Write a real four-MiB file with fixed 4 KiB blocks, rather than replacing the
+        // lazy source workload with a repeated String or complete Vec.
         file.write_all(&[b'a'; 4096]).unwrap();
     }
     drop(file);
@@ -200,7 +211,7 @@ fn four_mebibyte_single_paragraph_needs_no_uba_source_scan_or_metadata_file() {
         BidiBaseDirection::Auto,
         &MarkdownBidiCancellation::new(),
     );
-    drop(document); // 后续只有原准备Future/完成值拥有冻结Source，测试不靠活动Doc兜底。
+    drop(document); // Only the original Future/result retains frozen Source; no live document supplies hidden fallback ownership.
     let mut actual = fast_ready(&mut preparation, &authority);
     assert_eq!(mapping.reclaim_attempts(), reclaim_before);
     assert_eq!(actual.source_range(), 0..4 * 1024 * 1024);
@@ -221,6 +232,8 @@ fn four_mebibyte_single_paragraph_needs_no_uba_source_scan_or_metadata_file() {
 
 #[test]
 fn frozen_root_proof_survives_edit_but_never_authorizes_new_or_foreign_source() {
+    // The old frozen source remains exact after editing, while edited, restored, and
+    // separately recaptured sources must retain their own distinct authority.
     let mut fixture = Fixture::new("abcdef (123)");
     let old = fixture.source();
     let old_authority = old.authority();
@@ -245,7 +258,7 @@ fn frozen_root_proof_survives_edit_but_never_authorizes_new_or_foreign_source() 
     let first = edited_job.step(&edited_authority, ONE).unwrap();
     assert_quantum(first);
     assert_eq!(first.status, MarkdownBidiPrepareStatus::Pending);
-    assert_eq!(first.bytes, 1); // 后继真实混合root失去证书，不能复用旧root的全零结论。
+    assert_eq!(first.bytes, 1); // The edited mixed root loses admission and cannot reuse the old root's zero-level proof.
     assert!(fixture.document.undo().is_some());
     let restored = fixture.source();
     let restored_authority = restored.authority();
@@ -267,7 +280,7 @@ fn frozen_root_proof_survives_edit_but_never_authorizes_new_or_foreign_source() 
     assert!(matches!(
         restored_actual.require_layout_source(&foreign_same_root.authority()),
         Err(BidiError::SourceMismatch)
-    )); // 同generation/同root/同字节仍不等于同一次原Source capture。
+    )); // Equal generation, root, and bytes still do not identify the original Source capture.
 }
 
 #[test]
@@ -287,13 +300,14 @@ fn rtl_paragraphs_and_unproven_unicode_keep_original_cooperative_reader() {
             assert_eq!(first.status, MarkdownBidiPrepareStatus::Ready);
             let mut actual = preparation.take_ready(&authority).unwrap().unwrap();
             assert_ascii_oracle(text, base, &mut actual);
-            continue; // 真B段仍进完整oracle；只不再为已证明level0的源建立全部Text记录。
+            continue; // The complete oracle still checks actual B paragraphs; proven level zero only avoids the full Text table.
         }
         assert_eq!(first.status, MarkdownBidiPrepareStatus::Pending);
         assert!(preparation.take_ready(&authority).unwrap().is_none());
         if base == BidiBaseDirection::RightToLeft {
-            // RTL立即拒绝Uniform，原Store先创建FD，首量子尚无正文读取；不得为满足
-            // 测试期待而改写资源/读取顺序。随后完成原算法并与独立整段UBA语义对照。
+            // RTL immediately declines Uniform. The original Store creates its FD before
+            // text reads, so the first quantum has only resource work. Keep that actual
+            // order, then complete UBA and compare independent full-paragraph semantics.
             assert_eq!((first.bytes, first.source_borrow_max_bytes), (0, 0));
             assert_eq!((first.metadata_ops, first.resource_ops), (1, 1));
             let mut completed = false;
@@ -317,6 +331,8 @@ fn rtl_paragraphs_and_unproven_unicode_keep_original_cooperative_reader() {
 
 #[test]
 fn partial_ranges_read_only_original_one_byte_quanta_even_inside_mixed_leaf() {
+    // Partial scopes must use the actual Reader, even inside an otherwise proven or
+    // mixed leaf. Every poll retains the original one-byte Gate quantum.
     for (text, source, bytes) in [("abcd", 1..3, 1..3), ("aaa中bbb", 4..7, 6..9)] {
         let fixture = Fixture::new(text);
         let snapshot = fixture.document.text_snapshot();
@@ -348,7 +364,7 @@ fn partial_ranges_read_only_original_one_byte_quanta_even_inside_mixed_leaf() {
                 break;
             }
         }
-        assert!(done); // Partial必须读完其真实范围，不能以第一次Pending当作完成。
+        assert!(done); // Finish the actual partial range; its first Pending is not completion.
         assert_eq!(total_bytes, bytes.len());
         assert_eq!(gate.source_borrow_max(), 1);
     }
@@ -364,7 +380,7 @@ fn cancellation_still_revokes_before_and_after_zero_read_certificate() {
         let mapping = fixture.document.original_backing_observer().unwrap();
         let cancel = MarkdownBidiCancellation::new();
         if phase == 0 {
-            cancel.cancel(); // 构造前取消也不能借精确聚合制造一份新证书。
+            cancel.cancel(); // Preconstruction cancellation cannot use exact aggregates to mint a new certificate.
         }
         let (result, receipt) = MarkdownBidiPrepareJob::new_layout_source_observed(
             source,
@@ -378,7 +394,7 @@ fn cancellation_still_revokes_before_and_after_zero_read_certificate() {
         } else {
             let mut preparation = result.unwrap();
             if phase == 1 {
-                cancel.cancel(); // 已捕Source但尚未poll时取消，仍应退出原Future而不借正文。
+                cancel.cancel(); // Cancel after capture but before polling without borrowing text to finish the Future.
                 assert!(matches!(
                     preparation.step(&authority, ONE),
                     Err(BidiError::Cancelled)
@@ -414,7 +430,7 @@ fn actual_backing_eio_precedes_cancel_foreign_authority_and_ready_cache() {
         if ready {
             let first = preparation.step(&authority, ONE).unwrap();
             assert_eq!(first.status, MarkdownBidiPrepareStatus::Ready);
-            assert_eq!(first.bytes, 0); // 保留真实Ready缓存，随后实际源故障必须撤销它。
+            assert_eq!(first.bytes, 0); // Retain a real cached Ready, which the later actual source failure must revoke.
         }
         source.visit_byte_range(0..1, |_| Ok(())).unwrap();
         fixture.document.fail_next_original_reclaim_for_test();
@@ -423,7 +439,7 @@ fn actual_backing_eio_precedes_cancel_foreign_authority_and_ready_cache() {
             Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(
                 libc::EIO
             ))
-        ); // 只有原页实际驱逐失败才算EIO；设置测试位本身不算来源失败。
+        ); // Actual original-page reclaim failure establishes EIO; setting an injection flag alone does not.
         cancel.cancel();
         let foreign = fixture.source().authority();
         assert!(matches!(

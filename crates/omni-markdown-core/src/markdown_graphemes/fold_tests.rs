@@ -1,10 +1,11 @@
-//! 折叠只跳过真实硬控制之间的隐区；独立端点 oracle 同时核对可见序号和实际读取。
+//! Folds skip only hidden regions between actual hard controls. Independent endpoint oracles
+//! check visible-domain ordinals and actual source reads together.
 
 use super::{self as tests, *};
 use crate::markdown_layout_source::folds::FoldPlan;
 use std::ops::Range;
 
-/// 推进真实 job 到封存；每个 Pending 都应消费字节、标量或记录，不能靠空轮询假完成。
+/// Advance the real job through sealing; each Pending step consumes bytes, scalars, or records instead of empty polling.
 fn finish_folded(
     job: &mut MarkdownGraphemeJob,
     authority: &MarkdownLayoutTextAuthority,
@@ -23,7 +24,7 @@ fn finish_folded(
     panic!("有限可见内容没有完成真实 EOF");
 }
 
-/// 使用原 Source 的固定折叠证明；fixture 的 mmap 和索引仍由原资源 owner 管理。
+/// Use the original Source's fold proof while its actual resource owners retain the fixture mapping and index.
 fn folded_job(source: &MarkdownLayoutTextSource, hidden: Range<usize>) -> MarkdownGraphemeJob {
     let plan = FoldPlan::new(source, &[hidden]).unwrap();
     let mut job = MarkdownGraphemeJob::new(source.clone()).unwrap();
@@ -33,6 +34,8 @@ fn folded_job(source: &MarkdownLayoutTextSource, hidden: Range<usize>) -> Markdo
 
 #[test]
 fn folded_giant_unicode_body_reads_only_real_control_edges_and_visible_text() {
+    // The large hidden body is finite fixture data. Its independently supplied physical
+    // controls allow skipping the body while preserving exact global visible endpoints.
     let header = "# 中";
     let hidden_body = "👩\u{200d}💻\u{301}".repeat(8192);
     let suffix = "A\u{301}🇨🇳Z";
@@ -44,7 +47,8 @@ fn folded_giant_unicode_body_reads_only_real_control_edges_and_visible_text() {
         utf16: header.encode_utf16().count() + 2 + hidden_body.encode_utf16().count() + 2,
     };
     let mut job = folded_job(&source, 3..end.utf16);
-    // 此拒绝既不能误报非边界，也不能把健康 owner 撤权；随后仍须完成同一 job。
+    // A hidden-domain query must neither pretend NoBreak nor revoke this healthy owner;
+    // the same original job must remain usable at visible positions.
     for query in [
         MarkdownGraphemeQuery::IsBoundary,
         MarkdownGraphemeQuery::Previous,
@@ -74,7 +78,7 @@ fn folded_giant_unicode_body_reads_only_real_control_edges_and_visible_text() {
             byte: end.byte + 12,
             utf16: end.utf16 + 7,
         },
-    ]; // A×acute、RI×RI 的真实后缀规则不受被跳过的 emoji/Indic 状态污染。
+    ]; // Actual A-plus-acute and paired-RI suffix rules are not polluted by skipped emoji/Indic context.
     let mut prefix = job.stable_prefix(&authority).unwrap();
     let facts = prefix.facts().unwrap();
     assert_eq!(
@@ -119,6 +123,8 @@ fn folded_giant_unicode_body_reads_only_real_control_edges_and_visible_text() {
 
 #[test]
 fn folded_one_byte_crlf_and_real_eof_never_publish_hidden_control_ordinals() {
+    // One-byte quanta split CRLF and Unicode scalars. The explicit expectations cover
+    // closing controls, unterminated real EOF, and folds containing only their opening edge.
     let one = MarkdownGraphemeBudget {
         bytes: 1,
         scalars: 1,
@@ -157,7 +163,8 @@ fn folded_one_byte_crlf_and_real_eof_never_publish_hidden_control_ordinals() {
             expected_reads,
             "{text:?}"
         );
-        // 同一 Source 的普通 job 仍分析完整原文，并保持全源 ordinal；折叠不改全局协议。
+        // An ordinary job on the same Source still scans all text with whole-source
+        // ordinals; the folded display domain does not redefine the global protocol.
         let mut ordinary = MarkdownGraphemeJob::new(source.clone()).unwrap();
         tests::finish(&mut ordinary, &authority);
         assert_eq!(
@@ -174,6 +181,8 @@ fn folded_one_byte_crlf_and_real_eof_never_publish_hidden_control_ordinals() {
 
 #[test]
 fn folded_plan_keeps_exact_source_identity_cancel_and_first_resource_failure() {
+    // A separate capture cannot supply the fold proof even for the same document.
+    // Cancellation and actual original-source failure retain their distinct outcomes.
     let (directory, document) = tests::fixture("H\n中\nZ".as_bytes());
     let source = MarkdownLayoutTextSource::capture(&document);
     let foreign = MarkdownLayoutTextSource::capture(&document);
@@ -197,7 +206,8 @@ fn folded_plan_keeps_exact_source_identity_cancel_and_first_resource_failure() {
     ));
     let mut failed = folded_job(&source, 1..4);
     tests::poison_original_read_windows(&document);
-    // 同原 mmap 的真实首错优先于“隐藏范围”拒绝，不能借可见索引或取消状态掩盖 EIO。
+    // The original mmap's real failure precedes hidden-domain rejection; visible records
+    // or cancellation state cannot conceal its EIO.
     assert!(matches!(
         failed.query(
             &authority,

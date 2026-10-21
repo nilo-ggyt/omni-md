@@ -1,4 +1,4 @@
-//! 真实Core接口的边界、分页、失败与资源合同；官方原始case只从显式ROOT路径读取。
+//! Exercise actual Core boundaries, paging, failures, and resources; official source cases are read only from an explicitly supplied fixture path.
 use super::*;
 use crate::{MarkdownDocumentBuffer, MarkdownTextSelection};
 use sha2::{Digest, Sha256};
@@ -16,6 +16,7 @@ const TINY: MarkdownLineBreakBudget = MarkdownLineBreakBudget {
 };
 
 fn fixture(bytes: &[u8]) -> (TempDir, MarkdownDocumentBuffer) {
+    // This private synthetic file enters the production document/mmap path; the returned TempDir owns only this fixture.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("line-breaks.md");
     std::fs::write(&path, bytes).unwrap();
@@ -23,10 +24,12 @@ fn fixture(bytes: &[u8]) -> (TempDir, MarkdownDocumentBuffer) {
     (directory, document)
 }
 fn source(bytes: &[u8]) -> MarkdownLayoutTextSource {
+    // The immutable capture outlives the fixture document/path through its actual backing owner, without retaining an active editor or history.
     let (_directory, document) = fixture(bytes);
     MarkdownLayoutTextSource::capture(&document)
 }
 fn finish(job: &mut MarkdownLineBreakJob, authority: &MarkdownLayoutTextAuthority) {
+    // Tiny public quanta must converge to actual EOF while respecting every reported work dimension; a zero-work Pending would not be progress.
     let length = job.storage_profile().source_bytes;
     for _ in 0..length.checked_mul(4).unwrap().checked_add(16).unwrap() {
         let step = job.step(authority, TINY).unwrap();
@@ -48,6 +51,7 @@ fn finish(job: &mut MarkdownLineBreakJob, authority: &MarkdownLayoutTextAuthorit
     panic!("有限step没有达到真实EOF");
 }
 fn released(observer: &MarkdownLineBreakResourceObserver, source_done: bool) {
+    // Check this real derived index's returned FD/buffer independently of whether other legitimate Source owners still exist.
     let facts = observer.snapshot();
     assert!(!facts.metadata_file_open);
     assert_eq!(facts.metadata_map_bytes, 0);
@@ -65,6 +69,7 @@ fn compare(
     authority: &MarkdownLayoutTextAuthority,
     expected: &[(usize, usize)],
 ) -> usize {
+    // Use finite independent expected byte/UTF16 positions for all public query forms, including strict neighbors and interior coordinates.
     assert_eq!(job.storage_profile().boundary_records, expected.len());
     let profile = job.storage_profile();
     let mut count = 0;
@@ -113,7 +118,7 @@ fn compare(
     count
 }
 
-/// 每个量子只收费实际字节、标量和机会；折叠跳转不能以零工作 Pending 忙转。
+/// Each quantum charges actual bytes/scalars/opportunities; fold jumps cannot spin indefinitely with zero-work Pending.
 #[cfg(feature = "paged-line-compose")]
 fn finish_visible(job: &mut MarkdownLineBreakJob, authority: &MarkdownLayoutTextAuthority) {
     for _ in 0..16_384 {
@@ -134,9 +139,9 @@ fn finish_visible(job: &mut MarkdownLineBreakJob, authority: &MarkdownLayoutText
 
 #[cfg(feature = "paged-line-compose")]
 #[test]
-/// 同源折叠只撤内部查询；可见首尾机会仍逐条等同原完整 UAX14 结果。
+/// Same-Source folding denies interior queries only; visible opportunities remain identical to actual complete UAX14 results.
 fn folded_hard_breaks_keep_original_rules_and_deny_only_hidden_queries() {
-    // CR、LF、CRLF、真实无终止符 EOF 都由同一原 job 处理，含引号、数字和组合标记上下文。
+    // The same original job handles CR, LF, CRLF, and actual unterminated EOF, including quotation, numeric, and combining-mark context.
     for (text, hidden) in [
         ("a (\r\n隐😀\r\n后 1.2\n", 3..10),
         ("a\n\n后\n", 1..3),
@@ -181,7 +186,7 @@ fn folded_hard_breaks_keep_original_rules_and_deny_only_hidden_queries() {
                     Err(MarkdownLineBreakError::FoldedRange)
                 ));
             }
-            // 有效终点保留真实 mandatory；拒绝内部查询不会撤销它或原健康资源。
+            // A valid endpoint retains the actual Mandatory opportunity; denying interior access does not revoke it or healthy resources.
             assert!(matches!(
                 folded
                     .query(&authority, unit, end, MarkdownLineBreakQuery::IsBoundary)
@@ -202,7 +207,7 @@ fn folded_hard_breaks_keep_original_rules_and_deny_only_hidden_queries() {
 
 #[cfg(feature = "paged-line-compose")]
 #[test]
-/// 超长隐区不经过解码器，取消后仍须真实交还匿名索引与原 Source 资源。
+/// A giant hidden body bypasses decoding; cancellation still requires returning the actual anonymous index and original Source resources.
 fn folded_giant_body_is_not_read_and_original_eof_and_cancel_owners_still_apply() {
     let hidden_body = "隐😀ภาษาไทย".repeat(32_768);
     let text = format!("可见标题\r\n{hidden_body}\r\n后续正文\n");
@@ -234,13 +239,14 @@ fn folded_giant_body_is_not_read_and_original_eof_and_cancel_owners_still_apply(
     drop(folded);
     released(&observer, false);
     drop(original);
-    // proof 只保原 Weak authority；保留显示段表不应保活正文或匿名断行文件。
+    // The proof retains only original Weak authority; keeping a display plan must not keep text or the anonymous break file alive.
     released(&observer, true);
     drop(plan);
 }
 
 #[test]
 fn empty_crlf_and_surrogates_use_real_eof_and_exact_global_coordinates() {
+    // Every byte split must preserve CRLF, supplementary-scalar coordinates, and the single actual terminal opportunity, including an empty Source.
     for (bytes, expected) in [
         (b"".as_slice(), vec![(0, 0)]),
         ("A 中\r\n😀".as_bytes(), vec![(2, 2), (7, 5), (11, 7)]),
@@ -276,6 +282,7 @@ fn empty_crlf_and_surrogates_use_real_eof_and_exact_global_coordinates() {
 
 #[test]
 fn partial_context_does_not_publish_eot_and_sa_is_not_dictionary_ready() {
+    // A one-byte prefix cannot manufacture EOF or settle missing lookahead; later SA text remains explicitly dependent on dictionary work.
     let original = source("$ (.5 ภาษาไทย".as_bytes());
     let authority = original.authority();
     let mut job = MarkdownLineBreakJob::new(original).unwrap();
@@ -329,6 +336,7 @@ fn partial_context_does_not_publish_eot_and_sa_is_not_dictionary_ready() {
 
 #[test]
 fn same_payload_survives_edit_undo_and_document_drop_but_new_capture_is_foreign() {
+    // Canonical edits/history lifetime do not mutate the original immutable Source; an equal-looking later capture still has different authority.
     let (_directory, document) = fixture("A 中\r\n😀".as_bytes());
     let document = Rc::new(std::cell::RefCell::new(document));
     let canonical = Rc::downgrade(&document);
@@ -350,7 +358,7 @@ fn same_payload_survives_edit_undo_and_document_drop_but_new_capture_is_foreign(
     assert!(document.borrow_mut().undo().is_some());
     let foreign = MarkdownLayoutTextSource::capture(&document.borrow()).authority();
     drop(document);
-    assert!(canonical.upgrade().is_none()); // 索引只保不可变source，不保活动Doc或Undo对象。
+    assert!(canonical.upgrade().is_none()); // The index owns only immutable Source, without retaining the active document or Undo graph.
     finish(&mut job, &authority);
     compare(&mut job, &authority, &[(2, 2), (7, 5), (11, 7)]);
     assert!(matches!(
@@ -379,6 +387,7 @@ fn same_payload_survives_edit_undo_and_document_drop_but_new_capture_is_foreign(
 
 #[test]
 fn actual_readonly_fd_failure_revokes_prefix_and_closes_its_original_resources() {
+    // Retain the existing real-FD permission seam: production record append must fail at the OS boundary and revoke previously cached opportunities.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("metadata-control");
     std::fs::write(&path, b"unchanged").unwrap();
@@ -388,7 +397,7 @@ fn actual_readonly_fd_failure_revokes_prefix_and_closes_its_original_resources()
     let mut job = MarkdownLineBreakJob::new(original.clone()).unwrap();
     job.index = store::LineBreakIndex::test_with_file(readonly).unwrap();
     let observer = job.resource_observer();
-    // 600条真实机会超过一页512条；不是让尚未交付File的私有seal冒充写失败。
+    // Six hundred actual opportunities exceed the 512-record page; a real append to the handed-off read-only File supplies the failure.
     let mut failure = None;
     for _ in 0..32 {
         match job.step(&authority, MarkdownLineBreakBudget::default()) {
@@ -431,6 +440,7 @@ fn actual_readonly_fd_failure_revokes_prefix_and_closes_its_original_resources()
 
 #[test]
 fn cross_page_queries_and_many_no_breaks_keep_one_buffer_and_no_scalar_inventory() {
+    // Complete a real many-page index, query old records backward, then verify its actual bounded write buffer and release facts.
     let original = source("a ".repeat(10_000).as_bytes());
     let authority = original.authority();
     let mut job = MarkdownLineBreakJob::new(original).unwrap();
@@ -469,17 +479,17 @@ fn cross_page_queries_and_many_no_breaks_keep_one_buffer_and_no_scalar_inventory
 
 #[test]
 fn unicode_cross_page_strict_queries_keep_pending_prefix_and_sealed_eof() {
-    // 固定字面每组只有一个emoji和一个空格，真实断行机会在空格之后（LB18）；
-    // 原文每组恰为5个UTF8字节、3个UTF16单元，不能由待测索引反推期望坐标。
-    // 1027组跨过两个512-record页，最后三条仍处于未满的真实追加页。
+    // Each fixed literal contains one emoji and a space, with the actual LB18 opportunity after the space.
+    // Its independent stride is five UTF8 bytes and three UTF16 units; expectations are not inferred from the index under test.
+    // 1027 groups span two complete 512-record pages and three records in the actual partial append page.
     let text = "😀 ".repeat(1027);
     let original = source(text.as_bytes());
     let authority = original.authority();
     let mut job = MarkdownLineBreakJob::new(original).unwrap();
     let observer = job.resource_observer();
 
-    // 在旧页恰满、下一页首条和第三页首条分别暂停。这里只通过公开查询判断前缀
-    // 已交付，不读取私有页号、记录槽或machine位置来制造准备完成的事实。
+    // Pause when the old page is full and at the first records of its two successors. Only public queries establish prefix availability;
+    // private page numbers, record slots, or machine positions do not manufacture readiness for this scenario.
     for ordinal in [512, 513, 1025] {
         for _ in 0..text.len() * 4 {
             if matches!(
@@ -506,8 +516,8 @@ fn unicode_cross_page_strict_queries_keep_pending_prefix_and_sealed_eof() {
             (MarkdownLineBreakUnit::Utf16, 3),
         ] {
             let at = ordinal * stride;
-            // 页首相等时Previous必须交付旧页的真实前一条；Next不能以当前机会自身
-            // 或尚未发布的未来记录作答。字节/代理项坐标不相同，但两边属于同一机会。
+            // At an equal page-start record, Previous must read the actual old-page predecessor; Next cannot return itself or an unpublished record.
+            // Byte and UTF16 coordinates differ but identify the same actual opportunity.
             for (offset, query, expected) in [
                 (
                     at,
@@ -540,7 +550,7 @@ fn unicode_cross_page_strict_queries_keep_pending_prefix_and_sealed_eof() {
                     .unwrap(),
                 MarkdownLineBreakAnswer::Pending
             );
-            // 全文EOF仍在未读尾部，不能因追加页已含机会便签出其Previous或非边界。
+            // Document EOF is still unread; published append-page opportunities cannot certify its predecessor or a negative boundary answer.
             for query in [
                 MarkdownLineBreakQuery::IsBoundary,
                 MarkdownLineBreakQuery::Previous,
@@ -554,8 +564,8 @@ fn unicode_cross_page_strict_queries_keep_pending_prefix_and_sealed_eof() {
     }
 
     finish(&mut job, &authority);
-    // 封口后再从新旧页来回查询；零位置、真实EOF与页首两侧都保严格小于/大于，
-    // 并确认半页保留不会改变同一源的完整查询结果。
+    // After actual sealing, query both old and new pages again. Zero, EOF, and both sides of page starts retain strict neighboring semantics;
+    // keeping a partial append page must not change complete results for this same Source.
     for ordinal in [0, 1, 511, 512, 513, 1023, 1024, 1025, 1026, 1027] {
         for (unit, stride) in [
             (MarkdownLineBreakUnit::Byte, 5),
@@ -587,7 +597,7 @@ fn unicode_cross_page_strict_queries_keep_pending_prefix_and_sealed_eof() {
             }
         }
     }
-    // 原资源观察随同一生产任务close核归还，不额外保存Source、页或FD的强owner。
+    // Observe release through the same production job's close, without another strong Source, page, or FD owner.
     job.close().unwrap();
     released(&observer, true);
 }
@@ -595,6 +605,7 @@ fn unicode_cross_page_strict_queries_keep_pending_prefix_and_sealed_eof() {
 #[test]
 #[ignore = "需要ROOT官方Unicode18 LineBreakTest及显式OMNI_LB18_TEST_FILE"]
 fn official_19346_every_byte_split_and_real_core_global_queries() {
+    // This explicitly ignored oracle requires the exact official fixture identity; a normal test run does not imply the corpus was executed.
     let path = std::env::var_os("OMNI_LB18_TEST_FILE").expect("需要官方ROOT fixture路径");
     let mut file = File::open(&path).unwrap();
     let mut hash = Sha256::new();
@@ -617,6 +628,7 @@ fn official_19346_every_byte_split_and_real_core_global_queries() {
         .lines()
         .enumerate()
     {
+        // Reconstruct only one bounded official case and its independent break markers, then test every byte split through the real job.
         let line = line.unwrap();
         let body = line.split('#').next().unwrap().trim();
         if body.is_empty() {

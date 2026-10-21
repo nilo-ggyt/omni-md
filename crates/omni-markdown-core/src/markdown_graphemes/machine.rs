@@ -1,4 +1,5 @@
-//! 固定状态只记录规则所需的有限后缀，不把piece、配额或窗口边界当作段首/段尾。
+//! Fixed state retains only the suffix needed by Unicode rules. Piece, quantum, and viewport
+//! edges do not become paragraph starts or ends.
 use super::{
     MarkdownGraphemeBoundary as Boundary, MarkdownGraphemeError as Error,
     MarkdownGraphemeStatus as Status, MarkdownGraphemeStep as Step, Result, store::BoundaryIndex,
@@ -12,6 +13,8 @@ struct Properties {
     ep: bool,
 }
 fn property(table: &[(u32, u32, u8)], scalar: u32) -> u8 {
+    // Generated ranges are sorted and disjoint. An uncovered scalar uses that property's
+    // zero/default value without consulting the host Rust version's Unicode tables.
     let index = table.partition_point(|row| row.0 <= scalar);
     if index == 0 || scalar > table[index - 1].1 {
         0
@@ -41,15 +44,15 @@ impl State {
         let Some(previous) = self.previous else {
             return true;
         };
-        // GB3优先于控制字符；CR/LF跨chunk仍是同一对，不会因为新页而拆开。
+        // GB3 precedes control-character breaks: CR/LF remains one pair across chunks.
         if previous == 1 && current.gcb == 2 {
             return false;
         }
-        // GB4/GB5在所有扩展、Indic与emoji规则前应用。
+        // Apply GB4/GB5 before extension, Indic, and emoji rules.
         if matches!(previous, 1..=3) || matches!(current.gcb, 1..=3) {
             return true;
         }
-        // GB6..8保持Hangul组合次序，LV/LVT直接使用官方GCB数据。
+        // GB6..8 preserve Hangul composition order; LV/LVT come from the original GCB data.
         if previous == 9 && matches!(current.gcb, 9 | 10 | 12 | 13) {
             return false;
         }
@@ -59,25 +62,27 @@ impl State {
         if matches!(previous, 11 | 13) && current.gcb == 11 {
             return false;
         }
-        // GB9/9a/9b只决定边界，随后状态更新仍处理每个真实标量。
+        // GB9/9a/9b decide this boundary only; state advancement still processes each scalar.
         if matches!(current.gcb, 4 | 5 | 8) || previous == 7 {
             return false;
         }
-        // Unicode18 GB9c是Linker Extend* × Consonant，不再要求Linker左边存在Consonant。
+        // Unicode 18 GB9c uses Linker Extend* × Consonant without requiring a preceding Consonant.
         if current.incb == 1 && self.linker_extend_suffix {
             return false;
         }
-        // GB11只认GCB Extend和实际EP属性，不能把其他InCB Extend混为emoji上下文。
+        // GB11 requires GCB Extend and actual EP properties; other InCB Extend values are not emoji context.
         if previous == 5 && current.ep && self.zwj_after_ep {
             return false;
         }
-        // GB12/13只需RI连续段奇偶，不持有任意长RI列表或按chunk重置计数。
+        // GB12/13 retain only RI-run parity, with no unbounded RI list or chunk-based reset.
         if previous == 6 && current.gcb == 6 && self.ri_odd {
             return false;
         }
         true
     }
     fn advance(&mut self, current: Properties) {
+        // Derive all suffix facts from the previous state before replacing the preceding
+        // property, so scalar boundaries do not sever RI, emoji, or Indic context.
         self.ri_odd = current.gcb == 6 && (self.previous != Some(6) || !self.ri_odd);
         self.zwj_after_ep = current.gcb == 5 && self.ep_extend_suffix;
         self.ep_extend_suffix = current.ep || (current.gcb == 4 && self.ep_extend_suffix);
@@ -87,7 +92,7 @@ impl State {
     }
 }
 
-/// 脚本阶段复用原字素规则与数据；只携带固定后缀，不创建第二份边界索引或正文源。
+/// The script stage reuses these rules and fixed suffix state without another source or boundary index.
 #[cfg(feature = "paged-scripts")]
 #[derive(Default)]
 pub(crate) struct ScalarCursor(State);
@@ -97,7 +102,7 @@ impl ScalarCursor {
         let current = properties(scalar);
         let boundary = self.0.break_before(current);
         self.0.advance(current);
-        boundary // 必须先用旧后缀判断，再推进同一个State；chunk或配额不会重置它。
+        boundary // Classify with the old suffix before advancing the same state; chunks and quanta do not reset it.
     }
 }
 
@@ -116,7 +121,8 @@ pub(super) struct Machine {
 }
 
 impl Machine {
-    /// 原 row 票证明 BOF/完整换行之后的 GB1/GB4 首边界；未读内部不产生任何字素记录。
+    /// An original row ticket proves its initial GB1/GB4 boundary at BOF or after a complete
+    /// line ending. Unread row interiors produce no grapheme records.
     #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
     pub(super) fn begin_table(
         &mut self,
@@ -136,7 +142,8 @@ impl Machine {
             self.last_boundary = Some(span.start);
             step.records += 1;
         }
-        // 已读短前缀只保其真实历史记录；剩余正文没有要恢复的 GCB 上下文，末 CR/LF 将实际重入 DFA。
+        // Preserve any already committed short prefix. Skip the remaining opaque body;
+        // the actual trailing CR/LF will reenter this same DFA and establish its control suffix.
         self.byte = span.tail.byte;
         self.utf16 = span.tail.utf16;
         self.used = 0;
@@ -146,7 +153,8 @@ impl Machine {
         Ok(true)
     }
 
-    /// 真末 CR/LF 已完整消费后才提交 GB4 尾端，未终止的真实 Source EOF 则由 GB2 认证。
+    /// Commit the GB4 endpoint only after consuming actual trailing CR/LF; an unterminated
+    /// row ending at real Source EOF instead receives GB2 through finish.
     #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
     pub(super) fn finish_table(
         &mut self,
@@ -186,7 +194,7 @@ impl Machine {
         self.push_scalar_byte(byte, index, step, false)
     }
 
-    /// 末尾真实 CR/LF 只恢复规则后缀；隐藏内部不能写边界或扩大已分类前沿。
+    /// Actual trailing CR/LF restores rule state without publishing hidden interior boundaries or frontier.
     #[cfg(feature = "paged-line-compose")]
     pub(super) fn push_fold_tail(
         &mut self,
@@ -197,7 +205,8 @@ impl Machine {
         self.push_scalar_byte(byte, index, step, true)
     }
 
-    /// 原 UTF8 解码和规则状态始终只有一份；opaque_tail 仅允许已证明隐区末端的真实控制字节。
+    /// One decoder and rule state serve the original source. opaque_tail accepts only real
+    /// control bytes at a previously proven hidden region's trailing edge.
     fn push_scalar_byte(
         &mut self,
         byte: u8,
@@ -206,12 +215,14 @@ impl Machine {
         opaque_tail: bool,
     ) -> Result<()> {
         let position = self.byte;
-        // 此byte已经从真实piece解引用；即使下面发现UTF8错误，也要计入实际消耗后永久失败。
+        // This byte was actually dereferenced from a piece. Charge it even when decoding
+        // fails below and permanently revokes the caller's job.
         self.byte = self.byte.checked_add(1).ok_or(Error::CoordinateOverflow)?;
         step.bytes = step.bytes.checked_add(1).ok_or(Error::CoordinateOverflow)?;
         if self.used == 0 {
             self.scalar_start = position;
-            // UTF8前导长度仅保留单标量残余；后继完整from_utf8再核过长编码、代理区和上界。
+            // Retain only one scalar's leading-length state. The completed from_utf8 check
+            // below rejects overlong encoding, surrogate values, and out-of-range scalars.
             self.needed = match byte {
                 0..=0x7f => 1,
                 0xc2..=0xdf => 2,
@@ -223,7 +234,8 @@ impl Machine {
         self.pending[self.used] = byte;
         self.used += 1;
         if self.used != self.needed {
-            // 真实借用已结束也不丢弃残余；下次step从同一全局byte继续，不重新发sot。
+            // A borrow ending mid-scalar retains its bytes; the next step resumes the same
+            // global position rather than declaring a new start of text.
             return Ok(());
         }
         let scalar = std::str::from_utf8(&self.pending[..self.used])
@@ -232,14 +244,15 @@ impl Machine {
             .ok_or(Error::InvalidUtf8)?;
         if opaque_tail && !matches!(scalar, '\r' | '\n') {
             return Err(Error::CorruptMetadata);
-        } // 只有实际硬控制能切断任意长 RI/emoji/Indic 后缀，不能拿任意隐藏标量重置状态。
+        } // Only actual hard controls can sever arbitrary RI/emoji/Indic suffixes; hidden scalars cannot reset them.
         let boundary = Boundary {
             byte: self.scalar_start,
             utf16: self.utf16,
         };
         let value = properties(scalar);
         if !opaque_tail && self.state.break_before(value) && self.last_boundary != Some(boundary) {
-            // 只有实际规则确认的边界才写索引；IO失败不会继续更新或假装发布这一记录。
+            // Append only rule-confirmed boundaries. An I/O failure returns before updating
+            // the committed endpoint or pretending that the record was published.
             index.push(boundary)?;
             self.last_boundary = Some(boundary);
             step.records = step
@@ -263,7 +276,8 @@ impl Machine {
         Ok(())
     }
 
-    /// 已完整读取首分隔符后才允许跨过隐区；坐标跳跃不产生任何读取、标量或边界计数。
+    /// Jump only after consuming the complete opening delimiter; skipped coordinates incur
+    /// no fictional byte reads, decoded scalars, or boundary records.
     #[cfg(feature = "paged-line-compose")]
     pub(super) fn jump_fold(
         &mut self,
@@ -284,8 +298,8 @@ impl Machine {
         self.byte = to.byte;
         self.utf16 = to.utf16;
         self.frontier = Some(visible_start);
-        // 保留真实首控制后缀，随后只消费真实末控制；两者均由 GB4/5 切断隐藏文本上下文。
-        // 无终止符的真正 EOF 不再查询后继，只能由原 finish 发布 GB2。
+        // Preserve the actual opening control suffix, then consume only actual closing
+        // controls. GB4/5 isolate hidden context; unterminated real EOF is handled by finish/GB2.
         Ok(())
     }
 
@@ -295,7 +309,7 @@ impl Machine {
             utf16: self.utf16,
         };
         if self.last_boundary != Some(end) {
-            // 空源也只有一个0..0边界；末尾记录必须仍消费原step记录预算。
+            // Empty input still has one 0..0 boundary. The final record consumes this step's record quantum.
             index.push(end)?;
             self.last_boundary = Some(end);
             step.records = step
@@ -303,7 +317,8 @@ impl Machine {
                 .checked_add(1)
                 .ok_or(Error::CoordinateOverflow)?;
         }
-        // 先真实封存匿名索引，再授予完整EOF权限；同步失败时调用方永久撤权。
+        // Seal the actual index before granting complete EOF authority. A sealing failure
+        // propagates so the caller permanently revokes the job.
         index.seal()?;
         self.frontier = Some(end);
         self.ready = true;

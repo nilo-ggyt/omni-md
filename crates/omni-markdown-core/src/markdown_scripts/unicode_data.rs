@@ -1,4 +1,4 @@
-//! 由固定Unicode18脚本数据生成；generate-script-data.py核每个输入SHA后重建。
+//! Generated from pinned Unicode 18 script data; generate-script-data.py verifies every input SHA.
 // SPDX-License-Identifier: Unicode-3.0
 // UNICODE LICENSE V3
 //

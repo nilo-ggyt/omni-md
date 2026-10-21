@@ -1,4 +1,5 @@
-//! 开放证明与完整原SCX结果逐范围比较；有限测试镜像不进入产品状态。
+//! Compares open-prefix proofs range by range with complete original SCX runs.
+//! Finite expected results remain test data, not additional production state.
 use super::*;
 
 const ONE: MarkdownScriptBudget = MarkdownScriptBudget {
@@ -15,6 +16,8 @@ fn fixture(
     crate::MarkdownDocumentBuffer,
     MarkdownLayoutTextSource,
 ) {
+    // Both jobs can share one actual frozen source and its capture identity.
+    // The temporary directory owns all fixture bytes for this case.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("稳定脚本前缀.md");
     std::fs::write(&path, text).unwrap();
@@ -27,11 +30,15 @@ fn job(
     source: &MarkdownLayoutTextSource,
     cancellation: &MarkdownScriptCancellation,
 ) -> MarkdownScriptJob {
+    // Disable only the summary optimization so the original scalar machine
+    // remains the independent complete-run oracle for prefix publication.
     MarkdownScriptJob::new_streaming(source.clone(), &source.authority(), cancellation.clone())
         .unwrap()
 }
 
 fn finish(job: &mut MarkdownScriptJob, authority: &MarkdownLayoutTextAuthority) {
+    // One unit of each quota repeatedly resumes the original machine. The
+    // finite bound fails instead of treating an unfinished oracle as complete.
     for _ in 0..1_000_000 {
         if job.step(authority, ONE).unwrap().status == MarkdownScriptStatus::Ready {
             return;
@@ -42,6 +49,8 @@ fn finish(job: &mut MarkdownScriptJob, authority: &MarkdownLayoutTextAuthority) 
 
 #[test]
 fn pure_han_and_distant_latin_offer_singleton_prefix_without_closing_the_run_or_reading_the_tail() {
+    // A singleton Hani candidate can publish a settled local prefix before its
+    // eventual boundary, including when a distant Latin run follows it.
     for text in ["中文".repeat(4096), format!("{}tail", "中文".repeat(4096))] {
         let (_directory, _document, source) = fixture(&text);
         let authority = source.authority();
@@ -51,6 +60,8 @@ fn pure_han_and_distant_latin_offer_singleton_prefix_without_closing_the_run_or_
         for _ in 0..64 {
             actual.step(&authority, ONE).unwrap();
             {
+                // Keep this proof borrowed only while reading its facts; later
+                // mutable steps must not retain the borrowed machine state.
                 if let MarkdownScriptPrefixAnswer::Known(Some(prefix)) = actual
                     .stable_prefix_at(&authority, MarkdownScriptUnit::Utf16, 0)
                     .unwrap()
@@ -80,6 +91,8 @@ fn pure_han_and_distant_latin_offer_singleton_prefix_without_closing_the_run_or_
         let first = observed.expect("singleton前缀不需等纯Hani完整EOF");
         assert!(actual.storage_profile().source_bytes_read <= 64);
         assert_eq!(actual.storage_profile().completed_runs, 0);
+        // An open prefix is deliberately weaker than a complete run: the public
+        // closed-run query still cannot authorize the unread continuation.
         assert_eq!(
             actual
                 .run_at(&authority, MarkdownScriptUnit::Utf16, 0)
@@ -87,6 +100,8 @@ fn pure_han_and_distant_latin_offer_singleton_prefix_without_closing_the_run_or_
             MarkdownScriptAnswer::Pending
         );
         let mut oracle = job(&source, &cancellation);
+        // Compare with completion over the same original source, rather than
+        // recapturing equal bytes and substituting another authority.
         finish(&mut oracle, &authority);
         let MarkdownScriptAnswer::Known(Some(complete)) = oracle
             .run_at(&authority, MarkdownScriptUnit::Utf16, 0)
@@ -101,6 +116,8 @@ fn pure_han_and_distant_latin_offer_singleton_prefix_without_closing_the_run_or_
 
 #[test]
 fn every_published_prefix_matches_complete_original_runs_in_mixed_text_and_nested_pairs() {
+    // At each incremental publication, every covered UTF-16 unit must agree
+    // with the original machine on start and script, without overstating its end.
     for text in [
         "中文abc中文DEF",
         "  中(abc)文 a(α)中",
@@ -137,6 +154,8 @@ fn every_published_prefix_matches_complete_original_runs_in_mixed_text_and_neste
                             && facts.end_utf16 <= expected.end_utf16
                     );
                     if prefix.kind().unwrap() == MarkdownScriptPrefixKind::ClosedRun {
+                        // Only ClosedRun promises the full final extent; a
+                        // StableOpenPrefix may stop at an earlier settled GCB.
                         assert_eq!(facts, expected);
                     }
                 }
@@ -160,6 +179,8 @@ fn every_published_prefix_matches_complete_original_runs_in_mixed_text_and_neste
 
 #[test]
 fn ambiguous_scx_common_and_unclosed_giant_cluster_stay_pending() {
+    // Ambiguous SCX, unresolved Common text, and a giant first combining cluster
+    // each lack one of the facts needed to publish a stable open prefix.
     for text in [
         format!("{}カ", "ー".repeat(1024)),
         format!("{}中", "🙂".repeat(1024)),
@@ -178,11 +199,13 @@ fn ambiguous_scx_common_and_unclosed_giant_cluster_stay_pending() {
             ));
         }
         assert_eq!(actual.storage_profile().completed_runs, 0);
-    } // 多候选、未定Common及首个未闭合cluster都不能借primary或GB2冒充稳定脚本。
+    } // Neither a primary-script guess nor an artificial GB2 boundary establishes the missing proof.
 }
 
 #[test]
 fn action_in_progress_never_exposes_an_open_prefix_and_rtl_is_only_a_script_fact() {
+    // This existing internal-state assertion checks that suspended pairing work
+    // hides open candidates; it is not a native caller or input-event test.
     let text = format!("a({}α{}א)", "(".repeat(80), ")".repeat(80));
     let (_directory, _document, source) = fixture(&text);
     let authority = source.authority();
@@ -199,6 +222,8 @@ fn action_in_progress_never_exposes_an_open_prefix_and_rtl_is_only_a_script_fact
         }
     }
     assert!(pending_action);
+    // Hebrew can establish a script prefix independently of UBA. Its tag grants
+    // no resolved level, base direction, or visual ordering.
     let (_other_directory, _other_document, rtl_source) = fixture(&"אבג".repeat(100));
     let rtl_authority = rtl_source.authority();
     let mut rtl = job(&rtl_source, &MarkdownScriptCancellation::new());
@@ -214,11 +239,13 @@ fn action_in_progress_never_exposes_an_open_prefix_and_rtl_is_only_a_script_fact
             break;
         }
     }
-    assert!(found); // Hebr事实不包含level/base/方向；后继UBA不得据此跳过双向规则。
+    assert!(found); // A downstream UBA pass must still resolve levels and direction from its own original context.
 }
 
 #[test]
 fn borrowed_prefix_observes_cancel_source_errno_and_actual_owner_release() {
+    // Borrow a real prefix before cancellation. The existing reclaim fault hook
+    // separately checks source-error priority while that proof is still live.
     for source_error in [false, true] {
         let (_directory, document, source) = fixture(&"中文".repeat(128));
         let authority = source.authority();
@@ -238,6 +265,8 @@ fn borrowed_prefix_observes_cancel_source_errno_and_actual_owner_release() {
                 panic!("先取得真实稳定前缀")
             };
             if source_error {
+                // Earlier real source visits supply reclaimable windows; this
+                // explicit hook injects EIO into their actual reclaim path.
                 document.fail_next_original_reclaim_for_test();
                 assert!(matches!(
                     document.reclaim_original_read_windows_for_test(),
@@ -262,6 +291,8 @@ fn borrowed_prefix_observes_cancel_source_errno_and_actual_owner_release() {
             }
         }
         actual.close().unwrap();
+        // Permission failure is not resource completion. Drop every remaining
+        // source/document owner before observing final payload and mmap release.
         let closed = resources.snapshot();
         assert!(
             !closed.run_file_open
@@ -277,6 +308,8 @@ fn borrowed_prefix_observes_cancel_source_errno_and_actual_owner_release() {
 
 #[test]
 fn equal_bytes_foreign_authority_cannot_borrow_the_original_prefix() {
+    // Byte equality cannot transfer a capture's authority. A mismatched query
+    // poisons the job, so its original ticket cannot revive the same attempt.
     let (_directory, _document, source) = fixture("中文");
     let (_foreign_directory, _foreign_document, foreign) = fixture("中文");
     let mut actual = job(&source, &MarkdownScriptCancellation::new());

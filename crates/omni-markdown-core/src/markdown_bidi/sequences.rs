@@ -1,6 +1,6 @@
 // Copyright 2015 The Servo Project Developers.
 // Algorithm adapted from unicode-bidi 0.3.18 prepare.rs. SPDX-License-Identifier: MIT OR Apache-2.0
-//! BD13/X10：IRS以磁盘双向run链表示，暂停栈和已完成sequence均不创建段长Vec。
+//! BD13/X10 represent isolating run sequences as disk-backed bidirectional run chains, without paragraph-length Vecs for suspended or completed sequences.
 
 use super::prepare::io::CooperativeStore;
 use super::*;
@@ -16,6 +16,7 @@ pub(super) async fn next(
     store: &mut CooperativeStore,
     position: Position,
 ) -> Result<Option<Position>, BidiError> {
+    // Advance one original UTF16 record within its run, then follow the actual linked successor; source envelopes do not describe an IRS path.
     let run = Run::read_prepared(store, position.run).await?;
     if position.index + 1 < run.end {
         return Ok(Some(Position {
@@ -37,6 +38,7 @@ pub(super) async fn previous(
     store: &mut CooperativeStore,
     position: Position,
 ) -> Result<Option<Position>, BidiError> {
+    // Traverse the same actual run chain backward rather than treating intervening isolated source text as part of this sequence.
     let run = Run::read_prepared(store, position.run).await?;
     if position.index > run.start {
         return Ok(Some(Position {
@@ -81,7 +83,7 @@ pub(super) async fn compute(
 ) -> Result<u32, BidiError> {
     use BidiClass::*;
     let mut stack = DiskStack::new();
-    store.stack_push(&mut stack, NONE, NONE).await?; // 原算法的空底层sequence不是一个真正的可枚举run。
+    store.stack_push(&mut stack, NONE, NONE).await?; // The algorithm's empty bottom sequence is a sentinel, not an actual enumerable run.
     let mut count = 0;
     for id in runs {
         let run = Run::read_prepared(store, id).await?;
@@ -90,6 +92,7 @@ pub(super) async fn compute(
         }
         let start_class = Text::read_prepared(store, run.start).await?.original;
         let mut end_class = start_class;
+        // X9-removed trailing records do not determine the run's isolate-ending behavior.
         for index in (run.start..run.end).rev() {
             let class = Text::read_prepared(store, index).await?.original;
             if !removed(class) {
@@ -98,6 +101,7 @@ pub(super) async fn compute(
             }
         }
         let (head, tail) = if start_class == PDI && stack.len() > 1 {
+            // Resume the original suspended chain only when an actual matching PDI starts this run.
             store
                 .stack_pop(&mut stack)
                 .await?
@@ -108,6 +112,7 @@ pub(super) async fn compute(
         let head = if head == NONE {
             id
         } else {
+            // Connect real run records in place; a resumed chain does not copy a list accumulated while its isolate was suspended.
             let mut previous = Run::read_prepared(store, tail).await?;
             previous.next = id;
             previous.write_prepared(store, tail).await?;
@@ -117,13 +122,14 @@ pub(super) async fn compute(
             head
         };
         if matches!(end_class, RLI | LRI | FSI) {
-            store.stack_push(&mut stack, head, id).await?; // 匹配PDI会恢复同一真实链，不拷贝累计run列表。
+            store.stack_push(&mut stack, head, id).await?; // A matching PDI restores this actual chain without copying accumulated runs.
         } else {
             emit(store, paragraph, head, id, count).await?;
             count += 1;
         }
     }
     while let Some((head, tail)) = store.stack_pop(&mut stack).await? {
+        // Unmatched suspended chains still become actual sequences at paragraph end; the empty bottom sentinel emits nothing.
         if head != NONE {
             emit(store, paragraph, head, tail, count).await?;
             count += 1;
@@ -147,6 +153,7 @@ async fn emit(
     };
     let first = first(store, sequence).await?;
     let last = last(store, sequence).await?;
+    // Determine effective endpoint levels along this IRS, skipping X9-removed records without discarding their original coordinates.
     let mut start_level = Text::read_prepared(store, first.index).await?.level;
     let mut cursor = Some(first);
     while let Some(position) = cursor {
@@ -168,6 +175,7 @@ async fn emit(
         cursor = previous(store, position).await?;
     }
     let mut predecessor = paragraph.base;
+    // X10 uses actual surrounding paragraph levels for sos/eos; an ending isolate does not acquire an unrelated following strong context.
     for index in (paragraph.start..first.index).rev() {
         let text = Text::read_prepared(store, index).await?;
         if !removed(text.original) {
@@ -201,7 +209,7 @@ async fn emit(
     sequence.write_prepared(store, id).await
 }
 
-/// IRS内两个端点之间的真实连续游标范围；不把隔离段中间的source envelope当作本sequence。
+/// Update the actual cursor interval within one IRS; its source envelope must not include intervening isolated text as though it belonged to this sequence.
 pub(super) async fn set_processing(
     store: &mut CooperativeStore,
     start: Option<Position>,

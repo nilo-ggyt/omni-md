@@ -1,4 +1,5 @@
-//! 产品接口以有限合成oracle验证；官方原文件只从显式环境参数读取，不复制进仓库。
+//! Verify product entry points with finite synthetic oracles. Official test data is read only
+//! through an explicit environment path, never copied into the repository.
 use super::*;
 use crate::{MarkdownDocumentBuffer, MarkdownTextSelection};
 use sha2::{Digest, Sha256};
@@ -18,7 +19,8 @@ const TINY: MarkdownGraphemeBudget = MarkdownGraphemeBudget {
     scalars: 1,
     records: 1,
 };
-/// 先真实借入一页，再在公开测试驱逐点制造I/O失败；归还pin本身不代表msync发生。
+/// Borrow a real source page before failing the existing reclaim boundary. Returning a pin
+/// alone does not establish that the actual reclaim operation ran.
 fn poison_original_read_windows(document: &MarkdownDocumentBuffer) {
     document
         .text_snapshot()
@@ -30,10 +32,11 @@ fn poison_original_read_windows(document: &MarkdownDocumentBuffer) {
         Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(
             libc::EIO
         ))
-    ); // 只有真实无pin页回收已失败，后继算法才应观察同一个永久源错误。
+    ); // Only after actual unpinned-page reclaim fails should consumers observe this permanent Source error.
 }
 
 fn fixture(bytes: &[u8]) -> (TempDir, MarkdownDocumentBuffer) {
+    // Each fixture owns its isolated file and directory; no production vault is involved.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("graphemes.md");
     std::fs::write(&path, bytes).unwrap();
@@ -41,12 +44,15 @@ fn fixture(bytes: &[u8]) -> (TempDir, MarkdownDocumentBuffer) {
     (directory, document)
 }
 fn source(bytes: &[u8]) -> MarkdownLayoutTextSource {
+    // The captured immutable payload survives the document and pathname owners. Algorithms
+    // must not need the document, its history, or its save authority to read this source.
     let (_directory, document) = fixture(bytes);
     MarkdownLayoutTextSource::capture(&document)
 }
 fn finish(job: &mut MarkdownGraphemeJob, authority: &MarkdownLayoutTextAuthority) {
     let length = job.storage_profile().source_bytes;
-    // 有限配额允许中途停止；每个Pending都必须真正消费输入或输出记录，不能靠空轮询完成。
+    // Tiny independent quanta may suspend mid-scalar. Every unfinished step must consume
+    // actual input or output records rather than completing through empty polling.
     for _ in 0..length.saturating_mul(4).saturating_add(16) {
         let step = job.step(authority, TINY).unwrap();
         assert!(
@@ -72,6 +78,8 @@ fn finish(job: &mut MarkdownGraphemeJob, authority: &MarkdownLayoutTextAuthority
     panic!("有限step未完成真实EOF");
 }
 fn released(observer: &MarkdownGraphemeResourceObserver, source_done: bool) {
+    // Index cleanup and source-payload destruction are separate ownership facts. These
+    // bounded metadata measurements do not claim whole-process RSS or unrelated owners.
     let facts = observer.snapshot();
     assert!(facts.metadata_owner_released);
     assert!(!facts.metadata_file_open);
@@ -97,7 +105,8 @@ fn compare(
     let mut count = 0;
     for unit in [MarkdownGraphemeUnit::Byte, MarkdownGraphemeUnit::Utf16] {
         let maximum = coordinate(*expected.last().unwrap(), unit);
-        // 所有坐标都观察，包含UTF8内部byte及UTF16低代理项；只有官方÷位置可以返回Some。
+        // Query every coordinate, including UTF-8 interiors and UTF-16 low surrogates.
+        // Only independently supplied break positions may produce a matching boundary.
         for offset in 0..=maximum {
             for query in [
                 MarkdownGraphemeQuery::IsBoundary,
@@ -127,7 +136,7 @@ fn compare(
                 count += 1;
             }
         }
-        // 严格逆序遍历的期望来自独立breaklist，不把DFA顺序输出用作反向oracle。
+        // Reverse expectations come from the independent break list, not the DFA's own forward output.
         for &boundary in expected.iter().rev() {
             let offset = coordinate(boundary, unit);
             let wanted = expected
@@ -146,6 +155,8 @@ fn compare(
     count
 }
 fn each_split(bytes: &[u8], expected: &[MarkdownGraphemeBoundary]) {
+    // Force the actual paged machine through every byte split of the finite source;
+    // Dense admission must not bypass UTF-8, rule-state, or index I/O boundaries.
     let source = source(bytes);
     let authority = source.authority();
     for split in 0..=bytes.len() {
@@ -171,7 +182,8 @@ fn empty_crlf_surrogates_and_unicode18_rules_preserve_exact_coordinates() {
             MarkdownGraphemeBoundary { byte: 9, utf16: 5 },
         ],
     );
-    // Unicode18 GB9c不再要求左Consonant，且U+1F1AE已经不属于EP；两处均不能沿用17假设。
+    // Unicode 18 GB9c no longer requires a preceding Consonant, and U+1F1AE is not EP.
+    // Keep both explicit expectations independent of the earlier Unicode 17 assumptions.
     each_split(
         "\u{94d}\u{308}\u{915}".as_bytes(),
         &[
@@ -191,6 +203,8 @@ fn empty_crlf_surrogates_and_unicode18_rules_preserve_exact_coordinates() {
 
 #[test]
 fn utf8_step_and_source_split_do_not_forge_eof_or_negative_boundary() {
+    // A byte split inside the combining scalar leaves its boundary unknown until the
+    // original machine decodes enough input. A visitor edge supplies neither EOF nor NoBreak.
     let source = source("a\u{308}b".as_bytes());
     let authority = source.authority();
     let mut job = MarkdownGraphemeJob::new(source).unwrap();
@@ -252,6 +266,7 @@ fn utf8_step_and_source_split_do_not_forge_eof_or_negative_boundary() {
 
 #[test]
 fn same_bytes_generation_and_empty_root_cannot_replace_original_source_identity() {
+    // Equal bytes and generations, including an empty source, do not identify the original capture.
     for bytes in [b"".as_slice(), b"same"] {
         let original = source(bytes);
         let foreign = source(bytes);
@@ -281,6 +296,8 @@ fn same_bytes_generation_and_empty_root_cannot_replace_original_source_identity(
 
 #[test]
 fn cancelled_and_invalid_budget_or_query_never_restore_old_proof() {
+    // Even a previously completed result cannot survive cancellation, a zero quantum,
+    // or an invalid query. Returning to valid inputs must not restore old authority.
     for mode in 0..3 {
         let original = source(b"abc");
         let authority = original.authority();
@@ -327,6 +344,8 @@ fn cancelled_and_invalid_budget_or_query_never_restore_old_proof() {
 
 #[test]
 fn metadata_failure_rejects_published_cache_hits_and_releases_real_resources() {
+    // Preserve the existing write-failure injection: a later metadata failure invalidates
+    // even an earlier boundary that was already resident and successfully published.
     let original = source(b"abc");
     let authority = original.authority();
     let mut job = MarkdownGraphemeJob::new_paged(original).unwrap();
@@ -356,7 +375,8 @@ fn real_readonly_fd_error_is_permanent_without_a_shadow_source_file() {
     let original = MarkdownLayoutTextSource::capture(&document);
     let authority = original.authority();
     let mut job = MarkdownGraphemeJob::new_paged(original).unwrap();
-    // 只替换全新测试索引的FD；第一页在原buffer内，跨页才由OS真实拒绝write_all_at。
+    // The fresh test index uses a real read-only FD. Its first page fits the original
+    // buffer; crossing the page makes the OS actually reject write_all_at.
     job.index =
         store::BoundaryIndex::with_file(File::open(directory.path().join("graphemes.md")).unwrap())
             .unwrap();
@@ -378,6 +398,8 @@ fn real_readonly_fd_error_is_permanent_without_a_shadow_source_file() {
         job.step(&authority, TINY),
         Err(MarkdownGraphemeError::Poisoned)
     ));
+    // Cleanup still returns the real FD and buffer, while retaining the unsuccessful
+    // write/cleanup fact instead of reporting a successful resource release.
     drop(document);
     drop(job);
     let released = observer.snapshot();
@@ -409,7 +431,8 @@ fn snapshot_survives_edit_undo_and_document_drop_without_retaining_the_document(
     assert_ne!(document.generation(), generation);
     let current = MarkdownLayoutTextSource::capture(&document);
     assert_ne!(current.generation(), generation);
-    // 真正Doc Weak已死时原Snapshot仍能读取；旧任务不持有文档、历史或保存权限。
+    // The document's Weak is actually dead while the old Snapshot remains readable.
+    // The layout job owns no document, undo history, or publication authority.
     let document = Rc::new(document);
     let weak_document = Rc::downgrade(&document);
     drop(document);
@@ -431,7 +454,8 @@ fn snapshot_survives_edit_undo_and_document_drop_without_retaining_the_document(
 
 #[test]
 fn source_clone_extends_only_immutable_payload_and_index_pages_remain_single() {
-    let bytes = b"a".repeat(20000); // 仅明确有限测试oracle；产品不构造该数组。
+    // This explicitly finite array is an oracle input, not a production document copy.
+    let bytes = b"a".repeat(20000);
     let original = source(&bytes);
     let authority = original.authority();
     let mut job = MarkdownGraphemeJob::new_paged(original.clone()).unwrap();
@@ -459,6 +483,7 @@ fn source_clone_extends_only_immutable_payload_and_index_pages_remain_single() {
         );
     }
     assert_eq!(job.storage_profile().source_bytes_read, 20000);
+    // Closing the index does not destroy the immutable source held by the external clone.
     job.close().unwrap();
     released(&observer, false);
     drop(original);
@@ -467,6 +492,8 @@ fn source_clone_extends_only_immutable_payload_and_index_pages_remain_single() {
 
 #[test]
 fn huge_single_cluster_stays_pending_until_true_eof_with_bounded_source_borrows() {
+    // Stream a long combining sequence into an isolated file. The source is one EGC,
+    // so repeated bounded scans cannot certify its successor before actual EOF.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("giant-egc.md");
     {
@@ -509,6 +536,8 @@ fn huge_single_cluster_stays_pending_until_true_eof_with_bounded_source_borrows(
 #[test]
 #[ignore = "需要ROOT中官方Unicode18 GraphemeBreakTest与显式OMNI_GCB18_TEST_FILE"]
 fn official_853_every_byte_split_and_global_byte_utf16_queries() {
+    // The ignored oracle requires the explicitly supplied official file and exact digest.
+    // Reading or compiling this test does not run it or establish conformance acceptance.
     let path = std::env::var_os("OMNI_GCB18_TEST_FILE").expect("需要官方ROOT fixture路径");
     let mut hash = Sha256::new();
     let mut input = File::open(&path).unwrap();
@@ -527,6 +556,8 @@ fn official_853_every_byte_split_and_global_byte_utf16_queries() {
     let mut cases = 0;
     let mut jobs = 0;
     let mut queries = 0;
+    // Parse each finite official case's own divide markers as the independent oracle.
+    // Text encoding only provides coordinates, never inferred grapheme decisions.
     for (line_number, line) in BufReader::new(File::open(path).unwrap())
         .lines()
         .enumerate()
@@ -556,6 +587,8 @@ fn official_853_every_byte_split_and_global_byte_utf16_queries() {
         }
         assert!(bytes.len() <= 4096, "完整oracle仅限官方有限case");
         cases += 1;
+        // Test both origin and nonzero global coordinates, retaining the real leading
+        // newline context before trying every actual byte split of the input.
         for prefix in [false, true] {
             let mut actual_bytes = if prefix {
                 "🧭\n".as_bytes().to_vec()
@@ -604,6 +637,7 @@ fn official_853_every_byte_split_and_global_byte_utf16_queries() {
 
 #[test]
 fn source_reclaim_failure_overrides_quota_stop_and_revokes_completed_index() {
+    // A real original-window reclaim failure must override a local quota stop.
     let (_directory, document) = fixture(b"abcdef");
     let source = MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -636,6 +670,8 @@ fn source_reclaim_failure_overrides_quota_stop_and_revokes_completed_index() {
         ))
     ));
 
+    // Repeat after complete Ready to prove that cached index results cannot conceal a
+    // later failure of the same original source payload.
     let (_directory, other_document) = fixture(b"xyz");
     let source = MarkdownLayoutTextSource::capture(&other_document);
     let authority = source.authority();

@@ -1,4 +1,5 @@
-//! 属性查表和官方UCD分别验证；测试可以保存有限属性区间，产品不引入整空间数组。
+//! Check property lookup separately against official UCD. Tests retain finite property ranges;
+//! the product does not introduce a full-code-space array.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
@@ -15,7 +16,8 @@ fn unicode18_delta_boundaries_override_the_exact_published_baseline() {
     for &(first, last, previous, current) in unicode_data::CHANGED_BOUNDARIES {
         assert!(first <= last);
         assert_ne!(previous, current);
-        // 同时覆盖包含端点和单点区间；发布表的真实返回值也须与生成时基线一致。
+        // Check inclusive endpoints and singleton ranges, including the released table's
+        // actual return value against the baseline used for generation.
         for point in [first, last] {
             let scalar = char::from_u32(point).unwrap();
             assert_eq!(HardcodedBidiData.bidi_class(scalar), previous);
@@ -25,7 +27,8 @@ fn unicode18_delta_boundaries_override_the_exact_published_baseline() {
     }
     assert_eq!(changed, 4198);
     assert_eq!(unicode_data::CHANGED_BOUNDARIES.len(), 80);
-    // 未受增量影响的ASCII、Hebrew及既有括号继续消费固定发布表，不能覆盖邻近空洞。
+    // Unchanged ASCII, Hebrew, and existing brackets retain the fixed released table;
+    // a nearby delta must not cover unchanged holes.
     for scalar in [
         'a', 'א', '(', ')', '\u{05c7}', '\u{05ca}', '\u{2e5f}', '\u{2e64}',
     ] {
@@ -41,7 +44,7 @@ fn unicode18_default_al_noncharacters_new_marks_and_bracket_equivalence_are_pres
     use BidiClass::*;
     let data = UnicodeBidiData;
     for scalar in ['\u{086b}', '\u{088f}', '\u{0892}', '\u{10d28}', '\u{1ec70}'] {
-        assert_eq!(data.bidi_class(scalar), AL); // 未分配RTL区的@missing不能被通用L或邻块R取代。
+        assert_eq!(data.bidi_class(scalar), AL); // Specific unassigned-RTL defaults cannot become general L or a neighboring R value.
     }
     for scalar in [
         '\u{2065}',
@@ -50,7 +53,7 @@ fn unicode18_default_al_noncharacters_new_marks_and_bracket_equivalence_are_pres
         '\u{e0fff}',
         '\u{10ffff}',
     ] {
-        assert_eq!(data.bidi_class(scalar), BN); // 不可见/非字符仍有规范属性，不能因不显示而省略。
+        assert_eq!(data.bidi_class(scalar), BN); // Invisible and noncharacter scalars still have required normative properties.
     }
     for scalar in ['\u{05c8}', '\u{0b53}', '\u{1acf}', '\u{10ecb}', '\u{1d127}'] {
         assert_eq!(data.bidi_class(scalar), NSM);
@@ -111,11 +114,13 @@ fn parse_class(value: &str) -> BidiClass {
         "RLO" => RLO,
         "S" => S,
         "WS" => WS,
-        other => panic!("官方属性值未识别: {other}"), // 数据格式变化必须失败，不能退成L掩盖属性缺口。
+        other => panic!("官方属性值未识别: {other}"), // Reject format changes instead of hiding unparsed properties behind a default L.
     }
 }
 
 fn class_ranges(path: &Path) -> (Vec<OfficialClassRange>, Vec<OfficialClassRange>) {
+    // Keep ordered defaults and explicit ranges separate: the most specific matching
+    // default applies only where no explicit official row covers the scalar.
     let mut defaults = Vec::new();
     let mut explicit = Vec::new();
     for (index, line) in std::io::BufReader::new(std::fs::File::open(path).unwrap())
@@ -132,7 +137,7 @@ fn class_ranges(path: &Path) -> (Vec<OfficialClassRange>, Vec<OfficialClassRange
             (line.split('#').next().unwrap().trim(), false)
         };
         if payload.is_empty() {
-            continue; // 普通注释和空行没有属性定义，不能影响默认区域优先级。
+            continue; // Ordinary comments and empty lines define no properties or default precedence.
         }
         let (points, class) = payload.split_once(';').expect("官方属性必须有范围和值");
         let row = OfficialClassRange {
@@ -140,7 +145,7 @@ fn class_ranges(path: &Path) -> (Vec<OfficialClassRange>, Vec<OfficialClassRange
             class: parse_class(class),
         };
         if missing {
-            defaults.push(row); // 顺序保留通用默认值与后续更具体的默认值，显式行最后覆盖两者。
+            defaults.push(row); // Preserve general-to-specific default order; explicit rows override both.
         } else {
             explicit.push(row);
         }
@@ -188,7 +193,8 @@ fn official_brackets(path: &Path, unicode_data: &Path) -> BTreeMap<u32, (u32, bo
         .filter_map(|(&point, &(_, open))| open.then_some(point))
         .collect();
     let mut canonical = BTreeMap::new();
-    // 只保存真实开括号的规范分解，避免使用不同Unicode版本的NFD库或复制UnicodeData全文。
+    // Retain canonical decompositions only for actual opening brackets, without another
+    // Unicode version's NFD library or a copy of the complete UnicodeData file.
     for line in std::io::BufReader::new(std::fs::File::open(unicode_data).unwrap()).lines() {
         let line = line.unwrap();
         let mut fields = line.split(';');
@@ -198,7 +204,7 @@ fn official_brackets(path: &Path, unicode_data: &Path) -> BTreeMap<u32, (u32, bo
         }
         let decomposition = fields.nth(4).expect("UnicodeData必须包含规范分解字段");
         if decomposition.is_empty() || decomposition.starts_with('<') {
-            continue; // 兼容分解不属于BD16的规范等价关系。
+            continue; // Compatibility decomposition does not establish BD16 canonical equivalence.
         }
         let mut parts = decomposition.split_whitespace();
         let target = u32::from_str_radix(parts.next().unwrap(), 16).unwrap();
@@ -213,6 +219,8 @@ fn official_brackets(path: &Path, unicode_data: &Path) -> BTreeMap<u32, (u32, bo
         canonical.insert(point, target);
     }
     let mut normalized = BTreeMap::new();
+    // Resolve each reciprocal pair through its real opening bracket's canonical chain;
+    // a cycle is invalid source data, not a reason to fall back to the old provider.
     for (&point, &(pair, is_open)) in &raw {
         assert_eq!(raw.get(&pair), Some(&(point, !is_open)));
         let mut opening = if is_open { point } else { pair };
@@ -230,6 +238,8 @@ fn official_brackets(path: &Path, unicode_data: &Path) -> BTreeMap<u32, (u32, bo
 #[test]
 #[ignore = "需OMNI_BIDI_UCD_ROOT指向官方18.0.0属性、括号和UnicodeData下载目录"]
 fn official_ucd_properties_match_every_unicode_scalar() {
+    // This ignored offline oracle requires an explicit official-data root. Source review
+    // or normal test execution does not establish that this exhaustive control has run.
     let root = std::env::var_os("OMNI_BIDI_UCD_ROOT").expect("必须显式指定官方数据目录");
     let root = Path::new(&root);
     let (defaults, explicit) = class_ranges(&root.join("DerivedBidiClass-18.0.0.txt"));
@@ -242,7 +252,7 @@ fn official_ucd_properties_match_every_unicode_scalar() {
     let data = UnicodeBidiData;
     for point in 0..0x110000 {
         let Some(scalar) = char::from_u32(point) else {
-            continue; // 代理区不是合法Rust标量，但文件默认区域仍完整保留以防解析遗漏。
+            continue; // Surrogates are not Rust scalars; parsed default ranges still retain the full official extent.
         };
         while cursor < explicit.len() && *explicit[cursor].points.end() < point {
             cursor += 1;

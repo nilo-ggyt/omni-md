@@ -1,7 +1,10 @@
-//! 全源精确Printable证明与原Unicode机器差分；不把Dense自己的整数输出当唯一oracle。
+//! Compare exact whole-source printable proof with the original Unicode machine; Dense's own
+//! integer output is not the sole oracle.
 use super::*;
 
 fn dense_profile(job: &MarkdownGraphemeJob, bytes: usize) {
+    // Exact source proof can certify logical boundaries without text reads or physical
+    // metadata rows. These owned counters do not measure whole-process resident memory.
     let profile = job.storage_profile();
     assert!(profile.dense_printable_ascii);
     assert_eq!(
@@ -33,6 +36,8 @@ fn dense_profile(job: &MarkdownGraphemeJob, bytes: usize) {
 
 #[test]
 fn exact_printable_domain_and_empty_compare_all_queries_with_original_paged_machine() {
+    // Empty input and the complete printable-ASCII domain must agree with the actual
+    // paged Unicode machine for strict neighbors and membership at every coordinate.
     for bytes in [Vec::new(), (0x20u8..=0x7e).collect::<Vec<_>>()] {
         let original = source(&bytes);
         let authority = original.authority();
@@ -65,6 +70,8 @@ fn exact_printable_domain_and_empty_compare_all_queries_with_original_paged_mach
             paged.storage_profile().index_records_written,
             (bytes.len() + 1) as u64
         );
+        // Dense never allocates paged storage; its still-live owner is nevertheless not
+        // released until actual close, independently of Paged's real cleanup receipt.
         let dense_resources = dense.resource_observer();
         let paged_resources = paged.resource_observer();
         assert!(!dense_resources.snapshot().metadata_storage_allocated);
@@ -79,6 +86,8 @@ fn exact_printable_domain_and_empty_compare_all_queries_with_original_paged_mach
 
 #[test]
 fn three_lengths_export_global_256_batches_without_source_or_record_io_and_release_actual_owners() {
+    // Different original lengths retain exact global coordinates in capped batches,
+    // including the final 256-record window near actual EOF.
     for length in [4096, 8192, 32768] {
         let original = source(&b"A".repeat(length));
         let authority = original.authority();
@@ -121,6 +130,8 @@ fn three_lengths_export_global_256_batches_without_source_or_record_io_and_relea
             MarkdownGraphemeAnswer::Known(None)
         ));
         dense_profile(&job, length);
+        // Zero physical allocation is not a successful close. Keep the live Dense owner
+        // distinct from the external source clone that still retains the original mapping.
         let before = observer.snapshot();
         assert!(
             !before.metadata_storage_allocated
@@ -142,6 +153,8 @@ fn three_lengths_export_global_256_batches_without_source_or_record_io_and_relea
 
 #[test]
 fn controls_unicode_and_unread_tail_are_not_admitted_from_an_ascii_prefix_or_equal_lengths() {
+    // A printable prefix, equal coordinate lengths, or familiar ASCII surroundings do
+    // not prove the whole source domain when controls or any Unicode scalar remain.
     for text in [
         "A\tB",
         "A\nB",
@@ -184,6 +197,8 @@ fn controls_unicode_and_unread_tail_are_not_admitted_from_an_ascii_prefix_or_equ
 
 #[test]
 fn foreign_authority_cancel_and_invalid_batch_revoke_dense_without_fabricating_close() {
+    // Authority mismatch, cancellation, and oversized export revoke logical use while
+    // leaving the real Dense owner live until Drop; no storage release may be invented.
     for mode in 0..3 {
         let original = source(b"printable");
         let authority = original.authority();
@@ -234,6 +249,8 @@ fn foreign_authority_cancel_and_invalid_batch_revoke_dense_without_fabricating_c
 
 #[test]
 fn original_eio_precedes_cancel_ready_and_dense_arithmetic_then_close_returns_real_first_error() {
+    // Whole-source proof grants no exemption from original Source health. Actual reclaim
+    // EIO precedes old Ready, cancellation, arithmetic queries, and later construction.
     let (_directory, document) = fixture(b"printable");
     let original = MarkdownLayoutTextSource::capture(&document);
     let authority = original.authority();
@@ -269,6 +286,8 @@ fn original_eio_precedes_cancel_ready_and_dense_arithmetic_then_close_returns_re
         ))
     ));
     assert!(!observer.snapshot().metadata_owner_released);
+    // Explicit close still retires the Dense owner before returning the real Source
+    // failure; the last independent source/document owners control backing unmap.
     assert!(matches!(
         job.close(),
         Err(MarkdownGraphemeError::Source(
@@ -282,6 +301,8 @@ fn original_eio_precedes_cancel_ready_and_dense_arithmetic_then_close_returns_re
 
 #[test]
 fn original_frozen_dense_stays_exact_across_edit_and_undo_without_owning_document_history() {
+    // Editing changes the current source domain; undo creates another capture rather
+    // than restoring the old authority. The original immutable Dense source stays exact.
     let (_directory, mut document) = fixture(b"ABC");
     let original = MarkdownLayoutTextSource::capture(&document);
     let authority = original.authority();
@@ -302,6 +323,8 @@ fn original_frozen_dense_stays_exact_across_edit_and_undo_without_owning_documen
             .storage_profile()
             .dense_printable_ascii
     );
+    // Destroy the actual document owner, then query the old frozen payload without
+    // retaining its history or granting any save authority to the layout job.
     let document = Rc::new(document);
     let document_weak = Rc::downgrade(&document);
     drop(document);

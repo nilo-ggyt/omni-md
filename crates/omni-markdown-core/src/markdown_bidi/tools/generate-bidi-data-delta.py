@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""离线比较已下载的官方UCD和实际发布crate，只生成紧凑Rust属性provider。"""
+"""Compare explicit official UCD files with the released crate offline and emit a compact Rust property provider."""
 
-# 输入必须来自https://www.unicode.org/Public/{version}/ucd/的版本化最终文件；
-# DerivedBidiClass位于extracted/，BidiBrackets、UnicodeData与ReadMe位于ucd根。
-# 实际公开API二进制由同目录export-bidi-public-api.rs针对固定crate导出，
-# --public-records逐scalar认证后生成；工具和原始UCD均不进入产品运行路径。
+# Inputs are versioned final files from https://www.unicode.org/Public/{version}/ucd/.
+# DerivedBidiClass is under extracted/; BidiBrackets, UnicodeData, and ReadMe are at the UCD root.
+# export-bidi-public-api.rs exports the fixed crate's actual API results. When supplied,
+# --public-records verifies every scalar against them; neither tools nor raw UCD run in the product.
 
 from __future__ import annotations
 
@@ -29,7 +29,8 @@ LONG_NAMES = {
 
 
 def scalar(point: int) -> bool:
-    # Rust char不接受代理区；官方数据仍完整解析，只在比较和输出时排除该区。
+    # Rust char excludes surrogates. Parse the full official data, excluding these points
+    # only from scalar comparison and emitted deltas.
     return 0 <= point < LIMIT and not 0xD800 <= point <= 0xDFFF
 
 
@@ -46,6 +47,8 @@ def sha(path: Path) -> str:
 
 
 def published_tables(path: Path) -> tuple[bytearray, dict[int, tuple[int, bool]], str]:
+    # Parse the explicit released baseline and reject unrecognized table syntax instead
+    # of allowing parser omissions to masquerade as legitimate Unicode-version changes.
     text = path.read_text(encoding="utf-8")
     version_match = re.search(r"UNICODE_VERSION[^=]*=\s*\((\d+),\s*(\d+),\s*(\d+)\)", text)
     if version_match is None:
@@ -85,6 +88,8 @@ def published_tables(path: Path) -> tuple[bytearray, dict[int, tuple[int, bool]]
 
 
 def public_api_records(path: Path, parsed_classes: bytearray, parsed_brackets: dict[int, tuple[int, bool]], parsed_version: str) -> tuple[bytearray, dict[int, tuple[int, bool]]]:
+    # Require the complete fixed-width export, matching data version, and strict scalar
+    # order before any actual public result can validate the parsed baseline.
     expected_records = LIMIT - 0x800
     if path.stat().st_size != 40 + 10 * expected_records:
         raise ValueError("公开API文件长度不完整，禁止使用部分输出")
@@ -105,7 +110,8 @@ def public_api_records(path: Path, parsed_classes: bytearray, parsed_brackets: d
             if (tag == 0 and opening != 0) or (tag != 0 and not scalar(opening)):
                 raise ValueError("公开API括号记录无效")
             bracket = None if tag == 0 else (opening, tag == 1)
-            # 不允许一个错误源码解析器恰好生成貌似合理的版本增量；逐项核实实际公开返回值。
+            # Check actual public return values item by item so a faulty source parser
+            # cannot generate an apparently plausible version delta.
             if value != parsed_classes[point] or bracket != parsed_brackets.get(point):
                 raise ValueError(f"发布源码解析和实际公开API不一致: U+{point:04X}")
             classes[point] = value
@@ -124,7 +130,8 @@ def official_classes(path: Path, version: str) -> bytearray:
     missing = []
     explicit = []
     for line in lines:
-        # 专用@missing覆盖通用L默认值；显式赋值最后覆盖两者，不能漏掉未分配RTL区域。
+        # Specific @missing ranges override general L defaults; explicit assignments
+        # override both last, preserving unassigned RTL regions too.
         match = re.match(r"#\s*@missing:\s*([^;]+);\s*(\w+)", line)
         if match:
             start, end = extent(match.group(1))
@@ -152,6 +159,8 @@ def official_classes(path: Path, version: str) -> bytearray:
 
 
 def canonical_decompositions(path: Path) -> dict[int, tuple[int, ...]]:
+    # Only canonical decompositions contribute to BD16 equivalence. Compatibility
+    # mappings remain outside this bracket-identity contract.
     result = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         fields = line.split(";")
@@ -169,13 +178,16 @@ def normalized_opening(point: int, decompositions: dict[int, tuple[int, ...]], s
     decomposition = decompositions.get(point)
     if decomposition is None:
         return point
-    # BD16要求规范等价的开括号同类；BidiDataSource键是单标量，不能悄悄丢弃分解尾部。
+    # BD16 groups canonically equivalent opening brackets. BidiDataSource keys are
+    # single scalars, so a decomposition tail cannot be silently discarded.
     if len(decomposition) != 1:
         raise ValueError(f"括号规范分解不是单标量: {point:X}")
     return normalized_opening(decomposition[0], decompositions, seen | {point})
 
 
 def official_brackets(path: Path, unicode_data: Path, version: str, classes: bytearray) -> dict[int, tuple[int, bool]]:
+    # Verify version, actual ON classes, reciprocal pairs, and canonical opening identity
+    # directly from the supplied official files rather than assuming the old bracket set.
     lines = path.read_text(encoding="utf-8").splitlines()
     if not lines or lines[0] != f"# BidiBrackets-{version}.txt":
         raise ValueError("括号版本不匹配")
@@ -202,6 +214,8 @@ def official_brackets(path: Path, unicode_data: Path, version: str, classes: byt
 
 
 def deltas(old: bytearray, new: bytearray) -> list[tuple[int, int, int, int]]:
+    # Preserve both original and target classes in each contiguous changed interval;
+    # unchanged points and changed-value transitions close the current interval.
     if len(old) != LIMIT or len(new) != LIMIT:
         raise ValueError("属性比较范围不是完整Unicode码点空间")
     result = []
@@ -220,6 +234,8 @@ def deltas(old: bytearray, new: bytearray) -> list[tuple[int, int, int, int]]:
 
 
 def compact(changes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int]]:
+    # Runtime lookup needs only target values. Merge adjacent equal targets without
+    # bridging unchanged holes between independently proven delta intervals.
     result = []
     for start, end, _old, value in changes:
         if result and result[-1][1] + 1 == start and result[-1][2] == value:
@@ -230,13 +246,16 @@ def compact(changes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, in
 
 
 def emit(path: Path, version: str, crate_version: str, changes: list[tuple[int, int, int, int]], bracket_changes: dict[int, tuple[int, bool] | None], sources: list[Path], license_path: Path) -> None:
+    # Maintain output explanations here, then regenerate from the original authenticated
+    # inputs and released public API. Preserve license text, provenance hashes, property
+    # records, and baseline-version assertions independently of these comment templates.
     version_tuple = ", ".join(version.split("."))
     base_parts = crate_version.split(".")
     license_lines = "\n".join(f"// {line}" if line else "//" for line in license_path.read_text(encoding="utf-8").splitlines())
     lines = [
-        "//! 官方UCD属性增量；只修正稳定unicode-bidi 0.3.18的数据，不改变UBA规则。",
-        f"//! 数据版本{version}；必须与生成时同一发布crate的hardcoded-data一起使用。",
-        "//! 生成器generate-bidi-data-delta.py；UnicodeData仅用于BD16开括号规范等价类。",
+        "//! Official UCD property deltas for unicode-bidi 0.3.18; UBA rules remain unchanged.",
+        f"//! Data version {version}; use the exact released hardcoded-data baseline used during generation.",
+        "//! Generated by generate-bidi-data-delta.py; UnicodeData supplies only BD16 canonical opening identities.",
         "// SPDX-License-Identifier: Unicode-3.0",
         license_lines,
         "",
@@ -249,19 +268,20 @@ def emit(path: Path, version: str, crate_version: str, changes: list[tuple[int, 
         "use unicode_bidi::{BidiClass, BidiDataSource, HardcodedBidiData};",
         "",
         f"pub const UNICODE_VERSION: (u64, u64, u64) = ({version_tuple});",
-        "// crate原数据更新后必须重新生成增量，不能把旧差异覆盖到另一套基线。",
+        "// Regenerate after updating the crate's data; deltas cannot be applied to a different baseline.",
         "const _: () = assert!(",
         f"    unicode_bidi::UNICODE_VERSION.0 == {base_parts[0]}",
         f"        && unicode_bidi::UNICODE_VERSION.1 == {base_parts[1]}",
         f"        && unicode_bidi::UNICODE_VERSION.2 == {base_parts[2]}",
         ");",
         "",
+        "/// Static target-version properties over the independently verified released baseline.",
         "pub struct UnicodeBidiData;",
         "",
         "impl BidiDataSource for UnicodeBidiData {",
         "    fn bidi_class(&self, scalar: char) -> BidiClass {",
         "        let point = scalar as u32;",
-        "        // 增量区间完整覆盖所有实际差异；其余标量继续使用已固定的发布表。",
+        "        // Delta intervals cover every actual change. Unchanged scalars retain the pinned released table.",
         "        let slot = CLASS_DELTAS.partition_point(|&(_, end, _)| end < point);",
         "        match CLASS_DELTAS.get(slot) {",
         "            Some(&(start, _, value)) if start <= point => value,",
@@ -270,7 +290,7 @@ def emit(path: Path, version: str, crate_version: str, changes: list[tuple[int, 
         "    }",
         "",
         "    fn bidi_matched_opening_bracket(&self, scalar: char) -> Option<BidiMatchedOpeningBracket> {",
-        "        // 显式None表示新数据删除该括号，不能和没有增量时的旧表回退混淆。",
+        "        // Explicit None removes a target-version bracket; absence of a delta alone uses the old table.",
         "        match BRACKET_DELTAS.binary_search_by_key(&scalar, |&(point, _)| point) {",
         "            Ok(slot) => BRACKET_DELTAS[slot].1.map(|(opening, is_open)| BidiMatchedOpeningBracket { opening, is_open }),",
         "            Err(_) => HardcodedBidiData.bidi_matched_opening_bracket(scalar),",
@@ -290,7 +310,7 @@ def emit(path: Path, version: str, crate_version: str, changes: list[tuple[int, 
         lines.append(f"    ('\\u{{{point:X}}}', {entry}),")
     lines.extend([
         "];", "",
-        "// 以下逐区间原属性仅供离线控制和边界测试；生产查询不创建额外表或堆对象。",
+        "// Original per-interval facts support offline controls and boundary tests, without production allocation.",
         "#[cfg(test)]",
         "pub const CHANGED_BOUNDARIES: &[(u32, u32, BidiClass, BidiClass)] = &[",
     ])
@@ -326,7 +346,8 @@ def main() -> None:
     target, target_brackets = official[args.version]
     changes = deltas(old, target)
     bracket_changes = {point: target_brackets.get(point) for point in old_brackets.keys() | target_brackets.keys() if old_brackets.get(point) != target_brackets.get(point)}
-    # 离线完整重建生成provider的实际规则，确认压缩没有跨空洞或漏掉默认值差异。
+    # Reconstruct the generated provider offline to prove compaction preserved holes
+    # and all explicit/default property differences across the complete scalar space.
     projected = bytearray(old)
     for start, end, value in compact(changes):
         projected[start:end + 1] = bytes([value]) * (end - start + 1)
@@ -345,7 +366,8 @@ def main() -> None:
     if args.public_records is not None:
         inputs.append(args.public_records)
     emit(args.output, args.version, crate_version, changes, bracket_changes, inputs, root / "UNICODE-LICENSE.txt")
-    # 输出只有有限统计和实际差异区间；不保存额外报告文件或Unicode正文镜像。
+    # Print finite statistics and actual changed intervals without writing an additional
+    # report file or a Unicode-text mirror.
     baseline_changes = deltas(old, official[args.baseline_version][0])
     version_changes = deltas(official[args.baseline_version][0], target)
     print(json.dumps({

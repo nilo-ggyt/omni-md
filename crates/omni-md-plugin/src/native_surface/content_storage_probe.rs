@@ -1,4 +1,5 @@
-//! 诊断内容入口及有限元素读取；固定分块仅供归因，不代表软换行、双向文本或编辑功能验收。
+//! Opt-in TextKit content-provider attribution. Fixed chunks investigate element access only;
+//! they establish no soft-wrap, bidi, editing, or default paged-editor lazy-loading equivalence.
 
 use super::cache_owner::{CacheAdmission, CacheOwner, CachePayload};
 use super::*;
@@ -96,7 +97,7 @@ const CONTENT_PROBE_PHASES: &[&str] = &[
     "virtual.string_source_retain",
 ];
 
-/// 只记录现有调用的固定阶段；不访问Native对象，也不读取或保留正文。
+/// Record fixed phases of existing calls only, without Native getters or retained/read text.
 struct ProviderPhaseTrace {
     emitted: Cell<u8>,
     seen_phases: Cell<u128>,
@@ -107,6 +108,7 @@ struct ProviderPhaseTrace {
 
 impl ProviderPhaseTrace {
     fn new() -> Self {
+        // Idle diagnostics allocate no text or native owner; phase metadata is finite scalars.
         Self {
             emitted: Cell::new(0),
             seen_phases: Cell::new(0),
@@ -129,13 +131,15 @@ impl ProviderPhaseTrace {
         if emitted < CONTENT_PROBE_PHASE_LIMIT && self.seen_phases.get() & phase_bit == 0 {
             self.emitted.set(emitted + 1);
             self.seen_phases.set(self.seen_phases.get() | phase_bit);
-            // 每个固定阶段只输出首次入口，属性run不能刷掉后续setter/block；总预算仍最多64行。
+            // Emit each fixed phase's first entry only, so attribute runs cannot consume later
+            // setter/block visibility. The total log allowance remains the original finite budget.
             eprintln!(
                 "content_storage_probe native_phase={phase} call={call} previous_phase={previous_phase} previous_returned={previous_returned} diagnostic_formal=false"
             );
         }
         let value = operation();
-        // 只在原调用正常返回后置位；外来异常或Rust panic均保持false，不把展开误报为return。
+        // Mark return only after normal completion. Foreign exceptions and Rust panic leave
+        // false rather than misreporting stack unwind as a successful native return.
         self.last_returned.set(true);
         value
     }
@@ -168,7 +172,7 @@ impl CachePayload for FiniteParagraphCache {
     fn empty() -> Self {
         Self {
             entries: Vec::new(),
-        } // 未使用的探针不分配源文本或元素容量。
+        } // An unused probe allocates neither Source text nor element capacity.
     }
 }
 
@@ -190,16 +194,16 @@ enum ProviderFailure {
 impl ProviderFailure {
     fn code(self) -> &'static str {
         match self {
-            Self::Busy => "reentrant_provider", // 不以super完整枚举解除递归。
-            Self::Source => "source_unavailable", // 关闭或原Weak失效。
-            Self::Stale => "original_ticket_changed", // 原代次/模式/输入已撤权。
-            Self::Graph => "storage_graph_changed", // provider不再消费同一piece storage。
-            Self::Location => "global_location_failed", // 公开位置不能精确往返。
-            Self::Range => "finite_source_range_failed", // 无法证明真实有限源边界。
-            Self::WholeRead => "whole_read_guard", // 此原型绝不发出等于原文长度的bulk读取。
-            Self::Capacity => "finite_cache_exhausted", // 不淘汰仍可能被weak fragment引用的元素。
-            Self::Attributes => "finite_attributes_failed", // 字体/语义run未覆盖本次源位置。
-            Self::Ledger => "owned_registration_failed", // 未登记对象不能发布给系统。
+            Self::Busy => "reentrant_provider", // Do not escape reentry through whole superclass enumeration.
+            Self::Source => "source_unavailable", // Original weak owner ended or was closed.
+            Self::Stale => "original_ticket_changed", // Original generation/mode/input authority changed.
+            Self::Graph => "storage_graph_changed", // Provider no longer observes the same piece storage.
+            Self::Location => "global_location_failed", // Public positions fail exact roundtrip.
+            Self::Range => "finite_source_range_failed", // Actual finite Source bounds are unverified.
+            Self::WholeRead => "whole_read_guard", // This bounded prototype issues no bulk equal to original full-text length.
+            Self::Capacity => "finite_cache_exhausted", // Do not evict elements still referenced weakly by fragments.
+            Self::Attributes => "finite_attributes_failed", // Original font/semantic run does not cover this Source position.
+            Self::Ledger => "owned_registration_failed", // Never publish an unregistered owned object.
         }
     }
 }
@@ -213,6 +217,8 @@ struct ProviderTicket {
 
 impl ProviderTicket {
     fn current(&self) -> bool {
+        // This ticket checks original document identity and derived state only, not a post-read
+        // Source-health result. The reference live NSString's 0xfffd fallback semantics stay intact.
         let ivars = self.storage.ivars();
         if !ivars.accepts_edits.get()
             || !std::rc::Weak::ptr_eq(&self.document, &ivars.document.borrow())
@@ -223,7 +229,7 @@ impl ProviderTicket {
             || ivars.native_input_depth.get() != self.key.input_depth
             || ivars.composition_active.get() != self.key.composition
         {
-            return false; // 同一内容对象也不能给后继输入、模式或笔记续旧票。
+            return false; // The same content object cannot renew an old ticket for successor input, mode, or note.
         }
         self.document.upgrade().is_some_and(|document| {
             let document = document.borrow();
@@ -239,18 +245,18 @@ impl ProviderTicket {
         operation: impl FnOnce() -> T,
     ) -> Result<T, ProviderFailure> {
         if !self.current() {
-            return Err(ProviderFailure::Stale); // 原生调用前先核原权限，不换成当前票。
+            return Err(ProviderFailure::Stale); // Verify original authority before Native, without replacing it with a current ticket.
         }
         let value = self.trace.call(phase, operation);
         if self.current() {
             Ok(value)
         } else {
-            Err(ProviderFailure::Stale) // 返回值在本栈析构，不发布撤权后的对象。
+            Err(ProviderFailure::Stale) // The returned value drops on this stack; revoked work publishes no object.
         }
     }
 }
 
-/// 只保存真实公开range的固定标量；None绝不表示有效的0坐标。
+/// Fixed scalar facts from actual public ranges; None never means a valid zero coordinate.
 #[derive(Debug)]
 struct ParagraphRangeFacts {
     present: bool,
@@ -264,7 +270,7 @@ struct ParagraphRangeFacts {
 struct ProviderGuard<'a>(&'a Cell<bool>);
 impl Drop for ProviderGuard<'_> {
     fn drop(&mut self) {
-        self.0.set(false); // 每次同步入口结束即归还阶段，不安排重试或嵌套run loop。
+        self.0.set(false); // End this synchronous phase, without scheduling a retry or nested run loop.
     }
 }
 
@@ -290,8 +296,9 @@ pub(super) struct ContentStorageProbeIvars {
 impl Drop for ContentStorageProbeIvars {
     fn drop(&mut self) {
         let fragment_owner = self.fragment_probe.get_mut().take();
-        drop(fragment_owner); // provider析构先移出原槽，清理weak manager委托时不持RefCell借用。
-        // 仅真实对象析构时报告固定计数；没有Native getter、正文、路径或延后重试。
+        drop(fragment_owner); // Remove the owner from its slot before weak-manager delegate cleanup; no RefCell borrow crosses Native.
+        // Report scalar counts at actual object destruction only, without Native getters, text,
+        // paths, or deferred retries.
         eprintln!(
             "content_storage_probe stage=drop elements_calls={} enumeration_calls={} bounded={} cached_entries={} last_native_phase={} last_native_returned={} native_calls={} diagnostic_formal=false",
             self.elements_calls.get(),
@@ -306,13 +313,14 @@ impl Drop for ContentStorageProbeIvars {
 }
 
 define_class!(
-    // SAFETY: 只收紧为主线程类；不覆写存储、编辑事务或位置映射，沿用标准父类契约。
+    // SAFETY: Restricts this class to main-thread use without overriding storage, editing
+    // transactions, or position mapping; those retain their standard superclass contracts.
     #[unsafe(super = NSTextContentStorage)]
     #[thread_kind = MainThreadOnly]
     #[ivars = ContentStorageProbeIvars]
     pub(super) struct NativeMarkdownContentStorageProbe;
 
-    // SAFETY: NSObject协议没有额外实现义务；此对象仍由原surface独占并要求实际释放。
+    // SAFETY: No extra NSObject obligations; the original surface still owns this actual object and requires its release.
     unsafe impl NSObjectProtocol for NativeMarkdownContentStorageProbe {}
 
     impl NativeMarkdownContentStorageProbe {
@@ -325,10 +333,10 @@ define_class!(
                     self.ivars().mapping_observation_calls.set(count + 1);
                     Some(count + 1)
                 } else {
-                    None // 固定观察预算耗尽后不再递增，避免长枚举把诊断计数变成溢出故障。
+                    None // Stop incrementing after the finite observation budget, avoiding diagnostic overflow during long enumeration.
                 }
             } else {
-                None // 默认/=1/bounded仍原样向父类映射，未增加任何元素内容getter。
+                None // Default/=1/bounded modes preserve superclass mapping without adding element-content getters.
             };
             if let Some(call) = observed {
                 eprintln!(
@@ -336,12 +344,13 @@ define_class!(
                     call, element.class().name().to_string_lossy(),
                 );
             }
-            // SAFETY: 公开方法参数是原NSTextElement，nullable返回按绑定原ABI单次super转发，无自造中间值。
+            // SAFETY: Forward the original public NSTextElement once to super with its nullable
+            // return ABI, without a manufactured intermediate value.
             let value: Option<Retained<NSAttributedString>> = unsafe {
                 msg_send![super(self), attributedStringForTextElement: element]
             };
             if let Some(call) = observed {
-                let original_storage = self.ivars().storage.load(); // 临时weak升级只用于精确身份，不读原文字段。
+                let original_storage = self.ivars().storage.load(); // Temporary weak upgrade compares exact identity only, without text-field reads.
                 let is_original_storage = value.as_deref().zip(original_storage.as_deref()).map(|(value, storage)| {
                     let original: &NSAttributedString = storage;
                     std::ptr::eq(value, original)
@@ -353,9 +362,9 @@ define_class!(
                     value.as_deref().map_or_else(|| "nil".into(), |value| value.class().name().to_string_lossy()),
                     value.as_deref().is_some_and(virtual_attributed_receiver_is_ours),
                     is_original_storage,
-                ); // 不取string/length，也不因返回原storage或framework对象而改变结果。
+                ); // Read neither string nor length; returning original storage/framework values does not change the result.
             }
-            value // 唯一尾表达式按noncopy method_id移交原nullable对象，不做额外claim。
+            value // The sole noncopy method_id return transfers the original nullable value without another claim.
         }
 
         #[unsafe(method_id(textElementsForRange:))]
@@ -364,17 +373,19 @@ define_class!(
             self.ivars().elements_calls.set(self.ivars().elements_calls.get().saturating_add(1));
             self.emit("elements_enter", 0, true);
             let elements = if self.ivars().bounded || self.ivars().virtual_paragraph {
-                // 有限模式绝不向super索取完整paragraph；未准备好时明确提供空数组而非假Ready。
+                // Finite modes never request whole superclass paragraphs. Failure yields an
+                // explicit empty array, not fabricated Ready or full-request coverage.
                 match self.bounded_elements(range) {
                     Ok(elements) => elements,
                     Err(error) => { self.reject(error); NSArray::new() }
                 }
             } else {
-                // SAFETY: pass-through仍按原ABI单次转发，不复制或枚举原数组。
+                // SAFETY: Pass through once with the original ABI, without copying or enumerating the original array.
                 unsafe { msg_send![super(self), textElementsForRange: range] }
             };
             self.emit("elements_return", 0, true);
-            // 唯一尾表达式交给method_id执行非new selector的autorelease-return，未额外保留数组。
+            // The sole method_id tail follows the nonnew autorelease-return convention;
+            // no additional array retain is stored here.
             elements
         }
 
@@ -389,9 +400,10 @@ define_class!(
             self.ivars().enumeration_calls.set(self.ivars().enumeration_calls.get().saturating_add(1));
             self.emit("enumeration_enter", options.bits(), location.is_some());
             let end = if self.ivars().bounded || self.ivars().virtual_paragraph {
-                // 固定分块只是读取路径试验；一次至多提供一个真实元素，公开协议允许有限枚举。
-                // 官方helper只捕获ObjC异常；Rust panic仍原样展开。这里没有状态借用跨callback。
-                // AssertUnwindSafe只声明本同步诊断边界：原phase/cache lease仍由既有RAII归还。
+                // Fixed chunks test access only, delivering at most one actual element per
+                // enumeration. objc2 catches Objective-C exceptions only; Rust panic still unwinds.
+                // No state borrow crosses the callback. AssertUnwindSafe covers this synchronous
+                // diagnostic boundary; existing RAII still returns phase/cache leases.
                 match objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
                     self.bounded_enumeration(location, options, block)
                 })) {
@@ -400,18 +412,21 @@ define_class!(
                     Err(exception) => self.report_and_rethrow(exception),
                 }
             } else {
-                // SAFETY: 原NS_NOESCAPE block直接借给父类，不包装/复制/保存，也不改nil或方向。
+                // SAFETY: Lend the original NS_NOESCAPE block directly to super, without wrapping,
+                // copying, storing, or altering nil/direction semantics.
                 unsafe { msg_send![super(self), enumerateTextElementsFromLocation: location, options: options, usingBlock: block] }
             };
             self.emit("enumeration_return", options.bits(), end.is_some());
-            // Optional位置仍由method_id在唯一尾表达式按原非new返回约定移交；不缓存Native位置。
+            // Transfer the optional location through the original nonnew method_id tail;
+            // retain no Native position cache.
             end
         }
     }
 );
 
 impl NativeMarkdownContentStorageProbe {
-    /// 未显式启用时直接构造原标准类；启用时仍由原surface字段持有同一个实际content storage。
+    /// Without explicit opt-in, construct the standard reference class. When enabled, the
+    /// original surface field still owns this same actual content storage.
     pub(super) fn new_if_requested(
         storage: &Retained<PieceBackedMarkdownTextStorage>,
         ledger: &Rc<NativeMarkdownOwnedLedger>,
@@ -421,6 +436,8 @@ impl NativeMarkdownContentStorageProbe {
         let bounded = configured.as_deref() == Some(std::ffi::OsStr::new("bounded"));
         let virtual_paragraph =
             configured.as_deref() == Some(std::ffi::OsStr::new("virtual-paragraph"));
+        // Whole physical-paragraph experiments require the additional explicit synthetic gate;
+        // this provider is no general replacement for user documents or production pagination.
         if virtual_paragraph
             && std::env::var_os("OMNI_NATIVE_CONTENT_STORAGE_SYNTHETIC_EXCEPTION").as_deref()
                 != Some(std::ffi::OsStr::new("1"))
@@ -431,7 +448,7 @@ impl NativeMarkdownContentStorageProbe {
             && !virtual_paragraph
             && configured.as_deref() != Some(std::ffi::OsStr::new("1"))
         {
-            return Ok(NSTextContentStorage::new()); // 默认产品不分配计数对象或替换系统类。
+            return Ok(NSTextContentStorage::new()); // Ordinary reference construction allocates no probe counters or replacement system class.
         }
         let allocated = Self::alloc(mtm).set_ivars(ContentStorageProbeIvars {
             elements_calls: Cell::new(0),
@@ -451,7 +468,8 @@ impl NativeMarkdownContentStorageProbe {
             trace: Rc::new(ProviderPhaseTrace::new()),
             fragment_probe: RefCell::new(None),
         });
-        // SAFETY: 固定计数已初始化，标准NSTextContentStorage的init仍只调用一次，无第二套backing。
+        // SAFETY: Scalar state is initialized. Invoke standard NSTextContentStorage init once,
+        // without constructing a second backing store.
         let content: Retained<Self> = unsafe { msg_send![super(allocated), init] };
         ledger.include("editor.content_storage_probe", &content)?;
         content.emit("installed", 0, true);
@@ -465,14 +483,14 @@ impl NativeMarkdownContentStorageProbe {
                 "content_storage_probe mode=virtual-paragraph synthetic_only=true read_only=true parity=false diagnostic_formal=false physical_paragraph=true whole_bulk_forwarded=true"
             );
         }
-        // into_super移动唯一+1所有权；manager/observer/view继续消费原来的公开基类类型。
+        // into_super moves the one +1; manager/observer/view still consume the original public base type.
         Ok(content.into_super())
     }
 
     fn emit(&self, stage: &'static str, options: usize, present: bool) {
         let emitted = self.ivars().emitted.get();
         if emitted >= CONTENT_PROBE_LOG_LIMIT {
-            return; // 最多24条固定标量，计数继续累计但不输出Native地址、source或输入内容。
+            return; // Keep the existing finite scalar log budget; never emit Native addresses, Source text, or input contents.
         }
         self.ivars().emitted.set(emitted + 1);
         eprintln!(
@@ -486,12 +504,15 @@ impl NativeMarkdownContentStorageProbe {
     }
 
     fn report_and_rethrow(&self, exception: Option<Retained<objc2::exception::Exception>>) -> ! {
+        // Diagnose only the exception already caught by this synthetic provider operation,
+        // then rethrow that same outcome. No failure becomes a successful fallback paragraph.
         let trace = &self.ivars().trace;
         let synthetic_detail = std::env::var_os("OMNI_NATIVE_CONTENT_STORAGE_SYNTHETIC_EXCEPTION")
             .as_deref()
             == Some(std::ffi::OsStr::new("1"));
         if let Some(exception) = exception {
-            // class来自公开runtime元数据，不调用任意异常对象的description或Debug，避免泄露地址/正文。
+            // Class comes from public runtime metadata. Do not invoke arbitrary exception
+            // description/Debug methods that might disclose addresses or document contents.
             let class = exception.class();
             eprintln!(
                 "content_storage_probe stage=objc_exception class={} last_native_phase={} last_native_returned={} native_calls={} synthetic_detail={} diagnostic_formal=false",
@@ -506,23 +527,25 @@ impl NativeMarkdownContentStorageProbe {
             let mut is_exception = false;
             for _ in 0..64 {
                 let Some(candidate) = ancestor else {
-                    break; // 任意ObjC对象也可以被throw；未证明NSException就不能发送name/reason。
+                    break; // Any ObjC object may be thrown; without proven NSException ancestry, send neither name nor reason.
                 };
                 if exception_class.is_some_and(|expected| std::ptr::eq(candidate, expected)) {
                     is_exception = true;
-                    break; // 只核公开继承链，绝不推断或调用异常对象的私有ABI。
+                    break; // Inspect public ancestry only; infer or invoke no private exception ABI.
                 }
                 ancestor = candidate.superclass();
             }
             if is_exception {
-                // SAFETY: runtime继承链已证明NSException；公开name属性返回非空NSString且getter不改异常。
+                // SAFETY: Runtime ancestry proved NSException; public name returns nonnull
+                // NSString without mutating the original exception.
                 let name: Retained<NSString> = unsafe { msg_send![&exception, name] };
                 eprintln!(
                     "content_storage_probe stage=objc_exception_name name={} diagnostic_formal=false",
                     fixed_exception_name(&name),
                 );
                 if synthetic_detail {
-                    // SAFETY: 同一已认证NSException的公开reason允许nil；仅显式合成fixture开关读取此诊断文本。
+                    // SAFETY: The same verified NSException's public reason may be nil. Read this
+                    // diagnostic text only under the explicit synthetic-fixture gate.
                     let reason: Option<Retained<NSString>> =
                         unsafe { msg_send![&exception, reason] };
                     if let Some(reason) = reason {
@@ -541,7 +564,8 @@ impl NativeMarkdownContentStorageProbe {
                     "content_storage_probe stage=objc_exception_name name=not_nsexception diagnostic_formal=false"
                 );
             }
-            // 官方throw消费helper返回的原+1异常；不换异常、不继续provider，也不改变原失败/释放门槛。
+            // objc2 throw consumes the original caught +1, without replacing the exception,
+            // resuming provider work, or changing functional/release requirements.
             objc2::exception::throw(exception)
         } else {
             eprintln!(
@@ -550,7 +574,8 @@ impl NativeMarkdownContentStorageProbe {
                 trace.last_returned.get(),
                 trace.calls.get(),
             );
-            // SAFETY: helper明确用None表示原throw nil；Apple现代runtime支持nil，原样抛出不伪造异常对象。
+            // SAFETY: The catch helper explicitly represents thrown nil as None. Preserve that
+            // modern Apple runtime outcome instead of manufacturing another exception object.
             unsafe { objc2::ffi::objc_exception_throw(std::ptr::null_mut()) }
         }
     }
@@ -560,7 +585,8 @@ impl NativeMarkdownContentStorageProbe {
         let previous = self.ivars().failures.get();
         if previous & bit == 0 {
             self.ivars().failures.set(previous | bit);
-            // 拒绝独立于普通日志预算；容量耗尽或映射失败不能被早期调用刷掉。
+            // Rejection has an independent finite per-cause log slot; early ordinary calls
+            // cannot conceal capacity exhaustion or failed location mapping.
             eprintln!(
                 "content_storage_probe mode={} rejected={} diagnostic_formal=false",
                 if self.ivars().virtual_paragraph {
@@ -575,7 +601,7 @@ impl NativeMarkdownContentStorageProbe {
 
     fn enter(&self) -> Result<ProviderGuard<'_>, ProviderFailure> {
         if self.ivars().busy.replace(true) {
-            return Err(ProviderFailure::Busy); // 不包装block，也不以super枚举制造无限递归。
+            return Err(ProviderFailure::Busy); // Do not wrap/replay the block or escape into recursively expanding superclass enumeration.
         }
         Ok(ProviderGuard(&self.ivars().busy))
     }
@@ -584,13 +610,15 @@ impl NativeMarkdownContentStorageProbe {
         &self,
     ) -> Result<(ProviderTicket, Retained<ProtocolObject<dyn NSTextLocation>>), ProviderFailure>
     {
+        // Capture original weak document identity and complete derived-state scalars before
+        // querying the installed Native graph; release the document borrow before those calls.
         let storage = self
             .ivars()
             .trace
             .call("capture.weak_storage", || self.ivars().storage.load())
             .ok_or(ProviderFailure::Source)?;
         if !std::rc::Weak::ptr_eq(&self.ivars().document, &storage.ivars().document.borrow()) {
-            return Err(ProviderFailure::Source); // 不采纳后继笔记重新绑定的同一个adapter。
+            return Err(ProviderFailure::Source); // The same adapter rebound to a successor note cannot supply this provider's Source.
         }
         let (generation, length, selection) = {
             let document = self
@@ -627,7 +655,7 @@ impl NativeMarkdownContentStorageProbe {
             .native("capture.observer_storage", || observer.textStorage())?
             .ok_or(ProviderFailure::Graph)?;
         if !std::ptr::eq::<NSTextStorage>(&*installed, ticket.storage.as_super()) {
-            return Err(ProviderFailure::Graph); // 仍须是原graph上的唯一piece storage。
+            return Err(ProviderFailure::Graph); // The graph must still observe the one original piece storage.
         }
         let manager = ticket
             .native("capture.primary_manager", || {
@@ -641,10 +669,11 @@ impl NativeMarkdownContentStorageProbe {
             &*actual_content,
             self.as_super().as_super(),
         ) {
-            return Err(ProviderFailure::Graph); // 不能给另一manager提供同数值位置的元素。
+            return Err(ProviderFailure::Graph); // Equal numeric positions cannot admit elements for another manager.
         }
         let provider = ProtocolObject::<dyn NSTextElementProvider>::from_ref(self.as_super());
-        // 只使用公开全局位置API，不调用super元素枚举或paragraph创建路径。
+        // Use public global-position APIs only, without superclass element enumeration or
+        // paragraph construction merely to discover document coordinates.
         let document_range =
             ticket.native("capture.document_range", || provider.documentRange())?;
         let origin = ticket.native("capture.origin", || document_range.location())?;
@@ -653,7 +682,7 @@ impl NativeMarkdownContentStorageProbe {
             self.offsetFromLocation_toLocation(&origin, &end)
         })?;
         if usize::try_from(length).ok() != Some(key.length) {
-            return Err(ProviderFailure::Location); // 全局文档范围不能缩成当前chunk或另一来源。
+            return Err(ProviderFailure::Location); // Global document length cannot be replaced by a current chunk or another Source's extent.
         }
         Ok((ticket, origin))
     }
@@ -669,7 +698,7 @@ impl NativeMarkdownContentStorageProbe {
         })?;
         let offset = usize::try_from(offset).map_err(|_| ProviderFailure::Location)?;
         if offset > ticket.key.length {
-            return Err(ProviderFailure::Location); // NSNotFound或异文档位置不能截成合法索引。
+            return Err(ProviderFailure::Location); // NSNotFound or foreign-document coordinates cannot be clamped into a valid index.
         }
         Ok(offset)
     }
@@ -687,7 +716,7 @@ impl NativeMarkdownContentStorageProbe {
             })?
             .ok_or(ProviderFailure::Location)?;
         if self.offset(ticket, origin, &location)? != offset {
-            return Err(ProviderFailure::Location); // 每个发布端点都须按同一origin精确反查。
+            return Err(ProviderFailure::Location); // Every published endpoint must roundtrip exactly through the same original origin.
         }
         Ok(location)
     }
@@ -698,6 +727,8 @@ impl NativeMarkdownContentStorageProbe {
         role: &'static str,
         object: &AnyObject,
     ) -> Result<(), ProviderFailure> {
+        // Actual owned Native objects must enter the original ledger before publication; its
+        // weak identity alone does not retain the editor or authorize unregistered resources.
         let ledger = self
             .ivars()
             .ledger
@@ -713,22 +744,26 @@ impl NativeMarkdownContentStorageProbe {
         ticket: &ProviderTicket,
         source: &Range<usize>,
     ) -> Result<Vec<u16>, ProviderFailure> {
+        // This bounded reference mode allocates one finite UTF-16 copy. Its original live string
+        // may fill a failed Core copy with 0xfffd; ticket/length checks do not add a post-read
+        // Source-health receipt, so this probe alone cannot certify successful Source I/O.
         if source.is_empty()
             || source.end > ticket.key.length
             || source.len() > CONTENT_PROBE_UTF16_LIMIT
         {
-            return Err(ProviderFailure::Range); // 每一个实际bulk请求均受同一4096上限约束。
+            return Err(ProviderFailure::Range); // Every actual bulk request retains the same existing 4096-unit limit.
         }
         if source.start == 0 && source.end == ticket.key.length {
-            return Err(ProviderFailure::WholeRead); // 小文档也不能借探针清空原全文读取门禁。
+            return Err(ProviderFailure::WholeRead); // Even a small document cannot bypass this prototype's explicit whole-read rejection.
         }
         let string = ticket.native("read.string", || ticket.storage.as_super().string())?;
         if ticket.native("read.length", || string.length())? != ticket.key.length {
-            return Err(ProviderFailure::Graph); // 必须读取原虚拟NSString，不从另一镜像获得正文。
+            return Err(ProviderFailure::Graph); // Read the original virtual NSString, not a different text mirror.
         }
         let mut units = vec![0u16; source.len()];
         ticket.native("read.get_characters", || {
-            // SAFETY: 固定Vec恰好容纳已校验范围；仍调用原adapter primitive，原读量诊断完整保留。
+            // SAFETY: The finite Vec exactly fits the validated range. Invoke the original
+            // adapter primitive, preserving its actual read-request diagnostics and error semantics.
             unsafe {
                 string.getCharacters_range(
                     NonNull::new(units.as_mut_ptr()).expect("非空源窗口"),
@@ -750,29 +785,29 @@ impl NativeMarkdownContentStorageProbe {
             .iter()
             .find(|entry| entry.key == ticket.key && entry.source.contains(&offset))
         {
-            return Ok(entry.source.clone()); // 只复用同票已发布元素的纯范围，不重新复制内容。
+            return Ok(entry.source.clone()); // Reuse only coordinates of an element published under this same ticket, without another text copy.
         }
         let grid = {
             let document = ticket.document.upgrade().ok_or(ProviderFailure::Source)?;
             let document = document.borrow();
             finite_source_grid(ticket.key.length, offset, |point| {
                 if document.byte_offset_for_utf16(point).is_err() {
-                    false // 不能把surrogate中点或越界位置解释为合法网格边界。
+                    false // Neither a surrogate midpoint nor an out-of-bounds position is a valid grid boundary.
                 } else if point == 0 || point == ticket.key.length {
-                    true // 已由scalar索引证明的真实文档两端无需读取不存在的相邻unit。
+                    true // Actual scalar-verified document endpoints need no read of nonexistent neighboring units.
                 } else {
                     match (
                         document.utf16_code_unit_at(point - 1),
                         document.utf16_code_unit_at(point),
                     ) {
-                        (Ok(13), Ok(10)) => false, // CRLF中点不是本试验允许的paragraph边界。
-                        (Ok(_), Ok(_)) => true,    // 两侧真实unit读取成功且不是CRLF才允许。
-                        (Err(_), _) | (_, Err(_)) => false, // 读取错误一律拒绝，不能静默变成有效边界。
+                        (Ok(13), Ok(10)) => false, // A CRLF midpoint is not an admitted experimental paragraph boundary.
+                        (Ok(_), Ok(_)) => true, // Both actual neighboring units were read successfully and are not CRLF.
+                        (Err(_), _) | (_, Err(_)) => false, // Read failure is not silently converted into a valid boundary.
                     }
                 }
             })
             .ok_or(ProviderFailure::Range)?
-        }; // canonical借用在实际Native读取前结束；只用小量边界元数据。
+        }; // End the canonical borrow before actual Native reading; retain only finite boundary metadata.
         let units = self.read_units(ticket, &grid)?;
         segment_in_grid(&units, grid.start, offset).ok_or(ProviderFailure::Range)
     }
@@ -783,10 +818,13 @@ impl NativeMarkdownContentStorageProbe {
         origin: &ProtocolObject<dyn NSTextLocation>,
         source: &Range<usize>,
     ) -> Result<Retained<NSTextParagraph>, ProviderFailure> {
+        // Construct actual finite strings/attributed containers. This prototype deliberately
+        // copies the bounded chunk and does not establish physical-paragraph or editing parity.
         let mut units = self.read_units(ticket, source)?;
         let allocated_string = ticket.native("string.alloc", NSMutableString::alloc)?;
         let string = ticket.native("string.init", || {
-            // SAFETY: 临时mutable字符串复制有限UTF16，不借Vec；避免短值成为永不nil的tagged NSString。
+            // SAFETY: Temporary mutable string copies finite UTF-16 rather than borrowing the
+            // Vec; avoiding a tagged short NSString keeps actual native release observable.
             unsafe {
                 NSMutableString::initWithCharacters_length(
                     allocated_string,
@@ -805,7 +843,8 @@ impl NativeMarkdownContentStorageProbe {
         while cursor < source.end {
             let mut effective = NSRange::new(0, 0);
             let attributes = ticket.native("attributes.get", || {
-                // SAFETY: 栈上range输出活到同步getter返回；属性仍来自原piece storage，未引入第二模型。
+                // SAFETY: Stack range output remains live through the synchronous getter;
+                // attributes still come from original piece storage, without another model.
                 unsafe {
                     ticket
                         .storage
@@ -818,15 +857,16 @@ impl NativeMarkdownContentStorageProbe {
                 .checked_add(effective.length)
                 .ok_or(ProviderFailure::Attributes)?;
             if effective.location > cursor || end <= cursor {
-                return Err(ProviderFailure::Attributes); // 空run或不覆盖cursor时不能填默认样式伪成功。
+                return Err(ProviderFailure::Attributes); // Empty/noncovering runs cannot be patched with default style and called successful coverage.
             }
             let end = end.min(source.end);
             let local = NSRange::new(cursor - source.start, end - cursor);
             ticket.native("attributes.add", || {
-                // SAFETY: 字典来自正确类型的原属性primitive；local严格属于有限builder字符范围。
+                // SAFETY: Dictionary comes from the correctly typed original attribute
+                // primitive, and local lies wholly inside the finite builder's text range.
                 unsafe { builder.addAttributes_range(&attributes, local) };
             })?;
-            cursor = end; // 每轮至少前进一个unit，最多source.len轮，绝不扫描全文。
+            cursor = end; // Each turn advances at least one unit, with at most source.len turns and no whole-document scan.
         }
         let allocated_frozen = ticket.native("frozen.alloc", NSAttributedString::alloc)?;
         let frozen = ticket.native("frozen.init", || {
@@ -853,7 +893,8 @@ impl NativeMarkdownContentStorageProbe {
         ticket.native("paragraph.set_manager", || {
             paragraph.setTextContentManager(Some(self.as_super().as_super()))
         })?;
-        // 冻结值的长度与源range严格一致；这没有承诺跨chunk的软行/UBA/IME等价。
+        // Exact finite string/range length is only this prototype's admission fact, not proof
+        // of soft-line, UBA, or IME equivalence across chunks.
         let actual_value = ticket.native("paragraph.value", || paragraph.attributedString())?;
         if ticket.native("paragraph.value_length", || actual_value.length())? != source.len() {
             return Err(ProviderFailure::Range);
@@ -869,17 +910,19 @@ impl NativeMarkdownContentStorageProbe {
         reverse: bool,
         cache: &mut FiniteParagraphCache,
     ) -> Result<Option<Retained<NSTextParagraph>>, ProviderFailure> {
+        // Cache only elements issued under the same complete ticket. Bounded chunks and one
+        // synthetic full physical paragraph are different experiments, not interchangeable layouts.
         if ticket.key.length == 0 || (!reverse && offset == ticket.key.length) {
-            return Ok(None); // 没有源字符就不制造EOF paragraph或额外视觉行。
+            return Ok(None); // With no Source character, create neither an EOF paragraph nor another visual line.
         }
         let mut source = if self.ivars().virtual_paragraph {
-            0..ticket.key.length // 合成单物理段完整覆盖0..EOF，绝不使用4096网格伪造段界。
+            0..ticket.key.length // The synthetic physical paragraph covers actual 0..EOF; no 4096-unit grid invents paragraph boundaries.
         } else {
             self.source_for_offset(ticket, cache, offset.min(ticket.key.length - 1))?
         };
         if reverse && offset < ticket.key.length {
             if source.start == 0 {
-                return Ok(None); // Reverse按公开契约从包含location的前一个element开始。
+                return Ok(None); // Reverse enumeration starts before the element containing the supplied location.
             }
             source = self.source_for_offset(ticket, cache, source.start - 1)?;
         }
@@ -890,13 +933,13 @@ impl NativeMarkdownContentStorageProbe {
         {
             return ticket
                 .native("cache.retain", || entry.paragraph.clone())
-                .map(Some); // 同一element身份稳定，只有临时+1claim。
+                .map(Some); // Preserve the same element identity with one temporary +1 only.
         }
         if cache.entries.len() == CONTENT_PROBE_CACHE_LIMIT {
-            return Err(ProviderFailure::Capacity); // 活动期间不淘汰任何已发布paragraph，避免weak fragment断联。
+            return Err(ProviderFailure::Capacity); // Do not evict published paragraphs while active; weak fragment relationships must remain intact.
         }
         let paragraph = if self.ivars().virtual_paragraph {
-            virtual_paragraph::build(self, ticket, origin)? // 不复制文本或属性run，只构造Weak只读虚拟值。
+            virtual_paragraph::build(self, ticket, origin)? // Construct weak-bound read-only virtual values, without copying text or attribute runs here.
         } else {
             self.build_paragraph(ticket, origin, &source)?
         };
@@ -916,6 +959,8 @@ impl NativeMarkdownContentStorageProbe {
         origin: &ProtocolObject<dyn NSTextLocation>,
         range: Option<&NSTextRange>,
     ) -> Result<ParagraphRangeFacts, ProviderFailure> {
+        // Nullable public ranges/endpoints remain explicit absence. Observations cannot repair
+        // missing Native coordinates with this request's source interval or document origin.
         let mut facts = ParagraphRangeFacts {
             present: range.is_some(),
             start_present: false,
@@ -925,28 +970,30 @@ impl NativeMarkdownContentStorageProbe {
             roundtrip: false,
         };
         let Some(range) = range else {
-            return Ok(facts); // nullable子范围未提供时只记录缺失，不能制造端点或向offset传nil。
+            return Ok(facts); // Record an absent nullable subrange without manufactured endpoints or passing nil to offset.
         };
         let start: Option<Retained<ProtocolObject<dyn NSTextLocation>>> =
             ticket.native("verify.range_start", || {
-                // SAFETY: 发送公开location getter；使用相同对象ABI的Option专门检测违反nonnull的实际nil。
+                // SAFETY: Public location getter with the same object ABI; Option explicitly
+                // observes an actual nil that would violate its declared nonnull contract.
                 unsafe { msg_send![range, location] }
             })?;
         let end: Option<Retained<ProtocolObject<dyn NSTextLocation>>> =
             ticket.native("verify.range_end", || {
-                // SAFETY: 同一公开NSTextRange的endLocation getter；nil只记为缺失，绝不参与位置运算。
+                // SAFETY: Public endLocation on this same NSTextRange; nil is absence only and
+                // never enters coordinate arithmetic.
                 unsafe { msg_send![range, endLocation] }
             })?;
         facts.start_present = start.is_some();
         facts.end_present = end.is_some();
         let (Some(start), Some(end)) = (start, end) else {
-            return Ok(facts); // 缺失的真实端点不能用document origin或请求source替代。
+            return Ok(facts); // Missing actual endpoints cannot be replaced by document origin or requested Source coordinates.
         };
         for (location, offset) in [(&start, &mut facts.start), (&end, &mut facts.end)] {
             match self.offset(ticket, origin, location) {
                 Ok(actual) => *offset = Some(actual),
-                Err(ProviderFailure::Location) => {} // 无法映射保留None，不把未知坐标当合法范围。
-                Err(error) => return Err(error),     // 原票撤权等错误立即结束，不继续读取后继状态。
+                Err(ProviderFailure::Location) => {} // Unmappable coordinates remain None, not a valid interval.
+                Err(error) => return Err(error), // Original-ticket revocation ends observation before reading successor state.
             }
         }
         if let (Some(start_offset), Some(end_offset)) = (facts.start, facts.end)
@@ -960,7 +1007,7 @@ impl NativeMarkdownContentStorageProbe {
             let end_equal = ticket.native("verify.roundtrip_end", || {
                 end.compare(&original_end) == objc2_foundation::NSComparisonResult::Same
             })?;
-            facts.roundtrip = start_equal && end_equal; // 同一provider重建位置须与实际端点公开比较相等。
+            facts.roundtrip = start_equal && end_equal; // Positions rebuilt by the same provider must compare equal to actual original endpoints.
         }
         Ok(facts)
     }
@@ -973,6 +1020,8 @@ impl NativeMarkdownContentStorageProbe {
         source: &Range<usize>,
         cache_slot: usize,
     ) -> Result<Retained<NSTextRange>, ProviderFailure> {
+        // Before invoking the caller's block, require the original manager and the element's
+        // actual complete range. Content/separator ranges are separately observed nullable facts.
         let manager = ticket.native("verify.manager", || paragraph.textContentManager())?;
         let manager_current = manager.as_deref().is_some_and(|manager| {
             std::ptr::eq::<objc2_app_kit::NSTextContentManager>(manager, self.as_super().as_super())
@@ -999,7 +1048,8 @@ impl NativeMarkdownContentStorageProbe {
         let emitted = self.ivars().paragraph_fact_logs.get();
         if emitted < 4 {
             self.ivars().paragraph_fact_logs.set(emitted + 1);
-            // 固定前四次发布事实足够区分首轮构造与后续命中；不输出对象地址、属性值或正文。
+            // Four initial scalar observations distinguish construction from later cache hits;
+            // emit no object addresses, attribute values, or text.
             eprintln!(
                 "content_storage_probe stage=paragraph_facts enumeration_calls={} cache_slot={} source_start={} source_end={} manager_present={} manager_current={} represented={} transaction={} element={:?} content={:?} separator={:?} valid_element={} diagnostic_formal=false",
                 self.ivars().enumeration_calls.get(),
@@ -1017,9 +1067,10 @@ impl NativeMarkdownContentStorageProbe {
             );
         }
         if !valid_element {
-            return Err(ProviderFailure::Range); // Native撤销的旧元素不能重贴range或静默重建后继续原callback。
+            return Err(ProviderFailure::Range); // A Native-revoked element cannot be repaired/rebuilt and reused for the original callback.
         }
-        // paragraph子range按公开nullable契约只观察，不把未知范围强行补成source，也不改setter顺序。
+        // Observe nullable paragraph subranges only; do not replace unknown ranges with Source
+        // coordinates or alter the existing setter sequence to obtain a desired diagnostic result.
         range.ok_or(ProviderFailure::Range)
     }
 
@@ -1027,13 +1078,15 @@ impl NativeMarkdownContentStorageProbe {
         &self,
         requested: &NSTextRange,
     ) -> Result<Retained<NSArray<NSTextElement>>, ProviderFailure> {
+        // The local phase and real cache lease reject reentry without another graph or fallback.
+        // A single available element is only partial protocol delivery, never a complete layout receipt.
         let _phase = self.enter()?;
         let (ticket, origin) = self.capture()?;
         let location = ticket.native("elements.start", || requested.location())?;
         let end = ticket.native("elements.end", || requested.endLocation())?;
         let offset = self.offset(&ticket, &origin, &location)?;
         if self.offset(&ticket, &origin, &end)? < offset {
-            return Err(ProviderFailure::Location); // 不把倒序或异源范围变成另一个有效请求。
+            return Err(ProviderFailure::Location); // A reversed/foreign range cannot be transformed into another valid request.
         }
         let mut lease = match self.ivars().cache.begin() {
             CacheAdmission::Ready(lease) => lease,
@@ -1045,9 +1098,9 @@ impl NativeMarkdownContentStorageProbe {
                 NSArray::from_retained_slice(&[paragraph.into_super()])
             })?;
             self.include_owned(&ticket, "editor.content_provider.array", &elements)?;
-            Ok(elements) // 协议允许只返回已同步可用的相交前缀，不宣称填满请求范围。
+            Ok(elements) // Return only the synchronously available intersecting prefix, without claiming full requested coverage.
         } else {
-            Ok(NSArray::new()) // 标准空数组不缓存，也不作为已布局证明。
+            Ok(NSArray::new()) // An uncached standard empty array proves no completed layout.
         }
     }
 
@@ -1057,13 +1110,15 @@ impl NativeMarkdownContentStorageProbe {
         options: NSTextContentManagerEnumerationOptions,
         block: &block2::DynBlock<dyn Fn(NonNull<NSTextElement>) -> Bool + '_>,
     ) -> Result<Option<Retained<ProtocolObject<dyn NSTextLocation>>>, ProviderFailure> {
+        // Preserve actual forward/reverse/nil-location semantics, but deliver at most one
+        // admitted element. Cache ownership leaves no RefCell borrow across Native callbacks.
         let _phase = self.enter()?;
         let (ticket, origin) = self.capture()?;
         let reverse = options.contains(NSTextContentManagerEnumerationOptions::Reverse);
         let offset = match location {
-            Some(location) => self.offset(&ticket, &origin, location)?, // 保留原公开位置，不猜附近段落。
-            None if reverse => ticket.key.length, // 公开nil反向枚举从真实document.end开始。
-            None => 0,                            // 公开nil正向枚举从真实document.location开始。
+            Some(location) => self.offset(&ticket, &origin, location)?, // Preserve the original public location, without guessing a nearby paragraph.
+            None if reverse => ticket.key.length, // Public nil reverse starts at actual document.end.
+            None => 0, // Public nil forward starts at actual document.location.
         };
         let mut lease = match self.ivars().cache.begin() {
             CacheAdmission::Ready(lease) => lease,
@@ -1072,7 +1127,7 @@ impl NativeMarkdownContentStorageProbe {
         let Some(paragraph) =
             self.paragraph(&ticket, &origin, offset, reverse, lease.payload_mut())?
         else {
-            return Ok(None); // 未提供任何元素时不伪造枚举边界。
+            return Ok(None); // Without an actual element, fabricate no enumeration endpoint.
         };
         let (cache_slot, source) = {
             let cache = lease.payload_mut();
@@ -1085,26 +1140,27 @@ impl NativeMarkdownContentStorageProbe {
                         && std::ptr::eq::<NSTextParagraph>(&*entry.paragraph, &*paragraph)
                 })
                 .ok_or(ProviderFailure::Range)?;
-            (index + 1, entry.source.clone()) // 固定缓存槽号是纯标量；Native验证前结束局部payload借用。
+            (index + 1, entry.source.clone()) // Cache-slot number is scalar only; end the payload borrow before Native validation.
         };
         let range = self.validate_paragraph_before_callback(
             &ticket, &origin, &paragraph, &source, cache_slot,
         )?;
         let edge = if reverse {
-            ticket.native("enumeration.reverse_edge", || range.location())? // Reverse返回本次真实已枚举元素的前缘。
+            ticket.native("enumeration.reverse_edge", || range.location())? // Reverse returns the actual enumerated element's leading edge.
         } else {
-            ticket.native("enumeration.forward_edge", || range.endLocation())? // Forward返回本次真实已枚举元素的后缘。
+            ticket.native("enumeration.forward_edge", || range.endLocation())? // Forward returns the actual enumerated element's trailing edge.
         };
         let element: &NSTextElement = &paragraph;
         let _continue_requested = ticket.native("enumeration.original_block", || {
             block.call((NonNull::from(element),))
         })?;
-        // 一次固定只交付一个元素；block已原样调用，true也不要求无界枚举或淘汰已发布缓存。
+        // Deliver one element only. The original block ran unchanged; true requests continuation
+        // but does not force unbounded enumeration or eviction of already published cache entries.
         Ok(Some(edge))
     }
 }
 
-/// 两个开关同时匹配才观察；此helper不取得任何Native对象或正文owner。
+/// Observe only when both explicit gates match; acquire no Native object or text owner here.
 pub(super) fn receiver_observation_requested() -> bool {
     std::env::var_os("OMNI_NATIVE_CONTENT_STORAGE_PROBE").as_deref()
         == Some(std::ffi::OsStr::new("virtual-paragraph"))
@@ -1112,12 +1168,12 @@ pub(super) fn receiver_observation_requested() -> bool {
             == Some(std::ffi::OsStr::new("1"))
 }
 
-/// 只用公开runtime类身份分类，不强制注册新类或向对象发送data getter。
+/// Classify public runtime class identity only, without forced registration or object-data getters.
 pub(super) fn virtual_attributed_receiver_is_ours(value: &NSAttributedString) -> bool {
     virtual_paragraph::virtual_attributed_receiver_is_ours(value)
 }
 
-/// 默认日志只发布固定的公开异常名，不格式化任意name字符串或异常对象。
+/// Ordinary logs emit fixed public exception-name labels, without formatting arbitrary names or objects.
 fn fixed_exception_name(name: &NSString) -> &'static str {
     for (known, label) in [
         (ns_string!("NSRangeException"), "NSRangeException"),
@@ -1133,18 +1189,20 @@ fn fixed_exception_name(name: &NSString) -> &'static str {
         (ns_string!("NSMallocException"), "NSMallocException"),
     ] {
         if name.isEqualToString(known) {
-            return label; // 只输出匹配的固定标签，绝不把任意异常name当用户可见正文。
+            return label; // Emit the matched fixed label only, never arbitrary exception-name text.
         }
     }
-    "other_nsexception" // 未识别名称仍保留原异常，不能改判成已知契约错误。
+    "other_nsexception" // Preserve unrecognized original exceptions instead of relabeling them as a known contract error.
 }
 
-/// 只供显式合成fixture：最多复制1024 UTF16单位的系统异常reason，不接触文档adapter。
+/// Explicit synthetic fixtures only: copy at most 1024 UTF-16 units of a system exception reason,
+/// without touching the document adapter.
 fn finite_exception_reason(reason: &NSString) -> String {
     let length = reason.length().min(1024);
     let mut units = [0u16; 1024];
     if length > 0 {
-        // SAFETY: 公开NSString长度已认证，固定栈缓冲容纳本次0..length读取且不越过reason末尾。
+        // SAFETY: Public NSString length bounds this 0..length read inside the actual reason;
+        // fixed stack storage covers every requested unit.
         unsafe {
             reason.getCharacters_range(
                 NonNull::new(units.as_mut_ptr()).expect("固定非空诊断缓冲"),
@@ -1152,17 +1210,18 @@ fn finite_exception_reason(reason: &NSString) -> String {
             )
         };
     }
-    String::from_utf16_lossy(&units[..length]) // 截断surrogate只影响合成诊断显示，不更改原异常或源数据。
+    String::from_utf16_lossy(&units[..length]) // A truncated surrogate affects synthetic diagnostic display only, never original exception or Source data.
 }
 
-/// 固定source网格只是归因参数；stride留一个unit给scalar/CRLF边界，硬上限始终4096。
+/// Fixed Source grid is attribution only. Reserve one stride unit for scalar/CRLF adjustment;
+/// the actual hard limit remains the existing 4096 units.
 fn finite_source_grid(
     length: usize,
     offset: usize,
     mut boundary: impl FnMut(usize) -> bool,
 ) -> Option<Range<usize>> {
     if offset >= length {
-        return None; // EOF没有源字符，不从末尾猜另一个请求。
+        return None; // EOF contains no Source character; infer no replacement request from the tail.
     }
     let stride = CONTENT_PROBE_UTF16_LIMIT - 1;
     let mut bucket = offset / stride;
@@ -1183,12 +1242,13 @@ fn finite_source_grid(
         {
             return Some(start..end);
         }
-        bucket = bucket.checked_add(1)?; // offset恰在向前收缩的grid边界时，只再看后一块。
+        bucket = bucket.checked_add(1)?; // An offset at a grid's backward-adjusted end permits checking only the next bucket.
     }
-    None // 不满足真实边界就拒绝，不能用超预算或完整段落兜底。
+    None // Reject unverified boundaries rather than falling back to an over-budget or whole physical paragraph.
 }
 
-/// 网格内部仍按真实CR/LF/PS分段，避免把包含多个物理段落的值伪装成单个NSTextParagraph。
+/// Within a grid, split at actual CR/LF/PS so a value containing several physical paragraphs
+/// does not impersonate one NSTextParagraph. Grid edges still remain experimental artificial cuts.
 fn segment_in_grid(units: &[u16], origin: usize, offset: usize) -> Option<Range<usize>> {
     let mut start = 0;
     let mut index = 0;
@@ -1196,13 +1256,13 @@ fn segment_in_grid(units: &[u16], origin: usize, offset: usize) -> Option<Range<
         let separator = matches!(units[index], 10 | 13 | 0x2029);
         index += 1;
         if separator && units[index - 1] == 13 && units.get(index) == Some(&10) {
-            index += 1; // 真实CRLF只有一个段界，不能添加孤立LF段。
+            index += 1; // Actual CRLF contributes one boundary, without an invented standalone LF paragraph.
         }
         if separator || index == units.len() {
             if origin + start <= offset && offset < origin + index {
                 return Some(origin + start..origin + index);
             }
-            start = index; // 每次只推进真实分隔符或有限grid末端，不插入源字符。
+            start = index; // Advance only at actual separators or the finite grid edge, without inserting Source characters.
         }
     }
     None
@@ -1214,6 +1274,8 @@ mod tests {
 
     #[test]
     fn finite_grid_covers_shifted_scalar_boundary_without_exceeding_limit() {
+        // Pure range arithmetic uses this existing injected boundary predicate. It checks grid
+        // adjustment only, not real Source reading, paragraph parity, or Native fragment behavior.
         let boundary = |point| point != 4095;
         assert_eq!(finite_source_grid(20_000, 4094, boundary), Some(4094..8190));
         assert_eq!(finite_source_grid(20_000, 4095, boundary), Some(4094..8190));
@@ -1222,6 +1284,8 @@ mod tests {
 
     #[test]
     fn finite_segments_preserve_real_crlf_and_global_coordinates() {
+        // Independent finite fixture units verify CRLF/line boundaries and original global
+        // offsets; no extra paragraph or source character may be manufactured.
         let units: Vec<_> = "a\r\n中\n末".encode_utf16().collect();
         assert_eq!(segment_in_grid(&units, 100, 102), Some(100..103));
         assert_eq!(segment_in_grid(&units, 100, 103), Some(103..105));

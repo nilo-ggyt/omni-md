@@ -1,4 +1,5 @@
-//! 字素边界只有两种原表示：普通Unicode沿16B匿名记录；全源精确ASCII证明沿密集整数。
+//! Grapheme boundaries have two representations: anonymous 16-byte Unicode records, or dense
+//! integer coordinates authorized by exact whole-source printable-ASCII proof.
 use super::{MarkdownGraphemeBoundary as Boundary, MarkdownGraphemeError as Error, Result};
 use crate::markdown_layout_index::{LayoutIndexError, LayoutIndexObserver, PagedLayoutIndex};
 
@@ -18,7 +19,7 @@ pub(super) struct BoundaryIndex {
     pub(super) fail_record: Option<usize>,
 }
 
-/// Dense从未创建LayoutIndex，因此观察者不能拿一个伪造的map0索引冒充真实归还。
+/// Dense creates no LayoutIndex; its observer cannot pass off a fictitious zero-sized mapping as released storage.
 #[derive(Clone)]
 pub(super) enum BoundaryResourceObserver {
     Paged(LayoutIndexObserver),
@@ -42,7 +43,8 @@ impl BoundaryResourceObserver {
                 let actual = observer.snapshot();
                 BoundaryResources {
                     allocated: true,
-                    // 未写记录的活owner没有FD或buffer；仅实际close后才能签发owner归还事实。
+                    // A live owner with no records may have neither FD nor buffer. Only actual
+                    // close plus successful cleanup establishes that its owner was released.
                     released: actual.owner_closed
                         && !actual.file_open
                         && actual.mapped_bytes == 0
@@ -122,7 +124,7 @@ impl BoundaryIndex {
             Representation::Paged(inner) => inner,
             #[cfg(feature = "paged-shaping-frontier")]
             Representation::DensePrintableAscii(_) => return Err(Error::CorruptMetadata),
-        }; // Dense已由整源证明封闭，普通机器不可向它追加或重签另一个字符域。
+        }; // Whole-source proof already closes Dense; the streaming machine cannot append or change its character domain.
         #[cfg(test)]
         if self.fail_record == Some(inner.len()) {
             inner.poison();
@@ -130,6 +132,8 @@ impl BoundaryIndex {
                 "synthetic metadata write failure",
             )));
         }
+        // Persist original byte and UTF-16 coordinates together as fixed little-endian
+        // values; failed conversion or append never increments successful-write accounting.
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(
             &u64::try_from(boundary.byte)
@@ -146,7 +150,7 @@ impl BoundaryIndex {
             .checked_add(1)
             .ok_or(Error::CoordinateOverflow)?;
         inner.append(bytes)?;
-        self.writes = next; // 只统计真实成功写入的固定record，不把逻辑Dense边界计为IO。
+        self.writes = next; // Count only successful physical records, not logical Dense boundaries.
         Ok(())
     }
     pub(super) fn get(&mut self, record: usize) -> Result<Boundary> {
@@ -155,6 +159,8 @@ impl BoundaryIndex {
             #[cfg(feature = "paged-shaping-frontier")]
             Representation::DensePrintableAscii(inner) => return inner.get(record),
         };
+        // Decode only the requested original record. Unrepresentable stored coordinates
+        // poison the actual paged owner rather than leaving cached metadata reusable.
         let next = self.reads.checked_add(1).ok_or(Error::CoordinateOverflow)?;
         let bytes = inner.read(record)?;
         self.reads = next;
@@ -172,16 +178,16 @@ impl BoundaryIndex {
         result
     }
 
-    /// 借原分页owner给出的已初始化追加区间；字素层不复制页，也不推测页中坐标。
+    /// Borrow the original owner's initialized append range without copying a page or inferring its coordinates.
     pub(super) fn append_page_records(&mut self) -> Result<Option<std::ops::Range<usize>>> {
         match &mut self.inner {
             Representation::Paged(inner) => inner.append_page_records().map_err(Into::into),
             #[cfg(feature = "paged-shaping-frontier")]
-            Representation::DensePrintableAscii(_) => Ok(None), // 密集证明没有物理追加页。
+            Representation::DensePrintableAscii(_) => Ok(None), // Dense proof has no physical append page.
         }
     }
 
-    /// 顺序导出至多256条原边界；Dense计算整数不读页，Paged只访问真实固定记录。
+    /// Export at most 256 original boundaries: Dense computes integers and Paged reads actual records.
     #[cfg(feature = "paged-line-compose")]
     pub(super) fn read_batch(
         &mut self,
@@ -202,7 +208,7 @@ impl BoundaryIndex {
         for (record, slot) in range.zip(output.iter_mut()) {
             *slot = self.get(record)?;
         }
-        Ok(()) // 失败后的整个batch仍由外层永久撤权，不能发布已改动的候选前缀。
+        Ok(()) // The outer owner revokes the whole batch on failure; an already written prefix is not publishable.
     }
     pub(super) fn seal(&mut self) -> Result<()> {
         match &mut self.inner {

@@ -1,4 +1,5 @@
-//! 原 GCB 机器只沿真实 table 物理硬边界跨过正文；末控制仍进入同一 Unicode DFA。
+//! The original GCB machine skips row bodies only across certified physical table edges.
+//! Actual trailing controls still enter the same Unicode DFA.
 
 use super::*;
 use crate::markdown_layout_source::table_rows::{TableCursor, TablePlan};
@@ -9,7 +10,8 @@ pub(super) struct State {
 }
 
 impl MarkdownGraphemeJob {
-    /// 只在原 job 首次读取前装入共享动态目录，后来行追加无需换 Source 或重建索引。
+    /// The coordinator installs this shared dynamic directory before reading the original job.
+    /// Later row publication requires neither another Source nor a rebuilt index.
     pub(crate) fn install_table_plan(&mut self, plan: TablePlan) -> Result<()> {
         plan.require(&self.source)?;
         self.tables = Some(State {
@@ -20,7 +22,8 @@ impl MarkdownGraphemeJob {
     }
 }
 
-/// 一个结构 record 或两个末控制 byte 都支付原配额；跳过长度不会成为读取或 scalar 计数。
+/// Charge structural records and actual trailing control bytes to their original work dimensions;
+/// skipped body length does not become byte reads or scalar decoding work.
 pub(super) fn advance(
     job: &mut MarkdownGraphemeJob,
     budget: MarkdownGraphemeBudget,
@@ -35,7 +38,7 @@ pub(super) fn advance(
     };
     if !state.jumped && job.machine.byte >= span.end.byte {
         state.cursor.finish();
-        return Ok(true); // 已有原真实前缀越过短行，不重读，也不删除已经成立的 Unicode 事实。
+        return Ok(true); // An existing real prefix already passed this short row; do not replay or erase its Unicode facts.
     }
     if job.machine.byte < span.start.byte {
         return Ok(false);
@@ -49,6 +52,8 @@ pub(super) fn advance(
         }
         state.jumped = true;
     }
+    // Read only remaining real CR/LF bytes, bounded independently by byte and scalar work.
+    // A structural jump authorizes neither hidden text decoding nor fictional source reads.
     let start = job.machine.byte;
     let end = span.end.byte.min(
         start
@@ -69,6 +74,8 @@ pub(super) fn advance(
             Ok(())
         })
         .or_else(|error| {
+            // Consume only this visitor's local machine-failure sentinel. A real Source
+            // failure must propagate instead of being mistaken for a successful row tail.
             if error == MarkdownDocumentBufferError::RangeOutsideDocument && failure.is_some() {
                 Ok(())
             } else {
@@ -78,6 +85,8 @@ pub(super) fn advance(
     if let Some(error) = failure {
         return Err(error);
     }
+    // Commit the physical endpoint only after its complete real tail and with record
+    // quota remaining; otherwise the same row stays pending for the next advance.
     if job.machine.byte == span.end.byte && step.records < budget.records {
         job.machine.finish_table(span, &mut job.index, step)?;
         state.cursor.finish();
@@ -86,7 +95,7 @@ pub(super) fn advance(
     Ok(true)
 }
 
-/// 普通扫描只能到当前已封闭 row 的首硬边界，绝不预读它的正文来猜结束位置。
+/// Ordinary scanning stops at the current certified row start without reading its body to guess an end.
 pub(super) fn read_end(job: &MarkdownGraphemeJob, end: usize) -> usize {
     job.tables
         .as_ref()

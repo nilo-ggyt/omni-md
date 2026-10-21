@@ -1,8 +1,10 @@
-//! 仅复用原完整冻结 root 的精确 UniformZero 证书；范围不完整或属性不满足时不扫描正文。
+//! Reuse exact UniformZero proof from the complete original frozen root. Incomplete scopes
+//! or ineligible properties decline this path without scanning text.
 
 use super::*;
 
-/// 原 prepare 的同一 Source/Gate 前后门由调用者持有；这里只消费完整 root 已维护的属性。
+/// The caller owns the original preparation's Source/Gate checks around this function;
+/// this path consumes only properties already maintained for the complete frozen root.
 pub(in crate::markdown_bidi) fn certify(
     snapshot: &MarkdownTextSnapshot,
     source: &Range<usize>,
@@ -23,7 +25,8 @@ pub(in crate::markdown_bidi) fn certify(
         u32::try_from(bytes.end).map_err(|_| BidiError::CoordinateOverflow)?;
         return Ok(Some(UniformCertificate::clear()));
     }
-    // 白名单完全沿原 UBA root 快路；段落 B 只重启仍为零的 base，不签隐区 GCB 或脚本事实。
+    // Use the original UBA-root whitelist. Paragraph separators restart a base that is
+    // still zero; this proof grants no hidden-region GCB or script authority.
     let properties = snapshot.unicode_properties()?;
     let eligible = [
         BidiClass::L,
@@ -56,7 +59,8 @@ mod tests {
     use crate::{MarkdownDocumentBuffer, MarkdownLayoutTextSource};
 
     #[test]
-    // 真完整 root 聚合可以保原 UniformZero；巨隐区既不扫正文，也不建立多余 UBA 文件。
+    // Exact whole-root aggregation can retain UniformZero without scanning the giant
+    // hidden body or creating an otherwise unnecessary UBA backing file.
     fn folded_ltr_root_reuses_original_exact_zero_certificate_without_hidden_source_reads() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("folded-zero.md");
@@ -79,6 +83,8 @@ mod tests {
             &cancel,
         );
         let mut job = job.unwrap();
+        // A one-unit quantum can finish from existing complete-root proof with zero
+        // source reads; this is distinct from treating an unfinished scan as Ready.
         let progress = job
             .step(
                 &authority,

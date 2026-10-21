@@ -1,4 +1,4 @@
-//! 原UBA的纯Core可暂停驱动；编译器保存原循环locals，不展开重跑已改写的规则。
+//! A suspendable pure Core driver for the original UBA; compiler-owned loop locals survive without unwinding and replaying already modified rules.
 use super::*;
 use std::{
     future::Future,
@@ -16,12 +16,12 @@ use io::CooperativeStore;
 #[cfg(all(test, feature = "paged-layout-breaks"))]
 mod tests;
 
-/// 一次显式step的硬预算；byte与scalar各自计费，不把UTF8窗口边缘当段落末尾。
+/// Independent work limits for one explicit step; source bytes/scalars are charged separately and a UTF8 window edge is not a paragraph end.
 #[derive(Clone, Copy, Debug)]
 pub struct MarkdownBidiPrepareBudget {
     pub bytes: usize,
     pub scalars: usize,
-    /// 每32B读/写及每个FD/页分配/flush操作各消费一个单位。
+    /// One unit per admitted 32-byte record read/write or resource allocation/flush attempt; this does not count individual OS syscalls.
     pub metadata_ops: usize,
 }
 impl MarkdownBidiPrepareBudget {
@@ -49,7 +49,7 @@ pub enum MarkdownBidiPrepareStatus {
     Ready,
 }
 
-/// 所有计数只覆盖本次poll实际启动的操作；失败也保留已发生的工作，不报假0。
+/// Count work admitted/performed by this poll; failure retains work already done instead of reporting a false zero. Counts are not elapsed time or RSS.
 #[derive(Clone, Copy, Debug)]
 pub struct MarkdownBidiPrepareStep {
     pub status: MarkdownBidiPrepareStatus,
@@ -78,7 +78,7 @@ impl MarkdownBidiPrepareStep {
 
 type Computation = Pin<Box<dyn Future<Output = Result<MarkdownBidiParagraph, BidiError>>>>;
 
-/// 构造阶段一次封闭的实际范围；不是可被调用方重签部分UBA结果的公开请求。
+/// The actual range is bound once at construction, without a public request capable of reauthorizing partial UBA results.
 struct Seed {
     snapshot: MarkdownTextSnapshot,
     range: Range<usize>,
@@ -97,7 +97,7 @@ struct Seed {
     tables: Option<crate::markdown_layout_source::table_rows::TablePlan>,
 }
 
-/// 只复制稳定原因，不保留正文或业务闭包；首次Storage错误的原值仍由首次返回完整交付。
+/// Copy only a stable cause without text or business closures; the first return still delivers the original full Storage error.
 #[derive(Clone, Copy)]
 pub(super) enum Failure {
     Cancelled,
@@ -116,6 +116,7 @@ pub(super) enum Failure {
 }
 impl Failure {
     pub(super) fn capture(error: &BidiError) -> Self {
+        // Preserve typed stable variants and Storage errno/kind, rather than retaining an arbitrary error payload across the failed owner's lifetime.
         match error {
             BidiError::Cancelled => Self::Cancelled,
             BidiError::SourceMismatch => Self::SourceMismatch,
@@ -133,6 +134,7 @@ impl Failure {
         }
     }
     pub(super) fn error(self) -> BidiError {
+        // Repeated queries reconstruct the same stable failure category; a Storage error without errno retains its kind, not its original message object.
         match self {
             Self::Cancelled => BidiError::Cancelled,
             Self::SourceMismatch => BidiError::SourceMismatch,
@@ -154,11 +156,11 @@ impl Failure {
     }
 }
 
-/// 一个原worker内的固定Future和原Store；本值不承诺Send，不创建执行器或后台线程。
+/// One fixed future and original Store inside its actual worker; this value promises no Send and creates neither executor nor background thread.
 ///
-/// Source/取消handle先移入原worker，再在其中构造此job。所有await仅等待下一次显式step
-/// 补预算；没有timer、Native waker、轮询服务或额外正文模型。Drop真实销毁整个Future，
-/// 因而同时归还其中的Store、Source和固定页，观察者只保原子事实。
+/// Move Source/cancellation into the original worker before constructing this job there. Awaits only wait for the next explicit step's quota,
+/// without a timer, Native waker, polling service, or another text model. Drop destroys the actual future and returns its Store, Source,
+/// and fixed pages; observers retain atomic facts only.
 pub struct MarkdownBidiPrepareJob {
     gate: Rc<Gate>,
     computation: Option<Computation>,
@@ -171,7 +173,7 @@ pub struct MarkdownBidiPrepareJob {
 }
 
 impl MarkdownBidiPrepareJob {
-    /// 只接受完整原Source；0与EOF的byte坐标来自同一冻结树聚合，不隐读端点叶。
+    /// Accept only the complete original Source; byte zero/EOF come from the same frozen tree totals without hidden endpoint-leaf reads.
     #[cfg(feature = "paged-layout-breaks")]
     pub fn new_layout_source(
         source: crate::MarkdownLayoutTextSource,
@@ -185,7 +187,7 @@ impl MarkdownBidiPrepareJob {
         job
     }
 
-    /// 原资源scope在任何FD acquire之前即可取得；失败构造也不丢观察者。
+    /// Obtain the original resource scope before any FD acquisition; a failed constructor still returns its observer.
     #[cfg(feature = "paged-layout-breaks")]
     pub(crate) fn new_layout_source_observed(
         source: crate::MarkdownLayoutTextSource,
@@ -210,7 +212,7 @@ impl MarkdownBidiPrepareJob {
         )
     }
 
-    /// 折叠装配只建立显式可见段 scope；首个 level 仍须在后续原段量子内完成 UBA。
+    /// Fold composition establishes an explicit visible-paragraph scope only; the first actual level still needs later original paragraph quanta.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn new_layout_source_folded_observed(
         source: crate::MarkdownLayoutTextSource,
@@ -232,7 +234,7 @@ impl MarkdownBidiPrepareJob {
         )
     }
 
-    /// 原 Body flow 只声明动态表格结构目录，UBA 仍按当前真实完整 B 段逐量子准备。
+    /// Original Body flow declares a dynamic structural table directory only; UBA still prepares the actual complete B paragraph in quanta.
     #[cfg(all(
         feature = "s2-table-window-prototype",
         feature = "paged-shaping-frontier"
@@ -257,7 +259,7 @@ impl MarkdownBidiPrepareJob {
         )
     }
 
-    /// 所有 Source 装配复用同一 Seed/Future 初始化图，差异只在显式显示 proof 是否存在。
+    /// All Source composition uses the same Seed/future construction, differing only in explicit display proofs.
     #[cfg(feature = "paged-layout-breaks")]
     fn layout_source_observed(
         source: crate::MarkdownLayoutTextSource,
@@ -324,7 +326,7 @@ impl MarkdownBidiPrepareJob {
         (result, observer)
     }
 
-    /// 原有界端点游标已经封闭完整 B 段和双坐标；这里不再同步读取边叶转换端点。
+    /// The original bounded cursor already certified a complete B paragraph and both coordinate ranges; do not synchronously reread boundary leaves here.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn new_layout_paragraph_observed(
         source: crate::MarkdownLayoutTextSource,
@@ -360,8 +362,8 @@ impl MarkdownBidiPrepareJob {
         Ok(job)
     }
 
-    /// 旧Snapshot/range入口本来就是同步契约；只在这里执行原有有限叶端点定位，
-    /// 然后仍驱动同一个状态机。此初始化不冒充公开细byte预算的Prepare入口。
+    /// The synchronous snapshot/range entry performs its bounded endpoint-leaf lookup here, then drives the same state machine.
+    /// This initialization does not claim the fine source-byte admission of the public Prepare entry.
     pub(super) fn snapshot_range(
         snapshot: MarkdownTextSnapshot,
         range: Range<usize>,
@@ -411,6 +413,7 @@ impl MarkdownBidiPrepareJob {
     ) -> Result<Self, BidiError> {
         seed.snapshot.original_backing_health()?;
         seed.cancellation.check()?;
+        // Internal records use u32 IDs with NONE reserved; reject unrepresentable input rather than colliding with the sentinel.
         let units = u32::try_from(seed.range.len()).map_err(|_| BidiError::CoordinateOverflow)?;
         if units == NONE {
             return Err(BidiError::CoordinateOverflow);
@@ -457,13 +460,13 @@ impl MarkdownBidiPrepareJob {
             return self.fail(error);
         }
         if let Some(failure) = self.failure {
-            return Err(failure.error()); // 后来的取消/坏预算不能洗掉已知元数据首错。
+            return Err(failure.error()); // Later cancellation or an invalid quota cannot erase an already recorded metadata failure.
         }
         if let Err(error) = self.gate.health() {
             return self.fail(error);
         }
         if self.consumed {
-            return Err(BidiError::PoisonedMetadata); // 已消费不能靠新预算重新签一份结果。
+            return Err(BidiError::PoisonedMetadata); // A consumed result cannot be issued again by supplying another budget.
         }
         if budget.bytes == 0 || budget.scalars == 0 || budget.metadata_ops == 0 {
             return self.fail(BidiError::InvalidBudget);
@@ -480,7 +483,7 @@ impl MarkdownBidiPrepareJob {
             }
             let mut step = self.gate.progress();
             step.status = MarkdownBidiPrepareStatus::Ready;
-            return Ok(step); // Ready命中不再运行Future，但健康与原取消门仍必经。
+            return Ok(step); // A cached Ready does not rerun the future, but original health and cancellation remain required.
         }
         let mut context = Context::from_waker(Waker::noop());
         let result = self
@@ -489,13 +492,14 @@ impl MarkdownBidiPrepareJob {
             .ok_or(BidiError::PoisonedMetadata)?
             .as_mut()
             .poll(&mut context);
-        // 外部reader的真实源失败最优先；已有metadata错误不被随后取消洗掉。
+        // Actual original-source failure has priority after polling too; subsequent cancellation cannot erase a returned metadata cause.
         if let Err(error) = self.gate.source_health() {
             return self.fail(error);
         }
         match result {
             Poll::Ready(Err(error)) => self.fail(error),
             Poll::Ready(Ok(ready)) => {
+                // Recheck the same gate after all actual computation; failed final authorization drops the actual candidate instead of publishing it.
                 if let Err(error) = self.gate.health() {
                     drop(ready);
                     return self.fail(error);
@@ -507,6 +511,7 @@ impl MarkdownBidiPrepareJob {
                 Ok(progress)
             }
             Poll::Pending => {
+                // Pending keeps the original future's actual local state; a final health failure still destroys that owner immediately.
                 if let Err(error) = self.gate.health() {
                     return self.fail(error);
                 }
@@ -516,15 +521,16 @@ impl MarkdownBidiPrepareJob {
     }
 
     fn fail<T>(&mut self, error: BidiError) -> Result<T, BidiError> {
-        self.computation.take(); // Drop原Future先归还其中所有局部Store/借用/Source，而非改空immutable。
+        self.computation.take(); // Drop the original future and its actual local Store/borrows/Source rather than clearing immutable text elsewhere.
         self.ready.take();
         if let Err(source) = self.gate.source_health() {
             self.failure = Some(Failure::capture(&source));
-            return Err(source); // 原backing错误即使发生在最后Drop，也高于此前的取消或元数据失败。
+            return Err(source); // Even backing failure discovered during final Drop precedes the earlier cancellation or metadata outcome.
         }
         if let Some(failure) = self.failure {
             return Err(failure.error());
         }
+        // The existing contract retains an original Storage error; otherwise an observed failed close becomes Storage. It does not retain both errors.
         let error = if !matches!(error, BidiError::Storage(_))
             && let Some(errno) = self.resources.snapshot().close_errno
         {
@@ -558,13 +564,13 @@ impl MarkdownBidiPrepareJob {
         }
         let ready = self.ready.take();
         self.consumed = ready.is_some();
-        Ok(ready) // Pending只返回None；没有任何部分rule或未来SCX/UBA前缀的Ready授权。
+        Ok(ready) // Pending returns None only; no partial rule or future SCX/UBA prefix gains Ready authority.
     }
     pub fn resource_observer(&self) -> MarkdownBidiResourceObserver {
         self.resources.clone()
     }
 
-    /// 可见段 owner 只复核原任务的永久状态，不补预算、运行 Future 或转移 Ready 权限。
+    /// The visible-paragraph owner checks the original job's permanent state without replenishing quota, polling the future, or transferring Ready.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(super) fn require_healthy(&self) -> Result<(), BidiError> {
         self.gate.source_health()?;
@@ -573,11 +579,12 @@ impl MarkdownBidiPrepareJob {
         }
         self.gate.health()
     }
-    /// 失败时同样可核上次实际工作；这是固定诊断计数，不授予Source或部分层级权限。
+    /// Inspect last actual work after failure too; these fixed diagnostics grant neither Source nor partial-level authority.
     pub fn last_step(&self) -> MarkdownBidiPrepareStep {
         self.gate.progress()
     }
     pub(super) fn run(mut self) -> Result<MarkdownBidiParagraph, BidiError> {
+        // The synchronous API drives the same admitted computation to completion; its loop is not a promise of interactive yield or bounded total latency.
         loop {
             let step = self.advance(MarkdownBidiPrepareBudget::default())?;
             if step.status == MarkdownBidiPrepareStatus::Ready {
@@ -618,7 +625,7 @@ async fn compute(
         feature = "paged-shaping-frontier"
     ))]
     if let Some(tables) = tables {
-        // 表格目录最初可为空；未来行追加只撤其内部权限，不能为此预扫整篇或换一份 Source。
+        // The table directory may initially be empty; later rows only revoke their own interior authority, without a document prescan or replacement Source.
         return Ok(MarkdownBidiParagraph {
             _snapshot: snapshot,
             layout_source,
@@ -652,7 +659,7 @@ async fn compute(
         snapshot.original_backing_health()?;
         gate.health()?;
         let paragraph_count = if certificate.has_paragraph_boundaries() {
-            None // 多段只按需定位真实B范围，不伪造已经计算的总数或建立第二段目录。
+            None // Locate actual B ranges on demand without inventing a precomputed total or creating another paragraph directory.
         } else {
             Some(u32::from(units != 0))
         };
@@ -671,7 +678,7 @@ async fn compute(
     }
     #[cfg(feature = "paged-shaping-frontier")]
     if let Some(plan) = folds.filter(|plan| !plan.spans().is_empty()) {
-        // 完整 root 未证明零级时仅建立可见段 scope；禁止为了拿快路扫描隐藏 RTL 或控制正文。
+        // If the complete root cannot prove level zero, establish only a visible-paragraph scope; do not scan hidden RTL/controls to obtain a fast path.
         snapshot.original_backing_health()?;
         gate.health()?;
         return Ok(MarkdownBidiParagraph {
@@ -693,6 +700,7 @@ async fn compute(
     }
     let mut store =
         CooperativeStore::new(units, budget, cancellation, &resources, Rc::clone(&gate)).await?;
+    // Capture complete requested coordinates into the sole metadata Store, then run the ordered UBA phases over that original paged inventory.
     let paragraph_count =
         super::source::capture_prepared(&snapshot, &source, bytes, base, &mut store).await?;
     for id in 0..paragraph_count {
@@ -706,6 +714,7 @@ async fn compute(
         implicit::finish_levels(&mut store, paragraph).await?;
     }
     store.flush().await?;
+    // All dirty metadata must reach the original file and pass actual Source/Store checks before its completed owner is published.
     snapshot.original_backing_health()?;
     store.healthy()?;
     Ok(MarkdownBidiParagraph {

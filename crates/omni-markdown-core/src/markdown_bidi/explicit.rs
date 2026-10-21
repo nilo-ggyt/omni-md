@@ -1,6 +1,6 @@
 // Copyright 2015 The Servo Project Developers.
 // Algorithm adapted from unicode-bidi 0.3.18 explicit.rs. SPDX-License-Identifier: MIT OR Apache-2.0
-//! X1–X8/X9：合法显式level栈固定126项，overflow计数仍保留全部输入语义。
+//! X1-X8/X9 use a fixed 126-entry valid embedding stack; overflow counters still preserve the semantics of all input controls.
 
 use super::prepare::io::CooperativeStore;
 use super::*;
@@ -24,6 +24,7 @@ pub(super) async fn compute(
     paragraph: Paragraph,
 ) -> Result<(u32, u32), BidiError> {
     use BidiClass::*;
+    // Start each actual paragraph with its own base and bounded legal stack, without inheriting controls from a preceding paragraph.
     let initial = Status {
         level: paragraph.base,
         override_status: Override::Neutral,
@@ -44,6 +45,7 @@ pub(super) async fn compute(
         let last = stack[depth - 1];
         match text.original {
             RLE | LRE | RLO | LRO | RLI | LRI | FSI => {
+                // Preserve the initiator's current level and override behavior before deciding whether its new embedding/isolate is legal.
                 text.level = last.level;
                 let isolate = matches!(text.original, RLI | LRI | FSI);
                 if isolate {
@@ -59,6 +61,7 @@ pub(super) async fn compute(
                     && overflow_isolate == 0
                     && overflow_embedding == 0
                 {
+                    // Only valid levels enter the fixed stack; overflow controls are counted separately, never represented by unbounded heap growth.
                     if depth >= stack.len() {
                         return Err(BidiError::CorruptMetadata);
                     }
@@ -88,9 +91,10 @@ pub(super) async fn compute(
                 }
                 if !isolate {
                     text.processing = BN;
-                } // X9只移除格式作用；原UTF16位置仍保留。
+                } // X9 removes formatting influence only; the original UTF16 coordinate remains represented.
             }
             PDI => {
+                // An overflowing isolate consumes only its overflow count. A matching valid isolate also discards nested embeddings back to its original stack entry.
                 if overflow_isolate > 0 {
                     overflow_isolate -= 1;
                 } else if valid_isolate > 0 {
@@ -110,7 +114,7 @@ pub(super) async fn compute(
                 text.processing = apply_override(stack[depth - 1].override_status, text.processing);
             }
             PDF => {
-                if overflow_isolate > 0 { /* isolate溢出内部的PDF不得弹合法栈。 */
+                if overflow_isolate > 0 { /* PDF inside an overflowing isolate must not pop the valid stack. */
                 } else if overflow_embedding > 0 {
                     overflow_embedding -= 1;
                 } else if last.override_status != Override::Isolate && depth >= 2 {
@@ -119,7 +123,7 @@ pub(super) async fn compute(
                 text.level = stack[depth - 1].level;
                 text.processing = BN;
             }
-            B => {} // B仍保持paragraph base，随后独立段会重建整个显式栈。
+            B => {} // B retains this paragraph's base; the next actual paragraph rebuilds the entire explicit stack.
             _ => {
                 text.level = last.level;
                 if text.original != BN {
@@ -128,7 +132,7 @@ pub(super) async fn compute(
             }
         }
         text.write_prepared(store, at).await?;
-        // UTF16低项共享head的处理类别与level，不能被误当成另一个独立字符。
+        // A low-surrogate record shares the head's processing class/level and must not be treated as another independent character.
         if length == 2 {
             let mut continuation = Text::read_prepared(store, at + 1).await?;
             continuation.level = text.level;
@@ -138,6 +142,7 @@ pub(super) async fn compute(
         if at == paragraph.start {
             run_level = text.level;
         } else if !removed(text.original) && text.level != run_level {
+            // Publish completed logical level runs in the same Store; X9-removed controls do not create artificial run changes.
             Run {
                 start: run_start,
                 end: at,
@@ -153,6 +158,7 @@ pub(super) async fn compute(
         at += length;
     }
     if run_start < paragraph.end {
+        // Retain the last actual run too; this logical run inventory is not yet a visually reordered soft line.
         Run {
             start: run_start,
             end: paragraph.end,
@@ -167,6 +173,7 @@ pub(super) async fn compute(
 }
 
 fn apply_override(status: Override, class: BidiClass) -> BidiClass {
+    // Only directional overrides replace a character's processing class; neutral/isolate stack entries retain the actual class.
     match status {
         Override::Rtl => BidiClass::R,
         Override::Ltr => BidiClass::L,

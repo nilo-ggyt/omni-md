@@ -1,7 +1,7 @@
-//! Unicode18 / UAX14 revision57默认断行机会。它不做宽度选行、词典、locale或Native排版。
+//! Default Unicode18 / UAX14 revision57 opportunities; width selection, dictionary segmentation, locale tailoring, and Native layout have separate owners.
 //!
-//! 同一冻结source只借用有限piece；待决规则保留固定属性状态，真实机会进入独立匿名分页
-//! 索引。NoBreak不逐项存储，chunk末尾不是eot；显式feature不改变默认编辑器路径。
+//! Borrow bounded pieces of one frozen Source. Pending rules retain fixed property state, and actual opportunities enter an independently owned anonymous paged index.
+//! NoBreak outcomes are not stored per scalar, and chunk end is not text end; enabling a probe feature alone does not prove product-path integration.
 
 use crate::{
     MarkdownDocumentBufferError, MarkdownLayoutTextAuthority, MarkdownLayoutTextSource,
@@ -51,6 +51,7 @@ type Result<T> = std::result::Result<T, MarkdownLineBreakError>;
 
 impl From<LayoutIndexError> for MarkdownLineBreakError {
     fn from(value: LayoutIndexError) -> Self {
+        // Keep actual storage errors typed while mapping invalid record structure and arithmetic overflow to this index's public contract.
         match value {
             LayoutIndexError::InvalidRecord => Self::CorruptMetadata,
             LayoutIndexError::Overflow => Self::CoordinateOverflow,
@@ -61,6 +62,7 @@ impl From<LayoutIndexError> for MarkdownLineBreakError {
 }
 impl From<machine::Error> for MarkdownLineBreakError {
     fn from(value: machine::Error) -> Self {
+        // Decoder/order failure cannot become a valid partial index; the owning job revokes publication after receiving this cause.
         match value {
             machine::Error::OutOfOrder => Self::CorruptMetadata,
             machine::Error::InvalidUtf8 => Self::InvalidUtf8,
@@ -81,7 +83,7 @@ pub struct MarkdownLineBreakBoundary {
     pub byte: usize,
     pub utf16: usize,
     pub kind: MarkdownLineBreakKind,
-    /// 机会发布前已读source包含尚需词典分析的SA；false不证明未读后继没有SA。
+    /// Already read text includes SA requiring dictionary work; false does not prove an unread successor contains no SA.
     pub needs_dictionary: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,7 +157,7 @@ pub struct MarkdownLineBreakResourceSnapshot {
     pub metadata_file_open: bool,
     pub metadata_map_bytes: usize,
     pub metadata_peak_map_bytes: usize,
-    /// 原匿名metadata唯一写buffer的当前/历史实际heap字节；与正文映射分别计量。
+    /// Current/historical actual heap bytes of the anonymous metadata's sole write buffer, measured separately from document mappings.
     pub metadata_buffer_bytes: usize,
     pub metadata_peak_buffer_bytes: usize,
     pub cleanup_failed: bool,
@@ -177,7 +179,7 @@ impl MarkdownLineBreakResourceObserver {
     }
 }
 
-/// 只拥有同一个冻结source和自己的32B机会索引；没有第二份正文、字形或全局注册表。
+/// Own one frozen Source claim and a paged index of 32-byte opportunities, without a second body, glyph inventory, or global registry.
 pub struct MarkdownLineBreakJob {
     index: store::LineBreakIndex,
     source: MarkdownLayoutTextSource,
@@ -185,7 +187,7 @@ pub struct MarkdownLineBreakJob {
     failed: bool,
     ready: bool,
     source_borrow_max: usize,
-    // 跳过隐区只改变 canonical 游标；实读计数不能用该游标冒充已扫描全文。
+    // A hidden-range jump changes canonical coordinates only; those coordinates cannot stand in for actual source-byte consumption.
     source_bytes_read: usize,
     #[cfg(feature = "paged-line-compose")]
     folds: Option<FoldPlan>,
@@ -197,10 +199,10 @@ pub struct MarkdownLineBreakJob {
     split: Option<usize>,
 }
 impl MarkdownLineBreakJob {
-    /// 创建匿名元数据owner但不扫描source；调用方可让GCB与本任务共享同一个源payload。
+    /// Create the lazy metadata owner without opening its FD or scanning Source; callers can share the same immutable payload with the GCB job.
     ///
     /// # Errors
-    /// 匿名文件或页大小合同不可用时直接失败，局部资源由其原owner释放。
+    /// Reject an unsupported fixed-record layout; anonymous-file creation errors belong to the later operation that actually needs the FD.
     pub fn new(source: MarkdownLayoutTextSource) -> Result<Self> {
         Ok(Self {
             index: store::LineBreakIndex::new()?,
@@ -221,7 +223,7 @@ impl MarkdownLineBreakJob {
         })
     }
 
-    /// 显示装配只在首个扫描量子之前共享同 Source 的端点证明；普通构造仍分析完整正文。
+    /// Display composition shares same-Source endpoint proofs before the first scan quantum; ordinary construction still analyzes the complete text incrementally.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn install_fold_plan(&mut self, plan: FoldPlan) -> Result<()> {
         self.guard(plan.authority())?;
@@ -233,7 +235,7 @@ impl MarkdownLineBreakJob {
         Ok(())
     }
 
-    /// 原 pending 只推进到已实读的 header 换行；隐区末尾仍交给原 UTF8/LB 规则消费。
+    /// Settle original pending tokens only at an actually read header line ending; ordinary UTF8/LB rules still consume the hidden range's tail.
     #[cfg(feature = "paged-line-compose")]
     fn advance_fold(&mut self, records: &mut usize, budget: usize) -> Result<()> {
         let Some(span) = self
@@ -247,7 +249,7 @@ impl MarkdownLineBreakJob {
         if self.machine.byte_offset() != span.header_end.byte as u64 {
             return Ok(());
         }
-        // 两端共用同一终止符时无中段可跳，继续原扫描即可；机会写入仍过滤隐藏内部。
+        // If both endpoints share one terminator there is no interior to skip; continue ordinary decoding while still filtering hidden opportunities.
         if span.tail_start.byte <= span.header_end.byte {
             self.next_fold += 1;
             return Ok(());
@@ -266,7 +268,7 @@ impl MarkdownLineBreakJob {
     }
     fn guard(&mut self, authority: &MarkdownLayoutTextAuthority) -> Result<()> {
         if let Err(error) = self.source.health() {
-            // 同一冻结源的回收失败永久撤销已发布前缀与Ready权限；保留这次真实源错误。
+            // A reclaim failure in this frozen Source permanently revokes both published-prefix and Ready authority; return that actual Source cause.
             self.fail();
             return Err(MarkdownLineBreakError::Source(error));
         }
@@ -280,14 +282,15 @@ impl MarkdownLineBreakJob {
         Ok(())
     }
     fn fail(&mut self) {
+        // Poison the actual derived index, including cached records, rather than allowing a failed prefix to remain queryable.
         self.failed = true;
         self.index.poison();
     }
 
-    /// 三个配额均严格计费；前缀机会不代表完整Ready，任何失败永久撤销整个索引权限。
+    /// Charge all three quotas; a prefix opportunity is not complete Ready, and failure permanently revokes the whole derived index.
     ///
     /// # Errors
-    /// 外来源、零配额、UTF8/聚合不符、计数溢出或实际索引IO失败均返回原typed原因。
+    /// Return typed causes for foreign Source, zero quotas, invalid UTF8/coordinates, arithmetic overflow, or actual index I/O failure.
     pub fn step(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,
@@ -295,6 +298,7 @@ impl MarkdownLineBreakJob {
     ) -> Result<MarkdownLineBreakStep> {
         self.guard(authority)?;
         let result = self.step_inner(budget);
+        // Real shared-Source health is checked after all work, so metadata failure cannot mask an original source failure discovered during the quantum.
         let result = self
             .source
             .health()
@@ -318,6 +322,7 @@ impl MarkdownLineBreakJob {
             needs_dictionary: self.machine.needs_dictionary(),
         };
         if self.ready {
+            // Completion is cached only after actual EOF and index sealing; the outer guard still checks the original Source on every call.
             step.status = MarkdownLineBreakStatus::Ready;
             return Ok(step);
         }
@@ -341,8 +346,8 @@ impl MarkdownLineBreakJob {
             }
             let start = usize::try_from(self.machine.byte_offset())
                 .map_err(|_| MarkdownLineBreakError::CoordinateOverflow)?;
-            // 每字节至多完成一个scalar/机会；按三项余量的最小值借用，完整消费原piece回调，
-            // 不用伪错误提前中止访问，也不会先读4KiB再把其中未计费的正文丢掉。
+            // One byte completes at most one scalar/opportunity. Borrow at most the minimum remaining quota and consume the actual piece callback.
+            // Do not read 4 KiB first and discard uncharged text, or use a fabricated error to end successful visitation early.
             let size = (budget.bytes - step.bytes)
                 .min(budget.scalars - step.scalars)
                 .min(budget.records - step.records)
@@ -384,11 +389,11 @@ impl MarkdownLineBreakJob {
             let source_result = self.source.visit_byte_range(start..end, |bytes| {
                 if failure.is_some() {
                     return Ok(());
-                } // 首失败后不再写文件或消费后继piece。
+                } // Stop business decoding/writes after the first local failure; a later callback does not regain publication authority.
                 for byte in bytes {
                     if failure.is_some() {
                         break;
-                    } // 实际IO已失败，后继字节不能继续取得元数据写权。
+                    } // After actual I/O failure, later bytes cannot acquire permission to append metadata.
                     let mut event = None;
                     let mut duplicate = false;
                     let result =
@@ -411,8 +416,8 @@ impl MarkdownLineBreakJob {
                         {
                             continue;
                         }
-                        // 一个字节最多完成一个scalar/机会。先结束machine可变借用，再取它的
-                        // 原SA事实写同一个record，不把默认AL解析错误标记为词典已经完成。
+                        // Each byte completes at most one scalar/opportunity. End the mutable machine borrow before appending its original SA fact.
+                        // Default AL class resolution does not certify completed dictionary segmentation.
                         match index.push(event, machine.needs_dictionary()) {
                             Ok(()) => step.records += 1,
                             Err(error) => failure = Some(error),
@@ -421,7 +426,7 @@ impl MarkdownLineBreakJob {
                 }
                 Ok(())
             });
-            // 失败前已经解码的真实前缀也属于本量子的实际工作，跳过的源坐标不参与计数。
+            // Charge the actual prefix decoded before failure too; skipped source coordinates contribute no consumed bytes or scalars.
             let consumed = usize::try_from(self.machine.byte_offset() - before_byte)
                 .map_err(|_| MarkdownLineBreakError::CoordinateOverflow)?;
             self.source_bytes_read = self
@@ -444,15 +449,17 @@ impl MarkdownLineBreakJob {
                 .map_err(|_| MarkdownLineBreakError::CoordinateOverflow)?
                 != self.source.utf16_len()
             {
-                return Err(MarkdownLineBreakError::InvalidUtf8); // 精确source EOF也须吻合原UTF16聚合，短读不补eot。
+                return Err(MarkdownLineBreakError::InvalidUtf8); // Exact Source EOF must match original UTF16 totals; a short read cannot manufacture text end.
             }
             while step.records < budget.records && !self.machine.finished() {
+                // Drain actual remaining rules and the terminal opportunity under the record quota, preserving pending state between steps.
                 if let Some(event) = self.machine.finish_one()? {
                     self.index.push(event, self.machine.needs_dictionary())?;
                     step.records += 1;
                 }
             }
             if self.machine.finished() {
+                // The actual writer must seal successfully before the job publishes Ready.
                 self.index.seal()?;
                 self.ready = true;
             }
@@ -466,10 +473,10 @@ impl MarkdownLineBreakJob {
         Ok(step)
     }
 
-    /// 只查询原source已经认证的前缀；Previous/Next为严格前驱/后继，未知后继保持Pending。
+    /// Query only the original Source's certified prefix; Previous/Next are strict, and an unknown successor remains Pending.
     ///
     /// # Errors
-    /// 越界、外来权限或元数据IO错误永久撤权；内部UTF8/低代理项坐标只能是非边界。
+    /// Out-of-range, foreign-authority, or metadata I/O errors revoke the index; interior UTF8/low-surrogate coordinates cannot become boundaries.
     pub fn query(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,
@@ -493,7 +500,7 @@ impl MarkdownLineBreakJob {
             .as_ref()
             .is_some_and(|plan| plan.hides(offset, matches!(unit, MarkdownLineBreakUnit::Utf16)))
         {
-            // 隐区是有效正文，但本显示配置没有其查询权限；拒绝不会撤销健康可见前缀。
+            // Hidden text is valid, but this display configuration grants no query authority there; refusal does not revoke a healthy visible prefix.
             return Err(MarkdownLineBreakError::FoldedRange);
         }
         let result = self.query_inner(unit, offset, query);
@@ -547,15 +554,15 @@ impl MarkdownLineBreakJob {
         .map_err(|_| MarkdownLineBreakError::CoordinateOverflow)?;
         let mut low = 0;
         let mut high = self.index.len();
-        // 只保本次查询实际读到的两侧机会；下界收敛后直接交付，避免再读同一record。
-        // 这些局部值不跨query生存，不能替代原Source健康检查或发布尚未认证的后继。
+        // Retain only the neighboring opportunities actually read by this query, then return them without rereading the same record.
+        // These locals do not survive the query, replace Source health checks, or publish an uncertified successor.
         let mut previous = None;
         let mut following = None;
         if let Some(page) = self.index.append_page_records()?
             && !page.is_empty()
         {
-            // 前向排版通常查询原追加页附近。先读该页首条真实机会，便可只在其已初始化
-            // 区间二分；旧区域仍访问原FD，不增加页缓存，也不提前读取正文或未知记录。
+            // Forward layout often queries near the original append page. Its first actual record bounds binary search to initialized records.
+            // Older regions still use the original FD, without another page cache, early body reads, or invented records.
             let first = self.index.get(page.start)?;
             if position(first) < offset {
                 low = page.start + 1;
@@ -563,11 +570,11 @@ impl MarkdownLineBreakJob {
                 previous = Some(first);
             } else {
                 high = page.start;
-                following = Some(first); // 旧区域的严格Next也可能恰好是追加页首机会。
+                following = Some(first); // The strict successor of an older position may be exactly this append page's first opportunity.
                 if position(first) == offset {
                     low = page.start;
                     if matches!(query, MarkdownLineBreakQuery::Previous) && page.start != 0 {
-                        // 页首自身不是严格前驱；前一条必须沿原FD读取，不能靠页锚点推算。
+                        // The page's first record is not its own strict predecessor; read the actual previous record from the original FD.
                         previous = Some(self.index.get(page.start - 1)?);
                     }
                 }
@@ -606,7 +613,7 @@ impl MarkdownLineBreakJob {
                     if position(boundary) != offset {
                         return Ok(MarkdownLineBreakAnswer::Known(Some(boundary)));
                     }
-                    // Next保留严格大于语义；仅相等时再读取真实后一条，不能复用自身。
+                    // Next remains strictly greater; equality requires the actual next record instead of reusing the current opportunity.
                     low += 1;
                 }
                 if low < self.index.len() {
@@ -622,6 +629,7 @@ impl MarkdownLineBreakJob {
     }
 
     pub fn cancel(&mut self) {
+        // Revoke all derived opportunities immediately; explicit close or Drop still owns actual index/source resource release.
         self.fail();
     }
     #[must_use]
@@ -652,10 +660,10 @@ impl MarkdownLineBreakJob {
             source: self.source.resource_observer(),
         }
     }
-    /// 归还本索引真实FD和唯一写buffer；其他source克隆仍独立有效，不能强制清空其不可变正文。
+    /// Return this index's actual FD and sole write buffer; other Source clones remain independently valid and their immutable text is not cleared.
     ///
     /// # Errors
-    /// 实际写入/close失败保留负面资源收据，不能被已poison状态改写成释放成功。
+    /// Actual write/close failures retain negative resource facts; prior poison cannot turn failed cleanup into a success receipt.
     pub fn close(mut self) -> Result<()> {
         self.index.close()
     }
@@ -670,7 +678,7 @@ mod tests;
     feature = "paged-shaping-frontier"
 ))]
 impl MarkdownLineBreakJob {
-    /// 结构跳跃只在原 machine 已消费真实行尾后完成，尚未提交端点保持待决。
+    /// A structural jump completes only after the original machine consumes the actual row tail; an unconsumed endpoint remains pending.
     pub(crate) fn table_passed(&self, end: usize) -> bool {
         self.machine.utf16_offset() >= end as u64
     }

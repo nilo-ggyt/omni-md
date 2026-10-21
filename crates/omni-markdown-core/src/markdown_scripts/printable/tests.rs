@@ -1,4 +1,5 @@
-//! 原Machine作有限完整oracle；摘要路径的metadata与释放收据仍来自真实文件和映射。
+//! The original machine provides a finite complete oracle. Summary-path metadata
+//! and release receipts still describe actual files, buffers, and mappings.
 
 use super::*;
 use crate::{MarkdownDocumentBuffer, MarkdownTextSelection};
@@ -12,6 +13,8 @@ const ONE: MarkdownScriptBudget = MarkdownScriptBudget {
 };
 
 fn fixture(text: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+    // Each case owns its temporary file. Capture uses the real document backing
+    // whose exact root summary can be compared with original scalar scanning.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("printable-scripts.md");
     std::fs::write(&path, text).unwrap();
@@ -20,6 +23,8 @@ fn fixture(text: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
 }
 
 #[derive(Default)]
+// Accumulate actual step work only for these finite cases. These quantities do
+// not measure native UI latency, total product memory, or process RSS.
 struct Work {
     polls: usize,
     bytes: usize,
@@ -33,6 +38,8 @@ fn finish(
     authority: &MarkdownLayoutTextAuthority,
     budget: MarkdownScriptBudget,
 ) -> Work {
+    // Each reported work category must stay within its own quota. Pending must
+    // make progress rather than consume the finite guard with empty retries.
     let mut work = Work::default();
     for _ in 0..1_000_000 {
         let step = job.step(authority, budget).unwrap();
@@ -55,6 +62,8 @@ fn runs(
     job: &mut MarkdownScriptJob,
     authority: &MarkdownLayoutTextAuthority,
 ) -> Vec<MarkdownScriptRun> {
+    // Enumerate stored test output, then require both public coordinate queries
+    // to return the same record under its original source authority.
     let mut result = Vec::new();
     for index in 0..job.store.run_count() {
         let run = job.store.run(index).unwrap();
@@ -73,6 +82,8 @@ fn runs(
 }
 
 fn assert_released(observer: &MarkdownScriptResourceObserver) {
+    // Permission revocation and Ready alone do not establish cleanup: inspect
+    // actual FD, mapping, buffer, and final frozen-source ownership receipts.
     let actual = observer.snapshot();
     assert!(!actual.run_file_open && !actual.stack_file_open);
     assert_eq!(actual.mapped_bytes, 0);
@@ -82,6 +93,8 @@ fn assert_released(observer: &MarkdownScriptResourceObserver) {
 }
 
 fn compare_ascii(text: &str, budget: MarkdownScriptBudget) {
+    // This finite printable-only precondition lets the literal ASCII rule and
+    // the unoptimized original machine independently constrain the summary.
     assert!(text.len() <= 4096 && text.bytes().all(|byte| (b' '..=b'~').contains(&byte)));
     let (_directory, document) = fixture(text);
     let source = MarkdownLayoutTextSource::capture(&document);
@@ -95,6 +108,8 @@ fn compare_ascii(text: &str, budget: MarkdownScriptBudget) {
     let mut oracle =
         MarkdownScriptJob::new_streaming(source, &authority, MarkdownScriptCancellation::new())
             .unwrap();
+    // Construction must neither scan the body nor eagerly create index FDs or
+    // buffers. The zero-byte query is Pending until actual metadata sealing.
     let receipt = actual.resource_observer();
     let oracle_receipt = oracle.resource_observer();
     let before = receipt.snapshot();
@@ -115,7 +130,7 @@ fn compare_ascii(text: &str, budget: MarkdownScriptBudget) {
     );
     assert_eq!(oracle_work.bytes, text.len());
     assert_eq!(oracle_work.scalars, text.len());
-    assert_eq!(actual.machine.byte, text.len()); // 语义游标已到真EOF，实际读取量由独立字段保持0。
+    assert_eq!(actual.machine.byte, text.len()); // The semantic cursor reaches true EOF; the separate read count remains zero.
     assert_eq!(actual.storage_profile().source_bytes_read, 0);
     assert!(actual.machine.ready && actual.storage_profile().printable_summary_used);
     assert!(!oracle.storage_profile().printable_summary_used);
@@ -128,6 +143,8 @@ fn compare_ascii(text: &str, budget: MarkdownScriptBudget) {
         "原Machine结果不允许由新摘要改写：{text:?}"
     );
     if let Some(run) = actual_runs.first() {
+        // Printable ASCII contains only Common and Latin candidates. Literal
+        // letters, not the optimized result, decide the expected public tag.
         assert_eq!(actual_runs.len(), 1);
         assert_eq!((run.start_byte, run.start_utf16), (0, 0));
         assert_eq!((run.end_byte, run.end_utf16), (text.len(), text.len()));
@@ -143,7 +160,8 @@ fn compare_ascii(text: &str, budget: MarkdownScriptBudget) {
         assert!(text.is_empty());
     }
     for position in 0..=text.len() {
-        // 每个原坐标都走公开查询；不能只比较内部候选而漏掉EOF或范围定位。
+        // Query every original coordinate, including EOF, rather than compare
+        // only internal candidates and miss endpoint or range lookup errors.
         for unit in [MarkdownScriptUnit::Byte, MarkdownScriptUnit::Utf16] {
             assert_eq!(
                 actual.run_at(&authority, unit, position).unwrap(),
@@ -152,7 +170,8 @@ fn compare_ascii(text: &str, budget: MarkdownScriptBudget) {
         }
     }
     let after = receipt.snapshot();
-    // 此摘要只有至多一个真实run，私有封存及逐坐标读取始终落在原单buffer，无需创建File。
+    // At most one real run fits in the original single buffer. Private sealing
+    // and all coordinate queries therefore need no file consumer.
     assert!(!after.run_file_open && !after.stack_file_open);
     assert_eq!(after.stack_peak_mapped_bytes, 0);
     assert_eq!(after.run_peak_mapped_bytes, 0);
@@ -169,6 +188,8 @@ fn compare_ascii(text: &str, budget: MarkdownScriptBudget) {
 
 #[test]
 fn every_printable_property_and_complete_machine_oracle_agree_on_summary() {
+    // The generated property assumptions are checked separately from the
+    // differential run output, so an overly broad printable rule is visible.
     let latin = properties::get('a').primary;
     assert_eq!(MarkdownScript(latin).iso15924_tag(), *b"Latn");
     for byte in b' '..=b'~' {
@@ -181,7 +202,8 @@ fn every_printable_property_and_complete_machine_oracle_agree_on_summary() {
             assert_eq!(p.primary, unicode_data::COMMON);
             assert_eq!(p.scripts, None);
         }
-        // 每个95字符独立执行旧Machine，防止合并大样本里的Latin上下文掩盖Common事实。
+        // Run each of the 95 printable characters independently: Latin context
+        // in a combined sample must not hide a Common character's own result.
         compare_ascii(&char::from(byte).to_string(), ONE);
     }
     let all: String = (b' '..=b'~').map(char::from).collect();
@@ -191,6 +213,8 @@ fn every_printable_property_and_complete_machine_oracle_agree_on_summary() {
 
 #[test]
 fn empty_digits_nested_mismatched_and_pending_pairs_match_original_machine() {
+    // Entire-root ASCII proof must preserve the original machine's handling of
+    // empty input, Common-only text, and settled or unsettled bracket pairs.
     for text in [
         "",
         "[]",
@@ -217,12 +241,14 @@ fn empty_digits_nested_mismatched_and_pending_pairs_match_original_machine() {
         format!("{}{}a", "([{".repeat(64), ")]}}".repeat(64)),
         format!("{}{}", "(".repeat(96), ")".repeat(96)),
     ] {
-        compare_ascii(&text, ONE); // 真实旧栈超过32层；新证明不能靠截断配对记录保持结果。
+        compare_ascii(&text, ONE); // The original stack exceeds 32 frames; truncating pairing context cannot justify the proof.
     }
 }
 
 #[test]
 fn one_record_and_one_stack_operation_retain_real_pending_phases_without_eager_files() {
+    // One stack-operation quantum separates the two actual seal phases. A
+    // summary may write its run without claiming the machine has reached Ready.
     for text in ["", "[]a", "[]"] {
         let (_directory, document) = fixture(text);
         let source = MarkdownLayoutTextSource::capture(&document);
@@ -260,7 +286,8 @@ fn one_record_and_one_stack_operation_retain_real_pending_phases_without_eager_f
             (0, 0, 0, 1)
         );
         assert_eq!(receipt.snapshot().mapped_bytes, 0);
-        // 私有seal保留非空run的已付费buffer；只有close才归还这份实际分配。
+        // Private seal retains the nonempty run's paid working buffer. Only
+        // closing the owner relinquishes that actual allocation.
         assert_eq!(
             receipt.snapshot().buffer_bytes,
             if text.is_empty() {
@@ -270,6 +297,8 @@ fn one_record_and_one_stack_operation_retain_real_pending_phases_without_eager_f
             }
         );
         let cached = job.step(&authority, ONE).unwrap();
+        // Once both stores are sealed, another healthy step reports cached
+        // Ready without manufacturing additional source or metadata work.
         assert_eq!(cached.status, MarkdownScriptStatus::Ready);
         assert_eq!(
             (
@@ -288,11 +317,13 @@ fn one_record_and_one_stack_operation_retain_real_pending_phases_without_eager_f
 
 #[test]
 fn large_single_paragraph_writes_one_real_run_without_source_or_bracket_scan() {
+    // Build the real four-MiB input using a fixed-size block; the test itself
+    // need not allocate a second complete paragraph to exercise the summary.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("large-scripts.md");
     let mut file = std::fs::File::create(&path).unwrap();
     for _ in 0..1024 {
-        file.write_all(&[b'a'; 4096]).unwrap(); // 实际4MiB磁盘输入，堆上只保留固定4KiB写块。
+        file.write_all(&[b'a'; 4096]).unwrap(); // Fixed four-KiB writes create the actual four-MiB file.
     }
     drop(file);
     let document = MarkdownDocumentBuffer::open(&path, 8 * 1024 * 1024).unwrap();
@@ -300,6 +331,8 @@ fn large_single_paragraph_writes_one_real_run_without_source_or_bracket_scan() {
     let source = MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
     let before_reads = mapping.reclaim_attempts();
+    // Observe work after opening/capturing the source. Zero reads here concerns
+    // this script job, not the document's initial validation or the whole app.
     let mut job =
         MarkdownScriptJob::new(source, &authority, MarkdownScriptCancellation::new()).unwrap();
     let receipt = job.resource_observer();
@@ -328,6 +361,8 @@ fn large_single_paragraph_writes_one_real_run_without_source_or_bracket_scan() {
 
 #[test]
 fn unicode_controls_and_rtl_text_keep_original_source_work_and_machine_results() {
+    // Non-ASCII and controls disqualify the exact printable-root proof. The
+    // public constructor must retain actual source work and original SCX output.
     for text in [
         "a中",
         "אב (12)",
@@ -359,6 +394,8 @@ fn unicode_controls_and_rtl_text_keep_original_source_work_and_machine_results()
 
 #[test]
 fn frozen_edited_restored_roots_and_foreign_capture_keep_exact_source_authority() {
+    // An edit invalidates the current ASCII fact without changing the older
+    // frozen source. Undo can restore bytes but cannot restore capture identity.
     let (_directory, mut document) = fixture("[]abc");
     let old = MarkdownLayoutTextSource::capture(&document);
     let old_authority = old.authority();
@@ -377,6 +414,8 @@ fn frozen_edited_restored_roots_and_foreign_capture_keep_exact_source_authority(
     assert!(!edited_job.storage_profile().printable_summary_used);
     assert_eq!(finish(&mut edited_job, &edited_authority, ONE).bytes, 7);
     assert!(document.undo().is_some());
+    // A separately captured equal root is foreign even at the same generation;
+    // cached summary facts cannot transfer its authority to the restored job.
     let restored = MarkdownLayoutTextSource::capture(&document);
     let restored_authority = restored.authority();
     assert!(restored_authority != old_authority);
@@ -391,7 +430,7 @@ fn frozen_edited_restored_roots_and_foreign_capture_keep_exact_source_authority(
     assert!(matches!(
         restored_job.run_at(&foreign.authority(), MarkdownScriptUnit::Byte, 0),
         Err(MarkdownScriptError::SourceMismatch)
-    )); // 同字节/root/generation的外来capture仍撤销本job，不能借摘要混票。
+    )); // Equal bytes, root, and generation do not let a foreign capture reuse this job's ticket.
     assert!(matches!(
         restored_job.run_at(&restored_authority, MarkdownScriptUnit::Byte, 0),
         Err(MarkdownScriptError::Poisoned)
@@ -400,6 +439,8 @@ fn frozen_edited_restored_roots_and_foreign_capture_keep_exact_source_authority(
 
 #[test]
 fn cancellation_between_actual_phases_and_after_ready_releases_both_files_and_source() {
+    // Cover cancellation before construction, before work, between real seal
+    // phases, and after Ready. Every case must relinquish its actual owners.
     for phase in 0..4 {
         let (_directory, document) = fixture("[]abc");
         let mapping = document.original_backing_observer().unwrap();
@@ -433,7 +474,7 @@ fn cancellation_between_actual_phases_and_after_ready_releases_both_files_and_so
                 job.run_at(&authority, MarkdownScriptUnit::Byte, 0),
                 Err(MarkdownScriptError::Cancelled)
             ));
-            job.close().unwrap(); // 取消不能跳过任何真实FD或残留写映射的清理。
+            job.close().unwrap(); // Cancellation cannot skip cleanup of actual FDs, buffers, or mappings.
             assert_released(&receipt);
         }
         drop(document);
@@ -444,6 +485,8 @@ fn cancellation_between_actual_phases_and_after_ready_releases_both_files_and_so
 
 #[test]
 fn real_source_eio_precedes_cancel_foreign_authority_and_completed_summary() {
+    // Exercise the same source-health gate before work, during a Pending seal,
+    // and after Ready. Cached completion cannot outrank the original source errno.
     for phase in 0..3 {
         let (_directory, document) = fixture("[]abc");
         let mapping = document.original_backing_observer().unwrap();
@@ -467,7 +510,7 @@ fn real_source_eio_precedes_cancel_foreign_authority_and_completed_summary() {
             Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(
                 libc::EIO
             ))
-        ); // 真实借入页再触发驱逐错误；不是只置flag就宣称来源已坏。
+        ); // The existing fault hook operates on a real leased page's reclaim path, rather than merely setting a local job flag.
         cancel.cancel();
         let foreign = MarkdownLayoutTextSource::capture(&document).authority();
         assert!(matches!(
@@ -500,12 +543,15 @@ fn summary_private_seal_does_not_write_but_actual_cross_page_failure_revokes_kno
         MarkdownScriptJob::new(source, &authority, MarkdownScriptCancellation::new()).unwrap();
     let path = directory.path().join("readonly-summary-run");
     std::fs::write(&path, []).unwrap();
+    // Keep the existing private-store injection explicit: its FD is an actual
+    // read-only file, while the store implementation remains the production one.
     job.store =
         store::Store::with_runs_file(std::fs::File::open(&path).unwrap(), &job.cancellation)
             .unwrap();
     let receipt = job.resource_observer();
-    // 原精确摘要只有一条64B run，既没有跨页也不交出File Reader；private seal
-    // 合法读取原buffer，不能为延续旧测试预期强制把这条临时记录写盘。
+    // The exact summary has one 64-byte run, neither crosses a page nor hands a
+    // reader its file. Private seal legitimately serves the original buffer;
+    // preserving an old test expectation must not force this record to disk.
     let work = finish(&mut job, &authority, ONE);
     assert_eq!(
         (work.bytes, work.scalars, work.records, work.stack_ops),
@@ -528,8 +574,9 @@ fn summary_private_seal_does_not_write_but_actual_cross_page_failure_revokes_kno
     assert_released(&receipt);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 
-    // 真正需要File写入的位置是原SCX连续run跨页。混合脚本保留原Machine，
-    // 先取得一个真实Known前run，再由只读FD的真实EBADF撤销旧查询权限；不造摘要fallback。
+    // Crossing real SCX run pages actually requires a file write. Mixed scripts
+    // retain the original machine: first publish a real known run, then require
+    // the read-only FD's EBADF to revoke it, without a summary fallback.
     let text = "aא".repeat(300);
     let (directory, document) = fixture(&text);
     let source = MarkdownLayoutTextSource::capture(&document);
@@ -565,6 +612,8 @@ fn summary_private_seal_does_not_write_but_actual_cross_page_failure_revokes_kno
         }
     }
     assert!(known_prefix);
+    // A real storage failure permanently revokes earlier metadata. Cleanup
+    // still drops its owners, while the observer retains the failed outcome.
     assert!(
         matches!(failure, Some(MarkdownScriptError::Storage(error)) if error.raw_os_error() == Some(libc::EBADF))
     );

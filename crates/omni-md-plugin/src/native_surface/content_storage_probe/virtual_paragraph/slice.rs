@@ -1,4 +1,5 @@
-//! 虚拟值的UTF16范围运算；只转坐标，不读取、复制或重新编码源字符。
+//! UTF-16 range arithmetic for the synthetic virtual-value experiment. Translate coordinates
+//! only, without reading, copying, or reencoding Source characters.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Utf16Slice {
@@ -8,18 +9,19 @@ pub(super) struct Utf16Slice {
 
 impl Utf16Slice {
     pub(super) fn new(start: usize, length: usize, source_length: usize) -> Option<Self> {
+        // Reject overflow and source-bound violations before issuing an actual slice coordinate.
         let end = start.checked_add(length)?;
         (end <= source_length).then_some(Self { start, length })
     }
 
     pub(super) fn end(self) -> usize {
-        self.start + self.length // 只有new/subrange能构造本模块之外的值，已证明总和不溢出。
+        self.start + self.length // Actual callers establish this nonoverflowing sum through new/subrange; field visibility alone does not enforce it.
     }
 
     pub(super) fn subrange(self, location: usize, length: usize) -> Option<Self> {
         let local_end = location.checked_add(length)?;
         if local_end > self.length {
-            return None; // 包括越界空串；只有真实slice末端的空范围允许。
+            return None; // Empty ranges beyond EOF are invalid too; only the actual slice endpoint admits an empty substring.
         }
         let start = self.start.checked_add(location)?;
         Self::new(start, length, self.end())
@@ -27,7 +29,7 @@ impl Utf16Slice {
 
     pub(super) fn index(self, local_index: usize) -> Option<usize> {
         if local_index >= self.length {
-            return None; // index与range不同，EOF空范围不能变成一个可读unit。
+            return None; // A readable index differs from a range; an empty EOF substring contains no readable code unit.
         }
         self.start.checked_add(local_index)
     }
@@ -39,18 +41,20 @@ impl Utf16Slice {
         global_length: usize,
         source_length: usize,
     ) -> Option<(usize, usize)> {
+        // The original global attribute run must contain this exact receiver-local character.
+        // Intersect only after coverage is known, then return receiver-local coordinates.
         let global_index = self.index(local_index)?;
         let global_end = global_location.checked_add(global_length)?;
         if global_end > source_length
             || global_location > global_index
             || global_index >= global_end
         {
-            return None; // 原属性范围必须真实覆盖本次unit，未知/空run不能变成有效覆盖。
+            return None; // Unknown, empty, or noncovering original runs cannot become valid attribute coverage.
         }
         let start = global_location.max(self.start);
         let end = global_end.min(self.end());
         if start >= end {
-            return None; // 不能用零长度effectiveRange让Foundation不前进或假装成功。
+            return None; // A zero-length effective range cannot make Foundation stall or impersonate successful coverage.
         }
         Some((start - self.start, end - start))
     }
@@ -62,6 +66,8 @@ mod tests {
 
     #[test]
     fn nested_subranges_preserve_global_offsets_and_real_empty_eof() {
+        // Exercise actual production coordinate arithmetic, including nested global offsets and
+        // the distinction between an empty EOF range and an invalid EOF character index.
         let source = Utf16Slice::new(100, 20, 200).expect("真实source范围");
         let nested = source.subrange(5, 8).expect("真实子范围");
         assert_eq!(nested, Utf16Slice::new(105, 8, 200).expect("同全局范围"));
@@ -73,6 +79,8 @@ mod tests {
 
     #[test]
     fn overflow_and_invalid_effective_ranges_never_become_coordinates() {
+        // Invalid arithmetic or missing run coverage must remain None, rather than clamping
+        // into a valid-looking coordinate that could authorize another native request.
         assert_eq!(Utf16Slice::new(usize::MAX, 1, usize::MAX), None);
         let source = Utf16Slice::new(10, 10, 30).expect("真实source范围");
         assert_eq!(source.subrange(usize::MAX, 2), None);
@@ -85,6 +93,8 @@ mod tests {
 
     #[test]
     fn surrogate_code_units_are_forwarded_without_scalar_reencoding() {
+        // NSString slicing permits individual surrogate units. This pure coordinate control
+        // reads only its finite fixture, not a native string or a live document.
         let units: Vec<u16> = "甲😀乙".encode_utf16().collect();
         let emoji = Utf16Slice::new(1, 2, units.len()).expect("真实emoji源范围");
         let high = emoji

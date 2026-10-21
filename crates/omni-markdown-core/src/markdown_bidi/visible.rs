@@ -1,4 +1,5 @@
-//! 折叠显示只分析实际需要的完整 B 段；前一段与当前段各保留一次原 UBA 结果。
+//! Folded display analyzes only the complete B paragraphs actually needed, retaining at most
+//! the previous and current original UBA results.
 
 use super::*;
 use crate::{
@@ -19,7 +20,8 @@ pub(super) struct VisibleParagraphs {
     failure: Option<prepare::Failure>,
 }
 
-/// 仅原协调线程持在途 Future/Gate；已封存的 Paragraph 不持这些 !Send 资源，仍可原样跨线程。
+/// Only the coordinator retains the in-flight Future/Gate. Sealed paragraphs contain none
+/// of these !Send resources and retain their original cross-thread contract.
 #[derive(Default)]
 pub(crate) struct VisiblePreparation {
     cursor: Option<FrozenBidiParagraphCursor>,
@@ -27,14 +29,14 @@ pub(crate) struct VisiblePreparation {
     target: Option<usize>,
 }
 
-/// 只缓存这个已封存段的真实 UBA 查询进度；纯数值仍可随 Paragraph 原样跨线程转移。
+/// Cache only this sealed paragraph's actual UBA-query progress; numeric state travels with its paragraph.
 #[derive(Default)]
 pub(super) struct WordOrder {
     next: u32,
     permitted: Option<bool>,
 }
 
-/// 词组消费者单独支付原元数据访问；此结果不包含 GCB、Source 端点或 Native 提交权限。
+/// Word consumers pay for original metadata access; these facts grant no GCB, Source endpoint, or Native commit authority.
 pub(crate) struct WordOrderStep {
     pub(crate) records: usize,
     pub(crate) metadata_units: usize,
@@ -42,7 +44,8 @@ pub(crate) struct WordOrderStep {
 }
 
 impl MarkdownBidiParagraph {
-    /// CR/LF/TAB 是合法词组空白，不要求 Markdown 的“无内联控制”证书；真实完整段仍须全部零级。
+    /// CR/LF/TAB are valid word whitespace without a Markdown control-free certificate;
+    /// the actual complete paragraph must nevertheless have zero levels throughout.
     pub(crate) fn prepare_word_order(
         &mut self,
         authority: &MarkdownLayoutTextAuthority,
@@ -60,7 +63,8 @@ impl MarkdownBidiParagraph {
             Resolution::VisibleParagraphs(visible) => {
                 let paragraph = visible.character_mut(range.start)?;
                 let through = range.end.min(paragraph.source.end);
-                // CRLF 是一个原 GCB，却属于两个原 B 段；这里只证明实际当前段，后继由同一游标再准备。
+                // CRLF is one original GCB but spans two B paragraphs. Certify only the
+                // actual current paragraph; the same cursor prepares its successor later.
                 paragraph.prepare_word_order(authority, range.start..through, records)?
             }
             Resolution::UniformZero(_) => (
@@ -70,19 +74,20 @@ impl MarkdownBidiParagraph {
                     permitted: Some(true),
                 },
                 range.end,
-            ), // 原完整证书已经证明零级；换行等 Markdown 控制不影响视觉与逻辑前后的等价。
+            ), // Original complete proof already establishes level zero despite Markdown controls such as line endings.
             Resolution::Paged(store) => (
                 self.word_order.advance(store, self.units, records)?,
                 range.end,
             ),
         };
-        self.require_layout_source(authority)?; // 缓存命中和真实文件读取都不能绕过同源、取消与存储撤权。
+        self.require_layout_source(authority)?; // Cached and file-backed results both retain Source, cancellation, and storage checks.
         Ok(step)
     }
 }
 
 impl WordOrder {
-    /// 每条原 Text 记录只消费一次；在整段未完成前不把当前 GCB 的 level0 冒充全段视觉顺序。
+    /// Consume each original Text record once; one GCB's level zero cannot certify visual
+    /// order before the complete paragraph has been checked.
     fn advance(
         &mut self,
         store: &mut Store,
@@ -95,7 +100,8 @@ impl WordOrder {
                 let text = Text::read(store, self.next)?;
                 records += 1;
                 self.next += 1;
-                // 共用原 UBA 快证书的类别规则，拒绝嵌入/隔离控制；不以最终偶然为零的 level 猜方向。
+                // Reuse the original UBA certificate's class rules, rejecting embedding
+                // and isolate controls even if their resulting level happens to be zero.
                 if text.level != 0 || !uniform::eligible_class(text.original) {
                     self.permitted = Some(false);
                     break;
@@ -103,7 +109,7 @@ impl WordOrder {
             }
             if self.next == units && self.permitted.is_none() {
                 self.permitted = Some(true);
-            } // 低代理项也是原表的真实记录，同样计入记录量子，不再借正文解码或复制段落。
+            } // Low surrogates are actual table records too; charge them without decoding or copying paragraph text again.
         }
         Ok(WordOrderStep {
             records,
@@ -114,7 +120,7 @@ impl WordOrder {
 }
 
 impl VisibleParagraphs {
-    /// 此值只封闭显示范围，不签任何 level；真正段结果仍必须由原 prepare 完成。
+    /// Close only the display scope; actual levels still require the original paragraph preparation.
     pub(super) fn new(
         plan: FoldPlan,
         base: BidiBaseDirection,
@@ -133,7 +139,8 @@ impl VisibleParagraphs {
         )
     }
 
-    /// Table scope 从构造起保持实际段准备；将来的真实行由共享目录追加，不签任何隐藏 level。
+    /// Table scope retains actual paragraph preparation from construction. The shared
+    /// directory publishes later real rows without granting levels inside hidden bodies.
     #[cfg(feature = "s2-table-window-prototype")]
     pub(super) fn new_tables(
         tables: crate::markdown_layout_source::table_rows::TablePlan,
@@ -146,7 +153,8 @@ impl VisibleParagraphs {
         Self::create(folds, Some(tables), base, budget, cancellation, resources)
     }
 
-    /// 资源和相邻两段仍只有原初始化图；折叠与表格只改变各自真实区间的查询权限。
+    /// Keep one original ownership graph for resources and two adjacent paragraphs;
+    /// folds and tables change only query authority in their actual scopes.
     fn create(
         plan: Option<FoldPlan>,
         #[cfg(feature = "s2-table-window-prototype")] tables: Option<
@@ -171,7 +179,8 @@ impl VisibleParagraphs {
         }
     }
 
-    /// 原取消、任一真实子 Store 错误及首 close 失败都会撤销整个显示分析范围。
+    /// Original cancellation, a real child Store failure, or recorded close failure
+    /// invalidates successful use of the display analysis scope.
     pub(super) fn healthy(&self) -> Result<(), BidiError> {
         #[cfg(feature = "s2-table-window-prototype")]
         if let Some(tables) = &self.tables {
@@ -188,11 +197,12 @@ impl VisibleParagraphs {
                 Ok(()) | Err(BidiError::Cancelled) => {}
                 Err(error) => return Err(error),
             }
-        } // 两段共享同一取消位；先交付任一实际存储永久失败，再统一处理这个较弱原因。
+        } // Both paragraphs share cancellation; return actual storage failure before that weaker shared outcome.
         self.cancellation.check()
     }
 
-    /// 保留实际在途失败的稳定首因；显示范围错误属于无权限查询，不撤销其它已完成可见段。
+    /// Retain the stable cause of an actual in-flight failure. Out-of-domain queries
+    /// do not revoke other completed visible paragraphs.
     pub(super) fn remember_failure(&mut self, error: &BidiError) {
         if self.failure.is_none()
             && !matches!(
@@ -204,7 +214,8 @@ impl VisibleParagraphs {
         }
     }
 
-    /// 隐区仍有原正文，但没有可见 level/run 权限；CR 起点自身保留原段控制职责。
+    /// Hidden regions retain their text but grant no visible level/run authority;
+    /// the opening CR position keeps its original paragraph-control role.
     pub(super) fn require_range(&self, range: &Range<usize>) -> Result<(), BidiError> {
         if range.start > range.end {
             return Err(BidiError::InvalidRange);
@@ -232,7 +243,8 @@ impl VisibleParagraphs {
         Ok(())
     }
 
-    /// 仅委托完整覆盖请求的真实结果；两个有限槽之外的正文不会默认为 level0。
+    /// Delegate only to an actual result covering the complete request; text outside
+    /// the two retained slots does not default to level zero.
     pub(super) fn range(&self, range: &Range<usize>) -> Result<&MarkdownBidiParagraph, BidiError> {
         self.require_range(range)?;
         [&self.current, &self.previous]
@@ -245,7 +257,8 @@ impl VisibleParagraphs {
             .ok_or(BidiError::UnpreparedRange)
     }
 
-    /// 查询只借已有两段；不会在同步绘制或 run 遍历中隐式开始另一次全文规则分析。
+    /// Queries borrow only the two existing results, without starting hidden analysis
+    /// during synchronous drawing or run traversal.
     pub(super) fn range_mut(
         &mut self,
         range: &Range<usize>,
@@ -261,7 +274,8 @@ impl VisibleParagraphs {
             .ok_or(BidiError::UnpreparedRange)
     }
 
-    /// 字符所属段必须半开命中，不能把前一段的末端误签为后继段的 level/base。
+    /// Character lookup uses a half-open paragraph range, so the previous paragraph's
+    /// endpoint cannot supply the next paragraph's level or base direction.
     pub(super) fn character_mut(
         &mut self,
         position: usize,
@@ -275,7 +289,8 @@ impl VisibleParagraphs {
             .ok_or(BidiError::UnpreparedRange)
     }
 
-    /// 原端点游标与原 UBA 子任务共同分摊一个量子；段落完整之前不发布任何局部层级。
+    /// Original endpoint discovery and the UBA child share one quantum; incomplete
+    /// paragraphs publish no partial levels.
     pub(super) fn step(
         &mut self,
         source: &MarkdownLayoutTextSource,
@@ -288,16 +303,19 @@ impl VisibleParagraphs {
         self.require_range(&(position..position))?;
         if let Some(job) = &work.preparation {
             job.require_healthy()?;
-        } // 在途首错仍属于同一个 Item 任务，不能因缓存中恰有旧段就绕过它。
+        } // A cached older paragraph cannot bypass the same item's actual in-flight failure.
         if let Some(paragraph) = [&mut self.current, &mut self.previous]
             .into_iter()
             .flatten()
             .find(|paragraph| paragraph.source.contains(&position))
         {
-            // 原完整UBA已就绪仍不等于正文控制边界已封闭。子Uniform继续自己的唯一
-            // PreparedParagraph游标，真实换行留在段尾；Paged结果则沿原入口零工作返回。
+            // Complete UBA does not by itself close body-control endpoints. Uniform
+            // continues its sole PreparedParagraph cursor, retaining real trailing
+            // controls; a Paged result returns through the original zero-work entry.
             return paragraph.prepare_uniform_paragraph_range(authority, position, budget);
         }
+        // A changed target retires the actual old preparation and projection before
+        // checking cleanup health and starting the new original-source cursor.
         if work.target != Some(position) {
             drop(work.preparation.take());
             drop(work.cursor.take());
@@ -322,7 +340,8 @@ impl VisibleParagraphs {
                 return Ok(progress);
             };
             let bytes = found.byte_range.ok_or(BidiError::CorruptMetadata)?;
-            // 第三段启动前退役最旧一段；当前段仍用于原 hard-break 的后继前探和发布。
+            // Retire the oldest result before starting a third paragraph. The current
+            // result remains available for original hard-break lookahead and publication.
             if let Some(previous) = self.previous.take() {
                 drop(previous);
                 self.healthy()?;
@@ -338,6 +357,8 @@ impl VisibleParagraphs {
             )?);
             drop(work.cursor.take());
         }
+        // Endpoint discovery has already consumed its share of each independent work
+        // dimension; the UBA child receives only the remainder of the original quantum.
         let remaining = MarkdownBidiPrepareBudget {
             bytes: budget.bytes - progress.bytes,
             scalars: budget.scalars - progress.scalars,
@@ -369,8 +390,9 @@ impl VisibleParagraphs {
                 metadata_ops: remaining.metadata_ops - actual.metadata_ops,
             };
             if remaining.bytes != 0 && remaining.scalars != 0 && remaining.metadata_ops != 0 {
-                // 首次Ready也必须经过同一个子段入口，不能让零工作完成的Future绕开
-                // 正文端点准备。本次已发生的UBA工作先扣账，端点仅消费剩余原量子。
+                // First Ready still enters the same paragraph-endpoint preparation; a
+                // zero-work Future cannot skip it. Charge actual UBA work first and pass
+                // only the remaining original quantum to endpoint discovery.
                 let prepared = self
                     .current
                     .as_mut()
@@ -387,12 +409,12 @@ impl VisibleParagraphs {
         Ok(progress)
     }
 
-    /// 一个聚合收据包含两段真实文件和页；观察者本身不保活任何 Source 或 UBA 结果。
+    /// Aggregate actual files and pages from the two paragraphs without observers retaining Source or UBA results.
     pub(super) fn resource_observer(&self) -> MarkdownBidiResourceObserver {
         self.resources.observe()
     }
 
-    /// 页读数保留已经实际退役的段，当前缓存字节直接取真实共活资源收据。
+    /// Page counts include already retired results; current cache bytes come from the actual shared resource receipt.
     pub(super) fn storage(&self) -> (usize, u64) {
         (
             self.resources.observe().snapshot().cache_bytes,
@@ -406,7 +428,7 @@ mod tests {
     use super::*;
     use crate::MarkdownDocumentBuffer;
 
-    /// 原量子控制端点与完整规则的总工作，测试只对有限可见段建立独立 UBA oracle。
+    /// Bound combined endpoint/rule work; independent UBA oracles cover only finite visible paragraphs.
     fn prepare(
         paragraph: &mut MarkdownBidiParagraph,
         source: &MarkdownLayoutTextSource,
@@ -437,7 +459,8 @@ mod tests {
         panic!("实际可见 B 段没有在原预算内完成");
     }
 
-    /// 只比较真实完整原段，不把被隐藏的 RTL 后缀移出段后再改变 P2/UBA 方向结果。
+    /// Compare actual complete original paragraphs without removing a hidden RTL suffix
+    /// and thereby changing their P2/UBA direction result.
     fn assert_levels(actual: &mut MarkdownBidiParagraph, text: &str, start: usize) {
         let units: Vec<u16> = text.encode_utf16().collect();
         let oracle =
@@ -451,7 +474,8 @@ mod tests {
     }
 
     #[test]
-    /// 原 CR/LF 各结束一个真实 B 段；同一 GCB 的权限必须分两次完整证明，不能扩大任一段范围。
+    /// CR and LF each end a real B paragraph. Certify the shared GCB through two complete
+    /// paragraph scopes rather than extending either paragraph's authority.
     fn word_order_proof_stops_at_each_actual_b_paragraph_inside_crlf() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("crlf-word.md");
@@ -509,7 +533,8 @@ mod tests {
     }
 
     #[test]
-    /// 隐区 RTL 不触发全源 UBA；两段发布权限、第三段退役和真实页释放必须同时成立。
+    /// Hidden RTL does not start whole-source UBA; two-result authority, retirement before
+    /// a third paragraph, and actual page release must all hold.
     fn hidden_rtl_keeps_two_actual_paragraphs_and_releases_the_oldest_before_third() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("visible-bidi.md");
@@ -560,7 +585,8 @@ mod tests {
         let live = receipt.snapshot();
         assert!(live.file_created && live.file_open && live.cache_bytes == 131_072);
         paragraph = std::thread::spawn(move || {
-            // 真正完成的两段可以沿原公共合同跨线程；在途 Gate/Future 没有进入这个输出 owner。
+            // Actually completed paragraphs retain the public cross-thread contract;
+            // in-flight Gate/Future values never entered this output owner.
             assert_levels(&mut paragraph, second, end);
             paragraph
         })

@@ -1,4 +1,4 @@
-//! 一次分析及其全部元数据查询共享同一取消位；Core不创建线程、定时器或Native回调。
+//! One analysis and all its metadata queries share one cancellation bit; Core creates no thread, timer, or Native callback here.
 
 use super::BidiError;
 use std::sync::{
@@ -7,7 +7,7 @@ use std::sync::{
 };
 
 #[derive(Clone, Default)]
-/// 只允许false→true的取消权限；Clone共享原位，不能使已取消的分析重新可用。
+/// Monotonic false-to-true revocation; clones share the original bit and cannot reactivate a cancelled analysis.
 pub struct MarkdownBidiCancellation {
     cancelled: Arc<AtomicBool>,
     #[cfg(test)]
@@ -20,7 +20,7 @@ impl MarkdownBidiCancellation {
         Self::default()
     }
 
-    /// 发出永久取消；同步文件调用不能被打断，返回后会在原固定检查点观察该位。
+    /// Request permanent cancellation. A synchronous file call is not interrupted; the original fixed checkpoint observes the request afterward.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
@@ -31,6 +31,7 @@ impl MarkdownBidiCancellation {
     }
 
     pub(super) fn check(&self) -> Result<(), BidiError> {
+        // This scalar gate only reports revocation; the current Store/worker owner remains responsible for actual resource release.
         if self.is_cancelled() {
             Err(BidiError::Cancelled)
         } else {
@@ -57,7 +58,7 @@ impl MarkdownBidiCancellation {
     #[cfg(test)]
     pub(super) fn first_page_allocated(&self, observer: super::store::FileObserver) {
         if let Some(pause) = &self.pause {
-            // 此点只在真实第一份16KiB页和匿名FD均已存在后进入，不按sleep猜测分析进度。
+            // The existing test gate is reached only after the actual first 16-KiB page and anonymous FD exist, without sleep-based progress guesses.
             *pause.file.lock().expect("synthetic operation gate") = Some(observer);
             pause.entered.wait();
             pause.resume.wait();

@@ -1,9 +1,11 @@
-//! 原 SCX kernel 的真实段落跳转差分；大隐区只用来证明正文读取与实际索引资源不随其增长。
+//! Differential coverage of real paragraph skips in the original SCX kernel.
+//! A large hidden range checks bounded source reads and index resources, not RSS.
 
 use super::{self as scripts, *};
 use crate::markdown_layout_source::folds::FoldPlan;
 
-/// 原任务和 folded 任务共享同一冻结 Source，不能用新捕同代次文档补签证明。
+/// Shares the original frozen source between normal and folded jobs. A fresh
+/// capture with the same document generation would not authorize this proof.
 fn folded(source: &MarkdownLayoutTextSource, hidden: std::ops::Range<usize>) -> MarkdownScriptJob {
     let authority = source.authority();
     let mut job = MarkdownScriptJob::new_streaming(
@@ -18,7 +20,8 @@ fn folded(source: &MarkdownLayoutTextSource, hidden: std::ops::Range<usize>) -> 
 }
 
 #[test]
-// 完整可见段必须与原 SCX 相同；CRLF、括号与后继非拉丁文本不能继承隐区上下文。
+// Complete visible runs must match original SCX. CRLF, brackets, and following
+// non-Latin text must not inherit the skipped body's context.
 fn folded_script_crlf_resets_original_bracket_context_and_preserves_visible_source_runs() {
     let tiny = MarkdownScriptBudget {
         bytes: 1,
@@ -45,6 +48,8 @@ fn folded_script_crlf_resets_original_bracket_context_and_preserves_visible_sour
         let mut hidden = folded(&source, start..end);
         scripts::finish(&mut original, &authority, tiny);
         scripts::finish(&mut hidden, &authority, tiny);
+        // Compare only visible original-source coordinates. The fold plan grants
+        // no script answer inside the hidden range, even after both jobs finish.
         let mut utf16 = 0usize;
         for scalar in text.chars() {
             if utf16 < start || utf16 >= end {
@@ -63,6 +68,8 @@ fn folded_script_crlf_resets_original_bracket_context_and_preserves_visible_sour
             hidden.run_at(&authority, MarkdownScriptUnit::Utf16, start + 1),
             Err(MarkdownScriptError::FoldedRange)
         ));
+        // A hidden query is a local refusal, not poison: the following visible
+        // run remains usable through the same original authority.
         assert!(matches!(
             hidden
                 .run_at(&authority, MarkdownScriptUnit::Utf16, end)
@@ -79,7 +86,8 @@ fn folded_script_crlf_resets_original_bracket_context_and_preserves_visible_sour
 }
 
 #[test]
-// 隐区大小不能放大真实正文读取或索引；关闭同时归还本任务 FD、映射与 Source claim。
+// Hidden text must not scale real reads or indexes. Close relinquishes the job's
+// actual FDs, mappings, and frozen-source claim.
 fn folded_giant_script_body_does_not_read_or_spool_hidden_characters_and_releases_original_resources()
  {
     let header = "# H";
@@ -93,6 +101,8 @@ fn folded_giant_script_body_does_not_read_or_spool_hidden_characters_and_release
     let mut job = folded(&source, header.len()..hidden_end);
     let observer = job.resource_observer();
     scripts::finish(&mut job, &authority, MarkdownScriptBudget::default());
+    // Only the visible header/suffix and actual CRLF tails are borrowed. Hidden
+    // brackets must create neither script records nor bracket-stack metadata.
     let actual = job.storage_profile();
     assert_eq!(actual.source_bytes_read, header.len() + 4 + suffix.len());
     assert!(actual.completed_runs <= 3 && actual.bracket_records == 0);
@@ -110,5 +120,7 @@ fn folded_giant_script_body_does_not_read_or_spool_hidden_characters_and_release
             && !released.cleanup_failed
     );
     drop(source);
+    // The document remains live; this receipt specifically observes the frozen
+    // layout source after its final external clone and the job have gone away.
     assert!(observer.snapshot().source_payload_released);
 }

@@ -1,4 +1,5 @@
-//! 多段level0证书只保正在消费的一段；真实B端点仍由同一冻结树的有界游标取得。
+//! A multi-paragraph level-zero certificate retains only the currently consumed paragraph.
+//! Actual B endpoints still come from a bounded cursor on the same frozen tree.
 
 use super::*;
 use crate::markdown_document_buffer::FrozenBidiParagraphCursor;
@@ -37,7 +38,8 @@ impl PreparedParagraph {
             .map(|known| known.1.clone())
     }
 
-    /// 真实同一段的范围事实可覆盖其它位置；调用方仍须独立证明目标是scalar/GCB边界。
+    /// A proven paragraph range may cover another position; the caller must separately
+    /// establish that the target is a valid scalar/GCB boundary.
     pub(in crate::markdown_bidi) fn range_covering(&self, position: usize) -> Option<Range<usize>> {
         self.known
             .as_ref()
@@ -49,6 +51,8 @@ impl PreparedParagraph {
         &self,
         range: &Range<usize>,
     ) -> Option<(Range<usize>, usize)> {
+        // Reuse only the prepared paragraph's real content interval, excluding its
+        // trailing paragraph control. A subrange does not prove any new source endpoint.
         self.known
             .as_ref()
             .filter(|(_, paragraph, content_end)| {
@@ -68,7 +72,7 @@ impl PreparedParagraph {
         }
         if self.range_covering(position).is_some() && snapshot.utf16_boundaries_are_scalar()? {
             self.known.as_mut().expect("已知真实段").0 = position;
-            return Ok(ParagraphPrepareStep::ready()); // 无代理对时新端点也是已证明整数边界，不重复读取B叶。
+            return Ok(ParagraphPrepareStep::ready()); // With no surrogate pairs, the new integer endpoint needs no repeated B-leaf read.
         }
         let retained = if let Some(cursor) = &mut self.cursor {
             cursor.position() == position || cursor.advance_position(snapshot, position)?
@@ -77,7 +81,7 @@ impl PreparedParagraph {
         };
         if !retained {
             self.cursor = Some(snapshot.begin_bidi_paragraph(position)?);
-        } // 只有同 Frozen、同已知 B 段的真实前进点可复用；其余请求仍支付原冷路径。
+        } // Reuse only a real forward position in the same Frozen B scope; other requests retain the original cold path.
         let step = snapshot.advance_bidi_paragraph(
             self.cursor.as_mut().expect("原Frozen游标已安装"),
             budget.bytes,
@@ -91,8 +95,9 @@ impl PreparedParagraph {
                 .cursor
                 .take()
                 .and_then(FrozenBidiParagraphCursor::into_forward_range);
-            // 唯一游标只留下同次查询的 B 范围和 scalar 点；下一 GCB 不重找段的两端。
-            // 投影仍立即释放；没有正文 lease、历史段或额外 Source owner，取消/drop 原路归还。
+            // Retain only this query's B range and scalar cursor point, avoiding another
+            // endpoint search for the next GCB. Release the projection immediately: no
+            // text lease, historical paragraphs, or extra Source owner survives this step.
         }
         Ok(ParagraphPrepareStep {
             bytes: step.bytes,

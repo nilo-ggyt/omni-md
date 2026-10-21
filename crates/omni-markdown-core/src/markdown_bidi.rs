@@ -1,12 +1,16 @@
-//! 分页UBA元数据：按有限piece读取属性，所有与段长线性增长的中间状态存入匿名文件。
+//! Paged UBA metadata reads properties through bounded pieces and stores
+//! paragraph-length intermediate state in anonymous files.
 //!
-//! X/W/N/I与保留格式字符的规则移植自unicode-bidi 0.3.18；不调用其整段BidiInfo构造。
-//! 本模块不产生字形、caret或Native对象，不能单独证明编辑器已经完成视口排版。
+//! X/W/N/I and retained-format-character rules derive from unicode-bidi 0.3.18.
+//! This adapter uses its paged owners rather than a whole-text BidiInfo value.
+//! Glyphs, caret geometry, Native objects, and viewport completion belong to
+//! their later owning stages.
 //!
 //! Copyright 2015 The Servo Project Developers.
 //! Algorithm portions adapted from unicode-bidi 0.3.18, <https://github.com/servo/unicode-bidi>.
 //! SPDX-License-Identifier: MIT OR Apache-2.0
-//! 原上游MIT许可与归属随本目录LICENSE-MIT保留；改动仅将存储和游标替换为分页实现。
+//! Preserve the upstream MIT license and attribution in this directory's
+//! LICENSE-MIT alongside the paged storage/cursor adaptation.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -27,7 +31,8 @@ mod prepare;
 mod sequences;
 mod source;
 mod store;
-// 文档叶聚合与UBA只使用这一份Unicode 18发布增量；生成文件和许可保持原位置。
+// Document-leaf aggregates and UBA share this authoritative Unicode 18 delta;
+// generated data and its original license remain at their existing location.
 use crate::unicode_bidi_data as unicode_data;
 mod uniform;
 #[cfg(feature = "paged-shaping-frontier")]
@@ -50,6 +55,8 @@ pub enum BidiBaseDirection {
 }
 
 impl BidiBaseDirection {
+    /// Auto defers base selection to actual paragraph rules; explicit directions
+    /// supply only the corresponding original paragraph embedding level.
     fn level(self) -> Option<u8> {
         match self {
             Self::Auto => None,
@@ -66,10 +73,12 @@ pub struct BidiMemoryBudget {
 
 impl BidiMemoryBudget {
     pub fn new(cache_bytes: usize) -> Result<Self, BidiError> {
+        // Require the caller's exact admissible cache limit. Never enlarge it
+        // implicitly or replace bounded pages with a whole-table allocation.
         if !(4 * store::PAGE_BYTES..=1024 * 1024).contains(&cache_bytes)
             || !cache_bytes.is_multiple_of(store::PAGE_BYTES)
         {
-            return Err(BidiError::InvalidBudget); // 预算不是提示值；不能静默增大或退成全表Vec。
+            return Err(BidiError::InvalidBudget);
         }
         Ok(Self {
             pages: (cache_bytes / store::PAGE_BYTES) as u16,
@@ -129,11 +138,16 @@ pub struct MarkdownBidiStorageProfile {
     pub unicode_version: (u64, u64, u64),
 }
 
-/// 只有所有段和所有规则完成后才能构造；逻辑内容不可变，&mut查询仅用于有界IO页缓存。
+/// Completed scopes retain immutable logical results. Mutable queries serve
+/// bounded metadata I/O and explicitly prepared paragraph scopes, with no
+/// document mutation authority.
 pub struct MarkdownBidiParagraph {
-    // 保留原immutable资源，供同一分析值生命周期使用；查询本身只读取派生元数据，不再读取正文。
+    // Retain the original immutable source for this analysis. Completed paged
+    // lookups use derived metadata; prepared-scope operations retain their own
+    // explicit bounded source-read contract.
     _snapshot: MarkdownTextSnapshot,
-    // 新布局路径保留同一个capsule身份；旧Snapshot API不伪造布局权限。
+    // Layout capture retains the same capsule identity; snapshot-only public
+    // analysis grants no independently captured layout authority.
     #[cfg(feature = "paged-layout-breaks")]
     layout_source: Option<crate::MarkdownLayoutTextSource>,
     source: Range<usize>,
@@ -141,13 +155,15 @@ pub struct MarkdownBidiParagraph {
     units: u32,
     paragraph_count: Option<u32>,
     source_borrow_max: usize,
-    // 查询游标只读取已完成的原 UBA 表；与这个真实段一起退役，不保活第三段或在途 Future。
+    // This cursor queries completed original UBA metadata and retires with its
+    // actual paragraph, retaining no third paragraph or in-flight preparation.
     #[cfg(feature = "paged-shaping-frontier")]
     word_order: visible::WordOrder,
 }
 
-/// 原已完成 UBA 的单个 UTF16 记录；只供实际整形分项消费，不宣称这里存在 GCB 或 caret。
-/// 字节坐标来自原 Text 表的源捕获事实，不能为跨视口分项重新从正文起点定位。
+/// One completed UBA UTF-16 record supports actual shaping-item consumption;
+/// grapheme/caret authority still requires its own proof. Byte coordinates come
+/// from original Text capture without rescanning the document prefix.
 #[cfg(feature = "paged-line-compose")]
 #[derive(Clone)]
 pub(crate) struct MarkdownBidiShapingUnit {
@@ -161,7 +177,8 @@ pub(crate) struct MarkdownBidiShapingUnit {
 
 #[cfg(feature = "paged-line-compose")]
 impl MarkdownBidiShapingUnit {
-    /// 两条原记录必须同源、逐 UTF16 相邻且右边是真标量头；不同级别才构成自然整形分界。
+    /// Adjacent original UTF-16 records with a real right scalar head can mark
+    /// a shaping-level seam only when they share Source and differ in level.
     pub(crate) fn precedes_different_level(&self, right: &Self) -> bool {
         self.source == right.source
             && self.utf16.checked_add(1) == Some(right.utf16)
@@ -175,7 +192,8 @@ impl MarkdownBidiShapingUnit {
     }
 }
 
-/// 只借用原完整Uniform结果的范围事实；不授予GCB端点、活动文档或后继Source权限。
+/// Borrow completed original uniform facts without granting grapheme endpoints,
+/// live-document mutation, or authority over a later Source capture.
 #[cfg(feature = "paged-shaping-frontier")]
 pub(crate) struct UniformControlFreeSpan<'a> {
     _paragraph: &'a MarkdownBidiParagraph,
@@ -190,23 +208,27 @@ impl UniformControlFreeSpan<'_> {
         self.range.clone()
     }
 
-    /// 原完整Uniform只认证一个真实分析段；返回其全范围，不把本次子range冒充新段。
-    /// 此借用已核同Source和取消，仍不证明标量/GCB端点或分析范围外的段归属。
+    /// Return this actual analyzed paragraph's extent rather than treating the
+    /// requested subrange as a new paragraph. Same-Source/cancellation checks do
+    /// not prove scalar/GCB endpoints or ownership outside the analysis scope.
     pub(crate) fn paragraph_range(&self) -> Range<usize> {
         self.paragraph_range.clone()
     }
 
-    /// 原同源有界B查询已经验证的正文末端；分隔符仍留给原GCB/Script真实消费。
+    /// The bounded same-Source B query established this content endpoint;
+    /// separators still need actual consumption by original GCB/Script owners.
     pub(crate) fn content_end(&self) -> usize {
         self.content_end
     }
 
     pub(crate) fn level(&self) -> u8 {
-        0 // 只有原UniformZero且完整证明无六控制的结果可构造本借用值。
+        0 // Construction requires original UniformZero and complete proof that
+        // this span has none of the six Markdown inline separator controls.
     }
 }
 
-/// 只有完整证书才能省略分页表；未证明的输入始终保留原X/W/N/I存储和算法。
+/// Only a complete uniform certificate can omit paged tables. Other input keeps
+/// the actual X/W/N/I algorithm and its owned metadata representation.
 enum Resolution {
     UniformZero(uniform::UniformResolution),
     Paged(Store),
@@ -221,7 +243,8 @@ impl Resolution {
             Self::Paged(store) => store.healthy(),
             #[cfg(feature = "paged-shaping-frontier")]
             Self::VisibleParagraphs(visible) => visible.healthy(),
-        } // Uniform没有文件或页，但取消仍永久撤销已完成的分析值。
+        } // Uniform owns no file/page; its original cancellation still revokes
+        // the completed analysis permanently.
     }
 
     #[cfg(test)]
@@ -236,14 +259,16 @@ impl Resolution {
 }
 
 impl MarkdownBidiParagraph {
-    /// 仅用于原协调器选择是否有新端点工作；不读取来源或签发任何范围事实。
+    /// Tell the coordinator whether endpoint preparation exists, without
+    /// reading Source or issuing proof for any numeric range.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn uses_prepared_paragraphs(&self) -> bool {
         matches!(&self.resolution, Resolution::VisibleParagraphs(_))
             || matches!(&self.resolution, Resolution::UniformZero(certificate) if certificate.paragraphs)
     }
 
-    /// 原有限oracle仍核真实段数；未建立总目录的表示沿公开范围查询逐段验证，不伪造总数。
+    /// Finite oracles count actual public paragraph ranges when no total
+    /// directory exists, rather than manufacturing an aggregate count.
     #[cfg(test)]
     fn actual_paragraph_count(&mut self) -> usize {
         if let Some(count) = self.paragraph_count {
@@ -262,7 +287,8 @@ impl MarkdownBidiParagraph {
         count
     }
 
-    /// 只取得实际FD及固定缓存页的原子收据；不会延长分析、Source或Native对象的生命周期。
+    /// Observe actual descriptor/fixed-cache facts without retaining analysis,
+    /// Source, or Native objects and without claiming current kernel RSS.
     #[must_use]
     pub fn resource_observer(&self) -> MarkdownBidiResourceObserver {
         match &self.resolution {
@@ -317,10 +343,12 @@ impl MarkdownBidiParagraph {
         .run()
     }
 
-    /// 使用断行、字素与字形阶段的同一个冻结源，不由相同代次或相同正文推断身份。
+    /// Use the same frozen Source as break/grapheme/shaping stages, preserving
+    /// capture identity independently from equal text or generation.
     ///
-    /// UBA仍一次同步完成整段规则，工作状态位于匿名分页元数据中；调用者不能把它放到
-    /// 主线程后宣称有限响应时间。本接口只解决来源和永久I/O状态一致，不代表Native验收。
+    /// This synchronous entry completes the requested analysis using the original
+    /// Uniform proof or actual paged state as needed. UI callers need the existing worker;
+    /// Source/I/O consistency alone does not establish Native acceptance.
     #[cfg(feature = "paged-layout-breaks")]
     pub fn analyze_layout_source(
         source: crate::MarkdownLayoutTextSource,
@@ -339,8 +367,9 @@ impl MarkdownBidiParagraph {
         )
     }
 
-    /// 使用原冻结源和原票据同步计算；Native可把本纯Core入口放入自己的后台任务。
-    /// 每次固定元数据访问检查同一取消位，取消后原对象的Ready查询同样永久拒绝。
+    /// Compute synchronously under original frozen-source authority on the
+    /// caller's worker. Fixed metadata accesses share cancellation; completed
+    /// queries remain revoked after that original operation is cancelled.
     #[cfg(feature = "paged-layout-breaks")]
     pub fn analyze_layout_source_cancellable(
         source: crate::MarkdownLayoutTextSource,
@@ -361,7 +390,8 @@ impl MarkdownBidiParagraph {
         )
     }
 
-    /// 供行生产者在失败返回时同样取得本次实际FD/页的固定收据；不签发任何布局或源权限。
+    /// Failure-path tests observe the same actual descriptor/page receipts;
+    /// those observations issue neither layout nor Source authority.
     #[cfg(all(test, feature = "paged-line-compose"))]
     pub(crate) fn analyze_layout_source_cancellable_observed(
         source: crate::MarkdownLayoutTextSource,
@@ -382,7 +412,8 @@ impl MarkdownBidiParagraph {
             cancellation,
             Some(&resources),
         );
-        (result, observer) // 返回前已结束所有局部失败补偿；observer不持File、Source或规则计算状态。
+        (result, observer) // Local failure cleanup has ended; the observer owns
+        // no File, Source, or algorithm working state.
     }
 
     #[cfg(feature = "paged-layout-breaks")]
@@ -397,7 +428,8 @@ impl MarkdownBidiParagraph {
     ) -> Result<Self, BidiError> {
         source.health()?;
         if !source.permits(authority) {
-            return Err(BidiError::SourceMismatch); // 不以同文本、同generation或新票据替代原source身份。
+            return Err(BidiError::SourceMismatch); // Equal text/generation or a
+            // fresh ticket cannot replace the original Source allocation.
         }
         cancellation.check()?;
         let mut analyzed = Self::analyze_cancellable_observed(
@@ -414,13 +446,15 @@ impl MarkdownBidiParagraph {
         Ok(analyzed)
     }
 
-    /// Native发布几何前核对同一源票；本方法不授予活动文档或较新代次的消费权限。
+    /// Check original Source before Native geometry publication without
+    /// granting live-document or successor-generation consumption authority.
     #[cfg(feature = "paged-layout-breaks")]
     pub fn require_layout_source(
         &self,
         authority: &crate::MarkdownLayoutTextAuthority,
     ) -> Result<(), BidiError> {
-        self._snapshot.original_backing_health()?; // 真实源首错先于外来票、取消或已完成缓存。
+        self._snapshot.original_backing_health()?; // Actual Source failure
+        // precedes foreign tickets, cancellation, and completed-cache results.
         let result = (|| {
             let source = self
                 .layout_source
@@ -428,7 +462,8 @@ impl MarkdownBidiParagraph {
                 .ok_or(BidiError::SourceMismatch)?;
             source.health()?;
             if !source.permits(authority) {
-                // 不同capture即使文本与generation完全相同，也不能混入同一次几何发布。
+                // Distinct captures cannot share this geometry publication
+                // merely because their text and generations are equal.
                 return Err(BidiError::SourceMismatch);
             }
             self.resolution.healthy()
@@ -437,11 +472,13 @@ impl MarkdownBidiParagraph {
         if let Some(source) = &self.layout_source {
             source.health()?;
         }
-        result?; // 外来票/取消失败同样先复核原Source，不把同时确认的errno洗为较弱原因。
+        result?; // Source revalidation preserves a concurrently established
+        // actual errno before a weaker ticket/cancellation failure.
         self.resolution.healthy()
     }
 
-    /// 仅完整原Source的UniformZero才能把视觉前后等同逻辑前后；子段level0不授此权限。
+    /// Only whole-original-Source UniformZero equates visual and logical order;
+    /// one zero-level subparagraph cannot issue that whole-source permission.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn whole_source_uniform_zero(
         &self,
@@ -454,11 +491,13 @@ impl MarkdownBidiParagraph {
             .ok_or(BidiError::SourceMismatch)?;
         let proved = self.source == (0..source.utf16_len())
             && matches!(self.resolution, Resolution::UniformZero(_));
-        self.require_layout_source(authority)?; // 已完成值仍经过原Source首错、同capture和取消后置门。
+        self.require_layout_source(authority)?; // Completed values still pass
+        // original Source, same-capture, and cancellation checks after lookup.
         Ok(proved)
     }
 
-    /// 只声明当前结果按真实可见 B 段准备；不把子段零级、未准备段或隐区升级为全源方向证明。
+    /// Identify preparation of actual visible B paragraphs, without extending
+    /// local uniformity, unprepared scopes, or hidden text to whole-Source proof.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn uses_visible_paragraph_scopes(
         &self,
@@ -468,8 +507,9 @@ impl MarkdownBidiParagraph {
         Ok(matches!(self.resolution, Resolution::VisibleParagraphs(_)))
     }
 
-    /// 在原分析范围内消费完整Uniform的“无六种内联控制且level0”事实，不重新借正文。
-    /// 数字范围可含低代理项；它不是可编辑端点证明，分项交付仍须检查原GCB边界。
+    /// Borrow completed level-zero/no-Markdown-inline-control facts within the
+    /// original analysis scope. Numeric ranges can include low surrogates, so
+    /// actual item delivery still checks scalar and GCB endpoints separately.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn uniform_control_free_span(
         &self,
@@ -485,7 +525,8 @@ impl MarkdownBidiParagraph {
                 self.require_layout_source(authority)?;
                 return Err(BidiError::InvalidRange);
             }
-            // 子段证书只归属于其完整实际 B 范围，不能扩大为外层完整 Source 的 level0。
+            // A child certificate belongs only to its complete actual B scope;
+            // it cannot establish level zero for the outer whole Source.
             return visible
                 .range(&range)?
                 .uniform_control_free_span(authority, range);
@@ -501,9 +542,10 @@ impl MarkdownBidiParagraph {
                     .paragraph
                     .control_free(&range)
                     .map(|(paragraph, content_end)| {
-                        // Frozen游标定位的是同snapshot完整B段；公开分析入口也允许从其正文
-                        // 中部开始。可消费的段仍只到原分析权限两端，不能把snapshot外侧
-                        // 上下文授给开放Script或ascii_suffix当作自己的paragraph范围。
+                        // The frozen cursor found a complete B paragraph, but
+                        // public analysis may begin within it. Intersect actual
+                        // analysis bounds so Script/ascii_suffix cannot adopt
+                        // outside snapshot context as its own paragraph extent.
                         (
                             paragraph.start.max(self.source.start)
                                 ..paragraph.end.min(self.source.end),
@@ -511,12 +553,14 @@ impl MarkdownBidiParagraph {
                         )
                     })
             }
-            _ => None, // Paged及未证明的六种内联控制保持原查询；level0不授予GCB或字体权限。
+            _ => None, // Paged or unproven control input keeps its original
+                       // query path; level zero grants no GCB/font permission.
         };
         self.require_layout_source(authority)?;
         if !valid {
             return Err(BidiError::InvalidRange);
-        } // 数字范围失败也先完成后置Source/取消门，不为端点校验借正文。
+        } // Invalid numeric ranges still pass post-lookup Source/cancellation
+        // checks, without borrowing document text for endpoint validation.
         Ok(
             paragraph_range.map(|(paragraph_range, content_end)| UniformControlFreeSpan {
                 _paragraph: self,
@@ -524,10 +568,12 @@ impl MarkdownBidiParagraph {
                 paragraph_range,
                 content_end,
             }),
-        ) // 借用原Paragraph，不Clone权限/Source，不以generation相等转让证书。
+        ) // Borrow the actual Paragraph without cloning Source/authority or
+        // transferring its certificate through equal generation numbers.
     }
 
-    /// Paged已经有全段表；多段Uniform只按原预算准备实际当前B范围，不把源全部展开为层级记录。
+    /// Paged already has its full table; multiparagraph Uniform prepares only
+    /// the requested actual B scope under the existing finite work allowance.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn prepare_uniform_paragraph_range(
         &mut self,
@@ -556,11 +602,13 @@ impl MarkdownBidiParagraph {
         if let Ok(step) = &result {
             self.source_borrow_max = self.source_borrow_max.max(step.maximum_borrow);
         }
-        self.require_layout_source(authority)?; // 元数据剪枝也保原Source/取消；真实lease失败先于候选结果。
+        self.require_layout_source(authority)?; // Metadata pruning still retains
+        // original Source/cancellation; a real lease failure precedes the result.
         result
     }
 
-    /// 显式折叠的在途任务归原 Item；此处只把完整真实 B 段移入可跨线程的已封存结果。
+    /// The original item owns in-flight folded-scope work. Transfer only an
+    /// actual completed B paragraph into the transferable sealed result.
     #[cfg(feature = "paged-shaping-frontier")]
     pub(crate) fn prepare_layout_paragraph_range(
         &mut self,
@@ -603,7 +651,8 @@ impl MarkdownBidiParagraph {
         result
     }
 
-    /// 原同步公开查询也只复用同一有限叶算法；生产ItemStart先prepare，不在其量子内隐式扫描叶。
+    /// Synchronous public lookup reuses the bounded-leaf algorithm. Production
+    /// ItemStart explicitly prepares first instead of hiding scans in its turn.
     #[cfg(feature = "paged-shaping-frontier")]
     fn uniform_paragraph_at(&mut self, position: usize) -> Result<Option<Range<usize>>, BidiError> {
         self._snapshot.original_backing_health()?;
@@ -624,10 +673,12 @@ impl MarkdownBidiParagraph {
                 self._snapshot
                     .byte_offset_for_utf16(position)
                     .map_err(scalar_endpoint_error)?;
-            } // 公共同步API仍拒绝代理项内部；范围事实不能替代scalar边界。
+            } // Public queries still reject surrogate interiors; cached range
+            // facts cannot substitute for an actual scalar boundary.
             self._snapshot.original_backing_health()?;
             self.resolution.healthy()?;
-            // 部分分析仍可从snapshot真实B中部开始；公开段范围只交回该分析实际拥有的交集。
+            // Partial analysis may start inside a real snapshot B paragraph;
+            // return only the intersection actually owned by this analysis.
             return Ok(Some(
                 range.start.max(self.source.start)..range.end.min(self.source.end),
             ));
@@ -645,12 +696,14 @@ impl MarkdownBidiParagraph {
                     },
                 )
                 .map_err(|cause| match cause {
-                    // 首次定位和已知范围命中共用公开的标量边界错误；真实文件错误仍保原Source链。
+                    // Initial positioning and cached-range hits use the same
+                    // public scalar error, preserving actual file Source causes.
                     BidiError::Source(cause) => scalar_endpoint_error(cause),
                     other => other,
                 })?;
             self.source_borrow_max = self.source_borrow_max.max(step.maximum_borrow);
-        } // 同步API原本允许完成有限元数据查询；没有新增整段缓冲、Reader或另一份段规则。
+        } // Synchronous lookup may complete its metadata query without adding a
+        // whole-paragraph buffer, another reader, or duplicated paragraph rules.
         let range = certificate.paragraph.range_at(position);
         self._snapshot.original_backing_health()?;
         self.resolution.healthy()?;
@@ -661,9 +714,13 @@ impl MarkdownBidiParagraph {
         self.source.clone()
     }
 
-    /// 二分原已完成的段表，不为每个字体/脚本item重新读取整个段落。
-    /// 返回该分析值内的真实UBA段；分析范围本身若经裁剪，调用者仍须证明其外侧正文边界。
-    /// 真EOF返回None，低代理项/分析范围以外的位置失败；两者同样核原源与取消状态。
+    /// Paged queries binary-search completed metadata. Multi-paragraph Uniform
+    /// queries may complete real endpoint preparation through bounded reads;
+    /// formal itemization explicitly prepares that paragraph scope beforehand.
+    /// Return the actual scope within this analysis; callers separately establish
+    /// outside text boundaries for partial analyses.
+    /// Exact EOF is None; surrogate interiors and outside positions fail while
+    /// retaining the same original Source/cancellation checks.
     pub fn paragraph_range_at_utf16(
         &mut self,
         offset: usize,
@@ -676,29 +733,34 @@ impl MarkdownBidiParagraph {
         let relative = self.checked_range(offset..offset)?.start;
         if relative == self.units {
             return Ok(None);
-        } // EOF没有字符，不制造末尾空段或把前一段范围套到后继item。
+        } // EOF has no character and cannot manufacture a trailing paragraph or
+        // transfer the previous paragraph's range to a following item.
         let found = match &mut self.resolution {
             Resolution::UniformZero(_) => self.source.clone(),
-            // 完整Uniform证书只允许唯一段；字符不为空时原分析范围就是其精确段范围。
+            // A complete single-paragraph uniform certificate supplies this
+            // analysis's exact paragraph scope for a nonempty character query.
             Resolution::Paged(store) => {
                 let mut low = 0;
                 let mut high = self.paragraph_count.expect("实际分页段表已经计算总数");
                 let paragraph = loop {
                     if low >= high {
                         return Err(BidiError::CorruptMetadata);
-                    } // 原分析覆盖每个字符；找不到所属段不能退为“未知”或重扫正文补救。
+                    } // Complete analysis covers every character; missing
+                    // ownership is corruption, not permission to rescan text.
                     let mid = low + (high - low) / 2;
                     let paragraph = Paragraph::read(store, mid)?;
                     if paragraph.start >= paragraph.end || paragraph.end > self.units {
                         return Err(BidiError::CorruptMetadata);
-                    } // 磁盘记录必须是真实非空子范围，不能让损坏坐标驱动二分或溢出加法。
+                    } // Validate real nonempty disk intervals before they can
+                    // drive binary-search decisions or coordinate arithmetic.
                     if relative < paragraph.start {
                         high = mid;
                     } else if relative >= paragraph.end {
                         low = mid + 1;
                     } else {
                         break paragraph;
-                    } // 只命中包含原字符的半开段，分隔符沿capture已有归属，不另猜CRLF等边界。
+                    } // Match the original character's half-open paragraph;
+                    // separators retain captured ownership, including CRLF.
                 };
                 self.source.start + paragraph.start as usize
                     ..self.source.start + paragraph.end as usize
@@ -710,12 +772,14 @@ impl MarkdownBidiParagraph {
                 .ok_or(BidiError::CorruptMetadata)?,
         };
         self._snapshot.original_backing_health()?;
-        self.resolution.healthy()?; // 元数据IO后的同一源/取消复核，不能发布撤权前找到的候选。
+        self.resolution.healthy()?; // Recheck original Source/cancellation after
+        // metadata I/O so revoked candidates cannot leave this boundary.
         Ok(Some(found))
     }
 
-    /// 读取原UBA段的真实base，不把首个字符的resolved level当段方向。
-    /// LS后的空视觉行仍属于该段；EOF返回None，真正新空段由调用者按原段策略处理。
+    /// Read the actual paragraph base independently of its first resolved
+    /// character level. Empty visual lines after LS retain that paragraph; EOF
+    /// is None and a true new empty paragraph remains with its caller's policy.
     pub fn paragraph_base_level_at_utf16(
         &mut self,
         offset: usize,
@@ -732,7 +796,8 @@ impl MarkdownBidiParagraph {
             return Ok(None);
         }
         let base = match &mut self.resolution {
-            Resolution::UniformZero(_) => 0, // 完整证书只认证单个base=0段，不以字形方向猜测。
+            Resolution::UniformZero(_) => 0, // The complete certificate proves
+            // base zero, independently of glyph direction.
             Resolution::Paged(store) => {
                 let (mut low, mut high) =
                     (0, self.paragraph_count.expect("实际分页段表已经计算总数"));
@@ -769,16 +834,19 @@ impl MarkdownBidiParagraph {
     }
 
     pub fn level_at_utf16(&mut self, index: usize) -> Result<u8, BidiError> {
-        self._snapshot.original_backing_health()?; // 已有level缓存也不能越过原源的永久读取失败。
+        self._snapshot.original_backing_health()?; // Cached levels retain the
+        // original Source's permanent read failure.
         self.resolution.healthy()?;
         let relative = index
             .checked_sub(self.source.start)
             .ok_or(BidiError::InvalidRange)?;
         if relative >= self.units as usize {
-            return Err(BidiError::InvalidRange); // EOF没有字符level；低代理项沿真实duplicate record读取。
+            return Err(BidiError::InvalidRange); // EOF has no character level;
+            // low surrogates use their actual duplicate record instead.
         }
         let level = match &mut self.resolution {
-            // level是每UTF16单位事实；低代理项仍与head共享0，不把它当成run合法端点。
+            // Per-UTF-16 levels include the low surrogate's same zero level,
+            // without granting that code unit a legal run endpoint.
             Resolution::UniformZero(_) => 0,
             Resolution::Paged(store) => Text::read(store, relative as u32)?.level,
             #[cfg(feature = "paged-shaping-frontier")]
@@ -791,8 +859,9 @@ impl MarkdownBidiParagraph {
         Ok(level)
     }
 
-    /// 从原 General UBA 记录同时借真实级别、标量头和 byte 坐标；每次仅一次 Text 记录读取。
-    /// Uniform 没有该记录域，明确返回 None，由原聚合分项保留既有零级快速路径。
+    /// Read actual level, scalar-head, and byte facts from one General UBA Text
+    /// record. Uniform has no such record and returns None to its existing
+    /// aggregate-based zero-level item path.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn shaping_unit_at_utf16(
         &mut self,
@@ -816,7 +885,8 @@ impl MarkdownBidiParagraph {
             Resolution::Paged(store) => {
                 let value = Text::read(store, relative as u32)?;
                 let byte = value.byte as usize;
-                // 宽度来自同一次原 UTF8 捕获；不是用 UTF16 长度推测，也不读未来段的首记录。
+                // Byte width comes from this original UTF-8 capture, without
+                // estimating from UTF-16 length or reading a later paragraph.
                 let byte_end = byte
                     .checked_add(usize::from((value.flags >> 4) & 3) + 1)
                     .ok_or(BidiError::CoordinateOverflow)?;
@@ -837,14 +907,17 @@ impl MarkdownBidiParagraph {
                 .character_mut(index)?
                 .shaping_unit_at_utf16(authority, index)?,
         };
-        self.require_layout_source(authority)?; // 元数据 I/O 之后同样保原 Source 首错与原取消位。
+        self.require_layout_source(authority)?; // Preserve original Source
+        // failure and cancellation again after metadata I/O.
         Ok(value)
     }
 
-    /// 顺序交付逻辑run的Copy候选；调用方只能在本次返回Ok后提交这一批事实。
+    /// Visit Copy logical-run candidates in order; commit the batch only after
+    /// this complete call returns Ok.
     ///
-    /// 中途IO失败可能发生在若干次回调之后。返回Err时必须丢弃本次全部候选，
-    /// 不能在回调里直接写入显示状态、发送Native动作或把先前片段标记为完整覆盖。
+    /// I/O can fail after earlier callbacks. Err invalidates every candidate
+    /// from this call, so callbacks must not publish display state, send Native
+    /// actions, or certify coverage while the batch is still running.
     pub fn visit_logical_runs(
         &mut self,
         range: Range<usize>,
@@ -854,7 +927,8 @@ impl MarkdownBidiParagraph {
         let store = match &mut self.resolution {
             Resolution::UniformZero(cancellation) => {
                 if !relative.is_empty() {
-                    // 单段证书保证整个请求连续且为0；回调后仍须核原源和取消，不能提前发布候选。
+                    // This completed scope proves continuous zero-level input;
+                    // post-callback Source/cancellation still gate publication.
                     visit(MarkdownBidiRun {
                         source_utf16_start: self.source.start + relative.start as usize,
                         source_utf16_end: self.source.start + relative.end as usize,
@@ -890,16 +964,19 @@ impl MarkdownBidiParagraph {
                 source_utf16_start: self.source.start + from as usize,
                 source_utf16_end: self.source.start + at as usize,
                 level,
-            }); // 页借用已经结束；回调只得到有限Copy事实，不拿到snapshot或缓存buffer。
+            }); // The page borrow ended; callbacks receive finite Copy facts
+            // without a snapshot or metadata-cache buffer.
         }
         self._snapshot.original_backing_health()?;
         self.resolution.healthy()
     }
 
-    /// 调用方必须提交实际断好的单条软行；这里只应用L1/L2，不猜字体宽度或划分视觉行。
+    /// Apply L1/L2 only to an actual already-broken soft line supplied by the
+    /// caller; font widths and line formation remain their own stages.
     ///
-    /// 回调交付的仍是候选。若后继IO失败而返回Err，调用方必须丢弃本次所有候选；
-    /// 只有完整Ok才授予本条行的覆盖，不得在回调期间直接发布Native几何或绘制状态。
+    /// Callbacks still receive candidates: later I/O failure invalidates the
+    /// entire batch. Only full Ok grants this line's coverage, before which
+    /// Native geometry and paint state must remain unpublished.
     pub fn visit_visual_runs(
         &mut self,
         actual_soft_line: Range<usize>,
@@ -912,13 +989,16 @@ impl MarkdownBidiParagraph {
                 .uniform_paragraph_at(actual_soft_line.start)?
                 .is_none_or(|paragraph| actual_soft_line.end > paragraph.end)
         {
-            return Err(BidiError::InvalidRange); // 单条真实L1行不能越过另一个B段；CRLF也不合并。
+            return Err(BidiError::InvalidRange); // A real L1 line cannot cross
+            // another B paragraph, including separately owned CR/LF separators.
         }
         let relative = self.checked_range(actual_soft_line)?;
         match &mut self.resolution {
             Resolution::UniformZero(_) => {
                 if !relative.is_empty() {
-                    // 证书只允许无B或唯一尾B，故任何合法子范围都不会跨第二个UBA段。
+                    // An original Uniform certificate may cover multiple B
+                    // paragraphs. The actual-paragraph check above confines this
+                    // soft line to one validated paragraph scope.
                     visit(MarkdownBidiRun {
                         source_utf16_start: self.source.start + relative.start as usize,
                         source_utf16_end: self.source.start + relative.end as usize,
@@ -954,7 +1034,8 @@ impl MarkdownBidiParagraph {
             Resolution::Paged(store) => (store.cache_bytes(), store.page_loads),
             #[cfg(feature = "paged-shaping-frontier")]
             Resolution::VisibleParagraphs(visible) => visible.storage(),
-        }; // 资源事实按真实表示报告；Uniform不能冒充配置过但实际不存在的1MiB缓存。
+        }; // Report the actual representation; Uniform owns no hypothetical
+        // cache merely because a nonzero paged budget was configured.
         MarkdownBidiStorageProfile {
             cache_bytes,
             page_loads,
@@ -965,8 +1046,9 @@ impl MarkdownBidiParagraph {
     }
 
     fn checked_range(&mut self, range: Range<usize>) -> Result<Range<u32>, BidiError> {
-        self._snapshot.original_backing_health()?; // 空行与索引命中同样保留底层失败原因。
-        self.resolution.healthy()?; // 空查询同样不能把已撤销的整个分析值恢复成Ok。
+        self._snapshot.original_backing_health()?; // Empty lines and index hits
+        // retain actual backing failure just like nonempty metadata reads.
+        self.resolution.healthy()?; // Empty requests cannot revive revoked analysis.
         if range.start > range.end || range.start < self.source.start || range.end > self.source.end
         {
             return Err(BidiError::InvalidRange);
@@ -982,8 +1064,10 @@ impl MarkdownBidiParagraph {
                 for position in [start, end] {
                     if endpoints_are_scalar {
                         continue;
-                    } // 同root无代理对的精确聚合已证明整数端点。
-                    // 冻结树的端点转换只借用命中有限叶，不为Uniform建立代理项镜像。
+                    } // The same root's exact no-surrogate aggregate already
+                    // establishes these integer scalar endpoints.
+                    // Other endpoints borrow their bounded frozen tree leaf,
+                    // without adding a surrogate mirror for Uniform results.
                     self._snapshot
                         .byte_offset_for_utf16(self.source.start + position as usize)
                         .map_err(scalar_endpoint_error)?;
@@ -994,7 +1078,9 @@ impl MarkdownBidiParagraph {
             Resolution::Paged(store) => {
                 for position in [start, end] {
                     if position < self.units && Text::read(store, position)?.continuation() {
-                        return Err(BidiError::InvalidScalarBoundary); // run不能拆开代理对，即使level_at允许观察低项。
+                        return Err(BidiError::InvalidScalarBoundary); // A run
+                        // cannot split a surrogate pair even though level_at can
+                        // observe the low unit's actual level record.
                     }
                 }
             }
@@ -1013,7 +1099,8 @@ impl MarkdownBidiParagraph {
     }
 }
 
-/// 只有真实代理项内部端点属于边界错误；映射读取/回收失败保留其原始typed cause。
+/// Map only a real surrogate-interior endpoint to the public boundary error;
+/// mapped-source read/reclaim failures retain their original typed cause.
 fn scalar_endpoint_error(error: MarkdownDocumentBufferError) -> BidiError {
     match error {
         MarkdownDocumentBufferError::NotUnicodeBoundary => BidiError::InvalidScalarBoundary,
@@ -1177,7 +1264,8 @@ fn removed(class: BidiClass) -> bool {
     matches!(class, RLE | LRE | RLO | LRO | PDF | BN)
 }
 
-// 编码是本模块固定格式，不依赖第三方enum的未承诺discriminant或unsafe转型。
+// This fixed metadata encoding is independent of third-party enum discriminants
+// and needs no unsafe conversion between their representations.
 fn encode_class(class: BidiClass) -> u8 {
     use BidiClass::*;
     match class {

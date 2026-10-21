@@ -1,4 +1,5 @@
-//! 仅有限合成oracle允许完整String/Vec；产品状态始终只保留固定cluster摘要和分页metadata。
+//! Complete strings and vectors are confined to these finite synthetic oracles.
+//! Production retains fixed cluster summaries and paginated metadata instead.
 use super::*;
 use crate::MarkdownDocumentBuffer;
 
@@ -6,7 +7,8 @@ use crate::MarkdownDocumentBuffer;
 #[path = "fold_tests.rs"]
 mod fold_tests;
 
-/// 先真实借入一页，再在公开测试驱逐点制造I/O失败；归还pin本身不代表msync发生。
+/// Leases an actual source page before using the existing reclaim fault hook.
+/// Returning a pin alone does not imply that the backing performed an msync.
 fn poison_original_read_windows(document: &MarkdownDocumentBuffer) {
     document
         .text_snapshot()
@@ -18,10 +20,12 @@ fn poison_original_read_windows(document: &MarkdownDocumentBuffer) {
         Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(
             libc::EIO
         ))
-    ); // 只有真实无pin页回收已失败，后继算法才应观察同一个永久源错误。
+    ); // The reclaim path must report the injected EIO before later queries observe its sticky source error.
 }
 
 fn fixture(text: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+    // Each case owns its file and directory. The document uses the real backing
+    // rather than a replacement source with predeclared script properties.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("scripts.md");
     std::fs::write(&path, text).unwrap();
@@ -41,7 +45,8 @@ fn make_job(
     let (directory, document) = fixture(text);
     let source = MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
-    // 原规则/配额/故障测试固定保留逐scalar Machine；新摘要另以同一原路径作差分。
+    // Rule, quota, and failure cases retain scalar scanning. Summary tests use
+    // this same original machine as their separate differential oracle.
     let job =
         MarkdownScriptJob::new_streaming(source, &authority, MarkdownScriptCancellation::new())
             .unwrap();
@@ -52,6 +57,8 @@ fn finish(
     authority: &MarkdownLayoutTextAuthority,
     budget: MarkdownScriptBudget,
 ) {
+    // Every Pending quantum must perform real bounded work. The finite loop
+    // limit catches lack of progress without authorizing a partial result.
     for _ in 0..1_000_000 {
         let step = job.step(authority, budget).unwrap();
         assert!(
@@ -74,6 +81,8 @@ fn runs(
     job: &mut MarkdownScriptJob,
     authority: &MarkdownLayoutTextAuthority,
 ) -> Vec<MarkdownScriptRun> {
+    // Inspect the stored records only to enumerate this finite oracle, then
+    // verify each through the public query using the original source authority.
     (0..job.store.run_count())
         .map(|index| {
             let value = job.store.run(index).unwrap();
@@ -87,6 +96,8 @@ fn runs(
         .collect()
 }
 fn tagged(text: &str, budget: MarkdownScriptBudget) -> Vec<(String, [u8; 4])> {
+    // Copying completed fixture slices is confined to expected test output;
+    // production does not materialize the document to obtain script labels.
     let (_directory, _document, authority, mut job) = make_job(text);
     finish(&mut job, &authority, budget);
     runs(&mut job, &authority)
@@ -102,6 +113,8 @@ fn tagged(text: &str, budget: MarkdownScriptBudget) -> Vec<(String, [u8; 4])> {
 
 #[test]
 fn scx_common_inherited_marks_and_unknown_follow_declared_cluster_policy() {
+    // Literal tags distinguish the declared SCX/cluster policy, including
+    // inherited marks, context-sensitive extensions, Common, and Unknown.
     for (text, expected) in [
         ("hello 世界", vec![("hello ", *b"Latn"), ("世界", *b"Hani")]),
         ("aーあ", vec![("a", *b"Latn"), ("ーあ", *b"Hira")]),
@@ -124,6 +137,8 @@ fn scx_common_inherited_marks_and_unknown_follow_declared_cluster_policy() {
             expected,
             "{text:?}"
         );
+        // Byte-at-a-time decoding must preserve the same full-source context as
+        // the ordinary quota, including scalars split across source visits.
         assert_eq!(
             tagged(
                 text,
@@ -142,6 +157,8 @@ fn scx_common_inherited_marks_and_unknown_follow_declared_cluster_policy() {
 
 #[test]
 fn nested_pairs_keep_outer_context_beyond_32_and_paragraphs_reset_only_at_real_breaks() {
+    // A closing pair inherits its actual outer script, whereas unmatched
+    // leading brackets can resolve with the script found inside them.
     assert_eq!(
         tagged("A (α) B", MarkdownScriptBudget::default()),
         vec![
@@ -155,6 +172,8 @@ fn nested_pairs_keep_outer_context_beyond_32_and_paragraphs_reset_only_at_real_b
         vec![("(α)".into(), *b"Grek")]
     );
     let text = format!("a({}α{}א)", "(".repeat(96), ")".repeat(96));
+    // Resume real frame operations under a one-operation quota; the nesting
+    // exceeds a small in-memory stack and still retains the original opener.
     let (_directory, _document, authority, mut job) = make_job(&text);
     finish(
         &mut job,
@@ -173,16 +192,19 @@ fn nested_pairs_keep_outer_context_beyond_32_and_paragraphs_reset_only_at_real_b
     assert!(
         matches!(last, MarkdownScriptAnswer::Known(Some(run)) if run.script.iso15924_tag() == *b"Latn")
     );
-    // 最后closer的opening早于96层；丢弃底部32层的实现会把它错误继承为Hebrew。
+    // The last closer refers to an opener beneath 96 frames. Dropping older
+    // frames would incorrectly let the intervening Hebrew context own it.
     let reset = tagged("a(α\r\nא)", MarkdownScriptBudget::default());
     assert_eq!(reset.last().unwrap().1, *b"Hebr");
-    assert!(!reset.iter().any(|(part, _)| part.starts_with('\n'))); // CRLF仍完整，不在Script阶段拆开原GCB。
+    assert!(!reset.iter().any(|(part, _)| part.starts_with('\n'))); // Script itemization must not split the original CRLF grapheme.
     let quotes = tagged("a'α'א", MarkdownScriptBudget::default());
-    assert_eq!(quotes[1], ("α'".into(), *b"Grek")); // 引号角色依语言，不能仅按码点伪造一对括号。
+    assert_eq!(quotes[1], ("α'".into(), *b"Grek")); // A language-dependent quote is not automatically a paired bracket.
 }
 
 #[test]
 fn pending_prefix_and_every_byte_split_preserve_global_utf16_coverage() {
+    // A partial first scalar is not a published run or proof of absence. The
+    // subsequent sweep exercises every byte quota against the same full oracle.
     let text = "  a😀\u{0301}世界(א)";
     let (_directory, _document, authority, mut pending) = make_job(text);
     assert_eq!(
@@ -255,8 +277,9 @@ fn pending_prefix_and_every_byte_split_preserve_global_utf16_coverage() {
 
 #[test]
 fn cross_page_run_queries_keep_exact_unicode_ranges_and_unfinished_frontier() {
-    // 三种明确脚本逐字交替；Deseret占四个UTF8字节、两个UTF16单元，不能把两种坐标
-    // 混成记录序号。1029个真实run跨过四个完整追加页，最终还保留五条有效尾记录。
+    // Three specific scripts alternate scalar by scalar. Deseret occupies four
+    // UTF-8 bytes and two UTF-16 units, so neither coordinate is a record ordinal.
+    // The 1,029 actual runs cross four full append pages and leave five tail records.
     let text = "a𐐀中".repeat(343);
     let (directory, document) = fixture(&text);
     let mapping = document.original_backing_observer().unwrap();
@@ -271,7 +294,8 @@ fn cross_page_run_queries_keep_exact_unicode_ranges_and_unfinished_frontier() {
         records: 1,
         stack_ops: 1,
     };
-    // 期望直接来自三个原字符的编码与公开Script tag；不读取内部Store或改写分页状态。
+    // Expected extents come from the literal scalars and public script tags,
+    // without reading Store state or mutating pagination to prepare the answer.
     let segments = [
         (0..1, 0..1, *b"Latn"),
         (1..5, 1..3, *b"Dsrt"),
@@ -282,7 +306,8 @@ fn cross_page_run_queries_keep_exact_unicode_ranges_and_unfinished_frontier() {
         let (bytes, utf16, tag) = &segments[ordinal % 3];
         let bytes = group * 8 + bytes.start..group * 8 + bytes.end;
         let utf16 = group * 4 + utf16.start..group * 4 + utf16.end;
-        // 同一run内的首末单元都须归于完整原run；代理对内部的UTF16单元不另造脚本边界。
+        // First and last units belong to the same complete run. A UTF-16 unit
+        // inside a surrogate pair must not invent another script boundary.
         for (unit, offset) in [
             (MarkdownScriptUnit::Byte, bytes.start),
             (MarkdownScriptUnit::Byte, bytes.end - 1),
@@ -299,7 +324,8 @@ fn cross_page_run_queries_keep_exact_unicode_ranges_and_unfinished_frontier() {
             assert_eq!(run.script.iso15924_tag(), *tag);
             #[cfg(feature = "paged-shaping-frontier")]
             {
-                // Frontier也消费同一已封存run；本次借用结束后才允许继续扫描或再查询。
+                // The frontier borrows this same closed run. Its borrow ends
+                // before further scanning or another mutable query can proceed.
                 let MarkdownScriptPrefixAnswer::Known(Some(prefix)) =
                     job.stable_prefix_at(&authority, unit, offset).unwrap()
                 else {
@@ -315,8 +341,9 @@ fn cross_page_run_queries_keep_exact_unicode_ranges_and_unfinished_frontier() {
         let (bytes, utf16, _) = &segments[ordinal % 3];
         let end_byte = group * 8 + bytes.end;
         let end_utf16 = group * 4 + utf16.end;
-        // 只沿公开逐字节配额推进到这个run实际发布。查询不能替任务读完后继正文，
-        // records=1也让本次发布边缘不被同一步的后一记录掩盖。
+        // Advance through public one-byte steps until this run is published.
+        // Queries must not scan its successor; records=1 also exposes the exact
+        // publication frontier without a second record hiding it in one step.
         let mut closed = false;
         for _ in 0..text.len() * 8 {
             if matches!(
@@ -333,7 +360,8 @@ fn cross_page_run_queries_keep_exact_unicode_ranges_and_unfinished_frontier() {
             assert_eq!(step.status, MarkdownScriptStatus::Pending);
         }
         assert!(closed, "有限原输入必须能到达这个真实发布边界");
-        // 查询页首前后及旧文件区域；相等末端须进入下一run，而尚未发布时仍为Pending。
+        // Query both sides of a page edge and older file records. An equal end
+        // belongs to the next run, which remains Pending until actually closed.
         for known in [0, ordinal - 1, ordinal] {
             assert_run(&mut job, known);
         }
@@ -349,7 +377,8 @@ fn cross_page_run_queries_keep_exact_unicode_ranges_and_unfinished_frontier() {
             );
         }
     }
-    // 真EOF后再逆序查询尾部半页、旧页末及页首；不存在只能在完整任务结束后确认。
+    // After real EOF, reverse queries revisit the tail, old page ends, and page
+    // starts. Only completion can establish absence at the source endpoint.
     finish(&mut job, &authority, budget);
     for ordinal in [1028, 0, 1024, 1023, 512, 511, 256, 255, 1] {
         assert_run(&mut job, ordinal);
@@ -369,7 +398,8 @@ fn cross_page_run_queries_keep_exact_unicode_ranges_and_unfinished_frontier() {
     );
     assert_eq!(document.generation(), 0);
     assert!(!document.can_undo() && !document.can_redo());
-    // 真实close归还两索引及原Source；观察者只有弱资源事实，不把关闭标志冒充释放。
+    // Closing relinquishes both indexes and the source. Weak resource observers
+    // check actual release instead of treating a closed flag as deallocation.
     job.close().unwrap();
     drop(document);
     let facts = observer.snapshot();
@@ -382,8 +412,9 @@ fn cross_page_run_queries_keep_exact_unicode_ranges_and_unfinished_frontier() {
 
 #[test]
 fn sealed_run_queries_keep_foreign_source_cancel_and_invalid_offset_errors() {
-    // 每次都通过公开入口真正写过多个metadata页，再验证新旧查询区域的撤权结果；
-    // 不用私有记录突变、替代reader或预设缓存命中来制造错误。
+    // Each case first publishes multiple real metadata pages through the public
+    // entry. Revocation then covers both old and recent records, without private
+    // record mutation, a substitute reader, or an assumed cache hit.
     enum Failure {
         Cancelled,
         ForeignSource,
@@ -406,7 +437,8 @@ fn sealed_run_queries_keep_foreign_source_cancel_and_invalid_offset_errors() {
         match failure {
             Failure::Cancelled => {
                 cancellation.cancel();
-                // 尾追加页和旧FD区域都必须先观察同一取消，不能由原页内记录复活权限。
+                // Both the append tail and older FD region must observe the
+                // same cancellation before an existing record can be returned.
                 for offset in [text.len() - 1, 0] {
                     assert!(matches!(
                         job.run_at(&authority, MarkdownScriptUnit::Byte, offset),
@@ -415,6 +447,8 @@ fn sealed_run_queries_keep_foreign_source_cancel_and_invalid_offset_errors() {
                 }
             }
             Failure::ForeignSource => {
+                // Equal bytes in another document do not share source authority;
+                // the mismatched query also permanently poisons this job.
                 let (_other_directory, other_document) = fixture(&text);
                 let foreign = MarkdownLayoutTextSource::capture(&other_document).authority();
                 assert!(matches!(
@@ -427,6 +461,8 @@ fn sealed_run_queries_keep_foreign_source_cancel_and_invalid_offset_errors() {
                 ));
             }
             Failure::InvalidOffset => {
+                // An out-of-range public query revokes subsequent cached reads
+                // instead of converting its invalid endpoint into Known(None).
                 assert!(matches!(
                     job.run_at(&authority, MarkdownScriptUnit::Byte, text.len() + 1),
                     Err(MarkdownScriptError::InvalidRange)
@@ -437,7 +473,8 @@ fn sealed_run_queries_keep_foreign_source_cancel_and_invalid_offset_errors() {
                 ));
             }
         }
-        // 撤权不妨碍原owner清理；错误后同样要求Source及匿名文件实际终结。
+        // Revocation does not prevent the original owner from cleaning up. The
+        // source and anonymous indexes must also end after an error.
         job.close().unwrap();
         drop(document);
         let facts = observer.snapshot();
@@ -451,6 +488,8 @@ fn sealed_run_queries_keep_foreign_source_cancel_and_invalid_offset_errors() {
 
 #[test]
 fn authority_cancel_source_failure_and_real_release_are_not_replaced_by_cached_runs() {
+    // Establish a real completed answer before injecting the existing reclaim
+    // failure. Cached metadata and cancellation must not hide the source errno.
     let (directory, document) = fixture("a(א)世界");
     let source = MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -495,8 +534,10 @@ fn authority_cancel_source_failure_and_real_release_are_not_replaced_by_cached_r
             && !facts.cleanup_failed
             && facts.source_payload_released
     );
-    assert!(mapping.unmap_succeeded() && mapping.failed()); // 真实unmap成功不抹掉此前已注入的源回收失败。
+    assert!(mapping.unmap_succeeded() && mapping.failed()); // Successful unmapping must not erase the earlier injected reclaim failure.
     drop(directory);
+    // A separate healthy source isolates identity rejection from the preceding
+    // sticky I/O failure and verifies that a later valid ticket cannot revive it.
     let (_directory, _document, authority, mut job) = make_job("abc");
     let (_other_directory, other_document) = fixture("abc");
     let foreign = MarkdownLayoutTextSource::capture(&other_document).authority();
@@ -538,7 +579,8 @@ fn background_cancellation_joins_before_actual_metadata_and_source_release_recei
     entered.wait();
     drop(document);
     cancellation.cancel();
-    // 尚未推进任何记录时没有metadata FD，原worker仍独占活Source并须通过join实际归还。
+    // No records have advanced, so there is no metadata FD. The worker still
+    // owns the live source; cancellation alone cannot count as its release.
     assert!(!observer.snapshot().run_file_open && !mapping.unmap_succeeded());
     assert_eq!(observer.snapshot().buffer_bytes, 0);
     resume.wait();
@@ -552,11 +594,13 @@ fn background_cancellation_joins_before_actual_metadata_and_source_release_recei
             && !facts.cleanup_failed
             && facts.source_payload_released
     );
-    assert!(mapping.unmap_succeeded() && !mapping.failed()); // 只有取消、没有I/O失败的线程仍须实际干净释放映射。
+    assert!(mapping.unmap_succeeded() && !mapping.failed()); // Joining the cancelled worker establishes clean mapping release without an I/O failure.
 }
 
 #[test]
 fn unicode18_generated_scx_sets_and_bracket_cluster_assumptions_match_exact_tables() {
+    // These checks describe the generated Unicode tables and assumptions used
+    // by the machine; they are not evidence of a complete native UI workflow.
     for &(first, last, _) in unicode_data::EXTENSIONS {
         for point in first..=last {
             let p = properties::get(char::from_u32(point).unwrap());
@@ -567,6 +611,8 @@ fn unicode18_generated_scx_sets_and_bracket_cluster_assumptions_match_exact_tabl
         }
     }
     for &(point, _, _) in unicode_data::BRACKETS {
+        // The actual GCB cursor must put a bracket outside the neighboring base
+        // clusters; the script stack relies on that generated-data property.
         let scalar = char::from_u32(point).unwrap();
         assert!(!properties::get(scalar).mark);
         let mut cursor = crate::markdown_graphemes::MarkdownGraphemeScalarCursor::default();
@@ -581,6 +627,8 @@ fn unicode18_generated_scx_sets_and_bracket_cluster_assumptions_match_exact_tabl
 
 #[test]
 fn empty_invalid_budget_ready_cancel_and_real_metadata_io_failure_never_forge_known() {
+    // Empty input reaches real EOF, whereas invalid quotas poison a nonempty
+    // job. Neither a stalled first step nor an error can fabricate Known(None).
     let (_directory, _document, authority, mut empty) = make_job("");
     finish(
         &mut empty,
@@ -615,6 +663,7 @@ fn empty_invalid_budget_ready_cancel_and_real_metadata_io_failure_never_forge_kn
         Err(MarkdownScriptError::Poisoned)
     ));
     let (_directory, _document, authority, mut ready) = make_job("abc");
+    // Ready is a semantic state, not an exemption from current cancellation.
     finish(&mut ready, &authority, MarkdownScriptBudget::default());
     ready.cancellation.cancel();
     for _ in 0..2 {
@@ -624,13 +673,17 @@ fn empty_invalid_budget_ready_cancel_and_real_metadata_io_failure_never_forge_kn
         ));
     }
     let (directory, _document, authority, mut broken) = make_job(&"aא".repeat(300));
+    // This existing private store injection installs a real read-only FD. The
+    // eventual page flush must surface the kernel's EBADF rather than a test
+    // implementation returning a predetermined storage error.
     let path = directory.path().join("readonly-index");
     std::fs::write(&path, []).unwrap();
     broken.store =
         store::Store::with_runs_file(std::fs::File::open(path).unwrap(), &broken.cancellation)
             .unwrap();
     let observer = broken.resource_observer();
-    // 真正跨过256条run才写第一页；短private seal在新协议下不需要File消费者。
+    // The first write requires crossing 256 actual runs. A short private seal
+    // needs no file consumer, so merely sealing a small fixture would not fail.
     let mut failure = None;
     for _ in 0..64 {
         match broken.step(&authority, MarkdownScriptBudget::default()) {

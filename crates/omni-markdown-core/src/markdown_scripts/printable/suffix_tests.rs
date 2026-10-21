@@ -1,9 +1,11 @@
-//! 原SCX完整oracle和真实Frozen后缀租借；不以虚构ASCII Source替换前面的Unicode上下文。
+//! Uses the complete original SCX oracle and real frozen-source suffix leases.
+//! A synthetic ASCII source must not replace the preceding Unicode context.
 
 use super::*;
 use std::io::Write;
 
-/// 只用原Machine取得稳定Latn上下文，随后请求同一个job的真实EOF证明。
+/// Advances only the original machine to settled Latin context, then requests
+/// the same job's proof to its real source EOF.
 fn begin(
     job: &mut MarkdownScriptJob,
     authority: &MarkdownLayoutTextAuthority,
@@ -29,7 +31,7 @@ fn begin(
         assert!(step.bytes <= budget.bytes && step.scalars <= budget.scalars);
         assert!(step.records <= budget.records && step.stack_ops <= budget.stack_ops);
         if step.status == MarkdownScriptStatus::Ready {
-            return; // 有限反例可能先被原Machine完整处理，不能为强迫走快路改写其自然完成语义。
+            return; // A finite counterexample may finish normally first; do not force it through the optimized path.
         }
     }
     panic!("有限前缀应在原Machine内取得真实Latn上下文");
@@ -37,6 +39,8 @@ fn begin(
 
 #[test]
 fn original_unicode_context_and_ascii_tail_match_complete_script_and_gcb_oracle() {
+    // Mixed prefixes and disqualifying suffixes check both successful proof and
+    // rejection. Both jobs retain one source identity and its original context.
     for text in [
         "中文😀! Xword (a)[b]{c} 9",
         "first\r\nsecond word\r\nXaaa!",
@@ -78,6 +82,8 @@ fn original_unicode_context_and_ascii_tail_match_complete_script_and_gcb_oracle(
             begin(&mut actual, &authority, position, budget);
             finish(&mut actual, &authority, budget);
             finish(&mut oracle, &authority, budget);
+            // Compare all closed runs and every UTF-16 unit, not just the Latin
+            // candidate. A suffix proof cannot rewrite the preceding SCX result.
             assert_eq!(
                 runs(&mut actual, &authority),
                 runs(&mut oracle, &authority),
@@ -96,7 +102,8 @@ fn original_unicode_context_and_ascii_tail_match_complete_script_and_gcb_oracle(
                         .unwrap()
                 );
             }
-            // 同一原GCB标量机对有限完整夹具给出实际cluster端点；SCX闭项不能切开组合序列。
+            // The original GCB scalar machine supplies actual cluster endpoints
+            // for this finite fixture. Closed script runs must not cut a cluster.
             let mut gcb = crate::markdown_graphemes::MarkdownGraphemeScalarCursor::default();
             let mut boundaries = Vec::new();
             for (byte, scalar) in text.char_indices() {
@@ -111,6 +118,8 @@ fn original_unicode_context_and_ascii_tail_match_complete_script_and_gcb_oracle(
                 assert!(boundaries.contains(&run.start_byte) && boundaries.contains(&run.end_byte));
             }
             drop(document);
+            // Closing both real jobs after dropping the document must release
+            // metadata and the shared frozen-source payload, not just tickets.
             actual.close().unwrap();
             oracle.close().unwrap();
             assert_released(&receipt);
@@ -121,6 +130,8 @@ fn original_unicode_context_and_ascii_tail_match_complete_script_and_gcb_oracle(
 
 #[test]
 fn mixed_and_255_byte_crlf_prefix_keep_four_mebibyte_suffix_bounded_under_quota_one() {
+    // Fixed-size writes construct the long real suffix without a full test-side
+    // copy. Mixed and boundary-length CRLF prefixes retain original context.
     for prefix in [
         "one two 中文😀! ".to_owned(),
         format!("{}\r\nsecond word\r\n", "alpha ".repeat(40)),
@@ -158,6 +169,8 @@ fn mixed_and_255_byte_crlf_prefix_keep_four_mebibyte_suffix_bounded_under_quota_
             let receipt = job.resource_observer();
             begin(&mut job, &authority, position, budget);
             assert!(job.printable.is_some());
+            // Proof work includes actual boundary-leaf reads and metadata. The
+            // aggregate suffix may be skipped, but individual leases stay bounded.
             let work = finish(&mut job, &authority, budget);
             let profile = job.storage_profile();
             assert!(work.bytes < 8192 && profile.source_bytes_read < 16_384);
@@ -177,6 +190,8 @@ fn mixed_and_255_byte_crlf_prefix_keep_four_mebibyte_suffix_bounded_under_quota_
                 (source.byte_len(), source.utf16_len())
             );
             job.close().unwrap();
+            // Job closure relinquishes its own metadata; source/document clones
+            // intentionally remain live until both budget variants have run.
             let closed = receipt.snapshot();
             assert!(
                 !closed.run_file_open
@@ -194,6 +209,8 @@ fn mixed_and_255_byte_crlf_prefix_keep_four_mebibyte_suffix_bounded_under_quota_
 
 #[test]
 fn unsettled_bracket_context_does_not_gain_ascii_closure() {
+    // A settled local prefix alone is insufficient: an actual unresolved opener
+    // can still affect following script resolution and forbids Latin suffix proof.
     let text = "中(Xaaaa";
     let (_directory, document) = fixture(text);
     let source = MarkdownLayoutTextSource::capture(&document);
@@ -221,13 +238,15 @@ fn unsettled_bracket_context_does_not_gain_ascii_closure() {
         !job.prepare_ascii_suffix(&authority, position, source.utf16_len(), source.utf16_len())
             .unwrap()
     );
-    assert!(job.printable.is_none()); // 原真实括号栈可改变后继SCX，不能由纯ASCII后继消除它。
+    assert!(job.printable.is_none()); // Printable continuation cannot erase the original live bracket stack.
     finish(&mut job, &authority, ONE);
     job.close().unwrap();
 }
 
 #[test]
 fn pending_suffix_keeps_original_foreign_cancel_and_real_source_error_priority() {
+    // Refuse a foreign capture, observe cancellation, and preserve the source's
+    // EIO priority while a real suffix preparation is still Pending.
     for failure in [0, 1, 2] {
         let text = format!("中文😀! X{}", "a".repeat(16 * 1024));
         let (_directory, document) = fixture(&text);
@@ -242,6 +261,8 @@ fn pending_suffix_keeps_original_foreign_cancel_and_real_source_error_priority()
         assert!(job.printable.is_some());
         let foreign = MarkdownLayoutTextSource::capture(&document).authority();
         if failure == 2 {
+            // The existing fault hook targets reclamation after a real source
+            // visit; it does not represent a naturally occurring kernel failure.
             source.visit_byte_range(0..1, |_| Ok(())).unwrap();
             document.fail_next_original_reclaim_for_test();
             assert_eq!(
@@ -276,6 +297,8 @@ fn pending_suffix_keeps_original_foreign_cancel_and_real_source_error_priority()
 
 #[test]
 fn actual_frozen_suffix_partial_leaf_foreign_identity_and_surrogate_follow_each_quantum() {
+    // Starting inside a mixed leaf requires actual source bytes. One-unit quotas
+    // also charge directory work and cannot hide a whole boundary-leaf lease.
     let text = "中😀 prefix Xaaa";
     let (_directory, document) = fixture(text);
     let source = MarkdownLayoutTextSource::capture(&document);
@@ -296,8 +319,10 @@ fn actual_frozen_suffix_partial_leaf_foreign_identity_and_surrogate_follow_each_
             break;
         }
     }
-    assert!(bytes > 0 && maximum == 1); // 混合叶确实逐byte读取，不能藏一次4KiB边叶借用。
+    assert!(bytes > 0 && maximum == 1); // The mixed leaf was read byte by byte, without an uncharged four-KiB boundary lease.
     let foreign = MarkdownLayoutTextSource::capture(&document);
+    // Completion does not let another capture resume the cursor, even when its
+    // document and bytes are unchanged.
     assert!(matches!(
         foreign.advance_printable_ascii_suffix(&mut cursor, 1, 1, 1),
         Err(MarkdownDocumentBufferError::RangeOutsideDocument)
@@ -305,6 +330,8 @@ fn actual_frozen_suffix_partial_leaf_foreign_identity_and_surrogate_follow_each_
     let mut split = source
         .begin_printable_ascii_suffix(2..source.utf16_len())
         .unwrap();
+    // UTF-16 coordinate 2 cuts the original emoji's surrogate pair. A later
+    // printable suffix cannot make that invalid start into a Unicode boundary.
     loop {
         match source.advance_printable_ascii_suffix(&mut split, 1, 1, 1) {
             Ok(step) => {
@@ -318,6 +345,8 @@ fn actual_frozen_suffix_partial_leaf_foreign_identity_and_surrogate_follow_each_
     for tail in [
         "\t", "\n", "\u{c}", "\u{7f}", "א", "\u{661}", "\u{2067}", "\u{301}",
     ] {
+        // Controls, non-Latin scalars, bidi isolates, and combining marks are
+        // genuine counterexamples, not a reason to truncate the requested range.
         let (_directory, mixed) = fixture(&format!("中 Xaaa{tail}"));
         let mixed = MarkdownLayoutTextSource::capture(&mixed);
         let mut cursor = mixed
@@ -336,7 +365,8 @@ fn actual_frozen_suffix_partial_leaf_foreign_identity_and_surrogate_follow_each_
     }
 }
 
-/// 当前B范围由同一Source实际端点给出；此处只让原Machine走到足以启动证明的稳定Latn。
+/// Receives the current B range's actual endpoints from the same source. Only
+/// the original machine advances to Latin context sufficient to begin proof.
 fn begin_before_b(
     job: &mut MarkdownScriptJob,
     authority: &MarkdownLayoutTextAuthority,
@@ -363,6 +393,8 @@ fn begin_before_b(
 
 #[test]
 fn non_eof_ascii_proof_keeps_original_b_crlf_and_following_unicode_script_oracle() {
+    // Prove only the content before a real paragraph separator. The following
+    // B/CRLF and Unicode text still belong to the original machine's full oracle.
     for prefix in ["中😀 ", "🇨🇳👩\u{301}\u{200d}💻 क् "] {
         for separator in [
             "\r\n", "\n", "\r", "\u{85}", "\u{2029}", "\u{1c}", "\u{1d}", "\u{1e}", "\r\n\r\n",
@@ -405,6 +437,8 @@ fn non_eof_ascii_proof_keeps_original_b_crlf_and_following_unicode_script_oracle
                     budget,
                 );
                 let before_runs = actual.store.run_count();
+                // Exhaust only the suffix preparation. Successful non-EOF proof
+                // advances the cursor but cannot publish Ready or a closed run.
                 while actual.printable.is_some() {
                     let step = actual.step(&authority, budget).unwrap();
                     assert!(
@@ -415,7 +449,7 @@ fn non_eof_ascii_proof_keeps_original_b_crlf_and_following_unicode_script_oracle
                     );
                     assert_eq!(step.status, MarkdownScriptStatus::Pending);
                 }
-                assert_eq!(actual.store.run_count(), before_runs); // 证明B前正文没有提前写出闭run。
+                assert_eq!(actual.store.run_count(), before_runs); // Proving content before B must not append an early closed run.
                 assert_eq!(actual.machine.byte, prefix.len() + ascii.len());
                 assert!(actual.machine.complete_utf8(content_end) && !actual.machine.ready);
                 assert!(matches!(
@@ -425,6 +459,8 @@ fn non_eof_ascii_proof_keeps_original_b_crlf_and_following_unicode_script_oracle
                     MarkdownScriptAnswer::Pending
                 ));
                 finish(&mut actual, &authority, budget);
+                // Now let the original machine consume the actual separator,
+                // preserving CRLF grapheme continuity and subsequent script state.
                 finish(&mut oracle, &authority, budget);
                 assert_eq!(
                     runs(&mut actual, &authority),
@@ -441,6 +477,8 @@ fn non_eof_ascii_proof_keeps_original_b_crlf_and_following_unicode_script_oracle
 
 #[test]
 fn four_mebibyte_non_eof_paragraph_consumes_true_crlf_and_next_chinese_without_full_read() {
+    // The real long paragraph ends before EOF. Fixed-size writes avoid making a
+    // second complete body merely to test bounded suffix proof and B handoff.
     let mut file = tempfile::NamedTempFile::new().unwrap();
     file.write_all(b"X").unwrap();
     file.write_all(&[b'a'; 4095]).unwrap();
@@ -480,6 +518,8 @@ fn four_mebibyte_non_eof_paragraph_consumes_true_crlf_and_next_chinese_without_f
             budget,
         );
         finish(&mut job, &authority, budget);
+        // The first actual CRLF closes the Latin run. The second belongs to the
+        // original following paragraph, whose Hani text must still be itemized.
         let first = match job
             .run_at(&authority, MarkdownScriptUnit::Utf16, 0)
             .unwrap()
@@ -505,6 +545,8 @@ fn four_mebibyte_non_eof_paragraph_consumes_true_crlf_and_next_chinese_without_f
             job.storage_profile().source_bytes_read < 8192
                 && job.storage_profile().source_borrow_max_bytes <= 4096
         );
+        // This bound concerns actual script-source reads and leases; mapping
+        // observers separately check final ownership after all source clones drop.
         job.close().unwrap();
         let closed = resources.snapshot();
         assert!(
@@ -524,7 +566,8 @@ fn four_mebibyte_non_eof_paragraph_consumes_true_crlf_and_next_chinese_without_f
 fn actual_range_counterexample_still_validates_its_low_surrogate_end() {
     let (_directory, document) = fixture("中 X\t😀tail");
     let source = MarkdownLayoutTextSource::capture(&document);
-    // TAB已经否定ASCII，但末端切入emoji时仍必须返回端点错误，不能先交false。
+    // TAB already disproves printable ASCII, but an end inside the emoji still
+    // requires a boundary error instead of prematurely publishing false.
     let mut proof = source.begin_printable_ascii_suffix(2..5).unwrap();
     loop {
         match source.advance_printable_ascii_suffix(&mut proof, 1, 1, 1) {
@@ -540,6 +583,8 @@ fn actual_range_counterexample_still_validates_its_low_surrogate_end() {
 
 #[test]
 fn non_eof_pending_and_actual_b_handoff_preserve_foreign_cancel_eio_and_release() {
+    // Cover both in-flight proof and its successful non-EOF handoff. Neither
+    // phase can bypass original identity, cancellation, or source-health checks.
     for resumed in [false, true] {
         for failure in [0, 1, 2] {
             let prefix = "中😀 X";
@@ -563,6 +608,8 @@ fn non_eof_pending_and_actual_b_handoff_preserve_foreign_cancel_eio_and_release(
                 ONE,
             );
             if resumed {
+                // Consume only preparation: the actual separator is unread and
+                // the Latin run must still be Pending under the public query.
                 while job.printable.is_some() {
                     job.step(&authority, ONE).unwrap();
                 }
@@ -578,6 +625,8 @@ fn non_eof_pending_and_actual_b_handoff_preserve_foreign_cancel_eio_and_release(
             }
             let foreign = MarkdownLayoutTextSource::capture(&document).authority();
             if failure == 2 {
+                // Keep the existing reclaim injection explicit and require its
+                // real error path before testing priority against other failures.
                 source.visit_byte_range(0..1, |_| Ok(())).unwrap();
                 document.fail_next_original_reclaim_for_test();
                 assert_eq!(
@@ -606,6 +655,8 @@ fn non_eof_pending_and_actual_b_handoff_preserve_foreign_cancel_eio_and_release(
                 (_, error) => panic!("原B交接仍保来源首错/取消/权限：{error:?}"),
             }
             job.close().unwrap();
+            // Error priority is separate from cleanup. Drop the final source and
+            // document owners, then inspect actual mapping release and first errno.
             drop((source, document));
             assert_released(&receipt);
             assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0);

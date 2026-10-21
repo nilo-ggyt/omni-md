@@ -1,4 +1,5 @@
-//! 同原Uniform完整扫描封闭的控制事实；独立UBA oracle与实际源收据防止偷换读取/来源权限。
+//! Control facts retain the original complete Uniform semantics. Independent UBA oracles and
+//! actual source receipts keep text-read accounting separate from source authority.
 
 use super::*;
 use crate::{MarkdownDocumentBuffer, MarkdownLayoutTextSource, MarkdownTextSelection};
@@ -11,6 +12,8 @@ const ONE: MarkdownBidiPrepareBudget = MarkdownBidiPrepareBudget {
 };
 
 fn fixture(text: &str) -> (tempfile::TempDir, MarkdownDocumentBuffer) {
+    // Use an isolated real file so source ownership, immutable reads, and final unmap
+    // are exercised without accessing production documents.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("uniform-control.md");
     std::fs::write(&path, text).unwrap();
@@ -32,6 +35,8 @@ fn prepared(
         cancel,
     )
     .unwrap();
+    // Each independent work dimension has a one-unit quantum. Only actual Ready may
+    // publish the completed paragraph; an unfinished Future supplies no partial proof.
     let mut bytes = 0;
     for _ in 0..100_000 {
         let step = job.step(&authority, ONE).unwrap();
@@ -45,7 +50,7 @@ fn prepared(
         if step.status == MarkdownBidiPrepareStatus::Ready {
             return (job.take_ready(&authority).unwrap().unwrap(), bytes);
         }
-        assert!(job.take_ready(&authority).unwrap().is_none()); // 原Future未完成时不能查询局部控制事实。
+        assert!(job.take_ready(&authority).unwrap().is_none()); // An unfinished Future publishes no partial control facts.
     }
     panic!("有限控制夹具未在原量子预算内完成");
 }
@@ -56,6 +61,8 @@ pub(super) fn assert_oracle(
     actual: &mut MarkdownBidiParagraph,
 ) {
     assert!(text.chars().count() <= 4096);
+    // This finite independent oracle owns a full UTF-16 array; production preparation
+    // and long-document fixtures do not adopt that representation.
     let units: Vec<u16> = text.encode_utf16().collect();
     let oracle = BidiInfo::new_with_data_source(
         &UnicodeBidiData,
@@ -74,6 +81,8 @@ pub(super) fn assert_oracle(
         offset += scalar.len_utf16();
     }
     offsets.push(offset);
+    // Compare actual visual scalar order, including L1/L2 effects, rather than treating
+    // matching per-unit levels as sufficient evidence for run ordering.
     for paragraph in &oracle.paragraphs {
         let first = offsets.binary_search(&paragraph.range.start).unwrap();
         let last = offsets.binary_search(&paragraph.range.end).unwrap();
@@ -100,6 +109,8 @@ pub(super) fn assert_oracle(
 
 #[test]
 fn unicode_uniform_root_summary_seals_control_fact_without_any_source_read() {
+    // Exact properties maintained by original open/edit traversal can certify the
+    // complete frozen root without a second scan or a UBA metadata file.
     for text in [
         "中文长段落",
         "中😀a\u{0301}\u{00ad}",
@@ -117,7 +128,7 @@ fn unicode_uniform_root_summary_seals_control_fact_without_any_source_read() {
             &MarkdownBidiCancellation::new(),
         );
         assert!(matches!(actual.resolution, Resolution::UniformZero(_)));
-        assert_eq!(bytes, 0); // 原打开/编辑遍历的精确属性不要求重复扫描Unicode正文。
+        assert_eq!(bytes, 0); // Existing exact open/edit properties require no repeated Unicode-text scan.
         assert_eq!(actual.storage_profile().source_borrow_max_bytes, 0);
         assert_oracle(text, BidiBaseDirection::Auto, &mut actual);
         document.reclaim_original_read_windows_for_test().unwrap();
@@ -132,6 +143,8 @@ fn unicode_uniform_root_summary_seals_control_fact_without_any_source_read() {
             (mapping.managed_resident_bytes(), mapping.reclaim_attempts()),
             before
         );
+        // The completed value remains the last source owner after the document and
+        // external clone drop; only its destruction may complete the original unmap.
         let receipt = actual.resource_observer();
         assert!(!receipt.snapshot().file_created && receipt.snapshot().cache_bytes == 0);
         drop(document);
@@ -145,6 +158,8 @@ fn unicode_uniform_root_summary_seals_control_fact_without_any_source_read() {
 
 #[test]
 fn six_inline_controls_at_start_middle_and_end_never_receive_absence_certificate() {
+    // All six existing Markdown controls defeat an absence certificate regardless of
+    // position, while independent UBA results must remain complete and unchanged.
     for scalar in ['\t', '\n', '\r', '\u{0085}', '\u{2028}', '\u{2029}'] {
         for text in [
             format!("{scalar}中文"),
@@ -219,11 +234,13 @@ fn other_unicode_controls_do_not_expand_the_existing_markdown_control_set() {
                 .is_some()
         );
         assert_oracle(&text, BidiBaseDirection::Auto, &mut actual);
-    } // 本事实仅排除原产品的六控制，不据Unicode Control大类擅自增加新交互。
+    } // This fact excludes only the product's six existing controls, without expanding interaction policy to all Unicode controls.
 }
 
 #[test]
 fn paged_and_rtl_negative_paths_preserve_complete_original_uba_results() {
+    // Ineligible direction/classes retain full Paged UBA. Proven multi-B level zero
+    // still preserves each actual paragraph and grants no whole-source control-free span.
     for (text, base) in [
         ("中文", BidiBaseDirection::RightToLeft),
         ("中文א", BidiBaseDirection::Auto),
@@ -254,6 +271,8 @@ fn paged_and_rtl_negative_paths_preserve_complete_original_uba_results() {
 
 #[test]
 fn partial_snapshot_cannot_claim_source_and_bound_partial_source_cannot_extend_coverage() {
+    // A Snapshot-only analysis has no captured layout-source authority. Binding the
+    // actual partial source permits only its original analyzed interval.
     let (_directory, document) = fixture("AA中文😀BB");
     let source = MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -284,7 +303,8 @@ fn partial_snapshot_cannot_claim_source_and_bound_partial_source_cannot_extend_c
             .source_range(),
         2..6
     );
-    // 低代理项数字范围可被控制/level事实覆盖，仍不能冒称其为可编辑或GCB端点。
+    // A level/control fact may cover numeric low-surrogate coordinates without
+    // certifying them as editable positions or GCB endpoints.
     assert!(
         actual
             .uniform_control_free_span(&authority, 5..6)
@@ -306,8 +326,9 @@ fn partial_snapshot_cannot_claim_source_and_bound_partial_source_cannot_extend_c
     ));
 }
 
-/// 部分分析从真实B正文中部开始时，snapshot游标可见的前缀不属于原分析权限。
-/// 同一流式证书仍必须排除末尾换行，并在取消后撤销已经就绪的正文跨度。
+/// When partial analysis starts inside a B paragraph, the Snapshot cursor's preceding
+/// text is outside the analyzed authority. Exclude the actual trailing control and
+/// revoke the completed body span after cancellation.
 #[test]
 fn scanned_partial_terminal_b_keeps_its_original_analysis_start_and_body_end() {
     for ending in ['\n', '\r', '\u{2029}'] {
@@ -386,8 +407,9 @@ fn scanned_partial_terminal_b_keeps_its_original_analysis_start_and_body_end() {
     }
 }
 
-/// table-flow实际按B段准备；末尾分隔符不是正文控制，TAB/LS则仍属于同段内部。
-/// 全程一字节/一标量/一元数据，不用证书字段或人工构造段范围替代实际Visible消费者。
+/// Table flow prepares actual B paragraphs: a trailing separator is outside the body,
+/// while internal TAB/LS remains inside it. One-unit quanta exercise the real Visible
+/// consumer without substituting certificate fields or fabricated paragraph ranges.
 #[cfg(feature = "s2-table-window-prototype")]
 #[test]
 fn visible_table_flow_keeps_terminal_b_outside_the_actual_control_free_body() {
@@ -433,7 +455,8 @@ fn visible_table_flow_keeps_terminal_b_outside_the_actual_control_free_body() {
                     ready = true;
                     break;
                 }
-                // 完整UBA和真实正文端点都未交付之前，不签开放Script所消费的无控制跨度。
+                // Open Script consumes no control-free span until both complete UBA
+                // and the actual body endpoints have been prepared.
                 assert!(matches!(
                     actual.uniform_control_free_span(&authority, start..content_end),
                     Ok(None) | Err(BidiError::UnpreparedRange)
@@ -461,7 +484,8 @@ fn visible_table_flow_keeps_terminal_b_outside_the_actual_control_free_body() {
                     .unwrap()
                     .is_none()
             );
-            // CRLF是一张GCB、两个真实B段；后继LF本身不能变为正文或扩大前一段的权限。
+            // CRLF is one GCB but two actual B paragraphs. The following LF cannot
+            // become body text or extend the preceding paragraph's authority.
             if ending == "\r\n" {
                 let next = content_end + 1;
                 let mut complete = false;
@@ -497,7 +521,8 @@ fn visible_table_flow_keeps_terminal_b_outside_the_actual_control_free_body() {
                     level.number()
                 );
             }
-            // 取消撤销同Source已完成的跨度；没有文字编辑、历史或磁盘变化可被后继准备吞掉。
+            // Cancellation revokes the same Source's completed span. Preparation has
+            // changed neither text/history nor the isolated file's bytes.
             cancel.cancel();
             assert!(matches!(
                 actual.uniform_control_free_span(&authority, start..content_end),
@@ -514,8 +539,9 @@ fn visible_table_flow_keeps_terminal_b_outside_the_actual_control_free_body() {
     }
 }
 
-/// 正式table-flow Composer必须在长中文B段完整SCX之前发首个真实有界样式请求。
-/// 不提供猜测字体或伪LineReady；这里核原开放入口，后继整形另由原字体/字形回归负责。
+/// The actual table-flow Composer must issue its first bounded style request before
+/// completing SCX for a long Chinese B paragraph. This checks the original open entry,
+/// not guessed fonts or LineReady; existing font/glyph regressions own later shaping.
 #[cfg(feature = "s2-table-window-prototype")]
 #[test]
 fn table_flow_terminal_b_opens_first_style_before_the_complete_long_scx() {
@@ -571,6 +597,8 @@ fn table_flow_terminal_b_opens_first_style_before_the_complete_long_scx() {
 
 #[test]
 fn subrange_span_returns_original_analyzed_paragraph_without_reborrowing_source() {
+    // Subrange facts retain the original analyzed paragraph and require no source
+    // reborrow after actual read-window reclaim.
     let (_directory, document) = fixture("AA中文😀BB");
     let source = MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -592,7 +620,7 @@ fn subrange_span_returns_original_analyzed_paragraph_without_reborrowing_source(
             .unwrap()
             .unwrap();
         assert_eq!(span.source_range(), query);
-        assert_eq!(span.paragraph_range(), 2..6); // 查询一unit或低代理项不缩小、更不扩大原分析段。
+        assert_eq!(span.paragraph_range(), 2..6); // One-unit and low-surrogate queries neither shrink nor extend the analyzed paragraph.
         assert_eq!(span.level(), 0);
     }
     assert_eq!(
@@ -606,6 +634,8 @@ fn subrange_span_returns_original_analyzed_paragraph_without_reborrowing_source(
 
 #[test]
 fn frozen_edit_source_and_sync_prepare_share_only_their_original_certificate() {
+    // Cooperative and synchronous preparation agree for the same capture. A later
+    // edit keeps the old immutable fact valid but cannot borrow its old authority.
     let (_directory, mut document) = fixture("中文😀abc");
     let source = MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -661,6 +691,8 @@ fn frozen_edit_source_and_sync_prepare_share_only_their_original_certificate() {
 
 #[test]
 fn real_source_eio_precedes_foreign_authority_cancel_and_ready_control_proof() {
+    // Fail actual original-window reclaim after successful preparation. Its first EIO
+    // must precede cancellation, foreign authority, and a previously reusable span.
     let (_directory, document) = fixture("中文😀");
     let source = MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -701,6 +733,8 @@ fn real_source_eio_precedes_foreign_authority_cancel_and_ready_control_proof() {
 
 #[test]
 fn pending_and_cancelled_uniform_never_publish_a_reusable_control_fact() {
+    // Whole-root UBA Ready and actual paragraph-body preparation are independent stages.
+    // Cancellation must revoke both before an unfinished body can publish a reusable span.
     let (_directory, document) = fixture("中文😀\n");
     let source = MarkdownLayoutTextSource::capture(&document);
     let authority = source.authority();
@@ -729,7 +763,7 @@ fn pending_and_cancelled_uniform_never_publish_a_reusable_control_fact() {
             .uniform_control_free_span(&authority, 0..1)
             .unwrap()
             .is_none()
-    ); // root的完整level0证明不代替尚未取得的真B端点或当前无控制范围。
+    ); // Complete root level zero does not supply missing B endpoints or the current control-free body range.
     cancel.cancel();
     assert!(matches!(
         paragraph.prepare_uniform_paragraph_range(&authority, 0, ONE),

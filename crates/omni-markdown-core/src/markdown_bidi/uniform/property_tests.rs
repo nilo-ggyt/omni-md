@@ -1,4 +1,5 @@
-//! Unicode根摘要只授予原Uniform语义；有限完整UBA oracle与实际源/资源收据分别核验。
+//! Unicode root summaries grant only original Uniform semantics. Verify finite complete UBA
+//! oracles independently from actual Source and resource receipts.
 
 use super::*;
 use crate::{
@@ -34,6 +35,8 @@ fn preparation(
     MarkdownBidiPrepareJob,
     MarkdownBidiResourceObserver,
 ) {
+    // Bind the real captured payload before moving it into preparation. Matching text
+    // or a later document generation cannot replace that authority.
     let authority = source.authority();
     let (job, receipt) = MarkdownBidiPrepareJob::new_layout_source_observed(
         source,
@@ -49,6 +52,8 @@ fn fast(
     job: &mut MarkdownBidiPrepareJob,
     authority: &MarkdownLayoutTextAuthority,
 ) -> MarkdownBidiParagraph {
+    // Exact whole-root properties require no new Reader or Store work. Zero owned
+    // operation counts describe this path, not OS-wide resident-memory acceptance.
     let step = job.step(authority, ONE).unwrap();
     assert_eq!(step.status, MarkdownBidiPrepareStatus::Ready);
     assert_eq!(
@@ -74,11 +79,13 @@ fn unallocated(receipt: &MarkdownBidiResourceObserver) {
     let facts = receipt.snapshot();
     assert!(!facts.file_created && !facts.file_open && !facts.close_succeeded);
     assert_eq!((facts.cache_bytes, facts.peak_cache_bytes), (0, 0));
-    assert!(receipt.is_released()); // 没创建FD不同于创建后close，不能用合成关闭事件作收据。
+    assert!(receipt.is_released()); // Never creating an FD is distinct from closing one; no synthetic close receipt is valid.
 }
 
 #[test]
 fn complete_eligible_unicode_matches_original_uba_for_every_class_and_mixed_context() {
+    // Exercise eligible classes and mixed Unicode context through both public prepare
+    // paths. Zero levels and absence of the six Markdown controls are separate facts.
     for text in [
         "中",
         "😀",
@@ -160,7 +167,7 @@ fn actual_b_ranges_and_ineligible_classes_preserve_original_uba_semantics() {
                 assert_eq!((first.bytes, first.scalars, first.metadata_ops), (0, 0, 0));
                 let mut actual = job.take_ready(&authority).unwrap().unwrap();
                 control_tests::assert_oracle(text, base, &mut actual);
-                continue; // 新表示只省层级表；原每个B范围及L1/L2仍由同一个完整oracle核验。
+                continue; // Only the level table is avoided; the same full oracle still checks every actual B range and L1/L2 result.
             }
             assert_eq!(first.status, MarkdownBidiPrepareStatus::Pending);
             assert!(job.take_ready(&authority).unwrap().is_none());
@@ -189,6 +196,8 @@ fn actual_b_ranges_and_ineligible_classes_preserve_original_uba_semantics() {
 
 #[test]
 fn partial_unicode_ranges_never_reuse_full_root_summary_or_bypass_one_byte_budget() {
+    // A partial range cannot inherit a complete-root certificate, even if it excludes
+    // the root's RTL or B suffix. Observe the actual Reader through one-byte polls.
     for (text, source, bytes) in [
         ("甲中文乙", 1..3, 3..9),
         ("א中文ש", 1..3, 2..8),
@@ -216,7 +225,7 @@ fn partial_unicode_ranges_never_reuse_full_root_summary_or_bypass_one_byte_budge
             reads += work.bytes;
             if turn == 0 {
                 assert!(result.is_pending());
-                assert_eq!(reads, 1); // 即使整root可证明或范围恰好排除RTL/B，也必须真实扫描局部源。
+                assert_eq!(reads, 1); // A proven full root or excluded RTL/B tail does not eliminate the real partial-source scan.
             }
             if let Poll::Ready(result) = result {
                 assert!(result.unwrap().is_some());
@@ -231,6 +240,8 @@ fn partial_unicode_ranges_never_reuse_full_root_summary_or_bypass_one_byte_budge
 
 #[test]
 fn canonical_certificate_matches_the_unchanged_reader_on_complete_unicode_ranges() {
+    // Keep the unchanged scanner as an independent differential baseline. Compare
+    // completed certificate facts, without interpreting Pending as a declined certificate.
     for text in [
         "",
         "中文😀e\u{301}",
@@ -272,9 +283,9 @@ fn canonical_certificate_matches_the_unchanged_reader_on_complete_unicode_ranges
         }
         let original_fact = observed.expect("原Reader必须真实完成，不能把Pending视为None");
         if original_fact.is_some() {
-            assert_eq!(bytes, text.len()); // 独立旧路径确实读完整源，与摘要快路的零读取区别计量。
+            assert_eq!(bytes, text.len()); // The independent scanner actually read the full source, unlike the zero-read aggregate path.
         } else {
-            assert!(bytes > 0); // 遇到原拒绝类可以提前停，不能要求它为测试继续读后缀。
+            assert!(bytes > 0); // The scanner may stop at an ineligible class without reading an unnecessary suffix for this test.
         }
         let gate = Gate::new(&snapshot, MarkdownBidiCancellation::new());
         let mut candidate = Box::pin(certify_prepared(
@@ -307,7 +318,7 @@ fn actual_four_mebibyte_unicode_paragraph_uses_no_second_source_scan_and_release
     let mut file = std::fs::File::create(&path).unwrap();
     let chunk = "中文😀 ".repeat(372);
     for _ in 0..1024 {
-        file.write_all(chunk.as_bytes()).unwrap(); // 有限≤4KiB写块，真实大文件不先组装全文String。
+        file.write_all(chunk.as_bytes()).unwrap(); // Bounded blocks at most 4 KiB create the real large file without a complete String.
     }
     file.write_all(&[b'a'; 4096]).unwrap();
     drop(file);
@@ -337,6 +348,8 @@ fn actual_four_mebibyte_unicode_paragraph_uses_no_second_source_scan_and_release
     assert_eq!(span.source_range(), 0..length);
     assert_eq!(span.paragraph_range(), 0..length);
     unallocated(&receipt);
+    // Both the completed value and its preparation owner must leave before the source
+    // payload and actual original mapping can finish releasing.
     drop((actual, job));
     assert!(payload.payload_released());
     assert!(mapping.unmap_succeeded() && mapping.mapped_bytes() == 0 && !mapping.failed());
@@ -344,6 +357,8 @@ fn actual_four_mebibyte_unicode_paragraph_uses_no_second_source_scan_and_release
 
 #[test]
 fn frozen_unicode_root_and_undo_never_authorize_changed_or_foreign_sources() {
+    // Undo restores text content without restoring the previous capture's identity.
+    // Old immutable proof remains usable only with its own original Source authority.
     let (_directory, mut document) = fixture("中文😀 (123)");
     let old = MarkdownLayoutTextSource::capture(&document);
     let (authority, mut job, _) = preparation(
@@ -391,6 +406,8 @@ fn frozen_unicode_root_and_undo_never_authorize_changed_or_foreign_sources() {
 
 #[test]
 fn cached_unicode_summary_respects_cancellation_and_original_eio_priority() {
+    // Test source failure both before and after actual Ready. Reclaim EIO must precede
+    // cancellation, mismatched authority, and reusable cached control facts.
     for ready in [false, true] {
         let (_directory, document) = fixture("中文😀");
         let source = MarkdownLayoutTextSource::capture(&document);

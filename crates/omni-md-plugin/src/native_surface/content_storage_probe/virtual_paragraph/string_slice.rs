@@ -1,4 +1,7 @@
-//! NSString公开primitive的真实UTF16子范围视图；每次bulk完整转发原字符串并保留原计量。
+//! Actual UTF-16 subrange views over public NSString primitives in the synthetic reference
+//! experiment. Forward each complete bulk request to the original string and its diagnostics.
+//! The original live adapter may fill failed reads with 0xfffd. Ticket checks here validate
+//! identity/state, not a post-read Core Source-health receipt; this is no default lazy-render proof.
 
 use super::*;
 
@@ -9,51 +12,53 @@ pub(super) struct VirtualStringSliceIvars {
 }
 
 define_class!(
-    // SAFETY: 实现NSString要求的length和characterAtIndex:，bulk与substring仍遵守原UTF16单位契约。
-    // 自定义对象不保存正文，全部字符通过原NSString的真实global索引读取。
+    // SAFETY: Implements required NSString length/characterAtIndex: while preserving UTF-16
+    // bulk/substring contracts. Stores no text; every character uses the original string's actual global index.
     #[unsafe(super = NSString)]
     #[thread_kind = MainThreadOnly]
     #[ivars = VirtualStringSliceIvars]
     pub(super) struct SyntheticVirtualStringSlice;
 
-    // SAFETY: NSObject协议无额外义务；所有源访问及释放沿原主线程图。
+    // SAFETY: No additional NSObject obligations; Source access and release stay on the original main-thread graph.
     unsafe impl NSObjectProtocol for SyntheticVirtualStringSlice {}
 
     impl SyntheticVirtualStringSlice {
         #[unsafe(method(length))]
         fn slice_length(&self) -> NSUInteger {
             let _ticket = self.ivars().binding.ticket();
-            self.ivars().slice.length // 真实slice长度；不按viewport缩短，也不伪装为原全篇长度。
+            self.ivars().slice.length // Actual slice length, neither shortened to a viewport nor relabeled as the entire original Source.
         }
 
         #[unsafe(method(characterAtIndex:))]
         fn slice_character(&self, index: NSUInteger) -> unichar {
             let global = self.ivars().slice.index(index).unwrap_or_else(|| throw_virtual_range());
             self.ivars().binding.checked("virtual.string_character", || {
-                self.ivars().source.characterAtIndex(global) // 单位原样保留，包括单独surrogate；不转char。
+                self.ivars().source.characterAtIndex(global) // Preserve the actual unit, including a lone surrogate; do not convert it to Rust char.
             })
         }
 
         #[unsafe(method(getCharacters:range:))]
         /// # Safety
-        /// destination须在本同步调用期间可写range.length个UTF16单位。
+        /// destination must be writable for range.length UTF-16 units during this synchronous call.
         unsafe fn slice_characters_range(&self, destination: NonNull<unichar>, range: NSRange) {
             let global = self.ivars().slice.subrange(range.location, range.length)
                 .unwrap_or_else(|| throw_virtual_range());
             self.ivars().binding.checked("virtual.string_bulk", || {
-                // SAFETY: 已证明local/global范围长度相同且在原source内；原primitive完整写入caller缓冲。
-                // 直接转发原字符串，原string_read_diagnostic仍计真实global请求，wholebulk不被隐藏/截断。
+                // SAFETY: Local/global ranges have equal validated lengths inside the original
+                // Source; its primitive fills the caller buffer. Forward the entire request so
+                // original read diagnostics still observe real whole-bulk calls, without truncation.
                 unsafe { self.ivars().source.getCharacters_range(destination, NSRange::new(global.start, global.length)) };
             });
         }
 
         #[unsafe(method(getCharacters:))]
         /// # Safety
-        /// destination须在本同步调用期间可写本slice真实length个UTF16单位。
+        /// destination must be writable for this slice's actual UTF-16 length during this synchronous call.
         unsafe fn slice_all_characters(&self, destination: NonNull<unichar>) {
             let slice = self.ivars().slice;
             self.ivars().binding.checked("virtual.string_bulk", || {
-                // SAFETY: caller请求整个真实slice；原global范围与该slice长度完全相同，仍完整执行原bulk。
+                // SAFETY: Caller requests the whole actual slice, whose global range has the same
+                // complete length. This reference path does not impose a viewport read budget.
                 unsafe { self.ivars().source.getCharacters_range(destination, NSRange::new(slice.start, slice.length)) };
             });
         }
@@ -64,7 +69,8 @@ define_class!(
             let count = self.ivars().binding.counts.string_copy_entries.get();
             if count < 4 && super::super::receiver_observation_requested() {
                 self.ivars().binding.counts.string_copy_entries.set(count + 1);
-                // 首ticket前仅观察真实copy入口；同票全部slice共用四条预算，不添加正文或Native getter。
+                // Observe the actual copy entry before its first ticket load. All slices share
+                // four log entries, with no additional text access or Native getter.
                 let slice = self.ivars().slice;
                 eprintln!(
                     "content_storage_probe stage=virtual_string_copy_entry call={} global_location={} global_length={} synthetic_only=true read_only=true parity=false diagnostic_formal=false",
@@ -72,7 +78,8 @@ define_class!(
                 );
             }
             self.ivars().binding.checked("virtual.string_copy", || self.retain())
-            // copy家族移交这一个+1；只读值不创建完整字符副本，也没有第二次retain。
+            // Copy convention transfers this one +1; this read-only value creates neither a full
+            // character copy nor another retain. It does not prove framework-wide absence of copies.
         }
 
         #[unsafe(method_id(substringWithRange:))]
@@ -85,7 +92,7 @@ define_class!(
         #[unsafe(method_family = none)]
         fn slice_substring_from(&self, index: NSUInteger) -> Retained<NSString> {
             let length = self.ivars().slice.length.checked_sub(index).unwrap_or_else(|| throw_virtual_range());
-            self.requested_substring(NSRange::new(index, length)) // 不借super先复制整个值再裁切。
+            self.requested_substring(NSRange::new(index, length)) // Do not ask super to copy the complete value before slicing it.
         }
 
         #[unsafe(method_id(substringToIndex:))]
@@ -103,9 +110,11 @@ impl SyntheticVirtualStringSlice {
         slice: Utf16Slice,
         mtm: MainThreadMarker,
     ) -> Result<Retained<NSString>, ProviderFailure> {
+        // Validate this actual global view under the original read-only ticket before publishing
+        // any native object. The source string itself retains no live canonical document owner.
         let ticket = binding.ticket();
         if Utf16Slice::new(slice.start, slice.length, ticket.key.length) != Some(slice) {
-            return Err(ProviderFailure::Range); // 不发布溢出或超原doc范围的虚拟字符串。
+            return Err(ProviderFailure::Range); // Never publish an overflowing or out-of-original-document virtual string.
         }
         let allocated = ticket.native("virtual.string_alloc", || {
             Self::alloc(mtm).set_ivars(VirtualStringSliceIvars {
@@ -114,18 +123,21 @@ impl SyntheticVirtualStringSlice {
                 slice,
             })
         })?;
-        // SAFETY: 必需primitive和ivars已初始化；公开NSString子类只调用父类init，不传完整正文。
+        // SAFETY: Required primitives and ivars are initialized. The public NSString subclass
+        // calls superclass init without supplying a complete text argument.
         let value: Retained<Self> = ticket.native("virtual.string_init", || unsafe {
             msg_send![super(allocated), init]
         })?;
         if !std::ptr::eq(value.class(), Self::class()) {
-            return Err(ProviderFailure::Graph); // 不访问class-cluster意外替代对象的Rust ivars。
+            return Err(ProviderFailure::Graph); // Do not access Rust ivars after unexpected class-cluster object replacement.
         }
         binding.include_owned(&ticket, "editor.virtual_paragraph.string_slice", &value)?;
         Ok(value.into_super())
     }
 
     fn requested_substring(&self, range: NSRange) -> Retained<NSString> {
+        // Receiver bounds remain independent of the shared original Source. Exact full-range
+        // requests retain this value; partial requests create one directly rooted Source view.
         let ticket = self.ivars().binding.ticket();
         let slice = self
             .ivars()
@@ -147,7 +159,7 @@ impl SyntheticVirtualStringSlice {
                 })
                 .unwrap_or_else(|_| throw_virtual_contract());
             Self::create(Rc::clone(&self.ivars().binding), source, slice, mtm)
-                .unwrap_or_else(|_| throw_virtual_contract()) // 新对象仍指向原source，不串接一串substring owners。
+                .unwrap_or_else(|_| throw_virtual_contract()) // The new object refers directly to the original Source, without a chain of parent substring owners.
         }
     }
 }

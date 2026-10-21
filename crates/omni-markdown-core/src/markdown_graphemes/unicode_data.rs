@@ -1,5 +1,5 @@
-//! 自动生成的Unicode18静态属性；生成器逐文件核SHA256，未包含正文缓存。
-//! 上游属性遵守LICENSE-UNICODE；生成过程不采用宿主Rust版本的Unicode属性。
+//! Generated Unicode 18 static properties; the generator verifies each input SHA256.
+//! Upstream properties retain LICENSE-UNICODE. No document cache or host-Rust Unicode lookup is used.
 
 // 18.0.0-auxiliary-GraphemeBreakProperty.txt SHA256 0839dcb79e4ac639ecd538b1abf7c9d22e3f9dd265b7e182d33627aa4d75b45a
 pub(super) static GCB: &[(u32, u32, u8)] = &[

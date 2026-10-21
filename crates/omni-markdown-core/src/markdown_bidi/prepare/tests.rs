@@ -1,4 +1,4 @@
-//! 细量子以独立有限UBA结果作oracle；资源断言来自真实FD/页与原backing析构收据。
+//! Compare fine quanta with an independent finite UBA oracle; release assertions observe actual FD/pages and original backing destruction.
 use super::*;
 use crate::{MarkdownDocumentBuffer, MarkdownLayoutTextAuthority, MarkdownLayoutTextSource};
 use unicode_bidi::utf16::BidiInfo;
@@ -10,6 +10,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new(text: &str) -> Self {
+        // A private synthetic file enters the actual document/immutable Source graph; no user vault participates in these writes.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("prepare.md");
         std::fs::write(&path, text).unwrap();
@@ -38,6 +39,7 @@ impl Fixture {
 }
 
 fn assert_quantum(step: MarkdownBidiPrepareStep, budget: MarkdownBidiPrepareBudget) {
+    // Preserve the existing logical-operation accounting checks; these are not syscall counts, UI latency, or whole-product RSS.
     assert!(step.bytes <= budget.bytes);
     assert!(step.scalars <= budget.scalars);
     assert!(step.metadata_ops <= budget.metadata_ops);
@@ -53,7 +55,7 @@ fn complete(
     authority: &MarkdownLayoutTextAuthority,
     budget: MarkdownBidiPrepareBudget,
 ) -> (MarkdownBidiParagraph, usize) {
-    // 有限合成输入有明确防挂上界；达到上界必须失败，不能把仍未完成当成Ready。
+    // Finite synthetic input has an explicit hang bound; reaching it fails instead of treating unfinished work as Ready.
     for polls in 1..2_000_000 {
         let progress = job.step(authority, budget).unwrap();
         assert_quantum(progress, budget);
@@ -66,7 +68,7 @@ fn complete(
 }
 
 fn assert_oracle(text: &str, base: BidiBaseDirection, actual: &mut MarkdownBidiParagraph) {
-    assert!(text.chars().count() <= 4096); // 只允许此测试oracle建立有限完整数组。
+    assert!(text.chars().count() <= 4096); // Only this explicitly finite test oracle may construct complete arrays.
     let units: Vec<u16> = text.encode_utf16().collect();
     let oracle = BidiInfo::new_with_data_source(
         &UnicodeBidiData,
@@ -79,6 +81,7 @@ fn assert_oracle(text: &str, base: BidiBaseDirection, actual: &mut MarkdownBidiP
     }
     assert_eq!(actual.actual_paragraph_count(), oracle.paragraphs.len());
     let mut offsets = Vec::new();
+    // Compare actual scalar visual order and each L1-adjusted level; UTF16 continuation records must not become independent visible characters.
     let mut offset = 0;
     for scalar in text.chars() {
         offsets.push(offset);
@@ -117,6 +120,7 @@ fn assert_oracle(text: &str, base: BidiBaseDirection, actual: &mut MarkdownBidiP
 
 #[test]
 fn one_unit_quanta_preserve_nested_backfill_and_independent_uba_oracle() {
+    // Resume the same UBA rules under several tiny quotas, including nested isolate/bracket backfill, then compare complete actual output.
     for text in [
         "",
         "中😀 A123\u{0301}\n",
@@ -162,8 +166,8 @@ fn one_unit_quanta_preserve_nested_backfill_and_independent_uba_oracle() {
 #[test]
 fn source_quota_one_does_not_read_a_window_or_end_an_incomplete_scalar() {
     let mut text = "中😀\u{0301}".repeat(64);
-    // 完整root可零读取证明level0；真实LF位置仍须同源端点游标逐byte取得，
-    // 一byte量子不能把半个中文或emoji当完整scalar，也不能先借完整叶再报一byte。
+    // A complete root may prove level zero without reads; its actual LF position still requires the same-Source endpoint cursor.
+    // A one-byte quantum cannot finish half a CJK/emoji scalar or borrow a complete leaf and report only one byte.
     text.push('\n');
     let fixture = Fixture::new(&text);
     let mut job = fixture.job(BidiBaseDirection::Auto, &MarkdownBidiCancellation::new());
@@ -193,7 +197,7 @@ fn source_quota_one_does_not_read_a_window_or_end_an_incomplete_scalar() {
             if step.ready {
                 break;
             }
-            assert!(polls < 2_000_000); // 原有限源必须实际结束，不把不断Pending冒充成功。
+            assert!(polls < 2_000_000); // The original finite Source must actually finish; perpetual Pending is not success.
         }
         assert!(incomplete_scalar);
         (actual, polls)
@@ -204,7 +208,7 @@ fn source_quota_one_does_not_read_a_window_or_end_an_incomplete_scalar() {
         assert_eq!(first.source_borrow_max_bytes, 1);
         assert_eq!(first.status, MarkdownBidiPrepareStatus::Pending);
         assert!(job.take_ready(&authority).unwrap().is_none());
-        complete(&mut job, &authority, budget) // 未装配摘要快路时，原Reader的真实UTF8半scalar合同照旧。
+        complete(&mut job, &authority, budget) // Without the summary fast path, retain the original Reader's actual incomplete-UTF8 contract.
     };
     assert!(polls >= text.len() - 1);
     assert_eq!(
@@ -219,6 +223,7 @@ fn source_quota_one_does_not_read_a_window_or_end_an_incomplete_scalar() {
 
 #[test]
 fn dropping_pending_future_after_real_page_allocation_releases_original_owners() {
+    // Reach the actual first allocated page through public progress/resource facts, then Drop the still-pending future and its real owners.
     let fixture = Fixture::new("אב\u{2068}12😀\u{2069}Tail");
     let source_observer = fixture.source.resource_observer();
     let mapping = fixture.document.original_backing_observer().unwrap();
@@ -239,7 +244,7 @@ fn dropping_pending_future_after_real_page_allocation_releases_original_owners()
         if resource.cache_bytes == store::PAGE_BYTES {
             assert!(resource.file_open && !resource.close_succeeded);
             assert!(!source_observer.payload_released());
-            drop(job); // 实际Future局部Store先析构；未完成也不能保留FD、页或Source。
+            drop(job); // Destroy the actual future-local Store; unfinished work must not retain its FD, pages, or Source.
             let after = receipt.snapshot();
             assert!(after.close_succeeded && !after.file_open && after.cache_bytes == 0);
             assert!(receipt.is_released());
@@ -253,6 +258,7 @@ fn dropping_pending_future_after_real_page_allocation_releases_original_owners()
 
 #[test]
 fn cancellation_before_during_and_after_preparation_is_permanent_and_resource_complete() {
+    // Cover cancellation before allocation, with a real pending page, and after actual Ready; none may retain a publishable candidate or owned metadata.
     for phase in 0..3 {
         let fixture = Fixture::new("אב\u{2068}12😀\u{2069}Tail");
         let cancel = MarkdownBidiCancellation::new();
@@ -303,7 +309,7 @@ fn cancellation_before_during_and_after_preparation_is_permanent_and_resource_co
                 job.take_ready(&authority),
                 Err(BidiError::Cancelled)
             ));
-            assert!(receipt.is_released()); // 失败入口本身已Drop原Future/Ready，不必等外层job销毁。
+            assert!(receipt.is_released()); // The failure entry already dropped the original future/Ready owner, without waiting for the outer Job to die.
             drop(job);
         }
         assert!(receipt.is_released());
@@ -315,6 +321,7 @@ fn cancellation_before_during_and_after_preparation_is_permanent_and_resource_co
 
 #[test]
 fn original_source_error_dominates_foreign_ticket_cancel_and_ready_hits() {
+    // Both pending and cached-Ready paths must observe the original actual Source errno before a foreign authority or later cancellation.
     for ready in [false, true] {
         let fixture = Fixture::new("אב😀Tail");
         let cancel = MarkdownBidiCancellation::new();
@@ -341,7 +348,7 @@ fn original_source_error_dominates_foreign_ticket_cancel_and_ready_hits() {
             )
             .unwrap();
         }
-        // 原Doc真实读入后驱逐失败，不能用尚未触发的测试flag冒充实际errno。
+        // Perform an actual source read before failing reclamation; an untriggered test flag cannot stand in for an observed errno.
         fixture.source.visit_byte_range(0..1, |_| Ok(())).unwrap();
         fixture.document.fail_next_original_reclaim_for_test();
         assert_eq!(
@@ -370,6 +377,7 @@ fn original_source_error_dominates_foreign_ticket_cancel_and_ready_hits() {
 
 #[test]
 fn partial_actual_metadata_write_failure_never_becomes_ready_or_later_cancelled() {
+    // Retain the existing real-prefix-write failure seam and verify that its stable Storage cause survives later cancellation and repeated calls.
     let fixture = Fixture::new("אב (12😀) Tail");
     let cancel = MarkdownBidiCancellation::new();
     let mut job = fixture.job(BidiBaseDirection::Auto, &cancel);
@@ -415,6 +423,7 @@ fn partial_actual_metadata_write_failure_never_becomes_ready_or_later_cancelled(
 
 #[test]
 fn foreign_or_bad_budget_revokes_pending_and_empty_ready_still_checks_source() {
+    // Wrong authority and unusable quota are permanent failures; an actually empty completed input still retains original cancellation checks.
     let fixture = Fixture::new("אב😀");
     let mut job = fixture.job(BidiBaseDirection::Auto, &MarkdownBidiCancellation::new());
     let foreign = MarkdownLayoutTextSource::capture(&fixture.document).authority();
@@ -470,6 +479,7 @@ fn foreign_or_bad_budget_revokes_pending_and_empty_ready_still_checks_source() {
 
 #[test]
 fn original_source_moved_to_worker_and_pending_future_dropped_before_join_releases_mapping() {
+    // Construct the non-Send Job inside its actual worker, return only finite release observations, and join before checking final Source unmap.
     let fixture = Fixture::new("אב\u{2068}12😀\u{2069}Tail");
     let mapping = fixture.document.original_backing_observer().unwrap();
     let source_observer = fixture.source.resource_observer();
@@ -497,7 +507,7 @@ fn original_source_moved_to_worker_and_pending_future_dropped_before_join_releas
                 MarkdownBidiPrepareStatus::Pending
             );
         }
-        drop(job); // Future在创建它的worker内真实销毁，不将!Send job跨线程搬运。
+        drop(job); // Destroy the future in the worker that created it; no non-Send Job crosses threads.
         receipt
     });
     let receipt = worker.join().unwrap();
@@ -509,6 +519,7 @@ fn original_source_moved_to_worker_and_pending_future_dropped_before_join_releas
 #[cfg(feature = "s2-table-window-prototype")]
 #[test]
 fn draft_content_revocation_stops_metadata_only_quantum_before_cancellation() {
+    // Prepare an actual certified cell draft, reach metadata-only work, then change its contentSerial through the public edit path.
     use crate::{
         MarkdownTextSelection,
         markdown_document_buffer::{MarkdownTableWindowStep, MarkdownTableWindowTarget},
@@ -568,7 +579,7 @@ fn draft_content_revocation_stops_metadata_only_quantum_before_cancellation() {
             break;
         }
     }
-    assert!(metadata_only && receipt.snapshot().file_open); // 不按计时猜测，确已转入原元数据阶段。
+    assert!(metadata_only && receipt.snapshot().file_open); // Actual counters establish metadata work, without guessing the phase from elapsed time.
     let edit = document.capture_cell_draft_edit(&draft).unwrap();
     document
         .replace_cell_draft(edit, 0..1, "z", MarkdownTextSelection::caret(1), None)
@@ -597,10 +608,11 @@ fn draft_content_revocation_stops_metadata_only_quantum_before_cancellation() {
 #[test]
 #[ignore = "需OMNI_BIDI_PREPARE_PROFILE指向进程启动前预写的实际合成长文件"]
 fn actual_file_profile_reports_each_quantum_and_final_resource_release() {
+    // This explicitly ignored component profile requires a prewritten isolated fixture; a default run does not execute it or establish product acceptance.
     let path = std::env::var_os("OMNI_BIDI_PREPARE_PROFILE").expect("必须指定实际预写文件");
     let path = std::path::Path::new(&path);
     let length = usize::try_from(std::fs::metadata(path).unwrap().len()).unwrap();
-    // 被测子进程只打开原生产构造器，不读取或生成另一个完整String/Vec输入。
+    // Use the original production constructor without reading or generating another complete String/Vec input.
     let document =
         MarkdownDocumentBuffer::open(path, u64::try_from(length.max(1)).unwrap()).unwrap();
     let source = MarkdownLayoutTextSource::capture(&document);
@@ -617,7 +629,7 @@ fn actual_file_profile_reports_each_quantum_and_final_resource_release() {
     )
     .unwrap();
     let receipt = job.resource_observer();
-    drop(document); // 后续源保活只能来自真实Prepare/结果，所有收据均为纯原子观察。
+    drop(document); // Only actual Prepare/result owners may now retain Source; observations contain atomic facts only.
     let budget = MarkdownBidiPrepareBudget {
         bytes: 4096,
         scalars: 1024,

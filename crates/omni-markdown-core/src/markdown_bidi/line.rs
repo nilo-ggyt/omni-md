@@ -1,6 +1,6 @@
 // Copyright 2015 The Servo Project Developers.
 // L1 adapted from unicode-bidi 0.3.18 lib.rs. SPDX-License-Identifier: MIT OR Apache-2.0
-//! 真实软行的L1只写可复用磁盘scratch；L2按有限level树输出run，不创建整行indexMap。
+//! L1 for an actual soft line writes reusable disk scratch; L2 emits runs through a bounded level tree, without a whole-line index map.
 
 use super::*;
 
@@ -16,6 +16,7 @@ pub(super) fn visit(
     }
     let mut low = 0;
     let mut high = paragraph_count;
+    // Locate the actual containing paragraph in the original metadata; a single L1 operation cannot cross another paragraph's base.
     let paragraph = loop {
         if low >= high {
             return Err(BidiError::InvalidRange);
@@ -32,8 +33,9 @@ pub(super) fn visit(
     };
     if line.end > paragraph.end {
         return Err(BidiError::InvalidRange);
-    } // 一次L1不能跨越另一个UBA段的base。
+    } // One L1 operation must not cross a different UBA paragraph's base.
     let mut at = line.start;
+    // Copy resolved levels into reusable line scratch, leaving the immutable paragraph analysis available to other actual lines.
     while at < line.end {
         let text = Text::read(store, at)?;
         set(store, at, text.level)?;
@@ -48,6 +50,7 @@ pub(super) fn visit(
         let end = at + text.scalar_len()?;
         match text.original {
             B | S => {
+                // Reset the separator and its preceding resettable sequence to the actual paragraph base.
                 let from = *reset_from.get_or_insert(at);
                 for unit in from..end {
                     set(store, unit, paragraph.base)?;
@@ -58,6 +61,7 @@ pub(super) fn visit(
                 reset_from.get_or_insert(at);
             }
             RLE | LRE | RLO | LRO | PDF | BN => {
+                // X9-removed controls inherit the preceding resolved level while remaining part of the trailing resettable sequence.
                 reset_from.get_or_insert(at);
                 for unit in at..end {
                     set(store, unit, previous)?;
@@ -69,11 +73,12 @@ pub(super) fn visit(
         at = end;
     }
     if let Some(from) = reset_from {
+        // A real line end applies L1 to its trailing whitespace/formatting sequence, not just a source-buffer or item endpoint.
         for unit in from..line.end {
             set(store, unit, paragraph.base)?;
         }
     }
-    // level树的高度严格≤127；只递归更高level，不按行长增长栈。
+    // Recurse only into higher levels; the level hierarchy bounds depth to 127 independently of the line's length.
     emit(store, line, source_start, &mut visit, 0)
 }
 
@@ -93,6 +98,7 @@ fn set(store: &mut Store, index: u32, level: u8) -> Result<(), BidiError> {
 }
 
 fn scalar_before(store: &mut Store, end: u32) -> Result<u32, BidiError> {
+    // Walk backward to the actual scalar head so a visual reversal never separates a surrogate pair.
     let last = end.checked_sub(1).ok_or(BidiError::CorruptMetadata)?;
     if Text::read(store, last)?.continuation() {
         last.checked_sub(1).ok_or(BidiError::CorruptMetadata)
@@ -108,6 +114,7 @@ fn emit(
     visit: &mut impl FnMut(MarkdownBidiRun),
     depth: u8,
 ) -> Result<(), BidiError> {
+    // The recursive state is a range and level depth only; glyph order is streamed to the caller rather than retained as an index inventory.
     if depth > 126 {
         return Err(BidiError::CorruptMetadata);
     }
@@ -118,6 +125,7 @@ fn emit(
         at += Text::read(store, at)?.scalar_len()?;
     }
     let reverse = minimum & 1 != 0;
+    // Reverse traversal at odd levels and recurse into contiguous higher-level groups, retaining actual global UTF16 source ranges.
     let mut cursor = if reverse { range.end } else { range.start };
     while if reverse {
         cursor > range.start

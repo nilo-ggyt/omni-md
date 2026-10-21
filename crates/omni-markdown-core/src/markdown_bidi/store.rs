@@ -1,4 +1,4 @@
-//! 匿名元数据文件与全表共享的固定页缓存；正文从不进入此文件。
+//! One anonymous metadata file and a fixed page cache shared by all tables; document text never enters this file.
 
 use std::fs::File;
 use std::os::fd::IntoRawFd;
@@ -28,7 +28,7 @@ struct Page {
     used: u64,
 }
 
-/// 先真实drop固定Box，再更新收据；Store析构顺序不会把仍存活的页报成已释放。
+/// Drop the actual fixed Box before recording release, so Store field destruction cannot report a still-live page as returned.
 struct PageBytes {
     bytes: Option<Box<[u8; PAGE_BYTES]>>,
     resources: Arc<ResourceState>,
@@ -67,7 +67,7 @@ impl Drop for PageBytes {
     }
 }
 
-/// 正常路径只转发公开positioned IO；测试故障也先执行真实前缀IO，绝不替算法计算结果。
+/// Forward actual positioned I/O; existing test failures perform real prefix I/O first and do not compute substitute algorithm results.
 struct Io {
     file: Option<File>,
     resources: Arc<ResourceState>,
@@ -90,7 +90,7 @@ impl Io {
     }
 
     fn with_resources(file: File, resources: Arc<ResourceState>) -> Self {
-        resources.file_acquired(); // 只有调用方已真正取得File所有权，才把原scope记为存在FD。
+        resources.file_acquired(); // Record an FD only after the caller has actually acquired File ownership for this scope.
         Self {
             file: Some(file),
             resources,
@@ -149,12 +149,12 @@ impl Drop for Io {
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
             let fd = file.into_raw_fd();
-            // SAFETY: 此处移出唯一匿名FD所有者，只close一次；没有映射或外部借用依赖该descriptor。
+            // SAFETY: Move out the sole anonymous FD owner and close exactly once; no mapping or external borrow depends on this descriptor.
             let result = unsafe { libc::close(fd) };
             let status = if result == 0 {
                 1
             } else {
-                // 紧邻真实close读取errno，任何其他系统调用都不能覆盖它；失败不猜FD已经关闭。
+                // Read errno immediately after actual close, before another syscall can replace it; do not guess that a failed close returned the FD.
                 -std::io::Error::last_os_error()
                     .raw_os_error()
                     .filter(|errno| *errno > 0)
@@ -168,7 +168,7 @@ impl Drop for Io {
 #[cfg(test)]
 pub(super) type FileObserver = MarkdownBidiResourceObserver;
 
-/// 所有表共用同一组页，不因阶段或表数量放大预算。文件只存类别、层级与坐标。
+/// All tables share one page set; stages/table count do not multiply the budget. The file stores only classes, levels, and coordinates.
 pub(super) struct Store {
     io: Io,
     pages: Vec<Page>,
@@ -202,11 +202,11 @@ impl Store {
         cancellation: MarkdownBidiCancellation,
         resources: Option<&Arc<ResourceState>>,
     ) -> Result<Self, BidiError> {
-        cancellation.check()?; // 在建立匿名FD之前拒绝已经取消的任务。
+        cancellation.check()?; // Reject an already cancelled task before creating the anonymous FD.
         let file = tempfile::tempfile()?;
         let io = match resources {
             Some(resources) => Io::with_resources(file, Arc::clone(resources)),
-            None => Io::new(file), // 旧入口仍仅在确实创建Paged存储时分配收据，Uniform没有额外分配。
+            None => Io::new(file), // This test constructor allocates observations only for actual Paged storage; Uniform adds no such owner.
         };
         Self::with_io_cancellable(capacity, budget, io, cancellation)
     }
@@ -230,7 +230,7 @@ impl Store {
         Ok(store)
     }
 
-    /// 只有Prepare内部持有未配满固定页的候选；在全部页初始化前没有对外Store或Ready。
+    /// Only Prepare owns a candidate with an incomplete fixed-page allocation; no external Store or Ready is published before all pages initialize.
     pub(super) fn new_prepared_empty(
         capacity: u32,
         budget: BidiMemoryBudget,
@@ -259,7 +259,7 @@ impl Store {
         if self.pages.len() == 1 {
             self.cancellation.first_page_allocated(self.io.observer());
         }
-        self.cancellation.check() // 原真实页分配后的取消点仍在，失败析构不发布候选。
+        self.cancellation.check() // Retain the post-allocation cancellation point; failure drops the actual page owner without publishing the candidate.
     }
 
     pub(super) fn prepared_page_count(&self) -> usize {
@@ -291,13 +291,13 @@ impl Store {
         mut io: Io,
         cancellation: MarkdownBidiCancellation,
     ) -> Result<Self, BidiError> {
-        cancellation.check()?; // FD创建期间收到取消时，局部Io在返回前真实释放。
+        cancellation.check()?; // If cancellation arrived while creating the FD, the local Io actually releases it before returning.
         let mut bases = [0; 5];
         let extent = u64::from(capacity)
             .checked_add(2)
             .and_then(|value| value.checked_mul(RECORD_BYTES))
             .ok_or(BidiError::CoordinateOverflow)?;
-        // 表之间留整页边界；set_len只建立稀疏文件长度，不分配正文或全表内存。
+        // Separate tables on page boundaries; set_len establishes sparse logical length, without allocating text or whole-table RAM.
         let stride = extent
             .checked_add(PAGE_BYTES as u64 - 1)
             .map(|value| value / PAGE_BYTES as u64 * PAGE_BYTES as u64)
@@ -307,15 +307,15 @@ impl Store {
                 .checked_mul(index as u64)
                 .ok_or(BidiError::CoordinateOverflow)?;
         }
-        // 构造失败前尚未存在可查询Store；IO owner在?失败时直接归还匿名fd，不发布部分对象。
+        // No queryable Store exists yet; a failing ? drops the I/O owner and returns its anonymous FD without publishing a partial object.
         io.set_len(
             stride
                 .checked_mul(bases.len() as u64)
                 .ok_or(BidiError::CoordinateOverflow)?,
         )?;
-        cancellation.check()?; // set_len错误先传播；只有真实IO成功后才检查随后取消。
+        cancellation.check()?; // Propagate set_len failure first; only successful actual I/O is followed by a new cancellation check.
         let pages = Vec::with_capacity(usize::from(budget.pages));
-        // 页数由构造时已经验证的硬预算决定；后续miss只能复用这些真实buffer。
+        // The already validated fixed budget sets page count; later misses can only reuse these actual buffers.
 
         Ok(Self {
             io,
@@ -333,13 +333,13 @@ impl Store {
         if self.poisoned {
             Err(BidiError::PoisonedMetadata)
         } else {
-            self.cancellation.check() // 既存metadata I/O poison保首因；取消不允许把任何cache命中重新授权。
+            self.cancellation.check() // Existing metadata poison precedes later cancellation; the original I/O cause was returned at failure, and cached hits stay revoked.
         }
     }
 
     fn offset(&self, table: Table, id: u32) -> Result<u64, BidiError> {
         if id > self.capacity {
-            return Err(BidiError::CorruptMetadata); // 错误ID不能跨越表边界访问另一个有效record。
+            return Err(BidiError::CorruptMetadata); // An invalid ID cannot cross a table boundary to access another valid record.
         }
         self.bases[table as usize]
             .checked_add(u64::from(id) * RECORD_BYTES)
@@ -347,7 +347,7 @@ impl Store {
     }
 
     fn page(&mut self, number: u64) -> Result<usize, BidiError> {
-        self.healthy()?; // poison连cache hit也拒绝，不能通过仍在RAM的片段绕过全表撤权。
+        self.healthy()?; // Poison rejects cached hits too; resident fragments cannot bypass whole-store revocation.
         self.clock = self
             .clock
             .checked_add(1)
@@ -355,7 +355,7 @@ impl Store {
         if let Some(index) = self.pages.iter().position(|page| page.number == number) {
             self.pages[index].used = self.clock;
             self.healthy()?;
-            return Ok(index); // hit不读文件，也不创建第二份页。
+            return Ok(index); // A hit neither reads the file nor creates another page copy.
         }
         let index = self
             .pages
@@ -365,6 +365,7 @@ impl Store {
             .map(|(index, _)| index)
             .ok_or(BidiError::InvalidBudget)?;
         let page = &mut self.pages[index];
+        // Flush the actual dirty victim before reuse; failure poisons all tables rather than exposing a mixture of old and new metadata.
         if page.dirty
             && let Err(error) = self
                 .io
@@ -374,10 +375,10 @@ impl Store {
             return Err(error.into());
         }
         self.cancellation.check()?;
-        // 开始覆盖buffer之前先撤销旧身份；即使短读只改了前缀，也不再有可命中的旧页。
+        // Revoke the old identity before overwriting its buffer; a short read cannot leave the partly changed old page as a valid hit.
         page.number = u64::MAX;
         page.dirty = false;
-        // 匿名文件已设真实逻辑长度；未写稀疏页也必须成功读满，短读不能被当成零元数据。
+        // The file has an actual logical extent; even unwritten sparse pages require a complete read, not a short read reinterpreted as zero metadata.
         if let Err(error) = self
             .io
             .read_page(page.bytes.as_mut_slice(), number * PAGE_BYTES as u64)
@@ -386,7 +387,7 @@ impl Store {
             return Err(error.into());
         }
         self.io.resources.page_loaded();
-        self.cancellation.check()?; // 已完成真实IO，但取消后仍不发布新的页身份。
+        self.cancellation.check()?; // Actual I/O completed, but cancellation still prevents publishing the new page identity.
         page.number = number;
         page.used = self.clock;
         page.dirty = false;
@@ -400,7 +401,7 @@ impl Store {
         let slot = self.page(offset / PAGE_BYTES as u64)?;
         let from = (offset % PAGE_BYTES as u64) as usize;
         let mut value = [0; 32];
-        // record和页长整除，不跨页；只复制32B元数据，借用在返回前结束。
+        // Fixed records divide the page and do not cross it; copy only 32 metadata bytes and end the page borrow before returning.
         value.copy_from_slice(&self.pages[slot].bytes[from..from + 32]);
         self.healthy()?;
         Ok(value)
@@ -424,7 +425,7 @@ impl Store {
     #[cfg(test)]
     pub(super) fn flush(&mut self) -> Result<(), BidiError> {
         self.healthy()?;
-        // 同一个页写入实现；Prepare另在每个dirty页之前消费真实资源操作预算。
+        // Use the same page writer; Prepare separately admits one resource operation before each actual dirty-page flush.
         for index in 0..self.pages.len() {
             self.flush_prepared_page(index)?;
         }
@@ -432,7 +433,7 @@ impl Store {
     }
 
     pub(super) fn cache_bytes(&self) -> usize {
-        // 这是已分配页payload的真实大小，不包含小型页目录、Rust栈或进程总footprint。
+        // Count actual allocated page payload only, excluding the small directory, Rust stack, and whole-process footprint/RSS.
         self.pages.len() * PAGE_BYTES
     }
 
@@ -474,7 +475,7 @@ pub(super) fn write_u32(bytes: &mut [u8; 32], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-/// 初始FSI与IRS暂停栈可深于显式level上限；其条目同样分页，不能误用125项截断。
+/// Initial FSI and suspended IRS stacks can exceed the explicit-level bound; page their entries too instead of truncating at 125.
 pub(super) struct DiskStack {
     depth: u32,
 }
@@ -495,6 +496,7 @@ impl DiskStack {
         last: u32,
     ) -> Result<(), BidiError> {
         let mut bytes = [0; 32];
+        // Commit the actual stack record before changing depth; a failed write must not expose an uninitialized top.
         write_u32(&mut bytes, 0, first);
         write_u32(&mut bytes, 4, last);
         store.write(Table::Stack, self.depth, bytes)?;
@@ -507,7 +509,7 @@ impl DiskStack {
 
     pub(super) fn top(&self, store: &mut Store) -> Result<Option<(u32, u32)>, BidiError> {
         let Some(index) = self.depth.checked_sub(1) else {
-            return Ok(None); // 空栈是合法段首/未匹配PDI，不读取不存在的record。
+            return Ok(None); // Empty stack is valid at paragraph start or unmatched PDI; do not read a nonexistent record.
         };
         let bytes = store.read(Table::Stack, index)?;
         Ok(Some((read_u32(&bytes, 0), read_u32(&bytes, 4))))
@@ -522,7 +524,7 @@ impl DiskStack {
     }
 
     pub(super) fn clear(&mut self) {
-        self.depth = 0; // 旧槽只含元数据，后继push覆盖；没有堆容量或源owner留在栈中。
+        self.depth = 0; // Old slots contain only metadata for later overwrite, without retained heap capacity or Source owners.
     }
 }
 
@@ -536,6 +538,7 @@ mod tests {
 
     #[test]
     fn production_receipt_waits_for_the_actual_fd_and_each_fixed_page_to_be_released() {
+        // Keep the original Store live after cancellation, then observe actual FD/Box destruction rather than treating revocation as release.
         let mut store = small_store();
         let observer = store.resource_observer();
         let live = observer.snapshot();
@@ -543,7 +546,7 @@ mod tests {
         assert_eq!((live.cache_bytes, live.peak_cache_bytes), (65536, 65536));
         store.write(Table::Text, 0, [7; 32]).unwrap();
         store.cancellation.cancel();
-        assert!(!observer.is_released()); // 取消只撤权限，活的原文件和页不能被报为已经归还。
+        assert!(!observer.is_released()); // Cancellation revokes authority; the still-live file/pages have not actually returned.
         drop(store);
         let actual = observer.snapshot();
         assert!(actual.file_created && !actual.file_open && actual.close_succeeded);
@@ -553,7 +556,7 @@ mod tests {
     }
 
     fn dirty_four_pages(store: &mut Store) {
-        // 各record相隔一个真实页；第一次miss后的四个页都含可辨认数据，下一miss必然淘汰旧页。
+        // Records are one actual page apart; four distinguishable dirty pages force the next miss to evict an original page.
         for page in 0..4 {
             store
                 .write(Table::Text, page * 512, [0xc0 + page as u8; 32])
@@ -577,7 +580,7 @@ mod tests {
             Err(BidiError::Cancelled)
         ));
         assert!(matches!(store.flush(), Err(BidiError::Cancelled)));
-        assert!(!observer.closed()); // 撤权不等于资源析构，原Store仍活着必须保留其真实FD。
+        assert!(!observer.closed()); // Revocation is not destruction; the live original Store still owns its actual FD.
         drop(store);
         assert!(observer.closed());
 
@@ -591,6 +594,7 @@ mod tests {
 
     #[test]
     fn partial_read_revokes_old_page_and_poison_rejects_even_untouched_cache_hits() {
+        // Retain the existing partial-I/O seam and private buffer checks, alongside actual failure and permanent public Store-access rejection.
         let mut store = small_store();
         dirty_four_pages(&mut store);
         store.flush().unwrap();
@@ -605,7 +609,7 @@ mod tests {
             .find(|page| page.number == u64::MAX)
             .unwrap();
         assert_eq!(&invalid.bytes[..8], &[0; 8]);
-        assert_eq!(&invalid.bytes[8..32], &[0xc0; 24]); // 真正覆盖了前缀，而非只返回一个合成Err。
+        assert_eq!(&invalid.bytes[8..32], &[0xc0; 24]); // Actual prefix bytes changed before the injected error; this is not only a returned synthetic Err.
         assert!(matches!(
             store.read(Table::Text, 0),
             Err(BidiError::PoisonedMetadata)
@@ -633,7 +637,7 @@ mod tests {
         let mut actual = [0; 32];
         store.io.file().read_exact_at(&mut actual, 0).unwrap();
         assert_eq!(&actual[..8], &[0xc0; 8]);
-        assert_eq!(&actual[8..], &[0; 24]); // 仅诊断私有元数据的真实部分落盘，不读任何源正文。
+        assert_eq!(&actual[8..], &[0; 24]); // Inspect only actual partial persistence of private metadata, without reading document text.
         assert!(matches!(
             store.read(Table::Text, 512),
             Err(BidiError::PoisonedMetadata)
@@ -643,6 +647,7 @@ mod tests {
 
     #[test]
     fn failed_final_flush_permanently_revokes_every_following_access() {
+        // Final-flush failure must revoke later reads/writes even while the old cache still holds bytes.
         let mut store = small_store();
         store.write(Table::Text, 0, [0x77; 32]).unwrap();
         store.io.fault = Some(IoFault::PartialWrite(4));
@@ -659,6 +664,7 @@ mod tests {
 
     #[test]
     fn successful_eviction_never_grows_the_real_page_payload_or_page_directory() {
+        // Preserve this existing private directory-stability regression; actual metadata eviction runs through the production writer and fixed buffers.
         let mut store = small_store();
         let directory = store.pages.as_ptr();
         let capacity = store.pages.capacity();
@@ -675,6 +681,7 @@ mod tests {
 
     #[test]
     fn failed_length_initialization_returns_no_store_and_closes_its_actual_descriptor() {
+        // Isolate descriptor-number reuse from parallel tests by waiting for the exact child test process; only its anonymous File is examined.
         const CHILD: &str = "OMNI_BIDI_INIT_IO_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -694,7 +701,7 @@ mod tests {
             Store::with_io(8, BidiMemoryBudget::default(), io),
             Err(BidiError::Storage(_))
         ));
-        // SAFETY: 子进程只有此测试，错误构造后没有新建fd；F_GETFD安全观察实际关闭，不访问已析构Rust对象。
+        // SAFETY: This child runs only this test and opens no replacement FD after failed construction; F_GETFD observes actual close without using a dropped Rust object.
         assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),

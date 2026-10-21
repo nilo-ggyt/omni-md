@@ -1,4 +1,5 @@
-//! 完整Uniform扫描封闭的控制事实；未完成Future不能把局部“未见控制”交给分项消费者。
+//! Control facts sealed by a complete original-range proof: exact full-root
+//! properties or a completed budgeted scan. An unfinished prefix is insufficient.
 
 use super::super::{BidiError, MarkdownBidiCancellation};
 use unicode_bidi::BidiClass;
@@ -9,6 +10,8 @@ enum InlineControls {
     Present,
 }
 
+// The original preparation owns either exact full-root facts or scan observations.
+// Downstream consumers can use them only after the complete proof is sealed.
 pub(in crate::markdown_bidi) struct UniformCertificate {
     #[cfg(feature = "paged-shaping-frontier")]
     controls: InlineControls,
@@ -19,6 +22,8 @@ pub(in crate::markdown_bidi) struct UniformCertificate {
 }
 
 impl UniformCertificate {
+    // Paragraph boundaries require the shaping frontier's completed source facts;
+    // builds without that consumer do not infer new boundaries from this owner.
     pub(in crate::markdown_bidi) fn has_paragraph_boundaries(&self) -> bool {
         #[cfg(feature = "paged-shaping-frontier")]
         {
@@ -37,8 +42,9 @@ impl UniformCertificate {
             controls: if properties.separators() == 0 {
                 InlineControls::Absent
             } else {
-                // 摘要只决定完整原范围的精确存在性；含TAB/LS等仍可Uniform，但不能
-                // 给ItemScan签无控制事实，避免把UBA类别当成Markdown控制策略。
+                // The summary proves exact presence over the complete original
+                // range. TAB/LS can still be Uniform, but cannot authorize a
+                // control-free ItemScan: UBA classes are not Markdown policy.
                 InlineControls::Present
             },
             paragraphs: properties.bidi_classes()
@@ -46,13 +52,17 @@ impl UniformCertificate {
                     unicode_bidi::BidiClass::B,
                 )
                 != 0,
-            // 六种Markdown控制中只有TAB和LS不是B；其它控制只有真实B段端点可排除。
-            // 这不声称FF/VT/SHY等不是GCB_Control，GCB与真实字体前沿照旧独立处理它们。
+            // Of the six Markdown inline separators, only TAB and LS are not B.
+            // The others can be excluded only at an actual B paragraph endpoint.
+            // This says nothing about FF/VT/SHY being GCB_Control: grapheme and
+            // font processing retain their independent responsibilities.
             interior_controls_absent: properties.separators() & ((1 << 0) | (1 << 4)) == 0,
         }
     }
 
     pub(super) fn clear() -> Self {
+        // Empty facts alone do not authorize sealing. The caller must establish
+        // an exact full-scope proof or complete the actual original-range scan.
         Self {
             #[cfg(feature = "paged-shaping-frontier")]
             controls: InlineControls::Absent,
@@ -66,11 +76,13 @@ impl UniformCertificate {
     pub(super) fn observe(&mut self, scalar: char, class: BidiClass) {
         #[cfg(feature = "paged-shaping-frontier")]
         {
-            // 同一完整Reader已解析这个scalar的UBA类别；末尾B仍属于原段，
-            // 不能因含换行就丢掉正文的零级事实，也不能把它误签为整段无控制。
+            // The same complete reader has resolved this scalar's UBA class.
+            // A trailing B remains part of the original paragraph: it does not
+            // erase zero-level content facts or prove the whole range control-free.
             self.paragraphs |= class == BidiClass::B;
-            // TAB和LS能位于同一B段内部；它们必须继续阻止正文无内联控制授权。
-            // CR/LF/NEL/PS的排除则只交给后继真实B游标的content_end，绝不猜末字符。
+            // TAB and LS can occur inside a B paragraph and must keep blocking
+            // control-free content authorization. Only the subsequent actual B
+            // cursor's content_end can exclude CR/LF/NEL/PS; do not guess a suffix.
             self.interior_controls_absent &= !matches!(scalar, '\t' | '\u{2028}');
         }
         #[cfg(feature = "paged-shaping-frontier")]
@@ -78,18 +90,21 @@ impl UniformCertificate {
             scalar,
             '\t' | '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}'
         ) {
-            // 集合精确对应原Markdown inline_control，不由UBA的S/B类别推断；
-            // U+2028等WS也有原生换行职责，而其它S/B并不自动取得产品控制语义。
+            // This exact set matches Markdown inline_control, not the UBA S/B
+            // classes. U+2028 is WS yet has native line-breaking duties; other
+            // S/B scalars do not automatically gain product control semantics.
             self.controls = InlineControls::Present;
         }
         #[cfg(not(feature = "paged-shaping-frontier"))]
-        let _ = (scalar, class); // 未启用分项快路时不新增控制事实或改变原UBA规则。
+        let _ = (scalar, class); // No itemization fast path means no extra facts or UBA changes.
     }
 
     pub(in crate::markdown_bidi) fn seal(
         self,
         cancellation: MarkdownBidiCancellation,
     ) -> UniformResolution {
+        // Transfer completed facts and the same cancellation authority together.
+        // A consumer must still check cancellation before using the resolution.
         UniformResolution {
             cancellation,
             #[cfg(feature = "paged-shaping-frontier")]
@@ -118,11 +133,15 @@ pub(in crate::markdown_bidi) struct UniformResolution {
 
 impl UniformResolution {
     pub(in crate::markdown_bidi) fn check(&self) -> Result<(), BidiError> {
+        // Completion does not detach a resolution from its original cancellation.
         self.cancellation.check()
     }
 
     #[cfg(feature = "paged-shaping-frontier")]
     pub(in crate::markdown_bidi) fn control_free(&self) -> bool {
+        // Whole-range authorization requires both no paragraph boundary and no
+        // Markdown inline separator; a control-free interior alone is weaker.
+        // This structural predicate does not replace entry Source/cancel guards.
         !self.paragraphs && matches!(self.controls, InlineControls::Absent)
     }
 }

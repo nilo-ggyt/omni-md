@@ -1,11 +1,12 @@
-//! 只有全冻结源Printable ASCII精确证明可构造此表示；每整数坐标都是原GCB，且无FD/页。
+//! Exact whole-frozen-source printable-ASCII proof authorizes this representation: every integer
+//! coordinate is an original GCB, without any file descriptor or index page.
 use super::*;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
-/// 原owner的真实close/Drop收据，只保一个原子位，不持Source、正文或伪造layout-index。
+/// Receipt for this owner's actual close/Drop, retaining one atomic flag and no Source, text, or dummy index.
 #[derive(Clone)]
 pub(in crate::markdown_graphemes) struct DenseObserver(Arc<AtomicBool>);
 impl DenseObserver {
@@ -19,6 +20,7 @@ pub(super) struct DenseIndex {
 }
 impl DenseIndex {
     pub(super) fn new(source_length: usize) -> Result<Self> {
+        // Include both BOF and actual EOF; overflow cannot be represented as a truncated boundary count.
         let count = source_length
             .checked_add(1)
             .ok_or(Error::CoordinateOverflow)?;
@@ -28,6 +30,8 @@ impl DenseIndex {
         })
     }
     pub(super) fn get(&self, ordinal: usize) -> Result<Boundary> {
+        // Closed owners grant no arithmetic result. Exact ASCII proof makes byte, UTF-16,
+        // and ordinal coordinates equal only within this original finite extent.
         if self.closed.released() {
             return Err(Error::Poisoned);
         }

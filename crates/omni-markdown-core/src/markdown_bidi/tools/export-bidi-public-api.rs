@@ -1,4 +1,5 @@
-//! 独立离线控制：逐标量调用实际发布crate的公开API，不从源码表推测运行结果。
+//! Independent offline control calls the released crate's actual public API for each scalar,
+//! rather than inferring runtime results solely from parsed source tables.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -9,7 +10,8 @@ const SCALARS: u32 = 0x11_0000 - 0x800;
 const RECORD_BYTES: u32 = 10;
 
 fn class_code(class: BidiClass) -> u8 {
-    // 文件编码显式列出23类；crate新增或修改枚举时必须编译失败而非误写默认类。
+    // Enumerate all 23 encoded classes explicitly. An upstream enum change must fail
+    // compilation instead of silently writing a default class into the control file.
     match class {
         BidiClass::AL => 0,
         BidiClass::AN => 1,
@@ -44,7 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("只接受唯一输出路径".into());
     }
     let mut output = BufWriter::new(File::create(path)?);
-    // 40B头明确原crate数据版本、记录数和schema大小；失败的半文件不会通过Python验证。
+    // The 40-byte header records the actual crate data version, count, and schema size.
+    // The Python consumer rejects a partial file left by a failed export.
     output.write_all(b"OMUBIDI1")?;
     output.write_all(&unicode_bidi::UNICODE_VERSION.0.to_le_bytes())?;
     output.write_all(&unicode_bidi::UNICODE_VERSION.1.to_le_bytes())?;
@@ -57,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut class_counts = [0_u32; 23];
     for point in 0..0x11_0000 {
         let Some(scalar) = char::from_u32(point) else {
-            continue; // 代理区不是Rust scalar，不能用replacement character代替后比较。
+            continue; // Surrogates are not Rust scalars; do not compare replacement characters in their place.
         };
         let class = class_code(data.bidi_class(scalar));
         let bracket = data.bidi_matched_opening_bracket(scalar);
@@ -68,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             record[5] = if bracket.is_open { 1 } else { 2 };
             record[6..].copy_from_slice(&(bracket.opening as u32).to_le_bytes());
             brackets += 1;
-        } // 无括号的tag和opening保持明确的零值，不冒充实际U+0000开括号。
+        } // No-bracket records retain zero tag/opening fields without inventing a U+0000 opening bracket.
         output.write_all(&record)?;
         class_counts[class as usize] += 1;
         records += 1;
@@ -76,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if records != SCALARS {
         return Err("实际标量覆盖数不完整".into());
     }
-    output.flush()?; // 只有所有公开API记录实际落入输出流，才发布完成统计。
+    output.flush()?; // Report completion only after all actual API records reach the output stream.
     eprintln!(
         "public_api_export_complete scalars={records} bracket_entries={brackets} record_bytes={RECORD_BYTES} data_version={:?} class_counts={class_counts:?}",
         unicode_bidi::UNICODE_VERSION,

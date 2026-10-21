@@ -1,4 +1,5 @@
-//! 原Source多段level0只按需定位真实B端点；字节、scalar、目录预算与独立完整UBA语义分别核验。
+//! Original multi-paragraph level-zero sources locate actual B endpoints on demand. Check byte,
+//! scalar, and directory work separately from independent complete UBA semantics.
 
 use super::*;
 use crate::{MarkdownDocumentBuffer, MarkdownLayoutTextSource};
@@ -25,6 +26,8 @@ fn ready(
         cancel,
     )
     .unwrap();
+    // Exact complete-root proof can finish UBA with no reads; individual B paragraph
+    // endpoints still require the original bounded preparation cursor below.
     let step = job
         .step(
             &authority,
@@ -62,11 +65,13 @@ fn prepare(
         if step.ready {
             break;
         }
-    } // 等待的是这个真实游标完成；没有轮询Native、增加预算或把Pending当已找到的段。
+    } // Wait for this real cursor, without polling Native, increasing quanta, or interpreting Pending as a found paragraph.
 }
 
 #[test]
 fn exact_cr_lf_nel_ps_and_ascii_b_separators_keep_full_unicode_oracle() {
+    // Complete independent UBA determines actual paragraph ranges for every scalar,
+    // including CR/LF as separate B paragraphs and less common B-class controls.
     for text in [
         "alpha\r\nsecond\r\n中文😀e\u{301}",
         "\r\n\r\n",
@@ -124,8 +129,9 @@ fn exact_cr_lf_nel_ps_and_ascii_b_separators_keep_full_unicode_oracle() {
     }
 }
 
-/// emoji 使全源整数端点证明失效，但同段逐 GCB 定位仍应只顺读新标量。
-/// 实际源跨过原 mmap 叶，分别用一字节和生产量子核结果、收费与完整释放。
+/// Emoji invalidates whole-source integer-endpoint proof, but forward GCB requests in
+/// one paragraph should decode only newly needed scalars. Cross actual mmap leaves with
+/// both one-byte and production quanta, checking results, charged work, and final release.
 #[test]
 fn mixed_emoji_forward_graphemes_reuse_only_certified_scalar_points() {
     let prefix = "前段\n";
@@ -160,8 +166,9 @@ fn mixed_emoji_forward_graphemes_reuse_only_certified_scalar_points() {
         let resources = actual.resource_observer();
         let mut total_bytes = 0;
         let mut total_scalars = 0;
-        // 单元的四个真实 GCB 起点分别是中、emoji、e+组合音标、文；不把低代理项
-        // 或组合符内部当正常请求。跨叶后仍必须由同 Frozen 的真实 Boundary 验证。
+        // The four real GCB starts are the CJK scalar, emoji, e-plus-acute, and final CJK
+        // scalar. Low surrogates and combining interiors are not normal requests; crossing
+        // a leaf still requires the same Frozen source's actual boundary validation.
         for repetition in 0..384 {
             for relative in [0, 1, 3, 5] {
                 let position = start + repetition * unit.encode_utf16().count() + relative;
@@ -193,11 +200,12 @@ fn mixed_emoji_forward_graphemes_reuse_only_certified_scalar_points() {
                 );
             }
         }
-        // 这核验实际 lease/解码工作，防止每个 GCB 重扫同一叶或反复查 B 两端；
-        // 保留冷首查、跨叶与 UTF8 预读余量，不依赖游标内部字段或调用次数。
+        // Bound actual lease/decoding work to catch per-GCB leaf rescans or repeated B
+        // endpoint searches. Allow cold lookup, leaf transitions, and UTF-8 lookahead
+        // without depending on private cursor fields or invocation counts.
         assert!(total_bytes < text.len() * 8, "同段前进重复读取正文");
         assert!(total_scalars < text.chars().count() * 8);
-        // 即使另一 capture 来自同一文档，它也不拥有已保留的 Frozen 点。
+        // Another capture of the same document does not own the retained Frozen cursor point.
         let foreign = MarkdownLayoutTextSource::capture(&document);
         assert!(matches!(
             actual.prepare_uniform_paragraph_range(&foreign.authority(), content_end, budget),
@@ -211,8 +219,9 @@ fn mixed_emoji_forward_graphemes_reuse_only_certified_scalar_points() {
         assert_eq!(span.paragraph_range(), expected);
         assert_eq!(span.content_end(), content_end);
 
-        // 后退重新走冷路径；随后只前进一步到 emoji 开头，再请求其低代理项。
-        // 已知段范围与旧成功点都不能把这个无效位置变成 Ready。
+        // Backward lookup takes the cold path. Advance to the emoji, then ask for its
+        // low surrogate: known paragraph coverage or an earlier success cannot make
+        // this invalid scalar position Ready.
         prepare(&mut actual, &source, start, budget);
         prepare(&mut actual, &source, start + 1, budget);
         let error = loop {
@@ -234,7 +243,8 @@ fn mixed_emoji_forward_graphemes_reuse_only_certified_scalar_points() {
             actual.paragraph_range_at_utf16(start + 3).unwrap(),
             Some(expected.clone())
         );
-        // 另一真实 B 段不是原范围的续体，段尾换行仍属于原 B 范围而不是正文。
+        // The next actual B paragraph is not a continuation of this range; the trailing
+        // newline remains inside the original B scope but outside its body.
         prepare(&mut actual, &source, content_end + 1, budget);
         assert_eq!(
             actual.paragraph_range_at_utf16(content_end + 1).unwrap(),
@@ -257,6 +267,8 @@ fn mixed_emoji_forward_graphemes_reuse_only_certified_scalar_points() {
 
 #[test]
 fn mixed_leaf_scalar_endpoints_foreign_source_cancel_and_actual_eio_keep_priority() {
+    // Retain actual scalar validation even when a mixed leaf and earlier successful
+    // points make the enclosing paragraph range already known.
     let (_directory, document) = fixture("a😀b\r\n中\u{85}尾");
     let source = MarkdownLayoutTextSource::capture(&document);
     let foreign = MarkdownLayoutTextSource::capture(&document);
@@ -285,8 +297,9 @@ fn mixed_leaf_scalar_endpoints_foreign_source_cancel_and_actual_eio_keep_priorit
     assert_eq!(actual.paragraph_range_at_utf16(1).unwrap(), Some(0..5));
     prepare(&mut actual, &source, 3, one);
     assert_eq!(actual.paragraph_range_at_utf16(3).unwrap(), Some(0..5));
-    // 此时已经走过同段 emoji 的真实前进快路；保留点也不能绕过后续首个 Source 错误。
-    // 真实借用与驱逐失败在取消之前发生；后续查询不能把原errno重写为Cancelled或foreign。
+    // The same-paragraph forward path has already passed a real emoji. Its retained
+    // point still cannot bypass a later actual Source failure. Borrow/reclaim fails
+    // before cancellation, so subsequent queries preserve EIO over cancel or mismatch.
     source.visit_byte_range(0..1, |_| Ok(())).unwrap();
     document.fail_next_original_reclaim_for_test();
     assert_eq!(
@@ -323,6 +336,8 @@ fn mixed_leaf_scalar_endpoints_foreign_source_cancel_and_actual_eio_keep_priorit
 
 #[test]
 fn late_rtl_an_isolate_and_explicit_classes_never_receive_global_zero_level_proof() {
+    // A late ineligible class invalidates the complete-root certificate, even after a
+    // long LTR prefix. Finish the original budgeted UBA and compare its actual result.
     for suffix in ["א", "ش", "١", "\u{2067}א\u{2069}", "\u{202b}a\u{202c}"] {
         let text = format!("first\r\n{}{suffix}", "a".repeat(120));
         let (_directory, document) = fixture(&text);
@@ -359,6 +374,8 @@ fn late_rtl_an_isolate_and_explicit_classes_never_receive_global_zero_level_proo
 
 #[test]
 fn four_mebibyte_mixed_span_queries_only_true_b_leaves_and_releases_original_source() {
+    // Stream the large real file in fixed blocks, then edit its piece tree without
+    // building a complete source copy for paragraph lookup.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sparse-b.md");
     let mut file = std::fs::File::create(&path).unwrap();
@@ -373,7 +390,8 @@ fn four_mebibyte_mixed_span_queries_only_true_b_leaves_and_releases_original_sou
     document
         .insert_utf16(0, "first\r\n", crate::MarkdownTextSelection::caret(7))
         .unwrap();
-    // 在原Span内部真实插入控制，后半Span保留非零目录起点；不能用完整block才正确的prefix求和。
+    // Insert actual controls inside an original span, leaving the latter span's nonzero
+    // directory origin. Prefix arithmetic valid only at whole-block origins is insufficient.
     let middle = 10 * 4096 + 9;
     document
         .insert_utf16(
@@ -398,6 +416,8 @@ fn four_mebibyte_mixed_span_queries_only_true_b_leaves_and_releases_original_sou
         (middle + 1, middle + 1..middle + 2),
         (middle + 2, middle + 2..7 + 4 * 1024 * 1024 + 3),
     ] {
+        // Sparse B endpoints should require only the actual hit leaves, not a sequential
+        // scan of the four-MiB paragraph; work counts are not an OS RSS measurement.
         let mut bytes = 0;
         loop {
             let step = value

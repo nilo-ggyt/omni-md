@@ -1,10 +1,13 @@
-//! 仅合成归因：保留完整物理paragraph，标准fragment只领取原element内的真实有限范围。
+//! Synthetic attribution only: retain the complete physical paragraph while asking a standard
+//! fragment to use an actual finite range inside that original element. Its finite range alone
+//! proves neither bounded framework text access nor the default editor's lazy rendering.
 
 use super::*;
 use objc2_app_kit::{NSTextLayoutFragment, NSTextLayoutManagerDelegate};
 use objc2_foundation::NSComparisonResult;
 
-/// provider独占delegate的实际寿命；manager及delegate均不反向强持provider或正文。
+/// The provider exclusively owns delegate lifetime. Neither manager nor delegate holds a strong
+/// backlink to the provider or canonical document.
 pub(super) struct FragmentProbeOwner {
     delegate: Retained<FragmentRangeFactory>,
     manager: Weak<NSTextLayoutManager>,
@@ -12,6 +15,8 @@ pub(super) struct FragmentProbeOwner {
 
 impl Drop for FragmentProbeOwner {
     fn drop(&mut self) {
+        // Upgrade only the original weak manager and clear only this installed delegate. A
+        // successor delegate belongs to its own operation and must survive this owner's Drop.
         if let Some(manager) = self.manager.load() {
             let expected =
                 ProtocolObject::<dyn NSTextLayoutManagerDelegate>::from_ref(&*self.delegate);
@@ -19,7 +24,7 @@ impl Drop for FragmentProbeOwner {
                 .delegate()
                 .is_some_and(|actual| std::ptr::eq(actual.as_ref(), expected))
             {
-                manager.setDelegate(None); // 仅撤销原安装，不能清掉后来接管manager的delegate。
+                manager.setDelegate(None); // Revoke this exact installation, without clearing a later manager owner.
             }
         }
     }
@@ -36,14 +41,16 @@ pub(super) struct FragmentRangeIvars {
 }
 
 define_class!(
-    // SAFETY: 只实现公开factory；位置和完整paragraph仍来自原provider，不接管输入或排版算法。
+    // SAFETY: Implements the public factory only. Original provider supplies locations and the
+    // complete paragraph; this delegate takes over neither input nor shaping/layout algorithms.
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
     #[ivars = FragmentRangeIvars]
     struct FragmentRangeFactory;
-    // SAFETY: NSObject协议没有额外义务，所有原生访问和释放均限主线程。
+    // SAFETY: No extra NSObject obligations; all Native access and release remain main-thread-only.
     unsafe impl NSObjectProtocol for FragmentRangeFactory {}
-    // SAFETY: 必需非空返回与协议ABI一致；合成失败明确抛原生异常，不提供默认整段或伪空片。
+    // SAFETY: The required nonnull return follows the protocol ABI. Synthetic failure throws a
+    // native exception, never a default whole-paragraph fragment or fabricated empty fragment.
     unsafe impl NSTextLayoutManagerDelegate for FragmentRangeFactory {
         #[unsafe(method_id(textLayoutManager:textLayoutFragmentForLocation:inTextElement:))]
         fn fragment(
@@ -65,6 +72,8 @@ impl FragmentRangeFactory {
         location: &ProtocolObject<dyn NSTextLocation>,
         element: &NSTextElement,
     ) -> Result<Retained<NSTextLayoutFragment>, ProviderFailure> {
+        // Installation binds the original weak document/storage allocation. Reusing a shell for
+        // another note cannot authorize this callback, even with equal coordinates or length.
         let provider = self
             .ivars()
             .provider
@@ -74,7 +83,7 @@ impl FragmentRangeFactory {
         if !std::rc::Weak::ptr_eq(&self.ivars().document, &provider.ivars().document)
             || !std::rc::Weak::ptr_eq(&self.ivars().document, &storage.ivars().document.borrow())
         {
-            return Err(ProviderFailure::Source); // 安装授权固定原doc/source身份，不能接受重新绑定的同一个shell。
+            return Err(ProviderFailure::Source); // Original document/Source identity forbids admission through a rebound shell.
         }
         let (generation, length, selection) = {
             let document = self
@@ -91,10 +100,11 @@ impl FragmentRangeFactory {
         };
         let installed = self.ivars().installed_key;
         if installed.generation != 0 || generation != 0 || length != installed.length {
-            return Err(ProviderFailure::Stale); // 新回调不授权用户编辑后的g>0或另一长度的源。
+            return Err(ProviderFailure::Stale); // A new callback cannot admit an edited generation or another-length Source.
         }
-        // factory回调是新请求；入口只用Rust标量签该次派生状态，随后Native全程坚持这一张票。
-        // view初始化的合法宽度/选择变化不再误用安装票核验，也不能在同一请求中途补签。
+        // A factory callback is a new request. Capture its derived state from Rust scalars at
+        // entry, then preserve this same ticket across Native calls. Legal selection/width changes
+        // during view initialization do not reuse stale installation state or renew mid-request authority.
         let key = ContentKey {
             generation,
             length,
@@ -134,7 +144,7 @@ impl FragmentRangeFactory {
         };
         let _payload = PayloadUseGuard::enter(&ticket.storage.ivars().payload_use_depth);
         if key.input_depth != 0 || key.composition || !ticket.current() {
-            return Err(ProviderFailure::Stale); // 合成只读请求不接输入暂态，首个Native调用前已核原票。
+            return Err(ProviderFailure::Stale); // Reject transient input in this synthetic read-only request before its first Native call.
         }
         let observed_storage = ticket
             .native("fragment.provider_storage", || {
@@ -142,7 +152,7 @@ impl FragmentRangeFactory {
             })?
             .ok_or(ProviderFailure::Source)?;
         if !std::ptr::eq::<PieceBackedMarkdownTextStorage>(&*observed_storage, &*ticket.storage) {
-            return Err(ProviderFailure::Source); // provider也必须仍观察原安装storage，而非同坐标后继对象。
+            return Err(ProviderFailure::Source); // Provider must still observe original storage, not a same-coordinate successor object.
         }
         let actual_manager = ticket
             .native("fragment.weak_manager", || self.ivars().manager.load())?
@@ -151,9 +161,10 @@ impl FragmentRangeFactory {
             return Err(ProviderFailure::Graph);
         }
         let delegate = ticket.native("fragment.delegate", || manager.delegate())?;
+        // Exact original manager/delegate identity is independent of document coordinates.
         let expected = ProtocolObject::<dyn NSTextLayoutManagerDelegate>::from_ref(self);
         if !delegate.is_some_and(|actual| std::ptr::eq(actual.as_ref(), expected)) {
-            return Err(ProviderFailure::Graph); // 不为另一个delegate已接管的图发布片段。
+            return Err(ProviderFailure::Graph); // Do not publish into a graph already taken over by another delegate.
         }
         let (captured, origin) = ticket.native("fragment.capture", || provider.capture())??;
         if captured.key != ticket.key {
@@ -181,14 +192,14 @@ impl FragmentRangeFactory {
             location.compare(&requested_back)
         })? != NSComparisonResult::Same
         {
-            return Err(ProviderFailure::Location); // 同数值offset仍须反查原公开位置，不能接受异图坐标。
+            return Err(ProviderFailure::Location); // Equal numeric offsets still need exact original-position roundtrip; foreign graph coordinates cannot substitute.
         }
         if start != 0
             || end != ticket.key.length
             || requested >= end
             || element.downcast_ref::<NSTextParagraph>().is_none()
         {
-            return Err(ProviderFailure::Range); // 本实验只承诺已验证完整单物理段落，不把EOF空片猜成源覆盖。
+            return Err(ProviderFailure::Range); // This experiment admits only its complete single physical paragraph, not guessed EOF-empty source coverage.
         }
         let source = {
             let document = ticket.document.upgrade().ok_or(ProviderFailure::Source)?;
@@ -197,7 +208,7 @@ impl FragmentRangeFactory {
                 document.byte_offset_for_utf16(offset).is_ok()
             })
             .ok_or(ProviderFailure::Range)?
-        }; // 只查有限scalar端点，不读取正文或保持Core借用跨Native调用。
+        }; // Query finite scalar endpoints only; retain no Core borrow across later Native calls.
         let source_start = provider.location(&ticket, &origin, source.start)?;
         let source_end = provider.location(&ticket, &origin, source.end)?;
         let range = ticket
@@ -210,6 +221,8 @@ impl FragmentRangeFactory {
             })?
             .ok_or(ProviderFailure::Range)?;
         let fragment = ticket.native("fragment.init", || {
+            // The standard fragment still receives the complete original text element. Asking
+            // for a subrange does not prove it will never retain or bulk-read that whole element.
             NSTextLayoutFragment::initWithTextElement_range(
                 NSTextLayoutFragment::alloc(),
                 element,
@@ -221,7 +234,7 @@ impl FragmentRangeFactory {
         if !ticket.native("fragment.verify_range", || {
             actual.isEqualToTextRange(&range)
         })? {
-            return Err(ProviderFailure::Range); // 必须真实保留所给子范围，不能由系统扩回整段仍说有限。
+            return Err(ProviderFailure::Range); // Actual rangeInElement must preserve the requested subrange, not expand it and still claim finite range admission.
         }
         let calls = self.ivars().calls.get().saturating_add(1);
         self.ivars().calls.set(calls);
@@ -235,7 +248,8 @@ impl FragmentRangeFactory {
     }
 }
 
-/// Root在storage/manager连接后、创建NSTextView前调用；三个显式开关之外不改变任何对象。
+/// The original composition root calls this after storage/manager connection and before
+/// NSTextView creation. Outside the three explicit experiment gates, change no object.
 pub(in crate::native_surface) fn install_fragment_range_probe(
     content: &NSTextContentStorage,
     manager: &NSTextLayoutManager,
@@ -245,6 +259,7 @@ pub(in crate::native_surface) fn install_fragment_range_probe(
         || std::env::var_os("OMNI_NATIVE_FRAGMENT_RANGE_PROBE").as_deref()
             != Some(std::ffi::OsStr::new("1"))
     {
+        // Ordinary TextKit reference graphs retain their existing manager/delegate unchanged.
         return Ok(());
     }
     let provider = content
@@ -265,6 +280,7 @@ pub(in crate::native_surface) fn install_fragment_range_probe(
         .map_err(|_| "fragment安装原票失效")?
         .is_some()
     {
+        // Do not overwrite an actual pre-existing delegate or another rendering experiment.
         return Err("fragment范围实验不能覆盖已有delegate或Raster".into());
     }
     let primary = ticket
@@ -289,7 +305,8 @@ pub(in crate::native_surface) fn install_fragment_range_probe(
             })
         })
         .map_err(|_| "fragment分配期间原票失效")?;
-    // SAFETY: 原票和weak图已写入全部ivars；NSObject init不会读取正文或初始化另一套storage。
+    // SAFETY: Original ticket and weak graph are installed in all ivars. NSObject init reads no
+    // text and initializes no second storage graph.
     let delegate: Retained<FragmentRangeFactory> = ticket
         .native("fragment.delegate_init", || unsafe {
             msg_send![super(allocated), init]
@@ -302,6 +319,8 @@ pub(in crate::native_surface) fn install_fragment_range_probe(
         delegate,
         manager: Weak::from(manager),
     };
+    // Publish the actual weak delegate only while its strong local owner already exists. Every
+    // subsequent failure drops that owner and removes only this exact installation.
     ticket
         .native("fragment.install_set", || {
             manager.setDelegate(Some(
@@ -309,7 +328,8 @@ pub(in crate::native_surface) fn install_fragment_range_probe(
             ))
         })
         .map_err(|_| "fragment安装期间原票失效")?;
-    // 安装返回后再次核原票；局部owner失败析构会按精确delegate身份清理，不留下悬空weak委托。
+    // Recheck original authority and actual delegate after installation returns. Local-owner
+    // failure cleanup uses exact identity, leaving no dangling weak delegate or successor mutation.
     let installed = ticket
         .native("fragment.installed_delegate", || manager.delegate())
         .map_err(|_| "fragment安装返回后原票失效")?;
@@ -318,7 +338,7 @@ pub(in crate::native_surface) fn install_fragment_range_probe(
         return Err("fragment安装返回后delegate身份改变".into());
     }
     let previous = provider.ivars().fragment_probe.borrow_mut().replace(owner);
-    drop(previous); // RefCell借用已结束，潜在Native清理不在借用栈内。
+    drop(previous); // The RefCell borrow ended before any possible Native cleanup/reentry.
     eprintln!(
         "content_storage_probe stage=fragment_range_installed limit=4096 synthetic_only=true read_only=true parity=false diagnostic_formal=false"
     );
@@ -326,13 +346,16 @@ pub(in crate::native_surface) fn install_fragment_range_probe(
 }
 
 fn throw_fragment_failure(failure: ProviderFailure) -> ! {
+    // Preserve failure as an explicit experiment outcome, without fallback, another fragment
+    // attempt, or successful default-product attribution.
     eprintln!(
         "content_storage_probe stage=fragment_range_failed failure={} synthetic_only=true diagnostic_formal=false",
         failure.code()
     );
     let class = objc2::runtime::AnyClass::get(c"NSException").expect("Foundation异常类已链接");
-    // SAFETY: 仅显式合成模式可到此；公开NSException工厂的Exception类型遵守objc2异常包装ABI，
-    // 固定原因无正文，不恢复whole段fallback或继续布局，也不进行未知对象转型。
+    // SAFETY: Only explicit synthetic mode reaches this public NSException factory, whose
+    // Exception type follows objc2's exception ABI. Fixed reason contains no text; do not recover
+    // into whole-paragraph fallback, continue layout, or cast an unknown exception object.
     let exception: Retained<objc2::exception::Exception> = unsafe {
         msg_send![class, exceptionWithName: ns_string!("NSInternalInconsistencyException"), reason: ns_string!("Synthetic physical paragraph fragment-range contract failed"), userInfo: None::<&AnyObject>]
     };

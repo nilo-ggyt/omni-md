@@ -1,4 +1,4 @@
-//! 纯Core预算闸门；只有调用者再次step才会给原Future补充配额，不注册外部唤醒者。
+//! A pure Core budget gate: only the caller's next step replenishes the original future, with no external wake registration.
 use super::*;
 use std::{
     cell::Cell,
@@ -15,7 +15,7 @@ pub(in crate::markdown_bidi) enum Operation {
     Resource,
 }
 
-/// 只含固定计数、原取消位和原backing的原子观察者，不持正文或Store。
+/// Retain fixed counters, original cancellation, and backing observations without owning text or the Store.
 pub(in crate::markdown_bidi) struct Gate {
     remaining: Cell<MarkdownBidiPrepareBudget>,
     progress: Cell<MarkdownBidiPrepareStep>,
@@ -46,15 +46,15 @@ impl Gate {
     }
 
     pub(in crate::markdown_bidi) fn source_health(&self) -> Result<(), BidiError> {
-        // 同一个immutable snapshot只有这个原backing可产生读取I/O毒化；纯编辑段没有假FD。
-        // 每个await在消费预算前也查原errno，不能让跨线程取消覆盖已知损坏。
+        // This immutable snapshot's original backing supplies its actual I/O poison; purely edited pieces do not gain a fictional FD.
+        // Every await checks the original errno before admitting work, so cross-thread cancellation cannot hide known source damage.
         if let Some(errno) = self.backing.as_ref().and_then(|value| value.first_errno()) {
             return Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
         }
         #[cfg(feature = "s2-table-window-prototype")]
         if let Some(draft) = &self.draft {
-            // 只Weak scope与原contentSerial，不保Source或活动草稿。源I/O首错仍先检查；
-            // 元数据only阶段每个await也须看到真正撤权，不能等下一次正文借用才停机。
+            // Retain only weak scope/original contentSerial, without Source or the active draft. Actual source I/O failure stays first.
+            // Metadata-only awaits must also observe revocation rather than waiting for another text borrow to stop work.
             draft.health()?;
         }
         Ok(())
@@ -75,6 +75,7 @@ impl Gate {
     }
 
     pub(in crate::markdown_bidi) fn replenish(&self, budget: MarkdownBidiPrepareBudget) {
+        // Replace this explicit quantum's remaining allowance and progress; cumulative maximum source borrowing remains independently observable.
         self.remaining.set(budget);
         self.progress.set(MarkdownBidiPrepareStep::pending());
     }
@@ -92,7 +93,7 @@ impl Gate {
         self.maximum_borrow.get()
     }
     pub(in crate::markdown_bidi) fn bytes_read(&self, count: usize) {
-        // 这在真实copy发生后、lease归还前记录，即使随后归还失败也不把工作洗成0。
+        // Record after actual copy but before lease return; a subsequent return failure cannot erase work already performed.
         let mut progress = self.progress.get();
         progress.bytes += count;
         self.progress.set(progress);
@@ -122,7 +123,7 @@ impl Gate {
     }
 }
 
-/// Ready仅允许一次真实32B操作；Pending不执行Store调用，也不展开已修改规则的Future。
+/// Ready admits one record/resource operation attempt; Pending performs no Store call and does not unwind a future with modified rule state.
 pub(in crate::markdown_bidi) struct RecordPermit {
     gate: Rc<Gate>,
     kind: Operation,
@@ -135,7 +136,7 @@ impl Future for RecordPermit {
         }
         let mut budget = self.gate.remaining.get();
         if budget.metadata_ops == 0 {
-            return Poll::Pending; // 原worker下一量子显式补票；没有timer/waker或忙等。
+            return Poll::Pending; // The original worker explicitly replenishes the next quantum; no timer, registered waker, or busy wait is created here.
         }
         budget.metadata_ops -= 1;
         self.gate.remaining.set(budget);
@@ -151,7 +152,7 @@ impl Future for RecordPermit {
     }
 }
 
-/// 源批量在访问之前取得真实byte上限；不会先读4KiB后只给调用方记1byte。
+/// Admit the actual byte bound before source access, without reading 4 KiB and charging only one byte afterward.
 pub(in crate::markdown_bidi) struct SourcePermit {
     gate: Rc<Gate>,
     maximum: usize,
@@ -166,7 +167,7 @@ impl Future for SourcePermit {
         if budget.bytes == 0 || budget.scalars == 0 {
             return Poll::Pending;
         }
-        // 每byte至多完成一个scalar，保守取两者余额；跨UTF8残余仍可在1byte预算下前进。
+        // One byte completes at most one scalar, so use the smaller remaining allowance; incomplete UTF8 still advances under a one-byte quota.
         let count = self.maximum.min(budget.bytes).min(budget.scalars).min(4096);
         budget.bytes -= count;
         self.gate.remaining.set(budget);
@@ -174,7 +175,7 @@ impl Future for SourcePermit {
     }
 }
 
-/// 一个scalar可跨多个1byte量子；只有解码完成且取得scalar配额才执行其Unicode规则。
+/// A scalar may span several one-byte quanta; its Unicode rules run only after complete decoding and scalar admission.
 pub(in crate::markdown_bidi) struct ScalarPermit {
     gate: Rc<Gate>,
 }
