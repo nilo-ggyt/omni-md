@@ -469,6 +469,11 @@ pub trait NativeMarkdownPagedTextViewDelegate {
         Ok(None)
     }
     fn current(&self, epoch: u64) -> bool;
+    /// 只报告原owner已经接受关闭，不把current=false、暂缺Scene或准备中推断为退出。
+    /// 非Body客户没有Body关闭事务，默认false；这不授予输入、绘图或资源归还成功。
+    fn cursor_rects_retired(&self) -> bool {
+        false
+    }
     /// bounds_width是本次真实有限正文宽；无滚动owner的独立组件直接消费此输入，不填默认宽。
     fn virtual_viewport(
         &self,

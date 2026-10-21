@@ -203,7 +203,19 @@ impl NativeMarkdownPagedBody {
         Ok(()) // 只有原canonical零端点/原Source健康检查，无正文加载或Native调用。
     }
 
+    #[cfg_attr(feature = "native-close-stage-diagnostic", track_caller)]
     fn retire_find(&self, pending: &Rc<PendingFind>, failure: Option<String>) {
+        #[cfg(feature = "native-close-stage-diagnostic")]
+        if failure.is_none() {
+            // 正常取消没有错误载荷；保留实际发起退场的静态位置，避免终态观察只能看见
+            // 泛化取消而失去原分支。此处不重读Source、Native或请求权限，也不改变退场。
+            let caller = std::panic::Location::caller();
+            eprintln!(
+                "native_find_cancel_requested file={} line={}",
+                caller.file(),
+                caller.line(),
+            );
+        }
         let removed = {
             let mut slot = self.pending_find.borrow_mut();
             if slot

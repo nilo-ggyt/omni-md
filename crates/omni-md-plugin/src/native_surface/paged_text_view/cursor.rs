@@ -7,11 +7,35 @@ use objc2_app_kit::NSCursor;
 use objc2_foundation::NSIntersectionRect;
 
 impl NativeMarkdownPagedTextView {
+    /// Body接受关闭后先撤活动权限，再调用Native拆图，最后才封闭本View。
+    /// 这段原生回调窗口只应撤光标，不能把没有Origin的装饰查询写成永久输入失败。
+    fn link_cursor_origin(&self) -> Result<Option<Origin>> {
+        match self.origin() {
+            Ok(origin) => Ok(Some(origin)),
+            Err(NativeMarkdownPagedTextViewError::Revoked) => {
+                let delegate = self.ivars().delegate.borrow().clone();
+                let delegate = delegate.and_then(|delegate| delegate.upgrade());
+                // 槽借用已经归还；只向同一弱owner询问既有accepted-close事实。
+                // 不以!current或Scene缺失代签退休，也不新增状态、后继Source或重试。
+                let retired = delegate.is_some_and(|delegate| delegate.cursor_rects_retired());
+                if retired {
+                    Ok(None)
+                } else {
+                    Err(NativeMarkdownPagedTextViewError::Revoked)
+                }
+            }
+            // 只处理获取Origin的裸撤权；实际Input/Source错误和后面Scene/Font/Layer检查不变。
+            Err(cause) => Err(cause),
+        }
+    }
+
     /// 先读本次有限sealed几何，再结束全部Scene/Reader强借用；Native重入可以真正退休旧图。
     /// 临时Vec仅含Copy矩形，数量不超过当前Scene已有LINK part数，不是第二份链接语义或缓存。
     pub(super) fn install_link_cursor_rects(&self) -> Result<()> {
         let (ticket, key, weak_scene, mut areas) = {
-            let origin = self.origin()?;
+            let Some(origin) = self.link_cursor_origin()? else {
+                return Ok(());
+            };
             let ticket = cpu::candidate::Ticket::new(&origin);
             let scene = match self.scene_for_origin(origin) {
                 Ok(scene) => scene,
@@ -159,7 +183,9 @@ impl NativeMarkdownPagedTextView {
     /// 先结束Scene强借用再查询窗口，Source仍由原Weak在Native操作前后逐次短借核验。
     fn refresh_link_cursor_rects(&self, key: &NativeMarkdownPagedSceneKey) -> Result<()> {
         let (ticket, weak_scene) = {
-            let origin = self.origin()?;
+            let Some(origin) = self.link_cursor_origin()? else {
+                return Ok(());
+            };
             if origin.state != key.request.input
                 || origin.geometry_epoch != key.request.geometry_epoch
                 || !origin.delegate.scene_current(key)
