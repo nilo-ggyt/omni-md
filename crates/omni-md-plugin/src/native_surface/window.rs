@@ -350,7 +350,9 @@ impl NativeMarkdownWindowSurface {
             ),
             NSSize::new(248.0, 20.0),
         ));
-        note_title.setFont(Some(&NSFont::boldSystemFontOfSize(16.0)));
+        // SAFETY: AppKit公开的固定字重常量在本主线程构造期间有效，不借用文稿或字体缓冲。
+        let title_weight = unsafe { NSFontWeightSemibold };
+        note_title.setFont(Some(&NSFont::systemFontOfSize_weight(17.0, title_weight)));
         note_title.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
             0.90, 0.92, 0.96, 1.0,
         )));
@@ -371,7 +373,7 @@ impl NativeMarkdownWindowSurface {
             ),
             NSSize::new(248.0, 13.0),
         ));
-        note_path.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+        note_path.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         note_path.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
             0.58, 0.63, 0.72, 1.0,
         )));
@@ -450,20 +452,30 @@ impl NativeMarkdownWindowSurface {
         sidebar_title.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
         content_view.addSubview(&sidebar_title);
 
-        // 常驻显示实际保存位置；截断仅限显示，tooltip/辅助访问保留全路径。
+        // 笔记库身份使用实际目录末级名称；完整保存位置仍由同一标准标签的提示和AX值提供。
+        // 这里只改善长路径的显示，不改会话根、书签、文件身份或打开保存目标。
         let workspace_path = NSString::from_str(&workspace_root.to_string_lossy());
-        let workspace_location = NSTextField::labelWithString(&workspace_path, mtm);
+        let workspace_name = workspace_root
+            .file_name()
+            .unwrap_or(workspace_root.as_os_str())
+            .to_string_lossy();
+        let workspace_caption = NSString::from_str(&format!("笔记库 · {workspace_name}"));
+        let workspace_location = NSTextField::labelWithString(&workspace_caption, mtm);
         workspace_location.setFrame(NSRect::new(
             NSPoint::new(18.0, 34.0),
             NSSize::new(212.0, 18.0),
         ));
-        workspace_location.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+        workspace_location.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         // 窗口使用固定深色背景；系统浅色 appearance 的 secondaryLabelColor 会变成黑字。
         workspace_location.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
             0.58, 0.63, 0.72, 1.0,
         )));
         workspace_location.setToolTip(Some(&workspace_path));
         workspace_location.setAccessibilityLabel(Some(ns_string!("笔记保存位置")));
+        // SAFETY: 该静态标签的无障碍值明确为只读 NSString；AppKit 同步保留这份实际目录文案。
+        unsafe {
+            workspace_location.setAccessibilityValue(Some(&workspace_path));
+        }
         content_view.addSubview(&workspace_location);
 
         // 原生滚动列表只接收当前有限元数据页，搜索和底栏仍固定在容器外。
@@ -517,6 +529,9 @@ impl NativeMarkdownWindowSurface {
             empty_label = Some(empty_state_label);
         }
 
+        // 菜单构造须读实际初始模式；此时没有前台更新权限，只设置既有模式真值。
+        // 控件安装后仍由原调用再次同步按钮，不把构造阶段伪装成活会话。
+        controller.select_presentation_mode(presentation_mode);
         // Install remaining actions before the surface becomes visible or receives responder callbacks.
         let toolbar_controls = install_native_markdown_workspace_controls(
             &controller,

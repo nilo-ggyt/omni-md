@@ -45,8 +45,30 @@ use objc2_app_kit::{NSTextLayoutManagerSegmentOptions, NSTextLayoutManagerSegmen
 #[derive(Clone, Copy)]
 pub(in crate::native_surface) enum NativeMarkdownFindRevealFeedback {
     Found,
+    Numbered(NativeMarkdownFindPosition),
     ReplacedNext,
     ReplacedLast,
+}
+
+/// 原完整导航枚举证明的位置；两个非零纯值随原定位请求结束，不保查询或正文。
+#[derive(Clone, Copy)]
+pub(in crate::native_surface) struct NativeMarkdownFindPosition {
+    pub(super) ordinal: std::num::NonZeroUsize,
+    pub(super) total: std::num::NonZeroUsize,
+}
+
+impl NativeMarkdownFindRevealFeedback {
+    /// 只有原可见终点可消费此文案；替换不沿用旧文稿的匹配总数。
+    pub(super) fn text(self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Found => "找到匹配".into(),
+            Self::Numbered(position) => {
+                format!("第 {} / {} 处匹配", position.ordinal, position.total).into()
+            }
+            Self::ReplacedNext => "已替换，并选中下一个匹配".into(),
+            Self::ReplacedLast => "已替换，没有更多匹配".into(),
+        }
+    }
 }
 
 /// 隐藏导航是入口固定的有限权限，不把隐藏状态泛化为可执行替换/全选的权限。
@@ -912,25 +934,18 @@ impl PieceBackedMarkdownTextView {
             && bar.is_visible()
         {
             let text = if verified {
-                match context.request.feedback {
-                    NativeMarkdownFindRevealFeedback::Found => ns_string!("找到匹配"),
-                    NativeMarkdownFindRevealFeedback::ReplacedNext => {
-                        ns_string!("已替换，并选中下一个匹配")
-                    }
-                    NativeMarkdownFindRevealFeedback::ReplacedLast => {
-                        ns_string!("已替换，没有更多匹配")
-                    }
-                }
+                context.request.feedback.text()
             } else if !prepared {
                 // 看见首个字符不代表整批布局已准备完成；保留原成功门槛并说明真实失败阶段。
-                ns_string!("匹配已选中，但当前内容的布局未完成")
+                "匹配已选中，但当前内容的布局未完成".into()
             } else {
                 // 整批准备完成后仍须通过同票据的实际可见区认证，不能用选中状态替代。
-                ns_string!("匹配已选中，但未能完成可见区定位")
+                "匹配已选中，但未能完成可见区定位".into()
             };
+            let text = NSString::from_str(&text);
             // 此前的Native getters均已结束；setter前纯核票据，随后只移除相同slot。
             if context.is_current(self) {
-                bar.status.setStringValue(text);
+                bar.status.setStringValue(&text);
             }
         }
         #[cfg(feature = "native-markdown-runtime-probe")]

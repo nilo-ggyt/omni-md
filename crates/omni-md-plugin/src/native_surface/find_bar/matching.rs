@@ -499,16 +499,24 @@ impl Query {
 /// 导航只保留五个候选；替换排除当前项，普通导航允许唯一非空匹配回绕。
 #[derive(Default)]
 struct NavigationMatches {
-    first: Option<Found>,
-    last: Option<Found>,
-    previous: Option<Found>,
-    next: Option<Found>,
-    current: Option<Found>,
+    first: Option<NumberedMatch>,
+    last: Option<NumberedMatch>,
+    previous: Option<NumberedMatch>,
+    next: Option<NumberedMatch>,
+    current: Option<NumberedMatch>,
+    total: usize,
+}
+
+/// 序号只来自本次真实升序枚举；最多五个候选保留它，不保存全部命中或另一份正文。
+#[derive(Clone)]
+struct NumberedMatch {
+    found: Found,
+    ordinal: std::num::NonZeroUsize,
 }
 
 impl NavigationMatches {
     /// 与旧编辑器从 selection 边界开始再回绕的行为一致；零长当前位置仍必须前进。
-    fn navigation_target(self, backwards: bool) -> Option<Found> {
+    fn navigation_target(self, backwards: bool) -> Option<NumberedMatch> {
         let target = if backwards {
             // 优先前一处，越过文件起点后选择最后一处非当前匹配。
             self.previous.or(self.last)
@@ -518,29 +526,36 @@ impl NavigationMatches {
         };
         target.or_else(|| {
             // 唯一非空匹配仍是有效搜索结果；不能把“已选中”误报为“没有匹配”。
-            self.current.filter(|found| !found.range.is_empty())
+            self.current.filter(|found| !found.found.range.is_empty())
         })
     }
 
-    fn observe(&mut self, found: Found, selection: &Range<usize>) {
-        if found.range == *selection {
+    fn observe(&mut self, found: Found, selection: &Range<usize>) -> Result<(), String> {
+        // 原导航本就完整遍历一次；在原命中入口计数，不能按字节位置或可见高亮反推序号。
+        self.total = self.total.checked_add(1).ok_or("查找匹配数量超出范围")?;
+        let found = NumberedMatch {
+            found,
+            ordinal: std::num::NonZeroUsize::new(self.total).expect("真实枚举计数在加一后必为正数"),
+        };
+        if found.found.range == *selection {
             // 当前选择只为 ReplaceNext 提供替换候选；零长当前匹配也不能自我回绕。
             self.current = Some(found);
-            return;
+            return Ok(());
         }
         if self.first.is_none() {
             // 全文第一个非当前匹配用于正向回绕。
             self.first = Some(found.clone());
         }
-        if found.range.end <= selection.start {
+        if found.found.range.end <= selection.start {
             // 升序扫描中的最后一个前置匹配就是 Previous；不必反向解码或再次编译查询。
             self.previous = Some(found.clone());
         }
-        if self.next.is_none() && found.range.start >= selection.end {
+        if self.next.is_none() && found.found.range.start >= selection.end {
             // 只保留首次满足正向位置的候选，后续结果不覆盖它。
             self.next = Some(found.clone());
         }
         self.last = Some(found); // 反向回绕只需要最后一个非当前匹配，内存与结果总数无关。
+        Ok(())
     }
 }
 
@@ -687,7 +702,7 @@ pub(super) fn execute_textkit_find_action(
                 | MarkdownFindAction::ReplaceNext
         ) {
             // SelectAll/ReplaceAll 不保留导航候选，也不复制其 capture 描述符。
-            navigation.observe(found, &selection);
+            navigation.observe(found, &selection)?;
         }
         Ok(true)
     };
@@ -701,6 +716,7 @@ pub(super) fn execute_textkit_find_action(
     if document.borrow().generation() != generation || !read_current() {
         return Err("查找期间文档已变更，请重试".into());
     }
+    let total = navigation.total; // 只有完整枚举和同源复核成功后，才允许把它交给延后成功反馈。
     let target = match action {
         MarkdownFindAction::Previous => {
             // 双向导航允许唯一非空匹配回绕，仍只消费本轮扫描的有限候选。
@@ -712,7 +728,8 @@ pub(super) fn execute_textkit_find_action(
         }
         MarkdownFindAction::ReplaceNext => {
             let target = navigation.next.or(navigation.first);
-            if let Some(found) = navigation.current.filter(|found| found.precise) {
+            if let Some(found) = navigation.current.filter(|found| found.found.precise) {
+                let found = found.found; // 替换只消费原命中，不能把旧文稿的计数带到编辑后的正文。
                 // 下一候选来自旧 snapshot，先映射再提交；不搜索本次刚插入的 replacement 文本。
                 let mut replacement = ReplacementSpool::new(&template)?;
                 replacement.push(&found)?;
@@ -720,8 +737,8 @@ pub(super) fn execute_textkit_find_action(
                 let after = if let Some(target) = &target {
                     // 尚未改变 canonical，candidate 的两个端点仍以旧坐标计算。
                     replacement.map_selection(MarkdownTextSelection {
-                        anchor_utf16: target.range.start,
-                        head_utf16: target.range.end,
+                        anchor_utf16: target.found.range.start,
+                        head_utf16: target.found.range.end,
                     })?
                 } else {
                     // 最后一个匹配被替换后保留新片段末尾 caret，不把 replacement 再次当成旧匹配。
@@ -908,6 +925,18 @@ pub(super) fn execute_textkit_find_action(
         MarkdownFindAction::Hide => return Ok(()), // 上层在读取查询前已经处理隐藏。
     };
     if let Some(target) = target {
+        let feedback = if matches!(
+            action,
+            MarkdownFindAction::Next | MarkdownFindAction::Previous
+        ) {
+            NativeMarkdownFindRevealFeedback::Numbered(NativeMarkdownFindPosition {
+                ordinal: target.ordinal,
+                total: std::num::NonZeroUsize::new(total)
+                    .expect("存在真实导航目标就必有完整正数总量"),
+            })
+        } else {
+            NativeMarkdownFindRevealFeedback::Found // 未编辑的ReplaceNext导航也保留原反馈语义。
+        };
         // 一次粗定位后交由原有bounded executor完成真实segment可见性认证。
         view.begin_find_reveal(
             bar,
@@ -916,7 +945,7 @@ pub(super) fn execute_textkit_find_action(
             NativeMarkdownFindRevealTarget {
                 document: Rc::downgrade(&document),
                 generation,
-                range: target.range,
+                range: target.found.range,
                 visibility,
                 bar_revision,
                 table_epoch,
@@ -924,7 +953,7 @@ pub(super) fn execute_textkit_find_action(
                     capture: selection_capture.clone(),
                     native_before,
                 },
-                feedback: NativeMarkdownFindRevealFeedback::Found,
+                feedback,
             },
         )?;
     } else {

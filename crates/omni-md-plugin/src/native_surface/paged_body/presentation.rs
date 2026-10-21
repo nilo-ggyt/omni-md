@@ -53,11 +53,21 @@ impl NativeMarkdownPagedBody {
         for cell in &receipt.cells {
             cell.verify_released()?; // 格显示 Source、映射和实际目录仍沿各自原收据核验。
         }
+        // 字号或模式可以更换 Core payload，却仍合法共享同一冻结映射。
+        // 只认当前实际字体持有的原映射身份；关闭已先清空 fonts，届时全部映射仍须真实归还。
+        let current_mappings = self
+            .fonts
+            .borrow()
+            .iter()
+            .map(|font| font.native().bytes_observer())
+            .collect::<Vec<_>>();
         for (bytes, payload) in &receipt.fonts {
+            let mapping_retained = current_mappings
+                .iter()
+                .any(|current| current.same_mapping_resource(bytes));
             if !payload.payload_released()
-                || !bytes.unmap_succeeded()
-                || bytes.mapped_bytes() != 0
                 || bytes.failed()
+                || (!mapping_retained && (!bytes.unmap_succeeded() || bytes.mapped_bytes() != 0))
             {
                 return Err("上一模式的样式字体仍持有映射或文件".into());
             }
@@ -112,26 +122,38 @@ impl NativeMarkdownPagedBody {
                 return Err(ViewError::Revoked.into());
             }
             drop(current_scroll);
-            let base = self
-                .fonts
-                .borrow()
-                .first()
-                .expect("活动正文持唯一基础字体")
-                .clone();
+            // 只在接纳前的字体准备栈保原 Scene，用于保留 Native 回调中的 Source 首错。
+            // 进入退休前明确归还，不能因认证字体而把旧 Reader 跨模式保活。
+            let scene = self.scene.borrow().clone().ok_or(ViewError::Pending)?;
+            if !scene.key().same(key) {
+                return Err(ViewError::Revoked.into());
+            }
+            // 产品两种用途明确选择目标 Native base；通用 Body 仍沿原传入字体。
+            // 捕获只借本 Body 的有限活字体，仍逐实例核真实来源/轴/字号/平台推进。
+            let captured = self.capture_base_font(mode, &original);
+            scene.validate_ready(&original)?;
+            let base = captured?;
             let typography = (mode == MarkdownPresentationMode::InlinePreview)
-                .then(|| semantics::Typography::new(base.native().native_font()))
-                .transpose()?;
+                .then(|| semantics::Typography::new(base.native_font()))
+                .transpose();
+            scene.validate_ready(&original)?;
+            let typography = typography?;
             if !original() {
                 return Err(ViewError::Revoked.into());
             }
-            // 只共享原字体 payload/mmap，不重新捕获字体文件；目标 wrapper 记录对应模式的真实行度量。
-            let registered =
-                NativeMarkdownLineFont::register(base.native().clone(), &self.catalog, &original)?;
+            // 目标 wrapper 记录对应模式的真实行度量；共享 payload 和映射只来自上方实际捕获收据。
+            let registered = NativeMarkdownLineFont::register(base, &self.catalog, &original);
+            scene.validate_ready(&original)?;
+            let registered = registered?;
             let registered = if let Some(typography) = &typography {
-                registered.capture_preview_metrics(&typography.metrics_owner, &original)?
+                let captured =
+                    registered.capture_preview_metrics(&typography.metrics_owner, &original);
+                scene.validate_ready(&original)?;
+                captured?
             } else {
                 registered
             };
+            drop(scene);
             if !original() {
                 return Err(ViewError::Revoked.into());
             }
@@ -146,13 +168,14 @@ impl NativeMarkdownPagedBody {
                 .checked_add(1)
                 .ok_or(Error::CounterExhausted)?;
             let mut retired = self.resource_receipts()?;
-            // 目标基础字体显式共享原零号 payload/mmap；只有其余真实样式字体属于本次退休。
-            // Source、Reader、Writer、worker、格资源则全是旧 Producer 的独立归还义务。
+            // 零号也可能因用途变化而退休，不能再跳过首项。只有与目标实际同 Core
+            // payload 的旧字体继续存活；其它 payload 必须释放，共享映射另按当前 owner 核验。
+            let target_authority = registered.native().core_font().authority();
             retired.fonts = self
                 .fonts
                 .borrow()
                 .iter()
-                .skip(1)
+                .filter(|font| !font.native().core_font().permits(&target_authority))
                 .map(|font| {
                     (
                         font.native().bytes_observer(),
@@ -197,7 +220,7 @@ impl NativeMarkdownPagedBody {
             let old_fonts = self.fonts.replace(vec![Rc::new(registered)]);
             let old_typography = self.typography.replace(typography);
             self.presentation.set(mode); // 原 Producer 已实际退场，不能让它误接相同 Input/宽度的新模式。
-            drop((old_fonts, old_typography, base));
+            drop((old_fonts, old_typography));
             // 模式的结构义务与旧输入的位置恢复分开：真实新输入可以取消旧锚点，
             // 却不能让已经接纳的 Preview 留源码 ruler，或让 Source 缺失同一行号附件。
             let mode_current = || self.current_body() && self.presentation_mode() == mode;

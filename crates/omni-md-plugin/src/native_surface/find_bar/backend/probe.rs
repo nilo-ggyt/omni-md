@@ -271,7 +271,7 @@ pub fn run_native_paged_find_backend_control(mtm: MainThreadMarker) -> Result<()
                 || request.epoch() != 7
                 || !std::rc::Weak::ptr_eq(&request.document(), &Rc::downgrade(&document))
                 || request.completed_visible()
-                || bar.probe_found_feedback()
+                || bar.probe_numbered_feedback(1, 2)
             {
                 return Err("Paged Pending错误地完成或更换身份".into());
             }

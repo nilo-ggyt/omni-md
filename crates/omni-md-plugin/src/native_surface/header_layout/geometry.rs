@@ -98,7 +98,8 @@ pub(in crate::native_surface) fn header_frames(width: f64, height: f64) -> Optio
     };
     Some(HeaderFrames([
         // 标题与下方路径共享原横向余量，不挤压常用操作或下行格式入口。
-        frame(left, height - 29.0, undo_x - left - 12.0, 20.0),
+        // 标题与路径加大字号后保留独立行高，中文和拉丁下伸部不能借相邻行空间显示。
+        frame(left, height - 29.0, undo_x - left - 12.0, 22.0),
         frame(mode_x, height - 41.0, mode_width, 29.0),
         frame(menu_x, height - 41.0, menu_width, 29.0),
         // 反馈行位于页眉和Find/正文之间；无消息时隐藏，垂直占用由同一绝对布局函数撤销。
@@ -121,7 +122,7 @@ pub(in crate::native_surface) fn header_frames(width: f64, height: f64) -> Optio
             super::super::format_strip::HEIGHT,
         ),
         // 完整路径由标准label的值/AX和tooltip持有；视觉截断只限制这一行显示。
-        frame(left, height - 46.0, undo_x - left - 12.0, 13.0),
+        frame(left, height - 47.0, undo_x - left - 12.0, 15.0),
         // 原单行三列footer：模式、保存事实、树聚合统计分别有独立值和AX。
         frame(left, 6.0, 90.0, STATUS_HEIGHT - 10.0),
         frame(

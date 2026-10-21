@@ -311,7 +311,8 @@ impl Candidate {
             return Ok(Advance::Pending(self)); // 同一个原context只完成过一次；每轮至多处理一个子区Native请求。
         }
         let current = || self.current(surface, view);
-        let prior = surface.reusable_frame(view, &self.reusable, self.geometry, &current);
+        // 这里只借原活帧的不可变图片作精确内容比较；宽度改变不继承其位置、Scene 或输入票。
+        let prior = surface.reusable_frame(view, &self.reusable, &current);
         self.validate(surface, view)?; // 旧Native关系出错仍拒绝，不能被像素优化洗成cache miss。
         let prior = prior?;
         let certificates = self.staging.certificates.each_ref().map(Option::as_ref);

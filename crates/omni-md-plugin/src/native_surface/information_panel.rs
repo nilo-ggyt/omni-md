@@ -101,7 +101,7 @@ impl NativeMarkdownInformationPanel {
         let heading = Self::label("文档信息", true, controller)?;
         heading.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         content.addSubview(&heading);
-        let labels = ["标题", "路径", "字符", "词数", "行数", "字节", "修改"]
+        let labels = ["标题", "路径", "字符", "词数快照", "行数", "字节", "修改"]
             .map(|text| Self::label(text, false, controller));
         // 固定七项逐项传播真实登记错误；不因后项失败丢掉先前已登记的weak证据。
         let labels: [Retained<NSTextField>; 7] = labels
@@ -109,6 +109,8 @@ impl NativeMarkdownInformationPanel {
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .expect("信息卡有固定七个标签");
+        // 词数只在打开/显式刷新时统计；四字标签保原48pt列，悬停解释不会新增正文读取或计时器。
+        labels[3].setToolTip(Some(ns_string!("显示上次统计结果；编辑后点击刷新词数更新")));
         let values: [Retained<NSTextField>; 7] = (0..7)
             .map(|_| Self::label("", true, controller))
             .collect::<Result<Vec<_>, _>>()?

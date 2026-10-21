@@ -67,6 +67,9 @@ pub(super) fn local_first(rig: &mut Rig) -> Result<(), String> {
         NSRange::new(fixture::LOCAL_FIRST, 2),
         false,
     )?;
+    if !rig.bar.probe_numbered_feedback(1, 2) {
+        return Err("真实局部导航没有显示原完整源的第一处/共两处".into());
+    }
     Ok(())
 }
 
@@ -85,6 +88,9 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
         NSRange::new(fixture::FIRST, 2),
         false,
     )?;
+    if !rig.bar.probe_numbered_feedback(1, 2) {
+        return Err("远端首目标的真实可见结果没有显示第一处/共两处".into());
+    }
     let long_query = fixture::long_query();
     rig.bar
         .query
@@ -102,26 +108,36 @@ pub(super) fn run(rig: &mut Rig) -> Result<(), String> {
     {
         return Err("9000unit完整选择错误地促使匹配尾端进入frontier/shaper".into());
     }
-    for (stage, action, start) in [
+    if !rig.bar.probe_numbered_feedback(1, 1) {
+        return Err("跨视口长匹配没有按原完整扫描显示唯一结果".into());
+    }
+    for (stage, action, start, ordinal) in [
         (
             "remote_next_140001",
             MarkdownFindAction::Next,
             fixture::SECOND,
+            2,
         ),
         (
             "remote_previous",
             MarkdownFindAction::Previous,
             fixture::FIRST,
+            1,
         ),
         (
             "remote_next_again",
             MarkdownFindAction::Next,
             fixture::SECOND,
+            2,
         ),
-        ("remote_wrap", MarkdownFindAction::Next, fixture::FIRST),
+        ("remote_wrap", MarkdownFindAction::Next, fixture::FIRST, 1),
     ] {
         rig.bar.query.setStringValue(ns_string!("目标"));
         visible(rig, stage, action, NSRange::new(start, 2), false)?;
+        // 同一四MiB mmap Source的两处预声明目标；远端、反向与末尾回绕都必须带真实次序。
+        if !rig.bar.probe_numbered_feedback(ordinal, 2) {
+            return Err(format!("{stage}: 原导航次序或全文总数反馈错误"));
+        }
         let actual = rig
             .view
             .capture_ready_scene_key()

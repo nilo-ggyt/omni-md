@@ -205,15 +205,20 @@ fn sole_nonempty_match_wraps_for_both_navigation_directions() {
         // 分别重建方向状态，确保同一轮五个候选足以完成回绕，不重扫正文。
         for backwards in [false, true] {
             let mut matches = NavigationMatches::default();
-            matches.observe(
-                Found {
-                    range: range.clone(),
-                    precise: true,
-                    captures: Vec::new(),
-                },
-                &range,
+            matches
+                .observe(
+                    Found {
+                        range: range.clone(),
+                        precise: true,
+                        captures: Vec::new(),
+                    },
+                    &range,
+                )
+                .unwrap();
+            assert_eq!(
+                matches.navigation_target(backwards).unwrap().found.range,
+                range
             );
-            assert_eq!(matches.navigation_target(backwards).unwrap().range, range);
         }
     }
 }
@@ -228,20 +233,20 @@ fn navigation_excludes_current_and_wraps_with_one_scan() {
     };
     let mut matches = NavigationMatches::default();
     for range in [0..2, 3..5, 6..8] {
-        matches.observe(found(range), &(3..5));
+        matches.observe(found(range), &(3..5)).unwrap();
     }
-    assert_eq!(matches.first.unwrap().range, 0..2);
-    assert_eq!(matches.last.unwrap().range, 6..8);
-    assert_eq!(matches.previous.unwrap().range, 0..2);
-    assert_eq!(matches.next.unwrap().range, 6..8);
-    assert_eq!(matches.current.unwrap().range, 3..5);
+    assert_eq!(matches.first.unwrap().found.range, 0..2);
+    assert_eq!(matches.last.unwrap().found.range, 6..8);
+    assert_eq!(matches.previous.unwrap().found.range, 0..2);
+    assert_eq!(matches.next.unwrap().found.range, 6..8);
+    assert_eq!(matches.current.unwrap().found.range, 3..5);
     let mut only = NavigationMatches::default();
-    only.observe(found(2..2), &(2..2));
+    only.observe(found(2..2), &(2..2)).unwrap();
     assert!(
         only.first.is_none()
             && only.last.is_none()
             && only.next.is_none()
             && only.previous.is_none()
     );
-    assert_eq!(only.current.unwrap().range, 2..2);
+    assert_eq!(only.current.unwrap().found.range, 2..2);
 }

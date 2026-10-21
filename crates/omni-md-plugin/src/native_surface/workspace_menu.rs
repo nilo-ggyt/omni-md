@@ -7,7 +7,7 @@ pub(super) const CURRENT_NOTE_ACTIONS: &[(isize, &str)] = &[
     (30, "重命名…"),
     (31, "移动…"),
     (32, "创建副本"),
-    (33, "在 Finder 中显示"),
+    (33, "在访达中显示"),
     (34, "删除…"),
 ];
 
@@ -66,11 +66,26 @@ pub(super) const GROUPS: &[WorkspaceMenuGroup] = &[
     },
 ];
 
+/// 这里只补菜单实际需要的文稿条件；导入笔记始终可用，表格保留原独立准入拥有者。
+/// 折叠消费已接纳的源码模式，不能仅因打开了笔记就把预览中的折叠操作强行启用。
+fn document_menu_action_available(
+    tag: isize,
+    has_document: bool,
+    mode: MarkdownPresentationMode,
+) -> Option<bool> {
+    match tag {
+        20 | 21 => Some(has_document && mode == MarkdownPresentationMode::Source),
+        1 | 3..=8 | 30..=34 | 100..=112 | 115..=116 => Some(has_document),
+        _ => None, // 导入、分组、复制和表格继续由原各自入口决定，不改其额外启用条件。
+    }
+}
+
 /// 创建一个实际叶项，target借用同一controller；父menu拥有它直到accepted清理。
 pub(super) fn workspace_menu_item(
     title: &str,
     tag: isize,
     controller: &NativeMarkdownController,
+    has_document: bool,
     mtm: MainThreadMarker,
 ) -> Retained<NSMenuItem> {
     // SAFETY: 固定selector采用NSMenuItem action ABI；controller由当前surface强持有到detach之后。
@@ -87,6 +102,14 @@ pub(super) fn workspace_menu_item(
     unsafe {
         item.setTarget(Some(controller));
     }
+    // 初次空库和已打开笔记共用同一规则；标准菜单关闭了自动启停，不能依赖外部 responder 补齐。
+    if let Some(available) = document_menu_action_available(
+        tag,
+        has_document,
+        controller.ivars().published_presentation_mode.get(),
+    ) {
+        item.setEnabled(available);
+    }
     item
 }
 
@@ -101,7 +124,7 @@ pub(super) fn install_native_markdown_workspace_menu(
     let root = actions.menu().ok_or("文档菜单不可用")?;
     // 各叶项明确配置可用性，不能让AppKit按未声明的外部responder猜测启用状态。
     root.setAutoenablesItems(false);
-    let save = workspace_menu_item("保存", 1, controller, mtm);
+    let save = workspace_menu_item("保存", 1, controller, has_document, mtm);
     save.setKeyEquivalent(ns_string!("s"));
     root.addItem(&save);
     // SAFETY: 复制沿既有selector直接执行同一显式剪贴板事务，不新增命令或正文镜像。
@@ -123,8 +146,7 @@ pub(super) fn install_native_markdown_workspace_menu(
     root.addItem(&NSMenuItem::separatorItem(mtm));
     for &(tag, title) in CURRENT_NOTE_ACTIONS {
         // 当前文档即使不在侧栏的有限页内，也保留原五项直接入口；空态不提供假目标。
-        let item = workspace_menu_item(title, tag, controller, mtm);
-        item.setEnabled(has_document);
+        let item = workspace_menu_item(title, tag, controller, has_document, mtm);
         root.addItem(&item);
     }
     root.addItem(&NSMenuItem::separatorItem(mtm));
@@ -134,7 +156,7 @@ pub(super) fn install_native_markdown_workspace_menu(
         submenu.setAutoenablesItems(false);
         for &(tag, title) in group.items {
             // 保留的日常格式与文件动作仍使用原 tag；已删除的功能没有可执行叶项。
-            let item = workspace_menu_item(title, tag, controller, mtm);
+            let item = workspace_menu_item(title, tag, controller, has_document, mtm);
             if tag == 118 {
                 // 表格仅在真实文档存在时启用，后续install/empty沿原controller方法更新此item。
                 item.setEnabled(has_document);
@@ -159,13 +181,16 @@ pub(super) fn install_native_markdown_workspace_menu(
     ledger.include_menu("workspace.actions.menu", &root)
 }
 
-/// 同步原文档菜单的五个叶项；每个Native getter/setter后都拒绝关闭或较新的启停状态。
+/// 同步原固定两层菜单的文稿叶项；空库、新建成功和最后笔记删除沿同一文稿状态发布。
+/// 表格仍由原独立入口启停；每个 Native getter/setter 后同时拒绝关闭、换文稿或较新的模式。
 pub(super) fn set_current_note_actions_available(
     controller: &NativeMarkdownController,
     available: bool,
 ) {
+    let mode = controller.ivars().published_presentation_mode.get();
     let current = || {
         controller.ivars().document_actions_available.get() == available
+            && controller.ivars().published_presentation_mode.get() == mode
             && native_markdown_controller_has_foreground_authority(controller)
     };
     if !current() {
@@ -204,9 +229,38 @@ pub(super) fn set_current_note_actions_available(
         if !current() {
             return;
         }
-        if CURRENT_NOTE_ACTIONS.iter().any(|entry| entry.0 == tag) {
-            item.setEnabled(available);
-        } // 只更新当前笔记动作，保存/格式/查找仍归原有状态与命令规则。
+        if let Some(enabled) = document_menu_action_available(tag, available, mode) {
+            item.setEnabled(enabled);
+        }
+        if !current() {
+            return; // 顶层 setter 也可能重入；旧文稿不能继续修改新的子菜单状态。
+        }
+        let submenu = item.submenu();
+        if !current() {
+            return;
+        }
+        let Some(submenu) = submenu else { continue };
+        let children = submenu.itemArray();
+        if !current() {
+            return;
+        }
+        // 文档菜单只有既有两层；只访问本项实际子菜单，不递归系统菜单或增加状态库存。
+        for child_index in 0..children.count() {
+            if !current() {
+                return;
+            }
+            let child = children.objectAtIndex(child_index);
+            if !current() {
+                return;
+            }
+            let tag = child.tag();
+            if !current() {
+                return;
+            }
+            if let Some(enabled) = document_menu_action_available(tag, available, mode) {
+                child.setEnabled(enabled);
+            }
+        }
     }
 }
 

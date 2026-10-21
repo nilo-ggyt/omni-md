@@ -964,7 +964,7 @@ pub(super) fn native_markdown_sidebar_menu(
             add_native_markdown_menu_item(
                 &menu,
                 target,
-                "在 Finder 中显示",
+                "在访达中显示",
                 sel!(revealMarkdownEntryFromSidebar:),
                 mtm,
             );
@@ -996,7 +996,7 @@ pub(super) fn native_markdown_sidebar_menu(
             add_native_markdown_menu_item(
                 &menu,
                 target,
-                "在 Finder 中显示",
+                "在访达中显示",
                 sel!(revealMarkdownEntryFromSidebar:),
                 mtm,
             );
@@ -1036,7 +1036,7 @@ pub(super) fn native_markdown_sidebar_menu(
             add_native_markdown_menu_item(
                 &menu,
                 target,
-                "在 Finder 中显示",
+                "在访达中显示",
                 sel!(revealMarkdownEntryFromSidebar:),
                 mtm,
             );

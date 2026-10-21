@@ -438,12 +438,13 @@ impl CpuSurface {
         self.steps.get()
     }
 
-    /// 只短借当前活帧；普通旧scene/几何过期是cache miss，真实Native所有权错误仍原样拒绝。
+    /// 只短借当前活帧的不可变图片；不借旧 Scene、输入权限或瓦片位置。
+    /// 行号变宽或缩窗会改变完整几何，但仍可逐字节证明部分同尺寸图片未变；
+    /// 旧图的实际挂载关系继续完整核验，新位置和 Ready 仍只由当前候选发布。
     fn reusable_frame(
         &self,
         view: &NativeMarkdownPagedTextView,
         expected: &std::rc::Weak<TileFrame>,
-        geometry: Geometry,
         current: &impl Fn() -> bool,
     ) -> Result<Option<Rc<TileFrame>>> {
         let Some(frame) = expected.upgrade() else {
@@ -458,8 +459,8 @@ impl CpuSurface {
             .borrow()
             .as_ref()
             .is_some_and(|actual| Rc::ptr_eq(actual, &frame));
-        if !same_frame || published.geometry != geometry {
-            return Ok(None); // resize/scale/旧帧更换不新增绘图前置失败，当前候选仍可完整重绘。
+        if !same_frame {
+            return Ok(None); // 只能借本次预期的当前活帧，不能恢复历史图片或另一发布的像素。
         }
         self.layer_current(view, current)?;
         self.layers

@@ -69,13 +69,18 @@ impl NativeMarkdownEditorSurface {
         scroll_view.setHasVerticalScroller(true);
         scroll_view.setHasHorizontalScroller(false);
         scroll_view.setDrawsBackground(true);
-        // 正文和源码沿同一 14pt 文稿等宽 base；UI 字体的中文半宽策略不属于文稿排版合同。
-        let font = native_markdown_document_fixed_font(14.0).map_err(|cause| cause.to_string())?;
+        // 预览普通正文采用 15pt 系统比例文稿字体，源码保持 14pt 等宽；
+        // 两者都经原真实 CG 实例转换，不能把 UI 字体的中文半宽策略带入文稿。
+        let source_font =
+            native_markdown_document_fixed_font(14.0).map_err(|cause| cause.to_string())?;
+        let preview_font =
+            native_markdown_document_font(15.0).map_err(|cause| cause.to_string())?;
         let paragraph = objc2_app_kit::NSParagraphStyle::defaultParagraphStyle();
-        let body = NativeMarkdownPagedBody::attach(
+        let body = NativeMarkdownPagedBody::attach_with_presentation_fonts(
             Rc::clone(model.document()),
             &scroll_view,
-            font.as_ref(),
+            source_font.as_ref(),
+            preview_font.as_ref(),
             &paragraph,
             NativeMarkdownPagedBodyConfiguration {
                 presentation_mode: mode,
@@ -83,7 +88,9 @@ impl NativeMarkdownEditorSurface {
                 // 系统Emoji字体集合可超过64MiB；512MiB仅限制来源文件extent，
                 // 沿原匿名clone+mmap按表/字形触页，不预读全部字体；实际驻留仍独立验收。
                 maximum_font_bytes: 512 * 1024 * 1024,
-                padding: 8.0,
+                // 正文与页眉使用同一24pt横向留白，长文不再贴住侧栏或窗口边缘。
+                // 仍由原排版请求统一计算命中、换行和输入法矩形，不用绘图偏移伪装内边距。
+                padding: 24.0,
                 colors: NativeMarkdownPagedBodyColors {
                     background: [0.075, 0.084, 0.11, 1.0],
                     active_line: [27.0 / 255.0, 32.0 / 255.0, 42.0 / 255.0, 1.0],

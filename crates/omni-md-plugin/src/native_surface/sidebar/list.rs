@@ -273,6 +273,16 @@ impl NativeMarkdownSidebarTable {
         field.setTextColor(Some(&native_markdown_note_color(
             active && metadata.kind == NativeMarkdownSidebarEntryKind::Note,
         )));
+        // 当前打开的笔记与原生表格选择是两件事；焦点转入正文后，字重仍标明实际文稿。
+        // 复用行每次都重设普通/当前字重，避免旧笔记的强调样式串到下一页或目录行。
+        let weight = if active && metadata.kind == NativeMarkdownSidebarEntryKind::Note {
+            // SAFETY: 框架公开固定字重值进程内有效，样式不保留本行或业务对象。
+            unsafe { NSFontWeightSemibold }
+        } else {
+            // SAFETY: 与当前笔记分支同一公开常量合同，复用行必须恢复普通字重。
+            unsafe { NSFontWeightRegular }
+        };
+        field.setFont(Some(&NSFont::systemFontOfSize_weight(13.0, weight)));
         field.setToolTip(Some(&NSString::from_str(&metadata.relative_path)));
         let kind = match metadata.kind {
             NativeMarkdownSidebarEntryKind::Root => "笔记库",

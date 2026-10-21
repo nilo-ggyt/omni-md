@@ -12,6 +12,7 @@ use std::{
 use dispatch2::MainThreadBound;
 use objc2::{MainThreadOnly, rc::Retained};
 use objc2_app_kit::{NSParagraphStyle, NSScrollView};
+use objc2_core_foundation::{CFRetained, Type};
 use objc2_core_text::CTFont;
 use objc2_foundation::MainThreadMarker;
 use omni_markdown_core::{MarkdownDocumentBuffer, MarkdownLineFontCatalog};
@@ -148,6 +149,27 @@ pub struct NativeMarkdownPagedBodyConfiguration {
     pub colors: NativeMarkdownPagedBodyColors,
 }
 
+/// 基础字体是显式的 Native 资源用途；不预建第二套 Core palette 或排版续体。
+/// 通用挂载严格沿调用方同一字体，产品编辑器才分别指定源码与预览的文稿字体。
+enum BaseFonts {
+    Single(CFRetained<CTFont>),
+    Presentation {
+        source: CFRetained<CTFont>,
+        preview: CFRetained<CTFont>,
+    },
+}
+impl BaseFonts {
+    fn for_mode(&self, mode: omni_markdown_core::MarkdownPresentationMode) -> &CTFont {
+        match self {
+            Self::Single(font) => font,
+            Self::Presentation { source, preview } => match mode {
+                omni_markdown_core::MarkdownPresentationMode::Source => source,
+                omni_markdown_core::MarkdownPresentationMode::InlinePreview => preview,
+            },
+        }
+    }
+}
+
 /// 只读原 composer 的实际计数；缺少 Ready 或采样不能由这些字段推断产品验收通过。
 #[derive(Debug)]
 pub struct NativeMarkdownPagedBodyProgress {
@@ -282,6 +304,8 @@ pub struct NativeMarkdownPagedBody {
     >,
     off_main_notice: std::sync::Arc<std::sync::atomic::AtomicBool>,
     fonts: RefCell<Vec<Rc<NativeMarkdownLineFont>>>,
+    // Rc 只让同步装配在槽借用外借用两份不可变 Native 字体；关闭会取走实际强 claim。
+    base_fonts: RefCell<Option<Rc<BaseFonts>>>,
     // 只复用同真实Font与完整小GCB输入的已完成选择；弱字体票不延长原palette资源寿命。
     font_choices: RefCell<font_choice::FontChoices>,
     typography: RefCell<Option<semantics::Typography>>,
@@ -357,7 +381,31 @@ impl NativeMarkdownPagedBody {
         Self::attach_target(
             Attachment::Body(document),
             scroll,
-            font,
+            Rc::new(BaseFonts::Single(font.retain())),
+            paragraph,
+            configuration,
+            mtm,
+        )
+    }
+
+    /// 产品编辑器显式区分两种文稿用途；普通 attach 的单字体合同不因此改变。
+    /// 初次模式只捕获对应的一份 Core 字体，另一用途只保留 Native 字体 claim。
+    pub(in crate::native_surface) fn attach_with_presentation_fonts(
+        document: Rc<RefCell<MarkdownDocumentBuffer>>,
+        scroll: &NSScrollView,
+        source_font: &CTFont,
+        preview_font: &CTFont,
+        paragraph: &NSParagraphStyle,
+        configuration: NativeMarkdownPagedBodyConfiguration,
+        mtm: MainThreadMarker,
+    ) -> Result<Rc<Self>> {
+        Self::attach_target(
+            Attachment::Body(document),
+            scroll,
+            Rc::new(BaseFonts::Presentation {
+                source: source_font.retain(),
+                preview: preview_font.retain(),
+            }),
             paragraph,
             configuration,
             mtm,
@@ -376,7 +424,7 @@ impl NativeMarkdownPagedBody {
         Self::attach_target(
             Attachment::Cell(session),
             scroll,
-            font,
+            Rc::new(BaseFonts::Single(font.retain())),
             paragraph,
             configuration,
             mtm,
@@ -386,7 +434,7 @@ impl NativeMarkdownPagedBody {
     fn attach_target(
         target: Attachment,
         scroll: &NSScrollView,
-        font: &CTFont,
+        base_fonts: Rc<BaseFonts>,
         paragraph: &NSParagraphStyle,
         configuration: NativeMarkdownPagedBodyConfiguration,
         mtm: MainThreadMarker,
@@ -407,6 +455,7 @@ impl NativeMarkdownPagedBody {
         {
             return Err(ViewError::InvalidGeometry.into());
         }
+        let font = base_fonts.for_mode(configuration.presentation_mode);
         let captured =
             NativeMarkdownPagedFont::capture(font, configuration.maximum_font_bytes, mtm, &|| {
                 true
@@ -432,6 +481,7 @@ impl NativeMarkdownPagedBody {
             target,
             scroll,
             vec![registered],
+            base_fonts,
             catalog,
             paragraph,
             typography,
@@ -441,10 +491,15 @@ impl NativeMarkdownPagedBody {
 
     /// 两类输入只在此建立原生图。活动格借父亲已经注册的实际字体与段落，
     /// 与公开独立 Cell 附着共用此处的视口、通知、输入和失败释放，不再复制一套挂载流程。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "唯一挂载边明确接管输入、字体、段落与视口资源，不以参数袋隐藏实际所有权"
+    )]
     fn mount_target(
         target: Attachment,
         scroll: &NSScrollView,
         fonts: Vec<Rc<NativeMarkdownLineFont>>,
+        base_fonts: Rc<BaseFonts>,
         catalog: MarkdownLineFontCatalog,
         paragraph: Rc<super::paged_paragraph_style::NativeMarkdownLineParagraph>,
         typography: Option<semantics::Typography>,
@@ -479,6 +534,7 @@ impl NativeMarkdownPagedBody {
             notifications: RefCell::new(Vec::new()),
             off_main_notice: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fonts: RefCell::new(fonts),
+            base_fonts: RefCell::new(Some(base_fonts)),
             font_choices: RefCell::new(font_choice::FontChoices::new()),
             typography: RefCell::new(typography),
             catalog,
@@ -607,6 +663,34 @@ impl NativeMarkdownPagedBody {
 
     pub fn take_failure(&self) -> Option<NativeMarkdownPagedBodyError> {
         self.failure.borrow_mut().take()
+    }
+
+    /// 目标用途先消费原票再捕获；有限活字体只用于真实实例/冻结映射复用，不持旧 Scene。
+    /// Native 调用前已结束所有 Body 槽借用，失败由原调用方保留 Source 与资源首错。
+    fn capture_base_font(
+        &self,
+        mode: omni_markdown_core::MarkdownPresentationMode,
+        current: &dyn Fn() -> bool,
+    ) -> Result<NativeMarkdownPagedFont> {
+        let base_fonts = self
+            .base_fonts
+            .borrow()
+            .as_ref()
+            .cloned()
+            .ok_or(NativeMarkdownPagedBodyError::Closed)?;
+        let palette = self.fonts.borrow().clone();
+        let captured = NativeMarkdownPagedFont::capture_reusing(
+            base_fonts.for_mode(mode),
+            &palette,
+            self.configuration.maximum_font_bytes,
+            self.mtm,
+            current,
+        )?;
+        drop(palette);
+        if !current() {
+            return Err(ViewError::Revoked.into());
+        }
+        Ok(captured.into_font())
     }
 
     /// 只有实际已封存前缀的高度；它不代表尚未排版的文档尾部。
@@ -1244,6 +1328,8 @@ impl NativeMarkdownPagedBody {
         }
         self.font_choices.borrow_mut().clear(); // 先归还固定复用槽及其有限输入，不保旧Source或字体弱控制块。
         drop(self.typography.borrow_mut().take()); // 语义原NSFont策略随活动Body归还，不成为idle全局缓存。
+        let base_fonts = self.base_fonts.borrow_mut().take();
+        drop(base_fonts); // 两种用途的 Native claim 同步归还，不让已关闭 Body 或框架空壳继续持有。
         let fonts = std::mem::take(&mut *self.fonts.borrow_mut());
         drop(fonts); // 所有 RefCell 借用先归还，再执行真实 CF/Native 字体释放。
         drop(self.document.borrow_mut().take());

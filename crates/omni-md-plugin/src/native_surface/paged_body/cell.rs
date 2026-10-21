@@ -207,6 +207,36 @@ impl NativeMarkdownPagedBody {
         if right <= left || top <= bottom {
             return Err(ViewError::Pending.into()); // 行顶 padding 无文字交集，不能创造一张空编辑框。
         }
+        // 草稿仍是原 Source 字面客户：产品保持 14pt 等宽，不能因父预览正文
+        // 改成 15pt 比例字体而盲目继承父零号。通用 Single 用途仍取原调用方字体。
+        let scene = self.scene.borrow().clone().ok_or(ViewError::Pending)?;
+        if !scene.key().request.same(request) {
+            return Err(ViewError::Revoked.into());
+        }
+        let current = || self.scene_current(scene.key());
+        scene.validate_ready(&current)?;
+        let captured = self.capture_base_font(MarkdownPresentationMode::Source, &current);
+        scene.validate_ready(&current)?; // 字体回调若遇原 Source 错误，保它的实际首错。
+        let captured = captured?;
+        let authority = captured.core_font().authority();
+        let existing = self
+            .fonts
+            .borrow()
+            .iter()
+            .find(|font| font.native().core_font().permits(&authority))
+            .cloned();
+        let font = if let Some(existing) = existing {
+            drop(captured);
+            existing // 父亲已有完全相同的真实实例，不再注册相同 Core 或复制平台推进。
+        } else {
+            let registered = NativeMarkdownLineFont::register(captured, &self.catalog, &current);
+            scene.validate_ready(&current)?;
+            Rc::new(registered?)
+        };
+        // 子图只拥有已经选定的这一用途，不继承父亲两份家族，也不允许局部切换模式。
+        let base_fonts = Rc::new(BaseFonts::Single(font.native().native_font().retain()));
+        scene.validate_ready(&current)?;
+        drop(scene); // 原 Scene 只认证字体准备；不额外跨子视口挂载保留父 Source/Reader。
         let session = NativeMarkdownPagedCellSession::begin(
             self.input.document_identity(),
             hit.source.clone(),
@@ -223,7 +253,8 @@ impl NativeMarkdownPagedBody {
         let body = Self::mount_target(
             Attachment::Cell(session),
             &scroll,
-            self.fonts.borrow().clone(),
+            vec![font],
+            base_fonts,
             self.catalog.clone(),
             self.paragraph.clone(),
             None,

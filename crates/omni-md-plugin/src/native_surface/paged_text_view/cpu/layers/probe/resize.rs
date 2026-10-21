@@ -71,8 +71,26 @@ pub(super) fn run() -> Result<()> {
                 );
             }
         }
-        narrow_bitmap.finish_tile(writable, None)?;
+        narrow_bitmap.finish_tile(writable, Some(&wide))?;
         let narrow = narrow_bitmap.finish()?;
+        // 完整画面宽度已不同，左侧瓦片却由同一真实像素重新绘制而来。检查实际
+        // CGImage 身份与表示，证明借回了旧只读图片；不能仅凭复用计数声称未再分配。
+        let unchanged_image_reused =
+            narrow
+                .tiles
+                .first()
+                .zip(wide.tiles.first())
+                .is_some_and(|(current, original)| {
+                    std::ptr::eq(&*current.image, &*original.image)
+                        && current.presentation == original.presentation
+                        && match (&current.secondary_image, &original.secondary_image) {
+                            (None, None) => true,
+                            (Some(current), Some(original)) => {
+                                std::ptr::eq(&**current, &**original)
+                            }
+                            _ => false,
+                        }
+                });
         autoreleasepool(|_| -> Result<()> {
             backing.setFrame(narrow_bounds);
             backing.setBounds(narrow_bounds);
@@ -104,11 +122,12 @@ pub(super) fn run() -> Result<()> {
         drop((narrow, pool, backing, source, rendered));
         CATransaction::flush();
         println!(
-            "paged_lazy_layer_resize initially_empty={initially_empty} actual_representation_roles={correct_roles} actual_old_role_weak_nil={old_roles_returned} retired_group_empty={retired_group_empty} retired_weak_storage_returned={retired_storage_returned} exact_narrow_rgba={exact} actual_detach={detached} whole_product=false formal=false"
+            "paged_lazy_layer_resize initially_empty={initially_empty} actual_representation_roles={correct_roles} actual_unchanged_image_reused={unchanged_image_reused} actual_old_role_weak_nil={old_roles_returned} retired_group_empty={retired_group_empty} retired_weak_storage_returned={retired_storage_returned} exact_narrow_rgba={exact} actual_detach={detached} whole_product=false formal=false"
         );
         Ok((
             initially_empty
                 && correct_roles
+                && unchanged_image_reused
                 && old_roles_returned
                 && retired_group_empty
                 && retired_storage_returned

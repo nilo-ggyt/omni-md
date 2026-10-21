@@ -288,7 +288,7 @@ impl NativeMarkdownPagedFindBackend<'_> {
                         | MarkdownFindAction::Previous
                         | MarkdownFindAction::ReplaceNext
                 ) {
-                    navigation.observe(found, &selection);
+                    navigation.observe(found, &selection)?;
                 }
                 Ok(true)
             },
@@ -305,18 +305,20 @@ impl NativeMarkdownPagedFindBackend<'_> {
         if !current() {
             return Err("查找临时对象释放后原权限已失效".into());
         }
+        let total = navigation.total; // 原完整扫描已成功；异步Reveal仍须沿原Source/Input证明真正可见。
         let target = match action {
             MarkdownFindAction::Next => navigation.navigation_target(false),
             MarkdownFindAction::Previous => navigation.navigation_target(true),
             MarkdownFindAction::ReplaceNext => {
                 let target = navigation.next.or(navigation.first);
-                if let Some(found) = navigation.current.filter(|found| found.precise) {
+                if let Some(found) = navigation.current.filter(|found| found.found.precise) {
+                    let found = found.found; // 编辑后语义可能改变，旧序号和总数不进入替换反馈。
                     let mut replacement = ReplacementSpool::new(&template)?;
                     replacement.push(&found)?;
                     let after = if let Some(target) = &target {
                         replacement.map_selection(MarkdownTextSelection {
-                            anchor_utf16: target.range.start,
-                            head_utf16: target.range.end,
+                            anchor_utf16: target.found.range.start,
+                            head_utf16: target.found.range.end,
                         })?
                     } else {
                         MarkdownTextSelection::caret(
@@ -398,9 +400,21 @@ impl NativeMarkdownPagedFindBackend<'_> {
             MarkdownFindAction::Hide => return Err("隐藏查找栏应由原布局入口执行".into()),
         };
         if let Some(target) = target {
+            let feedback = if matches!(
+                action,
+                MarkdownFindAction::Next | MarkdownFindAction::Previous
+            ) {
+                NativeMarkdownFindRevealFeedback::Numbered(NativeMarkdownFindPosition {
+                    ordinal: target.ordinal,
+                    total: std::num::NonZeroUsize::new(total)
+                        .expect("存在真实导航目标就必有完整正数总量"),
+                })
+            } else {
+                NativeMarkdownFindRevealFeedback::Found
+            }; // ReplaceNext即使本轮只导航，也不扩大原替换反馈的计数承诺。
             let after = MarkdownTextSelection {
-                anchor_utf16: target.range.start,
-                head_utf16: target.range.end,
+                anchor_utf16: target.found.range.start,
+                head_utf16: target.found.range.end,
             };
             let outcome = self
                 .input
@@ -414,7 +428,7 @@ impl NativeMarkdownPagedFindBackend<'_> {
                 before,
                 PagedFindTarget {
                     selection: after,
-                    feedback: NativeMarkdownFindRevealFeedback::Found,
+                    feedback,
                 },
                 committed,
             )

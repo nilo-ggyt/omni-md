@@ -82,6 +82,34 @@ pub(super) struct NativeMarkdownDocumentAreaBinding {
 }
 
 impl NativeMarkdownController {
+    /// 复制完成只借原保存列确认，不改变正文高度、选择或已有错误提示。
+    /// 后续真实编辑、模式或保存通知会重新投影原保存事实，自然撤掉这次短反馈；不另起timer。
+    pub(super) fn present_copy_confirmation(&self) {
+        let document = self.ivars().footer_document.get();
+        let save = self.ivars().footer_save_result.get();
+        let mode = self.ivars().published_presentation_mode.get();
+        let current = || {
+            document.is_some()
+                && !self.ivars().close_finalizer_scheduled.get()
+                && native_markdown_controller_has_foreground_authority(self)
+                && self.ivars().footer_document.get() == document
+                && self.ivars().footer_save_result.get() == save
+                && self.ivars().published_presentation_mode.get() == mode
+        };
+        if !current() {
+            return;
+        }
+        let Some(labels) = self.ivars().footer_labels.get() else {
+            return; // 已关闭或尚未完整装配的控制器不能为了反馈重建控件。
+        };
+        // 保存状态仍排在首位；复制既不证明保存成功，也不撤销冲突、恢复或未确认事实。
+        let message = NSString::from_str(&format!("{} · 已复制全文", save.label(document)));
+        labels[1].setStringValue(&message);
+        if current() {
+            labels[1].setToolTip(Some(&message));
+        } // Native setter若重入换笔记，旧确认不能覆盖后继tooltip。
+    }
+
     /// 新文稿或空态清除上一个笔记的保存结果；只缓存四个显示标量，不授予文件操作权限。
     pub(in crate::native_surface) fn install_footer_document(
         &self,

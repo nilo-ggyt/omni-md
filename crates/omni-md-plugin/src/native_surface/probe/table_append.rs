@@ -2653,7 +2653,12 @@ impl NativeMarkdownHostedTableProbe {
             } else if actual.is_some() {
                 return Err("正文历史阶段没有正常辞任替换客户".into());
             }
-            if matches!(stage, 1 | 2) && !step(&current, || bar.probe_found_feedback())? {
+            // 原表头和末格各有一个“值”；实际Next/Previous必须显示对应完整源次序及真实总数。
+            if matches!(stage, 1 | 2)
+                && !step(&current, || {
+                    bar.probe_numbered_feedback(usize::from(stage), 2)
+                })?
+            {
                 return Err("真实导航尚未完成原匹配可见定位".into());
             }
             if stage == 3 {
@@ -4227,7 +4232,14 @@ impl NativeMarkdownHostedTableProbe {
             if step(&current, || content.bounds())?.size != size {
                 return Err("UI图内容根尺寸不是本次预声明窗口".into());
             }
-            let result = ui_render::write(directory, &content, "table-toolbar", paints, &current);
+            // 最小正式窗口沿同一次真实CPU终点导图，静态标签便于直接找到窄窗布局；
+            // 不再创建第二张图片，输出仍计入原三尺寸动作共用的三秒期限。
+            let label = if size == NSSize::new(900.0, 600.0) {
+                "table-toolbar-compact"
+            } else {
+                "table-toolbar"
+            };
+            let result = ui_render::write(directory, &content, label, paints, &current);
             // Native缓存/编码即使先报撤权，仍保原Source/Font首因和实际updateLayer失败；不以PNG洗错。
             scene
                 .validate_ready(&current)
@@ -4358,15 +4370,15 @@ impl NativeMarkdownHostedTableProbe {
                 (104, "斜体"),
                 (105, "下划线"),
                 (106, "删除线"),
-                (107, "行内代码"),
-                (108, "链接"),
+                (107, "插入行内代码"),
+                (108, "插入链接"),
                 (110, "无序列表"),
                 (111, "有序列表"),
                 (112, "任务列表"),
                 (109, "引用"),
-                (118, "表格"),
-                (116, "代码块"),
-                (115, "分隔线"),
+                (118, "插入表格"),
+                (116, "插入代码块"),
+                (115, "插入分隔线"),
             ];
             let formats = &controls[NATIVE_MARKDOWN_TOOLBAR_START + 5..];
             if formats.len() != expected.len() {

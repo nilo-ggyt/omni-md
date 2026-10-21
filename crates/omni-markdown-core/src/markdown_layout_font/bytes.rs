@@ -79,6 +79,13 @@ pub struct MarkdownLayoutFontBytesResourceObserver {
     captured_bytes: usize,
 }
 impl MarkdownLayoutFontBytesResourceObserver {
+    /// 只比较同一实际映射的释放收据，不保活映射，也不以文件路径、长度或内容相同猜共享。
+    /// 多个字号可拥有不同 Font payload 而共享该映射，释放责任须分别判断。
+    #[must_use]
+    pub fn same_mapping_resource(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.facts, &other.facts)
+    }
+
     #[must_use]
     pub fn mapping_drop_completed(&self) -> bool {
         self.facts.completed.load(Ordering::Acquire)

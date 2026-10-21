@@ -116,7 +116,7 @@ pub(super) struct NativeMarkdownControllerIvars {
     pub(super) exit_button: OnceCell<Retained<NSButton>>,
     pub(super) presentation_mode_button: OnceCell<Retained<NSButton>>,
     /// 只反映窗口已接受的实际模式，Busy只能用它修复picker，不能授权模式动作。
-    published_presentation_mode: Cell<MarkdownPresentationMode>,
+    pub(super) published_presentation_mode: Cell<MarkdownPresentationMode>,
     pub(super) table_menu_item: OnceCell<Retained<NSMenuItem>>,
     pub(super) copy_document_menu_item: OnceCell<Retained<NSMenuItem>>,
     pub(super) status_label: OnceCell<Retained<NSTextField>>,
@@ -1140,20 +1140,6 @@ impl NativeMarkdownController {
         }
     }
 
-    /// Acknowledges an explicit system pasteboard write without retaining a copied document.
-    pub(super) fn present_copy_confirmation(&self) {
-        if let Some(status_label) = self.ivars().status_label.get() {
-            // Confirmation uses the existing foreground label and schedules no reset timer.
-            status_label.setStringValue(ns_string!("已复制全文"));
-            // 新的确认不能继续展示上一错误或恢复提示的悬停消息。
-            status_label.setToolTip(None);
-            status_label.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
-                0.45, 0.72, 0.56, 1.0,
-            )));
-        }
-        self.set_feedback_visible(true);
-    }
-
     /// Reflects actual cursor exhaustion without probing the filesystem from idle UI.
     pub(super) fn set_next_sidebar_page_available(&self, available: bool) {
         // The button is installed once and remains borrowed by its native target until close detaches it.
@@ -1392,6 +1378,8 @@ impl NativeMarkdownController {
                 objc2_app_kit::NSControlStateValueOff
             });
         }
+        // 菜单只跟随已接受的实际模式；预览中的折叠项不能被“有文稿”状态重新启用。
+        set_current_note_actions_available(self, self.ivars().document_actions_available.get());
         self.render_footer();
     }
 }

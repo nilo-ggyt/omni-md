@@ -290,12 +290,39 @@ impl NativeMarkdownFindBar {
         self.is_visible().then(|| self.root.frame())
     }
 
-    /// 仅作原请求成功收据的UI附证，不以旧文案或slot消失推断定位成功。
+    /// 原Host夹具只知道前三个候选，不能把它们当全文总数；此处仅保留成功文案附证。
+    /// 真正成功仍由原请求终态和同Scene完整CPU帧认证，此形态门不成为计数的独立oracle。
     #[cfg(feature = "native-markdown-runtime-probe")]
     pub(super) fn probe_found_feedback(&self) -> bool {
+        let value = self.status.stringValue();
+        if value.length() > 64 {
+            return false; // 两个usize序号及固定短标签之外不可能是本成功文案，不复制任意长反馈。
+        }
+        let value = value.to_string();
+        let Some(numbers) = value
+            .strip_prefix("第 ")
+            .and_then(|value| value.strip_suffix(" 处匹配"))
+        else {
+            return false;
+        };
+        let Some((ordinal, total)) = numbers.split_once(" / ") else {
+            return false;
+        };
+        let (Ok(ordinal), Ok(total)) = (ordinal.parse::<usize>(), total.parse::<usize>()) else {
+            return false;
+        };
+        // 完整规范回构排除符号、前导零和附加文字；仍不借这份UI值证明源中实际有多少匹配。
+        ordinal != 0 && ordinal <= total && value == format!("第 {ordinal} / {total} 处匹配")
+    }
+
+    /// 已知合成源的序号/总数独立精确核对，不用上面的形态门放宽真实导航和回绕断言。
+    #[cfg(feature = "native-markdown-runtime-probe")]
+    pub(super) fn probe_numbered_feedback(&self, ordinal: usize, total: usize) -> bool {
         self.status
             .stringValue()
-            .isEqualToString(ns_string!("找到匹配"))
+            .isEqualToString(&NSString::from_str(&format!(
+                "第 {ordinal} / {total} 处匹配"
+            )))
     }
 
     /// 只观察原控件有限状态值，供旧输入反馈不得覆盖显式动作的真实竞态回归。

@@ -288,14 +288,9 @@ impl NativeMarkdownPagedFindRevealRequest {
         if !verified.key().same(proof.key()) || !self.is_current() {
             return Err("原查找可见证明在复核后已失效".into());
         }
-        let text = match self.feedback {
-            NativeMarkdownFindRevealFeedback::Found => ns_string!("找到匹配"),
-            NativeMarkdownFindRevealFeedback::ReplacedNext => {
-                ns_string!("已替换，并选中下一个匹配")
-            }
-            NativeMarkdownFindRevealFeedback::ReplacedLast => ns_string!("已替换，没有更多匹配"),
-        };
-        self.write_feedback(text)?;
+        // 计数只是一份原扫描收据；到此仍须完整通过上方同Scene/Input/Source的真实可见证明。
+        let text = NSString::from_str(&self.feedback.text());
+        self.write_feedback(&text)?;
         if !self.is_current() {
             return Err("查找成功反馈已被后继请求撤销".into());
         }

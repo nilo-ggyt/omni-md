@@ -3,8 +3,12 @@
 
 use std::{io::Write, ptr::NonNull};
 
-use objc2::{AnyThread, rc::autoreleasepool, runtime::AnyObject};
-use objc2_app_kit::NSFontAttributeName;
+use objc2::{
+    AnyThread,
+    rc::{Retained, autoreleasepool},
+    runtime::AnyObject,
+};
+use objc2_app_kit::{NSFont, NSFontAttributeName};
 use objc2_core_foundation::{CFRange, CFString, CFType, CGSize};
 use objc2_core_text::{CTFont, CTLine, CTRun, kCTFontAttributeName};
 use objc2_foundation::{MainThreadMarker, NSAttributedString, NSDictionary, NSString};
@@ -14,7 +18,9 @@ use omni_markdown_core::{
 };
 
 use super::{MAXIMUM_FONT_BYTES, NativeMarkdownPagedFont, assert_released};
-use omni_md_plugin::native_surface::native_markdown_document_fixed_font;
+use omni_md_plugin::native_surface::{
+    native_markdown_document_fixed_font, native_markdown_document_font,
+};
 
 // 三个完整上下文固定且远小于2KiB；孤立标点、汉字邻接与拉丁混排都不能截成同一种参考。
 const CASES: [(&str, &str); 3] = [
@@ -43,6 +49,7 @@ fn core_glyphs(
     font: &MarkdownLayoutFont,
     text: &str,
     language: Option<&'static str>,
+    points: f32,
 ) -> Result<Vec<Glyph>, String> {
     let source_authority = source.authority();
     let font_authority = font.authority();
@@ -56,7 +63,8 @@ fn core_glyphs(
             direction: MarkdownShapingDirection::LeftToRight,
             script: *b"Hani",
             language: language.map(str::to_owned),
-            points: 14.0,
+            // 字号来自本例真实捕获的 Native Font；比例 Preview 不能沿用源码的 14pt。
+            points,
             beginning_of_text: true,
             end_of_text: true,
             features: Vec::new(),
@@ -127,6 +135,8 @@ fn core_observations(
     font: MarkdownLayoutFont,
     label: &'static str,
     text: &'static str,
+    points: f32,
+    role: &'static str,
 ) -> Result<Vec<Observation>, String> {
     let mut file = tempfile::NamedTempFile::new()
         .map_err(|cause| format!("固定短例临时文件创建失败：{cause}"))?;
@@ -142,9 +152,9 @@ fn core_observations(
     let result = (|| {
         let mut observations = Vec::with_capacity(3);
         for language in [None, Some("zh-Hans"), Some("en")] {
-            let glyphs = core_glyphs(&source, &font, text, language)?;
+            let glyphs = core_glyphs(&source, &font, text, language, points)?;
             println!(
-                "native_paged_punctuation side=core case={label} language={} glyphs={glyphs:?}",
+                "native_paged_punctuation side=core case={label} font_role={role} point_size={points} language={} glyphs={glyphs:?}",
                 language.unwrap_or("none")
             );
             observations.push(Observation { language, glyphs });
@@ -164,7 +174,12 @@ fn core_observations(
 }
 
 /// 原生参考只用完整固定短串与捕获时同一个真实 CTFont，不从候选 glyph 或局部子串反造期望。
-fn native_glyphs(font: &CTFont, label: &str, source: &str) -> Result<Vec<Glyph>, String> {
+fn native_glyphs(
+    font: &CTFont,
+    label: &str,
+    source: &str,
+    role: &str,
+) -> Result<Vec<Glyph>, String> {
     autoreleasepool(|_| {
         let text = NSString::from_str(source);
         let font_type: &CFType = font.as_ref();
@@ -262,16 +277,14 @@ fn native_glyphs(font: &CTFont, label: &str, source: &str) -> Result<Vec<Glyph>,
             return Err("原生短例没有交付 line 声明的全部真实 glyph".into());
         }
         println!(
-            "native_paged_punctuation side=native case={label} language=unset glyphs={result:?}"
+            "native_paged_punctuation side=native case={label} font_role={role} language=unset glyphs={result:?}"
         );
         Ok(result)
     })
 }
 
-pub(super) fn run(mtm: MainThreadMarker) {
-    // 和正式编辑器相同的公开 14pt 文稿等宽角色；不按系统字体名称重建或覆盖 feature。
-    let base =
-        native_markdown_document_fixed_font(14.0).expect("系统必须为本机正式文稿提供实际等宽角色");
+/// 每个真实产品角色独立捕获、整形和释放，不能让第二种字号沿用第一种 Core 实例。
+fn run_role(mtm: MainThreadMarker, base: Retained<NSFont>, role: &'static str) {
     let scalar = CFString::from_str("，");
     let base_font: &CTFont = base.as_ref();
     // SAFETY: 原文稿 base 为完整 FF0C 选择真实回退；所有 case 共用这一实际不可变实例。
@@ -280,8 +293,11 @@ pub(super) fn run(mtm: MainThreadMarker) {
         .expect("固定标点例的真实文稿字体必须经过原生产捕获边界");
     let bytes = captured.bytes_observer();
     let payload = captured.core_font().resource_observer();
+    // 两个生产字号均可精确表示为 f32；传入 Core 的值必须仍绑定本例实际 Native 字号。
+    let native_points = captured.point_size();
+    let points = native_points as f32;
     println!(
-        "native_paged_punctuation font_metadata={:?} point_size={} actual_capture=true font_role=document_fixed_pitch interface_font_parity_required=false",
+        "native_paged_punctuation font_metadata={:?} point_size={} actual_capture=true font_role={role} interface_font_parity_required=false",
         captured.core_font().metadata(),
         captured.point_size()
     );
@@ -289,13 +305,16 @@ pub(super) fn run(mtm: MainThreadMarker) {
     for (label, text) in CASES {
         let core_font = captured.core_font().clone();
         // 原非 Send Job 仍在真实线程内构造/归还；每个短源、映射与 glyph 存储先结束再推进后例。
-        let worker = std::thread::spawn(move || core_observations(core_font, label, text));
-        let actual_native = native_glyphs(captured.native_font(), label, text);
+        let worker =
+            std::thread::spawn(move || core_observations(core_font, label, text, points, role));
+        let actual_native = native_glyphs(captured.native_font(), label, text, role);
         observations.push((label, worker.join(), actual_native));
     }
     drop((captured, native, scalar, base));
     assert!(payload.payload_released(), "固定标点例仍保活 Core Font");
     assert_released(&bytes);
+    // 连字号表示检查也放在原资源收尾后，不能新增一个先 panic 而漏验释放的出口。
+    assert_eq!(f64::from(points), native_points);
     // 默认比对放在真实字形、Source、Font 和 mmap 释放之后；不能因差异 panic 漏掉清理核验。
     for (label, actual_core, actual_native) in observations {
         let actual_core = actual_core
@@ -308,10 +327,24 @@ pub(super) fn run(mtm: MainThreadMarker) {
             .expect("真实 None 语言观察不可缺失");
         assert_eq!(
             default.glyphs, actual_native,
-            "{label}: 同一文稿字体的 Core 默认 None 必须与 Native 默认完整短串一致；不能择另一语言过关"
+            "{role}/{label}: 同一文稿字体的 Core 默认 None 必须与 Native 默认完整短串一致；不能择另一语言过关"
         );
     }
     println!(
-        "native_paged_punctuation default_language_exact=true explicit_languages_observed=true glyph_stores_released=true source_released=true font_unmapped=true formal=false"
+        "native_paged_punctuation font_role={role} default_language_exact=true explicit_languages_observed=true glyph_stores_released=true source_released=true font_unmapped=true formal=false"
     );
+}
+
+pub(super) fn run(mtm: MainThreadMarker) {
+    // 原 Source 的 14pt 等宽文稿控制完整保留，先结束其 Source、Job 与字体映射再换角色。
+    // 工厂与正式产品相同；不按字体名字重建、设置语言/feature 或关闭 kern。
+    let source =
+        native_markdown_document_fixed_font(14.0).expect("系统必须为本机正式文稿提供实际等宽角色");
+    run_role(mtm, source, "document_fixed_pitch");
+
+    // Preview 新增的 15pt 比例文稿角色也须经过自己的真实回退捕获与全部严格上下文。
+    // 同一比较和释放路径仅接收不同实际 Font，不复制 Native 参考或借旧字号的字距结果。
+    let preview =
+        native_markdown_document_font(15.0).expect("系统必须为本机正式预览提供实际比例角色");
+    run_role(mtm, preview, "document_proportional");
 }

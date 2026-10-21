@@ -536,7 +536,7 @@ pub(super) fn run_ready_control(
             )
         };
         if !matches!(execute(), Ok(NativeMarkdownFindExecution::Complete))
-            || !bar.probe_found_feedback()
+            || !bar.probe_numbered_feedback(1, 1)
             || port.0.borrow().is_some()
         {
             return Err("真实Ready同票Find未完成原可见fast path".into());
@@ -565,7 +565,7 @@ pub(super) fn run_ready_control(
             Ok(NativeMarkdownFindExecution::Pending(request)) => request,
             _ => return Err("移除Ready后Find没有保持Pending".into()),
         };
-        if pending.completed_visible() || bar.probe_found_feedback() {
+        if pending.completed_visible() || bar.probe_numbered_feedback(1, 1) {
             return Err("Pending复用了旧可见成功".into());
         }
         port.cancel_pending();
