@@ -60,13 +60,29 @@ fn wait(
     frame: Rc<Frame>,
     expected_complete: bool,
 ) -> Result<NativeMarkdownPagedBodyProgress, String> {
+    let mut finished_without_frame = false;
     if frame.published.borrow().is_none() {
         frame.waiting.set(true);
-        if let Some(remaining) = Duration::from_secs(3).checked_sub(frame.started.elapsed()) {
-            // SAFETY: 同步动作也计入原三秒；这里只等待剩余时间，真实完整帧提前停止原loop。
-            unsafe {
-                CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), false)
+        while frame.published.borrow().is_none() {
+            let Some(remaining) = Duration::from_secs(3)
+                .checked_sub(frame.started.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                break;
             };
+            // 共享主runloop也可能被先前窗口/释放回调stop；Stopped不代表原帧已交付或三秒到期。
+            // 每次只等待同一started期限的剩余时间，且唯一完成条件仍是原frame_published通知。
+            let progress = autoreleasepool(|_| {
+                // SAFETY: 原主线程default mode；没有文稿/Scene/RefCell借用跨真实source交付。
+                unsafe {
+                    CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), false)
+                }
+            });
+            if progress == objc2_core_foundation::CFRunLoopRunResult::Finished {
+                // 无可运行source时重入会立即返回；保明确失败，不空转、不重发观察或生产请求。
+                finished_without_frame = frame.published.borrow().is_none();
+                break;
+            }
         }
         frame.waiting.set(false);
     }
@@ -102,11 +118,13 @@ fn wait(
         frame.started.elapsed().as_secs_f64() * 1000.0,
         frame.published.borrow().is_some()
     );
-    let (key, paints, elapsed) = frame
-        .published
-        .borrow_mut()
-        .take()
-        .ok_or_else(|| format!("{stage}: 原三秒内没有真实完整帧通知"))?;
+    let (key, paints, elapsed) = frame.published.borrow_mut().take().ok_or_else(|| {
+        if finished_without_frame {
+            format!("{stage}: 原runloop已无可交付source，真实完整帧通知仍未完成")
+        } else {
+            format!("{stage}: 原三秒内没有真实完整帧通知")
+        }
+    })?;
     let actual = view
         .capture_ready_scene_key()
         .map_err(|cause| cause.to_string())?;

@@ -369,6 +369,12 @@ pub struct NativeMarkdownPagedCharacterRect {
 pub trait NativeMarkdownPagedTextScene {
     fn key(&self) -> &NativeMarkdownPagedSceneKey;
 
+    /// 仅枚举当前已封存、已裁剪的链接标签几何；不查URL、不推进Parser或创建链接目录。
+    /// 调用者须另证完整CPU帧已发布；visit只收集Copy值，归还Scene后才可进入Native登记。
+    fn visit_link_cursor_rects(&self, _visit: &mut dyn FnMut(NSRect)) -> Result<()> {
+        Ok(())
+    }
+
     /// 命中只读取本次已封存的可见LINK part和原GCB，不在mousedown同步解析或打开URL。
     fn link_hit(&self, _local: NSPoint) -> Result<Option<(std::ops::Range<usize>, usize)>> {
         Ok(None)

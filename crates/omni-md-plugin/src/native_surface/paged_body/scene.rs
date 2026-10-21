@@ -686,6 +686,18 @@ impl NativeMarkdownPagedTextScene for Scene {
     fn key(&self) -> &NativeMarkdownPagedSceneKey {
         &self.key
     }
+    /// 正文与只读格仍借同一张Scene；只交当前sealed标签的矩形，不登记URL或持久几何表。
+    /// visit只收集Copy矩形；调用者须归还这张Scene后才可进入Native，返回前仍读原Source首错。
+    fn visit_link_cursor_rects(&self, visit: &mut dyn FnMut(NSRect)) -> Result<()> {
+        self.require()?;
+        if let Some(window) = &self.window {
+            window
+                .visit_link_cursor_rects(&|| self.current(), visit)
+                .map_err(scene_error)?;
+        }
+        self.visit_grid_link_cursor_rects(visit)?;
+        self.require()
+    }
     /// 原sealed LINK part与真实GCB侧只授命中事实，不同步推进语义或把marker当作label。
     fn link_hit(&self, local: NSPoint) -> Result<Option<(Range<usize>, usize)>> {
         self.require()?;

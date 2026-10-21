@@ -25,6 +25,34 @@ pub struct NativeMarkdownComposedViewportHit {
 }
 
 impl NativeMarkdownComposedViewport {
+    /// 只线性枚举当前可见标签的真实推进包络，不查询目标或复制字形/正文。
+    /// 原同View坐标与viewport/cell clip在本层确定，AppKit光标区域的排序合并归安装者负责。
+    pub(in crate::native_surface) fn visit_link_cursor_rects(
+        &self,
+        current: &dyn Fn() -> bool,
+        visit: &mut dyn FnMut(NSRect),
+    ) -> Result<()> {
+        self.require(current)?;
+        for line in self.lines.iter().filter(|line| self.visible(line.frame)) {
+            for part in &line.parts {
+                let Some(area) = link_part_rect(line, part) else {
+                    continue;
+                };
+                let area = objc2_foundation::NSIntersectionRect(area, self.clip());
+                if area.size.width <= 0.0 || area.size.height <= 0.0 {
+                    continue; // 离屏与零advance不扩大成整行或相邻格的悬停范围。
+                }
+                if !rect(area) {
+                    return Err(NativeMarkdownComposedViewportError::InvalidGeometry);
+                }
+                self.require(current)?; // 只交纯Copy几何；调用者收集完毕并归还Scene后才可进入Native。
+                visit(area);
+                self.require(current)?; // Source首错仍来自原输出，临时集合不能给后继Scene补票。
+            }
+        }
+        self.require(current)
+    }
+
     /// Find只借当前可见软行的真实part源域；Preview的Markdown语法没有高亮权限，
     /// Source保留字面字符。折叠区和表格占位没有普通正文glyph，不能借行包络扫描其隐藏源。
     pub(in crate::native_surface) fn visible_find_ranges(
@@ -76,20 +104,10 @@ impl NativeMarkdownComposedViewport {
             }
             for part in &line.parts {
                 let facts = part.handle.facts();
-                let styles = facts.presentation;
-                if !styles.contains(MarkdownPresentationStyles::LINK)
-                    || styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER)
-                    || styles.contains(MarkdownPresentationStyles::MARKER)
-                {
-                    continue; // 激活只属于原链接正文；显露的Markdown语法仍可普通点击、选择和编辑。
-                }
-                let start = line.baseline.x + facts.origin_x_26_6 as f64 / 64.0;
-                let end = start + facts.x_advance_26_6 as f64 / 64.0;
-                let rect = NSRect::new(
-                    NSPoint::new(start.min(end), line.baseline.y - line.descent),
-                    NSSize::new((end - start).abs(), line.ascent + line.descent),
-                );
-                if inside(local, rect) {
+                let Some(area) = link_part_rect(line, part) else {
+                    continue;
+                };
+                if inside(local, area) {
                     self.require(current)?;
                     return Ok(Some(facts.source_utf16.clone()));
                 }
@@ -687,6 +705,25 @@ impl NativeMarkdownComposedViewport {
         }
         Ok(rect)
     }
+}
+
+/// 点击和悬停共享同一实际LINK标签包络；显露语法与零advance不获得额外激活区域。
+/// 负advance只交换左右边，仍保原行的真实字体高，不按UTF16个数或字形平均宽度猜测。
+fn link_part_rect(line: &Line, part: &Part) -> Option<NSRect> {
+    let facts = part.handle.facts();
+    let styles = facts.presentation;
+    if !styles.contains(MarkdownPresentationStyles::LINK)
+        || styles.contains(MarkdownPresentationStyles::HIDDEN_MARKER)
+        || styles.contains(MarkdownPresentationStyles::MARKER)
+    {
+        return None;
+    }
+    let start = line.baseline.x + facts.origin_x_26_6 as f64 / 64.0;
+    let end = start + facts.x_advance_26_6 as f64 / 64.0;
+    Some(NSRect::new(
+        NSPoint::new(start.min(end), line.baseline.y - line.descent),
+        NSSize::new((end - start).abs(), line.ascent + line.descent),
+    ))
 }
 
 fn inside(point: NSPoint, clip: NSRect) -> bool {

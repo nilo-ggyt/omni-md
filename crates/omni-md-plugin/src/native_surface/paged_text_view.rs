@@ -32,6 +32,7 @@ mod close;
 mod commands;
 mod context_menu;
 mod cpu;
+mod cursor;
 mod find;
 mod folding;
 mod formatting;
@@ -457,6 +458,16 @@ define_class!(
             // 显示入口允许放弃获取期间已被真实输入或几何换代取代的旧请求。
             // 输入命令仍走严格 scene()；实际 CPU 绘图和资源错误继续记录到原失败槽。
             self.record(surface.paint_current(self));
+        }
+        #[unsafe(method(resetCursorRects))]
+        /// AppKit拥有光标区域；只有原完整CPU图仍当前时才登记链接手形，不创建tracking续体。
+        fn reset_cursor_rects(&self) {
+            let _use = PayloadUseGuard::enter(&self.ivars().depth);
+            self.discardCursorRects();
+            if self.ivars().closed.get() { return; }
+            let result = self.install_link_cursor_rects();
+            if result.is_err() { self.discardCursorRects(); }
+            self.record(result);
         }
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
@@ -993,6 +1004,7 @@ impl NativeMarkdownPagedTextView {
         self.ivars().composition_anchor.set(None); // 真实几何换代结束原组字插入点坐标的交接。
         self.cancel_link_intent(); // 宽度、滚动或frame换代使原鼠标命中失效，不能给旧click补签新坐标。
         let result = advance_geometry(&self.ivars().geometry_epoch, &self.ivars().geometry_failed);
+        self.discardCursorRects(); // 先推进原几何票再撤区，Native重入不能重新安装已退休的旧几何。
         let cpu = self.ivars().cpu.borrow().clone();
         if let Some(cpu) = cpu {
             cpu.cancel_candidate();
@@ -1000,9 +1012,10 @@ impl NativeMarkdownPagedTextView {
         result
     }
     /// 原Body退休Scene时同步撤掉本View唯一未发布候选；Input/几何和已发布像素保持原归属。
-    /// 此入口不查询Native或后继Scene。先退出CPU槽借用，再归还旧绘图会话、context与tiles；
+    /// 不领取后继Scene；原Scene已退槽才撤AppKit光标区。先退出CPU槽借用，再归还绘图context与tiles；
     /// 已排队闭包只持Weak/serial，发现原serial失效即退出，不能把旧Scene退休写成输入失败。
     pub(in crate::native_surface) fn retire_scene_candidate(&self) {
+        self.discardCursorRects(); // 原Scene退场时同步撤光标，不等新Input或CPU覆盖旧手形。
         let cpu = self.ivars().cpu.borrow().clone();
         if let Some(cpu) = cpu {
             cpu.cancel_candidate();
@@ -1108,6 +1121,7 @@ impl NativeMarkdownPagedTextView {
         let receipt = NativeMarkdownPagedCloseReceipt::new(self.mtm());
         *self.ivars().close_receipt.borrow_mut() = Some(Rc::clone(&receipt));
         self.ivars().closed.set(true);
+        self.discardCursorRects(); // 框架即使短暂保留空壳，也不保旧文稿的链接命中区域。
         self.ivars().composition_anchor.set(None); // 系统缓存即使保留空视图，也不能保留原文稿位置或输入状态。
         self.close_context_menu(); // 跟踪中的原菜单先结束且失去target/action，不能在关闭后路由到另一篇笔记。
         self.unregisterDraggedTypes(); // 封闭后不再接收新路径或文本，原队列的已有载荷由Body同步归还。

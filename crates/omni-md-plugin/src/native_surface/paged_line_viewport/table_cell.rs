@@ -12,6 +12,16 @@ pub struct NativeMarkdownComposedTableCell {
 }
 
 impl NativeMarkdownComposedTableCell {
+    /// 悬停只消费显示窗口的真实几何，不需要canonical映射或链接目标副本。
+    /// window已用content_frame与外层viewport交集裁剪，不能把手形扩到格padding或邻格。
+    pub(in crate::native_surface) fn visit_link_cursor_rects(
+        &self,
+        current: &dyn Fn() -> bool,
+        visit: &mut dyn FnMut(NSRect),
+    ) -> Result<()> {
+        self.window.visit_link_cursor_rects(current, visit)
+    }
+
     /// 只读格拖选沿原实际显示行投影；canonical命中仍由下面同一display映射完成。
     pub(in crate::native_surface) fn project_drag_point(
         &self,

@@ -19,6 +19,8 @@ pub enum NativeMarkdownHostedFlow {
     SourceFolding,
     SourcePendingMode,
     SourceRelativeLink,
+    /// 同一相对笔记流程末尾追加一次显式本轮HTTP交接；只有CompleteUi宿主持有对应服务器。
+    SourceRelativeLinkHttp,
 }
 
 impl NativeMarkdownHostedFlow {
@@ -30,6 +32,7 @@ impl NativeMarkdownHostedFlow {
             Self::SourceFolding => SOURCE_FOLDING_STEPS,
             Self::SourcePendingMode => SOURCE_PENDING_STEPS,
             Self::SourceRelativeLink => SOURCE_RELATIVE_STEPS,
+            Self::SourceRelativeLinkHttp => SOURCE_RELATIVE_HTTP_STEPS,
         }
     }
 }
@@ -233,6 +236,10 @@ pub enum NativeMarkdownHostedStep {
     VerifyRelativeLinkTargetFrame,
     /// 核原未保存编辑已实际落盘，目标文件字节及元数据保持不变。
     VerifyRelativeLinkSaved,
+    /// 沿目标正文的真实Command鼠标链交付本轮HTTP页面；不直接调用系统打开API。
+    RelativeLinkHttpMouseUp,
+    /// Host收到本轮GET及真实pagehide后，核原目标文稿、历史、图及磁盘仍未变化。
+    VerifyRelativeLinkHttpUnchanged,
     /// 在同一原Host窗口结束已绑定目标，关闭后分别核源保存与目标释放。
     RelativeLinkReturn,
 }
@@ -323,6 +330,8 @@ impl NativeMarkdownHostedStep {
             Self::VerifyRelativeLinkTargetFrame => Some(573),
             Self::VerifyRelativeLinkSaved => Some(574),
             Self::RelativeLinkReturn => Some(575),
+            Self::RelativeLinkHttpMouseUp => Some(576),
+            Self::VerifyRelativeLinkHttpUnchanged => Some(577),
             _ => None,
         }
     }
@@ -452,9 +461,23 @@ const SOURCE_RELATIVE_STEPS: &[NativeMarkdownHostedStep] = &[
     NativeMarkdownHostedStep::RelativeLinkReturn,
 ];
 
+const SOURCE_RELATIVE_HTTP_STEPS: &[NativeMarkdownHostedStep] = &[
+    NativeMarkdownHostedStep::VerifyOpen,
+    NativeMarkdownHostedStep::RelativeLinkEdit,
+    NativeMarkdownHostedStep::VerifyRelativeLinkEditedFrame,
+    NativeMarkdownHostedStep::RelativeLinkMouseUp,
+    NativeMarkdownHostedStep::VerifyRelativeLinkTargetFrame,
+    NativeMarkdownHostedStep::VerifyRelativeLinkSaved,
+    NativeMarkdownHostedStep::RelativeLinkHttpMouseUp,
+    NativeMarkdownHostedStep::VerifyRelativeLinkHttpUnchanged,
+    NativeMarkdownHostedStep::RelativeLinkReturn,
+];
+
 /// 只持原弱正文、标量收据及原动作的有限请求；实际session与Native强图继续完全归Host。
 pub struct NativeMarkdownHostedWorkload {
     workload: NativeMarkdownMemoryWorkload,
+    /// 只有显式HTTP夹具构造持有这个有限URL；正常Full/SystemIme不创建网络或页面字段。
+    http_link: Option<String>,
     editing: RefCell<Option<HostedEditingProbe>>,
     editing_started: Cell<bool>,
     editing_completed: Cell<bool>,
@@ -490,11 +513,32 @@ impl NativeMarkdownHostedWorkload {
         workload.verify_unchanged()?;
         Ok(Self {
             workload,
+            http_link: None,
             editing: RefCell::new(None),
             editing_started: Cell::new(false),
             editing_completed: Cell::new(false),
             editing_failed: Cell::new(false),
         })
+    }
+
+    /// URL由本轮服务器拥有者显式交付；这个入口仍观察现成Host会话，不创建第二个编辑器。
+    pub fn observe_active_document_with_http_link(path: &Path, url: &str) -> Result<Self, String> {
+        let Some(address) = url.strip_prefix("http://127.0.0.1:") else {
+            return Err("HTTP验收链接必须属于显式本机服务器".into());
+        };
+        let (port, path_part) = address.split_once('/').ok_or("HTTP验收链接缺少本轮路径")?;
+        if url.len() > 256
+            || port.parse::<std::num::NonZeroU16>().is_err()
+            || !path_part.strip_prefix("omni-accept/").is_some_and(|nonce| {
+                nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err("HTTP验收链接不符合有限本轮身份".into());
+        }
+        let mut bridge =
+            Self::observe_active_document(path, NativeMarkdownHostedFlow::SourceRelativeLinkHttp)?;
+        bridge.http_link = Some(url.to_owned());
+        Ok(bridge)
     }
 
     /// 复用原工作负载生产动作与检查；调用者用真实事件边界安排后继验证，不执行嵌套run loop。
@@ -505,7 +549,9 @@ impl NativeMarkdownHostedWorkload {
                 425..=438 => self.workload.exercise_find_highlights(stage),
                 440..=469 | 560..=565 => self.workload.exercise_source_session(stage),
                 540..=555 => self.workload.exercise_source_folding(stage),
-                570..=575 => self.workload.exercise_relative_link(stage),
+                570..=577 => self
+                    .workload
+                    .exercise_relative_link(stage, self.http_link.as_deref()),
                 _ => unreachable!("原具名步骤只签发有限专项阶段"),
             };
         }

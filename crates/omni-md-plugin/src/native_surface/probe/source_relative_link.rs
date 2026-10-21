@@ -1,7 +1,7 @@
 //! 隔离笔记库内的真实链接交接：未保存编辑、原鼠标激活、旧图释放与目标完整帧分别核验。
 
 use super::*;
-use objc2::rc::Weak as NativeWeak;
+use objc2::rc::{Retained, Weak as NativeWeak};
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
 use omni_markdown_core::MarkdownDocumentRevision;
@@ -16,6 +16,52 @@ const TARGET_TEXT: &str =
 const PREFIX: &str =
     "未保存的中文😀前缀。\n\n[打开目标](相对链接验收/目标笔记.md#linked-target)\n\n";
 const LABEL: &str = "打开目标";
+const HTTP_LABEL: &str = "打开外部验收页";
+
+/// 精确目标由固定原文及有限HTTP后缀组成；比较接收流，不把canonical目标拼成第二份正文。
+struct TargetComparison<'a> {
+    expected: io::Chain<io::Cursor<&'static [u8]>, io::Cursor<&'a [u8]>>,
+    length: usize,
+    written: usize,
+}
+
+impl<'a> TargetComparison<'a> {
+    fn new(suffix: Option<&'a str>) -> Self {
+        let suffix = suffix.unwrap_or("").as_bytes();
+        Self {
+            expected: io::Cursor::new(TARGET_TEXT.as_bytes()).chain(io::Cursor::new(suffix)),
+            length: TARGET_TEXT.len() + suffix.len(),
+            written: 0,
+        }
+    }
+
+    fn finish(self) -> Result<(), String> {
+        if self.written != self.length {
+            return Err("相对链接目标缺少预声明字节".into());
+        }
+        Ok(())
+    }
+}
+
+impl Write for TargetComparison<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut expected = [0_u8; 512];
+        for part in bytes.chunks(expected.len()) {
+            self.expected.read_exact(&mut expected[..part.len()])?;
+            if part != &expected[..part.len()] {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "目标字节不同于预声明夹具",
+                ));
+            }
+            self.written += part.len();
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// 两个文件各有自己的磁盘身份；保存只能替换源文件，目标不能因打开或关闭被重写。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,13 +219,26 @@ pub(in super::super) struct RelativeLink {
     started: Cell<Option<Instant>>,
     signal: RefCell<Option<Box<dyn FnOnce()>>>,
     failure: RefCell<Option<String>>,
+    http_suffix: Option<String>,
+    http_input: Cell<Option<NativeMarkdownPagedInputState>>,
 }
 
 impl RelativeLink {
     /// 原401已确认首屏；只有显式相对链接流程可在Host独占合成库建立自己的create_new文件。
-    fn begin(workload: &NativeMarkdownMemoryWorkload) -> Result<Rc<Self>, String> {
-        if workload.flow != NativeMarkdownHostedFlow::SourceRelativeLink {
+    fn begin(
+        workload: &NativeMarkdownMemoryWorkload,
+        http_url: Option<&str>,
+    ) -> Result<Rc<Self>, String> {
+        if !matches!(
+            workload.flow,
+            NativeMarkdownHostedFlow::SourceRelativeLink
+                | NativeMarkdownHostedFlow::SourceRelativeLinkHttp
+        ) {
             return Err("相对链接文件只允许建在本轮明确的Host合成场景".into());
+        }
+        if (workload.flow == NativeMarkdownHostedFlow::SourceRelativeLinkHttp) != http_url.is_some()
+        {
+            return Err("HTTP流程和本轮显式页面身份不一致".into());
         }
         workload.verify_open()?;
         let original = workload.facts()?;
@@ -194,6 +253,12 @@ impl RelativeLink {
         created
             .write_all(TARGET_TEXT.as_bytes())
             .map_err(|cause| cause.to_string())?;
+        let http_suffix = http_url.map(|url| format!("\n[{HTTP_LABEL}]({url})\n"));
+        if let Some(suffix) = &http_suffix {
+            created
+                .write_all(suffix.as_bytes())
+                .map_err(|cause| cause.to_string())?;
+        } // 初次创建即封存完整目标；后续HTTP点击不编辑已通过原revision和磁盘身份门的笔记。
         created.sync_all().map_err(|cause| cause.to_string())?;
         drop(created);
         let target_disk = disk_identity(&target_path)?;
@@ -261,6 +326,8 @@ impl RelativeLink {
             started: Cell::new(None),
             signal: RefCell::new(None),
             failure: RefCell::new(None),
+            http_suffix,
+            http_input: Cell::new(None),
         });
         case.insert(workload)?;
         Ok(case)
@@ -567,7 +634,14 @@ impl RelativeLink {
                 || document.original_revision() != Some(self.target_revision)
                 || document.is_dirty()
                 || document.generation() != 0
-                || document.utf16_len() != TARGET_TEXT.encode_utf16().count()
+                || document.utf16_len()
+                    != TARGET_TEXT.encode_utf16().count()
+                        + self
+                            .http_suffix
+                            .as_deref()
+                            .unwrap_or("")
+                            .encode_utf16()
+                            .count()
                 || document.can_undo()
                 || document.can_redo()
             {
@@ -902,17 +976,11 @@ impl RelativeLink {
                 )
                 .map_err(|cause| cause.to_string())?;
             let document = editor.document().borrow();
-            let mut bytes = [0_u8; TARGET_TEXT.len()];
-            let written = {
-                let mut comparison = io::Cursor::new(bytes.as_mut_slice());
-                document
-                    .write_to(&mut comparison)
-                    .map_err(|cause| cause.to_string())?;
-                comparison.position() as usize
-            };
-            if written != TARGET_TEXT.len() || bytes != TARGET_TEXT.as_bytes() {
-                return Err("相对链接目标canonical不同于独立固定字节".into());
-            }
+            let mut comparison = TargetComparison::new(self.http_suffix.as_deref());
+            document
+                .write_to(&mut comparison)
+                .map_err(|cause| cause.to_string())?;
+            comparison.finish()?;
             drop(document);
             *self.target_graph.borrow_mut() = Some(Graph::capture(surface)?);
             Ok(())
@@ -1020,14 +1088,10 @@ impl RelativeLink {
         let file = file.as_mut().ok_or("目标独立FD已归还")?;
         file.seek(SeekFrom::Start(0))
             .map_err(|cause| cause.to_string())?;
-        let mut bytes = [0_u8; TARGET_TEXT.len()];
-        file.read_exact(&mut bytes)
-            .map_err(|cause| cause.to_string())?;
-        let mut tail = [0];
-        if bytes != TARGET_TEXT.as_bytes()
-            || file.read(&mut tail).map_err(|cause| cause.to_string())? != 0
-            || disk_identity(&self.target_path)? != self.target_disk
-        {
+        let mut comparison = TargetComparison::new(self.http_suffix.as_deref());
+        io::copy(file, &mut comparison).map_err(|cause| cause.to_string())?;
+        comparison.finish()?;
+        if disk_identity(&self.target_path)? != self.target_disk {
             return Err("相对链接打开或保存改写了目标文件".into());
         }
         Ok(())
@@ -1061,6 +1125,139 @@ impl RelativeLink {
         if !original && !bound_target {
             return Err("相对链接清理不能接管后来打开的同名Doc".into());
         }
+        Ok(())
+    }
+
+    /// HTTP只借已经通过相对导航的目标图；外部页面不能成为替换Doc、修改历史或重签Source的理由。
+    fn http_target_view(
+        &self,
+    ) -> Result<
+        Rc<Retained<crate::native_surface::paged_text_view::NativeMarkdownPagedTextView>>,
+        String,
+    > {
+        if self.http_suffix.is_none() || self.saved_disk.get().is_none() {
+            return Err("HTTP点击缺少显式页面或原保存完成事实".into());
+        }
+        let view = with_active_native_markdown_surface(|surface| {
+            let (target_document, target_body, navigated) = {
+                let target = self.target.borrow();
+                let target = target.as_ref().ok_or("HTTP目标没有原安装票")?;
+                (
+                    target.document.clone(),
+                    target.body.clone(),
+                    target.navigated_input.get(),
+                )
+            }; // 结束本地观察槽借用，再调用任何View/Scene原生入口。
+            let editor = surface.editor.as_ref().ok_or("HTTP原目标已关闭")?;
+            let input = editor
+                .text_view
+                .input_state()
+                .map_err(|cause| cause.to_string())?;
+            if !WeakMarkdownDocument::ptr_eq(&target_document, &Rc::downgrade(editor.document()))
+                || !std::rc::Weak::ptr_eq(&target_body, &Rc::downgrade(&editor.body))
+                || navigated != Some(input)
+                || self.http_input.get().is_some_and(|before| before != input)
+            {
+                return Err("HTTP改变了原目标Doc/Body或完整Input".into());
+            }
+            let document = editor.document().borrow();
+            if document
+                .current_revision()
+                .map_err(|cause| cause.to_string())?
+                != self.target_revision
+                || document.is_dirty()
+                || document.can_undo()
+                || document.can_redo()
+            {
+                return Err("HTTP外链改变了原目标内容或历史".into());
+            }
+            drop(document); // Source健康和revision先核完，任何后继Native取得都不跨Doc借用。
+            self.require_return_current(surface)?;
+            let key = editor
+                .text_view
+                .capture_ready_scene_key()
+                .map_err(|cause| cause.to_string())?;
+            if key.request.input != input
+                || self
+                    .frame
+                    .key
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|original| original.source != key.source)
+            {
+                return Err("HTTP目标不再使用原Source及完整Input".into());
+            } // 浏览器激活可以改变焦点表现，不因此接受另一份文稿或Source。
+            Ok(Rc::clone(&editor.text_view))
+        })?;
+        if disk_identity(&self.source_path)? != self.saved_disk.get().ok_or("HTTP原保存身份缺失")?
+        {
+            return Err("HTTP改变了已验证源文件的磁盘身份".into());
+        }
+        self.verify_target_file()?;
+        Ok(view)
+    }
+
+    /// 一次已命名的Command鼠标动作；服务器观察由Host在调用前登记，不能以入队当作HTTP成功。
+    fn click_http(&self) -> Result<(), String> {
+        if self.http_input.get().is_some() {
+            return Err("本轮HTTP链接不得重复点击".into());
+        }
+        let view = self.http_target_view()?;
+        let window = self.window.load().ok_or("HTTP原窗口已释放")?;
+        window.makeKeyWindow();
+        if !window.makeFirstResponder(Some(&**view)) || !window.isKeyWindow() {
+            return Err("HTTP原正文没有真实鼠标焦点".into());
+        }
+        let key = view
+            .capture_ready_scene_key()
+            .map_err(|cause| cause.to_string())?;
+        let before = view.input_state().map_err(|cause| cause.to_string())?;
+        // 后缀只有换行和左括号位于标签前；偏移来自独立生成内容，不从点击结果反推。
+        let start = TARGET_TEXT.encode_utf16().count() + 2;
+        let rect = view
+            .screen_rect(NSRange::new(start, 1))
+            .map_err(|cause| cause.to_string())?;
+        if rect.actual_range != NSRange::new(start, 1) || rect.rect.size.width <= 0.0 {
+            return Err("HTTP标签没有完整GCB墨迹点".into());
+        }
+        let point = window.convertPointFromScreen(NSPoint::new(
+            rect.rect.origin.x + rect.rect.size.width * 0.25,
+            rect.rect.origin.y + rect.rect.size.height * 0.5,
+        ));
+        let events = [NSEventType::LeftMouseDown, NSEventType::LeftMouseUp].map(|kind| {
+            NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                kind, point, NSEventModifierFlags::Command, 1.0, window.windowNumber(), None, 1, 1, 1.0,
+            )
+        });
+        let [Some(down), Some(up)] = events else {
+            return Err("无法建立HTTP真实鼠标事件".into());
+        };
+        if !view
+            .capture_ready_scene_key()
+            .is_ok_and(|actual| actual.same(&key))
+            || view.input_state().map_err(|cause| cause.to_string())? != before
+        {
+            return Err("HTTP鼠标构造期间原Scene/Input失效".into());
+        }
+        self.http_input.set(Some(before)); // 唯一动作先消费资格，任何错误均不重新投递外部导航。
+        let application = NSApplication::sharedApplication(window.mtm());
+        application.postEvent_atStart(&down, false);
+        application.postEvent_atStart(&up, false);
+        Ok(())
+    }
+
+    /// Host的真实GET/pagehide门通过后还须原文稿不变；这一步不认证浏览器内部对象或历史数据库。
+    fn verify_http_unchanged(&self) -> Result<(), String> {
+        if self.http_input.get().is_none() {
+            return Err("HTTP没有原鼠标动作票".into());
+        }
+        let view = self.http_target_view()?;
+        if let Some(cause) = view.take_failure() {
+            return Err(cause.to_string());
+        }
+        println!(
+            "native_external_http_link actual_command_mouse=true original_input_unchanged=true original_source_unchanged=true original_history_unchanged=true both_files_unchanged=true https_verified=false browser_internal_cleanup_verified=false"
+        );
         Ok(())
     }
 
@@ -1108,16 +1305,9 @@ impl RelativeLink {
             }
             let mut target =
                 std::fs::File::open(&self.target_path).map_err(|cause| cause.to_string())?;
-            let mut bytes = [0_u8; TARGET_TEXT.len()];
-            target
-                .read_exact(&mut bytes)
-                .map_err(|cause| cause.to_string())?;
-            let mut tail = [0];
-            if bytes != TARGET_TEXT.as_bytes()
-                || target.read(&mut tail).map_err(|cause| cause.to_string())? != 0
-            {
-                return Err("相对链接目标在最终关闭时字节变化".into());
-            }
+            let mut comparison = TargetComparison::new(self.http_suffix.as_deref());
+            io::copy(&mut target, &mut comparison).map_err(|cause| cause.to_string())?;
+            comparison.finish()?;
             Ok(target_graph.is_some())
         })();
         drop(original); // 成功与错误都先归还原独立FD，不能靠后继idle或进程退出替本轮清理。
@@ -1138,9 +1328,13 @@ impl Drop for RelativeLink {
 }
 
 impl NativeMarkdownMemoryWorkload {
-    pub(crate) fn exercise_relative_link(&self, stage: i16) -> Result<(), String> {
+    pub(crate) fn exercise_relative_link(
+        &self,
+        stage: i16,
+        http_url: Option<&str>,
+    ) -> Result<(), String> {
         if stage == 570 {
-            let case = RelativeLink::begin(self)?;
+            let case = RelativeLink::begin(self, http_url)?;
             *self.relative_link.borrow_mut() = Some(case);
             return Ok(());
         }
@@ -1155,6 +1349,8 @@ impl NativeMarkdownMemoryWorkload {
             573 => case.verify_target(),
             574 => case.verify_saved(),
             575 => self.request_return(),
+            576 => case.click_http(),
+            577 => case.verify_http_unchanged(),
             _ => Err("未声明的相对链接事件".into()),
         }
     }

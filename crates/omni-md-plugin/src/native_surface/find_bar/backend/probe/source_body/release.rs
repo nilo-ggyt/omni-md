@@ -41,6 +41,7 @@ pub(super) fn injected_source_eio_only(error: &NativeMarkdownPagedBodyError) -> 
 
 /// 原release事件一次交付；父窗口仍活时就核像素，不靠随后close窗口或外层pool退场通过。
 fn wait_close(receipt: &Rc<NativeMarkdownPagedCloseReceipt>) -> Result<(), String> {
+    let started = Instant::now();
     let arrived = Rc::new(Cell::new(false));
     let observed = Rc::clone(&arrived);
     let run_loop = CFRunLoop::current().ok_or("关闭资源缺少原主runloop")?;
@@ -48,8 +49,23 @@ fn wait_close(receipt: &Rc<NativeMarkdownPagedCloseReceipt>) -> Result<(), Strin
         observed.set(true);
         run_loop.stop(); // 只响应本次真实最后资源relay；回调不保Rig、View、Doc或Frame。
     });
-    // SAFETY: 原default mode只交付一次有限3秒；超时仍走原Rig清理并报告失败，不轮询资源。
-    unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 3.0, false) };
+    while !arrived.get() {
+        let Some(remaining) = Duration::from_secs(3)
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            break;
+        };
+        // 原receipt仍是唯一观察者；其它回调stop主loop不代表本次像素归还或期限已过。
+        // 只用同一started的剩余时间交付原source，不重发close、不轮询资源或增加等待配额。
+        let progress = autoreleasepool(|_| {
+            // SAFETY: 原AppKit主线程default mode，事件处理不跨循环保留Native临时claim。
+            unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), false) }
+        });
+        if progress == objc2_core_foundation::CFRunLoopRunResult::Finished && !arrived.get() {
+            return Err("原正文关闭runloop已无可交付source，真实像素归还事件仍未完成".into());
+        }
+    }
     if !arrived.get() {
         return Err("原正文关闭在3秒内没有真实像素归还事件".into());
     }
@@ -245,13 +261,52 @@ impl Retirement {
             observed.set(true);
             run_loop.stop(); // 只响应原账本的最后实际销毁事件，不携带字段或文档强引用。
         });
-        if let Some(remaining) = Duration::from_secs(3).checked_sub(self.close_started.elapsed()) {
-            // SAFETY: 原关闭共用一次三秒预算；只在外层pool退场后交付原cohort事件，不轮询Weak。
-            unsafe {
-                CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), false)
+        let mut finished_without_release = false;
+        while !arrived.get() {
+            let Some(remaining) = Duration::from_secs(3)
+                .checked_sub(self.close_started.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                break;
             };
+            // 其它组件也能stop同一主runloop；Stopped不是本cohort销毁，也不是期限已过。
+            // 只沿原close_started剩余时间继续交付真实source，不延期限、不轮询Weak或sleep。
+            let progress = autoreleasepool(|_| {
+                // SAFETY: 原主线程default mode；本次最多等待同一关闭期限的真实剩余秒数。
+                unsafe {
+                    CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), false)
+                }
+            });
+            if progress == objc2_core_foundation::CFRunLoopRunResult::Finished {
+                // 没有任何可运行source时再次调用会立即返回；明确失败而不是空转到三秒。
+                finished_without_release = !arrived.get();
+                break;
+            }
         }
         if !arrived.get() || !self.cohort.has_completed() {
+            // 只在原cohort等待失败时沿既有Weak清单定位尚存角色，不增第二张资源图。
+            // load产生的原生临时claim在本pool退出前归还；诊断不改变任何销毁或资源通过门。
+            autoreleasepool(|_| {
+                for (role, weak) in &self.native {
+                    let alive = weak.load().is_some();
+                    eprintln!("native_body_find_close_role role={role} alive={alive} formal=false");
+                }
+                eprintln!(
+                    "native_body_find_close_cohort {} arrived={} formal=false",
+                    self.cohort.diagnostic(),
+                    arrived.get(),
+                );
+                #[cfg(feature = "native-close-stage-diagnostic")]
+                {
+                    let (complete, roles) = self.ledger.diagnostic_alive_roles();
+                    eprintln!(
+                        "native_body_find_close_ledger complete={complete} roles={roles:?} formal=false"
+                    );
+                }
+            });
+            if finished_without_release {
+                return Err("原Find Native关闭runloop已无可交付source，原销毁事件仍未完成".into());
+            }
             return Err("原Find Native角色在关闭三秒内没有真实销毁事件".into());
         }
         metrics::sample("after_close")?; // 原autoreleasepool已退出，分类只能描述当前实际内核状态。

@@ -460,6 +460,7 @@ impl NativeMarkdownPagedTextView {
         let result = (|| {
             let current = |epoch| origin.session_current(self, epoch);
             commit.check_current(&current)?;
+            self.discardCursorRects(); // 已提交的完整Input先撤旧链接区，后继CPU完成才重建。
             self.retire_other_composition_anchor(commit.state);
             let cpu = self.ivars().cpu.borrow().clone();
             if let Some(cpu) = cpu {

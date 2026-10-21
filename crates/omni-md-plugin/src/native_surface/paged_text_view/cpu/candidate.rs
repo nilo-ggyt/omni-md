@@ -8,7 +8,7 @@ use crate::native_surface::viewport_pixels::{
 /// 与同步SceneUse相同的原事实，但不能把Input或delegate强边保存到后续主队列轮次。
 /// 克隆仍只有弱身份和固定元数据，供本次advance消费Candidate之后核原票的真实换代。
 #[derive(Clone)]
-pub(super) struct Ticket {
+pub(in super::super) struct Ticket {
     input: Weak<NativeMarkdownPagedInput>,
     delegate: Weak<dyn NativeMarkdownPagedTextViewDelegate>,
     state: NativeMarkdownPagedInputState,
@@ -17,7 +17,7 @@ pub(super) struct Ticket {
 }
 impl Ticket {
     /// 同步获取和异步候选共享原事实；只保存弱身份，绝不保存后继 Scene 或延长正文资源寿命。
-    pub(super) fn new(origin: &Origin) -> Self {
+    pub(in super::super) fn new(origin: &Origin) -> Self {
         Self {
             input: Rc::downgrade(&origin.input),
             delegate: Rc::downgrade(&origin.delegate),
@@ -26,7 +26,7 @@ impl Ticket {
             geometry_epoch: origin.geometry_epoch,
         }
     }
-    pub(super) fn current(
+    pub(in super::super) fn current(
         &self,
         view: &NativeMarkdownPagedTextView,
         key: &NativeMarkdownPagedSceneKey,
@@ -51,7 +51,7 @@ impl Ticket {
     /// 只有客户、完整输入或几何确已换代，旧CPU票的撤权才是正常退休。
     /// current中的bool还可能来自借用失败、Viewport故障或当前图层关系错误，不能直接
     /// 把!current当作成功；这里不领取后继Scene，也不让清理后的空serial代替身份事实。
-    pub(super) fn superseded(&self, view: &NativeMarkdownPagedTextView) -> Result<bool> {
+    pub(in super::super) fn superseded(&self, view: &NativeMarkdownPagedTextView) -> Result<bool> {
         let ivars = view.ivars();
         if ivars.geometry_failed.get() {
             return Ok(false); // 几何计数失败不是一次合法布局换代，原Revoked必须继续交给失败边界。

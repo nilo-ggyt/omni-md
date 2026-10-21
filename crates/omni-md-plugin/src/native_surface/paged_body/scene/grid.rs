@@ -47,6 +47,22 @@ pub(super) enum GridCharacterGeometry {
 }
 
 impl Scene {
+    /// 只遍历当前有限可见格；空格、未到文字区和已离开文字区都没有链接光标权限。
+    /// 每个Composed窗口内部沿原真实cell clip裁剪，不为悬停准备离屏内容或读取目标字符串。
+    pub(super) fn visit_grid_link_cursor_rects(&self, visit: &mut dyn FnMut(NSRect)) -> Result<()> {
+        self.validate_grids(&|| self.current())?;
+        for row in &self.grids {
+            for cell in &row.cells {
+                if let GridCellContent::Composed(window) = &cell.content {
+                    window
+                        .visit_link_cursor_rects(&|| self.current(), visit)
+                        .map_err(scene_error)?;
+                }
+            }
+        }
+        self.validate_grids(&|| self.current())
+    }
+
     /// 返回真实命中格；不按列均分宽度或用可见数组下标推导原表格列坐标。
     pub(super) fn grid_cell_at(&self, local: NSPoint) -> Option<&GridCellPublication> {
         self.grids

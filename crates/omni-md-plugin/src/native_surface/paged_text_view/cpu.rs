@@ -9,7 +9,7 @@ use objc2_core_graphics::CGContext;
 use objc2_quartz_core::{CALayer, CATransaction};
 
 mod calibration;
-mod candidate;
+pub(super) mod candidate;
 mod install;
 mod layers;
 mod scheduler;
@@ -168,6 +168,33 @@ impl CpuSurface {
     }
     pub(super) fn paints(&self) -> usize {
         self.paints.get()
+    }
+
+    /// 悬停只认这份实际已提交的完整图，不把Ready或候选等同于已经显示。
+    /// 临时Rc在本栈归还；Native关系复核后再核同一发布身份，不保旧Scene或像素历史。
+    pub(super) fn cursor_publication_current(
+        &self,
+        view: &NativeMarkdownPagedTextView,
+        key: &NativeMarkdownPagedSceneKey,
+        current: &impl Fn() -> bool,
+    ) -> Result<bool> {
+        let published = self.published.borrow().clone();
+        let Some(published) = published.filter(|published| published.key.same(key)) else {
+            return Ok(false);
+        };
+        self.layer_current(view, current)?;
+        self.layers
+            .validate(&self.layer, &published.publication, current)?;
+        if !self
+            .published
+            .borrow()
+            .as_ref()
+            .is_some_and(|actual| Rc::ptr_eq(actual, &published))
+            || !current()
+        {
+            return Err(NativeMarkdownPagedTextViewError::Revoked);
+        }
+        Ok(true)
     }
 
     /// 正式Source验收只借实际已发布key和原paint计数；不克隆像素、层或候选帧。
@@ -605,6 +632,8 @@ impl CpuSurface {
                     // 两条路径都只在原 Candidate 完成整帧真实绘制后提交新 key，并沿原尾部
                     // 增长一次 paint、通知一次。图层复用本身不冒充额外绘制或补发旧 Scene。
                     completed.scene.cpu_frame_published(count); // 只通知真实整帧提交事实；此后不新增可回滚Result或重领新scene。
+                    // 原绘图栈仍持Scene；只投原弱票，归还全部Reader后才让AppKit重建光标区。
+                    view.queue_link_cursor_refresh(&completed.key);
                     Ok(())
                 }
             }
